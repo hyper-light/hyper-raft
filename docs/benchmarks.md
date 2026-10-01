@@ -486,6 +486,26 @@ The workspace's tests, these scenarios included, also pass on Linux (aarch64, in
 machine, `rust:1.98.0`, `fdatasync` on the VM's file system; the tick came out at 36 ms). They
 have not been run on Windows here; CI runs the gates on all six targets.
 
+A member's loop waits on its socket until its next tick, and when the tick is already due it
+still takes what has arrived before it ticks. On a loaded machine a turn of the loop can outlast
+a tick, so the tick is due at every turn. A member that skipped its socket then kept ticking
+without reading anything: a leader stepped down by its quorum check with its followers' answers
+still unread in its socket, and the scenario stalled on the election that followed. Two runs
+showed this before the fix: one with a parallel build loading the machine (tick 12 ms, load
+average 39), one with the tick forced to 4 ms under the same load. Each leader read nothing for
+100 to 180 ms, about ten ticks fired with nothing read in between, and the answers it had missed
+were the first datagrams it read after stepping down. `node::tests` holds the directed test.
+
+The client waits on facts, with bounds taken from the protocol. A request waits for its answer
+through twice the longest election timeout. One write or read is retried for `WAIT_ELECTIONS`
+elections, each within twice the election timeout, rather than for a fixed number of requests:
+during an election, members that name no leader or a stale one answer at once, and a count of
+requests ran out long before the election ended. When a member names no other leader, the
+client lets a heartbeat interval pass before it asks the next member. `leader-killed` sends its
+in-flight writes to whoever leads at that moment, not to the first leader, because earlier
+writes may have moved the leadership. After the fix the suite passed 100 runs in a row, 50 of
+them under load.
+
 `tests/wal.rs` covers the log's torn-tail cut, its refusal of a damaged record that is not the
 last, and its bound; `tests/wire.rs` covers damaged and cut datagrams. One group at a time runs,
 at most five member processes of one thread each, and the test itself is one thread

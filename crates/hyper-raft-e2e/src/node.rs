@@ -259,14 +259,19 @@ impl Node {
 
     /// Waits for a datagram until `until`, then takes what else has arrived without waiting,
     /// at most what one turn of the loop takes before it drives the member again.
-    fn receive_until(&mut self, until: Instant) -> Result<(), NodeError> {
+    ///
+    /// A member whose tick is already due waits for nothing, but it still takes what has
+    /// arrived: its peers' answers are what its commits and its quorum check are made of. On a
+    /// loaded machine a turn can take longer than a tick, so the tick is due at every turn; a
+    /// member that then skipped its socket ticked on deaf, and as leader stepped down by its
+    /// quorum check with its followers' answers waiting unread in its socket.
+    pub fn receive_until(&mut self, until: Instant) -> Result<(), NodeError> {
         let wait = until.saturating_duration_since(Instant::now());
-        if wait.is_zero() {
-            return Ok(());
-        }
-        self.socket.set_read_timeout(Some(wait))?;
-        if !self.receive_one()? {
-            return Ok(());
+        if !wait.is_zero() {
+            self.socket.set_read_timeout(Some(wait))?;
+            if !self.receive_one()? {
+                return Ok(());
+            }
         }
         self.socket.set_nonblocking(true)?;
         // A turn takes as many datagrams as the member has voters to hear from and askers to

@@ -94,6 +94,41 @@ Chosen design, by kind of state:
   instead of holding `Arc<ServerConfig>`. Certificate resolvers, session stores, ticketers and the
   crypto provider are borrowed from that config for the call.
 
+### 3.2 rustls conformed (`hyper-tls`)
+
+rustls 0.23.45 holds configuration by `Arc` in about 230 places. The largest are `Arc<ClientConfig>`
+and `Arc<ServerConfig>` (51), then `Arc<RootCertStore>` and `Arc<CryptoProvider>` (17 each), then
+the certificate keys and signing keys (25), the verifiers and resolvers (23), the session stores,
+ticketer and key log (10), and the certificate-compression cache (6). Measured with
+`grep -rn "Arc<" src`. Each moves as follows:
+
+- **A connection holds no configuration.**
+  - `ClientConnection`, `ServerConnection` and the QUIC connections take their config by
+    reference on the calls that can advance a handshake: `process_new_packets`, and QUIC's
+    `read_hs` and `write_hs`.
+  - The reference travels in the state machine's `Context`, so no handshake state keeps a
+    `config` field.
+  - The caller owns the config: in hyper-quic, the endpoint's `Configs` slab.
+- **The crypto provider is `&'static CryptoProvider`.** AWS-LC's provider is static tables of
+  algorithm references.
+- **Certificate keys are borrowed for the call that uses them.**
+  - In TLS 1.3 a server selects its certificate and signs CertificateVerify in the same flight
+    as its reply to ClientHello. TLS 1.2's ServerKeyExchange is the same.
+  - A client signs its CertificateVerify in the call that handles the server's request.
+  - A resolver therefore returns `&CertifiedKey` borrowed from itself, and no key outlives the
+    call that signs with it.
+- **Mutable shared state is reached through `&mut` configuration.**
+  - The session stores, the ticketer's key rotation, the key log and the compression cache are
+    owned (`Box`) by the config.
+  - Each call that may change them takes `&mut ServerConfig` or `&mut ClientConfig`.
+  - Their internal `Mutex`es go. One endpoint drives its connections from one thread, so the
+    calls never overlap.
+- **Verifiers, resolvers and root stores are owned by their config**, as `Box<dyn …>` or by
+  value. A config shared by several endpoints is cloned per endpoint.
+- **Oracle.** rustls's own suite from its repository at the crate's source commit `2976d90`:
+  `tests/` and the `rustls-test` crate, which the published archive omits. It is kept passing
+  throughout. Interop runs against unmodified upstream rustls as a dev-only dependency.
+
 ## 4. Stages
 
 Each stage lands with its tests, its GAPS row and its design status in the same commit.

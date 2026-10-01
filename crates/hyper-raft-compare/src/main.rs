@@ -37,8 +37,9 @@ use workload::{Measured, Spec, Workload};
 static ALLOCATOR: Counting = Counting;
 
 /// The cores, by the name the command line gives them.
-const CORES: [&str; 6] = [
+const CORES: [&str; 7] = [
     "hyper",
+    "hyper-copy",
     "control",
     "mantle",
     "slates",
@@ -218,6 +219,15 @@ fn table_specs(filter: &[String], batch: usize) -> Vec<Spec> {
             (Workload::Fast, 1, 64, 10_000),
         ] {
             if !filter.is_empty() && !filter.iter().any(|name| name == workload.name()) {
+                continue;
+            }
+            // `MAX_BYTES` leaves out the workloads of larger entries (for a core whose cost
+            // there is stated apart, docs/benchmarks.md).
+            let max_bytes = std::env::var("MAX_BYTES")
+                .ok()
+                .and_then(|bytes| bytes.parse().ok())
+                .unwrap_or(usize::MAX);
+            if bytes > max_bytes {
                 continue;
             }
             specs.push(Spec {
@@ -411,7 +421,9 @@ fn main() {
             let batch: usize = std::env::var("BATCH")
                 .ok()
                 .and_then(|batch| batch.parse().ok())
-                .unwrap_or(16);
+                // The knee of the batch sweep (docs/benchmarks.md): the smallest batch past which
+                // doubling it gains under 5 % per entry for every core.
+                .unwrap_or(64);
             table(runs, &args[2..], batch, &cores);
         }
         Some("sweep") => {

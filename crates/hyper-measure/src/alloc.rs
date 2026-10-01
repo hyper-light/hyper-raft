@@ -13,13 +13,16 @@
 //! whole loop did and what the measured calls did ([`Counts::less`]).
 //!
 //! Counts are per thread: a block one thread allocates and another frees is
-//! a free on the second. The measurements in this repository allocate and
-//! free on one thread.
+//! a free on the second. Code that runs threads of its own, as a log runs its
+//! owner and its device's, is counted across the process instead
+//! ([`begin_process`], [`end_process`]): every thread's events go to shared
+//! atomic counters while that count runs, at the cost of an atomic add per
+//! event, so a process count is read with nothing else running.
 #![allow(unsafe_code)]
 use std::{
     alloc::{GlobalAlloc, Layout, System},
     cell::Cell,
-    sync::atomic::{AtomicBool, Ordering},
+    sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering},
 };
 
 /// What the allocator was asked to do while counting was on.
@@ -98,13 +101,61 @@ fn signed(bytes: usize) -> i64 {
     i64::try_from(bytes).unwrap_or(i64::MAX)
 }
 
-/// Records one event on this thread when counting is on. Every counter wraps
-/// at its width, which no run of this repository approaches (2^64 events);
-/// wrapping is stated so that the allocator can never unwind.
+/// Whether a process count runs: every thread's events go to [`PROCESS`].
+static PROCESS_ON: AtomicBool = AtomicBool::new(false);
+
+/// The process count's counters, one per field of [`Counts`].
+struct Process {
+    allocations: AtomicU64,
+    reallocations: AtomicU64,
+    moved: AtomicU64,
+    frees: AtomicU64,
+    bytes: AtomicU64,
+    live: AtomicI64,
+    peak: AtomicI64,
+}
+
+static PROCESS: Process = Process {
+    allocations: AtomicU64::new(0),
+    reallocations: AtomicU64::new(0),
+    moved: AtomicU64::new(0),
+    frees: AtomicU64::new(0),
+    bytes: AtomicU64::new(0),
+    live: AtomicI64::new(0),
+    peak: AtomicI64::new(0),
+};
+
+/// Records one event on this thread when counting is on, and in the process
+/// count when one runs. Every counter wraps at its width, which no run of this
+/// repository approaches (2^64 events); wrapping is stated so that the
+/// allocator can never unwind.
 fn note(record: impl Fn(&mut Counts)) {
     if ARMED.load(Ordering::Relaxed) {
+        if PROCESS_ON.load(Ordering::Relaxed) {
+            note_process(&record);
+        }
         note_armed(record);
     }
+}
+
+/// Adds one event to the process count: the event recorded into zeroed
+/// counts is the delta each shared counter takes.
+fn note_process(record: &impl Fn(&mut Counts)) {
+    let mut delta = Counts::ZERO;
+    record(&mut delta);
+    let p = &PROCESS;
+    p.allocations
+        .fetch_add(delta.allocations, Ordering::Relaxed);
+    p.reallocations
+        .fetch_add(delta.reallocations, Ordering::Relaxed);
+    p.moved.fetch_add(delta.moved, Ordering::Relaxed);
+    p.frees.fetch_add(delta.frees, Ordering::Relaxed);
+    p.bytes.fetch_add(delta.bytes, Ordering::Relaxed);
+    let live = p
+        .live
+        .fetch_add(delta.live, Ordering::Relaxed)
+        .wrapping_add(delta.live);
+    p.peak.fetch_max(live, Ordering::Relaxed);
 }
 
 /// [`note`] once a count has begun. Kept out of line: the address of a thread-local is
@@ -199,6 +250,42 @@ pub fn read() -> Counts {
 pub fn end() -> Counts {
     pause();
     read()
+}
+/// Zeroes the process count and turns it on: from here every thread's
+/// allocations, reallocations and frees are counted together.
+pub fn begin_process() {
+    ARMED.store(true, Ordering::Relaxed);
+    let p = &PROCESS;
+    for counter in [
+        &p.allocations,
+        &p.reallocations,
+        &p.moved,
+        &p.frees,
+        &p.bytes,
+    ] {
+        counter.store(0, Ordering::Relaxed);
+    }
+    p.live.store(0, Ordering::Relaxed);
+    p.peak.store(0, Ordering::Relaxed);
+    PROCESS_ON.store(true, Ordering::SeqCst);
+}
+/// The process count so far, counting left as it is.
+pub fn read_process() -> Counts {
+    let p = &PROCESS;
+    Counts {
+        allocations: p.allocations.load(Ordering::Relaxed),
+        reallocations: p.reallocations.load(Ordering::Relaxed),
+        moved: p.moved.load(Ordering::Relaxed),
+        frees: p.frees.load(Ordering::Relaxed),
+        bytes: p.bytes.load(Ordering::Relaxed),
+        live: p.live.load(Ordering::Relaxed),
+        peak: p.peak.load(Ordering::Relaxed),
+    }
+}
+/// Turns the process count off and gives it.
+pub fn end_process() -> Counts {
+    PROCESS_ON.store(false, Ordering::SeqCst);
+    read_process()
 }
 /// Whether the allocator is counting on this thread: false when a binary did
 /// not install [`Counting`], which a measurement checks before it trusts a

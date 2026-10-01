@@ -8,7 +8,9 @@
 //! device's work, the answer, and the drop of what the log held. The count is the process's,
 //! every thread's together (`hyper_measure::alloc::begin_process`), since the log runs threads of
 //! its own. Fetches are counted the same way: a group's entries still in memory, the same
-//! entries read back from the file after a reopen, a term and a view.
+//! entries read back from the file after a reopen, a term and a view. The same appends and reads
+//! are counted again through each group's handle (`GroupLog`), which keeps its writes' entries
+//! and answers its reads itself.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -24,7 +26,7 @@ use std::path::{Path, PathBuf};
 use hyper_block::buf::Alignment;
 use hyper_block::file::{CachingRequest, DeviceFile};
 use hyper_block::scratch::Scratch;
-use hyper_log::{Config, Entries, Entry, Log, Update, Waits};
+use hyper_log::{Config, Entries, Entry, GroupLog, Log, Update, Waits};
 use hyper_measure::{alloc, faults};
 
 #[global_allocator]
@@ -87,6 +89,56 @@ fn rounds(log: &Log<DeviceFile>, batches: Vec<Vec<Update>>) {
             p.wait().unwrap();
         }
     }
+}
+
+fn handle_rounds(handles: &mut [GroupLog<DeviceFile>], batches: Vec<Vec<Update>>) {
+    for batch in batches {
+        for (h, u) in handles.iter_mut().zip(batch) {
+            h.submit(u).unwrap();
+        }
+        for h in handles.iter_mut() {
+            h.wait().unwrap().unwrap();
+        }
+    }
+}
+
+/// The same appends and reads through each group's handle, on a log of their own.
+fn through_handles(dir: &Path, replicas: usize, size: usize) {
+    let scratch = Scratch::create(dir, ".hyper-log-allocs-handles").unwrap();
+    let log = Log::create(open(scratch.path()), config(replicas), 2).unwrap();
+    let mut handles: Vec<GroupLog<DeviceFile>> = (0..replicas)
+        .map(|g| log.group(g as u128).unwrap())
+        .collect();
+    handle_rounds(&mut handles, updates(replicas, size, 1, WARM));
+    let batches = updates(replicas, size, WARM + 1, ROUNDS);
+    let appends = ROUNDS * replicas as u64;
+    let cost = counted(appends, || handle_rounds(&mut handles, batches));
+    row("append through the handle", replicas, size, &cost);
+    let last = WARM + ROUNDS;
+    let mut into = Some(hyper_log::Fetched::new());
+    let mut fetch = |h: &GroupLog<DeviceFile>| {
+        let got = h
+            .fetch(last, last + 1, u64::MAX, into.take().unwrap())
+            .unwrap();
+        assert_eq!(got.len(), 1);
+        into = Some(got);
+    };
+    fetch(&handles[0]);
+    let cost = counted(replicas as u64, || {
+        for h in &handles {
+            fetch(h);
+        }
+    });
+    row("fetch through the handle, reserved", replicas, size, &cost);
+    let cost = counted(replicas as u64, || {
+        for h in &handles {
+            assert_eq!(h.term(last).unwrap(), 1);
+            assert_eq!(h.bounds().unwrap().1, last);
+        }
+    });
+    row("term and bounds through the handle", replicas, size, &cost);
+    let asked: u64 = handles.iter().map(GroupLog::asked).sum();
+    assert_eq!(asked, 0, "a handle asked the log for what it held");
 }
 
 struct Cost {
@@ -219,6 +271,7 @@ fn main() {
     for replicas in [1usize, 16] {
         for size in [128usize, 1 << 10, 16 << 10] {
             point(&dir, replicas, size);
+            through_handles(&dir, replicas, size);
         }
     }
 }

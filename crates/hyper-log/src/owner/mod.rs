@@ -1,9 +1,16 @@
-//! The log's owner: one thread that holds everything the log knows, its groups, its segments,
-//! its queue's room and the writer's batch, and that alone reads or changes it (mantle note 32
-//! §3.9). Callers reach it by message through a bounded inbox and hear back through their
-//! tickets; the device thread hands back each job it was given as a message too. The owner
-//! never waits on the device, so it answers a caller while a frame is being flushed, as readers
-//! of mantle's lock did.
+//! The log's owner: what the log knows, its groups, its segments, its queue's room and the
+//! writer's batch, held by one thread at a time and read or changed by that thread alone (mantle
+//! note 32 §3.9). Callers reach it by message through a bounded inbox and hear back through their
+//! tickets.
+//!
+//! The log runs two threads, leader and follower in turn (Leader/Followers: Schmidt, O'Ryan, Pyarali, Kircher and Buschmann, PLoP 2000; POSA2 ch. 5): the
+//! leader holds the owner and reads the inbox; when the owner has I/O to do, the leader hands the
+//! owner to the other thread, which leads from then on, and does the I/O itself with the device,
+//! which travels with the job, then hands the device back through the inbox and waits to lead
+//! again. So the owner never waits on the device and answers callers while a frame is flushed, as
+//! readers of mantle's lock did, and a frame's write, flush, confirmation and answers happen on
+//! the thread that took the submission from the inbox, with no thread between: two hand-offs a
+//! write, the submission's and its answer's, as mantle's writer had.
 //!
 //! The writer's loop is mantle-log's (`writer.rs`), run as steps between messages (`write.rs`):
 //! at the top of the loop, the batch is what was held for this frame and what is queued, that is
@@ -17,8 +24,7 @@ mod read;
 mod write;
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TryRecvError};
-use std::thread::JoinHandle;
+use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender};
 use std::time::Instant;
 
 use hyper_block::block::BlockFile;
@@ -26,7 +32,7 @@ use hyper_block::buf::AlignedBuf;
 use hyper_block::commit::Anticipation;
 
 use crate::codec::Writer as Payload;
-use crate::device::{Completion, Job, Look};
+use crate::device::{Answering, Completion, Device, Job, Look};
 use crate::format;
 use crate::room::{Room, Take};
 use crate::state::State;
@@ -44,10 +50,15 @@ pub(crate) enum Message<F> {
     Submit { submission: Submission, wait: bool },
     /// A question about the log's state, answered through its ticket.
     Query(Query, Ticket),
-    /// A job the device has done.
-    Done(Completion),
-    /// A caller's look at the file, run on the device thread.
+    /// A job the device has done, and the device, back from the thread that did it; a frame's
+    /// word that the frame before is settled comes without it.
+    Done(Completion, Option<Device<F>>),
+    /// A caller's look at the file, run by the thread that holds the device.
     Look(Look<F>),
+    /// A group's handle is wanted (`Log::group`).
+    Claim(u128, Ticket),
+    /// A group's handle was dropped.
+    Release(u128),
     /// The log is closing: the owner answers what it holds and ends.
     Close,
 }
@@ -109,12 +120,39 @@ struct Buffers {
     taken: Vec<Vec<(Submission, Placement)>>,
     /// Waiters room was just handed to.
     admitted: Vec<u64>,
+    /// The aligned buffers frames' own confirmations were laid out in, kept for later frames':
+    /// at most [`SPARE_FRAMES`], the frame awaiting its confirmation and the frame on the device.
+    confirms: Vec<AlignedBuf>,
+    /// Lists of a frame's answers, kept between frames: one for each frame whose answers are out
+    /// at once, the frame confirmed by the one on the device, that frame, and the one laid out.
+    answering: Vec<Vec<Answering>>,
+    /// The terms and lengths of the entries of the frame laid out that its handles' writes take
+    /// back with their answers: what publishing the frame needs of them.
+    lens: Vec<(u64, u32)>,
 }
 
 /// Frames whose update lists the writer holds at once besides the one it lays out: the frame on
 /// the device and the frame flushed and awaiting its confirmation (mantle
 /// docs/design/raft-log.md §3).
 const SPARE_FRAMES: usize = 2;
+
+/// Lists of answers the writer keeps for later frames: one for each frame whose answers are out
+/// at once, the frame awaiting its confirmation, the frame on the device, and the one laid out.
+const ANSWER_LISTS: usize = SPARE_FRAMES.saturating_add(1);
+
+/// What a leader does next: I/O for the device, the owner going to the other thread, which
+/// leads, while this one does the job; or, the log having closed, nothing, with the file unless
+/// the device was lost.
+pub(crate) type Led<F> = Result<(Box<Owner<F>>, Job<F>, Device<F>), Option<F>>;
+
+/// What the owner is wired to: the device, where it tells the device another frame follows,
+/// its inbox, and where the device tells it of a flush.
+pub(crate) struct Wiring<F> {
+    pub(crate) device: Device<F>,
+    pub(crate) more: SyncSender<u64>,
+    pub(crate) inbox: Receiver<Message<F>>,
+    pub(crate) flushes: Receiver<Completion>,
+}
 
 pub(crate) struct Owner<F> {
     p: Params,
@@ -135,8 +173,26 @@ pub(crate) struct Owner<F> {
     unconfirmed: Option<Unconfirmed>,
     buffers: Buffers,
     fenced: bool,
-    device: SyncSender<Job<F>>,
-    device_thread: Option<JoinHandle<Option<F>>>,
+    /// The device, while no thread does I/O with it.
+    device: Option<Device<F>>,
+    /// I/O waiting for the device, in the order asked: at most [`crate::device::JOBS`].
+    io: VecDeque<Job<F>>,
+    /// Where the owner tells the device that another frame follows the one it has.
+    more: SyncSender<u64>,
+    /// The owner has told the device so for the frame it has, or laid it out knowing.
+    more_told: bool,
+    /// The inbox, while a leader is not reading it.
+    inbox: Option<Receiver<Message<F>>>,
+    /// The owner has taken its first step: the restore of a lost frame at open.
+    started: bool,
+    /// Messages a step's drain of the inbox stopped at, handled at the loop's top, in order: a
+    /// completion, whose job the draining step may belong to, or a frame's flush and the message
+    /// the drain took after it. At most two.
+    deferred: VecDeque<Message<F>>,
+    /// The device's word that a frame is flushed while it writes the frame's confirmation
+    /// (`device.rs`). It wakes no one: the leader reads it before every message it takes from the
+    /// inbox, since anything a caller sends after hearing of the frame comes after the word.
+    flushes: Receiver<Completion>,
     /// Fetches waiting for the device, the first of them on it: one group's each at most for
     /// every group the log holds, past which a fetch is refused `Busy`.
     fetches: VecDeque<Fetch>,
@@ -147,6 +203,43 @@ pub(crate) struct Owner<F> {
     looks: VecDeque<Look<F>>,
     looking: bool,
     closing: bool,
+    /// Groups written through their handles: at most `max_groups`.
+    claimed: HashSet<u128>,
+}
+
+/// One of the log's two threads: it leads while it holds the owner, and does the owner's I/O
+/// once it has handed the owner to the other thread; then it waits to lead again. Should the
+/// other thread have ended, it does the I/O holding the owner and leads on. It gives back the
+/// file if it leads when the log closes.
+pub(crate) fn follow<F: BlockFile + 'static>(
+    batons: &Receiver<Box<Owner<F>>>,
+    peer: &SyncSender<Box<Owner<F>>>,
+    inbox: &SyncSender<Message<F>>,
+) -> Option<F> {
+    // The answers a job gives once the owner has heard of it, kept from job to job.
+    let mut answers = Vec::new();
+    let mut next = batons.recv().ok();
+    while let Some(owner) = next.take() {
+        match owner.lead() {
+            Ok((owner, job, mut device)) => {
+                let kept = peer.send(owner).err().map(|e| e.0);
+                let completion = device.execute(job, &mut answers);
+                // The owner hears of the job before its callers do (`device.rs`).
+                if inbox.send(Message::Done(completion, Some(device))).is_err() {
+                    return None;
+                }
+                for answering in answers.drain(..) {
+                    answering.durable();
+                }
+                next = match kept {
+                    Some(owner) => Some(owner),
+                    None => batons.recv().ok(),
+                };
+            }
+            Err(file) => return file,
+        }
+    }
+    None
 }
 
 impl<F: BlockFile + 'static> Owner<F> {
@@ -155,9 +248,14 @@ impl<F: BlockFile + 'static> Owner<F> {
         state: State,
         room: Room,
         restores: Vec<Submission>,
-        device: SyncSender<Job<F>>,
-        device_thread: JoinHandle<Option<F>>,
+        wiring: Wiring<F>,
     ) -> Self {
+        let Wiring {
+            device,
+            more,
+            inbox,
+            flushes,
+        } = wiring;
         Self {
             p,
             state,
@@ -171,27 +269,66 @@ impl<F: BlockFile + 'static> Owner<F> {
             unconfirmed: None,
             buffers: Buffers::new(),
             fenced: false,
-            device,
-            device_thread: Some(device_thread),
+            device: Some(device),
+            io: VecDeque::new(),
+            more,
+            more_told: false,
+            inbox: Some(inbox),
+            started: false,
+            deferred: VecDeque::new(),
+            flushes,
             fetches: VecDeque::new(),
             spare_reads: crate::device::Reads::none(),
             looks: VecDeque::new(),
             looking: false,
             closing: false,
+            claimed: HashSet::new(),
         }
     }
 
-    /// Runs until the log closes and nothing is left to answer; gives the file back.
-    pub(crate) fn run(mut self, inbox: &Receiver<Message<F>>) -> Option<F> {
-        self.step(inbox);
-        while !self.finished() {
-            match self.next(inbox) {
-                Ok(Some(m)) => self.handle(m, inbox),
-                Ok(None) => self.gathered(inbox),
+    /// Leads until there is I/O to do with the device, or until the log closes and nothing is
+    /// left to answer.
+    pub(crate) fn lead(mut self: Box<Self>) -> Led<F> {
+        let Some(inbox) = self.inbox.take() else {
+            return Err(self.device.take().map(Device::into_file));
+        };
+        if !self.started {
+            self.started = true;
+            self.step(&inbox);
+        }
+        loop {
+            if self.device.is_some()
+                && let Some(job) = self.io.pop_front()
+                && let Some(device) = self.device.take()
+            {
+                self.inbox = Some(inbox);
+                return Ok((self, job, device));
+            }
+            if let Some(message) = self.deferred.pop_front() {
+                self.handle(message, &inbox);
+                continue;
+            }
+            if let Ok(flushed) = self.flushes.try_recv() {
+                self.handle(Message::Done(flushed, None), &inbox);
+                continue;
+            }
+            if self.finished() {
+                break;
+            }
+            match self.next(&inbox) {
+                Ok(Some(m)) => match self.flushes.try_recv() {
+                    // The word came before the message: it is heard first.
+                    Ok(flushed) => {
+                        self.deferred.push_back(m);
+                        self.handle(Message::Done(flushed, None), &inbox);
+                    }
+                    Err(_) => self.handle(m, &inbox),
+                },
+                Ok(None) => self.gathered(&inbox),
                 Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => break,
             }
         }
-        self.stop()
+        Err(self.device.take().map(Device::into_file))
     }
 
     /// The next message, or `None` once the writer's wait for returning submitters is over;
@@ -219,13 +356,9 @@ impl<F: BlockFile + 'static> Owner<F> {
             && self.fetches.is_empty()
             && self.looks.is_empty()
             && !self.looking
-    }
-
-    /// Ends the device thread and gives back the file it held.
-    fn stop(mut self) -> Option<F> {
-        let thread = self.device_thread.take();
-        drop(self);
-        thread.and_then(|t| t.join().ok().flatten())
+            && self.io.is_empty()
+            && self.device.is_some()
+            && self.deferred.is_empty()
     }
 
     fn handle(&mut self, message: Message<F>, inbox: &Receiver<Message<F>>) {
@@ -238,22 +371,46 @@ impl<F: BlockFile + 'static> Owner<F> {
         match message {
             Message::Submit { submission, wait } => self.submit(submission, wait),
             Message::Query(query, ticket) => self.query(query, ticket),
-            Message::Done(completion) => self.done(completion, inbox),
+            Message::Done(completion, device) => {
+                if device.is_some() {
+                    self.device = device;
+                }
+                self.done(completion, inbox);
+            }
             Message::Look(look) => {
                 self.looks.push_back(look);
                 self.look();
+            }
+            Message::Claim(group, ticket) => self.claim(group, ticket),
+            Message::Release(group) => {
+                self.claimed.remove(&group);
             }
             Message::Close => self.closing = true,
         }
     }
 
-    /// Handles every message already waiting, without waiting for more.
+    /// Handles every message already waiting, without waiting for more. It stops at a completion,
+    /// since the step that drains may be the one the completion's job belongs to, and at a word
+    /// that a frame is flushed, which comes before the message taken with it: those, and what
+    /// follows them, are handled at the loop's top, in order.
     fn drain(&mut self, inbox: &Receiver<Message<F>>) {
+        if !self.deferred.is_empty() {
+            return;
+        }
         loop {
-            match inbox.try_recv() {
-                Ok(message) => self.take(message, inbox),
-                Err(TryRecvError::Empty | TryRecvError::Disconnected) => return,
+            let Ok(message) = inbox.try_recv() else {
+                return;
+            };
+            if let Ok(flushed) = self.flushes.try_recv() {
+                self.deferred.push_back(Message::Done(flushed, None));
+                self.deferred.push_back(message);
+                return;
             }
+            if matches!(message, Message::Done(..)) {
+                self.deferred.push_back(message);
+                return;
+            }
+            self.take(message, inbox);
         }
     }
 
@@ -263,11 +420,18 @@ impl<F: BlockFile + 'static> Owner<F> {
             s.ticket.answer(Err(LogError::Fenced));
             return;
         }
+        if !s.handle && self.claimed.contains(&s.group) {
+            s.ticket.answer(Err(LogError::Claimed(s.group)));
+            return;
+        }
         let mut admitted = std::mem::take(&mut self.buffers.admitted);
         match self.room.take(s.group, s.bytes, wait, &mut admitted) {
             Ok(Take::Admitted) => {
-                s.ticket.admit();
+                if s.admit {
+                    s.ticket.admit();
+                }
                 self.intake.push_back(s);
+                self.tell_more();
             }
             Ok(Take::Waiting(seq)) => {
                 self.waiting.insert(seq, s);
@@ -282,19 +446,48 @@ impl<F: BlockFile + 'static> Owner<F> {
     fn let_in(&mut self, admitted: &mut Vec<u64>) {
         for seq in admitted.drain(..) {
             if let Some(s) = self.waiting.remove(&seq) {
-                s.ticket.admit();
+                if s.admit {
+                    s.ticket.admit();
+                }
                 self.intake.push_back(s);
+                self.tell_more();
             }
         }
     }
 
     /// Answers a submission, and gives back its room in the queue to the waiters it fits.
     fn answer(&mut self, mut s: Submission, result: Result<(), LogError>) {
-        s.ticket.answer(result.map(|()| Answer::Durable));
+        let back = match &result {
+            Ok(()) if s.handle => crate::group::given_back(&mut s.update),
+            _ => Vec::new(),
+        };
+        s.ticket.answer(result.map(|()| Answer::Durable(back)));
         let mut admitted = std::mem::take(&mut self.buffers.admitted);
         self.room.release(s.group, s.bytes, &mut admitted);
         self.let_in(&mut admitted);
         self.buffers.admitted = admitted;
+    }
+
+    /// Hands out `group`'s handle: its state as the log holds it, with the bytes of the entries
+    /// the log keeps in memory, which the handle keeps from here on.
+    fn claim(&mut self, group: u128, mut ticket: Ticket) {
+        let answer = if self.state.damaged.contains_key(&group) {
+            Err(LogError::Damaged(
+                "the group's acknowledged records are damaged; it recovers from its peers",
+            ))
+        } else if self.claimed.contains(&group) {
+            Err(LogError::Claimed(group))
+        } else if self.claimed.len() >= self.p.config.max_groups {
+            Err(LogError::TooManyGroups(self.p.config.max_groups))
+        } else {
+            self.claimed.insert(group);
+            let mirror = match self.state.groups.get_mut(&group) {
+                Some(g) => crate::group::Mirror::of(g),
+                None => crate::group::Mirror::none(),
+            };
+            Ok(Answer::Claimed(Box::new(mirror)))
+        };
+        ticket.answer(answer);
     }
 
     /// Fences the log: no submission is taken from here on, and every waiter hears it.
@@ -315,16 +508,32 @@ impl<F: BlockFile + 'static> Owner<F> {
             Completion::Frame {
                 frame,
                 record,
+                confirm,
                 result,
                 took_ns,
+                confirming,
+                before,
+                these,
             } => {
                 self.buffers.frame = Some(frame);
                 self.buffers.record = Some(record);
-                self.written(result, took_ns, inbox);
+                let done = write::Flushed {
+                    result,
+                    took_ns,
+                    confirming,
+                    confirm,
+                    before,
+                    these,
+                };
+                self.written(done, inbox);
             }
-            Completion::Confirm { record, result } => {
-                self.buffers.record = Some(record);
-                self.confirmed(result, inbox);
+            Completion::Confirm {
+                record,
+                result,
+                these,
+            } => {
+                self.give_confirm(record);
+                self.confirmed(result, these, inbox);
             }
             Completion::Read(reads) => self.read(reads),
             Completion::Looked => {
@@ -342,8 +551,30 @@ impl<F: BlockFile + 'static> Owner<F> {
         let Some(look) = self.looks.pop_front() else {
             return;
         };
-        // A device that ended drops the look, and its caller hears the log closed.
-        self.looking = self.device.try_send(Job::Look(look)).is_ok();
+        self.io.push_back(Job::Look(look));
+        self.looking = true;
+    }
+
+    /// A submission was admitted while a frame is on the device: another frame follows it, so
+    /// the device leaves the frame's confirmation to the next one's record, as the writer did
+    /// when it found submissions queued (mantle docs/design/raft-log.md §3).
+    fn tell_more(&mut self) {
+        if self.more_told {
+            return;
+        }
+        if let write::Phase::Writing(w) = &self.phase {
+            // Full only with a word about the frame before still unread, which the device drops
+            // as it reads this one: one is always room for this frame's.
+            self.more_told = self.more.try_send(w.sequence()).is_ok();
+        }
+    }
+
+    /// Keeps an emptied list of answers for a later frame, while the writer holds fewer than
+    /// it can use.
+    fn keep_answers(&mut self, list: Vec<Answering>) {
+        if list.capacity() > 0 && self.buffers.answering.len() < ANSWER_LISTS {
+            self.buffers.answering.push(list);
+        }
     }
 }
 
@@ -380,6 +611,9 @@ impl Buffers {
             batch: VecDeque::new(),
             taken: Vec::new(),
             admitted: Vec::new(),
+            confirms: Vec::new(),
+            answering: Vec::new(),
+            lens: Vec::new(),
         }
     }
 }

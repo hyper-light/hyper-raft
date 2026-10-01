@@ -6,12 +6,16 @@
 //! and flushes it, publishes it to readers, and answers once a later durable record confirms the
 //! flush. Reads serve the view a Raft core's storage needs: bounds, terms and entries.
 //!
-//! From mantle-log at mantle `147f035` (`ORIGIN.md`), with its state held by one owner thread
-//! instead of a lock (mantle note 32 §3.9, L-2): callers reach the owner by message and hear
-//! back through tickets, one to one (`ticket.rs`); the owner runs the writer as steps between
-//! messages and hands every read and write of the file to the log's device thread, so it answers
-//! callers while a frame is flushed (`owner.rs`, `device.rs`). A log runs those two threads,
-//! whatever its number of groups or callers.
+//! From mantle-log at mantle `147f035` (`ORIGIN.md`), with its state held by one owner instead of
+//! a lock (mantle note 32 §3.9, L-2): callers reach the owner by message and hear back through
+//! tickets, one to one (`ticket.rs`). The owner runs the writer as steps between messages; the
+//! log's two threads take turns holding it, the one that has I/O to do handing it to the other
+//! and doing the I/O itself, so the owner answers callers while a frame is flushed and a write
+//! crosses from its caller to the thread that flushes it and back, as mantle's writer had it
+//! (`owner.rs`, `device.rs`). A log runs those two threads, whatever its number of groups or
+//! callers. A group's replica reads its group through the group's handle ([`GroupLog`]), which
+//! answers from the group's state as its writes left it, with no message to the owner
+//! (`group.rs`).
 #![cfg_attr(
     test,
     allow(
@@ -28,6 +32,7 @@ pub mod codec;
 mod device;
 mod error;
 pub mod format;
+mod group;
 mod owner;
 mod recover;
 mod room;
@@ -44,6 +49,7 @@ use hyper_block::buf::{Alignment, Pool};
 
 pub use error::LogError;
 pub use format::{HardState, Start};
+pub use group::GroupLog;
 pub use ticket::{Fetching, Pending};
 
 use owner::{Message, Owner, Query};
@@ -322,7 +328,9 @@ impl<F> Refused<F> {
 /// The log: a handle to its owner, which any number of threads may share by reference.
 pub struct Log<F: BlockFile + 'static> {
     inbox: SyncSender<Message<F>>,
-    owner: Option<JoinHandle<Option<F>>>,
+    /// The log's two threads, leading in turn; the one that leads when the log closes gives
+    /// back the file.
+    threads: [Option<JoinHandle<Option<F>>>; 2],
     p: Params,
 }
 
@@ -368,7 +376,7 @@ impl<F: BlockFile + 'static> Log<F> {
         Ok((log, recovery))
     }
 
-    /// Starts the owner and the device thread, the owner's first batch being `restores`: the
+    /// Starts the owner and the log's threads, the owner's first batch being `restores`: the
     /// handles that answer them.
     fn start(
         file: F,
@@ -439,6 +447,9 @@ impl<F: BlockFile + 'static> Log<F> {
                 class: Class::Normal,
                 tags: writer::Tags::default(),
                 ticket: Ticket::new(reply, None),
+                admit: false,
+                handle: false,
+                lens: (0, 0),
             });
         }
         Ok(Prepared {
@@ -449,8 +460,8 @@ impl<F: BlockFile + 'static> Log<F> {
         })
     }
 
-    /// Starts the device thread and hands it the file once it runs, then the owner: a thread the
-    /// OS refuses leaves the file with the caller.
+    /// Starts the log's two threads, then hands the owner, with the device and its file, to the
+    /// first to lead: a thread the OS refuses leaves the file with the caller.
     fn spawn(
         file: F,
         p: Params,
@@ -460,54 +471,70 @@ impl<F: BlockFile + 'static> Log<F> {
     ) -> Result<Self, Refused<F>> {
         let config = p.config;
         // Everything that may wait in the inbox at once: every submission the queue admits,
-        // every waiter for room, and the device's answers.
+        // every waiter for room, the device's answers and its word that a frame is settled, and
+        // a release from each group's handle.
         let capacity = config
             .queue_submissions
             .max(1)
             .saturating_add(config.max_groups.saturating_mul(room::GROUP_SUBMISSIONS))
-            .saturating_add(device::JOBS);
+            .saturating_add(device::JOBS)
+            .saturating_add(1)
+            .saturating_add(config.max_groups);
         let (inbox, messages) = sync_channel(capacity);
-        let (jobs, work) = sync_channel(device::JOBS);
-        let (hand, handed) = sync_channel::<F>(1);
-        let done = inbox.clone();
+        // Each thread waits for the owner on its own channel, which holds the one owner there is.
+        let (to_first, first_batons) = sync_channel::<Box<Owner<F>>>(1);
+        let (to_second, second_batons) = sync_channel::<Box<Owner<F>>>(1);
+        let worker = |batons, peer: SyncSender<Box<Owner<F>>>, name: &str| {
+            let done = inbox.clone();
+            std::thread::Builder::new()
+                .name(name.into())
+                .spawn(move || owner::follow(&batons, &peer, &done))
+        };
+        let Ok(leader) = worker(first_batons, to_second.clone(), "hyper-log") else {
+            return Err(Refused::with(LogError::Closed, file));
+        };
+        let Ok(follower) = worker(second_batons, to_first.clone(), "hyper-log-io") else {
+            // The first thread ends once nothing can hand it the owner.
+            drop((to_first, to_second));
+            let _ = leader.join();
+            return Err(Refused::with(LogError::Closed, file));
+        };
         let largest = usize::try_from(config.segment_bytes).unwrap_or(usize::MAX);
         let pool = Pool::new(p.align, largest.saturating_mul(2), largest);
-        let segment_bytes = config.segment_bytes;
-        let device_thread = std::thread::Builder::new()
-            .name("hyper-log-device".into())
-            .spawn(move || {
-                let file = handed.recv().ok()?;
-                Some(device::run(file, &work, &done, pool, segment_bytes))
-            });
-        let device_thread = match device_thread {
-            Ok(thread) => thread,
-            Err(_) => return Err(Refused::with(LogError::Closed, file)),
+        let (more, told) = sync_channel(device::MORE);
+        // One frame's flush is told at a time: the owner reads it before the next frame goes out.
+        let (flushed, flushes) = sync_channel(1);
+        let device = device::Device::new(
+            file,
+            pool,
+            config.segment_bytes,
+            told,
+            flushed,
+            inbox.clone(),
+        );
+        let wiring = owner::Wiring {
+            device,
+            more,
+            inbox: messages,
+            flushes,
         };
-        // The device thread waits for the file, with room for it.
-        if let Err(e) = hand.try_send(file) {
-            let file = match e {
-                std::sync::mpsc::TrySendError::Full(f)
-                | std::sync::mpsc::TrySendError::Disconnected(f) => f,
-            };
-            return Err(Refused::with(LogError::Closed, file));
-        }
-        let owner = Owner::new(p, state, room, first, jobs, device_thread);
-        let owner = std::thread::Builder::new()
-            .name("hyper-log".into())
-            .spawn(move || owner.run(&messages));
-        match owner {
-            Ok(owner) => Ok(Self {
-                inbox,
-                owner: Some(owner),
-                p,
-            }),
-            // The owner never ran: its closure, dropped with the refusal, ended the device
-            // thread, which took the file with it.
-            Err(_) => Err(Refused {
+        let owner = Box::new(Owner::new(p, state, room, first, wiring));
+        // The first thread waits with room for the owner. Should the send fail, the owner, and
+        // the file in it, ended with the thread.
+        let sent = to_first.send(owner);
+        drop((to_first, to_second));
+        if sent.is_err() {
+            let _ = (leader.join(), follower.join());
+            return Err(Refused {
                 error: LogError::Closed,
                 file: None,
-            }),
+            });
         }
+        Ok(Self {
+            inbox,
+            threads: [Some(leader), Some(follower)],
+            p,
+        })
     }
 
     /// Submits `update` for `group`: refused at once with `Busy` when the queue is full, and
@@ -515,7 +542,7 @@ impl<F: BlockFile + 'static> Log<F> {
     /// answered through the returned handle once it is durable and a later record confirms
     /// so.
     pub fn submit(&self, group: u128, update: Update) -> Result<Pending, LogError> {
-        self.send(group, Class::Normal, update, false, None)
+        self.send(group, Class::Normal, update, false, None, true)
     }
 
     /// Submits `update` for `group` as `submit` does, in `class`.
@@ -525,7 +552,7 @@ impl<F: BlockFile + 'static> Log<F> {
         class: Class,
         update: Update,
     ) -> Result<Pending, LogError> {
-        self.send(group, class, update, false, None)
+        self.send(group, class, update, false, None, true)
     }
 
     /// Submits `update` for `group`, waiting for room in the queue rather than refusing. A
@@ -534,7 +561,7 @@ impl<F: BlockFile + 'static> Log<F> {
     /// order, each told alone, and a fence tells each once, so the wait lasts no longer than the
     /// writer's progress (mantle docs/design/raft-log.md §3).
     pub fn submit_waiting(&self, group: u128, update: Update) -> Result<Pending, LogError> {
-        self.send(group, Class::Normal, update, true, None)
+        self.send(group, Class::Normal, update, true, None, true)
     }
 
     /// Submits `update` for `group` as `submit_waiting` does, in `class`.
@@ -544,7 +571,7 @@ impl<F: BlockFile + 'static> Log<F> {
         class: Class,
         update: Update,
     ) -> Result<Pending, LogError> {
-        self.send(group, class, update, true, None)
+        self.send(group, class, update, true, None, true)
     }
 
     /// Submits `update` for `group` in `class` as `submit_waiting` does, and wakes `waker` once
@@ -558,9 +585,11 @@ impl<F: BlockFile + 'static> Log<F> {
         update: Update,
         waker: Waker,
     ) -> Result<Pending, LogError> {
-        self.send(group, class, update, true, Some(waker))
+        self.send(group, class, update, true, Some(waker), true)
     }
 
+    /// Sends `update` to the owner; with `admit`, the caller is told once it is admitted or
+    /// refused, and waits for that here.
     fn send(
         &self,
         group: u128,
@@ -568,6 +597,7 @@ impl<F: BlockFile + 'static> Log<F> {
         update: Update,
         wait: bool,
         waker: Option<Waker>,
+        admit: bool,
     ) -> Result<Pending, LogError> {
         // Refused before it holds any room: no frame could take it, and every admitted
         // submission fits the byte bound alone, so none waits for a queue that cannot hold it.
@@ -587,6 +617,9 @@ impl<F: BlockFile + 'static> Log<F> {
             class,
             tags: writer::Tags::default(),
             ticket: Ticket::new(reply, waker),
+            admit,
+            handle: false,
+            lens: (0, 0),
         };
         let message = Message::Submit { submission, wait };
         let sent = if wait {
@@ -598,7 +631,9 @@ impl<F: BlockFile + 'static> Log<F> {
             })
         };
         sent?;
-        waiting.admitted()?;
+        if admit {
+            waiting.admitted()?;
+        }
         Ok(Pending(waiting))
     }
 
@@ -747,14 +782,36 @@ impl<F: BlockFile + 'static> Log<F> {
     }
 
     /// Submits `update` and waits until it is durable; refused at once when the queue is
-    /// full.
+    /// full. The caller hears only the answer, a refusal included, and is not woken for the
+    /// admission between.
     pub fn write(&self, group: u128, update: Update) -> Result<(), LogError> {
-        self.submit(group, update)?.wait()
+        self.send(group, Class::Normal, update, false, None, false)?
+            .wait()
     }
 
-    /// Submits `update`, waiting for room, and waits until it is durable.
+    /// Submits `update`, waiting for room, and waits until it is durable, hearing only the
+    /// answer.
     pub fn write_waiting(&self, group: u128, update: Update) -> Result<(), LogError> {
-        self.submit_waiting(group, update)?.wait()
+        self.send(group, Class::Normal, update, true, None, false)?
+            .wait()
+    }
+
+    /// The handle through which `group` is written and read from here on (`group.rs`): the log
+    /// refuses the group's submissions from anyone else, [`LogError::Claimed`], until the handle
+    /// is dropped. Refused `Claimed` while another handle holds it, `Damaged` for a group whose
+    /// records are damaged, and `TooManyGroups` past the log's bound on groups.
+    pub fn group(&self, group: u128) -> Result<GroupLog<F>, LogError> {
+        let (reply, answer) = ticket::port();
+        let waiting = Waiting::new(answer);
+        self.inbox
+            .send(Message::Claim(group, Ticket::new(reply, None)))
+            .map_err(|_| LogError::Closed)?;
+        match waiting.wait()? {
+            Answer::Claimed(mirror) => {
+                Ok(GroupLog::new(self.inbox.clone(), self.p, group, *mirror))
+            }
+            _ => Err(LogError::Closed),
+        }
     }
 
     /// The groups the log holds.
@@ -867,9 +924,9 @@ impl<F: BlockFile + 'static> Log<F> {
         matches!(self.ask(Query::Fenced), Ok(Answer::Fenced(true)))
     }
 
-    /// Runs `look` on the log's file, on the device thread, between the log's own I/O, and
-    /// returns what it returns: how a simulation reaches the device the log owns, to arm a
-    /// fault or read its counts.
+    /// Runs `look` on the log's file, on the thread that holds the device, between the log's own
+    /// I/O, and returns what it returns: how a simulation reaches the device the log owns, to arm
+    /// a fault or read its counts.
     pub fn with_file<R: Send + 'static>(
         &self,
         look: impl FnOnce(&F) -> R + Send + 'static,
@@ -890,15 +947,23 @@ impl<F: BlockFile + 'static> Log<F> {
     }
 
     fn stop(&mut self) -> Option<F> {
-        let owner = self.owner.take()?;
+        if self.threads.iter().all(Option::is_none) {
+            return None;
+        }
         let _ = self.inbox.send(Message::Close);
-        owner.join().ok().flatten()
+        let mut file = None;
+        for thread in &mut self.threads {
+            if let Some(Ok(Some(f))) = thread.take().map(JoinHandle::join) {
+                file = Some(f);
+            }
+        }
+        file
     }
 }
 
 impl<F: BlockFile + 'static> Drop for Log<F> {
     fn drop(&mut self) {
-        // The owner answers what it took, then ends with the device thread.
+        // The owner answers what it took, then the log's threads end.
         let _ = self.stop();
     }
 }

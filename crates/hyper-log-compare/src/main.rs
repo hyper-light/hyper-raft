@@ -4,6 +4,8 @@
 //! ```text
 //! hyper-log-compare one <hyper|focal> <dir> <entry bytes> <replicas> <seconds> [count]
 //! hyper-log-compare table <dir> <rounds> <seconds> <mantle binary> [sizes] [replicas]
+//! hyper-log-compare replica <hyper|mantle>
+//! hyper-log-compare replicas <rounds>
 //! ```
 //!
 //! The workload is mantle's `mantle bench log` (mantle `crates/mantle/src/bench_log.rs` at
@@ -42,6 +44,7 @@
 
 mod focal;
 mod hyper;
+mod replica;
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -311,11 +314,79 @@ fn table(args: &[String]) {
     }
 }
 
+/// One run of the replica's path in this process, printed as one line.
+fn replica_one(log: &str) {
+    let run = match log {
+        "hyper" => replica::run::<replica::hyper::Store>(),
+        "mantle" => replica::run::<replica::mantle::Store>(),
+        other => panic!("no log named {other}"),
+    };
+    println!("{}", run.line());
+}
+
+/// `rounds` runs of the replica's path for each log, each in a fresh process, the logs
+/// alternated: the median and range of each column.
+fn replicas(args: &[String]) {
+    let rounds: usize = args[0].parse().unwrap();
+    let logs = ["mantle", "hyper"];
+    let mut runs: Vec<Vec<replica::Run>> = vec![Vec::new(); logs.len()];
+    for round in 0..rounds {
+        for k in 0..logs.len() {
+            let at = (k + round) % logs.len();
+            let me = std::env::current_exe().unwrap();
+            let out = Command::new(me)
+                .args(["replica", logs[at]])
+                .output()
+                .unwrap();
+            let text = String::from_utf8_lossy(&out.stdout);
+            let run = replica::Run::parse(text.lines().last().unwrap_or("")).unwrap_or_else(|| {
+                panic!(
+                    "{} printed {text} {}",
+                    logs[at],
+                    String::from_utf8_lossy(&out.stderr)
+                )
+            });
+            eprintln!("{} {}", logs[at], run.line());
+            runs[at].push(run);
+        }
+    }
+    println!(
+        "| log | wall µs a committed entry, median (least–most) | writes | views | terms | fetches | reads another thread answered | allocations | reallocations | context switches |"
+    );
+    println!("|---|---|---|---|---|---|---|---|---|---|");
+    for (at, log) in logs.iter().enumerate() {
+        let r = &runs[at];
+        let mut wall: Vec<f64> = r.iter().map(|x| x.wall_ns / 1e3).collect();
+        let (least, most) = wall
+            .iter()
+            .fold((f64::MAX, f64::MIN), |(a, b), &v| (a.min(v), b.max(v)));
+        let col = |f: &dyn Fn(&replica::Run) -> f64| {
+            let mut v: Vec<f64> = r.iter().map(f).collect();
+            median(&mut v)
+        };
+        let calls: Vec<f64> = (0..5).map(|i| col(&|x| x.calls[i])).collect();
+        let allocations = col(&|x| x.allocations);
+        let reallocations = col(&|x| x.reallocations);
+        let switches = col(&|x| x.switches);
+        println!(
+            "| {log} | {:.0} ({least:.0}–{most:.0}) | {:.2} | {:.2} | {:.2} | {:.2} | {:.2} | {allocations:.1} | {reallocations:.1} | {switches:.1} |",
+            median(&mut wall),
+            calls[0],
+            calls[1],
+            calls[2],
+            calls[3],
+            calls[4],
+        );
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("one") => one(&args[1..]),
         Some("table") => table(&args[1..]),
+        Some("replica") => replica_one(&args[1]),
+        Some("replicas") => replicas(&args[1..]),
         _ => panic!("hyper-log-compare one|table ..."),
     }
 }

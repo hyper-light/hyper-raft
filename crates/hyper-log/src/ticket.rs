@@ -17,7 +17,8 @@ use std::cell::{Cell, RefCell};
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, sync_channel};
 use std::task::Waker;
 
-use crate::{Fetched, LogError, View};
+use crate::group::Mirror;
+use crate::{Entry, Fetched, LogError, View};
 
 /// Replies one ticket carries at most: its admission, for a submission, and its answer.
 const REPLIES: usize = 2;
@@ -32,8 +33,11 @@ pub(crate) enum Reply {
 
 /// What a call is answered.
 pub(crate) enum Answer {
-    /// A submission is durable.
-    Durable,
+    /// A submission is durable: a handle's write has its entries back, the log having written
+    /// them; any other has none.
+    Durable(Vec<Entry>),
+    /// A group's handle: its state as the log holds it.
+    Claimed(Box<Mirror>),
     Groups(Vec<u128>),
     View(Option<View>),
     Term(u64),
@@ -79,6 +83,15 @@ impl Ticket {
         Self {
             reply: Some(reply),
             waker,
+        }
+    }
+
+    /// The ticket, leaving one already answered in its place: the answer is someone else's to
+    /// give now.
+    pub(crate) fn take(&mut self) -> Self {
+        Self {
+            reply: self.reply.take(),
+            waker: self.waker.take(),
         }
     }
 
@@ -222,7 +235,7 @@ impl Pending {
 
 fn durable(answer: Answer) -> Result<(), LogError> {
     match answer {
-        Answer::Durable => Ok(()),
+        Answer::Durable(_) => Ok(()),
         _ => Err(LogError::Closed),
     }
 }

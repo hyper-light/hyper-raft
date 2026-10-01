@@ -10,19 +10,18 @@ use rustls::client::WebPkiServerVerifier;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use thiserror::Error;
 
-use crate::BloomTokenLog;
 use crate::crypto::rustls::{QuicServerConfig, configured_provider};
 use crate::{
     DEFAULT_SUPPORTED_VERSIONS, Duration, MAX_CID_SIZE, RandomConnectionIdGenerator, SystemTime,
-    TokenLog, TokenMemoryCache, TokenStore, VarInt, VarIntBoundsExceeded,
+    VarInt, VarIntBoundsExceeded,
     cid_generator::{ConnectionIdGenerator, HashedConnectionIdGenerator},
     crypto::{self, HandshakeTokenKey},
     shared::ConnectionId,
 };
 
 mod transport;
-pub use transport::{QlogConfig, QlogError};
 pub use transport::{AckFrequencyConfig, IdleTimeout, MtuDiscoveryConfig, TransportConfig};
+pub use transport::{QlogConfig, QlogError};
 
 /// Global configuration for the endpoint, affecting all connections
 ///
@@ -469,7 +468,6 @@ impl fmt::Debug for ServerConfig {
 #[derive(Clone)]
 pub struct ValidationTokenConfig {
     pub(crate) lifetime: Duration,
-    pub(crate) log: Arc<dyn TokenLog>,
     pub(crate) sent: u32,
 }
 
@@ -484,26 +482,11 @@ impl ValidationTokenConfig {
         self
     }
 
-    #[allow(rustdoc::redundant_explicit_links)] // which links are redundant depends on features
-    /// Set a custom [`TokenLog`]
-    ///
-    /// If the `bloom` feature is enabled (which it is by default), defaults to a default
-    /// [`BloomTokenLog`][crate::BloomTokenLog], which is suitable for most internet applications.
-    ///
-    /// If the `bloom` feature is disabled, defaults to [`NoneTokenLog`][crate::NoneTokenLog],
-    /// which makes the server ignore all address validation tokens (that is, tokens originating
-    /// from NEW_TOKEN frames--retry tokens are not affected).
-    pub fn log(&mut self, log: Arc<dyn TokenLog>) -> &mut Self {
-        self.log = log;
-        self
-    }
-
     /// Number of address validation tokens sent to a client when its path is validated
     ///
     /// This refers only to tokens sent in NEW_TOKEN frames, in contrast to retry tokens.
     ///
-    /// If the `bloom` feature is enabled (which it is by default), defaults to 2. Otherwise,
-    /// defaults to 0.
+    /// Defaults to 2.
     pub fn sent(&mut self, value: u32) -> &mut Self {
         self.sent = value;
         self
@@ -512,10 +495,8 @@ impl ValidationTokenConfig {
 
 impl Default for ValidationTokenConfig {
     fn default() -> Self {
-        let log = Arc::new(BloomTokenLog::default());
         Self {
             lifetime: Duration::from_secs(2 * 7 * 24 * 60 * 60),
-            log,
             sent: 2,
         }
     }
@@ -544,7 +525,6 @@ pub struct ClientConfig {
     pub(crate) crypto: Arc<dyn crypto::ClientConfig>,
 
     /// Validation token store to use
-    pub(crate) token_store: Arc<dyn TokenStore>,
 
     /// Provider that populates the destination connection ID of Initial Packets
     pub(crate) initial_dst_cid_provider: Arc<dyn Fn() -> ConnectionId + Send + Sync>,
@@ -559,7 +539,6 @@ impl ClientConfig {
         Self {
             transport: Default::default(),
             crypto,
-            token_store: Arc::new(TokenMemoryCache::default()),
             initial_dst_cid_provider: Arc::new(|| {
                 RandomConnectionIdGenerator::new(MAX_CID_SIZE).generate_cid()
             }),
@@ -589,14 +568,6 @@ impl ClientConfig {
         self
     }
 
-    /// Set a custom [`TokenStore`]
-    ///
-    /// Defaults to [`TokenMemoryCache`], which is suitable for most internet applications.
-    pub fn token_store(&mut self, store: Arc<dyn TokenStore>) -> &mut Self {
-        self.token_store = store;
-        self
-    }
-
     /// Set the QUIC version to use
     pub fn version(&mut self, version: u32) -> &mut Self {
         self.version = version;
@@ -620,7 +591,6 @@ impl fmt::Debug for ClientConfig {
         fmt.debug_struct("ClientConfig")
             .field("transport", &self.transport)
             // crypto not debug
-            // token_store not debug
             .field("version", &self.version)
             .finish_non_exhaustive()
     }

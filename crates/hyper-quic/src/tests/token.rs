@@ -182,30 +182,30 @@ fn use_token_then_retry() {
 #[test]
 fn use_same_token_twice() {
     #[derive(Default)]
-    struct EvilTokenStore(Mutex<Bytes>);
+    struct EvilTokenStore(Bytes);
 
     impl TokenStore for EvilTokenStore {
-        fn insert(&self, _server_name: &str, token: Bytes) {
-            let mut lock = self.0.lock().unwrap();
-            if lock.is_empty() {
-                *lock = token;
+        fn insert(&mut self, _server_name: &str, token: Bytes) {
+            if self.0.is_empty() {
+                self.0 = token;
             }
         }
 
-        fn take(&self, _server_name: &str) -> Option<Bytes> {
-            let lock = self.0.lock().unwrap();
-            if lock.is_empty() {
+        fn take(&mut self, _server_name: &str) -> Option<Bytes> {
+            if self.0.is_empty() {
                 None
             } else {
-                Some(lock.clone())
+                Some(self.0.clone())
             }
         }
     }
 
     let _guard = subscribe();
     let mut pair = Pair::default();
-    let mut client_config = client_config();
-    client_config.token_store(Arc::new(EvilTokenStore::default()));
+    let client_config = client_config();
+    pair.client
+        .endpoint
+        .set_token_store(Box::new(EvilTokenStore::default()));
     let (client_ch, _server_ch) = pair.connect_with(client_config.clone());
     pair.client
         .connections

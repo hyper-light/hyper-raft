@@ -20,10 +20,8 @@ use tracing::info;
 
 use super::*;
 use crate::{
-    Duration, Instant,
-    cid_generator::{RandomConnectionIdGenerator},
-    crypto::rustls::QuicServerConfig,
-    frame::FrameStruct,
+    Duration, Instant, cid_generator::RandomConnectionIdGenerator,
+    crypto::rustls::QuicServerConfig, frame::FrameStruct,
     transport_parameters::TransportParameters,
 };
 mod util;
@@ -146,7 +144,7 @@ fn version_negotiate_client() {
     let server_addr = "[::2]:7890".parse().unwrap();
     // Configure client to use empty CIDs so we can easily hardcode a server version negotiation
     // packet
-        let mut client = Endpoint::new(
+    let mut client = Endpoint::new(
         EndpointConfig {
             cid_generator: Box::new(RandomConnectionIdGenerator::new(0)),
             ..Default::default()
@@ -156,7 +154,13 @@ fn version_negotiate_client() {
         None,
     );
     let (_, mut client_ch) = client
-        .connect(Instant::now(), client_config(), server_addr, "localhost", None)
+        .connect(
+            Instant::now(),
+            client_config(),
+            server_addr,
+            "localhost",
+            None,
+        )
         .unwrap();
     let now = Instant::now();
     let mut buf = Vec::with_capacity(client.config().get_max_udp_payload_size() as usize);
@@ -1874,7 +1878,7 @@ fn implicit_open() {
 #[test]
 fn zero_length_cid() {
     let _guard = subscribe();
-        let mut pair = Pair::new(
+    let mut pair = Pair::new(
         EndpointConfig {
             cid_generator: Box::new(RandomConnectionIdGenerator::new(0)),
             ..EndpointConfig::default()
@@ -2960,10 +2964,8 @@ fn connect_runs_mtud_again_after_600_seconds() {
 
     // Note: we use an infinite idle timeout to ensure we can wait 600 seconds without the
     // connection closing
-    server_config.transport
-        .max_idle_timeout(None);
-    client_config.transport
-        .max_idle_timeout(None);
+    server_config.transport.max_idle_timeout(None);
+    client_config.transport.max_idle_timeout(None);
 
     let mut pair = Pair::new(Default::default(), server_config);
     pair.mtu = 1400;
@@ -3279,7 +3281,8 @@ fn setup_ack_frequency_test(max_ack_delay: Duration) -> (Pair, ConnectionHandle,
     ack_freq_config
         .ack_eliciting_threshold(10u32.into())
         .max_ack_delay(Some(max_ack_delay));
-    client_config.transport
+    client_config
+        .transport
         .ack_frequency_config(Some(ack_freq_config))
         .mtu_discovery_config(None); // To keep traffic cleaner
 

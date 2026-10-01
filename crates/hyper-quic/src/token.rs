@@ -56,7 +56,7 @@ pub trait TokenLog: Send + Sync {
     ///
     /// [2]: https://en.wikipedia.org/wiki/Denial-of-service_attack#Amplification
     fn check_and_insert(
-        &self,
+        &mut self,
         nonce: u128,
         issued: SystemTime,
         lifetime: Duration,
@@ -70,7 +70,12 @@ pub struct TokenReuseError;
 pub struct NoneTokenLog;
 
 impl TokenLog for NoneTokenLog {
-    fn check_and_insert(&self, _: u128, _: SystemTime, _: Duration) -> Result<(), TokenReuseError> {
+    fn check_and_insert(
+        &mut self,
+        _: u128,
+        _: SystemTime,
+        _: Duration,
+    ) -> Result<(), TokenReuseError> {
         Err(TokenReuseError)
     }
 }
@@ -81,7 +86,7 @@ pub trait TokenStore: Send + Sync {
     /// Potentially store a token for later one-time use
     ///
     /// Called when a NEW_TOKEN frame is received from the server.
-    fn insert(&self, server_name: &str, token: Bytes);
+    fn insert(&mut self, server_name: &str, token: Bytes);
 
     /// Try to find and take a token that was stored with the given server name
     ///
@@ -89,15 +94,15 @@ pub trait TokenStore: Send + Sync {
     /// de-anonymize a client's traffic.
     ///
     /// Called when trying to connect to a server. It is always ok for this to return `None`.
-    fn take(&self, server_name: &str) -> Option<Bytes>;
+    fn take(&mut self, server_name: &str) -> Option<Bytes>;
 }
 
 /// Null implementation of [`TokenStore`], which does not store any tokens
 pub struct NoneTokenStore;
 
 impl TokenStore for NoneTokenStore {
-    fn insert(&self, _: &str, _: Bytes) {}
-    fn take(&self, _: &str) -> Option<Bytes> {
+    fn insert(&mut self, _: &str, _: Bytes) {}
+    fn take(&mut self, _: &str) -> Option<Bytes> {
         None
     }
 }
@@ -116,6 +121,7 @@ impl IncomingToken {
     pub(crate) fn from_header(
         header: &InitialHeader,
         server_config: &ServerConfig,
+        log: &mut dyn TokenLog,
         remote_address: SocketAddr,
     ) -> Result<Self, InvalidRetryTokenError> {
         let unvalidated = Self {
@@ -171,9 +177,7 @@ impl IncomingToken {
                 {
                     return Ok(unvalidated);
                 }
-                if server_config
-                    .validation_token
-                    .log
+                if log
                     .check_and_insert(retry.nonce, issued, server_config.validation_token.lifetime)
                     .is_err()
                 {

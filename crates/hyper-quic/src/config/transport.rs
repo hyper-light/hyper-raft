@@ -3,9 +3,7 @@ use std::{fmt, io, time::Instant};
 use qlog::streamer::QlogStreamer;
 
 use crate::QlogStream;
-use crate::{
-    Duration, INITIAL_MTU, MAX_UDP_PAYLOAD, VarInt, VarIntBoundsExceeded, congestion,
-};
+use crate::{Duration, INITIAL_MTU, MAX_UDP_PAYLOAD, VarInt, VarIntBoundsExceeded, congestion};
 
 /// Parameters governing the core QUIC state machine
 ///
@@ -339,7 +337,6 @@ impl TransportConfig {
         self.enable_segmentation_offload = enabled;
         self
     }
-
 }
 
 impl Default for TransportConfig {
@@ -381,7 +378,6 @@ impl Default for TransportConfig {
             congestion: congestion::Congestion::default(),
 
             enable_segmentation_offload: true,
-
         }
     }
 }

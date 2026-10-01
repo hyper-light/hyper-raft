@@ -1,6 +1,6 @@
 use std::{
     cmp,
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{HashMap, VecDeque},
     env,
     io::{self, Write},
     mem,
@@ -567,12 +567,7 @@ pub(super) fn server_config_with_cert(
     cert: CertificateDer<'static>,
     key: PrivateKeyDer<'static>,
 ) -> ServerConfig {
-    let mut config = ServerConfig::with_crypto(Arc::new(server_crypto_with_cert(cert, key)));
-    config
-        .validation_token
-        .sent(2)
-        .log(Arc::new(SimpleTokenLog::default()));
-    config
+    ServerConfig::with_crypto(Arc::new(server_crypto_with_cert(cert, key)))
 }
 
 pub(super) fn server_crypto() -> QuicServerConfig {
@@ -717,22 +712,4 @@ lazy_static! {
     pub static ref CLIENT_PORTS: Mutex<RangeFrom<u16>> = Mutex::new(44433..);
     pub(crate) static ref CERTIFIED_KEY: rcgen::CertifiedKey<rcgen::KeyPair> =
         rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
-}
-
-#[derive(Default)]
-struct SimpleTokenLog(Mutex<HashSet<u128>>);
-
-impl TokenLog for SimpleTokenLog {
-    fn check_and_insert(
-        &self,
-        nonce: u128,
-        _issued: SystemTime,
-        _lifetime: Duration,
-    ) -> Result<(), TokenReuseError> {
-        if self.0.lock().unwrap().insert(nonce) {
-            Ok(())
-        } else {
-            Err(TokenReuseError)
-        }
-    }
 }

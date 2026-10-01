@@ -3,7 +3,6 @@ use std::{
     f64::consts::LN_2,
     hash::{BuildHasher, Hasher},
     mem::{size_of, take},
-    sync::Mutex,
 };
 
 use fastbloom::BloomFilter;
@@ -22,7 +21,7 @@ use crate::{Duration, SystemTime, TokenLog, TokenReuseError, UNIX_EPOCH};
 /// each of the two periods currently non-expired tokens could expire in. As such, turns over
 /// filters as time goes on to avoid bloom filter false positive rate increasing infinitely over
 /// time.
-pub struct BloomTokenLog(Mutex<State>);
+pub struct BloomTokenLog(State);
 
 impl BloomTokenLog {
     /// Construct with an approximate maximum memory usage and expected number of validation token
@@ -41,7 +40,7 @@ impl BloomTokenLog {
     /// between them and divides the allocation budget of `max_bytes` evenly between them. As such,
     /// each bloom filter will contain `max_bytes * 4` bits.
     pub fn new(max_bytes: usize, k_num: u32) -> Self {
-        Self(Mutex::new(State {
+        Self(State {
             config: FilterConfig {
                 filter_max_bytes: max_bytes / 2,
                 k_num,
@@ -49,13 +48,13 @@ impl BloomTokenLog {
             period_1_start: UNIX_EPOCH,
             filter_1: Filter::default(),
             filter_2: Filter::default(),
-        }))
+        })
     }
 }
 
 impl TokenLog for BloomTokenLog {
     fn check_and_insert(
-        &self,
+        &mut self,
         nonce: u128,
         issued: SystemTime,
         lifetime: Duration,
@@ -67,8 +66,7 @@ impl TokenLog for BloomTokenLog {
             return Err(TokenReuseError);
         }
 
-        let mut guard = self.0.lock().unwrap();
-        let state = &mut *guard;
+        let state = &mut self.0;
 
         // calculate how many periods past period 1 the token expires
         let expires_at = issued + lifetime;
@@ -129,7 +127,7 @@ impl Default for BloomTokenLog {
     }
 }
 
-/// Lockable state of [`BloomTokenLog`]
+/// State of [`BloomTokenLog`]
 struct State {
     config: FilterConfig,
     // filter_1 covers tokens that expire in the period starting at period_1_start and extending
@@ -294,7 +292,7 @@ mod test {
             let token = rng.random::<u128>();
             let result = log.check_and_insert(token, issued, lifetime);
             {
-                let filter = &log.0.lock().unwrap().filter_1;
+                let filter = &log.0.filter_1;
                 if let Filter::Set(ref hset) = *filter {
                     assert!(hset.capacity() * size_of::<u64>() <= 800);
                     assert_eq!(hset.len(), i + 1);
@@ -307,7 +305,7 @@ mod test {
         }
 
         assert!(
-            matches!(log.0.get_mut().unwrap().filter_1, Filter::Bloom { .. }),
+            matches!(log.0.filter_1, Filter::Bloom { .. }),
             "didn't bloom"
         );
     }
@@ -315,7 +313,7 @@ mod test {
     #[test]
     fn turn_over() {
         let mut rng = new_rng();
-        let log = BloomTokenLog::new_expected_items(800, 200);
+        let mut log = BloomTokenLog::new_expected_items(800, 200);
         let lifetime = Duration::from_secs(1_000);
         let mut old = Vec::default();
         let mut accepted = 0;
@@ -339,7 +337,7 @@ mod test {
         assert!(accepted > 0);
     }
 
-    fn test_doesnt_panic(log: BloomTokenLog) {
+    fn test_doesnt_panic(mut log: BloomTokenLog) {
         let mut rng = new_rng();
 
         let issued = SystemTime::now();

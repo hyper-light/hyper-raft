@@ -1,6 +1,6 @@
 use std::{fmt, net::SocketAddr};
 
-use bytes::{Buf, BufMut, BytesMut};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 
 use crate::{Instant, MAX_CID_SIZE, ResetToken, coding::BufExt, packet::PartialDecode};
 
@@ -58,6 +58,8 @@ pub(crate) enum EndpointEventInner {
     /// Stop routing connection ID for this sequence number to the connection
     /// When `bool == true`, a new connection ID will be issued to peer
     RetireConnectionId(Instant, u64, bool),
+    /// The server sent an address validation token (NEW_TOKEN) for later connections to it
+    NewToken { server_name: String, token: Bytes },
 }
 
 /// Protocol-level identifier for a connection.

@@ -2,7 +2,7 @@
 
 use std::{
     collections::{HashMap, VecDeque, hash_map},
-    sync::{Arc, Mutex},
+    sync::Arc,
 };
 
 use bytes::Bytes;
@@ -14,26 +14,23 @@ use crate::token::TokenStore;
 /// `TokenStore` implementation that stores up to `N` tokens per server name for up to a
 /// limited number of server names, in-memory
 #[derive(Debug)]
-pub struct TokenMemoryCache(Mutex<State>);
+pub struct TokenMemoryCache(State);
 
 impl TokenMemoryCache {
     /// Construct empty
     pub fn new(max_server_names: u32, max_tokens_per_server: usize) -> Self {
-        Self(Mutex::new(State::new(
-            max_server_names,
-            max_tokens_per_server,
-        )))
+        Self(State::new(max_server_names, max_tokens_per_server))
     }
 }
 
 impl TokenStore for TokenMemoryCache {
-    fn insert(&self, server_name: &str, token: Bytes) {
+    fn insert(&mut self, server_name: &str, token: Bytes) {
         trace!(%server_name, "storing token");
-        self.0.lock().unwrap().store(server_name, token)
+        self.0.store(server_name, token)
     }
 
-    fn take(&self, server_name: &str) -> Option<Bytes> {
-        let token = self.0.lock().unwrap().take(server_name);
+    fn take(&mut self, server_name: &str) -> Option<Bytes> {
+        let token = self.0.take(server_name);
         trace!(%server_name, found=%token.is_some(), "taking token");
         token
     }
@@ -46,7 +43,7 @@ impl Default for TokenMemoryCache {
     }
 }
 
-/// Lockable inner state of `TokenMemoryCache`
+/// Inner state of `TokenMemoryCache`
 #[derive(Debug)]
 struct State {
     max_server_names: u32,
@@ -169,7 +166,7 @@ mod tests {
 
         for _ in 0..10 {
             let mut cache_1: Vec<(u32, VecDeque<Bytes>)> = Vec::new(); // keep it sorted oldest to newest
-            let cache_2 = TokenMemoryCache::new(20, 2);
+            let mut cache_2 = TokenMemoryCache::new(20, 2);
 
             for i in 0..200 {
                 let server_name = rng.random::<u32>() % 10;
@@ -223,7 +220,7 @@ mod tests {
     #[test]
     fn zero_max_server_names() {
         // test that this edge case doesn't panic
-        let cache = TokenMemoryCache::new(0, 2);
+        let mut cache = TokenMemoryCache::new(0, 2);
         for i in 0..10 {
             cache.insert(&i.to_string(), Bytes::from(vec![i]));
             for j in 0..10 {
@@ -235,7 +232,7 @@ mod tests {
     #[test]
     fn zero_queue_length() {
         // test that this edge case doesn't panic
-        let cache = TokenMemoryCache::new(256, 0);
+        let mut cache = TokenMemoryCache::new(256, 0);
         for i in 0..10 {
             cache.insert(&i.to_string(), Bytes::from(vec![i]));
             for j in 0..10 {

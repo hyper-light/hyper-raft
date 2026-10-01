@@ -18,8 +18,9 @@ use thiserror::Error;
 use tracing::{debug, error, trace, warn};
 
 use crate::{
-    Duration, INITIAL_MTU, Instant, MAX_CID_SIZE, MIN_INITIAL_SIZE, RESET_TOKEN_SIZE, ResetToken,
-    QlogStream, Side, Transmit, TransportConfig, TransportError,
+    BloomTokenLog, Duration, INITIAL_MTU, Instant, MAX_CID_SIZE, MIN_INITIAL_SIZE, QlogStream,
+    RESET_TOKEN_SIZE, ResetToken, Side, TokenLog, TokenMemoryCache, TokenStore, Transmit,
+    TransportConfig, TransportError,
     cid_generator::ConnectionIdGenerator,
     coding::BufMutExt,
     config::{ClientConfig, EndpointConfig, ServerConfig},
@@ -56,6 +57,10 @@ pub struct Endpoint {
     /// Buffered Initial and 0-RTT messages for pending incoming connections
     incoming_buffers: Slab<IncomingBuffer>,
     all_incoming_buffers_total_bytes: u64,
+    /// Address validation tokens already presented to this server (RFC 9000 §8.1.4)
+    token_log: Box<dyn TokenLog>,
+    /// Address validation tokens servers gave this client, for its later connections to them
+    token_store: Box<dyn TokenStore>,
 }
 
 impl Endpoint {
@@ -90,7 +95,23 @@ impl Endpoint {
             last_stateless_reset: None,
             incoming_buffers: Slab::new(),
             all_incoming_buffers_total_bytes: 0,
+            token_log: Box::new(BloomTokenLog::default()),
+            token_store: Box::new(TokenMemoryCache::default()),
         }
+    }
+
+    /// Replace the log of address validation tokens presented to this server
+    ///
+    /// Defaults to a [`BloomTokenLog`], which is suitable for most internet applications.
+    pub fn set_token_log(&mut self, log: Box<dyn TokenLog>) {
+        self.token_log = log;
+    }
+
+    /// Replace the store of address validation tokens servers gave this client
+    ///
+    /// Defaults to a [`TokenMemoryCache`], which is suitable for most internet applications.
+    pub fn set_token_store(&mut self, store: Box<dyn TokenStore>) {
+        self.token_store = store;
     }
 
     /// Replace the server configuration, affecting new incoming connections only
@@ -129,6 +150,9 @@ impl Endpoint {
                         return Some(self.send_new_identifiers(now, ch, 1));
                     }
                 }
+            }
+            NewToken { server_name, token } => {
+                self.token_store.insert(&server_name, token);
             }
             Drained => {
                 if let Some(conn) = self.connections.try_remove(ch.0) {
@@ -370,6 +394,7 @@ impl Endpoint {
             .crypto
             .start_session(config.version, server_name, &params)?;
 
+        let token = self.token_store.take(server_name).unwrap_or_default();
         let conn = self.add_connection(
             ch,
             config.version,
@@ -385,7 +410,7 @@ impl Endpoint {
             config.transport,
             qlog,
             SideArgs::Client {
-                token_store: config.token_store,
+                token,
                 server_name: server_name.into(),
             },
         );
@@ -505,7 +530,12 @@ impl Endpoint {
 
         let server_config = self.server_config.as_ref().unwrap().clone();
 
-        let token = match IncomingToken::from_header(&header, &server_config, addresses.remote) {
+        let token = match IncomingToken::from_header(
+            &header,
+            &server_config,
+            &mut *self.token_log,
+            addresses.remote,
+        ) {
             Ok(token) => token,
             Err(InvalidRetryTokenError) => {
                 debug!("rejecting invalid retry token");

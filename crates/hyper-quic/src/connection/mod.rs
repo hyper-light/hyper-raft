@@ -15,9 +15,8 @@ use thiserror::Error;
 use tracing::{debug, error, trace, trace_span, warn};
 
 use crate::{
-    Dir, Duration, Frame, INITIAL_MTU, Instant, MAX_CID_SIZE, MAX_STREAM_COUNT,
-    MIN_INITIAL_SIZE, Side, StreamId, TIMER_GRANULARITY, TokenStore, Transmit, TransportError,
-    TransportErrorCode, VarInt,
+    Dir, Duration, Frame, INITIAL_MTU, Instant, MAX_CID_SIZE, MAX_STREAM_COUNT, MIN_INITIAL_SIZE,
+    Side, StreamId, TIMER_GRANULARITY, Transmit, TransportError, TransportErrorCode, VarInt,
     cid_generator::ConnectionIdGenerator,
     cid_queue::CidQueue,
     coding::BufMutExt,
@@ -944,12 +943,8 @@ impl Connection {
                 .congestion
                 .on_sent(now, buf.len() as u64, last_packet_number);
 
-            self.qlog.emit_recovery_metrics(
-                self.pto_count,
-                &mut self.path,
-                now,
-                self.orig_rem_cid,
-            );
+            self.qlog
+                .emit_recovery_metrics(self.pto_count, &mut self.path, now, self.orig_rem_cid);
         }
 
         self.app_limited = buf.is_empty() && !congestion_blocked;
@@ -1978,13 +1973,8 @@ impl Connection {
             self.spin = self.side.is_client() ^ spin;
         }
 
-        self.qlog.emit_packet_received(
-            packet,
-            space_id,
-            !is_1rtt,
-            now,
-            self.orig_rem_cid,
-        );
+        self.qlog
+            .emit_packet_received(packet, space_id, !is_1rtt, now, self.orig_rem_cid);
     }
 
     fn reset_idle_timeout(&mut self, now: Instant, space: SpaceId) {
@@ -2054,12 +2044,8 @@ impl Connection {
             self.handle_coalesced(now, remote, ecn, data);
         }
 
-        self.qlog.emit_recovery_metrics(
-            self.pto_count,
-            &mut self.path,
-            now,
-            self.orig_rem_cid,
-        );
+        self.qlog
+            .emit_recovery_metrics(self.pto_count, &mut self.path, now, self.orig_rem_cid);
 
         Ok(())
     }
@@ -2963,19 +2949,18 @@ impl Connection {
                     }
                 }
                 Frame::NewToken(NewToken { token }) => {
-                    let ConnectionSide::Client {
-                        token_store,
-                        server_name,
-                        ..
-                    } = &self.side
-                    else {
+                    let ConnectionSide::Client { server_name, .. } = &self.side else {
                         return Err(TransportError::PROTOCOL_VIOLATION("client sent NEW_TOKEN"));
                     };
                     if token.is_empty() {
                         return Err(TransportError::FRAME_ENCODING_ERROR("empty token"));
                     }
                     trace!("got new token");
-                    token_store.insert(server_name, token);
+                    self.endpoint_events
+                        .push_back(EndpointEventInner::NewToken {
+                            server_name: server_name.clone(),
+                            token,
+                        });
                 }
                 Frame::Datagram(datagram) => {
                     if self
@@ -3821,7 +3806,6 @@ enum ConnectionSide {
     Client {
         /// Sent in every outgoing Initial packet. Always empty after Initial keys are discarded
         token: Bytes,
-        token_store: Arc<dyn TokenStore>,
         server_name: String,
     },
     Server {
@@ -3856,14 +3840,7 @@ impl ConnectionSide {
 impl From<SideArgs> for ConnectionSide {
     fn from(side: SideArgs) -> Self {
         match side {
-            SideArgs::Client {
-                token_store,
-                server_name,
-            } => Self::Client {
-                token: token_store.take(&server_name).unwrap_or_default(),
-                token_store,
-                server_name,
-            },
+            SideArgs::Client { token, server_name } => Self::Client { token, server_name },
             SideArgs::Server {
                 server_config,
                 pref_addr_cid: _,
@@ -3876,7 +3853,8 @@ impl From<SideArgs> for ConnectionSide {
 /// Parameters to `Connection::new` specific to it being client-side or server-side
 pub(crate) enum SideArgs {
     Client {
-        token_store: Arc<dyn TokenStore>,
+        /// The address validation token from an earlier connection to this server, if any
+        token: Bytes,
         server_name: String,
     },
     Server {

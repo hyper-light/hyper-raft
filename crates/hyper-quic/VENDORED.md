@@ -48,3 +48,15 @@ Upstream's own tests are the oracle that conformance changed no behaviour.
      `HashedConnectionIdGenerator` now share its hash key, where upstream's factory drew a key per
      endpoint. The key only lets an endpoint cheaply reject CIDs it did not issue, and upstream
      already documents sharing it (`from_key`) to keep CIDs valid across restarts.
+5. **Address-validation tokens have single owners.**
+   - The endpoint owns the server's `TokenLog` (`Endpoint::set_token_log`; default
+     `BloomTokenLog`) and the client's `TokenStore` (`Endpoint::set_token_store`; default
+     `TokenMemoryCache`).
+   - Both traits take `&mut self`, and both default implementations lose their `Mutex`.
+   - `ValidationTokenConfig::log` and `ClientConfig::token_store` are gone.
+   - A client connection that receives NEW_TOKEN reports it as an endpoint event
+     (`EndpointEventInner::NewToken`), and the endpoint stores it. A connection's initial token is
+     taken from the store at `connect`.
+   - Two upstream test helpers were changed to match: `server_config_with_cert` no longer installs
+     a test log, which existed only for builds without `bloom`; `use_same_token_twice` installs its
+     store on the client endpoint.

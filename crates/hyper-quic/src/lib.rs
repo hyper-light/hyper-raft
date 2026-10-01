@@ -52,11 +52,11 @@ pub use connection::qlog::QlogStream;
 pub use rustls;
 
 mod config;
-pub use config::{QlogConfig, QlogError};
 pub use config::{
     AckFrequencyConfig, ClientConfig, ConfigError, EndpointConfig, IdleTimeout, MtuDiscoveryConfig,
     ServerConfig, StdSystemTime, TimeSource, TransportConfig, ValidationTokenConfig,
 };
+pub use config::{QlogConfig, QlogError};
 
 pub mod crypto;
 

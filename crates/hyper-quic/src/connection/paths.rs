@@ -61,9 +61,7 @@ impl PathData {
         now: Instant,
         config: &TransportConfig,
     ) -> Self {
-        let congestion = config
-            .congestion
-            .build(now, config.get_initial_mtu());
+        let congestion = config.congestion.build(now, config.get_initial_mtu());
         Self {
             remote,
             rtt: RttEstimator::new(config.initial_rtt),
@@ -136,9 +134,7 @@ impl PathData {
     /// This is useful when it is known the underlying path has changed.
     pub(super) fn reset(&mut self, now: Instant, config: &TransportConfig) {
         self.rtt = RttEstimator::new(config.initial_rtt);
-        self.congestion = config
-            .congestion
-            .build(now, config.get_initial_mtu());
+        self.congestion = config.congestion.build(now, config.get_initial_mtu());
         self.mtud.reset(config.get_initial_mtu(), config.min_mtu);
         self.pacing = Pacer::new(
             self.rtt.get(),

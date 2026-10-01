@@ -285,3 +285,24 @@ Taken from focal's patch of `crates/focal-raft` `7ab57e0..04a45f6`, after focal 
   unchanged into `Progress::heard_heartbeat`, since `Raft::handle_heartbeat_response` with it was
   over the lint wall's cognitive-complexity threshold (11/10); the harness reads a configuration
   through `Cluster::disk`, since its disks have one owner here.
+
+## The fast track's safety fix
+
+Not a port: this repository's own change, after the ports above. focal found the defect and
+documented the fast track as not safe as built (F42); the design, the literature it cites and the
+evidence are in `docs/raft.md`, "The fast track's election defect, and its fix".
+
+- **First rule** (`Raft::fast_commit`): a member that holds the entry beside its log counts toward a
+  fast quorum only once the leader knows its log holds an entry of the leader's term. Without it, an
+  election committed a second entry at an index that held a committed one (seed 9843 of 40,000 from
+  seed 3,000, reproduced on `e1e292c` before any change; directed test
+  `an_election_never_commits_a_second_entry_at_a_committed_index`).
+- **Second rule** (`Raft::fast_quorum_of_the_term`): a fast quorum counts only where it is one of the
+  voters the leader was elected under and of the one other set of voters a change in its term named;
+  after a change that names a third, none until the next term. Without it, a member counting by the
+  configuration before a change it had not applied was elected and committed a second entry (seeds
+  54104 and 203544, found once the first rule was in; directed test
+  `a_member_that_counts_by_the_configuration_before_commits_no_second_entry`).
+- The fast-track and README notes that it was not safe as built are replaced by the rules.
+- Evidence: 160,000 fast schedules from four base seeds pass; the raft-rs differential, which runs
+  no fast group, is unchanged; allocation counts in `docs/benchmarks.md`.

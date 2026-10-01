@@ -345,7 +345,8 @@ exact for a seed, so a change in them is a change in the code, not noise.
 |---|---|---|---|
 | F43, reads share a round | `1173f20` | identical in every row | identical in every row |
 | F41, a window bounded in bytes | `c548f42` | identical in every row | identical on steady, catchup and fast; transfer +2,048 (3 voters) and +4,096 (5); failover +1,024 and +3,072; snapshot +48 and +80 |
-| F42, heartbeat answers that say where the member is | this commit | identical in every row | identical but for snapshot, +24 (3 voters) and +40 (5) |
+| F42, heartbeat answers that say where the member is | `24adbae` | identical in every row | identical but for snapshot, +24 (3 voters) and +40 (5) |
+| The fast track's safety fix | the commit after `24adbae` | identical in every row | identical in every row |
 
 F41's bytes: a member's window holds each message's bytes beside its last index, sixteen bytes a
 slot against eight, and reserves its 128 slots (`Settings::shell`'s window) the first time it
@@ -358,6 +359,27 @@ F42's bytes: each member's progress keeps its stalled ticks, eight bytes more a 
 member that installs a snapshot builds its tracker anew, so the snapshot rows ask 8 bytes more per
 member per snapshot. The workloads deliver every message, so `HeartbeatAnswers::Position` and the
 stall's probe change nothing they count.
+
+The safety fix adds no allocation to any row. The fast workload (one leader, no change of the
+configuration, every message delivered) counts exactly as before: its followers' logs are of the
+leader's term before their first fast vote is counted, and the voters it was elected under are the
+voters in force. The two vectors the leader keeps of its term's voters are filled at an election
+only in a fast group, and keep their capacity from one election to the next.
+
+Time, all four changes together against `e1e292c` (in place, three voters, 10 timed runs each,
+the two builds interleaved run by run, 2026-10-01 near 09:00 PDT, load average 7 to 10; nanoseconds
+per op, median [min–max]):
+
+| Workload | `e1e292c` | after the four | ratio |
+|---|---|---|---|
+| steady b1 64 B | 1,456.6 [1,442.1–1,465.7] | 1,464.7 [1,445.2–1,480.4] | 1.006 |
+| steady b64 64 B | 145.5 [139.7–148.7] | 137.6 [135.1–141.4] | 0.946 |
+| catchup b64 64 B | 34.0 [32.2–35.2] | 34.7 [34.3–36.3] | 1.021 |
+| fast b1 64 B | 2,854.9 [2,826.0–3,054.9] | 2,939.5 [2,889.3–3,228.9] | 1.030 |
+| transfer | 4,385.9 [4,150.5–4,648.0] | 4,478.0 [4,087.9–4,664.7] | 1.021 |
+| failover | 6,535.6 [5,869.4–6,868.3] | 6,467.4 [5,991.9–6,864.1] | 0.990 |
+
+Every range overlaps its pair's; no difference is claimed.
 
 ## Where hyper-raft does not win, and why
 

@@ -237,6 +237,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "hyper-swim"
+version = "0.1.0"
+
+[[package]]
 name = "hyper-timing"
 version = "0.1.0"
 

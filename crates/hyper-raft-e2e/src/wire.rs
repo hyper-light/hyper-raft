@@ -3,13 +3,16 @@
 //! Every datagram is `[crc32c][kind][body]`: the checksum covers the kind and the body and is
 //! verified before anything is read, so a datagram that arrived damaged is dropped whole. A
 //! body is read by [`Reader`], which refuses a length past what is there instead of reading it.
-use std::net::SocketAddr;
+use std::{
+    io,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket},
+};
 
 /// The most bytes one UDP datagram carries over IPv4: 65,535 for the whole IP packet (RFC 791)
 /// less the 20-byte IP header and the 8-byte UDP header (RFC 768).
 pub const MAX_DATAGRAM: usize = 65_507;
 /// The bytes before a datagram's body: the 4-byte checksum and the kind.
-const HEADER: usize = 5;
+pub const HEADER: usize = 5;
 /// The CRC-32C (Castagnoli) polynomial, reflected (RFC 3720 Appendix B.4).
 const CASTAGNOLI: u32 = 0x82f6_3b78;
 
@@ -68,10 +71,78 @@ pub fn begin(buffer: &mut Vec<u8>, kind: Kind) {
     buffer.push(kind.byte());
 }
 
-/// Ends the datagram in `buffer`: its checksum goes in front. False when it is too long to
-/// send in one datagram.
-pub fn seal(buffer: &mut [u8]) -> bool {
-    if buffer.len() > MAX_DATAGRAM {
+/// The most bytes `socket` sends in one datagram. The OS may cap a datagram below what UDP can
+/// say — macOS at `net.inet.udp.maxdgram`, 9,216 bytes by default (udp(4)) — and refuses a send
+/// past the cap, so the cap is found by sending to the socket itself: a binary search between
+/// nothing and [`MAX_DATAGRAM`], at most ⌈log2 MAX_DATAGRAM⌉ = 16 sends. Nothing waits for them
+/// to arrive; each is of a kind no datagram has, and is read back out before the socket serves.
+pub fn largest(socket: &UdpSocket) -> io::Result<usize> {
+    let mut to = socket.local_addr()?;
+    if to.ip().is_unspecified() {
+        to.set_ip(match to.ip() {
+            IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::LOCALHOST),
+            IpAddr::V6(_) => IpAddr::V6(Ipv6Addr::LOCALHOST),
+        });
+    }
+    // Zeros but for a kind no datagram has.
+    let mut buffer = vec![0u8; MAX_DATAGRAM];
+    if let Some(kind) = buffer.get_mut(HEADER.saturating_sub(1)) {
+        *kind = u8::MAX;
+    }
+    let (mut low, mut high) = (0usize, MAX_DATAGRAM);
+    let mut sent = 0usize;
+    while low < high {
+        let size = high
+            .checked_sub(low)
+            .and_then(|span| span.checked_add(1))
+            .map(|span| span / 2)
+            .and_then(|half| low.checked_add(half))
+            .unwrap_or(high);
+        let went = buffer
+            .get(..size)
+            .is_some_and(|datagram| socket.send_to(datagram, to).is_ok());
+        if went {
+            low = size;
+            sent = sent.saturating_add(1);
+        } else {
+            high = size.saturating_sub(1);
+        }
+    }
+    drain(socket, sent, &mut buffer)?;
+    Ok(low)
+}
+
+/// Takes the `sent` probes back out of `socket`, which would otherwise sit ahead of what peers
+/// send. They went before this reads, so they come first, behind only what had already arrived;
+/// a datagram of another's among them is dropped, as the network may drop it.
+fn drain(socket: &UdpSocket, mut sent: usize, buffer: &mut [u8]) -> io::Result<()> {
+    socket.set_nonblocking(true)?;
+    let mut drained = Ok(());
+    while sent > 0 {
+        match socket.recv_from(buffer) {
+            Ok((length, _)) => {
+                if length >= HEADER && buffer.get(HEADER.saturating_sub(1)) == Some(&u8::MAX) {
+                    sent = sent.saturating_sub(1);
+                }
+            }
+            // Windows reports an ICMP port-unreachable for an earlier send on a receive.
+            Err(error) if error.kind() == io::ErrorKind::ConnectionReset => {}
+            // A probe the socket did not keep.
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+            Err(error) => {
+                drained = Err(error);
+                break;
+            }
+        }
+    }
+    socket.set_nonblocking(false)?;
+    drained
+}
+
+/// Ends the datagram in `buffer`: its checksum goes in front. False when it is longer than
+/// `most`, the most the socket sends in one datagram ([`largest`]).
+pub fn seal(buffer: &mut [u8], most: usize) -> bool {
+    if buffer.len() > most.min(MAX_DATAGRAM) {
         return false;
     }
     let crc = crc32c(buffer.get(4..).unwrap_or(&[]));

@@ -58,7 +58,7 @@ fn a_member_behind_its_tick_still_reads_what_arrived() {
     let client = UdpSocket::bind("127.0.0.1:0").unwrap();
     let mut request = Vec::new();
     wire::put_request(&mut request, 7, &Op::Status);
-    assert!(wire::seal(&mut request));
+    assert!(wire::seal(&mut request, wire::MAX_DATAGRAM));
     client.send_to(&request, address).unwrap();
     // The fact the turn below needs: the request is in the member's socket.
     let mut peeked = vec![0u8; wire::MAX_DATAGRAM];

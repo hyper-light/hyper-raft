@@ -21,7 +21,7 @@ fn every_kind_reads_back_as_written() {
         Op::Status,
     ] {
         wire::put_request(&mut buffer, 7, &op);
-        assert!(wire::seal(&mut buffer));
+        assert!(wire::seal(&mut buffer, wire::MAX_DATAGRAM));
         let (kind, body) = wire::open(&buffer).unwrap();
         assert_eq!(kind, Kind::Request);
         assert_eq!(wire::read_request(body), Some((7, op)));
@@ -46,14 +46,14 @@ fn every_kind_reads_back_as_written() {
         Outcome::Done,
     ] {
         wire::put_response(&mut buffer, 8, &outcome);
-        assert!(wire::seal(&mut buffer));
+        assert!(wire::seal(&mut buffer, wire::MAX_DATAGRAM));
         let (_, body) = wire::open(&buffer).unwrap();
         assert_eq!(wire::read_response(body), Some((8, outcome)));
     }
     let peers = Control::Peers(vec![(1, "127.0.0.1:9".parse().unwrap())]);
     for control in [peers, Control::Isolate(true)] {
         wire::put_control(&mut buffer, 9, &control);
-        assert!(wire::seal(&mut buffer));
+        assert!(wire::seal(&mut buffer, wire::MAX_DATAGRAM));
         let (_, body) = wire::open(&buffer).unwrap();
         assert_eq!(wire::read_control(body, 8), Some((9, control)));
     }
@@ -78,7 +78,7 @@ fn a_damaged_datagram_is_dropped_and_a_cut_body_reads_as_nothing() {
             value: b"value",
         },
     );
-    assert!(wire::seal(&mut buffer));
+    assert!(wire::seal(&mut buffer, wire::MAX_DATAGRAM));
     for at in 0..buffer.len() {
         let mut damaged = buffer.clone();
         damaged[at] ^= 0x01;
@@ -99,7 +99,25 @@ fn a_damaged_datagram_is_dropped_and_a_cut_body_reads_as_nothing() {
             .collect(),
     );
     wire::put_control(&mut buffer, 1, &many);
-    assert!(wire::seal(&mut buffer));
+    assert!(wire::seal(&mut buffer, wire::MAX_DATAGRAM));
     let (_, body) = wire::open(&buffer).unwrap();
     assert_eq!(wire::read_control(body, 8), None);
+}
+
+/// The largest datagram found is one the socket sends, and one byte more is one it refuses,
+/// unless it is UDP's own most; a probe datagram is read as nothing.
+#[test]
+fn the_largest_datagram_is_what_the_socket_sends() {
+    let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let to = socket.local_addr().unwrap();
+    let largest = wire::largest(&socket).unwrap();
+    assert!(largest > 0 && largest <= wire::MAX_DATAGRAM, "{largest}");
+    let datagram = vec![0u8; wire::MAX_DATAGRAM];
+    socket.send_to(&datagram[..largest], to).unwrap();
+    if largest < wire::MAX_DATAGRAM {
+        assert!(socket.send_to(&datagram[..largest + 1], to).is_err());
+    }
+    let mut received = vec![0u8; wire::MAX_DATAGRAM];
+    let (length, _) = socket.recv_from(&mut received).unwrap();
+    assert_eq!(wire::open(&received[..length]), None);
 }

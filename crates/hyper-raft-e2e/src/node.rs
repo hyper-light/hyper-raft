@@ -1,6 +1,6 @@
 //! One member as a process: hyper-raft driven over a UDP socket and a [`Wal`], with a key-value
 //! store as its application. One thread does everything: it waits on the socket until the next
-//! tick, steps what arrived, ticks when the tick is due, and drives the member's `Ready`.
+//! tick, steps what arrived, takes every tick that elapsed, and drives the member's `Ready`.
 //!
 //! A write is answered once it is committed and applied, so an answered write is on a majority
 //! of the members' disks; a read is answered by ReadIndex, once the leader has confirmed with a
@@ -24,11 +24,27 @@ use crate::{
     wire::{self, Command, Control, Kind, Op, Outcome, Status},
 };
 
-/// The bytes of a Raft message's fields other than its entries, and the datagram's own header,
-/// with room to spare: thirteen varint fields of at most eleven bytes with their tags (143
-/// bytes; raft-rs `eraftpb.proto`) and the 13-byte header ([`wire`]), rounded up to a power of
-/// two. An append's entries are bounded to a datagram less this.
-const MESSAGE_ROOM: usize = 256;
+/// The bytes of a member's datagram besides an append's entries: the datagram's header and the
+/// sender's id ([`wire`]), and the message record's header, fixed fields and checksum
+/// (`docs/raft.md` §3.1). The core counts an entry at its encoded bytes
+/// ([`hyper_raft::proto::encoded_bytes`]), so entries bounded to the datagram less this fill it.
+const MESSAGE_ROOM: usize = wire::HEADER
+    + 8
+    + hyper_raft::wire::HEADER_BYTES
+    + hyper_raft::wire::MESSAGE_FIXED_BYTES
+    + hyper_raft::wire::CHECKSUM_BYTES;
+/// Ticks in the election timeout: focal's shell's `election_tick` (hyper-raft
+/// tests/support/mod.rs, `Settings::shell`), the member the differential tests hold this core to.
+const ELECTION_TICKS: u32 = 10;
+/// [`ELECTION_TICKS`] as the core's configuration counts it.
+const ELECTION_TICK: usize = ELECTION_TICKS as usize;
+/// Ticks between a leader's heartbeats: focal's shell's `heartbeat_tick`, as above.
+const HEARTBEAT_TICK: usize = 2;
+/// The most ticks one turn takes: the longest election timeout the core draws,
+/// `2 · election_tick` (`set_randomized_election_timeout`). Past it every timer of the core has
+/// fired, so ticks beyond it would replay as a burst of campaigns for one stall, the rule
+/// mantle's replica holds its ticks by.
+const MAX_TURN_TICKS: u32 = 2 * ELECTION_TICKS;
 
 /// Why the member stopped.
 #[derive(Debug)]
@@ -105,6 +121,7 @@ struct Asker {
 struct Reply<'a> {
     socket: &'a UdpSocket,
     sending: &'a mut Vec<u8>,
+    datagram: usize,
 }
 
 impl Reply<'_> {
@@ -127,7 +144,7 @@ impl Reply<'_> {
     }
     fn respond(&mut self, to: SocketAddr, id: u64, outcome: &Outcome) -> Result<(), NodeError> {
         wire::put_response(self.sending, id, outcome);
-        if wire::seal(self.sending) {
+        if wire::seal(self.sending, self.datagram) {
             self.send(to)?;
         }
         Ok(())
@@ -192,18 +209,20 @@ pub struct Node {
     leading: bool,
     received: Vec<u8>,
     sending: Vec<u8>,
+    /// The most bytes the socket sends in one datagram ([`wire::largest`]).
+    datagram: usize,
     command: Vec<u8>,
 }
 
 impl Node {
     /// The member `settings` names, on `socket`, opened on `wal`.
     pub fn open(settings: Settings, socket: UdpSocket, wal: Wal) -> Result<Self, NodeError> {
+        let datagram = wire::largest(&socket)?;
         let max_size_per_msg =
-            u64::try_from(wire::MAX_DATAGRAM.saturating_sub(MESSAGE_ROOM)).unwrap_or(u64::MAX);
+            u64::try_from(datagram.saturating_sub(MESSAGE_ROOM)).unwrap_or(u64::MAX);
         let config = Config {
-            // focal's shell's settings (hyper-raft tests/support/mod.rs, Settings::shell).
-            election_tick: 10,
-            heartbeat_tick: 2,
+            election_tick: ELECTION_TICK,
+            heartbeat_tick: HEARTBEAT_TICK,
             max_size_per_msg,
             check_quorum: true,
             pre_vote: true,
@@ -231,7 +250,8 @@ impl Node {
             confirmed: Vec::new(),
             leading: false,
             received: vec![0; wire::MAX_DATAGRAM],
-            sending: Vec::with_capacity(wire::MAX_DATAGRAM),
+            sending: Vec::with_capacity(datagram),
+            datagram,
             command: Vec::new(),
             settings,
         })
@@ -239,19 +259,28 @@ impl Node {
 
     /// Runs until the deadline, or until the member stops.
     pub fn run(&mut self) -> Result<(), NodeError> {
-        let mut next_tick = Instant::now()
-            .checked_add(self.settings.tick)
-            .unwrap_or(self.settings.deadline);
+        let tick = self.settings.tick;
+        let mut ticked = Instant::now();
         while Instant::now() < self.settings.deadline {
+            let next_tick = ticked.checked_add(tick).unwrap_or(self.settings.deadline);
             self.receive_until(next_tick)?;
             let now = Instant::now();
-            if now >= next_tick {
+            // Every tick that elapsed is taken, not one per wake: the OS ends a timed wait on its
+            // own timer, later than asked (Windows on its 15.6 ms clock interrupt), and a member
+            // that took one tick per wake kept a clock slower than the group's timeouts assume.
+            let elapsed = now.saturating_duration_since(ticked);
+            let due = elapsed.as_nanos().checked_div(tick.as_nanos()).unwrap_or(0);
+            let take = u32::try_from(due).unwrap_or(u32::MAX).min(MAX_TURN_TICKS);
+            for _ in 0..take {
                 heard(self.raw.tick())?;
-                next_tick = next_tick
-                    .checked_add(self.settings.tick)
-                    .unwrap_or(self.settings.deadline)
-                    .max(now);
             }
+            ticked = if u128::from(take) < due {
+                now
+            } else {
+                tick.checked_mul(take)
+                    .and_then(|taken| ticked.checked_add(taken))
+                    .unwrap_or(now)
+            };
             self.drive()?;
         }
         Ok(())
@@ -338,6 +367,7 @@ impl Node {
         Reply {
             socket: &self.socket,
             sending: &mut self.sending,
+            datagram: self.datagram,
         }
     }
     fn respond(&mut self, to: SocketAddr, id: u64, outcome: &Outcome) -> Result<(), NodeError> {
@@ -458,7 +488,7 @@ impl Node {
             wire::begin(&mut self.sending, Kind::Raft);
             wire::put_u64(&mut self.sending, self.settings.id);
             message.encode(&mut self.sending);
-            if !wire::seal(&mut self.sending) {
+            if !wire::seal(&mut self.sending, self.datagram) {
                 // Too long for a datagram: dropped, and Raft sends again.
                 continue;
             }
@@ -518,10 +548,18 @@ impl Node {
             app,
             socket,
             sending,
+            datagram,
             ..
         } = self;
         let entries = raw.store().held(first, last)?;
-        app.apply(entries, &mut Reply { socket, sending })
+        app.apply(
+            entries,
+            &mut Reply {
+                socket,
+                sending,
+                datagram: *datagram,
+            },
+        )
     }
 
     fn confirm(&mut self, index: u64, context: &[u8]) {

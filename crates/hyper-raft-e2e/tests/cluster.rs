@@ -21,6 +21,7 @@
     clippy::arithmetic_side_effects,
     clippy::disallowed_macros,
     clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
     clippy::cognitive_complexity,
     missing_docs
 )]
@@ -63,11 +64,14 @@ const MAX_OPERATIONS: u32 = 1024;
 const MAX_KEYS: usize = 4096;
 const MAX_PENDING: usize = 64;
 const MAX_ENTRIES: usize = 1 << 16;
-/// The flushes the tick is measured from.
-const FSYNC_SAMPLES: usize = 16;
-/// The timed waits the tick is measured from, each asked for the least a member's tick can be.
-const WAKE_SAMPLES: usize = 16;
-const WAKE_ASKED: Duration = Duration::from_millis(1);
+/// The share of a time's distribution its measured bound covers, and the confidence it does: the
+/// 95/95 one-sided tolerance limit (Wilks 1941; the criterion USNRC Regulatory Guide 1.157 holds
+/// best-estimate analyses to). The slowest of n samples bounds the share with that confidence
+/// once 1 − COVERAGE^n ≥ CONFIDENCE, so n is derived, not chosen (`tolerance_samples`: 59).
+const COVERAGE: f64 = 0.95;
+const CONFIDENCE: f64 = 0.95;
+/// The least tick a member is given: `--tick-ms` counts whole milliseconds.
+const LEAST_TICK: Duration = Duration::from_millis(1);
 
 #[expect(
     clippy::disallowed_methods,
@@ -77,28 +81,35 @@ fn remove(path: &Path) {
     let _ = std::fs::remove_file(path);
 }
 
-/// How long a timed wait of `WAKE_ASKED` takes on this machine, at the slowest of `WAKE_SAMPLES`:
-/// a member ticks and a request waits by a socket's timeout, which the OS ends on its own timer,
-/// not at the time asked (Windows wakes on its clock interrupt, every 15.6 ms unless a process
-/// asks for finer: Microsoft, "Timer accuracy", and `timeBeginPeriod`).
-fn measure_wake() -> Duration {
-    let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
-    socket.set_read_timeout(Some(WAKE_ASKED)).unwrap();
-    let mut sink = [0u8; 1];
+/// The samples whose slowest is the 95/95 upper bound of a time (Wilks 1941).
+fn tolerance_samples() -> usize {
+    ((1.0 - CONFIDENCE).ln() / COVERAGE.ln()).ceil() as usize
+}
+
+/// The 95/95 upper bound of `sample`'s time.
+fn bound(mut sample: impl FnMut()) -> Duration {
     let mut slowest = Duration::ZERO;
-    for _ in 0..WAKE_SAMPLES {
+    for _ in 0..tolerance_samples() {
         let started = Instant::now();
-        let _ = socket.recv_from(&mut sink);
+        sample();
         slowest = slowest.max(started.elapsed());
     }
     slowest
 }
 
-/// The tick, from what a flush and a wake cost on this machine. Raft needs the broadcast time —
-/// a round trip and a flush of the log — well below the election timeout (Ongaro and Ousterhout
-/// 2014, §5.6); a round trip here is a member woken at each end. A tick of twice the slowest
-/// flush of a 4 KiB write (of `FSYNC_SAMPLES`) and the slowest wake puts the election timeout at
-/// twenty broadcasts or more, and a heartbeat at four.
+/// The tick, from what this machine's flushes, datagrams and timer cost.
+///
+/// - The broadcast time — what one replication takes — is the leader's flush, a datagram to the
+///   follower, the follower's flush and a datagram back, in series, each of the most a message
+///   carries: the member flushes before it
+///   acts on a `Ready`. Raft needs the election timeout an order of magnitude above it (Ongaro
+///   and Ousterhout 2014, §5.6), and the election timeout is `ELECTION_TICKS` ticks, so a tick
+///   is at least one broadcast time.
+/// - A member ticks on a socket timeout, which the OS ends on its own timer, not when asked
+///   (Windows on its clock interrupt, 15.6 ms unless a process asks for finer: Microsoft,
+///   `timeBeginPeriod`). The leader's heartbeat goes out on a tick, so a tick finer than the
+///   timer keeps is a heartbeat interval the leader cannot keep: a tick is at least the bound of
+///   a wait asked for `LEAST_TICK`.
 fn measure_tick() -> Duration {
     let path = PathBuf::from(TMP).join(format!("e2e-{}-probe", std::process::id()));
     let mut file = OpenOptions::new()
@@ -106,18 +117,30 @@ fn measure_tick() -> Duration {
         .append(true)
         .open(&path)
         .unwrap();
-    let block = vec![0x5au8; 4096];
-    let mut slowest = Duration::ZERO;
-    for _ in 0..FSYNC_SAMPLES {
-        let started = Instant::now();
+    // The most one message carries, and so the most one flush appends for it: the member caps a
+    // message's entries at what a datagram holds.
+    let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let block = vec![0x5au8; wire::largest(&socket).unwrap()];
+    let flush = bound(|| {
         file.write_all(&block).unwrap();
         file.sync_data().unwrap();
-        slowest = slowest.max(started.elapsed());
-    }
+    });
     drop(file);
     remove(&path);
-    let tick = ((slowest + measure_wake()) * 2).max(Duration::from_millis(1));
-    Duration::from_millis(tick.as_millis().try_into().unwrap())
+    let to = socket.local_addr().unwrap();
+    let mut received = vec![0u8; wire::MAX_DATAGRAM];
+    let datagram = bound(|| {
+        socket.send_to(&block, to).unwrap();
+        socket.recv_from(&mut received).unwrap();
+    });
+    socket.set_read_timeout(Some(LEAST_TICK)).unwrap();
+    let wake = bound(|| {
+        let _ = socket.recv_from(&mut received);
+    });
+    let broadcast = (flush + datagram) * 2;
+    let tick = broadcast.max(wake).max(LEAST_TICK);
+    // Whole milliseconds, rounded up: `--tick-ms`'s unit.
+    Duration::from_millis(tick.as_micros().div_ceil(1000).try_into().unwrap())
 }
 
 struct Member {
@@ -132,6 +155,8 @@ struct Cluster {
     tick: Duration,
     deadline: Duration,
     test: UdpSocket,
+    /// The most bytes the test's socket sends in one datagram ([`wire::largest`]).
+    datagram: usize,
     next_id: u64,
     buffer: Vec<u8>,
 }
@@ -201,12 +226,14 @@ impl Cluster {
             });
         }
         let test = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let datagram = wire::largest(&test).unwrap();
         let mut cluster = Self {
             name,
             members,
             tick,
             deadline,
             test,
+            datagram,
             next_id: 0,
             buffer: Vec::new(),
         };
@@ -224,7 +251,7 @@ impl Cluster {
     }
     /// Sends `buffer` to member `id` and waits for the answer to `request`.
     fn ask(&mut self, id: u64, request: u64) -> Option<Outcome> {
-        if !wire::seal(&mut self.buffer) {
+        if !wire::seal(&mut self.buffer, self.datagram) {
             panic!("a request too long for a datagram");
         }
         let address = self.address(id);
@@ -591,7 +618,7 @@ fn leader_killed(tick: Duration) -> String {
                 value: value.as_bytes(),
             },
         );
-        assert!(wire::seal(&mut cluster.buffer));
+        assert!(wire::seal(&mut cluster.buffer, cluster.datagram));
         let address = cluster.address(old);
         cluster.test.send_to(&cluster.buffer, address).unwrap();
         history.unknown.insert(key.into_bytes(), value.into_bytes());
@@ -758,8 +785,9 @@ fn main() -> ExitCode {
     let mut out = std::io::stdout().lock();
     writeln!(
         out,
-        "tick {} ms (twice the slowest of {FSYNC_SAMPLES} flushes and of {WAKE_SAMPLES} wakes)",
-        tick.as_millis()
+        "tick {} ms (the 95/95 bounds of a broadcast and a timed wait, {} samples each)",
+        tick.as_millis(),
+        tolerance_samples()
     )
     .unwrap();
     drop(out);

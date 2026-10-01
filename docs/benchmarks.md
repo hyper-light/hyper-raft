@@ -457,12 +457,18 @@ entry's encoded length" item above is closed by R-2.
 
 `crates/hyper-raft-e2e` runs each member as a process (`hyper-raft-node`) on a UDP socket on the
 loopback interface, with a log file it flushes with the platform's full flush before a `Ready` is
-acted on (`F_FULLFSYNC` on macOS), driven in place. `tests/cluster.rs` measures the tick first:
-twice the slowest of 16 flushes of 4 KiB plus the slowest of 16 timed waits asked for 1 ms, so
-that the election timeout (ten ticks or more) is far above the broadcast time (Ongaro and
-Ousterhout 2014, §5.6). The wait counts because a member ticks and a request waits on a socket
-timeout, which the OS ends on its own timer: on windows-2025 the flushes alone gave a 1 ms tick
-that Windows' 15.6 ms clock interrupt could not keep, and `commits-5` spent its budget in 2.5 s. On this machine the tick came out at
+acted on (`F_FULLFSYNC` on macOS), driven in place. `tests/cluster.rs` measures the tick first, from the 95/95 one-sided
+tolerance bound (Wilks 1941: the slowest of 59 samples) of three times: a flush of the largest
+message a member sends, a loopback round trip of that message, and a socket wait asked for 1 ms.
+A tick is at least one broadcast time — two flushes and two datagrams in series, leader then
+follower — so the election timeout (ten ticks) is an order of magnitude above it (Ongaro and
+Ousterhout 2014, §5.6); and at least the wait, since the leader's heartbeat goes out on a tick the
+OS timer must keep (Windows ends a timed wait on its 15.6 ms clock interrupt). A member takes every
+tick that elapsed when it wakes, at most `2 · election_tick`, so its Raft clock keeps wall time
+however late the OS wakes it; an earlier member took one tick per wake, and on windows-2025 a 1 ms
+tick ran its elections about fifteen times slower than their budget. The largest datagram is
+measured on each socket (macOS caps a send at 9,216 bytes by default), and an append's entries are
+bounded to it less the message's fixed bytes. On this machine the tick came out at
 10 to 52 ms across runs.
 
 Scenarios and what they assert, with one run's output (2026-10-01):

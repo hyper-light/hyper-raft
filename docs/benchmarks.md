@@ -426,6 +426,33 @@ slates with its publication is slower than every other row by orders of magnitud
 (293,618 ns per entry on three voters): its durability copies the whole log after every
 transition, where hyper-raft's owner writes each entry once, in place.
 
+## The message's layout
+
+R-2 (`docs/raft.md` §3.1) made the message hyper-raft's own type, so its layout is hyper-raft's to
+choose. The snapshot a message may carry was held inline, as raft-proto held it: 144 of the
+message's 280 bytes, in every heartbeat, vote and append, though only a snapshot message fills it.
+It is now boxed (`Message::snapshot: Option<Box<Snapshot>>`): a message is 144 bytes, and a
+snapshot message makes one allocation more, for a box of 144 bytes beside the image it already
+carries.
+
+`hyper-raft-compare one hyper <workload> 3 1 64 20000 1000 count`, before (R-2, `d472677`) and
+after, per operation; the same machine and day, 2026-10-01 around 11:30 PDT, shared:
+
+| Workload | Bytes asked before | after | Allocations before | after |
+|---|---|---|---|---|
+| steady, per entry | 7,064 | 3,800 | 11 | 11 |
+| catch-up, per entry | 143.7 | 139.9 | 1.01 | 1.01 |
+| snapshot, per snapshot | 73,856 | 70,192 | 12 | 13 |
+| transfer, per transfer | 22,824 | 14,120 | 28 | 28 |
+
+slates' core asks 3,368 bytes and makes 51 allocations per entry on the steady workload at batch 1
+(`one slates-core steady 3 1 64 20000 1000 count`): the gap in bytes asked, 7,064 against 3,368
+in the tables above, is now 3,800 against 3,368. The remaining 432 bytes are not yet traced: the
+four-slot first queue (`Outgoing::SMALLEST`) the earlier trace named now asks 576 bytes a ready,
+more than the gap, so it is not the whole account. An entry's bytes for the byte rules are now arithmetic on its lengths
+(`proto::encoded_bytes`), where raft-proto's were prost's `encoded_len`: the "counting each
+entry's encoded length" item above is closed by R-2.
+
 ## End to end
 
 `crates/hyper-raft-e2e` runs each member as a process (`hyper-raft-node`) on a UDP socket on the
@@ -458,6 +485,26 @@ ok all-killed: every member killed after 50 answered writes and restarted on its
 The workspace's tests, these scenarios included, also pass on Linux (aarch64, in Docker on this
 machine, `rust:1.98.0`, `fdatasync` on the VM's file system; the tick came out at 36 ms). They
 have not been run on Windows here; CI runs the gates on all six targets.
+
+A member's loop waits on its socket until its next tick, and when the tick is already due it
+still takes what has arrived before it ticks. On a loaded machine a turn of the loop can outlast
+a tick, so the tick is due at every turn. A member that skipped its socket then kept ticking
+without reading anything: a leader stepped down by its quorum check with its followers' answers
+still unread in its socket, and the scenario stalled on the election that followed. Two runs
+showed this before the fix: one with a parallel build loading the machine (tick 12 ms, load
+average 39), one with the tick forced to 4 ms under the same load. Each leader read nothing for
+100 to 180 ms, about ten ticks fired with nothing read in between, and the answers it had missed
+were the first datagrams it read after stepping down. `node::tests` holds the directed test.
+
+The client waits on facts, with bounds taken from the protocol. A request waits for its answer
+through twice the longest election timeout. One write or read is retried for `WAIT_ELECTIONS`
+elections, each within twice the election timeout, rather than for a fixed number of requests:
+during an election, members that name no leader or a stale one answer at once, and a count of
+requests ran out long before the election ended. When a member names no other leader, the
+client lets a heartbeat interval pass before it asks the next member. `leader-killed` sends its
+in-flight writes to whoever leads at that moment, not to the first leader, because earlier
+writes may have moved the leadership. After the fix the suite passed 100 runs in a row, 50 of
+them under load.
 
 `tests/wal.rs` covers the log's torn-tail cut, its refusal of a damaged record that is not the
 last, and its bound; `tests/wire.rs` covers damaged and cut datagrams. One group at a time runs,
@@ -684,4 +731,243 @@ cargo bench -p hyper-log --bench log -- DIR 1.0
 # The comparison: mantle's binary built at 147f035 in a clone (cargo build --release -p mantle).
 cd crates/hyper-log-compare && cargo build --release
 target/release/hyper-log-compare table DIR 5 1.0 path/to/mantle
+```
+
+# hyper-datagram against slates' seal
+
+The law (`CLAUDE.md` §1a) for the sealed datagram plane: its allocations, reallocations and page
+faults per datagram, and its cost against the plane it replaces, slates' control-datagram seal
+(`slates-transport` `src/seal.rs` at `5cce86a`, unchanged since in slates `main` `bfa7298`).
+
+## The machine
+
+The same Apple M5 Max (`Mac17,6`, 18 cores, 128 GiB), macOS 26.4.1, rustc 1.98.0, 2026-10-01 at
+10:26 PDT. The machine was shared with two other sessions building and testing: the load average
+was 40 to 46 during the runs. The allocation counts are exact whatever the load; the times are
+medians of seven fresh processes, with the least and the most beside them.
+
+## Allocations
+
+`cargo bench -p hyper-datagram --bench allocs`: two planes, one round queuing as many messages as
+a 1,232-byte path packs for each peer, flushing and opening every datagram, 2,000 rounds after 100,
+counted on the calling thread (the plane has no threads).
+
+| Peers | Message | Messages a datagram | Allocations | Reallocations | Bytes asked | Minor faults |
+|---|---|---|---|---|---|---|
+| 1 and 16 | 16 B | 66 | 0 | 0 | 0 | 0 |
+| 1 and 16 | 128 B | 9 | 0 | 0 | 0 | 0 |
+| 1 and 16 | 1,024 B | 1 | 0 | 0 | 0 | 0 |
+| 1 | a datagram 40 counters late, widening the window | 1 | 0 | 0 (was 1, 24 B) | 0 | 0 |
+
+The one cost the first count found was the replay window reallocating its bitmap when a verified
+late datagram widened it, on the receive path. The bitmap is now reserved to the window's limit
+when the epoch is installed (`window_limit / 8` bytes, 128 B at a limit of 1,024), so widening
+never reallocates.
+
+## Against slates
+
+`crates/hyper-datagram-compare`, a workspace of its own. One round is a consensus round's control
+traffic to one peer: as many messages of one size as a 1,232-byte path carries, sealed at one node
+and opened at the other in one thread, with no socket between them, so the cost is the plane's.
+hyper-datagram packs the round into one datagram; slates' seal carries one message a datagram under
+its own envelope (`ControlDatagram::encode_sealed`, `decode_sealed`). The messages are built before
+the clock starts.
+
+slates seals with RustCrypto's `aes-gcm` 0.10.3 (`aes` 0.8.4, `polyval` 0.6.2). On aarch64 both
+use their portable software code unless built with `--cfg aes_armv8 --cfg polyval_armv8`
+(`aes` `src/lib.rs` lines 30 to 36, `polyval` `src/lib.rs` line 37), and slates sets neither
+(`.cargo/config.toml` has only musl flags). The first table is slates as it ships on aarch64; the
+second builds it with the ARMv8 flags, so the difference left is the plane's design.
+
+slates as it builds (7 runs of 20,000 rounds each):
+
+| Message | Plane | Messages a round | Datagrams a round | ns a message | Allocations a message | Wire bytes a message |
+|---|---|---|---|---|---|---|
+| 16 B | hyper | 66 | 1 | 22.0 (21.0–24.7) | 0 | 18.6 |
+| 16 B | slates | 66 | 66 | 3,313.5 (2,643.0–5,852.6) | 5 | 84.0 |
+| 128 B | hyper | 9 | 1 | 86.0 (82.3–90.7) | 0 | 134.6 |
+| 128 B | slates | 9 | 9 | 6,932.7 (3,492.4–8,890.3) | 5 | 196.0 |
+| 1,024 B | hyper | 1 | 1 | 577.3 (552.3–656.2) | 0 | 1,067.0 |
+| 1,024 B | slates | 1 | 1 | 13,638.9 (13,372.7–14,499.6) | 5 | 1,092.0 |
+
+slates with its ARMv8 AES and PMULL code (7 runs of 20,000 rounds each):
+
+| Message | Plane | ns a message | Allocations a message | Wire bytes a message |
+|---|---|---|---|---|
+| 16 B | hyper | 21.6 (21.3–22.4) | 0 | 18.6 |
+| 16 B | slates | 223.0 (210.1–247.8) | 5 | 84.0 |
+| 128 B | hyper | 88.3 (83.8–91.4) | 0 | 134.6 |
+| 128 B | slates | 322.1 (306.7–345.4) | 5 | 196.0 |
+| 1,024 B | hyper | 586.0 (561.6–636.5) | 0 | 1,067.0 |
+| 1,024 B | slates | 1,220.5 (1,151.1–1,380.4) | 5 | 1,092.0 |
+
+With the same hardware crypto, hyper-datagram costs a tenth of slates' per 16-byte message, a
+quarter per 128-byte message and half per 1,024-byte message. Where it comes from:
+- **Packing.** One seal, one tag, one prologue and one checksum serve the whole round: at 16 B,
+  66 messages share 41 bytes of overhead, where slates spends 68 a message on its prologue, counter,
+  envelope and tag.
+- **No allocation.** slates allocates five times a message: the plaintext, the ciphertext, the
+  datagram, and on opening the plaintext and the decoded body. hyper-datagram seals into one
+  reused buffer and opens in place, handing out the messages as slices of the datagram.
+- **One message a datagram**, at 1,024 B, still leaves hyper-datagram at half slates' cost:
+  AWS-LC's AES-GCM in place, against `aes-gcm`'s encrypt and decrypt into new vectors.
+
+The comparison's other differences are recorded, not measured away: slates' opener keeps a
+high-water mark and refuses any datagram that arrives out of order, where hyper-datagram's RFC 4303
+window accepts a verified late datagram once; and slates' keys are not yet tied to a session
+(mantle audit §11.8), where hyper-datagram's come from the QUIC connection's exporter.
+
+## Commands for the plane
+
+```sh
+# The suites and the two-process test.
+cargo test -p hyper-datagram
+
+# Allocations per datagram.
+cargo bench -p hyper-datagram --bench allocs
+
+# The comparison, slates as it builds, then slates with its ARMv8 crypto.
+cd crates/hyper-datagram-compare && cargo build --release
+target/release/hyper-datagram-compare table 7 20000
+RUSTFLAGS="--cfg aes_armv8 --cfg polyval_armv8" cargo build --release --target-dir target/armv8
+target/armv8/release/hyper-datagram-compare table 7 20000
+```
+
+# hyper-swim against slates' detector
+
+The law (`CLAUDE.md` §1a) for the SWIM detector, ported from slates' (`crates/hyper-swim/ORIGIN.md`):
+its allocations, reallocations and page faults a member a period, before and after, and its cost
+against slates' own detector and wire at `5cce86a` (unchanged since in slates `main` `bfa7298`).
+
+## The machine
+
+The same Apple M5 Max, macOS 26.4.1, rustc 1.98.0, 2026-10-01 at 10:39 to 10:41 PDT, shared with
+two other sessions: the load average was 35 to 37. The allocation counts are exact; the times are
+medians of seven fresh processes, with the least and the most beside them.
+
+## The workload
+
+`N` detectors in one process run whole periods as a member's driver does (`tests/cluster.rs`):
+each ticks, sends its probe target a ping carrying up to eight gossip entries, the target applies
+them and answers with an acknowledgement carrying its own gossip and coordinate, and the prober
+applies that, credits the probe and folds the round trip into its Vivaldi coordinate. Every
+message goes through the wire codec. The transmit budget is λ·ln(n+1) for λ = 3 (SWIM §4.4); the
+count starts after twice the periods the joins' gossip takes to drain. Quiet has no membership
+changes; churning has one member refute a suspicion every period, so its new incarnation spreads.
+
+## Allocations
+
+`cargo bench -p hyper-swim --bench allocs`, 400 periods, the calling thread's count (the detector
+has no threads), per member per period:
+
+| Members | Workload | Allocations before | Reallocations before | Allocations after | Reallocations after |
+|---|---|---|---|---|---|
+| 4 | quiet | 6.67 | 8.00 | 0 | 0 |
+| 4 | churning | 12.56 | 8.76 | 0.00 (0.8 B a period) | 0 |
+| 16 | quiet | 6.13 | 8.26 | 0 | 0 |
+| 16 | churning | 12.14 | 10.46 | 0 | 0 |
+| 64 | quiet | 6.03 | 8.12 | 0 | 0 |
+| 64 | churning | 13.37 | 11.91 | 0 | 0 |
+| 256 | quiet | 7.52 | 8.95 | 0 | 0 |
+| 256 | churning | 14.74 | 12.91 | 0.00 (4.5 B a period) | 0 |
+
+The "before" counts were taken on the detector as ported, with a warm-up of 200 periods, which at
+256 members had not yet drained the joins; the "after" counts use the derived warm-up. Minor page
+faults were below 0.003 a member a period throughout. The two churning rows that are not exactly
+zero are a queue growing once, within the first counted periods, to the most reports a member has
+held. What each change removed is in `crates/hyper-swim/ORIGIN.md`, change 4.
+
+## Against slates
+
+`crates/hyper-swim-compare`, a workspace of its own, runs the workload above on both detectors,
+each through its own API (7 runs of 400 periods each):
+
+| Members | Workload | Detector | ns a member a period | Allocations a member a period |
+|---|---|---|---|---|
+| 16 | quiet | hyper | 121 (109–145) | 0 |
+| 16 | quiet | slates | 598 (567–693) | 6.13 |
+| 16 | churning | hyper | 547 (492–618) | 0 |
+| 16 | churning | slates | 1,556 (1,411–1,670) | 12.17 |
+| 64 | quiet | hyper | 179 (161–188) | 0 |
+| 64 | quiet | slates | 920 (787–972) | 6.04 |
+| 64 | churning | hyper | 821 (718–1,521) | 0 |
+| 64 | churning | slates | 3,010 (2,564–6,898) | 13.45 |
+| 256 | quiet | hyper | 448 (330–1,596) | 0 |
+| 256 | quiet | slates | 2,662 (1,606–5,681) | 6.01 |
+| 256 | churning | hyper | 1,639 (1,510–2,009) | 0 |
+| 256 | churning | slates | 5,078 (4,592–6,192) | 14.48 |
+
+hyper-swim's period costs 2.8 to 5.9 times less. Besides the allocations, the quiet period no
+longer scans the membership: slates' tick collected every suspect by walking all members, each
+period, which is what made its quiet cost grow with the membership; hyper-swim's membership
+indexes its suspects. The 256-member quiet period was 768 ns before that index and 374 to 448 ns
+after.
+
+## Commands for the detector
+
+```sh
+# The suites and the four-process kill test.
+cargo test -p hyper-swim
+
+# Allocations a member a period.
+cargo bench -p hyper-swim --bench allocs
+
+# The comparison.
+cd crates/hyper-swim-compare && cargo build --release
+target/release/hyper-swim-compare table 7 400
+```
+
+# hyper-timing against focal-timing and slates' timing
+
+The law (`CLAUDE.md` §1a) for the timing crate (`crates/hyper-timing/ORIGIN.md`): the operations a
+member runs each period of a group, measured against focal-timing at `a8e95f7` (the source of the
+paths, the tick pace and the rounds) and slates' `crates/cluster/src/timing.rs` at `5cce86a` (the
+source of the election timing, the priority and the timer).
+
+## The machine and the workload
+
+The same Apple M5 Max, macOS 26.4.1, rustc 1.98.0, 2026-10-01 at 10:52 PDT, shared with two other
+sessions (load average 17 to 28). `crates/hyper-timing-compare`, a workspace of its own, runs each
+operation two million times in a fresh process of its own, seven runs, the implementations rotated
+each run, and counts allocations over a further two million. A five-voter group, so four paths from
+each member, fed the same eight WAN round trips of 40 to 58 ms; a 10 ms heartbeat.
+
+## Results
+
+Medians (least–most), nanoseconds a call; no implementation allocates in any operation but slates'
+priority, once a call.
+
+| Operation | hyper | focal | slates |
+|---|---|---|---|
+| a sample folded into a path | 29.2 (28.3–30.6) | 0.9 (0.8–1.1) | 2.1 (1.7–2.4) |
+| a path's tail read | 1.2 (0.8–1.2) | 87.5 (82.2–93.0) | 1.2 (0.8–1.3) |
+| the election timing from four paths | 10.9 (10.7–12.0) | — | 10.9 (10.9–11.4) |
+| the quorum priority over four paths | 12.5 (11.8–13.5) | — | 24.8 (24.2–26.3), 1 allocation |
+| the tick pace from four paths | 5.5 (4.1–6.4) | 356.2 (284.5–386.0) | — |
+| a round's budget | 1.0 (0.9–1.2) | 1.1 (0.9–1.2) | 1.0 (0.9–1.1) |
+| a follower's period of the election timer | 1.6 (1.0–1.6) | — | 1.7 (1.0–1.7) |
+
+## Where hyper-timing does not win, and why
+
+A sample costs 29 ns, against focal's 0.9 and slates' 2.1. focal stores the sample and leaves the
+work to every read; slates' path is RFC 9002's smoothed estimator, two multiplies a sample. hyper's
+path is focal's median window, kept because one late answer from a starting or stalled peer must not
+move a group's election timeout (`PathRtt`'s documentation, from focal), and it now does the work of
+the median once a sample instead of three sorts a read. A member samples a path about once a period
+and reads it several times (the election timing, the priority, the tick pace, the round budget), so
+over a period of the four paths hyper spends about 150 ns (four samples and every derivation), focal about 360 ns (four samples, the tick pace and a round) and slates about 45 ns
+for an estimate that one late answer moves.
+
+Before these changes hyper-timing's tail read was focal's (71.7 ns), the election timing 940 ns and
+the priority 1,384 ns: the first measurement of this comparison found them, and the changes are in
+`crates/hyper-timing/ORIGIN.md`, change 7. The first measurement also timed a sample that the
+optimizer had removed, since nothing read the path afterwards; the harness now observes the path
+after every sample.
+
+## Commands for the timing
+
+```sh
+cargo test -p hyper-timing
+cd crates/hyper-timing-compare && cargo build --release
+target/release/hyper-timing-compare table 7 2000000
 ```

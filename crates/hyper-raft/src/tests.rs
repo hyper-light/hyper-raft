@@ -32,7 +32,7 @@ fn drain(node: &mut RawNode<Memory>) -> Vec<Message> {
         let entries = ready.entries().to_vec();
         node.store_mut().append(&entries);
         if let Some(hard) = ready.hard_state() {
-            let hard = hard.clone();
+            let hard = *hard;
             node.store_mut().hard_state = hard;
         }
         messages.extend(ready.take_messages());
@@ -53,7 +53,7 @@ fn drain(node: &mut RawNode<Memory>) -> Vec<Message> {
 }
 fn answer(kind: MessageType, from: u64, to: u64, term: u64) -> Message {
     Message {
-        msg_type: kind as i32,
+        msg_type: kind,
         from,
         to,
         term,
@@ -66,7 +66,7 @@ fn leader_with(config: Config) -> RawNode<Memory> {
     node.campaign().unwrap();
     let asked = drain(&mut node);
     assert!(asked.iter().all(|message| {
-        proto::message_type(message) == Some(MessageType::MsgRequestPreVote) && message.term == 1
+        message.msg_type == MessageType::MsgRequestPreVote && message.term == 1
     }));
     node.step(answer(MessageType::MsgRequestPreVoteResponse, 2, 1, 1))
         .unwrap();
@@ -169,7 +169,7 @@ fn what_a_peer_may_not_say_is_refused_and_changes_nothing() {
                 ..Default::default()
             });
         }
-        sent.snapshot = Some(stated);
+        sent.snapshot = Some(Box::new(stated));
         assert!(matches!(node.step(sent), Err(Error::Violation(_))));
         unchanged(&node, &hard, 3);
     }
@@ -182,14 +182,6 @@ fn what_a_peer_may_not_say_is_refused_and_changes_nothing() {
     append.log_term = 1;
     append.entries = vec![entry(u64::MAX, 1)];
     assert!(matches!(node.step(append), Err(Error::Violation(_))));
-    let unknown = Message {
-        msg_type: 77,
-        from: 1,
-        to: 2,
-        term: 1,
-        ..Message::default()
-    };
-    assert!(matches!(node.step(unknown), Err(Error::Violation(_))));
     unchanged(&node, &hard, 3);
     // The member goes on.
     let mut append = answer(MessageType::MsgAppend, 1, 2, 1);
@@ -340,7 +332,7 @@ fn committed_leader(config: Config) -> RawNode<Memory> {
 fn rounds(messages: &[Message]) -> Vec<(u64, Vec<u8>)> {
     messages
         .iter()
-        .filter(|message| proto::message_type(message) == Some(MessageType::MsgHeartbeat))
+        .filter(|message| message.msg_type == MessageType::MsgHeartbeat)
         .map(|message| (message.to, message.context.clone()))
         .collect()
 }
@@ -475,7 +467,7 @@ fn appends(messages: &[Message], to: u64) -> Vec<(u64, u64)> {
         .iter()
         .filter(|message| {
             message.to == to
-                && proto::message_type(message) == Some(MessageType::MsgAppend)
+                && message.msg_type == MessageType::MsgAppend
                 && !message.entries.is_empty()
         })
         .map(|message| {
@@ -724,7 +716,7 @@ fn a_heartbeats_answer_gives_back_what_the_member_holds_and_nothing_more() {
     let answers = drain(&mut member);
     let said = answers
         .iter()
-        .find(|message| proto::message_type(message) == Some(MessageType::MsgHeartbeatResponse))
+        .find(|message| message.msg_type == MessageType::MsgHeartbeatResponse)
         .unwrap();
     assert_eq!((said.index, said.log_term), (3, 1));
     // Under the rule of raft-rs it says nothing, and a full window gives
@@ -896,37 +888,15 @@ fn one_ready_is_out_at_a_time() {
 #[test]
 fn a_change_that_cannot_be_read_is_not_proposed() {
     let mut node = leader();
-    for change in [
-        ConfChangeV2 {
-            transition: 9,
-            ..Default::default()
-        },
-        ConfChangeV2 {
-            changes: vec![ConfChangeSingle {
-                change_type: 9,
-                node_id: 4,
-            }],
-            ..Default::default()
-        },
-    ] {
-        assert!(matches!(
-            node.propose_conf_change(vec![], &change),
-            Err(Error::Violation(_))
-        ));
-        assert!(matches!(
-            node.apply_conf_change(&change),
-            Err(Error::Violation(_))
-        ));
-    }
     // One that a peer's leader committed all the same is refused where it
     // is applied, and nothing unwinds.
     let garbled = Entry {
-        entry_type: EntryType::EntryConfChangeV2 as i32,
+        entry_type: EntryType::EntryConfChangeV2,
         data: vec![0xff; 3],
         ..Entry::default()
     };
     let mut proposal = Message {
-        msg_type: MessageType::MsgPropose as i32,
+        msg_type: MessageType::MsgPropose,
         from: 2,
         to: 1,
         ..Message::default()
@@ -995,12 +965,9 @@ fn storage_that_fails_stops_no_one_and_is_said() {
     node.step(refusal).unwrap();
     let sent = drain(&mut node);
     assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0].msg_type, MessageType::MsgSnapshot);
     assert_eq!(
-        proto::message_type(&sent[0]),
-        Some(MessageType::MsgSnapshot)
-    );
-    assert_eq!(
-        sent[0].snapshot.as_ref().map(proto::snapshot_index),
+        sent[0].snapshot.as_deref().map(proto::snapshot_index),
         Some(3)
     );
     assert_eq!(crate::raft::held(&node.raft), vec![(4, 1)]);
@@ -1017,10 +984,12 @@ fn one_told_to_campaign_while_it_asks_whether_it_could_does() {
     }
     assert_eq!(node.raft.term(), 1);
     let asked = drain(&mut node);
-    assert!(asked.iter().all(
-        |message| message.msg_type == MessageType::MsgRequestPreVote as i32
-            && message.context.is_empty()
-    ));
+    assert!(
+        asked
+            .iter()
+            .all(|message| message.msg_type == MessageType::MsgRequestPreVote
+                && message.context.is_empty())
+    );
     // The others hear their leader and refuse; the leader hands over.
     node.step(answer(MessageType::MsgTimeoutNow, 1, 2, 1))
         .unwrap();
@@ -1029,7 +998,7 @@ fn one_told_to_campaign_while_it_asks_whether_it_could_does() {
     let asked = drain(&mut node);
     assert_eq!(asked.len(), 2);
     for message in &asked {
-        assert_eq!(message.msg_type, MessageType::MsgRequestVote as i32);
+        assert_eq!(message.msg_type, MessageType::MsgRequestVote);
         assert_eq!(message.term, 2);
         assert_eq!(message.context, proto::CAMPAIGN_TRANSFER);
     }
@@ -1060,19 +1029,20 @@ fn one_told_to_campaign_while_it_asks_whether_it_could_does() {
 
 #[test]
 fn one_told_to_campaign_before_it_applied_a_change_campaigns_once_it_has() {
-    use crate::proto::{ConfChangeType, protocompat::PbMessageExt};
+    use crate::proto::ConfChangeType;
+    use crate::wire::Record;
     let change = ConfChangeV2 {
         changes: vec![ConfChangeSingle {
-            change_type: ConfChangeType::RemoveNode as i32,
+            change_type: ConfChangeType::RemoveNode,
             node_id: 1,
         }],
         ..Default::default()
     };
     let removal = Entry {
-        entry_type: EntryType::EntryConfChangeV2 as i32,
+        entry_type: EntryType::EntryConfChangeV2,
         index: 4,
         term: 1,
-        data: change.write_to_bytes().unwrap(),
+        data: change.encode_to_vec(),
         ..Entry::default()
     };
     let told = |heard: Option<MessageType>| {
@@ -1168,7 +1138,7 @@ fn a_read_asked_by_two_members_under_one_context_answers_both() {
     // The quorum confirms the read once, and each asker is answered.
     let answers: Vec<(u64, u64, Vec<u8>)> = drain(&mut node)
         .into_iter()
-        .filter(|message| proto::message_type(message) == Some(MessageType::MsgReadIndexResp))
+        .filter(|message| message.msg_type == MessageType::MsgReadIndexResp)
         .map(|message| {
             (
                 message.to,

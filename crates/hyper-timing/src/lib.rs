@@ -83,6 +83,15 @@ pub struct PathRtt {
     /// Where the next sample goes.
     next: usize,
     samples: u64,
+    /// The samples the window holds, in order: the first `held` slots. A sample replaces the one
+    /// it evicts by two shifts, so the window is never sorted whole.
+    ordered: [u64; PATH_WINDOW],
+    /// The window's median and median absolute deviation, computed when a sample changes the
+    /// window: a path is read several times a period (the election timing, the priority, the
+    /// round budget) and sampled about once, so each read is a field
+    /// (`docs/benchmarks.md`, "hyper-timing").
+    median: u64,
+    deviation: u64,
 }
 impl PathRtt {
     /// A path with no sample.
@@ -91,11 +100,22 @@ impl PathRtt {
             window: [0; PATH_WINDOW],
             next: 0,
             samples: 0,
+            ordered: [0; PATH_WINDOW],
+            median: 0,
+            deviation: 0,
         }
     }
     /// Fold one answered round trip in, in place of the oldest of the
     /// window.
     pub fn on_sample(&mut self, round_trip_ns: u64) {
+        let mut held = self.held();
+        if held == PATH_WINDOW
+            && let Some(&evicted) = self.window.get(self.next)
+        {
+            self.remove_ordered(evicted, held);
+            held = held.saturating_sub(1);
+        }
+        self.insert_ordered(round_trip_ns, held);
         if let Some(slot) = self.window.get_mut(self.next) {
             *slot = round_trip_ns;
         }
@@ -105,53 +125,93 @@ impl PathRtt {
             .checked_rem(PATH_WINDOW)
             .unwrap_or(0);
         self.samples = self.samples.saturating_add(1);
+        let held = self.held();
+        self.median = self
+            .ordered
+            .get(held.checked_div(2).unwrap_or(0))
+            .copied()
+            .unwrap_or(0);
+        self.deviation = self.median_deviation(held);
     }
     /// How many round trips have been folded in, including those the window no longer holds.
     pub const fn samples(&self) -> u64 {
         self.samples
     }
-    /// The samples in the window, sorted, and how many there are.
-    fn sorted(&self) -> ([u64; PATH_WINDOW], usize) {
-        let held = usize::try_from(self.samples)
+    /// How many samples the window holds.
+    fn held(&self) -> usize {
+        usize::try_from(self.samples)
             .unwrap_or(PATH_WINDOW)
-            .min(PATH_WINDOW);
-        let mut sorted = [u64::MAX; PATH_WINDOW];
-        for (slot, sample) in sorted.iter_mut().zip(self.window.iter().take(held)) {
-            *slot = *sample;
-        }
-        // The samples held are the first `held` slots of the ring until it
-        // is full, and all of it afterwards; the rest sort last.
-        sorted.sort_unstable();
-        (sorted, held)
+            .min(PATH_WINDOW)
     }
-    /// The middle of `held` sorted values, the upper one of two.
-    fn middle(sorted: &[u64; PATH_WINDOW], held: usize) -> u64 {
-        sorted
-            .get(held.checked_div(2).unwrap_or(0))
-            .copied()
-            .unwrap_or(0)
+    /// Takes `value`, which the first `held` ordered slots hold, out of them.
+    fn remove_ordered(&mut self, value: u64, held: usize) {
+        if let Some(ordered) = self.ordered.get_mut(..held) {
+            let position = ordered.partition_point(|&sample| sample < value);
+            if let Some(after) = ordered.get_mut(position..) {
+                after.rotate_left(1);
+            }
+        }
+    }
+    /// Puts `value` in order among the first `held` ordered slots, `held` below the window.
+    fn insert_ordered(&mut self, value: u64, held: usize) {
+        if let Some(ordered) = self.ordered.get_mut(..=held) {
+            let position = ordered
+                .get(..held)
+                .map_or(0, |taken| taken.partition_point(|&sample| sample < value));
+            if let Some(after) = ordered.get_mut(position..) {
+                after.rotate_right(1);
+            }
+            if let Some(slot) = ordered.get_mut(position) {
+                *slot = value;
+            }
+        }
+    }
+    /// The middle of the `held` samples' deviations from the median, the upper of two. Below the
+    /// median the deviations rise as the samples fall, and above it they rise with the samples, so
+    /// the two sides are merged from the median outwards until the middle one is reached.
+    fn median_deviation(&self, held: usize) -> u64 {
+        let centre = held.checked_div(2).unwrap_or(0);
+        let median = self.median;
+        let below = |step: usize| {
+            centre
+                .checked_sub(step.saturating_add(1))
+                .and_then(|index| self.ordered.get(index))
+                .map(|sample| median.saturating_sub(*sample))
+        };
+        let above = |step: usize| {
+            centre
+                .checked_add(step)
+                .filter(|index| *index < held)
+                .and_then(|index| self.ordered.get(index))
+                .map(|sample| sample.saturating_sub(median))
+        };
+        let (mut low, mut high, mut deviation) = (0usize, 0usize, 0u64);
+        for _ in 0..=centre {
+            match (below(low), above(high)) {
+                (Some(down), Some(up)) if down < up => {
+                    deviation = down;
+                    low = low.saturating_add(1);
+                }
+                (Some(down), None) => {
+                    deviation = down;
+                    low = low.saturating_add(1);
+                }
+                (_, Some(up)) => {
+                    deviation = up;
+                    high = high.saturating_add(1);
+                }
+                (None, None) => break,
+            }
+        }
+        deviation
     }
     /// The median round trip; zero before a sample.
-    pub fn smoothed_ns(&self) -> u64 {
-        let (sorted, held) = self.sorted();
-        if held == 0 {
-            return 0;
-        }
-        Self::middle(&sorted, held)
+    pub const fn smoothed_ns(&self) -> u64 {
+        self.median
     }
     /// The median absolute deviation from the median; zero before a sample.
-    pub fn variation_ns(&self) -> u64 {
-        let (sorted, held) = self.sorted();
-        if held == 0 {
-            return 0;
-        }
-        let median = Self::middle(&sorted, held);
-        let mut deviations = [u64::MAX; PATH_WINDOW];
-        for (slot, sample) in deviations.iter_mut().zip(sorted.iter().take(held)) {
-            *slot = sample.abs_diff(median);
-        }
-        deviations.sort_unstable();
-        Self::middle(&deviations, held)
+    pub const fn variation_ns(&self) -> u64 {
+        self.deviation
     }
     /// The bound on this path's round-trip tail,
     /// `median + max(4 · deviation, granularity)`, or `None` before a
@@ -312,6 +372,38 @@ mod tests {
             path.on_sample(sample * MS);
         }
         path
+    }
+
+    /// The window kept in order and the merged deviations give what sorting the window gave.
+    #[test]
+    fn the_ordered_window_is_the_sorted_window() {
+        let middle = |values: &mut Vec<u64>| {
+            values.sort_unstable();
+            values.get(values.len() / 2).copied().unwrap_or(0)
+        };
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        for _ in 0..200 {
+            let mut path = PathRtt::new();
+            let mut latest: std::collections::VecDeque<u64> = std::collections::VecDeque::new();
+            for _ in 0..60 {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                // Few distinct values, so ties are common.
+                let sample = (state % 7 + 1) * MS;
+                path.on_sample(sample);
+                latest.push_back(sample);
+                if latest.len() > PATH_WINDOW {
+                    latest.pop_front();
+                }
+                let median = middle(&mut latest.iter().copied().collect());
+                let deviation = middle(&mut latest.iter().map(|s| s.abs_diff(median)).collect());
+                assert_eq!(
+                    (path.smoothed_ns(), path.variation_ns()),
+                    (median, deviation)
+                );
+            }
+        }
     }
 
     #[test]

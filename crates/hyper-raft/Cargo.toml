@@ -8,13 +8,14 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-raft-proto.workspace = true
+crc32c.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
 # The core focal ran on before this one: the differential tests run both on
 # one schedule and compare what they say.
 raft.workspace = true
+raft-proto.workspace = true
 slog.workspace = true
 
 [[bench]]

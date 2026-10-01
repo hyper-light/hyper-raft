@@ -49,13 +49,13 @@ const CORES: [&str; 7] = [
 
 fn measure(core: &str, spec: &Spec, seed: u64) -> Option<Measured> {
     match core {
-        "hyper" => workload::run::<family::hyper::Node>(spec, seed),
-        "hyper-copy" => workload::run::<family::hyper_copy::Node>(spec, seed),
-        "control" => workload::run::<family::control::Node>(spec, seed),
-        "mantle" => workload::run::<family::mantle::Node>(spec, seed),
+        "hyper" => workload::run::<family::own::hyper::Node>(spec, seed),
+        "hyper-copy" => workload::run::<family::own::hyper_copy::Node>(spec, seed),
+        "control" => workload::run::<family::pb::control::Node>(spec, seed),
+        "mantle" => workload::run::<family::pb::mantle::Node>(spec, seed),
         "slates" => workload::run::<slates::Node<true>>(spec, seed),
         "slates-core" => workload::run::<slates::Node<false>>(spec, seed),
-        "raftrs" => workload::run::<family::raftrs::Node>(spec, seed),
+        "raftrs" => workload::run::<family::pb::raftrs::Node>(spec, seed),
         _ => panic!("no core named {core}"),
     }
 }
@@ -63,13 +63,13 @@ fn measure(core: &str, spec: &Spec, seed: u64) -> Option<Measured> {
 fn label(core: &str) -> &'static str {
     use crate::core::Core;
     match core {
-        "hyper" => family::hyper::Node::NAME,
-        "hyper-copy" => family::hyper_copy::Node::NAME,
-        "control" => family::control::Node::NAME,
-        "mantle" => family::mantle::Node::NAME,
+        "hyper" => family::own::hyper::Node::NAME,
+        "hyper-copy" => family::own::hyper_copy::Node::NAME,
+        "control" => family::pb::control::Node::NAME,
+        "mantle" => family::pb::mantle::Node::NAME,
         "slates" => slates::Node::<true>::NAME,
         "slates-core" => slates::Node::<false>::NAME,
-        "raftrs" => family::raftrs::Node::NAME,
+        "raftrs" => family::pb::raftrs::Node::NAME,
         _ => panic!("no core named {core}"),
     }
 }

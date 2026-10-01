@@ -45,7 +45,6 @@ pub(crate) fn copy_entry(entry: &Entry) -> Result<Entry> {
         index: entry.index,
         data,
         context,
-        sync_log: entry.sync_log,
     })
 }
 /// Copies the entries after `into`'s, reserving for exactly that many: a
@@ -1057,7 +1056,7 @@ pub(crate) mod tests {
     impl Storage for Memory {
         fn initial_state(&self) -> std::result::Result<InitialState, StorageError> {
             Ok(InitialState {
-                hard_state: self.hard_state.clone(),
+                hard_state: self.hard_state,
                 configuration: self.configuration.clone(),
                 proposals: self.proposals.clone(),
             })
@@ -1711,7 +1710,7 @@ pub(crate) mod tests {
             indexes(log.unstable.entries()),
             vec![(1, 1), (2, 2), (3, 2)]
         );
-        assert_eq!(log.unstable.bytes, 36);
+        assert_eq!(log.unstable.bytes, 3 * crate::wire::ENTRY_FIXED_BYTES);
         assert!(log.unstable.resident_bytes() > 0);
         assert_eq!(log.unstable.payload, 0);
         log.unstable.check().unwrap();

@@ -298,7 +298,7 @@ impl<R: Replica> Cluster<R> {
                 } else {
                     self.net.remove(*at)
                 };
-                let snapshot = message.msg_type == MessageType::MsgSnapshot as i32;
+                let snapshot = message.msg_type == MessageType::MsgSnapshot;
                 let (from, to) = (message.from, message.to);
                 let arrives = !*lose && !self.is_blocked(from, to) && self.peek(to).is_some();
                 if arrives {
@@ -416,7 +416,7 @@ impl<R: Replica> Cluster<R> {
                     .voters
                     .iter()
                     .map(|voter| ConfChangeSingle {
-                        change_type: ConfChangeType::RemoveNode as i32,
+                        change_type: ConfChangeType::RemoveNode,
                         node_id: *voter,
                     })
                     .collect(),
@@ -443,7 +443,7 @@ impl<R: Replica> Cluster<R> {
                 _ => (ConfChangeType::RemoveNode, rng.pick(&conf.learners)?),
             };
             Some(ConfChangeSingle {
-                change_type: kind as i32,
+                change_type: kind,
                 node_id: member,
             })
         };
@@ -463,7 +463,7 @@ impl<R: Replica> Cluster<R> {
             _ => ConfChangeTransition::Auto,
         };
         ConfChangeV2 {
-            transition: transition as i32,
+            transition,
             changes,
             context: vec![],
         }

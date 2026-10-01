@@ -33,6 +33,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::HostId;
 
+use crate::codec::Coordinate;
 use crate::coordinates::{CoordinateEngine, NetworkCoordinate};
 use crate::extension::{ExtensionDecision, ExtensionDenial, ExtensionTracker};
 use crate::gossip::Gossip;
@@ -125,6 +126,10 @@ pub struct Detector {
     /// This node's own handling delay in whole periods: the time between a probe's arrival and its
     /// handling, as the owner measured it (mantle `node.md` §3.5).
     self_lag_periods: u32,
+    /// The suspects a tick ages, held across ticks so ageing allocates nothing once grown.
+    aging: Vec<(HostId, u64)>,
+    /// The relays an indirect probe ranks, held for the same reason.
+    relays: Vec<HostId>,
 }
 
 /// A deterministic pseudo-random order over the members to probe (SWIM §4): each protocol period probes
@@ -195,6 +200,8 @@ impl Detector {
             period: 0,
             extensions: BTreeMap::new(),
             self_lag_periods: 0,
+            aging: Vec::new(),
+            relays: Vec::new(),
         }
     }
 
@@ -235,15 +242,25 @@ impl Detector {
     }
 
     /// This node's own network coordinate, to gossip so peers can predict the round-trip time to it.
-    pub fn coordinate(&self) -> NetworkCoordinate {
+    pub fn coordinate(&self) -> &NetworkCoordinate {
         self.coordinates.coordinate()
     }
 
     /// Learns `peer`'s network coordinate (from a probe reply or gossip), so this node can predict the
-    /// round-trip time to it and rank it among indirect-probe relays by proximity.
-    pub fn learn_coordinate(&mut self, peer: HostId, coordinate: NetworkCoordinate) {
-        if peer != self.local {
-            self.peer_coordinates.insert(peer, coordinate);
+    /// round-trip time to it and rank it among indirect-probe relays by proximity. Only a member this
+    /// node probes is learned, and a member's coordinate is forgotten when it is declared dead, so the
+    /// coordinates held are bounded by the membership. A coordinate already held is overwritten in
+    /// place.
+    pub fn learn_coordinate(&mut self, peer: HostId, coordinate: Coordinate<'_>) {
+        if peer == self.local || !self.is_probed(peer) {
+            return;
+        }
+        match self.peer_coordinates.get_mut(&peer) {
+            Some(held) => coordinate.write_into(held),
+            None => {
+                self.peer_coordinates
+                    .insert(peer, coordinate.to_coordinate());
+            }
         }
     }
 
@@ -346,12 +363,13 @@ impl Detector {
     /// the least-disseminated first, each with its remaining-transmit count decremented and dropped once
     /// exhausted — so the buffer is bounded and each change spreads a fixed number of times (§4.8; SWIM
     /// infection-style dissemination).
-    pub fn gossip(&mut self, max: usize) -> Vec<(HostId, MemberState)> {
-        self.gossip.drain(max, self.timing.gossip_transmits)
+    /// The batch replaces what `batch` held; `batch` keeps its capacity.
+    pub fn gossip_into(&mut self, max: usize, batch: &mut Vec<(HostId, MemberState)>) {
+        self.gossip.drain(max, self.timing.gossip_transmits, batch);
     }
 
     /// The gossip batch to piggyback on a direct ping to `target`: the ordinary batch
-    /// ([`gossip`](Detector::gossip)) plus, whenever this node currently **suspects** `target`, that
+    /// ([`gossip_into`](Detector::gossip_into)) plus, whenever this node currently **suspects** `target`, that
     /// suspicion — even after its transmit budget is spent (Lifeguard's **buddy system**; memberlist's
     /// `probeNode` sends a suspect message with every ping to a node it suspects). The suspected member then
     /// hears it from the very probe it answers and refutes at once, the refutation riding the acknowledgement
@@ -360,8 +378,13 @@ impl Detector {
     /// a direct acknowledgement does not clear a suspicion (only an alive at a higher incarnation does, SWIM
     /// §4.2), so the refutation is the only way back. The batch stays within `max`: the least-fresh entry makes
     /// room.
-    pub fn ping_gossip(&mut self, target: HostId, max: usize) -> Vec<(HostId, MemberState)> {
-        let mut batch = self.gossip(max);
+    pub fn ping_gossip_into(
+        &mut self,
+        target: HostId,
+        max: usize,
+        batch: &mut Vec<(HostId, MemberState)>,
+    ) {
+        self.gossip_into(max, batch);
         if let Some(state) = self.membership.state(target)
             && state.liveness == Liveness::Suspect
             && !batch.iter().any(|(host, _)| *host == target)
@@ -371,13 +394,12 @@ impl Detector {
             }
             batch.insert(0, (target, state));
         }
-        batch
     }
 
     /// Applies a received gossip batch, folding each update into the view (and re-enqueueing anything it
     /// adopts so the change spreads onward — the infection continues).
-    pub fn apply_gossip(&mut self, updates: &[(HostId, MemberState)]) {
-        for &(subject, state) in updates {
+    pub fn apply_gossip(&mut self, updates: impl IntoIterator<Item = (HostId, MemberState)>) {
+        for (subject, state) in updates {
             self.apply(subject, state);
         }
     }
@@ -387,8 +409,12 @@ impl Detector {
     /// suspicion — so a failure many peers suspect is declared dead sooner (the confirmation-count timeout,
     /// §4.8). A `sender` that holds and gossips a suspicion is corroborating it; the count is of distinct
     /// senders, so re-hearing the same sender does not inflate it.
-    pub fn apply_gossip_from(&mut self, sender: HostId, updates: &[(HostId, MemberState)]) {
-        for &(subject, state) in updates {
+    pub fn apply_gossip_from(
+        &mut self,
+        sender: HostId,
+        updates: impl IntoIterator<Item = (HostId, MemberState)>,
+    ) {
+        for (subject, state) in updates {
             self.apply(subject, state);
             if state.liveness == Liveness::Suspect
                 && self.membership.state(subject).map(|s| s.liveness) == Some(Liveness::Suspect)
@@ -492,20 +518,23 @@ impl Detector {
     /// When a direct ping has gone unanswered this period, asks up to `fanout` other alive peers to ping
     /// the current target on our behalf (SWIM's indirect probe). Returns the ping-requests to send;
     /// empty if there is no current target or no eligible relay. The caller sends them, and relays any
-    /// acknowledgement back as an indirect ack ([`on_indirect_ack`](Detector::on_indirect_ack)).
-    pub fn request_indirect(&self, fanout: usize) -> Vec<PingReq> {
+    /// acknowledgement back as an indirect ack ([`on_indirect_ack`](Detector::on_indirect_ack)). The
+    /// requests replace what `requests` held.
+    pub fn request_indirect_into(&mut self, fanout: usize, requests: &mut Vec<PingReq>) {
+        requests.clear();
         let Some(target) = self.probing else {
-            return Vec::new();
+            return;
         };
         if self.acked {
-            return Vec::new();
+            return;
         }
-        let mut relays: Vec<HostId> = self
-            .membership
-            .alive()
-            .into_iter()
-            .filter(|host| *host != self.local && *host != target)
-            .collect();
+        let mut relays = std::mem::take(&mut self.relays);
+        relays.clear();
+        relays.extend(
+            self.membership
+                .alive()
+                .filter(|host| *host != self.local && *host != target),
+        );
         // Prefer relays that sit nearest the target in coordinate space — they are the likeliest to reach it,
         // so a lost direct packet is retried through a near proxy rather than an arbitrary one. A relay whose
         // distance to the target is unknown sorts last, keeping a deterministic id-order fallback.
@@ -520,11 +549,13 @@ impl Detector {
                 (None, None) => a.0.cmp(&b.0),
             }
         });
-        relays
-            .into_iter()
-            .take(fanout)
-            .map(|relay| PingReq { relay, target })
-            .collect()
+        requests.extend(
+            relays
+                .iter()
+                .take(fanout)
+                .map(|&relay| PingReq { relay, target }),
+        );
+        self.relays = relays;
     }
 
     /// As a relay, responds to a ping-request for `target` with the ping to send it; the caller relays
@@ -548,13 +579,17 @@ impl Detector {
     /// local-health multiplier — is declared dead (at the incarnation it was suspected under). Counters and
     /// confirmations for members no longer suspected (refuted or already dead) are dropped.
     fn age_suspicions(&mut self, heard_from: Option<HostId>) {
-        let suspects = self.membership.suspects();
-        let suspect_ids: Vec<HostId> = suspects.iter().map(|(host, _)| *host).collect();
-        self.suspicion.retain(|host, _| suspect_ids.contains(host));
-        self.confirmations
-            .retain(|host, _| suspect_ids.contains(host));
-        self.extensions.retain(|host, _| suspect_ids.contains(host));
-        for (host, incarnation) in suspects {
+        let mut suspects = std::mem::take(&mut self.aging);
+        suspects.clear();
+        suspects.extend(self.membership.suspects());
+        let membership = &self.membership;
+        let suspected = |host: &HostId| {
+            membership.state(*host).map(|state| state.liveness) == Some(Liveness::Suspect)
+        };
+        self.suspicion.retain(|host, _| suspected(host));
+        self.confirmations.retain(|host, _| suspected(host));
+        self.extensions.retain(|host, _| suspected(host));
+        for &(host, incarnation) in &suspects {
             if heard_from == Some(host) {
                 continue;
             }
@@ -579,8 +614,10 @@ impl Detector {
                 self.suspicion.remove(&host);
                 self.confirmations.remove(&host);
                 self.extensions.remove(&host);
+                self.peer_coordinates.remove(&host);
             }
         }
+        self.aging = suspects;
     }
 
     /// Whether `member` is one this node probes: alive or suspected — a member until it is dead.
@@ -615,19 +652,20 @@ impl Detector {
             // The round is exhausted. Draw a fresh permutation from the current live-or-suspected peers; if none
             // remain, there is no target. The fresh set is drawn from them, so the next pass returns its first
             // member — the loop makes at most one further pass, and terminates without a step count.
-            let suspected = self.membership.suspects().into_iter().map(|(host, _)| host);
-            let mut fresh: Vec<HostId> = self
-                .membership
-                .alive()
-                .into_iter()
-                .chain(suspected)
-                .filter(|host| *host != self.local)
-                .collect();
-            if fresh.is_empty() {
+            // The fresh round reuses the last round's vector.
+            let local = self.local;
+            let suspected = self.membership.suspects().map(|(host, _)| host);
+            self.order.clear();
+            self.order.extend(
+                self.membership
+                    .alive()
+                    .chain(suspected)
+                    .filter(|host| *host != local),
+            );
+            if self.order.is_empty() {
                 return None;
             }
-            self.shuffler.shuffle(&mut fresh);
-            self.order = fresh;
+            self.shuffler.shuffle(&mut self.order);
             self.cursor = 0;
         }
     }
@@ -636,6 +674,27 @@ impl Detector {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The batch and request calls as values of their own, for the tests that read them.
+    impl Detector {
+        fn gossip(&mut self, max: usize) -> Vec<(HostId, MemberState)> {
+            let mut batch = Vec::new();
+            self.gossip_into(max, &mut batch);
+            batch
+        }
+
+        fn ping_gossip(&mut self, target: HostId, max: usize) -> Vec<(HostId, MemberState)> {
+            let mut batch = Vec::new();
+            self.ping_gossip_into(target, max, &mut batch);
+            batch
+        }
+
+        fn request_indirect(&mut self, fanout: usize) -> Vec<PingReq> {
+            let mut requests = Vec::new();
+            self.request_indirect_into(fanout, &mut requests);
+            requests
+        }
+    }
 
     const LOCAL: HostId = HostId(1);
     const A: HostId = HostId(2);
@@ -694,7 +753,7 @@ mod tests {
             Liveness::Dead
         );
         assert_eq!(
-            detector.membership().alive(),
+            detector.membership().alive().collect::<Vec<_>>(),
             vec![LOCAL],
             "the dead member left the neighbourhood"
         );
@@ -961,7 +1020,7 @@ mod tests {
         let batch = source.gossip(10);
 
         let mut other = Detector::new(B, timing(2, 2));
-        other.apply_gossip(&batch);
+        other.apply_gossip(batch);
         assert_eq!(
             other.membership().state(A).map(|s| s.liveness),
             Some(Liveness::Dead),
@@ -1110,8 +1169,8 @@ mod tests {
             liveness: Liveness::Suspect,
             incarnation,
         };
-        corroborated.apply_gossip_from(B, &[(A, suspect)]); // C = 1
-        corroborated.apply_gossip_from(C, &[(A, suspect)]); // C = 2 → the floor
+        corroborated.apply_gossip_from(B, [(A, suspect)]); // C = 1
+        corroborated.apply_gossip_from(C, [(A, suspect)]); // C = 2 → the floor
         corroborated.tick(); // window is now two; the second aged period declares A dead
         assert_eq!(
             corroborated.membership().state(A).map(|s| s.liveness),
@@ -1180,7 +1239,7 @@ mod tests {
         let mut peer = NetworkCoordinate::origin(8);
         peer.vec[0] = 30.0;
         peer.error = 0.05;
-        detector.learn_coordinate(A, peer);
+        detector.learn_coordinate(A, Coordinate::Held(&peer));
 
         assert!(
             detector.predicted_rtt(A).is_some(),
@@ -1210,7 +1269,7 @@ mod tests {
             let mut coordinate = NetworkCoordinate::origin(8);
             coordinate.vec[0] = x;
             coordinate.error = 0.05;
-            detector.learn_coordinate(host, coordinate);
+            detector.learn_coordinate(host, Coordinate::Held(&coordinate));
         }
         let position = |host: HostId| {
             positions

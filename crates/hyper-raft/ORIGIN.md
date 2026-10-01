@@ -306,3 +306,44 @@ evidence are in `docs/raft.md`, "The fast track's election defect, and its fix".
 - The fast-track and README notes that it was not safe as built are replaced by the rules.
 - Evidence: 160,000 fast schedules from four base seeds pass; the raft-rs differential, which runs
   no fast group, is unchanged; allocation counts in `docs/benchmarks.md`.
+
+## R-2: its own types and its own wire format
+
+The owner's decision (2026-10-01): hyper-raft speaks its own protocol. `raft-proto` is gone from
+production; the format is `docs/raft.md` §3.1, written and read by `src/wire.rs`.
+
+- **The types** (`src/proto.rs`) are plain structs with typed kinds: `MessageType`, `EntryType`,
+  `ConfChangeType` and `ConfChangeTransition` are enums held as themselves, so a kind no value
+  names is refused when bytes are read and never held. The fast track's two kinds, which were
+  numbers past raft-proto's range (100 and 101), are `MsgFastPropose` and `MsgFastVote`.
+  raft-rs's `deprecated_priority`, `sync_log` and the change `id` are not carried: hyper-raft never
+  read them. `HardState` is `Copy`.
+- **The format**: a record is a version, a kind, a fixed-width little-endian body with
+  variable-length bytes after the fixed fields, and a CRC-32C. Every count and length is checked
+  against the bytes left before anything is taken or allocated; an unknown version, kind, flag or
+  presence bit, a checksum mismatch and trailing bytes are each refused with a typed
+  `wire::DecodeError`.
+- **An entry's bytes** are counted by the format: `proto::encoded_bytes` is the entry's length in a
+  message (its 25 fixed bytes, its data and its context), and the unpersisted-entry count
+  (`approximate_bytes`, raft-rs's twelve-byte estimate before) is the same length.
+- **The empty change** has one encoding: no data. A leader's own leave entry always had none; a
+  proposal of the empty change is now written the same way, and `Plan::of_entry` reads an entry
+  with no data as the empty change (protocol buffers read empty bytes as the default message; this
+  format refuses a record cut short, so the case is explicit). Found by the differential.
+- **`apply_conf_change_v1`** builds the joint form of a single change directly (`proto::joint`)
+  instead of encoding the change into an entry and reading it back.
+- **The differential against raft-rs** (`tests/differential.rs`) compares the two cores as values
+  through `tests/support/convert.rs`, which converts field by field and re-encodes a change carried
+  in an entry's data between the formats. raft-rs counts an uncommitted change by its own encoding;
+  the adapter replays raft-rs's rule (reset on taking the lead, counted past the tail, taken off on
+  commit while leading, floored at zero) for the difference, so the counts compare in this
+  format's bytes. Four settings compare step for step as before (the shell's, without pre-vote and
+  check-quorum, a window of two and one entry a message, a network that loses nothing, each with
+  readies copied and in place). Where a bound counts bytes (pages of 100 and 64 bytes, a ready's
+  committed bytes, the uncommitted bound), the two cores cut at different entries by design, so
+  raft-rs is no oracle there: this core runs those schedules alone and is held after every step to
+  its bounds as it measures them (`alone`, `bounded`).
+- **Tests of the format** (`src/wire.rs`): every layout written out field by field, every type
+  round-tripped, every truncation, one-byte extension and single-bit flip of every record refused,
+  counts past the bytes refused with a valid checksum, and 140,000 arbitrary bodies under valid
+  checksums decoded without a panic.

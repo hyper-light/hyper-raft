@@ -10,7 +10,9 @@
 //! The scenarios run one after another in this one thread (`harness = false`), one group at a
 //! time: at most five member processes at once, each of one thread.
 //!
-//! Every wait is on the fact it needs (a member's answer), bounded by a stated budget in ticks.
+//! Every wait is on the fact it needs (a member's answer), bounded by a stated budget in ticks:
+//! a request waits for its answer through the longest election timeout, and one write or read
+//! is retried through `WAIT_ELECTIONS` elections before it fails.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -41,14 +43,21 @@ const TMP: &str = env!("CARGO_TARGET_TMPDIR");
 /// Ticks in a member's election timeout, at least (focal's shell's `election_tick`, which the
 /// node runs with); its randomized timeout is below twice this.
 const ELECTION_TICKS: u32 = 10;
+/// Ticks between a leader's heartbeats (focal's shell's `heartbeat_tick`, which the node runs
+/// with): within this a member hears of a leader elected.
+const HEARTBEAT_TICKS: u32 = 2;
 /// How long one request waits for its answer: two of the longest election timeouts, so a
 /// request to a member that is electing is answered once the election is over.
 const ANSWER_TICKS: u32 = 4 * ELECTION_TICKS;
-/// How many requests one operation sends before it fails: a request goes to every member in
-/// turn, and an election may need several rounds of them.
+/// How many statuses a wait for a member to have taken what it was sent asks for. The member
+/// takes datagrams in the order they arrive, so the first status after them sees them.
 const ATTEMPTS: usize = 64;
-/// How many election timeouts a wait for a leader, or for members to agree, may take.
+/// How many election timeouts a wait for a leader, for members to agree, or for one write or
+/// read to be answered through the elections it meets, may take.
 const WAIT_ELECTIONS: u32 = 40;
+/// The most writes and reads one scenario makes, and more: `commits` makes 600 (200 writes,
+/// each read back at once and again in the check at its end), and the others fewer.
+const MAX_OPERATIONS: u32 = 1024;
 /// The keys a member's store holds, the asks it keeps waiting, and the entries its log holds:
 /// above what any scenario writes, so that none is refused for room.
 const MAX_KEYS: usize = 4096;
@@ -155,8 +164,9 @@ fn spawn(
 
 impl Cluster {
     fn start(name: &'static str, voters: usize, tick: Duration) -> Self {
-        // Every scenario's members end by themselves well after it would have failed.
-        let deadline = tick * ANSWER_TICKS * (ATTEMPTS as u32) * 4;
+        // Every scenario's members end by themselves after it would have failed: each of its
+        // operations fails once it outlasts its budget, so none outlives them all.
+        let deadline = Self::budget(tick) * MAX_OPERATIONS;
         let mut members = Vec::new();
         for id in 1..=voters as u64 {
             let wal =
@@ -317,12 +327,25 @@ impl Cluster {
         }
         panic!("{}: no leader among {among:?}", self.name);
     }
-    /// Lets `ticks` pass by waiting for an answer that does not come: the test's socket is
-    /// asked nothing, so the wait is the timeout itself.
+    /// Lets `ticks` pass. The test's socket is asked nothing, so the wait is its timeout; an
+    /// answer that comes late to a request already given up on is dropped, and the wait goes on
+    /// to its end.
     fn wait_ticks(&mut self, ticks: u32) {
-        self.test.set_read_timeout(Some(self.tick * ticks)).unwrap();
-        let mut sink = [0u8; 64];
-        let _ = self.test.recv_from(&mut sink);
+        let until = Instant::now() + self.tick * ticks;
+        let mut sink = vec![0u8; wire::MAX_DATAGRAM];
+        loop {
+            let wait = until.saturating_duration_since(Instant::now());
+            if wait.is_zero() {
+                return;
+            }
+            self.test.set_read_timeout(Some(wait)).unwrap();
+            let _ = self.test.recv_from(&mut sink);
+        }
+    }
+    /// How long one write or read may take to be answered: `WAIT_ELECTIONS` elections, each
+    /// within twice the election timeout.
+    fn budget(tick: Duration) -> Duration {
+        tick * (2 * ELECTION_TICKS * WAIT_ELECTIONS)
     }
     fn up_members(&self) -> Vec<u64> {
         (1..=self.voters() as u64)
@@ -374,12 +397,18 @@ impl Client {
         }
         from
     }
-    fn target(&self, hint: u64, cluster: &Cluster, from: u64) -> u64 {
-        if hint != 0 && cluster.up(hint) {
-            hint
-        } else {
-            self.next(cluster, from)
+    /// Whom to ask after `from` answered that it does not lead and named `hint`. A member that
+    /// names no other leader is in an election, or its leader is gone: the client lets a
+    /// heartbeat interval pass, within which a leader elected makes itself known, before it asks
+    /// the next. Without the pause, two members that disagree on who leads during an election
+    /// (one names the other, which names no one) answer at once, over and over, and the client
+    /// spends its budget before the election ends.
+    fn target(&self, hint: u64, cluster: &mut Cluster, from: u64) -> u64 {
+        if hint != 0 && hint != from && cluster.up(hint) {
+            return hint;
         }
+        cluster.wait_ticks(HEARTBEAT_TICKS);
+        self.next(cluster, from)
     }
     /// Writes `key`; true once a member answered that it is committed.
     fn put(
@@ -390,7 +419,8 @@ impl Client {
         value: &[u8],
     ) -> bool {
         let mut target = self.leader;
-        for _ in 0..ATTEMPTS {
+        let until = Instant::now() + Cluster::budget(cluster.tick);
+        while Instant::now() < until {
             match cluster.request(target, &Op::Put { key, value }) {
                 Some(Outcome::Put(_)) => {
                     self.leader = target;
@@ -413,7 +443,8 @@ impl Client {
     /// Reads `key` linearizably through the leader.
     fn get(&mut self, cluster: &mut Cluster, key: &[u8]) -> Option<Vec<u8>> {
         let mut target = self.leader;
-        for _ in 0..ATTEMPTS {
+        let until = Instant::now() + Cluster::budget(cluster.tick);
+        while Instant::now() < until {
             match cluster.request(target, &Op::Get { key }) {
                 Some(Outcome::Value(value)) => {
                     self.leader = target;
@@ -508,10 +539,12 @@ fn leader_killed(tick: Duration) -> String {
     let name = "leader-killed";
     let mut cluster = Cluster::start(name, 3, tick);
     let all = cluster.up_members();
-    let (old, old_term) = cluster.leader_among(&all);
-    let mut client = Client { leader: old };
+    let (first, _) = cluster.leader_among(&all);
+    let mut client = Client { leader: first };
     let mut history = History::default();
     write_range(&mut cluster, &mut client, &mut history, 0..50);
+    // The leader now, which the writes may have moved: the writes in flight go to it.
+    let (old, old_term) = cluster.leader_among(&all);
     // Writes the leader has taken into its log, and has not answered, when it dies.
     let before = cluster.status(old).unwrap().last_index;
     for at in 50..55 {

@@ -144,7 +144,7 @@ fn a_proposal_is_committed_once_a_fast_quorum_holds_it() {
         !group
             .net
             .iter()
-            .any(|message| message.msg_type == MessageType::MsgAppendResponse as i32)
+            .any(|message| message.msg_type == MessageType::MsgAppendResponse)
     );
     // The members learn of the commit from the leader, and hold the entry
     // from it.
@@ -331,9 +331,9 @@ fn what_a_member_holds_it_holds_after_it_stopped() {
 fn while_the_group_changes_the_fast_quorum_commits_nothing() {
     let mut group = group(5);
     let joint = ConfChangeV2 {
-        transition: ConfChangeTransition::Explicit as i32,
+        transition: ConfChangeTransition::Explicit,
         changes: vec![ConfChangeSingle {
-            change_type: ConfChangeType::RemoveNode as i32,
+            change_type: ConfChangeType::RemoveNode,
             node_id: 5,
         }],
         context: vec![],
@@ -376,7 +376,7 @@ fn what_may_not_go_by_the_fast_track_is_refused() {
         ..Message::default()
     };
     let change = Entry {
-        entry_type: EntryType::EntryConfChangeV2 as i32,
+        entry_type: EntryType::EntryConfChangeV2,
         index: 2,
         data: vec![1],
         ..Entry::default()

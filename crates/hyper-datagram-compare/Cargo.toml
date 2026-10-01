@@ -1,0 +1,22 @@
+[package]
+name = "hyper-datagram-compare"
+description = "hyper-datagram measured against the sealed datagram plane it replaces, on one workload: slates' control-datagram seal (slates-transport)."
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+license = "MIT"
+publish = false
+
+# A workspace of its own: slates-transport is built from slates' repository at a pinned
+# revision, which the gates of this workspace do not fetch (docs/benchmarks.md).
+[workspace]
+
+[dependencies]
+hyper-datagram = { path = "../hyper-datagram" }
+hyper-measure = { path = "../hyper-measure" }
+# slates' control-datagram codec and seal at slates `5cce86a`, unchanged in seal.rs since.
+slates-transport = { git = "https://github.com/hyper-light/slates", rev = "5cce86aa4cae58b421d171756b24e4305797a3e8" }
+
+[profile.release]
+lto = true
+debug = "line-tables-only"

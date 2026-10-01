@@ -185,8 +185,8 @@ fn a_round_confirms_no_read_asked_after_it_left() {
     group.act(&Op::Propose(1, b"before".to_vec()));
     quiet(&mut group);
     group.act(&Op::Read(1, b"first".to_vec()));
-    let heartbeat = MessageType::MsgHeartbeat as i32;
-    let answer = MessageType::MsgHeartbeatResponse as i32;
+    let heartbeat = MessageType::MsgHeartbeat;
+    let answer = MessageType::MsgHeartbeatResponse;
     assert_eq!(
         deliver(&mut group, |message| message.msg_type == heartbeat),
         2
@@ -252,10 +252,10 @@ fn a_member_that_left_refuses_no_one_for_priority() {
     // vote member 1 then asks for, are lost. Member 1 is left a term ahead
     // of member 2, so that what member 2 answers from its own term member 1
     // does not hear.
-    let append = MessageType::MsgAppend as i32;
-    let answer = MessageType::MsgAppendResponse as i32;
-    let campaign = MessageType::MsgTimeoutNow as i32;
-    let to = |kind: i32, member: u64| {
+    let append = MessageType::MsgAppend;
+    let answer = MessageType::MsgAppendResponse;
+    let campaign = MessageType::MsgTimeoutNow;
+    let to = |kind: MessageType, member: u64| {
         move |message: &Message| message.msg_type == kind && message.to == member
     };
     assert!(deliver(&mut group, to(append, 1)) > 0);
@@ -277,7 +277,7 @@ fn a_member_that_left_refuses_no_one_for_priority() {
 fn change(kind: ConfChangeType, member: u64) -> ConfChangeV2 {
     ConfChangeV2 {
         changes: vec![ConfChangeSingle {
-            change_type: kind as i32,
+            change_type: kind,
             node_id: member,
         }],
         ..ConfChangeV2::default()
@@ -341,18 +341,18 @@ fn a_leader_leaves_a_joint_configuration_it_is_no_part_of_after() {
     let mut group: Cluster<New> = Cluster::new(5, &[1, 2, 3], Settings::focal(), 11);
     elect(&mut group, 1);
     let replace = ConfChangeV2 {
-        transition: ConfChangeTransition::Auto as i32,
+        transition: ConfChangeTransition::Auto,
         changes: vec![
             ConfChangeSingle {
-                change_type: ConfChangeType::AddNode as i32,
+                change_type: ConfChangeType::AddNode,
                 node_id: 4,
             },
             ConfChangeSingle {
-                change_type: ConfChangeType::AddNode as i32,
+                change_type: ConfChangeType::AddNode,
                 node_id: 5,
             },
             ConfChangeSingle {
-                change_type: ConfChangeType::RemoveNode as i32,
+                change_type: ConfChangeType::RemoveNode,
                 node_id: 1,
             },
         ],
@@ -480,7 +480,7 @@ fn priority_orders_an_election_and_never_judges_a_transfer() {
     let told: Vec<_> = group
         .net
         .iter()
-        .filter(|message| message.msg_type == MessageType::MsgTimeoutNow as i32)
+        .filter(|message| message.msg_type == MessageType::MsgTimeoutNow)
         .map(|message| message.to)
         .collect();
     assert_eq!(told, vec![2, 3]);

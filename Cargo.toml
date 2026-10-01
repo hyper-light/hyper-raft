@@ -9,10 +9,13 @@ members = ["crates/*"]
 # which the gates of this workspace do not fetch (docs/benchmarks.md). hyper-tls's test support
 # crate is upstream's `rustls-test`, test code outside the wall.
 exclude = [
-  "vendor",
-  "crates/hyper-raft-compare",
-  "crates/hyper-log-compare",
-  "crates/hyper-tls/tests/support/rustls-test",
+    "vendor",
+    "crates/hyper-raft-compare",
+    "crates/hyper-log-compare",
+    "crates/hyper-datagram-compare",
+    "crates/hyper-swim-compare",
+    "crates/hyper-timing-compare",
+    "crates/hyper-tls/tests/support/rustls-test",
 ]
 
 [workspace.package]

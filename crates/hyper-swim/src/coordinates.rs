@@ -92,9 +92,9 @@ impl CoordinateEngine {
         }
     }
 
-    /// This node's current coordinate (a copy — the engine owns the authoritative one).
-    pub fn coordinate(&self) -> NetworkCoordinate {
-        self.coordinate.clone()
+    /// This node's current coordinate.
+    pub fn coordinate(&self) -> &NetworkCoordinate {
+        &self.coordinate
     }
 
     /// The predicted round-trip time between `local` and `peer`: the Euclidean distance between their
@@ -115,19 +115,22 @@ impl CoordinateEngine {
     /// error, weighted by relative confidence and bounded by the timestep; feed part of the error into the
     /// height and the adjustment; and fold the error magnitude into the confidence estimate. A
     /// non-positive `rtt` is ignored (an unusable sample). Returns the updated coordinate.
-    pub fn update_with_rtt(&mut self, peer: &NetworkCoordinate, rtt: f64) -> NetworkCoordinate {
+    pub fn update_with_rtt(&mut self, peer: &NetworkCoordinate, rtt: f64) -> &NetworkCoordinate {
         if rtt <= 0.0 {
-            return self.coordinate();
+            return &self.coordinate;
         }
         let predicted = CoordinateEngine::estimate_rtt(&self.coordinate, peer);
         let error = rtt - predicted;
 
         let distance = vector_distance(&self.coordinate.vec, &peer.vec);
-        let unit = unit_vector(&self.coordinate.vec, &peer.vec, distance);
         let weight = confidence_weight(self.coordinate.error, peer.error);
         let step = TIMESTEP * weight;
 
-        for (component, direction) in self.coordinate.vec.iter_mut().zip(unit.iter()) {
+        // Each component moves along its own axis of the unit vector toward the peer, read before
+        // the component changes, so the step needs no vector of its own.
+        for (index, component) in self.coordinate.vec.iter_mut().enumerate() {
+            let toward = peer.vec.get(index).copied().unwrap_or(0.0);
+            let direction = unit_component(index, *component, toward, distance);
             *component += step * error * direction;
             *component *= 1.0 - GRAVITY;
         }
@@ -142,7 +145,7 @@ impl CoordinateEngine {
         let new_error = self.coordinate.error + ERROR_DECAY * (error.abs() - self.coordinate.error);
         self.coordinate.error = clamp(new_error, MIN_ERROR, MAX_ERROR);
 
-        self.coordinate()
+        &self.coordinate
     }
 }
 
@@ -166,24 +169,14 @@ fn vector_distance(left: &[f64], right: &[f64]) -> f64 {
     sum.sqrt()
 }
 
-/// The unit vector from `from` toward `to`. When the two coincide (zero distance) a small deterministic
-/// nudge along the first axis breaks the degeneracy, so a coordinate never stalls exactly on a peer.
-fn unit_vector(from: &[f64], to: &[f64], distance: f64) -> Vec<f64> {
-    let dimensions = from.len().max(to.len());
+/// Component `index` of the unit vector from `from` toward `to`, whose components there are `a`
+/// and `b`, `distance` apart. When the two coincide (zero distance) a small deterministic nudge along
+/// the first axis breaks the degeneracy, so a coordinate never stalls exactly on a peer.
+fn unit_component(index: usize, a: f64, b: f64, distance: f64) -> f64 {
     if distance <= f64::EPSILON {
-        let mut nudge = vec![0.0; dimensions];
-        if let Some(first) = nudge.first_mut() {
-            *first = 1.0;
-        }
-        return nudge;
+        return if index == 0 { 1.0 } else { 0.0 };
     }
-    (0..dimensions)
-        .map(|index| {
-            let a = from.get(index).copied().unwrap_or(0.0);
-            let b = to.get(index).copied().unwrap_or(0.0);
-            (a - b) / distance
-        })
-        .collect()
+    (a - b) / distance
 }
 
 /// The relative-confidence weight of the local error against the pair's total error: a node that is far
@@ -251,10 +244,10 @@ mod tests {
     fn a_non_positive_rtt_is_ignored() {
         let peer = NetworkCoordinate::origin(DIMENSIONS);
         let mut engine = CoordinateEngine::new();
-        let before = engine.coordinate();
+        let before = engine.coordinate().clone();
         engine.update_with_rtt(&peer, 0.0);
         engine.update_with_rtt(&peer, -5.0);
-        assert_eq!(engine.coordinate(), before, "no sample, no movement");
+        assert_eq!(engine.coordinate(), &before, "no sample, no movement");
     }
 
     /// Confidence improves (the error shrinks from full uncertainty) as consistent samples arrive.

@@ -102,21 +102,35 @@ impl ElectionPriority {
 /// A voter's election priority from its measured paths to the other voters of a group of
 /// `voters`: the `⌊voters/2⌋`-th smallest central round trip among `paths`, with that path's
 /// spread. Unknown while a sole voter, or while fewer measured paths than that exist.
+///
+/// The rank is counted rather than sorted, so the call allocates nothing: each measured path's
+/// position is the number of paths ordered before it, ties broken by their order in `paths`.
+/// That is quadratic in a group's voters, a handful.
 pub fn quorum_priority<'a, P: PathEstimate + 'a>(
-    paths: impl IntoIterator<Item = Option<&'a P>>,
+    paths: impl IntoIterator<Item = Option<&'a P>, IntoIter: Clone>,
     voters: usize,
 ) -> ElectionPriority {
-    let quorum = voters / 2;
-    let mut measured: Vec<(u64, u64)> = paths
+    let measured = paths
         .into_iter()
         .flatten()
-        .filter_map(|path| path.spread_ns().map(|spread| (path.smoothed_ns(), spread)))
-        .collect();
-    measured.sort_unstable();
-    quorum
-        .checked_sub(1)
-        .and_then(|position| measured.get(position))
-        .map_or_else(ElectionPriority::default, |&(quorum_ns, spread_ns)| {
+        .filter_map(|path| path.spread_ns().map(|spread| (path.smoothed_ns(), spread)));
+    let Some(position) = (voters / 2).checked_sub(1) else {
+        return ElectionPriority::default();
+    };
+    measured
+        .clone()
+        .enumerate()
+        .find(|&(index, key)| {
+            let rank = measured
+                .clone()
+                .enumerate()
+                .filter(|&(other, other_key)| {
+                    other_key < key || (other_key == key && other < index)
+                })
+                .count();
+            rank == position
+        })
+        .map_or_else(ElectionPriority::default, |(_, (quorum_ns, spread_ns))| {
             ElectionPriority {
                 quorum_ns,
                 spread_ns,
@@ -748,6 +762,53 @@ mod tests {
             quorum_priority::<ExchangeRtt>(std::iter::empty(), 1),
             ElectionPriority::default()
         );
+    }
+
+    /// The counted rank picks what sorting the measured paths picked, ties and gaps included.
+    #[test]
+    fn the_counted_rank_is_the_sorted_position() {
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for _ in 0..2_000 {
+            let voters = usize::try_from(next() % 9).unwrap() + 1;
+            let paths: Vec<Option<ExchangeRtt>> = (1..voters)
+                .map(|_| {
+                    // Few distinct round trips, so ties are common; a fifth unmeasured.
+                    let rtt = (next() % 4 + 1) * MS;
+                    (next() % 5 != 0).then(|| {
+                        let mut path = ExchangeRtt::new();
+                        for _ in 0..usize::try_from(next() % 3).unwrap() + 1 {
+                            path.on_sample(rtt + next() % 3);
+                        }
+                        path
+                    })
+                })
+                .collect();
+            let mut sorted: Vec<(u64, u64)> = paths
+                .iter()
+                .flatten()
+                .filter_map(|p| p.spread_ns().map(|spread| (p.smoothed_ns(), spread)))
+                .collect();
+            sorted.sort_unstable();
+            let expected = (voters / 2)
+                .checked_sub(1)
+                .and_then(|position| sorted.get(position))
+                .map_or_else(ElectionPriority::default, |&(quorum_ns, spread_ns)| {
+                    ElectionPriority {
+                        quorum_ns,
+                        spread_ns,
+                    }
+                });
+            assert_eq!(
+                quorum_priority(paths.iter().map(Option::as_ref), voters),
+                expected
+            );
+        }
     }
 
     #[test]

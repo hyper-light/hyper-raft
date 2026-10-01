@@ -12,3 +12,8 @@ workspace = true
 
 [dev-dependencies]
 hyper-datagram = { path = "../hyper-datagram" }
+hyper-measure = { path = "../hyper-measure" }
+
+[[bench]]
+name = "allocs"
+harness = false

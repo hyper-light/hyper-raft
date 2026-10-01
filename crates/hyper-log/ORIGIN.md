@@ -70,6 +70,14 @@ The suite's assertions are unchanged; its plumbing is not:
   read a channel's disconnection;
 - `a_completion_wakes_only_its_submitter` is new: 48 submitters with counting wakers over 12 rounds
   each, every wake its own answer's, each waker woken exactly as often as answered.
+- `a_groups_queued_updates_become_durable_in_order` hung once on Linux, in mantle's test as
+  written: each round holds the writer by a plug update and waits for its flush, but a log full of
+  what the groups keep refuses the plug `Full` with no frame written, so no flush ever came. The
+  round now waits for the plug's flush or its answer, whichever comes first (its waker tells the
+  holder), takes a `Full` or `Backlog` plug as the refusal it is, and runs that round unheld; the
+  holder forgets each round's events before the next. A direct case (a 4-block, 8-segment log
+  filled by one group's 8 KiB entries) shows the plug refused `Full` unheld. mantle's test at
+  `147f035` carries the same wait.
 
 ## Allocations (commit `4b48295`)
 

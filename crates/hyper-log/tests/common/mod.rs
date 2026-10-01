@@ -13,6 +13,7 @@
 
 use std::cell::Cell;
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, sync_channel};
+use std::task::Waker;
 
 use hyper_block::DiskError;
 use hyper_block::block::BlockFile;
@@ -43,7 +44,7 @@ enum Command {
 pub struct Held {
     file: SimFile,
     commands: Receiver<Command>,
-    events: SyncSender<Event>,
+    events: SyncSender<usize>,
     holding: Cell<bool>,
     /// Flushes that have arrived, and how many of them may complete.
     arrived: Cell<u64>,
@@ -51,26 +52,45 @@ pub struct Held {
     trap: Cell<Option<(u64, u64)>>,
 }
 
-/// What a held device tells the test.
+/// What a held device tells the test, on the channel that also carries the tags of the wakers
+/// `Holder::waker` makes: a flush held, a read held, or `TOLD` plus a waker's tag.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Event {
     Flush,
     Read,
 }
 
+const FLUSH: usize = 0;
+const READ: usize = 1;
+/// The first number a waker's tag is told as.
+const TOLD: usize = 2;
+
 /// The test's side of a hold.
 pub struct Holder {
     commands: SyncSender<Command>,
-    events: Receiver<Event>,
+    events: Receiver<usize>,
+    /// The device's end of `events`, kept for the wakers a test makes; `None` unless asked for,
+    /// so that a test whose log has gone hears the channel close.
+    tell: Option<SyncSender<usize>>,
     /// Events heard by `is_held` and not yet waited for.
     flushes: Cell<u64>,
     reads: Cell<u64>,
+    /// One more than the greatest waker tag told, 0 if none.
+    told: Cell<usize>,
 }
 
 /// A simulated file whose flushes and reads a test can hold, and the test's side of it.
 pub fn held(file: SimFile) -> (Held, Holder) {
+    let (device, mut holder) = held_telling(file);
+    holder.tell = None;
+    (device, holder)
+}
+
+/// `held`, whose holder also makes wakers that tell it when woken (`Holder::waker`).
+pub fn held_telling(file: SimFile) -> (Held, Holder) {
     let (commands, receive) = sync_channel(CHANNEL);
     let (events, heard) = sync_channel(CHANNEL);
+    let tell = Some(events.clone());
     (
         Held {
             file,
@@ -84,8 +104,10 @@ pub fn held(file: SimFile) -> (Held, Holder) {
         Holder {
             commands,
             events: heard,
+            tell,
             flushes: Cell::new(0),
             reads: Cell::new(0),
+            told: Cell::new(0),
         },
     )
 }
@@ -148,7 +170,7 @@ impl BlockFile for Held {
         let end = offset + buf.len() as u64;
         let trapped = |trap: Option<(u64, u64)>| trap.is_some_and(|(a, b)| offset < b && a < end);
         if trapped(self.trap.get()) {
-            let _ = self.events.send(Event::Read);
+            let _ = self.events.send(READ);
             while trapped(self.trap.get()) {
                 self.wait();
             }
@@ -165,7 +187,7 @@ impl BlockFile for Held {
         self.hear();
         let held = || self.holding.get() && self.arrived.get() > self.allowed.get();
         if held() {
-            let _ = self.events.send(Event::Flush);
+            let _ = self.events.send(FLUSH);
             while held() {
                 self.wait();
             }
@@ -234,11 +256,49 @@ impl Holder {
         self.wait_for(Event::Read);
     }
 
+    /// A waker that tells this holder `tag` when woken. Only a holder from `held_telling`
+    /// makes one.
+    pub fn waker(&self, tag: usize) -> Waker {
+        let tell = self.tell.clone().unwrap();
+        hyper_measure::wake::waker(TOLD + tag, tell).0
+    }
+
+    /// Waits until the writer is held in a flush (`true`) or the waker of `tag` is woken
+    /// (`false`), whichever the holder hears of first.
+    pub fn held_or_told(&self, tag: usize) -> bool {
+        loop {
+            self.listen();
+            if self.flushes.get() > 0 {
+                self.flushes.set(self.flushes.get() - 1);
+                return true;
+            }
+            if self.told.get() > tag {
+                return false;
+            }
+            self.note(self.events.recv().unwrap());
+        }
+    }
+
+    /// Forgets every event heard or waiting: the holds and wakes of what the test has finished
+    /// with. Every one the device sent before its last flush let through is waiting by then.
+    pub fn settle(&self) {
+        self.listen();
+        self.flushes.set(0);
+        self.reads.set(0);
+    }
+
+    fn note(&self, event: usize) {
+        match event {
+            FLUSH => self.flushes.set(self.flushes.get() + 1),
+            READ => self.reads.set(self.reads.get() + 1),
+            tag => self.told.set(self.told.get().max(tag - TOLD + 1)),
+        }
+    }
+
     fn listen(&self) {
         loop {
             match self.events.try_recv() {
-                Ok(Event::Flush) => self.flushes.set(self.flushes.get() + 1),
-                Ok(Event::Read) => self.reads.set(self.reads.get() + 1),
+                Ok(event) => self.note(event),
                 Err(TryRecvError::Empty | TryRecvError::Disconnected) => return,
             }
         }
@@ -255,10 +315,7 @@ impl Holder {
                 count.set(count.get() - 1);
                 return;
             }
-            match self.events.recv().unwrap() {
-                Event::Flush => self.flushes.set(self.flushes.get() + 1),
-                Event::Read => self.reads.set(self.reads.get() + 1),
-            }
+            self.note(self.events.recv().unwrap());
         }
     }
 }

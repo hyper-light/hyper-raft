@@ -23,7 +23,7 @@ use hyper_log::{
 use proptest::prelude::*;
 
 mod common;
-use common::{Held, Holder, held};
+use common::{Held, Holder, held, held_telling};
 
 const ID: u128 = 0x6d61_6e74_6c65_2d6c_6f67;
 const BLOCK: usize = 4096;
@@ -2530,7 +2530,7 @@ fn queued_in_order(
     seed: u64,
     segment_blocks: u64,
 ) -> Result<(), TestCaseError> {
-    let (device, gated) = held(sim(seed));
+    let (device, gated) = held_telling(sim(seed));
     let cfg = config(segment_blocks, 8);
     let log = Log::create(device, cfg, ID).unwrap();
     let segment = cfg.segment_bytes as usize;
@@ -2540,11 +2540,16 @@ fn queued_in_order(
         hard_state: Some(hard(1, 0)),
         ..Update::default()
     };
-    for round in rounds {
+    for (at, round) in rounds.iter().enumerate() {
+        gated.settle();
         gated.hold();
         let shut = gated.released();
-        let plugged = log.submit(99, plug.clone()).unwrap();
-        gated.held();
+        // The plug holds the writer in its flush while the round queues, unless the log, full of
+        // what the groups keep, refuses it with no frame written: then the round goes unheld.
+        let plugged = log
+            .submit_waking(99, Class::Normal, plug.clone(), gated.waker(at))
+            .unwrap();
+        gated.held_or_told(at);
         let mut predicted = models.clone();
         let mut submitted = Vec::new();
         for (step, size) in round {
@@ -2567,8 +2572,11 @@ fn queued_in_order(
             submitted.push((group, u, pending));
         }
         drop(shut);
-        plugged.wait().unwrap();
-        apply(&mut models, 99, &plug);
+        match plugged.wait() {
+            Ok(()) => apply(&mut models, 99, &plug),
+            Err(LogError::Full | LogError::Backlog(_)) => {}
+            Err(e) => return Err(TestCaseError::fail(format!("plug: {e}"))),
+        }
         for (group, u, pending) in submitted {
             match pending.wait() {
                 Ok(()) => apply(&mut models, group, &u),

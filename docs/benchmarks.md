@@ -612,6 +612,16 @@ on the file and goes on; the last runs to its end and closes the log.
 test a_writer_killed_mid_append_loses_nothing_it_acknowledged ... ok
 ```
 
+On Linux (aarch64, `rust:1.98.0` in Docker on this Mac, the container's overlay file system), the
+same test, with the suites of hyper-block, hyper-log (the equivalence included) and hyper-measure:
+
+```
+24 writers killed, 1784 appends acknowledged across 8 groups, 0 acknowledgements read after a kill
+test result: ok. 1 passed; 0 failed
+```
+
+Windows is linted (`x86_64-pc-windows-msvc`, `aarch64-pc-windows-msvc`), not run here.
+
 ## Commands for the log
 
 ```sh

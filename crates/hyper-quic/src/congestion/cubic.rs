@@ -3,13 +3,14 @@ use std::cmp;
 
 use super::{BASE_DATAGRAM_SIZE, Controller};
 use crate::connection::RttEstimator;
-use crate::{Duration, Instant};
+use crate::{Duration, Instant, float};
 
 /// CUBIC Constants.
 ///
 /// These are recommended value in RFC8312.
 const BETA_CUBIC: f64 = 0.7;
 
+/// CUBIC's scaling constant C (RFC 9438 §4.1)
 const C: f64 = 0.4;
 
 /// CUBIC State Variables.
@@ -85,7 +86,7 @@ impl Cubic {
     }
 
     fn minimum_window(&self) -> u64 {
-        2 * self.current_mtu
+        2u64.saturating_mul(self.current_mtu)
     }
 }
 
@@ -109,7 +110,8 @@ impl Controller for Cubic {
 
         if self.window < self.ssthresh {
             // Slow start
-            self.window += bytes;
+            // Windows and byte counts saturate at a size no connection reaches
+            self.window = self.window.saturating_add(bytes);
         } else {
             // Congestion avoidance.
             let ca_start_time;
@@ -127,10 +129,12 @@ impl Controller for Cubic {
                 }
             }
 
-            let t = now - ca_start_time;
+            let t = now.saturating_duration_since(ca_start_time);
 
             // w_cubic(t + rtt)
-            let w_cubic = self.cubic_state.w_cubic(t + rtt.get(), self.current_mtu);
+            let w_cubic = self
+                .cubic_state
+                .w_cubic(t.saturating_add(rtt.get()), self.current_mtu);
 
             // w_est(t)
             let w_est = self.cubic_state.w_est(t, rtt.get(), self.current_mtu);
@@ -139,25 +143,29 @@ impl Controller for Cubic {
 
             if w_cubic < w_est {
                 // TCP friendly region.
-                cubic_cwnd = cmp::max(cubic_cwnd, w_est as u64);
-            } else if cubic_cwnd < w_cubic as u64 {
+                cubic_cwnd = cmp::max(cubic_cwnd, float::saturating_u64(w_est));
+            } else if cubic_cwnd < float::saturating_u64(w_cubic) {
                 // Concave region or convex region use same increment.
                 let cubic_inc =
                     (w_cubic - cubic_cwnd as f64) / cubic_cwnd as f64 * self.current_mtu as f64;
 
                 // w_cubic grows cubically with the time since the last congestion
                 // event and can exceed `u64::MAX` after a long lossless period.
-                cubic_cwnd = cubic_cwnd.saturating_add(cubic_inc as u64);
+                cubic_cwnd = cubic_cwnd.saturating_add(float::saturating_u64(cubic_inc));
             }
 
             // Update the increment and increase cwnd by MSS.
-            self.cubic_state.cwnd_inc += cubic_cwnd - self.window;
+            // `cubic_cwnd` starts from the window and only grows
+            self.cubic_state.cwnd_inc = self
+                .cubic_state
+                .cwnd_inc
+                .saturating_add(cubic_cwnd.saturating_sub(self.window));
 
             // cwnd_inc can be more than 1 MSS in the late stage of max probing.
             // however RFC9002 §7.3.3 (Congestion Avoidance) limits
             // the increase of cwnd to 1 max_datagram_size per cwnd acknowledged.
             if self.cubic_state.cwnd_inc >= self.current_mtu {
-                self.window += self.current_mtu;
+                self.window = self.window.saturating_add(self.current_mtu);
                 self.cubic_state.cwnd_inc = 0;
             }
         }
@@ -191,11 +199,15 @@ impl Controller for Cubic {
             self.cubic_state.w_max = window;
         }
 
-        self.ssthresh = cmp::max((window * BETA_CUBIC) as u64, self.minimum_window());
+        self.ssthresh = cmp::max(
+            float::saturating_u64(window * BETA_CUBIC),
+            self.minimum_window(),
+        );
         self.window = self.ssthresh;
         self.cubic_state.k = self.cubic_state.cubic_k(self.current_mtu);
 
-        self.cubic_state.cwnd_inc = (self.cubic_state.cwnd_inc as f64 * BETA_CUBIC) as u64;
+        self.cubic_state.cwnd_inc =
+            float::saturating_u64(self.cubic_state.cwnd_inc as f64 * BETA_CUBIC);
 
         if is_persistent_congestion {
             self.recovery_start_time = None;
@@ -203,7 +215,7 @@ impl Controller for Cubic {
 
             // 4.7 Timeout - reduce ssthresh based on BETA_CUBIC
             self.ssthresh = cmp::max(
-                (self.window as f64 * BETA_CUBIC) as u64,
+                float::saturating_u64(self.window as f64 * BETA_CUBIC),
                 self.minimum_window(),
             );
 

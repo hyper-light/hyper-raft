@@ -183,3 +183,155 @@ Tests:
     initial-CID routing table but are not connections.
 
 Result: 309 unit tests (upstream's 303 and 6 new) and 3 doctests pass.
+
+## 4. No panics in shipped code (2026-10-01)
+
+The crate takes the workspace's lint table (`[lints] workspace = true`; its own `[lints.rust]`
+and the crate-root `allow(clippy::cognitive_complexity)` are gone): no `unwrap`, `expect`,
+`panic!`, `unreachable!` or assert family, no indexing or slicing that can go out of bounds, no
+overflowing arithmetic, no narrowing `as`, `cognitive_complexity` at most 10, every `const`
+documented. No item or crate in shipped code allows any of them; test code opts out at the crate
+root (`#![cfg_attr(test, allow(...))]`, the same list as hyper-tls) and at `tests/handshake.rs`'s.
+
+### Classes of change
+
+1. **Lookups that cannot miss, by construction.** The packet number spaces are a `Spaces`
+   struct reached by `SpaceId` (`get`/`get_mut`), not `[PacketSpace; 3]` indexed by `space as
+   usize`; the per-direction stream state is `PerDir<T>`; the timer table is destructured by
+   `Timer`; BBR's gain cycle by its offset. The endpoint's `Index<ConnectionHandle> for
+   Slab<ConnectionMeta>` is gone: each lookup is `get`/`get_mut`/`try_remove`, and an event for a
+   connection the endpoint no longer knows is ignored.
+2. **Fallible signatures where a failure has a caller** (each an API change):
+   - `Endpoint::new` returns `Result<Self, RngUnavailable>`: the system RNG failing to seed it
+     was an `expect`.
+   - `Endpoint::refuse` returns `Option<Transmit>`, `None` where the close cannot be protected.
+   - `ClientConfig::with_root_certificates` returns `ClientConfigError` (the verifier's error, or
+     the TLS configuration's: no TLS 1.3, no initial cipher suite), `QuicClientConfig::new` and
+     `QuicServerConfig::new` return the `rustls::Error`; upstream `expect`ed both.
+   - `ConnectError::InvalidTlsConfig` is new: a client TLS configuration that cannot start a QUIC
+     session (one without TLS 1.3, which `TryFrom<rustls::ClientConfig>` does not check) was an
+     `unwrap` in `start_session`.
+   - The crypto traits: `crypto::ServerConfig::start_session` returns
+     `Result<Box<dyn Session>, TransportError>` and `retry_tag` `Result<[u8; 16], CryptoError>`;
+     `HeaderKey::encrypt`/`decrypt` and `PacketKey::encrypt` return `Result<(), CryptoError>`;
+     `HandshakeTokenKey::aead_from_hkdf` returns `Result<Box<dyn AeadKey>, CryptoError>`.
+   - `StreamId::new` returns `Option`: an index at `MAX_STREAM_COUNT` or past it has no ID.
+   - Internal: `PacketNumber::new` and `PacketSpace::get_tx_number` return `Option`;
+     `PacketBuilder::finish` returns `Option`; `PartialEncode::finish` returns `Result`;
+     `Connection::write_crypto`, `upgrade_crypto`, `update_keys` and `set_peer_params` return
+     `Result<_, TransportError>`; `Token::encode` returns `Option`;
+     `AckFrequencyState::next_sequence_number` returns `Option`.
+3. **The connection's own invariants, as typed errors.** Where the connection finds its own
+   state inconsistent (no keys for a space it is sending in, the 1-RTT keys without the next
+   phase's, keys handed over after the last space, the 0-RTT outcome unknown after the
+   handshake) it returns `TransportError::INTERNAL_ERROR`, or kills the connection with it where
+   the caller cannot return one (`PacketBuilder`). A packet being built when this happens is
+   taken back out of the buffer: nothing unprotected is sent.
+4. **Checked arithmetic and `get`.** Every offset and length the peer influences is checked:
+   packet and header decoding (the payload length, the token's position, the packet number),
+   frame decoding (ACK ranges, lengths, CIDs), transport parameters (lengths, the reserved
+   parameter), CRYPTO data's end (RFC 9000 §19.6: past 2^62 - 1 is a FRAME_ENCODING_ERROR),
+   header protection's sample, Retry integrity, stateless reset tokens.
+5. **Saturation where it is the stated meaning**, each with a comment: statistics counters
+   (`ConnectionStats`, ECN counts); byte counts and offsets bounded by an in-memory buffer;
+   required sizes, which can only over-state and so write less (`fits`, `min_size`,
+   `NewToken::size`); congestion windows, byte totals and BBR's bandwidth samples, which saturate
+   at a size no connection reaches; durations (PTO, RTT estimates, delays), which can only
+   lengthen. A deadline past what `Instant` represents is never reached: the timer is not armed
+   (idle, keep-alive, key discard, path validation, MTU reactivation), except the close timer,
+   which then fires at once so that a closing connection cannot be held forever.
+6. **Float to integer without `as`**: `float::saturating_u64`/`saturating_u32` give `as`'s
+   meaning (fraction dropped, saturating, NaN to zero), and `float::scale_duration` gives
+   `Duration::mul_f32`'s without its panic; tests check them against `as` and `mul_f32`.
+7. **Debug-only assertions removed** where they checked an internal precondition the callers
+   hold (packet builder sizes, GSO alignment, ACK-only writes, `discard_space`'s space, upgrade
+   order, `handle_first_packet`'s side, CID sequence ordering, MTU discovery's phase). Release
+   builds never evaluated them, so no behaviour changes; `SentFrames::is_ack_only`, used only by
+   one of them, is gone.
+8. **Restructured so the type system proves the invariant**: `set_key_discard_timer` starts
+   from `now`, which every caller had made the previous keys' end time (upstream `expect`ed
+   both the previous keys and their end); `PacketNumber::decode` takes the header's first byte,
+   whose two low bits are the length, instead of a length upstream matched with
+   `unreachable!`; `LongHeaderType::from_byte` matches the two type bits exhaustively;
+   `TransportParameterId::try_from` finds the ID among `SUPPORTED`; `get_or_insert_recv`
+   re-opens a freed stream by construction; the `IncomingImproperDropWarner` is dismissed by a
+   flag instead of `mem::forget`.
+9. **Split for `cognitive_complexity`** into named steps, behaviour unchanged:
+   `poll_transmit` (`close_pending`, `queue_ack_frequency`, `fill_spaces`, `fill_step`,
+   `start_datagram`, `congestion_blocks`, `finish_for_next_datagram`, `allocate_datagram`,
+   `write_close`, `encode_close`, `send_off_path_response`, `finish_last_packet`,
+   `write_mtu_probe`, over a `TransmitState`), `populate_packet` (`write_signal_frames`,
+   `write_ack_frequency`, `write_path_frames`, `write_crypto_frames`, `write_cid_frames`,
+   `write_datagram_frames`, `write_new_tokens`), `handle_packet` (`packet_result`,
+   `on_authentication_failure`, `on_decrypted_packet`, `drops_authenticated`, `after_packet`,
+   `state_after_error`), `process_decrypted_packet` (`process_established`,
+   `process_while_closed`, `process_retry`, `process_handshake_packet`,
+   `on_client_handshake_complete`, `process_initial_packet`, `process_version_negotiate`),
+   `process_payload` (`process_data_frame`, `process_stream_frame`, one handler per frame
+   kind, `after_payload`), `on_ack_received` (`record_largest_acked`, `on_packets_acked`,
+   `update_rtt`, `on_ack_ecn`), `detect_lost_packets` (`find_lost_packets`, `on_packets_lost`),
+   `handle_timeout` (`on_timer`), `Endpoint::handle` (`negotiate_version`, `buffer_incoming`,
+   `handle_unknown`), `handle_first_packet` (`admit_first_packet`,
+   `authenticate_first_packet`), `TransportParameters::write` (`write_param` and one writer per
+   kind), `StreamsState::write_control_frames` and `write_stream_frames`, `RecoveryMetrics`.
+10. **Bounded loops**: `Endpoint::new_cid` draws at most 155 CIDs, `(3/4)^155 < 2^-64` given
+    `cids_exhausted` keeps a quarter of short CID spaces free; a generator that keeps giving
+    used CIDs refuses the connection (`CidsExhausted`) instead of spinning. The STREAM copy loop
+    stops on an empty read instead of spinning.
+11. **Every `const` in `src/` carries a `///`** with its derivation or citation. Upstream's
+    tunables keep upstream's values and say so. `scripts/check-contracts.py` now treats a file
+    a `#[cfg(test)] mod name;` declares as test code, as it treated an inline `#[cfg(test)] mod`,
+    and no longer stops scanning the declaring file at that line.
+12. **Tests**: `tests/handshake.rs`'s `unsafe` counting allocator is replaced by
+    `hyper_measure::alloc::Counting`; upstream tests changed only where the API did
+    (`.unwrap()` on the new `Result`s and `Option`s) and in one MTU discovery test (below).
+
+### Behaviour changes: former panics and what they are now
+
+| Reached by | Upstream | Now |
+|---|---|---|
+| **Local configuration and data**: an initial MTU above 16 KiB with 0-RTT data (any long header packet larger than its two-byte length field) | `assert!` in `PartialEncode::finish`, active in release builds | the packet builder caps each long header packet at what the field holds (`PartialEncode::length_limit`); the data goes in the next packet (`zero_rtt_long_header_packets_fit_their_length_field`, which panics on upstream's code) |
+| The API: `recv_stream` on a stream this side opened unidirectionally, `send_stream` on one the peer did | `assert!` | every operation fails with `ClosedStream` (`stream_used_against_its_direction_is_closed`) |
+| The API: `poll_transmit` with `max_datagrams == 0` | `assert!` | `None`, nothing sent (`poll_transmit_with_no_datagrams_sends_nothing`) |
+| The API: `Endpoint::new` with the system RNG unavailable | `expect` | `RngUnavailable` |
+| The API: an `Incoming` from another endpoint passed to `accept`/`refuse`/`retry`/`ignore` | slab `remove` panicked | `accept` refuses it (`INTERNAL_ERROR`), `retry` hands it back, `refuse`/`ignore` release no buffer or configuration of this endpoint's |
+| The API: a client TLS configuration without TLS 1.3 | `unwrap` at `connect` | `ConnectError::InvalidTlsConfig` |
+| The API: a CID generator that keeps giving used CIDs | an endless loop | the connection is refused (`CidsExhausted`) |
+| The API: a 4-byte CID on a 32-bit target | `cids_exhausted` overflowed `usize` | counted in `u64` |
+| The API: `mtu_discovery_config` interval or black-hole cooldown, `keep_alive_interval` or `max_idle_timeout` past `Instant`'s range | `Instant + Duration` panicked | never reached: not armed |
+| The API: `time_threshold` negative or not finite | `Duration::mul_f32` panicked | a loss delay of the timer granularity, the floor upstream applies (`float::scale_duration` gives zero) |
+| A peer, after 2^31 unacknowledged packets of a space | `panic!("packet number too large to encode")` | the connection is killed (`INTERNAL_ERROR`), nothing more sent (`packet_number_beyond_any_encoding_is_refused`) |
+| The connection's own packet numbers reaching 2^62 | `assert!` | killed without sending anything further, as RFC 9000 §12.3 requires |
+| A peer's Initial token or payload length past `usize` (32-bit targets) | truncated by `as` | `InvalidHeader`, the packet dropped |
+| The peer's parameters arriving during an MTU search | `debug_assert!` (debug builds only) | recorded; upstream's `should_panic` test now asserts that (`mtu_discovery_with_peer_max_udp_payload_size_during_search_records_it`) |
+| A forged or unexpected Retry with no ClientHello kept | `unwrap` | the Retry is discarded |
+| The connection's own state inconsistent (class 3) | `unwrap`, `expect`, `unreachable!` | `INTERNAL_ERROR`, unreachable by construction |
+| Every other site | `unwrap`, `expect`, assert, indexing, overflow | a typed refusal, unreachable by construction |
+
+No panic in upstream's receive path was found reachable from the wire on a 64-bit target: each
+peer-influenced quantity upstream did not check is a varint below 2^62 added to another below
+2^16, or was checked before the site (the header protection sample length, the ACK ranges by
+`scan_ack_blocks`, the transport parameters' bounds). Those sites are checked now regardless.
+
+### Oracle
+
+319 unit tests pass: upstream's 309 (§3), `float`'s 2, and the new
+`zero_rtt_long_header_packets_fit_their_length_field`, `stream_used_against_its_direction_is_closed`,
+`poll_transmit_with_no_datagrams_sends_nothing` and `packet_number_beyond_any_encoding_is_refused`,
+with upstream's `mtu_discovery_with_peer_max_udp_payload_size_during_search_panics` turned into
+the test of what now happens instead. `tests/handshake.rs` 2 and the 3 doctests pass.
+
+### Allocations per handshake
+
+`tests/handshake.rs`, client and server together, macOS aarch64 development machine, debug
+profile, three runs each; the counts before are the same test at 3fa28ed (this section's base)
+with its own counting allocator, after with `hyper_measure::alloc`, which counts the same calls:
+
+| Handshake | Before | Now |
+|---|---|---|
+| Full | 494 allocations, 55–58 reallocations | 494 allocations, 56–58 reallocations |
+| Resumed | 501 allocations, 54–58 reallocations | 501 allocations, 53–56 reallocations |
+
+No path gained an allocation. A first draft built `TransportError`s, whose reason is a `String`,
+eagerly in `ok_or(...)` on the success path, which cost 9–10 allocations a handshake; they are
+built only on failure (`ok_or_else`).

@@ -111,7 +111,7 @@ impl QlogSink {
                 header: PacketHeader {
                     packet_number: Some(pn),
                     packet_type: packet_type(space, is_0rtt),
-                    length: Some(len as u16),
+                    length: u16::try_from(len).ok(),
                     ..Default::default()
                 },
                 ..Default::default()

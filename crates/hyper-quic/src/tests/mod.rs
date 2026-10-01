@@ -116,7 +116,7 @@ fn pending_incoming_can_retry_after_disabling_server() {
 fn version_negotiate_server() {
     let _guard = subscribe();
     let client_addr = "[::2]:7890".parse().unwrap();
-    let mut server = Endpoint::new(Default::default(), Some(server_config()), true, None);
+    let mut server = Endpoint::new(Default::default(), Some(server_config()), true, None).unwrap();
     let now = Instant::now();
     let mut buf = Vec::with_capacity(server.config().get_max_udp_payload_size() as usize);
     // Long-header packet with reserved version number
@@ -155,7 +155,8 @@ fn version_negotiate_client() {
         None,
         true,
         None,
-    );
+    )
+    .unwrap();
     let config = client.insert_client_config(client_config()).unwrap();
     let (_, mut client_ch) = client
         .connect(Instant::now(), config, server_addr, "localhost", None)
@@ -263,7 +264,8 @@ fn server_stateless_reset() {
     let mut pair = Pair::new(endpoint_config.clone(), server_config());
     let (client_ch, _) = pair.connect();
     pair.drive(); // Flush any post-handshake frames
-    pair.server.endpoint = Endpoint::new(endpoint_config, Some(server_config()), true, None);
+    pair.server.endpoint =
+        Endpoint::new(endpoint_config, Some(server_config()), true, None).unwrap();
     // Force the server to generate the smallest possible stateless reset
     pair.client.connections.get_mut(&client_ch).unwrap().ping();
     info!("resetting");
@@ -291,7 +293,8 @@ fn client_stateless_reset() {
 
     let mut pair = Pair::new(endpoint_config.clone(), server_config());
     let (_, server_ch) = pair.connect();
-    pair.client.endpoint = Endpoint::new(endpoint_config, Some(server_config()), true, None);
+    pair.client.endpoint =
+        Endpoint::new(endpoint_config, Some(server_config()), true, None).unwrap();
     // Send something big enough to allow room for a smaller stateless reset.
     pair.server.connections.get_mut(&server_ch).unwrap().close(
         pair.time,
@@ -316,7 +319,8 @@ fn stateless_reset_limit() {
     let mut endpoint_config = EndpointConfig::default();
     endpoint_config.cid_generator(Box::new(RandomConnectionIdGenerator::new(8)));
     let endpoint_config = endpoint_config;
-    let mut endpoint = Endpoint::new(endpoint_config.clone(), Some(server_config()), true, None);
+    let mut endpoint =
+        Endpoint::new(endpoint_config.clone(), Some(server_config()), true, None).unwrap();
     let time = Instant::now();
     let mut buf = Vec::new();
     let event = endpoint.handle(time, remote, None, None, [0u8; 1024][..].into(), &mut buf);
@@ -367,6 +371,48 @@ fn export_keying_material() {
         .unwrap();
 
     assert_eq!(&client_buf[..], &server_buf[..]);
+}
+
+/// A stream used in the direction it does not carry: upstream asserted against it as the
+/// stream was looked up; it is never among the side's streams of that direction, so each
+/// operation fails with `ClosedStream`
+#[test]
+fn stream_used_against_its_direction_is_closed() {
+    let _guard = subscribe();
+    let mut pair = Pair::default();
+    let (client_ch, server_ch) = pair.connect();
+
+    let s = pair.client_streams(client_ch).open(Dir::Uni).unwrap();
+    pair.client_send(client_ch, s).write(b"hello").unwrap();
+    pair.drive();
+
+    // The client opened it, so the client cannot receive on it
+    assert_matches!(
+        pair.client_recv(client_ch, s).read(true).err(),
+        Some(ReadableError::ClosedStream)
+    );
+    // The client opened it, so the server cannot send on it
+    assert_matches!(
+        pair.server_send(server_ch, s).write(b"no"),
+        Err(WriteError::ClosedStream)
+    );
+}
+
+/// Upstream asserted that a transmit takes at least one datagram; with none, nothing is sent
+#[test]
+fn poll_transmit_with_no_datagrams_sends_nothing() {
+    let _guard = subscribe();
+    let mut pair = Pair::default();
+    let (client_ch, _) = pair.connect();
+    let s = pair.client_streams(client_ch).open(Dir::Uni).unwrap();
+    pair.client_send(client_ch, s).write(b"hello").unwrap();
+    let mut buf = Vec::new();
+    let now = pair.time;
+    let configs = pair.client.endpoint.configs();
+    let conn = pair.client.connections.get_mut(&client_ch).unwrap();
+    assert!(conn.poll_transmit(now, 0, &mut buf, configs).is_none());
+    assert!(buf.is_empty());
+    assert!(conn.poll_transmit(now, 1, &mut buf, configs).is_some());
 }
 
 #[test]
@@ -588,6 +634,64 @@ fn high_latency_handshake() {
     assert_eq!(pair.server_conn_mut(server_ch).bytes_in_flight(), 0);
     assert!(pair.client_conn_mut(client_ch).using_ecn());
     assert!(pair.server_conn_mut(server_ch).using_ecn());
+}
+
+/// A 0-RTT packet has a long header, whose length field has two bytes reserved: with an initial
+/// MTU past 16 KiB, upstream wrote a packet past what the field holds and its assert panicked.
+/// The packet builder keeps each long header packet within the field, and the data arrives.
+#[test]
+fn zero_rtt_long_header_packets_fit_their_length_field() {
+    let _guard = subscribe();
+    let mut endpoint_config = EndpointConfig::default();
+    endpoint_config.max_udp_payload_size(65_527).unwrap();
+    let mut pair = Pair::new(endpoint_config, server_config());
+    pair.mtu = 65_527;
+    pair.server.handle_incoming = Box::new(validate_incoming);
+    let mut client_config = client_config();
+    let mut transport = TransportConfig::default();
+    transport.initial_mtu(20_000);
+    transport.mtu_discovery_config(None);
+    // A window that lets the first datagrams go out whole
+    let mut cubic = crate::congestion::CubicConfig::default();
+    cubic.initial_window(1_000_000);
+    transport.congestion(crate::congestion::Congestion::Cubic(cubic));
+    client_config.transport_config(transport);
+    let config = pair.add_client_config(client_config);
+
+    // Establish normal connection, so that the next resumes it with 0-RTT
+    let client_ch = pair.begin_connect_shared(config);
+    pair.drive();
+    pair.server.assert_accept();
+    pair.client
+        .connections
+        .get_mut(&client_ch)
+        .unwrap()
+        .close(pair.time, VarInt(0), [][..].into());
+    pair.drive();
+
+    pair.client.addr = SocketAddr::new(
+        Ipv6Addr::LOCALHOST.into(),
+        CLIENT_PORTS.lock().unwrap().next().unwrap(),
+    );
+    let client_ch = pair.begin_connect_shared(config);
+    assert!(pair.client_conn_mut(client_ch).has_0rtt());
+    let s = pair.client_streams(client_ch).open(Dir::Uni).unwrap();
+    let msg = vec![0xa5; 40_000];
+    let written = pair.client_send(client_ch, s).write(&msg).unwrap();
+    assert_eq!(written, msg.len());
+    pair.client_send(client_ch, s).finish().unwrap();
+    pair.drive();
+
+    assert!(pair.client_conn_mut(client_ch).accepted_0rtt());
+    let server_ch = pair.server.assert_accept();
+    let mut received = Vec::new();
+    let mut recv = pair.server_recv(server_ch, s);
+    let mut chunks = recv.read(true).unwrap();
+    while let Ok(Some(chunk)) = chunks.next(usize::MAX) {
+        received.extend_from_slice(&chunk.bytes);
+    }
+    let _ = chunks.finalize();
+    assert_eq!(received, msg);
 }
 
 #[test]
@@ -1583,10 +1687,10 @@ fn idle_timeout() {
     while !pair.client_conn_mut(client_ch).is_closed()
         || !pair.server_conn_mut(server_ch).is_closed()
     {
-        if !pair.step() {
-            if let Some(t) = min_opt(pair.client.next_wakeup(), pair.server.next_wakeup()) {
-                pair.time = t;
-            }
+        if !pair.step()
+            && let Some(t) = min_opt(pair.client.next_wakeup(), pair.server.next_wakeup())
+        {
+            pair.time = t;
         }
         pair.client.inbound.clear(); // Simulate total S->C packet loss
     }
@@ -1919,10 +2023,10 @@ fn keep_alive() {
     // Run a good while longer than the idle timeout
     let end = pair.time + Duration::from_millis(20 * IDLE_TIMEOUT);
     while pair.time < end {
-        if !pair.step() {
-            if let Some(time) = min_opt(pair.client.next_wakeup(), pair.server.next_wakeup()) {
-                pair.time = time;
-            }
+        if !pair.step()
+            && let Some(time) = min_opt(pair.client.next_wakeup(), pair.server.next_wakeup())
+        {
+            pair.time = time;
         }
         assert!(!pair.client_conn_mut(client_ch).is_closed());
         assert!(!pair.server_conn_mut(server_ch).is_closed());
@@ -1943,8 +2047,9 @@ fn cid_rotation() {
         Some(server_config()),
         true,
         None,
-    );
-    let client = Endpoint::new(EndpointConfig::default(), None, true, None);
+    )
+    .unwrap();
+    let client = Endpoint::new(EndpointConfig::default(), None, true, None).unwrap();
 
     let mut pair = Pair::new_from_endpoint(client, server);
     let (_, server_ch) = pair.connect();
@@ -1964,10 +2069,10 @@ fn cid_rotation() {
         stop += CID_TIMEOUT;
         // Run a while until PushNewCID timer fires
         while pair.time < stop {
-            if !pair.step() {
-                if let Some(time) = min_opt(pair.client.next_wakeup(), pair.server.next_wakeup()) {
-                    pair.time = time;
-                }
+            if !pair.step()
+                && let Some(time) = min_opt(pair.client.next_wakeup(), pair.server.next_wakeup())
+            {
+                pair.time = time;
             }
         }
         info!(
@@ -2233,7 +2338,7 @@ fn tail_loss_respect_max_datagrams() {
         let mut t_config = TransportConfig::default();
         //Disabling GSO, so only a single segment should be sent per iops
         t_config.enable_segmentation_offload(false);
-        c_config.transport_config(t_config.into());
+        c_config.transport_config(t_config);
         c_config
     };
     let mut pair = Pair::default();
@@ -2351,7 +2456,7 @@ fn datagram_send_buffer_overflow() {
         let mut config = client_config();
         let mut transport = TransportConfig::default();
         transport.datagram_send_buffer_size(WINDOW);
-        config.transport_config(transport.into());
+        config.transport_config(transport);
         config
     };
     let mut pair = Pair::default();
@@ -2389,7 +2494,7 @@ fn datagram_send_buffer_space_preserves_queued_datagrams() {
     let mut client_config = client_config();
     let mut transport_config = TransportConfig::default();
     transport_config.datagram_send_buffer_size(100 + 3 * size_of::<Datagram>());
-    client_config.transport_config(transport_config.into());
+    client_config.transport_config(transport_config);
     let (client_ch, server_ch) = pair.connect_with(client_config);
 
     let first = Bytes::from_static(&[1; 7]);
@@ -2420,7 +2525,7 @@ fn datagram_larger_than_send_buffer_is_too_large() {
     let mut client_config = client_config();
     let mut transport_config = TransportConfig::default();
     transport_config.datagram_send_buffer_size(1 + size_of::<Datagram>());
-    client_config.transport_config(transport_config.into());
+    client_config.transport_config(transport_config);
     let (client_ch, _) = pair.connect_with(client_config);
 
     assert_matches!(
@@ -2449,7 +2554,7 @@ fn datagram_send_buffer_metadata_boundaries() {
             let mut client_config = client_config();
             let mut transport_config = TransportConfig::default();
             transport_config.datagram_send_buffer_size(window);
-            client_config.transport_config(transport_config.into());
+            client_config.transport_config(transport_config);
             let (client_ch, server_ch) = pair.connect_with(client_config);
 
             let Some(payload_capacity) = window.checked_sub(size_of::<Datagram>()) else {
@@ -2485,7 +2590,7 @@ fn datagram_send_buffer_blocks_until_drained() {
     let mut client_config = client_config();
     let mut transport_config = TransportConfig::default();
     transport_config.datagram_send_buffer_size(2 * (LEN + size_of::<Datagram>()));
-    client_config.transport_config(transport_config.into());
+    client_config.transport_config(transport_config);
     let (client_ch, server_ch) = pair.connect_with(client_config);
 
     for i in 0..2u8 {
@@ -2802,7 +2907,7 @@ pub(super) fn big_cert_and_key() -> (CertificateDer<'static>, PrivateKeyDer<'sta
 fn malformed_token_len() {
     let _guard = subscribe();
     let client_addr = "[::2]:7890".parse().unwrap();
-    let mut server = Endpoint::new(Default::default(), Some(server_config()), true, None);
+    let mut server = Endpoint::new(Default::default(), Some(server_config()), true, None).unwrap();
     let mut buf = Vec::with_capacity(server.config().get_max_udp_payload_size() as usize);
     server.handle(
         Instant::now(),
@@ -2902,12 +3007,12 @@ fn migrate_detects_new_mtu_and_respects_original_peer_max_udp_payload_size() {
 
     // Set up a client with a max payload size of 1400 (and use the defaults for the server)
     let server_endpoint_config = EndpointConfig::default();
-    let server = Endpoint::new(server_endpoint_config, Some(server_config()), true, None);
+    let server = Endpoint::new(server_endpoint_config, Some(server_config()), true, None).unwrap();
     let client_endpoint_config = EndpointConfig {
         max_udp_payload_size: VarInt::from(client_max_udp_payload_size),
         ..EndpointConfig::default()
     };
-    let client = Endpoint::new(client_endpoint_config, None, true, None);
+    let client = Endpoint::new(client_endpoint_config, None, true, None).unwrap();
     let mut pair = Pair::new_from_endpoint(client, server);
     pair.mtu = 1300;
 
@@ -3819,7 +3924,7 @@ fn pad_to_mtu() {
             pad_to_mtu: true,
             ..TransportConfig::default()
         };
-        c_config.transport_config(t_config.into());
+        c_config.transport_config(t_config);
         c_config
     };
     let mut pair = Pair::default();
@@ -4017,7 +4122,7 @@ fn oversized_datagrams_trigger_unblock() {
     let mut transport_config = TransportConfig::default();
     let send_buffer_size = transport_config.datagram_send_buffer_size;
     transport_config.initial_mtu(INITIAL_MTU as u16);
-    client_config.transport_config(transport_config.into());
+    client_config.transport_config(transport_config);
 
     let (client_ch, _) = pair.connect_with(client_config);
 
@@ -4134,7 +4239,7 @@ fn ack_bundled_with_datagrams() {
 fn reject_short_idcid() {
     let _guard = subscribe();
     let client_addr = "[::2]:7890".parse().unwrap();
-    let mut server = Endpoint::new(Default::default(), Some(server_config()), true, None);
+    let mut server = Endpoint::new(Default::default(), Some(server_config()), true, None).unwrap();
     let now = Instant::now();
     let mut buf = Vec::with_capacity(server.config().get_max_udp_payload_size() as usize);
     // Initial header that has an empty DCID but is otherwise well-formed

@@ -78,7 +78,6 @@ impl CidState {
             // Compare the timestamp with the last inserted record
             // Combine into a single batch if timestamp of current cid is same as the last record
             if expire_at == last.timestamp {
-                debug_assert!(new_cid_seq > last.sequence);
                 last.sequence = new_cid_seq;
                 return;
             }
@@ -102,7 +101,8 @@ impl CidState {
         let next_retire_sequence = self
             .retire_timestamp
             .pop_front()
-            .map(|seq| seq.sequence + 1);
+            // Sequence numbers are varints, below 2^62
+            .map(|seq| seq.sequence.saturating_add(1));
 
         // According to RFC:
         // Endpoints SHOULD NOT issue updates of the Retire Prior To field
@@ -138,7 +138,8 @@ impl CidState {
             Some(cid) => cid,
             None => return,
         };
-        self.issued += ids.len() as u64;
+        // A count of CIDs issued, below 2^62
+        self.issued = self.issued.saturating_add(ids.len() as u64);
         // Record the timestamp of CID with the largest seq number
         let sequence = last_cid.sequence;
         ids.iter().for_each(|frame| {

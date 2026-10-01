@@ -54,8 +54,9 @@ impl Pair {
     }
 
     pub(super) fn new(endpoint_config: EndpointConfig, server_config: ServerConfig) -> Self {
-        let server = Endpoint::new(endpoint_config.clone(), Some(server_config), true, None);
-        let client = Endpoint::new(endpoint_config, None, true, None);
+        let server =
+            Endpoint::new(endpoint_config.clone(), Some(server_config), true, None).unwrap();
+        let client = Endpoint::new(endpoint_config, None, true, None).unwrap();
 
         Self::new_from_endpoint(client, server)
     }
@@ -461,10 +462,10 @@ impl TestEndpoint {
             }
 
             for (ch, event) in endpoint_events {
-                if let Some(event) = self.endpoint.handle_event(ch, event) {
-                    if let Some(conn) = self.connections.get_mut(&ch) {
-                        conn.handle_event(event, self.endpoint.configs_mut());
-                    }
+                if let Some(event) = self.endpoint.handle_event(ch, event)
+                    && let Some(conn) = self.connections.get_mut(&ch)
+                {
+                    conn.handle_event(event, self.endpoint.configs_mut());
                 }
             }
         }
@@ -520,7 +521,7 @@ impl TestEndpoint {
 
     pub(super) fn reject(&mut self, incoming: Incoming) {
         let mut buf = Vec::new();
-        let transmit = self.endpoint.refuse(incoming, &mut buf);
+        let transmit = self.endpoint.refuse(incoming, &mut buf).unwrap();
         let size = transmit.size;
         self.outbound.extend(split_transmit(transmit, &buf[..size]));
     }
@@ -696,7 +697,8 @@ fn client_crypto_inner(
         WebPkiServerVerifier::builder_with_provider(roots, configured_provider())
             .build()
             .unwrap(),
-    );
+    )
+    .unwrap();
     inner.key_log = Box::new(KeyLogFile::new());
     if let Some(alpn) = alpn {
         inner.alpn_protocols = alpn;

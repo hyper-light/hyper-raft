@@ -21,7 +21,12 @@ impl RangeSet {
         self.pred(x).is_some_and(|(_, end)| end > x)
     }
 
+    /// Inserts `x`. `u64::MAX` has no half-open range and is not inserted; the values inserted
+    /// are packet numbers and stream offsets, below 2^62.
     pub fn insert_one(&mut self, x: u64) -> bool {
+        let Some(after) = x.checked_add(1) else {
+            return false;
+        };
         if let Some((start, end)) = self.pred(x) {
             match end.cmp(&x) {
                 // Wholly contained
@@ -31,12 +36,12 @@ impl RangeSet {
                 Ordering::Equal => {
                     // Extend existing
                     self.0.remove(&start);
-                    let mut new_end = x + 1;
-                    if let Some((next_start, next_end)) = self.succ(x) {
-                        if next_start == new_end {
-                            self.0.remove(&next_start);
-                            new_end = next_end;
-                        }
+                    let mut new_end = after;
+                    if let Some((next_start, next_end)) = self.succ(x)
+                        && next_start == new_end
+                    {
+                        self.0.remove(&next_start);
+                        new_end = next_end;
                     }
                     self.0.insert(start, new_end);
                     return true;
@@ -44,12 +49,12 @@ impl RangeSet {
                 _ => {}
             }
         }
-        let mut new_end = x + 1;
-        if let Some((next_start, next_end)) = self.succ(x) {
-            if next_start == new_end {
-                self.0.remove(&next_start);
-                new_end = next_end;
-            }
+        let mut new_end = after;
+        if let Some((next_start, next_end)) = self.succ(x)
+            && next_start == new_end
+        {
+            self.0.remove(&next_start);
+            new_end = next_end;
         }
         self.0.insert(x, new_end);
         true
@@ -181,7 +186,10 @@ impl RangeSet {
     }
 
     pub fn max(&self) -> Option<u64> {
-        self.0.last_key_value().map(|(_, &end)| end - 1)
+        // Ranges are non-empty, so `end` is at least 1.
+        self.0
+            .last_key_value()
+            .and_then(|(_, &end)| end.checked_sub(1))
     }
 
     pub fn len(&self) -> usize {
@@ -250,7 +258,8 @@ impl Iterator for EltIter<'_> {
             self.end = end;
         }
         let x = self.next;
-        self.next += 1;
+        // `x` is below `end`.
+        self.next = x.saturating_add(1);
         Some(x)
     }
 }
@@ -262,7 +271,8 @@ impl DoubleEndedIterator for EltIter<'_> {
             self.next = start;
             self.end = end;
         }
-        self.end -= 1;
+        // `next` is below `end`, so `end` is at least 1.
+        self.end = self.end.saturating_sub(1);
         Some(self.end)
     }
 }

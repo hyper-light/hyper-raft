@@ -49,7 +49,7 @@ impl Assembler {
             let mut recvd = RangeSet::new();
             recvd.insert(0..self.bytes_read);
             for chunk in &self.data {
-                recvd.insert(chunk.offset..chunk.offset + chunk.bytes.len() as u64);
+                recvd.insert(chunk.offset..chunk.end());
             }
             self.state = State::Unordered { recvd };
         }
@@ -65,33 +65,37 @@ impl Assembler {
                 if chunk.offset > self.bytes_read {
                     // Next chunk is after current read index
                     return None;
-                } else if (chunk.offset + chunk.bytes.len() as u64) <= self.bytes_read {
+                } else if chunk.end() <= self.bytes_read {
                     // Next chunk is useless as the read index is beyond its end
-                    self.buffered -= chunk.bytes.len();
-                    self.allocated -= chunk.allocation_size;
+                    self.buffered = self.buffered.saturating_sub(chunk.bytes.len());
+                    self.allocated = self.allocated.saturating_sub(chunk.allocation_size);
                     PeekMut::pop(chunk);
                     continue;
                 }
 
-                // Determine `start` and `len` of the slice of useful data in chunk
-                let start = (self.bytes_read - chunk.offset) as usize;
+                // Determine `start` and `len` of the slice of useful data in chunk: the read
+                // index lies within it.
+                let start =
+                    to_usize(self.bytes_read.saturating_sub(chunk.offset)).min(chunk.bytes.len());
                 if start > 0 {
                     chunk.bytes.advance(start);
-                    chunk.offset += start as u64;
-                    self.buffered -= start;
+                    chunk.offset = chunk.offset.saturating_add(len_u64(start));
+                    self.buffered = self.buffered.saturating_sub(start);
                 }
             }
 
+            // Stream offsets are below 2^62 and lengths are of data in memory: the sums do not
+            // saturate.
             return Some(if max_length < chunk.bytes.len() {
-                self.bytes_read += max_length as u64;
+                self.bytes_read = self.bytes_read.saturating_add(len_u64(max_length));
                 let offset = chunk.offset;
-                chunk.offset += max_length as u64;
-                self.buffered -= max_length;
+                chunk.offset = chunk.offset.saturating_add(len_u64(max_length));
+                self.buffered = self.buffered.saturating_sub(max_length);
                 Chunk::new(offset, chunk.bytes.split_to(max_length))
             } else {
-                self.bytes_read += chunk.bytes.len() as u64;
-                self.buffered -= chunk.bytes.len();
-                self.allocated -= chunk.allocation_size;
+                self.bytes_read = self.bytes_read.saturating_add(len_u64(chunk.bytes.len()));
+                self.buffered = self.buffered.saturating_sub(chunk.bytes.len());
+                self.allocated = self.allocated.saturating_sub(chunk.allocation_size);
                 let chunk = PeekMut::pop(chunk);
                 Chunk::new(chunk.offset, chunk.bytes)
             });
@@ -109,20 +113,21 @@ impl Assembler {
         let old = mem::replace(&mut self.data, new);
         let mut buffers = old.into_sorted_vec();
         self.buffered = 0;
-        let mut fragmented_buffered = 0;
+        let mut fragmented_buffered: usize = 0;
         let mut offset = 0;
         for chunk in buffers.iter_mut().rev() {
             chunk.try_mark_defragment(offset);
             let size = chunk.bytes.len();
-            offset = chunk.offset + size as u64;
-            self.buffered += size;
+            offset = chunk.end();
+            // Bytes in memory: the sums do not saturate.
+            self.buffered = self.buffered.saturating_add(size);
             if !chunk.defragmented || size < min_chunk_size {
-                fragmented_buffered += size;
+                fragmented_buffered = fragmented_buffered.saturating_add(size);
             }
         }
         self.allocated = self.buffered;
         let mut buffer = BytesMut::with_capacity(fragmented_buffered);
-        let mut offset = 0;
+        let mut offset: u64 = 0;
         for chunk in buffers.into_iter().rev() {
             // bytes might be empty after try_mark_defragment
             if chunk.bytes.is_empty() {
@@ -133,7 +138,7 @@ impl Assembler {
                 continue;
             }
             // Overlap is resolved by try_mark_defragment
-            if chunk.offset != offset + (buffer.len() as u64) {
+            if chunk.offset != offset.saturating_add(len_u64(buffer.len())) {
                 if !buffer.is_empty() {
                     self.data
                         .push(Buffer::new_defragmented(offset, buffer.split().freeze()));
@@ -156,53 +161,54 @@ impl Assembler {
         mut bytes: Bytes,
         allocation_size: usize,
     ) -> Result<(), TooManyChunks> {
-        debug_assert!(
-            bytes.len() <= allocation_size,
-            "allocation_size less than bytes.len(): {:?} < {:?}",
-            allocation_size,
-            bytes.len()
-        );
-        self.end = self.end.max(offset + bytes.len() as u64);
+        // `allocation_size` is at least `bytes.len()` (upstream asserted that in debug builds).
+        // Stream offsets are below 2^62, checked when the frame was decoded, so the sums of an
+        // offset and a length do not saturate.
+        let data_end = offset.saturating_add(len_u64(bytes.len()));
+        self.end = self.end.max(data_end);
         if let State::Unordered { ref mut recvd } = self.state {
             // Discard duplicate data
-            for duplicate in recvd.replace(offset..offset + bytes.len() as u64) {
+            for duplicate in recvd.replace(offset..data_end) {
+                // Each duplicate lies within the data from `offset` on.
                 if duplicate.start > offset {
-                    let buffer = Buffer::new(
-                        offset,
-                        bytes.split_to((duplicate.start - offset) as usize),
-                        allocation_size,
-                    );
-                    self.buffered += buffer.bytes.len();
-                    self.allocated += buffer.allocation_size;
+                    let before = to_usize(duplicate.start.saturating_sub(offset)).min(bytes.len());
+                    let buffer = Buffer::new(offset, bytes.split_to(before), allocation_size);
+                    // Bytes in memory: the sums do not saturate.
+                    self.buffered = self.buffered.saturating_add(buffer.bytes.len());
+                    self.allocated = self.allocated.saturating_add(buffer.allocation_size);
                     self.data.push(buffer);
                     offset = duplicate.start;
                 }
-                bytes.advance((duplicate.end - offset) as usize);
+                bytes.advance(to_usize(duplicate.end.saturating_sub(offset)).min(bytes.len()));
                 offset = duplicate.end;
             }
         } else if offset < self.bytes_read {
-            if (offset + bytes.len() as u64) <= self.bytes_read {
+            if data_end <= self.bytes_read {
                 return Ok(());
             } else {
-                let diff = self.bytes_read - offset;
-                offset += diff;
-                bytes.advance(diff as usize);
+                let diff = self.bytes_read.saturating_sub(offset);
+                offset = self.bytes_read;
+                bytes.advance(to_usize(diff).min(bytes.len()));
             }
         }
 
         // No early return when empty: the dedup loop above may already have pushed chunks.
         if !bytes.is_empty() {
             let buffer = Buffer::new(offset, bytes, allocation_size);
-            self.buffered += buffer.bytes.len();
-            self.allocated += buffer.allocation_size;
+            // Bytes in memory: the sums do not saturate.
+            self.buffered = self.buffered.saturating_add(buffer.bytes.len());
+            self.allocated = self.allocated.saturating_add(buffer.allocation_size);
             self.data.push(buffer);
         }
         // `self.buffered` also counts duplicate bytes, therefore we use
         // `self.end - self.bytes_read` as an upper bound of buffered unique
         // bytes. This will cause a defragmentation if the amount of duplicate
         // bytes exceedes a proportion of the receive window size.
-        let buffered = self.buffered.min((self.end - self.bytes_read) as usize);
-        let over_allocation = self.allocated - buffered;
+        let buffered = self
+            .buffered
+            .min(to_usize(self.end.saturating_sub(self.bytes_read)));
+        // `allocated` is never less than `buffered`.
+        let over_allocation = self.allocated.saturating_sub(buffered);
         // Rationale: on the one hand, we want to defragment rarely, ideally never
         // in non-pathological scenarios. However, a pathological or malicious
         // peer could send us one-byte frames, and since we use reference-counted
@@ -210,7 +216,7 @@ impl Assembler {
         // of memory allocated. This limits over-allocation in proportion to the
         // buffered data. The constants are chosen somewhat arbitrarily and try to
         // balance between defragmentation overhead and over-allocation.
-        let threshold = 32768.max(buffered * 3 / 2);
+        let threshold = 32768.max(buffered.saturating_mul(3) / 2);
         // Small gapped frames hold over-allocation below the threshold, so bound the count too.
         if over_allocation > threshold || self.data.len() > COMPACT_THRESHOLD {
             self.defragment();
@@ -273,6 +279,12 @@ impl Buffer {
         }
     }
 
+    /// The stream offset just past this buffer's data: below 2^62, so the sum does not
+    /// saturate.
+    fn end(&self) -> u64 {
+        self.offset.saturating_add(len_u64(self.bytes.len()))
+    }
+
     /// Constructs a new defragmented Buffer
     fn new_defragmented(offset: u64, bytes: Bytes) -> Self {
         let allocation_size = bytes.len();
@@ -286,7 +298,7 @@ impl Buffer {
 
     /// Discards data before `offset` and flags `self` as defragmented if it has good utilization
     fn try_mark_defragment(&mut self, offset: u64) {
-        let duplicate = offset.saturating_sub(self.offset) as usize;
+        let duplicate = to_usize(offset.saturating_sub(self.offset));
         self.offset = self.offset.max(offset);
         if duplicate >= self.bytes.len() {
             // All bytes are duplicate
@@ -298,7 +310,8 @@ impl Buffer {
         self.bytes.advance(duplicate);
         // Make sure that fragmented buffers with high utilization become defragmented and
         // defragmented buffers remain defragmented
-        self.defragmented = self.defragmented || self.bytes.len() * 6 / 5 >= self.allocation_size;
+        self.defragmented =
+            self.defragmented || self.bytes.len().saturating_mul(6) / 5 >= self.allocation_size;
         if self.defragmented {
             // Make sure that defragmented buffers do not contribute to over-allocation
             self.allocation_size = self.bytes.len();
@@ -371,6 +384,17 @@ const MIN_RETAINED_CHUNK_SIZE: usize = 128;
 /// Above `MAX_CHUNKS` so a flood of mergeable frames cannot force a defragmentation
 /// per frame.
 const COMPACT_THRESHOLD: usize = 2 * MAX_CHUNKS;
+
+/// A length in memory as a stream offset: a usize fits a u64 on every supported target.
+fn len_u64(len: usize) -> u64 {
+    u64::try_from(len).unwrap_or(u64::MAX)
+}
+
+/// A stream distance as a length in memory: one larger than a usize is larger than any data
+/// held, which every use clamps to.
+fn to_usize(distance: u64) -> usize {
+    usize::try_from(distance).unwrap_or(usize::MAX)
+}
 
 #[cfg(test)]
 mod test {

@@ -156,19 +156,31 @@ pub trait ServerConfig: Any + Send + Sync {
 
     /// Generate the integrity tag for a retry packet
     ///
-    /// Never called if `initial_keys` rejected `version`.
-    fn retry_tag(&self, version: u32, orig_dst_cid: &ConnectionId, packet: &[u8]) -> [u8; 16];
+    /// Never called if `initial_keys` rejected `version`; fails if the tag cannot be made
+    /// (upstream panicked).
+    fn retry_tag(
+        &self,
+        version: u32,
+        orig_dst_cid: &ConnectionId,
+        packet: &[u8],
+    ) -> Result<[u8; 16], CryptoError>;
 
     /// Start a server session with this configuration
     ///
-    /// Never called if `initial_keys` rejected `version`.
-    fn start_session(&self, version: u32, params: &TransportParameters) -> Box<dyn Session>;
+    /// Never called if `initial_keys` rejected `version`; fails if the configuration cannot
+    /// start a session (upstream panicked).
+    fn start_session(
+        &self,
+        version: u32,
+        params: &TransportParameters,
+    ) -> Result<Box<dyn Session>, TransportError>;
 }
 
 /// Keys used to protect packet payloads
 pub trait PacketKey: Send + Sync {
-    /// Encrypt the packet payload with the given packet number
-    fn encrypt(&self, packet: u64, buf: &mut [u8], header_len: usize);
+    /// Encrypt the packet payload with the given packet number; fails if `buf` has no room for
+    /// the tag after the header, or the key refuses (upstream panicked)
+    fn encrypt(&self, packet: u64, buf: &mut [u8], header_len: usize) -> Result<(), CryptoError>;
     /// Decrypt the packet payload with the given packet number
     fn decrypt(
         &self,
@@ -187,10 +199,12 @@ pub trait PacketKey: Send + Sync {
 
 /// Keys used to protect packet headers
 pub trait HeaderKey: Send + Sync {
-    /// Decrypt the given packet's header
-    fn decrypt(&self, pn_offset: usize, packet: &mut [u8]);
-    /// Encrypt the given packet's header
-    fn encrypt(&self, pn_offset: usize, packet: &mut [u8]);
+    /// Decrypt the given packet's header; fails if the packet is too short to sample (upstream
+    /// panicked)
+    fn decrypt(&self, pn_offset: usize, packet: &mut [u8]) -> Result<(), CryptoError>;
+    /// Encrypt the given packet's header; fails if the packet is too short to sample (upstream
+    /// panicked)
+    fn encrypt(&self, pn_offset: usize, packet: &mut [u8]) -> Result<(), CryptoError>;
     /// The sample size used for this key's algorithm
     fn sample_size(&self) -> usize;
 }
@@ -213,8 +227,8 @@ pub struct ExportKeyingMaterialError;
 
 /// A pseudo random key for HKDF
 pub trait HandshakeTokenKey: Send + Sync {
-    /// Derive AEAD using hkdf
-    fn aead_from_hkdf(&self, random_bytes: &[u8]) -> Box<dyn AeadKey>;
+    /// Derive AEAD using hkdf; an error where the key cannot be derived (upstream panicked)
+    fn aead_from_hkdf(&self, random_bytes: &[u8]) -> Result<Box<dyn AeadKey>, CryptoError>;
 }
 
 /// A key for sealing data with AEAD-based algorithms

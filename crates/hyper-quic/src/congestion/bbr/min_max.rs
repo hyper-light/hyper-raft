@@ -56,7 +56,7 @@ impl MinMax {
 
         if self.samples[0].value == 0  /* uninitialised */
             || /* found new max? */ sample.value >= self.samples[0].value
-            || /* nothing left in window? */ sample.time - self.samples[2].time > self.window
+            || /* nothing left in window? */ sample.time.saturating_sub(self.samples[2].time) > self.window
         {
             self.fill(sample); /* forget earlier samples */
             return;
@@ -74,7 +74,8 @@ impl MinMax {
 
     /* As time advances, update the 1st, 2nd, and 3rd choices. */
     fn subwin_update(&mut self, sample: MinMaxSample) {
-        let dt = sample.time - self.samples[0].time;
+        // Rounds only advance, so no sample is later than the current one
+        let dt = sample.time.saturating_sub(self.samples[0].time);
         if dt > self.window {
             /*
              * Passed entire window without a new sample so make 2nd
@@ -86,7 +87,7 @@ impl MinMax {
             self.samples[0] = self.samples[1];
             self.samples[1] = self.samples[2];
             self.samples[2] = sample;
-            if sample.time - self.samples[0].time > self.window {
+            if sample.time.saturating_sub(self.samples[0].time) > self.window {
                 self.samples[0] = self.samples[1];
                 self.samples[1] = self.samples[2];
                 self.samples[2] = sample;

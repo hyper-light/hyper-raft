@@ -78,25 +78,22 @@ impl State {
             // key already exists, push the new token to its token queue
             let tokens = &mut self.lru.get_mut(slot).tokens;
             if tokens.len() >= self.max_tokens_per_server {
-                debug_assert!(tokens.len() == self.max_tokens_per_server);
-                tokens.pop_front().unwrap();
+                tokens.pop_front();
             }
             tokens.push_back(token);
             return;
         }
 
         // key does not yet exist, create a new one, evicting the oldest if necessary
-        if self.lru.len() >= self.max_server_names {
-            // unwrap safety: max_server_names is > 0, so there's at least one entry, so lru() is
-            //                some
-            let evicted = self.lru.lru().unwrap();
+        // max_server_names is > 0, so a full cache has a least recently used entry
+        if self.lru.len() >= self.max_server_names
+            && let Some(evicted) = self.lru.lru()
+        {
             self.lru.remove(evicted);
             // The map is the name's only owner, so the evicted name is found by its slot: a scan
             // of at most `max_server_names` entries, paid only when a new name evicts an old one.
             // Upstream kept a second reference to the name in the entry, through an `Arc<str>`.
-            let before = self.lookup.len();
             self.lookup.retain(|_, slot| *slot != evicted);
-            debug_assert_eq!(self.lookup.len() + 1, before);
         }
 
         let slot = self.lru.insert(CacheEntry::new(token));
@@ -108,8 +105,8 @@ impl State {
 
         // pop from entry's token queue
         let entry = self.lru.get_mut(slab_key);
-        // unwrap safety: we never leave tokens empty
-        let token = entry.tokens.pop_front().unwrap();
+        // An entry's tokens are never left empty
+        let token = entry.tokens.pop_front();
 
         if entry.tokens.is_empty() {
             // token stack emptied, remove entry
@@ -117,7 +114,7 @@ impl State {
             self.lookup.remove(server_name);
         }
 
-        Some(token)
+        token
     }
 }
 

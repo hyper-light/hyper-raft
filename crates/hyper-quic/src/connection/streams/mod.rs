@@ -49,14 +49,17 @@ impl<'a> Streams<'a> {
         }
 
         // TODO: Queue STREAM_ID_BLOCKED if this fails
-        if self.state.next[dir as usize] >= self.state.max[dir as usize] {
+        if *self.state.next.get(dir) >= *self.state.max.get(dir) {
             return None;
         }
 
-        self.state.next[dir as usize] += 1;
-        let id = StreamId::new(self.state.side, dir, self.state.next[dir as usize] - 1);
+        // Below `max`, which a VarInt bounds below 2^60 (`MAX_STREAM_COUNT`).
+        let index = *self.state.next.get(dir);
+        let id = StreamId::new(self.state.side, dir, index)?;
+        *self.state.next.get_mut(dir) = index.saturating_add(1);
         self.state.insert(false, id);
-        self.state.send_streams += 1;
+        // A count of streams held in memory.
+        self.state.send_streams = self.state.send_streams.saturating_add(1);
         Some(id)
     }
 
@@ -65,17 +68,19 @@ impl<'a> Streams<'a> {
     /// Returns `None` if there are no new incoming streams for this connection.
     /// Has no impact on the data flow-control or stream concurrency limits.
     pub fn accept(&mut self, dir: Dir) -> Option<StreamId> {
-        if self.state.next_remote[dir as usize] == self.state.next_reported_remote[dir as usize] {
+        if *self.state.next_remote.get(dir) == *self.state.next_reported_remote.get(dir) {
             return None;
         }
 
-        let x = self.state.next_reported_remote[dir as usize];
-        self.state.next_reported_remote[dir as usize] = x + 1;
+        // Below `next_remote`, which the peer's stream limit bounds below 2^60.
+        let x = *self.state.next_reported_remote.get(dir);
+        let id = StreamId::new(!self.state.side, dir, x)?;
+        *self.state.next_reported_remote.get_mut(dir) = x.saturating_add(1);
         if dir == Dir::Bi {
-            self.state.send_streams += 1;
+            self.state.send_streams = self.state.send_streams.saturating_add(1);
         }
 
-        Some(StreamId::new(!self.state.side, dir, x))
+        Some(id)
     }
 
     #[cfg(fuzzing)]
@@ -95,9 +100,13 @@ impl<'a> Streams<'a> {
     /// [`Connection::max_concurrent_streams`](super::Connection::max_concurrent_streams).
     pub fn remote_open_streams(&self, dir: Dir) -> u64 {
         // total opened - total closed = total opened - ( total permitted - total permitted unclosed )
-        self.state.next_remote[dir as usize]
-            - (self.state.max_remote[dir as usize]
-                - self.state.allocated_remote_count[dir as usize])
+        // Each count is at most the one it is taken from.
+        let closed = self
+            .state
+            .max_remote
+            .get(dir)
+            .saturating_sub(*self.state.allocated_remote_count.get(dir));
+        self.state.next_remote.get(dir).saturating_sub(closed)
     }
 }
 
@@ -152,8 +161,10 @@ impl RecvStream<'_> {
         // connection-level flow control to account for discarded data. Otherwise, we can discard
         // state immediately.
         if !stream.final_offset_unknown() {
-            let recv = entry.remove().expect("must have recv when stopping");
-            self.state.stream_recv_freed(self.id, recv);
+            // Present: `get_or_insert_recv` made sure of it.
+            if let Some(recv) = entry.remove() {
+                self.state.stream_recv_freed(self.id, recv);
+            }
         }
 
         if self.state.add_read_credits(read_credits).should_transmit() {
@@ -184,8 +195,10 @@ impl RecvStream<'_> {
         // Clean up state after application observes the reset, since there's no reason for the
         // application to attempt to read or stop the stream once it knows it's reset
         let (_, recv) = entry.remove_entry();
-        self.state
-            .stream_recv_freed(self.id, recv.expect("must have recv on reset"));
+        // Present: it was read above.
+        if let Some(recv) = recv {
+            self.state.stream_recv_freed(self.id, recv);
+        }
         self.state.queue_max_stream_id(self.pending);
 
         Ok(Some(code))
@@ -282,8 +295,10 @@ impl<'a> SendStream<'a> {
             }
             Err(e) => return Err(e),
         };
-        self.state.data_sent += written.bytes as u64;
-        self.state.buffered_data += written.bytes as u64;
+        // Bytes of the connection, which flow control bounds below 2^62.
+        let bytes = u64::try_from(written.bytes).unwrap_or(u64::MAX);
+        self.state.data_sent = self.state.data_sent.saturating_add(bytes);
+        self.state.buffered_data = self.state.buffered_data.saturating_add(bytes);
         trace!(stream = %self.id, "wrote {} bytes", written.bytes);
         if !was_pending {
             self.state.pending.push_pending(self.id, stream.priority);
@@ -344,7 +359,11 @@ impl<'a> SendStream<'a> {
         // Restore the portion of the send window consumed by the data that we aren't about to
         // send. We leave flow control alone because the peer's responsible for issuing additional
         // credit based on the final offset communicated in the RESET_STREAM frame we send.
-        self.state.buffered_data -= stream.pending.buffered();
+        // The stream's buffered data is counted in the connection's.
+        self.state.buffered_data = self
+            .state
+            .buffered_data
+            .saturating_sub(stream.pending.buffered());
         stream.reset();
         self.pending.reset_stream.push((self.id, error_code));
 
@@ -405,14 +424,18 @@ impl PendingStreamsQueue {
     }
 
     /// Reinsert a stream that was pending and still contains unsent data.
+    ///
+    /// At most one stream is reinserted between pops; were one still waiting (upstream
+    /// asserted not), it goes back into the queue rather than being dropped.
     fn reinsert_pending(&mut self, id: StreamId, priority: i32) {
-        assert!(self.next.is_none());
-
-        self.next = Some(PendingStream {
+        let reinserted = PendingStream {
             priority,
             recency: self.recency, // the value here doesn't really matter
             id,
-        });
+        };
+        if let Some(previous) = self.next.replace(reinserted) {
+            self.streams.push(previous);
+        }
     }
 
     /// Push a pending stream ID with the given priority, queued after any already-queued streams for the priority
@@ -425,7 +448,8 @@ impl PendingStreamsQueue {
         // after all other queued streams of the same priority.
         // This is enough to implement round-robin scheduling for streams that are still pending even after being handled,
         // as in that case they are removed from the `BinaryHeap`, handled, and then immediately reinserted.
-        self.recency -= 1;
+        // Saturating: at the floor, later streams tie with each other and are still all queued.
+        self.recency = self.recency.saturating_sub(1);
         self.streams.push(PendingStream {
             priority,
             recency: self.recency,

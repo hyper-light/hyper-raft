@@ -1,8 +1,8 @@
 use std::any::Any;
 
 use super::{BASE_DATAGRAM_SIZE, Controller};
-use crate::Instant;
 use crate::connection::RttEstimator;
+use crate::{Instant, float};
 
 /// A simple, standard congestion controller
 #[derive(Debug, Clone)]
@@ -35,7 +35,7 @@ impl NewReno {
     }
 
     fn minimum_window(&self) -> u64 {
-        2 * self.current_mtu
+        2u64.saturating_mul(self.current_mtu)
     }
 }
 
@@ -54,7 +54,8 @@ impl Controller for NewReno {
 
         if self.window < self.ssthresh {
             // Slow start
-            self.window += bytes;
+            // Windows and byte counts saturate at a size no connection reaches
+            self.window = self.window.saturating_add(bytes);
 
             if self.window >= self.ssthresh {
                 // Exiting slow start
@@ -63,7 +64,7 @@ impl Controller for NewReno {
                 // towards the congestion avoidance phase - independent of when
                 // how close to `sshthresh` the `window` was when switching states,
                 // and independent of datagram sizes.
-                self.bytes_acked = self.window - self.ssthresh;
+                self.bytes_acked = self.window.saturating_sub(self.ssthresh);
             }
         } else {
             // Congestion avoidance
@@ -72,11 +73,11 @@ impl Controller for NewReno {
             // for every round trip.
             // This mechanism is called Appropriate Byte Counting in
             // https://tools.ietf.org/html/rfc3465
-            self.bytes_acked += bytes;
+            self.bytes_acked = self.bytes_acked.saturating_add(bytes);
 
-            if self.bytes_acked >= self.window {
-                self.bytes_acked -= self.window;
-                self.window += self.current_mtu;
+            if let Some(left) = self.bytes_acked.checked_sub(self.window) {
+                self.bytes_acked = left;
+                self.window = self.window.saturating_add(self.current_mtu);
             }
         }
     }
@@ -93,7 +94,9 @@ impl Controller for NewReno {
         }
 
         self.recovery_start_time = now;
-        self.window = (self.window as f32 * self.config.loss_reduction_factor) as u64;
+        self.window = float::saturating_u64(f64::from(
+            self.window as f32 * self.config.loss_reduction_factor,
+        ));
         self.window = self.window.max(self.minimum_window());
         self.ssthresh = self.window;
 

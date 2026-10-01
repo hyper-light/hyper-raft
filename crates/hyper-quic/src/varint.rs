@@ -36,15 +36,6 @@ impl VarInt {
         }
     }
 
-    /// Create a VarInt without ensuring it's in range
-    ///
-    /// # Safety
-    ///
-    /// `x` must be less than 2^62.
-    pub const unsafe fn from_u64_unchecked(x: u64) -> Self {
-        Self(x)
-    }
-
     /// Extract the integer value
     pub const fn into_inner(self) -> u64 {
         self.0
@@ -52,17 +43,21 @@ impl VarInt {
 
     /// Compute the number of bytes needed to encode this value
     pub(crate) const fn size(self) -> usize {
-        let x = self.0;
+        Self::size_of(self.0)
+    }
+
+    /// The number of bytes the variable-length encoding of `x` takes (RFC 9000 §16): 8 for
+    /// anything at or above 2^30. A `VarInt` is below 2^62; callers sizing a stream offset,
+    /// length or count know it is too (upstream built an unchecked `VarInt` for this).
+    pub(crate) const fn size_of(x: u64) -> usize {
         if x < 2u64.pow(6) {
             1
         } else if x < 2u64.pow(14) {
             2
         } else if x < 2u64.pow(30) {
             4
-        } else if x < 2u64.pow(62) {
-            8
         } else {
-            panic!("malformed VarInt");
+            8
         }
     }
 }
@@ -144,50 +139,53 @@ impl Codec for VarInt {
         if !r.has_remaining() {
             return Err(UnexpectedEnd);
         }
-        let mut buf = [0; 8];
-        buf[0] = r.get_u8();
-        let tag = buf[0] >> 6;
-        buf[0] &= 0b0011_1111;
+        let first = r.get_u8();
+        // The two most significant bits give the length (RFC 9000 §16); the rest is the value's
+        // most significant bits.
+        let tag = first >> 6;
+        let top = first & 0b0011_1111;
         let x = match tag {
-            0b00 => u64::from(buf[0]),
+            0b00 => u64::from(top),
             0b01 => {
-                if r.remaining() < 1 {
-                    return Err(UnexpectedEnd);
-                }
-                r.copy_to_slice(&mut buf[1..2]);
-                u64::from(u16::from_be_bytes(buf[..2].try_into().unwrap()))
+                let mut rest = [0; 1];
+                read_exact(r, &mut rest)?;
+                let [b1] = rest;
+                u64::from(u16::from_be_bytes([top, b1]))
             }
             0b10 => {
-                if r.remaining() < 3 {
-                    return Err(UnexpectedEnd);
-                }
-                r.copy_to_slice(&mut buf[1..4]);
-                u64::from(u32::from_be_bytes(buf[..4].try_into().unwrap()))
+                let mut rest = [0; 3];
+                read_exact(r, &mut rest)?;
+                let [b1, b2, b3] = rest;
+                u64::from(u32::from_be_bytes([top, b1, b2, b3]))
             }
-            0b11 => {
-                if r.remaining() < 7 {
-                    return Err(UnexpectedEnd);
-                }
-                r.copy_to_slice(&mut buf[1..8]);
-                u64::from_be_bytes(buf)
+            // 0b11: a two-bit tag has no other value.
+            _ => {
+                let mut rest = [0; 7];
+                read_exact(r, &mut rest)?;
+                let [b1, b2, b3, b4, b5, b6, b7] = rest;
+                u64::from_be_bytes([top, b1, b2, b3, b4, b5, b6, b7])
             }
-            _ => unreachable!(),
         };
         Ok(Self(x))
     }
 
     fn encode<B: BufMut>(&self, w: &mut B) {
-        let x = self.0;
-        if x < 2u64.pow(6) {
-            w.put_u8(x as u8);
-        } else if x < 2u64.pow(14) {
-            w.put_u16((0b01 << 14) | x as u16);
-        } else if x < 2u64.pow(30) {
-            w.put_u32((0b10 << 30) | x as u32);
-        } else if x < 2u64.pow(62) {
-            w.put_u64((0b11 << 62) | x);
-        } else {
-            unreachable!("malformed VarInt")
+        // Within each branch the value fits the bytes taken from it: a `VarInt` is below 2^62.
+        let [b7, b6, b5, b4, b3, b2, b1, b0] = self.0.to_be_bytes();
+        match self.size() {
+            1 => w.put_u8(b0),
+            2 => w.put_slice(&[0b0100_0000 | b1, b0]),
+            4 => w.put_slice(&[0b1000_0000 | b3, b2, b1, b0]),
+            _ => w.put_slice(&[0b1100_0000 | b7, b6, b5, b4, b3, b2, b1, b0]),
         }
     }
+}
+
+/// Fills `out` from `r`, or fails if `r` holds fewer bytes.
+fn read_exact<B: Buf>(r: &mut B, out: &mut [u8]) -> coding::Result<()> {
+    if r.remaining() < out.len() {
+        return Err(UnexpectedEnd);
+    }
+    r.copy_to_slice(out);
+    Ok(())
 }

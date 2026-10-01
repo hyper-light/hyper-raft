@@ -68,11 +68,16 @@ impl TokenLog for BloomTokenLog {
 
         let state = &mut self.0;
 
-        // calculate how many periods past period 1 the token expires
-        let expires_at = issued + lifetime;
-        let Ok(periods_forward) = expires_at
+        // calculate how many periods past period 1 the token expires; an expiry past what
+        // `SystemTime` represents has no period and is refused like a reused token (upstream's
+        // addition overflowed)
+        let Some(expires_at) = issued.checked_add(lifetime) else {
+            return Err(TokenReuseError);
+        };
+        let Some(periods_forward) = expires_at
             .duration_since(state.period_1_start)
-            .map(|duration| duration.as_nanos() / lifetime.as_nanos())
+            .ok()
+            .and_then(|duration| duration.as_nanos().checked_div(lifetime.as_nanos()))
         else {
             // shouldn't happen unless time travels backwards or lifetime changes or the current
             // system time is before the Unix epoch
@@ -87,7 +92,11 @@ impl TokenLog for BloomTokenLog {
             2 => {
                 // turn over filter 1
                 state.filter_1 = take(&mut state.filter_2);
-                state.period_1_start += lifetime;
+                // Within `expires_at`, which is representable.
+                state.period_1_start = state
+                    .period_1_start
+                    .checked_add(lifetime)
+                    .unwrap_or(expires_at);
                 &mut state.filter_2
             }
             _ => {
@@ -113,7 +122,11 @@ impl TokenLog for BloomTokenLog {
         //
         // per the Rust reference, we can truncate by simply casting:
         // https://doc.rust-lang.org/stable/reference/expressions/operator-expr.html#numeric-cast
-        filter.check_and_insert(nonce as u64, &state.config)
+        let [n0, n1, n2, n3, n4, n5, n6, n7, ..] = nonce.to_le_bytes();
+        filter.check_and_insert(
+            u64::from_le_bytes([n0, n1, n2, n3, n4, n5, n6, n7]),
+            &state.config,
+        )
     }
 }
 
@@ -161,16 +174,18 @@ impl Filter {
                     return Err(TokenReuseError);
                 }
 
-                if hset.capacity() * size_of::<u64>() <= config.filter_max_bytes {
+                // A memory size: saturating can only over-state it.
+                if hset.capacity().saturating_mul(size_of::<u64>()) <= config.filter_max_bytes {
                     return Ok(());
                 }
 
                 // convert to bloom
                 // avoid panicking if user passed in filter_max_bytes of 0. we document that this
                 // limit is approximate, so just fudge it up to 1.
-                let mut bloom = BloomFilter::with_num_bits((config.filter_max_bytes * 8).max(1))
-                    .hasher(FxBuildHasher)
-                    .hashes(config.k_num);
+                let mut bloom =
+                    BloomFilter::with_num_bits(config.filter_max_bytes.saturating_mul(8).max(1))
+                        .hasher(FxBuildHasher)
+                        .hashes(config.k_num);
                 for item in &*hset {
                     bloom.insert(item);
                 }
@@ -209,24 +224,18 @@ impl BuildHasher for IdentityBuildHasher {
 #[derive(Default)]
 struct IdentityHasher {
     data: [u8; 8],
-    #[cfg(debug_assertions)]
-    wrote_8_byte_slice: bool,
 }
 
 impl Hasher for IdentityHasher {
+    // Only `u64` fingerprints are hashed, one per hasher, as eight bytes (upstream asserted that
+    // in debug builds).
     fn write(&mut self, bytes: &[u8]) {
-        #[cfg(debug_assertions)]
-        {
-            assert!(!self.wrote_8_byte_slice);
-            assert_eq!(bytes.len(), 8);
-            self.wrote_8_byte_slice = true;
+        if let Ok(data) = <[u8; 8]>::try_from(bytes) {
+            self.data = data;
         }
-        self.data.copy_from_slice(bytes);
     }
 
     fn finish(&self) -> u64 {
-        #[cfg(debug_assertions)]
-        assert!(self.wrote_8_byte_slice);
         u64::from_ne_bytes(self.data)
     }
 }
@@ -243,11 +252,13 @@ fn optimal_k_num(num_bytes: usize, expected_hits: u64) -> u32 {
     //
     // we also impose a minimum return value of 1, to avoid making the bloom filter entirely
     // useless in the case that the user provided an absurdly high ratio of hits / bytes.
-    (((num_bits as f64 / expected_hits as f64) * LN_2).round() as u32).max(1)
+    crate::float::saturating_u32(((num_bits as f64 / expected_hits as f64) * LN_2).round()).max(1)
 }
 
 // remember to change the doc comment for `impl Default for BloomTokenLog` if these ever change
+/// Default filter size, 10 MiB (upstream's value, stated on `impl Default for BloomTokenLog`)
 const DEFAULT_MAX_BYTES: usize = 10 << 20;
+/// Default expected tokens per period, one million (upstream's value, stated on `impl Default`)
 const DEFAULT_EXPECTED_HITS: u64 = 1_000_000;
 
 #[cfg(test)]

@@ -670,6 +670,7 @@ dependencies = [
  "bytes",
  "fastbloom",
  "hex-literal",
+ "hyper-measure",
  "hyper-tls",
  "lazy_static",
  "lru-slab",

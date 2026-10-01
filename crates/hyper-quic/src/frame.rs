@@ -25,14 +25,14 @@ pub struct FrameType(u64);
 impl FrameType {
     fn stream(self) -> Option<StreamInfo> {
         if STREAM_TYS.contains(&self.0) {
-            Some(StreamInfo(self.0 as u8))
+            u8::try_from(self.0).ok().map(StreamInfo)
         } else {
             None
         }
     }
     fn datagram(self) -> Option<DatagramInfo> {
         if DATAGRAM_TYS.contains(&self.0) {
-            Some(DatagramInfo(self.0 as u8))
+            u8::try_from(self.0).ok().map(DatagramInfo)
         } else {
             None
         }
@@ -136,7 +136,9 @@ frame_types! {
     // DATAGRAM
 }
 
+/// The STREAM frame types (RFC 9000 §19.8)
 const STREAM_TYS: RangeInclusive<u64> = RangeInclusive::new(0x08, 0x0f);
+/// The DATAGRAM frame types (RFC 9221 §4)
 const DATAGRAM_TYS: RangeInclusive<u64> = RangeInclusive::new(0x30, 0x31);
 
 #[derive(Debug)]
@@ -281,6 +283,7 @@ impl From<TransportError> for ConnectionClose {
 }
 
 impl FrameStruct for ConnectionClose {
+    /// The frame type and three fields, each at its largest varint
     const SIZE_BOUND: usize = 1 + 8 + 8 + 8;
 }
 
@@ -290,13 +293,18 @@ impl ConnectionClose {
         out.write(self.error_code); // <= 8 bytes
         let ty = self.frame_type.map_or(0, |x| x.0);
         out.write_var(ty); // <= 8 bytes
+        // Room for the reason: saturating can only under-state it, which shortens the reason
         let max_len = max_len
-            - 3
-            - VarInt::from_u64(ty).unwrap().size()
-            - VarInt::from_u64(self.reason.len() as u64).unwrap().size();
-        let actual_len = self.reason.len().min(max_len);
-        out.write_var(actual_len as u64); // <= 8 bytes
-        out.put_slice(&self.reason[0..actual_len]); // whatever's left
+            .saturating_sub(3)
+            .saturating_sub(VarInt::size_of(ty))
+            .saturating_sub(VarInt::size_of(self.reason.len() as u64));
+        let reason = self
+            .reason
+            .as_ref()
+            .get(..self.reason.len().min(max_len))
+            .unwrap_or_default();
+        out.write_var(reason.len() as u64); // <= 8 bytes
+        out.put_slice(reason); // whatever's left
     }
 }
 
@@ -324,6 +332,7 @@ impl fmt::Display for ApplicationClose {
 }
 
 impl FrameStruct for ApplicationClose {
+    /// The frame type and two fields, each at its largest varint
     const SIZE_BOUND: usize = 1 + 8 + 8;
 }
 
@@ -331,10 +340,17 @@ impl ApplicationClose {
     pub(crate) fn encode<W: BufMut>(&self, out: &mut W, max_len: usize) {
         out.write(FrameType::APPLICATION_CLOSE); // 1 byte
         out.write(self.error_code); // <= 8 bytes
-        let max_len = max_len - 3 - VarInt::from_u64(self.reason.len() as u64).unwrap().size();
-        let actual_len = self.reason.len().min(max_len);
-        out.write_var(actual_len as u64); // <= 8 bytes
-        out.put_slice(&self.reason[0..actual_len]); // whatever's left
+        // Room for the reason: saturating can only under-state it, which shortens the reason
+        let max_len = max_len
+            .saturating_sub(3)
+            .saturating_sub(VarInt::size_of(self.reason.len() as u64));
+        let reason = self
+            .reason
+            .as_ref()
+            .get(..self.reason.len().min(max_len))
+            .unwrap_or_default();
+        out.write_var(reason.len() as u64); // <= 8 bytes
+        out.put_slice(reason); // whatever's left
     }
 }
 
@@ -354,7 +370,7 @@ impl fmt::Debug for Ack {
             if !first {
                 ranges.push(',');
             }
-            write!(ranges, "{range:?}").unwrap();
+            write!(ranges, "{range:?}")?;
             first = false;
         }
         ranges.push(']');
@@ -384,10 +400,15 @@ impl Ack {
         ecn: Option<&EcnCounts>,
         buf: &mut W,
     ) {
+        // The ranges are non-empty, disjoint and non-adjacent, so no difference below
+        // saturates; with no range there is no frame to write (callers send ACKs only with
+        // ranges pending, where upstream unwrapped)
         let mut rest = ranges.iter().rev();
-        let first = rest.next().unwrap();
-        let largest = first.end - 1;
-        let first_size = first.end - first.start;
+        let Some(first) = rest.next() else {
+            return;
+        };
+        let largest = first.end.saturating_sub(1);
+        let first_size = first.end.saturating_sub(first.start);
         buf.write(if ecn.is_some() {
             FrameType::ACK_ECN
         } else {
@@ -395,13 +416,13 @@ impl Ack {
         });
         buf.write_var(largest);
         buf.write_var(delay);
-        buf.write_var(ranges.len() as u64 - 1);
-        buf.write_var(first_size - 1);
+        buf.write_var((ranges.len() as u64).saturating_sub(1));
+        buf.write_var(first_size.saturating_sub(1));
         let mut prev = first.start;
         for block in rest {
-            let size = block.end - block.start;
-            buf.write_var(prev - block.end - 1);
-            buf.write_var(size - 1);
+            let size = block.end.saturating_sub(block.start);
+            buf.write_var(prev.saturating_sub(block.end).saturating_sub(1));
+            buf.write_var(size.saturating_sub(1));
             prev = block.start;
         }
         if let Some(x) = ecn {
@@ -421,23 +442,19 @@ pub struct EcnCounts {
     pub ce: u64,
 }
 
-impl std::ops::AddAssign<EcnCodepoint> for EcnCounts {
-    fn add_assign(&mut self, rhs: EcnCodepoint) {
-        match rhs {
-            EcnCodepoint::Ect0 => {
-                self.ect0 += 1;
-            }
-            EcnCodepoint::Ect1 => {
-                self.ect1 += 1;
-            }
-            EcnCodepoint::Ce => {
-                self.ce += 1;
-            }
-        }
-    }
-}
-
 impl EcnCounts {
+    /// Counts a packet received with `codepoint` (upstream's `+=`); a count of packets, it
+    /// saturates rather than wraps
+    pub(crate) fn count(&mut self, codepoint: EcnCodepoint) {
+        let count = match codepoint {
+            EcnCodepoint::Ect0 => &mut self.ect0,
+            EcnCodepoint::Ect1 => &mut self.ect1,
+            EcnCodepoint::Ce => &mut self.ce,
+        };
+        *count = count.saturating_add(1);
+    }
+
+    /// No packet counted
     pub const ZERO: Self = Self {
         ect0: 0,
         ect1: 0,
@@ -460,6 +477,7 @@ pub(crate) struct Stream {
 }
 
 impl FrameStruct for Stream {
+    /// The frame type and three fields, each at its largest varint
     const SIZE_BOUND: usize = 1 + 8 + 8 + 8;
 }
 
@@ -500,7 +518,7 @@ impl StreamMeta {
             out.write_var(self.offsets.start); // <=8 bytes
         }
         if length {
-            out.write_var(self.offsets.end - self.offsets.start); // <=8 bytes
+            out.write_var(self.offsets.end.saturating_sub(self.offsets.start)); // <=8 bytes
         }
     }
 }
@@ -515,6 +533,7 @@ pub(crate) struct Crypto {
 }
 
 impl Crypto {
+    /// The frame type, and offset and length at their largest varints
     pub(crate) const SIZE_BOUND: usize = 17;
 
     pub(crate) fn encode<W: BufMut>(&self, out: &mut W) {
@@ -538,7 +557,10 @@ impl NewToken {
     }
 
     pub(crate) fn size(&self) -> usize {
-        1 + VarInt::from_u64(self.token.len() as u64).unwrap().size() + self.token.len()
+        // A size: saturating can only over-state it, which refuses rather than overruns
+        1usize
+            .saturating_add(VarInt::size_of(self.token.len() as u64))
+            .saturating_add(self.token.len())
     }
 }
 
@@ -569,7 +591,9 @@ impl Iter {
         if len > self.bytes.remaining() as u64 {
             return Err(UnexpectedEnd);
         }
-        Ok(self.bytes.split_to(len as usize))
+        // At most what remains, so a `usize`
+        let len = usize::try_from(len).map_err(|_| UnexpectedEnd)?;
+        Ok(self.bytes.split_to(len))
     }
 
     fn try_next(&mut self) -> Result<Frame, IterErr> {
@@ -633,7 +657,9 @@ impl Iter {
             FrameType::ACK | FrameType::ACK_ECN => {
                 let largest = self.bytes.get_var()?;
                 let delay = self.bytes.get_var()?;
-                let extra_blocks = self.bytes.get_var()? as usize;
+                // A count past `usize` is past what any frame holds
+                let extra_blocks =
+                    usize::try_from(self.bytes.get_var()?).map_err(|_| IterErr::UnexpectedEnd)?;
                 let n = scan_ack_blocks(&self.bytes, largest, extra_blocks)?;
                 Frame::Ack(Ack {
                     delay,
@@ -665,9 +691,7 @@ impl Iter {
                 if length > self.bytes.remaining() {
                     return Err(IterErr::UnexpectedEnd);
                 }
-                let mut stage = [0; MAX_CID_SIZE];
-                self.bytes.copy_to_slice(&mut stage[0..length]);
-                let id = ConnectionId::new(&stage[..length]);
+                let id = ConnectionId::from_buf(&mut self.bytes, length);
                 if self.bytes.remaining() < 16 {
                     return Err(IterErr::UnexpectedEnd);
                 }
@@ -768,11 +792,15 @@ fn scan_ack_blocks(mut buf: &[u8], largest: u64, n: usize) -> Result<usize, Iter
     let mut smallest = largest.checked_sub(first_block).ok_or(IterErr::Malformed)?;
     for _ in 0..n {
         let gap = buf.get_var()?;
-        smallest = smallest.checked_sub(gap + 2).ok_or(IterErr::Malformed)?;
+        smallest = gap
+            .checked_add(2)
+            .and_then(|step| smallest.checked_sub(step))
+            .ok_or(IterErr::Malformed)?;
         let block = buf.get_var()?;
         smallest = smallest.checked_sub(block).ok_or(IterErr::Malformed)?;
     }
-    Ok(total_len - buf.remaining())
+    // What was read, at most what there was
+    Ok(total_len.saturating_sub(buf.remaining()))
 }
 
 enum IterErr {
@@ -816,12 +844,21 @@ impl Iterator for AckIter<'_> {
         if !self.data.has_remaining() {
             return None;
         }
-        let block = self.data.get_var().unwrap();
+        // The ranges were validated as the frame was decoded (`scan_ack_blocks`), so no step
+        // below fails; a step that would ends the iteration, where upstream panicked
+        let block = self.data.get_var().ok()?;
         let largest = self.largest;
+        let smallest = largest.checked_sub(block)?;
         if let Ok(gap) = self.data.get_var() {
-            self.largest -= block + gap + 2;
+            match gap
+                .checked_add(2)
+                .and_then(|step| smallest.checked_sub(step))
+            {
+                Some(next) => self.largest = next,
+                None => self.data = &[],
+            }
         }
-        Some(largest - block..=largest)
+        Some(smallest..=largest)
     }
 }
 
@@ -835,6 +872,7 @@ pub struct ResetStream {
 }
 
 impl FrameStruct for ResetStream {
+    /// The frame type and three fields, each at its largest varint
     const SIZE_BOUND: usize = 1 + 8 + 8 + 8;
 }
 
@@ -854,6 +892,7 @@ pub(crate) struct StopSending {
 }
 
 impl FrameStruct for StopSending {
+    /// The frame type and two fields, each at its largest varint
     const SIZE_BOUND: usize = 1 + 8 + 8;
 }
 
@@ -878,13 +917,15 @@ impl NewConnectionId {
         out.write(FrameType::NEW_CONNECTION_ID);
         out.write_var(self.sequence);
         out.write_var(self.retire_prior_to);
-        out.write(self.id.len() as u8);
+        // A connection ID is at most 20 bytes
+        out.write(u8::try_from(self.id.len()).unwrap_or(u8::MAX));
         out.put_slice(&self.id);
         out.put_slice(&self.reset_token);
     }
 }
 
 impl FrameStruct for NewConnectionId {
+    /// The frame type, two varints at their largest, and the CID's length, CID and reset token
     const SIZE_BOUND: usize = 1 + 8 + 8 + 1 + MAX_CID_SIZE + RESET_TOKEN_SIZE;
 }
 
@@ -899,6 +940,7 @@ pub struct Datagram {
 }
 
 impl FrameStruct for Datagram {
+    /// The frame type and a length at its largest varint
     const SIZE_BOUND: usize = 1 + 8;
 }
 
@@ -906,18 +948,22 @@ impl Datagram {
     pub(crate) fn encode(&self, length: bool, out: &mut Vec<u8>) {
         out.write(FrameType(*DATAGRAM_TYS.start() | u64::from(length))); // 1 byte
         if length {
-            // Safe to unwrap because we check length sanity before queueing datagrams
-            out.write(VarInt::from_u64(self.data.len() as u64).unwrap()); // <= 8 bytes
+            // Datagram lengths are checked before datagrams are queued
+            out.write_var(self.data.len() as u64); // <= 8 bytes
         }
         out.extend_from_slice(&self.data);
     }
 
     pub(crate) fn size(&self, length: bool) -> usize {
-        1 + if length {
-            VarInt::from_u64(self.data.len() as u64).unwrap().size()
+        // A size: saturating can only over-state it, which refuses rather than overruns
+        let length_size = if length {
+            VarInt::size_of(self.data.len() as u64)
         } else {
             0
-        } + self.data.len()
+        };
+        1usize
+            .saturating_add(length_size)
+            .saturating_add(self.data.len())
     }
 }
 

@@ -65,23 +65,26 @@ impl Send {
         if let Some(error_code) = self.stop_reason {
             return Err(WriteError::Stopped(error_code));
         }
-        let budget = self.max_data - self.pending.offset();
+        // The offset never passes the peer's limit: writes are bounded by this budget.
+        let budget = self.max_data.saturating_sub(self.pending.offset());
         if budget == 0 {
             return Err(WriteError::Blocked);
         }
-        let mut limit = limit.min(budget) as usize;
+        let mut limit = usize::try_from(limit.min(budget)).unwrap_or(usize::MAX);
 
         let mut result = Written::default();
         loop {
             let (chunk, chunks_consumed) = source.pop_chunk(limit);
-            result.chunks += chunks_consumed;
-            result.bytes += chunk.len();
+            // Counts of chunks and bytes in memory: the sums do not saturate.
+            result.chunks = result.chunks.saturating_add(chunks_consumed);
+            result.bytes = result.bytes.saturating_add(chunk.len());
 
             if chunk.is_empty() {
                 break;
             }
 
-            limit -= chunk.len();
+            // A source pops at most `limit` bytes.
+            limit = limit.saturating_sub(chunk.len());
             self.pending.write(chunk);
         }
 
@@ -176,13 +179,12 @@ impl BytesSource for BytesArray<'_> {
         // consumed
         let mut chunks_consumed = 0;
 
-        while self.consumed < self.chunks.len() {
-            let chunk = &mut self.chunks[self.consumed];
-
+        while let Some(chunk) = self.chunks.get_mut(self.consumed) {
             if chunk.len() <= limit {
                 let chunk = std::mem::take(chunk);
-                self.consumed += 1;
-                chunks_consumed += 1;
+                // Both count chunks of the slice: below its length.
+                self.consumed = self.consumed.saturating_add(1);
+                chunks_consumed = usize::saturating_add(chunks_consumed, 1);
                 if chunk.is_empty() {
                     continue;
                 }
@@ -222,8 +224,9 @@ impl BytesSource for ByteSlice<'_> {
             return (Bytes::new(), 0);
         }
 
-        let chunk = Bytes::from(self.data[..limit].to_owned());
-        self.data = &self.data[chunk.len()..];
+        let (taken, rest) = self.data.split_at(limit);
+        let chunk = Bytes::from(taken.to_owned());
+        self.data = rest;
 
         let chunks_consumed = usize::from(self.data.is_empty());
         (chunk, chunks_consumed)

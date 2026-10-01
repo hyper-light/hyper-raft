@@ -195,24 +195,34 @@ impl crypto::Session for TlsSession {
             None => return false,
         };
 
-        let mut pseudo_packet =
-            Vec::with_capacity(header.len() + payload.len() + orig_dst_cid.len() + 1);
-        pseudo_packet.push(orig_dst_cid.len() as u8);
-        pseudo_packet.extend_from_slice(orig_dst_cid);
-        pseudo_packet.extend_from_slice(header);
-        let tag_start = tag_start + pseudo_packet.len();
-        pseudo_packet.extend_from_slice(payload);
-
-        let (nonce, key) = match self.version {
-            Version::V1 => (RETRY_INTEGRITY_NONCE_V1, RETRY_INTEGRITY_KEY_V1),
-            Version::V1Draft => (RETRY_INTEGRITY_NONCE_DRAFT, RETRY_INTEGRITY_KEY_DRAFT),
-            _ => unreachable!(),
+        // A session's version is one `interpret_version` gave, which has retry keys
+        let Some((nonce, key)) = retry_integrity(self.version) else {
+            return false;
         };
 
-        let nonce = aead::Nonce::assume_unique_for_key(nonce);
-        let key = aead::LessSafeKey::new(aead::UnboundKey::new(&aead::AES_128_GCM, &key).unwrap());
+        // In-memory sizes: one datagram, so no sum saturates
+        let mut pseudo_packet = Vec::with_capacity(
+            header
+                .len()
+                .saturating_add(payload.len())
+                .saturating_add(orig_dst_cid.len())
+                .saturating_add(1),
+        );
+        pseudo_packet.push(cid_len_byte(orig_dst_cid));
+        pseudo_packet.extend_from_slice(orig_dst_cid);
+        pseudo_packet.extend_from_slice(header);
+        let tag_start = tag_start.saturating_add(pseudo_packet.len());
+        pseudo_packet.extend_from_slice(payload);
 
-        let (aad, tag) = pseudo_packet.split_at_mut(tag_start);
+        let nonce = aead::Nonce::assume_unique_for_key(nonce);
+        let Ok(key) = aead::UnboundKey::new(&aead::AES_128_GCM, &key) else {
+            return false;
+        };
+        let key = aead::LessSafeKey::new(key);
+
+        let Some((aad, tag)) = pseudo_packet.split_at_mut_checked(tag_start) else {
+            return false;
+        };
         key.open_in_place(nonce, aead::Aad::from(aad), tag).is_ok()
     }
 
@@ -229,43 +239,35 @@ impl crypto::Session for TlsSession {
     }
 }
 
+/// The Retry integrity key of draft-ietf-quic-tls-29 §5.8
 const RETRY_INTEGRITY_KEY_DRAFT: [u8; 16] = [
     0xcc, 0xce, 0x18, 0x7e, 0xd0, 0x9a, 0x09, 0xd0, 0x57, 0x28, 0x15, 0x5a, 0x6c, 0xb9, 0x6b, 0xe1,
 ];
+/// The Retry integrity nonce of draft-ietf-quic-tls-29 §5.8
 const RETRY_INTEGRITY_NONCE_DRAFT: [u8; 12] = [
     0xe5, 0x49, 0x30, 0xf9, 0x7f, 0x21, 0x36, 0xf0, 0x53, 0x0a, 0x8c, 0x1c,
 ];
 
+/// The Retry integrity key of QUIC v1 (RFC 9001 §5.8)
 const RETRY_INTEGRITY_KEY_V1: [u8; 16] = [
     0xbe, 0x0c, 0x69, 0x0b, 0x9f, 0x66, 0x57, 0x5a, 0x1d, 0x76, 0x6b, 0x54, 0xe3, 0x68, 0xc8, 0x4e,
 ];
+/// The Retry integrity nonce of QUIC v1 (RFC 9001 §5.8)
 const RETRY_INTEGRITY_NONCE_V1: [u8; 12] = [
     0x46, 0x15, 0x99, 0xd3, 0x5d, 0x63, 0x2b, 0xf2, 0x23, 0x98, 0x25, 0xbb,
 ];
 
 impl crypto::HeaderKey for Box<dyn HeaderProtectionKey> {
-    fn decrypt(&self, pn_offset: usize, packet: &mut [u8]) {
-        let (header, sample) = packet.split_at_mut(pn_offset + 4);
-        let (first, rest) = header.split_at_mut(1);
-        let pn_end = Ord::min(pn_offset + 3, rest.len());
-        self.decrypt_in_place(
-            &sample[..self.sample_size()],
-            &mut first[0],
-            &mut rest[pn_offset - 1..pn_end],
-        )
-        .unwrap();
+    fn decrypt(&self, pn_offset: usize, packet: &mut [u8]) -> Result<(), CryptoError> {
+        let (sample, first, pn) = header_protection_parts(packet, pn_offset, self.sample_size())?;
+        self.decrypt_in_place(sample, first, pn)
+            .map_err(|_| CryptoError)
     }
 
-    fn encrypt(&self, pn_offset: usize, packet: &mut [u8]) {
-        let (header, sample) = packet.split_at_mut(pn_offset + 4);
-        let (first, rest) = header.split_at_mut(1);
-        let pn_end = Ord::min(pn_offset + 3, rest.len());
-        self.encrypt_in_place(
-            &sample[..self.sample_size()],
-            &mut first[0],
-            &mut rest[pn_offset - 1..pn_end],
-        )
-        .unwrap();
+    fn encrypt(&self, pn_offset: usize, packet: &mut [u8]) -> Result<(), CryptoError> {
+        let (sample, first, pn) = header_protection_parts(packet, pn_offset, self.sample_size())?;
+        self.encrypt_in_place(sample, first, pn)
+            .map_err(|_| CryptoError)
     }
 
     fn sample_size(&self) -> usize {
@@ -314,14 +316,15 @@ impl QuicClientConfig {
     ///
     /// QUIC requires that TLS 1.3 be enabled. Advanced users can use any [`rustls::ClientConfig`] that
     /// satisfies this requirement.
-    pub(crate) fn new(verifier: Box<dyn ServerCertVerifier>) -> Self {
-        let inner = Self::inner(verifier);
-        Self {
-            // We're confident that the *ring* default provider contains TLS13_AES_128_GCM_SHA256
+    pub(crate) fn new(verifier: Box<dyn ServerCertVerifier>) -> Result<Self, rustls::Error> {
+        let inner = Self::inner(verifier)?;
+        Ok(Self {
+            // The aws-lc-rs default provider contains TLS13_AES_128_GCM_SHA256; one without it
+            // is refused, where upstream panicked
             initial: initial_suite_from_provider(inner.crypto_provider())
-                .expect("no initial cipher suite found"),
+                .ok_or(rustls::Error::Internal("no initial cipher suite found"))?,
             inner,
-        }
+        })
     }
 
     /// Initialize a QUIC-compatible TLS client configuration with a separate initial cipher suite
@@ -337,16 +340,18 @@ impl QuicClientConfig {
         }
     }
 
-    pub(crate) fn inner(verifier: Box<dyn ServerCertVerifier>) -> rustls::ClientConfig {
+    pub(crate) fn inner(
+        verifier: Box<dyn ServerCertVerifier>,
+    ) -> Result<rustls::ClientConfig, rustls::Error> {
+        // The default providers support TLS 1.3; one that does not is refused
         let mut config = rustls::ClientConfig::builder_with_provider(configured_provider())
-            .with_protocol_versions(&[&rustls::version::TLS13])
-            .unwrap() // The default providers support TLS 1.3
+            .with_protocol_versions(&[&rustls::version::TLS13])?
             .dangerous()
             .with_custom_certificate_verifier(verifier)
             .with_no_client_auth();
 
         config.enable_early_data = true;
-        config
+        Ok(config)
     }
 }
 
@@ -371,7 +376,7 @@ impl crypto::ClientConfig for QuicClientConfig {
                         .to_owned(),
                     to_vec(params),
                 )
-                .unwrap(),
+                .map_err(|_| ConnectError::InvalidTlsConfig)?,
             ),
             suite: self.initial,
         }))
@@ -438,9 +443,10 @@ impl QuicServerConfig {
     ) -> Result<Self, rustls::Error> {
         let inner = Self::inner(cert_chain, key)?;
         Ok(Self {
-            // We're confident that the *ring* default provider contains TLS13_AES_128_GCM_SHA256
+            // The aws-lc-rs default provider contains TLS13_AES_128_GCM_SHA256; one without it
+            // is refused, where upstream panicked
             initial: initial_suite_from_provider(inner.crypto_provider())
-                .expect("no initial cipher suite found"),
+                .ok_or(rustls::Error::Internal("no initial cipher suite found"))?,
             inner,
         })
     }
@@ -467,9 +473,9 @@ impl QuicServerConfig {
         cert_chain: Vec<CertificateDer<'static>>,
         key: PrivateKeyDer<'static>,
     ) -> Result<rustls::ServerConfig, rustls::Error> {
+        // The default provider supports TLS 1.3; one that does not is refused
         let mut inner = rustls::ServerConfig::builder_with_provider(configured_provider())
-            .with_protocol_versions(&[&rustls::version::TLS13])
-            .unwrap() // The *ring* default provider supports TLS 1.3
+            .with_protocol_versions(&[&rustls::version::TLS13])?
             .with_no_client_auth()
             .with_single_cert(cert_chain, key)?;
 
@@ -495,18 +501,19 @@ impl crypto::ServerConfig for QuicServerConfig {
         &self,
         version: u32,
         params: &TransportParameters,
-    ) -> Box<dyn crypto::Session> {
-        // Safe: `start_session()` is never called if `initial_keys()` rejected `version`
-        let version = interpret_version(version).unwrap();
-        Box::new(TlsSession {
+    ) -> Result<Box<dyn crypto::Session>, TransportError> {
+        // `start_session()` is never called if `initial_keys()` rejected `version`
+        let version = interpret_version(version)
+            .map_err(|_| TransportError::INTERNAL_ERROR("session for an unsupported version"))?;
+        let connection = rustls::quic::ServerConnection::new(&self.inner, version, to_vec(params))
+            .map_err(|_| TransportError::INTERNAL_ERROR("TLS configuration cannot serve QUIC"))?;
+        Ok(Box::new(TlsSession {
             version,
             got_handshake_data: false,
             next_secrets: None,
-            inner: rustls::quic::Connection::Server(
-                rustls::quic::ServerConnection::new(&self.inner, version, to_vec(params)).unwrap(),
-            ),
+            inner: rustls::quic::Connection::Server(connection),
             suite: self.initial,
-        })
+        }))
     }
 
     fn initial_keys(
@@ -518,29 +525,32 @@ impl crypto::ServerConfig for QuicServerConfig {
         Ok(initial_keys(version, *dst_cid, Side::Server, &self.initial))
     }
 
-    fn retry_tag(&self, version: u32, orig_dst_cid: &ConnectionId, packet: &[u8]) -> [u8; 16] {
-        // Safe: `start_session()` is never called if `initial_keys()` rejected `version`
-        let version = interpret_version(version).unwrap();
-        let (nonce, key) = match version {
-            Version::V1 => (RETRY_INTEGRITY_NONCE_V1, RETRY_INTEGRITY_KEY_V1),
-            Version::V1Draft => (RETRY_INTEGRITY_NONCE_DRAFT, RETRY_INTEGRITY_KEY_DRAFT),
-            _ => unreachable!(),
-        };
+    fn retry_tag(
+        &self,
+        version: u32,
+        orig_dst_cid: &ConnectionId,
+        packet: &[u8],
+    ) -> Result<[u8; 16], CryptoError> {
+        // `retry_tag()` is never called if `initial_keys()` rejected `version`
+        let version = interpret_version(version).map_err(|_| CryptoError)?;
+        let (nonce, key) = retry_integrity(version).ok_or(CryptoError)?;
 
-        let mut pseudo_packet = Vec::with_capacity(packet.len() + orig_dst_cid.len() + 1);
-        pseudo_packet.push(orig_dst_cid.len() as u8);
+        // In-memory sizes: one datagram
+        let mut pseudo_packet = Vec::with_capacity(
+            packet
+                .len()
+                .saturating_add(orig_dst_cid.len())
+                .saturating_add(1),
+        );
+        pseudo_packet.push(cid_len_byte(orig_dst_cid));
         pseudo_packet.extend_from_slice(orig_dst_cid);
         pseudo_packet.extend_from_slice(packet);
 
         let nonce = aead::Nonce::assume_unique_for_key(nonce);
-        let key = aead::LessSafeKey::new(aead::UnboundKey::new(&aead::AES_128_GCM, &key).unwrap());
+        let key = aead::LessSafeKey::new(aead::UnboundKey::new(&aead::AES_128_GCM, &key)?);
 
-        let tag = key
-            .seal_in_place_separate_tag(nonce, aead::Aad::from(pseudo_packet), &mut [])
-            .unwrap();
-        let mut result = [0; 16];
-        result.copy_from_slice(tag.as_ref());
-        result
+        let tag = key.seal_in_place_separate_tag(nonce, aead::Aad::from(pseudo_packet), &mut [])?;
+        tag.as_ref().try_into().map_err(|_| CryptoError)
     }
 }
 
@@ -598,11 +608,21 @@ pub(crate) fn initial_keys(
 }
 
 impl crypto::PacketKey for Box<dyn PacketKey> {
-    fn encrypt(&self, packet: u64, buf: &mut [u8], header_len: usize) {
-        let (header, payload_tag) = buf.split_at_mut(header_len);
-        let (payload, tag_storage) = payload_tag.split_at_mut(payload_tag.len() - self.tag_len());
-        let tag = self.encrypt_in_place(packet, &*header, payload).unwrap();
-        tag_storage.copy_from_slice(tag.as_ref());
+    fn encrypt(&self, packet: u64, buf: &mut [u8], header_len: usize) -> Result<(), CryptoError> {
+        let (header, payload_tag) = buf.split_at_mut_checked(header_len).ok_or(CryptoError)?;
+        let payload_len = payload_tag
+            .len()
+            .checked_sub(self.tag_len())
+            .ok_or(CryptoError)?;
+        let (payload, tag_storage) = payload_tag.split_at_mut(payload_len);
+        let tag = self
+            .encrypt_in_place(packet, &*header, payload)
+            .map_err(|_| CryptoError)?;
+        // The storage is `tag_len` bytes, the tag's length
+        for (storage, byte) in tag_storage.iter_mut().zip(tag.as_ref()) {
+            *storage = *byte;
+        }
+        Ok(())
     }
 
     fn decrypt(
@@ -630,6 +650,41 @@ impl crypto::PacketKey for Box<dyn PacketKey> {
     fn integrity_limit(&self) -> u64 {
         (**self).integrity_limit()
     }
+}
+
+/// The Retry integrity nonce and key of `version` (RFC 9001 §5.8)
+fn retry_integrity(version: Version) -> Option<([u8; 12], [u8; 16])> {
+    match version {
+        Version::V1 => Some((RETRY_INTEGRITY_NONCE_V1, RETRY_INTEGRITY_KEY_V1)),
+        Version::V1Draft => Some((RETRY_INTEGRITY_NONCE_DRAFT, RETRY_INTEGRITY_KEY_DRAFT)),
+        _ => None,
+    }
+}
+
+/// A connection ID's length byte; a connection ID is at most 20 bytes
+fn cid_len_byte(cid: &ConnectionId) -> u8 {
+    u8::try_from(cid.len()).unwrap_or(u8::MAX)
+}
+
+/// The sample, first byte and packet number bytes header protection covers (RFC 9001 §5.4):
+/// the sample starts four bytes past the packet number's offset, and the packet number is at
+/// most four bytes
+fn header_protection_parts(
+    packet: &mut [u8],
+    pn_offset: usize,
+    sample_size: usize,
+) -> Result<(&[u8], &mut u8, &mut [u8]), CryptoError> {
+    let sample_start = pn_offset.checked_add(4).ok_or(CryptoError)?;
+    let (header, sample) = packet
+        .split_at_mut_checked(sample_start)
+        .ok_or(CryptoError)?;
+    let sample = sample.get(..sample_size).ok_or(CryptoError)?;
+    let (first, rest) = header.split_first_mut().ok_or(CryptoError)?;
+    // `rest` starts at offset 1, so the packet number starts at `pn_offset - 1` within it
+    let pn_start = pn_offset.checked_sub(1).ok_or(CryptoError)?;
+    let pn_end = pn_offset.saturating_add(3).min(rest.len());
+    let pn = rest.get_mut(pn_start..pn_end).ok_or(CryptoError)?;
+    Ok((sample, first, pn))
 }
 
 fn interpret_version(version: u32) -> Result<Version, UnsupportedVersion> {

@@ -8,7 +8,7 @@ use bytes::{Buf, BufMut, Bytes};
 use rand::{Rng, RngExt};
 
 use crate::{
-    Duration, RESET_TOKEN_SIZE, ServerConfig, SystemTime, UNIX_EPOCH,
+    Duration, RESET_TOKEN_SIZE, ServerConfig, SystemTime, TimeSource, UNIX_EPOCH,
     coding::{BufExt, BufMutExt},
     crypto::{HandshakeTokenKey, HmacKey},
     packet::InitialHeader,
@@ -158,7 +158,11 @@ impl IncomingToken {
                 if address != remote_address {
                     return Err(InvalidRetryTokenError);
                 }
-                if issued + server_config.retry_token_lifetime < server_config.time_source.now() {
+                if expired(
+                    issued,
+                    server_config.retry_token_lifetime,
+                    &*server_config.time_source,
+                ) {
                     return Err(InvalidRetryTokenError);
                 }
 
@@ -172,9 +176,11 @@ impl IncomingToken {
                 if ip != remote_address.ip() {
                     return Ok(unvalidated);
                 }
-                if issued + server_config.validation_token.lifetime
-                    < server_config.time_source.now()
-                {
+                if expired(
+                    issued,
+                    server_config.validation_token.lifetime,
+                    &*server_config.time_source,
+                ) {
                     return Ok(unvalidated);
                 }
                 if log
@@ -217,7 +223,8 @@ impl Token {
     }
 
     /// Encode and encrypt
-    pub(crate) fn encode(&self, key: &dyn HandshakeTokenKey) -> Vec<u8> {
+    /// The sealed token: `None` if the key refuses to seal it (upstream unwrapped).
+    pub(crate) fn encode(&self, key: &dyn HandshakeTokenKey) -> Option<Vec<u8>> {
         let mut buf = Vec::new();
 
         // Encode payload
@@ -240,11 +247,11 @@ impl Token {
         }
 
         // Encrypt
-        let aead_key = key.aead_from_hkdf(&self.nonce.to_le_bytes());
-        aead_key.seal(&mut buf, &[]).unwrap();
+        let aead_key = key.aead_from_hkdf(&self.nonce.to_le_bytes()).ok()?;
+        aead_key.seal(&mut buf, &[]).ok()?;
         buf.extend(&self.nonce.to_le_bytes());
 
-        buf
+        Some(buf)
     }
 
     /// Decode and decrypt
@@ -255,9 +262,9 @@ impl Token {
         let nonce_slice_start = raw_token_bytes.len().checked_sub(size_of::<u128>())?;
         let (sealed_token, nonce_bytes) = raw_token_bytes.split_at(nonce_slice_start);
 
-        let nonce = u128::from_le_bytes(nonce_bytes.try_into().unwrap());
+        let nonce = u128::from_le_bytes(nonce_bytes.try_into().ok()?);
 
-        let aead_key = key.aead_from_hkdf(nonce_bytes);
+        let aead_key = key.aead_from_hkdf(nonce_bytes).ok()?;
         let mut sealed_token = sealed_token.to_vec();
         let data = aead_key.open(&mut sealed_token, &[]).ok()?;
 
@@ -360,7 +367,16 @@ fn encode_unix_secs(buf: &mut Vec<u8>, time: SystemTime) {
 }
 
 fn decode_unix_secs<B: Buf>(buf: &mut B) -> Option<SystemTime> {
-    Some(UNIX_EPOCH + Duration::from_secs(buf.get::<u64>().ok()?))
+    UNIX_EPOCH.checked_add(Duration::from_secs(buf.get::<u64>().ok()?))
+}
+
+/// Whether a token issued at `issued` with `lifetime` has expired. An expiry past what
+/// `SystemTime` represents is treated as expired, the conservative reading (upstream's addition
+/// overflowed).
+fn expired(issued: SystemTime, lifetime: Duration, time_source: &dyn TimeSource) -> bool {
+    issued
+        .checked_add(lifetime)
+        .is_none_or(|expiry| expiry < time_source.now())
 }
 
 /// Stateless reset token
@@ -375,8 +391,11 @@ impl ResetToken {
         let mut signature = vec![0; key.signature_len()];
         key.sign(&id, &mut signature);
         // TODO: Server ID??
+        // The endpoint's reset key is HMAC-SHA256 (32 bytes), of which the token is the first 16.
         let mut result = [0; RESET_TOKEN_SIZE];
-        result.copy_from_slice(&signature[..RESET_TOKEN_SIZE]);
+        for (out, byte) in result.iter_mut().zip(&signature) {
+            *out = *byte;
+        }
         result.into()
     }
 }
@@ -422,7 +441,7 @@ mod test {
         let mut master_key = [0; 64];
         rng.fill_bytes(&mut master_key);
         let prk = hkdf::Salt::new(hkdf::HKDF_SHA256, &[]).extract(&master_key);
-        let encoded = token.encode(&prk);
+        let encoded = token.encode(&prk).unwrap();
         let decoded = Token::decode(&prk, &encoded).expect("token didn't decrypt / decode");
         assert_eq!(token.nonce, decoded.nonce);
         decoded.payload

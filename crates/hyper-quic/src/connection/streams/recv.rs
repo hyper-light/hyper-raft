@@ -50,28 +50,33 @@ impl Recv {
         received: u64,
         max_data: u64,
     ) -> Result<(u64, bool), TransportError> {
-        let end = frame.offset + frame.data.len() as u64;
+        // A frame's offset is a variable-length integer (below 2^62) and its data is within one
+        // packet, so the sum does not saturate.
+        let end = frame
+            .offset
+            .saturating_add(u64::try_from(frame.data.len()).unwrap_or(u64::MAX));
         if end >= 2u64.pow(62) {
             return Err(TransportError::FLOW_CONTROL_ERROR(
                 "maximum stream offset too large",
             ));
         }
 
-        if let Some(final_offset) = self.final_offset() {
-            if end > final_offset || (frame.fin && end != final_offset) {
-                debug!(end, final_offset, "final size error");
-                return Err(TransportError::FINAL_SIZE_ERROR(""));
-            }
+        if let Some(final_offset) = self.final_offset()
+            && (end > final_offset || (frame.fin && end != final_offset))
+        {
+            debug!(end, final_offset, "final size error");
+            return Err(TransportError::FINAL_SIZE_ERROR(""));
         }
 
         let new_bytes = self.credit_consumed_by(end, received, max_data)?;
 
         // Stopped streams don't need to wait for the actual data, they just need to know
         // how much there was.
-        if frame.fin && !self.stopped {
-            if let RecvState::Recv { ref mut size } = self.state {
-                *size = Some(end);
-            }
+        if frame.fin
+            && !self.stopped
+            && let RecvState::Recv { ref mut size } = self.state
+        {
+            *size = Some(end);
         }
 
         self.end = self.end.max(end);
@@ -94,7 +99,8 @@ impl Recv {
         self.stopped = true;
         self.assembler.clear();
         // Issue flow control credit for unread data
-        let read_credits = self.end - self.assembler.bytes_read();
+        // The application reads only what was received.
+        let read_credits = self.end.saturating_sub(self.assembler.bytes_read());
         // This may send a spurious STOP_SENDING if we've already received all data, but it's a bit
         // fiddly to distinguish that from the case where we've received a FIN but are missing some
         // data that the peer might still be trying to retransmit, in which case a STOP_SENDING is
@@ -110,7 +116,12 @@ impl Recv {
     /// `false` the new window should only be transmitted if a previous transmission
     /// had failed.
     pub(super) fn max_stream_data(&mut self, stream_receive_window: u64) -> (u64, ShouldTransmit) {
-        let max_stream_data = self.assembler.bytes_read() + stream_receive_window;
+        // Both are below 2^62 (a stream offset and a configured window, a VarInt), so the sum does
+        // not saturate.
+        let max_stream_data = self
+            .assembler
+            .bytes_read()
+            .saturating_add(stream_receive_window);
 
         // Only announce a window update if it's significant enough
         // to make it worthwhile sending a MAX_STREAM_DATA frame.
@@ -119,7 +130,8 @@ impl Recv {
         // less updates. A fixed size would also work - but it would need to be
         // smaller than `stream_receive_window` in order to make sure the stream
         // does not get stuck.
-        let diff = max_stream_data - self.sent_max_stream_data;
+        // The window only grows: the last one sent is at most this one.
+        let diff = max_stream_data.saturating_sub(self.sent_max_stream_data);
         let transmit = self.can_send_flow_control() && diff >= (stream_receive_window / 8);
         (max_stream_data, ShouldTransmit(transmit))
     }
@@ -217,7 +229,9 @@ impl Recv {
     ) -> Result<u64, TransportError> {
         let prev_end = self.end;
         let new_bytes = offset.saturating_sub(prev_end);
-        if offset > self.sent_max_stream_data || received + new_bytes > max_data {
+        // Both are below 2^62 (a connection-level count and stream offsets), so the sum does not
+        // saturate.
+        if offset > self.sent_max_stream_data || received.saturating_add(new_bytes) > max_data {
             debug!(
                 received,
                 new_bytes,
@@ -265,11 +279,14 @@ impl<'a> Chunks<'a> {
             Entry::Vacant(_) => return Err(ReadableError::ClosedStream),
         };
 
-        let mut recv =
-            match get_or_insert_recv(streams.stream_receive_window)(entry.get_mut()).stopped {
-                true => return Err(ReadableError::ClosedStream),
-                false => entry.remove().unwrap().into_inner(), // this can't fail due to the previous get_or_insert_with
-            };
+        if get_or_insert_recv(streams.stream_receive_window)(entry.get_mut()).stopped {
+            return Err(ReadableError::ClosedStream);
+        }
+        // Present: `get_or_insert_recv` just made sure of it.
+        let Some(recv) = entry.remove() else {
+            return Err(ReadableError::ClosedStream);
+        };
+        let mut recv = recv.into_inner();
 
         recv.assembler.ensure_ordering(ordered)?;
         Ok(Self {
@@ -294,35 +311,28 @@ impl<'a> Chunks<'a> {
             ChunksState::Finished => {
                 return Ok(None);
             }
-            ChunksState::Finalized => panic!("must not call next() after finalize()"),
+            // `finalize` consumes the `Chunks`, so only its own drop reaches this state, after
+            // which `next` cannot be called (upstream's `panic!`): nothing more to read.
+            ChunksState::Finalized => return Ok(None),
         };
 
         if let Some(chunk) = rs.assembler.read(max_length, self.ordered) {
-            self.read += chunk.bytes.len() as u64;
+            // Bytes of this stream, whose offsets are below 2^62.
+            self.read = self
+                .read
+                .saturating_add(u64::try_from(chunk.bytes.len()).unwrap_or(u64::MAX));
             return Ok(Some(chunk));
         }
 
         match rs.state {
             RecvState::ResetRecvd { error_code, .. } => {
-                debug_assert_eq!(self.read, 0, "reset streams have empty buffers");
-                let state = mem::replace(&mut self.state, ChunksState::Reset(error_code));
-                // At this point if we have `rs` self.state must be `ChunksState::Readable`
-                let recv = match state {
-                    ChunksState::Readable(recv) => StreamRecv::Open(recv),
-                    _ => unreachable!("state must be ChunkState::Readable"),
-                };
-                self.streams.stream_recv_freed(self.id, recv);
+                // Reset streams have empty buffers (upstream asserted that in debug builds).
+                self.free_stream(ChunksState::Reset(error_code));
                 Err(ReadError::Reset(error_code))
             }
             RecvState::Recv { size } => {
                 if size == Some(rs.end) && rs.assembler.bytes_read() == rs.end {
-                    let state = mem::replace(&mut self.state, ChunksState::Finished);
-                    // At this point if we have `rs` self.state must be `ChunksState::Readable`
-                    let recv = match state {
-                        ChunksState::Readable(recv) => StreamRecv::Open(recv),
-                        _ => unreachable!("state must be ChunkState::Readable"),
-                    };
-                    self.streams.stream_recv_freed(self.id, recv);
+                    self.free_stream(ChunksState::Finished);
                     Ok(None)
                 } else {
                     // We don't need a distinct `ChunksState` variant for a blocked stream because
@@ -332,6 +342,14 @@ impl<'a> Chunks<'a> {
                     Err(ReadError::Blocked)
                 }
             }
+        }
+    }
+
+    /// Moves to `next`, returning the stream's receive state, which `next` found readable.
+    fn free_stream(&mut self, next: ChunksState) {
+        if let ChunksState::Readable(recv) = mem::replace(&mut self.state, next) {
+            self.streams
+                .stream_recv_freed(self.id, StreamRecv::Open(recv));
         }
     }
 
@@ -461,7 +479,7 @@ mod tests {
         let (new_bytes, is_closed) = s
             .ingest(
                 frame::Stream {
-                    id: StreamId::new(Side::Client, Dir::Uni, 0),
+                    id: StreamId::new(Side::Client, Dir::Uni, 0).unwrap(),
                     offset: INITIAL_OFFSET,
                     fin: false,
                     data: Bytes::from_static(&[0; INITIAL_BYTES as usize]),
@@ -494,7 +512,7 @@ mod tests {
         let (new_bytes, is_closed) = s
             .ingest(
                 frame::Stream {
-                    id: StreamId::new(Side::Client, Dir::Uni, 0),
+                    id: StreamId::new(Side::Client, Dir::Uni, 0).unwrap(),
                     offset: RECV_WINDOW - 1,
                     fin: false,
                     data: Bytes::from_static(&[0; 1]),
@@ -519,7 +537,7 @@ mod tests {
         let (new_bytes, is_closed) = s
             .ingest(
                 frame::Stream {
-                    id: StreamId::new(Side::Client, Dir::Uni, 0),
+                    id: StreamId::new(Side::Client, Dir::Uni, 0).unwrap(),
                     offset: 0,
                     fin: false,
                     data: Bytes::from_static(&[0; INITIAL_OFFSET as usize]),

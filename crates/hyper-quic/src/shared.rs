@@ -75,27 +75,38 @@ pub struct ConnectionId {
 
 impl ConnectionId {
     /// Construct cid from byte array
+    ///
+    /// A CID is at most `MAX_CID_SIZE` bytes (RFC 9000 §17.2); this keeps that many of a longer
+    /// slice (upstream asserted in debug builds and panicked).
     pub fn new(bytes: &[u8]) -> Self {
-        debug_assert!(bytes.len() <= MAX_CID_SIZE);
         let mut res = Self {
-            len: bytes.len() as u8,
+            len: 0,
             bytes: [0; MAX_CID_SIZE],
         };
-        res.bytes[..bytes.len()].copy_from_slice(bytes);
+        let (cid, _) = bytes.split_at(bytes.len().min(MAX_CID_SIZE));
+        res.set_len(cid.len());
+        res.copy_from_slice(cid);
         res
     }
 
     /// Constructs cid by reading `len` bytes from a `Buf`
     ///
-    /// Callers need to assure that `buf.remaining() >= len`
+    /// Callers need to assure that `buf.remaining() >= len` and `len <= MAX_CID_SIZE`; a call
+    /// that does not reads only what both allow (upstream asserted the second in debug builds
+    /// and panicked on the first).
     pub fn from_buf(buf: &mut (impl Buf + ?Sized), len: usize) -> Self {
-        debug_assert!(len <= MAX_CID_SIZE);
         let mut res = Self {
-            len: len as u8,
+            len: 0,
             bytes: [0; MAX_CID_SIZE],
         };
-        buf.copy_to_slice(&mut res[..len]);
+        res.set_len(len.min(MAX_CID_SIZE).min(buf.remaining()));
+        buf.copy_to_slice(&mut res);
         res
+    }
+
+    /// Sets the length, which is at most `MAX_CID_SIZE`, and so fits the `u8`.
+    fn set_len(&mut self, len: usize) {
+        self.len = u8::try_from(len.min(MAX_CID_SIZE)).unwrap_or(0);
     }
 
     /// Decode from long header format
@@ -109,7 +120,7 @@ impl ConnectionId {
 
     /// Encode in long header format
     pub(crate) fn encode_long(&self, buf: &mut impl BufMut) {
-        buf.put_u8(self.len() as u8);
+        buf.put_u8(self.len);
         buf.put_slice(self);
     }
 }
@@ -117,19 +128,24 @@ impl ConnectionId {
 impl ::std::ops::Deref for ConnectionId {
     type Target = [u8];
     fn deref(&self) -> &[u8] {
-        &self.bytes[0..self.len as usize]
+        // `len` is at most MAX_CID_SIZE (`set_len`).
+        self.bytes
+            .split_at(usize::from(self.len).min(MAX_CID_SIZE))
+            .0
     }
 }
 
 impl ::std::ops::DerefMut for ConnectionId {
     fn deref_mut(&mut self) -> &mut [u8] {
-        &mut self.bytes[0..self.len as usize]
+        self.bytes
+            .split_at_mut(usize::from(self.len).min(MAX_CID_SIZE))
+            .0
     }
 }
 
 impl fmt::Debug for ConnectionId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.bytes[0..self.len as usize].fmt(f)
+        (**self).fmt(f)
     }
 }
 

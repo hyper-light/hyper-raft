@@ -8,7 +8,7 @@ use crate::congestion::ControllerMetrics;
 use crate::congestion::bbr::bw_estimation::BandwidthEstimation;
 use crate::congestion::bbr::min_max::MinMax;
 use crate::connection::RttEstimator;
-use crate::{Duration, Instant};
+use crate::{Duration, Instant, float};
 
 use super::{BASE_DATAGRAM_SIZE, Controller};
 
@@ -116,12 +116,13 @@ impl Bbr {
         // follow each other.
         let mut rand_index = self
             .random_number_generator
-            .random_range(0..K_PACING_GAIN.len() as u8 - 1);
+            .random_range(0..GAIN_CYCLE_LENGTH - 1);
         if rand_index >= 1 {
-            rand_index += 1;
+            // At most the cycle's last offset
+            rand_index = rand_index.saturating_add(1);
         }
         self.current_cycle_offset = rand_index;
-        self.pacing_gain = K_PACING_GAIN[rand_index as usize];
+        self.pacing_gain = pacing_gain_at(rand_index);
     }
 
     fn update_recovery_state(&mut self, is_round_start: bool) {
@@ -183,18 +184,22 @@ impl Bbr {
         }
 
         if should_advance_gain_cycling {
-            self.current_cycle_offset = (self.current_cycle_offset + 1) % K_PACING_GAIN.len() as u8;
+            self.current_cycle_offset = self
+                .current_cycle_offset
+                .checked_add(1)
+                .filter(|&next| next < GAIN_CYCLE_LENGTH)
+                .unwrap_or(0);
             self.last_cycle_start = Some(now);
             // Stay in low gain mode until the target BDP is hit.  Low gain mode
             // will be exited immediately when the target BDP is achieved.
             if DRAIN_TO_TARGET
                 && self.pacing_gain < 1.0
-                && (K_PACING_GAIN[self.current_cycle_offset as usize] - 1.0).abs() < f32::EPSILON
+                && (pacing_gain_at(self.current_cycle_offset) - 1.0).abs() < f32::EPSILON
                 && in_flight > self.get_target_cwnd(1.0)
             {
                 return;
             }
-            self.pacing_gain = K_PACING_GAIN[self.current_cycle_offset as usize];
+            self.pacing_gain = pacing_gain_at(self.current_cycle_offset);
         }
     }
 
@@ -241,9 +246,11 @@ impl Bbr {
                     // ProbeRtt.  The CWND during ProbeRtt is
                     // kMinimumCongestionWindow, but we allow an extra packet since QUIC
                     // checks CWND before sending a packet.
-                    if bytes_in_flight < self.get_probe_rtt_cwnd() + self.current_mtu {
+                    if bytes_in_flight < self.get_probe_rtt_cwnd().saturating_add(self.current_mtu)
+                    {
+                        /// How long ProbeRtt lasts (upstream's value, from the BBR draft)
                         const K_PROBE_RTT_TIME: Duration = Duration::from_millis(200);
-                        self.exit_probe_rtt_at = Some(now + K_PROBE_RTT_TIME);
+                        self.exit_probe_rtt_at = now.checked_add(K_PROBE_RTT_TIME);
                     }
                 }
                 Some(exit_time) if is_round_start && now >= exit_time => {
@@ -262,9 +269,12 @@ impl Bbr {
 
     fn get_target_cwnd(&self, gain: f32) -> u64 {
         let bw = self.max_bandwidth.get_estimate();
-        let bdp = self.min_rtt.as_micros() as u64 * bw;
+        // Byte counts: saturating holds them at a size no connection reaches
+        let bdp = u64::try_from(self.min_rtt.as_micros())
+            .unwrap_or(u64::MAX)
+            .saturating_mul(bw);
         let bdpf = bdp as f64;
-        let cwnd = ((gain as f64 * bdpf) / 1_000_000f64) as u64;
+        let cwnd = float::saturating_u64((gain as f64 * bdpf) / 1_000_000f64);
         // BDP estimate will be zero if no bandwidth samples are available yet.
         if cwnd == 0 {
             return self.init_cwnd;
@@ -273,6 +283,7 @@ impl Bbr {
     }
 
     fn get_probe_rtt_cwnd(&self) -> u64 {
+        /// ProbeRTT's window as a fraction of the BDP (upstream's value, after Chromium's BBR)
         const K_MODERATE_PROBE_RTT_MULTIPLIER: f32 = 0.75;
         if PROBE_RTT_BASED_ON_BDP {
             return self.get_target_cwnd(K_MODERATE_PROBE_RTT_MULTIPLIER);
@@ -285,7 +296,7 @@ impl Bbr {
         if bw == 0 {
             return;
         }
-        let target_rate = (bw as f64 * self.pacing_gain as f64) as u64;
+        let target_rate = float::saturating_u64(bw as f64 * self.pacing_gain as f64);
         if self.is_at_full_bandwidth {
             self.pacing_rate = target_rate;
             return;
@@ -293,9 +304,11 @@ impl Bbr {
 
         // Pace at the rate of initial_window / RTT as soon as RTT measurements are
         // available.
-        if self.pacing_rate == 0 && self.min_rtt.as_nanos() != 0 {
-            self.pacing_rate =
-                BandwidthEstimation::bw_from_delta(self.init_cwnd, self.min_rtt).unwrap();
+        // With no RTT measured yet there is no rate
+        if self.pacing_rate == 0
+            && let Some(rate) = BandwidthEstimation::bw_from_delta(self.init_cwnd, self.min_rtt)
+        {
+            self.pacing_rate = rate;
             return;
         }
 
@@ -312,21 +325,21 @@ impl Bbr {
         let mut target_window = self.get_target_cwnd(self.cwnd_gain);
         if self.is_at_full_bandwidth {
             // Add the max recently measured ack aggregation to CWND.
-            target_window += self.ack_aggregation.max_ack_height.get();
+            target_window = target_window.saturating_add(self.ack_aggregation.max_ack_height.get());
         } else {
             // Add the most recent excess acked.  Because CWND never decreases in
             // STARTUP, this will automatically create a very localized max filter.
-            target_window += excess_acked;
+            target_window = target_window.saturating_add(excess_acked);
         }
         // Instead of immediately setting the target CWND as the new one, BBR grows
         // the CWND towards |target_window| by only increasing it |bytes_acked| at a
         // time.
         if self.is_at_full_bandwidth {
-            self.cwnd = target_window.min(self.cwnd + bytes_acked);
+            self.cwnd = target_window.min(self.cwnd.saturating_add(bytes_acked));
         } else if (self.cwnd_gain < target_window as f32) || (self.acked_bytes < self.init_cwnd) {
             // If the connection is not yet out of startup phase, do not decrease
             // the window.
-            self.cwnd += bytes_acked;
+            self.cwnd = self.cwnd.saturating_add(bytes_acked);
         }
 
         // Enforce the limits on the congestion window.
@@ -341,14 +354,14 @@ impl Bbr {
         }
         // Set up the initial recovery window.
         if self.recovery_window == 0 {
-            self.recovery_window = self.min_cwnd.max(in_flight + bytes_acked);
+            self.recovery_window = self.min_cwnd.max(in_flight.saturating_add(bytes_acked));
             return;
         }
 
         // Remove losses from the recovery window, while accounting for a potential
         // integer underflow.
-        if self.recovery_window >= bytes_lost {
-            self.recovery_window -= bytes_lost;
+        if let Some(left) = self.recovery_window.checked_sub(bytes_lost) {
+            self.recovery_window = left;
         } else {
             // k_max_segment_size = current_mtu
             self.recovery_window = self.current_mtu;
@@ -356,14 +369,14 @@ impl Bbr {
         // In CONSERVATION mode, just subtracting losses is sufficient.  In GROWTH,
         // release additional |bytes_acked| to achieve a slow-start-like behavior.
         if self.recovery_state == RecoveryState::Growth {
-            self.recovery_window += bytes_acked;
+            self.recovery_window = self.recovery_window.saturating_add(bytes_acked);
         }
 
         // Sanity checks.  Ensure that we always allow to send at least an MSS or
         // |bytes_acked| in response, whichever is larger.
         self.recovery_window = self
             .recovery_window
-            .max(in_flight + bytes_acked)
+            .max(in_flight.saturating_add(bytes_acked))
             .max(self.min_cwnd);
     }
 
@@ -372,7 +385,8 @@ impl Bbr {
         if app_limited {
             return;
         }
-        let target = (self.bw_at_last_round as f64 * K_STARTUP_GROWTH_TARGET as f64) as u64;
+        let target =
+            float::saturating_u64(self.bw_at_last_round as f64 * K_STARTUP_GROWTH_TARGET as f64);
         let bw = self.max_bandwidth.get_estimate();
         if bw >= target {
             self.bw_at_last_round = bw;
@@ -381,7 +395,7 @@ impl Bbr {
             return;
         }
 
-        self.round_wo_bw_gain += 1;
+        self.round_wo_bw_gain = self.round_wo_bw_gain.saturating_add(1);
         if self.round_wo_bw_gain >= K_ROUND_TRIPS_WITHOUT_GROWTH_BEFORE_EXITING_STARTUP as u64
             || (self.recovery_state.in_recovery())
         {
@@ -406,7 +420,7 @@ impl Controller for Bbr {
     ) {
         self.max_bandwidth
             .on_ack(now, sent, bytes, self.round_count, app_limited);
-        self.acked_bytes += bytes;
+        self.acked_bytes = self.acked_bytes.saturating_add(bytes);
         if self.is_min_rtt_expired(now, app_limited) || self.min_rtt > rtt.min() {
             self.min_rtt = rtt.min();
         }
@@ -437,7 +451,7 @@ impl Controller for Bbr {
                 self.max_acked_packet_number > self.current_round_trip_end_packet_number;
             if is_round_start {
                 self.current_round_trip_end_packet_number = self.max_sent_packet_number;
-                self.round_count += 1;
+                self.round_count = self.round_count.saturating_add(1);
             }
         }
 
@@ -471,7 +485,7 @@ impl Controller for Bbr {
         _is_persistent_congestion: bool,
         lost_bytes: u64,
     ) {
-        self.loss_state.lost_bytes += lost_bytes;
+        self.loss_state.lost_bytes = self.loss_state.lost_bytes.saturating_add(lost_bytes);
     }
 
     fn on_mtu_update(&mut self, new_mtu: u16) {
@@ -494,7 +508,8 @@ impl Controller for Bbr {
         ControllerMetrics {
             congestion_window: self.window(),
             ssthresh: None,
-            pacing_rate: Some(self.pacing_rate * 8),
+            // Bits per second
+            pacing_rate: Some(self.pacing_rate.saturating_mul(8)),
         }
     }
 
@@ -552,11 +567,13 @@ impl AckAggregationState {
     ) -> u64 {
         // Compute how many bytes are expected to be delivered, assuming max
         // bandwidth is correct.
-        let expected_bytes_acked = max_bandwidth
-            * now
-                .saturating_duration_since(self.aggregation_epoch_start_time.unwrap_or(now))
-                .as_micros() as u64
-            / 1_000_000;
+        // Byte counts: saturating holds them at a size no connection reaches
+        let elapsed_micros = u64::try_from(
+            now.saturating_duration_since(self.aggregation_epoch_start_time.unwrap_or(now))
+                .as_micros(),
+        )
+        .unwrap_or(u64::MAX);
+        let expected_bytes_acked = max_bandwidth.saturating_mul(elapsed_micros) / 1_000_000;
 
         // Reset the current aggregation epoch as soon as the ack arrival rate is
         // less than or equal to the max bandwidth.
@@ -569,8 +586,13 @@ impl AckAggregationState {
 
         // Compute how many extra bytes were delivered vs max bandwidth.
         // Include the bytes most recently acknowledged to account for stretch acks.
-        self.aggregation_epoch_bytes += newly_acked_bytes;
-        let diff = self.aggregation_epoch_bytes - expected_bytes_acked;
+        self.aggregation_epoch_bytes = self
+            .aggregation_epoch_bytes
+            .saturating_add(newly_acked_bytes);
+        // Above the expected bytes, as checked just before
+        let diff = self
+            .aggregation_epoch_bytes
+            .saturating_sub(expected_bytes_acked);
         self.max_ack_height.update_max(round, diff);
         diff
     }
@@ -624,21 +646,47 @@ impl LossState {
 }
 
 fn calculate_min_window(current_mtu: u64) -> u64 {
-    4 * current_mtu
+    4u64.saturating_mul(current_mtu)
+}
+
+/// The pacing gain at `offset` in the gain cycle
+fn pacing_gain_at(offset: u8) -> f32 {
+    let [g0, g1, g2, g3, g4, g5, g6, g7] = K_PACING_GAIN;
+    // The mask keeps the offset within the cycle's eight phases
+    match offset & (GAIN_CYCLE_LENGTH - 1) {
+        0 => g0,
+        1 => g1,
+        2 => g2,
+        3 => g3,
+        4 => g4,
+        5 => g5,
+        6 => g6,
+        _ => g7,
+    }
 }
 
 // The gain used for the STARTUP, equal to 2/ln(2).
+/// The gain used for STARTUP, 2/ln(2) (draft-cardwell-iccrg-bbr-congestion-control §4.6.1)
 const K_DEFAULT_HIGH_GAIN: f32 = 2.885;
 // The newly derived CWND gain for STARTUP, 2.
+/// The newly derived CWND gain for STARTUP, 2 (BBR draft §4.6.1)
 const K_DERIVED_HIGH_CWNDGAIN: f32 = 2.0;
 // The cycle of gains used during the ProbeBw stage.
+/// The cycle of gains used during ProbeBW (BBR draft §4.3.4)
 const K_PACING_GAIN: [f32; 8] = [1.25, 0.75, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0];
+/// Phases in the gain cycle, a power of two
+const GAIN_CYCLE_LENGTH: u8 = 8;
 
+/// The bandwidth growth per round that keeps STARTUP going, 25% (BBR draft §4.3.2.2)
 const K_STARTUP_GROWTH_TARGET: f32 = 1.25;
+/// Rounds without that growth before STARTUP ends, 3 (BBR draft §4.3.2.2)
 const K_ROUND_TRIPS_WITHOUT_GROWTH_BEFORE_EXITING_STARTUP: u8 = 3;
 
 // Do not allow initial congestion window to be greater than 200 packets.
+/// Do not allow initial congestion window to be greater than 200 packets (upstream's value)
 const K_MAX_INITIAL_CONGESTION_WINDOW: u64 = 200;
 
+/// ProbeRTT sizes its window from the BDP (upstream's choice)
 const PROBE_RTT_BASED_ON_BDP: bool = true;
+/// Low gain holds until the BDP target is reached (upstream's choice)
 const DRAIN_TO_TARGET: bool = true;

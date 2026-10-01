@@ -12,11 +12,35 @@
 //! related `Connection`. `Connection` types contain the bulk of the protocol logic related to
 //! managing a single connection and all the related state (such as streams).
 
+// Test code opts out of the no-panic wall (CLAUDE.md §1); shipped code does not.
+#![cfg_attr(
+    test,
+    allow(
+        clippy::panic,
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::unreachable,
+        clippy::indexing_slicing,
+        clippy::arithmetic_side_effects,
+        clippy::disallowed_macros,
+        clippy::cognitive_complexity,
+        clippy::cast_possible_truncation,
+        clippy::string_slice,
+        clippy::unwrap_in_result,
+        clippy::panic_in_result_fn,
+        clippy::missing_panics_doc,
+        clippy::todo,
+        clippy::dbg_macro,
+        clippy::disallowed_types,
+        clippy::disallowed_methods,
+        clippy::cast_sign_loss,
+        clippy::cast_possible_wrap
+    )
+)]
 #![cfg_attr(not(fuzzing), warn(missing_docs))]
 #![cfg_attr(test, allow(dead_code))]
 // Fixes welcome:
 #![warn(unreachable_pub)]
-#![allow(clippy::cognitive_complexity)]
 #![allow(clippy::too_many_arguments)]
 #![warn(clippy::use_self)]
 
@@ -29,6 +53,7 @@ use std::{
 mod cid_queue;
 pub mod coding;
 mod constant_time;
+mod float;
 mod range_set;
 #[cfg(test)]
 mod tests;
@@ -53,8 +78,8 @@ pub use rustls;
 
 mod config;
 pub use config::{
-    AckFrequencyConfig, ClientConfig, ClientConfigHandle, ConfigError, Configs, ConfigsFull,
-    EndpointConfig, IdleTimeout, MtuDiscoveryConfig, ServerConfig, ServerConfigHandle,
+    AckFrequencyConfig, ClientConfig, ClientConfigError, ClientConfigHandle, ConfigError, Configs,
+    ConfigsFull, EndpointConfig, IdleTimeout, MtuDiscoveryConfig, ServerConfig, ServerConfigHandle,
     StdSystemTime, TimeSource, TransportConfig, ValidationTokenConfig,
 };
 pub use config::{QlogConfig, QlogError};
@@ -68,6 +93,7 @@ pub use crate::frame::{ApplicationClose, ConnectionClose, Datagram, FrameType};
 mod endpoint;
 pub use crate::endpoint::{
     AcceptError, ConnectError, ConnectionHandle, DatagramEvent, Endpoint, Incoming, RetryError,
+    RngUnavailable,
 };
 
 mod packet;
@@ -213,6 +239,38 @@ impl Dir {
     }
 }
 
+/// One value per stream direction, read and written by [`Dir`]: an access that cannot be out of
+/// bounds, where upstream indexed a `[T; 2]` by `dir as usize`.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PerDir<T> {
+    bi: T,
+    uni: T,
+}
+
+impl<T> PerDir<T> {
+    pub(crate) const fn new(bi: T, uni: T) -> Self {
+        Self { bi, uni }
+    }
+
+    pub(crate) fn get(&self, dir: Dir) -> &T {
+        match dir {
+            Dir::Bi => &self.bi,
+            Dir::Uni => &self.uni,
+        }
+    }
+
+    pub(crate) fn get_mut(&mut self, dir: Dir) -> &mut T {
+        match dir {
+            Dir::Bi => &mut self.bi,
+            Dir::Uni => &mut self.uni,
+        }
+    }
+
+    pub(crate) fn iter(&self) -> impl Iterator<Item = &T> {
+        [&self.bi, &self.uni].into_iter()
+    }
+}
+
 impl fmt::Display for Dir {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         use Dir::*;
@@ -250,8 +308,15 @@ impl fmt::Display for StreamId {
 
 impl StreamId {
     /// Create a new StreamId
-    pub fn new(initiator: Side, dir: Dir, index: u64) -> Self {
-        Self((index << 2) | ((dir as u64) << 1) | initiator as u64)
+    ///
+    /// A stream ID is a 62-bit integer whose low two bits are the initiator and direction
+    /// (RFC 9000 §2.1), so `index` is below 2^60 (`MAX_STREAM_COUNT`); a larger one has no stream
+    /// ID and gives `None`. Upstream built an ID that panicked when encoded.
+    pub fn new(initiator: Side, dir: Dir, index: u64) -> Option<Self> {
+        if index >= MAX_STREAM_COUNT {
+            return None;
+        }
+        Some(Self((index << 2) | ((dir as u64) << 1) | initiator as u64))
     }
     /// Which side of a connection initiated the stream
     pub fn initiator(self) -> Side {
@@ -271,9 +336,11 @@ impl StreamId {
     }
 }
 
+// Every `StreamId` is below 2^62: `new` refuses a larger index, and the others come from a
+// `VarInt`.
 impl From<StreamId> for VarInt {
     fn from(x: StreamId) -> Self {
-        unsafe { Self::from_u64_unchecked(x.0) }
+        Self(x.0)
     }
 }
 
@@ -294,7 +361,7 @@ impl coding::Codec for StreamId {
         VarInt::decode(buf).map(|x| Self(x.into_inner()))
     }
     fn encode<B: bytes::BufMut>(&self, buf: &mut B) {
-        VarInt::from_u64(self.0).unwrap().encode(buf);
+        VarInt::from(*self).encode(buf);
     }
 }
 
@@ -321,12 +388,17 @@ pub struct Transmit {
 
 /// The maximum number of CIDs we bother to issue per connection
 const LOC_CID_COUNT: u64 = 8;
+/// A stateless reset token's length (RFC 9000 §10.3)
 const RESET_TOKEN_SIZE: usize = 16;
+/// The longest connection ID QUIC v1 allows (RFC 9000 §17.2)
 const MAX_CID_SIZE: usize = 20;
+/// The smallest datagram a client's Initial travels in (RFC 9000 §14.1)
 const MIN_INITIAL_SIZE: u16 = 1200;
 /// <https://www.rfc-editor.org/rfc/rfc9000.html#name-datagram-size>
 const INITIAL_MTU: u16 = 1200;
+/// The largest UDP payload, the default max_udp_payload_size (RFC 9000 §18.2)
 const MAX_UDP_PAYLOAD: u16 = 65527;
+/// The timer granularity RFC 9002 §6.1.2 recommends, 1 ms
 const TIMER_GRANULARITY: Duration = Duration::from_millis(1);
 /// Maximum number of streams that can be uniquely identified by a stream ID
 const MAX_STREAM_COUNT: u64 = 1 << 60;

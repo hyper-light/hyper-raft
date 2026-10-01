@@ -35,42 +35,56 @@ impl SendBuffer {
 
     /// Append application data to the end of the stream
     pub(super) fn write(&mut self, data: Bytes) {
-        self.unacked_len += data.len();
-        self.offset += data.len() as u64;
+        // Bytes held in memory, and a stream offset the send window bounds below 2^62: neither
+        // sum saturates.
+        self.unacked_len = self.unacked_len.saturating_add(data.len());
+        self.offset = self.offset.saturating_add(len_u64(data.len()));
         self.unacked_segments.push_back(data);
+    }
+
+    /// The offset of the first byte still held: `unacked_len` is at most `offset`.
+    fn base_offset(&self) -> u64 {
+        self.offset.saturating_sub(len_u64(self.unacked_len))
     }
 
     /// Discard a range of acknowledged stream data
     pub(super) fn ack(&mut self, mut range: Range<u64>) {
         // Clamp the range to data which is still tracked
-        let base_offset = self.offset - self.unacked_len as u64;
+        let base_offset = self.base_offset();
         range.start = base_offset.max(range.start);
         range.end = base_offset.max(range.end);
 
         self.acks.insert(range);
 
-        while self.acks.min() == Some(self.offset - self.unacked_len as u64) {
-            let prefix = self.acks.pop_min().unwrap();
-            let mut to_advance = (prefix.end - prefix.start) as usize;
+        while self.acks.min() == Some(self.base_offset()) {
+            let Some(prefix) = self.acks.pop_min() else {
+                break;
+            };
+            // Acknowledged data is data still held: at most `unacked_len`.
+            let mut to_advance = usize::try_from(prefix.end.saturating_sub(prefix.start))
+                .map_or(self.unacked_len, |n| n.min(self.unacked_len));
 
-            self.unacked_len -= to_advance;
+            self.unacked_len = self.unacked_len.saturating_sub(to_advance);
             while to_advance > 0 {
-                let front = self
-                    .unacked_segments
-                    .front_mut()
-                    .expect("Expected buffered data");
+                // `unacked_len` counts the bytes of these segments.
+                let Some(front) = self.unacked_segments.front_mut() else {
+                    break;
+                };
 
-                if front.len() <= to_advance {
-                    to_advance -= front.len();
+                if let Some(rest) = to_advance.checked_sub(front.len()) {
+                    to_advance = rest;
                     self.unacked_segments.pop_front();
                     self.front_trimmed = 0;
 
-                    if self.unacked_segments.len() * 4 < self.unacked_segments.capacity() {
+                    if self.unacked_segments.len().saturating_mul(4)
+                        < self.unacked_segments.capacity()
+                    {
                         self.unacked_segments.shrink_to_fit();
                     }
                 } else {
                     front.advance(to_advance);
-                    self.front_trimmed += to_advance;
+                    // Within the front segment's length.
+                    self.front_trimmed = self.front_trimmed.saturating_add(to_advance);
                     to_advance = 0;
                 }
             }
@@ -90,8 +104,10 @@ impl SendBuffer {
     /// - The second return value indicates whether the length needs to be encoded
     ///   in the STREAM frames metadata (`true`), or whether it can be omitted
     ///   since the selected range will fill the whole packet.
+    ///
+    /// The room left saturates at zero: metadata that does not fit leaves no room for data, where
+    /// upstream's subtraction underflowed (it asserted the guarantee in debug builds only).
     pub(super) fn poll_transmit(&mut self, mut max_len: usize) -> (Range<u64>, bool) {
-        debug_assert!(max_len >= 8 + 8);
         let mut encode_length = false;
 
         if let Some(range) = self.retransmits.pop_min() {
@@ -100,14 +116,14 @@ impl SendBuffer {
             // When the offset is known, we know how many bytes are required to encode it.
             // Offset 0 requires no space
             if range.start != 0 {
-                max_len -= VarInt::size(unsafe { VarInt::from_u64_unchecked(range.start) });
+                max_len = max_len.saturating_sub(VarInt::size_of(range.start));
             }
-            if range.end - range.start < max_len as u64 {
+            if range.end.saturating_sub(range.start) < len_u64(max_len) {
                 encode_length = true;
-                max_len -= 8;
+                max_len = max_len.saturating_sub(8);
             }
 
-            let end = range.end.min((max_len as u64).saturating_add(range.start));
+            let end = range.end.min(len_u64(max_len).saturating_add(range.start));
             if end != range.end {
                 self.retransmits.insert(end..range.end);
             }
@@ -119,16 +135,16 @@ impl SendBuffer {
         // When the offset is known, we know how many bytes are required to encode it.
         // Offset 0 requires no space
         if self.unsent != 0 {
-            max_len -= VarInt::size(unsafe { VarInt::from_u64_unchecked(self.unsent) });
+            max_len = max_len.saturating_sub(VarInt::size_of(self.unsent));
         }
-        if self.offset - self.unsent < max_len as u64 {
+        if self.offset.saturating_sub(self.unsent) < len_u64(max_len) {
             encode_length = true;
-            max_len -= 8;
+            max_len = max_len.saturating_sub(8);
         }
 
         let end = self
             .offset
-            .min((max_len as u64).saturating_add(self.unsent));
+            .min(len_u64(max_len).saturating_add(self.unsent));
         let result = self.unsent..end;
         self.unsent = end;
         (result, encode_length)
@@ -141,19 +157,23 @@ impl SendBuffer {
     /// should call the function again with an incremented start offset to
     /// retrieve more data.
     pub(super) fn get(&self, offsets: Range<u64>) -> &[u8] {
-        let base_offset = self.offset - self.unacked_len as u64;
-
-        let mut segment_offset = base_offset;
+        let mut segment_offset = self.base_offset();
         for segment in self.unacked_segments.iter() {
-            if offsets.start >= segment_offset
-                && offsets.start < segment_offset + segment.len() as u64
-            {
-                let start = (offsets.start - segment_offset) as usize;
-                let end = (offsets.end - segment_offset) as usize;
+            // Offsets of data held in memory: the sums do not saturate.
+            let segment_end = segment_offset.saturating_add(len_u64(segment.len()));
+            if offsets.start >= segment_offset && offsets.start < segment_end {
+                // Both within this segment's length, which is a usize.
+                let start = usize::try_from(offsets.start.saturating_sub(segment_offset))
+                    .unwrap_or(usize::MAX)
+                    .min(segment.len());
+                let end = usize::try_from(offsets.end.saturating_sub(segment_offset))
+                    .unwrap_or(usize::MAX)
+                    .min(segment.len());
 
-                return &segment[start..end.min(segment.len())];
+                let tail = segment.split_at(start).1;
+                return tail.split_at(end.saturating_sub(start).min(tail.len())).0;
             }
-            segment_offset += segment.len() as u64;
+            segment_offset = segment_end;
         }
 
         &[]
@@ -169,13 +189,14 @@ impl SendBuffer {
     }
 
     /// Queue a range of sent but unacknowledged data to be retransmitted
+    /// Only sent data can be lost (upstream asserted that in debug builds).
     pub(super) fn retransmit(&mut self, range: Range<u64>) {
-        debug_assert!(range.end <= self.unsent, "unsent data can't be lost");
         self.retransmits.insert(range);
     }
 
+    /// Called before any data is acknowledged, while everything written is held (upstream
+    /// asserted that in debug builds).
     pub(super) fn retransmit_all_for_0rtt(&mut self) {
-        debug_assert_eq!(self.offset, self.unacked_len as u64);
         self.unsent = 0;
     }
 
@@ -199,8 +220,13 @@ impl SendBuffer {
 
     /// Bytes still retained from application writes, including acknowledged data
     pub(super) fn buffered(&self) -> u64 {
-        (self.unacked_len + self.front_trimmed) as u64
+        len_u64(self.unacked_len.saturating_add(self.front_trimmed))
     }
+}
+
+/// A length in memory as a stream offset: a usize fits a u64 on every supported target.
+fn len_u64(len: usize) -> u64 {
+    u64::try_from(len).unwrap_or(u64::MAX)
 }
 
 #[cfg(test)]

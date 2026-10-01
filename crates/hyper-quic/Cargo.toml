@@ -30,9 +30,10 @@ tracing = { version = "0.1.10", default-features = false, features = ["std"] }
 [dev-dependencies]
 assert_matches = "1.1"
 hex-literal = "1"
+hyper-measure = { path = "../hyper-measure" }
 lazy_static = "1"
 rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem"] }
 tracing-subscriber = { version = "0.3.0", default-features = false, features = ["env-filter", "fmt", "ansi", "time", "local-time"] }
 
-[lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }
+[lints]
+workspace = true

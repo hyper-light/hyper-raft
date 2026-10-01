@@ -53,11 +53,8 @@ impl Pacer {
         window: u64,
         now: Instant,
     ) -> Option<Instant> {
-        debug_assert_ne!(
-            window, 0,
-            "zero-sized congestion control window is nonsense"
-        );
-
+        // A congestion window is never zero (upstream asserted that in debug builds); a zero one
+        // paces nothing, below.
         if window != self.last_window || mtu != self.last_mtu {
             self.capacity = optimal_capacity(smoothed_rtt, window, mtu);
 
@@ -72,12 +69,13 @@ impl Pacer {
             return None;
         }
 
-        // we disable pacing for extremely large windows
-        if window > u64::from(u32::MAX) {
+        // we disable pacing for extremely large windows, and for a zero one
+        let Ok(window) = u32::try_from(window) else {
+            return None;
+        };
+        if window == 0 {
             return None;
         }
-
-        let window = window as u32;
 
         let time_elapsed = now.checked_duration_since(self.prev).unwrap_or_else(|| {
             warn!("received a timestamp early than a previous recorded time, ignoring");
@@ -89,10 +87,10 @@ impl Pacer {
         }
 
         let elapsed_rtts = time_elapsed.as_secs_f64() / smoothed_rtt.as_secs_f64();
-        let new_tokens = window as f64 * 1.25 * elapsed_rtts;
+        let new_tokens = f64::from(window) * 1.25 * elapsed_rtts;
         self.tokens = self
             .tokens
-            .saturating_add(new_tokens as _)
+            .saturating_add(crate::float::saturating_u64(new_tokens))
             .min(self.capacity);
 
         self.prev = now;
@@ -102,14 +100,23 @@ impl Pacer {
             return None;
         }
 
+        // `tokens` is below `bytes_to_send` here; a deficit past u32::MAX saturates, as does the
+        // product.
+        let deficit = bytes_to_send.max(self.capacity).saturating_sub(self.tokens);
         let unscaled_delay = smoothed_rtt
-            .checked_mul((bytes_to_send.max(self.capacity) - self.tokens) as _)
+            .checked_mul(u32::try_from(deficit).unwrap_or(u32::MAX))
             .unwrap_or(Duration::MAX)
-            / window;
+            .checked_div(window)
+            .unwrap_or(Duration::MAX);
 
         // divisions come before multiplications to prevent overflow
-        // this is the time at which the pacing window becomes empty
-        Some(self.prev + (unscaled_delay / 5) * 4)
+        // this is the time at which the pacing window becomes empty; a time past what `Instant`
+        // represents does not pace (upstream's addition overflowed)
+        let delay = unscaled_delay
+            .checked_div(5)
+            .and_then(|fifth| fifth.checked_mul(4))
+            .unwrap_or(Duration::MAX);
+        self.prev.checked_add(delay)
     }
 }
 
@@ -129,11 +136,21 @@ impl Pacer {
 fn optimal_capacity(smoothed_rtt: Duration, window: u64, mtu: u16) -> u64 {
     let rtt = smoothed_rtt.as_nanos().max(1);
 
-    let capacity = ((window as u128 * BURST_INTERVAL_NANOS) / rtt) as u64;
+    // A u64 window times a nanosecond interval fits a u128; the quotient saturates into a u64.
+    let capacity = u128::from(window)
+        .saturating_mul(BURST_INTERVAL_NANOS)
+        .checked_div(rtt)
+        .map_or(u64::MAX, |capacity| {
+            u64::try_from(capacity).unwrap_or(u64::MAX)
+        });
 
     // Small bursts are less efficient (no GSO), could increase latency and don't effectively
     // use the channel's buffer capacity. Large bursts might block the connection on sending.
-    capacity.clamp(MIN_BURST_SIZE * mtu as u64, MAX_BURST_SIZE * mtu as u64)
+    // A u16 MTU times a small burst count does not saturate.
+    capacity.clamp(
+        MIN_BURST_SIZE.saturating_mul(u64::from(mtu)),
+        MAX_BURST_SIZE.saturating_mul(u64::from(mtu)),
+    )
 }
 
 /// The burst interval

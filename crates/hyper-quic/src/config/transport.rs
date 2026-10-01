@@ -341,10 +341,13 @@ impl TransportConfig {
 
 impl Default for TransportConfig {
     fn default() -> Self {
+        /// The RTT the default windows are sized for, in milliseconds (upstream's value)
         const EXPECTED_RTT: u32 = 100; // ms
+        /// The per-stream bandwidth the default windows sustain, 12.5 MB/s (upstream's value)
         const MAX_STREAM_BANDWIDTH: u32 = 12500 * 1000; // bytes/s
         // Window size needed to avoid pipeline
         // stalls
+        /// The bandwidth-delay product of the two above, the window that avoids pipeline stalls
         const STREAM_RWND: u32 = MAX_STREAM_BANDWIDTH / 1000 * EXPECTED_RTT;
 
         Self {

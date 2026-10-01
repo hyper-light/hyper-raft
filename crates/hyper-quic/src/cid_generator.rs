@@ -61,11 +61,11 @@ impl Default for RandomConnectionIdGenerator {
 impl RandomConnectionIdGenerator {
     /// Initialize Random CID generator with a fixed CID length
     ///
-    /// The given length must be less than or equal to MAX_CID_SIZE.
+    /// The given length must be less than or equal to MAX_CID_SIZE; a longer one is taken as
+    /// MAX_CID_SIZE (upstream asserted in debug builds and panicked when generating).
     pub fn new(cid_len: usize) -> Self {
-        debug_assert!(cid_len <= MAX_CID_SIZE);
         Self {
-            cid_len,
+            cid_len: cid_len.min(MAX_CID_SIZE),
             ..Self::default()
         }
     }
@@ -80,9 +80,11 @@ impl RandomConnectionIdGenerator {
 impl ConnectionIdGenerator for RandomConnectionIdGenerator {
     fn generate_cid(&mut self) -> ConnectionId {
         let mut bytes_arr = [0; MAX_CID_SIZE];
-        rand::rng().fill_bytes(&mut bytes_arr[..self.cid_len]);
+        // `cid_len` is at most MAX_CID_SIZE (`new`).
+        let (cid, _) = bytes_arr.split_at_mut(self.cid_len.min(MAX_CID_SIZE));
+        rand::rng().fill_bytes(cid);
 
-        ConnectionId::new(&bytes_arr[..self.cid_len])
+        ConnectionId::new(cid)
     }
 
     /// Provide the length of dst_cid in short header packet
@@ -95,7 +97,7 @@ impl ConnectionIdGenerator for RandomConnectionIdGenerator {
     }
 
     fn clone_box(&self) -> Box<dyn ConnectionIdGenerator> {
-        Box::new(self.clone())
+        Box::new(*self)
     }
 }
 
@@ -176,7 +178,9 @@ impl ConnectionIdGenerator for HashedConnectionIdGenerator {
     }
 }
 
+/// Nonce bytes of a hashed CID: 2^24 nonces, good for more than 16 million connections (upstream's value)
 const NONCE_LEN: usize = 3; // Good for more than 16 million connections
+/// Signature bytes of a hashed CID: the rest of its 8 bytes
 const SIGNATURE_LEN: usize = 8 - NONCE_LEN; // 8-byte total CID length
 
 #[cfg(test)]

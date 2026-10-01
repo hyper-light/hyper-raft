@@ -77,8 +77,10 @@ impl ArrayRangeSet {
         }
     }
 
+    /// Inserts `x`. `u64::MAX` has no half-open range and is not inserted; the values inserted
+    /// are packet numbers and stream offsets, below 2^62.
     pub fn insert_one(&mut self, x: u64) -> bool {
-        self.insert(x..x + 1)
+        x.checked_add(1).is_some_and(|end| self.insert(x..end))
     }
 
     pub fn insert(&mut self, x: Range<u64>) -> bool {
@@ -90,9 +92,7 @@ impl ArrayRangeSet {
         }
 
         let mut idx = 0;
-        while idx != self.0.len() {
-            let range = &mut self.0[idx];
-
+        while let Some(range) = self.0.get_mut(idx) {
             if range.start > x.end {
                 // The range is fully before this range and therefore not extensible.
                 // Add a new range to the left
@@ -120,22 +120,12 @@ impl ArrayRangeSet {
                 // Since it's not contained it must be bigger
                 range.end = x.end;
 
-                // Merge all follow-up ranges which overlap
-                while idx != self.0.len() - 1 {
-                    let curr = self.0[idx].clone();
-                    let next = self.0[idx + 1].clone();
-                    if curr.end >= next.start {
-                        self.0[idx].end = next.end.max(curr.end);
-                        self.0.remove(idx + 1);
-                    } else {
-                        break;
-                    }
-                }
-
+                self.merge_following(idx);
                 return true;
             }
 
-            idx += 1;
+            // `idx` is below the length, so the next index is at most the length.
+            idx = idx.saturating_add(1);
         }
 
         // Insert a range at the end
@@ -151,16 +141,17 @@ impl ArrayRangeSet {
             return false;
         }
 
+        // `idx` stays at most the length: it steps past ranges that exist.
         let mut idx = 0;
-        while idx != self.0.len() && x.start != x.end {
-            let range = self.0[idx].clone();
+        while let (Some(slot), false) = (self.0.get_mut(idx), x.start == x.end) {
+            let range = slot.clone();
 
             if x.end <= range.start {
                 // The range is fully before this range
                 return result;
             } else if x.start >= range.end {
                 // The range is fully after this range
-                idx += 1;
+                idx = idx.saturating_add(1);
                 continue;
             }
 
@@ -172,19 +163,36 @@ impl ArrayRangeSet {
             if left.is_empty() && right.is_empty() {
                 self.0.remove(idx);
             } else if left.is_empty() {
-                self.0[idx] = right;
-                idx += 1;
+                *slot = right;
+                idx = idx.saturating_add(1);
             } else if right.is_empty() {
-                self.0[idx] = left;
-                idx += 1;
+                *slot = left;
+                idx = idx.saturating_add(1);
             } else {
-                self.0[idx] = right;
+                *slot = right;
                 self.0.insert(idx, left);
-                idx += 2;
+                idx = idx.saturating_add(2);
             }
         }
 
         result
+    }
+
+    /// Merges the ranges after `idx` that overlap the range at `idx` into it.
+    fn merge_following(&mut self, idx: usize) {
+        let next_idx = idx.saturating_add(1);
+        while let (Some(curr_end), Some(next)) = (
+            self.0.get(idx).map(|range| range.end),
+            self.0.get(next_idx).cloned(),
+        ) {
+            if curr_end < next.start {
+                break;
+            }
+            if let Some(curr) = self.0.get_mut(idx) {
+                curr.end = next.end.max(curr_end);
+            }
+            self.0.remove(next_idx);
+        }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -204,6 +212,7 @@ impl ArrayRangeSet {
     }
 
     pub fn max(&self) -> Option<u64> {
-        self.iter().next_back().map(|x| x.end - 1)
+        // Ranges are non-empty, so `end` is at least 1.
+        self.iter().next_back().and_then(|x| x.end.checked_sub(1))
     }
 }

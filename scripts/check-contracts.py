@@ -12,6 +12,7 @@
   derivation or its citation (CLAUDE.md §1, "No arbitrary numbers").
 """
 import pathlib
+from pathlib import PurePosixPath
 import re
 import sys
 
@@ -40,6 +41,7 @@ UNSAFE_USE = re.compile(r"\bunsafe\s*(\{|fn\b|extern\b|impl\b)")
 NEEDS_SAFETY = re.compile(r"\bunsafe\s*(\{|impl\b)")
 CONST = re.compile(r"^\s*(?:pub(?:\([^)]*\))?\s+)?const\s+[A-Z_][A-Z0-9_]*\s*:")
 TEST_MODULE = re.compile(r"^\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+\w+")
+TEST_MODULE_FILE = re.compile(r"^\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+(\w+)\s*;")
 
 
 def code_of(line):
@@ -91,15 +93,39 @@ def check_unsafe(rel, lines):
     return failures
 
 
-def check_constants(rel, lines):
+def test_module_files(all_sources):
+    """Files of modules declared `#[cfg(test)] mod name;`: test code, as an inline test module's
+    body is, with every module below them."""
+    files, dirs = set(), set()
+    for rel, lines in all_sources:
+        path = PurePosixPath(rel)
+        # A module's children sit beside lib.rs, main.rs and mod.rs, and under `name/` otherwise
+        parent = path.parent if path.name in ("lib.rs", "main.rs", "mod.rs") else path.parent / path.stem
+        for n, line in enumerate(lines):
+            if line.strip() != "#[cfg(test)]":
+                continue
+            after = next((l for l in lines[n + 1:] if l.strip() and not l.strip().startswith("#[")), "")
+            declared = TEST_MODULE_FILE.match(after)
+            if declared:
+                name = declared.group(1)
+                files.add((parent / f"{name}.rs").as_posix())
+                dirs.add((parent / name).as_posix() + "/")
+    return files, dirs
+
+
+def check_constants(rel, lines, test_files):
     if not re.match(r"crates/[^/]+/src/", rel):
+        return []
+    files, dirs = test_files
+    if rel in files or any(rel.startswith(d) for d in dirs):
         return []
     failures = []
     for n, line in enumerate(lines):
-        # A test module ends what ships: the rest of the file is its body.
+        # A test module ends what ships: the rest of the file is its body. A test module in a file
+        # of its own (`mod name;`) is skipped as that file, and the scan goes on.
         if line.strip() == "#[cfg(test)]":
             after = next((l for l in lines[n + 1:] if l.strip() and not l.strip().startswith("#[")), "")
-            if TEST_MODULE.match(after):
+            if TEST_MODULE.match(after) and not TEST_MODULE_FILE.match(after):
                 break
         if not CONST.match(line):
             continue
@@ -113,9 +139,11 @@ def check_constants(rel, lines):
 
 def main():
     failures = []
-    for rel, lines in sources():
+    all_sources = list(sources())
+    test_files = test_module_files(all_sources)
+    for rel, lines in all_sources:
         failures.extend(check_unsafe(rel, lines))
-        failures.extend(check_constants(rel, lines))
+        failures.extend(check_constants(rel, lines, test_files))
     for rel in UNSAFE_ALLOWED:
         if not (ROOT / rel).exists():
             failures.append(f"{rel}: listed in UNSAFE_ALLOWED but missing")

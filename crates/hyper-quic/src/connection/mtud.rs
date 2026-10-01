@@ -22,11 +22,6 @@ impl MtuDiscovery {
         peer_max_udp_payload_size: Option<u16>,
         config: MtuDiscoveryConfig,
     ) -> Self {
-        debug_assert!(
-            initial_plpmtu >= min_mtu,
-            "initial_max_udp_payload_size must be at least {min_mtu}"
-        );
-
         let mut mtud = Self::with_state(
             initial_plpmtu,
             min_mtu,
@@ -86,11 +81,7 @@ impl MtuDiscovery {
             // It is possible for black hole detection to trigger before the connection has been
             // fully established, if the initial MTU is greater the minimum MTU. We should never
             // send probes before the connection has been fully established and we have received
-            // the peer's transport parameters though.
-            debug_assert!(
-                !matches!(state.phase, Phase::Searching(_)),
-                "Transport parameters received after MTU probing started"
-            );
+            // the peer's transport parameters though (upstream asserted as much in debug builds).
             state.peer_max_udp_payload_size = peer_max_udp_payload_size;
         }
     }
@@ -194,7 +185,7 @@ impl EnabledMtuDiscovery {
                 &self.config,
             ));
         } else if let Phase::Complete(next_mtud_activation) = &self.phase {
-            if now < *next_mtud_activation {
+            if next_mtud_activation.is_none_or(|activation| now < activation) {
                 return None;
             }
 
@@ -231,7 +222,7 @@ impl EnabledMtuDiscovery {
                 state.last_probed_mtu = probe_udp_payload_size;
                 return Some(probe_udp_payload_size);
             } else {
-                let next_mtud_activation = now + self.config.interval;
+                let next_mtud_activation = now.checked_add(self.config.interval);
                 self.phase = Phase::Complete(next_mtud_activation);
                 return None;
             }
@@ -259,14 +250,14 @@ impl EnabledMtuDiscovery {
         // We might no longer be searching, e.g. if a black hole was detected
         if let Phase::Searching(state) = &mut self.phase {
             state.in_flight_probe = None;
-            state.lost_probe_count += 1;
+            state.lost_probe_count = state.lost_probe_count.saturating_add(1);
         }
     }
 
     /// Called when a black hole is detected
     fn on_black_hole_detected(&mut self, now: Instant) {
         // Stop searching, if applicable, and reset the timer
-        let next_mtud_activation = now + self.config.black_hole_cooldown;
+        let next_mtud_activation = now.checked_add(self.config.black_hole_cooldown);
         self.phase = Phase::Complete(next_mtud_activation);
     }
 }
@@ -277,8 +268,9 @@ enum Phase {
     Initial,
     /// We are currently searching for a higher PMTU
     Searching(SearchState),
-    /// Searching has completed and will be triggered again at the provided instant
-    Complete(Instant),
+    /// Searching has completed and will be triggered again at the provided instant; never, when
+    /// that instant is past the clock's range (where upstream's addition panicked)
+    Complete(Option<Instant>),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -324,18 +316,17 @@ impl SearchState {
 
     /// Determines the next MTU to probe using binary search
     fn next_mtu_to_probe(&mut self, last_probe_succeeded: bool) -> Option<u16> {
-        debug_assert_eq!(self.in_flight_probe, None);
-
         if last_probe_succeeded {
             self.lower_bound = self.last_probed_mtu;
         } else {
-            self.upper_bound = self.last_probed_mtu - 1;
+            // A probed size is at least the lower bound, itself at least the minimum MTU
+            self.upper_bound = self.last_probed_mtu.saturating_sub(1);
         }
 
-        let next_mtu = (self.lower_bound as i32 + self.upper_bound as i32) / 2;
+        let next_mtu = self.lower_bound.midpoint(self.upper_bound);
 
         // Binary search stopping condition
-        if ((next_mtu - self.last_probed_mtu as i32).unsigned_abs() as u16) < self.minimum_change {
+        if next_mtu.abs_diff(self.last_probed_mtu) < self.minimum_change {
             // Special case: if the upper bound is far enough, we want to probe it as a last
             // step (otherwise we will never achieve the upper bound)
             if self.upper_bound.saturating_sub(self.last_probed_mtu) >= self.minimum_change {
@@ -345,7 +336,7 @@ impl SearchState {
             return None;
         }
 
-        Some(next_mtu as u16)
+        Some(next_mtu)
     }
 }
 
@@ -429,7 +420,7 @@ impl BlackHoleDetector {
         let end_last_burst = self
             .current_loss_burst
             .as_ref()
-            .is_some_and(|current| pn - current.latest_non_probe != 1);
+            .is_some_and(|current| pn.checked_sub(current.latest_non_probe) != Some(1));
 
         if end_last_burst {
             self.finish_loss_burst();
@@ -523,6 +514,7 @@ struct CurrentLossBurst {
 
 // Corresponds to the RFC's `MAX_PROBES` constant (see
 // https://www.rfc-editor.org/rfc/rfc8899#section-5.1.2)
+/// Probes sent at one size before it is deemed too large, RFC 8899 §5.1.2's MAX_PROBES
 const MAX_PROBE_RETRANSMITS: usize = 3;
 /// Maximum number of suspicious loss bursts that will not trigger black hole detection
 const BLACK_HOLE_THRESHOLD: usize = 3;
@@ -652,7 +644,7 @@ mod tests {
         assert!(mtud.black_hole_detected(now));
         assert_eq!(mtud.current_mtu, 1200);
         if let Phase::Complete(next_mtud_activation) = mtud.state.unwrap().phase {
-            assert_eq!(next_mtud_activation, now + Duration::from_secs(60));
+            assert_eq!(next_mtud_activation, Some(now + Duration::from_secs(60)));
         } else {
             panic!("Unexpected MTUD phase!");
         }
@@ -743,10 +735,10 @@ mod tests {
         assert!(completed(&mtud));
     }
 
-    #[cfg(debug_assertions)]
+    /// Upstream asserted, in debug builds, that the peer's parameters never arrive mid-search;
+    /// the parameter is recorded, and the search goes on
     #[test]
-    #[should_panic(expected = "Transport parameters received after MTU probing started")]
-    fn mtu_discovery_with_peer_max_udp_payload_size_during_search_panics() {
+    fn mtu_discovery_with_peer_max_udp_payload_size_during_search_records_it() {
         let mut mtud = default_mtud();
         assert!(mtud.poll_transmit(Instant::now(), 0).is_some());
         assert!(matches!(
@@ -754,6 +746,7 @@ mod tests {
             Phase::Searching(_)
         ));
         mtud.on_peer_max_udp_payload_size_received(1300);
+        assert_eq!(mtud.state.as_ref().unwrap().peer_max_udp_payload_size, 1300);
     }
 
     #[test]

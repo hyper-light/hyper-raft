@@ -41,10 +41,18 @@ impl PartialDecode {
         let plain_header =
             ProtectedHeader::decode(&mut buf, cid_parser, supported_versions, grease_quic_bit)?;
         let dgram_len = buf.get_ref().len();
-        let packet_len = plain_header
-            .payload_len()
-            .map(|len| (buf.position() + len) as usize)
-            .unwrap_or(dgram_len);
+        // The payload length is the peer's varint; an end past what a `usize` holds is past the
+        // datagram too
+        let packet_len = match plain_header.payload_len() {
+            Some(len) => buf
+                .position()
+                .checked_add(len)
+                .and_then(|end| usize::try_from(end).ok())
+                .ok_or(PacketDecodeError::InvalidHeader(
+                    "packet too short to contain payload length",
+                ))?,
+            None => dgram_len,
+        };
         match dgram_len.cmp(&packet_len) {
             Ordering::Equal => Ok((Self { plain_header, buf }, None)),
             Ordering::Less => Err(PacketDecodeError::InvalidHeader(
@@ -118,35 +126,21 @@ impl PartialDecode {
             plain_header,
             mut buf,
         } = self;
-
-        if let Initial(ProtectedInitialHeader {
-            dst_cid,
-            src_cid,
-            token_pos,
-            version,
-            ..
-        }) = plain_header
-        {
-            let number = Self::decrypt_header(&mut buf, header_crypto.unwrap())?;
-            let header_len = buf.position() as usize;
-            let mut bytes = buf.into_inner();
-
-            let header_data = bytes.split_to(header_len).freeze();
-            let token = header_data.slice(token_pos.start..token_pos.end);
-            return Ok(Packet {
-                header: Header::Initial(InitialHeader {
-                    dst_cid,
-                    src_cid,
-                    token,
-                    number,
-                    version,
-                }),
-                header_data,
-                payload: bytes,
-            });
-        }
+        // The connection unprotects a protected header only with its space's keys, where
+        // upstream unwrapped; a header without them is refused
+        let keys = || header_crypto.ok_or(PacketDecodeError::InvalidHeader("no header keys"));
 
         let header = match plain_header {
+            Initial(ProtectedInitialHeader {
+                dst_cid,
+                src_cid,
+                token_pos,
+                version,
+                ..
+            }) => {
+                let number = Self::decrypt_header(&mut buf, keys()?)?;
+                return Self::finish_initial(buf, dst_cid, src_cid, token_pos, number, version);
+            }
             Long {
                 ty,
                 dst_cid,
@@ -157,7 +151,7 @@ impl PartialDecode {
                 ty,
                 dst_cid,
                 src_cid,
-                number: Self::decrypt_header(&mut buf, header_crypto.unwrap())?,
+                number: Self::decrypt_header(&mut buf, keys()?)?,
                 version,
             },
             Retry {
@@ -170,8 +164,12 @@ impl PartialDecode {
                 version,
             },
             Short { spin, dst_cid, .. } => {
-                let number = Self::decrypt_header(&mut buf, header_crypto.unwrap())?;
-                let key_phase = buf.get_ref()[0] & KEY_PHASE_BIT != 0;
+                let number = Self::decrypt_header(&mut buf, keys()?)?;
+                let first = buf
+                    .get_ref()
+                    .first()
+                    .ok_or(PacketDecodeError::InvalidHeader("empty packet"))?;
+                let key_phase = first & KEY_PHASE_BIT != 0;
                 Header::Short {
                     spin,
                     key_phase,
@@ -188,14 +186,44 @@ impl PartialDecode {
                 dst_cid,
                 src_cid,
             },
-            Initial { .. } => unreachable!(),
         };
 
-        let header_len = buf.position() as usize;
+        let header_len = header_len(&buf)?;
         let mut bytes = buf.into_inner();
         Ok(Packet {
             header,
             header_data: bytes.split_to(header_len).freeze(),
+            payload: bytes,
+        })
+    }
+
+    /// Splits an Initial packet, its header unprotected, into header and payload
+    fn finish_initial(
+        buf: io::Cursor<BytesMut>,
+        dst_cid: ConnectionId,
+        src_cid: ConnectionId,
+        token_pos: Range<usize>,
+        number: PacketNumber,
+        version: u32,
+    ) -> Result<Packet, PacketDecodeError> {
+        let header_len = header_len(&buf)?;
+        let mut bytes = buf.into_inner();
+
+        let header_data = bytes.split_to(header_len).freeze();
+        // The token was found within the header as it was decoded
+        if token_pos.start > token_pos.end || token_pos.end > header_data.len() {
+            return Err(PacketDecodeError::InvalidHeader("token out of bounds"));
+        }
+        let token = header_data.slice(token_pos);
+        Ok(Packet {
+            header: Header::Initial(InitialHeader {
+                dst_cid,
+                src_cid,
+                token,
+                number,
+                version,
+            }),
+            header_data,
             payload: bytes,
         })
     }
@@ -205,17 +233,29 @@ impl PartialDecode {
         header_crypto: &dyn crypto::HeaderKey,
     ) -> Result<PacketNumber, PacketDecodeError> {
         let packet_length = buf.get_ref().len();
-        let pn_offset = buf.position() as usize;
-        if packet_length < pn_offset + 4 + header_crypto.sample_size() {
+        let pn_offset = header_len(buf)?;
+        // A required size: saturating can only over-state it, which refuses the packet
+        if packet_length
+            < pn_offset
+                .saturating_add(4)
+                .saturating_add(header_crypto.sample_size())
+        {
             return Err(PacketDecodeError::InvalidHeader(
                 "packet too short to extract header protection sample",
             ));
         }
 
-        header_crypto.decrypt(pn_offset, buf.get_mut());
+        header_crypto
+            .decrypt(pn_offset, buf.get_mut())
+            .map_err(|_| {
+                PacketDecodeError::InvalidHeader("packet too short to remove header protection")
+            })?;
 
-        let len = PacketNumber::decode_len(buf.get_ref()[0]);
-        PacketNumber::decode(len, buf)
+        let first = *buf
+            .get_ref()
+            .first()
+            .ok_or(PacketDecodeError::InvalidHeader("empty packet"))?;
+        PacketNumber::decode(first, buf)
     }
 }
 
@@ -231,7 +271,10 @@ impl Packet {
             Header::Short { .. } => SHORT_RESERVED_BITS,
             _ => LONG_RESERVED_BITS,
         };
-        self.header_data[0] & mask == 0
+        // A header is at least its first byte
+        self.header_data
+            .first()
+            .is_some_and(|first| first & mask == 0)
     }
 }
 
@@ -302,7 +345,7 @@ impl Header {
                 number.encode(w);
                 PartialEncode {
                     start,
-                    header_len: w.len() - start,
+                    header_len: w.len().saturating_sub(start),
                     pn: Some((number.len(), true)),
                 }
             }
@@ -321,7 +364,7 @@ impl Header {
                 number.encode(w);
                 PartialEncode {
                     start,
-                    header_len: w.len() - start,
+                    header_len: w.len().saturating_sub(start),
                     pn: Some((number.len(), true)),
                 }
             }
@@ -336,7 +379,7 @@ impl Header {
                 src_cid.encode_long(w);
                 PartialEncode {
                     start,
-                    header_len: w.len() - start,
+                    header_len: w.len().saturating_sub(start),
                     pn: None,
                 }
             }
@@ -356,7 +399,7 @@ impl Header {
                 number.encode(w);
                 PartialEncode {
                     start,
-                    header_len: w.len() - start,
+                    header_len: w.len().saturating_sub(start),
                     pn: Some((number.len(), false)),
                 }
             }
@@ -371,7 +414,7 @@ impl Header {
                 src_cid.encode_long(w);
                 PartialEncode {
                     start,
-                    header_len: w.len() - start,
+                    header_len: w.len().saturating_sub(start),
                     pn: None,
                 }
             }
@@ -468,36 +511,59 @@ pub(crate) struct PartialEncode {
 }
 
 impl PartialEncode {
+    /// The largest end, an absolute position in the buffer, a packet with this header may
+    /// reach: a long header's length field has two bytes reserved (a varint below 2^14) for the
+    /// packet number and payload that follow it. `None` for a header without the field.
+    pub(crate) fn length_limit(&self) -> Option<usize> {
+        /// The largest length two varint bytes hold
+        const MAX_LENGTH: usize = (1 << 14) - 1;
+        let (pn_len, true) = self.pn? else {
+            return None;
+        };
+        // In-memory positions, far below `usize::MAX`
+        Some(
+            self.start
+                .saturating_add(self.header_len)
+                .saturating_sub(pn_len)
+                .saturating_add(MAX_LENGTH),
+        )
+    }
+
+    /// Writes the length, encrypts the payload and protects the header; fails if the packet is
+    /// too short for its tag or its header protection sample (upstream panicked)
     pub(crate) fn finish(
         self,
         buf: &mut [u8],
         header_crypto: &dyn crypto::HeaderKey,
         crypto: Option<(u64, &dyn crypto::PacketKey)>,
-    ) {
+    ) -> Result<(), crypto::CryptoError> {
         let Self { header_len, pn, .. } = self;
         let (pn_len, write_len) = match pn {
             Some((pn_len, write_len)) => (pn_len, write_len),
-            None => return,
+            None => return Ok(()),
         };
 
-        let pn_pos = header_len - pn_len;
+        // The header ends with its packet number
+        let pn_pos = header_len.saturating_sub(pn_len);
         if write_len {
-            let len = buf.len() - header_len + pn_len;
-            assert!(len < 2usize.pow(14)); // Fits in reserved space
-            let mut slice = &mut buf[pn_pos - 2..pn_pos];
-            slice.put_u16(len as u16 | (0b01 << 14));
+            // The packet builder keeps a long header packet within the two bytes reserved for
+            // its length (`length_limit`), where upstream asserted it fit
+            let len = buf.len().saturating_sub(header_len).saturating_add(pn_len);
+            if let (Ok(len), Some(mut slice)) = (
+                u16::try_from(len),
+                pn_pos
+                    .checked_sub(2)
+                    .and_then(|length_pos| buf.get_mut(length_pos..pn_pos)),
+            ) {
+                slice.put_u16(len | (0b01 << 14));
+            }
         }
 
         if let Some((number, crypto)) = crypto {
-            crypto.encrypt(number, buf, header_len);
+            crypto.encrypt(number, buf, header_len)?;
         }
 
-        debug_assert!(
-            pn_pos + 4 + header_crypto.sample_size() <= buf.len(),
-            "packet must be padded to at least {} bytes for header protection sampling",
-            pn_pos + 4 + header_crypto.sample_size()
-        );
-        header_crypto.encrypt(pn_pos, buf);
+        header_crypto.encrypt(pn_pos, buf)
     }
 }
 
@@ -620,18 +686,20 @@ impl ProtectedHeader {
 
             match LongHeaderType::from_byte(first)? {
                 LongHeaderType::Initial => {
-                    let token_len = buf.get_var()? as usize;
-                    let token_start = buf.position() as usize;
-                    if token_len > buf.remaining() {
-                        return Err(PacketDecodeError::InvalidHeader("token out of bounds"));
-                    }
+                    let token_len = usize::try_from(buf.get_var()?)
+                        .ok()
+                        .filter(|&len| len <= buf.remaining())
+                        .ok_or(PacketDecodeError::InvalidHeader("token out of bounds"))?;
+                    let token_start = header_len(buf)?;
+                    // Within the datagram, as just checked
+                    let token_end = token_start.saturating_add(token_len);
                     buf.advance(token_len);
 
                     let len = buf.get_var()?;
                     Ok(Self::Initial(ProtectedInitialHeader {
                         dst_cid,
                         src_cid,
-                        token_pos: token_start..token_start + token_len,
+                        token_pos: token_start..token_end,
                         len,
                         version,
                     }))
@@ -687,19 +755,23 @@ pub(crate) enum PacketNumber {
 }
 
 impl PacketNumber {
-    pub(crate) fn new(n: u64, largest_acked: u64) -> Self {
-        let range = (n - largest_acked) * 2;
-        if range < 1 << 8 {
-            Self::U8(n as u8)
+    pub(crate) fn new(n: u64, largest_acked: u64) -> Option<Self> {
+        // Each packet number is past every one acknowledged, and below 2^62; a number 2^31 or
+        // more past the largest acknowledged has no encoding (RFC 9000 §17.1), where upstream
+        // panicked. The truncation to the low bytes is the encoding.
+        let range = n.checked_sub(largest_acked)?.checked_mul(2)?;
+        let [.., b3, b2, b1, b0] = n.to_be_bytes();
+        Some(if range < 1 << 8 {
+            Self::U8(b0)
         } else if range < 1 << 16 {
-            Self::U16(n as u16)
+            Self::U16(u16::from_be_bytes([b1, b0]))
         } else if range < 1 << 24 {
-            Self::U24(n as u32)
+            Self::U24(u32::from_be_bytes([0, b2, b1, b0]))
         } else if range < 1 << 32 {
-            Self::U32(n as u32)
+            Self::U32(u32::from_be_bytes([b3, b2, b1, b0]))
         } else {
-            panic!("packet number too large to encode")
-        }
+            return None;
+        })
     }
 
     pub(crate) fn len(self) -> usize {
@@ -722,20 +794,20 @@ impl PacketNumber {
         }
     }
 
-    pub(crate) fn decode<R: Buf>(len: usize, r: &mut R) -> Result<Self, PacketDecodeError> {
+    /// Decodes the packet number whose length the first byte of its (unprotected) header tags
+    pub(crate) fn decode<R: Buf>(first: u8, r: &mut R) -> Result<Self, PacketDecodeError> {
         use PacketNumber::*;
-        let pn = match len {
-            1 => U8(r.get()?),
-            2 => U16(r.get()?),
-            3 => U24(r.get_uint(3) as u32),
-            4 => U32(r.get()?),
-            _ => unreachable!(),
+        let pn = match first & 0x03 {
+            0 => U8(r.get()?),
+            1 => U16(r.get()?),
+            2 => {
+                let high = r.get::<u8>()?;
+                let low = r.get::<u16>()?;
+                U24((u32::from(high) << 16) | u32::from(low))
+            }
+            _ => U32(r.get()?),
         };
         Ok(pn)
-    }
-
-    pub(crate) fn decode_len(tag: u8) -> usize {
-        1 + (tag & 0x03) as usize
     }
 
     fn tag(self) -> u8 {
@@ -757,10 +829,15 @@ impl PacketNumber {
             U24(x) => u64::from(x),
             U32(x) => u64::from(x),
         };
-        let nbits = self.len() * 8;
-        let win = 1 << nbits;
-        let hwin = win / 2;
-        let mask = win - 1;
+        let win: u64 = match self {
+            U8(_) => 1 << 8,
+            U16(_) => 1 << 16,
+            U24(_) => 1 << 24,
+            U32(_) => 1 << 32,
+        };
+        let hwin = win >> 1;
+        // The window is at least 2^8
+        let mask = win.saturating_sub(1);
         // The incoming packet number should be greater than expected - hwin and less than or equal
         // to expected + hwin
         //
@@ -770,14 +847,24 @@ impl PacketNumber {
         // The following code calculates a candidate value and makes sure it's within the packet
         // number window.
         let candidate = (expected & !mask) | truncated;
+        // Packet numbers are below 2^62, so neither sum saturates
         if expected.checked_sub(hwin).is_some_and(|x| candidate <= x) {
-            candidate + win
-        } else if candidate > expected + hwin && candidate > win {
-            candidate - win
+            candidate.saturating_add(win)
+        } else if candidate > expected.saturating_add(hwin) && candidate > win {
+            candidate.saturating_sub(win)
         } else {
             candidate
         }
     }
+}
+
+/// The cursor's position: how much of the packet the header decoded so far takes, which is
+/// within the packet
+fn header_len<T: AsRef<[u8]>>(buf: &io::Cursor<T>) -> Result<usize, PacketDecodeError> {
+    usize::try_from(buf.position())
+        .ok()
+        .filter(|&len| len <= buf.get_ref().as_ref().len())
+        .ok_or(PacketDecodeError::InvalidHeader("header past the packet"))
 }
 
 /// A [`ConnectionIdParser`] implementation that assumes the connection ID is of fixed length
@@ -817,13 +904,12 @@ pub(crate) enum LongHeaderType {
 impl LongHeaderType {
     fn from_byte(b: u8) -> Result<Self, PacketDecodeError> {
         use {LongHeaderType::*, LongType::*};
-        debug_assert!(b & LONG_HEADER_FORM != 0, "not a long packet");
+        // Two bits, so the last arm is 0x3
         Ok(match (b & 0x30) >> 4 {
             0x0 => Initial,
             0x1 => Standard(ZeroRtt),
             0x2 => Standard(Handshake),
-            0x3 => Retry,
-            _ => unreachable!(),
+            _ => Retry,
         })
     }
 }
@@ -873,16 +959,22 @@ impl From<coding::UnexpectedEnd> for PacketDecodeError {
     }
 }
 
+/// The Header Form bit (RFC 9000 §17.2)
 pub(crate) const LONG_HEADER_FORM: u8 = 0x80;
+/// The Fixed Bit (RFC 9000 §17.2)
 pub(crate) const FIXED_BIT: u8 = 0x40;
+/// The Latency Spin Bit (RFC 9000 §17.3.1)
 pub(crate) const SPIN_BIT: u8 = 0x20;
+/// A short header's Reserved Bits (RFC 9000 §17.3.1)
 const SHORT_RESERVED_BITS: u8 = 0x18;
+/// A long header's Reserved Bits (RFC 9000 §17.2)
 const LONG_RESERVED_BITS: u8 = 0x0c;
+/// The Key Phase bit (RFC 9000 §17.3.1)
 const KEY_PHASE_BIT: u8 = 0x04;
 
 /// Packet number space identifiers
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Ord, PartialOrd)]
-pub enum SpaceId {
+pub(crate) enum SpaceId {
     /// Unprotected packets, used to bootstrap the handshake
     Initial = 0,
     Handshake = 1,
@@ -891,7 +983,7 @@ pub enum SpaceId {
 }
 
 impl SpaceId {
-    pub fn iter() -> impl Iterator<Item = Self> {
+    pub(crate) fn iter() -> impl Iterator<Item = Self> {
         [Self::Initial, Self::Handshake, Self::Data].iter().cloned()
     }
 }
@@ -902,11 +994,23 @@ mod tests {
     use hex_literal::hex;
     use std::io;
 
+    /// A packet number 2^31 or more past the largest acknowledged has no encoding (RFC 9000
+    /// §17.1): upstream panicked, and it is refused
+    #[test]
+    fn packet_number_beyond_any_encoding_is_refused() {
+        assert_eq!(
+            PacketNumber::new((1 << 31) - 1, 0),
+            Some(PacketNumber::U32((1 << 31) - 1))
+        );
+        assert_eq!(PacketNumber::new(1 << 31, 0), None);
+        assert_eq!(PacketNumber::new(5, 6), None);
+    }
+
     fn check_pn(typed: PacketNumber, encoded: &[u8]) {
         let mut buf = Vec::new();
         typed.encode(&mut buf);
         assert_eq!(&buf[..], encoded);
-        let decoded = PacketNumber::decode(typed.len(), &mut io::Cursor::new(&buf)).unwrap();
+        let decoded = PacketNumber::decode(typed.tag(), &mut io::Cursor::new(&buf)).unwrap();
         assert_eq!(typed, decoded);
     }
 
@@ -921,16 +1025,21 @@ mod tests {
 
     #[test]
     fn pn_encode() {
-        check_pn(PacketNumber::new(0x10, 0), &hex!("10"));
-        check_pn(PacketNumber::new(0x100, 0), &hex!("0100"));
-        check_pn(PacketNumber::new(0x10000, 0), &hex!("010000"));
+        check_pn(PacketNumber::new(0x10, 0).unwrap(), &hex!("10"));
+        check_pn(PacketNumber::new(0x100, 0).unwrap(), &hex!("0100"));
+        check_pn(PacketNumber::new(0x10000, 0).unwrap(), &hex!("010000"));
     }
 
     #[test]
     fn pn_expand_roundtrip() {
         for expected in 0..1024 {
             for actual in expected..1024 {
-                assert_eq!(actual, PacketNumber::new(actual, expected).expand(expected));
+                assert_eq!(
+                    actual,
+                    PacketNumber::new(actual, expected)
+                        .unwrap()
+                        .expand(expected)
+                );
             }
         }
     }
@@ -958,11 +1067,13 @@ mod tests {
         let encode = header.encode(&mut buf);
         let header_len = buf.len();
         buf.resize(header_len + 16 + client.packet.local.tag_len(), 0);
-        encode.finish(
-            &mut buf,
-            &*client.header.local,
-            Some((0, &*client.packet.local)),
-        );
+        encode
+            .finish(
+                &mut buf,
+                &*client.header.local,
+                Some((0, &*client.packet.local)),
+            )
+            .unwrap();
 
         for byte in &buf {
             print!("{byte:02x}");

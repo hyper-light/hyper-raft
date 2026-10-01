@@ -147,7 +147,10 @@ impl PathData {
     /// Indicates whether we're a server that hasn't validated the peer's address and hasn't
     /// received enough data from the peer to permit sending `bytes_to_send` additional bytes
     pub(super) fn anti_amplification_blocked(&self, bytes_to_send: u64) -> bool {
-        !self.validated && self.total_recvd * 3 < self.total_sent + bytes_to_send
+        // Byte counts: the budget saturates at a total no path reaches, and the bytes to send
+        // saturate upward, which blocks rather than over-sends
+        !self.validated
+            && self.total_recvd.saturating_mul(3) < self.total_sent.saturating_add(bytes_to_send)
     }
 
     /// Returns the path's current MTU
@@ -226,11 +229,7 @@ impl RecoveryMetrics {
     fn retain_updated(&self, previous: &Self) -> Self {
         macro_rules! keep_if_changed {
             ($name:ident) => {
-                if previous.$name == self.$name {
-                    None
-                } else {
-                    self.$name
-                }
+                keep_if_changed(previous.$name, self.$name)
             };
         }
 
@@ -291,7 +290,7 @@ impl RttEstimator {
         Self {
             latest: initial_rtt,
             smoothed: None,
-            var: initial_rtt / 2,
+            var: half(initial_rtt),
             min: initial_rtt,
         }
     }
@@ -316,7 +315,9 @@ impl RttEstimator {
 
     // PTO computed as described in RFC9002#6.2.1
     pub(crate) fn pto_base(&self) -> Duration {
-        self.get() + cmp::max(4 * self.var, TIMER_GRANULARITY)
+        // Durations: saturating can only lengthen them
+        self.get()
+            .saturating_add(cmp::max(self.var.saturating_mul(4), TIMER_GRANULARITY))
     }
 
     pub(crate) fn update(&mut self, ack_delay: Duration, rtt: Duration) {
@@ -325,17 +326,21 @@ impl RttEstimator {
         self.min = cmp::min(self.min, self.latest);
         // Based on RFC6298.
         if let Some(smoothed) = self.smoothed {
-            let adjusted_rtt = if self.min + ack_delay <= self.latest {
-                self.latest - ack_delay
+            // Durations: saturating can only lengthen them; the ACK delay is the peer's, capped
+            // at its max_ack_delay
+            let adjusted_rtt = if self.min.saturating_add(ack_delay) <= self.latest {
+                self.latest.saturating_sub(ack_delay)
             } else {
                 self.latest
             };
             let var_sample = smoothed.abs_diff(adjusted_rtt);
-            self.var = (3 * self.var + var_sample) / 4;
-            self.smoothed = Some((7 * smoothed + adjusted_rtt) / 8);
+            self.var = quarter(self.var.saturating_mul(3).saturating_add(var_sample));
+            self.smoothed = Some(eighth(
+                smoothed.saturating_mul(7).saturating_add(adjusted_rtt),
+            ));
         } else {
             self.smoothed = Some(self.latest);
-            self.var = self.latest / 2;
+            self.var = half(self.latest);
             self.min = self.latest;
         }
     }
@@ -432,16 +437,42 @@ impl InFlight {
         }
     }
 
+    // Counts of what is in flight: each removal is of a packet inserted before, so neither
+    // saturates in use
     fn insert(&mut self, packet: &SentPacket) {
-        self.bytes += u64::from(packet.size);
-        self.ack_eliciting += u64::from(packet.ack_eliciting);
+        self.bytes = self.bytes.saturating_add(u64::from(packet.size));
+        self.ack_eliciting = self
+            .ack_eliciting
+            .saturating_add(u64::from(packet.ack_eliciting));
     }
 
     /// Update counters to account for a packet becoming acknowledged, lost, or abandoned
     fn remove(&mut self, packet: &SentPacket) {
-        self.bytes -= u64::from(packet.size);
-        self.ack_eliciting -= u64::from(packet.ack_eliciting);
+        self.bytes = self.bytes.saturating_sub(u64::from(packet.size));
+        self.ack_eliciting = self
+            .ack_eliciting
+            .saturating_sub(u64::from(packet.ack_eliciting));
     }
+}
+
+/// A metric when it changed since `previous`
+fn keep_if_changed<T: PartialEq>(previous: Option<T>, current: Option<T>) -> Option<T> {
+    if previous == current { None } else { current }
+}
+
+/// `d / 2`; the divisor is a nonzero constant, so `checked_div` never refuses
+fn half(d: Duration) -> Duration {
+    d.checked_div(2).unwrap_or(Duration::ZERO)
+}
+
+/// `d / 4`; the divisor is a nonzero constant, so `checked_div` never refuses
+fn quarter(d: Duration) -> Duration {
+    d.checked_div(4).unwrap_or(Duration::ZERO)
+}
+
+/// `d / 8`; the divisor is a nonzero constant, so `checked_div` never refuses
+fn eighth(d: Duration) -> Duration {
+    d.checked_div(8).unwrap_or(Duration::ZERO)
 }
 
 #[cfg(test)]

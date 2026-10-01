@@ -594,13 +594,23 @@ impl ClientConfig {
 
 impl ClientConfig {
     /// Create a client configuration that trusts specified trust anchors
-    pub fn with_root_certificates(
-        roots: rustls::RootCertStore,
-    ) -> Result<Self, rustls::client::VerifierBuilderError> {
+    pub fn with_root_certificates(roots: rustls::RootCertStore) -> Result<Self, ClientConfigError> {
         Ok(Self::new(Box::new(crypto::rustls::QuicClientConfig::new(
             WebPkiServerVerifier::builder_with_provider(roots, configured_provider()).build()?,
-        ))))
+        )?)))
     }
+}
+
+/// Why [`ClientConfig::with_root_certificates`] could not build a configuration
+#[derive(Debug, Error)]
+pub enum ClientConfigError {
+    /// The server certificate verifier could not be built from the roots
+    #[error(transparent)]
+    Verifier(#[from] rustls::client::VerifierBuilderError),
+    /// The TLS configuration cannot serve QUIC: no TLS 1.3, or no initial cipher suite
+    /// (upstream panicked)
+    #[error(transparent)]
+    Tls(#[from] rustls::Error),
 }
 
 impl fmt::Debug for ClientConfig {

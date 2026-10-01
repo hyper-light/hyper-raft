@@ -1,8 +1,7 @@
 use std::{
-    cmp,
     collections::{BTreeMap, VecDeque},
     mem,
-    ops::{Bound, Index, IndexMut, Range},
+    ops::{Bound, Range},
 };
 
 use rand::{Rng, RngExt};
@@ -11,9 +10,9 @@ use tracing::trace;
 
 use super::assembler::Assembler;
 use crate::{
-    Dir, Duration, Instant, SocketAddr, StreamId, TransportError, VarInt, cid_queue::CidQueue,
-    connection::StreamsState, crypto::Keys, frame, packet::SpaceId, range_set::ArrayRangeSet,
-    shared::IssuedCid,
+    Dir, Duration, Instant, PerDir, SocketAddr, StreamId, TransportError, VarInt,
+    cid_queue::CidQueue, connection::StreamsState, crypto::Keys, frame, packet::SpaceId,
+    range_set::ArrayRangeSet, shared::IssuedCid,
 };
 
 pub(super) struct PacketSpace {
@@ -154,13 +153,18 @@ impl PacketSpace {
     ///
     /// In the Data space, the connection's [`PacketNumberFilter`] must be used rather than calling
     /// this directly.
-    pub(super) fn get_tx_number(&mut self) -> u64 {
-        // TODO: Handle packet number overflow gracefully
-        assert!(self.next_packet_number < 2u64.pow(62));
+    ///
+    /// `None` once the space's packet numbers (below 2^62) are spent, where upstream asserted:
+    /// the connection must then close without sending anything further (RFC 9000 §12.3).
+    pub(super) fn get_tx_number(&mut self) -> Option<u64> {
         let x = self.next_packet_number;
-        self.next_packet_number += 1;
-        self.sent_with_keys += 1;
-        x
+        if x >= MAX_PACKET_NUMBER {
+            return None;
+        }
+        self.next_packet_number = x.checked_add(1)?;
+        // At most one per packet number, so below 2^62
+        self.sent_with_keys = self.sent_with_keys.saturating_add(1);
+        Some(x)
     }
 
     pub(super) fn can_send(&self, streams: &StreamsState) -> SendableFrames {
@@ -189,11 +193,17 @@ impl PacketSpace {
             .ce
             .checked_sub(self.ecn_feedback.ce)
             .ok_or("peer CE count regression")?;
-        let total_increase = ect0_increase + ect1_increase + ce_increase;
+        // Each count is a varint (below 2^62), so neither sum can overflow
+        let ect0_ce_increase = ect0_increase
+            .checked_add(ce_increase)
+            .ok_or("ECN counts overflow")?;
+        let total_increase = ect0_ce_increase
+            .checked_add(ect1_increase)
+            .ok_or("ECN counts overflow")?;
         if total_increase < newly_acked {
             return Err("ECN bleaching");
         }
-        if (ect0_increase + ce_increase) < newly_acked || ect1_increase != 0 {
+        if ect0_ce_increase < newly_acked || ect1_increase != 0 {
             return Err("ECN corruption");
         }
         // If total_increase > newly_acked (which happens when ACKs are lost), this is required by
@@ -208,8 +218,9 @@ impl PacketSpace {
     pub(super) fn take(&mut self, number: u64) -> Option<SentPacket> {
         let packet = self.sent_packets.remove(&number)?;
         if !packet.ack_eliciting && number > self.largest_ack_eliciting_sent {
+            // The packet taken is one of those counted, so the count is at least one
             self.unacked_non_ack_eliciting_tail =
-                self.unacked_non_ack_eliciting_tail.checked_sub(1).unwrap();
+                self.unacked_non_ack_eliciting_tail.saturating_sub(1);
         }
         Some(packet)
     }
@@ -222,6 +233,7 @@ impl PacketSpace {
         // packets but don't send ACK-eliciting data for long periods use we must eventually start
         // forgetting about them, although it might also be reasonable to just kill the connection
         // due to weird peer behavior.
+        /// Non-ACK-eliciting packets kept after the last ACK-eliciting one (upstream's value)
         const MAX_UNACKED_NON_ACK_ELICTING_TAIL: u64 = 1_000;
 
         let mut forgotten = None;
@@ -229,27 +241,25 @@ impl PacketSpace {
             self.unacked_non_ack_eliciting_tail = 0;
             self.largest_ack_eliciting_sent = number;
         } else if self.unacked_non_ack_eliciting_tail > MAX_UNACKED_NON_ACK_ELICTING_TAIL {
-            let oldest_after_ack_eliciting = *self
+            // The count is of packets sent after the most recent ACK-eliciting one, so there is
+            // an oldest among them.
+            // Per https://www.rfc-editor.org/rfc/rfc9000.html#name-frames-and-frame-types,
+            // non-ACK-eliciting packets must only contain PADDING, ACK, and CONNECTION_CLOSE
+            // frames, which require no special handling on ACK or loss beyond removal from
+            // in-flight counters if padded.
+            forgotten = self
                 .sent_packets
                 .range((
                     Bound::Excluded(self.largest_ack_eliciting_sent),
                     Bound::Unbounded,
                 ))
                 .next()
-                .unwrap()
-                .0;
-            // Per https://www.rfc-editor.org/rfc/rfc9000.html#name-frames-and-frame-types,
-            // non-ACK-eliciting packets must only contain PADDING, ACK, and CONNECTION_CLOSE
-            // frames, which require no special handling on ACK or loss beyond removal from
-            // in-flight counters if padded.
-            let packet = self
-                .sent_packets
-                .remove(&oldest_after_ack_eliciting)
-                .unwrap();
-            debug_assert!(!packet.ack_eliciting);
-            forgotten = Some(packet);
+                .map(|(&oldest, _)| oldest)
+                .and_then(|oldest| self.sent_packets.remove(&oldest));
         } else {
-            self.unacked_non_ack_eliciting_tail += 1;
+            // Bounded by the limit just above
+            self.unacked_non_ack_eliciting_tail =
+                self.unacked_non_ack_eliciting_tail.saturating_add(1);
         }
 
         self.sent_packets.insert(number, packet);
@@ -265,16 +275,36 @@ impl PacketSpace {
     }
 }
 
-impl Index<SpaceId> for [PacketSpace; 3] {
-    type Output = PacketSpace;
-    fn index(&self, space: SpaceId) -> &PacketSpace {
-        &self.as_ref()[space as usize]
-    }
+/// The three packet number spaces, each reached by its [`SpaceId`] so that no lookup can miss
+pub(super) struct Spaces {
+    initial: PacketSpace,
+    handshake: PacketSpace,
+    data: PacketSpace,
 }
 
-impl IndexMut<SpaceId> for [PacketSpace; 3] {
-    fn index_mut(&mut self, space: SpaceId) -> &mut PacketSpace {
-        &mut self.as_mut()[space as usize]
+impl Spaces {
+    pub(super) fn new(initial: PacketSpace, handshake: PacketSpace, data: PacketSpace) -> Self {
+        Self {
+            initial,
+            handshake,
+            data,
+        }
+    }
+
+    pub(super) fn get(&self, space: SpaceId) -> &PacketSpace {
+        match space {
+            SpaceId::Initial => &self.initial,
+            SpaceId::Handshake => &self.handshake,
+            SpaceId::Data => &self.data,
+        }
+    }
+
+    pub(super) fn get_mut(&mut self, space: SpaceId) -> &mut PacketSpace {
+        match space {
+            SpaceId::Initial => &mut self.initial,
+            SpaceId::Handshake => &mut self.handshake,
+            SpaceId::Data => &mut self.data,
+        }
     }
 }
 
@@ -309,7 +339,7 @@ pub(super) struct SentPacket {
 pub struct Retransmits {
     pub(super) max_data: bool,
     pub(super) data_blocked: bool,
-    pub(super) max_stream_id: [bool; 2],
+    pub(super) max_stream_id: PerDir<bool>,
     pub(super) reset_stream: Vec<(StreamId, VarInt)>,
     pub(super) stop_sending: Vec<frame::StopSending>,
     pub(super) max_stream_data: FxHashSet<StreamId>,
@@ -355,7 +385,7 @@ impl Retransmits {
     pub(super) fn is_empty(&self, streams: &StreamsState) -> bool {
         !self.max_data
             && !(self.data_blocked && streams.can_send_data_blocked())
-            && !self.max_stream_id.into_iter().any(|x| x)
+            && !self.max_stream_id.iter().any(|&x| x)
             && self.reset_stream.is_empty()
             && self.stop_sending.is_empty()
             && self
@@ -387,7 +417,7 @@ impl ::std::ops::BitOrAssign for Retransmits {
         self.max_data |= rhs.max_data;
         self.data_blocked |= rhs.data_blocked;
         for dir in Dir::iter() {
-            self.max_stream_id[dir as usize] |= rhs.max_stream_id[dir as usize];
+            *self.max_stream_id.get_mut(dir) |= *rhs.max_stream_id.get(dir);
         }
         self.reset_stream.extend_from_slice(&rhs.reset_stream);
         self.stop_sending.extend_from_slice(&rhs.stop_sending);
@@ -449,10 +479,7 @@ impl ThinRetransmits {
     ///
     /// This function will allocate a backing storage if required.
     pub(super) fn get_or_create(&mut self) -> &mut Retransmits {
-        if self.retransmits.is_none() {
-            self.retransmits = Some(Box::default());
-        }
-        self.retransmits.as_deref_mut().unwrap()
+        self.retransmits.get_or_insert_with(Box::default)
     }
 }
 
@@ -488,37 +515,44 @@ impl Dedup {
         Self { window: 0, next: 0 }
     }
 
-    /// Highest packet number authenticated.
-    fn highest(&self) -> u64 {
-        self.next - 1
+    /// Highest packet number authenticated, if any.
+    fn highest(&self) -> Option<u64> {
+        self.next.checked_sub(1)
     }
 
     /// Record a newly authenticated packet number.
     ///
     /// Returns whether the packet might be a duplicate.
     pub(super) fn insert(&mut self, packet: u64) -> bool {
-        if let Some(diff) = packet.checked_sub(self.next) {
-            // Right of window
-            self.window = ((self.window << 1) | 1)
-                .checked_shl(cmp::min(diff, u64::from(u32::MAX)) as u32)
-                .unwrap_or(0);
-            self.next = packet + 1;
-            false
-        } else if self.highest() - packet < WINDOW_SIZE {
-            // Within window
-            if let Some(bit) = (self.highest() - packet).checked_sub(1) {
-                // < highest
-                let mask = 1 << bit;
-                let duplicate = self.window & mask != 0;
-                self.window |= mask;
-                duplicate
-            } else {
-                // == highest
-                true
+        match self
+            .highest()
+            .and_then(|highest| highest.checked_sub(packet))
+        {
+            None => {
+                // Right of window: no packet yet, or past the highest
+                let diff = packet.saturating_sub(self.next);
+                self.window = ((self.window << 1) | 1)
+                    .checked_shl(u32::try_from(diff).unwrap_or(u32::MAX))
+                    .unwrap_or(0);
+                // Packet numbers are below 2^62
+                self.next = packet.saturating_add(1);
+                false
             }
-        } else {
+            Some(behind) if behind < WINDOW_SIZE => {
+                // Within window
+                if let Some(bit) = behind.checked_sub(1) {
+                    // < highest
+                    let mask = 1 << bit;
+                    let duplicate = self.window & mask != 0;
+                    self.window |= mask;
+                    duplicate
+                } else {
+                    // == highest
+                    true
+                }
+            }
             // Left of window
-            true
+            Some(_) => true,
         }
     }
 
@@ -526,26 +560,27 @@ impl Dedup {
     ///
     /// If there are no missing packets, returns `None`
     fn smallest_missing_in_interval(&self, lower_bound: u64, upper_bound: u64) -> Option<u64> {
-        debug_assert!(lower_bound <= upper_bound);
-        debug_assert!(upper_bound <= self.highest());
+        /// Bits in the window
         const BITFIELD_SIZE: u64 = (mem::size_of::<Window>() * 8) as u64;
+        // Both bounds were received, so there is a highest packet at or above them
+        let highest = self.highest()?;
 
         // Since we already know the packets at the boundaries have been received, we only need to
         // check those in between them (this removes the necessity of extra logic to deal with the
         // highest packet, which is stored outside the bitfield)
-        let lower_bound = lower_bound + 1;
+        let lower_bound = lower_bound.checked_add(1)?;
         let upper_bound = upper_bound.saturating_sub(1);
 
         // Note: the offsets are counted from the right
         // The highest packet is not included in the bitfield, so we subtract 1 to account for that
-        let start_offset = (self.highest() - upper_bound).max(1) - 1;
+        let start_offset = highest.checked_sub(upper_bound)?.saturating_sub(1);
         if start_offset >= BITFIELD_SIZE {
             // The start offset is outside of the window. All packets outside of the window are
             // considered to be received.
             return None;
         }
 
-        let end_offset_exclusive = self.highest().saturating_sub(lower_bound);
+        let end_offset_exclusive = highest.saturating_sub(lower_bound);
 
         // The range is clamped at the edge of the window, because any earlier packets are
         // considered to be received
@@ -561,12 +596,13 @@ impl Dedup {
         let mask = if range_len == BITFIELD_SIZE {
             u128::MAX
         } else {
-            ((1u128 << range_len) - 1) << start_offset
+            // `range_len` is at least one here, so the low bits are not empty
+            (1u128 << range_len).checked_sub(1)? << start_offset
         };
         let gaps = !self.window & mask;
 
-        let smallest_missing_offset = 128 - gaps.leading_zeros() as u64;
-        let smallest_missing_packet = self.highest() - smallest_missing_offset;
+        let smallest_missing_offset = u64::from(Window::BITS.checked_sub(gaps.leading_zeros())?);
+        let smallest_missing_packet = highest.checked_sub(smallest_missing_offset)?;
 
         if smallest_missing_packet <= upper_bound {
             Some(smallest_missing_packet)
@@ -673,7 +709,7 @@ impl PendingAcks {
 
     pub(super) fn max_ack_delay_timeout(&self, max_ack_delay: Duration) -> Option<Instant> {
         self.earliest_ack_eliciting_since_last_ack_sent
-            .map(|earliest_unacked| earliest_unacked + max_ack_delay)
+            .and_then(|earliest_unacked| earliest_unacked.checked_add(max_ack_delay))
     }
 
     /// Whether any ACK frames can be sent even if doing so requires a dedicated packet
@@ -689,7 +725,9 @@ impl PendingAcks {
     /// Returns the delay since the packet with the largest packet number was received
     pub(super) fn ack_delay(&self, now: Instant) -> Duration {
         self.largest_packet
-            .map_or(Duration::default(), |(_, received)| now - received)
+            .map_or(Duration::default(), |(_, received)| {
+                now.saturating_duration_since(received)
+            })
     }
 
     /// Handle receipt of a new packet
@@ -702,8 +740,10 @@ impl PendingAcks {
         ack_eliciting: bool,
         dedup: &Dedup,
     ) -> bool {
+        // Both counts are statistics reset by each ACK sent; they saturate rather than wrap
         if !ack_eliciting {
-            self.non_ack_eliciting_since_last_ack_sent += 1;
+            self.non_ack_eliciting_since_last_ack_sent =
+                self.non_ack_eliciting_since_last_ack_sent.saturating_add(1);
             return false;
         }
 
@@ -716,7 +756,8 @@ impl PendingAcks {
             .or(Some(packet_number));
 
         // Handle ack_eliciting_threshold
-        self.ack_eliciting_since_last_ack_sent += 1;
+        self.ack_eliciting_since_last_ack_sent =
+            self.ack_eliciting_since_last_ack_sent.saturating_add(1);
         self.immediate_ack_required |=
             self.ack_eliciting_since_last_ack_sent > self.ack_eliciting_threshold;
 
@@ -754,18 +795,18 @@ impl PendingAcks {
                 else {
                     return false;
                 };
-                if self.reordering_threshold > largest_acked {
-                    return false;
-                }
                 // The largest packet number that could be declared lost without a new ACK being
-                // sent
-                let largest_reported = largest_acked - self.reordering_threshold + 1;
-                let Some(smallest_missing_unreported) =
-                    dedup.smallest_missing_in_interval(largest_reported, largest_unacked)
+                // sent; none while the threshold exceeds the largest acknowledged
+                let Some(largest_reported) = largest_acked
+                    .checked_sub(self.reordering_threshold)
+                    .and_then(|below| below.checked_add(1))
                 else {
                     return false;
                 };
-                largest_unacked - smallest_missing_unreported >= self.reordering_threshold
+                dedup
+                    .smallest_missing_in_interval(largest_reported, largest_unacked)
+                    .and_then(|smallest| largest_unacked.checked_sub(smallest))
+                    .is_some_and(|gap| gap >= self.reordering_threshold)
             }
         }
     }
@@ -805,7 +846,8 @@ impl PendingAcks {
 
     /// Remove ACKs of packets numbered at or below `max` from the set of pending ACKs
     pub(super) fn subtract_below(&mut self, max: u64) {
-        self.ranges.remove(0..(max + 1));
+        // Packet numbers are below 2^62
+        self.ranges.remove(0..max.saturating_add(1));
     }
 
     /// Returns the set of currently pending ACK ranges
@@ -823,6 +865,7 @@ impl PendingAcks {
         // non-ACK-eliciting packets, then include an ACK to help the peer perform timely loss
         // detection even if they're not sending any ACK-eliciting packets themselves. Exact
         // threshold chosen somewhat arbitrarily.
+        /// Unacknowledged non-ACK-eliciting packets that warrant an ACK (upstream's value)
         const LAZY_ACK_THRESHOLD: u64 = 10;
         if self.non_ack_eliciting_since_last_ack_sent > LAZY_ACK_THRESHOLD {
             self.immediate_ack_required = true;
@@ -880,25 +923,36 @@ impl PacketNumberFilter {
         if n != self.next_skipped_packet_number {
             return n;
         }
-        n + 1
+        // Packet numbers are below 2^62
+        n.saturating_add(1)
     }
 
+    /// The next packet number to send in the Data space, `None` once they are spent
     pub(super) fn allocate(
         &mut self,
         rng: &mut (impl Rng + ?Sized),
         space: &mut PacketSpace,
-    ) -> u64 {
-        let n = space.get_tx_number();
+    ) -> Option<u64> {
+        let n = space.get_tx_number()?;
         if n != self.next_skipped_packet_number {
-            return n;
+            return Some(n);
         }
 
         trace!("skipping pn {n}");
         // Skip this packet number, and choose the next one to skip
         self.prev_skipped_packet_number = Some(self.next_skipped_packet_number);
         let next_exponent = self.exponent.saturating_add(1);
-        self.next_skipped_packet_number = rng
-            .random_range(2u64.saturating_pow(self.exponent)..2u64.saturating_pow(next_exponent));
+        let (low, high) = (
+            2u64.saturating_pow(self.exponent),
+            2u64.saturating_pow(next_exponent),
+        );
+        // Once the exponent saturates the range is empty, which `random_range` would panic on;
+        // no packet number that high is ever sent, so none is skipped again
+        self.next_skipped_packet_number = if low < high {
+            rng.random_range(low..high)
+        } else {
+            u64::MAX
+        };
         self.exponent = next_exponent;
 
         space.get_tx_number()
@@ -919,6 +973,9 @@ impl PacketNumberFilter {
         Ok(())
     }
 }
+
+/// Packet numbers are below 2^62 (RFC 9000 §12.3)
+const MAX_PACKET_NUMBER: u64 = 1 << 62;
 
 /// Ensures we can always fit all our ACKs in a single minimum-MTU packet with room to spare
 const MAX_ACK_BLOCKS: usize = 64;

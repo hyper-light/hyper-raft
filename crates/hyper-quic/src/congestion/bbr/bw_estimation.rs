@@ -19,8 +19,9 @@ pub(crate) struct BandwidthEstimation {
 
 impl BandwidthEstimation {
     pub(crate) fn on_sent(&mut self, now: Instant, bytes: u64) {
+        // Byte counts: saturating holds them at a total no connection reaches
         self.prev_total_sent = self.total_sent;
-        self.total_sent += bytes;
+        self.total_sent = self.total_sent.saturating_add(bytes);
         self.prev_sent_time = self.sent_time;
         self.sent_time = Some(now);
     }
@@ -34,7 +35,7 @@ impl BandwidthEstimation {
         app_limited: bool,
     ) {
         self.prev_total_acked = self.total_acked;
-        self.total_acked += bytes;
+        self.total_acked = self.total_acked.saturating_add(bytes);
         self.prev_acked_time = self.acked_time;
         self.acked_time = Some(now);
 
@@ -44,9 +45,11 @@ impl BandwidthEstimation {
         };
 
         let send_rate = match self.sent_time {
+            // Each previous total is the total before the latest bytes, so no difference is
+            // negative
             Some(sent_time) if sent_time > prev_sent_time => Self::bw_from_delta(
-                self.total_sent - self.prev_total_sent,
-                sent_time - prev_sent_time,
+                self.total_sent.saturating_sub(self.prev_total_sent),
+                sent_time.saturating_duration_since(prev_sent_time),
             )
             .unwrap_or(0),
             _ => u64::MAX, // will take the min of send and ack, so this is just a skip
@@ -54,8 +57,8 @@ impl BandwidthEstimation {
 
         let ack_rate = match self.prev_acked_time {
             Some(prev_acked_time) => Self::bw_from_delta(
-                self.total_acked - self.prev_total_acked,
-                now - prev_acked_time,
+                self.total_acked.saturating_sub(self.prev_total_acked),
+                now.saturating_duration_since(prev_acked_time),
             )
             .unwrap_or(0),
             None => 0,
@@ -68,7 +71,7 @@ impl BandwidthEstimation {
     }
 
     pub(crate) fn bytes_acked_this_window(&self) -> u64 {
-        self.total_acked - self.acked_at_last_window
+        self.total_acked.saturating_sub(self.acked_at_last_window)
     }
 
     pub(crate) fn end_acks(&mut self, _current_round: u64, _app_limited: bool) {
@@ -79,14 +82,15 @@ impl BandwidthEstimation {
         self.max_filter.get()
     }
 
-    pub(crate) const fn bw_from_delta(bytes: u64, delta: Duration) -> Option<u64> {
-        let window_duration_ns = delta.as_nanos();
-        if window_duration_ns == 0 {
-            return None;
-        }
-        let b_ns = bytes * 1_000_000_000;
-        let bytes_per_second = b_ns / (window_duration_ns as u64);
-        Some(bytes_per_second)
+    /// Bytes per second; computed in u128, where upstream's u64 product overflowed past 18 GB
+    /// and its divisor was truncated past 584 years, and saturating into a u64
+    pub(crate) fn bw_from_delta(bytes: u64, delta: Duration) -> Option<u64> {
+        /// Nanoseconds in a second
+        const NANOS_PER_SEC: u128 = 1_000_000_000;
+        let bytes_per_second = u128::from(bytes)
+            .saturating_mul(NANOS_PER_SEC)
+            .checked_div(delta.as_nanos())?;
+        Some(u64::try_from(bytes_per_second).unwrap_or(u64::MAX))
     }
 }
 

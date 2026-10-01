@@ -1,7 +1,7 @@
 use tracing::{debug, trace};
 
 use crate::Instant;
-use crate::connection::spaces::PacketSpace;
+use crate::connection::spaces::Spaces;
 use crate::crypto::{HeaderKey, KeyPair, PacketKey};
 use crate::packet::{Packet, PartialDecode, SpaceId};
 use crate::token::ResetToken;
@@ -10,7 +10,7 @@ use crate::{RESET_TOKEN_SIZE, TransportError};
 /// Removes header protection of a packet, or returns `None` if the packet was dropped
 pub(super) fn unprotect_header(
     partial_decode: PartialDecode,
-    spaces: &[PacketSpace; 3],
+    spaces: &Spaces,
     zero_rtt_crypto: Option<&ZeroRttCrypto>,
     stateless_reset_token: Option<ResetToken>,
 ) -> Option<UnprotectHeaderResult> {
@@ -22,7 +22,7 @@ pub(super) fn unprotect_header(
             return None;
         }
     } else if let Some(space) = partial_decode.space() {
-        if let Some(ref crypto) = spaces[space].crypto {
+        if let Some(ref crypto) = spaces.get(space).crypto {
             Some(&*crypto.header.remote)
         } else {
             debug!(
@@ -38,8 +38,13 @@ pub(super) fn unprotect_header(
     };
 
     let packet = partial_decode.data();
-    let stateless_reset = packet.len() >= RESET_TOKEN_SIZE + 5
-        && stateless_reset_token.as_deref() == Some(&packet[packet.len() - RESET_TOKEN_SIZE..]);
+    // A stateless reset is at least five bytes ahead of its token (RFC 9000 §10.3)
+    let tail = packet
+        .len()
+        .checked_sub(RESET_TOKEN_SIZE)
+        .filter(|&start| start >= 5)
+        .and_then(|start| packet.get(start..));
+    let stateless_reset = tail.is_some() && stateless_reset_token.as_deref() == tail;
 
     match partial_decode.finish(header_crypto) {
         Ok(packet) => Some(UnprotectHeaderResult {
@@ -68,7 +73,7 @@ pub(super) struct UnprotectHeaderResult {
 /// Decrypts a packet's body in-place
 pub(super) fn decrypt_packet_body(
     packet: &mut Packet,
-    spaces: &[PacketSpace; 3],
+    spaces: &Spaces,
     zero_rtt_crypto: Option<&ZeroRttCrypto>,
     conn_key_phase: bool,
     prev_crypto: Option<&PrevCrypto>,
@@ -79,15 +84,23 @@ pub(super) fn decrypt_packet_body(
         return Ok(None);
     }
     let space = packet.header.space();
-    let rx_packet = spaces[space].rx_packet;
-    let number = packet.header.number().ok_or(None)?.expand(rx_packet + 1);
+    let rx_packet = spaces.get(space).rx_packet;
+    // The highest packet number received is below 2^62, so the next one is representable
+    let number = packet
+        .header
+        .number()
+        .ok_or(None)?
+        .expand(rx_packet.checked_add(1).ok_or(None)?);
     let packet_key_phase = packet.header.key_phase();
 
+    // Each key below is present whenever the header could be unprotected (`unprotect_header`
+    // drops a packet whose space has none); a packet that finds one missing is dropped, as
+    // undecryptable packets are
     let mut crypto_update = false;
     let crypto = if packet.header.is_0rtt() {
-        &zero_rtt_crypto.unwrap().packet
+        &zero_rtt_crypto.ok_or(None)?.packet
     } else if packet_key_phase == conn_key_phase || space != SpaceId::Data {
-        &spaces[space].crypto.as_ref().unwrap().packet.remote
+        &spaces.get(space).crypto.as_ref().ok_or(None)?.packet.remote
     } else if let Some(prev) = prev_crypto.filter(|&crypto|
         // Use the previous keys if this packet comes prior to acknowledgment of the
         // key update by the peer; otherwise, this must be a remotely-initiated key
@@ -101,7 +114,7 @@ pub(super) fn decrypt_packet_body(
         // lower-numbered packet. The key phase mismatch must therefore represent a new
         // remotely-initiated key update.
         crypto_update = true;
-        &next_crypto.unwrap().remote
+        &next_crypto.ok_or(None)?.remote
     };
 
     crypto
@@ -117,12 +130,8 @@ pub(super) fn decrypt_packet_body(
         )));
     }
 
-    let mut outgoing_key_update_acked = false;
-    if let Some(prev) = prev_crypto {
-        if prev.end_packet.is_none() && packet_key_phase == conn_key_phase {
-            outgoing_key_update_acked = true;
-        }
-    }
+    let outgoing_key_update_acked = prev_crypto
+        .is_some_and(|prev| prev.end_packet.is_none() && packet_key_phase == conn_key_phase);
 
     if crypto_update {
         // Validate incoming key update

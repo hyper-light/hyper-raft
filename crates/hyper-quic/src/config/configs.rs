@@ -47,7 +47,8 @@ struct Slot {
 
 enum SlotState {
     Vacant,
-    Occupied(Occupant),
+    /// Boxed: a configuration is large and slots are few and rarely change.
+    Occupied(Box<Occupant>),
     /// The generation counter is exhausted; the slot is never reused, so a stale key can never
     /// alias a later occupant
     Spent,
@@ -231,7 +232,7 @@ impl Configs {
             .enumerate()
             .find(|(_, slot)| matches!(slot.state, SlotState::Vacant))
         {
-            slot.state = SlotState::Occupied(occupant);
+            slot.state = SlotState::Occupied(Box::new(occupant));
             return Ok(ConfigKey {
                 index,
                 generation: slot.generation,
@@ -243,7 +244,7 @@ impl Configs {
         let index = self.slots.len();
         self.slots.push(Slot {
             generation: 0,
-            state: SlotState::Occupied(occupant),
+            state: SlotState::Occupied(Box::new(occupant)),
         });
         Ok(ConfigKey {
             index,

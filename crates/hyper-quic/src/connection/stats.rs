@@ -18,11 +18,14 @@ pub struct UdpStats {
     pub ios: u64,
 }
 
+// Statistics saturate: a count at u64::MAX stays there rather than wrapping to a small number.
 impl UdpStats {
     pub(crate) fn on_sent(&mut self, datagrams: u64, bytes: usize) {
-        self.datagrams += datagrams;
-        self.bytes += bytes as u64;
-        self.ios += 1;
+        self.datagrams = self.datagrams.saturating_add(datagrams);
+        self.bytes = self
+            .bytes
+            .saturating_add(u64::try_from(bytes).unwrap_or(u64::MAX));
+        self.ios = self.ios.saturating_add(1);
     }
 }
 
@@ -61,39 +64,47 @@ impl FrameStats {
     pub(crate) fn record(&mut self, frame: &Frame) {
         match frame {
             Frame::Padding => {}
-            Frame::Ping => self.ping += 1,
-            Frame::Ack(_) => self.acks += 1,
-            Frame::ResetStream(_) => self.reset_stream += 1,
-            Frame::StopSending(_) => self.stop_sending += 1,
-            Frame::Crypto(_) => self.crypto += 1,
-            Frame::Datagram(_) => self.datagram += 1,
-            Frame::NewToken(_) => self.new_token += 1,
-            Frame::MaxData(_) => self.max_data += 1,
-            Frame::MaxStreamData { .. } => self.max_stream_data += 1,
+            Frame::Ping => self.ping = self.ping.saturating_add(1),
+            Frame::Ack(_) => self.acks = self.acks.saturating_add(1),
+            Frame::ResetStream(_) => self.reset_stream = self.reset_stream.saturating_add(1),
+            Frame::StopSending(_) => self.stop_sending = self.stop_sending.saturating_add(1),
+            Frame::Crypto(_) => self.crypto = self.crypto.saturating_add(1),
+            Frame::Datagram(_) => self.datagram = self.datagram.saturating_add(1),
+            Frame::NewToken(_) => self.new_token = self.new_token.saturating_add(1),
+            Frame::MaxData(_) => self.max_data = self.max_data.saturating_add(1),
+            Frame::MaxStreamData { .. } => {
+                self.max_stream_data = self.max_stream_data.saturating_add(1)
+            }
             Frame::MaxStreams { dir, .. } => {
                 if *dir == Dir::Bi {
-                    self.max_streams_bidi += 1;
+                    self.max_streams_bidi = self.max_streams_bidi.saturating_add(1);
                 } else {
-                    self.max_streams_uni += 1;
+                    self.max_streams_uni = self.max_streams_uni.saturating_add(1);
                 }
             }
-            Frame::DataBlocked { .. } => self.data_blocked += 1,
-            Frame::Stream(_) => self.stream += 1,
-            Frame::StreamDataBlocked { .. } => self.stream_data_blocked += 1,
+            Frame::DataBlocked { .. } => self.data_blocked = self.data_blocked.saturating_add(1),
+            Frame::Stream(_) => self.stream = self.stream.saturating_add(1),
+            Frame::StreamDataBlocked { .. } => {
+                self.stream_data_blocked = self.stream_data_blocked.saturating_add(1)
+            }
             Frame::StreamsBlocked { dir, .. } => {
                 if *dir == Dir::Bi {
-                    self.streams_blocked_bidi += 1;
+                    self.streams_blocked_bidi = self.streams_blocked_bidi.saturating_add(1);
                 } else {
-                    self.streams_blocked_uni += 1;
+                    self.streams_blocked_uni = self.streams_blocked_uni.saturating_add(1);
                 }
             }
-            Frame::NewConnectionId(_) => self.new_connection_id += 1,
-            Frame::RetireConnectionId { .. } => self.retire_connection_id += 1,
-            Frame::PathChallenge(_) => self.path_challenge += 1,
-            Frame::PathResponse(_) => self.path_response += 1,
-            Frame::Close(_) => self.connection_close += 1,
-            Frame::AckFrequency(_) => self.ack_frequency += 1,
-            Frame::ImmediateAck => self.immediate_ack += 1,
+            Frame::NewConnectionId(_) => {
+                self.new_connection_id = self.new_connection_id.saturating_add(1)
+            }
+            Frame::RetireConnectionId { .. } => {
+                self.retire_connection_id = self.retire_connection_id.saturating_add(1)
+            }
+            Frame::PathChallenge(_) => self.path_challenge = self.path_challenge.saturating_add(1),
+            Frame::PathResponse(_) => self.path_response = self.path_response.saturating_add(1),
+            Frame::Close(_) => self.connection_close = self.connection_close.saturating_add(1),
+            Frame::AckFrequency(_) => self.ack_frequency = self.ack_frequency.saturating_add(1),
+            Frame::ImmediateAck => self.immediate_ack = self.immediate_ack.saturating_add(1),
             Frame::HandshakeDone => self.handshake_done = self.handshake_done.saturating_add(1),
         }
     }

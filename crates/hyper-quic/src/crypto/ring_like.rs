@@ -4,7 +4,11 @@ use crate::crypto::{self, CryptoError};
 
 impl crypto::HmacKey for hmac::Key {
     fn sign(&self, data: &[u8], out: &mut [u8]) {
-        out.copy_from_slice(hmac::sign(self, data).as_ref());
+        // `out` is `signature_len` bytes; were it another length, `copy_from_slice` would panic
+        // where this copies what both hold
+        for (out, tag) in out.iter_mut().zip(hmac::sign(self, data).as_ref()) {
+            *out = *tag;
+        }
     }
 
     fn signature_len(&self) -> usize {
@@ -17,15 +21,15 @@ impl crypto::HmacKey for hmac::Key {
 }
 
 impl crypto::HandshakeTokenKey for hkdf::Prk {
-    fn aead_from_hkdf(&self, random_bytes: &[u8]) -> Box<dyn crypto::AeadKey> {
+    fn aead_from_hkdf(&self, random_bytes: &[u8]) -> Result<Box<dyn crypto::AeadKey>, CryptoError> {
         let mut key_buffer = [0u8; 32];
         let info = [random_bytes];
-        let okm = self.expand(&info, hkdf::HKDF_SHA256).unwrap();
+        let okm = self.expand(&info, hkdf::HKDF_SHA256)?;
 
-        okm.fill(&mut key_buffer).unwrap();
+        okm.fill(&mut key_buffer)?;
 
-        let key = aead::UnboundKey::new(&aead::AES_256_GCM, &key_buffer).unwrap();
-        Box::new(aead::LessSafeKey::new(key))
+        let key = aead::UnboundKey::new(&aead::AES_256_GCM, &key_buffer)?;
+        Ok(Box::new(aead::LessSafeKey::new(key)))
     }
 }
 

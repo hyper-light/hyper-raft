@@ -83,16 +83,20 @@ impl Datagrams<'_> {
         // We use the conservative overhead bound for any packet number, reducing the budget by at
         // most 3 bytes, so that PN size fluctuations don't cause users sending maximum-size
         // datagrams to suffer avoidable packet loss.
-        let max_size = self.conn.path.current_mtu() as usize
-            - self.conn.predict_1rtt_overhead(None)
-            - Datagram::SIZE_BOUND;
+        // The room a packet leaves: none if the overhead does not fit.
+        let max_size = usize::from(self.conn.path.current_mtu())
+            .saturating_sub(self.conn.predict_1rtt_overhead(None))
+            .saturating_sub(Datagram::SIZE_BOUND);
         let limit = self
             .conn
             .peer_params
             .max_datagram_frame_size?
             .into_inner()
             .saturating_sub(Datagram::SIZE_BOUND as u64);
-        Some(limit.min(max_size as u64) as usize)
+        Some(
+            usize::try_from(limit.min(u64::try_from(max_size).unwrap_or(u64::MAX)))
+                .unwrap_or(max_size),
+        )
     }
 
     /// Receive an unreliable, unordered datagram
@@ -135,14 +139,20 @@ impl DatagramState {
             Some(x) => *x,
         };
 
-        let size_with_overhead = datagram.data.len() + size_of::<Datagram>();
+        // A datagram's length is of data in memory.
+        let size_with_overhead = datagram.data.len().saturating_add(size_of::<Datagram>());
 
         if size_with_overhead > window {
             return Err(TransportError::PROTOCOL_VIOLATION("oversized datagram"));
         }
 
         let was_empty = self.incoming.is_empty();
-        while self.incoming.memory_used() + size_with_overhead > window {
+        while self
+            .incoming
+            .memory_used()
+            .saturating_add(size_with_overhead)
+            > window
+        {
             debug!("dropping stale datagram");
             self.recv();
         }
@@ -189,7 +199,11 @@ impl DatagramState {
                     datagram.data.len(),
                     max_payload
                 );
-                self.outgoing.payload_bytes -= datagram.data.len();
+                // The buffer counted this datagram's bytes.
+                self.outgoing.payload_bytes = self
+                    .outgoing
+                    .payload_bytes
+                    .saturating_sub(datagram.data.len());
                 dropped_any = true;
             }
             result
@@ -207,7 +221,7 @@ impl DatagramState {
             None => return false,
         };
 
-        if buf.len() + datagram.size(true) > max_size {
+        if buf.len().saturating_add(datagram.size(true)) > max_size {
             // Future work: we could be more clever about cramming small datagrams into
             // mostly-full packets when a larger one is queued first
             self.outgoing.push_front(datagram);
@@ -232,25 +246,27 @@ pub(super) struct DatagramBuffer {
 }
 
 impl DatagramBuffer {
+    // Counts of bytes in memory: the sums do not saturate, and the buffer counted every byte
+    // it releases.
     fn push_back(&mut self, datagram: Datagram) {
-        self.payload_bytes += datagram.data.len();
+        self.payload_bytes = self.payload_bytes.saturating_add(datagram.data.len());
         self.queue.push_back(datagram);
     }
 
     fn pop_front(&mut self) -> Option<Datagram> {
         let datagram = self.queue.pop_front()?;
-        self.payload_bytes -= datagram.data.len();
+        self.payload_bytes = self.payload_bytes.saturating_sub(datagram.data.len());
         Some(datagram)
     }
 
     fn push_front(&mut self, datagram: Datagram) {
-        self.payload_bytes += datagram.data.len();
+        self.payload_bytes = self.payload_bytes.saturating_add(datagram.data.len());
         self.queue.push_front(datagram);
     }
 
     fn memory_used(&self) -> usize {
         self.payload_bytes
-            .saturating_add(self.queue.len() * size_of::<Datagram>())
+            .saturating_add(self.queue.len().saturating_mul(size_of::<Datagram>()))
     }
 
     pub(super) fn can_send_1rtt(&self, max_size: usize) -> bool {

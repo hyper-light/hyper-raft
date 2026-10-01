@@ -69,12 +69,13 @@ impl AckFrequencyState {
     }
 
     /// Returns the next sequence number for an ACK_FREQUENCY frame
-    pub(super) fn next_sequence_number(&mut self) -> VarInt {
-        assert!(self.next_outgoing_sequence_number <= VarInt::MAX);
-
+    ///
+    /// `None` once the sequence space (2^62 frames) is spent, where upstream asserted.
+    pub(super) fn next_sequence_number(&mut self) -> Option<VarInt> {
         let seq = self.next_outgoing_sequence_number;
-        self.next_outgoing_sequence_number.0 += 1;
-        seq
+        let next = seq.into_inner().checked_add(1)?;
+        self.next_outgoing_sequence_number = VarInt::from_u64(next).ok()?;
+        Some(seq)
     }
 
     /// Returns true if we should send an ACK_FREQUENCY frame
@@ -156,7 +157,7 @@ const MAX_RTT_ERROR: f32 = 0.2;
 
 /// Minimum value to request the peer set max ACK delay to when the peer supports the ACK frequency
 /// extension and an explicit max ACK delay is not configured.
-// Keep in sync with `AckFrequencyConfig::max_ack_delay` documentation
+/// Keep in sync with `AckFrequencyConfig::max_ack_delay` documentation
 const MIN_AUTOMATIC_ACK_DELAY: Duration = Duration::from_millis(25);
 
 #[cfg(test)]

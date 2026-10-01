@@ -162,21 +162,21 @@ impl TransportParameters {
             max_idle_timeout: config.max_idle_timeout.unwrap_or(VarInt(0)),
             disable_active_migration: server_config.is_some_and(|c| !c.migration),
             active_connection_id_limit: if cid_gen.cid_len() == 0 {
-                2 // i.e. default, i.e. unsent
+                VarInt::from_u32(2) // i.e. default, i.e. unsent
             } else {
-                CidQueue::LEN as u32
-            }
-            .into(),
+                VarInt::from_u64(CidQueue::LEN as u64).unwrap_or(VarInt::from_u32(2))
+            },
             max_datagram_frame_size: config
                 .datagram_receive_buffer_size
-                .map(|x| (x.min(u16::MAX.into()) as u16).into()),
+                .map(|x| u16::try_from(x).unwrap_or(u16::MAX).into()),
             grease_quic_bit: endpoint_config.grease_quic_bit,
-            min_ack_delay: Some(
-                VarInt::from_u64(u64::try_from(TIMER_GRANULARITY.as_micros()).unwrap()).unwrap(),
-            ),
+            // The timer granularity, a millisecond, in microseconds
+            min_ack_delay: u64::try_from(TIMER_GRANULARITY.as_micros())
+                .ok()
+                .and_then(|micros| VarInt::from_u64(micros).ok()),
             grease_transport_parameter: Some(ReservedTransportParameter::random(rng)),
             write_order: Some({
-                let mut order = std::array::from_fn(|i| i as u8);
+                let mut order = DEFAULT_WRITE_ORDER;
                 order.shuffle(rng);
                 order
             }),
@@ -226,7 +226,10 @@ pub(crate) struct PreferredAddress {
 
 impl PreferredAddress {
     fn wire_size(&self) -> u16 {
-        4 + 2 + 16 + 2 + 1 + self.connection_id.len() as u16 + 16
+        /// IPv4 address and port, IPv6 address and port, CID length, reset token
+        const FIXED: u16 = 4 + 2 + 16 + 2 + 1 + 16;
+        // A connection ID is at most 20 bytes
+        FIXED.saturating_add(u16::try_from(self.connection_id.len()).unwrap_or(u16::MAX))
     }
 
     fn write<W: BufMut>(&self, w: &mut W) {
@@ -234,7 +237,8 @@ impl PreferredAddress {
         w.write::<u16>(self.address_v4.map_or(0, |x| x.port()));
         w.write(self.address_v6.map_or(Ipv6Addr::UNSPECIFIED, |x| *x.ip()));
         w.write::<u16>(self.address_v6.map_or(0, |x| x.port()));
-        w.write::<u8>(self.connection_id.len() as u8);
+        // A connection ID is at most 20 bytes
+        w.write::<u8>(u8::try_from(self.connection_id.len()).unwrap_or(u8::MAX));
         w.put_slice(&self.connection_id);
         w.put_slice(&self.stateless_reset_token);
     }
@@ -245,12 +249,11 @@ impl PreferredAddress {
         let ip_v6 = r.get::<Ipv6Addr>()?;
         let port_v6 = r.get::<u16>()?;
         let cid_len = r.get::<u8>()?;
-        if r.remaining() < cid_len as usize || cid_len > MAX_CID_SIZE as u8 {
+        let cid_len = usize::from(cid_len);
+        if r.remaining() < cid_len || cid_len > MAX_CID_SIZE {
             return Err(Error::Malformed);
         }
-        let mut stage = [0; MAX_CID_SIZE];
-        r.copy_to_slice(&mut stage[0..cid_len as usize]);
-        let cid = ConnectionId::new(&stage[0..cid_len as usize]);
+        let cid = ConnectionId::from_buf(r, cid_len);
         if r.remaining() < 16 {
             return Err(Error::Malformed);
         }
@@ -307,100 +310,100 @@ impl From<UnexpectedEnd> for Error {
 impl TransportParameters {
     /// Encode `TransportParameters` into buffer
     pub fn write<W: BufMut>(&self, w: &mut W) {
-        for idx in self
-            .write_order
-            .as_ref()
-            .unwrap_or(&std::array::from_fn(|i| i as u8))
-        {
-            let id = TransportParameterId::SUPPORTED[*idx as usize];
-            match id {
-                TransportParameterId::ReservedTransportParameter => {
-                    if let Some(param) = self.grease_transport_parameter {
-                        param.write(w);
-                    }
+        for &idx in self.write_order.as_ref().unwrap_or(&DEFAULT_WRITE_ORDER) {
+            // Each order is a permutation of the supported IDs' indices
+            if let Some(&id) = TransportParameterId::SUPPORTED.get(usize::from(idx)) {
+                self.write_param(id, w);
+            }
+        }
+    }
+
+    /// Encodes the parameter `id`, if it is to be sent
+    fn write_param<W: BufMut>(&self, id: TransportParameterId, w: &mut W) {
+        match id {
+            TransportParameterId::ReservedTransportParameter => {
+                if let Some(param) = self.grease_transport_parameter {
+                    param.write(w);
                 }
-                TransportParameterId::StatelessResetToken => {
-                    if let Some(ref x) = self.stateless_reset_token {
-                        w.write_var(id as u64);
-                        w.write_var(16);
-                        w.put_slice(x);
-                    }
+            }
+            TransportParameterId::StatelessResetToken => {
+                if let Some(ref x) = self.stateless_reset_token {
+                    w.write_var(id as u64);
+                    w.write_var(16);
+                    w.put_slice(x);
                 }
-                TransportParameterId::DisableActiveMigration => {
-                    if self.disable_active_migration {
-                        w.write_var(id as u64);
-                        w.write_var(0);
-                    }
+            }
+            TransportParameterId::DisableActiveMigration | TransportParameterId::GreaseQuicBit => {
+                self.write_flag(id, w)
+            }
+            TransportParameterId::MaxDatagramFrameSize
+            | TransportParameterId::MinAckDelayDraft07 => self.write_optional_varint(id, w),
+            TransportParameterId::PreferredAddress => {
+                if let Some(ref x) = self.preferred_address {
+                    w.write_var(id as u64);
+                    w.write_var(u64::from(x.wire_size()));
+                    x.write(w);
                 }
-                TransportParameterId::MaxDatagramFrameSize => {
-                    if let Some(x) = self.max_datagram_frame_size {
-                        w.write_var(id as u64);
-                        w.write_var(x.size() as u64);
-                        w.write(x);
-                    }
-                }
-                TransportParameterId::PreferredAddress => {
-                    if let Some(ref x) = self.preferred_address {
-                        w.write_var(id as u64);
-                        w.write_var(x.wire_size() as u64);
-                        x.write(w);
-                    }
-                }
-                TransportParameterId::OriginalDestinationConnectionId => {
-                    if let Some(ref cid) = self.original_dst_cid {
-                        w.write_var(id as u64);
-                        w.write_var(cid.len() as u64);
-                        w.put_slice(cid);
-                    }
-                }
-                TransportParameterId::InitialSourceConnectionId => {
-                    if let Some(ref cid) = self.initial_src_cid {
-                        w.write_var(id as u64);
-                        w.write_var(cid.len() as u64);
-                        w.put_slice(cid);
-                    }
-                }
-                TransportParameterId::RetrySourceConnectionId => {
-                    if let Some(ref cid) = self.retry_src_cid {
-                        w.write_var(id as u64);
-                        w.write_var(cid.len() as u64);
-                        w.put_slice(cid);
-                    }
-                }
-                TransportParameterId::GreaseQuicBit => {
-                    if self.grease_quic_bit {
-                        w.write_var(id as u64);
-                        w.write_var(0);
-                    }
-                }
-                TransportParameterId::MinAckDelayDraft07 => {
-                    if let Some(x) = self.min_ack_delay {
-                        w.write_var(id as u64);
-                        w.write_var(x.size() as u64);
-                        w.write(x);
-                    }
-                }
-                id => {
-                    macro_rules! write_params {
-                        {$($(#[$doc:meta])* $name:ident ($id:ident) = $default:expr,)*} => {
-                            match id {
-                                $(TransportParameterId::$id => {
-                                    if self.$name.0 != $default {
-                                        w.write_var(id as u64);
-                                        w.write(VarInt::try_from(self.$name.size()).unwrap());
-                                        w.write(self.$name);
-                                    }
-                                })*,
-                                _ => {
-                                    unimplemented!("Missing implementation of write for transport parameter with code {id:?}");
-                                }
-                            }
-                        }
-                    }
-                    apply_params!(write_params);
+            }
+            TransportParameterId::OriginalDestinationConnectionId
+            | TransportParameterId::InitialSourceConnectionId
+            | TransportParameterId::RetrySourceConnectionId => self.write_cid(id, w),
+            id => self.write_varint_param(id, w),
+        }
+    }
+
+    /// Encodes a parameter that is present or absent, with no value
+    fn write_flag<W: BufMut>(&self, id: TransportParameterId, w: &mut W) {
+        let set = match id {
+            TransportParameterId::DisableActiveMigration => self.disable_active_migration,
+            _ => self.grease_quic_bit,
+        };
+        if set {
+            w.write_var(id as u64);
+            w.write_var(0);
+        }
+    }
+
+    /// Encodes a varint parameter that has no default
+    fn write_optional_varint<W: BufMut>(&self, id: TransportParameterId, w: &mut W) {
+        let value = match id {
+            TransportParameterId::MaxDatagramFrameSize => self.max_datagram_frame_size,
+            _ => self.min_ack_delay,
+        };
+        if let Some(x) = value {
+            w.write_var(id as u64);
+            w.write_var(x.size() as u64);
+            w.write(x);
+        }
+    }
+
+    /// Encodes a connection ID parameter
+    fn write_cid<W: BufMut>(&self, id: TransportParameterId, w: &mut W) {
+        let cid = match id {
+            TransportParameterId::OriginalDestinationConnectionId => &self.original_dst_cid,
+            TransportParameterId::InitialSourceConnectionId => &self.initial_src_cid,
+            _ => &self.retry_src_cid,
+        };
+        if let Some(cid) = cid {
+            w.write_var(id as u64);
+            w.write_var(cid.len() as u64);
+            w.put_slice(cid);
+        }
+    }
+
+    /// Encodes a varint parameter that has a default, when it differs from it
+    fn write_varint_param<W: BufMut>(&self, id: TransportParameterId, w: &mut W) {
+        macro_rules! write_params {
+            {$($(#[$doc:meta])* $name:ident ($id:ident) = $default:expr,)*} => {
+                match id {
+                    $(TransportParameterId::$id => write_unless_default(w, id, self.$name, $default),)*
+                    // Every other parameter is written by `write_param` (upstream's
+                    // `unimplemented!`)
+                    _ => {}
                 }
             }
         }
+        apply_params!(write_params);
     }
 
     /// Decode `TransportParameters` from buffer
@@ -428,7 +431,8 @@ impl TransportParameters {
             if (r.remaining() as u64) < len {
                 return Err(Error::Malformed);
             }
-            let len = len as usize;
+            // At most what remains, so a `usize`
+            let len = usize::try_from(len).map_err(|_| Error::Malformed)?;
             let Ok(id) = TransportParameterId::try_from(id) else {
                 // unknown transport parameters are ignored
                 r.advance(len);
@@ -496,7 +500,7 @@ impl TransportParameters {
                 }
             }
 
-            if remaining_before - r.remaining() != len {
+            if remaining_before.checked_sub(r.remaining()) != Some(len) {
                 return Err(Error::Malformed);
             }
         }
@@ -517,7 +521,8 @@ impl TransportParameters {
             // https://www.ietf.org/archive/id/draft-ietf-quic-ack-frequency-08.html#section-3-4
             || params.min_ack_delay.is_some_and(|min_ack_delay| {
                 // min_ack_delay uses microseconds, whereas max_ack_delay uses milliseconds
-                min_ack_delay.0 > params.max_ack_delay.0 * 1_000
+                // max_ack_delay is below 2^14 here, checked just above
+                min_ack_delay.0 > params.max_ack_delay.0.saturating_mul(1_000)
             })
             // https://www.rfc-editor.org/rfc/rfc9000.html#section-18.2-8
             || (side.is_server()
@@ -569,7 +574,10 @@ impl ReservedTransportParameter {
 
         let payload = {
             let mut slice = [0u8; Self::MAX_PAYLOAD_LEN];
-            rng.fill_bytes(&mut slice[..payload_len]);
+            // The length is below the buffer's
+            if let Some(filled) = slice.get_mut(..payload_len) {
+                rng.fill_bytes(filled);
+            }
             slice
         };
 
@@ -581,9 +589,14 @@ impl ReservedTransportParameter {
     }
 
     fn write(&self, w: &mut impl BufMut) {
+        // The length is at most the buffer's, as `random` chose it
+        let payload = self
+            .payload
+            .get(..self.payload_len)
+            .unwrap_or(&self.payload);
         w.write_var(self.id.0);
-        w.write_var(self.payload_len as u64);
-        w.put_slice(&self.payload[..self.payload_len]);
+        w.write_var(payload.len() as u64);
+        w.put_slice(payload);
     }
 
     /// Generates a random reserved identifier of the form `31 * N + 27`, as required by RFC 9000.
@@ -591,18 +604,17 @@ impl ReservedTransportParameter {
     /// that unknown transport parameters must be ignored by peers.
     /// See: <https://www.rfc-editor.org/rfc/rfc9000.html#section-18.1> and <https://www.rfc-editor.org/rfc/rfc9000.html#section-22.3>
     fn generate_reserved_id(rng: &mut impl Rng) -> VarInt {
-        let id = {
-            let rand = rng.random_range(0u64..(1 << 62) - 27);
-            let n = rand / 31;
-            31 * n + 27
-        };
-        debug_assert!(
-            id % 31 == 27,
-            "generated id does not have the form of 31 * N + 27"
-        );
-        VarInt::from_u64(id).expect(
-            "generated id does fit into range of allowed transport parameter IDs: [0; 2^62)",
-        )
+        /// The smallest reserved ID, `31 * 0 + 27`
+        const SMALLEST: u64 = 27;
+        /// The draw's bound, below which every `31 * N + 27` is a varint
+        const BOUND: u64 = (1 << 62) - SMALLEST;
+        let n = rng.random_range(0..BOUND) / 31;
+        // n is below (2^62 - 27) / 31, so the ID is a varint; the smallest reserved ID stands in
+        // were it not (upstream's `expect`)
+        n.checked_mul(31)
+            .and_then(|m| m.checked_add(SMALLEST))
+            .and_then(|id| VarInt::from_u64(id).ok())
+            .unwrap_or(VarInt::from_u32(27))
     }
 
     /// The maximum length of the payload to include as the parameter payload.
@@ -683,37 +695,32 @@ impl TryFrom<u64> for TransportParameterId {
     type Error = ();
 
     fn try_from(value: u64) -> Result<Self, Self::Error> {
-        let param = match value {
-            id if Self::MaxIdleTimeout == id => Self::MaxIdleTimeout,
-            id if Self::MaxUdpPayloadSize == id => Self::MaxUdpPayloadSize,
-            id if Self::InitialMaxData == id => Self::InitialMaxData,
-            id if Self::InitialMaxStreamDataBidiLocal == id => Self::InitialMaxStreamDataBidiLocal,
-            id if Self::InitialMaxStreamDataBidiRemote == id => {
-                Self::InitialMaxStreamDataBidiRemote
-            }
-            id if Self::InitialMaxStreamDataUni == id => Self::InitialMaxStreamDataUni,
-            id if Self::InitialMaxStreamsBidi == id => Self::InitialMaxStreamsBidi,
-            id if Self::InitialMaxStreamsUni == id => Self::InitialMaxStreamsUni,
-            id if Self::AckDelayExponent == id => Self::AckDelayExponent,
-            id if Self::MaxAckDelay == id => Self::MaxAckDelay,
-            id if Self::ActiveConnectionIdLimit == id => Self::ActiveConnectionIdLimit,
-            id if Self::ReservedTransportParameter == id => Self::ReservedTransportParameter,
-            id if Self::StatelessResetToken == id => Self::StatelessResetToken,
-            id if Self::DisableActiveMigration == id => Self::DisableActiveMigration,
-            id if Self::MaxDatagramFrameSize == id => Self::MaxDatagramFrameSize,
-            id if Self::PreferredAddress == id => Self::PreferredAddress,
-            id if Self::OriginalDestinationConnectionId == id => {
-                Self::OriginalDestinationConnectionId
-            }
-            id if Self::InitialSourceConnectionId == id => Self::InitialSourceConnectionId,
-            id if Self::RetrySourceConnectionId == id => Self::RetrySourceConnectionId,
-            id if Self::GreaseQuicBit == id => Self::GreaseQuicBit,
-            id if Self::MinAckDelayDraft07 == id => Self::MinAckDelayDraft07,
-            _ => return Err(()),
-        };
-        Ok(param)
+        Self::SUPPORTED
+            .iter()
+            .copied()
+            .find(|&id| id == value)
+            .ok_or(())
     }
 }
+
+/// Encodes a varint parameter when it is not its default
+fn write_unless_default<W: BufMut>(
+    w: &mut W,
+    id: TransportParameterId,
+    value: VarInt,
+    default: u64,
+) {
+    if value.0 != default {
+        w.write_var(id as u64);
+        w.write_var(value.size() as u64);
+        w.write(value);
+    }
+}
+
+/// The order parameters are written in when none is chosen: each supported ID's index
+const DEFAULT_WRITE_ORDER: [u8; TransportParameterId::SUPPORTED.len()] = [
+    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20,
+];
 
 fn decode_cid(len: usize, value: &mut Option<ConnectionId>, r: &mut impl Buf) -> Result<(), Error> {
     if len > MAX_CID_SIZE || value.is_some() || r.remaining() < len {

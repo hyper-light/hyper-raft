@@ -23,6 +23,7 @@ pub(crate) enum Timer {
 }
 
 impl Timer {
+    /// Every timer
     pub(crate) const VALUES: [Self; 9] = [
         Self::LossDetection,
         Self::Idle,
@@ -39,20 +40,47 @@ impl Timer {
 /// A table of data associated with each distinct kind of `Timer`
 #[derive(Debug, Copy, Clone, Default)]
 pub(crate) struct TimerTable {
-    data: [Option<Instant>; 10],
+    data: [Option<Instant>; 9],
 }
 
 impl TimerTable {
     pub(super) fn set(&mut self, timer: Timer, time: Instant) {
-        self.data[timer as usize] = Some(time);
+        *self.slot_mut(timer) = Some(time);
     }
 
     pub(super) fn get(&self, timer: Timer) -> Option<Instant> {
-        self.data[timer as usize]
+        let [a, b, c, d, e, f, g, h, i] = &self.data;
+        *match timer {
+            Timer::LossDetection => a,
+            Timer::Idle => b,
+            Timer::Close => c,
+            Timer::KeyDiscard => d,
+            Timer::PathValidation => e,
+            Timer::KeepAlive => f,
+            Timer::Pacing => g,
+            Timer::PushNewCid => h,
+            Timer::MaxAckDelay => i,
+        }
     }
 
     pub(super) fn stop(&mut self, timer: Timer) {
-        self.data[timer as usize] = None;
+        *self.slot_mut(timer) = None;
+    }
+
+    /// Each timer's slot, found by destructuring so that no lookup can miss
+    fn slot_mut(&mut self, timer: Timer) -> &mut Option<Instant> {
+        let [a, b, c, d, e, f, g, h, i] = &mut self.data;
+        match timer {
+            Timer::LossDetection => a,
+            Timer::Idle => b,
+            Timer::Close => c,
+            Timer::KeyDiscard => d,
+            Timer::PathValidation => e,
+            Timer::KeepAlive => f,
+            Timer::Pacing => g,
+            Timer::PushNewCid => h,
+            Timer::MaxAckDelay => i,
+        }
     }
 
     pub(super) fn next_timeout(&self) -> Option<Instant> {
@@ -60,6 +88,6 @@ impl TimerTable {
     }
 
     pub(super) fn is_expired(&self, timer: Timer, after: Instant) -> bool {
-        self.data[timer as usize].is_some_and(|x| x <= after)
+        self.get(timer).is_some_and(|x| x <= after)
     }
 }

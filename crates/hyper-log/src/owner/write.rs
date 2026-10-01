@@ -396,11 +396,10 @@ impl<F: BlockFile + 'static> Owner<F> {
                 self.schedule.held.push_back(s);
                 continue;
             }
-            match self.lay(s, payload, laid, new_groups) {
+            match self.lay(s, payload, laid, new_groups, batch) {
                 Ok(Some(new)) => new_groups = new_groups.saturating_add(usize::from(new)),
                 Ok(None) => refused = true,
-                Err((s, e)) => {
-                    batch.push_front(s);
+                Err(e) => {
                     self.buffers.seen = seen;
                     return Err(e);
                 }
@@ -411,14 +410,15 @@ impl<F: BlockFile + 'static> Owner<F> {
     }
 
     /// Lays one update into the frame: `Some(new group)` once laid or held for room, `None` if
-    /// refused and answered, the update back if it did not encode.
+    /// refused and answered. One that does not encode goes back to the front of `batch`.
     fn lay(
         &mut self,
         mut s: Submission,
         payload: &mut Payload,
         laid: &mut Laid,
         new_groups: usize,
-    ) -> Result<Option<bool>, (Submission, LogError)> {
+        batch: &mut VecDeque<Submission>,
+    ) -> Result<Option<bool>, LogError> {
         let (new, len) = match self.fits(&s, new_groups) {
             Ok(checked) => checked,
             Err(e) => {
@@ -437,7 +437,8 @@ impl<F: BlockFile + 'static> Owner<F> {
         let Some(placement) =
             writer::encode(payload, &mut laid.records, s.group, &s.update, s.marks)
         else {
-            return Err((s, LogError::TooLarge(len)));
+            batch.push_front(s);
+            return Err(LogError::TooLarge(len));
         };
         self.schedule.virtual_time = self.schedule.virtual_time.max(s.tags.start);
         laid.taken.push((s, placement));

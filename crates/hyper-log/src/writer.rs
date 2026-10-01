@@ -561,123 +561,108 @@ fn live_copies<'a>(state: &State, slot: u32, base: u64, records: &'a [Owned]) ->
     for record in records {
         match record {
             Owned::Entries { group, entries, .. } | Owned::Relocated { group, entries, .. } => {
-                let Some(g) = state.groups.get(group) else {
-                    continue;
-                };
-                let mut run: Run<'_> = None;
-                for e in entries {
-                    let live = g.slot(e.index).is_some_and(|s| s.place == at(e.at));
-                    match (&mut run, live) {
-                        (Some((first, run_entries)), true)
-                            if first.saturating_add(
-                                u64::try_from(run_entries.len()).unwrap_or(u64::MAX),
-                            ) == e.index =>
-                        {
-                            run_entries.push((e.term, &e.bytes));
-                        }
-                        (_, true) => {
-                            if let Some((first, entries)) = run.take() {
-                                out.push(Copy::Entries {
-                                    group: *group,
-                                    first,
-                                    entries,
-                                });
-                            }
-                            run = Some((e.index, vec![(e.term, &e.bytes)]));
-                        }
-                        (_, false) => {
-                            if let Some((first, entries)) = run.take() {
-                                out.push(Copy::Entries {
-                                    group: *group,
-                                    first,
-                                    entries,
-                                });
-                            }
-                        }
-                    }
-                }
-                if let Some((first, entries)) = run {
-                    out.push(Copy::Entries {
-                        group: *group,
-                        first,
-                        entries,
-                    });
+                if let Some(g) = state.groups.get(group) {
+                    entry_copies(g, *group, entries, &at, &mut out);
                 }
             }
-            Owned::HardState {
-                at: offset,
-                group,
-                state: hard,
-            } => {
-                let live = state
-                    .groups
-                    .get(group)
-                    .and_then(|g| g.hard)
-                    .is_some_and(|(_, p)| p == at(*offset));
-                if live {
-                    out.push(Copy::Hard {
-                        group: *group,
-                        state: *hard,
-                    });
-                }
-            }
-            Owned::Start {
-                at: offset,
-                group,
-                start,
-            } => {
-                let live = state
-                    .groups
-                    .get(group)
-                    .is_some_and(|g| g.start_at == Some(at(*offset)));
-                if live {
-                    out.push(Copy::Start {
-                        group: *group,
-                        start: *start,
-                    });
-                }
-            }
-            Owned::Proposal { group, proposal } => {
-                let live = state
-                    .groups
-                    .get(group)
-                    .and_then(|g| g.proposals.get(&proposal.index))
-                    .is_some_and(|p| p.place == at(proposal.at));
-                if live {
-                    out.push(Copy::Proposal {
-                        group: *group,
-                        index: proposal.index,
-                        term: proposal.term,
-                        bytes: &proposal.bytes,
-                    });
-                }
-            }
-            Owned::Uncertain {
-                at: offset,
-                group,
-                mark,
-            } => {
-                let live = state
-                    .groups
-                    .get(group)
-                    .and_then(|g| g.uncertain)
-                    .is_some_and(|(_, p)| p == at(*offset));
-                if live {
-                    out.push(Copy::Uncertain {
-                        group: *group,
-                        mark: *mark,
-                    });
-                }
-            }
-            Owned::Damaged { at: offset, group } => {
-                if state.damaged.get(group) == Some(&Some(at(*offset))) {
-                    out.push(Copy::Damaged { group: *group });
-                }
-            }
-            Owned::Removed { .. } => {}
+            other => out.extend(piece_copy(state, other, &at)),
         }
     }
     out
+}
+
+/// The runs of a record's entries that the group still points at, each a copy.
+fn entry_copies<'a>(
+    g: &Group,
+    group: u128,
+    entries: &'a [format::Decoded],
+    at: &impl Fn(usize) -> Place,
+    out: &mut Vec<Copy<'a>>,
+) {
+    let mut run: Run<'_> = None;
+    let flush = |run: &mut Run<'a>, out: &mut Vec<Copy<'a>>| {
+        if let Some((first, entries)) = run.take() {
+            out.push(Copy::Entries {
+                group,
+                first,
+                entries,
+            });
+        }
+    };
+    for e in entries {
+        let live = g.slot(e.index).is_some_and(|s| s.place == at(e.at));
+        if !live {
+            flush(&mut run, out);
+            continue;
+        }
+        let follows = run.as_ref().is_some_and(|(first, held)| {
+            first.saturating_add(u64::try_from(held.len()).unwrap_or(u64::MAX)) == e.index
+        });
+        match (&mut run, follows) {
+            (Some((_, held)), true) => held.push((e.term, &e.bytes)),
+            _ => {
+                flush(&mut run, out);
+                run = Some((e.index, vec![(e.term, &e.bytes)]));
+            }
+        }
+    }
+    flush(&mut run, out);
+}
+
+/// A record other than entries that the state still points at, as a copy.
+fn piece_copy<'a>(
+    state: &State,
+    record: &'a Owned,
+    at: &impl Fn(usize) -> Place,
+) -> Option<Copy<'a>> {
+    let group_of = |group: &u128| state.groups.get(group);
+    match record {
+        Owned::HardState {
+            at: offset,
+            group,
+            state: hard,
+        } => group_of(group)
+            .and_then(|g| g.hard)
+            .is_some_and(|(_, p)| p == at(*offset))
+            .then_some(Copy::Hard {
+                group: *group,
+                state: *hard,
+            }),
+        Owned::Start {
+            at: offset,
+            group,
+            start,
+        } => group_of(group)
+            .is_some_and(|g| g.start_at == Some(at(*offset)))
+            .then_some(Copy::Start {
+                group: *group,
+                start: *start,
+            }),
+        Owned::Proposal { group, proposal } => group_of(group)
+            .and_then(|g| g.proposals.get(&proposal.index))
+            .is_some_and(|p| p.place == at(proposal.at))
+            .then_some(Copy::Proposal {
+                group: *group,
+                index: proposal.index,
+                term: proposal.term,
+                bytes: &proposal.bytes,
+            }),
+        Owned::Uncertain {
+            at: offset,
+            group,
+            mark,
+        } => group_of(group)
+            .and_then(|g| g.uncertain)
+            .is_some_and(|(_, p)| p == at(*offset))
+            .then_some(Copy::Uncertain {
+                group: *group,
+                mark: *mark,
+            }),
+        Owned::Damaged { at: offset, group } => (state.damaged.get(group)
+            == Some(&Some(at(*offset))))
+        .then_some(Copy::Damaged { group: *group }),
+        Owned::Entries { .. } | Owned::Relocated { .. } | Owned::Removed { .. } => None,
+    }
 }
 
 /// Points the state at a relocated piece's new place.
@@ -893,60 +878,83 @@ pub(crate) fn encode(
     update: &Update,
     marks: Marks,
 ) -> Option<Placement> {
-    let mut placement = Placement::default();
-    let mut put = |record: &Record<'_>| {
-        *records = records.checked_add(1)?;
-        format::put(payload, record)
-    };
+    let mut lay = Lay { payload, records };
     if marks.damaged {
-        if let Placed::Record(at) = put(&Record::Damaged { group })? {
-            placement.damaged = Some(at);
-        }
-        return Some(placement);
+        let damaged = lay.put(&Record::Damaged { group })?;
+        return Some(Placement {
+            damaged: Some(damaged),
+            ..Placement::default()
+        });
     }
     if update.remove {
-        put(&Record::Removed { group })?;
-        return Some(placement);
+        lay.put(&Record::Removed { group })?;
+        return Some(Placement::default());
     }
-    if let Some(start) = update.start
-        && let Placed::Record(at) = put(&Record::Start { group, start })?
-    {
-        placement.start = Some(at);
-    }
-    if let Some(e) = &update.entries {
-        *records = records.checked_add(1)?;
-        let entries = e.entries.iter().map(|x| (x.term, x.bytes.as_slice()));
-        placement.entries = Some(format::put_entries(
-            payload, false, group, e.first, entries,
-        )?);
-    }
-    let mut put = |record: &Record<'_>| {
-        *records = records.checked_add(1)?;
-        format::put(payload, record)
+    let start = match update.start {
+        Some(start) => Some(lay.put(&Record::Start { group, start })?),
+        None => None,
     };
-    if let Some(state) = update.hard_state
-        && let Placed::Record(at) = put(&Record::HardState { group, state })?
-    {
-        placement.hard = Some(at);
-    }
-    for (i, p) in update.proposals.iter().enumerate() {
-        if let Placed::Record(at) = put(&Record::Proposal {
-            group,
-            index: p.index,
-            term: p.term,
-            bytes: &p.bytes,
-        })? && i == 0
-        {
-            // The record's start: its fields are where `put` placed it.
-            placement.proposals = at.checked_sub(format::RECORD_HEADER_LEN);
+    let entries = match &update.entries {
+        Some(e) => Some(lay.entries(group, e)?),
+        None => None,
+    };
+    let hard = match update.hard_state {
+        Some(state) => Some(lay.put(&Record::HardState { group, state })?),
+        None => None,
+    };
+    let proposals = lay.proposals(group, &update.proposals)?;
+    let uncertain = match marks.uncertain {
+        Some(mark) => Some(lay.put(&Record::Uncertain { group, mark })?),
+        None => None,
+    };
+    Some(Placement {
+        start,
+        entries,
+        hard,
+        proposals,
+        uncertain,
+        damaged: None,
+    })
+}
+
+/// A payload being laid out, and its count of records.
+struct Lay<'a> {
+    payload: &'a mut Payload,
+    records: &'a mut u32,
+}
+
+impl Lay<'_> {
+    /// Appends a record placed whole, and says where `put` placed it.
+    fn put(&mut self, record: &Record<'_>) -> Option<usize> {
+        *self.records = self.records.checked_add(1)?;
+        match format::put(self.payload, record)? {
+            Placed::Record(at) => Some(at),
+            Placed::Entries(_) => None,
         }
     }
-    if let Some(mark) = marks.uncertain
-        && let Placed::Record(at) = put(&Record::Uncertain { group, mark })?
-    {
-        placement.uncertain = Some(at);
+
+    /// Appends an update's entries record, and says where it starts.
+    fn entries(&mut self, group: u128, e: &crate::Entries) -> Option<usize> {
+        *self.records = self.records.checked_add(1)?;
+        let entries = e.entries.iter().map(|x| (x.term, x.bytes.as_slice()));
+        format::put_entries(self.payload, false, group, e.first, entries)
     }
-    Some(placement)
+
+    /// Appends a record for each proposal, and says where the first record starts: `put`
+    /// places a proposal at its fields, past the record's kind and group.
+    fn proposals(&mut self, group: u128, proposals: &[crate::Proposal]) -> Option<Option<usize>> {
+        let mut first = None;
+        for p in proposals {
+            let at = self.put(&Record::Proposal {
+                group,
+                index: p.index,
+                term: p.term,
+                bytes: &p.bytes,
+            })?;
+            first = first.or(at.checked_sub(format::RECORD_HEADER_LEN));
+        }
+        Some(first)
+    }
 }
 
 /// Makes the durable frame visible: the segment it opened, where swept pieces now are,
@@ -1034,101 +1042,153 @@ fn open_segment(state: &mut State, target: &Target) -> Result<(), LogError> {
     Ok(())
 }
 
+/// Where a piece laid at a payload offset is in the file.
+type Places<'a> = dyn Fn(usize) -> Result<Place, LogError> + 'a;
+
 /// Applies a durable update to the group's state, taking its entries' and proposals' bytes.
 fn apply(
     state: &mut State,
     config: &Config,
     s: &mut Submission,
     placement: &Placement,
-    place: &impl Fn(usize) -> Result<Place, LogError>,
+    place: &Places<'_>,
 ) -> Result<(), LogError> {
     let (group, marks) = (s.group, s.marks);
-    let update = &mut s.update;
-    let live = &mut state.live;
     if marks.damaged {
-        // Whatever the group held is gone; only the fence is live.
-        if let Some(g) = state.groups.remove(&group) {
-            for (p, bytes) in g.pieces() {
-                live.kill(p, bytes);
-            }
-        }
-        if let Some(at) = placement.damaged {
-            let new_at = place(at)?;
-            if let Some(Some(old)) = state.damaged.insert(group, Some(new_at)) {
-                live.kill(old, DAMAGED_BYTES);
-            }
-            live.add(new_at, DAMAGED_BYTES);
-        }
+        return apply_damage(state, group, placement, place);
+    }
+    if s.update.remove {
+        remove(state, group);
         return Ok(());
     }
-    if update.remove {
-        if let Some(Some(at)) = state.damaged.remove(&group) {
-            live.kill(at, DAMAGED_BYTES);
-        }
-        if let Some(g) = state.groups.remove(&group) {
-            for (p, bytes) in g.pieces() {
-                live.kill(p, bytes);
-            }
-        }
-        return Ok(());
-    }
+    let live = &mut state.live;
     let g = state.groups.entry(group).or_insert_with(|| Group {
         cache_from: 1,
         ..Group::default()
     });
-    if let (Some(start), Some(at)) = (update.start, placement.start) {
-        if let Some(old) = g.start_at {
-            live.kill(old, START_BYTES);
+    let update = &mut s.update;
+    apply_start(g, live, update, placement, place)?;
+    apply_entries(g, live, config, update, placement, place)?;
+    reach(g, live)?;
+    apply_hard(g, live, update, placement, place)?;
+    apply_proposals(g, live, update, placement, place)?;
+    apply_mark(g, live, marks, placement, place)
+}
+
+/// Whatever the group held is gone; only the fence is live.
+fn apply_damage(
+    state: &mut State,
+    group: u128,
+    placement: &Placement,
+    place: &Places<'_>,
+) -> Result<(), LogError> {
+    let live = &mut state.live;
+    if let Some(g) = state.groups.remove(&group) {
+        for (p, bytes) in g.pieces() {
+            live.kill(p, bytes);
         }
-        while g.start.index < start.index {
-            let Some(slot) = g.entries.pop_front() else {
-                break;
-            };
-            kill_slot(g, live, &slot);
-            g.start.index = g.start.index.saturating_add(1);
-        }
-        g.start = start;
+    }
+    if let Some(at) = placement.damaged {
         let new_at = place(at)?;
-        g.start_at = Some(new_at);
-        live.add(new_at, START_BYTES);
-        g.cache_from = g.cache_from.max(start.index.saturating_add(1));
-    }
-    if let Some(e) = &mut update.entries {
-        while g.last().is_some_and(|last| last >= e.first) {
-            let Some(slot) = g.entries.pop_back() else {
-                break;
-            };
-            kill_slot(g, live, &slot);
+        if let Some(Some(old)) = state.damaged.insert(group, Some(new_at)) {
+            live.kill(old, DAMAGED_BYTES);
         }
-        let mut at = placement
-            .entries
-            .and_then(|record| record.checked_add(format::ENTRIES_HEADER_LEN));
-        for entry in &mut e.entries {
-            let here = at.ok_or(LogError::Damaged("an offset past usize"))?;
-            at = here
-                .checked_add(format::ENTRY_HEADER_LEN)
-                .and_then(|a| a.checked_add(entry.bytes.len()));
-            let len =
-                u32::try_from(entry.bytes.len()).map_err(|_| LogError::TooLarge(usize::MAX))?;
-            let slot = Slot {
-                term: entry.term,
-                place: place(here)?,
-                len,
-                cached: Some(std::mem::take(&mut entry.bytes)),
-            };
-            live.add(slot.place, entry_bytes(len));
-            g.bytes = g.bytes.saturating_add(u64::from(len));
-            g.cached = g.cached.saturating_add(u64::from(len));
-            g.entries.push_back(slot);
-        }
-        g.cache_from = g
-            .cache_from
-            .min(e.first)
-            .max(g.start.index.saturating_add(1));
-        evict(g, config.group_cache);
+        live.add(new_at, DAMAGED_BYTES);
     }
-    // What the log has reached, by entries or by its start, is no longer a proposal
-    // (07 §1.4), and no longer uncertain once it holds what the mark covers.
+    Ok(())
+}
+
+/// Every record of the group dies, its fence too.
+fn remove(state: &mut State, group: u128) {
+    let live = &mut state.live;
+    if let Some(Some(at)) = state.damaged.remove(&group) {
+        live.kill(at, DAMAGED_BYTES);
+    }
+    if let Some(g) = state.groups.remove(&group) {
+        for (p, bytes) in g.pieces() {
+            live.kill(p, bytes);
+        }
+    }
+}
+
+/// A new start drops the entries before it.
+fn apply_start(
+    g: &mut Group,
+    live: &mut state::Live,
+    update: &Update,
+    placement: &Placement,
+    place: &Places<'_>,
+) -> Result<(), LogError> {
+    let (Some(start), Some(at)) = (update.start, placement.start) else {
+        return Ok(());
+    };
+    if let Some(old) = g.start_at {
+        live.kill(old, START_BYTES);
+    }
+    while g.start.index < start.index {
+        let Some(slot) = g.entries.pop_front() else {
+            break;
+        };
+        kill_slot(g, live, &slot);
+        g.start.index = g.start.index.saturating_add(1);
+    }
+    g.start = start;
+    let new_at = place(at)?;
+    g.start_at = Some(new_at);
+    live.add(new_at, START_BYTES);
+    g.cache_from = g.cache_from.max(start.index.saturating_add(1));
+    Ok(())
+}
+
+/// Entries replace the group's suffix from their first; their bytes are kept while recent.
+fn apply_entries(
+    g: &mut Group,
+    live: &mut state::Live,
+    config: &Config,
+    update: &mut Update,
+    placement: &Placement,
+    place: &Places<'_>,
+) -> Result<(), LogError> {
+    let Some(e) = &mut update.entries else {
+        return Ok(());
+    };
+    while g.last().is_some_and(|last| last >= e.first) {
+        let Some(slot) = g.entries.pop_back() else {
+            break;
+        };
+        kill_slot(g, live, &slot);
+    }
+    let mut at = placement
+        .entries
+        .and_then(|record| record.checked_add(format::ENTRIES_HEADER_LEN));
+    for entry in &mut e.entries {
+        let here = at.ok_or(LogError::Damaged("an offset past usize"))?;
+        at = here
+            .checked_add(format::ENTRY_HEADER_LEN)
+            .and_then(|a| a.checked_add(entry.bytes.len()));
+        let len = u32::try_from(entry.bytes.len()).map_err(|_| LogError::TooLarge(usize::MAX))?;
+        let slot = Slot {
+            term: entry.term,
+            place: place(here)?,
+            len,
+            cached: Some(std::mem::take(&mut entry.bytes)),
+        };
+        live.add(slot.place, entry_bytes(len));
+        g.bytes = g.bytes.saturating_add(u64::from(len));
+        g.cached = g.cached.saturating_add(u64::from(len));
+        g.entries.push_back(slot);
+    }
+    g.cache_from = g
+        .cache_from
+        .min(e.first)
+        .max(g.start.index.saturating_add(1));
+    evict(g, config.group_cache);
+    Ok(())
+}
+
+/// What the log has reached, by entries or by its start, is no longer a proposal (07 §1.4),
+/// and no longer uncertain once it holds what the mark covers.
+fn reach(g: &mut Group, live: &mut state::Live) -> Result<(), LogError> {
     let last = g.last().ok_or(LogError::Damaged("an index past u64"))?;
     if let Some((mark, at)) = g.uncertain
         && resolves(mark, last, g.last_term())
@@ -1136,20 +1196,43 @@ fn apply(
         live.kill(at, UNCERTAIN_BYTES);
         g.uncertain = None;
     }
-    let reached: Vec<u64> = g.proposals.range(..=last).map(|(&i, _)| i).collect();
-    for index in reached {
-        if let Some(p) = g.proposals.remove(&index) {
-            live.kill(p.place, proposal_bytes(&p.bytes));
+    while let Some(entry) = g.proposals.first_entry() {
+        if *entry.key() > last {
+            break;
         }
+        let p = entry.remove();
+        live.kill(p.place, proposal_bytes(&p.bytes));
     }
-    if let (Some(hard), Some(at)) = (update.hard_state, placement.hard) {
-        if let Some((_, old)) = g.hard {
-            live.kill(old, HARD_STATE_BYTES);
-        }
-        let new_at = place(at)?;
-        g.hard = Some((hard, new_at));
-        live.add(new_at, HARD_STATE_BYTES);
+    Ok(())
+}
+
+fn apply_hard(
+    g: &mut Group,
+    live: &mut state::Live,
+    update: &Update,
+    placement: &Placement,
+    place: &Places<'_>,
+) -> Result<(), LogError> {
+    let (Some(hard), Some(at)) = (update.hard_state, placement.hard) else {
+        return Ok(());
+    };
+    if let Some((_, old)) = g.hard {
+        live.kill(old, HARD_STATE_BYTES);
     }
+    let new_at = place(at)?;
+    g.hard = Some((hard, new_at));
+    live.add(new_at, HARD_STATE_BYTES);
+    Ok(())
+}
+
+/// Each proposal's record follows the one before; its bytes move into the group.
+fn apply_proposals(
+    g: &mut Group,
+    live: &mut state::Live,
+    update: &mut Update,
+    placement: &Placement,
+    place: &Places<'_>,
+) -> Result<(), LogError> {
     let mut record = placement.proposals;
     for p in &mut update.proposals {
         let start = record.ok_or(LogError::Damaged("an offset past usize"))?;
@@ -1162,27 +1245,35 @@ fn apply(
             .ok_or(LogError::Damaged("an offset past usize"))?;
         let new_at = place(at)?;
         let bytes = proposal_bytes(&p.bytes);
-        let old = g.proposals.insert(
-            p.index,
-            state::Proposal {
-                term: p.term,
-                place: new_at,
-                bytes: std::mem::take(&mut p.bytes),
-            },
-        );
-        if let Some(old) = old {
+        let proposal = state::Proposal {
+            term: p.term,
+            place: new_at,
+            bytes: std::mem::take(&mut p.bytes),
+        };
+        if let Some(old) = g.proposals.insert(p.index, proposal) {
             live.kill(old.place, proposal_bytes(&old.bytes));
         }
         live.add(new_at, bytes);
     }
-    if let (Some(mark), Some(at)) = (marks.uncertain, placement.uncertain) {
-        if let Some((_, old)) = g.uncertain {
-            live.kill(old, UNCERTAIN_BYTES);
-        }
-        let new_at = place(at)?;
-        g.uncertain = Some((mark, new_at));
-        live.add(new_at, UNCERTAIN_BYTES);
+    Ok(())
+}
+
+fn apply_mark(
+    g: &mut Group,
+    live: &mut state::Live,
+    marks: Marks,
+    placement: &Placement,
+    place: &Places<'_>,
+) -> Result<(), LogError> {
+    let (Some(mark), Some(at)) = (marks.uncertain, placement.uncertain) else {
+        return Ok(());
+    };
+    if let Some((_, old)) = g.uncertain {
+        live.kill(old, UNCERTAIN_BYTES);
     }
+    let new_at = place(at)?;
+    g.uncertain = Some((mark, new_at));
+    live.add(new_at, UNCERTAIN_BYTES);
     Ok(())
 }
 

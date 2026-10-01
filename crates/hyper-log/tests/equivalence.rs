@@ -21,7 +21,8 @@
     clippy::indexing_slicing,
     clippy::arithmetic_side_effects,
     clippy::disallowed_macros,
-    clippy::cast_possible_truncation
+    clippy::cast_possible_truncation,
+    clippy::cognitive_complexity
 )]
 
 use std::fmt::Write as _;
@@ -33,7 +34,7 @@ use hyper_log::{Config, Entries, Entry, HardState, Log, LogError, Proposal, Star
 mod common;
 use common::Holder;
 
-const ID: u128 = 0x6571_7569_7661_6c65_6e63_65;
+const ID: u128 = 0x0065_7175_6976_616c_656e_6365;
 const BLOCK: usize = 4096;
 const SEGMENT: u64 = 16 * BLOCK as u64;
 const GROUPS: u64 = 6;
@@ -318,7 +319,7 @@ fn canonical(mut image: Vec<u8>) -> Vec<u8> {
             let valid = hyper_log::format::SegmentHeader::decode(block).is_some();
             let incarnation = u64::from_le_bytes(block[24..32].try_into().unwrap());
             image[at + 32..at + 40].copy_from_slice(&incarnation.to_le_bytes());
-            let crc = crc32c::crc32c(&image[at..at + 48]) ^ u32::from(!valid) * u32::MAX;
+            let crc = crc32c::crc32c(&image[at..at + 48]) ^ (u32::from(!valid) * u32::MAX);
             image[at + 48..at + 52].copy_from_slice(&crc.to_le_bytes());
         } else if block.starts_with(b"MNLF") && block[4] == 3 {
             let header = hyper_log::format::FrameHeader::decode(block).unwrap();
@@ -342,7 +343,7 @@ fn last_frame(image: &[u8]) -> Option<u64> {
     let mut at = SEGMENT as usize;
     while at + BLOCK <= image.len() {
         if let Some(h) = hyper_log::format::FrameHeader::decode(&image[at..]) {
-            let end = at + h.frame_len().unwrap();
+            let end = at + h.frame_len()?;
             if end <= image.len()
                 && h.verifies(&image[at..end])
                 && best.is_none_or(|(s, _)| h.sequence > s)

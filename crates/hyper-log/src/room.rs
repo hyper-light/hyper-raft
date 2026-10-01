@@ -258,10 +258,10 @@ mod tests {
         }
         let mut told = 0usize;
         let mut holder = W as u128;
-        for k in 0..K {
+        for (k, &slot) in slots.iter().enumerate().take(K) {
             let mut admitted = Vec::new();
             room.release(holder, 1, &mut admitted);
-            assert_eq!(admitted, vec![slots[k]], "room went out of arrival order");
+            assert_eq!(admitted, vec![slot], "room went out of arrival order");
             told += admitted.len();
             holder = k as u128;
             assert_eq!(told, k + 1, "an answer woke more than it admitted");

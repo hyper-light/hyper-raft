@@ -10,8 +10,12 @@
 
 use crate::codec::{Reader, Writer};
 
+/// The first bytes of a segment's header: mantle-log's, kept so that hyper-log reads the files
+/// mantle wrote and writes the files mantle reads (`ORIGIN.md`).
 pub const SEGMENT_MAGIC: [u8; 4] = *b"MNLS";
+/// The first bytes of a frame's header, mantle-log's.
 pub const FRAME_MAGIC: [u8; 4] = *b"MNLF";
+/// The first bytes of a persist record, mantle-log's.
 pub const PERSIST_MAGIC: [u8; 4] = *b"MNLP";
 /// 2: the file begins with the persist area, and records include `Uncertain`. 3: a frame's
 /// confirmation is its own persist record rewritten in its own slot, and a record of a frame's
@@ -21,20 +25,31 @@ pub const FORMAT: u8 = 3;
 
 /// Bytes of a segment header before its padding.
 pub const SEGMENT_HEADER_LEN: usize = 52;
-/// Bytes of a frame header; the payload follows.
+/// Bytes of a frame header; the payload follows: magic 4, format 1, padding 3, log 16,
+/// incarnation, nonce, sequence and tail 8 each, payload length and record count 4 each, CRC 4.
 pub const FRAME_HEADER_LEN: usize = 68;
+/// [`FRAME_HEADER_LEN`] as a file offset.
 pub const FRAME_HEADER_BYTES: u64 = 68;
 /// Bytes of an entry before its payload: term, length, CRC.
 pub const ENTRY_HEADER_LEN: usize = 16;
+/// [`ENTRY_HEADER_LEN`] as a file offset.
 pub const ENTRY_HEADER_BYTES: u64 = 16;
 
+/// A record's kind, its first byte: entries from an index on.
 const ENTRIES: u8 = 1;
+/// Copies of entries a sweep moved.
 const RELOCATED: u8 = 2;
+/// A hard state.
 const HARD_STATE: u8 = 3;
+/// Where the group's log starts.
 const START: u8 = 4;
+/// A fast-track proposal.
 const PROPOSAL: u8 = 5;
+/// The group left the device.
 const REMOVED: u8 = 6;
+/// Entries the group may lack.
 const UNCERTAIN: u8 = 7;
+/// The group's acknowledged records are damaged.
 const DAMAGED: u8 = 8;
 
 /// Bytes of a persist record before its groups: magic, format, padding, the log's ID, the
@@ -47,17 +62,21 @@ pub const PERSIST_GROUP_LEN: usize = 97;
 /// A segment's header.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SegmentHeader {
+    /// The log's ID.
     pub log: u128,
+    /// The segment's place in the log's order of segments.
     pub incarnation: u64,
     /// Random, drawn when the segment opens, and carried by each of its frames. An opening
     /// whose header never became durable may leave a frame behind with an incarnation a
     /// later opening takes again; the nonce keeps that frame from ever reading as the later
     /// segment's.
     pub nonce: u64,
+    /// Bytes of each of the log's segments.
     pub segment_bytes: u64,
 }
 
 impl SegmentHeader {
+    /// The header's bytes, checksummed.
     pub fn encode(&self) -> Vec<u8> {
         let mut w = Writer::with_capacity(SEGMENT_HEADER_LEN);
         w.bytes(&SEGMENT_MAGIC);
@@ -96,16 +115,21 @@ impl SegmentHeader {
 /// A frame's header: one group-commit batch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FrameHeader {
+    /// The log's ID.
     pub log: u128,
     /// The incarnation and nonce of the segment the frame is in.
     pub incarnation: u64,
+    /// See [`FrameHeader::incarnation`].
     pub nonce: u64,
     /// Consecutive over the log's life: one a batch.
     pub sequence: u64,
     /// The incarnation of the oldest live segment when the frame was written.
     pub tail: u64,
+    /// Bytes of the payload.
     pub payload_len: u32,
+    /// Records in the payload.
     pub records: u32,
+    /// CRC-32C of the header before it and the payload.
     pub crc: u32,
 }
 
@@ -259,15 +283,20 @@ impl FrameHeader {
 /// A Raft hard state.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct HardState {
+    /// The current term.
     pub term: u64,
+    /// Whom the member voted for in it; 0 for no one.
     pub vote: u64,
+    /// The highest entry known committed.
     pub commit: u64,
 }
 
 /// Where a group's log starts: after `index`, whose term is `term`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Start {
+    /// The index the log starts after.
     pub index: u64,
+    /// That index's term.
     pub term: u64,
 }
 
@@ -276,44 +305,66 @@ pub struct Start {
 pub enum Record<'a> {
     /// Entries from `first` on, replacing any the group holds at or after it.
     Entries {
+        /// The group the record is of.
         group: u128,
+        /// The first entry's index.
         first: u64,
+        /// The entries: each one's term and bytes.
         entries: &'a [(u64, &'a [u8])],
     },
     /// Copies of entries the group holds, replacing none past them.
     Relocated {
+        /// The group the record is of.
         group: u128,
+        /// The first entry's index.
         first: u64,
+        /// The entries: each one's term and bytes.
         entries: &'a [(u64, &'a [u8])],
     },
+    /// A group's hard state; the latest wins.
     HardState {
+        /// The group the record is of.
         group: u128,
+        /// The hard state.
         state: HardState,
     },
+    /// Where a group's log starts.
     Start {
+        /// The group the record is of.
         group: u128,
+        /// Where the group's log starts.
         start: Start,
     },
+    /// An entry the group approved by itself on the fast track.
     Proposal {
+        /// The group the record is of.
         group: u128,
+        /// The index.
         index: u64,
+        /// Its term.
         term: u64,
+        /// Its bytes.
         bytes: &'a [u8],
     },
+    /// The group left this device: every record of it is dead.
     Removed {
+        /// The group the record is of.
         group: u128,
     },
     /// The group's log may lack entries through `mark.index`, of terms up to `mark.term`,
     /// that a frame no longer readable held: until it holds them again, or an entry of a
     /// later term, its replica takes no part in elections (§6).
     Uncertain {
+        /// The group the record is of.
         group: u128,
+        /// The mark: entries through its index, of terms up to its term.
         mark: Start,
     },
     /// The group's acknowledged records are damaged: until its removal the log serves it to
     /// no one, and its replica is rebuilt from its peers (§6). Whatever the group held before
     /// is gone.
     Damaged {
+        /// The group the record is of.
         group: u128,
     },
 }
@@ -486,50 +537,83 @@ pub fn encoded_len(record: &Record<'_>) -> Option<usize> {
 /// An entry or proposal as decoded: where it starts in the payload, and its fields.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Decoded {
+    /// Where it starts in the payload, past its record's kind and group.
     pub at: usize,
+    /// Its index.
     pub index: u64,
+    /// Its term.
     pub term: u64,
+    /// Its CRC-32C, which held.
     pub crc: u32,
+    /// Its bytes.
     pub bytes: Vec<u8>,
 }
 
 /// A record as decoded from a verified frame's payload.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Owned {
+    /// Entries from `first` on, replacing any the group holds at or after it.
     Entries {
+        /// The group the record is of.
         group: u128,
+        /// The first entry's index.
         first: u64,
+        /// The entries: each one's term and bytes.
         entries: Vec<Decoded>,
     },
+    /// Copies of entries the group holds, replacing none past them.
     Relocated {
+        /// The group the record is of.
         group: u128,
+        /// The first entry's index.
         first: u64,
+        /// The entries: each one's term and bytes.
         entries: Vec<Decoded>,
     },
+    /// A group's hard state; the latest wins.
     HardState {
+        /// Where the record starts in the payload.
         at: usize,
+        /// The group the record is of.
         group: u128,
+        /// The hard state.
         state: HardState,
     },
+    /// Where a group's log starts.
     Start {
+        /// Where the record starts in the payload.
         at: usize,
+        /// The group the record is of.
         group: u128,
+        /// Where the group's log starts.
         start: Start,
     },
+    /// An entry the group approved by itself on the fast track.
     Proposal {
+        /// The group the record is of.
         group: u128,
+        /// The proposal, as decoded.
         proposal: Decoded,
     },
+    /// The group left this device: every record of it is dead.
     Removed {
+        /// The group the record is of.
         group: u128,
     },
+    /// Entries the group's log may lack.
     Uncertain {
+        /// Where the record starts in the payload.
         at: usize,
+        /// The group the record is of.
         group: u128,
+        /// The mark: entries through its index, of terms up to its term.
         mark: Start,
     },
+    /// The group's acknowledged records are damaged.
     Damaged {
+        /// Where the record starts in the payload.
         at: usize,
+        /// The group the record is of.
         group: u128,
     },
 }
@@ -543,100 +627,115 @@ pub fn records(payload: &[u8], count: u32) -> Option<Vec<Owned>> {
         let at = r.position();
         let kind = r.u8()?;
         let group = r.u128()?;
-        let record = match kind {
-            ENTRIES | RELOCATED => {
-                let first = r.u64()?;
-                let n = r.u32()?;
-                // Each entry takes its header at least: a count the payload cannot hold is
-                // corrupt before anything is allocated for it.
-                if usize::try_from(n).ok()? > r.remaining() / ENTRY_HEADER_LEN {
-                    return None;
-                }
-                let mut entries = Vec::with_capacity(usize::try_from(n).ok()?);
-                for i in 0..u64::from(n) {
-                    let index = first.checked_add(i)?;
-                    let at = r.position();
-                    let term = r.u64()?;
-                    let (crc, bytes) = take_bytes(&mut r)?;
-                    if entry_crc(group, index, term, bytes) != crc {
-                        return None;
-                    }
-                    entries.push(Decoded {
-                        at,
-                        index,
-                        term,
-                        crc,
-                        bytes: bytes.to_vec(),
-                    });
-                }
-                if kind == ENTRIES {
-                    Owned::Entries {
-                        group,
-                        first,
-                        entries,
-                    }
-                } else {
-                    Owned::Relocated {
-                        group,
-                        first,
-                        entries,
-                    }
-                }
-            }
-            HARD_STATE => Owned::HardState {
-                at,
-                group,
-                state: HardState {
-                    term: r.u64()?,
-                    vote: r.u64()?,
-                    commit: r.u64()?,
-                },
-            },
-            START => Owned::Start {
-                at,
-                group,
-                start: Start {
-                    index: r.u64()?,
-                    term: r.u64()?,
-                },
-            },
-            PROPOSAL => {
-                let at = r.position();
-                let index = r.u64()?;
-                let term = r.u64()?;
-                let (crc, bytes) = take_bytes(&mut r)?;
-                if entry_crc(group, index, term, bytes) != crc {
-                    return None;
-                }
-                Owned::Proposal {
-                    group,
-                    proposal: Decoded {
-                        at,
-                        index,
-                        term,
-                        crc,
-                        bytes: bytes.to_vec(),
-                    },
-                }
-            }
-            REMOVED => Owned::Removed { group },
-            UNCERTAIN => Owned::Uncertain {
-                at,
-                group,
-                mark: Start {
-                    index: r.u64()?,
-                    term: r.u64()?,
-                },
-            },
-            DAMAGED => Owned::Damaged { at, group },
-            _ => return None,
-        };
-        out.push(record);
+        out.push(record(&mut r, kind, group, at)?);
     }
     if r.remaining() != 0 {
         return None;
     }
     Some(out)
+}
+
+/// The fields of one record of `kind` and `group` that starts at `at`.
+fn record(r: &mut Reader<'_>, kind: u8, group: u128, at: usize) -> Option<Owned> {
+    Some(match kind {
+        ENTRIES | RELOCATED => {
+            let first = r.u64()?;
+            let entries = decoded_entries(r, group, first)?;
+            if kind == ENTRIES {
+                Owned::Entries {
+                    group,
+                    first,
+                    entries,
+                }
+            } else {
+                Owned::Relocated {
+                    group,
+                    first,
+                    entries,
+                }
+            }
+        }
+        HARD_STATE => Owned::HardState {
+            at,
+            group,
+            state: HardState {
+                term: r.u64()?,
+                vote: r.u64()?,
+                commit: r.u64()?,
+            },
+        },
+        START => Owned::Start {
+            at,
+            group,
+            start: start(r)?,
+        },
+        PROPOSAL => Owned::Proposal {
+            group,
+            proposal: proposal(r, group)?,
+        },
+        REMOVED => Owned::Removed { group },
+        UNCERTAIN => Owned::Uncertain {
+            at,
+            group,
+            mark: start(r)?,
+        },
+        DAMAGED => Owned::Damaged { at, group },
+        _ => return None,
+    })
+}
+
+fn start(r: &mut Reader<'_>) -> Option<Start> {
+    Some(Start {
+        index: r.u64()?,
+        term: r.u64()?,
+    })
+}
+
+/// An entries record's count and entries, each verified by its CRC as `group`'s entry of its
+/// index.
+fn decoded_entries(r: &mut Reader<'_>, group: u128, first: u64) -> Option<Vec<Decoded>> {
+    let n = r.u32()?;
+    // Each entry takes its header at least: a count the payload cannot hold is corrupt before
+    // anything is allocated for it.
+    if usize::try_from(n).ok()? > r.remaining() / ENTRY_HEADER_LEN {
+        return None;
+    }
+    let mut entries = Vec::with_capacity(usize::try_from(n).ok()?);
+    for i in 0..u64::from(n) {
+        let index = first.checked_add(i)?;
+        let at = r.position();
+        let term = r.u64()?;
+        let (crc, bytes) = take_bytes(r)?;
+        if entry_crc(group, index, term, bytes) != crc {
+            return None;
+        }
+        entries.push(Decoded {
+            at,
+            index,
+            term,
+            crc,
+            bytes: bytes.to_vec(),
+        });
+    }
+    Some(entries)
+}
+
+/// A proposal record's fields, verified by its CRC.
+fn proposal(r: &mut Reader<'_>, group: u128) -> Option<Decoded> {
+    let at = r.position();
+    let index = r.u64()?;
+    let term = r.u64()?;
+    let (crc, bytes) = take_bytes(r)?;
+    if entry_crc(group, index, term, bytes) != crc {
+        return None;
+    }
+    Some(Decoded {
+        at,
+        index,
+        term,
+        crc,
+        bytes: bytes.to_vec(),
+    })
 }
 
 /// An entry's length, CRC and bytes.
@@ -664,8 +763,11 @@ pub fn entry_slice(bytes: &[u8], group: u128, index: u64) -> Option<(u64, &[u8])
 /// `term` (0 when there are none, and the frame only cut the group's log back).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Written {
+    /// The first entry's index.
     pub first: u64,
+    /// Entries written.
     pub count: u64,
+    /// The last one's term.
     pub term: u64,
 }
 
@@ -673,11 +775,17 @@ pub struct Written {
 /// recovery can restore it when the frame no longer reads (docs/design/raft-log.md §6).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Persisted {
+    /// The group.
     pub group: u128,
+    /// The hard state the frame wrote.
     pub hard_state: Option<HardState>,
+    /// The start the frame wrote.
     pub start: Option<Start>,
+    /// The entries the frame wrote.
     pub entries: Option<Written>,
+    /// The uncertainty mark the frame wrote.
     pub uncertain: Option<Start>,
+    /// The frame removed the group.
     pub removed: bool,
     /// The frame held proposals, which a persist record does not restore.
     pub proposals: bool,
@@ -689,24 +797,78 @@ pub struct Persisted {
 /// frame of `confirms` was flushed.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Persist {
+    /// The log's ID.
     pub log: u128,
+    /// The frame's sequence.
     pub sequence: u64,
     /// The last frame known flushed when this record was written: the frame before this one,
     /// which was written only after that one's flush, or, in a confirmation, this one.
     pub confirms: u64,
+    /// What the frame wrote, group by group.
     pub groups: Vec<Persisted>,
 }
 
+/// A persist row's flag: it carries a hard state.
 const HAS_HARD_STATE: u8 = 1;
+/// It carries a start.
 const HAS_START: u8 = 2;
+/// It carries entries written.
 const HAS_ENTRIES: u8 = 4;
+/// It carries an uncertainty mark.
 const HAS_UNCERTAIN: u8 = 8;
+/// The frame removed the group.
 const IS_REMOVED: u8 = 16;
+/// The frame held proposals of the group.
 const HAS_PROPOSALS: u8 = 32;
+/// The frame fenced the group as damaged.
 const IS_DAMAGED: u8 = 64;
 
 fn when<T>(set: bool, value: T) -> Option<T> {
     if set { Some(value) } else { None }
+}
+
+/// A persist record's header, if it has the magic and format: its log, sequence, the sequence it
+/// confirms, and its count of groups.
+fn persist_header(bytes: &[u8]) -> Option<(u128, u64, u64, usize)> {
+    let mut r = Reader::new(bytes.get(..PERSIST_HEADER_LEN)?);
+    if r.take(4)? != PERSIST_MAGIC || r.u8()? != FORMAT {
+        return None;
+    }
+    r.take(3)?;
+    let log = r.u128()?;
+    let sequence = r.u64()?;
+    let confirms = r.u64()?;
+    let count = usize::try_from(r.u32()?).ok()?;
+    Some((log, sequence, confirms, count))
+}
+
+/// One group's row of a persist record.
+fn persisted(r: &mut Reader<'_>) -> Option<Persisted> {
+    let group = r.u128()?;
+    let flags = r.u8()?;
+    let hard = HardState {
+        term: r.u64()?,
+        vote: r.u64()?,
+        commit: r.u64()?,
+    };
+    let start = start(r)?;
+    let entries = Written {
+        first: r.u64()?,
+        count: r.u64()?,
+        term: r.u64()?,
+    };
+    let uncertain = self::start(r)?;
+    let has = |flag: u8| flags & flag != 0;
+    Some(Persisted {
+        group,
+        hard_state: when(has(HAS_HARD_STATE), hard),
+        start: when(has(HAS_START), start),
+        entries: when(has(HAS_ENTRIES), entries),
+        uncertain: when(has(HAS_UNCERTAIN), uncertain),
+        removed: has(IS_REMOVED),
+        proposals: has(HAS_PROPOSALS),
+        damaged: has(IS_DAMAGED),
+    })
 }
 
 /// Bytes of a persist record of `groups` groups, with its CRC.
@@ -718,6 +880,7 @@ pub fn persist_len(groups: usize) -> Option<usize> {
 }
 
 impl Persist {
+    /// The record's bytes, checksummed whole; `None` past `u32` groups.
     pub fn encode(&self) -> Option<Vec<u8>> {
         let mut w = Writer::with_capacity(persist_len(self.groups.len())?);
         self.encode_into(&mut w)?;
@@ -773,15 +936,7 @@ impl Persist {
 
     /// The persist record at the start of `bytes`, if it is one and its checksum holds.
     pub fn decode(bytes: &[u8]) -> Option<Self> {
-        let mut r = Reader::new(bytes.get(..PERSIST_HEADER_LEN)?);
-        if r.take(4)? != PERSIST_MAGIC || r.u8()? != FORMAT {
-            return None;
-        }
-        r.take(3)?;
-        let log = r.u128()?;
-        let sequence = r.u64()?;
-        let confirms = r.u64()?;
-        let count = usize::try_from(r.u32()?).ok()?;
+        let (log, sequence, confirms, count) = persist_header(bytes)?;
         let len = persist_len(count)?;
         let whole = bytes.get(..len)?;
         let (body, crc) = whole.split_at(len.checked_sub(4)?);
@@ -791,37 +946,7 @@ impl Persist {
         let mut r = Reader::new(body.get(PERSIST_HEADER_LEN..)?);
         let mut groups = Vec::with_capacity(count);
         for _ in 0..count {
-            let group = r.u128()?;
-            let flags = r.u8()?;
-            let hard = HardState {
-                term: r.u64()?,
-                vote: r.u64()?,
-                commit: r.u64()?,
-            };
-            let start = Start {
-                index: r.u64()?,
-                term: r.u64()?,
-            };
-            let entries = Written {
-                first: r.u64()?,
-                count: r.u64()?,
-                term: r.u64()?,
-            };
-            let uncertain = Start {
-                index: r.u64()?,
-                term: r.u64()?,
-            };
-            let has = |flag: u8| flags & flag != 0;
-            groups.push(Persisted {
-                group,
-                hard_state: when(has(HAS_HARD_STATE), hard),
-                start: when(has(HAS_START), start),
-                entries: when(has(HAS_ENTRIES), entries),
-                uncertain: when(has(HAS_UNCERTAIN), uncertain),
-                removed: has(IS_REMOVED),
-                proposals: has(HAS_PROPOSALS),
-                damaged: has(IS_DAMAGED),
-            });
+            groups.push(persisted(&mut r)?);
         }
         Some(Self {
             log,

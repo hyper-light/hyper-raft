@@ -20,11 +20,10 @@
         clippy::panic,
         clippy::indexing_slicing,
         clippy::arithmetic_side_effects,
-        clippy::disallowed_macros
+        clippy::disallowed_macros,
+        clippy::cognitive_complexity
     )
 )]
-#![allow(missing_docs)]
-
 pub mod codec;
 mod device;
 mod error;
@@ -90,22 +89,29 @@ pub enum Waits {
 /// Entries to write from `first` on, replacing any the group holds at or after it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Entries {
+    /// The first entry's index.
     pub first: u64,
+    /// The entries, from `first` on; none says only where the group's entries end.
     pub entries: Vec<Entry>,
 }
 
 /// One entry: its term and its bytes, which the log takes and keeps while the entry is recent.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Entry {
+    /// The entry's term.
     pub term: u64,
+    /// Its bytes.
     pub bytes: Vec<u8>,
 }
 
 /// An entry the replica approved by itself on the fast track (07 §1.4).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Proposal {
+    /// Its index.
     pub index: u64,
+    /// Its term.
     pub term: u64,
+    /// Its bytes.
     pub bytes: Vec<u8>,
 }
 
@@ -115,8 +121,11 @@ pub struct Update {
     /// The log now starts after this: the engine made the entries before it durable, or a
     /// snapshot was installed there.
     pub start: Option<Start>,
+    /// Entries from an index on, replacing any the group holds at or after it.
     pub entries: Option<Entries>,
+    /// The hard state; the latest written wins.
     pub hard_state: Option<HardState>,
+    /// Entries approved on the fast track, held until the log reaches them.
     pub proposals: Vec<Proposal>,
     /// The replica left this device: every record of the group is dead. Nothing else may
     /// come with it.
@@ -131,6 +140,7 @@ pub struct Update {
 pub enum Class {
     /// A replica whose callers wait on the write: a metadata range's ready.
     Latency,
+    /// What a submission is unless it says otherwise.
     #[default]
     Normal,
     /// Work no caller waits on: a compaction's start, a rebuild's catch-up.
@@ -140,10 +150,13 @@ pub enum Class {
 /// A group's durable state, as a Raft core's storage reads it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct View {
+    /// Where the group's log starts.
     pub start: Start,
     /// The last entry's index, the start's when none is held.
     pub last: u64,
+    /// The group's hard state, if it wrote one.
     pub hard_state: Option<HardState>,
+    /// Its proposals the log has not reached.
     pub proposals: Vec<Proposal>,
     /// Entries the log may lack, through this mark's index and of terms up to its term,
     /// that a frame no longer readable held (mantle docs/design/raft-log.md §6). Until the log
@@ -272,9 +285,20 @@ pub(crate) fn frame_room(config: &Config, align: Alignment) -> Result<usize, Log
 /// law they add only waiting [research/11 §4, §5.2].
 const PIPELINE_FRAMES: u64 = 3;
 
+/// What starting a log needs besides its file and its state.
+struct Prepared {
+    p: Params,
+    room: room::Room,
+    /// The owner's first batch: the restore of a lost frame, if any.
+    first: Vec<Submission>,
+    /// The handles that answer the first batch.
+    pending: Vec<Pending>,
+}
+
 /// A log the file could not be made into, and the file, given back where the log has it.
 #[derive(Debug)]
 pub struct Refused<F> {
+    /// Why.
     pub error: LogError,
     /// The file, unless a thread of the log that held it ended without giving it back.
     pub file: Option<F>,
@@ -348,9 +372,9 @@ impl<F: BlockFile + 'static> Log<F> {
         restores: Vec<recover::Restore>,
     ) -> Result<(Self, Vec<Pending>), Refused<F>> {
         match Self::prepare(file.alignment(), config, id, restores) {
-            Ok((p, room, first, pending)) => {
-                let log = Self::spawn(file, p, state, room, first)?;
-                Ok((log, pending))
+            Ok(prepared) => {
+                let log = Self::spawn(file, prepared.p, state, prepared.room, prepared.first)?;
+                Ok((log, prepared.pending))
             }
             Err(error) => Err(Refused::with(error, file)),
         }
@@ -358,16 +382,12 @@ impl<F: BlockFile + 'static> Log<F> {
 
     /// The log's parameters, its queue's room, and its first batch with the handles that
     /// answer it.
-    #[expect(
-        clippy::type_complexity,
-        reason = "the four parts start() hands on, once"
-    )]
     fn prepare(
         align: Alignment,
         config: Config,
         id: u128,
         restores: Vec<recover::Restore>,
-    ) -> Result<(Params, room::Room, Vec<Submission>, Vec<Pending>), LogError> {
+    ) -> Result<Prepared, LogError> {
         let room_bytes = frame_room(&config, align)?;
         let queue_bytes = writer::charge(room_bytes)
             .and_then(|largest| largest.checked_mul(PIPELINE_FRAMES))
@@ -415,7 +435,12 @@ impl<F: BlockFile + 'static> Log<F> {
                 ticket: Ticket::new(reply, None),
             });
         }
-        Ok((p, room, first, pending))
+        Ok(Prepared {
+            p,
+            room,
+            first,
+            pending,
+        })
     }
 
     /// Starts the device thread and hands it the file once it runs, then the owner: a thread the

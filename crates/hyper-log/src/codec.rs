@@ -21,30 +21,37 @@ impl Writer {
         Self { buf }
     }
 
+    /// Appends a byte.
     pub fn u8(&mut self, v: u8) {
         self.buf.push(v);
     }
 
+    /// Appends a `u32`, little-endian.
     pub fn u32(&mut self, v: u32) {
         self.buf.extend_from_slice(&v.to_le_bytes());
     }
 
+    /// Appends a `u64`, little-endian.
     pub fn u64(&mut self, v: u64) {
         self.buf.extend_from_slice(&v.to_le_bytes());
     }
 
+    /// Appends a `u128`, little-endian.
     pub fn u128(&mut self, v: u128) {
         self.buf.extend_from_slice(&v.to_le_bytes());
     }
 
+    /// Appends `v` as it is.
     pub fn bytes(&mut self, v: &[u8]) {
         self.buf.extend_from_slice(v);
     }
 
+    /// Appends `n` zero bytes.
     pub fn zeros(&mut self, n: usize) {
         self.buf.resize(self.buf.len().saturating_add(n), 0);
     }
 
+    /// Bytes written.
     pub fn len(&self) -> usize {
         self.buf.len()
     }
@@ -54,14 +61,17 @@ impl Writer {
         self.buf.clear();
     }
 
+    /// Whether nothing is written.
     pub fn is_empty(&self) -> bool {
         self.buf.is_empty()
     }
 
+    /// The bytes written.
     pub fn as_slice(&self) -> &[u8] {
         &self.buf
     }
 
+    /// The bytes written, as the vector that holds them.
     pub fn into_vec(self) -> Vec<u8> {
         self.buf
     }
@@ -75,18 +85,22 @@ pub struct Reader<'a> {
 }
 
 impl<'a> Reader<'a> {
+    /// A reader of `buf` from its start.
     pub fn new(buf: &'a [u8]) -> Self {
         Self { buf, pos: 0 }
     }
 
+    /// Bytes read so far: where the next field starts.
     pub fn position(&self) -> usize {
         self.pos
     }
 
+    /// Bytes not yet read.
     pub fn remaining(&self) -> usize {
         self.buf.len().saturating_sub(self.pos)
     }
 
+    /// The next `n` bytes; `None` past the end.
     pub fn take(&mut self, n: usize) -> Option<&'a [u8]> {
         let end = self.pos.checked_add(n)?;
         let s = self.buf.get(self.pos..end)?;
@@ -98,18 +112,22 @@ impl<'a> Reader<'a> {
         self.take(N)?.try_into().ok()
     }
 
+    /// The next byte.
     pub fn u8(&mut self) -> Option<u8> {
         self.array::<1>().map(|[b]| b)
     }
 
+    /// The next `u32`, little-endian.
     pub fn u32(&mut self) -> Option<u32> {
         self.array().map(u32::from_le_bytes)
     }
 
+    /// The next `u64`, little-endian.
     pub fn u64(&mut self) -> Option<u64> {
         self.array().map(u64::from_le_bytes)
     }
 
+    /// The next `u128`, little-endian.
     pub fn u128(&mut self) -> Option<u128> {
         self.array().map(u128::from_le_bytes)
     }
@@ -126,14 +144,17 @@ pub fn crc32c(data: &[u8]) -> u32 {
 pub struct Crc32c(u32);
 
 impl Crc32c {
+    /// A CRC of nothing yet.
     pub fn new() -> Self {
         Self(0)
     }
 
+    /// Adds `data`, as if it followed what came before.
     pub fn update(&mut self, data: &[u8]) {
         self.0 = crc32c::crc32c_append(self.0, data);
     }
 
+    /// The CRC of everything added.
     pub fn finish(&self) -> u32 {
         self.0
     }

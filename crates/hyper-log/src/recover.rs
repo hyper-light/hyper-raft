@@ -23,9 +23,9 @@ pub(crate) enum Found<'a> {
 /// Which segment a frame must name to be one of its frames.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Segment {
-    pub log: u128,
-    pub incarnation: u64,
-    pub nonce: u64,
+    pub(crate) log: u128,
+    pub(crate) incarnation: u64,
+    pub(crate) nonce: u64,
 }
 
 /// Reads a log file's frames through a window of one segment's bytes, the most any frame
@@ -48,7 +48,7 @@ pub(crate) struct Reader<'a, F> {
 
 impl<'a, F: BlockFile> Reader<'a, F> {
     /// A reader of `file` whose window holds `segment_bytes`.
-    pub fn new(file: &'a F, align: Alignment, segment_bytes: u64) -> Result<Self, LogError> {
+    pub(crate) fn new(file: &'a F, align: Alignment, segment_bytes: u64) -> Result<Self, LogError> {
         let size = usize::try_from(segment_bytes).map_err(|_| LogError::Config("segment"))?;
         Ok(Self {
             file,
@@ -95,7 +95,7 @@ impl<'a, F: BlockFile> Reader<'a, F> {
     }
 
     /// The frame of `segment` at `offset`, reading no further than `end`, the segment's end.
-    pub fn frame_at(
+    pub(crate) fn frame_at(
         &mut self,
         segment: Segment,
         offset: u64,
@@ -285,11 +285,11 @@ type RecordCopy = (u64, format::Persist);
 /// persist record describes, before the log serves anyone (docs/design/raft-log.md §6).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Restore {
-    pub group: u128,
-    pub update: crate::Update,
-    pub uncertain: Option<format::Start>,
+    pub(crate) group: u128,
+    pub(crate) update: crate::Update,
+    pub(crate) uncertain: Option<format::Start>,
     /// The group is marked damaged; the update is empty.
-    pub damaged: bool,
+    pub(crate) damaged: bool,
 }
 
 /// Writes segment 0, incarnation 1: its header and an empty first frame.
@@ -366,231 +366,342 @@ struct Last {
     after: u64,
 }
 
-pub(crate) fn open<F: BlockFile>(
-    file: &F,
-    config: &Config,
+/// The file as an open finds it: its block, its length, the persist area before its segment
+/// slots, and how many slots it has.
+#[derive(Debug, Clone, Copy)]
+struct Shape {
     id: u128,
-) -> Result<(State, Recovery, Vec<Restore>), LogError> {
-    let align = file.alignment();
-    check(config, align)?;
-    let block = block_of(align)?;
-    let len = file.len()?;
-    if len == 0 {
-        return Err(LogError::Foreign("the file is empty"));
-    }
-    let segment = config.segment_bytes;
-    let area = persist_area(config);
-    let slots = len
-        .checked_sub(area)
-        .filter(|&rest| rest > 0)
-        .ok_or(LogError::Foreign("no segment past the persist area"))?
-        .div_ceil(segment);
-    let slots = u32::try_from(slots)
-        .ok()
-        .filter(|&s| s <= config.max_segments)
-        .ok_or(LogError::Foreign("more segments than the log's quota"))?;
-    let start_of = |slot: u32| {
-        u64::from(slot)
-            .checked_mul(segment)
-            .and_then(|s| s.checked_add(area))
-    };
+    block: u64,
+    len: u64,
+    segment: u64,
+    area: u64,
+    slots: u32,
+}
 
-    // 1. Every segment header.
-    let mut incarnation = vec![0u64; usize::try_from(slots).unwrap_or(0)];
-    let mut nonce = vec![0u64; usize::try_from(slots).unwrap_or(0)];
-    let mut by_incarnation: HashMap<u64, u32> = HashMap::new();
-    let mut header_block =
-        AlignedBuf::zeroed(align.get(), align).map_err(|e| LogError::Disk(e.into()))?;
-    header_block
+impl Shape {
+    fn of<F: BlockFile>(file: &F, config: &Config, id: u128) -> Result<Self, LogError> {
+        let block = block_of(file.alignment())?;
+        let len = file.len()?;
+        if len == 0 {
+            return Err(LogError::Foreign("the file is empty"));
+        }
+        let segment = config.segment_bytes;
+        let area = persist_area(config);
+        let slots = len
+            .checked_sub(area)
+            .filter(|&rest| rest > 0)
+            .ok_or(LogError::Foreign("no segment past the persist area"))?
+            .div_ceil(segment);
+        let slots = u32::try_from(slots)
+            .ok()
+            .filter(|&s| s <= config.max_segments)
+            .ok_or(LogError::Foreign("more segments than the log's quota"))?;
+        Ok(Self {
+            id,
+            block,
+            len,
+            segment,
+            area,
+            slots,
+        })
+    }
+
+    /// Where slot `slot` begins.
+    fn start_of(&self, slot: u32) -> Result<u64, LogError> {
+        u64::from(slot)
+            .checked_mul(self.segment)
+            .and_then(|s| s.checked_add(self.area))
+            .ok_or(LogError::Damaged("an offset past u64"))
+    }
+
+    /// Where slot `slot` ends.
+    fn end_of(&self, slot: u32) -> Result<u64, LogError> {
+        self.start_of(slot)?
+            .checked_add(self.segment)
+            .ok_or(LogError::Damaged("an offset past u64"))
+    }
+
+    /// Where slot `slot`'s first frame goes, after its header block.
+    fn first_frame(&self, slot: u32) -> Result<u64, LogError> {
+        self.start_of(slot)?
+            .checked_add(self.block)
+            .ok_or(LogError::Damaged("an offset past u64"))
+    }
+}
+
+/// Every segment header that reads as this log's: each slot's incarnation, 0 where none reads,
+/// and nonce, which slot holds each incarnation, and the highest.
+struct Headers {
+    incarnation: Vec<u64>,
+    nonce: Vec<u64>,
+    by_incarnation: HashMap<u64, u32>,
+    highest: u64,
+}
+
+impl Headers {
+    /// The slot of incarnation `inc`, which must be live.
+    fn slot(&self, inc: u64) -> Result<u32, LogError> {
+        self.by_incarnation
+            .get(&inc)
+            .copied()
+            .ok_or(LogError::Damaged("a live segment is missing"))
+    }
+
+    /// Which segment the frames of incarnation `inc` in `slot` name.
+    fn segment(&self, id: u128, slot: u32, inc: u64) -> Segment {
+        Segment {
+            log: id,
+            incarnation: inc,
+            nonce: self
+                .nonce
+                .get(usize::try_from(slot).unwrap_or(usize::MAX))
+                .copied()
+                .unwrap_or(0),
+        }
+    }
+
+    /// Whether slot `slot`'s header read as this log's.
+    fn reads(&self, slot: u32) -> bool {
+        usize::try_from(slot)
+            .ok()
+            .and_then(|i| self.incarnation.get(i))
+            .is_some_and(|&inc| inc != 0)
+    }
+}
+
+/// 1. Every segment header.
+fn headers<F: BlockFile>(file: &F, shape: &Shape) -> Result<Headers, LogError> {
+    let align = file.alignment();
+    let count = usize::try_from(shape.slots).unwrap_or(0);
+    let mut heads = Headers {
+        incarnation: vec![0u64; count],
+        nonce: vec![0u64; count],
+        by_incarnation: HashMap::new(),
+        highest: 0,
+    };
+    let mut block = AlignedBuf::zeroed(align.get(), align).map_err(|e| LogError::Disk(e.into()))?;
+    block
         .set_len(align.get())
         .map_err(|e| LogError::Disk(e.into()))?;
-    for slot in 0..slots {
-        let at = start_of(slot).ok_or(LogError::Damaged("an offset past u64"))?;
-        if at.checked_add(block).is_none_or(|end| end > len) {
+    for slot in 0..shape.slots {
+        let at = shape.start_of(slot)?;
+        if at
+            .checked_add(shape.block)
+            .is_none_or(|end| end > shape.len)
+        {
             continue;
         }
-        file.read_exact_at(header_block.as_mut_slice(), at)?;
-        let Some(h) = SegmentHeader::decode(header_block.as_slice()) else {
+        file.read_exact_at(block.as_mut_slice(), at)?;
+        let Some(h) = SegmentHeader::decode(block.as_slice()) else {
             continue;
         };
-        if h.log != id || h.segment_bytes != segment || h.incarnation == 0 {
+        if h.log != shape.id || h.segment_bytes != shape.segment || h.incarnation == 0 {
             continue;
         }
-        if by_incarnation.insert(h.incarnation, slot).is_some() {
+        if heads.by_incarnation.insert(h.incarnation, slot).is_some() {
             return Err(LogError::Damaged("two segments share an incarnation"));
         }
         let i = usize::try_from(slot).unwrap_or(usize::MAX);
-        if let (Some(e), Some(n)) = (incarnation.get_mut(i), nonce.get_mut(i)) {
+        if let (Some(e), Some(n)) = (heads.incarnation.get_mut(i), heads.nonce.get_mut(i)) {
             *e = h.incarnation;
             *n = h.nonce;
         }
     }
-    let highest = by_incarnation
+    heads.highest = heads
+        .by_incarnation
         .keys()
         .copied()
         .max()
         .ok_or(LogError::Foreign("no segment of this log"))?;
+    Ok(heads)
+}
 
-    let segment_of = |slot: u32, inc: u64| Segment {
-        log: id,
-        incarnation: inc,
-        nonce: nonce
-            .get(usize::try_from(slot).unwrap_or(usize::MAX))
-            .copied()
-            .unwrap_or(0),
-    };
-
-    // 2. The last valid frame, in the highest segment that holds one.
-    let mut reader = Reader::new(file, align, segment)?;
-    let frames_of = |reader: &mut Reader<'_, F>,
-                     inc: u64,
-                     visit: &mut Visit<'_>|
-     -> Result<(u64, bool), LogError> {
-        let slot = *by_incarnation
-            .get(&inc)
-            .ok_or(LogError::Damaged("a live segment is missing"))?;
-        let which = segment_of(slot, inc);
-        let begin = start_of(slot).ok_or(LogError::Damaged("an offset past u64"))?;
-        let end = begin
-            .checked_add(segment)
-            .ok_or(LogError::Damaged("an offset past u64"))?;
-        let mut offset = begin
-            .checked_add(block)
-            .ok_or(LogError::Damaged("an offset past u64"))?;
-        loop {
-            match reader.frame_at(which, offset, end)? {
-                Found::Frame(header, bytes, padded) => {
-                    visit(offset, &header, bytes, padded)?;
-                    offset = offset
-                        .checked_add(padded)
-                        .ok_or(LogError::Damaged("an offset past u64"))?;
-                }
-                Found::End => return Ok((offset, false)),
-                Found::Invalid => return Ok((offset, true)),
+/// Walks the frames of the segment of incarnation `inc`, visiting each that verifies: where
+/// they stop, and whether what stops them is a frame of the segment that does not verify.
+fn frames_of<F: BlockFile>(
+    reader: &mut Reader<'_, F>,
+    shape: &Shape,
+    heads: &Headers,
+    inc: u64,
+    visit: &mut Visit<'_>,
+) -> Result<(u64, bool), LogError> {
+    let slot = heads.slot(inc)?;
+    let which = heads.segment(shape.id, slot, inc);
+    let end = shape.end_of(slot)?;
+    let mut offset = shape.first_frame(slot)?;
+    loop {
+        match reader.frame_at(which, offset, end)? {
+            Found::Frame(header, bytes, padded) => {
+                visit(offset, &header, bytes, padded)?;
+                offset = offset
+                    .checked_add(padded)
+                    .ok_or(LogError::Damaged("an offset past u64"))?;
             }
+            Found::End => return Ok((offset, false)),
+            Found::Invalid => return Ok((offset, true)),
         }
-    };
-    let mut last: Option<Last> = None;
-    let mut inc = highest;
-    while last.is_none() {
+    }
+}
+
+/// 2. The last valid frame, in the highest segment that holds one.
+fn last_frame<F: BlockFile>(
+    reader: &mut Reader<'_, F>,
+    shape: &Shape,
+    heads: &Headers,
+) -> Result<Last, LogError> {
+    let mut inc = heads.highest;
+    loop {
         let mut found: Option<Last> = None;
-        let (stop, _) = frames_of(&mut reader, inc, &mut |offset, header, _, padded| {
-            found = Some(Last {
-                incarnation: inc,
-                offset,
-                sequence: header.sequence,
-                tail: header.tail,
-                after: offset.saturating_add(padded),
-            });
-            Ok(())
-        })?;
+        let (stop, _) = frames_of(
+            reader,
+            shape,
+            heads,
+            inc,
+            &mut |offset, header, _, padded| {
+                found = Some(Last {
+                    incarnation: inc,
+                    offset,
+                    sequence: header.sequence,
+                    tail: header.tail,
+                    after: offset.saturating_add(padded),
+                });
+                Ok(())
+            },
+        )?;
         // A frame is written only after the one before it is flushed, so a valid frame past
         // the point where the frames stop proves the frame there was acknowledged, whatever
         // part of it no longer reads: its checksum, or its magic, format or identity
         // (06 §A3). Only with none past it is the stop the log's end.
-        let slot = *by_incarnation
-            .get(&inc)
-            .ok_or(LogError::Damaged("a live segment is missing"))?;
-        let end = start_of(slot)
-            .and_then(|s| s.checked_add(segment))
-            .ok_or(LogError::Damaged("an offset past u64"))?;
+        let slot = heads.slot(inc)?;
+        let end = shape.end_of(slot)?;
         let after = found.map(|f| f.sequence);
-        if reader.later_frame(segment_of(slot, inc), stop, end, after)? {
+        if reader.later_frame(heads.segment(shape.id, slot, inc), stop, end, after)? {
             return Err(LogError::Damaged("an acknowledged frame does not verify"));
         }
-        last = found;
-        if last.is_none() {
-            inc = inc
-                .checked_sub(1)
-                .filter(|i| by_incarnation.contains_key(i))
-                .ok_or(LogError::Damaged("no segment holds a valid frame"))?;
+        if let Some(last) = found {
+            return Ok(last);
         }
+        inc = inc
+            .checked_sub(1)
+            .filter(|i| heads.by_incarnation.contains_key(i))
+            .ok_or(LogError::Damaged("no segment holds a valid frame"))?;
     }
-    let last = last.ok_or(LogError::Damaged("no segment holds a valid frame"))?;
-    // A slot whose header no longer reads as this log's may hold a newer segment whose header
-    // was damaged. A segment's header is written with its first frame and flushed with it, so
-    // a valid frame of this log past that first frame, in a segment newer than any whose
-    // header reads, proves the header was durable and is now damaged. The first frame alone
-    // is an opening that may never have been flushed, the torn tail's case.
-    for slot in 0..slots {
-        let i = usize::try_from(slot).map_err(|_| LogError::Damaged("a slot past usize"))?;
-        if incarnation.get(i).is_some_and(|&inc| inc != 0) {
+}
+
+/// A slot whose header no longer reads as this log's may hold a newer segment whose header
+/// was damaged. A segment's header is written with its first frame and flushed with it, so a
+/// valid frame of this log past that first frame, in a segment newer than any whose header
+/// reads, proves the header was durable and is now damaged. The first frame alone is an
+/// opening that may never have been flushed, the torn tail's case.
+fn lost_headers<F: BlockFile>(
+    reader: &mut Reader<'_, F>,
+    shape: &Shape,
+    heads: &Headers,
+) -> Result<(), LogError> {
+    for slot in 0..shape.slots {
+        if heads.reads(slot) {
             continue;
         }
-        let begin = start_of(slot).ok_or(LogError::Damaged("an offset past u64"))?;
-        let end = begin
-            .checked_add(segment)
-            .ok_or(LogError::Damaged("an offset past u64"))?;
-        let first = begin
-            .checked_add(block)
-            .ok_or(LogError::Damaged("an offset past u64"))?;
-        if reader.newer_frame(id, first, end, highest)? {
+        let first = shape.first_frame(slot)?;
+        if reader.newer_frame(shape.id, first, shape.end_of(slot)?, heads.highest)? {
             return Err(LogError::Damaged(
                 "a segment's header does not read, but its frames do",
             ));
         }
     }
-    if last.tail > last.incarnation {
-        return Err(LogError::Damaged(
-            "a frame names a tail after its own segment",
-        ));
-    }
+    Ok(())
+}
 
-    // 3. Replay the live segments, the tail to the highest, in sequence order.
-    let mut replayed: HashMap<u128, Replayed> = HashMap::new();
+/// What replaying the live segments rebuilt: each group, the frames replayed, and the bytes
+/// each live segment's frames take, padded, by slot: one entry for each of the log's
+/// segments at most.
+struct Replay {
+    groups: HashMap<u128, Replayed>,
+    frames: u64,
+    used: HashMap<u32, u64>,
+}
+
+/// 3. Replays the live segments, the tail to the highest, in sequence order.
+fn replay_live<F: BlockFile>(
+    reader: &mut Reader<'_, F>,
+    shape: &Shape,
+    heads: &Headers,
+    last: &Last,
+) -> Result<Replay, LogError> {
+    let mut replay = Replay {
+        groups: HashMap::new(),
+        frames: 0,
+        used: HashMap::new(),
+    };
     let mut expected: Option<u64> = None;
-    let mut frames = 0u64;
-    // The bytes each live segment's frames take, padded, by slot: one entry for each of the
-    // log's segments at most.
-    let mut used: HashMap<u32, u64> = HashMap::new();
-    for inc in last.tail..=highest {
-        let slot = *by_incarnation
-            .get(&inc)
-            .ok_or(LogError::Damaged("a live segment is missing"))?;
+    for inc in last.tail..=heads.highest {
+        let slot = heads.slot(inc)?;
         let mut held = 0u64;
-        let (end, invalid) = frames_of(&mut reader, inc, &mut |offset, header, bytes, padded| {
-            if expected.is_some_and(|e| e != header.sequence) {
-                return Err(LogError::Damaged("a frame is missing"));
-            }
-            expected = header.sequence.checked_add(1);
-            frames = frames.saturating_add(1);
-            held = held.saturating_add(1);
-            let payload = bytes
-                .get(format::FRAME_HEADER_LEN..header.frame_len().unwrap_or(0))
-                .ok_or(LogError::Damaged("a frame shorter than its header says"))?;
-            let records = format::records(payload, header.records)
-                .ok_or(LogError::Damaged("a verified frame does not decode"))?;
-            let base = offset
-                .checked_add(FRAME_HEADER_BYTES)
-                .ok_or(LogError::Damaged("an offset past u64"))?;
-            let bytes_used = used.entry(slot).or_insert(0);
-            *bytes_used = bytes_used.saturating_add(padded);
-            replay(&mut replayed, slot, base, records)
-        })?;
+        let (end, invalid) = frames_of(
+            reader,
+            shape,
+            heads,
+            inc,
+            &mut |offset, header, bytes, padded| {
+                if expected.is_some_and(|e| e != header.sequence) {
+                    return Err(LogError::Damaged("a frame is missing"));
+                }
+                expected = header.sequence.checked_add(1);
+                held = held.saturating_add(1);
+                replay_frame(&mut replay, slot, offset, header, bytes, padded)
+            },
+        )?;
         // A segment's header is flushed with its first frame, so a live segment before the
         // last frame's holds a frame at least. With none, its frames were written over or
         // damaged where they begin: the torn opening of a later frame in its reused slot, where
         // the last frame, which freed it, no longer reads. Sequences are checked only from the
         // first frame replayed, so without this the segment's pieces vanished unreported
-        // (docs/design/raft-log.md §6, step 4).
+        // (mantle docs/design/raft-log.md §6, step 4).
         if held == 0 && inc < last.incarnation {
             return Err(LogError::Damaged("a live segment holds no frame"));
         }
-        if invalid {
-            // Damage unless it lies after the last valid frame: then it is the torn tail.
-            let before_last =
-                inc < last.incarnation || (inc == last.incarnation && end < last.offset);
-            if before_last {
-                return Err(LogError::Damaged("an acknowledged frame does not verify"));
-            }
+        // Damage unless it lies after the last valid frame: then it is the torn tail.
+        let before_last = inc < last.incarnation || (inc == last.incarnation && end < last.offset);
+        if invalid && before_last {
+            return Err(LogError::Damaged("an acknowledged frame does not verify"));
         }
     }
     if expected != last.sequence.checked_add(1) {
         return Err(LogError::Damaged("a frame is missing"));
     }
+    Ok(replay)
+}
 
-    // 4. The groups as they run; those with a record missing recover from their peers, and
-    // so do those an earlier recovery fenced as damaged.
+/// Replays one verified frame of segment slot `slot` at `offset`.
+fn replay_frame(
+    replay: &mut Replay,
+    slot: u32,
+    offset: u64,
+    header: &FrameHeader,
+    bytes: &[u8],
+    padded: u64,
+) -> Result<(), LogError> {
+    replay.frames = replay.frames.saturating_add(1);
+    let payload = bytes
+        .get(format::FRAME_HEADER_LEN..header.frame_len().unwrap_or(0))
+        .ok_or(LogError::Damaged("a frame shorter than its header says"))?;
+    let records = format::records(payload, header.records)
+        .ok_or(LogError::Damaged("a verified frame does not decode"))?;
+    let base = offset
+        .checked_add(FRAME_HEADER_BYTES)
+        .ok_or(LogError::Damaged("an offset past u64"))?;
+    let used = replay.used.entry(slot).or_insert(0);
+    *used = used.saturating_add(padded);
+    replay_records(&mut replay.groups, slot, base, records)
+}
+
+/// The groups replay rebuilt, as they run: those whose records run unbroken, those with a
+/// record missing, which recover from their peers, and those an earlier recovery fenced as
+/// damaged, with where the fence is.
+type Finished = (HashMap<u128, state::Group>, Vec<u128>, HashMap<u128, Place>);
+
+/// 4. The groups as they run.
+fn finish(replayed: HashMap<u128, Replayed>) -> Finished {
     let mut groups = HashMap::new();
     let mut damaged = Vec::new();
     let mut fenced = HashMap::new();
@@ -606,6 +717,107 @@ pub(crate) fn open<F: BlockFile>(
             None => damaged.push(group),
         }
     }
+    (groups, damaged, fenced)
+}
+
+/// Each segment slot's live pieces and bytes, and the bytes its frames take.
+fn live_of(
+    slots: usize,
+    groups: &HashMap<u128, state::Group>,
+    fenced: &HashMap<u128, Place>,
+    used: &HashMap<u32, u64>,
+) -> Live {
+    let mut live = Live::with_slots(slots);
+    for g in groups.values() {
+        for (place, bytes) in g.pieces() {
+            live.add(place, bytes);
+        }
+    }
+    for &place in fenced.values() {
+        live.add(place, state::DAMAGED_BYTES);
+    }
+    for (&slot, &bytes) in used {
+        live.wrote(slot, bytes);
+    }
+    live
+}
+
+/// Step 5: the block where the next frame goes is erased; returns its offset. A frame there was never
+/// acknowledged but may be partly durable, its header whole while its last sectors, or the
+/// file's end, are not; left alone, a later crash could complete it with the zeros of a newer
+/// frame's padding and bring it back. Erased, it can neither return nor be taken for damage once
+/// frames follow it elsewhere.
+///
+/// The restore's frame takes the lost frame's sequence, so its persist record goes in the lost
+/// frame's slot, before its flush, and may tear there while the frame does not become durable.
+/// The lost frame's record, and whether it was confirmed, are copied to the other slot first
+/// and flushed with the erasure (`copy`, when there is a restore): what restores the lost frame
+/// then survives until the restore itself is durable. The other slot holds nothing recovery
+/// still needs: the record of the frame before, which reads whole, or of the frame after, which
+/// never became durable and so was never answered, and whose confirmation of the lost frame the
+/// copy carries.
+fn erase<F: BlockFile>(
+    file: &F,
+    shape: &Shape,
+    heads: &Headers,
+    last: &Last,
+    copy: Option<RecordCopy>,
+) -> Result<u64, LogError> {
+    let mut flush = false;
+    if let Some((at, record)) = copy {
+        write_record(file, &record, at)?;
+        flush = true;
+    }
+    let head_slot = heads.slot(heads.highest)?;
+    let head_offset = if heads.highest == last.incarnation {
+        last.after
+    } else {
+        shape.first_frame(head_slot)?
+    };
+    // Where the head is a newer segment than the last frame's, an opening whose frame never
+    // became durable, the block after the last frame is erased as well. A frame there was
+    // flushed before that opening was written, and no longer reads: the lost frame. Left in
+    // the tail, a sweep of that segment took it for a live frame damaged, and the restore's
+    // own frame fenced the log (mantle docs/design/raft-log.md §6, step 6).
+    let mut erasures = vec![(head_offset, shape.end_of(head_slot)?)];
+    if heads.highest != last.incarnation {
+        erasures.push((last.after, shape.end_of(heads.slot(last.incarnation)?)?));
+    }
+    let align = file.alignment();
+    let mut zeros = AlignedBuf::zeroed(align.get(), align).map_err(|e| LogError::Disk(e.into()))?;
+    zeros
+        .set_len(align.get())
+        .map_err(|e| LogError::Disk(e.into()))?;
+    for (at, end) in erasures {
+        if at.checked_add(shape.block).is_some_and(|stop| stop <= end) {
+            file.write_all_at(zeros.as_slice(), at)?;
+            flush = true;
+        }
+    }
+    if flush {
+        file.sync_data()?;
+    }
+    Ok(head_offset)
+}
+
+pub(crate) fn open<F: BlockFile>(
+    file: &F,
+    config: &Config,
+    id: u128,
+) -> Result<(State, Recovery, Vec<Restore>), LogError> {
+    check(config, file.alignment())?;
+    let shape = Shape::of(file, config, id)?;
+    let heads = headers(file, &shape)?;
+    let mut reader = Reader::new(file, file.alignment(), shape.segment)?;
+    let last = last_frame(&mut reader, &shape, &heads)?;
+    lost_headers(&mut reader, &shape, &heads)?;
+    if last.tail > last.incarnation {
+        return Err(LogError::Damaged(
+            "a frame names a tail after its own segment",
+        ));
+    }
+    let replay = replay_live(&mut reader, &shape, &heads, &last)?;
+    let (groups, mut damaged, fenced) = finish(replay.groups);
     // 4b. A frame after the last valid one may have been flushed and damaged since: its
     // persist record, written in the same flush, says what it held (AGL+18 §3.3.3).
     let (mut restores, copy) = restores(
@@ -621,147 +833,113 @@ pub(crate) fn open<F: BlockFile>(
     damaged.dedup();
     // A group newly found damaged is fenced by a record written before the log serves
     // anyone, so that the fence outlives what showed the damage: the frame is overwritten
-    // by the next, and a record missing may be swept away (audit S16).
+    // by the next, and a record missing may be swept away (mantle audit S16).
     restores.extend(damaged.iter().map(|&group| Restore {
         group,
         update: crate::Update::default(),
         uncertain: None,
         damaged: true,
     }));
-    let mut live = Live::with_slots(incarnation.len());
-    for g in groups.values() {
-        for (place, bytes) in g.pieces() {
-            live.add(place, bytes);
-        }
-    }
-    for &place in fenced.values() {
-        live.add(place, state::DAMAGED_BYTES);
-    }
-    for (&slot, &bytes) in &used {
-        live.wrote(slot, bytes);
-    }
-
-    // 5. The block where the next frame goes is erased. A frame there was never acknowledged
-    // but may be partly durable, its header whole while its last sectors, or the file's
-    // end, are not; left alone, a later crash could complete it with the zeros of a newer
-    // frame's padding and bring it back. Erased, it can neither return nor be taken for
-    // damage once frames follow it elsewhere.
-    //
-    // The restore's frame takes the lost frame's sequence, so its persist record goes in the
-    // lost frame's slot, before its flush, and may tear there while the frame does not become
-    // durable. The lost frame's record, and whether it was confirmed, are copied to the other
-    // slot first and flushed with the erasure: what restores the lost frame then survives
-    // until the restore itself is durable. The other slot holds nothing recovery still
-    // needs: the record of the frame before, which reads whole, or of the frame after, which
-    // never became durable and so was never answered, and whose confirmation of the lost
-    // frame the copy carries.
-    let mut flush = false;
-    if let Some((at, record)) = copy.filter(|_| !restores.is_empty()) {
-        write_record(file, &record, at)?;
-        flush = true;
-    }
-    let head_slot = *by_incarnation
-        .get(&highest)
-        .ok_or(LogError::Damaged("a live segment is missing"))?;
-    let head_offset = if highest == last.incarnation {
-        last.after
-    } else {
-        start_of(head_slot)
-            .and_then(|s| s.checked_add(block))
-            .ok_or(LogError::Damaged("an offset past u64"))?
-    };
-    let end_of = |inc: u64| {
-        by_incarnation
-            .get(&inc)
-            .and_then(|&slot| start_of(slot))
-            .and_then(|s| s.checked_add(segment))
-            .ok_or(LogError::Damaged("an offset past u64"))
-    };
-    // Where the head is a newer segment than the last frame's, an opening whose frame never
-    // became durable, the block after the last frame is erased as well. A frame there was
-    // flushed before that opening was written, and no longer reads: the lost frame. Left in
-    // the tail, a sweep of that segment took it for a live frame damaged, and the restore's
-    // own frame fenced the log (docs/design/raft-log.md §6, step 6).
-    let mut erase = vec![(head_offset, end_of(highest)?)];
-    if highest != last.incarnation {
-        erase.push((last.after, end_of(last.incarnation)?));
-    }
-    let mut zeros = AlignedBuf::zeroed(align.get(), align).map_err(|e| LogError::Disk(e.into()))?;
-    zeros
-        .set_len(align.get())
-        .map_err(|e| LogError::Disk(e.into()))?;
-    for (at, end) in erase {
-        if at.checked_add(block).is_some_and(|stop| stop <= end) {
-            file.write_all_at(zeros.as_slice(), at)?;
-            flush = true;
-        }
-    }
-    if flush {
-        file.sync_data()?;
-    }
-
-    let head_nonce = segment_of(head_slot, highest).nonce;
-    let live_segments = (last.tail..=highest)
-        .filter_map(|inc| by_incarnation.get(&inc).copied())
-        .collect();
-    let free = (0..slots)
-        .filter(|slot| {
-            let inc = incarnation
-                .get(usize::try_from(*slot).unwrap_or(usize::MAX))
-                .copied()
-                .unwrap_or(0);
-            inc < last.tail
-        })
-        .map(|slot| (slot, 0))
-        .collect();
-    let restored = restores
-        .iter()
-        .filter(|r| !r.damaged)
-        .map(|r| r.group)
-        .collect();
-    let state = State {
-        damaged: damaged
-            .iter()
-            .map(|&group| (group, None))
-            .chain(fenced.iter().map(|(&group, &at)| (group, Some(at))))
-            .collect(),
+    let live = live_of(heads.incarnation.len(), &groups, &fenced, &replay.used);
+    let copy = copy.filter(|_| !restores.is_empty());
+    let head_offset = erase(file, &shape, &heads, &last, copy)?;
+    let opened = Opened {
         groups,
+        damaged,
+        fenced,
         live,
-        segments: Segments {
-            incarnation,
-            nonce,
-            live: live_segments,
-            free,
-        },
-        head: Head {
-            slot: head_slot,
-            incarnation: highest,
-            nonce: head_nonce,
-            offset: head_offset,
-        },
-        next_sequence: last
-            .sequence
-            .checked_add(1)
-            .ok_or(LogError::Damaged("sequences past u64"))?,
-        next_incarnation: highest
-            .checked_add(1)
-            .ok_or(LogError::Damaged("incarnations past u64"))?,
-        durable: last.sequence,
-        durable_tail: last.tail,
+        head_offset,
+        frames: replay.frames,
     };
-    Ok((
-        state,
-        Recovery {
-            frames,
-            damaged: {
-                let mut all: Vec<u128> = damaged.into_iter().chain(fenced.into_keys()).collect();
-                all.sort_unstable();
-                all
+    let (state, recovery) = opened.into_state(heads, &last, shape.slots, &restores)?;
+    Ok((state, recovery, restores))
+}
+
+/// What an open found, before it is the log's state.
+struct Opened {
+    groups: HashMap<u128, state::Group>,
+    damaged: Vec<u128>,
+    fenced: HashMap<u128, Place>,
+    live: Live,
+    head_offset: u64,
+    frames: u64,
+}
+
+impl Opened {
+    /// The log's state, its head after the last frame, and what the open reports.
+    fn into_state(
+        self,
+        heads: Headers,
+        last: &Last,
+        slots: u32,
+        restores: &[Restore],
+    ) -> Result<(State, Recovery), LogError> {
+        let highest = heads.highest;
+        let head_slot = heads.slot(highest)?;
+        let head_nonce = heads.segment(0, head_slot, highest).nonce;
+        let live_segments = (last.tail..=highest)
+            .filter_map(|inc| heads.by_incarnation.get(&inc).copied())
+            .collect();
+        let free = (0..slots)
+            .filter(|slot| {
+                let inc = heads
+                    .incarnation
+                    .get(usize::try_from(*slot).unwrap_or(usize::MAX))
+                    .copied()
+                    .unwrap_or(0);
+                inc < last.tail
+            })
+            .map(|slot| (slot, 0))
+            .collect();
+        let restored = restores
+            .iter()
+            .filter(|r| !r.damaged)
+            .map(|r| r.group)
+            .collect();
+        let state = State {
+            damaged: self
+                .damaged
+                .iter()
+                .map(|&group| (group, None))
+                .chain(self.fenced.iter().map(|(&group, &at)| (group, Some(at))))
+                .collect(),
+            groups: self.groups,
+            live: self.live,
+            segments: Segments {
+                incarnation: heads.incarnation,
+                nonce: heads.nonce,
+                live: live_segments,
+                free,
             },
+            head: Head {
+                slot: head_slot,
+                incarnation: highest,
+                nonce: head_nonce,
+                offset: self.head_offset,
+            },
+            next_sequence: last
+                .sequence
+                .checked_add(1)
+                .ok_or(LogError::Damaged("sequences past u64"))?,
+            next_incarnation: highest
+                .checked_add(1)
+                .ok_or(LogError::Damaged("incarnations past u64"))?,
+            durable: last.sequence,
+            durable_tail: last.tail,
+        };
+        let mut all: Vec<u128> = self
+            .damaged
+            .into_iter()
+            .chain(self.fenced.into_keys())
+            .collect();
+        all.sort_unstable();
+        let recovery = Recovery {
+            frames: self.frames,
+            damaged: all,
             restored,
-        },
-        restores,
-    ))
+        };
+        Ok((state, recovery))
+    }
 }
 
 /// What the frame after the last valid one held, from its persist record, as the updates that
@@ -840,108 +1018,122 @@ fn restores<F: BlockFile>(
         }
         // A fence the frame wrote is kept whether or not the frame was confirmed: marking a
         // group damaged is always safe, and the frame it fenced may be gone.
-        if p.damaged {
+        if p.damaged || (confirmed && p.proposals) {
             damaged.push(p.group);
             continue;
         }
         let g = groups.get(&p.group).unwrap_or(&empty);
-        let current = g.hard.map(|(h, _)| h);
-        if !confirmed {
-            // The torn tail, keeping only a later term or a vote given.
-            let Some(h) = p.hard_state else {
-                continue;
-            };
-            let later =
-                current.is_none_or(|c| h.term > c.term || (h.term == c.term && c.vote == 0));
-            if later {
-                out.push(Restore {
-                    group: p.group,
-                    update: crate::Update {
-                        hard_state: Some(format::HardState {
-                            commit: current.map_or(0, |c| c.commit),
-                            ..h
-                        }),
-                        ..crate::Update::default()
-                    },
-                    uncertain: None,
-                    damaged: false,
-                });
-            }
-            continue;
-        }
-        if p.proposals {
-            damaged.push(p.group);
-            continue;
-        }
-        if p.removed {
-            out.push(Restore {
-                group: p.group,
-                update: crate::Update {
-                    remove: true,
-                    ..crate::Update::default()
-                },
-                uncertain: None,
-                damaged: false,
-            });
-            continue;
-        }
-        let mut update = crate::Update::default();
-        let mut last_index = g.last().ok_or(LogError::Damaged("an index past u64"))?;
-        if let Some(start) = p.start.filter(|s| s.index >= g.start.index) {
-            update.start = Some(start);
-            last_index = last_index.max(start.index);
-        }
-        let mut uncertain = g.uncertain.map(|(mark, _)| mark);
-        if let Some(w) = p.entries {
-            let from = w.first.max(
-                update
-                    .start
-                    .map_or(g.start.index, |s| s.index)
-                    .saturating_add(1),
-            );
-            update.entries = Some(crate::Entries {
-                first: from,
-                entries: Vec::new(),
-            });
-            last_index = last_index.min(from.saturating_sub(1));
-            if w.count > 0 {
-                let mark = format::Start {
-                    index: w
-                        .first
-                        .checked_add(w.count)
-                        .and_then(|end| end.checked_sub(1))
-                        .ok_or(LogError::Damaged("an index past u64"))?,
-                    term: w.term,
-                };
-                uncertain = Some(merge(uncertain, mark));
-            }
-        }
-        if let Some(mark) = p.uncertain {
-            uncertain = Some(merge(uncertain, mark));
-        }
-        let newer = p
-            .hard_state
-            .filter(|h| current.is_none_or(|c| h.term >= c.term));
-        // A commit past the entries the log still holds would name entries it lacks; the
-        // leader tells the replica its commit again.
-        let hard = newer.or(current).map(|h| format::HardState {
-            commit: h.commit.min(last_index),
-            ..h
-        });
-        if hard != current {
-            update.hard_state = hard;
-        }
-        if update == crate::Update::default() && uncertain == g.uncertain.map(|(m, _)| m) {
-            continue;
-        }
-        out.push(Restore {
-            group: p.group,
-            update,
-            uncertain,
-            damaged: false,
-        });
+        let restore = if confirmed {
+            restore_confirmed(&p, g)?
+        } else {
+            restore_torn(&p, g)
+        };
+        out.extend(restore);
     }
     Ok((out, copy))
+}
+
+/// An unconfirmed frame's group: the torn tail, keeping only a later term or a vote given, at
+/// the group's own commit.
+fn restore_torn(p: &format::Persisted, g: &state::Group) -> Option<Restore> {
+    let h = p.hard_state?;
+    let current = g.hard.map(|(h, _)| h);
+    let later = current.is_none_or(|c| h.term > c.term || (h.term == c.term && c.vote == 0));
+    later.then(|| Restore {
+        group: p.group,
+        update: crate::Update {
+            hard_state: Some(format::HardState {
+                commit: current.map_or(0, |c| c.commit),
+                ..h
+            }),
+            ..crate::Update::default()
+        },
+        uncertain: None,
+        damaged: false,
+    })
+}
+
+/// A confirmed frame's group, the frame damaged since it was acknowledged: its removal, or the
+/// start and hard state the frame left, its entries cut back to where the frame's began, and,
+/// where the frame wrote entries, the mark that the log may lack them. `None` where that
+/// changes nothing.
+fn restore_confirmed(p: &format::Persisted, g: &state::Group) -> Result<Option<Restore>, LogError> {
+    if p.removed {
+        return Ok(Some(Restore {
+            group: p.group,
+            update: crate::Update {
+                remove: true,
+                ..crate::Update::default()
+            },
+            uncertain: None,
+            damaged: false,
+        }));
+    }
+    let current = g.hard.map(|(h, _)| h);
+    let mut update = crate::Update::default();
+    let mut last_index = g.last().ok_or(LogError::Damaged("an index past u64"))?;
+    if let Some(start) = p.start.filter(|s| s.index >= g.start.index) {
+        update.start = Some(start);
+        last_index = last_index.max(start.index);
+    }
+    let mut uncertain = g.uncertain.map(|(mark, _)| mark);
+    if let Some(w) = p.entries {
+        let from = w.first.max(
+            update
+                .start
+                .map_or(g.start.index, |s| s.index)
+                .saturating_add(1),
+        );
+        update.entries = Some(crate::Entries {
+            first: from,
+            entries: Vec::new(),
+        });
+        last_index = last_index.min(from.saturating_sub(1));
+        uncertain = lacking(uncertain, w)?;
+    }
+    if let Some(mark) = p.uncertain {
+        uncertain = Some(merge(uncertain, mark));
+    }
+    let newer = p
+        .hard_state
+        .filter(|h| current.is_none_or(|c| h.term >= c.term));
+    // A commit past the entries the log still holds would name entries it lacks; the
+    // leader tells the replica its commit again.
+    let hard = newer.or(current).map(|h| format::HardState {
+        commit: h.commit.min(last_index),
+        ..h
+    });
+    if hard != current {
+        update.hard_state = hard;
+    }
+    if update == crate::Update::default() && uncertain == g.uncertain.map(|(m, _)| m) {
+        return Ok(None);
+    }
+    Ok(Some(Restore {
+        group: p.group,
+        update,
+        uncertain,
+        damaged: false,
+    }))
+}
+
+/// The mark `mark` widened to the entries `w` a lost frame wrote, if it wrote any.
+fn lacking(
+    mark: Option<format::Start>,
+    w: format::Written,
+) -> Result<Option<format::Start>, LogError> {
+    if w.count == 0 {
+        return Ok(mark);
+    }
+    let lost = format::Start {
+        index: w
+            .first
+            .checked_add(w.count)
+            .and_then(|end| end.checked_sub(1))
+            .ok_or(LogError::Damaged("an index past u64"))?,
+        term: w.term,
+    };
+    Ok(Some(merge(mark, lost)))
 }
 
 /// A mark covering both marks.
@@ -957,7 +1149,7 @@ fn merge(mark: Option<format::Start>, other: format::Start) -> format::Start {
 
 /// Applies one frame's records, in order, to the groups being rebuilt. `base` is the file
 /// offset of the frame's payload in segment `slot`.
-fn replay(
+fn replay_records(
     groups: &mut HashMap<u128, Replayed>,
     slot: u32,
     base: u64,
@@ -1008,7 +1200,7 @@ fn replay(
                     state::Proposal {
                         term: proposal.term,
                         place: place(proposal.at)?,
-                        bytes: proposal.bytes.into(),
+                        bytes: proposal.bytes,
                     },
                 );
             }

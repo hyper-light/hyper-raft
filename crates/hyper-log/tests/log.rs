@@ -6,7 +6,9 @@
     clippy::indexing_slicing,
     clippy::arithmetic_side_effects,
     clippy::disallowed_macros,
-    clippy::cast_possible_truncation
+    clippy::cast_possible_truncation,
+    clippy::cognitive_complexity,
+    clippy::unwrap_in_result
 )]
 
 use std::collections::{BTreeMap, HashMap};
@@ -444,7 +446,7 @@ fn invalid_updates_are_refused_and_change_nothing() {
         first: 3,
         entries: vec![Entry {
             term: 1,
-            bytes: Vec::from(vec![0u8; 16 * BLOCK]),
+            bytes: vec![0u8; 16 * BLOCK],
         }],
     };
     assert!(matches!(
@@ -1734,7 +1736,7 @@ fn sized(first: u64, len: usize) -> Update {
             first,
             entries: vec![Entry {
                 term: 1,
-                bytes: Vec::from(vec![b'x'; len - header]),
+                bytes: vec![b'x'; len - header],
             }],
         }),
         ..Update::default()
@@ -1798,7 +1800,7 @@ fn empty_entries_are_charged_their_records() {
             first: 1,
             entries: vec![Entry {
                 term: 1,
-                bytes: Vec::from(Vec::new()),
+                bytes: Vec::new(),
             }],
         }),
         ..Update::default()
@@ -2066,7 +2068,7 @@ fn a_log_whose_segments_are_all_live_answers_full() {
                     first: index,
                     entries: vec![Entry {
                         term: 1,
-                        bytes: Vec::from(vec![b'x'; len]),
+                        bytes: vec![b'x'; len],
                     }],
                 }),
                 ..Update::default()
@@ -2119,7 +2121,7 @@ fn a_full_log_keeps_room_for_the_compaction_it_waits_for() {
             first: index,
             entries: vec![Entry {
                 term: 1,
-                bytes: Vec::from(vec![b'x'; 1 << 10]),
+                bytes: vec![b'x'; 1 << 10],
             }],
         }),
         ..Update::default()
@@ -2192,7 +2194,7 @@ fn a_full_log_takes_any_frame_once_its_groups_compact() {
                     first,
                     entries: vec![Entry {
                         term: 1,
-                        bytes: Vec::from(vec![fill; size]),
+                        bytes: vec![fill; size],
                     }],
                 }),
                 ..Update::default()
@@ -2313,18 +2315,28 @@ enum Step {
     },
 }
 
+/// A step, of each kind by the weights mantle's `prop_oneof!` gave them: appends 6, compactions
+/// 2, snapshots 1, hard states 2, proposals 1, removals 1 and crashes 1 in 14. The macro boxes
+/// its arms in `Arc`s, which this repository denies in tests too, so the kind is drawn as a
+/// number and every field beside it.
 fn step() -> impl Strategy<Value = Step> {
-    let group = 0u128..4;
-    prop_oneof![
-        6 => (group.clone(), prop::collection::vec(1u64..4, 1..6), 0u64..3)
-            .prop_map(|(group, terms, back)| Step::Append { group, terms, back }),
-        2 => (group.clone(), 0u64..4).prop_map(|(group, keep)| Step::Compact { group, keep }),
-        1 => (group.clone(), 0u64..4).prop_map(|(group, ahead)| Step::Snapshot { group, ahead }),
-        2 => (group.clone(), 1u64..5).prop_map(|(group, term)| Step::Hard { group, term }),
-        1 => (group.clone(), 1u64..3).prop_map(|(group, ahead)| Step::Propose { group, ahead }),
-        1 => group.prop_map(|group| Step::Remove { group }),
-        1 => (0u64..6).prop_map(|ops| Step::Crash { ops }),
-    ]
+    (
+        0u32..14,
+        0u128..4,
+        (prop::collection::vec(1u64..4, 1..6), 0u64..3),
+        (0u64..4, 0u64..4, 1u64..5, 1u64..3, 0u64..6),
+    )
+        .prop_map(
+            |(kind, group, (terms, back), (keep, ahead, term, near, ops))| match kind {
+                0..=5 => Step::Append { group, terms, back },
+                6..=7 => Step::Compact { group, keep },
+                8 => Step::Snapshot { group, ahead },
+                9..=10 => Step::Hard { group, term },
+                11 => Step::Propose { group, ahead: near },
+                12 => Step::Remove { group },
+                _ => Step::Crash { ops },
+            },
+        )
 }
 
 /// The update a step makes of the group as the model holds it.
@@ -2417,63 +2429,78 @@ proptest! {
         segment_blocks in 4u64..10,
         max_segments in 3u32..8,
     ) {
-        let file = sim(seed);
-        let cfg = config(segment_blocks, max_segments);
-        let mut log = Log::create(file, cfg, ID).unwrap();
-        let mut models = Models::new();
-        let mut cut = false;
-        for step in &steps {
-            if let Step::Crash { ops } = step {
-                let ops = *ops;
-                log.with_file(move |f| f.inject(Fault::PowerCut { ops }).unwrap()).unwrap();
-                cut = true;
-                continue;
-            }
-            let Some((group, u)) = update(step, &models) else { continue };
-            match log.write(group, u.clone()) {
-                Ok(()) => apply(&mut models, group, &u),
-                Err(LogError::Fenced) => {
-                    prop_assert!(cut);
-                    // Power is gone: crash, reopen, and see whether the update landed, which
-                    // it may have wholly or not at all.
-                    let file = closed(log);
-                    file.crash(Crash::Random).unwrap();
-                    file.clear_faults().unwrap();
-                    cut = false;
-                    let (reopened, recovery) = Log::open(file, cfg, ID).unwrap();
-                    // A frame whose flush power cut was never confirmed: never damaged.
-                    prop_assert!(recovery.damaged.is_empty());
-                    let mut landed = models.clone();
-                    apply(&mut landed, group, &u);
-                    if holds(&reopened, group, landed.get(&group)) {
-                        models = landed;
-                    } else if recovery.restored.contains(&group) {
-                        // The frame tore after its persist record landed: the torn tail, but
-                        // for the term and vote it held.
-                        let kept = models.get(&group).cloned().unwrap_or_default().kept(&u);
-                        prop_assert!(holds(&reopened, group, Some(&kept)));
-                        models.insert(group, kept);
-                    }
-                    check(&reopened, &models);
-                    log = reopened;
-                }
-                // Refused whole, changing nothing: the update breaks a rule, or every segment
-                // holds live records the sweep of the tail cannot free.
-                Err(
-                    LogError::Invalid { .. }
-                    | LogError::Backlog(_)
-                    | LogError::TooManyGroups(_)
-                    | LogError::Full,
-                ) => {}
-                Err(e) => return Err(TestCaseError::fail(format!("{e}"))),
-            }
-        }
-        let file = closed(log);
-        file.clear_faults().unwrap();
-        let (log, recovery) = Log::open(file, cfg, ID).unwrap();
-        prop_assert!(recovery.damaged.is_empty());
-        check(&log, &models);
+        survives_power_loss(&steps, seed, segment_blocks, max_segments)?;
     }
+}
+
+/// Generated histories, cut by power loss at random points: after each reopen the log holds
+/// every acknowledged update, and the one in flight either wholly or not at all.
+fn survives_power_loss(
+    steps: &[Step],
+    seed: u64,
+    segment_blocks: u64,
+    max_segments: u32,
+) -> Result<(), TestCaseError> {
+    let file = sim(seed);
+    let cfg = config(segment_blocks, max_segments);
+    let mut log = Log::create(file, cfg, ID).unwrap();
+    let mut models = Models::new();
+    let mut cut = false;
+    for step in steps {
+        if let Step::Crash { ops } = step {
+            let ops = *ops;
+            log.with_file(move |f| f.inject(Fault::PowerCut { ops }).unwrap())
+                .unwrap();
+            cut = true;
+            continue;
+        }
+        let Some((group, u)) = update(step, &models) else {
+            continue;
+        };
+        match log.write(group, u.clone()) {
+            Ok(()) => apply(&mut models, group, &u),
+            Err(LogError::Fenced) => {
+                prop_assert!(cut);
+                // Power is gone: crash, reopen, and see whether the update landed, which
+                // it may have wholly or not at all.
+                let file = closed(log);
+                file.crash(Crash::Random).unwrap();
+                file.clear_faults().unwrap();
+                cut = false;
+                let (reopened, recovery) = Log::open(file, cfg, ID).unwrap();
+                // A frame whose flush power cut was never confirmed: never damaged.
+                prop_assert!(recovery.damaged.is_empty());
+                let mut landed = models.clone();
+                apply(&mut landed, group, &u);
+                if holds(&reopened, group, landed.get(&group)) {
+                    models = landed;
+                } else if recovery.restored.contains(&group) {
+                    // The frame tore after its persist record landed: the torn tail, but
+                    // for the term and vote it held.
+                    let kept = models.get(&group).cloned().unwrap_or_default().kept(&u);
+                    prop_assert!(holds(&reopened, group, Some(&kept)));
+                    models.insert(group, kept);
+                }
+                check(&reopened, &models);
+                log = reopened;
+            }
+            // Refused whole, changing nothing: the update breaks a rule, or every segment
+            // holds live records the sweep of the tail cannot free.
+            Err(
+                LogError::Invalid { .. }
+                | LogError::Backlog(_)
+                | LogError::TooManyGroups(_)
+                | LogError::Full,
+            ) => {}
+            Err(e) => return Err(TestCaseError::fail(format!("{e}"))),
+        }
+    }
+    let file = closed(log);
+    file.clear_faults().unwrap();
+    let (log, recovery) = Log::open(file, cfg, ID).unwrap();
+    prop_assert!(recovery.damaged.is_empty());
+    check(&log, &models);
+    Ok(())
 }
 
 proptest! {
@@ -2492,63 +2519,76 @@ proptest! {
         seed in any::<u64>(),
         segment_blocks in 4u64..10,
     ) {
-        let (device, gated) = held(sim(seed));
-        let cfg = config(segment_blocks, 8);
-        let log = Log::create(device, cfg, ID).unwrap();
-        let segment = cfg.segment_bytes as usize;
-        let sizes = [16, segment / 4, segment / 2 - 200, segment - 2 * BLOCK];
-        let mut models = Models::new();
-        let plug = Update {
-            hard_state: Some(hard(1, 0)),
-            ..Update::default()
-        };
-        for round in &rounds {
-            gated.hold();
-            let shut = gated.released();
-            let plugged = log.submit(99, plug.clone()).unwrap();
-            gated.held();
-            let mut predicted = models.clone();
-            let mut submitted = Vec::new();
-            for (step, size) in round {
-                let Some((group, mut u)) = update(step, &predicted) else { continue };
-                if let Some(e) = &mut u.entries {
-                    for x in &mut e.entries {
-                        x.bytes = Vec::from(vec![b'x'; sizes[*size]]);
-                    }
-                }
-                apply(&mut predicted, group, &u);
-                let pending = match log.submit(group, u.clone()) {
-                    Ok(pending) => pending,
-                    // At the queue's bound, or the group's, or more than a frame holds: refused
-                    // whole, changing nothing.
-                    Err(LogError::Busy | LogError::TooLarge(_)) => continue,
-                    Err(e) => return Err(TestCaseError::fail(format!("{e}"))),
-                };
-                submitted.push((group, u, pending));
-            }
-            drop(shut);
-            plugged.wait().unwrap();
-            apply(&mut models, 99, &plug);
-            for (group, u, pending) in submitted {
-                match pending.wait() {
-                    Ok(()) => apply(&mut models, group, &u),
-                    Err(
-                        LogError::Invalid { .. }
-                        | LogError::TooLarge(_)
-                        | LogError::Full
-                        | LogError::Backlog(_)
-                        | LogError::TooManyGroups(_),
-                    ) => {}
-                    Err(e) => return Err(TestCaseError::fail(format!("{e}"))),
+        queued_in_order(&rounds, seed, segment_blocks)?;
+    }
+}
+
+/// Rounds of updates submitted while the writer is held in a flush: each group's accepted
+/// updates become durable in the order submitted.
+fn queued_in_order(
+    rounds: &[Vec<(Step, usize)>],
+    seed: u64,
+    segment_blocks: u64,
+) -> Result<(), TestCaseError> {
+    let (device, gated) = held(sim(seed));
+    let cfg = config(segment_blocks, 8);
+    let log = Log::create(device, cfg, ID).unwrap();
+    let segment = cfg.segment_bytes as usize;
+    let sizes = [16, segment / 4, segment / 2 - 200, segment - 2 * BLOCK];
+    let mut models = Models::new();
+    let plug = Update {
+        hard_state: Some(hard(1, 0)),
+        ..Update::default()
+    };
+    for round in rounds {
+        gated.hold();
+        let shut = gated.released();
+        let plugged = log.submit(99, plug.clone()).unwrap();
+        gated.held();
+        let mut predicted = models.clone();
+        let mut submitted = Vec::new();
+        for (step, size) in round {
+            let Some((group, mut u)) = update(step, &predicted) else {
+                continue;
+            };
+            if let Some(e) = &mut u.entries {
+                for x in &mut e.entries {
+                    x.bytes = vec![b'x'; sizes[*size]];
                 }
             }
-            check(&log, &models);
+            apply(&mut predicted, group, &u);
+            let pending = match log.submit(group, u.clone()) {
+                Ok(pending) => pending,
+                // At the queue's bound, or the group's, or more than a frame holds: refused
+                // whole, changing nothing.
+                Err(LogError::Busy | LogError::TooLarge(_)) => continue,
+                Err(e) => return Err(TestCaseError::fail(format!("{e}"))),
+            };
+            submitted.push((group, u, pending));
         }
-        let device = closed(log);
-        let (log, recovery) = Log::open(device, cfg, ID).unwrap();
-        prop_assert!(recovery.damaged.is_empty());
+        drop(shut);
+        plugged.wait().unwrap();
+        apply(&mut models, 99, &plug);
+        for (group, u, pending) in submitted {
+            match pending.wait() {
+                Ok(()) => apply(&mut models, group, &u),
+                Err(
+                    LogError::Invalid { .. }
+                    | LogError::TooLarge(_)
+                    | LogError::Full
+                    | LogError::Backlog(_)
+                    | LogError::TooManyGroups(_),
+                ) => {}
+                Err(e) => return Err(TestCaseError::fail(format!("{e}"))),
+            }
+        }
         check(&log, &models);
     }
+    let device = closed(log);
+    let (log, recovery) = Log::open(device, cfg, ID).unwrap();
+    prop_assert!(recovery.damaged.is_empty());
+    check(&log, &models);
+    Ok(())
 }
 
 proptest! {
@@ -2587,7 +2627,7 @@ proptest! {
                     .iter()
                     .map(|&n| Entry {
                         term: 2,
-                        bytes: Vec::from(vec![b'e'; n]),
+                        bytes: vec![b'e'; n],
                     })
                     .collect(),
             }),
@@ -2598,7 +2638,7 @@ proptest! {
                 .map(|(i, &n)| Proposal {
                     index: last + 1 + i as u64,
                     term: 2,
-                    bytes: Vec::from(vec![b'p'; n]),
+                    bytes: vec![b'p'; n],
                 })
                 .collect(),
             ..Update::default()
@@ -2637,6 +2677,148 @@ fn permits(holder: &Holder, permits: Option<u64>) {
         }
         None => holder.release(),
     }
+}
+
+/// The cases proptest found failing in mantle-log's history and shrank, kept in
+/// `log.proptest-regressions` as seeds of its old strategy and written here as the inputs they
+/// shrank to, so that they are run whatever strategy draws the steps. Cases recorded before a
+/// property took `max_segments` run under every value it now draws.
+#[test]
+fn recorded_regressions_hold() {
+    use Step::{Append, Compact, Crash, Hard, Propose, Snapshot};
+    let one = |group| Append {
+        group,
+        terms: vec![1],
+        back: 0,
+    };
+    let three = |group| Append {
+        group,
+        terms: vec![1, 1, 1],
+        back: 0,
+    };
+    let snap = |group, ahead| Snapshot { group, ahead };
+    let without_quota: [(Vec<Step>, u64, u64); 3] = [
+        (
+            vec![
+                three(3),
+                Compact { group: 3, keep: 1 },
+                Crash { ops: 0 },
+                one(0),
+                one(0),
+            ],
+            0,
+            4,
+        ),
+        (
+            vec![
+                one(0),
+                Propose { group: 0, ahead: 2 },
+                Append {
+                    group: 0,
+                    terms: vec![1, 1, 1],
+                    back: 1,
+                },
+                Append {
+                    group: 0,
+                    terms: vec![1],
+                    back: 2,
+                },
+                Crash { ops: 0 },
+                one(0),
+            ],
+            0,
+            5,
+        ),
+        (
+            vec![
+                snap(2, 0),
+                one(0),
+                one(1),
+                snap(0, 0),
+                one(0),
+                one(0),
+                Crash { ops: 1 },
+                snap(0, 0),
+                Crash { ops: 1 },
+                snap(0, 1),
+            ],
+            9_027_821_557_123_358_245,
+            4,
+        ),
+    ];
+    for (steps, seed, blocks) in &without_quota {
+        for max_segments in 3u32..8 {
+            survives_power_loss(steps, *seed, *blocks, max_segments).unwrap();
+            damage_never_unreported(steps, *seed, *blocks, max_segments).unwrap();
+        }
+    }
+    let mut long_one = vec![one(0), one(3), one(0), three(2), Hard { group: 0, term: 1 }];
+    long_one.extend(std::iter::repeat_with(|| one(0)).take(4));
+    long_one.extend([
+        Hard { group: 0, term: 1 },
+        one(0),
+        one(0),
+        three(3),
+        snap(0, 0),
+        one(0),
+        one(0),
+        snap(0, 0),
+        one(0),
+        snap(0, 0),
+        snap(0, 0),
+    ]);
+    long_one.extend(std::iter::repeat_with(|| one(0)).take(7));
+    long_one.extend([Crash { ops: 1 }, one(0)]);
+    let mut long_two = vec![
+        one(0),
+        one(0),
+        Append {
+            group: 2,
+            terms: vec![1, 1, 1, 1],
+            back: 0,
+        },
+        snap(0, 0),
+        snap(0, 0),
+        snap(0, 0),
+        one(0),
+        snap(0, 0),
+        one(0),
+        one(0),
+        snap(0, 0),
+        snap(1, 0),
+        one(0),
+        snap(0, 0),
+        snap(0, 0),
+    ];
+    long_two.extend(std::iter::repeat_with(|| one(0)).take(6));
+    long_two.extend([snap(0, 0), one(0), Crash { ops: 1 }, snap(0, 0)]);
+    let with_quota: [(Vec<Step>, u64, u64, u32); 3] = [
+        (
+            vec![Crash { ops: 2 }, Propose { group: 0, ahead: 1 }],
+            3_285_527_586_399_690_220,
+            4,
+            3,
+        ),
+        (long_one, 7_909_410_152_274_503_951, 5, 3),
+        (long_two, 827_730_651_015_473_522, 4, 3),
+    ];
+    for (steps, seed, blocks, max_segments) in &with_quota {
+        survives_power_loss(steps, *seed, *blocks, *max_segments).unwrap();
+        damage_never_unreported(steps, *seed, *blocks, *max_segments).unwrap();
+    }
+    let rounds = vec![vec![
+        (one(2), 1),
+        (one(1), 3),
+        (
+            Append {
+                group: 1,
+                terms: vec![1],
+                back: 1,
+            },
+            0,
+        ),
+    ]];
+    queued_in_order(&rounds, 0, 4).unwrap();
 }
 
 /// The settings of `config` with a writer that forms each batch from what is queued, so a
@@ -2993,7 +3175,7 @@ fn a_torn_opening_over_a_segment_swept_by_a_lost_frame_loses_nothing_unreported(
                         first: 1,
                         entries: vec![Entry {
                             term: 6,
-                            bytes: Vec::from(vec![7u8; 5000]),
+                            bytes: vec![7u8; 5000],
                         }],
                     }),
                     hard_state: Some(hard(6, 0)),
@@ -3224,81 +3406,96 @@ proptest! {
         segment_blocks in 4u64..10,
         max_segments in 3u32..8,
     ) {
-        let file = sim(seed);
-        let cfg = config_now(segment_blocks, max_segments);
-        let log = Log::create(file, cfg, ID).unwrap();
-        let mut models = Models::new();
-        for step in &steps {
-            if let Step::Crash { ops } = step {
-                let ops = *ops;
-                log.with_file(move |f| f.inject(Fault::PowerCut { ops }).unwrap()).unwrap();
-                continue;
-            }
-            let Some((group, u)) = update(step, &models) else { continue };
-            match log.write(group, u.clone()) {
-                Ok(()) => apply(&mut models, group, &u),
-                Err(LogError::Fenced) => {
-                    let file = closed(log);
-                    file.crash(Crash::Random).unwrap();
-                    file.clear_faults().unwrap();
-                    let image = file.durable_image().unwrap();
-                    let frames = valid_frames(&image);
-                    let Some(last) = frames.iter().max_by_key(|f| f.2) else {
-                        return Ok(());
-                    };
-                    file.inject(Fault::BitFlip {
-                        offset: last.0 + 70,
-                        bit: 0,
-                        stored: true,
-                    })
-                    .unwrap();
-                    let (reopened, recovery) = match Log::open(file, cfg, ID) {
-                        Err(LogError::Damaged(_)) => return Ok(()),
-                        Err(e) => return Err(TestCaseError::fail(format!("{e}"))),
-                        Ok(r) => r,
-                    };
-                    for (&g, m) in &models {
-                        if g == group || recovery.damaged.contains(&g) {
-                            continue;
-                        }
-                        let view = reopened.view(g).unwrap();
-                        prop_assert!(view.is_some(), "group {g} gone: {recovery:?}");
-                        let view = view.unwrap();
-                        prop_assert_eq!(view.start, m.start, "group {}", g);
-                        if let Some(h) = m.hard {
-                            let got = view.hard_state.unwrap();
+        damage_never_unreported(&steps, seed, segment_blocks, max_segments)?;
+    }
+}
+
+/// Generated histories cut by power loss, and then the last frame that still reads damaged at
+/// rest: nothing acknowledged goes unreported.
+fn damage_never_unreported(
+    steps: &[Step],
+    seed: u64,
+    segment_blocks: u64,
+    max_segments: u32,
+) -> Result<(), TestCaseError> {
+    let file = sim(seed);
+    let cfg = config_now(segment_blocks, max_segments);
+    let log = Log::create(file, cfg, ID).unwrap();
+    let mut models = Models::new();
+    for step in steps {
+        if let Step::Crash { ops } = step {
+            let ops = *ops;
+            log.with_file(move |f| f.inject(Fault::PowerCut { ops }).unwrap())
+                .unwrap();
+            continue;
+        }
+        let Some((group, u)) = update(step, &models) else {
+            continue;
+        };
+        match log.write(group, u.clone()) {
+            Ok(()) => apply(&mut models, group, &u),
+            Err(LogError::Fenced) => {
+                let file = closed(log);
+                file.crash(Crash::Random).unwrap();
+                file.clear_faults().unwrap();
+                let image = file.durable_image().unwrap();
+                let frames = valid_frames(&image);
+                let Some(last) = frames.iter().max_by_key(|f| f.2) else {
+                    return Ok(());
+                };
+                file.inject(Fault::BitFlip {
+                    offset: last.0 + 70,
+                    bit: 0,
+                    stored: true,
+                })
+                .unwrap();
+                let (reopened, recovery) = match Log::open(file, cfg, ID) {
+                    Err(LogError::Damaged(_)) => return Ok(()),
+                    Err(e) => return Err(TestCaseError::fail(format!("{e}"))),
+                    Ok(r) => r,
+                };
+                for (&g, m) in &models {
+                    if g == group || recovery.damaged.contains(&g) {
+                        continue;
+                    }
+                    let view = reopened.view(g).unwrap();
+                    prop_assert!(view.is_some(), "group {g} gone: {recovery:?}");
+                    let view = view.unwrap();
+                    prop_assert_eq!(view.start, m.start, "group {}", g);
+                    if let Some(h) = m.hard {
+                        let got = view.hard_state.unwrap();
+                        prop_assert!(
+                            got.term > h.term || (got.term == h.term && got.vote == h.vote),
+                            "group {g}: {got:?} regressed from {h:?}"
+                        );
+                    }
+                    for (i, (term, bytes)) in (m.start.index + 1..).zip(&m.entries) {
+                        if i <= view.last {
+                            let got = reopened.entries(g, i, i + 1, u64::MAX).unwrap();
                             prop_assert!(
-                                got.term > h.term || (got.term == h.term && got.vote == h.vote),
-                                "group {g}: {got:?} regressed from {h:?}"
+                                got[0].term == *term && *got[0].bytes == bytes[..],
+                                "group {g} entry {i} differs"
+                            );
+                        } else {
+                            prop_assert!(
+                                view.uncertain.is_some_and(|mark| mark.index >= i),
+                                "group {g} entry {i} lost unmarked: {view:?} {recovery:?}"
                             );
                         }
-                        for (i, (term, bytes)) in (m.start.index + 1..).zip(&m.entries) {
-                            if i <= view.last {
-                                let got = reopened.entries(g, i, i + 1, u64::MAX).unwrap();
-                                prop_assert!(
-                                    got[0].term == *term && *got[0].bytes == bytes[..],
-                                    "group {g} entry {i} differs"
-                                );
-                            } else {
-                                prop_assert!(
-                                    view.uncertain.is_some_and(|mark| mark.index >= i),
-                                    "group {g} entry {i} lost unmarked: {view:?} {recovery:?}"
-                                );
-                            }
-                        }
                     }
-                    return Ok(());
                 }
-                Err(
-                    LogError::Invalid { .. }
-                    | LogError::Backlog(_)
-                    | LogError::TooManyGroups(_)
-                    | LogError::Full,
-                ) => {}
-                Err(e) => return Err(TestCaseError::fail(format!("{e}"))),
+                return Ok(());
             }
+            Err(
+                LogError::Invalid { .. }
+                | LogError::Backlog(_)
+                | LogError::TooManyGroups(_)
+                | LogError::Full,
+            ) => {}
+            Err(e) => return Err(TestCaseError::fail(format!("{e}"))),
         }
     }
+    Ok(())
 }
 
 /// One thread keeps many groups' submissions out at once through `submit_waking`: each

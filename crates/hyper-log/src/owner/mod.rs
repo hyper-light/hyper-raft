@@ -186,24 +186,28 @@ impl<F: BlockFile + 'static> Owner<F> {
         self.step(inbox);
         while !self.finished() {
             match self.next(inbox) {
-                Next::Message(m) => self.handle(m, inbox),
-                Next::Waited => self.gathered(inbox),
-                Next::Closed => break,
+                Ok(Some(m)) => self.handle(m, inbox),
+                Ok(None) => self.gathered(inbox),
+                Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => break,
             }
         }
         self.stop()
     }
 
-    /// The next message, or the end of the writer's wait for returning submitters.
-    fn next(&self, inbox: &Receiver<Message<F>>) -> Next<F> {
+    /// The next message, or `None` once the writer's wait for returning submitters is over;
+    /// an error once the inbox has closed.
+    fn next(&self, inbox: &Receiver<Message<F>>) -> Result<Option<Message<F>>, RecvTimeoutError> {
         let Some(deadline) = self.gather.as_ref().map(|g| g.deadline) else {
-            return inbox.recv().map_or(Next::Closed, Next::Message);
+            return inbox
+                .recv()
+                .map(Some)
+                .map_err(|_| RecvTimeoutError::Disconnected);
         };
         let left = deadline.saturating_duration_since(Instant::now());
         match inbox.recv_timeout(left) {
-            Ok(m) => Next::Message(m),
-            Err(RecvTimeoutError::Timeout) => Next::Waited,
-            Err(RecvTimeoutError::Disconnected) => Next::Closed,
+            Ok(m) => Ok(Some(m)),
+            Err(RecvTimeoutError::Timeout) => Ok(None),
+            Err(e) => Err(e),
         }
     }
 
@@ -341,14 +345,6 @@ impl<F: BlockFile + 'static> Owner<F> {
         // A device that ended drops the look, and its caller hears the log closed.
         self.looking = self.device.try_send(Job::Look(look)).is_ok();
     }
-}
-
-/// What the owner's wait gives it.
-enum Next<F> {
-    Message(Message<F>),
-    /// The writer's wait for returning submitters is over.
-    Waited,
-    Closed,
 }
 
 impl Schedule {

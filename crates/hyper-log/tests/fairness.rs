@@ -15,9 +15,9 @@
 
 use std::sync::Arc;
 
-use mantle_disk::buf::Alignment;
-use mantle_disk::sim::SimFile;
-use mantle_log::{Class, Config, Entries, Entry, Log, LogError, Pending, Update, Waits};
+use hyper_block::buf::Alignment;
+use hyper_block::sim::SimFile;
+use hyper_log::{Class, Config, Entries, Entry, Log, LogError, Pending, Update, Waits};
 
 mod common;
 use common::{Released, Stepped};
@@ -41,7 +41,7 @@ fn config() -> Config {
 
 /// An update of one entry at `index` whose records take `len` payload bytes.
 fn sized(index: u64, len: usize) -> Update {
-    let header = mantle_log::format::encoded_len(&mantle_log::format::Record::Entries {
+    let header = hyper_log::format::encoded_len(&hyper_log::format::Record::Entries {
         group: 0,
         first: index,
         entries: &[(1, &[])],

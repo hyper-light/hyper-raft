@@ -6,6 +6,9 @@
 //! frame, writes and flushes it, publishes it to readers, and answers once a later durable
 //! record confirms the flush. Reads
 //! serve the view focal-raft's `Storage` needs: bounds, terms and entries.
+//!
+//! From mantle-log at mantle `147f035` (`ORIGIN.md`).
+#![allow(missing_docs)]
 #![cfg_attr(
     test,
     allow(
@@ -18,6 +21,7 @@
     )
 )]
 
+pub mod codec;
 mod error;
 pub mod format;
 mod recover;
@@ -32,8 +36,8 @@ use std::sync::{Arc, RwLock};
 use std::task::Waker;
 use std::thread::JoinHandle;
 
-use mantle_disk::block::BlockFile;
-use mantle_disk::buf::{Alignment, Pool};
+use hyper_block::block::BlockFile;
+use hyper_block::buf::{Alignment, Pool};
 
 pub use error::LogError;
 pub use format::{HardState, Start};
@@ -415,7 +419,7 @@ impl<F: BlockFile + 'static> Log<F> {
         let (sender, receiver) = sync_channel(capacity);
         let writer = writer::Writer::new(Arc::clone(&shared), receiver, first)?;
         let handle = std::thread::Builder::new()
-            .name("mantle-log".into())
+            .name("hyper-log".into())
             .spawn(move || writer.run())
             .map_err(|_| LogError::Closed)?;
         Ok((
@@ -821,7 +825,7 @@ impl<F: BlockFile + 'static> Log<F> {
     }
 
     /// The file's bytes `[begin, end)`, block-aligned, in a buffer from the pool.
-    fn read_span(&self, begin: u64, end: u64) -> Result<mantle_disk::buf::PoolBuf<'_>, LogError> {
+    fn read_span(&self, begin: u64, end: u64) -> Result<hyper_block::buf::PoolBuf<'_>, LogError> {
         let size = usize::try_from(end.saturating_sub(begin))
             .map_err(|_| LogError::Damaged("a read past usize"))?;
         let mut buf = self

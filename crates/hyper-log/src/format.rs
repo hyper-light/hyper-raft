@@ -8,7 +8,7 @@
 //! for. A persist record says what one frame's flush made durable, group by group, and is
 //! checksummed as a whole.
 
-use mantle_codec::{Reader, Writer};
+use crate::codec::{Reader, Writer};
 
 pub const SEGMENT_MAGIC: [u8; 4] = *b"MNLS";
 pub const FRAME_MAGIC: [u8; 4] = *b"MNLF";
@@ -67,7 +67,7 @@ impl SegmentHeader {
         w.u64(self.incarnation);
         w.u64(self.nonce);
         w.u64(self.segment_bytes);
-        let crc = mantle_crc::crc32c(w.as_slice());
+        let crc = crate::codec::crc32c(w.as_slice());
         w.u32(crc);
         w.into_vec()
     }
@@ -76,7 +76,7 @@ impl SegmentHeader {
     pub fn decode(block: &[u8]) -> Option<Self> {
         let bytes = block.get(..SEGMENT_HEADER_LEN)?;
         let (body, crc) = bytes.split_at(SEGMENT_HEADER_LEN.checked_sub(4)?);
-        if mantle_crc::crc32c(body) != u32::from_le_bytes(crc.try_into().ok()?) {
+        if crate::codec::crc32c(body) != u32::from_le_bytes(crc.try_into().ok()?) {
             return None;
         }
         let mut r = Reader::new(body);
@@ -148,7 +148,7 @@ impl FrameHeader {
         w.u64(tail);
         w.u32(payload_len);
         w.u32(records);
-        let mut crc = mantle_crc::Crc32c::new();
+        let mut crc = crate::codec::Crc32c::new();
         crc.update(w.as_slice());
         crc.update(payload);
         w.u32(crc.finish());
@@ -191,7 +191,7 @@ impl FrameHeader {
         ) else {
             return false;
         };
-        let mut crc = mantle_crc::Crc32c::new();
+        let mut crc = crate::codec::Crc32c::new();
         crc.update(head);
         crc.update(payload);
         crc.finish() == self.crc
@@ -273,7 +273,7 @@ pub enum Placed {
 /// The CRC-32C an entry or proposal carries: of its group, index, term and bytes, so a
 /// read verifies both the bytes and that they are the ones asked for.
 pub fn entry_crc(group: u128, index: u64, term: u64, bytes: &[u8]) -> u32 {
-    let mut crc = mantle_crc::Crc32c::new();
+    let mut crc = crate::codec::Crc32c::new();
     crc.update(&group.to_le_bytes());
     crc.update(&index.to_le_bytes());
     crc.update(&term.to_le_bytes());
@@ -654,7 +654,7 @@ impl Persist {
             w.u64(uncertain.index);
             w.u64(uncertain.term);
         }
-        let crc = mantle_crc::crc32c(w.as_slice());
+        let crc = crate::codec::crc32c(w.as_slice());
         w.u32(crc);
         Some(w.into_vec())
     }
@@ -673,7 +673,7 @@ impl Persist {
         let len = persist_len(count)?;
         let whole = bytes.get(..len)?;
         let (body, crc) = whole.split_at(len.checked_sub(4)?);
-        if mantle_crc::crc32c(body) != u32::from_le_bytes(crc.try_into().ok()?) {
+        if crate::codec::crc32c(body) != u32::from_le_bytes(crc.try_into().ok()?) {
             return None;
         }
         let mut r = Reader::new(body.get(PERSIST_HEADER_LEN..)?);

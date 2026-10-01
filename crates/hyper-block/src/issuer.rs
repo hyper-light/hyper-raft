@@ -36,8 +36,12 @@ use std::thread::{Builder, JoinHandle};
 use crate::DiskError;
 use crate::block::BlockFile;
 use crate::buf::AlignedBuf;
-use crate::calibrate::UNDESCRIBED_QUEUE_DEPTH;
 use crate::threads::{self, Reservation};
+
+/// The queue assumed of a device the OS cannot describe: Native Command Queuing's 32 commands,
+/// the shallowest queue of a command-queuing interface (Serial ATA Revision 2.6, §13.6.2;
+/// AHCI 1.3.1 §1.1), which calibration's ladder then measures (mantle CLAUDE.md §5).
+pub const UNDESCRIBED_QUEUE_DEPTH: usize = 32;
 
 /// The transfers a device's issuer keeps in flight: the smaller of the queue the OS reports
 /// (`UNDESCRIBED_QUEUE_DEPTH` when it reports none) and the depth calibration measured
@@ -147,7 +151,7 @@ impl Issuer {
         let completions = events.clone();
         let device = path.to_path_buf();
         let thread = Builder::new()
-            .name("mantle-issuer".into())
+            .name("hyper-issuer".into())
             .spawn(move || run(&device, &inbox, &completions, workers, &ready))
             .map_err(|source| DiskError::Io {
                 op: "start a device issuer",
@@ -286,7 +290,7 @@ fn run(
             let (tasks, assigned) = sync_channel::<Task>(1);
             let (files, done) = (&files, completions.clone());
             match Builder::new()
-                .name("mantle-io".into())
+                .name("hyper-io".into())
                 .spawn_scoped(scope, move || work(id, files, &assigned, &done))
             {
                 Ok(handle) => {

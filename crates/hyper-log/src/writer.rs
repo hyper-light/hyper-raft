@@ -26,17 +26,17 @@
 //! and a few replicas would alternate between batches, every update waiting for two flushes
 //! (docs/measurements/2026-09-28-raft-log-benchmark.md). The writer waits for them as long as
 //! waiting is expected to lower total latency, as the chunk store's writer does
-//! (`mantle_disk::commit`). Under `Waits::Never` it forms each batch from what is queued.
+//! (`hyper_block::commit`). Under `Waits::Never` it forms each batch from what is queued.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::Receiver;
 
-use mantle_codec::Writer as Payload;
-use mantle_disk::block::BlockFile;
-use mantle_disk::buf::AlignedBuf;
-use mantle_disk::commit::Anticipation;
+use crate::codec::Writer as Payload;
+use hyper_block::block::BlockFile;
+use hyper_block::buf::AlignedBuf;
+use hyper_block::commit::Anticipation;
 
 use crate::format::{
     self, FRAME_HEADER_BYTES, FRAME_HEADER_LEN, FrameHeader, Owned, Placed, Record, SegmentHeader,
@@ -327,7 +327,7 @@ impl<F: BlockFile> Writer<F> {
     }
 
     /// Waits for the replicas the last confirmation answered while waiting is expected to
-    /// lower total latency, and learns how many of them return (`mantle_disk::commit`). The
+    /// lower total latency, and learns how many of them return (`hyper_block::commit`). The
     /// first `before` submissions in the batch were sent before the answers.
     fn gather(&mut self, batch: &mut VecDeque<Submission>, answered: u64, before: u64) {
         if answered == 0 || self.shared.config.waits == Waits::Never {

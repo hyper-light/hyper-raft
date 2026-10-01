@@ -12,10 +12,10 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
-use mantle_disk::block::BlockFile;
-use mantle_disk::buf::{AlignedBuf, Alignment};
-use mantle_disk::sim::{Crash, Fault, SimFile};
-use mantle_log::{
+use hyper_block::block::BlockFile;
+use hyper_block::buf::{AlignedBuf, Alignment};
+use hyper_block::sim::{Crash, Fault, SimFile};
+use hyper_log::{
     Class, Config, Entries, Entry, HardState, Log, LogError, Proposal, Start, Update, View, Waits,
 };
 use proptest::prelude::*;
@@ -151,7 +151,7 @@ fn apply(models: &mut Models, group: u128, u: &Update) {
 }
 
 /// Whether the log holds exactly `model` for `group`, `None` meaning nothing.
-fn holds<F: mantle_disk::block::BlockFile>(
+fn holds<F: hyper_block::block::BlockFile>(
     log: &Log<F>,
     group: u128,
     model: Option<&Model>,
@@ -188,7 +188,7 @@ fn holds<F: mantle_disk::block::BlockFile>(
 }
 
 /// The log holds exactly what the models say.
-fn check<F: mantle_disk::block::BlockFile>(log: &Log<F>, models: &Models) {
+fn check<F: hyper_block::block::BlockFile>(log: &Log<F>, models: &Models) {
     let mut groups = log.groups().unwrap();
     groups.sort_unstable();
     let mut expected: Vec<u128> = models.keys().copied().collect();
@@ -514,7 +514,7 @@ fn reclaiming_segments_keeps_every_live_record() {
     assert!(recovery.damaged.is_empty());
     check(&log, &models);
     // The file never grew past its quota.
-    let len = mantle_disk::block::BlockFile::len(&file).unwrap();
+    let len = hyper_block::block::BlockFile::len(&file).unwrap();
     assert!(len <= cfg.segment_bytes * u64::from(cfg.max_segments));
 }
 
@@ -1215,7 +1215,7 @@ fn a_torn_frame_without_its_persist_record_is_the_torn_tail() {
         .expect("the frame's write reached the disk");
     // The frame of sequence 2 keeps its record in the first persist slot.
     assert!(
-        mantle_log::format::Persist::decode(&image).is_none_or(|p| p.sequence != 2),
+        hyper_log::format::Persist::decode(&image).is_none_or(|p| p.sequence != 2),
         "the frame's persist record reached the disk"
     );
     damage(&file, torn.0 + 70);
@@ -1268,7 +1268,7 @@ fn segment_headers(image: &[u8], segment: u64) -> Vec<(u64, u64)> {
         .chunks(segment as usize)
         .enumerate()
         .filter_map(|(slot, s)| {
-            let h = mantle_log::format::SegmentHeader::decode(s)?;
+            let h = hyper_log::format::SegmentHeader::decode(s)?;
             Some((slot as u64 * segment, h.incarnation))
         })
         .collect()
@@ -1278,7 +1278,7 @@ fn segment_headers(image: &[u8], segment: u64) -> Vec<(u64, u64)> {
 fn valid_frames(image: &[u8]) -> Vec<(u64, u64, u64)> {
     let mut out = Vec::new();
     for (i, block) in image.chunks(BLOCK).enumerate() {
-        let Some(h) = mantle_log::format::FrameHeader::decode(block) else {
+        let Some(h) = hyper_log::format::FrameHeader::decode(block) else {
             continue;
         };
         let start = i * BLOCK;
@@ -1342,14 +1342,14 @@ fn a_damaged_header_of_the_newest_segment_is_reported() {
 fn an_opening_whose_header_never_became_durable_is_the_torn_tail() {
     let file = one_frame_each(21, 15);
     let segment = AREA + 16 * BLOCK as u64;
-    let zeros = mantle_disk::buf::AlignedBuf::zeroed(BLOCK, Alignment::new(BLOCK).unwrap())
+    let zeros = hyper_block::buf::AlignedBuf::zeroed(BLOCK, Alignment::new(BLOCK).unwrap())
         .map(|mut b| {
             b.set_len(BLOCK).unwrap();
             b
         })
         .unwrap();
-    mantle_disk::block::BlockFile::write_all_at(&*file, zeros.as_slice(), segment).unwrap();
-    mantle_disk::block::BlockFile::sync_data(&*file).unwrap();
+    hyper_block::block::BlockFile::write_all_at(&*file, zeros.as_slice(), segment).unwrap();
+    hyper_block::block::BlockFile::sync_data(&*file).unwrap();
     let (log, _) = Log::open(Arc::clone(&file), config(16, 8), ID).unwrap();
     assert_eq!(log.view(1).unwrap().unwrap().last, 14);
     log.write(
@@ -1447,12 +1447,12 @@ fn stale_frames_in_a_reused_slot_prove_nothing() {
     let image = file.durable_image().unwrap();
     for (i, chunk) in image.chunks(BLOCK).enumerate() {
         let mut b =
-            mantle_disk::buf::AlignedBuf::zeroed(BLOCK, Alignment::new(BLOCK).unwrap()).unwrap();
+            hyper_block::buf::AlignedBuf::zeroed(BLOCK, Alignment::new(BLOCK).unwrap()).unwrap();
         b.extend_from_slice(chunk).unwrap();
-        mantle_disk::block::BlockFile::write_all_at(&*torn, b.as_slice(), (i * BLOCK) as u64)
+        hyper_block::block::BlockFile::write_all_at(&*torn, b.as_slice(), (i * BLOCK) as u64)
             .unwrap();
     }
-    mantle_disk::block::BlockFile::sync_data(&*torn).unwrap();
+    hyper_block::block::BlockFile::sync_data(&*torn).unwrap();
 
     file.inject(Fault::BitFlip {
         offset: last_at,
@@ -1522,24 +1522,24 @@ impl Drop for Shut {
     }
 }
 
-impl mantle_disk::block::BlockFile for Gated {
+impl hyper_block::block::BlockFile for Gated {
     fn alignment(&self) -> Alignment {
         self.file.alignment()
     }
 
-    fn len(&self) -> Result<u64, mantle_disk::DiskError> {
-        mantle_disk::block::BlockFile::len(&*self.file)
+    fn len(&self) -> Result<u64, hyper_block::DiskError> {
+        hyper_block::block::BlockFile::len(&*self.file)
     }
 
-    fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> Result<(), mantle_disk::DiskError> {
+    fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> Result<(), hyper_block::DiskError> {
         self.file.read_exact_at(buf, offset)
     }
 
-    fn write_all_at(&self, buf: &[u8], offset: u64) -> Result<(), mantle_disk::DiskError> {
+    fn write_all_at(&self, buf: &[u8], offset: u64) -> Result<(), hyper_block::DiskError> {
         self.file.write_all_at(buf, offset)
     }
 
-    fn sync_data(&self) -> Result<(), mantle_disk::DiskError> {
+    fn sync_data(&self) -> Result<(), hyper_block::DiskError> {
         let mut gate = self.gate.lock().unwrap();
         gate.1 += 1;
         self.changed.notify_all();
@@ -1575,27 +1575,27 @@ impl Counting {
     }
 }
 
-impl mantle_disk::block::BlockFile for Counting {
+impl hyper_block::block::BlockFile for Counting {
     fn alignment(&self) -> Alignment {
         self.file.alignment()
     }
 
-    fn len(&self) -> Result<u64, mantle_disk::DiskError> {
+    fn len(&self) -> Result<u64, hyper_block::DiskError> {
         self.lengths
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        mantle_disk::block::BlockFile::len(&*self.file)
+        hyper_block::block::BlockFile::len(&*self.file)
     }
 
-    fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> Result<(), mantle_disk::DiskError> {
+    fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> Result<(), hyper_block::DiskError> {
         self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.file.read_exact_at(buf, offset)
     }
 
-    fn write_all_at(&self, buf: &[u8], offset: u64) -> Result<(), mantle_disk::DiskError> {
+    fn write_all_at(&self, buf: &[u8], offset: u64) -> Result<(), hyper_block::DiskError> {
         self.file.write_all_at(buf, offset)
     }
 
-    fn sync_data(&self) -> Result<(), mantle_disk::DiskError> {
+    fn sync_data(&self) -> Result<(), hyper_block::DiskError> {
         self.file.sync_data()
     }
 }
@@ -1619,7 +1619,7 @@ fn opening_reads_each_segment_through_a_window() {
         log.write(1, u).unwrap();
     }
     drop(log);
-    let len = mantle_disk::block::BlockFile::len(&*counting.file).unwrap();
+    let len = hyper_block::block::BlockFile::len(&*counting.file).unwrap();
     let segments = (len - AREA).div_ceil(settings.segment_bytes);
     counting.take();
     let (log, recovery) = Log::open(Arc::clone(&counting), settings, ID).unwrap();
@@ -1781,7 +1781,7 @@ fn the_queue_bounds_every_submission_not_yet_answered() {
 
 /// An update of one entry whose records take `len` payload bytes.
 fn sized(first: u64, len: usize) -> Update {
-    let header = mantle_log::format::encoded_len(&mantle_log::format::Record::Entries {
+    let header = hyper_log::format::encoded_len(&hyper_log::format::Record::Entries {
         group: 0,
         first,
         entries: &[(1, &[])],
@@ -1802,7 +1802,7 @@ fn sized(first: u64, len: usize) -> Update {
 /// What a submission of `len` payload bytes holds of the queue's byte bound: its records and
 /// its row in the frame's persist record.
 fn charged(len: usize) -> u64 {
-    (len + mantle_log::format::PERSIST_GROUP_LEN) as u64
+    (len + hyper_log::format::PERSIST_GROUP_LEN) as u64
 }
 
 /// The queue's byte bound is three frames of the largest charge, and holds every submission
@@ -1861,7 +1861,7 @@ fn empty_entries_are_charged_their_records() {
         }),
         ..Update::default()
     };
-    let len = mantle_log::format::encoded_len(&mantle_log::format::Record::Entries {
+    let len = hyper_log::format::encoded_len(&hyper_log::format::Record::Entries {
         group: 0,
         first: 1,
         entries: &[(1, &[])],
@@ -1962,7 +1962,7 @@ fn hot_beside_cold(seed: u64, hot_class: Class, cold_class: Class) {
     // update arrives for every frame.
     let mut next = [1u64, 1u64];
     let mut feed =
-        |log: &Log<Arc<Stepped>>, frame: usize, pending: &mut Vec<mantle_log::Pending>| {
+        |log: &Log<Arc<Stepped>>, frame: usize, pending: &mut Vec<hyper_log::Pending>| {
             let g = frame % 2;
             let update = sized(next[g], hot);
             pending.push(log.submit_in(g as u128 + 1, hot_class, update).unwrap());
@@ -2322,7 +2322,7 @@ fn another_log_or_geometry_is_refused() {
     ));
     // A segment one block past a buffer's bound, refused before the file is touched.
     let past = Config {
-        segment_bytes: mantle_disk::buf::MAX_BUFFER as u64 + BLOCK as u64,
+        segment_bytes: hyper_block::buf::MAX_BUFFER as u64 + BLOCK as u64,
         ..config(16, 8)
     };
     let untouched = sim(11);
@@ -2756,16 +2756,16 @@ impl Gate {
     }
 }
 
-impl mantle_disk::block::BlockFile for Gate {
+impl hyper_block::block::BlockFile for Gate {
     fn alignment(&self) -> Alignment {
         self.file.alignment()
     }
 
-    fn len(&self) -> Result<u64, mantle_disk::DiskError> {
-        mantle_disk::block::BlockFile::len(&*self.file)
+    fn len(&self) -> Result<u64, hyper_block::DiskError> {
+        hyper_block::block::BlockFile::len(&*self.file)
     }
 
-    fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> Result<(), mantle_disk::DiskError> {
+    fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> Result<(), hyper_block::DiskError> {
         let mut s = self.state.lock().unwrap();
         let end = offset + buf.len() as u64;
         if s.trap.is_some_and(|(a, b)| offset < b && a < end) {
@@ -2779,11 +2779,11 @@ impl mantle_disk::block::BlockFile for Gate {
         self.file.read_exact_at(buf, offset)
     }
 
-    fn write_all_at(&self, buf: &[u8], offset: u64) -> Result<(), mantle_disk::DiskError> {
+    fn write_all_at(&self, buf: &[u8], offset: u64) -> Result<(), hyper_block::DiskError> {
         self.file.write_all_at(buf, offset)
     }
 
-    fn sync_data(&self) -> Result<(), mantle_disk::DiskError> {
+    fn sync_data(&self) -> Result<(), hyper_block::DiskError> {
         let mut s = self.state.lock().unwrap();
         if s.permits == Some(0) {
             s.held += 1;
@@ -2810,7 +2810,7 @@ impl mantle_disk::block::BlockFile for Gate {
 fn a_confirmation_outlives_a_torn_record_of_the_next_frame() {
     let (mut reopened, mut torn) = (0, 0u32);
     // The second persist slot: a record of the log's most groups, padded to the block.
-    let slot = mantle_log::format::persist_len(64)
+    let slot = hyper_log::format::persist_len(64)
         .unwrap()
         .next_multiple_of(BLOCK);
     for seed in 0..64u64 {
@@ -2879,7 +2879,7 @@ fn a_confirmation_outlives_a_torn_record_of_the_next_frame() {
         }
         // The third frame's record, in the second persist slot, where a confirmation written
         // into the next frame's slot would have been: torn means it no longer reads at all.
-        let record = mantle_log::format::Persist::decode(&image[slot..]);
+        let record = hyper_log::format::Persist::decode(&image[slot..]);
         let tore = record.is_none();
         let two = frames.iter().find(|f| f.2 == 2).unwrap();
         damage(&file, two.0 + 70);
@@ -3082,7 +3082,7 @@ fn frame_tails(image: &[u8]) -> BTreeMap<u64, (u64, u64)> {
     valid_frames(image)
         .into_iter()
         .map(|(at, _, seq)| {
-            let h = mantle_log::format::FrameHeader::decode(&image[at as usize..]).unwrap();
+            let h = hyper_log::format::FrameHeader::decode(&image[at as usize..]).unwrap();
             (seq, (at, h.tail))
         })
         .collect()
@@ -3455,7 +3455,7 @@ fn a_waker_is_woken_once_for_each_answer() {
     let file = sim(23);
     let log = Log::create(Arc::clone(&file), config(64, 8), ID).unwrap();
     let (ready, woken) = std::sync::mpsc::sync_channel(GROUPS);
-    let mut out: Vec<Option<mantle_log::Pending>> = (0..GROUPS)
+    let mut out: Vec<Option<hyper_log::Pending>> = (0..GROUPS)
         .map(|g| {
             let waker = std::task::Waker::from(Arc::new(Ready {
                 index: g,
@@ -3466,7 +3466,7 @@ fn a_waker_is_woken_once_for_each_answer() {
                 ..Update::default()
             };
             Some(
-                log.submit_waking(g as u128, mantle_log::Class::Normal, u, waker)
+                log.submit_waking(g as u128, hyper_log::Class::Normal, u, waker)
                     .unwrap(),
             )
         })

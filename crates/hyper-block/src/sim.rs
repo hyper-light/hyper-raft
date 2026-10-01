@@ -16,7 +16,6 @@ use std::sync::Mutex;
 use crate::DiskError;
 use crate::block::BlockFile;
 use crate::buf::Alignment;
-use crate::measure::SplitMix64;
 
 /// The largest simulated file: tests hold two copies of it in memory.
 pub const MAX_SIM_LEN: u64 = 1 << 30;
@@ -228,6 +227,25 @@ fn sim_error(what: &str) -> DiskError {
         op: "sim",
         path: std::path::PathBuf::from("sim"),
         source: std::io::Error::new(std::io::ErrorKind::InvalidInput, what.to_owned()),
+    }
+}
+
+/// SplitMix64 (Steele, Lea and Flood, "Fast Splittable Pseudorandom Number Generators",
+/// OOPSLA 2014): one word of state, so that every crash and fault replays from its seed.
+#[derive(Debug, Clone)]
+pub struct SplitMix64(u64);
+
+impl SplitMix64 {
+    pub fn new(seed: u64) -> Self {
+        Self(seed)
+    }
+
+    pub fn next_u64(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
     }
 }
 

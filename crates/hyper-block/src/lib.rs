@@ -1,5 +1,10 @@
-//! Local storage devices: what the device under a path is, what it measures as, and how to
-//! move bytes to it with alignment and durability the device and OS actually guarantee.
+//! Block I/O for the shared log (mantle note 32 §3.9): how to move bytes to a device with the
+//! alignment and durability the device and OS actually guarantee, from mantle-disk at mantle
+//! `147f035` (`ORIGIN.md`).
+//!
+//! Identifying and measuring a device stays in mantle-disk: a caller that knows the device's
+//! alignment, queue and measured depth hands them in.
+#![allow(missing_docs)]
 #![cfg_attr(
     test,
     allow(
@@ -16,18 +21,12 @@ use std::path::PathBuf;
 
 pub mod block;
 pub mod buf;
-pub mod calibrate;
 pub mod commit;
 pub mod file;
-pub mod histogram;
-pub mod identity;
 #[cfg(all(target_vendor = "apple", any(test, feature = "sim")))]
 pub mod image;
 pub mod issuer;
-pub mod measure;
 mod node;
-pub mod probe;
-pub mod rounds;
 pub mod scratch;
 #[cfg(any(test, feature = "sim"))]
 pub mod sim;

@@ -20,7 +20,6 @@ use std::path::{Path, PathBuf};
 
 use crate::DiskError;
 use crate::buf::Alignment;
-use crate::identity::{FileSystemKind, Zoned};
 
 /// Whether transfers bypass the OS page cache.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -80,7 +79,7 @@ impl DeviceFile {
             ),
         };
         let node = crate::node::is_node(&file, path).map_err(wrap("stat"))?;
-        refuse_zones(path, node)?;
+        refuse_zones(path, &file, node)?;
         Ok(Self {
             file,
             path: path.to_path_buf(),
@@ -259,13 +258,13 @@ impl DeviceFile {
     }
 }
 
-/// Refuses what cannot hold a `DeviceFile` (audit B10). Mantle writes anywhere in the file:
-/// superblocks, a circular index log and reused segments all rewrite earlier offsets. A
-/// host-managed zoned device refuses a write anywhere but at its zone's write pointer
-/// (ZBC/ZAC, as Linux's zonefs documentation summarizes), and every zonefs file is a zone.
-/// A file on a file system over such a device is placed by that file system.
-fn refuse_zones(path: &Path, node: bool) -> Result<(), DiskError> {
-    match zone_refusal(&crate::probe::identify(path), node) {
+/// Refuses what cannot hold a `DeviceFile` (mantle audit B10). A log or a volume writes
+/// anywhere in its file: superblocks, a circular index log and reused segments all rewrite
+/// earlier offsets. A host-managed zoned device refuses a write anywhere but at its zone's write
+/// pointer (ZBC/ZAC, as Linux's zonefs documentation summarizes), and every zonefs file is a
+/// zone. A file on a file system over such a device is placed by that file system.
+fn refuse_zones(path: &Path, file: &File, node: bool) -> Result<(), DiskError> {
+    match zone_refusal(zones::of(path, file, node), node) {
         Some(reason) => Err(DiskError::Unsupported {
             path: path.to_path_buf(),
             reason,
@@ -274,19 +273,84 @@ fn refuse_zones(path: &Path, node: bool) -> Result<(), DiskError> {
     }
 }
 
-fn zone_refusal(id: &crate::identity::Identity, node: bool) -> Option<&'static str> {
-    if node && id.zoned == Zoned::HostManaged {
+/// What the zone check knows of the storage under a path.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct Zones {
+    /// The file is a zonefs file.
+    zonefs: bool,
+    /// The device takes writes only in each zone's order.
+    host_managed: bool,
+}
+
+fn zone_refusal(zones: Zones, node: bool) -> Option<&'static str> {
+    if node && zones.host_managed {
         Some(
-            "a host-managed zoned device takes writes only in each zone's order, and mantle \
-             has no zone backend",
+            "a host-managed zoned device takes writes only in each zone's order, and there is \
+             no zone backend",
         )
-    } else if id.file_system.kind == FileSystemKind::Zonefs {
+    } else if zones.zonefs {
         Some(
-            "a zonefs file is a zone, written only at its write pointer, and mantle has no \
-             zone backend",
+            "a zonefs file is a zone, written only at its write pointer, and there is no zone \
+             backend",
         )
     } else {
         None
+    }
+}
+
+/// Linux names both facts: statfs(2)'s `f_type` is zonefs's `ZONEFS_MAGIC` (0x5a4f4653,
+/// include/uapi/linux/magic.h) on a zonefs file, and a block device's `queue/zoned` reads
+/// `host-managed` for a device that takes writes only in zone order (Documentation/ABI/stable/
+/// sysfs-block); a partition's queue is its disk's, one directory up.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+mod zones {
+    use std::fs::File;
+    use std::path::Path;
+
+    use super::Zones;
+
+    /// zonefs's `f_type` (include/uapi/linux/magic.h, `ZONEFS_MAGIC`).
+    const ZONEFS_MAGIC: i128 = 0x5A4F_4653;
+
+    pub(super) fn of(path: &Path, file: &File, node: bool) -> Zones {
+        let zonefs = rustix::fs::statfs(path).is_ok_and(|s| i128::from(s.f_type) == ZONEFS_MAGIC);
+        let host_managed = node && host_managed(file);
+        Zones {
+            zonefs,
+            host_managed,
+        }
+    }
+
+    fn host_managed(file: &File) -> bool {
+        let Ok(stat) = rustix::fs::fstat(file) else {
+            return false;
+        };
+        let (major, minor) = (
+            rustix::fs::major(stat.st_rdev),
+            rustix::fs::minor(stat.st_rdev),
+        );
+        let device = format!("/sys/dev/block/{major}:{minor}");
+        [
+            format!("{device}/queue/zoned"),
+            format!("{device}/../queue/zoned"),
+        ]
+        .iter()
+        .find_map(|p| std::fs::read_to_string(p).ok())
+        .is_some_and(|zoned| zoned.trim() == "host-managed")
+    }
+}
+
+/// macOS and Windows have no zoned block devices this code can be given: neither exposes
+/// host-managed zones to a file system or to a disk's node.
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+mod zones {
+    use std::fs::File;
+    use std::path::Path;
+
+    use super::Zones;
+
+    pub(super) fn of(_path: &Path, _file: &File, _node: bool) -> Zones {
+        Zones::default()
     }
 }
 
@@ -428,7 +492,6 @@ mod sys {
 mod tests {
     use super::*;
     use crate::buf::AlignedBuf;
-    use crate::identity::{FileSystem, Identity};
 
     fn align() -> Alignment {
         Alignment::new(4096).unwrap()
@@ -436,27 +499,31 @@ mod tests {
 
     /// A host-managed device node and a zonefs file are refused; a file on a file system
     /// over a zoned device, and a host-aware device, which takes writes anywhere, are not
-    /// (audit B10).
+    /// (mantle audit B10).
     #[test]
     fn storage_that_takes_writes_only_in_zone_order_is_refused() {
-        let id = |kind: FileSystemKind, zoned: Zoned| {
-            let mut id = Identity::unknown(FileSystem {
-                kind,
-                block_size: None,
-                total_bytes: None,
-                available_bytes: None,
-            });
-            id.zoned = zoned;
-            id
+        let refused = |zonefs, host_managed, node| {
+            zone_refusal(
+                Zones {
+                    zonefs,
+                    host_managed,
+                },
+                node,
+            )
+            .is_some()
         };
-        let refused = |kind, zoned, node| zone_refusal(&id(kind, zoned), node).is_some();
-        assert!(refused(FileSystemKind::Device, Zoned::HostManaged, true));
-        assert!(refused(FileSystemKind::Zonefs, Zoned::HostManaged, false));
-        assert!(!refused(FileSystemKind::Btrfs, Zoned::HostManaged, false));
-        assert!(!refused(FileSystemKind::F2fs, Zoned::HostManaged, false));
-        assert!(!refused(FileSystemKind::Device, Zoned::HostAware, true));
-        assert!(!refused(FileSystemKind::Device, Zoned::None, true));
-        assert!(!refused(FileSystemKind::Device, Zoned::Unknown, true));
+        assert!(refused(false, true, true));
+        assert!(refused(true, true, false));
+        assert!(!refused(false, true, false));
+        assert!(!refused(false, false, true));
+        let dir = tempfile::tempdir().unwrap();
+        let file = DeviceFile::open(
+            &dir.path().join("plain"),
+            true,
+            CachingRequest::Buffered,
+            align(),
+        );
+        assert!(file.is_ok(), "a file on an ordinary file system is taken");
     }
 
     /// A device node's length is its device's capacity, it takes aligned writes and reads

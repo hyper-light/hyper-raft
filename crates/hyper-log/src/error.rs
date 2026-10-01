@@ -1,6 +1,6 @@
 //! What the log fails with.
 
-use mantle_disk::DiskError;
+use hyper_block::DiskError;
 
 #[derive(Debug, thiserror::Error)]
 pub enum LogError {

@@ -1,13 +1,11 @@
 [package]
-name = "mantle-disk"
-description = "Local storage devices: identification, measurement, aligned direct I/O and exact durability"
+name = "hyper-block"
+description = "Block I/O for the shared log: aligned direct I/O, the platform's full flush, buffers that meet the device's alignment, group commit's wait, a device issuer and a simulated device with power-loss semantics"
 version.workspace = true
-authors.workspace = true
 edition.workspace = true
-license.workspace = true
 rust-version.workspace = true
+license.workspace = true
 repository.workspace = true
-publish.workspace = true
 
 [features]
 # Test support for other crates: the simulated power-loss file and, on macOS, a disk image

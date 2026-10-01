@@ -3,8 +3,8 @@
 
 use std::sync::Arc;
 
-use mantle_disk::buf::Alignment;
-use mantle_disk::sim::SimFile;
+use hyper_block::buf::Alignment;
+use hyper_block::sim::SimFile;
 
 /// A simulated file that lets its flushes through one at a time, so a test can step the writer
 /// frame by frame and submit while it is held in a flush.
@@ -38,6 +38,12 @@ impl Stepped {
         }
     }
 
+    /// Whether the writer is held in a flush now.
+    pub fn is_held(&self) -> bool {
+        let gate = self.gate.lock().unwrap();
+        gate.0 > gate.1
+    }
+
     /// Lets the held flush complete and waits until the writer is held in its next one.
     pub fn step(&self) {
         let mut gate = self.gate.lock().unwrap();
@@ -64,24 +70,24 @@ impl Drop for Released {
     }
 }
 
-impl mantle_disk::block::BlockFile for Stepped {
+impl hyper_block::block::BlockFile for Stepped {
     fn alignment(&self) -> Alignment {
         self.file.alignment()
     }
 
-    fn len(&self) -> Result<u64, mantle_disk::DiskError> {
-        mantle_disk::block::BlockFile::len(&*self.file)
+    fn len(&self) -> Result<u64, hyper_block::DiskError> {
+        hyper_block::block::BlockFile::len(&*self.file)
     }
 
-    fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> Result<(), mantle_disk::DiskError> {
+    fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> Result<(), hyper_block::DiskError> {
         self.file.read_exact_at(buf, offset)
     }
 
-    fn write_all_at(&self, buf: &[u8], offset: u64) -> Result<(), mantle_disk::DiskError> {
+    fn write_all_at(&self, buf: &[u8], offset: u64) -> Result<(), hyper_block::DiskError> {
         self.file.write_all_at(buf, offset)
     }
 
-    fn sync_data(&self) -> Result<(), mantle_disk::DiskError> {
+    fn sync_data(&self) -> Result<(), hyper_block::DiskError> {
         let mut gate = self.gate.lock().unwrap();
         gate.0 += 1;
         let me = gate.0;

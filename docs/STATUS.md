@@ -24,6 +24,12 @@ The law's four columns:
 | hyper-tokio | new (T-1's second half; note 32 §6 item 6) | yes; `unsafe` only in `src/sys/linux.rs` | 0 allocations a round of its own: a 64 B round is 12.4 under it as under a busy-polled driver; a fixed outbox and receive buffers | through hyper-transport's comparison against focal-wire, both on tokio (`docs/benchmarks.md`) | yes: processes over UDP on macOS and Linux (sendmmsg, recvmmsg, UDP_SEGMENT, UDP_GRO); exchanges with every byte checked while the owner drops the driver's future mid-wait, lanes, the plane keyed from the TLS exporter, a peer killed mid-upload | no (`tokio`) |
 | hyper-multilog, hyper-sim, hyper-check | note 32 §3.2 | | | | | not started |
 
+Timing (`docs/timing.md`, sources in `docs/research/timing.md`): elections and failure detection
+move from picked constants to measurement — one NFD-E detector per node pair configured to
+minimize unavailability, the election span from Ongaro's split-vote probability, the timer
+granularity measured. Steps L-1 (`hyper-timing`) to L-5 (the consumers); not started. Until L-4
+the E2E harness computes its own tick and budgets, which this replaces.
+
 ## Consumers
 
 | Consumer | Takes | State |

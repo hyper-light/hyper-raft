@@ -4,8 +4,16 @@ resolver = "3"
 # members only once it meets every rule below (CLAUDE.md).
 members = ["crates/*"]
 # Vendored upstream sources are staged here, outside the build and the lint wall, until they are
-# conformed into a member crate (vendor/*/VENDORED.md).
-exclude = ["vendor", "crates/hyper-tls/tests/support/rustls-test"]
+# conformed into a member crate (vendor/*/VENDORED.md). The comparison bench is a workspace of its
+# own: it builds slates', focal's and raft-rs's cores from their repositories at pinned revisions,
+# which the gates of this workspace do not fetch (docs/benchmarks.md). hyper-tls's test support
+# crate is upstream's `rustls-test`, test code outside the wall.
+exclude = [
+  "vendor",
+  "crates/hyper-raft-compare",
+  "crates/hyper-log-compare",
+  "crates/hyper-tls/tests/support/rustls-test",
+]
 
 [workspace.package]
 version = "0.1.0"
@@ -23,6 +31,26 @@ raft = { version = "0.7.0", git = "https://github.com/tikv/raft-rs", rev = "8e4c
 raft-proto = { version = "0.7.0", git = "https://github.com/tikv/raft-rs", rev = "8e4cef172421bf77b2ae1c26628a9531b0be41f0", default-features = false, features = ["prost-codec"] }
 slog = "2.7"
 thiserror = "2.0"
+# The log's checksum, CRC-32C, which hyper-log computes with the `crc32c` crate (in place of
+# mantle-crc's `crc-fast`).
+crc32c = "0.6"
+# Segment nonces and scratch-file names from the operating system's random source.
+getrandom = "0.4"
+# Positional I/O, direct I/O, the platform's full flush and the thread ceilings (hyper-block).
+rustix = { version = "1.1", features = ["fs", "system", "param", "process", "time"] }
+windows-sys = { version = "0.61", features = [
+  "Win32_Foundation",
+  "Win32_Security",
+  "Win32_System_Diagnostics_ToolHelp",
+  "Win32_Storage_FileSystem",
+  "Win32_System_IO",
+  "Win32_System_Ioctl",
+  "Win32_System_SystemInformation",
+  "Win32_System_Threading",
+  "Win32_System_WindowsProgramming",
+] }
+proptest = "1.11"
+tempfile = "3.20"
 
 [workspace.lints.rust]
 # Allowed only in the OS-interface files scripts/check-contracts.py lists, each block commented.

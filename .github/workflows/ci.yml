@@ -19,7 +19,7 @@ jobs:
           - windows-11-arm
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       # The toolchain comes from rust-toolchain.toml, pinned exactly.
       - run: rustup show active-toolchain || rustup toolchain install
       - run: bash scripts/gates.sh

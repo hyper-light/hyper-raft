@@ -65,15 +65,21 @@ pub const MESSAGE_ALLOWANCE: usize = std::mem::size_of::<Message>() + 3 * BUFFER
 /// queued message at this, and its owner charges one for the same, so that
 /// a message moved from the one to the other costs the same at both.
 pub fn message_bytes(message: &Message) -> usize {
-    let slots = message
-        .entries
-        .capacity()
-        .saturating_mul(std::mem::size_of::<Entry>());
     let payload = message.entries.iter().fold(0usize, |bytes, entry| {
         bytes
             .saturating_add(entry.data.capacity())
             .saturating_add(entry.context.capacity())
     });
+    message_bytes_with(message, payload)
+}
+/// As [`message_bytes`], given what the entries' buffers hold by capacity,
+/// counted where the entries were chosen, so that they are not walked
+/// again.
+pub(crate) fn message_bytes_with(message: &Message, payload: usize) -> usize {
+    let slots = message
+        .entries
+        .capacity()
+        .saturating_mul(std::mem::size_of::<Entry>());
     let snapshot = message.snapshot.as_ref().map_or(0, |snapshot| {
         snapshot.data.capacity().saturating_add(MESSAGE_ALLOWANCE)
     });

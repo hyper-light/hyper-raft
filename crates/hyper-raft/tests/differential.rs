@@ -344,6 +344,80 @@ fn campaign(name: &str, settings: Settings, mix: Mix) -> Reached {
     reached
 }
 
+/// Every campaign again with this core's members given their `Ready`s in
+/// place (`RawNode::ready_in_place`): what they persist and apply is read
+/// where it is, and every step still says what `raft-rs` says.
+#[test]
+fn the_cores_agree_with_readies_given_in_place() {
+    let place = |settings: Settings| Settings {
+        in_place: true,
+        ..settings
+    };
+    let shell = campaign(
+        "shell in place",
+        place(Settings::shell()),
+        Mix::everything(),
+    );
+    assert!(shell.changes > 0 && shell.snapshots > 0 && shell.restarts > 0);
+    for (name, settings, mix) in [
+        (
+            "plain in place",
+            Settings {
+                check_quorum: false,
+                pre_vote: false,
+                ..Settings::shell()
+            },
+            Mix::everything(),
+        ),
+        (
+            "narrow in place",
+            Settings {
+                max_inflight_msgs: 2,
+                max_size_per_msg: 1,
+                max_committed_size_per_ready: 64,
+                ..Settings::shell()
+            },
+            Mix::everything(),
+        ),
+        (
+            "paged in place",
+            Settings {
+                max_size_per_msg: 100,
+                max_committed_size_per_ready: 100,
+                max_inflight_msgs: 4,
+                ..Settings::shell()
+            },
+            Mix::everything(),
+        ),
+        (
+            "whole in place",
+            Settings::shell(),
+            Mix {
+                restarts: false,
+                partitions: false,
+                lose: 0,
+                repeat: 0,
+                ..Mix::everything()
+            },
+        ),
+        (
+            "uncommitted in place",
+            Settings {
+                max_uncommitted_size: 96,
+                max_size_per_msg: 64,
+                ..Settings::shell()
+            },
+            Mix {
+                changes: false,
+                ..Mix::everything()
+            },
+        ),
+    ] {
+        let reached = campaign(name, place(settings), mix);
+        assert!(reached.committed > 0);
+    }
+}
+
 #[test]
 fn the_cores_agree_as_the_shell_sets_them() {
     let reached = campaign("shell", Settings::shell(), Mix::everything());

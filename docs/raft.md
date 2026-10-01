@@ -19,13 +19,31 @@ clock, no disk and no network:
 - one `Ready` at a time says what to persist, send and apply;
 - `advance_append` and `advance_apply_to` report back.
 
+A `Ready` comes in two forms that decide alike (`tests/differential.rs`, "in place"):
+- `RawNode::ready` copies what it gives, as raft-rs's `Ready` does: the entries to persist and the
+  entries to apply are the owner's to take.
+- `RawNode::ready_in_place` copies nothing the owner can read where it is. The owner writes the
+  snapshot and entries out from `RawNode::to_persist`, applies the range
+  `Ready::committed_range` names from its own storage, and keeps the very entries and snapshot
+  the member gives up at `RawNode::advance_append_keeping`. A disk-backed owner copies no entry
+  at all. `docs/benchmarks.md` measures both forms.
+
+A leader's proposals and a follower's appends move into the log uncopied (`Log::append_owned`,
+`Log::append_after_owned`).
+
 It is Raft as Ongaro's thesis states it, with these extensions:
 - pre-vote and check-quorum;
 - election priority with `Precedence::Log`;
 - learners and joint consensus (`ConfChangeV2`);
 - leader transfer;
-- an inflight window with conflict hints;
-- ReadIndex (quorum-confirmed, no lease) and snapshots;
+- an inflight window with conflict hints, bounded per member in messages and in bytes
+  (`Config::max_inflight_bytes`, `RawNode::set_inflight_bytes`: what the owner says the path to
+  the member carries before it answers), and a heartbeat's answer that says how far the member's
+  log goes (`HeartbeatAnswers::Position`, the default; `HeartbeatAnswers::Bare` is raft-rs's,
+  which the differential runs);
+- ReadIndex (quorum-confirmed, no lease), with one round of heartbeats for every read asked since
+  the last `Ready` (`ReadRounds::Shared`, the default; `ReadRounds::Each` is raft-rs's round per
+  read, which the differential runs), and snapshots;
 - the fast track (Fast Raft, Castiglia, Goldberg and Patterson, ICDCS 2020) for a group that enables it.
 
 Errors are of three kinds:
@@ -75,8 +93,8 @@ includes the consumers' suites. They run when each consumer takes a snapshot und
 
 The R-numbers are note 32 §2.13's ledger.
 
-**The fast track** stays focal's algorithm until note 32 §3.8's tests decide, and no owner enables it
-until then. The tests:
+**The fast track** stays focal's algorithm, with the safety fix below, until note 32 §3.8's tests
+decide, and no owner enables it until then. The tests:
 - slates' exhaustive search applied to it;
 - the reconfiguration and liveness the TLA+ model lacks;
 - slates' five-region crossover;
@@ -84,6 +102,132 @@ until then. The tests:
 
 TLC runs in this repository's CI only (owner's decision 7), beside `hyper-check`'s explorer. The model
 `FastTrack.tla` is still in focal (`docs/models/`) and moves here with that work.
+
+### The fast track's election defect, and its fix
+
+**The defect.** In a fast group an election could commit a second, different entry at an index that
+already held a committed one. Found by focal's schedules (`FOCAL_RAFT_SEEDS=40000
+FOCAL_RAFT_SEED=3000`, seed 9843) and reproduced here on `main` (`e1e292c`) before any change:
+`HYPER_RAFT_SEEDS=40000 HYPER_RAFT_SEED=3000 cargo test -p hyper-raft --release --test fast
+a_group_with_the_fast_track`, "seed 9843: member 3 committed another entry at 32". Traced: the leader
+of term 3 committed index 32 by the fast quorum {1, 2, 4} of four voters, where members 2 and 4 held
+the entry beside their logs and the leader knew nothing of their logs (`matched` 0). Member 3's log
+held an entry of an older term at 32. Members 2 and 4, whose logs were no more current than member
+3's, elected it; recovery takes the most-held entry only above the candidate's log, so it kept its
+own entry at 32 and committed it.
+
+**The cause.** A fast quorum's members hold the committed entry beside their logs, but vote by the
+classic comparison of logs. Their vote for the committing leader is a vote in that leader's round, and
+nothing an election reads records it.
+
+**The literature.**
+- Fast Raft (Castiglia, Goldberg and Patterson, arXiv:2004.06215, ICDCS 2020) §IV-C: "the definition
+  of up-to-date is modified to only include leader-approved entries", and the elected leader recovers
+  self-approved entries from its voters. Its safety proof (Lemma 2) shows that "a follower never
+  overwrites a chosen entry", and that a new leader inserts the most-voted entry, but not what an
+  elected leader does with a leader-approved entry of an older term at the same index. That is this
+  defect: the paper's rule has it too.
+- Fast Paxos (Lamport, Distributed Computing 19(2), 2006) §3.3 (picking a value in phase 2a, condition O4): a value is chosen in round
+  `k` only by a quorum of votes cast in round `k`, and a coordinator's recovery reads each acceptor's
+  round of its last vote (`vrnd`), which the acceptor keeps durable, and considers only the highest.
+  Here the round is the leader's term, and the only durable record an election reads is the log.
+- Raft (Ongaro, thesis §3.6.2, Figure 3.7): a leader counts replicas only for an entry of its own
+  term, for the same reason — a count of an older term's replicas says nothing a later election
+  will respect.
+
+**The fix.** A member that holds the entry beside its log counts toward a fast quorum only once the
+leader knows its log holds an entry of the leader's term (`self.log.term(progress.matched) ==
+self.term`, `Raft::fast_commit`). Then every member of the fast quorum R has a last log term at or
+above the leader's, and stays so: what it holds through the leader's first entry of the term is held
+by a majority, so no later leader's append truncates below it. By the classic rule each refuses any
+candidate whose last term is older. A candidate whose last term is the leader's or later holds, up to
+its last entry, the log of a leader that holds the committed entry: it holds the entry, or its log
+ends below the index, and then the entry is the most held among its voters (Fast Raft's own
+argument, which now applies). It is Fast Paxos's same-round condition, with the round recorded where
+elections read it, and it needs no message, no field and no state: the leader's first entry of its
+term reaches every member with its first append.
+
+**The alternatives, and why not.**
+- A voter refuses a candidate whose log is older than its own latest fast vote: the term of that
+  vote must be durable, which raft-proto's `HardState` has no room for before R-2, and the
+  comparison is of one term for the whole log. A candidate whose log is stale at the committed index
+  can have voted later entries beside its log to the same leader, so its own latest fast vote is as
+  recent as its voters' and it is elected with the stale entry: the rule must be per index.
+- What a member holds carries the term it was voted in, and an election weighs it at every index
+  above the candidate's commit (Fast Paxos's recovery, per index): it needs that term durable for
+  every held entry (a write each time a held entry is voted to a new leader), the candidate truncating
+  its own log at election, and a vote's term set against an entry's term that is only a lower bound
+  of the round it was accepted in. The fix above makes the classic comparison carry the round instead.
+
+**A second defect the schedules found once the first was mended: a configuration not yet
+applied.** With the rule above in, 40,000 schedules from seed 43,000 and from seed 200,000 each
+failed once (seeds 54104 and 203544: "member 2 committed another entry at 11", "member 1 committed
+another entry at 12"). Traced: the leader had applied a change that demoted a voter to a learner and
+committed an index by three of its four voters, a fast quorum of four. One of those three had not
+heard the change committed, so it counted by the five voters before it (a member campaigns by the
+configuration it has applied, as raft-rs does); it was elected by itself and two members of the five
+that held another entry, which was the most held among them. Raft's classic argument holds across a
+change because majorities of two configurations one change apart meet; a fast quorum of the new
+configuration need not be a fast quorum of the old one, and the guard the fast track had (no change
+committed and not applied, no joint configuration, both at the leader) says nothing of the members.
+
+The fix: a member that took an entry of the leader's term took the leader's commit with it (an
+append commits to the lesser of the leader's commit and its own last entry), and that commit covers
+the configuration the leader was elected under; a member campaigns only once it has applied every
+change it has committed. So it counts by the configuration the leader was elected under or by one
+the leader applied since. A member that took no entry of the term has an older last term than every
+member of the fast quorum, which refuse it, and no majority of a configuration one change away
+avoids three quarters of this one. The leader notes the voters it was elected under and the one
+other set of voters a change since named (a joint configuration's two halves are the two sets), and
+counts a fast quorum only where it is a fast quorum of each (`Raft::note_term_configuration`,
+`Raft::note_term_change`, `Raft::fast_quorum_of_the_term`). After a change that names a third set it
+commits by the classic quorum until its term ends. This assumes, as raft-rs does, that a member
+writes a `Ready`'s entries and its hard state's commit durably together. The directed test is
+`a_member_that_counts_by_the_configuration_before_commits_no_second_entry` (seed 54104).
+
+**What it costs.** Fast commits that counted members whose logs were not yet of the leader's term
+become classic ones, one round later: those at a new leader's first indexes, before its first append
+is answered, chiefly the entries it recovered at its election, which Fast Paxos also commits by a
+classic round. After a change of the configuration, a fast quorum must also be one of the voters
+before it, until the next term; after a second change, there is none until the next term.
+
+| Fast schedules | Fast commits, before | with the first rule | with both rules |
+|---|---|---|---|
+| 96 from seed 0 (the default) | 418 | 322 | 188 |
+| 40,000 from seed 3,000 | fails at seed 9843 | 140,198 | 93,864 |
+
+The schedules change leaders and configurations far more often than a group does in service (about
+five terms and many changes in every 4,000 steps); in the comparison's fast workload, a group with
+one leader and no change, the rules commit every proposal by the fast quorum as before
+(`docs/benchmarks.md`).
+
+**Why the model missed them.** The model has no change of configuration, so the second defect is
+outside it; covering it needs a configuration per member, the configuration a member has applied
+(its commit), and a single change of one voter. For the first: `FastTrack.tla` checks three voters (where the fast quorum is all of
+them, so no member outside it can hold an older entry at the index) and five voters at `MaxTerm = 2`
+and `MaxLen = 1`. The defect needs three terms on five voters: one in which a member takes an entry
+at the index from a leader, one in which another leader commits a different entry there by a fast
+quorum without that member, and one in which that member is elected. The model change:
+- `FastCommit`'s `HoldsByItself(l, m, i)` also requires that `m` acknowledged `l`'s log through an
+  index of `l`'s term: `LET a == acks[m][term[l]] IN a >= 1 /\ a <= Len(log[l]) /\ log[l][a].term =
+  term[l]`;
+- a configuration of five voters at `MaxTerm = 3` and `MaxLen = 2` (two indexes, so that a member can
+  hold an entry beside a log of the leader's term), checked for `Agreement`, `Committed` and
+  `LeaderHolds`;
+- a configuration with the old `HoldsByItself`, at the same bounds, which TLC must find violating
+  `Agreement`, as `FastTrackWrong.cfg` does for the recovery rule.
+
+TLC runs in this repository's CI only, so the model change is to be made with the model's move here;
+it was not run on this machine.
+
+**Evidence.** The directed test `an_election_never_commits_a_second_entry_at_a_committed_index` runs
+seed 9843's schedule with the rules it was found under (a round of reads for each read, no byte
+bound, bare heartbeat answers); it fails without the fix and passes with it. `a_member_that_counts_by_the_configuration_before_commits_no_second_entry`
+runs seed 54104's schedule; it fails without the second rule and passes with it. With both rules,
+160,000 fast schedules of 4,000 steps pass, 40,000 from each of the seeds 3,000, 43,000, 100,000 and
+200,000 (`HYPER_RAFT_SEEDS=40000 HYPER_RAFT_SEED=<seed> cargo test -p hyper-raft --release --test
+fast a_group_with_the_fast_track`): every member commits the same entry at every index, every
+answered read saw what was committed when it was asked, and every group settles.
 
 **Open against the rules until R-3.** These values are carried unchanged and are literals, not
 derivations:
@@ -95,7 +239,8 @@ derivations:
 | Crate | What | Steps and gate |
 |---|---|---|
 | `hyper-durable` | The shell: mantle's Ready pipeline with focal's accounting (note 32 §3.8). `Replica<L: LogStore, M: StateMachine>` with `begin` and `finish`; leader appends sent before the leader's own write; held inputs bounded by bytes and ticks; protocol-aware repair; the commit fence decided by `StateMachine::durable_applied`. | **D-1**: extract the shell from mantle's replica, leaving `RangeMachine: StateMachine` in mantle. Gate: mantle's `crates/range/tests/group.rs` and `sim.rs`. Recorded simulation seeds replay to identical Ready sequences and identical histories. **D-2**: focal's shell onto it (`guarded_in`, reservations before transitions, decoder fences, checkpoint images, nonblocking receipts). Gate: focal-consensus's tests and focal's real-process suites. Recorded seeds replay with identical committed output. The one intended timing change, leader appends sent early, is checked by the safety explorer. |
-| `hyper-log` | mantle's per-device log, with its `BlockFile` trait. It is the one crate that owns its device writer and files (`CLAUDE.md` §1). | **L-1**: move it. Gate: mantle's `crates/log/tests/log.rs`, `fairness.rs` and the range simulation; bytes on the simulated device identical per seed. **L-2**: an owner thread in place of `Arc`, `RwLock`, `Mutex` and `Condvar`, and `Waker` tickets in place of the mpsc `Pending`. Gate: L-1's suite; a test that a completion wakes only its submitter; mantle's log benchmark against its recorded baseline; frame contents per seed identical. **F-1**: focal's WAL converted to it, one way. Gate: recorded focal data directories converted and read back equal, and focal's restart and restore runbooks on real processes. |
+| `hyper-block` | mantle-disk's block layer, on which the log is written: `BlockFile`, the device file with its direct I/O and full flush, aligned buffers, group commit's wait, the device issuer, the simulated device (`crates/hyper-block/ORIGIN.md`). | Moved with L-1, from mantle `147f035`; on `main` once the `log` branch lands. |
+| `hyper-log` | mantle's per-device log, with its `BlockFile` trait. It is the one crate that owns its device writer and files (`CLAUDE.md` §1). | **Done on branch `log`** (`crates/hyper-log/ORIGIN.md`): L-1 and L-2 as below, with one change of plan: the owner never waits on the device, so the log runs two threads, the owner and a device thread that owns the file, until its writes go through hyper-block's issuer. **L-1**: move it. Gate: mantle's `crates/log/tests/log.rs`, `fairness.rs` and the range simulation; bytes on the simulated device identical per seed. **L-2**: an owner thread in place of `Arc`, `RwLock`, `Mutex` and `Condvar`, and `Waker` tickets in place of the mpsc `Pending`. Gate: L-1's suite; a test that a completion wakes only its submitter; mantle's log benchmark against its recorded baseline; frame contents per seed identical. **F-1**: focal's WAL converted to it, one way. Gate: recorded focal data directories converted and read back equal, and focal's restart and restore runbooks on real processes. |
 | `hyper-multilog` | slates' MLRaft layer: one group's log divided into `n` logs with barriers (note 32 R25). | Moved with X-1. Gate: slates' `tests/multilog*.rs` and its explorer (200 seeds × 3,000 steps), retargeted at this crate. No consumer enables it until an owner shows a gain; slates measured it worse for its own groups. |
 
 slates' consensus moves onto `hyper-raft` in **X-1**. Gate: slates' explorer, conformance, prevote,
@@ -105,8 +250,10 @@ no release to keep (owner's decision 9).
 
 ## 5. Shared test infrastructure the core will use
 
-The allocation-count bench (focal-memory's counting global allocator) comes back with `hyper-sim` (note
-32 §3.10), rewritten without its lock and with its `unsafe` listed in the contract script. The same
+The allocation-count bench (focal-memory's counting global allocator) came back as `hyper-measure`,
+rewritten without its lock and with its `unsafe` listed in the contract script; with it,
+`hyper-raft-compare` measures this crate against each core it replaces, and `hyper-raft-e2e` runs it
+as real processes (`docs/benchmarks.md`). The same
 applies to the timed simulation, the safety explorer and the exhaustive models from slates, and to
 mantle's linearizability checker. Each joins under the production lints, as focal requires of
 `focal-sim`.

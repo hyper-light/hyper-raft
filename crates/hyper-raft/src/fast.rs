@@ -13,7 +13,10 @@
 //! in it: the log holds what a leader approved and nothing else, so the
 //! log is the classic one, elections compare it as they always did, and a
 //! leader's entry takes the place of what a member held by taking its
-//! index.
+//! index. Because elections see only the log, what a member holds beside
+//! it counts for a fast commit only once its log holds an entry of the
+//! committing leader's term ([`crate::track`]): an election weighs the log,
+//! and the log must then say the member took that leader's word.
 //!
 //! A leader stamps what it takes with its own term. The term a proposer
 //! gave says nothing of the entry, for two proposers of one term propose

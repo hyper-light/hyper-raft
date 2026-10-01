@@ -111,12 +111,36 @@ impl Disk {
         let last = self.last_index();
         self.proposals.retain(|held| held.index > last);
     }
+    /// Keeps the entries a member gave up once durable, as they are: what
+    /// they replace is cut first, as `append` cuts it.
+    pub fn keep(&mut self, entries: Vec<Entry>) {
+        let Some(first) = entries.first() else {
+            return;
+        };
+        assert!(
+            first.index >= self.first_index() && first.index <= self.last_index() + 1,
+            "a gap in what is kept"
+        );
+        self.entries
+            .truncate((first.index - self.first_index()) as usize);
+        self.entries.extend(entries);
+        self.trim_proposals();
+    }
+    /// What the log reached is approved by itself no more.
+    pub fn trim_proposals(&mut self) {
+        let last = self.last_index();
+        self.proposals.retain(|held| held.index > last);
+    }
     pub fn install(&mut self, snapshot: &Snapshot) {
+        self.install_owned(snapshot.clone());
+    }
+    /// Installs the snapshot itself.
+    pub fn install_owned(&mut self, snapshot: Snapshot) {
         let metadata = snapshot.metadata.clone().unwrap_or_default();
         self.conf = sorted(metadata.conf_state.unwrap_or_default());
         self.hard_state.commit = self.hard_state.commit.max(metadata.index);
         self.entries.clear();
-        self.snapshot = snapshot.clone();
+        self.snapshot = snapshot;
         self.proposals.retain(|held| held.index > metadata.index);
     }
     /// Everything through `index` becomes the snapshot.
@@ -402,14 +426,27 @@ pub struct Settings {
     pub heartbeat_tick: usize,
     pub max_size_per_msg: u64,
     pub max_inflight_msgs: usize,
+    /// The bytes of entries a member is sent ahead of its answers;
+    /// `raft-rs` has no such bound.
+    pub max_inflight_bytes: u64,
     pub max_uncommitted_size: u64,
     pub max_committed_size_per_ready: u64,
     pub check_quorum: bool,
     pub pre_vote: bool,
     /// Whether priority yields to a longer log alone, as in `raft-rs`.
     pub by_length: bool,
+    /// Whether a leader sends a round of heartbeats for each read as it is
+    /// asked, as in `raft-rs`.
+    pub round_each: bool,
+    /// Whether a heartbeat's answer says nothing of the member's log and
+    /// frees a full window's first message, as in `raft-rs`.
+    pub bare_answers: bool,
     /// Whether the group has the fast track.
     pub fast: bool,
+    /// Whether this core's members are driven by `RawNode::ready_in_place`,
+    /// persisting their entries and applying what is committed where they
+    /// are, rather than by `RawNode::ready`'s copies.
+    pub in_place: bool,
 }
 impl Settings {
     /// As focal's shell sets a group.
@@ -419,18 +456,27 @@ impl Settings {
             heartbeat_tick: 2,
             max_size_per_msg: 4 * 1024 * 1024 + 1024,
             max_inflight_msgs: 128,
+            max_inflight_bytes: u64::MAX,
             max_uncommitted_size: 32 * 1024 * 1024,
             max_committed_size_per_ready: 16 * 1024 * 1024,
             check_quorum: true,
             pre_vote: true,
             by_length: true,
+            round_each: true,
+            bare_answers: true,
             fast: false,
+            in_place: false,
         }
     }
     /// As focal runs this core.
     pub fn focal() -> Self {
         Self {
             by_length: false,
+            round_each: false,
+            bare_answers: false,
+            // A few of a schedule's entries: the window fills by its
+            // bytes long before it fills by its places.
+            max_inflight_bytes: 256,
             ..Self::shell()
         }
     }
@@ -463,6 +509,9 @@ pub trait Replica: Sized {
     fn unreachable(&mut self, member: u64);
     fn snapshot_status(&mut self, member: u64, arrived: bool);
     fn set_priority(&mut self, priority: i64);
+    /// What the path to `member` carries before it answers. `raft-rs` has
+    /// no such bound and does nothing.
+    fn set_window(&mut self, _member: u64, _bytes: u64) {}
     fn set_timeout(&mut self, ticks: usize);
     fn drain(&mut self) -> Output;
     fn view(&self) -> View;
@@ -523,7 +572,9 @@ pub struct Old {
 }
 impl Old {
     fn settle(&mut self) {
-        let effective = if self.raw.raft.term == 0 {
+        // As this core settles it: no term, or no voter, and the priority
+        // judges nothing.
+        let effective = if self.raw.raft.term == 0 || !self.raw.raft.promotable() {
             0
         } else {
             self.priority
@@ -765,6 +816,7 @@ impl Replica for Old {
 pub struct New {
     pub raw: hyper_raft::RawNode<Store>,
     app: App,
+    in_place: bool,
 }
 impl New {
     fn apply(&mut self, entries: Vec<Entry>, output: &mut Output) {
@@ -805,6 +857,25 @@ fn heard<T>(outcome: hyper_raft::Result<T>) -> Option<T> {
     }
 }
 impl New {
+    /// What a `Ready` gives to apply: its copies, or, given in place, the
+    /// range read from storage.
+    fn committed(&self, copies: Vec<Entry>, range: Option<(u64, u64)>) -> Vec<Entry> {
+        let Some((first, last)) = range else {
+            return copies;
+        };
+        assert!(
+            copies.is_empty(),
+            "a ready in place copied what it gives to apply"
+        );
+        assert!(
+            self.in_place,
+            "a range given to apply by a ready that copies"
+        );
+        let disk = &self.raw.store().0;
+        (first..=last)
+            .map(|index| disk.entries[(index - disk.first_index()) as usize].clone())
+            .collect()
+    }
     pub fn fast_stats(&self) -> hyper_raft::FastStats {
         self.raw.raft.fast_stats()
     }
@@ -832,6 +903,7 @@ impl Replica for New {
             applied,
             max_size_per_msg: settings.max_size_per_msg,
             max_inflight_msgs: settings.max_inflight_msgs,
+            max_inflight_bytes: settings.max_inflight_bytes,
             max_uncommitted_size: settings.max_uncommitted_size,
             max_committed_size_per_ready: settings.max_committed_size_per_ready,
             check_quorum: settings.check_quorum,
@@ -841,12 +913,26 @@ impl Replica for New {
             } else {
                 hyper_raft::Precedence::Log
             },
+            read_rounds: if settings.round_each {
+                hyper_raft::ReadRounds::Each
+            } else {
+                hyper_raft::ReadRounds::Shared
+            },
+            heartbeat_answers: if settings.bare_answers {
+                hyper_raft::HeartbeatAnswers::Bare
+            } else {
+                hyper_raft::HeartbeatAnswers::Position
+            },
             fast: settings.fast,
             seed,
             ..hyper_raft::Config::new(id)
         };
         let raw = hyper_raft::RawNode::new(&config, store).expect("hyper-raft opens");
-        Self { raw, app }
+        Self {
+            raw,
+            app,
+            in_place: settings.in_place,
+        }
     }
     fn id(&self) -> u64 {
         self.raw.raft.id()
@@ -898,6 +984,9 @@ impl Replica for New {
     fn set_priority(&mut self, priority: i64) {
         self.raw.set_priority(priority);
     }
+    fn set_window(&mut self, member: u64, bytes: u64) {
+        self.raw.set_inflight_bytes(member, bytes);
+    }
     fn set_timeout(&mut self, ticks: usize) {
         self.raw
             .raft
@@ -908,15 +997,37 @@ impl Replica for New {
         let mut output = Output::default();
         let mut messages = Vec::new();
         while self.raw.has_ready() {
-            let mut ready = self.raw.ready().expect("a ready");
+            let mut ready = if self.in_place {
+                self.raw.ready_in_place().expect("a ready")
+            } else {
+                self.raw.ready().expect("a ready")
+            };
             if let Some(snapshot) = ready.snapshot() {
                 let metadata = snapshot.metadata.clone().unwrap_or_default();
                 output.snapshots.push((metadata.index, metadata.term));
                 self.app = App::decode(&snapshot.data);
                 self.raw.store_mut().0.install(snapshot);
             }
-            output.persisted.extend(ready.entries().iter().map(said));
-            {
+            if self.in_place {
+                // Read where the member holds them, and persisted before
+                // anything else is asked of it; the snapshot and the entries
+                // themselves are kept when the ready advances.
+                assert!(
+                    ready.entries().is_empty() && ready.snapshot().is_none(),
+                    "a ready in place copied what it persists"
+                );
+                let persist = self.raw.to_persist();
+                if let Some(snapshot) = persist.snapshot {
+                    let metadata = snapshot.metadata.clone().unwrap_or_default();
+                    output.snapshots.push((metadata.index, metadata.term));
+                    self.app = App::decode(&snapshot.data);
+                }
+                output.persisted.extend(persist.entries.iter().map(said));
+                let disk = &mut persist.store.0;
+                disk.proposals.extend(ready.proposals().iter().cloned());
+                disk.trim_proposals();
+            } else {
+                output.persisted.extend(ready.entries().iter().map(said));
                 let disk = &mut self.raw.store_mut().0;
                 disk.proposals.extend(ready.proposals().iter().cloned());
                 disk.append(ready.entries());
@@ -944,9 +1055,20 @@ impl Replica for New {
                     .into_iter()
                     .map(|read| (read.index, read.request_ctx)),
             );
-            let committed = ready.take_committed_entries();
+            let committed = self.committed(ready.take_committed_entries(), ready.committed_range());
             self.apply(committed, &mut output);
-            let mut light = self.raw.advance_append(ready).expect("advanced");
+            let mut light = if self.in_place {
+                self.raw
+                    .advance_append_keeping(ready, |store, kept| {
+                        if let Some(snapshot) = kept.snapshot {
+                            store.0.install_owned(snapshot);
+                        }
+                        store.0.keep(kept.entries);
+                    })
+                    .expect("advanced")
+            } else {
+                self.raw.advance_append(ready).expect("advanced")
+            };
             if let Some(commit) = light.commit_index() {
                 let disk = &mut self.raw.store_mut().0;
                 disk.hard_state.commit = commit;
@@ -955,7 +1077,7 @@ impl Replica for New {
                     .push((disk.hard_state.term, disk.hard_state.vote, commit));
             }
             messages.extend(light.take_messages());
-            let committed = light.take_committed_entries();
+            let committed = self.committed(light.take_committed_entries(), light.committed_range());
             self.apply(committed, &mut output);
             self.raw.advance_apply_to(self.app.index).expect("applied");
         }
@@ -1091,6 +1213,9 @@ impl Replica for Either {
     }
     fn set_priority(&mut self, priority: i64) {
         either!(self, node => node.set_priority(priority))
+    }
+    fn set_window(&mut self, member: u64, bytes: u64) {
+        either!(self, node => node.set_window(member, bytes))
     }
     fn set_timeout(&mut self, ticks: usize) {
         either!(self, node => node.set_timeout(ticks))

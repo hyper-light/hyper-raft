@@ -1,0 +1,20 @@
+[package]
+name = "hyper-log-e2e"
+description = "hyper-log in real use: a process appending to a real, fully flushed file, killed with SIGKILL mid-append and its log recovered and checked against every append it acknowledged."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+hyper-block = { path = "../hyper-block" }
+hyper-log = { path = "../hyper-log" }
+
+[[bin]]
+name = "hyper-log-writer"
+path = "src/main.rs"
+
+[lints]
+workspace = true

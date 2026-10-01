@@ -117,8 +117,10 @@ no release to keep (owner's decision 9).
 
 ## 5. Shared test infrastructure the core will use
 
-The allocation-count bench (focal-memory's counting global allocator) comes back with `hyper-sim` (note
-32 §3.10), rewritten without its lock and with its `unsafe` listed in the contract script. The same
+The allocation-count bench (focal-memory's counting global allocator) came back as `hyper-measure`,
+rewritten without its lock and with its `unsafe` listed in the contract script; with it,
+`hyper-raft-compare` measures this crate against each core it replaces, and `hyper-raft-e2e` runs it
+as real processes (`docs/benchmarks.md`). The same
 applies to the timed simulation, the safety explorer and the exhaustive models from slates, and to
 mantle's linearizability checker. Each joins under the production lints, as focal requires of
 `focal-sim`.

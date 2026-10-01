@@ -370,14 +370,15 @@ impl Outgoing {
             .saturating_add(count.saturating_mul(2))
             .saturating_mul(std::mem::size_of::<Message>())
     }
-    fn push(&mut self, message: Message) -> Result<()> {
+    /// Queues `message`, whose [`proto::message_bytes`] are `bytes`.
+    fn push_counted(&mut self, message: Message, bytes: usize) -> Result<()> {
         if self.msgs.len() == self.msgs.capacity() {
             let more = self.msgs.capacity().max(Self::SMALLEST);
             self.msgs
                 .try_reserve_exact(more)
                 .map_err(|_| Error::Memory)?;
         }
-        self.payload = self.payload.saturating_add(proto::message_bytes(&message));
+        self.payload = self.payload.saturating_add(bytes);
         self.msgs.push(message);
         Ok(())
     }
@@ -412,12 +413,19 @@ struct Outbox<'a, S> {
     max_entries: usize,
 }
 
-fn push(
+fn push(msgs: &mut Outgoing, id: NodeId, term: u64, priority: i64, message: Message) -> Result<()> {
+    push_with(msgs, id, term, priority, message, None)
+}
+
+/// As [`push`], given what the entries' buffers hold by capacity when it is
+/// already counted ([`proto::message_bytes_with`]).
+fn push_with(
     msgs: &mut Outgoing,
     id: NodeId,
     term: u64,
     priority: i64,
     mut message: Message,
+    entries_payload: Option<usize>,
 ) -> Result<()> {
     if message.from == 0 {
         message.from = id;
@@ -433,7 +441,7 @@ fn push(
         if message.msg_type == fast::FAST_VOTE {
             message.term = term;
         }
-        return msgs.push(message);
+        return queue(msgs, message, entries_payload);
     }
     let kind = proto::message_type(&message).ok_or(Error::Invariant("a message of no kind"))?;
     match kind {
@@ -471,7 +479,16 @@ fn push(
         }
         message.priority = priority;
     }
-    msgs.push(message)
+    queue(msgs, message, entries_payload)
+}
+
+/// Queues `message`, its bytes counted from `entries_payload` when given.
+fn queue(msgs: &mut Outgoing, message: Message, entries_payload: Option<usize>) -> Result<()> {
+    let bytes = match entries_payload {
+        Some(payload) => proto::message_bytes_with(&message, payload),
+        None => proto::message_bytes(&message),
+    };
+    msgs.push_counted(message, bytes)
 }
 
 fn priority_of(message: &Message) -> i64 {
@@ -485,6 +502,18 @@ fn priority_of(message: &Message) -> i64 {
 impl<S: Storage> Outbox<'_, S> {
     fn send(&mut self, message: Message) -> Result<()> {
         push(self.msgs, self.id, self.term, self.priority, message)
+    }
+    /// As [`Outbox::send`], for a message whose entries' payload was
+    /// counted as its page was chosen.
+    fn send_page(&mut self, message: Message, payload: usize) -> Result<()> {
+        push_with(
+            self.msgs,
+            self.id,
+            self.term,
+            self.priority,
+            message,
+            Some(payload),
+        )
     }
     fn snapshot(
         &mut self,
@@ -520,6 +549,8 @@ impl<S: Storage> Outbox<'_, S> {
             to,
             ..Message::default()
         };
+        // What the entries' buffers hold, counted as their page is chosen.
+        let mut payload = None;
         if progress.pending_request_snapshot != 0 {
             if !self.snapshot(&mut message, progress, to)? {
                 return Ok(false);
@@ -529,8 +560,12 @@ impl<S: Storage> Outbox<'_, S> {
             // any of it is copied.
             let entries = self
                 .log
-                .entries(progress.next_index, self.max_bytes, self.max_entries);
-            if !allow_empty && entries.as_ref().map_or(true, Vec::is_empty) {
+                .page(progress.next_index, self.max_bytes, self.max_entries);
+            if !allow_empty
+                && entries
+                    .as_ref()
+                    .map_or(true, |page| page.entries.is_empty())
+            {
                 return Ok(false);
             }
             let term = self.log.term(progress.next_index.saturating_sub(1));
@@ -544,15 +579,16 @@ impl<S: Storage> Outbox<'_, S> {
                 }
             }
             match (term, entries) {
-                (Ok(term), Ok(entries)) => {
+                (Ok(term), Ok(page)) => {
                     message.msg_type = MessageType::MsgAppend as i32;
                     message.index = progress.next_index.saturating_sub(1);
                     message.log_term = term;
                     message.commit = self.log.committed();
-                    if let Some(last) = entries.last() {
+                    if let Some(last) = page.entries.last() {
                         progress.sent(last.index)?;
                     }
-                    message.entries = entries;
+                    message.entries = page.entries;
+                    payload = Some(page.payload);
                 }
                 (_, Err(Error::Storage(StorageError::LogTemporarilyUnavailable))) => {
                     return Ok(false);
@@ -565,7 +601,10 @@ impl<S: Storage> Outbox<'_, S> {
                 }
             }
         }
-        self.send(message)?;
+        match payload {
+            Some(payload) => self.send_page(message, payload)?,
+            None => self.send(message)?,
+        }
         Ok(true)
     }
     /// As many messages as the window admits, and none that is empty.

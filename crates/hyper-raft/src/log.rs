@@ -70,7 +70,9 @@ pub(crate) fn copy_entries(entries: &[Entry], into: &mut Vec<Entry>) -> Result<(
     Ok(())
 }
 /// Keeps as many entries as `max_bytes` of their encoding admit, and one at
-/// least: the longest prefix whose running total fits.
+/// least: the longest prefix whose running total fits. The reference the
+/// tests hold a page to; the log builds its pages by [`page_of`].
+#[cfg(test)]
 pub(crate) fn limit_bytes(entries: &mut Vec<Entry>, max_bytes: u64) {
     if entries.len() <= 1 || max_bytes == u64::MAX {
         return;
@@ -79,24 +81,65 @@ pub(crate) fn limit_bytes(entries: &mut Vec<Entry>, max_bytes: u64) {
     entries.truncate(kept);
 }
 /// How many of `entries`, in order, a page admits that already holds
-/// `held` entries of `used` bytes: the rule of [`limit_bytes`] carried on
-/// across a boundary, so that a page is chosen before any of it is copied.
+/// `held` entries of `used` bytes: the page's rule carried on across a
+/// boundary, so that a page is chosen before any of it is copied.
 /// Every entry is taken while the running total fits, and the first is
 /// taken whatever its bytes when the page holds nothing yet.
 pub(crate) fn page_of(entries: &[Entry], held: usize, used: u64, max_bytes: u64) -> usize {
+    page_and_bytes(entries, held, used, max_bytes).0
+}
+/// As [`page_of`], with the running total of the page once the entries
+/// taken are in it. With no bound the total is not counted, and is `used`.
+pub(crate) fn page_and_bytes(
+    entries: &[Entry],
+    held: usize,
+    used: u64,
+    max_bytes: u64,
+) -> (usize, u64) {
+    let (taken, bytes, _) = page_bytes_payload(entries, held, used, max_bytes, false);
+    (taken, bytes)
+}
+/// As [`page_and_bytes`], with what the buffers of the entries taken hold
+/// by capacity ([`payload_of`]) when `payload` asks for it: counted in the
+/// same walk, so that a page's entries are read once.
+fn page_bytes_payload(
+    entries: &[Entry],
+    held: usize,
+    used: u64,
+    max_bytes: u64,
+    payload: bool,
+) -> (usize, u64, usize) {
+    let mut held_payload = 0usize;
     if max_bytes == u64::MAX {
-        return entries.len();
+        if payload {
+            held_payload = entries
+                .iter()
+                .fold(0usize, |sum, entry| sum.saturating_add(payload_of(entry)));
+        }
+        return (entries.len(), used, held_payload);
     }
     let mut bytes = used;
     let mut taken = 0usize;
     for entry in entries {
-        bytes = bytes.saturating_add(proto::encoded_bytes(entry));
-        if held.saturating_add(taken) > 0 && bytes > max_bytes {
+        let next = bytes.saturating_add(proto::encoded_bytes(entry));
+        if held.saturating_add(taken) > 0 && next > max_bytes {
             break;
         }
+        bytes = next;
         taken = taken.saturating_add(1);
+        if payload {
+            held_payload = held_payload.saturating_add(payload_of(entry));
+        }
     }
-    taken
+    (taken, bytes, held_payload)
+}
+
+/// A page of entries copied out of the log, and what their buffers hold by
+/// capacity ([`payload_of`]), counted as the page was chosen.
+#[derive(Debug, Default)]
+pub(crate) struct Page {
+    pub(crate) entries: Vec<Entry>,
+    pub(crate) payload: usize,
 }
 /// The bytes an entry's buffers hold, by capacity.
 pub(crate) fn payload_of(entry: &Entry) -> usize {
@@ -608,14 +651,20 @@ impl<S: Storage> Log<S> {
     /// byte-limited page to `max_entries` would, and copies no more than
     /// the page.
     pub fn entries(&self, index: u64, max_bytes: u64, max_entries: usize) -> Result<Vec<Entry>> {
+        self.page(index, max_bytes, max_entries)
+            .map(|page| page.entries)
+    }
+    /// As [`Log::entries`], with what the page's buffers hold, counted as
+    /// it was chosen.
+    pub(crate) fn page(&self, index: u64, max_bytes: u64, max_entries: usize) -> Result<Page> {
         let last = self.last_index()?;
         if index > last {
-            return Ok(Vec::new());
+            return Ok(Page::default());
         }
         let high = index
             .saturating_add(u64::try_from(max_entries).unwrap_or(u64::MAX))
             .min(last.saturating_add(1));
-        self.slice(index, high, max_bytes)
+        self.slice_page(index, high, max_bytes)
     }
     /// Whether a log that ends at `(last_index, term)` is at least as up to
     /// date as this one (Raft §5.4.1): a later last term, or the same and
@@ -791,15 +840,23 @@ impl<S: Storage> Log<S> {
     /// gives the whole of what was asked of it, the running total carries
     /// on into what is not yet durable, which is read where it is and
     /// copied only as far as the page reaches. The result is what copying
-    /// everything and then cutting it ([`limit_bytes`]) would give, for
+    /// everything and then cutting it would give, for
     /// both keep the longest prefix that fits and the first entry whatever
-    /// its bytes; the cut is kept after all the same, so that a storage
-    /// that gives more than its part admits is cut here.
+    /// its bytes. A storage that gives the whole of what was asked, more
+    /// than its part admits, is cut here by the same rule; every entry's
+    /// bytes are counted once.
     pub fn slice(&self, low: u64, high: u64, max_bytes: u64) -> Result<Vec<Entry>> {
+        self.slice_page(low, high, max_bytes)
+            .map(|page| page.entries)
+    }
+    /// As [`Log::slice`], with what the page's buffers hold by capacity,
+    /// counted in the walk that chooses it.
+    fn slice_page(&self, low: u64, high: u64, max_bytes: u64) -> Result<Page> {
         self.bounded(low, high)?;
         let mut entries = Vec::new();
+        let mut payload = 0usize;
         if low == high {
-            return Ok(entries);
+            return Ok(Page { entries, payload });
         }
         // The bytes of the page so far, by the rule the cut counts.
         let mut used = 0u64;
@@ -810,13 +867,22 @@ impl<S: Storage> Log<S> {
             let wanted = stored_high.saturating_sub(low);
             if u64::try_from(entries.len()).unwrap_or(u64::MAX) < wanted {
                 // Storage cut the page: it is complete.
-                return Ok(entries);
+                payload = entries
+                    .iter()
+                    .fold(0usize, |sum, entry| sum.saturating_add(payload_of(entry)));
+                return Ok(Page { entries, payload });
             }
-            if max_bytes != u64::MAX {
-                used = entries.iter().fold(0u64, |bytes, entry| {
-                    bytes.saturating_add(proto::encoded_bytes(entry))
-                });
+            // Storage gave all it was asked for. It is held to the rule
+            // here, once: a storage that gave more than its part admits is
+            // cut, and the page is complete; otherwise the running total
+            // carries on into what is not yet durable.
+            let (kept, bytes, held) = page_bytes_payload(&entries, 0, 0, max_bytes, true);
+            payload = held;
+            if kept < entries.len() {
+                entries.truncate(kept);
+                return Ok(Page { entries, payload });
             }
+            used = bytes;
         }
         if high > self.unstable.offset {
             let from = low.max(self.unstable.offset);
@@ -826,11 +892,13 @@ impl<S: Storage> Log<S> {
                 .try_reserve_exact(taken)
                 .map_err(|_| Error::Memory)?;
             for entry in tail.get(..taken).unwrap_or(&[]) {
-                entries.push(copy_entry(entry)?);
+                let copy = copy_entry(entry)?;
+                payload = payload.saturating_add(payload_of(&copy));
+                entries.push(copy);
             }
         }
-        limit_bytes(&mut entries, max_bytes);
-        Ok(entries)
+        // Built by the rule from end to end: nothing is left to cut.
+        Ok(Page { entries, payload })
     }
     /// The log begins again after `snapshot`.
     pub fn restore(&mut self, snapshot: Snapshot) -> Result<()> {
@@ -882,6 +950,9 @@ pub(crate) mod tests {
         pub entries: Vec<Entry>,
         /// What the member approved by itself.
         pub proposals: Vec<Entry>,
+        /// Gives every entry asked for, whatever the bytes: a storage that
+        /// does not page by the rule, which the log cuts.
+        pub greedy: bool,
     }
     impl Memory {
         pub fn with_voters(voters: &[u64]) -> Self {
@@ -951,7 +1022,11 @@ pub(crate) mod tests {
                 return Err(StorageError::Unavailable);
             }
             let range = &self.entries[(low - first) as usize..(high - first) as usize];
-            let taken = page_of(range, 0, 0, max_bytes);
+            let taken = if self.greedy {
+                range.len()
+            } else {
+                page_of(range, 0, 0, max_bytes)
+            };
             into.try_reserve_exact(taken)
                 .map_err(|_| StorageError::Unavailable)?;
             into.extend(range[..taken].iter().cloned());
@@ -1488,6 +1563,38 @@ pub(crate) mod tests {
                 .map(|r| r.last),
             Some(12)
         );
+    }
+    /// A storage that gives more than its part admits is cut by the rule,
+    /// and nothing not yet durable is added to a page it filled.
+    #[test]
+    fn a_storage_that_gives_too_much_is_cut_by_the_rule() {
+        let payload = |index| Entry {
+            index,
+            term: 1,
+            data: vec![7; 4096],
+            ..Entry::default()
+        };
+        let one = proto::encoded_bytes(&payload(1));
+        let mut store = Memory {
+            greedy: true,
+            ..Memory::default()
+        };
+        store.append(&(1..=6).map(payload).collect::<Vec<_>>());
+        let mut log = Log::new(store, 1024).unwrap();
+        log.append(&(7..=9).map(payload).collect::<Vec<_>>())
+            .unwrap();
+        for (low, max, expected) in [
+            (1, 2 * one, vec![(1, 1), (2, 1)]),
+            (1, one - 1, vec![(1, 1)]),
+            (5, 3 * one, vec![(5, 1), (6, 1), (7, 1)]),
+            (6, u64::MAX, (6..=9).map(|index| (index, 1)).collect()),
+        ] {
+            assert_eq!(
+                indexes(&log.slice(low, 10, max).unwrap()),
+                expected,
+                "{low} {max}"
+            );
+        }
     }
     #[test]
     fn a_rejection_names_where_the_logs_may_still_agree() {

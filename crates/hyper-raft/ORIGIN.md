@@ -159,3 +159,51 @@ All runs used `--test-threads=4`.
 
   Only the "moved by the allocator" column differs, and it differs for the unchanged raft-rs rows too:
   it records where the system allocator placed blocks.
+
+## After R-1: the law of measurement (branch `raft-law`)
+
+`CLAUDE.md` §1a: allocations, reallocations and page faults are measured on every hot path and
+driven down, and the crate is benchmarked against each core it replaces. The measurements are in
+`docs/benchmarks.md`; the counting allocator is `crates/hyper-measure` (it replaces the
+`benches/allocs.rs` this move removed, without its lock, its `unsafe` in two files the contract
+script lists). Two changes to this crate followed from them. Each decides exactly what the
+crate decided before.
+
+### Entries move into the log uncopied
+
+- A leader's proposals were copied into the log not yet durable, through a staging vector, and a
+  follower copied every entry of an append out of the leader's message the same way.
+- They now move in: `Log::append_owned` and `Log::append_after_owned` take the entries by value,
+  and when the log holds nothing not yet durable the incoming vector becomes its own.
+- `Log::append` and `Log::append_after` keep their borrowed signatures and copy, as before.
+- One count rose: a batch of appends to a log that holds nothing grows the adopted vector from
+  its exact length, one reallocation more per batch than growing a fresh one. Each such batch
+  saves one allocation and every entry's copy, so allocator calls fell in every workload
+  (`docs/benchmarks.md`, "Optimisations").
+
+### A `Ready` given in place
+
+- `RawNode::ready_in_place` decides exactly as `RawNode::ready` and copies nothing the owner can
+  read where it is: the owner writes from `RawNode::to_persist`, applies the range
+  `Ready::committed_range` names from its own storage (`Log::next_range_since` chooses it by the
+  rule `Log::next_entries_since` pages by), and keeps the entries and snapshot the member gives
+  up at `RawNode::advance_append_keeping`.
+- `RawNode::ready` and `RawNode::advance_append` are unchanged.
+
+### A page's entries are read once
+
+- A leader's page held what storage gave to the byte rule three times: storage's own count, a
+  running total for what followed it, and a final cut over the whole page. It now counts each
+  entry once, in the walk that also sums what the page's buffers hold, which the message queue's
+  accounting had walked the entries again for (`Log::slice`, `Outbox::send_page`,
+  `proto::message_bytes_with`).
+- A storage that gives more than the rule admits is still cut by the rule (a unit test holds it).
+
+### Proof
+
+- All tests pass: 55 unit tests, 7 differential tests, 10 fast-track tests, 8 group tests.
+- The differential runs every mix twice, with `Ready`s copied and given in place. `fast.rs` and
+  `group.rs` run their schedules both ways and assert equal results.
+- At 1,000 seeds from seed 1,000 every seed-fixed count the tests print is identical to focal
+  `a8e95f7`'s (R-1's record, above), and each in-place mix's counts equal its copying twin's: the
+  six mixes compared 22,275,363 steps each way.

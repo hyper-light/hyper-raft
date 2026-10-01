@@ -24,6 +24,7 @@
 #![cfg_attr(
     test,
     allow(
+        clippy::cognitive_complexity,
         clippy::panic,
         clippy::unwrap_used,
         clippy::expect_used,
@@ -76,6 +77,7 @@ pub struct PathRtt {
     samples: u64,
 }
 impl PathRtt {
+    /// A path with no sample.
     pub const fn new() -> Self {
         Self {
             window: [0; PATH_WINDOW],
@@ -96,6 +98,7 @@ impl PathRtt {
             .unwrap_or(0);
         self.samples = self.samples.saturating_add(1);
     }
+    /// How many round trips have been folded in, including those the window no longer holds.
     pub const fn samples(&self) -> u64 {
         self.samples
     }
@@ -168,6 +171,7 @@ pub struct ExchangeRtt {
 }
 
 impl ExchangeRtt {
+    /// An estimator with no sample.
     pub const fn new() -> Self {
         Self {
             smoothed_ns: 0,
@@ -193,12 +197,15 @@ impl ExchangeRtt {
         }
         self.samples = self.samples.saturating_add(1);
     }
+    /// How many round trips have been folded in.
     pub const fn samples(&self) -> u64 {
         self.samples
     }
+    /// The smoothed round trip, `smoothed_rtt` (RFC 9002 §5.3), in nanoseconds.
     pub const fn smoothed_ns(&self) -> u64 {
         self.smoothed_ns
     }
+    /// The mean deviation, `rttvar` (RFC 9002 §5.3), in nanoseconds.
     pub const fn variation_ns(&self) -> u64 {
         self.variation_ns
     }

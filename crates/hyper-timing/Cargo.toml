@@ -1,5 +1,5 @@
 [package]
-name = "focal-timing"
+name = "hyper-timing"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

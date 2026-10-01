@@ -14,9 +14,17 @@ use std::time::{Duration, Instant};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Spent {
     /// Every observed owner ran the whole budget of its own periods.
-    Budget { periods: u64 },
+    Budget {
+        /// The periods the least advanced owner ran.
+        periods: u64,
+    },
     /// The slowest observed owner ran no period for the frozen window.
-    Frozen { periods: u64, stalled: Duration },
+    Frozen {
+        /// The periods the least advanced owner ran before it stalled.
+        periods: u64,
+        /// How long it has run none.
+        stalled: Duration,
+    },
 }
 impl std::fmt::Display for Spent {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -32,6 +40,7 @@ impl std::fmt::Display for Spent {
     }
 }
 
+/// A wait spent in the observed owners' periods, bounded in wall time only by the frozen window.
 #[derive(Debug, Clone)]
 pub struct ProgressDeadline {
     began: Vec<u64>,
@@ -43,9 +52,7 @@ pub struct ProgressDeadline {
 impl ProgressDeadline {
     /// `counters` are the observed owners' period counts now, `budget` the
     /// periods each may run, and `frozen` how long the slowest may run none.
-    pub fn begin(counters: &[u64], budget: u64, frozen: Duration) -> Self {
-        Self::begin_at(counters, budget, frozen, Instant::now())
-    }
+    /// `now` is the caller's clock: the crate never reads one.
     pub fn begin_at(counters: &[u64], budget: u64, frozen: Duration, now: Instant) -> Self {
         Self {
             began: counters.to_vec(),
@@ -74,10 +81,8 @@ impl ProgressDeadline {
             .min()
             .unwrap_or(0)
     }
-    pub fn check(&mut self, counters: &[u64]) -> Result<(), Spent> {
-        self.check_at(counters, Instant::now())
-    }
-    /// `counters` in the order given to `begin`. No observed owner leaves
+    /// Whether the wait goes on at `now`, the caller's clock. `counters` are in the order given to
+    /// `begin_at`. No observed owner leaves
     /// only the frozen window.
     pub fn check_at(&mut self, counters: &[u64], now: Instant) -> Result<(), Spent> {
         let least = self.least(counters);

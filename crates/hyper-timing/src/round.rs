@@ -37,6 +37,7 @@ pub struct RoundBudget {
     pub lookahead: (u64, u64),
     /// What one extension adds.
     pub extension_ns: u64,
+    /// How many extensions a progressing round may take.
     pub max_extensions: u32,
     /// Progress older than this is no progress.
     pub stall_window_ns: u64,
@@ -100,6 +101,7 @@ pub struct ProgressWitness {
     stall_window_ns: u64,
 }
 impl ProgressWitness {
+    /// A witness that has seen nothing, for which progress older than `stall_window_ns` is none.
     pub fn new(stall_window_ns: u64) -> Self {
         Self {
             measure: 0,
@@ -107,6 +109,7 @@ impl ProgressWitness {
             stall_window_ns,
         }
     }
+    /// Record that the round has gathered `measure` by `now_ns`; only growth counts as progress.
     pub fn observe(&mut self, measure: u64, now_ns: u64) {
         if measure > self.measure {
             self.measure = measure;
@@ -125,15 +128,20 @@ impl ProgressWitness {
     }
 }
 
+/// What a round's deadline does at a judgement.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Verdict {
     /// The judgement of the deadline in force is not reached.
     Continue,
     /// Past the lookahead and progressing: the deadline moved to this.
-    Extend { deadline_ns: u64 },
+    Extend {
+        /// The deadline now in force.
+        deadline_ns: u64,
+    },
     /// Past the lookahead and stalled, or out of extensions.
     Expire,
 }
+/// A round's deadline, extended while the round progresses, up to its budget's extensions.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DeadlineExtender {
     deadline_ns: u64,
@@ -143,6 +151,7 @@ pub struct DeadlineExtender {
     granted: u32,
 }
 impl DeadlineExtender {
+    /// The deadline `budget` describes, with no extension granted.
     pub fn new(budget: &RoundBudget) -> Self {
         Self {
             deadline_ns: budget.deadline_ns,
@@ -152,6 +161,7 @@ impl DeadlineExtender {
             granted: 0,
         }
     }
+    /// The deadline in force, as elapsed time since the round began.
     pub fn deadline_ns(&self) -> u64 {
         self.deadline_ns
     }
@@ -174,6 +184,8 @@ impl DeadlineExtender {
             self.deadline_ns
         }
     }
+    /// Judge the round `elapsed_ns` after it began: continue before the judgement, extend a
+    /// progressing round, expire a stalled one or one out of extensions.
     pub fn evaluate(&mut self, elapsed_ns: u64, witness: &ProgressWitness, now_ns: u64) -> Verdict {
         if elapsed_ns < self.judgement_ns(witness) {
             return Verdict::Continue;
@@ -197,6 +209,7 @@ pub struct RoundWait {
     started_ns: u64,
 }
 impl RoundWait {
+    /// A round under `budget` that began at `now_ns`.
     pub fn begin(budget: &RoundBudget, now_ns: u64) -> Self {
         Self {
             extender: DeadlineExtender::new(budget),

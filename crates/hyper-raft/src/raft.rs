@@ -90,6 +90,29 @@ pub enum Precedence {
     Length,
 }
 
+/// When a leader asks its quorum for the reads that wait (Ongaro's thesis
+/// §6.4: a round of heartbeats sent after a read was asked, and answered by
+/// a quorum, confirms it and every read asked before it).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ReadRounds {
+    /// When the member is next asked what there is to do
+    /// ([`crate::RawNode::ready`]): one round, carrying the last read asked,
+    /// for every read asked since the round before. A read asked alone
+    /// leaves with the `Ready` its owner takes next; reads its owner took
+    /// together share a round; and a read asked after a round was sent is
+    /// asked for by the next, never confirmed by one that left before it.
+    /// A read that is asked again while it waits asks for no round of its
+    /// own: a round that was lost is asked again by the leader's clock.
+    #[default]
+    Shared,
+    /// As each read is asked, and each time it is asked again, a round of
+    /// its own: the rule of `raft-rs`. Twenty reads taken together are
+    /// forty heartbeats to two members, of which the answers to the last
+    /// two confirm all twenty. Kept to compare the two cores under one
+    /// rule.
+    Each,
+}
+
 /// How a member runs. [`Config::new`] gives the settings `raft-rs` 0.7
 /// defaults to, so that the two cores compare under one setting.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -122,6 +145,9 @@ pub struct Config {
     pub priority: i64,
     /// What a candidate of lower priority must hold to be voted for.
     pub precedence: Precedence,
+    /// When a leader sends the round of heartbeats that confirms the reads
+    /// that wait.
+    pub read_rounds: ReadRounds,
     /// Whether the group has the fast track ([`crate::fast`]). It is part
     /// of what the group is: every member is opened with the same.
     pub fast: bool,
@@ -150,6 +176,7 @@ impl Config {
             pre_vote: false,
             priority: 0,
             precedence: Precedence::Log,
+            read_rounds: ReadRounds::Shared,
             fast: false,
             skip_bcast_commit: false,
             seed: id,
@@ -1030,7 +1057,25 @@ impl<S: Storage> Raft<S> {
             }
             None => false,
         };
-        self.bcast_heartbeat_with(asked.then_some(context.as_slice()))
+        self.bcast_heartbeat_with(asked.then_some(context.as_slice()))?;
+        // It carried the last read asked: it is a round for every read
+        // that waits, and the one that asks again for a round that was
+        // lost.
+        self.read_only.asked();
+        Ok(())
+    }
+    /// Whether a read waits that no round sent asks for: the member has a
+    /// round to send.
+    pub fn reads_unasked(&self) -> bool {
+        self.state == StateRole::Leader && self.read_only.unasked()
+    }
+    /// One round of heartbeats for the reads asked since the last one, if
+    /// there are any ([`ReadRounds::Shared`]).
+    pub fn ask_reads(&mut self) -> Result<()> {
+        if self.reads_unasked() {
+            self.bcast_heartbeat()?;
+        }
+        Ok(())
     }
     fn bcast_heartbeat_with(&mut self, context: Option<&[u8]>) -> Result<()> {
         let (mut outbox, tracker) = self.outbox();
@@ -1736,14 +1781,26 @@ impl<S: Storage> Raft<S> {
         {
             return Err(Error::Capacity("reads that wait for their quorum"));
         }
-        let mut heartbeat = Vec::new();
-        heartbeat
-            .try_reserve_exact(context.len())
-            .map_err(|_| Error::Capacity("reads that wait for their quorum"))?;
-        heartbeat.extend_from_slice(&context);
-        self.read_only
-            .add(committed, context, message.from, self.id)?;
-        self.bcast_heartbeat_with(Some(&heartbeat))
+        match self.config.read_rounds {
+            // No round is sent for it here. One leaves when the member is
+            // next asked what there is to do (`ask_reads`), carrying the
+            // last read asked by then.
+            ReadRounds::Shared => self
+                .read_only
+                .add(committed, context, message.from, self.id),
+            ReadRounds::Each => {
+                let mut heartbeat = Vec::new();
+                heartbeat
+                    .try_reserve_exact(context.len())
+                    .map_err(|_| Error::Capacity("reads that wait for their quorum"))?;
+                heartbeat.extend_from_slice(&context);
+                self.read_only
+                    .add(committed, context, message.from, self.id)?;
+                self.bcast_heartbeat_with(Some(&heartbeat))?;
+                self.read_only.asked();
+                Ok(())
+            }
+        }
     }
     /// The read may be served at `index`: said here, or to who asked.
     fn answer_read(&mut self, from: NodeId, index: u64, context: Vec<u8>) -> Result<()> {

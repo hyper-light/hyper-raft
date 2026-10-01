@@ -37,7 +37,9 @@ It is Raft as Ongaro's thesis states it, with these extensions:
 - learners and joint consensus (`ConfChangeV2`);
 - leader transfer;
 - an inflight window with conflict hints;
-- ReadIndex (quorum-confirmed, no lease) and snapshots;
+- ReadIndex (quorum-confirmed, no lease), with one round of heartbeats for every read asked since
+  the last `Ready` (`ReadRounds::Shared`, the default; `ReadRounds::Each` is raft-rs's round per
+  read, which the differential runs), and snapshots;
 - the fast track (Fast Raft, Castiglia, Goldberg and Patterson, ICDCS 2020) for a group that enables it.
 
 Errors are of three kinds:

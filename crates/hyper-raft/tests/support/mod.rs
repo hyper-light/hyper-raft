@@ -432,6 +432,9 @@ pub struct Settings {
     pub pre_vote: bool,
     /// Whether priority yields to a longer log alone, as in `raft-rs`.
     pub by_length: bool,
+    /// Whether a leader sends a round of heartbeats for each read as it is
+    /// asked, as in `raft-rs`.
+    pub round_each: bool,
     /// Whether the group has the fast track.
     pub fast: bool,
     /// Whether this core's members are driven by `RawNode::ready_in_place`,
@@ -452,6 +455,7 @@ impl Settings {
             check_quorum: true,
             pre_vote: true,
             by_length: true,
+            round_each: true,
             fast: false,
             in_place: false,
         }
@@ -460,6 +464,7 @@ impl Settings {
     pub fn focal() -> Self {
         Self {
             by_length: false,
+            round_each: false,
             ..Self::shell()
         }
     }
@@ -889,6 +894,11 @@ impl Replica for New {
                 hyper_raft::Precedence::Length
             } else {
                 hyper_raft::Precedence::Log
+            },
+            read_rounds: if settings.round_each {
+                hyper_raft::ReadRounds::Each
+            } else {
+                hyper_raft::ReadRounds::Shared
             },
             fast: settings.fast,
             seed,

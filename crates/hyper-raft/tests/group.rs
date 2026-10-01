@@ -23,7 +23,7 @@
 mod support;
 
 use hyper_raft::proto::{
-    ConfChangeSingle, ConfChangeTransition, ConfChangeType, ConfChangeV2, MessageType,
+    ConfChangeSingle, ConfChangeTransition, ConfChangeType, ConfChangeV2, Message, MessageType,
 };
 use support::{Cluster, Either, Mix, New, Old, Op, Replica, Seeded, Settings};
 
@@ -42,16 +42,18 @@ fn scheduled<R: Replica>(group: &mut Cluster<R>, seed: u64, steps: u64, mix: &Mi
     }
 }
 
-/// Groups of this core under schedules; the terms they led.
-fn schedules_of_this_core(settings: Settings) -> usize {
+/// Groups of this core under schedules; the terms they led and the reads
+/// they answered.
+fn schedules_of_this_core(settings: Settings) -> (usize, u64) {
     let seeds = count("HYPER_RAFT_SEEDS", 96);
     let steps = count("HYPER_RAFT_STEPS", 4_000);
     let first = count("HYPER_RAFT_SEED", 0);
     let mix = Mix {
         leader_leaves: true,
+        bursts: true,
         ..Mix::everything()
     };
-    let mut terms = 0;
+    let (mut terms, mut answered) = (0, 0);
     for seed in first..first + seeds {
         let mut group: Cluster<New> = Cluster::new(5, &[1, 2, 3], settings, seed);
         group.stop_who_left = true;
@@ -62,15 +64,19 @@ fn schedules_of_this_core(settings: Settings) -> usize {
             "seed {seed}: a member led a group it left"
         );
         terms += group.leaders.len();
+        answered += group.answered;
     }
-    terms
+    (terms, answered)
 }
 
 #[test]
 fn a_group_of_this_core_is_safe_and_settles() {
     let seeds = count("HYPER_RAFT_SEEDS", 96);
-    let terms = schedules_of_this_core(Settings::focal());
-    println!("{seeds} schedules led {terms} terms");
+    let (terms, answered) = schedules_of_this_core(Settings::focal());
+    // Every read answered saw what was committed before it was asked
+    // (`Cluster::report`), asked alone or several at a time.
+    assert!(answered > seeds, "{answered} reads were answered");
+    println!("{seeds} schedules led {terms} terms and answered {answered} reads");
     assert!(terms as u64 > seeds);
 }
 
@@ -93,7 +99,10 @@ fn a_group_of_both_cores_is_safe_and_settles() {
     let seeds = count("HYPER_RAFT_SEEDS", 96);
     let steps = count("HYPER_RAFT_STEPS", 4_000);
     let first = count("HYPER_RAFT_SEED", 0);
-    let mix = Mix::everything();
+    let mix = Mix {
+        bursts: true,
+        ..Mix::everything()
+    };
     let (mut old, mut new, mut deposed) = (0, 0, 0);
     for seed in first..first + seeds {
         let mut group: Cluster<Either> = Cluster::new(5, &[1, 2, 3], Settings::focal(), seed);
@@ -144,6 +153,82 @@ fn ticks<R: Replica>(group: &mut Cluster<R>, members: &[u64], count: usize) {
         quiet(group);
     }
 }
+/// Delivers, and takes from the network, the messages `which` picks.
+fn deliver<R: Replica>(group: &mut Cluster<R>, which: impl Fn(&Message) -> bool) -> usize {
+    let mut delivered = 0;
+    while let Some(at) = group.net.iter().position(&which) {
+        group.act(&Op::Deliver {
+            at,
+            keep: false,
+            lose: false,
+        });
+        delivered += 1;
+    }
+    delivered
+}
+
+/// A round of heartbeats confirms the reads asked before it left, and no
+/// read asked after. A leader sends a round for one read; the answers are
+/// held on the network; the leader is cut off, another is elected and
+/// commits; the old leader, which has heard nothing, is asked a second
+/// read; and then the answers to the first round arrive. They prove that it
+/// led when the first read was asked, and nothing about when the second
+/// was: the first is answered and the second is not — answered at the old
+/// leader's commit it would miss what the group committed before it was
+/// asked (`Cluster::report` checks every answer against that).
+#[test]
+fn a_round_confirms_no_read_asked_after_it_left() {
+    let mut group: Cluster<New> = Cluster::new(3, &[1, 2, 3], Settings::focal(), 7);
+    elect(&mut group, 1);
+    group.act(&Op::Propose(1, b"before".to_vec()));
+    quiet(&mut group);
+    group.act(&Op::Read(1, b"first".to_vec()));
+    let heartbeat = MessageType::MsgHeartbeat as i32;
+    let answer = MessageType::MsgHeartbeatResponse as i32;
+    assert_eq!(
+        deliver(&mut group, |message| message.msg_type == heartbeat),
+        2
+    );
+    // The answers wait on the network while the leader is cut off.
+    let held: Vec<Message> = group
+        .net
+        .iter()
+        .filter(|message| message.msg_type == answer && message.context == b"first")
+        .cloned()
+        .collect();
+    assert_eq!(held.len(), 2);
+    group.net.clear();
+    separate(&mut group, 1);
+    for _ in 0..64 {
+        ticks(&mut group, &[2, 3], 1);
+        if group.leaders_now().iter().any(|leader| *leader != 1) {
+            break;
+        }
+    }
+    let leader = group
+        .leaders_now()
+        .into_iter()
+        .find(|leader| *leader != 1)
+        .expect("the two that remain elect one of them");
+    let committed = group.chosen.len();
+    group.act(&Op::Propose(leader, b"after".to_vec()));
+    quiet(&mut group);
+    assert!(group.chosen.len() > committed);
+    // The old leader still believes it leads, and is asked again.
+    assert!(group.leaders_now().contains(&1));
+    group.act(&Op::Read(1, b"second".to_vec()));
+    group.net.clear();
+    group.act(&Op::Heal);
+    group.net.extend(held);
+    assert_eq!(deliver(&mut group, |message| message.msg_type == answer), 2);
+    // The first read was answered; the second waits for a round of its own,
+    // which the members that follow another leader will not answer.
+    assert_eq!(group.answered, 1);
+    quiet(&mut group);
+    assert!(group.settles(400));
+    assert_eq!(group.answered, 1);
+}
+
 fn change(kind: ConfChangeType, member: u64) -> ConfChangeV2 {
     ConfChangeV2 {
         changes: vec![ConfChangeSingle {

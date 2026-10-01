@@ -207,3 +207,30 @@ crate decided before.
 - At 1,000 seeds from seed 1,000 every seed-fixed count the tests print is identical to focal
   `a8e95f7`'s (R-1's record, above), and each in-place mix's counts equal its copying twin's: the
   six mixes compared 22,275,363 steps each way.
+
+## Ports from focal
+
+focal's own session changes the core in its copy, `crates/focal-raft`, and each change is ported
+here in a commit of its own, adapted to this crate's names and its optimisations (above). Each
+keeps the raft-rs differential unchanged: the differential runs the rule raft-rs has wherever the
+port adds one of its own.
+
+### F43: reads asked together share one round of heartbeats (focal `6af1c6b`)
+
+- A leader no longer sends a round of heartbeats as each read is asked. `Raft::ask_reads` sends
+  one when the member is next asked for a `Ready` (`RawNode::ready` and `RawNode::ready_in_place`
+  alike), carrying the context of the last read asked; a quorum's answer confirms it and every read
+  before it (Ongaro's thesis §6.4).
+- `ReadOnly::asked` marks how many reads the last round sent asks for; a round never confirms a
+  read asked after it left (`ReadOnly::advance` takes the confirmed reads off the asked ones).
+  `RawNode::has_ready` is true while a read is unasked.
+- `Config::read_rounds` is `ReadRounds::Shared` by default. `ReadRounds::Each` keeps raft-rs's
+  round per read, and the differential runs with it (`Settings::shell`).
+- Tests: three unit tests from focal; the schedule harness checks every answered read against
+  the highest index committed when it was asked (`Cluster::report`), and this core's schedules ask
+  reads in bursts (`Mix::bursts`, `Op::Reads`); the directed safety test
+  `a_round_confirms_no_read_asked_after_it_left`.
+- Changed from focal's form: the round is asked in `RawNode::ready_given`, the one path both
+  `Ready` forms take, so the in-place form sends it too; the schedule count of
+  `schedules_of_this_core` returns the reads answered as well as the terms, so that the in-place
+  twin is held to answer the same reads; the doc comments the lint wall asks for.

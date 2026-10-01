@@ -207,3 +207,102 @@ crate decided before.
 - At 1,000 seeds from seed 1,000 every seed-fixed count the tests print is identical to focal
   `a8e95f7`'s (R-1's record, above), and each in-place mix's counts equal its copying twin's: the
   six mixes compared 22,275,363 steps each way.
+
+## Ports from focal
+
+focal's own session changes the core in its copy, `crates/focal-raft`, and each change is ported
+here in a commit of its own, adapted to this crate's names and its optimisations (above). Each
+keeps the raft-rs differential unchanged: the differential runs the rule raft-rs has wherever the
+port adds one of its own.
+
+### F43: reads asked together share one round of heartbeats (focal `6af1c6b`)
+
+- A leader no longer sends a round of heartbeats as each read is asked. `Raft::ask_reads` sends
+  one when the member is next asked for a `Ready` (`RawNode::ready` and `RawNode::ready_in_place`
+  alike), carrying the context of the last read asked; a quorum's answer confirms it and every read
+  before it (Ongaro's thesis §6.4).
+- `ReadOnly::asked` marks how many reads the last round sent asks for; a round never confirms a
+  read asked after it left (`ReadOnly::advance` takes the confirmed reads off the asked ones).
+  `RawNode::has_ready` is true while a read is unasked.
+- `Config::read_rounds` is `ReadRounds::Shared` by default. `ReadRounds::Each` keeps raft-rs's
+  round per read, and the differential runs with it (`Settings::shell`).
+- Tests: three unit tests from focal; the schedule harness checks every answered read against
+  the highest index committed when it was asked (`Cluster::report`), and this core's schedules ask
+  reads in bursts (`Mix::bursts`, `Op::Reads`); the directed safety test
+  `a_round_confirms_no_read_asked_after_it_left`.
+- Changed from focal's form: the round is asked in `RawNode::ready_given`, the one path both
+  `Ready` forms take, so the in-place form sends it too; the schedule count of
+  `schedules_of_this_core` returns the reads answered as well as the terms, so that the in-place
+  twin is held to answer the same reads; the doc comments the lint wall asks for.
+
+### F41: a member is sent no more bytes ahead of its answers than its path carries (focal `052ae4a`)
+
+- `Inflights` holds each message's last index and the bytes of its entries, and is full at
+  `cap` messages or at its byte bound. One entry larger than the bound is sent, alone; a bound is
+  never zero.
+- `Config::max_inflight_bytes` (default `u64::MAX`, no bound of its own; zero refused) seeds every
+  member's bound, and `RawNode::set_inflight_bytes` sets one member's as its owner learns the
+  path. `Tracker::new` takes the bound; `Progress::sent(last, bytes)` charges the window;
+  `Progress::page_bytes` cuts a page to the window's room while entries are sent ahead of their
+  answers; `Raft::check_accounting` checks every window's count of bytes.
+- The differential runs with no byte bound (`Settings::shell`). This core's schedules run with
+  256 bytes (`Settings::focal`, and so `Settings::fast`) and change bounds while they run
+  (`Mix::windows`, `Op::Window`).
+- Changed from focal's form: focal walked the page a second time after cutting it, summing
+  `proto::encoded_bytes`, to charge the window. Here the bytes are counted in the walk that chooses
+  the page (`Page::bytes`), which the byte rule makes anyway wherever it cuts: storage's page held
+  to the rule, and the tail not yet durable. Where it does not count them (a storage that cut the
+  page itself, or a page with no bound), the bytes are counted in the walk that already counts the
+  page's buffers, and only for a leader's page (`Log::page`); `Log::slice`, which pages what is
+  applied, counts nothing more than before. A unit test holds `Page::bytes` to the sum of the
+  encodings on every path, against a storage that pages by the rule and one that gives too much.
+
+### F42: a peer that answers nothing holds its own lane (focal `4bf7b64`)
+
+Taken from focal's patch of `crates/focal-raft` `7ab57e0..04a45f6`, after focal gated `4bf7b64`
+(`origin/slates-port`); the patch is byte for byte focal's diff `052ae4a..4bf7b64` of the crate.
+
+- `HeartbeatAnswers::Position` (the default): a member's heartbeat answer carries its last index
+  and that entry's term. Where the entry is of the leader's term, the answer is taken as an
+  append's answer for everything through it (not in a fast group, whose terms differ by member), so
+  lost answers are made good exactly and a full window gives back what the member holds and nothing
+  more. A member whose window is full and that answers for none of it through a beat of the
+  leader's ticks (`Progress::stalled`, counted by `Progress::tick` on the leader's ticks, never by
+  heartbeat answers) is probed; a probe is sent again when told lost (`MsgUnreachable`) or once a
+  beat has passed. `HeartbeatAnswers::Bare` keeps raft-rs's rule (answers say nothing; a full window
+  frees its first message at every answer), and the differential runs with it.
+- `Raft::settle_priority` puts no priority in force for a member that is not promotable: a member
+  that applied its own removal refused, for good, the voter that remained. The directed test is
+  `a_member_that_left_refuses_no_one_for_priority`. The harness's emulation of priority for
+  raft-rs (`Old::settle`) takes the same rule, so the differential still agrees step for step; its
+  `Reached` totals moved in the two mixes with priorities, `shell` (votes refused 2,217 → 2,215)
+  and `plain` (terms 5,036 → 5,025, committed 76,316 → 75,998), and reverting the two lines of the
+  rule restores them exactly.
+- `Cluster::settles` proposes again a proposal whose leader was deposed before it committed.
+- focal's documentation that the fast track is not safe as built (`fast.rs`, README) came with
+  it; the next change below mends it.
+- Changed from focal's form: the handling of a heartbeat's answer by `HeartbeatAnswers` moved
+  unchanged into `Progress::heard_heartbeat`, since `Raft::handle_heartbeat_response` with it was
+  over the lint wall's cognitive-complexity threshold (11/10); the harness reads a configuration
+  through `Cluster::disk`, since its disks have one owner here.
+
+## The fast track's safety fix
+
+Not a port: this repository's own change, after the ports above. focal found the defect and
+documented the fast track as not safe as built (F42); the design, the literature it cites and the
+evidence are in `docs/raft.md`, "The fast track's election defect, and its fix".
+
+- **First rule** (`Raft::fast_commit`): a member that holds the entry beside its log counts toward a
+  fast quorum only once the leader knows its log holds an entry of the leader's term. Without it, an
+  election committed a second entry at an index that held a committed one (seed 9843 of 40,000 from
+  seed 3,000, reproduced on `e1e292c` before any change; directed test
+  `an_election_never_commits_a_second_entry_at_a_committed_index`).
+- **Second rule** (`Raft::fast_quorum_of_the_term`): a fast quorum counts only where it is one of the
+  voters the leader was elected under and of the one other set of voters a change in its term named;
+  after a change that names a third, none until the next term. Without it, a member counting by the
+  configuration before a change it had not applied was elected and committed a second entry (seeds
+  54104 and 203544, found once the first rule was in; directed test
+  `a_member_that_counts_by_the_configuration_before_commits_no_second_entry`).
+- The fast-track and README notes that it was not safe as built are replaced by the rules.
+- Evidence: 160,000 fast schedules from four base seeds pass; the raft-rs differential, which runs
+  no fast group, is unchanged; allocation counts in `docs/benchmarks.md`.

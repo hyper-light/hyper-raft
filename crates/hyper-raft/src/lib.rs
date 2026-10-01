@@ -47,7 +47,10 @@ pub use configuration::{Change, Changed, Configuration, ConfigurationError};
 pub use error::{Error, Result, StorageError};
 pub use node::{Kept, LightReady, RawNode, Ready, SnapshotStatus, ToPersist};
 pub use quorum::{Quorum, Tally};
-pub use raft::{Config, FastStats, Limits, Outgoing, Precedence, Raft, SoftState, StateRole};
+pub use raft::{
+    Config, FastStats, HeartbeatAnswers, Limits, Outgoing, Precedence, Raft, ReadRounds, SoftState,
+    StateRole,
+};
 pub use read::ReadState;
 pub use storage::{InitialState, Storage};
 

@@ -71,7 +71,7 @@ pub(crate) fn copy_entries(entries: &[Entry], into: &mut Vec<Entry>) -> Result<(
 }
 /// Keeps as many entries as `max_bytes` of their encoding admit, and one at
 /// least: the longest prefix whose running total fits. The reference the
-/// tests hold a page to; the log builds its pages by [`page_of`].
+/// tests hold a page to; the log builds its pages by [`page_and_bytes`].
 #[cfg(test)]
 pub(crate) fn limit_bytes(entries: &mut Vec<Entry>, max_bytes: u64) {
     if entries.len() <= 1 || max_bytes == u64::MAX {
@@ -80,16 +80,18 @@ pub(crate) fn limit_bytes(entries: &mut Vec<Entry>, max_bytes: u64) {
     let kept = page_of(entries, 0, 0, max_bytes);
     entries.truncate(kept);
 }
+/// As [`page_and_bytes`], the count alone.
+#[cfg(test)]
+pub(crate) fn page_of(entries: &[Entry], held: usize, used: u64, max_bytes: u64) -> usize {
+    page_and_bytes(entries, held, used, max_bytes).0
+}
 /// How many of `entries`, in order, a page admits that already holds
 /// `held` entries of `used` bytes: the page's rule carried on across a
 /// boundary, so that a page is chosen before any of it is copied.
 /// Every entry is taken while the running total fits, and the first is
-/// taken whatever its bytes when the page holds nothing yet.
-pub(crate) fn page_of(entries: &[Entry], held: usize, used: u64, max_bytes: u64) -> usize {
-    page_and_bytes(entries, held, used, max_bytes).0
-}
-/// As [`page_of`], with the running total of the page once the entries
-/// taken are in it. With no bound the total is not counted, and is `used`.
+/// taken whatever its bytes when the page holds nothing yet. With it, the
+/// running total of the page once the entries taken are in it; with no
+/// bound the total is not counted, and is `used`.
 pub(crate) fn page_and_bytes(
     entries: &[Entry],
     held: usize,
@@ -101,7 +103,9 @@ pub(crate) fn page_and_bytes(
 }
 /// As [`page_and_bytes`], with what the buffers of the entries taken hold
 /// by capacity ([`payload_of`]) when `payload` asks for it: counted in the
-/// same walk, so that a page's entries are read once.
+/// same walk, so that a page's entries are read once. With no bound and
+/// `payload` asked for, the running total is counted in that walk too, for
+/// the window it is charged to ([`Page::bytes`]).
 fn page_bytes_payload(
     entries: &[Entry],
     held: usize,
@@ -111,12 +115,11 @@ fn page_bytes_payload(
 ) -> (usize, u64, usize) {
     let mut held_payload = 0usize;
     if max_bytes == u64::MAX {
-        if payload {
-            held_payload = entries
-                .iter()
-                .fold(0usize, |sum, entry| sum.saturating_add(payload_of(entry)));
+        if !payload {
+            return (entries.len(), used, held_payload);
         }
-        return (entries.len(), used, held_payload);
+        let (bytes, held_payload) = counted(entries, used);
+        return (entries.len(), bytes, held_payload);
     }
     let mut bytes = used;
     let mut taken = 0usize;
@@ -134,12 +137,30 @@ fn page_bytes_payload(
     (taken, bytes, held_payload)
 }
 
-/// A page of entries copied out of the log, and what their buffers hold by
-/// capacity ([`payload_of`]), counted as the page was chosen.
+/// The running total of `entries`' encodings from `used`, and what their
+/// buffers hold by capacity, in one walk.
+fn counted(entries: &[Entry], used: u64) -> (u64, usize) {
+    entries
+        .iter()
+        .fold((used, 0usize), |(bytes, payload), entry| {
+            (
+                bytes.saturating_add(proto::encoded_bytes(entry)),
+                payload.saturating_add(payload_of(entry)),
+            )
+        })
+}
+
+/// A page of entries copied out of the log, what their buffers hold by
+/// capacity ([`payload_of`]), and the bytes of their encodings by the
+/// page's rule, counted as the page was chosen.
 #[derive(Debug, Default)]
 pub(crate) struct Page {
     pub(crate) entries: Vec<Entry>,
     pub(crate) payload: usize,
+    /// The bytes of the entries' encodings ([`proto::encoded_bytes`]): what
+    /// a member's window is charged for the page. Counted only when the
+    /// page was asked for them ([`Log::page`]); zero otherwise.
+    pub(crate) bytes: u64,
 }
 /// The bytes an entry's buffers hold, by capacity.
 pub(crate) fn payload_of(entry: &Entry) -> usize {
@@ -654,8 +675,8 @@ impl<S: Storage> Log<S> {
         self.page(index, max_bytes, max_entries)
             .map(|page| page.entries)
     }
-    /// As [`Log::entries`], with what the page's buffers hold, counted as
-    /// it was chosen.
+    /// As [`Log::entries`], with what the page's buffers hold and the bytes
+    /// of its encodings, counted as it was chosen.
     pub(crate) fn page(&self, index: u64, max_bytes: u64, max_entries: usize) -> Result<Page> {
         let last = self.last_index()?;
         if index > last {
@@ -664,7 +685,7 @@ impl<S: Storage> Log<S> {
         let high = index
             .saturating_add(u64::try_from(max_entries).unwrap_or(u64::MAX))
             .min(last.saturating_add(1));
-        self.slice_page(index, high, max_bytes)
+        self.slice_page(index, high, max_bytes, true)
     }
     /// Whether a log that ends at `(last_index, term)` is at least as up to
     /// date as this one (Raft §5.4.1): a later last term, or the same and
@@ -846,17 +867,24 @@ impl<S: Storage> Log<S> {
     /// than its part admits, is cut here by the same rule; every entry's
     /// bytes are counted once.
     pub fn slice(&self, low: u64, high: u64, max_bytes: u64) -> Result<Vec<Entry>> {
-        self.slice_page(low, high, max_bytes)
+        self.slice_page(low, high, max_bytes, false)
             .map(|page| page.entries)
     }
     /// As [`Log::slice`], with what the page's buffers hold by capacity,
-    /// counted in the walk that chooses it.
-    fn slice_page(&self, low: u64, high: u64, max_bytes: u64) -> Result<Page> {
+    /// counted in the walk that chooses it; and, when `charged`, the bytes
+    /// of its encodings ([`Page::bytes`]), which the rule counts anyway
+    /// wherever it cuts and which are counted in that same walk where it
+    /// does not.
+    fn slice_page(&self, low: u64, high: u64, max_bytes: u64, charged: bool) -> Result<Page> {
         self.bounded(low, high)?;
         let mut entries = Vec::new();
         let mut payload = 0usize;
         if low == high {
-            return Ok(Page { entries, payload });
+            return Ok(Page {
+                entries,
+                payload,
+                bytes: 0,
+            });
         }
         // The bytes of the page so far, by the rule the cut counts.
         let mut used = 0u64;
@@ -866,11 +894,23 @@ impl<S: Storage> Log<S> {
                 .entries(low, stored_high, max_bytes, &mut entries)?;
             let wanted = stored_high.saturating_sub(low);
             if u64::try_from(entries.len()).unwrap_or(u64::MAX) < wanted {
-                // Storage cut the page: it is complete.
-                payload = entries
-                    .iter()
-                    .fold(0usize, |sum, entry| sum.saturating_add(payload_of(entry)));
-                return Ok(Page { entries, payload });
+                // Storage cut the page: it is complete. Storage counted its
+                // bytes by its own walk, so they are counted here, in the
+                // walk that counts its buffers, when they are charged.
+                let bytes;
+                (bytes, payload) = if charged {
+                    counted(&entries, 0)
+                } else {
+                    let held = entries
+                        .iter()
+                        .fold(0usize, |sum, entry| sum.saturating_add(payload_of(entry)));
+                    (0, held)
+                };
+                return Ok(Page {
+                    entries,
+                    payload,
+                    bytes,
+                });
             }
             // Storage gave all it was asked for. It is held to the rule
             // here, once: a storage that gave more than its part admits is
@@ -880,25 +920,40 @@ impl<S: Storage> Log<S> {
             payload = held;
             if kept < entries.len() {
                 entries.truncate(kept);
-                return Ok(Page { entries, payload });
+                return Ok(Page {
+                    entries,
+                    payload,
+                    bytes,
+                });
             }
             used = bytes;
         }
         if high > self.unstable.offset {
             let from = low.max(self.unstable.offset);
             let tail = self.unstable.slice(from, high)?;
-            let taken = page_of(tail, entries.len(), used, max_bytes);
+            let (taken, bytes) = page_and_bytes(tail, entries.len(), used, max_bytes);
+            used = bytes;
+            // With no bound the rule counted nothing; the bytes charged are
+            // counted in the walk that copies.
+            let count = charged && max_bytes == u64::MAX;
             entries
                 .try_reserve_exact(taken)
                 .map_err(|_| Error::Memory)?;
             for entry in tail.get(..taken).unwrap_or(&[]) {
                 let copy = copy_entry(entry)?;
                 payload = payload.saturating_add(payload_of(&copy));
+                if count {
+                    used = used.saturating_add(proto::encoded_bytes(&copy));
+                }
                 entries.push(copy);
             }
         }
         // Built by the rule from end to end: nothing is left to cut.
-        Ok(Page { entries, payload })
+        Ok(Page {
+            entries,
+            payload,
+            bytes: if charged { used } else { 0 },
+        })
     }
     /// The log begins again after `snapshot`.
     pub fn restore(&mut self, snapshot: Snapshot) -> Result<()> {
@@ -1498,6 +1553,12 @@ pub(crate) mod tests {
                 for entry in &page {
                     assert_eq!(entry.data.capacity(), entry.data.len());
                 }
+                // A leader's page is the same, with its buffers and the
+                // bytes of its encodings counted as it was chosen.
+                let counted = log.page(low, max, usize::MAX).unwrap();
+                assert_eq!(indexes(&counted.entries), indexes(&page), "{low} {max}");
+                assert_eq!(counted.bytes, encoded(&page), "{low} {max}");
+                assert_eq!(counted.payload, held(&page), "{low} {max}");
             }
         }
         // An oversized first entry is taken alone, stable or not.
@@ -1594,7 +1655,25 @@ pub(crate) mod tests {
                 expected,
                 "{low} {max}"
             );
+            let counted = log.page(low, max, usize::MAX).unwrap();
+            assert_eq!(indexes(&counted.entries), expected, "{low} {max}");
+            assert_eq!(counted.bytes, encoded(&counted.entries), "{low} {max}");
+            assert_eq!(counted.payload, held(&counted.entries), "{low} {max}");
         }
+        // A storage that cuts the page itself: the page's bytes are counted
+        // here all the same.
+        let mut store = Memory::default();
+        store.append(&(1..=6).map(payload).collect::<Vec<_>>());
+        let log = Log::new(store, 1024).unwrap();
+        let counted = log.page(1, 2 * one, usize::MAX).unwrap();
+        assert_eq!(indexes(&counted.entries), vec![(1, 1), (2, 1)]);
+        assert_eq!(counted.bytes, 2 * one);
+    }
+    fn encoded(entries: &[Entry]) -> u64 {
+        entries.iter().map(proto::encoded_bytes).sum()
+    }
+    fn held(entries: &[Entry]) -> usize {
+        entries.iter().map(payload_of).sum()
     }
     #[test]
     fn a_rejection_names_where_the_logs_may_still_agree() {

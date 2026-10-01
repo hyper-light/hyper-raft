@@ -426,12 +426,21 @@ pub struct Settings {
     pub heartbeat_tick: usize,
     pub max_size_per_msg: u64,
     pub max_inflight_msgs: usize,
+    /// The bytes of entries a member is sent ahead of its answers;
+    /// `raft-rs` has no such bound.
+    pub max_inflight_bytes: u64,
     pub max_uncommitted_size: u64,
     pub max_committed_size_per_ready: u64,
     pub check_quorum: bool,
     pub pre_vote: bool,
     /// Whether priority yields to a longer log alone, as in `raft-rs`.
     pub by_length: bool,
+    /// Whether a leader sends a round of heartbeats for each read as it is
+    /// asked, as in `raft-rs`.
+    pub round_each: bool,
+    /// Whether a heartbeat's answer says nothing of the member's log and
+    /// frees a full window's first message, as in `raft-rs`.
+    pub bare_answers: bool,
     /// Whether the group has the fast track.
     pub fast: bool,
     /// Whether this core's members are driven by `RawNode::ready_in_place`,
@@ -447,11 +456,14 @@ impl Settings {
             heartbeat_tick: 2,
             max_size_per_msg: 4 * 1024 * 1024 + 1024,
             max_inflight_msgs: 128,
+            max_inflight_bytes: u64::MAX,
             max_uncommitted_size: 32 * 1024 * 1024,
             max_committed_size_per_ready: 16 * 1024 * 1024,
             check_quorum: true,
             pre_vote: true,
             by_length: true,
+            round_each: true,
+            bare_answers: true,
             fast: false,
             in_place: false,
         }
@@ -460,6 +472,11 @@ impl Settings {
     pub fn focal() -> Self {
         Self {
             by_length: false,
+            round_each: false,
+            bare_answers: false,
+            // A few of a schedule's entries: the window fills by its
+            // bytes long before it fills by its places.
+            max_inflight_bytes: 256,
             ..Self::shell()
         }
     }
@@ -492,6 +509,9 @@ pub trait Replica: Sized {
     fn unreachable(&mut self, member: u64);
     fn snapshot_status(&mut self, member: u64, arrived: bool);
     fn set_priority(&mut self, priority: i64);
+    /// What the path to `member` carries before it answers. `raft-rs` has
+    /// no such bound and does nothing.
+    fn set_window(&mut self, _member: u64, _bytes: u64) {}
     fn set_timeout(&mut self, ticks: usize);
     fn drain(&mut self) -> Output;
     fn view(&self) -> View;
@@ -552,7 +572,9 @@ pub struct Old {
 }
 impl Old {
     fn settle(&mut self) {
-        let effective = if self.raw.raft.term == 0 {
+        // As this core settles it: no term, or no voter, and the priority
+        // judges nothing.
+        let effective = if self.raw.raft.term == 0 || !self.raw.raft.promotable() {
             0
         } else {
             self.priority
@@ -881,6 +903,7 @@ impl Replica for New {
             applied,
             max_size_per_msg: settings.max_size_per_msg,
             max_inflight_msgs: settings.max_inflight_msgs,
+            max_inflight_bytes: settings.max_inflight_bytes,
             max_uncommitted_size: settings.max_uncommitted_size,
             max_committed_size_per_ready: settings.max_committed_size_per_ready,
             check_quorum: settings.check_quorum,
@@ -889,6 +912,16 @@ impl Replica for New {
                 hyper_raft::Precedence::Length
             } else {
                 hyper_raft::Precedence::Log
+            },
+            read_rounds: if settings.round_each {
+                hyper_raft::ReadRounds::Each
+            } else {
+                hyper_raft::ReadRounds::Shared
+            },
+            heartbeat_answers: if settings.bare_answers {
+                hyper_raft::HeartbeatAnswers::Bare
+            } else {
+                hyper_raft::HeartbeatAnswers::Position
             },
             fast: settings.fast,
             seed,
@@ -950,6 +983,9 @@ impl Replica for New {
     }
     fn set_priority(&mut self, priority: i64) {
         self.raw.set_priority(priority);
+    }
+    fn set_window(&mut self, member: u64, bytes: u64) {
+        self.raw.set_inflight_bytes(member, bytes);
     }
     fn set_timeout(&mut self, ticks: usize) {
         self.raw
@@ -1177,6 +1213,9 @@ impl Replica for Either {
     }
     fn set_priority(&mut self, priority: i64) {
         either!(self, node => node.set_priority(priority))
+    }
+    fn set_window(&mut self, member: u64, bytes: u64) {
+        either!(self, node => node.set_window(member, bytes))
     }
     fn set_timeout(&mut self, ticks: usize) {
         either!(self, node => node.set_timeout(ticks))

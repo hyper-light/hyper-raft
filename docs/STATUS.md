@@ -27,5 +27,5 @@ The law's four columns:
 | Consumer | Takes | State |
 |---|---|---|
 | mantle | hyper-raft as `vendor/hyper-raft` (Cargo rename `focal-raft`), snapshot `cec55a6` | on mantle `dev` (`590f475`). The next snapshot takes the in-place `Ready` and the core ports |
-| focal | hyper-raft (R-1, F-1) | blocked: changes in `~/Projects/focal` need the owner's permission rule. focal's F43 (one ReadIndex heartbeat round per ready) is pending in focal-raft; it is ported here once focal gates it, so the cores do not diverge |
+| focal | hyper-raft (R-1, F-1) | blocked: changes in `~/Projects/focal` need the owner's permission rule. focal's core changes since R-1 are ported here (`crates/hyper-raft/ORIGIN.md`, "Ports from focal"): F43 (one ReadIndex heartbeat round per `Ready`), F41 (an inflight window bounded in bytes), F42 (heartbeat answers that say where the member is; no priority for a member that left); and the fast track's election defect is fixed here (`docs/raft.md`) |
 | slates | hyper-quic, hyper-datagram, hyper-swim, hyper-timing | slates' session owns the integration (slates A-52 §5) |

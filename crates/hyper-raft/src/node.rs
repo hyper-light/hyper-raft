@@ -305,6 +305,11 @@ impl<S: Storage> RawNode<S> {
     pub fn set_priority(&mut self, priority: i64) {
         self.raft.set_priority(priority);
     }
+    /// What the path to `member` carries before it answers
+    /// ([`Raft::set_inflight_bytes`]).
+    pub fn set_inflight_bytes(&mut self, member: u64, bytes: u64) -> bool {
+        self.raft.set_inflight_bytes(member, bytes)
+    }
     /// One tick of time has passed. True when the member acted on it: it
     /// campaigned, checked its quorum or sent heartbeats.
     pub fn tick(&mut self) -> Result<bool> {
@@ -511,6 +516,7 @@ impl<S: Storage> RawNode<S> {
     pub fn has_ready(&self) -> bool {
         let raft = &self.raft;
         !raft.msgs.is_empty()
+            || raft.reads_unasked()
             || raft.soft_state() != self.previous_soft
             || raft.hard_state() != self.previous_hard
             || !raft.read_states.is_empty()
@@ -567,6 +573,10 @@ impl<S: Storage> RawNode<S> {
             .number
             .checked_add(1)
             .ok_or(Error::Capacity("readies"))?;
+        // One round for the reads asked since the last (`Raft::ask_reads`): it
+        // leaves with this `Ready`. A round refused is asked for again by
+        // the next `Ready`, and by the heartbeat the leader's clock sends.
+        self.raft.ask_reads()?;
         let mut ready = Ready {
             number,
             ..Ready::default()

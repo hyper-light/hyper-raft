@@ -11,7 +11,10 @@ records the source revision and every change since.
 
 It is Raft as Ongaro's thesis states it, with pre-vote, check-quorum, election priority,
 learners, joint consensus, leader transfer, an inflight window with conflict hints,
-ReadIndex and snapshots. It keeps the log and speaks the messages of `raft-rs` 0.7
+ReadIndex and snapshots. Reads asked before the member is next asked what there is to do
+share one round of heartbeats (`ReadRounds`). What a member is sent ahead of its
+answers is bounded in messages and in bytes, the bytes by what its owner says the path to
+it carries (`RawNode::set_inflight_bytes`). It keeps the log and speaks the messages of `raft-rs` 0.7
 (`raft-proto`), which focal's groups ran on before. What it decides differently, and
 why, is in the module header of `src/raft.rs` and in focal's
 `docs/archictecutre/27-consensus-roadmap-and-slates-port.md` §4.5 (focal `a8e95f7`).
@@ -19,7 +22,10 @@ why, is in the module header of `src/raft.rs` and in focal's
 A group may have the fast track (`Config::fast`, `fast.rs`, `track.rs`; focal 27 §4.6): a
 member that does not lead proposes to every voter at once (`RawNode::propose_fast`),
 and its entry is committed when three quarters of the voters hold it, or a majority
-holds it from the leader, whichever is first.
+holds it from the leader, whichever is first. A voter that holds the entry beside its log
+counts for the three quarters only once its log holds an entry of the leader's term: without
+that rule an election could commit a second entry at an index that held a committed one
+(`docs/raft.md`, "The fast track's election defect"). No owner enables the fast track yet.
 
 An owner that writes its log out and keeps its own copy of what it wrote drives the member with
 `RawNode::ready_in_place`: it writes from `RawNode::to_persist`, applies the range

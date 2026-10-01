@@ -227,6 +227,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "hyper-measure"
+version = "0.1.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "hyper-raft"
 version = "0.1.0"
 dependencies = [
@@ -234,6 +241,14 @@ dependencies = [
  "raft-proto",
  "slog",
  "thiserror 2.0.20",
+]
+
+[[package]]
+name = "hyper-raft-e2e"
+version = "0.1.0"
+dependencies = [
+ "hyper-raft",
+ "raft-proto",
 ]
 
 [[package]]

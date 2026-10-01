@@ -51,8 +51,11 @@ use std::time::Duration;
 pub const ELECTION_MARGIN: u64 = 10;
 /// The estimator's timer granularity (RFC 9002 §6.1.2, `kGranularity`).
 pub const GRANULARITY_NS: u64 = 1_000_000;
+/// RFC 9002 §5.3: `smoothed_rtt = 7/8 · smoothed_rtt + 1/8 · sample`, the 1/8 as a shift of 3.
 const SMOOTHED_SHIFT: u32 = 3;
+/// RFC 9002 §5.3: `rttvar = 3/4 · rttvar + 1/4 · |smoothed_rtt − sample|`, the 1/4 as a shift of 2.
 const VARIATION_SHIFT: u32 = 2;
+/// RFC 9002 §6.2.1: the probe timeout's variation term, `4 · rttvar`.
 const TAIL_VARIATION_MULTIPLIER: u64 = 4;
 
 /// How many of a path's latest round trips its estimate is taken over.

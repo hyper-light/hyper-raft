@@ -4,8 +4,10 @@ resolver = "3"
 # members only once it meets every rule below (CLAUDE.md).
 members = ["crates/*"]
 # Vendored upstream sources are staged here, outside the build and the lint wall, until they are
-# conformed into a member crate (vendor/*/VENDORED.md).
-exclude = ["vendor"]
+# conformed into a member crate (vendor/*/VENDORED.md). The comparison bench is a workspace of its
+# own: it builds slates', focal's and raft-rs's cores from their repositories at pinned revisions,
+# which the gates of this workspace do not fetch (docs/benchmarks.md).
+exclude = ["vendor", "crates/hyper-raft-compare"]
 
 [workspace.package]
 version = "0.1.0"

@@ -431,8 +431,9 @@ fn what_may_not_go_by_the_fast_track_is_refused() {
     assert!(plain.peek(2).unwrap().held().is_empty() && plain.net.is_empty());
 }
 
-#[test]
-fn a_group_with_the_fast_track_is_safe_and_settles() {
+/// Groups with the fast track under schedules: the terms they led, the
+/// entries they committed, and what the fast track did.
+fn fast_schedules(settings: Settings) -> (usize, usize, hyper_raft::FastStats) {
     let seeds = count("HYPER_RAFT_SEEDS", 96);
     let steps = count("HYPER_RAFT_STEPS", 4_000);
     let first = count("HYPER_RAFT_SEED", 0);
@@ -444,7 +445,7 @@ fn a_group_with_the_fast_track_is_safe_and_settles() {
     let (mut terms, mut committed) = (0, 0);
     let mut did = hyper_raft::FastStats::default();
     for seed in first..first + seeds {
-        let mut group: Cluster<New> = Cluster::new(5, &[1, 2, 3, 4, 5], Settings::fast(), seed);
+        let mut group: Cluster<New> = Cluster::new(5, &[1, 2, 3, 4, 5], settings, seed);
         let mut rng = Seeded(seed);
         for _ in 0..steps {
             let op = group.choose(&mut rng, &mix);
@@ -463,6 +464,13 @@ fn a_group_with_the_fast_track_is_safe_and_settles() {
         terms += group.leaders.len();
         committed += group.chosen.len();
     }
+    (terms, committed, did)
+}
+
+#[test]
+fn a_group_with_the_fast_track_is_safe_and_settles() {
+    let seeds = count("HYPER_RAFT_SEEDS", 96);
+    let (terms, committed, did) = fast_schedules(Settings::fast());
     println!("{seeds} schedules led {terms} terms and committed {committed} entries: {did:?}");
     assert!(terms as u64 > seeds && committed as u64 > seeds * 8);
     // A schedule that never takes the fast track says nothing of it.
@@ -472,4 +480,17 @@ fn a_group_with_the_fast_track_is_safe_and_settles() {
         "{did:?}"
     );
     assert!(did.displaced > seeds, "{did:?}");
+}
+
+/// The same schedules with every member given its `Ready`s in place
+/// (`RawNode::ready_in_place`): the group decides exactly what it decided
+/// with copies.
+#[test]
+fn a_group_given_its_readies_in_place_decides_the_same() {
+    let copied = fast_schedules(Settings::fast());
+    let in_place = fast_schedules(Settings {
+        in_place: true,
+        ..Settings::fast()
+    });
+    assert_eq!(copied, in_place);
 }

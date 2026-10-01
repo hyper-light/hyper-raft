@@ -19,6 +19,18 @@ clock, no disk and no network:
 - one `Ready` at a time says what to persist, send and apply;
 - `advance_append` and `advance_apply_to` report back.
 
+A `Ready` comes in two forms that decide alike (`tests/differential.rs`, "in place"):
+- `RawNode::ready` copies what it gives, as raft-rs's `Ready` does: the entries to persist and the
+  entries to apply are the owner's to take.
+- `RawNode::ready_in_place` copies nothing the owner can read where it is. The owner writes the
+  snapshot and entries out from `RawNode::to_persist`, applies the range
+  `Ready::committed_range` names from its own storage, and keeps the very entries and snapshot
+  the member gives up at `RawNode::advance_append_keeping`. A disk-backed owner copies no entry
+  at all. `docs/benchmarks.md` measures both forms.
+
+A leader's proposals and a follower's appends move into the log uncopied (`Log::append_owned`,
+`Log::append_after_owned`).
+
 It is Raft as Ongaro's thesis states it, with these extensions:
 - pre-vote and check-quorum;
 - election priority with `Precedence::Log`;
@@ -105,8 +117,10 @@ no release to keep (owner's decision 9).
 
 ## 5. Shared test infrastructure the core will use
 
-The allocation-count bench (focal-memory's counting global allocator) comes back with `hyper-sim` (note
-32 §3.10), rewritten without its lock and with its `unsafe` listed in the contract script. The same
+The allocation-count bench (focal-memory's counting global allocator) came back as `hyper-measure`,
+rewritten without its lock and with its `unsafe` listed in the contract script; with it,
+`hyper-raft-compare` measures this crate against each core it replaces, and `hyper-raft-e2e` runs it
+as real processes (`docs/benchmarks.md`). The same
 applies to the timed simulation, the safety explorer and the exhaustive models from slates, and to
 mantle's linearizability checker. Each joins under the production lints, as focal requires of
 `focal-sim`.

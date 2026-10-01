@@ -138,10 +138,13 @@ pub enum SwimWireError {
     },
 }
 
-/// Format: the message tag occupies one leading byte; these are its values.
+/// Format: the message tag occupies one leading byte; a ping's.
 const TAG_PING: u8 = 1;
+/// Format: an acknowledgement's tag.
 const TAG_ACK: u8 = 2;
+/// Format: an indirect-probe request's tag.
 const TAG_PING_REQ: u8 = 3;
+/// Format: an indirect acknowledgement's tag.
 const TAG_INDIRECT_ACK: u8 = 4;
 
 /// Format: an acknowledgement's standing is one presence byte, then the eight-byte version when present.
@@ -149,9 +152,11 @@ const STANDING_ABSENT: u8 = 0;
 /// Format: the presence byte of a standing that follows.
 const STANDING_PRESENT: u8 = 1;
 
-/// Format: a liveness is one byte in a gossip entry; these are its values (the detector's three states).
+/// Format: a liveness is one byte in a gossip entry; alive's.
 const LIVENESS_ALIVE: u8 = 0;
+/// Format: suspect's liveness byte.
 const LIVENESS_SUSPECT: u8 = 1;
+/// Format: dead's liveness byte.
 const LIVENESS_DEAD: u8 = 2;
 
 /// Format: one gossip entry is a host id (u64), a liveness byte, and an incarnation (u64), little-endian.

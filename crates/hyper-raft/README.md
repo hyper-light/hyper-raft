@@ -21,6 +21,12 @@ member that does not lead proposes to every voter at once (`RawNode::propose_fas
 and its entry is committed when three quarters of the voters hold it, or a majority
 holds it from the leader, whichever is first.
 
+An owner that writes its log out and keeps its own copy of what it wrote drives the member with
+`RawNode::ready_in_place`: it writes from `RawNode::to_persist`, applies the range
+`Ready::committed_range` names from its own storage, and keeps the entries the member gives up at
+`RawNode::advance_append_keeping`. Nothing is copied, and the member decides exactly as it does
+under `RawNode::ready`.
+
 ## Rules
 
 - Nothing unwinds. `Error` says whether an operation was refused and changed nothing,
@@ -34,7 +40,7 @@ holds it from the leader, whichever is first.
 | Where | What |
 |---|---|
 | `src/**` | the log, quorums, configurations, progress, reads; what the core refuses and the bounds it keeps |
-| `tests/differential.rs` | this core and `raft-rs` on one schedule, compared after every step |
+| `tests/differential.rs` | this core and `raft-rs` on one schedule, compared after every step, with `Ready`s copied and given in place |
 | `tests/group.rs` | groups of this core, and of both cores together, under schedules: safe whatever the schedule, and settled once the network is whole; the decisions of focal 27 §4.5 |
 | `tests/fast.rs` | the fast track: committed by the fast quorum, taken again by the leader that follows, and groups that propose by it under schedules |
 | `benches/replicate.rs` | what replication costs with either core |

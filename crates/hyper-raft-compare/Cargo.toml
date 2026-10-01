@@ -1,0 +1,31 @@
+[package]
+name = "hyper-raft-compare"
+description = "hyper-raft measured against each core it replaces, on one workload: focal's (at the revision it came from and at the one mantle pins), slates' and raft-rs."
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+license = "MIT"
+publish = false
+
+# A workspace of its own: its dependencies are other projects' repositories at pinned revisions,
+# fetched only when the comparison runs (docs/benchmarks.md).
+[workspace]
+
+[dependencies]
+hyper-raft = { path = "../hyper-raft" }
+hyper-measure = { path = "../hyper-measure" }
+# (b) the control: focal-raft at the revision hyper-raft came from, byte-identical source.
+focal-raft-control = { package = "focal-raft", git = "https://github.com/hyper-light/focal", rev = "a8e95f71496461ebc8984926a65666746e946473" }
+# (c) the focal-raft mantle pins (mantle crates/range/Cargo.toml).
+focal-raft-mantle = { package = "focal-raft", git = "https://github.com/hyper-light/focal", rev = "1395e223c065e85158ec1611fdc72073d28fd8a0" }
+# (d) slates' own core, at slates main.
+slates-cluster = { git = "https://github.com/hyper-light/slates", rev = "5cce86aa4cae58b421d171756b24e4305797a3e8" }
+slates-db = { git = "https://github.com/hyper-light/slates", rev = "5cce86aa4cae58b421d171756b24e4305797a3e8" }
+# (e) raft-rs at the revision focal and mantle run, the reference all of them derive from.
+raft = { version = "0.7.0", git = "https://github.com/tikv/raft-rs", rev = "8e4cef172421bf77b2ae1c26628a9531b0be41f0", default-features = false, features = ["prost-codec"] }
+raft-proto = { version = "0.7.0", git = "https://github.com/tikv/raft-rs", rev = "8e4cef172421bf77b2ae1c26628a9531b0be41f0", default-features = false, features = ["prost-codec"] }
+slog = "2.7"
+
+[profile.release]
+lto = true
+debug = "line-tables-only"

@@ -42,8 +42,8 @@ fn scheduled<R: Replica>(group: &mut Cluster<R>, seed: u64, steps: u64, mix: &Mi
     }
 }
 
-#[test]
-fn a_group_of_this_core_is_safe_and_settles() {
+/// Groups of this core under schedules; the terms they led.
+fn schedules_of_this_core(settings: Settings) -> usize {
     let seeds = count("HYPER_RAFT_SEEDS", 96);
     let steps = count("HYPER_RAFT_STEPS", 4_000);
     let first = count("HYPER_RAFT_SEED", 0);
@@ -53,7 +53,7 @@ fn a_group_of_this_core_is_safe_and_settles() {
     };
     let mut terms = 0;
     for seed in first..first + seeds {
-        let mut group: Cluster<New> = Cluster::new(5, &[1, 2, 3], Settings::focal(), seed);
+        let mut group: Cluster<New> = Cluster::new(5, &[1, 2, 3], settings, seed);
         group.stop_who_left = true;
         scheduled(&mut group, seed, steps, &mix);
         assert!(group.settles(400), "seed {seed}: the group did not settle");
@@ -63,8 +63,29 @@ fn a_group_of_this_core_is_safe_and_settles() {
         );
         terms += group.leaders.len();
     }
+    terms
+}
+
+#[test]
+fn a_group_of_this_core_is_safe_and_settles() {
+    let seeds = count("HYPER_RAFT_SEEDS", 96);
+    let terms = schedules_of_this_core(Settings::focal());
     println!("{seeds} schedules led {terms} terms");
     assert!(terms as u64 > seeds);
+}
+
+/// The same schedules with every member given its `Ready`s in place: the
+/// group leads the same terms, and is safe and settles alike.
+#[test]
+fn a_group_given_its_readies_in_place_leads_the_same_terms() {
+    let in_place = Settings {
+        in_place: true,
+        ..Settings::focal()
+    };
+    assert_eq!(
+        schedules_of_this_core(Settings::focal()),
+        schedules_of_this_core(in_place)
+    );
 }
 
 #[test]

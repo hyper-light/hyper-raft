@@ -48,7 +48,7 @@ pub struct TransportConfig {
     #[cfg(test)]
     pub(crate) deterministic_packet_numbers: bool,
 
-    pub(crate) congestion_controller_factory: Arc<dyn congestion::ControllerFactory + Send + Sync>,
+    pub(crate) congestion: congestion::Congestion,
 
     pub(crate) enable_segmentation_offload: bool,
 
@@ -315,22 +315,16 @@ impl TransportConfig {
         self
     }
 
-    /// How to construct new `congestion::Controller`s
-    ///
-    /// Typically the refcounted configuration of a `congestion::Controller`,
-    /// e.g. a `congestion::NewRenoConfig`.
+    /// The congestion controller each path builds its own instance of
     ///
     /// # Example
     /// ```
-    /// # use hyper_quic::*; use std::sync::Arc;
+    /// # use hyper_quic::*;
     /// let mut config = TransportConfig::default();
-    /// config.congestion_controller_factory(Arc::new(congestion::NewRenoConfig::default()));
+    /// config.congestion(congestion::Congestion::NewReno(congestion::NewRenoConfig::default()));
     /// ```
-    pub fn congestion_controller_factory(
-        &mut self,
-        factory: Arc<dyn congestion::ControllerFactory + Send + Sync + 'static>,
-    ) -> &mut Self {
-        self.congestion_controller_factory = factory;
+    pub fn congestion(&mut self, congestion: congestion::Congestion) -> &mut Self {
+        self.congestion = congestion;
         self
     }
 
@@ -392,7 +386,7 @@ impl Default for TransportConfig {
             #[cfg(test)]
             deterministic_packet_numbers: false,
 
-            congestion_controller_factory: Arc::new(congestion::CubicConfig::default()),
+            congestion: congestion::Congestion::default(),
 
             enable_segmentation_offload: true,
 
@@ -427,7 +421,7 @@ impl fmt::Debug for TransportConfig {
             datagram_send_buffer_size,
             #[cfg(test)]
                 deterministic_packet_numbers: _,
-            congestion_controller_factory: _,
+            congestion,
             enable_segmentation_offload,
             qlog_sink,
         } = self;
@@ -457,7 +451,7 @@ impl fmt::Debug for TransportConfig {
             .field("allow_spin", allow_spin)
             .field("datagram_receive_buffer_size", datagram_receive_buffer_size)
             .field("datagram_send_buffer_size", datagram_send_buffer_size)
-            // congestion_controller_factory not debug
+            .field("congestion", congestion)
             .field("enable_segmentation_offload", enable_segmentation_offload);
         s.field("qlog_stream", &qlog_sink.is_enabled());
 

@@ -3,7 +3,6 @@
 use crate::Instant;
 use crate::connection::RttEstimator;
 use std::any::Any;
-use std::sync::Arc;
 
 mod bbr;
 mod cubic;
@@ -96,10 +95,35 @@ pub struct ControllerMetrics {
     pub pacing_rate: Option<u64>,
 }
 
-/// Constructs controllers on demand
-pub trait ControllerFactory {
-    /// Construct a fresh `Controller`
-    fn build(self: Arc<Self>, now: Instant, current_mtu: u16) -> Box<dyn Controller>;
+/// The congestion controller a connection's paths run, with its configuration, carried by value
+///
+/// A closed set: each controller here is reviewed and measured, and a path builds its own from
+/// this value, so no factory is shared between connections (docs/transport.md §3.1).
+#[derive(Debug, Clone)]
+pub enum Congestion {
+    /// CUBIC (RFC 9438), quinn's default
+    Cubic(CubicConfig),
+    /// NewReno (RFC 9002 §7)
+    NewReno(NewRenoConfig),
+    /// BBR (version 1)
+    Bbr(BbrConfig),
+}
+
+impl Default for Congestion {
+    fn default() -> Self {
+        Self::Cubic(CubicConfig::default())
+    }
+}
+
+impl Congestion {
+    /// A fresh controller for one path
+    pub(crate) fn build(&self, now: Instant, current_mtu: u16) -> Box<dyn Controller> {
+        match self {
+            Self::Cubic(config) => Box::new(Cubic::new(config.clone(), now, current_mtu)),
+            Self::NewReno(config) => Box::new(NewReno::new(config.clone(), now, current_mtu)),
+            Self::Bbr(config) => Box::new(Bbr::new(config.clone(), current_mtu)),
+        }
+    }
 }
 
 const BASE_DATAGRAM_SIZE: u64 = 1200;

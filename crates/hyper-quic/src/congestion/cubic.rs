@@ -1,8 +1,7 @@
 use std::any::Any;
 use std::cmp;
-use std::sync::Arc;
 
-use super::{BASE_DATAGRAM_SIZE, Controller, ControllerFactory};
+use super::{BASE_DATAGRAM_SIZE, Controller};
 use crate::connection::RttEstimator;
 use crate::{Duration, Instant};
 
@@ -59,7 +58,7 @@ impl State {
 /// The RFC8312 congestion controller, as widely used for TCP
 #[derive(Debug, Clone)]
 pub struct Cubic {
-    config: Arc<CubicConfig>,
+    config: CubicConfig,
     /// Maximum number of bytes in flight that may be sent.
     window: u64,
     /// Slow start threshold in bytes. When the congestion window is below ssthresh, the mode is
@@ -74,7 +73,7 @@ pub struct Cubic {
 
 impl Cubic {
     /// Construct a state using the given `config` and current time `now`
-    pub fn new(config: Arc<CubicConfig>, _now: Instant, current_mtu: u16) -> Self {
+    pub fn new(config: CubicConfig, _now: Instant, current_mtu: u16) -> Self {
         Self {
             window: config.initial_window,
             ssthresh: u64::MAX,
@@ -268,12 +267,6 @@ impl Default for CubicConfig {
     }
 }
 
-impl ControllerFactory for CubicConfig {
-    fn build(self: Arc<Self>, now: Instant, current_mtu: u16) -> Box<dyn Controller> {
-        Box::new(Cubic::new(self, now, current_mtu))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -281,7 +274,7 @@ mod tests {
     #[test]
     fn fast_convergence_reduces_w_max_without_double_reducing_window() {
         let now = Instant::now();
-        let config = Arc::new(CubicConfig::default());
+        let config = CubicConfig::default();
         let mut cubic = Cubic::new(config, now, BASE_DATAGRAM_SIZE as u16);
         let window = 8 * BASE_DATAGRAM_SIZE;
 
@@ -303,7 +296,7 @@ mod tests {
     fn congestion_avoidance_does_not_overflow_after_long_lossless_period() {
         let now = Instant::now();
         let rtt = RttEstimator::new(Duration::from_millis(100));
-        let config = Arc::new(CubicConfig::default());
+        let config = CubicConfig::default();
         let mut cubic = Cubic::new(config, now, BASE_DATAGRAM_SIZE as u16);
 
         // Put CUBIC directly into congestion avoidance.

@@ -1,6 +1,5 @@
 use std::any::Any;
 use std::fmt::Debug;
-use std::sync::Arc;
 
 use rand::{RngExt, SeedableRng};
 use rand_pcg::Pcg32;
@@ -11,7 +10,7 @@ use crate::congestion::bbr::min_max::MinMax;
 use crate::connection::RttEstimator;
 use crate::{Duration, Instant};
 
-use super::{BASE_DATAGRAM_SIZE, Controller, ControllerFactory};
+use super::{BASE_DATAGRAM_SIZE, Controller};
 
 mod bw_estimation;
 mod min_max;
@@ -24,7 +23,7 @@ mod min_max;
 /// More discussion and links at <https://groups.google.com/g/bbr-dev>.
 #[derive(Debug, Clone)]
 pub struct Bbr {
-    config: Arc<BbrConfig>,
+    config: BbrConfig,
     current_mtu: u64,
     max_bandwidth: BandwidthEstimation,
     acked_bytes: u64,
@@ -62,7 +61,7 @@ pub struct Bbr {
 
 impl Bbr {
     /// Construct a state using the given `config` and current time `now`
-    pub fn new(config: Arc<BbrConfig>, current_mtu: u16) -> Self {
+    pub fn new(config: BbrConfig, current_mtu: u16) -> Self {
         let initial_window = config.initial_window;
         Self {
             config,
@@ -533,12 +532,6 @@ impl Default for BbrConfig {
         Self {
             initial_window: K_MAX_INITIAL_CONGESTION_WINDOW * BASE_DATAGRAM_SIZE,
         }
-    }
-}
-
-impl ControllerFactory for BbrConfig {
-    fn build(self: Arc<Self>, _now: Instant, current_mtu: u16) -> Box<dyn Controller> {
-        Box::new(Bbr::new(self, current_mtu))
     }
 }
 

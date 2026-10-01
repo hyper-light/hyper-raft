@@ -1,14 +1,13 @@
 use std::any::Any;
-use std::sync::Arc;
 
-use super::{BASE_DATAGRAM_SIZE, Controller, ControllerFactory};
+use super::{BASE_DATAGRAM_SIZE, Controller};
 use crate::Instant;
 use crate::connection::RttEstimator;
 
 /// A simple, standard congestion controller
 #[derive(Debug, Clone)]
 pub struct NewReno {
-    config: Arc<NewRenoConfig>,
+    config: NewRenoConfig,
     current_mtu: u64,
     /// Maximum number of bytes in flight that may be sent.
     window: u64,
@@ -24,7 +23,7 @@ pub struct NewReno {
 
 impl NewReno {
     /// Construct a state using the given `config` and current time `now`
-    pub fn new(config: Arc<NewRenoConfig>, now: Instant, current_mtu: u16) -> Self {
+    pub fn new(config: NewRenoConfig, now: Instant, current_mtu: u16) -> Self {
         Self {
             window: config.initial_window,
             ssthresh: u64::MAX,
@@ -165,8 +164,3 @@ impl Default for NewRenoConfig {
     }
 }
 
-impl ControllerFactory for NewRenoConfig {
-    fn build(self: Arc<Self>, now: Instant, current_mtu: u16) -> Box<dyn Controller> {
-        Box::new(NewReno::new(self, now, current_mtu))
-    }
-}

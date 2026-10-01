@@ -43,6 +43,7 @@ impl Scratch {
         }
     }
 
+    /// Where the file is.
     pub fn path(&self) -> &Path {
         &self.path
     }
@@ -51,6 +52,10 @@ impl Scratch {
 impl Drop for Scratch {
     fn drop(&mut self) {
         // Nothing to report to: the file is ours, and absent is the goal.
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "a scratch file is removed by what created it, and by nothing else"
+        )]
         let _ = std::fs::remove_file(&self.path);
     }
 }
@@ -86,6 +91,10 @@ mod tests {
     fn what_is_already_at_the_name_is_refused_and_kept() {
         let dir = tempfile::tempdir().unwrap();
         let taken = dir.path().join("taken");
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the test puts a file where a scratch file would go"
+        )]
         std::fs::write(&taken, b"customer-data").unwrap();
         let refused = Scratch::at(taken.clone());
         assert!(matches!(

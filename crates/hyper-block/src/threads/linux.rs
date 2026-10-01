@@ -11,7 +11,7 @@ fn invalid(what: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, what)
 }
 
-pub fn count() -> io::Result<usize> {
+pub(super) fn count() -> io::Result<usize> {
     let status = std::fs::read_to_string("/proc/self/status")?;
     status
         .lines()
@@ -20,7 +20,7 @@ pub fn count() -> io::Result<usize> {
         .ok_or_else(|| invalid("/proc/self/status names no thread count"))
 }
 
-pub fn ceiling() -> io::Result<usize> {
+pub(super) fn ceiling() -> io::Result<usize> {
     let max: usize = std::fs::read_to_string("/proc/sys/kernel/threads-max")?
         .trim()
         .parse()
@@ -32,7 +32,7 @@ pub fn ceiling() -> io::Result<usize> {
     Ok(max.min(nproc))
 }
 
-pub fn thread_cpu() -> io::Result<Duration> {
+pub(super) fn thread_cpu() -> io::Result<Duration> {
     let t = rustix::time::clock_gettime(rustix::time::ClockId::ThreadCPUTime);
     let secs = u64::try_from(t.tv_sec).map_err(|_| invalid("a negative CPU time"))?;
     let nanos = u32::try_from(t.tv_nsec).map_err(|_| invalid("a negative CPU time"))?;

@@ -61,7 +61,7 @@ pub(crate) struct Tags {
 
 /// The order a frame considers a submission in: its tier (passed over, then each class), then
 /// when it was passed over and its class, or its start tag, then when it was taken.
-type Key = (u8, u128, u64);
+pub(crate) type Key = (u8, u128, u64);
 
 fn key(s: &Submission) -> Key {
     let class = match s.class {
@@ -81,34 +81,47 @@ fn key(s: &Submission) -> Key {
 /// group's update never sorts before one of its own taken earlier: it takes the later key of the
 /// two, as Tectonic gives traffic that borrows another TrafficGroup's resources the lower of their
 /// classes [research/01 §1.11], so a group's updates stay in the order submitted.
-pub(crate) fn order(batch: &mut VecDeque<Submission>) {
-    let mut taken: Vec<Submission> = std::mem::take(batch).into();
-    taken.sort_by_key(|s| s.tags.seq);
-    let mut last: HashMap<u128, Key> = HashMap::new();
-    let mut keyed: Vec<(Key, Submission)> = taken
-        .into_iter()
-        .map(|s| {
-            let own = key(&s);
-            let k = match last.get(&s.group) {
-                Some(&before) if before > own => before,
-                _ => own,
-            };
-            last.insert(s.group, k);
-            (k, s)
-        })
-        .collect();
-    // Stable: a group's updates of one key keep the order they were taken in.
-    keyed.sort_by_key(|(k, _)| *k);
-    batch.extend(keyed.into_iter().map(|(_, s)| s));
+///
+/// mantle sorts twice with a stable sort, which allocates; here each sort is unstable over keys
+/// made unique by position, which orders exactly as the stable sort does, in `keyed` and `last`,
+/// which the owner keeps between frames.
+pub(crate) fn order(
+    batch: &mut VecDeque<Submission>,
+    keyed: &mut Vec<(Key, u64, Submission)>,
+    last: &mut HashMap<u128, Key>,
+) {
+    keyed.clear();
+    last.clear();
+    // By when each was taken, ties (the restores at open, all taken at once) in batch order.
+    keyed.extend(
+        (0u64..)
+            .zip(batch.drain(..))
+            .map(|(at, s)| ((0, u128::from(s.tags.seq), 0), at, s)),
+    );
+    keyed.sort_unstable_by_key(|(k, at, _)| (*k, *at));
+    for (at, (k, place, s)) in (0u64..).zip(keyed.iter_mut()) {
+        let own = key(s);
+        *k = match last.get(&s.group) {
+            Some(&before) if before > own => before,
+            _ => own,
+        };
+        last.insert(s.group, *k);
+        *place = at;
+    }
+    // A group's updates of one key keep the order they were taken in.
+    keyed.sort_unstable_by_key(|(k, at, _)| (*k, *at));
+    batch.extend(keyed.drain(..).map(|(_, _, s)| s));
 }
 
-/// Where an update's pieces went in the payload.
-#[derive(Debug, Default)]
+/// Where an update's records went in the payload. An entry's place follows from its record's:
+/// the record's header, then each entry before it (`format::put_entries`); a proposal's from the
+/// first proposal's record, each proposal's record following the one before.
+#[derive(Debug, Default, Clone, Copy)]
 pub(crate) struct Placement {
     start: Option<usize>,
-    entries: Vec<(u64, usize)>,
+    entries: Option<usize>,
     hard: Option<usize>,
-    proposals: Vec<(u64, usize)>,
+    proposals: Option<usize>,
     uncertain: Option<usize>,
     damaged: Option<usize>,
 }
@@ -854,12 +867,8 @@ pub(crate) fn update_len(group: u128, update: &Update) -> Option<usize> {
         len = len.checked_add(format::encoded_len(&Record::Start { group, start })?)?;
     }
     if let Some(e) = &update.entries {
-        let entries: Vec<(u64, &[u8])> = e.entries.iter().map(|x| (x.term, &*x.bytes)).collect();
-        len = len.checked_add(format::encoded_len(&Record::Entries {
-            group,
-            first: e.first,
-            entries: &entries,
-        })?)?;
+        let lens = e.entries.iter().map(|x| x.bytes.len());
+        len = len.checked_add(format::entries_len(lens)?)?;
     }
     if let Some(state) = update.hard_state {
         len = len.checked_add(format::encoded_len(&Record::HardState { group, state })?)?;
@@ -905,28 +914,31 @@ pub(crate) fn encode(
         placement.start = Some(at);
     }
     if let Some(e) = &update.entries {
-        let entries: Vec<(u64, &[u8])> = e.entries.iter().map(|x| (x.term, &*x.bytes)).collect();
-        if let Placed::Entries(at) = put(&Record::Entries {
-            group,
-            first: e.first,
-            entries: &entries,
-        })? {
-            placement.entries = at;
-        }
+        *records = records.checked_add(1)?;
+        let entries = e.entries.iter().map(|x| (x.term, x.bytes.as_slice()));
+        placement.entries = Some(format::put_entries(
+            payload, false, group, e.first, entries,
+        )?);
     }
+    let mut put = |record: &Record<'_>| {
+        *records = records.checked_add(1)?;
+        format::put(payload, record)
+    };
     if let Some(state) = update.hard_state
         && let Placed::Record(at) = put(&Record::HardState { group, state })?
     {
         placement.hard = Some(at);
     }
-    for p in &update.proposals {
+    for (i, p) in update.proposals.iter().enumerate() {
         if let Placed::Record(at) = put(&Record::Proposal {
             group,
             index: p.index,
             term: p.term,
             bytes: &p.bytes,
-        })? {
-            placement.proposals.push((p.index, at));
+        })? && i == 0
+        {
+            // The record's start: its fields are where `put` placed it.
+            placement.proposals = at.checked_sub(format::RECORD_HEADER_LEN);
         }
     }
     if let Some(mark) = marks.uncertain
@@ -1088,12 +1100,19 @@ fn apply(
             };
             kill_slot(g, live, &slot);
         }
-        for (entry, &(_, at)) in e.entries.iter_mut().zip(&placement.entries) {
+        let mut at = placement
+            .entries
+            .and_then(|record| record.checked_add(format::ENTRIES_HEADER_LEN));
+        for entry in &mut e.entries {
+            let here = at.ok_or(LogError::Damaged("an offset past usize"))?;
+            at = here
+                .checked_add(format::ENTRY_HEADER_LEN)
+                .and_then(|a| a.checked_add(entry.bytes.len()));
             let len =
                 u32::try_from(entry.bytes.len()).map_err(|_| LogError::TooLarge(usize::MAX))?;
             let slot = Slot {
                 term: entry.term,
-                place: place(at)?,
+                place: place(here)?,
                 len,
                 cached: Some(std::mem::take(&mut entry.bytes)),
             };
@@ -1131,11 +1150,20 @@ fn apply(
         g.hard = Some((hard, new_at));
         live.add(new_at, HARD_STATE_BYTES);
     }
-    for (p, &(index, at)) in update.proposals.iter_mut().zip(&placement.proposals) {
+    let mut record = placement.proposals;
+    for p in &mut update.proposals {
+        let start = record.ok_or(LogError::Damaged("an offset past usize"))?;
+        record = start
+            .checked_add(format::RECORD_HEADER_LEN)
+            .and_then(|a| a.checked_add(format::PROPOSAL_FIELDS_LEN))
+            .and_then(|a| a.checked_add(p.bytes.len()));
+        let at = start
+            .checked_add(format::RECORD_HEADER_LEN)
+            .ok_or(LogError::Damaged("an offset past usize"))?;
         let new_at = place(at)?;
         let bytes = proposal_bytes(&p.bytes);
         let old = g.proposals.insert(
-            index,
+            p.index,
             state::Proposal {
                 term: p.term,
                 place: new_at,

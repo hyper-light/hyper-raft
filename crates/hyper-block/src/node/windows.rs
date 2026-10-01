@@ -9,7 +9,7 @@ use std::os::windows::io::AsRawHandle;
 use windows_sys::Win32::System::IO::DeviceIoControl;
 use windows_sys::Win32::System::Ioctl::{GET_LENGTH_INFORMATION, IOCTL_DISK_GET_LENGTH_INFO};
 
-pub fn len(file: &File) -> io::Result<u64> {
+pub(crate) fn len(file: &File) -> io::Result<u64> {
     let mut info = GET_LENGTH_INFORMATION { Length: 0 };
     let mut returned = 0u32;
     let size = u32::try_from(std::mem::size_of::<GET_LENGTH_INFORMATION>())

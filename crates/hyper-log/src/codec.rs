@@ -49,6 +49,11 @@ impl Writer {
         self.buf.len()
     }
 
+    /// Empties the writer, keeping what it allocated for the next use.
+    pub fn clear(&mut self) {
+        self.buf.clear();
+    }
+
     pub fn is_empty(&self) -> bool {
         self.buf.is_empty()
     }

@@ -4,7 +4,7 @@
 //!
 //! Identifying and measuring a device stays in mantle-disk: a caller that knows the device's
 //! alignment, queue and measured depth hands them in.
-#![allow(missing_docs)]
+
 #![cfg_attr(
     test,
     allow(
@@ -13,7 +13,9 @@
         clippy::panic,
         clippy::indexing_slicing,
         clippy::arithmetic_side_effects,
-        clippy::disallowed_macros
+        clippy::disallowed_macros,
+        clippy::cognitive_complexity,
+        clippy::cast_possible_truncation
     )
 )]
 
@@ -32,27 +34,41 @@ pub mod scratch;
 pub mod sim;
 pub mod threads;
 
+/// What a device operation fails with.
 #[derive(Debug, thiserror::Error)]
 pub enum DiskError {
+    /// The OS refused an operation on a file or device.
     #[error("{op} {}: {source}", path.display())]
     Io {
+        /// What was being done.
         op: &'static str,
+        /// The file or device it was done to.
         path: PathBuf,
+        /// The OS's error.
         #[source]
         source: std::io::Error,
     },
+    /// A direct transfer whose offset, length or buffer does not meet the file's alignment.
     #[error("direct transfer at offset {offset} of {len} bytes is not aligned to {align}")]
     Misaligned {
+        /// The transfer's file offset.
         offset: u64,
+        /// Its length in bytes.
         len: usize,
+        /// The alignment it had to meet.
         align: usize,
     },
+    /// A read reached the end of the file before it was full.
     #[error("{} ended at offset {offset}: {missing} bytes short", path.display())]
     ShortRead {
+        /// The file read.
         path: PathBuf,
+        /// The read's file offset.
         offset: u64,
+        /// Bytes the file did not have.
         missing: usize,
     },
+    /// A buffer refused a size or an alignment.
     #[error(transparent)]
     Buf(#[from] buf::BufError),
     /// A pool for `path` would take more threads than the process budget has left; refused
@@ -62,12 +78,21 @@ pub enum DiskError {
         path.display()
     )]
     Threads {
+        /// The device the pool would serve.
         path: PathBuf,
+        /// Threads the pool asked for.
         asked: usize,
+        /// Threads the budget had left.
         left: usize,
+        /// The budget's ceiling.
         ceiling: usize,
     },
-    /// Storage mantle cannot write as it must, refused before any write.
+    /// Storage that cannot be written as it must be, refused before any write.
     #[error("{}: {reason}", path.display())]
-    Unsupported { path: PathBuf, reason: &'static str },
+    Unsupported {
+        /// The file or device refused.
+        path: PathBuf,
+        /// Why.
+        reason: &'static str,
+    },
 }

@@ -83,6 +83,8 @@ pub(crate) struct Swept {
 pub(crate) struct Reads {
     pub(crate) group: u128,
     pub(crate) runs: Vec<Run>,
+    /// The entries of every run, a run's after the run's before it.
+    pub(crate) wanted: Vec<Wanted>,
     pub(crate) into: crate::Fetched,
     /// Entries a run did not hold as asked: moved since their place was taken, or damaged.
     pub(crate) missed: Vec<Wanted>,
@@ -98,7 +100,23 @@ pub(crate) struct Run {
     /// The place in the caller's reservation that the run's next entry would take: a run holds
     /// entries asked for one after another.
     pub(crate) contiguous: usize,
-    pub(crate) entries: Vec<Wanted>,
+    /// Its entries in the reads' list: `count` of them from `first`.
+    pub(crate) first: usize,
+    pub(crate) count: usize,
+}
+
+impl Reads {
+    /// Reads of nothing.
+    pub(crate) fn none() -> Self {
+        Self {
+            group: 0,
+            runs: Vec::new(),
+            wanted: Vec::new(),
+            into: crate::Fetched::default(),
+            missed: Vec::new(),
+            result: Ok(()),
+        }
+    }
 }
 
 /// An entry to read: its position among the entries asked for, its index and term, and the
@@ -184,10 +202,8 @@ impl Kind {
             Self::Sweep => Completion::Sweep(Err(failed())),
             Self::Read(group) => Completion::Read(Reads {
                 group,
-                runs: Vec::new(),
-                into: crate::Fetched::default(),
-                missed: Vec::new(),
                 result: Err(failed()),
+                ..Reads::none()
             }),
             Self::Look => Completion::Looked,
         }
@@ -293,17 +309,29 @@ impl<F: BlockFile> Device<F> {
     /// into the caller's reservation.
     fn read(&mut self, mut reads: Reads) -> Reads {
         let runs = std::mem::take(&mut reads.runs);
+        let wanted = std::mem::take(&mut reads.wanted);
         for run in &runs {
-            if let Err(e) = self.read_run(&mut reads, run) {
+            let entries = run
+                .first
+                .checked_add(run.count)
+                .and_then(|end| wanted.get(run.first..end))
+                .unwrap_or_default();
+            if let Err(e) = self.read_run(&mut reads, run, entries) {
                 reads.result = Err(e);
                 break;
             }
         }
         reads.runs = runs;
+        reads.wanted = wanted;
         reads
     }
 
-    fn read_run(&mut self, reads: &mut Reads, run: &Run) -> Result<(), LogError> {
+    fn read_run(
+        &mut self,
+        reads: &mut Reads,
+        run: &Run,
+        entries: &[Wanted],
+    ) -> Result<(), LogError> {
         let size = usize::try_from(run.end.saturating_sub(run.begin))
             .map_err(|_| LogError::Damaged("a read past usize"))?;
         let mut buf = self.pool.take(size).map_err(|e| LogError::Disk(e.into()))?;
@@ -316,7 +344,7 @@ impl<F: BlockFile> Device<F> {
                     .map_err(LogError::from)
             });
         if read.is_ok() {
-            for wanted in &run.entries {
+            for wanted in entries {
                 take_entry(reads, buf.as_slice(), run.begin, *wanted);
             }
         }

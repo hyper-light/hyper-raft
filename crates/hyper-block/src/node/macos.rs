@@ -29,7 +29,7 @@ const BLOCK_COUNT: Opcode = opcode::read::<u64>(b'd', 25);
 /// DKIOCSYNCHRONIZE: `_IOW('d', 22, dk_synchronize_t)`.
 const SYNCHRONIZE: Opcode = opcode::write::<Synchronize>(b'd', 22);
 
-pub fn len(file: &File) -> io::Result<u64> {
+pub(crate) fn len(file: &File) -> io::Result<u64> {
     // SAFETY: DKIOCGETBLOCKSIZE writes one uint32_t, the getter's output type.
     let size = unsafe { ioctl(file, Getter::<BLOCK_SIZE, u32>::new()) }?;
     // SAFETY: DKIOCGETBLOCKCOUNT writes one uint64_t, the getter's output type.
@@ -42,7 +42,7 @@ pub fn len(file: &File) -> io::Result<u64> {
     })
 }
 
-pub fn sync(file: &File) -> io::Result<()> {
+pub(crate) fn sync(file: &File) -> io::Result<()> {
     rustix::fs::fsync(file)?;
     // Offset and length zero name the whole media; options zero asks for a flush, where
     // DK_SYNCHRONIZE_OPTION_BARRIER would ask only for ordering.

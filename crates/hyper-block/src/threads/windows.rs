@@ -24,11 +24,11 @@ const POOL_THREADS: usize = 500;
 /// One `FILETIME` unit, 100 ns (`FILETIME`, Remarks).
 const FILETIME_NANOS: u64 = 100;
 
-pub fn ceiling() -> io::Result<usize> {
+pub(super) fn ceiling() -> io::Result<usize> {
     Ok(POOL_THREADS)
 }
 
-pub fn count() -> io::Result<usize> {
+pub(super) fn count() -> io::Result<usize> {
     // SAFETY: no pointers are passed; the result is a handle this code closes, or
     // INVALID_HANDLE_VALUE.
     let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
@@ -65,7 +65,7 @@ pub fn count() -> io::Result<usize> {
     Ok(threads)
 }
 
-pub fn thread_cpu() -> io::Result<Duration> {
+pub(super) fn thread_cpu() -> io::Result<Duration> {
     let zero = FILETIME {
         dwLowDateTime: 0,
         dwHighDateTime: 0,

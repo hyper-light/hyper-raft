@@ -24,19 +24,37 @@ pub const MAX_SIM_LEN: u64 = 1 << 30;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Fault {
     /// Reads overlapping `[offset, offset + len)` fail with EIO.
-    ReadError { offset: u64, len: u64 },
+    ReadError {
+        /// Where the failing range begins.
+        offset: u64,
+        /// Its length.
+        len: u64,
+    },
     /// Reads of the byte at `offset` return it with bit `bit` inverted; the stored byte is
     /// intact, as with a transient transfer error, unless `stored` is set.
-    BitFlip { offset: u64, bit: u8, stored: bool },
+    BitFlip {
+        /// The byte's file offset.
+        offset: u64,
+        /// The bit flipped, 0 to 7.
+        bit: u8,
+        /// The flip is on the medium, healed only by a write over it.
+        stored: bool,
+    },
     /// The next write fails with EIO before changing anything.
     WriteError,
     /// The next flush fails with EIO; each unflushed sector is left durable or not.
     SyncError,
     /// Writes that would grow the file past `len` fail with ENOSPC.
-    Capacity { len: u64 },
+    Capacity {
+        /// The file's capacity.
+        len: u64,
+    },
     /// Power is cut after `ops` more writes and flushes: that operation and every one after
     /// it fails, until the test crashes the file and clears its faults.
-    PowerCut { ops: u64 },
+    PowerCut {
+        /// Writes and flushes that still succeed.
+        ops: u64,
+    },
 }
 
 /// What a crash does with sectors written since the last successful flush.
@@ -66,9 +84,13 @@ struct State {
 /// Operation counts, so a test can assert what an engine did.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SimStats {
+    /// Reads issued.
     pub reads: u64,
+    /// Writes issued.
     pub writes: u64,
+    /// Flushes issued.
     pub syncs: u64,
+    /// Crashes the test made.
     pub crashes: u64,
 }
 
@@ -111,6 +133,7 @@ impl SimFile {
         Ok(())
     }
 
+    /// Disarms every fault.
     pub fn clear_faults(&self) -> Result<(), DiskError> {
         self.lock()?.faults.clear();
         Ok(())
@@ -136,6 +159,7 @@ impl SimFile {
         Ok(())
     }
 
+    /// The operations counted so far.
     pub fn stats(&self) -> Result<SimStats, DiskError> {
         Ok(self.lock()?.stats)
     }
@@ -237,14 +261,14 @@ fn sim_error(what: &str) -> DiskError {
 /// SplitMix64 (Steele, Lea and Flood, "Fast Splittable Pseudorandom Number Generators",
 /// OOPSLA 2014): one word of state, so that every crash and fault replays from its seed.
 #[derive(Debug, Clone)]
-pub struct SplitMix64(u64);
+struct SplitMix64(u64);
 
 impl SplitMix64 {
-    pub fn new(seed: u64) -> Self {
+    fn new(seed: u64) -> Self {
         Self(seed)
     }
 
-    pub fn next_u64(&mut self) -> u64 {
+    fn next_u64(&mut self) -> u64 {
         self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
         let mut z = self.0;
         z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);

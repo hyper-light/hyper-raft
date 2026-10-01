@@ -24,7 +24,9 @@ use crate::buf::Alignment;
 /// Whether transfers bypass the OS page cache.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Caching {
+    /// Transfers go straight between the device and the buffer.
     Direct,
+    /// Transfers go through the OS page cache.
     Buffered,
 }
 
@@ -33,9 +35,11 @@ pub enum Caching {
 pub enum CachingRequest {
     /// Direct I/O if the file system accepts it, otherwise buffered.
     PreferDirect,
+    /// Through the OS page cache.
     Buffered,
 }
 
+/// A file, or a device node, read and written at offsets with the platform's full flush.
 #[derive(Debug)]
 pub struct DeviceFile {
     file: File,
@@ -89,6 +93,7 @@ impl DeviceFile {
         })
     }
 
+    /// The path the file was opened at.
     pub fn path(&self) -> &Path {
         &self.path
     }
@@ -111,6 +116,7 @@ impl DeviceFile {
         })
     }
 
+    /// Whether the file's transfers bypass the page cache.
     pub fn caching(&self) -> Caching {
         self.caching
     }
@@ -207,10 +213,12 @@ impl DeviceFile {
             .map_err(|e| self.io_error("stat", e))
     }
 
+    /// Whether the file holds no bytes.
     pub fn is_empty(&self) -> Result<bool, DiskError> {
         self.len().map(|len| len == 0)
     }
 
+    /// The open file.
     pub fn std_file(&self) -> &File {
         &self.file
     }
@@ -377,19 +385,19 @@ mod sys {
     use std::os::unix::fs::FileExt;
     use std::path::Path;
 
-    pub fn write_at(file: &File, buf: &[u8], offset: u64) -> io::Result<usize> {
+    pub(super) fn write_at(file: &File, buf: &[u8], offset: u64) -> io::Result<usize> {
         file.write_at(buf, offset)
     }
 
-    pub fn read_at(file: &File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+    pub(super) fn read_at(file: &File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
         file.read_at(buf, offset)
     }
 
-    pub fn sync_dir(dir: &Path) -> io::Result<()> {
+    pub(super) fn sync_dir(dir: &Path) -> io::Result<()> {
         File::open(dir)?.sync_all()
     }
 
-    pub fn preallocate(file: &File, len: u64) -> io::Result<()> {
+    pub(super) fn preallocate(file: &File, len: u64) -> io::Result<()> {
         // Linux: fallocate(2) mode 0 allocates and extends. macOS: rustix issues
         // F_PREALLOCATE from the physical end of file, then ftruncate(2) — correct only
         // for an empty file, which is the one use.
@@ -398,7 +406,7 @@ mod sys {
     }
 
     #[cfg(any(target_os = "linux", target_os = "android"))]
-    pub fn open_direct(path: &Path, create: bool) -> io::Result<File> {
+    pub(super) fn open_direct(path: &Path, create: bool) -> io::Result<File> {
         use std::os::unix::fs::OpenOptionsExt;
         let flag = i32::try_from(rustix::fs::OFlags::DIRECT.bits())
             .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
@@ -408,20 +416,20 @@ mod sys {
     }
 
     #[cfg(any(target_os = "linux", target_os = "android"))]
-    pub fn refuses_direct(e: &io::Error) -> bool {
+    pub(super) fn refuses_direct(e: &io::Error) -> bool {
         // open(2): EINVAL "The filesystem does not support the O_DIRECT flag".
         e.raw_os_error() == Some(rustix::io::Errno::INVAL.raw_os_error())
     }
 
     #[cfg(target_vendor = "apple")]
-    pub fn open_direct(path: &Path, create: bool) -> io::Result<File> {
+    pub(super) fn open_direct(path: &Path, create: bool) -> io::Result<File> {
         let file = super::options(create).open(path)?;
         rustix::fs::fcntl_nocache(&file, true)?;
         Ok(file)
     }
 
     #[cfg(target_vendor = "apple")]
-    pub fn refuses_direct(e: &io::Error) -> bool {
+    pub(super) fn refuses_direct(e: &io::Error) -> bool {
         matches!(
             e.raw_os_error(),
             Some(code) if code == rustix::io::Errno::INVAL.raw_os_error()
@@ -430,12 +438,12 @@ mod sys {
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
-    pub fn open_direct(_path: &Path, _create: bool) -> io::Result<File> {
+    pub(super) fn open_direct(_path: &Path, _create: bool) -> io::Result<File> {
         Err(io::Error::from(io::ErrorKind::Unsupported))
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
-    pub fn refuses_direct(e: &io::Error) -> bool {
+    pub(super) fn refuses_direct(e: &io::Error) -> bool {
         e.kind() == io::ErrorKind::Unsupported
     }
 }
@@ -450,16 +458,16 @@ mod sys {
     use windows_sys::Win32::Foundation::ERROR_INVALID_PARAMETER;
     use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_NO_BUFFERING;
 
-    pub fn write_at(file: &File, buf: &[u8], offset: u64) -> io::Result<usize> {
+    pub(super) fn write_at(file: &File, buf: &[u8], offset: u64) -> io::Result<usize> {
         file.seek_write(buf, offset)
     }
 
-    pub fn read_at(file: &File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+    pub(super) fn read_at(file: &File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
         // std maps ReadFile's ERROR_HANDLE_EOF to Ok(0) (library/std/src/sys/pal/windows/handle.rs).
         file.seek_read(buf, offset)
     }
 
-    pub fn sync_dir(dir: &Path) -> io::Result<()> {
+    pub(super) fn sync_dir(dir: &Path) -> io::Result<()> {
         // A directory opens only with FILE_FLAG_BACKUP_SEMANTICS (CreateFileW); FlushFileBuffers
         // needs a handle with write access.
         use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS;
@@ -471,19 +479,23 @@ mod sys {
             .sync_all()
     }
 
-    pub fn preallocate(file: &File, len: u64) -> io::Result<()> {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the device layer sizes the files it owns; preallocation is its job"
+    )]
+    pub(super) fn preallocate(file: &File, len: u64) -> io::Result<()> {
         // SetEndOfFile allocates the clusters of a non-sparse NTFS file; the valid data
         // length stays at zero, so reads past what was written return zeros.
         file.set_len(len)
     }
 
-    pub fn open_direct(path: &Path, create: bool) -> io::Result<File> {
+    pub(super) fn open_direct(path: &Path, create: bool) -> io::Result<File> {
         let mut options = super::options(create);
         options.custom_flags(FILE_FLAG_NO_BUFFERING);
         options.open(path)
     }
 
-    pub fn refuses_direct(e: &io::Error) -> bool {
+    pub(super) fn refuses_direct(e: &io::Error) -> bool {
         e.raw_os_error() == i32::try_from(ERROR_INVALID_PARAMETER).ok()
     }
 }

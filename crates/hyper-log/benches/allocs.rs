@@ -94,31 +94,36 @@ struct Cost {
     reallocations: f64,
     bytes: f64,
     faults: f64,
+    /// Allocations the calling thread made: the caller's share of `allocations`.
+    caller: f64,
 }
 
-fn per(counts: alloc::Counts, faults: u64, n: u64) -> Cost {
+fn per(counts: alloc::Counts, caller: alloc::Counts, faults: u64, n: u64) -> Cost {
     let n = n as f64;
     Cost {
         allocations: counts.allocations as f64 / n,
         reallocations: counts.reallocations as f64 / n,
         bytes: counts.bytes as f64 / n,
         faults: faults as f64 / n,
+        caller: caller.allocations as f64 / n,
     }
 }
 
 fn counted(n: u64, work: impl FnOnce()) -> Cost {
     let before = faults::read().unwrap();
     alloc::begin_process();
+    alloc::begin();
     work();
+    let caller = alloc::end();
     let counts = alloc::end_process();
     let after = faults::read().unwrap();
-    per(counts, after.since(&before).minor, n)
+    per(counts, caller, after.since(&before).minor, n)
 }
 
 fn row(what: &str, replicas: usize, size: usize, cost: &Cost) {
     println!(
-        "  {what:<22} {replicas:>8} {size:>7} {:>10.2} {:>10.2} {:>12.0} {:>10.3}",
-        cost.allocations, cost.reallocations, cost.bytes, cost.faults
+        "  {what:<40} {replicas:>8} {size:>7} {:>10.2} {:>10.2} {:>12.0} {:>10.3} {:>10.2}",
+        cost.allocations, cost.reallocations, cost.bytes, cost.faults, cost.caller
     );
 }
 
@@ -138,6 +143,22 @@ fn point(dir: &Path, replicas: usize, size: usize) {
         }
     });
     row("fetch, in memory", replicas, size, &cost);
+    let mut into = Some(hyper_log::Fetched::new());
+    let mut fetch = |log: &Log<DeviceFile>, g: usize| {
+        let got = log
+            .fetch(g as u128, last, last + 1, u64::MAX, into.take().unwrap())
+            .unwrap();
+        assert_eq!(got.len(), 1);
+        into = Some(got);
+    };
+    // The reservation grows to an entry once, outside the count.
+    fetch(&log, 0);
+    let cost = counted(replicas as u64, || {
+        for g in 0..replicas {
+            fetch(&log, g);
+        }
+    });
+    row("fetch into a reservation", replicas, size, &cost);
     let cost = counted(replicas as u64, || {
         for g in 0..replicas {
             assert_eq!(log.term(g as u128, last).unwrap(), 1);
@@ -159,6 +180,26 @@ fn point(dir: &Path, replicas: usize, size: usize) {
         }
     });
     row("fetch, from the file", replicas, size, &cost);
+    let mut into = Some(hyper_log::Fetched::new());
+    let mut fetch = |log: &Log<DeviceFile>, g: usize| {
+        let got = log
+            .fetch(g as u128, last, last + 1, u64::MAX, into.take().unwrap())
+            .unwrap();
+        assert_eq!(got.len(), 1);
+        into = Some(got);
+    };
+    fetch(&log, 0);
+    let cost = counted(replicas as u64, || {
+        for g in 0..replicas {
+            fetch(&log, g);
+        }
+    });
+    row(
+        "fetch from the file, into a reservation",
+        replicas,
+        size,
+        &cost,
+    );
 }
 
 fn main() {
@@ -172,8 +213,8 @@ fn main() {
          every thread's ({ROUNDS} rounds after {WARM})"
     );
     println!(
-        "  {:<22} {:>8} {:>7} {:>10} {:>10} {:>12} {:>10}",
-        "", "replicas", "entry", "allocs", "reallocs", "bytes", "faults"
+        "  {:<40} {:>8} {:>7} {:>10} {:>10} {:>12} {:>10} {:>10}",
+        "", "replicas", "entry", "allocs", "reallocs", "bytes", "faults", "caller"
     );
     for replicas in [1usize, 16] {
         for size in [128usize, 1 << 10, 16 << 10] {

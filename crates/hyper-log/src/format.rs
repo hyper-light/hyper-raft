@@ -136,25 +136,83 @@ impl FrameHeader {
         records: u32,
         payload: &[u8],
     ) -> Option<Vec<u8>> {
+        let frame = Frame {
+            log,
+            incarnation,
+            nonce,
+            sequence,
+            tail,
+            records,
+        };
+        frame.header(payload).map(|h| h.to_vec())
+    }
+}
+
+/// What a frame's header says besides its payload's length and checksum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Frame {
+    /// The log's ID.
+    pub log: u128,
+    /// The incarnation of the segment the frame is in.
+    pub incarnation: u64,
+    /// The nonce of the segment the frame is in.
+    pub nonce: u64,
+    /// The frame's sequence.
+    pub sequence: u64,
+    /// The incarnation of the oldest live segment.
+    pub tail: u64,
+    /// Records in the payload.
+    pub records: u32,
+}
+
+impl Frame {
+    /// The header of this frame of `payload`, its CRC computed over both, in place: the bytes
+    /// [`FrameHeader::header`] gives, with nothing allocated.
+    pub fn header(&self, payload: &[u8]) -> Option<[u8; FRAME_HEADER_LEN]> {
         let payload_len = u32::try_from(payload.len()).ok()?;
-        let mut w = Writer::with_capacity(FRAME_HEADER_LEN);
-        w.bytes(&FRAME_MAGIC);
-        w.u8(FORMAT);
-        w.zeros(3);
-        w.u128(log);
-        w.u64(incarnation);
-        w.u64(nonce);
-        w.u64(sequence);
-        w.u64(tail);
-        w.u32(payload_len);
-        w.u32(records);
+        let mut out = [0u8; FRAME_HEADER_LEN];
+        let mut w = Fixed::new(&mut out);
+        w.bytes(&FRAME_MAGIC)?;
+        w.bytes(&[FORMAT, 0, 0, 0])?;
+        w.bytes(&self.log.to_le_bytes())?;
+        w.bytes(&self.incarnation.to_le_bytes())?;
+        w.bytes(&self.nonce.to_le_bytes())?;
+        w.bytes(&self.sequence.to_le_bytes())?;
+        w.bytes(&self.tail.to_le_bytes())?;
+        w.bytes(&payload_len.to_le_bytes())?;
+        w.bytes(&self.records.to_le_bytes())?;
         let mut crc = crate::codec::Crc32c::new();
-        crc.update(w.as_slice());
+        crc.update(w.written());
         crc.update(payload);
-        w.u32(crc.finish());
-        Some(w.into_vec())
+        w.bytes(&crc.finish().to_le_bytes())?;
+        Some(out)
+    }
+}
+
+/// Little-endian fields written into a fixed array, refusing past its end.
+struct Fixed<'a> {
+    out: &'a mut [u8],
+    at: usize,
+}
+
+impl<'a> Fixed<'a> {
+    fn new(out: &'a mut [u8]) -> Self {
+        Self { out, at: 0 }
     }
 
+    fn bytes(&mut self, v: &[u8]) -> Option<()> {
+        let end = self.at.checked_add(v.len())?;
+        self.out.get_mut(self.at..end)?.copy_from_slice(v);
+        self.at = end;
+        Some(())
+    }
+
+    fn written(&self) -> &[u8] {
+        self.out.get(..self.at).unwrap_or_default()
+    }
+}
+
+impl FrameHeader {
     /// The header at the start of `block`, if it has the frame magic and format. Its CRC is
     /// checked against the payload by [`FrameHeader::verifies`].
     pub fn decode(block: &[u8]) -> Option<Self> {
@@ -365,6 +423,48 @@ pub fn put(payload: &mut Writer, record: &Record<'_>) -> Option<Placed> {
             Some(Placed::Record(at))
         }
     }
+}
+
+/// Bytes of a record's kind and group, before its fields.
+pub const RECORD_HEADER_LEN: usize = 17;
+/// Bytes of an `Entries` or `Relocated` record before its entries: its kind and group, its first
+/// index and its count of entries.
+pub const ENTRIES_HEADER_LEN: usize = 29;
+/// Bytes of a `Proposal` record's fields before its bytes: index, term, length and CRC.
+pub const PROPOSAL_FIELDS_LEN: usize = 24;
+
+/// Bytes an `Entries` or `Relocated` record of entries of these payload lengths takes: what
+/// [`encoded_len`] says of it, with no list of the entries made.
+pub fn entries_len(mut lens: impl Iterator<Item = usize>) -> Option<usize> {
+    lens.try_fold(ENTRIES_HEADER_LEN, |sum, len| {
+        sum.checked_add(ENTRY_HEADER_LEN)?.checked_add(len)
+    })
+}
+
+/// Appends an `Entries` record of `entries` from `first`, or a `Relocated` one when
+/// `relocated`, as [`put`] does, and says where the record starts: entry `i` starts
+/// [`ENTRIES_HEADER_LEN`] after it plus [`ENTRY_HEADER_LEN`] and the bytes of each entry before
+/// it. `None` when a length does not fit its field.
+pub fn put_entries<'a>(
+    payload: &mut Writer,
+    relocated: bool,
+    group: u128,
+    first: u64,
+    entries: impl ExactSizeIterator<Item = (u64, &'a [u8])>,
+) -> Option<usize> {
+    let at = payload.len();
+    payload.u8(if relocated { RELOCATED } else { ENTRIES });
+    payload.u128(group);
+    payload.u64(first);
+    payload.u32(u32::try_from(entries.len()).ok()?);
+    for (i, (term, bytes)) in (0u64..).zip(entries) {
+        let index = first.checked_add(i)?;
+        payload.u64(term);
+        payload.u32(u32::try_from(bytes.len()).ok()?);
+        payload.u32(entry_crc(group, index, term, bytes));
+        payload.bytes(bytes);
+    }
+    Some(at)
 }
 
 /// Bytes `record` takes in a payload.
@@ -620,6 +720,13 @@ pub fn persist_len(groups: usize) -> Option<usize> {
 impl Persist {
     pub fn encode(&self) -> Option<Vec<u8>> {
         let mut w = Writer::with_capacity(persist_len(self.groups.len())?);
+        self.encode_into(&mut w)?;
+        Some(w.into_vec())
+    }
+
+    /// Appends the record's bytes to `w`, as [`Persist::encode`] gives them.
+    pub fn encode_into(&self, w: &mut Writer) -> Option<()> {
+        let from = w.len();
         w.bytes(&PERSIST_MAGIC);
         w.u8(FORMAT);
         w.zeros(3);
@@ -659,9 +766,9 @@ impl Persist {
             w.u64(uncertain.index);
             w.u64(uncertain.term);
         }
-        let crc = crate::codec::crc32c(w.as_slice());
+        let crc = crate::codec::crc32c(w.as_slice().get(from..)?);
         w.u32(crc);
-        Some(w.into_vec())
+        Some(())
     }
 
     /// The persist record at the start of `bytes`, if it is one and its checksum holds.

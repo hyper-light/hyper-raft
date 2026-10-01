@@ -19,13 +19,13 @@ mod macos;
 mod windows;
 
 #[cfg(target_vendor = "apple")]
-pub use macos::{len, sync};
+pub(crate) use macos::{len, sync};
 #[cfg(windows)]
-pub use windows::len;
+pub(crate) use windows::len;
 
 /// Whether `file`, opened at `path`, is a device node rather than a regular file.
 #[cfg(unix)]
-pub fn is_node(file: &File, _path: &Path) -> io::Result<bool> {
+pub(crate) fn is_node(file: &File, _path: &Path) -> io::Result<bool> {
     use std::os::unix::fs::FileTypeExt;
     let kind = file.metadata()?.file_type();
     Ok(kind.is_block_device() || kind.is_char_device())
@@ -35,12 +35,12 @@ pub fn is_node(file: &File, _path: &Path) -> io::Result<bool> {
 /// Win32 device namespace instead of the Win32 file namespace" (Naming Files, Paths, and
 /// Namespaces).
 #[cfg(windows)]
-pub fn is_node(_file: &File, path: &Path) -> io::Result<bool> {
+pub(crate) fn is_node(_file: &File, path: &Path) -> io::Result<bool> {
     Ok(path.as_os_str().to_string_lossy().starts_with(r"\\.\"))
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
-pub fn len(file: &File) -> io::Result<u64> {
+pub(crate) fn len(file: &File) -> io::Result<u64> {
     use std::io::Seek;
     // Every transfer names its offset, so moving the file's position changes nothing.
     let mut end = file;
@@ -48,7 +48,7 @@ pub fn len(file: &File) -> io::Result<u64> {
 }
 
 #[cfg(any(target_os = "linux", target_os = "android", windows))]
-pub fn sync(file: &File) -> io::Result<()> {
+pub(crate) fn sync(file: &File) -> io::Result<()> {
     file.sync_data()
 }
 
@@ -58,7 +58,7 @@ pub fn sync(file: &File) -> io::Result<()> {
     target_vendor = "apple",
     windows
 )))]
-pub fn len(_file: &File) -> io::Result<u64> {
+pub(crate) fn len(_file: &File) -> io::Result<u64> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "no device size for this operating system",
@@ -72,7 +72,7 @@ pub fn len(_file: &File) -> io::Result<u64> {
     target_vendor = "apple",
     windows
 )))]
-pub fn sync(_file: &File) -> io::Result<()> {
+pub(crate) fn sync(_file: &File) -> io::Result<()> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "no device flush for this operating system",

@@ -52,7 +52,7 @@ struct TaskInfo {
     priority: i32,
 }
 
-pub fn count() -> io::Result<usize> {
+pub(super) fn count() -> io::Result<usize> {
     let mut info = TaskInfo::default();
     let size = c_int::try_from(std::mem::size_of::<TaskInfo>())
         .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
@@ -72,7 +72,7 @@ pub fn count() -> io::Result<usize> {
     })
 }
 
-pub fn ceiling() -> io::Result<usize> {
+pub(super) fn ceiling() -> io::Result<usize> {
     let mut value: c_int = 0;
     let mut len = std::mem::size_of::<c_int>();
     // SAFETY: the name is a NUL-terminated literal; `value` is a writable int of `len` bytes
@@ -104,7 +104,7 @@ pub fn ceiling() -> io::Result<usize> {
     })
 }
 
-pub fn thread_cpu() -> io::Result<Duration> {
+pub(super) fn thread_cpu() -> io::Result<Duration> {
     let t = rustix::time::clock_gettime(rustix::time::ClockId::ThreadCPUTime);
     let secs = u64::try_from(t.tv_sec).map_err(|_| io::Error::from(io::ErrorKind::InvalidData))?;
     let nanos =

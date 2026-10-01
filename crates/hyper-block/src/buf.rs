@@ -6,7 +6,6 @@
 //! FILE_FLAG_NO_BUFFERING). The buffer is carved out of an ordinary allocation that is
 //! `align - 1` bytes longer than needed, so no `unsafe` allocation is involved.
 
-use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
 
 /// The largest alignment accepted. Direct-I/O alignments are logical block sizes and page
@@ -21,16 +20,31 @@ pub const MAX_ALIGNMENT: usize = 1 << 20;
 /// batch, far below it.
 pub const MAX_BUFFER: usize = 1 << 30;
 
+/// What a buffer refuses.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum BufError {
+    /// An alignment that is not a power of two up to [`MAX_ALIGNMENT`].
     #[error("alignment {0} is not a power of two in 1..={MAX_ALIGNMENT}")]
     Alignment(usize),
+    /// A buffer past [`MAX_BUFFER`].
     #[error("buffer of {0} bytes exceeds the {MAX_BUFFER}-byte bound")]
     TooLarge(usize),
+    /// More bytes than the buffer has room left for.
     #[error("{requested} bytes do not fit in the {available} bytes left")]
-    Full { requested: usize, available: usize },
+    Full {
+        /// Bytes asked to add.
+        requested: usize,
+        /// Bytes of room left.
+        available: usize,
+    },
+    /// A length past the buffer's capacity.
     #[error("length {len} exceeds capacity {capacity}")]
-    Length { len: usize, capacity: usize },
+    Length {
+        /// The length asked for.
+        len: usize,
+        /// The buffer's capacity.
+        capacity: usize,
+    },
 }
 
 /// A power-of-two alignment in bytes, at most [`MAX_ALIGNMENT`].
@@ -41,6 +55,7 @@ impl Alignment {
     /// One byte: no constraint.
     pub const BYTE: Self = Self(NonZeroUsize::MIN);
 
+    /// The alignment of `bytes`, a power of two up to [`MAX_ALIGNMENT`].
     pub fn new(bytes: usize) -> Result<Self, BufError> {
         match NonZeroUsize::new(bytes) {
             Some(n) if n.is_power_of_two() && bytes <= MAX_ALIGNMENT => Ok(Self(n)),
@@ -48,6 +63,7 @@ impl Alignment {
         }
     }
 
+    /// The alignment in bytes.
     pub fn get(self) -> usize {
         self.0.get()
     }
@@ -57,10 +73,12 @@ impl Alignment {
         self.0.get().wrapping_sub(1)
     }
 
+    /// Whether `n` is a multiple of the alignment.
     pub fn is_aligned(self, n: usize) -> bool {
         n & self.mask() == 0
     }
 
+    /// Whether `n` is a multiple of the alignment.
     pub fn is_aligned_u64(self, n: u64) -> bool {
         // usize is at most 64 bits on every supported target, so the widening is lossless.
         n & (self.mask() as u64) == 0
@@ -71,6 +89,7 @@ impl Alignment {
         n & !self.mask()
     }
 
+    /// `n` rounded down to a multiple of the alignment.
     pub fn down_u64(self, n: u64) -> u64 {
         n & !(self.mask() as u64)
     }
@@ -80,6 +99,7 @@ impl Alignment {
         n.checked_add(self.mask()).map(|m| m & !self.mask())
     }
 
+    /// `n` rounded up to a multiple of the alignment, or `None` past `u64::MAX`.
     pub fn up_u64(self, n: u64) -> Option<u64> {
         let mask = self.mask() as u64;
         n.checked_add(mask).map(|m| m & !mask)
@@ -155,6 +175,7 @@ impl AlignedBuf {
         })
     }
 
+    /// The alignment the buffer meets.
     pub fn alignment(&self) -> Alignment {
         self.align
     }
@@ -164,18 +185,22 @@ impl AlignedBuf {
         self.storage.len()
     }
 
+    /// Bytes the buffer holds at most: a multiple of its alignment.
     pub fn capacity(&self) -> usize {
         self.capacity
     }
 
+    /// Bytes in use.
     pub fn len(&self) -> usize {
         self.len
     }
 
+    /// Whether no byte is in use.
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
 
+    /// Bytes of room left.
     pub fn remaining(&self) -> usize {
         // len <= capacity is an invariant every mutator keeps.
         self.capacity.saturating_sub(self.len)
@@ -228,10 +253,12 @@ impl AlignedBuf {
         Ok(())
     }
 
+    /// Declares no byte in use, keeping the capacity.
     pub fn clear(&mut self) {
         self.len = 0;
     }
 
+    /// Appends `bytes`, refused past the capacity.
     pub fn extend_from_slice(&mut self, bytes: &[u8]) -> Result<(), BufError> {
         let available = self.remaining();
         if bytes.len() > available {
@@ -290,7 +317,9 @@ impl AlignedBuf {
 /// Free buffers are kept by capacity. A request takes the smallest free buffer that holds
 /// it and is at most twice its size, so a small read never ties up a large buffer; otherwise
 /// it allocates exactly what it needs. At most `limit` bytes are kept free, none in a
-/// buffer larger than `largest`; a buffer returned past either bound is freed.
+/// buffer larger than `largest`; a buffer returned past either bound is freed. The free buffers
+/// are one list in order of capacity, which once grown takes and gives with no allocation: they
+/// are at most `limit` over the alignment, a few for the sizes a log or a volume reads.
 ///
 /// A pool has one owner, the thread that issues the I/O its buffers carry: it takes a buffer
 /// and gives it back, and a buffer handed to another thread comes back by message.
@@ -298,7 +327,8 @@ pub struct Pool {
     align: Alignment,
     limit: usize,
     largest: usize,
-    by_capacity: BTreeMap<usize, Vec<AlignedBuf>>,
+    /// Free buffers, smallest capacity first.
+    free: Vec<AlignedBuf>,
     held: usize,
 }
 
@@ -321,7 +351,7 @@ impl Pool {
             align,
             limit,
             largest,
-            by_capacity: BTreeMap::new(),
+            free: Vec::new(),
             held: 0,
         }
     }
@@ -347,16 +377,15 @@ impl Pool {
 
     /// The smallest free buffer of `needed` bytes at least and twice that at most.
     fn reuse(&mut self, needed: usize) -> Option<AlignedBuf> {
-        let fit = self
-            .by_capacity
-            .range(needed..=needed.saturating_mul(2))
-            .next()
-            .map(|(c, _)| *c)?;
-        let list = self.by_capacity.get_mut(&fit)?;
-        let buf = list.pop()?;
-        if list.is_empty() {
-            self.by_capacity.remove(&fit);
+        let at = self.free.partition_point(|b| b.capacity() < needed);
+        let fits = self
+            .free
+            .get(at)
+            .is_some_and(|b| b.capacity() <= needed.saturating_mul(2));
+        if !fits {
+            return None;
         }
+        let buf = self.free.remove(at);
         self.held = self.held.saturating_sub(buf.allocated());
         Some(buf)
     }
@@ -376,7 +405,8 @@ impl Pool {
         let allocated = buf.allocated();
         if self.held.saturating_add(allocated) <= self.limit {
             self.held = self.held.saturating_add(allocated);
-            self.by_capacity.entry(capacity).or_default().push(buf);
+            let at = self.free.partition_point(|b| b.capacity() <= capacity);
+            self.free.insert(at, buf);
         }
     }
 }
@@ -493,7 +523,7 @@ mod tests {
             pool.give(b);
         }
         assert_eq!(pool.held(), 0);
-        assert!(pool.by_capacity.is_empty());
+        assert!(pool.free.is_empty());
     }
 
     proptest! {

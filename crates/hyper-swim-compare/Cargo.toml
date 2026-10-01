@@ -1,0 +1,24 @@
+[package]
+name = "hyper-swim-compare"
+description = "hyper-swim measured against the detector it replaces, on one workload: slates' SWIM detector and wire (slates-cluster)."
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+license = "MIT"
+publish = false
+
+# A workspace of its own: slates-cluster is built from slates' repository at a pinned revision,
+# which the gates of this workspace do not fetch (docs/benchmarks.md).
+[workspace]
+
+[dependencies]
+hyper-swim = { path = "../hyper-swim" }
+hyper-measure = { path = "../hyper-measure" }
+# slates' detector, gossip, membership, coordinates and SWIM wire at slates `5cce86a`, unchanged
+# in those files since.
+slates-cluster = { git = "https://github.com/hyper-light/slates", rev = "5cce86aa4cae58b421d171756b24e4305797a3e8" }
+slates-db = { git = "https://github.com/hyper-light/slates", rev = "5cce86aa4cae58b421d171756b24e4305797a3e8" }
+
+[profile.release]
+lto = true
+debug = "line-tables-only"

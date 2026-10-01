@@ -29,7 +29,7 @@ use std::time::{Duration, Instant};
 
 use hyper_datagram::{AdmitAll, ExporterSecret, Plane, PlaneLimits, Role, SECRET_BYTES};
 use hyper_swim::HostId;
-use hyper_swim::codec::SwimMessage;
+use hyper_swim::codec::{Coordinate, GossipBatch, SwimMessage};
 use hyper_swim::detector::{Detector, DetectorTiming};
 use hyper_swim::membership::Liveness;
 
@@ -129,18 +129,23 @@ fn member_process() {
     let boot_nonce = me;
     let mut nonce = 0u64;
     let mut buffer = vec![0u8; 2_048];
+    // The gossip batch and the encoded message, reused every period as a member's driver does.
+    let mut batch = Vec::new();
+    let mut encoded = Vec::new();
     for period in 0..RUN_PERIODS {
         let deadline = Instant::now() + PERIOD;
         if let Some(ping) = detector.tick() {
             nonce += 1;
+            detector.ping_gossip_into(ping.to, GOSSIP_PER_MESSAGE, &mut batch);
             let message = SwimMessage::Ping {
                 from: HostId(me),
                 nonce,
                 boot_nonce,
                 configuration_version: 0,
-                gossip: detector.ping_gossip(ping.to, GOSSIP_PER_MESSAGE),
+                gossip: GossipBatch::Entries(&batch),
             };
-            plane.queue(ping.to.0, &message.encode()).unwrap();
+            message.encode_into(&mut encoded);
+            plane.queue(ping.to.0, &encoded).unwrap();
         }
         flush(&mut plane, &socket, &address);
         while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
@@ -154,29 +159,32 @@ fn member_process() {
             let Ok(opened) = plane.open(&mut buffer[..length], &AdmitAll) else {
                 continue;
             };
-            let messages: Vec<Vec<u8>> = opened.messages().map(<[u8]>::to_vec).collect();
-            for bytes in messages {
-                match SwimMessage::decode(&bytes).unwrap() {
+            // The messages borrow the datagram, not the plane, so acknowledgements queue as they
+            // are read.
+            for bytes in opened.messages() {
+                match SwimMessage::decode(bytes).unwrap() {
                     SwimMessage::Ping {
                         from,
                         nonce,
                         gossip,
                         ..
                     } => {
-                        detector.apply_gossip_from(from, &gossip);
+                        detector.apply_gossip_from(from, gossip);
+                        detector.gossip_into(GOSSIP_PER_MESSAGE, &mut batch);
                         let ack = SwimMessage::Ack {
                             from: HostId(me),
                             nonce,
                             boot_nonce,
                             configuration_version: 0,
                             standing: None,
-                            gossip: detector.gossip(GOSSIP_PER_MESSAGE),
-                            coordinate: detector.coordinate(),
+                            gossip: GossipBatch::Entries(&batch),
+                            coordinate: Coordinate::Held(detector.coordinate()),
                         };
-                        let _ = plane.queue(from.0, &ack.encode());
+                        ack.encode_into(&mut encoded);
+                        let _ = plane.queue(from.0, &encoded);
                     }
                     SwimMessage::Ack { from, gossip, .. } => {
-                        detector.apply_gossip_from(from, &gossip);
+                        detector.apply_gossip_from(from, gossip);
                         detector.on_ack(from);
                     }
                     _ => {}

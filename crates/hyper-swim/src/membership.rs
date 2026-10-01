@@ -15,7 +15,7 @@
 //! The merge is a pure, deterministic state machine — no clock, no I/O — so it is oracle-tested at
 //! N=1 and over a simulated exchange before any timer or datagram is involved.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::HostId;
 
@@ -81,6 +81,9 @@ pub struct Membership {
     local: HostId,
     local_incarnation: u64,
     members: BTreeMap<HostId, MemberState>,
+    /// The members `members` holds suspected, so the detector ages them each period without
+    /// scanning the membership.
+    suspected: BTreeSet<HostId>,
 }
 
 impl Membership {
@@ -98,6 +101,7 @@ impl Membership {
             local,
             local_incarnation: 0,
             members,
+            suspected: BTreeSet::new(),
         }
     }
 
@@ -122,6 +126,11 @@ impl Membership {
             return None;
         }
         self.members.insert(subject, update);
+        if update.liveness == Liveness::Suspect {
+            self.suspected.insert(subject);
+        } else {
+            self.suspected.remove(&subject);
+        }
         Some(Change::Adopted {
             member: subject,
             state: update,
@@ -150,12 +159,11 @@ impl Membership {
 
     /// The members currently believed alive (the local node included), in id order — the neighbourhood
     /// the configuration group and placement draw from.
-    pub fn alive(&self) -> Vec<HostId> {
+    pub fn alive(&self) -> impl Iterator<Item = HostId> + '_ {
         self.members
             .iter()
             .filter(|(_, state)| state.liveness == Liveness::Alive)
             .map(|(&host, _)| host)
-            .collect()
     }
 
     /// The known state of `member`, if any.
@@ -165,12 +173,12 @@ impl Membership {
 
     /// The members currently suspected, with their incarnations — the set the failure detector ages
     /// toward death (each still a member until confirmed dead or refuted).
-    pub fn suspects(&self) -> Vec<(HostId, u64)> {
-        self.members
-            .iter()
-            .filter(|(_, state)| state.liveness == Liveness::Suspect)
-            .map(|(&host, state)| (host, state.incarnation))
-            .collect()
+    pub fn suspects(&self) -> impl Iterator<Item = (HostId, u64)> + '_ {
+        self.suspected.iter().filter_map(|&host| {
+            self.members
+                .get(&host)
+                .map(|state| (host, state.incarnation))
+        })
     }
 
     /// The local node's current incarnation.
@@ -259,7 +267,7 @@ mod tests {
         view.apply(PEER, state(Liveness::Alive, 1));
         view.apply(HostId(3), state(Liveness::Dead, 1));
         assert_eq!(
-            view.alive(),
+            view.alive().collect::<Vec<_>>(),
             vec![LOCAL, PEER],
             "the dead member is excluded"
         );

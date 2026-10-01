@@ -36,9 +36,13 @@ impl ReplayWindow {
             .max(DEFAULT_WIDTH)
             .div_ceil(WORD_BITS)
             .saturating_mul(WORD_BITS);
+        // The bitmap is reserved to the limit now, at install, so widening on the receive path
+        // never reallocates: at most `limit / 8` bytes an epoch.
+        let mut seen = Vec::with_capacity(limit.checked_div(WORD_BITS).unwrap_or(0));
+        seen.resize(DEFAULT_WIDTH / WORD_BITS, 0);
         Self {
             right: None,
-            seen: vec![0; DEFAULT_WIDTH / WORD_BITS],
+            seen,
             limit,
         }
     }

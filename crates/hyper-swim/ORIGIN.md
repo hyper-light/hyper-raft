@@ -29,10 +29,36 @@
      probes) and the lag in whole periods, within `health_max`. They measure different things, so
      both stand (note 32 §6, item 4).
 
+4. **No allocation in a period** (`CLAUDE.md` §1a; `docs/benchmarks.md`, "hyper-swim"). slates'
+   detector allocated 6 times a member a period in a quiet cluster and 12 to 14.5 times while
+   membership churned, with 8 to 13 reallocations. Each source and its replacement:
+   - **The wire.** `SwimMessage` owned its gossip and coordinate, `encode` returned a new vector and
+     `decode` built both. A message now borrows them: `GossipBatch` and `Coordinate` are either what
+     the sender holds or the received bytes, checked whole by `decode` and read in place;
+     `encode_into` writes into the caller's buffer.
+   - **The batches.** `gossip`, `ping_gossip` and `request_indirect` returned new vectors; their
+     `_into` forms fill the caller's. `apply_gossip` and `apply_gossip_from` take any iterator of
+     entries, a received batch included.
+   - **The coordinates.** `coordinate` returned a copy and the Vivaldi step built a unit vector;
+     the coordinate is lent, the step reads each axis in place, and `learn_coordinate` overwrites a
+     held coordinate in place. A learned coordinate is kept only for a member this node probes and
+     dropped when it is declared dead, so they are bounded by the membership (slates kept every
+     peer's for ever).
+   - **The tick.** Ageing collected the suspects and the membership's alive list into new vectors,
+     scanning the whole membership each period. The membership now indexes its suspects, so ageing
+     visits only them; `alive` and `suspects` are iterators; a round's probe order reuses the last
+     round's vector.
+   - **The gossip queue.** Two `BTree`s allocated and freed nodes as reports came and went. The
+     reports are now a `HashMap` and one FIFO queue per transmit count, each keeping its capacity.
+     The least-transmitted report still goes first; among equals the oldest goes first, where
+     slates took the lowest host id. A replaced report's old entry is skipped when reached, and the
+     queues are purged whenever a record finds them over twice the pending reports, which bounds
+     them at twice the membership.
+
 ## Tests
 
-- 43 unit tests: slates' 39, plus the extension series and its bounds, exact delay by a grant, and
-  the lag's dilation.
+- 46 unit tests: slates' 39, plus the extension series and its bounds, exact delay by a grant, the
+  lag's dilation, and the gossip queue's order, replacement and bound.
 - `tests/cluster.rs`: four real member processes run the detector over hyper-datagram on real
   UDP sockets.
   - The supervisor starts them together, lets them settle, and SIGKILLs one.

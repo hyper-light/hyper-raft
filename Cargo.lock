@@ -275,6 +275,7 @@ version = "0.1.0"
 dependencies = [
  "aws-lc-rs",
  "crc32c",
+ "hyper-measure",
 ]
 
 [[package]]
@@ -328,6 +329,7 @@ name = "hyper-swim"
 version = "0.1.0"
 dependencies = [
  "hyper-datagram",
+ "hyper-measure",
 ]
 
 [[package]]

@@ -72,3 +72,19 @@ fn the_band_holds_the_ratio_of_every_two_halves() {
         (10.0, 8.0, 12.0)
     );
 }
+
+#[test]
+fn work_set_aside_is_in_the_total_and_apart() {
+    alloc::begin();
+    let measured: Vec<u8> = Vec::with_capacity(16);
+    alloc::aside();
+    let harness: Vec<u8> = Vec::with_capacity(48);
+    alloc::back();
+    let total = alloc::end();
+    let aside = alloc::read_aside();
+    drop((measured, harness));
+    assert_eq!((total.allocations, total.bytes), (2, 64));
+    assert_eq!((aside.allocations, aside.bytes), (1, 48));
+    let core = total.less(&aside);
+    assert_eq!((core.allocations, core.bytes), (1, 16));
+}

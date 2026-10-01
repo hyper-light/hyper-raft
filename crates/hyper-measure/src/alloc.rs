@@ -5,8 +5,12 @@
 //! thread only, in thread-local cells: no lock, no atomic, no allocation, and
 //! a thread that is not counting pays one thread-local read. A measurement
 //! runs on one thread and turns counting on around what it measures
-//! ([`begin`], [`pause`], [`resume`], [`end`]), so the harness around the
-//! measured calls is not charged to them.
+//! ([`begin`], [`pause`], [`resume`], [`end`]).
+//!
+//! Within a count, work that is the harness's own and not the code under
+//! measurement (an owner's storage, a simulated network) is set [`aside`]: it
+//! is counted in the total and also apart, so one run gives both what the
+//! whole loop did and what the measured calls did ([`Counts::less`]).
 //!
 //! Counts are per thread: a block one thread allocates and another frees is
 //! a free on the second. The measurements in this repository allocate and
@@ -54,6 +58,21 @@ impl Counts {
     pub fn calls(&self) -> u64 {
         self.allocations.saturating_add(self.reallocations)
     }
+    /// The events of `self` that are not in `aside`: what the measured calls
+    /// did when `aside` is what was set aside within the same count. Live
+    /// and peak bytes are not divided (a block may be allocated by one and
+    /// freed by the other), so they are zero here; the total's say them.
+    pub fn less(&self, aside: &Self) -> Self {
+        Self {
+            allocations: self.allocations.saturating_sub(aside.allocations),
+            reallocations: self.reallocations.saturating_sub(aside.reallocations),
+            moved: self.moved.saturating_sub(aside.moved),
+            frees: self.frees.saturating_sub(aside.frees),
+            bytes: self.bytes.saturating_sub(aside.bytes),
+            live: 0,
+            peak: 0,
+        }
+    }
 }
 
 thread_local! {
@@ -61,7 +80,9 @@ thread_local! {
     // they are readable for the whole life of the thread, its teardown
     // included, and reading them never allocates.
     static COUNTS: Cell<Counts> = const { Cell::new(Counts::ZERO) };
+    static ASIDE: Cell<Counts> = const { Cell::new(Counts::ZERO) };
     static ON: Cell<bool> = const { Cell::new(false) };
+    static SET_ASIDE: Cell<bool> = const { Cell::new(false) };
 }
 
 /// Bytes as a signed count. A block is at most `isize::MAX` bytes
@@ -73,17 +94,21 @@ fn signed(bytes: usize) -> i64 {
 /// Records one event on this thread when counting is on. Every counter wraps
 /// at its width, which no run of this repository approaches (2^64 events);
 /// wrapping is stated so that the allocator can never unwind.
-fn note(record: impl FnOnce(&mut Counts)) {
+fn note(record: impl Fn(&mut Counts)) {
     if !ON.try_with(Cell::get).unwrap_or(false) {
         return;
     }
-    // A thread whose cells are gone records nothing; it cannot be counting.
-    let _ = COUNTS.try_with(|cell| {
+    let apply = |cell: &Cell<Counts>| {
         let mut counts = cell.get();
         record(&mut counts);
         counts.peak = counts.peak.max(counts.live);
         cell.set(counts);
-    });
+    };
+    // A thread whose cells are gone records nothing; it cannot be counting.
+    let _ = COUNTS.try_with(apply);
+    if SET_ASIDE.try_with(Cell::get).unwrap_or(false) {
+        let _ = ASIDE.try_with(apply);
+    }
 }
 
 fn allocated(size: usize) {
@@ -123,7 +148,22 @@ fn reallocated(old: usize, new: usize, moved: bool) {
 /// Zeroes this thread's counts and turns counting on.
 pub fn begin() {
     let _ = COUNTS.try_with(|cell| cell.set(Counts::ZERO));
+    let _ = ASIDE.try_with(|cell| cell.set(Counts::ZERO));
+    let _ = SET_ASIDE.try_with(|aside| aside.set(false));
     let _ = ON.try_with(|on| on.set(true));
+}
+/// What follows is the harness's own work: counted in the total and apart,
+/// until [`back`].
+pub fn aside() {
+    let _ = SET_ASIDE.try_with(|aside| aside.set(true));
+}
+/// What follows is the measured code's again.
+pub fn back() {
+    let _ = SET_ASIDE.try_with(|aside| aside.set(false));
+}
+/// What was set aside so far in this count.
+pub fn read_aside() -> Counts {
+    ASIDE.try_with(Cell::get).unwrap_or(Counts::ZERO)
 }
 /// Turns counting off on this thread, keeping the counts.
 pub fn pause() {
@@ -147,7 +187,8 @@ pub fn end() -> Counts {
 /// zero.
 pub fn installed() -> bool {
     begin();
-    let probe: Vec<u8> = Vec::with_capacity(1);
+    // Kept from the optimizer, which may elide an allocation nothing reads.
+    let probe: Vec<u8> = std::hint::black_box(Vec::with_capacity(1));
     let counts = end();
     drop(probe);
     counts.allocations > 0

@@ -426,6 +426,33 @@ slates with its publication is slower than every other row by orders of magnitud
 (293,618 ns per entry on three voters): its durability copies the whole log after every
 transition, where hyper-raft's owner writes each entry once, in place.
 
+## The message's layout
+
+R-2 (`docs/raft.md` §3.1) made the message hyper-raft's own type, so its layout is hyper-raft's to
+choose. The snapshot a message may carry was held inline, as raft-proto held it: 144 of the
+message's 280 bytes, in every heartbeat, vote and append, though only a snapshot message fills it.
+It is now boxed (`Message::snapshot: Option<Box<Snapshot>>`): a message is 144 bytes, and a
+snapshot message makes one allocation more, for a box of 144 bytes beside the image it already
+carries.
+
+`hyper-raft-compare one hyper <workload> 3 1 64 20000 1000 count`, before (R-2, `d472677`) and
+after, per operation; the same machine and day, 2026-10-01 around 11:30 PDT, shared:
+
+| Workload | Bytes asked before | after | Allocations before | after |
+|---|---|---|---|---|
+| steady, per entry | 7,064 | 3,800 | 11 | 11 |
+| catch-up, per entry | 143.7 | 139.9 | 1.01 | 1.01 |
+| snapshot, per snapshot | 73,856 | 70,192 | 12 | 13 |
+| transfer, per transfer | 22,824 | 14,120 | 28 | 28 |
+
+slates' core asks 3,368 bytes and makes 51 allocations per entry on the steady workload at batch 1
+(`one slates-core steady 3 1 64 20000 1000 count`): the gap in bytes asked, 7,064 against 3,368
+in the tables above, is now 3,800 against 3,368. The remaining 432 bytes are not yet traced: the
+four-slot first queue (`Outgoing::SMALLEST`) the earlier trace named now asks 576 bytes a ready,
+more than the gap, so it is not the whole account. An entry's bytes for the byte rules are now arithmetic on its lengths
+(`proto::encoded_bytes`), where raft-proto's were prost's `encoded_len`: the "counting each
+entry's encoded length" item above is closed by R-2.
+
 ## End to end
 
 `crates/hyper-raft-e2e` runs each member as a process (`hyper-raft-node`) on a UDP socket on the

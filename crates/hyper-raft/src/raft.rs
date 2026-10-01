@@ -600,7 +600,7 @@ impl<S: Storage> Outbox<'_, S> {
             return Err(Error::Invariant("a snapshot that states nothing"));
         }
         message.msg_type = MessageType::MsgSnapshot;
-        message.snapshot = Some(snapshot);
+        message.snapshot = Some(Box::new(snapshot));
         progress.become_snapshot(index);
         Ok(true)
     }
@@ -2305,7 +2305,11 @@ impl<S: Storage> Raft<S> {
         self.send(answer)
     }
     fn handle_snapshot(&mut self, mut message: Message) -> Result<()> {
-        let snapshot = message.snapshot.take().unwrap_or_default();
+        let snapshot = message
+            .snapshot
+            .take()
+            .map(|snapshot| *snapshot)
+            .unwrap_or_default();
         let mut answer = proto::message(message.from, MessageType::MsgAppendResponse);
         answer.index = if self.restore(snapshot)? {
             self.log.last_index()?

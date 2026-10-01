@@ -169,7 +169,7 @@ fn what_a_peer_may_not_say_is_refused_and_changes_nothing() {
                 ..Default::default()
             });
         }
-        sent.snapshot = Some(stated);
+        sent.snapshot = Some(Box::new(stated));
         assert!(matches!(node.step(sent), Err(Error::Violation(_))));
         unchanged(&node, &hard, 3);
     }
@@ -967,7 +967,7 @@ fn storage_that_fails_stops_no_one_and_is_said() {
     assert_eq!(sent.len(), 1);
     assert_eq!(sent[0].msg_type, MessageType::MsgSnapshot);
     assert_eq!(
-        sent[0].snapshot.as_ref().map(proto::snapshot_index),
+        sent[0].snapshot.as_deref().map(proto::snapshot_index),
         Some(3)
     );
     assert_eq!(crate::raft::held(&node.raft), vec![(4, 1)]);

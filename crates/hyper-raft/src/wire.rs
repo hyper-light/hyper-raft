@@ -488,7 +488,7 @@ impl Record for Message {
         MESSAGE_FIXED_BYTES
             .saturating_add(self.context.len())
             .saturating_add(entries)
-            .saturating_add(self.snapshot.as_ref().map_or(0, Record::body_len))
+            .saturating_add(self.snapshot.as_deref().map_or(0, Record::body_len))
     }
     fn put_body(&self, out: &mut Vec<u8>) {
         out.push(message_kind(self.msg_type));
@@ -563,7 +563,7 @@ impl Record for Message {
             entries.push(Entry::take_body(reader)?);
         }
         let snapshot = if flags & HAS_SNAPSHOT != 0 {
-            Some(Snapshot::take_body(reader)?)
+            Some(Box::new(Snapshot::take_body(reader)?))
         } else {
             None
         };
@@ -692,7 +692,7 @@ mod tests {
             entries: vec![entry(), Entry::default()],
             commit: 40,
             commit_term: 6,
-            snapshot: Some(snapshot()),
+            snapshot: Some(Box::new(snapshot())),
             request_snapshot: 9,
             reject: true,
             reject_hint: 39,

@@ -284,7 +284,10 @@ pub fn message_from(message: old::Message) -> Message {
         entries: message.entries.iter().map(entry_from).collect(),
         commit: message.commit,
         commit_term: message.commit_term,
-        snapshot: message.snapshot.as_ref().map(snapshot_from),
+        snapshot: message
+            .snapshot
+            .as_ref()
+            .map(|snapshot| Box::new(snapshot_from(snapshot))),
         request_snapshot: message.request_snapshot,
         reject: message.reject,
         reject_hint: message.reject_hint,
@@ -303,7 +306,7 @@ pub fn message_to(message: &Message) -> old::Message {
         entries: message.entries.iter().map(entry_to).collect(),
         commit: message.commit,
         commit_term: message.commit_term,
-        snapshot: message.snapshot.as_ref().map(snapshot_to),
+        snapshot: message.snapshot.as_deref().map(snapshot_to),
         request_snapshot: message.request_snapshot,
         reject: message.reject,
         reject_hint: message.reject_hint,

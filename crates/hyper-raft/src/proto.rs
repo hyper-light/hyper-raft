@@ -119,8 +119,9 @@ pub struct Message {
     pub commit: u64,
     /// The term of the entry at `commit`.
     pub commit_term: u64,
-    /// The snapshot carried.
-    pub snapshot: Option<Snapshot>,
+    /// The snapshot carried, boxed: only a snapshot message holds one, and inline its 144 bytes
+    /// would ride in every message (`docs/benchmarks.md`, "The message's layout").
+    pub snapshot: Option<Box<Snapshot>>,
     /// The index a follower asks a snapshot from.
     pub request_snapshot: u64,
     /// Whether the request is refused.

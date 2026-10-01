@@ -158,7 +158,7 @@ fn version_negotiate_client() {
         None,
     );
     let (_, mut client_ch) = client
-        .connect(Instant::now(), client_config(), server_addr, "localhost")
+        .connect(Instant::now(), client_config(), server_addr, "localhost", None)
         .unwrap();
     let now = Instant::now();
     let mut buf = Vec::with_capacity(client.config().get_max_udp_payload_size() as usize);
@@ -956,10 +956,10 @@ fn alpn_mismatch() {
 fn stream_id_limit() {
     let _guard = subscribe();
     let server = ServerConfig {
-        transport: Arc::new(TransportConfig {
+        transport: TransportConfig {
             max_concurrent_uni_streams: 1u32.into(),
             ..TransportConfig::default()
-        }),
+        },
         ..server_config()
     };
     let mut pair = Pair::new(Default::default(), server);
@@ -1044,10 +1044,10 @@ fn stream_id_limit() {
 fn data_blocked() {
     let _guard = subscribe();
     let server = ServerConfig {
-        transport: Arc::new(TransportConfig {
+        transport: TransportConfig {
             receive_window: 10u32.into(),
             ..TransportConfig::default()
-        }),
+        },
         ..server_config()
     };
     let mut pair = Pair::new(Default::default(), server);
@@ -1122,10 +1122,10 @@ fn data_blocked() {
 fn stream_data_blocked() {
     let _guard = subscribe();
     let server = ServerConfig {
-        transport: Arc::new(TransportConfig {
+        transport: TransportConfig {
             stream_receive_window: 10u32.into(),
             ..TransportConfig::default()
-        }),
+        },
         ..server_config()
     };
     let mut pair = Pair::new(Default::default(), server);
@@ -1244,10 +1244,10 @@ fn data_blocked_not_sent_for_local_send_window() {
 fn data_blocked_dropped_when_limit_raised() {
     let _guard = subscribe();
     let server = ServerConfig {
-        transport: Arc::new(TransportConfig {
+        transport: TransportConfig {
             receive_window: 10u32.into(),
             ..TransportConfig::default()
-        }),
+        },
         ..server_config()
     };
     let mut pair = Pair::new(Default::default(), server);
@@ -1284,10 +1284,10 @@ fn data_blocked_dropped_when_limit_raised() {
 fn stream_data_blocked_not_sent_after_reset() {
     let _guard = subscribe();
     let server = ServerConfig {
-        transport: Arc::new(TransportConfig {
+        transport: TransportConfig {
             stream_receive_window: 10u32.into(),
             ..TransportConfig::default()
-        }),
+        },
         ..server_config()
     };
     let mut pair = Pair::new(Default::default(), server);
@@ -1318,10 +1318,10 @@ fn stream_data_blocked_not_sent_after_reset() {
 fn data_blocked_retransmit() {
     let _guard = subscribe();
     let server = ServerConfig {
-        transport: Arc::new(TransportConfig {
+        transport: TransportConfig {
             receive_window: 10u32.into(),
             ..TransportConfig::default()
-        }),
+        },
         ..server_config()
     };
     let mut pair = Pair::new(Default::default(), server);
@@ -1567,10 +1567,10 @@ fn idle_timeout() {
     let _guard = subscribe();
     const IDLE_TIMEOUT: u64 = 100;
     let server = ServerConfig {
-        transport: Arc::new(TransportConfig {
+        transport: TransportConfig {
             max_idle_timeout: Some(VarInt(IDLE_TIMEOUT)),
             ..TransportConfig::default()
-        }),
+        },
         ..server_config()
     };
     let mut pair = Pair::new(Default::default(), server);
@@ -1694,7 +1694,7 @@ fn test_flow_control(config: TransportConfig, window_size: usize) {
     let mut pair = Pair::new(
         Default::default(),
         ServerConfig {
-            transport: Arc::new(config),
+            transport: config,
             ..server_config()
         },
     );
@@ -1907,11 +1907,11 @@ fn keep_alive() {
     let _guard = subscribe();
     const IDLE_TIMEOUT: u64 = 10;
     let server = ServerConfig {
-        transport: Arc::new(TransportConfig {
+        transport: TransportConfig {
             keep_alive_interval: Some(Duration::from_millis(IDLE_TIMEOUT / 2)),
             max_idle_timeout: Some(VarInt(IDLE_TIMEOUT)),
             ..TransportConfig::default()
-        }),
+        },
         ..server_config()
     };
     let mut pair = Pair::new(Default::default(), server);
@@ -2300,11 +2300,11 @@ fn datagram_recv_buffer_overflow() {
     const METADATA_WINDOW: usize = 2 * size_of::<Datagram>();
     const WINDOW: usize = PAYLOAD_WINDOW + METADATA_WINDOW;
     let server = ServerConfig {
-        transport: Arc::new(TransportConfig {
+        transport: TransportConfig {
             // Account for exactly two datagrams of metadata space
             datagram_receive_buffer_size: Some(WINDOW),
             ..TransportConfig::default()
-        }),
+        },
         ..server_config()
     };
     let mut pair = Pair::new(Default::default(), server);
@@ -2522,10 +2522,10 @@ fn datagram_send_buffer_blocks_until_drained() {
 fn datagram_unsupported() {
     let _guard = subscribe();
     let server = ServerConfig {
-        transport: Arc::new(TransportConfig {
+        transport: TransportConfig {
             datagram_receive_buffer_size: None,
             ..TransportConfig::default()
-        }),
+        },
         ..server_config()
     };
     let mut pair = Pair::new(Default::default(), server);
@@ -2680,10 +2680,10 @@ fn finish_retransmit() {
 fn repeated_request_response() {
     let _guard = subscribe();
     let server = ServerConfig {
-        transport: Arc::new(TransportConfig {
+        transport: TransportConfig {
             max_concurrent_bidi_streams: 1u32.into(),
             ..TransportConfig::default()
-        }),
+        },
         ..server_config()
     };
     let mut pair = Pair::new(Default::default(), server);
@@ -2967,11 +2967,9 @@ fn connect_runs_mtud_again_after_600_seconds() {
 
     // Note: we use an infinite idle timeout to ensure we can wait 600 seconds without the
     // connection closing
-    Arc::get_mut(&mut server_config.transport)
-        .unwrap()
+    server_config.transport
         .max_idle_timeout(None);
-    Arc::get_mut(&mut client_config.transport)
-        .unwrap()
+    client_config.transport
         .max_idle_timeout(None);
 
     let mut pair = Pair::new(Default::default(), server_config);
@@ -3288,8 +3286,7 @@ fn setup_ack_frequency_test(max_ack_delay: Duration) -> (Pair, ConnectionHandle,
     ack_freq_config
         .ack_eliciting_threshold(10u32.into())
         .max_ack_delay(Some(max_ack_delay));
-    Arc::get_mut(&mut client_config.transport)
-        .unwrap()
+    client_config.transport
         .ack_frequency_config(Some(ack_freq_config))
         .mtu_discovery_config(None); // To keep traffic cleaner
 

@@ -268,7 +268,7 @@ impl PacketBuilder {
         );
 
         let len = buffer.len() - encode_start;
-        conn.config.qlog_sink.emit_packet_sent(
+        conn.qlog.emit_packet_sent(
             self.exact_number,
             len,
             self.space,

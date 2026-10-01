@@ -1,12 +1,10 @@
-use std::{fmt, sync::Arc};
-use std::{io, sync::Mutex, time::Instant};
+use std::{fmt, io, time::Instant};
 
 use qlog::streamer::QlogStreamer;
 
 use crate::QlogStream;
 use crate::{
     Duration, INITIAL_MTU, MAX_UDP_PAYLOAD, VarInt, VarIntBoundsExceeded, congestion,
-    connection::qlog::QlogSink,
 };
 
 /// Parameters governing the core QUIC state machine
@@ -21,6 +19,7 @@ use crate::{
 /// for higher bandwidths and latencies increases worst-case memory consumption, but does not impair
 /// performance at lower bandwidths and latencies. The default configuration is tuned for a 100Mbps
 /// link with a 100ms round trip time.
+#[derive(Clone)]
 pub struct TransportConfig {
     pub(crate) max_concurrent_bidi_streams: VarInt,
     pub(crate) max_concurrent_uni_streams: VarInt,
@@ -51,8 +50,6 @@ pub struct TransportConfig {
     pub(crate) congestion: congestion::Congestion,
 
     pub(crate) enable_segmentation_offload: bool,
-
-    pub(crate) qlog_sink: QlogSink,
 }
 
 impl TransportConfig {
@@ -343,11 +340,6 @@ impl TransportConfig {
         self
     }
 
-    /// qlog capture configuration to use for a particular connection
-    pub fn qlog_stream(&mut self, stream: Option<QlogStream>) -> &mut Self {
-        self.qlog_sink = stream.into();
-        self
-    }
 }
 
 impl Default for TransportConfig {
@@ -390,7 +382,6 @@ impl Default for TransportConfig {
 
             enable_segmentation_offload: true,
 
-            qlog_sink: QlogSink::default(),
         }
     }
 }
@@ -423,7 +414,6 @@ impl fmt::Debug for TransportConfig {
                 deterministic_packet_numbers: _,
             congestion,
             enable_segmentation_offload,
-            qlog_sink,
         } = self;
         let mut s = fmt.debug_struct("TransportConfig");
 
@@ -453,7 +443,6 @@ impl fmt::Debug for TransportConfig {
             .field("datagram_send_buffer_size", datagram_send_buffer_size)
             .field("congestion", congestion)
             .field("enable_segmentation_offload", enable_segmentation_offload);
-        s.field("qlog_stream", &qlog_sink.is_enabled());
 
         s.finish_non_exhaustive()
     }
@@ -537,6 +526,17 @@ impl Default for AckFrequencyConfig {
     }
 }
 
+/// Why a qlog stream could not be started
+#[derive(Debug, thiserror::Error)]
+pub enum QlogError {
+    /// No writer was configured
+    #[error("no qlog writer was configured")]
+    NoWriter,
+    /// The qlog streamer could not write its header
+    #[error("the qlog streamer could not start: {0}")]
+    Start(#[from] qlog::Error),
+}
+
 /// Configuration for qlog trace logging
 pub struct QlogConfig {
     writer: Option<Box<dyn io::Write + Send + Sync>>,
@@ -571,10 +571,8 @@ impl QlogConfig {
     }
 
     /// Construct the [`QlogStream`] described by this configuration
-    pub fn into_stream(self) -> Option<QlogStream> {
-        use tracing::warn;
-
-        let writer = self.writer?;
+    pub fn into_stream(self) -> Result<QlogStream, QlogError> {
+        let writer = self.writer.ok_or(QlogError::NoWriter)?;
         let trace = qlog::TraceSeq::new(
             qlog::VantagePoint {
                 name: None,
@@ -601,13 +599,8 @@ impl QlogConfig {
             writer,
         );
 
-        match streamer.start_log() {
-            Ok(()) => Some(QlogStream(Arc::new(Mutex::new(streamer)))),
-            Err(e) => {
-                warn!("could not initialize endpoint qlog streamer: {e}");
-                None
-            }
-        }
+        streamer.start_log()?;
+        Ok(QlogStream(streamer))
     }
 }
 

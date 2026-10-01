@@ -15,7 +15,7 @@ use thiserror::Error;
 use tracing::{debug, error, trace, trace_span, warn};
 
 use crate::{
-    Dir, Duration, EndpointConfig, Frame, INITIAL_MTU, Instant, MAX_CID_SIZE, MAX_STREAM_COUNT,
+    Dir, Duration, Frame, INITIAL_MTU, Instant, MAX_CID_SIZE, MAX_STREAM_COUNT,
     MIN_INITIAL_SIZE, Side, StreamId, TIMER_GRANULARITY, TokenStore, Transmit, TransportError,
     TransportErrorCode, VarInt,
     cid_generator::ConnectionIdGenerator,
@@ -64,6 +64,7 @@ pub use paths::RttEstimator;
 use paths::{PathData, PathResponses};
 
 pub(crate) mod qlog;
+use qlog::QlogSink;
 
 mod send_buffer;
 
@@ -131,8 +132,10 @@ use timer::{Timer, TimerTable};
 /// call to [`handle_event`](Self::handle_event) at that same instant; however
 /// events or timeouts with different instants must not be interleaved.
 pub struct Connection {
-    endpoint_config: Arc<EndpointConfig>,
-    config: Arc<TransportConfig>,
+    /// Whether to grease the QUIC bit (RFC 9287), from the endpoint's configuration
+    grease_quic_bit: bool,
+    config: TransportConfig,
+    qlog: QlogSink,
     rng: StdRng,
     crypto: Box<dyn crypto::Session>,
     /// The CID we initially chose, for use during the handshake
@@ -249,8 +252,9 @@ pub struct Connection {
 
 impl Connection {
     pub(crate) fn new(
-        endpoint_config: Arc<EndpointConfig>,
-        config: Arc<TransportConfig>,
+        grease_quic_bit: bool,
+        config: TransportConfig,
+        qlog: QlogSink,
         init_cid: ConnectionId,
         loc_cid: ConnectionId,
         rem_cid: ConnectionId,
@@ -279,7 +283,8 @@ impl Connection {
         });
         let mut rng = StdRng::from_seed(rng_seed);
         let mut this = Self {
-            endpoint_config,
+            grease_quic_bit,
+            qlog,
             crypto,
             handshake_cid: loc_cid,
             rem_handshake_cid: rem_cid,
@@ -939,7 +944,7 @@ impl Connection {
                 .congestion
                 .on_sent(now, buf.len() as u64, last_packet_number);
 
-            self.config.qlog_sink.emit_recovery_metrics(
+            self.qlog.emit_recovery_metrics(
                 self.pto_count,
                 &mut self.path,
                 now,
@@ -1154,7 +1159,7 @@ impl Connection {
                     self.handle_coalesced(now, remote, ecn, data);
                 }
 
-                self.config.qlog_sink.emit_recovery_metrics(
+                self.qlog.emit_recovery_metrics(
                     self.pto_count,
                     &mut self.path,
                     now,
@@ -1212,7 +1217,7 @@ impl Connection {
                 Timer::LossDetection => {
                     self.on_loss_detection_timeout(now);
 
-                    self.config.qlog_sink.emit_recovery_metrics(
+                    self.qlog.emit_recovery_metrics(
                         self.pto_count,
                         &mut self.path,
                         now,
@@ -1778,7 +1783,7 @@ impl Connection {
 
             for &packet in &lost_packets {
                 let info = self.spaces[pn_space].take(packet).unwrap(); // safe: lost_packets is populated just above
-                self.config.qlog_sink.emit_packet_lost(
+                self.qlog.emit_packet_lost(
                     packet,
                     &info,
                     loss_delay,
@@ -1973,7 +1978,7 @@ impl Connection {
             self.spin = self.side.is_client() ^ spin;
         }
 
-        self.config.qlog_sink.emit_packet_received(
+        self.qlog.emit_packet_received(
             packet,
             space_id,
             !is_1rtt,
@@ -2049,7 +2054,7 @@ impl Connection {
             self.handle_coalesced(now, remote, ecn, data);
         }
 
-        self.config.qlog_sink.emit_recovery_metrics(
+        self.qlog.emit_recovery_metrics(
             self.pto_count,
             &mut self.path,
             now,
@@ -2244,7 +2249,7 @@ impl Connection {
                 data,
                 &FixedLengthConnectionIdParser::new(self.local_cid_state.cid_len()),
                 &[self.version],
-                self.endpoint_config.grease_quic_bit,
+                self.grease_quic_bit,
             ) {
                 Ok((partial_decode, rest)) => {
                     remaining = rest;

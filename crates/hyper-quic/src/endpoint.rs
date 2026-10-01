@@ -19,7 +19,7 @@ use tracing::{debug, error, trace, warn};
 
 use crate::{
     Duration, INITIAL_MTU, Instant, MAX_CID_SIZE, MIN_INITIAL_SIZE, RESET_TOKEN_SIZE, ResetToken,
-    Side, Transmit, TransportConfig, TransportError,
+    QlogStream, Side, Transmit, TransportConfig, TransportError,
     cid_generator::ConnectionIdGenerator,
     coding::BufMutExt,
     config::{ClientConfig, EndpointConfig, ServerConfig},
@@ -341,6 +341,7 @@ impl Endpoint {
         config: ClientConfig,
         remote: SocketAddr,
         server_name: &str,
+        qlog: Option<QlogStream>,
     ) -> Result<(ConnectionHandle, Connection), ConnectError> {
         if self.cids_exhausted() {
             return Err(ConnectError::CidsExhausted);
@@ -382,6 +383,7 @@ impl Endpoint {
             now,
             tls,
             config.transport,
+            qlog,
             SideArgs::Client {
                 token_store: config.token_store,
                 server_name: server_name.into(),
@@ -552,6 +554,7 @@ impl Endpoint {
         now: Instant,
         buf: &mut Vec<u8>,
         server_config: Option<Arc<ServerConfig>>,
+        qlog: Option<QlogStream>,
     ) -> Result<(ConnectionHandle, Connection), AcceptError> {
         let remote_address_validated = incoming.remote_address_validated();
         incoming.improper_drop_warner.dismiss();
@@ -654,6 +657,7 @@ impl Endpoint {
             incoming.received_at,
             tls,
             transport_config,
+            qlog,
             SideArgs::Server {
                 server_config,
                 pref_addr_cid,
@@ -817,7 +821,8 @@ impl Endpoint {
         addresses: FourTuple,
         now: Instant,
         tls: Box<dyn crypto::Session>,
-        transport_config: Arc<TransportConfig>,
+        transport_config: TransportConfig,
+        qlog: Option<QlogStream>,
         side_args: SideArgs,
     ) -> Connection {
         let mut rng_seed = [0; 32];
@@ -825,8 +830,9 @@ impl Endpoint {
         let side = side_args.side();
         let pref_addr_cid = side_args.pref_addr_cid();
         let conn = Connection::new(
-            self.config.clone(),
+            self.config.grease_quic_bit,
             transport_config,
+            qlog.into(),
             init_cid,
             loc_cid,
             rem_cid,

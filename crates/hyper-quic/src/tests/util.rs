@@ -49,7 +49,7 @@ impl Pair {
         let mut cfg = server_config();
         let mut transport = TransportConfig::default();
         transport.deterministic_packet_numbers(true);
-        cfg.transport = Arc::new(transport);
+        cfg.transport = transport;
         Self::new(Default::default(), cfg)
     }
 
@@ -212,7 +212,7 @@ impl Pair {
         let _guard = span.enter();
         let (client_ch, client_conn) = self
             .client
-            .connect(self.time, config, self.server.addr, "localhost")
+            .connect(self.time, config, self.server.addr, "localhost", None)
             .unwrap();
         self.client.connections.insert(client_ch, client_conn);
         client_ch
@@ -471,7 +471,7 @@ impl TestEndpoint {
         now: Instant,
     ) -> Result<ConnectionHandle, ConnectionError> {
         let mut buf = Vec::new();
-        match self.endpoint.accept(incoming, now, &mut buf, None) {
+        match self.endpoint.accept(incoming, now, &mut buf, None, None) {
             Ok((ch, conn)) => {
                 self.connections.insert(ch, conn);
                 self.accepted = Some(Ok(ch));
@@ -617,7 +617,7 @@ pub(super) fn client_config_with_deterministic_pns() -> ClientConfig {
     let mut cfg = ClientConfig::new(Arc::new(client_crypto()));
     let mut transport = TransportConfig::default();
     transport.deterministic_packet_numbers(true);
-    cfg.transport = Arc::new(transport);
+    cfg.transport = transport;
     cfg
 }
 

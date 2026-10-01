@@ -1,7 +1,3 @@
-// Function bodies in this module are regularly cfg'd out
-#![allow(unused_variables)]
-
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use qlog::{
@@ -21,45 +17,37 @@ use crate::{
     packet::SpaceId,
 };
 
-/// Shareable handle to a single qlog output stream
-#[derive(Clone)]
-pub struct QlogStream(pub(crate) Arc<Mutex<QlogStreamer>>);
+/// One connection's qlog output stream, owned by that connection
+pub struct QlogStream(pub(crate) QlogStreamer);
 
 impl QlogStream {
-    fn emit_event(&self, orig_rem_cid: ConnectionId, event: EventData, now: Instant) {
+    fn emit_event(&mut self, orig_rem_cid: ConnectionId, event: EventData, now: Instant) {
         // Time will be overwritten by `add_event_with_instant`
         let mut event = Event::with_time(0.0, event);
         event.group_id = Some(orig_rem_cid.to_string());
 
-        let mut qlog_streamer = self.0.lock().unwrap();
-        if let Err(e) = qlog_streamer.add_event_with_instant(event, now) {
+        if let Err(e) = self.0.add_event_with_instant(event, now) {
             warn!("could not emit qlog event: {e}");
         }
     }
 }
 
-/// A [`QlogStream`] that may be either dynamically disabled or compiled out entirely
-#[derive(Clone, Default)]
+/// A connection's [`QlogStream`], if it has one
+#[derive(Default)]
 pub(crate) struct QlogSink {
     stream: Option<QlogStream>,
 }
 
 impl QlogSink {
-    pub(crate) fn is_enabled(&self) -> bool {
-        {
-            self.stream.is_some()
-        }
-    }
-
     pub(super) fn emit_recovery_metrics(
-        &self,
+        &mut self,
         pto_count: u32,
         path: &mut PathData,
         now: Instant,
         orig_rem_cid: ConnectionId,
     ) {
         {
-            let Some(stream) = self.stream.as_ref() else {
+            let Some(stream) = self.stream.as_mut() else {
                 return;
             };
 
@@ -72,7 +60,7 @@ impl QlogSink {
     }
 
     pub(super) fn emit_packet_lost(
-        &self,
+        &mut self,
         pn: u64,
         info: &SentPacket,
         loss_delay: Duration,
@@ -81,7 +69,7 @@ impl QlogSink {
         orig_rem_cid: ConnectionId,
     ) {
         {
-            let Some(stream) = self.stream.as_ref() else {
+            let Some(stream) = self.stream.as_mut() else {
                 return;
             };
 
@@ -106,7 +94,7 @@ impl QlogSink {
     }
 
     pub(super) fn emit_packet_sent(
-        &self,
+        &mut self,
         pn: u64,
         len: usize,
         space: SpaceId,
@@ -115,7 +103,7 @@ impl QlogSink {
         orig_rem_cid: ConnectionId,
     ) {
         {
-            let Some(stream) = self.stream.as_ref() else {
+            let Some(stream) = self.stream.as_mut() else {
                 return;
             };
 
@@ -134,7 +122,7 @@ impl QlogSink {
     }
 
     pub(super) fn emit_packet_received(
-        &self,
+        &mut self,
         pn: u64,
         space: SpaceId,
         is_0rtt: bool,
@@ -142,7 +130,7 @@ impl QlogSink {
         orig_rem_cid: ConnectionId,
     ) {
         {
-            let Some(stream) = self.stream.as_ref() else {
+            let Some(stream) = self.stream.as_mut() else {
                 return;
             };
 

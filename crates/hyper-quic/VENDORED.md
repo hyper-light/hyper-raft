@@ -24,3 +24,19 @@ Upstream's own tests are the oracle that conformance changed no behaviour.
 - **Oracle.** 303 unit tests and 3 doctests pass. That is upstream's suite under this one
   configuration; the ring default ran 296 unit tests because the bloom-gated token tests were
   off.
+
+## 2. Configuration without `Arc` (docs/transport.md §3.1), in progress
+
+1. **Congestion control is the closed enum `congestion::Congestion`, carried by value.**
+   - `ControllerFactory` and `TransportConfig::congestion_controller_factory` are gone; use
+     `TransportConfig::congestion`.
+   - Each controller owns its config.
+2. **A connection owns its `TransportConfig`**, which is now `Clone` plain data.
+   - `ServerConfig::transport` and `ClientConfig`'s transport hold it by value.
+   - A connection keeps only `grease_quic_bit` from the endpoint's configuration.
+3. **qlog belongs to the connection.**
+   - `QlogStream` owns its streamer, with no `Arc<Mutex<_>>`.
+   - It is passed to `Endpoint::connect` and `Endpoint::accept`; `TransportConfig::qlog_stream`
+     is gone.
+   - `QlogConfig::into_stream` returns `Result<QlogStream, QlogError>`. A missing writer or a
+     failed header write used to be logged and dropped.

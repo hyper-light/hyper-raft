@@ -20,7 +20,7 @@ use crate::{
 };
 
 mod transport;
-pub use transport::QlogConfig;
+pub use transport::{QlogConfig, QlogError};
 pub use transport::{AckFrequencyConfig, IdleTimeout, MtuDiscoveryConfig, TransportConfig};
 
 /// Global configuration for the endpoint, affecting all connections
@@ -185,7 +185,7 @@ impl Default for EndpointConfig {
 #[derive(Clone)]
 pub struct ServerConfig {
     /// Transport configuration to use for incoming connections
-    pub transport: Arc<TransportConfig>,
+    pub transport: TransportConfig,
 
     /// TLS configuration used for incoming connections
     ///
@@ -224,7 +224,7 @@ impl ServerConfig {
         token_key: Arc<dyn HandshakeTokenKey>,
     ) -> Self {
         Self {
-            transport: Arc::new(TransportConfig::default()),
+            transport: TransportConfig::default(),
             crypto,
 
             token_key,
@@ -246,7 +246,7 @@ impl ServerConfig {
     }
 
     /// Set a custom [`TransportConfig`]
-    pub fn transport_config(&mut self, transport: Arc<TransportConfig>) -> &mut Self {
+    pub fn transport_config(&mut self, transport: TransportConfig) -> &mut Self {
         self.transport = transport;
         self
     }
@@ -533,7 +533,7 @@ impl fmt::Debug for ValidationTokenConfig {
 #[non_exhaustive]
 pub struct ClientConfig {
     /// Transport configuration to use
-    pub(crate) transport: Arc<TransportConfig>,
+    pub(crate) transport: TransportConfig,
 
     /// Cryptographic configuration to use
     pub(crate) crypto: Arc<dyn crypto::ClientConfig>,
@@ -579,7 +579,7 @@ impl ClientConfig {
     }
 
     /// Set a custom [`TransportConfig`]
-    pub fn transport_config(&mut self, transport: Arc<TransportConfig>) -> &mut Self {
+    pub fn transport_config(&mut self, transport: TransportConfig) -> &mut Self {
         self.transport = transport;
         self
     }

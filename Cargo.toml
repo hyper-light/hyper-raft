@@ -1,0 +1,63 @@
+[workspace]
+resolver = "3"
+# The shared crates (transport, consensus) consumed by slates, focal and mantle. A crate joins the
+# members only once it meets every rule below (CLAUDE.md).
+members = ["crates/*"]
+# Vendored upstream sources are staged here, outside the build and the lint wall, until they are
+# conformed into a member crate (vendor/*/VENDORED.md).
+exclude = ["vendor"]
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/hyper-light/hyper-raft"
+rust-version = "1.98"
+
+[workspace.lints.rust]
+# Allowed only in the OS-interface files scripts/check-contracts.py lists, each block commented.
+unsafe_code = "deny"
+unsafe_op_in_unsafe_fn = "deny"
+missing_docs = "deny"
+unused_must_use = "deny"
+unreachable_pub = "warn"
+# `--cfg loom` and `--cfg shuttle` select the interleaving and randomized-schedule tests.
+unexpected_cfgs = { level = "deny", check-cfg = ["cfg(loom)", "cfg(shuttle)"] }
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+# No shared ownership or locks, and no disk writes: the disallowed types and methods are listed in
+# clippy.toml with reasons. The union of slates', focal's and mantle's rules is the floor (CLAUDE.md).
+disallowed_types = "deny"
+disallowed_methods = "deny"
+# Every unsafe block carries a `// SAFETY:` line stating the invariant that makes it sound.
+undocumented_unsafe_blocks = "deny"
+# The no-panic law: typed refusals, never panics, outside tests (clippy.toml allows tests).
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+unreachable = "deny"
+dbg_macro = "deny"
+exit = "deny"
+# Indexing, slicing and arithmetic that can go out of bounds, overflow or divide by zero unwind:
+# use `.get()`, `checked_*` (`saturating_*` only where saturation is the stated meaning).
+indexing_slicing = "deny"
+string_slice = "deny"
+arithmetic_side_effects = "deny"
+# The assert family and print macros are listed in clippy.toml.
+disallowed_macros = "deny"
+panic_in_result_fn = "deny"
+unwrap_in_result = "deny"
+# Integers are checked: a narrowing `as` is a review failure; use `try_from`.
+cast_possible_truncation = "deny"
+cast_sign_loss = "deny"
+cast_possible_wrap = "deny"
+# Bounded functions: the threshold is a ratified shape constant in clippy.toml.
+cognitive_complexity = "deny"
+mem_forget = "deny"
+missing_safety_doc = "deny"
+missing_panics_doc = "deny"
+
+[profile.release]
+lto = true

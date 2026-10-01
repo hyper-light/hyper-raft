@@ -1,0 +1,62 @@
+# Lint configuration for the workspace: the union of slates', focal's and mantle's walls (CLAUDE.md).
+
+# slates' ratified shape constant (slates GAPS §5): the lowest threshold its reference crates pass.
+# It only ratchets down. A function above it is split, never allowed.
+cognitive-complexity-threshold = 10
+
+# The no-panic law applies to shipped code; tests may unwrap, expect, panic and dbg.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true
+allow-dbg-in-tests = true
+allow-indexing-slicing-in-tests = true
+
+# Each unwinds or bypasses typed errors; test code opts out at its crate root.
+disallowed-macros = [
+  { path = "std::assert", reason = "unwinds; return a typed error" },
+  { path = "std::assert_eq", reason = "unwinds; return a typed error" },
+  { path = "std::assert_ne", reason = "unwinds; return a typed error" },
+  { path = "std::debug_assert", reason = "a check that exists only in debug builds is a check production skips; return a typed error" },
+  { path = "std::debug_assert_eq", reason = "as debug_assert" },
+  { path = "std::debug_assert_ne", reason = "as debug_assert" },
+  { path = "core::assert", reason = "unwinds; return a typed error" },
+  { path = "core::assert_eq", reason = "unwinds; return a typed error" },
+  { path = "core::assert_ne", reason = "unwinds; return a typed error" },
+  { path = "core::debug_assert", reason = "as debug_assert" },
+  { path = "core::debug_assert_eq", reason = "as debug_assert" },
+  { path = "core::debug_assert_ne", reason = "as debug_assert" },
+  { path = "std::print", reason = "libraries report through return values and tracing" },
+  { path = "std::println", reason = "libraries report through return values and tracing" },
+  { path = "std::eprint", reason = "libraries report through return values and tracing" },
+  { path = "std::eprintln", reason = "libraries report through return values and tracing" },
+]
+
+# No atomic reference counting and no locks (slates R2, D-7, D-8; mantle's no-Arc rule). There is no
+# foreign-API exception: quinn-proto and rustls are vendored and conformed (mantle note 32 §6).
+disallowed-types = [
+  { path = "std::sync::Arc", reason = "ownership is by single owner, arena and generational handle; sharing is a move over a bounded channel or an epoch-published immutable root." },
+  { path = "std::rc::Rc", reason = "as Arc." },
+  { path = "std::sync::Mutex", reason = "no locks: single owners and moves over bounded channels." },
+  { path = "std::sync::RwLock", reason = "as Mutex." },
+  { path = "std::sync::Condvar", reason = "broadcast wakes are O(n) in the kernel and panicked macOS (mantle note 26); completions go through std::task::Waker, one to one." },
+]
+
+# The crates are sans-io and in-memory. hyper-log, which owns its device files, allows these in its
+# device module only, with the reason in place.
+disallowed-methods = [
+  { path = "std::fs::write", reason = "sans-io: only hyper-log's device module writes files." },
+  { path = "std::fs::create_dir", reason = "sans-io; see std::fs::write." },
+  { path = "std::fs::create_dir_all", reason = "sans-io; see std::fs::write." },
+  { path = "std::fs::remove_file", reason = "sans-io; see std::fs::write." },
+  { path = "std::fs::remove_dir", reason = "sans-io; see std::fs::write." },
+  { path = "std::fs::remove_dir_all", reason = "sans-io; see std::fs::write." },
+  { path = "std::fs::rename", reason = "sans-io; see std::fs::write." },
+  { path = "std::fs::hard_link", reason = "sans-io; see std::fs::write." },
+  { path = "std::fs::copy", reason = "sans-io; see std::fs::write." },
+  { path = "std::fs::set_permissions", reason = "sans-io; see std::fs::write." },
+  { path = "std::fs::File::create", reason = "sans-io; see std::fs::write." },
+  { path = "std::fs::File::create_new", reason = "sans-io; see std::fs::write." },
+  { path = "std::fs::File::set_len", reason = "sans-io; see std::fs::write." },
+  { path = "std::env::temp_dir", reason = "no /tmp; tests name and remove their own directories." },
+  { path = "std::thread::sleep", reason = "sans-io: time is an input, never a blocking sleep." },
+]

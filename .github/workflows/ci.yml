@@ -1,0 +1,26 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  gates:
+    # The six targets every consumer ships on (CLAUDE.md §1, Portable).
+    strategy:
+      fail-fast: false
+      matrix:
+        runner:
+          - ubuntu-24.04
+          - ubuntu-24.04-arm
+          - macos-15
+          - macos-15-intel
+          - windows-2025
+          - windows-11-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      # The toolchain comes from rust-toolchain.toml, pinned exactly.
+      - run: rustup show active-toolchain || rustup toolchain install
+      - run: bash scripts/gates.sh
+        shell: bash

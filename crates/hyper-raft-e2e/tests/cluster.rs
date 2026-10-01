@@ -247,15 +247,26 @@ impl Cluster {
         wire::put_request(&mut self.buffer, request, op);
         self.ask(id, request)
     }
+    /// Sends an instruction until the member answers it. An instruction is a datagram, which a
+    /// member descheduled on a slow runner may answer late or a full socket may drop, so it is
+    /// sent again, under the same request, for as long as a write is given; setting peers or
+    /// isolation twice changes nothing, so the instruction is idempotent.
     fn control(&mut self, id: u64, control: &Control) {
         self.next_id += 1;
         let request = self.next_id;
-        wire::put_control(&mut self.buffer, request, control);
-        assert_eq!(
-            self.ask(id, request),
-            Some(Outcome::Done),
-            "member {id} took no instruction"
-        );
+        let until = Instant::now() + Self::budget(self.tick);
+        loop {
+            wire::put_control(&mut self.buffer, request, control);
+            if let Some(outcome) = self.ask(id, request) {
+                assert_eq!(outcome, Outcome::Done, "member {id} refused an instruction");
+                return;
+            }
+            assert!(
+                Instant::now() < until,
+                "member {id} took no instruction within {:?}",
+                Self::budget(self.tick)
+            );
+        }
     }
     fn tell_peers(&mut self) {
         let peers: Vec<(u64, SocketAddr)> = (1..=self.voters() as u64)

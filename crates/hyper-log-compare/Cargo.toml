@@ -1,0 +1,24 @@
+[package]
+name = "hyper-log-compare"
+description = "hyper-log measured against the logs it replaces, on one workload: mantle's mantle-log (through its own `mantle bench log`) and focal's focal-log."
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+license = "MIT"
+publish = false
+
+# A workspace of its own: focal-log is built from focal's repository at a pinned revision,
+# which the gates of this workspace do not fetch (docs/benchmarks.md, "Throughput").
+[workspace]
+
+[dependencies]
+hyper-block = { path = "../hyper-block" }
+hyper-log = { path = "../hyper-log" }
+hyper-measure = { path = "../hyper-measure" }
+# focal's shared WAL at focal `origin/slates-port` 4bf7b64, its writer and its budget lanes.
+focal-log = { git = "https://github.com/hyper-light/focal", rev = "4bf7b6417ad45e3b496c80139f78e0d101dc3f11" }
+focal-memory = { git = "https://github.com/hyper-light/focal", rev = "4bf7b6417ad45e3b496c80139f78e0d101dc3f11" }
+
+[profile.release]
+lto = true
+debug = "line-tables-only"

@@ -494,3 +494,194 @@ HYPER_RAFT_SEEDS=1000 HYPER_RAFT_SEED=1000 cargo test -p hyper-raft --release --
 cargo test -p hyper-raft-e2e --test cluster
 CARGO_BUILD_JOBS=8 bash scripts/gates.sh
 ```
+
+# hyper-log against mantle-log and focal-log
+
+The law (`CLAUDE.md` §1a) for the log, moved from mantle by note 32's L-1 and L-2
+(`crates/hyper-log/ORIGIN.md`): its allocations, reallocations and page faults per append and per
+fetch, before and after L-2; its throughput and latency against mantle's own log and focal's; and
+real processes killed mid-append.
+
+## The machine
+
+The same Apple M5 Max (`Mac17,6`, 18 cores, 128 GiB), macOS 26.4.1, rustc 1.98.0, its internal SSD
+(APFS, `F_FULLFSYNC`), 2026-10-01 in the morning PDT. The machine was shared with other sessions:
+the load average was 20 to 29 during the runs, which the spreads below show.
+
+## Equivalence
+
+`crates/hyper-log/tests/equivalence.rs`: 24 seeds of four cycles of 40 rounds, groups appending,
+conflicting, compacting, voting, proposing, leaving and sending invalid updates, each round's
+batch fixed by holding the device in a flush, with power cuts, random-sector crashes and bit flips
+at rest between cycles, so that opens restore, mark and fence (over the 24 seeds: 9,919 updates
+written, 1,802 fenced, 203 invalid, 105 refused for damage, 37 for backlog; ten opens restored
+groups, five fenced one). The same harness, renamed, was run against mantle-log at mantle `147f035`
+(in a scratch clone; mantle untouched) and wrote 48 files: the transcripts of every answer, view,
+fetch and recovery, and each seed's device image with each segment's random nonce replaced by its
+incarnation and the checksums over it recomputed. hyper-log writes the same 48 files byte for byte
+at L-1 (`5bd0699`), at L-2 (`4e58930`), after the allocation work (`4b48295`) and after the wall
+(`af2679b`); the test asserts mantle's hashes of them.
+
+## Allocations
+
+`cargo bench -p hyper-log --bench allocs`: a log on a real file, closed-loop appends from 1 and 16
+replicas under `Waits::Measured`, 200 rounds after 20; every thread of the process counted
+(`hyper_measure::alloc::begin_process`), since the log runs threads of its own. The updates are built
+before the count begins, so an append's count is the log's own. "Before" is L-1 (`50582fa`), which is
+mantle-log's code; "after" is this branch.
+
+| Per operation | replicas | before: allocations, reallocations, bytes | after: allocations, reallocations, bytes |
+|---|---|---|---|
+| append, 128 B | 1 | 23.0, 5.0, 22,793 | **0.00**, 0.01, 63 |
+| append, 1 KiB | 1 | 23.0, 5.0, 23,688 | **0.00**, 0.01, 63 |
+| append, 16 KiB | 1 | 23.0, 5.0, 39,048 | **0.00**, 0.01, 63 |
+| append, 128 B | 16 | 8.38, 0.77, 4,377 | **0.00**, 0.01, 63 |
+| append, 16 KiB | 16 | 8.38, 0.77, 20,718 | **0.00**, 0.02, 63 |
+| fetch of an entry in memory, `entries` | 16 | 2.00, 0, 248 | 2.00, 0, 256 (128 B) to 16,512 (16 KiB) |
+| the same, into a reservation (`fetch`) | 16 | – | **0.00**, 0, 0 |
+| fetch of an entry from the file, `entries` | 16 | 5.44, 0, 1,296 (128 B) | 2.56, 0, 882 |
+| the same, into a reservation (`fetch`) | 16 | – | **0.00**, 0, 0 |
+| term, view | 1, 16 | 0, 0, 0 | 0, 0, 0 |
+
+- An append allocates nothing once warm. The 0.01 to 0.02 reallocations are each group's list of
+  retained entries doubling as it grows; the 63 bytes are those reallocations.
+- `entries` hands back `Entry`s with bytes of their own, so it makes the vector and a copy of each
+  entry: two allocations for one entry, as mantle's did, and the entry's bytes, where mantle's shared
+  an `Arc<[u8]>` with the log (248 bytes whatever the size). `fetch` copies into the caller's
+  reservation and allocates nothing.
+- The rows of one replica's fetches from the file (15 allocations) are a fresh log's first read: the
+  device's buffer pool and the thread's reservation are made then.
+- Minor page faults were at most 0.015 an append and 0 to 2 a fetch, before and after.
+
+## Throughput and latency
+
+`crates/hyper-log-compare`, a workspace of its own, runs mantle's own benchmark workload
+(`mantle bench log`, mantle `crates/mantle/src/bench_log.rs` at `147f035`) on each log: closed-loop
+replicas, each appending one entry to its own group and waiting until it is durable, held as
+records by at most a granted core's worth of driver threads that hear of each answer through the
+replica's waker; every replica keeps 64 entries behind its last; 1 s a point; a scratch file on the
+internal SSD.
+
+- **mantle**: mantle-log through mantle's own binary at `147f035`, built in a scratch clone:
+  `mantle bench log <dir> --seconds 1 --sizes <bytes> --replicas <n> --skip-device`.
+- **hyper**: hyper-log, this branch, driven as `crates/hyper-log/benches/log.rs` drives it.
+- **focal**: focal-log's `SharedWal` at focal `origin/slates-port` `4bf7b64`, a `WalLease` per
+  replica appending with `append_async_notified`, whose notification is the waker. focal keeps a
+  group's window by a checkpoint of the entries it keeps (`rewrite_checkpoint_async_notified`), where
+  mantle and hyper-log write a start: every 64th append is that checkpoint of 64 entries, the cadence
+  note 32 §3.9 asks the two to be compared at. focal refuses an append with `Capacity` when its
+  writer's budget is spent; a refused replica tries again after the next answer.
+
+Five rounds a point, the three logs in a rotated order each round, each point in a fresh process.
+Medians, with the least and the most. "Allocations an append" is a separate counting run, every
+thread's, building each update included (an entry's bytes and its list: two of hyper's), and is not
+measured for mantle's binary, which has no counting allocator (its counts are the "before" column
+above).
+
+| entry | replicas | log | appends/s, median (least–most) | p50 ms | p99 ms | p99.9 ms | appends a flush | reopen ms | threads | allocations an append |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 128 B | 1 | mantle | 60 (51–80) | 17.30 | 25.60 | 25.60 | 1.0 | 14.60 | 3 | – |
+| 128 B | 1 | hyper | 53 (37–62) | 16.97 | 27.63 | 28.93 | 1.0 | 12.33 | 4 | 2.89 |
+| 128 B | 1 | focal | 31 (27–44) | 32.70 | 42.44 | 42.44 | 1.0 | 0.43 | 3 | 16.82 |
+| 128 B | 4 | mantle | 200 (175–355) | 20.40 | 38.80 | 38.80 | 3.9 | 10.80 | 6 | – |
+| 128 B | 4 | hyper | 199 (119–240) | 18.98 | 33.07 | 35.55 | 3.9 | 14.52 | 7 | 2.69 |
+| 128 B | 4 | focal | 61 (51–73) | 66.93 | 92.41 | 92.44 | 2.2 | 0.57 | 6 | 13.04 |
+| 128 B | 16 | mantle | 760 (685–949) | 20.40 | 39.50 | 39.50 | 15.7 | 12.10 | 18 | – |
+| 128 B | 16 | hyper | 654 (592–1020) | 20.18 | 43.24 | 43.26 | 15.6 | 12.27 | 19 | 2.33 |
+| 128 B | 16 | focal | 246 (122–387) | 54.78 | 104.59 | 104.60 | 9.2 | 1.25 | 18 | 11.13 |
+| 128 B | 64 | mantle | 2470 (2200–3180) | 25.70 | 57.70 | 57.80 | 61.2 | 13.80 | 20 | – |
+| 128 B | 64 | hyper | 2466 (1453–3002) | 24.08 | 50.42 | 50.52 | 56.9 | 15.47 | 21 | 2.27 |
+| 128 B | 64 | focal | 928 (220–2215) | 67.29 | 117.91 | 123.49 | 39.9 | 3.49 | 20 | 10.40 |
+| 128 B | 256 | mantle | 9810 (9190–13200) | 26.20 | 49.20 | 49.20 | 217.1 | 19.30 | 20 | – |
+| 128 B | 256 | hyper | 13292 (8820–17067) | 15.50 | 41.47 | 48.05 | 242.5 | 15.92 | 21 | 2.19 |
+| 128 B | 256 | focal | 875 (601–1327) | 76.44 | 135.64 | 135.68 | 35.8 | 3.68 | 20 | 14.47 |
+| 1024 B | 1 | mantle | 57 (49–86) | 17.30 | 32.00 | 32.00 | 1.0 | 16.00 | 3 | – |
+| 1024 B | 1 | hyper | 54 (51–101) | 17.97 | 28.67 | 30.96 | 1.0 | 15.63 | 4 | 2.91 |
+| 1024 B | 1 | focal | 29 (24–41) | 35.41 | 63.67 | 63.67 | 1.0 | 0.43 | 3 | 16.39 |
+| 1024 B | 4 | mantle | 256 (168–335) | 16.30 | 30.80 | 30.80 | 3.9 | 8.42 | 6 | – |
+| 1024 B | 4 | hyper | 211 (202–366) | 17.89 | 29.86 | 30.79 | 3.9 | 12.27 | 7 | 2.34 |
+| 1024 B | 4 | focal | 72 (55–133) | 54.99 | 80.79 | 84.73 | 2.0 | 0.59 | 6 | 13.62 |
+| 1024 B | 16 | mantle | 662 (605–748) | 23.60 | 46.30 | 46.30 | 15.3 | 11.30 | 18 | – |
+| 1024 B | 16 | hyper | 812 (712–839) | 20.35 | 34.04 | 34.05 | 15.7 | 11.66 | 19 | 2.58 |
+| 1024 B | 16 | focal | 193 (155–252) | 82.37 | 124.95 | 124.96 | 9.5 | 0.97 | 18 | 11.68 |
+| 1024 B | 64 | mantle | 2870 (2560–6270) | 13.90 | 44.70 | 44.70 | 61.2 | 15.50 | 20 | – |
+| 1024 B | 64 | hyper | 2847 (2365–3322) | 21.27 | 39.24 | 42.33 | 62.4 | 18.54 | 21 | 2.19 |
+| 1024 B | 64 | focal | 986 (743–1188) | 54.97 | 115.09 | 134.54 | 43.8 | 3.64 | 20 | 10.22 |
+| 1024 B | 256 | mantle | 10100 (7170–13900) | 25.20 | 47.20 | 47.30 | 225.8 | 19.90 | 20 | – |
+| 1024 B | 256 | hyper | 9754 (5763–12477) | 26.50 | 40.25 | 40.44 | 212.3 | 21.26 | 21 | 2.21 |
+| 1024 B | 256 | focal | 1013 (921–1354) | 50.03 | 118.94 | 118.96 | 38.6 | 4.21 | 20 | 14.64 |
+| 16384 B | 1 | mantle | 55 (38–70) | 17.30 | 30.70 | 30.70 | 1.0 | 11.40 | 3 | – |
+| 16384 B | 1 | hyper | 50 (46–79) | 20.02 | 30.25 | 30.25 | 1.0 | 12.49 | 4 | 2.56 |
+| 16384 B | 1 | focal | 27 (24–44) | 37.07 | 57.25 | 57.25 | 1.0 | 0.71 | 3 | 16.64 |
+| 16384 B | 4 | mantle | 198 (120–225) | 20.40 | 39.10 | 39.10 | 3.9 | 9.85 | 6 | – |
+| 16384 B | 4 | hyper | 281 (202–347) | 12.66 | 30.55 | 30.93 | 3.9 | 12.29 | 7 | 2.54 |
+| 16384 B | 4 | focal | 65 (55–77) | 62.72 | 78.20 | 78.21 | 2.1 | 1.03 | 6 | 13.61 |
+| 16384 B | 16 | mantle | 724 (583–1010) | 21.50 | 41.10 | 41.10 | 15.7 | 18.60 | 18 | – |
+| 16384 B | 16 | hyper | 707 (687–1302) | 21.39 | 43.41 | 43.51 | 15.7 | 21.78 | 19 | 2.72 |
+| 16384 B | 16 | focal | 257 (126–291) | 62.74 | 110.27 | 110.39 | 10.3 | 2.76 | 18 | 11.91 |
+| 16384 B | 64 | mantle | 3740 (2650–5510) | 17.80 | 32.00 | 39.70 | 62.5 | 25.00 | 20 | – |
+| 16384 B | 64 | hyper | 3253 (2773–4087) | 21.35 | 44.51 | 44.58 | 62.6 | 30.65 | 21 | 2.28 |
+| 16384 B | 64 | focal | 1102 (642–3065) | 56.55 | 92.33 | 98.21 | 40.9 | 10.83 | 20 | 10.62 |
+| 16384 B | 256 | mantle | 7380 (5040–10600) | 30.90 | 77.20 | 77.20 | 183.2 | 51.70 | 20 | – |
+| 16384 B | 256 | hyper | 8255 (6974–12381) | 31.70 | 48.74 | 49.00 | 245.3 | 67.32 | 21 | 2.21 |
+| 16384 B | 256 | focal | 706 (353–2019) | 91.64 | 143.44 | 153.42 | 38.5 | 7.79 | 20 | 16.97 |
+
+What it shows, within what the spreads allow:
+- **hyper against mantle.** Within each other's spread at every point: the medians differ by
+  -18% (four replicas of 1 KiB) to +42% (four of 16 KiB), with no direction across the grid. p99 is
+  lower for hyper at 11 of 15 points, higher at 4. A lone replica's append takes two flushes in both, the frame's
+  and its confirmation's (mantle `docs/design/raft-log.md` §6), about 17 ms at the median here.
+- **The cost of L-2's design** is in hyper's threads, one more than mantle's (the owner and the
+  device thread, where mantle had one writer), and in a submission's admission, a round trip to the
+  owner where mantle took room with a lock: microseconds against a flush of milliseconds, invisible
+  in these rows. Reopen times are alike; recovery is mantle's code.
+- **focal** runs at a half to a tenth of mantle's and hyper's rate, at two to three times their
+  median latency: its appends
+  carry 1 to 44 records a flush at most here (its writer batches at most 64 requests), its
+  checkpoints write 64 entries every 64th append, and it refuses for budget at 64 and 256 replicas.
+  It reopens far faster: its replay reads only what checkpoints keep, where the mantle format
+  replays every live segment.
+
+## End to end
+
+`crates/hyper-log-e2e`: a writer process (`hyper-log-writer`) appends to a log in a real file
+(direct I/O where the file system takes it, `F_FULLFSYNC`), eight groups in rounds, each entry with a
+hard state and a compaction every 64th, printing each acknowledged append. `tests/kill.rs` kills it
+with `SIGKILL` (`TerminateProcess` on Windows) after a number of acknowledgements drawn for each of 24
+cycles, so the kill lands while frames are being written, flushed and confirmed; after each kill it
+opens the log in its own process and checks, against every append the writer acknowledged: no group
+damaged; every acknowledged entry held, with its bytes, from where the group's log starts; no start
+behind the one acknowledged; no commit behind the last acknowledged append. Then the writer restarts
+on the file and goes on; the last runs to its end and closes the log.
+
+```
+24 writers killed, 1784 appends acknowledged across 8 groups, 3 acknowledgements read after a kill
+test a_writer_killed_mid_append_loses_nothing_it_acknowledged ... ok
+```
+
+On Linux (aarch64, `rust:1.98.0` in Docker on this Mac, the container's overlay file system), the
+same test, with the suites of hyper-block, hyper-log (the equivalence included) and hyper-measure:
+
+```
+24 writers killed, 1784 appends acknowledged across 8 groups, 0 acknowledgements read after a kill
+test result: ok. 1 passed; 0 failed
+```
+
+Windows is linted (`x86_64-pc-windows-msvc`, `aarch64-pc-windows-msvc`), not run here.
+
+## Commands for the log
+
+```sh
+# The equivalence, the suites and the kill test.
+cargo test -p hyper-log -p hyper-block -p hyper-log-e2e --all-features
+
+# Allocations per append and per fetch.
+cargo bench -p hyper-log --bench allocs
+
+# hyper-log alone, mantle's workload and columns.
+cargo bench -p hyper-log --bench log -- DIR 1.0
+
+# The comparison: mantle's binary built at 147f035 in a clone (cargo build --release -p mantle).
+cd crates/hyper-log-compare && cargo build --release
+target/release/hyper-log-compare table DIR 5 1.0 path/to/mantle
+```

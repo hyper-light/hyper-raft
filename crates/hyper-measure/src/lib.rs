@@ -8,10 +8,15 @@
 //! test installs [`alloc::Counting`] as its global allocator and switches the
 //! counting on around what it measures.
 //!
-//! The `unsafe` this crate needs is in two files that
+//! A test or a benchmark that hands a call a `Waker` takes a counting one from
+//! [`wake`].
+//!
+//! The `unsafe` this crate needs is in three files that
 //! `scripts/check-contracts.py` lists: `src/alloc.rs` (the allocator forwards
-//! to the system's) and `src/faults.rs` (the OS calls that read the faults).
+//! to the system's), `src/faults.rs` (the OS calls that read the faults) and
+//! `src/wake.rs` (a waker built over a leaked slot).
 
 pub mod alloc;
 pub mod faults;
 pub mod stats;
+pub mod wake;

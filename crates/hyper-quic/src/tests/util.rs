@@ -53,7 +53,7 @@ impl Pair {
         Self::new(Default::default(), cfg)
     }
 
-    pub(super) fn new(endpoint_config: Arc<EndpointConfig>, server_config: ServerConfig) -> Self {
+    pub(super) fn new(endpoint_config: EndpointConfig, server_config: ServerConfig) -> Self {
         let server = Endpoint::new(
             endpoint_config.clone(),
             Some(Arc::new(server_config)),

@@ -40,3 +40,11 @@ Upstream's own tests are the oracle that conformance changed no behaviour.
      is gone.
    - `QlogConfig::into_stream` returns `Result<QlogStream, QlogError>`. A missing writer or a
      failed header write used to be logged and dropped.
+4. **The endpoint owns its `EndpointConfig` by value.**
+   - The reset key is AWS-LC's `hmac::Key`; the provider is no longer selectable.
+   - The CID-generator factory (`Arc<dyn Fn>`) is replaced by a generator value. Each endpoint
+     takes a copy through the new required method `ConnectionIdGenerator::clone_box`.
+   - One behavioural difference: two endpoints built from one configuration with the default
+     `HashedConnectionIdGenerator` now share its hash key, where upstream's factory drew a key per
+     endpoint. The key only lets an endpoint cheaply reject CIDs it did not issue, and upstream
+     already documents sharing it (`from_key`) to keep CIDs valid across restarts.

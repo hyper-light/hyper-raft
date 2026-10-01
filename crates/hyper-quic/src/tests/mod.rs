@@ -21,7 +21,7 @@ use tracing::info;
 use super::*;
 use crate::{
     Duration, Instant,
-    cid_generator::{ConnectionIdGenerator, RandomConnectionIdGenerator},
+    cid_generator::{RandomConnectionIdGenerator},
     crypto::rustls::QuicServerConfig,
     frame::FrameStruct,
     transport_parameters::TransportParameters,
@@ -146,13 +146,11 @@ fn version_negotiate_client() {
     let server_addr = "[::2]:7890".parse().unwrap();
     // Configure client to use empty CIDs so we can easily hardcode a server version negotiation
     // packet
-    let cid_generator_factory: fn() -> Box<dyn ConnectionIdGenerator> =
-        || Box::new(RandomConnectionIdGenerator::new(0));
-    let mut client = Endpoint::new(
-        Arc::new(EndpointConfig {
-            connection_id_generator_factory: Arc::new(cid_generator_factory),
+        let mut client = Endpoint::new(
+        EndpointConfig {
+            cid_generator: Box::new(RandomConnectionIdGenerator::new(0)),
             ..Default::default()
-        }),
+        },
         None,
         true,
         None,
@@ -256,9 +254,9 @@ fn server_stateless_reset() {
     let reset_key = hmac::Key::new(hmac::HMAC_SHA256, &key_material);
     rng.fill_bytes(&mut key_material);
 
-    let mut endpoint_config = EndpointConfig::new(Arc::new(reset_key));
-    endpoint_config.cid_generator(move || Box::new(HashedConnectionIdGenerator::from_key(0)));
-    let endpoint_config = Arc::new(endpoint_config);
+    let mut endpoint_config = EndpointConfig::new(reset_key);
+    endpoint_config.cid_generator(Box::new(HashedConnectionIdGenerator::from_key(0)));
+    let endpoint_config = endpoint_config;
 
     let mut pair = Pair::new(endpoint_config.clone(), server_config());
     let (client_ch, _) = pair.connect();
@@ -286,9 +284,9 @@ fn client_stateless_reset() {
     let reset_key = hmac::Key::new(hmac::HMAC_SHA256, &key_material);
     rng.fill_bytes(&mut key_material);
 
-    let mut endpoint_config = EndpointConfig::new(Arc::new(reset_key));
-    endpoint_config.cid_generator(move || Box::new(HashedConnectionIdGenerator::from_key(0)));
-    let endpoint_config = Arc::new(endpoint_config);
+    let mut endpoint_config = EndpointConfig::new(reset_key);
+    endpoint_config.cid_generator(Box::new(HashedConnectionIdGenerator::from_key(0)));
+    let endpoint_config = endpoint_config;
 
     let mut pair = Pair::new(endpoint_config.clone(), server_config());
     let (_, server_ch) = pair.connect();
@@ -316,8 +314,8 @@ fn stateless_reset_limit() {
     let _guard = subscribe();
     let remote = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 42);
     let mut endpoint_config = EndpointConfig::default();
-    endpoint_config.cid_generator(move || Box::new(RandomConnectionIdGenerator::new(8)));
-    let endpoint_config = Arc::new(endpoint_config);
+    endpoint_config.cid_generator(Box::new(RandomConnectionIdGenerator::new(8)));
+    let endpoint_config = endpoint_config;
     let mut endpoint = Endpoint::new(
         endpoint_config.clone(),
         Some(Arc::new(server_config())),
@@ -669,7 +667,7 @@ fn zero_rtt_rejection() {
         "foo".into(),
         "bar".into(),
     ])));
-    let mut pair = Pair::new(Arc::new(EndpointConfig::default()), server_config);
+    let mut pair = Pair::new(EndpointConfig::default(), server_config);
     let mut client_crypto = Arc::new(client_crypto_with_alpn(vec!["foo".into()]));
     let client_config = ClientConfig::new(client_crypto.clone());
 
@@ -765,7 +763,7 @@ fn test_zero_rtt_incoming_limit<F: FnOnce(&mut ServerConfig)>(configure_server: 
     let _guard = subscribe();
     let mut server_config = server_config();
     configure_server(&mut server_config);
-    let mut pair = Pair::new(Arc::new(EndpointConfig::default()), server_config);
+    let mut pair = Pair::new(EndpointConfig::default(), server_config);
     let config = client_config();
 
     // Establish normal connection
@@ -868,7 +866,7 @@ fn alpn_success() {
         "baz".into(),
     ])));
 
-    let mut pair = Pair::new(Arc::new(EndpointConfig::default()), server_config);
+    let mut pair = Pair::new(EndpointConfig::default(), server_config);
     let client_config = ClientConfig::new(Arc::new(client_crypto_with_alpn(vec![
         "bar".into(),
         "quux".into(),
@@ -901,7 +899,7 @@ fn alpn_success() {
 #[test]
 fn server_alpn_unset() {
     let _guard = subscribe();
-    let mut pair = Pair::new(Arc::new(EndpointConfig::default()), server_config());
+    let mut pair = Pair::new(EndpointConfig::default(), server_config());
     let client_config = ClientConfig::new(Arc::new(client_crypto_with_alpn(vec!["foo".into()])));
 
     let client_ch = pair.begin_connect(client_config);
@@ -921,7 +919,7 @@ fn client_alpn_unset() {
         "baz".into(),
     ])));
 
-    let mut pair = Pair::new(Arc::new(EndpointConfig::default()), server_config);
+    let mut pair = Pair::new(EndpointConfig::default(), server_config);
     let client_ch = pair.begin_connect(client_config());
     pair.drive();
     assert_matches!(
@@ -939,7 +937,7 @@ fn alpn_mismatch() {
         "baz".into(),
     ])));
 
-    let mut pair = Pair::new(Arc::new(EndpointConfig::default()), server_config);
+    let mut pair = Pair::new(EndpointConfig::default(), server_config);
     let client_ch = pair.begin_connect(ClientConfig::new(Arc::new(client_crypto_with_alpn(vec![
         "quux".into(),
         "corge".into(),
@@ -1876,13 +1874,11 @@ fn implicit_open() {
 #[test]
 fn zero_length_cid() {
     let _guard = subscribe();
-    let cid_generator_factory: fn() -> Box<dyn ConnectionIdGenerator> =
-        || Box::new(RandomConnectionIdGenerator::new(0));
-    let mut pair = Pair::new(
-        Arc::new(EndpointConfig {
-            connection_id_generator_factory: Arc::new(cid_generator_factory),
+        let mut pair = Pair::new(
+        EndpointConfig {
+            cid_generator: Box::new(RandomConnectionIdGenerator::new(0)),
             ..EndpointConfig::default()
-        }),
+        },
         server_config(),
     );
     let (client_ch, server_ch) = pair.connect();
@@ -1934,20 +1930,17 @@ fn cid_rotation() {
     let _guard = subscribe();
     const CID_TIMEOUT: Duration = Duration::from_secs(2);
 
-    let cid_generator_factory: fn() -> Box<dyn ConnectionIdGenerator> =
-        || Box::new(*RandomConnectionIdGenerator::new(8).set_lifetime(CID_TIMEOUT));
-
     // Only test cid rotation on server side to have a clear output trace
     let server = Endpoint::new(
-        Arc::new(EndpointConfig {
-            connection_id_generator_factory: Arc::new(cid_generator_factory),
+        EndpointConfig {
+            cid_generator: Box::new(*RandomConnectionIdGenerator::new(8).set_lifetime(CID_TIMEOUT)),
             ..EndpointConfig::default()
-        }),
+        },
         Some(Arc::new(server_config())),
         true,
         None,
     );
-    let client = Endpoint::new(Arc::new(EndpointConfig::default()), None, true, None);
+    let client = Endpoint::new(EndpointConfig::default(), None, true, None);
 
     let mut pair = Pair::new_from_endpoint(client, server);
     let (_, server_ch) = pair.connect();
@@ -2546,7 +2539,7 @@ fn large_initial() {
     let server_config =
         ServerConfig::with_crypto(Arc::new(server_crypto_with_alpn(vec![vec![0, 0, 0, 42]])));
 
-    let mut pair = Pair::new(Arc::new(EndpointConfig::default()), server_config);
+    let mut pair = Pair::new(EndpointConfig::default(), server_config);
     let client_crypto =
         client_crypto_with_alpn((0..1000u32).map(|x| x.to_be_bytes().to_vec()).collect());
     let cfg = ClientConfig::new(Arc::new(client_crypto));
@@ -2911,7 +2904,7 @@ fn migrate_detects_new_mtu_and_respects_original_peer_max_udp_payload_size() {
     // Set up a client with a max payload size of 1400 (and use the defaults for the server)
     let server_endpoint_config = EndpointConfig::default();
     let server = Endpoint::new(
-        Arc::new(server_endpoint_config),
+        server_endpoint_config,
         Some(Arc::new(server_config())),
         true,
         None,
@@ -2920,7 +2913,7 @@ fn migrate_detects_new_mtu_and_respects_original_peer_max_udp_payload_size() {
         max_udp_payload_size: VarInt::from(client_max_udp_payload_size),
         ..EndpointConfig::default()
     };
-    let client = Endpoint::new(Arc::new(client_endpoint_config), None, true, None);
+    let client = Endpoint::new(client_endpoint_config, None, true, None);
     let mut pair = Pair::new_from_endpoint(client, server);
     pair.mtu = 1300;
 
@@ -3646,7 +3639,7 @@ fn silently_drop_rejected_initials() {
     let _guard = subscribe();
     let mut server_config = server_config();
     server_config.max_incoming(0);
-    let mut pair = Pair::new(Arc::new(EndpointConfig::default()), server_config);
+    let mut pair = Pair::new(EndpointConfig::default(), server_config);
 
     let client_ch = pair.begin_connect(client_config());
     pair.drive();
@@ -4168,6 +4161,6 @@ fn preferred_address() {
     let mut server_config = server_config();
     server_config.preferred_address_v6(Some("[::1]:65535".parse().unwrap()));
 
-    let mut pair = Pair::new(Arc::new(EndpointConfig::default()), server_config);
+    let mut pair = Pair::new(EndpointConfig::default(), server_config);
     pair.connect();
 }

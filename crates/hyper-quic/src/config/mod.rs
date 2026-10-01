@@ -5,6 +5,7 @@ use std::{
     sync::Arc,
 };
 
+use aws_lc_rs::hmac;
 use rustls::client::WebPkiServerVerifier;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use thiserror::Error;
@@ -15,7 +16,7 @@ use crate::{
     DEFAULT_SUPPORTED_VERSIONS, Duration, MAX_CID_SIZE, RandomConnectionIdGenerator, SystemTime,
     TokenLog, TokenMemoryCache, TokenStore, VarInt, VarIntBoundsExceeded,
     cid_generator::{ConnectionIdGenerator, HashedConnectionIdGenerator},
-    crypto::{self, HandshakeTokenKey, HmacKey},
+    crypto::{self, HandshakeTokenKey},
     shared::ConnectionId,
 };
 
@@ -26,15 +27,11 @@ pub use transport::{AckFrequencyConfig, IdleTimeout, MtuDiscoveryConfig, Transpo
 /// Global configuration for the endpoint, affecting all connections
 ///
 /// Default values should be suitable for most internet applications.
-#[derive(Clone)]
 pub struct EndpointConfig {
-    pub(crate) reset_key: Arc<dyn HmacKey>,
+    pub(crate) reset_key: hmac::Key,
     pub(crate) max_udp_payload_size: VarInt,
-    /// CID generator factory
-    ///
-    /// Create a cid generator for local cid in Endpoint struct
-    pub(crate) connection_id_generator_factory:
-        Arc<dyn Fn() -> Box<dyn ConnectionIdGenerator> + Send + Sync>,
+    /// The generator of local CIDs; each endpoint built from this configuration takes a copy
+    pub(crate) cid_generator: Box<dyn ConnectionIdGenerator>,
     pub(crate) supported_versions: Vec<u32>,
     pub(crate) grease_quic_bit: bool,
     /// Minimum interval between outgoing stateless reset packets
@@ -45,13 +42,11 @@ pub struct EndpointConfig {
 
 impl EndpointConfig {
     /// Create a default config with a particular `reset_key`
-    pub fn new(reset_key: Arc<dyn HmacKey>) -> Self {
-        let cid_factory =
-            || -> Box<dyn ConnectionIdGenerator> { Box::<HashedConnectionIdGenerator>::default() };
+    pub fn new(reset_key: hmac::Key) -> Self {
         Self {
             reset_key,
             max_udp_payload_size: (1500u32 - 28).into(), // Ethernet MTU minus IP + UDP headers
-            connection_id_generator_factory: Arc::new(cid_factory),
+            cid_generator: Box::<HashedConnectionIdGenerator>::default(),
             supported_versions: DEFAULT_SUPPORTED_VERSIONS.to_vec(),
             grease_quic_bit: true,
             min_reset_interval: Duration::from_millis(20),
@@ -59,25 +54,22 @@ impl EndpointConfig {
         }
     }
 
-    /// Supply a custom connection ID generator factory
+    /// Supply a custom connection ID generator
     ///
-    /// Called once by each `Endpoint` constructed from this configuration to obtain the CID
-    /// generator which will be used to generate the CIDs used for incoming packets on all
-    /// connections involving that  `Endpoint`. A custom CID generator allows applications to embed
-    /// information in local connection IDs, e.g. to support stateless packet-level load balancers.
+    /// Each `Endpoint` constructed from this configuration takes its own copy, which generates the
+    /// CIDs used for incoming packets on all connections involving that `Endpoint`. A custom CID
+    /// generator allows applications to embed information in local connection IDs, e.g. to support
+    /// stateless packet-level load balancers.
     ///
     /// Defaults to [`HashedConnectionIdGenerator`].
-    pub fn cid_generator<F: Fn() -> Box<dyn ConnectionIdGenerator> + Send + Sync + 'static>(
-        &mut self,
-        factory: F,
-    ) -> &mut Self {
-        self.connection_id_generator_factory = Arc::new(factory);
+    pub fn cid_generator(&mut self, generator: Box<dyn ConnectionIdGenerator>) -> &mut Self {
+        self.cid_generator = generator;
         self
     }
 
     /// Private key used to send authenticated connection resets to peers who were
     /// communicating with a previous instance of this endpoint.
-    pub fn reset_key(&mut self, key: Arc<dyn HmacKey>) -> &mut Self {
+    pub fn reset_key(&mut self, key: hmac::Key) -> &mut Self {
         self.reset_key = key;
         self
     }
@@ -154,6 +146,20 @@ impl EndpointConfig {
     }
 }
 
+impl Clone for EndpointConfig {
+    fn clone(&self) -> Self {
+        Self {
+            reset_key: self.reset_key.clone(),
+            max_udp_payload_size: self.max_udp_payload_size,
+            cid_generator: self.cid_generator.clone_box(),
+            supported_versions: self.supported_versions.clone(),
+            grease_quic_bit: self.grease_quic_bit,
+            min_reset_interval: self.min_reset_interval,
+            rng_seed: self.rng_seed,
+        }
+    }
+}
+
 impl fmt::Debug for EndpointConfig {
     fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt.debug_struct("EndpointConfig")
@@ -169,13 +175,12 @@ impl fmt::Debug for EndpointConfig {
 
 impl Default for EndpointConfig {
     fn default() -> Self {
-        use aws_lc_rs::hmac;
         use rand::Rng;
 
         let mut reset_key = [0; 64];
         rand::rng().fill_bytes(&mut reset_key);
 
-        Self::new(Arc::new(hmac::Key::new(hmac::HMAC_SHA256, &reset_key)))
+        Self::new(hmac::Key::new(hmac::HMAC_SHA256, &reset_key))
     }
 }
 

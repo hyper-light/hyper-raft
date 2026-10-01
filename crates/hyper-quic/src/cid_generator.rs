@@ -30,6 +30,9 @@ pub trait ConnectionIdGenerator: Send + Sync {
     ///
     /// Connection IDs will be retired after the returned `Duration`, if any. Assumed to be constant.
     fn cid_lifetime(&self) -> Option<Duration>;
+
+    /// A copy of this generator for another endpoint built from the same configuration
+    fn clone_box(&self) -> Box<dyn ConnectionIdGenerator>;
 }
 
 /// The connection ID was not recognized by the [`ConnectionIdGenerator`]
@@ -90,6 +93,10 @@ impl ConnectionIdGenerator for RandomConnectionIdGenerator {
     fn cid_lifetime(&self) -> Option<Duration> {
         self.lifetime
     }
+
+    fn clone_box(&self) -> Box<dyn ConnectionIdGenerator> {
+        Box::new(self.clone())
+    }
 }
 
 /// Generates 8-byte connection IDs that can be efficiently
@@ -97,6 +104,7 @@ impl ConnectionIdGenerator for RandomConnectionIdGenerator {
 ///
 /// This generator uses a non-cryptographic hash and can therefore still be spoofed, but nonetheless
 /// helps prevents Quinn from responding to non-QUIC packets at very low cost.
+#[derive(Clone)]
 pub struct HashedConnectionIdGenerator {
     key: u64,
     lifetime: Option<Duration>,
@@ -161,6 +169,10 @@ impl ConnectionIdGenerator for HashedConnectionIdGenerator {
 
     fn cid_lifetime(&self) -> Option<Duration> {
         self.lifetime
+    }
+
+    fn clone_box(&self) -> Box<dyn ConnectionIdGenerator> {
+        Box::new(self.clone())
     }
 }
 

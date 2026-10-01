@@ -275,8 +275,7 @@ fn a_killed_member_is_declared_dead_by_every_survivor_and_no_live_one_is() {
     let mut views: BTreeMap<u64, (u64, BTreeMap<u64, char>)> = BTreeMap::new();
     let mut killed_at: Option<u64> = None;
     let mut detected: BTreeMap<u64, u64> = BTreeMap::new();
-    let wait =
-        PERIOD * u32::try_from(SETTLE_PERIODS + DETECTION_BOUND_PERIODS + NODES).unwrap() * 4;
+    let wait = PERIOD * u32::try_from(RUN_PERIODS).unwrap();
     let started = Instant::now();
     while detected.len() < (NODES - 1) as usize {
         let line = receiver

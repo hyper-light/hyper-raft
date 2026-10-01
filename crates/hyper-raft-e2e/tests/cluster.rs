@@ -1,0 +1,723 @@
+//! hyper-raft in real use. Each scenario starts a group of real processes
+//! (`hyper-raft-node`), each a member on its own UDP socket with its own fsynced log, and
+//! drives it as a client would, through the same datagrams a client sends. What is asserted is
+//! what a client can observe:
+//! - every write a member answered is read back, by a linearizable read through whichever
+//!   member leads, after leaders are killed, members restart and members are cut off;
+//! - a member cut off from the group never answers a read with a value the group has replaced;
+//! - every member that is up applies the same history (the same digest at the same index).
+//!
+//! The scenarios run one after another in this one thread (`harness = false`), one group at a
+//! time: at most five member processes at once, each of one thread.
+//!
+//! Every wait is on the fact it needs (a member's answer), bounded by a stated budget in ticks.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects,
+    clippy::disallowed_macros,
+    clippy::cast_possible_truncation,
+    clippy::cognitive_complexity,
+    missing_docs
+)]
+
+use std::{
+    collections::BTreeMap,
+    fs::OpenOptions,
+    io::{BufRead, BufReader, ErrorKind, Write},
+    net::{SocketAddr, UdpSocket},
+    path::{Path, PathBuf},
+    process::{Child, Command, ExitCode, Stdio},
+    time::{Duration, Instant},
+};
+
+use hyper_raft_e2e::wire::{self, Control, Kind, Op, Outcome, Status};
+
+const NODE: &str = env!("CARGO_BIN_EXE_hyper-raft-node");
+const TMP: &str = env!("CARGO_TARGET_TMPDIR");
+
+/// Ticks in a member's election timeout, at least (focal's shell's `election_tick`, which the
+/// node runs with); its randomized timeout is below twice this.
+const ELECTION_TICKS: u32 = 10;
+/// How long one request waits for its answer: two of the longest election timeouts, so a
+/// request to a member that is electing is answered once the election is over.
+const ANSWER_TICKS: u32 = 4 * ELECTION_TICKS;
+/// How many requests one operation sends before it fails: a request goes to every member in
+/// turn, and an election may need several rounds of them.
+const ATTEMPTS: usize = 64;
+/// How many election timeouts a wait for a leader, or for members to agree, may take.
+const WAIT_ELECTIONS: u32 = 40;
+/// The keys a member's store holds, the asks it keeps waiting, and the entries its log holds:
+/// above what any scenario writes, so that none is refused for room.
+const MAX_KEYS: usize = 4096;
+const MAX_PENDING: usize = 64;
+const MAX_ENTRIES: usize = 1 << 16;
+/// The flushes the tick is measured from.
+const FSYNC_SAMPLES: usize = 16;
+
+#[expect(
+    clippy::disallowed_methods,
+    reason = "a test removes the files it made in its own target directory"
+)]
+fn remove(path: &Path) {
+    let _ = std::fs::remove_file(path);
+}
+
+/// The tick, from what a flush costs on this machine. Raft needs the broadcast time — a round
+/// trip and a flush of the log — well below the election timeout (Ongaro and Ousterhout 2014,
+/// §5.6); a tick of twice the slowest of `FSYNC_SAMPLES` flushes of a 4 KiB write puts the
+/// election timeout at twenty flushes or more, and a heartbeat at four.
+fn measure_tick() -> Duration {
+    let path = PathBuf::from(TMP).join(format!("e2e-{}-probe", std::process::id()));
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .unwrap();
+    let block = vec![0x5au8; 4096];
+    let mut slowest = Duration::ZERO;
+    for _ in 0..FSYNC_SAMPLES {
+        let started = Instant::now();
+        file.write_all(&block).unwrap();
+        file.sync_data().unwrap();
+        slowest = slowest.max(started.elapsed());
+    }
+    drop(file);
+    remove(&path);
+    let tick = (slowest * 2).max(Duration::from_millis(1));
+    Duration::from_millis(tick.as_millis().try_into().unwrap())
+}
+
+struct Member {
+    child: Option<Child>,
+    address: SocketAddr,
+    wal: PathBuf,
+}
+
+struct Cluster {
+    name: &'static str,
+    members: Vec<Member>,
+    tick: Duration,
+    deadline: Duration,
+    test: UdpSocket,
+    next_id: u64,
+    buffer: Vec<u8>,
+}
+
+impl Drop for Cluster {
+    fn drop(&mut self) {
+        for member in &mut self.members {
+            if let Some(mut child) = member.child.take() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            remove(&member.wal);
+        }
+    }
+}
+
+fn spawn(
+    id: u64,
+    voters: usize,
+    listen: &str,
+    wal: &Path,
+    tick: Duration,
+    deadline: Duration,
+) -> (Child, u16) {
+    let voters: Vec<String> = (1..=voters).map(|voter| voter.to_string()).collect();
+    let mut child = Command::new(NODE)
+        .args(["--id", &id.to_string()])
+        .args(["--voters", &voters.join(",")])
+        .args(["--listen", listen])
+        .args(["--wal", wal.to_str().unwrap()])
+        .args(["--tick-ms", &tick.as_millis().to_string()])
+        .args(["--deadline-ms", &deadline.as_millis().to_string()])
+        .args(["--max-keys", &MAX_KEYS.to_string()])
+        .args(["--max-pending", &MAX_PENDING.to_string()])
+        .args(["--max-entries", &MAX_ENTRIES.to_string()])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .expect("the member starts");
+    let mut line = String::new();
+    BufReader::new(child.stdout.take().unwrap())
+        .read_line(&mut line)
+        .unwrap();
+    let port = line
+        .trim()
+        .strip_prefix("listening ")
+        .and_then(|port| port.parse().ok())
+        .unwrap_or_else(|| panic!("member {id} did not start: {line:?}"));
+    (child, port)
+}
+
+impl Cluster {
+    fn start(name: &'static str, voters: usize, tick: Duration) -> Self {
+        // Every scenario's members end by themselves well after it would have failed.
+        let deadline = tick * ANSWER_TICKS * (ATTEMPTS as u32) * 4;
+        let mut members = Vec::new();
+        for id in 1..=voters as u64 {
+            let wal =
+                PathBuf::from(TMP).join(format!("e2e-{}-{name}-{id}.wal", std::process::id()));
+            remove(&wal);
+            let (child, port) = spawn(id, voters, "127.0.0.1:0", &wal, tick, deadline);
+            members.push(Member {
+                child: Some(child),
+                address: SocketAddr::from(([127, 0, 0, 1], port)),
+                wal,
+            });
+        }
+        let test = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let mut cluster = Self {
+            name,
+            members,
+            tick,
+            deadline,
+            test,
+            next_id: 0,
+            buffer: Vec::new(),
+        };
+        cluster.tell_peers();
+        cluster
+    }
+    fn voters(&self) -> usize {
+        self.members.len()
+    }
+    fn up(&self, id: u64) -> bool {
+        self.members[(id - 1) as usize].child.is_some()
+    }
+    fn address(&self, id: u64) -> SocketAddr {
+        self.members[(id - 1) as usize].address
+    }
+    /// Sends `buffer` to member `id` and waits for the answer to `request`.
+    fn ask(&mut self, id: u64, request: u64) -> Option<Outcome> {
+        if !wire::seal(&mut self.buffer) {
+            panic!("a request too long for a datagram");
+        }
+        let address = self.address(id);
+        self.test.send_to(&self.buffer, address).unwrap();
+        let until = Instant::now() + self.tick * ANSWER_TICKS;
+        let mut received = vec![0u8; wire::MAX_DATAGRAM];
+        loop {
+            let wait = until.saturating_duration_since(Instant::now());
+            if wait.is_zero() {
+                return None;
+            }
+            self.test.set_read_timeout(Some(wait)).unwrap();
+            let length = match self.test.recv_from(&mut received) {
+                Ok((length, _)) => length,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::ConnectionReset
+                    ) =>
+                {
+                    if error.kind() == ErrorKind::ConnectionReset {
+                        continue;
+                    }
+                    return None;
+                }
+                Err(error) => panic!("the test's socket: {error}"),
+            };
+            let Some((Kind::Response, body)) = wire::open(&received[..length]) else {
+                continue;
+            };
+            if let Some((id, outcome)) = wire::read_response(body)
+                && id == request
+            {
+                return Some(outcome);
+            }
+        }
+    }
+    fn request(&mut self, id: u64, op: &Op<'_>) -> Option<Outcome> {
+        self.next_id += 1;
+        let request = self.next_id;
+        wire::put_request(&mut self.buffer, request, op);
+        self.ask(id, request)
+    }
+    fn control(&mut self, id: u64, control: &Control) {
+        self.next_id += 1;
+        let request = self.next_id;
+        wire::put_control(&mut self.buffer, request, control);
+        assert_eq!(
+            self.ask(id, request),
+            Some(Outcome::Done),
+            "member {id} took no instruction"
+        );
+    }
+    fn tell_peers(&mut self) {
+        let peers: Vec<(u64, SocketAddr)> = (1..=self.voters() as u64)
+            .map(|id| (id, self.address(id)))
+            .collect();
+        for id in 1..=self.voters() as u64 {
+            if self.up(id) {
+                self.control(id, &Control::Peers(peers.clone()));
+            }
+        }
+    }
+    fn status(&mut self, id: u64) -> Option<Status> {
+        match self.request(id, &Op::Status)? {
+            Outcome::Status(status) => Some(status),
+            other => panic!("member {id} answered a status with {other:?}"),
+        }
+    }
+    /// Kills member `id` with SIGKILL (TerminateProcess on Windows): no flush, no goodbye.
+    fn kill(&mut self, id: u64) {
+        let mut child = self.members[(id - 1) as usize]
+            .child
+            .take()
+            .expect("a member that is up");
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+    /// Starts member `id` again on its log, at the address it had.
+    fn restart(&mut self, id: u64) {
+        let member = &self.members[(id - 1) as usize];
+        assert!(member.child.is_none(), "member {id} is up");
+        let listen = member.address.to_string();
+        let (child, port) = spawn(
+            id,
+            self.voters(),
+            &listen,
+            &member.wal.clone(),
+            self.tick,
+            self.deadline,
+        );
+        assert_eq!(port, self.members[(id - 1) as usize].address.port());
+        self.members[(id - 1) as usize].child = Some(child);
+        self.tell_peers();
+    }
+    fn isolate(&mut self, id: u64, cut: bool) {
+        self.control(id, &Control::Isolate(cut));
+    }
+    /// Waits until the members in `among` agree on one leader of one term, which is among
+    /// them, and says which.
+    fn leader_among(&mut self, among: &[u64]) -> (u64, u64) {
+        for _ in 0..WAIT_ELECTIONS * 2 {
+            let mut seen: Vec<Status> = Vec::new();
+            for id in among {
+                if let Some(status) = self.status(*id) {
+                    seen.push(status);
+                }
+            }
+            let leaders: Vec<&Status> = seen.iter().filter(|status| status.leads).collect();
+            if let [leader] = leaders.as_slice()
+                && seen.len() == among.len()
+                && seen
+                    .iter()
+                    .all(|status| status.leader == leader.id && status.term == leader.term)
+            {
+                return (leader.id, leader.term);
+            }
+            // No agreement yet: the members are electing. The next round of statuses waits
+            // for them, through the time each answer takes.
+            self.wait_ticks(ELECTION_TICKS);
+        }
+        panic!("{}: no leader among {among:?}", self.name);
+    }
+    /// Lets `ticks` pass by waiting for an answer that does not come: the test's socket is
+    /// asked nothing, so the wait is the timeout itself.
+    fn wait_ticks(&mut self, ticks: u32) {
+        self.test.set_read_timeout(Some(self.tick * ticks)).unwrap();
+        let mut sink = [0u8; 64];
+        let _ = self.test.recv_from(&mut sink);
+    }
+    fn up_members(&self) -> Vec<u64> {
+        (1..=self.voters() as u64)
+            .filter(|id| self.up(*id))
+            .collect()
+    }
+    /// Waits until every member in `among` applied the same history through the same index.
+    fn converged(&mut self, among: &[u64]) -> Status {
+        for _ in 0..WAIT_ELECTIONS * 2 {
+            let seen: Vec<Status> = among.iter().filter_map(|id| self.status(*id)).collect();
+            if seen.len() == among.len()
+                && seen.iter().all(|status| {
+                    status.applied == seen[0].applied
+                        && status.digest == seen[0].digest
+                        && status.applied == status.commit
+                })
+                && seen[0].applied > 0
+            {
+                return seen[0];
+            }
+            self.wait_ticks(ELECTION_TICKS);
+        }
+        let seen: Vec<Option<Status>> = among.iter().map(|id| self.status(*id)).collect();
+        panic!("{}: the members did not converge: {seen:#?}", self.name);
+    }
+}
+
+/// What the client knows of the writes it made: the ones answered, which must be there, and
+/// the ones whose answer never came, which may or may not be.
+#[derive(Default)]
+struct History {
+    acked: BTreeMap<Vec<u8>, Vec<u8>>,
+    unknown: BTreeMap<Vec<u8>, Vec<u8>>,
+}
+
+struct Client {
+    leader: u64,
+}
+
+impl Client {
+    fn next(&self, cluster: &Cluster, from: u64) -> u64 {
+        let voters = cluster.voters() as u64;
+        let mut id = from;
+        for _ in 0..voters {
+            id = id % voters + 1;
+            if cluster.up(id) {
+                return id;
+            }
+        }
+        from
+    }
+    fn target(&self, hint: u64, cluster: &Cluster, from: u64) -> u64 {
+        if hint != 0 && cluster.up(hint) {
+            hint
+        } else {
+            self.next(cluster, from)
+        }
+    }
+    /// Writes `key`; true once a member answered that it is committed.
+    fn put(
+        &mut self,
+        cluster: &mut Cluster,
+        history: &mut History,
+        key: &[u8],
+        value: &[u8],
+    ) -> bool {
+        let mut target = self.leader;
+        for _ in 0..ATTEMPTS {
+            match cluster.request(target, &Op::Put { key, value }) {
+                Some(Outcome::Put(_)) => {
+                    self.leader = target;
+                    history.unknown.remove(key);
+                    history.acked.insert(key.to_vec(), value.to_vec());
+                    return true;
+                }
+                Some(Outcome::NotLeader(hint)) => target = self.target(hint, cluster, target),
+                Some(Outcome::Busy) => cluster.wait_ticks(1),
+                Some(other) => panic!("a write answered with {other:?}"),
+                None => {
+                    // No answer: the write may or may not be committed.
+                    history.unknown.insert(key.to_vec(), value.to_vec());
+                    target = self.next(cluster, target);
+                }
+            }
+        }
+        false
+    }
+    /// Reads `key` linearizably through the leader.
+    fn get(&mut self, cluster: &mut Cluster, key: &[u8]) -> Option<Vec<u8>> {
+        let mut target = self.leader;
+        for _ in 0..ATTEMPTS {
+            match cluster.request(target, &Op::Get { key }) {
+                Some(Outcome::Value(value)) => {
+                    self.leader = target;
+                    return value;
+                }
+                Some(Outcome::NotLeader(hint)) => target = self.target(hint, cluster, target),
+                Some(Outcome::Busy) => cluster.wait_ticks(1),
+                Some(other) => panic!("a read answered with {other:?}"),
+                None => target = self.next(cluster, target),
+            }
+        }
+        panic!(
+            "{}: no read of {:?} was answered",
+            cluster.name,
+            String::from_utf8_lossy(key)
+        );
+    }
+}
+
+/// Every write answered reads back as written, and every unanswered one reads back as written
+/// or as never written.
+fn verify(cluster: &mut Cluster, client: &mut Client, history: &History) -> usize {
+    for (key, value) in &history.acked {
+        let read = client.get(cluster, key);
+        assert_eq!(
+            read.as_deref(),
+            Some(value.as_slice()),
+            "{}: an answered write of {} was lost",
+            cluster.name,
+            String::from_utf8_lossy(key)
+        );
+    }
+    for (key, value) in &history.unknown {
+        let read = client.get(cluster, key);
+        assert!(
+            read.is_none() || read.as_deref() == Some(value.as_slice()),
+            "{}: {} reads as a value never written",
+            cluster.name,
+            String::from_utf8_lossy(key)
+        );
+    }
+    history.acked.len()
+}
+
+fn write_range(
+    cluster: &mut Cluster,
+    client: &mut Client,
+    history: &mut History,
+    keys: std::ops::Range<usize>,
+) {
+    for at in keys {
+        let key = format!("{}-{at}", cluster.name);
+        let value = format!("value-{at}");
+        assert!(
+            client.put(cluster, history, key.as_bytes(), value.as_bytes()),
+            "{}: a write of {key} was never answered",
+            cluster.name
+        );
+        // Read what was just answered: linearizability asks that it be there at once.
+        let read = client.get(cluster, key.as_bytes());
+        assert_eq!(
+            read.as_deref(),
+            Some(value.as_bytes()),
+            "{}: {key} did not read back",
+            cluster.name
+        );
+    }
+}
+
+/// A group of `voters` commits a workload, and every member applies it alike.
+fn commits(voters: usize, tick: Duration, name: &'static str) -> String {
+    let mut cluster = Cluster::start(name, voters, tick);
+    let all = cluster.up_members();
+    let (leader, _) = cluster.leader_among(&all);
+    let mut client = Client { leader };
+    let mut history = History::default();
+    let started = Instant::now();
+    write_range(&mut cluster, &mut client, &mut history, 0..200);
+    let elapsed = started.elapsed();
+    let checked = verify(&mut cluster, &mut client, &history);
+    let status = cluster.converged(&all);
+    format!(
+        "{name}: {voters} members; {checked} writes answered and read back ({:.2} ms per write and read); all applied index {} alike",
+        elapsed.as_secs_f64() * 1e3 / 200.0,
+        status.applied
+    )
+}
+
+/// The leader is killed while writes are in flight; the others elect, and nothing answered is
+/// lost. The killed member comes back on its log and applies the same history.
+fn leader_killed(tick: Duration) -> String {
+    let name = "leader-killed";
+    let mut cluster = Cluster::start(name, 3, tick);
+    let all = cluster.up_members();
+    let (old, old_term) = cluster.leader_among(&all);
+    let mut client = Client { leader: old };
+    let mut history = History::default();
+    write_range(&mut cluster, &mut client, &mut history, 0..50);
+    // Writes the leader has taken into its log, and has not answered, when it dies.
+    let before = cluster.status(old).unwrap().last_index;
+    for at in 50..55 {
+        let key = format!("{name}-{at}");
+        let value = format!("value-{at}");
+        cluster.next_id += 1;
+        wire::put_request(
+            &mut cluster.buffer,
+            cluster.next_id,
+            &Op::Put {
+                key: key.as_bytes(),
+                value: value.as_bytes(),
+            },
+        );
+        assert!(wire::seal(&mut cluster.buffer));
+        let address = cluster.address(old);
+        cluster.test.send_to(&cluster.buffer, address).unwrap();
+        history.unknown.insert(key.into_bytes(), value.into_bytes());
+    }
+    let mut appended = before;
+    for _ in 0..ATTEMPTS {
+        appended = cluster.status(old).unwrap().last_index;
+        if appended >= before + 5 {
+            break;
+        }
+    }
+    assert!(
+        appended >= before + 5,
+        "{name}: the leader never took the writes in flight"
+    );
+    cluster.kill(old);
+    let rest: Vec<u64> = cluster.up_members();
+    let (new, new_term) = cluster.leader_among(&rest);
+    assert_ne!(new, old);
+    assert!(new_term > old_term);
+    client.leader = new;
+    write_range(&mut cluster, &mut client, &mut history, 55..105);
+    let checked = verify(&mut cluster, &mut client, &history);
+    let unknown_present = history
+        .unknown
+        .keys()
+        .filter(|key| client.get(&mut cluster, key).is_some())
+        .count();
+    cluster.restart(old);
+    let status = cluster.converged(&all);
+    format!(
+        "{name}: leader {old} (term {old_term}) killed with 5 writes in its log unanswered; {new} elected in term {new_term}; {checked} answered writes read back; {unknown_present} of those 5 were committed by the new leader; member {old} restarted on its log and applied index {} alike",
+        status.applied
+    )
+}
+
+/// A follower is killed, the group goes on without it, and it comes back on its log and
+/// catches up.
+fn follower_restarts(tick: Duration) -> String {
+    let name = "follower-restarts";
+    let mut cluster = Cluster::start(name, 3, tick);
+    let all = cluster.up_members();
+    let (leader, _) = cluster.leader_among(&all);
+    let follower = all.iter().copied().find(|id| *id != leader).unwrap();
+    let mut client = Client { leader };
+    let mut history = History::default();
+    write_range(&mut cluster, &mut client, &mut history, 0..30);
+    cluster.kill(follower);
+    write_range(&mut cluster, &mut client, &mut history, 30..130);
+    let before = cluster.status(leader).unwrap();
+    cluster.restart(follower);
+    let status = cluster.converged(&all);
+    assert!(status.applied >= before.commit);
+    let checked = verify(&mut cluster, &mut client, &history);
+    format!(
+        "{name}: follower {follower} killed after 30 writes, 100 written without it, restarted on its log, caught up to index {} alike; {checked} writes read back",
+        status.applied
+    )
+}
+
+/// The leader of five is cut off by a drop filter in its own process. It answers no read with
+/// what the others replace; the others elect and go on; once the filter is lifted it follows
+/// and applies the same history.
+fn partition(tick: Duration) -> String {
+    let name = "partition";
+    let mut cluster = Cluster::start(name, 5, tick);
+    let all = cluster.up_members();
+    let (first, _) = cluster.leader_among(&all);
+    let mut client = Client { leader: first };
+    let mut history = History::default();
+    write_range(&mut cluster, &mut client, &mut history, 0..20);
+    let key = format!("{name}-moved");
+    assert!(client.put(&mut cluster, &mut history, key.as_bytes(), b"before"));
+    // The leader now, which the writes may have moved.
+    let (old, old_term) = cluster.leader_among(&all);
+    client.leader = old;
+    cluster.isolate(old, true);
+    // At once, while it still believes it leads: it can confirm nothing with a quorum, so it
+    // answers no read with a value and acknowledges no write; once its check of the quorum
+    // fails it steps down and tells whoever waits that it does not lead.
+    let early_read = cluster.request(
+        old,
+        &Op::Get {
+            key: key.as_bytes(),
+        },
+    );
+    assert!(
+        !matches!(early_read, Some(Outcome::Value(_))),
+        "{name}: the member cut off answered a read: {early_read:?}"
+    );
+    let early_write = cluster.request(
+        old,
+        &Op::Put {
+            key: key.as_bytes(),
+            value: b"cut-off",
+        },
+    );
+    assert!(
+        !matches!(early_write, Some(Outcome::Put(_))),
+        "{name}: the member cut off acknowledged a write: {early_write:?}"
+    );
+    history
+        .unknown
+        .insert(key.clone().into_bytes(), b"cut-off".to_vec());
+    let rest: Vec<u64> = all.iter().copied().filter(|id| *id != old).collect();
+    let (new, new_term) = cluster.leader_among(&rest);
+    assert!(new_term > old_term);
+    client.leader = new;
+    assert!(client.put(&mut cluster, &mut history, key.as_bytes(), b"after"));
+    // The write the cut-off member took was never committed: the group's value is "after".
+    history.unknown.remove(key.as_bytes());
+    write_range(&mut cluster, &mut client, &mut history, 20..60);
+    // The member cut off may still believe it leads; a read it answers must not be stale.
+    let stale = cluster.request(
+        old,
+        &Op::Get {
+            key: key.as_bytes(),
+        },
+    );
+    assert!(
+        !matches!(stale, Some(Outcome::Value(_))),
+        "{name}: the member cut off answered a read: {stale:?}"
+    );
+    cluster.isolate(old, false);
+    let status = cluster.converged(&all);
+    let (leader, _) = cluster.leader_among(&all);
+    let checked = verify(&mut cluster, &mut client, &history);
+    format!(
+        "{name}: leader {old} of 5 cut off; at once it answered a read with {early_read:?} and a write with {early_write:?}, and later the read of a replaced key with {stale:?}; {new} elected in term {new_term}; after the filter lifted, {leader} leads and all applied index {} alike; {checked} writes read back",
+        status.applied
+    )
+}
+
+/// Every member is killed at once and restarted on its log: every answered write survives.
+fn all_killed(tick: Duration) -> String {
+    let name = "all-killed";
+    let mut cluster = Cluster::start(name, 3, tick);
+    let all = cluster.up_members();
+    let (leader, _) = cluster.leader_among(&all);
+    let mut client = Client { leader };
+    let mut history = History::default();
+    write_range(&mut cluster, &mut client, &mut history, 0..50);
+    for id in &all {
+        cluster.kill(*id);
+    }
+    for id in &all {
+        cluster.restart(*id);
+    }
+    let (leader, term) = cluster.leader_among(&all);
+    client.leader = leader;
+    let checked = verify(&mut cluster, &mut client, &history);
+    let status = cluster.converged(&all);
+    format!(
+        "{name}: every member killed after 50 answered writes and restarted on its log; {leader} leads in term {term}; {checked} writes read back; all applied index {} alike",
+        status.applied
+    )
+}
+
+/// A scenario: run at a tick, it says what it saw.
+type Scenario = fn(Duration) -> String;
+
+fn main() -> ExitCode {
+    let tick = measure_tick();
+    let mut out = std::io::stdout().lock();
+    writeln!(
+        out,
+        "tick {} ms (twice the slowest of {FSYNC_SAMPLES} flushes)",
+        tick.as_millis()
+    )
+    .unwrap();
+    drop(out);
+    let scenarios: [(&str, Scenario); 6] = [
+        ("commits-3", |tick| commits(3, tick, "commits-3")),
+        ("commits-5", |tick| commits(5, tick, "commits-5")),
+        ("leader-killed", leader_killed),
+        ("follower-restarts", follower_restarts),
+        ("partition", partition),
+        ("all-killed", all_killed),
+    ];
+    let filter: Vec<String> = std::env::args()
+        .skip(1)
+        .filter(|arg| !arg.starts_with('-'))
+        .collect();
+    for (name, scenario) in scenarios {
+        if !filter.is_empty() && !filter.iter().any(|wanted| name.contains(wanted.as_str())) {
+            continue;
+        }
+        let started = Instant::now();
+        let said = scenario(tick);
+        let mut out = std::io::stdout().lock();
+        writeln!(out, "ok {said} [{:.1} s]", started.elapsed().as_secs_f64()).unwrap();
+    }
+    ExitCode::SUCCESS
+}

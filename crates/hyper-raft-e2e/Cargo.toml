@@ -1,0 +1,27 @@
+[package]
+name = "hyper-raft-e2e"
+description = "hyper-raft in real use: one OS process per member, on real UDP sockets and a real fsynced log, driven by tests that kill, restart and cut members off."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+hyper-raft = { path = "../hyper-raft" }
+# The codec of raft-rs's wire and log types, which hyper-raft speaks (prost).
+raft-proto.workspace = true
+
+[[bin]]
+name = "hyper-raft-node"
+path = "src/main.rs"
+
+[[test]]
+name = "cluster"
+# The scenarios run one after another in one thread: a cluster at a time, so the processes on
+# the machine stay few (CLAUDE.md §1a; no thread per anything).
+harness = false
+
+[lints]
+workspace = true

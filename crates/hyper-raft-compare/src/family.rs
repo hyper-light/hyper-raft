@@ -253,6 +253,7 @@ macro_rules! focal_core {
 
             impl Core for Node {
                 type Message = Message;
+                /// The name the tables give this core.
                 const NAME: &'static str = $name;
 
                 fn open(id: u64, voters: &[u64], settings: &Settings, seed: u64) -> Self {
@@ -452,6 +453,7 @@ pub mod raftrs {
 
     impl Core for Node {
         type Message = Message;
+        /// The name the tables give this core.
         const NAME: &'static str = "raft-rs 8e4cef1";
 
         fn open(id: u64, voters: &[u64], settings: &Settings, _seed: u64) -> Self {

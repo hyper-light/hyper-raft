@@ -129,6 +129,7 @@ impl<const PUBLISH: bool> Node<PUBLISH> {
 
 impl<const PUBLISH: bool> Core for Node<PUBLISH> {
     type Message = RaftMessage;
+    /// The name the tables give this core.
     const NAME: &'static str = if PUBLISH {
         "slates 5cce86a"
     } else {

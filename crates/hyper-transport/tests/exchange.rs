@@ -477,7 +477,9 @@ fn a_peer_that_stops_answering_is_given_up_within_its_period() {
     });
     assert_eq!(asker.asked[1].refused, Some((Refusal::Stalled, false)));
     let took = net.now - began;
-    assert!(took <= PERIOD * 2, "given up after {took:?}");
+    // The first judgement finds a period in which the peer said nothing: what was sent into its
+    // silence (the flight in the air and the probe timeout's probes) is no progress.
+    assert!(took <= PERIOD, "given up after {took:?}");
     assert_eq!(net.a.exchange_tail(2), Some(tail * 2));
 }
 

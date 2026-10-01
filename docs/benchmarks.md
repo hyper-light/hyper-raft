@@ -1061,8 +1061,18 @@ latency grid run on hyper-transport once slates' adapter drives it (note 32 §3.
 | exchanges | handshake 43–50 ms; 19 exchanges (control, request, bulk; 8 MiB and 16 × 64 KiB bodies) moved 9.0 MiB each way in 1.4–2.0 s; a vote answered in 1.3–13 ms |
 | reserve | four held bulk bodies stopped at 11,904 bytes, the peer's window less the bulk class's reserve; a vote crossed in 4.4–6.4 ms; the 16 MiB of bulk finished in 1.3–1.8 s once released |
 | refusals | kind, frame bound and budget refused by the peer, each typed; the exchange table's bound and the role refused locally; an identity past its bound replaced; one past the identity bound and an unknown certificate refused |
-| killed | an upload to a peer killed with SIGKILL refused as stalled 4.0 s after the kill (two 2 s periods); the next peer process answered after the route was retired |
+| killed | an upload to a peer killed with SIGKILL refused as stalled 3.95–3.96 s after the kill in six runs at load 28–36 (two 2 s periods: the judgement after the kill still hears the peer's last acknowledgements, the next hears silence); the next peer process answered after the route was retired. Before the fix below, one loaded gate run took 7.96 s, four periods |
 | lanes | 8,000 frames of 512 B on two lanes, echoed by the peer, in order, in 152 ms |
+
+**What sent into silence is not progress.** The first version counted a period's sent bytes alone,
+as focal's `carried` did. After a peer died the sender kept sending: the flight in the air, then the
+probe timeout's probes (RFC 9002 §6.2.4), a datagram or two each at a doubling backoff. Every period
+that held a probe counted as progress, so the end varied with how the backoff fell against the
+periods: two periods on one run, four on a loaded gate run. A period now also has to hear the peer;
+a live peer acknowledges within its `max_ack_delay` (RFC 9000 §13.2.1). In the in-memory test the
+dead peer's exchange now ends at the first judgement (it took two, the first having counted 13,776
+bytes sent into silence), and `progress::tests::what_is_sent_into_silence_is_not_progress` fails
+without the change.
 
 ## Commands for the transport
 

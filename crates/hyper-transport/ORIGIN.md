@@ -55,6 +55,13 @@ source: its credit law (`flow.rs`, `connection.rs`) is taken here. Neither repos
 
 ## Departures found while porting
 
+- **What is sent into silence is not progress.** focal's `carried` charged a period with the bytes
+  the connection sent and did not find lost. After a peer dies the sender still sends: the flight in
+  the air, then the probe timeout's probes, a datagram or two each at a doubling backoff, so every
+  period that held a probe kept the exchange alive and the end depended on where the backoff fell (a
+  killed peer's upload ended after two periods on one run, four on another). A period now also has to
+  have heard the peer (`progress.rs`; `what_is_sent_into_silence_is_not_progress`).
+
 - **Strict priority where credit is taken.** quinn orders what is buffered by stream priority, but
   connection credit is charged when an application writes. An owner that wrote its bulk body first
   starved its own requests of credit: the end-to-end run found request bodies stalled behind an 8 MiB

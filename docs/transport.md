@@ -216,8 +216,9 @@ which the end-to-end run showed quinn's send-order priority alone does not give)
 starts at RFC 9002's initial window plus the reserve and doubles when consumed within two round
 trips (Chromium's rule; a round trip under the 1 ms timer granularity counts as 1 ms), each growth
 reserved from the budget; the stream window is quinn's assembler limit made explicit (patch Q5).
-Exchanges are judged by progress-charged deadlines (T39); an owner that is not reading a body is not
-charged for it. Replication frames travel on lanes, unidirectional streams as wide as the core's
+Exchanges are judged by progress-charged deadlines (T39); a period's sent bytes count only if the
+peer was heard in it, so probes sent to a dead peer do not keep its exchanges alive, and an owner that
+is not reading a body is not charged for it. Replication frames travel on lanes, unidirectional streams as wide as the core's
 window, always read; a frame its class or the budget cannot take is skipped and counted. Admission
 bounds pending handshakes (Retry under load), identities, connections per identity (the one used
 longest ago replaced) and connections in all; every exchange and lane has a table bound. Every

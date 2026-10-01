@@ -8,9 +8,15 @@
 //!
 //! - **Asking**: the request is being carried and the reply's prefix has not arrived. A period is
 //!   charged what the connection sent and did not lose in it. The exchange ends at the end of a
-//!   period that sent less than a datagram, and at the end of one that began when all the
+//!   period that sent less than a datagram, or in which the peer sent nothing at all, and at the
+//!   end of one that began when all the
 //!   exchanges on the connection had to send beside it, and its own bytes, had been sent: the peer
-//!   had the request and a period to answer it.
+//!   had the request and a period to answer it. What was sent is progress only while the peer is
+//!   heard: a live peer acknowledges what it receives within its `max_ack_delay` (RFC 9000 §13.2.1,
+//!   25 ms by default, §18.2), so a period that heard nothing is silence, and what the sender put
+//!   into it (the flight in the air, then the probe timeout's probes, which RFC 9002 §6.2.4 sends
+//!   whether or not the peer lives) moved nothing. A period is to be longer than the peer's
+//!   acknowledgement delay; focal's `carried` counted bytes sent alone.
 //! - **Answering**: the reply's prefix arrived and its body is arriving. A period must bring a
 //!   datagram's worth of the connection's received bytes or the body's end, and the body is given no
 //!   longer than its residency: what its bytes take at the least a live sender delivers, two
@@ -179,7 +185,8 @@ impl Carry {
         match &mut self.phase {
             Phase::Asking { owed, charged, had } => {
                 let sent = moved.sent.saturating_sub(before.sent);
-                if *had || sent < LEAST_PROGRESS {
+                let heard = moved.received.saturating_sub(before.received);
+                if *had || sent < LEAST_PROGRESS || heard == 0 {
                     return Err(Refusal::Stalled);
                 }
                 *charged = charged.saturating_add(sent);
@@ -236,13 +243,34 @@ mod tests {
             let now = start + PERIOD * u32::try_from(period).unwrap();
             let sent = 12_500 * period;
             carry
-                .judge(now, moved(sent, 0), 1_000_000 - sent.min(1_000_000), PERIOD)
+                .judge(
+                    now,
+                    moved(sent, period * 100),
+                    1_000_000 - sent.min(1_000_000),
+                    PERIOD,
+                )
                 .unwrap();
         }
         // Everything was sent by the 80th period: the peer had the request and the 81st to answer.
         let now = start + PERIOD * 81;
         assert_eq!(
-            carry.judge(now, moved(1_000_000 + 1_200, 0), 0, PERIOD),
+            carry.judge(now, moved(1_000_000 + 1_200, 8_200), 0, PERIOD),
+            Err(Refusal::Stalled)
+        );
+    }
+
+    /// A peer that died leaves the sender sending into silence: the flight in the air, then the
+    /// probe timeout's probes, which RFC 9002 §6.2.4 sends whether or not the peer lives, a
+    /// datagram or two each, at a backoff that doubles. Counted as progress, they kept an exchange
+    /// to a killed peer alive for as many periods as held a probe: two periods on one run of the
+    /// end-to-end scenario, four on another.
+    #[test]
+    fn what_is_sent_into_silence_is_not_progress() {
+        let start = Instant::now();
+        let mut carry = Carry::idle(Progress::new(PERIOD).unwrap(), start, moved(0, 0));
+        carry.asking(start, moved(0, 0), 1_000_000);
+        assert_eq!(
+            carry.judge(start + PERIOD, moved(13_776, 0), 1_000_000, PERIOD),
             Err(Refusal::Stalled)
         );
     }
@@ -257,7 +285,7 @@ mod tests {
             .judge(start + PERIOD / 2, moved(500, 0), 10_000, PERIOD)
             .unwrap();
         assert_eq!(
-            carry.judge(start + PERIOD, moved(500 + 1_199, 0), 10_000, PERIOD),
+            carry.judge(start + PERIOD, moved(500 + 1_199, 300), 10_000, PERIOD),
             Err(Refusal::Stalled)
         );
     }

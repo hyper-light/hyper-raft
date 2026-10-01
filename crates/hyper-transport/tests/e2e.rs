@@ -710,6 +710,11 @@ fn killed() -> String {
         |_, asker| asker.asked[upload].done,
     );
     assert_eq!(asker.asked[upload].refused, Some((Refusal::Stalled, false)));
+    // The judgement after the kill still hears what the peer sent before it; the one after that
+    // hears silence and ends the exchange: at most two periods after the kill, the third the
+    // driver's lateness on a loaded machine. Before what was sent into silence stopped counting
+    // as progress, every period holding a probe-timeout probe carried the exchange on (7.96 s,
+    // four periods, on one loaded run).
     assert!(ended <= PERIOD * 3, "ended {ended:?} after the kill");
     // The route is retired and a new process reached.
     node.disconnect(Instant::now(), 2);

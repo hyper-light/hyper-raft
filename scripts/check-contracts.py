@@ -32,6 +32,8 @@ UNSAFE_ALLOWED = {
         "IOCTL_DISK_GET_LENGTH_INFO (a device's capacity)",
     "crates/hyper-block/src/threads/macos.rs":
         "proc_pidinfo and sysctlbyname (the process's threads and the workqueue's thread ceiling)",
+    "crates/hyper-tokio/src/sys/linux.rs":
+        "sendmmsg(2), recvmmsg(2) and the UDP_SEGMENT and UDP_GRO options and control messages (udp(7))",
     "crates/hyper-block/src/threads/windows.rs":
         "ToolHelp snapshots and GetThreadTimes (the process's threads and a thread's CPU time)",
 }

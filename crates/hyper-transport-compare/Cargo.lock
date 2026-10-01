@@ -553,6 +553,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "hyper-datagram"
+version = "0.1.0"
+dependencies = [
+ "aws-lc-rs",
+ "crc32c",
+]
+
+[[package]]
 name = "hyper-measure"
 version = "0.1.0"
 dependencies = [
@@ -599,6 +607,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "hyper-tokio"
+version = "0.1.0"
+dependencies = [
+ "hyper-datagram",
+ "hyper-transport",
+ "libc",
+ "tokio",
+]
+
+[[package]]
 name = "hyper-transport"
 version = "0.1.0"
 dependencies = [
@@ -615,6 +633,7 @@ version = "0.1.0"
 dependencies = [
  "focal-wire",
  "hyper-measure",
+ "hyper-tokio",
  "hyper-transport",
  "quinn",
  "rcgen",

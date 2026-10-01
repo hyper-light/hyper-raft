@@ -1,6 +1,6 @@
 [package]
 name = "hyper-transport-compare"
-description = "hyper-transport measured against the application layer it replaces, on one workload: focal-wire's core (its transport configuration, its frame codec and its per-exchange stream over quinn and tokio)."
+description = "hyper-transport measured against the application layer it replaces, on one workload: focal-wire's core (its transport configuration, its frame codec and its per-exchange stream over quinn), both on tokio."
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.98"
@@ -14,6 +14,7 @@ publish = false
 [dependencies]
 hyper-transport = { path = "../hyper-transport" }
 hyper-measure = { path = "../hyper-measure" }
+hyper-tokio = { path = "../hyper-tokio" }
 rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem"] }
 # focal-wire at focal `99191da` (branch slates-port), the source this crate was ported from.
 focal-wire = { git = "https://github.com/hyper-light/focal", rev = "99191dafbdda681caf3a948caf37fa7646c308aa" }

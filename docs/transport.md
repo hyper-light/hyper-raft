@@ -226,17 +226,81 @@ refusal is typed, and one that ends an exchange crosses the wire as the stream r
 
 **Measured** (`docs/benchmarks.md`, "hyper-transport against focal-wire's core"): an exchange adds
 0.27 allocations to the bare hyper-quic stream without a body and about 5 with one (three QUIC
-writes a side, each copied by hyper-quic); against focal-wire's core on loopback it makes half the
-allocations of a small exchange and a third to a half of the bytes at every size, and its rounds
-are faster at every size, on a machine at load 22 to 27. End to end, between real processes over
+writes a side, each copied by hyper-quic); against focal-wire's core on loopback, both on tokio
+and parked the same way (hyper-transport under hyper-tokio, §4b), its rounds are 8 to 65 % shorter
+at every size and it makes half the allocations of a small exchange and two fifths to a half of
+the bytes at every size, at load 36 to 50; it loses on reallocations, 1.9 to 4 a round with a
+body against 0 to 0.13. End to end, between real processes over
 UDP: exchanges in every class with megabyte bodies, the reserve keeping a vote moving past held
 bulk, typed refusals at every bound, a peer killed mid-upload, and frames on lanes in order.
 
-**Owed.** The tokio adapter (`hyper-tokio`, T-1's second half) and focal-wire's domain layer over
-this crate, with focal's suites as the gate; the TCP fallback (T53); slates' class-latency grid on
-this layer; the 1.5 to 3 reallocations an exchange of the larger bodies makes before its
-reservations reach their size; a frame bound a lane's frames are checked against apart from the
-message bound.
+**Owed.** focal-wire's domain layer over this crate, with focal's suites as the gate; the TCP
+fallback (T53); slates' class-latency grid on this layer; the 1.9 to 4 reallocations an exchange
+with a body makes against focal-wire's 0 to 0.13; a frame bound a lane's frames are checked against
+apart from the message bound.
+
+## 4b. The tokio adapter: `hyper-tokio` (T-1's second half, 2026-10-01)
+
+Built: `crates/hyper-tokio`, the only crate here that names a runtime (note 32 §6 item 6); slates
+never depends on it.
+
+**The API.**
+- `Driver<C, B, D>`: one hyper-transport `Endpoint`, its UDP socket and one timer.
+  - `Driver::bind(endpoint, address, io)` or `Driver::new(endpoint, std_socket, io)`, within a
+    tokio runtime with its I/O and time drivers; otherwise `Error::Runtime`.
+  - `event().await` (or `poll_event`) returns the endpoint's next event. Until one is ready it
+    drains the socket, fires the timers due, sends what the endpoint transmits, and parks on the
+    socket and the timer. An event already queued is handed out with no system call.
+  - `endpoint()` lends the endpoint for the owner's calls between events; `flush()` sends what
+    those calls queued without waiting; `stats()` counts datagrams, system calls and drops.
+- `PlaneSocket`: a hyper-datagram `Plane`'s own socket. `flush(plane, route, refused)` seals and
+  sends; `receive(plane, fence, deliver).await` opens a batch.
+- `Io { batch }`: the datagrams one system call carries either way, 1 to `UIO_MAXIOV` (1,024).
+
+**Shape.** The owner's task holds the driver and awaits it. tokio wakes that task through the
+socket's and the timer's wakers. Inside there is no task, thread, channel, lock or `Arc`, and no
+thread per connection or exchange. `event` and `receive` take and process a batch with no await in
+between, so dropping them loses nothing: an owner selects over them and its own work. tokio holds
+its scheduler and driver handles by `Arc` inside the runtime; that is tokio's code, not a site in
+this crate.
+
+**Bounds.**
+- The outbox holds at most `batch` datagrams. A datagram past it, with the socket full, is dropped
+  and counted; QUIC recovers it, and the plane retransmits nothing by design.
+- A turn drains at most 128 batches, and one poll takes at most 128 turns before it yields. 128 is
+  tokio's cooperative budget a task a poll.
+- Receive buffers are 64 KiB each (`GRO_LEGACY_MAX_SIZE`): `batch` of them on Linux, one
+  elsewhere.
+
+**Errors.**
+- A receive error that reports an earlier datagram gone astray is counted and read past: Windows'
+  reset after a send to a closed port, and refused or unreachable reports.
+- Any other receive error is `Error::Io`.
+- A send the kernel refuses is a lost datagram, dropped and counted. An `EIO` from a segmented
+  send turns segmentation off, since the device cannot segment.
+- tokio panics when no runtime, or no I/O or time driver, is current. Registration runs behind an
+  unwind boundary that returns `Error::Runtime`.
+
+**Sockets.** The owner's decisions: epoll on Linux, kqueue on macOS and IOCP on Windows (tokio's
+reactor); no io_uring; no AF_XDP.
+- Linux sends with `sendmmsg(2)` and receives with `recvmmsg(2)`. Consecutive equal-sized
+  datagrams to one destination go as one segmented message (`UDP_SEGMENT`, at most 64 segments and
+  65,507 bytes). Coalesced receives (`UDP_GRO`) are split by the segment size the kernel reports.
+  Each offload is used only where the kernel accepts the socket option (`src/sys/linux.rs`, the
+  one file with `unsafe`).
+- macOS and Windows send and receive one datagram a system call through tokio.
+- Owed: Windows' `UDP_SEND_MSG_SIZE` and `UDP_RECV_MAX_COALESCED_SIZE`. ECN marks are not set or
+  read, so the endpoint is handed none.
+
+**Measured** (`docs/benchmarks.md`, "Against focal-wire" and "hyper-tokio end to end").
+- In steady state the adapter allocates nothing a round: a 64 B round is 12.4 allocations under it,
+  as under the busy-polled driver it replaced in the comparison.
+- Real processes on macOS and on Linux pass every scenario: exchanges in every class with every
+  byte checked while the owner's tick drops the driver's future mid-wait, lane frames in order,
+  plane messages keyed from the connection's exporter, and a peer killed mid-upload.
+- On Linux a `sendmmsg` call carries 7.5 to 8 datagrams and a `recvmmsg` call 13 to 19.
+- Draining the socket before surfacing an event, rather than one batch a turn, cut a 64 KiB round
+  from 762 to 648 µs and its datagrams from 108.6 to 97.0.
 
 ## 5. Consumers
 

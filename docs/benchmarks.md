@@ -982,8 +982,9 @@ what the layer adds, and its cost against the core it replaces, focal-wire's, on
 
 The same Apple M5 Max (18 cores, 128 GiB), macOS 26.4.1, rustc 1.98.0, 2026-10-01 between 13:16
 and 13:40 PDT, shared with other sessions building and testing: the load average was 22 to 27
-during every run. Allocation counts are exact whatever the load; times are medians of the rounds of
-a row, and the comparison was run in four fresh processes.
+during every run of the allocation bench and the end-to-end scenarios of hyper-transport. Allocation
+counts are exact whatever the load. The comparison against focal-wire was run later, at the load
+its section states.
 
 ## Allocations
 
@@ -1021,28 +1022,97 @@ What the layer adds:
 ## Against focal-wire
 
 `crates/hyper-transport-compare` (a workspace of its own; focal-wire from focal at `99191da`): two
-endpoints in one process over two UDP sockets on loopback, one thread. One round is a request of
-the size and a reply of the size, the next round once the reply is whole. focal-wire runs its own
-transport configuration (`server_tls`, `client_tls`, `quic_transport`), its frame codec
-(`write_frame`, `read_frame_header`, `read_payload_arriving`, `require_end`) and its exchange shape
-(a bidirectional stream per request) over quinn 0.11 on a current-thread tokio runtime; its domain
-envelope and registry are left out. hyper-transport drives both endpoints from one loop polling the
-two non-blocking sockets, which spins where tokio parks: the times favour it on an idle machine and
-are recorded here on a loaded one. 2,000 rounds (250 at 512 KiB) after a tenth as many; four runs;
-the medians of the four runs' medians, the range beside them.
+endpoints in one process over two UDP sockets on loopback, on one current-thread tokio runtime,
+the answering side in a spawned task and the asking side in the runtime's own. One round is a
+request of the size and a reply of the size, the next round once the reply is whole. Both sides
+are driven the same way: parked on tokio's reactor (kqueue here) and timer between datagrams.
+- focal-wire runs its own transport configuration (`server_tls`, `client_tls`,
+  `quic_transport`), its frame codec (`write_frame`, `read_frame_header`,
+  `read_payload_arriving`, `require_end`) and its exchange shape (a bidirectional stream per
+  request, a task per request on the answering side) over quinn 0.11; its domain envelope and
+  registry are left out.
+- hyper-transport runs each endpoint under hyper-tokio's `Driver`, with a batch of 10 (one of
+  macOS's datagrams a system call either way, as quinn's here).
 
-| Size each way | focal-wire round | hyper-transport round | focal-wire allocations | hyper-transport allocations | focal-wire bytes | hyper-transport bytes |
+An earlier version of this table drove hyper-transport from one loop that busy-polled both
+sockets while focal-wire parked, which favoured hyper-transport's round times; those rows are
+replaced by these.
+
+The machine is the one above, 2026-10-01 14:15–14:18 PDT, load average 35.7 to 49.5 (median 43.5)
+across the rows. Each row is a fresh process; nine runs visit the eight rows in an order rotated by
+one from the run before (`compare.sh`). 2,000 rounds (250 at 512 KiB) after a tenth as many. The
+round is the median of the nine runs' medians, the range of those medians beside it. Allocations,
+reallocations and bytes are the whole process's per round, both sides and tokio included;
+datagrams are those the asking side sent and received per round.
+
+| Size each way | | Round | Allocations | Reallocations | Bytes | Datagrams |
 |---|---|---|---|---|---|---|
-| 64 B | 98 µs (79–158) | 35 µs (35–38) | 24.7 | 12.4 | 2,714 | 1,268 |
-| 4 KiB | 107 µs (85–151) | 62 µs (60–64) | 36.0 | 19.8 | 43,438 | 16,700 |
-| 64 KiB | 783 µs (756–798) | 688 µs (668–721) | 234.7 | 212.0 | 680,850 | 286,905 |
-| 512 KiB | 6,665 µs (6,393–7,011) | 5,516 µs (5,391–5,909) | 1,742 | 1,613 | 5,437,000 | 2,293,000 |
+| 64 B | focal-wire | 199 µs (94–262) | 24.7 | 0 | 2,714 | 2.7 |
+| | hyper-transport | 70 µs (64–124) | 12.4 | 0 | 1,266 | 2.8 |
+| 4 KiB | focal-wire | 115 µs (101–152) | 36.0 | 0 | 43,439 | 8.3 |
+| | hyper-transport | 82 µs (74–94) | 20.1 | 1.88 | 17,186 | 8.2 |
+| 64 KiB | focal-wire | 706 µs (700–726) | 233.5 | 0.01 | 680,969 | 100.1 |
+| | hyper-transport | 648 µs (639–675) | 212.3 | 2.00 | 286,430 | 97.0 |
+| 512 KiB | focal-wire | 5,798 µs (5,570–6,066) | 1,743.7 | 0.13 | 5,437,834 | 800.9 |
+| | hyper-transport | 4,806 µs (4,640–5,020) | 1,618.3 | 4.00 | 2,294,453 | 749.3 |
 
-hyper-transport makes half focal-wire's allocations for a small exchange and a third to a half of
-its bytes at every size: focal-wire allocates each payload whole before reading it and serialises
-each into a fresh buffer, where hyper-transport reads into the budget's recycled reservations.
-Reallocations are focal-wire's 0 against 1.5 to 3 here, the reservation buffers growing to the
-largest body before the warm-up ends at the larger sizes; that row is owed.
+A second pass of five runs at load 32.8 to 35.4 (14:18–14:19) agreed: 86 against 123 µs at 64 B,
+83 against 138 at 4 KiB, 651 against 725 at 64 KiB, 4,860 against 6,032 at 512 KiB, every count
+within 1 % of the table's.
+
+**Where hyper-transport wins.** Its rounds are shorter at every size on the same driving model:
+by 65 % at 64 B, 29 % at 4 KiB, 8 % at 64 KiB and 17 % at 512 KiB; the 64 B rows of both spread
+widely under this load. It makes half focal-wire's allocations at 64 B, 44 % fewer at 4 KiB and 7
+to 9 % fewer at 64 and 512 KiB, and two fifths to a half of its bytes: focal-wire allocates each payload whole before reading it and
+serialises each into a fresh buffer, where hyper-transport reads into the budget's recycled
+reservations.
+
+**Where hyper-transport loses.**
+- **Reallocations**: 1.9 to 4 a round with a body, against focal-wire's 0 to 0.13. The
+  reservation buffers grow to the largest body before the warm-up ends, as the in-memory bench
+  found; at 512 KiB the count rose from 1.85 to 4.00 with the drain below, not yet traced. This
+  row is owed.
+- **Datagrams at 64 B**: 2.8 a round against 2.7, an acknowledgement more in one round of ten.
+- **Allocations against its own earlier driver**: draining every datagram that has arrived before
+  surfacing an event (below) cut the datagrams of a 64 KiB round from 108.6 to 97.0 and its time
+  from 762 to 648 µs, but holds more datagrams at once, so hyper-quic's reused receive buffer is
+  reclaimed less often: 195 allocations a 64 KiB round became 212, 1,483 at 512 KiB became 1,618.
+
+**The adapter's turn order, measured.** hyper-tokio's first version took one batch of datagrams a
+turn and surfaced the endpoint's event before reading more. On this workload it lost at 64 KiB:
+762 µs (751–1,461) against focal-wire's 731 (710–1,193), nine runs at load 33.5 to 45.8, with 108.6
+datagrams a round against 100.4. A profile of each process over 5 s at 64 KiB (`sample`) put
+hyper-transport's thread in `sendto` for 2,170 of its samples and parked in `kevent` for 15, where
+focal-wire's spent 935 in `sendmsg` and 2,292 parked: hyper-transport's endpoint answered each
+batch as it came, in more and smaller acknowledgements and window updates. The driver now drains
+the socket, up to 128 batches, before it fires timers, sends and surfaces an event, and hands out an
+event already queued without any system call; the table above is that version.
+
+## hyper-tokio end to end
+
+`cargo test -p hyper-tokio --test e2e`: the asking process and one peer process, each a
+current-thread tokio runtime whose one task owns a `Driver` and a `PlaneSocket`; the asking task
+races every wait against its own 1 ms tick, so the driver's future is dropped mid-wait whenever the
+tick wins. macOS on this machine at load 33 to 45 (debug build), and Linux (`rust:1.98.0`
+container on the same machine, aarch64, kernel with `UDP_SEGMENT` and `UDP_GRO`; five runs).
+
+| Scenario | macOS | Linux |
+|---|---|---|
+| exchanges: 19 exchanges in every class, 8 MiB and 16 × 64 KiB bodies each way, every byte checked | 9.0 MiB each way in 1.01–1.46 s (the busy-polled driver of `hyper-transport`'s E2E: 1.33 s at the same load); a vote answered in 12–25 ms; the driver's future dropped mid-wait 29–64 times | 0.97–1.29 s; a vote in 13–16 ms; 7,100–7,400 datagrams each way |
+| lanes: 8,000 frames of 512 B on two lanes, echoed in order | 144 ms | 132–184 ms; 7.5–8.1 datagrams a `sendmmsg` call, 13.6–18.7 a `recvmmsg` call (segmented and coalesced) |
+| plane: 2,000 messages of 48 B sealed under keys from the connection's TLS exporter, on a socket of their own, echoed | 87 datagrams, none sent again, 19 ms | 87 datagrams, none sent again, 15–17 ms |
+| killed: a peer killed with SIGKILL mid-upload | refused as stalled 3.93–3.98 s after the kill (two 2 s periods); the next peer process answered; no receive error | 3.95–3.96 s; the next peer answered |
+
+Release builds on macOS, minutes apart: the exchanges scenario in 104 ms against the busy-polled
+driver's 99 ms.
+
+**A finding in the harness, not the adapter.** The first harness moved every exchange (a pass that
+fills a 64 KiB piece for each blocked body) after every single event. On Linux that owner fell so
+far behind that the peer refused seven of the sixteen 64 KiB requests as stalled at its 2 s period,
+and on macOS the scenario took 3.4 s. An owner takes the event it woke for and every one queued
+behind it (`Endpoint::poll_event`) before it moves its exchanges, as the busy-polled E2E did; then
+every run passed. The adapter hands out an event already queued without a system call, so that
+pattern costs nothing.
 
 ## Against slates' session plane
 
@@ -1081,6 +1151,13 @@ without the change.
 cargo test -p hyper-transport
 # Allocations per exchange and per frame.
 cargo bench -p hyper-transport --bench allocs
-# The comparison against focal-wire (fetches focal at 99191da).
-cd crates/hyper-transport-compare && cargo run --release -- 2000
+# The comparison against focal-wire (fetches focal at 99191da): nine rotated runs of fresh
+# processes, then the table.
+bash crates/hyper-transport-compare/compare.sh 9
+# One row: implementation (focal or hyper), size, rounds.
+cd crates/hyper-transport-compare && cargo run --release -- hyper 65536 2000
+# hyper-tokio: the end-to-end scenarios, and the refusals.
+cargo test -p hyper-tokio
+# The same on Linux, in a container on this machine (sendmmsg, recvmmsg, UDP_SEGMENT, UDP_GRO).
+docker run --rm -v "$PWD":/work -w /work rust:1.98.0 cargo test -p hyper-tokio --locked
 ```

@@ -1,0 +1,35 @@
+[package]
+name = "hyper-tokio"
+description = "The tokio adapter: drives a hyper-transport endpoint and a hyper-datagram plane on tokio, owning their UDP sockets and timers, with batched sends and receives where the platform has them"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+hyper-transport = { path = "../hyper-transport" }
+hyper-datagram = { path = "../hyper-datagram" }
+# The runtime this adapter serves (mantle note 32 §6 item 6: a separate crate; the sans-io crates
+# never name a runtime). Only its reactor (epoll, kqueue, IOCP) and its timer are used.
+tokio = { version = "1.48", default-features = false, features = ["net", "time"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# sendmmsg(2), recvmmsg(2) and the UDP_SEGMENT and UDP_GRO socket options and control messages,
+# which neither std nor tokio expose (hyper-measure's own dependency, already in the graph).
+libc = "0.2.189"
+
+[dev-dependencies]
+hyper-measure = { path = "../hyper-measure" }
+tokio = { version = "1.48", default-features = false, features = ["net", "time", "rt"] }
+# Certificates for the tests' mutual TLS (hyper-transport's own dev-dependency).
+rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem"] }
+
+[[test]]
+name = "e2e"
+# The scenarios run one after another, each with its peer processes; the binary is also the peer
+# process (CLAUDE.md §1a).
+harness = false
+
+[lints]
+workspace = true

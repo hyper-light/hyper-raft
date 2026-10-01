@@ -57,6 +57,43 @@ modules included: 182 `Arc` sites, 18 `Mutex`/`RwLock`, about 570 `unwrap`/`expe
 - **Licence.** Upstream's MIT/Apache-2.0 licence files are kept with the vendored source, and the upstream
   version and commit are recorded.
 
+### 3.1 Shared configuration without `Arc`
+
+quinn-proto shares immutable configuration among an endpoint and its connections by `Arc`. That
+covers the transport config, the TLS configs, the token and reset keys, the time source, the
+congestion factory and the initial-CID provider. rustls holds its config by `Arc` inside every
+handshake state. Two replacements were weighed and rejected:
+- **Process-lifetime `&'static` values.** Every certificate rotation would leak its config. With
+  certificates as short as 6 days (Let's Encrypt's short-lived certificates; CA/B Forum ballot
+  SC-081 caps lifetimes at 47 days by 2029), that growth has no bound but the process's life.
+- **A `Connection<'c>` borrowing from an append-only arena.** It has the same leak, and it pins
+  every consumer to one scope for the life of the arena.
+
+Chosen design, by kind of state:
+- **Plain data is copied into its owner.** A connection takes its own `TransportConfig` value,
+  a few hundred bytes. Congestion control is a closed enum of controllers carried by value
+  (`Cubic`, `NewReno`, `Bbr`, and Copa when it lands). That replaces the shared
+  `ControllerFactory`, and it makes the controller set one reviewed list, not a plug-in point.
+- **Shared immutable objects live in the endpoint's `Configs` slab.** These are the TLS configs,
+  the handshake-token and reset keys, the time source and the initial-CID provider.
+  - A connection holds a generation-checked handle.
+  - Each call that needs configuration takes `&Configs`: handling a datagram or a timeout,
+    polling a transmit, and the handshake's TLS steps.
+  - The endpoint counts the connections on each slot, as bookkeeping, not ownership, through the
+    drain events quinn-proto already sends.
+  - A slot that has been superseded and has no connections left is reclaimed. A full slab is a
+    typed refusal of the new configuration.
+  - Rotation therefore costs memory only while old connections live.
+- **Shared mutable state moves to its single owner.**
+  - The address-validation token log is consulted only by the endpoint, so the endpoint owns it
+    without a lock.
+  - The client's token store moves to the caller: a connection reports a received NEW_TOKEN as an
+    event instead of writing a shared store under a mutex.
+  - A qlog writer is owned by its connection.
+- **rustls follows the same rule.** Its handshake states take the config as a call argument
+  instead of holding `Arc<ServerConfig>`. Certificate resolvers, session stores, ticketers and the
+  crypto provider are borrowed from that config for the call.
+
 ## 4. Stages
 
 Each stage lands with its tests, its GAPS row and its design status in the same commit.

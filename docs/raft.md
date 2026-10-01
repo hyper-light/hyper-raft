@@ -53,10 +53,10 @@ Errors are of three kinds:
 
 Every queue has a bound in `Limits`.
 
-It keeps raft-rs's wire and log types through `raft-proto`, at the raft-rs revision focal and mantle
-pin (`8e4cef172421bf77b2ae1c26628a9531b0be41f0`). So a member on this core and a member on raft-rs
-exchange the same bytes. `tests/differential.rs` runs both cores on one schedule and compares them after
-every step. raft-rs is a dev-dependency only.
+It declares its own message and log types and writes them in its own format (§3.1). raft-rs, at the
+revision focal and mantle pin (`8e4cef172421bf77b2ae1c26628a9531b0be41f0`), is a dev-dependency only:
+`tests/differential.rs` runs both cores on one schedule and compares what they say after every step,
+field by field through an adapter between the two sets of types.
 
 The crate is sans-io, as every crate here is (`CLAUDE.md` §1). A durable shell drives it: today focal's
 `focal-consensus` and mantle's `crates/range` replica, and later `hyper-durable` (§4).
@@ -88,7 +88,7 @@ includes the consumers' suites. They run when each consumer takes a snapshot und
 | Step | What changes | Gate |
 |---|---|---|
 | **R-1** (done here) | focal-raft moved and conformed; no behaviour change. | focal-raft's own tests and the raft-rs differential, identical before and after (done, `ORIGIN.md`). Still to run: focal's full suite with focal on a snapshot of this crate, and mantle's `crates/range` suite including `sim.rs`. |
-| **R-2** | Own message types. `raft-proto` is replaced by the same messages declared as Rust structs with `prost` derive. No protoc, no build script, and no second git source in production. | Golden vectors equal for every message and entry type. The differential unchanged: raft-rs on its own types, this core on the new ones, compared by encoded bytes. focal's WAL replay of a recorded data directory. |
+| **R-2** | Own message types and **its own wire format** (the owner's decision, 2026-10-01: hyper-raft speaks its own protocol, not raft-rs's). The types are plain Rust structs with typed kinds; the encoding is §3.1's. No protobuf, no `prost`, no `raft-proto` in production. | Golden vectors of the new format pinned for every type. The differential unchanged in what it compares: raft-rs on its own types, this core on its own, compared field by field through the test adapter. Decoding refuses every truncation and corruption of every golden vector, never panics on arbitrary bytes. focal's WAL is translated by F-1's conversion. |
 | **R-3** | slates' enhancements, one commit each, in this order. First, regression tests for R6 and R7, which are expected to pass. Then tests for R4, R5, R20 and R21, with a patch only on failure. Then the R16 byte-bounded pipeline window, R17 out-of-order acknowledgement within a term, R13 learner catch-up rounds, and R22's compaction rule. `Limits::derive` replaces `Limits::default`. | For each: the slates test or bench that motivated it, run against this crate and showing slates' recorded improvement. The raft-rs differential; any intended divergence joins focal 27 §4.5's divergence table with its own test. mantle's and focal's suites. |
 
 The R-numbers are note 32 §2.13's ledger.
@@ -102,6 +102,61 @@ decide, and no owner enables it until then. The tests:
 
 TLC runs in this repository's CI only (owner's decision 7), beside `hyper-check`'s explorer. The model
 `FastTrack.tla` is still in focal (`docs/models/`) and moves here with that work.
+
+### 3.1 The wire format (R-2)
+
+hyper-raft writes its messages, entries, hard states, configurations, changes and snapshots in a
+format of its own. It is not raft-rs's: no member of mantle, focal or slates talks to a raft-rs
+member; mantle's and focal's logs keep entries in their own frames, and focal's WAL is translated
+once by F-1's conversion tool; the differential against raft-rs compares the two cores' outputs as
+values, not as bytes.
+
+**What it departs from, and why.** raft-rs writes `eraftpb` as protocol buffers
+(<https://protobuf.dev/programming-guides/encoding/>): every field a key and a varint or a
+length-delimited value, defaults omitted, fields in any order with the last occurrence winning. That
+suits a schema that evolves across many writers. A Raft message is the opposite case: a small,
+fixed set of fields, every one read on every message, on the path every entry takes. The format
+here follows the design of FIX's Simple Binary Encoding (SBE, FIX Trading Community, *Simple Binary
+Encoding Technical Specification* 1.0, §2: fixed-length fields at fixed offsets, little-endian,
+variable-length data after the fixed block, a version in the header) and of Cap'n Proto's
+argument against parse-heavy encodings (<https://capnproto.org/encoding.html>): a reader takes each
+field from a known offset, with no key dispatch and no merging, and knows every length before it
+takes any byte, so it allocates each buffer once at its exact size and can later lend entries out
+of the received bytes instead of copying them.
+
+**The layout.** Every integer is little-endian at its full width. A top-level value is a record:
+
+| Bytes | Field |
+|---|---|
+| 1 | format version, 1 |
+| 1 | the value's kind: message 1, entry 2, hard state 3, configuration 4, snapshot 5, change 6, joint change 7 |
+| … | the value's body |
+| 4 | CRC-32C (Castagnoli, RFC 3720 §B.4) of everything before it |
+
+The checksum is mantle `CLAUDE.md` §6's rule (every on-disk record and network payload carries a
+checksum verified on read); a mismatch is a typed corruption, never a value. Inside a record, nested
+values (a message's entries, a snapshot's configuration) are bodies without their own header or
+checksum.
+
+- **Message body**: kind (1), flags (1: bit 0 reject, bit 1 snapshot present; any other bit set is
+  refused), then nine `u64` (to, from, term, log term, index, commit, commit term, request snapshot,
+  reject hint) and an `i64` priority, then the entry count (`u32`) and context length (`u32`), the
+  context bytes, the entries, and the snapshot body when its flag is set.
+- **Entry body**: kind (1), term and index (`u64`), data and context lengths (`u32`), the data, the
+  context.
+- **Hard state**: term, vote, commit (`u64`).
+- **Configuration**: auto-leave (1), four counts (`u32`: voters, learners, outgoing voters, next
+  learners), then the ids (`u64`).
+- **Snapshot**: presence (1: bit 0 metadata, bit 1 its configuration; any other bit refused), the
+  index and term (`u64`) and the configuration body when present, the data length (`u32`), the data.
+- **Change**: kind (1), member (`u64`), context length (`u32`), context.
+- **Joint change**: transition (1), change count (`u32`), each change as kind (1) and member
+  (`u64`), context length (`u32`), context.
+
+Every count and length is checked against the bytes that remain before anything is taken, an
+unknown kind, version or flag is refused, and a record whose bytes run past its body is refused.
+raft-rs's `deprecated_priority`, `sync_log` and change `id` are not carried: hyper-raft never read
+them; the test adapter folds `deprecated_priority` into the priority as raft-rs does.
 
 ### The fast track's election defect, and its fix
 

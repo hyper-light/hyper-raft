@@ -310,6 +310,7 @@ dependencies = [
 name = "hyper-raft"
 version = "0.1.0"
 dependencies = [
+ "crc32c",
  "raft",
  "raft-proto",
  "slog",
@@ -321,7 +322,6 @@ name = "hyper-raft-e2e"
 version = "0.1.0"
 dependencies = [
  "hyper-raft",
- "raft-proto",
 ]
 
 [[package]]

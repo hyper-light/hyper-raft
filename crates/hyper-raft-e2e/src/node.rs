@@ -15,7 +15,8 @@ use std::{
 
 use hyper_raft::{
     Config, RawNode, StateRole,
-    proto::{Entry, Message, protocompat::PbMessage},
+    proto::{Entry, Message},
+    wire::Record,
 };
 
 use crate::{
@@ -451,7 +452,8 @@ impl Node {
             };
             wire::begin(&mut self.sending, Kind::Raft);
             wire::put_u64(&mut self.sending, self.settings.id);
-            if message.encode(&mut self.sending).is_err() || !wire::seal(&mut self.sending) {
+            message.encode(&mut self.sending);
+            if !wire::seal(&mut self.sending) {
                 // Too long for a datagram: dropped, and Raft sends again.
                 continue;
             }

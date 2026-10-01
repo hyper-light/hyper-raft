@@ -79,7 +79,7 @@ use crate::{
 /// Whether `entry` may go by the fast track: it states something, and it
 /// is no change of the configuration.
 fn proposable(entry: &Entry) -> bool {
-    entry.entry_type == EntryType::EntryNormal as i32
+    entry.entry_type == EntryType::EntryNormal
         && !entry.data.is_empty()
         && entry.index != 0
         && entry.index != u64::MAX

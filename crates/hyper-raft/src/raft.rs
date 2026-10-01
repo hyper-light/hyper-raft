@@ -518,7 +518,7 @@ fn push_with(
         }
         return queue(msgs, message, entries_payload);
     }
-    let kind = proto::message_type(&message).ok_or(Error::Invariant("a message of no kind"))?;
+    let kind = message.msg_type;
     match kind {
         MessageType::MsgRequestVote
         | MessageType::MsgRequestPreVote
@@ -547,11 +547,6 @@ fn push_with(
         kind,
         MessageType::MsgRequestVote | MessageType::MsgRequestPreVote
     ) {
-        if let Ok(priority) = u64::try_from(priority)
-            && priority > 0
-        {
-            message.deprecated_priority = priority;
-        }
         message.priority = priority;
     }
     queue(msgs, message, entries_payload)
@@ -567,11 +562,7 @@ fn queue(msgs: &mut Outgoing, message: Message, entries_payload: Option<usize>) 
 }
 
 fn priority_of(message: &Message) -> i64 {
-    if message.priority != 0 {
-        message.priority
-    } else {
-        i64::try_from(message.deprecated_priority).unwrap_or(i64::MAX)
-    }
+    message.priority
 }
 
 impl<S: Storage> Outbox<'_, S> {
@@ -608,7 +599,7 @@ impl<S: Storage> Outbox<'_, S> {
         if index == 0 {
             return Err(Error::Invariant("a snapshot that states nothing"));
         }
-        message.msg_type = MessageType::MsgSnapshot as i32;
+        message.msg_type = MessageType::MsgSnapshot;
         message.snapshot = Some(snapshot);
         progress.become_snapshot(index);
         Ok(true)
@@ -658,7 +649,7 @@ impl<S: Storage> Outbox<'_, S> {
             }
             match (term, entries) {
                 (Ok(term), Ok(page)) => {
-                    message.msg_type = MessageType::MsgAppend as i32;
+                    message.msg_type = MessageType::MsgAppend;
                     message.index = progress.next_index.saturating_sub(1);
                     message.log_term = term;
                     message.commit = self.log.committed();
@@ -1213,7 +1204,7 @@ impl<S: Storage> Raft<S> {
             && self.state == StateRole::Leader
         {
             let leave = Entry {
-                entry_type: EntryType::EntryConfChangeV2 as i32,
+                entry_type: EntryType::EntryConfChangeV2,
                 ..Entry::default()
             };
             // An entry that states nothing takes no room and is never
@@ -1616,7 +1607,7 @@ impl<S: Storage> Raft<S> {
         if message.msg_type == fast::FAST_VOTE {
             return self.step_fast_vote(message);
         }
-        let kind = proto::message_type(&message).ok_or(Error::Violation("a message of no kind"))?;
+        let kind = message.msg_type;
         if counts_beyond_bound(&message) {
             return Err(Error::Violation(
                 "a term or an index beyond what is counted",

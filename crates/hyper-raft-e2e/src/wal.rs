@@ -24,7 +24,8 @@ use std::{
 
 use hyper_raft::{
     StorageError,
-    proto::{ConfState, Entry, HardState, Snapshot, protocompat::PbMessage},
+    proto::{ConfState, Entry, HardState, Snapshot},
+    wire::Record,
 };
 
 use crate::wire::crc32c;
@@ -152,16 +153,14 @@ fn replay(bytes: &[u8], max_entries: usize) -> Result<Replayed, WalError> {
 }
 
 /// Appends one record of `kind` holding `message` to `buffer`.
-fn record(buffer: &mut Vec<u8>, kind: u8, message: &impl PbMessage) -> Result<(), WalError> {
+fn record(buffer: &mut Vec<u8>, kind: u8, message: &impl Record) -> Result<(), WalError> {
     let length =
         u32::try_from(message.encoded_len()).map_err(|_| WalError::Corrupt("a record too long"))?;
     let start = buffer.len();
     buffer.extend_from_slice(&length.to_le_bytes());
     buffer.extend_from_slice(&[0; 4]);
     buffer.push(kind);
-    message
-        .encode(buffer)
-        .map_err(|_| WalError::Corrupt("an encoding"))?;
+    message.encode(buffer);
     let body = start.saturating_add(RECORD_HEADER);
     let crc = crc32c(buffer.get(body..).unwrap_or(&[]));
     if let Some(slot) = buffer.get_mut(start.saturating_add(4)..body) {
@@ -271,7 +270,7 @@ impl Wal {
             record(&mut self.buffer, ENTRY, entry)?;
         }
         if let Some(hard) = hard {
-            let mut hard = hard.clone();
+            let mut hard = *hard;
             hard.commit = hard.commit.max(self.hard.commit);
             record(&mut self.buffer, HARD_STATE, &hard)?;
         }
@@ -279,7 +278,7 @@ impl Wal {
         self.file.sync_data()?;
         if let Some(hard) = hard {
             let commit = hard.commit.max(self.hard.commit);
-            self.hard = hard.clone();
+            self.hard = *hard;
             self.hard.commit = commit;
         }
         Ok(())
@@ -333,7 +332,7 @@ impl Wal {
 impl hyper_raft::Storage for Wal {
     fn initial_state(&self) -> Result<hyper_raft::InitialState, StorageError> {
         Ok(hyper_raft::InitialState {
-            hard_state: self.hard.clone(),
+            hard_state: self.hard,
             configuration: self.configuration.clone(),
             proposals: Vec::new(),
         })

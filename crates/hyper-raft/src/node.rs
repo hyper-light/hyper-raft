@@ -6,7 +6,7 @@
 //! after what the same `Ready` persists is durable
 //! ([`Ready::persisted_messages`]). A leader's may go at once: what it
 //! sends its members persist for themselves (Ongaro's thesis §10.2.1).
-use raft_proto::protocompat::PbMessageExt;
+use crate::wire::Record;
 
 use crate::{
     NodeId,
@@ -346,9 +346,13 @@ impl<S: Storage> RawNode<S> {
     pub fn propose_conf_change(&mut self, context: Vec<u8>, change: &ConfChangeV2) -> Result<()> {
         // What could not be read when it is applied is not proposed.
         Plan::of(change)?;
-        let data = change
-            .write_to_bytes()
-            .map_err(|_| Error::Capacity("a change's encoding"))?;
+        // The empty change, leaving the joint configuration, is written as no data, as the
+        // leader writes its own leave: one change, one encoding.
+        let data = if *change == ConfChangeV2::default() {
+            Vec::new()
+        } else {
+            change.encode_to_vec()
+        };
         self.operate(|raft| {
             let mut message = proto::message(0, MessageType::MsgPropose);
             message
@@ -356,7 +360,7 @@ impl<S: Storage> RawNode<S> {
                 .try_reserve_exact(1)
                 .map_err(|_| Error::Capacity("a proposal"))?;
             message.entries.push(Entry {
-                entry_type: EntryType::EntryConfChangeV2 as i32,
+                entry_type: EntryType::EntryConfChangeV2,
                 data,
                 context,
                 ..Entry::default()
@@ -375,14 +379,7 @@ impl<S: Storage> RawNode<S> {
     }
     /// A committed change in the older encoding is applied.
     pub fn apply_conf_change_v1(&mut self, change: &ConfChange) -> Result<ConfState> {
-        let entry = Entry {
-            entry_type: EntryType::EntryConfChange as i32,
-            data: change
-                .write_to_bytes()
-                .map_err(|_| Error::Capacity("a change's encoding"))?,
-            ..Entry::default()
-        };
-        let plan = Plan::of_entry(&entry)?.ok_or(Error::Invariant("a change that states none"))?;
+        let plan = Plan::of(&proto::joint(change))?;
         self.raft.settle_priority();
         let outcome = self.raft.apply_conf_change(&plan);
         self.raft.settle_priority();
@@ -395,7 +392,7 @@ impl<S: Storage> RawNode<S> {
         {
             return self.operate(|raft| raft.step(message));
         }
-        let kind = proto::message_type(&message).ok_or(Error::Violation("a message of no kind"))?;
+        let kind = message.msg_type;
         if is_local(kind) {
             return Err(Error::StepLocalMessage);
         }

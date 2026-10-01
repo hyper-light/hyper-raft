@@ -42,6 +42,7 @@ pub mod raft;
 pub mod read;
 pub mod storage;
 mod track;
+pub mod wire;
 
 pub use configuration::{Change, Changed, Configuration, ConfigurationError};
 pub use error::{Error, Result, StorageError};

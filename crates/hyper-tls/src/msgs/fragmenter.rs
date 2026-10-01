@@ -8,6 +8,7 @@ pub(crate) const PACKET_OVERHEAD: usize = 1 + 2 + 2;
 /// The largest record: its header and the largest plaintext.
 pub(crate) const MAX_FRAGMENT_SIZE: usize = MAX_FRAGMENT_LEN + PACKET_OVERHEAD;
 
+/// Splits messages into records of at most the maximum fragment length
 pub struct MessageFragmenter {
     max_frag: usize,
 }

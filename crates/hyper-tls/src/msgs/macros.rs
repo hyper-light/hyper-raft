@@ -24,27 +24,33 @@ macro_rules! enum_builder {
         $enum_vis enum $enum_name {
             $(
                 $(#[$enum_metas])*
+                #[doc = concat!("`", stringify!($enum_var), "`, ", stringify!($enum_val), " on the wire")]
                 $enum_var
             ),*
             $(
                 ,
                 $(
                     $(#[$enum_metas_nd])*
+                    #[doc = concat!("`", stringify!($enum_var_nd), "`, ", stringify!($enum_val_nd), " on the wire")]
                     $enum_var_nd
                 ),*
             )?
-            ,Unknown($uint)
+            ,
+            /// A value this enum does not name
+            Unknown($uint)
         }
 
         impl $enum_name {
             // NOTE(allow) generated irrespective if there are callers
             #[allow(dead_code)]
+            /// The value's encoding, big-endian
             $enum_vis fn to_array(self) -> [u8; core::mem::size_of::<$uint>()] {
                 <$uint>::from(self).to_be_bytes()
             }
 
             // NOTE(allow) generated irrespective if there are callers
             #[allow(dead_code)]
+            /// The variant's name; `None` for `Unknown`
             $enum_vis fn as_str(&self) -> Option<&'static str> {
                 match self {
                     $( $enum_name::$enum_var => Some(stringify!($enum_var))),*

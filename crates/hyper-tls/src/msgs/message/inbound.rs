@@ -9,8 +9,11 @@ use crate::msgs::fragmenter::MAX_FRAGMENT_LEN;
 /// This inbound type borrows its encrypted payload from a buffer elsewhere.
 /// It is used for joining and is consumed by decryption.
 pub struct InboundOpaqueMessage<'a> {
+    /// The record's content type
     pub typ: ContentType,
+    /// The record's protocol version
     pub version: ProtocolVersion,
+    /// The record's payload
     pub payload: BorrowedPayload<'a>,
 }
 
@@ -78,6 +81,7 @@ impl<'a> InboundOpaqueMessage<'a> {
     }
 }
 
+/// A record payload borrowed mutably from the receive buffer, decrypted in place
 pub struct BorrowedPayload<'a>(&'a mut [u8]);
 
 impl Deref for BorrowedPayload<'_> {
@@ -95,6 +99,7 @@ impl DerefMut for BorrowedPayload<'_> {
 }
 
 impl<'a> BorrowedPayload<'a> {
+    /// Shortens the payload to `len` bytes, keeping the start
     pub fn truncate(&mut self, len: usize) {
         if len >= self.len() {
             return;
@@ -121,8 +126,11 @@ impl<'a> BorrowedPayload<'a> {
 /// It results from decryption.
 #[derive(Debug)]
 pub struct InboundPlainMessage<'a> {
+    /// The record's content type
     pub typ: ContentType,
+    /// The record's protocol version
     pub version: ProtocolVersion,
+    /// The record's plaintext
     pub payload: &'a [u8],
 }
 

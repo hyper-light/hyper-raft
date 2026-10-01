@@ -6,7 +6,9 @@ use crate::NamedGroup;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 /// Parameters of an FFDHE group, with Big-endian byte order
 pub struct FfdheGroup<'a> {
+    /// The prime modulus, big-endian
     pub p: &'a [u8],
+    /// The generator, big-endian
     pub g: &'a [u8],
 }
 

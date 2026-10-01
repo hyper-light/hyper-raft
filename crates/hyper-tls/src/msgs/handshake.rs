@@ -2811,9 +2811,12 @@ impl<'a> HandshakeMessagePayload<'a> {
     }
 }
 
+/// An HPKE KDF and AEAD pair an ECH configuration offers (RFC 9180)
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct HpkeSymmetricCipherSuite {
+    /// The key derivation function
     pub kdf_id: HpkeKdf,
+    /// The AEAD
     pub aead_id: HpkeAead,
 }
 
@@ -2839,12 +2842,16 @@ impl TlsListElement for HpkeSymmetricCipherSuite {
     };
 }
 
+/// The HPKE key of an ECH configuration (draft-ietf-tls-esni §4)
 #[derive(Clone, Debug, PartialEq)]
 pub struct HpkeKeyConfig {
+    /// The configuration's identifier, which clients send back
     pub config_id: u8,
+    /// The key encapsulation mechanism
     pub kem_id: HpkeKem,
     /// draft-ietf-tls-esni-24: `opaque HpkePublicKey<1..2^16-1>;`
     pub public_key: PayloadU16<NonEmpty>,
+    /// The KDF and AEAD pairs the server accepts
     pub symmetric_cipher_suites: Vec<HpkeSymmetricCipherSuite>,
 }
 
@@ -2866,11 +2873,16 @@ impl Codec<'_> for HpkeKeyConfig {
     }
 }
 
+/// The contents of an ECH configuration (draft-ietf-tls-esni §4)
 #[derive(Clone, Debug, PartialEq)]
 pub struct EchConfigContents {
+    /// The server's HPKE key
     pub key_config: HpkeKeyConfig,
+    /// The longest name the server expects, for padding
     pub maximum_name_length: u8,
+    /// The public name, which the outer ClientHello carries
     pub public_name: DnsName<'static>,
+    /// The configuration's extensions
     pub extensions: Vec<EchConfigExtension>,
 }
 
@@ -2923,7 +2935,9 @@ pub enum EchConfigPayload {
     V18(EchConfigContents),
     /// An unknown version ECH configuration.
     Unknown {
+        /// The configuration's version
         version: EchVersion,
+        /// The configuration, undecoded
         contents: PayloadU16,
     },
 }

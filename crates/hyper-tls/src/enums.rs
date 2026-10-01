@@ -1,5 +1,4 @@
 #![allow(non_camel_case_types)]
-#![allow(missing_docs)]
 use crate::msgs::codec::{Codec, Reader};
 use crate::msgs::enums::HashAlgorithm;
 

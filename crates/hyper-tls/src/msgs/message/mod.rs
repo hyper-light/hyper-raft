@@ -16,21 +16,30 @@ use alloc::vec::Vec;
 pub(crate) use outbound::read_opaque_message_header;
 pub use outbound::{OutboundChunks, OutboundOpaqueMessage, OutboundPlainMessage, PrefixedPayload};
 
+/// The decoded payload of a TLS message
 #[derive(Debug)]
 pub enum MessagePayload<'a> {
+    /// An alert
     Alert(AlertMessagePayload),
     // one handshake message, parsed
+    /// A handshake message
     Handshake {
+        /// The message, decoded
         parsed: HandshakeMessagePayload<'a>,
+        /// The message as it was encoded, for the transcript
         encoded: Payload<'a>,
     },
     // (potentially) multiple handshake messages, unparsed
+    /// Several handshake messages encoded together
     HandshakeFlight(Payload<'a>),
+    /// A ChangeCipherSpec message
     ChangeCipherSpec(ChangeCipherSpecPayload),
+    /// Application data
     ApplicationData(Payload<'a>),
 }
 
 impl<'a> MessagePayload<'a> {
+    /// Encodes the payload
     pub fn encode(&self, bytes: &mut Vec<u8>) {
         match self {
             Self::Alert(x) => x.encode(bytes),
@@ -41,6 +50,7 @@ impl<'a> MessagePayload<'a> {
         }
     }
 
+    /// A handshake message's payload, encoding it
     pub fn handshake(parsed: HandshakeMessagePayload<'a>) -> Self {
         Self::Handshake {
             encoded: Payload::new(parsed.get_encoding()),
@@ -48,6 +58,7 @@ impl<'a> MessagePayload<'a> {
         }
     }
 
+    /// Decodes a payload of content type `typ`
     pub fn new(
         typ: ContentType,
         vers: ProtocolVersion,
@@ -70,6 +81,7 @@ impl<'a> MessagePayload<'a> {
         }
     }
 
+    /// The payload's content type
     pub fn content_type(&self) -> ContentType {
         match self {
             Self::Alert(_) => ContentType::Alert,
@@ -120,12 +132,16 @@ impl From<Message<'_>> for PlainMessage {
 /// or encrypted into an OpaqueMessage, and it is also used for joining and fragmenting.
 #[derive(Clone, Debug)]
 pub struct PlainMessage {
+    /// The record's content type
     pub typ: ContentType,
+    /// The record's protocol version
     pub version: ProtocolVersion,
+    /// The record's plaintext
     pub payload: Payload<'static>,
 }
 
 impl PlainMessage {
+    /// The message as an unencrypted record
     pub fn into_unencrypted_opaque(self) -> OutboundOpaqueMessage {
         OutboundOpaqueMessage {
             version: self.version,
@@ -134,6 +150,7 @@ impl PlainMessage {
         }
     }
 
+    /// The message, borrowed as an inbound plaintext record
     pub fn borrow_inbound(&self) -> InboundPlainMessage<'_> {
         InboundPlainMessage {
             version: self.version,
@@ -142,6 +159,7 @@ impl PlainMessage {
         }
     }
 
+    /// The message, borrowed as an outbound plaintext record
     pub fn borrow_outbound(&self) -> OutboundPlainMessage<'_> {
         OutboundPlainMessage {
             version: self.version,
@@ -154,11 +172,14 @@ impl PlainMessage {
 /// A message with decoded payload
 #[derive(Debug)]
 pub struct Message<'a> {
+    /// The protocol version the message is sent under
     pub version: ProtocolVersion,
+    /// The message's payload
     pub payload: MessagePayload<'a>,
 }
 
 impl Message<'_> {
+    /// Whether this is a handshake message of type `hstyp`
     pub fn is_handshake_type(&self, hstyp: HandshakeType) -> bool {
         // Bit of a layering violation, but OK.
         if let MessagePayload::Handshake { parsed, .. } = &self.payload {
@@ -168,6 +189,7 @@ impl Message<'_> {
         }
     }
 
+    /// An alert of `level` and `desc`
     pub fn build_alert(level: AlertLevel, desc: AlertDescription) -> Self {
         Self {
             version: ProtocolVersion::TLSv1_2,
@@ -178,6 +200,7 @@ impl Message<'_> {
         }
     }
 
+    /// A KeyUpdate that does not ask the peer to update
     pub fn build_key_update_notify() -> Self {
         Self {
             version: ProtocolVersion::TLSv1_3,
@@ -187,6 +210,7 @@ impl Message<'_> {
         }
     }
 
+    /// A KeyUpdate that asks the peer to update too
     pub fn build_key_update_request() -> Self {
         Self {
             version: ProtocolVersion::TLSv1_3,

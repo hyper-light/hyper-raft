@@ -65,6 +65,7 @@ impl<'a> Reader<'a> {
         self.cursor < self.buffer.len()
     }
 
+    /// `Ok` if nothing is left to read; otherwise `InvalidMessage::TrailingData` naming `name`
     pub fn expect_empty(&self, name: &'static str) -> Result<(), InvalidMessage> {
         match self.any_left() {
             true => Err(InvalidMessage::TrailingData(name)),

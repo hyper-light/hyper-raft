@@ -12,7 +12,9 @@ use crate::msgs::codec::{Codec, Reader};
 /// An externally length'd payload
 #[derive(Clone, Eq, PartialEq)]
 pub enum Payload<'a> {
+    /// Bytes borrowed from the message being read
     Borrowed(&'a [u8]),
+    /// Bytes the payload owns
     Owned(Vec<u8>),
 }
 
@@ -27,6 +29,7 @@ impl<'a> Codec<'a> for Payload<'a> {
 }
 
 impl<'a> Payload<'a> {
+    /// The payload's bytes
     pub fn bytes(&self) -> &[u8] {
         match self {
             Self::Borrowed(bytes) => bytes,
@@ -34,10 +37,12 @@ impl<'a> Payload<'a> {
         }
     }
 
+    /// The payload, owning its bytes
     pub fn into_owned(self) -> Payload<'static> {
         Payload::Owned(self.into_vec())
     }
 
+    /// The payload's bytes, owned
     pub fn into_vec(self) -> Vec<u8> {
         match self {
             Self::Borrowed(bytes) => bytes.to_vec(),
@@ -45,16 +50,19 @@ impl<'a> Payload<'a> {
         }
     }
 
+    /// Reads the rest of `r` as a payload
     pub fn read(r: &mut Reader<'a>) -> Self {
         Self::Borrowed(r.rest())
     }
 }
 
 impl Payload<'static> {
+    /// A payload owning `bytes`
     pub fn new(bytes: impl Into<Vec<u8>>) -> Self {
         Self::Owned(bytes.into())
     }
 
+    /// A payload of no bytes
     pub fn empty() -> Self {
         Self::Borrowed(&[])
     }
@@ -136,6 +144,7 @@ impl<C: Cardinality> fmt::Debug for PayloadU24<'_, C> {
 pub struct PayloadU16<C: Cardinality = MaybeEmpty>(pub(crate) Vec<u8>, PhantomData<C>);
 
 impl<C: Cardinality> PayloadU16<C> {
+    /// A payload owning `bytes`
     pub fn new(bytes: Vec<u8>) -> Self {
         Self(bytes, PhantomData)
     }

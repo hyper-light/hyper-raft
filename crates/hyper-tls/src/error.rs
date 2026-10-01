@@ -225,7 +225,6 @@ impl From<InvalidMessage> for AlertDescription {
 }
 
 #[non_exhaustive]
-#[allow(missing_docs)]
 #[derive(Debug, PartialEq, Clone)]
 /// The set of cases where we failed to make a connection because we thought
 /// the peer was misbehaving.
@@ -238,82 +237,159 @@ impl From<InvalidMessage> for AlertDescription {
 /// Please file a bug against rustls if you see `Error::PeerMisbehaved` in
 /// the wild.
 pub enum PeerMisbehaved {
+    /// The peer misbehaved: attempted downgrade to TLS 1.2 when TLS 1.3 is supported
     AttemptedDowngradeToTls12WhenTls13IsSupported,
+    /// The peer misbehaved: bad cert chain extensions
     BadCertChainExtensions,
+    /// The peer misbehaved: cipher suite differed on retry
     CipherSuiteDifferedOnRetry,
+    /// The peer misbehaved: disallowed encrypted extension
     DisallowedEncryptedExtension,
+    /// The peer misbehaved: duplicate client hello extensions
     DuplicateClientHelloExtensions,
+    /// The peer misbehaved: duplicate encrypted extensions
     DuplicateEncryptedExtensions,
+    /// The peer misbehaved: duplicate hello retry request extensions
     DuplicateHelloRetryRequestExtensions,
+    /// The peer misbehaved: duplicate new session ticket extensions
     DuplicateNewSessionTicketExtensions,
+    /// The peer misbehaved: duplicate server hello extensions
     DuplicateServerHelloExtensions,
+    /// The peer misbehaved: duplicate server name types
     DuplicateServerNameTypes,
+    /// The peer misbehaved: early data attempted in second client hello
     EarlyDataAttemptedInSecondClientHello,
+    /// The peer misbehaved: early data extension without resumption
     EarlyDataExtensionWithoutResumption,
+    /// The peer misbehaved: early data offered with varied cipher suite
     EarlyDataOfferedWithVariedCipherSuite,
+    /// The peer misbehaved: handshake hash varied after retry
     HandshakeHashVariedAfterRetry,
+    /// The peer misbehaved: illegal hello retry request with empty cookie
     IllegalHelloRetryRequestWithEmptyCookie,
+    /// The peer misbehaved: illegal hello retry request with no changes
     IllegalHelloRetryRequestWithNoChanges,
+    /// The peer misbehaved: illegal hello retry request with offered group
     IllegalHelloRetryRequestWithOfferedGroup,
+    /// The peer misbehaved: illegal hello retry request with unoffered cipher suite
     IllegalHelloRetryRequestWithUnofferedCipherSuite,
+    /// The peer misbehaved: illegal hello retry request with unoffered named group
     IllegalHelloRetryRequestWithUnofferedNamedGroup,
+    /// The peer misbehaved: illegal hello retry request with unsupported version
     IllegalHelloRetryRequestWithUnsupportedVersion,
+    /// The peer misbehaved: illegal hello retry request with wrong session id
     IllegalHelloRetryRequestWithWrongSessionId,
+    /// The peer misbehaved: illegal hello retry request with invalid ECH
     IllegalHelloRetryRequestWithInvalidEch,
+    /// The peer misbehaved: illegal middlebox change cipher spec
     IllegalMiddleboxChangeCipherSpec,
+    /// The peer misbehaved: illegal TLS inner plaintext
     IllegalTlsInnerPlaintext,
+    /// The peer misbehaved: incorrect binder
     IncorrectBinder,
+    /// The peer misbehaved: invalid cert compression
     InvalidCertCompression,
+    /// The peer misbehaved: invalid max early data size
     InvalidMaxEarlyDataSize,
+    /// The peer misbehaved: invalid key share
     InvalidKeyShare,
+    /// The peer misbehaved: key epoch with pending fragment
     KeyEpochWithPendingFragment,
+    /// The peer misbehaved: key update received in QUIC connection
     KeyUpdateReceivedInQuicConnection,
+    /// The peer misbehaved: message interleaved with handshake message
     MessageInterleavedWithHandshakeMessage,
+    /// The peer misbehaved: missing binder in PSK extension
     MissingBinderInPskExtension,
+    /// The peer misbehaved: missing key share
     MissingKeyShare,
+    /// The peer misbehaved: missing PSK extension in second client hello
     MissingPskExtensionInSecondClientHello,
+    /// The peer misbehaved: missing PSK modes extension
     MissingPskModesExtension,
+    /// The peer misbehaved: missing QUIC transport parameters
     MissingQuicTransportParameters,
+    /// The peer misbehaved: offered duplicate certificate compressions
     OfferedDuplicateCertificateCompressions,
+    /// The peer misbehaved: offered duplicate key shares
     OfferedDuplicateKeyShares,
+    /// The peer misbehaved: offered early data with old protocol version
     OfferedEarlyDataWithOldProtocolVersion,
+    /// The peer misbehaved: offered empty application protocol
     OfferedEmptyApplicationProtocol,
+    /// The peer misbehaved: offered incorrect compressions
     OfferedIncorrectCompressions,
+    /// The peer misbehaved: PSK extension must be last
     PskExtensionMustBeLast,
+    /// The peer misbehaved: PSK extension with mismatched ids and binders
     PskExtensionWithMismatchedIdsAndBinders,
+    /// The peer misbehaved: refused to follow hello retry request
     RefusedToFollowHelloRetryRequest,
+    /// The peer misbehaved: rejected early data interleaved with handshake message
     RejectedEarlyDataInterleavedWithHandshakeMessage,
+    /// The peer misbehaved: resumption attempted with varied EMS
     ResumptionAttemptedWithVariedEms,
+    /// The peer misbehaved: resumption offered with varied cipher suite
     ResumptionOfferedWithVariedCipherSuite,
+    /// The peer misbehaved: resumption offered with varied EMS
     ResumptionOfferedWithVariedEms,
+    /// The peer misbehaved: resumption offered with incompatible cipher suite
     ResumptionOfferedWithIncompatibleCipherSuite,
+    /// The peer misbehaved: selected different cipher suite after retry
     SelectedDifferentCipherSuiteAfterRetry,
+    /// The peer misbehaved: selected invalid PSK
     SelectedInvalidPsk,
+    /// The peer misbehaved: selected TLS 1.2 using TLS 1.3 version extension
     SelectedTls12UsingTls13VersionExtension,
+    /// The peer misbehaved: selected unoffered application protocol
     SelectedUnofferedApplicationProtocol,
+    /// The peer misbehaved: selected unoffered cert compression
     SelectedUnofferedCertCompression,
+    /// The peer misbehaved: selected unoffered cipher suite
     SelectedUnofferedCipherSuite,
+    /// The peer misbehaved: selected unoffered compression
     SelectedUnofferedCompression,
+    /// The peer misbehaved: selected unoffered key exchange group
     SelectedUnofferedKxGroup,
+    /// The peer misbehaved: selected unoffered PSK
     SelectedUnofferedPsk,
+    /// The peer misbehaved: selected unusable cipher suite for version
     SelectedUnusableCipherSuiteForVersion,
+    /// The peer misbehaved: server echoed compatibility session id
     ServerEchoedCompatibilitySessionId,
+    /// The peer misbehaved: server hello must offer uncompressed EC points
     ServerHelloMustOfferUncompressedEcPoints,
+    /// The peer misbehaved: server name differed on retry
     ServerNameDifferedOnRetry,
+    /// The peer misbehaved: server name must contain one host name
     ServerNameMustContainOneHostName,
+    /// The peer misbehaved: signed key exchange with wrong algorithm
     SignedKxWithWrongAlgorithm,
+    /// The peer misbehaved: signed handshake with unadvertised sig scheme
     SignedHandshakeWithUnadvertisedSigScheme,
+    /// The peer misbehaved: too many empty fragments
     TooManyEmptyFragments,
+    /// The peer misbehaved: too many key update requests
     TooManyKeyUpdateRequests,
+    /// The peer misbehaved: too many renegotiation requests
     TooManyRenegotiationRequests,
+    /// The peer misbehaved: too many warning alerts received
     TooManyWarningAlertsReceived,
+    /// The peer misbehaved: too much early data received
     TooMuchEarlyDataReceived,
+    /// The peer misbehaved: unexpected cleartext extension
     UnexpectedCleartextExtension,
+    /// The peer misbehaved: unsolicited cert extension
     UnsolicitedCertExtension,
+    /// The peer misbehaved: unsolicited encrypted extension
     UnsolicitedEncryptedExtension,
+    /// The peer misbehaved: unsolicited sct list
     UnsolicitedSctList,
+    /// The peer misbehaved: unsolicited server hello extension
     UnsolicitedServerHelloExtension,
+    /// The peer misbehaved: wrong group for key share
     WrongGroupForKeyShare,
+    /// The peer misbehaved: unsolicited ECH extension
     UnsolicitedEchExtension,
 }
 
@@ -325,7 +401,6 @@ impl From<PeerMisbehaved> for Error {
 }
 
 #[non_exhaustive]
-#[allow(missing_docs)]
 #[derive(Debug, PartialEq, Clone)]
 /// The set of cases where we failed to make a connection because a peer
 /// doesn't support a TLS version/feature we require.
@@ -333,27 +408,49 @@ impl From<PeerMisbehaved> for Error {
 /// This is `non_exhaustive`: we might add or stop using items here in minor
 /// versions.
 pub enum PeerIncompatible {
+    /// The peer is incompatible: EC points extension required
     EcPointsExtensionRequired,
+    /// The peer is incompatible: extended master secret extension required
     ExtendedMasterSecretExtensionRequired,
+    /// The peer is incompatible: incorrect certificate type extension
     IncorrectCertificateTypeExtension,
+    /// The peer is incompatible: key share extension required
     KeyShareExtensionRequired,
+    /// The peer is incompatible: named groups extension required
     NamedGroupsExtensionRequired,
+    /// The peer is incompatible: no certificate request signature schemes in common
     NoCertificateRequestSignatureSchemesInCommon,
+    /// The peer is incompatible: no cipher suites in common
     NoCipherSuitesInCommon,
+    /// The peer is incompatible: no EC point formats in common
     NoEcPointFormatsInCommon,
+    /// The peer is incompatible: no key exchange groups in common
     NoKxGroupsInCommon,
+    /// The peer is incompatible: no signature schemes in common
     NoSignatureSchemesInCommon,
+    /// The peer is incompatible: null compression required
     NullCompressionRequired,
+    /// The peer is incompatible: server does not support TLS 1.2 or13
     ServerDoesNotSupportTls12Or13,
+    /// The peer is incompatible: server sent hello retry request with unknown extension
     ServerSentHelloRetryRequestWithUnknownExtension,
+    /// The peer is incompatible: server TLS version is disabled by our config
     ServerTlsVersionIsDisabledByOurConfig,
+    /// The peer is incompatible: signature algorithms extension required
     SignatureAlgorithmsExtensionRequired,
+    /// The peer is incompatible: supported versions extension required
     SupportedVersionsExtensionRequired,
+    /// The peer is incompatible: TLS 1.2 not offered
     Tls12NotOffered,
+    /// The peer is incompatible: TLS 1.2 not offered or enabled
     Tls12NotOfferedOrEnabled,
+    /// The peer is incompatible: TLS 1.3 required for QUIC
     Tls13RequiredForQuic,
+    /// The peer is incompatible: uncompressed EC points required
     UncompressedEcPointsRequired,
+    /// The peer is incompatible: unsolicited certificate type extension
     UnsolicitedCertificateTypeExtension,
+    /// The peer is incompatible: server rejected encrypted client hello
     ServerRejectedEncryptedClientHello(Option<Vec<EchConfigPayload>>),
 }
 

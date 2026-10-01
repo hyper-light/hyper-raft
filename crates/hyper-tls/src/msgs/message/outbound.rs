@@ -12,8 +12,11 @@ use crate::record_layer::RecordLayer;
 /// It is used for fragmenting and is consumed by encryption.
 #[derive(Debug)]
 pub struct OutboundPlainMessage<'a> {
+    /// The record's content type
     pub typ: ContentType,
+    /// The record's protocol version
     pub version: ProtocolVersion,
+    /// The record's plaintext, in chunks
     pub payload: OutboundChunks<'a>,
 }
 
@@ -46,8 +49,11 @@ pub enum OutboundChunks<'a> {
     /// and cursors to single out a fragmented range of bytes.
     /// OutboundChunks assumes that start <= end
     Multiple {
+        /// The chunks
         chunks: &'a [&'a [u8]],
+        /// Where the payload starts within the chunks
         start: usize,
+        /// Where the payload ends within the chunks
         end: usize,
     },
 }
@@ -158,8 +164,11 @@ impl<'a> From<&'a [u8]> for OutboundChunks<'a> {
 /// It results from encryption and is used for io write.
 #[derive(Clone, Debug)]
 pub struct OutboundOpaqueMessage {
+    /// The record's content type
     pub typ: ContentType,
+    /// The record's protocol version
     pub version: ProtocolVersion,
+    /// The record's payload, after room for its header
     pub payload: PrefixedPayload,
 }
 
@@ -220,10 +229,12 @@ impl OutboundOpaqueMessage {
     }
 }
 
+/// A record payload with room for the record header before it
 #[derive(Clone, Debug)]
 pub struct PrefixedPayload(Vec<u8>);
 
 impl PrefixedPayload {
+    /// An empty payload with room for `capacity` bytes
     pub fn with_capacity(capacity: usize) -> Self {
         // A capacity hint: saturating only bounds an impossible request.
         let mut prefixed_payload = Vec::with_capacity(HEADER_SIZE.saturating_add(capacity));
@@ -231,14 +242,17 @@ impl PrefixedPayload {
         Self(prefixed_payload)
     }
 
+    /// Appends `slice`
     pub fn extend_from_slice(&mut self, slice: &[u8]) {
         self.0.extend_from_slice(slice)
     }
 
+    /// Appends every chunk of `chunks`
     pub fn extend_from_chunks(&mut self, chunks: &OutboundChunks<'_>) {
         chunks.copy_to_vec(&mut self.0)
     }
 
+    /// Shortens the payload to `len` bytes
     pub fn truncate(&mut self, len: usize) {
         // Truncating past the end is no change, as `Vec::truncate` defines it.
         self.0.truncate(len.saturating_add(HEADER_SIZE))

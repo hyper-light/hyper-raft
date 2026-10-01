@@ -282,6 +282,8 @@ root (`#![cfg_attr(test, allow(...))]`, the same list as hyper-tls) and at `test
     tunables keep upstream's values and say so. `scripts/check-contracts.py` now treats a file
     a `#[cfg(test)] mod name;` declares as test code, as it treated an inline `#[cfg(test)] mod`,
     and no longer stops scanning the declaring file at that line.
+13. **No `allow(missing_docs)`**: each `FrameStats` field names its frame type, where upstream
+    allowed the struct undocumented.
 12. **Tests**: `tests/handshake.rs`'s `unsafe` counting allocator is replaced by
     `hyper_measure::alloc::Counting`; upstream tests changed only where the API did
     (`.unwrap()` on the new `Result`s and `Option`s) and in one MTU discovery test (below).

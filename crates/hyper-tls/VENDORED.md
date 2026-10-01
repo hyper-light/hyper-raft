@@ -242,6 +242,11 @@ out at the crate root (`#![cfg_attr(test, allow(...))]`, and each integration te
     `idle_state`).
 11. **Every `const` in `src/` carries a `///`** with its derivation or citation
     (`scripts/check-contracts.py`). Upstream's tunables keep upstream's values and say so.
+13. **No `allow(missing_docs)`**: upstream allowed it on `enums`, `msgs`, `internal`,
+    `PeerMisbehaved` and `PeerIncompatible`. `enum_builder!` now documents each variant with its
+    registered name and wire value, `Unknown` and its two methods; each `PeerMisbehaved` and
+    `PeerIncompatible` variant states its name as a sentence (upstream does not say more about
+    them, by design); the `msgs` items `internal` re-exports carry their own docs.
 12. **Tests**: the in-crate `unsafe` in `alloc_per_handshake` is replaced by
     `hyper_measure::alloc::Counting` (a dev-dependency); `key_log_file_env` calls `env::set_var`
     without `unsafe` (edition 2021); the `read_buf` attributes of the removed feature are gone.

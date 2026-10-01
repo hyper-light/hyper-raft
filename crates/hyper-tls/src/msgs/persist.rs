@@ -66,6 +66,7 @@ impl<T> core::ops::Deref for Retrieved<T> {
     }
 }
 
+/// What a client keeps of a TLS 1.3 session to resume it
 #[derive(Debug)]
 pub struct Tls13ClientSessionValue {
     suite: &'static Tls13CipherSuite,
@@ -105,10 +106,12 @@ impl Tls13ClientSessionValue {
         }
     }
 
+    /// The early data the server allows on resumption
     pub fn max_early_data_size(&self) -> u32 {
         self.max_early_data_size
     }
 
+    /// The session's cipher suite
     pub fn suite(&self) -> &'static Tls13CipherSuite {
         self.suite
     }
@@ -126,10 +129,12 @@ impl Tls13ClientSessionValue {
         self.max_early_data_size = new;
     }
 
+    /// Keeps the QUIC transport parameters the session was made with
     pub fn set_quic_params(&mut self, quic_params: &[u8]) {
         self.quic_params = PayloadU16::new(quic_params.to_vec());
     }
 
+    /// The QUIC transport parameters the session was made with
     pub fn quic_params(&self) -> Vec<u8> {
         self.quic_params.0.clone()
     }
@@ -143,6 +148,7 @@ impl core::ops::Deref for Tls13ClientSessionValue {
     }
 }
 
+/// What a client keeps of a TLS 1.2 session to resume it
 #[derive(Debug, Clone)]
 pub struct Tls12ClientSessionValue {
     suite: &'static Tls12CipherSuite,
@@ -289,6 +295,7 @@ static MAX_TICKET_LIFETIME: u32 = 7 * 24 * 60 * 60;
 static MAX_FRESHNESS_SKEW_MS: u32 = 60 * 1000;
 
 // --- Server types ---
+/// What a server keeps of a session to resume it
 #[derive(Debug)]
 pub struct ServerSessionValue {
     pub(crate) sni: Option<DnsName<'static>>,
@@ -299,6 +306,7 @@ pub struct ServerSessionValue {
     pub(crate) client_cert_chain: Option<CertificateChain<'static>>,
     pub(crate) alpn: Option<PayloadU8>,
     pub(crate) application_data: PayloadU16,
+    /// When the session was made, in seconds since the Unix epoch
     pub creation_time_sec: u64,
     pub(crate) age_obfuscation_offset: u32,
     freshness: Option<bool>,

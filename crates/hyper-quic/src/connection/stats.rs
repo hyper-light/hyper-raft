@@ -32,31 +32,54 @@ impl UdpStats {
 /// Number of frames transmitted or received of each frame type
 #[derive(Default, Copy, Clone)]
 #[non_exhaustive]
-#[allow(missing_docs)]
 pub struct FrameStats {
+    /// ACK frames
     pub acks: u64,
+    /// ACK_FREQUENCY frames
     pub ack_frequency: u64,
+    /// CRYPTO frames
     pub crypto: u64,
+    /// CONNECTION_CLOSE frames
     pub connection_close: u64,
+    /// DATA_BLOCKED frames
     pub data_blocked: u64,
+    /// DATAGRAM frames
     pub datagram: u64,
+    /// HANDSHAKE_DONE frames, typically sent once
     pub handshake_done: u8,
+    /// IMMEDIATE_ACK frames
     pub immediate_ack: u64,
+    /// MAX_DATA frames
     pub max_data: u64,
+    /// MAX_STREAM_DATA frames
     pub max_stream_data: u64,
+    /// MAX_STREAMS frames for bidirectional streams
     pub max_streams_bidi: u64,
+    /// MAX_STREAMS frames for unidirectional streams
     pub max_streams_uni: u64,
+    /// NEW_CONNECTION_ID frames
     pub new_connection_id: u64,
+    /// NEW_TOKEN frames
     pub new_token: u64,
+    /// PATH_CHALLENGE frames
     pub path_challenge: u64,
+    /// PATH_RESPONSE frames
     pub path_response: u64,
+    /// PING frames
     pub ping: u64,
+    /// RESET_STREAM frames
     pub reset_stream: u64,
+    /// RETIRE_CONNECTION_ID frames
     pub retire_connection_id: u64,
+    /// STREAM_DATA_BLOCKED frames
     pub stream_data_blocked: u64,
+    /// STREAMS_BLOCKED frames for bidirectional streams
     pub streams_blocked_bidi: u64,
+    /// STREAMS_BLOCKED frames for unidirectional streams
     pub streams_blocked_uni: u64,
+    /// STOP_SENDING frames
     pub stop_sending: u64,
+    /// STREAM frames
     pub stream: u64,
 }
 

@@ -1,0 +1,32 @@
+[package]
+name = "mantle-disk"
+description = "Local storage devices: identification, measurement, aligned direct I/O and exact durability"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[features]
+# Test support for other crates: the simulated power-loss file and, on macOS, a disk image
+# attached as a device node.
+sim = []
+
+[dependencies]
+getrandom.workspace = true
+thiserror.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+rustix.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true

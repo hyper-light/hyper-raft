@@ -60,6 +60,26 @@ The inventory, the enhancement ledger and the migration plan are in mantle's
 - **Portable.** Linux, macOS and Windows on x86_64 and aarch64. `unsafe` is allowed only in the files
   `scripts/check-contracts.py` lists, each block with a `// SAFETY:` comment.
 
+## 1a. Law: measured against what each crate replaces
+
+The owner's law for every crate in this repository, with no exceptions:
+
+- **Allocations, reallocations and page faults are measured and driven down on every hot path.**
+  - Counts come from a counting allocator and the OS (`getrusage` minor and major faults, and
+    `task_info` on macOS), per operation, recorded with each benchmark.
+  - A change that raises any of them on a hot path does not land without a measured reason.
+- **Every crate is benchmarked against each project's own implementation it replaces:** slates',
+  focal's and mantle's.
+  - The comparison uses the same workload, the same hardware and recorded commands.
+  - Results go in `docs/benchmarks.md` with the hardware, the date and the exact command.
+  - A crate replaces a project's implementation only where it is at least as fast and allocates no
+    more. Any loss is fixed before the switch, not accepted.
+- **End-to-end tests of real usage.**
+  - Real processes on real UDP sockets and real disks, driven the way each consumer drives the
+    crate: slates' runtime, focal's nodes, mantle's node and client.
+  - These run beside the sans-io unit tests and the deterministic simulation, never instead of
+    them.
+
 ## 2. Vendored sources
 
 Upstream crates are staged under `vendor/` exactly as published, outside the workspace and the lint

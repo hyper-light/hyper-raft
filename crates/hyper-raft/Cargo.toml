@@ -1,0 +1,25 @@
+[package]
+name = "hyper-raft"
+description = "A Raft core with no clock, disk or network, shared by slates, focal and mantle."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+raft-proto.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+# The core focal ran on before this one: the differential tests run both on
+# one schedule and compare what they say.
+raft.workspace = true
+slog.workspace = true
+
+[[bench]]
+name = "replicate"
+harness = false
+
+[lints]
+workspace = true

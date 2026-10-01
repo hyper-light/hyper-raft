@@ -8,10 +8,21 @@ members = ["crates/*"]
 exclude = ["vendor", "crates/hyper-tls/tests/support/rustls-test"]
 
 [workspace.package]
+version = "0.1.0"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/hyper-light/hyper-raft"
 rust-version = "1.98"
+
+[workspace.dependencies]
+# raft-rs at the revision focal and mantle run: upstream PR #578 (native prost compatibility and a
+# maintained rustc-hash), recorded in focal's docs/dependencies/raft-upstream.md. hyper-raft takes
+# its message and log types (`raft-proto`) until step R-2 declares them itself (docs/raft.md); the
+# library itself is only the differential's oracle, a dev-dependency.
+raft = { version = "0.7.0", git = "https://github.com/tikv/raft-rs", rev = "8e4cef172421bf77b2ae1c26628a9531b0be41f0", default-features = false, features = ["prost-codec"] }
+raft-proto = { version = "0.7.0", git = "https://github.com/tikv/raft-rs", rev = "8e4cef172421bf77b2ae1c26628a9531b0be41f0", default-features = false, features = ["prost-codec"] }
+slog = "2.7"
+thiserror = "2.0"
 
 [workspace.lints.rust]
 # Allowed only in the OS-interface files scripts/check-contracts.py lists, each block commented.

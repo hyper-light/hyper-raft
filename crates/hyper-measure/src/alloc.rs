@@ -19,6 +19,7 @@
 use std::{
     alloc::{GlobalAlloc, Layout, System},
     cell::Cell,
+    sync::atomic::{AtomicBool, Ordering},
 };
 
 /// What the allocator was asked to do while counting was on.
@@ -85,6 +86,12 @@ thread_local! {
     static SET_ASIDE: Cell<bool> = const { Cell::new(false) };
 }
 
+/// Whether any thread of the process has begun a count. Until one has, the allocator reads this
+/// one word and nothing else, so a run that measures time alone pays no thread-local lookup
+/// (`_tlv_get_addr` on macOS, a call per access) on any allocation. It is written once, by
+/// [`begin`], and only read after, so no write contends for its cache line.
+static ARMED: AtomicBool = AtomicBool::new(false);
+
 /// Bytes as a signed count. A block is at most `isize::MAX` bytes
 /// (`Layout`'s rule), so the conversion never saturates for one block.
 fn signed(bytes: usize) -> i64 {
@@ -95,6 +102,16 @@ fn signed(bytes: usize) -> i64 {
 /// at its width, which no run of this repository approaches (2^64 events);
 /// wrapping is stated so that the allocator can never unwind.
 fn note(record: impl Fn(&mut Counts)) {
+    if ARMED.load(Ordering::Relaxed) {
+        note_armed(record);
+    }
+}
+
+/// [`note`] once a count has begun. Kept out of line: the address of a thread-local is
+/// computed by a call on macOS (`_tlv_get_addr`), which the optimizer would otherwise be free
+/// to hoist above the test of [`ARMED`] in every allocation.
+#[inline(never)]
+fn note_armed(record: impl Fn(&mut Counts)) {
     if !ON.try_with(Cell::get).unwrap_or(false) {
         return;
     }
@@ -147,6 +164,7 @@ fn reallocated(old: usize, new: usize, moved: bool) {
 
 /// Zeroes this thread's counts and turns counting on.
 pub fn begin() {
+    ARMED.store(true, Ordering::Relaxed);
     let _ = COUNTS.try_with(|cell| cell.set(Counts::ZERO));
     let _ = ASIDE.try_with(|cell| cell.set(Counts::ZERO));
     let _ = SET_ASIDE.try_with(|aside| aside.set(false));

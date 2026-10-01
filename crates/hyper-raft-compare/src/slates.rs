@@ -220,6 +220,9 @@ impl<const PUBLISH: bool> Core for Node<PUBLISH> {
     fn propose(&mut self, data: Vec<u8>) -> bool {
         self.raft.append_command(data)
     }
+    fn propose_batch(&mut self, batch: Vec<Vec<u8>>) -> bool {
+        batch.into_iter().all(|data| self.raft.append_command(data))
+    }
     fn propose_fast(&mut self, data: Vec<u8>, out: &mut Vec<Envelope<RaftMessage>>) -> Fast {
         let Some(proposal) = self.raft.propose_fast(data) else {
             return Fast::Refused;

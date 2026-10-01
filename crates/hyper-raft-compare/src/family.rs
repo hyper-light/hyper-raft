@@ -96,6 +96,11 @@ impl Disk {
             }),
         };
     }
+    /// The entries of `[first, last]`, where the store holds them.
+    pub fn range(&self, first: u64, last: u64) -> &[Entry] {
+        let base = self.first_index();
+        &self.entries[(first - base) as usize..=(last - base) as usize]
+    }
     /// The entries of `[low, high)` that `max_bytes` admit, one at least,
     /// appended to `into` with room reserved for exactly them.
     pub fn page(&self, low: u64, high: u64, max_bytes: u64, into: &mut Vec<Entry>) {
@@ -128,6 +133,22 @@ impl Disk {
 fn apply(app: &mut App, entries: &[Entry]) {
     for entry in entries {
         app.apply(entry.index, &entry.data);
+    }
+}
+
+/// One `MsgPropose` of every proposal of `batch`, from `id` to itself.
+fn proposal(id: u64, batch: Vec<Vec<u8>>) -> Message {
+    Message {
+        msg_type: raft_proto::eraftpb::MessageType::MsgPropose as i32,
+        from: id,
+        entries: batch
+            .into_iter()
+            .map(|data| Entry {
+                data,
+                ..Entry::default()
+            })
+            .collect(),
+        ..Message::default()
     }
 }
 
@@ -226,7 +247,94 @@ focal_storage!(focal_raft_mantle, no_any_entry);
 
 /// A core of focal's line, driven as focal's shell drives it.
 macro_rules! focal_core {
-    ($module:ident, $krate:ident, $name:literal) => {
+    // A `Ready` copied, as raft-rs gives it: its entries taken, what it commits copied.
+    (@flush copies, $self:ident, $out:ident) => {
+        while $self.raw.has_ready() {
+            let mut ready = $self.raw.ready().expect("a ready");
+            alloc::aside();
+            if let Some(snapshot) = ready.snapshot() {
+                $self.app = App::decode(&snapshot.data);
+                $self.raw.store_mut().install(snapshot.clone());
+            }
+            let entries = ready.take_entries();
+            $self.raw.store_mut().append(entries);
+            if let Some(hard) = ready.hard_state() {
+                $self.raw.store_mut().hard = hard.clone();
+            }
+            alloc::back();
+            let messages = ready.take_messages();
+            let persisted = ready.take_persisted_messages();
+            let committed = ready.take_committed_entries();
+            alloc::aside();
+            $out.extend(messages.into_iter().map(envelope));
+            $out.extend(persisted.into_iter().map(envelope));
+            apply(&mut $self.app, &committed);
+            drop(committed);
+            alloc::back();
+            let mut light = $self.raw.advance_append(ready).expect("advanced");
+            let messages = light.take_messages();
+            let committed = light.take_committed_entries();
+            alloc::aside();
+            if let Some(commit) = light.commit_index() {
+                $self.raw.store_mut().hard.commit = commit;
+            }
+            $out.extend(messages.into_iter().map(envelope));
+            apply(&mut $self.app, &committed);
+            drop(committed);
+            alloc::back();
+            $self.raw.advance_apply_to($self.app.index).expect("applied");
+        }
+    };
+    // A `Ready` given in place (`RawNode::ready_in_place`): the entries persisted from where the
+    // member holds them, what is committed applied from the owner's own store.
+    (@flush in_place, $self:ident, $out:ident) => {
+        while $self.raw.has_ready() {
+            let mut ready = $self.raw.ready_in_place().expect("a ready");
+            alloc::aside();
+            if let Some(snapshot) = $self.raw.to_persist().snapshot {
+                $self.app = App::decode(&snapshot.data);
+            }
+            // An in-memory store has nothing to write out: it keeps the entries themselves
+            // when the ready advances (`advance_append_keeping`). A store that writes them out
+            // reads them here, from `to_persist`.
+            if let Some(hard) = ready.hard_state() {
+                $self.raw.store_mut().hard = hard.clone();
+            }
+            alloc::back();
+            let messages = ready.take_messages();
+            let persisted = ready.take_persisted_messages();
+            alloc::aside();
+            $out.extend(messages.into_iter().map(envelope));
+            $out.extend(persisted.into_iter().map(envelope));
+            if let Some((first, last)) = ready.committed_range() {
+                apply(&mut $self.app, $self.raw.store().range(first, last));
+            }
+            alloc::back();
+            let mut light = $self
+                .raw
+                .advance_append_keeping(ready, |store, kept| {
+                    alloc::aside();
+                    if let Some(snapshot) = kept.snapshot {
+                        store.install(snapshot);
+                    }
+                    store.append(kept.entries);
+                    alloc::back();
+                })
+                .expect("advanced");
+            let messages = light.take_messages();
+            alloc::aside();
+            if let Some(commit) = light.commit_index() {
+                $self.raw.store_mut().hard.commit = commit;
+            }
+            $out.extend(messages.into_iter().map(envelope));
+            if let Some((first, last)) = light.committed_range() {
+                apply(&mut $self.app, $self.raw.store().range(first, last));
+            }
+            alloc::back();
+            $self.raw.advance_apply_to($self.app.index).expect("applied");
+        }
+    };
+    ($module:ident, $krate:ident, $name:literal, $mode:ident) => {
         pub mod $module {
             use hyper_measure::alloc;
             use raft_proto::eraftpb::Message;
@@ -306,6 +414,12 @@ macro_rules! focal_core {
                 fn propose(&mut self, data: Vec<u8>) -> bool {
                     heard(self.raw.propose(Vec::new(), data)).is_some()
                 }
+                fn propose_batch(&mut self, batch: Vec<Vec<u8>>) -> bool {
+                    alloc::aside();
+                    let message = super::proposal(self.raw.raft.id(), batch);
+                    alloc::back();
+                    heard(self.raw.step(message)).is_some()
+                }
                 fn propose_fast(
                     &mut self,
                     data: Vec<u8>,
@@ -333,41 +447,7 @@ macro_rules! focal_core {
                     heard(self.raw.step(message));
                 }
                 fn flush(&mut self, out: &mut Vec<Envelope<Message>>) {
-                    while self.raw.has_ready() {
-                        let mut ready = self.raw.ready().expect("a ready");
-                        alloc::aside();
-                        if let Some(snapshot) = ready.snapshot() {
-                            self.app = App::decode(&snapshot.data);
-                            self.raw.store_mut().install(snapshot.clone());
-                        }
-                        let entries = ready.take_entries();
-                        self.raw.store_mut().append(entries);
-                        if let Some(hard) = ready.hard_state() {
-                            self.raw.store_mut().hard = hard.clone();
-                        }
-                        alloc::back();
-                        let messages = ready.take_messages();
-                        let persisted = ready.take_persisted_messages();
-                        let committed = ready.take_committed_entries();
-                        alloc::aside();
-                        out.extend(messages.into_iter().map(envelope));
-                        out.extend(persisted.into_iter().map(envelope));
-                        apply(&mut self.app, &committed);
-                        drop(committed);
-                        alloc::back();
-                        let mut light = self.raw.advance_append(ready).expect("advanced");
-                        let messages = light.take_messages();
-                        let committed = light.take_committed_entries();
-                        alloc::aside();
-                        if let Some(commit) = light.commit_index() {
-                            self.raw.store_mut().hard.commit = commit;
-                        }
-                        out.extend(messages.into_iter().map(envelope));
-                        apply(&mut self.app, &committed);
-                        drop(committed);
-                        alloc::back();
-                        self.raw.advance_apply_to(self.app.index).expect("applied");
-                    }
+                    focal_core!(@flush $mode, self, out);
                 }
                 fn compact(&mut self) {
                     alloc::aside();
@@ -383,9 +463,15 @@ macro_rules! focal_core {
     };
 }
 
-focal_core!(hyper, hyper_raft, "hyper-raft");
-focal_core!(control, focal_raft_control, "focal-raft a8e95f7");
-focal_core!(mantle, focal_raft_mantle, "focal-raft 1395e22 (mantle)");
+focal_core!(hyper, hyper_raft, "hyper-raft", in_place);
+focal_core!(hyper_copy, hyper_raft, "hyper-raft, copying Ready", copies);
+focal_core!(control, focal_raft_control, "focal-raft a8e95f7", copies);
+focal_core!(
+    mantle,
+    focal_raft_mantle,
+    "focal-raft 1395e22 (mantle)",
+    copies
+);
 
 impl raft::Storage for Disk {
     fn initial_state(&self) -> raft::Result<raft::RaftState> {
@@ -505,6 +591,12 @@ pub mod raftrs {
         }
         fn propose(&mut self, data: Vec<u8>) -> bool {
             self.raw.propose(Vec::new(), data).is_ok()
+        }
+        fn propose_batch(&mut self, batch: Vec<Vec<u8>>) -> bool {
+            alloc::aside();
+            let message = super::proposal(self.raw.raft.id, batch);
+            alloc::back();
+            self.raw.step(message).is_ok()
         }
         fn propose_fast(&mut self, _data: Vec<u8>, _out: &mut Vec<Envelope<Message>>) -> Fast {
             Fast::Unsupported

@@ -25,33 +25,48 @@ pub struct Measured {
     pub faults: faults::Faults,
 }
 
-/// Measures segments of a run and adds them up.
+/// Whether this process counts allocations (`one ... count`) or times (`one ... time`).
+pub static COUNTING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Measures segments of a run and adds them up. A run either times or counts: counting costs
+/// each allocation a thread-local lookup, so a run that times never begins a count and its
+/// allocator reads one word per call (`hyper_measure::alloc`); the counts of a workload are
+/// fixed by its seed, so the counting run gives the timed run's counts exactly.
 struct Meter {
     measured: Measured,
     started: Option<(Instant, faults::Faults)>,
+    counting: bool,
 }
 
 impl Meter {
     fn new() -> Self {
-        assert!(
-            alloc::installed(),
-            "the counting allocator is not installed"
-        );
-        alloc::begin();
-        alloc::pause();
+        let counting = COUNTING.load(std::sync::atomic::Ordering::Relaxed);
+        if counting {
+            assert!(
+                alloc::installed(),
+                "the counting allocator is not installed"
+            );
+            alloc::begin();
+            alloc::pause();
+        }
         Self {
             measured: Measured::default(),
             started: None,
+            counting,
         }
     }
     fn start(&mut self) {
         let before = faults::read().expect("the OS counts faults");
-        alloc::resume();
+        if self.counting {
+            alloc::resume();
+        }
         self.started = Some((Instant::now(), before));
     }
     fn stop(&mut self) {
         let now = Instant::now();
-        alloc::pause();
+        if self.counting {
+            alloc::pause();
+        }
         let after = faults::read().expect("the OS counts faults");
         let (started, before) = self.started.take().expect("a segment was started");
         self.measured.elapsed += now - started;
@@ -71,8 +86,10 @@ impl Meter {
         };
     }
     fn finish(mut self, ops: u64) -> Measured {
-        self.measured.total = alloc::end();
-        self.measured.aside = alloc::read_aside();
+        if self.counting {
+            self.measured.total = alloc::end();
+            self.measured.aside = alloc::read_aside();
+        }
         self.measured.ops = ops;
         self.measured
     }
@@ -183,13 +200,22 @@ impl<C: Core> Group<C> {
     /// `count` proposals of `bytes` bytes each at the leader, sent at once.
     pub fn propose(&mut self, leader: u64, count: usize, bytes: usize) {
         let fill = (splitmix(&mut self.random) & 0xff) as u8;
-        for _ in 0..count {
+        if count == 1 {
             alloc::aside();
             let data = vec![fill; bytes];
             alloc::back();
             assert!(
                 self.at(leader).propose(data),
                 "{}: a proposal refused",
+                C::NAME
+            );
+        } else {
+            alloc::aside();
+            let batch = (0..count).map(|_| vec![fill; bytes]).collect();
+            alloc::back();
+            assert!(
+                self.at(leader).propose_batch(batch),
+                "{}: a batch refused",
                 C::NAME
             );
         }

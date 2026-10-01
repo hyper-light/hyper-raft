@@ -82,6 +82,11 @@ pub trait Core: Sized {
     fn period(&mut self, out: &mut Vec<Envelope<Self::Message>>);
     /// Proposes `data`; what to send is given at the next [`Core::flush`].
     fn propose(&mut self, data: Vec<u8>) -> bool;
+    /// Proposes every one of `batch` at once, by the core's own way of taking several: one
+    /// `MsgPropose` of them all for raft-rs's line (which each core steps as it steps a
+    /// forwarded proposal), one `append_command` each for slates'. The message the owner builds
+    /// is the owner's.
+    fn propose_batch(&mut self, batch: Vec<Vec<u8>>) -> bool;
     /// Proposes `data` by the fast track, from any member.
     fn propose_fast(&mut self, data: Vec<u8>, out: &mut Vec<Envelope<Self::Message>>) -> Fast;
     /// A leader opens the fast track where the core asks for it to be
@@ -101,8 +106,12 @@ pub trait Core: Sized {
     fn compact(&mut self);
 }
 
-/// The application every core applies to: an FNV-1a digest over each
-/// entry's bytes, and a count. The snapshot of it is its sixteen bytes and
+/// The application every core applies to: a digest of each entry's index,
+/// length and first and last words, and a count. It costs the same for an
+/// entry of any size, so that what a run measures is the core and not the
+/// application; that the members applied the same entries is the
+/// differential's to prove (hyper-raft `tests/differential.rs`), and this
+/// digest only checks the run. The snapshot of it is its twenty-four bytes and
 /// the bytes the workload says the application holds besides.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct App {
@@ -113,9 +122,14 @@ pub struct App {
 
 impl App {
     pub fn apply(&mut self, index: u64, data: &[u8]) {
-        let mut digest = self.digest ^ 0xcbf2_9ce4_8422_2325;
-        for byte in index.to_le_bytes().iter().chain(data) {
-            digest = (digest ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3);
+        let word = |bytes: Option<&[u8]>| {
+            bytes.map_or(0, |bytes| u64::from_le_bytes(bytes.try_into().unwrap()))
+        };
+        let first = word(data.get(..8));
+        let last = word(data.len().checked_sub(8).and_then(|at| data.get(at..)));
+        let mut digest = self.digest;
+        for value in [index, data.len() as u64, first, last] {
+            digest = (digest ^ value).wrapping_mul(0x0000_0100_0000_01b3);
         }
         self.digest = digest;
         self.count += 1;

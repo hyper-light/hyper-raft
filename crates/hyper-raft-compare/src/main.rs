@@ -49,6 +49,7 @@ const CORES: [&str; 6] = [
 fn measure(core: &str, spec: &Spec, seed: u64) -> Option<Measured> {
     match core {
         "hyper" => workload::run::<family::hyper::Node>(spec, seed),
+        "hyper-copy" => workload::run::<family::hyper_copy::Node>(spec, seed),
         "control" => workload::run::<family::control::Node>(spec, seed),
         "mantle" => workload::run::<family::mantle::Node>(spec, seed),
         "slates" => workload::run::<slates::Node<true>>(spec, seed),
@@ -62,6 +63,7 @@ fn label(core: &str) -> &'static str {
     use crate::core::Core;
     match core {
         "hyper" => family::hyper::Node::NAME,
+        "hyper-copy" => family::hyper_copy::Node::NAME,
         "control" => family::control::Node::NAME,
         "mantle" => family::mantle::Node::NAME,
         "slates" => slates::Node::<true>::NAME,
@@ -161,13 +163,28 @@ fn spec_args(spec: &Spec) -> Vec<String> {
     ]
 }
 
-/// Runs one measurement in a fresh process.
+/// Runs one measurement in fresh processes: a timed run and a counting run of the same seed,
+/// whose rows are joined (time and faults from the first, counts from the second).
 fn spawn(core: &str, spec: &Spec, seed: u64) -> Option<Row> {
+    let timed = spawn_one(core, spec, seed, "time")?;
+    let counted = spawn_one(core, spec, seed, "count")?;
+    Some(Row {
+        ops: timed.ops,
+        ns: timed.ns,
+        minor: timed.minor,
+        major: timed.major,
+        task: timed.task,
+        ..counted
+    })
+}
+
+fn spawn_one(core: &str, spec: &Spec, seed: u64, mode: &str) -> Option<Row> {
     let output = Command::new(std::env::current_exe().expect("this program"))
         .arg("one")
         .arg(core)
         .args(spec_args(spec))
         .arg(seed.to_string())
+        .arg(mode)
         .output()
         .expect("a run");
     if !output.status.success() {
@@ -254,7 +271,7 @@ fn number(value: f64) -> String {
 
 fn table(runs: usize, filter: &[String], batch: usize, cores: &[&str]) {
     println!(
-        "| workload | core | ns/op median [min–max] | band | ratio to hyper-raft | ops/s | allocs/op | reallocs/op | bytes/op | allocs/op whole loop | faults/op (minor+major) | Mach faults/op |"
+        "| workload | core | ns/op median [min–max] | band | ratio to hyper-raft | ops/s | allocs/op | reallocs/op | bytes/op | allocs/op whole loop | faults per 1k ops (minor+major) | Mach faults per 1k ops |"
     );
     println!("|---|---|---|---|---|---|---|---|---|---|---|---|");
     for spec in table_specs(filter, batch) {
@@ -309,8 +326,8 @@ fn table(runs: usize, filter: &[String], batch: usize, cores: &[&str]) {
                 number(aggregate.per_op(|row| row.reallocs).median),
                 number(aggregate.per_op(|row| row.bytes).median),
                 number(aggregate.per_op(|row| row.total_allocs).median),
-                number(aggregate.per_op(|row| row.minor + row.major).median),
-                number(aggregate.per_op(|row| row.task).median),
+                number(1e3 * aggregate.per_op(|row| row.minor + row.major).median),
+                number(1e3 * aggregate.per_op(|row| row.task).median),
             );
         }
     }
@@ -339,7 +356,8 @@ fn sweep(runs: usize, bytes: usize, cores: &[&str]) {
         let mut rows: Vec<Vec<f64>> = vec![Vec::new(); cores.len()];
         for run in 0..runs {
             for (at, core) in cores.iter().enumerate() {
-                let row = spawn(core, &spec, 1_000 + run as u64).expect("steady runs everywhere");
+                let row = spawn_one(core, &spec, 1_000 + run as u64, "time")
+                    .expect("steady runs everywhere");
                 rows[at].push(row.ns / row.ops);
             }
         }
@@ -377,6 +395,12 @@ fn main() {
                 rounds: args[6].parse().expect("rounds"),
             };
             let seed: u64 = args[7].parse().expect("a seed");
+            let counting = match args.get(8).map(String::as_str) {
+                Some("count") => true,
+                Some("time") | None => false,
+                Some(other) => panic!("a run times or counts, not {other}"),
+            };
+            workload::COUNTING.store(counting, std::sync::atomic::Ordering::Relaxed);
             match measure(core, &spec, seed) {
                 Some(measured) => println!("{}", Row::of(&measured).print()),
                 None => println!("unsupported"),

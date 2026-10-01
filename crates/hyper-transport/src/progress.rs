@@ -15,8 +15,9 @@
 //!   heard: a live peer acknowledges what it receives within its `max_ack_delay` (RFC 9000 §13.2.1,
 //!   25 ms by default, §18.2), so a period that heard nothing is silence, and what the sender put
 //!   into it (the flight in the air, then the probe timeout's probes, which RFC 9002 §6.2.4 sends
-//!   whether or not the peer lives) moved nothing. A period is to be longer than the peer's
-//!   acknowledgement delay; focal's `carried` counted bytes sent alone.
+//!   whether or not the peer lives) moved nothing. So a period must be longer than the peer's
+//!   acknowledgement delay, and `Endpoint::open` refuses one that is not
+//!   (`Refusal::Configuration`); focal's `carried` counted bytes sent alone.
 //! - **Answering**: the reply's prefix arrived and its body is arriving. A period must bring a
 //!   datagram's worth of the connection's received bytes or the body's end, and the body is given no
 //!   longer than its residency: what its bytes take at the least a live sender delivers, two

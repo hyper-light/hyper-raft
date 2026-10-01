@@ -340,7 +340,7 @@ built only on failure (`ok_or_else`).
 
 ## 5. What the application layer reads (2026-10-01)
 
-Two items made public for hyper-transport (mantle note 32 §3.4); no behaviour changes.
+Three items made public for hyper-transport (mantle note 32 §3.4); no behaviour changes.
 
 - **Patch Q5: the assembler's span limit.** `MAX_CHUNKS` (1,024, `connection/assembler.rs`), past
   which a stream's out-of-order spans close the connection ("too many gaps in stream buffer"), is
@@ -350,3 +350,7 @@ Two items made public for hyper-transport (mantle note 32 §3.4); no behaviour c
   now: the peer's connection credit not yet spent and room in the send window, whichever is less
   (the existing `StreamsState::write_limit`). quinn keeps one connection window, so an application
   that keeps a credit reserve for its more urgent classes (note 32 T16) needs to see it.
+- **`Connection::peer_max_ack_delay`.** The peer's `max_ack_delay` transport parameter (RFC 9000
+  §18.2; the default before its parameters arrive), which the connection already computed for its
+  own timers. hyper-transport judges an exchange by whether its period heard the peer, so it
+  refuses a period no longer than this (`Endpoint::open`, `Refusal::Configuration`).

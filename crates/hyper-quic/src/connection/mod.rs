@@ -1554,6 +1554,13 @@ impl Connection {
         self.local_ip
     }
 
+    /// The longest the peer said it delays an acknowledgement (its `max_ack_delay` transport
+    /// parameter, RFC 9000 §18.2; the default before its parameters arrive). A wait judged by
+    /// whether the peer was heard must be longer than this.
+    pub fn peer_max_ack_delay(&self) -> Duration {
+        get_max_ack_delay(&self.peer_params)
+    }
+
     /// Current best estimate of this connection's latency (round-trip-time)
     pub fn rtt(&self) -> Duration {
         self.path.rtt.get()

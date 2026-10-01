@@ -290,6 +290,23 @@ fn a_message_past_its_class_bound_is_refused_from_its_prefix() {
     );
 }
 
+/// A period that hears nothing ends an exchange, so a period no longer than the peer's
+/// acknowledgement delay could end one whose peer lives: it is refused before anything is sent,
+/// and one a millisecond longer is taken. The peer here states RFC 9000 §18.2's default of 25 ms.
+#[test]
+fn a_period_no_longer_than_the_peers_acknowledgement_delay_is_refused() {
+    let pair = Pair::new();
+    let mut net = connected::<Mantle, Mantle>(&pair, limits(), 256 << 20);
+    let delay = Duration::from_millis(25);
+    let short = hyper_transport::Progress::new(delay).unwrap();
+    assert_eq!(
+        net.a.open(net.now, 2, Kind::Get, b"", None, short),
+        Err(Refusal::Configuration)
+    );
+    let long = hyper_transport::Progress::new(delay + Duration::from_millis(1)).unwrap();
+    assert!(net.a.open(net.now, 2, Kind::Get, b"", None, long).is_ok());
+}
+
 /// The class comes from the message's kind and the sender's role (audit §13.3): a client may not
 /// send a snapshot, whatever it believes.
 #[test]

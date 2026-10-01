@@ -461,6 +461,13 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
         let class = C::class_of(kind, self.core.role).ok_or(Refusal::Kind)?;
         let key = self.core.connection_of(peer).ok_or(Refusal::NotConnected)?;
         let mut conn = self.take(key).ok_or(Refusal::NotConnected)?;
+        // A period that hears nothing ends an exchange whose request is being sent, so a period
+        // no longer than the peer's acknowledgement delay could end it while the peer lives
+        // (`progress.rs`): refused before anything is sent.
+        if deadline.period() <= conn.quic.peer_max_ack_delay() {
+            self.put(key, conn);
+            return Err(Refusal::Configuration);
+        }
         let ask = Ask {
             peer,
             kind: C::kind_code(kind),

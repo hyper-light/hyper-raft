@@ -206,7 +206,14 @@ fn spawn_one(core: &str, spec: &Spec, seed: u64, mode: &str) -> Option<Row> {
 /// The workloads of the table: every one at three and five voters.
 fn table_specs(filter: &[String], batch: usize) -> Vec<Spec> {
     let mut specs = Vec::new();
+    // `VOTERS` keeps the workloads of one group size.
+    let only: Option<usize> = std::env::var("VOTERS")
+        .ok()
+        .and_then(|voters| voters.parse().ok());
     for voters in [3, 5] {
+        if only.is_some_and(|only| only != voters) {
+            continue;
+        }
         for (workload, batch, bytes, rounds) in [
             (Workload::Steady, 1, 64, 20_000),
             (Workload::Steady, batch, 64, 40_000 / batch),
@@ -421,8 +428,8 @@ fn main() {
             let batch: usize = std::env::var("BATCH")
                 .ok()
                 .and_then(|batch| batch.parse().ok())
-                // The knee of the batch sweep (docs/benchmarks.md): the smallest batch past which
-                // doubling it gains under 5 % per entry for every core.
+                // Where the batch sweep flattens (docs/benchmarks.md): from 64 to 128 every core
+                // gains under 10 % per entry.
                 .unwrap_or(64);
             table(runs, &args[2..], batch, &cores);
         }

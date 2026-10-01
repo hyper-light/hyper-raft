@@ -48,7 +48,6 @@ fn a_member_behind_its_tick_still_reads_what_arrived() {
         id: 1,
         voters: vec![1],
         tick: Duration::from_millis(1),
-        deadline: Instant::now(),
         max_keys: 1,
         max_pending: 1,
         max_entries: 16,

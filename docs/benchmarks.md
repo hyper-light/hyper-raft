@@ -469,27 +469,51 @@ however late the OS wakes it; an earlier member took one tick per wake, and on w
 tick ran its elections about fifteen times slower than their budget. The largest datagram is
 measured on each socket (macOS caps a send at 9,216 bytes by default), and an append's entries are
 bounded to it less the message's fixed bytes. On this machine the tick came out at
-10 to 52 ms across runs.
+17 to 120 ms across runs, at load averages up to 43.
+
+The election timeout is ten ticks (Raft §5.6; etcd's tuning guide asks at least ten round trips)
+and the heartbeat one tick, the round trip (etcd's tuning guide). Every count in a scenario is
+derived, not picked:
+
+- A phase writes 59 writes, the 95/95 sample count, and `commits` reports their 95/95 bound.
+  `leader-killed` sends a phase's worth in flight as the leader dies.
+- A request waits `2 · election_tick + 1` ticks for its answer. A member not leading answers at
+  once; a leader answers within a broadcast, or, cut off, finds out within two election
+  timeouts by its quorum check and then answers all it held `NotLeader`. The extra tick is the
+  answer's own trip.
+- One write or read allows for as many elections as make every election the run causes (each
+  scenario's first, the leader killed, the leader cut off, every member killed) succeed with 95%
+  confidence across the run (Bonferroni). An election elects when the earliest of the voters'
+  randomized timers, drawn from the ten ticks of `[10, 20)`, fires two ticks (its pre-vote and
+  vote rounds) before the next: 61% for three voters, 44% for five, so 6 and 9 elections of at
+  most 22 ticks each.
+- Each member holds the keys its scenario writes, the asks the in-flight phase and the client
+  leave waiting, and an entry for every try a write may make within its budget plus a leader's
+  empty entry for every election.
+- A member serves until its standard input closes: the test holds the pipe, so no member
+  outlives it however the test ends, with no deadline to choose.
 
 Scenarios and what they assert, with one run's output (2026-10-01):
 
 | Scenario | Asserts |
 |---|---|
-| commits-3, commits-5 | 200 writes answered, each read back at once by a linearizable read; every member applied the same history to the same index |
-| leader-killed | the leader is killed with `SIGKILL` (`TerminateProcess` on Windows) holding 5 writes in its log unanswered; the others elect in a later term; every answered write reads back, every unanswered one reads as written or as never written; the killed member restarts on its log and applies the same history |
-| follower-restarts | a follower is killed, 100 writes are answered without it, it restarts on its log and catches up to the leader's commit with the same history |
+| commits-3, commits-5 | 59 writes answered, each read back at once by a linearizable read; every member applied the same history to the same index |
+| leader-killed | the leader is killed with `SIGKILL` (`TerminateProcess` on Windows) holding 59 writes in its log unanswered; the others elect in a later term; every answered write reads back, every unanswered one reads as written or as never written; the killed member restarts on its log and applies the same history |
+| follower-restarts | a follower is killed, 59 writes are answered without it, it restarts on its log and catches up to the leader's commit with the same history |
 | partition | the leader of five is cut off by a drop filter inside its own process: a read it is asked at once is never answered with a value and a write never acknowledged (it answers both `NotLeader` once its check of the quorum steps it down); the others elect; a key written after the cut never reads stale from it; once lifted it follows and every member applies the same history |
 | all-killed | every member is killed at once and restarted on its log: every answered write reads back |
 
 ```
-tick 35 ms (twice the slowest of 16 flushes)
-ok commits-3: 3 members; 200 writes answered and read back (31.12 ms per write and read); all applied index 201 alike [7.4 s]
-ok commits-5: 5 members; 200 writes answered and read back (34.06 ms per write and read); all applied index 201 alike [7.7 s]
-ok leader-killed: leader 3 (term 1) killed with 5 writes in its log unanswered; 1 elected in term 2; 100 answered writes read back; 2 of those 5 were committed by the new leader; member 3 restarted on its log and applied index 104 alike [4.1 s]
-ok follower-restarts: follower 1 killed after 30 writes, 100 written without it, restarted on its log, caught up to index 131 alike; 130 writes read back [5.4 s]
-ok partition: leader 3 of 5 cut off; at once it answered a read with Some(NotLeader(0)) and a write with Some(NotLeader(0)), and later the read of a replaced key with Some(NotLeader(0)); 1 elected in term 2; after the filter lifted, 1 leads and all applied index 64 alike; 61 writes read back [3.6 s]
-ok all-killed: every member killed after 50 answered writes and restarted on its log; 3 leads in term 2; 50 writes read back; all applied index 52 alike [2.8 s]
+tick 18 ms (the 95/95 bounds of a broadcast and a timed wait, 59 samples each)
+ok commits-3: 3 members; 59 writes answered and read back (22.65 ms per write and read, 34.80 ms the 95/95 bound); all applied index 60 alike [1.9 s]
+ok commits-5: 5 members; 59 writes answered and read back (23.91 ms per write and read, 34.43 ms the 95/95 bound); all applied index 60 alike [1.7 s]
+ok leader-killed: leader 3 (term 1) killed with 59 writes in its log unanswered; 1 elected in term 2; 118 answered writes read back; 1 of those 59 were committed by the new leader; member 3 restarted on its log and applied index 121 alike [3.0 s]
+ok follower-restarts: follower 1 killed after 59 writes, 59 written without it, restarted on its log, caught up to index 119 alike; 118 writes read back [3.0 s]
+ok partition: leader 3 of 5 cut off; at once it answered a read with Some(NotLeader(0)) and a write with Some(NotLeader(0)), and later the read of a replaced key with Some(NotLeader(0)); 5 elected in term 2; after the filter lifted, 5 leads and all applied index 122 alike; 119 writes read back [4.7 s]
+ok all-killed: every member killed after 59 answered writes and restarted on its log; 3 leads in term 2; 59 writes read back; all applied index 61 alike [2.2 s]
 ```
+
+That run was at load average 43.
 
 The workspace's tests, these scenarios included, also pass on Linux (aarch64, in Docker on this
 machine, `rust:1.98.0`, `fdatasync` on the VM's file system; the tick came out at 36 ms). They
@@ -505,9 +529,8 @@ average 39), one with the tick forced to 4 ms under the same load. Each leader r
 100 to 180 ms, about ten ticks fired with nothing read in between, and the answers it had missed
 were the first datagrams it read after stepping down. `node::tests` holds the directed test.
 
-The client waits on facts, with bounds taken from the protocol. A request waits for its answer
-through twice the longest election timeout. One write or read is retried for `WAIT_ELECTIONS`
-elections, each within twice the election timeout, rather than for a fixed number of requests:
+The client waits on facts, with the bounds derived above. One write or read is retried through its
+elections rather than for a fixed number of requests:
 during an election, members that name no leader or a stale one answer at once, and a count of
 requests ran out long before the election ended. When a member names no other leader, the
 client lets a heartbeat interval pass before it asks the next member. `leader-killed` sends its

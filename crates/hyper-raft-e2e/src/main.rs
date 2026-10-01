@@ -2,17 +2,19 @@
 //!
 //! ```text
 //! hyper-raft-node --id N --voters 1,2,3 --listen 127.0.0.1:0 --wal PATH --tick-ms T
-//!                 --deadline-ms D --max-keys K --max-pending P --max-entries E
+//!                 --max-keys K --max-pending P --max-entries E
 //! ```
 //!
-//! It prints `listening <port>` once its socket is bound, then serves until `D` milliseconds
-//! have passed or it is killed. Where the others listen it is told by the test (`Control::Peers`).
+//! It prints `listening <port>` once its socket is bound, then serves until its standard input
+//! ends — its parent closed it or died, so a member never outlives the test that started it — or
+//! it is killed. Where the others listen it is told by the test (`Control::Peers`).
 use std::{
     io::Write,
     net::UdpSocket,
     path::PathBuf,
     process::ExitCode,
-    time::{Duration, Instant},
+    sync::atomic::{AtomicBool, Ordering},
+    time::Duration,
 };
 
 use hyper_raft_e2e::{
@@ -44,15 +46,11 @@ fn parse(arguments: &[String]) -> Result<Arguments, String> {
         .split(',')
         .map(|voter| voter.parse::<u64>().map_err(|_| format!("a voter {voter}")))
         .collect::<Result<Vec<u64>, String>>()?;
-    let deadline = Instant::now()
-        .checked_add(Duration::from_millis(value(arguments, "--deadline-ms")?))
-        .ok_or("a deadline past what the clock counts")?;
     Ok(Arguments {
         settings: Settings {
             id: value(arguments, "--id")?,
             voters,
             tick: Duration::from_millis(value(arguments, "--tick-ms")?),
-            deadline,
             max_keys: value(arguments, "--max-keys")?,
             max_pending: value(arguments, "--max-pending")?,
             max_entries: value(arguments, "--max-entries")?,
@@ -75,8 +73,25 @@ fn serve(arguments: Arguments) -> Result<(), Box<dyn std::error::Error>> {
     writeln!(stdout, "listening {port}")?;
     stdout.flush()?;
     drop(stdout);
-    node.run()?;
+    watch_parent()?;
+    node.run(&PARENT_GONE)?;
     Ok(())
+}
+
+/// Set once standard input ends: the member's loop then returns, and the process with it.
+static PARENT_GONE: AtomicBool = AtomicBool::new(false);
+
+/// Watches standard input until it ends. The parent holds the pipe's other end for as long as it
+/// lives, so a member never outlives the test that started it, however the test ends (a test
+/// killed outright runs no clean-up of its own). One thread for the process, blocked on the pipe.
+fn watch_parent() -> std::io::Result<()> {
+    std::thread::Builder::new()
+        .name("parent".to_owned())
+        .spawn(|| {
+            let _ = std::io::copy(&mut std::io::stdin().lock(), &mut std::io::sink());
+            PARENT_GONE.store(true, Ordering::Release);
+        })
+        .map(drop)
 }
 
 fn main() -> ExitCode {

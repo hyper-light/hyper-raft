@@ -10,6 +10,7 @@ use std::{
     collections::BTreeMap,
     io::ErrorKind,
     net::{SocketAddr, UdpSocket},
+    sync::atomic::{AtomicBool, Ordering},
     time::{Duration, Instant},
 };
 
@@ -33,13 +34,17 @@ const MESSAGE_ROOM: usize = wire::HEADER
     + hyper_raft::wire::HEADER_BYTES
     + hyper_raft::wire::MESSAGE_FIXED_BYTES
     + hyper_raft::wire::CHECKSUM_BYTES;
-/// Ticks in the election timeout: focal's shell's `election_tick` (hyper-raft
-/// tests/support/mod.rs, `Settings::shell`), the member the differential tests hold this core to.
-const ELECTION_TICKS: u32 = 10;
+/// Ticks in the election timeout. A tick is at least one broadcast time (the test measures it so),
+/// and Raft needs the election timeout an order of magnitude above the broadcast time (Ongaro and
+/// Ousterhout 2014, §5.6; etcd's tuning guide: at least ten times the round trip).
+pub const ELECTION_TICKS: u32 = 10;
 /// [`ELECTION_TICKS`] as the core's configuration counts it.
 const ELECTION_TICK: usize = ELECTION_TICKS as usize;
-/// Ticks between a leader's heartbeats: focal's shell's `heartbeat_tick`, as above.
-const HEARTBEAT_TICK: usize = 2;
+/// Ticks between a leader's heartbeats: one, since a tick is a broadcast time and the heartbeat
+/// interval is the round trip between members (etcd's tuning guide).
+pub const HEARTBEAT_TICKS: u32 = 1;
+/// [`HEARTBEAT_TICKS`] as the core's configuration counts it.
+const HEARTBEAT_TICK: usize = HEARTBEAT_TICKS as usize;
 /// The most ticks one turn takes: the longest election timeout the core draws,
 /// `2 · election_tick` (`set_randomized_election_timeout`). Past it every timer of the core has
 /// fired, so ticks beyond it would replay as a burst of campaigns for one stall, the rule
@@ -55,6 +60,8 @@ pub enum NodeError {
     Raft(hyper_raft::Error),
     /// The socket refused.
     Io(std::io::Error),
+    /// The next tick is past what the clock counts.
+    Clock,
 }
 
 impl std::fmt::Display for NodeError {
@@ -63,6 +70,7 @@ impl std::fmt::Display for NodeError {
             Self::Wal(error) => write!(f, "{error}"),
             Self::Raft(error) => write!(f, "the core stopped: {error}"),
             Self::Io(error) => write!(f, "the socket: {error}"),
+            Self::Clock => write!(f, "the next tick is past what the clock counts"),
         }
     }
 }
@@ -98,9 +106,6 @@ pub struct Settings {
     pub voters: Vec<u64>,
     /// The time between ticks.
     pub tick: Duration,
-    /// When the process ends whatever happens, so that a member whose test died does not
-    /// outlive it.
-    pub deadline: Instant,
     /// The most keys the store holds; a write of a new key past it is refused, alike on every
     /// member.
     pub max_keys: usize,
@@ -257,12 +262,12 @@ impl Node {
         })
     }
 
-    /// Runs until the deadline, or until the member stops.
-    pub fn run(&mut self) -> Result<(), NodeError> {
+    /// Runs until `stop` is set, which it reads once a turn, or until the member fails.
+    pub fn run(&mut self, stop: &AtomicBool) -> Result<(), NodeError> {
         let tick = self.settings.tick;
         let mut ticked = Instant::now();
-        while Instant::now() < self.settings.deadline {
-            let next_tick = ticked.checked_add(tick).unwrap_or(self.settings.deadline);
+        while !stop.load(Ordering::Acquire) {
+            let next_tick = ticked.checked_add(tick).ok_or(NodeError::Clock)?;
             self.receive_until(next_tick)?;
             let now = Instant::now();
             // Every tick that elapsed is taken, not one per wake: the OS ends a timed wait on its

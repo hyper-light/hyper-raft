@@ -10,9 +10,10 @@
 //! The scenarios run one after another in this one thread (`harness = false`), one group at a
 //! time: at most five member processes at once, each of one thread.
 //!
-//! Every wait is on the fact it needs (a member's answer), bounded by a stated budget in ticks:
-//! a request waits for its answer through the longest election timeout, and one write or read
-//! is retried through `WAIT_ELECTIONS` elections before it fails.
+//! Every wait is on the fact it needs (a member's answer), bounded by a budget derived in ticks:
+//! a request waits for its answer as long as a live member can take to give one
+//! (`ANSWER_TICKS`), and one write or read is retried through as many elections as the run needs
+//! for every election it causes to succeed at its confidence (`Cluster::elections`).
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -36,34 +37,37 @@ use std::{
     time::{Duration, Instant},
 };
 
-use hyper_raft_e2e::wire::{self, Control, Kind, Op, Outcome, Status};
+use hyper_raft_e2e::{
+    node,
+    wire::{self, Control, Kind, Op, Outcome, Status},
+};
 
 const NODE: &str = env!("CARGO_BIN_EXE_hyper-raft-node");
 const TMP: &str = env!("CARGO_TARGET_TMPDIR");
 
-/// Ticks in a member's election timeout, at least (focal's shell's `election_tick`, which the
-/// node runs with); its randomized timeout is below twice this.
-const ELECTION_TICKS: u32 = 10;
-/// Ticks between a leader's heartbeats (focal's shell's `heartbeat_tick`, which the node runs
-/// with): within this a member hears of a leader elected.
-const HEARTBEAT_TICKS: u32 = 2;
-/// How long one request waits for its answer: two of the longest election timeouts, so a
-/// request to a member that is electing is answered once the election is over.
-const ANSWER_TICKS: u32 = 4 * ELECTION_TICKS;
-/// How many statuses a wait for a member to have taken what it was sent asks for. The member
-/// takes datagrams in the order they arrive, so the first status after them sees them.
-const ATTEMPTS: usize = 64;
-/// How many election timeouts a wait for a leader, for members to agree, or for one write or
-/// read to be answered through the elections it meets, may take.
-const WAIT_ELECTIONS: u32 = 40;
-/// The most writes and reads one scenario makes, and more: `commits` makes 600 (200 writes,
-/// each read back at once and again in the check at its end), and the others fewer.
-const MAX_OPERATIONS: u32 = 1024;
-/// The keys a member's store holds, the asks it keeps waiting, and the entries its log holds:
-/// above what any scenario writes, so that none is refused for room.
-const MAX_KEYS: usize = 4096;
-const MAX_PENDING: usize = 64;
-const MAX_ENTRIES: usize = 1 << 16;
+/// Ticks in a member's election timeout, at least, and between a leader's heartbeats: the node's
+/// own. Its randomized timeout is drawn from `[ELECTION_TICKS, 2 · ELECTION_TICKS)`
+/// (`set_randomized_election_timeout`).
+const ELECTION_TICKS: u32 = node::ELECTION_TICKS;
+const HEARTBEAT_TICKS: u32 = node::HEARTBEAT_TICKS;
+/// The broadcasts an election takes once a candidate's timer fires: its pre-vote round and its
+/// vote round (the node runs with `pre_vote`), each within a tick.
+const VOTE_ROUNDS: u32 = 2 * BROADCAST_TICKS;
+/// The ticks one broadcast takes at most: one, as the tick is measured (`measure_tick`).
+const BROADCAST_TICKS: u32 = 1;
+/// The longest a live member takes to answer an ask. One that is not leading answers at once; a
+/// leader answers a write once it commits and a read once a quorum confirms it, within a
+/// broadcast; a leader cut off from its quorum finds out by its quorum check, which looks back
+/// over the last election timeout every election timeout, so within two of them, and then
+/// answers everyone it kept waiting that it does not lead (`lead_or_let_go`). Each answer takes
+/// a tick to arrive. An ask unanswered for this long went to a member that is down or cut off.
+const ANSWER_TICKS: u32 = 2 * ELECTION_TICKS + BROADCAST_TICKS;
+/// The ticks one election takes at most: the longest randomized timeout and its vote rounds.
+const ELECTION_ROUND_TICKS: u32 = 2 * ELECTION_TICKS + VOTE_ROUNDS;
+/// The elections a full run causes on purpose beyond each scenario's first: the leader killed,
+/// the leader cut off, and every member killed at once. Restarts cause none: a member back on
+/// its log pre-votes, and a group with a leader refuses it.
+const DISRUPTIONS: u32 = 3;
 /// The share of a time's distribution its measured bound covers, and the confidence it does: the
 /// 95/95 one-sided tolerance limit (Wilks 1941; the criterion USNRC Regulatory Guide 1.157 holds
 /// best-estimate analyses to). The slowest of n samples bounds the share with that confidence
@@ -72,6 +76,22 @@ const COVERAGE: f64 = 0.95;
 const CONFIDENCE: f64 = 0.95;
 /// The least tick a member is given: `--tick-ms` counts whole milliseconds.
 const LEAST_TICK: Duration = Duration::from_millis(1);
+
+/// What every scenario of a run shares: the tick, and how many elections the run causes, which
+/// sets how many each wait must allow for.
+#[derive(Clone, Copy)]
+struct Run {
+    tick: Duration,
+    caused: u32,
+}
+
+/// The writes in a phase of a scenario: enough that the slowest of them bounds the 95th
+/// percentile of a write's time with 95% confidence (`tolerance_samples`), which `commits`
+/// reports. Every phase writes as many, and the writes a leader holds unanswered when it dies are
+/// as many again.
+fn workload() -> usize {
+    tolerance_samples()
+}
 
 #[expect(
     clippy::disallowed_methods,
@@ -153,7 +173,11 @@ struct Cluster {
     name: &'static str,
     members: Vec<Member>,
     tick: Duration,
-    deadline: Duration,
+    /// The elections one wait allows for (`Cluster::elections`).
+    elections: u32,
+    /// What each member is told it holds: the keys the scenario writes, the asks it keeps waiting
+    /// and the entries its log holds.
+    room: Room,
     test: UdpSocket,
     /// The most bytes the test's socket sends in one datagram ([`wire::largest`]).
     datagram: usize,
@@ -173,13 +197,39 @@ impl Drop for Cluster {
     }
 }
 
+/// What a member holds, from what its scenario writes.
+#[derive(Clone, Copy)]
+struct Room {
+    keys: usize,
+    pending: usize,
+    entries: usize,
+}
+
+impl Room {
+    /// Room for `writes` writes made at `elections` elections a wait.
+    /// - Keys: no more than the writes.
+    /// - Asks kept waiting: the writes a leader holds unanswered when it dies (`workload`), and
+    ///   the client's own one at a time.
+    /// - Entries: each write proposes once for each try that waited out an answer, at most
+    ///   `budget / ANSWER_TICKS` and the one answered; and each election adds its leader's empty
+    ///   entry.
+    fn for_writes(writes: usize, elections: u32, caused: u32) -> Self {
+        let tries = Cluster::budget_ticks(elections).div_ceil(ANSWER_TICKS) as usize + 1;
+        Self {
+            keys: writes,
+            pending: workload() + 1,
+            entries: writes * tries + (elections * caused) as usize,
+        }
+    }
+}
+
 fn spawn(
     id: u64,
     voters: usize,
     listen: &str,
     wal: &Path,
     tick: Duration,
-    deadline: Duration,
+    room: Room,
 ) -> (Child, u16) {
     let voters: Vec<String> = (1..=voters).map(|voter| voter.to_string()).collect();
     let mut child = Command::new(NODE)
@@ -188,10 +238,11 @@ fn spawn(
         .args(["--listen", listen])
         .args(["--wal", wal.to_str().unwrap()])
         .args(["--tick-ms", &tick.as_millis().to_string()])
-        .args(["--deadline-ms", &deadline.as_millis().to_string()])
-        .args(["--max-keys", &MAX_KEYS.to_string()])
-        .args(["--max-pending", &MAX_PENDING.to_string()])
-        .args(["--max-entries", &MAX_ENTRIES.to_string()])
+        .args(["--max-keys", &room.keys.to_string()])
+        .args(["--max-pending", &room.pending.to_string()])
+        .args(["--max-entries", &room.entries.to_string()])
+        // The member serves until this pipe closes: when the test ends, however it ends.
+        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
         .spawn()
@@ -209,16 +260,17 @@ fn spawn(
 }
 
 impl Cluster {
-    fn start(name: &'static str, voters: usize, tick: Duration) -> Self {
-        // Every scenario's members end by themselves after it would have failed: each of its
-        // operations fails once it outlasts its budget, so none outlives them all.
-        let deadline = Self::budget(tick) * MAX_OPERATIONS;
+    /// Starts `voters` members for scenario `name`, which makes `writes` writes.
+    fn start(name: &'static str, voters: usize, run: Run, writes: usize) -> Self {
+        let elections = Self::elections(voters, run.caused);
+        let room = Room::for_writes(writes, elections, run.caused);
+        let tick = run.tick;
         let mut members = Vec::new();
         for id in 1..=voters as u64 {
             let wal =
                 PathBuf::from(TMP).join(format!("e2e-{}-{name}-{id}.wal", std::process::id()));
             remove(&wal);
-            let (child, port) = spawn(id, voters, "127.0.0.1:0", &wal, tick, deadline);
+            let (child, port) = spawn(id, voters, "127.0.0.1:0", &wal, tick, room);
             members.push(Member {
                 child: Some(child),
                 address: SocketAddr::from(([127, 0, 0, 1], port)),
@@ -231,7 +283,8 @@ impl Cluster {
             name,
             members,
             tick,
-            deadline,
+            elections,
+            room,
             test,
             datagram,
             next_id: 0,
@@ -302,7 +355,7 @@ impl Cluster {
     fn control(&mut self, id: u64, control: &Control) {
         self.next_id += 1;
         let request = self.next_id;
-        let until = Instant::now() + Self::budget(self.tick);
+        let until = Instant::now() + self.budget();
         loop {
             wire::put_control(&mut self.buffer, request, control);
             if let Some(outcome) = self.ask(id, request) {
@@ -312,7 +365,7 @@ impl Cluster {
             assert!(
                 Instant::now() < until,
                 "member {id} took no instruction within {:?}",
-                Self::budget(self.tick)
+                self.budget()
             );
         }
     }
@@ -352,7 +405,7 @@ impl Cluster {
             &listen,
             &member.wal.clone(),
             self.tick,
-            self.deadline,
+            self.room,
         );
         assert_eq!(port, self.members[(id - 1) as usize].address.port());
         self.members[(id - 1) as usize].child = Some(child);
@@ -364,7 +417,8 @@ impl Cluster {
     /// Waits until the members in `among` agree on one leader of one term, which is among
     /// them, and says which.
     fn leader_among(&mut self, among: &[u64]) -> (u64, u64) {
-        for _ in 0..WAIT_ELECTIONS * 2 {
+        let until = Instant::now() + self.budget();
+        while Instant::now() < until {
             let mut seen: Vec<Status> = Vec::new();
             for id in among {
                 if let Some(status) = self.status(*id) {
@@ -380,11 +434,15 @@ impl Cluster {
             {
                 return (leader.id, leader.term);
             }
-            // No agreement yet: the members are electing. The next round of statuses waits
-            // for them, through the time each answer takes.
-            self.wait_ticks(ELECTION_TICKS);
+            // No agreement yet: the members are electing. A leader elected makes itself known
+            // within a heartbeat.
+            self.wait_ticks(HEARTBEAT_TICKS);
         }
-        panic!("{}: no leader among {among:?}", self.name);
+        panic!(
+            "{}: no leader among {among:?} within {:?}",
+            self.name,
+            self.budget()
+        );
     }
     /// Lets `ticks` pass. The test's socket is asked nothing, so the wait is its timeout; an
     /// answer that comes late to a request already given up on is dropped, and the wait goes on
@@ -401,10 +459,36 @@ impl Cluster {
             let _ = self.test.recv_from(&mut sink);
         }
     }
-    /// How long one write or read may take to be answered: `WAIT_ELECTIONS` elections, each
-    /// within twice the election timeout.
-    fn budget(tick: Duration) -> Duration {
-        tick * (2 * ELECTION_TICKS * WAIT_ELECTIONS)
+    /// The chance one election of a group of `voters` elects: the earliest timer of those that
+    /// campaign fires `VOTE_ROUNDS` ticks or more before the next, so its vote rounds end before
+    /// another campaigns. Each of `voters` timers is drawn uniformly from the `ELECTION_TICKS`
+    /// ticks of `[ELECTION_TICKS, 2 · ELECTION_TICKS)`; the chance that a given one is drawn at
+    /// tick `k` and every other at `k + VOTE_ROUNDS` or later, summed over the `voters` that may
+    /// be earliest and the ticks it may be drawn at. Every voter campaigning is the least chance:
+    /// a group that lost its leader has one fewer.
+    fn election_chance(voters: usize) -> f64 {
+        let slots = f64::from(ELECTION_TICKS);
+        let voters = voters as f64;
+        (0..ELECTION_TICKS)
+            .map(|at| {
+                let later = f64::from(ELECTION_TICKS.saturating_sub(at + VOTE_ROUNDS));
+                voters / slots * (later / slots).powf(voters - 1.0)
+            })
+            .sum()
+    }
+    /// The elections one wait allows for: enough that each of the `caused` elections of the run
+    /// elects within them with the run's confidence shared among them (Bonferroni), so the whole
+    /// run fails for want of an election with at most `1 − CONFIDENCE`.
+    fn elections(voters: usize, caused: u32) -> u32 {
+        let miss = (1.0 - CONFIDENCE) / f64::from(caused);
+        (miss.ln() / (1.0 - Self::election_chance(voters)).ln()).ceil() as u32
+    }
+    /// The ticks one write or read may take to be answered: its elections, and the answer.
+    fn budget_ticks(elections: u32) -> u32 {
+        elections * ELECTION_ROUND_TICKS + ANSWER_TICKS
+    }
+    fn budget(&self) -> Duration {
+        self.tick * Self::budget_ticks(self.elections)
     }
     fn up_members(&self) -> Vec<u64> {
         (1..=self.voters() as u64)
@@ -412,8 +496,17 @@ impl Cluster {
             .collect()
     }
     /// Waits until every member in `among` applied the same history through the same index.
+    /// A member behind catches up at least an entry a broadcast, so the wait is the elections'
+    /// budget and a tick for each entry the group's log holds.
     fn converged(&mut self, among: &[u64]) -> Status {
-        for _ in 0..WAIT_ELECTIONS * 2 {
+        let entries = among
+            .iter()
+            .filter_map(|id| self.status(*id))
+            .map(|status| status.last_index)
+            .max()
+            .unwrap_or(0);
+        let until = Instant::now() + self.budget() + self.tick * u32::try_from(entries).unwrap();
+        while Instant::now() < until {
             let seen: Vec<Status> = among.iter().filter_map(|id| self.status(*id)).collect();
             if seen.len() == among.len()
                 && seen.iter().all(|status| {
@@ -425,7 +518,7 @@ impl Cluster {
             {
                 return seen[0];
             }
-            self.wait_ticks(ELECTION_TICKS);
+            self.wait_ticks(HEARTBEAT_TICKS);
         }
         let seen: Vec<Option<Status>> = among.iter().map(|id| self.status(*id)).collect();
         panic!("{}: the members did not converge: {seen:#?}", self.name);
@@ -478,7 +571,7 @@ impl Client {
         value: &[u8],
     ) -> bool {
         let mut target = self.leader;
-        let until = Instant::now() + Cluster::budget(cluster.tick);
+        let until = Instant::now() + cluster.budget();
         while Instant::now() < until {
             match cluster.request(target, &Op::Put { key, value }) {
                 Some(Outcome::Put(_)) => {
@@ -488,7 +581,8 @@ impl Client {
                     return true;
                 }
                 Some(Outcome::NotLeader(hint)) => target = self.target(hint, cluster, target),
-                Some(Outcome::Busy) => cluster.wait_ticks(1),
+                // Its asks are answered within a broadcast, which makes room.
+                Some(Outcome::Busy) => cluster.wait_ticks(BROADCAST_TICKS),
                 Some(other) => panic!("a write answered with {other:?}"),
                 None => {
                     // No answer: the write may or may not be committed.
@@ -502,7 +596,7 @@ impl Client {
     /// Reads `key` linearizably through the leader.
     fn get(&mut self, cluster: &mut Cluster, key: &[u8]) -> Option<Vec<u8>> {
         let mut target = self.leader;
-        let until = Instant::now() + Cluster::budget(cluster.tick);
+        let until = Instant::now() + cluster.budget();
         while Instant::now() < until {
             match cluster.request(target, &Op::Get { key }) {
                 Some(Outcome::Value(value)) => {
@@ -510,7 +604,8 @@ impl Client {
                     return value;
                 }
                 Some(Outcome::NotLeader(hint)) => target = self.target(hint, cluster, target),
-                Some(Outcome::Busy) => cluster.wait_ticks(1),
+                // Its asks are answered within a broadcast, which makes room.
+                Some(Outcome::Busy) => cluster.wait_ticks(BROADCAST_TICKS),
                 Some(other) => panic!("a read answered with {other:?}"),
                 None => target = self.next(cluster, target),
             }
@@ -548,13 +643,16 @@ fn verify(cluster: &mut Cluster, client: &mut Client, history: &History) -> usiz
     history.acked.len()
 }
 
+/// Writes and reads back keys `keys`; says the slowest write and read.
 fn write_range(
     cluster: &mut Cluster,
     client: &mut Client,
     history: &mut History,
     keys: std::ops::Range<usize>,
-) {
+) -> Duration {
+    let mut slowest = Duration::ZERO;
     for at in keys {
+        let started = Instant::now();
         let key = format!("{}-{at}", cluster.name);
         let value = format!("value-{at}");
         assert!(
@@ -570,43 +668,49 @@ fn write_range(
             "{}: {key} did not read back",
             cluster.name
         );
+        slowest = slowest.max(started.elapsed());
     }
+    slowest
 }
 
 /// A group of `voters` commits a workload, and every member applies it alike.
-fn commits(voters: usize, tick: Duration, name: &'static str) -> String {
-    let mut cluster = Cluster::start(name, voters, tick);
+fn commits(voters: usize, run: Run, name: &'static str) -> String {
+    let writes = workload();
+    let mut cluster = Cluster::start(name, voters, run, writes);
     let all = cluster.up_members();
     let (leader, _) = cluster.leader_among(&all);
     let mut client = Client { leader };
     let mut history = History::default();
     let started = Instant::now();
-    write_range(&mut cluster, &mut client, &mut history, 0..200);
+    let slowest = write_range(&mut cluster, &mut client, &mut history, 0..writes);
     let elapsed = started.elapsed();
     let checked = verify(&mut cluster, &mut client, &history);
     let status = cluster.converged(&all);
     format!(
-        "{name}: {voters} members; {checked} writes answered and read back ({:.2} ms per write and read); all applied index {} alike",
-        elapsed.as_secs_f64() * 1e3 / 200.0,
+        "{name}: {voters} members; {checked} writes answered and read back ({:.2} ms per write and read, {:.2} ms the 95/95 bound); all applied index {} alike",
+        elapsed.as_secs_f64() * 1e3 / writes as f64,
+        slowest.as_secs_f64() * 1e3,
         status.applied
     )
 }
 
 /// The leader is killed while writes are in flight; the others elect, and nothing answered is
 /// lost. The killed member comes back on its log and applies the same history.
-fn leader_killed(tick: Duration) -> String {
+fn leader_killed(run: Run) -> String {
     let name = "leader-killed";
-    let mut cluster = Cluster::start(name, 3, tick);
+    let phase = workload();
+    // A phase before, the writes in flight, and a phase after.
+    let mut cluster = Cluster::start(name, 3, run, 3 * phase);
     let all = cluster.up_members();
     let (first, _) = cluster.leader_among(&all);
     let mut client = Client { leader: first };
     let mut history = History::default();
-    write_range(&mut cluster, &mut client, &mut history, 0..50);
+    write_range(&mut cluster, &mut client, &mut history, 0..phase);
     // The leader now, which the writes may have moved: the writes in flight go to it.
     let (old, old_term) = cluster.leader_among(&all);
     // Writes the leader has taken into its log, and has not answered, when it dies.
     let before = cluster.status(old).unwrap().last_index;
-    for at in 50..55 {
+    for at in phase..2 * phase {
         let key = format!("{name}-{at}");
         let value = format!("value-{at}");
         cluster.next_id += 1;
@@ -623,15 +727,18 @@ fn leader_killed(tick: Duration) -> String {
         cluster.test.send_to(&cluster.buffer, address).unwrap();
         history.unknown.insert(key.into_bytes(), value.into_bytes());
     }
+    // The member takes datagrams in the order they arrive, so the first status answered after
+    // them sees them; one lost is asked again, within the budget.
+    let in_flight = phase as u64;
+    let until = Instant::now() + cluster.budget();
     let mut appended = before;
-    for _ in 0..ATTEMPTS {
-        appended = cluster.status(old).unwrap().last_index;
-        if appended >= before + 5 {
-            break;
+    while appended < before + in_flight && Instant::now() < until {
+        if let Some(status) = cluster.status(old) {
+            appended = status.last_index;
         }
     }
     assert!(
-        appended >= before + 5,
+        appended >= before + in_flight,
         "{name}: the leader never took the writes in flight"
     );
     cluster.kill(old);
@@ -640,7 +747,12 @@ fn leader_killed(tick: Duration) -> String {
     assert_ne!(new, old);
     assert!(new_term > old_term);
     client.leader = new;
-    write_range(&mut cluster, &mut client, &mut history, 55..105);
+    write_range(
+        &mut cluster,
+        &mut client,
+        &mut history,
+        2 * phase..3 * phase,
+    );
     let checked = verify(&mut cluster, &mut client, &history);
     let unknown_present = history
         .unknown
@@ -650,31 +762,33 @@ fn leader_killed(tick: Duration) -> String {
     cluster.restart(old);
     let status = cluster.converged(&all);
     format!(
-        "{name}: leader {old} (term {old_term}) killed with 5 writes in its log unanswered; {new} elected in term {new_term}; {checked} answered writes read back; {unknown_present} of those 5 were committed by the new leader; member {old} restarted on its log and applied index {} alike",
+        "{name}: leader {old} (term {old_term}) killed with {phase} writes in its log unanswered; {new} elected in term {new_term}; {checked} answered writes read back; {unknown_present} of those {phase} were committed by the new leader; member {old} restarted on its log and applied index {} alike",
         status.applied
     )
 }
 
 /// A follower is killed, the group goes on without it, and it comes back on its log and
 /// catches up.
-fn follower_restarts(tick: Duration) -> String {
+fn follower_restarts(run: Run) -> String {
     let name = "follower-restarts";
-    let mut cluster = Cluster::start(name, 3, tick);
+    let phase = workload();
+    // A phase with the follower, and a phase without it.
+    let mut cluster = Cluster::start(name, 3, run, 2 * phase);
     let all = cluster.up_members();
     let (leader, _) = cluster.leader_among(&all);
     let follower = all.iter().copied().find(|id| *id != leader).unwrap();
     let mut client = Client { leader };
     let mut history = History::default();
-    write_range(&mut cluster, &mut client, &mut history, 0..30);
+    write_range(&mut cluster, &mut client, &mut history, 0..phase);
     cluster.kill(follower);
-    write_range(&mut cluster, &mut client, &mut history, 30..130);
+    write_range(&mut cluster, &mut client, &mut history, phase..2 * phase);
     let before = cluster.status(leader).unwrap();
     cluster.restart(follower);
     let status = cluster.converged(&all);
     assert!(status.applied >= before.commit);
     let checked = verify(&mut cluster, &mut client, &history);
     format!(
-        "{name}: follower {follower} killed after 30 writes, 100 written without it, restarted on its log, caught up to index {} alike; {checked} writes read back",
+        "{name}: follower {follower} killed after {phase} writes, {phase} written without it, restarted on its log, caught up to index {} alike; {checked} writes read back",
         status.applied
     )
 }
@@ -682,14 +796,17 @@ fn follower_restarts(tick: Duration) -> String {
 /// The leader of five is cut off by a drop filter in its own process. It answers no read with
 /// what the others replace; the others elect and go on; once the filter is lifted it follows
 /// and applies the same history.
-fn partition(tick: Duration) -> String {
+fn partition(run: Run) -> String {
     let name = "partition";
-    let mut cluster = Cluster::start(name, 5, tick);
+    let phase = workload();
+    // A phase before the cut, the moved key three times (before, to the member cut off, after),
+    // and a phase after.
+    let mut cluster = Cluster::start(name, 5, run, 2 * phase + 3);
     let all = cluster.up_members();
     let (first, _) = cluster.leader_among(&all);
     let mut client = Client { leader: first };
     let mut history = History::default();
-    write_range(&mut cluster, &mut client, &mut history, 0..20);
+    write_range(&mut cluster, &mut client, &mut history, 0..phase);
     let key = format!("{name}-moved");
     assert!(client.put(&mut cluster, &mut history, key.as_bytes(), b"before"));
     // The leader now, which the writes may have moved.
@@ -730,7 +847,7 @@ fn partition(tick: Duration) -> String {
     assert!(client.put(&mut cluster, &mut history, key.as_bytes(), b"after"));
     // The write the cut-off member took was never committed: the group's value is "after".
     history.unknown.remove(key.as_bytes());
-    write_range(&mut cluster, &mut client, &mut history, 20..60);
+    write_range(&mut cluster, &mut client, &mut history, phase..2 * phase);
     // The member cut off may still believe it leads; a read it answers must not be stale.
     let stale = cluster.request(
         old,
@@ -753,14 +870,15 @@ fn partition(tick: Duration) -> String {
 }
 
 /// Every member is killed at once and restarted on its log: every answered write survives.
-fn all_killed(tick: Duration) -> String {
+fn all_killed(run: Run) -> String {
     let name = "all-killed";
-    let mut cluster = Cluster::start(name, 3, tick);
+    let phase = workload();
+    let mut cluster = Cluster::start(name, 3, run, phase);
     let all = cluster.up_members();
     let (leader, _) = cluster.leader_among(&all);
     let mut client = Client { leader };
     let mut history = History::default();
-    write_range(&mut cluster, &mut client, &mut history, 0..50);
+    write_range(&mut cluster, &mut client, &mut history, 0..phase);
     for id in &all {
         cluster.kill(*id);
     }
@@ -772,13 +890,13 @@ fn all_killed(tick: Duration) -> String {
     let checked = verify(&mut cluster, &mut client, &history);
     let status = cluster.converged(&all);
     format!(
-        "{name}: every member killed after 50 answered writes and restarted on its log; {leader} leads in term {term}; {checked} writes read back; all applied index {} alike",
+        "{name}: every member killed after {phase} answered writes and restarted on its log; {leader} leads in term {term}; {checked} writes read back; all applied index {} alike",
         status.applied
     )
 }
 
 /// A scenario: run at a tick, it says what it saw.
-type Scenario = fn(Duration) -> String;
+type Scenario = fn(Run) -> String;
 
 fn main() -> ExitCode {
     let tick = measure_tick();
@@ -792,8 +910,8 @@ fn main() -> ExitCode {
     .unwrap();
     drop(out);
     let scenarios: [(&str, Scenario); 6] = [
-        ("commits-3", |tick| commits(3, tick, "commits-3")),
-        ("commits-5", |tick| commits(5, tick, "commits-5")),
+        ("commits-3", |run| commits(3, run, "commits-3")),
+        ("commits-5", |run| commits(5, run, "commits-5")),
         ("leader-killed", leader_killed),
         ("follower-restarts", follower_restarts),
         ("partition", partition),
@@ -803,12 +921,17 @@ fn main() -> ExitCode {
         .skip(1)
         .filter(|arg| !arg.starts_with('-'))
         .collect();
+    // Each scenario's first election, and the disruptions; a run of fewer causes fewer.
+    let run = Run {
+        tick,
+        caused: scenarios.len() as u32 + DISRUPTIONS,
+    };
     for (name, scenario) in scenarios {
         if !filter.is_empty() && !filter.iter().any(|wanted| name.contains(wanted.as_str())) {
             continue;
         }
         let started = Instant::now();
-        let said = scenario(tick);
+        let said = scenario(run);
         let mut out = std::io::stdout().lock();
         writeln!(out, "ok {said} [{:.1} s]", started.elapsed().as_secs_f64()).unwrap();
     }

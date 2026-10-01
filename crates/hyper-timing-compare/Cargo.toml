@@ -1,0 +1,25 @@
+[package]
+name = "hyper-timing-compare"
+description = "hyper-timing measured against the timing it replaces, operation by operation: focal-timing and slates' election timing (slates-cluster)."
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+license = "MIT"
+publish = false
+
+# A workspace of its own: focal-timing and slates-cluster are built from their repositories at
+# pinned revisions, which the gates of this workspace do not fetch (docs/benchmarks.md).
+[workspace]
+
+[dependencies]
+hyper-timing = { path = "../hyper-timing" }
+hyper-measure = { path = "../hyper-measure" }
+# focal-timing at the revision hyper-timing came from.
+focal-timing = { git = "https://github.com/hyper-light/focal", rev = "a8e95f71496461ebc8984926a65666746e946473" }
+# slates' election timing (`crates/cluster/src/timing.rs`) at slates `5cce86a`.
+slates-cluster = { git = "https://github.com/hyper-light/slates", rev = "5cce86aa4cae58b421d171756b24e4305797a3e8" }
+slates-db = { git = "https://github.com/hyper-light/slates", rev = "5cce86aa4cae58b421d171756b24e4305797a3e8" }
+
+[profile.release]
+lto = true
+debug = "line-tables-only"

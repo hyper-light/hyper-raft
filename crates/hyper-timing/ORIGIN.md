@@ -48,6 +48,19 @@
      nothing is known about is never cut off before the caller's bound; slates' own WAN-round bug
      was such a cut-off.
 
+7. **Reads are fields, and nothing allocates** (`CLAUDE.md` §1a; `docs/benchmarks.md`,
+   "hyper-timing").
+   - focal's `PathRtt` sorted its window on every read: `smoothed_ns` once, `variation_ns` twice,
+     so a tail read sorted three times (73 to 88 ns) and the election timing, the priority and the
+     tick pace each sorted every path several times. The window is now kept in order as samples
+     arrive (the evicted sample out and the new one in, two shifts), the median is read by index,
+     and the median absolute deviation is found by merging the two sides of the median outwards to
+     the middle. Both are kept as fields, so a read is a load. Results are identical to sorting
+     (a test compares them over 12,000 samples, ties included).
+   - `quorum_priority` collected the measured paths into a vector and sorted it. It now counts each
+     path's rank among the others, which allocates nothing; a test compares it with the sort over
+     2,000 groups.
+
 ## Planned
 
 - **The estimator that feeds election timing** is decided by the timed simulation in note 32 §3.7,

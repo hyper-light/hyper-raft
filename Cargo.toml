@@ -7,7 +7,7 @@ members = ["crates/*"]
 # conformed into a member crate (vendor/*/VENDORED.md). The comparison bench is a workspace of its
 # own: it builds slates', focal's and raft-rs's cores from their repositories at pinned revisions,
 # which the gates of this workspace do not fetch (docs/benchmarks.md).
-exclude = ["vendor", "crates/hyper-raft-compare", "crates/hyper-log-compare", "crates/hyper-datagram-compare", "crates/hyper-swim-compare"]
+exclude = ["vendor", "crates/hyper-raft-compare", "crates/hyper-log-compare", "crates/hyper-datagram-compare", "crates/hyper-swim-compare", "crates/hyper-timing-compare"]
 
 [workspace.package]
 version = "0.1.0"

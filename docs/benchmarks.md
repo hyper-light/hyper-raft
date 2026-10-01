@@ -869,3 +869,58 @@ cargo bench -p hyper-swim --bench allocs
 cd crates/hyper-swim-compare && cargo build --release
 target/release/hyper-swim-compare table 7 400
 ```
+
+# hyper-timing against focal-timing and slates' timing
+
+The law (`CLAUDE.md` §1a) for the timing crate (`crates/hyper-timing/ORIGIN.md`): the operations a
+member runs each period of a group, measured against focal-timing at `a8e95f7` (the source of the
+paths, the tick pace and the rounds) and slates' `crates/cluster/src/timing.rs` at `5cce86a` (the
+source of the election timing, the priority and the timer).
+
+## The machine and the workload
+
+The same Apple M5 Max, macOS 26.4.1, rustc 1.98.0, 2026-10-01 at 10:52 PDT, shared with two other
+sessions (load average 17 to 28). `crates/hyper-timing-compare`, a workspace of its own, runs each
+operation two million times in a fresh process of its own, seven runs, the implementations rotated
+each run, and counts allocations over a further two million. A five-voter group, so four paths from
+each member, fed the same eight WAN round trips of 40 to 58 ms; a 10 ms heartbeat.
+
+## Results
+
+Medians (least–most), nanoseconds a call; no implementation allocates in any operation but slates'
+priority, once a call.
+
+| Operation | hyper | focal | slates |
+|---|---|---|---|
+| a sample folded into a path | 29.2 (28.3–30.6) | 0.9 (0.8–1.1) | 2.1 (1.7–2.4) |
+| a path's tail read | 1.2 (0.8–1.2) | 87.5 (82.2–93.0) | 1.2 (0.8–1.3) |
+| the election timing from four paths | 10.9 (10.7–12.0) | — | 10.9 (10.9–11.4) |
+| the quorum priority over four paths | 12.5 (11.8–13.5) | — | 24.8 (24.2–26.3), 1 allocation |
+| the tick pace from four paths | 5.5 (4.1–6.4) | 356.2 (284.5–386.0) | — |
+| a round's budget | 1.0 (0.9–1.2) | 1.1 (0.9–1.2) | 1.0 (0.9–1.1) |
+| a follower's period of the election timer | 1.6 (1.0–1.6) | — | 1.7 (1.0–1.7) |
+
+## Where hyper-timing does not win, and why
+
+A sample costs 29 ns, against focal's 0.9 and slates' 2.1. focal stores the sample and leaves the
+work to every read; slates' path is RFC 9002's smoothed estimator, two multiplies a sample. hyper's
+path is focal's median window, kept because one late answer from a starting or stalled peer must not
+move a group's election timeout (`PathRtt`'s documentation, from focal), and it now does the work of
+the median once a sample instead of three sorts a read. A member samples a path about once a period
+and reads it several times (the election timing, the priority, the tick pace, the round budget), so
+over a period of the four paths hyper spends about 150 ns (four samples and every derivation), focal about 360 ns (four samples, the tick pace and a round) and slates about 45 ns
+for an estimate that one late answer moves.
+
+Before these changes hyper-timing's tail read was focal's (71.7 ns), the election timing 940 ns and
+the priority 1,384 ns: the first measurement of this comparison found them, and the changes are in
+`crates/hyper-timing/ORIGIN.md`, change 7. The first measurement also timed a sample that the
+optimizer had removed, since nothing read the path afterwards; the harness now observes the path
+after every sample.
+
+## Commands for the timing
+
+```sh
+cargo test -p hyper-timing
+cd crates/hyper-timing-compare && cargo build --release
+target/release/hyper-timing-compare table 7 2000000
+```

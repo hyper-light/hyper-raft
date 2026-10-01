@@ -11,7 +11,7 @@ The law's four columns:
 
 | Crate | Source | Wall | Allocs | Bench | E2E | On `main` |
 |---|---|---|---|---|---|---|
-| hyper-raft | focal-raft `a8e95f7`, with history | yes | in progress (`raft-law`) | in progress (`raft-law`) | in progress (`raft-law`) | yes |
+| hyper-raft | focal-raft `a8e95f7`, with history; the owner's decision (2026-10-01): core changes start here | yes | yes: 32 → 11 allocations per entry at batch 1, 0 reallocations (`docs/benchmarks.md`) | yes: against focal `a8e95f7` and `1395e22`, slates `5cce86a` and raft-rs; behind slates on catch-up and snapshot, traced to raft-proto's message size (fixed by step R-2) | yes: 3- and 5-member processes over UDP with fsynced logs; kill -9 of the leader, of a follower, and of all; partition | yes |
 | hyper-timing | focal-timing `a8e95f7` with history, and slates' election law `5cce86a` | yes | owed | owed | through hyper-swim and hyper-raft | yes |
 | hyper-datagram | new, after slates' seal and node.md §3.4 | yes | owed | owed against slates' `Sealer`/`Opener` | yes: two processes, UDP; replay and forgery from a third socket | yes |
 | hyper-swim | slates' detector `5cce86a` | yes | owed | owed | yes: four processes over hyper-datagram, SIGKILL detection | yes |
@@ -26,6 +26,6 @@ The law's four columns:
 
 | Consumer | Takes | State |
 |---|---|---|
-| mantle | hyper-raft as `vendor/hyper-raft` (Cargo rename `focal-raft`) | branch `hyper-raft-vendor`, gates running |
+| mantle | hyper-raft as `vendor/hyper-raft` (Cargo rename `focal-raft`), snapshot `cec55a6` | on mantle `dev` (`590f475`). The next snapshot takes the in-place `Ready` and the core ports |
 | focal | hyper-raft (R-1, F-1) | blocked: changes in `~/Projects/focal` need the owner's permission rule. focal's F43 (one ReadIndex heartbeat round per ready) is pending in focal-raft; it is ported here once focal gates it, so the cores do not diverge |
 | slates | hyper-quic, hyper-datagram, hyper-swim, hyper-timing | slates' session owns the integration (slates A-52 §5) |

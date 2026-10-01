@@ -292,7 +292,7 @@ pub(super) struct TestEndpoint {
     pub(super) outbound: VecDeque<(Transmit, Bytes)>,
     delayed: VecDeque<(Transmit, Bytes)>,
     pub(super) inbound: VecDeque<(Instant, Option<EcnCodepoint>, BytesMut)>,
-    accepted: Option<Result<ConnectionHandle, ConnectionError>>,
+    pub(super) accepted: Option<Result<ConnectionHandle, ConnectionError>>,
     pub(super) connections: HashMap<ConnectionHandle, Connection>,
     conn_events: HashMap<ConnectionHandle, VecDeque<ConnectionEvent>>,
     pub(super) captured_packets: Vec<Vec<u8>>,
@@ -618,6 +618,36 @@ pub(super) fn client_config_with_deterministic_pns() -> ClientConfig {
 
 pub(super) fn client_config_with_certs(certs: Vec<CertificateDer<'static>>) -> ClientConfig {
     ClientConfig::new(Arc::new(client_crypto_inner(Some(certs), None)))
+}
+
+/// A client offering only classical key exchange, so its ClientHello fits in one Initial
+/// datagram: the layout upstream's packet-counting tests were written against. The default
+/// client prefers X25519MLKEM768, whose 1,184-byte key share spreads the ClientHello over two.
+pub(super) fn client_config_classical(certs: Option<Vec<CertificateDer<'static>>>) -> ClientConfig {
+    let provider = Arc::new(rustls::crypto::CryptoProvider {
+        kx_groups: vec![
+            rustls::crypto::aws_lc_rs::kx_group::X25519,
+            rustls::crypto::aws_lc_rs::kx_group::SECP256R1,
+            rustls::crypto::aws_lc_rs::kx_group::SECP384R1,
+        ],
+        ..rustls::crypto::aws_lc_rs::default_provider()
+    });
+    let mut roots = rustls::RootCertStore::empty();
+    for cert in certs.unwrap_or_else(|| vec![CERTIFIED_KEY.cert.der().clone()]) {
+        roots.add(cert).unwrap();
+    }
+    let verifier = WebPkiServerVerifier::builder_with_provider(Arc::new(roots), provider.clone())
+        .build()
+        .unwrap();
+    let mut inner = rustls::ClientConfig::builder_with_provider(provider)
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .unwrap()
+        .dangerous()
+        .with_custom_certificate_verifier(verifier)
+        .with_no_client_auth();
+    inner.enable_early_data = true;
+    inner.key_log = Arc::new(KeyLogFile::new());
+    ClientConfig::new(Arc::new(QuicClientConfig::try_from(inner).unwrap()))
 }
 
 pub(super) fn client_crypto() -> QuicClientConfig {

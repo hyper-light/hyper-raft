@@ -27,6 +27,7 @@ use crate::{
 mod util;
 use util::*;
 
+mod first_flight;
 mod token;
 
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
@@ -768,7 +769,7 @@ fn test_zero_rtt_incoming_limit<F: FnOnce(&mut ServerConfig)>(configure_server: 
     let mut server_config = server_config();
     configure_server(&mut server_config);
     let mut pair = Pair::new(EndpointConfig::default(), server_config);
-    let config = client_config();
+    let config = client_config_classical(None);
 
     // Establish normal connection
     let client_ch = pair.begin_connect(config.clone());
@@ -1481,6 +1482,10 @@ fn initial_retransmit() {
     );
 }
 
+/// A client that closes before the server has seen its ClientHello begin sends an Initial holding
+/// only a CONNECTION_CLOSE. Upstream surfaced it as an `Incoming` whose connection was then lost;
+/// no handshake can follow a close, so the server neither surfaces nor keeps anything
+/// (VENDORED.md, connection attempts).
 #[test]
 fn instant_close_1() {
     let _guard = subscribe();
@@ -1493,17 +1498,13 @@ fn instant_close_1() {
         .unwrap()
         .close(pair.time, VarInt(0), Bytes::new());
     pair.drive();
-    let server_ch = pair.server.assert_accept();
-    assert_matches!(pair.client_conn_mut(client_ch).poll(), None);
-    assert_matches!(
-        pair.server_conn_mut(server_ch).poll(),
-        Some(Event::ConnectionLost {
-            reason: ConnectionError::ConnectionClosed(ConnectionClose {
-                error_code: TransportErrorCode::APPLICATION_ERROR,
-                ..
-            }),
-        })
+    assert!(
+        pair.server.accepted.is_none(),
+        "the server surfaced an attempt"
     );
+    assert_eq!(pair.server.endpoint.held_initials(), 0);
+    assert_eq!(pair.server.known_connections(), 0);
+    assert_matches!(pair.client_conn_mut(client_ch).poll(), None);
 }
 
 #[test]
@@ -2760,7 +2761,7 @@ fn server_can_send_3_inital_packets() {
 
     let (cert, key) = big_cert_and_key();
     let server = server_config_with_cert(cert.clone(), key);
-    let client = client_config_with_certs(vec![cert]);
+    let client = client_config_classical(Some(vec![cert]));
     let mut pair = Pair::new(Default::default(), server);
 
     let client_ch = pair.begin_connect(client);
@@ -2783,7 +2784,7 @@ fn server_can_send_3_inital_packets() {
 }
 
 /// Generate a big fat certificate that can't fit inside the initial anti-amplification limit
-fn big_cert_and_key() -> (CertificateDer<'static>, PrivateKeyDer<'static>) {
+pub(super) fn big_cert_and_key() -> (CertificateDer<'static>, PrivateKeyDer<'static>) {
     let cert = rcgen::generate_simple_self_signed(
         Some("localhost".into())
             .into_iter()

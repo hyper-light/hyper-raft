@@ -1,5 +1,6 @@
 use std::{
-    collections::{HashMap, hash_map},
+    cmp::{self, Reverse},
+    collections::{BinaryHeap, HashMap, hash_map},
     convert::TryFrom,
     fmt, mem,
     net::{IpAddr, SocketAddr},
@@ -18,9 +19,9 @@ use thiserror::Error;
 use tracing::{debug, error, trace, warn};
 
 use crate::{
-    BloomTokenLog, Duration, INITIAL_MTU, Instant, MAX_CID_SIZE, MIN_INITIAL_SIZE, QlogStream,
-    RESET_TOKEN_SIZE, ResetToken, Side, TokenLog, TokenMemoryCache, TokenStore, Transmit,
-    TransportConfig, TransportError,
+    BloomTokenLog, Duration, Frame, INITIAL_MTU, Instant, MAX_CID_SIZE, MIN_INITIAL_SIZE,
+    QlogStream, RESET_TOKEN_SIZE, ResetToken, Side, TIMER_GRANULARITY, TokenLog, TokenMemoryCache,
+    TokenStore, Transmit, TransportConfig, TransportError,
     cid_generator::ConnectionIdGenerator,
     coding::BufMutExt,
     config::{ClientConfig, EndpointConfig, ServerConfig},
@@ -56,6 +57,13 @@ pub struct Endpoint {
     last_stateless_reset: Option<Instant>,
     /// Buffered Initial and 0-RTT messages for pending incoming connections
     incoming_buffers: Slab<IncomingBuffer>,
+    /// Initial datagrams of connection attempts whose ClientHello has not yet begun (see
+    /// `handle_first_packet`); bounded with `incoming_buffers` by `max_incoming` and the incoming
+    /// byte limits, and dropped after `HeldInitial::expires`
+    held: Slab<HeldInitial>,
+    /// `held` entries in order of expiry, each with the CID it was held for
+    held_expiry: BinaryHeap<Reverse<(Instant, usize, ConnectionId)>>,
+    /// Bytes buffered in `incoming_buffers` and `held` together
     all_incoming_buffers_total_bytes: u64,
     /// Address validation tokens already presented to this server (RFC 9000 §8.1.4)
     token_log: Box<dyn TokenLog>,
@@ -94,6 +102,8 @@ impl Endpoint {
             allow_mtud,
             last_stateless_reset: None,
             incoming_buffers: Slab::new(),
+            held: Slab::new(),
+            held_expiry: BinaryHeap::new(),
             all_incoming_buffers_total_bytes: 0,
             token_log: Box::new(BloomTokenLog::default()),
             token_store: Box::new(TokenMemoryCache::default()),
@@ -240,6 +250,7 @@ impl Endpoint {
         };
 
         let addresses = FourTuple { remote, local_ip };
+        self.expire_held(now);
         let dst_cid = event.first_decode.dst_cid();
 
         if let Some(route_to) = self.index.get(&addresses, &event.first_decode) {
@@ -264,6 +275,10 @@ impl Endpoint {
                     }
 
                     None
+                }
+                // An attempt whose ClientHello has not begun: this datagram may begin it
+                RouteDatagramTo::Held(_) => {
+                    self.handle_first_packet(datagram_len, event, addresses, buf)
                 }
                 RouteDatagramTo::Connection(ch) => Some(DatagramEvent::ConnectionEvent(
                     ch,
@@ -479,7 +494,8 @@ impl Endpoint {
 
         // Saturation only happens under heavy load, where deriving initial keys per Initial just to
         // reply with CONNECTION_REFUSED would starve packet processing for existing connections.
-        if self.cids_exhausted() || self.incoming_buffers.len() >= server_config.max_incoming {
+        let pending = self.incoming_buffers.len() + self.held.len();
+        if self.cids_exhausted() || pending >= server_config.max_incoming {
             debug!(
                 "ignoring initial for connection {} due to saturation",
                 dst_cid
@@ -511,7 +527,16 @@ impl Endpoint {
             )));
         }
 
-        let packet = match event.first_decode.finish(Some(&*crypto.header.remote)) {
+        // Kept in case this datagram must be held and replayed to the connection later
+        let raw = {
+            let mut raw = BytesMut::from(event.first_decode.data());
+            if let Some(rest) = &event.remaining {
+                raw.extend_from_slice(rest);
+            }
+            raw
+        };
+
+        let mut packet = match event.first_decode.finish(Some(&*crypto.header.remote)) {
             Ok(packet) => packet,
             Err(e) => {
                 trace!("unable to decode initial packet: {}", e);
@@ -524,11 +549,56 @@ impl Endpoint {
             return None;
         }
 
+        // Authenticate the payload before anything acts on this packet: an Initial whose payload
+        // fails AEAD is not a connection attempt, and must not reach the application or spend an
+        // address validation token in the token log.
+        let Some(packet_number) = packet.header.number().map(|n| n.expand(0)) else {
+            return None;
+        };
+        if crypto
+            .packet
+            .remote
+            .decrypt(packet_number, &packet.header_data, &mut packet.payload)
+            .is_err()
+        {
+            debug!(
+                packet_number,
+                "dropping initial packet that fails authentication"
+            );
+            return None;
+        }
+
         let Header::Initial(header) = packet.header else {
             panic!("non-initial packet in handle_first_packet()");
         };
 
         let server_config = self.server_config.as_ref().unwrap().clone();
+
+        // A connection attempt begins with the first byte of the ClientHello: CRYPTO data at
+        // offset 0 (RFC 9001 §4.1.3). A ClientHello larger than one datagram, as a post-quantum
+        // key share makes it (X25519MLKEM768 adds 1,184 bytes, draft-ietf-tls-ecdhe-mlkem), spans
+        // several Initials. Any other Initial is held, not surfaced: if it arrived before the
+        // start it joins the attempt when the start arrives, and if it is a straggler from a
+        // flight the server already answered with Retry, it expires instead of appearing to the
+        // application as a second attempt.
+        match classify_first_initial(&packet.payload) {
+            FirstInitial::Begins => {}
+            FirstInitial::Continues => {
+                self.hold_initial(
+                    event.now,
+                    addresses,
+                    event.ecn,
+                    raw,
+                    header.dst_cid,
+                    &server_config,
+                );
+                return None;
+            }
+            FirstInitial::Closes => {
+                debug!("dropping initial that closes an attempt the server never saw begin");
+                return None;
+            }
+        }
 
         let token = match IncomingToken::from_header(
             &header,
@@ -550,10 +620,13 @@ impl Endpoint {
             }
         };
 
+        // Datagrams held for this attempt before its ClientHello began go to the connection with
+        // the rest of its buffered datagrams.
+        let (datagrams, total_bytes) = self.release_held(header.dst_cid);
         let incoming_idx = self.incoming_buffers.insert(IncomingBuffer {
             server_config,
-            datagrams: Vec::new(),
-            total_bytes: 0,
+            datagrams,
+            total_bytes,
         });
         self.index
             .insert_initial_incoming(header.dst_cid, incoming_idx);
@@ -575,12 +648,120 @@ impl Endpoint {
         }))
     }
 
+    /// Hold an authenticated Initial datagram whose attempt has not begun its ClientHello
+    fn hold_initial(
+        &mut self,
+        now: Instant,
+        addresses: FourTuple,
+        ecn: Option<EcnCodepoint>,
+        data: BytesMut,
+        dst_cid: ConnectionId,
+        server_config: &ServerConfig,
+    ) {
+        let len = data.len() as u64;
+        let key = match self.index.held(&dst_cid) {
+            Some(key) => key,
+            None => {
+                // RFC 9002 §6.2.1: PTO = smoothed_rtt + max(4 × rttvar, kGranularity), with no
+                // max_ack_delay in the Initial space; before any RTT sample, smoothed_rtt is the
+                // initial RTT and rttvar half of it (§5.3).
+                let rtt = server_config.transport.initial_rtt;
+                let pto = rtt + cmp::max(4 * (rtt / 2), TIMER_GRANULARITY);
+                let Some(expires) = pto.checked_mul(3).and_then(|t| now.checked_add(t)) else {
+                    debug!("not holding initial for {}: expiry out of range", dst_cid);
+                    return;
+                };
+                let key = self.held.insert(HeldInitial {
+                    dst_cid,
+                    expires,
+                    datagrams: Vec::new(),
+                    total_bytes: 0,
+                });
+                self.held_expiry.push(Reverse((expires, key, dst_cid)));
+                self.index.insert_initial_held(dst_cid, key);
+                key
+            }
+        };
+        let entry = &mut self.held[key];
+        let fits = entry
+            .total_bytes
+            .checked_add(len)
+            .is_some_and(|n| n <= server_config.incoming_buffer_size)
+            && self
+                .all_incoming_buffers_total_bytes
+                .checked_add(len)
+                .is_some_and(|n| n <= server_config.incoming_buffer_size_total);
+        if !fits {
+            debug!("not holding initial for {}: incoming buffers full", dst_cid);
+            return;
+        }
+        entry.datagrams.push(HeldDatagram {
+            now,
+            remote: addresses.remote,
+            ecn,
+            data,
+        });
+        entry.total_bytes += len;
+        self.all_incoming_buffers_total_bytes += len;
+    }
+
+    /// Take the datagrams held for `dst_cid`, decoded for delivery to its connection
+    fn release_held(&mut self, dst_cid: ConnectionId) -> (Vec<DatagramConnectionEvent>, u64) {
+        let Some(key) = self.index.held(&dst_cid) else {
+            return (Vec::new(), 0);
+        };
+        // The expiry heap keeps a stale entry, which `expire_held` recognises and skips
+        let entry = self.held.remove(key);
+        let parser = FixedLengthConnectionIdParser::new(self.local_cid_generator.cid_len());
+        let mut datagrams = Vec::with_capacity(entry.datagrams.len());
+        for held in entry.datagrams {
+            // Each decoded once already when it arrived, so a failure here is not reachable
+            if let Ok((first_decode, remaining)) = PartialDecode::new(
+                held.data,
+                &parser,
+                &self.config.supported_versions,
+                self.config.grease_quic_bit,
+            ) {
+                datagrams.push(DatagramConnectionEvent {
+                    now: held.now,
+                    remote: held.remote,
+                    ecn: held.ecn,
+                    first_decode,
+                    remaining,
+                });
+            }
+        }
+        (datagrams, entry.total_bytes)
+    }
+
+    /// Drop held Initials whose ClientHello did not begin before they expired
+    fn expire_held(&mut self, now: Instant) {
+        while let Some(&Reverse((expires, key, dst_cid))) = self.held_expiry.peek() {
+            if expires > now {
+                break;
+            }
+            self.held_expiry.pop();
+            let live = self
+                .held
+                .get(key)
+                .is_some_and(|held| held.dst_cid == dst_cid && held.expires == expires);
+            if live {
+                let held = self.held.remove(key);
+                self.all_incoming_buffers_total_bytes -= held.total_bytes;
+                if self.index.held(&dst_cid) == Some(key) {
+                    self.index.remove_initial(dst_cid);
+                }
+                trace!("held initials for {} expired", dst_cid);
+            }
+        }
+    }
+
     /// Attempt to accept this incoming connection (an error may still occur)
     // AcceptError cannot be made smaller without semver breakage
     #[allow(clippy::result_large_err)]
     pub fn accept(
         &mut self,
-        mut incoming: Incoming,
+        incoming: Incoming,
         now: Instant,
         buf: &mut Vec<u8>,
         server_config: Option<Arc<ServerConfig>>,
@@ -630,25 +811,6 @@ impl Endpoint {
                 )),
             });
         }
-
-        if incoming
-            .crypto
-            .packet
-            .remote
-            .decrypt(
-                packet_number,
-                &incoming.packet.header_data,
-                &mut incoming.packet.payload,
-            )
-            .is_err()
-        {
-            debug!(packet_number, "failed to authenticate initial packet");
-            self.index.remove_initial(dst_cid);
-            return Err(AcceptError {
-                cause: TransportError::PROTOCOL_VIOLATION("authentication failed").into(),
-                response: None,
-            });
-        };
 
         let ch = ConnectionHandle(self.connections.vacant_key());
         let loc_cid = self.new_cid(ch);
@@ -960,13 +1122,19 @@ impl Endpoint {
     #[cfg(test)]
     pub(crate) fn known_connections(&self) -> usize {
         let x = self.connections.len();
-        debug_assert_eq!(x, self.index.connection_ids_initial.len());
+        // Held Initials (`held_initials`) are routed by initial CID too, but are not connections
+        debug_assert_eq!(x, self.index.connection_ids_initial.len() - self.held.len());
         // Not all connections have known reset tokens
         debug_assert!(x >= self.index.connection_reset_tokens.0.len());
         // Not all connections have unique remotes, and 0-length CIDs might not be in use.
         debug_assert!(x >= self.index.incoming_connection_remotes.len());
         debug_assert!(x >= self.index.outgoing_connection_remotes.len());
         x
+    }
+
+    #[cfg(test)]
+    pub(crate) fn held_initials(&self) -> usize {
+        self.held.len()
     }
 
     #[cfg(test)]
@@ -1005,6 +1173,55 @@ impl fmt::Debug for Endpoint {
     }
 }
 
+/// Initial datagrams of a connection attempt whose ClientHello has not begun
+struct HeldInitial {
+    dst_cid: ConnectionId,
+    /// When the entry is dropped if the ClientHello has still not begun: three probe timeouts
+    /// computed from the server's initial RTT, the time RFC 9000 §10.2 allows a peer's stray
+    /// packets to keep arriving after state ends
+    expires: Instant,
+    datagrams: Vec<HeldDatagram>,
+    total_bytes: u64,
+}
+
+/// One held datagram, kept whole so the connection can decode it as if it had just arrived
+struct HeldDatagram {
+    now: Instant,
+    remote: SocketAddr,
+    ecn: Option<EcnCodepoint>,
+    data: BytesMut,
+}
+
+/// What a decrypted Initial from an unknown attempt carries
+enum FirstInitial {
+    /// The first byte of the ClientHello: the attempt begins here
+    Begins,
+    /// More of a ClientHello whose start has not arrived
+    Continues,
+    /// A CONNECTION_CLOSE, or no valid frames, before any ClientHello: nothing can follow, so
+    /// nothing is kept
+    Closes,
+}
+
+fn classify_first_initial(payload: &BytesMut) -> FirstInitial {
+    let Ok(frames) = frame::Iter::new(Bytes::copy_from_slice(payload)) else {
+        return FirstInitial::Closes;
+    };
+    let mut closes = false;
+    for frame in frames.filter_map(Result::ok) {
+        match frame {
+            Frame::Crypto(ref crypto) if crypto.offset == 0 => return FirstInitial::Begins,
+            Frame::Close(_) => closes = true,
+            _ => {}
+        }
+    }
+    if closes {
+        FirstInitial::Closes
+    } else {
+        FirstInitial::Continues
+    }
+}
+
 /// Buffered Initial and 0-RTT messages for a pending incoming connection
 struct IncomingBuffer {
     server_config: Arc<ServerConfig>,
@@ -1016,6 +1233,8 @@ struct IncomingBuffer {
 #[derive(Copy, Clone, Debug)]
 enum RouteDatagramTo {
     Incoming(usize),
+    /// An index into `Endpoint::held`
+    Held(usize),
     Connection(ConnectionHandle),
 }
 
@@ -1060,6 +1279,23 @@ impl ConnectionIndex {
         }
         self.connection_ids_initial
             .insert(dst_cid, RouteDatagramTo::Incoming(incoming_key));
+    }
+
+    /// Associate held Initial datagrams with their initial destination CID
+    fn insert_initial_held(&mut self, dst_cid: ConnectionId, held_key: usize) {
+        if dst_cid.is_empty() {
+            return;
+        }
+        self.connection_ids_initial
+            .insert(dst_cid, RouteDatagramTo::Held(held_key));
+    }
+
+    /// The held entry for an initial destination CID, if it has one
+    fn held(&self, dst_cid: &ConnectionId) -> Option<usize> {
+        match self.connection_ids_initial.get(dst_cid) {
+            Some(&RouteDatagramTo::Held(key)) => Some(key),
+            _ => None,
+        }
     }
 
     /// Remove an association with an initial destination CID
@@ -1213,6 +1449,7 @@ pub struct Incoming {
     received_at: Instant,
     addresses: FourTuple,
     ecn: Option<EcnCodepoint>,
+    /// The first packet, its payload already authenticated and decrypted
     packet: InitialPacket,
     rest: Option<BytesMut>,
     crypto: Keys,

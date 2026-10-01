@@ -60,3 +60,55 @@ Upstream's own tests are the oracle that conformance changed no behaviour.
    - Two upstream test helpers were changed to match: `server_config_with_cert` no longer installs
      a test log, which existed only for builds without `bloom`; `use_same_token_twice` installs its
      store on the client endpoint.
+6. **TLS is `hyper-tls`.** `rustls` is now a Cargo rename of `hyper-tls` (`crates/hyper-tls`), so the
+   source still refers to `rustls::`. `HandshakeData::negotiated_key_exchange_group` is always
+   present, as an `Option`; upstream gated it behind a test feature and filled it with `.expect`.
+
+## 3. Connection attempts (2026-10-01)
+
+hyper-tls prefers X25519MLKEM768, as Chromium and Firefox now do. Its 1,184-byte key share
+(draft-ietf-tls-ecdhe-mlkem) spreads a ClientHello over two Initial datagrams, and running upstream's
+suite on it exposed two defects in quinn-proto 0.11.18's server:
+
+- **An attempt reached the application before its payload was authenticated.** `handle_first_packet`
+  removed header protection and surfaced an `Incoming`; only `accept` decrypted the payload. A
+  forged Initial with a garbage payload therefore became a connection attempt, and its token was
+  spent in the token log first.
+- **A straggler became a second attempt.** When the server answered a two-datagram ClientHello's
+  first datagram with Retry, the second datagram arrived afterwards for a CID with no state. It was
+  surfaced as a new `Incoming` with half a ClientHello and an already-spent token. One client
+  attempt produced two decisions, and possibly a second Retry. Upstream's own `use_token_then_retry`
+  fails on this.
+
+The fix:
+
+- `handle_first_packet` authenticates the payload before anything else acts on the packet. `accept`
+  no longer decrypts again.
+- An attempt surfaces only with the first byte of its ClientHello: CRYPTO data at offset 0
+  (RFC 9001 §4.1.3).
+- An authenticated Initial carrying more of a ClientHello is held per initial CID (`Endpoint::held`).
+  When the start arrives, the held datagrams join the attempt's buffered datagrams. A straggler
+  after Retry is never joined; it expires three probe timeouts after arrival. That is RFC 9000
+  §10.2's allowance for stray packets after state ends, with the PTO computed by RFC 9002 §6.2.1
+  from the server's configured initial RTT.
+- Held entries count toward `max_incoming` and the incoming byte limits.
+- An Initial carrying only a CONNECTION_CLOSE, or no valid frames, before any ClientHello is
+  dropped, because no handshake can follow it.
+
+Tests:
+
+- `tests::first_flight` (new) covers: post-quantum negotiation; the two-datagram ClientHello; a
+  retried attempt surfacing once, with the straggler expiring; a reversed ClientHello surfacing once
+  with no time passing and no loss; a forged payload surfacing nothing and buffering nothing; and a
+  first flight that fills but never exceeds three times the bytes received, using a certificate
+  whose random names compression cannot shrink.
+- Upstream tests changed:
+  - `server_can_send_3_inital_packets` and the two `zero_rtt_incoming_buffer_size` tests use a
+    classical-key-exchange client (`client_config_classical`). Their expected counts derive from a
+    one-datagram ClientHello. The post-quantum layout is covered by the new tests.
+  - `instant_close_1` now asserts that the server surfaces and keeps nothing. Upstream surfaced the
+    close as an attempt and then lost the connection.
+  - `known_connections`' bookkeeping assertion excludes held Initials, which share the
+    initial-CID routing table but are not connections.
+
+Result: 309 unit tests (upstream's 303 and 6 new) and 3 doctests pass.

@@ -3,6 +3,7 @@ use std::{any::Any, io, str, sync::Arc};
 use aws_lc_rs::aead;
 use bytes::BytesMut;
 pub use rustls::Error;
+use rustls::NamedGroup;
 use rustls::{
     self, CipherSuite,
     client::danger::ServerCertVerifier,
@@ -60,6 +61,10 @@ impl crypto::Session for TlsSession {
                 Connection::Client(_) => None,
                 Connection::Server(ref session) => session.server_name().map(|x| x.into()),
             },
+            negotiated_key_exchange_group: self
+                .inner
+                .negotiated_key_exchange_group()
+                .map(|group| group.name()),
         }))
     }
 
@@ -252,6 +257,8 @@ pub struct HandshakeData {
     ///
     /// Always `None` for outgoing connections
     pub server_name: Option<String>,
+    /// The key exchange group negotiated with the peer, once the handshake has chosen one
+    pub negotiated_key_exchange_group: Option<NamedGroup>,
 }
 
 /// A QUIC-compatible TLS client configuration

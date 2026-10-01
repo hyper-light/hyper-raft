@@ -1,9 +1,8 @@
-//! What the log holds in memory (docs/design/raft-log.md §4): each group's retained entries,
-//! hard state, start and proposals, where each was written, and how many live pieces each
-//! segment still holds.
+//! What the log holds in memory (mantle docs/design/raft-log.md §4): each group's retained
+//! entries, hard state, start and proposals, where each was written, and how many live pieces
+//! each segment still holds. The log's owner holds all of it; nothing else reads it.
 
-use std::collections::{BTreeMap, VecDeque};
-use std::sync::Arc;
+use std::collections::{BTreeMap, HashMap, VecDeque};
 
 use crate::format::{HardState, Start};
 
@@ -16,13 +15,13 @@ pub struct Place {
 }
 
 /// A retained entry: its term, where it is, its payload's length and, while it is recent,
-/// its bytes.
+/// its bytes, which the update that wrote it handed over.
 #[derive(Debug, Clone)]
 pub struct Slot {
     pub term: u64,
     pub place: Place,
     pub len: u32,
-    pub cached: Option<Arc<[u8]>>,
+    pub cached: Option<Vec<u8>>,
 }
 
 /// An entry the group approved by itself on the fast track.
@@ -30,7 +29,7 @@ pub struct Slot {
 pub struct Proposal {
     pub term: u64,
     pub place: Place,
-    pub bytes: Arc<[u8]>,
+    pub bytes: Vec<u8>,
 }
 
 /// One group's durable state.
@@ -202,6 +201,57 @@ impl Live {
 
 fn slot_index(place: Place) -> usize {
     usize::try_from(place.slot).unwrap_or(usize::MAX)
+}
+
+/// Where the next frame goes.
+#[derive(Debug, Clone, Copy)]
+pub struct Head {
+    pub slot: u32,
+    pub incarnation: u64,
+    pub nonce: u64,
+    /// File offset of the next frame.
+    pub offset: u64,
+}
+
+/// Which segment slots are live, oldest first, and which are free.
+#[derive(Debug, Default)]
+pub struct Segments {
+    /// Each slot's incarnation, 0 for one never used, and its nonce.
+    pub incarnation: Vec<u64>,
+    pub nonce: Vec<u64>,
+    /// Live segments' slots, the tail first and the head last.
+    pub live: VecDeque<u32>,
+    /// Free slots, each with the sequence of the first frame that recorded a tail past it:
+    /// reused only once that frame is durable (mantle docs/design/raft-log.md §5).
+    pub free: VecDeque<(u32, u64)>,
+}
+
+/// Everything the log knows of its file and its groups.
+pub struct State {
+    pub groups: HashMap<u128, Group>,
+    /// Groups found damaged, served to no one until removed (`Recovery::damaged`), each with
+    /// where its `Damaged` record is: `None` only while open writes it.
+    pub damaged: HashMap<u128, Option<Place>>,
+    pub live: Live,
+    pub segments: Segments,
+    pub head: Head,
+    pub next_sequence: u64,
+    pub next_incarnation: u64,
+    /// The sequence of the last frame flushed.
+    pub durable: u64,
+    /// The tail the last frame flushed names.
+    pub durable_tail: u64,
+}
+
+impl State {
+    pub fn tail_incarnation(&self) -> u64 {
+        self.segments
+            .live
+            .front()
+            .and_then(|&slot| self.segments.incarnation.get(usize::try_from(slot).ok()?))
+            .copied()
+            .unwrap_or(self.head.incarnation)
+    }
 }
 
 /// A group as replay rebuilds it: entries may arrive out of order, since relocated copies

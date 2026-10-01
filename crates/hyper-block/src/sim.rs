@@ -10,8 +10,8 @@
 //! Reads can fail or return flipped bits, the single-block faults of Ganesan et al.
 //! (FAST 2017). Everything random comes from one seed, so a failing run replays exactly.
 
+use std::cell::{RefCell, RefMut};
 use std::collections::BTreeSet;
-use std::sync::Mutex;
 
 use crate::DiskError;
 use crate::block::BlockFile;
@@ -72,9 +72,11 @@ pub struct SimStats {
     pub crashes: u64,
 }
 
+/// A simulated file with power-loss semantics. It has one owner, as every [`BlockFile`] does: a
+/// log's device thread while the log runs, the test once the log has given it back.
 #[derive(Debug)]
 pub struct SimFile {
-    state: Mutex<State>,
+    state: RefCell<State>,
     align: Alignment,
     sector: u64,
     name: std::path::PathBuf,
@@ -89,7 +91,7 @@ impl SimFile {
             return Err(sim_error("sector larger than the alignment"));
         }
         Ok(Self {
-            state: Mutex::new(State {
+            state: RefCell::new(State {
                 visible: Vec::new(),
                 durable: Vec::new(),
                 dirty: BTreeSet::new(),
@@ -143,10 +145,12 @@ impl SimFile {
         Ok(self.lock()?.durable.clone())
     }
 
-    fn lock(&self) -> Result<std::sync::MutexGuard<'_, State>, DiskError> {
+    /// The file's state, for one operation: no operation runs inside another, so it is never
+    /// borrowed already, and a borrow that fails is refused rather than unwound.
+    fn lock(&self) -> Result<RefMut<'_, State>, DiskError> {
         self.state
-            .lock()
-            .map_err(|_| sim_error("simulated file lock poisoned"))
+            .try_borrow_mut()
+            .map_err(|_| sim_error("simulated file reentered"))
     }
 
     /// Refuses what a direct-I/O file would refuse: misaligned offsets, lengths and buffer

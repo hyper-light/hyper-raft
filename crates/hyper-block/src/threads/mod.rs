@@ -11,7 +11,7 @@
 //! request past what is left is refused, naming the device and the threads asked for.
 
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use crate::DiskError;
@@ -62,8 +62,10 @@ mod platform {
     }
 }
 
-/// Pool threads drawn from the budget and not yet given back.
-static DRAWN: Mutex<usize> = Mutex::new(0);
+/// Pool threads drawn from the budget and not yet given back. A draw adds its threads and takes
+/// them back if they passed the ceiling, one atomic step each way, so no draw waits for another;
+/// one that passes while another's excess is being taken back is refused, the safe direction.
+static DRAWN: AtomicUsize = AtomicUsize::new(0);
 
 fn os(op: &'static str, source: std::io::Error) -> DiskError {
     DiskError::Io {
@@ -91,15 +93,7 @@ pub fn thread_cpu() -> Result<Duration, DiskError> {
 
 /// Pool threads the budget has left.
 pub fn left() -> Result<usize, DiskError> {
-    let drawn = *DRAWN.lock().map_err(|_| poisoned())?;
-    Ok(ceiling()?.saturating_sub(drawn))
-}
-
-fn poisoned() -> DiskError {
-    os(
-        "account the thread budget",
-        std::io::Error::other("the budget's lock is poisoned"),
-    )
+    Ok(ceiling()?.saturating_sub(DRAWN.load(Ordering::Acquire)))
 }
 
 /// Threads drawn from the budget, given back when dropped.
@@ -109,6 +103,7 @@ pub struct Reservation {
 }
 
 impl Reservation {
+    /// The threads the reservation holds.
     pub fn threads(&self) -> usize {
         self.threads
     }
@@ -116,28 +111,36 @@ impl Reservation {
 
 impl Drop for Reservation {
     fn drop(&mut self) {
-        if let Ok(mut drawn) = DRAWN.lock() {
-            *drawn = drawn.saturating_sub(self.threads);
-        }
+        give_back(self.threads);
     }
+}
+
+/// Takes `threads` back from the budget: a reservation's own, never more than were drawn.
+fn give_back(threads: usize) {
+    DRAWN.fetch_sub(threads, Ordering::AcqRel);
 }
 
 /// Draws `threads` from the budget for a pool serving `path`, before any of them starts;
 /// [`DiskError::Threads`] when the budget has fewer left.
 pub fn reserve(threads: usize, path: &Path) -> Result<Reservation, DiskError> {
     let ceiling = ceiling()?;
-    let mut drawn = DRAWN.lock().map_err(|_| poisoned())?;
-    let left = ceiling.saturating_sub(*drawn);
-    if threads > left {
-        return Err(DiskError::Threads {
-            path: path.to_path_buf(),
-            asked: threads,
-            left,
-            ceiling,
-        });
+    let refused = |left: usize| DiskError::Threads {
+        path: path.to_path_buf(),
+        asked: threads,
+        left,
+        ceiling,
+    };
+    if threads > ceiling {
+        return Err(refused(left()?));
     }
-    // In range: `threads <= ceiling - drawn`.
-    *drawn = drawn.saturating_add(threads);
+    // Each draw added is at most the ceiling, which the OS states far below usize::MAX, and
+    // every draw past it is taken back at once: the sum never wraps.
+    let before = DRAWN.fetch_add(threads, Ordering::AcqRel);
+    let left = ceiling.saturating_sub(before);
+    if threads > left {
+        give_back(threads);
+        return Err(refused(left));
+    }
     Ok(Reservation { threads })
 }
 

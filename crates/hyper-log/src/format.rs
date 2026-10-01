@@ -549,10 +549,15 @@ fn take_bytes<'a>(r: &mut Reader<'a>) -> Option<(u32, &'a [u8])> {
 /// An entry read back alone from `bytes`, which start at its encoded start: its term and
 /// payload, if its CRC holds for `group` and `index`.
 pub fn entry_at(bytes: &[u8], group: u128, index: u64) -> Option<(u64, Vec<u8>)> {
+    entry_slice(bytes, group, index).map(|(term, payload)| (term, payload.to_vec()))
+}
+
+/// As [`entry_at`], borrowing the payload where it lies.
+pub fn entry_slice(bytes: &[u8], group: u128, index: u64) -> Option<(u64, &[u8])> {
     let mut r = Reader::new(bytes);
     let term = r.u64()?;
     let (crc, payload) = take_bytes(&mut r)?;
-    (entry_crc(group, index, term, payload) == crc).then(|| (term, payload.to_vec()))
+    (entry_crc(group, index, term, payload) == crc).then_some((term, payload))
 }
 
 /// Entries a frame wrote for a group: from `first`, `count` of them, the last of term

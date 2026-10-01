@@ -23,6 +23,16 @@ UNSAFE_ALLOWED = {
         "std::alloc::GlobalAlloc over System (the counting allocator; measurement only)",
     "crates/hyper-measure/src/faults.rs":
         "getrusage(2), Mach task_info(3) and Win32 GetProcessMemoryInfo (page-fault counts)",
+    "crates/hyper-measure/src/wake.rs":
+        "std::task::RawWaker over a leaked slot (counting wakers; tests and benchmarks only)",
+    "crates/hyper-block/src/node/macos.rs":
+        "the disk ioctls of <sys/disk.h> (a device node's capacity and cache flush)",
+    "crates/hyper-block/src/node/windows.rs":
+        "IOCTL_DISK_GET_LENGTH_INFO (a device's capacity)",
+    "crates/hyper-block/src/threads/macos.rs":
+        "proc_pidinfo and sysctlbyname (the process's threads and the workqueue's thread ceiling)",
+    "crates/hyper-block/src/threads/windows.rs":
+        "ToolHelp snapshots and GetThreadTimes (the process's threads and a thread's CPU time)",
 }
 
 ALLOW_UNSAFE = re.compile(r"(allow|expect)\s*\(\s*unsafe_code\b")

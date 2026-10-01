@@ -1,14 +1,17 @@
-//! The Raft log (docs/design/raft-log.md): one log per metadata device, shared by every range
-//! replica on it, so that one flush commits every group's writes.
+//! The shared Raft log (mantle docs/design/raft-log.md): one log per device, shared by every
+//! group on it, so that one flush commits every group's writes.
 //!
 //! A replica submits its `Ready`'s entries, hard state, start and proposals as one [`Update`];
-//! the writer thread gathers every update that arrived while the last flush ran into one
-//! frame, writes and flushes it, publishes it to readers, and answers once a later durable
-//! record confirms the flush. Reads
-//! serve the view focal-raft's `Storage` needs: bounds, terms and entries.
+//! the writer gathers every update that arrived while the last flush ran into one frame, writes
+//! and flushes it, publishes it to readers, and answers once a later durable record confirms the
+//! flush. Reads serve the view a Raft core's storage needs: bounds, terms and entries.
 //!
-//! From mantle-log at mantle `147f035` (`ORIGIN.md`).
-#![allow(missing_docs)]
+//! From mantle-log at mantle `147f035` (`ORIGIN.md`), with its state held by one owner thread
+//! instead of a lock (mantle note 32 §3.9, L-2): callers reach the owner by message and hear
+//! back through tickets, one to one (`ticket.rs`); the owner runs the writer as steps between
+//! messages and hands every read and write of the file to the log's device thread, so it answers
+//! callers while a frame is flushed (`owner.rs`, `device.rs`). A log runs those two threads,
+//! whatever its number of groups or callers.
 #![cfg_attr(
     test,
     allow(
@@ -20,19 +23,20 @@
         clippy::disallowed_macros
     )
 )]
+#![allow(missing_docs)]
 
 pub mod codec;
+mod device;
 mod error;
 pub mod format;
+mod owner;
 mod recover;
 mod room;
 mod state;
+mod ticket;
 mod writer;
 
-use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
-use std::sync::{Arc, RwLock};
+use std::sync::mpsc::{SyncSender, TrySendError, sync_channel};
 use std::task::Waker;
 use std::thread::JoinHandle;
 
@@ -41,12 +45,15 @@ use hyper_block::buf::{Alignment, Pool};
 
 pub use error::LogError;
 pub use format::{HardState, Start};
+pub use ticket::{Fetching, Pending};
 
-use state::{Group, Live, Place};
+use owner::{Message, Owner, Query};
+use ticket::{Answer, Ticket, Waiting};
+use writer::Submission;
 
 /// The log's parameters. Each comes from the node: the segment size from the device's
 /// geometry, the rest from the measured append rate and the replicas placed on the device
-/// (docs/design/raft-log.md §4–§5).
+/// (mantle docs/design/raft-log.md §4–§5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Config {
     /// Bytes of each segment: a multiple of the file's alignment, at least four blocks.
@@ -72,7 +79,7 @@ pub struct Config {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Waits {
     /// Waits for the submitters the last batch answered while waiting is expected to lower
-    /// total latency (docs/design/raft-log.md §3). What a node runs.
+    /// total latency (mantle docs/design/raft-log.md §3). What a node runs.
     Measured,
     /// Never waits: a batch is what is queued when the writer looks. For a caller whose
     /// submitters never return within a wait, as the replica simulation's, which drives each
@@ -87,10 +94,11 @@ pub struct Entries {
     pub entries: Vec<Entry>,
 }
 
+/// One entry: its term and its bytes, which the log takes and keeps while the entry is recent.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Entry {
     pub term: u64,
-    pub bytes: Arc<[u8]>,
+    pub bytes: Vec<u8>,
 }
 
 /// An entry the replica approved by itself on the fast track (07 §1.4).
@@ -98,7 +106,7 @@ pub struct Entry {
 pub struct Proposal {
     pub index: u64,
     pub term: u64,
-    pub bytes: Arc<[u8]>,
+    pub bytes: Vec<u8>,
 }
 
 /// What one replica makes durable at once: one `Ready`'s worth, applied in this order.
@@ -118,7 +126,7 @@ pub struct Update {
 /// How urgently a submission is wanted durable, as Tectonic's TrafficClasses order a node's
 /// work: latency-sensitive, normal and background [research/01 §1.11]. A frame with room for
 /// only some of the waiting updates takes them by class, most urgent first, after those it
-/// passed over before (docs/design/raft-log.md §3).
+/// passed over before (mantle docs/design/raft-log.md §3).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Class {
     /// A replica whose callers wait on the write: a metadata range's ready.
@@ -129,7 +137,7 @@ pub enum Class {
     Background,
 }
 
-/// A group's durable state, as focal-raft's `Storage` reads it.
+/// A group's durable state, as a Raft core's storage reads it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct View {
     pub start: Start,
@@ -138,7 +146,7 @@ pub struct View {
     pub hard_state: Option<HardState>,
     pub proposals: Vec<Proposal>,
     /// Entries the log may lack, through this mark's index and of terms up to its term,
-    /// that a frame no longer readable held (docs/design/raft-log.md §6). Until the log
+    /// that a frame no longer readable held (mantle docs/design/raft-log.md §6). Until the log
     /// again reaches the index, or holds an entry of a later term, the replica takes no part
     /// in elections: it may have acknowledged what it no longer holds.
     pub uncertain: Option<Start>,
@@ -157,116 +165,92 @@ pub struct Recovery {
     pub restored: Vec<u128>,
 }
 
-/// An update's answer, once it is durable or refused.
-#[derive(Debug)]
-pub struct Pending {
-    answer: Receiver<Result<(), LogError>>,
+/// Entries fetched: the caller's reservation, which the log fills with each entry's term and
+/// bytes. Handed back with its answer, it keeps its capacity for the next fetch, so a caller that
+/// fetches again with it allocates nothing once it has held the most it fetches.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Fetched {
+    bytes: Vec<u8>,
+    /// Each entry's term and where its bytes lie in `bytes`.
+    entries: Vec<(u64, usize, usize)>,
 }
 
-impl Pending {
-    pub fn wait(&self) -> Result<(), LogError> {
-        self.answer.recv().map_err(|_| LogError::Closed)?
+impl Fetched {
+    /// An empty reservation.
+    pub fn new() -> Self {
+        Self::default()
     }
 
-    /// The answer if it has come.
-    pub fn poll(&self) -> Option<Result<(), LogError>> {
-        match self.answer.try_recv() {
-            Ok(answer) => Some(answer),
-            Err(std::sync::mpsc::TryRecvError::Empty) => None,
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => Some(Err(LogError::Closed)),
+    /// Entries fetched.
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Whether no entry was fetched.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// The `i`th entry fetched: its term and its bytes.
+    pub fn get(&self, i: usize) -> Option<(u64, &[u8])> {
+        let &(term, start, len) = self.entries.get(i)?;
+        let end = start.checked_add(len)?;
+        Some((term, self.bytes.get(start..end)?))
+    }
+
+    /// Every entry fetched, in index order.
+    pub fn iter(&self) -> impl Iterator<Item = (u64, &[u8])> + '_ {
+        (0..self.entries.len()).filter_map(|i| self.get(i))
+    }
+
+    fn clear(&mut self) {
+        self.bytes.clear();
+        self.entries.clear();
+    }
+
+    /// Adds an entry held in memory.
+    fn push(&mut self, term: u64, bytes: &[u8]) {
+        let start = self.bytes.len();
+        self.bytes.extend_from_slice(bytes);
+        self.entries.push((term, start, bytes.len()));
+    }
+
+    /// Keeps a place for an entry to be read from the file: its position.
+    fn reserve(&mut self, term: u64) -> usize {
+        self.entries.push((term, 0, 0));
+        self.entries.len().saturating_sub(1)
+    }
+
+    /// Fills the place `at` with an entry read from the file.
+    fn fill(&mut self, at: usize, payload: &[u8]) {
+        let start = self.bytes.len();
+        self.bytes.extend_from_slice(payload);
+        if let Some(entry) = self.entries.get_mut(at) {
+            entry.1 = start;
+            entry.2 = payload.len();
         }
     }
 }
 
-/// What only the restore at open writes with an update (docs/design/raft-log.md §6).
+/// What only the restore at open writes with an update (mantle docs/design/raft-log.md §6).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-struct Marks {
+pub(crate) struct Marks {
     /// The group's log may lack entries through this mark.
-    uncertain: Option<Start>,
+    pub(crate) uncertain: Option<Start>,
     /// The group's acknowledged records are damaged: the update is otherwise empty.
-    damaged: bool,
+    pub(crate) damaged: bool,
 }
 
-/// An update on its way to the writer.
-struct Submission {
-    group: u128,
-    update: Update,
-    marks: Marks,
-    /// What it holds of the queue's byte bound, and what the writer's fair queue charges it.
-    bytes: u64,
-    class: Class,
-    /// Where the writer's fair queue placed it when taken (docs/design/raft-log.md §3).
-    tags: writer::Tags,
-    reply: SyncSender<Result<(), LogError>>,
-    /// Woken once the answer is sent, or once the submission is dropped unanswered, so a
-    /// caller that waits on many answers is told of each (docs/design/node.md §1.3).
-    waker: std::cell::Cell<Option<Waker>>,
-}
-
-impl Submission {
-    /// Wakes the submitter's waker, once.
-    fn wake(&self) {
-        if let Some(waker) = self.waker.take() {
-            waker.wake();
-        }
-    }
-}
-
-impl Drop for Submission {
-    fn drop(&mut self) {
-        // Its answer's sender goes with it: the handle reads `Closed`.
-        self.wake();
-    }
-}
-
-/// Where the next frame goes.
+/// What every part of the log knows once it opens, and never changes.
 #[derive(Debug, Clone, Copy)]
-struct Head {
-    slot: u32,
-    incarnation: u64,
-    nonce: u64,
-    /// File offset of the next frame.
-    offset: u64,
-}
-
-/// Which segment slots are live, oldest first, and which are free.
-#[derive(Debug, Default)]
-struct Segments {
-    /// Each slot's incarnation, 0 for one never used, and its nonce.
-    incarnation: Vec<u64>,
-    nonce: Vec<u64>,
-    /// Live segments' slots, the tail first and the head last.
-    live: VecDeque<u32>,
-    /// Free slots, each with the sequence of the first frame that recorded a tail past it:
-    /// reused only once that frame is durable (docs/design/raft-log.md §5).
-    free: VecDeque<(u32, u64)>,
-}
-
-struct State {
-    groups: HashMap<u128, Group>,
-    /// Groups found damaged, served to no one until removed (`Recovery::damaged`), each with
-    /// where its `Damaged` record is: `None` only while open writes it.
-    damaged: HashMap<u128, Option<Place>>,
-    live: Live,
-    segments: Segments,
-    head: Head,
-    next_sequence: u64,
-    next_incarnation: u64,
-    /// The sequence of the last frame flushed.
-    durable: u64,
-    /// The tail the last frame flushed names.
-    durable_tail: u64,
-}
-
-impl State {
-    fn tail_incarnation(&self) -> u64 {
-        self.segments
-            .live
-            .front()
-            .and_then(|&slot| self.segments.incarnation.get(usize::try_from(slot).ok()?))
-            .copied()
-            .unwrap_or(self.head.incarnation)
-    }
+pub(crate) struct Params {
+    pub(crate) id: u128,
+    pub(crate) config: Config,
+    pub(crate) align: Alignment,
+    /// Payload bytes one frame holds: no submission whose records take more is admitted.
+    pub(crate) frame_room: usize,
+    /// Charged bytes the queue holds at most (`PIPELINE_FRAMES`).
+    pub(crate) queue_bytes: u64,
 }
 
 /// Payload bytes one frame holds: a segment less its header block and the frame's header.
@@ -282,154 +266,217 @@ pub(crate) fn frame_room(config: &Config, align: Alignment) -> Result<usize, Log
 
 /// Frames' worth of charged bytes the log holds for submissions not yet answered: the frame
 /// flushed and awaiting the persist record that confirms it, the frame being written, whose
-/// record does, and the frame gathering while that flush runs (docs/design/raft-log.md §3). With
-/// less, the next frame could gather only once a flush ended and would go out short; bytes past
-/// a third frame cannot be written before the third flush from now, so by Little's law they
-/// add only waiting [research/11 §4, §5.2].
+/// record does, and the frame gathering while that flush runs (mantle docs/design/raft-log.md
+/// §3). With less, the next frame could gather only once a flush ended and would go out short;
+/// bytes past a third frame cannot be written before the third flush from now, so by Little's
+/// law they add only waiting [research/11 §4, §5.2].
 const PIPELINE_FRAMES: u64 = 3;
 
-struct Shared<F> {
-    file: F,
-    id: u128,
-    config: Config,
-    align: Alignment,
-    /// Payload bytes one frame holds: no submission whose records take more is admitted.
-    frame_room: usize,
-    /// Charged bytes the queue holds at most (`PIPELINE_FRAMES`).
-    queue_bytes: u64,
-    /// Buffers for reading entries back.
-    pool: Pool,
-    state: RwLock<State>,
-    /// Room in the queue, and the submitters waiting for it.
-    room: room::Room,
-    fenced: AtomicBool,
-    /// Submissions sent to the writer so far, counted just before each is sent.
-    submitted: AtomicU64,
-    /// Frames written and flushed since the log opened, and the updates they carried.
-    frames: AtomicU64,
-    updates: AtomicU64,
+/// A log the file could not be made into, and the file, given back where the log has it.
+#[derive(Debug)]
+pub struct Refused<F> {
+    pub error: LogError,
+    /// The file, unless a thread of the log that held it ended without giving it back.
+    pub file: Option<F>,
 }
 
-impl<F: BlockFile> Shared<F> {
-    fn read_state(&self) -> Result<std::sync::RwLockReadGuard<'_, State>, LogError> {
-        self.state.read().map_err(|_| LogError::Fenced)
-    }
-
-    /// Gives back the room of a submission of `group` answered or never sent, and hands it to
-    /// the submitters waiting for it.
-    fn release(&self, group: u128, bytes: u64) {
-        self.room.release(group, bytes);
+impl<F> Refused<F> {
+    fn with(error: LogError, file: F) -> Self {
+        Self {
+            error,
+            file: Some(file),
+        }
     }
 }
 
+/// The log: a handle to its owner, which any number of threads may share by reference.
 pub struct Log<F: BlockFile + 'static> {
-    shared: Arc<Shared<F>>,
-    sender: Option<SyncSender<Submission>>,
-    writer: Option<JoinHandle<()>>,
+    inbox: SyncSender<Message<F>>,
+    owner: Option<JoinHandle<Option<F>>>,
+    p: Params,
 }
 
 impl<F: BlockFile + 'static> Log<F> {
     /// Formats a new log `id` in `file`, which must be empty.
     pub fn create(file: F, config: Config, id: u128) -> Result<Self, LogError> {
-        let state = recover::create(&file, &config, id)?;
+        Self::try_create(file, config, id).map_err(|r| r.error)
+    }
+
+    /// Formats a new log as [`Log::create`] does, giving the file back with a refusal.
+    pub fn try_create(file: F, config: Config, id: u128) -> Result<Self, Refused<F>> {
+        let state = match recover::create(&file, &config, id) {
+            Ok(state) => state,
+            Err(error) => return Err(Refused::with(error, file)),
+        };
         let (log, _) = Self::start(file, config, id, state, Vec::new())?;
         Ok(log)
     }
 
-    /// Opens log `id` in `file` and recovers it (docs/design/raft-log.md §6). What a last
-    /// frame that no longer reads held, as its persist record says, is written back before
+    /// Opens log `id` in `file` and recovers it (mantle docs/design/raft-log.md §6). What a
+    /// last frame that no longer reads held, as its persist record says, is written back before
     /// the log serves anyone, in one frame.
     pub fn open(file: F, config: Config, id: u128) -> Result<(Self, Recovery), LogError> {
-        let (state, recovery, restores) = recover::open(&file, &config, id)?;
-        let (log, pending) = Self::start(file, config, id, state, restores)?;
+        Self::try_open(file, config, id).map_err(|r| r.error)
+    }
+
+    /// Opens a log as [`Log::open`] does, giving the file back with a refusal: what recovery
+    /// found damaged stays for whoever repairs or replaces it.
+    pub fn try_open(file: F, config: Config, id: u128) -> Result<(Self, Recovery), Refused<F>> {
+        let (state, recovery, restores) = match recover::open(&file, &config, id) {
+            Ok(opened) => opened,
+            Err(error) => return Err(Refused::with(error, file)),
+        };
+        let (mut log, pending) = Self::start(file, config, id, state, restores)?;
         for p in pending {
-            p.wait()?;
+            if let Err(error) = p.wait() {
+                return Err(Refused {
+                    error,
+                    file: log.stop(),
+                });
+            }
         }
         Ok((log, recovery))
     }
 
-    /// Starts the writer, whose first batch is `restores`: the handles that answer them.
+    /// Starts the owner and the device thread, the owner's first batch being `restores`: the
+    /// handles that answer them.
     fn start(
         file: F,
         config: Config,
         id: u128,
-        state: State,
+        state: state::State,
         restores: Vec<recover::Restore>,
-    ) -> Result<(Self, Vec<Pending>), LogError> {
-        let align = file.alignment();
-        let largest = usize::try_from(config.segment_bytes)
-            .map_err(|_| LogError::Config("segment larger than memory"))?;
-        let frame_room = frame_room(&config, align)?;
-        let queue_bytes = writer::charge(frame_room)
+    ) -> Result<(Self, Vec<Pending>), Refused<F>> {
+        match Self::prepare(file.alignment(), config, id, restores) {
+            Ok((p, room, first, pending)) => {
+                let log = Self::spawn(file, p, state, room, first)?;
+                Ok((log, pending))
+            }
+            Err(error) => Err(Refused::with(error, file)),
+        }
+    }
+
+    /// The log's parameters, its queue's room, and its first batch with the handles that
+    /// answer it.
+    #[expect(
+        clippy::type_complexity,
+        reason = "the four parts start() hands on, once"
+    )]
+    fn prepare(
+        align: Alignment,
+        config: Config,
+        id: u128,
+        restores: Vec<recover::Restore>,
+    ) -> Result<(Params, room::Room, Vec<Submission>, Vec<Pending>), LogError> {
+        let room_bytes = frame_room(&config, align)?;
+        let queue_bytes = writer::charge(room_bytes)
             .and_then(|largest| largest.checked_mul(PIPELINE_FRAMES))
             .ok_or(LogError::Config("a queue of three frames past u64"))?;
-        let shared = Arc::new(Shared {
-            file,
+        let p = Params {
             id,
             config,
             align,
-            frame_room,
+            frame_room: room_bytes,
             queue_bytes,
-            pool: Pool::new(align, largest.saturating_mul(2), largest),
-            state: RwLock::new(state),
-            room: room::Room::new(room::Limits {
-                submissions: config.queue_submissions,
-                bytes: queue_bytes,
-                waiters: config
-                    .max_groups
-                    .checked_mul(room::GROUP_SUBMISSIONS)
-                    .ok_or(LogError::Config("waiters past usize"))?,
-            }),
-            fenced: AtomicBool::new(false),
-            submitted: AtomicU64::new(0),
-            frames: AtomicU64::new(0),
-            updates: AtomicU64::new(0),
+        };
+        let waiters = config
+            .max_groups
+            .checked_mul(room::GROUP_SUBMISSIONS)
+            .ok_or(LogError::Config("waiters past usize"))?;
+        let mut room = room::Room::new(room::Limits {
+            submissions: config.queue_submissions,
+            bytes: queue_bytes,
+            waiters,
         });
-        // The restore is handed to the writer as its first batch, not sent: sent one by one,
-        // it could be taken in several batches, and a restore in parts is not atomic. It holds
-        // its room in the queue as a sent one does, past the queue's bound if it must, since
-        // one frame bounds it.
+        // The restore is the owner's first batch, not sent: sent one by one, it could be taken
+        // in several batches, and a restore in parts is not atomic. It holds its room in the
+        // queue as a sent one does, past the queue's bound if it must, since one frame bounds
+        // it.
         let mut pending = Vec::with_capacity(restores.len());
         let mut first = Vec::with_capacity(restores.len());
-        {
-            for r in restores {
-                let marks = Marks {
-                    uncertain: r.uncertain,
-                    damaged: r.damaged,
-                };
-                let bytes = writer::submission_len(r.group, &r.update, marks)
-                    .and_then(writer::charge)
-                    .ok_or(LogError::TooLarge(usize::MAX))?;
-                shared.room.hold(r.group, bytes)?;
-                let (reply, answer) = sync_channel(1);
-                pending.push(Pending { answer });
-                first.push(Submission {
-                    group: r.group,
-                    update: r.update,
-                    marks,
-                    bytes,
-                    class: Class::Normal,
-                    tags: writer::Tags::default(),
-                    reply,
-                    waker: std::cell::Cell::new(None),
-                });
-            }
+        for r in restores {
+            let marks = Marks {
+                uncertain: r.uncertain,
+                damaged: r.damaged,
+            };
+            let bytes = writer::submission_len(r.group, &r.update, marks)
+                .and_then(writer::charge)
+                .ok_or(LogError::TooLarge(usize::MAX))?;
+            room.hold(r.group, bytes)?;
+            let (reply, answer) = ticket::port();
+            pending.push(Pending(Waiting::new(answer)));
+            first.push(Submission {
+                group: r.group,
+                update: r.update,
+                marks,
+                bytes,
+                class: Class::Normal,
+                tags: writer::Tags::default(),
+                ticket: Ticket::new(reply, None),
+            });
         }
-        let capacity = config.queue_submissions.max(1);
-        let (sender, receiver) = sync_channel(capacity);
-        let writer = writer::Writer::new(Arc::clone(&shared), receiver, first)?;
-        let handle = std::thread::Builder::new()
+        Ok((p, room, first, pending))
+    }
+
+    /// Starts the device thread and hands it the file once it runs, then the owner: a thread the
+    /// OS refuses leaves the file with the caller.
+    fn spawn(
+        file: F,
+        p: Params,
+        state: state::State,
+        room: room::Room,
+        first: Vec<Submission>,
+    ) -> Result<Self, Refused<F>> {
+        let config = p.config;
+        // Everything that may wait in the inbox at once: every submission the queue admits,
+        // every waiter for room, and the device's answers.
+        let capacity = config
+            .queue_submissions
+            .max(1)
+            .saturating_add(config.max_groups.saturating_mul(room::GROUP_SUBMISSIONS))
+            .saturating_add(device::JOBS);
+        let (inbox, messages) = sync_channel(capacity);
+        let (jobs, work) = sync_channel(device::JOBS);
+        let (hand, handed) = sync_channel::<F>(1);
+        let done = inbox.clone();
+        let largest = usize::try_from(config.segment_bytes).unwrap_or(usize::MAX);
+        let pool = Pool::new(p.align, largest.saturating_mul(2), largest);
+        let segment_bytes = config.segment_bytes;
+        let device_thread = std::thread::Builder::new()
+            .name("hyper-log-device".into())
+            .spawn(move || {
+                let file = handed.recv().ok()?;
+                Some(device::run(file, &work, &done, pool, segment_bytes))
+            });
+        let device_thread = match device_thread {
+            Ok(thread) => thread,
+            Err(_) => return Err(Refused::with(LogError::Closed, file)),
+        };
+        // The device thread waits for the file, with room for it.
+        if let Err(e) = hand.try_send(file) {
+            let file = match e {
+                std::sync::mpsc::TrySendError::Full(f)
+                | std::sync::mpsc::TrySendError::Disconnected(f) => f,
+            };
+            return Err(Refused::with(LogError::Closed, file));
+        }
+        let owner = Owner::new(p, state, room, first, jobs, device_thread);
+        let owner = std::thread::Builder::new()
             .name("hyper-log".into())
-            .spawn(move || writer.run())
-            .map_err(|_| LogError::Closed)?;
-        Ok((
-            Self {
-                shared,
-                sender: Some(sender),
-                writer: Some(handle),
-            },
-            pending,
-        ))
+            .spawn(move || owner.run(&messages));
+        match owner {
+            Ok(owner) => Ok(Self {
+                inbox,
+                owner: Some(owner),
+                p,
+            }),
+            // The owner never ran: its closure, dropped with the refusal, ended the device
+            // thread, which took the file with it.
+            Err(_) => Err(Refused {
+                error: LogError::Closed,
+                file: None,
+            }),
+        }
     }
 
     /// Submits `update` for `group`: refused at once with `Busy` when the queue is full, and
@@ -452,9 +499,9 @@ impl<F: BlockFile + 'static> Log<F> {
 
     /// Submits `update` for `group`, waiting for room in the queue rather than refusing. A
     /// replica cannot have a `Ready` refused, so the log holds it back instead
-    /// (docs/design/replica.md §3). Room the writer frees goes to waiters in arrival order, each
-    /// woken alone, and a fence wakes each once, so the wait lasts no longer than the writer's
-    /// progress (docs/design/raft-log.md §3).
+    /// (mantle docs/design/replica.md §3). Room the writer frees goes to waiters in arrival
+    /// order, each told alone, and a fence tells each once, so the wait lasts no longer than the
+    /// writer's progress (mantle docs/design/raft-log.md §3).
     pub fn submit_waiting(&self, group: u128, update: Update) -> Result<Pending, LogError> {
         self.send(group, Class::Normal, update, true, None)
     }
@@ -471,8 +518,8 @@ impl<F: BlockFile + 'static> Log<F> {
 
     /// Submits `update` for `group` in `class` as `submit_waiting` does, and wakes `waker` once
     /// its answer has come, so one thread can keep many submissions out and learn of each
-    /// answer as it comes (docs/design/node.md §1.3, measurement.md §10). The waker is woken
-    /// exactly once, also when the log closes before it answers.
+    /// answer as it comes (mantle docs/design/node.md §1.3, measurement.md §10). The waker is
+    /// woken exactly once, also when the log closes before it answers.
     pub fn submit_waking(
         &self,
         group: u128,
@@ -495,17 +542,12 @@ impl<F: BlockFile + 'static> Log<F> {
         // submission fits the byte bound alone, so none waits for a queue that cannot hold it.
         let len = writer::submission_len(group, &update, Marks::default())
             .ok_or(LogError::TooLarge(usize::MAX))?;
-        if len > self.shared.frame_room {
+        if len > self.p.frame_room {
             return Err(LogError::TooLarge(len));
         }
         let bytes = writer::charge(len).ok_or(LogError::TooLarge(len))?;
-        if self.shared.fenced.load(Ordering::Acquire) {
-            return Err(LogError::Fenced);
-        }
-        self.shared.room.take(group, bytes, wait)?;
-        let sender = self.sender.as_ref().ok_or(LogError::Closed)?;
-        let (reply, answer) = sync_channel(1);
-        self.shared.submitted.fetch_add(1, Ordering::AcqRel);
+        let (reply, answer) = ticket::port();
+        let waiting = Waiting::new(answer);
         let submission = Submission {
             group,
             update,
@@ -513,39 +555,48 @@ impl<F: BlockFile + 'static> Log<F> {
             bytes,
             class,
             tags: writer::Tags::default(),
-            reply,
-            waker: std::cell::Cell::new(waker),
+            ticket: Ticket::new(reply, waker),
         };
-        match sender.try_send(submission) {
-            Ok(()) => Ok(Pending { answer }),
-            Err(e) => {
-                // The submission comes back in the error and is dropped here, which wakes its
-                // waker: the caller hears of the refusal from the result.
-                self.shared.release(group, bytes);
-                Err(match e {
-                    TrySendError::Full(_) => LogError::Busy,
-                    TrySendError::Disconnected(_) => LogError::Closed,
-                })
-            }
-        }
+        let message = Message::Submit { submission, wait };
+        let sent = if wait {
+            self.inbox.send(message).map_err(|_| LogError::Closed)
+        } else {
+            self.inbox.try_send(message).map_err(|e| match e {
+                TrySendError::Full(_) => LogError::Busy,
+                TrySendError::Disconnected(_) => LogError::Closed,
+            })
+        };
+        sent?;
+        waiting.admitted()?;
+        Ok(Pending(waiting))
+    }
+
+    /// Asks the owner and waits for its answer.
+    fn ask(&self, query: Query) -> Result<Answer, LogError> {
+        let (reply, answer) = ticket::port();
+        let waiting = Waiting::new(answer);
+        self.inbox
+            .send(Message::Query(query, Ticket::new(reply, None)))
+            .map_err(|_| LogError::Closed)?;
+        waiting.wait()
     }
 
     /// The parameters the log runs with.
     pub fn config(&self) -> Config {
-        self.shared.config
+        self.p.config
     }
 
     /// Payload bytes one frame holds: an update no longer than this fits a frame of its own.
     pub fn frame_room(&self) -> Result<usize, LogError> {
-        Ok(self.shared.frame_room)
+        Ok(self.p.frame_room)
     }
 
     /// Charged bytes the queue holds at most for submissions not yet answered: three frames
-    /// of the largest charge (docs/design/raft-log.md §3). A submission is charged the bytes
-    /// its records take in a frame, headers included, and its row in the frame's persist
+    /// of the largest charge (mantle docs/design/raft-log.md §3). A submission is charged the
+    /// bytes its records take in a frame, headers included, and its row in the frame's persist
     /// record, so an empty entry or an update of no records still costs what it holds.
     pub fn queue_bytes(&self) -> u64 {
-        self.shared.queue_bytes
+        self.p.queue_bytes
     }
 
     /// The most bytes one entry may hold and still fit a frame alone.
@@ -677,51 +728,26 @@ impl<F: BlockFile + 'static> Log<F> {
 
     /// The groups the log holds.
     pub fn groups(&self) -> Result<Vec<u128>, LogError> {
-        Ok(self.shared.read_state()?.groups.keys().copied().collect())
+        match self.ask(Query::Groups)? {
+            Answer::Groups(groups) => Ok(groups),
+            _ => Err(LogError::Closed),
+        }
     }
 
     /// A group's durable state; `None` for a group the log holds nothing of.
     pub fn view(&self, group: u128) -> Result<Option<View>, LogError> {
-        let state = self.shared.read_state()?;
-        if state.damaged.contains_key(&group) {
-            return Err(LogError::Damaged(
-                "the group's acknowledged records are damaged; it recovers from its peers",
-            ));
+        match self.ask(Query::View(group))? {
+            Answer::View(view) => Ok(view),
+            _ => Err(LogError::Closed),
         }
-        let Some(g) = state.groups.get(&group) else {
-            return Ok(None);
-        };
-        Ok(Some(View {
-            start: g.start,
-            last: g.last().ok_or(LogError::Damaged("an index past u64"))?,
-            hard_state: g.hard.map(|(h, _)| h),
-            proposals: g
-                .proposals
-                .iter()
-                .map(|(&index, p)| Proposal {
-                    index,
-                    term: p.term,
-                    bytes: Arc::clone(&p.bytes),
-                })
-                .collect(),
-            uncertain: g.uncertain.map(|(mark, _)| mark),
-        }))
     }
 
     /// The term of `index`, which may be the start's.
     pub fn term(&self, group: u128, index: u64) -> Result<u64, LogError> {
-        let state = self.shared.read_state()?;
-        let g = state
-            .groups
-            .get(&group)
-            .ok_or(LogError::Unavailable { group, index })?;
-        if index < g.start.index {
-            return Err(LogError::Compacted {
-                group,
-                first: g.start.index,
-            });
+        match self.ask(Query::Term(group, index))? {
+            Answer::Term(term) => Ok(term),
+            _ => Err(LogError::Closed),
         }
-        g.term(index).ok_or(LogError::Unavailable { group, index })
     }
 
     /// The entries of `[low, high)`, as many as `max_bytes` of payload admit and one at
@@ -733,195 +759,102 @@ impl<F: BlockFile + 'static> Log<F> {
         high: u64,
         max_bytes: u64,
     ) -> Result<Vec<Entry>, LogError> {
-        // What to read, taken under the lock; the file is read outside it.
-        let mut wanted = Vec::new();
-        {
-            let state = self.shared.read_state()?;
-            let g = state
-                .groups
-                .get(&group)
-                .ok_or(LogError::Unavailable { group, index: low })?;
-            let first = g.first().ok_or(LogError::Damaged("an index past u64"))?;
-            if low < first {
-                return Err(LogError::Compacted { group, first });
-            }
-            let mut total = 0u64;
-            for index in low..high {
-                let slot = g
-                    .slot(index)
-                    .ok_or(LogError::Unavailable { group, index })?;
-                total = total.saturating_add(u64::from(slot.len));
-                if !wanted.is_empty() && total > max_bytes {
-                    break;
-                }
-                wanted.push((index, slot.term, slot.place, slot.len, slot.cached.clone()));
-            }
-        }
-        // Entries no longer in memory are read from the file, those whose blocks touch in one
-        // read: an update's entries lie together in its frame, and a replica catching up asks
-        // for runs of them (audit P07).
-        let mut out = Vec::with_capacity(wanted.len());
-        let mut rest = wanted.as_slice();
-        while let Some(((index, term, place, len, cached), after)) = rest.split_first() {
-            if let Some(bytes) = cached {
-                out.push(Entry {
-                    term: *term,
-                    bytes: Arc::clone(bytes),
-                });
-                rest = after;
-                continue;
-            }
-            let (begin, mut end) = self.span(place, *len).ok_or(LogError::Corrupt {
-                group,
-                index: *index,
-            })?;
-            let mut run = 1usize;
-            for (_, _, next, next_len, next_cached) in after {
-                let Some((b, e)) = self.span(next, *next_len) else {
-                    break;
-                };
-                if next_cached.is_some() || next.slot != place.slot || b < begin || b > end {
-                    break;
-                }
-                end = end.max(e);
-                run = run.saturating_add(1);
-            }
-            let (these, later) = rest.split_at(run.min(rest.len()));
-            let bytes = self.read_span(begin, end)?;
-            for (index, term, place, len, _) in these {
-                let skip = usize::try_from(place.offset.saturating_sub(begin)).map_err(|_| {
-                    LogError::Corrupt {
-                        group,
-                        index: *index,
-                    }
-                })?;
-                let found = bytes
-                    .as_slice()
-                    .get(skip..)
-                    .and_then(|at| format::entry_at(at, group, *index))
-                    .filter(|(t, _)| t == term)
-                    .map(|(_, b)| Arc::<[u8]>::from(b));
-                let bytes = match found {
-                    Some(bytes) => bytes,
-                    // Moved since its place was taken: looked up again.
-                    None => self.read_entry(group, *index, *term, *place, *len)?,
-                };
-                out.push(Entry { term: *term, bytes });
-            }
-            rest = later;
-        }
-        Ok(out)
+        let fetched = self.fetch(group, low, high, max_bytes, Fetched::new())?;
+        Ok(fetched
+            .iter()
+            .map(|(term, bytes)| Entry {
+                term,
+                bytes: bytes.to_vec(),
+            })
+            .collect())
     }
 
-    /// The block-aligned span of the file holding an entry of `len` payload bytes at `place`.
-    fn span(&self, place: &Place, len: u32) -> Option<(u64, u64)> {
-        let align = self.shared.align;
-        let end = place
-            .offset
-            .checked_add(format::ENTRY_HEADER_BYTES)?
-            .checked_add(u64::from(len))
-            .and_then(|e| align.up_u64(e))?;
-        Some((align.down_u64(place.offset), end))
-    }
-
-    /// The file's bytes `[begin, end)`, block-aligned, in a buffer from the pool.
-    fn read_span(&self, begin: u64, end: u64) -> Result<hyper_block::buf::PoolBuf<'_>, LogError> {
-        let size = usize::try_from(end.saturating_sub(begin))
-            .map_err(|_| LogError::Damaged("a read past usize"))?;
-        let mut buf = self
-            .shared
-            .pool
-            .take(size)
-            .map_err(|e| LogError::Disk(e.into()))?;
-        buf.set_len(size).map_err(|e| LogError::Disk(e.into()))?;
-        self.shared.file.read_exact_at(buf.as_mut_slice(), begin)?;
-        Ok(buf)
-    }
-
-    /// Reads one entry from the file, verified as `group`'s entry `index` of `term`. An entry
-    /// relocated since its place was taken is looked up again once.
-    fn read_entry(
+    /// The entries of `[low, high)` as [`Log::entries`] gives them, copied into the caller's
+    /// reservation `into`, which comes back filled.
+    pub fn fetch(
         &self,
         group: u128,
-        index: u64,
-        term: u64,
-        place: Place,
-        len: u32,
-    ) -> Result<Arc<[u8]>, LogError> {
-        let mut place = place;
-        for _ in 0..2 {
-            if let Some(bytes) = self.read_at(group, index, term, place, len)? {
-                return Ok(bytes);
-            }
-            let state = self.shared.read_state()?;
-            let now = state
-                .groups
-                .get(&group)
-                .and_then(|g| g.slot(index))
-                .map(|s| s.place);
-            match now {
-                Some(p) if p != place => place = p,
-                Some(_) => return Err(LogError::Corrupt { group, index }),
-                None => return Err(LogError::Unavailable { group, index }),
-            }
-        }
-        Err(LogError::Corrupt { group, index })
+        low: u64,
+        high: u64,
+        max_bytes: u64,
+        into: Fetched,
+    ) -> Result<Fetched, LogError> {
+        self.fetch_waking(group, low, high, max_bytes, into, None)?
+            .wait()
     }
 
-    fn read_at(
+    /// Fetches as [`Log::fetch`] does, returning at once with a ticket, and wakes `waker`, if
+    /// given, once the entries have come.
+    pub fn fetch_waking(
         &self,
         group: u128,
-        index: u64,
-        term: u64,
-        place: Place,
-        len: u32,
-    ) -> Result<Option<Arc<[u8]>>, LogError> {
-        let align = self.shared.align;
-        let begin = align.down_u64(place.offset);
-        let end = place
-            .offset
-            .checked_add(format::ENTRY_HEADER_BYTES)
-            .and_then(|e| e.checked_add(u64::from(len)))
-            .and_then(|e| align.up_u64(e))
-            .ok_or(LogError::Corrupt { group, index })?;
-        let span = usize::try_from(end.saturating_sub(begin))
-            .map_err(|_| LogError::Corrupt { group, index })?;
-        let mut buf = self
-            .shared
-            .pool
-            .take(span)
-            .map_err(|e| LogError::Disk(e.into()))?;
-        buf.set_len(span).map_err(|e| LogError::Disk(e.into()))?;
-        self.shared.file.read_exact_at(buf.as_mut_slice(), begin)?;
-        let skip = usize::try_from(place.offset.saturating_sub(begin))
-            .map_err(|_| LogError::Corrupt { group, index })?;
-        let at = buf.as_slice().get(skip..).unwrap_or_default();
-        Ok(format::entry_at(at, group, index)
-            .filter(|(t, _)| *t == term)
-            .map(|(_, bytes)| Arc::from(bytes)))
+        low: u64,
+        high: u64,
+        max_bytes: u64,
+        into: Fetched,
+        waker: Option<Waker>,
+    ) -> Result<Fetching, LogError> {
+        let (reply, answer) = ticket::port();
+        let waiting = Waiting::new(answer);
+        let query = Query::Entries {
+            group,
+            low,
+            high,
+            max_bytes,
+            into,
+        };
+        self.inbox
+            .send(Message::Query(query, Ticket::new(reply, waker)))
+            .map_err(|_| LogError::Closed)?;
+        Ok(Fetching(waiting))
     }
 
     /// Frames written and flushed since the log opened, and the updates they carried: how
     /// many updates one flush commits.
     pub fn flushed(&self) -> (u64, u64) {
-        (
-            self.shared.frames.load(Ordering::Relaxed),
-            self.shared.updates.load(Ordering::Relaxed),
-        )
+        match self.ask(Query::Flushed) {
+            Ok(Answer::Flushed(frames, updates)) => (frames, updates),
+            _ => (0, 0),
+        }
     }
 
     /// Whether a failed write or flush has fenced the log.
     pub fn is_fenced(&self) -> bool {
-        self.shared.fenced.load(Ordering::Acquire)
+        matches!(self.ask(Query::Fenced), Ok(Answer::Fenced(true)))
+    }
+
+    /// Runs `look` on the log's file, on the device thread, between the log's own I/O, and
+    /// returns what it returns: how a simulation reaches the device the log owns, to arm a
+    /// fault or read its counts.
+    pub fn with_file<R: Send + 'static>(
+        &self,
+        look: impl FnOnce(&F) -> R + Send + 'static,
+    ) -> Result<R, LogError> {
+        let (result, back) = sync_channel(1);
+        let boxed: device::Look<F> = Box::new(move |file: &F| {
+            let _ = result.try_send(look(file));
+        });
+        self.inbox
+            .send(Message::Look(boxed))
+            .map_err(|_| LogError::Closed)?;
+        back.recv().map_err(|_| LogError::Closed)
+    }
+
+    /// Closes the log once it has answered every submission it took, and gives back its file.
+    pub fn close(mut self) -> Result<F, LogError> {
+        self.stop().ok_or(LogError::Closed)
+    }
+
+    fn stop(&mut self) -> Option<F> {
+        let owner = self.owner.take()?;
+        let _ = self.inbox.send(Message::Close);
+        owner.join().ok().flatten()
     }
 }
 
 impl<F: BlockFile + 'static> Drop for Log<F> {
     fn drop(&mut self) {
-        // Closing the channel stops the writer once it has answered what it took.
-        self.sender = None;
-        if let Some(handle) = self.writer.take() {
-            let _ = handle.join();
-        }
+        // The owner answers what it took, then ends with the device thread.
+        let _ = self.stop();
     }
 }

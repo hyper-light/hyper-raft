@@ -1,15 +1,15 @@
 //! One issuer per physical device: every volume on the device hands it its writes and flushes,
-//! and it keeps the device's depth in flight on a fixed set of workers (docs/design/node.md
-//! §1.2; chunk-store.md §4).
+//! and it keeps the device's depth in flight on a fixed set of workers (mantle
+//! docs/design/node.md §1.2; chunk-store.md §4).
 //!
 //! The issuer is one thread and a pool of blocking workers, all started when the device opens
 //! and none after, whatever the number of volumes, batches or regions: a thread per region of a
-//! batch, which the chunk writer started before, is a thread start on the write path and a count
-//! of threads that grows with load (research/26 §4.7, recommendation 7). The pool is the portable
-//! path of research/26 §2.5, the only one macOS offers: no interface there keeps more than 16
-//! file I/Os in flight without a blocked thread per I/O, and none carries `F_FULLFSYNC` (§2.4).
-//! Linux's io_uring and Windows's completion port, which node.md §1.2 takes where they exist, are
-//! not yet built; the pool runs on every platform until they are.
+//! batch, which mantle's chunk writer started before, is a thread start on the write path and a
+//! count of threads that grows with load (mantle research/26 §4.7, recommendation 7). The pool is
+//! the portable path of research/26 §2.5, the only one macOS offers: no interface there keeps
+//! more than 16 file I/Os in flight without a blocked thread per I/O, and none carries
+//! `F_FULLFSYNC` (§2.4). Linux's io_uring and Windows's completion port, which node.md §1.2 takes
+//! where they exist, are not yet built; the pool runs on every platform until they are.
 //!
 //! The pool holds `min(device queue, measured depth, thread budget)` workers ([`depth`]): the
 //! device queues no more than its queue, throughput stops growing at the measured depth, so a
@@ -17,19 +17,21 @@
 //! starts (research/26 §2.5, recommendation 4). Where the budget has fewer left the device runs
 //! at the depth it leaves.
 //!
-//! Ownership is single and passed by message: the issuer thread owns every attached file, in
-//! an arena its workers borrow inside the issuer's own thread scope, and the dispatch state;
-//! each worker owns one slot its tasks arrive on, woken alone (research/26 §5.3). A volume's
-//! writer holds an [`Attached`], through which it submits one batch at a time and waits for its
-//! answer. A batch's writes all complete before its flush is issued, and the flush only if all
-//! succeeded: a write that failed fails its batch, and its flush is never issued, because the
-//! caller then fences and recovers rather than trust what reached the device (Rebello et al.,
-//! ATC 2020). The answer comes once, after the flush.
+//! Ownership is single and passed by message. A submitter's file is duplicated once for each
+//! worker ([`BlockFile::try_clone`]), and each worker owns its duplicates in an arena of its own,
+//! so no file is shared between threads and nothing is locked. The issuer thread owns the
+//! dispatch state; each worker owns one slot its tasks arrive on, woken alone (research/26 §5.3).
+//! A worker is told of a file attached or detached in its own slot, before any transfer for it,
+//! since a transfer goes only to a worker with no such news waiting. A volume's writer holds an
+//! [`Attached`], through which it submits one batch at a time and waits for its answer. A
+//! batch's writes all complete before its flush is issued, and the flush only if all succeeded:
+//! a write that failed fails its batch, and its flush is never issued, because the caller then
+//! fences and recovers rather than trust what reached the device (Rebello et al., ATC 2020). The
+//! answer comes once, after the flush.
 
 use std::collections::VecDeque;
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
-use std::sync::RwLock;
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
 use std::thread::{Builder, JoinHandle};
 
@@ -46,7 +48,7 @@ pub const UNDESCRIBED_QUEUE_DEPTH: usize = 32;
 /// The transfers a device's issuer keeps in flight: the smaller of the queue the OS reports
 /// (`UNDESCRIBED_QUEUE_DEPTH` when it reports none) and the depth calibration measured
 /// throughput to stop growing at. A device calibration has not measured gets one at a time,
-/// as its reads do (docs/design/chunk-store.md §7).
+/// as its reads do (mantle docs/design/chunk-store.md §7).
 pub fn depth(queue: Option<u32>, measured: Option<usize>) -> usize {
     let queue = queue
         .and_then(|q| usize::try_from(q).ok())
@@ -70,9 +72,13 @@ pub struct Issuer {
 /// write and the flush asked for have completed.
 type Answer = Result<Vec<AlignedBuf>, DiskError>;
 
+/// A file as a worker holds it.
+type Handle = Box<dyn BlockFile>;
+
 enum Event {
     Attach {
-        file: Box<dyn BlockFile>,
+        /// One duplicate of the file for each worker.
+        files: Vec<Handle>,
         answers: SyncSender<Answer>,
         reply: SyncSender<Result<(usize, u64), DiskError>>,
     },
@@ -89,7 +95,7 @@ enum Event {
     },
     Done {
         worker: usize,
-        task: Finished,
+        report: Report,
     },
     Stop,
 }
@@ -104,24 +110,39 @@ enum Op {
     Flush,
 }
 
-struct Task {
+/// What a worker is handed: news of a file, or a transfer.
+enum Task {
+    Attach {
+        slot: usize,
+        generation: u64,
+        file: Handle,
+    },
+    Detach {
+        slot: usize,
+        generation: u64,
+    },
+    Transfer(Transfer),
+}
+
+struct Transfer {
     slot: usize,
     generation: u64,
     op: Op,
 }
 
-/// A worker's report of one task: the write's index and buffer, `None` for a flush.
+/// A worker's report of one task.
+enum Report {
+    /// A file attached, or one detached and dropped: which.
+    News(Option<(usize, u64)>),
+    Finished(Finished),
+}
+
+/// A transfer's end: the write's index and buffer, `None` for a flush.
 struct Finished {
     slot: usize,
     generation: u64,
     write: Option<(usize, Option<AlignedBuf>)>,
     result: Result<(), DiskError>,
-}
-
-/// An attached file, as the workers find it.
-struct File {
-    generation: u64,
-    file: Box<dyn BlockFile>,
 }
 
 impl Issuer {
@@ -144,8 +165,8 @@ impl Issuer {
             });
         }
         let budget = threads::reserve(threads, path)?;
-        // Room for every worker's completion at once, so a worker never waits to report while
-        // the issuer drains what arrives; a submitter waits for room behind them.
+        // Room for every worker's report at once, so a worker never waits to report while the
+        // issuer drains what arrives; a submitter waits for room behind them.
         let (events, inbox) = sync_channel(workers);
         let (ready, started) = sync_channel(1);
         let completions = events.clone();
@@ -180,16 +201,19 @@ impl Issuer {
         self.workers
     }
 
-    /// Hands the issuer a duplicate of `file`, for one submitter's batches.
+    /// Hands the issuer duplicates of `file`, one for each worker, for one submitter's batches.
     pub fn attach<F: BlockFile + 'static>(&self, file: &F) -> Result<Attached, DiskError> {
-        let file: Box<dyn BlockFile> = Box::new(file.try_clone()?);
+        let mut files: Vec<Handle> = Vec::with_capacity(self.workers);
+        for _ in 0..self.workers {
+            files.push(Box::new(file.try_clone()?));
+        }
         // One batch is out at a time (`Attached::write` takes `&mut self`), so one answer.
         let (answers, answered) = sync_channel(1);
         let (reply, replied) = sync_channel(1);
         let gone = || stopped(&self.path, "the device's issuer has stopped");
         self.events
             .send(Event::Attach {
-                file,
+                files,
                 answers,
                 reply,
             })
@@ -217,7 +241,7 @@ impl Drop for Issuer {
 }
 
 /// One submitter's way to its device's issuer: a volume's writer holds one. Dropping it
-/// detaches the file and returns once the issuer no longer holds it.
+/// detaches the file and returns once no worker holds a duplicate of it.
 pub struct Attached {
     slot: usize,
     generation: u64,
@@ -266,14 +290,15 @@ impl Drop for Attached {
             done,
         };
         if self.events.send(detach).is_ok() {
-            // Answered once the file is out of the arena, or dropped if the issuer stops first.
+            // Answered once every worker has dropped its duplicate, or dropped if the issuer
+            // stops first.
             let _ = detached.recv();
         }
     }
 }
 
-/// The issuer's thread: starts the workers in its own scope, so they borrow the arena of files
-/// it owns, reports whether all started, then dispatches until stopped.
+/// The issuer's thread: starts the workers in its own scope, reports whether all started, then
+/// dispatches until stopped.
 fn run(
     path: &Path,
     inbox: &Receiver<Event>,
@@ -281,17 +306,16 @@ fn run(
     workers: usize,
     ready: &SyncSender<Result<(), DiskError>>,
 ) {
-    let files: RwLock<Vec<Option<File>>> = RwLock::new(Vec::new());
     std::thread::scope(|scope| {
         let mut slots = Vec::with_capacity(workers);
         let mut handles = Vec::with_capacity(workers);
         let mut failed = None;
         for id in 0..workers {
             let (tasks, assigned) = sync_channel::<Task>(1);
-            let (files, done) = (&files, completions.clone());
+            let done = completions.clone();
             match Builder::new()
                 .name("hyper-io".into())
-                .spawn_scoped(scope, move || work(id, files, &assigned, &done))
+                .spawn_scoped(scope, move || work(id, &assigned, &done))
             {
                 Ok(handle) => {
                     slots.push(tasks);
@@ -312,18 +336,7 @@ fn run(
             None => Ok(()),
         };
         if ready.send(started).is_ok() && slots.len() == workers {
-            Dispatch {
-                files: &files,
-                idle: (0..slots.len()).rev().collect(),
-                in_flight: 0,
-                workers: slots,
-                pending: VecDeque::new(),
-                clients: Vec::new(),
-                generation: 0,
-                stopping: false,
-                path,
-            }
-            .run(inbox);
+            Dispatch::new(slots, path).run(inbox);
         } else {
             drop(slots);
         }
@@ -335,67 +348,89 @@ fn run(
     });
 }
 
-/// A worker: takes each task from its own slot, issues it and reports. An unwind from the
-/// file, which production code never raises, is caught here and reported as an error, so a
-/// batch's submitter never waits on a report that cannot come.
-fn work(
-    id: usize,
-    files: &RwLock<Vec<Option<File>>>,
-    tasks: &Receiver<Task>,
-    done: &SyncSender<Event>,
-) {
-    while let Ok(Task {
-        slot,
-        generation,
-        op,
-    }) = tasks.recv()
-    {
-        let (write, result) = match op {
-            Op::Write { index, buf, at } => {
-                let issued = std::panic::catch_unwind(AssertUnwindSafe(move || {
-                    let result = with_file(files, slot, generation, |f| {
-                        f.write_all_at(buf.as_slice(), at)
-                    });
-                    (buf, result)
-                }));
-                match issued {
-                    Ok((buf, result)) => (Some((index, Some(buf))), result),
-                    Err(_) => (Some((index, None)), Err(unwound())),
+/// A worker: takes each task from its own slot, carries it out on the duplicates it owns, and
+/// reports. An unwind from a file, which production code never raises, is caught here and
+/// reported as an error, so a batch's submitter never waits on a report that cannot come.
+fn work(id: usize, tasks: &Receiver<Task>, done: &SyncSender<Event>) {
+    let mut files: Vec<Option<(u64, Handle)>> = Vec::new();
+    while let Ok(task) = tasks.recv() {
+        let report = match task {
+            Task::Attach {
+                slot,
+                generation,
+                file,
+            } => {
+                place(&mut files, slot, Some((generation, file)));
+                Report::News(None)
+            }
+            Task::Detach { slot, generation } => {
+                if files
+                    .get(slot)
+                    .is_some_and(|f| f.as_ref().is_some_and(|(g, _)| *g == generation))
+                {
+                    place(&mut files, slot, None);
                 }
+                Report::News(Some((slot, generation)))
             }
-            Op::Flush => {
-                let issued = std::panic::catch_unwind(AssertUnwindSafe(|| {
-                    with_file(files, slot, generation, |f| f.sync_data())
-                }));
-                (None, issued.unwrap_or_else(|_| Err(unwound())))
-            }
+            Task::Transfer(transfer) => Report::Finished(carry_out(&files, transfer)),
         };
-        let task = Finished {
-            slot,
-            generation,
-            write,
-            result,
-        };
-        if done.send(Event::Done { worker: id, task }).is_err() {
+        if done.send(Event::Done { worker: id, report }).is_err() {
             return;
         }
     }
 }
 
-/// Runs `op` on the attached file, holding the arena to read only while it runs.
-fn with_file(
-    files: &RwLock<Vec<Option<File>>>,
-    slot: usize,
-    generation: u64,
-    op: impl FnOnce(&dyn BlockFile) -> Result<(), DiskError>,
-) -> Result<(), DiskError> {
-    let files = files.read().map_err(|_| unwound())?;
-    match files.get(slot) {
-        Some(Some(f)) if f.generation == generation => op(&*f.file),
-        _ => Err(stopped(
+/// Puts `file` in slot `slot` of a worker's arena, growing it to hold the slot.
+fn place(files: &mut Vec<Option<(u64, Handle)>>, slot: usize, file: Option<(u64, Handle)>) {
+    if files.len() <= slot {
+        files.resize_with(slot.saturating_add(1), || None);
+    }
+    if let Some(at) = files.get_mut(slot) {
+        *at = file;
+    }
+}
+
+/// Issues one transfer on the worker's duplicate of its file.
+fn carry_out(files: &[Option<(u64, Handle)>], transfer: Transfer) -> Finished {
+    let Transfer {
+        slot,
+        generation,
+        op,
+    } = transfer;
+    let file = match files.get(slot) {
+        Some(Some((g, file))) if *g == generation => Some(file),
+        _ => None,
+    };
+    let missing = || {
+        stopped(
             Path::new(""),
-            "a task for a file no longer attached",
-        )),
+            "a transfer for a file the worker does not hold",
+        )
+    };
+    let (write, result) = match op {
+        Op::Write { index, buf, at } => {
+            let issued = std::panic::catch_unwind(AssertUnwindSafe(move || {
+                let result =
+                    file.map_or_else(|| Err(missing()), |f| f.write_all_at(buf.as_slice(), at));
+                (buf, result)
+            }));
+            match issued {
+                Ok((buf, result)) => (Some((index, Some(buf))), result),
+                Err(_) => (Some((index, None)), Err(unwound())),
+            }
+        }
+        Op::Flush => {
+            let issued = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                file.map_or_else(|| Err(missing()), |f| f.sync_data())
+            }));
+            (None, issued.unwrap_or_else(|_| Err(unwound())))
+        }
+    };
+    Finished {
+        slot,
+        generation,
+        write,
+        result,
     }
 }
 
@@ -407,7 +442,7 @@ struct Client {
 }
 
 struct Batch {
-    /// Tasks issued or queued and not yet reported.
+    /// Transfers issued or queued and not yet reported.
     outstanding: usize,
     buffers: Vec<Option<AlignedBuf>>,
     failed: Option<DiskError>,
@@ -415,64 +450,57 @@ struct Batch {
     flush: bool,
 }
 
+/// A file being detached: the workers yet to drop their duplicates, and who waits for them.
+struct Detaching {
+    slot: usize,
+    generation: u64,
+    remaining: usize,
+    done: SyncSender<()>,
+}
+
 /// The issuer's state, owned by its thread.
 struct Dispatch<'a> {
-    files: &'a RwLock<Vec<Option<File>>>,
     /// Each worker's slot.
     workers: Vec<SyncSender<Task>>,
     /// Workers with no task.
     idle: Vec<usize>,
+    /// News of files waiting for each worker, given before any transfer: at most one attach and
+    /// one detach for each file attached, so bounded by the submitters.
+    news: Vec<VecDeque<Task>>,
     /// Tasks handed to workers and not yet reported.
     in_flight: usize,
-    /// Tasks waiting for a worker, in the order they arrived. Each attached submitter has at
-    /// most one batch out, so these are at most the attached submitters' batches, whose
+    /// Transfers waiting for a worker, in the order they arrived. Each attached submitter has
+    /// at most one batch out, so these are at most the attached submitters' batches, whose
     /// buffers their submitters already hold.
-    pending: VecDeque<Task>,
-    /// Indexed as the arena is.
+    pending: VecDeque<Transfer>,
+    /// Indexed by slot. A slot is reused once every worker has dropped the file it held.
     clients: Vec<Option<Client>>,
+    detaching: Vec<Detaching>,
     generation: u64,
     stopping: bool,
     path: &'a Path,
 }
 
-impl Dispatch<'_> {
+impl<'a> Dispatch<'a> {
+    fn new(workers: Vec<SyncSender<Task>>, path: &'a Path) -> Self {
+        let count = workers.len();
+        Self {
+            idle: (0..count).rev().collect(),
+            news: (0..count).map(|_| VecDeque::new()).collect(),
+            workers,
+            in_flight: 0,
+            pending: VecDeque::new(),
+            clients: Vec::new(),
+            detaching: Vec::new(),
+            generation: 0,
+            stopping: false,
+            path,
+        }
+    }
+
     fn run(mut self, inbox: &Receiver<Event>) {
         while let Ok(event) = inbox.recv() {
-            match event {
-                Event::Attach {
-                    file,
-                    answers,
-                    reply,
-                } => {
-                    let attached = self.attach(file, answers);
-                    let _ = reply.try_send(attached);
-                }
-                Event::Detach {
-                    slot,
-                    generation,
-                    done,
-                } => {
-                    self.detach(slot, generation);
-                    let _ = done.try_send(());
-                }
-                Event::Batch {
-                    slot,
-                    generation,
-                    writes,
-                    flush,
-                } => self.batch(slot, generation, writes, flush),
-                Event::Done { worker, task } => {
-                    self.idle.push(worker);
-                    self.in_flight = self.in_flight.saturating_sub(1);
-                    self.finished(task);
-                }
-                Event::Stop => {
-                    self.stopping = true;
-                    for task in std::mem::take(&mut self.pending) {
-                        self.refused(task);
-                    }
-                }
-            }
+            self.event(event);
             self.dispatch();
             if self.stopping && self.in_flight == 0 {
                 return;
@@ -480,32 +508,80 @@ impl Dispatch<'_> {
         }
     }
 
+    fn event(&mut self, event: Event) {
+        match event {
+            Event::Attach {
+                files,
+                answers,
+                reply,
+            } => {
+                let attached = self.attach(files, answers);
+                let _ = reply.try_send(attached);
+            }
+            Event::Detach {
+                slot,
+                generation,
+                done,
+            } => self.detach(slot, generation, done),
+            Event::Batch {
+                slot,
+                generation,
+                writes,
+                flush,
+            } => self.batch(slot, generation, writes, flush),
+            Event::Done { worker, report } => {
+                self.idle.push(worker);
+                self.in_flight = self.in_flight.saturating_sub(1);
+                match report {
+                    Report::News(dropped) => self.dropped(dropped),
+                    Report::Finished(finished) => self.finished(finished),
+                }
+            }
+            Event::Stop => {
+                self.stopping = true;
+                for transfer in std::mem::take(&mut self.pending) {
+                    self.refused(transfer);
+                }
+            }
+        }
+    }
+
     fn attach(
         &mut self,
-        file: Box<dyn BlockFile>,
+        files: Vec<Handle>,
         answers: SyncSender<Answer>,
     ) -> Result<(usize, u64), DiskError> {
         if self.stopping {
             return Err(stopped(self.path, "the device's issuer is stopping"));
         }
+        if files.len() != self.workers.len() {
+            return Err(invalid(
+                self.path,
+                "one duplicate of the file for each worker",
+            ));
+        }
         self.generation = self.generation.saturating_add(1);
         let generation = self.generation;
-        let mut files = self.files.write().map_err(|_| unwound())?;
-        // A slot a detached file left is reused, so the arena holds the files attached now.
-        let slot = files
-            .iter()
-            .position(Option::is_none)
-            .unwrap_or(files.len());
-        let file = Some(File { generation, file });
+        // A slot is free once its client detached and every worker dropped its file.
+        let busy = |slot: usize, clients: &[Option<Client>], detaching: &[Detaching]| {
+            clients.get(slot).is_some_and(Option::is_some)
+                || detaching.iter().any(|d| d.slot == slot)
+        };
+        let slot = (0..self.clients.len())
+            .find(|&s| !busy(s, &self.clients, &self.detaching))
+            .unwrap_or(self.clients.len());
+        for (news, file) in self.news.iter_mut().zip(files) {
+            news.push_back(Task::Attach {
+                slot,
+                generation,
+                file,
+            });
+        }
         let client = Some(Client {
             generation,
             answers,
             batch: None,
         });
-        match files.get_mut(slot) {
-            Some(free) => *free = file,
-            None => files.push(file),
-        }
         match self.clients.get_mut(slot) {
             Some(free) => *free = client,
             None => self.clients.push(client),
@@ -513,26 +589,45 @@ impl Dispatch<'_> {
         Ok((slot, generation))
     }
 
-    fn detach(&mut self, slot: usize, generation: u64) {
-        if !self
-            .clients
-            .get(slot)
-            .is_some_and(|c| c.as_ref().is_some_and(|c| c.generation == generation))
-        {
+    fn detach(&mut self, slot: usize, generation: u64, done: SyncSender<()>) {
+        if self.client(slot, generation).is_none() {
+            let _ = done.try_send(());
             return;
         }
         // The submitter waits for nothing once it detaches; its batch, if any, has ended.
         if let Some(client) = self.clients.get_mut(slot) {
             *client = None;
         }
-        // A poisoned arena is still a list of files; this one must be let go whatever
-        // unwound while the lock was held.
-        let mut files = self
-            .files
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(file) = files.get_mut(slot) {
-            *file = None;
+        for news in &mut self.news {
+            news.push_back(Task::Detach { slot, generation });
+        }
+        self.detaching.push(Detaching {
+            slot,
+            generation,
+            remaining: self.workers.len(),
+            done,
+        });
+    }
+
+    /// A worker dropped its duplicate of a detached file; the last one answers the detach.
+    fn dropped(&mut self, dropped: Option<(usize, u64)>) {
+        let Some((slot, generation)) = dropped else {
+            return;
+        };
+        let Some(at) = self
+            .detaching
+            .iter()
+            .position(|d| d.slot == slot && d.generation == generation)
+        else {
+            return;
+        };
+        let finished = self.detaching.get_mut(at).is_some_and(|d| {
+            d.remaining = d.remaining.saturating_sub(1);
+            d.remaining == 0
+        });
+        if finished {
+            let d = self.detaching.swap_remove(at);
+            let _ = d.done.try_send(());
         }
     }
 
@@ -565,14 +660,14 @@ impl Dispatch<'_> {
             flush: flush && count > 0,
         });
         if count == 0 {
-            self.pending.push_back(Task {
+            self.pending.push_back(Transfer {
                 slot,
                 generation,
                 op: Op::Flush,
             });
         }
         for (index, (buf, at)) in writes.into_iter().enumerate() {
-            self.pending.push_back(Task {
+            self.pending.push_back(Transfer {
                 slot,
                 generation,
                 op: Op::Write { index, buf, at },
@@ -587,15 +682,15 @@ impl Dispatch<'_> {
             .filter(|c| c.generation == generation)
     }
 
-    /// Records a task's report, and answers its batch or issues its flush once every write
+    /// Records a transfer's report, and answers its batch or issues its flush once every write
     /// has completed.
-    fn finished(&mut self, task: Finished) {
+    fn finished(&mut self, finished: Finished) {
         let Finished {
             slot,
             generation,
             write,
             result,
-        } = task;
+        } = finished;
         let Some(client) = self.client(slot, generation) else {
             return;
         };
@@ -617,7 +712,7 @@ impl Dispatch<'_> {
         if batch.flush && batch.failed.is_none() {
             batch.flush = false;
             batch.outstanding = 1;
-            self.pending.push_back(Task {
+            self.pending.push_back(Transfer {
                 slot,
                 generation,
                 op: Op::Flush,
@@ -633,54 +728,68 @@ impl Dispatch<'_> {
         }
     }
 
-    /// A task never issued: its batch fails.
-    fn refused(&mut self, task: Task) {
-        let write = match task.op {
+    /// A transfer never issued: its batch fails.
+    fn refused(&mut self, transfer: Transfer) {
+        self.failed(transfer, "the device's issuer is stopping");
+    }
+
+    /// Fails `transfer`'s batch with `why`, giving its buffer back.
+    fn failed(&mut self, transfer: Transfer, why: &str) {
+        let write = match transfer.op {
             Op::Write { index, buf, .. } => Some((index, Some(buf))),
             Op::Flush => None,
         };
         let path = self.path;
         self.finished(Finished {
-            slot: task.slot,
-            generation: task.generation,
+            slot: transfer.slot,
+            generation: transfer.generation,
             write,
-            result: Err(stopped(path, "the device's issuer is stopping")),
+            result: Err(stopped(path, why)),
         });
     }
 
-    /// Hands queued tasks to idle workers, in the order they arrived.
+    /// Hands each idle worker its news first, then queued transfers to the idle workers with
+    /// no news waiting, in the order they arrived.
     fn dispatch(&mut self) {
-        while !self.pending.is_empty() {
-            let Some(worker) = self.idle.pop() else {
-                return;
+        let mut idle = std::mem::take(&mut self.idle);
+        idle.retain(|&worker| !self.tell(worker));
+        while let Some(&worker) = idle.last() {
+            let Some(transfer) = self.pending.pop_front() else {
+                break;
             };
-            let Some(task) = self.pending.pop_front() else {
-                self.idle.push(worker);
-                return;
-            };
+            idle.pop();
             let sent = match self.workers.get(worker) {
-                Some(slot) => slot.try_send(task),
-                None => Err(TrySendError::Disconnected(task)),
+                Some(slot) => slot.try_send(Task::Transfer(transfer)),
+                None => Err(TrySendError::Disconnected(Task::Transfer(transfer))),
             };
             // An idle worker's slot is empty; one that is not, or whose worker ended, keeps no
-            // place among the idle, and its task fails its batch.
+            // place among the idle, and its transfer fails its batch.
             match sent {
                 Ok(()) => self.in_flight = self.in_flight.saturating_add(1),
                 Err(TrySendError::Full(task) | TrySendError::Disconnected(task)) => {
-                    let path = self.path;
-                    let write = match task.op {
-                        Op::Write { index, buf, .. } => Some((index, Some(buf))),
-                        Op::Flush => None,
-                    };
-                    self.finished(Finished {
-                        slot: task.slot,
-                        generation: task.generation,
-                        write,
-                        result: Err(stopped(path, "a device worker has ended")),
-                    });
+                    if let Task::Transfer(transfer) = task {
+                        self.failed(transfer, "a device worker has ended");
+                    }
                 }
             }
         }
+        self.idle = idle;
+    }
+
+    /// Gives an idle worker the next news it waits for: whether it was handed some.
+    fn tell(&mut self, worker: usize) -> bool {
+        let Some(task) = self.news.get_mut(worker).and_then(VecDeque::pop_front) else {
+            return false;
+        };
+        let sent = self
+            .workers
+            .get(worker)
+            .is_some_and(|slot| slot.try_send(task).is_ok());
+        if sent {
+            self.in_flight = self.in_flight.saturating_add(1);
+        }
+        // A worker that ended takes no news and no transfer: it leaves the idle.
+        true
     }
 }
 
@@ -706,53 +815,70 @@ fn invalid(path: &Path, why: &str) -> DiskError {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Condvar, Mutex};
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
     use super::*;
     use crate::buf::Alignment;
+    use crate::file::{CachingRequest, DeviceFile};
 
-    /// A file in memory that counts the transfers in flight, holds every write at a gate the
-    /// test opens, and fails the write at one offset when asked.
-    struct Probe {
-        data: Mutex<Vec<u8>>,
-        state: Mutex<State>,
-        changed: Condvar,
+    /// What every duplicate of one probe counts, in one place each test leaks for its run.
+    #[derive(Default)]
+    struct Counts {
+        in_flight: AtomicUsize,
+        most: AtomicUsize,
+        entered: AtomicUsize,
+        open: AtomicBool,
+        /// The offset whose write fails, `u64::MAX` for none.
+        fail_at: AtomicU64,
+        flushes: AtomicUsize,
+        /// Writes completed when the last flush was issued.
+        completed_at_flush: AtomicUsize,
+        completed: AtomicUsize,
+        /// Duplicates alive.
+        alive: AtomicUsize,
     }
 
-    #[derive(Default)]
-    struct State {
-        in_flight: usize,
-        most: usize,
-        entered: usize,
-        open: bool,
-        fail_at: Option<u64>,
-        /// Writes completed when each flush was issued.
-        flushes: Vec<usize>,
-        completed: usize,
+    /// A file on disk that counts the transfers in flight, holds every write until the test
+    /// opens it, and fails the write at one offset when asked; each duplicate is a handle of
+    /// the same file and counts in the same place.
+    struct Probe {
+        file: DeviceFile,
+        counts: &'static Counts,
     }
 
     impl Probe {
-        fn new(open: bool, fail_at: Option<u64>) -> Arc<Self> {
-            Arc::new(Self {
-                data: Mutex::new(vec![0; 1 << 20]),
-                state: Mutex::new(State {
-                    open,
-                    fail_at,
-                    ..State::default()
-                }),
-                changed: Condvar::new(),
-            })
+        fn new(dir: &Path, open: bool, fail_at: Option<u64>) -> Self {
+            let counts: &'static Counts = Box::leak(Box::default());
+            counts.open.store(open, Ordering::SeqCst);
+            counts
+                .fail_at
+                .store(fail_at.unwrap_or(u64::MAX), Ordering::SeqCst);
+            counts.alive.store(1, Ordering::SeqCst);
+            let file = DeviceFile::open(
+                &dir.join("probe"),
+                true,
+                CachingRequest::Buffered,
+                Alignment::new(4096).unwrap(),
+            )
+            .unwrap();
+            Self { file, counts }
         }
 
-        /// Waits until `n` writes have entered.
+        /// Waits until `n` writes have entered: the fact the test needs.
         fn entered(&self, n: usize) {
-            let state = self.state.lock().unwrap();
-            drop(self.changed.wait_while(state, |s| s.entered < n).unwrap());
+            while self.counts.entered.load(Ordering::SeqCst) < n {
+                std::thread::yield_now();
+            }
         }
 
         fn open(&self) {
-            self.state.lock().unwrap().open = true;
-            self.changed.notify_all();
+            self.counts.open.store(true, Ordering::SeqCst);
+        }
+    }
+
+    impl Drop for Probe {
+        fn drop(&mut self) {
+            self.counts.alive.fetch_sub(1, Ordering::SeqCst);
         }
     }
 
@@ -762,31 +888,27 @@ mod tests {
         }
 
         fn len(&self) -> Result<u64, DiskError> {
-            Ok(self.data.lock().unwrap().len() as u64)
+            self.file.len()
         }
 
         fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> Result<(), DiskError> {
-            let at = usize::try_from(offset).unwrap();
-            buf.copy_from_slice(&self.data.lock().unwrap()[at..at + buf.len()]);
-            Ok(())
+            self.file.read_exact_at(buf, offset)
         }
 
         fn write_all_at(&self, buf: &[u8], offset: u64) -> Result<(), DiskError> {
-            let mut state = self.state.lock().unwrap();
-            state.in_flight += 1;
-            state.most = state.most.max(state.in_flight);
-            state.entered += 1;
-            self.changed.notify_all();
-            let state = self.changed.wait_while(state, |s| !s.open).unwrap();
-            let fail = state.fail_at == Some(offset);
-            drop(state);
-            if !fail {
-                let at = usize::try_from(offset).unwrap();
-                self.data.lock().unwrap()[at..at + buf.len()].copy_from_slice(buf);
+            let c = self.counts;
+            let now = c.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            c.most.fetch_max(now, Ordering::SeqCst);
+            c.entered.fetch_add(1, Ordering::SeqCst);
+            while !c.open.load(Ordering::SeqCst) {
+                std::thread::yield_now();
             }
-            let mut state = self.state.lock().unwrap();
-            state.in_flight -= 1;
-            state.completed += 1;
+            let fail = c.fail_at.load(Ordering::SeqCst) == offset;
+            if !fail {
+                self.file.write_all_at(buf, offset)?;
+            }
+            c.in_flight.fetch_sub(1, Ordering::SeqCst);
+            c.completed.fetch_add(1, Ordering::SeqCst);
             if fail {
                 return Err(stopped(Path::new("probe"), "a write the test fails"));
             }
@@ -794,10 +916,19 @@ mod tests {
         }
 
         fn sync_data(&self) -> Result<(), DiskError> {
-            let mut state = self.state.lock().unwrap();
-            let completed = state.completed;
-            state.flushes.push(completed);
+            let c = self.counts;
+            c.completed_at_flush
+                .store(c.completed.load(Ordering::SeqCst), Ordering::SeqCst);
+            c.flushes.fetch_add(1, Ordering::SeqCst);
             Ok(())
+        }
+
+        fn try_clone(&self) -> Result<Self, DiskError> {
+            self.counts.alive.fetch_add(1, Ordering::SeqCst);
+            Ok(Self {
+                file: self.file.try_clone()?,
+                counts: self.counts,
+            })
         }
     }
 
@@ -832,14 +963,15 @@ mod tests {
     /// back in order, and its one flush is issued after every write has completed.
     #[test]
     fn a_batch_keeps_the_depth_and_flushes_after_its_writes() {
+        let dir = tempfile::tempdir().unwrap();
         let issuer = Issuer::start(Path::new("dev"), 4).unwrap();
         assert_eq!(issuer.depth(), 4);
-        let probe = Probe::new(false, None);
+        let probe = Probe::new(dir.path(), false, None);
         let mut attached = issuer.attach(&probe).unwrap();
         std::thread::scope(|s| {
             let batch = s.spawn(|| attached.write(writes(12), true));
             probe.entered(4);
-            assert_eq!(probe.state.lock().unwrap().in_flight, 4);
+            assert_eq!(probe.counts.in_flight.load(Ordering::SeqCst), 4);
             probe.open();
             let back = batch.join().unwrap().unwrap();
             assert_eq!(back.len(), 12);
@@ -847,11 +979,12 @@ mod tests {
                 assert_eq!(buf.as_slice()[0], fill(i));
             }
         });
-        let state = probe.state.lock().unwrap();
-        assert_eq!(state.most, 4);
-        assert_eq!(state.flushes, vec![12]);
-        drop(state);
-        let data = probe.data.lock().unwrap();
+        let c = probe.counts;
+        assert_eq!(c.most.load(Ordering::SeqCst), 4);
+        assert_eq!(c.flushes.load(Ordering::SeqCst), 1);
+        assert_eq!(c.completed_at_flush.load(Ordering::SeqCst), 12);
+        let mut data = vec![0u8; 12 * 4096];
+        probe.read_exact_at(&mut data, 0).unwrap();
         for i in 0..12 {
             assert!(data[i * 4096..(i + 1) * 4096].iter().all(|&b| b == fill(i)));
         }
@@ -861,25 +994,27 @@ mod tests {
     /// issued.
     #[test]
     fn a_failed_write_fails_its_batch_and_issues_no_flush() {
+        let dir = tempfile::tempdir().unwrap();
         let issuer = Issuer::start(Path::new("dev"), 2).unwrap();
-        let probe = Probe::new(true, Some(2 * 4096));
+        let probe = Probe::new(dir.path(), true, Some(2 * 4096));
         let mut attached = issuer.attach(&probe).unwrap();
         assert!(attached.write(writes(5), true).is_err());
-        let state = probe.state.lock().unwrap();
-        assert_eq!(state.completed, 5);
-        assert!(state.flushes.is_empty());
-        drop(state);
+        let c = probe.counts;
+        assert_eq!(c.completed.load(Ordering::SeqCst), 5);
+        assert_eq!(c.flushes.load(Ordering::SeqCst), 0);
         // The next batch is the submitter's to decide on; the issuer serves it.
         attached.flush().unwrap();
-        assert_eq!(probe.state.lock().unwrap().flushes, vec![5]);
+        assert_eq!(c.flushes.load(Ordering::SeqCst), 1);
+        assert_eq!(c.completed_at_flush.load(Ordering::SeqCst), 5);
     }
 
     /// Several submitters on one device share its workers: the device never has more than the
     /// depth in flight, whatever the number of files attached.
     #[test]
     fn submitters_share_the_depth() {
+        let dir = tempfile::tempdir().unwrap();
         let issuer = Issuer::start(Path::new("dev"), 2).unwrap();
-        let probe = Probe::new(false, None);
+        let probe = Probe::new(dir.path(), false, None);
         let mut attached: Vec<Attached> = (0..3).map(|_| issuer.attach(&probe).unwrap()).collect();
         std::thread::scope(|s| {
             let batches: Vec<_> = attached
@@ -892,25 +1027,31 @@ mod tests {
                 assert_eq!(batch.join().unwrap().unwrap().len(), 4);
             }
         });
-        let state = probe.state.lock().unwrap();
-        assert_eq!(state.most, 2);
-        assert_eq!(state.flushes.len(), 3);
+        let c = probe.counts;
+        assert_eq!(c.most.load(Ordering::SeqCst), 2);
+        assert_eq!(c.flushes.load(Ordering::SeqCst), 3);
     }
 
-    /// Detaching gives the file back before it returns; once the issuer is dropped, a batch
-    /// is refused rather than left waiting.
+    /// Detaching gives every duplicate back before it returns; once the issuer is dropped, a
+    /// batch is refused rather than left waiting.
     #[test]
     fn detach_releases_the_file_and_a_stopped_issuer_refuses() {
-        let issuer = Issuer::start(Path::new("dev"), 1).unwrap();
-        let probe = Probe::new(true, None);
+        let dir = tempfile::tempdir().unwrap();
+        let issuer = Issuer::start(Path::new("dev"), 2).unwrap();
+        let probe = Probe::new(dir.path(), true, None);
+        let alive = || probe.counts.alive.load(Ordering::SeqCst);
         let attached = issuer.attach(&probe).unwrap();
-        assert_eq!(Arc::strong_count(&probe), 2);
+        assert_eq!(
+            alive(),
+            3,
+            "the probe and a duplicate for each of two workers"
+        );
         drop(attached);
-        assert_eq!(Arc::strong_count(&probe), 1);
+        assert_eq!(alive(), 1);
         let mut attached = issuer.attach(&probe).unwrap();
         drop(issuer);
         assert!(attached.write(writes(1), true).is_err());
         drop(attached);
-        assert_eq!(Arc::strong_count(&probe), 1);
+        assert_eq!(alive(), 1);
     }
 }

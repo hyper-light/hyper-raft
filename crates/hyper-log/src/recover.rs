@@ -7,7 +7,8 @@ use hyper_block::buf::{AlignedBuf, Alignment, MAX_BUFFER};
 
 use crate::format::{self, FRAME_HEADER_BYTES, FrameHeader, Owned, SegmentHeader};
 use crate::state::{self, Live, Place, Replayed, Slot};
-use crate::{Config, Head, LogError, Recovery, Segments, State};
+use crate::state::{Head, Segments, State};
+use crate::{Config, LogError, Recovery};
 
 /// What a frame's position holds.
 pub(crate) enum Found<'a> {

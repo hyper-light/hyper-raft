@@ -13,14 +13,12 @@
     clippy::cast_precision_loss
 )]
 
-use std::sync::Arc;
-
 use hyper_block::buf::Alignment;
 use hyper_block::sim::SimFile;
 use hyper_log::{Class, Config, Entries, Entry, Log, LogError, Pending, Update, Waits};
 
 mod common;
-use common::{Released, Stepped};
+use common::held;
 
 const BLOCK: usize = 4096;
 /// Frames each mix runs for.
@@ -52,7 +50,7 @@ fn sized(index: u64, len: usize) -> Update {
             first: index,
             entries: vec![Entry {
                 term: 1,
-                bytes: Arc::from(vec![b'x'; len - header]),
+                bytes: vec![b'x'; len - header],
             }],
         }),
         ..Update::default()
@@ -96,16 +94,14 @@ struct Mix {
 /// Runs one hot source beside `cold` cold ones and measures how long the cold ones wait.
 fn run(seed: u64, mix: &Mix) -> Measured {
     let (hot, cold) = (mix.hot, mix.cold);
-    let file = Arc::new(
-        SimFile::new(
-            Alignment::new(BLOCK).unwrap(),
-            Alignment::new(512).unwrap(),
-            seed,
-        )
-        .unwrap(),
-    );
-    let stepped = Stepped::new(file);
-    let log = Log::create(Arc::clone(&stepped), config(), 1).unwrap();
+    let file = SimFile::new(
+        Alignment::new(BLOCK).unwrap(),
+        Alignment::new(512).unwrap(),
+        seed,
+    )
+    .unwrap();
+    let (device, stepped) = held(file);
+    let log = Log::create(device, config(), 1).unwrap();
     let room = log.frame_room().unwrap();
     let mut sources = vec![Source {
         group: 1,
@@ -128,7 +124,7 @@ fn run(seed: u64, mix: &Mix) -> Measured {
         });
     }
     stepped.hold();
-    let _released = Released(Arc::clone(&stepped));
+    let _released = stepped.released();
     // A first flush to hold the writer in.
     let first = log.submit(9, Update::default()).unwrap();
     stepped.held();
@@ -214,14 +210,12 @@ fn mixes() -> [Mix; 4] {
 #[test]
 fn a_hot_group_beside_cold_ones() {
     let bound = {
-        let file = Arc::new(
-            SimFile::new(
-                Alignment::new(BLOCK).unwrap(),
-                Alignment::new(512).unwrap(),
-                1,
-            )
-            .unwrap(),
-        );
+        let file = SimFile::new(
+            Alignment::new(BLOCK).unwrap(),
+            Alignment::new(512).unwrap(),
+            1,
+        )
+        .unwrap();
         let log = Log::create(file, config(), 1).unwrap();
         let room = log.frame_room().unwrap() as u64;
         2 + 2 * log.queue_bytes().div_ceil(room)

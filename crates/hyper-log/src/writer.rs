@@ -1,62 +1,62 @@
-//! The writer: one thread per log (docs/design/raft-log.md §3, §5).
+//! The writer's rules (mantle docs/design/raft-log.md §3, §5): how a batch is ordered and laid
+//! into a frame, where the frame goes, what a sweep of the tail copies, and what a durable frame
+//! changes. The owner (`owner.rs`) runs them; they read and change the state it holds.
 //!
-//! It runs the chunk store's group-commit loop (chunk-store.md §4): it takes every update
-//! that arrived while the last flush ran, lays them into one frame, writes the frame, flushes
-//! the file once, and publishes the updates to readers. It answers them once a later durable
-//! record confirms that flush: the next frame's persist record, or a confirmation written on
-//! its own when no frame follows at once (raft-log.md §6). One frame is one batch, so a valid
-//! frame with a later sequence proves an earlier one was flushed, which is what lets recovery
-//! tell a torn tail from damage (§6).
+//! It runs the chunk store's group-commit loop (chunk-store.md §4): it takes every update that
+//! arrived while the last flush ran, lays them into one frame, writes the frame, flushes the
+//! file once, and publishes the updates to readers. It answers them once a later durable record
+//! confirms that flush: the next frame's persist record, or a confirmation written on its own when
+//! no frame follows at once (raft-log.md §6). One frame is one batch, so a valid frame with a
+//! later sequence proves an earlier one was flushed, which is what lets recovery tell a torn tail
+//! from damage (§6).
 //!
-//! Segments are freed oldest first, so the live ones are always a run of incarnations that
-//! each frame's tail names. A tail with no live piece left is freed at once. When updates
-//! are waiting and free segments are short, the writer sweeps the tail: the frame first
-//! carries copies of every live piece of the tail, and names the next segment as the tail,
-//! the cleaning of a log-structured file system applied to the end of a log [RO92]. A group's
-//! live entries run unbroken from its start to its last, and the pieces of a record die
-//! from its front by a start and from its back by a replacement, so the live part of any
-//! record is one run and its copy is no larger than the record. The copies of a whole tail
-//! therefore fit in one frame, and a sweep always completes in the frame that begins it.
-//! A freed segment is reused only once a durable frame names a tail past it; the last free
-//! segment is kept for a frame that does so, which is how the log never runs out of room to
-//! free room.
-//!
-//! Replicas submit in a closed loop, each its next update once its last is durable. Formed at
-//! once from whatever is queued, each batch would miss the replicas the last one answered,
-//! and a few replicas would alternate between batches, every update waiting for two flushes
-//! (docs/measurements/2026-09-28-raft-log-benchmark.md). The writer waits for them as long as
-//! waiting is expected to lower total latency, as the chunk store's writer does
-//! (`hyper_block::commit`). Under `Waits::Never` it forms each batch from what is queued.
+//! Segments are freed oldest first, so the live ones are always a run of incarnations that each
+//! frame's tail names. A tail with no live piece left is freed at once. When updates are waiting
+//! and free segments are short, the writer sweeps the tail: the frame first carries copies of
+//! every live piece of the tail, and names the next segment as the tail, the cleaning of a
+//! log-structured file system applied to the end of a log [RO92]. A group's live entries run
+//! unbroken from its start to its last, and the pieces of a record die from its front by a start
+//! and from its back by a replacement, so the live part of any record is one run and its copy is
+//! no larger than the record. The copies of a whole tail therefore fit in one frame, and a sweep
+//! always completes in the frame that begins it. A freed segment is reused only once a durable
+//! frame names a tail past it; the last free segment is kept for a frame that does so, which is
+//! how the log never runs out of room to free room.
 
-use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::Arc;
-use std::sync::atomic::Ordering;
-use std::sync::mpsc::Receiver;
+use std::collections::{HashMap, VecDeque};
 
 use crate::codec::Writer as Payload;
-use hyper_block::block::BlockFile;
-use hyper_block::buf::AlignedBuf;
-use hyper_block::commit::Anticipation;
-
-use crate::format::{
-    self, FRAME_HEADER_BYTES, FRAME_HEADER_LEN, FrameHeader, Owned, Placed, Record, SegmentHeader,
-};
+use crate::format::{self, Owned, Placed, Record};
 use crate::state::{
-    self, DAMAGED_BYTES, Group, HARD_STATE_BYTES, PROPOSAL_EXTRA, Place, START_BYTES, Slot,
+    self, DAMAGED_BYTES, Group, HARD_STATE_BYTES, PROPOSAL_EXTRA, Place, START_BYTES, Slot, State,
     UNCERTAIN_BYTES, entry_bytes, resolves,
 };
-use crate::{Class, LogError, Shared, State, Submission, Update, Waits};
+use crate::ticket::Ticket;
+use crate::{Class, Config, LogError, Marks, Params, Update};
 
-/// Where the writer's fair queue placed a submission (docs/design/raft-log.md §3).
+/// An update on its way to a frame.
+pub(crate) struct Submission {
+    pub(crate) group: u128,
+    pub(crate) update: Update,
+    pub(crate) marks: Marks,
+    /// What it holds of the queue's byte bound, and what the writer's fair queue charges it.
+    pub(crate) bytes: u64,
+    pub(crate) class: Class,
+    /// Where the writer's fair queue placed it when taken (mantle docs/design/raft-log.md §3).
+    pub(crate) tags: Tags,
+    /// Where its admission and its answer go.
+    pub(crate) ticket: Ticket,
+}
+
+/// Where the writer's fair queue placed a submission (mantle docs/design/raft-log.md §3).
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct Tags {
     /// Its place in the order the writer took submissions.
-    seq: u64,
+    pub(crate) seq: u64,
     /// Its start tag in start-time fair queueing: the larger of the virtual time when it was
     /// taken and its group's last finish tag, in charged bytes [SFQ96 §2 eq. 4].
-    start: u128,
+    pub(crate) start: u128,
     /// The frame that first passed it over for room, if one has.
-    passed: Option<u64>,
+    pub(crate) passed: Option<u64>,
 }
 
 /// The order a frame considers a submission in: its tier (passed over, then each class), then
@@ -77,11 +77,11 @@ fn key(s: &Submission) -> Key {
     }
 }
 
-/// Puts the backlog in the order a frame considers it (docs/design/raft-log.md §3). A group's
-/// update never sorts before one of its own taken earlier: it takes the later key of the two,
-/// as Tectonic gives traffic that borrows another TrafficGroup's resources the lower of their
+/// Puts the backlog in the order a frame considers it (mantle docs/design/raft-log.md §3). A
+/// group's update never sorts before one of its own taken earlier: it takes the later key of the
+/// two, as Tectonic gives traffic that borrows another TrafficGroup's resources the lower of their
 /// classes [research/01 §1.11], so a group's updates stay in the order submitted.
-fn order(batch: &mut VecDeque<Submission>) {
+pub(crate) fn order(batch: &mut VecDeque<Submission>) {
     let mut taken: Vec<Submission> = std::mem::take(batch).into();
     taken.sort_by_key(|s| s.tags.seq);
     let mut last: HashMap<u128, Key> = HashMap::new();
@@ -104,7 +104,7 @@ fn order(batch: &mut VecDeque<Submission>) {
 
 /// Where an update's pieces went in the payload.
 #[derive(Debug, Default)]
-struct Placement {
+pub(crate) struct Placement {
     start: Option<usize>,
     entries: Vec<(u64, usize)>,
     hard: Option<usize>,
@@ -115,7 +115,7 @@ struct Placement {
 
 /// A live piece of the tail copied into the payload.
 #[derive(Debug)]
-enum Moved {
+pub(crate) enum Moved {
     Entry { group: u128, index: u64, at: usize },
     Hard { group: u128, at: usize },
     Start { group: u128, at: usize },
@@ -126,877 +126,40 @@ enum Moved {
 
 /// A sweep of the tail laid into the payload.
 #[derive(Debug)]
-struct Sweep {
-    slot: u32,
-    moved: Vec<Moved>,
+pub(crate) struct Sweep {
+    pub(crate) slot: u32,
+    pub(crate) moved: Vec<Moved>,
     /// The incarnation of the segment after the tail, which the frame names as the tail.
-    next_tail: u64,
-}
-
-pub(crate) struct Writer<F> {
-    shared: Arc<Shared<F>>,
-    receiver: Receiver<Submission>,
-    /// Updates held for the next batch: those a frame passed over for room, and those whose
-    /// group had an update in it.
-    held: VecDeque<Submission>,
-    /// Start-time fair queueing's virtual time, in charged bytes: the largest start tag laid
-    /// into a frame, and the largest finish tag once the backlog empties [SFQ96 §2].
-    virtual_time: u128,
-    /// Each group's last finish tag, while it is ahead of the virtual time and the group is
-    /// one the log holds or has an update waiting: at most `max_groups` and
-    /// `queue_submissions` entries.
-    finish: HashMap<u128, u128>,
-    /// Frames laid out so far, which date a submission passed over.
-    walks: u64,
-    /// Frames written in a row that swept and carried no update while updates waited: at most
-    /// `max_segments` before those waiting are refused `Full`.
-    fruitless: u64,
-    /// Payload bytes one frame holds.
-    capacity: usize,
-    anticipation: Anticipation,
-    /// Submissions taken off the channel so far.
-    received: u64,
-    /// The last frame flushed, while nothing durable yet says its flush completed: the next
-    /// frame's persist record will, or a confirmation written when no frame follows at once
-    /// (docs/design/raft-log.md §3, §6). Its updates are answered only then.
-    unconfirmed: Option<Unconfirmed>,
-    /// The aligned buffer the last frame was laid out in, kept for the next: one frame's
-    /// bytes at most, a segment and a block, which the log's settings hold within one I/O
-    /// buffer.
-    frame: Option<AlignedBuf>,
-    /// The first batch is the restore of a lost frame at open, which goes in one frame or not
-    /// at all (docs/design/raft-log.md §6).
-    restoring: bool,
-}
-
-/// A frame flushed and not yet confirmed, and the updates it carried: at most one frame's.
-struct Unconfirmed {
-    sequence: u64,
-    updates: Vec<Submission>,
-}
-
-impl<F: BlockFile> Writer<F> {
-    /// A writer whose first batch is `restores`, the restore of a lost frame at open, if any.
-    pub fn new(
-        shared: Arc<Shared<F>>,
-        receiver: Receiver<Submission>,
-        restores: Vec<Submission>,
-    ) -> Result<Self, LogError> {
-        let capacity = crate::frame_room(&shared.config, shared.align)?;
-        Ok(Self {
-            shared,
-            receiver,
-            restoring: !restores.is_empty(),
-            held: restores.into(),
-            capacity,
-            anticipation: Anticipation::new(),
-            received: 0,
-            virtual_time: 0,
-            finish: HashMap::new(),
-            walks: 0,
-            fruitless: 0,
-            unconfirmed: None,
-            frame: None,
-        })
-    }
-
-    pub fn run(mut self) {
-        // Submissions the last confirmation answered, and those already sent when it did.
-        let mut answered = 0u64;
-        let mut backlog = 0u64;
-        loop {
-            let mut batch = std::mem::take(&mut self.held);
-            let held = u64::try_from(batch.len()).unwrap_or(u64::MAX);
-            while let Ok(s) = self.receiver.try_recv() {
-                batch.push_back(self.taken(s));
-            }
-            if batch.is_empty() {
-                if self.unconfirmed.is_some() {
-                    // No frame would carry the confirmation: it goes on its own, at once.
-                    answered = self.confirm();
-                    backlog = self.backlog();
-                    continue;
-                }
-                // The backlog is empty: the busy period ends at the largest finish tag
-                // [SFQ96 §2], and no group's past service counts against it any longer.
-                let last = self.finish.values().copied().max().unwrap_or(0);
-                self.virtual_time = self.virtual_time.max(last);
-                self.finish.clear();
-                match self.receiver.recv() {
-                    Ok(s) => batch.push_back(self.taken(s)),
-                    Err(_) => return,
-                }
-            }
-            self.gather(&mut batch, answered, backlog.saturating_add(held));
-            if self.shared.fenced.load(Ordering::Acquire) {
-                for s in batch {
-                    self.answer(&s, Err(LogError::Fenced));
-                }
-                // Answer what still comes until the log is dropped.
-                while let Ok(s) = self.receiver.recv() {
-                    let s = self.taken(s);
-                    self.answer(&s, Err(LogError::Fenced));
-                }
-                return;
-            }
-            answered = match self.commit(batch) {
-                Ok(Some(confirmed)) => confirmed,
-                // No frame was written, so none confirms the last: a confirmation does, so that
-                // no answer waits on traffic that may only ever be refused.
-                Ok(None) => self.confirm(),
-                // The commit fenced the log and answered every update it held.
-                Err(_) => 0,
-            };
-            self.forget();
-            backlog = self.backlog();
-        }
-    }
-
-    /// Drops the finish tags that no longer order anything: those the virtual time has passed,
-    /// which a start tag would take the virtual time over, and those of groups the log no
-    /// longer holds with nothing waiting, so the map is bounded by the log's groups and the
-    /// queue's submissions.
-    fn forget(&mut self) {
-        let waiting: HashSet<u128> = self.held.iter().map(|s| s.group).collect();
-        let Ok(state) = self.shared.read_state() else {
-            self.finish.clear();
-            return;
-        };
-        let now = self.virtual_time;
-        self.finish.retain(|group, finish| {
-            *finish > now && (state.groups.contains_key(group) || waiting.contains(group))
-        });
-    }
-
-    /// Submissions sent before the answers just given went out: they are queued ahead of any
-    /// the answered replicas send next.
-    fn backlog(&self) -> u64 {
-        self.shared
-            .submitted
-            .load(Ordering::Acquire)
-            .saturating_sub(self.received)
-    }
-
-    /// Writes and flushes a confirmation that the last frame was flushed, and answers the
-    /// frame's updates: the number answered. A failed write or flush fences the log, and they
-    /// are answered `Fenced`.
-    ///
-    /// The confirmation is the frame's own persist record again, now saying the frame was
-    /// flushed, written over the record in the frame's own slot. The next frame's record goes
-    /// in the other slot before that frame's flush and may tear; a confirmation kept there
-    /// would tear with it, and a frame answered and then damaged at rest would be taken for a
-    /// torn one (docs/design/raft-log.md §6). The rewrite puts at risk only the record of a
-    /// frame not yet answered, which recovery may drop as it drops a torn tail.
-    fn confirm(&mut self) -> u64 {
-        let Some(frame) = self.unconfirmed.take() else {
-            return 0;
-        };
-        let written = if self.shared.fenced.load(Ordering::Acquire) {
-            Err(LogError::Fenced)
-        } else {
-            let record = format::Persist {
-                log: self.shared.id,
-                sequence: frame.sequence,
-                confirms: frame.sequence,
-                groups: frame.updates.iter().map(persisted).collect(),
-            };
-            write_persist(&self.shared, &record, frame.sequence)
-                .and_then(|()| self.shared.file.sync_data().map_err(LogError::from))
-        };
-        match written {
-            Ok(()) => self.settle(frame, Ok(())),
-            Err(_) => {
-                self.fence();
-                self.settle(frame, Err(()));
-                0
-            }
-        }
-    }
-
-    /// Answers the updates of a frame whose confirmation is durable, `Ok`, or will never be,
-    /// `Fenced`; the number answered.
-    fn settle(&self, frame: Unconfirmed, result: Result<(), ()>) -> u64 {
-        for s in &frame.updates {
-            let answer = match result {
-                Ok(()) => Ok(()),
-                Err(()) => Err(LogError::Fenced),
-            };
-            self.answer(s, answer);
-        }
-        u64::try_from(frame.updates.len()).unwrap_or(u64::MAX)
-    }
-
-    /// Waits for the replicas the last confirmation answered while waiting is expected to
-    /// lower total latency, and learns how many of them return (`hyper_block::commit`). The
-    /// first `before` submissions in the batch were sent before the answers.
-    fn gather(&mut self, batch: &mut VecDeque<Submission>, answered: u64, before: u64) {
-        if answered == 0 || self.shared.config.waits == Waits::Never {
-            return;
-        }
-        let returned = |batch: &VecDeque<Submission>| {
-            u64::try_from(batch.len())
-                .unwrap_or(u64::MAX)
-                .saturating_sub(before)
-        };
-        // A batch that holds a frame's worth already is not waited on: what came next would
-        // go in a later frame whatever the wait.
-        let full = u64::try_from(self.capacity).unwrap_or(u64::MAX);
-        let mut gathered = batch
-            .iter()
-            .fold(0u64, |sum, s| sum.saturating_add(s.bytes));
-        while returned(batch) < answered
-            && batch.len() < self.shared.config.queue_submissions
-            && gathered < full
-        {
-            let Some(step) = self.anticipation.wait(batch.len()) else {
-                break;
-            };
-            match self.receiver.recv_timeout(step) {
-                Ok(s) => {
-                    gathered = gathered.saturating_add(s.bytes);
-                    batch.push_back(self.taken(s));
-                }
-                Err(_) => break,
-            }
-        }
-        self.anticipation.learn(answered, returned(batch));
-    }
-
-    /// Counts a submission the writer took. Its room in the queue is held until it is
-    /// answered, so the queue's bound covers the updates held for a later frame and those in
-    /// the frame being written as well as those waiting (audit S03).
-    ///
-    /// It is stamped for the fair queue: its start tag is the larger of the virtual time and
-    /// its group's last finish tag, and its finish tag its start plus its charge [SFQ96 §2
-    /// eqs. 4–5]. Every group weighs the same, so a group's share of a full frame's bytes is the
-    /// others' (Theorem 1); the class orders tiers instead of weighting them.
-    fn taken(&mut self, mut s: Submission) -> Submission {
-        self.received = self.received.saturating_add(1);
-        let start = self
-            .finish
-            .get(&s.group)
-            .map_or(self.virtual_time, |&f| f.max(self.virtual_time));
-        // Charged bytes over the log's life stay far below 2^128: saturation is unreachable,
-        // and would only order the group last.
-        self.finish
-            .insert(s.group, start.saturating_add(u128::from(s.bytes)));
-        s.tags = Tags {
-            seq: self.received,
-            start,
-            passed: None,
-        };
-        s
-    }
-
-    /// Answers a submission, and gives back its room in the queue.
-    fn answer(&self, s: &Submission, result: Result<(), LogError>) {
-        // A submitter that stopped waiting has nothing to be told.
-        let _ = s.reply.try_send(result);
-        self.shared.release(s.group, s.bytes);
-        s.wake();
-    }
-
-    /// Fences the log: no submission is taken from here on, and every waiter wakes to hear
-    /// it.
-    fn fence(&self) {
-        self.shared.fenced.store(true, Ordering::Release);
-        self.shared.room.fence();
-    }
-
-    /// Writes one frame of a sweep and updates and publishes it. Its persist record confirms
-    /// the frame before, whose updates are answered, and the number answered is returned; its
-    /// own updates wait for their confirmation. `None` if no frame was written. An error
-    /// returned has fenced the log and answered `Fenced` every update the writer holds: those
-    /// taken for the frame, those of the batch not reached, those held for a later frame, and
-    /// those of the frame before, whose confirmation will never come. Wherever the commit
-    /// fails, no submitter waits on an answer that cannot come, and every submission's room in
-    /// the queue is given back. Updates refused on their own are answered as they are refused.
-    fn commit(&mut self, batch: VecDeque<Submission>) -> Result<Option<u64>, LogError> {
-        let mut batch = batch;
-        let mut taken = Vec::new();
-        let result = self.frame(&mut batch, &mut taken);
-        if result.is_err() {
-            // Fenced before anyone hears of it, so no answer outruns the fence.
-            self.fence();
-            let held = std::mem::take(&mut self.held);
-            let untaken = batch.iter().chain(&held);
-            for s in taken.iter().map(|(s, _)| s).chain(untaken) {
-                self.answer(s, Err(LogError::Fenced));
-            }
-            if let Some(before) = self.unconfirmed.take() {
-                self.settle(before, Err(()));
-            }
-        }
-        result
-    }
-
-    /// Lays the batch into a frame after any sweep, then writes and publishes it and answers
-    /// the frame before. Each update laid out moves from `batch` to `taken`, and leaves `taken`
-    /// only once it is answered or awaits its confirmation, so that on an error `commit`
-    /// answers every update this left.
-    fn frame(
-        &mut self,
-        batch: &mut VecDeque<Submission>,
-        taken: &mut Vec<(Submission, Placement)>,
-    ) -> Result<Option<u64>, LogError> {
-        let whole = std::mem::replace(&mut self.restoring, false);
-        let mut payload = Payload::default();
-        let mut records = 0u32;
-        let sweep = if self.sweepable()? {
-            Some(self.sweep(&mut payload, &mut records)?)
-        } else {
-            None
-        };
-        let mut refused = false;
-        self.walks = self.walks.saturating_add(1);
-        order(batch);
-        {
-            let state = self.shared.read_state()?;
-            let mut seen = HashSet::new();
-            let mut new_groups = 0usize;
-            while let Some(mut s) = batch.pop_front() {
-                if !seen.insert(s.group) {
-                    self.held.push_back(s);
-                    continue;
-                }
-                let checked =
-                    validate(&state, &self.shared.config, &s, new_groups).and_then(|new| {
-                        match submission_len(s.group, &s.update, s.marks) {
-                            Some(len) if len <= self.capacity => Ok((new, len)),
-                            Some(len) => Err(LogError::TooLarge(len)),
-                            None => Err(LogError::TooLarge(usize::MAX)),
-                        }
-                    });
-                let (new, len) = match checked {
-                    Ok(checked) => checked,
-                    Err(e) => {
-                        self.answer(&s, Err(e));
-                        refused = true;
-                        continue;
-                    }
-                };
-                if payload.len().saturating_add(len) > self.capacity {
-                    // The group stays taken for this frame: its later updates wait behind
-                    // this one, so its updates become durable in the order submitted. Passed
-                    // over, it goes ahead of every class from the next frame on, behind only
-                    // those passed over before it.
-                    s.tags.passed.get_or_insert(self.walks);
-                    self.held.push_back(s);
-                    continue;
-                }
-                let Some(placement) =
-                    encode(&mut payload, &mut records, s.group, &s.update, s.marks)
-                else {
-                    batch.push_front(s);
-                    return Err(LogError::TooLarge(len));
-                };
-                self.virtual_time = self.virtual_time.max(s.tags.start);
-                if new {
-                    new_groups = new_groups.saturating_add(1);
-                }
-                taken.push((s, placement));
-            }
-        }
-        if whole && (refused || !self.held.is_empty()) {
-            // A restore in parts would overwrite the lost frame's persist record with the
-            // first part's, and a crash before the last part was durable would leave the rest
-            // restored nowhere: none of it is written, and the open fails (raft-log.md §6).
-            let parts = taken.drain(..).map(|(s, _)| s);
-            for s in parts.chain(std::mem::take(&mut self.held)) {
-                self.answer(
-                    &s,
-                    Err(LogError::Damaged(
-                        "a lost frame's restore does not fit one frame",
-                    )),
-                );
-            }
-            return Ok(None);
-        }
-        if taken.is_empty() && sweep.is_none() {
-            return Ok(None);
-        }
-        let payload = payload.into_vec();
-        match self.place_and_write(&payload, records, sweep, taken)? {
-            Some(sequence) => {
-                self.shared.frames.fetch_add(1, Ordering::Relaxed);
-                let updates = u64::try_from(taken.len()).unwrap_or(u64::MAX);
-                self.shared.updates.fetch_add(updates, Ordering::Relaxed);
-                let confirmed = self
-                    .unconfirmed
-                    .take()
-                    .map_or(0, |before| self.settle(before, Ok(())));
-                // Frames that sweep and carry no update, in a row, while updates wait: each
-                // copies a tail with a dead piece, and its copies are all live, so after a
-                // sweep of every segment no dead piece is left to free. Past that many, the
-                // log cannot make room for what waits (docs/design/raft-log.md §5).
-                if taken.is_empty() {
-                    self.fruitless = self.fruitless.saturating_add(1);
-                    if self.fruitless >= u64::from(self.shared.config.max_segments) {
-                        self.refuse_held();
-                    }
-                } else {
-                    self.fruitless = 0;
-                }
-                self.unconfirmed = Some(Unconfirmed {
-                    sequence,
-                    updates: taken.drain(..).map(|(s, _)| s).collect(),
-                });
-                Ok(Some(confirmed))
-            }
-            None => {
-                // No segment can take the frame: every one holds live records the tail's
-                // sweep cannot free. Groups must compact. A frame that carried no update was
-                // a sweep making room for those held: none can come, and they are refused
-                // too, where before they were laid out again, and again, without an answer.
-                let sweep_only = taken.is_empty();
-                for (s, _) in taken.drain(..) {
-                    self.answer(&s, Err(LogError::Full));
-                }
-                if sweep_only {
-                    self.refuse_held();
-                }
-                Ok(None)
-            }
-        }
-    }
-
-    /// Answers every held update `Full`: no room can be made for them until groups compact.
-    fn refuse_held(&mut self) {
-        self.fruitless = 0;
-        for s in std::mem::take(&mut self.held) {
-            self.answer(&s, Err(LogError::Full));
-        }
-    }
-
-    /// Places, writes and publishes the frame: its sequence, or `None` if no segment can take
-    /// it.
-    fn place_and_write(
-        &mut self,
-        payload: &[u8],
-        records: u32,
-        sweep: Option<Sweep>,
-        taken: &[(Submission, Placement)],
-    ) -> Result<Option<u64>, LogError> {
-        let (tail, advances) = {
-            let state = self.shared.read_state()?;
-            let tail = match &sweep {
-                Some(s) => s.next_tail,
-                None => state.tail_incarnation(),
-            };
-            (tail, tail > state.durable_tail)
-        };
-        // A frame makes room if it names a later tail, whose durability frees a segment, or if
-        // its every update only frees what its group held: a compaction, a removal, a fence.
-        let makes_room =
-            advances || (!taken.is_empty() && taken.iter().all(|(s, _)| frees(&s.update, s.marks)));
-        let Some(target) = self.target(payload.len(), makes_room)? else {
-            return Ok(None);
-        };
-        let started = std::time::Instant::now();
-        let sequence = self.write(&target, records, payload, tail, taken)?;
-        self.anticipation
-            .served(u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX));
-        self.publish(&target, sweep, taken, tail)?;
-        Ok(Some(sequence))
-    }
-
-    /// Whether the tail should be swept now: free segments are short, a segment follows the
-    /// tail, and sweeping it makes room: its copies fit one frame, and that frame takes less
-    /// than the tail's frames do.
-    fn sweepable(&self) -> Result<bool, LogError> {
-        let state = self.shared.read_state()?;
-        let usable = usable_segments(&state, self.shared.config.max_segments);
-        let Some(&tail) = state.segments.live.front() else {
-            return Ok(false);
-        };
-        if usable >= 2 || state.segments.live.len() < 2 {
-            return Ok(false);
-        }
-        // The copies' bytes at most: every live piece, and a relocated record's header for
-        // each, as if no two entries ran together.
-        let (count, live_bytes) = state.live.of(tail);
-        let run = format::encoded_len(&Record::Relocated {
-            group: 0,
-            first: 0,
-            entries: &[],
-        })
-        .and_then(|len| u64::try_from(len).ok())
-        .ok_or(LogError::Config("a relocated record's header"))?;
-        let copies = count
-            .checked_mul(run)
-            .and_then(|h| h.checked_add(live_bytes));
-        let room = u64::try_from(self.capacity).unwrap_or(u64::MAX);
-        let Some(copies) = copies.filter(|&c| c <= room) else {
-            return Ok(false);
-        };
-        let frame = u64::try_from(FRAME_HEADER_LEN)
-            .ok()
-            .and_then(|h| h.checked_add(copies))
-            .and_then(|len| self.shared.align.up_u64(len))
-            .ok_or(LogError::Damaged("a frame past u64"))?;
-        // The sweep makes room if the segment after the tail holds nothing live, so that the
-        // frame naming a later tail frees it too, or if its frame takes less than the
-        // tail's frames. A tail copied into a segment of its own, as large as its own frames,
-        // frees one segment and fills another: the writer once swept every segment in turn so,
-        // while the updates waiting never fitted beside the copies. And a small live record
-        // left in the oldest segment once held back every dead segment behind it: its copy was
-        // as large as its frame, so it was never swept, and no frame larger than the head's
-        // room went in again.
-        // The segment after the tail, unless it is the head, which takes the next frame.
-        let dead_behind = state.segments.live.len() > 2
-            && state
-                .segments
-                .live
-                .get(1)
-                .is_some_and(|&slot| state.live.of(slot).0 == 0);
-        Ok(dead_behind || frame < state.live.used(tail))
-    }
-
-    /// Lays copies of every live piece of the tail into the payload.
-    fn sweep(&mut self, payload: &mut Payload, records: &mut u32) -> Result<Sweep, LogError> {
-        let (slot, incarnation, nonce, next_tail) = {
-            let state = self.shared.read_state()?;
-            let slot = *state
-                .segments
-                .live
-                .front()
-                .ok_or(LogError::Damaged("no tail"))?;
-            let next = state
-                .segments
-                .live
-                .get(1)
-                .map(|&s| incarnation_of(&state, s))
-                .ok_or(LogError::Damaged("no segment after the tail"))?;
-            (
-                slot,
-                incarnation_of(&state, slot),
-                nonce_of(&state, slot),
-                next,
-            )
-        };
-        let begin = slot_start(&self.shared, slot)?;
-        let end = begin
-            .checked_add(self.shared.config.segment_bytes)
-            .ok_or(LogError::Damaged("an offset past u64"))?;
-        let mut offset = begin
-            .checked_add(block(&self.shared)?)
-            .ok_or(LogError::Damaged("an offset past u64"))?;
-        let segment = crate::recover::Segment {
-            log: self.shared.id,
-            incarnation,
-            nonce,
-        };
-        // The tail is read through a window of a segment: nothing writes it while it is swept.
-        let mut reader = crate::recover::Reader::new(
-            &self.shared.file,
-            self.shared.align,
-            self.shared.config.segment_bytes,
-        )?;
-        let mut moved = Vec::new();
-        loop {
-            let (header, bytes, padded) = match reader.frame_at(segment, offset, end)? {
-                crate::recover::Found::Frame(header, bytes, padded) => (header, bytes, padded),
-                crate::recover::Found::End => break,
-                crate::recover::Found::Invalid => {
-                    return Err(LogError::Damaged("a live frame does not verify"));
-                }
-            };
-            let body = bytes
-                .get(FRAME_HEADER_LEN..header.frame_len().unwrap_or(0))
-                .ok_or(LogError::Damaged("a frame shorter than its header says"))?;
-            let decoded = format::records(body, header.records)
-                .ok_or(LogError::Damaged("a verified frame does not decode"))?;
-            let base = offset
-                .checked_add(FRAME_HEADER_BYTES)
-                .ok_or(LogError::Damaged("an offset past u64"))?;
-            let copies = {
-                let state = self.shared.read_state()?;
-                live_copies(&state, slot, base, &decoded)
-            };
-            for copy in &copies {
-                let placed = format::put(payload, &copy.record())
-                    .ok_or(LogError::Damaged("a copy does not encode"))?;
-                *records = records.saturating_add(1);
-                copy.moved(placed, &mut moved);
-            }
-            if payload.len() > self.capacity {
-                return Err(LogError::Damaged("a tail's live pieces outgrow a frame"));
-            }
-            offset = offset
-                .checked_add(padded)
-                .ok_or(LogError::Damaged("an offset past u64"))?;
-        }
-        Ok(Sweep {
-            slot,
-            moved,
-            next_tail,
-        })
-    }
-
-    /// Where the next frame of `payload_len` bytes goes: the head, or a segment opened for
-    /// it. The last free segment is kept for a frame that makes room, and while no segment is
-    /// free the head's room is too, so that the compaction or the tail's advance a full log
-    /// waits for always has somewhere to go (docs/design/raft-log.md §5). `None` when no
-    /// segment can take it.
-    fn target(&self, payload_len: usize, makes_room: bool) -> Result<Option<Target>, LogError> {
-        let shared = &self.shared;
-        let block = block(shared)?;
-        let frame_len = FRAME_HEADER_LEN
-            .checked_add(payload_len)
-            .and_then(|len| u64::try_from(len).ok())
-            .and_then(|len| shared.align.up_u64(len))
-            .ok_or(LogError::TooLarge(payload_len))?;
-        let state = shared.read_state()?;
-        let head = state.head;
-        let head_end = slot_start(shared, head.slot)?
-            .checked_add(shared.config.segment_bytes)
-            .ok_or(LogError::Damaged("an offset past u64"))?;
-        let usable = usable_segments(&state, shared.config.max_segments);
-        if head
-            .offset
-            .checked_add(frame_len)
-            .is_some_and(|end| end <= head_end)
-            && (usable > 0 || makes_room)
-        {
-            return Ok(Some(Target {
-                slot: head.slot,
-                incarnation: head.incarnation,
-                nonce: head.nonce,
-                offset: head.offset,
-                frame_len,
-                opens: false,
-            }));
-        }
-        if usable == 0 || (usable == 1 && !makes_room) {
-            return Ok(None);
-        }
-        let reusable = state
-            .segments
-            .free
-            .iter()
-            .find(|(_, after)| *after <= state.durable)
-            .map(|(slot, _)| *slot);
-        let slot = match reusable {
-            Some(slot) => slot,
-            None => u32::try_from(state.segments.incarnation.len())
-                .map_err(|_| LogError::Damaged("more slots than u32"))?,
-        };
-        let offset = slot_start(shared, slot)?
-            .checked_add(block)
-            .ok_or(LogError::Damaged("an offset past u64"))?;
-        Ok(Some(Target {
-            slot,
-            incarnation: state.next_incarnation,
-            nonce: crate::recover::random_nonce()?,
-            offset,
-            frame_len,
-            opens: true,
-        }))
-    }
-
-    /// Writes the frame, and the segment's header before it when it opens a segment, and the
-    /// frame's persist record, then flushes the file once. Returns the frame's sequence.
-    fn write(
-        &mut self,
-        target: &Target,
-        records: u32,
-        payload: &[u8],
-        tail: u64,
-        taken: &[(Submission, Placement)],
-    ) -> Result<u64, LogError> {
-        let shared = Arc::clone(&self.shared);
-        let (sequence, flushed) = {
-            let state = shared.read_state()?;
-            (state.next_sequence, state.durable)
-        };
-        let frame = FrameHeader::header(
-            shared.id,
-            target.incarnation,
-            target.nonce,
-            sequence,
-            tail,
-            records,
-            payload,
-        )
-        .ok_or(LogError::TooLarge(payload.len()))?;
-        let block = shared.align.get();
-        let header_room = if target.opens { block } else { 0 };
-        let frame_len =
-            usize::try_from(target.frame_len).map_err(|_| LogError::TooLarge(payload.len()))?;
-        let total = header_room
-            .checked_add(frame_len)
-            .ok_or(LogError::TooLarge(payload.len()))?;
-        // The last frame's buffer, reused while it is large enough: every byte up to the padded
-        // end is written below, so nothing of the frame before survives into this one.
-        let mut buf = match self.frame.take() {
-            Some(buf) if buf.capacity() >= total => buf,
-            _ => AlignedBuf::zeroed(total, shared.align).map_err(|e| LogError::Disk(e.into()))?,
-        };
-        buf.clear();
-        if target.opens {
-            let header = SegmentHeader {
-                log: shared.id,
-                incarnation: target.incarnation,
-                nonce: target.nonce,
-                segment_bytes: shared.config.segment_bytes,
-            };
-            buf.extend_from_slice(&header.encode())
-                .map_err(|e| LogError::Disk(e.into()))?;
-            buf.extend_zeros(block.saturating_sub(buf.len()))
-                .map_err(|e| LogError::Disk(e.into()))?;
-        }
-        buf.extend_from_slice(&frame)
-            .map_err(|e| LogError::Disk(e.into()))?;
-        buf.extend_from_slice(payload)
-            .map_err(|e| LogError::Disk(e.into()))?;
-        let at = if target.opens {
-            slot_start(&shared, target.slot)?
-        } else {
-            target.offset
-        };
-        let written = buf
-            .padded()
-            .map_err(|e| LogError::Disk(e.into()))
-            .and_then(|bytes| shared.file.write_all_at(bytes, at).map_err(LogError::from));
-        self.frame = Some(buf);
-        written?;
-        // What the frame's flush makes durable, apart from the frame, so that recovery can
-        // restore it should the frame be damaged since (§6); it confirms the frame before.
-        let record = format::Persist {
-            log: shared.id,
-            sequence,
-            confirms: flushed,
-            groups: taken.iter().map(|(s, _)| persisted(s)).collect(),
-        };
-        write_persist(&shared, &record, sequence)?;
-        shared.file.sync_data()?;
-        Ok(sequence)
-    }
-
-    /// Makes the durable frame visible: the segment it opened, where swept pieces now are,
-    /// every update's pieces, and the tails that died.
-    fn publish(
-        &mut self,
-        target: &Target,
-        sweep: Option<Sweep>,
-        taken: &[(Submission, Placement)],
-        tail: u64,
-    ) -> Result<(), LogError> {
-        let shared = Arc::clone(&self.shared);
-        let config = shared.config;
-        let base = target
-            .offset
-            .checked_add(FRAME_HEADER_BYTES)
-            .ok_or(LogError::Damaged("an offset past u64"))?;
-        let place = |at: usize| -> Result<Place, LogError> {
-            Ok(Place {
-                slot: target.slot,
-                offset: u64::try_from(at)
-                    .ok()
-                    .and_then(|at| base.checked_add(at))
-                    .ok_or(LogError::Damaged("an offset past u64"))?,
-            })
-        };
-        let mut guard = shared.state.write().map_err(|_| LogError::Fenced)?;
-        let state = &mut *guard;
-        if target.opens {
-            let slot = usize::try_from(target.slot).map_err(|_| LogError::Damaged("slot"))?;
-            if state.segments.incarnation.len() <= slot {
-                state.segments.incarnation.resize(slot.saturating_add(1), 0);
-                state.segments.nonce.resize(slot.saturating_add(1), 0);
-                state.live.grow(slot.saturating_add(1));
-            }
-            if let Some(entry) = state.segments.incarnation.get_mut(slot) {
-                *entry = target.incarnation;
-            }
-            if let Some(entry) = state.segments.nonce.get_mut(slot) {
-                *entry = target.nonce;
-            }
-            state.live.open(target.slot);
-            state.segments.free.retain(|(s, _)| *s != target.slot);
-            state.segments.live.push_back(target.slot);
-            state.next_incarnation = state
-                .next_incarnation
-                .checked_add(1)
-                .ok_or(LogError::Damaged("incarnations past u64"))?;
-        }
-        state.live.wrote(target.slot, target.frame_len);
-        let sequence = state.next_sequence;
-        state.durable = sequence;
-        state.durable_tail = tail;
-        state.next_sequence = sequence
-            .checked_add(1)
-            .ok_or(LogError::Damaged("sequences past u64"))?;
-        state.head = crate::Head {
-            slot: target.slot,
-            incarnation: target.incarnation,
-            nonce: target.nonce,
-            offset: target
-                .offset
-                .checked_add(target.frame_len)
-                .ok_or(LogError::Damaged("an offset past u64"))?,
-        };
-        if let Some(sweep) = sweep {
-            for m in &sweep.moved {
-                move_piece(state, m, &place)?;
-            }
-            if state.segments.live.front() != Some(&sweep.slot) || state.live.of(sweep.slot).0 != 0
-            {
-                return Err(LogError::Damaged("a swept tail still holds a live piece"));
-            }
-            state.segments.live.pop_front();
-            // This frame names the tail past it and is durable: the segment is free now.
-            state.segments.free.push_back((sweep.slot, sequence));
-        }
-        for (s, placement) in taken {
-            apply(state, &config, s, placement, &place)?;
-        }
-        drop_dead_tails(state);
-        Ok(())
-    }
+    pub(crate) next_tail: u64,
 }
 
 /// Where a frame goes.
 #[derive(Debug, Clone, Copy)]
-struct Target {
-    slot: u32,
-    incarnation: u64,
-    nonce: u64,
+pub(crate) struct Target {
+    pub(crate) slot: u32,
+    pub(crate) incarnation: u64,
+    pub(crate) nonce: u64,
     /// File offset of the frame.
-    offset: u64,
+    pub(crate) offset: u64,
     /// Bytes of the frame, padded.
-    frame_len: u64,
+    pub(crate) frame_len: u64,
     /// Whether the frame opens its segment, whose header it writes first.
-    opens: bool,
+    pub(crate) opens: bool,
 }
 
-fn block<F>(shared: &Shared<F>) -> Result<u64, LogError> {
-    u64::try_from(shared.align.get()).map_err(|_| LogError::Config("block"))
+pub(crate) fn block(p: &Params) -> Result<u64, LogError> {
+    u64::try_from(p.align.get()).map_err(|_| LogError::Config("block"))
 }
 
-pub(crate) fn slot_start<F>(shared: &Shared<F>, slot: u32) -> Result<u64, LogError> {
+pub(crate) fn slot_start(config: &Config, slot: u32) -> Result<u64, LogError> {
     u64::from(slot)
-        .checked_mul(shared.config.segment_bytes)
-        .and_then(|s| s.checked_add(crate::recover::persist_area(&shared.config)))
+        .checked_mul(config.segment_bytes)
+        .and_then(|s| s.checked_add(crate::recover::persist_area(config)))
         .ok_or(LogError::Damaged("an offset past u64"))
 }
 
-/// Writes `record` into the persist slot of the frame of `slot_of`.
-fn write_persist<F: BlockFile>(
-    shared: &Shared<F>,
-    record: &format::Persist,
-    slot_of: u64,
-) -> Result<(), LogError> {
-    let slot = crate::recover::persist_slot(&shared.config, shared.align)?;
-    crate::recover::write_record(
-        &shared.file,
-        record,
-        crate::recover::persist_at(slot, slot_of),
-    )
-}
-
 /// What a submission's frame makes durable for its group, as its persist record says it.
-fn persisted(s: &Submission) -> format::Persisted {
+pub(crate) fn persisted(s: &Submission) -> format::Persisted {
     let u = &s.update;
     format::Persisted {
         group: s.group,
@@ -1015,7 +178,7 @@ fn persisted(s: &Submission) -> format::Persisted {
 }
 
 /// Bytes a submission's records take in a payload: its update's and its marks'.
-pub(crate) fn submission_len(group: u128, update: &Update, marks: crate::Marks) -> Option<usize> {
+pub(crate) fn submission_len(group: u128, update: &Update, marks: Marks) -> Option<usize> {
     if marks.damaged {
         return format::encoded_len(&Record::Damaged { group });
     }
@@ -1029,12 +192,12 @@ pub(crate) fn submission_len(group: u128, update: &Update, marks: crate::Marks) 
 /// What a submission whose records take `len` payload bytes holds of the queue's byte bound
 /// until it is answered: those bytes, record and entry headers included, and its group's row in
 /// the frame's persist record. An empty entry costs its header and an update of no records its
-/// row, so a flood of them fills the bound as surely as large ones do (audit S03).
+/// row, so a flood of them fills the bound as surely as large ones do (mantle audit S03).
 pub(crate) fn charge(len: usize) -> Option<u64> {
     u64::try_from(len.checked_add(format::PERSIST_GROUP_LEN)?).ok()
 }
 
-fn incarnation_of(state: &State, slot: u32) -> u64 {
+pub(crate) fn incarnation_of(state: &State, slot: u32) -> u64 {
     usize::try_from(slot)
         .ok()
         .and_then(|s| state.segments.incarnation.get(s))
@@ -1042,7 +205,7 @@ fn incarnation_of(state: &State, slot: u32) -> u64 {
         .unwrap_or(0)
 }
 
-fn nonce_of(state: &State, slot: u32) -> u64 {
+pub(crate) fn nonce_of(state: &State, slot: u32) -> u64 {
     usize::try_from(slot)
         .ok()
         .and_then(|s| state.segments.nonce.get(s))
@@ -1052,7 +215,7 @@ fn nonce_of(state: &State, slot: u32) -> u64 {
 
 /// Segments a frame could open now: free ones a durable frame has released, and those the
 /// file may still grow by.
-fn usable_segments(state: &State, max_segments: u32) -> u64 {
+pub(crate) fn usable_segments(state: &State, max_segments: u32) -> u64 {
     let free = state
         .segments
         .free
@@ -1068,7 +231,7 @@ fn usable_segments(state: &State, max_segments: u32) -> u64 {
 
 /// Frees tail segments that hold no live piece. The next frame names the new tail, and a
 /// freed segment is reused only once that frame is durable.
-fn drop_dead_tails(state: &mut State) {
+pub(crate) fn drop_dead_tails(state: &mut State) {
     while state.segments.live.len() > 1 {
         let Some(&tail) = state.segments.live.front() else {
             return;
@@ -1079,6 +242,193 @@ fn drop_dead_tails(state: &mut State) {
         state.segments.live.pop_front();
         state.segments.free.push_back((tail, state.next_sequence));
     }
+}
+
+/// Whether the tail should be swept now: free segments are short, a segment follows the
+/// tail, and sweeping it makes room: its copies fit one frame, and that frame takes less
+/// than the tail's frames do.
+pub(crate) fn sweepable(state: &State, p: &Params) -> Result<bool, LogError> {
+    let usable = usable_segments(state, p.config.max_segments);
+    let Some(&tail) = state.segments.live.front() else {
+        return Ok(false);
+    };
+    if usable >= 2 || state.segments.live.len() < 2 {
+        return Ok(false);
+    }
+    // The copies' bytes at most: every live piece, and a relocated record's header for
+    // each, as if no two entries ran together.
+    let (count, live_bytes) = state.live.of(tail);
+    let run = format::encoded_len(&Record::Relocated {
+        group: 0,
+        first: 0,
+        entries: &[],
+    })
+    .and_then(|len| u64::try_from(len).ok())
+    .ok_or(LogError::Config("a relocated record's header"))?;
+    let copies = count
+        .checked_mul(run)
+        .and_then(|h| h.checked_add(live_bytes));
+    let room = u64::try_from(p.frame_room).unwrap_or(u64::MAX);
+    let Some(copies) = copies.filter(|&c| c <= room) else {
+        return Ok(false);
+    };
+    let frame = u64::try_from(format::FRAME_HEADER_LEN)
+        .ok()
+        .and_then(|h| h.checked_add(copies))
+        .and_then(|len| p.align.up_u64(len))
+        .ok_or(LogError::Damaged("a frame past u64"))?;
+    // The sweep makes room if the segment after the tail holds nothing live, so that the
+    // frame naming a later tail frees it too, or if its frame takes less than the
+    // tail's frames. A tail copied into a segment of its own, as large as its own frames,
+    // frees one segment and fills another: the writer once swept every segment in turn so,
+    // while the updates waiting never fitted beside the copies. And a small live record
+    // left in the oldest segment once held back every dead segment behind it: its copy was
+    // as large as its frame, so it was never swept, and no frame larger than the head's
+    // room went in again.
+    // The segment after the tail, unless it is the head, which takes the next frame.
+    let dead_behind = state.segments.live.len() > 2
+        && state
+            .segments
+            .live
+            .get(1)
+            .is_some_and(|&slot| state.live.of(slot).0 == 0);
+    Ok(dead_behind || frame < state.live.used(tail))
+}
+
+/// What the device reads for a sweep: the tail's segment, from its first frame to its end, and
+/// the incarnation of the segment after it.
+pub(crate) struct SweepRead {
+    pub(crate) slot: u32,
+    pub(crate) segment: crate::recover::Segment,
+    pub(crate) offset: u64,
+    pub(crate) end: u64,
+    pub(crate) next_tail: u64,
+}
+
+/// Where the sweep of the tail reads.
+pub(crate) fn sweep_read(state: &State, p: &Params) -> Result<SweepRead, LogError> {
+    let slot = *state
+        .segments
+        .live
+        .front()
+        .ok_or(LogError::Damaged("no tail"))?;
+    let next_tail = state
+        .segments
+        .live
+        .get(1)
+        .map(|&s| incarnation_of(state, s))
+        .ok_or(LogError::Damaged("no segment after the tail"))?;
+    let begin = slot_start(&p.config, slot)?;
+    let end = begin
+        .checked_add(p.config.segment_bytes)
+        .ok_or(LogError::Damaged("an offset past u64"))?;
+    let offset = begin
+        .checked_add(block(p)?)
+        .ok_or(LogError::Damaged("an offset past u64"))?;
+    Ok(SweepRead {
+        slot,
+        segment: crate::recover::Segment {
+            log: p.id,
+            incarnation: incarnation_of(state, slot),
+            nonce: nonce_of(state, slot),
+        },
+        offset,
+        end,
+        next_tail,
+    })
+}
+
+/// Lays copies of every live piece of the swept frames into the payload.
+pub(crate) fn sweep(
+    state: &State,
+    p: &Params,
+    read: &SweepRead,
+    frames: &[crate::device::Swept],
+    payload: &mut Payload,
+    records: &mut u32,
+) -> Result<Sweep, LogError> {
+    let mut moved = Vec::new();
+    for frame in frames {
+        let copies = live_copies(state, read.slot, frame.base, &frame.records);
+        for copy in &copies {
+            let placed = format::put(payload, &copy.record())
+                .ok_or(LogError::Damaged("a copy does not encode"))?;
+            *records = records.saturating_add(1);
+            copy.moved(placed, &mut moved);
+        }
+        if payload.len() > p.frame_room {
+            return Err(LogError::Damaged("a tail's live pieces outgrow a frame"));
+        }
+    }
+    Ok(Sweep {
+        slot: read.slot,
+        moved,
+        next_tail: read.next_tail,
+    })
+}
+
+/// Where the next frame of `payload_len` bytes goes: the head, or a segment opened for
+/// it. The last free segment is kept for a frame that makes room, and while no segment is
+/// free the head's room is too, so that the compaction or the tail's advance a full log
+/// waits for always has somewhere to go (mantle docs/design/raft-log.md §5). `None` when no
+/// segment can take it.
+pub(crate) fn target(
+    state: &State,
+    p: &Params,
+    payload_len: usize,
+    makes_room: bool,
+) -> Result<Option<Target>, LogError> {
+    let block = block(p)?;
+    let frame_len = format::FRAME_HEADER_LEN
+        .checked_add(payload_len)
+        .and_then(|len| u64::try_from(len).ok())
+        .and_then(|len| p.align.up_u64(len))
+        .ok_or(LogError::TooLarge(payload_len))?;
+    let head = state.head;
+    let head_end = slot_start(&p.config, head.slot)?
+        .checked_add(p.config.segment_bytes)
+        .ok_or(LogError::Damaged("an offset past u64"))?;
+    let usable = usable_segments(state, p.config.max_segments);
+    if head
+        .offset
+        .checked_add(frame_len)
+        .is_some_and(|end| end <= head_end)
+        && (usable > 0 || makes_room)
+    {
+        return Ok(Some(Target {
+            slot: head.slot,
+            incarnation: head.incarnation,
+            nonce: head.nonce,
+            offset: head.offset,
+            frame_len,
+            opens: false,
+        }));
+    }
+    if usable == 0 || (usable == 1 && !makes_room) {
+        return Ok(None);
+    }
+    let reusable = state
+        .segments
+        .free
+        .iter()
+        .find(|(_, after)| *after <= state.durable)
+        .map(|(slot, _)| *slot);
+    let slot = match reusable {
+        Some(slot) => slot,
+        None => u32::try_from(state.segments.incarnation.len())
+            .map_err(|_| LogError::Damaged("more slots than u32"))?,
+    };
+    let offset = slot_start(&p.config, slot)?
+        .checked_add(block)
+        .ok_or(LogError::Damaged("an offset past u64"))?;
+    Ok(Some(Target {
+        slot,
+        incarnation: state.next_incarnation,
+        nonce: crate::recover::random_nonce()?,
+        offset,
+        frame_len,
+        opens: true,
+    }))
 }
 
 /// A run of live entries being gathered: its first index and its entries' terms and bytes.
@@ -1387,8 +737,8 @@ fn proposal_bytes(bytes: &[u8]) -> u64 {
 
 /// Whether an update only frees what its group holds: a removal, a damage fence, or a new start
 /// that writes no entry or proposal, as a compaction or a snapshot's install does. Such a frame
-/// may take the room the log keeps for making room (docs/design/raft-log.md §5).
-fn frees(update: &Update, marks: crate::Marks) -> bool {
+/// may take the room the log keeps for making room (mantle docs/design/raft-log.md §5).
+pub(crate) fn frees(update: &Update, marks: Marks) -> bool {
     if update.remove || marks.damaged {
         return true;
     }
@@ -1399,9 +749,9 @@ fn frees(update: &Update, marks: crate::Marks) -> bool {
 }
 
 /// Whether `s` may be written as the group stands, and whether it makes a new group.
-fn validate(
+pub(crate) fn validate(
     state: &State,
-    config: &crate::Config,
+    config: &Config,
     s: &Submission,
     new_groups: usize,
 ) -> Result<bool, LogError> {
@@ -1527,12 +877,12 @@ pub(crate) fn update_len(group: u128, update: &Update) -> Option<usize> {
 
 /// Lays an update's records into the payload: removal alone, or start, entries, hard state
 /// and proposals, in the order they apply.
-fn encode(
+pub(crate) fn encode(
     payload: &mut Payload,
     records: &mut u32,
     group: u128,
     update: &Update,
-    marks: crate::Marks,
+    marks: Marks,
 ) -> Option<Placement> {
     let mut placement = Placement::default();
     let mut put = |record: &Record<'_>| {
@@ -1587,17 +937,103 @@ fn encode(
     Some(placement)
 }
 
-/// Applies a durable update to the group's state.
+/// Makes the durable frame visible: the segment it opened, where swept pieces now are,
+/// every update's pieces, and the tails that died. The updates' bytes move into the state, which
+/// keeps them while they are recent.
+pub(crate) fn publish(
+    state: &mut State,
+    p: &Params,
+    target: &Target,
+    sweep: Option<Sweep>,
+    taken: &mut [(Submission, Placement)],
+    tail: u64,
+) -> Result<(), LogError> {
+    let base = target
+        .offset
+        .checked_add(format::FRAME_HEADER_BYTES)
+        .ok_or(LogError::Damaged("an offset past u64"))?;
+    let place = |at: usize| -> Result<Place, LogError> {
+        Ok(Place {
+            slot: target.slot,
+            offset: u64::try_from(at)
+                .ok()
+                .and_then(|at| base.checked_add(at))
+                .ok_or(LogError::Damaged("an offset past u64"))?,
+        })
+    };
+    if target.opens {
+        open_segment(state, target)?;
+    }
+    state.live.wrote(target.slot, target.frame_len);
+    let sequence = state.next_sequence;
+    state.durable = sequence;
+    state.durable_tail = tail;
+    state.next_sequence = sequence
+        .checked_add(1)
+        .ok_or(LogError::Damaged("sequences past u64"))?;
+    state.head = state::Head {
+        slot: target.slot,
+        incarnation: target.incarnation,
+        nonce: target.nonce,
+        offset: target
+            .offset
+            .checked_add(target.frame_len)
+            .ok_or(LogError::Damaged("an offset past u64"))?,
+    };
+    if let Some(sweep) = sweep {
+        for m in &sweep.moved {
+            move_piece(state, m, &place)?;
+        }
+        if state.segments.live.front() != Some(&sweep.slot) || state.live.of(sweep.slot).0 != 0 {
+            return Err(LogError::Damaged("a swept tail still holds a live piece"));
+        }
+        state.segments.live.pop_front();
+        // This frame names the tail past it and is durable: the segment is free now.
+        state.segments.free.push_back((sweep.slot, sequence));
+    }
+    for (s, placement) in taken.iter_mut() {
+        apply(state, &p.config, s, placement, &place)?;
+    }
+    drop_dead_tails(state);
+    Ok(())
+}
+
+/// Records the segment a frame opened.
+fn open_segment(state: &mut State, target: &Target) -> Result<(), LogError> {
+    let slot = usize::try_from(target.slot).map_err(|_| LogError::Damaged("slot"))?;
+    if state.segments.incarnation.len() <= slot {
+        state.segments.incarnation.resize(slot.saturating_add(1), 0);
+        state.segments.nonce.resize(slot.saturating_add(1), 0);
+        state.live.grow(slot.saturating_add(1));
+    }
+    if let Some(entry) = state.segments.incarnation.get_mut(slot) {
+        *entry = target.incarnation;
+    }
+    if let Some(entry) = state.segments.nonce.get_mut(slot) {
+        *entry = target.nonce;
+    }
+    state.live.open(target.slot);
+    state.segments.free.retain(|(s, _)| *s != target.slot);
+    state.segments.live.push_back(target.slot);
+    state.next_incarnation = state
+        .next_incarnation
+        .checked_add(1)
+        .ok_or(LogError::Damaged("incarnations past u64"))?;
+    Ok(())
+}
+
+/// Applies a durable update to the group's state, taking its entries' and proposals' bytes.
 fn apply(
     state: &mut State,
-    config: &crate::Config,
-    s: &Submission,
+    config: &Config,
+    s: &mut Submission,
     placement: &Placement,
     place: &impl Fn(usize) -> Result<Place, LogError>,
 ) -> Result<(), LogError> {
-    let (group, update) = (s.group, &s.update);
+    let (group, marks) = (s.group, s.marks);
+    let update = &mut s.update;
     let live = &mut state.live;
-    if s.marks.damaged {
+    if marks.damaged {
         // Whatever the group held is gone; only the fence is live.
         if let Some(g) = state.groups.remove(&group) {
             for (p, bytes) in g.pieces() {
@@ -1645,21 +1081,21 @@ fn apply(
         live.add(new_at, START_BYTES);
         g.cache_from = g.cache_from.max(start.index.saturating_add(1));
     }
-    if let Some(e) = &update.entries {
+    if let Some(e) = &mut update.entries {
         while g.last().is_some_and(|last| last >= e.first) {
             let Some(slot) = g.entries.pop_back() else {
                 break;
             };
             kill_slot(g, live, &slot);
         }
-        for (entry, &(_, at)) in e.entries.iter().zip(&placement.entries) {
+        for (entry, &(_, at)) in e.entries.iter_mut().zip(&placement.entries) {
             let len =
                 u32::try_from(entry.bytes.len()).map_err(|_| LogError::TooLarge(usize::MAX))?;
             let slot = Slot {
                 term: entry.term,
                 place: place(at)?,
                 len,
-                cached: Some(Arc::clone(&entry.bytes)),
+                cached: Some(std::mem::take(&mut entry.bytes)),
             };
             live.add(slot.place, entry_bytes(len));
             g.bytes = g.bytes.saturating_add(u64::from(len));
@@ -1695,7 +1131,7 @@ fn apply(
         g.hard = Some((hard, new_at));
         live.add(new_at, HARD_STATE_BYTES);
     }
-    for (p, &(index, at)) in update.proposals.iter().zip(&placement.proposals) {
+    for (p, &(index, at)) in update.proposals.iter_mut().zip(&placement.proposals) {
         let new_at = place(at)?;
         let bytes = proposal_bytes(&p.bytes);
         let old = g.proposals.insert(
@@ -1703,7 +1139,7 @@ fn apply(
             state::Proposal {
                 term: p.term,
                 place: new_at,
-                bytes: Arc::clone(&p.bytes),
+                bytes: std::mem::take(&mut p.bytes),
             },
         );
         if let Some(old) = old {
@@ -1711,7 +1147,7 @@ fn apply(
         }
         live.add(new_at, bytes);
     }
-    if let (Some(mark), Some(at)) = (s.marks.uncertain, placement.uncertain) {
+    if let (Some(mark), Some(at)) = (marks.uncertain, placement.uncertain) {
         if let Some((_, old)) = g.uncertain {
             live.kill(old, UNCERTAIN_BYTES);
         }

@@ -10,18 +10,18 @@
 )]
 
 use std::collections::{BTreeMap, HashMap};
-use std::sync::Arc;
 
 use hyper_block::block::BlockFile;
 use hyper_block::buf::{AlignedBuf, Alignment};
 use hyper_block::sim::{Crash, Fault, SimFile};
 use hyper_log::{
-    Class, Config, Entries, Entry, HardState, Log, LogError, Proposal, Start, Update, View, Waits,
+    Class, Config, Entries, Entry, HardState, Log, LogError, Proposal, Refused, Start, Update,
+    View, Waits,
 };
 use proptest::prelude::*;
 
 mod common;
-use common::{Released, Stepped};
+use common::{Held, Holder, held};
 
 const ID: u128 = 0x6d61_6e74_6c65_2d6c_6f67;
 const BLOCK: usize = 4096;
@@ -41,21 +41,34 @@ fn config(segment_blocks: u64, max_segments: u32) -> Config {
     }
 }
 
-fn sim(seed: u64) -> Arc<SimFile> {
-    Arc::new(
-        SimFile::new(
-            Alignment::new(BLOCK).unwrap(),
-            Alignment::new(512).unwrap(),
-            seed,
-        )
-        .unwrap(),
+fn sim(seed: u64) -> SimFile {
+    SimFile::new(
+        Alignment::new(BLOCK).unwrap(),
+        Alignment::new(512).unwrap(),
+        seed,
     )
+    .unwrap()
+}
+
+/// The log's file, once the log has answered everything and closed.
+fn closed<F: BlockFile>(log: Log<F>) -> F {
+    log.close().unwrap()
+}
+
+/// The file an open took, whether it opened or was refused.
+fn opened_or_not(
+    opened: Result<(Log<SimFile>, hyper_log::Recovery), hyper_log::Refused<SimFile>>,
+) -> SimFile {
+    match opened {
+        Ok((log, _)) => closed(log),
+        Err(refused) => refused.file.unwrap(),
+    }
 }
 
 fn entry(term: u64, tag: &str) -> Entry {
     Entry {
         term,
-        bytes: Arc::from(tag.as_bytes()),
+        bytes: Vec::from(tag.as_bytes()),
     }
 }
 
@@ -235,14 +248,14 @@ fn hard(term: u64, commit: u64) -> HardState {
 fn updates_are_read_back_and_survive_reopening() {
     let file = sim(1);
     let mut models = Models::new();
-    let log = Log::create(Arc::clone(&file), config(16, 8), ID).unwrap();
+    let log = Log::create(file, config(16, 8), ID).unwrap();
     let a = Update {
         entries: Some(entries(1, &[1, 1, 1, 2, 2])),
         hard_state: Some(hard(2, 3)),
         proposals: vec![Proposal {
             index: 7,
             term: 2,
-            bytes: Arc::from(&b"fast"[..]),
+            bytes: Vec::from(&b"fast"[..]),
         }],
         ..Update::default()
     };
@@ -267,8 +280,8 @@ fn updates_are_read_back_and_survive_reopening() {
     ));
     // One entry at least, however small the byte budget.
     assert_eq!(log.entries(1, 1, 6, 0).unwrap().len(), 1);
-    drop(log);
-    let (log, recovery) = Log::open(Arc::clone(&file), config(16, 8), ID).unwrap();
+    let file = closed(log);
+    let (log, recovery) = Log::open(file, config(16, 8), ID).unwrap();
     assert!(recovery.damaged.is_empty());
     check(&log, &models);
     assert_eq!(
@@ -282,8 +295,8 @@ fn updates_are_read_back_and_survive_reopening() {
 fn conflicts_replace_the_suffix_and_starts_drop_the_prefix() {
     let file = sim(2);
     let mut models = Models::new();
-    let log = Log::create(Arc::clone(&file), config(16, 8), ID).unwrap();
-    let run = |log: &Log<Arc<SimFile>>, models: &mut Models, u: Update| {
+    let log = Log::create(file, config(16, 8), ID).unwrap();
+    let run = |log: &Log<SimFile>, models: &mut Models, u: Update| {
         log.write(7, u.clone()).unwrap();
         apply(models, 7, &u);
     };
@@ -311,7 +324,7 @@ fn conflicts_replace_the_suffix_and_starts_drop_the_prefix() {
             proposals: vec![Proposal {
                 index: 10,
                 term: 2,
-                bytes: Arc::from(&b"p"[..]),
+                bytes: Vec::from(&b"p"[..]),
             }],
             ..Update::default()
         },
@@ -346,8 +359,8 @@ fn conflicts_replace_the_suffix_and_starts_drop_the_prefix() {
         },
     );
     check(&log, &models);
-    drop(log);
-    let (log, _) = Log::open(Arc::clone(&file), config(16, 8), ID).unwrap();
+    let file = closed(log);
+    let (log, _) = Log::open(file, config(16, 8), ID).unwrap();
     check(&log, &models);
 }
 
@@ -357,7 +370,7 @@ fn invalid_updates_are_refused_and_change_nothing() {
     let mut small = config(16, 8);
     small.max_groups = 2;
     small.group_entries = 4;
-    let log = Log::create(Arc::clone(&file), small, ID).unwrap();
+    let log = Log::create(file, small, ID).unwrap();
     log.write(
         1,
         Update {
@@ -379,7 +392,7 @@ fn invalid_updates_are_refused_and_change_nothing() {
             proposals: vec![Proposal {
                 index: 2,
                 term: 1,
-                bytes: Arc::from(&b"x"[..]),
+                bytes: Vec::from(&b"x"[..]),
             }],
             ..Update::default()
         }),
@@ -431,7 +444,7 @@ fn invalid_updates_are_refused_and_change_nothing() {
         first: 3,
         entries: vec![Entry {
             term: 1,
-            bytes: Arc::from(vec![0u8; 16 * BLOCK]),
+            bytes: Vec::from(vec![0u8; 16 * BLOCK]),
         }],
     };
     assert!(matches!(
@@ -448,7 +461,7 @@ fn invalid_updates_are_refused_and_change_nothing() {
 #[test]
 fn a_removed_group_leaves_nothing_behind() {
     let file = sim(4);
-    let log = Log::create(Arc::clone(&file), config(16, 8), ID).unwrap();
+    let log = Log::create(file, config(16, 8), ID).unwrap();
     log.write(
         5,
         Update {
@@ -467,8 +480,8 @@ fn a_removed_group_leaves_nothing_behind() {
     )
     .unwrap();
     assert_eq!(log.view(5).unwrap(), None);
-    drop(log);
-    let (log, _) = Log::open(Arc::clone(&file), config(16, 8), ID).unwrap();
+    let file = closed(log);
+    let (log, _) = Log::open(file, config(16, 8), ID).unwrap();
     assert_eq!(log.view(5).unwrap(), None);
     assert!(log.groups().unwrap().is_empty());
 }
@@ -481,7 +494,7 @@ fn reclaiming_segments_keeps_every_live_record() {
     let file = sim(5);
     let cfg = config(8, 6);
     let mut models = Models::new();
-    let log = Log::create(Arc::clone(&file), cfg, ID).unwrap();
+    let log = Log::create(file, cfg, ID).unwrap();
     for round in 0..400u64 {
         for group in 0..6u128 {
             let m = models.entry(group).or_default().clone();
@@ -509,24 +522,24 @@ fn reclaiming_segments_keeps_every_live_record() {
         }
     }
     check(&log, &models);
-    drop(log);
-    let (log, recovery) = Log::open(Arc::clone(&file), cfg, ID).unwrap();
+    let file = closed(log);
+    let (log, recovery) = Log::open(file, cfg, ID).unwrap();
     assert!(recovery.damaged.is_empty());
     check(&log, &models);
     // The file never grew past its quota.
-    let len = hyper_block::block::BlockFile::len(&file).unwrap();
+    let len = hyper_block::block::BlockFile::len(&closed(log)).unwrap();
     assert!(len <= cfg.segment_bytes * u64::from(cfg.max_segments));
 }
 
 #[test]
 fn many_submitters_share_flushes() {
     let file = sim(6);
-    let log = Arc::new(Log::create(Arc::clone(&file), config(64, 8), ID).unwrap());
-    let before = file.stats().unwrap().syncs;
-    let threads: Vec<_> = (0..16u128)
-        .map(|group| {
-            let log = Arc::clone(&log);
-            std::thread::spawn(move || {
+    let log = Log::create(file, config(64, 8), ID).unwrap();
+    let before = log.with_file(|f| f.stats().unwrap().syncs).unwrap();
+    std::thread::scope(|s| {
+        for group in 0..16u128 {
+            let log = &log;
+            s.spawn(move || {
                 for i in 1..=20u64 {
                     loop {
                         let u = Update {
@@ -540,13 +553,10 @@ fn many_submitters_share_flushes() {
                         }
                     }
                 }
-            })
-        })
-        .collect();
-    for t in threads {
-        t.join().unwrap();
-    }
-    let syncs = file.stats().unwrap().syncs - before;
+            });
+        }
+    });
+    let syncs = log.with_file(|f| f.stats().unwrap().syncs).unwrap() - before;
     for group in 0..16u128 {
         assert_eq!(log.view(group).unwrap().unwrap().last, 20);
     }
@@ -560,11 +570,11 @@ fn waiting_submitters_are_never_refused() {
     let file = sim(11);
     let mut cfg = config(64, 8);
     cfg.queue_submissions = 1;
-    let log = Arc::new(Log::create(Arc::clone(&file), cfg, ID).unwrap());
-    let threads: Vec<_> = (0..8u128)
-        .map(|group| {
-            let log = Arc::clone(&log);
-            std::thread::spawn(move || {
+    let log = Log::create(file, cfg, ID).unwrap();
+    std::thread::scope(|s| {
+        for group in 0..8u128 {
+            let log = &log;
+            s.spawn(move || {
                 for i in 1..=20u64 {
                     let u = Update {
                         entries: Some(entries(i, &[1])),
@@ -572,12 +582,9 @@ fn waiting_submitters_are_never_refused() {
                     };
                     log.write_waiting(group, u).unwrap();
                 }
-            })
-        })
-        .collect();
-    for t in threads {
-        t.join().unwrap();
-    }
+            });
+        }
+    });
     for group in 0..8u128 {
         assert_eq!(log.view(group).unwrap().unwrap().last, 20);
     }
@@ -587,14 +594,15 @@ fn waiting_submitters_are_never_refused() {
 fn a_failed_flush_fences_the_log_and_loses_nothing_acknowledged() {
     let file = sim(7);
     let mut models = Models::new();
-    let log = Log::create(Arc::clone(&file), config(16, 8), ID).unwrap();
+    let log = Log::create(file, config(16, 8), ID).unwrap();
     let u = Update {
         entries: Some(entries(1, &[1, 1])),
         ..Update::default()
     };
     log.write(1, u.clone()).unwrap();
     apply(&mut models, 1, &u);
-    file.inject(Fault::SyncError).unwrap();
+    log.with_file(|f| f.inject(Fault::SyncError).unwrap())
+        .unwrap();
     let lost = Update {
         entries: Some(entries(3, &[1])),
         ..Update::default()
@@ -605,10 +613,10 @@ fn a_failed_flush_fences_the_log_and_loses_nothing_acknowledged() {
         log.submit(1, Update::default()),
         Err(LogError::Fenced)
     ));
-    drop(log);
+    let file = closed(log);
     file.crash(Crash::LoseAll).unwrap();
     file.clear_faults().unwrap();
-    let (log, recovery) = Log::open(Arc::clone(&file), config(16, 8), ID).unwrap();
+    let (log, recovery) = Log::open(file, config(16, 8), ID).unwrap();
     // Whatever of the lost frame's persist record the failed flush left durable, the frame
     // was never confirmed: it is the torn tail, and it held no term or vote to keep.
     assert!(recovery.restored.is_empty());
@@ -618,7 +626,7 @@ fn a_failed_flush_fences_the_log_and_loses_nothing_acknowledged() {
 #[test]
 fn damage_to_an_acknowledged_frame_is_reported() {
     let file = sim(8);
-    let log = Log::create(Arc::clone(&file), config(16, 8), ID).unwrap();
+    let log = Log::create(file, config(16, 8), ID).unwrap();
     for i in 1..=4u64 {
         log.write(
             1,
@@ -629,7 +637,7 @@ fn damage_to_an_acknowledged_frame_is_reported() {
         )
         .unwrap();
     }
-    drop(log);
+    let file = closed(log);
     // The second frame, just after the segment header and the empty first frame, in segment
     // 0, which follows the persist area of one segment's length.
     let second = AREA + 2 * BLOCK as u64 + 70;
@@ -640,7 +648,7 @@ fn damage_to_an_acknowledged_frame_is_reported() {
     })
     .unwrap();
     assert!(matches!(
-        Log::open(Arc::clone(&file), config(16, 8), ID),
+        Log::open(file, config(16, 8), ID),
         Err(LogError::Damaged(_))
     ));
 }
@@ -656,7 +664,7 @@ fn damage_to_the_last_acknowledged_frame_is_restored_from_its_persist_record() {
     for field in [0u64, 8, 40, 64, 70, 120] {
         let file = sim(30 + field);
         let cfg = config(16, 8);
-        let log = Log::create(Arc::clone(&file), cfg, ID).unwrap();
+        let log = Log::create(file, cfg, ID).unwrap();
         for i in 1..=3u64 {
             log.write(
                 1,
@@ -687,7 +695,7 @@ fn damage_to_the_last_acknowledged_frame_is_restored_from_its_persist_record() {
             },
         )
         .unwrap();
-        drop(log);
+        let mut file = closed(log);
         // Frames of one block each: the empty first frame, then one an update.
         file.inject(Fault::BitFlip {
             offset: AREA + 5 * BLOCK as u64 + field,
@@ -696,7 +704,7 @@ fn damage_to_the_last_acknowledged_frame_is_restored_from_its_persist_record() {
         })
         .unwrap();
         for reopening in 0..2 {
-            let (log, recovery) = Log::open(Arc::clone(&file), cfg, ID).unwrap();
+            let (log, recovery) = Log::open(file, cfg, ID).unwrap();
             let view = log.view(1).unwrap().unwrap();
             assert_eq!(
                 view.hard_state,
@@ -709,8 +717,9 @@ fn damage_to_the_last_acknowledged_frame_is_restored_from_its_persist_record() {
             if reopening == 0 {
                 assert_eq!(recovery.restored, vec![1]);
             }
+            file = closed(log);
         }
-        let (log, _) = Log::open(Arc::clone(&file), cfg, ID).unwrap();
+        let (log, _) = Log::open(file, cfg, ID).unwrap();
         log.write(
             1,
             Update {
@@ -720,8 +729,8 @@ fn damage_to_the_last_acknowledged_frame_is_restored_from_its_persist_record() {
         )
         .unwrap();
         assert_eq!(log.view(1).unwrap().unwrap().uncertain, None);
-        drop(log);
-        let (log, recovery) = Log::open(Arc::clone(&file), cfg, ID).unwrap();
+        let file = closed(log);
+        let (log, recovery) = Log::open(file, cfg, ID).unwrap();
         assert_eq!(recovery.restored, Vec::<u128>::new());
         let view = log.view(1).unwrap().unwrap();
         assert_eq!(
@@ -739,8 +748,8 @@ fn damage_to_the_last_acknowledged_frame_is_restored_from_its_persist_record() {
 fn a_lost_frame_with_proposals_leaves_its_group_damaged_until_removed() {
     let file = sim(41);
     let cfg = config(16, 8);
-    let gated = Gated::new(Arc::clone(&file));
-    let log = Log::create(Arc::clone(&gated), cfg, ID).unwrap();
+    let (device, gated) = held(file);
+    let log = Log::create(device, cfg, ID).unwrap();
     for group in [1, 2] {
         log.write(
             group,
@@ -752,7 +761,8 @@ fn a_lost_frame_with_proposals_leaves_its_group_damaged_until_removed() {
         .unwrap();
     }
     // Both groups' next updates go in one frame: the writer is held in a flush meanwhile.
-    let shut = gated.shut();
+    gated.hold();
+    let shut = gated.released();
     let plug = log
         .submit(
             3,
@@ -775,7 +785,7 @@ fn a_lost_frame_with_proposals_leaves_its_group_damaged_until_removed() {
                 proposals: vec![Proposal {
                     index: 5,
                     term: 2,
-                    bytes: Arc::from(&b"p"[..]),
+                    bytes: Vec::from(&b"p"[..]),
                 }],
                 ..Update::default()
             },
@@ -800,7 +810,7 @@ fn a_lost_frame_with_proposals_leaves_its_group_damaged_until_removed() {
     plug.wait().unwrap();
     with_proposal.wait().unwrap();
     other.wait().unwrap();
-    drop(log);
+    let mut file = closed(log).into_inner();
     // That frame, the last, is damaged at rest.
     let image = file.durable_image().unwrap();
     let last = valid_frames(&image)
@@ -816,7 +826,7 @@ fn a_lost_frame_with_proposals_leaves_its_group_damaged_until_removed() {
     // The group stays damaged across restarts, and another group's writes between them,
     // until it is removed (audit S16).
     for reopening in 0..3 {
-        let (log, recovery) = Log::open(Arc::clone(&file), cfg, ID).unwrap();
+        let (log, recovery) = Log::open(file, cfg, ID).unwrap();
         assert_eq!(recovery.damaged, vec![1], "reopening {reopening}");
         if reopening == 0 {
             assert_eq!(recovery.restored, vec![2]);
@@ -838,8 +848,9 @@ fn a_lost_frame_with_proposals_leaves_its_group_damaged_until_removed() {
             )
             .unwrap();
         }
+        file = closed(log);
     }
-    let (log, _) = Log::open(Arc::clone(&file), cfg, ID).unwrap();
+    let (log, _) = Log::open(file, cfg, ID).unwrap();
     log.write(
         1,
         Update {
@@ -862,9 +873,9 @@ fn a_lost_frame_with_proposals_leaves_its_group_damaged_until_removed() {
 
 /// A log whose last frame, acknowledged, held group 1's proposal and no longer reads: group
 /// 1 is damaged when the log next opens.
-fn damaged_group_one(seed: u64, cfg: Config) -> Arc<SimFile> {
+fn damaged_group_one(seed: u64, cfg: Config) -> SimFile {
     let file = sim(seed);
-    let log = Log::create(Arc::clone(&file), cfg, ID).unwrap();
+    let log = Log::create(file, cfg, ID).unwrap();
     log.write(
         1,
         Update {
@@ -884,13 +895,13 @@ fn damaged_group_one(seed: u64, cfg: Config) -> Arc<SimFile> {
             proposals: vec![Proposal {
                 index: 2,
                 term: 2,
-                bytes: Arc::from(&b"p"[..]),
+                bytes: Vec::from(&b"p"[..]),
             }],
             ..Update::default()
         },
     )
     .unwrap();
-    drop(log);
+    let file = closed(log);
     // The damage is written to the medium, so that it outlasts a test's clearing of faults.
     let image = file.durable_image().unwrap();
     let last = valid_frames(&image)
@@ -913,7 +924,7 @@ fn damaged_group_one(seed: u64, cfg: Config) -> Arc<SimFile> {
 fn a_damaged_groups_fence_survives_reclaiming_its_segment() {
     let cfg = config(8, 6);
     let file = damaged_group_one(46, cfg);
-    let (log, recovery) = Log::open(Arc::clone(&file), cfg, ID).unwrap();
+    let (log, recovery) = Log::open(file, cfg, ID).unwrap();
     assert_eq!(recovery.damaged, vec![1]);
     let segments = u64::from(cfg.max_segments);
     let per_segment = cfg.segment_bytes / BLOCK as u64;
@@ -932,8 +943,8 @@ fn a_damaged_groups_fence_survives_reclaiming_its_segment() {
         .unwrap();
     }
     assert!(matches!(log.view(1), Err(LogError::Damaged(_))));
-    drop(log);
-    let (log, recovery) = Log::open(Arc::clone(&file), cfg, ID).unwrap();
+    let file = closed(log);
+    let (log, recovery) = Log::open(file, cfg, ID).unwrap();
     assert_eq!(recovery.damaged, vec![1]);
     assert!(matches!(log.view(1), Err(LogError::Damaged(_))));
 }
@@ -947,18 +958,18 @@ fn power_lost_while_fencing_a_damaged_group_leaves_it_damaged() {
         for seed in 0..4 {
             let file = damaged_group_one(47 + seed, cfg);
             file.inject(Fault::PowerCut { ops }).unwrap();
-            drop(Log::open(Arc::clone(&file), cfg, ID));
+            let file = opened_or_not(Log::try_open(file, cfg, ID));
             file.crash(Crash::Random).unwrap();
             file.clear_faults().unwrap();
-            let (log, recovery) = Log::open(Arc::clone(&file), cfg, ID).unwrap();
+            let (log, recovery) = Log::open(file, cfg, ID).unwrap();
             assert_eq!(
                 recovery.damaged,
                 vec![1],
                 "power cut after {ops} operations"
             );
             assert!(matches!(log.view(1), Err(LogError::Damaged(_))));
-            drop(log);
-            let (_, recovery) = Log::open(Arc::clone(&file), cfg, ID).unwrap();
+            let file = closed(log);
+            let (_, recovery) = Log::open(file, cfg, ID).unwrap();
             assert_eq!(recovery.damaged, vec![1], "reopened after {ops} operations");
         }
     }
@@ -970,7 +981,7 @@ fn power_lost_while_fencing_a_damaged_group_leaves_it_damaged() {
 fn an_uncertainty_mark_survives_reclaiming_its_segment() {
     let file = sim(42);
     let cfg = config(8, 6);
-    let log = Log::create(Arc::clone(&file), cfg, ID).unwrap();
+    let log = Log::create(file, cfg, ID).unwrap();
     log.write(
         1,
         Update {
@@ -992,7 +1003,7 @@ fn an_uncertainty_mark_survives_reclaiming_its_segment() {
         },
     )
     .unwrap();
-    drop(log);
+    let file = closed(log);
     let image = file.durable_image().unwrap();
     let last = valid_frames(&image)
         .into_iter()
@@ -1004,7 +1015,7 @@ fn an_uncertainty_mark_survives_reclaiming_its_segment() {
         stored: true,
     })
     .unwrap();
-    let (log, recovery) = Log::open(Arc::clone(&file), cfg, ID).unwrap();
+    let (log, recovery) = Log::open(file, cfg, ID).unwrap();
     assert_eq!(recovery.restored, vec![1]);
     let mark = Some(Start { index: 3, term: 2 });
     assert_eq!(log.view(1).unwrap().unwrap().uncertain, mark);
@@ -1027,8 +1038,8 @@ fn an_uncertainty_mark_survives_reclaiming_its_segment() {
         .unwrap();
     }
     assert_eq!(log.view(1).unwrap().unwrap().uncertain, mark);
-    drop(log);
-    let (log, _) = Log::open(Arc::clone(&file), cfg, ID).unwrap();
+    let file = closed(log);
+    let (log, _) = Log::open(file, cfg, ID).unwrap();
     assert_eq!(log.view(1).unwrap().unwrap().uncertain, mark);
 }
 
@@ -1040,7 +1051,7 @@ fn an_uncertainty_mark_survives_reclaiming_its_segment() {
 fn an_unconfirmed_torn_frame_keeps_only_its_term_and_vote() {
     let file = sim(43);
     let cfg = config(16, 8);
-    let log = Log::create(Arc::clone(&file), cfg, ID).unwrap();
+    let log = Log::create(file, cfg, ID).unwrap();
     log.write(
         1,
         Update {
@@ -1056,7 +1067,8 @@ fn an_unconfirmed_torn_frame_keeps_only_its_term_and_vote() {
     .unwrap();
     // The next frame's writes, frame and persist record, reach the device; its flush fails,
     // and every written sector survives the crash.
-    file.inject(Fault::PowerCut { ops: 2 }).unwrap();
+    log.with_file(|f| f.inject(Fault::PowerCut { ops: 2 }).unwrap())
+        .unwrap();
     let voted = HardState {
         term: 4,
         vote: 3,
@@ -1073,7 +1085,7 @@ fn an_unconfirmed_torn_frame_keeps_only_its_term_and_vote() {
         ),
         Err(LogError::Fenced)
     ));
-    drop(log);
+    let file = closed(log);
     file.crash(Crash::KeepAll).unwrap();
     file.clear_faults().unwrap();
     // The frame tears: its payload no longer reads.
@@ -1089,7 +1101,7 @@ fn an_unconfirmed_torn_frame_keeps_only_its_term_and_vote() {
         stored: true,
     })
     .unwrap();
-    let (log, recovery) = Log::open(Arc::clone(&file), cfg, ID).unwrap();
+    let (log, recovery) = Log::open(file, cfg, ID).unwrap();
     assert_eq!((recovery.restored, recovery.damaged), (vec![1], vec![]));
     let view = log.view(1).unwrap().unwrap();
     assert_eq!(view.last, 1);
@@ -1115,7 +1127,7 @@ fn an_update_is_answered_only_once_its_frame_is_confirmed() {
     for confirmed in [false, true] {
         let file = sim(45);
         let cfg = config(16, 8);
-        let log = Log::create(Arc::clone(&file), cfg, ID).unwrap();
+        let log = Log::create(file, cfg, ID).unwrap();
         log.write(
             1,
             Update {
@@ -1141,15 +1153,16 @@ fn an_update_is_answered_only_once_its_frame_is_confirmed() {
         };
         if confirmed {
             log.write(1, second).unwrap();
-            file.crash(Crash::LoseAll).unwrap();
+            log.with_file(|f| f.crash(Crash::LoseAll).unwrap()).unwrap();
         } else {
             // The frame's write, its persist record's and the flush succeed; the confirmation's
             // write does not.
-            file.inject(Fault::PowerCut { ops: 3 }).unwrap();
+            log.with_file(|f| f.inject(Fault::PowerCut { ops: 3 }).unwrap())
+                .unwrap();
             assert!(matches!(log.write(1, second), Err(LogError::Fenced)));
-            file.crash(Crash::KeepAll).unwrap();
+            log.with_file(|f| f.crash(Crash::KeepAll).unwrap()).unwrap();
         }
-        drop(log);
+        let file = closed(log);
         file.clear_faults().unwrap();
         let image = file.durable_image().unwrap();
         let last = valid_frames(&image)
@@ -1163,7 +1176,7 @@ fn an_update_is_answered_only_once_its_frame_is_confirmed() {
             stored: true,
         })
         .unwrap();
-        let (log, recovery) = Log::open(Arc::clone(&file), cfg, ID).unwrap();
+        let (log, recovery) = Log::open(file, cfg, ID).unwrap();
         assert_eq!((recovery.restored, recovery.damaged), (vec![1], vec![]));
         let view = log.view(1).unwrap().unwrap();
         assert_eq!(view.last, 1, "confirmed {confirmed}");
@@ -1185,7 +1198,7 @@ fn an_update_is_answered_only_once_its_frame_is_confirmed() {
 fn a_torn_frame_without_its_persist_record_is_the_torn_tail() {
     let file = sim(40);
     let cfg = config(16, 8);
-    let log = Log::create(Arc::clone(&file), cfg, ID).unwrap();
+    let log = Log::create(file, cfg, ID).unwrap();
     log.write(
         1,
         Update {
@@ -1194,7 +1207,8 @@ fn a_torn_frame_without_its_persist_record_is_the_torn_tail() {
         },
     )
     .unwrap();
-    file.inject(Fault::PowerCut { ops: 1 }).unwrap();
+    log.with_file(|f| f.inject(Fault::PowerCut { ops: 1 }).unwrap())
+        .unwrap();
     assert!(matches!(
         log.write(
             1,
@@ -1205,7 +1219,7 @@ fn a_torn_frame_without_its_persist_record_is_the_torn_tail() {
         ),
         Err(LogError::Fenced)
     ));
-    drop(log);
+    let file = closed(log);
     file.crash(Crash::KeepAll).unwrap();
     file.clear_faults().unwrap();
     let image = file.durable_image().unwrap();
@@ -1219,7 +1233,7 @@ fn a_torn_frame_without_its_persist_record_is_the_torn_tail() {
         "the frame's persist record reached the disk"
     );
     damage(&file, torn.0 + 70);
-    let (log, recovery) = Log::open(Arc::clone(&file), cfg, ID).unwrap();
+    let (log, recovery) = Log::open(file, cfg, ID).unwrap();
     assert_eq!(recovery.restored, Vec::<u128>::new());
     let view = log.view(1).unwrap().unwrap();
     assert_eq!((view.last, view.uncertain), (1, None));
@@ -1234,7 +1248,7 @@ fn damage_to_any_field_of_an_acknowledged_frame_is_reported() {
     // sequence, tail, payload length, record count, CRC; then the payload.
     for field in [0u64, 4, 5, 8, 24, 32, 40, 48, 56, 60, 64, 70] {
         let file = sim(10 + field);
-        let log = Log::create(Arc::clone(&file), config(16, 8), ID).unwrap();
+        let log = Log::create(file, config(16, 8), ID).unwrap();
         for i in 1..=4u64 {
             log.write(
                 1,
@@ -1245,7 +1259,7 @@ fn damage_to_any_field_of_an_acknowledged_frame_is_reported() {
             )
             .unwrap();
         }
-        drop(log);
+        let file = closed(log);
         // The frame of the first update, after the segment header and the empty first frame.
         file.inject(Fault::BitFlip {
             offset: AREA + 2 * BLOCK as u64 + field,
@@ -1253,7 +1267,7 @@ fn damage_to_any_field_of_an_acknowledged_frame_is_reported() {
             stored: true,
         })
         .unwrap();
-        let opened = Log::open(Arc::clone(&file), config(16, 8), ID);
+        let opened = Log::open(file, config(16, 8), ID);
         assert!(
             matches!(opened, Err(LogError::Damaged(_))),
             "damage at byte {field} of a frame: {:?}",
@@ -1294,9 +1308,9 @@ fn valid_frames(image: &[u8]) -> Vec<(u64, u64, u64)> {
 
 /// A log of one group whose `n` updates each took a frame of one block: segment 0 holds the
 /// empty first frame and updates 1 to 14, and segment 1 the rest.
-fn one_frame_each(seed: u64, n: u64) -> Arc<SimFile> {
+fn one_frame_each(seed: u64, n: u64) -> SimFile {
     let file = sim(seed);
-    let log = Log::create(Arc::clone(&file), config(16, 8), ID).unwrap();
+    let log = Log::create(file, config(16, 8), ID).unwrap();
     for i in 1..=n {
         log.write(
             1,
@@ -1307,7 +1321,7 @@ fn one_frame_each(seed: u64, n: u64) -> Arc<SimFile> {
         )
         .unwrap();
     }
-    drop(log);
+    let file = closed(log);
     let frames = valid_frames(&file.durable_image().unwrap());
     assert_eq!(frames.len() as u64, n + 1, "one frame an update");
     file
@@ -1326,10 +1340,13 @@ fn a_damaged_header_of_the_newest_segment_is_reported() {
     })
     .unwrap();
     let before = file.durable_image().unwrap();
-    assert!(matches!(
-        Log::open(Arc::clone(&file), config(16, 8), ID),
-        Err(LogError::Damaged(_))
-    ));
+    let Err(Refused {
+        error: LogError::Damaged(_),
+        file: Some(file),
+    }) = Log::try_open(file, config(16, 8), ID)
+    else {
+        panic!("the damaged header was not reported");
+    };
     assert!(
         file.durable_image().unwrap() == before,
         "a failed open wrote"
@@ -1348,9 +1365,9 @@ fn an_opening_whose_header_never_became_durable_is_the_torn_tail() {
             b
         })
         .unwrap();
-    hyper_block::block::BlockFile::write_all_at(&*file, zeros.as_slice(), segment).unwrap();
-    hyper_block::block::BlockFile::sync_data(&*file).unwrap();
-    let (log, _) = Log::open(Arc::clone(&file), config(16, 8), ID).unwrap();
+    hyper_block::block::BlockFile::write_all_at(&file, zeros.as_slice(), segment).unwrap();
+    hyper_block::block::BlockFile::sync_data(&file).unwrap();
+    let (log, _) = Log::open(file, config(16, 8), ID).unwrap();
     assert_eq!(log.view(1).unwrap().unwrap().last, 14);
     log.write(
         1,
@@ -1360,8 +1377,8 @@ fn an_opening_whose_header_never_became_durable_is_the_torn_tail() {
         },
     )
     .unwrap();
-    drop(log);
-    let (log, recovery) = Log::open(Arc::clone(&file), config(16, 8), ID).unwrap();
+    let file = closed(log);
+    let (log, recovery) = Log::open(file, config(16, 8), ID).unwrap();
     assert!(recovery.damaged.is_empty());
     assert_eq!(log.view(1).unwrap().unwrap().last, 15);
     assert_eq!(log.term(1, 15).unwrap(), 2);
@@ -1382,7 +1399,7 @@ fn damage_at_the_end_of_a_segment_the_log_went_past_is_reported() {
         .unwrap();
         assert!(
             matches!(
-                Log::open(Arc::clone(&file), config(16, 8), ID),
+                Log::open(file, config(16, 8), ID),
                 Err(LogError::Damaged(_))
             ),
             "damage at byte {field}"
@@ -1398,7 +1415,7 @@ fn stale_frames_in_a_reused_slot_prove_nothing() {
     let file = sim(30);
     let cfg = config(8, 6);
     let segment = cfg.segment_bytes;
-    let log = Log::create(Arc::clone(&file), cfg, ID).unwrap();
+    let log = Log::create(file, cfg, ID).unwrap();
     let mut first = 1u64;
     // Frames of the head's incarnation in a reused slot, stale frames after them, and at
     // least two of the head's own.
@@ -1416,7 +1433,7 @@ fn stale_frames_in_a_reused_slot_prove_nothing() {
         }
         log.write(1, u).unwrap();
         first += 1;
-        let image = file.durable_image().unwrap();
+        let image = log.with_file(|f| f.durable_image().unwrap()).unwrap();
         let headers = segment_headers(&image, segment);
         let (head_at, head) = *headers.iter().max_by_key(|(_, inc)| *inc).unwrap();
         let frames = valid_frames(&image);
@@ -1434,7 +1451,7 @@ fn stale_frames_in_a_reused_slot_prove_nothing() {
             break;
         }
     }
-    drop(log);
+    let file = closed(log);
     let own = found.expect("the head never came to a reused slot with stale frames past it");
     let (last_at, _, last_seq) = *own.iter().max_by_key(|(_, _, seq)| *seq).unwrap();
     let (inner_at, ..) = *own
@@ -1449,10 +1466,10 @@ fn stale_frames_in_a_reused_slot_prove_nothing() {
         let mut b =
             hyper_block::buf::AlignedBuf::zeroed(BLOCK, Alignment::new(BLOCK).unwrap()).unwrap();
         b.extend_from_slice(chunk).unwrap();
-        hyper_block::block::BlockFile::write_all_at(&*torn, b.as_slice(), (i * BLOCK) as u64)
+        hyper_block::block::BlockFile::write_all_at(&torn, b.as_slice(), (i * BLOCK) as u64)
             .unwrap();
     }
-    hyper_block::block::BlockFile::sync_data(&*torn).unwrap();
+    hyper_block::block::BlockFile::sync_data(&torn).unwrap();
 
     file.inject(Fault::BitFlip {
         offset: last_at,
@@ -1460,7 +1477,7 @@ fn stale_frames_in_a_reused_slot_prove_nothing() {
         stored: true,
     })
     .unwrap();
-    let (log, _) = Log::open(Arc::clone(&file), cfg, ID).unwrap();
+    let (log, _) = Log::open(file, cfg, ID).unwrap();
     assert_eq!(log.view(1).unwrap().unwrap().last, first - 2);
     drop(log);
 
@@ -1471,107 +1488,30 @@ fn stale_frames_in_a_reused_slot_prove_nothing() {
     })
     .unwrap();
     assert!(matches!(
-        Log::open(Arc::clone(&torn), cfg, ID),
+        Log::open(torn, cfg, ID),
         Err(LogError::Damaged(_))
     ));
 }
 
-/// A simulated file whose flushes wait while its gate is shut, so a test can hold the writer
-/// in a flush while it queues submissions behind it.
-struct Gated {
-    file: Arc<SimFile>,
-    gate: std::sync::Mutex<(bool, u64)>,
-    changed: std::sync::Condvar,
-}
-
-impl Gated {
-    fn new(file: Arc<SimFile>) -> Arc<Self> {
-        Arc::new(Self {
-            file,
-            gate: std::sync::Mutex::new((true, 0)),
-            changed: std::sync::Condvar::new(),
-        })
-    }
-
-    fn set(&self, open: bool) {
-        self.gate.lock().unwrap().0 = open;
-        self.changed.notify_all();
-    }
-
-    /// Shuts the gate until the guard is dropped, as a failing test's unwinding drops it too,
-    /// so a log dropped after it never waits on a writer held at the gate.
-    fn shut(self: &Arc<Self>) -> Shut {
-        self.set(false);
-        Shut(Arc::clone(self))
-    }
-
-    /// Waits until a flush is held at the shut gate.
-    fn held(&self) {
-        let mut gate = self.gate.lock().unwrap();
-        while gate.1 == 0 {
-            gate = self.changed.wait(gate).unwrap();
-        }
-    }
-}
-
-struct Shut(Arc<Gated>);
-
-impl Drop for Shut {
-    fn drop(&mut self) {
-        self.0.set(true);
-    }
-}
-
-impl hyper_block::block::BlockFile for Gated {
-    fn alignment(&self) -> Alignment {
-        self.file.alignment()
-    }
-
-    fn len(&self) -> Result<u64, hyper_block::DiskError> {
-        hyper_block::block::BlockFile::len(&*self.file)
-    }
-
-    fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> Result<(), hyper_block::DiskError> {
-        self.file.read_exact_at(buf, offset)
-    }
-
-    fn write_all_at(&self, buf: &[u8], offset: u64) -> Result<(), hyper_block::DiskError> {
-        self.file.write_all_at(buf, offset)
-    }
-
-    fn sync_data(&self) -> Result<(), hyper_block::DiskError> {
-        let mut gate = self.gate.lock().unwrap();
-        gate.1 += 1;
-        self.changed.notify_all();
-        while !gate.0 {
-            gate = self.changed.wait(gate).unwrap();
-        }
-        gate.1 -= 1;
-        drop(gate);
-        self.file.sync_data()
-    }
-}
-
 /// A simulated file that counts its reads and the looks at its length.
 struct Counting {
-    file: Arc<SimFile>,
-    reads: std::sync::atomic::AtomicU64,
-    lengths: std::sync::atomic::AtomicU64,
+    file: SimFile,
+    reads: std::cell::Cell<u64>,
+    lengths: std::cell::Cell<u64>,
 }
 
 impl Counting {
-    fn new(file: Arc<SimFile>) -> Arc<Self> {
-        Arc::new(Self {
+    fn new(file: SimFile) -> Self {
+        Self {
             file,
-            reads: std::sync::atomic::AtomicU64::new(0),
-            lengths: std::sync::atomic::AtomicU64::new(0),
-        })
+            reads: std::cell::Cell::new(0),
+            lengths: std::cell::Cell::new(0),
+        }
     }
 
     /// Reads and looks at the length since the last call.
     fn take(&self) -> (u64, u64) {
-        use std::sync::atomic::Ordering::SeqCst;
-        (self.reads.swap(0, SeqCst), self.lengths.swap(0, SeqCst))
+        (self.reads.replace(0), self.lengths.replace(0))
     }
 }
 
@@ -1581,13 +1521,12 @@ impl hyper_block::block::BlockFile for Counting {
     }
 
     fn len(&self) -> Result<u64, hyper_block::DiskError> {
-        self.lengths
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        hyper_block::block::BlockFile::len(&*self.file)
+        self.lengths.set(self.lengths.get() + 1);
+        hyper_block::block::BlockFile::len(&self.file)
     }
 
     fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> Result<(), hyper_block::DiskError> {
-        self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.reads.set(self.reads.get() + 1);
         self.file.read_exact_at(buf, offset)
     }
 
@@ -1609,7 +1548,7 @@ fn opening_reads_each_segment_through_a_window() {
     let counting = Counting::new(sim(41));
     let settings = config(16, 8);
     let mut models = Models::new();
-    let log = Log::create(Arc::clone(&counting), settings, ID).unwrap();
+    let log = Log::create(counting, settings, ID).unwrap();
     for n in 1..=120u64 {
         let u = Update {
             entries: Some(entries(n, &[1])),
@@ -1618,12 +1557,12 @@ fn opening_reads_each_segment_through_a_window() {
         apply(&mut models, 1, &u);
         log.write(1, u).unwrap();
     }
-    drop(log);
-    let len = hyper_block::block::BlockFile::len(&*counting.file).unwrap();
+    let counting = closed(log);
+    let len = hyper_block::block::BlockFile::len(&counting.file).unwrap();
     let segments = (len - AREA).div_ceil(settings.segment_bytes);
     counting.take();
-    let (log, recovery) = Log::open(Arc::clone(&counting), settings, ID).unwrap();
-    let (reads, lengths) = counting.take();
+    let (log, recovery) = Log::open(counting, settings, ID).unwrap();
+    let (reads, lengths) = log.with_file(Counting::take).unwrap();
     // The writer reclaimed the oldest segments as it went; three at least hold one-block
     // frames that the open replays, a block after each segment's header.
     let per_segment = settings.segment_bytes / BLOCK as u64 - 1;
@@ -1653,7 +1592,7 @@ fn entries_not_in_memory_that_lie_together_are_read_at_once() {
         group_cache: 0,
         ..config(16, 8)
     };
-    let log = Log::create(Arc::clone(&counting), settings, ID).unwrap();
+    let log = Log::create(counting, settings, ID).unwrap();
     let terms = vec![1u64; 200];
     log.write(
         1,
@@ -1663,9 +1602,9 @@ fn entries_not_in_memory_that_lie_together_are_read_at_once() {
         },
     )
     .unwrap();
-    counting.take();
+    log.with_file(Counting::take).unwrap();
     let got = log.entries(1, 1, 201, u64::MAX).unwrap();
-    let (reads, _) = counting.take();
+    let (reads, _) = log.with_file(Counting::take).unwrap();
     assert_eq!(got, entries(1, &terms).entries);
     assert_eq!(reads, 1, "{reads} reads for 200 entries written together");
 }
@@ -1674,15 +1613,16 @@ fn entries_not_in_memory_that_lie_together_are_read_at_once() {
 /// one waits for a frame with room and a newer one would fit the frame it missed (audit S02).
 #[test]
 fn a_groups_updates_keep_their_order_when_one_waits_for_room() {
-    let gated = Gated::new(sim(40));
+    let (device, gated) = held(sim(40));
     let cfg = config(4, 8);
-    let log = Log::create(Arc::clone(&gated), cfg, ID).unwrap();
+    let log = Log::create(device, cfg, ID).unwrap();
     let state = |term, vote| HardState {
         term,
         vote,
         commit: 0,
     };
-    let shut = gated.shut();
+    gated.hold();
+    let shut = gated.released();
     let first = log
         .submit(
             3,
@@ -1732,8 +1672,8 @@ fn a_groups_updates_keep_their_order_when_one_waits_for_room() {
         pending.wait().unwrap();
     }
     assert_eq!(log.view(1).unwrap().unwrap().hard_state, Some(state(2, 2)));
-    drop(log);
-    let (log, _) = Log::open(Arc::clone(&gated), cfg, ID).unwrap();
+    let device = closed(log);
+    let (log, _) = Log::open(device, cfg, ID).unwrap();
     assert_eq!(log.view(1).unwrap().unwrap().hard_state, Some(state(2, 2)));
 }
 
@@ -1742,15 +1682,16 @@ fn a_groups_updates_keep_their_order_when_one_waits_for_room() {
 /// at the bound, never after it (audit S03).
 #[test]
 fn the_queue_bounds_every_submission_not_yet_answered() {
-    let gated = Gated::new(sim(41));
+    let (device, gated) = held(sim(41));
     let mut cfg = config(16, 8);
     cfg.queue_submissions = 2;
-    let log = Log::create(Arc::clone(&gated), cfg, ID).unwrap();
+    let log = Log::create(device, cfg, ID).unwrap();
     let small = |term| Update {
         hard_state: Some(hard(term, 0)),
         ..Update::default()
     };
-    let shut = gated.shut();
+    gated.hold();
+    let shut = gated.released();
     let mut pending = vec![log.submit(1, small(1)).unwrap()];
     gated.held();
     // One flush is held: the queue takes one more, from any group, and no third.
@@ -1764,9 +1705,10 @@ fn the_queue_bounds_every_submission_not_yet_answered() {
     // A group holds two submissions at most: the one a frame takes and one for the next.
     let mut cfg = config(16, 8);
     cfg.queue_submissions = 8;
-    let gated = Gated::new(sim(42));
-    let log = Log::create(Arc::clone(&gated), cfg, ID).unwrap();
-    let shut = gated.shut();
+    let (device, gated) = held(sim(42));
+    let log = Log::create(device, cfg, ID).unwrap();
+    gated.hold();
+    let shut = gated.released();
     let mut pending = vec![log.submit(1, small(1)).unwrap()];
     gated.held();
     pending.push(log.submit(1, small(2)).unwrap());
@@ -1792,7 +1734,7 @@ fn sized(first: u64, len: usize) -> Update {
             first,
             entries: vec![Entry {
                 term: 1,
-                bytes: Arc::from(vec![b'x'; len - header]),
+                bytes: Vec::from(vec![b'x'; len - header]),
             }],
         }),
         ..Update::default()
@@ -1811,14 +1753,14 @@ fn charged(len: usize) -> u64 {
 /// though the count bound has room (audit S03).
 #[test]
 fn the_queue_bounds_the_bytes_of_every_submission_not_yet_answered() {
-    let stepped = Stepped::new(sim(43));
+    let (device, stepped) = held(sim(43));
     let cfg = config_now(16, 64);
-    let log = Log::create(Arc::clone(&stepped), cfg, ID).unwrap();
+    let log = Log::create(device, cfg, ID).unwrap();
     let room = log.frame_room().unwrap();
     assert_eq!(log.queue_bytes(), 3 * charged(room));
     let full = |first| sized(first, room);
     stepped.hold();
-    let _released = Released(Arc::clone(&stepped));
+    let _released = stepped.released();
     let mut pending = vec![log.submit(1, full(1)).unwrap()];
     stepped.held();
     // One group floods: its second is taken, and its third refused at its own bound.
@@ -1847,16 +1789,16 @@ fn the_queue_bounds_the_bytes_of_every_submission_not_yet_answered() {
 /// flood of them from many groups fills the byte bound as large ones do (audit S03).
 #[test]
 fn empty_entries_are_charged_their_records() {
-    let stepped = Stepped::new(sim(44));
+    let (device, stepped) = held(sim(44));
     let mut cfg = config_now(16, 64);
     cfg.queue_submissions = 4096;
-    let log = Log::create(Arc::clone(&stepped), cfg, ID).unwrap();
+    let log = Log::create(device, cfg, ID).unwrap();
     let empty = Update {
         entries: Some(Entries {
             first: 1,
             entries: vec![Entry {
                 term: 1,
-                bytes: Arc::from(Vec::new()),
+                bytes: Vec::from(Vec::new()),
             }],
         }),
         ..Update::default()
@@ -1872,7 +1814,7 @@ fn empty_entries_are_charged_their_records() {
     let fit = log.queue_bytes() / cost;
     assert!(fit < cfg.queue_submissions as u64);
     stepped.hold();
-    let _released = Released(Arc::clone(&stepped));
+    let _released = stepped.released();
     let mut pending = vec![log.submit(0, empty.clone()).unwrap()];
     stepped.held();
     let mut group = 1u128;
@@ -1906,13 +1848,13 @@ fn empty_entries_are_charged_their_records() {
 /// frame (docs/design/raft-log.md §3).
 #[test]
 fn an_update_passed_over_for_room_is_written_in_the_next_frame() {
-    let stepped = Stepped::new(sim(45));
+    let (device, stepped) = held(sim(45));
     let cfg = config_now(16, 64);
-    let log = Log::create(Arc::clone(&stepped), cfg, ID).unwrap();
+    let log = Log::create(device, cfg, ID).unwrap();
     let room = log.frame_room().unwrap();
     let (hot, cold) = (room * 45 / 100, room * 60 / 100);
     stepped.hold();
-    let _released = Released(Arc::clone(&stepped));
+    let _released = stepped.released();
     let mut pending = vec![log.submit(9, Update::default()).unwrap()];
     stepped.held();
     // The next frame takes 1's first, holds 1's second behind it, and passes 2 over.
@@ -1949,25 +1891,24 @@ fn latency_traffic_does_not_starve_background_work() {
 }
 
 fn hot_beside_cold(seed: u64, hot_class: Class, cold_class: Class) {
-    let stepped = Stepped::new(sim(seed));
+    let (device, stepped) = held(sim(seed));
     let cfg = config_now(16, 64);
-    let log = Log::create(Arc::clone(&stepped), cfg, ID).unwrap();
+    let log = Log::create(device, cfg, ID).unwrap();
     let room = log.frame_room().unwrap();
     let (hot, cold) = (room * 55 / 100, room * 60 / 100);
     stepped.hold();
-    let _released = Released(Arc::clone(&stepped));
+    let _released = stepped.released();
     let mut pending = vec![log.submit(9, Update::default()).unwrap()];
     stepped.held();
     // A group has one update in a frame at most, so two stand in for a range whose next
     // update arrives for every frame.
     let mut next = [1u64, 1u64];
-    let mut feed =
-        |log: &Log<Arc<Stepped>>, frame: usize, pending: &mut Vec<hyper_log::Pending>| {
-            let g = frame % 2;
-            let update = sized(next[g], hot);
-            pending.push(log.submit_in(g as u128 + 1, hot_class, update).unwrap());
-            next[g] += 1;
-        };
+    let mut feed = |log: &Log<Held>, frame: usize, pending: &mut Vec<hyper_log::Pending>| {
+        let g = frame % 2;
+        let update = sized(next[g], hot);
+        pending.push(log.submit_in(g as u128 + 1, hot_class, update).unwrap());
+        next[g] += 1;
+    };
     feed(&log, 0, &mut pending);
     pending.push(log.submit_in(3, cold_class, sized(1, cold)).unwrap());
     let before = log.flushed().0;
@@ -1997,17 +1938,17 @@ fn hot_beside_cold(seed: u64, hot_class: Class, cold_class: Class) {
 /// the order they came in (docs/design/raft-log.md §3).
 #[test]
 fn a_full_frame_takes_updates_by_class() {
-    let stepped = Stepped::new(sim(47));
-    let log = Log::create(Arc::clone(&stepped), config_now(16, 64), ID).unwrap();
+    let (device, stepped) = held(sim(47));
+    let log = Log::create(device, config_now(16, 64), ID).unwrap();
     let big = log.frame_room().unwrap() * 60 / 100;
     stepped.hold();
-    let _released = Released(Arc::clone(&stepped));
+    let _released = stepped.released();
     let mut pending = vec![log.submit(9, Update::default()).unwrap()];
     stepped.held();
     pending.push(log.submit_in(3, Class::Background, sized(1, big)).unwrap());
     pending.push(log.submit_in(2, Class::Normal, sized(1, big)).unwrap());
     pending.push(log.submit_in(1, Class::Latency, sized(1, big)).unwrap());
-    let written = |log: &Log<Arc<Stepped>>| -> Vec<bool> {
+    let written = |log: &Log<Held>| -> Vec<bool> {
         (1..=3).map(|g| log.view(g).unwrap().is_some()).collect()
     };
     stepped.step();
@@ -2027,11 +1968,11 @@ fn a_full_frame_takes_updates_by_class() {
 /// earlier: it takes the earlier one's place in the order (docs/design/raft-log.md §3).
 #[test]
 fn a_groups_urgent_update_waits_behind_its_own_earlier_one() {
-    let stepped = Stepped::new(sim(48));
-    let log = Log::create(Arc::clone(&stepped), config_now(16, 64), ID).unwrap();
+    let (device, stepped) = held(sim(48));
+    let log = Log::create(device, config_now(16, 64), ID).unwrap();
     let big = log.frame_room().unwrap() * 60 / 100;
     stepped.hold();
-    let _released = Released(Arc::clone(&stepped));
+    let _released = stepped.released();
     let first = log.submit(9, Update::default()).unwrap();
     stepped.held();
     let older = log.submit_in(1, Class::Background, sized(1, big)).unwrap();
@@ -2057,12 +1998,12 @@ fn a_groups_urgent_update_waits_behind_its_own_earlier_one() {
 /// (docs/design/raft-log.md §3).
 #[test]
 fn a_group_just_served_waits_behind_one_that_was_not() {
-    let stepped = Stepped::new(sim(49));
-    let log = Log::create(Arc::clone(&stepped), config_now(16, 64), ID).unwrap();
+    let (device, stepped) = held(sim(49));
+    let log = Log::create(device, config_now(16, 64), ID).unwrap();
     let room = log.frame_room().unwrap();
     let (hot, cold) = (room * 60 / 100, room * 50 / 100);
     stepped.hold();
-    let _released = Released(Arc::clone(&stepped));
+    let _released = stepped.released();
     let mut pending = vec![log.submit(9, Update::default()).unwrap()];
     stepped.held();
     pending.push(log.submit(1, sized(1, hot)).unwrap());
@@ -2094,13 +2035,12 @@ fn a_log_whose_segments_are_all_live_answers_full() {
         (4, 8, 7 << 10),
         (16, 4, 1 << 10),
     ]) {
-        let file = Counting::new(sim(seed));
-        let log = Log::create(Arc::clone(&file), config(blocks, segments), ID).unwrap();
+        let log = Log::create(Counting::new(sim(seed)), config(blocks, segments), ID).unwrap();
         // The answer, or `None` once the writer has gone past what one update takes: one
         // frame, which sweeps at most once, and a sweep reads its segment in two reads at most
         // (raft-log.md §6).
         let write = |update: Update| -> Option<Result<(), LogError>> {
-            file.take();
+            log.with_file(Counting::take).unwrap();
             let pending = log.submit(1, update).unwrap();
             let before = log.flushed().0;
             let mut reads = 0;
@@ -2108,7 +2048,7 @@ fn a_log_whose_segments_are_all_live_answers_full() {
                 if let Some(answer) = pending.poll() {
                     return Some(answer);
                 }
-                reads += file.take().0;
+                reads += log.with_file(Counting::take).unwrap().0;
                 if reads > 2 || log.flushed().0 > before + 2 {
                     return None;
                 }
@@ -2126,7 +2066,7 @@ fn a_log_whose_segments_are_all_live_answers_full() {
                     first: index,
                     entries: vec![Entry {
                         term: 1,
-                        bytes: Arc::from(vec![b'x'; len]),
+                        bytes: Vec::from(vec![b'x'; len]),
                     }],
                 }),
                 ..Update::default()
@@ -2179,7 +2119,7 @@ fn a_full_log_keeps_room_for_the_compaction_it_waits_for() {
             first: index,
             entries: vec![Entry {
                 term: 1,
-                bytes: Arc::from(vec![b'x'; 1 << 10]),
+                bytes: Vec::from(vec![b'x'; 1 << 10]),
             }],
         }),
         ..Update::default()
@@ -2213,7 +2153,7 @@ fn a_reopened_log_sweeps_the_segments_it_recovered() {
     let file = sim(71);
     let settings = config(16, 8);
     let mut models = Models::new();
-    let write = |log: &Log<Arc<SimFile>>, models: &mut Models, n: u64| {
+    let write = |log: &Log<SimFile>, models: &mut Models, n: u64| {
         let u = Update {
             entries: Some(entries(n, &[1])),
             ..Update::default()
@@ -2221,12 +2161,12 @@ fn a_reopened_log_sweeps_the_segments_it_recovered() {
         apply(models, 1, &u);
         log.write(1, u).unwrap();
     };
-    let log = Log::create(Arc::clone(&file), settings, ID).unwrap();
+    let log = Log::create(file, settings, ID).unwrap();
     for n in 1..=100u64 {
         write(&log, &mut models, n);
     }
-    drop(log);
-    let (log, _) = Log::open(Arc::clone(&file), settings, ID).unwrap();
+    let file = closed(log);
+    let (log, _) = Log::open(file, settings, ID).unwrap();
     for n in 101..=200u64 {
         write(&log, &mut models, n);
     }
@@ -2252,7 +2192,7 @@ fn a_full_log_takes_any_frame_once_its_groups_compact() {
                     first,
                     entries: vec![Entry {
                         term: 1,
-                        bytes: Arc::from(vec![fill; size]),
+                        bytes: Vec::from(vec![fill; size]),
                     }],
                 }),
                 ..Update::default()
@@ -2302,18 +2242,23 @@ fn a_full_log_takes_any_frame_once_its_groups_compact() {
 
 #[test]
 fn another_log_or_geometry_is_refused() {
-    let file = sim(9);
-    drop(Log::create(Arc::clone(&file), config(16, 8), ID).unwrap());
+    let file = closed(Log::create(sim(9), config(16, 8), ID).unwrap());
+    let Err(Refused {
+        error: LogError::Foreign(_),
+        file: Some(file),
+    }) = Log::try_open(file, config(16, 8), ID + 1)
+    else {
+        panic!("another log's file was opened");
+    };
+    let Err(Refused {
+        error: LogError::Foreign(_),
+        file: Some(file),
+    }) = Log::try_open(file, config(32, 8), ID)
+    else {
+        panic!("another geometry's file was opened");
+    };
     assert!(matches!(
-        Log::open(Arc::clone(&file), config(16, 8), ID + 1),
-        Err(LogError::Foreign(_))
-    ));
-    assert!(matches!(
-        Log::open(Arc::clone(&file), config(32, 8), ID),
-        Err(LogError::Foreign(_))
-    ));
-    assert!(matches!(
-        Log::create(Arc::clone(&file), config(16, 8), ID),
+        Log::create(file, config(16, 8), ID),
         Err(LogError::Foreign(_))
     ));
     assert!(matches!(
@@ -2325,11 +2270,13 @@ fn another_log_or_geometry_is_refused() {
         segment_bytes: hyper_block::buf::MAX_BUFFER as u64 + BLOCK as u64,
         ..config(16, 8)
     };
-    let untouched = sim(11);
-    assert!(matches!(
-        Log::create(Arc::clone(&untouched), past, ID),
-        Err(LogError::Config(_))
-    ));
+    let Err(Refused {
+        error: LogError::Config(_),
+        file: Some(untouched),
+    }) = Log::try_create(sim(11), past, ID)
+    else {
+        panic!("a segment past a buffer's bound was taken");
+    };
     assert!(untouched.durable_image().unwrap().is_empty());
 }
 
@@ -2440,7 +2387,7 @@ fn update(step: &Step, models: &Models) -> Option<(u128, Update)> {
                 proposals: vec![Proposal {
                     index: m(group).last() + ahead,
                     term: 1,
-                    bytes: Arc::from(&b"fast"[..]),
+                    bytes: Vec::from(&b"fast"[..]),
                 }],
                 ..Update::default()
             },
@@ -2472,12 +2419,13 @@ proptest! {
     ) {
         let file = sim(seed);
         let cfg = config(segment_blocks, max_segments);
-        let mut log = Log::create(Arc::clone(&file), cfg, ID).unwrap();
+        let mut log = Log::create(file, cfg, ID).unwrap();
         let mut models = Models::new();
         let mut cut = false;
         for step in &steps {
             if let Step::Crash { ops } = step {
-                file.inject(Fault::PowerCut { ops: *ops }).unwrap();
+                let ops = *ops;
+                log.with_file(move |f| f.inject(Fault::PowerCut { ops }).unwrap()).unwrap();
                 cut = true;
                 continue;
             }
@@ -2488,11 +2436,11 @@ proptest! {
                     prop_assert!(cut);
                     // Power is gone: crash, reopen, and see whether the update landed, which
                     // it may have wholly or not at all.
-                    drop(log);
+                    let file = closed(log);
                     file.crash(Crash::Random).unwrap();
                     file.clear_faults().unwrap();
                     cut = false;
-                    let (reopened, recovery) = Log::open(Arc::clone(&file), cfg, ID).unwrap();
+                    let (reopened, recovery) = Log::open(file, cfg, ID).unwrap();
                     // A frame whose flush power cut was never confirmed: never damaged.
                     prop_assert!(recovery.damaged.is_empty());
                     let mut landed = models.clone();
@@ -2520,9 +2468,9 @@ proptest! {
                 Err(e) => return Err(TestCaseError::fail(format!("{e}"))),
             }
         }
-        drop(log);
+        let file = closed(log);
         file.clear_faults().unwrap();
-        let (log, recovery) = Log::open(Arc::clone(&file), cfg, ID).unwrap();
+        let (log, recovery) = Log::open(file, cfg, ID).unwrap();
         prop_assert!(recovery.damaged.is_empty());
         check(&log, &models);
     }
@@ -2544,9 +2492,9 @@ proptest! {
         seed in any::<u64>(),
         segment_blocks in 4u64..10,
     ) {
-        let gated = Gated::new(sim(seed));
+        let (device, gated) = held(sim(seed));
         let cfg = config(segment_blocks, 8);
-        let log = Log::create(Arc::clone(&gated), cfg, ID).unwrap();
+        let log = Log::create(device, cfg, ID).unwrap();
         let segment = cfg.segment_bytes as usize;
         let sizes = [16, segment / 4, segment / 2 - 200, segment - 2 * BLOCK];
         let mut models = Models::new();
@@ -2555,7 +2503,8 @@ proptest! {
             ..Update::default()
         };
         for round in &rounds {
-            let shut = gated.shut();
+            gated.hold();
+            let shut = gated.released();
             let plugged = log.submit(99, plug.clone()).unwrap();
             gated.held();
             let mut predicted = models.clone();
@@ -2564,7 +2513,7 @@ proptest! {
                 let Some((group, mut u)) = update(step, &predicted) else { continue };
                 if let Some(e) = &mut u.entries {
                     for x in &mut e.entries {
-                        x.bytes = Arc::from(vec![b'x'; sizes[*size]]);
+                        x.bytes = Vec::from(vec![b'x'; sizes[*size]]);
                     }
                 }
                 apply(&mut predicted, group, &u);
@@ -2595,8 +2544,8 @@ proptest! {
             }
             check(&log, &models);
         }
-        drop(log);
-        let (log, recovery) = Log::open(Arc::clone(&gated), cfg, ID).unwrap();
+        let device = closed(log);
+        let (log, recovery) = Log::open(device, cfg, ID).unwrap();
         prop_assert!(recovery.damaged.is_empty());
         check(&log, &models);
     }
@@ -2619,7 +2568,7 @@ proptest! {
     ) {
         let file = sim(seed);
         let cfg = config(segment_blocks, 64);
-        let log = Log::create(Arc::clone(&file), cfg, ID).unwrap();
+        let log = Log::create(file, cfg, ID).unwrap();
         let mut models = Models::new();
         if held > 0 {
             let u = Update {
@@ -2638,7 +2587,7 @@ proptest! {
                     .iter()
                     .map(|&n| Entry {
                         term: 2,
-                        bytes: Arc::from(vec![b'e'; n]),
+                        bytes: Vec::from(vec![b'e'; n]),
                     })
                     .collect(),
             }),
@@ -2649,7 +2598,7 @@ proptest! {
                 .map(|(i, &n)| Proposal {
                     index: last + 1 + i as u64,
                     term: 2,
-                    bytes: Arc::from(vec![b'p'; n]),
+                    bytes: Vec::from(vec![b'p'; n]),
                 })
                 .collect(),
             ..Update::default()
@@ -2670,9 +2619,23 @@ proptest! {
         }
         apply(&mut models, 1, &update);
         check(&log, &models);
-        drop(log);
-        let (log, _) = Log::open(Arc::clone(&file), cfg, ID).unwrap();
+        let file = closed(log);
+        let (log, _) = Log::open(file, cfg, ID).unwrap();
         check(&log, &models);
+    }
+}
+
+/// Lets `permits` flushes through and holds the next, or, with `None`, lets every flush
+/// through.
+fn permits(holder: &Holder, permits: Option<u64>) {
+    match permits {
+        Some(n) => {
+            holder.hold();
+            for _ in 0..n {
+                holder.allow();
+            }
+        }
+        None => holder.release(),
     }
 }
 
@@ -2697,110 +2660,6 @@ fn damage(file: &SimFile, offset: u64) {
     file.sync_data().unwrap();
 }
 
-#[derive(Default)]
-struct Gates {
-    /// Flushes let through before the next is held; `None` lets every one through.
-    permits: Option<u64>,
-    /// Flushes held now.
-    held: u64,
-    /// Reads overlapping this range are held until released.
-    trap: Option<(u64, u64)>,
-    trapped: u64,
-}
-
-/// A simulated file that lets its flushes through a counted number at a time and holds reads
-/// of a range, so a test can stop the writer at a chosen flush or read.
-struct Gate {
-    file: Arc<SimFile>,
-    state: std::sync::Mutex<Gates>,
-    changed: std::sync::Condvar,
-}
-
-impl Gate {
-    fn new(file: Arc<SimFile>) -> Arc<Self> {
-        Arc::new(Self {
-            file,
-            state: std::sync::Mutex::new(Gates::default()),
-            changed: std::sync::Condvar::new(),
-        })
-    }
-
-    fn permits(&self, permits: Option<u64>) {
-        self.state.lock().unwrap().permits = permits;
-        self.changed.notify_all();
-    }
-
-    /// Waits until a flush is held.
-    fn flush_held(&self) {
-        let mut s = self.state.lock().unwrap();
-        while s.held == 0 {
-            s = self.changed.wait(s).unwrap();
-        }
-    }
-
-    fn trap(&self, from: u64, len: u64) {
-        self.state.lock().unwrap().trap = Some((from, from + len));
-    }
-
-    /// Waits until a read is held.
-    fn read_held(&self) {
-        let mut s = self.state.lock().unwrap();
-        while s.trapped == 0 {
-            s = self.changed.wait(s).unwrap();
-        }
-    }
-
-    fn release(&self) {
-        self.state.lock().unwrap().trap = None;
-        self.changed.notify_all();
-    }
-}
-
-impl hyper_block::block::BlockFile for Gate {
-    fn alignment(&self) -> Alignment {
-        self.file.alignment()
-    }
-
-    fn len(&self) -> Result<u64, hyper_block::DiskError> {
-        hyper_block::block::BlockFile::len(&*self.file)
-    }
-
-    fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> Result<(), hyper_block::DiskError> {
-        let mut s = self.state.lock().unwrap();
-        let end = offset + buf.len() as u64;
-        if s.trap.is_some_and(|(a, b)| offset < b && a < end) {
-            s.trapped += 1;
-            self.changed.notify_all();
-            while s.trap.is_some() {
-                s = self.changed.wait(s).unwrap();
-            }
-        }
-        drop(s);
-        self.file.read_exact_at(buf, offset)
-    }
-
-    fn write_all_at(&self, buf: &[u8], offset: u64) -> Result<(), hyper_block::DiskError> {
-        self.file.write_all_at(buf, offset)
-    }
-
-    fn sync_data(&self) -> Result<(), hyper_block::DiskError> {
-        let mut s = self.state.lock().unwrap();
-        if s.permits == Some(0) {
-            s.held += 1;
-            self.changed.notify_all();
-            while s.permits == Some(0) {
-                s = self.changed.wait(s).unwrap();
-            }
-            s.held -= 1;
-        }
-        if let Some(p) = s.permits.as_mut() {
-            *p -= 1;
-        }
-        drop(s);
-        self.file.sync_data()
-    }
-}
-
 /// A frame confirmed on its own is answered, and the confirmation must outlast the next
 /// frame's persist record, which is written before that frame's flush and may tear: a record
 /// of five groups or more spans two sectors. Power fails at the next frame's flush, the
@@ -2814,10 +2673,9 @@ fn a_confirmation_outlives_a_torn_record_of_the_next_frame() {
         .unwrap()
         .next_multiple_of(BLOCK);
     for seed in 0..64u64 {
-        let file = sim(seed);
-        let gate = Gate::new(Arc::clone(&file));
+        let (device, gate) = held(sim(seed));
         let cfg = config_now(16, 8);
-        let log = Log::create(Arc::clone(&gate), cfg, ID).unwrap();
+        let log = Log::create(device, cfg, ID).unwrap();
         log.write(
             1,
             Update {
@@ -2832,7 +2690,7 @@ fn a_confirmation_outlives_a_torn_record_of_the_next_frame() {
         )
         .unwrap();
         // The second frame's flush passes; the flush of its confirmation is held.
-        gate.permits(Some(1));
+        permits(&gate, Some(1));
         let second = log
             .submit(
                 1,
@@ -2842,7 +2700,7 @@ fn a_confirmation_outlives_a_torn_record_of_the_next_frame() {
                 },
             )
             .unwrap();
-        gate.flush_held();
+        gate.held();
         let others: Vec<_> = (10..16u128)
             .map(|g| {
                 log.submit(
@@ -2861,13 +2719,15 @@ fn a_confirmation_outlives_a_torn_record_of_the_next_frame() {
             .collect();
         // The confirmation's flush succeeds; the third frame's writes, its frame and its
         // record, reach the device, and its flush fails.
-        file.inject(Fault::PowerCut { ops: 3 }).unwrap();
-        gate.permits(None);
+        // The device is held in the confirmation's flush: the fault goes in by the hold's own
+        // channel, before the flush is let through.
+        gate.inject(Fault::PowerCut { ops: 3 });
+        permits(&gate, None);
         second.wait().unwrap();
         for o in others {
             assert!(matches!(o.wait(), Err(LogError::Fenced)));
         }
-        drop(log);
+        let file = closed(log).into_inner();
         file.crash(Crash::Random).unwrap();
         file.clear_faults().unwrap();
         let image = file.durable_image().unwrap();
@@ -2883,7 +2743,7 @@ fn a_confirmation_outlives_a_torn_record_of_the_next_frame() {
         let tore = record.is_none();
         let two = frames.iter().find(|f| f.2 == 2).unwrap();
         damage(&file, two.0 + 70);
-        let (log, recovery) = Log::open(Arc::clone(&file), cfg, ID).unwrap();
+        let (log, recovery) = Log::open(file, cfg, ID).unwrap();
         let at = format!("seed {seed}, record {record:?}");
         // The second frame was answered, so it is restored: its entry cut and marked, the
         // hard state the first frame left, and nothing of the third frame, never answered.
@@ -2923,10 +2783,9 @@ fn a_confirmation_outlives_a_torn_record_of_the_next_frame() {
 /// confirmation will follow, and the batch's, whose room in the queue is given back.
 #[test]
 fn a_commit_that_fails_before_its_frame_answers_every_update() {
-    let file = sim(7);
-    let gate = Gate::new(Arc::clone(&file));
+    let (device, gate) = held(sim(7));
     let cfg = config_now(4, 3);
-    let log = Log::create(Arc::clone(&gate), cfg, ID).unwrap();
+    let log = Log::create(device, cfg, ID).unwrap();
     let state = |term| Update {
         hard_state: Some(HardState {
             term,
@@ -2946,22 +2805,23 @@ fn a_commit_that_fails_before_its_frame_answers_every_update() {
     .unwrap();
     log.write(1, state(1)).unwrap();
     // The next frame opens segment 1 and is held in its flush while another update queues.
-    gate.permits(Some(0));
+    permits(&gate, Some(0));
     let a = log.submit(1, state(2)).unwrap();
-    gate.flush_held();
+    gate.held();
     let b = log.submit(1, state(3)).unwrap();
     // The commit after it sweeps segment 0, whose read is held, and fails.
     let segment_zero = cfg.segment_bytes;
     gate.trap(segment_zero, cfg.segment_bytes);
-    gate.permits(None);
+    permits(&gate, None);
     gate.read_held();
     let d = log.submit(4, state(1)).unwrap();
-    file.inject(Fault::ReadError {
+    // The device is held in the read: the fault goes in by the hold's own channel, before
+    // the read is let through.
+    gate.inject(Fault::ReadError {
         offset: segment_zero,
         len: cfg.segment_bytes,
-    })
-    .unwrap();
-    gate.release();
+    });
+    gate.untrap();
     // Answered after the failed commit, by which time every answer it gives has gone out.
     assert!(matches!(d.wait(), Err(LogError::Fenced)));
     assert!(log.is_fenced());
@@ -2988,9 +2848,8 @@ fn power_lost_while_restoring_a_lost_frame_loses_nothing_acknowledged() {
     let groups = 10..16u128;
     for ops in 0..8 {
         for seed in 0..24u64 {
-            let file = sim(1000 + seed);
-            let gate = Gate::new(Arc::clone(&file));
-            let log = Log::create(Arc::clone(&gate), cfg, ID).unwrap();
+            let (device, gate) = held(sim(1000 + seed));
+            let log = Log::create(device, cfg, ID).unwrap();
             for g in groups.clone() {
                 let voted = HardState {
                     term: 1,
@@ -3008,7 +2867,7 @@ fn power_lost_while_restoring_a_lost_frame_loses_nothing_acknowledged() {
             }
             // One frame, held in its flush, while the six groups queue: the next frame carries
             // all six, so its persist record spans sectors and can tear.
-            gate.permits(Some(0));
+            permits(&gate, Some(0));
             let plug = log
                 .submit(
                     1,
@@ -3018,7 +2877,7 @@ fn power_lost_while_restoring_a_lost_frame_loses_nothing_acknowledged() {
                     },
                 )
                 .unwrap();
-            gate.flush_held();
+            gate.held();
             let pending: Vec<_> = groups
                 .clone()
                 .map(|g| {
@@ -3026,7 +2885,7 @@ fn power_lost_while_restoring_a_lost_frame_loses_nothing_acknowledged() {
                         vec![Proposal {
                             index: 5,
                             term: 2,
-                            bytes: Arc::from(&b"p"[..]),
+                            bytes: Vec::from(&b"p"[..]),
                         }]
                     } else {
                         Vec::new()
@@ -3044,21 +2903,21 @@ fn power_lost_while_restoring_a_lost_frame_loses_nothing_acknowledged() {
                     log.submit(g, u).unwrap()
                 })
                 .collect();
-            gate.permits(None);
+            permits(&gate, None);
             plug.wait().unwrap();
             for p in pending {
                 p.wait().unwrap();
             }
-            drop(log);
+            let file = closed(log).into_inner();
             let frames = valid_frames(&file.durable_image().unwrap());
             let last = frames.iter().max_by_key(|f| f.2).unwrap();
             assert_eq!(last.2, 8, "the six groups share the last frame");
             damage(&file, last.0 + 70);
             file.inject(Fault::PowerCut { ops }).unwrap();
-            drop(Log::open(Arc::clone(&file), cfg, ID));
+            let file = opened_or_not(Log::try_open(file, cfg, ID));
             file.crash(Crash::Random).unwrap();
             file.clear_faults().unwrap();
-            let (log, recovery) = Log::open(Arc::clone(&file), cfg, ID).unwrap();
+            let (log, recovery) = Log::open(file, cfg, ID).unwrap();
             let at = format!("power cut after {ops} operations, seed {seed}");
             assert_eq!(recovery.damaged, vec![15], "{at}: {recovery:?}");
             for g in 10..15u128 {
@@ -3105,7 +2964,7 @@ fn a_torn_opening_over_a_segment_swept_by_a_lost_frame_loses_nothing_unreported(
     for ops in 1..=2u64 {
         for seed in 0..200u64 {
             let file = sim(5000 + seed);
-            let log = Log::create(Arc::clone(&file), cfg, ID).unwrap();
+            let log = Log::create(file, cfg, ID).unwrap();
             // Group 2's entry stays live in segment 0; group 1's hard states die as they go.
             log.write(
                 2,
@@ -3134,7 +2993,7 @@ fn a_torn_opening_over_a_segment_swept_by_a_lost_frame_loses_nothing_unreported(
                         first: 1,
                         entries: vec![Entry {
                             term: 6,
-                            bytes: Arc::from(vec![7u8; 5000]),
+                            bytes: Vec::from(vec![7u8; 5000]),
                         }],
                     }),
                     hard_state: Some(hard(6, 0)),
@@ -3142,7 +3001,7 @@ fn a_torn_opening_over_a_segment_swept_by_a_lost_frame_loses_nothing_unreported(
                 },
             )
             .unwrap();
-            let image = file.durable_image().unwrap();
+            let image = log.with_file(|f| f.durable_image().unwrap()).unwrap();
             let tails = frame_tails(&image);
             let (&swept, &(swept_at, tail)) = tails.iter().next_back().unwrap();
             assert_eq!(swept, 7, "seed {seed}");
@@ -3152,7 +3011,8 @@ fn a_torn_opening_over_a_segment_swept_by_a_lost_frame_loses_nothing_unreported(
             let before = image[slot0 as usize..(slot0 + segment) as usize].to_vec();
             // The next frame opens segment 0 again; power fails after `ops` of its writes. Its
             // sectors differ from what they overwrite, so any of them may tear.
-            file.inject(Fault::PowerCut { ops }).unwrap();
+            log.with_file(move |f| f.inject(Fault::PowerCut { ops }).unwrap())
+                .unwrap();
             assert!(
                 log.write(
                     1,
@@ -3170,7 +3030,7 @@ fn a_torn_opening_over_a_segment_swept_by_a_lost_frame_loses_nothing_unreported(
                 )
                 .is_err()
             );
-            drop(log);
+            let file = closed(log);
             file.crash(Crash::Random).unwrap();
             file.clear_faults().unwrap();
             let image = file.durable_image().unwrap();
@@ -3183,8 +3043,11 @@ fn a_torn_opening_over_a_segment_swept_by_a_lost_frame_loses_nothing_unreported(
             damage(&file, swept_at + 70);
             let at = format!("power cut after {ops} writes, seed {seed}");
             let damaged = file.durable_image().unwrap();
-            match Log::open(Arc::clone(&file), cfg, ID) {
-                Err(LogError::Damaged(why)) => {
+            match Log::try_open(file, cfg, ID) {
+                Err(Refused {
+                    error: LogError::Damaged(why),
+                    file: Some(file),
+                }) => {
                     assert!(!untouched, "{at}: refused with segment 0 intact");
                     // Segment 0's header still reads, and its frames begin with the opening's.
                     unframed += u32::from(why == "a live segment holds no frame");
@@ -3194,7 +3057,7 @@ fn a_torn_opening_over_a_segment_swept_by_a_lost_frame_loses_nothing_unreported(
                     );
                     refused += 1;
                 }
-                Err(e) => panic!("{at}: {e:?}"),
+                Err(refused) => panic!("{at}: {:?}", refused.error),
                 Ok((log, recovery)) => {
                     let two = log.view(2).unwrap();
                     assert!(
@@ -3230,7 +3093,7 @@ fn a_torn_opening_over_a_segment_swept_by_a_lost_frame_loses_nothing_unreported(
 fn a_live_segment_whose_first_frame_no_longer_reads_is_reported() {
     for field in [0u64, 8, 24, 32] {
         let file = sim(60 + field);
-        let log = Log::create(Arc::clone(&file), config(16, 8), ID).unwrap();
+        let log = Log::create(file, config(16, 8), ID).unwrap();
         log.write(
             2,
             Update {
@@ -3249,7 +3112,7 @@ fn a_live_segment_whose_first_frame_no_longer_reads_is_reported() {
             )
             .unwrap();
         }
-        drop(log);
+        let file = closed(log);
         let frames = valid_frames(&file.durable_image().unwrap());
         assert!(
             frames.iter().any(|f| f.1 == 2),
@@ -3262,7 +3125,7 @@ fn a_live_segment_whose_first_frame_no_longer_reads_is_reported() {
             stored: true,
         })
         .unwrap();
-        let opened = Log::open(Arc::clone(&file), config(16, 8), ID);
+        let opened = Log::open(file, config(16, 8), ID);
         assert!(
             matches!(opened, Err(LogError::Damaged(_))),
             "damage at byte {field} of the first frame: {:?}",
@@ -3283,7 +3146,7 @@ fn a_lost_last_frame_before_a_torn_opening_is_restored_while_its_segment_is_swep
     let mut hit = 0;
     for seed in 0..64u64 {
         let file = sim(7000 + seed);
-        let log = Log::create(Arc::clone(&file), cfg, ID).unwrap();
+        let log = Log::create(file, cfg, ID).unwrap();
         // Segment 0 fills, segment 1 opens and fills, and segment 0, dead, is free again.
         for term in 1..=5 {
             log.write(
@@ -3295,7 +3158,7 @@ fn a_lost_last_frame_before_a_torn_opening_is_restored_while_its_segment_is_swep
             )
             .unwrap();
         }
-        let image = file.durable_image().unwrap();
+        let image = log.with_file(|f| f.durable_image().unwrap()).unwrap();
         let tails = frame_tails(&image);
         let (&lost, &(lost_at, _)) = tails.iter().next_back().unwrap();
         assert_eq!(lost, 5, "seed {seed}");
@@ -3305,7 +3168,8 @@ fn a_lost_last_frame_before_a_torn_opening_is_restored_while_its_segment_is_swep
             "the last block of segment 1"
         );
         // The next frame opens segment 0 again, and power fails before its flush.
-        file.inject(Fault::PowerCut { ops: 1 }).unwrap();
+        log.with_file(|f| f.inject(Fault::PowerCut { ops: 1 }).unwrap())
+            .unwrap();
         assert!(
             log.write(
                 1,
@@ -3316,7 +3180,7 @@ fn a_lost_last_frame_before_a_torn_opening_is_restored_while_its_segment_is_swep
             )
             .is_err()
         );
-        drop(log);
+        let file = closed(log);
         file.crash(Crash::Random).unwrap();
         file.clear_faults().unwrap();
         let image = file.durable_image().unwrap();
@@ -3328,16 +3192,15 @@ fn a_lost_last_frame_before_a_torn_opening_is_restored_while_its_segment_is_swep
         hit += 1;
         damage(&file, lost_at + 70);
         let at = format!("seed {seed}");
-        let (log, recovery) =
-            Log::open(Arc::clone(&file), cfg, ID).unwrap_or_else(|e| panic!("{at}: {e:?}"));
+        let (log, recovery) = Log::open(file, cfg, ID).unwrap_or_else(|e| panic!("{at}: {e:?}"));
         assert_eq!(
             (recovery.restored, recovery.damaged),
             (vec![1], vec![]),
             "{at}"
         );
         assert_eq!(log.view(1).unwrap().unwrap().hard_state, Some(hard(5, 0)));
-        drop(log);
-        let (log, _) = Log::open(Arc::clone(&file), cfg, ID).unwrap();
+        let file = closed(log);
+        let (log, _) = Log::open(file, cfg, ID).unwrap();
         assert_eq!(log.view(1).unwrap().unwrap().hard_state, Some(hard(5, 0)));
     }
     assert!(
@@ -3363,18 +3226,19 @@ proptest! {
     ) {
         let file = sim(seed);
         let cfg = config_now(segment_blocks, max_segments);
-        let log = Log::create(Arc::clone(&file), cfg, ID).unwrap();
+        let log = Log::create(file, cfg, ID).unwrap();
         let mut models = Models::new();
         for step in &steps {
             if let Step::Crash { ops } = step {
-                file.inject(Fault::PowerCut { ops: *ops }).unwrap();
+                let ops = *ops;
+                log.with_file(move |f| f.inject(Fault::PowerCut { ops }).unwrap()).unwrap();
                 continue;
             }
             let Some((group, u)) = update(step, &models) else { continue };
             match log.write(group, u.clone()) {
                 Ok(()) => apply(&mut models, group, &u),
                 Err(LogError::Fenced) => {
-                    drop(log);
+                    let file = closed(log);
                     file.crash(Crash::Random).unwrap();
                     file.clear_faults().unwrap();
                     let image = file.durable_image().unwrap();
@@ -3388,7 +3252,7 @@ proptest! {
                         stored: true,
                     })
                     .unwrap();
-                    let (reopened, recovery) = match Log::open(Arc::clone(&file), cfg, ID) {
+                    let (reopened, recovery) = match Log::open(file, cfg, ID) {
                         Err(LogError::Damaged(_)) => return Ok(()),
                         Err(e) => return Err(TestCaseError::fail(format!("{e}"))),
                         Ok(r) => r,
@@ -3442,25 +3306,15 @@ proptest! {
 /// learns of every answer without looking at the others (docs/design/measurement.md §10).
 #[test]
 fn a_waker_is_woken_once_for_each_answer() {
-    struct Ready {
-        index: usize,
-        ready: std::sync::mpsc::SyncSender<usize>,
-    }
-    impl std::task::Wake for Ready {
-        fn wake(self: Arc<Self>) {
-            self.ready.try_send(self.index).unwrap();
-        }
-    }
     const GROUPS: usize = 32;
     let file = sim(23);
-    let log = Log::create(Arc::clone(&file), config(64, 8), ID).unwrap();
+    let log = Log::create(file, config(64, 8), ID).unwrap();
     let (ready, woken) = std::sync::mpsc::sync_channel(GROUPS);
+    let mut slots = Vec::new();
     let mut out: Vec<Option<hyper_log::Pending>> = (0..GROUPS)
         .map(|g| {
-            let waker = std::task::Waker::from(Arc::new(Ready {
-                index: g,
-                ready: ready.clone(),
-            }));
+            let (waker, slot) = hyper_measure::wake::waker(g, ready.clone());
+            slots.push(slot);
             let u = Update {
                 entries: Some(entries(1, &[1])),
                 ..Update::default()
@@ -3477,9 +3331,57 @@ fn a_waker_is_woken_once_for_each_answer() {
         let pending = out[g].take().expect("a waker woken twice");
         pending.poll().unwrap().unwrap();
     }
-    // Every waker went with its submission, and none woke again.
-    assert!(woken.recv().is_err());
     for g in 0..GROUPS {
         assert_eq!(log.view(g as u128).unwrap().unwrap().last, 1);
     }
+    // Every waker went with its submission, and none woke again, before or after the log
+    // closed and dropped whatever it held.
+    drop(log);
+    assert!(woken.try_recv().is_err());
+    for (g, slot) in slots.iter().enumerate() {
+        assert_eq!(slot.wakes(), 1, "waker {g}");
+    }
+}
+
+/// Many submitters, each with a waker, keep updates out across many frames: an answer wakes
+/// its own submitter's waker and no other's, once (mantle note 26 §5.3, note 32 L-2).
+#[test]
+fn a_completion_wakes_only_its_submitter() {
+    const GROUPS: usize = 48;
+    const ROUNDS: usize = 12;
+    let log = Log::create(sim(24), config(64, 8), ID).unwrap();
+    let (ready, woken) = std::sync::mpsc::sync_channel(GROUPS);
+    let wakers: Vec<_> = (0..GROUPS)
+        .map(|g| hyper_measure::wake::waker(g, ready.clone()))
+        .collect();
+    drop(ready);
+    let submit = |g: usize, round: usize| {
+        let u = Update {
+            entries: Some(entries(round as u64 + 1, &[1])),
+            ..Update::default()
+        };
+        log.submit_waking(g as u128, Class::Normal, u, wakers[g].0.clone())
+            .unwrap()
+    };
+    let mut out: Vec<Option<hyper_log::Pending>> =
+        (0..GROUPS).map(|g| Some(submit(g, 0))).collect();
+    let mut answered = vec![0usize; GROUPS];
+    let mut total = 0usize;
+    while total < GROUPS * ROUNDS {
+        let g = woken.recv().unwrap();
+        let pending = out[g].take().expect("woken with no submission out");
+        pending.poll().expect("woken before its answer").unwrap();
+        answered[g] += 1;
+        total += 1;
+        // A waker woken for another's answer would have been woken before its own came.
+        assert_eq!(wakers[g].1.wakes() as usize, answered[g], "waker {g}");
+        if answered[g] < ROUNDS {
+            out[g] = Some(submit(g, answered[g]));
+        }
+    }
+    drop(log);
+    for (g, (_, slot)) in wakers.iter().enumerate() {
+        assert_eq!(slot.wakes() as usize, ROUNDS, "waker {g}");
+    }
+    assert!(woken.try_recv().is_err(), "a wake with no answer");
 }

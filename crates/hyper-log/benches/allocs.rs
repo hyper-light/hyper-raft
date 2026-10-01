@@ -20,7 +20,6 @@
 )]
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
 use hyper_block::buf::Alignment;
 use hyper_block::file::{CachingRequest, DeviceFile};
@@ -59,7 +58,6 @@ fn open(path: &Path) -> DeviceFile {
 }
 
 fn updates(replicas: usize, size: usize, from: u64, rounds: u64) -> Vec<Vec<Update>> {
-    let payload: Arc<[u8]> = Arc::from(vec![0x5a; size]);
     (from..from + rounds)
         .map(|index| {
             (0..replicas)
@@ -68,7 +66,7 @@ fn updates(replicas: usize, size: usize, from: u64, rounds: u64) -> Vec<Vec<Upda
                         first: index,
                         entries: vec![Entry {
                             term: 1,
-                            bytes: Arc::clone(&payload),
+                            bytes: vec![0x5a; size],
                         }],
                     }),
                     ..Update::default()

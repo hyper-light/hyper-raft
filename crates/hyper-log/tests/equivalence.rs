@@ -4,7 +4,7 @@
 //! bytes on the device and gets the same answers as mantle-log at mantle `147f035` did.
 //!
 //! The run is deterministic: every frame's batch is fixed by holding the device in a flush while
-//! the batch's updates are submitted (`common::Stepped`), the writer never waits on the clock
+//! the batch's updates are submitted (`common::held`), the writer never waits on the clock
 //! (`Waits::Never`), and every crash and fault draws from the simulated device's seed. Only the
 //! segment nonces are drawn from the operating system (`raft-log.md` §2), so the image is compared
 //! with each nonce replaced by its segment's incarnation and the checksums over it recomputed
@@ -25,14 +25,13 @@
 )]
 
 use std::fmt::Write as _;
-use std::sync::Arc;
 
 use hyper_block::buf::Alignment;
 use hyper_block::sim::{Crash, Fault, SimFile};
 use hyper_log::{Config, Entries, Entry, HardState, Log, LogError, Proposal, Start, Update, Waits};
 
 mod common;
-use common::{Released, Stepped};
+use common::Holder;
 
 const ID: u128 = 0x6571_7569_7661_6c65_6e63_65;
 const BLOCK: usize = 4096;
@@ -118,7 +117,7 @@ struct Held {
     term: u64,
 }
 
-fn held(log: &Log<Arc<Stepped>>, group: u128) -> Held {
+fn held(log: &Log<common::Held>, group: u128) -> Held {
     match log.view(group) {
         Ok(Some(v)) => Held {
             start: v.start.index,
@@ -164,7 +163,7 @@ fn update(rng: &mut Rng, h: Held, round: u64) -> Update {
         entries: (0..count)
             .map(|_| Entry {
                 term,
-                bytes: Arc::from(bytes(rng, round)),
+                bytes: bytes(rng, round),
             })
             .collect(),
     });
@@ -180,7 +179,7 @@ fn update(rng: &mut Rng, h: Held, round: u64) -> Update {
         u.proposals.push(Proposal {
             index: last.max(first) + 2,
             term,
-            bytes: Arc::from(bytes(rng, round)),
+            bytes: bytes(rng, round),
         });
     }
     u
@@ -207,7 +206,7 @@ fn answer(r: Result<(), LogError>) -> &'static str {
     }
 }
 
-fn views(log: &Log<Arc<Stepped>>, out: &mut String) {
+fn views(log: &Log<common::Held>, out: &mut String) {
     for g in 1..=GROUPS {
         match log.view(u128::from(g)) {
             Ok(Some(v)) => {
@@ -244,14 +243,14 @@ const PLUG: u64 = GROUPS + 1;
 /// One round: a plug update is written alone and held in its flush while the round's updates
 /// are submitted, so they make the next frame together. A plug the log refuses (it is full)
 /// holds nothing, and the round's updates are then written one at a time.
-fn round(log: &Log<Arc<Stepped>>, stepped: &Arc<Stepped>, rng: &mut Rng, n: u64, out: &mut String) {
+fn round(log: &Log<common::Held>, stepped: &Holder, rng: &mut Rng, n: u64, out: &mut String) {
     let mut groups: Vec<u64> = (1..=GROUPS).collect();
     for i in (1..groups.len()).rev() {
         groups.swap(i, rng.below(i as u64 + 1) as usize);
     }
     let k = 1 + rng.below(GROUPS) as usize;
     stepped.hold();
-    let _released = Released(Arc::clone(stepped));
+    let _released = stepped.released();
     let plug = Update {
         hard_state: Some(HardState {
             term: n,
@@ -298,7 +297,7 @@ fn round(log: &Log<Arc<Stepped>>, stepped: &Arc<Stepped>, rng: &mut Rng, n: u64,
 
 /// A round under an armed power cut: one update at a time, since a failed write is never
 /// flushed and a held flush would wait for it forever.
-fn faulty_round(log: &Log<Arc<Stepped>>, rng: &mut Rng, n: u64, out: &mut String) {
+fn faulty_round(log: &Log<common::Held>, rng: &mut Rng, n: u64, out: &mut String) {
     let _ = write!(out, "f{n}");
     for _ in 0..1 + rng.below(3) {
         let g = 1 + rng.below(GROUPS);
@@ -358,23 +357,21 @@ fn last_frame(image: &[u8]) -> Option<u64> {
 
 /// One seed's run: its transcript and its canonical image.
 fn run(seed: u64) -> (String, Vec<u8>) {
-    let file = Arc::new(
-        SimFile::new(
-            Alignment::new(BLOCK).unwrap(),
-            Alignment::new(512).unwrap(),
-            seed,
-        )
-        .unwrap(),
-    );
+    let mut file = SimFile::new(
+        Alignment::new(BLOCK).unwrap(),
+        Alignment::new(512).unwrap(),
+        seed,
+    )
+    .unwrap();
     let mut rng = Rng(seed);
     let mut out = String::new();
     let mut n = 0u64;
     for cycle in 0..CYCLES {
-        let stepped = Stepped::new(Arc::clone(&file));
+        let (device, stepped) = common::held(file);
         let log = if cycle == 0 {
-            Log::create(Arc::clone(&stepped), config(), ID).unwrap()
+            Log::create(device, config(), ID).unwrap()
         } else {
-            match Log::open(Arc::clone(&stepped), config(), ID) {
+            match Log::try_open(device, config(), ID) {
                 Ok((log, r)) => {
                     let _ = writeln!(
                         out,
@@ -383,8 +380,9 @@ fn run(seed: u64) -> (String, Vec<u8>) {
                     );
                     log
                 }
-                Err(e) => {
-                    let _ = writeln!(out, "open refused: {}", answer(Err(e)));
+                Err(refused) => {
+                    let _ = writeln!(out, "open refused: {}", answer(Err(refused.error)));
+                    file = refused.file.unwrap().into_inner();
                     break;
                 }
             }
@@ -394,7 +392,9 @@ fn run(seed: u64) -> (String, Vec<u8>) {
         for r in 0..ROUNDS {
             n += 1;
             if cut == Some(r) {
-                file.inject(Fault::PowerCut { ops: rng.below(12) }).unwrap();
+                let ops = rng.below(12);
+                log.with_file(move |d| d.file().inject(Fault::PowerCut { ops }).unwrap())
+                    .unwrap();
             }
             if cut.is_some_and(|c| r >= c) {
                 faulty_round(&log, &mut rng, n, &mut out);
@@ -402,7 +402,7 @@ fn run(seed: u64) -> (String, Vec<u8>) {
                 round(&log, &stepped, &mut rng, n, &mut out);
             }
         }
-        drop(log);
+        file = log.close().unwrap().into_inner();
         file.crash(Crash::Random).unwrap();
         file.clear_faults().unwrap();
         let image = file.durable_image().unwrap();

@@ -169,7 +169,7 @@
 //! ```rust
 //! # use webpki;
 //! # use std::sync::Arc;
-//! # hyper_tls::crypto::aws_lc_rs::default_provider().install_default();
+//! # hyper_tls::crypto::aws_lc_rs::DEFAULT_PROVIDER.install_default();
 //! # let root_store = hyper_tls::RootCertStore::from_iter(
 //! #  webpki_roots::TLS_SERVER_ROOTS
 //! #      .iter()

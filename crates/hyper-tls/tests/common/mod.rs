@@ -17,7 +17,7 @@ pub fn server_config_builder(
     if exactly_one_provider() {
         hyper_tls::ServerConfig::builder()
     } else {
-        hyper_tls::ServerConfig::builder_with_provider(provider.clone().into())
+        hyper_tls::ServerConfig::builder_with_provider(static_provider(provider.clone()))
             .with_safe_default_protocol_versions()
             .unwrap()
     }
@@ -30,7 +30,7 @@ pub fn server_config_builder_with_versions(
     if exactly_one_provider() {
         hyper_tls::ServerConfig::builder_with_protocol_versions(versions)
     } else {
-        hyper_tls::ServerConfig::builder_with_provider(provider.clone().into())
+        hyper_tls::ServerConfig::builder_with_provider(static_provider(provider.clone()))
             .with_protocol_versions(versions)
             .unwrap()
     }
@@ -44,7 +44,7 @@ pub fn client_config_builder(
     if exactly_one_provider() {
         hyper_tls::ClientConfig::builder()
     } else {
-        hyper_tls::ClientConfig::builder_with_provider(provider.clone().into())
+        hyper_tls::ClientConfig::builder_with_provider(static_provider(provider.clone()))
             .with_safe_default_protocol_versions()
             .unwrap()
     }
@@ -57,7 +57,7 @@ pub fn client_config_builder_with_versions(
     if exactly_one_provider() {
         hyper_tls::ClientConfig::builder_with_protocol_versions(versions)
     } else {
-        hyper_tls::ClientConfig::builder_with_provider(provider.clone().into())
+        hyper_tls::ClientConfig::builder_with_provider(static_provider(provider.clone()))
             .with_protocol_versions(versions)
             .unwrap()
     }
@@ -70,7 +70,7 @@ pub fn webpki_client_verifier_builder(
     if exactly_one_provider() {
         WebPkiClientVerifier::builder(roots)
     } else {
-        WebPkiClientVerifier::builder_with_provider(roots, provider.clone().into())
+        WebPkiClientVerifier::builder_with_provider(roots, provider)
     }
 }
 
@@ -81,7 +81,7 @@ pub fn webpki_server_verifier_builder(
     if exactly_one_provider() {
         WebPkiServerVerifier::builder(roots)
     } else {
-        WebPkiServerVerifier::builder_with_provider(roots, provider.clone().into())
+        WebPkiServerVerifier::builder_with_provider(roots, provider)
     }
 }
 

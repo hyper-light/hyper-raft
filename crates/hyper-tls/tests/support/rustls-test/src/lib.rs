@@ -477,10 +477,18 @@ impl KeyType {
     }
 }
 
+/// A provider borrowed for the life of the process, as configurations take it.
+///
+/// Tests build providers at runtime, so each one is leaked here; a program keeps its provider in a
+/// `static`.
+pub fn static_provider(provider: CryptoProvider) -> &'static CryptoProvider {
+    Box::leak(Box::new(provider))
+}
+
 pub fn server_config_builder(
     provider: &CryptoProvider,
 ) -> rustls::ConfigBuilder<ServerConfig, rustls::WantsVerifier> {
-    ServerConfig::builder_with_provider(provider.clone().into())
+    ServerConfig::builder_with_provider(static_provider(provider.clone()))
         .with_safe_default_protocol_versions()
         .unwrap()
 }
@@ -489,7 +497,7 @@ pub fn server_config_builder_with_versions(
     versions: &[&'static rustls::SupportedProtocolVersion],
     provider: &CryptoProvider,
 ) -> rustls::ConfigBuilder<ServerConfig, rustls::WantsVerifier> {
-    ServerConfig::builder_with_provider(provider.clone().into())
+    ServerConfig::builder_with_provider(static_provider(provider.clone()))
         .with_protocol_versions(versions)
         .unwrap()
 }
@@ -497,7 +505,7 @@ pub fn server_config_builder_with_versions(
 pub fn client_config_builder(
     provider: &CryptoProvider,
 ) -> rustls::ConfigBuilder<ClientConfig, rustls::WantsVerifier> {
-    ClientConfig::builder_with_provider(provider.clone().into())
+    ClientConfig::builder_with_provider(static_provider(provider.clone()))
         .with_safe_default_protocol_versions()
         .unwrap()
 }
@@ -506,7 +514,7 @@ pub fn client_config_builder_with_versions(
     versions: &[&'static rustls::SupportedProtocolVersion],
     provider: &CryptoProvider,
 ) -> rustls::ConfigBuilder<ClientConfig, rustls::WantsVerifier> {
-    ClientConfig::builder_with_provider(provider.clone().into())
+    ClientConfig::builder_with_provider(static_provider(provider.clone()))
         .with_protocol_versions(versions)
         .unwrap()
 }
@@ -539,13 +547,10 @@ pub fn make_server_config_with_kx_groups(
 ) -> ServerConfig {
     finish_server_config(
         kt,
-        ServerConfig::builder_with_provider(
-            CryptoProvider {
-                kx_groups,
-                ..provider.clone()
-            }
-            .into(),
-        )
+        ServerConfig::builder_with_provider(static_provider(CryptoProvider {
+            kx_groups,
+            ..provider.clone()
+        }))
         .with_safe_default_protocol_versions()
         .unwrap(),
     )
@@ -654,13 +659,10 @@ pub fn make_client_config_with_cipher_suite_and_raw_key_support(
         kt.get_certified_client_key(provider)
             .unwrap(),
     ));
-    ClientConfig::builder_with_provider(
-        CryptoProvider {
-            cipher_suites: vec![cipher_suite],
-            ..provider.clone()
-        }
-        .into(),
-    )
+    ClientConfig::builder_with_provider(static_provider(CryptoProvider {
+        cipher_suites: vec![cipher_suite],
+        ..provider.clone()
+    }))
     .with_protocol_versions(&[&rustls::version::TLS13])
     .unwrap()
     .dangerous()
@@ -706,13 +708,10 @@ pub fn make_client_config_with_kx_groups(
     kx_groups: Vec<&'static dyn rustls::crypto::SupportedKxGroup>,
     provider: &CryptoProvider,
 ) -> ClientConfig {
-    let builder = ClientConfig::builder_with_provider(
-        CryptoProvider {
-            kx_groups,
-            ..provider.clone()
-        }
-        .into(),
-    )
+    let builder = ClientConfig::builder_with_provider(static_provider(CryptoProvider {
+        kx_groups,
+        ..provider.clone()
+    }))
     .with_safe_default_protocol_versions()
     .unwrap();
     finish_client_config(kt, builder)
@@ -753,14 +752,14 @@ pub fn webpki_client_verifier_builder(
     roots: Arc<RootCertStore>,
     provider: &CryptoProvider,
 ) -> ClientCertVerifierBuilder {
-    WebPkiClientVerifier::builder_with_provider(roots, provider.clone().into())
+    WebPkiClientVerifier::builder_with_provider(roots, provider)
 }
 
 pub fn webpki_server_verifier_builder(
     roots: Arc<RootCertStore>,
     provider: &CryptoProvider,
 ) -> ServerCertVerifierBuilder {
-    WebPkiServerVerifier::builder_with_provider(roots, provider.clone().into())
+    WebPkiServerVerifier::builder_with_provider(roots, provider)
 }
 
 pub fn make_pair(kt: KeyType, provider: &CryptoProvider) -> (ClientConnection, ServerConnection) {
@@ -1517,7 +1516,7 @@ impl RawTls {
 
 pub fn aes_128_gcm_with_1024_confidentiality_limit(
     provider: CryptoProvider,
-) -> Arc<CryptoProvider> {
+) -> &'static CryptoProvider {
     const CONFIDENTIALITY_LIMIT: u64 = 1024;
 
     // needed to extend lifetime of Tls13CipherSuite to 'static
@@ -1561,17 +1560,16 @@ pub fn aes_128_gcm_with_1024_confidentiality_limit(
         }
     });
 
-    CryptoProvider {
+    static_provider(CryptoProvider {
         cipher_suites: vec![
             SupportedCipherSuite::Tls13(tls13_limited),
             SupportedCipherSuite::Tls12(tls12_limited),
         ],
         ..provider
-    }
-    .into()
+    })
 }
 
-pub fn unsafe_plaintext_crypto_provider(provider: CryptoProvider) -> Arc<CryptoProvider> {
+pub fn unsafe_plaintext_crypto_provider(provider: CryptoProvider) -> &'static CryptoProvider {
     static TLS13_PLAIN_SUITE: OnceLock<rustls::Tls13CipherSuite> = OnceLock::new();
 
     let tls13 = TLS13_PLAIN_SUITE.get_or_init(|| {
@@ -1590,11 +1588,10 @@ pub fn unsafe_plaintext_crypto_provider(provider: CryptoProvider) -> Arc<CryptoP
         }
     });
 
-    CryptoProvider {
+    static_provider(CryptoProvider {
         cipher_suites: vec![SupportedCipherSuite::Tls13(tls13)],
         ..provider
-    }
-    .into()
+    })
 }
 
 mod plaintext {

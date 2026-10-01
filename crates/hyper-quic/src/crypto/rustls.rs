@@ -536,7 +536,7 @@ impl crypto::ServerConfig for QuicServerConfig {
 }
 
 pub(crate) fn initial_suite_from_provider(
-    provider: &Arc<rustls::crypto::CryptoProvider>,
+    provider: &rustls::crypto::CryptoProvider,
 ) -> Option<Suite> {
     provider
         .cipher_suites
@@ -550,9 +550,9 @@ pub(crate) fn initial_suite_from_provider(
         .flatten()
 }
 
-pub(crate) fn configured_provider() -> Arc<rustls::crypto::CryptoProvider> {
-    let provider = rustls::crypto::aws_lc_rs::default_provider();
-    Arc::new(provider)
+/// aws-lc-rs's default provider: process-lifetime algorithm tables, borrowed by every configuration
+pub(crate) fn configured_provider() -> &'static rustls::crypto::CryptoProvider {
+    &rustls::crypto::aws_lc_rs::DEFAULT_PROVIDER
 }
 
 fn to_vec(params: &TransportParameters) -> Vec<u8> {

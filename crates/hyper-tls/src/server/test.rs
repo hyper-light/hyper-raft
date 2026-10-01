@@ -85,12 +85,13 @@ mod tests {
     #[test]
     fn test_server_rejects_no_extended_master_secret_extension_when_require_ems_or_fips() {
         let provider = super::provider::default_provider();
-        let mut config = ServerConfig::builder_with_provider(provider.into())
-            .with_protocol_versions(&[&version::TLS12])
-            .unwrap()
-            .with_no_client_auth()
-            .with_single_cert(server_cert(), server_key())
-            .unwrap();
+        let mut config =
+            ServerConfig::builder_with_provider(crate::crypto::static_provider(provider))
+                .with_protocol_versions(&[&version::TLS12])
+                .unwrap()
+                .with_no_client_auth()
+                .with_single_cert(server_cert(), server_key())
+                .unwrap();
 
         if config.provider.fips() {
             assert!(config.require_ems);
@@ -119,12 +120,13 @@ mod tests {
 
     #[test]
     fn server_picks_ffdhe_group_when_clienthello_has_no_ffdhe_group_in_groups_ext() {
-        let config = ServerConfig::builder_with_provider(ffdhe_provider().into())
-            .with_protocol_versions(&[&version::TLS12])
-            .unwrap()
-            .with_no_client_auth()
-            .with_single_cert(server_cert(), server_key())
-            .unwrap();
+        let config =
+            ServerConfig::builder_with_provider(crate::crypto::static_provider(ffdhe_provider()))
+                .with_protocol_versions(&[&version::TLS12])
+                .unwrap()
+                .with_no_client_auth()
+                .with_single_cert(server_cert(), server_key())
+                .unwrap();
 
         let mut ch = minimal_client_hello();
         ch.cipher_suites
@@ -138,12 +140,13 @@ mod tests {
 
     #[test]
     fn server_picks_ffdhe_group_when_clienthello_has_no_groups_ext() {
-        let config = ServerConfig::builder_with_provider(ffdhe_provider().into())
-            .with_protocol_versions(&[&version::TLS12])
-            .unwrap()
-            .with_no_client_auth()
-            .with_single_cert(server_cert(), server_key())
-            .unwrap();
+        let config =
+            ServerConfig::builder_with_provider(crate::crypto::static_provider(ffdhe_provider()))
+                .with_protocol_versions(&[&version::TLS12])
+                .unwrap()
+                .with_no_client_auth()
+                .with_single_cert(server_cert(), server_key())
+                .unwrap();
 
         let mut ch = minimal_client_hello();
         ch.cipher_suites
@@ -158,12 +161,13 @@ mod tests {
 
     #[test]
     fn server_accepts_client_with_no_ecpoints_extension_and_only_ffdhe_cipher_suites() {
-        let config = ServerConfig::builder_with_provider(ffdhe_provider().into())
-            .with_protocol_versions(&[&version::TLS12])
-            .unwrap()
-            .with_no_client_auth()
-            .with_single_cert(server_cert(), server_key())
-            .unwrap();
+        let config =
+            ServerConfig::builder_with_provider(crate::crypto::static_provider(ffdhe_provider()))
+                .with_protocol_versions(&[&version::TLS12])
+                .unwrap()
+                .with_no_client_auth()
+                .with_single_cert(server_cert(), server_key())
+                .unwrap();
 
         let mut ch = minimal_client_hello();
         ch.cipher_suites
@@ -237,13 +241,14 @@ mod tests {
     fn second_client_hello_cannot_withdraw_psk_offer() {
         // Per RFC 9846 section 4.2.2, dropping a PreSharedKey offer is not one of the
         // changes a client may make after a HelloRetryRequest.
-        let config =
-            ServerConfig::builder_with_provider(super::provider::default_provider().into())
-                .with_protocol_versions(&[&version::TLS13])
-                .unwrap()
-                .with_no_client_auth()
-                .with_single_cert(server_cert(), server_key())
-                .unwrap();
+        let config = ServerConfig::builder_with_provider(crate::crypto::static_provider(
+            super::provider::default_provider(),
+        ))
+        .with_protocol_versions(&[&version::TLS13])
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(server_cert(), server_key())
+        .unwrap();
         let mut conn = ServerConnection::new(config.into()).unwrap();
 
         let encode = |hello| {
@@ -297,7 +302,7 @@ mod tests {
             ],
             ..super::provider::default_provider()
         };
-        let config = ServerConfig::builder_with_provider(provider.into())
+        let config = ServerConfig::builder_with_provider(crate::crypto::static_provider(provider))
             .with_protocol_versions(&[&version::TLS13])
             .unwrap()
             .with_no_client_auth()
@@ -356,7 +361,7 @@ mod tests {
             kx_groups: vec![super::provider::kx_group::X25519],
             ..super::provider::default_provider()
         };
-        ServerConfig::builder_with_provider(x25519_provider.into())
+        ServerConfig::builder_with_provider(crate::crypto::static_provider(x25519_provider))
             .with_protocol_versions(&[&version::TLS13])
             .unwrap()
             .with_no_client_auth()

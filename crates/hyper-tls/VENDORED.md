@@ -53,3 +53,20 @@ Every change from the archive is listed here, in order.
 
   All pass. The extra unit and api tests are the ported known-answer tests and the
   compression-dependent tests, which upstream's default build leaves off.
+
+## 2. Configuration without `Arc` (docs/transport.md §3.2)
+
+1. **The crypto provider is `&'static CryptoProvider`.** A provider is tables of algorithm
+   references; aws-lc-rs's is static data.
+   - `ClientConfig::builder_with_provider`, `ServerConfig::builder_with_provider`, their
+     `builder_with_details`, and `ConfigBuilder`, `ClientConfig` and `ServerConfig` hold and
+     return `&'static CryptoProvider`.
+   - The process default is a `OnceLock<&'static CryptoProvider>`:
+     `CryptoProvider::install_default(&'static self) -> Result<(), &'static Self>` and
+     `get_default() -> Option<&'static Self>`. The implicit default is
+     `crypto::aws_lc_rs::DEFAULT_PROVIDER`, a `LazyLock` over `default_provider()`.
+   - The webpki verifier builders read only the provider's signature algorithms, so they borrow
+     it for the call: `builder_with_provider(roots, &CryptoProvider)`.
+   - Tests build providers at runtime; they leak each one to get `'static`
+     (`rustls_test::static_provider`, `crypto::static_provider` under `cfg(test)`). A program
+     keeps its provider in a `static`.

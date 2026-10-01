@@ -945,7 +945,7 @@ mod tests {
         let dcid = ConnectionId::new(&hex!("06b858ec6f80452b"));
         let provider = default_provider();
 
-        let suite = initial_suite_from_provider(&std::sync::Arc::new(provider)).unwrap();
+        let suite = initial_suite_from_provider(&provider).unwrap();
         let client = initial_keys(Version::V1, dcid, Side::Client, &suite);
         let mut buf = Vec::new();
         let header = Header::Initial(InitialHeader {

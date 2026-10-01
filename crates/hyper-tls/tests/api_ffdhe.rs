@@ -21,7 +21,7 @@ fn config_builder_for_client_rejects_cipher_suites_without_compatible_kx_groups(
         ..provider::default_provider()
     };
 
-    let build_err = ClientConfig::builder_with_provider(bad_crypto_provider.into())
+    let build_err = ClientConfig::builder_with_provider(static_provider(bad_crypto_provider))
         .with_safe_default_protocol_versions()
         .unwrap_err()
         .to_string();
@@ -47,15 +47,19 @@ fn ffdhe_ciphersuite() {
     for (expected_protocol, expected_cipher_suite) in test_cases {
         let client_config = finish_client_config(
             KeyType::Rsa2048,
-            hyper_tls::ClientConfig::builder_with_provider(ffdhe::ffdhe_provider().into())
-                .with_protocol_versions(&[expected_protocol])
-                .unwrap(),
+            hyper_tls::ClientConfig::builder_with_provider(
+                static_provider(ffdhe::ffdhe_provider()),
+            )
+            .with_protocol_versions(&[expected_protocol])
+            .unwrap(),
         );
         let server_config = finish_server_config(
             KeyType::Rsa2048,
-            hyper_tls::ServerConfig::builder_with_provider(ffdhe::ffdhe_provider().into())
-                .with_safe_default_protocol_versions()
-                .unwrap(),
+            hyper_tls::ServerConfig::builder_with_provider(
+                static_provider(ffdhe::ffdhe_provider()),
+            )
+            .with_safe_default_protocol_versions()
+            .unwrap(),
         );
         do_suite_and_kx_test(
             client_config,
@@ -73,34 +77,28 @@ fn server_avoids_dhe_cipher_suites_when_client_has_no_known_dhe_in_groups_ext() 
 
     let client_config = finish_client_config(
         KeyType::Rsa2048,
-        hyper_tls::ClientConfig::builder_with_provider(
-            CryptoProvider {
-                cipher_suites: vec![
-                    ffdhe::TLS_DHE_RSA_WITH_AES_128_GCM_SHA256,
-                    provider::cipher_suite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
-                ],
-                kx_groups: vec![&ffdhe::FFDHE4096_KX_GROUP, provider::kx_group::SECP256R1],
-                ..provider::default_provider()
-            }
-            .into(),
-        )
+        hyper_tls::ClientConfig::builder_with_provider(static_provider(CryptoProvider {
+            cipher_suites: vec![
+                ffdhe::TLS_DHE_RSA_WITH_AES_128_GCM_SHA256,
+                provider::cipher_suite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+            ],
+            kx_groups: vec![&ffdhe::FFDHE4096_KX_GROUP, provider::kx_group::SECP256R1],
+            ..provider::default_provider()
+        }))
         .with_safe_default_protocol_versions()
         .unwrap(),
     );
 
     let server_config = finish_server_config(
         KeyType::Rsa2048,
-        hyper_tls::ServerConfig::builder_with_provider(
-            CryptoProvider {
-                cipher_suites: vec![
-                    ffdhe::TLS_DHE_RSA_WITH_AES_128_GCM_SHA256,
-                    provider::cipher_suite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
-                ],
-                kx_groups: vec![&ffdhe::FFDHE2048_KX_GROUP, provider::kx_group::SECP256R1],
-                ..provider::default_provider()
-            }
-            .into(),
-        )
+        hyper_tls::ServerConfig::builder_with_provider(static_provider(CryptoProvider {
+            cipher_suites: vec![
+                ffdhe::TLS_DHE_RSA_WITH_AES_128_GCM_SHA256,
+                provider::cipher_suite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+            ],
+            kx_groups: vec![&ffdhe::FFDHE2048_KX_GROUP, provider::kx_group::SECP256R1],
+            ..provider::default_provider()
+        }))
         .with_safe_default_protocol_versions()
         .unwrap(),
     );
@@ -121,18 +119,15 @@ fn server_avoids_dhe_cipher_suites_when_client_has_no_known_dhe_in_groups_ext() 
 fn server_avoids_cipher_suite_with_no_common_kx_groups() {
     let server_config = finish_server_config(
         KeyType::Rsa2048,
-        hyper_tls::ServerConfig::builder_with_provider(
-            CryptoProvider {
-                cipher_suites: vec![
-                    provider::cipher_suite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
-                    ffdhe::TLS_DHE_RSA_WITH_AES_128_GCM_SHA256,
-                    provider::cipher_suite::TLS13_AES_128_GCM_SHA256,
-                ],
-                kx_groups: vec![provider::kx_group::SECP256R1, &ffdhe::FFDHE2048_KX_GROUP],
-                ..provider::default_provider()
-            }
-            .into(),
-        )
+        hyper_tls::ServerConfig::builder_with_provider(static_provider(CryptoProvider {
+            cipher_suites: vec![
+                provider::cipher_suite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+                ffdhe::TLS_DHE_RSA_WITH_AES_128_GCM_SHA256,
+                provider::cipher_suite::TLS13_AES_128_GCM_SHA256,
+            ],
+            kx_groups: vec![provider::kx_group::SECP256R1, &ffdhe::FFDHE2048_KX_GROUP],
+            ..provider::default_provider()
+        }))
         .with_safe_default_protocol_versions()
         .unwrap(),
     )
@@ -206,18 +201,15 @@ fn server_avoids_cipher_suite_with_no_common_kx_groups() {
     for (client_kx_groups, protocol_version, expected_cipher_suite, expected_group) in test_cases {
         let client_config = finish_client_config(
             KeyType::Rsa2048,
-            hyper_tls::ClientConfig::builder_with_provider(
-                CryptoProvider {
-                    cipher_suites: vec![
-                        provider::cipher_suite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
-                        ffdhe::TLS_DHE_RSA_WITH_AES_128_GCM_SHA256,
-                        provider::cipher_suite::TLS13_AES_128_GCM_SHA256,
-                    ],
-                    kx_groups: client_kx_groups,
-                    ..provider::default_provider()
-                }
-                .into(),
-            )
+            hyper_tls::ClientConfig::builder_with_provider(static_provider(CryptoProvider {
+                cipher_suites: vec![
+                    provider::cipher_suite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+                    ffdhe::TLS_DHE_RSA_WITH_AES_128_GCM_SHA256,
+                    provider::cipher_suite::TLS13_AES_128_GCM_SHA256,
+                ],
+                kx_groups: client_kx_groups,
+                ..provider::default_provider()
+            }))
             .with_protocol_versions(&[protocol_version])
             .unwrap(),
         )

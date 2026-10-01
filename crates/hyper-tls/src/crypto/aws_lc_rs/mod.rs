@@ -1,4 +1,5 @@
 use alloc::vec::Vec;
+use std::sync::LazyLock;
 
 // aws-lc-rs has a -- roughly -- ring-compatible API, so we just reuse all that
 // glue here.  The shared files should always use `super::ring_like` to access a
@@ -32,6 +33,10 @@ pub(crate) mod quic;
 pub(crate) mod ticketer;
 pub(crate) mod tls12;
 pub(crate) mod tls13;
+
+/// aws-lc-rs's default provider as process-lifetime data, for configurations that borrow their
+/// provider for `'static`.
+pub static DEFAULT_PROVIDER: LazyLock<CryptoProvider> = LazyLock::new(default_provider);
 
 /// A `CryptoProvider` backed by aws-lc-rs.
 pub fn default_provider() -> CryptoProvider {

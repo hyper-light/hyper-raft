@@ -216,41 +216,32 @@ impl CryptoProvider {
     /// Call this early in your process to configure which provider is used for
     /// the provider.  The configuration should happen before any use of
     /// [`ClientConfig::builder()`] or [`ServerConfig::builder()`].
-    pub fn install_default(self) -> Result<(), Arc<Self>> {
+    ///
+    /// A provider is tables of algorithm references that live for the whole process, so the
+    /// default is borrowed for `'static`: keep it in a `static` (for example a
+    /// [`std::sync::LazyLock`]) and install a reference to it.
+    pub fn install_default(&'static self) -> Result<(), &'static Self> {
         static_default::install_default(self)
     }
 
     /// Returns the default `CryptoProvider` for this process.
     ///
     /// This will be `None` if no default has been set yet.
-    pub fn get_default() -> Option<&'static Arc<Self>> {
+    pub fn get_default() -> Option<&'static Self> {
         static_default::get_default()
     }
 
-    /// An internal function that:
-    ///
-    /// - gets the pre-installed default, or
-    /// - installs one `from_crate_features()`, or else
-    /// - panics about the need to call [`CryptoProvider::install_default()`]
-    pub(crate) fn get_default_or_install_from_crate_features() -> &'static Arc<Self> {
+    /// The process-default provider, installing aws-lc-rs's default provider if none is
+    /// installed yet.
+    pub(crate) fn get_default_or_install_from_crate_features() -> &'static Self {
         if let Some(provider) = Self::get_default() {
             return provider;
         }
 
-        let provider = Self::from_crate_features()
-            .expect(r###"
-Could not automatically determine the process-level CryptoProvider from Rustls crate features.
-Call CryptoProvider::install_default() before this point to select a provider manually, or make sure exactly one of the 'aws-lc-rs' and 'ring' features is enabled.
-See the documentation of the CryptoProvider type for more information.
-            "###);
-        // Ignore the error resulting from us losing a race, and accept the outcome.
+        let provider: &'static Self = &aws_lc_rs::DEFAULT_PROVIDER;
+        // Losing a race to another installer is fine: whichever provider won is the default.
         let _ = provider.install_default();
-        Self::get_default().unwrap()
-    }
-
-    /// The provider this crate is built with: aws-lc-rs, its only provider
-    fn from_crate_features() -> Option<Self> {
-        Some(aws_lc_rs::default_provider())
+        Self::get_default().unwrap_or(provider)
     }
 
     /// Returns `true` if this `CryptoProvider` is operating in FIPS mode.
@@ -625,23 +616,31 @@ impl From<Vec<u8>> for SharedSecret {
     }
 }
 
+/// A provider borrowed for the life of the process, as configurations take it: unit tests build
+/// providers at runtime, so each is leaked.
+#[cfg(test)]
+pub(crate) fn static_provider(provider: CryptoProvider) -> &'static CryptoProvider {
+    Box::leak(Box::new(provider))
+}
+
 mod static_default {
     use std::sync::OnceLock;
 
     use super::CryptoProvider;
-    use crate::sync::Arc;
 
     pub(crate) fn install_default(
-        default_provider: CryptoProvider,
-    ) -> Result<(), Arc<CryptoProvider>> {
-        PROCESS_DEFAULT_PROVIDER.set(Arc::new(default_provider))
+        default_provider: &'static CryptoProvider,
+    ) -> Result<(), &'static CryptoProvider> {
+        PROCESS_DEFAULT_PROVIDER.set(default_provider)
     }
 
-    pub(crate) fn get_default() -> Option<&'static Arc<CryptoProvider>> {
-        PROCESS_DEFAULT_PROVIDER.get()
+    pub(crate) fn get_default() -> Option<&'static CryptoProvider> {
+        PROCESS_DEFAULT_PROVIDER.get().copied()
     }
 
-    static PROCESS_DEFAULT_PROVIDER: OnceLock<Arc<CryptoProvider>> = OnceLock::new();
+    /// The process-default provider: a reference to process-lifetime algorithm tables, set at
+    /// most once.
+    static PROCESS_DEFAULT_PROVIDER: OnceLock<&'static CryptoProvider> = OnceLock::new();
 }
 
 #[cfg(test)]

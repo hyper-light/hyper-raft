@@ -63,6 +63,10 @@ Upstream's own tests are the oracle that conformance changed no behaviour.
 6. **TLS is `hyper-tls`.** `rustls` is now a Cargo rename of `hyper-tls` (`crates/hyper-tls`), so the
    source still refers to `rustls::`. `HandshakeData::negotiated_key_exchange_group` is always
    present, as an `Option`; upstream gated it behind a test feature and filled it with `.expect`.
+7. **The crypto provider is borrowed for `'static`.** Every TLS configuration uses
+   `rustls::crypto::aws_lc_rs::DEFAULT_PROVIDER`, where upstream built a fresh
+   `Arc<CryptoProvider>` per configuration. The classical-key-exchange test client keeps its
+   provider in a `LazyLock`.
 
 ## 3. Connection attempts (2026-10-01)
 

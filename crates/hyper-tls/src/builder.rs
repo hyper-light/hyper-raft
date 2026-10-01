@@ -30,7 +30,7 @@ use crate::{ClientConfig, ServerConfig};
 /// supported protocol versions.
 ///
 /// ```
-/// # hyper_tls::crypto::aws_lc_rs::default_provider().install_default();
+/// # hyper_tls::crypto::aws_lc_rs::DEFAULT_PROVIDER.install_default();
 /// use hyper_tls::{ClientConfig, ServerConfig};
 /// ClientConfig::builder()
 /// //  ...
@@ -44,7 +44,7 @@ use crate::{ClientConfig, ServerConfig};
 /// You may also override the choice of protocol versions:
 ///
 /// ```no_run
-/// # hyper_tls::crypto::aws_lc_rs::default_provider().install_default();
+/// # hyper_tls::crypto::aws_lc_rs::DEFAULT_PROVIDER.install_default();
 /// # use hyper_tls::ServerConfig;
 /// ServerConfig::builder_with_protocol_versions(&[&hyper_tls::version::TLS13])
 /// //  ...
@@ -78,7 +78,7 @@ use crate::{ClientConfig, ServerConfig};
 /// For example:
 ///
 /// ```
-/// # hyper_tls::crypto::aws_lc_rs::default_provider().install_default();
+/// # hyper_tls::crypto::aws_lc_rs::DEFAULT_PROVIDER.install_default();
 /// # use hyper_tls::ClientConfig;
 /// # let root_certs = hyper_tls::RootCertStore::empty();
 /// ClientConfig::builder()
@@ -100,7 +100,7 @@ use crate::{ClientConfig, ServerConfig};
 /// For example:
 ///
 /// ```no_run
-/// # hyper_tls::crypto::aws_lc_rs::default_provider().install_default();
+/// # hyper_tls::crypto::aws_lc_rs::DEFAULT_PROVIDER.install_default();
 /// # use hyper_tls::ServerConfig;
 /// # let certs = vec![];
 /// # let private_key = pki_types::PrivateKeyDer::from(
@@ -155,15 +155,15 @@ use crate::{ClientConfig, ServerConfig};
 #[derive(Clone)]
 pub struct ConfigBuilder<Side: ConfigSide, State> {
     pub(crate) state: State,
-    pub(crate) provider: Arc<CryptoProvider>,
+    pub(crate) provider: &'static CryptoProvider,
     pub(crate) time_provider: Arc<dyn TimeProvider>,
     pub(crate) side: PhantomData<Side>,
 }
 
 impl<Side: ConfigSide, State> ConfigBuilder<Side, State> {
     /// Return the crypto provider used to construct this builder.
-    pub fn crypto_provider(&self) -> &Arc<CryptoProvider> {
-        &self.provider
+    pub fn crypto_provider(&self) -> &'static CryptoProvider {
+        self.provider
     }
 }
 

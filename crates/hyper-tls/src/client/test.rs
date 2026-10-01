@@ -47,12 +47,13 @@ mod tests {
     /// is not sent if the client does not support TLS 1.2.
     #[test]
     fn test_no_session_ticket_request_on_tls_1_3() {
-        let mut config =
-            ClientConfig::builder_with_provider(super::provider::default_provider().into())
-                .with_protocol_versions(&[&version::TLS13])
-                .unwrap()
-                .with_root_certificates(roots())
-                .with_no_client_auth();
+        let mut config = ClientConfig::builder_with_provider(crate::crypto::static_provider(
+            super::provider::default_provider(),
+        ))
+        .with_protocol_versions(&[&version::TLS13])
+        .unwrap()
+        .with_root_certificates(roots())
+        .with_no_client_auth();
         config.resumption = Resumption::in_memory_sessions(128)
             .tls12_resumption(Tls12Resumption::SessionIdOrTickets);
         let ch = client_hello_sent_for_config(config).unwrap();
@@ -62,11 +63,13 @@ mod tests {
     #[test]
     fn test_no_renegotiation_scsv_on_tls_1_3() {
         let ch = client_hello_sent_for_config(
-            ClientConfig::builder_with_provider(super::provider::default_provider().into())
-                .with_protocol_versions(&[&version::TLS13])
-                .unwrap()
-                .with_root_certificates(roots())
-                .with_no_client_auth(),
+            ClientConfig::builder_with_provider(crate::crypto::static_provider(
+                super::provider::default_provider(),
+            ))
+            .with_protocol_versions(&[&version::TLS13])
+            .unwrap()
+            .with_root_certificates(roots())
+            .with_no_client_auth(),
         )
         .unwrap();
         assert!(!ch
@@ -77,12 +80,13 @@ mod tests {
     #[test]
     fn test_client_does_not_offer_sha1() {
         for version in crate::ALL_VERSIONS {
-            let config =
-                ClientConfig::builder_with_provider(super::provider::default_provider().into())
-                    .with_protocol_versions(&[version])
-                    .unwrap()
-                    .with_root_certificates(roots())
-                    .with_no_client_auth();
+            let config = ClientConfig::builder_with_provider(crate::crypto::static_provider(
+                super::provider::default_provider(),
+            ))
+            .with_protocol_versions(&[version])
+            .unwrap()
+            .with_root_certificates(roots())
+            .with_no_client_auth();
             let ch = client_hello_sent_for_config(config).unwrap();
             assert!(
                 !ch.extensions
@@ -97,12 +101,13 @@ mod tests {
 
     #[test]
     fn test_client_rejects_hrr_with_varied_session_id() {
-        let config =
-            ClientConfig::builder_with_provider(super::provider::default_provider().into())
-                .with_safe_default_protocol_versions()
-                .unwrap()
-                .with_root_certificates(roots())
-                .with_no_client_auth();
+        let config = ClientConfig::builder_with_provider(crate::crypto::static_provider(
+            super::provider::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(roots())
+        .with_no_client_auth();
         let mut conn =
             ClientConnection::new(config.into(), ServerName::try_from("localhost").unwrap())
                 .unwrap();
@@ -135,12 +140,13 @@ mod tests {
 
     #[test]
     fn test_client_rejects_no_extended_master_secret_extension_when_require_ems_or_fips() {
-        let mut config =
-            ClientConfig::builder_with_provider(super::provider::default_provider().into())
-                .with_safe_default_protocol_versions()
-                .unwrap()
-                .with_root_certificates(roots())
-                .with_no_client_auth();
+        let mut config = ClientConfig::builder_with_provider(crate::crypto::static_provider(
+            super::provider::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(roots())
+        .with_no_client_auth();
         if config.provider.fips() {
             assert!(config.require_ems);
         } else {
@@ -184,12 +190,14 @@ mod tests {
             [(&version::TLS12, false), (&version::TLS13, true)]
         {
             let client_hello = client_hello_sent_for_config(
-                ClientConfig::builder_with_provider(super::provider::default_provider().into())
-                    .with_protocol_versions(&[protocol_version])
-                    .unwrap()
-                    .dangerous()
-                    .with_custom_certificate_verifier(Arc::new(cas_sending_server_verifier.clone()))
-                    .with_no_client_auth(),
+                ClientConfig::builder_with_provider(crate::crypto::static_provider(
+                    super::provider::default_provider(),
+                ))
+                .with_protocol_versions(&[protocol_version])
+                .unwrap()
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(cas_sending_server_verifier.clone()))
+                .with_no_client_auth(),
             )
             .unwrap();
             assert_eq!(
@@ -206,12 +214,13 @@ mod tests {
     #[test]
     fn test_client_with_custom_verifier_can_accept_ecdsa_sha1_signatures() {
         let verifier = Arc::new(ExpectSha1EcdsaVerifier::default());
-        let config = ClientConfig::builder_with_provider(x25519_provider().into())
-            .with_safe_default_protocol_versions()
-            .unwrap()
-            .dangerous()
-            .with_custom_certificate_verifier(verifier.clone())
-            .with_no_client_auth();
+        let config =
+            ClientConfig::builder_with_provider(crate::crypto::static_provider(x25519_provider()))
+                .with_safe_default_protocol_versions()
+                .unwrap()
+                .dangerous()
+                .with_custom_certificate_verifier(verifier.clone())
+                .with_no_client_auth();
 
         let mut conn =
             ClientConnection::new(config.into(), ServerName::try_from("localhost").unwrap())
@@ -433,14 +442,15 @@ mod tests {
     }
 
     fn client_config_for_rpk(key_log: Arc<dyn KeyLog>) -> ClientConfig {
-        let mut config = ClientConfig::builder_with_provider(x25519_provider().into())
-            .with_protocol_versions(&[&version::TLS13])
-            .unwrap()
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(ServerVerifierRequiringRpk))
-            .with_client_cert_resolver(Arc::new(AlwaysResolvesClientRawPublicKeys::new(Arc::new(
-                client_certified_key(),
-            ))));
+        let mut config =
+            ClientConfig::builder_with_provider(crate::crypto::static_provider(x25519_provider()))
+                .with_protocol_versions(&[&version::TLS13])
+                .unwrap()
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(ServerVerifierRequiringRpk))
+                .with_client_cert_resolver(Arc::new(AlwaysResolvesClientRawPublicKeys::new(
+                    Arc::new(client_certified_key()),
+                )));
         config.key_log = key_log;
         config
     }
@@ -603,11 +613,13 @@ mod tests {
 #[test]
 fn hybrid_kx_component_share_offered_if_supported_separately() {
     let ch = client_hello_sent_for_config(
-        ClientConfig::builder_with_provider(crate::crypto::aws_lc_rs::default_provider().into())
-            .with_safe_default_protocol_versions()
-            .unwrap()
-            .with_root_certificates(roots())
-            .with_no_client_auth(),
+        ClientConfig::builder_with_provider(crate::crypto::static_provider(
+            crate::crypto::aws_lc_rs::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(roots())
+        .with_no_client_auth(),
     )
     .unwrap();
 
@@ -625,7 +637,7 @@ fn hybrid_kx_component_share_not_offered_unless_supported_separately() {
         ..aws_lc_rs::default_provider()
     };
     let ch = client_hello_sent_for_config(
-        ClientConfig::builder_with_provider(provider.into())
+        ClientConfig::builder_with_provider(crate::crypto::static_provider(provider))
             .with_safe_default_protocol_versions()
             .unwrap()
             .with_root_certificates(roots())

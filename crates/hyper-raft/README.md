@@ -12,7 +12,9 @@ records the source revision and every change since.
 It is Raft as Ongaro's thesis states it, with pre-vote, check-quorum, election priority,
 learners, joint consensus, leader transfer, an inflight window with conflict hints,
 ReadIndex and snapshots. Reads asked before the member is next asked what there is to do
-share one round of heartbeats (`ReadRounds`). It keeps the log and speaks the messages of `raft-rs` 0.7
+share one round of heartbeats (`ReadRounds`). What a member is sent ahead of its
+answers is bounded in messages and in bytes, the bytes by what its owner says the path to
+it carries (`RawNode::set_inflight_bytes`). It keeps the log and speaks the messages of `raft-rs` 0.7
 (`raft-proto`), which focal's groups ran on before. What it decides differently, and
 why, is in the module header of `src/raft.rs` and in focal's
 `docs/archictecutre/27-consensus-roadmap-and-slates-port.md` §4.5 (focal `a8e95f7`).

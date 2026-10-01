@@ -234,3 +234,25 @@ port adds one of its own.
   `Ready` forms take, so the in-place form sends it too; the schedule count of
   `schedules_of_this_core` returns the reads answered as well as the terms, so that the in-place
   twin is held to answer the same reads; the doc comments the lint wall asks for.
+
+### F41: a member is sent no more bytes ahead of its answers than its path carries (focal `052ae4a`)
+
+- `Inflights` holds each message's last index and the bytes of its entries, and is full at
+  `cap` messages or at its byte bound. One entry larger than the bound is sent, alone; a bound is
+  never zero.
+- `Config::max_inflight_bytes` (default `u64::MAX`, no bound of its own; zero refused) seeds every
+  member's bound, and `RawNode::set_inflight_bytes` sets one member's as its owner learns the
+  path. `Tracker::new` takes the bound; `Progress::sent(last, bytes)` charges the window;
+  `Progress::page_bytes` cuts a page to the window's room while entries are sent ahead of their
+  answers; `Raft::check_accounting` checks every window's count of bytes.
+- The differential runs with no byte bound (`Settings::shell`). This core's schedules run with
+  256 bytes (`Settings::focal`, and so `Settings::fast`) and change bounds while they run
+  (`Mix::windows`, `Op::Window`).
+- Changed from focal's form: focal walked the page a second time after cutting it, summing
+  `proto::encoded_bytes`, to charge the window. Here the bytes are counted in the walk that chooses
+  the page (`Page::bytes`), which the byte rule makes anyway wherever it cuts: storage's page held
+  to the rule, and the tail not yet durable. Where it does not count them (a storage that cut the
+  page itself, or a page with no bound), the bytes are counted in the walk that already counts the
+  page's buffers, and only for a leader's page (`Log::page`); `Log::slice`, which pages what is
+  applied, counts nothing more than before. A unit test holds `Page::bytes` to the sum of the
+  encodings on every path, against a storage that pages by the rule and one that gives too much.

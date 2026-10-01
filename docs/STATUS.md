@@ -27,5 +27,5 @@ The law's four columns:
 | Consumer | Takes | State |
 |---|---|---|
 | mantle | hyper-raft as `vendor/hyper-raft` (Cargo rename `focal-raft`) | branch `hyper-raft-vendor`, gates running |
-| focal | hyper-raft (R-1, F-1) | blocked: changes in `~/Projects/focal` need the owner's permission rule. focal's core changes since R-1 are ported here (`crates/hyper-raft/ORIGIN.md`, "Ports from focal"): F43 (one ReadIndex heartbeat round per `Ready`) |
+| focal | hyper-raft (R-1, F-1) | blocked: changes in `~/Projects/focal` need the owner's permission rule. focal's core changes since R-1 are ported here (`crates/hyper-raft/ORIGIN.md`, "Ports from focal"): F43 (one ReadIndex heartbeat round per `Ready`), F41 (an inflight window bounded in bytes) |
 | slates | hyper-quic, hyper-datagram, hyper-swim, hyper-timing | slates' session owns the integration (slates A-52 §5) |

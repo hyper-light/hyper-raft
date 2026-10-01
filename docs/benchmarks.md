@@ -334,6 +334,25 @@ Tried and not kept: a message queue given exactly what a burst asks for, in plac
 workloads (0 → 1.0), which §1a does not allow without a measured reason that outweighs it; focal's
 shell also prices the queue by `SMALLEST` and `growth_of`.
 
+## Ports from focal, counted
+
+Each port from focal (`crates/hyper-raft/ORIGIN.md`, "Ports from focal") was counted with
+`hyper-raft-compare one <core> <workload> ... 1000 count`, in place and copying, at three and five
+voters, on every workload of the tables, before and after. Allocation and reallocation counts are
+exact for a seed, so a change in them is a change in the code, not noise.
+
+| Port | Commit | Allocations and reallocations | Bytes asked for per op |
+|---|---|---|---|
+| F43, reads share a round | `1173f20` | identical in every row | identical in every row |
+| F41, a window bounded in bytes | this commit | identical in every row | identical on steady, catchup and fast; transfer +2,048 (3 voters) and +4,096 (5); failover +1,024 and +3,072; snapshot +48 and +80 |
+
+F41's bytes: a member's window holds each message's bytes beside its last index, sixteen bytes a
+slot against eight, and reserves its 128 slots (`Settings::shell`'s window) the first time it
+takes a message after a reset. A transfer or an election resets every follower's window once, so
+those rows ask 1,024 bytes more per follower per reset, and no more allocations; the steady and
+catch-up rows, whose windows are never reset, ask for nothing more. The byte bound itself costs
+no walk: the bytes it charges are counted where the page is chosen (ORIGIN.md, F41).
+
 ## Where hyper-raft does not win, and why
 
 hyper-raft in place allocates less than every other core in every row. It is faster than raft-rs

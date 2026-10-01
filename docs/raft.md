@@ -36,7 +36,9 @@ It is Raft as Ongaro's thesis states it, with these extensions:
 - election priority with `Precedence::Log`;
 - learners and joint consensus (`ConfChangeV2`);
 - leader transfer;
-- an inflight window with conflict hints;
+- an inflight window with conflict hints, bounded per member in messages and in bytes
+  (`Config::max_inflight_bytes`, `RawNode::set_inflight_bytes`: what the owner says the path to
+  the member carries before it answers);
 - ReadIndex (quorum-confirmed, no lease), with one round of heartbeats for every read asked since
   the last `Ready` (`ReadRounds::Shared`, the default; `ReadRounds::Each` is raft-rs's round per
   read, which the differential runs), and snapshots;

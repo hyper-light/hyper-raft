@@ -51,6 +51,7 @@ fn schedules_of_this_core(settings: Settings) -> (usize, u64) {
     let mix = Mix {
         leader_leaves: true,
         bursts: true,
+        windows: true,
         ..Mix::everything()
     };
     let (mut terms, mut answered) = (0, 0);
@@ -101,6 +102,7 @@ fn a_group_of_both_cores_is_safe_and_settles() {
     let first = count("HYPER_RAFT_SEED", 0);
     let mix = Mix {
         bursts: true,
+        windows: true,
         ..Mix::everything()
     };
     let (mut old, mut new, mut deposed) = (0, 0, 0);

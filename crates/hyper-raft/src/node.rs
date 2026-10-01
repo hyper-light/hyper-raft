@@ -305,6 +305,11 @@ impl<S: Storage> RawNode<S> {
     pub fn set_priority(&mut self, priority: i64) {
         self.raft.set_priority(priority);
     }
+    /// What the path to `member` carries before it answers
+    /// ([`Raft::set_inflight_bytes`]).
+    pub fn set_inflight_bytes(&mut self, member: u64, bytes: u64) -> bool {
+        self.raft.set_inflight_bytes(member, bytes)
+    }
     /// One tick of time has passed. True when the member acted on it: it
     /// campaigned, checked its quorum or sent heartbeats.
     pub fn tick(&mut self) -> Result<bool> {

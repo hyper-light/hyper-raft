@@ -291,6 +291,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "hyper-log-e2e"
+version = "0.1.0"
+dependencies = [
+ "hyper-block",
+ "hyper-log",
+]
+
+[[package]]
 name = "hyper-measure"
 version = "0.1.0"
 dependencies = [

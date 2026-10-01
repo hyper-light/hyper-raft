@@ -23,5 +23,9 @@ tempfile.workspace = true
 name = "allocs"
 harness = false
 
+[[bench]]
+name = "log"
+harness = false
+
 [lints]
 workspace = true

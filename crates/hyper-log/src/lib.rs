@@ -245,6 +245,12 @@ impl Fetched {
     }
 }
 
+thread_local! {
+    /// The reservation [`Log::entries`] fetches into, kept for this thread's next call: one
+    /// segment's bytes at most.
+    static KEPT: std::cell::Cell<Option<Fetched>> = const { std::cell::Cell::new(None) };
+}
+
 /// What only the restore at open writes with an update (mantle docs/design/raft-log.md §6).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct Marks {
@@ -776,7 +782,8 @@ impl<F: BlockFile + 'static> Log<F> {
     }
 
     /// The entries of `[low, high)`, as many as `max_bytes` of payload admit and one at
-    /// least, reading from the file those no longer in memory.
+    /// least, reading from the file those no longer in memory. Each is copied out of a
+    /// reservation the calling thread keeps for this; [`Log::fetch`] fills the caller's own.
     pub fn entries(
         &self,
         group: u128,
@@ -784,14 +791,26 @@ impl<F: BlockFile + 'static> Log<F> {
         high: u64,
         max_bytes: u64,
     ) -> Result<Vec<Entry>, LogError> {
-        let fetched = self.fetch(group, low, high, max_bytes, Fetched::new())?;
-        Ok(fetched
+        let into = KEPT
+            .try_with(|kept| kept.take())
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        let fetched = self.fetch(group, low, high, max_bytes, into)?;
+        let entries = fetched
             .iter()
             .map(|(term, bytes)| Entry {
                 term,
                 bytes: bytes.to_vec(),
             })
-            .collect())
+            .collect();
+        // Kept while it holds no more than a segment, the most one frame's entries take: a larger
+        // fetch is a catch-up read whose reservation goes with it.
+        let segment = usize::try_from(self.p.config.segment_bytes).unwrap_or(usize::MAX);
+        if fetched.bytes.capacity() <= segment {
+            let _ = KEPT.try_with(|kept| kept.set(Some(fetched)));
+        }
+        Ok(entries)
     }
 
     /// The entries of `[low, high)` as [`Log::entries`] gives them, copied into the caller's

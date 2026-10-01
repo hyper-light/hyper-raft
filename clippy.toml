@@ -41,8 +41,8 @@ disallowed-types = [
   { path = "std::sync::Condvar", reason = "broadcast wakes are O(n) in the kernel and panicked macOS (mantle note 26); completions go through std::task::Waker, one to one." },
 ]
 
-# The crates are sans-io and in-memory. hyper-log, which owns its device files, allows these in its
-# device module only, with the reason in place.
+# The crates are sans-io and in-memory. hyper-log and hyper-block, which own their device files,
+# allow these in their device modules only, with the reason in place.
 disallowed-methods = [
   { path = "std::fs::write", reason = "sans-io: only hyper-log's device module writes files." },
   { path = "std::fs::create_dir", reason = "sans-io; see std::fs::write." },

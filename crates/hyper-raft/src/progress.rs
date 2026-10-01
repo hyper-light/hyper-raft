@@ -6,6 +6,7 @@ use crate::{
     quorum,
 };
 
+/// How a leader sends to a member.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ProgressState {
     /// One message a heartbeat, until the member answers where it is.
@@ -27,6 +28,8 @@ pub struct Inflights {
     cap: usize,
 }
 impl Inflights {
+    /// An empty window of at most `cap` messages; its buffer is reserved
+    /// when the first is sent.
     pub fn new(cap: usize) -> Self {
         Self {
             start: 0,
@@ -35,9 +38,11 @@ impl Inflights {
             cap,
         }
     }
+    /// Whether the window admits no more.
     pub fn full(&self) -> bool {
         self.count >= self.cap
     }
+    /// How many messages are out and not answered.
     pub fn count(&self) -> usize {
         self.count
     }
@@ -48,6 +53,8 @@ impl Inflights {
             position
         }
     }
+    /// A message whose last index is `inflight` was sent; fatal into a
+    /// full window.
     pub fn add(&mut self, inflight: u64) -> Result<()> {
         if self.full() {
             return Err(Error::Invariant("a message sent into a full window"));
@@ -81,6 +88,7 @@ impl Inflights {
         self.count = self.count.saturating_sub(freed);
         self.start = position;
     }
+    /// The oldest message out is answered.
     pub fn free_first_one(&mut self) {
         if self.count > 0
             && let Some(first) = self.buffer.get(self.start).copied()
@@ -88,11 +96,13 @@ impl Inflights {
             self.free_to(first);
         }
     }
+    /// Nothing is out, and the buffer is given up.
     pub fn reset(&mut self) {
         self.count = 0;
         self.start = 0;
         self.buffer = Vec::new();
     }
+    /// The bytes the window's buffer holds, by capacity.
     pub fn resident_bytes(&self) -> usize {
         self.buffer
             .capacity()
@@ -100,12 +110,14 @@ impl Inflights {
     }
 }
 
+/// What a leader knows of one member, and how it sends to it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Progress {
     /// The highest index known to be held by the member.
     pub matched: u64,
     /// The index of the next entry to send.
     pub next_index: u64,
+    /// How the leader sends to the member.
     pub state: ProgressState,
     /// While probing: a message is out and no other is sent.
     pub paused: bool,
@@ -115,11 +127,14 @@ pub struct Progress {
     pub pending_request_snapshot: u64,
     /// Whether the member was heard from since the leader last looked.
     pub recent_active: bool,
+    /// The messages sent and not answered.
     pub inflights: Inflights,
     /// The member's commit as it last said.
     pub committed_index: u64,
 }
 impl Progress {
+    /// A member probed from `next_index`, with a window of `window`
+    /// messages.
     pub fn new(next_index: u64, window: usize) -> Self {
         Self {
             matched: 0,
@@ -149,6 +164,8 @@ impl Progress {
         self.recent_active = false;
         self.inflights.reset();
     }
+    /// Probes again from past what the member is known to hold, or past
+    /// the snapshot it was sent.
     pub fn become_probe(&mut self) {
         // After a snapshot the member holds what the snapshot held.
         let after_snapshot = if self.state == ProgressState::Snapshot {
@@ -159,17 +176,21 @@ impl Progress {
         self.reset_state(ProgressState::Probe);
         self.next_index = self.matched.saturating_add(1).max(after_snapshot);
     }
+    /// Sends ahead of answers from past what the member is known to hold.
     pub fn become_replicate(&mut self) {
         self.reset_state(ProgressState::Replicate);
         self.next_index = self.matched.saturating_add(1);
     }
+    /// A snapshot at `index` is on its way.
     pub fn become_snapshot(&mut self, index: u64) {
         self.reset_state(ProgressState::Snapshot);
         self.pending_snapshot = index;
     }
+    /// The snapshot on its way did not arrive.
     pub fn snapshot_failure(&mut self) {
         self.pending_snapshot = 0;
     }
+    /// Whether a member sent a snapshot holds what the snapshot held.
     pub fn is_snapshot_caught_up(&self) -> bool {
         self.state == ProgressState::Snapshot && self.matched >= self.pending_snapshot
     }
@@ -184,6 +205,7 @@ impl Progress {
         self.next_index = self.next_index.max(index.saturating_add(1));
         news
     }
+    /// The member says it committed `committed`; the highest said is kept.
     pub fn update_committed(&mut self, committed: u64) {
         self.committed_index = self.committed_index.max(committed);
     }
@@ -221,6 +243,8 @@ impl Progress {
         self.paused = false;
         true
     }
+    /// Whether nothing more may be sent now: a probe is out, the window is
+    /// full, or a snapshot is on its way.
     pub fn is_paused(&self) -> bool {
         match self.state {
             ProgressState::Probe => self.paused,
@@ -259,6 +283,8 @@ pub struct Tracker {
     scratch: Vec<u64>,
 }
 impl Tracker {
+    /// Every member of `configuration`, probed from `next_index` with a
+    /// window of `window` messages; no votes.
     pub fn new(configuration: Configuration, next_index: u64, window: usize) -> Result<Self> {
         let mut tracker = Self {
             progress: Vec::new(),
@@ -270,6 +296,7 @@ impl Tracker {
         tracker.apply(configuration, &[], next_index)?;
         Ok(tracker)
     }
+    /// The configuration in force.
     pub fn configuration(&self) -> &Configuration {
         &self.configuration
     }
@@ -277,19 +304,23 @@ impl Tracker {
         self.progress
             .binary_search_by_key(&member, |(member, _)| *member)
     }
+    /// What is known of `member`, if it is one.
     pub fn get(&self, member: NodeId) -> Option<&Progress> {
         let position = self.find(member).ok()?;
         self.progress.get(position).map(|(_, progress)| progress)
     }
+    /// What is known of `member`, to change, if it is one.
     pub fn get_mut(&mut self, member: NodeId) -> Option<&mut Progress> {
         let position = self.find(member).ok()?;
         self.progress
             .get_mut(position)
             .map(|(_, progress)| progress)
     }
+    /// How many members are tracked.
     pub fn len(&self) -> usize {
         self.progress.len()
     }
+    /// Whether no member is tracked.
     pub fn is_empty(&self) -> bool {
         self.progress.is_empty()
     }
@@ -299,6 +330,7 @@ impl Tracker {
             .iter()
             .map(|(member, progress)| (*member, progress))
     }
+    /// In order of member, to change.
     pub fn iter_mut(&mut self) -> impl ExactSizeIterator<Item = (NodeId, &mut Progress)> {
         self.progress
             .iter_mut()
@@ -339,6 +371,7 @@ impl Tracker {
         );
         incoming.min(outgoing)
     }
+    /// Forgets the votes of the last election.
     pub fn reset_votes(&mut self) {
         self.votes.clear();
     }
@@ -364,6 +397,8 @@ impl Tracker {
             quorum::tally(self.configuration.outgoing(), Quorum::Classic, answer),
         )
     }
+    /// What the votes recorded decide, in both halves of a joint
+    /// configuration.
     pub fn tally_votes(&self) -> Tally {
         self.decided(|member| {
             self.votes

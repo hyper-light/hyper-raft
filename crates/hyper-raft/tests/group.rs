@@ -13,11 +13,17 @@
     clippy::unreachable,
     clippy::indexing_slicing,
     clippy::arithmetic_side_effects,
-    clippy::disallowed_macros
+    clippy::disallowed_macros,
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss,
+    clippy::cognitive_complexity,
+    clippy::disallowed_types,
+    unreachable_pub
 )]
 mod support;
 
-use focal_raft::proto::{
+use hyper_raft::proto::{
     ConfChangeSingle, ConfChangeTransition, ConfChangeType, ConfChangeV2, MessageType,
 };
 use support::{Cluster, Either, Mix, New, Old, Op, Replica, Seeded, Settings};
@@ -39,9 +45,9 @@ fn scheduled<R: Replica>(group: &mut Cluster<R>, seed: u64, steps: u64, mix: &Mi
 
 #[test]
 fn a_group_of_this_core_is_safe_and_settles() {
-    let seeds = count("FOCAL_RAFT_SEEDS", 96);
-    let steps = count("FOCAL_RAFT_STEPS", 4_000);
-    let first = count("FOCAL_RAFT_SEED", 0);
+    let seeds = count("HYPER_RAFT_SEEDS", 96);
+    let steps = count("HYPER_RAFT_STEPS", 4_000);
+    let first = count("HYPER_RAFT_SEED", 0);
     let mix = Mix {
         leader_leaves: true,
         ..Mix::everything()
@@ -64,9 +70,9 @@ fn a_group_of_this_core_is_safe_and_settles() {
 
 #[test]
 fn a_group_of_both_cores_is_safe_and_settles() {
-    let seeds = count("FOCAL_RAFT_SEEDS", 96);
-    let steps = count("FOCAL_RAFT_STEPS", 4_000);
-    let first = count("FOCAL_RAFT_SEED", 0);
+    let seeds = count("HYPER_RAFT_SEEDS", 96);
+    let steps = count("HYPER_RAFT_STEPS", 4_000);
+    let first = count("HYPER_RAFT_SEED", 0);
     let mix = Mix::everything();
     let (mut old, mut new, mut deposed) = (0, 0, 0);
     for seed in first..first + seeds {
@@ -86,7 +92,7 @@ fn a_group_of_both_cores_is_safe_and_settles() {
         }
     }
     println!(
-        "{seeds} schedules: raft-rs led {old} terms and focal-raft {new}; {deposed} members \
+        "{seeds} schedules: raft-rs led {old} terms and hyper-raft {new}; {deposed} members \
          of raft-rs were stopped for leading a group they were no voter of"
     );
     assert!(old > 0 && new > 0);

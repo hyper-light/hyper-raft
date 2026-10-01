@@ -7,16 +7,20 @@
         clippy::unreachable,
         clippy::indexing_slicing,
         clippy::arithmetic_side_effects,
-        clippy::disallowed_macros
+        clippy::disallowed_macros,
+        clippy::cognitive_complexity,
+        clippy::cast_possible_truncation,
+        unreachable_pub
     )
 )]
-//! focal's own consensus core (27 §4.2, §6 stage D): a state machine with no
-//! clock, no disk and no network. It is told what time has passed
+//! The Raft core slates, focal and mantle share: a state machine with no
+//! clock, no disk and no network. It began as focal's own core (focal 27
+//! §4.2, §6 stage D) and moved here with its history (`ORIGIN.md`). It is told what time has passed
 //! ([`RawNode::tick`]) and what arrived ([`RawNode::step`]), and it says what
 //! to persist, send and apply ([`RawNode::ready`]).
 //!
 //! The classic track is Raft as Ongaro's thesis states it, with the
-//! extensions focal runs on: pre-vote and check-quorum, election priority,
+//! extensions focal ran it with: pre-vote and check-quorum, election priority,
 //! learners, joint consensus, leader transfer, an inflight window with
 //! conflict hints, ReadIndex, and snapshots. It speaks the messages and
 //! keeps the log of `raft-rs`, the core focal ran on before, so members on
@@ -50,6 +54,8 @@ pub use storage::{InitialState, Storage};
 /// A member's identity. Zero is no member.
 pub type NodeId = u64;
 /// The most members a configuration names, voters and learners together.
+/// focal's bound, carried unchanged; its derivation is owed with
+/// [`Limits`]'s (`docs/raft.md`, R-3).
 pub const MAX_MEMBERS: usize = 1024;
 
 #[cfg(test)]

@@ -5,7 +5,7 @@
 #![allow(dead_code)]
 use std::{cell::RefCell, rc::Rc};
 
-use focal_raft::proto::{
+use hyper_raft::proto::{
     CAMPAIGN_TRANSFER, ConfChange, ConfChangeV2, ConfState, Entry, EntryType, HardState, Message,
     MessageType, Snapshot, SnapshotMetadata,
 };
@@ -228,10 +228,10 @@ impl raft::Storage for Store {
         Ok(disk.snapshot.clone())
     }
 }
-impl focal_raft::Storage for Store {
-    fn initial_state(&self) -> Result<focal_raft::InitialState, focal_raft::StorageError> {
+impl hyper_raft::Storage for Store {
+    fn initial_state(&self) -> Result<hyper_raft::InitialState, hyper_raft::StorageError> {
         let disk = self.0.borrow();
-        Ok(focal_raft::InitialState {
+        Ok(hyper_raft::InitialState {
             hard_state: disk.hard_state.clone(),
             configuration: disk.conf.clone(),
             proposals: disk.proposals.clone(),
@@ -243,17 +243,17 @@ impl focal_raft::Storage for Store {
         high: u64,
         max_bytes: u64,
         into: &mut Vec<Entry>,
-    ) -> Result<(), focal_raft::StorageError> {
+    ) -> Result<(), hyper_raft::StorageError> {
         let disk = self.0.borrow();
         if low < disk.first_index() {
-            return Err(focal_raft::StorageError::Compacted);
+            return Err(hyper_raft::StorageError::Compacted);
         }
         if low > high || high > disk.last_index() + 1 {
-            return Err(focal_raft::StorageError::Unavailable);
+            return Err(hyper_raft::StorageError::Unavailable);
         }
         let page = disk.slice(low, high, max_bytes);
         into.try_reserve_exact(page.len())
-            .map_err(|_| focal_raft::StorageError::Unavailable)?;
+            .map_err(|_| hyper_raft::StorageError::Unavailable)?;
         into.extend(page);
         Ok(())
     }
@@ -262,13 +262,13 @@ impl focal_raft::Storage for Store {
         low: u64,
         high: u64,
         predicate: &mut dyn FnMut(&Entry) -> bool,
-    ) -> Result<bool, focal_raft::StorageError> {
+    ) -> Result<bool, hyper_raft::StorageError> {
         let disk = self.0.borrow();
         if low < disk.first_index() {
-            return Err(focal_raft::StorageError::Compacted);
+            return Err(hyper_raft::StorageError::Compacted);
         }
         if low > high || high > disk.last_index() + 1 {
-            return Err(focal_raft::StorageError::Unavailable);
+            return Err(hyper_raft::StorageError::Unavailable);
         }
         let first = disk.first_index();
         Ok(
@@ -277,24 +277,24 @@ impl focal_raft::Storage for Store {
                 .any(predicate),
         )
     }
-    fn term(&self, index: u64) -> Result<u64, focal_raft::StorageError> {
+    fn term(&self, index: u64) -> Result<u64, hyper_raft::StorageError> {
         let disk = self.0.borrow();
         if index < disk.snapshot_index() {
-            return Err(focal_raft::StorageError::Compacted);
+            return Err(hyper_raft::StorageError::Compacted);
         }
         disk.term(index)
-            .ok_or(focal_raft::StorageError::Unavailable)
+            .ok_or(hyper_raft::StorageError::Unavailable)
     }
-    fn first_index(&self) -> Result<u64, focal_raft::StorageError> {
+    fn first_index(&self) -> Result<u64, hyper_raft::StorageError> {
         Ok(self.0.borrow().first_index())
     }
-    fn last_index(&self) -> Result<u64, focal_raft::StorageError> {
+    fn last_index(&self) -> Result<u64, hyper_raft::StorageError> {
         Ok(self.0.borrow().last_index())
     }
-    fn snapshot(&self, request_index: u64, _to: u64) -> Result<Snapshot, focal_raft::StorageError> {
+    fn snapshot(&self, request_index: u64, _to: u64) -> Result<Snapshot, hyper_raft::StorageError> {
         let disk = self.0.borrow();
         if disk.snapshot_index() == 0 || disk.snapshot_index() < request_index {
-            return Err(focal_raft::StorageError::SnapshotTemporarilyUnavailable);
+            return Err(hyper_raft::StorageError::SnapshotTemporarilyUnavailable);
         }
         Ok(disk.snapshot.clone())
     }
@@ -757,10 +757,10 @@ impl Replica for Old {
 }
 
 // ---------------------------------------------------------------------
-// focal-raft.
+// hyper-raft.
 
 pub struct New {
-    pub raw: focal_raft::RawNode<Store>,
+    pub raw: hyper_raft::RawNode<Store>,
     store: Store,
     app: App,
 }
@@ -772,7 +772,7 @@ impl New {
             let Some(change) = change_of(&entry) else {
                 continue;
             };
-            let led = self.raw.raft.state() == focal_raft::StateRole::Leader;
+            let led = self.raw.raft.state() == hyper_raft::StateRole::Leader;
             let applied = match change {
                 Ok(change) => self.raw.apply_conf_change(&change),
                 Err(change) => self.raw.apply_conf_change_v1(&change),
@@ -793,7 +793,7 @@ impl New {
         }
     }
 }
-fn heard<T>(outcome: focal_raft::Result<T>) -> Option<T> {
+fn heard<T>(outcome: hyper_raft::Result<T>) -> Option<T> {
     match outcome {
         Ok(value) => Some(value),
         Err(error) => {
@@ -803,7 +803,7 @@ fn heard<T>(outcome: focal_raft::Result<T>) -> Option<T> {
     }
 }
 impl New {
-    pub fn fast_stats(&self) -> focal_raft::FastStats {
+    pub fn fast_stats(&self) -> hyper_raft::FastStats {
         self.raw.raft.fast_stats()
     }
     /// What the member holds approved by itself.
@@ -824,7 +824,7 @@ impl Replica for New {
         } else {
             App::decode(&store.0.borrow().snapshot.data)
         };
-        let config = focal_raft::Config {
+        let config = hyper_raft::Config {
             election_tick: settings.election_tick,
             heartbeat_tick: settings.heartbeat_tick,
             applied,
@@ -835,15 +835,15 @@ impl Replica for New {
             check_quorum: settings.check_quorum,
             pre_vote: settings.pre_vote,
             precedence: if settings.by_length {
-                focal_raft::Precedence::Length
+                hyper_raft::Precedence::Length
             } else {
-                focal_raft::Precedence::Log
+                hyper_raft::Precedence::Log
             },
             fast: settings.fast,
             seed,
-            ..focal_raft::Config::new(id)
+            ..hyper_raft::Config::new(id)
         };
-        let raw = focal_raft::RawNode::new(&config, store.clone()).expect("focal-raft opens");
+        let raw = hyper_raft::RawNode::new(&config, store.clone()).expect("hyper-raft opens");
         Self { raw, store, app }
     }
     fn id(&self) -> u64 {
@@ -884,9 +884,9 @@ impl Replica for New {
     }
     fn snapshot_status(&mut self, member: u64, arrived: bool) {
         let status = if arrived {
-            focal_raft::SnapshotStatus::Finish
+            hyper_raft::SnapshotStatus::Finish
         } else {
-            focal_raft::SnapshotStatus::Failure
+            hyper_raft::SnapshotStatus::Failure
         };
         heard(self.raw.report_snapshot(member, status));
     }
@@ -972,9 +972,9 @@ impl Replica for New {
                     progress.matched,
                     progress.next_index,
                     match progress.state {
-                        focal_raft::progress::ProgressState::Probe => 0,
-                        focal_raft::progress::ProgressState::Replicate => 1,
-                        focal_raft::progress::ProgressState::Snapshot => 2,
+                        hyper_raft::progress::ProgressState::Probe => 0,
+                        hyper_raft::progress::ProgressState::Replicate => 1,
+                        hyper_raft::progress::ProgressState::Snapshot => 2,
                     },
                     progress.paused,
                     progress.pending_snapshot,
@@ -991,10 +991,10 @@ impl Replica for New {
             commit: raft.log().committed(),
             leader: raft.leader_id(),
             role: role(match raft.state() {
-                focal_raft::StateRole::Follower => 0,
-                focal_raft::StateRole::Candidate => 1,
-                focal_raft::StateRole::Leader => 2,
-                focal_raft::StateRole::PreCandidate => 3,
+                hyper_raft::StateRole::Follower => 0,
+                hyper_raft::StateRole::Candidate => 1,
+                hyper_raft::StateRole::Leader => 2,
+                hyper_raft::StateRole::PreCandidate => 3,
             }),
             last_index: raft.log().last_index().expect("a last index"),
             persisted: raft.log().persisted(),

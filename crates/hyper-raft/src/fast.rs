@@ -28,8 +28,13 @@ use crate::{
 
 /// A proposal, from a proposer to every voter. It bears no term: what is
 /// held may come from anyone.
+///
+/// A wire identifier, not a tunable: any value outside raft-proto's
+/// `MessageType` (0 to 18, `MsgHup` to `MsgRequestPreVoteResponse`) keeps it
+/// from being read as a classic message; every member must use the same.
 pub const FAST_PROPOSE: i32 = 100;
-/// What a voter holds at an index, to the leader.
+/// What a voter holds at an index, to the leader. A wire identifier, as
+/// [`FAST_PROPOSE`].
 pub const FAST_VOTE: i32 = 101;
 
 /// Whether two entries state the same. Their index is where they are held,
@@ -66,6 +71,8 @@ pub struct Proposals {
     max_bytes: usize,
 }
 impl Proposals {
+    /// Nothing held, and room for at most `max_entries` entries of
+    /// `max_bytes` together.
     pub fn new(max_entries: usize, max_bytes: usize) -> Self {
         Self {
             held: Vec::new(),
@@ -78,12 +85,15 @@ impl Proposals {
         self.held
             .binary_search_by_key(&index, |held| held.entry.index)
     }
+    /// How many entries are held.
     pub fn len(&self) -> usize {
         self.held.len()
     }
+    /// Whether nothing is held.
     pub fn is_empty(&self) -> bool {
         self.held.is_empty()
     }
+    /// What is held at `index`.
     pub fn get(&self, index: u64) -> Option<&Entry> {
         let position = self.find(index).ok()?;
         self.held.get(position).map(|held| &held.entry)
@@ -124,6 +134,7 @@ impl Proposals {
             .filter(|held| !held.durable)
             .map(|held| &held.entry)
     }
+    /// Whether anything held is not durable yet.
     pub fn has_unstable(&self) -> bool {
         self.held.iter().any(|held| !held.durable)
     }
@@ -148,6 +159,7 @@ impl Proposals {
             .filter(|held| held.durable)
             .map(|held| &held.entry)
     }
+    /// Everything held, in order of index.
     pub fn iter(&self) -> impl Iterator<Item = &Entry> + Clone {
         self.held.iter().map(|held| &held.entry)
     }
@@ -178,6 +190,8 @@ impl Proposals {
         }
         Ok(())
     }
+    /// The bytes held: the entries as counted, and their slots by
+    /// capacity.
     pub fn resident_bytes(&self) -> usize {
         self.bytes.saturating_add(
             self.held
@@ -235,6 +249,8 @@ pub struct Votes {
     max_bytes: usize,
 }
 impl Votes {
+    /// No votes, and room for at most `max_slots` indexes of `max_bytes`
+    /// together.
     pub fn new(max_slots: usize, max_bytes: usize) -> Self {
         Self {
             slots: Vec::new(),
@@ -243,9 +259,11 @@ impl Votes {
             max_bytes,
         }
     }
+    /// Whether no vote is held.
     pub fn is_empty(&self) -> bool {
         self.slots.is_empty()
     }
+    /// Drops every vote, and the memory that held them.
     pub fn clear(&mut self) {
         self.slots = Vec::new();
         self.bytes = 0;
@@ -369,6 +387,8 @@ impl Votes {
             self.slots = Vec::new();
         }
     }
+    /// The bytes the votes hold: the entries as counted, and the slots,
+    /// choices and voters by capacity.
     pub fn resident_bytes(&self) -> usize {
         let slots = self
             .slots
@@ -410,9 +430,11 @@ pub struct Decided {
     indexes: Vec<(u64, Vec<NodeId>)>,
 }
 impl Decided {
+    /// Forgets every decided index, and the memory that held them.
     pub fn clear(&mut self) {
         self.indexes = Vec::new();
     }
+    /// Whether no index waits to be committed.
     pub fn is_empty(&self) -> bool {
         self.indexes.is_empty()
     }
@@ -420,6 +442,8 @@ impl Decided {
         self.indexes
             .binary_search_by_key(&index, |(index, _)| *index)
     }
+    /// The leader took an entry at `index`, which `holders` hold; an index
+    /// decided already keeps its holders. At most `limit` indexes wait.
     pub fn decide(&mut self, index: u64, holders: &[NodeId], limit: usize) -> Result<()> {
         let Err(position) = self.find(index) else {
             return Ok(());
@@ -435,6 +459,7 @@ impl Decided {
         self.indexes.insert(position, (index, held));
         Ok(())
     }
+    /// Whether `index` was decided and is not committed.
     pub fn knows(&self, index: u64) -> bool {
         self.find(index).is_ok()
     }
@@ -455,6 +480,8 @@ impl Decided {
         }
         Ok(())
     }
+    /// Who holds what was taken at `index`, in order; none for an index
+    /// not decided.
     pub fn holders(&self, index: u64) -> &[NodeId] {
         self.find(index)
             .ok()
@@ -480,6 +507,7 @@ impl Decided {
             self.indexes = Vec::new();
         }
     }
+    /// The bytes the decided indexes hold, by capacity.
     pub fn resident_bytes(&self) -> usize {
         self.indexes.iter().fold(
             self.indexes

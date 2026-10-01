@@ -9,7 +9,13 @@
     clippy::indexing_slicing,
     clippy::disallowed_macros,
     clippy::cast_precision_loss,
-    clippy::arithmetic_side_effects
+    clippy::arithmetic_side_effects,
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss,
+    clippy::cognitive_complexity,
+    clippy::disallowed_types,
+    unreachable_pub
 )]
 //! What the core costs a group: proposals replicated to every member and
 //! committed, with storage in memory and a network that loses nothing, so
@@ -63,7 +69,7 @@ fn replicate<R: Replica>(members: u64, batch: usize, bytes: usize, rounds: usize
 fn main() {
     println!(
         "{:<44} {:>14} {:>14} {:>8}",
-        "entries committed by every member", "raft-rs ns", "focal-raft ns", "ratio"
+        "entries committed by every member", "raft-rs ns", "hyper-raft ns", "ratio"
     );
     for (members, batch, bytes, rounds) in [
         (3u64, 1usize, 64usize, 20_000usize),

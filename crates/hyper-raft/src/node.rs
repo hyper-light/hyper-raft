@@ -23,7 +23,11 @@ use crate::{
 /// What became of a snapshot that was sent.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SnapshotStatus {
+    /// It was sent: the leader waits for the member's answer and probes
+    /// past it.
     Finish,
+    /// It did not arrive: the leader waits a heartbeat and probes past what
+    /// the member is known to hold.
     Failure,
 }
 
@@ -61,20 +65,26 @@ impl LightReady {
     pub fn commit_index(&self) -> Option<u64> {
         self.commit_index
     }
+    /// Committed and durable here: to apply.
     pub fn committed_entries(&self) -> &[Entry] {
         &self.committed_entries
     }
+    /// Takes the entries to apply, leaving none.
     pub fn take_committed_entries(&mut self) -> Vec<Entry> {
         std::mem::take(&mut self.committed_entries)
     }
+    /// To send.
     pub fn messages(&self) -> &[Message] {
         &self.messages
     }
+    /// Takes the messages to send, leaving none.
     pub fn take_messages(&mut self) -> Vec<Message> {
         std::mem::take(&mut self.messages)
     }
 }
 
+/// What the member asks of its owner at once: what to persist, send and
+/// apply. One is out at a time, until [`RawNode::advance_append`].
 #[derive(Debug, Default, PartialEq)]
 pub struct Ready {
     number: u64,
@@ -90,6 +100,7 @@ pub struct Ready {
     must_sync: bool,
 }
 impl Ready {
+    /// Which `Ready` this is, counted from one since the member opened.
     pub fn number(&self) -> u64 {
         self.number
     }
@@ -101,9 +112,11 @@ impl Ready {
     pub fn hard_state(&self) -> Option<&HardState> {
         self.hard_state.as_ref()
     }
+    /// Reads that may be served once their index is applied.
     pub fn read_states(&self) -> &[ReadState] {
         &self.read_states
     }
+    /// Takes the reads, leaving none.
     pub fn take_read_states(&mut self) -> Vec<ReadState> {
         std::mem::take(&mut self.read_states)
     }
@@ -111,6 +124,7 @@ impl Ready {
     pub fn entries(&self) -> &[Entry] {
         &self.entries
     }
+    /// Takes the entries to persist, leaving none.
     pub fn take_entries(&mut self) -> Vec<Entry> {
         std::mem::take(&mut self.entries)
     }
@@ -127,6 +141,7 @@ impl Ready {
     pub fn displaced(&self) -> &[Entry] {
         &self.displaced
     }
+    /// Takes the displaced entries, leaving none.
     pub fn take_displaced(&mut self) -> Vec<Entry> {
         std::mem::take(&mut self.displaced)
     }
@@ -138,6 +153,7 @@ impl Ready {
     pub fn committed_entries(&self) -> &[Entry] {
         self.light.committed_entries()
     }
+    /// Takes the entries to apply, leaving none.
     pub fn take_committed_entries(&mut self) -> Vec<Entry> {
         self.light.take_committed_entries()
     }
@@ -149,6 +165,7 @@ impl Ready {
             self.light.messages()
         }
     }
+    /// Takes the messages to send at once, leaving none.
     pub fn take_messages(&mut self) -> Vec<Message> {
         if self.after_persisting {
             Vec::new()
@@ -164,6 +181,8 @@ impl Ready {
             &[]
         }
     }
+    /// Takes the messages to send once this `Ready` is durable, leaving
+    /// none.
     pub fn take_persisted_messages(&mut self) -> Vec<Message> {
         if self.after_persisting {
             self.light.take_messages()
@@ -186,7 +205,10 @@ struct Given {
     snapshot: Option<u64>,
 }
 
+/// A member as its owner drives it: operations in, one [`Ready`] at a time
+/// out.
 pub struct RawNode<S> {
+    /// The state machine itself.
     pub raft: Raft<S>,
     previous_soft: SoftState,
     previous_hard: HardState,
@@ -198,6 +220,7 @@ pub struct RawNode<S> {
 }
 
 impl<S: Storage> RawNode<S> {
+    /// The member `config` names, opened on what `store` holds.
     pub fn new(config: &Config, store: S) -> Result<Self> {
         let raft = Raft::new(config, store)?;
         Ok(Self {
@@ -209,9 +232,11 @@ impl<S: Storage> RawNode<S> {
             commit_since: config.applied,
         })
     }
+    /// The storage the member reads.
     pub fn store(&self) -> &S {
         self.raft.store()
     }
+    /// The storage the member reads, for its owner to write.
     pub fn store_mut(&mut self) -> &mut S {
         self.raft.store_mut()
     }
@@ -231,15 +256,21 @@ impl<S: Storage> RawNode<S> {
         self.raft.settle_priority();
         outcome
     }
+    /// The priority this member's elections are judged by from the next
+    /// operation on ([`Config::priority`]).
     pub fn set_priority(&mut self, priority: i64) {
         self.raft.set_priority(priority);
     }
+    /// One tick of time has passed. True when the member acted on it: it
+    /// campaigned, checked its quorum or sent heartbeats.
     pub fn tick(&mut self) -> Result<bool> {
         self.operate(Raft::tick)
     }
+    /// Campaigns now, by pre-vote when the group runs it.
     pub fn campaign(&mut self) -> Result<()> {
         self.operate(|raft| raft.step(proto::message(0, MessageType::MsgHup)))
     }
+    /// Proposes an entry stating `data`, which the leader appends.
     pub fn propose(&mut self, context: Vec<u8>, data: Vec<u8>) -> Result<()> {
         self.operate(|raft| {
             let mut message = proto::message(0, MessageType::MsgPropose);
@@ -261,6 +292,8 @@ impl<S: Storage> RawNode<S> {
     pub fn propose_fast(&mut self, context: Vec<u8>, data: Vec<u8>) -> Result<u64> {
         self.operate(|raft| raft.propose_fast(context, data))
     }
+    /// Proposes a change of the configuration; one that could not be read
+    /// when applied is refused here.
     pub fn propose_conf_change(&mut self, context: Vec<u8>, change: &ConfChangeV2) -> Result<()> {
         // What could not be read when it is applied is not proposed.
         Plan::of(change)?;
@@ -340,12 +373,14 @@ impl<S: Storage> RawNode<S> {
         message.from = member;
         self.tell(message)
     }
+    /// What became of the snapshot sent to `member`.
     pub fn report_snapshot(&mut self, member: NodeId, status: SnapshotStatus) -> Result<()> {
         let mut message = proto::message(0, MessageType::MsgSnapStatus);
         message.from = member;
         message.reject = status == SnapshotStatus::Failure;
         self.tell(message)
     }
+    /// Asks the leader for a snapshot that reaches this member's log.
     pub fn request_snapshot(&mut self) -> Result<()> {
         self.operate(Raft::request_snapshot)
     }
@@ -396,6 +431,7 @@ impl<S: Storage> RawNode<S> {
     pub fn check_accounting(&self) -> Result<()> {
         self.raft.check_accounting()
     }
+    /// Whether [`RawNode::ready`] has anything to give.
     pub fn has_ready(&self) -> bool {
         let raft = &self.raft;
         !raft.msgs.is_empty()

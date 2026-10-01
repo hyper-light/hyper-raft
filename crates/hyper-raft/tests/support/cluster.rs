@@ -4,7 +4,7 @@
 //! so two groups that are alike are scheduled alike.
 use std::collections::BTreeMap;
 
-use focal_raft::proto::{
+use hyper_raft::proto::{
     ConfChangeSingle, ConfChangeTransition, ConfChangeType, ConfChangeV2, ConfState, Message,
     MessageType,
 };

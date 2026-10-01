@@ -1,9 +1,11 @@
 [package]
-name = "focal-raft"
+name = "hyper-raft"
+description = "A Raft core with no clock, disk or network, shared by slates, focal and mantle."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
 
 [dependencies]
 raft-proto.workspace = true
@@ -21,7 +23,3 @@ harness = false
 
 [lints]
 workspace = true
-
-[[bench]]
-name = "allocs"
-harness = false

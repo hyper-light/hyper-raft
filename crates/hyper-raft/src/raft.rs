@@ -47,12 +47,16 @@ pub struct Limits {
     /// for one that asks to lead carries them all, so their bytes are
     /// what one message may be.
     pub proposals: usize,
+    /// The bytes of the entries a member holds approved by itself.
     pub proposal_bytes: usize,
     /// How far above what is committed an entry may be proposed.
     pub fast_window: u64,
     /// The bytes of what a leader was told the voters hold.
     pub vote_bytes: usize,
 }
+/// focal's bounds, carried unchanged. They are literals, not derivations
+/// (mantle note 32 §2.10); `Limits::derive` replaces them in R-3
+/// (`docs/raft.md`).
 impl Default for Limits {
     fn default() -> Self {
         Self {
@@ -86,8 +90,11 @@ pub enum Precedence {
     Length,
 }
 
+/// How a member runs. [`Config::new`] gives the settings `raft-rs` 0.7
+/// defaults to, so that the two cores compare under one setting.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Config {
+    /// This member's identity; never zero.
     pub id: NodeId,
     /// Ticks without the leader before an election.
     pub election_tick: usize,
@@ -109,7 +116,11 @@ pub struct Config {
     pub check_quorum: bool,
     /// An election is asked about before a term is spent on it.
     pub pre_vote: bool,
+    /// This member's rank in elections: a voter of higher priority votes
+    /// for a candidate of lower only when the candidate's log is ahead of
+    /// its own by [`Config::precedence`]. It never judges a transfer.
     pub priority: i64,
+    /// What a candidate of lower priority must hold to be voted for.
     pub precedence: Precedence,
     /// Whether the group has the fast track ([`crate::fast`]). It is part
     /// of what the group is: every member is opened with the same.
@@ -118,9 +129,13 @@ pub struct Config {
     pub skip_bcast_commit: bool,
     /// What the election timeouts are drawn from.
     pub seed: u64,
+    /// The bounds of what grows.
     pub limits: Limits,
 }
 impl Config {
+    /// The member `id` with `raft-rs` 0.7's defaults (its `Config::default`:
+    /// an election after twenty ticks, a heartbeat every two, a window of
+    /// 256 messages, no byte bounds) and the bounds of [`Limits::default`].
     pub fn new(id: NodeId) -> Self {
         Self {
             id,
@@ -141,6 +156,9 @@ impl Config {
             limits: Limits::default(),
         }
     }
+    /// Whether the settings describe a member that can run: an identity, an
+    /// election that waits longer than a heartbeat, a window, and bounds
+    /// that admit something and agree with each other.
     pub fn validate(&self) -> Result<()> {
         if self.id == 0 {
             return Err(Error::Settings("a member's identity is zero"));
@@ -203,19 +221,26 @@ pub struct FastStats {
     pub recovered: u64,
 }
 
+/// What a member is in its group.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum StateRole {
+    /// It follows a leader, or waits to hear of one.
     #[default]
     Follower,
+    /// It asks for votes in a term of its own.
     Candidate,
+    /// It leads its term.
     Leader,
+    /// It asks whether it could be elected, spending no term.
     PreCandidate,
 }
 
 /// What a member says of itself that is not durable.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SoftState {
+    /// The leader it knows of; zero for none.
     pub leader_id: NodeId,
+    /// What it is.
     pub raft_state: StateRole,
 }
 
@@ -228,6 +253,8 @@ enum Campaign {
     Transfer,
 }
 
+/// One member: its term and vote, its role, its log and what it knows of
+/// the others.
 pub struct Raft<S> {
     pub(crate) id: NodeId,
     pub(crate) term: u64,
@@ -305,15 +332,19 @@ impl Outgoing {
     /// group queues at most, a heartbeat a peer or a vote request a peer,
     /// and one more.
     pub const SMALLEST: usize = 4;
+    /// How many messages wait.
     pub fn len(&self) -> usize {
         self.msgs.len()
     }
+    /// Whether no message waits.
     pub fn is_empty(&self) -> bool {
         self.msgs.is_empty()
     }
+    /// The messages that wait, in the order queued.
     pub fn as_slice(&self) -> &[Message] {
         &self.msgs
     }
+    /// The slots the queue holds.
     pub fn capacity(&self) -> usize {
         self.msgs.capacity()
     }
@@ -563,7 +594,36 @@ impl<S: Storage> Outbox<'_, S> {
     }
 }
 
+/// What the term check of [`Raft::step`] leaves of a message.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TermChecked {
+    /// The message goes on to the handler of its kind.
+    Handle,
+    /// The term check answered it or dropped it.
+    Done,
+}
+
+/// Whether a message carries a term or an index at the end of what is
+/// counted, past which the next could not be named.
+fn counts_beyond_bound(message: &Message) -> bool {
+    [
+        message.term,
+        message.index,
+        message.commit,
+        message.log_term,
+        message.commit_term,
+        message.request_snapshot,
+        message.reject_hint,
+    ]
+    .contains(&u64::MAX)
+        || message
+            .entries
+            .iter()
+            .any(|entry| entry.index == u64::MAX || entry.term == u64::MAX)
+}
+
 impl<S: Storage> Raft<S> {
+    /// The member `config` names, opened on what `store` holds.
     pub fn new(config: &Config, store: S) -> Result<Self> {
         config.validate()?;
         let initial = store.initial_state()?;
@@ -631,18 +691,23 @@ impl<S: Storage> Raft<S> {
     pub fn config(&self) -> &Config {
         &self.config
     }
+    /// This member's identity.
     pub fn id(&self) -> NodeId {
         self.id
     }
+    /// This member's term.
     pub fn term(&self) -> u64 {
         self.term
     }
+    /// Whom this member voted for in its term; zero for none.
     pub fn vote(&self) -> NodeId {
         self.vote
     }
+    /// What this member is.
     pub fn state(&self) -> StateRole {
         self.state
     }
+    /// The leader this member knows of; zero for none.
     pub fn leader_id(&self) -> NodeId {
         self.leader_id
     }
@@ -650,24 +715,31 @@ impl<S: Storage> Raft<S> {
     pub fn pending_conf_index(&self) -> u64 {
         self.pending_conf_index
     }
+    /// The member this leader hands the lead to, while it does.
     pub fn lead_transferee(&self) -> Option<NodeId> {
         self.lead_transferee
     }
+    /// This member's log.
     pub fn log(&self) -> &Log<S> {
         &self.log
     }
+    /// The storage this member reads.
     pub fn store(&self) -> &S {
         self.log.store()
     }
+    /// The storage this member reads, for its owner to write.
     pub fn store_mut(&mut self) -> &mut S {
         self.log.store_mut()
     }
+    /// What this member knows of each member, and the votes it holds.
     pub fn tracker(&self) -> &Tracker {
         &self.tracker
     }
+    /// The configuration in force.
     pub fn configuration(&self) -> &Configuration {
         self.tracker.configuration()
     }
+    /// The messages that wait to be taken, in the order queued.
     pub fn messages(&self) -> &[Message] {
         self.msgs.as_slice()
     }
@@ -680,36 +752,48 @@ impl<S: Storage> Raft<S> {
     pub fn held_bytes(&self) -> usize {
         self.held.bytes()
     }
+    /// Reads that may be served once their index is applied, not yet
+    /// taken.
     pub fn read_states(&self) -> &[ReadState] {
         &self.read_states
     }
+    /// How many reads wait for their quorum.
     pub fn pending_read_count(&self) -> usize {
         self.read_only.len()
     }
+    /// How many reads wait to be taken.
     pub fn ready_read_count(&self) -> usize {
         self.read_states.len()
     }
+    /// Ticks since this member last heard its leader, or last campaigned.
     pub fn election_elapsed(&self) -> usize {
         self.election_elapsed
     }
+    /// The ticks this member waits, in this term, before it campaigns:
+    /// drawn from `[election_tick, 2 election_tick)` by [`Config::seed`].
     pub fn randomized_election_timeout(&self) -> usize {
         self.randomized_election_timeout
     }
     pub(crate) fn committed_bytes_per_ready(&self) -> u64 {
         self.config.max_committed_size_per_ready
     }
+    /// The bytes of proposals this leader holds uncommitted, as
+    /// [`Config::max_uncommitted_size`] counts them.
     pub fn uncommitted_bytes(&self) -> usize {
         self.uncommitted_bytes
     }
+    /// The snapshot storage does not hold yet.
     pub fn snapshot(&self) -> Option<&Snapshot> {
         self.log.unstable().snapshot()
     }
+    /// Who leads and what this member is.
     pub fn soft_state(&self) -> SoftState {
         SoftState {
             leader_id: self.leader_id,
             raft_state: self.state,
         }
     }
+    /// The term, the vote and the commit, to persist.
     pub fn hard_state(&self) -> HardState {
         HardState {
             term: self.term,
@@ -725,6 +809,8 @@ impl<S: Storage> Raft<S> {
     pub fn has_pending_conf(&self) -> bool {
         self.pending_conf_index > self.log.applied()
     }
+    /// Whether the committed entry is of this member's term: a leader
+    /// serves reads only once it is.
     pub fn commit_to_current_term(&self) -> bool {
         self.log
             .term(self.log.committed())
@@ -738,6 +824,7 @@ impl<S: Storage> Raft<S> {
     pub fn priority_in_force(&self) -> i64 {
         self.priority_in_force
     }
+    /// The priority the owner gives, in force once the member has a term.
     pub fn set_priority(&mut self, priority: i64) {
         self.priority = priority;
         self.settle_priority();
@@ -1092,6 +1179,7 @@ impl<S: Storage> Raft<S> {
         }
         Ok(())
     }
+    /// Storage holds the snapshot at `index`.
     pub fn on_persist_snapshot(&mut self, index: u64) -> Result<()> {
         self.log.maybe_persist_snapshot(index).map(|_| ())
     }
@@ -1339,73 +1427,12 @@ impl<S: Storage> Raft<S> {
             return self.step_fast_vote(message);
         }
         let kind = proto::message_type(&message).ok_or(Error::Violation("a message of no kind"))?;
-        if [
-            message.term,
-            message.index,
-            message.commit,
-            message.log_term,
-            message.commit_term,
-            message.request_snapshot,
-            message.reject_hint,
-        ]
-        .contains(&u64::MAX)
-            || message
-                .entries
-                .iter()
-                .any(|entry| entry.index == u64::MAX || entry.term == u64::MAX)
-        {
+        if counts_beyond_bound(&message) {
             return Err(Error::Violation(
                 "a term or an index beyond what is counted",
             ));
         }
-        if message.term == 0 {
-            // The member's own, or forwarded to it.
-        } else if message.term > self.term {
-            if matches!(
-                kind,
-                MessageType::MsgRequestVote | MessageType::MsgRequestPreVote
-            ) {
-                let force = message.context.as_slice() == CAMPAIGN_TRANSFER;
-                let in_lease = self.config.check_quorum
-                    && self.leader_id != 0
-                    && self.election_elapsed < self.config.election_tick;
-                if !force && in_lease {
-                    // One that heard its leader within an election timeout
-                    // neither moves its term nor votes: a member removed
-                    // from the group cannot disturb it.
-                    return Ok(());
-                }
-            }
-            let granted = kind == MessageType::MsgRequestPreVoteResponse && !message.reject;
-            if kind == MessageType::MsgRequestPreVote || granted {
-                // Asking moves no term, and neither does being granted:
-                // the term moves when the election is held.
-            } else if matches!(
-                kind,
-                MessageType::MsgAppend | MessageType::MsgHeartbeat | MessageType::MsgSnapshot
-            ) {
-                self.become_follower(message.term, message.from)?;
-            } else {
-                self.become_follower(message.term, 0)?;
-            }
-        } else if message.term < self.term {
-            if (self.config.check_quorum || self.config.pre_vote)
-                && matches!(kind, MessageType::MsgHeartbeat | MessageType::MsgAppend)
-            {
-                // A leader of an older term: this member moved its term
-                // while it was cut off. Its answer tells that leader, which
-                // no vote request of this member would, refused as they
-                // are while the leader is heard.
-                self.send(proto::message(message.from, MessageType::MsgAppendResponse))?;
-            } else if kind == MessageType::MsgRequestPreVote {
-                // Answered and not dropped: a candidate of an older term
-                // that hears nothing would ask for ever.
-                let mut answer =
-                    proto::message(message.from, MessageType::MsgRequestPreVoteResponse);
-                answer.term = self.term;
-                answer.reject = true;
-                self.send(answer)?;
-            }
+        if self.step_term(kind, &message)? == TermChecked::Done {
             return Ok(());
         }
 
@@ -1423,6 +1450,76 @@ impl<S: Storage> Raft<S> {
             },
         }
     }
+
+    /// Holds a message's term against this member's: a newer one moves the
+    /// member's term, an older one is answered and goes no further.
+    fn step_term(&mut self, kind: MessageType, message: &Message) -> Result<TermChecked> {
+        if message.term == 0 {
+            // The member's own, or forwarded to it.
+            Ok(TermChecked::Handle)
+        } else if message.term > self.term {
+            self.step_newer_term(kind, message)
+        } else if message.term < self.term {
+            self.step_older_term(kind, message)?;
+            Ok(TermChecked::Done)
+        } else {
+            Ok(TermChecked::Handle)
+        }
+    }
+
+    /// A message of a term newer than this member's.
+    fn step_newer_term(&mut self, kind: MessageType, message: &Message) -> Result<TermChecked> {
+        if matches!(
+            kind,
+            MessageType::MsgRequestVote | MessageType::MsgRequestPreVote
+        ) {
+            let force = message.context.as_slice() == CAMPAIGN_TRANSFER;
+            let in_lease = self.config.check_quorum
+                && self.leader_id != 0
+                && self.election_elapsed < self.config.election_tick;
+            if !force && in_lease {
+                // One that heard its leader within an election timeout
+                // neither moves its term nor votes: a member removed
+                // from the group cannot disturb it.
+                return Ok(TermChecked::Done);
+            }
+        }
+        let granted = kind == MessageType::MsgRequestPreVoteResponse && !message.reject;
+        if kind == MessageType::MsgRequestPreVote || granted {
+            // Asking moves no term, and neither does being granted:
+            // the term moves when the election is held.
+        } else if matches!(
+            kind,
+            MessageType::MsgAppend | MessageType::MsgHeartbeat | MessageType::MsgSnapshot
+        ) {
+            self.become_follower(message.term, message.from)?;
+        } else {
+            self.become_follower(message.term, 0)?;
+        }
+        Ok(TermChecked::Handle)
+    }
+
+    /// A message of a term older than this member's.
+    fn step_older_term(&mut self, kind: MessageType, message: &Message) -> Result<()> {
+        if (self.config.check_quorum || self.config.pre_vote)
+            && matches!(kind, MessageType::MsgHeartbeat | MessageType::MsgAppend)
+        {
+            // A leader of an older term: this member moved its term
+            // while it was cut off. Its answer tells that leader, which
+            // no vote request of this member would, refused as they
+            // are while the leader is heard.
+            self.send(proto::message(message.from, MessageType::MsgAppendResponse))?;
+        } else if kind == MessageType::MsgRequestPreVote {
+            // Answered and not dropped: a candidate of an older term
+            // that hears nothing would ask for ever.
+            let mut answer = proto::message(message.from, MessageType::MsgRequestPreVoteResponse);
+            answer.term = self.term;
+            answer.reject = true;
+            self.send(answer)?;
+        }
+        Ok(())
+    }
+
     fn step_vote(&mut self, kind: MessageType, message: &Message) -> Result<()> {
         let answer_kind = if kind == MessageType::MsgRequestVote {
             MessageType::MsgRequestVoteResponse

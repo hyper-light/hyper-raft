@@ -18,12 +18,16 @@ use crate::{
     error::{Error, Result},
 };
 
-/// What a vote request of a transferred campaign carries.
+/// What a vote request of a transferred campaign carries: the bytes
+/// `raft-rs` sends (its `CAMPAIGN_TRANSFER`), so either core reads the
+/// other's.
 pub const CAMPAIGN_TRANSFER: &[u8] = b"CampaignTransfer";
 
+/// The message's kind; none for a value no kind has.
 pub fn message_type(message: &Message) -> Option<MessageType> {
     MessageType::from_i32(message.msg_type)
 }
+/// The entry's kind; none for a value no kind has.
 pub fn entry_type(entry: &Entry) -> Option<EntryType> {
     EntryType::from_i32(entry.entry_type)
 }
@@ -35,7 +39,11 @@ pub fn changes_configuration(entry: &Entry) -> bool {
 pub fn encoded_bytes(entry: &Entry) -> u64 {
     u64::try_from(entry.encoded_len()).unwrap_or(u64::MAX)
 }
-/// About the bytes an entry holds in memory.
+/// About the bytes an entry encodes to: its data and context, and twelve
+/// for the tags, term, index and type, which is `raft-rs`'s
+/// `entry_approximate_size` and its derivation (ten bytes for a normal
+/// entry of small index and data, eleven for a change, rounded up for
+/// larger ones).
 pub fn approximate_bytes(entry: &Entry) -> usize {
     entry
         .data
@@ -75,12 +83,16 @@ pub fn message_bytes(message: &Message) -> usize {
         .saturating_add(payload)
         .saturating_add(snapshot)
 }
+/// The index of the last entry the snapshot covers; zero when it states
+/// none.
 pub fn snapshot_index(snapshot: &Snapshot) -> u64 {
     snapshot
         .metadata
         .as_ref()
         .map_or(0, |metadata| metadata.index)
 }
+/// The term of the last entry the snapshot covers; zero when it states
+/// none.
 pub fn snapshot_term(snapshot: &Snapshot) -> u64 {
     snapshot
         .metadata
@@ -91,6 +103,7 @@ pub fn snapshot_term(snapshot: &Snapshot) -> u64 {
 pub fn snapshot_is_empty(snapshot: &Snapshot) -> bool {
     snapshot_index(snapshot) == 0
 }
+/// An empty message of `kind` for `to`.
 pub fn message(to: NodeId, kind: MessageType) -> Message {
     Message {
         to,
@@ -104,25 +117,32 @@ pub fn message(to: NodeId, kind: MessageType) -> Message {
 pub enum Transition {
     /// At most one voter moves.
     Simple,
-    /// Into the joint configuration; `auto_leave` says whether the leader
-    /// leaves it by itself.
-    Enter { auto_leave: bool },
+    /// Into the joint configuration.
+    Enter {
+        /// Whether the leader leaves the joint configuration by itself.
+        auto_leave: bool,
+    },
     /// Out of the joint configuration.
     Leave,
 }
 /// A change as the log states it, read once.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Plan {
+    /// How the change moves the configuration.
     pub transition: Transition,
+    /// The changes that are not withdrawn, in the order stated.
     pub changes: Vec<Change>,
     /// How many changes the entry states, withdrawn ones among them.
     pub stated: usize,
+    /// What the proposer attached to the change.
     pub context: Vec<u8>,
 }
 impl Plan {
     /// The most changes one entry states.
     pub const MAX_CHANGES: usize = crate::MAX_MEMBERS;
 
+    /// The change `change` states; a violation for a kind or transition
+    /// no value names.
     pub fn of(change: &ConfChangeV2) -> Result<Self> {
         let transition = ConfChangeTransition::from_i32(change.transition)
             .ok_or(Error::Violation("unknown transition of a change"))?;
@@ -215,6 +235,7 @@ impl Plan {
 }
 
 impl Configuration {
+    /// The configuration the log or a snapshot states.
     pub fn from_conf_state(state: &ConfState) -> Result<Self> {
         let copy = |members: &[NodeId]| -> Result<Vec<NodeId>> {
             if members.len() > crate::MAX_MEMBERS {

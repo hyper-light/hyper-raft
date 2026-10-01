@@ -59,4 +59,14 @@ disallowed-methods = [
   { path = "std::fs::File::set_len", reason = "sans-io; see std::fs::write." },
   { path = "std::env::temp_dir", reason = "no /tmp; tests name and remove their own directories." },
   { path = "std::thread::sleep", reason = "sans-io: time is an input, never a blocking sleep." },
+  # The accessors generated for the enumerations of raft-proto's wire and log types unwind on a value
+  # they do not know, and a peer chooses the value; hyper_raft::proto reads them as options (focal's
+  # clippy.toml, carried with the core).
+  { path = "raft_proto::eraftpb::Message::get_msg_type", reason = "unwinds on an unknown value; use hyper_raft::proto::message_type" },
+  { path = "raft_proto::eraftpb::Entry::get_entry_type", reason = "unwinds on an unknown value; use hyper_raft::proto::entry_type" },
+  { path = "raft_proto::eraftpb::ConfChange::get_change_type", reason = "unwinds on an unknown value; use hyper_raft::proto::Plan" },
+  { path = "raft_proto::eraftpb::ConfChangeSingle::get_change_type", reason = "unwinds on an unknown value; use hyper_raft::proto::Plan" },
+  { path = "raft_proto::eraftpb::ConfChangeV2::get_transition", reason = "unwinds on an unknown value; use hyper_raft::proto::Plan" },
+  { path = "raft_proto::eraftpb::ConfChangeV2::enter_joint", reason = "unwinds on an unknown value; use hyper_raft::proto::Plan" },
+  { path = "raft_proto::eraftpb::ConfChangeV2::leave_joint", reason = "unwinds on an unknown value; use hyper_raft::proto::Plan" },
 ]

@@ -15,7 +15,9 @@ use crate::NodeId;
 /// Which quorum a decision needs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Quorum {
+    /// A majority of the voters.
     Classic,
+    /// ⌈3M/4⌉ of the M voters, for the fast track.
     Fast,
 }
 impl Quorum {

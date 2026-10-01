@@ -11,10 +11,14 @@ use crate::{
 /// A read whose index may be served once it is applied.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ReadState {
+    /// The leader's commit when the read was asked: the read may be served
+    /// once this member has applied it.
     pub index: u64,
+    /// What the asker calls the read.
     pub request_ctx: Vec<u8>,
 }
 
+/// A read the leader holds until a quorum confirms that it still leads.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PendingRead {
     /// What the asker calls the read.
@@ -30,9 +34,11 @@ pub struct PendingRead {
     acks: Vec<NodeId>,
 }
 impl PendingRead {
+    /// Who confirmed the leader for this read so far, in order of identity.
     pub fn acks(&self) -> &[NodeId] {
         &self.acks
     }
+    /// Who asked this read, in the order they asked.
     pub fn origins(&self) -> &[NodeId] {
         &self.origins
     }
@@ -49,18 +55,22 @@ pub struct ReadOnly {
     limit: usize,
 }
 impl ReadOnly {
+    /// No reads, and room for at most `limit`.
     pub fn new(limit: usize) -> Self {
         Self {
             queue: VecDeque::new(),
             limit,
         }
     }
+    /// How many reads wait.
     pub fn len(&self) -> usize {
         self.queue.len()
     }
+    /// Whether no read waits.
     pub fn is_empty(&self) -> bool {
         self.queue.is_empty()
     }
+    /// Drops every read that waits, and the memory that held them.
     pub fn clear(&mut self) {
         self.queue = VecDeque::new();
     }
@@ -152,6 +162,8 @@ impl ReadOnly {
     pub fn last_context(&self) -> Option<&[u8]> {
         self.queue.back().map(|read| read.context.as_slice())
     }
+    /// The bytes the waiting reads hold: the queue's slots and each read's
+    /// context, askers and confirmations, by capacity.
     pub fn resident_bytes(&self) -> usize {
         let slots = self
             .queue

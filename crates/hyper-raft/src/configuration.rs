@@ -8,22 +8,32 @@
 //! the majority of both the old voters and the new.
 use crate::{MAX_MEMBERS, NodeId};
 
+/// Why a configuration, or a change of one, is refused.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum ConfigurationError {
+    /// A member is named zero, which is no member.
     #[error("a member's identity is zero")]
     ZeroMember,
+    /// More members than [`MAX_MEMBERS`].
     #[error("a configuration names at most {MAX_MEMBERS} members")]
     TooManyMembers,
+    /// No voter is named.
     #[error("a configuration has no voter")]
     NoVoter,
+    /// A member is named twice, or in two roles at once.
     #[error("a member is named twice, or as a voter and a learner at once")]
     Overlap,
+    /// A change into a joint configuration while one is joint already.
     #[error("the configuration is joint, and only leaving it may follow")]
     AlreadyJoint,
+    /// Leaving, or a joint-only setting, on a configuration that is not
+    /// joint.
     #[error("the configuration is not joint")]
     NotJoint,
+    /// A simple change that would move more than one voter.
     #[error("a simple change moves at most one voter; more need a joint change")]
     NotSimple,
+    /// The memory to hold the configuration could not be reserved.
     #[error("no room for the configuration")]
     Capacity,
 }
@@ -43,6 +53,7 @@ pub enum Change {
 /// A configuration as a change made it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Changed {
+    /// The configuration after the change.
     pub configuration: Configuration,
     /// The members the change removed and added again, in order.
     pub renewed: Vec<NodeId>,
@@ -133,6 +144,9 @@ impl Configuration {
             auto_leave: self.auto_leave,
         })
     }
+    /// Whether the sets form a configuration: within [`MAX_MEMBERS`], no
+    /// zero, no member named twice or in two roles, a voter at least, and
+    /// the joint-only sets empty when the configuration is not joint.
     pub fn validate(&self) -> Result<(), ConfigurationError> {
         let sets = [
             &self.voters,
@@ -177,21 +191,29 @@ impl Configuration {
         }
         Ok(())
     }
+    /// The voters, in order: the incoming half of a joint configuration.
     pub fn voters(&self) -> &[NodeId] {
         &self.voters
     }
+    /// The voters before a joint change, in order; empty when not joint.
     pub fn outgoing(&self) -> &[NodeId] {
         &self.outgoing
     }
+    /// The learners, in order.
     pub fn learners(&self) -> &[NodeId] {
         &self.learners
     }
+    /// The outgoing voters that become learners when the joint
+    /// configuration is left, in order.
     pub fn learners_next(&self) -> &[NodeId] {
         &self.learners_next
     }
+    /// Whether the leader leaves the joint configuration by itself once it
+    /// has committed it.
     pub fn auto_leave(&self) -> bool {
         self.auto_leave
     }
+    /// Whether a decision needs the majorities of two voter sets.
     pub fn is_joint(&self) -> bool {
         !self.outgoing.is_empty()
     }
@@ -203,6 +225,7 @@ impl Configuration {
     pub fn learns(&self, member: NodeId) -> bool {
         holds(&self.learners, member) || holds(&self.learners_next, member)
     }
+    /// Whether `member` votes or learns.
     pub fn contains(&self, member: NodeId) -> bool {
         self.votes(member) || self.learns(member)
     }

@@ -20,13 +20,19 @@
     clippy::unreachable,
     clippy::indexing_slicing,
     clippy::arithmetic_side_effects,
-    clippy::disallowed_macros
+    clippy::disallowed_macros,
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss,
+    clippy::cognitive_complexity,
+    clippy::disallowed_types,
+    unreachable_pub
 )]
 mod support;
 
 use std::collections::VecDeque;
 
-use focal_raft::proto::MessageType;
+use hyper_raft::proto::MessageType;
 use support::{Cluster, Mix, New, Old, Op, Replica, Report, Seeded, Settings};
 
 fn count(name: &str, default: u64) -> u64 {
@@ -75,7 +81,7 @@ impl Reached {
                 self.terms += 1;
             }
             for message in &output.messages {
-                match focal_raft::proto::message_type(message) {
+                match hyper_raft::proto::message_type(message) {
                     Some(MessageType::MsgAppendResponse) if message.reject => self.rejections += 1,
                     Some(MessageType::MsgTimeoutNow) => self.transfers += 1,
                     Some(
@@ -115,7 +121,7 @@ fn tells_one_that_asks(group: &Cluster<New>, op: &Op) -> bool {
         })
 }
 
-fn brief(message: &focal_raft::proto::Message) -> String {
+fn brief(message: &hyper_raft::proto::Message) -> String {
     let entries: Vec<String> = message
         .entries
         .iter()
@@ -131,7 +137,7 @@ fn brief(message: &focal_raft::proto::Message) -> String {
         .collect();
     format!(
         "{:?} {}->{} term {} log {}@{} commit {}@{} reject {} hint {} request {} context {:?} priority {} snapshot {:?} [{}]",
-        focal_raft::proto::message_type(message),
+        hyper_raft::proto::message_type(message),
         message.from,
         message.to,
         message.term,
@@ -164,7 +170,7 @@ fn explain(old: &[Report], new: &[Report]) -> String {
             ($what:literal, $old:expr, $new:expr) => {
                 if $old != $new {
                     lines.push(format!(
-                        "member {member} {}:\n  raft-rs:    {:?}\n  focal-raft: {:?}",
+                        "member {member} {}:\n  raft-rs:    {:?}\n  hyper-raft: {:?}",
                         $what, $old, $new
                     ));
                 }
@@ -209,7 +215,7 @@ fn explain(old: &[Report], new: &[Report]) -> String {
         differ!("refused changes", old.output.refused, new.output.refused);
         if old.output.messages != new.output.messages {
             lines.push(format!(
-                "member {member} messages:\n  raft-rs:\n{}\n  focal-raft:\n{}",
+                "member {member} messages:\n  raft-rs:\n{}\n  hyper-raft:\n{}",
                 old.output
                     .messages
                     .iter()
@@ -298,9 +304,9 @@ fn run(seed: u64, steps: u64, settings: Settings, mix: Mix, reached: &mut Reache
 
 fn campaign(name: &str, settings: Settings, mix: Mix) -> Reached {
     let mut reached = Reached::default();
-    let seeds = count("FOCAL_RAFT_SEEDS", 96);
-    let steps = count("FOCAL_RAFT_STEPS", 4_000);
-    let first = count("FOCAL_RAFT_SEED", 0);
+    let seeds = count("HYPER_RAFT_SEEDS", 96);
+    let steps = count("HYPER_RAFT_STEPS", 4_000);
+    let first = count("HYPER_RAFT_SEED", 0);
     let mut ran = 0u64;
     let mut left = 0u64;
     let mut compared = 0u64;

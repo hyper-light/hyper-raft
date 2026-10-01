@@ -9,11 +9,17 @@
     clippy::unreachable,
     clippy::indexing_slicing,
     clippy::arithmetic_side_effects,
-    clippy::disallowed_macros
+    clippy::disallowed_macros,
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss,
+    clippy::cognitive_complexity,
+    clippy::disallowed_types,
+    unreachable_pub
 )]
 mod support;
 
-use focal_raft::{
+use hyper_raft::{
     fast::{FAST_PROPOSE, FAST_VOTE},
     proto::{
         ConfChangeSingle, ConfChangeTransition, ConfChangeType, ConfChangeV2, Entry, EntryType,
@@ -22,7 +28,7 @@ use focal_raft::{
 };
 use support::{Cluster, Mix, New, Op, Replica, Seeded, Settings};
 
-fn add(total: &mut focal_raft::FastStats, more: focal_raft::FastStats) {
+fn add(total: &mut hyper_raft::FastStats, more: hyper_raft::FastStats) {
     total.proposed += more.proposed;
     total.displaced += more.displaced;
     total.held += more.held;
@@ -428,16 +434,16 @@ fn what_may_not_go_by_the_fast_track_is_refused() {
 
 #[test]
 fn a_group_with_the_fast_track_is_safe_and_settles() {
-    let seeds = count("FOCAL_RAFT_SEEDS", 96);
-    let steps = count("FOCAL_RAFT_STEPS", 4_000);
-    let first = count("FOCAL_RAFT_SEED", 0);
+    let seeds = count("HYPER_RAFT_SEEDS", 96);
+    let steps = count("HYPER_RAFT_STEPS", 4_000);
+    let first = count("HYPER_RAFT_SEED", 0);
     let mix = Mix {
         leader_leaves: true,
         fast: 60,
         ..Mix::everything()
     };
     let (mut terms, mut committed) = (0, 0);
-    let mut did = focal_raft::FastStats::default();
+    let mut did = hyper_raft::FastStats::default();
     for seed in first..first + seeds {
         let mut group: Cluster<New> = Cluster::new(5, &[1, 2, 3, 4, 5], Settings::fast(), seed);
         let mut rng = Seeded(seed);

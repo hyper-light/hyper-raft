@@ -44,9 +44,11 @@ fn proposable(entry: &Entry) -> bool {
 }
 
 impl<S: Storage> Raft<S> {
+    /// Whether this member's group runs the fast track ([`crate::Config::fast`]).
     pub fn fast(&self) -> bool {
         self.config.fast
     }
+    /// What the fast track did at this member since it opened.
     pub fn fast_stats(&self) -> FastStats {
         self.fast_stats
     }

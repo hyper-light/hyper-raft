@@ -187,9 +187,11 @@ impl Unstable {
         self.offset = proto::snapshot_index(&snapshot).saturating_add(1);
         self.snapshot = Some(snapshot);
     }
+    /// The entries storage does not hold yet, in order of index.
     pub fn entries(&self) -> &[Entry] {
         &self.entries
     }
+    /// The snapshot storage does not hold yet.
     pub fn snapshot(&self) -> Option<&Snapshot> {
         self.snapshot.as_ref()
     }
@@ -239,6 +241,8 @@ impl Unstable {
     }
 }
 
+/// The log of one member: storage, what follows it in memory, and the
+/// committed, persisted and applied indexes.
 pub struct Log<S> {
     pub(crate) store: S,
     pub(crate) unstable: Unstable,
@@ -250,6 +254,8 @@ pub struct Log<S> {
 }
 
 impl<S: Storage> Log<S> {
+    /// The log `store` holds, with room for at most `max_unstable` entries
+    /// that are not yet durable.
     pub fn new(store: S, max_unstable: usize) -> Result<Self> {
         let first = store.first_index()?;
         let last = store.last_index()?;
@@ -268,30 +274,38 @@ impl<S: Storage> Log<S> {
             max_unstable,
         })
     }
+    /// The storage the log reads.
     pub fn store(&self) -> &S {
         &self.store
     }
+    /// The storage the log reads, for its owner to write.
     pub fn store_mut(&mut self) -> &mut S {
         &mut self.store
     }
+    /// The highest index known committed.
     pub fn committed(&self) -> u64 {
         self.committed
     }
+    /// The highest index known durable.
     pub fn persisted(&self) -> u64 {
         self.persisted
     }
+    /// The highest index applied.
     pub fn applied(&self) -> u64 {
         self.applied
     }
+    /// What storage does not hold yet.
     pub fn unstable(&self) -> &Unstable {
         &self.unstable
     }
+    /// The index of the first entry the log holds.
     pub fn first_index(&self) -> Result<u64> {
         match self.unstable.first_index() {
             Some(index) => Ok(index),
             None => Ok(self.store.first_index()?),
         }
     }
+    /// The index of the last entry the log holds, or of its snapshot.
     pub fn last_index(&self) -> Result<u64> {
         match self.unstable.last_index() {
             Some(index) => Ok(index),
@@ -310,10 +324,12 @@ impl<S: Storage> Log<S> {
             None => Ok(self.store.term(index)?),
         }
     }
+    /// The term of the last entry; fatal when the log cannot say it.
     pub fn last_term(&self) -> Result<u64> {
         self.term(self.last_index()?)
             .map_err(|_| Error::Invariant("the last entry's term is not held"))
     }
+    /// Whether the log holds an entry of `term` at `index`.
     pub fn match_term(&self, index: u64, term: u64) -> bool {
         self.term(index).is_ok_and(|held| held == term)
     }
@@ -402,6 +418,8 @@ impl<S: Storage> Log<S> {
         self.commit_to(committed.min(last_new))?;
         Ok(Some((conflict, last_new)))
     }
+    /// Commits through `to`; a commit at or below the one known changes
+    /// nothing, and one beyond the log is a violation.
     pub fn commit_to(&mut self, to: u64) -> Result<()> {
         if self.committed >= to {
             return Ok(());
@@ -412,6 +430,8 @@ impl<S: Storage> Log<S> {
         self.committed = to;
         Ok(())
     }
+    /// The entries through `index` are applied, which lies between what was
+    /// applied and what is committed; zero says nothing.
     pub fn applied_to(&mut self, index: u64) -> Result<()> {
         if index == 0 {
             return Ok(());
@@ -451,6 +471,7 @@ impl<S: Storage> Log<S> {
         self.unstable.payload = 0;
         Ok(())
     }
+    /// The snapshot at `index` is handed to storage.
     pub fn stable_snapshot(&mut self, index: u64) -> Result<()> {
         match &self.unstable.snapshot {
             Some(snapshot) if proto::snapshot_index(snapshot) == index => {
@@ -490,6 +511,9 @@ impl<S: Storage> Log<S> {
             .min(last.saturating_add(1));
         self.slice(index, high, max_bytes)
     }
+    /// Whether a log that ends at `(last_index, term)` is at least as up to
+    /// date as this one (Raft §5.4.1): a later last term, or the same and
+    /// at least as long.
     pub fn is_up_to_date(&self, last_index: u64, term: u64) -> Result<bool> {
         let held = self.last_term()?;
         Ok(term > held || (term == held && last_index >= self.last_index()?))
@@ -512,6 +536,8 @@ impl<S: Storage> Log<S> {
             Ok(Vec::new())
         }
     }
+    /// A copy of a snapshot at `request_index` or later for the member `to`:
+    /// the one not yet durable if it is late enough, else storage's.
     pub fn snapshot(&self, request_index: u64, to: u64) -> std::result::Result<Snapshot, Error> {
         if let Some(snapshot) = &self.unstable.snapshot
             && proto::snapshot_index(snapshot) >= request_index
@@ -547,6 +573,8 @@ impl<S: Storage> Log<S> {
             false
         }
     }
+    /// Storage holds the snapshot at `index`; true when that moved what is
+    /// known durable.
     pub fn maybe_persist_snapshot(&mut self, index: u64) -> Result<bool> {
         if index <= self.persisted {
             return Ok(false);

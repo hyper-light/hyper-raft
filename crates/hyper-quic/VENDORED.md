@@ -337,3 +337,16 @@ with its own counting allocator, after with `hyper_measure::alloc`, which counts
 No path gained an allocation. A first draft built `TransportError`s, whose reason is a `String`,
 eagerly in `ok_or(...)` on the success path, which cost 9–10 allocations a handshake; they are
 built only on failure (`ok_or_else`).
+
+## 5. What the application layer reads (2026-10-01)
+
+Two items made public for hyper-transport (mantle note 32 §3.4); no behaviour changes.
+
+- **Patch Q5: the assembler's span limit.** `MAX_CHUNKS` (1,024, `connection/assembler.rs`), past
+  which a stream's out-of-order spans close the connection ("too many gaps in stream buffer"), is
+  public and re-exported as `hyper_quic::MAX_STREAM_CHUNKS`, so that a stream window is derived from
+  it instead of from a literal (node.md §3.3: a window of at most `2 · 1,024 · d` cannot reach it).
+- **`Streams::write_limit`.** The stream bytes the connection may still take from the application
+  now: the peer's connection credit not yet spent and room in the send window, whichever is less
+  (the existing `StreamsState::write_limit`). quinn keeps one connection window, so an application
+  that keeps a credit reserve for its more urgent classes (note 32 T16) needs to see it.

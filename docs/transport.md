@@ -178,6 +178,65 @@ Each stage lands with its tests, its GAPS row and its design status in the same 
      past its reservation refused before it is retained).
    - qlog output decodable by standard tooling.
 
+## 4a. The application layer: `hyper-transport` (T-1, 2026-10-01)
+
+Built: `crates/hyper-transport`, mantle note 32 §3.4's application layer, a sans-io state machine
+over hyper-quic. Its generic core is ported from focal-wire (`ORIGIN.md` lists each module's source,
+each ported test's origin, and what was left out).
+
+**The API as it stands** (`src/lib.rs`, `src/endpoint.rs`):
+- A project supplies `Classes` (its kinds; the class each sender role gives each kind, or none; each
+  class's rank and frame bound; each kind's wire code), `Budget<Class>` (reserve and release over its
+  own accountant, on the lane `Window` or `Class(c)`) and `Directory` (the peer and role a
+  certificate names, and the name a peer's certificate is checked against when dialed).
+- `Endpoint<C, B, D>` is driven by `handle_datagram`, `poll_transmit`, `poll_timeout`,
+  `handle_timeout` and `poll_event`, every one taking the caller's `now`; its owner calls `connect`,
+  `disconnect`, `open`, `head`, `write_body`, `read_body`, `body_complete`, `reply`, `end`,
+  `reserve`, `release`, `send_frame`, `export_keying_material`, `path`, `credit`, `exchange_tail`
+  and `stats`.
+- Events: `Connected { peer, role, epoch }`, `Request`, `Reply`, `BodyReady`, `Writable`,
+  `Frame { peer, lane, kind, frame }`, `Refused { exchange, refusal, by_peer }`,
+  `Closed { peer, epoch }`, `Unreachable`.
+- Departures from §3.4's sketch, none of substance: `Directory` is the third type parameter (§3.4's
+  `PeerId` presumed one); `Classes` gains `RANKS`, `rank`, `kind_code`, `kind_of` (the reserve counts
+  the classes above, and the kind crosses the wire); `send_frame` takes the frame's kind (its class
+  bounds it and orders it); `write_body`, `reply` and `read_body` take the endpoint's last `now`
+  rather than one of their own; `handle_datagram` takes `&[u8]`, since hyper-quic takes its own
+  buffer.
+
+**What it does.** One connection per peer under mutual TLS 1.3 with 0-RTT off. An exchange is a
+bidirectional stream: each message a 20-byte prefix (kind, head and body lengths, CRC-32C of prefix
+and head), the head, and an optional body ended by its CRC-32C. The receiver checks the prefix
+against its own class bound and head bound before reserving the head from the budget and reading
+it; bodies are read only into the owner's reservations, so QUIC's flow control holds the sender.
+The class comes from the kind and the sender's role. A class leaves one packet's stream bytes of the
+peer's connection credit for each class above it (slates' reserve), and takes no credit while a more
+urgent class on the connection is waiting for it (strict priority at the point credit is taken,
+which the end-to-end run showed quinn's send-order priority alone does not give). The receive window
+starts at RFC 9002's initial window plus the reserve and doubles when consumed within two round
+trips (Chromium's rule; a round trip under the 1 ms timer granularity counts as 1 ms), each growth
+reserved from the budget; the stream window is quinn's assembler limit made explicit (patch Q5).
+Exchanges are judged by progress-charged deadlines (T39); an owner that is not reading a body is not
+charged for it. Replication frames travel on lanes, unidirectional streams as wide as the core's
+window, always read; a frame its class or the budget cannot take is skipped and counted. Admission
+bounds pending handshakes (Retry under load), identities, connections per identity (the one used
+longest ago replaced) and connections in all; every exchange and lane has a table bound. Every
+refusal is typed, and one that ends an exchange crosses the wire as the stream reset's code.
+
+**Measured** (`docs/benchmarks.md`, "hyper-transport against focal-wire's core"): an exchange adds
+0.27 allocations to the bare hyper-quic stream without a body and about 5 with one (three QUIC
+writes a side, each copied by hyper-quic); against focal-wire's core on loopback it makes half the
+allocations of a small exchange and a third to a half of the bytes at every size, and its rounds
+are faster at every size, on a machine at load 22 to 27. End to end, between real processes over
+UDP: exchanges in every class with megabyte bodies, the reserve keeping a vote moving past held
+bulk, typed refusals at every bound, a peer killed mid-upload, and frames on lanes in order.
+
+**Owed.** The tokio adapter (`hyper-tokio`, T-1's second half) and focal-wire's domain layer over
+this crate, with focal's suites as the gate; the TCP fallback (T53); slates' class-latency grid on
+this layer; the 1.5 to 3 reallocations an exchange of the larger bodies makes before its
+reservations reach their size; a frame bound a lane's frames are checked against apart from the
+message bound.
+
 ## 5. Consumers
 
 slates, focal and mantle each vendor a snapshot of the conformed crates, recording the hyper-raft revision

@@ -68,9 +68,9 @@ pub use bloom_token_log::BloomTokenLog;
 mod connection;
 pub use crate::connection::{
     Chunk, Chunks, ClosedStream, Connection, ConnectionError, ConnectionStats, Datagrams, Event,
-    FinishError, FrameStats, PathStats, ReadError, ReadableError, RecvStream, RttEstimator,
-    SendDatagramError, SendStream, ShouldTransmit, StreamEvent, Streams, UdpStats, WriteError,
-    Written,
+    FinishError, FrameStats, MAX_STREAM_CHUNKS, PathStats, ReadError, ReadableError, RecvStream,
+    RttEstimator, SendDatagramError, SendStream, ShouldTransmit, StreamEvent, Streams, UdpStats,
+    WriteError, Written,
 };
 pub use connection::qlog::QlogStream;
 

@@ -1,0 +1,35 @@
+[package]
+name = "hyper-transport"
+description = "The application layer over hyper-quic, sans-io: one connection per peer, request and reply exchanges in classes with a credit reserve, streaming bodies through reservations, replication lanes and typed refusals at every bound"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+hyper-quic = { path = "../hyper-quic" }
+hyper-timing = { path = "../hyper-timing" }
+# The QUIC layer takes a received datagram as `BytesMut` (hyper-quic's own dependency).
+bytes = "1"
+# Every message's prefix and head, and every body, carry a CRC-32C (mantle CLAUDE.md §6).
+crc32c.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+hyper-measure = { path = "../hyper-measure" }
+# Certificates for the tests' mutual TLS (hyper-quic's own dev-dependency).
+rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem"] }
+
+[[test]]
+name = "e2e"
+# The scenarios run one after another in one thread, each with one peer process at a time
+# (CLAUDE.md §1a; no thread per anything). The binary also serves as the peer process.
+harness = false
+
+[[bench]]
+name = "allocs"
+harness = false
+
+[lints]
+workspace = true

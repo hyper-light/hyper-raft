@@ -15,6 +15,7 @@ exclude = [
     "crates/hyper-datagram-compare",
     "crates/hyper-swim-compare",
     "crates/hyper-timing-compare",
+    "crates/hyper-transport-compare",
     "crates/hyper-tls/tests/support/rustls-test",
 ]
 

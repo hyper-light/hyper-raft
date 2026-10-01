@@ -40,7 +40,7 @@ mod ack_frequency;
 use ack_frequency::AckFrequencyState;
 
 mod assembler;
-pub use assembler::Chunk;
+pub use assembler::{Chunk, MAX_CHUNKS as MAX_STREAM_CHUNKS};
 
 mod cid_state;
 use cid_state::CidState;

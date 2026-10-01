@@ -88,6 +88,14 @@ impl<'a> Streams<'a> {
         self.state
     }
 
+    /// The stream bytes the connection may still take from the application now: the peer's
+    /// connection credit not yet spent and room in the send window, whichever is less. An
+    /// application that keeps credit back for its more urgent streams writes its others within
+    /// this less what it keeps.
+    pub fn write_limit(&self) -> u64 {
+        self.state.write_limit()
+    }
+
     /// The number of streams that may have unacknowledged data.
     pub fn send_streams(&self) -> usize {
         self.state.send_streams

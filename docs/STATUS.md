@@ -20,7 +20,7 @@ The law's four columns:
 | hyper-log | mantle-log `147f035`, with history (L-1); one owner and tickets (L-2) | yes | appends and fetches into a reservation: 0 allocations once warm (was 23 an append at one replica, 8.4 at sixteen) | against mantle-log (its own `mantle bench log`) and focal-log `4bf7b64` | yes: a writer process killed with SIGKILL mid-append 24 times, every acknowledged append recovered | yes |
 | hyper-block | mantle-disk `147f035`, with history: block, buf, commit, issuer and what they need | yes | `Pool` takes and gives with no allocation once grown | through hyper-log | through hyper-log | yes |
 | hyper-durable | mantle's replica shell (D-1) | | | | | not started |
-| hyper-transport | focal-wire's core (T-1) | | | | | not started |
+| hyper-transport | focal-wire's core `99191da` (T-1), slates' credit law; `ORIGIN.md` | yes | an exchange adds 0.27 allocations to a bare hyper-quic stream without a body, about 5 with one (three QUIC writes a side); a lane frame 1.07; reallocations at the bare stream's (`docs/benchmarks.md`) | yes: against focal-wire's core at `99191da` on loopback, half its allocations for a small exchange, a third to a half of its bytes, faster rounds at every size (load 22–27); slates' session plane not comparable until its adapter drives this layer | yes: processes over UDP; every class with megabyte bodies, the class reserve under held bulk, typed refusals at every bound, a peer killed mid-upload, lane frames in order | no (`transport`); the tokio adapter owed |
 | hyper-multilog, hyper-sim, hyper-check, hyper-tokio | note 32 §3.2 | | | | | not started |
 
 ## Consumers

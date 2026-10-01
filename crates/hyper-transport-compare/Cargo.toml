@@ -1,0 +1,26 @@
+[package]
+name = "hyper-transport-compare"
+description = "hyper-transport measured against the application layer it replaces, on one workload: focal-wire's core (its transport configuration, its frame codec and its per-exchange stream over quinn and tokio)."
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+license = "MIT"
+publish = false
+
+# A workspace of its own: focal-wire is built from focal's repository at a pinned revision, which
+# the gates of this workspace do not fetch (docs/benchmarks.md).
+[workspace]
+
+[dependencies]
+hyper-transport = { path = "../hyper-transport" }
+hyper-measure = { path = "../hyper-measure" }
+rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem"] }
+# focal-wire at focal `99191da` (branch slates-port), the source this crate was ported from.
+focal-wire = { git = "https://github.com/hyper-light/focal", rev = "99191dafbdda681caf3a948caf37fa7646c308aa" }
+# What focal-wire runs on, at the versions focal's lock resolves.
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-aws-lc-rs"] }
+tokio = { version = "1.48", features = ["rt", "net", "time", "io-util", "macros"] }
+
+[profile.release]
+lto = true
+debug = "line-tables-only"

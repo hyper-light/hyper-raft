@@ -370,8 +370,9 @@ pub(crate) struct TooManyChunks;
 /// Bound on the number of distinct spans kept for a stream
 ///
 /// Independent of how much memory those spans over-allocate. A frame is rejected only
-/// if compaction cannot get the count back down to this.
-const MAX_CHUNKS: usize = 1024;
+/// if compaction cannot get the count back down to this. Public so that a window can be derived
+/// from it (mantle note 32, patch Q5): the connection is closed when a stream holds more.
+pub const MAX_CHUNKS: usize = 1024;
 
 /// Minimum size of a defragmented chunk that is retained without coalescing.
 ///

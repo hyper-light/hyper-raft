@@ -971,3 +971,106 @@ cargo test -p hyper-timing
 cd crates/hyper-timing-compare && cargo build --release
 target/release/hyper-timing-compare table 7 2000000
 ```
+
+# hyper-transport against focal-wire's core
+
+The law (`CLAUDE.md` §1a) for the application layer over hyper-quic: its allocations and
+reallocations per exchange and per lane frame, measured against bare hyper-quic streams to isolate
+what the layer adds, and its cost against the core it replaces, focal-wire's, on one workload.
+
+## The machine
+
+The same Apple M5 Max (18 cores, 128 GiB), macOS 26.4.1, rustc 1.98.0, 2026-10-01 between 13:16
+and 13:40 PDT, shared with other sessions building and testing: the load average was 22 to 27
+during every run. Allocation counts are exact whatever the load; times are medians of the rounds of
+a row, and the comparison was run in four fresh processes.
+
+## Allocations
+
+`cargo bench -p hyper-transport --bench allocs`: two endpoints over the in-memory network of
+`tests/common`, which reuses its datagram buffers, so the counts are the endpoints' own, both sides,
+hyper-quic and hyper-tls included. 2,000 exchanges after 200 (500 for 64 KiB). The bare rows are the
+same exchanges written directly on hyper-quic streams, with the same heads and bodies in one write
+each way.
+
+| Workload | Allocations | Reallocations | Bytes | Time (in memory) |
+|---|---|---|---|---|
+| hyper-transport exchange, 16 B heads, no body | 8.35 | 0 | 1,110 | 3.2 µs |
+| bare hyper-quic stream, 16 B each way | 8.08 | 0 | 1,009 | 2.1 µs |
+| hyper-transport exchange, 16 B heads, 4 KiB bodies | 21.0 | 2.33 | 17,760 | 11.5 µs |
+| bare hyper-quic stream, 4 KiB + 16 B each way | 16.2 | 2.08 | 17,493 | 8.6 µs |
+| hyper-transport exchange, 16 B heads, 64 KiB bodies | 211.1 | 2.33 | 286,124 | 147.2 µs |
+| bare hyper-quic stream, 64 KiB + 16 B each way | 208.2 | 2.08 | 285,881 | 116.3 µs |
+| hyper-transport lane frame, 512 B | 1.07 | 0.09 | 620 | 0.8 µs |
+
+What the layer adds:
+- **An exchange without a body: 0.27 allocations.** Every buffer it holds is a reservation the
+  budget recycles: the prefix and head written in one QUIC write, the head read into a reservation,
+  the event queue, the exchange table and the per-connection lists reused.
+- **An exchange with a body: about 5.** Each body is three QUIC writes a side where the bare stream
+  makes one: the prefix and head, the body, and the body's CRC-32C trailer. hyper-quic copies each
+  write into its own buffer (`SendStream::write`), one allocation each. The trailer is mantle's
+  checksum rule; merging it into the owner's last write would copy the owner's bytes instead.
+- **Reallocations equal to the bare stream's** once the budget's spare buffers are chosen by size:
+  before, a reservation took whichever spare buffer was on top and grew it: 10.33 reallocations an
+  exchange at 64 KiB before, 2.33 now, against the bare stream's 2.08.
+- **A lane frame: 1.07**, the frame's one QUIC write; the frame is queued in a recycled reservation.
+- Time at 64 KiB is 27 % over the bare stream: the CRC-32C of 128 KiB and the copy of each body into
+  the reader's reservation, which the bare stream drops without reading.
+
+## Against focal-wire
+
+`crates/hyper-transport-compare` (a workspace of its own; focal-wire from focal at `99191da`): two
+endpoints in one process over two UDP sockets on loopback, one thread. One round is a request of
+the size and a reply of the size, the next round once the reply is whole. focal-wire runs its own
+transport configuration (`server_tls`, `client_tls`, `quic_transport`), its frame codec
+(`write_frame`, `read_frame_header`, `read_payload_arriving`, `require_end`) and its exchange shape
+(a bidirectional stream per request) over quinn 0.11 on a current-thread tokio runtime; its domain
+envelope and registry are left out. hyper-transport drives both endpoints from one loop polling the
+two non-blocking sockets, which spins where tokio parks: the times favour it on an idle machine and
+are recorded here on a loaded one. 2,000 rounds (250 at 512 KiB) after a tenth as many; four runs;
+the medians of the four runs' medians, the range beside them.
+
+| Size each way | focal-wire round | hyper-transport round | focal-wire allocations | hyper-transport allocations | focal-wire bytes | hyper-transport bytes |
+|---|---|---|---|---|---|---|
+| 64 B | 98 µs (79–158) | 35 µs (35–38) | 24.7 | 12.4 | 2,714 | 1,268 |
+| 4 KiB | 107 µs (85–151) | 62 µs (60–64) | 36.0 | 19.8 | 43,438 | 16,700 |
+| 64 KiB | 783 µs (756–798) | 688 µs (668–721) | 234.7 | 212.0 | 680,850 | 286,905 |
+| 512 KiB | 6,665 µs (6,393–7,011) | 5,516 µs (5,391–5,909) | 1,742 | 1,613 | 5,437,000 | 2,293,000 |
+
+hyper-transport makes half focal-wire's allocations for a small exchange and a third to a half of
+its bytes at every size: focal-wire allocates each payload whole before reading it and serialises
+each into a fresh buffer, where hyper-transport reads into the budget's recycled reservations.
+Reallocations are focal-wire's 0 against 1.5 to 3 here, the reservation buffers growing to the
+largest body before the warm-up ends at the larger sizes; that row is owed.
+
+## Against slates' session plane
+
+Not run. slates' session plane has no exchange API of its own outside its runtime: its benches
+(`class_latency_bench`, `congestion_bench`, `path_mtu_bench`) drive whole sessions through slates'
+scheduler and simulated paths, and hyper-transport replaces the plane's application layer only
+above a different wire (standard QUIC, not slates' dialect). The comparison owed is slates' class
+latency grid run on hyper-transport once slates' adapter drives it (note 32 §3.4, "slates").
+
+## End to end
+
+`cargo test -p hyper-transport --test e2e`: this machine, load 22 to 27, one peer process at a time.
+
+| Scenario | Result |
+|---|---|
+| exchanges | handshake 43–50 ms; 19 exchanges (control, request, bulk; 8 MiB and 16 × 64 KiB bodies) moved 9.0 MiB each way in 1.4–2.0 s; a vote answered in 1.3–13 ms |
+| reserve | four held bulk bodies stopped at 11,904 bytes, the peer's window less the bulk class's reserve; a vote crossed in 4.4–6.4 ms; the 16 MiB of bulk finished in 1.3–1.8 s once released |
+| refusals | kind, frame bound and budget refused by the peer, each typed; the exchange table's bound and the role refused locally; an identity past its bound replaced; one past the identity bound and an unknown certificate refused |
+| killed | an upload to a peer killed with SIGKILL refused as stalled 4.0 s after the kill (two 2 s periods); the next peer process answered after the route was retired |
+| lanes | 8,000 frames of 512 B on two lanes, echoed by the peer, in order, in 152 ms |
+
+## Commands for the transport
+
+```sh
+# The suites, the in-memory scenarios and the end-to-end scenarios.
+cargo test -p hyper-transport
+# Allocations per exchange and per frame.
+cargo bench -p hyper-transport --bench allocs
+# The comparison against focal-wire (fetches focal at 99191da).
+cd crates/hyper-transport-compare && cargo run --release -- 2000
+```

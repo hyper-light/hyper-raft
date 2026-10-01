@@ -1086,13 +1086,12 @@ impl<S: Storage> Raft<S> {
         }
         Ok(())
     }
-    fn admit_uncommitted(&mut self, entries: &[Entry]) -> bool {
+    /// Whether `bytes` more of proposals may be held uncommitted; counted when
+    /// they may.
+    fn admit_uncommitted(&mut self, bytes: usize) -> bool {
         if self.config.max_uncommitted_size == u64::MAX {
             return true;
         }
-        let bytes = entries.iter().fold(0usize, |bytes, entry| {
-            bytes.saturating_add(entry.data.len())
-        });
         let limit = usize::try_from(self.config.max_uncommitted_size).unwrap_or(usize::MAX);
         // An entry that states nothing is never refused, and one proposal
         // is always admitted.
@@ -1137,14 +1136,14 @@ impl<S: Storage> Raft<S> {
         if last.checked_add(count).is_none_or(|end| end == u64::MAX) {
             return Err(Error::Capacity("the log's indexes"));
         }
+        let bytes = entries.iter().fold(0usize, |bytes, entry| {
+            bytes.saturating_add(entry.data.len())
+        });
         if recovered {
-            let bytes = entries.iter().fold(0usize, |bytes, entry| {
-                bytes.saturating_add(entry.data.len())
-            });
             if self.config.max_uncommitted_size != u64::MAX {
                 self.uncommitted_bytes = self.uncommitted_bytes.saturating_add(bytes);
             }
-        } else if !self.admit_uncommitted(&entries) {
+        } else if !self.admit_uncommitted(bytes) {
             return Ok(false);
         }
         let mut index = last;
@@ -1153,10 +1152,8 @@ impl<S: Storage> Raft<S> {
             entry.term = self.term;
             entry.index = index;
         }
-        if let Err(error) = self.log.append(&entries) {
-            let bytes = entries.iter().fold(0usize, |bytes, entry| {
-                bytes.saturating_add(entry.data.len())
-            });
+        // The proposals move into the log: a leader copies nothing of its own.
+        if let Err(error) = self.log.append_owned(entries) {
             if self.config.max_uncommitted_size != u64::MAX {
                 self.uncommitted_bytes = self.uncommitted_bytes.saturating_sub(bytes);
             }
@@ -1881,7 +1878,7 @@ impl<S: Storage> Raft<S> {
             MessageType::MsgPropose => Err(Error::ProposalDropped),
             MessageType::MsgAppend => {
                 self.become_follower(message.term, message.from)?;
-                self.handle_append_entries(&message)
+                self.handle_append_entries(message)
             }
             MessageType::MsgHeartbeat => {
                 self.become_follower(message.term, message.from)?;
@@ -1939,7 +1936,7 @@ impl<S: Storage> Raft<S> {
                 self.election_elapsed = 0;
                 self.leader_id = message.from;
                 self.told_to_campaign = false;
-                self.handle_append_entries(&message)?;
+                self.handle_append_entries(message)?;
                 self.heard_leader()
             }
             MessageType::MsgHeartbeat => {
@@ -2020,7 +2017,7 @@ impl<S: Storage> Raft<S> {
         message.log_term = self.log.term(message.reject_hint)?;
         self.send(message)
     }
-    fn handle_append_entries(&mut self, message: &Message) -> Result<()> {
+    fn handle_append_entries(&mut self, mut message: Message) -> Result<()> {
         if self.pending_request_snapshot != 0 {
             return self.send_request_snapshot();
         }
@@ -2033,11 +2030,10 @@ impl<S: Storage> Raft<S> {
         // A leader on another core bounds its messages by their bytes
         // alone. What is more than this member may hold is left for the
         // leader to send again: the answer names the last entry taken.
-        let taken = message
-            .entries
-            .get(..self.config.limits.unstable_entries)
-            .unwrap_or(&message.entries);
-        match self.log.append_after(
+        let mut taken = std::mem::take(&mut message.entries);
+        taken.truncate(self.config.limits.unstable_entries);
+        // The leader's entries move into the log uncopied.
+        match self.log.append_after_owned(
             message.index,
             message.log_term,
             message.commit,

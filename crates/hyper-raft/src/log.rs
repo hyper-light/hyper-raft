@@ -132,31 +132,38 @@ impl Unstable {
         self.offset
             .saturating_add(u64::try_from(self.entries.len()).unwrap_or(u64::MAX))
     }
-    fn truncate_and_append(&mut self, entries: &[Entry], limit: usize) -> Result<()> {
+    /// How many held entries an append that begins at `after` keeps: all of
+    /// them when it follows the last, none when it begins at or before the
+    /// first, and those before it otherwise.
+    fn kept_before(&self, after: u64) -> Result<usize> {
+        if after == self.end() {
+            Ok(self.entries.len())
+        } else if after <= self.offset {
+            Ok(0)
+        } else {
+            position(after, self.offset).ok_or(Error::Invariant("an index before the offset"))
+        }
+    }
+    /// Takes `entries` after what is held, replacing what they overlap.
+    /// Nothing is copied: the entries move in, and when none is kept the
+    /// entries' own buffer becomes the log's, so an append to a log that holds
+    /// nothing not yet durable allocates nothing.
+    fn truncate_and_append(&mut self, mut entries: Vec<Entry>, limit: usize) -> Result<()> {
         let Some(first) = entries.first() else {
             return Ok(());
         };
         let after = first.index;
-        let kept = if after == self.end() {
-            self.entries.len()
-        } else if after <= self.offset {
-            0
-        } else {
-            position(after, self.offset).ok_or(Error::Invariant("an index before the offset"))?
-        };
+        let kept = self.kept_before(after)?;
         if kept.saturating_add(entries.len()) > limit {
             return Err(Error::Capacity("entries not yet durable"));
         }
         // Everything that can refuse has, before anything is replaced.
-        let mut copies = Vec::new();
-        copy_entries(entries, &mut copies)?;
-        self.entries
-            .try_reserve(
-                copies
-                    .len()
-                    .saturating_sub(self.entries.len().saturating_sub(kept)),
-            )
-            .map_err(|_| Error::Memory)?;
+        if kept > 0 {
+            let replaced = self.entries.len().saturating_sub(kept);
+            self.entries
+                .try_reserve(entries.len().saturating_sub(replaced))
+                .map_err(|_| Error::Memory)?;
+        }
         if after <= self.offset && after != self.end() {
             self.offset = after;
         }
@@ -164,10 +171,14 @@ impl Unstable {
             self.bytes = self.bytes.saturating_sub(proto::approximate_bytes(&entry));
             self.payload = self.payload.saturating_sub(payload_of(&entry));
         }
-        for entry in copies {
-            self.bytes = self.bytes.saturating_add(proto::approximate_bytes(&entry));
-            self.payload = self.payload.saturating_add(payload_of(&entry));
-            self.entries.push(entry);
+        for entry in &entries {
+            self.bytes = self.bytes.saturating_add(proto::approximate_bytes(entry));
+            self.payload = self.payload.saturating_add(payload_of(entry));
+        }
+        if kept == 0 {
+            self.entries = entries;
+        } else {
+            self.entries.append(&mut entries);
         }
         Ok(())
     }
@@ -239,6 +250,17 @@ impl Unstable {
         }
         Ok(())
     }
+}
+
+/// What an append will do, decided before the log changes
+/// ([`Log::append_after`]).
+struct AppendPlan {
+    /// The first index the entries replace; zero when they replace none.
+    conflict: u64,
+    /// Where in the entries sent the part to append begins.
+    from: usize,
+    /// The last index sent.
+    last_new: u64,
 }
 
 /// The log of one member: storage, what follows it in memory, and the
@@ -388,6 +410,58 @@ impl<S: Storage> Log<S> {
         entries: &[Entry],
         committed_agrees: bool,
     ) -> Result<Option<(u64, u64)>> {
+        let Some(plan) = self.plan_append(index, term, entries, committed_agrees)? else {
+            return Ok(None);
+        };
+        if plan.conflict != 0 {
+            let suffix = entries
+                .get(plan.from..)
+                .ok_or(Error::Violation("entries out of order"))?;
+            let mut copies = Vec::new();
+            copy_entries(suffix, &mut copies)?;
+            self.append_owned(copies)?;
+            // What replaced a durable entry is not durable.
+            self.persisted = self.persisted.min(plan.conflict.saturating_sub(1));
+        }
+        self.commit_to(committed.min(plan.last_new))?;
+        Ok(Some((plan.conflict, plan.last_new)))
+    }
+    /// As [`Log::append_after`], taking the leader's entries: what the log
+    /// does not hold yet moves in uncopied, and what it holds is dropped.
+    pub fn append_after_owned(
+        &mut self,
+        index: u64,
+        term: u64,
+        committed: u64,
+        mut entries: Vec<Entry>,
+        committed_agrees: bool,
+    ) -> Result<Option<(u64, u64)>> {
+        let Some(plan) = self.plan_append(index, term, &entries, committed_agrees)? else {
+            return Ok(None);
+        };
+        if plan.conflict != 0 {
+            if plan.from > entries.len() {
+                return Err(Error::Violation("entries out of order"));
+            }
+            entries.drain(..plan.from);
+            self.append_owned(entries)?;
+            // What replaced a durable entry is not durable.
+            self.persisted = self.persisted.min(plan.conflict.saturating_sub(1));
+        }
+        self.commit_to(committed.min(plan.last_new))?;
+        Ok(Some((plan.conflict, plan.last_new)))
+    }
+    /// What an append of `entries` after `(index, term)` does, decided before
+    /// the log changes: `None` when the log does not hold `(index, term)`;
+    /// otherwise the first index the entries replace (zero for none), where in
+    /// `entries` the part to append begins, and the last index sent.
+    fn plan_append(
+        &self,
+        index: u64,
+        term: u64,
+        entries: &[Entry],
+        committed_agrees: bool,
+    ) -> Result<Option<AppendPlan>> {
         let agreed = if committed_agrees { self.committed } else { 0 };
         if (index > agreed || !committed_agrees) && !self.match_term(index, term) {
             return Ok(None);
@@ -396,27 +470,29 @@ impl<S: Storage> Log<S> {
             .iter()
             .take_while(|entry| entry.index <= agreed)
             .count();
-        let entries = entries.get(skipped..).unwrap_or(&[]);
+        let rest = entries.get(skipped..).unwrap_or(&[]);
         let index = index.saturating_add(u64::try_from(skipped).unwrap_or(u64::MAX));
         let last_new = index
-            .checked_add(u64::try_from(entries.len()).unwrap_or(u64::MAX))
+            .checked_add(u64::try_from(rest.len()).unwrap_or(u64::MAX))
             .ok_or(Error::Violation("an index beyond what can be counted"))?;
-        let conflict = self.find_conflict(entries);
+        let conflict = self.find_conflict(rest);
+        let mut from = entries.len();
         if conflict != 0 {
             if conflict <= self.committed {
                 return Err(Error::Violation("an entry replaces a committed one"));
             }
             let start = position(conflict, index.saturating_add(1))
                 .ok_or(Error::Violation("entries out of order"))?;
-            let suffix = entries
-                .get(start..)
+            from = skipped
+                .checked_add(start)
+                .filter(|from| *from <= entries.len())
                 .ok_or(Error::Violation("entries out of order"))?;
-            self.append(suffix)?;
-            // What replaced a durable entry is not durable.
-            self.persisted = self.persisted.min(conflict.saturating_sub(1));
         }
-        self.commit_to(committed.min(last_new))?;
-        Ok(Some((conflict, last_new)))
+        Ok(Some(AppendPlan {
+            conflict,
+            from,
+            last_new,
+        }))
     }
     /// Commits through `to`; a commit at or below the one known changes
     /// nothing, and one beyond the log is a violation.
@@ -483,8 +559,16 @@ impl<S: Storage> Log<S> {
             )),
         }
     }
-    /// Appends after what is committed, replacing what follows.
+    /// Appends a copy of `entries` after what is committed, replacing what
+    /// follows.
     pub fn append(&mut self, entries: &[Entry]) -> Result<u64> {
+        let mut copies = Vec::new();
+        copy_entries(entries, &mut copies)?;
+        self.append_owned(copies)
+    }
+    /// Appends `entries` after what is committed, replacing what follows.
+    /// They move in uncopied ([`Unstable`]).
+    pub fn append_owned(&mut self, entries: Vec<Entry>) -> Result<u64> {
         let Some(first) = entries.first() else {
             return self.last_index();
         };

@@ -15,7 +15,7 @@
 //!
 //! The deadline, the extension and the stall window are derived from what
 //! the exchanges with these peers were measured to take
-//! ([`RoundBudget::derive`]), so a slow machine or a far group stretches its
+//! ([`RoundBudget::derive`], one law for focal and slates), so a slow machine or a far group stretches its
 //! own rounds. Nothing here reads a clock or sleeps: the caller says what
 //! time it is.
 use crate::ELECTION_MARGIN;
@@ -23,6 +23,34 @@ use std::time::Duration;
 
 fn nanos(duration: Duration) -> u64 {
     u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
+}
+
+/// The anchors a round's budget is derived from: the owner's own periods, so nothing in a budget
+/// is a hidden constant.
+#[derive(Clone, Copy, Debug)]
+pub struct RoundAnchors {
+    /// The owner's period, its heartbeat.
+    pub heartbeat_ns: u64,
+    /// Periods of no new reply after which a round is judged stalled, not merely slow: as long as
+    /// a peer may go unheard before it is suspected.
+    pub stall_periods: u32,
+    /// How many times the collection loop polls per period.
+    pub polls_per_period: u64,
+    /// The fraction of the deadline, `numerator / denominator`, at which a round that has gathered
+    /// something is first judged.
+    pub lookahead: (u64, u64),
+}
+
+impl RoundAnchors {
+    /// How often the collection loop polls: `polls_per_period` times a period, at least every
+    /// nanosecond.
+    pub fn poll_interval_ns(&self) -> u64 {
+        let heartbeat = self.heartbeat_ns.max(1);
+        heartbeat
+            .checked_div(self.polls_per_period.max(1))
+            .unwrap_or(heartbeat)
+            .max(1)
+    }
 }
 
 /// What a round may spend.
@@ -54,22 +82,26 @@ impl RoundBudget {
             stall_window_ns: deadline_ns,
         }
     }
-    /// From the owner's `period` and the `tail` of the slowest exchange
-    /// measured with the round's peers, never past `ceiling` in all: a
-    /// round opens for one period or one tail, whichever is longer, and is
-    /// given all of it while nothing has arrived; once something has, it is
-    /// judged at three quarters of the deadline in force, extended a period
-    /// at a time while replies arrive, and two periods (or one tail) without
-    /// a reply are a stall. No measurement yet opens the round to its
-    /// ceiling: a peer nothing is known about is given the time it was
-    /// always given.
-    pub fn derive(period: Duration, tail: Option<Duration>, ceiling: Duration) -> Self {
-        let ceiling_ns = nanos(ceiling).max(1);
-        let period_ns = nanos(period).clamp(1, ceiling_ns);
-        let Some(tail) = tail else {
-            return Self::hard(ceiling);
+    /// The one law for a round's budget, from focal (27 §3.1 P1) and slates (§4.8 "late work"):
+    /// from the owner's `anchors`, the `tail_ns` of the slowest exchange measured with the round's
+    /// peers, and never past `ceiling_ns` in all.
+    ///
+    /// - A round opens for one period or one tail, whichever is longer, and is given all of it
+    ///   while nothing has arrived. A fixed one-period deadline expired every WAN round with every
+    ///   reply in flight (slates `docs/bugs/2026-09-14-consensus-round-expires-inside-the-wan-rtt.md`).
+    /// - Once something has arrived, it is judged at `anchors.lookahead` of the deadline in force,
+    ///   and extended a period at a time while replies arrive. The extensions are capped at
+    ///   [`ELECTION_MARGIN`], so a round never outlasts the election timeout it would displace a
+    ///   leader over, and at the room the ceiling leaves.
+    /// - `anchors.stall_periods` periods, or one tail, without a reply are a stall.
+    /// - No measurement yet gives the round the whole ceiling, hard: a peer nothing is known about
+    ///   is never cut off before the caller's bound.
+    pub fn derive(anchors: &RoundAnchors, tail_ns: Option<u64>, ceiling_ns: u64) -> Self {
+        let ceiling_ns = ceiling_ns.max(1);
+        let period_ns = anchors.heartbeat_ns.clamp(1, ceiling_ns);
+        let Some(tail_ns) = tail_ns else {
+            return Self::hard(Duration::from_nanos(ceiling_ns));
         };
-        let tail_ns = nanos(tail);
         let deadline_ns = period_ns.max(tail_ns).min(ceiling_ns);
         let room = ceiling_ns.saturating_sub(deadline_ns);
         let extensions = room
@@ -78,10 +110,13 @@ impl RoundBudget {
             .min(ELECTION_MARGIN);
         Self {
             deadline_ns,
-            lookahead: (3, 4),
+            lookahead: anchors.lookahead,
             extension_ns: period_ns,
             max_extensions: u32::try_from(extensions).unwrap_or(u32::MAX),
-            stall_window_ns: period_ns.saturating_mul(2).max(tail_ns).min(ceiling_ns),
+            stall_window_ns: period_ns
+                .saturating_mul(u64::from(anchors.stall_periods))
+                .max(tail_ns)
+                .min(ceiling_ns),
         }
     }
     /// The longest a round on this budget lasts.
@@ -243,8 +278,18 @@ mod tests {
     fn ms(value: u64) -> Duration {
         Duration::from_millis(value)
     }
+    /// focal's anchors: a 100 ms period, two periods to a stall, judged at three quarters
+    const FOCAL: RoundAnchors = RoundAnchors {
+        heartbeat_ns: 100 * MS,
+        stall_periods: 2,
+        polls_per_period: 10,
+        lookahead: (3, 4),
+    };
+    fn derive(anchors: &RoundAnchors, tail: Option<Duration>, ceiling: Duration) -> RoundBudget {
+        RoundBudget::derive(anchors, tail.map(nanos), nanos(ceiling))
+    }
     fn budget() -> RoundBudget {
-        RoundBudget::derive(ms(100), Some(ms(10)), ms(5_000))
+        derive(&FOCAL, Some(ms(10)), ms(5_000))
     }
 
     #[test]
@@ -262,24 +307,31 @@ mod tests {
         );
         assert_eq!(budget().max_deadline_ns(), 1_100 * MS);
         // A far group opens to its tail, and its stall window is the tail.
-        let far = RoundBudget::derive(ms(100), Some(ms(1_300)), ms(5_000));
+        let far = derive(&FOCAL, Some(ms(1_300)), ms(5_000));
         assert_eq!(far.deadline_ns, 1_300 * MS);
         assert_eq!(far.stall_window_ns, 1_300 * MS);
         assert_eq!(far.max_deadline_ns(), 2_300 * MS);
         // Nothing past the ceiling: the extensions are what room is left.
-        let tight = RoundBudget::derive(ms(100), Some(ms(4_750)), ms(5_000));
+        let tight = derive(&FOCAL, Some(ms(4_750)), ms(5_000));
         assert_eq!((tight.deadline_ns, tight.max_extensions), (4_750 * MS, 2));
         assert!(tight.max_deadline_ns() <= 5_000 * MS);
-        let over = RoundBudget::derive(ms(100), Some(ms(9_000)), ms(5_000));
+        let over = derive(&FOCAL, Some(ms(9_000)), ms(5_000));
         assert_eq!((over.deadline_ns, over.max_extensions), (5_000 * MS, 0));
         assert_eq!(over.stall_window_ns, 5_000 * MS);
         // No measurement: the ceiling, hard.
         assert_eq!(
-            RoundBudget::derive(ms(100), None, ms(5_000)),
+            derive(&FOCAL, None, ms(5_000)),
             RoundBudget::hard(ms(5_000))
         );
         // A period of nothing divides nothing.
-        let zero = RoundBudget::derive(Duration::ZERO, Some(Duration::ZERO), ms(5));
+        let zero = derive(
+            &RoundAnchors {
+                heartbeat_ns: 0,
+                ..FOCAL
+            },
+            Some(Duration::ZERO),
+            ms(5),
+        );
         assert_eq!((zero.deadline_ns, zero.extension_ns), (1, 1));
         assert!(zero.max_deadline_ns() <= 5 * MS);
     }

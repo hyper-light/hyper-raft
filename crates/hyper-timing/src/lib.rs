@@ -38,7 +38,12 @@
 mod progress;
 pub use progress::{ProgressDeadline, Spent};
 mod round;
-pub use round::{DeadlineExtender, ProgressWitness, RoundBudget, RoundWait, Verdict};
+pub use round::{DeadlineExtender, ProgressWitness, RoundAnchors, RoundBudget, RoundWait, Verdict};
+mod election;
+pub use election::{
+    ElectionPriority, ElectionTimer, ElectionTiming, FollowerStep, PathEstimate,
+    REPAIR_ROUND_TRIPS, quorum_priority,
+};
 
 use std::time::Duration;
 

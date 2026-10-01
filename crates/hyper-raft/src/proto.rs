@@ -15,6 +15,27 @@ pub enum EntryType {
     EntryConfChangeV2,
 }
 
+impl EntryType {
+    /// The kind's byte in the format (`docs/raft.md` §3.1), which a log that keeps entries in its
+    /// own frames may keep too.
+    pub const fn byte(self) -> u8 {
+        match self {
+            EntryType::EntryNormal => 0,
+            EntryType::EntryConfChange => 1,
+            EntryType::EntryConfChangeV2 => 2,
+        }
+    }
+    /// The kind a byte names; none for a byte no kind has.
+    pub const fn from_byte(byte: u8) -> Option<Self> {
+        match byte {
+            0 => Some(EntryType::EntryNormal),
+            1 => Some(EntryType::EntryConfChange),
+            2 => Some(EntryType::EntryConfChangeV2),
+            _ => None,
+        }
+    }
+}
+
 /// One entry of the log.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Entry {
@@ -215,7 +236,7 @@ pub struct ConfChangeV2 {
     pub context: Vec<u8>,
 }
 
-use crate::wire::Record;
+use crate::wire::{DecodeError, Record};
 
 use crate::{
     Change, Configuration, NodeId,
@@ -309,6 +330,24 @@ pub fn message(to: NodeId, kind: MessageType) -> Message {
     }
 }
 
+/// The change a committed entry states, in the joint encoding; none for an entry that states
+/// none. A change of one member is its joint form ([`joint`]); a change entry with no data
+/// states the empty change, as a leader writes its own leave; data that is no change of its
+/// kind is the decoder's error.
+pub fn change_of(entry: &Entry) -> core::result::Result<Option<ConfChangeV2>, DecodeError> {
+    match entry.entry_type {
+        EntryType::EntryNormal => Ok(None),
+        EntryType::EntryConfChange if entry.data.is_empty() => {
+            Ok(Some(joint(&ConfChange::default())))
+        }
+        EntryType::EntryConfChange => {
+            ConfChange::decode(&entry.data).map(|single| Some(joint(&single)))
+        }
+        EntryType::EntryConfChangeV2 if entry.data.is_empty() => Ok(Some(ConfChangeV2::default())),
+        EntryType::EntryConfChangeV2 => ConfChangeV2::decode(&entry.data).map(Some),
+    }
+}
+
 /// A change of one member as the joint encoding states it: the same change, by `Auto`.
 pub fn joint(single: &ConfChange) -> ConfChangeV2 {
     ConfChangeV2 {
@@ -398,28 +437,10 @@ impl Plan {
     }
     /// The change an entry states; none for an entry that states none.
     pub fn of_entry(entry: &Entry) -> Result<Option<Self>> {
-        match entry.entry_type {
-            EntryType::EntryNormal => Ok(None),
-            EntryType::EntryConfChange => {
-                let single = if entry.data.is_empty() {
-                    ConfChange::default()
-                } else {
-                    ConfChange::decode(&entry.data)
-                        .map_err(|_| Error::Violation("a change that does not decode"))?
-                };
-                Self::of(&joint(&single)).map(Some)
-            }
-            EntryType::EntryConfChangeV2 => {
-                // A change entry with no data states the empty change: leaving the joint
-                // configuration, as the leader proposes it by itself.
-                let change = if entry.data.is_empty() {
-                    ConfChangeV2::default()
-                } else {
-                    ConfChangeV2::decode(&entry.data)
-                        .map_err(|_| Error::Violation("a change that does not decode"))?
-                };
-                Self::of(&change).map(Some)
-            }
+        match change_of(entry) {
+            Ok(None) => Ok(None),
+            Ok(Some(change)) => Self::of(&change).map(Some),
+            Err(_) => Err(Error::Violation("a change that does not decode")),
         }
     }
     /// The configuration after this change.

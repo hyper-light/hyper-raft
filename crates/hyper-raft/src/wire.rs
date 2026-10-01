@@ -197,24 +197,11 @@ fn put_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
     out.extend_from_slice(bytes);
 }
 
-fn entry_kind(kind: EntryType) -> u8 {
-    match kind {
-        EntryType::EntryNormal => 0,
-        EntryType::EntryConfChange => 1,
-        EntryType::EntryConfChangeV2 => 2,
-    }
-}
-
-fn take_entry_kind(byte: u8) -> Result<EntryType, DecodeError> {
-    match byte {
-        0 => Ok(EntryType::EntryNormal),
-        1 => Ok(EntryType::EntryConfChange),
-        2 => Ok(EntryType::EntryConfChangeV2),
-        value => Err(DecodeError::Unknown {
-            what: "entry kind",
-            value,
-        }),
-    }
+fn take_entry_kind(value: u8) -> Result<EntryType, DecodeError> {
+    EntryType::from_byte(value).ok_or(DecodeError::Unknown {
+        what: "entry kind",
+        value,
+    })
 }
 
 /// The message kinds, in the order of their bytes.
@@ -309,7 +296,7 @@ impl Record for Entry {
             .saturating_add(self.context.len())
     }
     fn put_body(&self, out: &mut Vec<u8>) {
-        out.push(entry_kind(self.entry_type));
+        out.push(self.entry_type.byte());
         out.extend_from_slice(&self.term.to_le_bytes());
         out.extend_from_slice(&self.index.to_le_bytes());
         put_length(out, self.data.len());

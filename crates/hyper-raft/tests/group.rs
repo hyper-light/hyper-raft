@@ -18,7 +18,6 @@
     clippy::cast_possible_wrap,
     clippy::cast_sign_loss,
     clippy::cognitive_complexity,
-    clippy::disallowed_types,
     unreachable_pub
 )]
 mod support;
@@ -165,7 +164,7 @@ fn a_leader_a_change_leaves_no_voter_hands_the_group_over_and_follows() {
         let leader = leaders[0];
         assert!(leader == 2 || leader == 3);
         assert_eq!(group.peek(leader).unwrap().view().term, term + 1);
-        let conf = group.stores[(leader - 1) as usize].0.borrow().conf.clone();
+        let conf = group.disk(leader).conf.clone();
         assert_eq!(conf.voters, vec![2, 3]);
         assert_eq!(conf.learners, if demoted { vec![1] } else { vec![] });
         let reports = group.act(&Op::Propose(leader, b"after".to_vec()));
@@ -215,11 +214,7 @@ fn a_leader_leaves_a_joint_configuration_it_is_no_part_of_after() {
     let leaders = group.leaders_now();
     assert_eq!(leaders.len(), 1);
     assert_ne!(leaders[0], 1);
-    let conf = group.stores[(leaders[0] - 1) as usize]
-        .0
-        .borrow()
-        .conf
-        .clone();
+    let conf = group.disk(leaders[0]).conf.clone();
     assert_eq!(conf.voters, vec![2, 3, 4, 5]);
     assert!(conf.voters_outgoing.is_empty() && !conf.auto_leave);
     assert_eq!(
@@ -262,7 +257,7 @@ fn divided<R: Replica>(settings: Settings) -> Cluster<R> {
     assert_eq!(old.last_index, new.last_index);
     assert!(new.term > old.term);
     // The follower goes away, and the leader stops and opens again.
-    group.nodes[(other - 1) as usize] = None;
+    group.stop(other);
     group.act(&Op::Restart(leader));
     group.act(&Op::Heal);
     group.net.clear();

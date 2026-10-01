@@ -9,7 +9,7 @@ use hyper_raft::proto::{
     MessageType,
 };
 
-use super::{Output, Replica, Said, Seeded, Settings, Store, View, members, votes};
+use super::{Disk, Output, Replica, Said, Seeded, Settings, Store, View, members, votes};
 
 /// The most messages the network holds; the oldest is lost for a new one.
 const NETWORK: usize = 2048;
@@ -78,9 +78,15 @@ impl Mix {
     }
 }
 
+/// A member: running, and owning its disk, or stopped, and the cluster
+/// holds the disk until it opens again.
+pub enum Member<R> {
+    Up(R),
+    Down(Box<Store>),
+}
+
 pub struct Cluster<R> {
-    pub nodes: Vec<Option<R>>,
-    pub stores: Vec<Store>,
+    members: Vec<Member<R>>,
     pub net: Vec<Message>,
     pub blocked: Vec<(u64, u64)>,
     pub settings: Settings,
@@ -106,10 +112,8 @@ impl<R: Replica> Cluster<R> {
             voters: voters.to_vec(),
             ..ConfState::default()
         };
-        let stores: Vec<Store> = (0..count).map(|_| Store::new(boot.clone())).collect();
         let mut cluster = Self {
-            nodes: Vec::new(),
-            stores,
+            members: Vec::new(),
             net: Vec::new(),
             blocked: Vec::new(),
             settings,
@@ -122,16 +126,16 @@ impl<R: Replica> Cluster<R> {
             opened: 0,
         };
         for id in 1..=count {
-            let node = cluster.open(id);
-            cluster.nodes.push(Some(node));
+            let node = cluster.open(id, Store::new(boot.clone()));
+            cluster.members.push(Member::Up(node));
         }
         cluster
     }
-    fn open(&mut self, id: u64) -> R {
+    fn open(&mut self, id: u64, store: Store) -> R {
         self.opened += 1;
         R::open(
             id,
-            self.stores[(id - 1) as usize].clone(),
+            store,
             &self.settings,
             self.seed
                 .wrapping_mul(1_000_003)
@@ -139,13 +143,47 @@ impl<R: Replica> Cluster<R> {
         )
     }
     pub fn node(&mut self, id: u64) -> Option<&mut R> {
-        self.nodes.get_mut((id - 1) as usize)?.as_mut()
+        match self.members.get_mut((id - 1) as usize)? {
+            Member::Up(node) => Some(node),
+            Member::Down(_) => None,
+        }
     }
     pub fn peek(&self, id: u64) -> Option<&R> {
-        self.nodes.get((id - 1) as usize)?.as_ref()
+        match self.members.get((id - 1) as usize)? {
+            Member::Up(node) => Some(node),
+            Member::Down(_) => None,
+        }
+    }
+    /// What the member holds durable, running or stopped.
+    pub fn disk(&self, id: u64) -> &Disk {
+        match &self.members[(id - 1) as usize] {
+            Member::Up(node) => &node.store().0,
+            Member::Down(store) => &store.0,
+        }
+    }
+    /// The member stops: what was not durable is gone, and the cluster
+    /// holds what was.
+    pub fn stop(&mut self, id: u64) {
+        let member = &mut self.members[(id - 1) as usize];
+        if let Member::Up(node) = member {
+            let store = std::mem::take(node.store_mut());
+            *member = Member::Down(Box::new(store));
+        }
+    }
+    /// The member stops, if it runs, and opens on what was durable.
+    fn restart(&mut self, id: u64) {
+        self.stop(id);
+        let Member::Down(store) = std::mem::replace(
+            &mut self.members[(id - 1) as usize],
+            Member::Down(Box::default()),
+        ) else {
+            unreachable!("a member that was just stopped");
+        };
+        let node = self.open(id, *store);
+        self.members[(id - 1) as usize] = Member::Up(node);
     }
     pub fn ids(&self) -> Vec<u64> {
-        (1..=self.nodes.len() as u64).collect()
+        (1..=self.members.len() as u64).collect()
     }
     pub fn up(&self) -> Vec<u64> {
         self.ids()
@@ -201,14 +239,12 @@ impl<R: Replica> Cluster<R> {
             }
             self.net.push(message.clone());
         }
-        let conf = self.stores[(member - 1) as usize].0.borrow().conf.clone();
+        let conf = self.disk(member).conf.clone();
         if self.stop_who_left && view.role == 2 && !votes(&conf, member) {
             // It leads a group it is no voter of, and unwinds when it next
             // commits. Its owner stops it, and it opens as what it is.
             self.deposed += 1;
-            self.nodes[(member - 1) as usize] = None;
-            let node = self.open(member);
-            self.nodes[(member - 1) as usize] = Some(node);
+            self.restart(member);
         }
         Report {
             member,
@@ -274,9 +310,7 @@ impl<R: Replica> Cluster<R> {
             }
             Op::Restart(id) => {
                 // What was not durable is gone; what was is what it opens on.
-                self.nodes[(*id - 1) as usize] = None;
-                let node = self.open(*id);
-                self.nodes[(*id - 1) as usize] = Some(node);
+                self.restart(*id);
                 reports.push(self.report(*id, None));
             }
             Op::Compact(id) => {
@@ -316,7 +350,7 @@ impl<R: Replica> Cluster<R> {
     }
 
     fn change(&self, rng: &mut Seeded, leader: u64, mix: &Mix) -> ConfChangeV2 {
-        let conf = self.stores[(leader - 1) as usize].0.borrow().conf.clone();
+        let conf = self.disk(leader).conf.clone();
         let joint = !conf.voters_outgoing.is_empty();
         if joint && rng.chance(70) {
             // Out of the joint configuration.
@@ -483,8 +517,7 @@ impl<R: Replica> Cluster<R> {
             }
             if let Some(index) = proposed {
                 let leader = self.leaders_now().into_iter().next();
-                let conf =
-                    leader.map(|leader| self.stores[(leader - 1) as usize].0.borrow().conf.clone());
+                let conf = leader.map(|leader| self.disk(leader).conf.clone());
                 if let Some(conf) = conf
                     && members(&conf).iter().all(|member| {
                         self.peek(*member)
@@ -510,7 +543,7 @@ impl<R: Replica> Cluster<R> {
         }
         for id in self.ids() {
             let view = self.peek(id).map(|node| node.view());
-            let conf = self.stores[(id - 1) as usize].0.borrow().conf.clone();
+            let conf = self.disk(id).conf.clone();
             println!("member {id}: proposed {proposed:?} {conf:?}\n  {view:?}");
         }
         false

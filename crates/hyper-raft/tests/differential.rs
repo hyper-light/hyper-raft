@@ -25,7 +25,6 @@
     clippy::cast_possible_wrap,
     clippy::cast_sign_loss,
     clippy::cognitive_complexity,
-    clippy::disallowed_types,
     unreachable_pub
 )]
 mod support;

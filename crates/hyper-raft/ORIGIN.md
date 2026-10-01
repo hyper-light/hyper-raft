@@ -74,10 +74,31 @@ lints, `string_slice`, `panic_in_result_fn`, `unwrap_in_result`, `undocumented_u
     `cast_possible_truncation` and `unreachable_pub`. These cover 19 test functions over the threshold,
     7 casts and 4 `pub` helpers in the in-crate test modules.
   - The crate-root `allow` of `tests/differential.rs`, `tests/fast.rs`, `tests/group.rs` and
-    `benches/replicate.rs` adds the three cast lints, `cognitive_complexity`, `disallowed_types` and
-    `unreachable_pub`. These cover 30 casts, 9 test functions over the threshold, 58 `pub` helpers in
-    `tests/support`, and the harness's `Rc<RefCell<Disk>>`.
-  - The `Rc` goes in the next commit (below).
+    `benches/replicate.rs` adds the three cast lints, `cognitive_complexity` and `unreachable_pub`.
+    These cover 30 casts, 9 test functions over the threshold and 58 `pub` helpers in `tests/support`.
+  - No test code opts out of `disallowed_types`. The harness's disk had been an `Rc<RefCell<Disk>>`;
+    see the next section.
+
+### The harness's disk has one owner
+
+In focal, the harness kept each member's disk as an `Rc<RefCell<Disk>>`, shared by the member's node
+and by the cluster. This repository denies `Rc` in test code too. The harness now gives each disk one
+owner at a time. This is a separate commit, so that the commit before it keeps the tests unchanged as
+its proof.
+
+- `Store` is the `Disk` itself.
+- A running member's node owns its store, and the harness reaches it through the node: raft-rs's
+  `mut_store`, or this crate's `store_mut`.
+- `Cluster` holds each member as `Member::Up(node)` or `Member::Down(store)`.
+  - `Cluster::stop` takes the store out of the node it drops.
+  - `Cluster::restart` opens the member on what was stopped.
+  - `Cluster::disk` reads a member's disk, running or stopped.
+- The tests stopped a member by writing `group.nodes[i] = None`; they now call `group.stop(i)`
+  (5 sites in `tests/fast.rs` and `tests/group.rs`). They read a configuration through
+  `group.disk(id)` in place of `group.stores[i].0.borrow()` (2 sites in `tests/group.rs`). No assertion
+  changed.
+- The proof is the same as for the commit before. Every seed-fixed count the tests print is identical to
+  focal `a8e95f7`'s, at 96 seeds and at 1,000 seeds from seed 1,000.
 
 ### Constants
 

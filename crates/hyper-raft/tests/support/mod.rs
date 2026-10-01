@@ -3,8 +3,6 @@
 //! can crash and compact, and both say what they did in the same words
 //! ([`Output`], [`View`]), so what they say is compared for equality.
 #![allow(dead_code)]
-use std::{cell::RefCell, rc::Rc};
-
 use hyper_raft::proto::{
     CAMPAIGN_TRANSFER, ConfChange, ConfChangeV2, ConfState, Entry, EntryType, HardState, Message,
     MessageType, Snapshot, SnapshotMetadata,
@@ -166,25 +164,28 @@ impl Disk {
     }
 }
 
+/// One member's disk. The member's node owns it while it runs, and the
+/// cluster holds it while the member is stopped (`Cluster::stop`): one
+/// owner at a time, so nothing is shared.
 #[derive(Clone, Default)]
-pub struct Store(pub Rc<RefCell<Disk>>);
+pub struct Store(pub Disk);
 impl Store {
     pub fn new(boot: ConfState) -> Self {
         let boot = sorted(boot);
-        Self(Rc::new(RefCell::new(Disk {
+        Self(Disk {
             conf: boot.clone(),
             boot,
             ..Disk::default()
-        })))
+        })
     }
     /// A copy that shares nothing, for the other core.
     pub fn twin(&self) -> Self {
-        Self(Rc::new(RefCell::new(self.0.borrow().clone())))
+        Self(self.0.clone())
     }
 }
 impl raft::Storage for Store {
     fn initial_state(&self) -> raft::Result<raft::RaftState> {
-        let disk = self.0.borrow();
+        let disk = &self.0;
         Ok(raft::RaftState {
             hard_state: disk.hard_state.clone(),
             conf_state: disk.conf.clone(),
@@ -197,7 +198,7 @@ impl raft::Storage for Store {
         max_size: impl Into<Option<u64>>,
         _context: raft::GetEntriesContext,
     ) -> raft::Result<Vec<Entry>> {
-        let disk = self.0.borrow();
+        let disk = &self.0;
         if low < disk.first_index() {
             return Err(raft::StorageError::Compacted.into());
         }
@@ -207,7 +208,7 @@ impl raft::Storage for Store {
         Ok(disk.slice(low, high, max_size.into().unwrap_or(u64::MAX)))
     }
     fn term(&self, index: u64) -> raft::Result<u64> {
-        let disk = self.0.borrow();
+        let disk = &self.0;
         if index < disk.snapshot_index() {
             return Err(raft::StorageError::Compacted.into());
         }
@@ -215,13 +216,13 @@ impl raft::Storage for Store {
             .ok_or_else(|| raft::StorageError::Unavailable.into())
     }
     fn first_index(&self) -> raft::Result<u64> {
-        Ok(self.0.borrow().first_index())
+        Ok(self.0.first_index())
     }
     fn last_index(&self) -> raft::Result<u64> {
-        Ok(self.0.borrow().last_index())
+        Ok(self.0.last_index())
     }
     fn snapshot(&self, request_index: u64, _to: u64) -> raft::Result<Snapshot> {
-        let disk = self.0.borrow();
+        let disk = &self.0;
         if disk.snapshot_index() == 0 || disk.snapshot_index() < request_index {
             return Err(raft::StorageError::SnapshotTemporarilyUnavailable.into());
         }
@@ -230,7 +231,7 @@ impl raft::Storage for Store {
 }
 impl hyper_raft::Storage for Store {
     fn initial_state(&self) -> Result<hyper_raft::InitialState, hyper_raft::StorageError> {
-        let disk = self.0.borrow();
+        let disk = &self.0;
         Ok(hyper_raft::InitialState {
             hard_state: disk.hard_state.clone(),
             configuration: disk.conf.clone(),
@@ -244,7 +245,7 @@ impl hyper_raft::Storage for Store {
         max_bytes: u64,
         into: &mut Vec<Entry>,
     ) -> Result<(), hyper_raft::StorageError> {
-        let disk = self.0.borrow();
+        let disk = &self.0;
         if low < disk.first_index() {
             return Err(hyper_raft::StorageError::Compacted);
         }
@@ -263,7 +264,7 @@ impl hyper_raft::Storage for Store {
         high: u64,
         predicate: &mut dyn FnMut(&Entry) -> bool,
     ) -> Result<bool, hyper_raft::StorageError> {
-        let disk = self.0.borrow();
+        let disk = &self.0;
         if low < disk.first_index() {
             return Err(hyper_raft::StorageError::Compacted);
         }
@@ -278,7 +279,7 @@ impl hyper_raft::Storage for Store {
         )
     }
     fn term(&self, index: u64) -> Result<u64, hyper_raft::StorageError> {
-        let disk = self.0.borrow();
+        let disk = &self.0;
         if index < disk.snapshot_index() {
             return Err(hyper_raft::StorageError::Compacted);
         }
@@ -286,13 +287,13 @@ impl hyper_raft::Storage for Store {
             .ok_or(hyper_raft::StorageError::Unavailable)
     }
     fn first_index(&self) -> Result<u64, hyper_raft::StorageError> {
-        Ok(self.0.borrow().first_index())
+        Ok(self.0.first_index())
     }
     fn last_index(&self) -> Result<u64, hyper_raft::StorageError> {
-        Ok(self.0.borrow().last_index())
+        Ok(self.0.last_index())
     }
     fn snapshot(&self, request_index: u64, _to: u64) -> Result<Snapshot, hyper_raft::StorageError> {
-        let disk = self.0.borrow();
+        let disk = &self.0;
         if disk.snapshot_index() == 0 || disk.snapshot_index() < request_index {
             return Err(hyper_raft::StorageError::SnapshotTemporarilyUnavailable);
         }
@@ -446,6 +447,7 @@ pub trait Replica: Sized {
     fn open(id: u64, store: Store, settings: &Settings, seed: u64) -> Self;
     fn id(&self) -> u64;
     fn store(&self) -> &Store;
+    fn store_mut(&mut self) -> &mut Store;
     fn tick(&mut self) -> bool;
     fn step(&mut self, message: Message) -> bool;
     fn propose(&mut self, data: Vec<u8>) -> bool;
@@ -469,7 +471,7 @@ pub trait Replica: Sized {
     /// nothing new to compact.
     fn compact(&mut self) -> bool {
         let app = self.app();
-        let mut disk = self.store().0.borrow_mut();
+        let disk = &mut self.store_mut().0;
         if app.index <= disk.snapshot_index() || app.index > disk.last_index() {
             return false;
         }
@@ -516,7 +518,6 @@ fn role(state: u8) -> u8 {
 
 pub struct Old {
     pub raw: raft::RawNode<Store>,
-    store: Store,
     priority: i64,
     app: App,
 }
@@ -555,7 +556,7 @@ impl Old {
                     if led && !votes(&conf, self.raw.raft.id) {
                         output.leader_left = true;
                     }
-                    self.store.0.borrow_mut().conf = conf.clone();
+                    self.raw.mut_store().0.conf = conf.clone();
                     output.confs.push(conf);
                 }
                 Err(_) => output.refused.push(entry.index),
@@ -564,13 +565,13 @@ impl Old {
     }
 }
 impl Replica for Old {
-    fn open(id: u64, store: Store, settings: &Settings, _seed: u64) -> Self {
-        store.0.borrow_mut().reopen();
-        let applied = store.0.borrow().snapshot_index();
+    fn open(id: u64, mut store: Store, settings: &Settings, _seed: u64) -> Self {
+        store.0.reopen();
+        let applied = store.0.snapshot_index();
         let app = if applied == 0 {
             App::default()
         } else {
-            App::decode(&store.0.borrow().snapshot.data)
+            App::decode(&store.0.snapshot.data)
         };
         let config = raft::Config {
             id,
@@ -586,10 +587,9 @@ impl Replica for Old {
             ..Default::default()
         };
         let logger = slog::Logger::root(slog::Discard, slog::o!());
-        let raw = raft::RawNode::new(&config, store.clone(), &logger).expect("raft-rs opens");
+        let raw = raft::RawNode::new(&config, store, &logger).expect("raft-rs opens");
         Self {
             raw,
-            store,
             priority: 0,
             app,
         }
@@ -598,7 +598,10 @@ impl Replica for Old {
         self.raw.raft.id
     }
     fn store(&self) -> &Store {
-        &self.store
+        self.raw.store()
+    }
+    fn store_mut(&mut self) -> &mut Store {
+        self.raw.mut_store()
     }
     fn tick(&mut self) -> bool {
         self.operate(|raw| raw.tick())
@@ -666,13 +669,13 @@ impl Replica for Old {
                 let metadata = snapshot.metadata.clone().unwrap_or_default();
                 output.snapshots.push((metadata.index, metadata.term));
                 self.app = App::decode(&snapshot.data);
-                self.store.0.borrow_mut().install(&snapshot);
+                self.raw.mut_store().0.install(&snapshot);
             }
             output.persisted.extend(ready.entries().iter().map(said));
-            self.store.0.borrow_mut().append(ready.entries());
+            self.raw.mut_store().0.append(ready.entries());
             if let Some(hard) = ready.hs() {
                 output.hard_states.push((hard.term, hard.vote, hard.commit));
-                self.store.0.borrow_mut().hard_state = hard.clone();
+                self.raw.mut_store().0.hard_state = hard.clone();
             }
             messages.extend(ready.take_messages());
             messages.extend(ready.take_persisted_messages());
@@ -686,7 +689,7 @@ impl Replica for Old {
             self.apply(committed, &mut output);
             let mut light = self.raw.advance_append(ready);
             if let Some(commit) = light.commit_index() {
-                let mut disk = self.store.0.borrow_mut();
+                let disk = &mut self.raw.mut_store().0;
                 disk.hard_state.commit = commit;
                 output
                     .hard_states
@@ -761,7 +764,6 @@ impl Replica for Old {
 
 pub struct New {
     pub raw: hyper_raft::RawNode<Store>,
-    store: Store,
     app: App,
 }
 impl New {
@@ -782,7 +784,7 @@ impl New {
                     if led && !votes(&conf, self.raw.raft.id()) {
                         output.leader_left = true;
                     }
-                    self.store.0.borrow_mut().conf = conf.clone();
+                    self.raw.store_mut().0.conf = conf.clone();
                     output.confs.push(conf);
                 }
                 Err(error) => {
@@ -816,13 +818,13 @@ impl New {
     }
 }
 impl Replica for New {
-    fn open(id: u64, store: Store, settings: &Settings, seed: u64) -> Self {
-        store.0.borrow_mut().reopen();
-        let applied = store.0.borrow().snapshot_index();
+    fn open(id: u64, mut store: Store, settings: &Settings, seed: u64) -> Self {
+        store.0.reopen();
+        let applied = store.0.snapshot_index();
         let app = if applied == 0 {
             App::default()
         } else {
-            App::decode(&store.0.borrow().snapshot.data)
+            App::decode(&store.0.snapshot.data)
         };
         let config = hyper_raft::Config {
             election_tick: settings.election_tick,
@@ -843,14 +845,17 @@ impl Replica for New {
             seed,
             ..hyper_raft::Config::new(id)
         };
-        let raw = hyper_raft::RawNode::new(&config, store.clone()).expect("hyper-raft opens");
-        Self { raw, store, app }
+        let raw = hyper_raft::RawNode::new(&config, store).expect("hyper-raft opens");
+        Self { raw, app }
     }
     fn id(&self) -> u64 {
         self.raw.raft.id()
     }
     fn store(&self) -> &Store {
-        &self.store
+        self.raw.store()
+    }
+    fn store_mut(&mut self) -> &mut Store {
+        self.raw.store_mut()
     }
     fn tick(&mut self) -> bool {
         heard(self.raw.tick()).unwrap_or(false)
@@ -908,18 +913,18 @@ impl Replica for New {
                 let metadata = snapshot.metadata.clone().unwrap_or_default();
                 output.snapshots.push((metadata.index, metadata.term));
                 self.app = App::decode(&snapshot.data);
-                self.store.0.borrow_mut().install(snapshot);
+                self.raw.store_mut().0.install(snapshot);
             }
             output.persisted.extend(ready.entries().iter().map(said));
             {
-                let mut disk = self.store.0.borrow_mut();
+                let disk = &mut self.raw.store_mut().0;
                 disk.proposals.extend(ready.proposals().iter().cloned());
                 disk.append(ready.entries());
             }
             output.displaced.extend(ready.displaced().iter().map(said));
             if let Some(hard) = ready.hard_state() {
                 output.hard_states.push((hard.term, hard.vote, hard.commit));
-                self.store.0.borrow_mut().hard_state = hard.clone();
+                self.raw.store_mut().0.hard_state = hard.clone();
             }
             for message in ready.messages().iter().chain(ready.persisted_messages()) {
                 // A page is sized before it is copied: it holds no spare
@@ -943,7 +948,7 @@ impl Replica for New {
             self.apply(committed, &mut output);
             let mut light = self.raw.advance_append(ready).expect("advanced");
             if let Some(commit) = light.commit_index() {
-                let mut disk = self.store.0.borrow_mut();
+                let disk = &mut self.raw.store_mut().0;
                 disk.hard_state.commit = commit;
                 output
                     .hard_states
@@ -1047,6 +1052,9 @@ impl Replica for Either {
     }
     fn store(&self) -> &Store {
         either!(self, node => node.store())
+    }
+    fn store_mut(&mut self) -> &mut Store {
+        either!(self, node => node.store_mut())
     }
     fn tick(&mut self) -> bool {
         either!(self, node => node.tick())

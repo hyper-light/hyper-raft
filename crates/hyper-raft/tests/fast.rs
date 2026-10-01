@@ -14,7 +14,6 @@
     clippy::cast_possible_wrap,
     clippy::cast_sign_loss,
     clippy::cognitive_complexity,
-    clippy::disallowed_types,
     unreachable_pub
 )]
 mod support;
@@ -237,9 +236,9 @@ fn what_a_leader_committed_by_the_fast_quorum_the_next_leader_takes() {
         // The leader stops before any member heard from it, and one of
         // the others is away.
         group.net.clear();
-        group.nodes[0] = None;
+        group.stop(1);
         if lost != 1 {
-            group.nodes[(lost - 1) as usize] = None;
+            group.stop(lost);
         }
         let candidate = (2..=5).find(|member| *member != lost).unwrap();
         for _ in 0..40 {
@@ -278,7 +277,7 @@ fn what_no_one_committed_a_later_leader_may_replace() {
             && ((message.from == 2 && message.to == 3) || (message.from == 4 && message.to == 5))
     });
     group.net.clear();
-    group.nodes[0] = None;
+    group.stop(1);
     for _ in 0..40 {
         for member in group.up() {
             group.act(&Op::Tick(member));
@@ -313,7 +312,7 @@ fn what_a_member_holds_it_holds_after_it_stopped() {
         assert_eq!(group.peek(member).unwrap().held(), vec![(2, b"e".to_vec())]);
     }
     // The leader stops; whoever is elected takes what the two hold.
-    group.nodes[0] = None;
+    group.stop(1);
     for _ in 0..40 {
         for member in group.up() {
             group.act(&Op::Tick(member));

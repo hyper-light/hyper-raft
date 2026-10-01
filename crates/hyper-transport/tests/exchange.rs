@@ -987,3 +987,107 @@ fn a_body_blocked_by_its_stream_window_hears_no_writable_until_quic_says_so() {
         );
     }
 }
+
+/// A reply of `reply` bytes that node 1 asked for and does not read: node 2 writes the body until
+/// no credit is left or all of it is written. Says the net, both sides' exchange, and the bytes
+/// node 2's owner wrote.
+fn reply_unread(
+    reply: u64,
+) -> (
+    Net<Node<Mantle>, Node<Mantle>>,
+    hyper_transport::ExchangeId,
+    hyper_transport::ExchangeId,
+    u64,
+) {
+    let pair = Pair::new();
+    let mut net = connected::<Mantle, Mantle>(&pair, limits(), 1 << 30);
+    let progress = hyper_transport::Progress::new(PERIOD).unwrap();
+    let asked = net
+        .a
+        .open(net.now, 2, Kind::Get, &[7, 1, 2, 3], None, progress)
+        .unwrap();
+    let mut served = None;
+    net.until(TURNS, |net| {
+        while let Some(event) = net.b.poll_event() {
+            if let Event::Request { exchange, .. } = event {
+                served = Some(exchange);
+            }
+        }
+        served.is_some()
+    });
+    let served = served.expect("the request arrived");
+    net.b.reply(served, b"ok", Some(reply)).unwrap();
+    let mut piece = vec![0u8; PIECE];
+    let mut written = 0u64;
+    for _ in 0..TURNS {
+        let before = written;
+        while written < reply {
+            let length = (reply - written).min(PIECE as u64) as usize;
+            fill(7, written, &mut piece[..length]);
+            match net.b.write_body(served, &piece[..length]).unwrap() {
+                0 => break,
+                took => written += took as u64,
+            }
+        }
+        let moved = net.exchange();
+        while net.a.poll_event().is_some() {}
+        while net.b.poll_event().is_some() {}
+        if written == reply || (written == before && !moved) {
+            break;
+        }
+    }
+    (net, asked, served, written)
+}
+
+/// The owner wrote its reply's last byte with the last of the credit, so the trailer the endpoint
+/// adds could not go, and ended the exchange: the peer still reads the whole reply, checksum and
+/// all. An end that reset the stream refused the peer a message written whole (windows-11-arm,
+/// e2e `every exchange done`: `refused: Some((Closed, true))` at 46,154 of 65,536 bytes read).
+#[test]
+fn a_reply_ended_before_its_trailer_left_still_reaches_the_peer_whole() {
+    // How much an unread reply takes before the credit runs out.
+    let (_, _, _, room) = reply_unread(REQUEST_BOUND / 2);
+    let (mut net, asked, served, written) = reply_unread(room);
+    assert_eq!(written, room, "the whole body was written");
+    assert_eq!(
+        net.b.credit(1, Class::Request),
+        Some(0),
+        "no credit is left for the trailer"
+    );
+    net.b.end(served);
+    let mut read = 0u64;
+    let mut whole = false;
+    net.until(TURNS, |net| {
+        while let Some(event) = net.a.poll_event() {
+            assert!(
+                !matches!(event, Event::Refused { exchange, .. } if exchange == asked),
+                "the reply was refused: {event:?}"
+            );
+        }
+        loop {
+            let mut into = net.a.reserve(Class::Request, PIECE as u64).unwrap();
+            let got = net.a.read_body(asked, &mut into).unwrap();
+            for (at, byte) in into.bytes().iter().enumerate() {
+                assert_eq!(*byte, pattern(7, read + at as u64), "a reply byte");
+            }
+            net.a.release(into);
+            read += got as u64;
+            if got == 0 {
+                break;
+            }
+        }
+        if read == room && !whole {
+            let mut empty = hyper_transport::Reservation::default();
+            let _ = net.a.read_body(asked, &mut empty);
+            whole = net.a.body_complete(asked);
+        }
+        whole
+    });
+    assert_eq!((read, whole), (room, true), "the reply arrived whole");
+    net.a.end(asked);
+    net.exchange();
+    assert!(
+        net.b.credit(1, Class::Request).is_some(),
+        "node 2 is still connected"
+    );
+}

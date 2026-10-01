@@ -65,6 +65,9 @@ const MAX_PENDING: usize = 64;
 const MAX_ENTRIES: usize = 1 << 16;
 /// The flushes the tick is measured from.
 const FSYNC_SAMPLES: usize = 16;
+/// The timed waits the tick is measured from, each asked for the least a member's tick can be.
+const WAKE_SAMPLES: usize = 16;
+const WAKE_ASKED: Duration = Duration::from_millis(1);
 
 #[expect(
     clippy::disallowed_methods,
@@ -74,10 +77,28 @@ fn remove(path: &Path) {
     let _ = std::fs::remove_file(path);
 }
 
-/// The tick, from what a flush costs on this machine. Raft needs the broadcast time — a round
-/// trip and a flush of the log — well below the election timeout (Ongaro and Ousterhout 2014,
-/// §5.6); a tick of twice the slowest of `FSYNC_SAMPLES` flushes of a 4 KiB write puts the
-/// election timeout at twenty flushes or more, and a heartbeat at four.
+/// How long a timed wait of `WAKE_ASKED` takes on this machine, at the slowest of `WAKE_SAMPLES`:
+/// a member ticks and a request waits by a socket's timeout, which the OS ends on its own timer,
+/// not at the time asked (Windows wakes on its clock interrupt, every 15.6 ms unless a process
+/// asks for finer: Microsoft, "Timer accuracy", and `timeBeginPeriod`).
+fn measure_wake() -> Duration {
+    let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+    socket.set_read_timeout(Some(WAKE_ASKED)).unwrap();
+    let mut sink = [0u8; 1];
+    let mut slowest = Duration::ZERO;
+    for _ in 0..WAKE_SAMPLES {
+        let started = Instant::now();
+        let _ = socket.recv_from(&mut sink);
+        slowest = slowest.max(started.elapsed());
+    }
+    slowest
+}
+
+/// The tick, from what a flush and a wake cost on this machine. Raft needs the broadcast time —
+/// a round trip and a flush of the log — well below the election timeout (Ongaro and Ousterhout
+/// 2014, §5.6); a round trip here is a member woken at each end. A tick of twice the slowest
+/// flush of a 4 KiB write (of `FSYNC_SAMPLES`) and the slowest wake puts the election timeout at
+/// twenty broadcasts or more, and a heartbeat at four.
 fn measure_tick() -> Duration {
     let path = PathBuf::from(TMP).join(format!("e2e-{}-probe", std::process::id()));
     let mut file = OpenOptions::new()
@@ -95,7 +116,7 @@ fn measure_tick() -> Duration {
     }
     drop(file);
     remove(&path);
-    let tick = (slowest * 2).max(Duration::from_millis(1));
+    let tick = ((slowest + measure_wake()) * 2).max(Duration::from_millis(1));
     Duration::from_millis(tick.as_millis().try_into().unwrap())
 }
 
@@ -737,7 +758,7 @@ fn main() -> ExitCode {
     let mut out = std::io::stdout().lock();
     writeln!(
         out,
-        "tick {} ms (twice the slowest of {FSYNC_SAMPLES} flushes)",
+        "tick {} ms (twice the slowest of {FSYNC_SAMPLES} flushes and of {WAKE_SAMPLES} wakes)",
         tick.as_millis()
     )
     .unwrap();

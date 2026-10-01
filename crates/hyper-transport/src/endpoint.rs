@@ -535,11 +535,12 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
     }
 
     /// End `exchange`: its reservations go back to the budget, and a half not yet complete is
-    /// reset, which the peer sees as [`Refusal::Closed`]. An exchange is the owner's until it ends
-    /// it or it is refused.
+    /// reset, which the peer sees as [`Refusal::Closed`]. A message whose every body byte was
+    /// written is complete to its owner: the trailer the endpoint adds is still sent, after
+    /// which the exchange goes. An exchange is the owner's until it ends it or it is refused.
     pub fn end(&mut self, exchange: ExchangeId) {
         let _ = self.with_exchange(exchange, |core, conn, id| {
-            core.finish_exchange(conn, id, None);
+            core.end(conn, id);
             Ok(())
         });
     }
@@ -1101,6 +1102,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
             writable_sent: false,
             stream_blocked: false,
             starved: false,
+            ended: false,
         };
         match self.exchanges.insert(exchange) {
             Ok(id) => {
@@ -1449,6 +1451,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
             writable_sent: false,
             stream_blocked: false,
             starved: false,
+            ended: false,
         };
         let id = self.exchanges.insert(exchange)?;
         conn.exchanges.push(id);
@@ -1628,6 +1631,9 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
             if !exchange.opened {
                 exchange.carry.rest();
             }
+            if exchange.ended {
+                self.finish_exchange(conn, id, None);
+            }
         }
         Ok(())
     }
@@ -1706,6 +1712,30 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
         Ok(())
     }
 
+    /// The owner ends exchange `id`. When the peer's message is whole and all this side has left
+    /// to send is its trailer, which credit did not take when the body's last byte was written,
+    /// the exchange waits for the trailer to go; resetting it would refuse the peer a message its
+    /// owner wrote whole.
+    fn end(&mut self, conn: &mut Conn<C::Role>, id: u64) {
+        let trailer_left = self.exchanges.get_mut(id).is_some_and(|exchange| {
+            exchange.ended = exchange.out.state == Out::Trailer
+                && matches!(exchange.incoming.state, In::Whole | In::Finished);
+            exchange.ended
+        });
+        if trailer_left {
+            if let Some(exchange) = self.exchanges.get_mut(id)
+                && let Some(head) = exchange.incoming.head.take()
+            {
+                self.budget.release(head);
+            }
+            if let Err(failure) = self.flush_trailer(conn, id) {
+                self.finish_exchange(conn, id, Some(failure));
+            }
+        } else {
+            self.finish_exchange(conn, id, None);
+        }
+    }
+
     /// End exchange `id`: with `failure`, the owner hears it was refused. A half not yet complete
     /// is reset with the refusal's code, so the peer hears it too.
     fn finish_exchange(
@@ -1741,7 +1771,9 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
         {
             self.budget.release(reservation);
         }
-        if let Some((refusal, by_peer)) = failure {
+        if let Some((refusal, by_peer)) = failure
+            && !exchange.ended
+        {
             self.events.push_back(Event::Refused {
                 exchange: ExchangeId(id),
                 refusal,

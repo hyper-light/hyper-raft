@@ -458,8 +458,11 @@ entry's encoded length" item above is closed by R-2.
 `crates/hyper-raft-e2e` runs each member as a process (`hyper-raft-node`) on a UDP socket on the
 loopback interface, with a log file it flushes with the platform's full flush before a `Ready` is
 acted on (`F_FULLFSYNC` on macOS), driven in place. `tests/cluster.rs` measures the tick first:
-twice the slowest of 16 flushes of 4 KiB, so that the election timeout (ten ticks or more) is far
-above the broadcast time (Ongaro and Ousterhout 2014, §5.6). On this machine the tick came out at
+twice the slowest of 16 flushes of 4 KiB plus the slowest of 16 timed waits asked for 1 ms, so
+that the election timeout (ten ticks or more) is far above the broadcast time (Ongaro and
+Ousterhout 2014, §5.6). The wait counts because a member ticks and a request waits on a socket
+timeout, which the OS ends on its own timer: on windows-2025 the flushes alone gave a 1 ms tick
+that Windows' 15.6 ms clock interrupt could not keep, and `commits-5` spent its budget in 2.5 s. On this machine the tick came out at
 10 to 52 ms across runs.
 
 Scenarios and what they assert, with one run's output (2026-10-01):

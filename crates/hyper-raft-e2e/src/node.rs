@@ -100,6 +100,82 @@ struct Asker {
     id: u64,
 }
 
+/// Where answers go out: the socket, and the buffer a datagram is built in.
+struct Reply<'a> {
+    socket: &'a UdpSocket,
+    sending: &'a mut Vec<u8>,
+}
+
+impl Reply<'_> {
+    fn send(&self, to: SocketAddr) -> Result<(), NodeError> {
+        match self.socket.send_to(self.sending, to) {
+            Ok(_) => Ok(()),
+            // A peer that is down refuses; Raft sends again.
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    ErrorKind::ConnectionRefused
+                        | ErrorKind::ConnectionReset
+                        | ErrorKind::WouldBlock
+                ) =>
+            {
+                Ok(())
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+    fn respond(&mut self, to: SocketAddr, id: u64, outcome: &Outcome) -> Result<(), NodeError> {
+        wire::put_response(self.sending, id, outcome);
+        if wire::seal(self.sending) {
+            self.send(to)?;
+        }
+        Ok(())
+    }
+}
+
+/// The application: the key-value store, what it applied, and the writes it answers once
+/// applied.
+struct App {
+    id: u64,
+    max_keys: usize,
+    store: BTreeMap<Vec<u8>, Vec<u8>>,
+    applied: u64,
+    digest: u64,
+    writes: BTreeMap<u64, Asker>,
+}
+
+impl App {
+    /// Applies `entries`, read where the log holds them, answering the writes this member
+    /// proposed.
+    fn apply(&mut self, entries: &[Entry], reply: &mut Reply<'_>) -> Result<(), NodeError> {
+        for entry in entries {
+            self.applied = entry.index;
+            let mut digest = self.digest ^ 0xcbf2_9ce4_8422_2325;
+            for byte in entry.index.to_le_bytes().iter().chain(&entry.data) {
+                digest = (digest ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3);
+            }
+            self.digest = digest;
+            let Some(command) = wire::read_command(&entry.data) else {
+                continue;
+            };
+            let room = self.store.len() < self.max_keys || self.store.contains_key(command.key);
+            let outcome = if room {
+                self.store
+                    .insert(command.key.to_vec(), command.value.to_vec());
+                Outcome::Put(entry.index)
+            } else {
+                Outcome::Busy
+            };
+            if command.origin == self.id
+                && let Some(asker) = self.writes.remove(&command.sequence)
+            {
+                reply.respond(asker.address, asker.id, &outcome)?;
+            }
+        }
+        Ok(())
+    }
+}
+
 /// A member, its socket, its store and who waits on it.
 pub struct Node {
     raw: RawNode<Wal>,
@@ -107,11 +183,8 @@ pub struct Node {
     settings: Settings,
     peers: Vec<(u64, SocketAddr)>,
     isolated: bool,
-    store: BTreeMap<Vec<u8>, Vec<u8>>,
-    applied: u64,
-    digest: u64,
+    app: App,
     next_sequence: u64,
-    writes: BTreeMap<u64, Asker>,
     reads: BTreeMap<u64, (Asker, Vec<u8>)>,
     /// Reads confirmed at an index, waiting for it to be applied.
     confirmed: Vec<(u64, u64)>,
@@ -144,11 +217,15 @@ impl Node {
             socket,
             peers: Vec::new(),
             isolated: false,
-            store: BTreeMap::new(),
-            applied: 0,
-            digest: 0,
+            app: App {
+                id: settings.id,
+                max_keys: settings.max_keys,
+                store: BTreeMap::new(),
+                applied: 0,
+                digest: 0,
+                writes: BTreeMap::new(),
+            },
             next_sequence: 0,
-            writes: BTreeMap::new(),
             reads: BTreeMap::new(),
             confirmed: Vec::new(),
             leading: false,
@@ -251,30 +328,14 @@ impl Node {
         heard(self.raw.step(message)).map(|_| ())
     }
 
-    fn respond(&mut self, to: SocketAddr, id: u64, outcome: &Outcome) -> Result<(), NodeError> {
-        wire::put_response(&mut self.sending, id, outcome);
-        if wire::seal(&mut self.sending) {
-            self.send_datagram(to)?;
+    fn reply(&mut self) -> Reply<'_> {
+        Reply {
+            socket: &self.socket,
+            sending: &mut self.sending,
         }
-        Ok(())
     }
-
-    fn send_datagram(&self, to: SocketAddr) -> Result<(), NodeError> {
-        match self.socket.send_to(&self.sending, to) {
-            Ok(_) => Ok(()),
-            // A peer that is down refuses; Raft sends again.
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    ErrorKind::ConnectionRefused
-                        | ErrorKind::ConnectionReset
-                        | ErrorKind::WouldBlock
-                ) =>
-            {
-                Ok(())
-            }
-            Err(error) => Err(error.into()),
-        }
+    fn respond(&mut self, to: SocketAddr, id: u64, outcome: &Outcome) -> Result<(), NodeError> {
+        self.reply().respond(to, id, outcome)
     }
 
     fn hear_client(&mut self, body: &[u8], from: SocketAddr) -> Result<(), NodeError> {
@@ -300,9 +361,9 @@ impl Node {
             leads: raft.state() == StateRole::Leader,
             leader: raft.leader_id(),
             commit: raft.log().committed(),
-            applied: self.applied,
+            applied: self.app.applied,
             last_index: raft.log().last_index().unwrap_or(0),
-            digest: self.digest,
+            digest: self.app.digest,
         }
     }
 
@@ -326,7 +387,7 @@ impl Node {
     }
 
     fn write(&mut self, asker: Asker, key: &[u8], value: &[u8]) -> Result<(), NodeError> {
-        if !self.admits(asker, self.writes.len())? {
+        if !self.admits(asker, self.app.writes.len())? {
             return Ok(());
         }
         let sequence = self.sequence();
@@ -342,7 +403,7 @@ impl Node {
         let data = self.command.clone();
         match heard(self.raw.propose(Vec::new(), data))? {
             Some(()) => {
-                self.writes.insert(sequence, asker);
+                self.app.writes.insert(sequence, asker);
                 Ok(())
             }
             None => self.respond(asker.address, asker.id, &Outcome::Busy),
@@ -394,45 +455,66 @@ impl Node {
                 // Too long for a datagram: dropped, and Raft sends again.
                 continue;
             }
-            self.send_datagram(address)?;
+            self.reply().send(address)?;
         }
         Ok(())
     }
 
     /// Everything the member asks of its owner, in the order Raft requires: a leader's messages
-    /// at once; what is to persist, flushed; a follower's messages once that is durable; then
-    /// what is committed, applied.
+    /// at once; what is to persist, written from where the member holds it and flushed; a
+    /// follower's messages once that is durable; then what is committed, applied from the log.
+    /// Nothing is copied: the member gives its `Ready`s in place, and the log keeps the very
+    /// entries the member gives up once they are durable.
     fn drive(&mut self) -> Result<(), NodeError> {
         while self.raw.has_ready() {
-            let mut ready = heard(self.raw.ready())?.ok_or(NodeError::Raft(
+            let mut ready = heard(self.raw.ready_in_place())?.ok_or(NodeError::Raft(
                 hyper_raft::Error::Invariant("a ready that would not come"),
             ))?;
             self.send_raft(ready.take_messages())?;
-            let entries = ready.take_entries();
-            let hard = ready.hard_state().cloned();
-            self.raw.store_mut().persist(entries, hard.as_ref())?;
+            let persist = self.raw.to_persist();
+            persist.store.write(persist.entries, ready.hard_state())?;
             for read in ready.take_read_states() {
                 self.confirm(read.index, &read.request_ctx);
             }
-            let committed = ready.take_committed_entries();
-            self.apply(&committed)?;
+            if let Some((first, last)) = ready.committed_range() {
+                self.apply(first, last)?;
+            }
             self.send_raft(ready.take_persisted_messages())?;
-            let mut light = heard(self.raw.advance_append(ready))?.ok_or(NodeError::Raft(
-                hyper_raft::Error::Invariant("a ready that would not advance"),
-            ))?;
+            let mut light = heard(
+                self.raw
+                    .advance_append_keeping(ready, |wal, kept| wal.keep(kept.entries)),
+            )?
+            .ok_or(NodeError::Raft(hyper_raft::Error::Invariant(
+                "a ready that would not advance",
+            )))?;
+            self.raw.store_mut().damage()?;
             if let Some(commit) = light.commit_index() {
                 // A commit need not be durable to be acted on (raft-rs's `must_sync`): it is
                 // written with the next record, and a member that restarts learns it again.
                 self.raw.store_mut().set_commit(commit);
             }
             self.send_raft(light.take_messages())?;
-            let committed = light.take_committed_entries();
-            self.apply(&committed)?;
-            heard(self.raw.advance_apply_to(self.applied))?;
+            if let Some((first, last)) = light.committed_range() {
+                self.apply(first, last)?;
+            }
+            heard(self.raw.advance_apply_to(self.app.applied))?;
             self.lead_or_let_go()?;
             self.answer_reads()?;
         }
         Ok(())
+    }
+
+    /// Applies `[first, last]`, read where the log holds it.
+    fn apply(&mut self, first: u64, last: u64) -> Result<(), NodeError> {
+        let Self {
+            raw,
+            app,
+            socket,
+            sending,
+            ..
+        } = self;
+        let entries = raw.store().held(first, last)?;
+        app.apply(entries, &mut Reply { socket, sending })
     }
 
     fn confirm(&mut self, index: u64, context: &[u8]) {
@@ -444,41 +526,12 @@ impl Node {
         }
     }
 
-    fn apply(&mut self, entries: &[Entry]) -> Result<(), NodeError> {
-        for entry in entries {
-            self.applied = entry.index;
-            let mut digest = self.digest ^ 0xcbf2_9ce4_8422_2325;
-            for byte in entry.index.to_le_bytes().iter().chain(&entry.data) {
-                digest = (digest ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3);
-            }
-            self.digest = digest;
-            let Some(command) = wire::read_command(&entry.data) else {
-                continue;
-            };
-            let room =
-                self.store.len() < self.settings.max_keys || self.store.contains_key(command.key);
-            let outcome = if room {
-                self.store
-                    .insert(command.key.to_vec(), command.value.to_vec());
-                Outcome::Put(entry.index)
-            } else {
-                Outcome::Busy
-            };
-            if command.origin == self.settings.id
-                && let Some(asker) = self.writes.remove(&command.sequence)
-            {
-                self.respond(asker.address, asker.id, &outcome)?;
-            }
-        }
-        Ok(())
-    }
-
     /// A member that stopped leading answers everyone it kept waiting: they ask the new leader.
     fn lead_or_let_go(&mut self) -> Result<(), NodeError> {
         let leading = self.raw.raft.state() == StateRole::Leader;
         if self.leading && !leading {
             let leader = self.raw.raft.leader_id();
-            let writes = std::mem::take(&mut self.writes);
+            let writes = std::mem::take(&mut self.app.writes);
             let reads = std::mem::take(&mut self.reads);
             self.confirmed.clear();
             for asker in writes
@@ -493,7 +546,7 @@ impl Node {
     }
 
     fn answer_reads(&mut self) -> Result<(), NodeError> {
-        let applied = self.applied;
+        let applied = self.app.applied;
         let mut at = 0;
         while let Some((index, sequence)) = self.confirmed.get(at).copied() {
             if index > applied {
@@ -502,7 +555,7 @@ impl Node {
             }
             self.confirmed.swap_remove(at);
             if let Some((asker, key)) = self.reads.remove(&sequence) {
-                let value = self.store.get(&key).cloned();
+                let value = self.app.store.get(&key).cloned();
                 self.respond(asker.address, asker.id, &Outcome::Value(value))?;
             }
         }

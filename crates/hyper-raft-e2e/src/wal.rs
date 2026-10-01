@@ -203,6 +203,8 @@ pub struct Wal {
     /// What one write encodes into, kept from one write to the next.
     buffer: Vec<u8>,
     max_entries: usize,
+    /// Entries handed over that could not be placed.
+    damaged: Option<WalError>,
 }
 
 impl Wal {
@@ -237,6 +239,7 @@ impl Wal {
             entries: replayed.entries,
             buffer: Vec::new(),
             max_entries,
+            damaged: None,
         })
     }
     /// Writes `entries` and `hard` and flushes them; then the log in memory holds them. The
@@ -246,6 +249,14 @@ impl Wal {
         entries: Vec<Entry>,
         hard: Option<&HardState>,
     ) -> Result<(), WalError> {
+        self.write(&entries, hard)?;
+        self.keep(entries);
+        self.damage()
+    }
+    /// Writes `entries` and `hard` where they are, and flushes them. The log in memory takes
+    /// the entries when they are handed over ([`Wal::keep`]); until then it reads them from the
+    /// member, which holds them while they are written (`RawNode::ready_in_place`).
+    pub fn write(&mut self, entries: &[Entry], hard: Option<&HardState>) -> Result<(), WalError> {
         if entries.is_empty() && hard.is_none() {
             return Ok(());
         }
@@ -256,7 +267,7 @@ impl Wal {
             return Err(WalError::Full);
         }
         self.buffer.clear();
-        for entry in &entries {
+        for entry in entries {
             record(&mut self.buffer, ENTRY, entry)?;
         }
         if let Some(hard) = hard {
@@ -266,15 +277,35 @@ impl Wal {
         }
         self.file.write_all(&self.buffer)?;
         self.file.sync_data()?;
-        for entry in entries {
-            place(&mut self.entries, entry)?;
-        }
         if let Some(hard) = hard {
             let commit = hard.commit.max(self.hard.commit);
             self.hard = hard.clone();
             self.hard.commit = commit;
         }
         Ok(())
+    }
+    /// Takes entries already written, as they are, into the log in memory. A place it cannot
+    /// take them at is kept as damage, which [`Wal::damage`] reports.
+    pub fn keep(&mut self, entries: Vec<Entry>) {
+        for entry in entries {
+            if let Err(error) = place(&mut self.entries, entry) {
+                self.damaged.get_or_insert(error);
+                return;
+            }
+        }
+    }
+    /// Whether the log in memory took every entry it was handed.
+    pub fn damage(&mut self) -> Result<(), WalError> {
+        self.damaged.take().map_or(Ok(()), Err)
+    }
+    /// The entries of `[first, last]`, where the log holds them.
+    pub fn held(&self, first: u64, last: u64) -> Result<&[Entry], WalError> {
+        let low =
+            usize::try_from(first.saturating_sub(1)).map_err(|_| WalError::Corrupt("an index"))?;
+        let high = usize::try_from(last).map_err(|_| WalError::Corrupt("an index"))?;
+        self.entries
+            .get(low..high)
+            .ok_or(WalError::Corrupt("a range the log does not hold"))
     }
     /// The hard state, its commit as last known.
     pub fn hard_state(&self) -> &HardState {

@@ -998,9 +998,9 @@ each way.
 |---|---|---|---|---|
 | hyper-transport exchange, 16 B heads, no body | 8.35 | 0 | 1,110 | 3.2 µs |
 | bare hyper-quic stream, 16 B each way | 8.08 | 0 | 1,009 | 2.1 µs |
-| hyper-transport exchange, 16 B heads, 4 KiB bodies | 21.0 | 2.33 | 17,760 | 11.5 µs |
+| hyper-transport exchange, 16 B heads, 4 KiB bodies | 21.0 (12.5 since) | 2.33 (0 since) | 17,760 | 11.5 µs |
 | bare hyper-quic stream, 4 KiB + 16 B each way | 16.2 | 2.08 | 17,493 | 8.6 µs |
-| hyper-transport exchange, 16 B heads, 64 KiB bodies | 211.1 | 2.33 | 286,124 | 147.2 µs |
+| hyper-transport exchange, 16 B heads, 64 KiB bodies | 211.1 (30.5 since) | 2.33 (0 since) | 286,124 | 147.2 µs |
 | bare hyper-quic stream, 64 KiB + 16 B each way | 208.2 | 2.08 | 285,881 | 116.3 µs |
 | hyper-transport lane frame, 512 B | 1.07 | 0.09 | 620 | 0.8 µs |
 
@@ -1068,10 +1068,8 @@ serialises each into a fresh buffer, where hyper-transport reads into the budget
 reservations.
 
 **Where hyper-transport loses.**
-- **Reallocations**: 1.9 to 4 a round with a body, against focal-wire's 0 to 0.13. The
-  reservation buffers grow to the largest body before the warm-up ends, as the in-memory bench
-  found; at 512 KiB the count rose from 1.85 to 4.00 with the drain below, not yet traced. This
-  row is owed.
+- **Reallocations** (since closed, below): 1.9 to 4 a round with a body, against focal-wire's 0 to
+  0.13.
 - **Datagrams at 64 B**: 2.8 a round against 2.7, an acknowledgement more in one round of ten.
 - **Allocations against its own earlier driver**: draining every datagram that has arrived before
   surfacing an event (below) cut the datagrams of a 64 KiB round from 108.6 to 97.0 and its time
@@ -1087,6 +1085,39 @@ focal-wire's spent 935 in `sendmsg` and 2,292 parked: hyper-transport's endpoint
 batch as it came, in more and smaller acknowledgements and window updates. The driver now drains
 the socket, up to 128 batches, before it fires timers, sends and surfaces an event, and hands out an
 event already queued without any system call; the table above is that version.
+
+### Reallocations, traced and closed (2026-10-01, 14:30–15:05 PDT)
+
+Each reallocation was traced to its site by a counting allocator that recorded the call stack of
+every reallocation in the measured rounds (both the in-memory bench and this comparison; a
+throwaway harness, not kept). Every one with a body was the same site: `Endpoint::handle_datagram`
+copied each datagram into one reused `BytesMut` with `reserve(len)`. hyper-quic keeps views of a
+datagram while the owner has not read its stream data, so the buffer was rarely reclaimable, and
+`reserve` grew it in place a datagram at a time (311 → 1,515 bytes, 975 → 1,950, ...). Datagrams are
+now cut from 65,527-byte chunks (RFC 9000 §18.2's largest datagram): a chunk with room takes the
+next, a chunk whose views are gone is reclaimed whole (`try_reclaim`), and otherwise a fresh one is
+allocated, never grown, as quinn cuts each receive batch from one `BytesMut`. The reservations were
+not a site: the budget's buffers chosen by size never grew once warm.
+
+`bash compare.sh 5` after the change, load average 16.5 to 21.2 (median 18.5), against the table's
+hyper-transport rows (load 35.7 to 49.5); focal-wire's rows of the same five runs beside them:
+
+| Size each way | Reallocations before | after | focal-wire | Allocations before | after | focal-wire | Bytes before | after | Round after | focal-wire round |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 64 B | 0 | 0 | 0 | 12.4 | 12.4 | 24.7 | 1,266 | 1,299 | 40 µs (37–42) | 59 µs (56–62) |
+| 4 KiB | 1.88 | 0 | 0 | 20.1 | 12.8 | 36.0 | 17,186 | 14,660 | 48 µs (45–51) | 65 µs (61–68) |
+| 64 KiB | 2.00 | 0 | 0.01 | 212.3 | 32.4 | 230.4 | 286,430 | 283,086 | 428 µs (424–434) | 449 µs (446–458) |
+| 512 KiB | 4.00 | 0 | 0.22 | 1,618.3 | 175.1 | 1,704.8 | 2,294,453 | 2,266,370 | 3,987 µs (3,963–4,087) | 4,112 µs (3,845–4,219) |
+
+The same change took the allocations too: a datagram that could not reuse the buffer had been an
+allocation, so a 64 KiB round now makes 32 allocations where focal-wire makes 230. The 64 B row's 33
+bytes more are the first chunk of each side, amortised over 2,000 rounds. In the in-memory bench
+(`cargo bench -p hyper-transport --bench allocs`, load 31 to 37): 12.5 allocations and 0
+reallocations a 4 KiB exchange (21.0 and 2.33 before), 30.5 and 0 at 64 KiB (211.1 and 2.33).
+A lane frame keeps 0.09 reallocations: hyper-quic's send buffer (`SendBuffer::ack`, upstream's
+`shrink_to_fit` once a stream's queue is under a quarter of its capacity) gives its segment queue
+back after each burst and grows it again with the next; that is upstream's bound on what an idle
+stream holds, kept.
 
 ## hyper-tokio end to end
 

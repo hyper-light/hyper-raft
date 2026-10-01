@@ -147,6 +147,10 @@ pub struct Stats {
     pub streams_refused: u64,
 }
 
+/// The bytes datagrams are received into at a time: one datagram of the largest size QUIC allows,
+/// `max_udp_payload_size`'s ceiling of 65,527 (RFC 9000 §18.2), so a chunk never holds less than
+/// the datagram it is cut for, and about 45 of a 1,452-byte path's.
+const RECEIVE_CHUNK: usize = 65_527;
 /// The QUIC application error code a connection closes with when it ends without a fault.
 const CLOSE_NORMAL: u32 = 0;
 /// A message's incoming states, each of which a step leaves or stops at: the bound on the steps
@@ -304,10 +308,16 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
         bytes: &[u8],
     ) {
         self.core.now = now;
-        // The QUIC layer takes the datagram as its own buffer. One buffer is reused: the part
-        // handed over shares its allocation, and once the QUIC layer drops it the next reserve
-        // reclaims it.
-        self.receive.reserve(bytes.len());
+        // The QUIC layer takes the datagram as its own buffer, and keeps views of it while it
+        // holds stream data the owner has not read. Datagrams are cut from a chunk: one that has
+        // room takes the next, one whose views are all gone is reclaimed whole, and otherwise a
+        // fresh chunk is allocated. A chunk is never grown: growing it in place, a datagram at a
+        // time, was two reallocations a round of a 64 KiB exchange (docs/benchmarks.md). A view
+        // pins its chunk as one pins its receive batch in quinn, which copies each batch into one
+        // `BytesMut` and cuts its datagrams from it (quinn 0.11 `endpoint.rs`, `poll_socket`).
+        if !self.receive.try_reclaim(bytes.len()) {
+            self.receive = BytesMut::with_capacity(RECEIVE_CHUNK.max(bytes.len()));
+        }
         self.receive.extend_from_slice(bytes);
         let datagram = self.receive.split_to(bytes.len());
         let mut buffer = std::mem::take(&mut self.scratch);

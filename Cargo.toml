@@ -5,7 +5,7 @@ resolver = "3"
 members = ["crates/*"]
 # Vendored upstream sources are staged here, outside the build and the lint wall, until they are
 # conformed into a member crate (vendor/*/VENDORED.md).
-exclude = ["vendor"]
+exclude = ["vendor", "crates/hyper-tls/tests/support/rustls-test"]
 
 [workspace.package]
 edition = "2024"

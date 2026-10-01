@@ -40,12 +40,13 @@ impl RootCertStore {
             match anchor_from_trusted_cert(&der_cert) {
                 Ok(anchor) => {
                     self.roots.push(anchor.to_owned());
-                    valid_count += 1;
+                    // A count of items of one iterator, held in memory: below usize::MAX.
+                    valid_count = usize::saturating_add(valid_count, 1);
                 }
                 Err(err) => {
                     trace!("invalid cert der {:?}", der_cert.as_ref());
                     debug!("certificate parsing failed: {err:?}");
-                    invalid_count += 1;
+                    invalid_count = usize::saturating_add(invalid_count, 1);
                 }
             };
         }
@@ -133,7 +134,7 @@ fn root_cert_store_debug() {
         subject_public_key_info: Der::from_slice(&[]),
         name_constraints: None,
     };
-    let store = RootCertStore::from_iter(iter::repeat(ta).take(138));
+    let store = RootCertStore::from_iter(iter::repeat_n(ta, 138));
 
     assert_eq!(
         format!("{store:?}"),

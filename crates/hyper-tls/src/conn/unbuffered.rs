@@ -1,13 +1,13 @@
 //! Unbuffered connection API
 
 use alloc::vec::Vec;
+use core::error::Error as StdError;
 use core::num::NonZeroUsize;
 use core::{fmt, mem};
-use std::error::Error as StdError;
 
 use super::{SideData, UnbufferedConnectionCommon};
 use crate::client::{ClientConfig, ClientConnectionData};
-use crate::msgs::deframer::buffers::DeframerSliceBuffer;
+use crate::msgs::deframer::buffers::{BufferProgress, DeframerSliceBuffer};
 use crate::server::{ServerConfig, ServerConnectionData};
 use crate::Error;
 
@@ -21,7 +21,8 @@ impl UnbufferedConnectionCommon<ClientConnectionData> {
         config: &mut ClientConfig,
         incoming_tls: &'i mut [u8],
     ) -> UnbufferedStatus<'c, 'i, ClientConnectionData> {
-        self.process_tls_records_common(config, incoming_tls, |_| false, |_, _| unreachable!())
+        // A client never receives early data.
+        self.process_tls_records_common(config, incoming_tls, |_| false, None)
     }
 }
 
@@ -39,10 +40,14 @@ impl UnbufferedConnectionCommon<ServerConnectionData> {
             config,
             incoming_tls,
             |conn| conn.peek_early_data().is_some(),
-            |conn, incoming_tls| ReadEarlyData::new(conn, incoming_tls).into(),
+            Some(|conn, incoming_tls| ReadEarlyData::new(conn, incoming_tls).into()),
         )
     }
 }
+
+/// Makes the state that hands received early data to the caller.
+type EarlyDataState<'c, 'i, Data> =
+    fn(&'c mut UnbufferedConnectionCommon<Data>, &'i mut [u8]) -> ConnectionState<'c, 'i, Data>;
 
 impl<Data: SideData> UnbufferedConnectionCommon<Data> {
     fn process_tls_records_common<'c, 'i>(
@@ -50,13 +55,13 @@ impl<Data: SideData> UnbufferedConnectionCommon<Data> {
         config: &mut Data::Config,
         incoming_tls: &'i mut [u8],
         mut early_data_available: impl FnMut(&mut Self) -> bool,
-        early_data_state: impl FnOnce(&'c mut Self, &'i mut [u8]) -> ConnectionState<'c, 'i, Data>,
+        early_data_state: Option<EarlyDataState<'c, 'i, Data>>,
     ) -> UnbufferedStatus<'c, 'i, Data> {
         let mut buffer = DeframerSliceBuffer::new(incoming_tls);
         let mut buffer_progress = self.core.hs_deframer.progress();
 
         let (discard, state) = loop {
-            if early_data_available(self) {
+            if let (true, Some(early_data_state)) = (early_data_available(self), early_data_state) {
                 break (
                     buffer.pending_discard(),
                     early_data_state(self, incoming_tls),
@@ -77,78 +82,83 @@ impl<Data: SideData> UnbufferedConnectionCommon<Data> {
                 );
             }
 
-            let deframer_output = if self.core.common_state.has_received_close_notify {
-                None
-            } else {
-                match self.core.deframe(buffer.filled_mut(), &mut buffer_progress) {
-                    Err(err) => {
-                        buffer.queue_discard(buffer_progress.take_discard());
-                        return UnbufferedStatus {
-                            discard: buffer.pending_discard(),
-                            state: Err(err),
-                        };
-                    }
-                    Ok(r) => r,
+            match self.process_next_message(config, &mut buffer, &mut buffer_progress) {
+                Ok(true) => {
+                    buffer.queue_discard(buffer_progress.take_discard());
+                    continue;
                 }
-            };
-
-            if let Some(msg) = deframer_output {
-                let mut state =
-                    match mem::replace(&mut self.core.state, Err(Error::HandshakeNotComplete)) {
-                        Ok(state) => state,
-                        Err(e) => {
-                            buffer.queue_discard(buffer_progress.take_discard());
-                            self.core.state = Err(e.clone());
-                            return UnbufferedStatus {
-                                discard: buffer.pending_discard(),
-                                state: Err(e),
-                            };
-                        }
+                Ok(false) => {}
+                Err(err) => {
+                    buffer.queue_discard(buffer_progress.take_discard());
+                    return UnbufferedStatus {
+                        discard: buffer.pending_discard(),
+                        state: Err(err),
                     };
-
-                match self.core.process_msg(msg, state, None, config) {
-                    Ok(new) => state = new,
-
-                    Err(e) => {
-                        buffer.queue_discard(buffer_progress.take_discard());
-                        self.core.state = Err(e.clone());
-                        return UnbufferedStatus {
-                            discard: buffer.pending_discard(),
-                            state: Err(e),
-                        };
-                    }
                 }
-
-                buffer.queue_discard(buffer_progress.take_discard());
-
-                self.core.state = Ok(state);
-            } else if self.wants_write {
-                break (
-                    buffer.pending_discard(),
-                    TransmitTlsData { conn: self }.into(),
-                );
-            } else if self.core.common_state.has_received_close_notify
-                && !self.emitted_peer_closed_state
-            {
-                self.emitted_peer_closed_state = true;
-                break (buffer.pending_discard(), ConnectionState::PeerClosed);
-            } else if self.core.common_state.has_received_close_notify
-                && self.core.common_state.has_sent_close_notify
-            {
-                break (buffer.pending_discard(), ConnectionState::Closed);
-            } else if self.core.common_state.may_send_application_data {
-                break (
-                    buffer.pending_discard(),
-                    ConnectionState::WriteTraffic(WriteTraffic { conn: self }),
-                );
-            } else {
-                break (buffer.pending_discard(), ConnectionState::BlockedHandshake);
             }
+
+            break (buffer.pending_discard(), self.idle_state());
         };
 
         UnbufferedStatus {
             discard,
             state: Ok(state),
+        }
+    }
+
+    /// Deframes the next message and runs the handshake on it: `Ok(false)` when there is none.
+    /// A failure of the handshake is kept as the connection's state.
+    fn process_next_message(
+        &mut self,
+        config: &mut Data::Config,
+        buffer: &mut DeframerSliceBuffer<'_>,
+        buffer_progress: &mut BufferProgress,
+    ) -> Result<bool, Error> {
+        if self.core.common_state.has_received_close_notify {
+            return Ok(false);
+        }
+        let Some(msg) = self.core.deframe(buffer.filled_mut(), buffer_progress)? else {
+            return Ok(false);
+        };
+
+        let state = match mem::replace(&mut self.core.state, Err(Error::HandshakeNotComplete)) {
+            Ok(state) => state,
+            Err(e) => {
+                self.core.state = Err(e.clone());
+                return Err(e);
+            }
+        };
+
+        match self
+            .core
+            .process_msg(msg, state, None, config)
+            .and_then(|new| self.core.common_state.take_encrypt_failure().map(|()| new))
+        {
+            Ok(new) => {
+                self.core.state = Ok(new);
+                Ok(true)
+            }
+            Err(e) => {
+                self.core.state = Err(e.clone());
+                Err(e)
+            }
+        }
+    }
+
+    /// The state to report once there is nothing to read, encode or process.
+    fn idle_state<'c, 'i>(&'c mut self) -> ConnectionState<'c, 'i, Data> {
+        let common = &self.core.common_state;
+        if self.wants_write {
+            TransmitTlsData { conn: self }.into()
+        } else if common.has_received_close_notify && !self.emitted_peer_closed_state {
+            self.emitted_peer_closed_state = true;
+            ConnectionState::PeerClosed
+        } else if common.has_received_close_notify && common.has_sent_close_notify {
+            ConnectionState::Closed
+        } else if common.may_send_application_data {
+            ConnectionState::WriteTraffic(WriteTraffic { conn: self })
+        } else {
+            ConnectionState::BlockedHandshake
         }
     }
 }
@@ -474,16 +484,18 @@ impl<'c, Data> EncodeTlsData<'c, Data> {
 
         let required_size = chunk.len();
 
-        if required_size > outgoing_tls.len() {
-            self.chunk = Some(chunk);
-            Err(InsufficientSizeError { required_size }.into())
-        } else {
-            let written = chunk.len();
-            outgoing_tls[..written].copy_from_slice(&chunk);
+        match outgoing_tls.get_mut(..required_size) {
+            None => {
+                self.chunk = Some(chunk);
+                Err(InsufficientSizeError { required_size }.into())
+            }
+            Some(dst) => {
+                dst.copy_from_slice(&chunk);
 
-            self.conn.wants_write = true;
+                self.conn.wants_write = true;
 
-            Ok(written)
+                Ok(required_size)
+            }
         }
     }
 }

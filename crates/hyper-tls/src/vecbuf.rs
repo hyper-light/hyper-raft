@@ -50,10 +50,12 @@ impl ChunkVecBuffer {
 
     /// How many bytes we're storing
     pub(crate) fn len(&self) -> usize {
+        // Lengths of buffers in memory: their sum stays below isize::MAX, and `prefix_used`
+        // lies within the first of them.
         self.chunks
             .iter()
-            .fold(0usize, |acc, chunk| acc + chunk.len())
-            - self.prefix_used
+            .fold(0usize, |acc, chunk| acc.saturating_add(chunk.len()))
+            .saturating_sub(self.prefix_used)
     }
 
     /// For a proposed append of `len` bytes, how many
@@ -72,11 +74,8 @@ impl ChunkVecBuffer {
     pub(crate) fn append(&mut self, bytes: Vec<u8>) -> usize {
         let len = bytes.len();
 
+        // `prefix_used` is zero whenever `chunks` is empty (`consume` keeps it so).
         if !bytes.is_empty() {
-            if self.chunks.is_empty() {
-                debug_assert_eq!(self.prefix_used, 0);
-            }
-
             self.chunks.push_back(bytes);
         }
 
@@ -124,11 +123,15 @@ impl ChunkVecBuffer {
     pub(crate) fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         let mut offs = 0;
 
-        while offs < buf.len() && !self.is_empty() {
-            let used = (&self.chunks[0][self.prefix_used..]).read(&mut buf[offs..])?;
+        while offs < buf.len() {
+            let (Some(mut chunk), Some(room)) = (self.chunk(), buf.get_mut(offs..)) else {
+                break;
+            };
+            let used = chunk.read(room)?;
 
             self.consume(used);
-            offs += used;
+            // At most `buf.len()`: each read fills part of the room left.
+            offs = offs.saturating_add(used);
         }
 
         Ok(offs)
@@ -136,33 +139,32 @@ impl ChunkVecBuffer {
 
     pub(crate) fn consume_first_chunk(&mut self, used: usize) {
         // this backs (infallible) `BufRead::consume`, where `used` is
-        // user-supplied.
-        assert!(
-            used <= self.chunk().map(|ch| ch.len()).unwrap_or_default(),
-            "illegal `BufRead::consume` usage",
-        );
-        self.consume(used);
+        // user-supplied. Like std's `BufReader`, consuming more than `fill_buf` returned
+        // consumes what it returned (upstream asserted).
+        let available = self.chunk().map(|ch| ch.len()).unwrap_or_default();
+        self.consume(used.min(available));
     }
 
     fn consume(&mut self, used: usize) {
-        // first, mark the rightmost extent of the used buffer
-        self.prefix_used += used;
+        // first, mark the rightmost extent of the used buffer; callers consume what they read,
+        // which lies within the buffers, so this does not saturate.
+        self.prefix_used = self.prefix_used.saturating_add(used);
 
         // then reduce `prefix_used` by discarding wholly-covered
         // buffers
         while let Some(buf) = self.chunks.front() {
-            if self.prefix_used < buf.len() {
-                return;
-            } else {
-                self.prefix_used -= buf.len();
-                self.chunks.pop_front();
+            match self.prefix_used.checked_sub(buf.len()) {
+                None => return,
+                Some(rest) => {
+                    self.prefix_used = rest;
+                    self.chunks.pop_front();
+                }
             }
         }
 
-        debug_assert_eq!(
-            self.prefix_used, 0,
-            "attempted to `ChunkVecBuffer::consume` more than available"
-        );
+        // Consuming more than is held (upstream asserted in debug builds) leaves an empty
+        // buffer, whose invariant is a zero prefix.
+        self.prefix_used = 0;
     }
 
     /// Read data out of this object, passing it `wr`
@@ -174,11 +176,12 @@ impl ChunkVecBuffer {
         let mut prefix = self.prefix_used;
         let mut bufs = [io::IoSlice::new(&[]); 64];
         for (iov, chunk) in bufs.iter_mut().zip(self.chunks.iter()) {
-            *iov = io::IoSlice::new(&chunk[prefix..]);
+            // `prefix_used` lies within the first chunk.
+            *iov = io::IoSlice::new(chunk.get(prefix..).unwrap_or_default());
             prefix = 0;
         }
         let len = cmp::min(bufs.len(), self.chunks.len());
-        let bufs = &bufs[..len];
+        let bufs = bufs.split_at(len).0;
         let used = wr.write_vectored(bufs)?;
         let available_bytes = bufs.iter().map(|ch| ch.len()).sum();
 
@@ -188,10 +191,9 @@ impl ChunkVecBuffer {
             // case the caller ignores the error.
             // See <https://github.com/rustls/rustls/issues/2316> for background.
             self.consume(available_bytes);
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                std::format!("illegal write_vectored return value ({used} > {available_bytes})"),
-            ));
+            return Err(io::Error::other(std::format!(
+                "illegal write_vectored return value ({used} > {available_bytes})"
+            )));
         }
         self.consume(used);
         Ok(used)
@@ -199,7 +201,10 @@ impl ChunkVecBuffer {
 
     /// Returns the first contiguous chunk of data, or None if empty.
     pub(crate) fn chunk(&self) -> Option<&[u8]> {
-        self.chunks.front().map(|chunk| &chunk[self.prefix_used..])
+        // `prefix_used` lies within the first chunk.
+        self.chunks
+            .front()
+            .map(|chunk| chunk.get(self.prefix_used..).unwrap_or_default())
     }
 }
 

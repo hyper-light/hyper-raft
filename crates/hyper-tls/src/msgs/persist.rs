@@ -116,7 +116,8 @@ impl Tls13ClientSessionValue {
     #[doc(hidden)]
     /// Test only: rewind epoch by `delta` seconds.
     pub fn rewind_epoch(&mut self, delta: u32) {
-        self.common.epoch -= delta as u64;
+        // No earlier than the Unix epoch.
+        self.common.epoch = self.common.epoch.saturating_sub(u64::from(delta));
     }
 
     #[doc(hidden)]
@@ -196,7 +197,8 @@ impl Tls12ClientSessionValue {
     #[doc(hidden)]
     /// Test only: rewind epoch by `delta` seconds.
     pub fn rewind_epoch(&mut self, delta: u32) {
-        self.common.epoch -= delta as u64;
+        // No earlier than the Unix epoch.
+        self.common.epoch = self.common.epoch.saturating_sub(u64::from(delta));
     }
 }
 
@@ -420,7 +422,10 @@ impl ServerSessionValue {
     ) -> Self {
         let client_age_ms = obfuscated_client_age_ms.wrapping_sub(self.age_obfuscation_offset);
         let server_age_ms =
-            (time_now.as_secs().saturating_sub(self.creation_time_sec) as u32).saturating_mul(1000);
+            // An age past u32::MAX seconds saturates, as the milliseconds below do.
+            u32::try_from(time_now.as_secs().saturating_sub(self.creation_time_sec))
+                .unwrap_or(u32::MAX)
+                .saturating_mul(1000);
 
         let age_difference = server_age_ms.abs_diff(client_age_ms);
 

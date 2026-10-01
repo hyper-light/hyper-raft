@@ -2937,7 +2937,7 @@ fn test_client_write_and_vectored_write_equivalence() {
 
     const N: usize = 1000;
 
-    let data_chunked: Vec<IoSlice> = std::iter::repeat(IoSlice::new(b"A")).take(N).collect();
+    let data_chunked: Vec<IoSlice> = std::iter::repeat_n(IoSlice::new(b"A"), N).collect();
     let bytes_written_chunked = client.writer().write_vectored(&data_chunked).unwrap();
     let bytes_sent_chunked = transfer(&mut client, &mut server);
     println!("write_vectored returned {bytes_written_chunked} and sent {bytes_sent_chunked}");
@@ -3525,6 +3525,53 @@ fn test_tls12_exporter() {
     }
 }
 
+/// A TLS 1.2 exporter context is prefixed by a uint16 length (RFC 5705 §4); a longer one reached
+/// upstream's `assert!`. It is refused.
+#[test]
+fn test_tls12_exporter_refuses_context_longer_than_uint16() {
+    let provider = provider::default_provider();
+    let client_config = make_client_config_with_versions(
+        KeyType::EcdsaP256,
+        &[&hyper_tls::version::TLS12],
+        &provider,
+    );
+    let server_config = make_server_config(KeyType::EcdsaP256, &provider);
+    let (mut client, mut server) = make_pair_for_configs(client_config, server_config);
+    do_handshake(&mut client, &mut server);
+
+    let context = vec![0u8; 0x1_0000];
+    let mut secret = [0u8; 32];
+    assert!(client
+        .export_keying_material(&mut secret, b"label", Some(&context))
+        .is_err());
+    assert!(client
+        .export_keying_material(&mut secret, b"label", Some(&context[..0xffff]))
+        .is_ok());
+}
+
+/// A TLS 1.3 HkdfLabel's label is `opaque label<7..255>` beginning "tls13 " (RFC 8446 §7.1), so an
+/// exporter label longer than 249 bytes cannot be encoded; upstream truncated its length byte.
+#[test]
+fn test_tls13_exporter_refuses_label_longer_than_249() {
+    let provider = provider::default_provider();
+    let client_config = make_client_config_with_versions(
+        KeyType::EcdsaP256,
+        &[&hyper_tls::version::TLS13],
+        &provider,
+    );
+    let server_config = make_server_config(KeyType::EcdsaP256, &provider);
+    let (mut client, mut server) = make_pair_for_configs(client_config, server_config);
+    do_handshake(&mut client, &mut server);
+
+    let mut secret = [0u8; 32];
+    assert!(client
+        .export_keying_material(&mut secret, &[b'a'; 250], None)
+        .is_err());
+    assert!(client
+        .export_keying_material(&mut secret, &[b'a'; 249], None)
+        .is_ok());
+}
+
 #[test]
 fn test_tls13_exporter() {
     let provider = provider::default_provider();
@@ -4089,6 +4136,7 @@ fn hkdf_expand_label<T: From<[u8; N]>, const N: usize>(
             &[0],
         ],
     )
+    .unwrap()
 }
 
 #[test]
@@ -4668,7 +4716,7 @@ fn early_data_can_be_rejected_by_server() {
     assert_eq!(client.early_data().unwrap().bytes_left(), 1234);
     client.early_data().unwrap().flush().unwrap();
     assert_eq!(client.early_data().unwrap().write(b"hello").unwrap(), 5);
-    server.reject_early_data();
+    server.reject_early_data().unwrap();
     do_handshake(&mut client, &mut server);
 
     assert!(!client.is_early_data_accepted());
@@ -4954,7 +5002,7 @@ mod test_quic {
                 server_params.into(),
             )
             .unwrap();
-            server.reject_early_data();
+            server.reject_early_data().unwrap();
 
             step(&mut client, &mut server, &mut server_config).unwrap();
             assert_eq!(client.quic_transport_parameters(), Some(server_params));
@@ -5363,7 +5411,7 @@ mod test_quic {
         let header_len = PLAIN_HEADER.len();
         let tag_len = client_keys.local.packet.tag_len();
         let padding_len = 1200 - header_len - PAYLOAD.len() - tag_len;
-        buf.extend(std::iter::repeat(0).take(padding_len));
+        buf.extend(std::iter::repeat_n(0, padding_len));
         let (header, payload) = buf.split_at_mut(header_len);
         let tag = client_keys
             .local
@@ -6232,7 +6280,7 @@ fn test_acceptor() {
     let mut acceptor = Acceptor::default();
     acceptor.read_tls(&mut buf.as_slice()).unwrap();
     let accepted = acceptor.accept().unwrap().unwrap();
-    let ch = accepted.client_hello();
+    let ch = accepted.client_hello().unwrap();
     assert_eq!(ch.server_name(), Some("localhost"));
     assert_eq!(
         ch.named_groups().unwrap(),
@@ -6415,7 +6463,7 @@ fn test_acceptor_rejected_handshake() {
     let mut acceptor = Acceptor::default();
     acceptor.read_tls(&mut buf.as_slice()).unwrap();
     let accepted = acceptor.accept().unwrap().unwrap();
-    let ch = accepted.client_hello();
+    let ch = accepted.client_hello().unwrap();
     assert_eq!(ch.server_name(), Some("localhost"));
 
     let (err, mut alert) = accepted.into_connection(&mut server_config).unwrap_err();

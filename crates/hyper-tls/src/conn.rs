@@ -241,6 +241,7 @@ mod connection {
         }
     }
 
+    /// The error text for EOF before close_notify.
     const UNEXPECTED_EOF_MESSAGE: &str =
         "peer closed connection without sending TLS close_notify: \
 https://docs.rs/rustls/latest/rustls/manual/_03_howto/index.html#unexpected-eof";
@@ -306,9 +307,9 @@ https://docs.rs/rustls/latest/rustls/manual/_03_howto/index.html#unexpected-eof"
 
         fn write_vectored(&mut self, bufs: &[io::IoSlice<'_>]) -> io::Result<usize> {
             let payload_owner: Vec<&[u8]>;
-            let payload = match bufs.len() {
-                0 => return Ok(0),
-                1 => OutboundChunks::Single(bufs[0].deref()),
+            let payload = match bufs {
+                [] => return Ok(0),
+                [single] => OutboundChunks::Single(single.deref()),
                 _ => {
                     payload_owner = bufs.iter().map(|io_slice| io_slice.deref()).collect();
 
@@ -589,7 +590,8 @@ impl<Data> ConnectionCommon<Data> {
                         io.flush()?;
                         return Ok((rdlen, wrlen)); // EOF.
                     }
-                    Ok(n) => wrlen += n,
+                    // A byte count no call can bring near usize::MAX.
+                    Ok(n) => wrlen = usize::saturating_add(wrlen, n),
                     Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
                         blocked_write = Some(err);
                         break;
@@ -607,11 +609,13 @@ impl<Data> ConnectionCommon<Data> {
 
             // If we want to write, but are WouldBlocked by the underlying IO, *and*
             // have no desire to read; that is everything.
-            if let (Some(_), false) = (&blocked_write, self.wants_read()) {
-                return match wrlen {
-                    0 => Err(blocked_write.unwrap()),
-                    _ => Ok((rdlen, wrlen)),
-                };
+            if !self.wants_read() {
+                if let Some(err) = blocked_write.take() {
+                    return match wrlen {
+                        0 => Err(err),
+                        _ => Ok((rdlen, wrlen)),
+                    };
+                }
             }
 
             while !eof && self.wants_read() {
@@ -621,7 +625,8 @@ impl<Data> ConnectionCommon<Data> {
                         Some(0)
                     }
                     Ok(n) => {
-                        rdlen += n;
+                        // A byte count no call can bring near usize::MAX.
+                        rdlen = usize::saturating_add(rdlen, n);
                         Some(n)
                     }
                     Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
@@ -646,11 +651,13 @@ impl<Data> ConnectionCommon<Data> {
 
             // If we want to read, but are WouldBlocked by the underlying IO, *and*
             // have no desire to write; that is everything.
-            if let (Some(_), false) = (&blocked_read, self.wants_write()) {
-                return match rdlen {
-                    0 => Err(blocked_read.unwrap()),
-                    _ => Ok((rdlen, wrlen)),
-                };
+            if !self.wants_write() {
+                if let Some(err) = blocked_read.take() {
+                    return match rdlen {
+                        0 => Err(err),
+                        _ => Ok((rdlen, wrlen)),
+                    };
+                }
             }
 
             // if we're doing IO until handshaked, and we believe we've finished handshaking,
@@ -721,10 +728,7 @@ impl<Data> ConnectionCommon<Data> {
     /// [`reader()`]: ConnectionCommon::reader
     pub fn read_tls(&mut self, rd: &mut dyn io::Read) -> Result<usize, io::Error> {
         if self.received_plaintext.is_full() {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                "received plaintext buffer full",
-            ));
+            return Err(io::Error::other("received plaintext buffer full"));
         }
 
         if self.has_received_close_notify {
@@ -851,6 +855,12 @@ impl<Data> ConnectionCore<Data> {
         let mut buffer_progress = self.hs_deframer.progress();
 
         loop {
+            if let Err(e) = self.common_state.take_encrypt_failure() {
+                self.state = Err(e.clone());
+                deframer_buffer.discard(buffer_progress.take_discard());
+                return Err(e);
+            }
+
             let res = self.deframe(deframer_buffer.filled_mut(), &mut buffer_progress);
 
             let opt_msg = match res {
@@ -890,6 +900,10 @@ impl<Data> ConnectionCore<Data> {
         }
 
         deframer_buffer.discard(buffer_progress.take_discard());
+        if let Err(e) = self.common_state.take_encrypt_failure() {
+            self.state = Err(e.clone());
+            return Err(e);
+        }
         self.state = Ok(state);
         Ok(self.common_state.current_io_state())
     }
@@ -905,7 +919,7 @@ impl<Data> ConnectionCore<Data> {
     ) -> Result<Option<InboundPlainMessage<'b>>, Error> {
         // before processing any more of `buffer`, return any extant messages from `hs_deframer`
         if self.hs_deframer.has_message_ready() {
-            Ok(self.take_handshake_message(buffer, buffer_progress))
+            self.take_handshake_message(buffer, buffer_progress)
         } else {
             self.process_more_input(buffer, buffer_progress)
         }
@@ -915,17 +929,18 @@ impl<Data> ConnectionCore<Data> {
         &mut self,
         buffer: &'b mut [u8],
         buffer_progress: &mut BufferProgress,
-    ) -> Option<InboundPlainMessage<'b>> {
-        let message = self
-            .hs_deframer
-            .iter(buffer)
-            .next()
-            .map(|(message, discard)| {
-                buffer_progress.add_discard(discard);
-                message
-            });
+    ) -> Result<Option<InboundPlainMessage<'b>>, Error> {
+        let message =
+            self.hs_deframer
+                .iter(buffer)
+                .next()
+                .transpose()?
+                .map(|(message, discard)| {
+                    buffer_progress.add_discard(discard);
+                    message
+                });
         self.common_state.aligned_handshake = self.hs_deframer.is_aligned();
-        message
+        Ok(message)
     }
 
     fn process_more_input<'b>(
@@ -941,7 +956,10 @@ impl<Data> ConnectionCore<Data> {
         let locator = Locator::new(buffer);
 
         loop {
-            let mut iter = DeframerIter::new(&mut buffer[buffer_progress.processed()..]);
+            let unprocessed = buffer
+                .get_mut(buffer_progress.processed()..)
+                .ok_or(Error::Internal("deframer progress past the buffer"))?;
+            let mut iter = DeframerIter::new(unprocessed);
 
             let (message, processed) = loop {
                 let message = match iter.next().transpose() {
@@ -1018,7 +1036,9 @@ impl<Data> ConnectionCore<Data> {
                     {
                         return Err(PeerMisbehaved::TooManyEmptyFragments.into());
                     }
-                    self.seen_consecutive_empty_fragments += 1;
+                    // Below ALLOWED_CONSECUTIVE_EMPTY_FRAGMENTS_MAX, checked above.
+                    self.seen_consecutive_empty_fragments =
+                        self.seen_consecutive_empty_fragments.saturating_add(1);
                 }
                 _ => {
                     self.seen_consecutive_empty_fragments = 0;
@@ -1034,17 +1054,17 @@ impl<Data> ConnectionCore<Data> {
             //
             // is fixed by -Zpolonius
             // https://github.com/rust-lang/rfcs/blob/master/text/2094-nll.md#problem-case-3-conditional-control-flow-across-functions
-            let unborrowed = InboundUnborrowedMessage::unborrow(&locator, message);
+            let unborrowed = InboundUnborrowedMessage::unborrow(&locator, message)?;
 
             if unborrowed.typ != ContentType::Handshake {
-                let message = unborrowed.reborrow(&Delocator::new(buffer));
+                let message = unborrowed.reborrow(&Delocator::new(buffer))?;
                 buffer_progress.add_discard(processed);
                 return Ok(Some(message));
             }
 
-            let message = unborrowed.reborrow(&Delocator::new(buffer));
+            let message = unborrowed.reborrow(&Delocator::new(buffer))?;
             self.hs_deframer
-                .input_message(message, &locator, buffer_progress.processed());
+                .input_message(message, &locator, buffer_progress.processed())?;
             self.hs_deframer.coalesce(buffer)?;
 
             self.common_state.aligned_handshake = self.hs_deframer.is_aligned();
@@ -1053,7 +1073,7 @@ impl<Data> ConnectionCore<Data> {
                 // trial decryption finishes with the first handshake message after it started.
                 self.common_state.record_layer.finish_trial_decryption();
 
-                return Ok(self.take_handshake_message(buffer, buffer_progress));
+                return self.take_handshake_message(buffer, buffer_progress);
             }
         }
     }
@@ -1247,20 +1267,20 @@ struct InboundUnborrowedMessage {
 }
 
 impl InboundUnborrowedMessage {
-    fn unborrow(locator: &Locator, msg: InboundPlainMessage<'_>) -> Self {
-        Self {
+    fn unborrow(locator: &Locator, msg: InboundPlainMessage<'_>) -> Result<Self, Error> {
+        Ok(Self {
             typ: msg.typ,
             version: msg.version,
-            bounds: locator.locate(msg.payload),
-        }
+            bounds: locator.locate(msg.payload)?,
+        })
     }
 
-    fn reborrow<'b>(self, delocator: &Delocator<'b>) -> InboundPlainMessage<'b> {
-        InboundPlainMessage {
+    fn reborrow<'b>(self, delocator: &Delocator<'b>) -> Result<InboundPlainMessage<'b>, Error> {
+        Ok(InboundPlainMessage {
             typ: self.typ,
             version: self.version,
-            payload: delocator.slice_from_range(&self.bounds),
-        }
+            payload: delocator.slice_from_range(&self.bounds)?,
+        })
     }
 }
 

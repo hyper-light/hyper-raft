@@ -49,12 +49,8 @@ impl<'a> FfdheGroup<'a> {
     /// Construct an `FfdheGroup` from the given `p` and `g`, trimming any potential leading zeros.
     pub fn from_params_trimming_leading_zeros(p: &'a [u8], g: &'a [u8]) -> Self {
         fn trim_leading_zeros(buf: &[u8]) -> &[u8] {
-            for start in 0..buf.len() {
-                if buf[start] != 0 {
-                    return &buf[start..];
-                }
-            }
-            &[]
+            let zeros = buf.iter().take_while(|&&b| b == 0).count();
+            buf.split_at(zeros).1
         }
 
         FfdheGroup {

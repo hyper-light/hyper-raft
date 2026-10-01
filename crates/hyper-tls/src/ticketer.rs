@@ -104,7 +104,8 @@ impl TicketSwitcher {
 
 impl ProducesTickets for TicketSwitcher {
     fn lifetime(&self) -> u32 {
-        self.lifetime * 2
+        // Two generations of keys are live; a lifetime hint past u32::MAX saturates.
+        self.lifetime.saturating_mul(2)
     }
 
     fn enabled(&self) -> bool {
@@ -200,7 +201,8 @@ impl TicketRotator {
 
 impl ProducesTickets for TicketRotator {
     fn lifetime(&self) -> u32 {
-        self.lifetime * 2
+        // Two generations of keys are live; a lifetime hint past u32::MAX saturates.
+        self.lifetime.saturating_mul(2)
     }
 
     fn enabled(&self) -> bool {

@@ -43,6 +43,7 @@ mod cache {
     use crate::msgs::persist;
     use crate::{limited_cache, NamedGroup};
 
+    /// Tickets kept per server: upstream rustls's value, kept unchanged.
     const MAX_TLS13_TICKETS_PER_SERVER: usize = 8;
 
     struct ServerData {

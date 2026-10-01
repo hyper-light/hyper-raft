@@ -2,6 +2,7 @@ use core::fmt;
 
 use crate::crypto;
 use crate::crypto::hash;
+use crate::crypto::tls13::{copy_prefix, prefix};
 use crate::suites::{CipherSuiteCommon, SupportedCipherSuite};
 
 pub(crate) mod key_schedule;
@@ -102,13 +103,14 @@ pub(crate) struct VerifyMessage {
 
 impl VerifyMessage {
     fn new(handshake_hash: &hash::Output, context_string_with_0: &[u8; 34]) -> Self {
-        let used = 64 + context_string_with_0.len() + handshake_hash.as_ref().len();
         let mut buf = [0x20u8; MAX_VERIFY_MSG];
 
-        let (_spaces, context) = buf.split_at_mut(64);
-        let (context, hash) = context.split_at_mut(34);
+        let (_spaces, context) = buf.split_at_mut(VERIFY_PAD_LEN);
+        let (context, hash) = context.split_at_mut(context_string_with_0.len());
         context.copy_from_slice(context_string_with_0);
-        hash[..handshake_hash.as_ref().len()].copy_from_slice(handshake_hash.as_ref());
+        let hashed = copy_prefix(hash, handshake_hash.as_ref());
+        // At most MAX_VERIFY_MSG, so this does not saturate.
+        let used = VERIFY_PREFIX_LEN.saturating_add(hashed);
 
         Self { buf, used }
     }
@@ -116,10 +118,17 @@ impl VerifyMessage {
 
 impl AsRef<[u8]> for VerifyMessage {
     fn as_ref(&self) -> &[u8] {
-        &self.buf[..self.used]
+        prefix(&self.buf, self.used)
     }
 }
 
+/// The server's CertificateVerify context string (RFC 8446 §4.4.3).
 const SERVER_CONSTANT: &[u8; 34] = b"TLS 1.3, server CertificateVerify\x00";
+/// The client's CertificateVerify context string (RFC 8446 §4.4.3).
 const CLIENT_CONSTANT: &[u8; 34] = b"TLS 1.3, client CertificateVerify\x00";
-const MAX_VERIFY_MSG: usize = 64 + CLIENT_CONSTANT.len() + hash::Output::MAX_LEN;
+/// The 64 spaces that begin the signed content (RFC 8446 §4.4.3).
+const VERIFY_PAD_LEN: usize = 64;
+/// The pad and a context string, which the transcript hash follows.
+const VERIFY_PREFIX_LEN: usize = VERIFY_PAD_LEN + CLIENT_CONSTANT.len();
+/// The longest signed content: the pad, a context string and the longest transcript hash.
+const MAX_VERIFY_MSG: usize = VERIFY_PAD_LEN + CLIENT_CONSTANT.len() + hash::Output::MAX_LEN;

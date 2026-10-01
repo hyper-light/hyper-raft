@@ -168,7 +168,7 @@ impl Layout {
         share: &'a [u8],
         post_quantum_share_len: usize,
     ) -> Option<(&'a [u8], &'a [u8])> {
-        if share.len() != self.classical_share_len + post_quantum_share_len {
+        if self.classical_share_len.checked_add(post_quantum_share_len) != Some(share.len()) {
             return None;
         }
 

@@ -25,37 +25,41 @@ pub(crate) fn wrap_in_octet_string(bytes: &[u8]) -> Vec<u8> {
 }
 
 fn asn1_wrap(tag: u8, bytes_a: &[u8], bytes_b: &[u8]) -> Vec<u8> {
-    let len = bytes_a.len() + bytes_b.len();
+    // Lengths of slices in memory: their sum stays below isize::MAX.
+    let len = bytes_a.len().saturating_add(bytes_b.len());
+    let size = len.to_be_bytes();
+    // X.690 §8.1.3: the short form is one octet below 0x80; the long form is 0x80 | the count
+    // of length octets, then the length's octets without leading zeros.
+    let (short, octets) = match u8::try_from(len) {
+        Ok(short) if short <= 0x7f => (Some(short), &[][..]),
+        _ => {
+            let leading_zero_bytes = size.iter().take_while(|&&x| x == 0).count();
+            (None, size.split_at(leading_zero_bytes).1)
+        }
+    };
 
-    if len <= 0x7f {
-        // Short form
-        let mut ret = Vec::with_capacity(2 + len);
-        ret.push(tag);
-        ret.push(len as u8);
-        ret.extend_from_slice(bytes_a);
-        ret.extend_from_slice(bytes_b);
-        ret
-    } else {
-        // Long form
-        let size = len.to_be_bytes();
-        let leading_zero_bytes = size.iter().position(|&x| x != 0).unwrap_or(size.len());
-        assert!(leading_zero_bytes < size.len());
-        let encoded_bytes = size.len() - leading_zero_bytes;
-
-        let mut ret = Vec::with_capacity(2 + encoded_bytes + len);
-        ret.push(tag);
-
-        ret.push(0x80 + encoded_bytes as u8);
-        ret.extend_from_slice(&size[leading_zero_bytes..]);
-
-        ret.extend_from_slice(bytes_a);
-        ret.extend_from_slice(bytes_b);
-        ret
+    // A capacity hint: the tag, the length octets and the contents.
+    let mut ret = Vec::with_capacity(len.saturating_add(octets.len()).saturating_add(2));
+    ret.push(tag);
+    match short {
+        Some(short) => ret.push(short),
+        None => {
+            // At most the eight octets of a usize.
+            let count = u8::try_from(octets.len()).unwrap_or(8);
+            ret.push(0x80 | count);
+            ret.extend_from_slice(octets);
+        }
     }
+    ret.extend_from_slice(bytes_a);
+    ret.extend_from_slice(bytes_b);
+    ret
 }
 
+/// The universal tag of SEQUENCE, constructed (X.690 §8.9, X.680 §8.6).
 const DER_SEQUENCE_TAG: u8 = 0x30;
+/// The universal tag of BIT STRING (X.680 §8.6).
 const DER_BIT_STRING_TAG: u8 = 0x03;
+/// The universal tag of OCTET STRING (X.680 §8.6).
 const DER_OCTET_STRING_TAG: u8 = 0x04;
 
 #[cfg(test)]

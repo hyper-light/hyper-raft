@@ -271,13 +271,13 @@ impl<const KEY_SIZE: usize, const KDF_SIZE: usize> HpkeAwsLcRs<KEY_SIZE, KDF_SIZ
             &shared_secret,
             &key_schedule_context,
             Label::Key,
-        ));
+        )?);
 
         let base_nonce = self.key_schedule_labeled_expand::<NONCE_LEN>(
             &shared_secret,
             &key_schedule_context,
             Label::BaseNonce,
-        );
+        )?;
 
         Ok(KeySchedule {
             aead: self.aead,
@@ -292,7 +292,7 @@ impl<const KEY_SIZE: usize, const KDF_SIZE: usize> HpkeAwsLcRs<KEY_SIZE, KDF_SIZ
         shared_secret: &KemSharedSecret<KDF_SIZE>,
         key_schedule_context: &[u8],
         label: Label,
-    ) -> [u8; L] {
+    ) -> Result<[u8; L], Error> {
         let suite_id = LabeledSuiteId::Hpke(self.suite);
         labeled_expand::<L>(
             suite_id,
@@ -567,7 +567,7 @@ impl<const KDF_SIZE: usize> DhKem<KDF_SIZE> {
         let shared_secret = agreement::agree(&sk_e, pk_r, aws_lc_rs::error::Unspecified, |dh| {
             Ok(self.extract_and_expand(dh, &kem_context))
         })
-        .map_err(unspecified_err)?;
+        .map_err(unspecified_err)??;
 
         Ok((
             KemSharedSecret(shared_secret),
@@ -605,7 +605,7 @@ impl<const KDF_SIZE: usize> DhKem<KDF_SIZE> {
         let shared_secret = agreement::agree(&sk_r, pk_e, aws_lc_rs::error::Unspecified, |dh| {
             Ok(self.extract_and_expand(dh, &kem_context))
         })
-        .map_err(unspecified_err)?;
+        .map_err(unspecified_err)??;
 
         Ok(KemSharedSecret(shared_secret))
     }
@@ -613,7 +613,7 @@ impl<const KDF_SIZE: usize> DhKem<KDF_SIZE> {
     /// See [RFC 9180 §4.1 "DH-Based KEM (DHKEM)"][0].
     ///
     /// [0]: https://www.rfc-editor.org/rfc/rfc9180.html#section-4.1
-    fn extract_and_expand(&self, dh: &[u8], kem_context: &[u8]) -> [u8; KDF_SIZE] {
+    fn extract_and_expand(&self, dh: &[u8], kem_context: &[u8]) -> Result<[u8; KDF_SIZE], Error> {
         // def ExtractAndExpand(dh, kem_context):
         //   eae_prk = LabeledExtract("", "eae_prk", dh)
         //   shared_secret = LabeledExpand(eae_prk, "shared_secret",
@@ -668,9 +668,11 @@ fn generate_p_curve_key_pair(
     alg: &'static agreement::Algorithm,
 ) -> Result<(HpkePublicKey, HpkePrivateKey), Error> {
     // We only initialize DH KEM instances that use this function as a key generator
-    // for non-X25519 algorithms. Debug assert this just in case since `AsBigEndian<EcPrivateKeyBin>`
-    // will panic for this algorithm.
-    debug_assert_ne!(alg, &agreement::X25519);
+    // for non-X25519 algorithms. Refuse X25519 here anyway, since `AsBigEndian<EcPrivateKeyBin>`
+    // panics for that algorithm (upstream asserted in debug builds only).
+    if alg == &agreement::X25519 {
+        return Err(Error::Internal("P-curve key generation asked for X25519"));
+    }
     let (public_key, private_key) = generate_key_pair(alg)?;
     let raw_private_key: EcPrivateKeyBin<'_> =
         private_key.as_be_bytes().map_err(unspecified_err)?;
@@ -732,8 +734,8 @@ impl<const KEY_SIZE: usize> KeySchedule<KEY_SIZE> {
         //   * N-4 bytes of the base nonce (0s in `nonce` to XOR in as-is).
         //   * 4 bytes derived from the sequence number XOR the base nonce.
         let mut nonce = [0; NONCE_LEN];
-        let seq_bytes = self.seq_num.to_be_bytes();
-        nonce[NONCE_LEN - seq_bytes.len()..].copy_from_slice(&seq_bytes);
+        let [.., n0, n1, n2, n3] = &mut nonce;
+        [*n0, *n1, *n2, *n3] = self.seq_num.to_be_bytes();
 
         for (n, &b) in nonce.iter_mut().zip(&self.base_nonce) {
             *n ^= b;
@@ -761,7 +763,12 @@ impl<const KEY_SIZE: usize> KeySchedule<KEY_SIZE> {
             return Err(aws_lc_rs::error::Unspecified);
         }
 
-        self.seq_num += 1;
+        // The u32 counter ends far below the AEAD's limit; at its end the context refuses, never
+        // reusing a nonce.
+        self.seq_num = self
+            .seq_num
+            .checked_add(1)
+            .ok_or(aws_lc_rs::error::Unspecified)?;
         Ok(())
     }
 }
@@ -818,13 +825,15 @@ fn labeled_expand<const L: usize>(
     expander: Box<dyn HkdfExpander>,
     label: Label,
     kem_context: &[u8],
-) -> [u8; L] {
+) -> Result<[u8; L], Error> {
     // def LabeledExpand(prk, label, info, L):
     //   labeled_info = concat(I2OSP(L, 2), "HPKE-v1", suite_id,
     //                         label, info)
     //   return Expand(prk, labeled_info, L)
 
-    let output_len = u16::to_be_bytes(L as u16);
+    let output_len = u16::try_from(L)
+        .map_err(|_| Error::Internal("HPKE LabeledExpand length exceeds I2OSP(L, 2)"))?
+        .to_be_bytes();
     let info = &[
         &output_len[..],
         b"HPKE-v1",
@@ -833,7 +842,7 @@ fn labeled_expand<const L: usize>(
         kem_context,
     ];
 
-    expand(&*expander, info)
+    Ok(expand(&*expander, info)?)
 }
 
 /// Label describes the possible labels for use with [labeled_extract_for_expand] and [labeled_expand].
@@ -917,6 +926,7 @@ fn key_rejected_err(_e: aws_lc_rs::error::KeyRejected) -> Error {
 
 // The `cipher::chacha::KEY_LEN` const is not exported, so we copy it here:
 // https://github.com/aws/aws-lc-rs/blob/0186ef7bb1a4d7e140bae8074a9871f49afedf1b/aws-lc-rs/src/cipher/chacha.rs#L13
+/// ChaCha20's key length (RFC 8439 §2.3), copied from aws-lc-rs as cited above.
 const CHACHA_KEY_LEN: usize = 32;
 
 static RING_HKDF_HMAC_SHA256: &HkdfUsingHmac<'static> = &HkdfUsingHmac(&HMAC_SHA256);

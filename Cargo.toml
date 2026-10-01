@@ -60,7 +60,7 @@ missing_docs = "deny"
 unused_must_use = "deny"
 unreachable_pub = "warn"
 # `--cfg loom` and `--cfg shuttle` select the interleaving and randomized-schedule tests.
-unexpected_cfgs = { level = "deny", check-cfg = ["cfg(loom)", "cfg(shuttle)"] }
+unexpected_cfgs = { level = "deny", check-cfg = ["cfg(loom)", "cfg(shuttle)", "cfg(fuzzing)"] }
 
 [workspace.lints.clippy]
 all = { level = "deny", priority = -1 }

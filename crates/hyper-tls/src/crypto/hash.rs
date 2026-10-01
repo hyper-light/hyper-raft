@@ -32,15 +32,13 @@ pub struct Output {
 }
 
 impl Output {
-    /// Build a `hash::Output` from a slice of no more than `Output::MAX_LEN` bytes.
+    /// Build a `hash::Output` from a slice of no more than `Output::MAX_LEN` bytes, the
+    /// longest digest of any supported hash (SHA-512); it keeps that many of a longer slice
+    /// (upstream asserted in debug builds and panicked).
     pub fn new(bytes: &[u8]) -> Self {
-        let mut output = Self {
-            buf: [0u8; Self::MAX_LEN],
-            used: bytes.len(),
-        };
-        debug_assert!(bytes.len() <= Self::MAX_LEN);
-        output.buf[..bytes.len()].copy_from_slice(bytes);
-        output
+        let mut buf = [0u8; Self::MAX_LEN];
+        let used = super::tls13::copy_prefix(&mut buf, bytes);
+        Self { buf, used }
     }
 
     /// Maximum supported hash output size: supports up to SHA512.
@@ -49,7 +47,7 @@ impl Output {
 
 impl AsRef<[u8]> for Output {
     fn as_ref(&self) -> &[u8] {
-        &self.buf[..self.used]
+        super::tls13::prefix(&self.buf, self.used)
     }
 }
 

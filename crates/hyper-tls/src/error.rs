@@ -79,6 +79,10 @@ pub enum Error {
     /// A catch-all error for unlikely errors.
     General(String),
 
+    /// An invariant of this implementation did not hold. This is a defect in hyper-tls, never
+    /// something a peer caused; upstream rustls panicked at each such site (`VENDORED.md` §3).
+    Internal(&'static str),
+
     /// We failed to figure out what time it currently is.
     FailedToGetCurrentTime,
 
@@ -680,15 +684,16 @@ impl fmt::Display for CertificateError {
                     many => {
                         write!(f, "is only valid for ")?;
 
-                        let n = many.len();
-                        let all_but_last = &many[..n - 1];
-                        let last = &many[n - 1];
+                        let Some((last, all_but_last)) = many.split_last() else {
+                            return Ok(());
+                        };
 
-                        for (i, name) in all_but_last.iter().enumerate() {
-                            write!(f, "{name}")?;
-                            if i < n - 2 {
-                                write!(f, ", ")?;
-                            }
+                        let mut names = all_but_last.iter();
+                        if let Some(first) = names.next() {
+                            write!(f, "{first}")?;
+                        }
+                        for name in names {
+                            write!(f, ", {name}")?;
                         }
                         write!(f, " or {last}")
                     }
@@ -1001,8 +1006,16 @@ impl fmt::Display for Error {
                 write!(f, "keys may not be consistent: {why:?}")
             }
             Self::General(err) => write!(f, "unexpected error: {err}"),
+            Self::Internal(what) => write!(f, "internal error: {what}"),
             Self::Other(err) => write!(f, "other error: {err}"),
         }
+    }
+}
+
+impl From<crate::crypto::tls13::OutputLengthError> for Error {
+    #[inline]
+    fn from(_: crate::crypto::tls13::OutputLengthError) -> Self {
+        Self::Internal("HKDF-Expand output longer than 255 * HashLen")
     }
 }
 
@@ -1013,7 +1026,7 @@ impl From<SystemTimeError> for Error {
     }
 }
 
-impl std::error::Error for Error {}
+impl core::error::Error for Error {}
 
 impl From<rand::GetRandomFailed> for Error {
     fn from(_: rand::GetRandomFailed) -> Self {
@@ -1023,8 +1036,8 @@ impl From<rand::GetRandomFailed> for Error {
 
 mod other_error {
     use alloc::boxed::Box;
+    use core::error::Error as StdError;
     use core::fmt;
-    use std::error::Error as StdError;
 
     use super::Error;
 
@@ -1117,7 +1130,7 @@ mod tests {
         }
     }
 
-    impl std::error::Error for Empty {}
+    impl core::error::Error for Empty {}
 
     #[test]
     fn certificate_error_equality() {
@@ -1351,6 +1364,7 @@ mod tests {
             .into(),
             super::CertificateError::InvalidOcspResponse.into(),
             Error::General("undocumented error".to_string()),
+            Error::Internal("an invariant"),
             Error::FailedToGetCurrentTime,
             Error::FailedToGetRandomBytes,
             Error::HandshakeNotComplete,

@@ -2,81 +2,28 @@
 //! allocator. Each count is printed for comparison with the same test run against 526c2cc, where
 //! configurations were shared by `Arc` (the commit message records both).
 
-use std::alloc::{GlobalAlloc, Layout, System};
-use std::cell::Cell;
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects,
+    clippy::disallowed_macros
+)]
+
 use std::io;
 
+use hyper_measure::alloc::{self, Counting, Counts};
 use hyper_tls::pki_types::pem::PemObject;
 use hyper_tls::pki_types::{CertificateDer, PrivateKeyDer};
 use hyper_tls::{ClientConfig, ClientConnection, RootCertStore, ServerConfig, ServerConnection};
 
-struct Counting;
-
-thread_local! {
-    static COUNTING: Cell<bool> = const { Cell::new(false) };
-    static ALLOCS: Cell<u64> = const { Cell::new(0) };
-    static REALLOCS: Cell<u64> = const { Cell::new(0) };
-    static BYTES: Cell<u64> = const { Cell::new(0) };
-}
-
-fn note(counter: &'static std::thread::LocalKey<Cell<u64>>, by: u64) {
-    if COUNTING.try_with(Cell::get).unwrap_or(false) {
-        let _ = counter.try_with(|c| c.set(c.get() + by));
-    }
-}
-
-// SAFETY: every method forwards to the system allocator unchanged; the counters are thread-local
-// cells that never allocate.
-unsafe impl GlobalAlloc for Counting {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        note(&ALLOCS, 1);
-        note(&BYTES, layout.size() as u64);
-        // SAFETY: the caller upholds `GlobalAlloc::alloc`'s contract.
-        unsafe { System.alloc(layout) }
-    }
-
-    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        note(&ALLOCS, 1);
-        note(&BYTES, layout.size() as u64);
-        // SAFETY: as `alloc`.
-        unsafe { System.alloc_zeroed(layout) }
-    }
-
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        // SAFETY: as `alloc`.
-        unsafe { System.dealloc(ptr, layout) }
-    }
-
-    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        note(&REALLOCS, 1);
-        // SAFETY: as `alloc`.
-        unsafe { System.realloc(ptr, layout, new_size) }
-    }
-}
-
 #[global_allocator]
 static GLOBAL: Counting = Counting;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Counts {
-    allocs: u64,
-    reallocs: u64,
-    bytes: u64,
-}
-
 fn measure<R>(f: impl FnOnce() -> R) -> (R, Counts) {
-    for c in [&ALLOCS, &REALLOCS, &BYTES] {
-        c.with(|c| c.set(0));
-    }
-    COUNTING.with(|c| c.set(true));
+    alloc::begin();
     let r = f();
-    COUNTING.with(|c| c.set(false));
-    let counts = Counts {
-        allocs: ALLOCS.with(Cell::get),
-        reallocs: REALLOCS.with(Cell::get),
-        bytes: BYTES.with(Cell::get),
-    };
-    (r, counts)
+    (r, alloc::end())
 }
 
 const CHAIN: &[u8] = include_bytes!("../test-ca/ecdsa-p256/end.fullchain");
@@ -89,6 +36,7 @@ fn server_config(versions: &[&'static hyper_tls::SupportedProtocolVersion]) -> S
         .collect();
     let key = PrivateKeyDer::from_pem_slice(KEY).unwrap();
     ServerConfig::builder_with_protocol_versions(versions)
+        .unwrap()
         .with_no_client_auth()
         .with_single_cert(chain, key)
         .unwrap()
@@ -100,6 +48,7 @@ fn client_config(versions: &[&'static hyper_tls::SupportedProtocolVersion]) -> C
         .add(CertificateDer::from_pem_slice(CA).unwrap())
         .unwrap();
     ClientConfig::builder_with_protocol_versions(versions)
+        .unwrap()
         .with_root_certificates(roots)
         .with_no_client_auth()
 }
@@ -149,6 +98,7 @@ fn report(name: &str, versions: &[&'static hyper_tls::SupportedProtocolVersion])
 
 #[test]
 fn allocations_per_handshake() {
+    assert!(alloc::installed());
     report("TLS 1.3", &[&hyper_tls::version::TLS13]);
     report("TLS 1.2", &[&hyper_tls::version::TLS12]);
 }

@@ -29,14 +29,12 @@ pub struct Tag {
 impl Tag {
     /// Build a tag by copying a byte slice.
     ///
-    /// The slice can be up to [`Tag::MAX_LEN`] bytes in length.
+    /// The tag holds up to [`Tag::MAX_LEN`] bytes, the longest HMAC of any supported hash
+    /// (SHA-512); it keeps that many of a longer slice (upstream panicked).
     pub fn new(bytes: &[u8]) -> Self {
-        let mut tag = Self {
-            buf: [0u8; Self::MAX_LEN],
-            used: bytes.len(),
-        };
-        tag.buf[..bytes.len()].copy_from_slice(bytes);
-        tag
+        let mut buf = [0u8; Self::MAX_LEN];
+        let used = super::tls13::copy_prefix(&mut buf, bytes);
+        Self { buf, used }
     }
 
     /// Maximum supported HMAC tag size: supports up to SHA512.
@@ -51,7 +49,7 @@ impl Drop for Tag {
 
 impl AsRef<[u8]> for Tag {
     fn as_ref(&self) -> &[u8] {
-        &self.buf[..self.used]
+        super::tls13::prefix(&self.buf, self.used)
     }
 }
 

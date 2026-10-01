@@ -64,25 +64,29 @@ impl<'a> Iterator for DeframerIter<'a> {
             }
         };
 
-        let end = HEADER_SIZE + len as usize;
+        // A five-byte header and a `uint16` body: far below usize::MAX.
+        let end = HEADER_SIZE.saturating_add(usize::from(len));
 
-        self.buf.get(HEADER_SIZE..end)?;
+        if self.buf.len() < end {
+            // More data is required.
+            return None;
+        }
 
         // we now have a TLS header and body on the front of `self.buf`.  remove
         // it from the front.
         let (consumed, remainder) = mem::take(&mut self.buf).split_at_mut(end);
+        let (_header, body) = consumed.split_at_mut(HEADER_SIZE);
         self.buf = remainder;
-        self.consumed += end;
+        // Bytes of one buffer: bounded by its length.
+        self.consumed = self.consumed.saturating_add(end);
 
-        Some(Ok(InboundOpaqueMessage::new(
-            typ,
-            version,
-            &mut consumed[HEADER_SIZE..],
-        )))
+        Some(Ok(InboundOpaqueMessage::new(typ, version, body)))
     }
 }
 
-pub fn fuzz_deframer(data: &[u8]) {
+/// Deframes `data` until the first error and reports whether the deframer stayed within it:
+/// its fuzz property. Upstream asserted the property; the harness checks the result.
+pub fn fuzz_deframer(data: &[u8]) -> bool {
     let mut buf = data.to_vec();
     let mut iter = DeframerIter::new(&mut buf);
 
@@ -92,7 +96,7 @@ pub fn fuzz_deframer(data: &[u8]) {
         }
     }
 
-    assert!(iter.bytes_consumed() <= buf.len());
+    iter.bytes_consumed() <= buf.len()
 }
 
 #[cfg(test)]

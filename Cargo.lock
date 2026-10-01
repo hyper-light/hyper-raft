@@ -724,6 +724,7 @@ dependencies = [
  "brotli-decompressor",
  "env_logger",
  "hex",
+ "hyper-measure",
  "log",
  "macro_rules_attribute",
  "num-bigint",

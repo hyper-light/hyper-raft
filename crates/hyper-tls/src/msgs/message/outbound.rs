@@ -19,7 +19,8 @@ pub struct OutboundPlainMessage<'a> {
 
 impl OutboundPlainMessage<'_> {
     pub(crate) fn encoded_len(&self, record_layer: &RecordLayer) -> usize {
-        HEADER_SIZE + record_layer.encrypted_len(self.payload.len())
+        // A required size: saturating can only over-state it, which refuses rather than overruns.
+        HEADER_SIZE.saturating_add(record_layer.encrypted_len(self.payload.len()))
     }
 
     pub(crate) fn to_unencrypted_opaque(&self) -> OutboundOpaqueMessage {
@@ -55,8 +56,8 @@ impl<'a> OutboundChunks<'a> {
     /// Create a payload from a slice of byte slices.
     /// If fragmented the cursors are added by default: start = 0, end = length
     pub fn new(chunks: &'a [&'a [u8]]) -> Self {
-        if chunks.len() == 1 {
-            Self::Single(chunks[0])
+        if let [single] = chunks {
+            Self::Single(single)
         } else {
             Self::Multiple {
                 chunks,
@@ -83,17 +84,21 @@ impl<'a> OutboundChunks<'a> {
         match *self {
             Self::Single(chunk) => vec.extend_from_slice(chunk),
             Self::Multiple { chunks, start, end } => {
-                let mut size = 0;
+                let mut size: usize = 0;
                 for chunk in chunks.iter() {
                     let psize = size;
                     let len = chunk.len();
-                    size += len;
+                    // Lengths of slices in memory: their sum stays below isize::MAX.
+                    size = size.saturating_add(len);
                     if size <= start || psize >= end {
                         continue;
                     }
                     let start = start.saturating_sub(psize);
-                    let end = if end - psize < len { end - psize } else { len };
-                    vec.extend_from_slice(&chunk[start..end]);
+                    // `psize < end` here.
+                    let end = Ord::min(end.saturating_sub(psize), len);
+                    if let Some(part) = chunk.get(start..end) {
+                        vec.extend_from_slice(part);
+                    }
                 }
             }
         }
@@ -104,11 +109,12 @@ impl<'a> OutboundChunks<'a> {
     pub fn split_at(&self, mid: usize) -> (Self, Self) {
         match *self {
             Self::Single(chunk) => {
-                let mid = Ord::min(mid, chunk.len());
-                (Self::Single(&chunk[..mid]), Self::Single(&chunk[mid..]))
+                let (head, tail) = chunk.split_at(Ord::min(mid, chunk.len()));
+                (Self::Single(head), Self::Single(tail))
             }
             Self::Multiple { chunks, start, end } => {
-                let mid = Ord::min(start + mid, end);
+                // Clamped to `end` either way.
+                let mid = Ord::min(start.saturating_add(mid), end);
                 (
                     Self::Multiple {
                         chunks,
@@ -134,7 +140,8 @@ impl<'a> OutboundChunks<'a> {
     pub fn len(&self) -> usize {
         match self {
             Self::Single(chunk) => chunk.len(),
-            Self::Multiple { start, end, .. } => end - start,
+            // `start <= end` by construction; an inverted range is empty.
+            Self::Multiple { start, end, .. } => end.saturating_sub(*start),
         }
     }
 }
@@ -186,12 +193,17 @@ impl OutboundOpaqueMessage {
         })
     }
 
+    /// The record on the wire: its header, then its payload. The length field takes the
+    /// payload length's low-order two bytes, as upstream's `as u16` did; the fragmenter bounds
+    /// every record's payload to 2^14 + 256 bytes (RFC 8446 §5.2), which the field holds.
     pub fn encode(self) -> Vec<u8> {
-        let length = self.payload.len() as u16;
+        let [.., l1, l0] = self.payload.len().to_be_bytes();
+        let [v0, v1] = self.version.to_array();
         let mut encoded_payload = self.payload.0;
-        encoded_payload[0] = self.typ.into();
-        encoded_payload[1..3].copy_from_slice(&self.version.to_array());
-        encoded_payload[3..5].copy_from_slice(&(length).to_be_bytes());
+        // `PrefixedPayload` always begins with its header's room.
+        if let Some(header) = encoded_payload.first_chunk_mut::<HEADER_SIZE>() {
+            *header = [self.typ.into(), v0, v1, l1, l0];
+        }
         encoded_payload
     }
 
@@ -213,7 +225,8 @@ pub struct PrefixedPayload(Vec<u8>);
 
 impl PrefixedPayload {
     pub fn with_capacity(capacity: usize) -> Self {
-        let mut prefixed_payload = Vec::with_capacity(HEADER_SIZE + capacity);
+        // A capacity hint: saturating only bounds an impossible request.
+        let mut prefixed_payload = Vec::with_capacity(HEADER_SIZE.saturating_add(capacity));
         prefixed_payload.resize(HEADER_SIZE, 0);
         Self(prefixed_payload)
     }
@@ -227,23 +240,26 @@ impl PrefixedPayload {
     }
 
     pub fn truncate(&mut self, len: usize) {
-        self.0.truncate(len + HEADER_SIZE)
+        // Truncating past the end is no change, as `Vec::truncate` defines it.
+        self.0.truncate(len.saturating_add(HEADER_SIZE))
     }
 
     fn len(&self) -> usize {
-        self.0.len() - HEADER_SIZE
+        self.as_ref().len()
     }
 }
 
+// Every constructor writes the header's room first, so the split is always at `HEADER_SIZE`.
 impl AsRef<[u8]> for PrefixedPayload {
     fn as_ref(&self) -> &[u8] {
-        &self.0[HEADER_SIZE..]
+        self.0.split_at(HEADER_SIZE.min(self.0.len())).1
     }
 }
 
 impl AsMut<[u8]> for PrefixedPayload {
     fn as_mut(&mut self) -> &mut [u8] {
-        &mut self.0[HEADER_SIZE..]
+        let header = HEADER_SIZE.min(self.0.len());
+        self.0.split_at_mut(header).1
     }
 }
 
@@ -255,7 +271,7 @@ impl<'a> Extend<&'a u8> for PrefixedPayload {
 
 impl From<&[u8]> for PrefixedPayload {
     fn from(content: &[u8]) -> Self {
-        let mut payload = Vec::with_capacity(HEADER_SIZE + content.len());
+        let mut payload = Vec::with_capacity(HEADER_SIZE.saturating_add(content.len()));
         payload.extend(&[0u8; HEADER_SIZE]);
         payload.extend(content);
         Self(payload)

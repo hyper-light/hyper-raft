@@ -11,31 +11,35 @@ use crate::version::TLS13;
 pub struct HkdfExpanderUsingHmac(Box<dyn hmac::Key>);
 
 impl HkdfExpanderUsingHmac {
-    fn expand_unchecked(&self, info: &[&[u8]], output: &mut [u8]) {
-        let mut term = hmac::Tag::new(b"");
-
-        for (n, chunk) in output.chunks_mut(self.0.tag_len()).enumerate() {
-            term = self.0.sign_concat(term.as_ref(), info, &[(n + 1) as u8]);
-            chunk.copy_from_slice(&term.as_ref()[..chunk.len()]);
+    /// RFC 5869 §2.3: `T(n) = HMAC(PRK, T(n-1) | info | n)` for the one-byte counter `n`, so the
+    /// output is at most 255 blocks; a longer one, or a zero-length tag, is refused.
+    fn expand_checked(&self, info: &[&[u8]], output: &mut [u8]) -> Result<(), OutputLengthError> {
+        let tag_len = self.0.tag_len();
+        let max = tag_len.checked_mul(255).ok_or(OutputLengthError)?;
+        if output.len() > max || (tag_len == 0 && !output.is_empty()) {
+            return Err(OutputLengthError);
         }
+
+        let mut term = hmac::Tag::new(b"");
+        for (counter, chunk) in (1u8..=255).zip(output.chunks_mut(tag_len.max(1))) {
+            term = self.0.sign_concat(term.as_ref(), info, &[counter]);
+            let block = term.as_ref().get(..chunk.len()).ok_or(OutputLengthError)?;
+            chunk.copy_from_slice(block);
+        }
+        Ok(())
     }
 }
 
 impl HkdfExpander for HkdfExpanderUsingHmac {
     fn expand_slice(&self, info: &[&[u8]], output: &mut [u8]) -> Result<(), OutputLengthError> {
-        if output.len() > 255 * self.0.tag_len() {
-            return Err(OutputLengthError);
-        }
-
-        self.expand_unchecked(info, output);
-        Ok(())
+        self.expand_checked(info, output)
     }
 
-    fn expand_block(&self, info: &[&[u8]]) -> OkmBlock {
+    fn expand_block(&self, info: &[&[u8]]) -> Result<OkmBlock, OutputLengthError> {
         let mut tag = [0u8; hmac::Tag::MAX_LEN];
-        let reduced_tag = &mut tag[..self.0.tag_len()];
-        self.expand_unchecked(info, reduced_tag);
-        OkmBlock::new(reduced_tag)
+        let reduced_tag = tag.get_mut(..self.0.tag_len()).ok_or(OutputLengthError)?;
+        self.expand_checked(info, reduced_tag)?;
+        Ok(OkmBlock::new(reduced_tag))
     }
 
     fn hash_len(&self) -> usize {
@@ -48,9 +52,8 @@ pub struct HkdfUsingHmac<'a>(pub &'a dyn hmac::Hmac);
 
 impl Hkdf for HkdfUsingHmac<'_> {
     fn extract_from_zero_ikm(&self, salt: Option<&[u8]>) -> Box<dyn HkdfExpander> {
-        let zeroes = [0u8; hmac::Tag::MAX_LEN];
         Box::new(HkdfExpanderUsingHmac(self.0.with_key(
-            &self.extract_prk_from_secret(salt, &zeroes[..self.0.hash_output_len()]),
+            &self.extract_prk_from_secret(salt, zero_hash_len(self.0.hash_output_len())),
         )))
     }
 
@@ -71,13 +74,20 @@ impl Hkdf for HkdfUsingHmac<'_> {
 
 impl HkdfPrkExtract for HkdfUsingHmac<'_> {
     fn extract_prk_from_secret(&self, salt: Option<&[u8]>, secret: &[u8]) -> Vec<u8> {
-        let zeroes = [0u8; hmac::Tag::MAX_LEN];
         let salt = match salt {
             Some(salt) => salt,
-            None => &zeroes[..self.0.hash_output_len()],
+            None => zero_hash_len(self.0.hash_output_len()),
         };
         self.0.with_key(salt).sign(&[secret]).as_ref().to_vec()
     }
+}
+
+/// `0_HashLen`, the string of `hash_len` zero bytes (RFC 8446 §7.1). A tag holds at most
+/// [`hmac::Tag::MAX_LEN`] bytes, so no HMAC this crate can carry has a longer `HashLen`; the
+/// string is that long at most.
+pub(crate) fn zero_hash_len(hash_len: usize) -> &'static [u8] {
+    static ZEROES: [u8; hmac::Tag::MAX_LEN] = [0u8; hmac::Tag::MAX_LEN];
+    ZEROES.split_at(hash_len.min(ZEROES.len())).0
 }
 
 /// Implementation of `HKDF-Expand` with an implicitly stored and immutable `PRK`.
@@ -102,9 +112,10 @@ pub trait HkdfExpander: Send + Sync {
     /// - `info` is a slice of byte slices, which should be processed sequentially
     ///   (or concatenated if that is not possible).
     ///
-    /// This is infallible, because by definition `OkmBlock` is always exactly
-    /// `HashLen` bytes long.
-    fn expand_block(&self, info: &[&[u8]]) -> OkmBlock;
+    /// `OkmBlock` is always exactly `HashLen` bytes long, which `HKDF-Expand` always produces;
+    /// an implementation whose `HashLen` exceeds [`OkmBlock::MAX_LEN`] refuses (upstream's
+    /// implementations panicked).
+    fn expand_block(&self, info: &[&[u8]]) -> Result<OkmBlock, OutputLengthError>;
 
     /// Return what `HashLen` is for this instance.
     ///
@@ -196,17 +207,17 @@ pub(crate) trait HkdfPrkExtract: Hkdf {
 /// - `info` is a slice of byte slices, which should be processed sequentially
 ///   (or concatenated if that is not possible).
 ///
-/// This is infallible, because the set of types (and therefore their length) is known
-/// at compile time.
-pub fn expand<T, const N: usize>(expander: &dyn HkdfExpander, info: &[&[u8]]) -> T
+/// Fails only if `N` exceeds `255 * HashLen` (upstream panicked).
+pub fn expand<T, const N: usize>(
+    expander: &dyn HkdfExpander,
+    info: &[&[u8]],
+) -> Result<T, OutputLengthError>
 where
     T: From<[u8; N]>,
 {
     let mut output = [0u8; N];
-    expander
-        .expand_slice(info, &mut output)
-        .expect("expand type parameter T is too large");
-    T::from(output)
+    expander.expand_slice(info, &mut output)?;
+    Ok(T::from(output))
 }
 
 /// Output key material from HKDF, as a value type.
@@ -219,14 +230,12 @@ pub struct OkmBlock {
 impl OkmBlock {
     /// Build a single OKM block by copying a byte slice.
     ///
-    /// The slice can be up to [`OkmBlock::MAX_LEN`] bytes in length.
+    /// The block holds up to [`OkmBlock::MAX_LEN`] bytes, the longest HKDF output of any
+    /// supported hash (SHA-512); it keeps that many of a longer slice (upstream panicked).
     pub fn new(bytes: &[u8]) -> Self {
-        let mut tag = Self {
-            buf: [0u8; Self::MAX_LEN],
-            used: bytes.len(),
-        };
-        tag.buf[..bytes.len()].copy_from_slice(bytes);
-        tag
+        let mut buf = [0u8; Self::MAX_LEN];
+        let used = copy_prefix(&mut buf, bytes);
+        Self { buf, used }
     }
 
     /// Maximum supported HMAC tag size: supports up to SHA512.
@@ -241,8 +250,22 @@ impl Drop for OkmBlock {
 
 impl AsRef<[u8]> for OkmBlock {
     fn as_ref(&self) -> &[u8] {
-        &self.buf[..self.used]
+        prefix(&self.buf, self.used)
     }
+}
+
+/// Copies as much of `src` as `dst` holds into its front, returning the count copied.
+pub(crate) fn copy_prefix(dst: &mut [u8], src: &[u8]) -> usize {
+    for (d, s) in dst.iter_mut().zip(src) {
+        *d = *s;
+    }
+    dst.len().min(src.len())
+}
+
+/// The first `used` bytes of `buf`; `used` comes from [`copy_prefix`] into `buf`, so it never
+/// exceeds the buffer.
+pub(crate) fn prefix(buf: &[u8], used: usize) -> &[u8] {
+    buf.split_at(used.min(buf.len())).0
 }
 
 /// An error type used for `HkdfExpander::expand_slice` when
@@ -280,7 +303,7 @@ mod tests {
         ];
 
         let output: ByteArray<42> =
-            expand(hkdf.extract_from_secret(Some(salt), ikm).as_ref(), info);
+            expand(hkdf.extract_from_secret(Some(salt), ikm).as_ref(), info).unwrap();
 
         assert_eq!(
             &output.0,
@@ -302,7 +325,8 @@ mod tests {
         let output: ByteArray<82> = expand(
             hkdf.extract_from_secret(Some(&salt), &ikm).as_ref(),
             &[&info],
-        );
+        )
+        .unwrap();
 
         assert_eq!(
             &output.0,
@@ -325,7 +349,7 @@ mod tests {
         let info = &[];
 
         let output: ByteArray<42> =
-            expand(hkdf.extract_from_secret(Some(salt), ikm).as_ref(), info);
+            expand(hkdf.extract_from_secret(Some(salt), ikm).as_ref(), info).unwrap();
 
         assert_eq!(
             &output.0,
@@ -349,7 +373,8 @@ mod tests {
         let ikm = &[0x0b; 40];
         let info = &[&b"hel"[..], &b"lo"[..]];
 
-        let output: ByteArray<96> = expand(hkdf.extract_from_secret(None, ikm).as_ref(), info);
+        let output: ByteArray<96> =
+            expand(hkdf.extract_from_secret(None, ikm).as_ref(), info).unwrap();
 
         assert_eq!(
             &output.0,

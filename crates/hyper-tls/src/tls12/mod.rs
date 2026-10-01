@@ -8,7 +8,9 @@ use zeroize::Zeroize;
 use crate::common_state::{CommonState, Side};
 use crate::conn::ConnectionRandoms;
 use crate::crypto;
-use crate::crypto::cipher::{AeadKey, MessageDecrypter, MessageEncrypter, Tls12AeadAlgorithm};
+use crate::crypto::cipher::{
+    AeadKey, KeyBlockShape, MessageDecrypter, MessageEncrypter, Tls12AeadAlgorithm,
+};
 use crate::crypto::hash;
 use crate::enums::{AlertDescription, SignatureScheme};
 use crate::error::{Error, InvalidMessage};
@@ -139,28 +141,29 @@ impl ConnectionSecrets {
         randoms: ConnectionRandoms,
         suite: &'static Tls12CipherSuite,
         master_secret: &[u8],
-    ) -> Self {
-        let mut ret = Self {
+    ) -> Result<Self, Error> {
+        Ok(Self {
             randoms,
             suite,
-            master_secret: [0u8; 48],
-        };
-        ret.master_secret.copy_from_slice(master_secret);
-        ret
+            master_secret: master_secret
+                .try_into()
+                .map_err(|_| Error::Internal("stored TLS 1.2 master secret is not 48 bytes"))?,
+        })
     }
 
     /// Make a `MessageCipherPair` based on the given supported ciphersuite `self.suite`,
     /// and the session's `secrets`.
-    pub(crate) fn make_cipher_pair(&self, side: Side) -> MessageCipherPair {
+    pub(crate) fn make_cipher_pair(&self, side: Side) -> Result<MessageCipherPair, Error> {
         // Make a key block, and chop it up.
         // Note: we don't implement any ciphersuites with nonzero mac_key_len.
-        let key_block = self.make_key_block();
-        let shape = self.suite.aead_alg.key_block_shape();
-
-        let (client_write_key, key_block) = key_block.split_at(shape.enc_key_len);
-        let (server_write_key, key_block) = key_block.split_at(shape.enc_key_len);
-        let (client_write_iv, key_block) = key_block.split_at(shape.fixed_iv_len);
-        let (server_write_iv, extra) = key_block.split_at(shape.fixed_iv_len);
+        let key_block = self.make_key_block()?;
+        let KeyBlock {
+            client_write_key,
+            server_write_key,
+            client_write_iv,
+            server_write_iv,
+            extra,
+        } = KeyBlock::split(&key_block, &self.suite.aead_alg.key_block_shape())?;
 
         let (write_key, write_iv, read_key, read_iv) = match side {
             Side::Client => (
@@ -177,20 +180,25 @@ impl ConnectionSecrets {
             ),
         };
 
-        (
+        Ok((
             self.suite
                 .aead_alg
-                .decrypter(AeadKey::new(read_key), read_iv),
+                .decrypter(AeadKey::new(read_key)?, read_iv),
             self.suite
                 .aead_alg
-                .encrypter(AeadKey::new(write_key), write_iv, extra),
-        )
+                .encrypter(AeadKey::new(write_key)?, write_iv, extra),
+        ))
     }
 
-    fn make_key_block(&self) -> Vec<u8> {
+    fn make_key_block(&self) -> Result<Vec<u8>, Error> {
         let shape = self.suite.aead_alg.key_block_shape();
 
-        let len = (shape.enc_key_len + shape.fixed_iv_len) * 2 + shape.explicit_nonce_len;
+        let len = shape
+            .enc_key_len
+            .checked_add(shape.fixed_iv_len)
+            .and_then(|pair| pair.checked_mul(2))
+            .and_then(|pairs| pairs.checked_add(shape.explicit_nonce_len))
+            .ok_or(Error::Internal("TLS 1.2 key block shape overflows"))?;
 
         let mut out = vec![0u8; len];
 
@@ -202,9 +210,9 @@ impl ConnectionSecrets {
             &self.master_secret,
             b"key expansion",
             &randoms,
-        );
+        )?;
 
-        out
+        Ok(out)
     }
 
     pub(crate) fn suite(&self) -> &'static Tls12CipherSuite {
@@ -215,7 +223,11 @@ impl ConnectionSecrets {
         &self.master_secret[..]
     }
 
-    fn make_verify_data(&self, handshake_hash: &hash::Output, label: &[u8]) -> Vec<u8> {
+    fn make_verify_data(
+        &self,
+        handshake_hash: &hash::Output,
+        label: &[u8],
+    ) -> Result<Vec<u8>, Error> {
         let mut out = vec![0u8; 12];
 
         self.suite.prf_provider.for_secret(
@@ -223,16 +235,22 @@ impl ConnectionSecrets {
             &self.master_secret,
             label,
             handshake_hash.as_ref(),
-        );
+        )?;
 
-        out
+        Ok(out)
     }
 
-    pub(crate) fn client_verify_data(&self, handshake_hash: &hash::Output) -> Vec<u8> {
+    pub(crate) fn client_verify_data(
+        &self,
+        handshake_hash: &hash::Output,
+    ) -> Result<Vec<u8>, Error> {
         self.make_verify_data(handshake_hash, b"client finished")
     }
 
-    pub(crate) fn server_verify_data(&self, handshake_hash: &hash::Output) -> Vec<u8> {
+    pub(crate) fn server_verify_data(
+        &self,
+        handshake_hash: &hash::Output,
+    ) -> Result<Vec<u8>, Error> {
         self.make_verify_data(handshake_hash, b"server finished")
     }
 
@@ -241,39 +259,45 @@ impl ConnectionSecrets {
         output: &mut [u8],
         label: &[u8],
         context: Option<&[u8]>,
-    ) {
+    ) -> Result<(), Error> {
         let mut randoms = Vec::new();
         randoms.extend_from_slice(&self.randoms.client);
         randoms.extend_from_slice(&self.randoms.server);
         if let Some(context) = context {
-            assert!(context.len() <= 0xffff);
-            (context.len() as u16).encode(&mut randoms);
+            // RFC 5705 §4: the context is prefixed by its uint16 length; a longer one cannot be
+            // expressed (upstream asserted).
+            u16::try_from(context.len())
+                .map_err(|_| {
+                    Error::General("export_keying_material context longer than 65535 bytes".into())
+                })?
+                .encode(&mut randoms);
             randoms.extend_from_slice(context);
         }
 
         self.suite
             .prf_provider
-            .for_secret(output, &self.master_secret, label, &randoms);
+            .for_secret(output, &self.master_secret, label, &randoms)
     }
 
     pub(crate) fn extract_secrets(&self, side: Side) -> Result<PartiallyExtractedSecrets, Error> {
         // Make a key block, and chop it up
-        let key_block = self.make_key_block();
-        let shape = self.suite.aead_alg.key_block_shape();
-
-        let (client_key, key_block) = key_block.split_at(shape.enc_key_len);
-        let (server_key, key_block) = key_block.split_at(shape.enc_key_len);
-        let (client_iv, key_block) = key_block.split_at(shape.fixed_iv_len);
-        let (server_iv, explicit_nonce) = key_block.split_at(shape.fixed_iv_len);
+        let key_block = self.make_key_block()?;
+        let KeyBlock {
+            client_write_key,
+            server_write_key,
+            client_write_iv,
+            server_write_iv,
+            extra: explicit_nonce,
+        } = KeyBlock::split(&key_block, &self.suite.aead_alg.key_block_shape())?;
 
         let client_secrets = self.suite.aead_alg.extract_keys(
-            AeadKey::new(client_key),
-            client_iv,
+            AeadKey::new(client_write_key)?,
+            client_write_iv,
             explicit_nonce,
         )?;
         let server_secrets = self.suite.aead_alg.extract_keys(
-            AeadKey::new(server_key),
-            server_iv,
+            AeadKey::new(server_write_key)?,
+            server_write_iv,
             explicit_nonce,
         )?;
 
@@ -282,6 +306,39 @@ impl ConnectionSecrets {
             Side::Server => (server_secrets, client_secrets),
         };
         Ok(PartiallyExtractedSecrets { tx, rx })
+    }
+}
+
+/// A TLS 1.2 key block cut by its shape (RFC 5246 §6.3), mac keys omitted: no suite here has one.
+struct KeyBlock<'a> {
+    client_write_key: &'a [u8],
+    server_write_key: &'a [u8],
+    client_write_iv: &'a [u8],
+    server_write_iv: &'a [u8],
+    extra: &'a [u8],
+}
+
+impl<'a> KeyBlock<'a> {
+    /// Cuts `key_block`, which `make_key_block` sized for `shape`.
+    fn split(key_block: &'a [u8], shape: &KeyBlockShape) -> Result<Self, Error> {
+        let short = Error::Internal("TLS 1.2 key block shorter than its shape");
+        let (client_write_key, rest) = key_block
+            .split_at_checked(shape.enc_key_len)
+            .ok_or_else(|| short.clone())?;
+        let (server_write_key, rest) = rest
+            .split_at_checked(shape.enc_key_len)
+            .ok_or_else(|| short.clone())?;
+        let (client_write_iv, rest) = rest
+            .split_at_checked(shape.fixed_iv_len)
+            .ok_or_else(|| short.clone())?;
+        let (server_write_iv, extra) = rest.split_at_checked(shape.fixed_iv_len).ok_or(short)?;
+        Ok(Self {
+            client_write_key,
+            server_write_key,
+            client_write_iv,
+            server_write_iv,
+            extra,
+        })
     }
 }
 
@@ -333,6 +390,7 @@ pub(crate) fn decode_kx_params<'a, T: KxDecode<'a>>(
     }
 }
 
+/// The TLS 1.2 downgrade sentinel, "DOWNGRD\x01" (RFC 8446 §4.1.3).
 pub(crate) const DOWNGRADE_SENTINEL: [u8; 8] = [0x44, 0x4f, 0x57, 0x4e, 0x47, 0x52, 0x44, 0x01];
 
 #[cfg(test)]

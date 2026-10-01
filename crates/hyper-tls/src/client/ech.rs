@@ -14,7 +14,7 @@ use crate::hash_hs::{HandshakeHash, HandshakeHashBuffer};
 use crate::log::{debug, trace, warn};
 use crate::msgs::base::{Payload, PayloadU16};
 use crate::msgs::codec::{Codec, Reader};
-use crate::msgs::enums::{ExtensionType, HpkeKem};
+use crate::msgs::enums::{ExtensionType, HpkeAead, HpkeKem};
 use crate::msgs::handshake::{
     ClientExtensions, ClientHelloPayload, EchConfigContents, EchConfigPayload, Encoding,
     EncryptedClientHello, EncryptedClientHelloOuter, HandshakeMessagePayload, HandshakePayload,
@@ -29,8 +29,8 @@ use crate::tls13::key_schedule::{
 };
 use crate::CipherSuite::TLS_EMPTY_RENEGOTIATION_INFO_SCSV;
 use crate::{
-    AlertDescription, CommonState, EncryptedClientHelloError, Error, PeerIncompatible,
-    PeerMisbehaved, ProtocolVersion, Tls13CipherSuite,
+    AlertDescription, CommonState, EncryptedClientHelloError, Error, InvalidMessage,
+    PeerIncompatible, PeerMisbehaved, ProtocolVersion, Tls13CipherSuite,
 };
 
 /// Controls how Encrypted Client Hello (ECH) is used in a client handshake.
@@ -106,19 +106,15 @@ impl EchConfig {
                 Error::InvalidEncryptedClientHello(EncryptedClientHelloError::InvalidConfigList)
             })?;
 
-        // Note: we name the index var _i because if the log feature is disabled
+        // Note: we name the ordinal var _n because if the log feature is disabled
         //       it is unused.
-        for (_i, config) in ech_configs.iter().enumerate() {
+        for (_n, config) in (1usize..).zip(ech_configs.iter()) {
             let contents = match config {
                 EchConfigPayload::V18(contents) => contents,
                 EchConfigPayload::Unknown {
                     version: _version, ..
                 } => {
-                    warn!(
-                        "ECH config {} has unsupported version {:?}",
-                        _i + 1,
-                        _version
-                    );
+                    warn!("ECH config {} has unsupported version {:?}", _n, _version);
                     continue; // Unsupported version.
                 }
             };
@@ -234,7 +230,8 @@ impl EchGreaseConfig {
                         symmetric_cipher_suites: vec![suite.sym],
                     },
                     maximum_name_length: 0,
-                    public_name: DnsName::try_from("filler").unwrap(),
+                    public_name: DnsName::try_from("filler")
+                        .map_err(|_| Error::Internal("GREASE ECH public name"))?,
                     extensions: Vec::default(),
                 }),
                 suite: self.suite,
@@ -247,17 +244,12 @@ impl EchGreaseConfig {
 
         // Construct an inner hello using the outer hello - this allows us to know the size of
         // dummy payload we should use for the GREASE extension.
-        let encoded_inner_hello = grease_state.encode_inner_hello(outer_hello, None, &None);
+        let encoded_inner_hello = grease_state.encode_inner_hello(outer_hello, None, &None)?;
 
         // Generate a payload of random data equivalent in length to a real inner hello.
-        let payload_len = encoded_inner_hello.len()
-            + suite
-                .sym
-                .aead_id
-                .tag_len()
-                // Safety: we have confirmed the AEAD is supported when building the config. All
-                //  supported AEADs have a tag length.
-                .unwrap();
+        // We have confirmed the AEAD is supported when building the config. All supported AEADs
+        // have a tag length.
+        let payload_len = sealed_len(&encoded_inner_hello, suite.sym.aead_id)?;
         let mut payload = vec![0; payload_len];
         secure_random.fill(&mut payload)?;
 
@@ -333,7 +325,7 @@ impl EchState {
         let EchConfigPayload::V18(config_contents) = &config.config else {
             // the public EchConfig::new() constructor ensures we only have supported
             // configurations.
-            unreachable!("ECH config version mismatch");
+            return Err(Error::Internal("ECH config version mismatch"));
         };
         let key_config = &config_contents.key_config;
 
@@ -387,19 +379,14 @@ impl EchState {
         );
 
         // Construct the encoded inner hello and update the transcript.
-        let encoded_inner_hello = self.encode_inner_hello(&outer_hello, retry_req, resuming);
+        let encoded_inner_hello = self.encode_inner_hello(&outer_hello, retry_req, resuming)?;
 
         // Complete the ClientHelloOuterAAD with an ech extension, the payload should be a placeholder
         // of size L, all zeroes. L == length of encrypting encoded client hello inner w/ the selected
         // HPKE AEAD. (sum of plaintext + tag length, typically).
-        let payload_len = encoded_inner_hello.len()
-            + self
-                .cipher_suite
-                .aead_id
-                .tag_len()
-                // Safety: we've already verified this AEAD is supported when loading the config
-                // that was used to create the ECH context. All supported AEADs have a tag length.
-                .unwrap();
+        // We've already verified this AEAD is supported when loading the config that was used to
+        // create the ECH context. All supported AEADs have a tag length.
+        let payload_len = sealed_len(&encoded_inner_hello, self.cipher_suite.aead_id)?;
 
         // Outer hello's created in response to a hello retry request omit the enc value.
         let enc = match retry_req.is_some() {
@@ -457,20 +444,22 @@ impl EchState {
 
         // Add the server hello confirmation - this is computed by altering the received
         // encoding rather than reencoding it.
-        confirmation_transcript
-            .add_message(&Self::server_hello_conf(server_hello, server_hello_encoded));
+        confirmation_transcript.add_message(&Self::server_hello_conf(
+            server_hello,
+            server_hello_encoded,
+        )?);
 
         // Derive a confirmation secret from the inner hello random and the confirmation transcript.
         let derived = ks.server_ech_confirmation_secret(
             self.inner_hello_random.0.as_ref(),
             confirmation_transcript.current_hash(),
-        );
+        )?;
 
         // Check that first 8 digits of the derived secret match the last 8 digits of the original
         // server random. This match signals that the server accepted the ECH offer.
-        // Indexing safety: Random is [0; 32] by construction.
+        let (_, random_tail) = server_hello.random.0.split_at(24);
 
-        match ConstantTimeEq::ct_eq(derived.as_ref(), server_hello.random.0[24..].as_ref()).into() {
+        match ConstantTimeEq::ct_eq(derived.as_ref(), random_tail).into() {
             true => {
                 trace!("ECH accepted by server");
                 Ok(Some(EchAccepted {
@@ -527,7 +516,7 @@ impl EchState {
             cs.hkdf_provider,
             &self.inner_hello_random.0,
             confirmation_transcript.current_hash(),
-        );
+        )?;
 
         match ConstantTimeEq::ct_eq(derived.as_ref(), ech_conf.bytes()).into() {
             true => {
@@ -561,7 +550,66 @@ impl EchState {
         outer_hello: &ClientHelloPayload,
         retryreq: Option<&HelloRetryRequest>,
         resuming: &Option<Retrieved<&persist::Tls13ClientSessionValue>>,
-    ) -> Vec<u8> {
+    ) -> Result<Vec<u8>, Error> {
+        let (mut inner_hello, compressed_exts) = self.inner_hello_from(outer_hello);
+
+        // If we're resuming, we need to update the PSK binder in the inner hello.
+        if let Some(resuming) = resuming.as_ref() {
+            let mut chp = HandshakeMessagePayload(HandshakePayload::ClientHello(inner_hello));
+
+            // Retain the early key schedule we get from processing the binder.
+            self.early_data_key_schedule = Some(tls13::fill_in_psk_binder(
+                resuming,
+                &self.inner_hello_transcript,
+                &mut chp,
+            )?);
+
+            // fill_in_psk_binder works on an owned HandshakeMessagePayload, so we need to
+            // extract our inner hello back out of it to retain ownership.
+            inner_hello = match chp.0 {
+                HandshakePayload::ClientHello(chp) => chp,
+                _ => return Err(Error::Internal("inner hello is not a ClientHello")),
+            };
+        }
+
+        trace!("ECH Inner Hello: {inner_hello:#?}");
+
+        // Encode the inner hello according to the rules required for ECH. This differs
+        // from the standard encoding in several ways. Notably this is where we will
+        // replace the block of contiguous to-be-compressed extensions with a marker.
+        let mut encoded_hello = inner_hello.ech_inner_encoding(compressed_exts);
+        self.pad_inner_hello(&mut encoded_hello, &inner_hello)?;
+
+        // Construct the inner hello message that will be used for the transcript.
+        let inner_hello_msg = Message {
+            version: match retryreq {
+                // <https://datatracker.ietf.org/doc/html/rfc8446#section-5.1>:
+                // "This value MUST be set to 0x0303 for all records generated
+                //  by a TLS 1.3 implementation ..."
+                Some(_) => ProtocolVersion::TLSv1_2,
+                // "... other than an initial ClientHello (i.e., one not
+                // generated after a HelloRetryRequest), where it MAY also be
+                // 0x0301 for compatibility purposes"
+                //
+                // (retryreq == None means we're in the "initial ClientHello" case)
+                None => ProtocolVersion::TLSv1_0,
+            },
+            payload: MessagePayload::handshake(HandshakeMessagePayload(
+                HandshakePayload::ClientHello(inner_hello),
+            )),
+        };
+
+        // Update the inner transcript buffer with the inner hello message.
+        self.inner_hello_transcript.add_message(&inner_hello_msg);
+
+        Ok(encoded_hello)
+    }
+
+    /// The inner hello built on the outer one as a template, and the extensions it compresses.
+    fn inner_hello_from(
+        &mut self,
+        outer_hello: &ClientHelloPayload,
+    ) -> (ClientHelloPayload, Vec<ExtensionType>) {
         // Start building an inner hello using the outer_hello as a template.
         let mut inner_hello = ClientHelloPayload {
             // Some information is copied over as-is.
@@ -609,34 +657,29 @@ impl EchState {
         let outer_extensions = outer_hello.used_extensions_in_encoding_order();
         let mut compressed_exts = Vec::with_capacity(outer_extensions.len());
         for ext in outer_extensions {
-            // Some outer hello extensions are only useful in the context where a TLS 1.3
-            // connection allows TLS 1.2. This isn't the case for ECH so we skip adding them
-            // to the inner hello.
-            if matches!(
-                ext,
+            match ext {
+                // Some outer hello extensions are only useful in the context where a TLS 1.3
+                // connection allows TLS 1.2. This isn't the case for ECH so we skip adding them
+                // to the inner hello.
                 ExtensionType::ExtendedMasterSecret
-                    | ExtensionType::SessionTicket
-                    | ExtensionType::ECPointFormats
-            ) {
-                continue;
-            }
-
-            if ext == ExtensionType::ServerName {
-                // We may want to replace the outer hello SNI with our own inner hello specific SNI.
-                if let Some(sni_value) = inner_sni {
-                    inner_hello.server_name = Some(ServerNamePayload::from(sni_value));
+                | ExtensionType::SessionTicket
+                | ExtensionType::ECPointFormats => {}
+                // We may want to replace the outer hello SNI with our own inner hello specific
+                // SNI. We don't want to add, or compress, the SNI from the outer hello.
+                ExtensionType::ServerName => {
+                    if let Some(sni_value) = inner_sni {
+                        inner_hello.server_name = Some(ServerNamePayload::from(sni_value));
+                    }
                 }
-                // We don't want to add, or compress, the SNI from the outer hello.
-                continue;
+                // Compressed extensions need to be put aside to include in one contiguous block.
+                // Uncompressed extensions get added directly to the inner hello.
+                _ => {
+                    if ext.ech_compress() {
+                        compressed_exts.push(ext);
+                    }
+                    inner_hello.clone_one(outer_hello, ext);
+                }
             }
-
-            // Compressed extensions need to be put aside to include in one contiguous block.
-            // Uncompressed extensions get added directly to the inner hello.
-            if ext.ech_compress() {
-                compressed_exts.push(ext);
-            }
-
-            inner_hello.clone_one(outer_hello, ext);
         }
 
         // We've added all the uncompressed extensions. Now we need to add the contiguous
@@ -648,34 +691,15 @@ impl EchState {
         // always have the ECH cover name in SNI).
         self.sent_extensions = inner_hello.collect_used();
 
-        // If we're resuming, we need to update the PSK binder in the inner hello.
-        if let Some(resuming) = resuming.as_ref() {
-            let mut chp = HandshakeMessagePayload(HandshakePayload::ClientHello(inner_hello));
+        (inner_hello, compressed_exts)
+    }
 
-            // Retain the early key schedule we get from processing the binder.
-            self.early_data_key_schedule = Some(tls13::fill_in_psk_binder(
-                resuming,
-                &self.inner_hello_transcript,
-                &mut chp,
-            ));
-
-            // fill_in_psk_binder works on an owned HandshakeMessagePayload, so we need to
-            // extract our inner hello back out of it to retain ownership.
-            inner_hello = match chp.0 {
-                HandshakePayload::ClientHello(chp) => chp,
-                // Safety: we construct the HMP above and know its type unconditionally.
-                _ => unreachable!(),
-            };
-        }
-
-        trace!("ECH Inner Hello: {inner_hello:#?}");
-
-        // Encode the inner hello according to the rules required for ECH. This differs
-        // from the standard encoding in several ways. Notably this is where we will
-        // replace the block of contiguous to-be-compressed extensions with a marker.
-        let mut encoded_hello = inner_hello.ech_inner_encoding(compressed_exts);
-
-        // Calculate padding
+    /// Pads the encoded inner hello as draft-ietf-tls-esni-18 §6.1.3 recommends.
+    fn pad_inner_hello(
+        &self,
+        encoded_hello: &mut Vec<u8>,
+        inner_hello: &ClientHelloPayload,
+    ) -> Result<(), Error> {
         // max_name_len = L
         let max_name_len = usize::from(self.maximum_name_length);
         let max_name_len = if max_name_len > 0 { max_name_len } else { 255 };
@@ -688,38 +712,19 @@ impl EchState {
             }
             // L + 9
             // "This is the length of a "server_name" extension with an L-byte name."
-            _ => max_name_len + 9,
+            _ => max_name_len
+                .checked_add(9)
+                .ok_or(Error::Internal("ECH name padding overflows"))?,
         };
-        encoded_hello.extend(iter::repeat(0).take(name_padding_len));
+        encoded_hello.extend(iter::repeat_n(0, name_padding_len));
 
         // Let L be the length of the EncodedClientHelloInner with all the padding computed so far
-        // Let N = 31 - ((L - 1) % 32) and add N bytes of padding.
-        let padding_len = 31 - ((encoded_hello.len() - 1) % 32);
-        encoded_hello.extend(iter::repeat(0).take(padding_len));
-
-        // Construct the inner hello message that will be used for the transcript.
-        let inner_hello_msg = Message {
-            version: match retryreq {
-                // <https://datatracker.ietf.org/doc/html/rfc8446#section-5.1>:
-                // "This value MUST be set to 0x0303 for all records generated
-                //  by a TLS 1.3 implementation ..."
-                Some(_) => ProtocolVersion::TLSv1_2,
-                // "... other than an initial ClientHello (i.e., one not
-                // generated after a HelloRetryRequest), where it MAY also be
-                // 0x0301 for compatibility purposes"
-                //
-                // (retryreq == None means we're in the "initial ClientHello" case)
-                None => ProtocolVersion::TLSv1_0,
-            },
-            payload: MessagePayload::handshake(HandshakeMessagePayload(
-                HandshakePayload::ClientHello(inner_hello),
-            )),
-        };
-
-        // Update the inner transcript buffer with the inner hello message.
-        self.inner_hello_transcript.add_message(&inner_hello_msg);
-
-        encoded_hello
+        // Let N = 31 - ((L - 1) % 32) and add N bytes of padding. For L >= 1 that is the distance
+        // from L up to the next multiple of 32, -L mod 32; 2^64 is a multiple of 32, so the
+        // wrapping negation computes it exactly.
+        let padding_len = encoded_hello.len().wrapping_neg() % 32;
+        encoded_hello.extend(iter::repeat_n(0, padding_len));
+        Ok(())
     }
 
     // See https://datatracker.ietf.org/doc/html/draft-ietf-tls-esni-18#name-grease-psk
@@ -754,7 +759,7 @@ impl EchState {
     fn server_hello_conf(
         server_hello: &ServerHelloPayload,
         server_hello_encoded: &Payload<'_>,
-    ) -> Message<'static> {
+    ) -> Result<Message<'static>, Error> {
         // The confirmation is computed over the server hello, which has had
         // its `random` field altered to zero the final 8 bytes.
         //
@@ -763,9 +768,13 @@ impl EchState {
         // we operate here on the received encoding, as the confirmation needs
         // to be computed on that.
         let mut encoded = server_hello_encoded.clone().into_vec();
-        encoded[SERVER_HELLO_ECH_CONFIRMATION_SPAN].fill(0x00);
+        // A parsed ServerHello holds its whole random, so the span is present.
+        encoded
+            .get_mut(SERVER_HELLO_ECH_CONFIRMATION_SPAN)
+            .ok_or(Error::InvalidMessage(InvalidMessage::MessageTooShort))?
+            .fill(0x00);
 
-        Message {
+        Ok(Message {
             version: ProtocolVersion::TLSv1_3,
             payload: MessagePayload::Handshake {
                 encoded: Payload::Owned(encoded),
@@ -773,7 +782,7 @@ impl EchState {
                     server_hello.clone(),
                 )),
             },
-        }
+        })
     }
 
     fn hello_retry_request_conf(retry_req: &HelloRetryRequest) -> Message<'_> {
@@ -804,6 +813,13 @@ impl EchState {
 /// - the balance of the random field (24 bytes).
 const SERVER_HELLO_ECH_CONFIRMATION_SPAN: core::ops::Range<usize> =
     (1 + 3 + 2 + 24)..(1 + 3 + 2 + 32);
+
+/// The length of `plaintext` sealed under `aead`: its length and the AEAD's tag.
+fn sealed_len(plaintext: &[u8], aead: HpkeAead) -> Result<usize, Error> {
+    aead.tag_len()
+        .and_then(|tag_len| plaintext.len().checked_add(tag_len))
+        .ok_or(Error::Internal("ECH AEAD without a tag length"))
+}
 
 /// Returned from EchState::check_acceptance when the server has accepted the ECH offer.
 ///
@@ -861,7 +877,8 @@ mod tests {
             unreachable!("ServerHello is a handshake message");
         };
 
-        let message = EchState::server_hello_conf(&server_hello, server_hello_encoded_before);
+        let message =
+            EchState::server_hello_conf(&server_hello, server_hello_encoded_before).unwrap();
 
         let Message {
             payload:
@@ -891,7 +908,7 @@ mod tests {
     fn inner_client_hello_length_conceals_inner_name_length() {
         let base_inner_len = inner_hello_encoding_for_name(dns_name_of_len(1), true).len();
         assert!(
-            base_inner_len % 32 == 0,
+            base_inner_len.is_multiple_of(32),
             "inner hello length must be 32-byte padded"
         );
         assert!(
@@ -912,7 +929,7 @@ mod tests {
     fn inner_client_hello_length_does_not_leak_length_of_omitted_inner_name() {
         let base_inner_len = inner_hello_encoding_for_name(dns_name_of_len(1), false).len();
         assert!(
-            base_inner_len % 32 == 0,
+            base_inner_len.is_multiple_of(32),
             "inner hello length must be 32-byte padded"
         );
         assert!(
@@ -968,6 +985,7 @@ mod tests {
             None,
             &None,
         )
+        .unwrap()
     }
 
     fn dns_name_of_len(mut len: usize) -> DnsName<'static> {

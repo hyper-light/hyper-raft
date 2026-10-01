@@ -140,13 +140,13 @@ mod server_hello {
                     }
 
                     let secrets =
-                        ConnectionSecrets::new_resume(self.randoms, suite, resuming.secret());
+                        ConnectionSecrets::new_resume(self.randoms, suite, resuming.secret())?;
                     cx.stores.key_log.log(
                         "CLIENT_RANDOM",
                         &secrets.randoms.client,
                         &secrets.master_secret,
                     );
-                    cx.common.start_encryption_tls12(&secrets, Side::Client);
+                    cx.common.start_encryption_tls12(&secrets, Side::Client)?;
 
                     // Since we're resuming, we verified the certificate and
                     // proof of possession in the prior session.
@@ -568,9 +568,9 @@ fn emit_finished(
     secrets: &ConnectionSecrets,
     transcript: &mut HandshakeHash,
     common: &mut CommonState,
-) {
+) -> Result<(), Error> {
     let vh = transcript.current_hash();
-    let verify_data = secrets.client_verify_data(&vh);
+    let verify_data = secrets.client_verify_data(&vh)?;
     let verify_data_payload = Payload::new(verify_data);
 
     let f = Message {
@@ -582,6 +582,7 @@ fn emit_finished(
 
     transcript.add_message(&f);
     common.send_msg(f, true);
+    Ok(())
 }
 
 struct ServerKxDetails {
@@ -724,6 +725,7 @@ impl State<ClientConnectionData> for ExpectCertificateRequest<'_> {
             .filter(|scheme| scheme.algorithm().is_some())
             .collect::<Vec<_>>();
 
+        /// TLS 1.2 exporters (RFC 5705) take no context here.
         const NO_CONTEXT: Option<Vec<u8>> = None; // TLS 1.2 doesn't use a context.
         let no_compression = None; // or compression
         let client_auth = ClientAuthRequest::new(
@@ -961,11 +963,11 @@ impl State<ClientConnectionData> for ExpectServerDone<'_> {
             &secrets.randoms.client,
             &secrets.master_secret,
         );
-        cx.common.start_encryption_tls12(&secrets, Side::Client);
+        cx.common.start_encryption_tls12(&secrets, Side::Client)?;
         cx.common.record_layer.start_encrypting();
 
         // 5.
-        emit_finished(&secrets, &mut transcript, cx.common);
+        emit_finished(&secrets, &mut transcript, cx.common)?;
 
         if st.must_issue_new_ticket {
             Ok(Box::new(ExpectNewTicket {
@@ -1194,7 +1196,7 @@ impl State<ClientConnectionData> for ExpectFinished {
 
         // Work out what verify_data we expect.
         let vh = st.transcript.current_hash();
-        let expect_verify_data = st.secrets.server_verify_data(&vh);
+        let expect_verify_data = st.secrets.server_verify_data(&vh)?;
 
         // Constant-time verification of this is relatively unimportant: they only
         // get one chance.  But it can't hurt.
@@ -1216,7 +1218,7 @@ impl State<ClientConnectionData> for ExpectFinished {
         if st.resuming {
             emit_ccs(cx.common);
             cx.common.record_layer.start_encrypting();
-            emit_finished(&st.secrets, &mut st.transcript, cx.common);
+            emit_finished(&st.secrets, &mut st.transcript, cx.common)?;
         }
 
         cx.common.start_traffic(&mut cx.sendable_plaintext);
@@ -1280,8 +1282,7 @@ impl State<ClientConnectionData> for ExpectTraffic {
         label: &[u8],
         context: Option<&[u8]>,
     ) -> Result<(), Error> {
-        self.secrets.export_keying_material(output, label, context);
-        Ok(())
+        self.secrets.export_keying_material(output, label, context)
     }
 
     fn extract_secrets(&self) -> Result<PartiallyExtractedSecrets, Error> {

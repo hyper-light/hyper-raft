@@ -3,7 +3,13 @@ use core::mem;
 use core::ops::Range;
 use std::io;
 
+use crate::error::Error;
 use crate::msgs::message::MAX_WIRE_SIZE;
+
+/// The refusal for a range or slice that is not where the deframer put it: every range comes
+/// from `locate` over the same buffer, so this is a defect, not peer input (upstream unwrapped
+/// or asserted).
+const MISPLACED: Error = Error::Internal("deframer range outside its buffer");
 
 /// Conversion from a slice within a larger buffer into
 /// a `Range` offset within.
@@ -21,15 +27,15 @@ impl Locator {
     }
 
     #[inline]
-    pub(crate) fn locate(&self, slice: &[u8]) -> Range<usize> {
-        let bounds = slice.as_ptr_range();
-        debug_assert!(self.fully_contains(slice));
-        let start = bounds.start as usize - self.bounds.start as usize;
-        let len = bounds.end as usize - bounds.start as usize;
-        Range {
-            start,
-            end: start + len,
+    pub(crate) fn locate(&self, slice: &[u8]) -> Result<Range<usize>, Error> {
+        if !self.fully_contains(slice) {
+            return Err(MISPLACED);
         }
+        let start = (slice.as_ptr() as usize)
+            .checked_sub(self.bounds.start as usize)
+            .ok_or(MISPLACED)?;
+        let end = start.checked_add(slice.len()).ok_or(MISPLACED)?;
+        Ok(Range { start, end })
     }
 
     #[inline]
@@ -51,10 +57,9 @@ impl<'b> Delocator<'b> {
     }
 
     #[inline]
-    pub(crate) fn slice_from_range(&'_ self, range: &Range<usize>) -> &'b [u8] {
-        // safety: this unwrap is safe so long as `range` came from `locate()`
-        // for the same buffer
-        self.slice.get(range.clone()).unwrap()
+    pub(crate) fn slice_from_range(&'_ self, range: &Range<usize>) -> Result<&'b [u8], Error> {
+        // `range` came from `locate()` for the same buffer.
+        self.slice.get(range.clone()).ok_or(MISPLACED)
     }
 
     #[inline]
@@ -75,11 +80,21 @@ impl<'b> Coalescer<'b> {
     }
 
     #[inline]
-    pub(crate) fn copy_within(&mut self, from: Range<usize>, to: Range<usize>) {
-        debug_assert!(from.len() == to.len());
-        debug_assert!(self.slice.get(from.clone()).is_some());
-        debug_assert!(self.slice.get(to.clone()).is_some());
+    pub(crate) fn copy_within(
+        &mut self,
+        from: Range<usize>,
+        to: Range<usize>,
+    ) -> Result<(), Error> {
+        // `copy_within` panics unless both ranges lie in the slice; they are spans this
+        // deframer located, but upstream only asserted that in debug builds.
+        if from.len() != to.len()
+            || self.slice.get(from.clone()).is_none()
+            || self.slice.get(to.clone()).is_none()
+        {
+            return Err(MISPLACED);
+        }
         self.slice.copy_within(from, to.start);
+        Ok(())
     }
 
     #[inline]
@@ -120,12 +135,14 @@ impl BufferProgress {
 
     #[inline]
     pub(crate) fn add_discard(&mut self, discard: usize) {
-        self.discard += discard;
+        // A prefix length of one buffer: bounded by its length, so this never saturates.
+        self.discard = self.discard.saturating_add(discard);
     }
 
     #[inline]
     pub(crate) fn add_processed(&mut self, processed: usize) {
-        self.processed += processed;
+        // As `add_discard`.
+        self.processed = self.processed.saturating_add(processed);
     }
 
     #[inline]
@@ -172,19 +189,25 @@ impl DeframerVecBuffer {
              * 0          ^ self.used
              */
 
-            self.buf.copy_within(taken..self.used, 0);
-            self.used -= taken;
+            if let Some(pending) = self.buf.get(taken..self.used) {
+                let pending = pending.len();
+                self.buf.copy_within(taken..self.used, 0);
+                self.used = pending;
+            }
         } else if taken >= self.used {
             self.used = 0;
         }
     }
 
     pub(crate) fn filled_mut(&mut self) -> &mut [u8] {
-        &mut self.buf[..self.used]
+        // `used` never exceeds the buffer: `read` and `extend` grow it within.
+        let used = self.used.min(self.buf.len());
+        self.buf.split_at_mut(used).0
     }
 
     pub(crate) fn filled(&self) -> &[u8] {
-        &self.buf[..self.used]
+        let used = self.used.min(self.buf.len());
+        self.buf.split_at(used).0
     }
 }
 
@@ -199,8 +222,18 @@ impl DeframerVecBuffer {
         // we get a message with a length field out of range here,
         // we do a zero length read.  That looks like an EOF to
         // the next layer up, which is fine.
-        let new_bytes = rd.read(&mut self.buf[self.used..])?;
-        self.used += new_bytes;
+        let room = self
+            .buf
+            .get_mut(self.used..)
+            .ok_or_else(|| io::Error::other("deframer buffer cursor past its end"))?;
+        let new_bytes = rd.read(room)?;
+        self.used = self
+            .used
+            .checked_add(new_bytes)
+            .filter(|used| *used <= self.buf.len())
+            .ok_or_else(|| {
+                io::Error::other("reader reported more bytes than it was given room for")
+            })?;
         Ok(new_bytes)
     }
 
@@ -211,6 +244,7 @@ impl DeframerVecBuffer {
         /// service.
         const MAX_HANDSHAKE_SIZE: u32 = 0xffff;
 
+        /// The read size: one page on the common platforms, upstream's choice.
         const READ_SIZE: usize = 4096;
 
         // We allow a maximum of 64k of buffered data for handshake messages only. Enforce this
@@ -234,7 +268,8 @@ impl DeframerVecBuffer {
         // make sure to reduce the buffer size again (large messages should be rare).
         // Also, reduce the buffer size if there are neither full nor partial messages in it,
         // which usually means that the other side suspended sending data.
-        let need_capacity = Ord::min(allow_max, self.used + READ_SIZE);
+        // `used` is below `allow_max` here, so the sum does not saturate.
+        let need_capacity = Ord::min(allow_max, self.used.saturating_add(READ_SIZE));
         if need_capacity > self.buf.len() {
             self.buf.resize(need_capacity, 0);
         } else if self.used == 0 || self.buf.len() > allow_max {
@@ -248,16 +283,18 @@ impl DeframerVecBuffer {
     /// Append `bytes` to the end of this buffer.
     ///
     /// Return a `Range` saying where it went.
-    pub(crate) fn extend(&mut self, bytes: &[u8]) -> Range<usize> {
-        let len = bytes.len();
+    pub(crate) fn extend(&mut self, bytes: &[u8]) -> Result<Range<usize>, Error> {
         let start = self.used;
-        let end = start + len;
+        let end = start.checked_add(bytes.len()).ok_or(MISPLACED)?;
         if self.buf.len() < end {
             self.buf.resize(end, 0);
         }
-        self.buf[start..end].copy_from_slice(bytes);
-        self.used += len;
-        Range { start, end }
+        self.buf
+            .get_mut(start..end)
+            .ok_or(MISPLACED)?
+            .copy_from_slice(bytes);
+        self.used = end;
+        Ok(Range { start, end })
     }
 }
 
@@ -277,7 +314,8 @@ impl<'a> DeframerSliceBuffer<'a> {
 
     /// Tracks a pending discard operation of `num_bytes`
     pub(crate) fn queue_discard(&mut self, num_bytes: usize) {
-        self.discard += num_bytes;
+        // A prefix length of `buf`: bounded by its length, so this never saturates.
+        self.discard = self.discard.saturating_add(num_bytes);
     }
 
     pub(crate) fn pending_discard(&self) -> usize {
@@ -285,6 +323,8 @@ impl<'a> DeframerSliceBuffer<'a> {
     }
 
     pub(crate) fn filled_mut(&mut self) -> &mut [u8] {
-        &mut self.buf[self.discard..]
+        // A discard past the end leaves nothing to deframe.
+        let discard = self.discard.min(self.buf.len());
+        self.buf.split_at_mut(discard).1
     }
 }

@@ -1,4 +1,27 @@
-#![allow(clippy::disallowed_types)]
+//! Upstream rustls's SSLKEYLOGFILE tests (test code: the no-panic wall is off).
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::indexing_slicing,
+    clippy::string_slice,
+    clippy::arithmetic_side_effects,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_wrap,
+    clippy::disallowed_macros,
+    clippy::disallowed_types,
+    clippy::disallowed_methods,
+    clippy::cognitive_complexity,
+    clippy::unwrap_in_result,
+    clippy::panic_in_result_fn,
+    clippy::missing_panics_doc,
+    clippy::dbg_macro,
+    unreachable_pub
+)]
 
 use std::env;
 use std::sync::Mutex;
@@ -29,7 +52,7 @@ fn serialized(f: impl FnOnce()) {
     let _guard = MUTEX.lock().unwrap();
 
     // XXX: NOT thread safe.
-    unsafe { env::set_var("SSLKEYLOGFILE", "./sslkeylogfile.txt") };
+    env::set_var("SSLKEYLOGFILE", "./sslkeylogfile.txt");
 
     f()
 }

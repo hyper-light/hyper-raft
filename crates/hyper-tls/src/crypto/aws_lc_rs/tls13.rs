@@ -5,10 +5,10 @@ use aws_lc_rs::{aead, hkdf, hmac};
 
 use crate::crypto;
 use crate::crypto::cipher::{
-    make_tls13_aad, AeadKey, InboundOpaqueMessage, Iv, MessageDecrypter, MessageEncrypter, Nonce,
-    Tls13AeadAlgorithm, UnsupportedOperationError,
+    make_tls13_aad, AeadKey, InboundOpaqueMessage, Iv, KeyRejected, MessageDecrypter,
+    MessageEncrypter, Nonce, Tls13AeadAlgorithm, UnsupportedOperationError,
 };
-use crate::crypto::tls13::{Hkdf, HkdfExpander, OkmBlock, OutputLengthError};
+use crate::crypto::tls13::{zero_hash_len, Hkdf, HkdfExpander, OkmBlock, OutputLengthError};
 use crate::enums::{CipherSuite, ContentType, ProtocolVersion};
 use crate::error::Error;
 use crate::msgs::message::{
@@ -86,23 +86,26 @@ struct Chacha20Poly1305Aead(AeadAlgorithm);
 
 impl Tls13AeadAlgorithm for Chacha20Poly1305Aead {
     fn encrypter(&self, key: AeadKey, iv: Iv) -> Box<dyn MessageEncrypter> {
-        // safety: the caller arranges that `key` is `key_len()` in bytes, so this unwrap is safe.
-        Box::new(AeadMessageEncrypter {
-            enc_key: aead::LessSafeKey::new(
-                aead::UnboundKey::new(self.0 .0, key.as_ref()).unwrap(),
-            ),
-            iv,
-        })
+        // The caller arranges that `key` is `key_len()` in bytes, so the key is accepted; were it
+        // not, the connection gets the refusing cipher.
+        match aead::UnboundKey::new(self.0 .0, key.as_ref()) {
+            Ok(key) => Box::new(AeadMessageEncrypter {
+                enc_key: aead::LessSafeKey::new(key),
+                iv,
+            }),
+            Err(_) => Box::new(KeyRejected),
+        }
     }
 
     fn decrypter(&self, key: AeadKey, iv: Iv) -> Box<dyn MessageDecrypter> {
-        // safety: the caller arranges that `key` is `key_len()` in bytes, so this unwrap is safe.
-        Box::new(AeadMessageDecrypter {
-            dec_key: aead::LessSafeKey::new(
-                aead::UnboundKey::new(self.0 .0, key.as_ref()).unwrap(),
-            ),
-            iv,
-        })
+        // As `encrypter`.
+        match aead::UnboundKey::new(self.0 .0, key.as_ref()) {
+            Ok(key) => Box::new(AeadMessageDecrypter {
+                dec_key: aead::LessSafeKey::new(key),
+                iv,
+            }),
+            Err(_) => Box::new(KeyRejected),
+        }
     }
 
     fn key_len(&self) -> usize {
@@ -184,34 +187,22 @@ struct AeadAlgorithm(&'static aead::Algorithm);
 impl AeadAlgorithm {
     // using aead::TlsRecordSealingKey
     fn encrypter(&self, key: AeadKey, iv: Iv) -> Box<dyn MessageEncrypter> {
-        // safety:
-        // - the caller arranges that `key` is `key_len()` in bytes, so this unwrap is safe.
+        // - the caller arranges that `key` is `key_len()` in bytes, so the key is accepted.
         // - this function should only be used for `Algorithm::AES_128_GCM` or `Algorithm::AES_256_GCM`
-        Box::new(GcmMessageEncrypter {
-            enc_key: aead::TlsRecordSealingKey::new(
-                self.0,
-                aead::TlsProtocolId::TLS13,
-                key.as_ref(),
-            )
-            .unwrap(),
-            iv,
-        })
+        // Were either not so, the connection gets the refusing cipher.
+        match aead::TlsRecordSealingKey::new(self.0, aead::TlsProtocolId::TLS13, key.as_ref()) {
+            Ok(enc_key) => Box::new(GcmMessageEncrypter { enc_key, iv }),
+            Err(_) => Box::new(KeyRejected),
+        }
     }
 
     // using aead::TlsRecordOpeningKey
     fn decrypter(&self, key: AeadKey, iv: Iv) -> Box<dyn MessageDecrypter> {
-        // safety:
-        // - the caller arranges that `key` is `key_len()` in bytes, so this unwrap is safe.
-        // - this function should only be used for `Algorithm::AES_128_GCM` or `Algorithm::AES_256_GCM`
-        Box::new(GcmMessageDecrypter {
-            dec_key: aead::TlsRecordOpeningKey::new(
-                self.0,
-                aead::TlsProtocolId::TLS13,
-                key.as_ref(),
-            )
-            .unwrap(),
-            iv,
-        })
+        // As `encrypter`.
+        match aead::TlsRecordOpeningKey::new(self.0, aead::TlsProtocolId::TLS13, key.as_ref()) {
+            Ok(dec_key) => Box::new(GcmMessageDecrypter { dec_key, iv }),
+            Err(_) => Box::new(KeyRejected),
+        }
     }
 
     fn key_len(&self) -> usize {
@@ -239,7 +230,7 @@ impl MessageEncrypter for AeadMessageEncrypter {
         let mut payload = PrefixedPayload::with_capacity(total_len);
 
         let nonce = aead::Nonce::assume_unique_for_key(Nonce::new(&self.iv, seq).0);
-        let aad = aead::Aad::from(make_tls13_aad(total_len));
+        let aad = aead::Aad::from(make_tls13_aad(record_len(total_len)?));
         payload.extend_from_chunks(&msg.payload);
         payload.extend_from_slice(&msg.typ.to_array());
 
@@ -257,7 +248,7 @@ impl MessageEncrypter for AeadMessageEncrypter {
     }
 
     fn encrypted_payload_len(&self, payload_len: usize) -> usize {
-        payload_len + 1 + self.enc_key.algorithm().tag_len()
+        sealed_record_len(payload_len, self.enc_key.algorithm().tag_len())
     }
 }
 
@@ -273,7 +264,11 @@ impl MessageDecrypter for AeadMessageDecrypter {
         }
 
         let nonce = aead::Nonce::assume_unique_for_key(Nonce::new(&self.iv, seq).0);
-        let aad = aead::Aad::from(make_tls13_aad(payload.len()));
+        // A record past the uint16 length field is not one the peer could have sent intact;
+        // upstream truncated the length and failed to open it.
+        let aad = aead::Aad::from(make_tls13_aad(
+            u16::try_from(payload.len()).map_err(|_| Error::DecryptError)?,
+        ));
         let plain_len = self
             .dec_key
             .open_in_place(nonce, aad, payload)
@@ -300,7 +295,7 @@ impl MessageEncrypter for GcmMessageEncrypter {
         let mut payload = PrefixedPayload::with_capacity(total_len);
 
         let nonce = aead::Nonce::assume_unique_for_key(Nonce::new(&self.iv, seq).0);
-        let aad = aead::Aad::from(make_tls13_aad(total_len));
+        let aad = aead::Aad::from(make_tls13_aad(record_len(total_len)?));
         payload.extend_from_chunks(&msg.payload);
         payload.extend_from_slice(&msg.typ.to_array());
 
@@ -316,7 +311,7 @@ impl MessageEncrypter for GcmMessageEncrypter {
     }
 
     fn encrypted_payload_len(&self, payload_len: usize) -> usize {
-        payload_len + 1 + self.enc_key.algorithm().tag_len()
+        sealed_record_len(payload_len, self.enc_key.algorithm().tag_len())
     }
 }
 
@@ -337,7 +332,11 @@ impl MessageDecrypter for GcmMessageDecrypter {
         }
 
         let nonce = aead::Nonce::assume_unique_for_key(Nonce::new(&self.iv, seq).0);
-        let aad = aead::Aad::from(make_tls13_aad(payload.len()));
+        // A record past the uint16 length field is not one the peer could have sent intact;
+        // upstream truncated the length and failed to open it.
+        let aad = aead::Aad::from(make_tls13_aad(
+            u16::try_from(payload.len()).map_err(|_| Error::DecryptError)?,
+        ));
         let plain_len = self
             .dec_key
             .open_in_place(nonce, aad, payload)
@@ -349,27 +348,33 @@ impl MessageDecrypter for GcmMessageDecrypter {
     }
 }
 
+/// A TLS 1.3 record's payload length once sealed: the plaintext, its one-byte content type and
+/// the tag (RFC 8446 §5.2). A required size: saturating can only over-state it, which refuses
+/// rather than overruns.
+fn sealed_record_len(payload_len: usize, tag_len: usize) -> usize {
+    payload_len.saturating_add(1).saturating_add(tag_len)
+}
+
+/// The record's `uint16 length` field for a sealed payload of `total_len` bytes. The fragmenter
+/// keeps records far shorter; a longer one cannot be framed (upstream truncated the length).
+fn record_len(total_len: usize) -> Result<u16, Error> {
+    u16::try_from(total_len).map_err(|_| Error::EncryptError)
+}
+
 struct AwsLcHkdf(hkdf::Algorithm, hmac::Algorithm);
 
 impl Hkdf for AwsLcHkdf {
     fn extract_from_zero_ikm(&self, salt: Option<&[u8]>) -> Box<dyn HkdfExpander> {
-        let zeroes = [0u8; OkmBlock::MAX_LEN];
-        let salt = match salt {
-            Some(salt) => salt,
-            None => &zeroes[..self.0.len()],
-        };
+        let zeroes = zero_hash_len(self.0.len());
+        let salt = salt.unwrap_or(zeroes);
         Box::new(AwsLcHkdfExpander {
             alg: self.0,
-            prk: hkdf::Salt::new(self.0, salt).extract(&zeroes[..self.0.len()]),
+            prk: hkdf::Salt::new(self.0, salt).extract(zeroes),
         })
     }
 
     fn extract_from_secret(&self, salt: Option<&[u8]>, secret: &[u8]) -> Box<dyn HkdfExpander> {
-        let zeroes = [0u8; OkmBlock::MAX_LEN];
-        let salt = match salt {
-            Some(salt) => salt,
-            None => &zeroes[..self.0.len()],
-        };
+        let salt = salt.unwrap_or(zero_hash_len(self.0.len()));
         Box::new(AwsLcHkdfExpander {
             alg: self.0,
             prk: hkdf::Salt::new(self.0, salt).extract(secret),
@@ -405,14 +410,11 @@ impl HkdfExpander for AwsLcHkdfExpander {
             .map_err(|_| OutputLengthError)
     }
 
-    fn expand_block(&self, info: &[&[u8]]) -> OkmBlock {
+    fn expand_block(&self, info: &[&[u8]]) -> Result<OkmBlock, OutputLengthError> {
         let mut buf = [0u8; OkmBlock::MAX_LEN];
-        let output = &mut buf[..self.hash_len()];
-        self.prk
-            .expand(info, Len(output.len()))
-            .and_then(|okm| okm.fill(output))
-            .unwrap();
-        OkmBlock::new(output)
+        let output = buf.get_mut(..self.hash_len()).ok_or(OutputLengthError)?;
+        self.expand_slice(info, output)?;
+        Ok(OkmBlock::new(output))
     }
 
     fn hash_len(&self) -> usize {

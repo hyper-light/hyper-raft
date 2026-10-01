@@ -358,8 +358,10 @@ impl ClientConfig {
     /// [the process-default `CryptoProvider`][CryptoProvider#using-the-per-process-default-cryptoprovider]
     /// and safe protocol version defaults.
     ///
+    /// Fails as [`Self::builder_with_protocol_versions`] does.
+    ///
     /// For more information, see the [`ConfigBuilder`] documentation.
-    pub fn builder() -> ConfigBuilder<Self, WantsVerifier> {
+    pub fn builder() -> Result<ConfigBuilder<Self, WantsVerifier>, Error> {
         Self::builder_with_protocol_versions(versions::DEFAULT_VERSIONS)
     }
 
@@ -367,23 +369,16 @@ impl ClientConfig {
     /// [the process-default `CryptoProvider`][CryptoProvider#using-the-per-process-default-cryptoprovider]
     /// and the provided protocol versions.
     ///
-    /// Panics if
-    /// - the supported versions are not compatible with the provider (eg.
-    ///   the combination of ciphersuites supported by the provider and supported
-    ///   versions lead to zero cipher suites being usable),
-    /// - if a `CryptoProvider` cannot be resolved using a combination of
-    ///   the crate features and process default.
+    /// Fails if the supported versions are not compatible with the process-default provider
+    /// (eg. the combination of ciphersuites supported by the provider and supported versions
+    /// lead to zero cipher suites being usable). Upstream panicked.
     ///
     /// For more information, see the [`ConfigBuilder`] documentation.
     pub fn builder_with_protocol_versions(
         versions: &[&'static versions::SupportedProtocolVersion],
-    ) -> ConfigBuilder<Self, WantsVerifier> {
-        // Safety assumptions:
-        // 1. that the provider has been installed (explicitly or implicitly)
-        // 2. that the process-level default provider is usable with the supplied protocol versions.
+    ) -> Result<ConfigBuilder<Self, WantsVerifier>, Error> {
         Self::builder_with_provider(CryptoProvider::get_default_or_install_from_crate_features())
             .with_protocol_versions(versions)
-            .unwrap()
     }
 
     /// Create a builder for a client configuration with a specific [`CryptoProvider`].
@@ -591,9 +586,7 @@ impl Default for Resumption {
     /// Create an in-memory session store resumption with up to 256 server names, allowing
     /// a TLS 1.2 session to resume with a session id or RFC 5077 ticket.
     fn default() -> Self {
-        let ret = Self::in_memory_sessions(256);
-
-        ret
+        Self::in_memory_sessions(256)
     }
 }
 
@@ -673,10 +666,13 @@ impl EarlyData {
         )
     }
 
-    pub(super) fn enable(&mut self, max_data: usize) {
-        assert_eq!(self.state, EarlyDataState::Disabled);
+    pub(super) fn enable(&mut self, max_data: usize) -> Result<(), Error> {
+        if self.state != EarlyDataState::Disabled {
+            return Err(Error::Internal("early data enabled twice"));
+        }
         self.state = EarlyDataState::Ready;
         self.left = max_data;
+        Ok(())
     }
 
     pub(super) fn rejected(&mut self) {
@@ -684,34 +680,46 @@ impl EarlyData {
         self.state = EarlyDataState::Rejected;
     }
 
-    pub(super) fn accepted(&mut self) {
+    pub(super) fn accepted(&mut self) -> Result<(), Error> {
         trace!("EarlyData accepted");
-        assert_eq!(self.state, EarlyDataState::Ready);
+        if self.state != EarlyDataState::Ready {
+            return Err(Error::Internal("early data accepted without being offered"));
+        }
         self.state = EarlyDataState::Accepted;
+        Ok(())
     }
 
-    pub(super) fn finished(&mut self) {
+    pub(super) fn finished(&mut self) -> Result<(), Error> {
         trace!("EarlyData finished");
         self.state = match self.state {
             EarlyDataState::Accepted => EarlyDataState::AcceptedFinished,
-            _ => panic!("bad EarlyData state"),
-        }
+            _ => {
+                return Err(Error::Internal(
+                    "early data finished without being accepted",
+                ))
+            }
+        };
+        Ok(())
     }
 
-    fn check_write_opt(&mut self, sz: usize) -> Option<usize> {
+    /// The prefix of `data` that the remaining early-data allowance admits, counted against it;
+    /// `None` once early data is refused. A disabled state admits nothing: no writer for early
+    /// data is handed out until it is enabled (upstream's `unreachable!`).
+    fn admit<'d>(&mut self, data: &'d [u8]) -> Option<&'d [u8]> {
         match self.state {
-            EarlyDataState::Disabled => unreachable!(),
+            EarlyDataState::Disabled
+            | EarlyDataState::Rejected
+            | EarlyDataState::AcceptedFinished => None,
             EarlyDataState::Ready | EarlyDataState::Accepted => {
-                let take = if self.left < sz {
-                    mem::replace(&mut self.left, 0)
-                } else {
-                    self.left -= sz;
-                    sz
+                let take = match self.left.checked_sub(data.len()) {
+                    Some(rest) => {
+                        self.left = rest;
+                        data.len()
+                    }
+                    None => mem::replace(&mut self.left, 0),
                 };
-
-                Some(take)
+                data.get(..take)
             }
-            EarlyDataState::Rejected | EarlyDataState::AcceptedFinished => None,
         }
     }
 }
@@ -760,8 +768,8 @@ mod connection {
     }
 
     impl super::EarlyData {
-        fn check_write(&mut self, sz: usize) -> io::Result<usize> {
-            self.check_write_opt(sz)
+        fn admit_or_refuse<'d>(&mut self, data: &'d [u8]) -> io::Result<&'d [u8]> {
+            self.admit(data)
                 .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))
         }
 
@@ -873,8 +881,8 @@ mod connection {
                 .core
                 .data
                 .early_data
-                .check_write(data.len())
-                .map(|sz| self.inner.send_early_plaintext(&data[..sz]))
+                .admit_or_refuse(data)
+                .map(|admitted| self.inner.send_early_plaintext(admitted))
         }
     }
 
@@ -1066,20 +1074,14 @@ impl MayEncryptEarlyData<'_> {
         early_data: &[u8],
         outgoing_tls: &mut [u8],
     ) -> Result<usize, EarlyDataError> {
-        let Some(allowed) = self
-            .conn
-            .core
-            .data
-            .early_data
-            .check_write_opt(early_data.len())
-        else {
+        let Some(allowed) = self.conn.core.data.early_data.admit(early_data) else {
             return Err(EarlyDataError::ExceededAllowedEarlyData);
         };
 
         self.conn
             .core
             .common_state
-            .write_plaintext(early_data[..allowed].into(), outgoing_tls)
+            .write_plaintext(allowed.into(), outgoing_tls)
             .map_err(|e| e.into())
     }
 }
@@ -1108,7 +1110,7 @@ impl fmt::Display for EarlyDataError {
     }
 }
 
-impl std::error::Error for EarlyDataError {}
+impl core::error::Error for EarlyDataError {}
 
 /// State associated with a client connection.
 #[derive(Debug)]

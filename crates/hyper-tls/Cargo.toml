@@ -11,6 +11,9 @@ rust-version.workspace = true
 [lib]
 name = "hyper_tls"
 
+[lints]
+workspace = true
+
 [dependencies]
 aws-lc-rs = { version = "1.18", default-features = false, features = ["aws-lc-sys", "prebuilt-nasm"] }
 brotli = { version = "8", default-features = false, features = ["std"] }
@@ -27,6 +30,8 @@ zlib-rs = "0.6"
 base64 = "0.22"
 env_logger = "0.11"
 hex = "0.4"
+# The counting allocator for the allocations-per-handshake test.
+hyper-measure = { path = "../hyper-measure" }
 log = "0.4.8"
 macro_rules_attribute = "0.2"
 num-bigint = "0.4.4"

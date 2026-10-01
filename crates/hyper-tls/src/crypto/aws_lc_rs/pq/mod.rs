@@ -54,9 +54,14 @@ pub static MLKEM1024: &dyn SupportedKxGroup = &MlKem {
     group: NamedGroup::MLKEM1024,
 };
 
+/// The refusal for a key share of the wrong length.
 const INVALID_KEY_SHARE: Error = Error::PeerMisbehaved(PeerMisbehaved::InvalidKeyShare);
 
+/// An X25519 public key (RFC 7748 §6.1).
 const X25519_LEN: usize = 32;
+/// An uncompressed secp256r1 point (RFC 8446 §4.2.8.2, SEC 1 §2.3.3).
 const SECP256R1_LEN: usize = 65;
+/// An ML-KEM-768 ciphertext (FIPS 203 Table 3).
 const MLKEM768_CIPHERTEXT_LEN: usize = 1088;
+/// An ML-KEM-768 encapsulation key (FIPS 203 Table 3).
 const MLKEM768_ENCAP_LEN: usize = 1184;

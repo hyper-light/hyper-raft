@@ -62,7 +62,7 @@ impl Payload<'static> {
 
 impl<'a> Codec<'a> for CertificateDer<'a> {
     fn encode(&self, bytes: &mut Vec<u8>) {
-        codec::u24(self.as_ref().len() as u32).encode(bytes);
+        codec::low_u24(self.as_ref().len()).encode(bytes);
         bytes.extend(self.as_ref());
     }
 
@@ -96,8 +96,7 @@ impl<C: Cardinality> PayloadU24<'_, C> {
 impl<'a, C: Cardinality> Codec<'a> for PayloadU24<'a, C> {
     fn encode(&self, bytes: &mut Vec<u8>) {
         let inner = self.0.bytes();
-        debug_assert!(inner.len() >= C::MIN);
-        codec::u24(inner.len() as u32).encode(bytes);
+        codec::low_u24(inner.len()).encode(bytes);
         bytes.extend_from_slice(inner);
     }
 
@@ -113,7 +112,6 @@ impl<'a, C: Cardinality> Codec<'a> for PayloadU24<'a, C> {
 
 impl<'a, C: Cardinality> From<Payload<'a>> for PayloadU24<'a, C> {
     fn from(value: Payload<'a>) -> Self {
-        debug_assert!(value.bytes().len() >= C::MIN);
         Self(value, PhantomData)
     }
 }
@@ -139,7 +137,6 @@ pub struct PayloadU16<C: Cardinality = MaybeEmpty>(pub(crate) Vec<u8>, PhantomDa
 
 impl<C: Cardinality> PayloadU16<C> {
     pub fn new(bytes: Vec<u8>) -> Self {
-        debug_assert!(bytes.len() >= C::MIN);
         Self(bytes, PhantomData)
     }
 }
@@ -152,8 +149,7 @@ impl PayloadU16<MaybeEmpty> {
 
 impl<C: Cardinality> Codec<'_> for PayloadU16<C> {
     fn encode(&self, bytes: &mut Vec<u8>) {
-        debug_assert!(self.0.len() >= C::MIN);
-        (self.0.len() as u16).encode(bytes);
+        codec::low_u16(self.0.len()).encode(bytes);
         bytes.extend_from_slice(&self.0);
     }
 
@@ -182,12 +178,11 @@ pub(crate) struct PayloadU8<C: Cardinality = MaybeEmpty>(pub(crate) Vec<u8>, Pha
 
 impl<C: Cardinality> PayloadU8<C> {
     pub(crate) fn encode_slice(slice: &[u8], bytes: &mut Vec<u8>) {
-        (slice.len() as u8).encode(bytes);
+        codec::low_u8(slice.len()).encode(bytes);
         bytes.extend_from_slice(slice);
     }
 
     pub(crate) fn new(bytes: Vec<u8>) -> Self {
-        debug_assert!(bytes.len() >= C::MIN);
         Self(bytes, PhantomData)
     }
 }
@@ -200,8 +195,7 @@ impl PayloadU8<MaybeEmpty> {
 
 impl<C: Cardinality> Codec<'_> for PayloadU8<C> {
     fn encode(&self, bytes: &mut Vec<u8>) {
-        debug_assert!(self.0.len() >= C::MIN);
-        (self.0.len() as u8).encode(bytes);
+        codec::low_u8(self.0.len()).encode(bytes);
         bytes.extend_from_slice(&self.0);
     }
 
@@ -229,6 +223,7 @@ impl<C: Cardinality> fmt::Debug for PayloadU8<C> {
 }
 
 pub trait Cardinality: Clone + Eq + PartialEq {
+    /// The fewest bytes a decoded value may hold.
     const MIN: usize;
 }
 
@@ -236,6 +231,7 @@ pub trait Cardinality: Clone + Eq + PartialEq {
 pub struct MaybeEmpty;
 
 impl Cardinality for MaybeEmpty {
+    /// Zero: the grammar's lower bound is 0.
     const MIN: usize = 0;
 }
 
@@ -243,6 +239,7 @@ impl Cardinality for MaybeEmpty {
 pub struct NonEmpty;
 
 impl Cardinality for NonEmpty {
+    /// One: the grammar's lower bound is not 0.
     const MIN: usize = 1;
 }
 

@@ -1,6 +1,27 @@
-#![cfg_attr(read_buf, feature(read_buf))]
-#![cfg_attr(read_buf, feature(core_io))]
-#![cfg_attr(read_buf, feature(core_io_borrowed_buf))]
+//! Upstream rustls's API tests, run against hyper-tls (test code: the no-panic wall is off).
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::indexing_slicing,
+    clippy::string_slice,
+    clippy::arithmetic_side_effects,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_wrap,
+    clippy::disallowed_macros,
+    clippy::disallowed_types,
+    clippy::disallowed_methods,
+    clippy::cognitive_complexity,
+    clippy::unwrap_in_result,
+    clippy::panic_in_result_fn,
+    clippy::missing_panics_doc,
+    clippy::dbg_macro,
+    unreachable_pub
+)]
 
 use std::cell::RefCell;
 

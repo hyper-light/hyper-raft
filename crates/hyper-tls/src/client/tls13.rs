@@ -173,7 +173,7 @@ pub(super) fn handle_server_hello(
                 .send_fatal_alert(AlertDescription::IllegalParameter, err)
         })?;
 
-    let mut key_schedule = key_schedule_pre_handshake.into_handshake(shared_secret);
+    let mut key_schedule = key_schedule_pre_handshake.into_handshake(shared_secret)?;
 
     // If we have ECH state, check that the server accepted our offer.
     if let Some(ech_state) = ech_state {
@@ -186,7 +186,7 @@ pub(super) fn handle_server_hello(
             ..
         } = &server_hello_msg
         else {
-            unreachable!("ServerHello is a handshake message");
+            return Err(Error::Internal("ServerHello is not a handshake message"));
         };
         cx.data.ech_status = match ech_state.confirm_acceptance(
             &mut key_schedule,
@@ -228,7 +228,7 @@ pub(super) fn handle_server_hello(
         &mut **cx.stores.key_log,
         &randoms.client,
         cx.common,
-    );
+    )?;
 
     emit_fake_ccs(&mut sent_tls13_fake_ccs, cx.common);
 
@@ -305,19 +305,13 @@ pub(super) fn initial_key_share(
     server_name: &ServerName<'_>,
     kx_state: &mut KxState,
 ) -> Result<Box<dyn ActiveKeyExchange>, Error> {
+    // The builder refuses a provider without key exchange groups.
     let group = resumption
         .store
         .kx_hint(server_name)
         .and_then(|group_name| config.find_kx_group(group_name, ProtocolVersion::TLSv1_3))
-        .unwrap_or_else(|| {
-            config
-                .provider
-                .kx_groups
-                .iter()
-                .copied()
-                .next()
-                .expect("No kx groups configured")
-        });
+        .or_else(|| config.provider.kx_groups.first().copied())
+        .ok_or(Error::Internal("no key exchange groups configured"))?;
 
     *kx_state = KxState::Start(group);
     group.start()
@@ -329,7 +323,7 @@ pub(super) fn fill_in_psk_binder(
     resuming: &persist::Tls13ClientSessionValue,
     transcript: &HandshakeHashBuffer,
     hmp: &mut HandshakeMessagePayload<'_>,
-) -> KeyScheduleEarly {
+) -> Result<KeyScheduleEarly, Error> {
     // We need to know the hash function of the suite we're trying to resume into.
     let suite = resuming.suite();
     let suite_hash = suite.common.hash_provider;
@@ -342,7 +336,8 @@ pub(super) fn fill_in_psk_binder(
     // Run a fake key_schedule to simulate what the server will do if it chooses
     // to resume.
     let key_schedule = KeyScheduleEarly::new(suite, resuming.secret());
-    let real_binder = key_schedule.resumption_psk_binder_key_and_sign_verify_data(&handshake_hash);
+    let real_binder =
+        key_schedule.resumption_psk_binder_key_and_sign_verify_data(&handshake_hash)?;
 
     if let HandshakePayload::ClientHello(ch) = &mut hmp.0 {
         if let Some(PresharedKeyOffer {
@@ -353,14 +348,19 @@ pub(super) fn fill_in_psk_binder(
             // the caller of this function must have set up the desired identity, and a
             // matching (dummy) binder; or else the binder we compute here will be incorrect.
             // See `prepare_resumption()`.
-            debug_assert_eq!(identities.len(), 1);
-            debug_assert_eq!(binders.len(), 1);
-            debug_assert_eq!(binders[0].as_ref().len(), real_binder.as_ref().len());
-            binders[0] = PresharedKeyBinder::from(real_binder.as_ref().to_vec());
+            let ([_], [binder]) = (identities.as_slice(), binders.as_mut_slice()) else {
+                return Err(Error::Internal("PSK offer without exactly one identity"));
+            };
+            if binder.as_ref().len() != real_binder.as_ref().len() {
+                return Err(Error::Internal(
+                    "PSK placeholder binder of the wrong length",
+                ));
+            }
+            *binder = PresharedKeyBinder::from(real_binder.as_ref().to_vec());
         }
     };
 
-    key_schedule
+    Ok(key_schedule)
 }
 
 pub(super) fn prepare_resumption(
@@ -368,14 +368,15 @@ pub(super) fn prepare_resumption(
     resuming_session: &Retrieved<&persist::Tls13ClientSessionValue>,
     exts: &mut ClientExtensions<'_>,
     doing_retry: bool,
-) {
+) -> Result<(), Error> {
     let resuming_suite = resuming_session.suite();
     cx.common.suite = Some(resuming_suite.into());
     // The EarlyData extension MUST be supplied together with the
     // PreSharedKey extension.
     let max_early_data_size = resuming_session.max_early_data_size();
     if cx.config.enable_early_data && max_early_data_size > 0 && !doing_retry {
-        cx.data.early_data.enable(max_early_data_size as usize);
+        // A u32 widens into usize on every supported target (64-bit).
+        cx.data.early_data.enable(max_early_data_size as usize)?;
         exts.early_data_request = Some(());
     }
 
@@ -393,6 +394,7 @@ pub(super) fn prepare_resumption(
         PresharedKeyIdentity::new(resuming_session.ticket().to_vec(), obfuscated_ticket_age);
     let psk_offer = PresharedKeyOffer::new(psk_identity, binder);
     exts.preshared_key_offer = Some(psk_offer);
+    Ok(())
 }
 
 pub(super) fn derive_early_traffic_secret(
@@ -402,7 +404,7 @@ pub(super) fn derive_early_traffic_secret(
     sent_tls13_fake_ccs: &mut bool,
     transcript_buffer: &HandshakeHashBuffer,
     client_random: &[u8; 32],
-) {
+) -> Result<(), Error> {
     // For middlebox compatibility
     emit_fake_ccs(sent_tls13_fake_ccs, cx.common);
 
@@ -412,11 +414,12 @@ pub(super) fn derive_early_traffic_secret(
         &mut **cx.stores.key_log,
         client_random,
         cx.common,
-    );
+    )?;
 
     // Now the client can send encrypted early data
     cx.common.early_traffic = true;
     trace!("Starting early data traffic");
+    Ok(())
 }
 
 pub(super) fn emit_fake_ccs(sent_tls13_fake_ccs: &mut bool, common: &mut CommonState) {
@@ -541,7 +544,7 @@ impl State<ClientConnectionData> for ExpectEncryptedExtensions {
                 let was_early_traffic = cx.common.early_traffic;
                 if was_early_traffic {
                     match exts.early_data_ack {
-                        Some(()) => cx.data.early_data.accepted(),
+                        Some(()) => cx.data.early_data.accepted()?,
                         None => {
                             cx.data.early_data.rejected();
                             cx.common.early_traffic = false;
@@ -551,7 +554,7 @@ impl State<ClientConnectionData> for ExpectEncryptedExtensions {
 
                 if was_early_traffic && !cx.common.early_traffic {
                     // If no early traffic, set the encryption key for handshakes
-                    self.key_schedule.set_handshake_encrypter(cx.common);
+                    self.key_schedule.set_handshake_encrypter(cx.common)?;
                 }
 
                 cx.common.peer_certificates = Some(resuming_session.server_cert_chain().clone());
@@ -1263,7 +1266,7 @@ impl State<ClientConnectionData> for ExpectFinished {
             require_handshake_msg!(m, HandshakeType::Finished, HandshakePayload::Finished)?;
 
         let handshake_hash = st.transcript.current_hash();
-        let expect_verify_data = st.key_schedule.sign_server_finish(&handshake_hash);
+        let expect_verify_data = st.key_schedule.sign_server_finish(&handshake_hash)?;
 
         let fin = match ConstantTimeEq::ct_eq(expect_verify_data.as_ref(), finished.bytes()).into()
         {
@@ -1283,8 +1286,8 @@ impl State<ClientConnectionData> for ExpectFinished {
         if cx.common.early_traffic {
             emit_end_of_early_data_tls13(&mut st.transcript, cx.common);
             cx.common.early_traffic = false;
-            cx.data.early_data.finished();
-            st.key_schedule.set_handshake_encrypter(cx.common);
+            cx.data.early_data.finished()?;
+            st.key_schedule.set_handshake_encrypter(cx.common)?;
         }
 
         let mut flight = HandshakeFlightTls13::new(&mut st.transcript);
@@ -1336,7 +1339,7 @@ impl State<ClientConnectionData> for ExpectFinished {
                 flight.transcript.current_hash(),
                 &mut **cx.stores.key_log,
                 &st.randoms.client,
-            );
+            )?;
 
         emit_finished_tls13(&mut flight, &verify_data);
         flight.finish(cx.common);
@@ -1351,7 +1354,7 @@ impl State<ClientConnectionData> for ExpectFinished {
         /* Now move to our application traffic keys. */
         cx.common.check_aligned_handshake()?;
         let (key_schedule, resumption) =
-            key_schedule_pre_finished.into_traffic(cx.common, st.transcript.current_hash());
+            key_schedule_pre_finished.into_traffic(cx.common, st.transcript.current_hash())?;
         cx.common.start_traffic(&mut cx.sendable_plaintext);
 
         // Now that we've reached the end of the normal handshake we must enforce ECH acceptance by
@@ -1401,7 +1404,7 @@ impl ExpectTraffic {
         cx: &mut KernelContext<'_>,
         nst: NewSessionTicketPayloadTls13,
     ) -> Result<(), Error> {
-        let secret = self.resumption.derive_ticket_psk(&nst.nonce.0);
+        let secret = self.resumption.derive_ticket_psk(&nst.nonce.0)?;
 
         let now = cx.config.current_time()?;
 
@@ -1469,12 +1472,11 @@ impl ExpectTraffic {
         common.check_aligned_handshake()?;
 
         if common.should_update_key(key_update_request)? {
-            self.key_schedule.update_encrypter_and_notify(common);
+            self.key_schedule.update_encrypter_and_notify(common)?;
         }
 
         // Update our read-side keys.
-        self.key_schedule.update_decrypter(common);
-        Ok(())
+        self.key_schedule.update_decrypter(common)
     }
 }
 

@@ -523,7 +523,10 @@ pub trait ActiveKeyExchange: Send + Sync {
         self: Box<Self>,
         _peer_pub_key: &[u8],
     ) -> Result<SharedSecret, Error> {
-        unreachable!("only called if `hybrid_component()` implemented")
+        // Only called if `hybrid_component()` is implemented (upstream's `unreachable!`).
+        Err(Error::Internal(
+            "complete_hybrid_component called without hybrid_component",
+        ))
     }
 
     /// Return the public key being used.
@@ -575,7 +578,8 @@ pub struct SharedSecret {
 impl SharedSecret {
     /// Returns the shared secret as a slice of bytes.
     pub fn secret_bytes(&self) -> &[u8] {
-        &self.buf[self.offset..]
+        // `offset` only moves within the buffer (`strip_leading_zeros`).
+        self.buf.split_at(self.offset.min(self.buf.len())).1
     }
 
     /// Removes leading zeros from `secret_bytes()` by adjusting the `offset`.
@@ -589,7 +593,8 @@ impl SharedSecret {
             .find(|(_i, x)| **x != 0)
             .map(|(i, _x)| i)
             .unwrap_or(self.secret_bytes().len());
-        self.offset += start;
+        // `start` is within `secret_bytes()`, so the offset stays within the buffer.
+        self.offset = self.offset.saturating_add(start);
     }
 }
 

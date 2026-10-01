@@ -6,7 +6,7 @@ use zeroize::Zeroize;
 
 use crate::enums::{ContentType, ProtocolVersion};
 use crate::error::Error;
-use crate::msgs::codec;
+
 pub use crate::msgs::message::{
     BorrowedPayload, InboundOpaqueMessage, InboundPlainMessage, OutboundChunks,
     OutboundOpaqueMessage, OutboundPlainMessage, PlainMessage, PrefixedPayload,
@@ -102,7 +102,7 @@ impl fmt::Display for UnsupportedOperationError {
     }
 }
 
-impl std::error::Error for UnsupportedOperationError {}
+impl core::error::Error for UnsupportedOperationError {}
 
 /// How a TLS1.2 `key_block` is partitioned.
 ///
@@ -180,12 +180,10 @@ impl Iv {
         Self(value)
     }
 
-    /// Create a new `Iv` from a byte slice, of precisely `NONCE_LEN` bytes.
-    pub fn copy(value: &[u8]) -> Self {
-        debug_assert_eq!(value.len(), NONCE_LEN);
-        let mut iv = Self::new(Default::default());
-        iv.0.copy_from_slice(value);
-        iv
+    /// Create a new `Iv` from a byte slice, of precisely `NONCE_LEN` bytes: `None` for any
+    /// other length (upstream panicked).
+    pub fn copy(value: &[u8]) -> Option<Self> {
+        <[u8; NONCE_LEN]>::try_from(value).ok().map(Self::new)
     }
 }
 
@@ -210,9 +208,7 @@ impl Nonce {
     /// This is `iv ^ seq` where `seq` is encoded as a 96-bit big-endian integer.
     #[inline]
     pub fn new(iv: &Iv, seq: u64) -> Self {
-        let mut seq_bytes = [0u8; NONCE_LEN];
-        codec::put_u64(seq, &mut seq_bytes[4..]);
-        Self::new_from_seq(iv, seq_bytes)
+        Self::for_path(0, iv, seq)
     }
 
     /// Creates a unique nonce based on the `iv`, the packet number `pn` and multipath `path_id`.
@@ -220,10 +216,9 @@ impl Nonce {
     /// The nonce is computed as the XOR between the `iv` and the 96-bit big-ending integer formed
     /// by concatenating `path_id` and `pn`.
     pub fn for_path(path_id: u32, iv: &Iv, pn: u64) -> Self {
-        let mut seq_bytes = [0u8; NONCE_LEN];
-        seq_bytes[0..4].copy_from_slice(&path_id.to_be_bytes());
-        codec::put_u64(pn, &mut seq_bytes[4..]);
-        Self::new_from_seq(iv, seq_bytes)
+        let [p0, p1, p2, p3] = path_id.to_be_bytes();
+        let [s0, s1, s2, s3, s4, s5, s6, s7] = pn.to_be_bytes();
+        Self::new_from_seq(iv, [p0, p1, p2, p3, s0, s1, s2, s3, s4, s5, s6, s7])
     }
 
     /// Creates a unique nonce based on the `iv` and sequence number `seq`.
@@ -245,36 +240,34 @@ pub const NONCE_LEN: usize = 12;
 ///
 /// See RFC8446 s5.2 for the `additional_data` definition.
 #[inline]
-pub fn make_tls13_aad(payload_len: usize) -> [u8; 5] {
-    let version = ProtocolVersion::TLSv1_2.to_array();
-    [
-        ContentType::ApplicationData.into(),
-        // Note: this is `legacy_record_version`, i.e. TLS1.2 even for TLS1.3.
-        version[0],
-        version[1],
-        (payload_len >> 8) as u8,
-        (payload_len & 0xff) as u8,
-    ]
+///
+/// `payload_len` is the record's `uint16 length` field: a record longer than that does not exist.
+pub fn make_tls13_aad(payload_len: u16) -> [u8; 5] {
+    let [v0, v1] = ProtocolVersion::TLSv1_2.to_array();
+    let [l0, l1] = payload_len.to_be_bytes();
+    // Note: the version is `legacy_record_version`, i.e. TLS1.2 even for TLS1.3.
+    [ContentType::ApplicationData.into(), v0, v1, l0, l1]
 }
 
 /// Returns a TLS1.2 `additional_data` encoding.
 ///
 /// See RFC5246 s6.2.3.3 for the `additional_data` definition.
 #[inline]
+///
+/// `len` is the record's `uint16 length` field: a record longer than that does not exist.
 pub fn make_tls12_aad(
     seq: u64,
     typ: ContentType,
     vers: ProtocolVersion,
-    len: usize,
+    len: u16,
 ) -> [u8; TLS12_AAD_SIZE] {
-    let mut out = [0; TLS12_AAD_SIZE];
-    codec::put_u64(seq, &mut out[0..]);
-    out[8] = typ.into();
-    codec::put_u16(vers.into(), &mut out[9..]);
-    codec::put_u16(len as u16, &mut out[11..]);
-    out
+    let [s0, s1, s2, s3, s4, s5, s6, s7] = seq.to_be_bytes();
+    let [v0, v1] = u16::from(vers).to_be_bytes();
+    let [l0, l1] = len.to_be_bytes();
+    [s0, s1, s2, s3, s4, s5, s6, s7, typ.into(), v0, v1, l0, l1]
 }
 
+/// TLS 1.2's additional data: seq_num, type, version and length (RFC 5246 §6.2.3.3).
 const TLS12_AAD_SIZE: usize = 8 + 1 + 2 + 2;
 
 /// A key for an AEAD algorithm.
@@ -286,20 +279,28 @@ pub struct AeadKey {
 }
 
 impl AeadKey {
-    pub(crate) fn new(buf: &[u8]) -> Self {
-        debug_assert!(buf.len() <= Self::MAX_LEN);
+    /// The key `buf`, refused when it is longer than [`Self::MAX_LEN`] (upstream asserted).
+    pub(crate) fn new(buf: &[u8]) -> Result<Self, Error> {
         let mut key = Self::from([0u8; Self::MAX_LEN]);
-        key.buf[..buf.len()].copy_from_slice(buf);
+        key.buf
+            .get_mut(..buf.len())
+            .ok_or(Error::Internal("AEAD key longer than AeadKey::MAX_LEN"))?
+            .copy_from_slice(buf);
         key.used = buf.len();
-        key
+        Ok(key)
     }
 
-    pub(crate) fn with_length(self, len: usize) -> Self {
-        assert!(len <= self.used);
-        Self {
+    /// The first `len` bytes of this key, refused when it holds fewer (upstream asserted).
+    pub(crate) fn with_length(self, len: usize) -> Result<Self, Error> {
+        if len > self.used {
+            return Err(Error::Internal(
+                "AEAD key shorter than its algorithm's key length",
+            ));
+        }
+        Ok(Self {
             buf: self.buf,
             used: len,
-        }
+        })
     }
 
     /// Largest possible AEAD key in the ciphersuites we support.
@@ -314,7 +315,9 @@ impl Drop for AeadKey {
 
 impl AsRef<[u8]> for AeadKey {
     fn as_ref(&self) -> &[u8] {
-        &self.buf[..self.used]
+        // `used` never exceeds MAX_LEN: `new` and `with_length` refuse it. Were it to, the empty
+        // key is one every AEAD rejects, a typed refusal, never a wrong key.
+        self.buf.get(..self.used).unwrap_or_default()
     }
 }
 
@@ -341,6 +344,35 @@ impl MessageEncrypter for InvalidMessageEncrypter {
 
     fn encrypted_payload_len(&self, payload_len: usize) -> usize {
         payload_len
+    }
+}
+
+/// The cipher in place of an AEAD key the provider rejected: every record fails with
+/// [`Error::Internal`]. The key schedule derives exactly `key_len()` bytes, so this is not reached;
+/// upstream unwrapped the key's construction.
+pub(crate) struct KeyRejected;
+
+impl MessageEncrypter for KeyRejected {
+    fn encrypt(
+        &mut self,
+        _m: OutboundPlainMessage<'_>,
+        _seq: u64,
+    ) -> Result<OutboundOpaqueMessage, Error> {
+        Err(Error::Internal("AEAD key rejected by the provider"))
+    }
+
+    fn encrypted_payload_len(&self, payload_len: usize) -> usize {
+        payload_len
+    }
+}
+
+impl MessageDecrypter for KeyRejected {
+    fn decrypt<'a>(
+        &mut self,
+        _m: InboundOpaqueMessage<'a>,
+        _seq: u64,
+    ) -> Result<InboundPlainMessage<'a>, Error> {
+        Err(Error::Internal("AEAD key rejected by the provider"))
     }
 }
 

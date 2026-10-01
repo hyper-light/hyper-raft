@@ -289,8 +289,9 @@ mod connection {
         ///
         /// Useful if invariants encoded in `received_resumption_data()` cannot be respected.
         ///
-        /// Must be called while `is_handshaking` is true.
-        pub fn reject_early_data(&mut self) {
+        /// Must be called while `is_handshaking` is true; afterwards it is refused (upstream
+        /// panicked).
+        pub fn reject_early_data(&mut self) -> Result<(), Error> {
             self.inner.core.reject_early_data()
         }
 
@@ -389,17 +390,20 @@ mod connection {
             config: &mut Data::Config,
             plaintext: &[u8],
         ) -> Result<(), Error> {
-            let range = self.deframer_buffer.extend(plaintext);
+            let range = self.deframer_buffer.extend(plaintext)?;
 
+            let filled = self.deframer_buffer.filled();
             self.core.hs_deframer.input_message(
                 InboundPlainMessage {
                     typ: ContentType::Handshake,
                     version: ProtocolVersion::TLSv1_3,
-                    payload: &self.deframer_buffer.filled()[range.clone()],
+                    payload: filled
+                        .get(range.clone())
+                        .ok_or(Error::Internal("QUIC handshake data outside the deframer"))?,
                 },
-                &Locator::new(self.deframer_buffer.filled()),
+                &Locator::new(filled),
                 range.end,
-            );
+            )?;
 
             self.core
                 .hs_deframer
@@ -519,6 +523,10 @@ pub struct Secrets {
     quic: &'static dyn Algorithm,
     side: Side,
     version: Version,
+    /// Set once deriving a secret failed: every key derived from here on refuses its every use
+    /// ([`RefusedKey`]). HKDF-Expand-Label of a hash-length secret under a fixed label does not
+    /// fail; upstream unwrapped it.
+    refused: bool,
 }
 
 impl Secrets {
@@ -537,6 +545,7 @@ impl Secrets {
             quic,
             side,
             version,
+            refused: false,
         }
     }
 
@@ -548,22 +557,20 @@ impl Secrets {
     }
 
     pub(crate) fn update(&mut self) {
-        self.client = hkdf_expand_label_block(
-            self.suite
-                .hkdf_provider
-                .expander_for_okm(&self.client)
-                .as_ref(),
-            self.version.key_update_label(),
-            &[],
-        );
-        self.server = hkdf_expand_label_block(
-            self.suite
-                .hkdf_provider
-                .expander_for_okm(&self.server)
-                .as_ref(),
-            self.version.key_update_label(),
-            &[],
-        );
+        let next = |secret: &OkmBlock| {
+            hkdf_expand_label_block(
+                self.suite.hkdf_provider.expander_for_okm(secret).as_ref(),
+                self.version.key_update_label(),
+                &[],
+            )
+        };
+        match (next(&self.client), next(&self.server)) {
+            (Ok(client), Ok(server)) => {
+                self.client = client;
+                self.server = server;
+            }
+            _ => self.refused = true,
+        }
     }
 
     fn local_remote(&self) -> (&OkmBlock, &OkmBlock) {
@@ -594,6 +601,61 @@ impl DirectionalKeys {
             header: builder.header_protection_key(),
             packet: builder.packet_key(),
         }
+    }
+
+    fn refused() -> Self {
+        Self {
+            header: Box::new(RefusedKey),
+            packet: Box::new(RefusedKey),
+        }
+    }
+}
+
+/// The key in place of one whose derivation failed (see [`Secrets`]): every use is
+/// [`Error::Internal`].
+pub(crate) struct RefusedKey;
+
+impl RefusedKey {
+    /// The refusal's text.
+    const WHY: &'static str = "QUIC key derivation failed";
+}
+
+impl HeaderProtectionKey for RefusedKey {
+    fn encrypt_in_place(&self, _: &[u8], _: &mut u8, _: &mut [u8]) -> Result<(), Error> {
+        Err(Error::Internal(Self::WHY))
+    }
+
+    fn decrypt_in_place(&self, _: &[u8], _: &mut u8, _: &mut [u8]) -> Result<(), Error> {
+        Err(Error::Internal(Self::WHY))
+    }
+
+    fn sample_len(&self) -> usize {
+        // RFC 9001 §5.4.2: every header protection algorithm samples 16 bytes.
+        16
+    }
+}
+
+impl PacketKey for RefusedKey {
+    fn encrypt_in_place(&self, _: u64, _: &[u8], _: &mut [u8]) -> Result<Tag, Error> {
+        Err(Error::Internal(Self::WHY))
+    }
+
+    fn decrypt_in_place<'a>(&self, _: u64, _: &[u8], _: &'a mut [u8]) -> Result<&'a [u8], Error> {
+        Err(Error::Internal(Self::WHY))
+    }
+
+    fn tag_len(&self) -> usize {
+        // RFC 9001 §5.3: every AEAD QUIC uses has a 16-byte tag.
+        16
+    }
+
+    fn confidentiality_limit(&self) -> u64 {
+        // No limit: the key refuses before any would be reached.
+        u64::MAX
+    }
+
+    fn integrity_limit(&self) -> u64 {
+        u64::MAX
     }
 }
 
@@ -807,6 +869,12 @@ pub struct PacketKeySet {
 
 impl PacketKeySet {
     fn new(secrets: &Secrets) -> Self {
+        if secrets.refused {
+            return Self {
+                local: Box::new(RefusedKey),
+                remote: Box::new(RefusedKey),
+            };
+        }
         let (local, remote) = secrets.local_remote();
         let (version, alg, hkdf) = (secrets.version, secrets.quic, secrets.suite.hkdf_provider);
         Self {
@@ -848,7 +916,10 @@ impl<'a> KeyBuilder<'a> {
 
         let packet_iv =
             hkdf_expand_label(self.expander.as_ref(), self.version.packet_iv_label(), &[]);
-        self.alg.packet_key(packet_key, packet_iv)
+        match (packet_key, packet_iv) {
+            (Ok(packet_key), Ok(packet_iv)) => self.alg.packet_key(packet_key, packet_iv),
+            _ => Box::new(RefusedKey),
+        }
     }
 
     /// Derive header protection keys
@@ -859,7 +930,10 @@ impl<'a> KeyBuilder<'a> {
             self.version.header_key_label(),
             &[],
         );
-        self.alg.header_protection_key(header_key)
+        match header_key {
+            Ok(header_key) => self.alg.header_protection_key(header_key),
+            Err(_) => Box::new(RefusedKey),
+        }
     }
 }
 
@@ -902,25 +976,35 @@ impl Keys {
         client_dst_connection_id: &[u8],
         side: Side,
     ) -> Self {
+        /// The client's initial secret label (RFC 9001 §5.2).
         const CLIENT_LABEL: &[u8] = b"client in";
+        /// The server's initial secret label (RFC 9001 §5.2).
         const SERVER_LABEL: &[u8] = b"server in";
         let salt = version.initial_salt();
         let hs_secret = suite
             .hkdf_provider
             .extract_from_secret(Some(salt), client_dst_connection_id);
 
-        let secrets = Secrets {
-            version,
-            client: hkdf_expand_label_block(hs_secret.as_ref(), CLIENT_LABEL, &[]),
-            server: hkdf_expand_label_block(hs_secret.as_ref(), SERVER_LABEL, &[]),
-            suite,
-            quic,
-            side,
+        let (Ok(client), Ok(server)) = (
+            hkdf_expand_label_block(hs_secret.as_ref(), CLIENT_LABEL, &[]),
+            hkdf_expand_label_block(hs_secret.as_ref(), SERVER_LABEL, &[]),
+        ) else {
+            return Self {
+                local: DirectionalKeys::refused(),
+                remote: DirectionalKeys::refused(),
+            };
         };
+        let secrets = Secrets::new(client, server, suite, quic, side, version);
         Self::new(&secrets)
     }
 
     fn new(secrets: &Secrets) -> Self {
+        if secrets.refused {
+            return Self {
+                local: DirectionalKeys::refused(),
+                remote: DirectionalKeys::refused(),
+            };
+        }
         let (local, remote) = secrets.local_remote();
         Self {
             local: DirectionalKeys::new(secrets.suite, secrets.quic, local, secrets.version),

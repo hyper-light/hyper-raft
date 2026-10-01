@@ -26,12 +26,17 @@ impl Prf for PrfUsingHmac<'_> {
                 .as_ref(),
             label,
             seed,
-        );
-        Ok(())
+        )
     }
 
-    fn for_secret(&self, output: &mut [u8], secret: &[u8], label: &[u8], seed: &[u8]) {
-        prf(output, self.0.with_key(secret).as_ref(), label, seed);
+    fn for_secret(
+        &self,
+        output: &mut [u8],
+        secret: &[u8],
+        label: &[u8],
+        seed: &[u8],
+    ) -> Result<(), Error> {
+        prf(output, self.0.with_key(secret).as_ref(), label, seed)
     }
 }
 
@@ -61,8 +66,15 @@ pub trait Prf: Send + Sync {
 
     /// Computes `PRF(secret, label, seed)`, writing the result into `output`.
     ///
-    /// The caller guarantees that `secret`, `label`, and `seed` are non-empty.
-    fn for_secret(&self, output: &mut [u8], secret: &[u8], label: &[u8], seed: &[u8]);
+    /// The caller guarantees that `secret`, `label`, and `seed` are non-empty. An input the
+    /// implementation cannot use is an error (upstream's implementations panicked).
+    fn for_secret(
+        &self,
+        output: &mut [u8],
+        secret: &[u8],
+        label: &[u8],
+        seed: &[u8],
+    ) -> Result<(), Error>;
 
     /// Return `true` if this is backed by a FIPS-approved implementation.
     fn fips(&self) -> bool {
@@ -70,19 +82,32 @@ pub trait Prf: Send + Sync {
     }
 }
 
-pub(crate) fn prf(out: &mut [u8], hmac_key: &dyn hmac::Key, label: &[u8], seed: &[u8]) {
+pub(crate) fn prf(
+    out: &mut [u8],
+    hmac_key: &dyn hmac::Key,
+    label: &[u8],
+    seed: &[u8],
+) -> Result<(), Error> {
     // A(1)
     let mut current_a = hmac_key.sign(&[label, seed]);
 
     let chunk_size = hmac_key.tag_len();
+    if chunk_size == 0 {
+        return Err(Error::Internal("TLS 1.2 PRF over an HMAC with no output"));
+    }
     for chunk in out.chunks_mut(chunk_size) {
         // P_hash[i] = HMAC_hash(secret, A(i) + seed)
         let p_term = hmac_key.sign(&[current_a.as_ref(), label, seed]);
-        chunk.copy_from_slice(&p_term.as_ref()[..chunk.len()]);
+        let term = p_term
+            .as_ref()
+            .get(..chunk.len())
+            .ok_or(Error::Internal("HMAC tag shorter than its stated length"))?;
+        chunk.copy_from_slice(term);
 
         // A(i+1) = HMAC_hash(secret, A(i))
         current_a = hmac_key.sign(&[current_a.as_ref()]);
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -105,7 +130,8 @@ mod tests {
             &*hmac::HMAC_SHA256.with_key(secret),
             label,
             seed,
-        );
+        )
+        .unwrap();
         assert_eq!(expect.len(), output.len());
         assert_eq!(expect.to_vec(), output.to_vec());
     }
@@ -123,7 +149,8 @@ mod tests {
             &*hmac::HMAC_SHA512.with_key(secret),
             label,
             seed,
-        );
+        )
+        .unwrap();
         assert_eq!(expect.len(), output.len());
         assert_eq!(expect.to_vec(), output.to_vec());
     }
@@ -141,7 +168,8 @@ mod tests {
             &*hmac::HMAC_SHA384.with_key(secret),
             label,
             seed,
-        );
+        )
+        .unwrap();
         assert_eq!(expect.len(), output.len());
         assert_eq!(expect.to_vec(), output.to_vec());
     }

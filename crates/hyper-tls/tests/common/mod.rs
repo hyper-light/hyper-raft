@@ -13,7 +13,7 @@ pub fn server_config_builder(
     // ensure `ServerConfig::builder()` is covered, even though it is
     // equivalent to `builder_with_provider(provider::provider().into())`.
     if exactly_one_provider() {
-        hyper_tls::ServerConfig::builder()
+        hyper_tls::ServerConfig::builder().unwrap()
     } else {
         hyper_tls::ServerConfig::builder_with_provider(static_provider(provider.clone()))
             .with_safe_default_protocol_versions()
@@ -26,7 +26,7 @@ pub fn server_config_builder_with_versions(
     provider: &CryptoProvider,
 ) -> hyper_tls::ConfigBuilder<ServerConfig, hyper_tls::WantsVerifier> {
     if exactly_one_provider() {
-        hyper_tls::ServerConfig::builder_with_protocol_versions(versions)
+        hyper_tls::ServerConfig::builder_with_protocol_versions(versions).unwrap()
     } else {
         hyper_tls::ServerConfig::builder_with_provider(static_provider(provider.clone()))
             .with_protocol_versions(versions)
@@ -40,7 +40,7 @@ pub fn client_config_builder(
     // ensure `ClientConfig::builder()` is covered, even though it is
     // equivalent to `builder_with_provider(provider::provider().into())`.
     if exactly_one_provider() {
-        hyper_tls::ClientConfig::builder()
+        hyper_tls::ClientConfig::builder().unwrap()
     } else {
         hyper_tls::ClientConfig::builder_with_provider(static_provider(provider.clone()))
             .with_safe_default_protocol_versions()
@@ -53,7 +53,7 @@ pub fn client_config_builder_with_versions(
     provider: &CryptoProvider,
 ) -> hyper_tls::ConfigBuilder<ClientConfig, hyper_tls::WantsVerifier> {
     if exactly_one_provider() {
-        hyper_tls::ClientConfig::builder_with_protocol_versions(versions)
+        hyper_tls::ClientConfig::builder_with_protocol_versions(versions).unwrap()
     } else {
         hyper_tls::ClientConfig::builder_with_provider(static_provider(provider.clone()))
             .with_protocol_versions(versions)

@@ -288,8 +288,9 @@ impl ClientCertVerifier for NoClientAuth {
         false
     }
 
+    // Not consulted: `offer_client_auth` is false (upstream's `unimplemented!`).
     fn root_hint_subjects(&self) -> &[DistinguishedName] {
-        unimplemented!();
+        &[]
     }
 
     fn verify_client_cert(
@@ -298,7 +299,9 @@ impl ClientCertVerifier for NoClientAuth {
         _intermediates: &[CertificateDer<'_>],
         _now: UnixTime,
     ) -> Result<ClientCertVerified, Error> {
-        unimplemented!();
+        Err(Error::Internal(
+            "NoClientAuth asked to verify a client certificate",
+        ))
     }
 
     fn verify_tls12_signature(
@@ -307,7 +310,7 @@ impl ClientCertVerifier for NoClientAuth {
         _cert: &CertificateDer<'_>,
         _dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, Error> {
-        unimplemented!();
+        Err(Error::Internal("NoClientAuth asked to verify a signature"))
     }
 
     fn verify_tls13_signature(
@@ -316,11 +319,11 @@ impl ClientCertVerifier for NoClientAuth {
         _cert: &CertificateDer<'_>,
         _dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, Error> {
-        unimplemented!();
+        Err(Error::Internal("NoClientAuth asked to verify a signature"))
     }
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        unimplemented!();
+        Vec::new()
     }
 }
 

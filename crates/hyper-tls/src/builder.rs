@@ -33,10 +33,12 @@ use alloc::boxed::Box;
 /// # hyper_tls::crypto::aws_lc_rs::DEFAULT_PROVIDER.install_default();
 /// use hyper_tls::{ClientConfig, ServerConfig};
 /// ClientConfig::builder()
+///     .unwrap()
 /// //  ...
 /// # ;
 ///
 /// ServerConfig::builder()
+///     .unwrap()
 /// //  ...
 /// # ;
 /// ```
@@ -82,6 +84,7 @@ use alloc::boxed::Box;
 /// # use hyper_tls::ClientConfig;
 /// # let root_certs = hyper_tls::RootCertStore::empty();
 /// ClientConfig::builder()
+///     .unwrap()
 ///     .with_root_certificates(root_certs)
 ///     .with_no_client_auth();
 /// ```
@@ -107,6 +110,7 @@ use alloc::boxed::Box;
 /// #    pki_types::PrivatePkcs8KeyDer::from(vec![])
 /// # );
 /// ServerConfig::builder()
+///     .unwrap()
 ///     .with_no_client_auth()
 ///     .with_single_cert(certs, private_key)
 ///     .expect("bad certificate/key");

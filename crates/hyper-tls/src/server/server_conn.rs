@@ -495,7 +495,7 @@ impl ServerConfig {
     /// and safe protocol version defaults.
     ///
     /// For more information, see the [`ConfigBuilder`] documentation.
-    pub fn builder() -> ConfigBuilder<Self, WantsVerifier> {
+    pub fn builder() -> Result<ConfigBuilder<Self, WantsVerifier>, Error> {
         Self::builder_with_protocol_versions(versions::DEFAULT_VERSIONS)
     }
 
@@ -503,23 +503,16 @@ impl ServerConfig {
     /// [the process-default `CryptoProvider`][CryptoProvider#using-the-per-process-default-cryptoprovider]
     /// and the provided protocol versions.
     ///
-    /// Panics if
-    /// - the supported versions are not compatible with the provider (eg.
-    ///   the combination of ciphersuites supported by the provider and supported
-    ///   versions lead to zero cipher suites being usable),
-    /// - if a `CryptoProvider` cannot be resolved using a combination of
-    ///   the crate features and process default.
+    /// Fails if the supported versions are not compatible with the process-default provider
+    /// (eg. the combination of ciphersuites supported by the provider and supported versions
+    /// lead to zero cipher suites being usable). Upstream panicked.
     ///
     /// For more information, see the [`ConfigBuilder`] documentation.
     pub fn builder_with_protocol_versions(
         versions: &[&'static versions::SupportedProtocolVersion],
-    ) -> ConfigBuilder<Self, WantsVerifier> {
-        // Safety assumptions:
-        // 1. that the provider has been installed (explicitly or implicitly)
-        // 2. that the process-level default provider is usable with the supplied protocol versions.
+    ) -> Result<ConfigBuilder<Self, WantsVerifier>, Error> {
         Self::builder_with_provider(CryptoProvider::get_default_or_install_from_crate_features())
             .with_protocol_versions(versions)
-            .unwrap()
     }
 
     /// Create a builder for a server configuration with a specific [`CryptoProvider`].
@@ -727,17 +720,27 @@ mod connection {
         ///
         /// Integrity will be assured by rustls, but the data will be visible to the client. If secrecy
         /// from the client is desired, encrypt the data separately.
-        pub fn set_resumption_data(&mut self, data: &[u8]) {
-            assert!(data.len() < 2usize.pow(15));
+        ///
+        /// Data of 2^15 bytes or more is refused (upstream panicked).
+        pub fn set_resumption_data(&mut self, data: &[u8]) -> Result<(), Error> {
+            /// The bound this method documents: room for the rest of a ticket's contents.
+            const MAX_RESUMPTION_DATA: usize = 1 << 15;
+            if data.len() >= MAX_RESUMPTION_DATA {
+                return Err(Error::General(
+                    "resumption data must be less than 2^15 bytes".into(),
+                ));
+            }
             self.inner.core.data.resumption_data = data.into();
+            Ok(())
         }
 
         /// Explicitly discard early data, notifying the client
         ///
         /// Useful if invariants encoded in `received_resumption_data()` cannot be respected.
         ///
-        /// Must be called while `is_handshaking` is true.
-        pub fn reject_early_data(&mut self) {
+        /// Must be called while `is_handshaking` is true; afterwards it is refused (upstream
+        /// panicked).
+        pub fn reject_early_data(&mut self) -> Result<(), Error> {
             self.inner.core.reject_early_data()
         }
 
@@ -836,7 +839,7 @@ mod connection {
     ///     };
     ///
     ///     // For some user-defined choose_server_config:
-    ///     let mut config = choose_server_config(accepted.client_hello());
+    ///     let mut config = choose_server_config(accepted.client_hello().unwrap());
     ///     let conn = accepted
     ///         .into_connection(&mut config)
     ///         .unwrap();
@@ -876,8 +879,7 @@ mod connection {
         pub fn read_tls(&mut self, rd: &mut dyn io::Read) -> Result<usize, io::Error> {
             match &mut self.inner {
                 Some(conn) => conn.read_tls(rd),
-                None => Err(io::Error::new(
-                    io::ErrorKind::Other,
+                None => Err(io::Error::other(
                     "acceptor cannot read after successful acceptance",
                 )),
             }
@@ -1051,8 +1053,11 @@ pub struct Accepted {
 
 impl Accepted {
     /// Get the [`ClientHello`] for this connection.
-    pub fn client_hello(&self) -> ClientHello<'_> {
-        let payload = Self::client_hello_payload(&self.message);
+    ///
+    /// `None` is not returned: an `Accepted` is made only from a ClientHello. Upstream's
+    /// accessor reached `unreachable!` otherwise.
+    pub fn client_hello(&self) -> Option<ClientHello<'_>> {
+        let payload = Self::client_hello_payload(&self.message)?;
         let ch = ClientHello {
             server_name: &self.connection.core.data.sni,
             signature_schemes: &self.sig_schemes,
@@ -1065,7 +1070,7 @@ impl Accepted {
         };
 
         trace!("Accepted::client_hello(): {ch:#?}");
-        ch
+        Some(ch)
     }
 
     /// Convert the [`Accepted`] into a [`ServerConnection`].
@@ -1091,7 +1096,12 @@ impl Accepted {
         let state = hs::ExpectClientHello::new(config, ServerExtensionsInput::default());
         let mut cx = self.connection.context(config);
 
-        let ch = Self::client_hello_payload(&self.message);
+        let Some(ch) = Self::client_hello_payload(&self.message) else {
+            return Err((
+                Error::Internal("an accepted message that is not a ClientHello"),
+                AcceptedAlert::from(self.connection),
+            ));
+        };
         let new = match state.with_certified_key(self.sig_schemes, ch, &self.message, &mut cx) {
             Ok(new) => new,
             Err(err) => return Err((err, AcceptedAlert::from(self.connection))),
@@ -1103,13 +1113,15 @@ impl Accepted {
         })
     }
 
-    fn client_hello_payload<'a>(message: &'a Message<'_>) -> &'a ClientHelloPayload {
+    /// The ClientHello an `Accepted` was made from; `None` is not reached, since only a
+    /// ClientHello becomes an `Accepted` (upstream's `unreachable!`).
+    fn client_hello_payload<'a>(message: &'a Message<'_>) -> Option<&'a ClientHelloPayload> {
         match &message.payload {
             crate::msgs::message::MessagePayload::Handshake { parsed, .. } => match &parsed.0 {
-                crate::msgs::handshake::HandshakePayload::ClientHello(ch) => ch,
-                _ => unreachable!(),
+                crate::msgs::handshake::HandshakePayload::ClientHello(ch) => Some(ch),
+                _ => None,
             },
-            _ => unreachable!(),
+            _ => None,
         }
     }
 }
@@ -1197,12 +1209,15 @@ impl EarlyDataState {
             return false;
         };
 
-        if received.apply_limit(available) != available || available > *left {
+        let Some(still_left) = left.checked_sub(available) else {
+            return false;
+        };
+        if received.apply_limit(available) != available {
             return false;
         }
 
         received.append(bytes.into_vec());
-        *left -= available;
+        *left = still_left;
         true
     }
 }
@@ -1238,12 +1253,14 @@ impl ConnectionCore<ServerConnectionData> {
         ))
     }
 
-    pub(crate) fn reject_early_data(&mut self) {
-        assert!(
-            self.common_state.is_handshaking(),
-            "cannot retroactively reject early data"
-        );
+    pub(crate) fn reject_early_data(&mut self) -> Result<(), Error> {
+        if !self.common_state.is_handshaking() {
+            return Err(Error::General(
+                "cannot retroactively reject early data".into(),
+            ));
+        }
         self.data.early_data.reject();
+        Ok(())
     }
 
     pub(crate) fn get_sni_str(&self) -> Option<&str> {

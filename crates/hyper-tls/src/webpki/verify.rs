@@ -93,6 +93,7 @@ impl WebPkiSupportedAlgorithms {
         &self,
         scheme: SignatureScheme,
     ) -> Result<&[&'static dyn SignatureVerificationAlgorithm], Error> {
+        // (`first_algorithm` takes the first of these for TLS 1.3.)
         self.mapping
             .iter()
             .filter_map(|item| if item.0 == scheme { Some(item.1) } else { None })
@@ -196,7 +197,7 @@ pub fn verify_tls13_signature(
         return Err(PeerMisbehaved::SignedHandshakeWithUnadvertisedSigScheme.into());
     }
 
-    let alg = supported_schemes.convert_scheme(dss.scheme)?[0];
+    let alg = first_algorithm(supported_schemes, dss.scheme)?;
 
     let cert = webpki::EndEntityCert::try_from(cert).map_err(pki_error)?;
 
@@ -218,7 +219,7 @@ pub fn verify_tls13_signature_with_raw_key(
     }
 
     let raw_key = webpki::RawPublicKeyEntity::try_from(spki).map_err(pki_error)?;
-    let alg = supported_schemes.convert_scheme(dss.scheme)?[0];
+    let alg = first_algorithm(supported_schemes, dss.scheme)?;
 
     raw_key
         .verify_signature(alg, msg, dss.signature())
@@ -260,6 +261,19 @@ pub(crate) fn verify_server_cert_signed_by_trust_anchor_impl(
         Ok(_) => Ok(()),
         Err(e) => Err(pki_error(e)),
     }
+}
+
+/// The first verification algorithm `supported_schemes` maps `scheme` to. A scheme mapped to no
+/// algorithm is one this verifier did not advertise (upstream indexed the list).
+fn first_algorithm(
+    supported_schemes: &WebPkiSupportedAlgorithms,
+    scheme: SignatureScheme,
+) -> Result<&'static dyn SignatureVerificationAlgorithm, Error> {
+    supported_schemes
+        .convert_scheme(scheme)?
+        .first()
+        .copied()
+        .ok_or_else(|| PeerMisbehaved::SignedHandshakeWithUnadvertisedSigScheme.into())
 }
 
 #[cfg(test)]

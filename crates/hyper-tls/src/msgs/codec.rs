@@ -42,7 +42,8 @@ impl<'a> Reader<'a> {
     ///
     /// Moves the cursor to the end of the buffer length.
     pub fn rest(&mut self) -> &'a [u8] {
-        let rest = &self.buffer[self.cursor..];
+        // The cursor never passes the end (`take` refuses that), so nothing is lost here.
+        let rest = self.buffer.get(self.cursor..).unwrap_or_default();
         self.cursor = self.buffer.len();
         rest
     }
@@ -52,12 +53,10 @@ impl<'a> Reader<'a> {
     /// bytes remaining after the cursor to take the length
     /// then None is returned instead.
     pub fn take(&mut self, length: usize) -> Option<&'a [u8]> {
-        if self.left() < length {
-            return None;
-        }
-        let current = self.cursor;
-        self.cursor += length;
-        Some(&self.buffer[current..current + length])
+        let end = self.cursor.checked_add(length)?;
+        let taken = self.buffer.get(self.cursor..end)?;
+        self.cursor = end;
+        Some(taken)
     }
 
     /// Used to check whether the reader has any content left
@@ -82,8 +81,27 @@ impl<'a> Reader<'a> {
     /// Returns the number of bytes that are still able to be
     /// read (The number of remaining takes)
     pub fn left(&self) -> usize {
-        self.buffer.len() - self.cursor
+        self.buffer.get(self.cursor..).map_or(0, <[u8]>::len)
     }
+}
+
+/// The low-order byte of `len`, as `len as u8` takes it: the length field of an encoding whose
+/// own limits keep `len` within the field (a larger one is one the peer refuses to parse).
+pub(crate) fn low_u8(len: usize) -> u8 {
+    let [.., b0] = len.to_be_bytes();
+    b0
+}
+
+/// The low-order two bytes of `len`, as `len as u16` takes them (see [`low_u8`]).
+pub(crate) fn low_u16(len: usize) -> u16 {
+    let [.., b1, b0] = len.to_be_bytes();
+    u16::from_be_bytes([b1, b0])
+}
+
+/// The low-order three bytes of `len`, as `u24(len as u32)` takes them (see [`low_u8`]).
+pub(crate) fn low_u24(len: usize) -> u24 {
+    let [.., b2, b1, b0] = len.to_be_bytes();
+    u24(u32::from_be_bytes([0, b2, b1, b0]))
 }
 
 /// Trait for implementing encoding and decoding functionality
@@ -133,16 +151,9 @@ impl Codec<'_> for u8 {
     }
 }
 
-pub(crate) fn put_u16(v: u16, out: &mut [u8]) {
-    let out: &mut [u8; 2] = (&mut out[..2]).try_into().unwrap();
-    *out = u16::to_be_bytes(v);
-}
-
 impl Codec<'_> for u16 {
     fn encode(&self, bytes: &mut Vec<u8>) {
-        let mut b16 = [0u8; 2];
-        put_u16(*self, &mut b16);
-        bytes.extend_from_slice(&b16);
+        bytes.extend_from_slice(&self.to_be_bytes());
     }
 
     fn read(r: &mut Reader<'_>) -> Result<Self, InvalidMessage> {
@@ -168,8 +179,8 @@ impl From<u24> for usize {
 
 impl Codec<'_> for u24 {
     fn encode(&self, bytes: &mut Vec<u8>) {
-        let be_bytes = u32::to_be_bytes(self.0);
-        bytes.extend_from_slice(&be_bytes[1..]);
+        let [_, a, b, c] = u32::to_be_bytes(self.0);
+        bytes.extend_from_slice(&[a, b, c]);
     }
 
     fn read(r: &mut Reader<'_>) -> Result<Self, InvalidMessage> {
@@ -193,16 +204,9 @@ impl Codec<'_> for u32 {
     }
 }
 
-pub(crate) fn put_u64(v: u64, bytes: &mut [u8]) {
-    let bytes: &mut [u8; 8] = (&mut bytes[..8]).try_into().unwrap();
-    *bytes = u64::to_be_bytes(v);
-}
-
 impl Codec<'_> for u64 {
     fn encode(&self, bytes: &mut Vec<u8>) {
-        let mut b64 = [0u8; 8];
-        put_u64(*self, &mut b64);
-        bytes.extend_from_slice(&b64);
+        bytes.extend_from_slice(&self.to_be_bytes());
     }
 
     fn read(r: &mut Reader<'_>) -> Result<Self, InvalidMessage> {
@@ -281,6 +285,7 @@ impl Codec<'_> for () {
 /// As such, the `Codec` implementation for `Vec<T>` requires an implementation of this trait
 /// for its element type `T`.
 pub(crate) trait TlsListElement {
+    /// The list's length prefix and the bounds it enforces, as the RFC grammar for the list states.
     const SIZE_LEN: ListLength;
 }
 
@@ -353,30 +358,29 @@ impl<'a> LengthPrefixedBuffer<'a> {
 
 impl Drop for LengthPrefixedBuffer<'_> {
     /// Goes back and corrects the length previously inserted at the start of the structure.
+    ///
+    /// The field takes the low-order bytes of the body's length, as upstream's release build did
+    /// (its debug build asserted the length fit). A body longer than its field can express is one
+    /// the encoder's own limits never produce; were it, the peer would refuse the framing.
     fn drop(&mut self) {
-        match self.size_len {
-            ListLength::NonZeroU8 { .. } => {
-                let len = self.buf.len() - self.len_offset - 1;
-                debug_assert!(len <= 0xff);
-                self.buf[self.len_offset] = len as u8;
-            }
+        let Some(field_and_body) = self.buf.get_mut(self.len_offset..) else {
+            return;
+        };
+        let [.., b2, b1, b0] = field_and_body.len().to_be_bytes();
+        let field: &[u8] = match self.size_len {
+            ListLength::NonZeroU8 { .. } => &[b0.wrapping_sub(1)],
             ListLength::U16 | ListLength::NonZeroU16 { .. } => {
-                let len = self.buf.len() - self.len_offset - 2;
-                debug_assert!(len <= 0xffff);
-                let out: &mut [u8; 2] = (&mut self.buf[self.len_offset..self.len_offset + 2])
-                    .try_into()
-                    .unwrap();
-                *out = u16::to_be_bytes(len as u16);
+                &u16::from_be_bytes([b1, b0]).wrapping_sub(2).to_be_bytes()
             }
             ListLength::U24 { .. } => {
-                let len = self.buf.len() - self.len_offset - 3;
-                debug_assert!(len <= 0xff_ffff);
-                let len_bytes = u32::to_be_bytes(len as u32);
-                let out: &mut [u8; 3] = (&mut self.buf[self.len_offset..self.len_offset + 3])
-                    .try_into()
-                    .unwrap();
-                out.copy_from_slice(&len_bytes[1..]);
+                let [_, x2, x1, x0] = u32::from_be_bytes([0, b2, b1, b0])
+                    .wrapping_sub(3)
+                    .to_be_bytes();
+                &[x2, x1, x0]
             }
+        };
+        for (out, byte) in field_and_body.iter_mut().zip(field) {
+            *out = *byte;
         }
     }
 }

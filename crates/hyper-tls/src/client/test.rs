@@ -137,6 +137,94 @@ mod tests {
         );
     }
 
+    /// An ECH client offers TLS 1.3 only, but the cipher suites of its outer hello are every
+    /// suite usable over TCP, TLS 1.2's included. A server that answers with a
+    /// HelloRetryRequest selecting a TLS 1.2 suite reached upstream's `unreachable!` ("ECH state
+    /// should only be set when TLS 1.3 was negotiated"); it is now refused with an alert.
+    #[test]
+    fn test_ech_client_rejects_hrr_selecting_tls12_suite() {
+        use crate::client::{EchConfig, EchMode};
+        use crate::crypto::aws_lc_rs::hpke::ALL_SUPPORTED_SUITES;
+        use crate::msgs::codec::Codec;
+        use crate::msgs::handshake::{
+            EchConfigContents, EchConfigPayload, HpkeKeyConfig, HpkeSymmetricCipherSuite,
+        };
+        use pki_types::{DnsName, EchConfigListBytes};
+
+        let suite = ALL_SUPPORTED_SUITES[0];
+        let (public_key, _) = suite.generate_key_pair().unwrap();
+        let suite_id = suite.suite();
+        let config_payload = EchConfigPayload::V18(EchConfigContents {
+            key_config: HpkeKeyConfig {
+                config_id: 10,
+                kem_id: suite_id.kem,
+                public_key: PayloadU16::new(public_key.0.clone()),
+                symmetric_cipher_suites: vec![HpkeSymmetricCipherSuite {
+                    kdf_id: suite_id.sym.kdf_id,
+                    aead_id: suite_id.sym.aead_id,
+                }],
+            },
+            maximum_name_length: 0,
+            public_name: DnsName::try_from("example.com").unwrap(),
+            extensions: vec![],
+        });
+        let mut config_bytes = Vec::new();
+        vec![config_payload].encode(&mut config_bytes);
+        let ech_config = EchConfig::new(EchConfigListBytes::from(config_bytes), &[suite]).unwrap();
+
+        let mut config = ClientConfig::builder_with_provider(crate::crypto::static_provider(
+            super::provider::default_provider(),
+        ))
+        .with_ech(EchMode::Enable(ech_config))
+        .unwrap()
+        .with_root_certificates(roots())
+        .with_no_client_auth();
+        let mut conn =
+            ClientConnection::new(&mut config, ServerName::try_from("localhost").unwrap()).unwrap();
+        let mut sent = Vec::new();
+        conn.write_tls(&mut sent).unwrap();
+        let outer = OutboundOpaqueMessage::read(&mut Reader::init(&sent))
+            .unwrap()
+            .into_plain_message();
+        let Message {
+            payload:
+                MessagePayload::Handshake {
+                    parsed: HandshakeMessagePayload(HandshakePayload::ClientHello(ch)),
+                    ..
+                },
+            ..
+        } = Message::try_from(outer).unwrap()
+        else {
+            panic!("the client's first flight is not a ClientHello");
+        };
+        let tls12_suite = CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256;
+        assert!(ch.cipher_suites.contains(&tls12_suite));
+
+        // A well-formed HelloRetryRequest in every respect but its cipher suite.
+        let hrr = Message {
+            version: ProtocolVersion::TLSv1_3,
+            payload: MessagePayload::handshake(HandshakeMessagePayload(
+                HandshakePayload::HelloRetryRequest(HelloRetryRequest {
+                    cipher_suite: tls12_suite,
+                    legacy_version: ProtocolVersion::TLSv1_2,
+                    session_id: ch.session_id,
+                    extensions: HelloRetryRequestExtensions {
+                        cookie: Some(PayloadU16::new(vec![1, 2, 3, 4])),
+                        supported_versions: Some(ProtocolVersion::TLSv1_3),
+                        ..HelloRetryRequestExtensions::default()
+                    },
+                }),
+            )),
+        };
+
+        conn.read_tls(&mut hrr.into_wire_bytes().as_slice())
+            .unwrap();
+        assert_eq!(
+            conn.process_new_packets(&mut config).unwrap_err(),
+            PeerMisbehaved::SelectedUnusableCipherSuiteForVersion.into()
+        );
+    }
+
     #[test]
     fn test_client_rejects_no_extended_master_secret_extension_when_require_ems_or_fips() {
         let mut config = ClientConfig::builder_with_provider(crate::crypto::static_provider(
@@ -585,8 +673,8 @@ mod tests {
                 .expander_for_okm(&OkmBlock::new(secret));
 
             // Derive Encrypter
-            let key = derive_traffic_key(expander.as_ref(), cipher_suite.aead_alg);
-            let iv = derive_traffic_iv(expander.as_ref());
+            let key = derive_traffic_key(expander.as_ref(), cipher_suite.aead_alg).unwrap();
+            let iv = derive_traffic_iv(expander.as_ref()).unwrap();
             cipher_suite.aead_alg.encrypter(key, iv)
         }
     }

@@ -135,7 +135,7 @@ impl SigningKey for RsaSigningKey {
         ALL_RSA_SCHEMES
             .iter()
             .find(|scheme| offered.contains(scheme))
-            .map(|scheme| RsaSigner::new(&self.key, *scheme))
+            .and_then(|scheme| RsaSigner::new(&self.key, *scheme))
     }
 
     fn public_key(&self) -> Option<SubjectPublicKeyInfoDer<'_>> {
@@ -165,7 +165,8 @@ struct RsaSigner<'a> {
 }
 
 impl<'a> RsaSigner<'a> {
-    fn new(key: &'a RsaKeyPair, scheme: SignatureScheme) -> Box<dyn Signer + 'a> {
+    /// `None` for a scheme that is not RSA: `choose_scheme` offers only `ALL_RSA_SCHEMES`.
+    fn new(key: &'a RsaKeyPair, scheme: SignatureScheme) -> Option<Box<dyn Signer + 'a>> {
         let encoding: &dyn signature::RsaEncoding = match scheme {
             SignatureScheme::RSA_PKCS1_SHA256 => &signature::RSA_PKCS1_SHA256,
             SignatureScheme::RSA_PKCS1_SHA384 => &signature::RSA_PKCS1_SHA384,
@@ -173,14 +174,14 @@ impl<'a> RsaSigner<'a> {
             SignatureScheme::RSA_PSS_SHA256 => &signature::RSA_PSS_SHA256,
             SignatureScheme::RSA_PSS_SHA384 => &signature::RSA_PSS_SHA384,
             SignatureScheme::RSA_PSS_SHA512 => &signature::RSA_PSS_SHA512,
-            _ => unreachable!(),
+            _ => return None,
         };
 
-        Box::new(Self {
+        Some(Box::new(Self {
             key,
             scheme,
             encoding,
-        })
+        }))
     }
 }
 
@@ -268,7 +269,8 @@ impl SigningKey for EcdsaSigningKey {
             SignatureScheme::ECDSA_NISTP256_SHA256 => alg_id::ECDSA_P256,
             SignatureScheme::ECDSA_NISTP384_SHA384 => alg_id::ECDSA_P384,
             SignatureScheme::ECDSA_NISTP521_SHA512 => alg_id::ECDSA_P521,
-            _ => unreachable!(),
+            // An ECDSA key is made only for these three schemes.
+            _ => return None,
         };
 
         Some(public_key_to_spki(&id, self.key.public_key()))

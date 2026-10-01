@@ -124,7 +124,14 @@ impl ProducesTickets for Rfc5077Ticketer {
         //    the encrypted_state field (2 octets) and its contents (variable
         //    length)."
         let mut hmac_data =
-            Vec::with_capacity(self.key_name.len() + iv.len() + 2 + encrypted_state.len());
+            // A capacity hint: saturating only bounds an impossible request.
+            Vec::with_capacity(
+                self.key_name
+                    .len()
+                    .saturating_add(iv.len())
+                    .saturating_add(2)
+                    .saturating_add(encrypted_state.len()),
+            );
         hmac_data.extend(&self.key_name);
         hmac_data.extend(iv);
         hmac_data.extend(u16::try_from(encrypted_state.len()).ok()?.to_be_bytes());
@@ -138,8 +145,13 @@ impl ProducesTickets for Rfc5077Ticketer {
         //   iv: [u8; 16]
         //   encrypted_state: [u8, _]
         //   mac tag: [u8; 32]
-        let mut ciphertext =
-            Vec::with_capacity(self.key_name.len() + iv.len() + encrypted_state.len() + tag.len());
+        let mut ciphertext = Vec::with_capacity(
+            self.key_name
+                .len()
+                .saturating_add(iv.len())
+                .saturating_add(encrypted_state.len())
+                .saturating_add(tag.len()),
+        );
         ciphertext.extend(self.key_name);
         ciphertext.extend(iv);
         ciphertext.extend(encrypted_state);
@@ -169,8 +181,13 @@ impl ProducesTickets for Rfc5077Ticketer {
         let (enc_state, mac) = try_split_at(ciphertext, ciphertext.len().checked_sub(tag_len)?)?;
 
         // Reconstitute the HMAC data to verify the tag.
-        let mut hmac_data =
-            Vec::with_capacity(alleged_key_name.len() + iv.len() + 2 + enc_state.len());
+        let mut hmac_data = Vec::with_capacity(
+            alleged_key_name
+                .len()
+                .saturating_add(iv.len())
+                .saturating_add(2)
+                .saturating_add(enc_state.len()),
+        );
         hmac_data.extend(alleged_key_name);
         hmac_data.extend(iv);
         hmac_data.extend(u16::try_from(enc_state.len()).ok()?.to_be_bytes());

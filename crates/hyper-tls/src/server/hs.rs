@@ -249,17 +249,18 @@ impl ExtensionProcessing {
         extension_type: ExtensionType,
         cx: &mut ServerContext<'_>,
     ) -> Result<(), Error> {
-        debug_assert!(
-            extension_type == ExtensionType::ClientCertificateType
-                || extension_type == ExtensionType::ServerCertificateType
-        );
+        let field = match extension_type {
+            ExtensionType::ClientCertificateType => &mut self.extensions.client_certificate_type,
+            ExtensionType::ServerCertificateType => &mut self.extensions.server_certificate_type,
+            _ => return Err(Error::Internal("not a certificate type extension")),
+        };
         let raw_key_negotation_result = match (
             requires_raw_keys,
             client_supports.contains(&CertificateType::RawPublicKey),
             client_supports.contains(&CertificateType::X509),
         ) {
-            (true, true, _) => Ok((extension_type, CertificateType::RawPublicKey)),
-            (false, _, true) => Ok((extension_type, CertificateType::X509)),
+            (true, true, _) => Ok(CertificateType::RawPublicKey),
+            (false, _, true) => Ok(CertificateType::X509),
             (false, true, false) => Err(Error::PeerIncompatible(
                 PeerIncompatible::IncorrectCertificateTypeExtension,
             )),
@@ -270,20 +271,14 @@ impl ExtensionProcessing {
         };
 
         match raw_key_negotation_result {
-            Ok((ExtensionType::ClientCertificateType, cert_type)) => {
-                self.extensions.client_certificate_type = Some(cert_type);
+            Ok(cert_type) => {
+                *field = Some(cert_type);
+                Ok(())
             }
-            Ok((ExtensionType::ServerCertificateType, cert_type)) => {
-                self.extensions.server_certificate_type = Some(cert_type);
-            }
-            Err(err) => {
-                return Err(cx
-                    .common
-                    .send_fatal_alert(AlertDescription::HandshakeFailure, err));
-            }
-            Ok((_, _)) => unreachable!(),
+            Err(err) => Err(cx
+                .common
+                .send_fatal_alert(AlertDescription::HandshakeFailure, err)),
         }
-        Ok(())
     }
 }
 
@@ -594,8 +589,10 @@ impl ExpectClientHello {
             });
 
         if selected_version == ProtocolVersion::TLSv1_3 {
-            // This unwrap is structurally guaranteed by the early return for `!ffdhe_possible && !ecdhe_possible`
-            return Ok((*suite, *maybe_skxg.unwrap()));
+            // Structurally guaranteed by the early return for `!ffdhe_possible && !ecdhe_possible`;
+            // were it not, there is no group in common.
+            let skxg = maybe_skxg.ok_or(PeerIncompatible::NoKxGroupsInCommon)?;
+            return Ok((*suite, *skxg));
         }
 
         // For TLS1.2, the server can unilaterally choose a DHE group if it has one and
@@ -702,7 +699,9 @@ pub(super) fn process_client_hello<'m>(
     if let (Some(sni), false) = (&sni, done_retry) {
         // Save the SNI into the session.
         // The SNI hostname is immutable once set.
-        assert!(data.sni.is_none());
+        if data.sni.is_some() {
+            return Err(Error::Internal("SNI recorded before the first ClientHello"));
+        }
         data.sni = Some(sni.clone());
     } else if data.sni != sni {
         return Err(PeerMisbehaved::ServerNameDifferedOnRetry.into());

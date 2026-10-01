@@ -60,6 +60,9 @@ pub struct CommonState {
     pub(crate) refresh_traffic_keys_pending: bool,
     pub(crate) fips: bool,
     pub(crate) tls13_tickets_received: u32,
+    /// The first failure to encrypt an outgoing record. The send paths cannot return it, so it
+    /// is kept here and returned by the next call that processes input (upstream panicked).
+    encrypt_failure: Option<Error>,
 }
 
 impl CommonState {
@@ -92,6 +95,25 @@ impl CommonState {
             refresh_traffic_keys_pending: false,
             fips: false,
             tls13_tickets_received: 0,
+            encrypt_failure: None,
+        }
+    }
+
+    /// Returns the first failure to encrypt an outgoing record since the last call, if any.
+    pub(crate) fn take_encrypt_failure(&mut self) -> Result<(), Error> {
+        match self.encrypt_failure.take() {
+            Some(err) => Err(err),
+            None => Ok(()),
+        }
+    }
+
+    /// Encrypts `m` and queues it, or keeps the failure for [`Self::take_encrypt_failure`].
+    fn encrypt_and_queue(&mut self, m: OutboundPlainMessage<'_>) {
+        match self.record_layer.encrypt_outgoing(m) {
+            Ok(em) => self.queue_tls_message(em),
+            Err(err) => {
+                self.encrypt_failure.get_or_insert(err);
+            }
         }
     }
 
@@ -284,7 +306,7 @@ impl CommonState {
             payload,
         );
 
-        Ok(self.write_fragments(outgoing_tls, fragments))
+        self.write_fragments(outgoing_tls, fragments)
     }
 
     // Changing the keys must not span any fragmented handshake
@@ -337,8 +359,7 @@ impl CommonState {
     fn send_single_fragment(&mut self, m: OutboundPlainMessage<'_>) {
         if m.typ == ContentType::Alert {
             // Alerts are always sendable -- never quashed by a PreEncryptAction.
-            let em = self.record_layer.encrypt_outgoing(m);
-            self.queue_tls_message(em);
+            self.encrypt_and_queue(m);
             return;
         }
 
@@ -370,14 +391,10 @@ impl CommonState {
             }
         };
 
-        let em = self.record_layer.encrypt_outgoing(m);
-        self.queue_tls_message(em);
+        self.encrypt_and_queue(m);
     }
 
     fn send_plain_non_buffering(&mut self, payload: OutboundChunks<'_>, limit: Limit) -> usize {
-        debug_assert!(self.may_send_application_data);
-        debug_assert!(self.record_layer.is_encrypting());
-
         if payload.is_empty() {
             // Don't send empty fragments.
             return 0;
@@ -438,13 +455,7 @@ impl CommonState {
                 if let MessagePayload::Alert(alert) = m.payload {
                     self.quic.alert = Some(alert.description);
                 } else {
-                    debug_assert!(
-                        matches!(
-                            m.payload,
-                            MessagePayload::Handshake { .. } | MessagePayload::HandshakeFlight(_)
-                        ),
-                        "QUIC uses TLS for the cryptographic handshake only"
-                    );
+                    // QUIC uses TLS for the cryptographic handshake only.
                     let mut bytes = Vec::new();
                     m.payload.encode(&mut bytes);
                     self.quic.hs_queue.push_back((must_encrypt, bytes));
@@ -468,11 +479,16 @@ impl CommonState {
         self.received_plaintext.append(bytes.into_vec());
     }
 
-    pub(crate) fn start_encryption_tls12(&mut self, secrets: &ConnectionSecrets, side: Side) {
-        let (dec, enc) = secrets.make_cipher_pair(side);
+    pub(crate) fn start_encryption_tls12(
+        &mut self,
+        secrets: &ConnectionSecrets,
+        side: Side,
+    ) -> Result<(), Error> {
+        let (dec, enc) = secrets.make_cipher_pair(side)?;
         self.record_layer
             .prepare_message_encrypter(enc, secrets.suite().common.confidentiality_limit);
         self.record_layer.prepare_message_decrypter(dec);
+        Ok(())
     }
 
     pub(crate) fn missing_extension(&mut self, why: PeerMisbehaved) -> Error {
@@ -537,7 +553,6 @@ impl CommonState {
         desc: AlertDescription,
         err: impl Into<Error>,
     ) -> Error {
-        debug_assert!(!self.sent_fatal_alert);
         let m = Message::build_alert(AlertLevel::Fatal, desc);
         self.send_msg(m, self.record_layer.is_encrypting());
         self.sent_fatal_alert = true;
@@ -567,7 +582,7 @@ impl CommonState {
     ) -> Result<usize, EncryptError> {
         self.send_close_notify();
         self.check_required_size(outgoing_tls, [].into_iter())?;
-        Ok(self.write_fragments(outgoing_tls, [].into_iter()))
+        self.write_fragments(outgoing_tls, [].into_iter())
     }
 
     fn send_warning_alert_no_log(&mut self, desc: AlertDescription) {
@@ -582,8 +597,10 @@ impl CommonState {
     ) -> Result<(), EncryptError> {
         let mut required_size = self.sendable_tls.len();
 
+        // Saturating: a size past usize::MAX is still more than any buffer holds, which is all
+        // the comparison below asks.
         for m in fragments {
-            required_size += m.encoded_len(&self.record_layer);
+            required_size = required_size.saturating_add(m.encoded_len(&self.record_layer));
         }
 
         if required_size > outgoing_tls.len() {
@@ -599,26 +616,25 @@ impl CommonState {
         &mut self,
         outgoing_tls: &mut [u8],
         fragments: impl Iterator<Item = OutboundPlainMessage<'a>>,
-    ) -> usize {
+    ) -> Result<usize, EncryptError> {
         let mut written = 0;
 
         // Any pre-existing encrypted messages in `sendable_tls` must
         // be output before encrypting any of the `fragments`.
         while let Some(message) = self.sendable_tls.pop() {
-            let len = message.len();
-            outgoing_tls[written..written + len].copy_from_slice(&message);
-            written += len;
+            written = put_at(outgoing_tls, written, &message)?;
         }
 
         for m in fragments {
-            let em = self.record_layer.encrypt_outgoing(m).encode();
-
-            let len = em.len();
-            outgoing_tls[written..written + len].copy_from_slice(&em);
-            written += len;
+            let em = self
+                .record_layer
+                .encrypt_outgoing(m)
+                .map_err(|_| EncryptError::EncryptExhausted)?
+                .encode();
+            written = put_at(outgoing_tls, written, &em)?;
         }
 
-        written
+        Ok(written)
     }
 
     pub(crate) fn set_max_fragment_size(&mut self, new: Option<usize>) -> Result<(), Error> {
@@ -678,13 +694,14 @@ impl CommonState {
         }
     }
 
-    pub(crate) fn enqueue_key_update_notification(&mut self) {
+    pub(crate) fn enqueue_key_update_notification(&mut self) -> Result<(), Error> {
         let message = PlainMessage::from(Message::build_key_update_notify());
         self.queued_key_update_message = Some(
             self.record_layer
-                .encrypt_outgoing(message.borrow_outbound())
+                .encrypt_outgoing(message.borrow_outbound())?
                 .encode(),
         );
+        Ok(())
     }
 
     pub(crate) fn received_tls13_change_cipher_spec(&mut self) -> Result<(), Error> {
@@ -708,9 +725,6 @@ impl CommonState {
     }
 
     pub(crate) fn send_early_plaintext(&mut self, data: &[u8]) -> usize {
-        debug_assert!(self.early_traffic);
-        debug_assert!(self.record_layer.is_encrypting());
-
         if data.is_empty() {
             // Don't send empty fragments.
             return 0;
@@ -911,45 +925,49 @@ struct TemperCounters {
     allowed_middlebox_ccs: u8,
 }
 
+/// Copies `src` into `dst` at `at` and returns the offset after it. The caller has checked the
+/// room (`check_required_size`); a shortfall is the same refusal that check makes.
+fn put_at(dst: &mut [u8], at: usize, src: &[u8]) -> Result<usize, EncryptError> {
+    let end = at.saturating_add(src.len());
+    dst.get_mut(at..end)
+        .ok_or(EncryptError::InsufficientSize(InsufficientSizeError {
+            required_size: end,
+        }))?
+        .copy_from_slice(src);
+    Ok(end)
+}
+
 impl TemperCounters {
     fn received_warning_alert(&mut self) -> Result<(), Error> {
-        match self.allowed_warning_alerts {
-            0 => Err(PeerMisbehaved::TooManyWarningAlertsReceived.into()),
-            _ => {
-                self.allowed_warning_alerts -= 1;
-                Ok(())
-            }
-        }
+        self.allowed_warning_alerts = self
+            .allowed_warning_alerts
+            .checked_sub(1)
+            .ok_or(PeerMisbehaved::TooManyWarningAlertsReceived)?;
+        Ok(())
     }
 
     fn received_renegotiation_request(&mut self) -> Result<(), Error> {
-        match self.allowed_renegotiation_requests {
-            0 => Err(PeerMisbehaved::TooManyRenegotiationRequests.into()),
-            _ => {
-                self.allowed_renegotiation_requests -= 1;
-                Ok(())
-            }
-        }
+        self.allowed_renegotiation_requests = self
+            .allowed_renegotiation_requests
+            .checked_sub(1)
+            .ok_or(PeerMisbehaved::TooManyRenegotiationRequests)?;
+        Ok(())
     }
 
     fn received_key_update_request(&mut self) -> Result<(), Error> {
-        match self.allowed_key_update_requests {
-            0 => Err(PeerMisbehaved::TooManyKeyUpdateRequests.into()),
-            _ => {
-                self.allowed_key_update_requests -= 1;
-                Ok(())
-            }
-        }
+        self.allowed_key_update_requests = self
+            .allowed_key_update_requests
+            .checked_sub(1)
+            .ok_or(PeerMisbehaved::TooManyKeyUpdateRequests)?;
+        Ok(())
     }
 
     fn received_tls13_change_cipher_spec(&mut self) -> Result<(), Error> {
-        match self.allowed_middlebox_ccs {
-            0 => Err(PeerMisbehaved::IllegalMiddleboxChangeCipherSpec.into()),
-            _ => {
-                self.allowed_middlebox_ccs -= 1;
-                Ok(())
-            }
-        }
+        self.allowed_middlebox_ccs = self
+            .allowed_middlebox_ccs
+            .checked_sub(1)
+            .ok_or(PeerMisbehaved::IllegalMiddleboxChangeCipherSpec)?;
+        Ok(())
     }
 
     fn received_app_data(&mut self) {
@@ -958,6 +976,7 @@ impl TemperCounters {
 
     // cf. BoringSSL `kMaxKeyUpdates`
     // <https://github.com/google/boringssl/blob/dec5989b793c56ad4dd32173bd2d8595ca78b398/ssl/tls13_both.cc#L35-L38>
+    /// Key updates a peer may request: BoringSSL's `kMaxKeyUpdates`, cited above.
     const INITIAL_KEY_UPDATE_REQUESTS: u8 = 32;
 }
 
@@ -993,7 +1012,6 @@ pub(crate) enum KxState {
 
 impl KxState {
     pub(crate) fn complete(&mut self) {
-        debug_assert!(matches!(self, Self::Start(_)));
         if let Self::Start(group) = self {
             *self = Self::Complete(*group);
         }
@@ -1016,7 +1034,10 @@ impl<'a, const TLS13: bool> HandshakeFlight<'a, TLS13> {
     pub(crate) fn add(&mut self, hs: HandshakeMessagePayload<'_>) {
         let start_len = self.body.len();
         hs.encode(&mut self.body);
-        self.transcript.add(&self.body[start_len..]);
+        // The body only grows, so the bytes `hs` encoded to start at `start_len`.
+        if let Some(added) = self.body.get(start_len..) {
+            self.transcript.add(added);
+        }
     }
 
     pub(crate) fn finish(self, common: &mut CommonState) {
@@ -1036,5 +1057,9 @@ impl<'a, const TLS13: bool> HandshakeFlight<'a, TLS13> {
 pub(crate) type HandshakeFlightTls12<'a> = HandshakeFlight<'a, false>;
 pub(crate) type HandshakeFlightTls13<'a> = HandshakeFlight<'a, true>;
 
+/// The default bound on received plaintext not yet read: upstream's 16 KiB, one record
+/// (RFC 8446 §5.1); configurable (`set_buffer_limit`).
 const DEFAULT_RECEIVED_PLAINTEXT_LIMIT: usize = 16 * 1024;
+/// The default bound on buffered outgoing TLS: upstream's 64 KiB; configurable
+/// (`set_buffer_limit`).
 pub(crate) const DEFAULT_BUFFER_LIMIT: usize = 64 * 1024;

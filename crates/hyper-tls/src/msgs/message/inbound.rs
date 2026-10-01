@@ -40,17 +40,17 @@ impl<'a> InboundOpaqueMessage<'a> {
 
     /// Force conversion into a plaintext message.
     ///
-    /// `range` restricts the resulting message: this function panics if it is out of range for
-    /// the underlying message payload.
+    /// `range` restricts the resulting message: this function returns `None` if it is out of
+    /// range for the underlying message payload (upstream panicked).
     ///
     /// This should only be used for messages that are known to be in plaintext. Otherwise, the
     /// `InboundOpaqueMessage` should be decrypted into a `PlainMessage` using a `MessageDecrypter`.
-    pub fn into_plain_message_range(self, range: Range<usize>) -> InboundPlainMessage<'a> {
-        InboundPlainMessage {
+    pub fn into_plain_message_range(self, range: Range<usize>) -> Option<InboundPlainMessage<'a>> {
+        Some(InboundPlainMessage {
             typ: self.typ,
             version: self.version,
-            payload: &self.payload.into_inner()[range],
-        }
+            payload: self.payload.into_inner().get(range)?,
+        })
     }
 
     /// For TLS1.3 (only), checks the length msg.payload is valid and removes the padding.
@@ -108,13 +108,9 @@ impl<'a> BorrowedPayload<'a> {
     }
 
     pub(crate) fn pop(&mut self) -> Option<u8> {
-        if self.is_empty() {
-            return None;
-        }
-
-        let len = self.len();
-        let last = self[len - 1];
-        self.truncate(len - 1);
+        let (&last, rest) = self.split_last()?;
+        let rest = rest.len();
+        self.truncate(rest);
         Some(last)
     }
 }

@@ -262,13 +262,13 @@ mod client_hello {
                 self.randoms,
                 self.suite,
                 &resumedata.master_secret.0,
-            );
+            )?;
             cx.stores.key_log.log(
                 "CLIENT_RANDOM",
                 &secrets.randoms.client,
                 &secrets.master_secret,
             );
-            cx.common.start_encryption_tls12(&secrets, Side::Server);
+            cx.common.start_encryption_tls12(&secrets, Side::Server)?;
             cx.common.peer_certificates = resumedata.client_cert_chain;
             cx.common.handshake_kind = Some(HandshakeKind::Resumed);
 
@@ -279,7 +279,7 @@ mod client_hello {
             }
             emit_ccs(cx.common);
             cx.common.record_layer.start_encrypting();
-            emit_finished(&secrets, &mut self.transcript, cx.common);
+            emit_finished(&secrets, &mut self.transcript, cx.common)?;
 
             Ok(Box::new(ExpectCcs {
                 secrets,
@@ -345,7 +345,7 @@ mod client_hello {
         randoms: &ConnectionRandoms,
     ) -> Result<Box<dyn ActiveKeyExchange>, Error> {
         let kx = selected_group.start()?;
-        let kx_params = ServerKeyExchangeParams::new(&*kx);
+        let kx_params = ServerKeyExchangeParams::new(&*kx)?;
 
         let mut msg = Vec::new();
         msg.extend(randoms.client);
@@ -532,7 +532,7 @@ impl State<ServerConnectionData> for ExpectClientKx<'_> {
             &secrets.randoms.client,
             &secrets.master_secret,
         );
-        cx.common.start_encryption_tls12(&secrets, Side::Server);
+        cx.common.start_encryption_tls12(&secrets, Side::Server)?;
 
         match self.client_cert {
             Some(client_cert) => Ok(Box::new(ExpectCertificateVerify {
@@ -597,9 +597,11 @@ impl State<ServerConnectionData> for ExpectCertificateVerify<'_> {
             match self.transcript.take_handshake_buf() {
                 Some(msgs) => {
                     let certs = &self.client_cert;
-                    cx.config
-                        .verifier
-                        .verify_tls12_signature(&msgs, &certs[0], sig)
+                    cx.config.verifier.verify_tls12_signature(
+                        &msgs,
+                        certs.first().ok_or(Error::NoCertificatesPresented)?,
+                        sig,
+                    )
                 }
                 None => {
                     // This should be unreachable; the handshake buffer was initialized with
@@ -764,9 +766,9 @@ fn emit_finished(
     secrets: &ConnectionSecrets,
     transcript: &mut HandshakeHash,
     common: &mut CommonState,
-) {
+) -> Result<(), Error> {
     let vh = transcript.current_hash();
-    let verify_data = secrets.server_verify_data(&vh);
+    let verify_data = secrets.server_verify_data(&vh)?;
     let verify_data_payload = Payload::new(verify_data);
 
     let f = Message {
@@ -778,6 +780,7 @@ fn emit_finished(
 
     transcript.add_message(&f);
     common.send_msg(f, true);
+    Ok(())
 }
 
 struct ExpectFinished {
@@ -804,7 +807,7 @@ impl State<ServerConnectionData> for ExpectFinished {
         cx.common.check_aligned_handshake()?;
 
         let vh = self.transcript.current_hash();
-        let expect_verify_data = self.secrets.client_verify_data(&vh);
+        let expect_verify_data = self.secrets.client_verify_data(&vh)?;
 
         let _fin_verified =
             match ConstantTimeEq::ct_eq(&expect_verify_data[..], finished.bytes()).into() {
@@ -842,7 +845,7 @@ impl State<ServerConnectionData> for ExpectFinished {
             }
             emit_ccs(cx.common);
             cx.common.record_layer.start_encrypting();
-            emit_finished(&self.secrets, &mut self.transcript, cx.common);
+            emit_finished(&self.secrets, &mut self.transcript, cx.common)?;
         }
 
         cx.common.start_traffic(&mut cx.sendable_plaintext);
@@ -892,8 +895,7 @@ impl State<ServerConnectionData> for ExpectTraffic {
         label: &[u8],
         context: Option<&[u8]>,
     ) -> Result<(), Error> {
-        self.secrets.export_keying_material(output, label, context);
-        Ok(())
+        self.secrets.export_keying_material(output, label, context)
     }
 
     fn extract_secrets(&self) -> Result<PartiallyExtractedSecrets, Error> {
@@ -921,8 +923,8 @@ impl KernelState for ExpectTraffic {
         _cx: &mut KernelContext<'_>,
         _message: NewSessionTicketPayloadTls13,
     ) -> Result<(), Error> {
-        unreachable!(
-            "server connections should never have handle_new_session_ticket called on them"
-        )
+        Err(Error::Internal(
+            "server connections should never have handle_new_session_ticket called on them",
+        ))
     }
 }

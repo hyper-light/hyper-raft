@@ -14,12 +14,13 @@ use crate::enums::{
     CertificateCompressionAlgorithm, CertificateType, CipherSuite, EchClientHelloType,
     HandshakeType, ProtocolVersion, SignatureScheme,
 };
-use crate::error::InvalidMessage;
+use crate::error::{Error, InvalidMessage};
 use crate::ffdhe_groups::FfdheGroup;
 use crate::log::warn;
 use crate::msgs::base::{MaybeEmpty, NonEmpty, Payload, PayloadU16, PayloadU24, PayloadU8};
 use crate::msgs::codec::{
-    self, Codec, LengthPrefixedBuffer, ListLength, Reader, TlsListElement, TlsListIter,
+    self, low_u16, low_u8, Codec, LengthPrefixedBuffer, ListLength, Reader, TlsListElement,
+    TlsListIter,
 };
 use crate::msgs::enums::{
     CertificateStatusType, ClientCertificateType, Compression, ECCurveType, ECPointFormat,
@@ -120,7 +121,7 @@ pub(crate) struct SessionId {
 
 impl fmt::Debug for SessionId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        super::base::hex(f, &self.data[..self.len])
+        super::base::hex(f, self.as_ref())
     }
 }
 
@@ -131,8 +132,8 @@ impl PartialEq for SessionId {
         }
 
         let mut diff = 0u8;
-        for i in 0..self.len {
-            diff |= self.data[i] ^ other.data[i];
+        for (a, b) in self.as_ref().iter().zip(other.as_ref()) {
+            diff |= a ^ b;
         }
 
         diff == 0u8
@@ -141,9 +142,9 @@ impl PartialEq for SessionId {
 
 impl Codec<'_> for SessionId {
     fn encode(&self, bytes: &mut Vec<u8>) {
-        debug_assert!(self.len <= 32);
-        bytes.push(self.len as u8);
-        bytes.extend_from_slice(self.as_ref());
+        let id = self.as_ref();
+        low_u8(id.len()).encode(bytes);
+        bytes.extend_from_slice(id);
     }
 
     fn read(r: &mut Reader<'_>) -> Result<Self, InvalidMessage> {
@@ -157,7 +158,7 @@ impl Codec<'_> for SessionId {
         };
 
         let mut out = [0u8; 32];
-        out[..len].clone_from_slice(&bytes[..len]);
+        let len = crate::crypto::tls13::copy_prefix(&mut out, bytes);
         Ok(Self { data: out, len })
     }
 }
@@ -183,7 +184,8 @@ impl SessionId {
 
 impl AsRef<[u8]> for SessionId {
     fn as_ref(&self) -> &[u8] {
-        &self.data[..self.len]
+        // Every constructor keeps `len` within the 32-byte array.
+        crate::crypto::tls13::prefix(&self.data, self.len)
     }
 }
 
@@ -239,6 +241,7 @@ impl Default for SupportedEcPointFormats {
 
 /// RFC8422: `ECPointFormat ec_point_format_list<1..2^8-1>`
 impl TlsListElement for ECPointFormat {
+    /// The list's length prefix, per the grammar on this impl.
     const SIZE_LEN: ListLength = ListLength::NonZeroU8 {
         empty_error: InvalidMessage::IllegalEmptyList("ECPointFormats"),
     };
@@ -246,6 +249,7 @@ impl TlsListElement for ECPointFormat {
 
 /// RFC8422: `NamedCurve named_curve_list<2..2^16-1>`
 impl TlsListElement for NamedGroup {
+    /// The list's length prefix, per the grammar on this impl.
     const SIZE_LEN: ListLength = ListLength::NonZeroU16 {
         empty_error: InvalidMessage::IllegalEmptyList("NamedGroups"),
     };
@@ -253,6 +257,7 @@ impl TlsListElement for NamedGroup {
 
 /// RFC8446: `SignatureScheme supported_signature_algorithms<2..2^16-2>;`
 impl TlsListElement for SignatureScheme {
+    /// The list's length prefix, per the grammar on this impl.
     const SIZE_LEN: ListLength = ListLength::NonZeroU16 {
         empty_error: InvalidMessage::NoSignatureSchemes,
     };
@@ -302,7 +307,7 @@ impl<'a> Codec<'a> for ServerNamePayload<'a> {
 
         ServerNameType::HostName.encode(server_name_list.buf);
         let name_slice = dns_name.as_ref().as_bytes();
-        (name_slice.len() as u16).encode(server_name_list.buf);
+        low_u16(name_slice.len()).encode(server_name_list.buf);
         server_name_list.buf.extend_from_slice(name_slice);
     }
 
@@ -405,6 +410,7 @@ impl Deref for ProtocolName {
 
 /// RFC7301: `ProtocolName protocol_name_list<2..2^16-1>`
 impl TlsListElement for ProtocolName {
+    /// The list's length prefix, per the grammar on this impl.
     const SIZE_LEN: ListLength = ListLength::NonZeroU16 {
         empty_error: InvalidMessage::IllegalEmptyList("ProtocolNames"),
     };
@@ -419,6 +425,7 @@ impl SingleProtocolName {
         Self(single)
     }
 
+    /// RFC 7301 §3.1: `ProtocolName protocol_name_list<2..2^16-1>`.
     const SIZE_LEN: ListLength = ListLength::NonZeroU16 {
         empty_error: InvalidMessage::IllegalEmptyList("ProtocolNames"),
     };
@@ -514,6 +521,7 @@ impl Codec<'_> for PresharedKeyIdentity {
 
 /// RFC8446: `PskIdentity identities<7..2^16-1>;`
 impl TlsListElement for PresharedKeyIdentity {
+    /// The list's length prefix, per the grammar on this impl.
     const SIZE_LEN: ListLength = ListLength::NonZeroU16 {
         empty_error: InvalidMessage::IllegalEmptyList("PskIdentities"),
     };
@@ -526,6 +534,7 @@ wrapped_payload!(
 
 /// RFC8446: `PskBinderEntry binders<33..2^16-1>;`
 impl TlsListElement for PresharedKeyBinder {
+    /// The list's length prefix, per the grammar on this impl.
     const SIZE_LEN: ListLength = ListLength::NonZeroU16 {
         empty_error: InvalidMessage::IllegalEmptyList("PskBinders"),
     };
@@ -566,6 +575,7 @@ wrapped_payload!(pub(crate) struct ResponderId, PayloadU16,);
 
 /// RFC6066: `ResponderID responder_id_list<0..2^16-1>;`
 impl TlsListElement for ResponderId {
+    /// The list's length prefix, per the grammar on this impl.
     const SIZE_LEN: ListLength = ListLength::U16;
 }
 
@@ -670,6 +680,7 @@ impl Codec<'_> for PskKeyExchangeModes {
 }
 
 impl TlsListElement for PskKeyExchangeMode {
+    /// RFC 8446 §4.2.9: `PskKeyExchangeMode ke_modes<1..255>`.
     const SIZE_LEN: ListLength = ListLength::NonZeroU8 {
         empty_error: InvalidMessage::IllegalEmptyList("PskKeyExchangeModes"),
     };
@@ -677,6 +688,7 @@ impl TlsListElement for PskKeyExchangeMode {
 
 /// RFC8446: `KeyShareEntry client_shares<0..2^16-1>;`
 impl TlsListElement for KeyShareEntry {
+    /// The list's length prefix, per the grammar on this impl.
     const SIZE_LEN: ListLength = ListLength::U16;
 }
 
@@ -705,6 +717,7 @@ impl SupportedProtocolVersions {
         false
     }
 
+    /// RFC 8446 §4.2.1: `ProtocolVersion versions<2..254>`.
     const LIST_LENGTH: ListLength = ListLength::NonZeroU8 {
         empty_error: InvalidMessage::IllegalEmptyList("ProtocolVersions"),
     };
@@ -738,6 +751,7 @@ impl Codec<'_> for SupportedProtocolVersions {
 }
 
 impl TlsListElement for ProtocolVersion {
+    /// RFC 8446 §4.2.1: `ProtocolVersion versions<2..254>`.
     const SIZE_LEN: ListLength = ListLength::NonZeroU8 {
         empty_error: InvalidMessage::IllegalEmptyList("ProtocolVersions"),
     };
@@ -747,6 +761,7 @@ impl TlsListElement for ProtocolVersion {
 ///
 /// Ditto `CertificateType server_certificate_types<1..2^8-1>;`
 impl TlsListElement for CertificateType {
+    /// The list's length prefix, per the grammar on this impl.
     const SIZE_LEN: ListLength = ListLength::NonZeroU8 {
         empty_error: InvalidMessage::IllegalEmptyList("CertificateTypes"),
     };
@@ -754,6 +769,7 @@ impl TlsListElement for CertificateType {
 
 /// RFC8879: `CertificateCompressionAlgorithm algorithms<2..2^8-2>;`
 impl TlsListElement for CertificateCompressionAlgorithm {
+    /// The list's length prefix, per the grammar on this impl.
     const SIZE_LEN: ListLength = ListLength::NonZeroU8 {
         empty_error: InvalidMessage::IllegalEmptyList("CertificateCompressionAlgorithms"),
     };
@@ -1130,11 +1146,14 @@ fn trim_hostname_trailing_dot_for_sni(dns_name: &DnsName<'_>) -> DnsName<'static
 
     // RFC6066: "The hostname is represented as a byte string using
     // ASCII encoding without a trailing dot"
-    if dns_name_str.ends_with('.') {
-        let trimmed = &dns_name_str[0..dns_name_str.len() - 1];
-        DnsName::try_from(trimmed).unwrap().to_owned()
-    } else {
-        dns_name.to_owned()
+    // A name that is only a dot has nothing left to send once trimmed, so it is sent as given;
+    // upstream unwrapped the trimmed name's validation.
+    match dns_name_str
+        .strip_suffix('.')
+        .and_then(|trimmed| DnsName::try_from(trimmed).ok())
+    {
+        Some(trimmed) => trimmed.to_owned(),
+        None => dns_name.to_owned(),
     }
 }
 
@@ -1416,6 +1435,7 @@ impl DerefMut for ClientHelloPayload {
 
 /// RFC8446: `CipherSuite cipher_suites<2..2^16-2>;`
 impl TlsListElement for CipherSuite {
+    /// The list's length prefix, per the grammar on this impl.
     const SIZE_LEN: ListLength = ListLength::NonZeroU16 {
         empty_error: InvalidMessage::IllegalEmptyList("CipherSuites"),
     };
@@ -1423,6 +1443,7 @@ impl TlsListElement for CipherSuite {
 
 /// RFC5246: `CompressionMethod compression_methods<1..2^8-1>;`
 impl TlsListElement for Compression {
+    /// The list's length prefix, per the grammar on this impl.
     const SIZE_LEN: ListLength = ListLength::NonZeroU8 {
         empty_error: InvalidMessage::IllegalEmptyList("Compressions"),
     };
@@ -1430,6 +1451,7 @@ impl TlsListElement for Compression {
 
 /// draft-ietf-tls-esni-17: `ExtensionType OuterExtensions<2..254>;`
 impl TlsListElement for ExtensionType {
+    /// The list's length prefix, per the grammar on this impl.
     const SIZE_LEN: ListLength = ListLength::NonZeroU8 {
         empty_error: InvalidMessage::IllegalEmptyList("ExtensionTypes"),
     };
@@ -1625,12 +1647,9 @@ impl Codec<'_> for ServerHelloPayload {
 }
 
 impl ServerHelloPayload {
-    fn payload_encode(&self, bytes: &mut Vec<u8>, encoding: Encoding) {
-        debug_assert!(
-            !matches!(encoding, Encoding::EchConfirmation),
-            "we cannot compute an ECH confirmation on a received ServerHello"
-        );
-
+    // An ECH confirmation is never computed on a received ServerHello: it is computed on the
+    // received encoding (`EchState::server_hello_conf`), which upstream asserted in debug builds.
+    fn payload_encode(&self, bytes: &mut Vec<u8>, _encoding: Encoding) {
         self.legacy_version.encode(bytes);
         self.random.encode(bytes);
         self.session_id.encode(bytes);
@@ -1681,6 +1700,7 @@ impl<'a> Deref for CertificateChain<'a> {
 }
 
 impl TlsListElement for CertificateDer<'_> {
+    /// RFC 5246 §7.4.2: `ASN.1Cert certificate_list<0..2^24-1>`, bounded below that.
     const SIZE_LEN: ListLength = ListLength::U24 {
         max: CERTIFICATE_MAX_SIZE_LIMIT,
         error: InvalidMessage::CertificatePayloadTooLarge,
@@ -1771,6 +1791,7 @@ impl<'a> CertificateEntry<'a> {
 }
 
 impl TlsListElement for CertificateEntry<'_> {
+    /// RFC 8446 §4.4.2: `CertificateEntry certificate_list<0..2^24-1>`, bounded below that.
     const SIZE_LEN: ListLength = ListLength::U24 {
         max: CERTIFICATE_MAX_SIZE_LIMIT,
         error: InvalidMessage::CertificatePayloadTooLarge,
@@ -2017,16 +2038,18 @@ pub(crate) struct ServerDhParams {
 }
 
 impl ServerDhParams {
-    pub(crate) fn new(kx: &dyn ActiveKeyExchange) -> Self {
+    pub(crate) fn new(kx: &dyn ActiveKeyExchange) -> Result<Self, Error> {
         let Some(params) = kx.ffdhe_group() else {
-            panic!("invalid NamedGroup for DHE key exchange: {:?}", kx.group());
+            return Err(Error::Internal(
+                "a DHE key exchange group without FFDHE parameters",
+            ));
         };
 
-        Self {
+        Ok(Self {
             dh_p: PayloadU16::new(params.p.to_vec()),
             dh_g: PayloadU16::new(params.g.to_vec()),
             dh_Ys: PayloadU16::new(kx.pub_key().to_vec()),
-        }
+        })
     }
 
     pub(crate) fn as_ffdhe_group(&self) -> FfdheGroup<'_> {
@@ -2058,11 +2081,11 @@ pub(crate) enum ServerKeyExchangeParams {
 }
 
 impl ServerKeyExchangeParams {
-    pub(crate) fn new(kx: &dyn ActiveKeyExchange) -> Self {
-        match kx.group().key_exchange_algorithm() {
-            KeyExchangeAlgorithm::DHE => Self::Dh(ServerDhParams::new(kx)),
+    pub(crate) fn new(kx: &dyn ActiveKeyExchange) -> Result<Self, Error> {
+        Ok(match kx.group().key_exchange_algorithm() {
+            KeyExchangeAlgorithm::DHE => Self::Dh(ServerDhParams::new(kx)?),
             KeyExchangeAlgorithm::ECDHE => Self::Ecdh(ServerEcdhParams::new(kx)),
-        }
+        })
     }
 
     pub(crate) fn pub_key(&self) -> &[u8] {
@@ -2151,6 +2174,7 @@ impl ServerKeyExchangePayload {
 
 /// RFC5246: `ClientCertificateType certificate_types<1..2^8-1>;`
 impl TlsListElement for ClientCertificateType {
+    /// The list's length prefix, per the grammar on this impl.
     const SIZE_LEN: ListLength = ListLength::NonZeroU8 {
         empty_error: InvalidMessage::IllegalEmptyList("ClientCertificateTypes"),
     };
@@ -2192,6 +2216,7 @@ impl DistinguishedName {
 /// RFC8446: `DistinguishedName authorities<3..2^16-1>;` however,
 /// RFC5246: `DistinguishedName certificate_authorities<0..2^16-1>;`
 impl TlsListElement for DistinguishedName {
+    /// The list's length prefix, per the grammar on this impl.
     const SIZE_LEN: ListLength = ListLength::U16;
 }
 
@@ -2808,6 +2833,7 @@ impl Codec<'_> for HpkeSymmetricCipherSuite {
 
 /// draft-ietf-tls-esni-24: `HpkeSymmetricCipherSuite cipher_suites<4..2^16-4>;`
 impl TlsListElement for HpkeSymmetricCipherSuite {
+    /// The list's length prefix, per the grammar on this impl.
     const SIZE_LEN: ListLength = ListLength::NonZeroU16 {
         empty_error: InvalidMessage::IllegalEmptyList("HpkeSymmetricCipherSuites"),
     };
@@ -2903,6 +2929,7 @@ pub enum EchConfigPayload {
 }
 
 impl TlsListElement for EchConfigPayload {
+    /// draft-ietf-tls-esni §4: `ECHConfig ECHConfigList<4..2^16-1>`.
     const SIZE_LEN: ListLength = ListLength::U16;
 }
 
@@ -2980,6 +3007,7 @@ impl Codec<'_> for EchConfigExtension {
 }
 
 impl TlsListElement for EchConfigExtension {
+    /// draft-ietf-tls-esni §4: `ECHConfigExtension extensions<0..2^16-1>`.
     const SIZE_LEN: ListLength = ListLength::U16;
 }
 

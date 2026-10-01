@@ -191,7 +191,8 @@ mod feat_brotli {
             brotli::BrotliDecompress(&mut in_cursor, &mut out_cursor)
                 .map_err(|_| DecompressionFailed)?;
 
-            if out_cursor.position() as usize != out_cursor.into_inner().len() {
+            let filled = usize::try_from(out_cursor.position()).ok();
+            if filled != Some(out_cursor.into_inner().len()) {
                 return Err(DecompressionFailed);
             }
 
@@ -318,7 +319,8 @@ impl CompressionCache {
     ) -> Result<Compression<'static>, CompressionFailed> {
         let algorithm = compressor.algorithm();
         let encoding = original.get_encoding();
-        let uncompressed_len = encoding.len() as u32;
+        // CompressedCertificate's uncompressed_length is a uint24 (RFC 8879 §4).
+        let uncompressed_len = u32::try_from(encoding.len()).map_err(|_| CompressionFailed)?;
         let compressed = compressor.compress(encoding, CompressionLevel::Interactive)?;
 
         // this `CompressionCacheEntry` in fact never makes it into the cache, so
@@ -366,7 +368,7 @@ impl CompressionCacheInner {
         }
 
         // do compression:
-        let uncompressed_len = encoding.len() as u32;
+        let uncompressed_len = u32::try_from(encoding.len()).map_err(|_| CompressionFailed)?;
         let compressed = compressor.compress(encoding.clone(), CompressionLevel::Amortized)?;
         let new_entry = CompressionCacheEntry {
             algorithm,

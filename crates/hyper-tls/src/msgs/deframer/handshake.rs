@@ -3,8 +3,8 @@ use core::mem;
 use core::ops::Range;
 
 use super::buffers::{BufferProgress, Coalescer, Delocator, Locator};
-use crate::error::InvalidMessage;
-use crate::msgs::codec::{u24, Codec};
+use crate::error::{Error, InvalidMessage};
+use crate::msgs::codec::u24;
 use crate::msgs::message::InboundPlainMessage;
 use crate::{ContentType, ProtocolVersion};
 
@@ -38,11 +38,9 @@ impl HandshakeDeframer {
         msg: InboundPlainMessage<'_>,
         containing_buffer: &Locator,
         outer_discard: usize,
-    ) {
-        debug_assert_eq!(msg.typ, ContentType::Handshake);
-        debug_assert!(containing_buffer.fully_contains(msg.payload));
-        debug_assert!(self.outer_discard <= outer_discard);
-
+    ) -> Result<(), Error> {
+        // Callers pass only handshake records (upstream asserted that in debug builds); the
+        // payload's containment is checked by `locate`.
         self.outer_discard = outer_discard;
 
         // if our last span is incomplete, we can blindly add this as a new span --
@@ -57,16 +55,17 @@ impl HandshakeDeframer {
             self.spans.push(FragmentSpan {
                 version: msg.version,
                 size: None,
-                bounds: containing_buffer.locate(msg.payload),
+                bounds: containing_buffer.locate(msg.payload)?,
             });
-            return;
+            return Ok(());
         }
 
         // otherwise, we can expect `msg` to contain a handshake header introducing
         // a new message (and perhaps several of them.)
         for span in DissectHandshakeIter::new(msg, containing_buffer) {
-            self.spans.push(span);
+            self.spans.push(span?);
         }
+        Ok(())
     }
 
     /// Returns a `BufferProgress` that skips over unprocessed handshake data.
@@ -157,12 +156,13 @@ impl HandshakeDeframer {
     ///            |
     /// spans = [ { bounds = (5, 18), size = Some(9), .. } ]
     /// ```
-    pub(crate) fn coalesce(&mut self, containing_buffer: &mut [u8]) -> Result<(), InvalidMessage> {
+    pub(crate) fn coalesce(&mut self, containing_buffer: &mut [u8]) -> Result<(), Error> {
         // Strategy: while there is work to do, scan `spans`
         // for a pair where the first is not complete.  move
         // the second down towards the first, then reparse the contents.
+        // Each pass joins two spans, so the loop ends within `spans.len()` passes.
         while let Some(i) = self.requires_coalesce() {
-            self.coalesce_one(i, Coalescer::new(containing_buffer));
+            self.coalesce_one(i, Coalescer::new(containing_buffer))?;
         }
 
         // check resulting spans pass our imposed length limit
@@ -171,40 +171,56 @@ impl HandshakeDeframer {
             .iter()
             .any(|span| span.size.unwrap_or_default() > MAX_HANDSHAKE_SIZE)
         {
-            true => Err(InvalidMessage::HandshakePayloadTooLarge),
+            true => Err(InvalidMessage::HandshakePayloadTooLarge.into()),
             false => Ok(()),
         }
     }
 
     /// Within `containing_buffer`, move `span[index+1]` to be contiguous
-    /// with `span[index]`.
-    fn coalesce_one(&mut self, index: usize, mut containing_buffer: Coalescer<'_>) {
-        let second = self.spans.remove(index + 1);
+    /// with `span[index]`. `index` is not the last span (`requires_coalesce`).
+    fn coalesce_one(
+        &mut self,
+        index: usize,
+        mut containing_buffer: Coalescer<'_>,
+    ) -> Result<(), Error> {
+        let misplaced = Error::Internal("handshake span to coalesce is missing");
+        let next = index.checked_add(1).ok_or_else(|| misplaced.clone())?;
+        if next >= self.spans.len() {
+            return Err(misplaced);
+        }
+        let second = self.spans.remove(next);
         let mut first = self.spans.remove(index);
 
         // move the entirety of `second` to be contiguous with `first`
         let len = second.bounds.len();
+        let end = first
+            .bounds
+            .end
+            .checked_add(len)
+            .ok_or_else(|| misplaced.clone())?;
         let target = Range {
             start: first.bounds.end,
-            end: first.bounds.end + len,
+            end,
         };
 
-        containing_buffer.copy_within(second.bounds, target);
+        containing_buffer.copy_within(second.bounds, target)?;
         let delocator = containing_buffer.delocator();
 
         // now adjust `first` to cover both
-        first.bounds.end += len;
+        first.bounds.end = end;
 
         // finally, attempt to re-dissect `first`
         let msg = InboundPlainMessage {
             typ: ContentType::Handshake,
             version: first.version,
-            payload: delocator.slice_from_range(&first.bounds),
+            payload: delocator.slice_from_range(&first.bounds)?,
         };
 
-        for (i, span) in DissectHandshakeIter::new(msg, &delocator.locator()).enumerate() {
-            self.spans.insert(index + i, span);
+        let locator = delocator.locator();
+        for (at, span) in (index..).zip(DissectHandshakeIter::new(msg, &locator)) {
+            self.spans.insert(at, span?);
         }
+        Ok(())
     }
 
     /// We require coalescing if any span except the last is not complete.
@@ -249,7 +265,7 @@ impl<'a, 'b> DissectHandshakeIter<'a, 'b> {
 }
 
 impl Iterator for DissectHandshakeIter<'_, '_> {
-    type Item = FragmentSpan;
+    type Item = Result<FragmentSpan, Error>;
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.payload.is_empty() {
@@ -257,35 +273,41 @@ impl Iterator for DissectHandshakeIter<'_, '_> {
         }
 
         // If there is not enough data to have a header the length is unknown
-        if self.payload.len() < HANDSHAKE_HEADER_LEN {
+        let Some((header, rest)) = self.payload.split_first_chunk::<HANDSHAKE_HEADER_LEN>() else {
             let buf = mem::take(&mut self.payload);
-            let bounds = self.containing_buffer.locate(buf);
-            return Some(FragmentSpan {
-                version: self.version,
-                size: None,
-                bounds: bounds.clone(),
-            });
-        }
-
-        let (header, rest) = mem::take(&mut self.payload).split_at(HANDSHAKE_HEADER_LEN);
-
-        // safety: header[1..] is exactly 3 bytes, so `u24::read_bytes` cannot fail
-        let size = u24::read_bytes(&header[1..]).unwrap().into();
-
-        let available = if size < rest.len() {
-            self.payload = &rest[size..];
-            size
-        } else {
-            rest.len()
+            return Some(
+                self.containing_buffer
+                    .locate(buf)
+                    .map(|bounds| FragmentSpan {
+                        version: self.version,
+                        size: None,
+                        bounds,
+                    }),
+            );
         };
+        let [_typ, s2, s1, s0] = *header;
+        let size = usize::from(u24(u32::from_be_bytes([0, s2, s1, s0])));
 
-        let mut bounds = self.containing_buffer.locate(header);
-        bounds.end += available;
-        Some(FragmentSpan {
-            version: self.version,
-            size: Some(size),
-            bounds: bounds.clone(),
-        })
+        let (body, after) = rest.split_at(size.min(rest.len()));
+        self.payload = after;
+
+        Some(
+            self.containing_buffer
+                .locate(header)
+                .and_then(|bounds| {
+                    // The body follows the header in the same buffer.
+                    let end = bounds
+                        .end
+                        .checked_add(body.len())
+                        .ok_or(Error::Internal("handshake span past the buffer"))?;
+                    Ok(bounds.start..end)
+                })
+                .map(|bounds| FragmentSpan {
+                    version: self.version,
+                    size: Some(size),
+                    bounds,
+                }),
+        )
     }
 }
 
@@ -296,7 +318,7 @@ pub(crate) struct HandshakeIter<'a, 'b> {
 }
 
 impl<'b> Iterator for HandshakeIter<'_, 'b> {
-    type Item = (InboundPlainMessage<'b>, usize);
+    type Item = Result<(InboundPlainMessage<'b>, usize), Error>;
 
     fn next(&mut self) -> Option<Self::Item> {
         let next_span = self.deframer.spans.get(self.index)?;
@@ -304,25 +326,32 @@ impl<'b> Iterator for HandshakeIter<'_, 'b> {
         if !next_span.is_complete() {
             return None;
         }
+        let payload = match self.containing_buffer.slice_from_range(&next_span.bounds) {
+            Ok(payload) => payload,
+            Err(err) => return Some(Err(err)),
+        };
+        let version = next_span.version;
+
+        // `get` above found a span at `index`, so the next index is still within `spans`.
+        self.index = self.index.saturating_add(1);
 
         // if this is the last handshake message, then we'll end
         // up with an empty `spans` and can discard the remainder
         // of the input buffer.
-        let discard = if self.deframer.spans.len() - 1 == self.index {
+        let discard = if self.deframer.spans.len() == self.index {
             mem::take(&mut self.deframer.outer_discard)
         } else {
             0
         };
 
-        self.index += 1;
-        Some((
+        Some(Ok((
             InboundPlainMessage {
                 typ: ContentType::Handshake,
-                version: next_span.version,
-                payload: self.containing_buffer.slice_from_range(&next_span.bounds),
+                version,
+                payload,
             },
             discard,
-        ))
+        )))
     }
 }
 
@@ -352,12 +381,13 @@ impl FragmentSpan {
     /// bounds exactly encompasses one handshake message.
     fn is_complete(&self) -> bool {
         match self.size {
-            Some(sz) => sz + HANDSHAKE_HEADER_LEN == self.bounds.len(),
+            Some(sz) => sz.checked_add(HANDSHAKE_HEADER_LEN) == Some(self.bounds.len()),
             None => false,
         }
     }
 }
 
+/// A handshake message's header: its type and its `uint24` length (RFC 8446 §4).
 const HANDSHAKE_HEADER_LEN: usize = 1 + 3;
 
 /// TLS allows for handshake messages of up to 16MB.  We
@@ -379,8 +409,8 @@ mod tests {
             payload: slice,
         };
         let locator = Locator::new(within);
-        let discard = locator.locate(slice).end;
-        hs.input_message(msg, &locator, discard);
+        let discard = locator.locate(slice).unwrap().end;
+        hs.input_message(msg, &locator, discard).unwrap();
     }
 
     #[test]
@@ -399,7 +429,7 @@ mod tests {
         hs.coalesce(&mut input).unwrap();
         std::println!("after:  {hs:?}");
 
-        let (msg, discard) = hs.iter(&input).next().unwrap();
+        let (msg, discard) = hs.iter(&input).next().unwrap().unwrap();
         std::println!("msg {msg:?} discard {discard:?}");
         assert_eq!(msg.typ, ContentType::Handshake);
         assert_eq!(msg.version, ProtocolVersion::TLSv1_3);
@@ -421,7 +451,7 @@ mod tests {
         hs.coalesce(&mut input).unwrap();
         assert_eq!(hs.spans.len(), 1);
 
-        let (msg, discard) = std::dbg!(hs.iter(&input).next().unwrap());
+        let (msg, discard) = std::dbg!(hs.iter(&input).next().unwrap().unwrap());
         assert_eq!(msg.typ, ContentType::Handshake);
         assert_eq!(msg.version, ProtocolVersion::TLSv1_3);
         assert_eq!(msg.payload, &[0x21, 0x00, 0x00, 0x05, 1, 2, 3, 4, 5]);
@@ -443,7 +473,7 @@ mod tests {
 
         assert_eq!(
             hs.coalesce(&mut input),
-            Err(InvalidMessage::HandshakePayloadTooLarge)
+            Err(InvalidMessage::HandshakePayloadTooLarge.into())
         );
     }
 
@@ -457,7 +487,7 @@ mod tests {
         add_bytes(&mut hs, &input[8..12], &input);
 
         let mut iter = hs.iter(&input);
-        let (msg, discard) = iter.next().unwrap();
+        let (msg, discard) = iter.next().unwrap().unwrap();
         assert!(iter.next().is_none());
 
         assert_eq!(msg.typ, ContentType::Handshake);
@@ -480,14 +510,15 @@ mod tests {
             let plain = message.unwrap().into_plain_message();
             std::println!("message {plain:?}");
 
-            hs.input_message(plain, &locator, iter.bytes_consumed());
+            hs.input_message(plain, &locator, iter.bytes_consumed())
+                .unwrap();
         }
 
         hs.coalesce(&mut input[..]).unwrap();
 
         let mut iter = hs.iter(&input[..]);
         for _ in 0..4 {
-            let (msg, discard) = iter.next().unwrap();
+            let (msg, discard) = iter.next().unwrap().unwrap();
             assert!(matches!(
                 msg,
                 InboundPlainMessage {
@@ -498,7 +529,7 @@ mod tests {
             assert_eq!(discard, 0);
         }
 
-        let (msg, discard) = iter.next().unwrap();
+        let (msg, discard) = iter.next().unwrap().unwrap();
         assert!(matches!(
             msg,
             InboundPlainMessage {

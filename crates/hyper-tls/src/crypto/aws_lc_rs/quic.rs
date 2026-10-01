@@ -10,8 +10,14 @@ use crate::quic;
 pub(crate) struct HeaderProtectionKey(aead::quic::HeaderProtectionKey);
 
 impl HeaderProtectionKey {
-    pub(crate) fn new(key: AeadKey, alg: &'static aead::quic::Algorithm) -> Self {
-        Self(aead::quic::HeaderProtectionKey::new(alg, key.as_ref()).unwrap())
+    pub(crate) fn new(
+        key: AeadKey,
+        alg: &'static aead::quic::Algorithm,
+    ) -> Result<Self, aws_lc_rs::error::Unspecified> {
+        Ok(Self(aead::quic::HeaderProtectionKey::new(
+            alg,
+            key.as_ref(),
+        )?))
     }
 
     fn xor_in_place(
@@ -29,9 +35,10 @@ impl HeaderProtectionKey {
             .new_mask(sample)
             .map_err(|_| Error::General("sample of invalid length".into()))?;
 
-        // The `unwrap()` will not panic because `new_mask` returns a
-        // non-empty result.
-        let (first_mask, pn_mask) = mask.split_first().unwrap();
+        // `new_mask` returns a non-empty result.
+        let (first_mask, pn_mask) = mask
+            .split_first()
+            .ok_or_else(|| Error::General("empty header protection mask".into()))?;
 
         // It is OK for the `mask` to be longer than `packet_number`,
         // but a valid `packet_number` will never be longer than `mask`.
@@ -42,6 +49,7 @@ impl HeaderProtectionKey {
         // Infallible from this point on. Before this point, `first` and
         // `packet_number` are unchanged.
 
+        /// The header form bit of a long header (RFC 9000 §17.2).
         const LONG_HEADER_FORM: u8 = 0x80;
         let bits = match *first & LONG_HEADER_FORM == LONG_HEADER_FORM {
             true => 0x0f,  // Long header: 4 bits masked
@@ -108,15 +116,13 @@ impl PacketKey {
         confidentiality_limit: u64,
         integrity_limit: u64,
         aead_algorithm: &'static aead::Algorithm,
-    ) -> Self {
-        Self {
-            key: aead::LessSafeKey::new(
-                aead::UnboundKey::new(aead_algorithm, key.as_ref()).unwrap(),
-            ),
+    ) -> Result<Self, aws_lc_rs::error::Unspecified> {
+        Ok(Self {
+            key: aead::LessSafeKey::new(aead::UnboundKey::new(aead_algorithm, key.as_ref())?),
             iv,
             confidentiality_limit,
             integrity_limit,
-        }
+        })
     }
 }
 
@@ -166,15 +172,13 @@ impl quic::PacketKey for PacketKey {
         header: &[u8],
         payload: &'a mut [u8],
     ) -> Result<&'a [u8], Error> {
-        let payload_len = payload.len();
         let aad = aead::Aad::from(header);
         let nonce = aead::Nonce::assume_unique_for_key(Nonce::new(&self.iv, packet_number).0);
-        self.key
+        let plain = self
+            .key
             .open_in_place(nonce, aad, payload)
             .map_err(|_| Error::DecryptError)?;
-
-        let plain_len = payload_len - self.key.algorithm().tag_len();
-        Ok(&payload[..plain_len])
+        Ok(plain)
     }
 
     fn decrypt_in_place_for_path<'a>(
@@ -184,16 +188,14 @@ impl quic::PacketKey for PacketKey {
         header: &[u8],
         payload: &'a mut [u8],
     ) -> Result<&'a [u8], Error> {
-        let payload_len = payload.len();
         let aad = aead::Aad::from(header);
         let nonce =
             aead::Nonce::assume_unique_for_key(Nonce::for_path(path_id, &self.iv, packet_number).0);
-        self.key
+        let plain = self
+            .key
             .open_in_place(nonce, aad, payload)
             .map_err(|_| Error::DecryptError)?;
-
-        let plain_len = payload_len - self.key.algorithm().tag_len();
-        Ok(&payload[..plain_len])
+        Ok(plain)
     }
 
     /// Tag length for the underlying AEAD algorithm
@@ -221,18 +223,26 @@ pub(crate) struct KeyBuilder {
 }
 
 impl quic::Algorithm for KeyBuilder {
+    // The key schedule derives `aead_key_len()` bytes, which the provider accepts; were it
+    // not, the key refuses its every use (upstream unwrapped).
     fn packet_key(&self, key: AeadKey, iv: Iv) -> Box<dyn quic::PacketKey> {
-        Box::new(PacketKey::new(
+        match PacketKey::new(
             key,
             iv,
             self.confidentiality_limit,
             self.integrity_limit,
             self.packet_alg,
-        ))
+        ) {
+            Ok(key) => Box::new(key),
+            Err(_) => Box::new(quic::RefusedKey),
+        }
     }
 
     fn header_protection_key(&self, key: AeadKey) -> Box<dyn quic::HeaderProtectionKey> {
-        Box::new(HeaderProtectionKey::new(key, self.header_alg))
+        match HeaderProtectionKey::new(key, self.header_alg) {
+            Ok(key) => Box::new(key),
+            Err(_) => Box::new(quic::RefusedKey),
+        }
     }
 
     fn aead_key_len(&self) -> usize {

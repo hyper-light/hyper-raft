@@ -160,6 +160,7 @@
 //! ```rust,no_run
 //! # let root_store: hyper_tls::RootCertStore = panic!();
 //! let config = hyper_tls::ClientConfig::builder()
+//!     .unwrap()
 //!     .with_root_certificates(root_store)
 //!     .with_no_client_auth();
 //! ```
@@ -176,6 +177,7 @@
 //! #      .cloned(),
 //! # );
 //! # let mut config = hyper_tls::ClientConfig::builder()
+//! #     .unwrap()
 //! #     .with_root_certificates(root_store)
 //! #     .with_no_client_auth();
 //! let example_com = "example.com".try_into().unwrap();
@@ -271,6 +273,31 @@
 //!
 //! [x25519mlkem768-manual]: manual::_05_defaults#about-the-post-quantum-secure-key-exchange-x25519mlkem768
 
+// Test code opts out of the no-panic wall (CLAUDE.md §1); shipped code does not.
+#![cfg_attr(
+    test,
+    allow(
+        clippy::panic,
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::unreachable,
+        clippy::indexing_slicing,
+        clippy::arithmetic_side_effects,
+        clippy::disallowed_macros,
+        clippy::cognitive_complexity,
+        clippy::cast_possible_truncation,
+        clippy::string_slice,
+        clippy::unwrap_in_result,
+        clippy::panic_in_result_fn,
+        clippy::missing_panics_doc,
+        clippy::todo,
+        clippy::dbg_macro,
+        clippy::disallowed_types,
+        clippy::disallowed_methods,
+        clippy::cast_sign_loss,
+        clippy::cast_possible_wrap
+    )
+)]
 // Require docs for public APIs, deny unsafe code, etc.
 #![forbid(unsafe_code, unused_must_use)]
 #![forbid(unstable_features)]

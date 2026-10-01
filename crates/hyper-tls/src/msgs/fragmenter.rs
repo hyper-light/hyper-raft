@@ -1,8 +1,11 @@
 use crate::enums::{ContentType, ProtocolVersion};
 use crate::msgs::message::{OutboundChunks, OutboundPlainMessage, PlainMessage};
 use crate::Error;
+/// The largest record plaintext, 2^14 bytes (RFC 8446 §5.1).
 pub(crate) const MAX_FRAGMENT_LEN: usize = 16384;
+/// A record header: type, version and length (RFC 8446 §5.1).
 pub(crate) const PACKET_OVERHEAD: usize = 1 + 2 + 2;
+/// The largest record: its header and the largest plaintext.
 pub(crate) const MAX_FRAGMENT_SIZE: usize = MAX_FRAGMENT_LEN + PACKET_OVERHEAD;
 
 pub struct MessageFragmenter {
@@ -62,7 +65,9 @@ impl MessageFragmenter {
     /// Returns BadMaxFragmentSize if the size is smaller than 32 or larger than 16389.
     pub fn set_max_fragment_size(&mut self, max_fragment_size: Option<usize>) -> Result<(), Error> {
         self.max_frag = match max_fragment_size {
-            Some(sz @ 32..=MAX_FRAGMENT_SIZE) => sz - PACKET_OVERHEAD,
+            Some(sz @ 32..=MAX_FRAGMENT_SIZE) => sz
+                .checked_sub(PACKET_OVERHEAD)
+                .ok_or(Error::BadMaxFragmentSize)?,
             None => MAX_FRAGMENT_LEN,
             _ => return Err(Error::BadMaxFragmentSize),
         };
@@ -98,7 +103,11 @@ impl<'a> Iterator for Chunker<'a> {
 
 impl ExactSizeIterator for Chunker<'_> {
     fn len(&self) -> usize {
-        (self.payload.len() + self.limit - 1) / self.limit
+        // `limit` is a fragment size of at least 27 bytes (`set_max_fragment_size`).
+        match self.limit {
+            0 => 0,
+            limit => self.payload.len().div_ceil(limit),
+        }
     }
 }
 

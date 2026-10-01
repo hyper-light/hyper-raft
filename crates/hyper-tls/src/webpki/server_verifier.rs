@@ -238,22 +238,17 @@ impl ServerCertVerifier for WebPkiServerVerifier {
 
         let crl_refs = self.crls.iter().collect::<Vec<_>>();
 
-        let revocation = if self.crls.is_empty() {
-            None
-        } else {
-            // Note: unwrap here is safe because RevocationOptionsBuilder only errors when given
-            //       empty CRLs.
-            Some(
-                webpki::RevocationOptionsBuilder::new(crl_refs.as_slice())
-                    // Note: safe to unwrap here - new is only fallible if no CRLs are provided
-                    //       and we verify this above.
-                    .unwrap()
+        // `RevocationOptionsBuilder::new` refuses only an empty CRL list, which is exactly the
+        // case without revocation checking.
+        let revocation = webpki::RevocationOptionsBuilder::new(crl_refs.as_slice())
+            .ok()
+            .map(|builder| {
+                builder
                     .with_depth(self.revocation_check_depth)
                     .with_status_policy(self.unknown_revocation_policy)
                     .with_expiration_policy(self.revocation_expiration_policy)
-                    .build(),
-            )
-        };
+                    .build()
+            });
 
         // Note: we use the crate-internal `_impl` fn here in order to provide revocation
         // checking information, if applicable.

@@ -3,8 +3,9 @@ use alloc::boxed::Box;
 use aws_lc_rs::{aead, tls_prf};
 
 use crate::crypto::cipher::{
-    make_tls12_aad, AeadKey, InboundOpaqueMessage, Iv, KeyBlockShape, MessageDecrypter,
-    MessageEncrypter, Nonce, Tls12AeadAlgorithm, UnsupportedOperationError, NONCE_LEN,
+    make_tls12_aad, AeadKey, InboundOpaqueMessage, Iv, KeyBlockShape, KeyRejected,
+    MessageDecrypter, MessageEncrypter, Nonce, Tls12AeadAlgorithm, UnsupportedOperationError,
+    NONCE_LEN,
 };
 use crate::crypto::tls12::Prf;
 use crate::crypto::{ActiveKeyExchange, KeyExchangeAlgorithm};
@@ -125,19 +126,13 @@ pub(crate) struct GcmAlgorithm(&'static aead::Algorithm);
 
 impl Tls12AeadAlgorithm for GcmAlgorithm {
     fn decrypter(&self, dec_key: AeadKey, dec_iv: &[u8]) -> Box<dyn MessageDecrypter> {
-        // safety: see `encrypter()`.
+        // See `encrypter()`: neither the key nor the salt fails for the key block's shape.
         let dec_key =
-            aead::TlsRecordOpeningKey::new(self.0, aead::TlsProtocolId::TLS12, dec_key.as_ref())
-                .unwrap();
-
-        let mut ret = GcmMessageDecrypter {
-            dec_key,
-            dec_salt: [0u8; 4],
-        };
-
-        debug_assert_eq!(dec_iv.len(), 4);
-        ret.dec_salt.copy_from_slice(dec_iv);
-        Box::new(ret)
+            aead::TlsRecordOpeningKey::new(self.0, aead::TlsProtocolId::TLS12, dec_key.as_ref());
+        match (dec_key, <[u8; 4]>::try_from(dec_iv)) {
+            (Ok(dec_key), Ok(dec_salt)) => Box::new(GcmMessageDecrypter { dec_key, dec_salt }),
+            _ => Box::new(KeyRejected),
+        }
     }
 
     fn encrypter(
@@ -146,11 +141,11 @@ impl Tls12AeadAlgorithm for GcmAlgorithm {
         write_iv: &[u8],
         explicit: &[u8],
     ) -> Box<dyn MessageEncrypter> {
-        // safety: `TlsRecordSealingKey::new` fails if
+        // `TlsRecordSealingKey::new` fails if
         // - `enc_key`'s length is wrong for `algorithm`.  But the length is defined by
         //   `algorithm.key_len()` in `key_block_shape()`, below.
         // - `algorithm` is not supported: but `AES_128_GCM` and `AES_256_GCM` is.
-        // thus, this `unwrap()` is unreachable.
+        // Either way the connection gets the refusing cipher, never a panic.
         //
         // `TlsProtocolId::TLS13` is deliberate: we reuse the nonce construction from
         // RFC7905 and TLS13: a random starting point, XOR'd with the sequence number.  This means
@@ -159,10 +154,11 @@ impl Tls12AeadAlgorithm for GcmAlgorithm {
         // The most important property is that nonce is unique per key, which is satisfied by
         // this construction, even if the nonce is not monotonically increasing.
         let enc_key =
-            aead::TlsRecordSealingKey::new(self.0, aead::TlsProtocolId::TLS13, enc_key.as_ref())
-                .unwrap();
-        let iv = gcm_iv(write_iv, explicit);
-        Box::new(GcmMessageEncrypter { enc_key, iv })
+            aead::TlsRecordSealingKey::new(self.0, aead::TlsProtocolId::TLS13, enc_key.as_ref());
+        match (enc_key, gcm_iv(write_iv, explicit)) {
+            (Ok(enc_key), Some(iv)) => Box::new(GcmMessageEncrypter { enc_key, iv }),
+            _ => Box::new(KeyRejected),
+        }
     }
 
     fn key_block_shape(&self) -> KeyBlockShape {
@@ -179,12 +175,12 @@ impl Tls12AeadAlgorithm for GcmAlgorithm {
         write_iv: &[u8],
         explicit: &[u8],
     ) -> Result<ConnectionTrafficSecrets, UnsupportedOperationError> {
-        let iv = gcm_iv(write_iv, explicit);
-        Ok(match self.0.key_len() {
-            16 => ConnectionTrafficSecrets::Aes128Gcm { key, iv },
-            32 => ConnectionTrafficSecrets::Aes256Gcm { key, iv },
-            _ => unreachable!(),
-        })
+        let iv = gcm_iv(write_iv, explicit).ok_or(UnsupportedOperationError)?;
+        match self.0.key_len() {
+            16 => Ok(ConnectionTrafficSecrets::Aes128Gcm { key, iv }),
+            32 => Ok(ConnectionTrafficSecrets::Aes256Gcm { key, iv }),
+            _ => Err(UnsupportedOperationError),
+        }
     }
 
     fn fips(&self) -> bool {
@@ -196,23 +192,30 @@ pub(crate) struct ChaCha20Poly1305;
 
 impl Tls12AeadAlgorithm for ChaCha20Poly1305 {
     fn decrypter(&self, dec_key: AeadKey, iv: &[u8]) -> Box<dyn MessageDecrypter> {
-        let dec_key = aead::LessSafeKey::new(
-            aead::UnboundKey::new(&aead::CHACHA20_POLY1305, dec_key.as_ref()).unwrap(),
-        );
-        Box::new(ChaCha20Poly1305MessageDecrypter {
-            dec_key,
-            dec_offset: Iv::copy(iv),
-        })
+        // The key block's shape gives a 32-byte key and a 12-byte IV, which never fail.
+        match (
+            aead::UnboundKey::new(&aead::CHACHA20_POLY1305, dec_key.as_ref()),
+            Iv::copy(iv),
+        ) {
+            (Ok(dec_key), Some(dec_offset)) => Box::new(ChaCha20Poly1305MessageDecrypter {
+                dec_key: aead::LessSafeKey::new(dec_key),
+                dec_offset,
+            }),
+            _ => Box::new(KeyRejected),
+        }
     }
 
     fn encrypter(&self, enc_key: AeadKey, enc_iv: &[u8], _: &[u8]) -> Box<dyn MessageEncrypter> {
-        let enc_key = aead::LessSafeKey::new(
-            aead::UnboundKey::new(&aead::CHACHA20_POLY1305, enc_key.as_ref()).unwrap(),
-        );
-        Box::new(ChaCha20Poly1305MessageEncrypter {
-            enc_key,
-            enc_offset: Iv::copy(enc_iv),
-        })
+        match (
+            aead::UnboundKey::new(&aead::CHACHA20_POLY1305, enc_key.as_ref()),
+            Iv::copy(enc_iv),
+        ) {
+            (Ok(enc_key), Some(enc_offset)) => Box::new(ChaCha20Poly1305MessageEncrypter {
+                enc_key: aead::LessSafeKey::new(enc_key),
+                enc_offset,
+            }),
+            _ => Box::new(KeyRejected),
+        }
     }
 
     fn key_block_shape(&self) -> KeyBlockShape {
@@ -229,11 +232,10 @@ impl Tls12AeadAlgorithm for ChaCha20Poly1305 {
         iv: &[u8],
         _explicit: &[u8],
     ) -> Result<ConnectionTrafficSecrets, UnsupportedOperationError> {
-        // This should always be true because KeyBlockShape and the Iv nonce len are in agreement.
-        debug_assert_eq!(aead::NONCE_LEN, iv.len());
+        // KeyBlockShape and the Iv nonce len are in agreement.
         Ok(ConnectionTrafficSecrets::Chacha20Poly1305 {
             key,
-            iv: Iv::new(iv[..].try_into().unwrap()),
+            iv: Iv::copy(iv).ok_or(UnsupportedOperationError)?,
         })
     }
 
@@ -254,7 +256,9 @@ struct GcmMessageDecrypter {
     dec_salt: [u8; 4],
 }
 
+/// The explicit part of a TLS 1.2 GCM nonce carried in each record (RFC 5288 §3).
 const GCM_EXPLICIT_NONCE_LEN: usize = 8;
+/// A GCM record's bytes beyond its plaintext: the explicit nonce and the 16-byte tag (RFC 5288 §3).
 const GCM_OVERHEAD: usize = GCM_EXPLICIT_NONCE_LEN + 16;
 
 impl MessageDecrypter for GcmMessageDecrypter {
@@ -264,28 +268,28 @@ impl MessageDecrypter for GcmMessageDecrypter {
         seq: u64,
     ) -> Result<InboundPlainMessage<'a>, Error> {
         let payload = &msg.payload;
-        if payload.len() < GCM_OVERHEAD {
+        let (Some(plain_len), Some((explicit, _))) = (
+            payload.len().checked_sub(GCM_OVERHEAD),
+            payload.split_first_chunk::<GCM_EXPLICIT_NONCE_LEN>(),
+        ) else {
             return Err(Error::DecryptError);
-        }
-
-        let nonce = {
-            let mut nonce = [0u8; 12];
-            nonce[..4].copy_from_slice(&self.dec_salt);
-            nonce[4..].copy_from_slice(&payload[..8]);
-            aead::Nonce::assume_unique_for_key(nonce)
         };
 
+        let nonce = aead::Nonce::assume_unique_for_key(concat_nonce(&self.dec_salt, explicit));
         let aad = aead::Aad::from(make_tls12_aad(
             seq,
             msg.typ,
             msg.version,
-            payload.len() - GCM_OVERHEAD,
+            u16::try_from(plain_len).map_err(|_| Error::PeerSentOversizedRecord)?,
         ));
 
         let payload = &mut msg.payload;
+        let sealed = payload
+            .get_mut(GCM_EXPLICIT_NONCE_LEN..)
+            .ok_or(Error::DecryptError)?;
         let plain_len = self
             .dec_key
-            .open_in_place(nonce, aad, &mut payload[GCM_EXPLICIT_NONCE_LEN..])
+            .open_in_place(nonce, aad, sealed)
             .map_err(|_| Error::DecryptError)?
             .len();
 
@@ -293,11 +297,10 @@ impl MessageDecrypter for GcmMessageDecrypter {
             return Err(Error::PeerSentOversizedRecord);
         }
 
-        Ok(
-            msg.into_plain_message_range(
-                GCM_EXPLICIT_NONCE_LEN..GCM_EXPLICIT_NONCE_LEN + plain_len,
-            ),
-        )
+        // At most MAX_FRAGMENT_LEN, so the sum does not overflow.
+        let plain_end = GCM_EXPLICIT_NONCE_LEN.saturating_add(plain_len);
+        msg.into_plain_message_range(GCM_EXPLICIT_NONCE_LEN..plain_end)
+            .ok_or(Error::DecryptError)
     }
 }
 
@@ -310,21 +313,32 @@ impl MessageEncrypter for GcmMessageEncrypter {
         let total_len = self.encrypted_payload_len(msg.payload.len());
         let mut payload = PrefixedPayload::with_capacity(total_len);
 
-        let nonce = aead::Nonce::assume_unique_for_key(Nonce::new(&self.iv, seq).0);
-        let aad = aead::Aad::from(make_tls12_aad(seq, msg.typ, msg.version, msg.payload.len()));
-        payload.extend_from_slice(&nonce.as_ref()[4..]);
+        let nonce_bytes = Nonce::new(&self.iv, seq).0;
+        let (_, explicit) = nonce_bytes.split_at(NONCE_LEN - GCM_EXPLICIT_NONCE_LEN);
+        let nonce = aead::Nonce::assume_unique_for_key(nonce_bytes);
+        let plain_len = u16::try_from(msg.payload.len()).map_err(|_| Error::EncryptError)?;
+        let aad = aead::Aad::from(make_tls12_aad(seq, msg.typ, msg.version, plain_len));
+        payload.extend_from_slice(explicit);
         payload.extend_from_chunks(&msg.payload);
 
-        self.enc_key
-            .seal_in_place_separate_tag(nonce, aad, &mut payload.as_mut()[GCM_EXPLICIT_NONCE_LEN..])
-            .map(|tag| payload.extend_from_slice(tag.as_ref()))
+        let sealed = payload
+            .as_mut()
+            .get_mut(GCM_EXPLICIT_NONCE_LEN..)
+            .ok_or(Error::EncryptError)?;
+        let tag = self
+            .enc_key
+            .seal_in_place_separate_tag(nonce, aad, sealed)
             .map_err(|_| Error::EncryptError)?;
+        payload.extend_from_slice(tag.as_ref());
 
         Ok(OutboundOpaqueMessage::new(msg.typ, msg.version, payload))
     }
 
     fn encrypted_payload_len(&self, payload_len: usize) -> usize {
-        payload_len + GCM_EXPLICIT_NONCE_LEN + self.enc_key.algorithm().tag_len()
+        // A required size: saturating can only over-state it, which refuses rather than overruns.
+        payload_len
+            .saturating_add(GCM_EXPLICIT_NONCE_LEN)
+            .saturating_add(self.enc_key.algorithm().tag_len())
     }
 }
 
@@ -344,6 +358,7 @@ struct ChaCha20Poly1305MessageDecrypter {
     dec_offset: Iv,
 }
 
+/// The Poly1305 tag a ChaCha20-Poly1305 record carries beyond its plaintext (RFC 7905 §2).
 const CHACHAPOLY1305_OVERHEAD: usize = 16;
 
 impl MessageDecrypter for ChaCha20Poly1305MessageDecrypter {
@@ -354,16 +369,16 @@ impl MessageDecrypter for ChaCha20Poly1305MessageDecrypter {
     ) -> Result<InboundPlainMessage<'a>, Error> {
         let payload = &msg.payload;
 
-        if payload.len() < CHACHAPOLY1305_OVERHEAD {
+        let Some(plain_len) = payload.len().checked_sub(CHACHAPOLY1305_OVERHEAD) else {
             return Err(Error::DecryptError);
-        }
+        };
 
         let nonce = aead::Nonce::assume_unique_for_key(Nonce::new(&self.dec_offset, seq).0);
         let aad = aead::Aad::from(make_tls12_aad(
             seq,
             msg.typ,
             msg.version,
-            payload.len() - CHACHAPOLY1305_OVERHEAD,
+            u16::try_from(plain_len).map_err(|_| Error::PeerSentOversizedRecord)?,
         ));
 
         let payload = &mut msg.payload;
@@ -392,7 +407,8 @@ impl MessageEncrypter for ChaCha20Poly1305MessageEncrypter {
         let mut payload = PrefixedPayload::with_capacity(total_len);
 
         let nonce = aead::Nonce::assume_unique_for_key(Nonce::new(&self.enc_offset, seq).0);
-        let aad = aead::Aad::from(make_tls12_aad(seq, msg.typ, msg.version, msg.payload.len()));
+        let plain_len = u16::try_from(msg.payload.len()).map_err(|_| Error::EncryptError)?;
+        let aad = aead::Aad::from(make_tls12_aad(seq, msg.typ, msg.version, plain_len));
         payload.extend_from_chunks(&msg.payload);
 
         self.enc_key
@@ -403,42 +419,54 @@ impl MessageEncrypter for ChaCha20Poly1305MessageEncrypter {
     }
 
     fn encrypted_payload_len(&self, payload_len: usize) -> usize {
-        payload_len + self.enc_key.algorithm().tag_len()
+        // A required size: saturating can only over-state it, which refuses rather than overruns.
+        payload_len.saturating_add(self.enc_key.algorithm().tag_len())
     }
 }
 
-fn gcm_iv(write_iv: &[u8], explicit: &[u8]) -> Iv {
-    debug_assert_eq!(write_iv.len(), 4);
-    debug_assert_eq!(explicit.len(), 8);
+/// The 12-byte GCM nonce: the 4-byte salt from the key block, then the record's explicit part.
+fn concat_nonce(salt: &[u8; 4], explicit: &[u8; GCM_EXPLICIT_NONCE_LEN]) -> [u8; NONCE_LEN] {
+    let mut nonce = [0u8; NONCE_LEN];
+    let (head, tail) = nonce.split_at_mut(salt.len());
+    head.copy_from_slice(salt);
+    tail.copy_from_slice(explicit);
+    nonce
+}
 
-    // The GCM nonce is constructed from a 32-bit 'salt' derived
-    // from the master-secret, and a 64-bit explicit part,
-    // with no specified construction.  Thanks for that.
-    //
-    // We use the same construction as TLS1.3/ChaCha20Poly1305:
-    // a starting point extracted from the key block, xored with
-    // the sequence number.
-    let mut iv = [0; NONCE_LEN];
-    iv[..4].copy_from_slice(write_iv);
-    iv[4..].copy_from_slice(explicit);
-
-    Iv::new(iv)
+/// The GCM nonce is constructed from a 32-bit 'salt' derived from the master-secret, and a 64-bit
+/// explicit part, with no specified construction.  Thanks for that.
+///
+/// We use the same construction as TLS1.3/ChaCha20Poly1305: a starting point extracted from the
+/// key block, xored with the sequence number. `None` unless the key block's shape gave a 4-byte
+/// salt and an 8-byte explicit part.
+fn gcm_iv(write_iv: &[u8], explicit: &[u8]) -> Option<Iv> {
+    Some(Iv::new(concat_nonce(
+        write_iv.try_into().ok()?,
+        explicit.try_into().ok()?,
+    )))
 }
 
 struct Tls12Prf(&'static tls_prf::Algorithm);
 
 impl Prf for Tls12Prf {
-    fn for_secret(&self, output: &mut [u8], secret: &[u8], label: &[u8], seed: &[u8]) {
-        // safety:
-        // - [1] is safe because our caller guarantees `secret` is non-empty; this is
-        //   the only documented error case.
-        // - [2] is safe in practice because the only failure from `derive()` is due
-        //   to zero `output.len()`; this is outlawed at higher levels
+    fn for_secret(
+        &self,
+        output: &mut [u8],
+        secret: &[u8],
+        label: &[u8],
+        seed: &[u8],
+    ) -> Result<(), Error> {
+        // The documented failures are an empty `secret` and an empty `output`, both of which the
+        // callers rule out.
         let derived = tls_prf::Secret::new(self.0, secret)
-            .unwrap() // [1]
-            .derive(label, seed, output.len())
-            .unwrap(); // [2]
-        output.copy_from_slice(derived.as_ref());
+            .and_then(|secret| secret.derive(label, seed, output.len()))
+            .map_err(|_| Error::Internal("TLS 1.2 PRF refused its input"))?;
+        let derived = derived.as_ref();
+        if derived.len() != output.len() {
+            return Err(Error::Internal("TLS 1.2 PRF output of the wrong length"));
+        }
+        output.copy_from_slice(derived);
+        Ok(())
     }
 
     fn for_key_exchange(
@@ -455,8 +483,7 @@ impl Prf for Tls12Prf {
                 .secret_bytes(),
             label,
             seed,
-        );
-        Ok(())
+        )
     }
 
     fn fips(&self) -> bool {

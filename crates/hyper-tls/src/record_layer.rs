@@ -80,7 +80,9 @@ impl RecordLayer {
         let encrypted_len = encr.payload.len();
         match self.message_decrypter.decrypt(encr, self.read_seq) {
             Ok(plaintext) => {
-                self.read_seq += 1;
+                // The peer's records are counted by a u64 it cannot exhaust before the soft
+                // limit above asks to close; at the end of the space, refuse.
+                self.read_seq = self.read_seq.checked_add(1).ok_or(Error::DecryptError)?;
                 if !self.has_decrypted {
                     self.has_decrypted = true;
                 }
@@ -99,17 +101,22 @@ impl RecordLayer {
 
     /// Encrypt a TLS message.
     ///
-    /// `plain` is a TLS message we'd like to send.  This function
-    /// panics if the requisite keying material hasn't been established yet.
+    /// `plain` is a TLS message we'd like to send. Before the keying material is established,
+    /// past the sequence space, or when the encrypter fails, this is an error (upstream panicked).
     pub(crate) fn encrypt_outgoing(
         &mut self,
         plain: OutboundPlainMessage<'_>,
-    ) -> OutboundOpaqueMessage {
-        debug_assert!(self.encrypt_state == DirectionState::Active);
-        assert!(self.next_pre_encrypt_action() != PreEncryptAction::Refuse);
+    ) -> Result<OutboundOpaqueMessage, Error> {
+        if self.encrypt_state != DirectionState::Active {
+            return Err(Error::Internal("encrypting before the encrypter is active"));
+        }
+        if self.next_pre_encrypt_action() == PreEncryptAction::Refuse {
+            return Err(Error::EncryptError);
+        }
         let seq = self.write_seq;
-        self.write_seq += 1;
-        self.message_encrypter.encrypt(plain, seq).unwrap()
+        // Below SEQ_HARD_LIMIT, checked just above.
+        self.write_seq = seq.checked_add(1).ok_or(Error::EncryptError)?;
+        self.message_encrypter.encrypt(plain, seq)
     }
 
     /// Prepare to use the given `MessageEncrypter` for future message encryption.
@@ -136,14 +143,14 @@ impl RecordLayer {
     /// Start using the `MessageEncrypter` previously provided to the previous
     /// call to `prepare_message_encrypter`.
     pub(crate) fn start_encrypting(&mut self) {
-        debug_assert!(self.encrypt_state == DirectionState::Prepared);
+        // From `Prepared`; upstream asserted that in debug builds only.
         self.encrypt_state = DirectionState::Active;
     }
 
     /// Start using the `MessageDecrypter` previously provided to the previous
     /// call to `prepare_message_decrypter`.
     pub(crate) fn start_decrypting(&mut self) {
-        debug_assert!(self.decrypt_state == DirectionState::Prepared);
+        // From `Prepared`; upstream asserted that in debug builds only.
         self.decrypt_state = DirectionState::Active;
     }
 
@@ -255,12 +262,14 @@ pub(crate) enum PreEncryptAction {
     /// alert should be sent instead.
     RefreshOrClose,
 
-    /// Do not call `encrypt_outgoing` further, it will panic rather than
+    /// Do not call `encrypt_outgoing` further, it will refuse rather than
     /// over-use the key.
     Refuse,
 }
 
+/// The sequence number at which we ask to close or update keys before it wraps (RFC 8446 §5.3).
 const SEQ_SOFT_LIMIT: u64 = 0xffff_ffff_ffff_0000u64;
+/// The sequence number past which we refuse to encrypt: it must never wrap (RFC 8446 §5.3).
 const SEQ_HARD_LIMIT: u64 = 0xffff_ffff_ffff_fffeu64;
 
 #[cfg(test)]

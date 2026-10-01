@@ -165,3 +165,129 @@ Every change from the archive is listed here, in order.
 
     The full handshakes' bytes are dominated by the brotli compressor's tables. The TLS 1.2
     resumed rise is item 8's copy of the ticket and chain out of the store.
+
+## 3. No panics in shipped code (2026-10-01)
+
+The crate takes the workspace's lint table (`[lints] workspace = true`): no `unwrap`, `expect`,
+`panic!`, `unreachable!`, `unimplemented!`, `todo!` or assert family, no indexing or slicing that
+can go out of bounds, no overflowing arithmetic, no narrowing `as`, `cognitive_complexity` at most
+10, every `const` documented. No item or crate in shipped code allows any of them; test code opts
+out at the crate root (`#![cfg_attr(test, allow(...))]`, and each integration test's root).
+
+### Classes of change
+
+1. **`Error::Internal(&'static str)`** is new: an invariant of this implementation did not hold.
+   It is never something a peer caused. Each site upstream panicked at for such an invariant now
+   returns it: early-data state transitions, a PSK offer without exactly one identity and binder,
+   a missing key share after TLS 1.3 was negotiated, an ECH config of the wrong version, a key
+   exchange group claiming DHE without FFDHE parameters, deframer ranges outside their buffer,
+   `handle_new_session_ticket` on a server, `complete_hybrid_component` without
+   `hybrid_component`, and the like.
+2. **Fallible signatures where a failure has a caller.**
+   - `ClientConfig::builder`, `builder_with_protocol_versions` and the `ServerConfig` pair return
+     `Result<ConfigBuilder<_, WantsVerifier>, Error>`; upstream unwrapped
+     `with_protocol_versions`.
+   - The TLS 1.3 key schedule (`KeySchedule*`, `derive_traffic_key`, `derive_traffic_iv`,
+     `hkdf_expand_label*`), `HkdfExpander::expand_block`, `crypto::tls13::expand`,
+     `tls12::Prf::for_secret`, `ConnectionSecrets` (key block, verify data, exporter),
+     `CommonState::start_encryption_tls12` and `enqueue_key_update_notification`,
+     `RecordLayer::encrypt_outgoing`, HPKE's labeled expansion and key schedule return their
+     failure. `From<OutputLengthError> for Error` maps HKDF's.
+   - `InboundOpaqueMessage::into_plain_message_range` and `Accepted::client_hello` return
+     `Option`; `Iv::copy` returns `Option` for a slice that is not `NONCE_LEN` bytes.
+   - `ServerConnection::set_resumption_data` and both `reject_early_data`s return
+     `Result<(), Error>`.
+3. **A refusing value where the trait has no error path.**
+   - An AEAD key the provider rejects (unreachable: the key schedule derives `key_len()` bytes)
+     gives `cipher::KeyRejected`, an encrypter and decrypter whose every record is
+     `Error::Internal`; upstream unwrapped the key's construction.
+   - A QUIC key whose derivation or construction fails gives `quic::RefusedKey`, whose every use
+     is `Error::Internal`; `Secrets` keeps a `refused` flag so later key updates refuse too.
+   - A record that fails to encrypt on a send path that cannot return is kept as the connection's
+     encrypt failure and returned by the next `process_new_packets` (or unbuffered
+     `process_tls_records`), which also poisons the state.
+4. **Checked arithmetic and `get`.** Every offset and length the peer influences is checked:
+   the deframer, `Reader`, the GCM and ChaCha20-Poly1305 record layers, HKDF, the TLS 1.2 key
+   block (`KeyBlock::split`), `ChunkVecBuffer`. Counters that limit the peer (`TemperCounters`,
+   the early-data allowance, `skip_data_left`) use `checked_sub`.
+5. **Saturation where it is the stated meaning**, each with a comment: a required size
+   (`encrypted_payload_len`, `check_required_size`, `encoded_len`), which can only over-state;
+   capacity hints; byte counts and offsets bounded by an in-memory buffer; the RFC 9149 ticket
+   count hint (uint8); a ticket lifetime hint; ages and the test-only epoch rewind.
+6. **Length fields of encodings** (`LengthPrefixedBuffer`, `PayloadU8/16/24`, `SessionId`, SNI,
+   the record header) take the low-order bytes of the length, as upstream's `as` casts did in a
+   release build; the encoders' own limits keep every length within its field. `codec::low_u8`,
+   `low_u16` and `low_u24` state this once.
+7. **Fixed-capacity values** (`hmac::Tag`, `hash::Output`, `OkmBlock`) hold at most their
+   `MAX_LEN` (SHA-512's 64 bytes) and keep that many bytes of a longer slice, where upstream
+   panicked; no supported hash is longer. HKDF's zero salt and IKM come from one static
+   (`zero_hash_len`).
+8. **Debug-only assertions removed** where they checked an internal precondition the callers
+   hold (record-layer direction states, early-traffic flags, the fatal-alert flag, key exchange
+   state, the protocol side in the key schedule). Release builds never evaluated them, so no
+   behaviour changes.
+9. **Restructured so the type system proves the invariant**: `LoggedSecret` (only secrets with a
+   key-log label can be logged), PSK identities and binders zipped after their lengths are
+   checked, the revocation options built only from a non-empty CRL list, `RsaSigner::new` and
+   the ECDSA public key returning `None` for a scheme they do not serve, array destructuring for
+   nonces and AAD.
+10. **Split for `cognitive_complexity`** into named steps, behaviour unchanged:
+    `emit_client_hello_for_retry` (`offered_versions`, `client_hello_extensions`,
+    `offer_key_shares`, `offer_tls13_extensions`, `offered_cipher_suites`, `apply_ech`,
+    `derive_early_secret`), `ExpectServerHello::handle` (`server_hello_version`),
+    `EchState::encode_inner_hello` (`inner_hello_from`, `pad_inner_hello`), server
+    `handle_client_hello` (`check_client_hello`, `check_second_hello`, `retry_for_key_share`,
+    `choose_psk`, `settle_resumption`, `next_state`, `emit_server_authentication`,
+    `install_handshake_decrypter`), and `process_tls_records_common` (`process_next_message`,
+    `idle_state`).
+11. **Every `const` in `src/` carries a `///`** with its derivation or citation
+    (`scripts/check-contracts.py`). Upstream's tunables keep upstream's values and say so.
+12. **Tests**: the in-crate `unsafe` in `alloc_per_handshake` is replaced by
+    `hyper_measure::alloc::Counting` (a dev-dependency); `key_log_file_env` calls `env::set_var`
+    without `unsafe` (edition 2021); the `read_buf` attributes of the removed feature are gone.
+
+### Behaviour changes: former panics and what they are now
+
+| Reached by | Upstream | Now |
+|---|---|---|
+| **A peer**: a server's HelloRetryRequest selecting a TLS 1.2 cipher suite to a client offering ECH | `unreachable!` in `handle_hello_retry_request` | `illegal_parameter` alert, `PeerMisbehaved::SelectedUnusableCipherSuiteForVersion` (`client::test::test_ech_client_rejects_hrr_selecting_tls12_suite`, which panics on upstream's code) |
+| The API: `ClientConfig::builder()`/`ServerConfig::builder()` with a process provider that cannot serve the versions | `unwrap` | the `Error` from `with_protocol_versions` |
+| The API: a TLS 1.2 exporter context of 2^16 bytes or more | `assert!` | `Error::General` (`test_tls12_exporter_refuses_context_longer_than_uint16`) |
+| The API: a TLS 1.3 exporter label longer than 249 bytes | the label's length byte was truncated: a wrong key, silently | `Error::General` (`test_tls13_exporter_refuses_label_longer_than_249`) |
+| The API: `set_resumption_data` with 2^15 bytes or more | `assert!` | `Error::General` |
+| The API: `reject_early_data` after the handshake | `assert!` | `Error::General` |
+| The API: `BufRead::consume` past what `fill_buf` returned | `assert!` | consumes what it returned, as std's `BufReader` does |
+| A provider: `Hmac`/`Hkdf` with a tag longer than 64 bytes, a zero-length tag, an AEAD key or IV of the wrong length | slicing, `chunks_mut(0)`, `unwrap` | `Error::Internal`/`OutputLengthError`, or the refusing cipher or key |
+| HPKE: the u32 sequence number at its end | overflow (debug) or wrap, reusing a nonce (release) | the context refuses |
+| Every other site | `unwrap`, `expect`, `unreachable!`, assert, indexing | `Error::Internal`, unreachable by construction |
+
+### Oracle
+
+Unit 247 (246 and the ECH HelloRetryRequest test), api 229 (227 and the two exporter tests),
+api_ffdhe 5, client_cert_verifier 4, ech 2, key_log_file_env 2, process_provider 1,
+server_cert_verifier 6, unbuffered 27, alloc_per_handshake 1, doctests 15 (3 ignored): all pass.
+Upstream's assertions are unchanged; the tests changed only where the API did (`.unwrap()` on
+the new `Result`s and `Option`s).
+
+### Allocations per handshake
+
+`tests/alloc_per_handshake.rs`, now counting with `hyper_measure::alloc`, macOS aarch64
+development machine, debug profile, three runs (reallocations vary by ±1, bytes by ±300, since
+`hyper_measure` also counts what each reallocation grew):
+
+| Handshake | §2 | Now |
+|---|---|---|
+| TLS 1.3 full | 286 allocs | 286 allocs, 45 reallocs, 34,602,141 B |
+| TLS 1.3 resumed | 213 allocs | 213 allocs, 41 reallocs, 55,706 B |
+| TLS 1.2 full | 140 allocs | 140 allocs, 32 reallocs, 32,832 B |
+| TLS 1.2 resumed | 101 allocs | 101 allocs, 17 reallocs, 21,766 B |
+
+No hot path gained an allocation. The TLS 1.2 resumed +2 against 526c2cc (§2 item 8) is still
+owed. Its cause: `ClientSessionStore::tls12_session` hands out an owned
+`Tls12ClientSessionValue`, so the ticket and the server's certificate chain are copied out of a
+store that keeps them for the next connection, where upstream bumped two reference counts. The
+ticket copy could go if every ClientHello borrowed it from the store in the call that sends it,
+but a store shared by connections may replace it between a ClientHello and its retry, which RFC
+8446 §4.1.2 forbids changing. The chain has two owners, the store and `peer_certificates`;
+without shared ownership one of them copies, unless `peer_certificates` borrows the
+configuration's store, an API change left for the consumers to ask for.

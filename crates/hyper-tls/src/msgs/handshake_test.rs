@@ -4,7 +4,7 @@ use std::{format, println, vec};
 use pki_types::{CertificateDer, DnsName};
 
 use super::base::{Payload, PayloadU16, PayloadU24, PayloadU8};
-use super::codec::{put_u16, Codec, Reader};
+use super::codec::{Codec, Reader};
 use super::enums::{
     ClientCertificateType, Compression, ECCurveType, ExtensionType, KeyUpdateRequest, NamedGroup,
 };
@@ -736,6 +736,7 @@ fn can_decode_server_hello_from_api_devicecheck_apple_com() {
 fn wrapped_dn_encoding() {
     let subject = b"subject";
     let dn = DistinguishedName::in_sequence(&subject[..]);
+    /// The universal tag of SEQUENCE, constructed (X.690 §8.9).
     const DER_SEQUENCE_TAG: u8 = 0x30;
     let expected_prefix = vec![DER_SEQUENCE_TAG, subject.len() as u8];
     assert_eq!(dn.as_ref(), [expected_prefix, subject.to_vec()].concat());
@@ -1040,4 +1041,8 @@ fn sample_certificate_status() -> CertificateStatus<'static> {
     CertificateStatus {
         ocsp_response: PayloadU24::from(Payload::new(vec![1, 2, 3])),
     }
+}
+
+fn put_u16(v: u16, out: &mut [u8]) {
+    out[..2].copy_from_slice(&v.to_be_bytes());
 }

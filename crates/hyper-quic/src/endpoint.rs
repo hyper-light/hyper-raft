@@ -5,7 +5,6 @@ use std::{
     fmt, mem,
     net::{IpAddr, SocketAddr},
     ops::{Index, IndexMut},
-    sync::Arc,
 };
 
 use bytes::{BufMut, Bytes, BytesMut};
@@ -24,7 +23,10 @@ use crate::{
     TokenStore, Transmit, TransportConfig, TransportError,
     cid_generator::ConnectionIdGenerator,
     coding::BufMutExt,
-    config::{ClientConfig, EndpointConfig, ServerConfig},
+    config::{
+        ClientConfig, ClientConfigHandle, ConfigKey, Configs, ConfigsFull, EndpointConfig,
+        ServerConfig, ServerConfigHandle,
+    },
     connection::{Connection, ConnectionError, SideArgs},
     crypto::{self, Keys, UnsupportedVersion},
     frame,
@@ -50,7 +52,10 @@ pub struct Endpoint {
     connections: Slab<ConnectionMeta>,
     local_cid_generator: Box<dyn ConnectionIdGenerator>,
     config: EndpointConfig,
-    server_config: Option<Arc<ServerConfig>>,
+    /// The server and client configurations this endpoint and its connections share
+    configs: Configs,
+    /// The configuration new incoming connections are accepted under
+    server_config: Option<ServerConfigHandle>,
     /// Whether the underlying UDP socket promises not to fragment packets
     allow_mtud: bool,
     /// Time at which a stateless reset was most recently sent
@@ -84,10 +89,13 @@ impl Endpoint {
     /// using [`EndpointConfig::rng_seed`].
     pub fn new(
         config: EndpointConfig,
-        server_config: Option<Arc<ServerConfig>>,
+        server_config: Option<ServerConfig>,
         allow_mtud: bool,
         rng_seed: Option<[u8; 32]>,
     ) -> Self {
+        let mut configs = Configs::new(config.config_slots);
+        // The slab is empty and has at least one slot, so the insertion cannot be refused
+        let server_config = server_config.and_then(|c| configs.insert_server(c).ok());
         Self {
             rng: match rng_seed.or(config.rng_seed) {
                 Some(seed) => StdRng::from_seed(seed),
@@ -98,6 +106,7 @@ impl Endpoint {
             connections: Slab::new(),
             local_cid_generator: config.cid_generator.clone_box(),
             config,
+            configs,
             server_config,
             allow_mtud,
             last_stateless_reset: None,
@@ -126,9 +135,72 @@ impl Endpoint {
 
     /// Replace the server configuration, affecting new incoming connections only
     ///
-    /// Pending incoming connections retain the configuration active when they first arrived.
-    pub fn set_server_config(&mut self, server_config: Option<Arc<ServerConfig>>) {
-        self.server_config = server_config;
+    /// Pending incoming connections retain the configuration active when they first arrived. The
+    /// replaced configuration is dropped once the last connection started under it drains. Refused
+    /// with [`ConfigsFull`] when every slot holds a configuration still in use; the current
+    /// configuration is then kept.
+    pub fn set_server_config(
+        &mut self,
+        server_config: Option<ServerConfig>,
+    ) -> Result<(), ConfigsFull> {
+        let new = match server_config {
+            Some(config) => Some(self.configs.insert_server(config)?),
+            None => None,
+        };
+        if let Some(old) = mem::replace(&mut self.server_config, new) {
+            self.configs.supersede(old.0);
+        }
+        Ok(())
+    }
+
+    /// Add a client configuration for [`connect`](Self::connect) to use
+    ///
+    /// Connections made with the returned handle share the configuration, including its TLS
+    /// session cache, so later connections to a server can resume earlier sessions. Refused with
+    /// [`ConfigsFull`] when every slot holds a configuration still in use.
+    pub fn insert_client_config(
+        &mut self,
+        config: ClientConfig,
+    ) -> Result<ClientConfigHandle, ConfigsFull> {
+        self.configs.insert_client(config)
+    }
+
+    /// Stop offering a client configuration to new connections
+    ///
+    /// The configuration is dropped once the last connection made with it drains; `connect` with
+    /// the handle fails from now on.
+    pub fn retire_client_config(&mut self, handle: ClientConfigHandle) {
+        self.configs.supersede(handle.0);
+    }
+
+    /// Insert a server configuration without making it current, for
+    /// [`accept`](Self::accept) to use for chosen incoming connections
+    pub fn insert_server_config(
+        &mut self,
+        config: ServerConfig,
+    ) -> Result<ServerConfigHandle, ConfigsFull> {
+        self.configs.insert_server(config)
+    }
+
+    /// Stop offering a server configuration inserted with
+    /// [`insert_server_config`](Self::insert_server_config)
+    ///
+    /// The configuration is dropped once the last connection accepted with it drains.
+    pub fn retire_server_config(&mut self, handle: ServerConfigHandle) {
+        if self.server_config != Some(handle) {
+            self.configs.supersede(handle.0);
+        }
+    }
+
+    /// The configurations this endpoint and its connections share
+    pub fn configs(&self) -> &Configs {
+        &self.configs
+    }
+
+    /// The configurations this endpoint and its connections share, to lend to
+    /// [`Connection::handle_event`]
+    pub fn configs_mut(&mut self) -> &mut Configs {
+        &mut self.configs
     }
 
     /// Process `EndpointEvent`s emitted from related `Connection`s
@@ -167,6 +239,7 @@ impl Endpoint {
             Drained => {
                 if let Some(conn) = self.connections.try_remove(ch.0) {
                     self.index.remove(&conn);
+                    self.configs.release(conn.config);
                 } else {
                     // This indicates a bug in downstream code, which could cause spurious
                     // connection loss instead of this error if the CID was (re)allocated prior to
@@ -258,7 +331,9 @@ impl Endpoint {
             match route_to {
                 RouteDatagramTo::Incoming(incoming_idx) => {
                     let incoming_buffer = &mut self.incoming_buffers[incoming_idx];
-                    let config = &incoming_buffer.server_config;
+                    // A pending attempt keeps its configuration's slot, so the lookup succeeds;
+                    // were it to fail, the datagram is not buffered
+                    let config = self.configs.server_config(incoming_buffer.server_config)?;
 
                     if incoming_buffer
                         .total_bytes
@@ -373,11 +448,13 @@ impl Endpoint {
         })
     }
 
-    /// Initiate a connection
+    /// Initiate a connection with the client configuration `config` refers to
+    ///
+    /// `config` comes from [`insert_client_config`](Self::insert_client_config).
     pub fn connect(
         &mut self,
         now: Instant,
-        config: ClientConfig,
+        config: ClientConfigHandle,
         remote: SocketAddr,
         server_name: &str,
         qlog: Option<QlogStream>,
@@ -388,31 +465,40 @@ impl Endpoint {
         if remote.port() == 0 || remote.ip().is_unspecified() {
             return Err(ConnectError::InvalidRemoteAddress(remote));
         }
-        if !self.config.supported_versions.contains(&config.version) {
+        let Some(client) = self.configs.client_for_connect(config) else {
+            return Err(ConnectError::UnknownConfig);
+        };
+        let version = client.version;
+        if !self.config.supported_versions.contains(&version) {
             return Err(ConnectError::UnsupportedVersion);
         }
 
-        let remote_id = (config.initial_dst_cid_provider)();
+        let remote_id = (client.initial_dst_cid_provider)();
         trace!(initial_dcid = %remote_id);
 
         let ch = ConnectionHandle(self.connections.vacant_key());
         let loc_cid = self.new_cid(ch);
+        let Some(client) = self.configs.client_for_connect(config) else {
+            return Err(ConnectError::UnknownConfig);
+        };
         let params = TransportParameters::new(
-            &config.transport,
+            &client.transport,
             &self.config,
             self.local_cid_generator.as_ref(),
             loc_cid,
             None,
             &mut self.rng,
         );
-        let tls = config
-            .crypto
-            .start_session(config.version, server_name, &params)?;
+        let tls = client.crypto.start_session(version, server_name, &params)?;
+        let transport = client.transport.clone();
+        if !self.configs.acquire(config.0) {
+            return Err(ConnectError::UnknownConfig);
+        }
 
         let token = self.token_store.take(server_name).unwrap_or_default();
         let conn = self.add_connection(
             ch,
-            config.version,
+            version,
             remote_id,
             loc_cid,
             remote_id,
@@ -422,7 +508,8 @@ impl Endpoint {
             },
             now,
             tls,
-            config.transport,
+            config.0,
+            transport,
             qlog,
             SideArgs::Client {
                 token,
@@ -480,12 +567,14 @@ impl Endpoint {
         let dst_cid = event.first_decode.dst_cid();
         let header = event.first_decode.initial_header().unwrap();
 
-        let Some(server_config) = &self.server_config else {
+        let Some(server_handle) = self.server_config else {
             debug!("packet for unrecognized connection {}", dst_cid);
             return self
                 .stateless_reset(event.now, datagram_len, addresses, *dst_cid, buf)
                 .map(DatagramEvent::Response);
         };
+        // The current server configuration always occupies its slot
+        let server_config = self.configs.server_config(server_handle)?;
 
         if datagram_len < MIN_INITIAL_SIZE as usize {
             debug!("ignoring short initial for connection {}", dst_cid);
@@ -572,8 +661,6 @@ impl Endpoint {
             panic!("non-initial packet in handle_first_packet()");
         };
 
-        let server_config = self.server_config.as_ref().unwrap().clone();
-
         // A connection attempt begins with the first byte of the ClientHello: CRYPTO data at
         // offset 0 (RFC 9001 §4.1.3). A ClientHello larger than one datagram, as a post-quantum
         // key share makes it (X25519MLKEM768 adds 1,184 bytes, draft-ietf-tls-ecdhe-mlkem), spans
@@ -590,7 +677,7 @@ impl Endpoint {
                     event.ecn,
                     raw,
                     header.dst_cid,
-                    &server_config,
+                    server_handle,
                 );
                 return None;
             }
@@ -600,9 +687,10 @@ impl Endpoint {
             }
         }
 
+        let server_config = self.configs.server_config(server_handle)?;
         let token = match IncomingToken::from_header(
             &header,
-            &server_config,
+            server_config,
             &mut *self.token_log,
             addresses.remote,
         ) {
@@ -622,9 +710,12 @@ impl Endpoint {
 
         // Datagrams held for this attempt before its ClientHello began go to the connection with
         // the rest of its buffered datagrams.
+        if !self.configs.acquire(server_handle.0) {
+            return None;
+        }
         let (datagrams, total_bytes) = self.release_held(header.dst_cid);
         let incoming_idx = self.incoming_buffers.insert(IncomingBuffer {
-            server_config,
+            server_config: server_handle,
             datagrams,
             total_bytes,
         });
@@ -656,8 +747,14 @@ impl Endpoint {
         ecn: Option<EcnCodepoint>,
         data: BytesMut,
         dst_cid: ConnectionId,
-        server_config: &ServerConfig,
+        server_config: ServerConfigHandle,
     ) {
+        let Some(server_config) = self.configs.server_config(server_config) else {
+            return;
+        };
+        let initial_rtt = server_config.transport.initial_rtt;
+        let incoming_buffer_size = server_config.incoming_buffer_size;
+        let incoming_buffer_size_total = server_config.incoming_buffer_size_total;
         let len = data.len() as u64;
         let key = match self.index.held(&dst_cid) {
             Some(key) => key,
@@ -665,7 +762,7 @@ impl Endpoint {
                 // RFC 9002 §6.2.1: PTO = smoothed_rtt + max(4 × rttvar, kGranularity), with no
                 // max_ack_delay in the Initial space; before any RTT sample, smoothed_rtt is the
                 // initial RTT and rttvar half of it (§5.3).
-                let rtt = server_config.transport.initial_rtt;
+                let rtt = initial_rtt;
                 let pto = rtt + cmp::max(4 * (rtt / 2), TIMER_GRANULARITY);
                 let Some(expires) = pto.checked_mul(3).and_then(|t| now.checked_add(t)) else {
                     debug!("not holding initial for {}: expiry out of range", dst_cid);
@@ -686,11 +783,11 @@ impl Endpoint {
         let fits = entry
             .total_bytes
             .checked_add(len)
-            .is_some_and(|n| n <= server_config.incoming_buffer_size)
+            .is_some_and(|n| n <= incoming_buffer_size)
             && self
                 .all_incoming_buffers_total_bytes
                 .checked_add(len)
-                .is_some_and(|n| n <= server_config.incoming_buffer_size_total);
+                .is_some_and(|n| n <= incoming_buffer_size_total);
         if !fits {
             debug!("not holding initial for {}: incoming buffers full", dst_cid);
             return;
@@ -757,6 +854,10 @@ impl Endpoint {
     }
 
     /// Attempt to accept this incoming connection (an error may still occur)
+    ///
+    /// `server_config`, when given, is a configuration from
+    /// [`insert_server_config`](Self::insert_server_config) to accept this connection under in
+    /// place of the one active when the attempt arrived.
     // AcceptError cannot be made smaller without semver breakage
     #[allow(clippy::result_large_err)]
     pub fn accept(
@@ -764,7 +865,7 @@ impl Endpoint {
         incoming: Incoming,
         now: Instant,
         buf: &mut Vec<u8>,
-        server_config: Option<Arc<ServerConfig>>,
+        server_config: Option<ServerConfigHandle>,
         qlog: Option<QlogStream>,
     ) -> Result<(ConnectionHandle, Connection), AcceptError> {
         let remote_address_validated = incoming.remote_address_validated();
@@ -779,7 +880,29 @@ impl Endpoint {
             version,
             ..
         } = incoming.packet.header;
-        let server_config = server_config.unwrap_or_else(|| incoming_buffer.server_config.clone());
+        let handle = server_config.unwrap_or(incoming_buffer.server_config);
+        // The connection, if one is made, counts on `handle`; the attempt no longer counts on the
+        // configuration it arrived under
+        let counted = self.configs.acquire(handle.0);
+        self.configs.release(incoming_buffer.server_config.0);
+        let Some(server_config) = self.configs.server_config(handle).filter(|_| counted) else {
+            if counted {
+                self.configs.release(handle.0);
+            }
+            debug!("refusing connection: its server configuration is no longer held");
+            self.index.remove_initial(dst_cid);
+            return Err(AcceptError {
+                cause: ConnectionError::TransportError(released_server_config()),
+                response: Some(self.initial_close(
+                    version,
+                    incoming.addresses,
+                    &incoming.crypto,
+                    &src_cid,
+                    released_server_config(),
+                    buf,
+                )),
+            });
+        };
 
         if server_config
             .transport
@@ -789,6 +912,7 @@ impl Endpoint {
             })
         {
             debug!("abandoning accept of stale initial");
+            self.configs.release(handle.0);
             self.index.remove_initial(dst_cid);
             return Err(AcceptError {
                 cause: ConnectionError::TimedOut,
@@ -798,6 +922,7 @@ impl Endpoint {
 
         if self.cids_exhausted() {
             debug!("refusing connection");
+            self.configs.release(handle.0);
             self.index.remove_initial(dst_cid);
             return Err(AcceptError {
                 cause: ConnectionError::CidsExhausted,
@@ -814,31 +939,59 @@ impl Endpoint {
 
         let ch = ConnectionHandle(self.connections.vacant_key());
         let loc_cid = self.new_cid(ch);
+        let Some(server_config) = self.configs.server_config(handle) else {
+            self.configs.release(handle.0);
+            return Err(AcceptError {
+                cause: ConnectionError::TransportError(released_server_config()),
+                response: None,
+            });
+        };
         let mut params = TransportParameters::new(
             &server_config.transport,
             &self.config,
             self.local_cid_generator.as_ref(),
             loc_cid,
-            Some(&server_config),
+            Some(server_config),
             &mut self.rng,
         );
+        let migration = server_config.migration;
+        let has_preferred_address = server_config.has_preferred_address();
+        let (address_v4, address_v6) = (
+            server_config.preferred_address_v4,
+            server_config.preferred_address_v6,
+        );
+        let validation_tokens_sent = server_config.validation_token.sent;
         params.stateless_reset_token = Some(ResetToken::new(&self.config.reset_key, loc_cid));
         params.original_dst_cid = Some(incoming.token.orig_dst_cid);
         params.retry_src_cid = incoming.token.retry_src_cid;
         let mut pref_addr_cid = None;
-        if server_config.has_preferred_address() {
+        if has_preferred_address {
             let cid = self.new_cid(ch);
             pref_addr_cid = Some(cid);
             params.preferred_address = Some(PreferredAddress {
-                address_v4: server_config.preferred_address_v4,
-                address_v6: server_config.preferred_address_v6,
+                address_v4,
+                address_v6,
                 connection_id: cid,
                 stateless_reset_token: ResetToken::new(&self.config.reset_key, cid),
             });
         }
 
-        let tls = server_config.crypto.clone().start_session(version, &params);
+        let Some(server_config) = self.configs.server_config(handle) else {
+            self.configs.release(handle.0);
+            return Err(AcceptError {
+                cause: ConnectionError::TransportError(released_server_config()),
+                response: None,
+            });
+        };
+        let tls = server_config.crypto.start_session(version, &params);
         let transport_config = server_config.transport.clone();
+        let side_args = SideArgs::Server {
+            migration,
+            has_preferred_address,
+            validation_tokens_sent,
+            pref_addr_cid,
+            path_validated: remote_address_validated,
+        };
         let mut conn = self.add_connection(
             ch,
             version,
@@ -848,17 +1001,15 @@ impl Endpoint {
             incoming.addresses,
             incoming.received_at,
             tls,
+            handle.0,
             transport_config,
             qlog,
-            SideArgs::Server {
-                server_config,
-                pref_addr_cid,
-                path_validated: remote_address_validated,
-            },
+            side_args,
         );
         self.index.insert_initial(dst_cid, ch);
 
         match conn.handle_first_packet(
+            &mut self.configs,
             incoming.received_at,
             incoming.addresses.remote,
             incoming.ecn,
@@ -870,7 +1021,10 @@ impl Endpoint {
                 trace!(id = ch.0, icid = %dst_cid, "new connection");
 
                 for event in incoming_buffer.datagrams {
-                    conn.handle_event(ConnectionEvent(ConnectionEventInner::Datagram(event)))
+                    conn.handle_event(
+                        ConnectionEvent(ConnectionEventInner::Datagram(event)),
+                        &mut self.configs,
+                    )
                 }
 
                 Ok((ch, conn))
@@ -942,11 +1096,12 @@ impl Endpoint {
             return Err(RetryError(Box::new(incoming)));
         }
 
-        let server_config = self.incoming_buffers[incoming.incoming_idx]
-            .server_config
-            .clone();
-        self.clean_up_incoming(&incoming);
-        incoming.improper_drop_warner.dismiss();
+        let server_handle = self.incoming_buffers[incoming.incoming_idx].server_config;
+        let Some(server_config) = self.configs.server_config(server_handle) else {
+            // A pending attempt keeps its configuration's slot; were it gone, nothing could sign
+            // the token, and the attempt is handed back untouched
+            return Err(RetryError(Box::new(incoming)));
+        };
 
         // First Initial
         // The peer will use this as the DCID of its following Initials. Initial DCIDs are
@@ -978,6 +1133,9 @@ impl Endpoint {
         ));
         encode.finish(buf, &*incoming.crypto.header.local, None);
 
+        self.clean_up_incoming(&incoming);
+        incoming.improper_drop_warner.dismiss();
+
         Ok(Transmit {
             destination: incoming.addresses.remote,
             ecn: None,
@@ -1001,6 +1159,7 @@ impl Endpoint {
         self.index.remove_initial(incoming.packet.header.dst_cid);
         let incoming_buffer = self.incoming_buffers.remove(incoming.incoming_idx);
         self.all_incoming_buffers_total_bytes -= incoming_buffer.total_bytes;
+        self.configs.release(incoming_buffer.server_config.0);
     }
 
     fn add_connection(
@@ -1013,6 +1172,7 @@ impl Endpoint {
         addresses: FourTuple,
         now: Instant,
         tls: Box<dyn crypto::Session>,
+        shared_config: ConfigKey,
         transport_config: TransportConfig,
         qlog: Option<QlogStream>,
         side_args: SideArgs,
@@ -1031,6 +1191,7 @@ impl Endpoint {
             addresses.remote,
             addresses.local_ip,
             tls,
+            shared_config,
             self.local_cid_generator.as_ref(),
             now,
             version,
@@ -1058,6 +1219,7 @@ impl Endpoint {
             addresses,
             side,
             reset_token: None,
+            config: shared_config,
         });
         debug_assert_eq!(id, ch.0, "connection handle allocation out of sync");
 
@@ -1224,7 +1386,8 @@ fn classify_first_initial(payload: &BytesMut) -> FirstInitial {
 
 /// Buffered Initial and 0-RTT messages for a pending incoming connection
 struct IncomingBuffer {
-    server_config: Arc<ServerConfig>,
+    /// The configuration the attempt arrived under, counted on until it is accepted or dismissed
+    server_config: ServerConfigHandle,
     datagrams: Vec<DatagramConnectionEvent>,
     total_bytes: u64,
 }
@@ -1409,6 +1572,8 @@ pub(crate) struct ConnectionMeta {
     /// Reset token provided by the peer for the CID we're currently sending to, and the address
     /// being sent to
     reset_token: Option<(SocketAddr, ResetToken)>,
+    /// The configuration slot the connection counts on, released when it drains
+    config: ConfigKey,
 }
 
 /// Internal identifier for a `Connection` currently associated with an endpoint
@@ -1527,6 +1692,14 @@ impl Drop for IncomingImproperDropWarner {
     }
 }
 
+/// The error for an incoming attempt whose server configuration's slot no longer holds it
+///
+/// The endpoint keeps a slot while attempts or connections count on it, so this is reached only
+/// through a handle from [`Endpoint::insert_server_config`] that was retired with nothing on it.
+fn released_server_config() -> TransportError {
+    TransportError::CONNECTION_REFUSED("server configuration no longer held")
+}
+
 /// Errors in the parameters being used to create a new connection
 ///
 /// These arise before any I/O has been performed.
@@ -1555,6 +1728,11 @@ pub enum ConnectError {
     /// Use `Endpoint::connect_with` to specify a client configuration.
     #[error("no default client config")]
     NoDefaultClientConfig,
+    /// The client configuration handle does not refer to a configuration this endpoint holds
+    ///
+    /// The configuration was retired, or the handle came from another endpoint.
+    #[error("unknown client configuration")]
+    UnknownConfig,
     /// The local endpoint does not support the QUIC version specified in the client configuration
     #[error("unsupported QUIC version")]
     UnsupportedVersion,

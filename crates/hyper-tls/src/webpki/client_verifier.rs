@@ -1,3 +1,4 @@
+use alloc::boxed::Box;
 use alloc::vec::Vec;
 
 use pki_types::{CertificateDer, CertificateRevocationListDer, UnixTime};
@@ -9,7 +10,6 @@ use crate::crypto;
 use crate::crypto::{CryptoProvider, WebPkiSupportedAlgorithms};
 #[cfg(doc)]
 use crate::server::ServerConfig;
-use crate::sync::Arc;
 use crate::verify::{
     ClientCertVerified, ClientCertVerifier, DigitallySignedStruct, HandshakeSignatureValid,
     NoClientAuth,
@@ -25,7 +25,7 @@ use crate::{DistinguishedName, Error, RootCertStore, SignatureScheme};
 /// For more information, see the [`WebPkiClientVerifier`] documentation.
 #[derive(Debug, Clone)]
 pub struct ClientCertVerifierBuilder {
-    roots: Arc<RootCertStore>,
+    roots: RootCertStore,
     root_hint_subjects: Vec<DistinguishedName>,
     crls: Vec<CertificateRevocationListDer<'static>>,
     revocation_check_depth: RevocationCheckDepth,
@@ -36,10 +36,7 @@ pub struct ClientCertVerifierBuilder {
 }
 
 impl ClientCertVerifierBuilder {
-    pub(crate) fn new(
-        roots: Arc<RootCertStore>,
-        supported_algs: WebPkiSupportedAlgorithms,
-    ) -> Self {
+    pub(crate) fn new(roots: RootCertStore, supported_algs: WebPkiSupportedAlgorithms) -> Self {
         Self {
             root_hint_subjects: roots.subjects(),
             roots,
@@ -161,7 +158,7 @@ impl ClientCertVerifierBuilder {
     /// If `with_signature_verification_algorithms` was not called on the builder, a default set of
     /// signature verification algorithms is used, controlled by the selected [`CryptoProvider`].
     ///
-    /// Once built, the provided `Arc<dyn ClientCertVerifier>` can be used with a Rustls
+    /// Once built, the provided `Box<dyn ClientCertVerifier>` can be used with a Rustls
     /// [`ServerConfig`] to configure client certificate validation using
     /// [`with_client_cert_verifier`][ConfigBuilder<ClientConfig, WantsVerifier>::with_client_cert_verifier].
     ///
@@ -169,12 +166,12 @@ impl ClientCertVerifierBuilder {
     /// This function will return a [`VerifierBuilderError`] if:
     /// 1. No trust anchors have been provided.
     /// 2. DER encoded CRLs have been provided that can not be parsed successfully.
-    pub fn build(self) -> Result<Arc<dyn ClientCertVerifier>, VerifierBuilderError> {
+    pub fn build(self) -> Result<Box<dyn ClientCertVerifier>, VerifierBuilderError> {
         if self.roots.is_empty() {
             return Err(VerifierBuilderError::NoRootAnchors);
         }
 
-        Ok(Arc::new(WebPkiClientVerifier::new(
+        Ok(Box::new(WebPkiClientVerifier::new(
             self.roots,
             self.root_hint_subjects,
             parse_crls(self.crls)?,
@@ -193,7 +190,7 @@ impl ClientCertVerifierBuilder {
 /// It must be created via the [`WebPkiClientVerifier::builder()`] or
 /// [`WebPkiClientVerifier::builder_with_provider()`] functions.
 ///
-/// Once built, the provided `Arc<dyn ClientCertVerifier>` can be used with a Rustls [`ServerConfig`]
+/// Once built, the provided `Box<dyn ClientCertVerifier>` can be used with a Rustls [`ServerConfig`]
 /// to configure client certificate validation using [`with_client_cert_verifier`][ConfigBuilder<ClientConfig, WantsVerifier>::with_client_cert_verifier].
 ///
 /// Example:
@@ -244,7 +241,7 @@ impl ClientCertVerifierBuilder {
 /// [^1]: <https://github.com/rustls/webpki>
 #[derive(Debug)]
 pub struct WebPkiClientVerifier {
-    roots: Arc<RootCertStore>,
+    roots: RootCertStore,
     root_hint_subjects: Vec<DistinguishedName>,
     crls: Vec<CertRevocationList<'static>>,
     revocation_check_depth: RevocationCheckDepth,
@@ -265,7 +262,7 @@ impl WebPkiClientVerifier {
     /// Use [`Self::builder_with_provider`] if you wish to specify an explicit provider.
     ///
     /// For more information, see the [`ClientCertVerifierBuilder`] documentation.
-    pub fn builder(roots: Arc<RootCertStore>) -> ClientCertVerifierBuilder {
+    pub fn builder(roots: RootCertStore) -> ClientCertVerifierBuilder {
         Self::builder_with_provider(
             roots,
             CryptoProvider::get_default_or_install_from_crate_features(),
@@ -283,7 +280,7 @@ impl WebPkiClientVerifier {
     ///
     /// For more information, see the [`ClientCertVerifierBuilder`] documentation.
     pub fn builder_with_provider(
-        roots: Arc<RootCertStore>,
+        roots: RootCertStore,
         provider: &CryptoProvider,
     ) -> ClientCertVerifierBuilder {
         ClientCertVerifierBuilder::new(roots, provider.signature_verification_algorithms)
@@ -294,8 +291,8 @@ impl WebPkiClientVerifier {
     ///
     /// This is in contrast to using `WebPkiClientVerifier::builder().allow_unauthenticated().build()`,
     /// which will produce a verifier that will offer client authentication, but not require it.
-    pub fn no_client_auth() -> Arc<dyn ClientCertVerifier> {
-        Arc::new(NoClientAuth {})
+    pub fn no_client_auth() -> Box<dyn ClientCertVerifier> {
+        Box::new(NoClientAuth {})
     }
 
     /// Construct a new `WebpkiClientVerifier`.
@@ -313,7 +310,7 @@ impl WebPkiClientVerifier {
     ///   clients can connect.
     /// * `supported_algs` specifies which signature verification algorithms should be used.
     pub(crate) fn new(
-        roots: Arc<RootCertStore>,
+        roots: RootCertStore,
         root_hint_subjects: Vec<DistinguishedName>,
         crls: Vec<CertRevocationList<'static>>,
         revocation_check_depth: RevocationCheckDepth,
@@ -433,7 +430,6 @@ mod tests {
 
     use super::{provider, WebPkiClientVerifier};
     use crate::server::VerifierBuilderError;
-    use crate::sync::Arc;
     use crate::RootCertStore;
 
     fn load_crls(crls_der: &[&[u8]]) -> Vec<CertificateRevocationListDer<'static>> {
@@ -450,15 +446,15 @@ mod tests {
         ])
     }
 
-    fn load_roots(roots_der: &[&[u8]]) -> Arc<RootCertStore> {
+    fn load_roots(roots_der: &[&[u8]]) -> RootCertStore {
         let mut roots = RootCertStore::empty();
         roots_der
             .iter()
             .for_each(|der| roots.add(CertificateDer::from(der.to_vec())).unwrap());
-        roots.into()
+        roots
     }
 
-    fn test_roots() -> Arc<RootCertStore> {
+    fn test_roots() -> RootCertStore {
         load_roots(&[
             include_bytes!("../../test-ca/ecdsa-p256/ca.der").as_slice(),
             include_bytes!("../../test-ca/rsa-2048/ca.der").as_slice(),
@@ -633,7 +629,7 @@ mod tests {
     fn test_builder_no_roots() {
         // Trying to create a client verifier builder with no trust anchors should fail at build time
         let result = WebPkiClientVerifier::builder_with_provider(
-            RootCertStore::empty().into(),
+            RootCertStore::empty(),
             &provider::default_provider(),
         )
         .build();

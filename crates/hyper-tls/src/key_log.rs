@@ -10,8 +10,8 @@ use crate::KeyLogFile;
 /// sensitive and can break the security of past, present and
 /// future sessions.
 ///
-/// You'll likely want some interior mutability in your
-/// implementation to make this useful.
+/// A key log is owned by its configuration and written through `&mut`: the calls that
+/// derive secrets take the configuration mutably, so no interior mutability is needed.
 ///
 /// See [`KeyLogFile`] that implements the standard
 /// `SSLKEYLOGFILE` environment variable behaviour.
@@ -36,7 +36,7 @@ pub trait KeyLog: Debug + Send + Sync {
     ///
     /// These strings are selected to match the NSS key log format:
     /// <https://nss-crypto.org/reference/security/nss/legacy/key_log_format/index.html>
-    fn log(&self, label: &str, client_random: &[u8], secret: &[u8]);
+    fn log(&mut self, label: &str, client_random: &[u8], secret: &[u8]);
 
     /// Indicates whether the secret with label `label` will be logged.
     ///
@@ -53,7 +53,7 @@ pub trait KeyLog: Debug + Send + Sync {
 pub struct NoKeyLog;
 
 impl KeyLog for NoKeyLog {
-    fn log(&self, _: &str, _: &[u8], _: &[u8]) {}
+    fn log(&mut self, _: &str, _: &[u8], _: &[u8]) {}
     #[inline]
     fn will_log(&self, _label: &str) -> bool {
         false

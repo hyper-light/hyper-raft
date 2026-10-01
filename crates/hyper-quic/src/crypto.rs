@@ -8,7 +8,7 @@
 //! Note that usage of any protocol (version) other than TLS 1.3 does not conform to any
 //! published versions of the specification, and will not be supported in QUIC v1.
 
-use std::{any::Any, str, sync::Arc};
+use std::{any::Any, str};
 
 use bytes::BytesMut;
 
@@ -58,7 +58,14 @@ pub trait Session: Send + Sync + 'static {
     /// handshake data is available. Future calls will always return false.
     ///
     /// On success, returns `true` iff `self.handshake_data()` has been populated.
-    fn read_handshake(&mut self, buf: &[u8]) -> Result<bool, TransportError>;
+    ///
+    /// `config` is the configuration the session was started from, lent for this call by the
+    /// endpoint that owns it: the session holds no configuration of its own.
+    fn read_handshake(
+        &mut self,
+        config: SessionConfig<'_>,
+        buf: &[u8],
+    ) -> Result<bool, TransportError>;
 
     /// The peer's QUIC transport parameters
     ///
@@ -91,6 +98,17 @@ pub trait Session: Send + Sync + 'static {
     ) -> Result<(), ExportKeyingMaterialError>;
 }
 
+/// The configuration a session's handshake reads with, lent for one call
+///
+/// An endpoint owns its configurations in its [`Configs`](crate::Configs); a connection holds only
+/// a handle to the one it was started from, and the endpoint lends it here.
+pub enum SessionConfig<'a> {
+    /// The configuration of an outgoing connection
+    Client(&'a mut dyn ClientConfig),
+    /// The configuration of an incoming connection
+    Server(&'a mut dyn ServerConfig),
+}
+
 /// A pair of keys for bidirectional communication
 pub struct KeyPair<T> {
     /// Key for encrypting data
@@ -108,10 +126,16 @@ pub struct Keys {
 }
 
 /// Client-side configuration for the crypto protocol
-pub trait ClientConfig: Send + Sync {
+///
+/// `Any` lets a session recover its own implementation's configuration from the
+/// [`SessionConfig`] it is lent.
+pub trait ClientConfig: Any + Send + Sync {
     /// Start a client session with this configuration
+    ///
+    /// Takes `&mut self` because starting a session may consume state the configuration owns, such
+    /// as a stored resumption ticket.
     fn start_session(
-        self: Arc<Self>,
+        &mut self,
         version: u32,
         server_name: &str,
         params: &TransportParameters,
@@ -119,7 +143,10 @@ pub trait ClientConfig: Send + Sync {
 }
 
 /// Server-side configuration for the crypto protocol
-pub trait ServerConfig: Send + Sync {
+///
+/// `Any` lets a session recover its own implementation's configuration from the
+/// [`SessionConfig`] it is lent.
+pub trait ServerConfig: Any + Send + Sync {
     /// Create the initial set of keys given the client's initial destination ConnectionId
     fn initial_keys(
         &self,
@@ -135,11 +162,7 @@ pub trait ServerConfig: Send + Sync {
     /// Start a server session with this configuration
     ///
     /// Never called if `initial_keys` rejected `version`.
-    fn start_session(
-        self: Arc<Self>,
-        version: u32,
-        params: &TransportParameters,
-    ) -> Box<dyn Session>;
+    fn start_session(&self, version: u32, params: &TransportParameters) -> Box<dyn Session>;
 }
 
 /// Keys used to protect packet payloads

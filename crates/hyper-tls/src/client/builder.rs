@@ -3,13 +3,14 @@ use core::marker::PhantomData;
 
 use pki_types::{CertificateDer, PrivateKeyDer};
 
-use super::client_conn::Resumption;
+use alloc::boxed::Box;
+
+use super::client_conn::ClientSettings;
 use crate::builder::{ConfigBuilder, WantsVerifier};
 use crate::client::{handy, ClientConfig, EchMode, ResolvesClientCert};
 use crate::error::Error;
-use crate::key_log::NoKeyLog;
+use crate::identity::Identity;
 use crate::sign::{CertifiedKey, SingleCertAndKey};
-use crate::sync::Arc;
 use crate::versions::TLS13;
 use crate::webpki::{self, WebPkiServerVerifier};
 use crate::{compress, verify, versions, WantsVersions};
@@ -50,12 +51,12 @@ impl ConfigBuilder<ClientConfig, WantsVerifier> {
     /// ```
     pub fn with_root_certificates(
         self,
-        root_store: impl Into<Arc<webpki::RootCertStore>>,
+        root_store: webpki::RootCertStore,
     ) -> ConfigBuilder<ClientConfig, WantsClientCert> {
         let algorithms = self.provider.signature_verification_algorithms;
-        self.with_webpki_verifier(
-            WebPkiServerVerifier::new_without_revocation(root_store, algorithms).into(),
-        )
+        self.with_webpki_verifier(Box::new(WebPkiServerVerifier::new_without_revocation(
+            root_store, algorithms,
+        )))
     }
 
     /// Choose how to verify server certificates using a webpki verifier.
@@ -64,7 +65,7 @@ impl ConfigBuilder<ClientConfig, WantsVerifier> {
     /// [`webpki::WebPkiServerVerifier::builder_with_provider`] for more information.
     pub fn with_webpki_verifier(
         self,
-        verifier: Arc<WebPkiServerVerifier>,
+        verifier: Box<WebPkiServerVerifier>,
     ) -> ConfigBuilder<ClientConfig, WantsClientCert> {
         ConfigBuilder {
             state: WantsClientCert {
@@ -89,8 +90,9 @@ impl ConfigBuilder<ClientConfig, WantsVerifier> {
 pub(super) mod danger {
     use core::marker::PhantomData;
 
+    use alloc::boxed::Box;
+
     use crate::client::WantsClientCert;
-    use crate::sync::Arc;
     use crate::{verify, ClientConfig, ConfigBuilder, WantsVerifier};
 
     /// Accessor for dangerous configuration options.
@@ -104,7 +106,7 @@ pub(super) mod danger {
         /// Set a custom certificate verifier.
         pub fn with_custom_certificate_verifier(
             self,
-            verifier: Arc<dyn verify::ServerCertVerifier>,
+            verifier: Box<dyn verify::ServerCertVerifier>,
         ) -> ConfigBuilder<ClientConfig, WantsClientCert> {
             ConfigBuilder {
                 state: WantsClientCert {
@@ -124,10 +126,9 @@ pub(super) mod danger {
 /// certificate.
 ///
 /// For more information, see the [`ConfigBuilder`] documentation.
-#[derive(Clone)]
 pub struct WantsClientCert {
     versions: versions::EnabledVersions,
-    verifier: Arc<dyn verify::ServerCertVerifier>,
+    verifier: Box<dyn verify::ServerCertVerifier>,
     client_ech_mode: Option<EchMode>,
 }
 
@@ -146,42 +147,41 @@ impl ConfigBuilder<ClientConfig, WantsClientCert> {
         cert_chain: Vec<CertificateDer<'static>>,
         key_der: PrivateKeyDer<'static>,
     ) -> Result<ClientConfig, Error> {
-        let certified_key = CertifiedKey::from_der(cert_chain, key_der, &self.provider)?;
-        Ok(self.with_client_cert_resolver(Arc::new(SingleCertAndKey::from(certified_key))))
+        let certified_key = CertifiedKey::from_der(cert_chain, key_der, self.provider)?;
+        Ok(self.with_client_cert_resolver(Box::new(SingleCertAndKey::from(certified_key))))
     }
 
     /// Do not support client auth.
     pub fn with_no_client_auth(self) -> ClientConfig {
-        self.with_client_cert_resolver(Arc::new(handy::FailResolveClientCert {}))
+        self.with_client_cert_resolver(Box::new(handy::FailResolveClientCert {}))
     }
 
     /// Sets a custom [`ResolvesClientCert`].
     pub fn with_client_cert_resolver(
         self,
-        client_auth_cert_resolver: Arc<dyn ResolvesClientCert>,
+        client_auth_cert_resolver: Box<dyn ResolvesClientCert>,
     ) -> ClientConfig {
         let require_ems = self.provider.fips();
 
-        ClientConfig {
+        ClientConfig::from_settings(ClientSettings {
             provider: self.provider,
             alpn_protocols: Vec::new(),
             check_selected_alpn: true,
-            resumption: Resumption::default(),
             max_fragment_size: None,
             client_auth_cert_resolver,
+            client_auth_cert_resolver_identity: Identity::fresh(),
             versions: self.state.versions,
             enable_sni: true,
             verifier: self.state.verifier,
-            key_log: Arc::new(NoKeyLog {}),
+            verifier_identity: Identity::fresh(),
             enable_secret_extraction: false,
             enable_early_data: false,
             require_ems,
             time_provider: self.time_provider,
             cert_compressors: compress::default_cert_compressors().to_vec(),
-            cert_compression_cache: Arc::new(compress::CompressionCache::default()),
             cert_decompressors: compress::default_cert_decompressors().to_vec(),
             ech_mode: self.state.client_ech_mode,
             send_ticket_request: None,
-        }
+        })
     }
 }

@@ -2,12 +2,11 @@
 
 use std::num::NonZeroUsize;
 
-use hyper_tls::client::{ClientConnectionData, EarlyDataError, UnbufferedClientConnection};
+use hyper_tls::client::EarlyDataError;
 use hyper_tls::crypto::CryptoProvider;
-use hyper_tls::server::{ServerConnectionData, UnbufferedServerConnection};
 use hyper_tls::unbuffered::{
     ConnectionState, EncodeError, EncryptError, InsufficientSizeError, ReadTraffic,
-    UnbufferedConnectionCommon, UnbufferedStatus, WriteTraffic,
+    UnbufferedStatus, WriteTraffic,
 };
 use hyper_tls::version::TLS13;
 use hyper_tls::{
@@ -122,9 +121,9 @@ fn handshake_config(
     editor(&mut client_config, &mut server_config);
 
     run(
-        Arc::new(client_config),
+        Shared::new(client_config),
         &mut NO_ACTIONS.clone(),
-        Arc::new(server_config),
+        Shared::new(server_config),
         &mut NO_ACTIONS.clone(),
     )
 }
@@ -145,9 +144,9 @@ fn app_data_client_to_server() {
         };
 
         let outcome = run(
-            Arc::new(client_config),
+            Shared::new(client_config),
             &mut client_actions,
-            Arc::new(server_config),
+            Shared::new(server_config),
             &mut NO_ACTIONS.clone(),
         );
 
@@ -172,9 +171,9 @@ fn app_data_server_to_client() {
         };
 
         let outcome = run(
-            Arc::new(client_config),
+            Shared::new(client_config),
             &mut NO_ACTIONS.clone(),
-            Arc::new(server_config),
+            Shared::new(server_config),
             &mut server_actions,
         );
 
@@ -190,12 +189,12 @@ fn early_data() {
 
     let mut server_config = make_server_config(KeyType::Rsa2048, &provider);
     server_config.max_early_data_size = 128;
-    let server_config = Arc::new(server_config);
+    let server_config = Shared::new(server_config);
 
     let mut client_config =
         make_client_config_with_versions(KeyType::Rsa2048, &[&TLS13], &provider);
     client_config.enable_early_data = true;
-    let client_config = Arc::new(client_config);
+    let client_config = Shared::new(client_config);
 
     // first handshake allows the second to be a resumption and use 0-RTT
     let outcome = run(
@@ -254,9 +253,9 @@ fn early_data() {
 }
 
 fn run(
-    client_config: Arc<ClientConfig>,
+    client_config: Shared<ClientConfig>,
     client_actions: &mut Actions,
-    server_config: Arc<ServerConfig>,
+    server_config: Shared<ServerConfig>,
     server_actions: &mut Actions,
 ) -> Outcome {
     let mut outcome = Outcome::default();
@@ -265,8 +264,8 @@ fn run(
     let mut server_handshake_done = false;
 
     let mut client =
-        UnbufferedClientConnection::new(client_config.clone(), server_name("localhost")).unwrap();
-    let mut server = UnbufferedServerConnection::new(server_config.clone()).unwrap();
+        TestUnbufferedClient::new(client_config.clone(), server_name("localhost")).unwrap();
+    let mut server = TestUnbufferedServer::new(server_config.clone()).unwrap();
     let mut buffers = BothBuffers::default();
 
     while !(client_handshake_done
@@ -416,9 +415,9 @@ fn close_notify_client_to_server() {
         };
 
         let outcome = run(
-            Arc::new(client_config),
+            Shared::new(client_config),
             &mut client_actions,
-            Arc::new(server_config),
+            Shared::new(server_config),
             &mut NO_ACTIONS.clone(),
         );
 
@@ -442,9 +441,9 @@ fn close_notify_server_to_client() {
         };
 
         let outcome = run(
-            Arc::new(client_config),
+            Shared::new(client_config),
             &mut NO_ACTIONS.clone(),
-            Arc::new(server_config),
+            Shared::new(server_config),
             &mut server_actions,
         );
 
@@ -715,9 +714,9 @@ fn refresh_traffic_keys_automatically() {
 
     let server_config = make_server_config(KeyType::Rsa2048, &provider::default_provider());
     let mut outcome = run(
-        Arc::new(client_config),
+        Shared::new(client_config),
         &mut NO_ACTIONS.clone(),
-        Arc::new(server_config),
+        Shared::new(server_config),
         &mut NO_ACTIONS.clone(),
     );
     let mut server = outcome.server.take().unwrap();
@@ -784,9 +783,9 @@ fn tls12_connection_fails_after_key_reaches_confidentiality_limit() {
 
     let server_config = make_server_config(KeyType::Ed25519, &provider::default_provider());
     let mut outcome = run(
-        Arc::new(client_config),
+        Shared::new(client_config),
         &mut NO_ACTIONS.clone(),
-        Arc::new(server_config),
+        Shared::new(server_config),
         &mut NO_ACTIONS.clone(),
     );
     let mut server = outcome.server.take().unwrap();
@@ -856,13 +855,12 @@ fn tls13_packed_handshake() {
     .with_safe_default_protocol_versions()
     .unwrap()
     .dangerous()
-    .with_custom_certificate_verifier(Arc::new(MockServerVerifier::rejects_certificate(
+    .with_custom_certificate_verifier(Box::new(MockServerVerifier::rejects_certificate(
         CertificateError::UnknownIssuer.into(),
     )))
     .with_no_client_auth();
 
-    let mut client =
-        UnbufferedClientConnection::new(Arc::new(client_config), server_name("localhost")).unwrap();
+    let mut client = TestUnbufferedClient::new(client_config, server_name("localhost")).unwrap();
 
     let (_hello, _) = encode_tls_data(client.process_tls_records(&mut []));
     confirm_transmit_tls_data(client.process_tls_records(&mut []));
@@ -881,10 +879,10 @@ fn tls13_packed_handshake() {
 
 #[test]
 fn rejects_junk() {
-    let mut server = UnbufferedServerConnection::new(Arc::new(make_server_config(
+    let mut server = TestUnbufferedServer::new(make_server_config(
         KeyType::Rsa2048,
         &provider::default_provider(),
-    )))
+    ))
     .unwrap();
 
     let mut buf = [0xff; 5];
@@ -1074,19 +1072,19 @@ impl Actions<'_> {
 
 #[derive(Default)]
 struct Outcome {
-    server: Option<UnbufferedServerConnection>,
+    server: Option<TestUnbufferedServer>,
     server_transcript: Vec<String>,
     server_received_early_data: Vec<Vec<u8>>,
     server_received_app_data: Vec<Vec<u8>>,
     server_saw_peer_closed_state: bool,
-    client: Option<UnbufferedClientConnection>,
+    client: Option<TestUnbufferedClient>,
     client_transcript: Vec<String>,
     client_received_app_data: Vec<Vec<u8>>,
     client_saw_peer_closed_state: bool,
 }
 
 fn advance_client(
-    conn: &mut UnbufferedConnectionCommon<ClientConnectionData>,
+    conn: &mut TestUnbufferedClient,
     buffers: &mut Buffers,
     actions: Actions,
     transcript: &mut Vec<String>,
@@ -1131,7 +1129,7 @@ fn advance_client(
 }
 
 fn advance_server(
-    conn: &mut UnbufferedConnectionCommon<ServerConnectionData>,
+    conn: &mut TestUnbufferedServer,
     buffers: &mut Buffers,
     actions: Actions,
     transcript: &mut Vec<String>,
@@ -1382,14 +1380,13 @@ impl Buffer {
 
 fn make_connection_pair(
     version: &'static hyper_tls::SupportedProtocolVersion,
-) -> (UnbufferedClientConnection, UnbufferedServerConnection) {
+) -> (TestUnbufferedClient, TestUnbufferedServer) {
     let provider = provider::default_provider();
     let server_config = make_server_config(KeyType::Rsa2048, &provider);
     let client_config = make_client_config_with_versions(KeyType::Rsa2048, &[version], &provider);
 
-    let client =
-        UnbufferedClientConnection::new(Arc::new(client_config), server_name("localhost")).unwrap();
-    let server = UnbufferedServerConnection::new(Arc::new(server_config)).unwrap();
+    let client = TestUnbufferedClient::new(client_config, server_name("localhost")).unwrap();
+    let server = TestUnbufferedServer::new(server_config).unwrap();
     (client, server)
 }
 
@@ -1493,13 +1490,13 @@ fn test_secret_extraction_enabled() {
             .unwrap();
         // Opt into secret extraction from both sides
         server_config.enable_secret_extraction = true;
-        let server_config = Arc::new(server_config);
+        let server_config = Shared::new(server_config);
 
         let mut client_config = make_client_config(kt, &provider);
         client_config.enable_secret_extraction = true;
 
         let mut outcome = run(
-            Arc::new(client_config),
+            Shared::new(client_config),
             &mut NO_ACTIONS.clone(),
             server_config.clone(),
             &mut NO_ACTIONS.clone(),
@@ -1509,8 +1506,8 @@ fn test_secret_extraction_enabled() {
         let server = outcome.server.take().unwrap();
 
         // The handshake is finished, we're now able to extract traffic secrets
-        let client_secrets = client.dangerous_into_kernel_connection().unwrap().0;
-        let server_secrets = server.dangerous_into_kernel_connection().unwrap().0;
+        let client_secrets = client.conn.dangerous_into_kernel_connection().unwrap().0;
+        let server_secrets = server.conn.dangerous_into_kernel_connection().unwrap().0;
 
         // Comparing secrets for equality is something you should never have to
         // do in production code, so ConnectionTrafficSecrets doesn't implement
@@ -1550,19 +1547,19 @@ fn test_secret_extraction_enabled() {
 fn kernel_err_on_secret_extraction_not_enabled() {
     let provider = provider::default_provider();
     let server_config = make_server_config(KeyType::Rsa2048, &provider);
-    let server_config = Arc::new(server_config);
+    let server_config = Shared::new(server_config);
 
     let client_config = make_client_config(KeyType::Rsa2048, &provider);
-    let client_config = Arc::new(client_config);
+    let client_config = Shared::new(client_config);
 
-    let mut server = UnbufferedServerConnection::new(server_config).unwrap();
+    let mut server = TestUnbufferedServer::new(server_config).unwrap();
     let mut client =
-        UnbufferedClientConnection::new(client_config, "localhost".try_into().unwrap()).unwrap();
+        TestUnbufferedClient::new(client_config, "localhost".try_into().unwrap()).unwrap();
 
     do_unbuffered_handshake(&mut client, &mut server);
 
-    assert!(client.dangerous_into_kernel_connection().is_err());
-    assert!(server.dangerous_into_kernel_connection().is_err());
+    assert!(client.conn.dangerous_into_kernel_connection().is_err());
+    assert!(server.conn.dangerous_into_kernel_connection().is_err());
 }
 
 #[test]
@@ -1570,22 +1567,21 @@ fn kernel_err_on_handshake_not_complete() {
     let provider = provider::default_provider();
     let mut server_config = make_server_config(KeyType::Rsa2048, &provider);
     server_config.enable_secret_extraction = true;
-    let server_config = Arc::new(server_config);
+    let server_config = Shared::new(server_config);
 
     let mut client_config = make_client_config(KeyType::Rsa2048, &provider);
     client_config.enable_secret_extraction = true;
-    let client_config = Arc::new(client_config);
+    let client_config = Shared::new(client_config);
 
-    let server = UnbufferedServerConnection::new(server_config).unwrap();
-    let client =
-        UnbufferedClientConnection::new(client_config, "localhost".try_into().unwrap()).unwrap();
+    let server = TestUnbufferedServer::new(server_config).unwrap();
+    let client = TestUnbufferedClient::new(client_config, "localhost".try_into().unwrap()).unwrap();
 
     assert!(matches!(
-        client.dangerous_into_kernel_connection(),
+        client.conn.dangerous_into_kernel_connection(),
         Err(Error::HandshakeNotComplete)
     ));
     assert!(matches!(
-        server.dangerous_into_kernel_connection(),
+        server.conn.dangerous_into_kernel_connection(),
         Err(Error::HandshakeNotComplete)
     ));
 }
@@ -1595,22 +1591,24 @@ fn kernel_initial_traffic_secrets_match() {
     let provider = provider::default_provider();
     let mut server_config = make_server_config(KeyType::Rsa2048, &provider);
     server_config.enable_secret_extraction = true;
-    let server_config = Arc::new(server_config);
+    let server_config = Shared::new(server_config);
 
     let mut client_config = make_client_config(KeyType::Rsa2048, &provider);
     client_config.enable_secret_extraction = true;
-    let client_config = Arc::new(client_config);
+    let client_config = Shared::new(client_config);
 
-    let mut server = UnbufferedServerConnection::new(server_config).unwrap();
+    let mut server = TestUnbufferedServer::new(server_config).unwrap();
     let mut client =
-        UnbufferedClientConnection::new(client_config, "localhost".try_into().unwrap()).unwrap();
+        TestUnbufferedClient::new(client_config, "localhost".try_into().unwrap()).unwrap();
 
     do_unbuffered_handshake(&mut client, &mut server);
 
     let (client_secrets, _) = client
+        .conn
         .dangerous_into_kernel_connection()
         .expect("failed to convert client connection to an KernelConnection");
     let (server_secrets, _) = server
+        .conn
         .dangerous_into_kernel_connection()
         .expect("failed to convert server connection to an KernelConnection");
 
@@ -1624,23 +1622,25 @@ fn kernel_key_updates_tls13() {
     let mut server_config =
         make_server_config_with_versions(KeyType::Rsa2048, &[&TLS13], &provider);
     server_config.enable_secret_extraction = true;
-    let server_config = Arc::new(server_config);
+    let server_config = Shared::new(server_config);
 
     let mut client_config =
         make_client_config_with_versions(KeyType::Rsa2048, &[&TLS13], &provider);
     client_config.enable_secret_extraction = true;
-    let client_config = Arc::new(client_config);
+    let client_config = Shared::new(client_config);
 
-    let mut server = UnbufferedServerConnection::new(server_config).unwrap();
+    let mut server = TestUnbufferedServer::new(server_config).unwrap();
     let mut client =
-        UnbufferedClientConnection::new(client_config, "localhost".try_into().unwrap()).unwrap();
+        TestUnbufferedClient::new(client_config, "localhost".try_into().unwrap()).unwrap();
 
     do_unbuffered_handshake(&mut client, &mut server);
 
     let (_, mut client) = client
+        .conn
         .dangerous_into_kernel_connection()
         .expect("failed to convert client connection to an KernelConnection");
     let (_, mut server) = server
+        .conn
         .dangerous_into_kernel_connection()
         .expect("failed to convert server connection to an KernelConnection");
 
@@ -1664,23 +1664,25 @@ fn kernel_key_updates_tls12() {
     let mut server_config =
         make_server_config_with_versions(KeyType::Rsa2048, &[&TLS12], &provider);
     server_config.enable_secret_extraction = true;
-    let server_config = Arc::new(server_config);
+    let server_config = Shared::new(server_config);
 
     let mut client_config =
         make_client_config_with_versions(KeyType::Rsa2048, &[&TLS12], &provider);
     client_config.enable_secret_extraction = true;
-    let client_config = Arc::new(client_config);
+    let client_config = Shared::new(client_config);
 
-    let mut server = UnbufferedServerConnection::new(server_config).unwrap();
+    let mut server = TestUnbufferedServer::new(server_config).unwrap();
     let mut client =
-        UnbufferedClientConnection::new(client_config, "localhost".try_into().unwrap()).unwrap();
+        TestUnbufferedClient::new(client_config, "localhost".try_into().unwrap()).unwrap();
 
     do_unbuffered_handshake(&mut client, &mut server);
 
     let (_, mut client) = client
+        .conn
         .dangerous_into_kernel_connection()
         .expect("failed to convert client connection to an KernelConnection");
     let (_, mut server) = server
+        .conn
         .dangerous_into_kernel_connection()
         .expect("failed to convert server connection to an KernelConnection");
 

@@ -7,7 +7,6 @@ use zeroize::Zeroize;
 
 use crate::msgs::ffdhe_groups::FfdheGroup;
 use crate::sign::SigningKey;
-use crate::sync::Arc;
 pub use crate::webpki::{
     verify_tls12_signature, verify_tls13_signature, verify_tls13_signature_with_raw_key,
     WebPkiSupportedAlgorithms,
@@ -117,7 +116,6 @@ pub use crate::suites::CipherSuiteCommon;
 /// API (with [`ConfigBuilder::with_single_cert`], etc.), it might look like this:
 ///
 /// ```
-/// # use std::sync::Arc;
 /// # mod fictious_hsm_api { pub fn load_private_key(key_der: pki_types::PrivateKeyDer<'static>) -> ! { unreachable!(); } }
 /// use hyper_tls::crypto::aws_lc_rs;
 ///
@@ -132,7 +130,7 @@ pub use crate::suites::CipherSuiteCommon;
 /// struct HsmKeyLoader;
 ///
 /// impl hyper_tls::crypto::KeyProvider for HsmKeyLoader {
-///     fn load_private_key(&self, key_der: pki_types::PrivateKeyDer<'static>) -> Result<Arc<dyn hyper_tls::sign::SigningKey>, hyper_tls::Error> {
+///     fn load_private_key(&self, key_der: pki_types::PrivateKeyDer<'static>) -> Result<Box<dyn hyper_tls::sign::SigningKey>, hyper_tls::Error> {
 ///          fictious_hsm_api::load_private_key(key_der)
 ///     }
 /// }
@@ -305,7 +303,7 @@ pub trait KeyProvider: Send + Sync + Debug {
     fn load_private_key(
         &self,
         key_der: PrivateKeyDer<'static>,
-    ) -> Result<Arc<dyn SigningKey>, Error>;
+    ) -> Result<Box<dyn SigningKey>, Error>;
 
     /// Return `true` if this is backed by a FIPS-approved implementation.
     ///

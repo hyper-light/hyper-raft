@@ -19,7 +19,6 @@ use crate::crypto::hpke::{
 use crate::crypto::tls13::{expand, HkdfExpander, HkdfPrkExtract, HkdfUsingHmac};
 use crate::msgs::enums::{HpkeAead, HpkeKdf, HpkeKem};
 use crate::msgs::handshake::HpkeSymmetricCipherSuite;
-use crate::sync::Arc;
 use crate::{Error, OtherError};
 
 /// Default [RFC 9180] Hybrid Public Key Encryption (HPKE) suites supported by aws-lc-rs cryptography.
@@ -912,7 +911,7 @@ impl<const KDF_LEN: usize> Drop for KemSharedSecret<KDF_LEN> {
 
 fn key_rejected_err(_e: aws_lc_rs::error::KeyRejected) -> Error {
     {
-        Error::Other(OtherError(Arc::new(_e)))
+        Error::Other(OtherError::new(_e))
     }
 }
 
@@ -1147,8 +1146,11 @@ mod rfc_tests {
 
     fn test_vectors() -> Vec<TestVector> {
         serde_json::from_reader(
-            &mut File::open(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/rfc-9180-test-vectors.json"))
-                .expect("failed to open test vectors data file"),
+            &mut File::open(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/data/rfc-9180-test-vectors.json"
+            ))
+            .expect("failed to open test vectors data file"),
         )
         .expect("failed to deserialize test vectors")
     }

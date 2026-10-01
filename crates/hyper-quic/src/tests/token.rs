@@ -27,7 +27,7 @@ fn stateless_retry() {
 fn retry_token_expired() {
     let _guard = subscribe();
 
-    let fake_time = Arc::new(FakeTimeSource::new());
+    let fake_time = FakeTimeSource::new();
     let retry_token_lifetime = Duration::from_secs(1);
 
     let mut pair = Pair::default();
@@ -35,9 +35,9 @@ fn retry_token_expired() {
 
     let mut config = server_config();
     config
-        .time_source(Arc::clone(&fake_time) as _)
+        .time_source(Box::new(fake_time.clone()))
         .retry_token_lifetime(retry_token_lifetime);
-    pair.server.set_server_config(Some(Arc::new(config)));
+    pair.server.set_server_config(Some(config)).unwrap();
 
     let client_ch = pair.begin_connect(client_config());
     pair.drive_client();
@@ -64,8 +64,8 @@ fn retry_token_expired() {
 fn use_token() {
     let _guard = subscribe();
     let mut pair = Pair::default();
-    let client_config = client_config();
-    let (client_ch, _server_ch) = pair.connect_with(client_config.clone());
+    let client_config = pair.add_client_config(client_config());
+    let (client_ch, _server_ch) = pair.connect_with_shared(client_config);
     pair.client
         .connections
         .get_mut(&client_ch)
@@ -82,7 +82,7 @@ fn use_token() {
         assert!(incoming.may_retry());
         IncomingConnectionBehavior::Accept
     });
-    let (client_ch_2, _server_ch_2) = pair.connect_with(client_config);
+    let (client_ch_2, _server_ch_2) = pair.connect_with_shared(client_config);
     pair.client
         .connections
         .get_mut(&client_ch_2)
@@ -99,9 +99,9 @@ fn use_token() {
 fn retry_then_use_token() {
     let _guard = subscribe();
     let mut pair = Pair::default();
-    let client_config = client_config();
+    let client_config = pair.add_client_config(client_config());
     pair.server.handle_incoming = Box::new(validate_incoming);
-    let (client_ch, _server_ch) = pair.connect_with(client_config.clone());
+    let (client_ch, _server_ch) = pair.connect_with_shared(client_config);
     pair.client
         .connections
         .get_mut(&client_ch)
@@ -118,7 +118,7 @@ fn retry_then_use_token() {
         assert!(incoming.may_retry());
         IncomingConnectionBehavior::Accept
     });
-    let (client_ch_2, _server_ch_2) = pair.connect_with(client_config);
+    let (client_ch_2, _server_ch_2) = pair.connect_with_shared(client_config);
     pair.client
         .connections
         .get_mut(&client_ch_2)
@@ -135,8 +135,8 @@ fn retry_then_use_token() {
 fn use_token_then_retry() {
     let _guard = subscribe();
     let mut pair = Pair::default();
-    let client_config = client_config();
-    let (client_ch, _server_ch) = pair.connect_with(client_config.clone());
+    let client_config = pair.add_client_config(client_config());
+    let (client_ch, _server_ch) = pair.connect_with_shared(client_config);
     pair.client
         .connections
         .get_mut(&client_ch)
@@ -166,7 +166,7 @@ fn use_token_then_retry() {
             }
         }
     });
-    let (client_ch_2, _server_ch_2) = pair.connect_with(client_config);
+    let (client_ch_2, _server_ch_2) = pair.connect_with_shared(client_config);
     pair.client
         .connections
         .get_mut(&client_ch_2)
@@ -202,11 +202,11 @@ fn use_same_token_twice() {
 
     let _guard = subscribe();
     let mut pair = Pair::default();
-    let client_config = client_config();
+    let client_config = pair.add_client_config(client_config());
     pair.client
         .endpoint
         .set_token_store(Box::new(EvilTokenStore::default()));
-    let (client_ch, _server_ch) = pair.connect_with(client_config.clone());
+    let (client_ch, _server_ch) = pair.connect_with_shared(client_config);
     pair.client
         .connections
         .get_mut(&client_ch)
@@ -223,7 +223,7 @@ fn use_same_token_twice() {
         assert!(incoming.may_retry());
         IncomingConnectionBehavior::Accept
     });
-    let (client_ch_2, _server_ch_2) = pair.connect_with(client_config.clone());
+    let (client_ch_2, _server_ch_2) = pair.connect_with_shared(client_config);
     pair.client
         .connections
         .get_mut(&client_ch_2)
@@ -240,7 +240,7 @@ fn use_same_token_twice() {
         assert!(incoming.may_retry());
         IncomingConnectionBehavior::Accept
     });
-    let (client_ch_3, _server_ch_3) = pair.connect_with(client_config);
+    let (client_ch_3, _server_ch_3) = pair.connect_with_shared(client_config);
     pair.client
         .connections
         .get_mut(&client_ch_3)
@@ -256,16 +256,16 @@ fn use_same_token_twice() {
 #[test]
 fn use_token_expired() {
     let _guard = subscribe();
-    let fake_time = Arc::new(FakeTimeSource::new());
+    let fake_time = FakeTimeSource::new();
     let lifetime = Duration::from_secs(10000);
     let mut server_config = server_config();
     server_config
-        .time_source(Arc::clone(&fake_time) as _)
+        .time_source(Box::new(fake_time.clone()))
         .validation_token
         .lifetime(lifetime);
     let mut pair = Pair::new(Default::default(), server_config);
-    let client_config = client_config();
-    let (client_ch, _server_ch) = pair.connect_with(client_config.clone());
+    let client_config = pair.add_client_config(client_config());
+    let (client_ch, _server_ch) = pair.connect_with_shared(client_config);
     pair.client
         .connections
         .get_mut(&client_ch)
@@ -282,7 +282,7 @@ fn use_token_expired() {
         assert!(incoming.may_retry());
         IncomingConnectionBehavior::Accept
     });
-    let (client_ch_2, _server_ch_2) = pair.connect_with(client_config.clone());
+    let (client_ch_2, _server_ch_2) = pair.connect_with_shared(client_config);
     pair.client
         .connections
         .get_mut(&client_ch_2)
@@ -301,7 +301,7 @@ fn use_token_expired() {
         assert!(incoming.may_retry());
         IncomingConnectionBehavior::Accept
     });
-    let (client_ch_3, _server_ch_3) = pair.connect_with(client_config);
+    let (client_ch_3, _server_ch_3) = pair.connect_with_shared(client_config);
     pair.client
         .connections
         .get_mut(&client_ch_3)
@@ -314,11 +314,14 @@ fn use_token_expired() {
     assert_eq!(pair.server.known_cids(), 0);
 }
 
-pub(super) struct FakeTimeSource(Mutex<SystemTime>);
+/// A clock the test advances; clones share it, so the test keeps one while the server
+/// configuration owns another
+#[derive(Clone)]
+pub(super) struct FakeTimeSource(Arc<Mutex<SystemTime>>);
 
 impl FakeTimeSource {
     pub(super) fn new() -> Self {
-        Self(Mutex::new(SystemTime::now()))
+        Self(Arc::new(Mutex::new(SystemTime::now())))
     }
 
     pub(super) fn advance(&self, dur: Duration) {

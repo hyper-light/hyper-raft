@@ -74,16 +74,27 @@ Chosen design, by kind of state:
   a few hundred bytes. Congestion control is a closed enum of controllers carried by value
   (`Cubic`, `NewReno`, `Bbr`, and Copa when it lands). That replaces the shared
   `ControllerFactory`, and it makes the controller set one reviewed list, not a plug-in point.
-- **Shared immutable objects live in the endpoint's `Configs` slab.** These are the TLS configs,
-  the handshake-token and reset keys, the time source and the initial-CID provider.
-  - A connection holds a generation-checked handle.
-  - Each call that needs configuration takes `&Configs`: handling a datagram or a timeout,
-    polling a transmit, and the handshake's TLS steps.
-  - The endpoint counts the connections on each slot, as bookkeeping, not ownership, through the
-    drain events quinn-proto already sends.
-  - A slot that has been superseded and has no connections left is reclaimed. A full slab is a
-    typed refusal of the new configuration.
+- **Shared objects live in the endpoint's `Configs` slab.** A slot holds a server or a client
+  configuration, and with it the TLS config, the handshake-token key, the time source and the
+  initial-CID provider. The stateless-reset key stays in the endpoint's own `EndpointConfig`,
+  which no connection reads.
+  - A connection, and a pending incoming attempt, holds a generation-checked handle.
+  - Each call that needs configuration is lent it. Handling a datagram takes `&mut Configs`,
+    because a TLS read can change the config's stores (session cache, ticketer, key log); polling
+    a transmit takes `&Configs`, for the NEW_TOKEN key and clock; handling a timeout takes none.
+  - The few plain values a connection reads outside a TLS step (whether the peer may migrate,
+    whether a preferred address was sent, how many NEW_TOKEN frames to send) are copied into it
+    at accept.
+  - The endpoint counts the connections and incoming attempts on each slot, as bookkeeping, not
+    ownership: up at creation, down at the drain events quinn-proto already sends and when an
+    attempt is accepted, refused, retried or ignored.
+  - A slot that has been superseded and has no users left is reclaimed. A full slab is a typed
+    refusal (`ConfigsFull`) of the new configuration. The bound is
+    `EndpointConfig::config_slots`, default 4: one current and one draining configuration per
+    side, since rotations are days apart.
   - Rotation therefore costs memory only while old connections live.
+  - Connections made with one client handle share its TLS session cache, as connections made
+    from clones of one `Arc`'d config did.
 - **Shared mutable state moves to its single owner.**
   - The address-validation token log is consulted only by the endpoint, so the endpoint owns it
     without a lock.
@@ -93,6 +104,9 @@ Chosen design, by kind of state:
 - **rustls follows the same rule.** Its handshake states take the config as a call argument
   instead of holding `Arc<ServerConfig>`. Certificate resolvers, session stores, ticketers and the
   crypto provider are borrowed from that config for the call.
+- Measured on `tests/handshake.rs` (crates/hyper-quic/VENDORED.md §2.11): the same datagrams,
+  size for size, as quinn-proto with `Arc`, and 11 and 10 fewer allocations per full and resumed
+  handshake.
 
 ### 3.2 rustls conformed (`hyper-tls`)
 
@@ -104,17 +118,21 @@ ticketer and key log (10), and the certificate-compression cache (6). Measured w
 
 - **A connection holds no configuration.**
   - `ClientConnection`, `ServerConnection` and the QUIC connections take their config by
-    reference on the calls that can advance a handshake: `process_new_packets`, and QUIC's
-    `read_hs` and `write_hs`.
+    reference on the calls that can advance a handshake: `process_new_packets`, `complete_io`,
+    the unbuffered `process_tls_records`, and QUIC's `read_hs`. QUIC's `write_hs` takes none: it
+    drains the flight a read produced and consults no configuration.
   - The reference travels in the state machine's `Context`, so no handshake state keeps a
     `config` field.
   - The caller owns the config: in hyper-quic, the endpoint's `Configs` slab.
 - **The crypto provider is `&'static CryptoProvider`.** AWS-LC's provider is static tables of
   algorithm references.
 - **Certificate keys are borrowed for the call that uses them.**
-  - In TLS 1.3 a server selects its certificate and signs CertificateVerify in the same flight
-    as its reply to ClientHello. TLS 1.2's ServerKeyExchange is the same.
-  - A client signs its CertificateVerify in the call that handles the server's request.
+  - In TLS 1.3 a server selects its certificate and signs CertificateVerify in the call that
+    handles ClientHello. TLS 1.2's ServerKeyExchange is the same.
+  - A client does not: it receives CertificateRequest in one call and signs CertificateVerify in
+    a later one (TLS 1.3: on the server's Finished; TLS 1.2: on ServerHelloDone). It keeps the
+    request and resolves its credentials in the signing call. The messages are unchanged; the
+    resolver now runs after the server's certificate is verified.
   - A resolver therefore returns `&CertifiedKey` borrowed from itself, and no key outlives the
     call that signs with it.
 - **Mutable shared state is reached through `&mut` configuration.**
@@ -123,8 +141,17 @@ ticketer and key log (10), and the certificate-compression cache (6). Measured w
   - Each call that may change them takes `&mut ServerConfig` or `&mut ClientConfig`.
   - Their internal `Mutex`es go. One endpoint drives its connections from one thread, so the
     calls never overlap.
+  - The config is split into read-only settings and these stores, so one call can hold a
+    borrowed certificate key and a mutable store together.
+  - A TLS 1.2 session stays in the cache for reuse, so resuming copies its ticket and
+    certificate chain out, where `Arc` shared them: +2 allocations per resumed TLS 1.2
+    handshake, measured (crates/hyper-tls/VENDORED.md §2.10). Every other handshake allocates
+    less than before.
 - **Verifiers, resolvers and root stores are owned by their config**, as `Box<dyn …>` or by
-  value. A config shared by several endpoints is cloned per endpoint.
+  value. Configs are not `Clone`: each endpoint builds its own.
+  - Upstream refused to resume a session under another verifier or client resolver by comparing
+    `Arc` pointers. Each installation now draws a process-unique identity from an atomic
+    counter, and a session records the identities it was made under.
 - **Oracle.** rustls's own suite from its repository at the crate's source commit `2976d90`:
   `tests/` and the `rustls-test` crate, which the published archive omits. It is kept passing
   throughout. Interop runs against unmodified upstream rustls as a dev-only dependency.

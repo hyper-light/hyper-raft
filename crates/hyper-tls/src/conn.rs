@@ -29,7 +29,7 @@ mod connection {
     use core::ops::{Deref, DerefMut};
     use std::io::{self, BufRead, Read};
 
-    use crate::common_state::{CommonState, IoState};
+    use crate::common_state::CommonState;
     use crate::error::Error;
     use crate::msgs::message::OutboundChunks;
     use crate::suites::ExtractedSecrets;
@@ -37,6 +37,10 @@ mod connection {
     use crate::ConnectionCommon;
 
     /// A client or server connection.
+    ///
+    /// Processing records needs the configuration of the connection's side, so
+    /// `process_new_packets` and `complete_io` are called on the variant, with its
+    /// [`ClientConfig`](crate::ClientConfig) or [`ServerConfig`](crate::ServerConfig).
     #[derive(Debug)]
     pub enum Connection {
         /// A client connection
@@ -79,16 +83,6 @@ mod connection {
             }
         }
 
-        /// Processes any new packets read by a previous call to [`Connection::read_tls`].
-        ///
-        /// See [`ConnectionCommon::process_new_packets()`] for more information.
-        pub fn process_new_packets(&mut self) -> Result<IoState, Error> {
-            match self {
-                Self::Client(conn) => conn.process_new_packets(),
-                Self::Server(conn) => conn.process_new_packets(),
-            }
-        }
-
         /// Derives key material from the agreed connection secrets.
         ///
         /// See [`ConnectionCommon::export_keying_material()`] for more information.
@@ -101,20 +95,6 @@ mod connection {
             match self {
                 Self::Client(conn) => conn.export_keying_material(output, label, context),
                 Self::Server(conn) => conn.export_keying_material(output, label, context),
-            }
-        }
-
-        /// This function uses `io` to complete any outstanding IO for this connection.
-        ///
-        /// See [`ConnectionCommon::complete_io()`] for more information.
-        pub fn complete_io<T>(&mut self, io: &mut T) -> Result<(usize, usize), io::Error>
-        where
-            Self: Sized,
-            T: Read + io::Write,
-        {
-            match self {
-                Self::Client(conn) => conn.complete_io(io),
-                Self::Server(conn) => conn.complete_io(io),
             }
         }
 
@@ -373,7 +353,7 @@ pub struct ConnectionCommon<Data> {
     sendable_plaintext: ChunkVecBuffer,
 }
 
-impl<Data> ConnectionCommon<Data> {
+impl<Data: SideData> ConnectionCommon<Data> {
     /// Processes any new packets read by a previous call to
     /// [`Connection::read_tls`].
     ///
@@ -390,12 +370,35 @@ impl<Data> ConnectionCommon<Data> {
     /// Success from this function comes with some sundry state data
     /// about the connection.
     ///
+    /// `config` is the configuration of this connection's side: the [`ClientConfig`] or
+    /// [`ServerConfig`] the connection was made with. The connection holds no configuration;
+    /// the handshake reads its settings and writes its session store, ticketer, key log and
+    /// compression cache during this call.
+    ///
     /// [`read_tls`]: Connection::read_tls
-    /// [`process_new_packets`]: Connection::process_new_packets
+    /// [`process_new_packets`]: ConnectionCommon::process_new_packets
+    /// [`ClientConfig`]: crate::ClientConfig
+    /// [`ServerConfig`]: crate::ServerConfig
     #[inline]
-    pub fn process_new_packets(&mut self) -> Result<IoState, Error> {
-        self.core
-            .process_new_packets(&mut self.deframer_buffer, &mut self.sendable_plaintext)
+    pub fn process_new_packets(&mut self, config: &mut Data::Config) -> Result<IoState, Error> {
+        self.core.process_new_packets(
+            &mut self.deframer_buffer,
+            &mut self.sendable_plaintext,
+            config,
+        )
+    }
+
+    /// The handshake context for one call: this connection's state and `config`, split into
+    /// the settings it reads and the stores it writes.
+    pub(crate) fn context<'a>(&'a mut self, config: &'a mut Data::Config) -> Context<'a, Data> {
+        let (settings, stores) = Data::split(config);
+        Context {
+            common: &mut self.core.common_state,
+            data: &mut self.core.data,
+            sendable_plaintext: Some(&mut self.sendable_plaintext),
+            config: settings,
+            stores,
+        }
     }
 
     /// Derives key material from the agreed connection secrets.
@@ -550,16 +553,23 @@ impl<Data> ConnectionCommon<Data> {
     /// Errors from TLS record handling (i.e., from [`process_new_packets`])
     /// are wrapped in an `io::ErrorKind::InvalidData`-kind error.
     ///
+    /// `config` is passed to [`process_new_packets`].
+    ///
     /// [`is_handshaking`]: CommonState::is_handshaking
     /// [`wants_read`]: CommonState::wants_read
     /// [`wants_write`]: CommonState::wants_write
     /// [`write_tls`]: ConnectionCommon::write_tls
     /// [`read_tls`]: ConnectionCommon::read_tls
     /// [`process_new_packets`]: ConnectionCommon::process_new_packets
-    pub fn complete_io<T>(&mut self, io: &mut T) -> Result<(usize, usize), io::Error>
+    pub fn complete_io<T>(
+        &mut self,
+        io: &mut T,
+        config: &mut Data::Config,
+    ) -> Result<(usize, usize), io::Error>
     where
         Self: Sized,
         T: io::Read + io::Write,
+        Data: SideData,
     {
         let mut eof = false;
         let mut wrlen = 0;
@@ -626,7 +636,7 @@ impl<Data> ConnectionCommon<Data> {
                 }
             }
 
-            if let Err(e) = self.process_new_packets() {
+            if let Err(e) = self.process_new_packets(config) {
                 // In case we have an alert to send describing this error, try a last-gasp
                 // write -- but don't predate the primary error.
                 let _ignored = self.write_tls(io);
@@ -670,11 +680,7 @@ impl<Data> ConnectionCommon<Data> {
 
         let res = self
             .core
-            .deframe(
-                None,
-                self.deframer_buffer.filled_mut(),
-                &mut buffer_progress,
-            )
+            .deframe(self.deframer_buffer.filled_mut(), &mut buffer_progress)
             .map(|opt| opt.map(|pm| Message::try_from(pm).map(|m| m.into_owned())));
 
         match res? {
@@ -743,16 +749,6 @@ impl<Data> ConnectionCommon<Data> {
     /// [`CommonState::wants_write`] function can be used to check if the output buffer is empty.
     pub fn write_tls(&mut self, wr: &mut dyn io::Write) -> Result<usize, io::Error> {
         self.sendable_tls.write_to(wr)
-    }
-}
-
-impl<'a, Data> From<&'a mut ConnectionCommon<Data>> for Context<'a, Data> {
-    fn from(conn: &'a mut ConnectionCommon<Data>) -> Self {
-        Self {
-            common: &mut conn.core.common_state,
-            data: &mut conn.core.data,
-            sendable_plaintext: Some(&mut conn.sendable_plaintext),
-        }
     }
 }
 
@@ -839,7 +835,11 @@ impl<Data> ConnectionCore<Data> {
         &mut self,
         deframer_buffer: &mut DeframerVecBuffer,
         sendable_plaintext: &mut ChunkVecBuffer,
-    ) -> Result<IoState, Error> {
+        config: &mut Data::Config,
+    ) -> Result<IoState, Error>
+    where
+        Data: SideData,
+    {
         let mut state = match mem::replace(&mut self.state, Err(Error::HandshakeNotComplete)) {
             Ok(state) => state,
             Err(e) => {
@@ -851,15 +851,14 @@ impl<Data> ConnectionCore<Data> {
         let mut buffer_progress = self.hs_deframer.progress();
 
         loop {
-            let res = self.deframe(
-                Some(&*state),
-                deframer_buffer.filled_mut(),
-                &mut buffer_progress,
-            );
+            let res = self.deframe(deframer_buffer.filled_mut(), &mut buffer_progress);
 
             let opt_msg = match res {
                 Ok(opt_msg) => opt_msg,
                 Err(e) => {
+                    if e == Error::DecryptError {
+                        state.handle_decrypt_error(config);
+                    }
                     self.state = Err(e.clone());
                     deframer_buffer.discard(buffer_progress.take_discard());
                     return Err(e);
@@ -870,7 +869,7 @@ impl<Data> ConnectionCore<Data> {
                 break;
             };
 
-            match self.process_msg(msg, state, Some(sendable_plaintext)) {
+            match self.process_msg(msg, state, Some(sendable_plaintext), config) {
                 Ok(new) => state = new,
                 Err(e) => {
                     self.state = Err(e.clone());
@@ -896,9 +895,11 @@ impl<Data> ConnectionCore<Data> {
     }
 
     /// Pull a message out of the deframer and send any messages that need to be sent as a result.
+    ///
+    /// A record that fails decryption is `Error::DecryptError`, after the `bad_record_mac` alert
+    /// is queued.
     fn deframe<'b>(
         &mut self,
-        state: Option<&dyn State<Data>>,
         buffer: &'b mut [u8],
         buffer_progress: &mut BufferProgress,
     ) -> Result<Option<InboundPlainMessage<'b>>, Error> {
@@ -906,7 +907,7 @@ impl<Data> ConnectionCore<Data> {
         if self.hs_deframer.has_message_ready() {
             Ok(self.take_handshake_message(buffer, buffer_progress))
         } else {
-            self.process_more_input(state, buffer, buffer_progress)
+            self.process_more_input(buffer, buffer_progress)
         }
     }
 
@@ -929,7 +930,6 @@ impl<Data> ConnectionCore<Data> {
 
     fn process_more_input<'b>(
         &mut self,
-        state: Option<&dyn State<Data>>,
         buffer: &'b mut [u8],
         buffer_progress: &mut BufferProgress,
     ) -> Result<Option<InboundPlainMessage<'b>>, Error> {
@@ -947,7 +947,7 @@ impl<Data> ConnectionCore<Data> {
                 let message = match iter.next().transpose() {
                     Ok(Some(message)) => message,
                     Ok(None) => return Ok(None),
-                    Err(err) => return Err(self.handle_deframe_error(err, state)),
+                    Err(err) => return Err(self.handle_deframe_error(err)),
                 };
 
                 let allowed_plaintext = match message.typ {
@@ -988,7 +988,7 @@ impl<Data> ConnectionCore<Data> {
 
                     Ok(Some(message)) => message,
 
-                    Err(err) => return Err(self.handle_deframe_error(err, state)),
+                    Err(err) => return Err(self.handle_deframe_error(err)),
                 };
 
                 let Decrypted {
@@ -1058,7 +1058,7 @@ impl<Data> ConnectionCore<Data> {
         }
     }
 
-    fn handle_deframe_error(&mut self, error: Error, state: Option<&dyn State<Data>>) -> Error {
+    fn handle_deframe_error(&mut self, error: Error) -> Error {
         match error {
             error @ Error::InvalidMessage(_) => {
                 if self.common_state.is_quic() {
@@ -1072,13 +1072,9 @@ impl<Data> ConnectionCore<Data> {
             Error::PeerSentOversizedRecord => self
                 .common_state
                 .send_fatal_alert(AlertDescription::RecordOverflow, error),
-            Error::DecryptError => {
-                if let Some(state) = state {
-                    state.handle_decrypt_error();
-                }
-                self.common_state
-                    .send_fatal_alert(AlertDescription::BadRecordMac, error)
-            }
+            Error::DecryptError => self
+                .common_state
+                .send_fatal_alert(AlertDescription::BadRecordMac, error),
 
             error => error,
         }
@@ -1089,7 +1085,11 @@ impl<Data> ConnectionCore<Data> {
         msg: InboundPlainMessage<'_>,
         state: Box<dyn State<Data>>,
         sendable_plaintext: Option<&mut ChunkVecBuffer>,
-    ) -> Result<Box<dyn State<Data>>, Error> {
+        config: &mut Data::Config,
+    ) -> Result<Box<dyn State<Data>>, Error>
+    where
+        Data: SideData,
+    {
         // Drop CCS messages during handshake in TLS1.3
         if msg.typ == ContentType::ChangeCipherSpec
             && !self.common_state.may_receive_application_data
@@ -1126,8 +1126,13 @@ impl<Data> ConnectionCore<Data> {
             return Ok(state);
         }
 
-        self.common_state
-            .process_main_protocol(msg, state, &mut self.data, sendable_plaintext)
+        self.common_state.process_main_protocol(
+            msg,
+            state,
+            &mut self.data,
+            sendable_plaintext,
+            config,
+        )
     }
 
     pub(crate) fn dangerous_extract_secrets(self) -> Result<ExtractedSecrets, Error> {
@@ -1203,7 +1208,35 @@ impl<Data> ConnectionCore<Data> {
 }
 
 /// Data specific to the peer's side (client or server).
-pub trait SideData: Debug {}
+///
+/// Each side names its configuration type, [`ClientConfig`] or [`ServerConfig`], which the calls
+/// that may advance a handshake take.
+///
+/// [`ClientConfig`]: crate::ClientConfig
+/// [`ServerConfig`]: crate::ServerConfig
+pub trait SideData: Debug + SideConfig {}
+
+pub(crate) use side::SideConfig;
+
+pub(crate) mod side {
+    /// How a side's configuration is split for one call: into the settings a handshake reads and
+    /// borrows of the stores it writes.
+    ///
+    /// A connection holds no configuration. Each call that may advance a handshake takes the
+    /// configuration and splits it, so that a certificate key borrowed from the settings can be
+    /// signed with while the session stores and key log are written.
+    pub trait SideConfig {
+        /// The configuration a connection on this side is driven with.
+        type Config;
+        /// The part of `Config` a handshake reads.
+        type Settings;
+        /// Borrows of the parts of `Config` a handshake writes.
+        type Stores<'a>;
+
+        /// Split `config` into its settings and its stores.
+        fn split(config: &mut Self::Config) -> (&Self::Settings, Self::Stores<'_>);
+    }
+}
 
 /// An InboundPlainMessage which does not borrow its payload, but
 /// references a range that can later be borrowed.

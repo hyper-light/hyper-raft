@@ -9,7 +9,6 @@ use crate::client::ResolvesClientCert;
 use crate::enums::{SignatureAlgorithm, SignatureScheme};
 use crate::error::{Error, InconsistentKeys};
 use crate::server::{ClientHello, ParsedCertificate, ResolvesServerCert};
-use crate::sync::Arc;
 use crate::x509;
 
 /// An abstract signing key.
@@ -18,8 +17,8 @@ use crate::x509;
 /// for authentication.  This includes server and client authentication.
 ///
 /// Objects of this type are always used within Rustls as
-/// `Arc<dyn SigningKey>`. There are no concrete public structs in Rustls
-/// that implement this trait.
+/// `Box<dyn SigningKey>`, owned by the [`CertifiedKey`] that pairs them with a certificate.
+/// There are no concrete public structs in Rustls that implement this trait.
 ///
 /// There are two main ways to get a signing key:
 ///
@@ -60,8 +59,9 @@ pub trait SigningKey: Debug + Send + Sync {
     /// Choose a `SignatureScheme` from those offered.
     ///
     /// Expresses the choice by returning something that implements `Signer`,
-    /// using the chosen scheme.
-    fn choose_scheme(&self, offered: &[SignatureScheme]) -> Option<Box<dyn Signer>>;
+    /// using the chosen scheme. The signer borrows the key: it signs within the call that
+    /// chose it.
+    fn choose_scheme(&self, offered: &[SignatureScheme]) -> Option<Box<dyn Signer + '_>>;
 
     /// Get the RFC 5280-compliant SubjectPublicKeyInfo (SPKI) of this [`SigningKey`] if available.
     fn public_key(&self) -> Option<SubjectPublicKeyInfoDer<'_>> {
@@ -93,16 +93,10 @@ pub trait Signer: Debug + Send + Sync {
 ///
 /// [`ConfigBuilder::with_cert_resolver()`]: crate::ConfigBuilder::with_cert_resolver
 #[derive(Debug)]
-pub struct SingleCertAndKey(Arc<CertifiedKey>);
+pub struct SingleCertAndKey(CertifiedKey);
 
 impl From<CertifiedKey> for SingleCertAndKey {
     fn from(certified_key: CertifiedKey) -> Self {
-        Self(Arc::new(certified_key))
-    }
-}
-
-impl From<Arc<CertifiedKey>> for SingleCertAndKey {
-    fn from(certified_key: Arc<CertifiedKey>) -> Self {
         Self(certified_key)
     }
 }
@@ -112,8 +106,8 @@ impl ResolvesClientCert for SingleCertAndKey {
         &self,
         _root_hint_subjects: &[&[u8]],
         _sigschemes: &[SignatureScheme],
-    ) -> Option<Arc<CertifiedKey>> {
-        Some(self.0.clone())
+    ) -> Option<&CertifiedKey> {
+        Some(&self.0)
     }
 
     fn has_certs(&self) -> bool {
@@ -122,8 +116,8 @@ impl ResolvesClientCert for SingleCertAndKey {
 }
 
 impl ResolvesServerCert for SingleCertAndKey {
-    fn resolve(&self, _client_hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
-        Some(self.0.clone())
+    fn resolve(&self, _client_hello: ClientHello<'_>) -> Option<&CertifiedKey> {
+        Some(&self.0)
     }
 }
 
@@ -135,13 +129,13 @@ impl ResolvesServerCert for SingleCertAndKey {
 /// certificates.
 ///
 /// [RFC 7250]: https://tools.ietf.org/html/rfc7250
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct CertifiedKey {
     /// The certificate chain or raw public key.
     pub cert: Vec<CertificateDer<'static>>,
 
     /// The certified key.
-    pub key: Arc<dyn SigningKey>,
+    pub key: Box<dyn SigningKey>,
 
     /// An optional OCSP response from the certificate issuer,
     /// attesting to its continued validity.
@@ -175,7 +169,7 @@ impl CertifiedKey {
     ///
     /// The cert chain must not be empty. The first certificate in the chain
     /// must be the end-entity certificate.
-    pub fn new(cert: Vec<CertificateDer<'static>>, key: Arc<dyn SigningKey>) -> Self {
+    pub fn new(cert: Vec<CertificateDer<'static>>, key: Box<dyn SigningKey>) -> Self {
         Self {
             cert,
             key,

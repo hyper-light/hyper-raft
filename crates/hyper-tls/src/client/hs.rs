@@ -7,13 +7,13 @@ use core::ops::Deref;
 use pki_types::ServerName;
 
 use super::tls12;
-use super::{ResolvesClientCert, Tls12Resumption};
+use super::Tls12Resumption;
 use crate::bs_debug;
 use crate::check::inappropriate_handshake_message;
 use crate::client::client_conn::ClientConnectionData;
 use crate::client::common::ClientHelloDetails;
 use crate::client::ech::EchState;
-use crate::client::{tls13, ClientConfig, EchMode, EchStatus};
+use crate::client::{tls13, ClientSettings, EchMode, EchStatus};
 use crate::common_state::{CommonState, HandshakeKind, KxState, State};
 use crate::conn::ConnectionRandoms;
 use crate::crypto::{ActiveKeyExchange, KeyExchangeAlgorithm};
@@ -22,6 +22,7 @@ use crate::enums::{
 };
 use crate::error::{Error, PeerIncompatible, PeerMisbehaved};
 use crate::hash_hs::HandshakeHashBuffer;
+use crate::identity::Identity;
 use crate::log::{debug, trace};
 use crate::msgs::base::Payload;
 use crate::msgs::enums::{Compression, ExtensionType};
@@ -34,9 +35,7 @@ use crate::msgs::handshake::{
 };
 use crate::msgs::message::{Message, MessagePayload};
 use crate::msgs::persist;
-use crate::sync::Arc;
 use crate::tls13::key_schedule::KeyScheduleEarly;
-use crate::verify::ServerCertVerifier;
 use crate::SupportedCipherSuite;
 
 pub(super) type NextState<'a> = Box<dyn State<ClientConnectionData> + 'a>;
@@ -65,7 +64,6 @@ struct ExpectServerHelloOrHelloRetryRequest {
 }
 
 pub(super) struct ClientHelloInput {
-    pub(super) config: Arc<ClientConfig>,
     pub(super) resuming: Option<persist::Retrieved<ClientSessionValue>>,
     pub(super) random: Random,
     pub(super) sent_tls13_fake_ccs: bool,
@@ -80,9 +78,9 @@ impl ClientHelloInput {
         server_name: ServerName<'static>,
         extra_exts: &ClientExtensionsInput<'_>,
         cx: &mut ClientContext<'_>,
-        config: Arc<ClientConfig>,
     ) -> Result<Self, Error> {
-        let mut resuming = ClientSessionValue::retrieve(&server_name, &config, cx);
+        let config = cx.config;
+        let mut resuming = ClientSessionValue::retrieve(&server_name, cx);
         let session_id = match &mut resuming {
             Some(_resuming) => {
                 debug!("Resuming session");
@@ -91,7 +89,7 @@ impl ClientHelloInput {
                         // If we have a ticket, we use the sessionid as a signal that
                         // we're  doing an abbreviated handshake.  See section 3.4 in
                         // RFC5077.
-                        if !inner.ticket().0.is_empty() {
+                        if !inner.ticket().is_empty() {
                             inner.session_id = SessionId::random(config.provider.secure_random)?;
                         }
                         Some(inner.session_id)
@@ -129,7 +127,6 @@ impl ClientHelloInput {
             session_id,
             server_name,
             prev_ech_ext: None,
-            config,
         })
     }
 
@@ -138,14 +135,16 @@ impl ClientHelloInput {
         extra_exts: ClientExtensionsInput<'static>,
         cx: &mut ClientContext<'_>,
     ) -> NextStateOrError<'static> {
+        let config = cx.config;
         let mut transcript_buffer = HandshakeHashBuffer::new();
-        if self.config.client_auth_cert_resolver.has_certs() {
+        if config.client_auth_cert_resolver.has_certs() {
             transcript_buffer.set_client_auth_enabled();
         }
 
-        let key_share = if self.config.needs_key_share() {
+        let key_share = if config.needs_key_share() {
             Some(tls13::initial_key_share(
-                &self.config,
+                config,
+                cx.stores.resumption,
                 &self.server_name,
                 &mut cx.common.kx_state,
             )?)
@@ -153,9 +152,9 @@ impl ClientHelloInput {
             None
         };
 
-        let ech_state = match self.config.ech_mode.as_ref() {
+        let ech_state = match config.ech_mode.as_ref() {
             Some(EchMode::Enable(ech_config)) => {
-                Some(ech_config.state(self.server_name.clone(), &self.config)?)
+                Some(ech_config.state(self.server_name.clone(), config)?)
             }
             _ => None,
         };
@@ -188,7 +187,7 @@ fn emit_client_hello_for_retry(
     cx: &mut ClientContext<'_>,
     mut ech_state: Option<EchState>,
 ) -> NextStateOrError<'static> {
-    let config = &input.config;
+    let config = cx.config;
     // Defense in depth: the ECH state should be None if ECH is disabled based on config
     // builder semantics.
     let forbids_tls12 = cx.common.is_quic() || ech_state.is_some();
@@ -350,7 +349,7 @@ fn emit_client_hello_for_retry(
     }
 
     // Do we have a SessionID or ticket cached for this host?
-    let tls13_session = prepare_resumption(&input.resuming, &mut exts, suite, cx, config);
+    let tls13_session = prepare_resumption(&input.resuming, &mut exts, suite, cx);
 
     // Extensions MAY be randomized
     // but they also need to keep the same order as the previous ClientHello
@@ -485,7 +484,6 @@ fn emit_client_hello_for_retry(
             };
 
             tls13::derive_early_traffic_secret(
-                &*config.key_log,
                 cx,
                 resuming_suite.common.hash_provider,
                 &schedule,
@@ -535,14 +533,14 @@ fn prepare_resumption<'a>(
     exts: &mut ClientExtensions<'_>,
     suite: Option<SupportedCipherSuite>,
     cx: &mut ClientContext<'_>,
-    config: &ClientConfig,
 ) -> Option<persist::Retrieved<&'a persist::Tls13ClientSessionValue>> {
+    let config = cx.config;
     // Check whether we're resuming with a non-empty ticket.
     let resuming = match resuming {
         Some(resuming) if !resuming.ticket().is_empty() => resuming,
         _ => {
             if config.supports_version(ProtocolVersion::TLSv1_2, cx.common.protocol)
-                && config.resumption.tls12_resumption == Tls12Resumption::SessionIdOrTickets
+                && cx.stores.resumption.tls12_resumption == Tls12Resumption::SessionIdOrTickets
             {
                 // If we don't have a ticket, request one.
                 exts.session_ticket = Some(ClientSessionTicket::Request);
@@ -554,7 +552,7 @@ fn prepare_resumption<'a>(
     let Some(tls13) = resuming.map(|csv| csv.tls13()) else {
         // TLS 1.2; send the ticket if we have support this protocol version
         if config.supports_version(ProtocolVersion::TLSv1_2, cx.common.protocol)
-            && config.resumption.tls12_resumption == Tls12Resumption::SessionIdOrTickets
+            && cx.stores.resumption.tls12_resumption == Tls12Resumption::SessionIdOrTickets
         {
             exts.session_ticket = Some(ClientSessionTicket::Offer(Payload::new(resuming.ticket())));
         }
@@ -577,7 +575,7 @@ fn prepare_resumption<'a>(
         suite.can_resume_from(tls13.suite())?;
     }
 
-    tls13::prepare_resumption(config, cx, &tls13, exts, suite.is_some());
+    tls13::prepare_resumption(cx, &tls13, exts, suite.is_some());
     Some(tls13)
 }
 
@@ -623,7 +621,7 @@ pub(super) fn process_alpn_protocol(
 
 pub(super) fn process_server_cert_type_extension(
     common: &mut CommonState,
-    config: &ClientConfig,
+    config: &ClientSettings,
     server_cert_extension: Option<&CertificateType>,
 ) -> Result<Option<(ExtensionType, CertificateType)>, Error> {
     process_cert_type_extension(
@@ -636,7 +634,7 @@ pub(super) fn process_server_cert_type_extension(
 
 pub(super) fn process_client_cert_type_extension(
     common: &mut CommonState,
-    config: &ClientConfig,
+    config: &ClientSettings,
     client_cert_extension: Option<&CertificateType>,
 ) -> Result<Option<(ExtensionType, CertificateType)>, Error> {
     process_cert_type_extension(
@@ -661,7 +659,7 @@ impl State<ClientConnectionData> for ExpectServerHello {
         trace!("We got ServerHello {server_hello:#?}");
 
         use crate::ProtocolVersion::{TLSv1_2, TLSv1_3};
-        let config = &self.input.config;
+        let config = cx.config;
         let tls13_supported = config.supports_version(TLSv1_3, cx.common.protocol);
 
         let server_version = if server_hello.legacy_version == TLSv1_2 {
@@ -732,7 +730,7 @@ impl State<ClientConnectionData> for ExpectServerHello {
                 cx.common,
                 &self.input.hello.alpn_protocols,
                 server_hello.selected_protocol.as_ref().map(|s| s.as_ref()),
-                self.input.config.check_selected_alpn,
+                config.check_selected_alpn,
             )?;
         }
 
@@ -846,7 +844,7 @@ impl ExpectServerHelloOrHelloRetryRequest {
 
         // A retry request is illegal if it contains no cookie and asks for
         // retry of a group we already sent.
-        let config = &self.next.input.config;
+        let config = cx.config;
 
         if let (None, Some(req_group)) = (&hrr.cookie, hrr.key_share) {
             let offered_hybrid = offered_key_share
@@ -1069,25 +1067,25 @@ pub(super) enum ClientSessionValue {
 impl ClientSessionValue {
     fn retrieve(
         server_name: &ServerName<'static>,
-        config: &ClientConfig,
         cx: &mut ClientContext<'_>,
     ) -> Option<persist::Retrieved<Self>> {
-        let found = config
-            .resumption
-            .store
+        let config = cx.config;
+        let store = &mut cx.stores.resumption.store;
+        let found = store
             .take_tls13_ticket(server_name)
             .map(ClientSessionValue::Tls13)
             .or_else(|| {
                 {
-                    config
-                        .resumption
-                        .store
+                    store
                         .tls12_session(server_name)
                         .map(ClientSessionValue::Tls12)
                 }
             })
             .and_then(|resuming| {
-                resuming.compatible_config(&config.verifier, &config.client_auth_cert_resolver)
+                resuming.compatible_config(
+                    config.verifier_identity,
+                    config.client_auth_cert_resolver_identity,
+                )
             })
             .and_then(|resuming| {
                 let now = config
@@ -1131,8 +1129,8 @@ impl ClientSessionValue {
 
     fn compatible_config(
         self,
-        server_cert_verifier: &Arc<dyn ServerCertVerifier>,
-        client_creds: &Arc<dyn ResolvesClientCert>,
+        server_cert_verifier: Identity,
+        client_creds: Identity,
     ) -> Option<Self> {
         match &self {
             Self::Tls13(v) => v

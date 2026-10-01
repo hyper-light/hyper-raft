@@ -154,7 +154,8 @@
 //! [`webpki_roots`]: https://crates.io/crates/webpki-roots
 //!
 //! Next, we make a `ClientConfig`.  You're likely to make one of these per process,
-//! and use it for all connections made by that process.
+//! and use it for all connections made by that process. A connection holds no configuration:
+//! each call that may advance its handshake takes the `ClientConfig` mutably.
 //!
 //! ```rust,no_run
 //! # let root_store: hyper_tls::RootCertStore = panic!();
@@ -168,19 +169,17 @@
 //!
 //! ```rust
 //! # use webpki;
-//! # use std::sync::Arc;
 //! # hyper_tls::crypto::aws_lc_rs::DEFAULT_PROVIDER.install_default();
 //! # let root_store = hyper_tls::RootCertStore::from_iter(
 //! #  webpki_roots::TLS_SERVER_ROOTS
 //! #      .iter()
 //! #      .cloned(),
 //! # );
-//! # let config = hyper_tls::ClientConfig::builder()
+//! # let mut config = hyper_tls::ClientConfig::builder()
 //! #     .with_root_certificates(root_store)
 //! #     .with_no_client_auth();
-//! let rc_config = Arc::new(config);
 //! let example_com = "example.com".try_into().unwrap();
-//! let mut client = hyper_tls::ClientConnection::new(rc_config, example_com);
+//! let mut client = hyper_tls::ClientConnection::new(&mut config, example_com);
 //! ```
 //!
 //! Now you should do appropriate IO for the `client` object.  If `client.wants_read()` yields
@@ -191,7 +190,8 @@
 //!
 //! The return types of `read_tls()` and `write_tls()` only tell you if the IO worked.  No
 //! parsing or processing of the TLS messages is done.  After each `read_tls()` you should
-//! therefore call `client.process_new_packets()` which parses and processes the messages.
+//! therefore call `client.process_new_packets(&mut config)` which parses and processes the
+//! messages.
 //! Any error returned from `process_new_packets` is fatal to the connection, and will tell you
 //! why.  For example, if the server's certificate is expired `process_new_packets` will
 //! return `Err(InvalidCertificate(Expired))`.  From this point on,
@@ -207,7 +207,8 @@
 //! errors.
 //!
 //! ```rust,no_run
-//! # let mut client = hyper_tls::ClientConnection::new(panic!(), panic!()).unwrap();
+//! # let mut config: hyper_tls::ClientConfig = panic!();
+//! # let mut client = hyper_tls::ClientConnection::new(&mut config, panic!()).unwrap();
 //! # struct Socket { }
 //! # impl Socket {
 //! #   fn ready_for_write(&self) -> bool { false }
@@ -228,14 +229,13 @@
 //! #   panic!();
 //! # }
 //! use std::io;
-//! use hyper_tls::Connection;
 //!
 //! client.writer().write(b"GET / HTTP/1.0\r\n\r\n").unwrap();
 //! let mut socket = connect("example.com", 443);
 //! loop {
 //!   if client.wants_read() && socket.ready_for_read() {
 //!     client.read_tls(&mut socket).unwrap();
-//!     client.process_new_packets().unwrap();
+//!     client.process_new_packets(&mut config).unwrap();
 //!
 //!     let mut plaintext = Vec::new();
 //!     client.reader().read_to_end(&mut plaintext).unwrap();
@@ -294,7 +294,7 @@
 //   underneath.
 // - too_many_arguments: some things just need a lot of state, wrapping it
 //   doesn't necessarily make it easier to follow what's going on
-// - new_ret_no_self: we sometimes return `Arc<Self>`, which seems fine
+// - new_ret_no_self: we sometimes return `Box<Self>`, which seems fine
 // - single_component_path_imports: our top-level `use log` import causes
 //   a false positive, https://github.com/rust-lang/rust-clippy/issues/5210
 // - new_without_default: for internal constructors, the indirection is not
@@ -328,16 +328,6 @@ use log;
 #[macro_use]
 mod test_macros;
 
-/// This internal `sync` module aliases the `Arc` implementation to allow downstream forks
-/// of rustls targeting architectures without atomic pointers to replace the implementation
-/// with another implementation such as `portable_atomic_util::Arc` in one central location.
-mod sync {
-    #[allow(clippy::disallowed_types)]
-    pub(crate) type Arc<T> = alloc::sync::Arc<T>;
-    #[allow(clippy::disallowed_types)]
-    pub(crate) type Weak<T> = alloc::sync::Weak<T>;
-}
-
 #[macro_use]
 mod msgs;
 mod common_state;
@@ -347,6 +337,7 @@ mod conn;
 pub mod crypto;
 mod error;
 mod hash_hs;
+mod identity;
 mod limited_cache;
 mod rand;
 mod record_layer;
@@ -455,7 +446,7 @@ pub use crate::enums::{
     ProtocolVersion, SignatureAlgorithm, SignatureScheme,
 };
 pub use crate::error::{
-    CertRevocationListError, CertificateError, EncryptedClientHelloError, Error,
+    CertRevocationListError, CertificateError, ClonableError, EncryptedClientHelloError, Error,
     ExtendedKeyPurpose, InconsistentKeys, InvalidMessage, OtherError, PeerIncompatible,
     PeerMisbehaved,
 };
@@ -491,8 +482,8 @@ pub mod client {
 
     pub use builder::WantsClientCert;
     pub use client_conn::{
-        ClientConfig, ClientConnectionData, ClientSessionStore, EarlyDataError, ResolvesClientCert,
-        Resumption, TicketRequest, Tls12Resumption, UnbufferedClientConnection,
+        ClientConfig, ClientConnectionData, ClientSessionStore, ClientSettings, EarlyDataError,
+        ResolvesClientCert, Resumption, TicketRequest, Tls12Resumption, UnbufferedClientConnection,
     };
     pub use client_conn::{ClientConnection, WriteEarlyData};
     pub use ech::{EchConfig, EchGreaseConfig, EchMode, EchStatus};
@@ -534,7 +525,7 @@ pub mod server {
     pub use handy::{AlwaysResolvesServerRawPublicKeys, NoServerSessionStorage};
     pub use server_conn::{
         Accepted, ClientHello, ProducesTickets, ResolvesServerCert, ServerConfig,
-        ServerConnectionData, StoresServerSessions, UnbufferedServerConnection,
+        ServerConnectionData, ServerSettings, StoresServerSessions, UnbufferedServerConnection,
     };
     pub use server_conn::{AcceptedAlert, Acceptor, ReadEarlyData, ServerConnection};
 
@@ -584,9 +575,6 @@ pub mod ticketer;
 pub mod manual;
 
 pub mod time_provider;
-
-/// APIs abstracting over locking primitives.
-pub mod lock;
 
 /// Polyfills for features that are not yet stabilized or available with current MSRV.
 pub(crate) mod polyfill;

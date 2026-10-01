@@ -35,13 +35,11 @@
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 use core::fmt::Debug;
-use std::sync::Mutex;
 
 use crate::enums::CertificateCompressionAlgorithm;
 use crate::msgs::base::{Payload, PayloadU24};
 use crate::msgs::codec::Codec;
 use crate::msgs::handshake::{CertificatePayloadTls13, CompressedCertificatePayload};
-use crate::sync::Arc;
 
 /// Returns the supported `CertDecompressor` implementations enabled
 /// by crate features.
@@ -277,8 +275,9 @@ pub struct CompressionCacheInner {
 
     /// LRU-order entries.
     ///
-    /// First is least-used, last is most-used.
-    entries: Mutex<VecDeque<Arc<CompressionCacheEntry>>>,
+    /// First is least-used, last is most-used. The cache is owned by its configuration and
+    /// reached through `&mut`, so it needs no lock, and an entry is lent out rather than shared.
+    entries: VecDeque<CompressionCacheEntry>,
 }
 
 impl CompressionCache {
@@ -291,85 +290,32 @@ impl CompressionCache {
 
         Self::Enabled(CompressionCacheInner {
             size,
-            entries: Mutex::new(VecDeque::with_capacity(size)),
+            entries: VecDeque::with_capacity(size),
         })
     }
 
-    /// Return a `CompressionCacheEntry`, which is an owning
-    /// wrapper for a `CompressedCertificatePayload`.
+    /// Return the compression of `original`: a cached entry lent from the cache, or a fresh
+    /// one when the cache is disabled or `original` has a per-connection context.
     ///
     /// `compressor` is the compression function we have negotiated.
     /// `original` is the uncompressed certificate message.
     pub(crate) fn compression_for(
-        &self,
+        &mut self,
         compressor: &dyn CertCompressor,
         original: &CertificatePayloadTls13<'_>,
-    ) -> Result<Arc<CompressionCacheEntry>, CompressionFailed> {
+    ) -> Result<Compression<'_>, CompressionFailed> {
         match self {
             Self::Disabled => Self::uncached_compression(compressor, original),
 
-            Self::Enabled(_) => self.compression_for_impl(compressor, original),
+            Self::Enabled(inner) => inner.compression_for(compressor, original),
         }
-    }
-
-    fn compression_for_impl(
-        &self,
-        compressor: &dyn CertCompressor,
-        original: &CertificatePayloadTls13<'_>,
-    ) -> Result<Arc<CompressionCacheEntry>, CompressionFailed> {
-        let (max_size, entries) = match self {
-            Self::Enabled(CompressionCacheInner { size, entries }) => (*size, entries),
-            _ => unreachable!(),
-        };
-
-        // context is a per-connection quantity, and included in the compressed data.
-        // it is not suitable for inclusion in the cache.
-        if !original.context.0.is_empty() {
-            return Self::uncached_compression(compressor, original);
-        }
-
-        // cache probe:
-        let encoding = original.get_encoding();
-        let algorithm = compressor.algorithm();
-
-        let mut cache = entries.lock().map_err(|_| CompressionFailed)?;
-        for (i, item) in cache.iter().enumerate() {
-            if item.algorithm == algorithm && item.original == encoding {
-                // this item is now MRU
-                let item = cache.remove(i).unwrap();
-                cache.push_back(item.clone());
-                return Ok(item);
-            }
-        }
-        drop(cache);
-
-        // do compression:
-        let uncompressed_len = encoding.len() as u32;
-        let compressed = compressor.compress(encoding.clone(), CompressionLevel::Amortized)?;
-        let new_entry = Arc::new(CompressionCacheEntry {
-            algorithm,
-            original: encoding,
-            compressed: CompressedCertificatePayload {
-                alg: algorithm,
-                uncompressed_len,
-                compressed: PayloadU24::from(Payload::new(compressed)),
-            },
-        });
-
-        // insert into cache
-        let mut cache = entries.lock().map_err(|_| CompressionFailed)?;
-        if cache.len() == max_size {
-            cache.pop_front();
-        }
-        cache.push_back(new_entry.clone());
-        Ok(new_entry)
     }
 
     /// Compress `original` using `compressor` at `Interactive` level.
     fn uncached_compression(
         compressor: &dyn CertCompressor,
         original: &CertificatePayloadTls13<'_>,
-    ) -> Result<Arc<CompressionCacheEntry>, CompressionFailed> {
+    ) -> Result<Compression<'static>, CompressionFailed> {
         let algorithm = compressor.algorithm();
         let encoding = original.get_encoding();
         let uncompressed_len = encoding.len() as u32;
@@ -377,7 +323,7 @@ impl CompressionCache {
 
         // this `CompressionCacheEntry` in fact never makes it into the cache, so
         // `original` is left empty
-        Ok(Arc::new(CompressionCacheEntry {
+        Ok(Compression::Fresh(CompressionCacheEntry {
             algorithm,
             original: Vec::new(),
             compressed: CompressedCertificatePayload {
@@ -386,6 +332,77 @@ impl CompressionCache {
                 compressed: PayloadU24::from(Payload::new(compressed)),
             },
         }))
+    }
+}
+
+impl CompressionCacheInner {
+    fn compression_for(
+        &mut self,
+        compressor: &dyn CertCompressor,
+        original: &CertificatePayloadTls13<'_>,
+    ) -> Result<Compression<'_>, CompressionFailed> {
+        // context is a per-connection quantity, and included in the compressed data.
+        // it is not suitable for inclusion in the cache.
+        if !original.context.0.is_empty() {
+            return CompressionCache::uncached_compression(compressor, original);
+        }
+
+        // cache probe:
+        let encoding = original.get_encoding();
+        let algorithm = compressor.algorithm();
+
+        let hit = self
+            .entries
+            .iter()
+            .position(|item| item.algorithm == algorithm && item.original == encoding);
+        if let Some(item) = hit.and_then(|i| self.entries.remove(i)) {
+            // this item is now MRU
+            self.entries.push_back(item);
+            return self
+                .entries
+                .back()
+                .map(Compression::Cached)
+                .ok_or(CompressionFailed);
+        }
+
+        // do compression:
+        let uncompressed_len = encoding.len() as u32;
+        let compressed = compressor.compress(encoding.clone(), CompressionLevel::Amortized)?;
+        let new_entry = CompressionCacheEntry {
+            algorithm,
+            original: encoding,
+            compressed: CompressedCertificatePayload {
+                alg: algorithm,
+                uncompressed_len,
+                compressed: PayloadU24::from(Payload::new(compressed)),
+            },
+        };
+
+        // insert into cache
+        if self.entries.len() == self.size {
+            self.entries.pop_front();
+        }
+        self.entries.push_back(new_entry);
+        self.entries
+            .back()
+            .map(Compression::Cached)
+            .ok_or(CompressionFailed)
+    }
+}
+
+/// A compressed certificate message: lent from the cache, or made for one use.
+#[derive(Debug)]
+pub(crate) enum Compression<'a> {
+    Cached(&'a CompressionCacheEntry),
+    Fresh(CompressionCacheEntry),
+}
+
+impl Compression<'_> {
+    pub(crate) fn compressed_cert_payload(&self) -> CompressedCertificatePayload<'_> {
+        match self {
+            Self::Cached(entry) => entry.compressed_cert_payload(),
+            Self::Fresh(entry) => entry.compressed_cert_payload(),
+        }
     }
 }
 
@@ -489,7 +506,7 @@ mod tests {
 
         use pki_types::CertificateDer;
 
-        let cache = CompressionCache::default();
+        let mut cache = CompressionCache::default();
 
         let cert = CertificateDer::from(vec![1]);
 

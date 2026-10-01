@@ -53,8 +53,9 @@ pub use rustls;
 
 mod config;
 pub use config::{
-    AckFrequencyConfig, ClientConfig, ConfigError, EndpointConfig, IdleTimeout, MtuDiscoveryConfig,
-    ServerConfig, StdSystemTime, TimeSource, TransportConfig, ValidationTokenConfig,
+    AckFrequencyConfig, ClientConfig, ClientConfigHandle, ConfigError, Configs, ConfigsFull,
+    EndpointConfig, IdleTimeout, MtuDiscoveryConfig, ServerConfig, ServerConfigHandle,
+    StdSystemTime, TimeSource, TransportConfig, ValidationTokenConfig,
 };
 pub use config::{QlogConfig, QlogError};
 

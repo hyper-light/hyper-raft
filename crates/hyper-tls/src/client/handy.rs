@@ -2,7 +2,6 @@ use pki_types::ServerName;
 
 use crate::enums::SignatureScheme;
 use crate::msgs::persist;
-use crate::sync::Arc;
 use crate::{client, sign, NamedGroup};
 
 /// An implementer of `ClientSessionStore` which does nothing.
@@ -10,23 +9,27 @@ use crate::{client, sign, NamedGroup};
 pub(super) struct NoClientSessionStorage;
 
 impl client::ClientSessionStore for NoClientSessionStorage {
-    fn set_kx_hint(&self, _: ServerName<'static>, _: NamedGroup) {}
+    fn set_kx_hint(&mut self, _: ServerName<'static>, _: NamedGroup) {}
 
     fn kx_hint(&self, _: &ServerName<'_>) -> Option<NamedGroup> {
         None
     }
 
-    fn set_tls12_session(&self, _: ServerName<'static>, _: persist::Tls12ClientSessionValue) {}
+    fn set_tls12_session(&mut self, _: ServerName<'static>, _: persist::Tls12ClientSessionValue) {}
 
     fn tls12_session(&self, _: &ServerName<'_>) -> Option<persist::Tls12ClientSessionValue> {
         None
     }
 
-    fn remove_tls12_session(&self, _: &ServerName<'_>) {}
+    fn remove_tls12_session(&mut self, _: &ServerName<'_>) {}
 
-    fn insert_tls13_ticket(&self, _: ServerName<'static>, _: persist::Tls13ClientSessionValue) {}
+    fn insert_tls13_ticket(&mut self, _: ServerName<'static>, _: persist::Tls13ClientSessionValue) {
+    }
 
-    fn take_tls13_ticket(&self, _: &ServerName<'_>) -> Option<persist::Tls13ClientSessionValue> {
+    fn take_tls13_ticket(
+        &mut self,
+        _: &ServerName<'_>,
+    ) -> Option<persist::Tls13ClientSessionValue> {
         None
     }
 }
@@ -37,7 +40,6 @@ mod cache {
 
     use pki_types::ServerName;
 
-    use crate::lock::Mutex;
     use crate::msgs::persist;
     use crate::{limited_cache, NamedGroup};
 
@@ -67,8 +69,11 @@ mod cache {
     /// in memory.
     ///
     /// It enforces a limit on the number of entries to bound memory usage.
+    ///
+    /// It is owned by its [`ClientConfig`](crate::ClientConfig) and changed through `&mut`, so it
+    /// needs no lock.
     pub struct ClientSessionMemoryCache {
-        servers: Mutex<limited_cache::LimitedCache<ServerName<'static>, ServerData>>,
+        servers: limited_cache::LimitedCache<ServerName<'static>, ServerData>,
     }
 
     impl ClientSessionMemoryCache {
@@ -78,35 +83,27 @@ mod cache {
             let max_servers = size.saturating_add(MAX_TLS13_TICKETS_PER_SERVER - 1)
                 / MAX_TLS13_TICKETS_PER_SERVER;
             Self {
-                servers: Mutex::new(limited_cache::LimitedCache::new(max_servers)),
+                servers: limited_cache::LimitedCache::new(max_servers),
             }
         }
     }
 
     impl super::client::ClientSessionStore for ClientSessionMemoryCache {
-        fn set_kx_hint(&self, server_name: ServerName<'static>, group: NamedGroup) {
+        fn set_kx_hint(&mut self, server_name: ServerName<'static>, group: NamedGroup) {
             self.servers
-                .lock()
-                .unwrap()
                 .get_or_insert_default_and_edit(server_name, |data| data.kx_hint = Some(group));
         }
 
         fn kx_hint(&self, server_name: &ServerName<'_>) -> Option<NamedGroup> {
-            self.servers
-                .lock()
-                .unwrap()
-                .get(server_name)
-                .and_then(|sd| sd.kx_hint)
+            self.servers.get(server_name).and_then(|sd| sd.kx_hint)
         }
 
         fn set_tls12_session(
-            &self,
+            &mut self,
             _server_name: ServerName<'static>,
             _value: persist::Tls12ClientSessionValue,
         ) {
             self.servers
-                .lock()
-                .unwrap()
                 .get_or_insert_default_and_edit(_server_name.clone(), |data| {
                     data.tls12 = Some(_value)
                 });
@@ -117,43 +114,35 @@ mod cache {
             _server_name: &ServerName<'_>,
         ) -> Option<persist::Tls12ClientSessionValue> {
             self.servers
-                .lock()
-                .unwrap()
                 .get(_server_name)
                 .and_then(|sd| sd.tls12.as_ref().cloned())
         }
 
-        fn remove_tls12_session(&self, _server_name: &ServerName<'static>) {
+        fn remove_tls12_session(&mut self, _server_name: &ServerName<'static>) {
             self.servers
-                .lock()
-                .unwrap()
                 .get_mut(_server_name)
                 .and_then(|data| data.tls12.take());
         }
 
         fn insert_tls13_ticket(
-            &self,
+            &mut self,
             server_name: ServerName<'static>,
             value: persist::Tls13ClientSessionValue,
         ) {
-            self.servers.lock().unwrap().get_or_insert_default_and_edit(
-                server_name.clone(),
-                |data| {
+            self.servers
+                .get_or_insert_default_and_edit(server_name.clone(), |data| {
                     if data.tls13.len() == data.tls13.capacity() {
                         data.tls13.pop_front();
                     }
                     data.tls13.push_back(value);
-                },
-            );
+                });
         }
 
         fn take_tls13_ticket(
-            &self,
+            &mut self,
             server_name: &ServerName<'static>,
         ) -> Option<persist::Tls13ClientSessionValue> {
             self.servers
-                .lock()
-                .unwrap()
                 .get_mut(server_name)
                 .and_then(|data| data.tls13.pop_back())
         }
@@ -177,7 +166,7 @@ impl client::ResolvesClientCert for FailResolveClientCert {
         &self,
         _root_hint_subjects: &[&[u8]],
         _sigschemes: &[SignatureScheme],
-    ) -> Option<Arc<sign::CertifiedKey>> {
+    ) -> Option<&sign::CertifiedKey> {
         None
     }
 
@@ -190,11 +179,11 @@ impl client::ResolvesClientCert for FailResolveClientCert {
 /// [RFC 7250] raw public key.
 ///
 /// [RFC 7250]: https://tools.ietf.org/html/rfc7250
-#[derive(Clone, Debug)]
-pub struct AlwaysResolvesClientRawPublicKeys(Arc<sign::CertifiedKey>);
+#[derive(Debug)]
+pub struct AlwaysResolvesClientRawPublicKeys(sign::CertifiedKey);
 impl AlwaysResolvesClientRawPublicKeys {
     /// Create a new `AlwaysResolvesClientRawPublicKeys` instance.
-    pub fn new(certified_key: Arc<sign::CertifiedKey>) -> Self {
+    pub fn new(certified_key: sign::CertifiedKey) -> Self {
         Self(certified_key)
     }
 }
@@ -204,8 +193,8 @@ impl client::ResolvesClientCert for AlwaysResolvesClientRawPublicKeys {
         &self,
         _root_hint_subjects: &[&[u8]],
         _sigschemes: &[SignatureScheme],
-    ) -> Option<Arc<sign::CertifiedKey>> {
-        Some(self.0.clone())
+    ) -> Option<&sign::CertifiedKey> {
+        Some(&self.0)
     }
 
     fn only_raw_public_keys(&self) -> bool {
@@ -230,25 +219,22 @@ mod tests {
 
     use super::provider::cipher_suite;
     use super::NoClientSessionStorage;
-    use crate::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
-    use crate::client::{ClientSessionStore, ResolvesClientCert};
+    use crate::client::ClientSessionStore;
+    use crate::identity::Identity;
     use crate::msgs::base::PayloadU16;
     use crate::msgs::enums::NamedGroup;
     use crate::msgs::handshake::CertificateChain;
     use crate::msgs::handshake::SessionId;
     use crate::msgs::persist::Tls13ClientSessionValue;
-    use crate::pki_types::CertificateDer;
     use crate::suites::SupportedCipherSuite;
-    use crate::sync::Arc;
-    use crate::{sign, DigitallySignedStruct, Error, SignatureScheme};
 
     #[test]
     fn test_noclientsessionstorage_does_nothing() {
-        let c = NoClientSessionStorage {};
+        let mut c = NoClientSessionStorage {};
         let name = ServerName::try_from("example.com").unwrap();
         let now = UnixTime::now();
-        let server_cert_verifier: Arc<dyn ServerCertVerifier> = Arc::new(DummyServerCertVerifier);
-        let resolves_client_cert: Arc<dyn ResolvesClientCert> = Arc::new(DummyResolvesClientCert);
+        let server_cert_verifier = Identity::fresh();
+        let resolves_client_cert = Identity::fresh();
 
         c.set_kx_hint(name.clone(), NamedGroup::X25519);
         assert_eq!(None, c.kx_hint(&name));
@@ -266,11 +252,11 @@ mod tests {
                 Tls12ClientSessionValue::new(
                     tls12_suite,
                     SessionId::empty(),
-                    Arc::new(PayloadU16::empty()),
+                    PayloadU16::empty(),
                     &[],
                     CertificateChain::default(),
-                    &server_cert_verifier,
-                    &resolves_client_cert,
+                    server_cert_verifier,
+                    resolves_client_cert,
                     now,
                     0,
                     true,
@@ -288,11 +274,11 @@ mod tests {
             name.clone(),
             Tls13ClientSessionValue::new(
                 tls13_suite,
-                Arc::new(PayloadU16::empty()),
+                PayloadU16::empty(),
                 &[],
                 CertificateChain::default(),
-                &server_cert_verifier,
-                &resolves_client_cert,
+                server_cert_verifier,
+                resolves_client_cert,
                 now,
                 0,
                 0,
@@ -300,60 +286,5 @@ mod tests {
             ),
         );
         assert!(c.take_tls13_ticket(&name).is_none());
-    }
-
-    #[derive(Debug)]
-    struct DummyServerCertVerifier;
-
-    impl ServerCertVerifier for DummyServerCertVerifier {
-        fn verify_server_cert(
-            &self,
-            _end_entity: &CertificateDer<'_>,
-            _intermediates: &[CertificateDer<'_>],
-            _server_name: &ServerName<'_>,
-            _ocsp_response: &[u8],
-            _now: UnixTime,
-        ) -> Result<ServerCertVerified, Error> {
-            unreachable!()
-        }
-
-        fn verify_tls12_signature(
-            &self,
-            _message: &[u8],
-            _cert: &CertificateDer<'_>,
-            _dss: &DigitallySignedStruct,
-        ) -> Result<HandshakeSignatureValid, Error> {
-            unreachable!()
-        }
-
-        fn verify_tls13_signature(
-            &self,
-            _message: &[u8],
-            _cert: &CertificateDer<'_>,
-            _dss: &DigitallySignedStruct,
-        ) -> Result<HandshakeSignatureValid, Error> {
-            unreachable!()
-        }
-
-        fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-            unreachable!()
-        }
-    }
-
-    #[derive(Debug)]
-    struct DummyResolvesClientCert;
-
-    impl ResolvesClientCert for DummyResolvesClientCert {
-        fn resolve(
-            &self,
-            _root_hint_subjects: &[&[u8]],
-            _sigschemes: &[SignatureScheme],
-        ) -> Option<Arc<sign::CertifiedKey>> {
-            unreachable!()
-        }
-
-        fn has_certs(&self) -> bool {
-            unreachable!()
-        }
     }
 }

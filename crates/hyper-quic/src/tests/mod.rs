@@ -23,7 +23,7 @@ use crate::{
     crypto::rustls::QuicServerConfig, frame::FrameStruct,
     transport_parameters::TransportParameters,
 };
-mod util;
+pub(crate) mod util;
 use util::*;
 
 mod first_flight;
@@ -40,10 +40,12 @@ use wasm_bindgen_test::wasm_bindgen_test as test;
 #[test]
 fn pending_incoming_survives_server_config_change() {
     let _guard = subscribe();
-    let replacement = ServerConfig::with_crypto(Arc::new(server_crypto_with_alpn(vec![
-        "replacement-only".into(),
-    ])));
-    for replacement in [None, Some(Arc::new(replacement))] {
+    for replace in [false, true] {
+        let replacement = replace.then(|| {
+            ServerConfig::with_crypto(Box::new(server_crypto_with_alpn(vec![
+                "replacement-only".into(),
+            ])))
+        });
         let mut pair = Pair::default();
         let client_ch = pair.begin_connect(client_config());
         pair.drive_client();
@@ -60,7 +62,7 @@ fn pending_incoming_survives_server_config_change() {
             panic!("expected an incoming connection");
         };
 
-        pair.server.set_server_config(replacement);
+        pair.server.set_server_config(replacement).unwrap();
         // Retransmitted Initials must still be buffered after the configuration changes.
         assert!(
             pair.server
@@ -81,17 +83,23 @@ fn pending_incoming_survives_server_config_change() {
 #[test]
 fn pending_incoming_can_retry_after_disabling_server() {
     let _guard = subscribe();
-    let config = server_config();
-    let mut pair = Pair::new(Default::default(), config.clone());
+    // Both configurations share one token key, as upstream's clone of one configuration did, so
+    // that the second validates the retry token the first issued
+    let mut master_key = [0u8; 64];
+    rand::rng().fill_bytes(&mut master_key);
+    let token_key =
+        aws_lc_rs::hkdf::Salt::new(aws_lc_rs::hkdf::HKDF_SHA256, &[]).extract(&master_key);
+    let config = || ServerConfig::new(Box::new(server_crypto()), Box::new(token_key.clone()));
+    let mut pair = Pair::new(Default::default(), config());
     pair.server.handle_incoming = Box::new(|_| IncomingConnectionBehavior::Wait);
     let client_ch = pair.begin_connect(client_config());
     pair.drive_client();
     pair.server.drive_incoming(pair.time, pair.client.addr);
     let incoming = pair.server.waiting_incoming.pop().unwrap();
 
-    pair.server.set_server_config(None);
+    pair.server.set_server_config(None).unwrap();
     pair.server.retry(incoming);
-    pair.server.set_server_config(Some(Arc::new(config)));
+    pair.server.set_server_config(Some(config())).unwrap();
     pair.server.handle_incoming = Box::new(|incoming| {
         assert!(incoming.remote_address_validated());
         IncomingConnectionBehavior::Accept
@@ -108,12 +116,7 @@ fn pending_incoming_can_retry_after_disabling_server() {
 fn version_negotiate_server() {
     let _guard = subscribe();
     let client_addr = "[::2]:7890".parse().unwrap();
-    let mut server = Endpoint::new(
-        Default::default(),
-        Some(Arc::new(server_config())),
-        true,
-        None,
-    );
+    let mut server = Endpoint::new(Default::default(), Some(server_config()), true, None);
     let now = Instant::now();
     let mut buf = Vec::with_capacity(server.config().get_max_udp_payload_size() as usize);
     // Long-header packet with reserved version number
@@ -153,14 +156,9 @@ fn version_negotiate_client() {
         true,
         None,
     );
+    let config = client.insert_client_config(client_config()).unwrap();
     let (_, mut client_ch) = client
-        .connect(
-            Instant::now(),
-            client_config(),
-            server_addr,
-            "localhost",
-            None,
-        )
+        .connect(Instant::now(), config, server_addr, "localhost", None)
         .unwrap();
     let now = Instant::now();
     let mut buf = Vec::with_capacity(client.config().get_max_udp_payload_size() as usize);
@@ -178,7 +176,7 @@ fn version_negotiate_client() {
         &mut buf,
     );
     if let Some(DatagramEvent::ConnectionEvent(_, event)) = opt_event {
-        client_ch.handle_event(event);
+        client_ch.handle_event(event, client.configs_mut());
     }
     assert_matches!(
         client_ch.poll(),
@@ -265,8 +263,7 @@ fn server_stateless_reset() {
     let mut pair = Pair::new(endpoint_config.clone(), server_config());
     let (client_ch, _) = pair.connect();
     pair.drive(); // Flush any post-handshake frames
-    pair.server.endpoint =
-        Endpoint::new(endpoint_config, Some(Arc::new(server_config())), true, None);
+    pair.server.endpoint = Endpoint::new(endpoint_config, Some(server_config()), true, None);
     // Force the server to generate the smallest possible stateless reset
     pair.client.connections.get_mut(&client_ch).unwrap().ping();
     info!("resetting");
@@ -294,8 +291,7 @@ fn client_stateless_reset() {
 
     let mut pair = Pair::new(endpoint_config.clone(), server_config());
     let (_, server_ch) = pair.connect();
-    pair.client.endpoint =
-        Endpoint::new(endpoint_config, Some(Arc::new(server_config())), true, None);
+    pair.client.endpoint = Endpoint::new(endpoint_config, Some(server_config()), true, None);
     // Send something big enough to allow room for a smaller stateless reset.
     pair.server.connections.get_mut(&server_ch).unwrap().close(
         pair.time,
@@ -320,12 +316,7 @@ fn stateless_reset_limit() {
     let mut endpoint_config = EndpointConfig::default();
     endpoint_config.cid_generator(Box::new(RandomConnectionIdGenerator::new(8)));
     let endpoint_config = endpoint_config;
-    let mut endpoint = Endpoint::new(
-        endpoint_config.clone(),
-        Some(Arc::new(server_config())),
-        true,
-        None,
-    );
+    let mut endpoint = Endpoint::new(endpoint_config.clone(), Some(server_config()), true, None);
     let time = Instant::now();
     let mut buf = Vec::new();
     let event = endpoint.handle(time, remote, None, None, [0u8; 1024][..].into(), &mut buf);
@@ -525,7 +516,7 @@ fn reject_missing_client_cert() {
         .with_protocol_versions(&[&rustls::version::TLS13])
         .unwrap()
         .with_client_cert_verifier(
-            WebPkiClientVerifier::builder_with_provider(Arc::new(store), provider)
+            WebPkiClientVerifier::builder_with_provider(store, provider)
                 .build()
                 .unwrap(),
         )
@@ -535,7 +526,7 @@ fn reject_missing_client_cert() {
 
     let mut pair = Pair::new(
         Default::default(),
-        ServerConfig::with_crypto(Arc::new(config)),
+        ServerConfig::with_crypto(Box::new(config)),
     );
 
     info!("connecting");
@@ -604,10 +595,10 @@ fn zero_rtt_happypath() {
     let _guard = subscribe();
     let mut pair = Pair::default();
     pair.server.handle_incoming = Box::new(validate_incoming);
-    let config = client_config();
+    let config = pair.add_client_config(client_config());
 
     // Establish normal connection
-    let client_ch = pair.begin_connect(config.clone());
+    let client_ch = pair.begin_connect_shared(config);
     pair.drive();
     pair.server.assert_accept();
     pair.client
@@ -622,7 +613,7 @@ fn zero_rtt_happypath() {
         CLIENT_PORTS.lock().unwrap().next().unwrap(),
     );
     info!("resuming session");
-    let client_ch = pair.begin_connect(config);
+    let client_ch = pair.begin_connect_shared(config);
     assert!(pair.client_conn_mut(client_ch).has_0rtt());
     let s = pair.client_streams(client_ch).open(Dir::Uni).unwrap();
     const MSG: &[u8] = b"Hello, 0-RTT!";
@@ -668,16 +659,18 @@ fn zero_rtt_happypath() {
 #[test]
 fn zero_rtt_rejection() {
     let _guard = subscribe();
-    let server_config = ServerConfig::with_crypto(Arc::new(server_crypto_with_alpn(vec![
+    let server_config = ServerConfig::with_crypto(Box::new(server_crypto_with_alpn(vec![
         "foo".into(),
         "bar".into(),
     ])));
     let mut pair = Pair::new(EndpointConfig::default(), server_config);
-    let mut client_crypto = Arc::new(client_crypto_with_alpn(vec!["foo".into()]));
-    let client_config = ClientConfig::new(client_crypto.clone());
+    let client_config =
+        pair.add_client_config(ClientConfig::new(Box::new(client_crypto_with_alpn(vec![
+            "foo".into(),
+        ]))));
 
     // Establish normal connection
-    let client_ch = pair.begin_connect(client_config);
+    let client_ch = pair.begin_connect_shared(client_config);
     pair.drive();
     let server_ch = pair.server.assert_accept();
     assert_matches!(
@@ -706,14 +699,20 @@ fn zero_rtt_rejection() {
     // We want to have a TLS client config with the existing session cache (so resumption could
     // happen), but with different ALPN protocols (so that the server must reject it). Reuse
     // the existing `ClientConfig` and change the ALPN protocols to make that happen.
-    let this = Arc::get_mut(&mut client_crypto).expect("QuicClientConfig is shared");
-    let inner = Arc::get_mut(&mut this.inner).expect("QuicClientConfig.inner is shared");
-    inner.alpn_protocols = vec!["bar".into()];
+    let config = pair
+        .client
+        .configs_mut()
+        .client_config_mut(client_config)
+        .expect("the client configuration is held");
+    let crypto: &mut dyn std::any::Any = &mut *config.crypto;
+    let this = crypto
+        .downcast_mut::<crypto::rustls::QuicClientConfig>()
+        .expect("the client configuration is rustls's");
+    this.inner.alpn_protocols = vec!["bar".into()];
 
     // Changing protocols invalidates 0-RTT
-    let client_config = ClientConfig::new(client_crypto);
     info!("resuming session");
-    let client_ch = pair.begin_connect(client_config);
+    let client_ch = pair.begin_connect_shared(client_config);
     assert!(pair.client_conn_mut(client_ch).has_0rtt());
     let s = pair.client_streams(client_ch).open(Dir::Uni).unwrap();
     const MSG: &[u8] = b"Hello, 0-RTT!";
@@ -769,10 +768,10 @@ fn test_zero_rtt_incoming_limit<F: FnOnce(&mut ServerConfig)>(configure_server: 
     let mut server_config = server_config();
     configure_server(&mut server_config);
     let mut pair = Pair::new(EndpointConfig::default(), server_config);
-    let config = client_config_classical(None);
+    let config = pair.add_client_config(client_config_classical(None));
 
     // Establish normal connection
-    let client_ch = pair.begin_connect(config.clone());
+    let client_ch = pair.begin_connect_shared(config);
     pair.drive();
     pair.server.assert_accept();
     pair.client
@@ -788,7 +787,7 @@ fn test_zero_rtt_incoming_limit<F: FnOnce(&mut ServerConfig)>(configure_server: 
     );
     info!("resuming session");
     pair.server.handle_incoming = Box::new(|_| IncomingConnectionBehavior::Wait);
-    let client_ch = pair.begin_connect(config);
+    let client_ch = pair.begin_connect_shared(config);
     assert!(pair.client_conn_mut(client_ch).has_0rtt());
     let s = pair.client_streams(client_ch).open(Dir::Uni).unwrap();
     pair.client_send(client_ch, s)
@@ -865,14 +864,14 @@ fn zero_rtt_incoming_buffer_size_total() {
 #[test]
 fn alpn_success() {
     let _guard = subscribe();
-    let server_config = ServerConfig::with_crypto(Arc::new(server_crypto_with_alpn(vec![
+    let server_config = ServerConfig::with_crypto(Box::new(server_crypto_with_alpn(vec![
         "foo".into(),
         "bar".into(),
         "baz".into(),
     ])));
 
     let mut pair = Pair::new(EndpointConfig::default(), server_config);
-    let client_config = ClientConfig::new(Arc::new(client_crypto_with_alpn(vec![
+    let client_config = ClientConfig::new(Box::new(client_crypto_with_alpn(vec![
         "bar".into(),
         "quux".into(),
         "corge".into(),
@@ -905,7 +904,7 @@ fn alpn_success() {
 fn server_alpn_unset() {
     let _guard = subscribe();
     let mut pair = Pair::new(EndpointConfig::default(), server_config());
-    let client_config = ClientConfig::new(Arc::new(client_crypto_with_alpn(vec!["foo".into()])));
+    let client_config = ClientConfig::new(Box::new(client_crypto_with_alpn(vec!["foo".into()])));
 
     let client_ch = pair.begin_connect(client_config);
     pair.drive();
@@ -918,7 +917,7 @@ fn server_alpn_unset() {
 #[test]
 fn client_alpn_unset() {
     let _guard = subscribe();
-    let server_config = ServerConfig::with_crypto(Arc::new(server_crypto_with_alpn(vec![
+    let server_config = ServerConfig::with_crypto(Box::new(server_crypto_with_alpn(vec![
         "foo".into(),
         "bar".into(),
         "baz".into(),
@@ -936,14 +935,14 @@ fn client_alpn_unset() {
 #[test]
 fn alpn_mismatch() {
     let _guard = subscribe();
-    let server_config = ServerConfig::with_crypto(Arc::new(server_crypto_with_alpn(vec![
+    let server_config = ServerConfig::with_crypto(Box::new(server_crypto_with_alpn(vec![
         "foo".into(),
         "bar".into(),
         "baz".into(),
     ])));
 
     let mut pair = Pair::new(EndpointConfig::default(), server_config);
-    let client_ch = pair.begin_connect(ClientConfig::new(Arc::new(client_crypto_with_alpn(vec![
+    let client_ch = pair.begin_connect(ClientConfig::new(Box::new(client_crypto_with_alpn(vec![
         "quux".into(),
         "corge".into(),
     ]))));
@@ -1941,7 +1940,7 @@ fn cid_rotation() {
             cid_generator: Box::new(*RandomConnectionIdGenerator::new(8).set_lifetime(CID_TIMEOUT)),
             ..EndpointConfig::default()
         },
-        Some(Arc::new(server_config())),
+        Some(server_config()),
         true,
         None,
     );
@@ -2542,12 +2541,12 @@ fn datagram_unsupported() {
 fn large_initial() {
     let _guard = subscribe();
     let server_config =
-        ServerConfig::with_crypto(Arc::new(server_crypto_with_alpn(vec![vec![0, 0, 0, 42]])));
+        ServerConfig::with_crypto(Box::new(server_crypto_with_alpn(vec![vec![0, 0, 0, 42]])));
 
     let mut pair = Pair::new(EndpointConfig::default(), server_config);
     let client_crypto =
         client_crypto_with_alpn((0..1000u32).map(|x| x.to_be_bytes().to_vec()).collect());
-    let cfg = ClientConfig::new(Arc::new(client_crypto));
+    let cfg = ClientConfig::new(Box::new(client_crypto));
     let client_ch = pair.begin_connect(cfg);
     pair.drive();
     let server_ch = pair.server.assert_accept();
@@ -2803,12 +2802,7 @@ pub(super) fn big_cert_and_key() -> (CertificateDer<'static>, PrivateKeyDer<'sta
 fn malformed_token_len() {
     let _guard = subscribe();
     let client_addr = "[::2]:7890".parse().unwrap();
-    let mut server = Endpoint::new(
-        Default::default(),
-        Some(Arc::new(server_config())),
-        true,
-        None,
-    );
+    let mut server = Endpoint::new(Default::default(), Some(server_config()), true, None);
     let mut buf = Vec::with_capacity(server.config().get_max_udp_payload_size() as usize);
     server.handle(
         Instant::now(),
@@ -2908,12 +2902,7 @@ fn migrate_detects_new_mtu_and_respects_original_peer_max_udp_payload_size() {
 
     // Set up a client with a max payload size of 1400 (and use the defaults for the server)
     let server_endpoint_config = EndpointConfig::default();
-    let server = Endpoint::new(
-        server_endpoint_config,
-        Some(Arc::new(server_config())),
-        true,
-        None,
-    );
+    let server = Endpoint::new(server_endpoint_config, Some(server_config()), true, None);
     let client_endpoint_config = EndpointConfig {
         max_udp_payload_size: VarInt::from(client_max_udp_payload_size),
         ..EndpointConfig::default()
@@ -3979,7 +3968,12 @@ fn path_changes_unblock_oversized_datagrams() {
                     panic!("expected a connection event");
                 };
                 assert_eq!(ch, server_ch);
-                pair.server_conn_mut(ch).handle_event(event);
+                let server = &mut pair.server;
+                server
+                    .connections
+                    .get_mut(&ch)
+                    .unwrap()
+                    .handle_event(event, server.endpoint.configs_mut());
             }
             assert_eq!(
                 pair.server_conn_mut(server_ch).remote_address(),
@@ -4140,12 +4134,7 @@ fn ack_bundled_with_datagrams() {
 fn reject_short_idcid() {
     let _guard = subscribe();
     let client_addr = "[::2]:7890".parse().unwrap();
-    let mut server = Endpoint::new(
-        Default::default(),
-        Some(Arc::new(server_config())),
-        true,
-        None,
-    );
+    let mut server = Endpoint::new(Default::default(), Some(server_config()), true, None);
     let now = Instant::now();
     let mut buf = Vec::with_capacity(server.config().get_max_udp_payload_size() as usize);
     // Initial header that has an empty DCID but is otherwise well-formed

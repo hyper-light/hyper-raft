@@ -30,24 +30,24 @@ use super::*;
 
 mod common;
 use common::{
-    do_handshake, make_client_config_with_versions, make_pair_for_arc_configs, make_server_config,
-    transfer, Arc, KeyType,
+    do_handshake, make_client_config_with_versions, make_pair_for_configs, make_server_config,
+    transfer, KeyType, Shared,
 };
 
 #[test]
 fn exercise_key_log_file_for_client() {
     serialized(|| {
         let provider = provider::default_provider();
-        let server_config = Arc::new(make_server_config(KeyType::Rsa2048, &provider));
+        let server_config = Shared::new(make_server_config(KeyType::Rsa2048, &provider));
         unsafe { env::set_var("SSLKEYLOGFILE", "./sslkeylogfile.txt") };
 
         for version in hyper_tls::ALL_VERSIONS {
             let mut client_config =
                 make_client_config_with_versions(KeyType::Rsa2048, &[version], &provider);
-            client_config.key_log = Arc::new(hyper_tls::KeyLogFile::new());
+            client_config.key_log = Box::new(hyper_tls::KeyLogFile::new());
 
             let (mut client, mut server) =
-                make_pair_for_arc_configs(&Arc::new(client_config), &server_config);
+                make_pair_for_configs(client_config, server_config.clone());
 
             assert_eq!(5, client.writer().write(b"hello").unwrap());
 
@@ -65,15 +65,15 @@ fn exercise_key_log_file_for_server() {
         let mut server_config = make_server_config(KeyType::Rsa2048, &provider);
 
         unsafe { env::set_var("SSLKEYLOGFILE", "./sslkeylogfile.txt") };
-        server_config.key_log = Arc::new(hyper_tls::KeyLogFile::new());
+        server_config.key_log = Box::new(hyper_tls::KeyLogFile::new());
 
-        let server_config = Arc::new(server_config);
+        let server_config = Shared::new(server_config);
 
         for version in hyper_tls::ALL_VERSIONS {
             let client_config =
                 make_client_config_with_versions(KeyType::Rsa2048, &[version], &provider);
             let (mut client, mut server) =
-                make_pair_for_arc_configs(&Arc::new(client_config), &server_config);
+                make_pair_for_configs(client_config, server_config.clone());
 
             assert_eq!(5, client.writer().write(b"hello").unwrap());
 

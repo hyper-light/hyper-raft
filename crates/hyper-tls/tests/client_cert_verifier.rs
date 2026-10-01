@@ -8,13 +8,11 @@ mod common;
 
 use common::{
     do_handshake_until_both_error, do_handshake_until_error, make_client_config_with_versions,
-    make_client_config_with_versions_with_auth, make_pair_for_arc_configs, server_config_builder,
-    server_name, Arc, ErrorFromPeer, KeyType, MockClientVerifier,
+    make_client_config_with_versions_with_auth, make_pair_for_configs, server_config_builder,
+    server_name, ErrorFromPeer, KeyType, MockClientVerifier, Shared, TestClient, TestServer,
 };
 use hyper_tls::server::danger::ClientCertVerified;
-use hyper_tls::{
-    AlertDescription, ClientConnection, Error, InvalidMessage, ServerConfig, ServerConnection,
-};
+use hyper_tls::{AlertDescription, Error, InvalidMessage, ServerConfig};
 
 // Client is authorized!
 fn ver_ok() -> Result<ClientCertVerified, Error> {
@@ -36,7 +34,7 @@ fn server_config_with_verifier(
     client_cert_verifier: MockClientVerifier,
 ) -> ServerConfig {
     server_config_builder(&provider::default_provider())
-        .with_client_cert_verifier(Arc::new(client_cert_verifier))
+        .with_client_cert_verifier(Box::new(client_cert_verifier))
         .with_single_cert(kt.get_chain(), kt.get_key())
         .unwrap()
 }
@@ -48,13 +46,13 @@ fn client_verifier_works() {
     for kt in KeyType::all_for_provider(&provider).iter() {
         let client_verifier = MockClientVerifier::new(ver_ok, *kt, &provider);
         let server_config = server_config_with_verifier(*kt, client_verifier);
-        let server_config = Arc::new(server_config);
+        let server_config = Shared::new(server_config);
 
         for version in hyper_tls::ALL_VERSIONS {
             let client_config =
                 make_client_config_with_versions_with_auth(*kt, &[version], &provider);
             let (mut client, mut server) =
-                make_pair_for_arc_configs(&Arc::new(client_config.clone()), &server_config);
+                make_pair_for_configs(client_config, server_config.clone());
             let err = do_handshake_until_error(&mut client, &mut server);
             assert_eq!(err, Ok(()));
         }
@@ -69,13 +67,13 @@ fn client_verifier_no_schemes() {
         let mut client_verifier = MockClientVerifier::new(ver_ok, *kt, &provider);
         client_verifier.offered_schemes = Some(vec![]);
         let server_config = server_config_with_verifier(*kt, client_verifier);
-        let server_config = Arc::new(server_config);
+        let server_config = Shared::new(server_config);
 
         for version in hyper_tls::ALL_VERSIONS {
             let client_config =
                 make_client_config_with_versions_with_auth(*kt, &[version], &provider);
             let (mut client, mut server) =
-                make_pair_for_arc_configs(&Arc::new(client_config.clone()), &server_config);
+                make_pair_for_configs(client_config, server_config.clone());
             let err = do_handshake_until_error(&mut client, &mut server);
             assert_eq!(
                 err,
@@ -95,13 +93,12 @@ fn client_verifier_no_auth_yes_root() {
         let client_verifier = MockClientVerifier::new(ver_unreachable, *kt, &provider);
 
         let server_config = server_config_with_verifier(*kt, client_verifier);
-        let server_config = Arc::new(server_config);
+        let server_config = Shared::new(server_config);
 
         for version in hyper_tls::ALL_VERSIONS {
             let client_config = make_client_config_with_versions(*kt, &[version], &provider);
-            let mut server = ServerConnection::new(server_config.clone()).unwrap();
-            let mut client =
-                ClientConnection::new(Arc::new(client_config), server_name("localhost")).unwrap();
+            let mut server = TestServer::new(server_config.clone()).unwrap();
+            let mut client = TestClient::new(client_config, server_name("localhost")).unwrap();
             let errs = do_handshake_until_both_error(&mut client, &mut server);
             assert_eq!(
                 errs,
@@ -123,14 +120,13 @@ fn client_verifier_fails_properly() {
     for kt in KeyType::all_for_provider(&provider).iter() {
         let client_verifier = MockClientVerifier::new(ver_err, *kt, &provider);
         let server_config = server_config_with_verifier(*kt, client_verifier);
-        let server_config = Arc::new(server_config);
+        let server_config = Shared::new(server_config);
 
         for version in hyper_tls::ALL_VERSIONS {
             let client_config =
                 make_client_config_with_versions_with_auth(*kt, &[version], &provider);
-            let mut server = ServerConnection::new(server_config.clone()).unwrap();
-            let mut client =
-                ClientConnection::new(Arc::new(client_config), server_name("localhost")).unwrap();
+            let mut server = TestServer::new(server_config.clone()).unwrap();
+            let mut client = TestClient::new(client_config, server_name("localhost")).unwrap();
             let err = do_handshake_until_error(&mut client, &mut server);
             assert_eq!(
                 err,

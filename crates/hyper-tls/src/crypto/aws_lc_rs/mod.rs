@@ -1,3 +1,4 @@
+use alloc::boxed::Box;
 use alloc::vec::Vec;
 use std::sync::LazyLock;
 
@@ -15,7 +16,6 @@ use crate::enums::SignatureScheme;
 use crate::rand::GetRandomFailed;
 use crate::sign::SigningKey;
 use crate::suites::SupportedCipherSuite;
-use crate::sync::Arc;
 use crate::webpki::WebPkiSupportedAlgorithms;
 use crate::{Error, OtherError};
 
@@ -76,7 +76,7 @@ impl KeyProvider for AwsLcRs {
     fn load_private_key(
         &self,
         key_der: PrivateKeyDer<'static>,
-    ) -> Result<Arc<dyn SigningKey>, Error> {
+    ) -> Result<Box<dyn SigningKey>, Error> {
         sign::any_supported_type(&Zeroizing::new(key_der))
     }
 
@@ -269,7 +269,7 @@ pub(super) fn fips() -> bool {
 
 pub(super) fn unspecified_err(_e: aws_lc_rs::error::Unspecified) -> Error {
     {
-        Error::Other(OtherError(Arc::new(_e)))
+        Error::Other(OtherError::new(_e))
     }
 }
 

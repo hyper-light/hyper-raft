@@ -5,31 +5,38 @@ use core::num::NonZeroUsize;
 use core::{fmt, mem};
 use std::error::Error as StdError;
 
-use super::UnbufferedConnectionCommon;
-use crate::client::ClientConnectionData;
+use super::{SideData, UnbufferedConnectionCommon};
+use crate::client::{ClientConfig, ClientConnectionData};
 use crate::msgs::deframer::buffers::DeframerSliceBuffer;
-use crate::server::ServerConnectionData;
+use crate::server::{ServerConfig, ServerConnectionData};
 use crate::Error;
 
 impl UnbufferedConnectionCommon<ClientConnectionData> {
     /// Processes the TLS records in `incoming_tls` buffer until a new [`UnbufferedStatus`] is
     /// reached.
+    ///
+    /// `config` is the configuration this connection was made with; the connection holds none.
     pub fn process_tls_records<'c, 'i>(
         &'c mut self,
+        config: &mut ClientConfig,
         incoming_tls: &'i mut [u8],
     ) -> UnbufferedStatus<'c, 'i, ClientConnectionData> {
-        self.process_tls_records_common(incoming_tls, |_| false, |_, _| unreachable!())
+        self.process_tls_records_common(config, incoming_tls, |_| false, |_, _| unreachable!())
     }
 }
 
 impl UnbufferedConnectionCommon<ServerConnectionData> {
     /// Processes the TLS records in `incoming_tls` buffer until a new [`UnbufferedStatus`] is
     /// reached.
+    ///
+    /// `config` is the configuration this connection was made with; the connection holds none.
     pub fn process_tls_records<'c, 'i>(
         &'c mut self,
+        config: &mut ServerConfig,
         incoming_tls: &'i mut [u8],
     ) -> UnbufferedStatus<'c, 'i, ServerConnectionData> {
         self.process_tls_records_common(
+            config,
             incoming_tls,
             |conn| conn.peek_early_data().is_some(),
             |conn, incoming_tls| ReadEarlyData::new(conn, incoming_tls).into(),
@@ -37,9 +44,10 @@ impl UnbufferedConnectionCommon<ServerConnectionData> {
     }
 }
 
-impl<Data> UnbufferedConnectionCommon<Data> {
+impl<Data: SideData> UnbufferedConnectionCommon<Data> {
     fn process_tls_records_common<'c, 'i>(
         &'c mut self,
+        config: &mut Data::Config,
         incoming_tls: &'i mut [u8],
         mut early_data_available: impl FnMut(&mut Self) -> bool,
         early_data_state: impl FnOnce(&'c mut Self, &'i mut [u8]) -> ConnectionState<'c, 'i, Data>,
@@ -72,10 +80,7 @@ impl<Data> UnbufferedConnectionCommon<Data> {
             let deframer_output = if self.core.common_state.has_received_close_notify {
                 None
             } else {
-                match self
-                    .core
-                    .deframe(None, buffer.filled_mut(), &mut buffer_progress)
-                {
+                match self.core.deframe(buffer.filled_mut(), &mut buffer_progress) {
                     Err(err) => {
                         buffer.queue_discard(buffer_progress.take_discard());
                         return UnbufferedStatus {
@@ -101,7 +106,7 @@ impl<Data> UnbufferedConnectionCommon<Data> {
                         }
                     };
 
-                match self.core.process_msg(msg, state, None) {
+                match self.core.process_msg(msg, state, None, config) {
                     Ok(new) => state = new,
 
                     Err(e) => {

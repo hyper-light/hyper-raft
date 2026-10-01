@@ -4,7 +4,6 @@ use std::{
     convert::TryFrom,
     fmt, io, mem,
     net::{IpAddr, SocketAddr},
-    sync::Arc,
 };
 
 use bytes::{Bytes, BytesMut};
@@ -20,7 +19,7 @@ use crate::{
     cid_generator::ConnectionIdGenerator,
     cid_queue::CidQueue,
     coding::BufMutExt,
-    config::{ServerConfig, TransportConfig},
+    config::{ConfigKey, Configs, ServerConfigHandle, TransportConfig},
     crypto::{self, KeyPair, Keys, PacketKey},
     frame::{self, Close, Datagram, FrameStruct, NewConnectionId, NewToken},
     packet::{
@@ -137,6 +136,9 @@ pub struct Connection {
     qlog: QlogSink,
     rng: StdRng,
     crypto: Box<dyn crypto::Session>,
+    /// The endpoint's slot holding the configuration this connection was started from, which the
+    /// endpoint lends to each call that needs it
+    shared_config: ConfigKey,
     /// The CID we initially chose, for use during the handshake
     handshake_cid: ConnectionId,
     /// The CID the peer initially chose, for use during the handshake
@@ -260,6 +262,7 @@ impl Connection {
         remote: SocketAddr,
         local_ip: Option<IpAddr>,
         crypto: Box<dyn crypto::Session>,
+        shared_config: ConfigKey,
         cid_gen: &dyn ConnectionIdGenerator,
         now: Instant,
         version: u32,
@@ -285,6 +288,7 @@ impl Connection {
             grease_quic_bit,
             qlog,
             crypto,
+            shared_config,
             handshake_cid: loc_cid,
             rem_handshake_cid: rem_cid,
             local_cid_state: CidState::new(
@@ -466,6 +470,7 @@ impl Connection {
         now: Instant,
         max_datagrams: usize,
         buf: &mut Vec<u8>,
+        configs: &Configs,
     ) -> Option<Transmit> {
         assert!(max_datagrams != 0);
         let max_datagrams = match self.config.enable_segmentation_offload {
@@ -890,8 +895,14 @@ impl Connection {
                 }
             }
 
-            let sent =
-                self.populate_packet(now, space_id, buf, builder.max_size, builder.exact_number);
+            let sent = self.populate_packet(
+                configs,
+                now,
+                space_id,
+                buf,
+                builder.max_size,
+                builder.exact_number,
+            );
 
             // ACK-only packets should only be sent when explicitly allowed. If we write them due to
             // any other reason, there is a bug which leads to one component announcing write
@@ -1118,7 +1129,7 @@ impl Connection {
     /// Will execute protocol logic upon receipt of a connection event, in turn preparing signals
     /// (including application `Event`s, `EndpointEvent`s and outgoing datagrams) that should be
     /// extracted through the relevant methods.
-    pub fn handle_event(&mut self, event: ConnectionEvent) {
+    pub fn handle_event(&mut self, event: ConnectionEvent, configs: &mut Configs) {
         use ConnectionEventInner::*;
         match event.0 {
             Datagram(DatagramConnectionEvent {
@@ -1142,7 +1153,7 @@ impl Connection {
                 self.stats.udp_rx.bytes += first_decode.len() as u64;
                 let data_len = first_decode.len();
 
-                self.handle_decode(now, remote, ecn, first_decode);
+                self.handle_decode(configs, now, remote, ecn, first_decode);
                 // The current `path` might have changed inside `handle_decode`,
                 // since the packet could have triggered a migration. Make sure
                 // the data received is accounted for the most recent path by accessing
@@ -1151,7 +1162,7 @@ impl Connection {
 
                 if let Some(data) = remaining {
                     self.stats.udp_rx.bytes += data.len() as u64;
-                    self.handle_coalesced(now, remote, ecn, data);
+                    self.handle_coalesced(configs, now, remote, ecn, data);
                 }
 
                 self.qlog.emit_recovery_metrics(
@@ -2010,6 +2021,7 @@ impl Connection {
     /// efficient.
     pub(crate) fn handle_first_packet(
         &mut self,
+        configs: &mut Configs,
         now: Instant,
         remote: SocketAddr,
         ecn: Option<EcnCodepoint>,
@@ -2039,9 +2051,9 @@ impl Connection {
             false,
         );
 
-        self.process_decrypted_packet(now, remote, Some(packet_number), packet.into())?;
+        self.process_decrypted_packet(configs, now, remote, Some(packet_number), packet.into())?;
         if let Some(data) = remaining {
-            self.handle_coalesced(now, remote, ecn, data);
+            self.handle_coalesced(configs, now, remote, ecn, data);
         }
 
         self.qlog
@@ -2087,6 +2099,7 @@ impl Connection {
 
     fn read_crypto(
         &mut self,
+        configs: &mut Configs,
         space: SpaceId,
         crypto: &frame::Crypto,
         payload_len: usize,
@@ -2129,7 +2142,10 @@ impl Connection {
 
         while let Some(chunk) = space.crypto_stream.read(usize::MAX, true) {
             trace!("consumed {} CRYPTO bytes", chunk.bytes.len());
-            if self.crypto.read_handshake(&chunk.bytes)? {
+            let config = configs
+                .session_config(self.shared_config)
+                .ok_or_else(released_config)?;
+            if self.crypto.read_handshake(config, &chunk.bytes)? {
                 self.events.push_back(Event::HandshakeDataReady);
             }
         }
@@ -2223,6 +2239,7 @@ impl Connection {
 
     fn handle_coalesced(
         &mut self,
+        configs: &mut Configs,
         now: Instant,
         remote: SocketAddr,
         ecn: Option<EcnCodepoint>,
@@ -2239,7 +2256,7 @@ impl Connection {
             ) {
                 Ok((partial_decode, rest)) => {
                     remaining = rest;
-                    self.handle_decode(now, remote, ecn, partial_decode);
+                    self.handle_decode(configs, now, remote, ecn, partial_decode);
                 }
                 Err(e) => {
                     trace!("malformed header: {}", e);
@@ -2251,6 +2268,7 @@ impl Connection {
 
     fn handle_decode(
         &mut self,
+        configs: &mut Configs,
         now: Instant,
         remote: SocketAddr,
         ecn: Option<EcnCodepoint>,
@@ -2262,12 +2280,20 @@ impl Connection {
             self.zero_rtt_crypto.as_ref(),
             self.peer_params.stateless_reset_token,
         ) {
-            self.handle_packet(now, remote, ecn, decoded.packet, decoded.stateless_reset);
+            self.handle_packet(
+                configs,
+                now,
+                remote,
+                ecn,
+                decoded.packet,
+                decoded.stateless_reset,
+            );
         }
     }
 
     fn handle_packet(
         &mut self,
+        configs: &mut Configs,
         now: Instant,
         remote: SocketAddr,
         ecn: Option<EcnCodepoint>,
@@ -2367,7 +2393,7 @@ impl Connection {
                         );
                     }
 
-                    self.process_decrypted_packet(now, remote, number, packet)
+                    self.process_decrypted_packet(configs, now, remote, number, packet)
                 }
             }
         };
@@ -2421,6 +2447,7 @@ impl Connection {
 
     fn process_decrypted_packet(
         &mut self,
+        configs: &mut Configs,
         now: Instant,
         remote: SocketAddr,
         number: Option<u64>,
@@ -2429,8 +2456,12 @@ impl Connection {
         let state = match self.state {
             State::Established => {
                 match packet.header.space() {
-                    SpaceId::Data => self.process_payload(now, remote, number.unwrap(), packet)?,
-                    _ if packet.header.has_frames() => self.process_early_payload(now, packet)?,
+                    SpaceId::Data => {
+                        self.process_payload(configs, now, remote, number.unwrap(), packet)?
+                    }
+                    _ if packet.header.has_frames() => {
+                        self.process_early_payload(configs, now, packet)?
+                    }
                     _ => {
                         trace!("discarding unexpected pre-handshake packet");
                     }
@@ -2552,7 +2583,7 @@ impl Connection {
                 }
                 self.on_path_validated();
 
-                self.process_early_payload(now, packet)?;
+                self.process_early_payload(configs, now, packet)?;
                 if self.state.is_closed() {
                     return Ok(());
                 }
@@ -2631,7 +2662,7 @@ impl Connection {
                 }
 
                 let starting_space = self.highest_space;
-                self.process_early_payload(now, packet)?;
+                self.process_early_payload(configs, now, packet)?;
 
                 if self.side.is_server()
                     && starting_space == SpaceId::Initial
@@ -2655,7 +2686,7 @@ impl Connection {
                 ty: LongType::ZeroRtt,
                 ..
             } => {
-                self.process_payload(now, remote, number.unwrap(), packet)?;
+                self.process_payload(configs, now, remote, number.unwrap(), packet)?;
                 Ok(())
             }
             Header::VersionNegotiate { .. } => {
@@ -2684,6 +2715,7 @@ impl Connection {
     /// Process an Initial or Handshake packet payload
     fn process_early_payload(
         &mut self,
+        configs: &mut Configs,
         now: Instant,
         packet: Packet,
     ) -> Result<(), TransportError> {
@@ -2706,7 +2738,7 @@ impl Connection {
             match frame {
                 Frame::Padding | Frame::Ping => {}
                 Frame::Crypto(frame) => {
-                    self.read_crypto(packet.header.space(), &frame, payload_len)?;
+                    self.read_crypto(configs, packet.header.space(), &frame, payload_len)?;
                 }
                 Frame::Ack(ack) => {
                     self.on_ack_received(now, packet.header.space(), ack)?;
@@ -2738,6 +2770,7 @@ impl Connection {
 
     fn process_payload(
         &mut self,
+        configs: &mut Configs,
         now: Instant,
         remote: SocketAddr,
         number: u64,
@@ -2798,7 +2831,7 @@ impl Connection {
             }
             match frame {
                 Frame::Crypto(frame) => {
-                    self.read_crypto(SpaceId::Data, &frame, payload_len)?;
+                    self.read_crypto(configs, SpaceId::Data, &frame, payload_len)?;
                 }
                 Frame::Stream(frame) => {
                     if self.streams.received(frame, payload_len)?.should_transmit() {
@@ -3037,11 +3070,11 @@ impl Connection {
             && !is_probing_packet
             && number == self.spaces[SpaceId::Data].rx_packet
         {
-            let ConnectionSide::Server { ref server_config } = self.side else {
+            let ConnectionSide::Server { migration, .. } = self.side else {
                 panic!("packets from unknown remote should be dropped by clients");
             };
             debug_assert!(
-                server_config.migration,
+                migration,
                 "migration-initiating packets should have been dropped immediately"
             );
             self.migrate(now, remote);
@@ -3133,8 +3166,12 @@ impl Connection {
 
         // Subtract 1 to account for the CID we supplied while handshaking
         let mut n = self.peer_params.issue_cids_limit() - 1;
-        if let ConnectionSide::Server { server_config } = &self.side {
-            if server_config.has_preferred_address() {
+        if let ConnectionSide::Server {
+            has_preferred_address,
+            ..
+        } = self.side
+        {
+            if has_preferred_address {
                 // We also sent a CID in the transport parameters
                 n -= 1;
             }
@@ -3145,6 +3182,7 @@ impl Connection {
 
     fn populate_packet(
         &mut self,
+        configs: &Configs,
         now: Instant,
         space_id: SpaceId,
         buf: &mut Vec<u8>,
@@ -3360,8 +3398,15 @@ impl Connection {
         // NEW_TOKEN
         while let Some(remote_addr) = space.pending.new_tokens.pop() {
             debug_assert_eq!(space_id, SpaceId::Data);
-            let ConnectionSide::Server { server_config } = &self.side else {
+            if !self.side.is_server() {
                 panic!("NEW_TOKEN frames should not be enqueued by clients");
+            }
+            let Some(server_config) = configs.server_config(ServerConfigHandle(self.shared_config))
+            else {
+                // The configuration that would sign the token is gone; send none rather than one
+                // the server cannot validate
+                space.pending.new_tokens.clear();
+                break;
             };
 
             if remote_addr != self.path.remote {
@@ -3782,15 +3827,27 @@ impl Connection {
     /// Mark the path as validated, and enqueue NEW_TOKEN frames to be sent as appropriate
     fn on_path_validated(&mut self) {
         self.path.validated = true;
-        let ConnectionSide::Server { server_config } = &self.side else {
+        let ConnectionSide::Server {
+            validation_tokens_sent,
+            ..
+        } = self.side
+        else {
             return;
         };
         let new_tokens = &mut self.spaces[SpaceId::Data as usize].pending.new_tokens;
         new_tokens.clear();
-        for _ in 0..server_config.validation_token.sent {
+        for _ in 0..validation_tokens_sent {
             new_tokens.push(self.path.remote);
         }
     }
+}
+
+/// The error for a connection whose configuration's slot no longer holds it
+///
+/// The endpoint keeps a slot until the last connection started under it drains, so this is not
+/// reached through the endpoint; it is still a typed error, not an assumption.
+fn released_config() -> TransportError {
+    TransportError::INTERNAL_ERROR("connection's configuration released while in use")
 }
 
 impl fmt::Debug for Connection {
@@ -3808,15 +3865,22 @@ enum ConnectionSide {
         token: Bytes,
         server_name: String,
     },
+    /// Plain values copied from the server configuration at accept, so that the connection reads
+    /// them without being lent the configuration
     Server {
-        server_config: Arc<ServerConfig>,
+        /// `ServerConfig::migration`
+        migration: bool,
+        /// `ServerConfig::has_preferred_address`
+        has_preferred_address: bool,
+        /// `ValidationTokenConfig::sent`
+        validation_tokens_sent: u32,
     },
 }
 
 impl ConnectionSide {
     fn remote_may_migrate(&self) -> bool {
-        match self {
-            Self::Server { server_config } => server_config.migration,
+        match *self {
+            Self::Server { migration, .. } => migration,
             Self::Client { .. } => false,
         }
     }
@@ -3842,10 +3906,16 @@ impl From<SideArgs> for ConnectionSide {
         match side {
             SideArgs::Client { token, server_name } => Self::Client { token, server_name },
             SideArgs::Server {
-                server_config,
+                migration,
+                has_preferred_address,
+                validation_tokens_sent,
                 pref_addr_cid: _,
                 path_validated: _,
-            } => Self::Server { server_config },
+            } => Self::Server {
+                migration,
+                has_preferred_address,
+                validation_tokens_sent,
+            },
         }
     }
 }
@@ -3858,7 +3928,9 @@ pub(crate) enum SideArgs {
         server_name: String,
     },
     Server {
-        server_config: Arc<ServerConfig>,
+        migration: bool,
+        has_preferred_address: bool,
+        validation_tokens_sent: u32,
         pref_addr_cid: Option<ConnectionId>,
         path_validated: bool,
     },

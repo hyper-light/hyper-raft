@@ -34,10 +34,12 @@ mod connection {
     };
     use crate::msgs::message::InboundPlainMessage;
     use crate::server::{ServerConfig, ServerConnectionData};
-    use crate::sync::Arc;
     use crate::vecbuf::ChunkVecBuffer;
 
     /// A QUIC client or server connection.
+    ///
+    /// Reading handshake data needs the configuration of the connection's side, so `read_hs` is
+    /// called on the variant, with its [`ClientConfig`] or [`ServerConfig`].
     #[derive(Debug)]
     pub enum Connection {
         /// A client connection
@@ -62,16 +64,6 @@ mod connection {
             match self {
                 Self::Client(conn) => conn.zero_rtt_keys(),
                 Self::Server(conn) => conn.zero_rtt_keys(),
-            }
-        }
-
-        /// Consume unencrypted TLS handshake data.
-        ///
-        /// Handshake data obtained from separate encryption levels should be supplied in separate calls.
-        pub fn read_hs(&mut self, plaintext: &[u8]) -> Result<(), Error> {
-            match self {
-                Self::Client(conn) => conn.read_hs(plaintext),
-                Self::Server(conn) => conn.read_hs(plaintext),
             }
         }
 
@@ -154,24 +146,22 @@ mod connection {
         ///
         /// This differs from `ClientConnection::new()` in that it takes an extra `params` argument,
         /// which contains the TLS-encoded transport parameters to send.
+        ///
+        /// The configuration is taken for this call only: it may supply a stored session to
+        /// resume. [`ConnectionCommon::read_hs`] takes it again.
         pub fn new(
-            config: Arc<ClientConfig>,
+            config: &mut ClientConfig,
             quic_version: Version,
             name: ServerName<'static>,
             params: Vec<u8>,
         ) -> Result<Self, Error> {
-            Self::new_with_alpn(
-                config.clone(),
-                quic_version,
-                name,
-                params,
-                config.alpn_protocols.clone(),
-            )
+            let alpn_protocols = config.alpn_protocols.clone();
+            Self::new_with_alpn(config, quic_version, name, params, alpn_protocols)
         }
 
         /// Make a new QUIC ClientConnection with custom ALPN protocols.
         pub fn new_with_alpn(
-            config: Arc<ClientConfig>,
+            config: &mut ClientConfig,
             quic_version: Version,
             name: ServerName<'static>,
             params: Vec<u8>,
@@ -256,8 +246,11 @@ mod connection {
         ///
         /// This differs from `ServerConnection::new()` in that it takes an extra `params` argument,
         /// which contains the TLS-encoded transport parameters to send.
+        ///
+        /// The configuration is read for this call only. [`ConnectionCommon::read_hs`] takes it
+        /// again.
         pub fn new(
-            config: Arc<ServerConfig>,
+            config: &ServerConfig,
             quic_version: Version,
             params: Vec<u8>,
         ) -> Result<Self, Error> {
@@ -389,7 +382,13 @@ mod connection {
         /// Consume unencrypted TLS handshake data.
         ///
         /// Handshake data obtained from separate encryption levels should be supplied in separate calls.
-        pub fn read_hs(&mut self, plaintext: &[u8]) -> Result<(), Error> {
+        ///
+        /// `config` is the configuration this connection was made with; the connection holds none.
+        pub fn read_hs(
+            &mut self,
+            config: &mut Data::Config,
+            plaintext: &[u8],
+        ) -> Result<(), Error> {
             let range = self.deframer_buffer.extend(plaintext);
 
             self.core.hs_deframer.input_message(
@@ -406,8 +405,11 @@ mod connection {
                 .hs_deframer
                 .coalesce(self.deframer_buffer.filled_mut())?;
 
-            self.core
-                .process_new_packets(&mut self.deframer_buffer, &mut self.sendable_plaintext)?;
+            self.core.process_new_packets(
+                &mut self.deframer_buffer,
+                &mut self.sendable_plaintext,
+                config,
+            )?;
 
             Ok(())
         }
@@ -415,6 +417,9 @@ mod connection {
         /// Emit unencrypted TLS handshake data.
         ///
         /// When this returns `Some(_)`, the new keys must be used for future handshake data.
+        ///
+        /// This only drains handshake data that `read_hs` or the constructor already produced, so
+        /// it takes no configuration.
         pub fn write_hs(&mut self, buf: &mut Vec<u8>) -> Option<KeyChange> {
             self.core.common_state.quic.write_hs(buf)
         }

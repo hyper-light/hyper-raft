@@ -1,8 +1,6 @@
 #![allow(dead_code)]
 #![allow(clippy::disallowed_types, clippy::duplicate_mod)]
 
-pub use std::sync::Arc;
-
 use hyper_tls::client::{ClientConfig, ServerCertVerifierBuilder, WebPkiServerVerifier};
 use hyper_tls::crypto::CryptoProvider;
 use hyper_tls::server::{ClientCertVerifierBuilder, ServerConfig, WebPkiClientVerifier};
@@ -64,7 +62,7 @@ pub fn client_config_builder_with_versions(
 }
 
 pub fn webpki_client_verifier_builder(
-    roots: Arc<RootCertStore>,
+    roots: RootCertStore,
     provider: &CryptoProvider,
 ) -> ClientCertVerifierBuilder {
     if exactly_one_provider() {
@@ -75,7 +73,7 @@ pub fn webpki_client_verifier_builder(
 }
 
 pub fn webpki_server_verifier_builder(
-    roots: Arc<RootCertStore>,
+    roots: RootCertStore,
     provider: &CryptoProvider,
 ) -> ServerCertVerifierBuilder {
     if exactly_one_provider() {

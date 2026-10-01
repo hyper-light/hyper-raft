@@ -1,44 +1,50 @@
+use core::borrow::BorrowMut;
 use core::ops::{Deref, DerefMut};
 use std::io::{BufRead, IoSlice, Read, Result, Write};
 
 use crate::conn::{ConnectionCommon, SideData};
 
 /// This type implements `io::Read` and `io::Write`, encapsulating
-/// a Connection `C` and an underlying transport `T`, such as a socket.
+/// a Connection `C`, the configuration `F` it was made with, and an underlying transport `T`,
+/// such as a socket.
 ///
-/// Relies on [`ConnectionCommon::complete_io()`] to perform the necessary I/O.
+/// Relies on [`ConnectionCommon::complete_io()`] to perform the necessary I/O. A connection holds
+/// no configuration, so the stream borrows it for the calls that may advance the handshake.
 ///
 /// This allows you to use a rustls Connection like a normal stream.
 #[derive(Debug)]
-pub struct Stream<'a, C: 'a + ?Sized, T: 'a + Read + Write + ?Sized> {
+pub struct Stream<'a, C: 'a + ?Sized, T: 'a + Read + Write + ?Sized, F: 'a + ?Sized> {
     /// Our TLS connection
     pub conn: &'a mut C,
+
+    /// The configuration our TLS connection was made with
+    pub config: &'a mut F,
 
     /// The underlying transport, like a socket
     pub sock: &'a mut T,
 }
 
-impl<'a, C, T, S> Stream<'a, C, T>
+impl<'a, C, T, S> Stream<'a, C, T, S::Config>
 where
     C: 'a + DerefMut + Deref<Target = ConnectionCommon<S>>,
     T: 'a + Read + Write,
     S: SideData,
 {
-    /// Make a new Stream using the Connection `conn` and socket-like object
-    /// `sock`.  This does not fail and does no IO.
-    pub fn new(conn: &'a mut C, sock: &'a mut T) -> Self {
-        Self { conn, sock }
+    /// Make a new Stream using the Connection `conn`, the configuration `config` it was made
+    /// with, and socket-like object `sock`.  This does not fail and does no IO.
+    pub fn new(conn: &'a mut C, config: &'a mut S::Config, sock: &'a mut T) -> Self {
+        Self { conn, config, sock }
     }
 
     /// If we're handshaking, complete all the IO for that.
     /// If we have data to write, write it all.
     fn complete_prior_io(&mut self) -> Result<()> {
         if self.conn.is_handshaking() {
-            self.conn.complete_io(self.sock)?;
+            self.conn.complete_io(self.sock, self.config)?;
         }
 
         if self.conn.wants_write() {
-            self.conn.complete_io(self.sock)?;
+            self.conn.complete_io(self.sock, self.config)?;
         }
 
         Ok(())
@@ -52,7 +58,7 @@ where
         // needed to get more plaintext, which we must do if EOF has not been
         // hit.
         while self.conn.wants_read() {
-            if self.conn.complete_io(self.sock)?.0 == 0 {
+            if self.conn.complete_io(self.sock, self.config)?.0 == 0 {
                 break;
             }
         }
@@ -70,7 +76,7 @@ where
     }
 }
 
-impl<'a, C, T, S> Read for Stream<'a, C, T>
+impl<'a, C, T, S> Read for Stream<'a, C, T, S::Config>
 where
     C: 'a + DerefMut + Deref<Target = ConnectionCommon<S>>,
     T: 'a + Read + Write,
@@ -82,7 +88,7 @@ where
     }
 }
 
-impl<'a, C, T, S> BufRead for Stream<'a, C, T>
+impl<'a, C, T, S> BufRead for Stream<'a, C, T, S::Config>
 where
     C: 'a + DerefMut + Deref<Target = ConnectionCommon<S>>,
     T: 'a + Read + Write,
@@ -92,6 +98,7 @@ where
         // reborrow to get an owned `Stream`
         Stream {
             conn: self.conn,
+            config: self.config,
             sock: self.sock,
         }
         .fill_buf()
@@ -102,7 +109,7 @@ where
     }
 }
 
-impl<'a, C, T, S> Write for Stream<'a, C, T>
+impl<'a, C, T, S> Write for Stream<'a, C, T, S::Config>
 where
     C: 'a + DerefMut + Deref<Target = ConnectionCommon<S>>,
     T: 'a + Read + Write,
@@ -116,7 +123,7 @@ where
         // Try to write the underlying transport here, but don't let
         // any errors mask the fact we've consumed `len` bytes.
         // Callers will learn of permanent errors on the next call.
-        let _ = self.conn.complete_io(self.sock);
+        let _ = self.conn.complete_io(self.sock, self.config);
 
         Ok(len)
     }
@@ -129,7 +136,7 @@ where
         // Try to write the underlying transport here, but don't let
         // any errors mask the fact we've consumed `len` bytes.
         // Callers will learn of permanent errors on the next call.
-        let _ = self.conn.complete_io(self.sock);
+        let _ = self.conn.complete_io(self.sock, self.config);
 
         Ok(len)
     }
@@ -139,40 +146,47 @@ where
 
         self.conn.writer().flush()?;
         if self.conn.wants_write() {
-            self.conn.complete_io(self.sock)?;
+            self.conn.complete_io(self.sock, self.config)?;
         }
         Ok(())
     }
 }
 
 /// This type implements `io::Read` and `io::Write`, encapsulating
-/// and owning a Connection `C` and an underlying transport `T`, such as a socket.
+/// and owning a Connection `C`, the configuration `F` it is driven with, and an underlying
+/// transport `T`, such as a socket.
+///
+/// `F` is the configuration itself, or a mutable borrow of one that other connections share.
 ///
 /// Relies on [`ConnectionCommon::complete_io()`] to perform the necessary I/O.
 ///
 /// This allows you to use a rustls Connection like a normal stream.
 #[derive(Debug)]
-pub struct StreamOwned<C: Sized, T: Read + Write + Sized> {
+pub struct StreamOwned<C: Sized, T: Read + Write + Sized, F: Sized> {
     /// Our connection
     pub conn: C,
+
+    /// The configuration our connection was made with, or a borrow of it
+    pub config: F,
 
     /// The underlying transport, like a socket
     pub sock: T,
 }
 
-impl<C, T, S> StreamOwned<C, T>
+impl<C, T, F, S> StreamOwned<C, T, F>
 where
     C: DerefMut + Deref<Target = ConnectionCommon<S>>,
     T: Read + Write,
+    F: BorrowMut<S::Config>,
     S: SideData,
 {
-    /// Make a new StreamOwned taking the Connection `conn` and socket-like
-    /// object `sock`.  This does not fail and does no IO.
+    /// Make a new StreamOwned taking the Connection `conn`, its configuration `config` and
+    /// socket-like object `sock`.  This does not fail and does no IO.
     ///
-    /// This is the same as `Stream::new` except `conn` and `sock` are
+    /// This is the same as `Stream::new` except `conn`, `config` and `sock` are
     /// moved into the StreamOwned.
-    pub fn new(conn: C, sock: T) -> Self {
-        Self { conn, sock }
+    pub fn new(conn: C, config: F, sock: T) -> Self {
+        Self { conn, config, sock }
     }
 
     /// Get a reference to the underlying socket
@@ -185,30 +199,33 @@ where
         &mut self.sock
     }
 
-    /// Extract the `conn` and `sock` parts from the `StreamOwned`
-    pub fn into_parts(self) -> (C, T) {
-        (self.conn, self.sock)
+    /// Extract the `conn`, `config` and `sock` parts from the `StreamOwned`
+    pub fn into_parts(self) -> (C, F, T) {
+        (self.conn, self.config, self.sock)
     }
 }
 
-impl<'a, C, T, S> StreamOwned<C, T>
+impl<'a, C, T, F, S> StreamOwned<C, T, F>
 where
     C: DerefMut + Deref<Target = ConnectionCommon<S>>,
     T: Read + Write,
+    F: BorrowMut<S::Config>,
     S: SideData,
 {
-    fn as_stream(&'a mut self) -> Stream<'a, C, T> {
+    fn as_stream(&'a mut self) -> Stream<'a, C, T, S::Config> {
         Stream {
             conn: &mut self.conn,
+            config: self.config.borrow_mut(),
             sock: &mut self.sock,
         }
     }
 }
 
-impl<C, T, S> Read for StreamOwned<C, T>
+impl<C, T, F, S> Read for StreamOwned<C, T, F>
 where
     C: DerefMut + Deref<Target = ConnectionCommon<S>>,
     T: Read + Write,
+    F: BorrowMut<S::Config>,
     S: SideData,
 {
     fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
@@ -216,10 +233,11 @@ where
     }
 }
 
-impl<C, T, S> BufRead for StreamOwned<C, T>
+impl<C, T, F, S> BufRead for StreamOwned<C, T, F>
 where
     C: DerefMut + Deref<Target = ConnectionCommon<S>>,
     T: Read + Write,
+    F: BorrowMut<S::Config>,
     S: 'static + SideData,
 {
     fn fill_buf(&mut self) -> Result<&[u8]> {
@@ -231,10 +249,11 @@ where
     }
 }
 
-impl<C, T, S> Write for StreamOwned<C, T>
+impl<C, T, F, S> Write for StreamOwned<C, T, F>
 where
     C: DerefMut + Deref<Target = ConnectionCommon<S>>,
     T: Read + Write,
+    F: BorrowMut<S::Config>,
     S: SideData,
 {
     fn write(&mut self, buf: &[u8]) -> Result<usize> {
@@ -251,21 +270,21 @@ mod tests {
     use std::net::TcpStream;
 
     use super::{Stream, StreamOwned};
-    use crate::client::ClientConnection;
-    use crate::server::ServerConnection;
+    use crate::client::{ClientConfig, ClientConnection};
+    use crate::server::{ServerConfig, ServerConnection};
 
     #[test]
     fn stream_can_be_created_for_connection_and_tcpstream() {
-        type _Test<'a> = Stream<'a, ClientConnection, TcpStream>;
+        type _Test<'a> = Stream<'a, ClientConnection, TcpStream, ClientConfig>;
     }
 
     #[test]
     fn streamowned_can_be_created_for_client_and_tcpstream() {
-        type _Test = StreamOwned<ClientConnection, TcpStream>;
+        type _Test = StreamOwned<ClientConnection, TcpStream, ClientConfig>;
     }
 
     #[test]
     fn streamowned_can_be_created_for_server_and_tcpstream() {
-        type _Test = StreamOwned<ServerConnection, TcpStream>;
+        type _Test = StreamOwned<ServerConnection, TcpStream, ServerConfig>;
     }
 }

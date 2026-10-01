@@ -56,8 +56,9 @@
 use alloc::boxed::Box;
 use core::marker::PhantomData;
 
-use crate::client::ClientConnectionData;
+use crate::client::{ClientConfig, ClientConnectionData, ClientSettings, Resumption};
 use crate::common_state::Protocol;
+use crate::conn::SideConfig;
 use crate::msgs::codec::Codec;
 use crate::msgs::handshake::{CertificateChain, NewSessionTicketPayloadTls13};
 use crate::quic::Quic;
@@ -167,9 +168,11 @@ impl KernelConnection<ClientConnectionData> {
     /// use hyper_tls::kernel::KernelConnection;
     /// use hyper_tls::client::ClientConnectionData;
     ///
-    /// # fn doctest(conn: &mut KernelConnection<ClientConnectionData>, typ: ContentType, message: &[u8]) -> Result<(), hyper_tls::Error> {
+    /// # fn doctest(conn: &mut KernelConnection<ClientConnectionData>, config: &mut hyper_tls::ClientConfig, typ: ContentType, message: &[u8]) -> Result<(), hyper_tls::Error> {
     /// let conn: &mut KernelConnection<ClientConnectionData> = // ...
     /// #   conn;
+    /// let config: &mut hyper_tls::ClientConfig = // the configuration the connection was made with
+    /// #   config;
     /// let typ: ContentType = // ...
     /// #   typ;
     /// let mut message: &[u8] = // ...
@@ -196,7 +199,7 @@ impl KernelConnection<ClientConnectionData> {
     ///     let (payload, rest) = rest.split_at(len);
     ///     message = rest;
     ///
-    ///     conn.handle_new_session_ticket(payload)?;
+    ///     conn.handle_new_session_ticket(config, payload)?;
     /// }
     /// # Ok(())
     /// # }
@@ -211,7 +214,14 @@ impl KernelConnection<ClientConnectionData> {
     /// - An error occurs while the connection updates the session ticket store.
     ///
     /// [0]: https://datatracker.ietf.org/doc/html/rfc8446#section-4
-    pub fn handle_new_session_ticket(&mut self, payload: &[u8]) -> Result<(), Error> {
+    ///
+    /// `config` is the configuration the connection was made with: the ticket is stored in its
+    /// session store.
+    pub fn handle_new_session_ticket(
+        &mut self,
+        config: &mut ClientConfig,
+        payload: &[u8],
+    ) -> Result<(), Error> {
         // We want to return a more specific error here first if this is called
         // on a non-TLS 1.3 connection since a parsing error isn't the real issue
         // here.
@@ -222,12 +232,15 @@ impl KernelConnection<ClientConnectionData> {
         }
 
         let nst = NewSessionTicketPayloadTls13::read_bytes(payload)?;
+        let (settings, stores) = ClientConnectionData::split(config);
         let mut cx = KernelContext {
             peer_certificates: self.peer_certificates.as_ref(),
             protocol: self.protocol,
             quic: &self.quic,
+            config: settings,
+            resumption: stores.resumption,
         };
-        self.state.handle_new_session_ticket(&mut cx, &nst)
+        self.state.handle_new_session_ticket(&mut cx, nst)
     }
 }
 
@@ -242,7 +255,7 @@ pub(crate) trait KernelState: Send + Sync {
     fn handle_new_session_ticket(
         &mut self,
         cx: &mut KernelContext<'_>,
-        message: &NewSessionTicketPayloadTls13,
+        message: NewSessionTicketPayloadTls13,
     ) -> Result<(), Error>;
 }
 
@@ -250,6 +263,10 @@ pub(crate) struct KernelContext<'a> {
     pub(crate) peer_certificates: Option<&'a CertificateChain<'static>>,
     pub(crate) protocol: Protocol,
     pub(crate) quic: &'a Quic,
+    /// The client configuration's settings, for the identities a stored session records
+    pub(crate) config: &'a ClientSettings,
+    /// Where a client stores the ticket
+    pub(crate) resumption: &'a mut Resumption,
 }
 
 impl KernelContext<'_> {

@@ -16,13 +16,12 @@ use super::ring_like::signature::{self, EcdsaKeyPair, Ed25519KeyPair, KeyPair, R
 use crate::crypto::signer::{public_key_to_spki, Signer, SigningKey};
 use crate::enums::{SignatureAlgorithm, SignatureScheme};
 use crate::error::Error;
-use crate::sync::Arc;
 
 /// Parse `der` as any supported key encoding/type, returning
 /// the first which works.
-pub fn any_supported_type(der: &PrivateKeyDer<'_>) -> Result<Arc<dyn SigningKey>, Error> {
+pub fn any_supported_type(der: &PrivateKeyDer<'_>) -> Result<Box<dyn SigningKey>, Error> {
     if let Ok(rsa) = RsaSigningKey::new(der) {
-        return Ok(Arc::new(rsa));
+        return Ok(Box::new(rsa));
     }
 
     if let Ok(ecdsa) = any_ecdsa_type(der) {
@@ -35,7 +34,7 @@ pub fn any_supported_type(der: &PrivateKeyDer<'_>) -> Result<Arc<dyn SigningKey>
         }
 
         if let Ok(pqdsa) = PqdsaSigningKey::from_pkcs8(pkcs8) {
-            return Ok(Arc::new(pqdsa));
+            return Ok(Box::new(pqdsa));
         }
     }
 
@@ -48,13 +47,13 @@ pub fn any_supported_type(der: &PrivateKeyDer<'_>) -> Result<Arc<dyn SigningKey>
 ///
 /// Both SEC1 (PEM section starting with 'BEGIN EC PRIVATE KEY') and PKCS8
 /// (PEM section starting with 'BEGIN PRIVATE KEY') encodings are supported.
-pub fn any_ecdsa_type(der: &PrivateKeyDer<'_>) -> Result<Arc<dyn SigningKey>, Error> {
+pub fn any_ecdsa_type(der: &PrivateKeyDer<'_>) -> Result<Box<dyn SigningKey>, Error> {
     if let Ok(ecdsa_p256) = EcdsaSigningKey::new(
         der,
         SignatureScheme::ECDSA_NISTP256_SHA256,
         &signature::ECDSA_P256_SHA256_ASN1_SIGNING,
     ) {
-        return Ok(Arc::new(ecdsa_p256));
+        return Ok(Box::new(ecdsa_p256));
     }
 
     if let Ok(ecdsa_p384) = EcdsaSigningKey::new(
@@ -62,7 +61,7 @@ pub fn any_ecdsa_type(der: &PrivateKeyDer<'_>) -> Result<Arc<dyn SigningKey>, Er
         SignatureScheme::ECDSA_NISTP384_SHA384,
         &signature::ECDSA_P384_SHA384_ASN1_SIGNING,
     ) {
-        return Ok(Arc::new(ecdsa_p384));
+        return Ok(Box::new(ecdsa_p384));
     }
 
     if let Ok(ecdsa_p521) = EcdsaSigningKey::new(
@@ -70,7 +69,7 @@ pub fn any_ecdsa_type(der: &PrivateKeyDer<'_>) -> Result<Arc<dyn SigningKey>, Er
         SignatureScheme::ECDSA_NISTP521_SHA512,
         &signature::ECDSA_P521_SHA512_ASN1_SIGNING,
     ) {
-        return Ok(Arc::new(ecdsa_p521));
+        return Ok(Box::new(ecdsa_p521));
     }
 
     Err(Error::General(
@@ -84,9 +83,9 @@ pub fn any_ecdsa_type(der: &PrivateKeyDer<'_>) -> Result<Arc<dyn SigningKey>, Er
 /// in browsers.  It is also not supported by the WebPKI, because the
 /// CA/Browser Forum Baseline Requirements do not support it for publicly
 /// trusted certificates.
-pub fn any_eddsa_type(der: &PrivatePkcs8KeyDer<'_>) -> Result<Arc<dyn SigningKey>, Error> {
+pub fn any_eddsa_type(der: &PrivatePkcs8KeyDer<'_>) -> Result<Box<dyn SigningKey>, Error> {
     // TODO: Add support for Ed448
-    Ok(Arc::new(Ed25519SigningKey::new(
+    Ok(Box::new(Ed25519SigningKey::new(
         der,
         SignatureScheme::ED25519,
     )?))
@@ -98,7 +97,7 @@ pub fn any_eddsa_type(der: &PrivatePkcs8KeyDer<'_>) -> Result<Arc<dyn SigningKey
 /// the public, stable, API.
 #[doc(hidden)]
 pub struct RsaSigningKey {
-    key: Arc<RsaKeyPair>,
+    key: RsaKeyPair,
 }
 
 static ALL_RSA_SCHEMES: &[SignatureScheme] = &[
@@ -127,18 +126,16 @@ impl RsaSigningKey {
             Error::General(format!("failed to parse RSA private key: {key_rejected}"))
         })?;
 
-        Ok(Self {
-            key: Arc::new(key_pair),
-        })
+        Ok(Self { key: key_pair })
     }
 }
 
 impl SigningKey for RsaSigningKey {
-    fn choose_scheme(&self, offered: &[SignatureScheme]) -> Option<Box<dyn Signer>> {
+    fn choose_scheme(&self, offered: &[SignatureScheme]) -> Option<Box<dyn Signer + '_>> {
         ALL_RSA_SCHEMES
             .iter()
             .find(|scheme| offered.contains(scheme))
-            .map(|scheme| RsaSigner::new(self.key.clone(), *scheme))
+            .map(|scheme| RsaSigner::new(&self.key, *scheme))
     }
 
     fn public_key(&self) -> Option<SubjectPublicKeyInfoDer<'_>> {
@@ -161,14 +158,14 @@ impl Debug for RsaSigningKey {
     }
 }
 
-struct RsaSigner {
-    key: Arc<RsaKeyPair>,
+struct RsaSigner<'a> {
+    key: &'a RsaKeyPair,
     scheme: SignatureScheme,
     encoding: &'static dyn signature::RsaEncoding,
 }
 
-impl RsaSigner {
-    fn new(key: Arc<RsaKeyPair>, scheme: SignatureScheme) -> Box<dyn Signer> {
+impl<'a> RsaSigner<'a> {
+    fn new(key: &'a RsaKeyPair, scheme: SignatureScheme) -> Box<dyn Signer + 'a> {
         let encoding: &dyn signature::RsaEncoding = match scheme {
             SignatureScheme::RSA_PKCS1_SHA256 => &signature::RSA_PKCS1_SHA256,
             SignatureScheme::RSA_PKCS1_SHA384 => &signature::RSA_PKCS1_SHA384,
@@ -187,7 +184,7 @@ impl RsaSigner {
     }
 }
 
-impl Signer for RsaSigner {
+impl Signer for RsaSigner<'_> {
     fn sign(&self, message: &[u8]) -> Result<Vec<u8>, Error> {
         let mut sig = vec![0; self.key.public_modulus_len()];
 
@@ -203,7 +200,7 @@ impl Signer for RsaSigner {
     }
 }
 
-impl Debug for RsaSigner {
+impl Debug for RsaSigner<'_> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.debug_struct("RsaSigner")
             .field("scheme", &self.scheme)
@@ -223,7 +220,7 @@ impl Debug for RsaSigner {
 ///
 /// Currently this is only implemented for ECDSA keys.
 struct EcdsaSigningKey {
-    key: Arc<EcdsaKeyPair>,
+    key: EcdsaKeyPair,
     scheme: SignatureScheme,
 }
 
@@ -248,17 +245,17 @@ impl EcdsaSigningKey {
         };
 
         Ok(Self {
-            key: Arc::new(key_pair),
+            key: key_pair,
             scheme,
         })
     }
 }
 
 impl SigningKey for EcdsaSigningKey {
-    fn choose_scheme(&self, offered: &[SignatureScheme]) -> Option<Box<dyn Signer>> {
+    fn choose_scheme(&self, offered: &[SignatureScheme]) -> Option<Box<dyn Signer + '_>> {
         if offered.contains(&self.scheme) {
             Some(Box::new(EcdsaSigner {
-                key: self.key.clone(),
+                key: &self.key,
                 scheme: self.scheme,
             }))
         } else {
@@ -292,12 +289,12 @@ impl Debug for EcdsaSigningKey {
     }
 }
 
-struct EcdsaSigner {
-    key: Arc<EcdsaKeyPair>,
+struct EcdsaSigner<'a> {
+    key: &'a EcdsaKeyPair,
     scheme: SignatureScheme,
 }
 
-impl Signer for EcdsaSigner {
+impl Signer for EcdsaSigner<'_> {
     fn sign(&self, message: &[u8]) -> Result<Vec<u8>, Error> {
         let rng = SystemRandom::new();
         self.key
@@ -311,7 +308,7 @@ impl Signer for EcdsaSigner {
     }
 }
 
-impl Debug for EcdsaSigner {
+impl Debug for EcdsaSigner<'_> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.debug_struct("EcdsaSigner")
             .field("scheme", &self.scheme)
@@ -321,7 +318,7 @@ impl Debug for EcdsaSigner {
 
 pub(crate) struct PqdsaSigningKey {
     kind: PqdsaKeyKind,
-    inner: Arc<PqdsaKeyPair>,
+    inner: PqdsaKeyPair,
 }
 
 impl PqdsaSigningKey {
@@ -334,7 +331,7 @@ impl PqdsaSigningKey {
 
             return Ok(Self {
                 kind,
-                inner: Arc::new(key_pair),
+                inner: key_pair,
             });
         }
 
@@ -345,13 +342,13 @@ impl PqdsaSigningKey {
 }
 
 impl SigningKey for PqdsaSigningKey {
-    fn choose_scheme(&self, offered: &[SignatureScheme]) -> Option<Box<dyn Signer>> {
+    fn choose_scheme(&self, offered: &[SignatureScheme]) -> Option<Box<dyn Signer + '_>> {
         if !offered.contains(&self.kind.scheme()) {
             return None;
         }
 
         Some(Box::new(PqdsaSigner {
-            key: self.inner.clone(),
+            key: &self.inner,
             kind: self.kind,
         }))
     }
@@ -376,12 +373,12 @@ impl Debug for PqdsaSigningKey {
     }
 }
 
-struct PqdsaSigner {
-    key: Arc<PqdsaKeyPair>,
+struct PqdsaSigner<'a> {
+    key: &'a PqdsaKeyPair,
     kind: PqdsaKeyKind,
 }
 
-impl Signer for PqdsaSigner {
+impl Signer for PqdsaSigner<'_> {
     fn sign(&self, message: &[u8]) -> Result<Vec<u8>, Error> {
         let expected_sig_len = self.key.algorithm().signature_len();
         let mut sig = vec![0; expected_sig_len];
@@ -402,7 +399,7 @@ impl Signer for PqdsaSigner {
     }
 }
 
-impl Debug for PqdsaSigner {
+impl Debug for PqdsaSigner<'_> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.debug_struct("PqdsaSigner")
             .field("scheme", &self.kind.scheme())
@@ -459,7 +456,7 @@ impl PqdsaKeyKind {
 ///
 /// Currently this is only implemented for Ed25519 keys.
 struct Ed25519SigningKey {
-    key: Arc<Ed25519KeyPair>,
+    key: Ed25519KeyPair,
     scheme: SignatureScheme,
 }
 
@@ -469,7 +466,7 @@ impl Ed25519SigningKey {
     fn new(der: &PrivatePkcs8KeyDer<'_>, scheme: SignatureScheme) -> Result<Self, Error> {
         match Ed25519KeyPair::from_pkcs8_maybe_unchecked(der.secret_pkcs8_der()) {
             Ok(key_pair) => Ok(Self {
-                key: Arc::new(key_pair),
+                key: key_pair,
                 scheme,
             }),
             Err(e) => Err(Error::General(format!(
@@ -480,10 +477,10 @@ impl Ed25519SigningKey {
 }
 
 impl SigningKey for Ed25519SigningKey {
-    fn choose_scheme(&self, offered: &[SignatureScheme]) -> Option<Box<dyn Signer>> {
+    fn choose_scheme(&self, offered: &[SignatureScheme]) -> Option<Box<dyn Signer + '_>> {
         if offered.contains(&self.scheme) {
             Some(Box::new(Ed25519Signer {
-                key: self.key.clone(),
+                key: &self.key,
                 scheme: self.scheme,
             }))
         } else {
@@ -510,12 +507,12 @@ impl Debug for Ed25519SigningKey {
     }
 }
 
-struct Ed25519Signer {
-    key: Arc<Ed25519KeyPair>,
+struct Ed25519Signer<'a> {
+    key: &'a Ed25519KeyPair,
     scheme: SignatureScheme,
 }
 
-impl Signer for Ed25519Signer {
+impl Signer for Ed25519Signer<'_> {
     fn sign(&self, message: &[u8]) -> Result<Vec<u8>, Error> {
         Ok(self.key.sign(message).as_ref().into())
     }
@@ -525,7 +522,7 @@ impl Signer for Ed25519Signer {
     }
 }
 
-impl Debug for Ed25519Signer {
+impl Debug for Ed25519Signer<'_> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.debug_struct("Ed25519Signer")
             .field("scheme", &self.scheme)

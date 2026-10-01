@@ -27,7 +27,6 @@ use crate::msgs::enums::{
     PskKeyExchangeMode, ServerNameType,
 };
 use crate::rand;
-use crate::sync::Arc;
 use crate::verify::DigitallySignedStruct;
 use crate::x509::wrap_in_sequence;
 
@@ -2302,17 +2301,16 @@ impl Codec<'_> for CertificateRequestPayloadTls13 {
 #[derive(Debug)]
 pub(crate) struct NewSessionTicketPayload {
     pub(crate) lifetime_hint: u32,
-    // Tickets can be large (KB), so we deserialise this straight
-    // into an Arc, so it can be passed directly into the client's
-    // session object without copying.
-    pub(crate) ticket: Arc<PayloadU16>,
+    // Tickets can be large (KB): the message owns its ticket and moves it into the
+    // client's session value without copying.
+    pub(crate) ticket: PayloadU16,
 }
 
 impl NewSessionTicketPayload {
     pub(crate) fn new(lifetime_hint: u32, ticket: Vec<u8>) -> Self {
         Self {
             lifetime_hint,
-            ticket: Arc::new(PayloadU16::new(ticket)),
+            ticket: PayloadU16::new(ticket),
         }
     }
 }
@@ -2325,7 +2323,7 @@ impl Codec<'_> for NewSessionTicketPayload {
 
     fn read(r: &mut Reader<'_>) -> Result<Self, InvalidMessage> {
         let lifetime = u32::read(r)?;
-        let ticket = Arc::new(PayloadU16::read(r)?);
+        let ticket = PayloadU16::read(r)?;
 
         Ok(Self {
             lifetime_hint: lifetime,
@@ -2372,7 +2370,7 @@ pub(crate) struct NewSessionTicketPayloadTls13 {
     pub(crate) lifetime: u32,
     pub(crate) age_add: u32,
     pub(crate) nonce: PayloadU8,
-    pub(crate) ticket: Arc<PayloadU16>,
+    pub(crate) ticket: PayloadU16,
     pub(crate) extensions: NewSessionTicketExtensions,
 }
 
@@ -2382,7 +2380,7 @@ impl NewSessionTicketPayloadTls13 {
             lifetime,
             age_add,
             nonce: PayloadU8::new(nonce),
-            ticket: Arc::new(PayloadU16::new(ticket)),
+            ticket: PayloadU16::new(ticket),
             extensions: NewSessionTicketExtensions::default(),
         }
     }
@@ -2402,11 +2400,11 @@ impl Codec<'_> for NewSessionTicketPayloadTls13 {
         let age_add = u32::read(r)?;
         let nonce = PayloadU8::read(r)?;
         // nb. RFC8446: `opaque ticket<1..2^16-1>;`
-        let ticket = Arc::new(match PayloadU16::<NonEmpty>::read(r) {
+        let ticket = match PayloadU16::<NonEmpty>::read(r) {
             Err(InvalidMessage::IllegalEmptyValue) => Err(InvalidMessage::EmptyTicketValue),
             Err(err) => Err(err),
             Ok(pl) => Ok(PayloadU16::new(pl.0)),
-        }?);
+        }?;
         let extensions = NewSessionTicketExtensions::read(r)?;
 
         Ok(Self {

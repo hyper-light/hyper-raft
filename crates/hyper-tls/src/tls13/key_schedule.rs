@@ -49,7 +49,7 @@ impl KeyScheduleEarly {
     pub(crate) fn client_early_traffic_secret(
         &self,
         hs_hash: &hash::Output,
-        key_log: &dyn KeyLog,
+        key_log: &mut dyn KeyLog,
         client_random: &[u8; 32],
         common: &mut CommonState,
     ) {
@@ -154,7 +154,7 @@ impl KeyScheduleHandshakeStart {
         early_data_enabled: bool,
         hs_hash: hash::Output,
         suite: &'static Tls13CipherSuite,
-        key_log: &dyn KeyLog,
+        key_log: &mut dyn KeyLog,
         client_random: &[u8; 32],
         common: &mut CommonState,
     ) -> KeyScheduleHandshake {
@@ -179,7 +179,7 @@ impl KeyScheduleHandshakeStart {
     pub(crate) fn derive_server_handshake_secrets(
         self,
         hs_hash: hash::Output,
-        key_log: &dyn KeyLog,
+        key_log: &mut dyn KeyLog,
         client_random: &[u8; 32],
         common: &mut CommonState,
     ) -> KeyScheduleHandshake {
@@ -221,7 +221,7 @@ impl KeyScheduleHandshakeStart {
     fn into_handshake(
         self,
         hs_hash: hash::Output,
-        key_log: &dyn KeyLog,
+        key_log: &mut dyn KeyLog,
         client_random: &[u8; 32],
         common: &mut CommonState,
     ) -> KeyScheduleHandshake {
@@ -299,7 +299,7 @@ impl KeyScheduleHandshake {
     pub(crate) fn into_traffic_with_client_finished_pending(
         self,
         hs_hash: hash::Output,
-        key_log: &dyn KeyLog,
+        key_log: &mut dyn KeyLog,
         client_random: &[u8; 32],
         common: &mut CommonState,
     ) -> KeyScheduleTrafficWithClientFinishedPending {
@@ -335,7 +335,7 @@ impl KeyScheduleHandshake {
         self,
         pre_finished_hash: hash::Output,
         handshake_hash: hash::Output,
-        key_log: &dyn KeyLog,
+        key_log: &mut dyn KeyLog,
         client_random: &[u8; 32],
     ) -> (KeyScheduleClientBeforeFinished, hmac::Tag) {
         let before_finished =
@@ -359,7 +359,7 @@ impl KeyScheduleBeforeFinished {
     fn new(
         mut ks: KeySchedule,
         hs_hash: hash::Output,
-        key_log: &dyn KeyLog,
+        key_log: &mut dyn KeyLog,
         client_random: &[u8; 32],
     ) -> Self {
         ks.input_empty();
@@ -667,7 +667,7 @@ impl KeySchedule {
         &self,
         kind: SecretKind,
         hs_hash: &[u8],
-        key_log: &dyn KeyLog,
+        key_log: &mut dyn KeyLog,
         client_random: &[u8; 32],
     ) -> OkmBlock {
         let output = self.derive(kind, hs_hash);
@@ -1158,12 +1158,12 @@ mod tests {
         #[derive(Debug)]
         struct Log<'a>(&'a [u8]);
         impl KeyLog for Log<'_> {
-            fn log(&self, _label: &str, _client_random: &[u8], secret: &[u8]) {
+            fn log(&mut self, _label: &str, _client_random: &[u8], secret: &[u8]) {
                 assert_eq!(self.0, secret);
             }
         }
-        let log = Log(expected_traffic_secret);
-        let traffic_secret = ks.derive_logged_secret(kind, hash, &log, &[0; 32]);
+        let mut log = Log(expected_traffic_secret);
+        let traffic_secret = ks.derive_logged_secret(kind, hash, &mut log, &[0; 32]);
 
         // Since we can't test key equality, we test the output of sealing with the key instead.
         let aead_alg = &aead::AES_128_GCM;

@@ -2,7 +2,6 @@ use alloc::vec::Vec;
 use core::fmt::Debug;
 
 use crate::server::ClientHello;
-use crate::sync::Arc;
 use crate::{server, sign};
 
 /// Something which never stores sessions.
@@ -10,13 +9,13 @@ use crate::{server, sign};
 pub struct NoServerSessionStorage {}
 
 impl server::StoresServerSessions for NoServerSessionStorage {
-    fn put(&self, _id: Vec<u8>, _sec: Vec<u8>) -> bool {
+    fn put(&mut self, _id: Vec<u8>, _sec: Vec<u8>) -> bool {
         false
     }
     fn get(&self, _id: &[u8]) -> Option<Vec<u8>> {
         None
     }
-    fn take(&self, _id: &[u8]) -> Option<Vec<u8>> {
+    fn take(&mut self, _id: &[u8]) -> Option<Vec<u8>> {
         None
     }
     fn can_cache(&self) -> bool {
@@ -25,43 +24,48 @@ impl server::StoresServerSessions for NoServerSessionStorage {
 }
 
 mod cache {
+    use alloc::boxed::Box;
     use alloc::vec::Vec;
     use core::fmt::{Debug, Formatter};
 
-    use crate::lock::Mutex;
-    use crate::sync::Arc;
     use crate::{limited_cache, server};
 
     /// An implementer of `StoresServerSessions` that stores everything
     /// in memory.  If enforces a limit on the number of stored sessions
     /// to bound memory usage.
+    ///
+    /// It is owned by its [`ServerConfig`](crate::ServerConfig) and changed through `&mut`, so it
+    /// needs no lock.
     pub struct ServerSessionMemoryCache {
-        cache: Mutex<limited_cache::LimitedCache<Vec<u8>, Vec<u8>>>,
+        cache: limited_cache::LimitedCache<Vec<u8>, Vec<u8>>,
     }
 
     impl ServerSessionMemoryCache {
         /// Make a new ServerSessionMemoryCache.  `size` is the maximum
         /// number of stored sessions, and may be rounded-up for
         /// efficiency.
-        pub fn new(size: usize) -> Arc<Self> {
-            Arc::new(Self {
-                cache: Mutex::new(limited_cache::LimitedCache::new(size)),
+        ///
+        /// It is boxed, as [`ServerConfig::session_storage`](crate::ServerConfig::session_storage)
+        /// holds it.
+        pub fn new(size: usize) -> Box<Self> {
+            Box::new(Self {
+                cache: limited_cache::LimitedCache::new(size),
             })
         }
     }
 
     impl server::StoresServerSessions for ServerSessionMemoryCache {
-        fn put(&self, key: Vec<u8>, value: Vec<u8>) -> bool {
-            self.cache.lock().unwrap().insert(key, value);
+        fn put(&mut self, key: Vec<u8>, value: Vec<u8>) -> bool {
+            self.cache.insert(key, value);
             true
         }
 
         fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
-            self.cache.lock().unwrap().get(key).cloned()
+            self.cache.get(key).cloned()
         }
 
-        fn take(&self, key: &[u8]) -> Option<Vec<u8>> {
-            self.cache.lock().unwrap().remove(key)
+        fn take(&mut self, key: &[u8]) -> Option<Vec<u8>> {
+            self.cache.remove(key)
         }
 
         fn can_cache(&self) -> bool {
@@ -84,13 +88,13 @@ mod cache {
 
         #[test]
         fn test_serversessionmemorycache_accepts_put() {
-            let c = ServerSessionMemoryCache::new(4);
+            let mut c = ServerSessionMemoryCache::new(4);
             assert!(c.put(vec![0x01], vec![0x02]));
         }
 
         #[test]
         fn test_serversessionmemorycache_persists_put() {
-            let c = ServerSessionMemoryCache::new(4);
+            let mut c = ServerSessionMemoryCache::new(4);
             assert!(c.put(vec![0x01], vec![0x02]));
             assert_eq!(c.get(&[0x01]), Some(vec![0x02]));
             assert_eq!(c.get(&[0x01]), Some(vec![0x02]));
@@ -98,7 +102,7 @@ mod cache {
 
         #[test]
         fn test_serversessionmemorycache_overwrites_put() {
-            let c = ServerSessionMemoryCache::new(4);
+            let mut c = ServerSessionMemoryCache::new(4);
             assert!(c.put(vec![0x01], vec![0x02]));
             assert!(c.put(vec![0x01], vec![0x04]));
             assert_eq!(c.get(&[0x01]), Some(vec![0x04]));
@@ -106,7 +110,7 @@ mod cache {
 
         #[test]
         fn test_serversessionmemorycache_drops_to_maintain_size_invariant() {
-            let c = ServerSessionMemoryCache::new(2);
+            let mut c = ServerSessionMemoryCache::new(2);
             assert!(c.put(vec![0x01], vec![0x02]));
             assert!(c.put(vec![0x03], vec![0x04]));
             assert!(c.put(vec![0x05], vec![0x06]));
@@ -137,10 +141,10 @@ impl server::ProducesTickets for NeverProducesTickets {
     fn lifetime(&self) -> u32 {
         0
     }
-    fn encrypt(&self, _bytes: &[u8]) -> Option<Vec<u8>> {
+    fn encrypt(&mut self, _bytes: &[u8]) -> Option<Vec<u8>> {
         None
     }
-    fn decrypt(&self, _bytes: &[u8]) -> Option<Vec<u8>> {
+    fn decrypt(&mut self, _bytes: &[u8]) -> Option<Vec<u8>> {
         None
     }
 }
@@ -149,19 +153,19 @@ impl server::ProducesTickets for NeverProducesTickets {
 /// [RFC 7250] raw public key.
 ///
 /// [RFC 7250]: https://tools.ietf.org/html/rfc7250
-#[derive(Clone, Debug)]
-pub struct AlwaysResolvesServerRawPublicKeys(Arc<sign::CertifiedKey>);
+#[derive(Debug)]
+pub struct AlwaysResolvesServerRawPublicKeys(sign::CertifiedKey);
 
 impl AlwaysResolvesServerRawPublicKeys {
     /// Create a new `AlwaysResolvesServerRawPublicKeys` instance.
-    pub fn new(certified_key: Arc<sign::CertifiedKey>) -> Self {
+    pub fn new(certified_key: sign::CertifiedKey) -> Self {
         Self(certified_key)
     }
 }
 
 impl server::ResolvesServerCert for AlwaysResolvesServerRawPublicKeys {
-    fn resolve(&self, _client_hello: ClientHello<'_>) -> Option<Arc<sign::CertifiedKey>> {
-        Some(self.0.clone())
+    fn resolve(&self, _client_hello: ClientHello<'_>) -> Option<&sign::CertifiedKey> {
+        Some(&self.0)
     }
 
     fn only_raw_public_keys(&self) -> bool {
@@ -178,7 +182,6 @@ mod sni_resolver {
     use crate::error::Error;
     use crate::hash_map::HashMap;
     use crate::server::ClientHello;
-    use crate::sync::Arc;
     use crate::webpki::{verify_server_name, ParsedCertificate};
     use crate::{server, sign};
 
@@ -186,7 +189,7 @@ mod sni_resolver {
     /// on client-supplied server name (via SNI).
     #[derive(Debug)]
     pub struct ResolvesServerCertUsingSni {
-        by_name: HashMap<String, Arc<sign::CertifiedKey>>,
+        by_name: HashMap<String, sign::CertifiedKey>,
     }
 
     impl ResolvesServerCertUsingSni {
@@ -224,16 +227,16 @@ mod sni_resolver {
                 .and_then(|cert| verify_server_name(&cert, &server_name))?;
 
             if let ServerName::DnsName(name) = server_name {
-                self.by_name.insert(name.as_ref().to_string(), Arc::new(ck));
+                self.by_name.insert(name.as_ref().to_string(), ck);
             }
             Ok(())
         }
     }
 
     impl server::ResolvesServerCert for ResolvesServerCertUsingSni {
-        fn resolve(&self, client_hello: ClientHello<'_>) -> Option<Arc<sign::CertifiedKey>> {
+        fn resolve(&self, client_hello: ClientHello<'_>) -> Option<&sign::CertifiedKey> {
             if let Some(name) = client_hello.server_name() {
-                self.by_name.get(name).cloned()
+                self.by_name.get(name)
             } else {
                 // This kind of resolver requires SNI
                 None
@@ -294,13 +297,13 @@ mod tests {
 
     #[test]
     fn test_noserversessionstorage_drops_put() {
-        let c = NoServerSessionStorage {};
+        let mut c = NoServerSessionStorage {};
         assert!(!c.put(vec![0x01], vec![0x02]));
     }
 
     #[test]
     fn test_noserversessionstorage_denies_gets() {
-        let c = NoServerSessionStorage {};
+        let mut c = NoServerSessionStorage {};
         c.put(vec![0x01], vec![0x02]);
         assert_eq!(c.get(&[]), None);
         assert_eq!(c.get(&[0x01]), None);
@@ -309,7 +312,7 @@ mod tests {
 
     #[test]
     fn test_noserversessionstorage_denies_takes() {
-        let c = NoServerSessionStorage {};
+        let mut c = NoServerSessionStorage {};
         assert_eq!(c.take(&[]), None);
         assert_eq!(c.take(&[0x01]), None);
         assert_eq!(c.take(&[0x02]), None);
@@ -317,7 +320,7 @@ mod tests {
 
     #[test]
     fn test_neverproducestickets_does_nothing() {
-        let npt = NeverProducesTickets {};
+        let mut npt = NeverProducesTickets {};
         assert!(!npt.enabled());
         assert_eq!(0, npt.lifetime());
         assert_eq!(None, npt.encrypt(&[]));

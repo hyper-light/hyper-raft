@@ -1,8 +1,7 @@
 use std::{
     fmt,
     net::{SocketAddrV4, SocketAddrV6},
-    num::TryFromIntError,
-    sync::Arc,
+    num::{NonZeroUsize, TryFromIntError},
 };
 
 use aws_lc_rs::hmac;
@@ -19,6 +18,9 @@ use crate::{
     shared::ConnectionId,
 };
 
+mod configs;
+pub(crate) use configs::ConfigKey;
+pub use configs::{ClientConfigHandle, Configs, ConfigsFull, ServerConfigHandle};
 mod transport;
 pub use transport::{AckFrequencyConfig, IdleTimeout, MtuDiscoveryConfig, TransportConfig};
 pub use transport::{QlogConfig, QlogError};
@@ -37,6 +39,8 @@ pub struct EndpointConfig {
     pub(crate) min_reset_interval: Duration,
     /// Optional seed to be used internally for random number generation
     pub(crate) rng_seed: Option<[u8; 32]>,
+    /// Bound on the configurations the endpoint holds at once (see [`Configs`])
+    pub(crate) config_slots: NonZeroUsize,
 }
 
 impl EndpointConfig {
@@ -50,6 +54,7 @@ impl EndpointConfig {
             grease_quic_bit: true,
             min_reset_interval: Duration::from_millis(20),
             rng_seed: None,
+            config_slots: configs::DEFAULT_CONFIG_SLOTS,
         }
     }
 
@@ -143,6 +148,16 @@ impl EndpointConfig {
         self.rng_seed = seed;
         self
     }
+
+    /// Bound on the server and client configurations an endpoint holds at once
+    ///
+    /// A configuration stays held while it is current or while connections started under it live;
+    /// adding one beyond the bound is refused with [`ConfigsFull`]. Defaults to 4: one current and
+    /// one draining configuration per side (see `DEFAULT_CONFIG_SLOTS` for the derivation).
+    pub fn config_slots(&mut self, slots: NonZeroUsize) -> &mut Self {
+        self.config_slots = slots;
+        self
+    }
 }
 
 impl Clone for EndpointConfig {
@@ -155,6 +170,7 @@ impl Clone for EndpointConfig {
             grease_quic_bit: self.grease_quic_bit,
             min_reset_interval: self.min_reset_interval,
             rng_seed: self.rng_seed,
+            config_slots: self.config_slots,
         }
     }
 }
@@ -168,6 +184,7 @@ impl fmt::Debug for EndpointConfig {
             .field("supported_versions", &self.supported_versions)
             .field("grease_quic_bit", &self.grease_quic_bit)
             .field("rng_seed", &self.rng_seed)
+            .field("config_slots", &self.config_slots)
             .finish_non_exhaustive()
     }
 }
@@ -185,8 +202,8 @@ impl Default for EndpointConfig {
 
 /// Parameters governing incoming connections
 ///
-/// Default values should be suitable for most internet applications.
-#[derive(Clone)]
+/// Default values should be suitable for most internet applications. An endpoint owns its server
+/// configuration in its [`Configs`]; each endpoint serving the same parameters builds its own.
 pub struct ServerConfig {
     /// Transport configuration to use for incoming connections
     pub transport: TransportConfig,
@@ -194,13 +211,13 @@ pub struct ServerConfig {
     /// TLS configuration used for incoming connections
     ///
     /// Must be set to use TLS 1.3 only.
-    pub crypto: Arc<dyn crypto::ServerConfig>,
+    pub crypto: Box<dyn crypto::ServerConfig>,
 
     /// Configuration for sending and handling validation tokens
     pub validation_token: ValidationTokenConfig,
 
     /// Used to generate one-time AEAD keys to protect handshake tokens
-    pub(crate) token_key: Arc<dyn HandshakeTokenKey>,
+    pub(crate) token_key: Box<dyn HandshakeTokenKey>,
 
     /// Duration after a retry token was issued for which it's considered valid
     pub(crate) retry_token_lifetime: Duration,
@@ -218,14 +235,14 @@ pub struct ServerConfig {
     pub(crate) incoming_buffer_size: u64,
     pub(crate) incoming_buffer_size_total: u64,
 
-    pub(crate) time_source: Arc<dyn TimeSource>,
+    pub(crate) time_source: Box<dyn TimeSource>,
 }
 
 impl ServerConfig {
     /// Create a default config with a particular handshake token key
     pub fn new(
-        crypto: Arc<dyn crypto::ServerConfig>,
-        token_key: Arc<dyn HandshakeTokenKey>,
+        crypto: Box<dyn crypto::ServerConfig>,
+        token_key: Box<dyn HandshakeTokenKey>,
     ) -> Self {
         Self {
             transport: TransportConfig::default(),
@@ -245,7 +262,7 @@ impl ServerConfig {
             incoming_buffer_size: 10 << 20,
             incoming_buffer_size_total: 100 << 20,
 
-            time_source: Arc::new(StdSystemTime),
+            time_source: Box::new(StdSystemTime),
         }
     }
 
@@ -265,7 +282,7 @@ impl ServerConfig {
     }
 
     /// Private key used to authenticate data included in handshake tokens
-    pub fn token_key(&mut self, value: Arc<dyn HandshakeTokenKey>) -> &mut Self {
+    pub fn token_key(&mut self, value: Box<dyn HandshakeTokenKey>) -> &mut Self {
         self.token_key = value;
         self
     }
@@ -356,7 +373,7 @@ impl ServerConfig {
     /// This exists to allow system time to be mocked in tests, or wherever else desired.
     ///
     /// Defaults to [`StdSystemTime`], which simply calls [`SystemTime::now()`](SystemTime::now).
-    pub fn time_source(&mut self, time_source: Arc<dyn TimeSource>) -> &mut Self {
+    pub fn time_source(&mut self, time_source: Box<dyn TimeSource>) -> &mut Self {
         self.time_source = time_source;
         self
     }
@@ -374,7 +391,7 @@ impl ServerConfig {
         cert_chain: Vec<CertificateDer<'static>>,
         key: PrivateKeyDer<'static>,
     ) -> Result<Self, rustls::Error> {
-        Ok(Self::with_crypto(Arc::new(QuicServerConfig::new(
+        Ok(Self::with_crypto(Box::new(QuicServerConfig::new(
             cert_chain, key,
         )?)))
     }
@@ -384,7 +401,7 @@ impl ServerConfig {
     /// Create a server config with the given [`crypto::ServerConfig`]
     ///
     /// Uses a randomized handshake token key.
-    pub fn with_crypto(crypto: Arc<dyn crypto::ServerConfig>) -> Self {
+    pub fn with_crypto(crypto: Box<dyn crypto::ServerConfig>) -> Self {
         use aws_lc_rs::hkdf;
         use rand::Rng;
 
@@ -393,7 +410,7 @@ impl ServerConfig {
         rng.fill_bytes(&mut master_key);
         let master_key = hkdf::Salt::new(hkdf::HKDF_SHA256, &[]).extract(&master_key);
 
-        Self::new(crypto, Arc::new(master_key))
+        Self::new(crypto, Box::new(master_key))
     }
 }
 
@@ -514,20 +531,20 @@ impl fmt::Debug for ValidationTokenConfig {
 
 /// Configuration for outgoing connections
 ///
-/// Default values should be suitable for most internet applications.
-#[derive(Clone)]
+/// Default values should be suitable for most internet applications. An endpoint owns its client
+/// configurations in its [`Configs`] ([`Endpoint::insert_client_config`](crate::Endpoint::insert_client_config)).
 #[non_exhaustive]
 pub struct ClientConfig {
     /// Transport configuration to use
     pub(crate) transport: TransportConfig,
 
     /// Cryptographic configuration to use
-    pub(crate) crypto: Arc<dyn crypto::ClientConfig>,
+    pub(crate) crypto: Box<dyn crypto::ClientConfig>,
 
     /// Validation token store to use
 
     /// Provider that populates the destination connection ID of Initial Packets
-    pub(crate) initial_dst_cid_provider: Arc<dyn Fn() -> ConnectionId + Send + Sync>,
+    pub(crate) initial_dst_cid_provider: Box<dyn Fn() -> ConnectionId + Send + Sync>,
 
     /// QUIC protocol version to use
     pub(crate) version: u32,
@@ -535,11 +552,11 @@ pub struct ClientConfig {
 
 impl ClientConfig {
     /// Create a default config with a particular cryptographic config
-    pub fn new(crypto: Arc<dyn crypto::ClientConfig>) -> Self {
+    pub fn new(crypto: Box<dyn crypto::ClientConfig>) -> Self {
         Self {
             transport: Default::default(),
             crypto,
-            initial_dst_cid_provider: Arc::new(|| {
+            initial_dst_cid_provider: Box::new(|| {
                 RandomConnectionIdGenerator::new(MAX_CID_SIZE).generate_cid()
             }),
             version: 1,
@@ -556,7 +573,7 @@ impl ClientConfig {
     /// at least 8 bytes long and unpredictable, as per section 7.2 of RFC 9000.
     pub fn initial_dst_cid_provider(
         &mut self,
-        initial_dst_cid_provider: Arc<dyn Fn() -> ConnectionId + Send + Sync>,
+        initial_dst_cid_provider: Box<dyn Fn() -> ConnectionId + Send + Sync>,
     ) -> &mut Self {
         self.initial_dst_cid_provider = initial_dst_cid_provider;
         self
@@ -578,9 +595,9 @@ impl ClientConfig {
 impl ClientConfig {
     /// Create a client configuration that trusts specified trust anchors
     pub fn with_root_certificates(
-        roots: Arc<rustls::RootCertStore>,
+        roots: rustls::RootCertStore,
     ) -> Result<Self, rustls::client::VerifierBuilderError> {
-        Ok(Self::new(Arc::new(crypto::rustls::QuicClientConfig::new(
+        Ok(Self::new(Box::new(crypto::rustls::QuicClientConfig::new(
             WebPkiServerVerifier::builder_with_provider(roots, configured_provider()).build()?,
         ))))
     }

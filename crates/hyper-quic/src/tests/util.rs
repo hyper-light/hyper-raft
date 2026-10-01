@@ -7,7 +7,7 @@ use std::{
     net::{Ipv6Addr, SocketAddr, UdpSocket},
     ops::RangeFrom,
     str,
-    sync::{Arc, Mutex},
+    sync::Mutex,
 };
 
 use assert_matches::assert_matches;
@@ -54,12 +54,7 @@ impl Pair {
     }
 
     pub(super) fn new(endpoint_config: EndpointConfig, server_config: ServerConfig) -> Self {
-        let server = Endpoint::new(
-            endpoint_config.clone(),
-            Some(Arc::new(server_config)),
-            true,
-            None,
-        );
+        let server = Endpoint::new(endpoint_config.clone(), Some(server_config), true, None);
         let client = Endpoint::new(endpoint_config, None, true, None);
 
         Self::new_from_endpoint(client, server)
@@ -194,20 +189,46 @@ impl Pair {
         self.connect_with(client_config())
     }
 
+    /// Hand a client configuration to the client endpoint, for connections that share it
+    pub(super) fn add_client_config(&mut self, config: ClientConfig) -> ClientConfigHandle {
+        self.client.insert_client_config(config).unwrap()
+    }
+
+    /// Connect with a configuration of its own, retired once the connection exists so that its
+    /// slot is reclaimed when the connection drains
     pub(super) fn connect_with(
         &mut self,
         config: ClientConfig,
     ) -> (ConnectionHandle, ConnectionHandle) {
+        let config = self.add_client_config(config);
+        let connection = self.connect_with_shared(config);
+        self.client.retire_client_config(config);
+        connection
+    }
+
+    /// Connect with a configuration added by `add_client_config`
+    pub(super) fn connect_with_shared(
+        &mut self,
+        config: ClientConfigHandle,
+    ) -> (ConnectionHandle, ConnectionHandle) {
         info!("connecting");
-        let client_ch = self.begin_connect(config);
+        let client_ch = self.begin_connect_shared(config);
         self.drive();
         let server_ch = self.server.assert_accept();
         self.finish_connect(client_ch, server_ch);
         (client_ch, server_ch)
     }
 
-    /// Just start connecting the client
+    /// Just start connecting the client, with a configuration of its own
     pub(super) fn begin_connect(&mut self, config: ClientConfig) -> ConnectionHandle {
+        let config = self.add_client_config(config);
+        let client_ch = self.begin_connect_shared(config);
+        self.client.retire_client_config(config);
+        client_ch
+    }
+
+    /// Just start connecting the client, with a configuration added by `add_client_config`
+    pub(super) fn begin_connect_shared(&mut self, config: ClientConfigHandle) -> ConnectionHandle {
         let span = info_span!("client");
         let _guard = span.enter();
         let (client_ch, client_conn) = self
@@ -418,14 +439,16 @@ impl TestEndpoint {
 
                 for (_, mut events) in self.conn_events.drain() {
                     for event in events.drain(..) {
-                        conn.handle_event(event);
+                        conn.handle_event(event, self.endpoint.configs_mut());
                     }
                 }
 
                 while let Some(event) = conn.poll_endpoint_events() {
                     endpoint_events.push((*ch, event));
                 }
-                while let Some(transmit) = conn.poll_transmit(now, MAX_DATAGRAMS, &mut buf) {
+                while let Some(transmit) =
+                    conn.poll_transmit(now, MAX_DATAGRAMS, &mut buf, self.endpoint.configs())
+                {
                     let size = transmit.size;
                     self.outbound.extend(split_transmit(transmit, &buf[..size]));
                     buf.clear();
@@ -438,9 +461,9 @@ impl TestEndpoint {
             }
 
             for (ch, event) in endpoint_events {
-                if let Some(event) = self.handle_event(ch, event) {
+                if let Some(event) = self.endpoint.handle_event(ch, event) {
                     if let Some(conn) = self.connections.get_mut(&ch) {
-                        conn.handle_event(event);
+                        conn.handle_event(event, self.endpoint.configs_mut());
                     }
                 }
             }
@@ -560,14 +583,14 @@ impl Write for TestWriter {
 }
 
 pub(super) fn server_config() -> ServerConfig {
-    ServerConfig::with_crypto(Arc::new(server_crypto()))
+    ServerConfig::with_crypto(Box::new(server_crypto()))
 }
 
 pub(super) fn server_config_with_cert(
     cert: CertificateDer<'static>,
     key: PrivateKeyDer<'static>,
 ) -> ServerConfig {
-    ServerConfig::with_crypto(Arc::new(server_crypto_with_cert(cert, key)))
+    ServerConfig::with_crypto(Box::new(server_crypto_with_cert(cert, key)))
 }
 
 pub(super) fn server_crypto() -> QuicServerConfig {
@@ -604,12 +627,12 @@ fn server_crypto_inner(
     config.try_into().unwrap()
 }
 
-pub(super) fn client_config() -> ClientConfig {
-    ClientConfig::new(Arc::new(client_crypto()))
+pub(crate) fn client_config() -> ClientConfig {
+    ClientConfig::new(Box::new(client_crypto()))
 }
 
 pub(super) fn client_config_with_deterministic_pns() -> ClientConfig {
-    let mut cfg = ClientConfig::new(Arc::new(client_crypto()));
+    let mut cfg = ClientConfig::new(Box::new(client_crypto()));
     let mut transport = TransportConfig::default();
     transport.deterministic_packet_numbers(true);
     cfg.transport = transport;
@@ -617,7 +640,7 @@ pub(super) fn client_config_with_deterministic_pns() -> ClientConfig {
 }
 
 pub(super) fn client_config_with_certs(certs: Vec<CertificateDer<'static>>) -> ClientConfig {
-    ClientConfig::new(Arc::new(client_crypto_inner(Some(certs), None)))
+    ClientConfig::new(Box::new(client_crypto_inner(Some(certs), None)))
 }
 
 /// A client offering only classical key exchange, so its ClientHello fits in one Initial
@@ -638,7 +661,7 @@ pub(super) fn client_config_classical(certs: Option<Vec<CertificateDer<'static>>
     for cert in certs.unwrap_or_else(|| vec![CERTIFIED_KEY.cert.der().clone()]) {
         roots.add(cert).unwrap();
     }
-    let verifier = WebPkiServerVerifier::builder_with_provider(Arc::new(roots), provider)
+    let verifier = WebPkiServerVerifier::builder_with_provider(roots, provider)
         .build()
         .unwrap();
     let mut inner = rustls::ClientConfig::builder_with_provider(provider)
@@ -648,8 +671,8 @@ pub(super) fn client_config_classical(certs: Option<Vec<CertificateDer<'static>>
         .with_custom_certificate_verifier(verifier)
         .with_no_client_auth();
     inner.enable_early_data = true;
-    inner.key_log = Arc::new(KeyLogFile::new());
-    ClientConfig::new(Arc::new(QuicClientConfig::try_from(inner).unwrap()))
+    inner.key_log = Box::new(KeyLogFile::new());
+    ClientConfig::new(Box::new(QuicClientConfig::try_from(inner).unwrap()))
 }
 
 pub(super) fn client_crypto() -> QuicClientConfig {
@@ -670,11 +693,11 @@ fn client_crypto_inner(
     }
 
     let mut inner = QuicClientConfig::inner(
-        WebPkiServerVerifier::builder_with_provider(Arc::new(roots), configured_provider())
+        WebPkiServerVerifier::builder_with_provider(roots, configured_provider())
             .build()
             .unwrap(),
     );
-    inner.key_log = Arc::new(KeyLogFile::new());
+    inner.key_log = Box::new(KeyLogFile::new());
     if let Some(alpn) = alpn {
         inner.alpn_protocols = alpn;
     }

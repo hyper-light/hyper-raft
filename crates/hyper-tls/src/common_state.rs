@@ -4,6 +4,7 @@ use alloc::vec::Vec;
 use pki_types::CertificateDer;
 
 use crate::conn::kernel::KernelState;
+use crate::conn::SideData;
 use crate::crypto::SupportedKxGroup;
 use crate::enums::{AlertDescription, ContentType, HandshakeType, ProtocolVersion};
 use crate::error::{Error, InvalidMessage, PeerMisbehaved};
@@ -190,12 +191,13 @@ impl CommonState {
         matches!(self.negotiated_version, Some(ProtocolVersion::TLSv1_3))
     }
 
-    pub(crate) fn process_main_protocol<Data>(
+    pub(crate) fn process_main_protocol<Data: SideData>(
         &mut self,
         msg: Message<'_>,
         mut state: Box<dyn State<Data>>,
         data: &mut Data,
         sendable_plaintext: Option<&mut ChunkVecBuffer>,
+        config: &mut Data::Config,
     ) -> Result<Box<dyn State<Data>>, Error> {
         // For TLS1.2, outside of the handshake, send rejection alerts for
         // renegotiation requests.  These can occur any time.
@@ -211,12 +213,18 @@ impl CommonState {
             }
         }
 
-        let mut cx = Context {
-            common: self,
-            data,
-            sendable_plaintext,
+        let handled = {
+            let (settings, stores) = Data::split(config);
+            let mut cx = Context {
+                common: &mut *self,
+                data,
+                sendable_plaintext,
+                config: settings,
+                stores,
+            };
+            state.handle(&mut cx, msg)
         };
-        match state.handle(&mut cx, msg) {
+        match handled {
             Ok(next) => {
                 state = next.into_owned();
                 Ok(state)
@@ -806,7 +814,8 @@ pub(crate) trait State<Data>: Send + Sync {
         message: Message<'m>,
     ) -> Result<Box<dyn State<Data> + 'm>, Error>
     where
-        Self: 'm;
+        Self: 'm,
+        Data: SideData;
 
     fn export_keying_material(
         &self,
@@ -825,7 +834,12 @@ pub(crate) trait State<Data>: Send + Sync {
         Err(Error::HandshakeNotComplete)
     }
 
-    fn handle_decrypt_error(&self) {}
+    /// A record failed decryption; `config` is the connection's configuration.
+    fn handle_decrypt_error(&self, _config: &mut Data::Config)
+    where
+        Data: SideData,
+    {
+    }
 
     fn into_external_state(self: Box<Self>) -> Result<Box<dyn KernelState + 'static>, Error> {
         Err(Error::HandshakeNotComplete)
@@ -834,12 +848,20 @@ pub(crate) trait State<Data>: Send + Sync {
     fn into_owned(self: Box<Self>) -> Box<dyn State<Data> + 'static>;
 }
 
-pub(crate) struct Context<'a, Data> {
+pub(crate) struct Context<'a, Data: SideData> {
     pub(crate) common: &'a mut CommonState,
     pub(crate) data: &'a mut Data,
     /// Buffered plaintext. This is `Some` if any plaintext was written during handshake and `None`
     /// otherwise.
     pub(crate) sendable_plaintext: Option<&'a mut ChunkVecBuffer>,
+    /// The settings of the configuration driving this call, which the handshake reads.
+    ///
+    /// Copying this reference out of the context borrows the settings for `'a`, independently
+    /// of the context: a certificate key resolved from them stays usable while the context is
+    /// passed on mutably.
+    pub(crate) config: &'a Data::Settings,
+    /// The stores of the configuration driving this call, which the handshake writes.
+    pub(crate) stores: Data::Stores<'a>,
 }
 
 /// Side of the connection.

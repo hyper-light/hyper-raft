@@ -1,9 +1,6 @@
 //! Storing tokens sent from servers in NEW_TOKEN frames and using them in subsequent connections
 
-use std::{
-    collections::{HashMap, VecDeque, hash_map},
-    sync::Arc,
-};
+use std::collections::{HashMap, VecDeque};
 
 use bytes::Bytes;
 use lru_slab::LruSlab;
@@ -48,8 +45,8 @@ impl Default for TokenMemoryCache {
 struct State {
     max_server_names: u32,
     max_tokens_per_server: usize,
-    // map from server name to index in lru
-    lookup: HashMap<Arc<str>, u32>,
+    // map from server name to index in lru; the map is the name's only owner
+    lookup: HashMap<Box<str>, u32>,
     lru: LruSlab<CacheEntry>,
 }
 
@@ -77,36 +74,33 @@ impl State {
             return;
         }
 
-        let server_name = Arc::<str>::from(server_name);
-        match self.lookup.entry(server_name.clone()) {
-            hash_map::Entry::Occupied(hmap_entry) => {
-                // key already exists, push the new token to its token queue
-                let tokens = &mut self.lru.get_mut(*hmap_entry.get()).tokens;
-                if tokens.len() >= self.max_tokens_per_server {
-                    debug_assert!(tokens.len() == self.max_tokens_per_server);
-                    tokens.pop_front().unwrap();
-                }
-                tokens.push_back(token);
+        if let Some(&slot) = self.lookup.get(server_name) {
+            // key already exists, push the new token to its token queue
+            let tokens = &mut self.lru.get_mut(slot).tokens;
+            if tokens.len() >= self.max_tokens_per_server {
+                debug_assert!(tokens.len() == self.max_tokens_per_server);
+                tokens.pop_front().unwrap();
             }
-            hash_map::Entry::Vacant(hmap_entry) => {
-                // key does not yet exist, create a new one, evicting the oldest if necessary
-                let removed_key = if self.lru.len() >= self.max_server_names {
-                    // unwrap safety: max_server_names is > 0, so there's at least one entry, so
-                    //                lru() is some
-                    Some(self.lru.remove(self.lru.lru().unwrap()).server_name)
-                } else {
-                    None
-                };
+            tokens.push_back(token);
+            return;
+        }
 
-                hmap_entry.insert(self.lru.insert(CacheEntry::new(server_name, token)));
+        // key does not yet exist, create a new one, evicting the oldest if necessary
+        if self.lru.len() >= self.max_server_names {
+            // unwrap safety: max_server_names is > 0, so there's at least one entry, so lru() is
+            //                some
+            let evicted = self.lru.lru().unwrap();
+            self.lru.remove(evicted);
+            // The map is the name's only owner, so the evicted name is found by its slot: a scan
+            // of at most `max_server_names` entries, paid only when a new name evicts an old one.
+            // Upstream kept a second reference to the name in the entry, through an `Arc<str>`.
+            let before = self.lookup.len();
+            self.lookup.retain(|_, slot| *slot != evicted);
+            debug_assert_eq!(self.lookup.len() + 1, before);
+        }
 
-                // for borrowing reasons, we must defer removing the evicted hmap entry to here
-                if let Some(removed_slot) = removed_key {
-                    let removed = self.lookup.remove(&removed_slot);
-                    debug_assert!(removed.is_some());
-                }
-            }
-        };
+        let slot = self.lru.insert(CacheEntry::new(token));
+        self.lookup.insert(Box::from(server_name), slot);
     }
 
     fn take(&mut self, server_name: &str) -> Option<Bytes> {
@@ -130,20 +124,16 @@ impl State {
 /// Cache entry within `TokenMemoryCache`'s LRU slab
 #[derive(Debug)]
 struct CacheEntry {
-    server_name: Arc<str>,
     // invariant: tokens is never empty
     tokens: VecDeque<Bytes>,
 }
 
 impl CacheEntry {
     /// Construct with a single token
-    fn new(server_name: Arc<str>, token: Bytes) -> Self {
+    fn new(token: Bytes) -> Self {
         let mut tokens = VecDeque::new();
         tokens.push_back(token);
-        Self {
-            server_name,
-            tokens,
-        }
+        Self { tokens }
     }
 }
 

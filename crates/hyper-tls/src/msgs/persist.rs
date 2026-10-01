@@ -1,20 +1,18 @@
 use alloc::vec::Vec;
-use core::cmp;
+use core::{cmp, mem};
 
 use pki_types::{DnsName, UnixTime};
 use zeroize::Zeroizing;
 
-use crate::client::ResolvesClientCert;
 use crate::enums::{CipherSuite, ProtocolVersion};
 use crate::error::InvalidMessage;
+use crate::identity::Identity;
 use crate::msgs::base::{MaybeEmpty, PayloadU16, PayloadU8};
 use crate::msgs::codec::{Codec, Reader};
 use crate::msgs::handshake::SessionId;
 use crate::msgs::handshake::{CertificateChain, ProtocolName};
-use crate::sync::{Arc, Weak};
 use crate::tls12::Tls12CipherSuite;
 use crate::tls13::Tls13CipherSuite;
-use crate::verify::ServerCertVerifier;
 
 pub(crate) struct Retrieved<T> {
     pub(crate) value: T,
@@ -80,11 +78,11 @@ pub struct Tls13ClientSessionValue {
 impl Tls13ClientSessionValue {
     pub(crate) fn new(
         suite: &'static Tls13CipherSuite,
-        ticket: Arc<PayloadU16>,
+        ticket: PayloadU16,
         secret: &[u8],
         server_cert_chain: CertificateChain<'static>,
-        server_cert_verifier: &Arc<dyn ServerCertVerifier>,
-        client_creds: &Arc<dyn ResolvesClientCert>,
+        server_cert_verifier: Identity,
+        client_creds: Identity,
         time_now: UnixTime,
         lifetime_secs: u32,
         age_add: u32,
@@ -157,11 +155,11 @@ impl Tls12ClientSessionValue {
     pub(crate) fn new(
         suite: &'static Tls12CipherSuite,
         session_id: SessionId,
-        ticket: Arc<PayloadU16>,
+        ticket: PayloadU16,
         master_secret: &[u8],
         server_cert_chain: CertificateChain<'static>,
-        server_cert_verifier: &Arc<dyn ServerCertVerifier>,
-        client_creds: &Arc<dyn ResolvesClientCert>,
+        server_cert_verifier: Identity,
+        client_creds: Identity,
         time_now: UnixTime,
         lifetime_secs: u32,
         extended_ms: bool,
@@ -182,8 +180,9 @@ impl Tls12ClientSessionValue {
         }
     }
 
-    pub(crate) fn ticket(&mut self) -> Arc<PayloadU16> {
-        self.common.ticket.clone()
+    /// Move the ticket out, for the session value that replaces this one.
+    pub(crate) fn take_ticket(&mut self) -> PayloadU16 {
+        mem::replace(&mut self.common.ticket, PayloadU16::empty())
     }
 
     pub(crate) fn extended_ms(&self) -> bool {
@@ -211,46 +210,45 @@ impl core::ops::Deref for Tls12ClientSessionValue {
 
 #[derive(Debug, Clone)]
 pub struct ClientSessionCommon {
-    ticket: Arc<PayloadU16>,
+    ticket: PayloadU16,
     secret: Zeroizing<PayloadU8>,
     epoch: u64,
     lifetime_secs: u32,
-    server_cert_chain: Arc<CertificateChain<'static>>,
-    server_cert_verifier: Weak<dyn ServerCertVerifier>,
-    client_creds: Weak<dyn ResolvesClientCert>,
+    server_cert_chain: CertificateChain<'static>,
+    /// The server certificate verifier installed when this session was made
+    server_cert_verifier: Identity,
+    /// The client certificate resolver installed when this session was made
+    client_creds: Identity,
 }
 
 impl ClientSessionCommon {
     fn new(
-        ticket: Arc<PayloadU16>,
+        ticket: PayloadU16,
         secret: &[u8],
         time_now: UnixTime,
         lifetime_secs: u32,
         server_cert_chain: CertificateChain<'static>,
-        server_cert_verifier: &Arc<dyn ServerCertVerifier>,
-        client_creds: &Arc<dyn ResolvesClientCert>,
+        server_cert_verifier: Identity,
+        client_creds: Identity,
     ) -> Self {
         Self {
             ticket,
             secret: Zeroizing::new(PayloadU8::new(secret.to_vec())),
             epoch: time_now.as_secs(),
             lifetime_secs: cmp::min(lifetime_secs, MAX_TICKET_LIFETIME),
-            server_cert_chain: Arc::new(server_cert_chain),
-            server_cert_verifier: Arc::downgrade(server_cert_verifier),
-            client_creds: Arc::downgrade(client_creds),
+            server_cert_chain,
+            server_cert_verifier,
+            client_creds,
         }
     }
 
     pub(crate) fn compatible_config(
         &self,
-        server_cert_verifier: &Arc<dyn ServerCertVerifier>,
-        client_creds: &Arc<dyn ResolvesClientCert>,
+        server_cert_verifier: Identity,
+        client_creds: Identity,
     ) -> bool {
-        let same_verifier = Weak::ptr_eq(
-            &Arc::downgrade(server_cert_verifier),
-            &self.server_cert_verifier,
-        );
-        let same_creds = Weak::ptr_eq(&Arc::downgrade(client_creds), &self.client_creds);
+        let same_verifier = server_cert_verifier == self.server_cert_verifier;
+        let same_creds = client_creds == self.client_creds;
 
         match (same_verifier, same_creds) {
             (true, true) => true,

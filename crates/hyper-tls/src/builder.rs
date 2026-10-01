@@ -7,11 +7,11 @@ use crate::client::EchMode;
 use crate::crypto::CryptoProvider;
 use crate::error::Error;
 use crate::msgs::handshake::ALL_KEY_EXCHANGE_ALGORITHMS;
-use crate::sync::Arc;
 use crate::time_provider::TimeProvider;
 use crate::versions;
 #[cfg(doc)]
 use crate::{ClientConfig, ServerConfig};
+use alloc::boxed::Box;
 
 /// A [builder] for [`ServerConfig`] or [`ClientConfig`] values.
 ///
@@ -152,11 +152,10 @@ use crate::{ClientConfig, ServerConfig};
 /// [`WantsServerCert`]: crate::server::WantsServerCert
 /// [`CryptoProvider::get_default`]: crate::crypto::CryptoProvider::get_default
 /// [`DangerousClientConfigBuilder::with_custom_certificate_verifier`]: crate::client::danger::DangerousClientConfigBuilder::with_custom_certificate_verifier
-#[derive(Clone)]
 pub struct ConfigBuilder<Side: ConfigSide, State> {
     pub(crate) state: State,
     pub(crate) provider: &'static CryptoProvider,
-    pub(crate) time_provider: Arc<dyn TimeProvider>,
+    pub(crate) time_provider: Box<dyn TimeProvider>,
     pub(crate) side: PhantomData<Side>,
 }
 

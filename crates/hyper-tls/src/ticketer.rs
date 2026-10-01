@@ -1,11 +1,9 @@
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::mem;
-use std::sync::{RwLock, RwLockReadGuard};
 
 use pki_types::UnixTime;
 
-use crate::lock::{Mutex, MutexGuard};
 use crate::server::ProducesTickets;
 use crate::{rand, Error};
 
@@ -24,7 +22,7 @@ pub(crate) struct TicketSwitcherState {
 pub struct TicketSwitcher {
     pub(crate) generator: fn() -> Result<Box<dyn ProducesTickets>, rand::GetRandomFailed>,
     lifetime: u32,
-    state: Mutex<TicketSwitcherState>,
+    state: TicketSwitcherState,
 }
 
 impl TicketSwitcher {
@@ -43,14 +41,14 @@ impl TicketSwitcher {
         Ok(Self {
             generator,
             lifetime,
-            state: Mutex::new(TicketSwitcherState {
+            state: TicketSwitcherState {
                 next: Some(generator()?),
                 current: generator()?,
                 previous: None,
                 next_switch_time: UnixTime::now()
                     .as_secs()
                     .saturating_add(u64::from(lifetime)),
-            }),
+            },
         })
     }
 
@@ -61,78 +59,46 @@ impl TicketSwitcher {
     /// Calling this regularly will ensure timely key erasure.  Otherwise,
     /// key erasure will be delayed until the next encrypt/decrypt call.
     ///
-    /// For efficiency, this is also responsible for locking the state mutex
-    /// and returning the mutexguard.
-    pub(crate) fn maybe_roll(&self, now: UnixTime) -> Option<MutexGuard<'_, TicketSwitcherState>> {
-        // The code below aims to make switching as efficient as possible
-        // in the common case that the generator never fails. To achieve this
-        // we run the following steps:
-        //  1. If no switch is necessary, just return the mutexguard
-        //  2. Shift over all of the ticketers (so current becomes previous,
-        //     and next becomes current). After this, other threads can
-        //     start using the new current ticketer.
-        //  3. unlock mutex and generate new ticketer.
-        //  4. Place new ticketer in next and return current
-        //
-        // There are a few things to note here. First, we don't check whether
-        // a new switch might be needed in step 4, even though, due to locking
-        // and entropy collection, significant amounts of time may have passed.
-        // This is to guarantee that the thread doing the switch will eventually
-        // make progress.
-        //
-        // Second, because next may be None, step 2 can fail. In that case
-        // we enter a recovery mode where we generate 2 new ticketers, one for
-        // next and one for the current ticketer. We then take the mutex a
-        // second time and redo the time check to see if a switch is still
-        // necessary.
-        //
-        // This somewhat convoluted approach ensures good availability of the
-        // mutex, by ensuring that the state is usable and the mutex not held
-        // during generation. It also ensures that, so long as the inner
-        // ticketer never generates panics during encryption/decryption,
-        // we are guaranteed to never panic when holding the mutex.
-
+    /// The ticketer is owned by its configuration and reached through `&mut`, so the switch
+    /// needs no lock. If `next` is missing because an earlier generation failed, both a new
+    /// `next` and a new `current` are generated, and the time is checked again before switching.
+    pub(crate) fn maybe_roll(&mut self, now: UnixTime) -> Option<&mut TicketSwitcherState> {
         let now = now.as_secs();
-        let mut are_recovering = false; // Are we recovering from previous failure?
-        {
-            // Scope the mutex so we only take it for as long as needed
-            let mut state = self.state.lock()?;
+        let generator = self.generator;
+        let lifetime = self.lifetime;
+        let state = &mut self.state;
 
-            // Fast path in case we do not need to switch to the next ticketer yet
-            if now <= state.next_switch_time {
-                return Some(state);
-            }
-
-            // Make the switch, or mark for recovery if not possible
-            match state.next.take() {
-                Some(next) => {
-                    state.previous = Some(mem::replace(&mut state.current, next));
-                    state.next_switch_time = now.saturating_add(u64::from(self.lifetime));
-                }
-                _ => are_recovering = true,
-            }
+        // Fast path in case we do not need to switch to the next ticketer yet
+        if now <= state.next_switch_time {
+            return Some(state);
         }
+
+        // Make the switch, or mark for recovery if not possible
+        let are_recovering = match state.next.take() {
+            Some(next) => {
+                state.previous = Some(mem::replace(&mut state.current, next));
+                state.next_switch_time = now.saturating_add(u64::from(lifetime));
+                false
+            }
+            None => true,
+        };
 
         // We always need a next, so generate it now
-        let next = (self.generator)().ok()?;
+        let next = generator().ok()?;
         if !are_recovering {
-            // Normal path, generate new next and place it in the state
-            let mut state = self.state.lock()?;
             state.next = Some(next);
-            Some(state)
-        } else {
-            // Recovering, generate also a new current ticketer, and modify state
-            // as needed. (we need to redo the time check, otherwise this might
-            // result in very rapid switching of ticketers)
-            let new_current = (self.generator)().ok()?;
-            let mut state = self.state.lock()?;
-            state.next = Some(next);
-            if now > state.next_switch_time {
-                state.previous = Some(mem::replace(&mut state.current, new_current));
-                state.next_switch_time = now.saturating_add(u64::from(self.lifetime));
-            }
-            Some(state)
+            return Some(state);
         }
+
+        // Recovering: also generate a new current ticketer, and redo the time check, otherwise
+        // this might result in very rapid switching of ticketers.
+        let new_current = generator().ok()?;
+        state.next = Some(next);
+        if now > state.next_switch_time {
+            state.previous = Some(mem::replace(&mut state.current, new_current));
+            state.next_switch_time = now.saturating_add(u64::from(lifetime));
+        }
+        Some(state)
     }
 }
 
@@ -145,13 +111,13 @@ impl ProducesTickets for TicketSwitcher {
         true
     }
 
-    fn encrypt(&self, message: &[u8]) -> Option<Vec<u8>> {
+    fn encrypt(&mut self, message: &[u8]) -> Option<Vec<u8>> {
         let now = UnixTime::now();
 
         self.maybe_roll(now)?.current.encrypt(message)
     }
 
-    fn decrypt(&self, ciphertext: &[u8]) -> Option<Vec<u8>> {
+    fn decrypt(&mut self, ciphertext: &[u8]) -> Option<Vec<u8>> {
         let now = UnixTime::now();
 
         let state = self.maybe_roll(now)?;
@@ -160,7 +126,7 @@ impl ProducesTickets for TicketSwitcher {
         state.current.decrypt(ciphertext).or_else(|| {
             state
                 .previous
-                .as_ref()
+                .as_mut()
                 .and_then(|previous| previous.decrypt(ciphertext))
         })
     }
@@ -179,7 +145,7 @@ pub(crate) struct TicketRotatorState {
 pub struct TicketRotator {
     pub(crate) generator: fn() -> Result<Box<dyn ProducesTickets>, rand::GetRandomFailed>,
     lifetime: u32,
-    state: RwLock<TicketRotatorState>,
+    state: TicketRotatorState,
 }
 
 impl TicketRotator {
@@ -197,13 +163,13 @@ impl TicketRotator {
         Ok(Self {
             generator,
             lifetime,
-            state: RwLock::new(TicketRotatorState {
+            state: TicketRotatorState {
                 current: generator()?,
                 previous: None,
                 next_switch_time: UnixTime::now()
                     .as_secs()
                     .saturating_add(u64::from(lifetime)),
-            }),
+            },
         })
     }
 
@@ -214,46 +180,21 @@ impl TicketRotator {
     /// Calling this regularly will ensure timely key erasure.  Otherwise,
     /// key erasure will be delayed until the next encrypt/decrypt call.
     ///
-    /// For efficiency, this is also responsible for locking the state rwlock
-    /// and returning it for read.
-    pub(crate) fn maybe_roll(
-        &self,
-        now: UnixTime,
-    ) -> Option<RwLockReadGuard<'_, TicketRotatorState>> {
+    /// The ticketer is owned by its configuration and reached through `&mut`, so the rotation
+    /// needs no lock.
+    pub(crate) fn maybe_roll(&mut self, now: UnixTime) -> Option<&mut TicketRotatorState> {
         let now = now.as_secs();
 
-        // Fast, common, & read-only path in case we do not need to switch
-        // to the next ticketer yet
-        {
-            let read = self.state.read().ok()?;
-
-            if now <= read.next_switch_time {
-                return Some(read);
-            }
+        // Fast, common path in case we do not need to switch to the next ticketer yet
+        if now <= self.state.next_switch_time {
+            return Some(&mut self.state);
         }
 
         // We need to switch ticketers, and make a new one.
-        // Generate a potential "next" ticketer outside the lock.
         let next = (self.generator)().ok()?;
-
-        let mut write = self.state.write().ok()?;
-
-        if now <= write.next_switch_time {
-            // Another thread beat us to it.  Nothing to do.
-            drop(write);
-
-            return self.state.read().ok();
-        }
-
-        // Now we have:
-        // - confirmed we need rotation
-        // - confirmed we are the thread that will do it
-        // - successfully made the replacement ticketer
-        write.previous = Some(mem::replace(&mut write.current, next));
-        write.next_switch_time = now.saturating_add(u64::from(self.lifetime));
-        drop(write);
-
-        self.state.read().ok()
+        self.state.previous = Some(mem::replace(&mut self.state.current, next));
+        self.state.next_switch_time = now.saturating_add(u64::from(self.lifetime));
+        Some(&mut self.state)
     }
 }
 
@@ -266,18 +207,18 @@ impl ProducesTickets for TicketRotator {
         true
     }
 
-    fn encrypt(&self, message: &[u8]) -> Option<Vec<u8>> {
+    fn encrypt(&mut self, message: &[u8]) -> Option<Vec<u8>> {
         self.maybe_roll(UnixTime::now())?.current.encrypt(message)
     }
 
-    fn decrypt(&self, ciphertext: &[u8]) -> Option<Vec<u8>> {
+    fn decrypt(&mut self, ciphertext: &[u8]) -> Option<Vec<u8>> {
         let state = self.maybe_roll(UnixTime::now())?;
 
         // Decrypt with the current key; if that fails, try with the previous.
         state.current.decrypt(ciphertext).or_else(|| {
             state
                 .previous
-                .as_ref()
+                .as_mut()
                 .and_then(|previous| previous.decrypt(ciphertext))
         })
     }

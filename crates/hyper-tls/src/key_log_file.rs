@@ -7,7 +7,6 @@ use std::io;
 use std::io::Write;
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
-use std::sync::Mutex;
 
 use crate::log::warn;
 use crate::KeyLog;
@@ -84,25 +83,20 @@ impl Debug for KeyLogFileInner {
 ///
 /// If such a file cannot be opened, or cannot be written then
 /// this does nothing but logs errors at warning-level.
-pub struct KeyLogFile(Mutex<KeyLogFileInner>);
+pub struct KeyLogFile(KeyLogFileInner);
 
 impl KeyLogFile {
     /// Makes a new `KeyLogFile`.  The environment variable is
     /// inspected and the named file is opened during this call.
     pub fn new() -> Self {
         let var = var_os("SSLKEYLOGFILE");
-        Self(Mutex::new(KeyLogFileInner::new(var)))
+        Self(KeyLogFileInner::new(var))
     }
 }
 
 impl KeyLog for KeyLogFile {
-    fn log(&self, label: &str, client_random: &[u8], secret: &[u8]) {
-        match self
-            .0
-            .lock()
-            .unwrap()
-            .try_write(label, client_random, secret)
-        {
+    fn log(&mut self, label: &str, client_random: &[u8], secret: &[u8]) {
+        match self.0.try_write(label, client_random, secret) {
             Ok(()) => {}
             Err(e) => {
                 warn!("error writing to key log file: {e}");
@@ -113,10 +107,7 @@ impl KeyLog for KeyLogFile {
 
 impl Debug for KeyLogFile {
     fn fmt(&self, f: &mut Formatter<'_>) -> core::fmt::Result {
-        match self.0.try_lock() {
-            Ok(key_log_file) => write!(f, "{key_log_file:?}"),
-            Err(_) => write!(f, "KeyLogFile {{ <locked> }}"),
-        }
+        write!(f, "{:?}", self.0)
     }
 }
 

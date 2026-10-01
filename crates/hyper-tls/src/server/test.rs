@@ -2,7 +2,6 @@ use alloc::boxed::Box;
 use alloc::vec;
 
 use super::ServerConnectionData;
-use crate::common_state::Context;
 use crate::enums::{CipherSuite, SignatureScheme};
 use crate::msgs::base::PayloadU16;
 use crate::msgs::enums::{Compression, NamedGroup};
@@ -53,11 +52,8 @@ fn test_process_client_hello(hello: ClientHelloPayload) -> Result<(), Error> {
     super::hs::process_client_hello(
         &m,
         false,
-        &mut Context {
-            common: &mut CommonState::new(Side::Server),
-            data: &mut ServerConnectionData::default(),
-            sendable_plaintext: None,
-        },
+        &mut CommonState::new(Side::Server),
+        &mut ServerConnectionData::default(),
     )
     .map(|_| ())
 }
@@ -77,7 +73,6 @@ mod tests {
     use crate::pki_types::{CertificateDer, PrivateKeyDer};
     use crate::server::{AlwaysResolvesServerRawPublicKeys, ServerConfig, ServerConnection};
     use crate::sign::CertifiedKey;
-    use crate::sync::Arc;
     use crate::{
         version, CipherSuiteCommon, SupportedCipherSuite, Tls12CipherSuite, Tls13CipherSuite,
     };
@@ -98,7 +93,7 @@ mod tests {
         } else {
             config.require_ems = true;
         }
-        let mut conn = ServerConnection::new(config.into()).unwrap();
+        let mut conn = ServerConnection::new(&config).unwrap();
 
         let mut ch = minimal_client_hello();
         ch.extensions.extended_master_secret_request.take();
@@ -111,7 +106,7 @@ mod tests {
         conn.read_tls(&mut ch.into_wire_bytes().as_slice()).unwrap();
 
         assert_eq!(
-            conn.process_new_packets(),
+            conn.process_new_packets(&mut config),
             Err(Error::PeerIncompatible(
                 PeerIncompatible::ExtendedMasterSecretExtensionRequired
             ))
@@ -132,10 +127,7 @@ mod tests {
         ch.cipher_suites
             .push(TLS_DHE_RSA_WITH_AES_128_GCM_SHA256.suite());
 
-        server_chooses_ffdhe_group_for_client_hello(
-            ServerConnection::new(config.into()).unwrap(),
-            ch,
-        );
+        server_chooses_ffdhe_group_for_client_hello(config, ch);
     }
 
     #[test]
@@ -153,10 +145,7 @@ mod tests {
             .push(TLS_DHE_RSA_WITH_AES_128_GCM_SHA256.suite());
         ch.extensions.named_groups.take();
 
-        server_chooses_ffdhe_group_for_client_hello(
-            ServerConnection::new(config.into()).unwrap(),
-            ch,
-        );
+        server_chooses_ffdhe_group_for_client_hello(config, ch);
     }
 
     #[test]
@@ -174,16 +163,14 @@ mod tests {
             .push(TLS_DHE_RSA_WITH_AES_128_GCM_SHA256.suite());
         ch.extensions.ec_point_formats.take();
 
-        server_chooses_ffdhe_group_for_client_hello(
-            ServerConnection::new(config.into()).unwrap(),
-            ch,
-        );
+        server_chooses_ffdhe_group_for_client_hello(config, ch);
     }
 
     fn server_chooses_ffdhe_group_for_client_hello(
-        mut conn: ServerConnection,
+        mut config: ServerConfig,
         client_hello: ClientHelloPayload,
     ) {
+        let mut conn = ServerConnection::new(&config).unwrap();
         let ch = Message {
             version: ProtocolVersion::TLSv1_3,
             payload: MessagePayload::handshake(HandshakeMessagePayload(
@@ -191,7 +178,7 @@ mod tests {
             )),
         };
         conn.read_tls(&mut ch.into_wire_bytes().as_slice()).unwrap();
-        conn.process_new_packets().unwrap();
+        conn.process_new_packets(&mut config).unwrap();
 
         let KxState::Start(skxg) = &conn.kx_state else {
             panic!("unexpected kx_state");
@@ -210,10 +197,11 @@ mod tests {
             )),
         };
 
-        let mut conn = ServerConnection::new(server_config_for_rpk().into()).unwrap();
+        let mut config = server_config_for_rpk();
+        let mut conn = ServerConnection::new(&config).unwrap();
         conn.read_tls(&mut ch.into_wire_bytes().as_slice()).unwrap();
         assert_eq!(
-            conn.process_new_packets().unwrap_err(),
+            conn.process_new_packets(&mut config).unwrap_err(),
             PeerIncompatible::IncorrectCertificateTypeExtension.into(),
         );
     }
@@ -229,10 +217,11 @@ mod tests {
             )),
         };
 
-        let mut conn = ServerConnection::new(server_config_for_rpk().into()).unwrap();
+        let mut config = server_config_for_rpk();
+        let mut conn = ServerConnection::new(&config).unwrap();
         conn.read_tls(&mut ch.into_wire_bytes().as_slice()).unwrap();
         assert_eq!(
-            conn.process_new_packets().unwrap_err(),
+            conn.process_new_packets(&mut config).unwrap_err(),
             PeerIncompatible::IncorrectCertificateTypeExtension.into(),
         );
     }
@@ -241,7 +230,7 @@ mod tests {
     fn second_client_hello_cannot_withdraw_psk_offer() {
         // Per RFC 9846 section 4.2.2, dropping a PreSharedKey offer is not one of the
         // changes a client may make after a HelloRetryRequest.
-        let config = ServerConfig::builder_with_provider(crate::crypto::static_provider(
+        let mut config = ServerConfig::builder_with_provider(crate::crypto::static_provider(
             super::provider::default_provider(),
         ))
         .with_protocol_versions(&[&version::TLS13])
@@ -249,7 +238,7 @@ mod tests {
         .with_no_client_auth()
         .with_single_cert(server_cert(), server_key())
         .unwrap();
-        let mut conn = ServerConnection::new(config.into()).unwrap();
+        let mut conn = ServerConnection::new(&config).unwrap();
 
         let encode = |hello| {
             Message {
@@ -274,7 +263,7 @@ mod tests {
             vec![0u8; 32],
         ));
         conn.read_tls(&mut encode(first).as_slice()).unwrap();
-        conn.process_new_packets().unwrap();
+        conn.process_new_packets(&mut config).unwrap();
 
         // the second hello follows the retry, but drops the PSK offer entirely.
         let mut second = minimal_client_hello();
@@ -285,7 +274,7 @@ mod tests {
         conn.read_tls(&mut encode(second).as_slice()).unwrap();
 
         assert_eq!(
-            conn.process_new_packets().unwrap_err(),
+            conn.process_new_packets(&mut config).unwrap_err(),
             PeerMisbehaved::MissingPskExtensionInSecondClientHello.into(),
         );
     }
@@ -302,13 +291,14 @@ mod tests {
             ],
             ..super::provider::default_provider()
         };
-        let config = ServerConfig::builder_with_provider(crate::crypto::static_provider(provider))
-            .with_protocol_versions(&[&version::TLS13])
-            .unwrap()
-            .with_no_client_auth()
-            .with_single_cert(server_cert(), server_key())
-            .unwrap();
-        let mut conn = ServerConnection::new(config.into()).unwrap();
+        let mut config =
+            ServerConfig::builder_with_provider(crate::crypto::static_provider(provider))
+                .with_protocol_versions(&[&version::TLS13])
+                .unwrap()
+                .with_no_client_auth()
+                .with_single_cert(server_cert(), server_key())
+                .unwrap();
+        let mut conn = ServerConnection::new(&config).unwrap();
 
         let encode = |hello| {
             Message {
@@ -326,7 +316,7 @@ mod tests {
         first.cipher_suites = vec![CipherSuite::TLS13_AES_128_GCM_SHA256];
         first.extensions.key_shares = Some(vec![]);
         conn.read_tls(&mut encode(first).as_slice()).unwrap();
-        conn.process_new_packets().unwrap();
+        conn.process_new_packets(&mut config).unwrap();
 
         // the second hello follows the retry, but offers only a different suite. It shares
         // the retried suite's hash, so the transcript stays valid and nothing else objects.
@@ -335,7 +325,7 @@ mod tests {
         conn.read_tls(&mut encode(second).as_slice()).unwrap();
 
         assert_eq!(
-            conn.process_new_packets().unwrap_err(),
+            conn.process_new_packets(&mut config).unwrap_err(),
             PeerMisbehaved::CipherSuiteDifferedOnRetry.into(),
         );
     }
@@ -365,9 +355,9 @@ mod tests {
             .with_protocol_versions(&[&version::TLS13])
             .unwrap()
             .with_no_client_auth()
-            .with_cert_resolver(Arc::new(AlwaysResolvesServerRawPublicKeys::new(Arc::new(
+            .with_cert_resolver(Box::new(AlwaysResolvesServerRawPublicKeys::new(
                 server_certified_key(),
-            ))))
+            )))
     }
 
     fn server_certified_key() -> CertifiedKey {

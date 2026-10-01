@@ -18,7 +18,6 @@ use crate::log::debug;
 use crate::polyfill::try_split_at;
 use crate::rand::GetRandomFailed;
 use crate::server::ProducesTickets;
-use crate::sync::Arc;
 
 /// A concrete, safe ticket creation mechanism.
 pub struct Ticketer {}
@@ -31,8 +30,8 @@ impl Ticketer {
     /// using AES 256 for encryption and HMAC-SHA256 for ciphertext authentication.
     ///
     /// [RFC 5077 §4]: https://www.rfc-editor.org/rfc/rfc5077#section-4
-    pub fn new() -> Result<Arc<dyn ProducesTickets>, Error> {
-        Ok(Arc::new(crate::ticketer::TicketRotator::new(
+    pub fn new() -> Result<Box<dyn ProducesTickets>, Error> {
+        Ok(Box::new(crate::ticketer::TicketRotator::new(
             6 * 60 * 60,
             make_ticket_generator,
         )?))
@@ -111,7 +110,7 @@ impl ProducesTickets for Rfc5077Ticketer {
     }
 
     /// Encrypt `message` and return the ciphertext.
-    fn encrypt(&self, message: &[u8]) -> Option<Vec<u8>> {
+    fn encrypt(&mut self, message: &[u8]) -> Option<Vec<u8>> {
         // Encrypt the ticket state - the cipher module handles generating a random IV of
         // appropriate size, returning it in the `DecryptionContext`.
         let mut encrypted_state = Vec::from(message);
@@ -152,7 +151,7 @@ impl ProducesTickets for Rfc5077Ticketer {
         Some(ciphertext)
     }
 
-    fn decrypt(&self, ciphertext: &[u8]) -> Option<Vec<u8>> {
+    fn decrypt(&mut self, ciphertext: &[u8]) -> Option<Vec<u8>> {
         if ciphertext.len() > self.maximum_ciphertext_len.load(Ordering::SeqCst) {
             #[cfg(debug_assertions)]
             debug!("rejected over-length ticket");
@@ -209,7 +208,7 @@ mod tests {
 
     #[test]
     fn basic_pairwise_test() {
-        let t = Ticketer::new().unwrap();
+        let mut t = Ticketer::new().unwrap();
         assert!(t.enabled());
         let cipher = t.encrypt(b"hello world").unwrap();
         let plain = t.decrypt(&cipher).unwrap();
@@ -218,13 +217,13 @@ mod tests {
 
     #[test]
     fn refuses_decrypt_before_encrypt() {
-        let t = Ticketer::new().unwrap();
+        let mut t = Ticketer::new().unwrap();
         assert_eq!(t.decrypt(b"hello"), None);
     }
 
     #[test]
     fn refuses_decrypt_larger_than_largest_encryption() {
-        let t = Ticketer::new().unwrap();
+        let mut t = Ticketer::new().unwrap();
         let mut cipher = t.encrypt(b"hello world").unwrap();
         assert_eq!(t.decrypt(&cipher), Some(b"hello world".to_vec()));
 
@@ -237,7 +236,7 @@ mod tests {
 
     #[test]
     fn ticketrotator_switching_test() {
-        let t = Arc::new(crate::ticketer::TicketRotator::new(1, make_ticket_generator).unwrap());
+        let mut t = crate::ticketer::TicketRotator::new(1, make_ticket_generator).unwrap();
         let now = UnixTime::now();
         let cipher1 = t.encrypt(b"ticket 1").unwrap();
         assert_eq!(t.decrypt(&cipher1).unwrap(), b"ticket 1");
@@ -298,7 +297,7 @@ mod tests {
     #[test]
     fn ticketswitcher_switching_test() {
         #[expect(deprecated)]
-        let t = Arc::new(crate::ticketer::TicketSwitcher::new(1, make_ticket_generator).unwrap());
+        let mut t = crate::ticketer::TicketSwitcher::new(1, make_ticket_generator).unwrap();
         let now = UnixTime::now();
         let cipher1 = t.encrypt(b"ticket 1").unwrap();
         assert_eq!(t.decrypt(&cipher1).unwrap(), b"ticket 1");
@@ -355,7 +354,7 @@ mod tests {
 
     #[test]
     fn refuses_decrypt_truncated_ciphertext() {
-        let t = make_ticket_generator().unwrap();
+        let mut t = make_ticket_generator().unwrap();
         let cipher = t.encrypt(b"hello world").unwrap();
         assert_eq!(t.decrypt(&cipher), Some(b"hello world".to_vec()));
 

@@ -1,4 +1,4 @@
-use std::{any::Any, io, str, sync::Arc};
+use std::{any::Any, io, str};
 
 use aws_lc_rs::aead;
 use bytes::BytesMut;
@@ -14,7 +14,8 @@ use rustls::{
 use crate::{
     ConnectError, ConnectionId, Side, TransportError, TransportErrorCode,
     crypto::{
-        self, CryptoError, ExportKeyingMaterialError, HeaderKey, KeyPair, Keys, UnsupportedVersion,
+        self, CryptoError, ExportKeyingMaterialError, HeaderKey, KeyPair, Keys, SessionConfig,
+        UnsupportedVersion,
     },
     transport_parameters::TransportParameters,
 };
@@ -95,8 +96,33 @@ impl crypto::Session for TlsSession {
         self.inner.is_handshaking()
     }
 
-    fn read_handshake(&mut self, buf: &[u8]) -> Result<bool, TransportError> {
-        self.inner.read_hs(buf).map_err(|e| {
+    fn read_handshake(
+        &mut self,
+        config: SessionConfig<'_>,
+        buf: &[u8],
+    ) -> Result<bool, TransportError> {
+        let read = match (&mut self.inner, config) {
+            (Connection::Client(session), SessionConfig::Client(config)) => {
+                let config: &mut dyn Any = config;
+                let Some(config) = config.downcast_mut::<QuicClientConfig>() else {
+                    return Err(foreign_config());
+                };
+                session.read_hs(&mut config.inner, buf)
+            }
+            (Connection::Server(session), SessionConfig::Server(config)) => {
+                let config: &mut dyn Any = config;
+                let Some(config) = config.downcast_mut::<QuicServerConfig>() else {
+                    return Err(foreign_config());
+                };
+                session.read_hs(&mut config.inner, buf)
+            }
+            _ => {
+                return Err(TransportError::INTERNAL_ERROR(
+                    "TLS session lent the other side's configuration",
+                ));
+            }
+        };
+        read.map_err(|e| {
             if let Some(alert) = self.inner.alert() {
                 TransportError {
                     code: TransportErrorCode::crypto(alert.into()),
@@ -279,7 +305,7 @@ pub struct HandshakeData {
 ///
 /// [root_certs]: crate::config::ClientConfig::with_root_certificates()
 pub struct QuicClientConfig {
-    pub(crate) inner: Arc<rustls::ClientConfig>,
+    pub(crate) inner: rustls::ClientConfig,
     initial: Suite,
 }
 
@@ -288,13 +314,13 @@ impl QuicClientConfig {
     ///
     /// QUIC requires that TLS 1.3 be enabled. Advanced users can use any [`rustls::ClientConfig`] that
     /// satisfies this requirement.
-    pub(crate) fn new(verifier: Arc<dyn ServerCertVerifier>) -> Self {
+    pub(crate) fn new(verifier: Box<dyn ServerCertVerifier>) -> Self {
         let inner = Self::inner(verifier);
         Self {
             // We're confident that the *ring* default provider contains TLS13_AES_128_GCM_SHA256
             initial: initial_suite_from_provider(inner.crypto_provider())
                 .expect("no initial cipher suite found"),
-            inner: Arc::new(inner),
+            inner,
         }
     }
 
@@ -302,7 +328,7 @@ impl QuicClientConfig {
     ///
     /// This is useful if you want to avoid the initial cipher suite for traffic encryption.
     pub fn with_initial(
-        inner: Arc<rustls::ClientConfig>,
+        inner: rustls::ClientConfig,
         initial: Suite,
     ) -> Result<Self, NoInitialCipherSuite> {
         match initial.suite.common.suite {
@@ -311,7 +337,7 @@ impl QuicClientConfig {
         }
     }
 
-    pub(crate) fn inner(verifier: Arc<dyn ServerCertVerifier>) -> rustls::ClientConfig {
+    pub(crate) fn inner(verifier: Box<dyn ServerCertVerifier>) -> rustls::ClientConfig {
         let mut config = rustls::ClientConfig::builder_with_provider(configured_provider())
             .with_protocol_versions(&[&rustls::version::TLS13])
             .unwrap() // The default providers support TLS 1.3
@@ -326,7 +352,7 @@ impl QuicClientConfig {
 
 impl crypto::ClientConfig for QuicClientConfig {
     fn start_session(
-        self: Arc<Self>,
+        &mut self,
         version: u32,
         server_name: &str,
         params: &TransportParameters,
@@ -338,7 +364,7 @@ impl crypto::ClientConfig for QuicClientConfig {
             next_secrets: None,
             inner: rustls::quic::Connection::Client(
                 rustls::quic::ClientConnection::new(
-                    self.inner.clone(),
+                    &mut self.inner,
                     version,
                     ServerName::try_from(server_name)
                         .map_err(|_| ConnectError::InvalidServerName(server_name.into()))?
@@ -356,14 +382,6 @@ impl TryFrom<rustls::ClientConfig> for QuicClientConfig {
     type Error = NoInitialCipherSuite;
 
     fn try_from(inner: rustls::ClientConfig) -> Result<Self, Self::Error> {
-        Arc::new(inner).try_into()
-    }
-}
-
-impl TryFrom<Arc<rustls::ClientConfig>> for QuicClientConfig {
-    type Error = NoInitialCipherSuite;
-
-    fn try_from(inner: Arc<rustls::ClientConfig>) -> Result<Self, Self::Error> {
         Ok(Self {
             initial: initial_suite_from_provider(inner.crypto_provider())
                 .ok_or(NoInitialCipherSuite { specific: false })?,
@@ -409,7 +427,7 @@ impl std::error::Error for NoInitialCipherSuite {}
 ///
 /// [single]: crate::config::ServerConfig::with_single_cert()
 pub struct QuicServerConfig {
-    inner: Arc<rustls::ServerConfig>,
+    inner: rustls::ServerConfig,
     initial: Suite,
 }
 
@@ -423,7 +441,7 @@ impl QuicServerConfig {
             // We're confident that the *ring* default provider contains TLS13_AES_128_GCM_SHA256
             initial: initial_suite_from_provider(inner.crypto_provider())
                 .expect("no initial cipher suite found"),
-            inner: Arc::new(inner),
+            inner,
         })
     }
 
@@ -431,7 +449,7 @@ impl QuicServerConfig {
     ///
     /// This is useful if you want to avoid the initial cipher suite for traffic encryption.
     pub fn with_initial(
-        inner: Arc<rustls::ServerConfig>,
+        inner: rustls::ServerConfig,
         initial: Suite,
     ) -> Result<Self, NoInitialCipherSuite> {
         match initial.suite.common.suite {
@@ -464,14 +482,6 @@ impl TryFrom<rustls::ServerConfig> for QuicServerConfig {
     type Error = NoInitialCipherSuite;
 
     fn try_from(inner: rustls::ServerConfig) -> Result<Self, Self::Error> {
-        Arc::new(inner).try_into()
-    }
-}
-
-impl TryFrom<Arc<rustls::ServerConfig>> for QuicServerConfig {
-    type Error = NoInitialCipherSuite;
-
-    fn try_from(inner: Arc<rustls::ServerConfig>) -> Result<Self, Self::Error> {
         Ok(Self {
             initial: initial_suite_from_provider(inner.crypto_provider())
                 .ok_or(NoInitialCipherSuite { specific: false })?,
@@ -482,7 +492,7 @@ impl TryFrom<Arc<rustls::ServerConfig>> for QuicServerConfig {
 
 impl crypto::ServerConfig for QuicServerConfig {
     fn start_session(
-        self: Arc<Self>,
+        &self,
         version: u32,
         params: &TransportParameters,
     ) -> Box<dyn crypto::Session> {
@@ -493,8 +503,7 @@ impl crypto::ServerConfig for QuicServerConfig {
             got_handshake_data: false,
             next_secrets: None,
             inner: rustls::quic::Connection::Server(
-                rustls::quic::ServerConnection::new(self.inner.clone(), version, to_vec(params))
-                    .unwrap(),
+                rustls::quic::ServerConnection::new(&self.inner, version, to_vec(params)).unwrap(),
             ),
             suite: self.initial,
         })
@@ -533,6 +542,14 @@ impl crypto::ServerConfig for QuicServerConfig {
         result.copy_from_slice(tag.as_ref());
         result
     }
+}
+
+/// The error for a session lent a configuration from another crypto implementation
+///
+/// An endpoint lends each session the configuration that started it, so this is unreachable
+/// through the endpoint; it is still a typed error, not an assumption.
+fn foreign_config() -> TransportError {
+    TransportError::INTERNAL_ERROR("TLS session lent another implementation's configuration")
 }
 
 pub(crate) fn initial_suite_from_provider(

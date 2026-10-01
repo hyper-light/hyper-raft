@@ -117,7 +117,7 @@ fn server_avoids_dhe_cipher_suites_when_client_has_no_known_dhe_in_groups_ext() 
 
 #[test]
 fn server_avoids_cipher_suite_with_no_common_kx_groups() {
-    let server_config = finish_server_config(
+    let server_config = Shared::new(finish_server_config(
         KeyType::Rsa2048,
         hyper_tls::ServerConfig::builder_with_provider(static_provider(CryptoProvider {
             cipher_suites: vec![
@@ -130,8 +130,7 @@ fn server_avoids_cipher_suite_with_no_common_kx_groups() {
         }))
         .with_safe_default_protocol_versions()
         .unwrap(),
-    )
-    .into();
+    ));
 
     let test_cases = [
         (
@@ -212,10 +211,9 @@ fn server_avoids_cipher_suite_with_no_common_kx_groups() {
             }))
             .with_protocol_versions(&[protocol_version])
             .unwrap(),
-        )
-        .into();
+        );
 
-        let (mut client, mut server) = make_pair_for_arc_configs(&client_config, &server_config);
+        let (mut client, mut server) = make_pair_for_configs(client_config, server_config.clone());
         do_handshake(&mut client, &mut server);
         assert_eq!(
             server.negotiated_cipher_suite().unwrap().suite(),

@@ -13,9 +13,11 @@
     unused_qualifications
 )]
 
-use core::ops::DerefMut;
+use core::cell::{Ref, RefCell, RefMut};
+use core::ops::{Deref, DerefMut};
 use std::io;
-use std::sync::{Arc, OnceLock};
+use std::rc::Rc;
+use std::sync::OnceLock;
 
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::client::{
@@ -24,7 +26,7 @@ use rustls::client::{
 };
 use rustls::crypto::cipher::{InboundOpaqueMessage, MessageDecrypter, MessageEncrypter};
 use rustls::crypto::{
-    CryptoProvider, WebPkiSupportedAlgorithms, verify_tls13_signature_with_raw_key,
+    verify_tls13_signature_with_raw_key, CryptoProvider, WebPkiSupportedAlgorithms,
 };
 use rustls::internal::msgs::codec::{Codec, Reader};
 use rustls::internal::msgs::message::{Message, OutboundOpaqueMessage, PlainMessage};
@@ -35,17 +37,18 @@ use rustls::pki_types::{
 };
 use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
 use rustls::server::{
-    AlwaysResolvesServerRawPublicKeys, ClientCertVerifierBuilder, UnbufferedServerConnection,
-    WebPkiClientVerifier,
+    Accepted, AcceptedAlert, AlwaysResolvesServerRawPublicKeys, ClientCertVerifierBuilder,
+    UnbufferedServerConnection, WebPkiClientVerifier,
 };
 use rustls::sign::CertifiedKey;
 use rustls::unbuffered::{
     ConnectionState, EncodeError, UnbufferedConnectionCommon, UnbufferedStatus,
 };
 use rustls::{
-    CipherSuite, ClientConfig, ClientConnection, Connection, ConnectionCommon, ContentType,
-    DigitallySignedStruct, DistinguishedName, Error, InconsistentKeys, NamedGroup, ProtocolVersion,
-    RootCertStore, ServerConfig, ServerConnection, SideData, SignatureScheme, SupportedCipherSuite,
+    CipherSuite, ClientConfig, ClientConnection, ConnectionCommon, ContentType,
+    DigitallySignedStruct, DistinguishedName, Error, InconsistentKeys, IoState, NamedGroup,
+    ProtocolVersion, RootCertStore, ServerConfig, ServerConnection, SideData, SignatureScheme,
+    SupportedCipherSuite,
 };
 
 macro_rules! embed_files {
@@ -212,10 +215,277 @@ embed_files! {
     (RSA_4096_INTER_KEY, "rsa-4096", "inter.key");
 }
 
-pub fn transfer(
-    left: &mut impl DerefMut<Target = ConnectionCommon<impl SideData>>,
-    right: &mut impl DerefMut<Target = ConnectionCommon<impl SideData>>,
-) -> usize {
+/// A configuration shared by the connections a test makes from it.
+///
+/// A connection holds no configuration: each call that may advance its handshake takes the
+/// configuration mutably. Upstream's tests shared configurations by `Arc`; these tests share them
+/// through this handle, and drive each connection with the configuration it was made from.
+#[derive(Debug)]
+pub struct Shared<T>(Rc<RefCell<T>>);
+
+impl<T> Shared<T> {
+    pub fn new(value: T) -> Self {
+        Self(Rc::new(RefCell::new(value)))
+    }
+
+    pub fn borrow(&self) -> Ref<'_, T> {
+        self.0.borrow()
+    }
+
+    pub fn borrow_mut(&self) -> RefMut<'_, T> {
+        self.0.borrow_mut()
+    }
+}
+
+impl<T> Clone for Shared<T> {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
+}
+
+impl<T> From<T> for Shared<T> {
+    fn from(value: T) -> Self {
+        Self::new(value)
+    }
+}
+
+/// A client connection and the configuration it is driven with.
+#[derive(Debug)]
+pub struct TestClient {
+    pub conn: ClientConnection,
+    pub config: Shared<ClientConfig>,
+}
+
+impl TestClient {
+    pub fn new(
+        config: impl Into<Shared<ClientConfig>>,
+        name: ServerName<'static>,
+    ) -> Result<Self, Error> {
+        let config = config.into();
+        let conn = ClientConnection::new(&mut config.borrow_mut(), name)?;
+        Ok(Self { conn, config })
+    }
+
+    pub fn new_with_alpn(
+        config: impl Into<Shared<ClientConfig>>,
+        name: ServerName<'static>,
+        alpn_protocols: Vec<Vec<u8>>,
+    ) -> Result<Self, Error> {
+        let config = config.into();
+        let conn = ClientConnection::new_with_alpn(&mut config.borrow_mut(), name, alpn_protocols)?;
+        Ok(Self { conn, config })
+    }
+
+    pub fn process_new_packets(&mut self) -> Result<IoState, Error> {
+        self.conn.process_new_packets(&mut self.config.borrow_mut())
+    }
+
+    pub fn complete_io<T: io::Read + io::Write>(
+        &mut self,
+        io: &mut T,
+    ) -> Result<(usize, usize), io::Error> {
+        self.conn.complete_io(io, &mut self.config.borrow_mut())
+    }
+}
+
+impl Deref for TestClient {
+    type Target = ClientConnection;
+
+    fn deref(&self) -> &ClientConnection {
+        &self.conn
+    }
+}
+
+impl DerefMut for TestClient {
+    fn deref_mut(&mut self) -> &mut ClientConnection {
+        &mut self.conn
+    }
+}
+
+/// A server connection and the configuration it is driven with.
+#[derive(Debug)]
+pub struct TestServer {
+    pub conn: ServerConnection,
+    pub config: Shared<ServerConfig>,
+}
+
+impl TestServer {
+    pub fn new(config: impl Into<Shared<ServerConfig>>) -> Result<Self, Error> {
+        let config = config.into();
+        let conn = ServerConnection::new(&config.borrow())?;
+        Ok(Self { conn, config })
+    }
+
+    /// Continue an accepted connection with `config`.
+    pub fn accept(
+        accepted: Accepted,
+        config: impl Into<Shared<ServerConfig>>,
+    ) -> Result<Self, (Error, AcceptedAlert)> {
+        let config = config.into();
+        let conn = accepted.into_connection(&mut config.borrow_mut())?;
+        Ok(Self { conn, config })
+    }
+
+    pub fn process_new_packets(&mut self) -> Result<IoState, Error> {
+        self.conn.process_new_packets(&mut self.config.borrow_mut())
+    }
+
+    pub fn complete_io<T: io::Read + io::Write>(
+        &mut self,
+        io: &mut T,
+    ) -> Result<(usize, usize), io::Error> {
+        self.conn.complete_io(io, &mut self.config.borrow_mut())
+    }
+}
+
+impl Deref for TestServer {
+    type Target = ServerConnection;
+
+    fn deref(&self) -> &ServerConnection {
+        &self.conn
+    }
+}
+
+impl DerefMut for TestServer {
+    fn deref_mut(&mut self) -> &mut ServerConnection {
+        &mut self.conn
+    }
+}
+
+/// A connection whose records the test moves: a bare connection, or one with its configuration.
+pub trait AsConnection {
+    type Data: SideData;
+
+    fn common(&mut self) -> &mut ConnectionCommon<Self::Data>;
+}
+
+impl AsConnection for ClientConnection {
+    type Data = rustls::client::ClientConnectionData;
+
+    fn common(&mut self) -> &mut ConnectionCommon<Self::Data> {
+        self
+    }
+}
+
+impl AsConnection for ServerConnection {
+    type Data = rustls::server::ServerConnectionData;
+
+    fn common(&mut self) -> &mut ConnectionCommon<Self::Data> {
+        self
+    }
+}
+
+impl AsConnection for TestClient {
+    type Data = rustls::client::ClientConnectionData;
+
+    fn common(&mut self) -> &mut ConnectionCommon<Self::Data> {
+        &mut self.conn
+    }
+}
+
+impl AsConnection for TestServer {
+    type Data = rustls::server::ServerConnectionData;
+
+    fn common(&mut self) -> &mut ConnectionCommon<Self::Data> {
+        &mut self.conn
+    }
+}
+
+/// A connection the test drives: it processes records with its own configuration.
+pub trait Driven: AsConnection {
+    fn process_new_packets(&mut self) -> Result<IoState, Error>;
+}
+
+impl Driven for TestClient {
+    fn process_new_packets(&mut self) -> Result<IoState, Error> {
+        Self::process_new_packets(self)
+    }
+}
+
+impl Driven for TestServer {
+    fn process_new_packets(&mut self) -> Result<IoState, Error> {
+        Self::process_new_packets(self)
+    }
+}
+
+/// An unbuffered client connection and the configuration it is driven with.
+pub struct TestUnbufferedClient {
+    pub conn: UnbufferedClientConnection,
+    pub config: Shared<ClientConfig>,
+}
+
+impl TestUnbufferedClient {
+    pub fn new(
+        config: impl Into<Shared<ClientConfig>>,
+        name: ServerName<'static>,
+    ) -> Result<Self, Error> {
+        let config = config.into();
+        let conn = UnbufferedClientConnection::new(&mut config.borrow_mut(), name)?;
+        Ok(Self { conn, config })
+    }
+
+    pub fn process_tls_records<'c, 'i>(
+        &'c mut self,
+        incoming_tls: &'i mut [u8],
+    ) -> UnbufferedStatus<'c, 'i, rustls::client::ClientConnectionData> {
+        self.conn
+            .process_tls_records(&mut self.config.borrow_mut(), incoming_tls)
+    }
+}
+
+impl Deref for TestUnbufferedClient {
+    type Target = UnbufferedClientConnection;
+
+    fn deref(&self) -> &UnbufferedClientConnection {
+        &self.conn
+    }
+}
+
+impl DerefMut for TestUnbufferedClient {
+    fn deref_mut(&mut self) -> &mut UnbufferedClientConnection {
+        &mut self.conn
+    }
+}
+
+/// An unbuffered server connection and the configuration it is driven with.
+pub struct TestUnbufferedServer {
+    pub conn: UnbufferedServerConnection,
+    pub config: Shared<ServerConfig>,
+}
+
+impl TestUnbufferedServer {
+    pub fn new(config: impl Into<Shared<ServerConfig>>) -> Result<Self, Error> {
+        let config = config.into();
+        let conn = UnbufferedServerConnection::new(&config.borrow())?;
+        Ok(Self { conn, config })
+    }
+
+    pub fn process_tls_records<'c, 'i>(
+        &'c mut self,
+        incoming_tls: &'i mut [u8],
+    ) -> UnbufferedStatus<'c, 'i, rustls::server::ServerConnectionData> {
+        self.conn
+            .process_tls_records(&mut self.config.borrow_mut(), incoming_tls)
+    }
+}
+
+impl Deref for TestUnbufferedServer {
+    type Target = UnbufferedServerConnection;
+
+    fn deref(&self) -> &UnbufferedServerConnection {
+        &self.conn
+    }
+}
+
+impl DerefMut for TestUnbufferedServer {
+    fn deref_mut(&mut self) -> &mut UnbufferedServerConnection {
+        &mut self.conn
+    }
+}
+
+pub fn transfer(left: &mut impl AsConnection, right: &mut impl AsConnection) -> usize {
+    let left = left.common();
+    let right = right.common();
     let mut buf = [0u8; 262144];
     let mut total = 0;
 
@@ -242,7 +512,8 @@ pub fn transfer(
     total
 }
 
-pub fn transfer_eof(conn: &mut impl DerefMut<Target = ConnectionCommon<impl SideData>>) {
+pub fn transfer_eof(conn: &mut impl AsConnection) {
+    let conn = conn.common();
     let empty_buf = [0u8; 0];
     let empty_cursor: &mut dyn io::Read = &mut &empty_buf[..];
     let sz = conn.read_tls(empty_cursor).unwrap();
@@ -256,10 +527,15 @@ pub enum Altered {
     Raw(Vec<u8>),
 }
 
-pub fn transfer_altered<F>(left: &mut Connection, filter: F, right: &mut Connection) -> usize
+pub fn transfer_altered<F>(
+    left: &mut impl AsConnection,
+    filter: F,
+    right: &mut impl AsConnection,
+) -> usize
 where
     F: Fn(&mut Message<'_>) -> Altered,
 {
+    let (left, right) = (left.common(), right.common());
     let mut buf = [0u8; 262144];
     let mut total = 0;
 
@@ -294,9 +570,7 @@ where
             };
 
             let message_enc_reader: &mut dyn io::Read = &mut &message_enc[..];
-            let len = right
-                .read_tls(message_enc_reader)
-                .unwrap();
+            let len = right.read_tls(message_enc_reader).unwrap();
             assert_eq!(len, message_enc.len());
         }
     }
@@ -416,7 +690,7 @@ impl KeyType {
     pub fn get_certified_client_key(
         &self,
         provider: &CryptoProvider,
-    ) -> Result<Arc<CertifiedKey>, Error> {
+    ) -> Result<CertifiedKey, Error> {
         let private_key = provider
             .key_provider
             .load_private_key(self.get_client_key())?;
@@ -424,37 +698,27 @@ impl KeyType {
             .public_key()
             .ok_or(Error::InconsistentKeys(InconsistentKeys::Unknown))?;
         let public_key_as_cert = CertificateDer::from(public_key.to_vec());
-        Ok(Arc::new(CertifiedKey::new(
-            vec![public_key_as_cert],
-            private_key,
-        )))
+        Ok(CertifiedKey::new(vec![public_key_as_cert], private_key))
     }
 
     pub fn certified_key_with_raw_pub_key(
         &self,
         provider: &CryptoProvider,
-    ) -> Result<Arc<CertifiedKey>, Error> {
-        let private_key = provider
-            .key_provider
-            .load_private_key(self.get_key())?;
+    ) -> Result<CertifiedKey, Error> {
+        let private_key = provider.key_provider.load_private_key(self.get_key())?;
         let public_key = private_key
             .public_key()
             .ok_or(Error::InconsistentKeys(InconsistentKeys::Unknown))?;
         let public_key_as_cert = CertificateDer::from(public_key.to_vec());
-        Ok(Arc::new(CertifiedKey::new(
-            vec![public_key_as_cert],
-            private_key,
-        )))
+        Ok(CertifiedKey::new(vec![public_key_as_cert], private_key))
     }
 
     pub fn certified_key_with_cert_chain(
         &self,
         provider: &CryptoProvider,
-    ) -> Result<Arc<CertifiedKey>, Error> {
-        let private_key = provider
-            .key_provider
-            .load_private_key(self.get_key())?;
-        Ok(Arc::new(CertifiedKey::new(self.get_chain(), private_key)))
+    ) -> Result<CertifiedKey, Error> {
+        let private_key = provider.key_provider.load_private_key(self.get_key())?;
+        Ok(CertifiedKey::new(self.get_chain(), private_key))
     }
 
     fn get_crl(&self, role: &str, r#type: &str) -> CertificateRevocationListDer<'static> {
@@ -556,15 +820,13 @@ pub fn make_server_config_with_kx_groups(
     )
 }
 
-pub fn get_client_root_store(kt: KeyType) -> Arc<RootCertStore> {
+pub fn get_client_root_store(kt: KeyType) -> RootCertStore {
     // The key type's chain file contains the DER encoding of the EE cert, the intermediate cert,
     // and the root trust anchor. We want only the trust anchor to build the root cert store.
     let chain = kt.get_chain();
     let mut roots = RootCertStore::empty();
+    roots.add(chain.last().unwrap().clone()).unwrap();
     roots
-        .add(chain.last().unwrap().clone())
-        .unwrap();
-    roots.into()
 }
 
 pub fn make_server_config_with_mandatory_client_auth_crls(
@@ -622,14 +884,13 @@ pub fn make_server_config_with_raw_key_support(
 ) -> ServerConfig {
     let mut client_verifier =
         MockClientVerifier::new(|| Ok(ClientCertVerified::assertion()), kt, provider);
-    let server_cert_resolver = Arc::new(AlwaysResolvesServerRawPublicKeys::new(
-        kt.certified_key_with_raw_pub_key(provider)
-            .unwrap(),
+    let server_cert_resolver = Box::new(AlwaysResolvesServerRawPublicKeys::new(
+        kt.certified_key_with_raw_pub_key(provider).unwrap(),
     ));
     client_verifier.expect_raw_public_keys = true;
     // We don't support tls1.2 for Raw Public Keys, hence the version is hard-coded.
     server_config_builder_with_versions(&[&rustls::version::TLS13], provider)
-        .with_client_cert_verifier(Arc::new(client_verifier))
+        .with_client_cert_verifier(Box::new(client_verifier))
         .with_cert_resolver(server_cert_resolver)
 }
 
@@ -637,10 +898,9 @@ pub fn make_client_config_with_raw_key_support(
     kt: KeyType,
     provider: &CryptoProvider,
 ) -> ClientConfig {
-    let server_verifier = Arc::new(MockServerVerifier::expects_raw_public_keys(provider));
-    let client_cert_resolver = Arc::new(AlwaysResolvesClientRawPublicKeys::new(
-        kt.get_certified_client_key(provider)
-            .unwrap(),
+    let server_verifier = Box::new(MockServerVerifier::expects_raw_public_keys(provider));
+    let client_cert_resolver = Box::new(AlwaysResolvesClientRawPublicKeys::new(
+        kt.get_certified_client_key(provider).unwrap(),
     ));
     // We don't support tls1.2 for Raw Public Keys, hence the version is hard-coded.
     client_config_builder_with_versions(&[&rustls::version::TLS13], provider)
@@ -654,10 +914,9 @@ pub fn make_client_config_with_cipher_suite_and_raw_key_support(
     cipher_suite: SupportedCipherSuite,
     provider: &CryptoProvider,
 ) -> ClientConfig {
-    let server_verifier = Arc::new(MockServerVerifier::expects_raw_public_keys(provider));
-    let client_cert_resolver = Arc::new(AlwaysResolvesClientRawPublicKeys::new(
-        kt.get_certified_client_key(provider)
-            .unwrap(),
+    let server_verifier = Box::new(MockServerVerifier::expects_raw_public_keys(provider));
+    let client_cert_resolver = Box::new(AlwaysResolvesClientRawPublicKeys::new(
+        kt.get_certified_client_key(provider).unwrap(),
     ));
     ClientConfig::builder_with_provider(static_provider(CryptoProvider {
         cipher_suites: vec![cipher_suite],
@@ -749,49 +1008,41 @@ pub fn make_client_config_with_verifier(
 }
 
 pub fn webpki_client_verifier_builder(
-    roots: Arc<RootCertStore>,
+    roots: RootCertStore,
     provider: &CryptoProvider,
 ) -> ClientCertVerifierBuilder {
     WebPkiClientVerifier::builder_with_provider(roots, provider)
 }
 
 pub fn webpki_server_verifier_builder(
-    roots: Arc<RootCertStore>,
+    roots: RootCertStore,
     provider: &CryptoProvider,
 ) -> ServerCertVerifierBuilder {
     WebPkiServerVerifier::builder_with_provider(roots, provider)
 }
 
-pub fn make_pair(kt: KeyType, provider: &CryptoProvider) -> (ClientConnection, ServerConnection) {
+pub fn make_pair(kt: KeyType, provider: &CryptoProvider) -> (TestClient, TestServer) {
     make_pair_for_configs(
         make_client_config(kt, provider),
         make_server_config(kt, provider),
     )
 }
 
+/// A client and a server made from these configurations: each is a configuration of its own,
+/// or a [`Shared`] handle to one other connections are made from too.
 pub fn make_pair_for_configs(
-    client_config: ClientConfig,
-    server_config: ServerConfig,
-) -> (ClientConnection, ServerConnection) {
-    make_pair_for_arc_configs(&Arc::new(client_config), &Arc::new(server_config))
-}
-
-pub fn make_pair_for_arc_configs(
-    client_config: &Arc<ClientConfig>,
-    server_config: &Arc<ServerConfig>,
-) -> (ClientConnection, ServerConnection) {
+    client_config: impl Into<Shared<ClientConfig>>,
+    server_config: impl Into<Shared<ServerConfig>>,
+) -> (TestClient, TestServer) {
     (
-        ClientConnection::new(client_config.clone(), server_name("localhost")).unwrap(),
-        ServerConnection::new(server_config.clone()).unwrap(),
+        TestClient::new(client_config, server_name("localhost")).unwrap(),
+        TestServer::new(server_config).unwrap(),
     )
 }
 
-pub fn do_handshake(
-    client: &mut impl DerefMut<Target = ConnectionCommon<impl SideData>>,
-    server: &mut impl DerefMut<Target = ConnectionCommon<impl SideData>>,
-) -> (usize, usize) {
+pub fn do_handshake(client: &mut impl Driven, server: &mut impl Driven) -> (usize, usize) {
     let (mut to_client, mut to_server) = (0, 0);
-    while server.is_handshaking() || client.is_handshaking() {
+    while server.common().is_handshaking() || client.common().is_handshaking() {
         to_server += transfer(client, server);
         server.process_new_packets().unwrap();
         to_client += transfer(server, client);
@@ -807,8 +1058,8 @@ pub fn do_handshake(
 // by either. In practice this just means that session tickets are processed
 // by the client.
 pub fn do_unbuffered_handshake(
-    client: &mut UnbufferedClientConnection,
-    server: &mut UnbufferedServerConnection,
+    client: &mut TestUnbufferedClient,
+    server: &mut TestUnbufferedServer,
 ) {
     fn is_idle<Data>(conn: &UnbufferedConnectionCommon<Data>, data: &[u8]) -> bool {
         !conn.is_handshaking() && !conn.wants_write() && data.is_empty()
@@ -817,7 +1068,7 @@ pub fn do_unbuffered_handshake(
     let mut client_data = Vec::with_capacity(1024);
     let mut server_data = Vec::with_capacity(1024);
 
-    while !is_idle(client, &client_data) || !is_idle(server, &server_data) {
+    while !is_idle(&client.conn, &client_data) || !is_idle(&server.conn, &server_data) {
         loop {
             let UnbufferedStatus { discard, state } = client.process_tls_records(&mut client_data);
             let state = state.unwrap();
@@ -837,8 +1088,7 @@ pub fn do_unbuffered_handshake(
 
                     let old_len = server_data.len();
                     server_data.resize(old_len + required, 0);
-                    data.encode(&mut server_data[old_len..])
-                        .unwrap();
+                    data.encode(&mut server_data[old_len..]).unwrap();
                 }
                 ConnectionState::TransmitTlsData(data) => data.done(),
                 st => unreachable!("unexpected connection state: {st:?}"),
@@ -866,8 +1116,7 @@ pub fn do_unbuffered_handshake(
 
                     let old_len = client_data.len();
                     client_data.resize(old_len + required, 0);
-                    data.encode(&mut client_data[old_len..])
-                        .unwrap();
+                    data.encode(&mut client_data[old_len..]).unwrap();
                 }
                 ConnectionState::TransmitTlsData(data) => data.done(),
                 _ => unreachable!(),
@@ -888,8 +1137,8 @@ pub enum ErrorFromPeer {
 }
 
 pub fn do_handshake_until_error(
-    client: &mut ClientConnection,
-    server: &mut ServerConnection,
+    client: &mut TestClient,
+    server: &mut TestServer,
 ) -> Result<(), ErrorFromPeer> {
     while server.is_handshaking() || client.is_handshaking() {
         transfer(client, server);
@@ -906,14 +1155,11 @@ pub fn do_handshake_until_error(
 }
 
 pub fn do_handshake_altered(
-    client: ClientConnection,
+    mut client: TestClient,
     alter_server_message: impl Fn(&mut Message<'_>) -> Altered,
     alter_client_message: impl Fn(&mut Message<'_>) -> Altered,
-    server: ServerConnection,
+    mut server: TestServer,
 ) -> Result<(), ErrorFromPeer> {
-    let mut client: Connection = Connection::Client(client);
-    let mut server: Connection = Connection::Server(server);
-
     while server.is_handshaking() || client.is_handshaking() {
         transfer_altered(&mut client, &alter_client_message, &mut server);
 
@@ -932,8 +1178,8 @@ pub fn do_handshake_altered(
 }
 
 pub fn do_handshake_until_both_error(
-    client: &mut ClientConnection,
-    server: &mut ServerConnection,
+    client: &mut TestClient,
+    server: &mut TestServer,
 ) -> Result<(), Vec<ErrorFromPeer>> {
     match do_handshake_until_error(client, server) {
         Err(server_err @ ErrorFromPeer::Server(_)) => {
@@ -1046,16 +1292,8 @@ pub fn do_suite_and_kx_test(
 
     assert_eq!(None, client.negotiated_cipher_suite());
     assert_eq!(None, server.negotiated_cipher_suite());
-    assert!(
-        client
-            .negotiated_key_exchange_group()
-            .is_none()
-    );
-    assert!(
-        server
-            .negotiated_key_exchange_group()
-            .is_none()
-    );
+    assert!(client.negotiated_key_exchange_group().is_none());
+    assert!(server.negotiated_key_exchange_group().is_none());
     assert_eq!(None, client.protocol_version());
     assert_eq!(None, server.protocol_version());
     assert!(client.is_handshaking());
@@ -1070,24 +1308,13 @@ pub fn do_suite_and_kx_test(
     assert_eq!(Some(expect_version), server.protocol_version());
     assert_eq!(None, client.negotiated_cipher_suite());
     assert_eq!(Some(expect_suite), server.negotiated_cipher_suite());
-    assert!(
-        client
-            .negotiated_key_exchange_group()
-            .is_none()
-    );
+    assert!(client.negotiated_key_exchange_group().is_none());
     if matches!(expect_version, ProtocolVersion::TLSv1_2) {
-        assert!(
-            server
-                .negotiated_key_exchange_group()
-                .is_none()
-        );
+        assert!(server.negotiated_key_exchange_group().is_none());
     } else {
         assert_eq!(
             expect_kx,
-            server
-                .negotiated_key_exchange_group()
-                .unwrap()
-                .name()
+            server.negotiated_key_exchange_group().unwrap().name()
         );
     }
 
@@ -1098,24 +1325,14 @@ pub fn do_suite_and_kx_test(
     assert_eq!(Some(expect_suite), server.negotiated_cipher_suite());
     assert_eq!(
         expect_kx,
-        client
-            .negotiated_key_exchange_group()
-            .unwrap()
-            .name()
+        client.negotiated_key_exchange_group().unwrap().name()
     );
     if matches!(expect_version, ProtocolVersion::TLSv1_2) {
-        assert!(
-            server
-                .negotiated_key_exchange_group()
-                .is_none()
-        );
+        assert!(server.negotiated_key_exchange_group().is_none());
     } else {
         assert_eq!(
             expect_kx,
-            server
-                .negotiated_key_exchange_group()
-                .unwrap()
-                .name()
+            server.negotiated_key_exchange_group().unwrap().name()
         );
     }
 
@@ -1132,21 +1349,15 @@ pub fn do_suite_and_kx_test(
     assert_eq!(Some(expect_suite), server.negotiated_cipher_suite());
     assert_eq!(
         expect_kx,
-        client
-            .negotiated_key_exchange_group()
-            .unwrap()
-            .name()
+        client.negotiated_key_exchange_group().unwrap().name()
     );
     assert_eq!(
         expect_kx,
-        server
-            .negotiated_key_exchange_group()
-            .unwrap()
-            .name()
+        server.negotiated_key_exchange_group().unwrap().name()
     );
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct MockServerVerifier {
     cert_rejection_error: Option<Error>,
     tls12_signature_error: Option<Error>,
@@ -1204,9 +1415,7 @@ impl ServerCertVerifier for MockServerVerifier {
                 message,
                 &SubjectPublicKeyInfoDer::from(cert.as_ref()),
                 dss,
-                self.raw_public_key_algorithms
-                    .as_ref()
-                    .unwrap(),
+                self.raw_public_key_algorithms.as_ref().unwrap(),
             ),
             _ => Ok(HandshakeSignatureValid::assertion()),
         }
@@ -1302,7 +1511,7 @@ pub struct MockClientVerifier {
     pub offered_schemes: Option<Vec<SignatureScheme>>,
     expect_raw_public_keys: bool,
     raw_public_key_algorithms: Option<WebPkiSupportedAlgorithms>,
-    parent: Arc<dyn ClientCertVerifier>,
+    parent: Box<dyn ClientCertVerifier>,
 }
 
 impl MockClientVerifier {
@@ -1352,8 +1561,7 @@ impl ClientCertVerifier for MockClientVerifier {
         if self.expect_raw_public_keys {
             Ok(HandshakeSignatureValid::assertion())
         } else {
-            self.parent
-                .verify_tls12_signature(message, cert, dss)
+            self.parent.verify_tls12_signature(message, cert, dss)
         }
     }
 
@@ -1368,13 +1576,10 @@ impl ClientCertVerifier for MockClientVerifier {
                 message,
                 &SubjectPublicKeyInfoDer::from(cert.as_ref()),
                 dss,
-                self.raw_public_key_algorithms
-                    .as_ref()
-                    .unwrap(),
+                self.raw_public_key_algorithms.as_ref().unwrap(),
             )
         } else {
-            self.parent
-                .verify_tls13_signature(message, cert, dss)
+            self.parent.verify_tls13_signature(message, cert, dss)
         }
     }
 
@@ -1404,23 +1609,17 @@ pub struct RawTls {
 
 impl RawTls {
     /// conn must be post-handshake, and must have been created with `enable_secret_extraction`
-    pub fn new_client(conn: ClientConnection) -> Self {
+    pub fn new_client(conn: impl Into<ClientConnection>) -> Self {
+        let conn = conn.into();
         let suite = conn.negotiated_cipher_suite().unwrap();
-        Self::new(
-            suite,
-            conn.dangerous_extract_secrets()
-                .unwrap(),
-        )
+        Self::new(suite, conn.dangerous_extract_secrets().unwrap())
     }
 
     /// conn must be post-handshake, and must have been created with `enable_secret_extraction`
-    pub fn new_server(conn: ServerConnection) -> Self {
+    pub fn new_server(conn: impl Into<ServerConnection>) -> Self {
+        let conn = conn.into();
         let suite = conn.negotiated_cipher_suite().unwrap();
-        Self::new(
-            suite,
-            conn.dangerous_extract_secrets()
-                .unwrap(),
-        )
+        Self::new(suite, conn.dangerous_extract_secrets().unwrap())
     }
 
     fn new(suite: SupportedCipherSuite, secrets: rustls::ExtractedSecrets) -> Self {
@@ -1454,9 +1653,7 @@ impl RawTls {
             (
                 rustls::ConnectionTrafficSecrets::Aes256Gcm { key, iv },
                 SupportedCipherSuite::Tls12(tls12),
-            ) => tls12
-                .aead_alg
-                .decrypter(key, &iv.as_ref()[..4]),
+            ) => tls12.aead_alg.decrypter(key, &iv.as_ref()[..4]),
 
             _ => todo!(),
         };
@@ -1469,29 +1666,21 @@ impl RawTls {
         }
     }
 
-    pub fn encrypt_and_send(
-        &mut self,
-        msg: &PlainMessage,
-        peer: &mut impl DerefMut<Target = ConnectionCommon<impl SideData>>,
-    ) {
+    pub fn encrypt_and_send(&mut self, msg: &PlainMessage, peer: &mut impl AsConnection) {
+        let peer = peer.common();
         let data = self
             .encrypter
             .encrypt(msg.borrow_outbound(), self.enc_seq)
             .unwrap()
             .encode();
         self.enc_seq += 1;
-        peer.read_tls(&mut io::Cursor::new(data))
-            .unwrap();
+        peer.read_tls(&mut io::Cursor::new(data)).unwrap();
     }
 
-    pub fn receive_and_decrypt(
-        &mut self,
-        peer: &mut impl DerefMut<Target = ConnectionCommon<impl SideData>>,
-        f: impl Fn(Message<'_>),
-    ) {
+    pub fn receive_and_decrypt(&mut self, peer: &mut impl AsConnection, f: impl Fn(Message<'_>)) {
+        let peer = peer.common();
         let mut data = vec![];
-        peer.write_tls(&mut io::Cursor::new(&mut data))
-            .unwrap();
+        peer.write_tls(&mut io::Cursor::new(&mut data)).unwrap();
 
         let mut reader = Reader::init(&data);
         let content_type = ContentType::read(&mut reader).unwrap();
@@ -1501,10 +1690,7 @@ impl RawTls {
         assert_eq!(len as usize, left.len());
 
         let inbound = InboundOpaqueMessage::new(content_type, version, left);
-        let plain = self
-            .decrypter
-            .decrypt(inbound, self.dec_seq)
-            .unwrap();
+        let plain = self.decrypter.decrypt(inbound, self.dec_seq).unwrap();
         self.dec_seq += 1;
 
         let msg = Message::try_from(plain).unwrap();
@@ -1595,11 +1781,11 @@ pub fn unsafe_plaintext_crypto_provider(provider: CryptoProvider) -> &'static Cr
 }
 
 mod plaintext {
-    use rustls::ConnectionTrafficSecrets;
     use rustls::crypto::cipher::{
         AeadKey, InboundOpaqueMessage, InboundPlainMessage, Iv, MessageDecrypter, MessageEncrypter,
         OutboundPlainMessage, PrefixedPayload, Tls13AeadAlgorithm, UnsupportedOperationError,
     };
+    use rustls::ConnectionTrafficSecrets;
 
     use super::*;
 
@@ -1777,11 +1963,7 @@ pub mod encoding {
         pub fn new_sig_algs() -> Self {
             Self {
                 typ: ExtensionType::SignatureAlgorithms,
-                body: len_u16(
-                    SignatureScheme::RSA_PKCS1_SHA256
-                        .to_array()
-                        .to_vec(),
-                ),
+                body: len_u16(SignatureScheme::RSA_PKCS1_SHA256.to_array().to_vec()),
             }
         }
 
@@ -1804,9 +1986,7 @@ pub mod encoding {
         pub fn new_versions_server_tls13() -> Self {
             Self {
                 typ: ExtensionType::SupportedVersions,
-                body: ProtocolVersion::TLSv1_3
-                    .to_array()
-                    .to_vec(),
+                body: ProtocolVersion::TLSv1_3.to_array().to_vec(),
             }
         }
 
@@ -1874,5 +2054,17 @@ pub mod encoding {
             i.encode(&mut body);
         }
         body
+    }
+}
+
+impl From<TestClient> for ClientConnection {
+    fn from(client: TestClient) -> Self {
+        client.conn
+    }
+}
+
+impl From<TestServer> for ServerConnection {
+    fn from(server: TestServer) -> Self {
+        server.conn
     }
 }

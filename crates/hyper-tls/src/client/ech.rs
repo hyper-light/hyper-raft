@@ -6,7 +6,7 @@ use core::iter;
 use pki_types::{DnsName, EchConfigListBytes, ServerName};
 use subtle::ConstantTimeEq;
 
-use crate::client::tls13;
+use crate::client::{tls13, ClientSettings};
 use crate::crypto::hash::Hash;
 use crate::crypto::hpke::{EncapsulatedSecret, Hpke, HpkePublicKey, HpkeSealer, HpkeSuite};
 use crate::crypto::SecureRandom;
@@ -29,8 +29,8 @@ use crate::tls13::key_schedule::{
 };
 use crate::CipherSuite::TLS_EMPTY_RENEGOTIATION_INFO_SCSV;
 use crate::{
-    AlertDescription, ClientConfig, CommonState, EncryptedClientHelloError, Error,
-    PeerIncompatible, PeerMisbehaved, ProtocolVersion, Tls13CipherSuite,
+    AlertDescription, CommonState, EncryptedClientHelloError, Error, PeerIncompatible,
+    PeerMisbehaved, ProtocolVersion, Tls13CipherSuite,
 };
 
 /// Controls how Encrypted Client Hello (ECH) is used in a client handshake.
@@ -157,7 +157,7 @@ impl EchConfig {
     pub(super) fn state(
         &self,
         server_name: ServerName<'static>,
-        config: &ClientConfig,
+        config: &ClientSettings,
     ) -> Result<EchState, Error> {
         EchState::new(
             self,

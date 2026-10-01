@@ -1,3 +1,4 @@
+use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::marker::PhantomData;
 use core::ops::{Deref, DerefMut};
@@ -10,17 +11,17 @@ use super::hs::{self, ClientHelloInput};
 use crate::builder::ConfigBuilder;
 use crate::client::{EchMode, EchStatus};
 use crate::common_state::{CommonState, Protocol, Side};
-use crate::conn::{ConnectionCore, UnbufferedConnectionCommon};
+use crate::conn::{ConnectionCore, SideConfig, UnbufferedConnectionCommon};
 use crate::crypto::{CryptoProvider, SupportedKxGroup};
 use crate::enums::{CipherSuite, ProtocolVersion, SignatureScheme};
 use crate::error::Error;
+use crate::identity::Identity;
 use crate::kernel::KernelConnection;
 use crate::log::trace;
 use crate::msgs::enums::NamedGroup;
 use crate::msgs::handshake::ClientExtensionsInput;
 use crate::msgs::persist;
 use crate::suites::{ExtractedSecrets, SupportedCipherSuite};
-use crate::sync::Arc;
 use crate::time_provider::DefaultTimeProvider;
 use crate::time_provider::TimeProvider;
 use crate::unbuffered::{EncryptError, TransmitTlsData};
@@ -36,12 +37,11 @@ use crate::{crypto, DistinguishedName};
 /// **highly sensitive**, containing enough key material to break all security
 /// of the corresponding session.
 ///
-/// `set_`, `insert_`, `remove_` and `take_` operations are mutating; this isn't
-/// expressed in the type system to allow implementations freedom in
-/// how to achieve interior mutability.  `Mutex` is a common choice.
+/// A store is owned by its [`ClientConfig`], and the `set_`, `insert_`, `remove_` and `take_`
+/// operations take `&mut self`: the calls that may change it take the configuration mutably.
 pub trait ClientSessionStore: fmt::Debug + Send + Sync {
     /// Remember what `NamedGroup` the given server chose.
-    fn set_kx_hint(&self, server_name: ServerName<'static>, group: NamedGroup);
+    fn set_kx_hint(&mut self, server_name: ServerName<'static>, group: NamedGroup);
 
     /// This should return the value most recently passed to `set_kx_hint`
     /// for the given `server_name`.
@@ -55,7 +55,7 @@ pub trait ClientSessionStore: fmt::Debug + Send + Sync {
     ///
     /// At most one of these can be remembered at a time, per `server_name`.
     fn set_tls12_session(
-        &self,
+        &mut self,
         server_name: ServerName<'static>,
         value: persist::Tls12ClientSessionValue,
     );
@@ -67,7 +67,7 @@ pub trait ClientSessionStore: fmt::Debug + Send + Sync {
     ) -> Option<persist::Tls12ClientSessionValue>;
 
     /// Remove and forget any saved TLS1.2 session for `server_name`.
-    fn remove_tls12_session(&self, server_name: &ServerName<'static>);
+    fn remove_tls12_session(&mut self, server_name: &ServerName<'static>);
 
     /// Remember a TLS1.3 ticket that might be retrieved later from `take_tls13_ticket`, allowing
     /// resumption of this session.
@@ -77,7 +77,7 @@ pub trait ClientSessionStore: fmt::Debug + Send + Sync {
     /// implementations of this trait should apply a reasonable bound of how many items are stored
     /// simultaneously.
     fn insert_tls13_ticket(
-        &self,
+        &mut self,
         server_name: ServerName<'static>,
         value: persist::Tls13ClientSessionValue,
     );
@@ -86,7 +86,7 @@ pub trait ClientSessionStore: fmt::Debug + Send + Sync {
     ///
     /// Implementations of this trait must return each value provided to `add_tls13_ticket` _at most once_.
     fn take_tls13_ticket(
-        &self,
+        &mut self,
         server_name: &ServerName<'static>,
     ) -> Option<persist::Tls13ClientSessionValue>;
 }
@@ -112,12 +112,15 @@ pub trait ResolvesClientCert: fmt::Debug + Send + Sync {
     /// authentication.  The server may reject the handshake later
     /// if it requires authentication.
     ///
+    /// The key is borrowed from the resolver for the call that signs with it: the client
+    /// resolves its certificate when it sends its `Certificate` and `CertificateVerify`.
+    ///
     /// [RFC 5280 A.1]: https://www.rfc-editor.org/rfc/rfc5280#appendix-A.1
     fn resolve(
         &self,
         root_hint_subjects: &[&[u8]],
         sigschemes: &[SignatureScheme],
-    ) -> Option<Arc<sign::CertifiedKey>>;
+    ) -> Option<&sign::CertifiedKey>;
 
     /// Return true if the client only supports raw public keys.
     ///
@@ -146,20 +149,66 @@ pub trait ResolvesClientCert: fmt::Debug + Send + Sync {
 /// by connections intended for domains that offer the provided [`crate::client::EchConfig`] in
 /// their DNS zone.
 ///
+/// # Ownership
+///
+/// A configuration owns everything it is built from: its verifier, its certificate resolver, its
+/// session store, its key log and its compression cache. A connection holds none of it. Each call
+/// that may advance a handshake takes the configuration, mutably, because the session store, the
+/// key log and the compression cache are written as the handshake runs. Connections that share a
+/// configuration are driven with the same value, one call at a time.
+///
+/// The settings a handshake only reads are a [`ClientSettings`], reached through `Deref`, so
+/// `config.alpn_protocols` and the like name them directly.
+///
 /// # Defaults
 ///
-/// * [`ClientConfig::max_fragment_size`]: the default is `None` (meaning 16kB).
+/// * [`ClientSettings::max_fragment_size`]: the default is `None` (meaning 16kB).
 /// * [`ClientConfig::resumption`]: supports resumption with up to 256 server names, using session
 ///   ids or tickets, with a max of eight tickets per server.
-/// * [`ClientConfig::alpn_protocols`]: the default is empty -- no ALPN protocol is negotiated.
+/// * [`ClientSettings::alpn_protocols`]: the default is empty -- no ALPN protocol is negotiated.
 /// * [`ClientConfig::key_log`]: key material is not logged.
-/// * [`ClientConfig::cert_decompressors`]: depends on the crate features, see [`compress::default_cert_decompressors()`].
-/// * [`ClientConfig::cert_compressors`]: depends on the crate features, see [`compress::default_cert_compressors()`].
+/// * [`ClientSettings::cert_decompressors`]: depends on the crate features, see [`compress::default_cert_decompressors()`].
+/// * [`ClientSettings::cert_compressors`]: depends on the crate features, see [`compress::default_cert_compressors()`].
 /// * [`ClientConfig::cert_compression_cache`]: caches the most recently used 4 compressions
 ///
 /// [`RootCertStore`]: crate::RootCertStore
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct ClientConfig {
+    settings: ClientSettings,
+
+    /// How and when the client can resume a previous session.
+    ///
+    /// Resumption is only allowed under the server certificate verifier and the client
+    /// certificate resolver a session was made under. Installing another verifier
+    /// ([`DangerousClientConfig::set_certificate_verifier`]) or resolver
+    /// ([`ClientSettings::set_client_auth_cert_resolver`]) makes the stored sessions
+    /// unresumable, as does moving the store to another configuration.
+    ///
+    /// To illustrate, imagine two `ClientConfig`s `A` and `B`.  `A` fully validates
+    /// the server certificate, `B` does not.  If a session originated by `B` were
+    /// resumed by `A`, this would give a false impression to the user of `A` that the
+    /// server certificate is fully validated.
+    ///
+    /// [`DangerousClientConfig::set_certificate_verifier`]: crate::client::danger::DangerousClientConfig::set_certificate_verifier
+    pub resumption: Resumption,
+
+    /// How to output key material for debugging.  The default
+    /// does nothing.
+    pub key_log: Box<dyn KeyLog>,
+
+    /// Caching for compressed certificates.
+    ///
+    /// This is optional: [`compress::CompressionCache::Disabled`] gives
+    /// a cache that does no caching.
+    pub cert_compression_cache: compress::CompressionCache,
+}
+
+/// The settings of a [`ClientConfig`] that a handshake only reads.
+///
+/// A `ClientConfig` dereferences to its settings, so these fields are set and read through the
+/// configuration.
+#[derive(Debug)]
+pub struct ClientSettings {
     /// Which ALPN protocols we include in our client hello.
     /// If empty, no ALPN extension is sent.
     pub alpn_protocols: Vec<Vec<u8>>,
@@ -168,25 +217,6 @@ pub struct ClientConfig {
     ///
     /// The default is true.
     pub check_selected_alpn: bool,
-
-    /// How and when the client can resume a previous session.
-    ///
-    /// # Sharing `resumption` between `ClientConfig`s
-    /// In a program using many `ClientConfig`s it may improve resumption rates
-    /// (which has a significant impact on connection performance) if those
-    /// configs share a single `Resumption`.
-    ///
-    /// However, resumption is only allowed between two `ClientConfig`s if their
-    /// `client_auth_cert_resolver` (ie, potential client authentication credentials)
-    /// and `verifier` (ie, server certificate verification settings) are
-    /// the same (according to `Arc::ptr_eq`).
-    ///
-    /// To illustrate, imagine two `ClientConfig`s `A` and `B`.  `A` fully validates
-    /// the server certificate, `B` does not.  If `A` and `B` shared a resumption store,
-    /// it would be possible for a session originated by `B` to be inserted into the
-    /// store, and then resumed by `A`.  This would give a false impression to the user
-    /// of `A` that the server certificate is fully validated.
-    pub resumption: Resumption,
 
     /// The maximum size of plaintext input to be emitted in a single TLS record.
     /// A value of None is equivalent to the [TLS maximum] of 16 kB.
@@ -202,17 +232,19 @@ pub struct ClientConfig {
     pub max_fragment_size: Option<usize>,
 
     /// How to decide what client auth certificate/keys to use.
-    pub client_auth_cert_resolver: Arc<dyn ResolvesClientCert>,
+    ///
+    /// Set with [`Self::set_client_auth_cert_resolver`], which gives the resolver a new
+    /// identity so that sessions made under another resolver do not resume.
+    pub(super) client_auth_cert_resolver: Box<dyn ResolvesClientCert>,
+
+    /// The installation of `client_auth_cert_resolver` that stored sessions are checked against.
+    pub(super) client_auth_cert_resolver_identity: Identity,
 
     /// Whether to send the Server Name Indication (SNI) extension
     /// during the client handshake.
     ///
     /// The default is true.
     pub enable_sni: bool,
-
-    /// How to output key material for debugging.  The default
-    /// does nothing.
-    pub key_log: Arc<dyn KeyLog>,
 
     /// Allows traffic secrets to be extracted after the handshake,
     /// e.g. for kTLS setup.
@@ -240,7 +272,7 @@ pub struct ClientConfig {
     pub require_ems: bool,
 
     /// Provides the current system time
-    pub time_provider: Arc<dyn TimeProvider>,
+    pub time_provider: Box<dyn TimeProvider>,
 
     /// Source of randomness and other crypto.
     pub(super) provider: &'static CryptoProvider,
@@ -250,7 +282,10 @@ pub struct ClientConfig {
     pub(super) versions: versions::EnabledVersions,
 
     /// How to verify the server certificate chain.
-    pub(super) verifier: Arc<dyn verify::ServerCertVerifier>,
+    pub(super) verifier: Box<dyn verify::ServerCertVerifier>,
+
+    /// The installation of `verifier` that stored sessions are checked against.
+    pub(super) verifier_identity: Identity,
 
     /// How to decompress the server's certificate chain.
     ///
@@ -276,12 +311,6 @@ pub struct ClientConfig {
     /// [RFC8779]: https://datatracker.ietf.org/doc/rfc8879/
     pub cert_compressors: Vec<&'static dyn compress::CertCompressor>,
 
-    /// Caching for compressed certificates.
-    ///
-    /// This is optional: [`compress::CompressionCache::Disabled`] gives
-    /// a cache that does no caching.
-    pub cert_compression_cache: Arc<compress::CompressionCache>,
-
     /// How to offer Encrypted Client Hello (ECH). The default is to not offer ECH.
     pub(super) ech_mode: Option<EchMode>,
 
@@ -291,6 +320,28 @@ pub struct ClientConfig {
     ///
     /// [RFC 9149]: https://datatracker.ietf.org/doc/html/rfc9149
     pub send_ticket_request: Option<TicketRequest>,
+}
+
+/// The parts of a [`ClientConfig`] a handshake writes, borrowed for one call.
+#[derive(Debug)]
+pub struct ClientStores<'a> {
+    pub(crate) resumption: &'a mut Resumption,
+    pub(crate) key_log: &'a mut Box<dyn KeyLog>,
+    pub(crate) cert_compression_cache: &'a mut compress::CompressionCache,
+}
+
+impl Deref for ClientConfig {
+    type Target = ClientSettings;
+
+    fn deref(&self) -> &ClientSettings {
+        &self.settings
+    }
+}
+
+impl DerefMut for ClientConfig {
+    fn deref_mut(&mut self) -> &mut ClientSettings {
+        &mut self.settings
+    }
 }
 
 /// Desired session ticket counts for the RFC 9149 `ticket_request` extension.
@@ -349,7 +400,7 @@ impl ClientConfig {
         ConfigBuilder {
             state: WantsVersions {},
             provider,
-            time_provider: Arc::new(DefaultTimeProvider),
+            time_provider: Box::new(DefaultTimeProvider),
             side: PhantomData,
         }
     }
@@ -369,7 +420,7 @@ impl ClientConfig {
     /// For more information, see the [`ConfigBuilder`] documentation.
     pub fn builder_with_details(
         provider: &'static CryptoProvider,
-        time_provider: Arc<dyn TimeProvider>,
+        time_provider: Box<dyn TimeProvider>,
     ) -> ConfigBuilder<Self, WantsVersions> {
         ConfigBuilder {
             state: WantsVersions {},
@@ -379,6 +430,24 @@ impl ClientConfig {
         }
     }
 
+    /// Assemble a configuration from its settings and its default stores.
+    pub(super) fn from_settings(settings: ClientSettings) -> Self {
+        Self {
+            settings,
+            resumption: Resumption::default(),
+            key_log: Box::new(crate::key_log::NoKeyLog {}),
+            cert_compression_cache: compress::CompressionCache::default(),
+        }
+    }
+
+    /// Access configuration options whose use is dangerous and requires
+    /// extra care.
+    pub fn dangerous(&mut self) -> danger::DangerousClientConfig<'_> {
+        danger::DangerousClientConfig { cfg: self }
+    }
+}
+
+impl ClientSettings {
     /// Return true if connections made with this `ClientConfig` will
     /// operate in FIPS mode.
     ///
@@ -404,10 +473,12 @@ impl ClientConfig {
         self.provider
     }
 
-    /// Access configuration options whose use is dangerous and requires
-    /// extra care.
-    pub fn dangerous(&mut self) -> danger::DangerousClientConfig<'_> {
-        danger::DangerousClientConfig { cfg: self }
+    /// Replace the client certificate resolver.
+    ///
+    /// Sessions stored under the previous resolver no longer resume.
+    pub fn set_client_auth_cert_resolver(&mut self, resolver: Box<dyn ResolvesClientCert>) {
+        self.client_auth_cert_resolver = resolver;
+        self.client_auth_cert_resolver_identity = Identity::fresh();
     }
 
     pub(super) fn needs_key_share(&self) -> bool {
@@ -466,11 +537,11 @@ impl ClientConfig {
 }
 
 /// Configuration for how/when a client is allowed to resume a previous session.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct Resumption {
     /// How we store session data or tickets. The default is to use an in-memory
     /// [super::handy::ClientSessionMemoryCache].
-    pub(super) store: Arc<dyn ClientSessionStore>,
+    pub(super) store: Box<dyn ClientSessionStore>,
 
     /// What mechanism is used for resuming a TLS 1.2 session.
     pub(super) tls12_resumption: Tls12Resumption,
@@ -483,7 +554,7 @@ impl Resumption {
     /// a session id or RFC 5077 ticket.
     pub fn in_memory_sessions(num: usize) -> Self {
         Self {
-            store: Arc::new(super::handy::ClientSessionMemoryCache::new(num)),
+            store: Box::new(super::handy::ClientSessionMemoryCache::new(num)),
             tls12_resumption: Tls12Resumption::SessionIdOrTickets,
         }
     }
@@ -491,7 +562,7 @@ impl Resumption {
     /// Use a custom [`ClientSessionStore`] implementation to store sessions.
     ///
     /// By default, enables resuming a TLS 1.2 session with a session id or RFC 5077 ticket.
-    pub fn store(store: Arc<dyn ClientSessionStore>) -> Self {
+    pub fn store(store: Box<dyn ClientSessionStore>) -> Self {
         Self {
             store,
             tls12_resumption: Tls12Resumption::SessionIdOrTickets,
@@ -501,7 +572,7 @@ impl Resumption {
     /// Disable all use of session resumption.
     pub fn disabled() -> Self {
         Self {
-            store: Arc::new(NoClientSessionStorage),
+            store: Box::new(NoClientSessionStorage),
             tls12_resumption: Tls12Resumption::Disabled,
         }
     }
@@ -544,9 +615,11 @@ pub enum Tls12Resumption {
 
 /// Container for unsafe APIs
 pub(super) mod danger {
+    use alloc::boxed::Box;
+
     use super::verify::ServerCertVerifier;
     use super::ClientConfig;
-    use crate::sync::Arc;
+    use crate::identity::Identity;
 
     /// Accessor for dangerous configuration options.
     #[derive(Debug)]
@@ -557,8 +630,11 @@ pub(super) mod danger {
 
     impl DangerousClientConfig<'_> {
         /// Overrides the default `ServerCertVerifier` with something else.
-        pub fn set_certificate_verifier(&mut self, verifier: Arc<dyn ServerCertVerifier>) {
+        ///
+        /// Sessions stored under the previous verifier no longer resume.
+        pub fn set_certificate_verifier(&mut self, verifier: Box<dyn ServerCertVerifier>) {
             self.cfg.verifier = verifier;
+            self.cfg.verifier_identity = Identity::fresh();
         }
     }
 }
@@ -654,7 +730,6 @@ mod connection {
     use crate::conn::{ConnectionCommon, ConnectionCore};
     use crate::error::Error;
     use crate::suites::ExtractedSecrets;
-    use crate::sync::Arc;
     use crate::ClientConfig;
 
     /// Stub that implements io::Write and dispatches to `write_early_data`.
@@ -710,13 +785,17 @@ mod connection {
         /// Make a new ClientConnection.  `config` controls how
         /// we behave in the TLS protocol, `name` is the
         /// name of the server we want to talk to.
-        pub fn new(config: Arc<ClientConfig>, name: ServerName<'static>) -> Result<Self, Error> {
-            Self::new_with_alpn(config.clone(), name, config.alpn_protocols.clone())
+        ///
+        /// The configuration is taken for this call only: it may supply a stored session to
+        /// resume. Later calls that may advance the handshake take it again.
+        pub fn new(config: &mut ClientConfig, name: ServerName<'static>) -> Result<Self, Error> {
+            let alpn_protocols = config.alpn_protocols.clone();
+            Self::new_with_alpn(config, name, alpn_protocols)
         }
 
         /// Make a new ClientConnection with custom ALPN protocols.
         pub fn new_with_alpn(
-            config: Arc<ClientConfig>,
+            config: &mut ClientConfig,
             name: ServerName<'static>,
             alpn_protocols: Vec<Vec<u8>>,
         ) -> Result<Self, Error> {
@@ -836,7 +915,7 @@ pub use connection::{ClientConnection, WriteEarlyData};
 
 impl ConnectionCore<ClientConnectionData> {
     pub(crate) fn for_client(
-        config: Arc<ClientConfig>,
+        config: &mut ClientConfig,
         name: ServerName<'static>,
         extra_exts: ClientExtensionsInput<'static>,
         proto: Protocol,
@@ -848,14 +927,17 @@ impl ConnectionCore<ClientConnectionData> {
         common_state.fips = config.fips();
         let mut data = ClientConnectionData::new();
 
+        let (settings, stores) = ClientConnectionData::split(config);
         let mut cx = hs::ClientContext {
             common: &mut common_state,
             data: &mut data,
             // `start_handshake` won't produce plaintext
             sendable_plaintext: None,
+            config: settings,
+            stores,
         };
 
-        let input = ClientHelloInput::new(name, &extra_exts, &mut cx, config)?;
+        let input = ClientHelloInput::new(name, &extra_exts, &mut cx)?;
         let state = input.start_handshake(extra_exts, &mut cx)?;
         Ok(Self::new(state, data, common_state))
     }
@@ -875,17 +957,18 @@ pub struct UnbufferedClientConnection {
 impl UnbufferedClientConnection {
     /// Make a new ClientConnection. `config` controls how we behave in the TLS protocol, `name` is
     /// the name of the server we want to talk to.
-    pub fn new(config: Arc<ClientConfig>, name: ServerName<'static>) -> Result<Self, Error> {
+    pub fn new(config: &mut ClientConfig, name: ServerName<'static>) -> Result<Self, Error> {
+        let alpn_protocols = config.alpn_protocols.clone();
         Self::new_with_extensions(
-            config.clone(),
+            config,
             name,
-            ClientExtensionsInput::from_alpn(config.alpn_protocols.clone()),
+            ClientExtensionsInput::from_alpn(alpn_protocols),
         )
     }
 
     /// Make a new UnbufferedClientConnection with custom ALPN protocols.
     pub fn new_with_alpn(
-        config: Arc<ClientConfig>,
+        config: &mut ClientConfig,
         name: ServerName<'static>,
         alpn_protocols: Vec<Vec<u8>>,
     ) -> Result<Self, Error> {
@@ -897,7 +980,7 @@ impl UnbufferedClientConnection {
     }
 
     fn new_with_extensions(
-        config: Arc<ClientConfig>,
+        config: &mut ClientConfig,
         name: ServerName<'static>,
         extensions: ClientExtensionsInput<'static>,
     ) -> Result<Self, Error> {
@@ -1044,3 +1127,26 @@ impl ClientConnectionData {
 }
 
 impl crate::conn::SideData for ClientConnectionData {}
+
+impl SideConfig for ClientConnectionData {
+    type Config = ClientConfig;
+    type Settings = ClientSettings;
+    type Stores<'a> = ClientStores<'a>;
+
+    fn split(config: &mut ClientConfig) -> (&ClientSettings, ClientStores<'_>) {
+        let ClientConfig {
+            settings,
+            resumption,
+            key_log,
+            cert_compression_cache,
+        } = config;
+        (
+            settings,
+            ClientStores {
+                resumption,
+                key_log,
+                cert_compression_cache,
+            },
+        )
+    }
+}

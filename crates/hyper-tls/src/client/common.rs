@@ -5,7 +5,6 @@ use super::ResolvesClientCert;
 use crate::log::{debug, trace};
 use crate::msgs::enums::ExtensionType;
 use crate::msgs::handshake::{CertificateChain, DistinguishedName, ProtocolName, ServerExtensions};
-use crate::sync::Arc;
 use crate::{compress, sign, CipherSuite, SignatureScheme};
 
 #[derive(Debug)]
@@ -77,36 +76,53 @@ impl ClientHelloDetails {
     }
 }
 
-pub(super) enum ClientAuthDetails {
-    /// Send an empty `Certificate` and no `CertificateVerify`.
-    Empty { auth_context_tls13: Option<Vec<u8>> },
-    /// Send a non-empty `Certificate` and a `CertificateVerify`.
-    Verify {
-        certkey: Arc<sign::CertifiedKey>,
-        signer: Box<dyn sign::Signer>,
-        auth_context_tls13: Option<Vec<u8>>,
-        compressor: Option<&'static dyn compress::CertCompressor>,
-    },
+/// A server's request for client authentication, kept until the client answers it.
+///
+/// The client resolves its certificate in the call that sends its `Certificate` and
+/// `CertificateVerify`: on the server's `Finished` in TLS 1.3, on `ServerHelloDone` in TLS 1.2.
+/// The certificate key is borrowed from the configuration, and a connection holds no
+/// configuration between calls, so the request is kept instead of the key.
+pub(super) struct ClientAuthRequest {
+    canames: Option<Vec<DistinguishedName>>,
+    sigschemes: Vec<SignatureScheme>,
+    auth_context_tls13: Option<Vec<u8>>,
+    compressor: Option<&'static dyn compress::CertCompressor>,
 }
 
-impl ClientAuthDetails {
-    pub(super) fn resolve(
-        resolver: &dyn ResolvesClientCert,
-        canames: Option<&[DistinguishedName]>,
-        sigschemes: &[SignatureScheme],
+impl ClientAuthRequest {
+    pub(super) fn new(
+        canames: Option<Vec<DistinguishedName>>,
+        sigschemes: Vec<SignatureScheme>,
         auth_context_tls13: Option<Vec<u8>>,
         compressor: Option<&'static dyn compress::CertCompressor>,
     ) -> Self {
+        Self {
+            canames,
+            sigschemes,
+            auth_context_tls13,
+            compressor,
+        }
+    }
+
+    /// Choose the certificate and signer to answer this request with.
+    pub(super) fn resolve(self, resolver: &dyn ResolvesClientCert) -> ClientAuthDetails<'_> {
+        let Self {
+            canames,
+            sigschemes,
+            auth_context_tls13,
+            compressor,
+        } = self;
         let acceptable_issuers = canames
+            .as_deref()
             .unwrap_or_default()
             .iter()
             .map(|p| p.as_ref())
             .collect::<Vec<&[u8]>>();
 
-        if let Some(certkey) = resolver.resolve(&acceptable_issuers, sigschemes) {
-            if let Some(signer) = certkey.key.choose_scheme(sigschemes) {
+        if let Some(certkey) = resolver.resolve(&acceptable_issuers, &sigschemes) {
+            if let Some(signer) = certkey.key.choose_scheme(&sigschemes) {
                 debug!("Attempting client auth");
-                return Self::Verify {
+                return ClientAuthDetails::Verify {
                     certkey,
                     signer,
                     auth_context_tls13,
@@ -116,6 +132,18 @@ impl ClientAuthDetails {
         }
 
         debug!("Client auth requested but no cert/sigscheme available");
-        Self::Empty { auth_context_tls13 }
+        ClientAuthDetails::Empty { auth_context_tls13 }
     }
+}
+
+pub(super) enum ClientAuthDetails<'a> {
+    /// Send an empty `Certificate` and no `CertificateVerify`.
+    Empty { auth_context_tls13: Option<Vec<u8>> },
+    /// Send a non-empty `Certificate` and a `CertificateVerify`.
+    Verify {
+        certkey: &'a sign::CertifiedKey,
+        signer: Box<dyn sign::Signer + 'a>,
+        auth_context_tls13: Option<Vec<u8>>,
+        compressor: Option<&'static dyn compress::CertCompressor>,
+    },
 }

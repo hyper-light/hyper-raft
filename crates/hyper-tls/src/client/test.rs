@@ -16,12 +16,12 @@ use crate::msgs::handshake::{
     ServerHelloPayload, SessionId,
 };
 use crate::msgs::message::{Message, MessagePayload, OutboundOpaqueMessage};
-use crate::sync::Arc;
 use crate::{Error, PeerIncompatible, PeerMisbehaved, RootCertStore};
 
 #[macro_rules_attribute::apply(test_for_each_provider)]
 mod tests {
-    use std::sync::OnceLock;
+    // Test doubles share state with the test through `Arc`: the configuration owns the double.
+    use std::sync::{Arc, OnceLock};
 
     use super::super::*;
     use crate::client::AlwaysResolvesClientRawPublicKeys;
@@ -101,7 +101,7 @@ mod tests {
 
     #[test]
     fn test_client_rejects_hrr_with_varied_session_id() {
-        let config = ClientConfig::builder_with_provider(crate::crypto::static_provider(
+        let mut config = ClientConfig::builder_with_provider(crate::crypto::static_provider(
             super::provider::default_provider(),
         ))
         .with_safe_default_protocol_versions()
@@ -109,8 +109,7 @@ mod tests {
         .with_root_certificates(roots())
         .with_no_client_auth();
         let mut conn =
-            ClientConnection::new(config.into(), ServerName::try_from("localhost").unwrap())
-                .unwrap();
+            ClientConnection::new(&mut config, ServerName::try_from("localhost").unwrap()).unwrap();
         let mut sent = Vec::new();
         conn.write_tls(&mut sent).unwrap();
 
@@ -133,7 +132,7 @@ mod tests {
         conn.read_tls(&mut hrr.into_wire_bytes().as_slice())
             .unwrap();
         assert_eq!(
-            conn.process_new_packets().unwrap_err(),
+            conn.process_new_packets(&mut config).unwrap_err(),
             PeerMisbehaved::IllegalHelloRetryRequestWithWrongSessionId.into()
         );
     }
@@ -153,10 +152,8 @@ mod tests {
             config.require_ems = true;
         }
 
-        let config = Arc::new(config);
         let mut conn =
-            ClientConnection::new(config.clone(), ServerName::try_from("localhost").unwrap())
-                .unwrap();
+            ClientConnection::new(&mut config, ServerName::try_from("localhost").unwrap()).unwrap();
         let mut sent = Vec::new();
         conn.write_tls(&mut sent).unwrap();
 
@@ -176,7 +173,7 @@ mod tests {
         conn.read_tls(&mut sh.into_wire_bytes().as_slice()).unwrap();
 
         assert_eq!(
-            conn.process_new_packets(),
+            conn.process_new_packets(&mut config),
             Err(PeerIncompatible::ExtendedMasterSecretExtensionRequired.into())
         );
     }
@@ -196,7 +193,7 @@ mod tests {
                 .with_protocol_versions(&[protocol_version])
                 .unwrap()
                 .dangerous()
-                .with_custom_certificate_verifier(Arc::new(cas_sending_server_verifier.clone()))
+                .with_custom_certificate_verifier(Box::new(cas_sending_server_verifier.clone()))
                 .with_no_client_auth(),
             )
             .unwrap();
@@ -213,18 +210,18 @@ mod tests {
     /// Regression test for <https://github.com/seanmonstar/reqwest/issues/2191>
     #[test]
     fn test_client_with_custom_verifier_can_accept_ecdsa_sha1_signatures() {
-        let verifier = Arc::new(ExpectSha1EcdsaVerifier::default());
-        let config =
+        let verifier = ExpectSha1EcdsaVerifier::default();
+        let seen_sha1_signature = verifier.seen_sha1_signature.clone();
+        let mut config =
             ClientConfig::builder_with_provider(crate::crypto::static_provider(x25519_provider()))
                 .with_safe_default_protocol_versions()
                 .unwrap()
                 .dangerous()
-                .with_custom_certificate_verifier(verifier.clone())
+                .with_custom_certificate_verifier(Box::new(verifier))
                 .with_no_client_auth();
 
         let mut conn =
-            ClientConnection::new(config.into(), ServerName::try_from("localhost").unwrap())
-                .unwrap();
+            ClientConnection::new(&mut config, ServerName::try_from("localhost").unwrap()).unwrap();
         let mut sent = Vec::new();
         conn.write_tls(&mut sent).unwrap();
 
@@ -245,7 +242,7 @@ mod tests {
             )),
         };
         conn.read_tls(&mut sh.into_wire_bytes().as_slice()).unwrap();
-        conn.process_new_packets().unwrap();
+        conn.process_new_packets(&mut config).unwrap();
 
         let cert = Message {
             version: ProtocolVersion::TLSv1_2,
@@ -257,7 +254,7 @@ mod tests {
         };
         conn.read_tls(&mut cert.into_wire_bytes().as_slice())
             .unwrap();
-        conn.process_new_packets().unwrap();
+        conn.process_new_packets(&mut config).unwrap();
 
         let server_kx = Message {
             version: ProtocolVersion::TLSv1_2,
@@ -281,7 +278,7 @@ mod tests {
         };
         conn.read_tls(&mut server_kx.into_wire_bytes().as_slice())
             .unwrap();
-        conn.process_new_packets().unwrap();
+        conn.process_new_packets(&mut config).unwrap();
 
         let server_done = Message {
             version: ProtocolVersion::TLSv1_2,
@@ -291,14 +288,14 @@ mod tests {
         };
         conn.read_tls(&mut server_done.into_wire_bytes().as_slice())
             .unwrap();
-        conn.process_new_packets().unwrap();
+        conn.process_new_packets(&mut config).unwrap();
 
-        assert!(verifier.seen_sha1_signature.load(Ordering::SeqCst));
+        assert!(seen_sha1_signature.load(Ordering::SeqCst));
     }
 
     #[derive(Debug, Default)]
     struct ExpectSha1EcdsaVerifier {
-        seen_sha1_signature: AtomicBool,
+        seen_sha1_signature: Arc<AtomicBool>,
     }
 
     impl ServerCertVerifier for ExpectSha1EcdsaVerifier {
@@ -395,12 +392,10 @@ mod tests {
     fn client_requiring_rpk_receives_server_ee(
         encrypted_extensions: ServerExtensions<'_>,
     ) -> Result<(), Error> {
-        let fake_server_crypto = Arc::new(FakeServerCrypto::new());
-        let mut conn = ClientConnection::new(
-            client_config_for_rpk(fake_server_crypto.clone()).into(),
-            ServerName::try_from("localhost").unwrap(),
-        )
-        .unwrap();
+        let fake_server_crypto = FakeServerCrypto::new();
+        let mut config = client_config_for_rpk(Box::new(fake_server_crypto.clone()));
+        let mut conn =
+            ClientConnection::new(&mut config, ServerName::try_from("localhost").unwrap()).unwrap();
         let mut sent = Vec::new();
         conn.write_tls(&mut sent).unwrap();
 
@@ -424,7 +419,7 @@ mod tests {
             )),
         };
         conn.read_tls(&mut sh.into_wire_bytes().as_slice()).unwrap();
-        conn.process_new_packets().unwrap();
+        conn.process_new_packets(&mut config).unwrap();
 
         let ee = Message {
             version: ProtocolVersion::TLSv1_3,
@@ -438,18 +433,18 @@ mod tests {
             .encrypt(PlainMessage::from(ee).borrow_outbound(), 0)
             .unwrap();
         conn.read_tls(&mut enc_ee.encode().as_slice()).unwrap();
-        conn.process_new_packets().map(|_| ())
+        conn.process_new_packets(&mut config).map(|_| ())
     }
 
-    fn client_config_for_rpk(key_log: Arc<dyn KeyLog>) -> ClientConfig {
+    fn client_config_for_rpk(key_log: Box<dyn KeyLog>) -> ClientConfig {
         let mut config =
             ClientConfig::builder_with_provider(crate::crypto::static_provider(x25519_provider()))
                 .with_protocol_versions(&[&version::TLS13])
                 .unwrap()
                 .dangerous()
-                .with_custom_certificate_verifier(Arc::new(ServerVerifierRequiringRpk))
-                .with_client_cert_resolver(Arc::new(AlwaysResolvesClientRawPublicKeys::new(
-                    Arc::new(client_certified_key()),
+                .with_custom_certificate_verifier(Box::new(ServerVerifierRequiringRpk))
+                .with_client_cert_resolver(Box::new(AlwaysResolvesClientRawPublicKeys::new(
+                    client_certified_key(),
                 )));
         config.key_log = key_log;
         config
@@ -566,15 +561,15 @@ mod tests {
         }
     }
 
-    #[derive(Debug)]
+    #[derive(Clone, Debug)]
     struct FakeServerCrypto {
-        server_handshake_secret: OnceLock<Vec<u8>>,
+        server_handshake_secret: Arc<OnceLock<Vec<u8>>>,
     }
 
     impl FakeServerCrypto {
         fn new() -> Self {
             Self {
-                server_handshake_secret: OnceLock::new(),
+                server_handshake_secret: Arc::new(OnceLock::new()),
             }
         }
 
@@ -601,7 +596,7 @@ mod tests {
             true
         }
 
-        fn log(&self, label: &str, _client_random: &[u8], secret: &[u8]) {
+        fn log(&mut self, label: &str, _client_random: &[u8], secret: &[u8]) {
             if label == "SERVER_HANDSHAKE_TRAFFIC_SECRET" {
                 self.server_handshake_secret.set(secret.to_vec()).unwrap();
             }
@@ -650,9 +645,8 @@ fn hybrid_kx_component_share_not_offered_unless_supported_separately() {
     assert_eq!(key_shares[0].group, NamedGroup::X25519MLKEM768);
 }
 
-fn client_hello_sent_for_config(config: ClientConfig) -> Result<ClientHelloPayload, Error> {
-    let mut conn =
-        ClientConnection::new(config.into(), ServerName::try_from("localhost").unwrap())?;
+fn client_hello_sent_for_config(mut config: ClientConfig) -> Result<ClientHelloPayload, Error> {
+    let mut conn = ClientConnection::new(&mut config, ServerName::try_from("localhost").unwrap())?;
     let mut bytes = Vec::new();
     conn.write_tls(&mut bytes).unwrap();
 

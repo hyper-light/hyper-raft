@@ -1022,11 +1022,11 @@ impl From<rand::GetRandomFailed> for Error {
 }
 
 mod other_error {
+    use alloc::boxed::Box;
     use core::fmt;
     use std::error::Error as StdError;
 
     use super::Error;
-    use crate::sync::Arc;
 
     /// Any other error that cannot be expressed by a more specific [`Error`] variant.
     ///
@@ -1034,8 +1034,36 @@ mod other_error {
     /// exposing a provider specific error.
     ///
     /// Enums holding this type will never compare equal to each other.
-    #[derive(Debug, Clone)]
-    pub struct OtherError(pub Arc<dyn StdError + Send + Sync>);
+    ///
+    /// A connection keeps the error that ended it and repeats it to later calls, so an [`Error`]
+    /// is cloned. The source is therefore owned and clonable, where upstream shared it by `Arc`.
+    #[derive(Debug)]
+    pub struct OtherError(pub Box<dyn ClonableError>);
+
+    impl OtherError {
+        /// Wrap `error`.
+        pub fn new(error: impl StdError + Clone + Send + Sync + 'static) -> Self {
+            Self(Box::new(error))
+        }
+    }
+
+    /// An error that can be copied into a new box: the source of an [`OtherError`].
+    pub trait ClonableError: StdError + Send + Sync + 'static {
+        /// A boxed copy of this error.
+        fn clone_box(&self) -> Box<dyn ClonableError>;
+    }
+
+    impl<T: StdError + Clone + Send + Sync + 'static> ClonableError for T {
+        fn clone_box(&self) -> Box<dyn ClonableError> {
+            Box::new(self.clone())
+        }
+    }
+
+    impl Clone for OtherError {
+        fn clone(&self) -> Self {
+            Self(self.0.clone_box())
+        }
+    }
 
     impl PartialEq<Self> for OtherError {
         fn eq(&self, _other: &Self) -> bool {
@@ -1059,12 +1087,13 @@ mod other_error {
 
     impl StdError for OtherError {
         fn source(&self) -> Option<&(dyn StdError + 'static)> {
-            Some(self.0.as_ref())
+            let source: &(dyn StdError + 'static) = &*self.0;
+            Some(source)
         }
     }
 }
 
-pub use other_error::OtherError;
+pub use other_error::{ClonableError, OtherError};
 
 #[cfg(test)]
 mod tests {
@@ -1077,7 +1106,18 @@ mod tests {
     use super::{
         CertRevocationListError, Error, InconsistentKeys, InvalidMessage, OtherError, UnixTime,
     };
-    use crate::sync::Arc;
+
+    /// An error with an empty message, as the source of an `OtherError` under test.
+    #[derive(Debug, Clone)]
+    struct Empty;
+
+    impl core::fmt::Display for Empty {
+        fn fmt(&self, _: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            Ok(())
+        }
+    }
+
+    impl std::error::Error for Empty {}
 
     #[test]
     fn certificate_error_equality() {
@@ -1198,7 +1238,7 @@ mod tests {
             ApplicationVerificationFailure
         );
         assert_eq!(InvalidOcspResponse, InvalidOcspResponse);
-        let other = Other(OtherError(Arc::from(Box::from(""))));
+        let other = Other(OtherError::new(Empty));
         assert_ne!(other, other);
         assert_ne!(BadEncoding, Expired);
     }
@@ -1243,14 +1283,14 @@ mod tests {
         assert_eq!(UnsupportedDeltaCrl, UnsupportedDeltaCrl);
         assert_eq!(UnsupportedIndirectCrl, UnsupportedIndirectCrl);
         assert_eq!(UnsupportedRevocationReason, UnsupportedRevocationReason);
-        let other = Other(OtherError(Arc::from(Box::from(""))));
+        let other = Other(OtherError::new(Empty));
         assert_ne!(other, other);
         assert_ne!(BadSignature, InvalidCrlNumber);
     }
 
     #[test]
     fn other_error_equality() {
-        let other_error = OtherError(Arc::from(Box::from("")));
+        let other_error = OtherError::new(Empty);
         assert_ne!(other_error, other_error);
         let other: Error = other_error.into();
         assert_ne!(other, other);
@@ -1320,7 +1360,7 @@ mod tests {
             Error::InconsistentKeys(InconsistentKeys::KeyMismatch),
             Error::InconsistentKeys(InconsistentKeys::Unknown),
             Error::InvalidCertRevocationList(CertRevocationListError::BadSignature),
-            Error::Other(OtherError(Arc::from(Box::from("")))),
+            Error::Other(OtherError::new(Empty)),
         ];
 
         for err in all {

@@ -25,7 +25,7 @@ Upstream's own tests are the oracle that conformance changed no behaviour.
   configuration; the ring default ran 296 unit tests because the bloom-gated token tests were
   off.
 
-## 2. Configuration without `Arc` (docs/transport.md §3.1), in progress
+## 2. Configuration without `Arc` (docs/transport.md §3.1)
 
 1. **Congestion control is the closed enum `congestion::Congestion`, carried by value.**
    - `ControllerFactory` and `TransportConfig::congestion_controller_factory` are gone; use
@@ -67,6 +67,73 @@ Upstream's own tests are the oracle that conformance changed no behaviour.
    `rustls::crypto::aws_lc_rs::DEFAULT_PROVIDER`, where upstream built a fresh
    `Arc<CryptoProvider>` per configuration. The classical-key-exchange test client keeps its
    provider in a `LazyLock`.
+
+8. **TLS configuration lives in the endpoint's `Configs` slab** (`config/configs.rs`).
+   - The endpoint owns every server and client configuration in a slab of
+     `EndpointConfig::config_slots` slots (default 4, derived: one current and one draining
+     configuration per side; a rotation is days apart, far longer than a connection lives).
+     `ServerConfig` holds its crypto configuration, handshake-token key and time source as
+     `Box`es, and `ClientConfig` its crypto configuration and initial-CID provider; neither is
+     `Clone` any more.
+   - A connection and a pending `Incoming` hold a generation-checked key. The endpoint counts
+     them per slot: up when an attempt is surfaced or a connection created, down when the attempt
+     is accepted, refused, retried or ignored and when a connection's `Drained` event arrives. A
+     superseded configuration is dropped when its count reaches zero; a slot whose generation
+     counter is exhausted is never reused. A full slab refuses the new configuration with
+     `ConfigsFull`.
+   - Endpoint API: `Endpoint::new` takes `Option<ServerConfig>` by value;
+     `set_server_config(Option<ServerConfig>) -> Result<(), ConfigsFull>` supersedes the current
+     one; `insert_client_config`/`retire_client_config` and
+     `insert_server_config`/`retire_server_config` manage the others; `connect` takes a
+     `ClientConfigHandle` (connections made with one handle share its TLS session cache, so a
+     later connection resumes); `accept` takes an optional `ServerConfigHandle`; `configs()` and
+     `configs_mut()` lend the slab. `ConnectError::UnknownConfig` is new.
+   - Connection API: `handle_event(event, &mut Configs)` and
+     `poll_transmit(now, max_datagrams, buf, &Configs)`. A datagram can carry CRYPTO data, and a
+     TLS read can change the configuration's stores (session cache, ticketer, key log), so that
+     call borrows mutably; this deviates from §3.1's `&Configs`. A transmit can carry NEW_TOKEN,
+     which reads the token key and time source. `handle_timeout` needs no configuration.
+   - The values a connection read from its `Arc<ServerConfig>` without a TLS step (`migration`,
+     whether a preferred address was sent, `ValidationTokenConfig::sent`) are copied into the
+     connection at accept.
+   - The crypto traits borrow: `crypto::ClientConfig::start_session(&mut self, …)`,
+     `crypto::ServerConfig::start_session(&self, …)`, and
+     `Session::read_handshake(&mut self, SessionConfig<'_>, buf)`, where `SessionConfig` lends
+     the client's or server's crypto configuration for the call. Both configuration traits are
+     `Any`, so the rustls session recovers its own `QuicClientConfig` or `QuicServerConfig`; a
+     configuration of the wrong side or implementation is a typed `INTERNAL_ERROR`, unreachable
+     through the endpoint. `QuicClientConfig` and `QuicServerConfig` own their rustls
+     configuration; `with_initial` and `TryFrom` take it by value.
+9. **`TokenMemoryCache` owns each server name once.** Upstream shared it between the lookup map
+   and the LRU entry through `Arc<str>`. The map now owns it (`Box<str>`); evicting the least
+   recently used name finds its map entry by slot, a scan bounded by `max_server_names` and paid
+   only when a new name evicts. Storing a token for a known name no longer allocates a name.
+10. **Tests.** Only the API changed in them; every assertion is unchanged.
+    - The harness's `connect_with`/`begin_connect` insert a configuration per connection and
+      retire it at once; `add_client_config` with `connect_with_shared`/`begin_connect_shared`
+      serve the tests that reused one configuration through `clone` (0-RTT, tokens).
+      `zero_rtt_rejection` changes ALPN through `Configs::client_config_mut` where upstream used
+      `Arc::get_mut`.
+    - `pending_incoming_can_retry_after_disabling_server` reused one `ServerConfig` through
+      `clone`, sharing its token key. It now builds two configurations around one token key, so
+      the second still validates the first's retry token.
+    - The fake time source is a clonable handle (`Arc<Mutex<SystemTime>>`, test code).
+    - New: four unit tests of the slab (refusal when full, reclamation after the last user,
+      immediate reclamation when unused, a current configuration kept without users), and
+      `tests/handshake.rs`: two endpoints driven through the public API complete a handshake and
+      exchange data both ways, and allocations per handshake are counted.
+    - Oracle: 313 unit tests (309 and the 4 new) and 3 doctests pass, and `tests/handshake.rs`'s
+      2 tests.
+11. **Wire behaviour and allocations.** `tests/handshake.rs` with each datagram's size printed,
+    run at 526c2cc (adapted to its `Arc` API) and here: the same 63 datagrams with the same sizes
+    in the same order, across a warm-up, a full and a resumed handshake. Allocations per
+    handshake, client and server together, macOS aarch64 development machine, debug profile,
+    three runs each (reallocations vary by ±3 in both):
+
+    | Handshake | 526c2cc | Now |
+    |---|---|---|
+    | Full | 505 allocs, ~174,300 B | 494 allocs, ~174,100 B |
+    | Resumed | 511 allocs, ~129,880 B | 501 allocs, ~129,530 B |
 
 ## 3. Connection attempts (2026-10-01)
 

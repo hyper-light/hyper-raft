@@ -1105,6 +1105,19 @@ impl<S: Storage> Raft<S> {
             false
         }
     }
+    /// The last index when this member last became leader: entries above it
+    /// are its own proposals, counted uncommitted until given to apply.
+    pub(crate) fn leader_tail(&self) -> u64 {
+        self.leader_tail
+    }
+    /// `bytes` of proposals were committed and given to apply: uncommitted no
+    /// more.
+    pub(crate) fn reduce_uncommitted_bytes(&mut self, bytes: usize) {
+        if self.state != StateRole::Leader || self.config.max_uncommitted_size == u64::MAX {
+            return;
+        }
+        self.uncommitted_bytes = self.uncommitted_bytes.saturating_sub(bytes);
+    }
     /// What was committed and given to apply is uncommitted no more.
     pub(crate) fn reduce_uncommitted(&mut self, entries: &[Entry]) {
         if self.state != StateRole::Leader || self.config.max_uncommitted_size == u64::MAX {

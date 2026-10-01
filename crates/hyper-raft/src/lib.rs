@@ -45,7 +45,7 @@ mod track;
 
 pub use configuration::{Change, Changed, Configuration, ConfigurationError};
 pub use error::{Error, Result, StorageError};
-pub use node::{LightReady, RawNode, Ready, SnapshotStatus};
+pub use node::{Kept, LightReady, RawNode, Ready, SnapshotStatus, ToPersist};
 pub use quorum::{Quorum, Tally};
 pub use raft::{Config, FastStats, Limits, Outgoing, Precedence, Raft, SoftState, StateRole};
 pub use read::ReadState;

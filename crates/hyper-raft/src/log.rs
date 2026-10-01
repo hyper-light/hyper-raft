@@ -252,6 +252,19 @@ impl Unstable {
     }
 }
 
+/// Entries committed and durable, given to apply where storage holds them
+/// ([`Log::next_range_since`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CommittedRange {
+    /// The first index of the range.
+    pub first: u64,
+    /// The last index of the range.
+    pub last: u64,
+    /// The bytes of the data of the entries of the range above the index
+    /// asked about.
+    pub data_above: usize,
+}
+
 /// What an append will do, decided before the log changes
 /// ([`Log::append_after`]).
 struct AppendPlan {
@@ -524,6 +537,12 @@ impl<S: Storage> Log<S> {
     }
     /// The entries through `(index, term)` are handed to storage.
     pub fn stable_entries(&mut self, index: u64, term: u64) -> Result<()> {
+        self.take_stable_entries(index, term).map(drop)
+    }
+    /// As [`Log::stable_entries`], giving the entries up to the caller: the
+    /// log holds them no more, and storage, which holds them now, may keep
+    /// these very ones.
+    pub fn take_stable_entries(&mut self, index: u64, term: u64) -> Result<Vec<Entry>> {
         if self.unstable.snapshot.is_some() {
             return Err(Error::Invariant(
                 "entries made durable before their snapshot",
@@ -542,21 +561,24 @@ impl<S: Storage> Log<S> {
         self.unstable.offset = index.saturating_add(1);
         // Given up, and not emptied: a member that rests holds what it
         // held before it was written to.
-        self.unstable.entries = Vec::new();
         self.unstable.bytes = 0;
         self.unstable.payload = 0;
-        Ok(())
+        Ok(std::mem::take(&mut self.unstable.entries))
     }
     /// The snapshot at `index` is handed to storage.
     pub fn stable_snapshot(&mut self, index: u64) -> Result<()> {
-        match &self.unstable.snapshot {
-            Some(snapshot) if proto::snapshot_index(snapshot) == index => {
-                self.unstable.snapshot = None;
-                Ok(())
+        self.take_stable_snapshot(index).map(drop)
+    }
+    /// As [`Log::stable_snapshot`], giving the snapshot up to the caller.
+    pub fn take_stable_snapshot(&mut self, index: u64) -> Result<Snapshot> {
+        match self.unstable.snapshot.take() {
+            Some(snapshot) if proto::snapshot_index(&snapshot) == index => Ok(snapshot),
+            held => {
+                self.unstable.snapshot = held;
+                Err(Error::Invariant(
+                    "the snapshot made durable is not the one given",
+                ))
             }
-            _ => Err(Error::Invariant(
-                "the snapshot made durable is not the one given",
-            )),
         }
     }
     /// Appends a copy of `entries` after what is committed, replacing what
@@ -619,6 +641,56 @@ impl<S: Storage> Log<S> {
         } else {
             Ok(Vec::new())
         }
+    }
+    /// The entries after `since` that are committed and durable, as the
+    /// range of them storage holds: the page [`Log::next_entries_since`]
+    /// gives, chosen by the same rule (the longest prefix whose encoding fits
+    /// `max_bytes`, and one at least) and copied nowhere. With it, the bytes
+    /// of the data of those entries above `above`, which a leader counts
+    /// uncommitted until they are given to apply. None when there are none.
+    ///
+    /// Entries committed and durable are always in storage: `persisted` is
+    /// below the first entry not yet durable whatever replaced what, so what
+    /// is given to apply is read where storage holds it.
+    pub fn next_range_since(
+        &self,
+        since: u64,
+        max_bytes: u64,
+        above: u64,
+    ) -> Result<Option<CommittedRange>> {
+        let offset = since.saturating_add(1).max(self.first_index()?);
+        let high = self.apply_bound().saturating_add(1);
+        if high <= offset {
+            return Ok(None);
+        }
+        if high > self.unstable.offset {
+            return Err(Error::Invariant("committed entries not yet durable"));
+        }
+        let mut taken = 0u64;
+        let mut bytes = 0u64;
+        let mut data_above = 0usize;
+        self.store.any_entry(offset, high, &mut |entry| {
+            let next = bytes.saturating_add(proto::encoded_bytes(entry));
+            if taken > 0 && max_bytes != u64::MAX && next > max_bytes {
+                return true;
+            }
+            bytes = next;
+            taken = taken.saturating_add(1);
+            if entry.index > above {
+                data_above = data_above.saturating_add(entry.data.len());
+            }
+            false
+        })?;
+        let last = offset
+            .checked_add(taken)
+            .and_then(|end| end.checked_sub(1))
+            .filter(|last| *last >= offset)
+            .ok_or(Error::Invariant("storage held none of what is committed"))?;
+        Ok(Some(CommittedRange {
+            first: offset,
+            last,
+            data_above,
+        }))
     }
     /// A copy of a snapshot at `request_index` or later for the member `to`:
     /// the one not yet durable if it is late enough, else storage's.
@@ -1372,6 +1444,50 @@ pub(crate) mod tests {
         // What follows an oversized stable entry is left for the next page.
         assert_eq!(indexes(&log.slice(2, 5, one).unwrap()), vec![(2, 1)]);
         assert_eq!(indexes(&log.slice(2, 5, 2 * one).unwrap()), vec![(2, 1)]);
+    }
+    /// What is given to apply in place is the range of the page copies would
+    /// give, at every bound, with the data bytes above any index counted.
+    #[test]
+    fn a_range_given_to_apply_is_the_page_copies_would_give() {
+        let sized = |index: u64| Entry {
+            index,
+            term: 1,
+            data: vec![3; (index as usize % 5) * 700],
+            ..Entry::default()
+        };
+        let mut store = Memory::default();
+        store.append(&(1..=12).map(sized).collect::<Vec<_>>());
+        let mut log = Log::new(store, 1024).unwrap();
+        log.commit_to(10).unwrap();
+        let one = proto::encoded_bytes(&sized(4));
+        for since in [0, 1, 5, 9, 10] {
+            for max in [0, 1, one - 1, one, 2 * one, 3 * one + 5, u64::MAX] {
+                let copies = log.next_entries_since(since, max).unwrap();
+                let range = log.next_range_since(since, max, 6).unwrap();
+                match (copies.first(), copies.last(), range) {
+                    (None, None, None) => {}
+                    (Some(first), Some(last), Some(range)) => {
+                        assert_eq!((range.first, range.last), (first.index, last.index));
+                        let above: usize = copies
+                            .iter()
+                            .filter(|entry| entry.index > 6)
+                            .map(|entry| entry.data.len())
+                            .sum();
+                        assert_eq!(range.data_above, above, "{since} {max}");
+                    }
+                    other => panic!("{since} {max}: {other:?}"),
+                }
+            }
+        }
+        // What is committed and not yet durable is never given in place.
+        log.append(&[entry(13, 1)]).unwrap();
+        log.commit_to(13).unwrap();
+        assert_eq!(
+            log.next_range_since(10, u64::MAX, 0)
+                .unwrap()
+                .map(|r| r.last),
+            Some(12)
+        );
     }
     #[test]
     fn a_rejection_names_where_the_logs_may_still_agree() {

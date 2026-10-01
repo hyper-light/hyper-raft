@@ -496,6 +496,7 @@ dependencies = [
  "bytes",
  "fastbloom",
  "hex-literal",
+ "hyper-tls",
  "lazy_static",
  "lru-slab",
  "qlog",
@@ -503,7 +504,6 @@ dependencies = [
  "rand_pcg",
  "rcgen",
  "rustc-hash",
- "rustls",
  "slab",
  "thiserror",
  "tinyvec",
@@ -945,20 +945,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "faf0c4a6ece9950b9abdb62b1cfcf2a68b3b67a10ba445b3bb85be2a293d0632"
 dependencies = [
  "nom",
-]
-
-[[package]]
-name = "rustls"
-version = "0.23.45"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0d41d731c7d2f962d1ccc364cec258de3c0e93b38c2fb3ba97ac74513048d634"
-dependencies = [
- "aws-lc-rs",
- "once_cell",
- "rustls-pki-types",
- "rustls-webpki",
- "subtle",
- "zeroize",
 ]
 
 [[package]]

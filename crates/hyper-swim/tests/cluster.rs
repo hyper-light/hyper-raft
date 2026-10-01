@@ -30,8 +30,8 @@ use std::time::{Duration, Instant};
 use hyper_datagram::{AdmitAll, ExporterSecret, Plane, PlaneLimits, Role, SECRET_BYTES};
 use hyper_swim::HostId;
 use hyper_swim::codec::{Coordinate, GossipBatch, SwimMessage};
-use hyper_swim::detector::{Detector, DetectorTiming};
-use hyper_swim::membership::Liveness;
+use hyper_swim::detector::{Detector, DetectorTiming, PingReq};
+use hyper_swim::membership::{Liveness, MemberState};
 
 /// Members in the test cluster.
 const NODES: u64 = 4;
@@ -52,6 +52,9 @@ const TIMING: DetectorTiming = DetectorTiming {
 };
 /// Gossip entries piggybacked per message.
 const GOSSIP_PER_MESSAGE: usize = 8;
+/// Members asked to probe a target that did not answer directly (SWIM §4.1's k): every other
+/// member, which in a cluster this small is every relay there is.
+const INDIRECT_FANOUT: usize = NODES as usize;
 /// The longest a member may take, after the victim dies, to report it dead, in periods:
 /// - a round to probe it (`NODES`);
 /// - the widest suspicion window (`suspicion_periods × (health_max + 1)`);
@@ -95,7 +98,7 @@ fn member_process() {
         .split(',')
         .map(|port| port.parse().unwrap())
         .collect();
-    let address = |id: u64| format!("127.0.0.1:{}", ports[(id - 1) as usize]);
+    let address = move |id: u64| format!("127.0.0.1:{}", ports[(id - 1) as usize]);
     let socket = UdpSocket::bind(address(me)).unwrap();
 
     let limits = PlaneLimits {
@@ -126,82 +129,218 @@ fn member_process() {
     let mut start = String::new();
     std::io::stdin().read_line(&mut start).unwrap();
 
-    let boot_nonce = me;
-    let mut nonce = 0u64;
-    let mut buffer = vec![0u8; 2_048];
-    // The gossip batch and the encoded message, reused every period as a member's driver does.
-    let mut batch = Vec::new();
-    let mut encoded = Vec::new();
+    let mut member = Member {
+        me,
+        socket,
+        plane,
+        detector,
+        address: Box::new(address),
+        nonce: 0,
+        buffer: vec![0u8; 2_048],
+        batch: Vec::new(),
+        encoded: Vec::new(),
+        requests: Vec::new(),
+        relaying: BTreeMap::new(),
+    };
+    let mut due = Instant::now();
     for period in 0..RUN_PERIODS {
-        let deadline = Instant::now() + PERIOD;
-        if let Some(ping) = detector.tick() {
-            nonce += 1;
-            detector.ping_gossip_into(ping.to, GOSSIP_PER_MESSAGE, &mut batch);
-            let message = SwimMessage::Ping {
-                from: HostId(me),
-                nonce,
-                boot_nonce,
-                configuration_version: 0,
-                gossip: GossipBatch::Entries(&batch),
-            };
-            message.encode_into(&mut encoded);
-            plane.queue(ping.to.0, &encoded).unwrap();
-        }
-        flush(&mut plane, &socket, &address);
-        while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
-            if remaining.is_zero() {
-                break;
-            }
-            socket.set_read_timeout(Some(remaining)).unwrap();
-            let Ok((length, _)) = socket.recv_from(&mut buffer) else {
-                break;
-            };
-            let Ok(opened) = plane.open(&mut buffer[..length], &AdmitAll) else {
-                continue;
-            };
-            // The messages borrow the datagram, not the plane, so acknowledgements queue as they
-            // are read.
-            for bytes in opened.messages() {
-                match SwimMessage::decode(bytes).unwrap() {
-                    SwimMessage::Ping {
-                        from,
-                        nonce,
-                        gossip,
-                        ..
-                    } => {
-                        detector.apply_gossip_from(from, gossip);
-                        detector.gossip_into(GOSSIP_PER_MESSAGE, &mut batch);
-                        let ack = SwimMessage::Ack {
-                            from: HostId(me),
-                            nonce,
-                            boot_nonce,
-                            configuration_version: 0,
-                            standing: None,
-                            gossip: GossipBatch::Entries(&batch),
-                            coordinate: Coordinate::Held(detector.coordinate()),
-                        };
-                        ack.encode_into(&mut encoded);
-                        let _ = plane.queue(from.0, &encoded);
-                    }
-                    SwimMessage::Ack { from, gossip, .. } => {
-                        detector.apply_gossip_from(from, gossip);
-                        detector.on_ack(from);
-                    }
-                    _ => {}
-                }
-            }
-            flush(&mut plane, &socket, &address);
-        }
+        // The member's own lag: how late this period began against when it was due, as a
+        // starved process's would be (node.md §3.5); the detector dilates its suspicion by it.
+        let began = Instant::now();
+        member.detector.observe_self_lag(
+            u64::try_from(began.saturating_duration_since(due).as_nanos()).unwrap(),
+            u64::try_from(PERIOD.as_nanos()).unwrap(),
+        );
+        let deadline = began + PERIOD;
+        due = deadline;
+        member.probe();
+        // SWIM §4.1: a probe unanswered by half the period is retried through other members.
+        member.receive_until(deadline - PERIOD / 2);
+        member.probe_indirectly();
+        member.receive_until(deadline);
         let view: String = (1..=NODES)
             .filter(|peer| *peer != me)
             .map(|peer| {
-                let state = detector.membership().state(HostId(peer)).unwrap();
+                let state = member.detector.membership().state(HostId(peer)).unwrap();
                 format!("{peer}{}", liveness_letter(state.liveness))
             })
             .collect::<Vec<_>>()
             .join(" ");
         writeln!(stdout, "{me} {period} {view}").unwrap();
         stdout.flush().unwrap();
+    }
+}
+
+/// One member's driver: its socket, plane and detector, and the probes it relays.
+struct Member {
+    me: u64,
+    socket: UdpSocket,
+    plane: Plane,
+    detector: Detector,
+    address: Box<dyn Fn(u64) -> String>,
+    nonce: u64,
+    buffer: Vec<u8>,
+    batch: Vec<(HostId, MemberState)>,
+    encoded: Vec<u8>,
+    requests: Vec<PingReq>,
+    /// Probes this member makes for others: the target, and who asked with which nonce. One
+    /// a target, so bounded by the membership.
+    relaying: BTreeMap<u64, (HostId, u64)>,
+}
+
+impl Member {
+    fn send(&mut self, to: u64, message: &SwimMessage<'_>) {
+        message.encode_into(&mut self.encoded);
+        let _ = self.plane.queue(to, &self.encoded);
+    }
+
+    /// The period's direct probe.
+    fn probe(&mut self) {
+        if let Some(ping) = self.detector.tick() {
+            self.nonce += 1;
+            let mut batch = std::mem::take(&mut self.batch);
+            self.detector
+                .ping_gossip_into(ping.to, GOSSIP_PER_MESSAGE, &mut batch);
+            self.send(
+                ping.to.0,
+                &SwimMessage::Ping {
+                    from: HostId(self.me),
+                    nonce: self.nonce,
+                    boot_nonce: self.me,
+                    configuration_version: 0,
+                    gossip: GossipBatch::Entries(&batch),
+                },
+            );
+            self.batch = batch;
+        }
+        flush(&mut self.plane, &self.socket, &*self.address);
+    }
+
+    /// Asks every other member to probe a target that has not answered.
+    fn probe_indirectly(&mut self) {
+        let mut requests = std::mem::take(&mut self.requests);
+        self.detector
+            .request_indirect_into(INDIRECT_FANOUT, &mut requests);
+        for request in &requests {
+            self.send(
+                request.relay.0,
+                &SwimMessage::PingReq {
+                    from: HostId(self.me),
+                    target: request.target,
+                    nonce: self.nonce,
+                    gossip: GossipBatch::Entries(&[]),
+                },
+            );
+        }
+        self.requests = requests;
+        flush(&mut self.plane, &self.socket, &*self.address);
+    }
+
+    /// Reads and answers until `until`. Only the timeout ends it: any other error (Windows
+    /// reports a reset on the next receive after a send to a closed port) skips that datagram.
+    fn receive_until(&mut self, until: Instant) {
+        while let Some(remaining) = until.checked_duration_since(Instant::now()) {
+            if remaining.is_zero() {
+                break;
+            }
+            self.socket.set_read_timeout(Some(remaining)).unwrap();
+            let length = match self.socket.recv_from(&mut self.buffer) {
+                Ok((length, _)) => length,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    break;
+                }
+                Err(_) => continue,
+            };
+            let mut buffer = std::mem::take(&mut self.buffer);
+            if let Ok(opened) = self.plane.open(&mut buffer[..length], &AdmitAll) {
+                // The messages borrow the datagram, not the plane, so answers queue as they are
+                // read.
+                for bytes in opened.messages() {
+                    self.handle(SwimMessage::decode(bytes).unwrap());
+                }
+            }
+            self.buffer = buffer;
+            flush(&mut self.plane, &self.socket, &*self.address);
+        }
+    }
+
+    fn handle(&mut self, message: SwimMessage<'_>) {
+        match message {
+            SwimMessage::Ping {
+                from,
+                nonce,
+                gossip,
+                ..
+            } => {
+                self.detector.apply_gossip_from(from, gossip);
+                let mut batch = std::mem::take(&mut self.batch);
+                self.detector.gossip_into(GOSSIP_PER_MESSAGE, &mut batch);
+                let coordinate = self.detector.coordinate().clone();
+                self.send(
+                    from.0,
+                    &SwimMessage::Ack {
+                        from: HostId(self.me),
+                        nonce,
+                        boot_nonce: self.me,
+                        configuration_version: 0,
+                        standing: None,
+                        gossip: GossipBatch::Entries(&batch),
+                        coordinate: Coordinate::Held(&coordinate),
+                    },
+                );
+                self.batch = batch;
+            }
+            SwimMessage::Ack { from, gossip, .. } => {
+                self.detector.apply_gossip_from(from, gossip);
+                // An answer to a probe made for another member goes back to it.
+                if let Some((asker, nonce)) = self.relaying.remove(&from.0) {
+                    self.send(
+                        asker.0,
+                        &SwimMessage::IndirectAck {
+                            from: HostId(self.me),
+                            target: from,
+                            nonce,
+                            boot_nonce: self.me,
+                            gossip: GossipBatch::Entries(&[]),
+                        },
+                    );
+                }
+                self.detector.on_ack(from);
+            }
+            SwimMessage::PingReq {
+                from,
+                target,
+                nonce,
+                gossip,
+            } => {
+                self.detector.apply_gossip_from(from, gossip);
+                self.relaying.insert(target.0, (from, nonce));
+                self.send(
+                    target.0,
+                    &SwimMessage::Ping {
+                        from: HostId(self.me),
+                        nonce,
+                        boot_nonce: self.me,
+                        configuration_version: 0,
+                        gossip: GossipBatch::Entries(&[]),
+                    },
+                );
+            }
+            SwimMessage::IndirectAck {
+                target,
+                gossip,
+                from,
+                ..
+            } => {
+                self.detector.apply_gossip_from(from, gossip);
+                self.detector.on_indirect_ack(target);
+            }
+        }
     }
 }
 

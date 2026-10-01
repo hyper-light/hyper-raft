@@ -517,48 +517,65 @@ impl Server {
         node: &mut Node<C>,
     ) {
         while let Some(event) = node.poll_event() {
-            match event {
-                Event::Request {
+            self.on_event(node, event);
+        }
+        self.advance_all(node);
+    }
+
+    /// Handles one event of `node`; [`Server::advance_all`] then moves the exchanges on.
+    pub fn on_event<C: Classes<Kind = Kind, Class = Class, Role = Role>>(
+        &mut self,
+        node: &mut Node<C>,
+        event: Event<C>,
+    ) {
+        match event {
+            Event::Request {
+                exchange,
+                class,
+                body,
+                ..
+            } => {
+                let head = node.head(exchange).unwrap();
+                let seed = u64::from(head.first().copied().unwrap_or(0));
+                if seed == u64::from(RELEASE) {
+                    self.hold_bulk = false;
+                }
+                self.served.push(Served {
                     exchange,
                     class,
-                    body,
-                    ..
-                } => {
-                    let head = node.head(exchange).unwrap();
-                    let seed = u64::from(head.first().copied().unwrap_or(0));
-                    if seed == u64::from(RELEASE) {
-                        self.hold_bulk = false;
-                    }
-                    self.served.push(Served {
-                        exchange,
-                        class,
-                        seed,
-                        read: 0,
-                        body: body.unwrap_or(0),
-                        replied: false,
-                        written: 0,
-                        reply: body.unwrap_or(0),
-                    });
-                }
-                Event::Frame {
-                    peer, lane, frame, ..
-                } => {
-                    self.frames.push((peer, lane, frame.bytes().to_vec()));
-                    node.release(frame);
-                }
-                Event::Connected { peer, .. } => self.connected.push(peer),
-                Event::Closed { peer, .. } => self.closed.push(peer),
-                Event::Refused {
-                    exchange,
-                    refusal,
-                    by_peer,
-                } => {
-                    self.refused.push((refusal, by_peer));
-                    self.served.retain(|served| served.exchange != exchange);
-                }
-                _ => {}
+                    seed,
+                    read: 0,
+                    body: body.unwrap_or(0),
+                    replied: false,
+                    written: 0,
+                    reply: body.unwrap_or(0),
+                });
             }
+            Event::Frame {
+                peer, lane, frame, ..
+            } => {
+                self.frames.push((peer, lane, frame.bytes().to_vec()));
+                node.release(frame);
+            }
+            Event::Connected { peer, .. } => self.connected.push(peer),
+            Event::Closed { peer, .. } => self.closed.push(peer),
+            Event::Refused {
+                exchange,
+                refusal,
+                by_peer,
+            } => {
+                self.refused.push((refusal, by_peer));
+                self.served.retain(|served| served.exchange != exchange);
+            }
+            _ => {}
         }
+    }
+
+    /// Moves every exchange as far as it goes.
+    pub fn advance_all<C: Classes<Kind = Kind, Class = Class, Role = Role>>(
+        &mut self,
+        node: &mut Node<C>,
+    ) {
         let mut served = std::mem::take(&mut self.served);
         served.retain_mut(|exchange| !self.advance(node, exchange));
         self.served = served;
@@ -708,45 +725,62 @@ impl Asker {
         node: &mut Node<C>,
     ) {
         while let Some(event) = node.poll_event() {
-            self.events.push(format!("{event:?}"));
-            match event {
-                Event::Reply { exchange, body } => {
-                    if let Some(asked) = self
-                        .asked
-                        .iter_mut()
-                        .find(|asked| asked.exchange == exchange)
-                    {
-                        asked.reply = Some(body.unwrap_or(0));
-                        asked.answered = Some(self.clock);
-                        let mut head = b"ok:".to_vec();
-                        head.extend_from_slice(&asked.head);
-                        assert_eq!(node.head(exchange), Some(&head[..]), "the reply's head");
-                    }
-                }
-                Event::Refused {
-                    exchange,
-                    refusal,
-                    by_peer,
-                } => {
-                    if let Some(asked) = self
-                        .asked
-                        .iter_mut()
-                        .find(|asked| asked.exchange == exchange)
-                    {
-                        asked.refused = Some((refusal, by_peer));
-                        asked.done = true;
-                    }
-                }
-                Event::Connected { peer, .. } => self.connected.push(peer),
-                Event::Unreachable { peer } => self.unreachable.push(peer),
-                Event::Frame { lane, frame, .. } => {
-                    self.frames.push((lane, frame.bytes().to_vec()));
-                    node.release(frame);
-                }
-                Event::Closed { peer, .. } => self.closed.push(peer),
-                _ => {}
-            }
+            self.on_event(node, event);
         }
+        self.advance_all(node);
+    }
+
+    /// Handles one event of `node`; [`Asker::advance_all`] then moves the exchanges on.
+    pub fn on_event<C: Classes<Kind = Kind, Class = Class, Role = Role>>(
+        &mut self,
+        node: &mut Node<C>,
+        event: Event<C>,
+    ) {
+        self.events.push(format!("{event:?}"));
+        match event {
+            Event::Reply { exchange, body } => {
+                if let Some(asked) = self
+                    .asked
+                    .iter_mut()
+                    .find(|asked| asked.exchange == exchange)
+                {
+                    asked.reply = Some(body.unwrap_or(0));
+                    asked.answered = Some(self.clock);
+                    let mut head = b"ok:".to_vec();
+                    head.extend_from_slice(&asked.head);
+                    assert_eq!(node.head(exchange), Some(&head[..]), "the reply's head");
+                }
+            }
+            Event::Refused {
+                exchange,
+                refusal,
+                by_peer,
+            } => {
+                if let Some(asked) = self
+                    .asked
+                    .iter_mut()
+                    .find(|asked| asked.exchange == exchange)
+                {
+                    asked.refused = Some((refusal, by_peer));
+                    asked.done = true;
+                }
+            }
+            Event::Connected { peer, .. } => self.connected.push(peer),
+            Event::Unreachable { peer } => self.unreachable.push(peer),
+            Event::Frame { lane, frame, .. } => {
+                self.frames.push((lane, frame.bytes().to_vec()));
+                node.release(frame);
+            }
+            Event::Closed { peer, .. } => self.closed.push(peer),
+            _ => {}
+        }
+    }
+
+    /// Moves every exchange as far as it goes.
+    pub fn advance_all<C: Classes<Kind = Kind, Class = Class, Role = Role>>(
+        &mut self,
+        node: &mut Node<C>,
+    ) {
         for at in 0..self.asked.len() {
             self.advance(node, at);
         }

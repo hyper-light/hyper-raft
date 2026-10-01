@@ -239,6 +239,9 @@ dependencies = [
 [[package]]
 name = "hyper-swim"
 version = "0.1.0"
+dependencies = [
+ "hyper-datagram",
+]
 
 [[package]]
 name = "hyper-timing"

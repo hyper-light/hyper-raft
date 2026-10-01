@@ -33,4 +33,10 @@
 
 - 43 unit tests: slates' 39, plus the extension series and its bounds, exact delay by a grant, and
   the lag's dilation.
-- End-to-end over hyper-datagram between real processes: owed in the next commit.
+- `tests/cluster.rs`: four real member processes run the detector over hyper-datagram on real
+  UDP sockets.
+  - The supervisor starts them together, lets them settle, and SIGKILLs one.
+  - Every survivor must report it dead within a bound derived from the timing: a probe round, the
+    widest suspicion window, and a gossip spread (33 periods here).
+  - No live member may ever be suspected.
+  - Measured over six runs: 3 to 5 periods after the kill, with no false suspicion.

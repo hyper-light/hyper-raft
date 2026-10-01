@@ -9,3 +9,6 @@ rust-version.workspace = true
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+hyper-datagram = { path = "../hyper-datagram" }

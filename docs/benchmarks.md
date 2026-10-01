@@ -408,6 +408,10 @@ ok partition: leader 3 of 5 cut off; at once it answered a read with Some(NotLea
 ok all-killed: every member killed after 50 answered writes and restarted on its log; 3 leads in term 2; 50 writes read back; all applied index 52 alike [2.8 s]
 ```
 
+The workspace's tests, these scenarios included, also pass on Linux (aarch64, in Docker on this
+machine, `rust:1.98.0`, `fdatasync` on the VM's file system; the tick came out at 36 ms). They
+have not been run on Windows here; CI runs the gates on all six targets.
+
 `tests/wal.rs` covers the log's torn-tail cut, its refusal of a damaged record that is not the
 last, and its bound; `tests/wire.rs` covers damaged and cut datagrams. One group at a time runs,
 at most five member processes of one thread each, and the test itself is one thread

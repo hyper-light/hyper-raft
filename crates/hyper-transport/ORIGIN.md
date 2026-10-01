@@ -65,5 +65,11 @@ source: its credit law (`flow.rs`, `connection.rs`) is taken here. Neither repos
 - **Strict priority where credit is taken.** quinn orders what is buffered by stream priority, but
   connection credit is charged when an application writes. An owner that wrote its bulk body first
   starved its own requests of credit: the end-to-end run found request bodies stalled behind an 8 MiB
-  bulk body (`tests/e2e.rs` `exchanges`). A class now takes no credit while a more urgent class on the
-  connection has bytes waiting for it (`Core::demand_above`).
+  bulk body (`tests/e2e.rs` `exchanges`). The first rule counted a more urgent exchange as waiting
+  only once its owner had been refused a write, so an owner that wrote bulk first still let the bulk
+  body take a whole window before its requests took a byte (30,332 bytes in
+  `requests_behind_a_bulk_body_take_credit_first_from_a_slow_owner`). A class now takes only the
+  credit left after the bytes every more urgent class has declared and not sent (`Core::demand_above`).
+- **This side's delays are not the peer's.** A period in which an exchange's own owner offered
+  nothing the peer would take, or a more urgent class of this side took the credit, is held rather
+  than judged (`Core::ours_to_move`; `an_owner_late_to_write_is_not_refused_by_its_own_side`).

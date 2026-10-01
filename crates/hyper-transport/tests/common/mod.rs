@@ -385,6 +385,24 @@ impl<A: Drive, B: Drive> Net<A, B> {
         true
     }
 
+    /// Moves the clock to the earliest timer of either side, or by `most` if that comes first: an
+    /// owner that acts at least every `most` sees time pass no faster than that.
+    pub fn advance_within(&mut self, most: Duration) {
+        let next = [
+            self.a.timeout(),
+            if self.b_dead { None } else { self.b.timeout() },
+        ]
+        .into_iter()
+        .flatten()
+        .min()
+        .map_or(self.now + most, |next| next.min(self.now + most));
+        self.now = self.now.max(next);
+        self.a.fire(self.now);
+        if !self.b_dead {
+            self.b.fire(self.now);
+        }
+    }
+
     /// Runs the network until `done` holds, exchanging datagrams and firing timers; `done` is
     /// asked after every exchange, so it can poll events and act on them. Panics after `turns`
     /// turns of the clock: a test's bound on a protocol that did not end.

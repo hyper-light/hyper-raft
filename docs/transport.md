@@ -210,15 +210,17 @@ and head), the head, and an optional body ended by its CRC-32C. The receiver che
 against its own class bound and head bound before reserving the head from the budget and reading
 it; bodies are read only into the owner's reservations, so QUIC's flow control holds the sender.
 The class comes from the kind and the sender's role. A class leaves one packet's stream bytes of the
-peer's connection credit for each class above it (slates' reserve), and takes no credit while a more
-urgent class on the connection is waiting for it (strict priority at the point credit is taken,
-which the end-to-end run showed quinn's send-order priority alone does not give). The receive window
+peer's connection credit for each class above it (slates' reserve), and takes only the credit left
+after every more urgent class on the connection has what it declared and not yet sent, offered by
+its owner or not (strict priority at the point credit is taken, which the end-to-end run showed
+quinn's send-order priority alone does not give). The receive window
 starts at RFC 9002's initial window plus the reserve and doubles when consumed within two round
 trips (Chromium's rule; a round trip under the 1 ms timer granularity counts as 1 ms), each growth
 reserved from the budget; the stream window is quinn's assembler limit made explicit (patch Q5).
 Exchanges are judged by progress-charged deadlines (T39); a period's sent bytes count only if the
-peer was heard in it, so probes sent to a dead peer do not keep its exchanges alive, and an owner that
-is not reading a body is not charged for it. Replication frames travel on lanes, unidirectional streams as wide as the core's
+peer was heard in it, so probes sent to a dead peer do not keep its exchanges alive; and a period
+that moved nothing through this side's own doing (an owner not reading a body, or bytes the peer's
+credit would take but this side has not sent) is no evidence against the peer and is not judged. Replication frames travel on lanes, unidirectional streams as wide as the core's
 window, always read; a frame its class or the budget cannot take is skipped and counted. Admission
 bounds pending handshakes (Retry under load), identities, connections per identity (the one used
 longest ago replaced) and connections in all; every exchange and lane has a table bound. Every

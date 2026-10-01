@@ -1505,35 +1505,46 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
         }
     }
 
-    /// Whether an exchange or a lane of a class more urgent than `rank` has bytes waiting for
-    /// credit on `conn`: strict priority among classes (T15) is kept where the credit is taken,
-    /// not only where QUIC orders what is buffered, so a lower class never takes credit a higher
-    /// one is waiting for.
-    fn demand_above(&self, conn: &Conn<C::Role>, rank: u8) -> bool {
+    /// The bytes that exchanges and lanes of classes more urgent than `rank` on `conn` still have
+    /// to send: what they declared and have not written, whether or not their owner has offered
+    /// it yet. Strict priority among classes (T15) is kept where the credit is taken, not only
+    /// where QUIC orders what is buffered: a lower class takes only the credit these leave. An
+    /// earlier rule counted a more urgent exchange as waiting only once its owner had been refused
+    /// a write, so an owner that wrote its bulk body first took the credit its requests were about
+    /// to need (`requests_behind_a_bulk_body_take_credit_first_from_a_slow_owner`).
+    fn demand_above(&self, conn: &Conn<C::Role>, rank: u8) -> u64 {
         let exchanges = conn
             .exchanges
             .iter()
             .filter_map(|id| self.exchanges.get(*id))
-            .any(|exchange| {
-                let waiting =
-                    exchange.wants_write || matches!(exchange.out.state, Out::Head | Out::Trailer);
-                exchange.rank < rank && exchange.stream.is_some() && waiting
+            .filter(|exchange| exchange.rank < rank && exchange.stream.is_some())
+            .fold(0u64, |sum, exchange| {
+                sum.saturating_add(exchange.out.pending())
             });
-        let lanes = conn
-            .lanes_out
+        conn.lanes_out
             .iter()
-            .any(|lane| lane.queue.front().is_some_and(|(front, _)| *front < rank));
-        exchanges || lanes
+            .flat_map(|lane| {
+                let written = lane.written;
+                lane.queue
+                    .iter()
+                    .enumerate()
+                    .map(move |(at, (front, frame))| {
+                        let unsent = if at == 0 {
+                            frame.bytes().len().saturating_sub(written)
+                        } else {
+                            frame.bytes().len()
+                        };
+                        if *front < rank { length(unsent) } else { 0 }
+                    })
+            })
+            .fold(exchanges, u64::saturating_add)
     }
 
-    /// The credit a class of `rank` may take on `conn` now: none while a more urgent class waits,
-    /// and otherwise what QUIC would take less the reserve for the classes above.
+    /// The credit a class of `rank` may take on `conn` now: what QUIC would take, less the reserve
+    /// for the classes above and less what those classes still have to send.
     fn allowed(&self, conn: &mut Conn<C::Role>, rank: u8) -> u64 {
-        if self.demand_above(conn, rank) {
-            0
-        } else {
-            credit(&mut conn.quic, rank)
-        }
+        let demand = self.demand_above(conn, rank);
+        credit(&mut conn.quic, rank).saturating_sub(demand)
     }
 
     fn rank_of(&self, id: u64) -> u8 {
@@ -1768,8 +1779,11 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
         let held = self.held(conn);
         let at = moved(&conn.quic);
         let rtt = conn.quic.rtt();
+        // What the peer's credit would take of this exchange's class now, before this side's own
+        // classes are served: none means the peer is not taking what the exchange has to send.
+        let peer_takes = credit(&mut conn.quic, self.rank_of(id));
         let judged = self.exchanges.get_mut(id).map_or(Ok(()), |exchange| {
-            if exchange.incoming.state == In::Body && !exchange.starved {
+            if Self::ours_to_move(exchange, peer_takes) {
                 exchange.carry.hold(now, at);
                 return Ok(());
             }
@@ -1778,6 +1792,18 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
         if let Err(refusal) = judged {
             self.finish_exchange(conn, id, Some((refusal, false)));
         }
+    }
+
+    /// Whether a period that moved nothing for `exchange` is this side's doing, not the peer's,
+    /// and so no evidence against the peer: its owner is not reading the body it is answered with,
+    /// or it has bytes to send that the peer's credit would take (`peer_takes`) and this side has
+    /// not sent, because its owner has not offered them or a more urgent class of this side's
+    /// took the credit first. Only a peer that stops taking or answering ends an exchange.
+    fn ours_to_move(exchange: &Exchange<C::Class>, peer_takes: u64) -> bool {
+        let unread = exchange.incoming.state == In::Body && !exchange.starved;
+        let sending = matches!(exchange.out.state, Out::Head | Out::Body | Out::Trailer);
+        let unsent = sending && exchange.stream.is_some() && peer_takes > 0;
+        unread || unsent
     }
 
     /// Grow the receive window if the owner consumed a whole one within two round trips and the

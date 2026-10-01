@@ -655,3 +655,210 @@ fn an_identity_past_its_bound_replaces_its_connection_used_least() {
     );
     drop(first);
 }
+
+/// One exchange the slow owner below asked: what of its body it wrote, what of its reply it read.
+struct Slow {
+    exchange: hyper_transport::ExchangeId,
+    seed: u8,
+    body: u64,
+    written: u64,
+    replied: bool,
+    read: u64,
+    done: bool,
+    refused: Option<(Refusal, bool)>,
+}
+
+impl Slow {
+    fn open(net: &mut Net<Node<Mantle>, Node<Mantle>>, kind: Kind, seed: u8, body: u64) -> Self {
+        let progress = hyper_transport::Progress::new(PERIOD).unwrap();
+        let exchange = net
+            .a
+            .open(net.now, 2, kind, &[seed, 1, 2, 3], Some(body), progress)
+            .unwrap();
+        Self {
+            exchange,
+            seed,
+            body,
+            written: 0,
+            replied: false,
+            read: 0,
+            done: false,
+            refused: None,
+        }
+    }
+    /// Writes as much of the body as the endpoint takes now.
+    fn write(&mut self, node: &mut Node<Mantle>, piece: &mut [u8]) {
+        while !self.done && self.written < self.body {
+            let length = (self.body - self.written).min(piece.len() as u64) as usize;
+            fill(u64::from(self.seed), self.written, &mut piece[..length]);
+            match node.write_body(self.exchange, &piece[..length]) {
+                Ok(0) | Err(_) => return,
+                Ok(took) => self.written += took as u64,
+            }
+        }
+    }
+    /// Reads what of the reply has arrived; ends the exchange once it is whole.
+    fn read(&mut self, node: &mut Node<Mantle>) {
+        if self.done || !self.replied {
+            return;
+        }
+        while self.read < self.body {
+            let mut into = node.reserve(Class::Request, PIECE as u64).unwrap();
+            let got = node.read_body(self.exchange, &mut into);
+            node.release(into);
+            match got {
+                Ok(0) | Err(_) => break,
+                Ok(got) => self.read += got as u64,
+            }
+        }
+        if self.read == self.body && node.body_complete(self.exchange) && self.written == self.body
+        {
+            node.end(self.exchange);
+            self.done = true;
+        }
+    }
+}
+
+/// Strict priority where credit is taken (T15), with an owner that is slow to write: requests
+/// opened behind a bulk body in flight, on a connection whose window cannot grow past what they
+/// need, take the credit before the bulk body takes any, although the owner writes the bulk body
+/// first at every turn and reaches the requests only every eighth turn or once 100 ms have passed;
+/// and none of the exchanges is refused as stalled while the peer lives. Seen first in hyper-tokio's
+/// first harness, where seven requests sat at no byte written for a period while an 8 MiB bulk
+/// body completed. The earlier rule counted a request as waiting for credit only once its owner had
+/// been refused a write, so the bulk body took the window's credit first.
+#[test]
+fn requests_behind_a_bulk_body_take_credit_first_from_a_slow_owner() {
+    const REQUESTS: u8 = 7;
+    /// How late the owner may be in reaching the requests, well inside the 2 s period.
+    const LATE: Duration = Duration::from_millis(100);
+    let pair = Pair::new();
+    let mut narrow = limits();
+    narrow.window_ceiling = 32 << 10;
+    let mut net = connected::<Mantle, Mantle>(&pair, narrow, 1 << 30);
+    let mut server = Server::new();
+    let mut piece = vec![0u8; PIECE];
+    let mut bulk = Slow::open(&mut net, Kind::Snapshot, 100, 8 << 20);
+    // The bulk body is in flight before the requests are asked.
+    while bulk.written < 256 << 10 {
+        bulk.write(&mut net.a, &mut piece);
+        net.exchange();
+        server.serve(&mut net.b);
+        if !net.exchange() {
+            net.advance();
+        }
+    }
+    let mut requests: Vec<Slow> = (0..REQUESTS)
+        .map(|seed| Slow::open(&mut net, Kind::Put, seed, 64 << 10))
+        .collect();
+    let opened_at = bulk.written;
+    // What the bulk body took before any request's body took a byte.
+    let mut bulk_first = None;
+    let mut visited = net.now;
+    for turn in 0..1_000_000u64 {
+        // The owner writes bulk first at every turn.
+        bulk.write(&mut net.a, &mut piece);
+        if turn % 8 == 0 || net.now - visited >= LATE {
+            visited = net.now;
+            for request in &mut requests {
+                request.write(&mut net.a, &mut piece);
+            }
+        }
+        if bulk_first.is_none() && requests.iter().any(|request| request.written > 0) {
+            bulk_first = Some(bulk.written - opened_at);
+        }
+        net.exchange();
+        server.serve(&mut net.b);
+        if !net.exchange() {
+            net.advance_within(LATE);
+        }
+        while let Some(event) = net.a.poll_event() {
+            match event {
+                Event::Reply { exchange, .. } => {
+                    for slow in requests.iter_mut().chain([&mut bulk]) {
+                        slow.replied |= slow.exchange == exchange;
+                    }
+                }
+                Event::Refused {
+                    exchange,
+                    refusal,
+                    by_peer,
+                } => {
+                    for slow in requests.iter_mut().chain([&mut bulk]) {
+                        if slow.exchange == exchange {
+                            slow.refused = Some((refusal, by_peer));
+                            slow.done = true;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        for request in &mut requests {
+            request.read(&mut net.a);
+        }
+        bulk.read(&mut net.a);
+        if bulk.done && requests.iter().all(|request| request.done) {
+            break;
+        }
+    }
+    for request in requests.iter().chain([&bulk]) {
+        assert_eq!(
+            request.refused, None,
+            "refused; the server saw {:?}",
+            server.refused
+        );
+        assert_eq!(request.read, request.body);
+    }
+    assert!(server.refused.is_empty(), "{:?}", server.refused);
+    assert_eq!(
+        bulk_first,
+        Some(0),
+        "the bulk body took credit before the requests"
+    );
+}
+
+/// A period in which an exchange's own owner offered nothing, while the peer would take it, is
+/// this side's doing and no evidence against the peer: the exchange is not refused as stalled by
+/// its own side. Here the owner writes a bulk body only three periods after opening it, and the
+/// peer, holding bulk bodies unread meanwhile, does not judge it either.
+#[test]
+fn an_owner_late_to_write_is_not_refused_by_its_own_side() {
+    let pair = Pair::new();
+    let mut net = connected::<Mantle, Mantle>(&pair, limits(), 1 << 30);
+    let mut server = Server::new();
+    server.hold_bulk = true;
+    let mut piece = vec![0u8; PIECE];
+    let mut bulk = Slow::open(&mut net, Kind::Snapshot, 9, 256 << 10);
+    let opened = net.now;
+    let mut refused = None;
+    let mut turns = 0u64;
+    while !bulk.done {
+        turns += 1;
+        assert!(turns < 1_000_000, "the exchange never ended");
+        if net.now - opened >= PERIOD * 3 {
+            server.hold_bulk = false;
+            bulk.write(&mut net.a, &mut piece);
+        }
+        net.exchange();
+        server.serve(&mut net.b);
+        if !net.exchange() {
+            net.advance_within(Duration::from_millis(100));
+        }
+        while let Some(event) = net.a.poll_event() {
+            match event {
+                Event::Reply { .. } => bulk.replied = true,
+                Event::Refused {
+                    refusal, by_peer, ..
+                } => {
+                    refused = Some((refusal, by_peer));
+                    bulk.done = true;
+                }
+                _ => {}
+            }
+        }
+        bulk.read(&mut net.a);
+    }
+    assert_eq!(refused, None, "the server saw {:?}", server.refused);
+    assert_eq!(bulk.read, bulk.body);
+}

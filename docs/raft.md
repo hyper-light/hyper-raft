@@ -38,7 +38,9 @@ It is Raft as Ongaro's thesis states it, with these extensions:
 - leader transfer;
 - an inflight window with conflict hints, bounded per member in messages and in bytes
   (`Config::max_inflight_bytes`, `RawNode::set_inflight_bytes`: what the owner says the path to
-  the member carries before it answers);
+  the member carries before it answers), and a heartbeat's answer that says how far the member's
+  log goes (`HeartbeatAnswers::Position`, the default; `HeartbeatAnswers::Bare` is raft-rs's,
+  which the differential runs);
 - ReadIndex (quorum-confirmed, no lease), with one round of heartbeats for every read asked since
   the last `Ready` (`ReadRounds::Shared`, the default; `ReadRounds::Each` is raft-rs's round per
   read, which the differential runs), and snapshots;

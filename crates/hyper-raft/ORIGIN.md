@@ -256,3 +256,32 @@ port adds one of its own.
   page's buffers, and only for a leader's page (`Log::page`); `Log::slice`, which pages what is
   applied, counts nothing more than before. A unit test holds `Page::bytes` to the sum of the
   encodings on every path, against a storage that pages by the rule and one that gives too much.
+
+### F42: a peer that answers nothing holds its own lane (focal `4bf7b64`)
+
+Taken from focal's patch of `crates/focal-raft` `7ab57e0..04a45f6`, after focal gated `4bf7b64`
+(`origin/slates-port`); the patch is byte for byte focal's diff `052ae4a..4bf7b64` of the crate.
+
+- `HeartbeatAnswers::Position` (the default): a member's heartbeat answer carries its last index
+  and that entry's term. Where the entry is of the leader's term, the answer is taken as an
+  append's answer for everything through it (not in a fast group, whose terms differ by member), so
+  lost answers are made good exactly and a full window gives back what the member holds and nothing
+  more. A member whose window is full and that answers for none of it through a beat of the
+  leader's ticks (`Progress::stalled`, counted by `Progress::tick` on the leader's ticks, never by
+  heartbeat answers) is probed; a probe is sent again when told lost (`MsgUnreachable`) or once a
+  beat has passed. `HeartbeatAnswers::Bare` keeps raft-rs's rule (answers say nothing; a full window
+  frees its first message at every answer), and the differential runs with it.
+- `Raft::settle_priority` puts no priority in force for a member that is not promotable: a member
+  that applied its own removal refused, for good, the voter that remained. The directed test is
+  `a_member_that_left_refuses_no_one_for_priority`. The harness's emulation of priority for
+  raft-rs (`Old::settle`) takes the same rule, so the differential still agrees step for step; its
+  `Reached` totals moved in the two mixes with priorities, `shell` (votes refused 2,217 → 2,215)
+  and `plain` (terms 5,036 → 5,025, committed 76,316 → 75,998), and reverting the two lines of the
+  rule restores them exactly.
+- `Cluster::settles` proposes again a proposal whose leader was deposed before it committed.
+- focal's documentation that the fast track is not safe as built (`fast.rs`, README) came with
+  it; the next change below mends it.
+- Changed from focal's form: the handling of a heartbeat's answer by `HeartbeatAnswers` moved
+  unchanged into `Progress::heard_heartbeat`, since `Raft::handle_heartbeat_response` with it was
+  over the lint wall's cognitive-complexity threshold (11/10); the harness reads a configuration
+  through `Cluster::disk`, since its disks have one owner here.

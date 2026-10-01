@@ -1,7 +1,7 @@
 //! What a leader knows of each member, and what a candidate knows of its
 //! votes.
 use crate::{
-    Configuration, NodeId, Quorum, Tally,
+    Configuration, HeartbeatAnswers, NodeId, Quorum, Tally,
     error::{Error, Result},
     quorum,
 };
@@ -188,6 +188,13 @@ pub struct Progress {
     pub inflights: Inflights,
     /// The member's commit as it last said.
     pub committed_index: u64,
+    /// The leader's ticks since something sent to the member was out and
+    /// none of it was answered for: a full window, or a probe
+    /// (`HeartbeatAnswers`). A tick is the leader's own period, which its
+    /// owner stretches by the path to the group's members; so a beat of
+    /// ticks is time enough, on whatever path, for what was sent to have
+    /// been answered.
+    pub stalled: usize,
 }
 impl Progress {
     /// A member probed from `next_index`, with a window of `window`
@@ -203,10 +210,12 @@ impl Progress {
             recent_active: false,
             inflights: Inflights::new(window, window_bytes),
             committed_index: 0,
+            stalled: 0,
         }
     }
     fn reset_state(&mut self, state: ProgressState) {
         self.paused = false;
+        self.stalled = 0;
         self.pending_snapshot = 0;
         self.state = state;
         self.inflights.reset();
@@ -219,6 +228,7 @@ impl Progress {
         self.pending_snapshot = 0;
         self.pending_request_snapshot = 0;
         self.recent_active = false;
+        self.stalled = 0;
         self.inflights.reset();
     }
     /// Probes again from past what the member is known to hold, or past
@@ -258,6 +268,7 @@ impl Progress {
         if news {
             self.matched = index;
             self.paused = false;
+            self.stalled = 0;
         }
         self.next_index = self.next_index.max(index.saturating_add(1));
         news
@@ -300,6 +311,70 @@ impl Progress {
         self.paused = false;
         true
     }
+    /// The member answered a heartbeat (`HeartbeatAnswers`): `held` is
+    /// how far it said it holds this leader's log, when it said so; `news`
+    /// whether that was more than was known; `beat` the leader's ticks in a
+    /// heartbeat.
+    pub fn heard_heartbeat(
+        &mut self,
+        answers: HeartbeatAnswers,
+        held: Option<u64>,
+        news: bool,
+        beat: usize,
+    ) {
+        match answers {
+            HeartbeatAnswers::Bare => {
+                self.paused = false;
+                // A full window would wait on answers that may be lost.
+                if self.state == ProgressState::Replicate && self.inflights.full() {
+                    self.inflights.free_first_one();
+                }
+            }
+            HeartbeatAnswers::Position => match self.state {
+                ProgressState::Replicate => {
+                    if let Some(held) = held {
+                        self.inflights.free_to(held);
+                    }
+                    // The window is full, and the member answers
+                    // heartbeats and nothing of what is out. Nothing more
+                    // is sent for that: what is out stays within its
+                    // bound. Once a beat has passed with no answer for any
+                    // of it, the member is not being reached by it — what
+                    // its owner was not told was lost — and it is asked
+                    // where it is.
+                    if !news && self.inflights.full() && self.stalled >= beat {
+                        self.become_probe();
+                    }
+                }
+                // The one message a probe is, is sent again when it was
+                // told lost (`MsgUnreachable`), and when a beat has passed
+                // since it was sent and the member answers heartbeats and
+                // not it — not at every heartbeat's answer, which on a path
+                // slower than the heartbeats sent the page again and again
+                // behind itself.
+                ProgressState::Probe if self.paused => {
+                    if self.stalled >= beat {
+                        self.paused = false;
+                    }
+                }
+                ProgressState::Probe | ProgressState::Snapshot => {}
+            },
+        }
+    }
+    /// A tick of the leader passed: counted for a member with a probe out
+    /// or a window that is full, and for no other.
+    pub fn tick(&mut self) {
+        let waits = match self.state {
+            ProgressState::Probe => self.paused,
+            ProgressState::Replicate => self.inflights.full(),
+            ProgressState::Snapshot => false,
+        };
+        self.stalled = if waits {
+            self.stalled.saturating_add(1)
+        } else {
+            0
+        };
+    }
     /// Whether nothing more may be sent now: a probe is out, the window is
     /// full, or a snapshot is on its way.
     pub fn is_paused(&self) -> bool {
@@ -309,13 +384,15 @@ impl Progress {
             ProgressState::Snapshot => true,
         }
     }
-    /// The bytes a page for the member may hold: `page`, and while entries
-    /// are sent ahead of their answers, no more than the window has room
-    /// for.
+    /// The bytes a page for the member may hold: `page`, and no more than
+    /// the path to the member carries — what the window has room for while
+    /// entries are sent ahead of their answers, the window's bound for the
+    /// one message a probe is.
     pub fn page_bytes(&self, page: u64) -> u64 {
         match self.state {
             ProgressState::Replicate => page.min(self.inflights.room()),
-            ProgressState::Probe | ProgressState::Snapshot => page,
+            ProgressState::Probe => page.min(self.inflights.byte_cap()),
+            ProgressState::Snapshot => page,
         }
     }
     /// Entries through `last` were sent, `bytes` of them.
@@ -327,6 +404,7 @@ impl Progress {
             }
             ProgressState::Probe => {
                 self.paused = true;
+                self.stalled = 0;
                 Ok(())
             }
             ProgressState::Snapshot => Err(Error::Invariant(
@@ -742,8 +820,9 @@ mod tests {
     fn a_member_is_paused_by_its_state() {
         let mut progress = Progress::new(1, 2, 100);
         assert!(!progress.is_paused());
-        // Probed, a member is sent a whole page.
-        assert_eq!(progress.page_bytes(4_096), 4_096);
+        // Probed, a member is sent one message of what its path carries.
+        assert_eq!(progress.page_bytes(4_096), 100);
+        assert_eq!(progress.page_bytes(64), 64);
         progress.sent(1, 4_096).unwrap();
         assert!(progress.is_paused() && progress.next_index == 1);
         progress.become_replicate();

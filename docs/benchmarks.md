@@ -344,7 +344,8 @@ exact for a seed, so a change in them is a change in the code, not noise.
 | Port | Commit | Allocations and reallocations | Bytes asked for per op |
 |---|---|---|---|
 | F43, reads share a round | `1173f20` | identical in every row | identical in every row |
-| F41, a window bounded in bytes | this commit | identical in every row | identical on steady, catchup and fast; transfer +2,048 (3 voters) and +4,096 (5); failover +1,024 and +3,072; snapshot +48 and +80 |
+| F41, a window bounded in bytes | `c548f42` | identical in every row | identical on steady, catchup and fast; transfer +2,048 (3 voters) and +4,096 (5); failover +1,024 and +3,072; snapshot +48 and +80 |
+| F42, heartbeat answers that say where the member is | this commit | identical in every row | identical but for snapshot, +24 (3 voters) and +40 (5) |
 
 F41's bytes: a member's window holds each message's bytes beside its last index, sixteen bytes a
 slot against eight, and reserves its 128 slots (`Settings::shell`'s window) the first time it
@@ -352,6 +353,11 @@ takes a message after a reset. A transfer or an election resets every follower's
 those rows ask 1,024 bytes more per follower per reset, and no more allocations; the steady and
 catch-up rows, whose windows are never reset, ask for nothing more. The byte bound itself costs
 no walk: the bytes it charges are counted where the page is chosen (ORIGIN.md, F41).
+
+F42's bytes: each member's progress keeps its stalled ticks, eight bytes more a member, and a
+member that installs a snapshot builds its tracker anew, so the snapshot rows ask 8 bytes more per
+member per snapshot. The workloads deliver every message, so `HeartbeatAnswers::Position` and the
+stall's probe change nothing they count.
 
 ## Where hyper-raft does not win, and why
 

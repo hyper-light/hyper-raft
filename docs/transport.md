@@ -233,13 +233,16 @@ and parked the same way (hyper-transport under hyper-tokio, §4b), its rounds ar
 at every size and it makes half the allocations of a small exchange and two fifths to a half of
 the bytes at every size, at load 36 to 50. Its reallocations, 1.9 to 4 a round with a body against
 focal-wire's 0 to 0.13, were each the receive buffer grown a datagram at a time; datagrams are now
-cut from chunks never grown, and a round makes none at any size, with a seventh of focal-wire's
-allocations at 64 KiB and a tenth at 512 KiB (load 16 to 21). End to end, between real processes over
+cut from a bounded pool of chunks charged to the budget and never grown (past the pool, a datagram
+is copied into a buffer of its own size, so the chunk memory a peer can pin is at most
+`receive_chunks × 65,527` bytes an endpoint), and a round makes no reallocation at any size, with an
+eighth of focal-wire's allocations at 64 KiB and a twelfth at 512 KiB (load 53 to 68). End to end, between real processes over
 UDP: exchanges in every class with megabyte bodies, the reserve keeping a vote moving past held
 bulk, typed refusals at every bound, a peer killed mid-upload, and frames on lanes in order.
 
 **Owed.** focal-wire's domain layer over this crate, with focal's suites as the gate; the TCP
-fallback (T53); slates' class-latency grid on this layer; a frame bound a lane's frames are checked against
+fallback (T53); slates' class-latency grid on this layer; charging hyper-quic's assembler
+over-allocation (at most `max(32 KiB, 1.5 × buffered)` a stream) to the budget; a frame bound a lane's frames are checked against
 apart from the message bound.
 
 ## 4b. The tokio adapter: `hyper-tokio` (T-1's second half, 2026-10-01)

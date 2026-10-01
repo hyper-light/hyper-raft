@@ -998,9 +998,9 @@ each way.
 |---|---|---|---|---|
 | hyper-transport exchange, 16 B heads, no body | 8.35 | 0 | 1,110 | 3.2 µs |
 | bare hyper-quic stream, 16 B each way | 8.08 | 0 | 1,009 | 2.1 µs |
-| hyper-transport exchange, 16 B heads, 4 KiB bodies | 21.0 (12.5 since) | 2.33 (0 since) | 17,760 | 11.5 µs |
+| hyper-transport exchange, 16 B heads, 4 KiB bodies | 21.0 (12.4 since) | 2.33 (0 since) | 17,760 (9,313 since) | 11.5 µs |
 | bare hyper-quic stream, 4 KiB + 16 B each way | 16.2 | 2.08 | 17,493 | 8.6 µs |
-| hyper-transport exchange, 16 B heads, 64 KiB bodies | 211.1 (30.5 since) | 2.33 (0 since) | 286,124 | 147.2 µs |
+| hyper-transport exchange, 16 B heads, 64 KiB bodies | 211.1 (26.4 since) | 2.33 (0 since) | 286,124 (148,633 since) | 147.2 µs |
 | bare hyper-quic stream, 64 KiB + 16 B each way | 208.2 | 2.08 | 285,881 | 116.3 µs |
 | hyper-transport lane frame, 512 B | 1.07 | 0.09 | 620 | 0.8 µs |
 
@@ -1086,38 +1086,82 @@ batch as it came, in more and smaller acknowledgements and window updates. The d
 the socket, up to 128 batches, before it fires timers, sends and surfaces an event, and hands out an
 event already queued without any system call; the table above is that version.
 
-### Reallocations, traced and closed (2026-10-01, 14:30–15:05 PDT)
+### Reallocations, traced and closed (2026-10-01, 14:30–15:20 PDT)
 
 Each reallocation was traced to its site by a counting allocator that recorded the call stack of
 every reallocation in the measured rounds (both the in-memory bench and this comparison; a
 throwaway harness, not kept). Every one with a body was the same site: `Endpoint::handle_datagram`
 copied each datagram into one reused `BytesMut` with `reserve(len)`. hyper-quic keeps views of a
 datagram while the owner has not read its stream data, so the buffer was rarely reclaimable, and
-`reserve` grew it in place a datagram at a time (311 → 1,515 bytes, 975 → 1,950, ...). Datagrams are
-now cut from 65,527-byte chunks (RFC 9000 §18.2's largest datagram): a chunk with room takes the
-next, a chunk whose views are gone is reclaimed whole (`try_reclaim`), and otherwise a fresh one is
-allocated, never grown, as quinn cuts each receive batch from one `BytesMut`. The reservations were
-not a site: the budget's buffers chosen by size never grew once warm.
+`reserve` grew it in place a datagram at a time (311 → 1,515 bytes, 975 → 1,950, ...). The budget's
+reservations were not a site: its buffers, chosen by size, never grew once warm.
 
-`bash compare.sh 5` after the change, load average 16.5 to 21.2 (median 18.5), against the table's
-hyper-transport rows (load 35.7 to 49.5); focal-wire's rows of the same five runs beside them:
+Datagrams are now cut from a bounded pool of chunks (`crates/hyper-transport/src/receive.rs`), each
+65,527 bytes (RFC 9000 §18.2's largest datagram) and never grown: the active chunk takes the next
+datagram, or is reclaimed whole once every view of it is gone (`try_reclaim`), or a held chunk
+that is free takes over, or a new chunk is added, reserved from the budget first. Past
+`Limits::receive_chunks` chunks, or when the budget refuses one, a datagram is copied into a buffer
+of its own size.
 
-| Size each way | Reallocations before | after | focal-wire | Allocations before | after | focal-wire | Bytes before | after | Round after | focal-wire round |
-|---|---|---|---|---|---|---|---|---|---|---|
-| 64 B | 0 | 0 | 0 | 12.4 | 12.4 | 24.7 | 1,266 | 1,299 | 40 µs (37–42) | 59 µs (56–62) |
-| 4 KiB | 1.88 | 0 | 0 | 20.1 | 12.8 | 36.0 | 17,186 | 14,660 | 48 µs (45–51) | 65 µs (61–68) |
-| 64 KiB | 2.00 | 0 | 0.01 | 212.3 | 32.4 | 230.4 | 286,430 | 283,086 | 428 µs (424–434) | 449 µs (446–458) |
-| 512 KiB | 4.00 | 0 | 0.22 | 1,618.3 | 175.1 | 1,704.8 | 2,294,453 | 2,266,370 | 3,987 µs (3,963–4,087) | 4,112 µs (3,845–4,219) |
+**The memory a peer can pin, stated.** A view pins its whole chunk, so a peer whose data sits unread
+could leave chunks each pinned by one small datagram, up to 54 times the bytes those datagrams
+carry at QUIC's 1,200-byte floor. Bounded now:
+- **chunks, per endpoint**: at most `receive_chunks × 65,527` bytes, whatever any peer sends, every
+  byte reserved from the budget on `Lane::Window` and held for the endpoint's life; one connection
+  can pin at most the same. The tests set `receive_chunks` to what a full 16 MiB window of unread
+  data packed into chunks occupies, 257 (16.8 MB, charged);
+- **copies, per connection**: a copied datagram holds its own bytes. What hyper-quic keeps of a
+  stream is bounded by its assembler: over-allocation, the datagram bytes kept beyond the stream
+  bytes buffered, at most `max(32,768, 1.5 × buffered)` before it compacts (`assembler.rs`
+  `insert`), and buffered bytes by the receive window. So a connection's copies hold at most
+  `2.5 × W + 32 KiB × s` for a receive window `W` (charged, its grant) and `s` open streams. The
+  over-allocation part is hyper-quic's own allowance, as before the pool; it is not charged to the
+  budget, and is recorded here as owed.
 
-The same change took the allocations too: a datagram that could not reuse the buffer had been an
-allocation, so a 64 KiB round now makes 32 allocations where focal-wire makes 230. The 64 B row's 33
-bytes more are the first chunk of each side, amortised over 2,000 rounds. In the in-memory bench
-(`cargo bench -p hyper-transport --bench allocs`, load 31 to 37): 12.5 allocations and 0
-reallocations a 4 KiB exchange (21.0 and 2.33 before), 30.5 and 0 at 64 KiB (211.1 and 2.33).
-A lane frame keeps 0.09 reallocations: hyper-quic's send buffer (`SendBuffer::ack`, upstream's
-`shrink_to_fit` once a stream's queue is under a quarter of its capacity) gives its segment queue
-back after each burst and grows it again with the next; that is upstream's bound on what an idle
-stream holds, kept.
+`unread_datagrams_pin_no_more_receive_chunks_than_the_bound` (`tests/exchange.rs`) is that peer:
+sixteen bulk requests whose bodies the receiver holds unread, each followed by 48 answered
+requests of 1,300-byte bodies so that each chunk is pinned by one small datagram, against a pool of
+three chunks. The pool never passes three, datagrams past it are copied, and everything completes
+once the bodies are read; without the bound the pool grows past three and the test fails.
+`receive::tests::single_unread_datagrams_pin_no_more_than_the_pool` does the same on the pool
+alone, with the budget's charge checked to the byte.
+
+`bash compare.sh 5` with the bounded pool, load average 52.9 to 67.7 (median 58.9), against the
+table's hyper-transport rows (load 35.7 to 49.5); focal-wire's rows of the same five runs beside
+them:
+
+| Size each way | Reallocations before → after | focal-wire | Allocations before → after | focal-wire | Bytes before → after | focal-wire | Round after | focal-wire round |
+|---|---|---|---|---|---|---|---|---|
+| 64 B | 0 → 0 | 0 | 12.4 → 12.4 | 24.7 | 1,266 → 1,299 | 2,714 | 279 µs (218–302) | 303 µs (103–360) |
+| 4 KiB | 1.88 → 0 | 0 | 20.1 → 12.7 | 36.0 | 17,186 → 9,386 | 43,443 | 83 µs (74–108) | 132 µs (125–150) |
+| 64 KiB | 2.00 → 0 | 0.01 | 212.3 → 28.3 | 235.2 | 286,430 → 149,066 | 680,859 | 642 µs (640–656) | 737 µs (728–743) |
+| 512 KiB | 4.00 → 0 | 0.12 | 1,618.3 → 141.5 | 1,746.0 | 2,294,453 → 1,192,383 | 5,435,061 | 4,620 µs (4,598–4,627) | 6,099 µs (5,688–6,643) |
+
+Again on the final code (with the `Writable` fix below), five runs at load average 8.0 to 9.1: the
+same counts to within 0.2 allocations and 0 reallocations at every size (focal-wire 0 to 0.19);
+rounds 24 against 32 µs at 64 B, 39 against 46 at 4 KiB, 389 against 410 at 64 KiB, 2,940 against
+3,678 at 512 KiB.
+
+**A livelock found by the gate run of this change.** One run of hyper-tokio's end-to-end exchanges
+never finished: the 8 MiB bulk exchange heard `Writable` after `Writable`. The endpoint judged a
+body writable by the connection's credit alone; when the stream's own window refused a write the
+credit allowed, the refused write queued a `Writable` at once, the owner wrote nothing and was told
+again, and hyper-tokio's driver, which hands out a queued event without a system call, never read
+the peer's window update. A body refused by its stream's window now hears `Writable` only after
+QUIC's own `Writable` for that stream
+(`a_body_blocked_by_its_stream_window_hears_no_writable_until_quic_says_so`, failing before);
+hyper-tokio's end-to-end ran five times clean after it, at load 13 to 18.
+
+The same change took allocations and bytes too: a datagram that could not reuse the old buffer had
+been an allocation, and the pool's chunks are reused instead of reallocated. A 64 KiB round now makes
+28 allocations where focal-wire makes 235, and asks for a fifth of its bytes. The 64 B row's 33 bytes
+more are the first chunk of each side, amortised over 2,000 rounds. In the in-memory bench
+(`cargo bench -p hyper-transport --bench allocs`, load 41 to 57): 12.4 allocations, 0 reallocations
+and 9,313 bytes a 4 KiB exchange (21.0, 2.33, 17,760 before); 26.4, 0 and 148,633 at 64 KiB (211.1,
+2.33, 286,124). A lane frame keeps 0.09 reallocations: hyper-quic's send buffer (`SendBuffer::ack`,
+upstream's `shrink_to_fit` once a stream's queue is under a quarter of its capacity) gives its
+segment queue back after each burst and grows it again with the next; that is upstream's bound on
+what an idle stream holds, kept.
 
 ## hyper-tokio end to end
 

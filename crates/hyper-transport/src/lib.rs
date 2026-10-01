@@ -42,6 +42,7 @@ mod exchange;
 mod frame;
 mod lane;
 mod progress;
+mod receive;
 mod round;
 mod timing;
 pub mod tls;
@@ -55,6 +56,7 @@ pub use endpoint::{Config, Endpoint, Limits, PathFacts, Stats};
 pub use error::Refusal;
 pub use hyper_quic::{EcnCodepoint, Transmit};
 pub use progress::{LEAST_PROGRESS, Progress};
+pub use receive::RECEIVE_CHUNK;
 pub use round::{Round, RoundEnd};
 pub use timing::spread;
 

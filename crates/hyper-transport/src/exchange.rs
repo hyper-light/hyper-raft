@@ -238,6 +238,9 @@ pub(crate) struct Exchange<K> {
     pub(crate) wants_write: bool,
     /// A [`crate::Event::Writable`] is outstanding; the owner's next write answers it.
     pub(crate) writable_sent: bool,
+    /// QUIC refused a write the connection's credit allowed: the stream's own window is spent,
+    /// and only QUIC's `Writable` for the stream says it can take more.
+    pub(crate) stream_blocked: bool,
     /// The owner's last read of the body wanted more than had arrived: only then is a period that
     /// brought nothing evidence against the sender.
     pub(crate) starved: bool,

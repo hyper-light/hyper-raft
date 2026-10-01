@@ -10,7 +10,6 @@ use std::marker::PhantomData;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
-use bytes::BytesMut;
 use hyper_quic::rustls::pki_types::CertificateDer;
 use hyper_quic::{
     ClientConfigHandle, Connection, DatagramEvent, Dir, EcnCodepoint, EndpointConfig,
@@ -26,6 +25,7 @@ use crate::exchange::{End, Exchange, In, Incoming, Out, Outgoing, Pushed, abando
 use crate::frame::{PREFIX_BYTES, Prefix};
 use crate::lane::{LaneIn, LaneOut, OPENER_BYTES, Reading, opened};
 use crate::progress::{Carry, Moved, Progress};
+use crate::receive::Receive;
 use crate::timing::PeerTiming;
 use crate::tls::{self, Credentials};
 use crate::{Classes, Directory, Epoch, Event, ExchangeId, PeerId, Refusal};
@@ -61,6 +61,12 @@ pub struct Limits {
     /// queued for sending; one past the bound is dropped and counted, as RFC 9000 lets an endpoint
     /// leave any of them unsent.
     pub max_responses: usize,
+    /// The chunks of [`crate::RECEIVE_CHUNK`] bytes received datagrams are cut from, each reserved
+    /// from the budget: the chunk memory a peer can pin is at most this many chunks, whatever it
+    /// sends; past them a datagram is copied into a buffer of its own (`crate::receive`). A full
+    /// receive window of unread data, packed, occupies `window_ceiling / RECEIVE_CHUNK` chunks; the
+    /// owner sets this from that and its budget.
+    pub receive_chunks: usize,
 }
 
 impl Limits {
@@ -145,12 +151,12 @@ pub struct Stats {
     pub responses_dropped: u64,
     /// Streams a peer opened past a bound, refused.
     pub streams_refused: u64,
+    /// Receive chunks held, each charged to the budget.
+    pub receive_chunks: usize,
+    /// Datagrams copied into buffers of their own because no chunk could take them.
+    pub receive_copied: u64,
 }
 
-/// The bytes datagrams are received into at a time: one datagram of the largest size QUIC allows,
-/// `max_udp_payload_size`'s ceiling of 65,527 (RFC 9000 §18.2), so a chunk never holds less than
-/// the datagram it is cut for, and about 45 of a 1,452-byte path's.
-const RECEIVE_CHUNK: usize = 65_527;
 /// The QUIC application error code a connection closes with when it ends without a fault.
 const CLOSE_NORMAL: u32 = 0;
 /// A message's incoming states, each of which a step leaves or stops at: the bound on the steps
@@ -202,7 +208,7 @@ pub struct Endpoint<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role
     client: ClientConfigHandle,
     conns: Vec<Option<Box<Conn<C::Role>>>>,
     core: Core<C, B, D>,
-    receive: BytesMut,
+    receive: Receive,
     scratch: Vec<u8>,
     responses: VecDeque<(Transmit, Vec<u8>)>,
     spare: Vec<Vec<u8>>,
@@ -291,7 +297,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
                 ids: Vec::new(),
                 stats: Stats::default(),
             },
-            receive: BytesMut::new(),
+            receive: Receive::new(limits.receive_chunks),
             scratch: Vec::new(),
             responses: VecDeque::with_capacity(limits.max_responses),
             spare: Vec::with_capacity(limits.max_responses),
@@ -308,18 +314,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
         bytes: &[u8],
     ) {
         self.core.now = now;
-        // The QUIC layer takes the datagram as its own buffer, and keeps views of it while it
-        // holds stream data the owner has not read. Datagrams are cut from a chunk: one that has
-        // room takes the next, one whose views are all gone is reclaimed whole, and otherwise a
-        // fresh chunk is allocated. A chunk is never grown: growing it in place, a datagram at a
-        // time, was two reallocations a round of a 64 KiB exchange (docs/benchmarks.md). A view
-        // pins its chunk as one pins its receive batch in quinn, which copies each batch into one
-        // `BytesMut` and cuts its datagrams from it (quinn 0.11 `endpoint.rs`, `poll_socket`).
-        if !self.receive.try_reclaim(bytes.len()) {
-            self.receive = BytesMut::with_capacity(RECEIVE_CHUNK.max(bytes.len()));
-        }
-        self.receive.extend_from_slice(bytes);
-        let datagram = self.receive.split_to(bytes.len());
+        let datagram = self.receive.take(bytes, &mut self.core.budget);
         let mut buffer = std::mem::take(&mut self.scratch);
         buffer.clear();
         match self
@@ -648,6 +643,8 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
             exchanges: self.core.exchanges.len(),
             connections: self.conns.iter().flatten().count(),
             events: self.core.events.len(),
+            receive_chunks: self.receive.chunks(),
+            receive_copied: self.receive.copied(),
             ..self.core.stats
         }
     }
@@ -922,9 +919,15 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
                     }
                 }
             }
-            StreamEvent::Writable { .. }
-            | StreamEvent::Finished { .. }
-            | StreamEvent::Available { .. } => {}
+            StreamEvent::Writable { id } => {
+                if let Some(exchange) = self
+                    .exchange_on(conn, id)
+                    .and_then(|exchange| self.exchanges.get_mut(exchange))
+                {
+                    exchange.stream_blocked = false;
+                }
+            }
+            StreamEvent::Finished { .. } | StreamEvent::Available { .. } => {}
         }
     }
 
@@ -1096,6 +1099,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
             ready_sent: false,
             wants_write: false,
             writable_sent: false,
+            stream_blocked: false,
             starved: false,
         };
         match self.exchanges.insert(exchange) {
@@ -1443,6 +1447,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
             ready_sent: false,
             wants_write: false,
             writable_sent: false,
+            stream_blocked: false,
             starved: false,
         };
         let id = self.exchanges.insert(exchange)?;
@@ -1658,6 +1663,8 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
         exchange.out.left = exchange.out.left.saturating_sub(length(took));
         exchange.wants_write = took < from.len();
         exchange.writable_sent = false;
+        // Fewer taken than the credit allowed: the stream's own window refused the rest.
+        exchange.stream_blocked = took < from.len() && length(took) < allowed;
         if exchange.out.left == 0 {
             exchange.out.state = Out::Trailer;
             if let Err(failure) = self.flush_trailer(conn, id) {
@@ -1764,7 +1771,10 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
 
     fn wake(&mut self, conn: &mut Conn<C::Role>, id: u64) {
         let wanted = self.exchanges.get(id).is_some_and(|exchange| {
-            exchange.wants_write && !exchange.writable_sent && exchange.out.state == Out::Body
+            exchange.wants_write
+                && !exchange.writable_sent
+                && !exchange.stream_blocked
+                && exchange.out.state == Out::Body
         });
         if !wanted || self.allowed(conn, self.rank_of(id)) == 0 {
             return;

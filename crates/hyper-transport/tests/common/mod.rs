@@ -266,6 +266,8 @@ pub fn limits() -> Limits {
         idle_timeout: Duration::from_secs(10),
         keep_alive: Some(Duration::from_secs(2)),
         max_responses: 16,
+        // A full 16 MiB window of unread data, packed: 16 MiB / 65,527 B, and one.
+        receive_chunks: (16 << 20) / hyper_transport::RECEIVE_CHUNK + 1,
     }
 }
 

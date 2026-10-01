@@ -862,3 +862,128 @@ fn an_owner_late_to_write_is_not_refused_by_its_own_side() {
     assert_eq!(refused, None, "the server saw {:?}", server.refused);
     assert_eq!(bulk.read, bulk.body);
 }
+
+/// A peer that leaves single small datagrams unread across many receive chunks: each of sixteen
+/// bulk requests, whose bodies the receiver holds unread, is followed by enough answered requests
+/// of 1,300-byte bodies to fill the rest of a chunk, so each chunk is pinned by one small datagram. The receiver holds
+/// no more chunks than its bound, each charged to its budget, and copies the datagrams past it into
+/// buffers of their own instead of growing; everything completes once the bodies are read.
+#[test]
+fn unread_datagrams_pin_no_more_receive_chunks_than_the_bound() {
+    const CHUNKS: usize = 3;
+    let pair = Pair::new();
+    let mut tight = limits();
+    tight.receive_chunks = CHUNKS;
+    tight.streams_per_connection = 32;
+    let mut net = connected::<Mantle, Mantle>(&pair, tight, 1 << 30);
+    let (mut asker, mut server) = (Asker::new(), Server::new());
+    server.hold_bulk = true;
+    for held in 0..16u8 {
+        asker
+            .ask(
+                &mut net.a,
+                net.now,
+                2,
+                (Kind::Snapshot, Class::Bulk),
+                held,
+                Some(600),
+                Duration::from_secs(60),
+            )
+            .unwrap();
+        for filler in 0..48u8 {
+            let at = asker
+                .ask(
+                    &mut net.a,
+                    net.now,
+                    2,
+                    (Kind::Put, Class::Request),
+                    100 + filler,
+                    Some(1_300),
+                    PERIOD,
+                )
+                .unwrap();
+            net.until(TURNS, |net| {
+                asker.drive(&mut net.a);
+                server.serve(&mut net.b);
+                asker.drive(&mut net.a);
+                asker.asked[at].done
+            });
+            assert!(
+                net.b.stats().receive_chunks <= CHUNKS,
+                "the pool grew past its bound"
+            );
+        }
+    }
+    let stats = net.b.stats();
+    assert_eq!(stats.receive_chunks, CHUNKS);
+    assert!(
+        stats.receive_copied > 0,
+        "past the bound, datagrams were copied: {stats:?}"
+    );
+    // Released, the held bodies are read and everything completes.
+    asker
+        .ask(
+            &mut net.a,
+            net.now,
+            2,
+            (Kind::Vote, Class::Control),
+            RELEASE,
+            None,
+            PERIOD,
+        )
+        .unwrap();
+    run(&mut net, &mut asker, &mut server);
+    assert!(
+        asker
+            .asked
+            .iter()
+            .all(|asked| asked.refused.is_none() && asked.read == asked.body)
+    );
+    assert!(net.b.stats().receive_chunks <= CHUNKS);
+}
+
+/// A body blocked by its stream's own window, not by the connection's credit, hears no
+/// `Writable` until QUIC says the stream can take more. Before, the endpoint judged writability by
+/// the connection's credit alone, so every write the stream refused queued a `Writable` at once: an
+/// owner that answers events before reading its socket (hyper-tokio's driver hands out a queued
+/// event without a system call) spun on them, never read the peer's window update, and an 8 MiB
+/// bulk body stalled for good (seen once in a gate run of hyper-tokio's end-to-end exchanges).
+#[test]
+fn a_body_blocked_by_its_stream_window_hears_no_writable_until_quic_says_so() {
+    let pair = Pair::new();
+    let mut net = connected::<Mantle, Mantle>(&pair, limits(), 1 << 30);
+    let mut server = Server::new();
+    let mut piece = vec![0u8; PIECE];
+    // The peer reads as the body arrives until the connection's window has grown past one
+    // stream's (`stream_window_ceiling`, about 2.3 MB), then stops reading: the body is held back
+    // by its stream's window while the connection still has credit.
+    let mut bulk = Slow::open(&mut net, Kind::Snapshot, 7, 512 << 20);
+    let mut blocked = false;
+    for _ in 0..100_000 {
+        server.hold_bulk = bulk.written > 32 << 20;
+        let before = bulk.written;
+        bulk.write(&mut net.a, &mut piece);
+        let credit = net
+            .a
+            .credit(2, Class::Bulk)
+            .is_some_and(|credit| credit > 0);
+        if server.hold_bulk && bulk.written == before && credit {
+            blocked = true;
+            break;
+        }
+        net.exchange();
+        server.serve(&mut net.b);
+        while net.a.poll_event().is_some() {}
+        if !net.exchange() {
+            net.advance();
+        }
+    }
+    assert!(blocked, "the stream's window never held the body back");
+    // Nothing has moved on the network since the refused write: no Writable may be queued for it.
+    while let Some(event) = net.a.poll_event() {
+        assert!(
+            !matches!(event, Event::Writable { exchange } if exchange == bulk.exchange),
+            "a Writable for a body its stream still refuses"
+        );
+    }
+}

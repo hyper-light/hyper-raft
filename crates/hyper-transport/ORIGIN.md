@@ -70,6 +70,13 @@ source: its credit law (`flow.rs`, `connection.rs`) is taken here. Neither repos
   body take a whole window before its requests took a byte (30,332 bytes in
   `requests_behind_a_bulk_body_take_credit_first_from_a_slow_owner`). A class now takes only the
   credit left after the bytes every more urgent class has declared and not sent (`Core::demand_above`).
+- **Writable means the stream can take more.** A body refused by its stream's own window, with
+  connection credit to spare, was told `Writable` again at once, and an owner driven by queued
+  events spun without reading the window update; it now waits for QUIC's `Writable` for the stream
+  (`a_body_blocked_by_its_stream_window_hears_no_writable_until_quic_says_so`).
+- **Received datagrams are cut from a bounded, charged pool** (`receive.rs`): at most
+  `receive_chunks` chunks of 65,527 bytes, each reserved from the budget; past them a datagram is
+  copied into a buffer of its own (`unread_datagrams_pin_no_more_receive_chunks_than_the_bound`).
 - **This side's delays are not the peer's.** A period in which an exchange's own owner offered
   nothing the peer would take, or a more urgent class of this side took the credit, is held rather
   than judged (`Core::ours_to_move`; `an_owner_late_to_write_is_not_refused_by_its_own_side`).

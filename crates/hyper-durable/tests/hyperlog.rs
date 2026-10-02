@@ -15,6 +15,7 @@
 
 mod support;
 
+use std::sync::OnceLock;
 use std::sync::mpsc::{Receiver, sync_channel};
 use std::task::Waker;
 use std::time::Instant;
@@ -63,7 +64,7 @@ fn settle(r: &mut Member, waker: &Waker, woken: &Receiver<usize>) {
     let mut out = Output::default();
     loop {
         out.clear();
-        let driven = r.drive(Instant::now(), waker, &mut out).unwrap();
+        let driven = r.drive(now(), waker, &mut out).unwrap();
         if driven.more {
             continue;
         }
@@ -113,11 +114,11 @@ fn a_refusal_for_the_groups_bound_stalls_until_a_compaction_frees_it() {
             Err(e) => panic!("{e}"),
         }
         out.clear();
-        r.drive(Instant::now(), &waker, &mut out).unwrap();
+        r.drive(now(), &waker, &mut out).unwrap();
         settle(&mut r, &waker, &woken);
         if r.is_stalled() {
             stalled += 1;
-            assert!(r.compact(2, Instant::now(), &waker).unwrap());
+            assert!(r.compact(2, now(), &waker).unwrap());
             settle(&mut r, &waker, &woken);
             assert!(!r.is_stalled(), "a compaction did not free the room");
         }
@@ -131,4 +132,12 @@ fn a_refusal_for_the_groups_bound_stalls_until_a_compaction_frees_it() {
     let view = r.core().store().log().view().unwrap();
     assert!(view.hard_state.commit <= view.last);
     assert_eq!(view.last, r.applied().index);
+}
+
+/// The owner's clock in nanoseconds: the test reads the host's monotonic clock at its edge, as an
+/// owner does, and hands the shell nanoseconds since the first reading.
+fn now() -> u64 {
+    static EPOCH: OnceLock<Instant> = OnceLock::new();
+    let epoch = *EPOCH.get_or_init(Instant::now);
+    u64::try_from(epoch.elapsed().as_nanos()).unwrap_or(u64::MAX)
 }

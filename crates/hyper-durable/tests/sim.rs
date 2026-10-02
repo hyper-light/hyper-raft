@@ -1,5 +1,6 @@
 //! The shell under deterministic simulation (`docs/durable.md` §12): groups driven by seeded
-//! schedules of ticks, deliveries, losses, drives, writes made durable at the schedule's choice,
+//! schedules of detectors' words, deliveries, losses, drives, writes made durable at the
+//! schedule's choice,
 //! refusals for room, failed writes, proposals, entries acted on at start, changes of
 //! configuration, reads, compactions and crashes, with readies ahead of their persistence up to
 //! the store's depth; every output held to the oracle of `support::cluster` against the
@@ -35,7 +36,8 @@ fn schedule(shape: Shape, seed: u64, steps: u64, crash: Option<u64>) -> (Cluster
         if group.act(op) {
             if crash == Some(events) {
                 let member = match op {
-                    Op::Tick(id)
+                    Op::Suspect(id, _)
+                    | Op::Trust(id, _)
                     | Op::Drive(id)
                     | Op::Durable(id)
                     | Op::Propose(id)

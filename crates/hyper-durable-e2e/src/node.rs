@@ -1,10 +1,19 @@
 //! One member as a process: a hyper-durable `Replica` over hyper-log on a real file, a UDP socket,
 //! and the key-value store of [`crate::machine`]. One thread does the member's work: it waits on
-//! its socket until the next tick, steps what arrived, takes the ticks that elapsed, and drives the
-//! replica, which submits its writes with the member's waker and returns. The log's answer wakes
-//! the waker, which a relay thread turns into a datagram to the member's own socket, so the one
-//! wait the member makes covers both: nothing polls on a timer. The log runs its own two threads.
-//! A process runs these four, whatever it holds.
+//! its socket until the replica's deadline or the end of its period, steps what arrived, and drives
+//! the replica, which submits its writes with the member's waker and returns. The log's answer
+//! wakes the waker, which a relay thread turns into a datagram to the member's own socket, so the
+//! one wait the member makes covers both. The log runs its own two threads. A process runs these
+//! four, whatever it holds.
+//!
+//! The replica elects by suspicion (timing step L-2, `docs/timing.md` §2.8) and takes no ticks.
+//! What its detectors believe of its peers the test tells it (`control::Order::Suspect`, `Trust`,
+//! `Restarted`): the test kills the members, so it knows, and stands for L-3's node-pair stream
+//! until L-4. Its group's timing is hyper-timing's law over what the member measures: each period
+//! it probes each peer and times the answer (`ExchangeRtt`), its timed waits give the granularity
+//! (`Lateness`), and its replica's vote writes the mean flush (`Flushes`); the ballot and its span
+//! are derived again whenever a measurement moves, and a group with no measured quorum of paths
+//! draws no delay and so does not campaign (`docs/timing.md` §3, item 10).
 //!
 //! A write is answered once it is applied, so an answered write is committed; a read once a
 //! quorum confirmed the leader and the member applied through the index it was confirmed at.
@@ -24,8 +33,9 @@ use hyper_durable::{
 use hyper_log::{Config as LogConfig, Log, Waits};
 use hyper_raft::proto::{ConfChangeSingle, ConfChangeTransition, ConfChangeV2, ConfState, Message};
 use hyper_raft::wire::Record;
-use hyper_raft::{Config, StateRole};
+use hyper_raft::{Config, StateRole, Timing};
 use hyper_raft_e2e::wire::{self, Command, Control, Kind, Op, Outcome, Status};
+use hyper_timing::{Ballot, ExchangeRtt, Lateness};
 
 use crate::control::{self, Order, Point, Report};
 use crate::file::{self, FaultFile};
@@ -36,14 +46,6 @@ pub const GROUP: u128 = 1;
 /// The log's id.
 const LOG_ID: u128 = 0x0068_7970_6572_2d64_7572_6162_6c65;
 
-/// Ticks in the election timeout: Raft needs it an order of magnitude above the broadcast time,
-/// which a tick is measured to cover (Ongaro and Ousterhout 2014, §5.6; hyper-raft-e2e's).
-pub const ELECTION_TICKS: u32 = 10;
-/// Ticks between a leader's heartbeats: one, a tick being a broadcast time.
-pub const HEARTBEAT_TICKS: u32 = 1;
-/// The most ticks one turn takes: the longest election timeout the core draws, `2 ·
-/// election_tick`; more would replay as a burst of campaigns (hyper-raft-e2e's rule).
-const MAX_TURN_TICKS: u32 = 2 * ELECTION_TICKS;
 /// The bytes of a member's datagram besides an append's entries: the datagram's header and the
 /// sender's id, and the message record's header, fixed fields and checksum (hyper-raft-e2e's).
 const MESSAGE_ROOM: usize = wire::HEADER
@@ -78,7 +80,7 @@ pub enum NodeError {
     Open(hyper_durable::OpenError),
     /// The socket refused.
     Io(std::io::Error),
-    /// The next tick is past what the clock counts.
+    /// The next period is past what the clock counts.
     Clock,
 }
 
@@ -89,7 +91,7 @@ impl std::fmt::Display for NodeError {
             Self::Log(e) => write!(f, "the log: {e}"),
             Self::Open(e) => write!(f, "open: {e}"),
             Self::Io(e) => write!(f, "the socket: {e}"),
-            Self::Clock => write!(f, "the next tick is past what the clock counts"),
+            Self::Clock => write!(f, "the next period is past what the clock counts"),
         }
     }
 }
@@ -109,8 +111,9 @@ pub struct Settings {
     pub id: u64,
     /// The voters a new group is founded with.
     pub voters: Vec<u64>,
-    /// The time between ticks.
-    pub tick: Duration,
+    /// The owner's period: a commit no write stated for a period is written, and each peer is
+    /// probed once a period.
+    pub period: Duration,
     /// The most keys the store holds.
     pub max_keys: usize,
     /// The most writes and reads one member waits to answer.
@@ -146,6 +149,14 @@ pub struct Node {
     sending: Vec<u8>,
     datagram: usize,
     command: Vec<u8>,
+    /// The member's clock's origin: probes are stamped in nanoseconds since.
+    epoch: Instant,
+    /// The round trips measured to each peer, in the order of `peers`.
+    paths: Vec<(u64, ExchangeRtt)>,
+    /// How late the member's timed waits end: the granularity `G`.
+    lateness: Lateness,
+    /// The timing last given to the replica.
+    timing: Option<Timing>,
 }
 
 /// Opens the log at `path`, or creates it when the file is new.
@@ -175,16 +186,13 @@ impl Node {
             u64::try_from(datagram.saturating_sub(MESSAGE_ROOM)).unwrap_or(u64::MAX);
         let shell = Shell {
             core: Config {
-                election_tick: usize::try_from(ELECTION_TICKS).unwrap_or(usize::MAX),
-                heartbeat_tick: usize::try_from(HEARTBEAT_TICKS).unwrap_or(usize::MAX),
                 max_size_per_msg,
                 check_quorum: true,
                 pre_vote: true,
                 seed: settings.id,
                 ..Config::new(settings.id)
             },
-            // The owner's period is its tick: a commit no write stated for a tick is written.
-            quiet: settings.tick,
+            quiet: settings.period,
         };
         let store = GroupStore::claim(&log, GROUP).map_err(|e| match e {
             hyper_durable::ClaimError::Log(e) => NodeError::Log(e),
@@ -216,8 +224,66 @@ impl Node {
             sending: Vec::with_capacity(datagram),
             datagram,
             command: Vec::new(),
+            epoch: Instant::now(),
+            paths: Vec::new(),
+            lateness: Lateness::new(),
+            timing: None,
             settings,
         })
+    }
+
+    /// Nanoseconds on the member's clock.
+    fn nanos(&self, at: Instant) -> u64 {
+        u64::try_from(at.saturating_duration_since(self.epoch).as_nanos()).unwrap_or(u64::MAX)
+    }
+
+    /// Probes every peer, stamped now: each answers at once, and the answer times the path.
+    fn probe(&mut self) -> Result<(), NodeError> {
+        if self.isolated {
+            return Ok(());
+        }
+        let stamp = self.nanos(Instant::now());
+        for at in 0..self.peers.len() {
+            let Some(&(peer, address)) = self.peers.get(at) else {
+                continue;
+            };
+            if peer == self.settings.id {
+                continue;
+            }
+            control::put_order(&mut self.sending, 0, &Order::Probe(stamp));
+            if wire::seal(&mut self.sending, self.datagram) {
+                self.send(address)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The group's timing from what the member measured: the ballot over its paths to the other
+    /// voters, the span it chooses, given to the replica when it moved. None before a quorum's
+    /// paths and a wait are measured.
+    fn measure(&mut self) -> Result<(), NodeError> {
+        let Some(granularity) = self.lateness.granularity().filter(|g| !g.is_zero()) else {
+            return Ok(());
+        };
+        let voters = &self.replica.configuration().voters;
+        let paths = self
+            .paths
+            .iter()
+            .filter(|(peer, _)| voters.contains(peer))
+            .map(|(_, path)| path);
+        let durable = self.replica.flushes().mean().unwrap_or(Duration::ZERO);
+        let Some(ballot) = Ballot::measure(paths, voters.len(), durable, granularity) else {
+            return Ok(());
+        };
+        let Some(span) = ballot.span(granularity) else {
+            return Ok(());
+        };
+        let timing = Timing::of(&ballot, &span);
+        if self.timing != Some(timing) {
+            self.timing = Some(timing);
+            heard(self.replica.set_timing(timing))?;
+        }
+        Ok(())
     }
 
     /// The log, which outlives the replica's handle on it.
@@ -228,32 +294,34 @@ impl Node {
     /// Runs until `parent` says the test is gone, or until the member stops at an armed point
     /// (`Ok(Some(point))`), or fails.
     pub fn run(&mut self, parent: &Receiver<()>) -> Result<Option<Point>, NodeError> {
-        let tick = self.settings.tick;
-        let mut ticked = Instant::now();
+        let period = self.settings.period;
+        let mut next_period = Instant::now();
         // The member drives once before it waits: a reopened member replays its log alone.
         if let Some(point) = self.drive()? {
             return Ok(Some(point));
         }
         while parent.try_recv().is_err() {
-            let next_tick = ticked.checked_add(tick).ok_or(NodeError::Clock)?;
-            self.receive_until(next_tick)?;
+            let now = Instant::now();
+            if now >= next_period {
+                self.probe()?;
+                next_period = now.checked_add(period).ok_or(NodeError::Clock)?;
+            }
+            // Woken at the replica's deadline, or at the period's end, whichever is first.
+            let until = self
+                .replica
+                .deadline()
+                .and_then(|at| self.epoch.checked_add(Duration::from_nanos(at)))
+                .map_or(next_period, |deadline| deadline.min(next_period));
+            if !self.receive_until(until)? {
+                let woke = Instant::now();
+                let (asked, ended) = (self.nanos(until), self.nanos(woke));
+                // A fold that is full keeps its mean: the wait is one of more than it counts.
+                let _ = self.lateness.on_wait(asked, ended);
+            }
             if std::mem::take(&mut self.woken) && self.stops_at(Point::Durable) {
                 return Ok(Some(Point::Durable));
             }
-            let now = Instant::now();
-            let elapsed = now.saturating_duration_since(ticked);
-            let due = elapsed.as_nanos().checked_div(tick.as_nanos()).unwrap_or(0);
-            let take = u32::try_from(due).unwrap_or(u32::MAX).min(MAX_TURN_TICKS);
-            for _ in 0..take {
-                heard(self.replica.tick())?;
-            }
-            ticked = if u128::from(take) < due {
-                now
-            } else {
-                tick.checked_mul(take)
-                    .and_then(|taken| ticked.checked_add(taken))
-                    .unwrap_or(now)
-            };
+            self.measure()?;
             if let Some(point) = self.drive()? {
                 return Ok(Some(point));
             }
@@ -277,13 +345,13 @@ impl Node {
     }
 
     /// Waits for a datagram until `until`, then takes what else has arrived, at most a turn's
-    /// worth (hyper-raft-e2e's `receive_until`).
-    fn receive_until(&mut self, until: Instant) -> Result<(), NodeError> {
+    /// worth (hyper-raft-e2e's `receive_until`). False when the wait timed out with nothing.
+    fn receive_until(&mut self, until: Instant) -> Result<bool, NodeError> {
         let wait = until.saturating_duration_since(Instant::now());
         if !wait.is_zero() {
             self.socket.set_read_timeout(Some(wait))?;
             if !self.receive_one()? {
-                return Ok(());
+                return Ok(false);
             }
         }
         self.socket.set_nonblocking(true)?;
@@ -304,7 +372,7 @@ impl Node {
             }
         }
         self.socket.set_nonblocking(false)?;
-        outcome
+        outcome.map(|()| true)
     }
 
     fn receive_one(&mut self) -> Result<bool, NodeError> {
@@ -486,11 +554,14 @@ impl Node {
                 self.respond(from, id, &Outcome::Done)
             }
             Order::Report => {
+                let nanos = |d: Duration| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX);
                 let report = Report {
                     status: self.status(),
                     durable_commit: self.replica.durable_commit(),
                     known: self.replica.configuration_known(),
                     voters: self.replica.configuration().voters.clone(),
+                    span_ns: self.timing.map_or(0, |t| nanos(t.span)),
+                    round_ns: self.timing.map_or(0, |t| nanos(t.round)),
                 };
                 control::put_report(&mut self.sending, id, &report);
                 if wire::seal(&mut self.sending, self.datagram) {
@@ -516,6 +587,49 @@ impl Node {
                     }
                 };
                 self.respond(from, id, &outcome)
+            }
+            Order::Suspect(member) => {
+                heard(self.replica.suspect(member))?;
+                self.respond(from, id, &Outcome::Done)
+            }
+            Order::Trust(member) => {
+                heard(self.replica.trust(member))?;
+                self.respond(from, id, &Outcome::Done)
+            }
+            Order::Restarted(member) => {
+                heard(self.replica.restarted(member))?;
+                self.respond(from, id, &Outcome::Done)
+            }
+            Order::Probe(stamp) => {
+                if self.isolated {
+                    return Ok(());
+                }
+                control::put_order(&mut self.sending, id, &Order::Echo(stamp));
+                if wire::seal(&mut self.sending, self.datagram) {
+                    self.send(from)?;
+                }
+                Ok(())
+            }
+            Order::Echo(stamp) => {
+                let Some(peer) = self
+                    .peers
+                    .iter()
+                    .find(|(_, address)| *address == from)
+                    .map(|(peer, _)| *peer)
+                else {
+                    return Ok(());
+                };
+                let took = self.nanos(Instant::now()).saturating_sub(stamp);
+                match self.paths.iter_mut().find(|(at, _)| *at == peer) {
+                    Some((_, path)) => path.on_sample(took),
+                    None => {
+                        let mut path = ExchangeRtt::new();
+                        path.on_sample(took);
+                        // One a peer, and the peers are bounded by `MAX_MEMBERS` (`hear_test`).
+                        self.paths.push((peer, path));
+                    }
+                }
+                Ok(())
             }
         }
     }
@@ -550,14 +664,15 @@ impl Node {
             let out_before = self.replica.in_flight();
             let configuration = self.replica.configuration().clone();
             self.out.clear();
-            let driven = match self
-                .replica
-                .drive(Instant::now(), &self.waker, &mut self.out)
-            {
-                Ok(driven) => driven,
-                Err(ReplicaError::Fenced(cause)) => return Err(NodeError::Fenced(cause)),
-                Err(_) => return Ok(None),
-            };
+            let driven =
+                match self
+                    .replica
+                    .drive(self.nanos(Instant::now()), &self.waker, &mut self.out)
+                {
+                    Ok(driven) => driven,
+                    Err(ReplicaError::Fenced(cause)) => return Err(NodeError::Fenced(cause)),
+                    Err(_) => return Ok(None),
+                };
             let submitted = self.replica.in_flight() > out_before;
             let messages = std::mem::take(&mut self.out.messages);
             let released = !messages.is_empty();

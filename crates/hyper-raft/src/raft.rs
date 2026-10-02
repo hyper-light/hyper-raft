@@ -1682,6 +1682,14 @@ impl<S: Storage> Raft<S> {
         self.watch_mut()?.timing = Some((nanos(timing.span), nanos(timing.round)));
         Ok(())
     }
+    /// The timing the owner last gave, if any.
+    pub fn timing(&self) -> Option<Timing> {
+        let (span, round) = self.watch.as_ref()?.timing?;
+        Some(Timing {
+            span: std::time::Duration::from_nanos(span),
+            round: std::time::Duration::from_nanos(round),
+        })
+    }
     /// The owner holds this member's campaigns, or lets them go: its log may
     /// lack what it acknowledged, or it is stalled for room
     /// (`docs/durable.md` §5, §8). Everything else goes on: it trusts and

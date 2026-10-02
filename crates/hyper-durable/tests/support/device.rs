@@ -5,7 +5,7 @@
 //! `crates/range/tests/sim.rs` at `1c179e8`) and focal's F17 cases, against this shell.
 use std::sync::mpsc::{Receiver, sync_channel};
 use std::task::Waker;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use hyper_block::buf::Alignment;
 use hyper_block::sim::{Crash, Fault, SimFile};
@@ -99,8 +99,18 @@ impl Device {
             .unwrap();
     }
 
+    /// The member's paths are measured: it is given its group's timing, and campaigns by
+    /// suspicion from here on. Until then only the founder campaigns, on its owner's word, as no
+    /// span is chosen before a quorum's paths are measured (`docs/timing.md` §2.3).
+    pub fn measured(&mut self) {
+        if let Some(r) = self.replica.as_mut() {
+            r.set_timing(timing()).unwrap();
+        }
+    }
+
     /// Loses power: the process with everything its log and state machine had not made
-    /// durable. The device keeps what `crash` says of its unflushed sectors.
+    /// durable. The device keeps what `crash` says of its unflushed sectors. It reopens with its
+    /// paths measured, as its node's are.
     pub fn crash(&mut self, crash: Crash) {
         let replica = self.replica.take().expect("up");
         self.acted_before
@@ -113,11 +123,12 @@ impl Device {
         let (log, _) = Log::open(file, log_config(), LOG_ID).expect("the log reopens");
         self.log = Some(log);
         self.open();
+        self.measured();
     }
 
     /// Drives the replica once; its messages go to `wire`. The configuration it held when a
     /// failed write fenced it, if one did.
-    pub fn drive(&mut self, now: Instant, wire: &mut Vec<Message>) -> Option<ConfState> {
+    pub fn drive(&mut self, now: u64, wire: &mut Vec<Message>) -> Option<ConfState> {
         let replica = self.replica.as_mut()?;
         if replica.fenced().is_some() {
             return None;
@@ -135,7 +146,7 @@ impl Device {
 
     /// Waits until every write out is answered, driving as answers come: the log wakes the
     /// member once for every write it answers, so a wait never outlasts one.
-    pub fn settle(&mut self, now: Instant, wire: &mut Vec<Message>) -> Option<ConfState> {
+    pub fn settle(&mut self, now: u64, wire: &mut Vec<Message>) -> Option<ConfState> {
         loop {
             let cut = self.drive(now, wire);
             if cut.is_some() {
@@ -186,14 +197,26 @@ pub struct Case {
     pub action: Action,
 }
 
+/// The timing a directed run's members elect by (timing step L-2): a round of ten of the run's
+/// 10 ms rounds and a span as long, as the ticks before it waited ten ticks of a round each and
+/// drew over ten more. A message is delivered at the end of the round it was sent in, so a vote
+/// round takes two or three rounds and is covered.
+pub fn timing() -> hyper_raft::Timing {
+    hyper_raft::Timing {
+        span: Duration::from_millis(100),
+        round: Duration::from_millis(100),
+    }
+}
+
 /// Rounds a directed run waits for what a group with a quorum and no faults does within a few
-/// election timeouts: twenty of the longest timeout the core draws, `2 · election_tick`, as
-/// mantle's directed runs wait. Reaching it is the failure the run looks for.
-pub const PATIENT_ROUNDS: usize = 40 * 10;
+/// elections: twenty of the longest wait the core draws, a round and the span, as mantle's
+/// directed runs wait twenty of their longest timeout. Reaching it is the failure the run looks
+/// for.
+pub const PATIENT_ROUNDS: usize = 20 * 20;
 
 pub struct Directed {
     pub devices: Vec<Device>,
-    now: Instant,
+    now: u64,
 }
 
 impl Directed {
@@ -206,7 +229,7 @@ impl Directed {
             devices: (1..=case.members)
                 .map(|id| Device::new(id, seed, &configuration))
                 .collect(),
-            now: Instant::now(),
+            now: 0,
         }
     }
 
@@ -240,18 +263,34 @@ impl Directed {
         }
     }
 
-    /// One round: every member ticks, takes its ready, the operator looking on after each, and
-    /// what was sent arrives. The target's configuration when its write failed, if one did.
-    pub fn round(&mut self, case: &Case, takes: Takes) -> Option<ConfState> {
-        self.now += Duration::from_millis(10);
-        let now = self.now;
+    /// Every member's paths are measured ([`Device::measured`]).
+    pub fn measured(&mut self) {
         for d in &mut self.devices {
-            if let Some(r) = d.replica.as_mut()
-                && r.fenced().is_none()
+            d.measured();
+        }
+    }
+
+    /// The member `id`'s power was cut and it reopened: every other member's detectors see its
+    /// new incarnation.
+    pub fn restarted(&mut self, id: u64) {
+        for d in &mut self.devices {
+            if d.id != id
+                && let Some(r) = d.replica.as_mut()
             {
-                r.tick().unwrap();
+                match r.restarted(id) {
+                    Ok(()) | Err(ReplicaError::Fenced(_)) => {}
+                    Err(e) => panic!("member {}: restarted: {e}", d.id),
+                }
             }
         }
+    }
+
+    /// One round: the clock moves on, every member takes its ready (woken at the clock), the
+    /// operator looking on after each, and what was sent arrives. The target's configuration
+    /// when its write failed, if one did.
+    pub fn round(&mut self, case: &Case, takes: Takes) -> Option<ConfState> {
+        self.now += 10_000_000;
+        let now = self.now;
         let mut wire = Vec::new();
         let mut cut = None;
         let ids: Vec<u64> = self.devices.iter().map(|d| d.id).collect();
@@ -289,7 +328,7 @@ impl Directed {
         cut
     }
 
-    pub fn now(&self) -> Instant {
+    pub fn now(&self) -> u64 {
         self.now
     }
 }

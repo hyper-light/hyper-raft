@@ -5,6 +5,7 @@
 use std::collections::VecDeque;
 use std::sync::mpsc::{Receiver, sync_channel};
 use std::task::Waker;
+use std::sync::OnceLock;
 use std::time::Instant;
 
 use hyper_block::block::BlockFile;
@@ -251,7 +252,7 @@ impl<F: BlockFile + 'static> Group<F> {
         let leader = self.handles[0];
         let wire = &mut self.wire;
         self.owner
-            .turn(Instant::now(), &mut self.out, |h, driven, out| {
+            .turn(now(), &mut self.out, |h, driven, out| {
                 driven.unwrap();
                 wire.extend(out.messages.drain(..));
                 if h == leader {
@@ -342,4 +343,11 @@ impl<F: BlockFile + 'static> Group<F> {
     pub fn flushes(&self) -> u64 {
         self.logs.iter().map(|l| l.flushed().0).sum()
     }
+}
+
+/// The owner's clock in nanoseconds since the first reading, as the shell takes it.
+fn now() -> u64 {
+    static EPOCH: OnceLock<Instant> = OnceLock::new();
+    let epoch = *EPOCH.get_or_init(Instant::now);
+    u64::try_from(epoch.elapsed().as_nanos()).unwrap_or(u64::MAX)
 }

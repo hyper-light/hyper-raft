@@ -17,6 +17,7 @@
 
 mod support;
 
+use std::sync::OnceLock;
 use std::task::Waker;
 use std::time::Instant;
 
@@ -61,13 +62,40 @@ fn sole<B: Budget>(depth: usize, budget: B, tune: impl FnOnce(&mut Settings)) ->
     r
 }
 
+/// Elects member 1 of three by hand: it campaigns, and the test answers its pre-votes and then
+/// its votes as if from the other two.
+fn elect_by_hand(r: &mut Sim) {
+    r.campaign().unwrap();
+    for asked in [MessageType::MsgRequestPreVote, MessageType::MsgRequestVote] {
+        let answer = match asked {
+            MessageType::MsgRequestPreVote => MessageType::MsgRequestPreVoteResponse,
+            _ => MessageType::MsgRequestVoteResponse,
+        };
+        let out = pump(r);
+        for m in out.messages {
+            if m.msg_type == asked {
+                r.step(Message {
+                    msg_type: answer,
+                    from: m.to,
+                    to: 1,
+                    term: m.term,
+                    ..Message::default()
+                })
+                .unwrap();
+            }
+        }
+    }
+    pump(r);
+    assert!(r.is_leader());
+}
+
 /// Drives `r` and makes every write durable until nothing is out and nothing more to do.
 fn pump<B: Budget>(r: &mut Sim<B>) -> Output<(u64, Vec<u8>)> {
     let mut all = Output::default();
     let mut out = Output::default();
     for _ in 0..10_000 {
         out.clear();
-        let driven = r.drive(Instant::now(), waker(), &mut out).unwrap();
+        let driven = r.drive(now(), waker(), &mut out).unwrap();
         all.messages.append(&mut out.messages);
         all.answers.append(&mut out.answers);
         all.reads.append(&mut out.reads);
@@ -105,7 +133,7 @@ fn the_writes_out_never_pass_the_stores_depth() {
         for i in 0..64u64 {
             r.propose(Vec::new(), i.to_le_bytes().to_vec()).unwrap();
             out.clear();
-            r.drive(Instant::now(), waker(), &mut out).unwrap();
+            r.drive(now(), waker(), &mut out).unwrap();
             deepest = deepest.max(r.in_flight());
             assert!(r.core().in_flight() <= depth, "depth {depth}");
             assert!(r.in_flight() <= depth + 1, "depth {depth}");
@@ -153,8 +181,6 @@ fn a_change_waits_behind_the_fence_and_what_waits_is_bounded() {
     let page = 256u64;
     let mut s = settings(1, 9);
     s.core.max_committed_size_per_ready = page;
-    s.core.check_quorum = false;
-    s.core.pre_vote = false;
     let mut r: Sim = Replica::open(
         &s,
         SimStore::new(depth),
@@ -162,22 +188,7 @@ fn a_change_waits_behind_the_fence_and_what_waits_is_bounded() {
         Unbounded,
     )
     .unwrap();
-    r.campaign().unwrap();
-    let mut out = pump(&mut r);
-    for m in out.messages.drain(..) {
-        if m.msg_type == MessageType::MsgRequestVote {
-            r.step(Message {
-                msg_type: MessageType::MsgRequestVoteResponse,
-                from: m.to,
-                to: 1,
-                term: m.term,
-                ..Message::default()
-            })
-            .unwrap();
-        }
-    }
-    pump(&mut r);
-    assert!(r.is_leader());
+    elect_by_hand(&mut r);
     let ack = |r: &mut Sim| {
         let index = r.core().raft.log().last_index().unwrap();
         let term = r.term();
@@ -200,13 +211,13 @@ fn a_change_waits_behind_the_fence_and_what_waits_is_bounded() {
     for i in 0..40u64 {
         r.propose(Vec::new(), vec![i as u8; 32]).unwrap();
         let mut out = Output::default();
-        r.drive(Instant::now(), waker(), &mut out).unwrap();
+        r.drive(now(), waker(), &mut out).unwrap();
     }
     let mut held = None;
     for _ in 0..200 {
         ack(&mut r);
         let mut out = Output::default();
-        r.drive(Instant::now(), waker(), &mut out).unwrap();
+        r.drive(now(), waker(), &mut out).unwrap();
         if let Some(range) = r.behind_fence() {
             held = Some(range);
             let entry = 32 + hyper_raft::wire::ENTRY_FIXED_BYTES as u64;
@@ -229,22 +240,22 @@ fn a_change_waits_behind_the_fence_and_what_waits_is_bounded() {
     assert!(r.durable_commit() >= r.applied().index);
 }
 
-/// A write refused for room stalls the replica: inputs are refused `Stalled`, ticks dropped,
-/// snapshot reports kept (one a member, members only), and the refused writes are made again,
-/// in order, once the log has room; nothing was lost.
+/// A write refused for room stalls the replica: inputs are refused `Stalled`, its campaigns held
+/// whatever its detectors say, snapshot reports kept (one a member, members only), and the
+/// refused writes are made again, in order, once the log has room; nothing was lost.
 #[test]
 fn a_write_refused_for_room_stalls_the_replica_until_it_is_made_again() {
     let mut r = sole(3, Unbounded, |s| s.core.limits.pending_reads = 8);
     for i in 0..3u64 {
         r.propose(Vec::new(), i.to_le_bytes().to_vec()).unwrap();
         let mut out = Output::default();
-        r.drive(Instant::now(), waker(), &mut out).unwrap();
+        r.drive(now(), waker(), &mut out).unwrap();
     }
     r.log_mut().refuse = Some(Fault::Room("the group's retained bound"));
     r.log_mut().make_durable();
     r.log_mut().full = true;
     let mut out = Output::default();
-    let driven = r.drive(Instant::now(), waker(), &mut out).unwrap();
+    let driven = r.drive(now(), waker(), &mut out).unwrap();
     assert!(r.is_stalled());
     assert_eq!(
         driven.stalled,
@@ -259,17 +270,20 @@ fn a_write_refused_for_room_stalls_the_replica_until_it_is_made_again() {
     assert_eq!(r.read(b"r".to_vec()), Err(ReplicaError::Stalled));
     assert_eq!(r.campaign(), Err(ReplicaError::Stalled));
     let term = r.term();
+    r.suspect(2).unwrap();
     for _ in 0..100 {
-        r.tick().unwrap();
+        let mut out = Output::default();
+        let driven = r.drive(now(), waker(), &mut out).unwrap();
+        assert_eq!(driven.wake, None, "a stalled member is due for nothing");
     }
-    assert_eq!(r.term(), term, "a stalled member's timers ran");
+    assert_eq!(r.term(), term, "a stalled member campaigned");
     for member in [1, 9, 1] {
         r.report_snapshot(member, true).unwrap();
     }
     r.log_mut().full = false;
     // Nothing is made again until room may have been freed: the owner says so.
     let mut out = Output::default();
-    r.drive(Instant::now(), waker(), &mut out).unwrap();
+    r.drive(now(), waker(), &mut out).unwrap();
     assert!(r.is_stalled());
     r.resume();
     pump(&mut r);
@@ -364,18 +378,18 @@ fn an_unwind_inside_a_call_fences_the_replica() {
     r.campaign().unwrap();
     let mut out = Output::default();
     for _ in 0..8 {
-        r.drive(Instant::now(), waker(), &mut out).unwrap();
+        r.drive(now(), waker(), &mut out).unwrap();
     }
     r.propose(Vec::new(), b"boom".to_vec()).unwrap();
     let mut fenced = None;
     for _ in 0..8 {
-        if let Err(e) = r.drive(Instant::now(), waker(), &mut out) {
+        if let Err(e) = r.drive(now(), waker(), &mut out) {
             fenced = Some(e);
             break;
         }
     }
     assert_eq!(fenced, Some(ReplicaError::Fenced(Cause::Unwound)));
-    assert_eq!(r.tick(), Err(ReplicaError::Fenced(Cause::Unwound)));
+    assert_eq!(r.suspect(2), Err(ReplicaError::Fenced(Cause::Unwound)));
 }
 
 fn entries(first: u64, terms: &[u64]) -> Vec<Entry> {
@@ -499,7 +513,8 @@ fn a_log_that_starts_past_the_state_machine_does_not_open() {
 
 /// A marked member (its log may lack entries it acknowledged) takes no part in elections: it
 /// refuses to campaign, drops a vote asked by a candidate behind its mark, and sends no request
-/// for votes of its own.
+/// for votes of its own, though it opened knowing no leader and its detectors suspect every
+/// peer: its campaigns are held, and it is due for nothing.
 #[test]
 fn a_marked_member_takes_no_part_in_elections() {
     let mut store = SimStore::new(1);
@@ -537,8 +552,20 @@ fn a_marked_member_takes_no_part_in_elections() {
         ..Message::default()
     })
     .unwrap();
-    for _ in 0..100 {
-        r.tick().unwrap();
+    r.set_timing(hyper_raft::Timing {
+        span: std::time::Duration::from_millis(1),
+        round: std::time::Duration::from_millis(1),
+    })
+    .unwrap();
+    r.suspect(1).unwrap();
+    r.suspect(3).unwrap();
+    let start = now();
+    let mut out = Output::default();
+    for step in 0..100u64 {
+        out.clear();
+        let at = start + step * 1_000_000;
+        let driven = r.drive(at, waker(), &mut out).unwrap();
+        assert_eq!(driven.wake, None, "a marked member is due for nothing");
     }
     let out = pump(&mut r);
     assert!(
@@ -590,7 +617,7 @@ fn the_owner_gives_each_replica_one_ready_a_turn() {
     assert!(owner.insert(extra).is_err());
     let mut out = Output::default();
     for _ in 0..50 {
-        owner.turn(Instant::now(), &mut out, |_, d, _| {
+        owner.turn(now(), &mut out, |_, d, _| {
             d.unwrap();
         });
         for &h in &handles {
@@ -615,7 +642,7 @@ fn the_owner_gives_each_replica_one_ready_a_turn() {
     }
     let mut driven = [0u32; 3];
     for _ in 0..4 {
-        owner.turn(Instant::now(), &mut out, |h, d, _| {
+        owner.turn(now(), &mut out, |h, d, _| {
             d.unwrap();
             driven[h.slot()] += 1;
         });
@@ -654,8 +681,6 @@ fn the_owner_gives_each_replica_one_ready_a_turn() {
 /// A leader of three, elected by hand, whose followers' answers are stepped in by the test.
 fn led(depth: usize, ahead: bool) -> Sim {
     let mut s = settings(1, 9);
-    s.core.check_quorum = false;
-    s.core.pre_vote = false;
     s.core.apply_unpersisted = ahead;
     let mut r: Sim = Replica::open(
         &s,
@@ -664,22 +689,7 @@ fn led(depth: usize, ahead: bool) -> Sim {
         Unbounded,
     )
     .unwrap();
-    r.campaign().unwrap();
-    let out = pump(&mut r);
-    for m in out.messages {
-        if m.msg_type == MessageType::MsgRequestVote {
-            r.step(Message {
-                msg_type: MessageType::MsgRequestVoteResponse,
-                from: m.to,
-                to: 1,
-                term: m.term,
-                ..Message::default()
-            })
-            .unwrap();
-        }
-    }
-    pump(&mut r);
-    assert!(r.is_leader());
+    elect_by_hand(&mut r);
     r
 }
 
@@ -706,11 +716,11 @@ fn a_leader_applies_its_own_term_before_its_write_is_durable() {
         let mut r = led(3, ahead);
         r.propose(Vec::new(), b"fast".to_vec()).unwrap();
         let mut out = Output::default();
-        r.drive(Instant::now(), waker(), &mut out).unwrap();
+        r.drive(now(), waker(), &mut out).unwrap();
         acknowledge(&mut r, 2);
         acknowledge(&mut r, 3);
         out.clear();
-        r.drive(Instant::now(), waker(), &mut out).unwrap();
+        r.drive(now(), waker(), &mut out).unwrap();
         let answered = out.answers.iter().any(|(_, data)| data == b"fast");
         let disk = r.log_mut().disk.last();
         assert_eq!(
@@ -725,4 +735,12 @@ fn a_leader_applies_its_own_term_before_its_write_is_durable() {
         pump(&mut r);
         assert!(r.machine().now.entries.iter().any(|(_, _, d)| d == b"fast"));
     }
+}
+
+/// The owner's clock in nanoseconds: the test reads the host's monotonic clock at its edge, as an
+/// owner does, and hands the shell nanoseconds since the first reading.
+fn now() -> u64 {
+    static EPOCH: OnceLock<Instant> = OnceLock::new();
+    let epoch = *EPOCH.get_or_init(Instant::now);
+    u64::try_from(epoch.elapsed().as_nanos()).unwrap_or(u64::MAX)
 }

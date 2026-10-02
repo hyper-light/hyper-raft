@@ -443,12 +443,28 @@ Every call into the core and the state machine runs inside an unwind boundary (f
 
 ## 8. Composition
 
-**hyper-timing (L-2).** The core campaigns on its detector's suspicion of the leader's node after
-the election law's randomized delay (`docs/timing.md` §2.3). The shell withholds a suspicion from the
-core while the member is marked, stalled or fenced, and the core already refuses one while a
-committed change is unapplied. A vote's latency is a flush (I1), which the ballot charges as the mean
-flush (`Flushes`): the shell feeds that fold with each hard-state write's submit-to-durable time, on
-the owner's clock passed into `drive`. A node heartbeats only after its log took a write and a flush
+**hyper-timing (L-2, built).** The core elects by suspicion (`docs/timing.md` §2.8): it campaigns
+when it trusts no leader, after the election law's randomized delay, and takes no ticks; the shell
+opens every core so (`Elections::Suspicion`) and has no `tick`. The owner tells a replica what its
+node's detectors believe (`Replica::suspect`, `trust`, `restarted`) and its group's measured timing
+(`Replica::set_timing`); `drive` wakes the core at the owner's clock, and `Driven::wake` and
+`Replica::deadline` say when to drive again though nothing arrives, none for a group with nothing in
+flight. The clock is the owner's monotonic clock in nanoseconds, a `u64`, as the core's and
+hyper-liveness's are (`docs/timing.md` §2.9: one type a simulated world drives every sans-io crate
+by; an owner with an `Instant` converts at its edge). The node's liveness stream (L-3) is wired by
+the owner: `Owner::pairs` keeps the stream told which peers each replica's group has,
+`Owner::believe` takes each of its changes to the replicas with a member on that node,
+`Owner::measure` derives each group's timing from what the stream measured
+(`Replica::measure`) and charges the leaders' pairs their groups' expected election, and
+`Driven::flushed` is the flush each heartbeat proves (`crates/hyper-durable/tests/liveness.rs`). The shell holds the core's campaigns while the member is marked or stalled
+(`RawNode::hold_campaigns`), and the core already holds one while a committed change is unapplied.
+It does not withhold the detectors' words, as the plan here said it would: a marked follower that
+kept trusting a leader its detector suspected would refuse every pre-vote for that leader's group,
+and a group whose other voter is a candidate could not elect; words change nothing durable, so a
+stalled member takes them too, and a fenced one takes nothing, its owner telling the reopened
+replica what its detectors believe. A vote's latency is a flush (I1), which the ballot charges as
+the mean flush (`Flushes`): the shell feeds that fold with each hard-state write's
+submit-to-durable time, on the owner's clock passed into `drive`. A node heartbeats only after its log took a write and a flush
 within the period (`docs/timing.md` §2.1, L-3): the log's completions are that evidence.
 
 **hyper-transport.** Messages leave as the shell releases them; the transport may lose or reorder
@@ -494,7 +510,14 @@ pub struct Replica<L: LogStore, M: StateMachine, B: Budget = Unbounded> { /* cor
 impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
     pub fn open(config: &Config, log: L, machine: M, budget: B) -> Result<Self, OpenError>;
     pub fn step(&mut self, message: Message) -> Result<(), ReplicaError>;
-    pub fn suspect(&mut self, node: NodeId) -> Result<(), ReplicaError>;
+    /// What the node's failure detectors believe of a member's node (timing step L-2).
+    pub fn suspect(&mut self, member: NodeId) -> Result<(), ReplicaError>;
+    pub fn trust(&mut self, member: NodeId) -> Result<(), ReplicaError>;
+    pub fn restarted(&mut self, member: NodeId) -> Result<(), ReplicaError>;
+    /// The group's span and round tail, from hyper-timing's law over the measured paths.
+    pub fn set_timing(&mut self, timing: Timing) -> Result<(), ReplicaError>;
+    /// When to drive though nothing arrives; none for a group with nothing in flight.
+    pub fn deadline(&self) -> Option<u64>;
     pub fn propose(&mut self, entry: &[u8]) -> Result<(), ReplicaError>;
     pub fn propose_fast(&mut self, entry: &[u8]) -> Result<u64, ReplicaError>;
     pub fn read(&mut self, context: &[u8]) -> Result<(), ReplicaError>;
@@ -502,7 +525,7 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
     pub fn transfer(&mut self, to: NodeId) -> Result<(), ReplicaError>;
     pub fn report_snapshot(&mut self, to: NodeId, arrived: bool) -> Result<(), ReplicaError>;
     /// §2.2. Fills the owner's buffers, which it reuses: no allocation in a steady state.
-    pub fn drive(&mut self, now: Instant, waker: &Waker, out: &mut Output<M::Answer>)
+    pub fn drive(&mut self, now_ns: u64, waker: &Waker, out: &mut Output<M::Answer>)
         -> Result<Driven, ReplicaError>;
     pub fn compact(&mut self, keep: u64) -> Result<(), ReplicaError>;
 }
@@ -641,13 +664,13 @@ and allocates no more on that project's workload.
 - **`StateMachine`** (`src/machine.rs`) applies an `EntryRef`, borrowed, with no copy; its
   `durable` point carries its term (§4.3); `image`, `install` (durable before it returns) and
   `persist` are its snapshot and compaction.
-- **`Replica`** (`src/replica.rs`): `open`, `tick`, `step`, `campaign`, `propose`, `propose_fast`,
-  `change`, `read`, `transfer`, `report_unreachable`, `report_snapshot`, `drive`, `compact`,
-  `resume`. Every call runs inside the unwind boundary. A drive takes the log's answers first and
+- **`Replica`** (`src/replica.rs`): `open`, `step`, `suspect`, `trust`, `restarted`,
+  `set_timing`, `deadline`, `campaign`, `propose`, `propose_fast`, `change`, `read`, `transfer`,
+  `report_unreachable`, `report_snapshot`, `drive`, `compact`, `resume`. Every call runs inside the unwind boundary. A drive takes the log's answers first and
   only then, applies what the fence allows, takes at most one `Ready` (§7's quantum), and writes the
   commit alone when the fence or a quiet period asks. `Settings::quiet` is the owner's period.
-  `L-2`'s `suspect` is not there: the core campaigns on ticks until L-2, and a stalled replica's
-  ticks are dropped.
+  Elections are by suspicion (L-2, §8): no ticks; a drive wakes the core and `Driven::wake` says
+  when to drive again, and a stalled or marked replica's campaigns are held.
 - **`Owner`** (`src/owner.rs`): an arena by generational handle, one waker a slot made by the
   embedder, turns by deficit round robin with a quantum of one `Ready`. The crate spawns nothing.
 - **`Budget`**: reserved before an input, settled to the replica's resident bytes after each call;
@@ -678,16 +701,31 @@ Tests (`crates/hyper-durable/tests`):
   write is durable, its disk the slowest; five voters at depth one), 128 seeds of 5,000 steps each
   by default, with refusals, failed writes, crashes, compactions and changes; and a crash after
   every step of a schedule that did something, in turn (`a_crash_after_every_durability_event_loses_nothing_durable`).
+  Members elect by suspicion: a tenth of the steps are a detector's word about a peer (right nine
+  in ten of a member that is down, wrong one in ten of one that is up), the clock moves a
+  millisecond a step, a member reopened after a crash is told to the others as restarted, and the
+  group settles with every detector trusting every member. The round tail and the span are half a
+  second each, as the ticks before waited ten ticks of fifty steps and drew over ten more. Soaked
+  by suspicion at 1,000 seeds a shape and the crash after every event at 64 seeds; the soak found
+  one harness defect, a settle that resumed a stalled replica once and never again while a refusal
+  taken after it stalled the replica anew (seed 5, crash 4), now resumed each round.
   A crash after a drive is the harder case for every event inside it: nothing durable changes
   within a drive, and what it released has left. Soaked at 1,000 seeds a shape; three shell
   defects were found and fixed so (a commit-only write naming entries not yet written; a
   compaction behind a snapshot's start still out; a refused write made again before room was
   freed, a refusal a drive), and one in the harness's own model of hyper-log's refusals.
 - `directed.rs`: mantle's four cases and focal's two, on hyper-log over simulated devices with the
-  power cut at each write and flush in turn, both ways of taking readies.
+  power cut at each write and flush in turn, both ways of taking readies. The founder campaigns on
+  its owner's word; the members are given their timing once it leads, as no span is chosen before
+  their paths are measured, and a member whose power was cut reopens timed, told to the others as
+  restarted.
 - `crates/hyper-durable-e2e`, real processes: each member a `Replica` on hyper-log over a real,
   fully flushed file (`DeviceFile`), over UDP in hyper-raft-e2e's datagrams, woken by its log's
   answers through a datagram to its own socket (four threads a process, whatever it holds). The
+  members elect by suspicion: each times its paths to the others by probes once a period and
+  derives its group's timing by hyper-timing's law, and the test, which kills and starts them, tells
+  the others it suspects a member it killed and that one it started is a new incarnation (L-3's
+  stream and L-4's harness replace it). The
   test (`tests/kill.rs`) kills the leader and a follower with `SIGKILL` at each named durability
   point (a write submitted; a write durable whose answer was not taken; messages released), and at
   seeded random points and counts; focal's F17 cases (the founder killed once it applied the
@@ -705,6 +743,10 @@ Tests (`crates/hyper-durable/tests`):
     readies are taken ahead; a core change is asked;
   - the extra switches are involuntary, the price of the overlap;
   - the one-member tail does not reproduce in nine rotated rounds.
+- `liveness.rs`: the shell on the node-pair liveness stream (L-3), three nodes on one simulated
+  clock, 64 seeds by default: elected from nothing, silent while idle but after a detector's change,
+  and the leader's node killed, suspected by every survivor within its stated bound and replaced
+  (`docs/timing.md` §2.9).
 - `shell.rs`, `hyperlog.rs`, `threads.rs`: each bound of §6 at its edge, the open repairs of §4.3,
   marks, the unwind boundary, the owner's turns, parts and refusals on hyper-log, and the threads
   an owner's sixty-four groups cost (none of their own).

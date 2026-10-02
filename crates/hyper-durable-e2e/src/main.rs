@@ -1,7 +1,7 @@
 //! A member of a hyper-durable group, as a process (`hyper_durable_e2e::node`).
 //!
 //! ```text
-//! hyper-durable-node --id N --voters 1,2,3 --listen 127.0.0.1:0 --log PATH --tick-ms T
+//! hyper-durable-node --id N --voters 1,2,3 --listen 127.0.0.1:0 --log PATH --period-ms T
 //!                    --max-keys K --max-pending P
 //! ```
 //!
@@ -50,7 +50,7 @@ fn parse(arguments: &[String]) -> Result<Arguments, String> {
         settings: Settings {
             id: value(arguments, "--id")?,
             voters,
-            tick: Duration::from_millis(value(arguments, "--tick-ms")?),
+            period: Duration::from_millis(value(arguments, "--period-ms")?),
             max_keys: value(arguments, "--max-keys")?,
             max_pending: value(arguments, "--max-pending")?,
         },

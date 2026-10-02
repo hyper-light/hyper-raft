@@ -465,6 +465,20 @@ fn a_killed_peer_is_suspected_within_the_stated_bound() {
         let settle = sim.now + 2_000 * MS;
         sim.run(settle);
         let victim = 3usize;
+        // Killed while every survivor trusts it: one that suspected it by a mistake just before
+        // would hold that suspicion through the kill and make no new one to measure.
+        let trusted = |sim: &Sim| {
+            (0..3).all(|node| {
+                matches!(
+                    sim.nodes[node].liveness.trust(victim as u64 + 1),
+                    Some(Trust::Trusted { .. })
+                )
+            })
+        };
+        while !trusted(&sim) {
+            let next = sim.now + MS;
+            sim.run(next);
+        }
         let killed_at = sim.now;
         sim.nodes[victim].alive = false;
         let last_sent: Vec<u64> = (0..4usize)

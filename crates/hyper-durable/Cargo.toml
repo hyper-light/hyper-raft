@@ -9,6 +9,7 @@ repository.workspace = true
 
 [dependencies]
 hyper-block = { path = "../hyper-block" }
+hyper-liveness = { path = "../hyper-liveness" }
 hyper-log = { path = "../hyper-log" }
 hyper-raft = { path = "../hyper-raft" }
 hyper-timing = { path = "../hyper-timing" }

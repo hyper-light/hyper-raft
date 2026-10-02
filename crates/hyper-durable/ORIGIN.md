@@ -69,3 +69,17 @@ made again rather than fencing the replica (`Replica::make_again`).
   frame-sized writes would hold all three frames' bytes and the log's tests of a cold group's room
   fail; a group's third write waits in the log for its group's room instead, never refused, and
   `docs/durable.md` §14 item 1 measures whether the third frame earns its place.
+
+## L-2: elections by suspicion, on the node-pair stream
+
+Timing step L-2 (`docs/timing.md` §2.9, `docs/durable.md` §8). The shell opens every core electing
+by suspicion and has no `tick`; `suspect`, `trust`, `restarted`, `set_timing` and `deadline` reach
+the core, and `drive` wakes it. The time every call takes is the owner's monotonic clock in
+nanoseconds (`u64`), as the core's and hyper-liveness's. The campaigns are held while the member is
+marked or stalled (`RawNode::hold_campaigns`); the detectors' words are not withheld, which the plan
+had said, since a marked follower that kept trusting a suspected leader would refuse every
+pre-vote of its group. The owner wires the node's `hyper_liveness::Liveness`: `Owner::pairs`,
+`Owner::believe`, `Owner::measure`, `Replica::measure`, `Replica::believe_all`, `Replica::peers`,
+`Driven::flushed`. The simulation's settle resumed a stalled replica once and never again, so a
+refusal taken after it stalled the replica for good; found by the suspicion soak (seed 5, crash 4),
+it now resumes each round.

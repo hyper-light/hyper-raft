@@ -16,9 +16,21 @@
 //! least the largest unit of work, one `Ready`, so the round robin is fair within one unit
 //! (Shreedhar and Varghese, "Efficient Fair Queuing Using Deficit Round Robin", SIGCOMM 1995,
 //! Theorem 4.5: "if for all i, Quantum_i ≥ Max"), and a turn's work is O(1) a replica.
+//!
+//! **Liveness** (timing steps L-2 and L-3, `docs/timing.md` §2.8–§2.9). The node keeps one
+//! `hyper_liveness::Liveness`, a stream to each node it shares a group with, on the thread that
+//! owns its plane socket or on an owner's; the groups send no liveness of their own. The owner
+//! keeps its replicas' pairs attached ([`Owner::pairs`]), takes each change the stream reports to
+//! every replica that has a member on that node ([`Owner::believe`]; a member's id is its node's,
+//! as in focal and the E2E), derives each group's timing from what the stream measured and charges
+//! each leader's pair its groups' expected election ([`Owner::measure`]), and feeds the stream each
+//! replica's durable writes from [`Driven::flushed`]. A change reaches the replicas of that node
+//! only: the node's standing changed, which is rare, and an idle group is touched by nothing else.
 use std::collections::VecDeque;
 use std::task::Waker;
-use std::time::Instant;
+use std::time::Duration;
+
+use hyper_liveness::{Change, Liveness, PeerId};
 
 use crate::budget::Budget;
 use crate::machine::StateMachine;
@@ -44,6 +56,8 @@ struct Slot<R> {
     generation: u32,
     replica: Option<R>,
     queued: bool,
+    /// The peers the node's liveness stream was told this replica shares a group with.
+    attached: Vec<PeerId>,
 }
 
 /// One owner thread's replicas.
@@ -70,6 +84,7 @@ impl<L: LogStore, M: StateMachine, B: Budget> Owner<L, M, B> {
                 generation: 0,
                 replica: None,
                 queued: false,
+                attached: Vec::new(),
             })
             .collect();
         let count = u32::try_from(wakers.len()).unwrap_or(u32::MAX);
@@ -121,6 +136,7 @@ impl<L: LogStore, M: StateMachine, B: Budget> Owner<L, M, B> {
         let entry = self.entry_mut(handle)?;
         let replica = entry.replica.take()?;
         entry.generation = entry.generation.wrapping_add(1);
+        entry.attached.clear();
         self.free.push(handle.slot);
         Some(replica)
     }
@@ -179,12 +195,113 @@ impl<L: LogStore, M: StateMachine, B: Budget> Owner<L, M, B> {
         !self.queue.is_empty()
     }
 
+    /// Keeps the node's liveness stream told which peers the replica at `handle` shares a group
+    /// with: its configuration's other members, attached as they join and detached as they
+    /// leave; all of them detached once the replica is gone (`hyper_liveness::Liveness::attach`
+    /// counts the groups a pair shares). Called when the replica is inserted, after a drive that
+    /// may have changed its configuration, and before it is removed with `gone`. At most
+    /// `hyper_raft::MAX_MEMBERS` peers a replica.
+    pub fn pairs(
+        &mut self,
+        handle: Handle,
+        liveness: &mut Liveness,
+        gone: bool,
+    ) -> Result<(), hyper_liveness::Refusal> {
+        let Some(entry) = self
+            .slots
+            .get_mut(handle.slot())
+            .filter(|entry| entry.generation == handle.generation)
+        else {
+            return Ok(());
+        };
+        let mut now: Vec<PeerId> = match (&entry.replica, gone) {
+            (Some(replica), false) => replica.peers().collect(),
+            _ => Vec::new(),
+        };
+        now.sort_unstable();
+        now.dedup();
+        for peer in &now {
+            if entry.attached.binary_search(peer).is_err() {
+                liveness.attach(*peer)?;
+            }
+        }
+        for peer in &entry.attached {
+            if now.binary_search(peer).is_err() {
+                liveness.detach(*peer)?;
+            }
+        }
+        entry.attached = now;
+        Ok(())
+    }
+
+    /// A change the node's liveness stream reported, taken to every replica with a member on that
+    /// node, each queued for its next turn. A replica that refuses it is fenced and reopened by
+    /// its owner, which tells the new one what the stream believes
+    /// ([`Replica::believe_all`](crate::Replica::believe_all)).
+    pub fn believe(&mut self, change: &Change) {
+        let (peer, suspected) = match change {
+            Change::Suspected(suspicion) => (suspicion.peer, true),
+            Change::Trusted { peer, .. } => (*peer, false),
+        };
+        for at in 0..self.slots.len() {
+            let Some(entry) = self.slots.get_mut(at) else {
+                continue;
+            };
+            let Some(replica) = entry.replica.as_mut() else {
+                continue;
+            };
+            if entry.attached.binary_search(&peer).is_err() {
+                continue;
+            }
+            let _ = if suspected {
+                replica.suspect(peer)
+            } else {
+                replica.trust(peer)
+            };
+            if let Ok(slot) = u32::try_from(at) {
+                self.queue_slot(slot);
+            }
+        }
+    }
+
+    /// Each group's timing from what the node's liveness stream measured
+    /// ([`Replica::measure`](crate::Replica::measure)), and each leader's pair charged the mean
+    /// expected election `T_E` of the groups it leads here (`Liveness::set_election`: the mean
+    /// minimizes their summed unavailability, which is linear in `T_E`). Called when the stream's
+    /// estimates move: a pair configured again, a granularity or a flush mean that changed.
+    pub fn measure(&mut self, liveness: &mut Liveness) {
+        // The leaders' nodes and their groups' elections: at most one entry a peer the node keeps.
+        let mut charged: Vec<(PeerId, Duration, u32)> = Vec::new();
+        for entry in &mut self.slots {
+            let Some(replica) = entry.replica.as_mut() else {
+                continue;
+            };
+            let Ok(Some(span)) = replica.measure(liveness) else {
+                continue;
+            };
+            let leader = replica.leader();
+            if leader == 0 || leader == replica.id() {
+                continue;
+            }
+            match charged.iter_mut().find(|(peer, ..)| *peer == leader) {
+                Some((_, sum, count)) => {
+                    *sum = sum.saturating_add(span.election);
+                    *count = count.saturating_add(1);
+                }
+                None => charged.push((leader, span.election, 1)),
+            }
+        }
+        for (peer, sum, count) in charged {
+            let _ = liveness.set_election(peer, sum.checked_div(count).unwrap_or(sum));
+        }
+    }
+
     /// Drives each queued replica once, for at most one `Ready`, handing its output to `each`
     /// with its outcome; one with more to do is queued again behind the others. `out` is the
     /// owner's buffer, emptied before each drive. Returns the replicas driven.
     pub fn turn(
         &mut self,
-        now: Instant,
+        now: u64,
         out: &mut Output<M::Answer>,
         mut each: impl FnMut(Handle, Result<Driven, ReplicaError>, &mut Output<M::Answer>),
     ) -> usize {

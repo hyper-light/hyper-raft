@@ -35,15 +35,16 @@
 use std::collections::VecDeque;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::task::Waker;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
+use hyper_liveness::{Liveness, PeerId};
 use hyper_raft::proto::{
     self, ConfChange, ConfChangeV2, ConfState, Entry, EntryType, HardState, Message, MessageType,
     Snapshot, SnapshotMetadata,
 };
 use hyper_raft::wire::Record;
-use hyper_raft::{Config, RawNode, SnapshotStatus, StateRole, StorageError};
-use hyper_timing::Flushes;
+use hyper_raft::{Config, Elections, RawNode, SnapshotStatus, StateRole, StorageError, Timing};
+use hyper_timing::{Ballot, Flushes, Span, Trust};
 
 use crate::budget::{Budget, Unbounded};
 use crate::held::Held;
@@ -53,8 +54,10 @@ use crate::store::{Entries, EntryRef, Fault, Health, LogStore, Point, Write};
 /// How a replica runs.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Settings {
-    /// The core's settings. Its `applied` is the state machine's durable index and its
-    /// `limits.readies_in_flight` the store's depth, whatever is given here.
+    /// The core's settings. Its `applied` is the state machine's durable index, its
+    /// `limits.readies_in_flight` the store's depth, and its elections by suspicion (timing step
+    /// L-2, `docs/timing.md` §2.3), whatever is given here: the shell runs no election ticks, so
+    /// pre-vote and check-quorum must be on, or the replica does not open.
     pub core: Config,
     /// The owner's period: a commit no write has stated while the applied index ran past the
     /// durable commit for this long is written then, so a member that stops reopens with what it
@@ -170,6 +173,14 @@ pub struct Driven {
     pub out: usize,
     /// A write waits for room: what the log said.
     pub stalled: Option<Fault>,
+    /// When to drive the replica again though nothing arrives (`Replica::deadline`): a
+    /// campaign's delay, a leader's beat while its group has work in flight, a transfer's end.
+    /// None for a group with nothing in flight: it needs no wake at all.
+    pub wake: Option<u64>,
+    /// The latest write of the replica's that became durable in this drive: when it was
+    /// submitted and when its answer was taken. The node's liveness stream takes it as the flush
+    /// a heartbeat proves (`hyper_liveness::Liveness::on_durable`, `Write::Log`).
+    pub flushed: Option<(u64, u64)>,
 }
 
 /// The writes a replica made, by what they were for: what an owner reads to see what its group
@@ -203,7 +214,7 @@ struct Out {
     proposals: bool,
     /// Whether it moves the log's start: a snapshot's install or a compaction.
     start: bool,
-    submitted: Instant,
+    submitted: u64,
 }
 
 /// What a write is of.
@@ -289,10 +300,12 @@ pub struct Replica<L: LogStore, M: StateMachine, B: Budget = Unbounded> {
     repair: Option<u64>,
     fenced: Option<Cause>,
     /// When the applied index first ran past the durable commit with nothing out.
-    quiet_since: Option<Instant>,
+    quiet_since: Option<u64>,
     flushes: Flushes,
-    last_durable: Option<Instant>,
+    last_durable: Option<u64>,
     writes_made: Writes,
+    /// The latest write made durable since the last drive ended ([`Driven::flushed`]).
+    flushed: Option<(u64, u64)>,
 }
 
 /// The term of an entry the state machine applied, as a point.
@@ -351,6 +364,7 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
         let mut config = settings.core.clone();
         config.applied = durable.index;
         config.limits.readies_in_flight = depth;
+        config.elections = Elections::Suspicion;
         // A walk of the log reads a page the size of what one `Ready` gives to apply.
         let page = config.max_committed_size_per_ready;
         let held = Held::new(log, machine.configuration().clone(), view.hard_state, page);
@@ -387,6 +401,7 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
             flushes: Flushes::new(),
             last_durable: None,
             writes_made: Writes::default(),
+            flushed: None,
         };
         // A log compacted before the restart serves a lagging member only by snapshot.
         if view.start.index > 0 {
@@ -473,7 +488,7 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
 
     /// When the log last answered a write durable: the evidence a node heartbeats on
     /// (`docs/timing.md` §2.1, L-3).
-    pub fn last_durable(&self) -> Option<Instant> {
+    pub fn last_durable(&self) -> Option<u64> {
         self.last_durable
     }
 
@@ -660,17 +675,123 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
         )
     }
 
-    /// A tick of the group's clock. A replica stalled for room takes no part in its group, and
-    /// its timers resume when it does: the tick is dropped, not held (`docs/durable.md` §10:
-    /// mantle's held ticks replayed a burst of campaigns).
-    pub fn tick(&mut self) -> Result<(), ReplicaError> {
+    /// The owner's detectors suspect `member`'s node (timing step L-2, `docs/timing.md` §2.1):
+    /// a follower that knows it for its leader campaigns after its delay, a leader they leave no
+    /// quorum steps down. Taken while stalled or marked, as it changes nothing durable: the
+    /// replica's campaigns are held meanwhile (`docs/durable.md` §8), and what it believes of its
+    /// peers is current when they are let go. A fenced replica takes nothing; its owner tells
+    /// the reopened one what its detectors believe.
+    pub fn suspect(&mut self, member: u64) -> Result<(), ReplicaError> {
         self.guarded(|r| {
-            if r.stall.is_some() {
-                return Ok(());
-            }
-            let ticked = r.node.tick();
-            r.heard(ticked).map(drop)
+            let told = r.node.suspect(member);
+            r.heard(told)
         })
+    }
+
+    /// The owner's detectors trust `member`'s node again.
+    pub fn trust(&mut self, member: u64) -> Result<(), ReplicaError> {
+        self.guarded(|r| {
+            let told = r.node.trust(member);
+            r.heard(told)
+        })
+    }
+
+    /// The owner's detectors saw `member`'s node start again, a new incarnation: trusted, and
+    /// leading nothing it led before it stopped.
+    pub fn restarted(&mut self, member: u64) -> Result<(), ReplicaError> {
+        self.guarded(|r| {
+            let told = r.node.restarted(member);
+            r.heard(told)
+        })
+    }
+
+    /// What the owner's measurements give the group's elections: the span hyper-timing's law
+    /// chose over the measured paths to its voters, and their round tail (`hyper_raft::Timing`,
+    /// `Timing::of`). Given again whenever the law's ballot moves.
+    pub fn set_timing(&mut self, timing: Timing) -> Result<(), ReplicaError> {
+        self.guarded(|r| {
+            let set = r.node.set_timing(timing);
+            r.heard(set)
+        })
+    }
+
+    /// The other members of the group, each once: the node pairs the node's liveness stream keeps
+    /// for this group (`hyper_liveness::Liveness::attach`).
+    pub fn peers(&self) -> impl Iterator<Item = PeerId> + '_ {
+        let id = self.id();
+        self.node
+            .raft
+            .configuration()
+            .members()
+            .filter(move |member| *member != id)
+    }
+
+    /// Tells the core what the node's liveness stream believes of every other member now: on
+    /// opening, and on reopening a fenced replica, before any change reaches it.
+    pub fn believe_all(&mut self, liveness: &Liveness) -> Result<(), ReplicaError> {
+        let peers: Vec<PeerId> = self.peers().collect();
+        for peer in peers {
+            if liveness.trust(peer) == Some(Trust::Suspected) {
+                self.suspect(peer)?;
+            } else {
+                self.trust(peer)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The group's timing by hyper-timing's law over what the node's liveness stream measured
+    /// (`docs/timing.md` §2.3, §2.9): the ballot over the echoed round trips to the group's
+    /// voters (`Liveness::round_trip`), the mean flush of this replica's vote writes or, before
+    /// one, of the node's log writes (`Liveness::flush_mean`), and the node's timer granularity;
+    /// given to the core when it moved. The span, for the leader's pair's `T_E`
+    /// (`Liveness::set_election`); none before a quorum's paths and the granularity are measured,
+    /// when the core draws no delay and so does not campaign (§3, item 10).
+    pub fn measure(&mut self, liveness: &Liveness) -> Result<Option<Span>, ReplicaError> {
+        let Some(granularity) = liveness.granularity().filter(|g| !g.is_zero()) else {
+            return Ok(None);
+        };
+        let id = self.id();
+        let configuration = self.node.raft.configuration();
+        let voters = configuration.voters();
+        let paths = voters
+            .iter()
+            .filter(|voter| **voter != id)
+            .filter_map(|voter| liveness.round_trip(*voter));
+        let durable = self
+            .flushes
+            .mean()
+            .or_else(|| liveness.flush_mean())
+            .unwrap_or(Duration::ZERO);
+        let Some(ballot) = Ballot::measure(paths, voters.len(), durable, granularity) else {
+            return Ok(None);
+        };
+        let Some(span) = ballot.span(granularity) else {
+            return Ok(None);
+        };
+        let timing = Timing::of(&ballot, &span);
+        if self.node.raft.timing() != Some(timing) {
+            self.set_timing(timing)?;
+        }
+        Ok(Some(span))
+    }
+
+    /// When the owner is to drive the replica though nothing arrives (`Driven::wake`); none when
+    /// nothing is timed.
+    pub fn deadline(&self) -> Option<u64> {
+        self.node.deadline()
+    }
+
+    /// Wakes the core at the owner's clock (timing step L-2): what it armed since the last
+    /// drive is timed, and a campaign, a beat or a transfer's end that is due is done. Its
+    /// campaigns are held while the member's log may lack what it acknowledged or a write waits
+    /// for room: a marked member takes no part in elections (§5), a stalled one in nothing.
+    fn wake(&mut self, now: u64) -> Result<(), ReplicaError> {
+        let held = self.mark.is_some() || self.stall.is_some();
+        let told = self.node.hold_campaigns(held);
+        self.must(told)?;
+        let woken = self.node.wake(now);
+        self.must(woken).map(drop)
     }
 
     /// A message from the network, bound to its authenticated sender by the transport. While the
@@ -863,10 +984,11 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
 
     /// Does what there is to do (`docs/durable.md` §2.2): takes the log's answers, applies what
     /// the fence allows, and takes at most one `Ready`, whose write goes out with `waker`. `now`
-    /// is the owner's clock. Fills `out`, which the owner reuses.
+    /// is the owner's monotonic clock in nanoseconds, as the core's and hyper-liveness's are.
+    /// Fills `out`, which the owner reuses.
     pub fn drive(
         &mut self,
-        now: Instant,
+        now: u64,
         waker: &Waker,
         out: &mut Output<M::Answer>,
     ) -> Result<Driven, ReplicaError> {
@@ -875,6 +997,8 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
             if r.stall.is_some() {
                 r.make_again(now, waker)?;
             }
+            r.refresh_mark()?;
+            r.wake(now)?;
             if r.stall.is_none() {
                 r.take_reports()?;
                 r.release_fence(out)?;
@@ -889,7 +1013,7 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
         })
     }
 
-    fn driven(&self) -> Driven {
+    fn driven(&mut self) -> Driven {
         let slot = self.has_slot();
         let more = self.stall.is_none()
             && slot
@@ -901,6 +1025,8 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
             more,
             out: self.writes.len(),
             stalled: self.stall.as_ref().map(|stall| stall.fault.clone()),
+            wake: self.deadline(),
+            flushed: self.flushed.take(),
         }
     }
 
@@ -913,11 +1039,7 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
     /// Takes the log's answers, in the order submitted. Only here: a write submitted in this
     /// drive is never looked at in it, so what a drive gives out never hangs on how soon a flush
     /// happened to end (mantle's determinism finding, replica.md §5).
-    fn take_answers(
-        &mut self,
-        now: Instant,
-        out: &mut Output<M::Answer>,
-    ) -> Result<(), ReplicaError> {
+    fn take_answers(&mut self, now: u64, out: &mut Output<M::Answer>) -> Result<(), ReplicaError> {
         loop {
             let Some(front) = self.writes.front() else {
                 return Ok(());
@@ -945,7 +1067,7 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
         &mut self,
         write: Out,
         answer: Result<(), Fault>,
-        now: Instant,
+        now: u64,
         out: &mut Output<M::Answer>,
     ) -> Result<(), ReplicaError> {
         let behind = match self.stall.as_mut() {
@@ -973,17 +1095,15 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
     fn durable(
         &mut self,
         write: Out,
-        now: Instant,
+        now: u64,
         out: &mut Output<M::Answer>,
     ) -> Result<(), ReplicaError> {
         if write.state == State::Submitted {
             self.last_durable = Some(now);
+            self.flushed = Some((write.submitted, now));
             if write.vote {
-                let took = now.saturating_duration_since(write.submitted);
                 // A fold that is full keeps its mean: the sample is one of more than it counts.
-                let _ = self
-                    .flushes
-                    .on_flush(0, u64::try_from(took.as_nanos()).unwrap_or(u64::MAX));
+                let _ = self.flushes.on_flush(write.submitted, now);
             }
         }
         if let Some(commit) = write.commit {
@@ -1050,7 +1170,7 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
     /// room: one write of everything the core holds not yet durable, laid out from the core
     /// (R-4 keeps it until its notice), with the latest hard state and the messages every
     /// refused write held. Its notice is the last refused `Ready`'s, which covers all of them.
-    fn make_again(&mut self, now: Instant, waker: &Waker) -> Result<(), ReplicaError> {
+    fn make_again(&mut self, now: u64, waker: &Waker) -> Result<(), ReplicaError> {
         let freed = self.stall.as_ref().is_some_and(|stall| stall.freed);
         if !freed || !self.writes.is_empty() || !self.node.store().log.room() {
             return Ok(());
@@ -1182,7 +1302,7 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
     /// the commit; when none is due, a write of the commit alone does.
     fn take_ready(
         &mut self,
-        now: Instant,
+        now: u64,
         waker: &Waker,
         out: &mut Output<M::Answer>,
     ) -> Result<(), ReplicaError> {
@@ -1249,7 +1369,7 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
     /// answered it is durable, which at the front it already is.
     fn take_answers_of_empty(
         &mut self,
-        now: Instant,
+        now: u64,
         out: &mut Output<M::Answer>,
     ) -> Result<(), ReplicaError> {
         while self
@@ -1338,7 +1458,7 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
     /// A write of the commit alone, with the term and vote of the last write: the fence waits
     /// for it (`docs/durable.md` §4.1). Every entry the core gave to apply is committed and
     /// durable here, so the commit names only what the log holds once the write is durable.
-    fn commit_write(&mut self, now: Instant, waker: &Waker) -> Result<(), ReplicaError> {
+    fn commit_write(&mut self, now: u64, waker: &Waker) -> Result<(), ReplicaError> {
         let hard = HardState {
             commit: self
                 .stated_commit()?
@@ -1369,7 +1489,7 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
     /// A commit no write has stated while the applied index ran past the durable commit for a
     /// whole owner period is written then, one such write at a time, waited for by no one, so a
     /// member that stops reopens with what it applied (focal F17's `settle_commit`).
-    fn quiet_commit(&mut self, now: Instant, waker: &Waker) -> Result<(), ReplicaError> {
+    fn quiet_commit(&mut self, now: u64, waker: &Waker) -> Result<(), ReplicaError> {
         let behind = self.writes.is_empty()
             && self.fence.is_none()
             && self.applied.index > self.durable_commit();
@@ -1378,7 +1498,8 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
             return Ok(());
         }
         let since = *self.quiet_since.get_or_insert(now);
-        if now.saturating_duration_since(since) >= self.quiet && self.has_slot() {
+        let quiet = u64::try_from(self.quiet.as_nanos()).unwrap_or(u64::MAX);
+        if now.saturating_sub(since) >= quiet && self.has_slot() {
             self.quiet_since = None;
             self.writes_made.quiet = self.writes_made.quiet.saturating_add(1);
             self.commit_write(now, waker)?;
@@ -1680,12 +1801,7 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
     /// keeping `keep` entries for members that lag; true when a compaction's start went out.
     /// The start never passes the state machine's durable index (I8) nor what the log holds
     /// durably (`docs/durable.md` §4.2). Allowed while stalled: a compaction is what frees room.
-    pub fn compact(
-        &mut self,
-        keep: u64,
-        now: Instant,
-        waker: &Waker,
-    ) -> Result<bool, ReplicaError> {
+    pub fn compact(&mut self, keep: u64, now: u64, waker: &Waker) -> Result<bool, ReplicaError> {
         self.guarded(|r| {
             let persisted = r.machine.persist();
             r.machine_did(persisted)?;

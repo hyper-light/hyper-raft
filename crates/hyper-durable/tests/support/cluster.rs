@@ -1,10 +1,13 @@
 //! A group of replicas on [`SimStore`]s, driven one step at a time by a seeded schedule, and the
 //! oracle every step is held to.
 //!
-//! Every step is one of: a tick, a delivery or loss of a message, a drive of a member, a write of
-//! a member made durable (or refused, or failed), a proposal, a change of configuration, a read,
-//! a compaction, a crash. A crash loses every write not durable and the state machine's applied
-//! state past its durable point; the member reopens on what is left.
+//! Every step is one of: a word of a member's failure detectors about another (suspected, or
+//! trusted again), a delivery or loss of a message, a drive of a member, a write of a member made
+//! durable (or refused, or failed), a proposal, a change of configuration, a read, a compaction, a
+//! crash. Members elect by suspicion (timing step L-2) and take no ticks: the clock moves a
+//! millisecond a step, and a drive wakes the member at it. A crash loses every write not durable
+//! and the state machine's applied state past its durable point; the member reopens on what is
+//! left, and the others' detectors see its new incarnation.
 //!
 //! The oracle, against each member's durable state `D` (its store's disk) when an output leaves
 //! or the step ends (`docs/durable.md` §3):
@@ -26,7 +29,7 @@
 //! and what the drive released has left, for the others to act on.
 use std::collections::{BTreeMap, VecDeque};
 use std::task::Waker;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use hyper_durable::{Cause, Fault, Output, Replica, ReplicaError, Settings, Unbounded};
 use hyper_raft::proto::{
@@ -67,7 +70,10 @@ pub struct Node {
 /// A step of the schedule.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Op {
-    Tick(u64),
+    /// The first member's detectors suspect the second.
+    Suspect(u64, u64),
+    /// The first member's detectors trust the second again.
+    Trust(u64, u64),
     Deliver(usize),
     Lose(usize),
     Drive(u64),
@@ -107,7 +113,8 @@ pub struct Cluster {
     pub net: VecDeque<Message>,
     /// The entry every member applied at each index: term and data.
     pub chosen: BTreeMap<u64, (u64, Vec<u8>)>,
-    pub now: Instant,
+    /// The schedule's clock, nanoseconds: a step is a millisecond.
+    pub now: u64,
     pub reached: Reached,
     pub seq: u64,
     out: Output<(u64, Vec<u8>)>,
@@ -120,11 +127,26 @@ pub struct Cluster {
 /// The most messages the network holds; past it the oldest is lost, as a network may lose any.
 const NET: usize = 4096;
 
+/// Of a thousand words about a member that is down, how many are right; and of a thousand about
+/// one that is up, how many are wrong: a detector errs both ways now and then, and the schedule is
+/// safe whatever it says.
+const ACCURATE: u64 = 900;
+
+/// The timing the schedule's members elect by: a round and a span of half a second each, five
+/// hundred of the schedule's millisecond steps, as the ticks before it waited ten ticks of fifty
+/// steps each (a member ticked one step in fifty) and drew over ten more: a vote round, a
+/// message delivered and a write made durable at the schedule's choice, takes about that many
+/// steps.
+pub fn timing() -> hyper_raft::Timing {
+    hyper_raft::Timing {
+        span: Duration::from_millis(500),
+        round: Duration::from_millis(500),
+    }
+}
+
 pub fn settings(id: u64, seed: u64) -> Settings {
     Settings {
         core: Config {
-            election_tick: 10,
-            heartbeat_tick: 1,
             max_size_per_msg: 256,
             max_inflight_msgs: 8,
             max_committed_size_per_ready: 512,
@@ -157,13 +179,14 @@ impl Cluster {
             .map(|id| {
                 let mut kv = Kv::new(configuration.clone(), shape.volatile);
                 kv.control = shape.control;
-                let replica = Replica::open(
+                let mut replica = Replica::open(
                     &shaped(id, seed, &shape),
                     SimStore::new(shape.depth),
                     kv,
                     Unbounded,
                 )
                 .expect("a member opens");
+                replica.set_timing(timing()).expect("timing");
                 Node {
                     id,
                     replica: Some(replica),
@@ -178,7 +201,7 @@ impl Cluster {
             nodes,
             net: VecDeque::new(),
             chosen: BTreeMap::new(),
-            now: Instant::now(),
+            now: 0,
             reached: Reached::default(),
             seq: 0,
             out: Output::default(),
@@ -224,7 +247,19 @@ impl Cluster {
         let roll = rng.below(1000);
         let leader = self.leader().unwrap_or(member);
         match roll {
-            0..100 => Op::Tick(member),
+            0..100 => {
+                let peer = 1 + rng.below(n);
+                let down = self
+                    .nodes
+                    .iter()
+                    .any(|n| n.id == peer && n.replica.is_none());
+                let right = rng.below(1000) < ACCURATE;
+                if down == right {
+                    Op::Suspect(member, peer)
+                } else {
+                    Op::Trust(member, peer)
+                }
+            }
             100..400 if !self.net.is_empty() => {
                 Op::Deliver(rng.below(self.net.len() as u64) as usize)
             }
@@ -255,15 +290,16 @@ impl Cluster {
             980..990 if faults => Op::Refuse(member),
             990..994 if faults => Op::Fail(member),
             994..1000 => Op::Resume(member),
-            _ => Op::Tick(member),
+            _ => Op::Drive(member),
         }
     }
 
     /// Takes `op`; true when it did something a crash after it would cut into.
     pub fn act(&mut self, op: Op) -> bool {
-        self.now += Duration::from_millis(1);
+        self.now += 1_000_000;
         let did = match op {
-            Op::Tick(id) => self.with(id, |r| r.tick()),
+            Op::Suspect(id, peer) => self.with(id, |r| r.suspect(peer)),
+            Op::Trust(id, peer) => self.with(id, |r| r.trust(peer)),
             Op::Deliver(at) => self.deliver(at),
             Op::Lose(at) => self.net.remove(at).is_some(),
             Op::Drive(id) => self.drive(id),
@@ -475,6 +511,7 @@ impl Cluster {
             Unbounded,
         )
         .unwrap_or_else(|e| panic!("member {id} does not reopen: {e}"));
+        replica.set_timing(timing()).expect("timing");
         let mut out = Output::default();
         for _ in 0..64 {
             let before = replica.applied();
@@ -502,6 +539,16 @@ impl Cluster {
         }
         node.replica = Some(replica);
         node.reopened = true;
+        // The others' detectors see its new incarnation.
+        let others: Vec<u64> = self
+            .nodes
+            .iter()
+            .filter(|n| n.id != id && n.replica.is_some())
+            .map(|n| n.id)
+            .collect();
+        for other in others {
+            self.with(other, |r| r.restarted(id));
+        }
     }
 
     /// Drives `id` once and holds what it gave out to the oracle.
@@ -689,8 +736,26 @@ impl Cluster {
                 r.resume();
             }
         }
+        // Every member up and the network whole: the detectors trust every member.
+        for &id in &ids {
+            for &peer in &ids {
+                if peer != id {
+                    self.with(id, |r| r.trust(peer));
+                }
+            }
+        }
         let mut proposed: Option<Vec<u8>> = None;
         for round in 0..rounds {
+            // The log has room: a refusal the schedule armed before it settled, taken by the
+            // replica only now, stalls it, and the owner says room was freed, as it does once a
+            // compaction or a quiet queue frees it.
+            for &id in &ids {
+                if let Some(r) = self.replica(id)
+                    && r.is_stalled()
+                {
+                    r.resume();
+                }
+            }
             self.round(&ids);
             let Some(leader) = self.leader() else {
                 continue;
@@ -711,12 +776,9 @@ impl Cluster {
         false
     }
 
-    /// A round with no faults: every member ticks, drives, makes its writes durable and drives
-    /// again, and every message is delivered.
+    /// A round with no faults: every member drives, makes its writes durable and drives again,
+    /// and every message is delivered.
     pub fn round(&mut self, ids: &[u64]) {
-        for &id in ids {
-            self.act(Op::Tick(id));
-        }
         for &id in ids {
             self.act(Op::Drive(id));
             while self.durable(id) {}

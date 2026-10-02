@@ -95,6 +95,7 @@ fn directed(case: &Case, takes: Takes, ops: Option<u64>, seed: u64) -> bool {
         }
     }
     assert!(elected, "member 1 is never elected");
+    d.measured();
     if let Some(ops) = ops {
         d.device(case.target)
             .unwrap()
@@ -133,8 +134,9 @@ fn directed(case: &Case, takes: Takes, ops: Option<u64>, seed: u64) -> bool {
         }
     };
     let now = d.now();
+    d.device(case.target).unwrap().crash(Crash::LoseAll);
+    d.restarted(case.target);
     let target = d.device(case.target).unwrap();
-    target.crash(Crash::LoseAll);
     // Alone, the target reaches what its own durable state says is committed.
     let mut ignored = Vec::new();
     let mut settled = false;

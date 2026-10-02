@@ -13,6 +13,8 @@ hyper-block = { path = "../hyper-block" }
 hyper-durable = { path = "../hyper-durable" }
 hyper-log = { path = "../hyper-log" }
 hyper-raft = { path = "../hyper-raft" }
+# The election law the members derive their timing by (timing step L-2).
+hyper-timing = { path = "../hyper-timing" }
 # The datagram framing, client requests and commands of hyper-raft's own end-to-end harness, so a
 # client speaks to this member as to that one.
 hyper-raft-e2e = { path = "../hyper-raft-e2e" }

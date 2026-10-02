@@ -10,8 +10,8 @@ use hyper_raft::proto::{
 };
 
 use super::{
-    Coverage, Disk, Output, Replica, Said, Seeded, Settings, Step, Store, TICK_NS, View, members,
-    votes,
+    Coverage, Disk, Output, ROUND_NS, Replica, SPAN_NS, Said, Seeded, Settings, Step, Store,
+    TICK_NS, View, members, votes,
 };
 
 /// The most messages the network holds; the oldest is lost for a new one.
@@ -750,7 +750,12 @@ impl<R: Replica> Cluster<R> {
 
     /// With the network whole and every member up, the group elects and
     /// commits: within `budget` rounds of ticks and deliveries a proposal
-    /// is applied by every member of the configuration.
+    /// is applied by every member of the configuration. By suspicion the
+    /// budget is no count but progress (`docs/sim.md` §4.2): the rounds go
+    /// on while any member's term, commit, applied index or last index
+    /// moves, and fail once a quiet period passes with none moving — the
+    /// longest draw of the members' span, the election's three rounds and a
+    /// replication round, in rounds of one tick of each member's clock.
     pub fn settles(&mut self, budget: usize) -> bool {
         self.blocked.clear();
         for id in self.ids() {
@@ -772,7 +777,24 @@ impl<R: Replica> Cluster<R> {
         // The index the proposal took, and the term of the leader that
         // took it.
         let mut proposed: Option<(u64, u64)> = None;
-        for round in 0..budget {
+        let quiet = (SPAN_NS + 4 * ROUND_NS).div_ceil(TICK_NS) as usize;
+        let mut seen: BTreeMap<u64, (u64, u64, u64, u64)> = BTreeMap::new();
+        let mut moved = 0usize;
+        for round in 0.. {
+            if self.settings.suspicion {
+                for id in self.up() {
+                    let view = self.peek(id).map(|node| node.view()).expect("up");
+                    let at = (view.term, view.commit, view.applied, view.last_index);
+                    if seen.insert(id, at) != Some(at) {
+                        moved = round;
+                    }
+                }
+                if round > moved + quiet {
+                    break;
+                }
+            } else if round >= budget {
+                break;
+            }
             // A member that joined after the leader's snapshot was taken is
             // not named by it and discards it: it is seeded by a snapshot
             // taken since, which is the owner's to take.

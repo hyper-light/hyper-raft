@@ -638,6 +638,7 @@ name = "hyper-durable"
 version = "0.1.0"
 dependencies = [
  "hyper-block",
+ "hyper-liveness",
  "hyper-log",
  "hyper-measure",
  "hyper-raft",
@@ -655,6 +656,7 @@ dependencies = [
  "hyper-measure",
  "hyper-raft",
  "hyper-raft-e2e",
+ "hyper-timing",
 ]
 
 [[package]]

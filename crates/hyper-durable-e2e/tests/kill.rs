@@ -15,8 +15,13 @@
 //!
 //! The scenarios run one after another in this one thread (`harness = false`), one group at a
 //! time; the test reads each member's output on a thread of its own, one a process, at most three.
-//! Every wait is on the fact it needs, bounded by a budget in ticks derived as hyper-raft-e2e
-//! derives its own.
+//! Every wait is on the fact it needs, bounded by what the members' own election law says an
+//! election takes and the period this machine's broadcast is measured to take.
+//!
+//! The members elect by suspicion (timing step L-2) and take no ticks. The test is their failure
+//! detector: it kills them, so it tells the others that it suspects a member it killed, and that a
+//! member it started again is a new incarnation (`control::Order::Suspect`, `Restarted`), until
+//! L-3's node-pair stream and L-4's harness detect them.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -46,27 +51,24 @@ struct Watch {
 }
 
 use hyper_durable_e2e::control::{self, Order, Point, Report};
-use hyper_durable_e2e::node::{ELECTION_TICKS, HEARTBEAT_TICKS};
 use hyper_raft::proto::ConfChangeType;
 use hyper_raft_e2e::wire::{self, Control, Kind, Op, Outcome};
 
 const NODE: &str = env!("CARGO_BIN_EXE_hyper-durable-node");
 const TMP: &str = env!("CARGO_TARGET_TMPDIR");
 
-/// The ticks one broadcast takes at most: one, as the tick is measured (`measure_tick`).
-const BROADCAST_TICKS: u32 = 1;
-/// The longest a live member takes to answer an ask: a leader cut off finds out by its quorum
-/// check within two election timeouts, and an answer takes a tick to arrive (hyper-raft-e2e's).
-const ANSWER_TICKS: u32 = 2 * ELECTION_TICKS + BROADCAST_TICKS;
-/// The ticks one election takes at most: the longest randomized timeout and its two vote rounds
-/// (pre-vote and vote).
-const ELECTION_ROUND_TICKS: u32 = 2 * ELECTION_TICKS + 2 * BROADCAST_TICKS;
+/// The periods an ask and its answer take at most beside an election: the ask, the broadcast that
+/// commits it (a period is measured to cover one, `measure_period`), and the answer.
+const ANSWER_PERIODS: u32 = 3;
+/// The rounds an election takes past its delay: pre-vote, vote, and the new leader's first
+/// append (`docs/timing.md` §2.8).
+const ELECTION_ROUNDS: u32 = 3;
 /// The share of a time's distribution its measured bound covers, and the confidence: the 95/95
 /// one-sided tolerance limit (Wilks 1941), hyper-raft-e2e's.
 const COVERAGE: f64 = 0.95;
 const CONFIDENCE: f64 = 0.95;
-/// The least tick: `--tick-ms` counts whole milliseconds.
-const LEAST_TICK: Duration = Duration::from_millis(1);
+/// The least period: `--period-ms` counts whole milliseconds.
+const LEAST_PERIOD: Duration = Duration::from_millis(1);
 /// Keys a member holds at most, and asks it keeps waiting: far past what a scenario writes.
 const MAX_KEYS: usize = 1 << 16;
 const MAX_PENDING: usize = 64;
@@ -93,10 +95,10 @@ fn remove(path: &Path) {
     let _ = std::fs::remove_file(path);
 }
 
-/// The tick, from what this machine's flushes, datagrams and timer cost: a broadcast (two
-/// flushes and two datagrams of the most a message carries) and the timer's wake, at least a
+/// The owner's period, from what this machine's flushes, datagrams and timer cost: a broadcast
+/// (two flushes and two datagrams of the most a message carries) and the timer's wake, at least a
 /// millisecond (hyper-raft-e2e's `measure_tick`, whose reasons hold here).
-fn measure_tick() -> Duration {
+fn measure_period() -> Duration {
     let path = PathBuf::from(TMP).join(format!("durable-{}-probe", std::process::id()));
     let mut file = OpenOptions::new()
         .create(true)
@@ -117,12 +119,12 @@ fn measure_tick() -> Duration {
         socket.send_to(&block, to).unwrap();
         socket.recv_from(&mut received).unwrap();
     });
-    socket.set_read_timeout(Some(LEAST_TICK)).unwrap();
+    socket.set_read_timeout(Some(LEAST_PERIOD)).unwrap();
     let wake = bound(|| {
         let _ = socket.recv_from(&mut received);
     });
-    let tick = ((flush + datagram) * 2).max(wake).max(LEAST_TICK);
-    Duration::from_millis(tick.as_micros().div_ceil(1000).try_into().unwrap())
+    let period = ((flush + datagram) * 2).max(wake).max(LEAST_PERIOD);
+    Duration::from_millis(period.as_micros().div_ceil(1000).try_into().unwrap())
 }
 
 struct Member {
@@ -137,13 +139,19 @@ struct Cluster {
     name: String,
     members: Vec<Member>,
     voters: Vec<u64>,
-    tick: Duration,
+    period: Duration,
+    /// The longest an election takes as the members' law says: the greatest span and three of its
+    /// rounds any member reported; a period before any member has measured its paths, which its
+    /// first probes do within one.
+    election: Duration,
     test: UdpSocket,
     datagram: usize,
     next_id: u64,
     buffer: Vec<u8>,
     /// Every write a member answered: key → value.
     acked: BTreeMap<Vec<u8>, Vec<u8>>,
+    /// Members that printed `stopped`: they wait to be killed and answer nothing.
+    stopped: Vec<u64>,
 }
 
 impl Drop for Cluster {
@@ -159,14 +167,14 @@ impl Drop for Cluster {
 }
 
 /// Starts the member `id` of `voters` on its log; its port and the lines it prints after.
-fn spawn(id: u64, voters: &[u64], log: &Path, tick: Duration) -> (Child, u16, Receiver<String>) {
+fn spawn(id: u64, voters: &[u64], log: &Path, period: Duration) -> (Child, u16, Receiver<String>) {
     let list: Vec<String> = voters.iter().map(u64::to_string).collect();
     let mut child = Command::new(NODE)
         .args(["--id", &id.to_string()])
         .args(["--voters", &list.join(",")])
         .args(["--listen", "127.0.0.1:0"])
         .args(["--log", log.to_str().unwrap()])
-        .args(["--tick-ms", &tick.as_millis().to_string()])
+        .args(["--period-ms", &period.as_millis().to_string()])
         .args(["--max-keys", &MAX_KEYS.to_string()])
         .args(["--max-pending", &MAX_PENDING.to_string()])
         .stdin(Stdio::piped())
@@ -195,14 +203,14 @@ fn spawn(id: u64, voters: &[u64], log: &Path, tick: Duration) -> (Child, u16, Re
 }
 
 impl Cluster {
-    fn start(name: &str, voters: u64, tick: Duration) -> Self {
+    fn start(name: &str, voters: u64, period: Duration) -> Self {
         let ids: Vec<u64> = (1..=voters).collect();
         let mut members = Vec::new();
         for &id in &ids {
             let log =
                 PathBuf::from(TMP).join(format!("durable-{}-{name}-{id}.log", std::process::id()));
             remove(&log);
-            let (child, port, lines) = spawn(id, &ids, &log, tick);
+            let (child, port, lines) = spawn(id, &ids, &log, period);
             members.push(Member {
                 id,
                 child: Some(child),
@@ -217,12 +225,14 @@ impl Cluster {
             name: name.to_owned(),
             members,
             voters: ids,
-            tick,
+            period,
+            election: period,
             test,
             datagram,
             next_id: 0,
             buffer: Vec::new(),
             acked: BTreeMap::new(),
+            stopped: Vec::new(),
         };
         cluster.tell_peers();
         cluster
@@ -240,8 +250,21 @@ impl Cluster {
             .collect()
     }
 
-    fn ticks(&self, ticks: u32) -> Duration {
-        self.tick * ticks
+    fn periods(&self, periods: u32) -> Duration {
+        self.period * periods
+    }
+
+    /// The longest a live member takes to answer an ask: an election, should the leader be gone,
+    /// and the ask's own periods.
+    fn answer(&self) -> Duration {
+        self.election + self.periods(ANSWER_PERIODS)
+    }
+
+    /// Takes what a report says of the member's election law.
+    fn heard_law(&mut self, report: &Report) {
+        let span = Duration::from_nanos(report.span_ns);
+        let round = Duration::from_nanos(report.round_ns);
+        self.election = self.election.max(span + round * ELECTION_ROUNDS);
     }
 
     /// Sends what is in the buffer to `id` and waits for its answer to `ask`, at most `wait`.
@@ -275,7 +298,7 @@ impl Cluster {
         self.next_id += 1;
         let ask = self.next_id;
         wire::put_request(&mut self.buffer, ask, op);
-        let body = self.exchange(id, ask, self.ticks(ANSWER_TICKS))?;
+        let body = self.exchange(id, ask, self.answer())?;
         wire::read_response(&body).map(|(_, outcome)| outcome)
     }
 
@@ -283,7 +306,7 @@ impl Cluster {
         self.next_id += 1;
         let ask = self.next_id;
         control::put_order(&mut self.buffer, ask, &order);
-        let body = self.exchange(id, ask, self.ticks(ANSWER_TICKS))?;
+        let body = self.exchange(id, ask, self.answer())?;
         wire::read_response(&body).map(|(_, outcome)| outcome)
     }
 
@@ -292,7 +315,33 @@ impl Cluster {
         let ask = self.next_id;
         control::put_order(&mut self.buffer, ask, &Order::Report);
         let body = self.exchange_resent(id, ask)?;
-        control::read_report(&body, hyper_raft::MAX_MEMBERS).map(|(_, report)| report)
+        let report = control::read_report(&body, hyper_raft::MAX_MEMBERS).map(|(_, r)| r)?;
+        self.heard_law(&report);
+        Some(report)
+    }
+
+    /// Tells every other member up what their detectors say of `member` (the test kills and
+    /// starts the members, so it knows): an order each, sent again until answered. A member
+    /// stopped at an armed point answers nothing and is about to be killed: it is told once, an
+    /// answer's time.
+    fn tell_detectors(&mut self, member: u64, word: impl Fn(u64) -> Order) {
+        for id in self.up() {
+            if id == member {
+                continue;
+            }
+            self.next_id += 1;
+            let ask = self.next_id;
+            control::put_order(&mut self.buffer, ask, &word(member));
+            if self.stopped.contains(&id) {
+                let _ = self.exchange(id, ask, self.answer());
+                continue;
+            }
+            assert!(
+                self.exchange_resent(id, ask).is_some(),
+                "{}: member {id} was not told of {member}",
+                self.name
+            );
+        }
     }
 
     fn tell_peers(&mut self) {
@@ -311,12 +360,13 @@ impl Cluster {
     }
 
     /// How long the group may go with no member's term, commit, applied index or last index
-    /// moving before a wait gives up: one election round and an answer, from the members' own
-    /// settings. A live group elects or starts a new term within a round (Raft §5.2, under its
-    /// randomized timeout), so a round in which nothing moves is a group that is stuck, not one
-    /// that drew a split vote. A wait has no count of elections: it goes on while the group moves.
+    /// moving before a wait gives up: one election and an answer, by the members' own law. A live
+    /// group elects or starts a new term within an election (a candidate unresolved draws again a
+    /// round after it began), so an election in which nothing moves is a group that is stuck, not
+    /// one that drew a split vote. A wait has no count of elections: it goes on while the group
+    /// moves.
     fn quiet(&self) -> Duration {
-        self.ticks(ELECTION_ROUND_TICKS + ANSWER_TICKS)
+        self.election + self.answer()
     }
 
     /// A fresh watch over the group's progress.
@@ -371,7 +421,7 @@ impl Cluster {
     fn exchange_resent(&mut self, id: u64, ask: u64) -> Option<Vec<u8>> {
         let until = Instant::now() + self.quiet();
         loop {
-            let answer = self.ticks(ANSWER_TICKS);
+            let answer = self.answer();
             if let Some(body) = self.exchange(id, ask, answer) {
                 return Some(body);
             }
@@ -431,7 +481,12 @@ impl Cluster {
         loop {
             let left = deadline.saturating_duration_since(Instant::now());
             match lines.recv_timeout(left) {
-                Ok(line) if line.starts_with(prefix) => return Some(line),
+                Ok(line) if line.starts_with(prefix) => {
+                    if line.starts_with("stopped") {
+                        self.stopped.push(id);
+                    }
+                    return Some(line);
+                }
                 Ok(_) => {}
                 Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => return None,
             }
@@ -445,6 +500,8 @@ impl Cluster {
             let _ = child.wait();
         }
         member.lines = None;
+        self.stopped.retain(|&stopped| stopped != id);
+        self.tell_detectors(id, Order::Suspect);
     }
 
     /// The exit status of a member that fenced and exited, once it printed `fenced` within
@@ -454,21 +511,23 @@ impl Cluster {
         let member = self.member(id);
         let status = member.child.take()?.wait().ok()?;
         member.lines = None;
+        self.tell_detectors(id, Order::Suspect);
         status.code()
     }
 
     fn restart(&mut self, id: u64, tell: bool) {
-        let tick = self.tick;
+        let period = self.period;
         let voters = self.voters.clone();
         let member = self.member(id);
         assert!(member.child.is_none());
-        let (child, port, lines) = spawn(id, &voters, &member.log.clone(), tick);
+        let (child, port, lines) = spawn(id, &voters, &member.log.clone(), period);
         member.child = Some(child);
         member.lines = Some(lines);
         member.address = SocketAddr::from(([127, 0, 0, 1], port));
         if tell {
             self.tell_peers();
         }
+        self.tell_detectors(id, Order::Restarted);
     }
 
     /// Every write a member answered reads back as it was answered, and every member up applies
@@ -533,8 +592,8 @@ impl Cluster {
 /// Kills `target` (the leader or a follower) at `point`, the `count`-th time it passes it, while
 /// the group takes writes; restarts it on its log; every answered write reads back and every
 /// member applies the same history.
-fn kill_at(tick: Duration, point: Point, leader: bool, count: u64, name: &str) {
-    let mut cluster = Cluster::start(name, 3, tick);
+fn kill_at(period: Duration, point: Point, leader: bool, count: u64, name: &str) {
+    let mut cluster = Cluster::start(name, 3, period);
     cluster.write_some("before", tolerance_samples() / 4);
     let lead = cluster.leader().expect("a leader");
     let target = if leader {
@@ -572,8 +631,8 @@ fn kill_at(tick: Duration, point: Point, leader: bool, count: u64, name: &str) {
 /// focal F17 (`cli_network`): the founder of a group of two removes its only peer; the operator
 /// stops the peer for good once the founder says it applied the change; the founder is killed
 /// there and restarted alone, and must elect itself and take a write.
-fn founder(tick: Duration) {
-    let mut cluster = Cluster::start("founder", 2, tick);
+fn founder(period: Duration) {
+    let mut cluster = Cluster::start("founder", 2, period);
     cluster.write_some("before", 4);
     let founder = cluster.leader().expect("a leader");
     let peer = cluster.up().into_iter().find(|&id| id != founder).unwrap();
@@ -615,8 +674,8 @@ fn founder(tick: Duration) {
 
 /// The same founder killed while the removal waits behind its commit fence: it applied nothing,
 /// so the operator stops no one; restarted, the group finishes the removal.
-fn founder_fenced(tick: Duration) {
-    let mut cluster = Cluster::start("founder-fenced", 2, tick);
+fn founder_fenced(period: Duration) {
+    let mut cluster = Cluster::start("founder-fenced", 2, period);
     cluster.write_some("before", 4);
     let founder = cluster.leader().expect("a leader");
     let peer = cluster.up().into_iter().find(|&id| id != founder).unwrap();
@@ -642,7 +701,7 @@ fn founder_fenced(tick: Duration) {
             break;
         }
         // A removal the kill lost is proposed again.
-        if asked.elapsed() > cluster.ticks(ANSWER_TICKS)
+        if asked.elapsed() > cluster.answer()
             && let Some(leader) = cluster.leader()
         {
             let _ = cluster.order(leader, Order::Change(ConfChangeType::RemoveNode, peer));
@@ -662,7 +721,7 @@ fn founder_fenced(tick: Duration) {
 /// focal F17 (`cli_upgrade`): a member acts on a fence (an entry it acts on at its next start)
 /// and is killed there; restarted and told of no peer, it acts on the fence again from its own
 /// log before it hears from anyone.
-fn fence_host(tick: Duration, leader: bool) {
+fn fence_host(period: Duration, leader: bool) {
     let mut cluster = Cluster::start(
         if leader {
             "fence-leader"
@@ -670,7 +729,7 @@ fn fence_host(tick: Duration, leader: bool) {
             "fence-follower"
         },
         3,
-        tick,
+        period,
     );
     cluster.write_some("before", 4);
     let lead = cluster.leader().expect("a leader");
@@ -694,7 +753,7 @@ fn fence_host(tick: Duration, leader: bool) {
     // Restarted on its log and told of no one: whatever it reaches, it reaches alone.
     cluster.restart(host, false);
     let again = cluster
-        .line(host, "acted", cluster.ticks(ANSWER_TICKS))
+        .line(host, "acted", cluster.answer())
         .expect("the host reopened below the fence it acted on");
     let again: u64 = again.trim_start_matches("acted ").parse().unwrap();
     assert_eq!(again, acted, "the host acted on another entry at its start");
@@ -704,7 +763,7 @@ fn fence_host(tick: Duration, leader: bool) {
 
 /// A member's flush fails: it fences, exits, and is started again on its log; nothing answered
 /// is lost.
-fn failed_flush(tick: Duration, leader: bool) {
+fn failed_flush(period: Duration, leader: bool) {
     let mut cluster = Cluster::start(
         if leader {
             "flush-leader"
@@ -712,7 +771,7 @@ fn failed_flush(tick: Duration, leader: bool) {
             "flush-follower"
         },
         3,
-        tick,
+        period,
     );
     cluster.write_some("before", 4);
     let lead = cluster.leader().expect("a leader");
@@ -741,7 +800,7 @@ fn failed_flush(tick: Duration, leader: bool) {
 }
 
 /// Kills at random points: a seeded choice of member, point and count, many times.
-fn random_kills(tick: Duration, rounds: u64) {
+fn random_kills(period: Duration, rounds: u64) {
     let mut state = 0x5eed_u64;
     let mut next = |n: u64| {
         state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
@@ -755,13 +814,13 @@ fn random_kills(tick: Duration, rounds: u64) {
         let point = points[next(3) as usize];
         let leader = next(2) == 0;
         let count = 1 + next(8);
-        kill_at(tick, point, leader, count, &format!("random-{round}"));
+        kill_at(period, point, leader, count, &format!("random-{round}"));
     }
 }
 
 fn main() -> ExitCode {
-    let tick = measure_tick();
-    println!("tick {tick:?} (election {ELECTION_TICKS} ticks, heartbeat {HEARTBEAT_TICKS})");
+    let period = measure_period();
+    println!("period {period:?}; elections by suspicion, the test the members' detector");
     let filter: Option<String> = std::env::args().skip(1).find(|a| !a.starts_with('-'));
     let runs = |name: &str| filter.as_deref().is_none_or(|f| name.contains(f));
     let started = Instant::now();
@@ -773,25 +832,25 @@ fn main() -> ExitCode {
         for leader in [true, false] {
             let name = format!("kill-{name}-{}", if leader { "leader" } else { "follower" });
             if runs(&name) {
-                kill_at(tick, point, leader, 1, &name);
+                kill_at(period, point, leader, 1, &name);
                 println!("{name}: ok");
             }
         }
     }
     if runs("founder") {
-        founder(tick);
+        founder(period);
         println!("founder: ok");
-        founder_fenced(tick);
+        founder_fenced(period);
         println!("founder-fenced: ok");
     }
     if runs("fence") {
-        fence_host(tick, false);
-        fence_host(tick, true);
+        fence_host(period, false);
+        fence_host(period, true);
         println!("fence: ok");
     }
     if runs("flush") {
-        failed_flush(tick, false);
-        failed_flush(tick, true);
+        failed_flush(period, false);
+        failed_flush(period, true);
         println!("flush: ok");
     }
     if runs("random") {
@@ -799,7 +858,7 @@ fn main() -> ExitCode {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(6);
-        random_kills(tick, rounds);
+        random_kills(period, rounds);
         println!("random: {rounds} ok");
     }
     println!("all ok in {:?}", started.elapsed());

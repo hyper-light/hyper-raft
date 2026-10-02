@@ -75,6 +75,8 @@ struct Sim {
     cut: Vec<u64>,
     /// Who led each term.
     leaders: BTreeMap<u64, u64>,
+    /// The members' timing: how long a run may go with nothing moving.
+    timing: Timing,
 }
 
 impl Sim {
@@ -102,6 +104,7 @@ impl Sim {
             sent: Vec::new(),
             cut: Vec::new(),
             leaders: BTreeMap::new(),
+            timing,
         }
     }
     fn voters(voters: &[u64]) -> ConfState {
@@ -172,28 +175,47 @@ impl Sim {
             (Some(_), None) => unreachable!("matched above"),
         }
     }
-    /// Runs until nothing is in flight and nothing is due, or `limit` passes.
-    fn run(&mut self, limit: u64) -> bool {
-        let end = self.now + limit;
-        while self.now <= end {
-            if !self.next() {
-                return true;
-            }
-        }
-        false
+    /// How long a run may go with no member's term, role, commit or last index moving before it
+    /// is stuck (`docs/sim.md` §4.2): the longest draw of the span, the election's three rounds and
+    /// a replication round, from the members' own timing. The test suspects explicitly, so no
+    /// detection time is added.
+    fn quiet(&self) -> u64 {
+        (self.timing.span + self.timing.round * 4).as_nanos() as u64
     }
-    /// Runs until `done` holds, or `limit` passes.
-    fn run_until(&mut self, limit: u64, mut done: impl FnMut(&Self) -> bool) -> bool {
-        let end = self.now + limit;
-        while self.now <= end {
+    fn progress(&self) -> Vec<(u64, u64, u8, u64, u64)> {
+        self.up()
+            .into_iter()
+            .map(|id| {
+                let view = self.peek(id).view();
+                (id, view.term, view.role, view.commit, view.last_index)
+            })
+            .collect()
+    }
+    /// Runs until nothing is in flight and nothing is due; false when it is stuck instead: events
+    /// go on and nothing moves for a quiet period.
+    fn run(&mut self) -> bool {
+        self.run_until(|_| false)
+    }
+    /// Runs until `done` holds, or until nothing is in flight and nothing is due (then whether
+    /// `done` holds); false when it is stuck.
+    fn run_until(&mut self, mut done: impl FnMut(&Self) -> bool) -> bool {
+        let mut seen = self.progress();
+        let mut moved = self.now;
+        loop {
             if done(self) {
                 return true;
             }
             if !self.next() {
-                return done(self);
+                return done(self) || self.flight.is_empty();
+            }
+            let now = self.progress();
+            if now != seen {
+                seen = now;
+                moved = self.now;
+            } else if self.now > moved + self.quiet() {
+                return false;
             }
         }
-        false
     }
     /// The clock moves on by `by` with nothing delivered: a member woken now finds what fell due.
     fn pass(&mut self, by: u64) {
@@ -235,9 +257,9 @@ impl Sim {
     fn found(&mut self, id: u64) {
         self.node(id).campaign();
         self.settle(id);
-        assert!(self.run_until(100 * LATENCY, |sim| sim.leader() == Some(id)));
+        assert!(self.run_until(|sim| sim.leader() == Some(id)));
         // Everything in flight lands, and the group goes quiet.
-        assert!(self.run(100 * LATENCY), "the group never went quiet");
+        assert!(self.run(), "the group never went quiet");
     }
     fn count_sent(&self, from: usize, kind: MessageType) -> usize {
         self.sent[from..]
@@ -260,13 +282,13 @@ fn a_group_opened_on_no_history_elects_and_then_sleeps() {
             sim.settle(id);
         }
         assert!(
-            sim.run_until(1_000 * LATENCY, |sim| sim.leader().is_some()),
+            sim.run_until(|sim| sim.leader().is_some()),
             "seed {seed}: no leader"
         );
         let leader = sim.leader().unwrap();
         sim.node(leader).propose(b"x".to_vec());
         sim.settle(leader);
-        assert!(sim.run(100 * LATENCY), "seed {seed}: never quiet");
+        assert!(sim.run(), "seed {seed}: never quiet");
         for id in 1..=3 {
             assert_eq!(sim.peek(id).deadline(), None, "seed {seed}: member {id}");
             assert_eq!(sim.peek(id).app().index, 2, "seed {seed}: member {id}");
@@ -302,7 +324,7 @@ fn elections_start_only_on_suspicion() {
     for id in [2, 3] {
         sim.suspect(id, 1);
     }
-    assert!(sim.run_until(100 * LATENCY, |sim| sim.leader().is_some()));
+    assert!(sim.run_until(|sim| sim.leader().is_some()));
     let leader = sim.leader().unwrap();
     assert!(leader == 2 || leader == 3);
     assert!(sim.term(leader) > 1);
@@ -361,7 +383,7 @@ fn split_votes_resolve_as_often_as_the_law_says() {
             sim.settle(id);
         }
         assert!(
-            sim.run_until(10_000 * LATENCY, |sim| sim.leader().is_some_and(|l| l != 1)),
+            sim.run_until(|sim| sim.leader().is_some_and(|l| l != 1)),
             "seed {seed}: no leader"
         );
         let elected = sim.term(sim.leader().unwrap());
@@ -416,10 +438,10 @@ fn a_member_that_trusts_its_leader_refuses_a_pre_vote() {
     sim.suspect(3, 1);
     // While its detector is wrong it asks again, a round and a draw after each ask.
     let asked = |sim: &Sim| sim.count_sent(from, MessageType::MsgRequestPreVote) >= 6;
-    assert!(sim.run_until(1_000 * LATENCY, asked));
+    assert!(sim.run_until(asked));
     sim.trust(3, 1);
     assert!(
-        sim.run(100 * LATENCY),
+        sim.run(),
         "it trusts its leader again, and the group goes quiet"
     );
     let granted = sim.sent[from..]
@@ -500,7 +522,7 @@ fn a_leader_that_steps_down_hands_over() {
     }
     assert_eq!(sim.peek(1).view().role, 0);
     assert_eq!(sim.count_sent(from, MessageType::MsgTimeoutNow), 1);
-    assert!(sim.run_until(100 * LATENCY, |sim| sim.leader().is_some()));
+    assert!(sim.run_until(|sim| sim.leader().is_some()));
     assert_eq!(sim.leader(), Some(2), "the one voter it still trusted");
 }
 
@@ -522,7 +544,7 @@ fn a_leader_that_removes_itself_hands_over_to_the_voter_that_holds_the_most() {
     };
     sim.node(1).propose_change(&change);
     sim.settle(1);
-    assert!(sim.run_until(100 * LATENCY, |sim| sim.peek(1).view().role != 2));
+    assert!(sim.run_until(|sim| sim.peek(1).view().role != 2));
     // No voter holds its whole log: the one that holds the most is told to campaign.
     assert!(
         sim.sent
@@ -530,7 +552,7 @@ fn a_leader_that_removes_itself_hands_over_to_the_voter_that_holds_the_most() {
             .any(|m| m.msg_type == MessageType::MsgTimeoutNow && m.from == 1 && m.to == 2)
     );
     sim.cut.clear();
-    assert!(sim.run_until(100 * LATENCY, |sim| sim.leader().is_some_and(|l| l != 1)));
+    assert!(sim.run_until(|sim| sim.leader().is_some_and(|l| l != 1)));
     assert_eq!(sim.leader(), Some(2));
 }
 
@@ -553,7 +575,7 @@ fn no_campaign_while_held() {
     assert_eq!(sim.sent.len(), sent);
     sim.node(2).raw.hold_campaigns(false).unwrap();
     sim.settle(2);
-    assert!(sim.run_until(100 * LATENCY, |sim| sim.leader() == Some(2)));
+    assert!(sim.run_until(|sim| sim.leader() == Some(2)));
 }
 
 /// A restarted leader its owner holds from campaigning (its log was marked) leads nothing, and
@@ -573,10 +595,10 @@ fn a_restarted_leader_held_from_campaigning_hands_over() {
     for id in [2, 3] {
         assert_eq!(sim.peek(id).view().leader, 1, "they trust its node");
     }
-    assert!(sim.run_until(100 * LATENCY, |sim| sim.leader().is_some()));
+    assert!(sim.run_until(|sim| sim.leader().is_some()));
     assert!(sim.leader() != Some(1));
     // Its order is answered once the term has moved, and it stops.
-    assert!(sim.run(100 * LATENCY), "it handed over for ever");
+    assert!(sim.run(), "it handed over for ever");
 }
 
 /// A follower whose detectors see its leader's node start again forgets it, and campaigns.
@@ -592,7 +614,7 @@ fn a_follower_forgets_a_leader_that_started_again() {
         sim.settle(id);
         assert!(sim.peek(id).deadline().is_some(), "member {id} campaigns");
     }
-    assert!(sim.run_until(100 * LATENCY, |sim| sim.leader().is_some()));
+    assert!(sim.run_until(|sim| sim.leader().is_some()));
 }
 
 /// A leader beats only while its group has work in flight: an append lost on its way leaves a
@@ -622,7 +644,7 @@ fn a_leader_beats_while_work_is_in_flight_and_then_sleeps() {
         .expect("work in flight: a beat is due");
     assert_eq!(beat, sim.now + timing.round.as_nanos() as u64);
     let from = sim.sent.len();
-    assert!(sim.run(100 * LATENCY));
+    assert!(sim.run());
     assert!(sim.count_sent(from, MessageType::MsgHeartbeat) > 0);
     for id in 1..=3 {
         assert_eq!(sim.peek(id).app().index, 2, "member {id}");

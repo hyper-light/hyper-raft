@@ -109,6 +109,7 @@ name = "hyper-durable"
 version = "0.1.0"
 dependencies = [
  "hyper-block 0.1.0",
+ "hyper-liveness",
  "hyper-log 0.1.0",
  "hyper-raft 0.1.0",
  "hyper-timing",
@@ -128,6 +129,13 @@ dependencies = [
  "hyper-raft 0.1.0",
  "mantle-meta",
  "mantle-range",
+]
+
+[[package]]
+name = "hyper-liveness"
+version = "0.1.0"
+dependencies = [
+ "hyper-timing",
 ]
 
 [[package]]
@@ -164,6 +172,7 @@ name = "hyper-raft"
 version = "0.1.0"
 dependencies = [
  "crc32c",
+ "hyper-timing",
  "thiserror",
 ]
 

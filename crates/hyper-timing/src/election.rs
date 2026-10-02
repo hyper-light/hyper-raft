@@ -187,10 +187,16 @@ pub struct Ballot {
     /// to find, where they are still a majority; all of them otherwise (a group of two elects only
     /// with both).
     pub available: u32,
-    /// The one-way latency `l`: half the slowest measured path's mean round trip. A candidate's
-    /// request reaches the voter on that path last; a round trip is what one clock can measure, and
-    /// half of it is a symmetric path's one-way delay, the half NTP's offset takes (RFC 5905 §8,
-    /// `θ = ½[(T2 − T1) + (T3 − T4)]`).
+    /// The latency `l` of Ongaro's split: from a candidate's turn to campaign to its request
+    /// reaching the voter it reaches last. Half the slowest measured path's mean round trip (a round
+    /// trip is what one clock can measure, and half of it is a symmetric path's one-way delay, the
+    /// half NTP's offset takes, RFC 5905 §8, `θ = ½[(T2 − T1) + (T3 − T4)]`), plus the mean flush:
+    /// a candidate's request leaves only once its own term and vote are durable (Raft Figure 2's
+    /// persistent state; `docs/durable.md` I1), and another member that turns to campaign within
+    /// that time has voted for itself before the request reaches it. Found by hyper-durable's
+    /// processes (`docs/timing.md` §2.9): with the flush left out, two voters whose flush was some
+    /// two orders of magnitude past the path's one-way delay split round after round, the span a sliver of the window
+    /// their campaigns collided in.
     pub latency: Duration,
     /// The vote round: the candidate's quorum, the `⌊n/2⌋`-th smallest mean round trip, since a
     /// candidate wins with `⌊n/2⌋` votes beside its own; plus the mean flush a voter makes its vote
@@ -230,7 +236,7 @@ impl Ballot {
         Some(Self {
             voters,
             available: if others > voters / 2 { others } else { voters },
-            latency: Duration::from_nanos(slowest / 2),
+            latency: Duration::from_nanos((slowest / 2).saturating_add(durable_ns)),
             round: Duration::from_nanos(quorum.saturating_add(durable_ns)),
             broadcast_tail: Duration::from_nanos(tail.saturating_add(durable_ns)),
             samples,
@@ -574,7 +580,11 @@ mod tests {
         let ballot = Ballot::measure([&far, &near, &middle, &near], 5, durable, G).unwrap();
         assert_eq!(ballot.voters, 5);
         assert_eq!(ballot.available, 4, "all but the leader that crashed");
-        assert_eq!(ballot.latency, ms(80), "half the slowest mean round trip");
+        assert_eq!(
+            ballot.latency,
+            ms(80) + durable,
+            "half the slowest mean round trip, and the candidate's own flush"
+        );
         // Five voters: a candidate wins with two votes beside its own, the second-nearest.
         assert_eq!(ballot.round, ms(10) + durable);
         let tail = far.tail_ns(nanos(G)).unwrap();

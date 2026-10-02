@@ -1,6 +1,7 @@
 //! What the test tells a member beyond hyper-raft-e2e's own controls (`wire::Control`: where its
 //! peers listen, whether it is cut off), on the same framing and checksum: where to stop, a change
-//! of configuration, a flush to fail, and what the member is, at length.
+//! of configuration, a flush to fail, what its failure detectors believe of its peers, and what the
+//! member is, at length; and the probes members time their paths by.
 use hyper_raft::proto::ConfChangeType;
 use hyper_raft_e2e::wire::{self, Kind, Reader, Status};
 
@@ -72,6 +73,17 @@ pub enum Order {
     Report,
     /// The log answered a write: the member's own waker, relayed to its socket.
     Wake,
+    /// The member's detectors suspect this member's node (timing step L-2). The test kills
+    /// members, so it knows: it is the members' detector until L-3's stream and L-4's harness.
+    Suspect(u64),
+    /// The member's detectors trust this member's node again.
+    Trust(u64),
+    /// The member's detectors saw this member's node start again, a new incarnation.
+    Restarted(u64),
+    /// A peer times its path to this member: answered at once with the same stamp.
+    Probe(u64),
+    /// The answer to a probe stamped as it was sent, on the prober's clock.
+    Echo(u64),
 }
 
 /// The first tag this harness's orders take: past those of `wire::Control`.
@@ -99,7 +111,18 @@ pub fn put_order(buffer: &mut Vec<u8>, id: u64, order: &Order) {
         Order::FailFlush => buffer.push(FIRST_TAG.saturating_add(2)),
         Order::Report => buffer.push(FIRST_TAG.saturating_add(3)),
         Order::Wake => buffer.push(FIRST_TAG.saturating_add(4)),
+        Order::Suspect(word) => tagged(buffer, 5, *word),
+        Order::Trust(word) => tagged(buffer, 6, *word),
+        Order::Restarted(word) => tagged(buffer, 7, *word),
+        Order::Probe(word) => tagged(buffer, 8, *word),
+        Order::Echo(word) => tagged(buffer, 9, *word),
     }
+}
+
+/// An order's tag, `FIRST_TAG` and `offset`, and its one word.
+fn tagged(buffer: &mut Vec<u8>, offset: u8, word: u64) {
+    buffer.push(FIRST_TAG.saturating_add(offset));
+    wire::put_u64(buffer, word);
 }
 
 /// Reads an order's body; none for one of `wire::Control`'s.
@@ -121,6 +144,11 @@ pub fn read_order(body: &[u8]) -> Option<(u64, Order)> {
         2 => Order::FailFlush,
         3 => Order::Report,
         4 => Order::Wake,
+        5 => Order::Suspect(reader.u64()?),
+        6 => Order::Trust(reader.u64()?),
+        7 => Order::Restarted(reader.u64()?),
+        8 => Order::Probe(reader.u64()?),
+        9 => Order::Echo(reader.u64()?),
         _ => return None,
     };
     Some((id, order))
@@ -137,6 +165,12 @@ pub struct Report {
     pub known: bool,
     /// The voters of its configuration.
     pub voters: Vec<u64>,
+    /// The span its elections draw their delays over, nanoseconds; zero before its paths are
+    /// measured (timing step L-2).
+    pub span_ns: u64,
+    /// The round tail its elections and beats run by, nanoseconds; zero before its paths are
+    /// measured.
+    pub round_ns: u64,
 }
 
 /// The response tag a report takes: past those of `wire::Outcome`.
@@ -159,6 +193,8 @@ pub fn put_report(buffer: &mut Vec<u8>, id: u64, report: &Report) {
         s.digest,
         report.durable_commit,
         u64::from(report.known),
+        report.span_ns,
+        report.round_ns,
         u64::try_from(report.voters.len()).unwrap_or(u64::MAX),
     ] {
         wire::put_u64(buffer, word);
@@ -168,14 +204,9 @@ pub fn put_report(buffer: &mut Vec<u8>, id: u64, report: &Report) {
     }
 }
 
-/// Reads a report from a response's body; at most `max_voters` voters.
-pub fn read_report(body: &[u8], max_voters: usize) -> Option<(u64, Report)> {
-    let mut reader = Reader::new(body);
-    let id = reader.u64()?;
-    if reader.u8()? != REPORT {
-        return None;
-    }
-    let status = Status {
+/// The status a report begins with.
+fn read_status(reader: &mut Reader<'_>) -> Option<Status> {
+    Some(Status {
         id: reader.u64()?,
         term: reader.u64()?,
         leads: reader.u64()? != 0,
@@ -184,9 +215,21 @@ pub fn read_report(body: &[u8], max_voters: usize) -> Option<(u64, Report)> {
         applied: reader.u64()?,
         last_index: reader.u64()?,
         digest: reader.u64()?,
-    };
+    })
+}
+
+/// Reads a report from a response's body; at most `max_voters` voters.
+pub fn read_report(body: &[u8], max_voters: usize) -> Option<(u64, Report)> {
+    let mut reader = Reader::new(body);
+    let id = reader.u64()?;
+    if reader.u8()? != REPORT {
+        return None;
+    }
+    let status = read_status(&mut reader)?;
     let durable_commit = reader.u64()?;
     let known = reader.u64()? != 0;
+    let span_ns = reader.u64()?;
+    let round_ns = reader.u64()?;
     let count = usize::try_from(reader.u64()?).ok()?;
     if count > max_voters {
         return None;
@@ -201,6 +244,8 @@ pub fn read_report(body: &[u8], max_voters: usize) -> Option<(u64, Report)> {
             durable_commit,
             known,
             voters,
+            span_ns,
+            round_ns,
         },
     ))
 }

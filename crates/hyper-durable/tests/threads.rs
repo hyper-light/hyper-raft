@@ -13,6 +13,7 @@
 
 mod support;
 
+use std::sync::OnceLock;
 use std::task::Waker;
 use std::time::Instant;
 
@@ -76,7 +77,7 @@ fn threads_do_not_grow_with_the_groups() {
     let mut out = Output::default();
     let mut applied = 0;
     for _ in 0..10_000 {
-        owner.turn(Instant::now(), &mut out, |_, d, _| {
+        owner.turn(now(), &mut out, |_, d, _| {
             d.unwrap();
         });
         applied = handles
@@ -105,4 +106,12 @@ fn threads_do_not_grow_with_the_groups() {
         threads.windows(2).all(|w| w[0] == w[1]),
         "threads grew with the groups: {threads:?}"
     );
+}
+
+/// The owner's clock in nanoseconds: the test reads the host's monotonic clock at its edge, as an
+/// owner does, and hands the shell nanoseconds since the first reading.
+fn now() -> u64 {
+    static EPOCH: OnceLock<Instant> = OnceLock::new();
+    let epoch = *EPOCH.get_or_init(Instant::now);
+    u64::try_from(epoch.elapsed().as_nanos()).unwrap_or(u64::MAX)
 }

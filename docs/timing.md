@@ -87,7 +87,9 @@ against his figures before any measured link relies on it.
 design, with nothing picked between them:
 - **The ballot.** From a voter's measured paths to the others: `l` is half the slowest path's mean
   round trip (a round trip is what one clock measures; half of it is a symmetric path's one-way
-  delay, the half NTP's offset takes, RFC 5905 §8), and the vote round is the candidate's quorum,
+  delay, the half NTP's offset takes, RFC 5905 §8) plus the mean flush, since a candidate's request
+  leaves only once its own term and vote are durable and a member that turns to campaign in that
+  time splits the vote as surely as one within the path's delay (L-2, §2.9), and the vote round is the candidate's quorum,
   the `⌊n/2⌋`-th smallest mean round trip, plus the mean flush a voter makes its vote durable in (Raft's
   `votedFor` is persistent, Figure 2; `Flushes`). Means, because `T_E` is an expectation. The span
   is chosen for `s = n − 1`, the voters left when the leader's node crashed, which is the case the
@@ -697,6 +699,54 @@ spend a term and depose a leader that never left.
   (dissertation §3.10: given up when not finished within an election), or at once when the
   transferee is suspected.
 - **A sole voter** campaigns at once, timed or not: it has no one to split a vote with.
+
+**Time** is the owner's monotonic clock in nanoseconds, a `u64`, for the core, the durable shell
+(`Replica::drive`, `deadline`, `Driven::wake` and `flushed`) and hyper-liveness alike. The core
+must not read a clock, so it takes a number; a `std::time::Instant` has no value of its own a
+simulated world can make without reading the host's clock, and each crate that took one anchored on
+`Instant::now()` in its tests. One integer type across the sans-io crates lets one simulated clock
+drive them all (`docs/sim.md`), and an owner with an `Instant` converts at its edge, once.
+
+**The law's latency counts the candidate's flush.** hyper-durable's processes found it: two voters
+whose vote flush was two orders of magnitude past the path's one-way delay split round after round
+(terms in the thousands, no leader), because a candidate's request leaves only once its term and
+vote are durable, and the other, turning to campaign in that time, had voted for itself before the
+request reached it. Ongaro's model has the request leave at once; with durable votes the split's
+latency is the path's delay and the flush, which `Ballot::latency` now is. The core's own
+schedules persist at once and never saw it.
+
+**Driven by hyper-liveness (L-3).** `crates/hyper-durable`'s owner keeps each replica's node pairs
+attached to the node's stream from its configuration (`Owner::pairs`), takes each `Change` to every
+replica with a member on that node (`Owner::believe`; a fenced replica reopened is told the stream's
+beliefs, `Replica::believe_all`), derives each group's timing by this law from what the stream
+measured, its echoed round trips, mean flush and granularity (`Replica::measure`, `Owner::measure`),
+charges each leader's pair the mean `T_E` of the groups it leads (`Liveness::set_election`), and
+hands the stream each replica's durable writes as its flush proof (`Driven::flushed`). Held to it in
+`crates/hyper-durable/tests/liveness.rs`, three nodes on one simulated clock with seeded delays,
+flushes and wake lateness, 64 seeds: a group elects from nothing, sends no Raft message while idle
+but after a detector's change (1,900 over 248 changes, the stream's one-heartbeat margins erring
+within their allowance), and its leader's node killed, every survivor suspects it within the bound
+the suspicion states and the survivors elect and commit. What it found of the stream, for L-3:
+- **A link can stay unconfigured for good.** The receiver asks the sender's interval only once its
+  estimator configures, and until it asks the sender sends at its floor; where the heartbeats at the
+  floor are too correlated for `τ_int` to be measured (item 6), the estimator refuses for ever and
+  never asks for the longer interval that would let it configure. In the test, seed 0, one node's
+  link to another took 3,000,000 heartbeats unconfigured; in hyper-durable-e2e's processes on this
+  machine, both followers' links to one member took 2,700 each unconfigured while the reverse links
+  configured within a few hundred. A crash of that member is suspected by nothing (item 10). The
+  test waits, as the fact a crash needs, until the leader's node is judged.
+- **A new run is not surfaced.** The stream sees a peer's restart (a new `boot` re-anchors the pair
+  and counts in the MTBF) but reports no change for it, so the owner has nothing to give the core's
+  `restarted`; the core's own rule (a member that voted for itself in its term hands over or
+  campaigns) covers a restarted leader without it.
+- **The pool** of item 10 is not there yet.
+- **Its kill test killed during a mistake.** With the law's latency corrected the `T_E` its owners
+  charge moved, and seed 26 of `a_killed_peer_is_suspected_within_the_stated_bound` killed the
+  victim while a survivor suspected it by a mistake; that survivor held the suspicion through the
+  kill and made no new one to measure. The test now kills once every survivor trusts the victim,
+  the fact its assertion needs.
+hyper-durable-e2e therefore still takes its detectors' words from the test, which kills the members
+and so knows, until the first of these is closed (L-4).
 
 **The model.** These rules only bring forward or refuse a campaign, or forget a leader, which is
 volatile; the TLA+ model's `Elect` may be taken at any time with any quorum the log comparison

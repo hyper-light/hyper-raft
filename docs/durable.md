@@ -1,7 +1,7 @@
 # hyper-durable: the durable shell around the Raft core
 
 > Status (2026-10-02): the shell's D-1 core is built (`crates/hyper-durable`, §15) on core steps
-> R-4 (§2.1), R-5 (§5.1) and R-6 (§4.4); R-7 is not built, and §15 says what waits on it.
+> R-4 (§2.1), R-5 (§5.1), R-6 (§4.4) and R-7 (§5.2).
 > Sources and what each establishes are in
 > `docs/research/durable.md` ("research §n"). This replaces `docs/raft.md` §4's plan to extract
 > mantle's replica: the shell is designed from all three projects' shells and the literature, then
@@ -391,8 +391,9 @@ calls for:
   one). CTRL lets such a member lead and recover its own lost entries before it serves: for each
   lost `⟨term, index⟩` it asks the voters, fixes it from any `have`, discards it and everything
   after on a majority's `dontHave`, and waits on `haveFaulty` (§3.4.2–3.4.3). This is core step
-  **R-7**, after R-5, behind the TLA+ model extended with a marked member and the explorer's
-  schedules; until R-7 such a group waits, as mantle's does.
+  **R-7** (§5.2): with the suffix marks hyper-log keeps, the vote itself is the question, and a
+  marked member is elected on its log, without its own vote, by a quorum of the others that answer
+  for no more than it holds.
 - **A damaged frame with later frames after it.** PAR identifies faulty entries by identifiers
   stored apart from them; hyper-log should report each group the frame touched as marked through
   the frame's range rather than refuse to open the log (a hyper-log change, open in mantle replica.md
@@ -443,6 +444,99 @@ In `crates/hyper-raft` (`src/raft.rs`, `src/progress.rs`, `src/node.rs`, `src/pr
 
 **The gate as run** is `docs/raft.md` §3's R-5 row; counts in `crates/hyper-raft/ORIGIN.md` and
 `crates/hyper-durable/ORIGIN.md`, cost in `docs/benchmarks.md`, "Repair by entries (R-5)".
+
+### 5.2 As built (core step R-7): a marked member's election
+
+**The rule.** For a member `u` let `ω_u` be the `(term, index)` of the last entry of its durable log,
+`μ_u` its mark while it is marked, and `κ_u` its claim: `μ_u` while marked, else `ω_u` (`Raft::claim`;
+a mark not yet ended is always past `ω_u`). Pairs are ordered as Raft orders logs, by term and then
+index (thesis §3.6.1). Then:
+
+- a voter `u` grants a candidate `C` only if `ω_C ≥ κ_u` (R-5's judgment, kept);
+- a marked `C` campaigns on its log: its requests name `ω_C`, never its mark, and its own vote,
+  though cast and durable as every vote is, is not counted toward its quorum (`Raft::campaign`
+  polls itself as a refusal); it campaigns only where the others can be a quorum of each half of its
+  configuration (`Raft::may_campaign`; a sole voter and one of two wait, refused `Error::Lost`), and
+  not in a fast group;
+- elected, its mark ends (`Raft::become_leader`).
+
+So a marked candidate is elected exactly when a quorum of each half of its configuration, without
+it, answers for no more than its log holds.
+
+**Why it is safe.** Two assumptions about marks, which are the store's:
+
+- (M1) a member that durably acknowledged an entry `w` holds `w` in its log, or holds a later entry
+  of `w`'s term or an entry of a later term (it took a leader's log past `w`, or compacted it into
+  a snapshot past it), or is marked with `μ ≥ w`. hyper-log keeps this: a persist record stored
+  apart from its frame survives the frame's loss and names the frame's last index and term, and two
+  marks merge to the greater index and term (`docs/research/durable.md` §5, PAR §3.3.3–§3.3.4); a
+  frame lost before its persist record was written was never acknowledged.
+- (M2) the term and vote are never lost. A member that loses them is damaged and rebuilt under a
+  new identity (§5); PAR keeps two copies of its metainfo for the same reason (§3.3.1).
+
+Under (M1), `κ_u ≥ w` from the moment `u` acknowledges `w`, for good. Let `e` be committed in term
+`T` at index `i`: the leader of `T` counted a quorum `Q` of its configuration holding an entry `w =
+(T, j)` with `j ≥ i` (Raft commits only entries of its term, earlier ones by implication). Let `C`
+be elected in a term `U > T` by grants `G`, a quorum of each half of its configuration, `C ∈ G` only
+if `C` is unmarked. The quorums of the configurations a change passes through meet as Raft's do
+(thesis §4.1 for a change by one voter, §4.3 for the joint configuration): the rule changes which
+members' judgment counts, not the quorums' shapes, so there is `u ∈ G ∩ Q`. If `u = C`, `C` is
+unmarked and its own log holds `w`. Otherwise `u` granted, so `ω_C ≥ κ_u ≥ w`. Either way `ω_C ≥ w`,
+and Raft's Leader Completeness argument (thesis §3.6.3) gives the rest: if `C`'s last entry is of
+`T`, `C` took it from `T`'s leader and its log matches that leader's through an index past `j`; if of
+a later term `T′`, from `T′`'s leader, which held `e` (by induction on terms), and matches it through
+an index past `i` (terms never fall along a log). So `C`'s log holds every committed entry. Its lost
+entries then carry nothing committed that its log does not hold, and its mark ends. Election Safety
+is untouched: `G` is a quorum, each member votes once a term (M2), `C`'s own vote included.
+
+What the proof needs of the self-exclusion is the case `u = C` with `C` marked: `C` may be the only
+member of `G ∩ Q`, and its log may lack `w` (`a_marked_log_that_may_lack_a_committed_entry_is_never_elected`;
+with its own vote counted, `faults_at_rest_*` and the directed tests commit a second entry at an
+index, and `MarkedSelf.cfg` must be refused). What it needs of the voters' judgment by the mark is
+`u ≠ C` marked and lacking `w` (`MarkedWhole.cfg`, and the same tests mutated).
+
+**Which configurations, which marks.** The argument covers every configuration hyper-raft's change
+protocol makes on the classic track: one voter added or removed by one entry, and a joint
+configuration entered and left by `ConfChangeV2` (a candidate counts a quorum of each half without
+itself). A fast group's marked member does not campaign: a fast commit counts what a voter holds
+beside its log, which a lost frame takes with it and no mark names. Marks are suffix marks: what a
+log may lack is its tail past `ω_u`, through `μ_u`. A damaged frame with intact frames after it
+(PAR's Figure 4(b) as drawn, a faulty entry below good ones) is a hole, which hyper-log does not
+report today (it refuses to open such a log, §5); the schedules' disk cuts at the first damaged
+entry and marks through what it held (§12), which makes a hole a suffix at the cost of the good
+entries after it, then repaired by R-5.
+
+**CTRL, mapped.** PAR's leader asks the voters about each faulty `⟨term, index⟩` and hears `have`,
+`dontHave` or `haveFaulty` (§3.4.2–§3.4.3). With suffix marks the vote is that question for the
+whole lost range at once: a grant (`κ_u ≤ ω_C`) is `dontHave` (no witness above `C`'s log), a
+whole voter's refusal is `have` or more (its log goes past `C`'s), a marked voter's refusal is
+`haveFaulty` (its mark covers what `C` lacks). Case 2, a majority of `dontHave`, is `C` elected
+without its own vote, its lost entries discarded; case 3, wait on `haveFaulty`, is a refused
+campaign drawn again. Case 1, fixing `C`'s entries from a `have`, is not needed: hyper-log names
+only the last lost entry, `μ_C`, so a `have` is a voter `v` holding `μ_C`, whose log then matches
+`C`'s lost range whole (Log Matching), and `ω_v ≥ μ_C`. Every voter that would grant `C` on its
+mark, as CTRL elects it, then grants `v` (`κ_u ≤ μ_C ≤ ω_v`, `C` included), so `v` is a candidate the
+rule admits, elected without copying anything to `C`. A partial fix (some lost entries from a
+`have`, the rest discarded) needs each lost entry's identity, which hyper-log does not keep. PAR
+names each faulty entry from identifiers stored apart; with the last's alone, the lowest term a lost
+entry may have is `ω_u`'s, and a marked voter whose mark's term is below the candidate's lost
+entries' cannot yet answer `dontHave`. A store that kept the first lost entry's term would let it
+(§14).
+
+**Where a group must wait.** A marked member of a group of one or two voters, or of a joint half of
+two, is never part of a quorum of the others: the other alone may lack entries that the marked
+member and a voter since removed committed under an earlier configuration, and only the operator,
+rebuilding the marked member, can end the wait. Where every copy of a committed entry is lost, the
+group waits for good, as PAR's does ("the system will remain unavailable", §3.4.2). The schedules
+count both (`docs/raft.md` §3's R-7 row).
+
+**The model.** R-7 changes who counts toward an election, which is what the TLA+ model checks, so
+the model gains the marked member (`docs/models/README.md`): `Lose`, a member losing its log's tail
+at rest and marking through its last entry; a voter judging by its claim (`Claim`); a marked
+candidate's own vote uncounted (`Own`); the mark ending as the log reaches it or at election. Every
+configuration before it has the states it had (`Losers = {}`); three new ones pass (three voters, a
+change by one voter, a joint configuration) and three must be refused (the candidate's own vote
+counted, voters judging by their logs, and the claim that no marked member is ever elected).
 
 Ganesan et al.'s findings are the tests' checklist (research §5): every fault detected (checksums on
 every record and payload, R-2's CRC-32C), crash and corruption never conflated, redundancy always
@@ -626,7 +720,7 @@ slates measured a delta format not worth a second recovery path).
 - **The core.** R-4 (readies ahead of persistence; built, §2.1), R-5 (a lost-entries refusal
   regresses a member's progress; built, §5.1), R-6 (an apply pause; a leader's own-term entries given to apply
   before its write is durable; the durable commit carried in answers; built, §4.4), R-7 (CTRL's
-  leader-side recovery).
+  leader-side recovery; built, §5.2).
 - **hyper-log.** `GROUP_SUBMISSIONS` from `PIPELINE_FRAMES`; health per group; a damaged frame
   reported as marks through its range for the groups it touched.
 
@@ -699,9 +793,12 @@ and allocates no more on that project's workload.
    "Repair by entries (R-5)"): one lost entry of 30,000 repaired in 1.8 KB and 32 µs in process
    against a snapshot's 30.7 MB and 8.9 ms; the bytes stay below the snapshot's until nearly the
    whole log is lost, and in-process time crosses near 2,000 entries. Open: whether a leader should
-   choose a snapshot past a crossover measured on a real path. Before R-7, 116 to 192 of 1,000
-   schedules a setting with faults at rest end with a group that must wait on a mark
-   (`crates/hyper-raft/ORIGIN.md`, R-5).
+   choose a snapshot past a crossover measured on a real path. The schedules' waits on a mark
+   (`crates/hyper-raft/ORIGIN.md`, R-5 and R-7): with one marked member at a time, 97 to 192 of
+   1,000 schedules a setting end waiting before R-7 and after it alike, every one inspected in a
+   configuration of two voters or one; with two of three marked at once, 1,950 of 4,000 before R-7
+   and 1,627 after. Open: a first lost entry's term in the mark (§5.2), and what an operator's
+   rebuild of a marked member of two costs.
 6. **The idle confirmation flush.** Whether hyper-log can drop the confirmation a lone frame needs
    when nothing follows it, by PAR's identifiers stored apart, or whether depth makes it rare enough
    (with depth, under load, the next frame confirms).
@@ -743,8 +840,8 @@ What waits on core steps not built:
 
 - **R-5** (built, §5.1): a marked member's repair is the core's, by entries; the shell's snapshot
   request and its serving are gone.
-- **R-7.** A marked member does not campaign and drops vote requests behind its mark, so a group
-  whose only up-to-date log is marked waits, as mantle's does.
+- **R-7** (built, §5.2): a marked member campaigns on its log, without its own vote, where the
+  others can be a quorum; the shell holds only a stalled member's campaigns.
 - **Asked of the core besides:** `RawNode::into_store`, so a closed replica gives back its store;
   and the fast track's proposals not yet durable, so a refused write that held them is made again
   instead of fencing the replica (no owner enables the fast track yet).
@@ -812,6 +909,7 @@ Tests (`crates/hyper-durable/tests`):
   and the leader's node killed, suspected by every survivor within its stated bound and replaced
   (`docs/timing.md` §2.9).
 - `shell.rs`, `hyperlog.rs`, `threads.rs`: each bound of §6 at its edge, the open repairs of §4.3,
-  marks, the unwind boundary, the owner's turns, parts and refusals on hyper-log, and the threads
+  marks (a marked member of three campaigning on its log, one of two asking no one), the unwind
+  boundary, the owner's turns, parts and refusals on hyper-log, and the threads
   an owner's sixty-four groups cost (none of their own).
 

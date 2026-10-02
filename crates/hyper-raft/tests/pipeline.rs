@@ -130,7 +130,7 @@ fn schedule(
         group.check_kept();
     } else {
         // Only a group whose marks leave no member the election rule admits
-        // may wait (`docs/durable.md` §5): it is counted, and is no failure.
+        // may wait (`docs/durable.md` §5.2): it is counted, and is no failure.
         let electable = group.electable();
         assert!(
             group.faults > 0 && electable.is_empty(),
@@ -202,7 +202,11 @@ fn schedules_of(name: &str, settings: Settings, voters: &[u64], mix: &Mix) -> (C
         coverage.answers > seeds && coverage.fenced > 0 && coverage.stated > 0,
         "{name}: {coverage:?}"
     );
-    if settings.apply_unpersisted {
+    // With faults at rest a leader's term is short, and its own entries are
+    // rarely committed before its write of them: the schedules without
+    // faults are the ones that hold applying before durability to its
+    // coverage (24 schedules with two marks at once reached none).
+    if settings.apply_unpersisted && mix.corrupt == 0 {
         assert!(coverage.unpersisted > 0, "{name}: {coverage:?}");
     }
     (coverage, committed)
@@ -271,10 +275,22 @@ fn corrupt_rate() -> u64 {
 /// group would hold another at its index.
 #[test]
 fn faults_at_rest_lose_nothing_acknowledged() {
-    for suspicion in [false] {
-        // By suspicion only once a marked member may campaign (R-7): one that
-        // led and restarted marked cannot otherwise end the lease its
-        // followers keep on its node, which lives.
+    faults_at_rest(1);
+}
+
+/// The same with two of the three voters' disks marked at once: the case
+/// where the only logs as current as the group's may all be marked (Protocol-
+/// Aware Recovery's Figure 4(b), Alagappan et al., FAST 2018, §3.4), which
+/// a marked member's election (core step R-7) is for. What both marked
+/// members acknowledged may be lost to both: such a group must wait, and
+/// is counted.
+#[test]
+fn faults_at_rest_on_two_members_at_once_lose_nothing_acknowledged() {
+    faults_at_rest(2);
+}
+
+fn faults_at_rest(marks: usize) {
+    for suspicion in [false, true] {
         for (name, settings) in settings() {
             let settings = Settings {
                 suspicion,
@@ -282,6 +298,7 @@ fn faults_at_rest_lose_nothing_acknowledged() {
             };
             let mix = Mix {
                 corrupt: corrupt_rate(),
+                marks,
                 ..mix_for(&settings, 0)
             };
             schedules_of(name, settings, &[1, 2, 3], &mix);
@@ -363,12 +380,6 @@ fn crashes_at_every_persistence_step(faults_at_rest: bool) {
     for (apply_unpersisted, suspicion) in
         [(false, false), (true, false), (false, true), (true, true)]
     {
-        if corrupt > 0 && suspicion {
-            // A marked member does not campaign (`docs/durable.md` §5): one
-            // that led, restarted marked, cannot end the lease its followers
-            // keep on its node, which lives.
-            continue;
-        }
         let settings = Settings {
             depth: 3,
             apply_unpersisted,

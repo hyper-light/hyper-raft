@@ -106,6 +106,10 @@ pub struct Mix {
     /// Of ten thousand steps, how many are a fault at rest ([`Op::Corrupt`]);
     /// none where the cores are compared, `raft-rs` having no marks.
     pub corrupt: u64,
+    /// The most members whose disks are marked at once. Past one, what two
+    /// acknowledged may be lost to both, and the group then waits for good
+    /// (`docs/durable.md` §5.2); such waits are counted, not failed.
+    pub marks: usize,
 }
 impl Mix {
     pub fn everything() -> Self {
@@ -124,6 +128,7 @@ impl Mix {
             lag: 0,
             leader_durable: 100,
             corrupt: 0,
+            marks: 1,
         }
     }
 }
@@ -707,9 +712,8 @@ impl<R: Replica> Cluster<R> {
                 }
             }
             // Drawn only where faults at rest are: a schedule without draws as
-            // it always did. One member's disk at a time is marked: with two,
-            // what both acknowledged may be lost to both, and the group then
-            // waits for good (`docs/durable.md` §5).
+            // it always did. At most `Mix::marks` members' disks are marked
+            // at once.
             if mix.corrupt > 0 && rng.below(10_000) < mix.corrupt {
                 // A member whose disk holds entries.
                 let holding: Vec<u64> = all
@@ -720,10 +724,11 @@ impl<R: Replica> Cluster<R> {
                 let member = rng.pick(&holding).unwrap_or(1);
                 let others_marked = all
                     .iter()
-                    .any(|id| *id != member && self.disk(*id).mark().is_some());
+                    .filter(|id| **id != member && self.disk(**id).mark().is_some())
+                    .count();
                 let disk = self.disk(member);
                 let held = disk.entries.len() as u64;
-                if !others_marked && held > 0 {
+                if others_marked < mix.marks && held > 0 {
                     let fault = if rng.chance(50) {
                         Fault::Flip(disk.first_index() + rng.below(held))
                     } else {
@@ -959,14 +964,15 @@ impl<R: Replica> Cluster<R> {
 
 impl<R: Replica> Cluster<R> {
     /// The members the election rule admits, read from every member's disk
-    /// whatever runs (`docs/durable.md` §5): a voter of the configuration it
-    /// applied, unmarked, for which a quorum of each half of that
-    /// configuration answers for no more than its log holds — each voter for
-    /// its log's last entry, or for its mark where its log may lack what it
-    /// acknowledged. A group with none must wait, for its logs cannot show
-    /// that an entry one of its marked members helped commit is held
-    /// elsewhere; with one, once the network is whole and every member up,
-    /// it elects.
+    /// whatever runs (`docs/durable.md` §5.2): a voter of the configuration
+    /// it applied for which a quorum of each half of that configuration
+    /// answers for no more than its log holds — each voter for its log's
+    /// last entry, or for its mark where its log may lack what it
+    /// acknowledged — not counting the candidate itself where it is marked
+    /// (R-7), nor a marked one at all in a fast group. A group with none must
+    /// wait, for its logs cannot show that an entry a marked member helped
+    /// commit is held elsewhere; with one, once the network is whole and
+    /// every member up, it elects.
     pub fn electable(&self) -> Vec<u64> {
         let claim = |disk: &Disk| {
             let last = disk.last_index();
@@ -979,7 +985,8 @@ impl<R: Replica> Cluster<R> {
             .filter(|candidate| {
                 let disk = self.disk(*candidate);
                 let conf = &disk.conf;
-                if !votes(conf, *candidate) || disk.mark().is_some() {
+                let marked = disk.mark().is_some();
+                if !votes(conf, *candidate) || (marked && self.settings.fast) {
                     return false;
                 }
                 let last = disk.last_index();
@@ -988,7 +995,10 @@ impl<R: Replica> Cluster<R> {
                     half.is_empty()
                         || half
                             .iter()
-                            .filter(|voter| claim(self.disk(**voter)) <= whole)
+                            .filter(|voter| {
+                                !(marked && **voter == *candidate)
+                                    && claim(self.disk(**voter)) <= whole
+                            })
                             .count()
                             * 2
                             > half.len()

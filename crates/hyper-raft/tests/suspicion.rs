@@ -601,6 +601,49 @@ fn a_restarted_leader_held_from_campaigning_hands_over() {
     assert!(sim.run(), "it handed over for ever");
 }
 
+/// A restarted leader held from campaigning, whose first heir cannot act on the order (cut off
+/// here; a learner by its own configuration in the schedule that found it, seed 75 of the faults
+/// at rest by suspicion), names the next heir that holds as much at its next hand-over: knowing
+/// nothing of what its followers hold, it takes them in turn. Naming the first for good, its
+/// other follower trusted its node and the group elected no one.
+#[test]
+fn a_restarted_leader_hands_over_to_each_heir_in_turn() {
+    let (timing, _) = timing_for(3);
+    let mut sim = Sim::new(3, &Sim::voters(&[1, 2, 3]), timing, 10);
+    sim.found(1);
+    sim.cut.push(2);
+    let store = std::mem::take(sim.node(1).store_mut());
+    let mut node = New::open(1, store, &Settings::focal().by_suspicion(), 99);
+    node.raw.set_timing(timing).unwrap();
+    node.raw.hold_campaigns(true).unwrap();
+    sim.nodes[0] = Some(node);
+    sim.settle(1);
+    assert!(
+        sim.run_until(|sim| sim.leader().is_some()),
+        "its follower kept trusting its node"
+    );
+    assert_eq!(sim.leader(), Some(3));
+}
+
+/// A leader told a member started again empties its window to it and probes it from what it is
+/// known to hold: what was in flight went with the incarnation that stopped.
+#[test]
+fn a_leader_probes_a_member_that_started_again() {
+    let (timing, _) = timing_for(3);
+    let mut sim = Sim::new(3, &Sim::voters(&[1, 2, 3]), timing, 11);
+    sim.found(1);
+    sim.cut.push(3);
+    sim.node(1).propose(b"lost on its way".to_vec());
+    sim.settle(1);
+    let before = sim.peek(1).raw.raft.tracker().get(3).cloned().unwrap();
+    assert!(before.inflights.count() > 0);
+    sim.node(1).raw.restarted(3).unwrap();
+    let after = sim.peek(1).raw.raft.tracker().get(3).cloned().unwrap();
+    assert_eq!(after.inflights.count(), 0);
+    assert_eq!(after.state, hyper_raft::progress::ProgressState::Probe);
+    assert_eq!(after.next_index, after.matched + 1);
+}
+
 /// A follower whose detectors see its leader's node start again forgets it, and campaigns.
 #[test]
 fn a_follower_forgets_a_leader_that_started_again() {

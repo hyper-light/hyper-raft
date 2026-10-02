@@ -768,6 +768,61 @@ in both trees; the counting and interleaved runs are a scratch harness over `hyp
 hyper[-copy] <workload> 3|5 <batch> <bytes> <rounds> 1000 time|count` under `/usr/bin/time -l`,
 instructions an op `(I(R) − I(R/5)) / (ops(R) − ops(R/5))` at R = 40,000.
 
+## A marked member's election (R-7)
+
+Core step R-7 (`docs/durable.md` §5.2). Measured on 2026-10-02 on the machine above, with other
+sessions' work holding the load at 42 to 57; each figure says its load. R-7 adds to the core a test
+of the mark where a campaign starts and where a candidate counts itself, and changes two rules of
+L-2's hand-over and restart (`docs/timing.md` §2.9); nothing on a path that replicates.
+
+**Allocations**: identical to `main`'s on all 32 cells (three and five voters, in place and copying,
+every workload).
+
+**Time, instructions and cycles**, `main`, R-5 and R-7 interleaved in fresh processes, each round
+every tree once, the order rotated and reversed; per round the ratio to `main`; the geometric mean
+and its Student-t 95 % interval (load 43.5 at the start, 42.5 at the end):
+
+| Cell | rounds | R-5 time | R-5 instr. | R-5 cycles | R-7 time | R-7 instr. | R-7 cycles |
+|---|---|---|---|---|---|---|---|
+| steady 64 B, in place | 30 | 1.039 [0.901, 1.199] | 1.002 [1.002, 1.003] | 0.995 [0.978, 1.012] | 0.996 [0.879, 1.127] | 1.002 [1.002, 1.002] | 1.001 [0.989, 1.012] |
+| steady 64 B, copying | 30 | 0.983 [0.946, 1.022] | 1.002 [1.002, 1.003] | 0.999 [0.982, 1.016] | 0.998 [0.959, 1.040] | 1.002 [1.001, 1.003] | 0.995 [0.981, 1.008] |
+| steady 4 KiB, in place | 30 | 1.017 [0.993, 1.042] | 1.001 [1.001, 1.002] | 1.029 [0.994, 1.066] | 1.028 [0.998, 1.058] | 1.001 [1.000, 1.001] | 1.000 [0.966, 1.035] |
+| steady 4 KiB, copying | 30 | 1.019 [0.997, 1.041] | 1.001 [0.999, 1.003] | 1.014 [0.991, 1.036] | 1.021 [1.001, 1.041] | 0.994 [0.993, 0.996] | 1.013 [0.999, 1.028] |
+| transfer, in place | 30 | 0.994 [0.962, 1.027] | 1.000 [1.000, 1.001] | 0.985 [0.961, 1.009] | 1.033 [1.000, 1.067] | 1.000 [0.999, 1.000] | 0.987 [0.967, 1.007] |
+| transfer, copying | 30 | 0.993 [0.972, 1.015] | 1.001 [1.000, 1.001] | 1.006 [0.973, 1.040] | 0.996 [0.977, 1.015] | 1.000 [0.999, 1.000] | 0.988 [0.959, 1.017] |
+| steady batch 64 | 10 | 0.986 [0.951, 1.023] | 1.000 [1.000, 1.000] | 0.958 [0.914, 1.005] | 0.977 [0.903, 1.057] | 1.000 [1.000, 1.001] | 1.002 [0.979, 1.025] |
+| catch-up | 10 | 1.041 [0.691, 1.567] | 1.002 [1.002, 1.002] | 1.022 [1.007, 1.037] | 0.933 [0.691, 1.260] | 1.002 [1.001, 1.002] | 1.021 [1.005, 1.039] |
+| snapshot | 10 | 1.274 [0.769, 2.110] | 1.002 [1.002, 1.002] | 1.019 [1.007, 1.031] | 1.244 [0.630, 2.453] | 1.001 [1.001, 1.002] | 1.026 [1.013, 1.040] |
+| fast | 10 | 0.994 [0.949, 1.040] | 1.001 [1.000, 1.002] | 0.987 [0.952, 1.023] | 1.000 [0.970, 1.031] | 0.999 [0.998, 1.000] | 1.004 [0.958, 1.051] |
+| failover | 10 | 0.995 [0.970, 1.021] | 1.000 [1.000, 1.001] | 1.021 [0.976, 1.069] | 1.024 [0.989, 1.061] | 1.000 [0.999, 1.001] | 0.995 [0.965, 1.025] |
+
+Instructions an op, net of set-up, five runs each, load 42–44: steady 64 B in place `main` 24,136,
+R-7 24,199 (0.26 %); copying 30,261 and 30,251. At this load the time intervals are wide (catch-up's
+and snapshot's span a factor of two), and four lie above 1 or touch it: R-7's steady 4 KiB copying
+(1.021 [1.001, 1.041]) and transfer in place (1.033 [1.000, 1.067]), and the cycles of catch-up and
+snapshot for R-5 and R-7 alike (1.02). A second pass on those cells, 16 rounds at load 42–57, put
+`main` with 48 inert bytes in the member beside them (what R-5 and R-7 add: the mark and its copy in
+the configuration, the R-6 section's test of layout):
+
+| Cell | main + 48 inert bytes: time | instr. | cycles | R-7: time | instr. | cycles |
+|---|---|---|---|---|---|---|
+| steady 4 KiB, in place | 0.966 [0.940, 0.994] | 1.000 [1.000, 1.001] | 1.000 [0.957, 1.044] | 1.030 [0.988, 1.075] | 1.001 [1.001, 1.002] | 1.029 [0.975, 1.085] |
+| steady 4 KiB, copying | 0.986 [0.939, 1.035] | 1.004 [1.002, 1.007] | 1.011 [0.961, 1.063] | 0.995 [0.925, 1.071] | 0.995 [0.993, 0.998] | 0.989 [0.952, 1.028] |
+| transfer, in place | 1.040 [0.925, 1.170] | 1.001 [1.000, 1.001] | 0.990 [0.942, 1.041] | 1.000 [0.928, 1.078] | 1.000 [0.999, 1.000] | 1.000 [0.949, 1.053] |
+| catch-up | 0.885 [0.746, 1.050] | 1.000 [1.000, 1.000] | 1.001 [0.985, 1.017] | 0.897 [0.720, 1.118] | 1.001 [1.001, 1.002] | 0.996 [0.984, 1.009] |
+| snapshot | 1.016 [0.757, 1.362] | 1.000 [1.000, 1.000] | 1.002 [0.986, 1.017] | 1.147 [0.798, 1.649] | 1.001 [1.001, 1.001] | 1.020 [0.998, 1.043] |
+
+In the second pass no interval of R-7's time or cycles lies above 1, and inert bytes alone move the
+4 KiB in-place cell's time by −3.4 %: the leans of the first pass did not hold, at a load where a
+cell's interval spans several per cent. Instructions stay within 0.3 % of `main`'s in every cell.
+Not closed: a pass at a load low enough to state these cells to 1 %, which this machine did not have
+today.
+
+**`benches/pipeline.rs`**: every simulated figure identical to `main`'s.
+
+Commands: as R-5's; the second pass `CELLS=... RUNS=16` over the same harness, `main` built with
+`inert: [u64; 6]` in `Raft`.
+
 ## Where hyper-raft does not win, and why
 
 hyper-raft in place allocates less than every other core in every row. It is faster than raft-rs
@@ -969,6 +1024,10 @@ $B one hyper steady 3 1 64 20000 1000 count
 # comparison's counts and times against main built the same way.
 HYPER_RAFT_SEEDS=1000 HYPER_RAFT_STEPS=4000 HYPER_RAFT_CRASH_SEEDS=40 cargo test -p hyper-raft --release --test pipeline --test repair -- --nocapture
 cargo bench -p hyper-raft --bench repair
+
+# A marked member's election (R-7): the same schedules, faults at rest on two members at once
+# among them, and the comparison of main, R-5 and R-7 interleaved.
+HYPER_RAFT_SEEDS=1000 HYPER_RAFT_STEPS=4000 HYPER_RAFT_CRASH_SEEDS=40 cargo test -p hyper-raft --release --test pipeline --test repair --test suspicion -- --nocapture
 
 # The end-to-end scenarios, and every gate.
 cargo test -p hyper-raft-e2e --test cluster

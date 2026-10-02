@@ -71,6 +71,25 @@
 (* other, so a leader may write a change before it (the core writes its    *)
 (* first entry at once): the model has every run of the core and more.    *)
 (*                                                                         *)
+(* A member of Losers may lose the tail of its log at rest and reopen     *)
+(* knowing what it acknowledged (Lose): hyper-log's uncertainty mark,      *)
+(* PAR's faulty entry (Alagappan et al., FAST 2018), docs/durable.md §5.   *)
+(* It keeps its term and vote; its mark names the last entry it held, the  *)
+(* greater index and term of two marks where one was not yet ended, and    *)
+(* ends once its log reaches the mark's index or holds an entry of a later *)
+(* term (Lost::resolved_by).  A leader still counts what it was told the   *)
+(* member holds (acks): the core's leader takes the member's word that it  *)
+(* lost them (R-5) and counts less, so the model has every run of the core *)
+(* and more.  With Marks = "core", what the core does since R-7: a marked  *)
+(* voter grants a vote only to a log at least as current as its mark; a    *)
+(* marked candidate campaigns on its log, and its own vote is not counted  *)
+(* (a quorum of the others must find its log at least as current as what  *)
+(* each answers for); elected, its mark ends.  Marks = "self" counts the   *)
+(* marked candidate's own vote, and "whole" lets a marked voter judge by   *)
+(* its log: each is refused (MarkedSelf.cfg, MarkedWhole.cfg).  With       *)
+(* Losers = {} no step of these is enabled and every configuration has the *)
+(* states it had.                                                          *)
+(*                                                                         *)
 (* Nothing here grows without a bound.  A configuration states how many    *)
 (* distinct states it has (StateBudget), the checker stops at one more     *)
 (* (WithinBudget), and scripts/check-model.sh gives the checker the memory *)
@@ -111,6 +130,7 @@ CONSTANTS Servers,   \* every member, voter or not
           MaxTerm,
           MaxLen,    \* how long a log grows
           HeldAt,    \* the indexes at which proposals are held
+          Losers,    \* the members whose log may lose its tail at rest
           StateBudget \* the distinct states the checker may find
 
 Stated  == Values \cup {Noop}
@@ -143,15 +163,25 @@ VARIABLES
   under,    \* [Servers -> configurations]: of a leader, the configuration
             \* it was elected under (Raft::note_term_configuration); of a
             \* follower, none
-  chosen    \* [Indexes -> [value, term]]: what was first committed, and by a leader of which term
+  chosen,   \* [Indexes -> [value, term]]: what was first committed, and by a leader of which term
+  mark,     \* [Servers -> [index, term]]: what a member's log may lack of
+            \* what it acknowledged; NoMark for none (Raft::lost)
+  markedLed \* whether a member was elected while marked (NoMarkedLeader)
 
-vars == <<term, vote, role, log, held, commit, says, acks, under, chosen>>
+vars == <<term, vote, role, log, held, commit, says, acks, under, chosen, mark, markedLed>>
 
 NotChosen == [value |-> Nothing, term |-> 0]
+NoMark == [index |-> 0, term |-> 0]
 
 Min(a, b) == IF a < b THEN a ELSE b
 Max(a, b) == IF a > b THEN a ELSE b
 LastTerm(l) == IF Len(l) = 0 THEN 0 ELSE l[Len(l)].term
+
+\* Whether a log holds again what a mark says it may lack (Lost::resolved_by).
+Resolves(k, l) == Len(l) >= k.index \/ LastTerm(l) > k.term
+Marked(s) == mark[s] # NoMark
+\* The mark a member keeps once its log is l.
+Settled(s, l) == IF Marked(s) /\ Resolves(mark[s], l) THEN NoMark ELSE mark[s]
 
 \* The configuration a member counts by: the one its committed log states.
 States(s, x) == \E i \in 1..commit[s] : log[s][i].value = x
@@ -175,6 +205,8 @@ TypeOK ==
   /\ held \in [Servers -> [Indexes -> Values \cup {Nothing}]]
   /\ \A s \in Servers : \A i \in Indexes : i <= Len(log[s]) => held[s][i] = Nothing
   /\ \A s \in Servers : role[s] = "follower" => under[s] = NoConfiguration
+  /\ mark \in [Servers -> [index : 0..MaxLen, term : 0..MaxTerm]]
+  /\ markedLed \in BOOLEAN
 
 Init ==
   /\ term   = [s \in Servers |-> 0]
@@ -187,6 +219,8 @@ Init ==
   /\ acks   = [s \in Servers |-> [t \in 0..MaxTerm |-> 0]]
   /\ under  = [s \in Servers |-> NoConfiguration]
   /\ chosen = [i \in Indexes |-> NotChosen]
+  /\ mark   = [s \in Servers |-> NoMark]
+  /\ markedLed = FALSE
 
 ----------------------------------------------------------------------------
 \* A proposal reaches a voter, which holds it if it holds nothing there,
@@ -199,14 +233,14 @@ Hold(m, i, v) ==
   /\ held[m][i] = Nothing
   /\ held' = [held EXCEPT ![m][i] = v]
   /\ says' = [says EXCEPT ![m][i] = [value |-> v, term |-> term[m]]]
-  /\ UNCHANGED <<term, vote, role, log, commit, acks, under, chosen>>
+  /\ UNCHANGED <<term, vote, role, log, commit, acks, under, chosen, mark, markedLed>>
 
 \* A member says again what it holds, as of a term it has come to since.
 Say(m, i) ==
   /\ held[m][i] # Nothing
   /\ says[m][i].term # term[m]
   /\ says' = [says EXCEPT ![m][i] = [value |-> held[m][i], term |-> term[m]]]
-  /\ UNCHANGED <<term, vote, role, log, held, commit, acks, under, chosen>>
+  /\ UNCHANGED <<term, vote, role, log, held, commit, acks, under, chosen, mark, markedLed>>
 
 Write(l, v) ==
   /\ log' = [log EXCEPT ![l] = Append(@, [term |-> term[l], value |-> v])]
@@ -217,7 +251,7 @@ Take(l, v) ==
   /\ role[l] = "leader"
   /\ Len(log[l]) < MaxLen
   /\ Write(l, v)
-  /\ UNCHANGED <<term, vote, role, commit, says, acks, under, chosen>>
+  /\ UNCHANGED <<term, vote, role, commit, says, acks, under, chosen, mark, markedLed>>
 
 \* A leader writes the change, or the entry that leaves the joint
 \* configuration once the one that entered it is committed.  It writes none
@@ -238,7 +272,7 @@ Reconfigure(l) ==
   /\ ~Pending(l)
   /\ \A i \in older : i <= commit[l]
   /\ Write(l, v)
-  /\ UNCHANGED <<term, vote, role, commit, says, acks, under, chosen>>
+  /\ UNCHANGED <<term, vote, role, commit, says, acks, under, chosen, mark, markedLed>>
 
 CONSTANT Counts   \* "round" | "any"
 \* A member's log is of the leader's round: it said it holds the leader's
@@ -280,7 +314,7 @@ FastCommit(l) ==
   /\ FastOfTheTerm(l, {m \in c.in : HoldsByItself(l, m, i) \/ HoldsFromLeader(l, m, i)})
   /\ commit' = [commit EXCEPT ![l] = i]
   /\ chosen' = Choose(i, l)
-  /\ UNCHANGED <<term, vote, role, log, held, says, acks, under>>
+  /\ UNCHANGED <<term, vote, role, log, held, says, acks, under, mark, markedLed>>
 
 ClassicCommit(l, i) ==
   LET c == ConfigurationOf(l) IN
@@ -294,7 +328,7 @@ ClassicCommit(l, i) ==
                  IF j > commit[l] /\ j <= i /\ chosen[j] = NotChosen
                  THEN [value |-> log[l][j].value, term |-> term[l]]
                  ELSE chosen[j]]
-  /\ UNCHANGED <<term, vote, role, log, held, says, acks, under>>
+  /\ UNCHANGED <<term, vote, role, log, held, says, acks, under, mark, markedLed>>
 
 \* A member of the leader's configuration takes from it what follows the
 \* point p, through k.
@@ -317,16 +351,46 @@ Replicate(l, m, p) ==
      IN /\ log' = [log EXCEPT ![m] = taken]
         /\ held' = [held EXCEPT ![m] = Release(@, Len(taken))]
         /\ commit' = [commit EXCEPT ![m] = Max(@, Min(commit[l], k))]
+        /\ mark' = [mark EXCEPT ![m] = Settled(m, taken)]
   /\ term' = [term EXCEPT ![m] = term[l]]
   /\ vote' = [vote EXCEPT ![m] = IF term[m] = term[l] THEN @ ELSE Nobody]
   /\ role' = [role EXCEPT ![m] = "follower"]
   /\ under' = [under EXCEPT ![m] = NoConfiguration]
   /\ acks' = [acks EXCEPT ![m][term[l]] = Max(@, k)]
-  /\ UNCHANGED <<says, chosen>>
+  /\ UNCHANGED <<says, chosen, markedLed>>
 
+\* A member of Losers loses the entries of its log after k at rest, and
+\* reopens: it keeps its term and vote (their two copies, PAR §3.3.1), and
+\* marks through the last entry it held, with any mark not yet ended
+\* (hyper-log's merge).  What its log no longer holds it no longer states
+\* committed; it leads no more.
+Lose(m, k) ==
+  LET old == [index |-> Len(log[m]), term |-> LastTerm(log[m])]
+      merged == IF Marked(m)
+                THEN [index |-> Max(mark[m].index, old.index),
+                      term |-> Max(mark[m].term, old.term)]
+                ELSE old
+  IN
+  /\ m \in Losers
+  /\ k < Len(log[m])
+  /\ log' = [log EXCEPT ![m] = SubSeq(@, 1, k)]
+  /\ commit' = [commit EXCEPT ![m] = Min(@, k)]
+  /\ mark' = [mark EXCEPT ![m] = merged]
+  /\ role' = [role EXCEPT ![m] = "follower"]
+  /\ under' = [under EXCEPT ![m] = NoConfiguration]
+  /\ UNCHANGED <<term, vote, held, says, acks, chosen, markedLed>>
+
+CONSTANT Marks   \* "core" | "self" | "whole"
+\* What a voter answers for in an election (Raft::claim): its log's last
+\* entry, or its mark while its log may lack what it acknowledged.  "whole"
+\* judges by the log alone, which the core does not.
+Claim(m) ==
+  IF Marked(m) /\ Marks # "whole"
+  THEN mark[m]
+  ELSE [index |-> Len(log[m]), term |-> LastTerm(log[m])]
 Current(c, m) ==
-  \/ LastTerm(log[c]) > LastTerm(log[m])
-  \/ LastTerm(log[c]) = LastTerm(log[m]) /\ Len(log[c]) >= Len(log[m])
+  \/ LastTerm(log[c]) > Claim(m).term
+  \/ LastTerm(log[c]) = Claim(m).term /\ Len(log[c]) >= Claim(m).index
 
 \* How many of the voters V hold v at i by themselves, as their votes say.
 Count(V, i, v) ==
@@ -365,10 +429,14 @@ Asked(c, Q) ==
   /\ c \notin Q
   /\ \A m \in Q : /\ term[m] < term[c] + 1 \/ (term[m] = term[c] + 1 /\ vote[m] = Nobody)
                   /\ Current(c, m)
+\* Whose vote a candidate counts besides those it was given: its own, but
+\* for a marked candidate's (R-7), whose log may lack what it acknowledged;
+\* "self" counts that too, which the core does not.
+Own(c) == IF Marked(c) /\ Marks # "self" THEN {} ELSE {c}
 Quorums(c, Q) ==
   LET counted == ConfigurationOf(c) IN
-  {{}} \cup {V \in SUBSET ((Q \cup {c}) \cap Voters(counted)) :
-               c \in V /\ ClassicOf(counted, V)}
+  {{}} \cup {V \in SUBSET ((Q \cup Own(c)) \cap Voters(counted)) :
+               Own(c) \subseteq V /\ ClassicOf(counted, V)}
 
 Elect(c, Q, V) ==
   LET t == term[c] + 1
@@ -387,7 +455,7 @@ Elect(c, Q, V) ==
   /\ IF V = {}
      THEN /\ role'  = [m \in Servers |-> IF m \in voted THEN "follower" ELSE role[m]]
           /\ under' = [m \in Servers |-> IF m \in voted THEN NoConfiguration ELSE under[m]]
-          /\ UNCHANGED <<log, held>>
+          /\ UNCHANGED <<log, held, mark, markedLed>>
      ELSE LET length == Len(log[c])
               reported == {i \in Indexes : /\ i > length
                                            /\ \E v \in Values : Count(V, i, v) > 0}
@@ -405,6 +473,10 @@ Elect(c, Q, V) ==
              /\ under' = [m \in Servers |-> IF m = c THEN counted
                                             ELSE IF m \in voted THEN NoConfiguration
                                             ELSE under[m]]
+             \* Elected, what it lost was committed by no one: its mark ends
+             \* (Raft::become_leader).
+             /\ mark' = [mark EXCEPT ![c] = NoMark]
+             /\ markedLed' = (markedLed \/ Marked(c))
   /\ UNCHANGED <<commit, acks, chosen>>
 
 \* Each step's guards that do not depend on its later arguments come
@@ -425,6 +497,7 @@ Next ==
                        /\ \E Q \in SUBSET (Servers \ {c}) :
                             /\ Asked(c, Q)
                             /\ \E V \in Quorums(c, Q) : Elect(c, Q, V)
+  \/ \E m \in Losers : \E k \in 0..MaxLen : Lose(m, k)
 
 Spec == Init /\ [][Next]_vars
 
@@ -482,6 +555,11 @@ FastByHeldAfterChange ==
     /\ under[l] # c
     /\ \E j \in 1..(i - 1) : log[l][j].value \in Changes /\ log[l][j].term = term[l]
 NoFastByHeldAfterChange == ~FastByHeldAfterChange
+
+\* No member was elected while marked.  A configuration that checks R-7 must
+\* reach it (MarkedReached.cfg, which the checker must refuse), or it checks
+\* nothing of a marked member's election.
+NoMarkedLeader == ~markedLed
 
 \* For the checker: it has found no more states than the configuration
 \* states it has.

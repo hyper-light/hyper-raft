@@ -700,15 +700,19 @@ and the owners that still tick.
   on that node, which is per group only when a node's standing changes. A member is trusted until
   its owner says otherwise, so a member opened with no word from any detector trusts everyone.
 - `RawNode::restarted(member)`: the node came back as a new incarnation. It is trusted, and leads
-  nothing it led before.
+  nothing it led before. A leader probes it from what it is known to hold, its window emptied: what
+  was in flight went with the incarnation that stopped (core step R-7; with a window of one byte, a
+  leader waiting on ten such messages freed one a beat, `HeartbeatAnswers::Bare`, and the group
+  looked stalled for longer than the schedules' quiet period, seed 478 of the faults at rest).
 - `RawNode::set_timing(Timing { span, round })`: `Timing::of(&ballot, &span)` from the law of §2.3,
   `span` the `W` the ballot chose and `round` the ballot's `broadcast_tail` (the slowest voter path's
   tail over `G`, plus the mean flush). Given again whenever the ballot moves.
 - `RawNode::wake(now)`, the owner's monotonic clock in nanoseconds, after each call it makes and at
   `RawNode::deadline()`; the core reads no clock, and what a call arms is timed at the next wake.
   A group with nothing timed has no deadline and is woken for nothing.
-- `RawNode::hold_campaigns(held)`: the owner holds the member's campaigns (a log that may lack
-  what it acknowledged, a write that waits for room). Everything else goes on.
+- `RawNode::hold_campaigns(held)`: the owner holds the member's campaigns (a write that waits for
+  room; a log that may lack what it acknowledged the core judges itself, `docs/durable.md` §5.2).
+  Everything else goes on.
 
 `Config::validate` refuses elections by suspicion without pre-vote and check-quorum: a member that
 opens knowing no leader campaigns, and without pre-vote one that restarted in an idle group would
@@ -734,7 +738,12 @@ spend a term and depose a leader that never left.
 - **A leader steps down** once it and those it trusts are no quorum of either half (check-quorum
   from the detectors, Raft §6.2), at once: the detector already waited its `η + α`.
 - **A leader that stops leading in its term hands over**: a transfer's order (`MsgTimeoutNow`,
-  dissertation §3.10) to the voter it trusts that holds the most of its log. Its followers trust
+  dissertation §3.10) to the voter it trusts that holds the most of its log, and among those that
+  hold as much, to each in turn, one a hand-over (`Watch::attempt`): one that restarted knows nothing
+  of what its followers hold, and the first it named may be one that cannot campaign. A leader that
+  restarted marked and could not campaign named a member that was a learner by its own
+  configuration, again and again, while its followers kept their lease on its node (core step R-7,
+  seed 75 of the faults at rest by suspicion). Its followers trust
   its node, which lives, and on ticks their lease would have run out; nothing else would make them
   campaign. The schedules found it twice: a leader that removed itself with no voter holding its
   whole log (seed 7 of the four settings), and one that stepped down for want of a quorum. The

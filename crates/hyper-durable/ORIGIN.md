@@ -105,3 +105,13 @@ what it tells the core at open. The edits, all in `src/replica.rs` but the tests
   marked) and `tests/sim.rs` `a_member_whose_last_writes_were_lost_at_rest_is_repaired_by_entries`:
   the leader resends every lost entry, sends no snapshot, the mark ends and the group settles.
 
+## R-7: a marked member's election
+
+Core step R-7 (`docs/durable.md` §5.2). Nothing in `src/` changes: the shell already left a marked
+member's campaigns to the core (R-5), and `Replica::campaign` maps the core's refusal. Tests:
+`tests/shell.rs`'s `a_marked_member_takes_no_part_in_elections` becomes two,
+`a_marked_member_campaigns_on_its_log_and_votes_by_its_mark` (three voters: it refuses a candidate
+behind its mark and asks its pre-votes naming its log's last entry) and
+`a_marked_member_of_two_takes_no_part_in_elections` (two voters: refused `Marked`, due for nothing,
+asking no one).
+

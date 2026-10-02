@@ -1,8 +1,10 @@
 # The core's model
 
 `FastTrack.tla` is a TLA+ model of `crates/hyper-raft` as it is built: the classic track, a change
-of the voters by one entry or through a joint configuration, and the fast track with both of its
-rules (`docs/raft.md`, "The fast track's election defect, and its fix"). TLC checks it in CI only
+of the voters by one entry or through a joint configuration, the fast track with both of its
+rules (`docs/raft.md`, "The fast track's election defect, and its fix"), and members whose log loses
+its tail at rest and reopens marked, with a marked member's election (core steps R-5 and R-7,
+`docs/durable.md` §5.2). TLC checks it in CI only
 (`CLAUDE.md` §1, "Model checking"): the `model` job of `.github/workflows/ci.yml` runs
 `scripts/check-model.sh`, which runs every configuration below and fails on any that does not end
 as it states. `scripts/gates.sh` does not run it: the gates run on the owner's machine, and TLC does
@@ -42,6 +44,9 @@ their terms.
 | `ClassicCommit(l, i)` | `Raft::maybe_commit`: the tracker's quorum index (`Tracker::quorum_index`, both halves of a joint configuration) and `Log::maybe_commit`, which commits only an entry of the leader's term. |
 | `Replicate(l, m, p)` | `Raft::bcast_append` to the members of the leader's configuration; `Raft::handle_append_entries` → `Log::maybe_append` and `Raft::release_proposals` at the member; the answer, `Raft::handle_append_response` (`Progress::matched`, the model's `acks`). |
 | `Elect(c, Q, V)` | `Raft::hup` (a voter of its own applied configuration), `Raft::campaign`, `Raft::step_vote` (the log comparison, `Log::is_up_to_date`, and the held entries sent with the vote), `Raft::poll`, `Raft::hear_report`, then `Raft::become_leader` → `Raft::note_term_configuration` and `Raft::recover` (the entry most held among the voters, at every index above the log). |
+| `Lose(m, k)` | A member of `Losers` whose log lost its tail after `k` at rest and reopened: hyper-log's uncertainty mark (`Health::Marked`), passed to the core as `Config::lost` (`Lost`). It keeps its term and vote, marks through its last entry, the greater index and term where a mark had not yet ended (hyper-log's merge), and its commit falls to what it holds. The mark ends as `Lost::resolved_by` says, in `Replicate` (`Raft::settle_lost` at every notice) and at its election (`Raft::become_leader`). |
+| `Claim(m)`, `Current(c, m)` | `Raft::claim` in `Raft::step_vote`: a voter grants only a log at least as current as its mark while marked. `Marks = "whole"` judges by the log alone (refused). |
+| `Own(c)`, `Quorums(c, Q)` | `Raft::campaign` polling a marked candidate's own vote as a refusal (R-7): its quorum is of the others. `Marks = "self"` counts it (refused). `Raft::may_campaign`'s further limits (the others can be a quorum; not in a fast group) only refuse campaigns the model may take and win nothing by. |
 
 What the model leaves out, and why it is sound to:
 - **Messages** are not modelled one by one: what was said stays said and may be acted on at any
@@ -75,6 +80,12 @@ What the model leaves out, and why it is sound to:
   forgetting its leader, which no action reads. None grants a vote the log comparison would refuse,
   so `Elect` is unchanged and so is every configuration's state count. **Learners** do not vote and are not counted.
   **ReadIndex** commits nothing. **A snapshot** stands for a committed prefix of a log.
+- **A member's word that it lost entries** (R-5's refusal flagged lost, `Raft::take_lost`) lowers
+  what its leader counts it holding; the model's leader keeps counting what it was told (`acks`)
+  and so commits in more runs than the core. A lost write that was never acknowledged is a crash,
+  which the model has; a mark covers what was acknowledged, which hyper-log's persist record, kept
+  apart from its frame, names. Losing the term or the vote is a damaged member, rebuilt under a new
+  identity, not modelled.
 - **The leader's first entry** is an entry it takes like any other, so the model's leader may
   write a change before it; the core writes its first entry at once. The model has every run of
   the core and some more.
@@ -107,6 +118,12 @@ one worker, `TLC_MEMORY_MB=256`, beside other work (load average about 30 on 18 
 | `least` | `FastTrackWrong.cfg` | 5 voters, 2 terms, 1 index, the least-held entry recovered, no first rule | 89,337 (focal: 89,337) | refused: `LeaderHolds` | 2 min 58 s |
 | `anyconfig` | `FastTrackAnyConfig.cfg` | `change` without the second rule | 755,201 | refused: `LeaderHolds` | 1 min 22 s |
 | `growreached` | `FastTrackGrowReached.cfg` | `grow` and the claim `NoFastByHeldAfterChange` | 12,451 | refused: `NoFastByHeldAfterChange` | 2 s |
+| `marked` | `Marked.cfg` | classic core, 3 voters, any losing its log's tail at rest, 3 terms, 2 indexes | first CI run | passes | |
+| `markedchange` | `MarkedChange.cfg` | classic core, 2 voters and s3 added by one entry, any losing its tail, 3 terms, 2 indexes | first CI run | passes | |
+| `markedjoint` | `MarkedJoint.cfg` | classic core, s1 replaced by s3 through a joint configuration, any losing its tail, 3 terms, 2 indexes | first CI run | passes | |
+| `markedself` | `MarkedSelf.cfg` | `marked` at 2 terms and 1 index, a marked candidate's own vote counted | first CI run | refused: `LeaderHolds` | |
+| `markedwhole` | `MarkedWhole.cfg` | `marked` at 2 terms and 1 index, voters judging by their logs | first CI run | refused: `LeaderHolds` | |
+| `markedreach` | `MarkedReached.cfg` | `marked` and the claim `NoMarkedLeader` | first CI run | refused: `NoMarkedLeader` | |
 
 What each shows:
 - `one`, `round`, `four`: focal's three, unchanged. `reached` shows that `round` commits an index
@@ -144,6 +161,24 @@ model before an election became one step took 208 million states and 26 GB of di
 3 terms and 2 indexes without ending. A change of five voters to four, as seed 54104 had, is
 five voters at two indexes: past that bound too, so `anyconfig` and `change` show the same defect
 and rule at three.
+
+**The marked members (R-7, 2026-10-02).** The model gained `Lose`, `Claim`, `Own`, the variables
+`mark` and `markedLed` and the constants `Losers` and `Marks`. With `Losers = {}` no step of them is
+enabled and `mark` and `markedLed` keep their first values, so every configuration above has the
+states it had; each states `Losers = {}` and `Marks = "core"`. The six new ones were written without
+running TLC (`CLAUDE.md` §1): their `StateBudget` is a ceiling, the largest configuration measured
+(`change`'s 3,304,320, whose memory set the runner's bounds), and `scripts/check-model.sh` fails each
+of them on its first CI run with the count it found ("has N states and states 3304320"), which is
+the count to record here and in the configuration. What each shows:
+- `marked`, `markedchange`, `markedjoint`: every invariant across marks on three voters, across a
+  change by one voter, and through a joint configuration, a marked candidate counting both halves'
+  majorities without itself.
+- `markedself` is the self-exclusion taken out: s1 commits an entry by s2, s2 loses it at rest,
+  and s2 counts its own vote with s3's, whose log is empty, and leads without it.
+- `markedwhole` is the voters' judgment by the mark taken out: s2, having lost the entry, votes for
+  s3 by its own empty log.
+- `markedreach` shows `marked` elects a marked member (s1 writes an entry, loses it, and is elected
+  on its empty log by s2 and s3): without it `marked` would check nothing of R-7.
 
 **To change the model.** A change that makes a configuration larger or smaller fails the check
 until its states are counted again and stated; a new configuration is first run with a

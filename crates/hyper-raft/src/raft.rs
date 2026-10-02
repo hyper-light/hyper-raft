@@ -1066,12 +1066,22 @@ impl<S: Storage> Raft<S> {
         }
         Ok(())
     }
-    /// Whether this member may campaign as far as what it lost goes: not
-    /// while its log may lack entries it acknowledged, for a log that
-    /// short could lead without an entry it helped commit (mantle's rule,
-    /// `docs/durable.md` §5).
+    /// Whether this member may campaign as far as what it lost goes (core
+    /// step R-7, `docs/durable.md` §5.2). One whose log may lack what it
+    /// acknowledged campaigns on its log, and its own vote is not counted:
+    /// elected, a quorum of the others answered for no more than its log
+    /// holds, so every entry ever committed is in its log (every commit's
+    /// quorum meets that one in a member that held the entry, or holds it
+    /// under its mark, and answered for it). So only where the others can
+    /// be a quorum of each half of its configuration, and not in a fast
+    /// group, whose held proposals the argument does not cover. A sole
+    /// voter, or one of two, that lost what it acknowledged waits.
     fn may_campaign(&self) -> bool {
-        self.lost.is_none()
+        if self.lost.is_none() {
+            return true;
+        }
+        let id = self.id;
+        !self.config.fast && self.tracker.quorum_of(|member| member != id)
     }
     /// The last entry this member answers for in an election, `(index, term)`: its log's last,
     /// or what it marks lost, which is later (`docs/durable.md` §5). It may have acknowledged
@@ -1393,8 +1403,15 @@ impl<S: Storage> Raft<S> {
         if self.told_to_campaign {
             // It is told again by itself if another change waits.
             self.told_to_campaign = false;
-            if self.state == StateRole::Follower && self.promotable {
-                self.hup(true)?;
+            if self.state == StateRole::Follower
+                && self.promotable
+                && let Err(error) = self.hup(true)
+                && error.is_fatal()
+            {
+                // A campaign it may no longer make (its log may lack what it
+                // acknowledged, and the change left the others no quorum
+                // without it) is refused, and changes nothing.
+                return Err(error);
             }
         }
         // A joint configuration that leaves by itself does so once the
@@ -1698,16 +1715,32 @@ impl<S: Storage> Raft<S> {
     /// heir's campaign moves them to its term, where they know no leader.
     /// An heir that cannot win leaves them so all the same, and they elect
     /// among themselves.
+    ///
+    /// Among heirs that hold as much, it takes them in turn, one a hand-over
+    /// (the campaign count, `Watch::attempt`): one that restarted knows
+    /// nothing of what its followers hold, and the heir it names first may
+    /// be one that cannot campaign (a learner by its own configuration) or
+    /// cannot win, while its followers keep their lease on it. A schedule
+    /// found that with a leader that restarted marked (R-7, seed 75 of the
+    /// faults at rest by suspicion): it named the same heir for good.
     fn hand_over(&mut self) -> Result<()> {
         let configuration = self.tracker.configuration();
-        let heir = self
-            .tracker
-            .iter()
-            .filter(|(member, _)| {
+        let heirs = || {
+            self.tracker.iter().filter(|(member, _)| {
                 *member != self.id && configuration.votes(*member) && !self.suspects(*member)
             })
-            .max_by_key(|(member, progress)| (progress.matched, std::cmp::Reverse(*member)))
-            .map(|(member, _)| member);
+        };
+        let Some(most) = heirs().map(|(_, progress)| progress.matched).max() else {
+            return Ok(());
+        };
+        let tied = || heirs().filter(|(_, progress)| progress.matched == most);
+        let turn = self
+            .watch
+            .as_ref()
+            .map_or(0, |watch| usize::try_from(watch.attempt).unwrap_or(0))
+            .checked_rem(tied().count())
+            .unwrap_or(0);
+        let heir = tied().map(|(member, _)| member).nth(turn);
         match heir {
             Some(heir) => self.send(proto::message(heir, MessageType::MsgTimeoutNow)),
             None => Ok(()),
@@ -1724,6 +1757,12 @@ impl<S: Storage> Raft<S> {
             return Ok(());
         }
         if self.state == StateRole::Leader {
+            // What was in flight to it went with the incarnation that
+            // stopped: its window is empty, and it is probed from what it
+            // is known to hold, not waited on.
+            if let Some(progress) = self.tracker.get_mut(member) {
+                progress.become_probe();
+            }
             return self.probe(member);
         }
         if self.leader_id == member {
@@ -1784,9 +1823,16 @@ impl<S: Storage> Raft<S> {
         let Some(watch) = self.watch.as_ref() else {
             return true;
         };
-        let id = self.id;
-        self.tracker
-            .quorum_of(|member| member == id || !watch.suspects(member))
+        let (id, whole) = (self.id, self.lost.is_none());
+        // A member whose log may lack what it acknowledged is no part of
+        // its own quorum (R-7).
+        self.tracker.quorum_of(|member| {
+            if member == id {
+                whole
+            } else {
+                !watch.suspects(member)
+            }
+        })
     }
     /// Whether a leader's group has work in flight, which its beats
     /// recover if a message of it is lost: a transfer, a read, or a member
@@ -2066,6 +2112,10 @@ impl<S: Storage> Raft<S> {
         self.reset(term)?;
         self.leader_id = self.id;
         self.state = StateRole::Leader;
+        // Elected without its own vote by a quorum that answered for no more
+        // than its log holds (R-7): what it lost was committed by no one, and
+        // its first entry, of a later term, will hold what the mark marks.
+        self.lost = None;
         if let Some(watch) = self.watch.as_mut() {
             watch.led = term;
         }
@@ -2105,7 +2155,9 @@ impl<S: Storage> Raft<S> {
             self.become_candidate()?;
             (MessageType::MsgRequestVote, self.term)
         };
-        if self.poll(self.id, true)? == Tally::Won {
+        // A member whose log may lack what it acknowledged does not count
+        // its own vote (R-7): it is no witness for its own log.
+        if self.poll(self.id, self.lost.is_none())? == Tally::Won {
             // The one voter there is.
             return Ok(());
         }

@@ -509,12 +509,8 @@ fn a_log_that_starts_past_the_state_machine_does_not_open() {
     ));
 }
 
-/// A marked member (its log may lack entries it acknowledged) takes no part in elections: it
-/// refuses to campaign, refuses its vote to a candidate behind its mark, and sends no request
-/// for votes of its own, though it opened knowing no leader and its detectors suspect every
-/// peer: the core holds its campaigns, and it is due for nothing.
-#[test]
-fn a_marked_member_takes_no_part_in_elections() {
+/// A store holding two entries of term 1, marked through 5 of term 1.
+fn marked_store() -> SimStore {
     let mut store = SimStore::new(1);
     store
         .write_now(&Write {
@@ -531,15 +527,23 @@ fn a_marked_member_takes_no_part_in_elections() {
         })
         .unwrap();
     store.mark = Some(Point { index: 5, term: 1 });
+    store
+}
+
+/// A marked member (its log may lack entries it acknowledged) of three voters refuses its vote
+/// to a candidate behind its mark, and campaigns on its log (core step R-7): its requests name
+/// its log's last entry, not the mark, and once its detectors suspect every peer its campaign is
+/// timed.
+#[test]
+fn a_marked_member_campaigns_on_its_log_and_votes_by_its_mark() {
     let mut r: Sim = Replica::open(
         &settings(2, 1),
-        store,
+        marked_store(),
         Kv::new(voters(&[1, 2, 3]), false),
         Unbounded,
     )
     .unwrap();
     assert_eq!(r.mark(), Some(Point { index: 5, term: 1 }));
-    assert_eq!(r.campaign(), Err(ReplicaError::Marked));
     r.step(Message {
         msg_type: MessageType::MsgRequestVote,
         from: 3,
@@ -550,13 +554,51 @@ fn a_marked_member_takes_no_part_in_elections() {
         ..Message::default()
     })
     .unwrap();
+    let out = pump(&mut r);
+    assert!(
+        out.messages
+            .iter()
+            .filter(|m| m.msg_type == MessageType::MsgRequestVoteResponse)
+            .all(|m| m.reject),
+        "{:?}",
+        out.messages
+    );
+    assert_eq!(r.campaign(), Ok(()));
+    let out = pump(&mut r);
+    let asked: Vec<_> = out
+        .messages
+        .iter()
+        .filter(|m| {
+            matches!(
+                m.msg_type,
+                MessageType::MsgRequestVote | MessageType::MsgRequestPreVote
+            )
+        })
+        .map(|m| (m.to, m.index, m.log_term))
+        .collect();
+    assert_eq!(asked, vec![(1, 2, 1), (3, 2, 1)]);
+}
+
+/// A marked member of two voters takes no part in elections: the other is no quorum without
+/// it, so it refuses to campaign and sends no request for votes, though it opened knowing no
+/// leader and its detectors suspect its peer: the core holds its campaigns, and it is due for
+/// nothing.
+#[test]
+fn a_marked_member_of_two_takes_no_part_in_elections() {
+    let mut r: Sim = Replica::open(
+        &settings(2, 1),
+        marked_store(),
+        Kv::new(voters(&[1, 2]), false),
+        Unbounded,
+    )
+    .unwrap();
+    assert_eq!(r.campaign(), Err(ReplicaError::Marked));
     r.set_timing(hyper_raft::Timing {
         span: std::time::Duration::from_millis(1),
         round: std::time::Duration::from_millis(1),
     })
     .unwrap();
     r.suspect(1).unwrap();
-    r.suspect(3).unwrap();
     let start = now();
     let mut out = Output::default();
     for step in 0..100u64 {
@@ -567,11 +609,10 @@ fn a_marked_member_takes_no_part_in_elections() {
     }
     let out = pump(&mut r);
     assert!(
-        out.messages.iter().all(|m| match m.msg_type {
-            MessageType::MsgRequestVote | MessageType::MsgRequestPreVote => false,
-            MessageType::MsgRequestVoteResponse => m.reject,
-            _ => true,
-        }),
+        !out.messages.iter().any(|m| matches!(
+            m.msg_type,
+            MessageType::MsgRequestVote | MessageType::MsgRequestPreVote
+        )),
         "{:?}",
         out.messages
     );

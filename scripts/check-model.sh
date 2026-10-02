@@ -48,6 +48,12 @@ anyround     FastTrackAnyRound.cfg          LeaderHolds
 least        FastTrackWrong.cfg             LeaderHolds
 anyconfig    FastTrackAnyConfig.cfg         LeaderHolds
 growreached  FastTrackGrowReached.cfg       NoFastByHeldAfterChange
+marked       Marked.cfg                     -
+markedchange MarkedChange.cfg               -
+markedjoint  MarkedJoint.cfg                -
+markedself   MarkedSelf.cfg                 LeaderHolds
+markedwhole  MarkedWhole.cfg                LeaderHolds
+markedreach  MarkedReached.cfg              NoMarkedLeader
 "
 
 if ! command -v java >/dev/null 2>&1; then

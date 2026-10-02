@@ -557,3 +557,56 @@ its sources; `docs/raft.md` §3).
   `main` an op after three hot-path costs found and removed (the first build was 1.2 % above); no
   interval of time above 1; `benches/pipeline.rs`'s simulated figures identical.
 
+## R-7: a marked member's election
+
+Not a port: this repository's change (`docs/durable.md` §5.2, which states the rule, the safety
+argument, the configurations and marks it covers, and CTRL mapped onto it; `docs/raft.md` §3).
+
+- **The rule** (`src/raft.rs`): `Raft::may_campaign` lets a marked member campaign where the others
+  can be a quorum of each half of its configuration (`Tracker::quorum_of`) and the group has no
+  fast track; `Raft::campaign` polls its own vote as a refusal while marked; `trusted_quorum` counts
+  a marked member out of its own quorum; `Raft::become_leader` ends the mark; `commit_apply` takes a
+  campaign a change made impossible as the refusal it is (a schedule found `advance_apply_to`
+  returning `Error::Lost` where a marked member had been told to campaign once a change applied).
+- **Two rules of L-2 found wanting by the schedules with faults, by suspicion** (`docs/timing.md`
+  §2.9 states both): a leader that restarted and cannot campaign hands over to each heir that holds
+  as much in turn (`hand_over`, by `Watch::attempt`), where it named the lowest for good (seed 75: a
+  member that was a learner by its own configuration, while the followers kept their lease on the
+  leader's node); and a leader told a member started again probes it with its window emptied
+  (`restarted`), where it waited on ten messages that went with the old incarnation, freeing one a
+  beat (seed 478, a window of one byte, `HeartbeatAnswers::Bare`). Each has its directed test in
+  `tests/suspicion.rs`, which fails without it.
+- **Tests**: `tests/repair.rs` gains three: PAR's Figure 4(b) in suffix form (fails on R-5: "no one
+  was elected"), a marked log that may lack a committed entry never elected (fails with the
+  candidate's own vote counted, and with the voters judging by their logs: "committed another entry
+  at 5"), and a marked member of one or two voters asking no one. The schedules' harness:
+  `Cluster::electable` holds the rule (a marked candidate counted out of its own quorum, none in a
+  fast group), `Mix::marks` the most members marked at once; `tests/pipeline.rs` runs the faults at
+  rest by suspicion too, and with two of three voters marked at once
+  (`faults_at_rest_on_two_members_at_once_lose_nothing_acknowledged`); the crash enumeration with
+  faults runs by suspicion too. Mutated, the schedules fail at once: the candidate's own vote counted
+  (seed 26: "member 2 committed another entry at 9"), the voters judging by their logs (seed 4).
+- **Recorded on 2026-10-02** (`HYPER_RAFT_SEEDS=1000 HYPER_RAFT_STEPS=4000 HYPER_RAFT_CRASH_SEEDS=40`,
+  load 44–48): on ticks every schedule without faults prints R-6's counts exactly; by suspicion the
+  two L-2 changes move them (74,181, 77,062, 68,754 and 66,719 entries committed at the four
+  settings, against L-2's 75,539, 76,083, 67,930 and 66,354), and the fast track's 19,826 (19,252).
+  With faults at rest, one marked member at a time, on ticks: 58,963, 51,879, 42,891 and 48,102
+  entries committed through 2,774, 2,736, 2,907 and 2,818 faults, 148, 186, 97 and 132 groups left
+  waiting on a mark; by suspicion 60,246, 56,054, 45,361 and 51,424 through 2,782, 2,829, 2,892 and
+  2,875, 137, 181, 121 and 132 waiting. Two marked at once, on ticks: 413, 452, 334 and 428 groups
+  waiting through 4,370, 4,165, 4,282 and 4,216 faults, where R-5's rule, the same harness and seeds,
+  left 422, 523, 516 and 489 (1,627 against 1,950); by suspicion 384, 453, 356 and 412. The crash at
+  every persistence step of 40 schedules with faults: 1,880 crashes (1,279 faults) and 1,772
+  (1,070) on ticks, 1,953 (1,437) and 1,789 (1,023) by suspicion. `HYPER_RAFT_SEEDS=300
+  HYPER_RAFT_SEED=1000` over the differential, group and fast suites prints what `main` prints but
+  for the mixed group's line.
+- **Where the groups wait.** Of 11 waits in 200 schedules inspected, every one was a group whose
+  configuration (or a half of a joint one) held two voters or one, with the marked member among
+  them, or whose committed entries were held only by a member a change had removed: the rule's
+  bound (`docs/durable.md` §5.2), not a defect. R-7's gain is where the only current logs are marked
+  in a group of three or more, which two marks at once make common and one rarely.
+- **Measured** (`docs/benchmarks.md`, "A marked member's election (R-7)"): allocations identical
+  on all 32 cells; instructions within 0.3 % of `main`'s an op; at load 42–57 no interval of time or
+  cycles above 1 in a second pass of the cells the first pass leaned on, where `main` with 48 inert
+  bytes moved one by 3.4 %; `benches/pipeline.rs`'s simulated figures identical.
+

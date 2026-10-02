@@ -18,7 +18,10 @@ use std::io;
 use std::path::Path;
 use std::time::Duration;
 
-use hyper_timing::{Costs, Floors, LinkBehaviour, configure, election_span};
+use hyper_timing::{
+    Costs, Event, Floors, LinkBehaviour, LinkEstimator, Refusal, Schedule, Window, configure,
+    election_span, mistake_bound,
+};
 
 use crate::{HEARTBEAT_BYTES, WAIT_BYTES};
 
@@ -496,20 +499,6 @@ fn replay_phase(
     (mistakes, suspected, span as f64 * eta, points)
 }
 
-/// Theorem 7's `β` (Chen, Toueg and Aguilera 2002): `Π_{j≥0, x_j>0} (V + p_L x_j²)/(V + x_j²)`,
-/// `x_j = α − jη`; the bound on the probability that a freshness point finds every heartbeat still
-/// able to be fresh late or lost. The same product as `hyper_timing::configure`'s, checked here
-/// against the replay.
-fn theorem7_beta(loss: f64, variance: f64, eta: f64, alpha: f64) -> f64 {
-    let mut product = 1.0;
-    let mut x = alpha;
-    while x > 0.0 {
-        product *= (variance + loss * x * x) / (variance + x * x);
-        x -= eta;
-    }
-    product
-}
-
 /// The joint exceedance of `threshold` at lags `0..=max_lag` against independence,
 /// `#{D_i > x, D_{i+k} > x} / ((n − k) p²)`, by sequence number, and the first lag from which the
 /// count stays within a Poisson 95 % band of independence's (`|c − e| ≤ 1.96√e`) for as many lags
@@ -552,32 +541,127 @@ fn exceedance(beats: &[Beat], threshold: f64, max_lag: usize) -> (Vec<f64>, Opti
     (ratio, lag)
 }
 
-/// NFD-E's window at interval `stride · η`: `min(n_G, n_Allan)` over the heartbeats one in `stride`,
-/// with `n_G = τ_int · V / G²` the window whose estimate of the expected arrival is within the
-/// timer's resolution `G`, and `n_Allan` the window past which averaging no longer improves it.
-fn window_for(trace: &Table, stride: u64, g: f64) -> usize {
-    window_parts(trace, stride, g).0
-}
-
-/// [`window_for`] with its two terms: `(n, n_G, n_Allan)`.
-fn window_parts(trace: &Table, stride: u64, g: f64) -> (usize, usize, usize) {
-    let series: Vec<f64> = trace
+/// hyper-timing's estimator over the heartbeats `phase` modulo `stride`, at interval `stride · η`,
+/// with the receiver's granularity `g` (ns): every received heartbeat fed by its kernel stamp, on
+/// the sender's schedule, which the two processes share a clock for. The window, the loss and the
+/// estimates are the estimator's, so the analysis and the detector cannot compute them apart.
+fn estimator(
+    trace: &Table,
+    interval: u64,
+    stride: u64,
+    phase: u64,
+    g: f64,
+) -> Option<LinkEstimator> {
+    let eta = interval * stride;
+    let origin = trace.origin + (phase * interval) as f64;
+    let mut link = LinkEstimator::new(
+        Duration::from_nanos(eta),
+        Duration::from_nanos(g.max(1.0) as u64),
+        Some(Schedule {
+            seq: 0,
+            at_ns: origin.max(0.0) as u64,
+        }),
+    )
+    .ok()?;
+    for (i, d) in trace
         .delay
         .iter()
+        .skip(phase as usize)
         .step_by(stride as usize)
-        .copied()
-        .filter(|d| !d.is_nan())
-        .collect();
-    if series.len() < 32 {
-        return (1, 1, 1);
+        .enumerate()
+    {
+        if !d.is_nan() {
+            let arrival = origin + i as f64 * eta as f64 + d;
+            let _ = link.on_heartbeat(i as u64, arrival.max(0.0) as u64);
+        }
     }
-    let n = series.len() as f64;
-    let mean = series.iter().sum::<f64>() / n;
-    let var = series.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / (n - 1.0);
-    let tau = tau_int(&autocorrelation(&series, series.len() / 2));
-    let n_g = (tau * var / (g * g)).ceil().max(1.0) as usize;
-    let (n_allan, _) = allan_minimum(&allan(&series, mean_of));
-    (n_g.min(n_allan).max(1), n_g, n_allan)
+    Some(link)
+}
+
+/// NFD-E's window at interval `stride · η`, the estimator's: `min(n_G, n_A)` under its drift bound,
+/// over the heartbeats one in `stride`.
+fn window_parts(trace: &Table, interval: u64, stride: u64, g: f64) -> Window {
+    estimator(trace, interval, stride, 0, g).map_or(
+        Window {
+            length: 1,
+            granularity: None,
+            allan: None,
+            drift: 1,
+        },
+        |link| link.estimates().window,
+    )
+}
+
+fn window_for(trace: &Table, interval: u64, stride: u64, g: f64) -> usize {
+    window_parts(trace, interval, stride, g).length as usize
+}
+
+/// The estimator run as the detector over every phase of the trace at interval `stride · η`, as a
+/// sans-io driver runs it: deadlines polled before each arrival, the arrival fed, and the detector
+/// configured from its own estimates whenever they have renewed. The sender never failed, so every
+/// suspicion is a mistake. Returns (mistakes, freshness points, the mistakes Theorem 7 allows summed
+/// over the points at the configuration then in force, configurations).
+fn online(
+    trace: &Table,
+    interval: u64,
+    stride: u64,
+    g: f64,
+    costs: &Costs,
+    floors: &Floors,
+) -> (u64, u64, f64, u64) {
+    let eta = interval * stride;
+    let mut total = (0u64, 0u64, 0.0f64, 0u64);
+    for phase in 0..stride {
+        let origin = trace.origin + (phase * interval) as f64;
+        let Ok(mut link) = LinkEstimator::new(
+            Duration::from_nanos(eta),
+            Duration::from_nanos(g.max(1.0) as u64),
+            Some(Schedule {
+                seq: 0,
+                at_ns: origin.max(0.0) as u64,
+            }),
+        ) else {
+            continue;
+        };
+        let mut beta = None;
+        for (i, d) in trace
+            .delay
+            .iter()
+            .skip(phase as usize)
+            .step_by(stride as usize)
+            .enumerate()
+        {
+            if d.is_nan() {
+                continue;
+            }
+            let arrival = (origin + i as f64 * eta as f64 + d).max(0.0) as u64;
+            while let Some(deadline) = link.deadline().filter(|t| *t <= arrival) {
+                if link.poll(deadline) == Some(Event::Suspected) {
+                    total.0 += 1;
+                }
+            }
+            let _ = link.on_heartbeat(i as u64, arrival);
+            if let Some(beta) = beta {
+                total.1 += 1;
+                total.2 += beta;
+            }
+            if link.reconfigure_due() {
+                match link.configure(costs, floors) {
+                    Ok(configured) => {
+                        let current = configured.current;
+                        beta = Some(
+                            current.interval.as_secs_f64()
+                                / current.mistake_recurrence.as_secs_f64(),
+                        );
+                        total.3 += 1;
+                    }
+                    Err(Refusal::TooFewHeartbeats | Refusal::CorrelationUnmeasured) => {}
+                    Err(Refusal::Unconfigurable) => break,
+                }
+            }
+        }
+    }
+    total
 }
 
 /// Ferro and Segers' intervals estimator of the extremal index `θ` of the exceedances of
@@ -677,9 +761,13 @@ pub fn main(dirs: &[String]) -> io::Result<()> {
             last = Some(b.seq);
         }
         let lost = meta.count.saturating_sub(received);
-        // Jeffreys' interval for a binomial proportion (Brown, Cai and DasGupta, Statistical
-        // Science 16(2), 2001): posterior mean `(k + ½)/(n + 1)`.
-        let loss = (lost as f64 + 0.5) / (meta.count as f64 + 1.0);
+        // G, the mean lateness of the receiver's own waits, and the estimator over the whole
+        // trace at its interval: its loss is the Jeffreys posterior mean `(k + ½)/(m + 1)` over the
+        // sequence numbers from the first received to the latest.
+        let g = waits.iter().map(|w| w.1).sum::<f64>() / waits.len().max(1) as f64;
+        let trace = table(&beats, meta.count, meta.interval_ns);
+        let full = estimator(&trace, meta.interval_ns, 1, 0, g);
+        let loss = full.as_ref().map_or(0.5, |link| link.estimates().loss);
         let _ = writeln!(
             out,
             "sent {}, received {received}, lost {lost}, reordered {reordered}; p_L (Jeffreys mean) {loss:.3e}\n",
@@ -752,7 +840,6 @@ pub fn main(dirs: &[String]) -> io::Result<()> {
         let _ = writeln!(out, "| ρ of ranks | {} |", show(&rank_rho));
         let mut sorted_kd = kd.clone();
         sorted_kd.sort_by(f64::total_cmp);
-        let trace = table(&beats, meta.count, meta.interval_ns);
         let mut tail_lag = 1u64;
         for q in [0.99, 0.999] {
             let x = quantile(&sorted_kd, q);
@@ -806,7 +893,6 @@ pub fn main(dirs: &[String]) -> io::Result<()> {
         let (n_allan, dev_allan) = allan_minimum(&a_mean);
         let (n_allan_med, _) = allan_minimum(&a_median);
         let t_stat = n_allan as f64 * eta;
-        let g = s_wait.mean;
         let n_g = (s_kd.tau * s_kd.sd.powi(2) / (g * g)).ceil().max(1.0);
         let _ = writeln!(
             out,
@@ -853,7 +939,7 @@ pub fn main(dirs: &[String]) -> io::Result<()> {
             .collect();
         for &stride in &strides {
             let spacing = eta * stride as f64;
-            let window = window_for(&trace, stride, g);
+            let window = window_for(&trace, meta.interval_ns, stride, g);
             let mut refuted = false;
             let mut tests = 0;
             // The margins tested: the trace's own tail quantiles, and margins holding 2, 3, 5, 10
@@ -879,7 +965,7 @@ pub fn main(dirs: &[String]) -> io::Result<()> {
                 tests += 1;
                 let (mistakes, _, _, points) =
                     replay(&trace, meta.interval_ns, stride, window, alpha, false);
-                let bound = theorem7_beta(loss, s_kd.sd * s_kd.sd, spacing, alpha);
+                let bound = mistake_bound(loss, s_kd.sd * s_kd.sd, spacing, alpha);
                 let (lower, _) = poisson95(mistakes);
                 let no = lower / points.max(1) as f64 > bound;
                 refuted |= no;
@@ -942,7 +1028,7 @@ pub fn main(dirs: &[String]) -> io::Result<()> {
         // Theorem 7 against the replay: the bound on the probability that a freshness point is a
         // mistake, from each estimate pair, and the rate the replayed detector made.
         let robust_sd = MAD_NORMAL * s_kd.mad;
-        let window_at = |stride: u64| window_for(&trace, stride, g);
+        let window_at = |stride: u64| window_for(&trace, meta.interval_ns, stride, g);
         let _ = writeln!(
             out,
             "| estimate | η | α (at quantile) | window | Theorem 7 β | replayed mistakes / points | replayed rate (95 %) | bound holds |\n|---|---|---|---|---|---|---|---|"
@@ -960,7 +1046,7 @@ pub fn main(dirs: &[String]) -> io::Result<()> {
                     let window = window_at(stride);
                     let (mistakes, _, _, points) =
                         replay(&trace, meta.interval_ns, stride, window, alpha, robust);
-                    let bound = theorem7_beta(loss, sd * sd, eta * stride as f64, alpha);
+                    let bound = mistake_bound(loss, sd * sd, eta * stride as f64, alpha);
                     let rate = mistakes as f64 / points.max(1) as f64;
                     let (lower, upper) = poisson95(mistakes);
                     let (lower, upper) =
@@ -1020,18 +1106,24 @@ pub fn main(dirs: &[String]) -> io::Result<()> {
                     continue;
                 };
                 let stride = ((det.interval.as_nanos() as f64 / eta).round() as u64).max(1);
-                let (window, n_g_at, n_allan_at) = window_parts(&trace, stride, g);
+                let parts = window_parts(&trace, meta.interval_ns, stride, g);
+                let window = parts.length;
+                let (n_g_at, n_allan_at, drift) = (
+                    parts.granularity.map_or("—".into(), |n| n.to_string()),
+                    parts.allan.map_or("—".into(), |n| n.to_string()),
+                    parts.drift,
+                );
                 let (mistakes, suspected, replayed, points) = replay(
                     &trace,
                     meta.interval_ns,
                     stride,
-                    window,
+                    window as usize,
                     det.margin.as_nanos() as f64,
                     robust,
                 );
                 let _ = writeln!(
                     out,
-                    "| {name} | {} | {} | {} | {window} (n_G {n_g_at}, n_Allan {n_allan_at}) | {} | {} | {:.3e} | {mistakes} / {points} | {} | {} | {:.2e} |",
+                    "| {name} | {} | {} | {} | {window} (n_G {n_g_at}, n_Allan {n_allan_at}, drift {drift}) | {} | {} | {:.3e} | {mistakes} / {points} | {} | {} | {:.2e} |",
                     secs(Duration::from_secs(mtbf)),
                     secs(det.interval),
                     secs(det.margin),
@@ -1058,6 +1150,39 @@ pub fn main(dirs: &[String]) -> io::Result<()> {
                     suspected / replayed.max(1.0)
                 );
             }
+        }
+
+        // The estimator itself as the detector, online: its own window, estimates and
+        // configurations as the heartbeats come, at each interval the configurator chose above.
+        let _ = writeln!(
+            out,
+            "\n| online, MTBF | η | configurations | mistakes / points | Theorem 7 allows (Σβ) | bound holds |\n|---|---|---|---|---|---|"
+        );
+        let mean_link = LinkBehaviour {
+            loss,
+            mean_delay: Duration::from_secs_f64(s_kd.mean.max(0.0) / 1e9),
+            delay_deviation: Duration::from_secs_f64(s_kd.sd.max(0.0) / 1e9),
+        };
+        for mtbf in [3_600u64, 86_400, 30 * 86_400, 365 * 86_400] {
+            let Some(election) = t_e else { continue };
+            let costs = Costs {
+                election,
+                mtbf: Duration::from_secs(mtbf),
+            };
+            let Some(det) = configure(&mean_link, &costs, &floors) else {
+                continue;
+            };
+            let stride = ((det.interval.as_nanos() as f64 / eta).round() as u64).max(1);
+            let (mistakes, points, allowed, configurations) =
+                online(&trace, meta.interval_ns, stride, g, &costs, &floors);
+            let (lower, _) = poisson95(mistakes);
+            let _ = writeln!(
+                out,
+                "| {} | {} | {configurations} | {mistakes} / {points} | {allowed:.2} | {} |",
+                secs(Duration::from_secs(mtbf)),
+                secs(Duration::from_secs_f64(eta * stride as f64 / 1e9)),
+                if lower <= allowed { "yes" } else { "**no**" }
+            );
         }
         print!("{out}");
     }

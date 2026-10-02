@@ -1289,9 +1289,100 @@ after every sample.
 
 ```sh
 cargo test -p hyper-timing
+cargo bench -p hyper-timing --bench estimator           # the detector's estimator, per heartbeat
+cargo test -p hyper-timing --test replay -- --nocapture # the replay against Theorem 7
 cd crates/hyper-timing-compare && cargo build --release
 target/release/hyper-timing-compare table 7 2000000
 ```
+
+# The detector's estimator
+
+`hyper_timing::LinkEstimator` (`crates/hyper-timing/src/link.rs`, `docs/timing.md` §2.6), the
+receiving side of a node pair's heartbeats: NFD-E's expected arrival over the window
+`min(n_G, n_A)` under the drift bound, the history's prediction-error variance, the Jeffreys loss,
+freshness and suspicion. Nothing in focal, slates or mantle estimates NFD-E, so there is no
+implementation to replace and compare with; the nearest per-heartbeat work each project already
+does, a path estimator's sample, is timed in the same run for reference.
+
+## Per heartbeat, under the allocation law
+
+`cargo bench -p hyper-timing --bench estimator`, the Apple M5 Max, macOS 26.4.1, rustc 1.98.0,
+2026-10-01 at 20:50 PDT, shared with other sessions (load average 27.8 to 29.6). A link at a 50 ms
+interval, fed a millisecond of jitter and one heartbeat in a thousand stalled 40 ms, warmed past its
+window and configured; each heartbeat is the driver's work (poll the deadline if it passed, feed the
+heartbeat, check whether a configuration is due). Two million heartbeats a run, seven runs, the two
+rings rotated; configurations timed apart. Medians (least–most); allocations, reallocations and
+minor faults per heartbeat, configurations included.
+
+| ring | ns a heartbeat | allocations | reallocations | minor faults | ns a configuration |
+|---|---|---|---|---|---|
+| 1 ms granularity (window bound 1,332) | 77.2 (75.7–81.7) | 0 | 0 | 0 | 2,407 (2,347–2,549) |
+| granularity at the interval (window bound 66,665) | 129.2 (122.0–135.8) | 0 | 0 | 0 | 711 (677–753) |
+| `PathRtt::on_sample`, for reference | 65.5 (65.3–84.2) | | | | |
+| `ExchangeRtt::on_sample`, for reference | 6.1 (5.7–7.5) | | | | |
+
+A heartbeat is a step on each Allan level it finishes (one on average, seventeen at most), a ring
+write, and the window read from the levels; the larger bound costs more because more levels
+qualify for `n_A`. `crates/hyper-timing/tests/alloc.rs` asserts the zero: 100,000 heartbeats with
+their polls, estimate reads and every configuration due, and the three folds, with no allocation or
+reallocation.
+
+## The replay against Theorem 7
+
+`cargo test -p hyper-timing --test replay -- --nocapture`. No raw trace is kept, so each recorded
+shape is a model: a body, hiccups, and stalls that block the sender and delay every heartbeat
+inside them to their end, fitted to the run's table and checked on a run as long at the recorded
+interval. The estimator runs as the detector at the model's correlation time, configured from its
+own estimates whenever they renew, over four simulated hours; every suspicion is a mistake, and
+Theorem 7's allowance is `β` summed over the freshness points at the configuration then in force.
+
+| shape (checked at the recorded interval) | η | MTBF | mistakes / points | Theorem 7 allows | holds |
+|---|---|---|---|---|---|
+| macOS 100 µs: sd/(1.4826·MAD) 21.9 (run 24), mean/median 1.94 (1.85) | 50 ms | 1 h | 52 / 287,944 | 138.0 | yes |
+| | 50 ms | 30 d | 0 / 287,944 | 0.1 | yes |
+| macOS `F_FULLFSYNC` 10 ms: 10.8 (13), 1.20 (1.19) | 500 ms | 1 h | 23 / 28,744 | 75.3 | yes |
+| | 500 ms | 30 d | 0 / 28,744 | 0.1 | yes |
+
+The flush model's stalls block the sender for up to 250 ms, so its correlation time is 500 ms, not
+the recorded run's 200 ms (whose stalls were a flushing sender's backlog, draining while it kept
+sending). Run at 200 ms, below that, the detector broke the bound, 19 mistakes against 11.5 allowed
+at an hour's MTBF, every one a stall that held two heartbeats of a two-heartbeat margin late: the
+independence rule of §2.6 at work. A stopped sender was suspected within the detection bound the
+configurator gave.
+
+## A trace with the estimator in place
+
+`hyper-timing-trace run <dir> 100 120` and `analyse <dir>`: macOS at 100 µs for 120 s, 2026-10-01
+at 20:45 PDT, load 37.1 → 32.4. The analyser now takes NFD-E's window (`n_G`, `n_A` and the drift
+bound), the loss and Theorem 7's `β` from hyper-timing, and replays the estimator itself as the
+detector (the last table). The raw trace was deleted once summarized.
+
+| series | n | mean ± 95 % | sd (95 %) | median (95 %) | MAD (95 %) | p99 | p99.9 | p99.99 | max | τ_int |
+|---|---|---|---|---|---|---|---|---|---|---|
+| D (kernel stamp − σ) | 1200000 | 114.3 ± 34.9 | 811.6 (0.0–1290.3) | 63.5 (61.1–66.1) | 28.1 (26.8–29.5) | 310.6 | 11486.3 | 35489.9 | 44373.6 | 577.5 |
+| D (process read − σ) | 1200000 | 192.9 ± 69.7 | 1450.9 (0.0–2177.7) | 86.5 (82.9–90.3) | 36.0 (34.3–37.8) | 1105.1 | 25425.8 | 52175.3 | 61971.2 | 721.8 |
+
+The window at 50 ms is the estimator's: `n_A` 64 under `n_G` 73, which is the drift bound for the
+receiver's `G` of 56 µs measured at 100 µs waits. The correlation time is 50 ms, as on the
+five-minute macOS runs.
+
+| estimate | MTBF | η | α | window | detection bound | T_MR bound | U | replayed mistakes / points | replayed T_MR | bound holds | suspected share |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| mean/sd | 3600.000 s | 50000.0 µs | 52359.8 µs | 64 (n_G 73, n_Allan 64, drift 73) | 102474.1 µs | 1964.480 s | 2.901e-5 | 0 / 1199500 | > 60000.000 s | yes | 0.00e0 |
+| mean/sd | 1.0 d | 50000.0 µs | 57026.3 µs | 64 (n_G 73, n_Allan 64, drift 73) | 107140.6 µs | 18713.330 s | 1.285e-6 | 0 / 1199500 | > 60000.000 s | yes | 0.00e0 |
+| mean/sd | 30.0 d | 50000.0 µs | 70081.0 µs | 64 (n_G 73, n_Allan 64, drift 73) | 120195.3 µs | 2.6 d | 4.965e-8 | 0 / 1199500 | > 60000.000 s | yes | 0.00e0 |
+| mean/sd | 365.0 d | 50000.0 µs | 101895.4 µs | 64 (n_G 73, n_Allan 64, drift 73) | 152009.7 µs | 238.8 d | 4.875e-9 | 0 / 1199500 | > 60000.000 s | yes | 0.00e0 |
+| median/1.4826·MAD | 3600.000 s | 9007.5 µs | 8951.6 µs | 256 (n_G 413, n_Allan 256, drift 413) | 18022.6 µs | 407.307 s | 6.884e-6 | 690 / 1199910 | 15.652 s | **no** | 8.79e-4 |
+| median/1.4826·MAD | 1.0 d | 20028.6 µs | 19972.6 µs | 128 (n_G 185, n_Allan 128, drift 185) | 40064.7 µs | 4194.132 s | 6.355e-7 | 599 / 1199800 | 40.067 s | **no** | 2.37e-4 |
+| median/1.4826·MAD | 30.0 d | 50000.0 µs | 50515.2 µs | 64 (n_G 73, n_Allan 64, drift 73) | 100578.7 µs | 81.0 d | 3.917e-8 | 0 / 1199500 | > 60000.000 s | yes | 0.00e0 |
+| median/1.4826·MAD | 365.0 d | 50000.0 µs | 51178.1 µs | 64 (n_G 73, n_Allan 64, drift 73) | 101241.6 µs | 427.9 d | 3.251e-9 | 0 / 1199500 | > 60000.000 s | yes | 0.00e0 |
+
+| online, MTBF | η | configurations | mistakes / points | Theorem 7 allows (Σβ) | bound holds |
+|---|---|---|---|---|---|
+| 3600.000 s | 50000.0 µs | 79674 | 0 / 1154359 | 73.45 | yes |
+| 1.0 d | 50000.0 µs | 79674 | 0 / 1154359 | 11.94 | yes |
+| 30.0 d | 50000.0 µs | 79674 | 0 / 1154359 | 0.15 | yes |
+| 365.0 d | 50000.0 µs | 79674 | 0 / 1154359 | 0.02 | yes |
 
 # Heartbeat traces: hyper-timing's measured inputs
 

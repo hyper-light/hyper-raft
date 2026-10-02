@@ -5,5 +5,13 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[dev-dependencies]
+hyper-measure = { path = "../hyper-measure" }
+proptest.workspace = true
+
+[[bench]]
+name = "estimator"
+harness = false
+
 [lints]
 workspace = true

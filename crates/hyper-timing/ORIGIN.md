@@ -61,6 +61,14 @@
      path's rank among the others, which allocates nothing; a test compares it with the sort over
      2,000 groups.
 
+8. **The detector, new in hyper-raft** (`docs/timing.md` §2.2–§2.6, step L-1).
+   - `src/qos.rs`: Theorem 7's bound, the configurator minimizing unavailability within the
+     measured floors, the margin at a given interval, and the split-vote span.
+   - `src/link.rs`: `LinkEstimator`, NFD-E's expected arrival over the window `min(n_G, n_A)`
+     computed online under a drift bound derived from RFC 5905's `PHI`, the prediction errors'
+     variance over the history, the Jeffreys loss, the unseen-delay term, freshness and suspicion.
+   - `src/folds.rs`: the timer-lateness, flush and exposure folds.
+
 ## Planned
 
 - **The estimator that feeds election timing** is decided by the timed simulation in note 32 §3.7,

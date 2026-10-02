@@ -143,8 +143,15 @@ fn golden(mut low: f64, mut high: f64, resolution: f64, f: &impl Fn(f64) -> f64)
 }
 
 /// Theorem 7's `β`: the bound on the probability that every heartbeat still fresh at a freshness
-/// point is late or lost, for margin `alpha` and interval `eta` (seconds), variance `variance`
-/// (seconds squared) and loss `loss`.
+/// point is late or lost, `Π_{j≥0, x_j>0} (V + p_L x_j²)/(V + x_j²)` with `x_j = α − jη`, for margin
+/// `alpha`, interval `eta`, variance `variance` and loss `loss`. The product is a ratio of squares, so
+/// any one unit serves for the times (seconds, nanoseconds) with its square for the variance. The
+/// configurator and the trace analyser (`crates/hyper-timing-trace`) both use this one, so the bound
+/// they report and the one the configurator minimizes cannot differ.
+pub fn mistake_bound(loss: f64, variance: f64, eta: f64, alpha: f64) -> f64 {
+    beta(loss, variance, eta, alpha)
+}
+
 fn beta(loss: f64, variance: f64, eta: f64, alpha: f64) -> f64 {
     let mut product = 1.0;
     let mut x = alpha;
@@ -193,12 +200,7 @@ pub struct Floors {
 /// can be configured: a link that loses every heartbeat, or a granularity, MTBF or election time that
 /// is not a positive finite time.
 pub fn configure(link: &LinkBehaviour, costs: &Costs, floors: &Floors) -> Option<Detector> {
-    let resolution = floors.granularity.as_secs_f64();
-    let mtbf = costs.mtbf.as_secs_f64();
-    let election = costs.election.as_secs_f64();
-    if !(0.0..1.0).contains(&link.loss) || resolution <= 0.0 || mtbf <= 0.0 || election <= 0.0 {
-        return None;
-    }
+    let resolution = resolution(link, costs, floors)?;
     let base = resolution.max(floors.sender.as_secs_f64());
     let independent = base.max(floors.correlation.as_secs_f64());
     // One heartbeat in the margin: `α` below `η`.
@@ -206,6 +208,45 @@ pub fn configure(link: &LinkBehaviour, costs: &Costs, floors: &Floors) -> Option
     // Any margin, its heartbeats independent.
     let any = search(link, costs, resolution, independent, false);
     let (eta, alpha, value) = if single.2 <= any.2 { single } else { any };
+    detector(link, eta, alpha, value)
+}
+
+/// The detector that minimizes a group's expected unavailability on `link` at a given `interval`:
+/// the margin alone is searched. It is the detector for the heartbeats a link is sending now, while
+/// [`configure`]'s interval, where it differs, is the one to move the link to. Below the correlation
+/// time the margin holds one heartbeat (`α < η`), as in [`configure`]. `None` where [`configure`]
+/// would give none, or for a zero interval.
+pub fn detector_at(
+    link: &LinkBehaviour,
+    costs: &Costs,
+    floors: &Floors,
+    interval: Duration,
+) -> Option<Detector> {
+    let resolution = resolution(link, costs, floors)?;
+    let eta = interval.as_secs_f64();
+    if eta <= 0.0 {
+        return None;
+    }
+    let single = eta < floors.correlation.as_secs_f64();
+    let (alpha, value) = best_margin(link, costs, resolution, eta, single);
+    detector(link, eta, alpha, value)
+}
+
+/// The search's resolution, the granularity in seconds, or `None` when nothing can be configured: a
+/// link that loses every heartbeat, or a granularity, MTBF or election time that is not a positive
+/// finite time.
+fn resolution(link: &LinkBehaviour, costs: &Costs, floors: &Floors) -> Option<f64> {
+    let resolution = floors.granularity.as_secs_f64();
+    let mtbf = costs.mtbf.as_secs_f64();
+    let election = costs.election.as_secs_f64();
+    if !(0.0..1.0).contains(&link.loss) || resolution <= 0.0 || mtbf <= 0.0 || election <= 0.0 {
+        return None;
+    }
+    Some(resolution)
+}
+
+/// The detector `(eta, alpha)` on `link`, seconds, with its unavailability `value`.
+fn detector(link: &LinkBehaviour, eta: f64, alpha: f64, value: f64) -> Option<Detector> {
     let variance = link.delay_deviation.as_secs_f64().powi(2);
     let beta = beta(link.loss, variance, eta, alpha);
     Some(Detector {
@@ -221,6 +262,26 @@ pub fn configure(link: &LinkBehaviour, costs: &Costs, floors: &Floors) -> Option
     })
 }
 
+/// The best margin for interval `eta` and its `U`, to within `resolution`. `U ≥ α / MTBF`, so a
+/// margin past `MTBF · U(η, η)` costs more than any it could save. With `single`, the margin stays
+/// below the interval.
+fn best_margin(
+    link: &LinkBehaviour,
+    costs: &Costs,
+    resolution: f64,
+    eta: f64,
+    single: bool,
+) -> (f64, f64) {
+    let high = if single {
+        (eta - resolution).max(0.0)
+    } else {
+        (costs.mtbf.as_secs_f64() * unavailability(link, costs, eta, eta)).max(eta)
+    };
+    minimize(0.0, high, resolution, |alpha| {
+        unavailability(link, costs, eta, alpha)
+    })
+}
+
 /// The interval at or above `floor` and its margin that minimize `U`, to within `resolution`: the
 /// interval, the margin and `U`. With `single`, the margin stays below the interval.
 fn search(
@@ -231,25 +292,14 @@ fn search(
     single: bool,
 ) -> (f64, f64, f64) {
     let mtbf = costs.mtbf.as_secs_f64();
-    // The best margin for an interval: `U ≥ α / MTBF`, so a margin past `MTBF · U(η, η)` costs more
-    // than any it could save.
-    let best_margin = |eta: f64| {
-        let high = (mtbf * unavailability(link, costs, eta, eta)).max(eta);
-        let high = if single {
-            (eta - resolution).max(0.0)
-        } else {
-            high
-        };
-        minimize(0.0, high, resolution, |alpha| {
-            unavailability(link, costs, eta, alpha)
-        })
-    };
-    // Likewise for the interval: `U ≥ η / MTBF`.
-    let (_, at_floor) = best_margin(floor);
+    // `U ≥ η / MTBF`, so an interval past `MTBF · U` at the floor costs more than any it could save.
+    let (_, at_floor) = best_margin(link, costs, resolution, floor, single);
     let high = (mtbf * at_floor).max(floor);
-    let (eta, _) = minimize(floor, high, resolution, |eta| best_margin(eta).1);
+    let (eta, _) = minimize(floor, high, resolution, |eta| {
+        best_margin(link, costs, resolution, eta, single).1
+    });
     let eta = eta.max(floor);
-    let (alpha, value) = best_margin(eta);
+    let (alpha, value) = best_margin(link, costs, resolution, eta, single);
     (eta, alpha, value)
 }
 

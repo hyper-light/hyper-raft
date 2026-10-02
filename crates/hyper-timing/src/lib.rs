@@ -31,7 +31,10 @@
         clippy::unreachable,
         clippy::indexing_slicing,
         clippy::arithmetic_side_effects,
-        clippy::disallowed_macros
+        clippy::disallowed_macros,
+        clippy::cast_possible_wrap,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss
     )
 )]
 
@@ -40,7 +43,17 @@ pub use progress::{ProgressDeadline, Spent};
 mod round;
 pub use round::{DeadlineExtender, ProgressWitness, RoundAnchors, RoundBudget, RoundWait, Verdict};
 mod qos;
-pub use qos::{Costs, Detector, Floors, LinkBehaviour, Span, configure, election_span};
+pub use qos::{
+    Costs, Detector, Floors, LinkBehaviour, Span, configure, detector_at, election_span,
+    mistake_bound,
+};
+mod folds;
+pub use folds::{Exposure, Flushes, FoldFull, Lateness};
+mod link;
+pub use link::{
+    Configuration, EstimateError, Estimates, Event, LinkEstimator, Refusal, Schedule, Trust,
+    WINDOW_LIMIT, Window,
+};
 mod election;
 pub use election::{
     ElectionPriority, ElectionTimer, ElectionTiming, FollowerStep, PathEstimate,

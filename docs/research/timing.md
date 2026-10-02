@@ -167,6 +167,23 @@ events in exposure `T`, mean `(k + ½)/T`.
 2003, pp. 19–49.** The score interval for a Poisson mean from a count `k`,
 `k + z²/2 ± z√(k + z²/4)`, has close to nominal coverage down to small counts.
 
+**Rényi, "Théorie des éléments saillants d'une suite d'observations", Ann. Fac. Sci. Univ.
+Clermont-Ferrand 8, 1962, pp. 7–13; Arnold, Balakrishnan and Nagaraja, *Records*, Wiley, 1998,
+ch. 2.** For independent, identically distributed continuous observations the record indicators
+are independent and the `n`-th observation is a record (larger than all before it) with
+probability exactly `1/n`, whatever the distribution; the argument needs only exchangeability (each
+of the `n` is equally likely to be the largest). The estimator uses it for the chance that the next
+heartbeat is later than every one in a history of `m` independent ones, `1/(m + 1)`.
+
+**Welford, "Note on a method for calculating corrected sums of squares and products",
+Technometrics 4(3), 1962, pp. 419–420.** The running mean and sum of squared deviations updated
+one observation at a time, without the cancellation of the sum-of-squares formula.
+
+**RFC 5905 (Mills, Martin, Burbank, Kasch), Network Time Protocol Version 4, §7.2, Figure 6
+(read 2026-10-01).** `TOLERANCE`, "frequency tolerance PHI (s/s)", 15e-6: the frequency error NTP
+assumes of a clock. Two clocks within it of true time drift apart by up to 30 ppm; the estimator's
+window bound takes it as the drift a link's expected arrival must follow.
+
 ## The machines' timers, from their sources
 
 **XNU `osfmk/kern/timer_call.c`, `timer_call_slop` and `timer_compute_leeway`
@@ -202,4 +219,6 @@ slack would allow.
 5. The first estimates, before a link has history.
 
 `docs/timing.md` answers 1–3, answers 5 for the loss, the mean delay and the MTBF from the traces
-and the sources above (§3), and states 4 and the first variance as measurements still to make.
+and the sources above (§3), answers the part of the first variance a history has not yet seen by
+Rényi's record probability (§2.6), and states 4 and the rest of the first variance as measurements
+still to make.

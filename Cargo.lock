@@ -716,6 +716,10 @@ dependencies = [
 [[package]]
 name = "hyper-timing"
 version = "0.1.0"
+dependencies = [
+ "hyper-measure",
+ "proptest",
+]
 
 [[package]]
 name = "hyper-tls"

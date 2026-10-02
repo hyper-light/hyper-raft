@@ -196,6 +196,36 @@ the expected arrival's error against how fast it follows the link. Two measureme
   straddles a stall averages it in; at the configured spacing the stalls are single heartbeats and
   the curve falls.
 
+The estimator (`crates/hyper-timing/src/link.rs`, `LinkEstimator`) computes both online, in bounded
+memory and bounded work a heartbeat, and the trace analyser now takes its window from it:
+- `n_A` from Allan levels at windows `1, 2, 4, …`, each holding its unfinished window's sum and the
+  running sum of squared differences of consecutive window means: one step a level a heartbeat. A
+  level enters the comparison at seven windows, where its relative uncertainty `1/√(2(K−1))` is
+  finer than the fall `1 − 1/√2` a doubling makes for white noise; the analyser had used 16.
+- `τ_int` from the same levels: the variance of an `m`-mean is `V·τ_int/m` once `m` is long against
+  the correlation (Sokal 1997, §3), and the Allan variance of non-overlapping means is that variance
+  less the neighbouring means' covariance, which vanishes there; so `τ̂(m) = m·σ²_A(m)/V` at the
+  shortest `m ≥ 6·τ̂(m)`, Madras and Sokal's self-consistent window. The analyser had summed the
+  autocorrelation by FFT. The Allan form is one a drift does not inflate.
+- `V` is the variance of the prediction errors `A_i − EA_i` over the link's history: what the
+  freshness test compares with `α`, `V(D)(1 + 1/n)` for independent delays, and free of the two
+  clocks' offset and drift, which `EA` follows and a plain variance of `A_i − iη` would count as
+  delay (15 ppm is 54 ms an hour).
+- **The window's bound.** `EA` is a mean centred `(n − 1)/2` heartbeats back predicting `(n + 1)/2`
+  ahead of it; two clocks within RFC 5905's frequency tolerance `PHI = 15 ppm` (§7.2) drift apart by
+  up to `2·PHI·η` a heartbeat, so `EA` lags a drifting pair by up to `PHI·η·(n + 1)`. A lag past `G`
+  is a link that moved by more than the timer can observe, which `n_A` exists to stop, so
+  `n + 1 ≤ G / (PHI·η)`. With `η ≥ G` (the configurator's floor) no window passes `1/PHI − 1 =
+  66,665`. Each link's ring holds `G/(PHI·η) − 1` eight-byte prefix sums, sized when it is built:
+  3,333 slots (27 KiB) for Linux's 1 ms tick at 20 ms, 33,333 (267 KiB) for macOS's half-the-wait
+  `G` at 50 ms, 533 KiB at most. A pair drifting faster than `PHI` shows it in the Allan deviation,
+  and `n_A` binds first. The bound is not loose on the traces: with the receiver's `G` of 45 µs
+  measured at 100 µs waits, a 50 ms interval allows 59, under the 128 recorded above for a shared
+  clock.
+On a 120 s macOS trace at 100 µs recorded with the estimator in place (2026-10-01, load 32–37,
+`docs/benchmarks.md`, "The detector's estimator"), the window at 50 ms is 64: `n_A` 64 under
+`n_G` 73, which is the drift bound.
+
 **Item 3, in part: first estimates.**
 - `E(D)`: NFD-E's estimator over the heartbeats received so far, its window filling to `n`.
 - `p_L`: the Jeffreys posterior mean `(k + ½)/(m + 1)` after `k` losses in `m` heartbeats
@@ -206,11 +236,21 @@ the expected arrival's error against how fast it follows the link. Two measureme
   exposure `T` with `k` failures, so `MTBF = 2T` before the first failure: a fleet that has run
   little is treated as failing as often as its exposure cannot exclude, and detection is fast
   until history says otherwise.
-- `V(D)`, still open: the first heartbeats underestimate it badly. Over consecutive blocks of `m`
+- `V(D)`, in part: the first heartbeats underestimate it badly. Over consecutive blocks of `m`
   heartbeats, the median block's deviation is 1–18 % of the run's on every run with a tail, for `m`
   from 2 to 2,048 (78–83 % on idle Linux from `m = 8`): the variance lives in stalls a short window
   has not yet seen. A link's `V(D)` is therefore the variance over its whole history, not over the
-  window; what a link with no history uses until it has seen its node's stalls is §3, item 3.
+  window. What a short history has not seen is counted, not guessed: for exchangeable delays the
+  chance that the next is later than all `m` before it is exactly `1/(m + 1)` whatever their
+  distribution (the first record indicator; Rényi 1962), with `m = count / τ_int` independent
+  heartbeats. A heartbeat that late is to Theorem 7 as good as lost:
+  `Pr(lost or later than x) ≤ p + (1 − p)·V/(V + x²)`, `p = 1 − (1 − p_L)(1 − 1/(m + 1))`, which is
+  Theorem 7's factor with `p` for `p_L`. The estimator feeds the configurator `p` as the loss, so a
+  young link's margin cannot promise better than its history excludes, and the configurator spreads
+  the margin over more heartbeats until the history has shown more. It refuses to configure until
+  it has the evidence `m` needs: two prediction errors (a variance) and a measured `τ_int` (an Allan
+  level holding Madras and Sokal's window), a few dozen heartbeats at the correlation-time floor.
+  What stays open is §3, item 3.
 
 **The configurator on the measured inputs.** With `p_L`, `E(D)` and `V(D)` from each trace, the
 floors above, `T_E` from `election_span` (three voters, two up, one-way latency the measured mean
@@ -235,8 +275,8 @@ the stalls' correlation time, not the timer's `G`.
 
 ## 3. Open, to be measured before it is fixed
 
-Items 2, 6 and 7 and part of 3 are settled by the traces (§2.6); the remaining items keep their
-numbers.
+Items 2, 6 and 7 and part of 3 are settled by the traces (§2.6) and implemented in L-1's estimator;
+the remaining items keep their numbers.
 
 - **1. Heartbeat cost.** `η` minimizing `U` ignores what heartbeats cost, and the configurator
   shows what that means: on a LAN-like link (0.2 ms mean delay, 0.1 ms deviation, 1 % loss,
@@ -245,11 +285,19 @@ numbers.
   time. At one heartbeat per peer per floor, a node with many peers spends its network on
   liveness. Placement bounds the peers per node, and the cost per heartbeat must be measured
   against the data path and enter `U` before the fleet step.
-- **3. The first variance.** A link with no history underestimates `V(D)` by an order of
+- **3. The first variance, in part.** A link with no history underestimates `V(D)` by an order of
   magnitude until it has seen a stall (§2.6), and Theorem 7's bound with too small a variance is
-  not a bound. The candidate, to be measured: seed a new link's variance from its node's other
-  links, since the stalls measured here are the hosts', not the links'. The fleet's first link
-  has nothing to seed from.
+  not a bound. Closed by L-1: a delay past everything the history has seen, which no variance
+  estimate can know of, is counted with the loss at its distribution-free probability
+  `1/(m + 1)` (§2.6), and the estimator refuses to configure before `τ_int` is measured. Open: the
+  sampling error of the variance within the range seen, which a heavy tail skews low. On synthetic
+  traces of the recorded macOS shapes (`crates/hyper-timing/tests/replay.rs`), 40 seeds of 2, 10
+  and 60 minutes each kept Theorem 7's bound with the unseen term and also without it, the term
+  halving the first two minutes' mistakes (macOS 100 µs shape: 11 with it, 46 allowed, against 22
+  without, 51 allowed; flush shape: 2 with it, 15 allowed, against 8 without, 37 allowed): the models do not show the residual error
+  mattering, and they are models. The candidate stands, to be measured on real links: seed a new
+  link's history from its node's other links, since the stalls measured here are the hosts', not
+  the links'. The fleet's first link has nothing to seed from.
 - **4. A group stalled on a live node.** Node-pair detection does not see one group wedged while
   its node is healthy; groups with work still exchange appends, and a follower whose forwarded
   proposals make no progress needs a rule that is not a timer constant.
@@ -269,8 +317,18 @@ numbers.
   and the split-vote span, each checked against a brute-force search and the split probability
   against a Monte Carlo; the configurator takes the measured floors (`Floors`: `G`, `E[flush] + G`,
   `T_c`) and searches both regimes, one heartbeat in the margin at the base floors and any margin at
-  `η ≥ T_c`, keeping the better; the estimator the traces specified (§2.6) is still to implement,
-  and the first variance stays open): the NFD-E estimator as a
+  `η ≥ T_c`, keeping the better, and `detector_at` gives the best margin at the interval a link
+  sends at now. `link.rs` holds the estimator the traces specified (§2.6): `LinkEstimator`, NFD-E's
+  expected arrival over the window `min(n_G, n_A)` under the drift bound, the mean and the variance
+  of the prediction errors, `p_L` by Jeffreys, the unseen-delay term, freshness and suspicion events,
+  feeding the configurator when its estimates have renewed, refusing it without evidence;
+  `folds.rs` the timer-lateness fold for `G`, the flush fold for the sender's floor and the
+  exposure fold for the MTBF. Each is bounded; a heartbeat costs 77–129 ns and no allocation
+  (`docs/benchmarks.md`); a replay of synthetic traces of the recorded shapes keeps Theorem 7's
+  bound, and the trace analyser takes its window, loss and bound from the crate. Still to do in
+  L-1: `W` and the detector replacing `ELECTION_MARGIN`'s base and span and `PATH_WINDOW` in the
+  election law, the granularity fold replacing `GRANULARITY_NS`, and the comparison with the
+  current derivation): the NFD-E estimator as a
   `PathEstimate` over mean and variance with the window `min(n_G, n_A)`, the floors `G` and
   `E[flush] + G` and the independence rule `η ≥ T_c` when `α ≥ η`, the Theorem 7 bounds, the
   configurator minimizing `U`, the split-vote model and `W` replacing `ELECTION_MARGIN`'s base and

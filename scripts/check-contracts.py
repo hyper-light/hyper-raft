@@ -23,7 +23,9 @@ UNSAFE_ALLOWED = {
     "crates/hyper-measure/src/alloc.rs":
         "std::alloc::GlobalAlloc over System (the counting allocator; measurement only)",
     "crates/hyper-measure/src/faults.rs":
-        "getrusage(2), Mach task_info(3) and Win32 GetProcessMemoryInfo (page-fault counts)",
+        "getrusage(2) through libc; Mach task_info(3) through libc, with task_events_info declared "
+        "here and read only when the kernel's count of written words matches it; Win32 "
+        "K32GetProcessMemoryInfo through windows-sys (page-fault counts)",
     "crates/hyper-measure/src/wake.rs":
         "std::task::RawWaker over a leaked slot (counting wakers; tests and benchmarks only)",
     "crates/hyper-block/src/node/macos.rs":

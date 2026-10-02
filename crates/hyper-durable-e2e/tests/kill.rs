@@ -356,6 +356,12 @@ impl Cluster {
         }
     }
 
+    /// Tells every member up where the others listen, sent again each answer's time until it
+    /// answers, for as long as its process runs. A member just started has no group yet whose
+    /// progress could bound the wait: it serves once its process is scheduled, which a loaded
+    /// runner may delay past any quiet period the group's own timing gives (CI run 37027945581,
+    /// ubuntu-24.04-arm: a period of 3 ms, a quiet period of 15 ms). A member whose process ended
+    /// instead fails the wait.
     fn tell_peers(&mut self) {
         let peers: Vec<(u64, SocketAddr)> =
             self.members.iter().map(|m| (m.id, m.address)).collect();
@@ -363,11 +369,18 @@ impl Cluster {
             self.next_id += 1;
             let ask = self.next_id;
             wire::put_control(&mut self.buffer, ask, &Control::Peers(peers.clone()));
-            assert!(
-                self.exchange_resent(id, ask).is_some(),
-                "{}: member {id} was not told its peers",
-                self.name
-            );
+            loop {
+                let answer = self.answer();
+                if self.exchange(id, ask, answer).is_some() {
+                    break;
+                }
+                let name = self.name.clone();
+                let child = self.member(id).child.as_mut().unwrap();
+                assert!(
+                    child.try_wait().unwrap().is_none(),
+                    "{name}: member {id} ended before it was told its peers"
+                );
+            }
         }
     }
 

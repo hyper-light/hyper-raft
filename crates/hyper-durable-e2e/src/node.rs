@@ -10,8 +10,9 @@
 //! What its detectors believe of its peers the test tells it (`control::Order::Suspect`, `Trust`,
 //! `Restarted`): the test kills the members, so it knows, and stands for L-3's node-pair stream
 //! until L-4. Its group's timing is hyper-timing's law over what the member measures: each period
-//! it probes each peer and times the answer (`ExchangeRtt`), its timed waits give the granularity
-//! (`Lateness`), and its replica's vote writes the mean flush (`Flushes`); the ballot and its span
+//! it probes each peer and times the answer (`ExchangeRtt`), its wakes give the granularity
+//! (`Wakes`: every wake at or past the one it asked, whatever woke it), and its replica's vote
+//! writes the mean flush (`Flushes`); the ballot and its span
 //! are derived again whenever a measurement moves, and a group with no measured quorum of paths
 //! draws no delay and so does not campaign (`docs/timing.md` §3, item 10).
 //!
@@ -35,7 +36,7 @@ use hyper_raft::proto::{ConfChangeSingle, ConfChangeTransition, ConfChangeV2, Co
 use hyper_raft::wire::Record;
 use hyper_raft::{Config, StateRole, Timing};
 use hyper_raft_e2e::wire::{self, Command, Control, Kind, Op, Outcome, Status};
-use hyper_timing::{Ballot, ExchangeRtt, Lateness};
+use hyper_timing::{Ballot, ExchangeRtt, Wakes};
 
 use crate::control::{self, Order, Point, Report};
 use crate::file::{self, FaultFile};
@@ -153,8 +154,12 @@ pub struct Node {
     epoch: Instant,
     /// The round trips measured to each peer, in the order of `peers`.
     paths: Vec<(u64, ExchangeRtt)>,
-    /// How late the member's timed waits end: the granularity `G`.
-    lateness: Lateness,
+    /// How late the member wakes past what it asked: the granularity `G`. A wake counts whenever
+    /// it comes at or past the time asked, whatever woke it: a member whose waits a datagram ended
+    /// each time, as the test's own asks do while it waits on the group, measured no `G` when only
+    /// a wait that timed out counted, so it derived no timing and never campaigned (CI run
+    /// 37026031322, Linux and Windows).
+    wakes: Wakes,
     /// The timing last given to the replica.
     timing: Option<Timing>,
 }
@@ -230,7 +235,7 @@ impl Node {
             command: Vec::new(),
             epoch: Instant::now(),
             paths: Vec::new(),
-            lateness: Lateness::new(),
+            wakes: Wakes::new(),
             timing: None,
             settings,
         })
@@ -270,7 +275,7 @@ impl Node {
     /// voters, the span it chooses, given to the replica when it moved. None before a quorum's
     /// paths and a wait are measured.
     fn measure(&mut self) -> Result<(), NodeError> {
-        let Some(granularity) = self.lateness.granularity().filter(|g| !g.is_zero()) else {
+        let Some(granularity) = self.wakes.granularity() else {
             return Ok(());
         };
         let voters = &self.replica.configuration().voters;
@@ -324,12 +329,9 @@ impl Node {
                 .deadline()
                 .and_then(|at| self.epoch.checked_add(Duration::from_nanos(at)))
                 .map_or(next_period, |deadline| deadline.min(next_period));
-            if !self.receive_until(until)? {
-                let woke = Instant::now();
-                let (asked, ended) = (self.nanos(until), self.nanos(woke));
-                // A fold that is full keeps its mean: the wait is one of more than it counts.
-                let _ = self.lateness.on_wait(asked, ended);
-            }
+            self.wakes.ask(Some(self.nanos(until)));
+            self.receive_until(until)?;
+            self.wakes.woke(self.nanos(Instant::now()));
             if std::mem::take(&mut self.woken) && self.stops_at(Point::Durable) {
                 return Ok(Some(Point::Durable));
             }
@@ -357,17 +359,17 @@ impl Node {
     }
 
     /// Waits for a datagram until `until`, then takes what else has arrived, at most a turn's
-    /// worth (hyper-raft-e2e's `receive_until`). False when the wait timed out with nothing.
+    /// worth (hyper-raft-e2e's `receive_until`).
     #[allow(
         clippy::disallowed_methods,
         reason = "real processes on the host's clock, threads and environment (CLAUDE.md §1a, end to end)"
     )]
-    fn receive_until(&mut self, until: Instant) -> Result<bool, NodeError> {
+    fn receive_until(&mut self, until: Instant) -> Result<(), NodeError> {
         let wait = until.saturating_duration_since(Instant::now());
         if !wait.is_zero() {
             self.socket.set_read_timeout(Some(wait))?;
             if !self.receive_one()? {
-                return Ok(false);
+                return Ok(());
             }
         }
         self.socket.set_nonblocking(true)?;
@@ -388,7 +390,7 @@ impl Node {
             }
         }
         self.socket.set_nonblocking(false)?;
-        outcome.map(|()| true)
+        outcome
     }
 
     fn receive_one(&mut self) -> Result<bool, NodeError> {

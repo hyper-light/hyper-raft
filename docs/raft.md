@@ -93,6 +93,11 @@ includes the consumers' suites. They run when each consumer takes a snapshot und
 
 The R-numbers are note 32 §2.13's ledger.
 
+The durable shell needs four more core steps, R-4 to R-7: readies given ahead of their persistence,
+an entry-level repair of a member that lost what it acknowledged, an apply pause with a leader's
+own-term entries applied before its own write is durable, and CTRL's leader-side recovery. Their
+design and gates are in `docs/durable.md` §2.1, §4, §5 and §11.
+
 **The fast track** stays focal's algorithm, with the safety fix below, until note 32 §3.8's tests
 decide, and no owner enables it until then. The tests:
 - slates' exhaustive search applied to it;
@@ -289,7 +294,7 @@ derivations:
 
 | Crate | What | Steps and gate |
 |---|---|---|
-| `hyper-durable` | The shell: mantle's Ready pipeline with focal's accounting (note 32 §3.8). `Replica<L: LogStore, M: StateMachine>` with `begin` and `finish`; leader appends sent before the leader's own write; held inputs bounded by bytes and ticks; protocol-aware repair; the commit fence decided by `StateMachine::durable_applied`. | **D-1**: extract the shell from mantle's replica, leaving `RangeMachine: StateMachine` in mantle. Gate: mantle's `crates/range/tests/group.rs` and `sim.rs`. Recorded simulation seeds replay to identical Ready sequences and identical histories. **D-2**: focal's shell onto it (`guarded_in`, reservations before transitions, decoder fences, checkpoint images, nonblocking receipts). Gate: focal-consensus's tests and focal's real-process suites. Recorded seeds replay with identical committed output. The one intended timing change, leader appends sent early, is checked by the safety explorer. |
+| `hyper-durable` | The shell, designed from all three projects' shells and the literature, not extracted from one: `docs/durable.md`, sources in `docs/research/durable.md`. Readies ahead of their persistence, the commit fence over the durable commit, protocol-aware repair, derived bounds. | The core steps it needs first (R-4 to R-7, `docs/durable.md` §11); then mantle (D-1), focal (D-2) and slates (X-1) onto it, each gated by its own suites' outcomes and measured against its own shell (`docs/durable.md` §12–§13). |
 | `hyper-block` | mantle-disk's block layer, on which the log is written: `BlockFile`, the device file with its direct I/O and full flush, aligned buffers, group commit's wait, the device issuer, the simulated device (`crates/hyper-block/ORIGIN.md`). | Moved with L-1, from mantle `147f035`; on `main` once the `log` branch lands. |
 | `hyper-log` | mantle's per-device log, with its `BlockFile` trait. It is the one crate that owns its device writer and files (`CLAUDE.md` §1). | **Done on branch `log`** (`crates/hyper-log/ORIGIN.md`): L-1 and L-2 as below, with one change of plan: the owner never waits on the device, so the log runs two threads, the owner and a device thread that owns the file, until its writes go through hyper-block's issuer. **L-1**: move it. Gate: mantle's `crates/log/tests/log.rs`, `fairness.rs` and the range simulation; bytes on the simulated device identical per seed. **L-2**: an owner thread in place of `Arc`, `RwLock`, `Mutex` and `Condvar`, and `Waker` tickets in place of the mpsc `Pending`. Gate: L-1's suite; a test that a completion wakes only its submitter; mantle's log benchmark against its recorded baseline; frame contents per seed identical. **F-1**: focal's WAL converted to it, one way. Gate: recorded focal data directories converted and read back equal, and focal's restart and restore runbooks on real processes. |
 | `hyper-multilog` | slates' MLRaft layer: one group's log divided into `n` logs with barriers (note 32 R25). | Moved with X-1. Gate: slates' `tests/multilog*.rs` and its explorer (200 seeds × 3,000 steps), retargeted at this crate. No consumer enables it until an owner shows a gain; slates measured it worse for its own groups. |

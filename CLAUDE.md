@@ -105,5 +105,6 @@ six targets.
 
 - `docs/transport.md`: the transport's design and plan.
 - `docs/raft.md`: the consensus crates' design and plan.
+- `docs/durable.md`: the durable shell's design and plan.
 
 A change in behaviour updates its document in the same commit.

@@ -1,0 +1,22 @@
+[package]
+name = "hyper-durable"
+description = "The durable shell around hyper-raft's core: generic over the log a group's writes become durable in and the state machine it applies to, with the release rules of docs/durable.md stated as invariants."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+hyper-block = { path = "../hyper-block" }
+hyper-log = { path = "../hyper-log" }
+hyper-raft = { path = "../hyper-raft" }
+hyper-timing = { path = "../hyper-timing" }
+thiserror.workspace = true
+
+[dev-dependencies]
+hyper-block = { path = "../hyper-block", features = ["sim"] }
+hyper-measure = { path = "../hyper-measure" }
+
+[lints]
+workspace = true

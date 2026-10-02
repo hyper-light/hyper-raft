@@ -1,7 +1,7 @@
 # hyper-durable: the durable shell around the Raft core
 
-> Status (2026-10-02): design; of the core steps it needs, R-4 (§2.1) and R-6 (§4.4) are built,
-> the shell is not.
+> Status (2026-10-02): the shell's D-1 core is built (`crates/hyper-durable`, §15) on core steps
+> R-4 (§2.1) and R-6 (§4.4); R-5 and R-7 are not built, and §15 says what waits on each.
 > Sources and what each establishes are in
 > `docs/research/durable.md` ("research §n"). This replaces `docs/raft.md` §4's plan to extract
 > mantle's replica: the shell is designed from all three projects' shells and the literature, then
@@ -156,8 +156,11 @@ open.
 ### 2.4 Failures
 
 A write refused for room another write frees (`Backlog`, `Full`, `TooManyGroups`, `Busy`) waits,
-whole, with the writes after it untaken, and the replica refuses calls `Stalled` until the owner
-frees room and drives again: a member that cannot persist takes no part (mantle, audit S04). A
+whole, with the writes after it untaken (hyper-log refuses each one sent behind it, `Behind`), and
+the replica refuses calls `Stalled` until room may have been freed: its own compaction durable, or
+its owner's word (`Replica::resume`); made again before, the writes would only be refused again, a
+refusal a drive. They are made again as one write of everything the core holds not yet durable,
+whose notice is the last refused `Ready`'s: a member that cannot persist takes no part (mantle, audit S04). A
 snapshot report that arrives meanwhile is kept, the latest per member, since replication to that
 member pauses until its fate is known (a mantle simulation seed found a lost report pausing it for
 good). Any other failure fences the replica: a failed flush leaves the device's contents unknown
@@ -201,9 +204,23 @@ Where each is kept, as of R-4:
 | I4 | `Log::next_entries_since` and `next_range_since` give only what is committed and durable here, or a leader's own committed entries where it applies before its write is durable (`Log::unpersisted_after`, §4.4) | `Lagged::apply`, every entry given to apply; `a_leader_applies_its_own_committed_entries_before_its_write_is_durable` |
 | I5 | the shell's commit fence (§4.1), with the core's apply pause (`RawNode::pause_apply`) and durable commit (`RawNode::durable_commit`, `commit_durable`), R-6 | `Lagged::release`: the schedules' harness keeps the fence as a shell does, stating a commit only as `Ready`s give one, holding a change and every entry after it until its disk states a commit covering it, and paused meanwhile. Before R-6 it recorded the commit before every apply; without that, a 4,000-step schedule (seed 19, `random_interleavings_keep_every_invariant` at three writes out) reproduced §4.1's hole, a sole voter that restarted without its commit reverting to the configuration before changes it had applied, electing itself by it, and leaving a group that cannot elect. `an_owner_that_pauses_apply_is_given_nothing_more` |
 | Answers (R-6) | `node::state_durable_commit`: an answer to an append or a heartbeat states no commit beyond what is durable when it leaves | `check_commit` at every release; `an_answer_a_notice_releases_states_the_durable_commit` (fails on R-4); `an_answer_states_no_commit_that_no_durable_write_stated` (mantle's case) |
-| I6, I8 | the shell's (§4; D-1) | — |
+| I6, I8 | the shell's (§4; D-1) | §15's table |
 | I7 | `RawNode::on_persist` takes notices in issue order; a `Ready` gives only what no earlier one gave | `Lagged::make_durable`: once a write is durable the disk holds the term, vote and log the member held when it took the `Ready` |
 
+
+Where the shell keeps each, as built (D-1, `crates/hyper-durable`; the oracle and its checks are
+`tests/support/cluster.rs`, run by `tests/sim.rs`):
+
+| | Enforced in the shell | Tested |
+|---|---|---|
+| I1 | a `Ready`'s persisted messages leave with its write's answer, answers taken in submission order (`Replica::take_answers`, `durable`); a write refused for room releases nothing until it is made again (`refused`, `make_again`); the repair message leaves only with no write out (`ask_repair`) | `check_promises` on every release, against the sender's disk; mutated to release a `Ready`'s persisted messages at once, the schedules fail ("MsgRequestVote of term 1 left with term 0 durable") |
+| I2 | the same | `check_acknowledgement` on every release |
+| I3 | the core's; the shell tells it a write is durable only from that write's answer | `check_leader_commit`: every commit new to the group, held by a majority of each half of the configuration that decided it, through steps in which the leader stepped down |
+| I4 | the shell applies only what the core gives (`walk`), reading a leader's own entries past the store where the core holds them (`Config::apply_unpersisted`) | `check_applied`: every member applies the same entry at an index; `a_leader_applies_its_own_term_before_its_write_is_durable` |
+| I5 | `Replica::walk` stops at a change or an entry `StateMachine::acts_at_start` past `C_d`, holds the page (`behind_fence`) and pauses the core (`pause_apply`); `Ready`s go on and state the commit, or a write of the commit alone does (`commit_write`); `release_fence` applies once `C_d` covers it | `check_applied` at every drive; `Cluster::restart`: every entry acted on before a crash is applied again from the member's own durable state before it hears from anyone; `tests/directed.rs`, the four cases of mantle `1c179e8` and focal's two F17 cases with the power cut at every device operation in turn, all of which fail with the fence taken out |
+| I6 | answers are what `StateMachine::apply` returns as it applies; reads leave once applied through their index (`release_reads`) | `reads_past_the_bound_are_refused`; the schedules' reads |
+| I7 | every write states the core's commit, or the last entry where the member decides alone; a write of the commit alone states no more than the entries written (`written_through`); a commit stated past what the log holds once the write is durable fences (`durable`); hyper-log refuses writes sent behind a refused one (`LogError::Behind`) | `Cluster::durable`: once a write is durable its disk's commit is an entry it holds; a 600-seed soak found a commit-only write stating entries not yet written, fixed by `written_through` |
+| I8 | `install` before the write that moves the start; a compaction never passes the state machine's durable index, what the log holds, nor a start still out (`compact`); `repair_at_open` | `check_start` after every step; `an_install_the_log_never_recorded_is_finished_at_open`, `a_state_machine_past_the_logs_commit_raises_it`, `a_state_machine_past_the_logs_last_entry_moves_its_start`, `a_log_that_starts_past_the_state_machine_does_not_open` |
 
 ## 4. The commit fence
 
@@ -607,3 +624,68 @@ and allocates no more on that project's workload.
    be nothing.
 8. **slates' store.** A transition's publication cost at slates' record sizes through the shell,
    against its own path.
+
+## 15. As built (D-1)
+
+`crates/hyper-durable` (`ORIGIN.md` records where each rule came from):
+
+- **`LogStore`** (`src/store.rs`) is not a supertrait of the core's `Storage`: the replica wraps
+  the store in `Held` (`src/held.rs`), which adds what the shell keeps beside the log, the
+  configuration it opened at and the snapshot it prepared, and answers the core's walks of the
+  log with one entry whose buffers it reuses. A store reads as its answered writes left it, and
+  adds `bounds`, `visit` (entries where the store holds them, borrowed: the state machine applies
+  from the log's own buffers), `room` and `write_now` (the writes of §4.3, before the core opens).
+  `GroupStore` (`src/hyperlog.rs`) is hyper-log's group handle, each write one update cut into
+  frame-sized parts and answered once every part is; `RamStore` (`src/memory.rs`) completes each
+  write as it is submitted, depth one, slates' case and the simplest test store.
+- **`StateMachine`** (`src/machine.rs`) applies an `EntryRef`, borrowed, with no copy; its
+  `durable` point carries its term (§4.3); `image`, `install` (durable before it returns) and
+  `persist` are its snapshot and compaction.
+- **`Replica`** (`src/replica.rs`): `open`, `tick`, `step`, `campaign`, `propose`, `propose_fast`,
+  `change`, `read`, `transfer`, `report_unreachable`, `report_snapshot`, `drive`, `compact`,
+  `resume`. Every call runs inside the unwind boundary. A drive takes the log's answers first and
+  only then, applies what the fence allows, takes at most one `Ready` (§7's quantum), and writes the
+  commit alone when the fence or a quiet period asks. `Settings::quiet` is the owner's period.
+  `L-2`'s `suspect` is not there: the core campaigns on ticks until L-2, and a stalled replica's
+  ticks are dropped.
+- **`Owner`** (`src/owner.rs`): an arena by generational handle, one waker a slot made by the
+  embedder, turns by deficit round robin with a quantum of one `Ready`. The crate spawns nothing.
+- **`Budget`**: reserved before an input, settled to the replica's resident bytes after each call;
+  `Unbounded` compiles both out.
+
+What waits on core steps not built:
+
+- **R-5.** A marked member asks for a snapshot reaching its mark, mantle's repair
+  (`Replica::ask_repair`, a refusal with `request_snapshot`); a leader prepares one when asked
+  (`serve_requests`). R-5 replaces the message with a refusal flagged lost that regresses the
+  member's progress, so the leader resends the lost entries; nothing else in the shell changes.
+- **R-7.** A marked member does not campaign and drops vote requests behind its mark, so a group
+  whose only up-to-date log is marked waits, as mantle's does.
+- **Asked of the core besides:** `RawNode::into_store`, so a closed replica gives back its store;
+  and the fast track's proposals not yet durable, so a refused write that held them is made again
+  instead of fencing the replica (no owner enables the fast track yet).
+
+hyper-log changed with it (`crates/hyper-durable/ORIGIN.md`): writes sent behind a refused one are
+refused (`LogError::Behind`), and `GroupLog::depth` and `has_room`. `GROUP_SUBMISSIONS` is still two,
+not `PIPELINE_FRAMES` plus one (§11): at four, a group of frame-sized writes holds all three frames'
+bytes and a cold group's room goes; a group's third write waits in the log for its own room, which
+§14 item 1 measures.
+
+Tests (`crates/hyper-durable/tests`):
+
+- `sim.rs`: five shapes (three voters at depth three with a durable state machine; at depth two
+  with a replayed one; a control group, every entry acted on at start; a leader applying before its
+  write is durable, its disk the slowest; five voters at depth one), 128 seeds of 5,000 steps each
+  by default, with refusals, failed writes, crashes, compactions and changes; and a crash after
+  every step of a schedule that did something, in turn (`a_crash_after_every_durability_event_loses_nothing_durable`).
+  A crash after a drive is the harder case for every event inside it: nothing durable changes
+  within a drive, and what it released has left. Soaked at 1,000 seeds a shape; three shell
+  defects were found and fixed so (a commit-only write naming entries not yet written; a
+  compaction behind a snapshot's start still out; a refused write made again before room was
+  freed, a refusal a drive), and one in the harness's own model of hyper-log's refusals.
+- `directed.rs`: mantle's four cases and focal's two, on hyper-log over simulated devices with the
+  power cut at each write and flush in turn, both ways of taking readies.
+- `shell.rs`, `hyperlog.rs`, `threads.rs`: each bound of §6 at its edge, the open repairs of §4.3,
+  marks, the unwind boundary, the owner's turns, parts and refusals on hyper-log, and the threads
+  an owner's sixty-four groups cost (none of their own).
+

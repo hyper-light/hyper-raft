@@ -634,6 +634,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "hyper-durable"
+version = "0.1.0"
+dependencies = [
+ "hyper-block",
+ "hyper-log",
+ "hyper-measure",
+ "hyper-raft",
+ "hyper-timing",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "hyper-log"
 version = "0.1.0"
 dependencies = [

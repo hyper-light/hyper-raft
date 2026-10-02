@@ -442,6 +442,11 @@ impl<F: BlockFile + 'static> Owner<F> {
         new_groups: usize,
         batch: &mut VecDeque<Submission>,
     ) -> Result<Option<bool>, LogError> {
+        if self.behind(&s) {
+            let group = s.group;
+            self.answer(s, Err(LogError::Behind(group)));
+            return Ok(None);
+        }
         let (new, len) = match self.fits(&s, new_groups) {
             Ok(checked) => checked,
             Err(e) => {

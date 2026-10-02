@@ -11,6 +11,7 @@ members = ["crates/*"]
 exclude = [
     "vendor",
     "crates/hyper-raft-compare",
+    "crates/hyper-durable-compare",
     "crates/hyper-log-compare",
     "crates/hyper-datagram-compare",
     "crates/hyper-swim-compare",

@@ -1,0 +1,30 @@
+[package]
+name = "hyper-durable-compare"
+description = "hyper-durable measured against the shells it replaces, on one workload: mantle's range replica (crates/range at origin/dev 1c179e8) first; focal's DurableNode and slates' publication are later steps."
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+license = "MIT"
+publish = false
+
+# A workspace of its own: mantle's range replica is built from mantle's repository at a pinned
+# revision, which the gates of this workspace do not fetch (docs/benchmarks.md, "The durable shell
+# against mantle's").
+[workspace]
+
+[dependencies]
+hyper-block = { path = "../hyper-block", features = ["sim"] }
+hyper-durable = { path = "../hyper-durable" }
+hyper-log = { path = "../hyper-log" }
+hyper-measure = { path = "../hyper-measure" }
+hyper-raft = { path = "../hyper-raft" }
+# mantle's range replica and its engine at mantle origin/dev `1c179e8` (its commit fence), with
+# the snapshots of hyper-raft, hyper-log and hyper-block mantle vendors there: the other side.
+mantle-range = { git = "https://github.com/hyper-light/mantle", rev = "1c179e8a734d40640b82b6bddf8cad2030d0b55f" }
+mantle-meta = { git = "https://github.com/hyper-light/mantle", rev = "1c179e8a734d40640b82b6bddf8cad2030d0b55f" }
+mantle-hyper-block = { package = "hyper-block", git = "https://github.com/hyper-light/mantle", rev = "1c179e8a734d40640b82b6bddf8cad2030d0b55f", features = ["sim"] }
+mantle-hyper-log = { package = "hyper-log", git = "https://github.com/hyper-light/mantle", rev = "1c179e8a734d40640b82b6bddf8cad2030d0b55f" }
+
+[profile.release]
+lto = true
+debug = "line-tables-only"

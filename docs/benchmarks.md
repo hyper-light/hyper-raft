@@ -3049,3 +3049,160 @@ cargo test -p hyper-tokio
 # The same on Linux, in a container on this machine (sendmmsg, recvmmsg, UDP_SEGMENT, UDP_GRO).
 docker run --rm -v "$PWD":/work -w /work rust:1.98.0 cargo test -p hyper-tokio --locked
 ```
+
+# The durable shell against mantle's
+
+`crates/hyper-durable-compare` (a workspace of its own, like the other comparisons) runs mantle's
+replica workload through both shells in one process: a range group of 1, 3 or 5 members, each on a
+log of its own, member 1 leading, committing one entry at a time through the leader (closed loop),
+each entry a mantle `wire::Entry` applied by mantle's engine (`Model`) and its Name layer
+(`apply_entry`) on both sides, so the shells and what they drive the core and the log with are what
+differs.
+
+- **mantle 1c179e8**: mantle's range `Replica` at origin/dev `1c179e8` (its commit fence), over the
+  hyper-raft, hyper-log and hyper-block mantle vendors there, driven as its node drives it: every
+  member `begin`s its ready, the messages are delivered, every member `wait_persisted`s.
+- **hyper-durable**: this branch's `Replica` over `GroupStore` on this repository's hyper-log, with
+  mantle's engine and layer as its `StateMachine`, held by one `Owner` and driven by its turns,
+  woken by the logs' answers; readies taken ahead to the log's depth (three).
+
+Both logs run mantle's group-test configuration with the writer's measured waits. `file` is a real
+file on this machine's SSD, direct I/O and `F_FULLFSYNC`; `sim` is hyper-block's simulated device,
+whose flush costs nothing. Each point runs five rounds, the two shells alternating with the order
+rotated each round, each run a fresh group on fresh logs: 50 entries to warm, 300 measured.
+Latencies are pooled over the rounds; the other columns are per committed entry, medians over the
+rounds: frames flushed by every member's log, the process's allocations and reallocations (every
+thread), minor and major page faults, context switches, and the threads alive. Apple M5 Max (18
+cores, 128 GiB), macOS 26.4.1, 2026-10-02 02:55–03:15 PDT, other sessions building; the load
+average is beside each point (1, 5 and 15 minutes, before → after).
+
+
+**File, register entries, 1 member(s); load 12.70 8.67 12.74 → 10.99 8.65 12.59**
+
+| shell | p50 µs | p99 µs | p99.9 µs | entries/s | flushes | allocations | reallocations | faults | switches | threads |
+|---|---|---|---|---|---|---|---|---|---|---|
+| mantle 1c179e8 | 8573 | 18957 | 21283 | 96 | 1.00 | 38.4 | 9.05 | 0.00 | 17.7 | 3 |
+| hyper-durable | 8507 | 14731 | 95632 | 115 | 1.00 | 30.4 | 9.05 | 0.00 | 15.1 | 3 |
+
+**File, register entries, 3 member(s); load 10.99 8.65 12.59 → 23.09 12.15 13.19**
+
+| shell | p50 µs | p99 µs | p99.9 µs | entries/s | flushes | allocations | reallocations | faults | switches | threads |
+|---|---|---|---|---|---|---|---|---|---|---|
+| mantle 1c179e8 | 50079 | 98295 | 271506 | 20 | 6.00 | 135.1 | 21.16 | 0.00 | 117.4 | 7 |
+| hyper-durable | 36384 | 56620 | 198911 | 26 | 5.73 | 100.7 | 21.22 | 0.00 | 135.3 | 7 |
+
+**File, register entries, 5 member(s); load 23.09 12.15 13.19 → 39.32 25.69 18.81**
+
+| shell | p50 µs | p99 µs | p99.9 µs | entries/s | flushes | allocations | reallocations | faults | switches | threads |
+|---|---|---|---|---|---|---|---|---|---|---|
+| mantle 1c179e8 | 60909 | 132943 | 375740 | 15 | 10.00 | 225.8 | 33.27 | 0.00 | 228.1 | 11 |
+| hyper-durable | 46389 | 78367 | 290526 | 21 | 9.83 | 168.5 | 33.61 | 0.00 | 228.8 | 11 |
+
+**File, put-1KiB entries, 1 member(s); load 39.32 25.69 18.81 → 35.95 26.19 19.25**
+
+| shell | p50 µs | p99 µs | p99.9 µs | entries/s | flushes | allocations | reallocations | faults | switches | threads |
+|---|---|---|---|---|---|---|---|---|---|---|
+| mantle 1c179e8 | 8559 | 23281 | 34940 | 106 | 1.00 | 26.0 | 10.04 | 0.00 | 15.6 | 3 |
+| hyper-durable | 8520 | 26734 | 154405 | 99 | 1.00 | 18.0 | 10.04 | 0.00 | 15.1 | 3 |
+
+**File, put-1KiB entries, 3 member(s); load 35.95 26.19 19.25 → 31.34 28.17 21.16**
+
+| shell | p50 µs | p99 µs | p99.9 µs | entries/s | flushes | allocations | reallocations | faults | switches | threads |
+|---|---|---|---|---|---|---|---|---|---|---|
+| mantle 1c179e8 | 45014 | 111936 | 309714 | 22 | 6.00 | 96.1 | 12.13 | 0.00 | 105.9 | 7 |
+| hyper-durable | 34736 | 47489 | 283334 | 28 | 5.78 | 61.6 | 12.19 | 0.00 | 107.4 | 7 |
+
+**File, put-1KiB entries, 5 member(s); load 31.34 28.17 21.16 → 10.03 22.24 20.30**
+
+| shell | p50 µs | p99 µs | p99.9 µs | entries/s | flushes | allocations | reallocations | faults | switches | threads |
+|---|---|---|---|---|---|---|---|---|---|---|
+| mantle 1c179e8 | 58496 | 107002 | 354744 | 17 | 10.00 | 160.2 | 14.22 | 0.00 | 215.5 | 11 |
+| hyper-durable | 43442 | 69734 | 288825 | 22 | 9.82 | 102.8 | 14.47 | 0.00 | 230.9 | 11 |
+
+**Sim, register entries, 1 member(s); load 10.03 22.24 20.30 → 10.03 22.24 20.30**
+
+| shell | p50 µs | p99 µs | p99.9 µs | entries/s | flushes | allocations | reallocations | faults | switches | threads |
+|---|---|---|---|---|---|---|---|---|---|---|
+| mantle 1c179e8 | 7 | 21 | 92 | 121751 | 1.00 | 44.4 | 9.07 | 0.00 | 3.0 | 3 |
+| hyper-durable | 7 | 21 | 33 | 131459 | 1.00 | 36.4 | 9.07 | 0.01 | 3.0 | 3 |
+
+**Sim, register entries, 3 member(s); load 10.03 22.24 20.30 → 10.03 22.24 20.30**
+
+| shell | p50 µs | p99 µs | p99.9 µs | entries/s | flushes | allocations | reallocations | faults | switches | threads |
+|---|---|---|---|---|---|---|---|---|---|---|
+| mantle 1c179e8 | 54 | 155 | 403 | 17461 | 6.00 | 171.2 | 21.20 | 2.65 | 16.5 | 7 |
+| hyper-durable | 34 | 166 | 237 | 26157 | 5.55 | 130.3 | 21.36 | 2.66 | 14.0 | 7 |
+
+**Sim, register entries, 5 member(s); load 10.03 22.24 20.30 → 10.03 22.24 20.30**
+
+| shell | p50 µs | p99 µs | p99.9 µs | entries/s | flushes | allocations | reallocations | faults | switches | threads |
+|---|---|---|---|---|---|---|---|---|---|---|
+| mantle 1c179e8 | 74 | 220 | 516 | 12801 | 10.00 | 286.0 | 33.33 | 4.65 | 26.0 | 11 |
+| hyper-durable | 49 | 102 | 252 | 18936 | 9.12 | 219.5 | 33.61 | 4.54 | 22.9 | 11 |
+
+**Sim, put-1KiB entries, 1 member(s); load 10.03 22.24 20.30 → 10.03 22.24 20.30**
+
+| shell | p50 µs | p99 µs | p99.9 µs | entries/s | flushes | allocations | reallocations | faults | switches | threads |
+|---|---|---|---|---|---|---|---|---|---|---|
+| mantle 1c179e8 | 7 | 20 | 173 | 117948 | 1.00 | 32.0 | 10.06 | 0.00 | 3.0 | 3 |
+| hyper-durable | 7 | 18 | 30 | 118505 | 1.00 | 24.0 | 10.06 | 0.00 | 3.0 | 3 |
+
+**Sim, put-1KiB entries, 3 member(s); load 10.03 22.24 20.30 → 10.03 22.24 20.30**
+
+| shell | p50 µs | p99 µs | p99.9 µs | entries/s | flushes | allocations | reallocations | faults | switches | threads |
+|---|---|---|---|---|---|---|---|---|---|---|
+| mantle 1c179e8 | 53 | 149 | 420 | 17507 | 6.00 | 132.2 | 12.17 | 2.66 | 16.3 | 7 |
+| hyper-durable | 32 | 146 | 230 | 28119 | 5.52 | 90.3 | 12.31 | 2.66 | 13.6 | 7 |
+
+**Sim, put-1KiB entries, 5 member(s); load 10.03 22.24 20.30 → 10.03 22.24 20.30**
+
+| shell | p50 µs | p99 µs | p99.9 µs | entries/s | flushes | allocations | reallocations | faults | switches | threads |
+|---|---|---|---|---|---|---|---|---|---|---|
+| mantle 1c179e8 | 73 | 214 | 510 | 12929 | 10.00 | 220.3 | 14.28 | 4.65 | 25.7 | 11 |
+| hyper-durable | 49 | 100 | 244 | 19066 | 9.13 | 153.2 | 14.60 | 4.60 | 23.5 | 11 |
+
+- **Faster with more than one member**: on the device p50 23–27% lower (36.4 against 50.1 ms at
+  three members, 46.4 against 60.9 at five), p99 35–58% lower, entries a second 27–40% higher; on
+  the simulated device p50 33–40% lower and entries a second 47–61% higher, p99 even at three
+  members (166 against 155 µs with register entries, 146 against 149 with 1 KiB) and half at
+  five. A follower's next append no longer waits for its last write's answer, and a leader's own
+  write overlaps its followers'. With one member p50 is even (one flush an entry for both: the
+  commit rides the entry's own write, `commit = last`).
+- **Fewer flushes**: 5.5–5.8 frames an entry at three members against 6.0, 9.1–9.8 at five against
+  10.0: frames carry more than one write of a member.
+- **Fewer allocations**: 18–36% fewer at every point (100.7 against 135.1 at three members on the
+  device, register entries; 61.6 against 96.1 with 1 KiB entries): the store encodes each entry
+  once into its frame from where the core holds it, a write is not cloned per part, and the state
+  machine applies from the log's own buffers.
+- **Losses, open before mantle switches (`CLAUDE.md` §1a):**
+  - *Reallocations*, 0.06–0.34 an entry more (21.22 against 21.16 at three members; 33.61 against
+    33.27 at five). They are the driving thread's (the shell, the core, the store, the state
+    machine), not the logs': split by thread on the simulated device at three members they are
+    21.09 against 21.03 at depth one and 21.14 at depths two and three. So about half comes with
+    taking readies ahead (the core's unstable log keeps entries until their notice, R-4) and half
+    is there at depth one; neither is traced to its site yet.
+  - *Context switches on the device* at three and five members (135 against 117 an entry with
+    register entries at three; even at five). On the simulated device hyper-durable switches less
+    (14.0 against 16.5). The device runs rose from load 11 to 39 across them; to be measured again
+    with the runs interleaved by point, and traced.
+  - *One member on the device*: p99.9 96 ms against 21 with register entries and 154 against 35
+    with 1 KiB, and with 1 KiB entries p99 26.7 against 23.3 ms and 99 entries a second against
+    106: a few flushes of 300 a round under load 10–40, with the p50 even; not traced yet.
+
+```
+# From the repository root: the comparison is a workspace of its own and fetches mantle at the
+# revision in crates/hyper-durable-compare/Cargo.toml.
+cd crates/hyper-durable-compare && CARGO_BUILD_JOBS=4 cargo build --release
+./target/release/hyper-durable-compare --rounds 5 --entries 300 --warm 50
+# The driving thread's counts at depths one to three (the split above).
+for d in 1 2 3; do HYPER_DURABLE_DEPTH=$d ./target/release/hyper-durable-compare \
+  --devices sim --members 3 --shapes register --rounds 3 --entries 300; done
+```
+
+focal's and slates' comparisons are the next steps: focal's needs `DurableNode`'s workloads
+(`cargo bench -p focal-consensus --bench commits`) after F-1 converts its WAL to hyper-log, and a
+`StateMachine` over focal's control and data groups with `acts_at_start` true for the control
+groups; slates' needs a `LogStore` over its anchor publication (`RamStore` is its shape, depth one)
+with `SavedRaft` as what the core's `Storage` reads, measured on `publication_cost`'s workload
+against its own path at `ec5e0df`.
+

@@ -698,6 +698,11 @@ Tests (`crates/hyper-durable/tests`):
   history. With the fence taken out the fence host reopens below the fence it acted on; the
   founder's window is too narrow between processes to fail there (its write is on its way when it
   applies), which `directed.rs` covers deterministically.
+- Measured against mantle's shell (`crates/hyper-durable-compare`, `docs/benchmarks.md`, "The
+  durable shell against mantle's"): faster with three and five members and 18–36% fewer
+  allocations; open before mantle switches: 0.06–0.34 more reallocations an entry (about half
+  with readies taken ahead), more context switches on a real disk at three members, and the
+  one-member tail on a real disk.
 - `shell.rs`, `hyperlog.rs`, `threads.rs`: each bound of §6 at its edge, the open repairs of §4.3,
   marks, the unwind boundary, the owner's turns, parts and refusals on hyper-log, and the threads
   an owner's sixty-four groups cost (none of their own).

@@ -507,6 +507,115 @@ own unchanged functions moved more than that (`flush` 156 against 189, `quiet` 1
 `RawNode::operate` had fallen out of line on the proposal path, which `#[inline]` restored. Under the
 load of these runs R-6's medians lean 1–3 % above `main`'s on the comparison and within 1 % on the
 core alone; the noise band measured at load 2 is 2 %.
+That reading was wrong on both counts; the next section settles it.
+
+### The lean, settled
+
+Measured on 2026-10-02, 02:40–04:55 PDT, on the machine above. Trees: `main` at `b73e18b`, R-6 at
+`94a3a6a`, and R-6 with the fix below, each `hyper-raft-compare` built with LTO the same way, and the
+one-voter loop R-4 timed (`micro`, LTO, the best of five passes). The runs:
+
+- **Interleaved fresh processes.** Each round runs every tree once, the order rotated and reversed
+  round to round; a cell's statistic is over the rounds.
+- **Per round, the ratio of a tree to `main`** (adjacent runs, so a slow stretch of the machine falls
+  on both). Stated: the geometric mean of the ratios with its Student-t 95 % interval on their
+  logarithms, and the median with its sign-test (distribution-free, binomial order statistics) 95 %
+  interval. A cell leans only where the interval excludes 1.
+- **Three measures.** The loop's own time (`ns=`, the harness's clock). Instructions retired and
+  cycles for the whole process, from `proc_pid_rusage(RUSAGE_INFO_V4)` (`ri_instructions`,
+  `ri_cycles`), which are counted by the core's PMU and do not depend on the load. The whole-process
+  counts include the group's set-up and so dilute a ratio towards 1. Where per-op instructions are
+  quoted below they are net of the set-up: `(I(R) − I(R/5)) / (ops(R) − ops(R/5))`, median of 3 to 5.
+- **Two schedulings.** The default, where the scheduler places a run on the 6 super cores or the 12
+  performance cores as the load allows, and `taskpolicy -c background`, which holds it to the
+  performance cluster at a fixed lower clock; cycles are the measure there.
+- **What could not be had.** Linux `perf stat` was not available: Docker Desktop's VM exposes no PMU
+  (`/sys/bus/event_source/devices` has only software, tracepoint, kprobe and uprobe). Instruments'
+  CPU Counters template (CPU Bottlenecks mode) gave the split of R-6's extra cycles: on the in-place
+  steady 4 KiB cell, six runs a tree, useful work 51–54 % of cycles against `main`'s 56–62 %, with
+  the processing (back-end) share 31–35 % against 26–29 %; instruction delivery and discarded work
+  were the same.
+
+**The lean was real, and on the in-place path.** At load 11–13 the first full pass (30 rounds) put
+R-6 above `main` on the in-place steady cells: 64 B time 1.063 [1.054, 1.071], cycles 1.055; 4 KiB
+time 1.098 [1.084, 1.113], cycles 1.067 [1.060, 1.074], with instructions only 1.004–1.007. The
+copying cells were 0.99–1.00 in time and cycles. At load 2–4, R-6's 4 KiB in-place cell stays above
+(time 1.031 [1.020, 1.041], 1.042 [1.033, 1.050] in two passes), and on the performance cores its
+cycles are 1.051–1.056 at load 2–22. The 64 B in-place cell is the one whose sign moved with the
+load (1.055 at load 12, 0.97–0.98 at load 3–9).
+
+**Cause 1: storage's walk fell out of line.** R-6's `Log::next_range_since` gave its page closure to
+storage from two places, `Storage::any_entry` directly and through `Log::any_entry`. With a third call
+site, LLVM no longer inlined the in-memory store's `any_entry` (it appears as a 252-byte function in
+R-6's binary and not in `main`'s), so the closure, which storage takes as `&mut dyn FnMut`, was
+called through its vtable once an entry (a 152-byte `FnMut` shim, also absent in `main`). The fix
+asks storage once, from one place, for the part it holds, and walks the leader's not-yet-durable tail
+(`Config::apply_unpersisted`) from the log's own slice after it: both symbols vanish, and the in-place
+steady cells go from R-6's 1.03–1.10 to 0.96–0.97 of `main` (below).
+
+**Cause 2: `Log` grew by 16 bytes.** With cause 1 fixed, leadership transfer and failover still ran
+3.7–5.3 % slower than `main` at load 3.5–4 with instructions within 0.2 %, and R-6's hold on answers
+never ran in any workload (a counter in `hold_answers`: zero calls in steady, transfer, failover,
+catch-up, fast and snapshot). `main` with R-6's four new fields added and no other change (`durable_commit`
+in `Raft`, `unpersisted_after: Option<u64>` in `Log`, `apply_paused` in `RawNode`, `commit` in `Mark`,
+none read) reproduced most of it: transfer 1.017–1.018, failover 1.023–1.028, both intervals above 1;
+`main` with 32 inert bytes in `RawNode` instead moved transfer by 0.4 % and failover by 1.0–1.7 %, and
+the steady in-place cells by −3 to −4 %: these loops are that sensitive to where the member's fields
+fall. `unpersisted_after` is now a plain index with `u64::MAX` for none (8 bytes, not 16):
+transfer 1.005 [1.001, 1.009], failover 1.002 [0.994, 1.010] in the same pass where the `Option` gave
+1.045 and 1.049. `Mark::commit` is likewise a plain `u64`, 0 for none (the durable commit only rises),
+which drops a branch a notice and 8 bytes a write out.
+
+**After, at load 1.8–3.5** (04:00–04:45 PDT, 30 rounds; time ratio to `main` with its 95 % interval,
+then the performance cores' cycles ratio at load 2.0–4.0, 16 rounds):
+
+| Cell | R-6 time | fixed time | R-6 cycles (perf. cores) | fixed cycles (perf. cores) |
+|---|---|---|---|---|
+| loop, 64 B | 1.007 [0.999, 1.015] | 1.005 [0.998, 1.012] | 0.992 [0.989, 0.994] | 0.997 [0.993, 1.000] |
+| loop, 4 KiB | 1.022 [1.017, 1.028] | 1.034 [1.027, 1.041] | 0.993 [0.979, 1.007] | 1.003 [0.991, 1.015] |
+| steady 64 B, in place | 0.974 [0.969, 0.980] | 0.960 [0.954, 0.965] | 1.019 [1.007, 1.031] | 1.004 [0.992, 1.016] |
+| steady 64 B, copying | 0.985 [0.979, 0.991] | 0.974 [0.969, 0.980] | 1.007 [0.998, 1.016] | 1.006 [1.000, 1.013] |
+| steady 4 KiB, in place | 1.031 [1.020, 1.041] | 1.005 [0.987, 1.022] | 1.056 [1.036, 1.076] | 1.011 [0.993, 1.030] |
+| steady 4 KiB, copying | 0.989 [0.983, 0.994] | 0.995 [0.989, 1.001] | 0.995 [0.984, 1.007] | 0.997 [0.987, 1.007] |
+| transfer, in place | 1.024 [1.015, 1.033] | 1.005 [0.995, 1.015] | 1.029 [1.016, 1.042] | 1.015 [1.006, 1.025] |
+| transfer, copying | 1.023 [1.013, 1.034] | 1.022 [1.009, 1.035] | 1.007 [0.999, 1.015] | 1.009 [1.003, 1.016] |
+| steady batch 64 | 0.996 [0.983, 1.009] | 0.998 [0.983, 1.013] | 1.000 [0.996, 1.003] | 1.004 [1.001, 1.007] |
+| catch-up | 0.980 [0.973, 0.986] | 1.003 [0.986, 1.021] | 1.006 [1.001, 1.012] | 0.984 [0.980, 0.988] |
+| snapshot | 1.000 [0.996, 1.004] | 1.008 [1.004, 1.013] | 1.011 [1.008, 1.015] | 0.988 [0.984, 0.991] |
+| fast | 1.010 [0.999, 1.021] | 1.005 [0.993, 1.017] | 1.015 [1.006, 1.023] | 1.011 [1.001, 1.021] |
+| failover | 1.034 [1.027, 1.042] | 1.004 [0.998, 1.010] | 1.019 [1.009, 1.030] | 1.013 [1.002, 1.024] |
+
+Instructions an op, net of set-up, `main` / R-6 / fixed: steady 64 B in place 24,007 / 24,141 /
+23,973; copying 29,988 / 30,293 / 30,223; steady 4 KiB in place 26,738 / 26,867 / 26,736; transfer in
+place 89,714 / 90,374 / 89,885; copying 99,891 / 100,656 / 100,544; failover 113,793 / 114,828 /
+114,434; the one-voter loop 2,820.4 / 2,830.2 / 2,822.2 (64 B) and 3,899.5 / 3,909.5 / 3,901.5
+(4 KiB). Allocations, reallocations and faults are R-6's, which were `main`'s.
+
+**What is left, and why it stays.**
+- *What correctness needs.* On the copying path, where nothing offsets it, R-6 costs 230 instructions
+  an op at steady 64 B (0.8 %) and 650 on transfer (0.7 %): the loads and compares that state the
+  durable commit (the follower's `Ready` comparing its durable commit with its commit, the notice's
+  `max`, the release's check), the pause's two flag tests, the apply bound's compare. Removing every
+  one of them at once (not shippable) brought the copying cell to +45 ± 65; removing any one alone
+  moved it within the run-to-run spread (±50–190), so the cost is spread, a few instructions each
+  across the three members' `Ready`s and notices. In place, the cheaper storage walk more than pays
+  for it (−0.1 %); the one-voter loop is +2 instructions an op (0.06 %).
+- *Where the intervals still exclude 1 above.* Time on the 4 KiB one-voter loop (1.034), transfer
+  copying (1.022) and snapshot (1.008) with default scheduling; cycles on the performance cores for transfer (1.015,
+  1.009), failover (1.013), fast (1.011), steady 64 B copying and batch 64 (1.006, 1.004). Each sits
+  with instructions within 0.06–0.7 % and, in the other scheduling, an interval that includes 1 or is
+  below it (the loop's cycles 1.003 [0.991, 1.015], snapshot's 0.988; failover's time 1.004; fast's 1.005), against
+  layout moves of 1–4 % that inert bytes alone produce in these same loops. Not closed: placing
+  `Raft`'s and `Log`'s fields would need `#[repr(C)]` and a hand order across the member, which no
+  measurement here yet justifies over the compiler's.
+- The lean seen at load 21–27 in the first runs above was mostly cause 1, whose cost grew with the
+  load (the 64 B in-place cell: 1.055 at load 12, 0.98 at load 3–9).
+
+Commands (scratch harnesses outside the workspace; the tree's own binaries):
+`hyper-raft-compare one hyper[-copy] <workload> 3 <batch> <bytes> <rounds> 1000 time` for
+steady (rounds 40,000), transfer (20,000), steady batch 64 (20,000), catch-up (4,000), snapshot
+(4,000), fast (20,000), failover (5,000); `micro <bytes> 400000|200000`; each under `taskpolicy -c
+background` for the performance-core pass.
 
 ## Where hyper-raft does not win, and why
 

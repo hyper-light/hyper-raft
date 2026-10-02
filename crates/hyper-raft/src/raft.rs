@@ -1281,7 +1281,7 @@ impl<S: Storage> Raft<S> {
         self.read_only.clear();
         self.pending_request_snapshot = 0;
         // Only a leader applies before its own write is durable.
-        self.log.unpersisted_after = None;
+        self.log.unpersisted_after = u64::MAX;
         let next = self.log.last_index()?.saturating_add(1);
         let (committed, persisted, id) = (self.log.committed(), self.log.persisted(), self.id);
         for (member, progress) in self.tracker.iter_mut() {
@@ -1529,7 +1529,7 @@ impl<S: Storage> Raft<S> {
         self.leader_tail = last;
         if self.config.apply_unpersisted {
             // Every entry after `last` is of this term (`append_entries`).
-            self.log.unpersisted_after = Some(last);
+            self.log.unpersisted_after = last;
         }
         if let Some(progress) = self.tracker.get_mut(self.id) {
             progress.become_replicate();

@@ -1298,7 +1298,7 @@ fn a_leader_applies_its_own_committed_entries_before_its_write_is_durable() {
         node.advance_issued(ready).unwrap();
         // Not a leader: it waits for its writes again.
         node.step(beat_from(3, 2, 2)).unwrap();
-        assert_eq!(node.raft.log().unpersisted_after, None);
+        assert_eq!(node.raft.log().unpersisted_after, u64::MAX);
     }
 }
 

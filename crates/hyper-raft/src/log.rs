@@ -399,9 +399,12 @@ pub struct Log<S> {
     /// durable (`Config::apply_unpersisted`): the last index before its
     /// term's entries. What is committed after it is given to apply once
     /// everything through it is durable here; the entries through it are of
-    /// earlier terms, which a write still out may replace. None for a member
-    /// that does not lead, or does not apply so.
-    pub(crate) unpersisted_after: Option<u64>,
+    /// earlier terms, which a write still out may replace. `u64::MAX` for a
+    /// member that does not lead, or does not apply so: no index reaches it.
+    /// A plain index rather than an `Option`, so `Log` grows by 8 bytes, not
+    /// 16: the 16 left the leadership-transfer and failover loops 2-5 %
+    /// slower than at `b73e18b` (`docs/benchmarks.md`, R-6).
+    pub(crate) unpersisted_after: u64,
     /// The most entries held that are not yet durable.
     max_unstable: usize,
 }
@@ -425,7 +428,7 @@ impl<S: Storage> Log<S> {
                 issued: last.saturating_add(1),
                 ..Unstable::default()
             },
-            unpersisted_after: None,
+            unpersisted_after: u64::MAX,
             max_unstable,
         })
     }
@@ -781,9 +784,10 @@ impl<S: Storage> Log<S> {
     /// ([`Log::unpersisted_after`]).
     #[inline]
     fn apply_bound(&self) -> u64 {
-        match self.unpersisted_after {
-            Some(tail) if self.persisted >= tail => self.committed,
-            _ => self.committed.min(self.persisted),
+        if self.persisted >= self.unpersisted_after {
+            self.committed
+        } else {
+            self.committed.min(self.persisted)
         }
     }
     /// Whether entries after `since` are committed and durable.
@@ -813,8 +817,7 @@ impl<S: Storage> Log<S> {
     /// is given to apply is read where storage holds it. A leader's own
     /// entries given to apply before they are durable here
     /// ([`Log::unpersisted_after`]) are not in storage yet: the range's tail
-    /// past [`Unstable::entries`]' offset is read where the log holds it
-    /// ([`Log::any_entry`], [`Log::slice`]).
+    /// past [`Unstable::entries`]' offset is read where the log holds it.
     pub fn next_range_since(
         &self,
         since: u64,
@@ -825,6 +828,9 @@ impl<S: Storage> Log<S> {
         let high = self.apply_bound().saturating_add(1);
         if high <= offset {
             return Ok(None);
+        }
+        if high > self.unstable.offset && self.unpersisted_after == u64::MAX {
+            return Err(Error::Invariant("committed entries not yet durable"));
         }
         let mut taken = 0u64;
         let mut bytes = 0u64;
@@ -841,12 +847,15 @@ impl<S: Storage> Log<S> {
             }
             false
         };
-        if high <= self.unstable.offset {
-            self.store.any_entry(offset, high, &mut page)?;
-        } else if self.unpersisted_after.is_some() {
-            self.any_entry(offset, high, &mut page)?;
-        } else {
-            return Err(Error::Invariant("committed entries not yet durable"));
+        // Storage is walked from this one call, not through `Log::any_entry`
+        // as well: a second call site put an in-memory store's walk out of
+        // line behind a `dyn` call an entry, which cost the in-place `Ready`
+        // up to 7 % (`docs/benchmarks.md`, R-6).
+        let stored = high.min(self.unstable.offset);
+        let full = offset < stored && self.store.any_entry(offset, stored, &mut page)?;
+        if !full && high > self.unstable.offset {
+            let from = offset.max(self.unstable.offset);
+            self.unstable.slice(from, high)?.iter().any(page);
         }
         let last = offset
             .checked_add(taken)

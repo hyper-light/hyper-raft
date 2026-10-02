@@ -363,11 +363,12 @@ struct Mark {
     snapshot: Option<u64>,
     /// The term and vote its hard state stated, when it changed them.
     vote: Option<(u64, u64)>,
-    /// The commit its hard state stated, when it gave one: durable with it,
-    /// whatever the term the notice is heard in, for it names only entries
-    /// this write or an earlier one holds, and a committed entry is never
-    /// replaced.
-    commit: Option<u64>,
+    /// The commit its hard state stated, or 0 when it gave none: durable
+    /// with it, whatever the term the notice is heard in, for it names only
+    /// entries this write or an earlier one holds, and a committed entry is
+    /// never replaced. The durable commit only rises
+    /// (`Raft::commit_durable`), so 0 states nothing.
+    commit: u64,
     in_place: bool,
 }
 
@@ -961,7 +962,7 @@ impl<S: Storage> RawNode<S> {
             }
             self.previous_hard = hard;
         }
-        let commit = ready.hard_state.map(|hard| hard.commit);
+        let commit = ready.hard_state.map_or(0, |hard| hard.commit);
         let unstable = &mut self.raft.log.unstable;
         let mark = Mark {
             number: taken.number,
@@ -1022,9 +1023,7 @@ impl<S: Storage> RawNode<S> {
             .take_while(|given| given.mark.number <= number)
         {
             given.stable = stabilize(&mut raft.log, term, durable_vote, &given.mark, &mut kept)?;
-            if let Some(commit) = given.mark.commit {
-                raft.commit_durable(commit);
-            }
+            raft.commit_durable(given.mark.commit);
             in_place = given.mark.in_place;
         }
         if kept.snapshot.is_some() || !kept.entries.is_empty() {

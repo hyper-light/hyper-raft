@@ -1,6 +1,7 @@
 # hyper-durable: the durable shell around the Raft core
 
-> Status (2026-10-01): design, nothing built. Sources and what each establishes are in
+> Status (2026-10-02): design; of the core steps it needs, R-4 is built (§2.1), the shell is not.
+> Sources and what each establishes are in
 > `docs/research/durable.md` ("research §n"). This replaces `docs/raft.md` §4's plan to extract
 > mantle's replica: the shell is designed from all three projects' shells and the literature, then
 > built and measured against each of them (`CLAUDE.md` §1a).
@@ -62,32 +63,60 @@ lower p99 latency from 1,000 to 32,000 writes a second, and etcd's rafttoy 29 % 
 73 % more throughput at saturation (research §3). On hyper-log it also removes mantle's second
 flush under load, since the next frame's persist record confirms the last.
 
-hyper-durable is built on that core, which is a core change, **R-4**, in this order:
+hyper-durable is built on that core, which is a core change, **R-4**. It is in
+(`crates/hyper-raft/src/node.rs`, `src/log.rs`); as built:
 
-- `RawNode::ready` may be called while earlier `Ready`s are out, and `RawNode::advance_issued(ready)`
-  says the `Ready`'s write was issued; `RawNode::on_persist(number)` says every `Ready` through
-  `number` is durable. `advance_append` stays as `advance_issued` followed by `on_persist` of the
-  same number, so every existing caller and the raft-rs differential are unchanged.
-- **The unstable log keeps its entries until they are durable** (etcd's rule, research §3), with a
-  mark for how far a write was issued; a `Ready` gives only entries past that mark. raft-rs instead
-  moves them to storage when the write is issued and needs storage to serve undurable entries; that
-  would make hyper-log's group handle serve writes it has not answered, which it does not do by
-  design (`GroupLog` answers "as of the writes answered"). `ready_in_place` and
-  `advance_append_keeping` keep their zero-copy contract: the entries are given up at `on_persist`.
-- **ABA.** A persist notice moves the durable index only below the first index a later issued write
-  replaces and only where storage holds that term (`Log::maybe_persist`, raft-rs's rule, already in
-  the core), and the issue mark falls back to a conflict's index when a leader's append truncates.
-  etcd's term check on the notice is the second guard and is taken too.
-- A leader counts itself toward a commit only at `on_persist` (thesis §10.2.1: "the leader uses its
-  own match index to indicate the latest entry to have been durably written to its disk"); a
-  follower's acknowledgements, votes and every other message the core marks as answering for a
-  write are attached to the `Ready` that wrote it and released by the shell at its `on_persist`.
+- **The calls.** `RawNode::ready` and `ready_in_place` may be taken while earlier `Ready`s' writes
+  are out, up to `Limits::readies_in_flight` of them (one by default, the owner that finishes each
+  write before it takes the next; the shell sets its store's depth, §6); one more is refused
+  `Capacity` and changes nothing. A `Ready` taken is issued by `RawNode::advance_issued(ready)`:
+  until then the member takes no operation, as before, and `RawNode::to_persist` reads what it
+  gives. `RawNode::on_persist(number)` (and `on_persist_keeping(number, keep)`) says every `Ready`
+  through `number` is durable, in the order issued, and returns what follows (a `LightReady`).
+  `RawNode::in_flight` says how many are out. `advance_append` and `advance_append_keeping` are
+  `advance_issued` and `on_persist` of the same number, so every existing caller and the raft-rs
+  differential are unchanged.
+- **The unstable log keeps its entries until they are durable** (etcd's rule, research §3), with
+  a mark for how far writes were issued (`Unstable::issued`, and whether its snapshot's was); a
+  `Ready` gives only what is past the mark, and a replacement below the mark moves it back. At a
+  notice, what the write vouches for leaves (`Log::take_stable_to`, `Log::take_stable_snapshot`);
+  `ready_in_place` and `on_persist_keeping` keep their zero-copy contract, the entries given up at
+  the notice. An issued write remembers the last entry not yet durable when it was issued: every
+  entry before it was given by it or an earlier one, so all are durable with it.
+- **ABA, both guards.** etcd's: an issued write remembers the term it was issued in, and a notice
+  heard in a later term makes no entry or snapshot durable. Liveness needs nothing more: every change of term
+  is a write of its own (the hard state), whose notice vouches for every entry before it. Then
+  raft-rs's: what a notice names leaves only where the unstable log still holds it past its offset
+  (`Log::take_stable_to`), and the durable index moves only below the first index not durable and
+  where storage holds the term (`Log::maybe_persist`). The directed test
+  (`a_notice_heard_in_a_later_term_makes_nothing_durable`, etcd's five-step schedule) fails with the
+  term guard taken out.
+- **What leaves when** (I1, I2, I7; refined from the plan, which attached answers to the write that
+  made them). Every message of a member that does not lead is a persisted message of the `Ready`
+  that takes it, as before; that write holds, with every earlier one, all the member held when the
+  messages were made. A leader's leave at once only while the term and vote it leads in are durable
+  (new: etcd's rule that no message leaves before the latest hard state is durable; it is reached by
+  a sole voter elected with learners, whose term rides the same `Ready`). What a notice makes (a
+  leader's commit, the fast track's word that a member holds a proposal) leaves with the notice only
+  when the member leads with a durable term and vote, or nothing is out or left unwritten; otherwise
+  it waits in the queue for the next `Ready` and leaves as that one's messages do.
+- **A leader counts itself toward a commit only at the notice** (I3; thesis §10.2.1, as before), and
+  may commit earlier by a majority of followers. It need not have a durable log to be elected: a
+  sole voter is elected while its writes are out (`Raft::become_leader` no longer refuses that).
 
-The gate for R-4 is the raft-rs differential unchanged at depth one (one `Ready` out), and at depth
-`k` a differential against raft-rs's own `advance_append_async`/`on_persist_ready` driven by the
-same schedule; the recorded fast-track seeds of `docs/raft.md` (160,000 schedules from four seeds)
-pass with readies persisted at random lags; the TLA+ model gains an issued-but-not-durable write
-per member and a crash that loses it.
+**The gate as run.** The raft-rs differential unchanged at depth one (every campaign of
+`tests/differential.rs`). At depth `k` raft-rs is no oracle: it moves entries to storage when a
+write is issued and has no term guard, so at the schedules the guard is for it counts durable what
+a write still out will overwrite, and the two cores disagree there by design. Depth `k` is held
+instead to a durability oracle against each member's disk at every step (`tests/pipeline.rs`, §3
+below), over schedules that interleave persistence steps (take and issue, a write durable, a notice)
+with everything else, crashes at every persistence step of a schedule in turn, and the fast-track
+schedules with readies persisted at random lags. The TLA+ model (`docs/models/README.md`) is
+unchanged: its member acts atomically on durable state, and R-4 keeps every output behind the
+durability it depends on (I1, I2, I7), so a run with writes out maps to a run of the model in which a
+member's step happens when the write that carries it is durable, and a crash that loses writes out
+is the model's crash. A pending write as a state of its own is not modelled; adding it recounts every
+configuration's budget in CI.
 
 ### 2.2 One `drive`
 
@@ -159,6 +188,18 @@ Stated over a member's durable state `D` (what a restart would read) at the mome
 
 I1–I3 and I7 are etcd's and raft-rs's contracts (research §3); I5 is focal's F17 (research §4); I8 is
 mantle's.
+
+Where each is kept, as of R-4:
+
+| | Enforced | Tested |
+|---|---|---|
+| I1 | `RawNode::ready_given` (a leader's messages leave at once only with its term and vote durable; every other member's wait for the write); `RawNode::releases_now` for what a notice makes | `tests/support/lagged.rs`, `check_message` and `Lagged::take`, at every write's durability and every release; `a_leader_sends_nothing_at_once_before_its_term_is_durable` |
+| I2 | the same, and the write that takes a message holds everything the member held when it was made | `check_message` (acknowledgements, the fast track's word); `a_followers_answer_waits_for_the_write_that_holds_what_it_says` |
+| I3 | `Raft::on_persist_entries` moves a leader's own progress, reached only from a notice; `Raft::reset` starts it at what is durable | `Cluster::check_durable` (its own entry on its disk; each commit held durably by a majority of each half of its configuration); `readies_are_taken_while_writes_are_out` |
+| I4 | `Log::next_entries_since` and `next_range_since` give only what is committed and durable here | `Lagged::apply`, every entry given to apply |
+| I5, I6, I8 | the shell's (§4; D-1). The schedules' harness keeps I5 at its strictest, recording the commit before it applies, as the synchronous harness always did: without it a 4,000-step schedule (seed 19, `random_interleavings_keep_every_invariant` at three writes out) reproduced §4.1's hole, a sole voter that restarted without its commit reverting to the configuration before changes it had applied, electing itself by it, and leaving a group that cannot elect | — |
+| I7 | `RawNode::on_persist` takes notices in issue order; a `Ready` gives only what no earlier one gave | `Lagged::make_durable`: once a write is durable the disk holds the term, vote and log the member held when it took the `Ready` |
+
 
 ## 4. The commit fence
 
@@ -420,9 +461,10 @@ slates measured a delta format not worth a second recovery path).
 - **slates (X-1).** A `LogStore` over its anchor publication, depth one, `submit` publishing and
   `poll` answering at once; `SavedRaft` carries what the core's `Storage` and `InitialState` read.
   Its groups are re-founded (owner's decision 9).
-- **The core.** R-4 (readies ahead of persistence), R-5 (a lost-entries refusal regresses a
-  member's progress), R-6 (an apply pause; a leader's own-term entries given to apply before its
-  write is durable; the durable commit carried in answers), R-7 (CTRL's leader-side recovery).
+- **The core.** R-4 (readies ahead of persistence; built, §2.1), R-5 (a lost-entries refusal
+  regresses a member's progress), R-6 (an apply pause; a leader's own-term entries given to apply
+  before its write is durable; the durable commit carried in answers, `docs/raft.md` §3), R-7
+  (CTRL's leader-side recovery).
 - **hyper-log.** `GROUP_SUBMISSIONS` from `PIPELINE_FRAMES`; health per group; a damaged frame
   reported as marks through its range for the groups it touched.
 
@@ -491,7 +533,3 @@ and allocates no more on that project's workload.
    be nothing.
 8. **slates' store.** A transition's publication cost at slates' record sizes through the shell,
    against its own path.
-</content>
-</invoke>
-<invoke name="Bash">
-<parameter name="command">cd /private/tmp/claude-501/-Users-adalundhe-Projects-mantle/02c17d90-de60-44b8-a9b1-b42df5c5e5df/scratchpad/dur-notes/src; grep -n "may be lost\|messages may be\|does not assume the network" ongaro.txt | head

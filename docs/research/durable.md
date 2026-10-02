@@ -253,5 +253,3 @@ shared memory before any reply (`retention.rs`). Cost linear in the record, abou
 70 µs at 1,000 entries, 3.1 ms at 50,000 (`docs/wip/BENCHMARKS.md`, 2026-10-01); bounded by the
 thesis's compaction rule; delta publication measured and rejected at its sizes. Durable across a
 daemon crash, not a power loss.
-</content>
-</invoke>

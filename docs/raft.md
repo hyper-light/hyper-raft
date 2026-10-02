@@ -9,6 +9,9 @@
 >
 > The plan and its evidence are mantle's `docs/research/32-shared-transport-and-raft.md` ("note 32").
 > Its §6 records the owner's decisions.
+>
+> Step R-4 is done (2026-10-02): `Ready`s are taken ahead of their persistence (§3,
+> `docs/durable.md` §2.1).
 
 ## 1. What `hyper-raft` is
 
@@ -16,8 +19,11 @@
 clock, no disk and no network:
 - `RawNode::tick` says that time has passed;
 - `RawNode::step` gives it what arrived;
-- one `Ready` at a time says what to persist, send and apply;
-- `advance_append` and `advance_apply_to` report back.
+- a `Ready` says what to persist, send and apply; one is taken at a time, and once its write is
+  issued (`advance_issued`) the member takes operations again and the next may be taken, up to
+  `Limits::readies_in_flight` writes out;
+- `on_persist` says which writes are durable, in the order issued, and `advance_apply_to` how far
+  the application applied; `advance_append` is `advance_issued` and `on_persist` at once.
 
 A `Ready` comes in two forms that decide alike (`tests/differential.rs`, "in place"):
 - `RawNode::ready` copies what it gives, as raft-rs's `Ready` does: the entries to persist and the
@@ -25,8 +31,8 @@ A `Ready` comes in two forms that decide alike (`tests/differential.rs`, "in pla
 - `RawNode::ready_in_place` copies nothing the owner can read where it is. The owner writes the
   snapshot and entries out from `RawNode::to_persist`, applies the range
   `Ready::committed_range` names from its own storage, and keeps the very entries and snapshot
-  the member gives up at `RawNode::advance_append_keeping`. A disk-backed owner copies no entry
-  at all. `docs/benchmarks.md` measures both forms.
+  the member gives up at `RawNode::advance_append_keeping` (or `on_persist_keeping`, once the
+  write is durable). A disk-backed owner copies no entry at all. `docs/benchmarks.md` measures both forms.
 
 A leader's proposals and a follower's appends move into the log uncopied (`Log::append_owned`,
 `Log::append_after_owned`).
@@ -93,10 +99,15 @@ includes the consumers' suites. They run when each consumer takes a snapshot und
 
 The R-numbers are note 32 §2.13's ledger.
 
-The durable shell needs four more core steps, R-4 to R-7: readies given ahead of their persistence,
-an entry-level repair of a member that lost what it acknowledged, an apply pause with a leader's
-own-term entries applied before its own write is durable, and CTRL's leader-side recovery. Their
-design and gates are in `docs/durable.md` §2.1, §4, §5 and §11.
+The durable shell needs four more core steps, R-4 to R-7. Their design and gates are in
+`docs/durable.md` §2.1, §4, §5 and §11.
+
+| Step | What changes | Gate |
+|---|---|---|
+| **R-4** (done, 2026-10-02) | `Ready`s taken ahead of their persistence: `advance_issued`, `on_persist`, `on_persist_keeping`, `Limits::readies_in_flight`; the unstable log keeps its entries until they are durable, with an issue mark; etcd's term guard and raft-rs's `maybe_persist` against ABA; a leader sends at once only while its term and vote are durable; what a notice makes leaves with it only when nothing is out or unwritten (`docs/durable.md` §2.1, where each invariant is kept in §3). | Run: the raft-rs differential unchanged at depth one; the recorded-seed equivalence of the synchronous path; `tests/pipeline.rs` (random interleavings of proposals, ticks, deliveries and persistence steps at depths two and three, held to a durability oracle against each member's disk; a crash at every persistence step of a schedule in turn; the fast-track schedules at random lags); allocation counts identical on every workload; `benches/pipeline.rs` (`docs/benchmarks.md`, "Readies in flight"). raft-rs is no oracle at depth `k` (`docs/durable.md` §2.1). |
+| **R-5** | A lost-entries refusal regresses a member's progress (CTRL's follower repair, `docs/durable.md` §5). | `docs/durable.md` §12. |
+| **R-6** | An apply pause (etcd's `applyingEntsPaused`); a leader's own-term entries given to apply before its own write is durable; and the durable commit carried in answers: `MsgAppendResponse` and `MsgHeartbeatResponse` state the durable commit the shell tells the core (`C_d`, `docs/durable.md` §4.1), not `log.committed()`. The case that needs the last, found in mantle (`1c179e8`, its F17 commit fence): a member commits alone as leader in `advance_append`, then steps down in the same term (check-quorum); its answers then state a commit no write has made durable yet, and a shell's `configuration_known` could count it. R-4 does not carry it: the core is told which writes are durable, not which commit a write stated. | `docs/durable.md` §12; that case as a directed test. |
+| **R-7** | CTRL's leader-side recovery of a marked member's own lost entries (`docs/durable.md` §5). | `docs/durable.md` §12, behind the TLA+ model extended with a marked member. |
 
 **The fast track** stays focal's algorithm, with the safety fix below, until note 32 §3.8's tests
 decide, and no owner enables it until then. The tests:

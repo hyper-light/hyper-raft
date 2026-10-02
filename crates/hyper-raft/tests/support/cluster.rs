@@ -9,7 +9,9 @@ use hyper_raft::proto::{
     MessageType,
 };
 
-use super::{Disk, Output, Replica, Said, Seeded, Settings, Store, View, members, votes};
+use super::{
+    Coverage, Disk, Output, Replica, Said, Seeded, Settings, Step, Store, View, members, votes,
+};
 
 /// The most messages the network holds; the oldest is lost for a new one.
 const NETWORK: usize = 2048;
@@ -42,6 +44,8 @@ pub enum Op {
     Campaign(u64),
     Unreachable(u64, u64),
     Ping(u64),
+    /// A step of the member's persistence ([`Step`]).
+    Persist(u64, Step),
 }
 
 /// What one member did in an operation.
@@ -74,6 +78,9 @@ pub struct Mix {
     pub fast: u64,
     pub lose: u64,
     pub repeat: u64,
+    /// Of a hundred steps, how many are a member's persistence steps
+    /// ([`Step`]); none where every member persists what it takes at once.
+    pub lag: u64,
 }
 impl Mix {
     pub fn everything() -> Self {
@@ -89,6 +96,7 @@ impl Mix {
             fast: 0,
             lose: 8,
             repeat: 5,
+            lag: 0,
         }
     }
 }
@@ -124,6 +132,15 @@ pub struct Cluster<R> {
     /// How many reads were answered.
     pub answered: u64,
     opened: u64,
+    /// For each member that leads, the term and commit last checked
+    /// against what the voters hold durably.
+    checked: BTreeMap<u64, (u64, u64)>,
+    /// For each member that leads, the configuration it had applied when
+    /// last checked: a commit decided before a change applied in the same
+    /// step was counted by it.
+    counted_by: BTreeMap<u64, ConfState>,
+    /// What the persistence steps of members since stopped reached.
+    stopped: Coverage,
 }
 
 impl<R: Replica> Cluster<R> {
@@ -146,6 +163,9 @@ impl<R: Replica> Cluster<R> {
             asked: BTreeMap::new(),
             answered: 0,
             opened: 0,
+            checked: BTreeMap::new(),
+            counted_by: BTreeMap::new(),
+            stopped: Coverage::default(),
         };
         for id in 1..=count {
             let node = cluster.open(id, Store::new(boot.clone()));
@@ -188,6 +208,7 @@ impl<R: Replica> Cluster<R> {
     pub fn stop(&mut self, id: u64) {
         let member = &mut self.members[(id - 1) as usize];
         if let Member::Up(node) = member {
+            self.stopped.add(node.coverage());
             let store = std::mem::take(node.store_mut());
             *member = Member::Down(Box::new(store));
         }
@@ -203,6 +224,19 @@ impl<R: Replica> Cluster<R> {
         };
         let node = self.open(id, *store);
         self.members[(id - 1) as usize] = Member::Up(node);
+    }
+    /// What every member's persistence steps reached, stopped or running.
+    pub fn coverage(&self) -> Coverage {
+        let mut total = self.stopped;
+        for id in self.up() {
+            if let Some(node) = self.peek(id) {
+                let mut running = node.coverage();
+                // A member that runs has lost nothing.
+                running.lost = 0;
+                total.add(running);
+            }
+        }
+        total
     }
     pub fn ids(&self) -> Vec<u64> {
         (1..=self.members.len() as u64).collect()
@@ -398,8 +432,64 @@ impl<R: Replica> Cluster<R> {
                 }
                 reports.push(self.report(*id, None));
             }
+            Op::Persist(id, step) => {
+                let accepted = self.node(*id).map(|node| node.persist(*step));
+                reports.push(self.report(*id, accepted));
+            }
+        }
+        if R::LAGGED {
+            self.check_durable();
         }
         reports
+    }
+
+    /// The durability oracle for what a leader decides (`docs/durable.md`
+    /// §3): it counts itself only for what its own disk holds (I3), and what
+    /// it commits a majority of each half of its configuration holds
+    /// durably, in its log or, by the fast track, beside it.
+    fn check_durable(&mut self) {
+        for id in self.up() {
+            let Some(led) = self.peek(id).and_then(Replica::led) else {
+                continue;
+            };
+            if let Some(own) = &led.own {
+                assert!(
+                    holds(self.disk(id), own),
+                    "seed {}: leader {id} counted itself for {} before its disk held it",
+                    self.seed,
+                    own.index
+                );
+            }
+            let Some(committed) = &led.committed else {
+                continue;
+            };
+            let conf = self.disk(id).conf.clone();
+            let before = self.counted_by.insert(id, conf.clone());
+            let last = self.checked.insert(id, (led.term, committed.index));
+            // What it knew committed when it was elected it did not decide,
+            // and a commit it has not moved since was checked.
+            if last.is_none_or(|(term, index)| term != led.term || index == committed.index) {
+                continue;
+            }
+            let held = |conf: &ConfState| {
+                [&conf.voters, &conf.voters_outgoing].iter().all(|half| {
+                    half.is_empty()
+                        || half
+                            .iter()
+                            .filter(|voter| holds(self.disk(**voter), committed))
+                            .count()
+                            * 2
+                            > half.len()
+                })
+            };
+            assert!(
+                held(&conf) || before.as_ref().is_some_and(held),
+                "seed {}: leader {id} of term {} committed {} that no majority of {conf:?} or {before:?} holds durably",
+                self.seed,
+                led.term,
+                committed.index
+            );
+        }
     }
 
     fn change(&self, rng: &mut Seeded, leader: u64, mix: &Mix) -> ConfChangeV2 {
@@ -485,6 +575,23 @@ impl<R: Replica> Cluster<R> {
             }
         };
         for _ in 0..16 {
+            // Drawn only where members persist in steps: a schedule of
+            // members that do not draws as it always did.
+            if mix.lag > 0 && !up.is_empty() && rng.chance(mix.lag) {
+                let step = match rng.below(3) {
+                    0 => Step::Take,
+                    1 => Step::Durable,
+                    _ => Step::Notify,
+                };
+                // A member with something to persist, where one has.
+                let busy: Vec<u64> = up
+                    .iter()
+                    .copied()
+                    .filter(|id| self.peek(*id).is_some_and(Replica::busy))
+                    .collect();
+                let member = rng.pick(&busy).unwrap_or_else(|| any(rng));
+                return Op::Persist(member, step);
+            }
             let drawn = rng.below(100);
             match drawn {
                 0..=49 if !self.net.is_empty() => {
@@ -584,6 +691,13 @@ impl<R: Replica> Cluster<R> {
                     keep: false,
                     lose: false,
                 });
+                if R::LAGGED && self.net.is_empty() {
+                    // What the members took is persisted and heard of, and
+                    // what that sends is delivered in turn.
+                    for id in self.up() {
+                        self.act(&Op::Persist(id, Step::Flush));
+                    }
+                }
             }
             // A proposal taken by a leader that was deposed before it
             // committed may be gone with its term: it is proposed again to
@@ -625,6 +739,9 @@ impl<R: Replica> Cluster<R> {
             }
             for id in self.ids() {
                 self.act(&Op::Tick(id));
+                if R::LAGGED {
+                    self.act(&Op::Persist(id, Step::Flush));
+                }
             }
         }
         for id in self.ids() {
@@ -634,4 +751,20 @@ impl<R: Replica> Cluster<R> {
         }
         false
     }
+}
+
+/// Whether `disk` holds `entry` durably: in its log, beside it as a
+/// proposal it approved (the fast track), or under its snapshot.
+pub fn holds(disk: &Disk, entry: &hyper_raft::proto::Entry) -> bool {
+    let same = |held: &hyper_raft::proto::Entry| {
+        held.entry_type == entry.entry_type && held.data == entry.data
+    };
+    entry.index <= disk.snapshot_index()
+        || (entry.index >= disk.first_index()
+            && entry.index <= disk.last_index()
+            && same(&disk.entries[(entry.index - disk.first_index()) as usize]))
+        || disk
+            .proposals
+            .iter()
+            .any(|held| held.index == entry.index && same(held))
 }

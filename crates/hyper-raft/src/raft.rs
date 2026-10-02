@@ -53,6 +53,12 @@ pub struct Limits {
     pub fast_window: u64,
     /// The bytes of what a leader was told the voters hold.
     pub vote_bytes: usize,
+    /// `Ready`s whose writes are out and not yet known durable
+    /// ([`crate::RawNode::advance_issued`]). One is an owner that finishes
+    /// each write before it takes the next. An owner over a pipelined store
+    /// sets the store's depth: hyper-durable sets `LogStore::depth`, which
+    /// for hyper-log is its pipeline frames (`docs/durable.md` §6).
+    pub readies_in_flight: usize,
 }
 /// focal's bounds, carried unchanged. They are literals, not derivations
 /// (mantle note 32 §2.10); `Limits::derive` replaces them in R-3
@@ -68,6 +74,7 @@ impl Default for Limits {
             proposal_bytes: 8 * 1024 * 1024 - 64 * 1024,
             fast_window: 256,
             vote_bytes: 64 * 1024 * 1024,
+            readies_in_flight: 1,
         }
     }
 }
@@ -256,6 +263,7 @@ impl Config {
             || self.limits.proposal_bytes == 0
             || self.limits.fast_window == 0
             || self.limits.vote_bytes == 0
+            || self.limits.readies_in_flight == 0
         {
             return Err(Error::Settings("a bound that admits nothing"));
         }
@@ -1477,12 +1485,11 @@ impl<S: Storage> Raft<S> {
         self.reset(term)?;
         self.leader_id = self.id;
         self.state = StateRole::Leader;
+        // Its log need not be durable yet: a member that is the one voter
+        // is elected before its writes are (`docs/durable.md` §2.1). It
+        // counts itself by what is durable (`reset`), and that moves only as
+        // its writes become durable (I3, `Raft::on_persist_entries`).
         let last = self.log.last_index()?;
-        // A candidate's log is durable before it asks for votes and does
-        // not change while it asks.
-        if last != self.log.persisted() {
-            return Err(Error::Invariant("a leader whose log is not durable"));
-        }
         self.uncommitted_bytes = 0;
         self.leader_tail = last;
         if let Some(progress) = self.tracker.get_mut(self.id) {

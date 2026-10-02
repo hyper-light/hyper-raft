@@ -33,6 +33,13 @@ An owner that writes its log out and keeps its own copy of what it wrote drives 
 `RawNode::advance_append_keeping`. Nothing is copied, and the member decides exactly as it does
 under `RawNode::ready`.
 
+An owner whose store takes several writes at once takes `Ready`s ahead of their persistence
+(`docs/durable.md` §2.1): it issues each `Ready`'s write (`RawNode::advance_issued`), the member
+takes operations again, and the store's answers come back in order (`RawNode::on_persist`, or
+`on_persist_keeping` for entries written in place), up to `Limits::readies_in_flight` writes out.
+A message that waits for a write is a `Ready`'s persisted message, and the owner sends it once that
+write and every earlier one are durable.
+
 ## Rules
 
 - Nothing unwinds. `Error` says whether an operation was refused and changed nothing,
@@ -49,7 +56,9 @@ under `RawNode::ready`.
 | `tests/differential.rs` | this core and `raft-rs` on one schedule, compared after every step, with `Ready`s copied and given in place |
 | `tests/group.rs` | groups of this core, and of both cores together, under schedules: safe whatever the schedule, and settled once the network is whole; the decisions of focal 27 §4.5 |
 | `tests/fast.rs` | the fast track: committed by the fast quorum, taken again by the leader that follows, and groups that propose by it under schedules |
+| `tests/pipeline.rs` | members that take `Ready`s ahead of their persistence, under schedules that interleave persistence with everything else and crash at every persistence step: held at every step to what their disks hold (`docs/durable.md` §3) |
 | `benches/replicate.rs` | what replication costs with either core |
+| `benches/pipeline.rs` | readies in flight against one at a time, on simulated devices and a simulated network |
 
 The fast track's TLA+ model is still in focal (`docs/models/FastTrack.tla`). It moves here
 with the fast-track decision (`docs/raft.md`).

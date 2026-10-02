@@ -381,6 +381,80 @@ per op, median [min–max]):
 
 Every range overlaps its pair's; no difference is claimed.
 
+## Readies in flight (R-4)
+
+Core step R-4 (`docs/durable.md` §2.1) lets a member take `Ready`s while earlier writes are out.
+Measured on 2026-10-02 on the machine above, against `main` at `9aafcd9` built the same way.
+
+**The synchronous path did not move.** An owner that finishes each write before it takes the next
+(`advance_append`, every row of the tables above) runs a path of its own that passes through no
+queue.
+
+- Allocations, reallocations and bytes asked for, by the core and by the whole loop: identical on
+  every workload of the table at three and five voters, in place and copying (36 counting runs,
+  `hyper-raft-compare one <core> <workload> ... 1000 count`, before and after; 11.0 allocations per
+  entry at batch 1 in place, 23.0 copying, as before).
+- Time per op, `main` and R-4 interleaved run by run in fresh processes, the order alternated, at
+  load 7.3–11 (01:18–01:19 PDT); median [least–most], nanoseconds:
+
+  | Workload | Core | `main` | R-4 | ratio |
+  |---|---|---|---|---|
+  | steady batch 1, 64 B (30 runs) | in place | 1,041 [946–1,771] | 1,059 [983–1,712] | 1.02 |
+  | | copying | 1,261 [1,203–2,363] | 1,288 [1,201–1,422] | 1.02 |
+  | steady batch 1, 4 KiB (30 runs, twice) | in place | 1,369 [1,324–1,461]; 1,385 [1,329–1,599] | 1,392 [1,357–1,596]; 1,438 [1,355–1,662] | 1.02; 1.04 |
+  | | copying | 2,539 [2,269–3,298] | 2,537 [2,314–2,912] | 1.00 |
+  | transfer (30 runs) | in place | 2,848 [2,622–3,362] | 2,866 [2,641–3,396] | 1.01 |
+  | | copying | 3,221 [3,007–3,544] | 3,276 [3,023–3,975] | 1.02 |
+  | steady batch 64, 64 B (10 runs) | in place | 88 [85–93] | 90 [86–98] | 1.02 |
+  | catchup, per entry (10 runs) | in place | 22 [19–25] | 22 [20–26] | 1.00 |
+  | snapshot (10 runs) | in place | 3,444 [2,913–5,907] | 3,103 [2,856–4,012] | 0.90 |
+  | fast (10 runs) | in place | 2,230 [2,004–2,515] | 2,224 [2,047–2,816] | 1.00 |
+
+  Every ratio is inside the two cores' ranges. The first build of R-4 was 15 % slower on steady
+  batch 1 (1,168 ns against 1,017) with the same allocations. A loop of one voter's proposal,
+  `Ready` in place and `advance_append_keeping`, built with LTO against both trees (the best of five
+  passes of 400,000 proposals), put it at 115 ns a proposal against 89, and `sample` attributed the
+  difference to the record of each write being built, moved into the queue and out again. The
+  synchronous path now passes through no queue and records nothing it does not need: 93.6 ns against
+  92.8 at load 8–10.
+
+**What readies in flight buy** (`cargo bench -p hyper-raft --bench pipeline`, `benches/pipeline.rs`).
+Three voters; each device flushes one batch at a time and takes into it every write submitted before
+the flush began (group commit); the network delivers each message a fixed one-way time later;
+closed-loop clients propose 64-byte entries at the leader and again once theirs is applied there.
+Time is simulated in microseconds from this machine's measurements: a flush is 4,330 µs (mantle's
+p50 for an append that waits one `F_FULLFSYNC` on APFS, `docs/measurements/2026-09-29-log-confirmation.md`
+there) and a one-way trip 198 µs (half the 395 µs loopback round trip of hyper-transport, "An
+answer is charged with what arrives"). A write that asks for no flush (a commit alone) is answered
+with the writes before it. Two devices: **flush**, where a flush answers what it holds; and
+**confirmed**, hyper-log's, where a frame is answered once a later flush has written its persist
+record and a frame nothing follows is confirmed by a flush of its own. 20,000 entries a cell; wall
+time the better of three, at load 7.3–8.4 (01:19 PDT):
+
+| device | clients | depth 1: p50 µs, entries/s, flushes/entry | depth 2 | depth 3 |
+|---|---|---|---|---|
+| flush | 1 | 4,726, 212, 3.00 | 4,726, 212, 3.00 | 4,726, 212, 3.00 |
+| flush | 4 | 12,990, 308, 2.25 | 12,990, 308, 2.25 | 12,990, 346, 2.00 |
+| flush | 16 | 12,990, 1,231, 0.563 | 12,990, 1,231, 0.563 | 12,990, 1,259, 0.550 |
+| flush | 64 | 12,990, 4,902, 0.141 | 12,990, 4,907, 0.141 | 12,990, 4,939, 0.140 |
+| confirmed | 1 | 9,056, 110, 6.00 | 9,056, 110, 6.00 | 9,056, 110, 6.00 |
+| confirmed | 4 | 25,980, 154, 4.50 | 21,650, 188, 3.69 | 17,320, 231, 3.00 |
+| confirmed | 16 | 25,980, 615, 1.125 | 21,650, 707, 0.980 | 17,320, 923, 0.750 |
+| confirmed | 64 | 25,980, 2,451, 0.282 | 21,650, 2,780, 0.249 | 17,320, 3,671, 0.188 |
+
+- On a device whose flush answers its own writes, depth buys almost nothing: the device is serial
+  and group commit already batches what arrives during a flush, depth one or three (at most +12 %
+  entries a second, at four clients).
+- On hyper-log's confirmed device it is what the design said (`docs/durable.md` §2.1): at depth one a
+  write is answered only after a second flush confirms it, so the next write waits two flushes; at
+  depth three the next write's flush confirms the last. Under load p50 falls by a third (25,980 to
+  17,320 µs), throughput rises by half (2,451 to 3,671 entries a second at 64 clients) and flushes
+  per entry fall by a third. One client sees no change: nothing follows its write, so a flush of its
+  own confirms it (6.0 flushes per entry, 9,056 µs, mantle's two-flush 8.65 ms), the idle
+  confirmation of `docs/durable.md` §14.6.
+- The core's CPU per committed entry, with the harness, is the same at every depth: 1,190 to
+  2,110 ns, unordered by depth.
+
 ## Where hyper-raft does not win, and why
 
 hyper-raft in place allocates less than every other core in every row. It is faster than raft-rs
@@ -568,6 +642,10 @@ $B one hyper steady 3 1 64 20000 1000 count
 
 # The recorded-seed equivalence (from the repository root).
 HYPER_RAFT_SEEDS=1000 HYPER_RAFT_SEED=1000 cargo test -p hyper-raft --release -- --test-threads=4 --nocapture
+
+# Readies in flight (R-4): the schedules, the crash at every persistence step, and the bench.
+HYPER_RAFT_SEEDS=1000 HYPER_RAFT_STEPS=4000 HYPER_RAFT_CRASH_SEEDS=40 cargo test -p hyper-raft --release --test pipeline -- --nocapture
+cargo bench -p hyper-raft --bench pipeline
 
 # The end-to-end scenarios, and every gate.
 cargo test -p hyper-raft-e2e --test cluster

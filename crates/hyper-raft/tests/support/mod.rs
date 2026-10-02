@@ -337,6 +337,30 @@ impl hyper_raft::Storage for Store {
     }
 }
 
+/// What a leader decided: the entry at its commit, and the entry through
+/// which it counts itself as holding its log.
+#[derive(Clone, Debug)]
+pub struct Led {
+    pub term: u64,
+    pub committed: Option<Entry>,
+    pub own: Option<Entry>,
+}
+
+/// A member's persistence, one step at a time ([`Lagged`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Step {
+    /// The member takes a `Ready`, sends what may leave at once, and
+    /// issues its write.
+    Take,
+    /// The oldest write out is durable on the member's disk.
+    Durable,
+    /// The member's owner hears of the writes durable since it last did:
+    /// it sends what waited for them and tells the core.
+    Notify,
+    /// Every step until nothing is left to take, write or hear.
+    Flush,
+}
+
 /// What the application is: a digest of what it applied, in order.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct App {
@@ -379,7 +403,7 @@ impl App {
 }
 
 pub type Said = (u64, u64, EntryType, Vec<u8>);
-fn said(entry: &Entry) -> Said {
+pub fn said(entry: &Entry) -> Said {
     (
         entry.index,
         entry.term,
@@ -459,6 +483,9 @@ pub struct Settings {
     /// persisting their entries and applying what is committed where they
     /// are, rather than by `RawNode::ready`'s copies.
     pub in_place: bool,
+    /// `Ready`s a member driven ahead of its persistence ([`Lagged`]) has
+    /// out at once (`Limits::readies_in_flight`); the others have one.
+    pub depth: usize,
 }
 impl Settings {
     /// As focal's shell sets a group.
@@ -478,6 +505,7 @@ impl Settings {
             bare_answers: true,
             fast: false,
             in_place: false,
+            depth: 1,
         }
     }
     /// As focal runs this core.
@@ -502,6 +530,10 @@ impl Settings {
 }
 
 pub trait Replica: Sized {
+    /// Whether the member takes its `Ready`s ahead of their persistence,
+    /// as the schedule's persistence steps say ([`Lagged`]); the others
+    /// persist each `Ready` as they take it.
+    const LAGGED: bool = false;
     fn open(id: u64, store: Store, settings: &Settings, seed: u64) -> Self;
     fn id(&self) -> u64;
     fn store(&self) -> &Store;
@@ -526,6 +558,24 @@ pub trait Replica: Sized {
     fn set_window(&mut self, _member: u64, _bytes: u64) {}
     fn set_timeout(&mut self, ticks: usize);
     fn drain(&mut self) -> Output;
+    /// A persistence step ([`Step`]); true when it did something.
+    fn persist(&mut self, _step: Step) -> bool {
+        false
+    }
+    /// Whether a persistence step has something to do.
+    fn busy(&self) -> bool {
+        false
+    }
+    /// What the member's persistence steps reached; the writes out count
+    /// as lost, for they are when it stops.
+    fn coverage(&self) -> Coverage {
+        Coverage::default()
+    }
+    /// What a member that leads decided, for the durability oracle
+    /// (`Cluster::check_durable`); none for one that does not lead.
+    fn led(&self) -> Option<Led> {
+        None
+    }
     fn view(&self) -> View;
     fn app(&self) -> App;
     /// Everything applied becomes the snapshot. False when there is
@@ -897,32 +947,63 @@ pub struct New {
 }
 impl New {
     fn apply(&mut self, entries: Vec<Entry>, output: &mut Output) {
-        for entry in entries {
-            output.committed.push(said(&entry));
-            self.app.apply(&entry);
-            let Some(change) = change_of(&entry) else {
-                continue;
-            };
-            let led = self.raw.raft.state() == hyper_raft::StateRole::Leader;
-            let applied = match change {
-                Ok(change) => self.raw.apply_conf_change(&change),
-                Err(change) => self.raw.apply_conf_change_v1(&change),
-            };
-            match applied {
-                Ok(conf) => {
-                    if led && !votes(&conf, self.raw.raft.id()) {
-                        output.leader_left = true;
-                    }
-                    self.raw.store_mut().0.conf = conf.clone();
-                    output.confs.push(conf);
+        apply_to(&mut self.raw, &mut self.app, entries, output);
+    }
+}
+/// What this core gave to apply is applied: the application takes each
+/// entry, and the core each change.
+fn apply_to(
+    raw: &mut hyper_raft::RawNode<Store>,
+    app: &mut App,
+    entries: Vec<Entry>,
+    output: &mut Output,
+) {
+    for entry in entries {
+        output.committed.push(said(&entry));
+        app.apply(&entry);
+        let Some(change) = change_of(&entry) else {
+            continue;
+        };
+        let led = raw.raft.state() == hyper_raft::StateRole::Leader;
+        let applied = match change {
+            Ok(change) => raw.apply_conf_change(&change),
+            Err(change) => raw.apply_conf_change_v1(&change),
+        };
+        match applied {
+            Ok(conf) => {
+                if led && !votes(&conf, raw.raft.id()) {
+                    output.leader_left = true;
                 }
-                Err(error) => {
-                    assert!(!error.is_fatal(), "applying a change: {error}");
-                    output.refused.push(entry.index);
-                }
+                raw.store_mut().0.conf = conf.clone();
+                output.confs.push(conf);
+            }
+            Err(error) => {
+                assert!(!error.is_fatal(), "applying a change: {error}");
+                output.refused.push(entry.index);
             }
         }
     }
+}
+/// What a `Ready` gives to apply: its copies, or, given in place, the range
+/// read from storage.
+fn committed_of(
+    raw: &hyper_raft::RawNode<Store>,
+    in_place: bool,
+    copies: Vec<Entry>,
+    range: Option<(u64, u64)>,
+) -> Vec<Entry> {
+    let Some((first, last)) = range else {
+        return copies;
+    };
+    assert!(
+        copies.is_empty(),
+        "a ready in place copied what it gives to apply"
+    );
+    assert!(in_place, "a range given to apply by a ready that copies");
+    let disk = &raw.store().0;
+    (first..=last)
+        .map(|index| disk.entries[(index - disk.first_index()) as usize].clone())
+        .collect()
 }
 fn heard<T>(outcome: hyper_raft::Result<T>) -> Option<T> {
     match outcome {
@@ -937,21 +1018,7 @@ impl New {
     /// What a `Ready` gives to apply: its copies, or, given in place, the
     /// range read from storage.
     fn committed(&self, copies: Vec<Entry>, range: Option<(u64, u64)>) -> Vec<Entry> {
-        let Some((first, last)) = range else {
-            return copies;
-        };
-        assert!(
-            copies.is_empty(),
-            "a ready in place copied what it gives to apply"
-        );
-        assert!(
-            self.in_place,
-            "a range given to apply by a ready that copies"
-        );
-        let disk = &self.raw.store().0;
-        (first..=last)
-            .map(|index| disk.entries[(index - disk.first_index()) as usize].clone())
-            .collect()
+        committed_of(&self.raw, self.in_place, copies, range)
     }
     pub fn fast_stats(&self) -> hyper_raft::FastStats {
         self.raw.raft.fast_stats()
@@ -1002,6 +1069,10 @@ impl Replica for New {
             },
             fast: settings.fast,
             seed,
+            limits: hyper_raft::Limits {
+                readies_in_flight: settings.depth,
+                ..hyper_raft::Limits::default()
+            },
             ..hyper_raft::Config::new(id)
         };
         let raw = hyper_raft::RawNode::new(&config, store).expect("hyper-raft opens");
@@ -1162,60 +1233,64 @@ impl Replica for New {
         output
     }
     fn view(&self) -> View {
-        // What the member counts is what it holds, after every operation.
-        self.raw
-            .check_accounting()
-            .expect("the member's accounting adds up");
-        let raft = &self.raw.raft;
-        let members = raft
-            .tracker()
-            .iter()
-            .map(|(member, progress)| {
-                (
-                    member,
-                    progress.matched,
-                    progress.next_index,
-                    match progress.state {
-                        hyper_raft::progress::ProgressState::Probe => 0,
-                        hyper_raft::progress::ProgressState::Replicate => 1,
-                        hyper_raft::progress::ProgressState::Snapshot => 2,
-                    },
-                    progress.paused,
-                    progress.pending_snapshot,
-                    progress.pending_request_snapshot,
-                    progress.recent_active,
-                    progress.inflights.count(),
-                    progress.committed_index,
-                )
-            })
-            .collect();
-        View {
-            term: raft.term(),
-            vote: raft.vote(),
-            commit: raft.log().committed(),
-            leader: raft.leader_id(),
-            role: role(match raft.state() {
-                hyper_raft::StateRole::Follower => 0,
-                hyper_raft::StateRole::Candidate => 1,
-                hyper_raft::StateRole::Leader => 2,
-                hyper_raft::StateRole::PreCandidate => 3,
-            }),
-            last_index: raft.log().last_index().expect("a last index"),
-            persisted: raft.log().persisted(),
-            applied: raft.log().applied(),
-            timeout: raft.randomized_election_timeout(),
-            elapsed: raft.election_elapsed(),
-            pending_conf: raft.pending_conf_index(),
-            transferee: raft.lead_transferee(),
-            promotable: raft.promotable(),
-            uncommitted: raft.uncommitted_bytes(),
-            pending_reads: raft.pending_read_count(),
-            app: self.app,
-            members,
-        }
+        view_of(&self.raw, self.app)
     }
     fn app(&self) -> App {
         self.app
+    }
+}
+
+/// What a member of this core is.
+fn view_of(raw: &hyper_raft::RawNode<Store>, app: App) -> View {
+    // What the member counts is what it holds, after every operation.
+    raw.check_accounting()
+        .expect("the member's accounting adds up");
+    let raft = &raw.raft;
+    let members = raft
+        .tracker()
+        .iter()
+        .map(|(member, progress)| {
+            (
+                member,
+                progress.matched,
+                progress.next_index,
+                match progress.state {
+                    hyper_raft::progress::ProgressState::Probe => 0,
+                    hyper_raft::progress::ProgressState::Replicate => 1,
+                    hyper_raft::progress::ProgressState::Snapshot => 2,
+                },
+                progress.paused,
+                progress.pending_snapshot,
+                progress.pending_request_snapshot,
+                progress.recent_active,
+                progress.inflights.count(),
+                progress.committed_index,
+            )
+        })
+        .collect();
+    View {
+        term: raft.term(),
+        vote: raft.vote(),
+        commit: raft.log().committed(),
+        leader: raft.leader_id(),
+        role: role(match raft.state() {
+            hyper_raft::StateRole::Follower => 0,
+            hyper_raft::StateRole::Candidate => 1,
+            hyper_raft::StateRole::Leader => 2,
+            hyper_raft::StateRole::PreCandidate => 3,
+        }),
+        last_index: raft.log().last_index().expect("a last index"),
+        persisted: raft.log().persisted(),
+        applied: raft.log().applied(),
+        timeout: raft.randomized_election_timeout(),
+        elapsed: raft.election_elapsed(),
+        pending_conf: raft.pending_conf_index(),
+        transferee: raft.lead_transferee(),
+        promotable: raft.promotable(),
+        uncommitted: raft.uncommitted_bytes(),
+        pending_reads: raft.pending_read_count(),
+        app,
+        members,
     }
 }
 
@@ -1309,5 +1384,8 @@ impl Replica for Either {
 }
 
 pub mod cluster;
+pub mod lagged;
 #[allow(unused_imports)]
 pub use cluster::{Cluster, Mix, Op, Report};
+#[allow(unused_imports)]
+pub use lagged::{Coverage, Lagged};

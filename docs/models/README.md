@@ -47,6 +47,15 @@ What the model leaves out, and why it is sound to:
 - **Messages** are not modelled one by one: what was said stays said and may be acted on at any
   later time or never, which is every order, delay, repetition and loss.
 - **A crash** is a member that does nothing for a while; what is durable is all a member has.
+- **Readies ahead of their persistence** (core step R-4, `docs/durable.md` §2.1). A member of the
+  model acts on durable state and its action is durable at once; the core may hold state that is not
+  durable yet and decide on it. It never lets an output depend on that state before it is durable:
+  a member that does not lead sends nothing before the write holding everything it held when it made
+  the message is durable, a leader sends at once only while its term and vote are durable and counts
+  itself only for what its own writes made durable, and writes are durable in the order issued (I1
+  to I3 and I7). So a run of the core with writes out maps to a run of the model in which each
+  member's step happens when the write that carries it is durable, and a crash that loses the writes
+  out is the model's crash. No action changes; the pending write is not a state of the model.
 - **Pre-vote, check-quorum, priority and leader transfer** only refuse or bring forward a
   campaign, which the model may take at any time. **Learners** do not vote and are not counted.
   **ReadIndex** commits nothing. **A snapshot** stands for a committed prefix of a log.

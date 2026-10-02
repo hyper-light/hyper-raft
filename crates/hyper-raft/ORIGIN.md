@@ -347,3 +347,46 @@ production; the format is `docs/raft.md` §3.1, written and read by `src/wire.rs
   round-tripped, every truncation, one-byte extension and single-bit flip of every record refused,
   counts past the bytes refused with a valid checksum, and 140,000 arbitrary bodies under valid
   checksums decoded without a panic.
+
+## R-4: readies ahead of their persistence
+
+Not a port: this repository's change, the first of the core steps the durable shell needs
+(`docs/durable.md` §2.1, which states the design as built; `docs/raft.md` §3).
+
+- **The calls** (`src/node.rs`): `RawNode::advance_issued`, `on_persist`, `on_persist_keeping` and
+  `in_flight`; `Limits::readies_in_flight` (one by default) bounds the writes out, and a `Ready`
+  beyond it is refused `Capacity`. `advance_append` and `advance_append_keeping` are the two at once
+  and take a path of their own that passes through no queue. `outstanding` says a `Ready` is taken or
+  a write is out.
+- **The log** (`src/log.rs`): the unstable part keeps its entries until a notice says they are
+  durable, with an issue mark (`Unstable::issued`, `snapshot_issued`, `unissued`,
+  `unissued_snapshot`, `has_unissued`); `Log::take_stable_to` and `take_stable_snapshot` replace
+  `take_stable_entries`, `stable_entries` and `stable_snapshot`, and refuse nothing: what a notice
+  names that is no longer held is not made durable.
+- **The fast track** (`src/fast.rs`): what a member approved by itself is given to one write
+  (`Proposals::issue`, `unissued`, `has_unissued` in place of `unstable` and `has_unstable`).
+- **A leader** (`src/raft.rs`): `Raft::become_leader` no longer refuses a log that is not durable,
+  for a sole voter is elected while its writes are out; it counts itself by what is durable, as
+  before.
+- **What leaves when**: a leader's messages leave at once only while its term and vote are durable
+  (before, a leader's always did; the raft-rs differential merges the two lists, and the case is a
+  sole voter elected with learners); what a notice makes leaves with it only when nothing is out or
+  unwritten.
+- **Tests**: the unit tests of the calls, the ABA schedule (fails with the term guard taken out), the
+  answers held for the write that holds what they say, a sole voter's term held before it sends;
+  `tests/pipeline.rs` over `tests/support/lagged.rs` (a member whose persistence is three steps of
+  the schedule) and the durability oracle of `Cluster::check_durable`. Recorded on 2026-10-02:
+  1,000 schedules of 4,000 steps at each of three settings (three writes out, focal's at two in
+  place, focal's at three with a window of two and one-entry messages) and twice 1,000 fast-track
+  schedules: 72,670, 73,180 and 62,069 entries committed, 97,483, 64,903 and 158,208 `Ready`s taken
+  behind another, 36,864, 31,263 and 72,679 notices of several writes, 8,305, 6,301 and 7,899 writes
+  lost at crashes; 1,690 crashes, one at each persistence step of 40 schedules in turn. The harness's
+  `Cluster::settles` drives a lagged member's writes and changes nothing a synchronous member does
+  (the recorded-seed equivalence).
+- **Equivalence of the synchronous path**: `HYPER_RAFT_SEEDS=300 HYPER_RAFT_SEED=1000 cargo test -p
+  hyper-raft --release --test differential --test group --test fast -- --nocapture` prints the same
+  coverage on `main` and here, every campaign and count, but one line: the group of both cores
+  (`a_group_of_both_cores_is_safe_and_settles`) differs between two runs of `main` itself, since
+  raft-rs draws its election timeouts from the thread.
+- **Measured**: allocations identical on every workload, time within the noise
+  (`docs/benchmarks.md`, "Readies in flight").

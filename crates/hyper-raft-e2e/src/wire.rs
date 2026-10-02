@@ -71,26 +71,26 @@ pub fn begin(buffer: &mut Vec<u8>, kind: Kind) {
     buffer.push(kind.byte());
 }
 
-/// The most bytes `socket` sends in one datagram. The OS may cap a datagram below what UDP can
-/// say — macOS at `net.inet.udp.maxdgram`, 9,216 bytes by default (udp(4)) — and refuses a send
-/// past the cap, so the cap is found by sending to the socket itself: a binary search between
-/// nothing and [`MAX_DATAGRAM`], at most ⌈log2 MAX_DATAGRAM⌉ = 16 sends. Nothing waits for them
-/// to arrive; each is of a kind no datagram has, and is read back out before the socket serves.
+/// The most bytes a socket bound like `socket` sends in one datagram. The OS may cap a datagram
+/// below what UDP can say — macOS at `net.inet.udp.maxdgram`, 9,216 bytes by default (udp(4)) —
+/// and refuses a send past the cap. The cap is a property of a new socket's defaults on the
+/// address, not of what `socket` holds, so it is found on a probe socket of its own bound to the
+/// same address, sending to itself: a binary search between nothing and [`MAX_DATAGRAM`], at most
+/// ⌈log2 MAX_DATAGRAM⌉ = 16 sends. `socket` itself sends and receives nothing, so nothing a peer
+/// sends it queues behind a probe.
 pub fn largest(socket: &UdpSocket) -> io::Result<usize> {
-    let mut to = socket.local_addr()?;
-    if to.ip().is_unspecified() {
-        to.set_ip(match to.ip() {
+    let mut at = socket.local_addr()?;
+    if at.ip().is_unspecified() {
+        at.set_ip(match at.ip() {
             IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::LOCALHOST),
             IpAddr::V6(_) => IpAddr::V6(Ipv6Addr::LOCALHOST),
         });
     }
-    // Zeros but for a kind no datagram has.
-    let mut buffer = vec![0u8; MAX_DATAGRAM];
-    if let Some(kind) = buffer.get_mut(HEADER.saturating_sub(1)) {
-        *kind = u8::MAX;
-    }
+    at.set_port(0);
+    let probe = UdpSocket::bind(at)?;
+    let to = probe.local_addr()?;
+    let buffer = vec![0u8; MAX_DATAGRAM];
     let (mut low, mut high) = (0usize, MAX_DATAGRAM);
-    let mut sent = 0usize;
     while low < high {
         let size = high
             .checked_sub(low)
@@ -100,43 +100,14 @@ pub fn largest(socket: &UdpSocket) -> io::Result<usize> {
             .unwrap_or(high);
         let went = buffer
             .get(..size)
-            .is_some_and(|datagram| socket.send_to(datagram, to).is_ok());
+            .is_some_and(|datagram| probe.send_to(datagram, to).is_ok());
         if went {
             low = size;
-            sent = sent.saturating_add(1);
         } else {
             high = size.saturating_sub(1);
         }
     }
-    drain(socket, sent, &mut buffer)?;
     Ok(low)
-}
-
-/// Takes the `sent` probes back out of `socket`, which would otherwise sit ahead of what peers
-/// send. They went before this reads, so they come first, behind only what had already arrived;
-/// a datagram of another's among them is dropped, as the network may drop it.
-fn drain(socket: &UdpSocket, mut sent: usize, buffer: &mut [u8]) -> io::Result<()> {
-    socket.set_nonblocking(true)?;
-    let mut drained = Ok(());
-    while sent > 0 {
-        match socket.recv_from(buffer) {
-            Ok((length, _)) => {
-                if length >= HEADER && buffer.get(HEADER.saturating_sub(1)) == Some(&u8::MAX) {
-                    sent = sent.saturating_sub(1);
-                }
-            }
-            // Windows reports an ICMP port-unreachable for an earlier send on a receive.
-            Err(error) if error.kind() == io::ErrorKind::ConnectionReset => {}
-            // A probe the socket did not keep.
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
-            Err(error) => {
-                drained = Err(error);
-                break;
-            }
-        }
-    }
-    socket.set_nonblocking(false)?;
-    drained
 }
 
 /// Ends the datagram in `buffer`: its checksum goes in front. False when it is longer than

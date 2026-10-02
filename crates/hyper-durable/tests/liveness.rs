@@ -37,7 +37,9 @@ use hyper_durable::{Output, Owner, Replica, Unbounded};
 use hyper_liveness::{
     Change, Liveness, Output as LiveOutput, Settings as LiveSettings, Write, is_liveness,
 };
-use hyper_raft::proto::{ConfState, Message};
+use hyper_raft::proto::{
+    ConfChangeSingle, ConfChangeTransition, ConfChangeType, ConfChangeV2, ConfState, Message,
+};
 use hyper_timing::Exposure;
 use support::cluster::settings;
 use support::{Kv, Seeded, SimStore};
@@ -465,6 +467,39 @@ impl World {
         ok
     }
 
+    /// The leader proposes a change of its configuration: `kind` of `node`.
+    fn change(&mut self, kind: ConfChangeType, node: u64) -> bool {
+        let Some(leader) = self.leader() else {
+            return false;
+        };
+        let change = ConfChangeV2 {
+            transition: ConfChangeTransition::Auto,
+            changes: vec![ConfChangeSingle {
+                change_type: kind,
+                node_id: node,
+            }],
+            context: vec![],
+        };
+        let at = &mut self.nodes[(leader - 1) as usize];
+        let ok = at
+            .owner
+            .get_mut(at.handle)
+            .unwrap()
+            .change(Vec::new(), &change)
+            .is_ok();
+        at.owner.schedule(at.handle);
+        at.alarm = Some(self.now);
+        ok
+    }
+
+    /// Whether every live node's configuration names `node` a voter (`named`), or none does.
+    fn named_everywhere(&self, node: u64, named: bool) -> bool {
+        self.nodes
+            .iter()
+            .filter(|n| n.alive)
+            .all(|n| self.replica(n.id).configuration().voters.contains(&node) == named)
+    }
+
     fn applied_everywhere(&self, data: &[u8]) -> bool {
         self.nodes.iter().filter(|n| n.alive).all(|n| {
             self.replica(n.id)
@@ -605,4 +640,53 @@ fn a_leader_killed_before_its_links_have_evidence_is_replaced() {
         "a leader killed young: replaced within {} ms of the kill at the most",
         slowest / 1_000_000
     );
+}
+
+/// A node removed from its group while suspected, started again and added back counts in the
+/// group's quorum once more, with the third node then dead: the removal, restart and return end to
+/// end on the liveness stream. The core forgets what it was told of a member its configuration no
+/// longer names, and the replica is told what its stream believes of a peer it is given
+/// (`Owner::pairs`). Before both, the leader's core still suspected the node it was given back
+/// (hyper-raft's `a_member_removed_while_suspected_is_believed_anew_when_added_again` holds the
+/// outage that followed); here the pair, let go with the group's last and begun anew, happened to
+/// tell the core again with its first judgement of the restarted node, which a pair the two nodes
+/// share through another group does not.
+#[test]
+fn a_node_removed_while_suspected_and_added_again_counts_in_the_quorum() {
+    let first = support::count("HYPER_DURABLE_LIVENESS_SEED", 0);
+    for seed in first..first + support::count("HYPER_DURABLE_LIVENESS_SEEDS", 64) {
+        let mut world = World::new(seed);
+        world.run_until(|w| w.leader().is_some_and(|leader| w.judged(leader)));
+        let leader = world.leader().unwrap();
+        let removed = if leader == 3 { 2 } else { 3 };
+        let other = 6 - leader - removed;
+        // A follower dies, and the leader's stream suspects it.
+        world.nodes[(removed - 1) as usize].alive = false;
+        world.run_until(|w| {
+            w.nodes[(leader - 1) as usize].liveness.trust(removed)
+                == Some(hyper_timing::Trust::Suspected)
+        });
+        // It is removed, starts again, and is added back.
+        world.run_until(|w| w.leader().is_some());
+        assert!(world.change(ConfChangeType::RemoveNode, removed));
+        world.run_until(|w| w.named_everywhere(removed, false));
+        world.restart(removed);
+        world.run_until(|w| w.leader().is_some());
+        assert!(world.change(ConfChangeType::AddNode, removed));
+        world.run_until(|w| w.named_everywhere(removed, true));
+        assert!(world.propose(b"rejoined"));
+        world.run_until(|w| w.applied_everywhere(b"rejoined"));
+        // The other follower dies. Once every live node's stream suspects it, the leader and the
+        // node added back are a quorum by their detectors, and the group leads on.
+        world.nodes[(other - 1) as usize].alive = false;
+        world.run_until(|w| {
+            w.nodes
+                .iter()
+                .filter(|n| n.alive)
+                .all(|n| n.liveness.trust(other) == Some(hyper_timing::Trust::Suspected))
+        });
+        world.run_until(|w| w.leader().is_some());
+        assert!(world.propose(b"after"));
+        world.run_until(|w| w.applied_everywhere(b"after"));
+    }
 }

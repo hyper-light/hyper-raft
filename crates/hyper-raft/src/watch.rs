@@ -148,6 +148,11 @@ impl Watch {
             Err(_) => false,
         }
     }
+    /// Forgets what the detectors said of every member `named` is false for: one the
+    /// configuration no longer names.
+    pub(crate) fn forget_unnamed(&mut self, named: impl Fn(NodeId) -> bool) {
+        self.suspected.retain(|member| named(*member));
+    }
     /// The members suspected, in order.
     pub(crate) fn suspected(&self) -> &[NodeId] {
         &self.suspected

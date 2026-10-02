@@ -3155,9 +3155,23 @@ impl<S: Storage> Raft<S> {
         Ok(true)
     }
 
+    /// What the detectors said of a member goes when the configuration stops naming it. Kept, a
+    /// suspicion outlived the member's removal, and once it was added again nothing told this
+    /// member otherwise: the owner tells a replica only of the peers it shares a group with, and
+    /// the stream's pair had nothing new to say. A leader then counted a live member out of its
+    /// quorum (`a_member_removed_while_suspected_is_believed_anew_when_added_again`). The owner
+    /// tells it what its detectors believe of a member it is given again (hyper-durable's
+    /// `Owner::pairs`).
+    fn forget_unnamed(&mut self) {
+        if let Some(watch) = self.watch.as_deref_mut() {
+            let configuration = self.tracker.configuration();
+            watch.forget_unnamed(|member| configuration.contains(member));
+        }
+    }
     /// The configuration changed: what follows from it.
     fn post_conf_change(&mut self) -> Result<ConfState> {
         let stated = self.tracker.configuration().to_conf_state()?;
+        self.forget_unnamed();
         let votes = self.tracker.configuration().votes(self.id);
         self.promotable = votes;
         if self.state != StateRole::Leader {

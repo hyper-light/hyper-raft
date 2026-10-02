@@ -31,6 +31,7 @@ use std::task::Waker;
 use std::time::Duration;
 
 use hyper_liveness::{Change, Liveness, PeerId};
+use hyper_timing::Trust;
 
 use crate::budget::Budget;
 use crate::machine::StateMachine;
@@ -198,8 +199,10 @@ impl<L: LogStore, M: StateMachine, B: Budget> Owner<L, M, B> {
     /// Keeps the node's liveness stream told which peers the replica at `handle` shares a group
     /// with: its configuration's other members, attached as they join and detached as they
     /// leave; all of them detached once the replica is gone (`hyper_liveness::Liveness::attach`
-    /// counts the groups a pair shares). Called when the replica is inserted, after a drive that
-    /// may have changed its configuration, and before it is removed with `gone`. At most
+    /// counts the groups a pair shares). A peer it is given is told to it as the stream believes
+    /// it then (`Replica::suspect`, `Replica::trust`): no change the stream reported while it
+    /// was not attached reached it. Called when the replica is inserted, after a drive that may
+    /// have changed its configuration, and before it is removed with `gone`. At most
     /// `hyper_raft::MAX_MEMBERS` peers a replica.
     pub fn pairs(
         &mut self,
@@ -223,6 +226,17 @@ impl<L: LogStore, M: StateMachine, B: Budget> Owner<L, M, B> {
         for peer in &now {
             if entry.attached.binary_search(peer).is_err() {
                 liveness.attach(*peer)?;
+                // What the stream believes of it now: a change it reported while the replica
+                // shared no group with the peer reached only the replicas that did (`believe`),
+                // and a pair begun anew reports nothing while it trusts. A refusal fences the
+                // replica, as there.
+                if let Some(replica) = entry.replica.as_mut() {
+                    let _ = if liveness.trust(*peer) == Some(Trust::Suspected) {
+                        replica.suspect(*peer)
+                    } else {
+                        replica.trust(*peer)
+                    };
+                }
             }
         }
         for peer in &entry.attached {

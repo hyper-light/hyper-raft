@@ -328,6 +328,13 @@ impl Node {
         for peer in &now {
             if self.attached.binary_search(peer).is_err() {
                 self.liveness.attach(*peer).map_err(NodeError::Liveness)?;
+                // What the stream believes of it now (hyper-durable's `Owner::pairs`).
+                let suspected = self.liveness.trust(*peer) == Some(Trust::Suspected);
+                heard(if suspected {
+                    self.replica.suspect(*peer)
+                } else {
+                    self.replica.trust(*peer)
+                })?;
             }
         }
         for peer in &self.attached {

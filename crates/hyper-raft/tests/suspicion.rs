@@ -625,6 +625,49 @@ fn a_restarted_leader_hands_over_to_each_heir_in_turn() {
     assert_eq!(sim.leader(), Some(3));
 }
 
+/// What the detectors said of a member goes when the configuration stops naming it. A member
+/// removed while suspected and added again was still suspected by the leader's core, and nothing
+/// told it otherwise (its owner tells a replica only of the peers it shares a group with); when
+/// another member then failed, the leader counted its live member out of its quorum, stepped down,
+/// and the group, two live voters of three, never elected again: the leader saw no quorum to
+/// campaign with, and the other trusted the leader's node.
+#[test]
+fn a_member_removed_while_suspected_is_believed_anew_when_added_again() {
+    let (timing, _) = timing_for(3);
+    let mut sim = Sim::new(3, &Sim::voters(&[1, 2, 3]), timing, 13);
+    sim.found(1);
+    sim.suspect(1, 3);
+    let change = |change_type, node_id| ConfChangeV2 {
+        transition: ConfChangeTransition::Auto,
+        changes: vec![ConfChangeSingle {
+            change_type,
+            node_id,
+        }],
+        context: vec![],
+    };
+    sim.node(1)
+        .propose_change(&change(ConfChangeType::RemoveNode, 3));
+    sim.settle(1);
+    assert!(sim.run_until(|sim| !sim.peek(1).raw.raft.configuration().contains(3)));
+    assert!(
+        !sim.peek(1).raw.raft.suspects(3),
+        "removed, it is believed of no more"
+    );
+    sim.node(1)
+        .propose_change(&change(ConfChangeType::AddNode, 3));
+    sim.settle(1);
+    assert!(sim.run_until(|sim| sim.peek(1).raw.raft.configuration().votes(3)));
+    sim.stop(2);
+    sim.suspect(1, 2);
+    sim.suspect(3, 2);
+    assert!(sim.run(), "the group did not come to rest");
+    assert_eq!(
+        sim.leader(),
+        Some(1),
+        "1 and 3 are a quorum, and 1 leads on"
+    );
+}
+
 /// A leader told a member started again empties its window to it and probes it from what it is
 /// known to hold: what was in flight went with the incarnation that stopped.
 #[test]

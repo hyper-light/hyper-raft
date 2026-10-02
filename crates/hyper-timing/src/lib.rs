@@ -39,6 +39,8 @@ mod progress;
 pub use progress::{ProgressDeadline, Spent};
 mod round;
 pub use round::{DeadlineExtender, ProgressWitness, RoundAnchors, RoundBudget, RoundWait, Verdict};
+mod qos;
+pub use qos::{Costs, Detector, LinkBehaviour, Span, configure, election_span};
 mod election;
 pub use election::{
     ElectionPriority, ElectionTimer, ElectionTiming, FollowerStep, PathEstimate,

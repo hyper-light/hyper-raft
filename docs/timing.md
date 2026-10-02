@@ -101,9 +101,12 @@ mechanism's own stated bound passes without them. It computes no tick and no bud
 
 ## 3. Open, to be measured before it is fixed
 
-1. **Heartbeat cost.** `η` minimizing `U` ignores what heartbeats cost; placement bounds the
-   peers per node, and the message cost per peer must be measured against the data path before
-   it is allowed to bound `η`.
+1. **Heartbeat cost.** `η` minimizing `U` ignores what heartbeats cost, and the configurator
+   shows what that means: on a LAN-like link (0.2 ms mean delay, 0.1 ms deviation, 1 % loss,
+   10 ms elections, a month's MTBF) the optimum interval is the timer floor itself, whatever the
+   floor (`qos::tests`). At one heartbeat per peer per floor, a node with many peers spends its
+   network on liveness. Placement bounds the peers per node, and the cost per heartbeat must be
+   measured against the data path and enter `U` before the fleet step.
 2. **NFD-E's estimation window `n`.** Larger `n` estimates `EA` more exactly (standard error
    `√(V(D)/n)`) and adapts more slowly. Candidates: the `n` whose error falls below `G`, which
    nothing finer can observe, bounded by the time over which the link's measurements stay
@@ -129,7 +132,10 @@ mechanism's own stated bound passes without them. It computes no tick and no bud
 
 ## 4. Steps
 
-- **L-1** in `hyper-timing`, sans-io: the NFD-E estimator as a `PathEstimate`, the Theorem 7
+- **L-1** in `hyper-timing`, sans-io (in part: `qos.rs` holds the Theorem 7 bound, the
+  configurator and the split-vote span, each checked against a brute-force search and the split
+  probability against a Monte Carlo; the estimator and the granularity fold wait on traces for
+  open items 2, 3 and 7): the NFD-E estimator as a `PathEstimate`, the Theorem 7
   bounds, the configurator minimizing `U`, the split-vote model and `W` replacing
   `ELECTION_MARGIN`'s base and span, the granularity probe replacing `GRANULARITY_NS`. Unit and
   property tests; benchmarks under the allocation law against the current derivation

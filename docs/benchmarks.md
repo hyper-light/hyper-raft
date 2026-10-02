@@ -899,91 +899,96 @@ entry's encoded length" item above is closed by R-2.
 
 `crates/hyper-raft-e2e` runs each member as a process (`hyper-raft-node`) on a UDP socket on the
 loopback interface, with a log file it flushes with the platform's full flush before a `Ready` is
-acted on (`F_FULLFSYNC` on macOS), driven in place. `tests/cluster.rs` measures the tick first, from the 95/95 one-sided
-tolerance bound (Wilks 1941: the slowest of 59 samples) of three times: a flush of the largest
-message a member sends, a loopback round trip of that message, and a socket wait asked for 1 ms.
-A tick is at least one broadcast time — two flushes and two datagrams in series, leader then
-follower — so the election timeout (ten ticks) is an order of magnitude above it (Ongaro and
-Ousterhout 2014, §5.6); and at least the wait, since the leader's heartbeat goes out on a tick the
-OS timer must keep (Windows ends a timed wait on its 15.6 ms clock interrupt). A member takes every
-tick that elapsed when it wakes, at most `2 · election_tick`, so its Raft clock keeps wall time
-however late the OS wakes it; an earlier member took one tick per wake, and on windows-2025 a 1 ms
-tick ran its elections about fifteen times slower than their budget. The largest datagram is
-measured on each socket (macOS caps a send at 9,216 bytes by default), and an append's entries are
-bounded to it less the message's fixed bytes. On this machine the tick came out at
-17 to 120 ms across runs, at load averages up to 43.
+acted on (`F_FULLFSYNC` on macOS), driven in place. Since timing step L-4 (`docs/timing.md` §2.9,
+"On real detectors") each member elects by suspicion on its own node-pair liveness stream, the
+stream's timing law over its own measurements, as hyper-durable-e2e's members do; the test tells no
+member what to believe and computes no time of its own.
 
-The election timeout is ten ticks (Raft §5.6; etcd's tuning guide asks at least ten round trips)
-and the heartbeat one tick, the round trip (etcd's tuning guide). Every count in a scenario is
-derived, not picked:
+What the test no longer has: the measured tick (the 95/95 one-sided tolerance bounds, Wilks 1941,
+of a flush, a loopback round trip and a 1 ms wait, 59 samples each), `--tick-ms`, the election and
+heartbeat tick counts, the answer budget in ticks, the elections each wait allowed for (Ongaro's
+split chance over ten tick slots, Bonferroni across the run's caused elections), and the member's
+bounds derived from that budget. What derives each count now:
 
-- A phase writes 59 writes, the 95/95 sample count, and `commits` reports their 95/95 bound.
-  `leader-killed` sends a phase's worth in flight as the leader dies.
-- A request waits `2 · election_tick + 1` ticks for its answer. A member not leading answers at
-  once; a leader answers within a broadcast, or, cut off, finds out within two election
-  timeouts by its quorum check and then answers all it held `NotLeader`. The extra tick is the
-  answer's own trip.
-- One write or read allows for as many elections as make every election the run causes (each
-  scenario's first, the leader killed, the leader cut off, every member killed) succeed with 95%
-  confidence across the run (Bonferroni). An election elects when the earliest of the voters'
-  randomized timers, drawn from the ten ticks of `[10, 20)`, fires two ticks (its pre-vote and
-  vote rounds) before the next: 61% for three voters, 44% for five, so 6 and 9 elections of at
-  most 22 ticks each.
-- Each member holds the keys its scenario writes, the asks the in-flight phase and the client
-  leave waiting, and an entry for every try a write may make within its budget plus a leader's
-  empty entry for every election.
-- A member serves until its standard input closes: the test holds the pipe, so no member
-  outlives it however the test ends, with no deadline to choose.
-
-Scenarios and what they assert, with one run's output (2026-10-01):
+- **Waits.** Every wait goes on while the group moves — any member's term, commit, applied index,
+  last index or restarts seen, or, while a pair is unjudged, the heartbeats it took — and fails once
+  a quiet period passes with nothing moved: the longest any member's report states for its
+  detection (`η + α`) or, while a pair is unjudged, the interval its heartbeats come at
+  (`PairReport::interval`), then its election's span and three rounds and an ask's three, never less than
+  RFC 6298's one-second retransmission timeout (§2.1, §2.4). A look that began before the quiet
+  period ended counts as movement unseen, so an ask whose answer was lost spends the test's own
+  timeout, not the group's. An ask waits that timeout for its answer, by a peek (`wire::arrives`).
+  A wait that gives up prints each member's last report.
+- **A phase** writes one entry more than an append carries: the datagram the platform allows
+  (`wire::largest`) less a message's fixed bytes, over the scenario's shortest entry. A member that
+  missed a phase catches up over more than one append. 136 writes on macOS (a 9,216-byte datagram),
+  977 on Linux (65,507).
+- **The member's bounds** are the scenario's: keys, the keys it writes; asks kept waiting, the
+  writes in flight and the client's one; the log, one entry a write and one a term
+  (`Wal::open`'s `max_writes`), for a leader proposes no write its log already holds and each term's
+  leader appends one empty entry.
+- **Writes in flight** (`leader-killed`) go from a client of their own to whoever leads, and those
+  not answered are sent again while the leader's log holds fewer than all the scenario's writes: on
+  Linux a phase overflows a socket's buffer, and the leadership moves under such a burst.
 
 | Scenario | Asserts |
 |---|---|
-| commits-3, commits-5 | 59 writes answered, each read back at once by a linearizable read; every member applied the same history to the same index |
-| leader-killed | the leader is killed with `SIGKILL` (`TerminateProcess` on Windows) holding 59 writes in its log unanswered; the others elect in a later term; every answered write reads back, every unanswered one reads as written or as never written; the killed member restarts on its log and applies the same history |
-| follower-restarts | a follower is killed, 59 writes are answered without it, it restarts on its log and catches up to the leader's commit with the same history |
-| partition | the leader of five is cut off by a drop filter inside its own process: a read it is asked at once is never answered with a value and a write never acknowledged (it answers both `NotLeader` once its check of the quorum steps it down); the others elect; a key written after the cut never reads stale from it; once lifted it follows and every member applies the same history |
-| all-killed | every member is killed at once and restarted on its log: every answered write reads back |
+| commits-3, commits-5 | a phase of writes answered, each read back at once by a linearizable read; every member applied the same history to the same index |
+| leader-killed | writes in flight sent to the leader until its log holds them all, then the leader killed with `SIGKILL` (`TerminateProcess` on Windows); the others elect in a later term; every answered write reads back, every unanswered one reads as written or as never written; the killed member restarts on its log, every member that heard its last run reports the restart, and it applies the same history |
+| follower-restarts | a follower killed, a phase answered without it, restarted on its log, its restart reported, caught up to the leader's commit with the same history |
+| partition | the leader of five cut off by a drop filter inside its process, its heartbeats with its Raft messages: a read it is asked at once is never answered with a value and a write never acknowledged; the others elect; the member cut off suspects all four and all four suspect it; a key written after the cut never reads stale from it; once lifted it follows and every member applies the same history |
+| all-killed | every member killed at once and restarted on its log: every answered write reads back |
+
+Runs of the whole binary, `cargo test -p hyper-raft-e2e --test cluster`, on this change over hyper-raft
+`0eaac7e`, 2026-10-02 (the runs over `7a8812c`, with the unjudged interval in the quiet period, are
+below the table):
+
+| host | runs | passed | a run |
+|---|---|---|---|
+| macOS 26.4.1, Apple M5 Max, load 34–78 | 10 | 10 | 31–53 s |
+| Linux (Docker, rust:1.98.0, aarch64), four CPUs and four busy loops, VM load 9.7–11.8 | 10 | 10 | 51–189 s |
+| Linux, two CPUs and two busy loops, load 6.3–9.6 | 10 | 10 | 47–130 s |
+| Linux, one CPU and one busy loop, load 4.5–9.7 | 10 | 10 | 42–68 s |
+
+The macOS runs shared the machine with other sessions' builds and with the Linux runs. One macOS
+run's output:
 
 ```
-tick 18 ms (the 95/95 bounds of a broadcast and a timed wait, 59 samples each)
-ok commits-3: 3 members; 59 writes answered and read back (22.65 ms per write and read, 34.80 ms the 95/95 bound); all applied index 60 alike [1.9 s]
-ok commits-5: 5 members; 59 writes answered and read back (23.91 ms per write and read, 34.43 ms the 95/95 bound); all applied index 60 alike [1.7 s]
-ok leader-killed: leader 3 (term 1) killed with 59 writes in its log unanswered; 1 elected in term 2; 118 answered writes read back; 1 of those 59 were committed by the new leader; member 3 restarted on its log and applied index 121 alike [3.0 s]
-ok follower-restarts: follower 1 killed after 59 writes, 59 written without it, restarted on its log, caught up to index 119 alike; 118 writes read back [3.0 s]
-ok partition: leader 3 of 5 cut off; at once it answered a read with Some(NotLeader(0)) and a write with Some(NotLeader(0)), and later the read of a replaced key with Some(NotLeader(0)); 5 elected in term 2; after the filter lifted, 5 leads and all applied index 122 alike; 119 writes read back [4.7 s]
-ok all-killed: every member killed after 59 answered writes and restarted on its log; 3 leads in term 2; 59 writes read back; all applied index 61 alike [2.2 s]
+ok commits-3: 3 members; 136 writes answered and read back (24.05 ms per write and read, 43.70 ms the slowest); all applied index 137 alike [3.7 s]
+ok commits-5: 5 members; 136 writes answered and read back (33.26 ms per write and read, 66.13 ms the slowest); all applied index 137 alike [4.8 s]
+ok leader-killed: leader 3 (term 1) killed with the 129 writes in flight in its log; 1 elected in term 2; 261 answered writes read back; 3 of them answered before the kill, and 126 of those unanswered committed by the new leader; member 3 restarted on its log, its restart reported, and applied index 391 alike [8.6 s]
+ok follower-restarts: follower 1 killed after 122 writes, 122 written without it, restarted on its log, its restart reported, caught up to index 245 alike; 244 writes read back [6.7 s]
+ok partition: leader 5 of 5 cut off; at once it answered a read with Some(NotLeader(0)) and a write with Some(NotLeader(0)), and later the read of a replaced key with Some(NotLeader(0)); it suspected all four and all four suspected it; 4 elected in term 7; after the filter lifted, 4 leads and all applied index 281 alike; 273 writes read back [11.7 s]
+ok all-killed: every member killed after 134 answered writes and restarted on its log; 1 leads in term 2; 134 writes read back; all applied index 136 alike [4.8 s]
 ```
 
-That run was at load average 43.
+A write and its read took 1.7–33 ms on average a run on Linux (the slowest under the busy loops and the macOS runs beside them) and 22–46 ms on macOS (`F_FULLFSYNC` under load).
+On Linux the detectors mistake often (`docs/timing.md` §2.9): the terms reached at the end of
+leader-killed ran from 1 to 18 across the 30 runs, where the scenario causes two elections, and the
+leader-killed's writes in flight were all answered before the kill in 9 of them (a burst moves the
+leadership, and each new leader commits what it took); in the other 21 the leader died holding 20
+to 208 unanswered. On macOS the terms stayed at 1 to 7.
 
-The workspace's tests, these scenarios included, also pass on Linux (aarch64, in Docker on this
-machine, `rust:1.98.0`, `fdatasync` on the VM's file system; the tick came out at 36 ms). They
-have not been run on Windows here; CI runs the gates on all six targets.
-
-A member's loop waits on its socket until its next tick, and when the tick is already due it
-still takes what has arrived before it ticks. On a loaded machine a turn of the loop can outlast
-a tick, so the tick is due at every turn. A member that skipped its socket then kept ticking
-without reading anything: a leader stepped down by its quorum check with its followers' answers
-still unread in its socket, and the scenario stalled on the election that followed. Two runs
-showed this before the fix: one with a parallel build loading the machine (tick 12 ms, load
-average 39), one with the tick forced to 4 ms under the same load. Each leader read nothing for
-100 to 180 ms, about ten ticks fired with nothing read in between, and the answers it had missed
-were the first datagrams it read after stepping down. `node::tests` holds the directed test.
-
-The client waits on facts, with the bounds derived above. One write or read is retried through its
-elections rather than for a fixed number of requests:
-during an election, members that name no leader or a stale one answer at once, and a count of
-requests ran out long before the election ended. When a member names no other leader, the
-client lets a heartbeat interval pass before it asks the next member. `leader-killed` sends its
-in-flight writes to whoever leads at that moment, not to the first leader, because earlier
-writes may have moved the leadership. After the fix the suite passed 100 runs in a row, 50 of
-them under load.
+On the way, 17 of 18, 28 of 30 and 15 of 15 Linux runs passed on earlier forms of this code; each
+defect found was fixed at its cause before the runs above:
+- the test read its own reports behind a flood of answers to the writes in flight (they now go from
+  a client of their own);
+- a resent burst always reached the leader in the same order, so the same first few hundred were
+  taken and the rest dropped again (only the unanswered are resent);
+- a look whose ask lost its answer spent the whole quiet period (the quiet period now counts only
+  looks begun after it);
+- a member released the askers it kept waiting only when it saw itself stop leading, so one that
+  stepped down and led again between two looks kept askers whose entries its new term had replaced
+  (they are now released when the term it leads changes).
+Three of those runs stopped with the group judged quiet, a write or the writes in flight unanswered,
+before the dump of the last look was added; none has recurred in the 45 Linux runs since, and the
+cause is not established. A recurrence prints the members' reports.
 
 `tests/wal.rs` covers the log's torn-tail cut, its refusal of a damaged record that is not the
-last, and its bound; `tests/wire.rs` covers damaged and cut datagrams. One group at a time runs,
-at most five member processes of one thread each, and the test itself is one thread
-(`harness = false`).
+last, and its bound; `tests/wire.rs` damaged and cut datagrams; `tests/node.rs` a member whose
+deadline is due still reading what arrived; `tests/arrives.rs` the peek. One group at a time runs,
+at most five member processes of two threads each (the loop, and the one watching its parent), and
+the test itself is one thread (`harness = false`).
 
 ## Commands
 

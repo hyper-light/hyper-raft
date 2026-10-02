@@ -1038,6 +1038,37 @@ period. Measured in `docs/benchmarks.md`, "hyper-durable-e2e on its own detector
 younger than its evidence" (the stalled member's scenarios, 0.7–112 s on main across the six
 targets, 0.3–18.8 s with a young link judged by what its node measured).
 
+hyper-raft-e2e's members (`crates/hyper-raft-e2e`, a `RawNode` over a file log of the harness's
+own) run the same wiring on the core directly: `Config::elections = Suspicion` with pre-vote and
+check-quorum, the pairs attached from the configuration, each `Change` taken to `suspect`, `trust`
+or `restarted`, the timing derived by this law from the stream's echoed round trips, mean flush and
+granularity (`stream::timing`, as `Replica::measure` derives it) and every pair charged the span's
+`T_E`, each log write handed to the stream as a flush proof, and, where the group wrote none in
+time, the log's hard state written again and flushed on the same file (`Wal::prove`). The member
+wakes at the earlier of the core's deadline and the stream's, waiting by a peek and taking without
+waiting as hyper-durable-e2e's members do; a member cut off drops its heartbeats with its Raft
+messages. Its test is hyper-durable-e2e's in shape: no tick, no `--tick-ms`, no 95/95
+bounds of a flush, a datagram or a wake, no count of elections per wait or per run; waits go on
+while any member's term, commit, applied index, last index or restarts seen moves (or, while a pair
+is unjudged, its heartbeats), and fail once a quiet period of the members' stated law passes with
+nothing moved (the longer of a member's stated detection and an unjudged pair's interval, then its
+election's span and rounds and an ask's), a period that counts only looks begun after it ended, so that an ask whose answer
+was lost spends the test's retransmission timeout and not the group's. The partition is now also
+seen by the detectors: the member cut off suspects every other and every other suspects it. Its
+bounds stay the scenario's: the keys it writes, the asks it keeps waiting, and a log of one entry a
+write and one a term — a leader proposes no write its log already holds, so a write asked again is
+held once, and each term's leader appends one empty entry. A phase writes one entry more than an
+append carries on the platform's datagram, so a member that missed one catches up over more than
+one append. Measured in `docs/benchmarks.md`, "End to end".
+
+What its runs found of the stream: with elections that cost tens of milliseconds, the configurator
+accepts detectors whose mistake recurrence is short (a 1 ms interval and a 0.5 ms margin at first,
+then about 10 ms and 4 ms, recurrence 150–480 ms on Linux in Docker), and a burst of hundreds of
+writes delays a leader's reads of its heartbeats, which this harness stamps when read: the leader
+changed at many bursts of the leader-killed scenario's writes in flight (terms up to 18 at its end
+across 30 Linux runs, where the scenario causes two; 1 to 7 on macOS). Every answered write still read back. Whether the mistakes'
+cost is priced right by `U` with elections this cheap is §3's item 1 and item 3.
+
 **The model.** These rules only bring forward or refuse a campaign, or forget a leader, which is
 volatile; the TLA+ model's `Elect` may be taken at any time with any quorum the log comparison
 admits, so it needs no change (`docs/models/README.md`).
@@ -1219,7 +1250,7 @@ and election law; the remaining items keep their numbers, and item 10 is what L-
   "hyper-liveness"). Its follow-ups (§2.9) done: every link configures or is judged by its node's
   pool, the interval its evidence needs measured online, a moved interval expected, a restart
   reported (`Change::Restarted`).
-- **L-4** the E2E member and harness on L-1–L-3 (§2.5): hyper-raft-e2e's harness still computes its
-  tick and budgets; hyper-durable-e2e's runs on its members' own detectors, its computed period and
-  budgets gone (§2.9, "On real detectors").
+- **L-4** the E2E member and harness on L-1–L-3 (§2.5), done: hyper-durable-e2e's and
+  hyper-raft-e2e's members run on their own detectors, and neither test computes a period, a tick, a
+  tolerance bound or a count of elections (§2.9, "On real detectors").
 - **L-5** mantle, focal and slates on it.

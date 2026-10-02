@@ -6,11 +6,7 @@
     clippy::disallowed_macros
 )]
 
-use std::{
-    net::UdpSocket,
-    path::PathBuf,
-    time::{Duration, Instant},
-};
+use std::{net::UdpSocket, path::PathBuf, time::Duration};
 
 use hyper_raft_e2e::{
     node::{Node, Settings},
@@ -31,16 +27,18 @@ fn remove(path: &std::path::Path) {
     let _ = std::fs::remove_file(path);
 }
 
-/// A member whose tick is already due when it turns to its socket still takes what has
+/// A member whose deadline is already due when it turns to its socket still takes what has
 /// arrived. Before the fix, a member skipped its socket whenever it was behind its ticks, as it
 /// is on a loaded machine. It ticked on without reading its peers' answers, and as leader it
-/// stepped down by its quorum check while those answers waited unread in its socket.
+/// stepped down by its quorum check while those answers waited unread in its socket. A member on
+/// its detectors is as behind at every turn of a loaded machine, and its detectors are made of
+/// what it reads.
 #[test]
 #[allow(
     clippy::disallowed_methods,
     reason = "real processes on the host's clock, threads and environment (CLAUDE.md §1a, end to end); the member's socket is waited on by a peek, never a timed receive"
 )]
-fn a_member_behind_its_tick_still_reads_what_arrived() {
+fn a_member_behind_its_deadline_still_reads_what_arrived() {
     let path = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
         .join(format!("node-{}-behind-its-tick.wal", std::process::id()));
     remove(&path);
@@ -51,12 +49,12 @@ fn a_member_behind_its_tick_still_reads_what_arrived() {
     let settings = Settings {
         id: 1,
         voters: vec![1],
-        tick: Duration::from_millis(1),
         max_keys: 1,
         max_pending: 1,
-        max_entries: 16,
+        max_writes: 16,
     };
-    let mut node = Node::open(settings, socket, wal).unwrap();
+    // Its first run: nothing heard it before.
+    let mut node = Node::open(settings, 1, socket, wal).unwrap();
 
     let client = UdpSocket::bind("127.0.0.1:0").unwrap();
     let mut request = Vec::new();
@@ -68,8 +66,8 @@ fn a_member_behind_its_tick_still_reads_what_arrived() {
     arrived.set_read_timeout(Some(LOOPBACK_BOUND)).unwrap();
     arrived.peek_from(&mut peeked).unwrap();
 
-    // The tick was due before the member turned to its socket.
-    node.receive_until(Instant::now()).unwrap();
+    // The member's deadline was due before it turned to its socket.
+    node.receive_until(Some(0)).unwrap();
 
     let mut answer = vec![0u8; wire::MAX_DATAGRAM];
     assert!(

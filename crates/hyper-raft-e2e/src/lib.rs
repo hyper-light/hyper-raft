@@ -9,5 +9,7 @@
 //! One thread per process, and one process per member: the harness never multiplies either.
 
 pub mod node;
+pub mod run;
+pub mod stream;
 pub mod wal;
 pub mod wire;

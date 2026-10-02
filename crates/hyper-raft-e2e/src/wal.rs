@@ -14,6 +14,11 @@
 //! directory on Unix, so that the name survives too; Windows offers no directory handle to the
 //! standard library, and NTFS journals the creation.
 //!
+//! The log holds one entry for each write its scenario makes and one more for each term: a leader
+//! proposes no write its log already holds (`node`), so each write is held once, and each term's
+//! leader appends one empty entry (Raft §8). It refuses an entry past that bound
+//! ([`WalError::Full`]).
+//!
 //! This module is the harness's device writer, as `hyper-log`'s device module is the shared
 //! log's: the one place it writes files.
 use std::{
@@ -44,7 +49,7 @@ pub enum WalError {
     Io(std::io::Error),
     /// A record that is not the last does not read back as written.
     Corrupt(&'static str),
-    /// The log holds as many entries as it was opened to hold.
+    /// The log holds as many entries as its writes and its term allow.
     Full,
 }
 
@@ -125,7 +130,13 @@ fn place(entries: &mut Vec<Entry>, entry: Entry) -> Result<(), WalError> {
     Ok(())
 }
 
-fn replay(bytes: &[u8], max_entries: usize) -> Result<Replayed, WalError> {
+/// The most entries a log of `max_writes` writes holds at `term`: one for each write, and one
+/// for each term's leader.
+fn bound(max_writes: usize, term: u64) -> usize {
+    max_writes.saturating_add(usize::try_from(term).unwrap_or(usize::MAX))
+}
+
+fn replay(bytes: &[u8], max_writes: usize) -> Result<Replayed, WalError> {
     let mut replayed = Replayed {
         hard: HardState::default(),
         entries: Vec::new(),
@@ -141,13 +152,13 @@ fn replay(bytes: &[u8], max_entries: usize) -> Result<Replayed, WalError> {
             ENTRY => {
                 let entry = Entry::decode(payload).map_err(|_| WalError::Corrupt("an entry"))?;
                 place(&mut replayed.entries, entry)?;
-                if replayed.entries.len() > max_entries {
-                    return Err(WalError::Full);
-                }
             }
             _ => return Err(WalError::Corrupt("a record of no kind")),
         }
         replayed.valid = end;
+    }
+    if replayed.entries.len() > bound(max_writes, replayed.hard.term) {
+        return Err(WalError::Full);
     }
     Ok(replayed)
 }
@@ -201,15 +212,15 @@ pub struct Wal {
     entries: Vec<Entry>,
     /// What one write encodes into, kept from one write to the next.
     buffer: Vec<u8>,
-    max_entries: usize,
+    max_writes: usize,
     /// Entries handed over that could not be placed.
     damaged: Option<WalError>,
 }
 
 impl Wal {
-    /// The log at `path` of a group of `voters`, holding at most `max_entries` entries; made
-    /// empty if there is none.
-    pub fn open(path: &Path, voters: Vec<u64>, max_entries: usize) -> Result<Self, WalError> {
+    /// The log at `path` of a group of `voters` whose scenario makes at most `max_writes` writes;
+    /// made empty if there is none.
+    pub fn open(path: &Path, voters: Vec<u64>, max_writes: usize) -> Result<Self, WalError> {
         let created = !path.exists();
         let mut file = OpenOptions::new()
             .read(true)
@@ -223,7 +234,7 @@ impl Wal {
         }
         let mut bytes = Vec::new();
         file.read_to_end(&mut bytes)?;
-        let replayed = replay(&bytes, max_entries)?;
+        let replayed = replay(&bytes, max_writes)?;
         if replayed.valid < bytes.len() {
             cut(&file, replayed.valid)?;
         }
@@ -237,7 +248,7 @@ impl Wal {
             },
             entries: replayed.entries,
             buffer: Vec::new(),
-            max_entries,
+            max_writes,
             damaged: None,
         })
     }
@@ -262,7 +273,8 @@ impl Wal {
         let end = entries.last().map_or(0, |entry| {
             usize::try_from(entry.index).unwrap_or(usize::MAX)
         });
-        if end > self.max_entries {
+        let term = hard.map_or(self.hard.term, |hard| hard.term.max(self.hard.term));
+        if end > bound(self.max_writes, term) {
             return Err(WalError::Full);
         }
         self.buffer.clear();
@@ -281,6 +293,18 @@ impl Wal {
             self.hard = *hard;
             self.hard.commit = commit;
         }
+        Ok(())
+    }
+    /// Writes the hard state it holds again and flushes it: a durable write that changes nothing,
+    /// made when the member's liveness stream asks for one to prove a heartbeat by and no write of
+    /// the group's came in time (`hyper_liveness::Output::flush`). It goes to the same file as
+    /// every other, so a disk that stops stops the member's heartbeats with it.
+    pub fn prove(&mut self) -> Result<(), WalError> {
+        self.buffer.clear();
+        let hard = self.hard;
+        record(&mut self.buffer, HARD_STATE, &hard)?;
+        self.file.write_all(&self.buffer)?;
+        self.file.sync_data()?;
         Ok(())
     }
     /// Takes entries already written, as they are, into the log in memory. A place it cannot

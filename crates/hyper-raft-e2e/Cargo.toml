@@ -10,6 +10,12 @@ publish = false
 
 [dependencies]
 hyper-raft = { path = "../hyper-raft" }
+# The record the member's run is kept in beside its log (`hyper_block::record`, `run`).
+hyper-block = { path = "../hyper-block" }
+# The node-pair liveness stream the members' detectors are (timing step L-3).
+hyper-liveness = { path = "../hyper-liveness" }
+# The election law's types: the ballot and span the members' timing is derived by.
+hyper-timing = { path = "../hyper-timing" }
 # The codec of raft-rs's wire and log types, which hyper-raft speaks (prost).
 
 [[bin]]

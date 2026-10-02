@@ -4,16 +4,28 @@
 //! what a client can observe:
 //! - every write a member answered is read back, by a linearizable read through whichever
 //!   member leads, after leaders are killed, members restart and members are cut off;
-//! - a member cut off from the group never answers a read with a value the group has replaced;
-//! - every member that is up applies the same history (the same digest at the same index).
+//! - a member cut off from the group never answers a read with a value the group has replaced,
+//!   and its detectors and every other member's see the cut;
+//! - every member that is up applies the same history (the same digest at the same index);
+//! - a member started again is reported restarted to every other member's core.
+//!
+//! The members elect by suspicion on their own failure detectors: each runs the node-pair
+//! liveness stream (`hyper_liveness`, timing step L-3) and takes its words to its core, with the
+//! election law's timing derived from what the stream measured (`docs/timing.md` §2.9), and the
+//! test tells no member what to believe. The test derives no time of its own. It waits on facts
+//! — a leader, an answer, a report — and goes on while the group moves (`docs/sim.md` §4.2):
+//! while any member's term, commit, applied index, last index or restarts seen moves, or, while a
+//! member still has a pair no margin judges, the heartbeats it has taken (the evidence its
+//! detectors are built from). It gives up once a quiet period passes with nothing moved: the
+//! longest any member states its detectors take to suspect a crash (or, while a pair no margin
+//! judges takes heartbeats at a longer interval, that interval), its election's span and
+//! rounds and an ask's rounds, by the members' own law; never less than the test's own
+//! retransmission timeout, RFC 6298's one second before any measurement and never less after
+//! (§2.1, §2.4), past which it could not tell a member that did not move from an answer it did
+//! not wait for. An ask waits that timeout for its answer.
 //!
 //! The scenarios run one after another in this one thread (`harness = false`), one group at a
-//! time: at most five member processes at once, each of one thread.
-//!
-//! Every wait is on the fact it needs (a member's answer), bounded by a budget derived in ticks:
-//! a request waits for its answer as long as a live member can take to give one
-//! (`ANSWER_TICKS`), and one write or read is retried through as many elections as the run needs
-//! for every election it causes to succeed at its confidence (`Cluster::elections`).
+//! time: at most five member processes at once.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -29,69 +41,32 @@
 
 use std::{
     collections::BTreeMap,
-    fs::OpenOptions,
-    io::{BufRead, BufReader, ErrorKind, Write},
+    io::{BufRead, BufReader, Write},
     net::{SocketAddr, UdpSocket},
     path::{Path, PathBuf},
     process::{Child, Command, ExitCode, Stdio},
     time::{Duration, Instant},
 };
 
+use hyper_raft::proto::{self, Entry};
 use hyper_raft_e2e::{
     node,
-    wire::{self, Control, Kind, Op, Outcome, Status},
+    stream::{self, Report},
+    wire::{self, Control, Kind, Op, Outcome},
 };
 
 const NODE: &str = env!("CARGO_BIN_EXE_hyper-raft-node");
 const TMP: &str = env!("CARGO_TARGET_TMPDIR");
 
-/// Ticks in a member's election timeout, at least, and between a leader's heartbeats: the node's
-/// own. Its randomized timeout is drawn from `[ELECTION_TICKS, 2 · ELECTION_TICKS)`
-/// (`set_randomized_election_timeout`).
-const ELECTION_TICKS: u32 = node::ELECTION_TICKS;
-const HEARTBEAT_TICKS: u32 = node::HEARTBEAT_TICKS;
-/// The broadcasts an election takes once a candidate's timer fires: its pre-vote round and its
-/// vote round (the node runs with `pre_vote`), each within a tick.
-const VOTE_ROUNDS: u32 = 2 * BROADCAST_TICKS;
-/// The ticks one broadcast takes at most: one, as the tick is measured (`measure_tick`).
-const BROADCAST_TICKS: u32 = 1;
-/// The longest a live member takes to answer an ask. One that is not leading answers at once; a
-/// leader answers a write once it commits and a read once a quorum confirms it, within a
-/// broadcast; a leader cut off from its quorum finds out by its quorum check, which looks back
-/// over the last election timeout every election timeout, so within two of them, and then
-/// answers everyone it kept waiting that it does not lead (`lead_or_let_go`). Each answer takes
-/// a tick to arrive. An ask unanswered for this long went to a member that is down or cut off.
-const ANSWER_TICKS: u32 = 2 * ELECTION_TICKS + BROADCAST_TICKS;
-/// The ticks one election takes at most: the longest randomized timeout and its vote rounds.
-const ELECTION_ROUND_TICKS: u32 = 2 * ELECTION_TICKS + VOTE_ROUNDS;
-/// The elections a full run causes on purpose beyond each scenario's first: the leader killed,
-/// the leader cut off, and every member killed at once. Restarts cause none: a member back on
-/// its log pre-votes, and a group with a leader refuses it.
-const DISRUPTIONS: u32 = 3;
-/// The share of a time's distribution its measured bound covers, and the confidence it does: the
-/// 95/95 one-sided tolerance limit (Wilks 1941; the criterion USNRC Regulatory Guide 1.157 holds
-/// best-estimate analyses to). The slowest of n samples bounds the share with that confidence
-/// once 1 − COVERAGE^n ≥ CONFIDENCE, so n is derived, not chosen (`tolerance_samples`: 59).
-const COVERAGE: f64 = 0.95;
-const CONFIDENCE: f64 = 0.95;
-/// The least tick a member is given: `--tick-ms` counts whole milliseconds.
-const LEAST_TICK: Duration = Duration::from_millis(1);
-
-/// What every scenario of a run shares: the tick, and how many elections the run causes, which
-/// sets how many each wait must allow for.
-#[derive(Clone, Copy)]
-struct Run {
-    tick: Duration,
-    caused: u32,
-}
-
-/// The writes in a phase of a scenario: enough that the slowest of them bounds the 95th
-/// percentile of a write's time with 95% confidence (`tolerance_samples`), which `commits`
-/// reports. Every phase writes as many, and the writes a leader holds unanswered when it dies are
-/// as many again.
-fn workload() -> usize {
-    tolerance_samples()
-}
+/// RFC 6298 §2.1 and §2.4: the retransmission timeout before any round trip is measured, and the
+/// least it is ever set to after, one second.
+const RTO: Duration = Duration::from_secs(1);
+/// The rounds an ask and its answer take beside an election: the ask, the broadcast that commits
+/// it, and the answer.
+const ANSWER_ROUNDS: u32 = 3;
+/// The rounds an election takes past its delay: pre-vote, vote, and the new leader's first
+/// append (`docs/timing.md` §2.3).
+const ELECTION_ROUNDS: u32 = 3;
 
 #[expect(
     clippy::disallowed_methods,
@@ -101,74 +76,39 @@ fn remove(path: &Path) {
     let _ = std::fs::remove_file(path);
 }
 
-/// The samples whose slowest is the 95/95 upper bound of a time (Wilks 1941).
-fn tolerance_samples() -> usize {
-    ((1.0 - CONFIDENCE).ln() / COVERAGE.ln()).ceil() as usize
+/// The writes in a phase of scenario `name`: one more than one append carries to a member behind,
+/// so that a member that missed a phase catches up over more than one append. An append carries
+/// entries up to the datagram less a message's fixed bytes (`node::MESSAGE_ROOM`), counted at
+/// their encoded bytes; the scenario's shortest write is its first, so this many of it is the
+/// most an append carries.
+fn phase(name: &str, datagram: usize) -> usize {
+    let mut data = Vec::new();
+    wire::put_command(
+        &mut data,
+        &wire::Command {
+            origin: 1,
+            sequence: 1,
+            key: format!("{name}-0").as_bytes(),
+            value: b"value-0",
+        },
+    );
+    let entry = Entry {
+        index: 1,
+        term: 1,
+        data,
+        ..Entry::default()
+    };
+    let room = datagram.saturating_sub(node::MESSAGE_ROOM) as u64;
+    (room / proto::encoded_bytes(&entry).max(1)) as usize + 1
 }
 
-/// The 95/95 upper bound of `sample`'s time.
-#[allow(
-    clippy::disallowed_methods,
-    reason = "real processes on the host's clock, threads and environment (CLAUDE.md §1a, end to end)"
-)]
-fn bound(mut sample: impl FnMut()) -> Duration {
-    let mut slowest = Duration::ZERO;
-    for _ in 0..tolerance_samples() {
-        let started = Instant::now();
-        sample();
-        slowest = slowest.max(started.elapsed());
-    }
-    slowest
-}
-
-/// The tick, from what this machine's flushes, datagrams and timer cost.
-///
-/// - The broadcast time — what one replication takes — is the leader's flush, a datagram to the
-///   follower, the follower's flush and a datagram back, in series, each of the most a message
-///   carries: the member flushes before it
-///   acts on a `Ready`. Raft needs the election timeout an order of magnitude above it (Ongaro
-///   and Ousterhout 2014, §5.6), and the election timeout is `ELECTION_TICKS` ticks, so a tick
-///   is at least one broadcast time.
-/// - A member ticks on a socket timeout, which the OS ends on its own timer, not when asked
-///   (Windows on its clock interrupt, 15.6 ms unless a process asks for finer: Microsoft,
-///   `timeBeginPeriod`). The leader's heartbeat goes out on a tick, so a tick finer than the
-///   timer keeps is a heartbeat interval the leader cannot keep: a tick is at least the bound of
-///   a wait asked for `LEAST_TICK`.
-#[allow(
-    clippy::disallowed_methods,
-    reason = "real processes on the host's clock (CLAUDE.md §1a, end to end); a timed receive on a socket nothing sends to measures the wait's lateness, and has nothing to lose"
-)]
-fn measure_tick() -> Duration {
-    let path = PathBuf::from(TMP).join(format!("e2e-{}-probe", std::process::id()));
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-        .unwrap();
-    // The most one message carries, and so the most one flush appends for it: the member caps a
-    // message's entries at what a datagram holds.
-    let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
-    let block = vec![0x5au8; wire::largest(&socket).unwrap()];
-    let flush = bound(|| {
-        file.write_all(&block).unwrap();
-        file.sync_data().unwrap();
-    });
-    drop(file);
-    remove(&path);
-    let to = socket.local_addr().unwrap();
-    let mut received = vec![0u8; wire::MAX_DATAGRAM];
-    let datagram = bound(|| {
-        socket.send_to(&block, to).unwrap();
-        socket.recv_from(&mut received).unwrap();
-    });
-    socket.set_read_timeout(Some(LEAST_TICK)).unwrap();
-    let wake = bound(|| {
-        let _ = socket.recv_from(&mut received);
-    });
-    let broadcast = (flush + datagram) * 2;
-    let tick = broadcast.max(wake).max(LEAST_TICK);
-    // Whole milliseconds, rounded up: `--tick-ms`'s unit.
-    Duration::from_millis(tick.as_micros().div_ceil(1000).try_into().unwrap())
+/// What a member holds, from what its scenario writes: the keys, the asks it keeps waiting at
+/// once, and the writes, which bound its log (one entry for each, and one for each term).
+#[derive(Clone, Copy)]
+struct Room {
+    keys: usize,
+    pending: usize,
+    writes: usize,
 }
 
 struct Member {
@@ -177,15 +117,19 @@ struct Member {
     wal: PathBuf,
 }
 
+/// What a wait last saw of each member's progress, and until when it waits without seeing more.
+struct Watch {
+    seen: BTreeMap<u64, [u64; 7]>,
+    until: Instant,
+}
+
 struct Cluster {
     name: &'static str,
     members: Vec<Member>,
-    tick: Duration,
-    /// The elections one wait allows for (`Cluster::elections`).
-    elections: u32,
-    /// What each member is told it holds: the keys the scenario writes, the asks it keeps waiting
-    /// and the entries its log holds.
     room: Room,
+    /// What each member's latest report says its law takes: its stated detection, its election's
+    /// span and rounds, and an ask's rounds.
+    law: BTreeMap<u64, Duration>,
     test: UdpSocket,
     /// The most bytes the test's socket sends in one datagram ([`wire::largest`]).
     datagram: usize,
@@ -205,50 +149,16 @@ impl Drop for Cluster {
     }
 }
 
-/// What a member holds, from what its scenario writes.
-#[derive(Clone, Copy)]
-struct Room {
-    keys: usize,
-    pending: usize,
-    entries: usize,
-}
-
-impl Room {
-    /// Room for `writes` writes made at `elections` elections a wait.
-    /// - Keys: no more than the writes.
-    /// - Asks kept waiting: the writes a leader holds unanswered when it dies (`workload`), and
-    ///   the client's own one at a time.
-    /// - Entries: each write proposes once for each try that waited out an answer, at most
-    ///   `budget / ANSWER_TICKS` and the one answered; and each election adds its leader's empty
-    ///   entry.
-    fn for_writes(writes: usize, elections: u32, caused: u32) -> Self {
-        let tries = Cluster::budget_ticks(elections).div_ceil(ANSWER_TICKS) as usize + 1;
-        Self {
-            keys: writes,
-            pending: workload() + 1,
-            entries: writes * tries + (elections * caused) as usize,
-        }
-    }
-}
-
-fn spawn(
-    id: u64,
-    voters: usize,
-    listen: &str,
-    wal: &Path,
-    tick: Duration,
-    room: Room,
-) -> (Child, u16) {
+fn spawn(id: u64, voters: usize, listen: &str, wal: &Path, room: Room) -> (Child, u16) {
     let voters: Vec<String> = (1..=voters).map(|voter| voter.to_string()).collect();
     let mut child = Command::new(NODE)
         .args(["--id", &id.to_string()])
         .args(["--voters", &voters.join(",")])
         .args(["--listen", listen])
         .args(["--wal", wal.to_str().unwrap()])
-        .args(["--tick-ms", &tick.as_millis().to_string()])
         .args(["--max-keys", &room.keys.to_string()])
         .args(["--max-pending", &room.pending.to_string()])
-        .args(["--max-entries", &room.entries.to_string()])
+        .args(["--max-writes", &room.writes.to_string()])
         // The member serves until this pipe closes: when the test ends, however it ends.
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -268,17 +178,14 @@ fn spawn(
 }
 
 impl Cluster {
-    /// Starts `voters` members for scenario `name`, which makes `writes` writes.
-    fn start(name: &'static str, voters: usize, run: Run, writes: usize) -> Self {
-        let elections = Self::elections(voters, run.caused);
-        let room = Room::for_writes(writes, elections, run.caused);
-        let tick = run.tick;
+    /// Starts `voters` members for scenario `name`, each given `room`.
+    fn start(name: &'static str, voters: usize, room: Room) -> Self {
         let mut members = Vec::new();
         for id in 1..=voters as u64 {
             let wal =
                 PathBuf::from(TMP).join(format!("e2e-{}-{name}-{id}.wal", std::process::id()));
             remove(&wal);
-            let (child, port) = spawn(id, voters, "127.0.0.1:0", &wal, tick, room);
+            let (child, port) = spawn(id, voters, "127.0.0.1:0", &wal, room);
             members.push(Member {
                 child: Some(child),
                 address: SocketAddr::from(([127, 0, 0, 1], port)),
@@ -290,15 +197,16 @@ impl Cluster {
         let mut cluster = Self {
             name,
             members,
-            tick,
-            elections,
             room,
+            law: BTreeMap::new(),
             test,
             datagram,
             next_id: 0,
             buffer: Vec::new(),
         };
-        cluster.tell_peers();
+        for id in cluster.up_members() {
+            cluster.tell_peers(id);
+        }
         cluster
     }
     fn voters(&self) -> usize {
@@ -307,101 +215,241 @@ impl Cluster {
     fn up(&self, id: u64) -> bool {
         self.members[(id - 1) as usize].child.is_some()
     }
+    fn up_members(&self) -> Vec<u64> {
+        (1..=self.voters() as u64)
+            .filter(|id| self.up(*id))
+            .collect()
+    }
     fn address(&self, id: u64) -> SocketAddr {
         self.members[(id - 1) as usize].address
     }
-    /// Sends `buffer` to member `id` and waits for the answer to `request`.
+
+    /// Sends what is in the buffer to `id` and waits for its answer to `ask`, one retransmission
+    /// timeout at most; the answer's body.
     #[allow(
         clippy::disallowed_methods,
         reason = "real processes on the host's clock, threads and environment (CLAUDE.md §1a, end to end)"
     )]
-    fn ask(&mut self, id: u64, request: u64) -> Option<Outcome> {
-        if !wire::seal(&mut self.buffer, self.datagram) {
-            panic!("a request too long for a datagram");
-        }
-        let address = self.address(id);
-        self.test.send_to(&self.buffer, address).unwrap();
-        let until = Instant::now() + self.tick * ANSWER_TICKS;
+    fn exchange(&mut self, id: u64, ask: u64) -> Option<Vec<u8>> {
+        assert!(wire::seal(&mut self.buffer, self.datagram));
+        let to = self.address(id);
+        self.test.send_to(&self.buffer, to).ok()?;
+        let deadline = Instant::now() + RTO;
         let mut received = vec![0u8; wire::MAX_DATAGRAM];
         loop {
-            let wait = until.saturating_duration_since(Instant::now());
-            if wait.is_zero() {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
                 return None;
             }
-            // Waited for by a peek, taken without waiting (`wire::arrives`).
-            if !wire::arrives(&self.test, Some(wait), &mut received).unwrap() {
+            // Waited for by a peek, taken without waiting (`wire::arrives`). A refusal from a
+            // member that is down reads as an error on some platforms: no answer yet, and the
+            // wait goes on to its timeout.
+            if !wire::arrives(&self.test, Some(left), &mut received).unwrap() {
                 return None;
             }
-            let length = match wire::take(&self.test, &mut received) {
-                Ok((length, _)) => length,
-                Err(error)
-                    if matches!(
-                        error.kind(),
-                        ErrorKind::ConnectionReset | ErrorKind::WouldBlock
-                    ) =>
-                {
-                    continue;
-                }
-                Err(error) => panic!("the test's socket: {error}"),
+            let Ok((length, _)) = wire::take(&self.test, &mut received) else {
+                continue;
             };
             let Some((Kind::Response, body)) = wire::open(&received[..length]) else {
                 continue;
             };
-            if let Some((id, outcome)) = wire::read_response(body)
-                && id == request
-            {
-                return Some(outcome);
+            if wire::Reader::new(body).u64() == Some(ask) {
+                return Some(body.to_vec());
             }
         }
     }
-    fn request(&mut self, id: u64, op: &Op<'_>) -> Option<Outcome> {
+    fn ask(&mut self, id: u64, op: &Op<'_>) -> Option<Outcome> {
         self.next_id += 1;
-        let request = self.next_id;
-        wire::put_request(&mut self.buffer, request, op);
-        self.ask(id, request)
+        let ask = self.next_id;
+        wire::put_request(&mut self.buffer, ask, op);
+        let body = self.exchange(id, ask)?;
+        wire::read_response(&body).map(|(_, outcome)| outcome)
     }
-    /// Sends an instruction until the member answers it. An instruction is a datagram, which a
-    /// member descheduled on a slow runner may answer late or a full socket may drop, so it is
-    /// sent again, under the same request, for as long as a write is given; setting peers or
-    /// isolation twice changes nothing, so the instruction is idempotent.
+    fn report(&mut self, id: u64) -> Option<Report> {
+        self.next_id += 1;
+        let ask = self.next_id;
+        stream::put_report_ask(&mut self.buffer, ask);
+        let body = self.exchange(id, ask)?;
+        let (_, report) = stream::read_report(&body, hyper_raft::MAX_MEMBERS)?;
+        let round = Duration::from_nanos(report.round_ns);
+        // The longest its detectors state to suspect a crash, or, while a pair no margin judges
+        // takes heartbeats at a longer interval, that interval: the most a wait that goes on
+        // while those heartbeats move can see none.
+        let law = Duration::from_nanos(report.detection_ns.max(report.unjudged_interval_ns))
+            + Duration::from_nanos(report.span_ns)
+            + round * (ELECTION_ROUNDS + ANSWER_ROUNDS);
+        self.law.insert(id, law);
+        Some(report)
+    }
+    /// Sends an instruction to `id` until it answers, each retransmission timeout, for as long as
+    /// its process runs: an instruction is an idempotent datagram, which a loaded machine may
+    /// drop or deliver late, and a member just started has no group yet whose progress could
+    /// bound the wait. A member whose process ended fails it.
+    fn instruct(&mut self, id: u64, control: &Control) {
+        self.next_id += 1;
+        let ask = self.next_id;
+        loop {
+            wire::put_control(&mut self.buffer, ask, control);
+            if let Some(body) = self.exchange(id, ask) {
+                let outcome = wire::read_response(&body).map(|(_, outcome)| outcome);
+                assert_eq!(
+                    outcome,
+                    Some(Outcome::Done),
+                    "member {id} refused an instruction"
+                );
+                return;
+            }
+            let name = self.name;
+            let child = self.members[(id - 1) as usize].child.as_mut().unwrap();
+            assert!(
+                child.try_wait().unwrap().is_none(),
+                "{name}: member {id} ended before it took an instruction"
+            );
+        }
+    }
+    fn tell_peers(&mut self, id: u64) {
+        let peers: Vec<(u64, SocketAddr)> = (1..=self.voters() as u64)
+            .map(|peer| (peer, self.address(peer)))
+            .collect();
+        self.instruct(id, &Control::Peers(peers));
+    }
+
+    /// How long the group may go with nothing moving before a wait gives up: the longest any
+    /// member's law takes, from its latest report, and never less than a retransmission timeout.
+    /// A live group suspects a dead leader within its stated detection, elects or starts a new
+    /// term within an election, and answers within an ask's rounds, so a quiet period in which
+    /// nothing moves is a group that is stuck, not one that drew a split vote. A wait has no count
+    /// of elections: it goes on while the group moves.
+    fn quiet(&self) -> Duration {
+        self.law.values().copied().max().unwrap_or(RTO).max(RTO)
+    }
     #[allow(
         clippy::disallowed_methods,
         reason = "real processes on the host's clock, threads and environment (CLAUDE.md §1a, end to end)"
     )]
-    fn control(&mut self, id: u64, control: &Control) {
-        self.next_id += 1;
-        let request = self.next_id;
-        let until = Instant::now() + self.budget();
-        loop {
-            wire::put_control(&mut self.buffer, request, control);
-            if let Some(outcome) = self.ask(id, request) {
-                assert_eq!(outcome, Outcome::Done, "member {id} refused an instruction");
-                return;
+    fn watch(&self) -> Watch {
+        Watch {
+            seen: BTreeMap::new(),
+            until: Instant::now() + self.quiet(),
+        }
+    }
+    /// Whether the group is still moving: asks every member up for its report, and extends the
+    /// watch by a quiet period whenever any member's term, commit, applied index, last index or
+    /// restarts seen has moved since it last looked, or, while it has a pair no margin judges,
+    /// the heartbeats it has taken. The group is quiet only once a look that began after the
+    /// quiet period ended saw nothing move: an ask whose answer was lost spends a retransmission
+    /// timeout of the test's own, not of the group's.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "real processes on the host's clock, threads and environment (CLAUDE.md §1a, end to end)"
+    )]
+    fn moving(&mut self, watch: &mut Watch) -> bool {
+        let looked = Instant::now();
+        let mut moved = false;
+        let mut seen = Vec::new();
+        for id in self.up_members() {
+            if let Some(report) = self.report(id) {
+                let judging = if report.unjudged > 0 { report.taken } else { 0 };
+                let at = [
+                    report.status.term,
+                    report.status.commit,
+                    report.status.applied,
+                    report.status.last_index,
+                    report.restarts,
+                    report.unjudged,
+                    judging,
+                ];
+                if watch.seen.insert(id, at) != Some(at) {
+                    moved = true;
+                }
+                seen.push(report);
             }
-            assert!(
-                Instant::now() < until,
-                "member {id} took no instruction within {:?}",
-                self.budget()
+        }
+        if moved {
+            watch.until = Instant::now() + self.quiet();
+        }
+        let moving = looked < watch.until;
+        if !moving {
+            // What the group was when it was judged stuck, for the failure that follows.
+            eprintln!(
+                "{}: nothing moved for {:?}; the last look: {seen:?}",
+                self.name,
+                self.quiet()
             );
         }
+        moving
     }
-    fn tell_peers(&mut self) {
-        let peers: Vec<(u64, SocketAddr)> = (1..=self.voters() as u64)
-            .map(|id| (id, self.address(id)))
-            .collect();
-        for id in 1..=self.voters() as u64 {
-            if self.up(id) {
-                self.control(id, &Control::Peers(peers.clone()));
+    /// The reports of the members in `among` that answer.
+    fn reports(&mut self, among: &[u64]) -> BTreeMap<u64, Report> {
+        among
+            .iter()
+            .filter_map(|id| self.report(*id).map(|report| (*id, report)))
+            .collect()
+    }
+    /// Waits while the group moves until `fact` holds of the reports of the members in `among`;
+    /// whether it did.
+    fn until(&mut self, among: &[u64], fact: impl Fn(&BTreeMap<u64, Report>) -> bool) -> bool {
+        let mut watch = self.watch();
+        loop {
+            let reports = self.reports(among);
+            if fact(&reports) {
+                return true;
+            }
+            if !self.moving(&mut watch) {
+                return false;
             }
         }
     }
-    fn status(&mut self, id: u64) -> Option<Status> {
-        match self.request(id, &Op::Status)? {
-            Outcome::Status(status) => Some(status),
-            other => panic!("member {id} answered a status with {other:?}"),
+    /// The member that leads in the latest term any member leads in, once one does, waited for
+    /// while the group moves. A member cut off may still believe it leads an older term.
+    fn leader(&mut self) -> Option<u64> {
+        let mut watch = self.watch();
+        loop {
+            let up = self.up_members();
+            let leader = self
+                .reports(&up)
+                .into_iter()
+                .filter(|(_, report)| report.status.leads)
+                .max_by_key(|(_, report)| report.status.term)
+                .map(|(id, _)| id);
+            if leader.is_some() {
+                return leader;
+            }
+            if !self.moving(&mut watch) {
+                return None;
+            }
         }
     }
-    /// Kills member `id` with SIGKILL (TerminateProcess on Windows): no flush, no goodbye.
+    /// Waits while the group moves until the members in `among` agree on one leader of one term,
+    /// which is among them, and says which.
+    fn leader_among(&mut self, among: &[u64]) -> (u64, u64) {
+        // What the reports agreed on when they did: asked again, a leader a detector's mistake
+        // deposed since would be gone.
+        let agreed = std::cell::Cell::new((0, 0));
+        let count = among.len();
+        let found = self.until(among, |reports| {
+            let leaders: Vec<&Report> = reports.values().filter(|r| r.status.leads).collect();
+            let [leader] = leaders.as_slice() else {
+                return false;
+            };
+            let all = reports.len() == count
+                && reports.values().all(|r| {
+                    r.status.leader == leader.status.id && r.status.term == leader.status.term
+                });
+            if all {
+                agreed.set((leader.status.id, leader.status.term));
+            }
+            all
+        });
+        assert!(
+            found,
+            "{}: the group stopped moving with no leader among {among:?}",
+            self.name
+        );
+        agreed.get()
+    }
+    /// Kills member `id` with SIGKILL (TerminateProcess on Windows): no flush, no goodbye. Nobody
+    /// is told: the others' detectors find out.
     fn kill(&mut self, id: u64) {
         let mut child = self.members[(id - 1) as usize]
             .child
@@ -409,147 +457,71 @@ impl Cluster {
             .expect("a member that is up");
         child.kill().unwrap();
         child.wait().unwrap();
+        self.law.remove(&id);
     }
-    /// Starts member `id` again on its log, at the address it had.
+    /// Starts member `id` again on its log, at the address it had; then, while the group moves,
+    /// every other member up that had heard its last run reports the restart its stream saw
+    /// (`hyper_liveness::Change::Restarted`). A member that never took a heartbeat of the last
+    /// run cannot tell the new one from a first.
     fn restart(&mut self, id: u64) {
+        let up = self.up_members();
+        let before: BTreeMap<u64, u64> = self
+            .reports(&up)
+            .into_iter()
+            .filter(|(_, r)| r.heard.contains(&id))
+            .map(|(other, r)| (other, r.restarts))
+            .collect();
         let member = &self.members[(id - 1) as usize];
         assert!(member.child.is_none(), "member {id} is up");
         let listen = member.address.to_string();
-        let (child, port) = spawn(
-            id,
-            self.voters(),
-            &listen,
-            &member.wal.clone(),
-            self.tick,
-            self.room,
-        );
+        let (child, port) = spawn(id, self.voters(), &listen, &member.wal.clone(), self.room);
         assert_eq!(port, self.members[(id - 1) as usize].address.port());
         self.members[(id - 1) as usize].child = Some(child);
-        self.tell_peers();
-    }
-    fn isolate(&mut self, id: u64, cut: bool) {
-        self.control(id, &Control::Isolate(cut));
-    }
-    /// Waits until the members in `among` agree on one leader of one term, which is among
-    /// them, and says which.
-    #[allow(
-        clippy::disallowed_methods,
-        reason = "real processes on the host's clock, threads and environment (CLAUDE.md §1a, end to end)"
-    )]
-    fn leader_among(&mut self, among: &[u64]) -> (u64, u64) {
-        let until = Instant::now() + self.budget();
-        while Instant::now() < until {
-            let mut seen: Vec<Status> = Vec::new();
-            for id in among {
-                if let Some(status) = self.status(*id) {
-                    seen.push(status);
-                }
-            }
-            let leaders: Vec<&Status> = seen.iter().filter(|status| status.leads).collect();
-            if let [leader] = leaders.as_slice()
-                && seen.len() == among.len()
-                && seen
-                    .iter()
-                    .all(|status| status.leader == leader.id && status.term == leader.term)
-            {
-                return (leader.id, leader.term);
-            }
-            // No agreement yet: the members are electing. A leader elected makes itself known
-            // within a heartbeat.
-            self.wait_ticks(HEARTBEAT_TICKS);
-        }
-        panic!(
-            "{}: no leader among {among:?} within {:?}",
-            self.name,
-            self.budget()
+        self.tell_peers(id);
+        let others: Vec<u64> = before.keys().copied().collect();
+        let seen = self.until(&others, |reports| {
+            before
+                .iter()
+                .all(|(other, restarts)| reports.get(other).is_some_and(|r| r.restarts > *restarts))
+        });
+        assert!(
+            seen,
+            "{}: a member's stream never reported {id}'s restart",
+            self.name
         );
     }
-    /// Lets `ticks` pass. The test's socket is asked nothing, so the wait is its timeout; an
-    /// answer that comes late to a request already given up on is dropped, and the wait goes on
-    /// to its end.
-    #[allow(
-        clippy::disallowed_methods,
-        reason = "real processes on the host's clock, threads and environment (CLAUDE.md §1a, end to end); the timed receives drop whatever arrives while the test waits out its ticks, so none has a datagram to lose"
-    )]
-    fn wait_ticks(&mut self, ticks: u32) {
-        let until = Instant::now() + self.tick * ticks;
-        let mut sink = vec![0u8; wire::MAX_DATAGRAM];
-        loop {
-            let wait = until.saturating_duration_since(Instant::now());
-            if wait.is_zero() {
-                return;
+    fn isolate(&mut self, id: u64, cut: bool) {
+        self.instruct(id, &Control::Isolate(cut));
+    }
+    /// Waits while the group moves until every member in `among` applied the same history
+    /// through the same index, all it knows committed.
+    fn converged(&mut self, among: &[u64]) -> u64 {
+        let count = among.len();
+        let applied = std::cell::Cell::new(0);
+        let found = self.until(among, |reports| {
+            let Some(first) = reports.values().next() else {
+                return false;
+            };
+            let alike = reports.len() == count
+                && first.status.applied > 0
+                && reports.values().all(|r| {
+                    r.status.applied == first.status.applied
+                        && r.status.digest == first.status.digest
+                        && r.status.applied == r.status.commit
+                });
+            if alike {
+                applied.set(first.status.applied);
             }
-            self.test.set_read_timeout(Some(wait)).unwrap();
-            let _ = self.test.recv_from(&mut sink);
+            alike
+        });
+        if !found {
+            let reports = self.reports(among);
+            panic!(
+                "{}: the members stopped moving before they converged: {reports:#?}",
+                self.name
+            );
         }
-    }
-    /// The chance one election of a group of `voters` elects: the earliest timer of those that
-    /// campaign fires `VOTE_ROUNDS` ticks or more before the next, so its vote rounds end before
-    /// another campaigns. Each of `voters` timers is drawn uniformly from the `ELECTION_TICKS`
-    /// ticks of `[ELECTION_TICKS, 2 · ELECTION_TICKS)`; the chance that a given one is drawn at
-    /// tick `k` and every other at `k + VOTE_ROUNDS` or later, summed over the `voters` that may
-    /// be earliest and the ticks it may be drawn at. Every voter campaigning is the least chance:
-    /// a group that lost its leader has one fewer.
-    fn election_chance(voters: usize) -> f64 {
-        let slots = f64::from(ELECTION_TICKS);
-        let voters = voters as f64;
-        (0..ELECTION_TICKS)
-            .map(|at| {
-                let later = f64::from(ELECTION_TICKS.saturating_sub(at + VOTE_ROUNDS));
-                voters / slots * (later / slots).powf(voters - 1.0)
-            })
-            .sum()
-    }
-    /// The elections one wait allows for: enough that each of the `caused` elections of the run
-    /// elects within them with the run's confidence shared among them (Bonferroni), so the whole
-    /// run fails for want of an election with at most `1 − CONFIDENCE`.
-    fn elections(voters: usize, caused: u32) -> u32 {
-        let miss = (1.0 - CONFIDENCE) / f64::from(caused);
-        (miss.ln() / (1.0 - Self::election_chance(voters)).ln()).ceil() as u32
-    }
-    /// The ticks one write or read may take to be answered: its elections, and the answer.
-    fn budget_ticks(elections: u32) -> u32 {
-        elections * ELECTION_ROUND_TICKS + ANSWER_TICKS
-    }
-    fn budget(&self) -> Duration {
-        self.tick * Self::budget_ticks(self.elections)
-    }
-    fn up_members(&self) -> Vec<u64> {
-        (1..=self.voters() as u64)
-            .filter(|id| self.up(*id))
-            .collect()
-    }
-    /// Waits until every member in `among` applied the same history through the same index.
-    /// A member behind catches up at least an entry a broadcast, so the wait is the elections'
-    /// budget and a tick for each entry the group's log holds.
-    #[allow(
-        clippy::disallowed_methods,
-        reason = "real processes on the host's clock, threads and environment (CLAUDE.md §1a, end to end)"
-    )]
-    fn converged(&mut self, among: &[u64]) -> Status {
-        let entries = among
-            .iter()
-            .filter_map(|id| self.status(*id))
-            .map(|status| status.last_index)
-            .max()
-            .unwrap_or(0);
-        let until = Instant::now() + self.budget() + self.tick * u32::try_from(entries).unwrap();
-        while Instant::now() < until {
-            let seen: Vec<Status> = among.iter().filter_map(|id| self.status(*id)).collect();
-            if seen.len() == among.len()
-                && seen.iter().all(|status| {
-                    status.applied == seen[0].applied
-                        && status.digest == seen[0].digest
-                        && status.applied == status.commit
-                })
-                && seen[0].applied > 0
-            {
-                return seen[0];
-            }
-            self.wait_ticks(HEARTBEAT_TICKS);
-        }
-        let seen: Vec<Option<Status>> = among.iter().map(|id| self.status(*id)).collect();
-        panic!("{}: the members did not converge: {seen:#?}", self.name);
+        applied.get()
     }
 }
 
@@ -566,35 +538,17 @@ struct Client {
 }
 
 impl Client {
-    fn next(&self, cluster: &Cluster, from: u64) -> u64 {
-        let voters = cluster.voters() as u64;
-        let mut id = from;
-        for _ in 0..voters {
-            id = id % voters + 1;
-            if cluster.up(id) {
-                return id;
-            }
+    /// Whom to ask next: the leader `hint` names, if it is another member up; the member that
+    /// leads the latest term otherwise, once one does.
+    fn next(&mut self, cluster: &mut Cluster, hint: u64) {
+        if hint != 0 && hint != self.leader && cluster.up(hint) {
+            self.leader = hint;
+        } else if let Some(leader) = cluster.leader() {
+            self.leader = leader;
         }
-        from
     }
-    /// Whom to ask after `from` answered that it does not lead and named `hint`. A member that
-    /// names no other leader is in an election, or its leader is gone: the client lets a
-    /// heartbeat interval pass, within which a leader elected makes itself known, before it asks
-    /// the next. Without the pause, two members that disagree on who leads during an election
-    /// (one names the other, which names no one) answer at once, over and over, and the client
-    /// spends its budget before the election ends.
-    fn target(&self, hint: u64, cluster: &mut Cluster, from: u64) -> u64 {
-        if hint != 0 && hint != from && cluster.up(hint) {
-            return hint;
-        }
-        cluster.wait_ticks(HEARTBEAT_TICKS);
-        self.next(cluster, from)
-    }
-    /// Writes `key`; true once a member answered that it is committed.
-    #[allow(
-        clippy::disallowed_methods,
-        reason = "real processes on the host's clock, threads and environment (CLAUDE.md §1a, end to end)"
-    )]
+    /// Writes `key`; true once a member answered that it is committed, false once the group
+    /// stopped moving without an answer.
     fn put(
         &mut self,
         cluster: &mut Cluster,
@@ -602,55 +556,48 @@ impl Client {
         key: &[u8],
         value: &[u8],
     ) -> bool {
-        let mut target = self.leader;
-        let until = Instant::now() + cluster.budget();
-        while Instant::now() < until {
-            match cluster.request(target, &Op::Put { key, value }) {
+        let mut watch = cluster.watch();
+        loop {
+            let hint = match cluster.ask(self.leader, &Op::Put { key, value }) {
                 Some(Outcome::Put(_)) => {
-                    self.leader = target;
                     history.unknown.remove(key);
                     history.acked.insert(key.to_vec(), value.to_vec());
                     return true;
                 }
-                Some(Outcome::NotLeader(hint)) => target = self.target(hint, cluster, target),
-                // Its asks are answered within a broadcast, which makes room.
-                Some(Outcome::Busy) => cluster.wait_ticks(BROADCAST_TICKS),
+                Some(Outcome::NotLeader(hint)) => hint,
+                Some(Outcome::Busy) => self.leader,
                 Some(other) => panic!("a write answered with {other:?}"),
                 None => {
                     // No answer: the write may or may not be committed.
                     history.unknown.insert(key.to_vec(), value.to_vec());
-                    target = self.next(cluster, target);
+                    0
                 }
+            };
+            if !cluster.moving(&mut watch) {
+                return false;
             }
+            self.next(cluster, hint);
         }
-        false
     }
     /// Reads `key` linearizably through the leader.
-    #[allow(
-        clippy::disallowed_methods,
-        reason = "real processes on the host's clock, threads and environment (CLAUDE.md §1a, end to end)"
-    )]
     fn get(&mut self, cluster: &mut Cluster, key: &[u8]) -> Option<Vec<u8>> {
-        let mut target = self.leader;
-        let until = Instant::now() + cluster.budget();
-        while Instant::now() < until {
-            match cluster.request(target, &Op::Get { key }) {
-                Some(Outcome::Value(value)) => {
-                    self.leader = target;
-                    return value;
-                }
-                Some(Outcome::NotLeader(hint)) => target = self.target(hint, cluster, target),
-                // Its asks are answered within a broadcast, which makes room.
-                Some(Outcome::Busy) => cluster.wait_ticks(BROADCAST_TICKS),
+        let mut watch = cluster.watch();
+        loop {
+            let hint = match cluster.ask(self.leader, &Op::Get { key }) {
+                Some(Outcome::Value(value)) => return value,
+                Some(Outcome::NotLeader(hint)) => hint,
+                Some(Outcome::Busy) => self.leader,
                 Some(other) => panic!("a read answered with {other:?}"),
-                None => target = self.next(cluster, target),
-            }
+                None => 0,
+            };
+            assert!(
+                cluster.moving(&mut watch),
+                "{}: the group stopped moving with no read of {:?} answered",
+                cluster.name,
+                String::from_utf8_lossy(key)
+            );
+            self.next(cluster, hint);
         }
-        panic!(
-            "{}: no read of {:?} was answered",
-            cluster.name,
-            String::from_utf8_lossy(key)
-        );
     }
 }
 
@@ -697,7 +644,7 @@ fn write_range(
         let value = format!("value-{at}");
         assert!(
             client.put(cluster, history, key.as_bytes(), value.as_bytes()),
-            "{}: a write of {key} was never answered",
+            "{}: the group stopped moving with a write of {key} unanswered",
             cluster.name
         );
         // Read what was just answered: linearizability asks that it be there at once.
@@ -713,14 +660,24 @@ fn write_range(
     slowest
 }
 
-/// A group of `voters` commits a workload, and every member applies it alike.
+/// The datagram the test's sockets carry at most, which every phase is sized by.
+fn datagram() -> usize {
+    wire::largest(&UdpSocket::bind("127.0.0.1:0").unwrap()).unwrap()
+}
+
+/// A group of `voters` commits a phase of writes, and every member applies it alike.
 #[allow(
     clippy::disallowed_methods,
     reason = "real processes on the host's clock, threads and environment (CLAUDE.md §1a, end to end)"
 )]
-fn commits(voters: usize, run: Run, name: &'static str) -> String {
-    let writes = workload();
-    let mut cluster = Cluster::start(name, voters, run, writes);
+fn commits(voters: usize, name: &'static str) -> String {
+    let writes = phase(name, datagram());
+    let room = Room {
+        keys: writes,
+        pending: 1,
+        writes,
+    };
+    let mut cluster = Cluster::start(name, voters, room);
     let all = cluster.up_members();
     let (leader, _) = cluster.leader_among(&all);
     let mut client = Client { leader };
@@ -729,66 +686,140 @@ fn commits(voters: usize, run: Run, name: &'static str) -> String {
     let slowest = write_range(&mut cluster, &mut client, &mut history, 0..writes);
     let elapsed = started.elapsed();
     let checked = verify(&mut cluster, &mut client, &history);
-    let status = cluster.converged(&all);
+    let applied = cluster.converged(&all);
     format!(
-        "{name}: {voters} members; {checked} writes answered and read back ({:.2} ms per write and read, {:.2} ms the 95/95 bound); all applied index {} alike",
+        "{name}: {voters} members; {checked} writes answered and read back ({:.2} ms per write and read, {:.2} ms the slowest); all applied index {applied} alike",
         elapsed.as_secs_f64() * 1e3 / writes as f64,
         slowest.as_secs_f64() * 1e3,
-        status.applied
     )
+}
+
+/// A client of its own for the writes in flight: it sends them at once without waiting, and reads
+/// their answers only to leave out of its next sending the ones answered. Answers to that many at
+/// once would fill the test's own socket and push out the reports it waits on.
+struct Flight {
+    socket: UdpSocket,
+    /// The request each write was last sent under: id → the write's number.
+    sent: BTreeMap<u64, usize>,
+    /// The writes a member answered committed.
+    answered: std::collections::BTreeSet<usize>,
+}
+
+impl Flight {
+    fn new() -> Self {
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        socket.set_nonblocking(true).unwrap();
+        Self {
+            socket,
+            sent: BTreeMap::new(),
+            answered: std::collections::BTreeSet::new(),
+        }
+    }
+    /// Sends the writes `keys` of scenario `name` not yet answered to `to`, at once.
+    fn send(&mut self, cluster: &mut Cluster, name: &str, to: u64, keys: std::ops::Range<usize>) {
+        self.take_answers();
+        self.sent.clear();
+        let address = cluster.address(to);
+        for at in keys.filter(|at| !self.answered.contains(at)) {
+            let key = format!("{name}-{at}");
+            let value = format!("value-{at}");
+            cluster.next_id += 1;
+            wire::put_request(
+                &mut cluster.buffer,
+                cluster.next_id,
+                &Op::Put {
+                    key: key.as_bytes(),
+                    value: value.as_bytes(),
+                },
+            );
+            assert!(wire::seal(&mut cluster.buffer, cluster.datagram));
+            // A full socket refuses or drops: the write is sent again.
+            let _ = self.socket.send_to(&cluster.buffer, address);
+            self.sent.insert(cluster.next_id, at);
+        }
+    }
+    /// Takes the answers that have come, without waiting.
+    fn take_answers(&mut self) {
+        let mut received = vec![0u8; wire::MAX_DATAGRAM];
+        while let Ok((length, _)) = self.socket.recv_from(&mut received) {
+            let Some((Kind::Response, body)) = wire::open(&received[..length]) else {
+                continue;
+            };
+            if let Some((id, Outcome::Put(_))) = wire::read_response(body)
+                && let Some(at) = self.sent.get(&id)
+            {
+                self.answered.insert(*at);
+            }
+        }
+    }
 }
 
 /// The leader is killed while writes are in flight; the others elect, and nothing answered is
 /// lost. The killed member comes back on its log and applies the same history.
-#[allow(
-    clippy::disallowed_methods,
-    reason = "real processes on the host's clock, threads and environment (CLAUDE.md §1a, end to end)"
-)]
-fn leader_killed(run: Run) -> String {
+fn leader_killed() -> String {
     let name = "leader-killed";
-    let phase = workload();
-    // A phase before, the writes in flight, and a phase after.
-    let mut cluster = Cluster::start(name, 3, run, 3 * phase);
+    let phase = phase(name, datagram());
+    // A phase before, the writes in flight, and a phase after; the leader keeps the writes in
+    // flight waiting, and the client's one.
+    let room = Room {
+        keys: 3 * phase,
+        pending: phase + 1,
+        writes: 3 * phase,
+    };
+    let mut cluster = Cluster::start(name, 3, room);
     let all = cluster.up_members();
     let (first, _) = cluster.leader_among(&all);
     let mut client = Client { leader: first };
     let mut history = History::default();
     write_range(&mut cluster, &mut client, &mut history, 0..phase);
     // The leader now, which the writes may have moved: the writes in flight go to it.
-    let (old, old_term) = cluster.leader_among(&all);
-    // Writes the leader has taken into its log, and has not answered, when it dies.
-    let before = cluster.status(old).unwrap().last_index;
+    let in_flight = phase;
     for at in phase..2 * phase {
-        let key = format!("{name}-{at}");
-        let value = format!("value-{at}");
-        cluster.next_id += 1;
-        wire::put_request(
-            &mut cluster.buffer,
-            cluster.next_id,
-            &Op::Put {
-                key: key.as_bytes(),
-                value: value.as_bytes(),
-            },
+        history.unknown.insert(
+            format!("{name}-{at}").into_bytes(),
+            format!("value-{at}").into_bytes(),
         );
-        assert!(wire::seal(&mut cluster.buffer, cluster.datagram));
-        let address = cluster.address(old);
-        cluster.test.send_to(&cluster.buffer, address).unwrap();
-        history.unknown.insert(key.into_bytes(), value.into_bytes());
     }
-    // The member takes datagrams in the order they arrive, so the first status answered after
-    // them sees them; one lost is asked again, within the budget.
-    let in_flight = phase as u64;
-    let until = Instant::now() + cluster.budget();
-    let mut appended = before;
-    while appended < before + in_flight && Instant::now() < until {
-        if let Some(status) = cluster.status(old) {
-            appended = status.last_index;
+    // The writes in flight go to whoever leads, and those not answered are sent again while its
+    // log holds fewer than every write made — a datagram is lost when a socket's buffer is full,
+    // and the leadership may move — until a leader holds them all; a write a leader holds
+    // already it does not propose again.
+    let mut flight = Flight::new();
+    let made = (phase + in_flight) as u64;
+    let mut watch = cluster.watch();
+    let (mut sent_to, mut seen) = (0, 0);
+    let (old, old_term) = loop {
+        let leader = cluster.leader().unwrap_or(sent_to);
+        let report = cluster.report(leader).filter(|r| r.status.leads);
+        if let Some(report) = &report
+            && report.writes >= made
+        {
+            break (leader, report.status.term);
+        }
+        let holds = report.map_or(seen, |r| r.writes);
+        if leader != sent_to || holds == seen {
+            flight.send(&mut cluster, name, leader, phase..2 * phase);
+            sent_to = leader;
+        }
+        seen = holds;
+        if !cluster.moving(&mut watch) {
+            let up = cluster.up_members();
+            let reports = cluster.reports(&up);
+            panic!(
+                "{name}: the group stopped moving before a leader took the writes in flight ({} of {in_flight} answered): {reports:#?}",
+                flight.answered.len()
+            );
+        }
+    };
+    // The writes in flight that were answered are committed.
+    flight.take_answers();
+    let answered = flight.answered.len();
+    for at in &flight.answered {
+        let key = format!("{name}-{at}").into_bytes();
+        if let Some(value) = history.unknown.remove(&key) {
+            history.acked.insert(key, value);
         }
     }
-    assert!(
-        appended >= before + in_flight,
-        "{name}: the leader never took the writes in flight"
-    );
     cluster.kill(old);
     let rest: Vec<u64> = cluster.up_members();
     let (new, new_term) = cluster.leader_among(&rest);
@@ -808,20 +839,24 @@ fn leader_killed(run: Run) -> String {
         .filter(|key| client.get(&mut cluster, key).is_some())
         .count();
     cluster.restart(old);
-    let status = cluster.converged(&all);
+    let applied = cluster.converged(&all);
     format!(
-        "{name}: leader {old} (term {old_term}) killed with {phase} writes in its log unanswered; {new} elected in term {new_term}; {checked} answered writes read back; {unknown_present} of those {phase} were committed by the new leader; member {old} restarted on its log and applied index {} alike",
-        status.applied
+        "{name}: leader {old} (term {old_term}) killed with the {in_flight} writes in flight in its log; {new} elected in term {new_term}; {checked} answered writes read back; {answered} of them answered before the kill, and {unknown_present} of those unanswered committed by the new leader; member {old} restarted on its log, its restart reported, and applied index {applied} alike"
     )
 }
 
 /// A follower is killed, the group goes on without it, and it comes back on its log and
 /// catches up.
-fn follower_restarts(run: Run) -> String {
+fn follower_restarts() -> String {
     let name = "follower-restarts";
-    let phase = workload();
+    let phase = phase(name, datagram());
     // A phase with the follower, and a phase without it.
-    let mut cluster = Cluster::start(name, 3, run, 2 * phase);
+    let room = Room {
+        keys: 2 * phase,
+        pending: 1,
+        writes: 2 * phase,
+    };
+    let mut cluster = Cluster::start(name, 3, room);
     let all = cluster.up_members();
     let (leader, _) = cluster.leader_among(&all);
     let follower = all.iter().copied().find(|id| *id != leader).unwrap();
@@ -830,26 +865,37 @@ fn follower_restarts(run: Run) -> String {
     write_range(&mut cluster, &mut client, &mut history, 0..phase);
     cluster.kill(follower);
     write_range(&mut cluster, &mut client, &mut history, phase..2 * phase);
-    let before = cluster.status(leader).unwrap();
+    let up = cluster.up_members();
+    let commit = cluster
+        .reports(&up)
+        .values()
+        .map(|r| r.status.commit)
+        .max()
+        .unwrap();
     cluster.restart(follower);
-    let status = cluster.converged(&all);
-    assert!(status.applied >= before.commit);
+    let applied = cluster.converged(&all);
+    assert!(applied >= commit);
     let checked = verify(&mut cluster, &mut client, &history);
     format!(
-        "{name}: follower {follower} killed after {phase} writes, {phase} written without it, restarted on its log, caught up to index {} alike; {checked} writes read back",
-        status.applied
+        "{name}: follower {follower} killed after {phase} writes, {phase} written without it, restarted on its log, its restart reported, caught up to index {applied} alike; {checked} writes read back"
     )
 }
 
-/// The leader of five is cut off by a drop filter in its own process. It answers no read with
-/// what the others replace; the others elect and go on; once the filter is lifted it follows
-/// and applies the same history.
-fn partition(run: Run) -> String {
+/// The leader of five is cut off by a drop filter in its own process, its heartbeats with its
+/// Raft messages. It answers no read with what the others replace; it suspects every other and
+/// every other suspects it; the others elect and go on; once the filter is lifted it follows and
+/// applies the same history.
+fn partition() -> String {
     let name = "partition";
-    let phase = workload();
+    let phase = phase(name, datagram());
     // A phase before the cut, the moved key three times (before, to the member cut off, after),
     // and a phase after.
-    let mut cluster = Cluster::start(name, 5, run, 2 * phase + 3);
+    let room = Room {
+        keys: 2 * phase + 1,
+        pending: 1,
+        writes: 2 * phase + 3,
+    };
+    let mut cluster = Cluster::start(name, 5, room);
     let all = cluster.up_members();
     let (first, _) = cluster.leader_among(&all);
     let mut client = Client { leader: first };
@@ -862,9 +908,9 @@ fn partition(run: Run) -> String {
     client.leader = old;
     cluster.isolate(old, true);
     // At once, while it still believes it leads: it can confirm nothing with a quorum, so it
-    // answers no read with a value and acknowledges no write; once its check of the quorum
-    // fails it steps down and tells whoever waits that it does not lead.
-    let early_read = cluster.request(
+    // answers no read with a value and acknowledges no write; once its detectors leave it no
+    // quorum it steps down and tells whoever waits that it does not lead.
+    let early_read = cluster.ask(
         old,
         &Op::Get {
             key: key.as_bytes(),
@@ -874,7 +920,7 @@ fn partition(run: Run) -> String {
         !matches!(early_read, Some(Outcome::Value(_))),
         "{name}: the member cut off answered a read: {early_read:?}"
     );
-    let early_write = cluster.request(
+    let early_write = cluster.ask(
         old,
         &Op::Put {
             key: key.as_bytes(),
@@ -891,13 +937,26 @@ fn partition(run: Run) -> String {
     let rest: Vec<u64> = all.iter().copied().filter(|id| *id != old).collect();
     let (new, new_term) = cluster.leader_among(&rest);
     assert!(new_term > old_term);
+    // The cut is the detectors' to see: the member cut off suspects every other, and every other
+    // suspects it.
+    let seen = cluster.until(&all, |reports| {
+        reports.len() == all.len()
+            && reports.iter().all(|(id, r)| {
+                if *id == old {
+                    rest.iter().all(|peer| r.suspected.contains(peer))
+                } else {
+                    r.suspected.contains(&old)
+                }
+            })
+    });
+    assert!(seen, "{name}: the detectors did not see the cut");
     client.leader = new;
     assert!(client.put(&mut cluster, &mut history, key.as_bytes(), b"after"));
     // The write the cut-off member took was never committed: the group's value is "after".
     history.unknown.remove(key.as_bytes());
     write_range(&mut cluster, &mut client, &mut history, phase..2 * phase);
     // The member cut off may still believe it leads; a read it answers must not be stale.
-    let stale = cluster.request(
+    let stale = cluster.ask(
         old,
         &Op::Get {
             key: key.as_bytes(),
@@ -908,20 +967,24 @@ fn partition(run: Run) -> String {
         "{name}: the member cut off answered a read: {stale:?}"
     );
     cluster.isolate(old, false);
-    let status = cluster.converged(&all);
+    let applied = cluster.converged(&all);
     let (leader, _) = cluster.leader_among(&all);
     let checked = verify(&mut cluster, &mut client, &history);
     format!(
-        "{name}: leader {old} of 5 cut off; at once it answered a read with {early_read:?} and a write with {early_write:?}, and later the read of a replaced key with {stale:?}; {new} elected in term {new_term}; after the filter lifted, {leader} leads and all applied index {} alike; {checked} writes read back",
-        status.applied
+        "{name}: leader {old} of 5 cut off; at once it answered a read with {early_read:?} and a write with {early_write:?}, and later the read of a replaced key with {stale:?}; it suspected all four and all four suspected it; {new} elected in term {new_term}; after the filter lifted, {leader} leads and all applied index {applied} alike; {checked} writes read back"
     )
 }
 
 /// Every member is killed at once and restarted on its log: every answered write survives.
-fn all_killed(run: Run) -> String {
+fn all_killed() -> String {
     let name = "all-killed";
-    let phase = workload();
-    let mut cluster = Cluster::start(name, 3, run, phase);
+    let phase = phase(name, datagram());
+    let room = Room {
+        keys: phase,
+        pending: 1,
+        writes: phase,
+    };
+    let mut cluster = Cluster::start(name, 3, room);
     let all = cluster.up_members();
     let (leader, _) = cluster.leader_among(&all);
     let mut client = Client { leader };
@@ -936,34 +999,32 @@ fn all_killed(run: Run) -> String {
     let (leader, term) = cluster.leader_among(&all);
     client.leader = leader;
     let checked = verify(&mut cluster, &mut client, &history);
-    let status = cluster.converged(&all);
+    let applied = cluster.converged(&all);
     format!(
-        "{name}: every member killed after {phase} answered writes and restarted on its log; {leader} leads in term {term}; {checked} writes read back; all applied index {} alike",
-        status.applied
+        "{name}: every member killed after {phase} answered writes and restarted on its log; {leader} leads in term {term}; {checked} writes read back; all applied index {applied} alike"
     )
 }
 
-/// A scenario: run at a tick, it says what it saw.
-type Scenario = fn(Run) -> String;
+/// A scenario: it says what it saw.
+type Scenario = fn() -> String;
 
 #[allow(
     clippy::disallowed_methods,
     reason = "real processes on the host's clock, threads and environment (CLAUDE.md §1a, end to end)"
 )]
 fn main() -> ExitCode {
-    let tick = measure_tick();
     let mut out = std::io::stdout().lock();
     writeln!(
         out,
-        "tick {} ms (the 95/95 bounds of a broadcast and a timed wait, {} samples each)",
-        tick.as_millis(),
-        tolerance_samples()
+        "elections by suspicion, on the members' own detectors (hyper-liveness); a phase is {} writes on this datagram ({} bytes)",
+        phase("commits-3", datagram()),
+        datagram()
     )
     .unwrap();
     drop(out);
     let scenarios: [(&str, Scenario); 6] = [
-        ("commits-3", |run| commits(3, run, "commits-3")),
-        ("commits-5", |run| commits(5, run, "commits-5")),
+        ("commits-3", || commits(3, "commits-3")),
+        ("commits-5", || commits(5, "commits-5")),
         ("leader-killed", leader_killed),
         ("follower-restarts", follower_restarts),
         ("partition", partition),
@@ -973,19 +1034,17 @@ fn main() -> ExitCode {
         .skip(1)
         .filter(|arg| !arg.starts_with('-'))
         .collect();
-    // Each scenario's first election, and the disruptions; a run of fewer causes fewer.
-    let run = Run {
-        tick,
-        caused: scenarios.len() as u32 + DISRUPTIONS,
-    };
+    let started = Instant::now();
     for (name, scenario) in scenarios {
         if !filter.is_empty() && !filter.iter().any(|wanted| name.contains(wanted.as_str())) {
             continue;
         }
-        let started = Instant::now();
-        let said = scenario(run);
+        let at = Instant::now();
+        let said = scenario();
         let mut out = std::io::stdout().lock();
-        writeln!(out, "ok {said} [{:.1} s]", started.elapsed().as_secs_f64()).unwrap();
+        writeln!(out, "ok {said} [{:.1} s]", at.elapsed().as_secs_f64()).unwrap();
     }
+    let mut out = std::io::stdout().lock();
+    writeln!(out, "all ok in {:.1} s", started.elapsed().as_secs_f64()).unwrap();
     ExitCode::SUCCESS
 }

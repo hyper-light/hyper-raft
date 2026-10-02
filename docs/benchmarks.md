@@ -889,6 +889,111 @@ fetch are the same at every row; a fetch from the file at 16 replicas carries 12
 (1090 against 969 at 128 B), the carrier box a log allocates at its first job, spread over the
 bench's fetches.
 
+## Many small appends
+
+mantle measured its `mantle bench log --skip-device --sizes 128,16384 --replicas 1,256` on this
+crate at main `8fe3f23` (mantle `docs/measurements/2026-10-01-group-log.md`, branch `shared-log`):
+at 256 replicas appending 128 B, 2–4% fewer appends a second than its `crates/log`, more in 4 of 28
+paired rounds, p99 lower in every batch. Its frames carried 249–254 appends against 127–253, about
+105 frames a second against 150, and it took the writer's wait for returning submitters to
+overshoot.
+
+**The workload here.** `hyper-log-compare` now drives mantle-log at mantle `a2021df` in its own
+process, exactly as it drives hyper-log (`src/mantle.rs`: the same configuration, file, driver
+threads, wakers and updates), and counts every flush of each log's file and the time in it
+(`Flushing`). `pairs` runs the logs, each point in a fresh process, in an order rotated every round,
+printing each run with the load average read just before it. This machine as it was: the Apple M5
+Max of the sections above, APFS on the internal SSD, `F_FULLFSYNC`, other sessions building.
+
+**What the frames hide.** A frame's appends are answered once a later durable record confirms its
+flush: the next frame's persist record, or a confirmation of its own (mantle
+`docs/design/raft-log.md` §6). Counting the file's flushes, both logs flush about as often and carry
+the same appends a flush (main `7d77169`, load 31–36: 209 and 218 flushes a second, 127.3 and 127.5
+appends each). hyper-log writes one frame of nearly every replica and a confirmation for it;
+mantle-log writes frames of two shifting cohorts, each confirming the one before. Either way a
+replica's append takes two flushes and appears in at most every other frame, so 128 a flush is the
+protocol's bound at 256 replicas. What differed was the time the file sat idle between flushes:
+20% of the run for hyper-log, 16% for mantle-log.
+
+**The cause.** The idle time is the writer's gathering of the replicas its last frame answered,
+1.05–1.27 ms a frame at load 30–34 (temporary probes, not kept). The wait itself was not long: of
+those 1.2 ms the owner was blocked waiting for a message for 55–65 µs. It was the owner's own work,
+and a sample of the owner thread (`sample`, two seconds of the point) put 145 of its 191 busy
+samples in one place: `Ticket::admit`, the reply that tells a caller its submission is admitted,
+which wakes the caller (`semaphore_signal`). `Log::submit_waking` waited for that admission, a round
+trip to the owner on every submission, so a driver thread holding 14 replicas could send the next
+replica's append only once the owner had admitted the last. The replicas a frame answered came back
+one owner wake apart, about 4 µs each, while the file sat idle; the wait for them, `p·S/(n + p)`
+with `p` learned near one and `S` about 4 ms, kept going because each next one did come within it.
+mantle-log took its room under a lock in the caller and sent without hearing back. The wait's rule
+and inputs are unchanged.
+
+**The change.** `Log::submit_waking` returns once the submission is on its way: the caller hears
+everything through its waker, its admission included, as a group's handle already did
+(`GroupLog::submit_waking`). A submission without room still waits in the log, not refused; one
+the log refuses (`Busy` past the waiters it holds, `Fenced`, `Claimed`) is answered with the
+refusal. `Log::submit` and `Log::submit_waiting`, whose callers block until admitted, are unchanged,
+and so is the equivalence harness, whose rounds wait on the plug's flush or its answer
+(`tests/equivalence.rs`). Two other changes the frame counts suggested were built and measured and
+are not kept: letting the device wait for a frame to follow before confirming one on its own, and
+weighing the unconfirmed frame's appends in the wait. At load 26–32 they ran 28,790 appends a
+second against 29,985 for this change alone (six paired rounds).
+
+**Measured.** `hyper-log-compare pairs DIR <rounds> 2.0 <sizes> <replicas> hyper
+base=<main build>:hyper mantle-log`: **hyper** this change, **base** main `7d77169` with the same
+harness, **mantle-log** mantle `a2021df`. Medians, the least and the most; the last column is the
+rounds in which that run made more appends a second than hyper, paired by round.
+
+Eight rounds of 2 s at 128 B and 256 replicas, 19:55–19:57 PDT, load 26.3–33.8:
+
+| run | load | appends/s | p50 ms | p99 ms | appends a frame | file flushes/s | flushing | more than hyper |
+|---|---|---|---|---|---|---|---|---|
+| hyper | 26.3–33.8 | **29,772** (27,620–30,440) | 8.52 | 10.72 | 253.7 | 234 | 90% | – |
+| base | 26.7–33.7 | 26,703 (26,255–27,833) | 9.50 | 12.89 | 250.0 | 210 | 82% | 0/8 |
+| mantle-log | 26.3–33.8 | 27,726 (19,300–28,298) | 9.37 | 12.67 | 158.9 | 218 | 84% | 0/8 |
+
+mantle's grid, six rounds of 2 s, 19:57–20:01 PDT:
+
+| entry | replicas | run | load | appends/s | p50 ms | p99 ms | appends a frame | file flushes/s | flushing | more than hyper |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 128 B | 1 | hyper | 33.0–34.4 | 122 (92–125) | 8.44 | 10.25 | 1.0 | 245 | 95% | – |
+| 128 B | 1 | base | 32.3–34.4 | 121 (99–124) | 8.42 | 10.16 | 1.0 | 242 | 95% | 3/6 |
+| 128 B | 1 | mantle-log | 32.3–34.1 | 121 (99–124) | 8.45 | 10.51 | 1.0 | 242 | 95% | 3/6 |
+| 128 B | 256 | hyper | 29.5–34.4 | **29,891** (28,918–30,239) | 8.54 | 11.67 | 253.3 | 235 | 89% | – |
+| 128 B | 256 | base | 29.3–35.9 | 27,060 (25,751–27,274) | 9.48 | 12.76 | 251.2 | 214 | 82% | 0/6 |
+| 128 B | 256 | mantle-log | 30.8–35.9 | 27,912 (14,323–28,356) | 8.86 | 12.80 | 157.1 | 219 | 84% | 0/6 |
+| 16 KiB | 1 | hyper | 29.1–29.9 | 121 (64–125) | 8.47 | 9.96 | 1.0 | 242 | 95% | – |
+| 16 KiB | 1 | base | 28.9–30.3 | 123 (121–124) | 8.45 | 9.53 | 1.0 | 245 | 95% | 4/6 |
+| 16 KiB | 1 | mantle-log | 28.9–30.3 | 121 (101–126) | 8.47 | 9.57 | 1.0 | 242 | 95% | 3/6 |
+| 16 KiB | 256 | hyper | 28.4–31.4 | **23,079** (22,386–23,569) | 10.85 | 15.72 | 253.2 | 182 | 83% | – |
+| 16 KiB | 256 | base | 29.2–31.7 | 21,470 (18,395–21,878) | 11.82 | 15.81 | 252.0 | 169 | 77% | 0/6 |
+| 16 KiB | 256 | mantle-log | 27.4–31.0 | 20,555 (20,310–21,143) | 12.27 | 16.13 | 207.1 | 162 | 73% | 0/6 |
+
+The same at light load, 19:50–19:55 PDT: at 128 B and 256 replicas, eight rounds at load 3.8–7.7,
+hyper 26,713 (21,547–29,669), base 25,228, mantle-log 25,669, hyper ahead of each in 7 of 8; six
+more at load 2.7–3.9, hyper 26,840 (26,622–27,119), base 24,875, mantle-log 25,416, hyper ahead in
+every round. At 16 KiB and 256 replicas, load 2.7–23.8: hyper 20,367, base 20,114, mantle-log
+20,482, hyper ahead of each in 5 of 6. At one replica every run is the device's, two flushes an
+append and 95% of the time flushing, and the three are within a flush a second of each other.
+
+- **At 256 replicas** hyper-log now runs 7% (128 B) and 12% (16 KiB) more appends a second than
+  mantle-log in the loaded runs, in every paired round, with lower p50 and p99, and keeps 90% of
+  the run flushing where mantle-log keeps 84% (main: 82%). It still writes one frame of nearly
+  every replica and its confirmation; the file waits less between them.
+- **The replica's path** (`hyper-log-compare replicas 9`) does not use `submit_waking` and is
+  unchanged: this build 140 µs a committed entry (135–368) against mantle-log's 148 (145–275), main's
+  153 (133–215) against 154 (151–453), load 26–27, 72.2 allocations, 0.2 reallocations and 12.1
+  context switches an entry in each.
+- **Allocations** (`hyper-log-compare one hyper DIR <bytes> <replicas> 1.0 count`, main and this
+  change alternated twice, load 29–33): per append, the driver's two included, at or below main at
+  every point: 2.42–2.47 against 2.46–2.50 at one replica, 2.20–2.21 against 2.22–2.36 at 16, 2.06–2.07
+  against 2.07–2.09 at 256. `cargo bench -p hyper-log --bench allocs`, which submits with
+  `Log::submit` and through handles, prints the same table on both.
+- **Equivalence**: the 48 files are byte-identical to main's (`HYPER_LOG_EQUIVALENCE_OUT`, `diff -r`),
+  `EXPECTED` unchanged. On Linux (aarch64, `rust:1.98.0` in Docker on this Mac), the equivalence
+  test binary of this change passed pinned to one core (`taskset -c 0`) 200 times of 200 and
+  unpinned 50 of 50.
+
 ## End to end
 
 `crates/hyper-log-e2e`: a writer process (`hyper-log-writer`) appends to a log in a real file
@@ -937,6 +1042,11 @@ target/release/hyper-log-compare table DIR 5 1.0 path/to/mantle
 target/release/hyper-log-compare replicas 9
 target/release/hyper-log-compare replica <hyper|mantle>
 target/release/hyper-log-compare one hyper DIR 128 <replicas> 1.0
+
+# mantle's bench grid on hyper-log, another build of it, and mantle-log a2021df in this process:
+# rounds rotated, each run a fresh process, the load average beside each, file flushes counted.
+target/release/hyper-log-compare pairs DIR 8 2.0 128,16384 1,256 hyper base=path/to/other/hyper-log-compare:hyper mantle-log
+target/release/hyper-log-compare one mantle-log DIR 128 256 2.0
 
 # The equivalence on Linux, pinned to one core 200 times and unpinned 50 times, in rust:1.98.0
 # with the repository at /src: build the test binary once, then from crates/hyper-log run

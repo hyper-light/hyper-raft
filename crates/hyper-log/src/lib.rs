@@ -429,6 +429,8 @@ enum Hears {
     /// Only its answer, which it waits for from the moment it submits: its frame's I/O may be
     /// given to it to do (`owner::Owner::start`).
     Waits,
+    /// Only its answer, through its waker, the caller going on meanwhile.
+    Answer,
 }
 
 /// The log: a handle to its owner, which any number of threads may share by reference.
@@ -694,10 +696,20 @@ impl<F: BlockFile + 'static> Log<F> {
         self.send(group, class, update, true, None, Hears::Admission)
     }
 
-    /// Submits `update` for `group` in `class` as `submit_waiting` does, and wakes `waker` once
-    /// its answer has come, so one thread can keep many submissions out and learn of each
-    /// answer as it comes (mantle docs/design/node.md §1.3, measurement.md §10). The waker is
-    /// woken exactly once, also when the log closes before it answers.
+    /// Submits `update` for `group` in `class`, which waits in the log for room rather than
+    /// being refused, as `submit_waiting`'s does, and wakes `waker` once its answer has come, so
+    /// one thread can keep many submissions out and learn of each answer as it comes (mantle
+    /// docs/design/node.md §1.3, measurement.md §10). The call returns once the submission is on
+    /// its way, without waiting to hear it admitted: whatever the log says of it, a refusal for
+    /// room (`Busy` past the waiters the log holds), a fence or a claimed group included, is its
+    /// answer, as with a group's handle (`GroupLog::submit_waking`). The waker is woken exactly
+    /// once, also when the log closes before it answers.
+    ///
+    /// Waiting for the admission was a round trip to the log's owner for every submission, and
+    /// the owner woke each caller as it admitted it: a thread keeping many submissions out could
+    /// send its next only once the owner had admitted the last, so the submitters a frame
+    /// answered came back one owner wake at a time while the device sat idle
+    /// (`docs/benchmarks.md`, "Many small appends").
     pub fn submit_waking(
         &self,
         group: u128,
@@ -705,7 +717,7 @@ impl<F: BlockFile + 'static> Log<F> {
         update: Update,
         waker: Waker,
     ) -> Result<Pending, LogError> {
-        self.send(group, class, update, true, Some(waker), Hears::Admission)
+        self.send(group, class, update, true, Some(waker), Hears::Answer)
     }
 
     /// Sends `update` to the owner; the caller hears as `hears` says, and waits here for its

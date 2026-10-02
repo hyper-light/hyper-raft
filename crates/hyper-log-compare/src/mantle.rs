@@ -1,15 +1,19 @@
-//! hyper-log on the workload, as `crates/hyper-log/benches/log.rs` drives it.
+//! mantle-log at mantle `a2021df`, in this process, on the workload exactly as `hyper.rs` drives
+//! hyper-log: the same configuration, file, driver threads, wakers and updates, so that a round
+//! of the two differs only in the log. mantle's `mantle bench log` at `a2021df` drives the same
+//! log the same way (`crates/mantle/src/bench_log.rs` there), its entry bytes one shared buffer
+//! where here each update builds its own, as hyper's driver does.
 
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::sync_channel;
 use std::time::{Duration, Instant};
 
-use hyper_block::buf::Alignment;
-use hyper_block::file::{CachingRequest, DeviceFile};
-use hyper_block::scratch::Scratch;
 use hyper_block::threads;
-use hyper_log::{Class, Config, Entries, Entry, Log, LogError, Pending, Start, Update, Waits};
+use mantle_disk::buf::Alignment;
+use mantle_disk::file::{CachingRequest, DeviceFile};
+use mantle_disk::scratch::Scratch;
+use mantle_log::{Class, Config, Entries, Entry, Log, LogError, Pending, Start, Update, Waits};
 
 use crate::{FLUSH_NS, FLUSHES, KEEP, Point, counted, counted_flush, drivers, flushes, quantile};
 
@@ -41,24 +45,24 @@ fn open(path: &Path) -> Flushing {
 /// The file, its flushes counted (`crate::counted_flush`).
 pub struct Flushing(DeviceFile);
 
-impl hyper_block::block::BlockFile for Flushing {
+impl mantle_disk::block::BlockFile for Flushing {
     fn alignment(&self) -> Alignment {
         self.0.alignment()
     }
 
-    fn len(&self) -> Result<u64, hyper_block::DiskError> {
+    fn len(&self) -> Result<u64, mantle_disk::DiskError> {
         self.0.len()
     }
 
-    fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> Result<(), hyper_block::DiskError> {
+    fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> Result<(), mantle_disk::DiskError> {
         self.0.read_exact_at(buf, offset)
     }
 
-    fn write_all_at(&self, buf: &[u8], offset: u64) -> Result<(), hyper_block::DiskError> {
+    fn write_all_at(&self, buf: &[u8], offset: u64) -> Result<(), mantle_disk::DiskError> {
         self.0.write_all_at(buf, offset)
     }
 
-    fn sync_data(&self) -> Result<(), hyper_block::DiskError> {
+    fn sync_data(&self) -> Result<(), mantle_disk::DiskError> {
         counted_flush(|| self.0.sync_data())
     }
 }
@@ -81,7 +85,7 @@ fn update(last: u64, size: usize) -> Update {
             first: next,
             entries: vec![Entry {
                 term: 1,
-                bytes: vec![0x5a; size],
+                bytes: vec![0x5a; size].into(),
             }],
         }),
         ..Update::default()
@@ -174,7 +178,7 @@ pub fn point(dir: &Path, size: usize, count: usize, step: Duration, count_allocs
     });
     latencies.sort_unstable();
     let (frames, updates) = log.flushed();
-    drop(log.close().unwrap());
+    drop(log);
     let reopening = Instant::now();
     let (log, _) = Log::open(open(scratch.path()), config(count), 1).unwrap();
     let reopen_ns = reopening.elapsed().as_nanos() as u64;

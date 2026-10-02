@@ -208,5 +208,7 @@ pub fn point(dir: &Path, size: usize, count: usize, step: Duration, count_allocs
         read,
         threads: peak.load(Ordering::Relaxed),
         allocs,
+        syncs_per_s: f64::NAN,
+        busy: f64::NAN,
     }
 }

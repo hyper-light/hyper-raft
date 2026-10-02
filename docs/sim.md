@@ -382,14 +382,21 @@ and mantle's replica are held to the same statement.
 ### 4.2 Liveness
 
 Every run ends in its liveness phase (§3.8) and must converge: a leader elected and an entry proposed
-after healing applied by every member of the configuration. The bound is not a literal:
-- In the **ordered** discipline, from the election law (`docs/timing.md` §2.3): elections needed are
-  geometric in `Pr(split)` (Ongaro §9.3), so `k = ⌈ln δ / ln Pr(split)⌉` elections cover all but a
-  fraction `δ` of runs, and the bound is the detector's stated detection time plus `k` election spans and
-  a replication round. `δ` is the test's stated false-failure rate over its seed budget: with `S` seeds,
-  `δ = α / S` keeps the chance of any false failure below `α`.
-- In the **free** discipline, ticks stand for time, and the same `k` elections of at most
-  `2 · election_tick` ticks each, plus the rounds to replicate, give the bound in rounds.
+after healing applied by every member of the configuration. The bound is neither a literal nor a
+confidence level someone picks: Raft does not bound the elections a group needs (split votes repeat
+with nonzero probability, Ongaro §9.3), so any fixed count of elections is a false-failure rate chosen
+by hand, which the owner ruled out (hyper-raft-e2e and hyper-durable-e2e removed theirs). The phase
+waits on progress instead, as those harnesses do:
+- In the **ordered** discipline, the phase goes on while any member's term, commit, applied index or
+  last index moves, and fails once a quiet period passes in which nothing moved: the detector's stated
+  detection time, one election round (the longest randomized delay of the election law's span and its
+  vote rounds, `docs/timing.md` §2.3) and a replication round, all from the members' own settings. A
+  live group elects or starts a new term within that period, so a period without movement is a stuck
+  group, not a split vote.
+- In the **free** discipline, ticks stand for time and the same rule counts rounds: the quiet period is
+  `2 · election_tick` ticks and the rounds to replicate.
+Because a group that keeps moving without converging waits on, the world's own budget (§3.8, the run's
+step bound) ends such a run, and reports it as unconverged with the trace, never as a pass.
 
 A liveness property that is not convergence is a monitor with hot and cold states (P#, §2.5): a run
 that ends its bound in a hot state fails.
@@ -460,14 +467,18 @@ strategy replays exactly.
 | **Exhaustive, implementation level** | Every schedule of the real core at a tiny scope, reduced by state symmetry and event independence (FlyMC §4.1); scenarios of partitions × leaders × rounds (Twins §4.2) | Elections and changes at three members, a few rounds |
 | **Replay and shrink** | A failing trace shortened while it still fails | Every failure |
 
-**PCT's runs, derived.** For a confidence `1 − δ` that a bug of depth `d` is found, a campaign runs
-`R = ⌈ln(1/δ) · n · k^(d−1)⌉` runs. The bugs that matter are shallow: 92 % of TaxDC's are triggered by
-one untimely event and over 90 % involve one to three messages and nodes (Findings #1, #3); 98 % of Yuan
-et al.'s failures manifest on three nodes or fewer. At `n = 3` members and `d = 1`, `R = 14` runs give
-`δ = 0.01`; at `d = 2`, `R` grows with `k`, which is why `k` counts only the choice points where events
-of different processes race, not every step. The priorities are over processes (members) and the
-change points over those racing choice points — PCT's threads become members, as PCTCP's chains are
-the processes' event chains.
+**PCT's runs, and what they guarantee.** A campaign of `R` runs finds a bug of depth `d` with
+probability at least `1 − δ`, `δ = (1 − 1/(n · k^(d−1)))^R ≈ exp(−R / (n · k^(d−1)))` (Burckhardt et al.,
+ASPLOS'10, Theorem 9). `δ` is not picked: `R` is what the campaign's measured budget runs (its time
+bound in CI, divided by the measured cost of a run), and the confidence it reaches is reported beside
+the result, per depth, so a campaign says what it covered rather than claiming a confidence it chose.
+The bugs that matter are shallow: 92 % of TaxDC's are triggered by one untimely event and over 90 %
+involve one to three messages and nodes (Findings #1, #3); 98 % of Yuan et al.'s failures manifest on
+three nodes or fewer. At `n = 3` members and `d = 1` the confidence rises as `1 − exp(−R/3)` — 14 runs
+already pass 0.99 — while at `d = 2` it falls with `k`, which is why `k` counts only the choice points
+where events of different processes race, not every step. The priorities are over processes (members)
+and the change points over those racing choice points — PCT's threads become members, as PCTCP's chains
+are the processes' event chains.
 
 **Coverage, defined.** The abstract state is the TLA+ model's: `docs/models/README.md` already maps
 every model action to the core's functions, which is the `map` Gulcan et al.'s Algorithm 1 needs. An

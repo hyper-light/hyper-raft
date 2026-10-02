@@ -172,6 +172,22 @@ pub struct Driven {
     pub stalled: Option<Fault>,
 }
 
+/// The writes a replica made, by what they were for: what an owner reads to see what its group
+/// costs its log.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Writes {
+    /// `Ready`s whose write held something.
+    pub readies: u64,
+    /// `Ready`s that held nothing to make durable: no write.
+    pub empty: u64,
+    /// Writes of the commit alone the fence asked for.
+    pub fenced: u64,
+    /// Writes of the commit alone after a quiet period.
+    pub quiet: u64,
+    /// Compactions' starts.
+    pub starts: u64,
+}
+
 /// A write the replica made, oldest first, with what waits for it.
 #[derive(Debug)]
 struct Out {
@@ -276,6 +292,7 @@ pub struct Replica<L: LogStore, M: StateMachine, B: Budget = Unbounded> {
     quiet_since: Option<Instant>,
     flushes: Flushes,
     last_durable: Option<Instant>,
+    writes_made: Writes,
 }
 
 /// The term of an entry the state machine applied, as a point.
@@ -369,6 +386,7 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
             quiet_since: None,
             flushes: Flushes::new(),
             last_durable: None,
+            writes_made: Writes::default(),
         };
         // A log compacted before the restart serves a lagging member only by snapshot.
         if view.start.index > 0 {
@@ -479,6 +497,11 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
     /// The state machine, for its owner's own use of it, between drives.
     pub fn machine_mut(&mut self) -> &mut M {
         &mut self.machine
+    }
+
+    /// The writes this replica made since it opened, by what they were for.
+    pub fn writes(&self) -> Writes {
+        self.writes_made
     }
 
     /// The bytes the budget holds for this replica.
@@ -1169,6 +1192,7 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
             && !self.fence_covered(last)
             && self.has_slot()
         {
+            self.writes_made.fenced = self.writes_made.fenced.saturating_add(1);
             return self.commit_write(now, waker);
         }
         if !due {
@@ -1193,6 +1217,11 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
             .unissued_snapshot()
             .is_some_and(|s| !proto::snapshot_is_empty(s));
         let state = self.write_ready(&ready, hard, waker)?;
+        if state == State::Empty {
+            self.writes_made.empty = self.writes_made.empty.saturating_add(1);
+        } else {
+            self.writes_made.readies = self.writes_made.readies.saturating_add(1);
+        }
         let issued = self.node.advance_issued(ready);
         self.must(issued)?;
         if let Some(hard) = hard {
@@ -1351,6 +1380,7 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
         let since = *self.quiet_since.get_or_insert(now);
         if now.saturating_duration_since(since) >= self.quiet && self.has_slot() {
             self.quiet_since = None;
+            self.writes_made.quiet = self.writes_made.quiet.saturating_add(1);
             self.commit_write(now, waker)?;
         }
         Ok(())
@@ -1685,6 +1715,7 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
             if let Some(hard) = hard {
                 r.issued = hard;
             }
+            r.writes_made.starts = r.writes_made.starts.saturating_add(1);
             r.writes.push_back(Out {
                 kind: Kind::Start,
                 state,

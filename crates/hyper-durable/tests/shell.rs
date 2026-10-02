@@ -131,6 +131,15 @@ fn a_sole_voter_logs_its_commit_in_the_write_of_its_entries() {
         submits + 1,
         "a write of its own for the commit"
     );
+    // Many entries, one write each, and never a write of the commit alone (§4.1).
+    let before = r.writes();
+    for i in 0..32u64 {
+        r.propose(Vec::new(), i.to_le_bytes().to_vec()).unwrap();
+        pump(&mut r);
+    }
+    let after = r.writes();
+    assert_eq!(after.readies - before.readies, 32);
+    assert_eq!((after.fenced, after.quiet), (before.fenced, before.quiet));
 }
 
 /// A change waits behind the fence until a write states its commit; entries committed after it

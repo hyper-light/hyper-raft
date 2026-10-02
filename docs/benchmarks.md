@@ -3206,3 +3206,102 @@ groups; slates' needs a `LogStore` over its anchor publication (`RamStore` is it
 with `SavedRaft` as what the core's `Storage` reads, measured on `publication_cost`'s workload
 against its own path at `ec5e0df`.
 
+
+## The three losses against mantle's shell, traced (2026-10-02, 03:30–04:30 PDT)
+
+Each loss of the section above, root-caused in the same runs against mantle `1c179e8`. Same machine.
+The load average fell from 28 to 2 over the hour, and each table says the load it ran at.
+
+**Reallocations.** Every reallocation's call site was recorded with a tracing allocator: a
+`GlobalAlloc` over `System` that captures a backtrace for each reallocation of an 8-aligned
+block, on every thread, during the measured entries. It was a scratch build, not committed: its
+`unsafe` is outside the contract script's list. Byte buffers were sampled one in 300, because
+capturing every one slowed the run until the difference vanished; the difference depends on
+timing. All of the byte-buffer sites are mantle's engine and layer, and they are identical for
+both shells. Simulated device, three members, 4 × 3,000 entries; reallocations a committed entry
+at the sites only hyper-durable has:
+
+| site | per entry | whose |
+|---|---|---|
+| `hyper_raft::log::Unstable::truncate_and_append` | 0.09–0.16 | the core |
+| `hyper_raft::raft::Outgoing::push_counted` | 0.01–0.02 | the core |
+| `hyper_durable::hyperlog::update_of` | 0.002–0.007 | the shell |
+
+- **The shell's site is fixed.** The store collected a write's entries through a `Result`, so the
+  iterator gave no lower bound and the list grew by reallocation. Both lists are now reserved at
+  their exact length. Traced after the fix, the site is gone.
+- **The core's two sites are a consequence of taking readies ahead (R-4).**
+  - When nothing is unstable, `truncate_and_append` adopts the incoming exact-sized `Vec` and
+    drops the grown one, so the next proposal appended while a write is out reallocates.
+  - When the notice of a write makes everything durable, `take_stable_to` hands the whole `Vec`
+    away (`mem::take`), so the capacity is lost again.
+  - `Outgoing::take` gives the queue's `Vec` to the owner and starts again from four slots, so a
+    `Ready` that carries more messages, which pipelining makes more likely, grows it.
+- **The proof.** Driving the members as mantle's node does (`HYPER_DURABLE_ROUNDS=1`: every write
+  answered before the next turn, so nothing is taken ahead) gives 21.16 an entry, mantle's
+  number. The same holds at depth one.
+- **An experiment on the core, reverted.** In `truncate_and_append`, reuse the retained capacity
+  when it holds the incoming entries; in `take_stable_to`, drain what became durable in place
+  rather than hand the `Vec` away. With both, the driving thread's reallocations were 21.02
+  against mantle's 21.02 at three members, and 33.03 against 33.02 at five, with the pipeline on.
+  Those runs counted 5.6 more allocations an entry, which is the experiment's environment-variable
+  switch (an `OsString` a call). It has not been measured with the switch removed.
+- **The change asked of the core** (`crates/hyper-raft/src` is another agent's; not made here):
+  1. `Unstable::truncate_and_append`, with `kept == 0`: when `self.entries.capacity() >=
+     entries.len()`, `clear` and `append` instead of replacing the `Vec`.
+  2. `Log::take_stable_to`, the full-take branch: for `RawNode::on_persist` (an owner that does
+     not keep the entries), drop what became durable in place with `drain(..count)` instead of
+     `mem::take`. `on_persist_keeping` keeps its zero-copy hand-off.
+  3. `Outgoing::take` (0.01–0.02): an alternative that swaps the queue with an owner's emptied
+     buffer, so neither side's capacity is lost.
+
+**Context switches.** `/usr/bin/time -l` on one shell a process (file device, three members,
+three rounds of 300, two runs each, load 2–7):
+
+| shell | voluntary | involuntary | user + sys s | wall s |
+|---|---|---|---|---|
+| mantle 1c179e8 | 100,106; 99,449 | 25,810; 25,359 | 0.99; 0.90 | 55.9; 55.7 |
+| hyper-durable | 98,564; 113,543 | 32,737; 34,342 | 0.92; 1.29 | 32.9; 37.1 |
+
+- **Writes and wakes are exact.** `HYPER_DURABLE_DIAGNOSIS=1` counts 5.70–5.81 writes and the
+  same number of log wakes an entry at three members. There are no writes of the commit alone,
+  no quiet writes and no parts.
+- **The extra switches are involuntary:** +7,000 to +8,500 a run, about +30%. Voluntary switches
+  are even within the runs' spread, and CPU time is even.
+- **They are the overlap's.** Driven as mantle's node drives (`HYPER_DURABLE_ROUNDS=1`),
+  hyper-durable switches within 2% of mantle (129.1 against 126.6 an entry). It also loses its
+  latency then: 53.4 ms p50 against 53.2, 6.00 flushes an entry. Taking readies ahead keeps a
+  leader's log and its followers' logs (seven threads) runnable at once, and the OS preempts more
+  among them.
+- **Not fixed in the shell.** No shell change removes these switches without giving up that
+  overlap. Trading the 35% latency for an even count of switches is not a fix, and per entry the
+  CPU time is no higher. A scheduler-level cause (wakeup preemption on Apple silicon) is not
+  measured further here.
+
+**The one-member tail** does not reproduce. Nine rotated rounds of 500 entries, load 34 → 2,
+real disk:
+
+| point | shell | p50 µs | p99 µs | p99.9 µs | entries/s |
+|---|---|---|---|---|---|
+| register, 1 member | mantle 1c179e8 | 19,088 | 30,910 | 269,923 | 50 |
+| | hyper-durable | 19,279 | 32,071 | 260,213 | 49 |
+| put 1 KiB, 1 member | mantle 1c179e8 | 8,542 | 21,446 | 165,243 | 102 |
+| | hyper-durable | 8,520 | 21,083 | 78,537 | 102 |
+
+- Per entry both shells make one write, one flush and one wake. hyper-durable writes no commit of
+  its own, because a sole voter's `commit = last` rides its append. `shell.rs`
+  (`a_sole_voter_logs_its_commit_in_the_write_of_its_entries`) now also asserts that 32 entries
+  make 32 writes and no write of the commit alone.
+- The earlier tail was a few flushes of 1,500 at loads 10–40.
+- None of the candidates is in play: no commit-only write, a lone frame's confirmation that both
+  logs pay alike, and no third write, since one member's closed loop has one write out.
+
+```
+cd crates/hyper-durable-compare && cargo build --release
+HYPER_DURABLE_DIAGNOSIS=1 ./target/release/hyper-durable-compare --devices file --members 1,3 \
+  --shapes register,put --rounds 9 --entries 500
+HYPER_DURABLE_ROUNDS=1 ./target/release/hyper-durable-compare --devices file --members 3 \
+  --shapes register --rounds 5 --entries 300
+for o in mantle hyper; do HYPER_DURABLE_ONLY=$o /usr/bin/time -l ./target/release/hyper-durable-compare \
+  --devices file --members 3 --shapes register --rounds 3 --entries 300; done
+```

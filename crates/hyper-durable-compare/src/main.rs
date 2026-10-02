@@ -235,13 +235,28 @@ fn measure_durable<F: hyper_block::block::BlockFile + 'static>(
     shape: Shape,
 ) -> Run {
     let g = std::cell::RefCell::new(g);
-    measure(
+    let (w0, k0) = g.borrow().diagnosis();
+    let r = measure(
         warm,
         entries,
         shape,
         |e| g.borrow_mut().commit(e),
         || g.borrow().flushes(),
-    )
+    );
+    if std::env::var_os("HYPER_DURABLE_DIAGNOSIS").is_some() {
+        let (w, k) = g.borrow().diagnosis();
+        let n = (warm + entries) as f64;
+        println!(
+            "  writes an entry: readies {:.2} empty {:.2} fenced {:.2} quiet {:.2} starts {:.2}; wakes {:.2}",
+            (w.readies - w0.readies) as f64 / n,
+            (w.empty - w0.empty) as f64 / n,
+            (w.fenced - w0.fenced) as f64 / n,
+            (w.quiet - w0.quiet) as f64 / n,
+            (w.starts - w0.starts) as f64 / n,
+            (k - k0) as f64 / n
+        );
+    }
+    r
 }
 
 fn percentile(sorted: &[Duration], p: f64) -> Duration {
@@ -329,7 +344,8 @@ fn main() {
                     } else {
                         [Shell::Durable, Shell::Mantle]
                     };
-                    for shell in order {
+                    let only = std::env::var("HYPER_DURABLE_ONLY").ok();
+                    for shell in order.into_iter().filter(|s| only.as_deref().is_none_or(|o| s.name().starts_with(o))) {
                         let r = run(shell, device, m, shape, warm, entries, round);
                         runs[usize::from(shell == Shell::Durable)].push(r);
                     }
@@ -343,8 +359,8 @@ fn main() {
                     "| shell | p50 µs | p99 µs | p99.9 µs | entries/s | flushes/entry | allocs/entry | reallocs/entry | faults/entry | switches/entry | threads | driver's allocs/entry | driver's reallocs/entry |"
                 );
                 println!("|---|---|---|---|---|---|---|---|---|---|---|---|---|");
-                println!("{}", report(Shell::Mantle, &runs[0]));
-                println!("{}", report(Shell::Durable, &runs[1]));
+                if !runs[0].is_empty() { println!("{}", report(Shell::Mantle, &runs[0])); }
+                if !runs[1].is_empty() { println!("{}", report(Shell::Durable, &runs[1])); }
             }
         }
     }

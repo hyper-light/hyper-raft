@@ -237,32 +237,40 @@ fn hard_to_log(h: HardState) -> hyper_log::HardState {
 /// `write` as one update of the log: the one copy of what the core lent.
 fn update_of(write: &Write<'_>) -> Result<Update, Fault> {
     let encoded = |e: &Entry| encode_entry(e).ok_or(Fault::Failed("an entry past what u32 counts"));
+    let no_memory = |_| Fault::Failed("no memory for a write");
+    // Each list is reserved at its exact length before it is filled: collected through a
+    // `Result`, an iterator gives no lower bound, and the list grew by reallocation (traced at
+    // 0.005 an entry on mantle's replica workload).
     let entries = match write.entries {
-        Some(Entries { first, entries }) => Some(hyper_log::Entries {
-            first,
-            entries: entries
-                .iter()
-                .map(|e| {
-                    Ok(hyper_log::Entry {
-                        term: e.term,
-                        bytes: encoded(e)?,
-                    })
-                })
-                .collect::<Result<_, Fault>>()?,
-        }),
+        Some(Entries { first, entries }) => {
+            let mut encoded_entries = Vec::new();
+            encoded_entries
+                .try_reserve_exact(entries.len())
+                .map_err(no_memory)?;
+            for e in entries {
+                encoded_entries.push(hyper_log::Entry {
+                    term: e.term,
+                    bytes: encoded(e)?,
+                });
+            }
+            Some(hyper_log::Entries {
+                first,
+                entries: encoded_entries,
+            })
+        }
         None => None,
     };
-    let proposals = write
-        .proposals
-        .iter()
-        .map(|p| {
-            Ok(Proposal {
-                index: p.index,
-                term: p.term,
-                bytes: encoded(p)?,
-            })
-        })
-        .collect::<Result<_, Fault>>()?;
+    let mut proposals = Vec::new();
+    proposals
+        .try_reserve_exact(write.proposals.len())
+        .map_err(no_memory)?;
+    for p in write.proposals {
+        proposals.push(Proposal {
+            index: p.index,
+            term: p.term,
+            bytes: encoded(p)?,
+        });
+    }
     Ok(Update {
         start: write.start.map(|p| Start {
             index: p.index,

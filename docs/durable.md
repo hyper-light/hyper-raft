@@ -699,10 +699,12 @@ Tests (`crates/hyper-durable/tests`):
   founder's window is too narrow between processes to fail there (its write is on its way when it
   applies), which `directed.rs` covers deterministically.
 - Measured against mantle's shell (`crates/hyper-durable-compare`, `docs/benchmarks.md`, "The
-  durable shell against mantle's"): faster with three and five members and 18–36% fewer
-  allocations; open before mantle switches: 0.06–0.34 more reallocations an entry (about half
-  with readies taken ahead), more context switches on a real disk at three members, and the
-  one-member tail on a real disk.
+  durable shell against mantle's" and "The three losses ... traced"): faster with three and five
+  members and 18–36% fewer allocations. Of the losses:
+  - the reallocations are the core's unstable log and outgoing queue giving up their capacity when
+    readies are taken ahead; a core change is asked;
+  - the extra switches are involuntary, the price of the overlap;
+  - the one-member tail does not reproduce in nine rotated rounds.
 - `shell.rs`, `hyperlog.rs`, `threads.rs`: each bound of §6 at its edge, the open repairs of §4.3,
   marks, the unwind boundary, the owner's turns, parts and refusals on hyper-log, and the threads
   an owner's sixty-four groups cost (none of their own).

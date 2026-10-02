@@ -161,6 +161,11 @@ pub struct Group<F: BlockFile + 'static> {
     woken: Receiver<usize>,
     out: Output<usize>,
     wire: VecDeque<Message>,
+    slots: Vec<&'static hyper_measure::wake::Slot>,
+    /// Waits for every write out before the next turn (`HYPER_DURABLE_ROUNDS`).
+    rounds: bool,
+    /// The leader answered in a turn the wait took.
+    answered: bool,
 }
 
 /// mantle's group test's settings, as the core takes them.
@@ -186,9 +191,11 @@ fn settings(id: u64) -> Settings {
 impl<F: BlockFile + 'static> Group<F> {
     pub fn open(members: u64, mut device: impl FnMut(u64) -> F) -> Self {
         let (tell, woken) = sync_channel(4096);
-        let wakers: Vec<Waker> = (0..members)
-            .map(|slot| hyper_measure::wake::waker(slot as usize, tell.clone()).0)
+        let made: Vec<(Waker, &'static hyper_measure::wake::Slot)> = (0..members)
+            .map(|slot| hyper_measure::wake::waker(slot as usize, tell.clone()))
             .collect();
+        let slots = made.iter().map(|(_, s)| *s).collect();
+        let wakers: Vec<Waker> = made.into_iter().map(|(w, _)| w).collect();
         let mut owner = Owner::new(wakers);
         let mut logs = Vec::new();
         let mut handles = Vec::new();
@@ -221,6 +228,9 @@ impl<F: BlockFile + 'static> Group<F> {
             woken,
             out: Output::default(),
             wire: VecDeque::new(),
+            slots,
+            rounds: std::env::var_os("HYPER_DURABLE_ROUNDS").is_some(),
+            answered: false,
         };
         let first = group.handles[0];
         group.owner.get_mut(first).unwrap().campaign().unwrap();
@@ -264,6 +274,22 @@ impl<F: BlockFile + 'static> Group<F> {
 
     /// With nothing to do, waits for the log to answer a write.
     fn wait(&mut self) {
+        if self.rounds {
+            // As mantle's node waits: for every write out before the next turn.
+            while self
+                .handles
+                .iter()
+                .any(|&h| self.owner.get(h).is_some_and(|r| r.in_flight() > 0))
+            {
+                if let Ok(slot) = self.woken.recv() {
+                    self.owner.woken(slot);
+                }
+                let mut done = false;
+                self.turn(&mut |answered| done |= answered);
+                self.answered |= done;
+            }
+            return;
+        }
         if !self.owner.has_work() {
             if let Ok(slot) = self.woken.recv() {
                 self.owner.woken(slot);
@@ -284,14 +310,33 @@ impl<F: BlockFile + 'static> Group<F> {
             .unwrap();
         self.owner.schedule(leader);
         for _ in 0..1_000_000 {
-            let mut done = false;
+            let mut done = std::mem::take(&mut self.answered);
             self.turn(&mut |answered| done |= answered);
             if done {
                 return;
             }
             self.wait();
+            if std::mem::take(&mut self.answered) {
+                return;
+            }
         }
         panic!("the group never applied an entry");
+    }
+
+    /// The writes every member made, by kind, and the wakes the logs' answers made.
+    pub fn diagnosis(&self) -> (hyper_durable::Writes, u64) {
+        let mut all = hyper_durable::Writes::default();
+        for &h in &self.handles {
+            if let Some(r) = self.owner.get(h) {
+                let w = r.writes();
+                all.readies += w.readies;
+                all.empty += w.empty;
+                all.fenced += w.fenced;
+                all.quiet += w.quiet;
+                all.starts += w.starts;
+            }
+        }
+        (all, self.slots.iter().map(|s| s.wakes()).sum())
     }
 
     pub fn flushes(&self) -> u64 {

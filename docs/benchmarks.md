@@ -601,6 +601,26 @@ incarnation and the checksums over it recomputed. hyper-log writes the same 48 f
 at L-1 (`5bd0699`), at L-2 (`4e58930`), after the allocation work (`4b48295`) and after the wall
 (`af2679b`); the test asserts mantle's hashes of them.
 
+It held on most CI runs and failed now and then (windows-11-arm at main `16a1621`, seeds 19 and
+23; macos-15-intel at `a2d42b5`, seed 0). Pinned to one core (`taskset -c 0` in a `rust:1.98.0`
+container), main's test failed about one run in ten, which made the causes visible in the
+transcripts and the device images:
+- **The harness.** `Holder::is_held` never consumed its event, so from a cycle's second round on a
+  round waited for nothing before submitting its updates. The owner's drain could then take the
+  plug and the updates into one frame: seed 19's round 114 wrote 67 frames where mantle wrote 68.
+  Each round now waits for the plug's flush or the plug's answer, both events the holder hears of.
+- **The fair queue's busy period** [SFQ96 §2] ended when the owner parked, after it had drained what
+  answered callers sent once the answers had gone out; a caller quick enough found the last period's
+  finish tags still standing, and two updates of one frame swapped places (seed 0's frame 116 began
+  with group 5's record, not group 2's). The period now ends when the answers go out with nothing
+  queued.
+- **"Another frame follows"** reached the device after the caller heard its submission admitted,
+  so a caller that released a held flush on hearing it could beat the word, and the frame was
+  confirmed on its own: one confirmation record more.
+
+With the three fixed (`d04934e`, `7585e19`) the branch passed 200 of 200 runs pinned to one core
+and 50 of 50 unpinned, every hash mantle's.
+
 ## Allocations
 
 `cargo bench -p hyper-log --bench allocs`: a log on a real file, closed-loop appends from 1 and 16
@@ -621,6 +641,8 @@ mantle-log's code; "after" is this branch.
 | fetch of an entry from the file, `entries` | 16 | 5.44, 0, 1,296 (128 B) | 2.56, 0, 882 |
 | the same, into a reservation (`fetch`) | 16 | – | **0.00**, 0, 0 |
 | term, view | 1, 16 | 0, 0, 0 | 0, 0, 0 |
+| append through the group's handle, `GroupLog::submit` | 1, 16 | – | **0.00**, 0.01–0.03, 63–149 |
+| fetch, term and bounds through the handle | 1, 16 | – | **0**, 0, 0; the handle asked the owner for nothing |
 
 - An append allocates nothing once warm. The 0.01 to 0.02 reallocations are each group's list of
   retained entries doubling as it grows; the 63 bytes are those reallocations.
@@ -720,6 +742,105 @@ What it shows, within what the spreads allow:
   checkpoints write 64 entries every 64th append, and it refuses for budget at 64 and 256 replicas.
   It reopens far faster: its replay reads only what checkpoints keep, where the mantle format
   replays every live segment.
+
+### The same, after the replica's path work
+
+The table again at this branch's `7585e19` (the group's handle, leader/followers), the same
+binaries for mantle and focal, 17:18–17:24 PDT, load 26 to 41. The workload drives hyper-log by
+`Log::submit_waking`, as mantle's bench drives its log, not through handles.
+
+| entry | replicas | log | appends/s, median (least–most) | p50 ms | p99 ms | p99.9 ms | appends a flush | reopen ms | threads | allocations an append |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 128 B | 1 | mantle | 40 (31–58) | 25.20 | 44.50 | 44.50 | 1.0 | 15.70 | 3 | – |
+| 128 B | 1 | hyper | 39 (30–99) | 24.61 | 41.41 | 41.41 | 1.0 | 16.66 | 4 | 3.40 |
+| 128 B | 1 | focal | 14 (11–38) | 71.70 | 106.39 | 106.39 | 1.0 | 0.25 | 3 | 16.95 |
+| 128 B | 4 | mantle | 189 (162–296) | 20.40 | 33.90 | 33.90 | 3.9 | 11.30 | 6 | – |
+| 128 B | 4 | hyper | 351 (170–432) | 9.47 | 21.21 | 21.49 | 4.0 | 11.68 | 7 | 2.43 |
+| 128 B | 4 | focal | 105 (33–140) | 28.03 | 107.31 | 107.32 | 2.1 | 0.50 | 6 | 13.33 |
+| 128 B | 16 | mantle | 1870 (1220–1890) | 8.65 | 11.00 | 12.60 | 15.9 | 6.08 | 18 | – |
+| 128 B | 16 | hyper | 1881 (1271–1893) | 8.48 | 10.70 | 13.55 | 15.9 | 6.03 | 19 | 2.23 |
+| 128 B | 16 | focal | 765 (735–998) | 24.45 | 26.71 | 27.07 | 9.7 | 1.49 | 18 | 10.89 |
+| 128 B | 64 | mantle | 5350 (4700–6290) | 10.50 | 24.60 | 27.80 | 61.8 | 7.17 | 20 | – |
+| 128 B | 64 | hyper | 4486 (4400–7330) | 13.53 | 28.56 | 28.64 | 63.1 | 9.73 | 21 | 2.10 |
+| 128 B | 64 | focal | 3420 (2007–3590) | 14.83 | 51.46 | 58.15 | 51.1 | 5.02 | 20 | 10.17 |
+| 128 B | 256 | mantle | 22500 (21600–27600) | 9.70 | 25.60 | 30.10 | 168.7 | 11.90 | 20 | – |
+| 128 B | 256 | hyper | 20794 (17920–27543) | 10.39 | 26.71 | 26.83 | 252.6 | 11.93 | 21 | 2.09 |
+| 128 B | 256 | focal | 2851 (472–3040) | 25.20 | 42.36 | 51.89 | 40.9 | 4.30 | 20 | 14.03 |
+| 1024 B | 1 | mantle | 95 (78–117) | 8.65 | 18.10 | 18.10 | 1.0 | 5.86 | 3 | – |
+| 1024 B | 1 | hyper | 109 (62–119) | 8.50 | 19.08 | 21.96 | 1.0 | 5.16 | 4 | 2.50 |
+| 1024 B | 1 | focal | 66 (53–75) | 12.79 | 24.75 | 26.73 | 1.0 | 0.37 | 3 | 16.27 |
+| 1024 B | 4 | mantle | 202 (172–286) | 20.40 | 28.80 | 34.20 | 3.9 | 9.48 | 6 | – |
+| 1024 B | 4 | hyper | 220 (208–259) | 17.05 | 27.72 | 27.76 | 3.9 | 12.30 | 7 | 2.57 |
+| 1024 B | 4 | focal | 72 (66–91) | 55.76 | 69.73 | 71.14 | 2.0 | 0.36 | 6 | 13.25 |
+| 1024 B | 16 | mantle | 745 (662–881) | 21.50 | 47.90 | 47.90 | 15.6 | 11.80 | 18 | – |
+| 1024 B | 16 | hyper | 787 (519–986) | 21.05 | 41.36 | 41.40 | 15.7 | 11.24 | 19 | 2.42 |
+| 1024 B | 16 | focal | 278 (218–449) | 56.20 | 97.93 | 102.16 | 10.3 | 0.78 | 18 | 10.97 |
+| 1024 B | 64 | mantle | 3660 (3540–6430) | 17.30 | 32.30 | 32.30 | 61.9 | 11.70 | 20 | – |
+| 1024 B | 64 | hyper | 4218 (3509–6819) | 16.03 | 24.06 | 24.08 | 62.9 | 11.46 | 21 | 2.13 |
+| 1024 B | 64 | focal | 2090 (1832–3486) | 28.87 | 57.20 | 62.52 | 52.7 | 5.09 | 20 | 10.21 |
+| 1024 B | 256 | mantle | 16800 (14300–19400) | 16.30 | 30.10 | 30.10 | 238.9 | 17.60 | 20 | – |
+| 1024 B | 256 | hyper | 24962 (14206–25168) | 9.63 | 21.20 | 21.38 | 253.3 | 20.71 | 21 | 2.10 |
+| 1024 B | 256 | focal | 3530 (2732–4240) | 13.77 | 51.05 | 52.17 | 54.6 | 7.27 | 20 | 14.38 |
+| 16384 B | 1 | mantle | 99 (82–114) | 8.91 | 18.00 | 18.90 | 1.0 | 7.33 | 3 | – |
+| 16384 B | 1 | hyper | 114 (84–119) | 8.51 | 14.98 | 16.48 | 1.0 | 7.10 | 4 | 2.66 |
+| 16384 B | 1 | focal | 63 (52–75) | 12.84 | 27.72 | 28.69 | 1.0 | 0.67 | 3 | 16.34 |
+| 16384 B | 4 | mantle | 219 (162–396) | 17.80 | 33.10 | 33.10 | 3.9 | 8.06 | 6 | – |
+| 16384 B | 4 | hyper | 234 (178–447) | 16.02 | 28.17 | 32.26 | 3.9 | 11.62 | 7 | 2.38 |
+| 16384 B | 4 | focal | 99 (89–149) | 42.50 | 60.96 | 62.68 | 2.0 | 0.97 | 6 | 13.42 |
+| 16384 B | 16 | mantle | 1170 (1090–1820) | 13.10 | 25.10 | 25.10 | 15.8 | 13.60 | 18 | – |
+| 16384 B | 16 | hyper | 1709 (1034–1869) | 8.53 | 16.16 | 18.97 | 15.9 | 18.03 | 19 | 2.62 |
+| 16384 B | 16 | focal | 785 (341–956) | 13.89 | 54.46 | 59.26 | 12.7 | 5.72 | 18 | 10.76 |
+| 16384 B | 64 | mantle | 6420 (2710–7320) | 9.70 | 21.50 | 28.80 | 62.4 | 22.90 | 20 | – |
+| 16384 B | 64 | hyper | 5118 (2556–7125) | 9.49 | 21.38 | 21.41 | 63.2 | 31.65 | 21 | 2.20 |
+| 16384 B | 64 | focal | 3828 (834–4411) | 14.67 | 50.72 | 53.76 | 56.7 | 23.89 | 20 | 10.29 |
+| 16384 B | 256 | mantle | 17600 (11700–19400) | 13.10 | 31.90 | 31.90 | 239.4 | 64.00 | 20 | – |
+| 16384 B | 256 | hyper | 17655 (13652–20034) | 12.75 | 29.88 | 30.03 | 252.4 | 80.24 | 21 | 2.10 |
+| 16384 B | 256 | focal | 3740 (3123–4019) | 13.69 | 40.82 | 50.01 | 57.2 | 24.32 | 20 | 14.59 |
+
+hyper's median is above mantle-log's at 11 of 15 points (1% to 86% higher) and below at 4 (128 B
+at 1, 64 and 256 replicas, 16 KiB at 64: 3% to 20% lower); its p99 is lower at 12 of 15. focal-log
+runs at 13% to 69% of mantle-log's rate, lowest at 256 replicas. hyper-log runs one thread more
+than mantle-log, as before.
+
+## The replica's path
+
+mantle measured its replica path on hyper-log at 828 µs a committed entry against 159 µs on its
+`crates/log` (mantle `docs/measurements/2026-10-01-shared-log.md`, load 38–40): every read was a
+round trip to the log's owner thread, and every write crossed four threads. `hyper-log-compare
+replica` mirrors that run: a group of three members, each a hyper-raft core on its own log on a
+simulated device, driven in one process as mantle's `crates/range/tests/group.rs` settles them
+(`drive` with waiting, messages delivered in order), 50 entries of 32 bytes to warm, then 300
+measured, each proposed by the leader and settled before the next; the store is mantle's
+`LogStore` over each log. Per committed entry: the wall time, the storage's calls, the reads
+another thread answered, every allocation and reallocation in the process, and its context
+switches (`hyper_measure::faults::switches`, getrusage's voluntary and involuntary switches).
+
+- **before**: hyper-log at main `50a711d`, the store as mantle has it at `shared-log` `03bda33`,
+  keeping the group's bounds between its writes.
+- **after**: this branch, the store on the group's handle (`GroupLog`).
+- **mantle-log**: `crates/log` at mantle `a2021df`, the store as it was there.
+
+Nine rounds, the three in a rotated order, each run a fresh process; medians, with the least and the
+most. Load average 27 (17:18 PDT, other sessions building).
+
+| | wall µs a committed entry | writes | storage calls: views, terms, fetches | reads another thread answered | allocations | reallocations | context switches |
+|---|---|---|---|---|---|---|---|
+| before | 697 (622–997) | 6 | 6, 9, 3 (the store's own cache answered the rest) | 18 | 72.2 | 0.17 | – |
+| **after** | **166** (156–366) | 6 | 82, 12, 3 | **0** | 72.2 | 0.20 | 19.5 |
+| mantle-log | 163 (153–229) | 6 | 82, 12, 3 (under a read lock) | 0 | 213.2 | 21.17 | 12.1 |
+
+- Reads cost nothing: the handle answers all 97 of an entry's reads where the replica is.
+- A write is two hand-offs, caller to the thread that flushes and back, as mantle's writer had
+  it; it was seven (an admission and two device round trips).
+- The 2% left to mantle-log, within the runs' spread, is one context switch a write (19.5 an entry
+  against 12.1, six writes): while one of the log's threads flushes, the other holds the owner so
+  that callers are answered meanwhile, and it sleeps and is woken once more than a single writer
+  does. A design that lets a waiting caller do the flush itself, with no hand-off of the owner, is
+  the next step (`ORIGIN.md`, "Not done"). A protocol that woke the owner only when it waited for
+  the device was tried and measured: it left the count at 19.4, since the switch is the
+  hand-off's, and was not kept.
+- Allocations are a third of mantle-log's and reallocations a hundredth: hyper-log's appends
+  allocate nothing (below), and the rest are the core's and the store's.
 
 ## End to end
 

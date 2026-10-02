@@ -103,9 +103,47 @@ Appends and fetches into a reservation allocate nothing once warm: `docs/benchma
   `log.proptest-regressions` recorded are run as the inputs they shrank to
   (`recorded_regressions_hold`), since the file's seeds replay other inputs under the new strategy.
 
+## Reads where the replica is, two hand-offs a write (commits `d04934e`, `7585e19`)
+
+mantle measured its replica path on this crate at 828 µs a committed entry against 159 µs on its
+own `crates/log` (mantle `docs/measurements/2026-10-01-shared-log.md`): every read was a round trip
+to the owner thread, and every write crossed four threads. Both are fixed at their cause.
+
+- **A group's handle** (`src/group.rs`, `Log::group`). A replica reads and writes its group
+  through the group's `GroupLog`, which keeps, on the replica's thread, what the core reads: the
+  start, the last entry, the term of every retained entry as runs of one term, the hard state and
+  marks, and the bytes of the recent entries within `group_cache`, by the log's own cache rule. It
+  is exact because the core reads its storage only between its own writes (hyper-raft's `RawNode`
+  takes no call while a `Ready` is out) and only the group's own writes move what it reads; each
+  write's answer brings its entries back, the log having written them, and the handle applies it
+  as the log did (`writer::apply`). It asks the owner only for entries older than its cache, a view
+  with proposals, and everything after a failure it cannot account for. The log holds the group
+  for its handle: another writer is refused `LogError::Claimed`. No shared memory, no atomics, no
+  `unsafe`. A property test checks every read of the handle against the log's own after every
+  write of a random history (`tests/group.rs`).
+- **Leader/followers** (`src/owner/mod.rs`, Schmidt, O'Ryan, Pyarali, Kircher and Buschmann,
+  PLoP 2000). The two threads take turns holding the owner; the one with I/O to do hands the owner
+  to the other and does the I/O itself, the device travelling with the job. It finishes a frame as
+  mantle's writer did: the frame before answered once this frame's record confirms it; then, unless
+  the owner said another frame follows, this frame confirmed and answered. The owner hears of the
+  flush before the confirmation is written, through a side channel it reads before every message,
+  so a frame is published once flushed without waking it. A write crosses from its caller to the
+  thread that flushes it and back. A blocking write is no longer woken for its admission.
+- **Fixed with it** (`7585e19`): a round's framing no longer depends on how fast its callers
+  return. The busy period of the fair queue ends when the answers go out with nothing queued, not
+  after the owner has drained what answered callers sent since; and the device hears that another
+  frame follows before the caller hears it is admitted. The equivalence's rounds now wait for the
+  plug's flush or its answer: `is_held` never consumed its event. Together these were the
+  equivalence failures on Windows and macOS CI, reproduced pinned to one core
+  (`docs/benchmarks.md`, "Equivalence").
+
+The 48 equivalence files are byte-identical to mantle-log's throughout.
+
 ## Not done
 
-- The writes through hyper-block's device issuer (mantle `docs/design/node.md` §1.2): the log has its
-  own device thread until then.
-- Entries read from the file wait behind a frame's write and flush on the one device thread.
+- The writes through hyper-block's device issuer (mantle `docs/design/node.md` §1.2): the log does
+  its own I/O on its second thread until then.
+- Entries read from the file wait behind a frame's write and flush: one I/O at a time.
+- A write costs one context switch more than mantle's single writer: the thread that takes the owner
+  while the other flushes sleeps and is woken again (`docs/benchmarks.md`, "The replica's path").
 - mantle's replica shell on this crate (D-1), and mantle and focal consuming it (F-1).

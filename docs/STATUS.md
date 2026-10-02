@@ -37,8 +37,8 @@ The core's TLA+ model (`docs/models/`, from focal `7ea6f63`): the classic track,
 configuration by one entry or through a joint configuration, the fast track with both of its
 rules, and members marked at rest with a marked member's election (R-7). Seven configurations pass
 at their stated states and five are refused as they must be, among them each fast-track rule taken
-out; six more for the marked members (three to pass, three to be refused) are counted by CI's first
-run, which fails each until its count is recorded (`docs/models/README.md`). CI's `model` job runs
+out; eight more for the marked members, three that pass and five refused, at their stated states
+as CI counted them (`docs/models/README.md`). CI's `model` job runs
 them on Linux.
 
 ## Consumers

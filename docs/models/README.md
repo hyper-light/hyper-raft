@@ -118,12 +118,14 @@ one worker, `TLC_MEMORY_MB=256`, beside other work (load average about 30 on 18 
 | `least` | `FastTrackWrong.cfg` | 5 voters, 2 terms, 1 index, the least-held entry recovered, no first rule | 89,337 (focal: 89,337) | refused: `LeaderHolds` | 2 min 58 s |
 | `anyconfig` | `FastTrackAnyConfig.cfg` | `change` without the second rule | 755,201 | refused: `LeaderHolds` | 1 min 22 s |
 | `growreached` | `FastTrackGrowReached.cfg` | `grow` and the claim `NoFastByHeldAfterChange` | 12,451 | refused: `NoFastByHeldAfterChange` | 2 s |
-| `marked` | `Marked.cfg` | classic core, 3 voters, any losing its log's tail at rest, 3 terms, 2 indexes | first CI run | passes | |
-| `markedchange` | `MarkedChange.cfg` | classic core, 2 voters and s3 added by one entry, any losing its tail, 3 terms, 2 indexes | first CI run | passes | |
-| `markedjoint` | `MarkedJoint.cfg` | classic core, s1 replaced by s3 through a joint configuration, any losing its tail, 3 terms, 2 indexes | first CI run | passes | |
-| `markedself` | `MarkedSelf.cfg` | `marked` at 2 terms and 1 index, a marked candidate's own vote counted | first CI run | refused: `LeaderHolds` | |
-| `markedwhole` | `MarkedWhole.cfg` | `marked` at 2 terms and 1 index, voters judging by their logs | first CI run | refused: `LeaderHolds` | |
-| `markedreach` | `MarkedReached.cfg` | `marked` and the claim `NoMarkedLeader` | first CI run | refused: `NoMarkedLeader` | |
+| `marked` | `Marked.cfg` | classic core, 3 voters, any losing its log's tail at rest, 2 terms, 2 indexes | 196,484 | passes | 14 s (CI, 4 workers) |
+| `markedchange` | `MarkedChange.cfg` | classic core, 2 voters and s3 added by one entry, any losing its tail, 2 terms, 2 indexes | 76,173 | passes | 5 s (CI, 4 workers) |
+| `markedjoint` | `MarkedJoint.cfg` | classic core, s3 removed through a joint configuration, any losing its tail, 2 terms, 2 indexes | 909,876 | passes | 51 s (CI, 4 workers) |
+| `markedself` | `MarkedSelf.cfg` | `marked` at 2 terms and 1 index, a marked candidate's own vote counted | 979 | refused: `LeaderHolds` | 1 s (CI) |
+| `markedwhole` | `MarkedWhole.cfg` | `marked` at 2 terms and 1 index, voters judging by their logs | 1,187 | refused: `LeaderHolds` | 1 s (CI) |
+| `markedreach` | `MarkedReached.cfg` | `marked` and the claim `NoMarkedLeader` | 241 | refused: `NoMarkedLeader` | 1 s (CI) |
+| `changereach` | `MarkedChangeReached.cfg` | `markedchange` and the claim `NoMarkedLeader` | 6,297 | refused: `NoMarkedLeader` | 2 s (CI) |
+| `jointreach` | `MarkedJointReached.cfg` | `markedjoint` and the claim `NoMarkedLeader` | 579 | refused: `NoMarkedLeader` | 1 s (CI) |
 
 What each shows:
 - `one`, `round`, `four`: focal's three, unchanged. `reached` shows that `round` commits an index
@@ -164,21 +166,28 @@ and rule at three.
 
 **The marked members (R-7, 2026-10-02).** The model gained `Lose`, `Claim`, `Own`, the variables
 `mark` and `markedLed` and the constants `Losers` and `Marks`. With `Losers = {}` no step of them is
-enabled and `mark` and `markedLed` keep their first values, so every configuration above has the
-states it had; each states `Losers = {}` and `Marks = "core"`. The six new ones were written without
-running TLC (`CLAUDE.md` §1): their `StateBudget` is a ceiling, the largest configuration measured
-(`change`'s 3,304,320, whose memory set the runner's bounds), and `scripts/check-model.sh` fails each
-of them on its first CI run with the count it found ("has N states and states 3304320"), which is
-the count to record here and in the configuration. What each shows:
-- `marked`, `markedchange`, `markedjoint`: every invariant across marks on three voters, across a
-  change by one voter, and through a joint configuration, a marked candidate counting both halves'
-  majorities without itself.
-- `markedself` is the self-exclusion taken out: s1 commits an entry by s2, s2 loses it at rest,
-  and s2 counts its own vote with s3's, whose log is empty, and leads without it.
+enabled and `mark` and `markedLed` keep their first values: every configuration above has the
+states it had (CI run 37044106956, all twelve at their counts), and each states `Losers = {}` and
+`Marks = "core"`. TLC was not run on the owner's machine: the eight new configurations were counted
+by CI (run 37048934354, the job's whole suite 35 minutes at four workers, the eight together under
+two). Each is at the smallest scope that still does what it is for:
+- `marked`, `markedchange`, `markedjoint`: every invariant at two terms and two indexes, the fewest at
+  which a marked member's log holds an entry below what it lost and one is elected in the second
+  term. Three voters at three terms and two indexes had passed 3.3 million states with 659,491 on
+  the queue when its first ceiling stopped it (run 37044106956).
+- `markedreach`, `changereach`, `jointreach` show each of the three elects a marked member, or it
+  checks nothing of R-7: s1 leads term 1, writes an entry, loses it at rest, and is elected in term 2
+  by the two others vouching for its log; after the change by one voter the same under the three
+  voters it made. In `markedjoint` the halves are of two and three voters: no member of the half of
+  two can be elected while marked (the other alone is no quorum), and the marked member elected is
+  elected under the three voters before the change, which the run then passes through.
+- `markedself` is the self-exclusion taken out: s1 commits an entry by s2, s2 loses it at rest, and
+  s2 counts its own vote with s3's, whose log is empty, and leads without it.
 - `markedwhole` is the voters' judgment by the mark taken out: s2, having lost the entry, votes for
   s3 by its own empty log.
-- `markedreach` shows `marked` elects a marked member (s1 writes an entry, loses it, and is elected
-  on its empty log by s2 and s3): without it `marked` would check nothing of R-7.
+
+`scripts/check-model.sh` now runs every configuration named and fails at the end if any did not end
+as it states, so one run reports every count.
 
 **To change the model.** A change that makes a configuration larger or smaller fails the check
 until its states are counted again and stated; a new configuration is first run with a

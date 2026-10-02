@@ -534,9 +534,10 @@ count both (`docs/raft.md` §3's R-7 row).
 the model gains the marked member (`docs/models/README.md`): `Lose`, a member losing its log's tail
 at rest and marking through its last entry; a voter judging by its claim (`Claim`); a marked
 candidate's own vote uncounted (`Own`); the mark ending as the log reaches it or at election. Every
-configuration before it has the states it had (`Losers = {}`); three new ones pass (three voters, a
-change by one voter, a joint configuration) and three must be refused (the candidate's own vote
-counted, voters judging by their logs, and the claim that no marked member is ever elected).
+configuration before it has the states it had (`Losers = {}`); three new ones pass at two terms and
+two indexes (three voters, a change by one voter, a joint configuration: 196,484, 76,173 and 909,876
+states), and five must be refused (the candidate's own vote counted, voters judging by their logs,
+and for each of the three the claim that no marked member is ever elected), counted by CI.
 
 Ganesan et al.'s findings are the tests' checklist (research §5): every fault detected (checksums on
 every record and payload, R-2's CRC-32C), crash and corruption never conflated, redundancy always

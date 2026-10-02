@@ -1569,14 +1569,17 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
     }
 
     /// Gives out `messages`: a marked member's campaigns ask no one, its election timer still
-    /// running so that it holds no lease on a leader that is gone.
-    fn emit(&self, messages: Vec<Message>, out: &mut Output<M::Answer>) {
+    /// running so that it holds no lease on a leader that is gone. The emptied vector goes back to
+    /// the core as its next queue (`RawNode::recycle_messages`), so the queue's room is not grown
+    /// again for every ready taken ahead.
+    fn emit(&mut self, mut messages: Vec<Message>, out: &mut Output<M::Answer>) {
         if self.mark.is_some() {
             out.messages
-                .extend(messages.into_iter().filter(|m| !campaigns(m)));
+                .extend(messages.drain(..).filter(|m| !campaigns(m)));
         } else {
-            out.messages.extend(messages);
+            out.messages.append(&mut messages);
         }
+        self.node.recycle_messages(messages);
     }
 
     /// Reads confirmed and now applied far enough leave.

@@ -483,6 +483,15 @@ impl<S: Storage> RawNode<S> {
         self.raft.commit_durable(commit);
         Ok(())
     }
+    /// The owner is done with the messages a [`Ready`] or [`LightReady`]
+    /// gave: their vector, emptied, becomes the member's next queue of
+    /// messages, so its room is not grown again. Optional; a vector with no
+    /// more room than the member keeps already, or more than
+    /// [`crate::Limits::pending_messages`] slots, is dropped.
+    pub fn recycle_messages(&mut self, emptied: Vec<Message>) {
+        let most = self.raft.config.limits.pending_messages;
+        self.raft.msgs.recycle(emptied, most);
+    }
     /// The owner holds what it was given to apply and takes no more until
     /// [`RawNode::resume_apply`] (core step R-6, an apply pause as etcd's
     /// `applyingEntsPaused`): `Ready`s and notices give nothing to apply
@@ -980,7 +989,7 @@ impl<S: Storage> RawNode<S> {
     /// The writes of every `Ready` through `number` are durable, in the
     /// order they were issued, and storage answers for them.
     pub fn on_persist(&mut self, number: u64) -> Result<LightReady> {
-        self.on_persist_keeping(number, |_, _| {})
+        self.persist_through(number, None::<fn(&mut S, Kept)>)
     }
     /// As [`RawNode::on_persist`], handing what became durable to `keep`,
     /// with the storage, before the member reads storage for it: an owner
@@ -992,6 +1001,17 @@ impl<S: Storage> RawNode<S> {
         &mut self,
         number: u64,
         keep: impl FnOnce(&mut S, Kept),
+    ) -> Result<LightReady> {
+        self.persist_through(number, Some(keep))
+    }
+    /// [`RawNode::on_persist`] with no `keep`: what became durable is dropped
+    /// where it was held, so the log keeps its room for the next entries
+    /// rather than giving it away with them. Else
+    /// [`RawNode::on_persist_keeping`].
+    fn persist_through(
+        &mut self,
+        number: u64,
+        keep: Option<impl FnOnce(&mut S, Kept)>,
     ) -> Result<LightReady> {
         if self.taken.is_some() {
             return Err(Error::Invariant(
@@ -1009,6 +1029,7 @@ impl<S: Storage> RawNode<S> {
         {
             return Err(Error::Invariant("a write made durable that is not out"));
         }
+        let keeps = keep.is_some();
         let mut kept = Kept::default();
         let mut in_place = false;
         let Self {
@@ -1022,11 +1043,20 @@ impl<S: Storage> RawNode<S> {
             .iter_mut()
             .take_while(|given| given.mark.number <= number)
         {
-            given.stable = stabilize(&mut raft.log, term, durable_vote, &given.mark, &mut kept)?;
+            given.stable = stabilize(
+                &mut raft.log,
+                term,
+                durable_vote,
+                &given.mark,
+                &mut kept,
+                keeps,
+            )?;
             raft.commit_durable(given.mark.commit);
             in_place = given.mark.in_place;
         }
-        if kept.snapshot.is_some() || !kept.entries.is_empty() {
+        if let Some(keep) = keep
+            && (kept.snapshot.is_some() || !kept.entries.is_empty())
+        {
             keep(&mut self.raft.log.store, kept);
         }
         self.raft.settle_priority();
@@ -1084,7 +1114,7 @@ impl<S: Storage> RawNode<S> {
     /// What `ready` gave to persist is durable, and storage answers for it:
     /// [`RawNode::advance_issued`] and [`RawNode::on_persist`] at once.
     pub fn advance_append(&mut self, ready: Ready) -> Result<LightReady> {
-        self.advance_append_keeping(ready, |_, _| {})
+        self.advance_through(ready, None::<fn(&mut S, Kept)>)
     }
     /// As [`RawNode::advance_append`], handing what `ready` gave to persist
     /// to `keep` ([`RawNode::on_persist_keeping`]).
@@ -1093,10 +1123,19 @@ impl<S: Storage> RawNode<S> {
         ready: Ready,
         keep: impl FnOnce(&mut S, Kept),
     ) -> Result<LightReady> {
+        self.advance_through(ready, Some(keep))
+    }
+    /// [`RawNode::advance_append`] with no `keep`, else
+    /// [`RawNode::advance_append_keeping`] (as [`RawNode::persist_through`]).
+    fn advance_through(
+        &mut self,
+        ready: Ready,
+        keep: Option<impl FnOnce(&mut S, Kept)>,
+    ) -> Result<LightReady> {
         if !self.issued.is_empty() {
             let number = ready.number;
             self.advance_issued(ready)?;
-            return self.on_persist_keeping(number, keep);
+            return self.persist_through(number, keep);
         }
         // The only write out, issued and durable at once: nothing happened
         // between its taking and now, so it vouches for everything not yet
@@ -1126,11 +1165,14 @@ impl<S: Storage> RawNode<S> {
             kept.snapshot = log.take_stable_snapshot(index);
         }
         if let Some((index, term)) = last {
-            log.take_stable_to(index, term, &mut kept.entries)?;
+            let into = keep.is_some().then_some(&mut kept.entries);
+            log.take_stable_to(index, term, into)?;
         }
         log.unstable.issue();
         self.raft.held.issue();
-        if kept.snapshot.is_some() || !kept.entries.is_empty() {
+        if let Some(keep) = keep
+            && (kept.snapshot.is_some() || !kept.entries.is_empty())
+        {
             keep(&mut self.raft.log.store, kept);
         }
         self.raft.settle_priority();
@@ -1191,6 +1233,7 @@ fn stabilize<S: Storage>(
     durable_vote: &mut (u64, u64),
     given: &Mark,
     kept: &mut Kept,
+    keeps: bool,
 ) -> Result<Stable> {
     if let Some(vote) = given.vote {
         *durable_vote = vote;
@@ -1206,7 +1249,7 @@ fn stabilize<S: Storage>(
         stable.snapshot = Some(index);
     }
     if let Some((index, entry_term)) = given.last_entry
-        && log.take_stable_to(index, entry_term, &mut kept.entries)?
+        && log.take_stable_to(index, entry_term, keeps.then_some(&mut kept.entries))?
     {
         stable.entries = Some((index, entry_term));
     }

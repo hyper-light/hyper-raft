@@ -3363,6 +3363,37 @@ at the sites only hyper-durable has:
      `mem::take`. `on_persist_keeping` keeps its zero-copy hand-off.
   3. `Outgoing::take` (0.01–0.02): an alternative that swaps the queue with an owner's emptied
      buffer, so neither side's capacity is lost.
+- **Made in the core** (2026-10-02, 05:20–05:40 PDT, load 3.7–4.2), each as asked:
+  1. `truncate_and_append` with nothing kept appends into the log's own emptied vector when it has
+     the room, and takes the incoming one only when it does not.
+  2. `take_stable_to` takes `Option<&mut Vec<Entry>>`: `on_persist` and `advance_append` (no `keep`)
+     drop what became durable in place, `clear` or `drain`, so the vector keeps its room;
+     `on_persist_keeping` and `advance_append_keeping` hand it off as before.
+  3. `RawNode::recycle_messages(emptied)`: an owner gives back the vector a `Ready` or `LightReady`
+     gave its messages in; it is the member's queue at once if nothing waits, else the next
+     `take`'s, kept only where it has more room than what it replaces and no more than
+     `Limits::pending_messages` slots (`Outgoing::resident_bytes` counts it). hyper-durable does
+     not call it yet, so the runs below do not show it.
+
+  Simulated device, register, 5 rounds of 3,000 entries, the core before and after in alternate
+  runs, two each (`--devices sim --members 3,5 --shapes register --rounds 5 --entries 3000`);
+  mantle `1c179e8` in the same runs:
+
+  | members | shell | driver's reallocs/entry | driver's allocs/entry | process reallocs/entry |
+  |---|---|---|---|---|
+  | 3 | mantle 1c179e8 | 21.00; 21.00; 21.00; 21.00 | 135.0 | 21.29 |
+  | | hyper-durable, core before | 21.11; 21.12 | 99.6; 99.7 | 21.37; 21.38 |
+  | | hyper-durable, core after | 21.01; 21.01 | 99.4; 99.5 | 21.27; 21.27 |
+  | 5 | mantle 1c179e8 | 33.01 (all four) | 225.7 | 33.48 |
+  | | hyper-durable, core before | 33.21; 33.22 | 166.0; 166.0 | 33.62; 33.63 |
+  | | hyper-durable, core after | 33.02; 33.02 | 165.7; 165.7 | 33.43; 33.43 |
+
+  The driving thread's reallocations are mantle's to 0.01, the 0.01 that the third change leaves
+  for the shell to take up; the process's are below mantle's. Allocations fell by 0.2–0.3 an
+  entry: the 5.6 more of the earlier experiment were its environment-variable switch, not the
+  change. `hyper-raft-compare ... count`, every workload, in place and copying, three voters:
+  allocations, reallocations and bytes unchanged (no reallocation in either), since that harness
+  finishes each write before the next.
 
 **Context switches.** `/usr/bin/time -l` on one shell a process (file device, three members,
 three rounds of 300, two runs each, load 2–7):

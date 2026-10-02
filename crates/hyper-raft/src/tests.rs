@@ -1604,3 +1604,62 @@ fn a_read_asked_by_two_members_under_one_context_answers_both() {
     );
     assert_eq!(node.raft.pending_read_count(), 0);
 }
+
+/// With readies taken ahead (R-4) a proposal is appended while a write is
+/// out. What a notice makes durable, for an owner that does not keep it
+/// (`RawNode::on_persist`), is dropped where it was held, and the log's
+/// vector keeps its room: the next proposal lands without growing it again.
+#[test]
+fn a_notice_leaves_the_log_its_room_for_the_next_proposal() {
+    let mut node = leader_with(with_depth(1, 2));
+    node.propose(vec![], b"a".to_vec()).unwrap();
+    let first = node.ready().unwrap();
+    let mut written = first.entries().to_vec();
+    node.advance_issued(first).unwrap();
+    for data in [b"b", b"c", b"d", b"e", b"f", b"g", b"h"] {
+        node.propose(vec![], data.to_vec()).unwrap();
+    }
+    let second = node.ready().unwrap();
+    written.extend_from_slice(second.entries());
+    let number = second.number();
+    node.advance_issued(second).unwrap();
+    let room = node.raft.log().unstable.entries.capacity();
+    assert!(room >= 8);
+    node.store_mut().append(&written);
+    node.on_persist(number).unwrap();
+    assert!(node.raft.log().unstable.entries.is_empty());
+    assert_eq!(node.raft.log().unstable.entries.capacity(), room);
+    node.propose(vec![], b"i".to_vec()).unwrap();
+    assert_eq!(node.raft.log().unstable.entries.len(), 1);
+    assert_eq!(node.raft.log().unstable.entries.capacity(), room);
+}
+
+/// The vector an owner empties and gives back is the member's next queue of
+/// messages, room and all; one with more room than the bound is dropped.
+#[test]
+fn messages_given_back_are_the_next_queue() {
+    let mut node = leader();
+    node.tick().unwrap();
+    node.tick().unwrap();
+    let mut ready = node.ready().unwrap();
+    let mut given = ready.take_messages();
+    assert!(!given.is_empty());
+    given.reserve(64);
+    let room = given.capacity();
+    node.advance_append(ready).unwrap();
+    node.recycle_messages(given);
+    node.tick().unwrap();
+    node.tick().unwrap();
+    let mut ready = node.ready().unwrap();
+    let messages = ready.take_messages();
+    assert!(!messages.is_empty());
+    assert_eq!(messages.capacity(), room);
+    node.advance_append(ready).unwrap();
+    // More room than may ever wait is not kept.
+    let mut bounded = config(1);
+    bounded.limits.pending_messages = 8;
+    let mut node = leader_with(bounded);
+    let before = node.raft.msgs.resident_bytes();
+    node.recycle_messages(Vec::with_capacity(9));
+    assert_eq!(node.raft.msgs.resident_bytes(), before);
+}

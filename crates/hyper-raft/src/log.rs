@@ -257,7 +257,11 @@ impl Unstable {
             self.bytes = self.bytes.saturating_add(proto::approximate_bytes(entry));
             self.payload = self.payload.saturating_add(payload_of(entry));
         }
-        if kept == 0 {
+        // Nothing kept: the incoming vector is taken as it is, unless the
+        // log's own, emptied above, already has the room. Keeping that room
+        // is what lets a proposal appended while a write is out (core step
+        // R-4) land without growing the vector again.
+        if kept == 0 && self.entries.capacity() < entries.len() {
             self.entries = entries;
         } else {
             self.entries.append(&mut entries);
@@ -664,19 +668,21 @@ impl<S: Storage> Log<S> {
     /// append replaced them while the write was out), when they are durable
     /// already, or when a snapshot before them is not.
     pub fn stable_to(&mut self, index: u64, term: u64) -> Result<bool> {
-        let mut given_up = Vec::new();
-        self.take_stable_to(index, term, &mut given_up)
+        self.take_stable_to(index, term, None)
     }
     /// As [`Log::stable_to`], giving the entries up to `into`, after what it
     /// holds: storage, which holds them now, may keep these very ones. When
     /// they are all that is held and `into` is empty, the log's own vector
-    /// is given, copied nowhere.
+    /// is given, copied nowhere. With no `into` they are dropped in place,
+    /// and the log keeps its vector's room for what is appended next: with
+    /// readies taken ahead (core step R-4) the next proposal arrives while a
+    /// write is out, and a vector given away is grown again for it.
     #[inline]
     pub(crate) fn take_stable_to(
         &mut self,
         index: u64,
         term: u64,
-        into: &mut Vec<Entry>,
+        into: Option<&mut Vec<Entry>>,
     ) -> Result<bool> {
         let unstable = &mut self.unstable;
         // Entries are never durable before the snapshot they follow.
@@ -697,15 +703,19 @@ impl<S: Storage> Log<S> {
         if count == unstable.entries.len() {
             // Given up, and not emptied: a member that rests holds what it
             // held before it was written to.
+            match into {
+                None => unstable.entries.clear(),
+                Some(into) if into.is_empty() => {
+                    *into = std::mem::take(&mut unstable.entries);
+                }
+                Some(into) => {
+                    into.try_reserve(count).map_err(|_| Error::Memory)?;
+                    into.append(&mut unstable.entries);
+                }
+            }
             unstable.bytes = 0;
             unstable.payload = 0;
-            if into.is_empty() {
-                *into = std::mem::take(&mut unstable.entries);
-            } else {
-                into.try_reserve(count).map_err(|_| Error::Memory)?;
-                into.append(&mut unstable.entries);
-            }
-        } else {
+        } else if let Some(into) = into {
             into.try_reserve(count).map_err(|_| Error::Memory)?;
             for entry in unstable.entries.drain(..count) {
                 unstable.bytes = unstable
@@ -713,6 +723,13 @@ impl<S: Storage> Log<S> {
                     .saturating_sub(proto::approximate_bytes(&entry));
                 unstable.payload = unstable.payload.saturating_sub(payload_of(&entry));
                 into.push(entry);
+            }
+        } else {
+            for entry in unstable.entries.drain(..count) {
+                unstable.bytes = unstable
+                    .bytes
+                    .saturating_sub(proto::approximate_bytes(&entry));
+                unstable.payload = unstable.payload.saturating_sub(payload_of(&entry));
             }
         }
         unstable.offset = index.saturating_add(1);

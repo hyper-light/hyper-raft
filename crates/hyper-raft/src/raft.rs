@@ -427,6 +427,9 @@ pub struct Raft<S> {
 pub struct Outgoing {
     msgs: Vec<Message>,
     payload: usize,
+    /// An emptied queue an owner gave back ([`Outgoing::recycle`]), which
+    /// the next [`Outgoing::take`] leaves in place of the one it gives.
+    spare: Vec<Message>,
 }
 impl Outgoing {
     /// The fewest slots a queue is given: what a tick of a three-member
@@ -453,10 +456,12 @@ impl Outgoing {
     pub fn payload(&self) -> usize {
         self.payload
     }
-    /// The bytes held, by capacity: the slots and what the messages hold.
+    /// The bytes held, by capacity: the slots, the spare queue's, and what
+    /// the messages hold.
     pub fn resident_bytes(&self) -> usize {
         self.msgs
             .capacity()
+            .saturating_add(self.spare.capacity())
             .saturating_mul(std::mem::size_of::<Message>())
             .saturating_add(self.payload)
     }
@@ -483,11 +488,32 @@ impl Outgoing {
         self.msgs.push(message);
         Ok(())
     }
-    /// Everything queued, given up: the queue that remains holds nothing
-    /// and keeps no room.
+    /// Everything queued, given up: the queue that remains holds nothing,
+    /// with the room of the spare an owner gave back, if any.
     pub fn take(&mut self) -> Vec<Message> {
         self.payload = 0;
-        std::mem::take(&mut self.msgs)
+        let spare = std::mem::take(&mut self.spare);
+        std::mem::replace(&mut self.msgs, spare)
+    }
+    /// An owner gives back a queue it has emptied, so the room a burst grew
+    /// stays with the member rather than being grown again from
+    /// [`Outgoing::SMALLEST`]: it is the queue now if nothing waits, else the
+    /// next [`Outgoing::take`]'s. It is kept only where it has more room than
+    /// what it would replace, and no more than `most` slots, the most that
+    /// may wait ([`Limits::pending_messages`]); otherwise it is dropped.
+    pub(crate) fn recycle(&mut self, mut emptied: Vec<Message>, most: usize) {
+        emptied.clear();
+        let room = emptied.capacity();
+        if room > most {
+            return;
+        }
+        if self.msgs.is_empty() {
+            if room > self.msgs.capacity() {
+                self.msgs = emptied;
+            }
+        } else if room > self.spare.capacity() {
+            self.spare = emptied;
+        }
     }
     /// Whether the counter says what a walk of the messages says.
     pub(crate) fn check(&self) -> Result<()> {

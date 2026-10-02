@@ -90,6 +90,8 @@ pub(crate) struct LaneIn {
     pub(crate) frame: Option<Reservation>,
     /// The frame's bytes still to arrive.
     pub(crate) left: u64,
+    /// The rank of the frame's class; a skipped frame's counts as the most urgent's.
+    pub(crate) rank: u8,
 }
 
 impl LaneIn {
@@ -105,6 +107,7 @@ impl LaneIn {
             kind: 0,
             frame: None,
             left: 0,
+            rank: 0,
         }
     }
 }

@@ -12,7 +12,7 @@ source: its credit law (`flow.rs`, `connection.rs`) is taken here. Neither repos
 |---|---|---|
 | `admission.rs` | focal `admission.rs` (27 §3.1 P5; the audit's F20) | One owner instead of `Arc<Mutex<State>>`; connections are keys, not quinn handles. The pending places, the replacement of an identity's connection used longest ago, the connection bound met after the replacement rule, and the identity bound are focal's. focal's fixed 4 per node and 16 per participant are excluded (note 32 T9): one configured `per_identity`. focal's per-identity ingress share (F03) is the budget's, through `Budget::reserve` before a head is read. |
 | `frame.rs` | focal `frame.rs` (`read_frame_header`, F03, F52) | The fixed header read first and checked before any byte past it is reserved or read is focal's. The layout is new: a kind, a head and an optional streamed body, with CRC-32C over prefix and head and a body trailer (mantle CLAUDE.md §6), where focal carried one postcard payload under a magic. |
-| `progress.rs` | focal `transport.rs` `carried`, `frame.rs` `read_payload_arriving` and `residency` (note 32 T39) | The same law, judged by the caller's clock: asking, a period that sends less than a datagram or that began with everything owed sent ends the exchange; answering, a period must bring a datagram of the body or its end, within its residency. focal's `Held` atomic is the endpoint's own sum over its exchanges. |
+| `progress.rs` | focal `transport.rs` `carried`, `frame.rs` `read_payload_arriving` and `residency` (note 32 T39) | The same law, judged by the caller's clock: asking, a period that sends less than a datagram or that began with everything owed sent ends the exchange; answering, a period must bring a datagram or the body's end, and one that began with everything the peer declared of the body's class and the less urgent ones delivered ends it (focal's residency is gone; see below). focal's `Held` atomic is the endpoint's own sum over its exchanges. |
 | `round.rs` | focal `round.rs` (27 §3.1 P1, note 32 T45) | `gather` over `FuturesUnordered` becomes `Round`, which the owner reports to and judges at its next judgement, over hyper-timing's `RoundWait`. focal's 1,024-peer bound is gone: the round holds counts, no table. |
 | `timing.rs` | focal `peers.rs` (`Exchange`, `exchange_tail`, `spread`; T40, T41) | The estimator doubles per abandoned exchange without focal's cap of six (note 32 T40); `spread` is focal's F64 unchanged. |
 | `credit.rs` | slates `connection.rs` `class_credit_reserve`, `stream_bytes_per_packet`; slates `flow.rs` autotune; focal `transport.rs` `STREAM_WINDOW_CEILING` (T16, T17, T33) | The reserve is slates' law over QUIC's own packet layout (RFC 9000 §17, §19.8; RFC 9001 §5.3). The window starts at RFC 9002's initial window and doubles by Chromium's rule, each growth reserved from the budget. focal's 1 MiB stream ceiling, set after its 10 MiB window closed connections, is replaced by its derivation from the assembler's span limit, now public in hyper-quic (patch Q5). |
@@ -62,6 +62,20 @@ source: its credit law (`flow.rs`, `connection.rs`) is taken here. Neither repos
   killed peer's upload ended after two periods on one run, four on another). A period now also has to
   have heard the peer (`progress.rs`; `what_is_sent_into_silence_is_not_progress`).
 
+- **An answer is charged with what arrives, not priced by the path.** focal gave a payload its
+  residency, its bytes at two datagrams of the least size a round trip (a probe timeout since focal's audit F36)
+  , and a wait at least: a sender limited by its path, which holds where a payload is written
+  whole and read on a stream of its own. Here the peer's owner writes a body as it has it and the
+  exchanges share the connection, so a body that took longer than a period on a path of microseconds
+  was refused while it moved: an 8 MiB bulk reply at 5.6 and 5.5 MB read (ubuntu-24.04 at
+  `ac10f6f`, windows-11-arm at `35d35d8`, its sender CPU-bound on a loaded runner, 2.7 MB/s against
+  the 6 MB/s that two datagrams per 395 µs assume), and a 64 KiB reply queued behind fifteen others
+  at none read while its period brought 464 KB (macOS, three runs at once under background QoS). The
+  wait is now charged with the bytes the connection delivered of its class and the less urgent ones,
+  against what the peer declared of them, as the asking phase is charged with what it sent
+  (`a_reply_written_slower_than_the_path_carries_is_not_refused_while_it_arrives`,
+  `a_reply_queued_behind_the_peers_others_is_not_refused_while_they_arrive`,
+  `a_body_the_peer_withholds_while_it_sends_others_is_given_up`).
 - **Strict priority where credit is taken.** quinn orders what is buffered by stream priority, but
   connection credit is charged when an application writes. An owner that wrote its bulk body first
   starved its own requests of credit: the end-to-end run found request bodies stalled behind an 8 MiB

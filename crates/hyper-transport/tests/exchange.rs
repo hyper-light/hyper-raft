@@ -1093,3 +1093,236 @@ fn a_reply_ended_before_its_trailer_left_still_reaches_the_peer_whole() {
         "node 2 is still connected"
     );
 }
+
+/// A server owner whose replies' bodies come from a source that gives it a piece every `step`:
+/// it writes what it has as credit takes it, to the exchanges in the order their requests came,
+/// so its bodies arrive at the source's rate, not the path's. A reply whose seed is in `withheld`
+/// declares its body and is never sent a byte of it.
+struct Paced {
+    step: Duration,
+    next: Instant,
+    /// What the source has given and what of it was written.
+    given: u64,
+    written: u64,
+    /// The exchange, its seed, its reply body's length and what of it was written.
+    served: Vec<(hyper_transport::ExchangeId, u8, u64, u64)>,
+    withheld: Vec<u8>,
+    piece: Vec<u8>,
+}
+
+impl Paced {
+    fn new(step: Duration, now: Instant) -> Self {
+        Self {
+            step,
+            next: now,
+            given: 0,
+            written: 0,
+            served: Vec::new(),
+            withheld: Vec::new(),
+            piece: vec![0; PIECE],
+        }
+    }
+    /// Answers every request with a body of `reply(seed)` bytes, takes a piece from the source if
+    /// its step has come, and writes what it has.
+    fn serve(&mut self, node: &mut Node<Mantle>, now: Instant, reply: impl Fn(u8) -> u64) {
+        while let Some(event) = node.poll_event() {
+            if let Event::Request { exchange, .. } = event {
+                let head = node.head(exchange).unwrap().to_vec();
+                let mut answer = b"ok:".to_vec();
+                answer.extend_from_slice(&head);
+                let body = reply(head[0]);
+                node.reply(exchange, &answer, Some(body)).unwrap();
+                self.served.push((exchange, head[0], body, 0));
+            }
+        }
+        while now >= self.next {
+            self.given += PIECE as u64;
+            self.next += self.step;
+        }
+        for (exchange, seed, body, written) in &mut self.served {
+            if self.withheld.contains(seed) || *written == *body {
+                continue;
+            }
+            while *written < *body && self.written < self.given {
+                let length = (*body - *written).min(self.given - self.written) as usize;
+                let length = length.min(PIECE);
+                fill(u64::from(*seed), *written, &mut self.piece[..length]);
+                let took = node.write_body(*exchange, &self.piece[..length]).unwrap();
+                *written += took as u64;
+                self.written += took as u64;
+                if took < length {
+                    return;
+                }
+            }
+            if *written == *body {
+                node.end(*exchange);
+            } else {
+                return;
+            }
+        }
+    }
+}
+
+/// Runs node 1's asker against node 2's paced server until every exchange is done.
+fn run_paced(
+    net: &mut Net<Node<Mantle>, Node<Mantle>>,
+    asker: &mut Asker,
+    paced: &mut Paced,
+    reply: impl Fn(u8) -> u64,
+) {
+    for _ in 0..1_000_000 {
+        asker.drive(&mut net.a);
+        paced.serve(&mut net.b, net.now, &reply);
+        net.exchange();
+        asker.drive(&mut net.a);
+        if asker.finished() {
+            return;
+        }
+        if !net.exchange() {
+            net.advance_within(paced.step);
+        }
+    }
+    panic!("the exchanges never ended");
+}
+
+/// A reply body its owner writes slower than the path would carry it is not refused while it
+/// arrives: here 2 MiB at 64 KiB every 250 ms, four periods, each bringing half a megabyte. The
+/// answering wait gave a body only its residency at two datagrams a round trip of the path, and at
+/// least a period: on a path whose round trip is microseconds that is one period, so a body that
+/// took longer was refused at the first judgement that found it unfinished, however much arrived
+/// (ubuntu-24.04 at ac10f6f, windows-11-arm at 35d35d8: an 8 MiB bulk reply refused as stalled at
+/// 5.6 and 5.5 MB read, its sender CPU-bound on a loaded runner).
+#[test]
+fn a_reply_written_slower_than_the_path_carries_is_not_refused_while_it_arrives() {
+    const BODY: u64 = 2 << 20;
+    let pair = Pair::new();
+    let mut net = connected::<Mantle, Mantle>(&pair, limits(), 1 << 30);
+    let mut asker = Asker::new();
+    let mut paced = Paced::new(Duration::from_millis(250), net.now);
+    asker
+        .ask(
+            &mut net.a,
+            net.now,
+            2,
+            (Kind::Snapshot, Class::Bulk),
+            3,
+            None,
+            PERIOD,
+        )
+        .unwrap();
+    let began = net.now;
+    run_paced(&mut net, &mut asker, &mut paced, |_| BODY);
+    let asked = &asker.asked[0];
+    assert_eq!(asked.refused, None, "{asked:?}");
+    assert_eq!(asked.read, BODY);
+    assert!(net.now - began > PERIOD * 3, "the body took four periods");
+}
+
+/// A reply queued behind the peer's other replies is not refused while the connection carries
+/// them: sixteen 128 KiB replies, their heads at once and their bodies one after another at 64 KiB
+/// every 250 ms, so the last body begins 7.5 s after its head. Reproduced on macOS with three
+/// loaded runs at once under background QoS: a reply refused with none of its 65,536 bytes read
+/// while the connection received 464 KB in its period.
+#[test]
+fn a_reply_queued_behind_the_peers_others_is_not_refused_while_they_arrive() {
+    const REQUESTS: u8 = 16;
+    let pair = Pair::new();
+    let mut net = connected::<Mantle, Mantle>(&pair, limits(), 1 << 30);
+    let mut asker = Asker::new();
+    let mut paced = Paced::new(Duration::from_millis(250), net.now);
+    for seed in 0..REQUESTS {
+        asker
+            .ask(
+                &mut net.a,
+                net.now,
+                2,
+                (Kind::Get, Class::Request),
+                seed,
+                None,
+                PERIOD,
+            )
+            .unwrap();
+    }
+    run_paced(&mut net, &mut asker, &mut paced, |_| 2 * PIECE as u64);
+    for asked in &asker.asked {
+        assert_eq!(asked.refused, None, "{asked:?}");
+        assert_eq!(asked.read, 2 * PIECE as u64);
+    }
+}
+
+/// A peer that answers with a head, declares a body and never sends it, while it keeps the
+/// connection busy with the replies to the requests that follow, is still given up: once the
+/// connection has delivered everything the peer owed, the withheld body has a period more, and no
+/// longer, though every period brings a quarter of a megabyte.
+#[test]
+fn a_body_the_peer_withholds_while_it_sends_others_is_given_up() {
+    const OTHERS: usize = 12;
+    let pair = Pair::new();
+    let mut net = connected::<Mantle, Mantle>(&pair, limits(), 1 << 30);
+    let mut asker = Asker::new();
+    let mut paced = Paced::new(Duration::from_millis(250), net.now);
+    paced.withheld.push(0);
+    let reply = |seed: u8| {
+        if seed == 0 {
+            PIECE as u64
+        } else {
+            4 * PIECE as u64
+        }
+    };
+    let ask = |asker: &mut Asker, net: &mut Net<Node<Mantle>, Node<Mantle>>, seed: u8| {
+        asker
+            .ask(
+                &mut net.a,
+                net.now,
+                2,
+                (Kind::Get, Class::Request),
+                seed,
+                None,
+                PERIOD,
+            )
+            .unwrap();
+    };
+    ask(&mut asker, &mut net, 0);
+    ask(&mut asker, &mut net, 1);
+    let began = net.now;
+    let mut given_up = None;
+    for _ in 0..1_000_000 {
+        asker.drive(&mut net.a);
+        paced.serve(&mut net.b, net.now, reply);
+        net.exchange();
+        asker.drive(&mut net.a);
+        if given_up.is_none() && asker.asked[0].done {
+            given_up = Some(net.now - began);
+        }
+        // A request follows each reply, so the connection is never idle.
+        let outstanding = asker.asked[1..].iter().filter(|asked| !asked.done).count();
+        if outstanding == 0 && asker.asked.len() <= OTHERS {
+            let seed = asker.asked.len() as u8;
+            ask(&mut asker, &mut net, seed);
+        }
+        if asker.finished() {
+            break;
+        }
+        if !net.exchange() {
+            net.advance_within(paced.step);
+        }
+    }
+    assert_eq!(asker.asked[0].refused, Some((Refusal::Stalled, false)));
+    assert_eq!(asker.asked[0].read, 0);
+    for asked in &asker.asked[1..] {
+        assert_eq!(asked.refused, None, "{asked:?}");
+        assert_eq!(asked.read, 4 * PIECE as u64);
+    }
+    // Owed at first: the withheld 64 KiB and the first reply's 256 KiB, which with the second
+    // reply's are delivered within the first period; the second period, which began with them
+    // delivered, ends the exchange, while replies arrive until 12 s.
+    let given_up = given_up.unwrap();
+    assert!(
+        given_up > PERIOD * 2 && given_up < PERIOD * 3,
+        "given up after {given_up:?}"
+    );
+    assert!(
+        net.now - began > PERIOD * 5,
+        "the others kept the connection busy"
+    );
+}

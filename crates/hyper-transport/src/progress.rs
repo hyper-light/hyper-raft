@@ -18,11 +18,27 @@
 //!   whether or not the peer lives) moved nothing. So a period must be longer than the peer's
 //!   acknowledgement delay, and `Endpoint::open` refuses one that is not
 //!   (`Refusal::Configuration`); focal's `carried` counted bytes sent alone.
-//! - **Answering**: the reply's prefix arrived and its body is arriving. A period must bring a
-//!   datagram's worth of the connection's received bytes or the body's end, and the body is given no
-//!   longer than its residency: what its bytes take at the least a live sender delivers, two
-//!   datagrams a round trip, the smallest congestion window QUIC keeps (RFC 9002 §7.2), measured
-//!   against the longest round trip seen while it arrives; one period at least.
+//! - **Answering**: the reply's prefix arrived and its body is arriving (or, on the side that
+//!   answers, the request is arriving). A period must bring a datagram's worth of the connection's
+//!   received bytes, or the body's end. Its bytes may come after others the peer sends first: what
+//!   a more urgent class has to send (strict priority, T15), and what the peer declared on the
+//!   connection's other exchanges of its class or a less urgent one. So the wait is charged with
+//!   the bytes of its own class and the less urgent ones that the connection delivered, against
+//!   what the peer declared and has still to deliver of them, this body included; the body ends at
+//!   the end of a period that began with all of that delivered, as the asking phase ends one that
+//!   began with everything sent. A peer that withholds the body while it sends others is given up
+//!   once it has sent everything it owed; one that sends nothing, within a period.
+//!
+//!   The wait used to be bounded instead by the body's residency, its bytes at two datagrams of
+//!   the least size a round trip of the path (focal `frame.rs`), and a period at least. That prices
+//!   a sender limited by its path alone, which holds where a payload is written whole before it is
+//!   sent and has its stream to itself. Here the peer's owner writes the body as it has it, its
+//!   exchanges share the connection, and both ends may be short of CPU, so the round trip QUIC
+//!   measures (395 µs on loopback) says nothing of when the body ends: an 8 MiB bulk reply moving
+//!   at 2.7 MB/s was refused at 5.5 MB read (windows-11-arm, 35d35d8), and a 64 KiB reply queued
+//!   behind fifteen others at none read while its period brought 464 KB. A wall-clock bound
+//!   measures the machine, not the peer (`hyper_timing::progress`); what a slow body holds here is
+//!   bounded in bytes by the receive window the budget funds, not by time.
 
 use std::time::{Duration, Instant};
 
@@ -34,9 +50,6 @@ use crate::credit::MIN_DATAGRAM;
 /// The least a period must move: one datagram of the smallest size a QUIC path carries
 /// (RFC 9000 §14; focal `frame.rs`'s `LEAST_PROGRESS`).
 pub const LEAST_PROGRESS: u64 = MIN_DATAGRAM;
-/// The smallest congestion window QUIC keeps is two datagrams (RFC 9002 §7.2,
-/// `kMinimumWindow = 2 * max_datagram_size`): what a live sender delivers a round trip at least.
-const MINIMUM_WINDOW_DATAGRAMS: u64 = 2;
 
 /// A progress-charged deadline: the period at which an exchange is judged.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -72,6 +85,8 @@ pub(crate) struct Moved {
     pub(crate) sent: u64,
     /// Bytes the connection received.
     pub(crate) received: u64,
+    /// Stream bytes the connection delivered of the exchange's class and the less urgent ones.
+    pub(crate) delivered: u64,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -85,16 +100,51 @@ enum Phase {
         had: bool,
     },
     Answering {
-        began: Instant,
-        /// The body's whole length: what its residency is priced by.
-        total: u64,
+        /// What the peer declared on the connection, of the exchange's class and the less urgent
+        /// ones, and has still to deliver, this body included: the most it was found to be.
+        owed: u64,
+        /// What the periods so far delivered of those classes.
+        charged: u64,
+        /// Whether the period now running began with everything owed delivered.
+        had: bool,
         /// The body's length still to arrive.
         remaining: u64,
-        longest: Duration,
     },
     /// Nothing is being waited on: a served exchange whose request has arrived and whose reply
     /// has not begun is the owner's to answer.
     Idle,
+}
+
+/// The stream bytes a connection delivered to this side's reading, by the rank of the class they
+/// belong to: what the answering wait of a class is charged with. Bytes whose class is not known
+/// yet (a request's prefix, a lane's opening, a skipped frame) count as the most urgent class's,
+/// so they are charged to no wait but that class's.
+#[derive(Clone, Debug)]
+pub(crate) struct Delivered {
+    /// One sum per rank: as many as the project's classes have ranks.
+    by_rank: Vec<u64>,
+}
+
+impl Delivered {
+    pub(crate) fn new(ranks: u8) -> Self {
+        Self {
+            by_rank: vec![0; usize::from(ranks.max(1))],
+        }
+    }
+    /// `bytes` of a class of `rank` were read.
+    pub(crate) fn add(&mut self, rank: u8, bytes: u64) {
+        let last = self.by_rank.len().saturating_sub(1);
+        if let Some(sum) = self.by_rank.get_mut(usize::from(rank).min(last)) {
+            *sum = sum.saturating_add(bytes);
+        }
+    }
+    /// What was read of the classes of `rank` and the less urgent ones.
+    pub(crate) fn from(&self, rank: u8) -> u64 {
+        self.by_rank
+            .iter()
+            .skip(usize::from(rank))
+            .fold(0, |sum, bytes| sum.saturating_add(*bytes))
+    }
 }
 
 /// One exchange's wait.
@@ -125,14 +175,15 @@ impl Carry {
             had: false,
         };
     }
-    /// The exchange is answered: `remaining` bytes of body are to arrive.
-    pub(crate) fn answering(&mut self, now: Instant, moved: Moved, remaining: u64, rtt: Duration) {
+    /// The exchange is answered: `remaining` bytes of body are to arrive, and the peer has
+    /// `backlog` to deliver of the exchange's class and the less urgent ones, this body included.
+    pub(crate) fn answering(&mut self, now: Instant, moved: Moved, remaining: u64, backlog: u64) {
         self.restart(now, moved);
         self.phase = Phase::Answering {
-            began: now,
-            total: remaining,
+            owed: backlog.max(remaining),
+            charged: 0,
+            had: false,
             remaining,
-            longest: rtt,
         };
     }
     /// Nothing is waited on until the exchange asks or is answered again.
@@ -145,20 +196,21 @@ impl Carry {
             *remaining = remaining.saturating_sub(bytes);
         }
     }
-    /// The owner is not reading the body it is answered with: a period in which it did not ask
-    /// for more is no evidence against the sender, so the wait starts afresh from `now`, the rest of
-    /// the body priced anew.
-    pub(crate) fn hold(&mut self, now: Instant, moved: Moved) {
+    /// The period was this side's doing (its owner is not reading the body it is answered with,
+    /// or has not written what the peer would take): no evidence against the peer, so the wait
+    /// starts afresh from `now`, an answer's charge anew against the `backlog` the peer has now.
+    pub(crate) fn hold(&mut self, now: Instant, moved: Moved, backlog: u64) {
         self.restart(now, moved);
         if let Phase::Answering {
-            began,
-            total,
+            owed,
+            charged,
+            had,
             remaining,
-            ..
         } = &mut self.phase
         {
-            *began = now;
-            *total = *remaining;
+            *owed = backlog.max(*remaining);
+            *charged = 0;
+            *had = false;
         }
     }
     fn restart(&mut self, now: Instant, moved: Moved) {
@@ -170,13 +222,14 @@ impl Carry {
         (!matches!(self.phase, Phase::Idle)).then_some(self.next)
     }
     /// Judge the wait at `now`, if a judgement is due: `moved` is what the connection has moved,
-    /// `held` what its exchanges have to send now, `rtt` its round trip now.
+    /// `held` what its exchanges have to send now, `backlog` what the peer has declared and not
+    /// yet delivered of the exchange's class and the less urgent ones.
     pub(crate) fn judge(
         &mut self,
         now: Instant,
         moved: Moved,
         held: u64,
-        rtt: Duration,
+        backlog: u64,
     ) -> Result<(), Refusal> {
         if now < self.next || matches!(self.phase, Phase::Idle) {
             return Ok(());
@@ -196,31 +249,23 @@ impl Carry {
                 Ok(())
             }
             Phase::Answering {
-                began,
-                total,
+                owed,
+                charged,
+                had,
                 remaining,
-                longest,
             } => {
-                *longest = (*longest).max(rtt);
                 let received = moved.received.saturating_sub(before.received);
-                let residency = residency(*total, *longest).max(self.period);
-                let spent = now.saturating_duration_since(*began) > residency;
-                if received < LEAST_PROGRESS.min(*remaining) || spent {
+                if *had || received < LEAST_PROGRESS.min(*remaining) {
                     return Err(Refusal::Stalled);
                 }
+                *charged = charged.saturating_add(moved.delivered.saturating_sub(before.delivered));
+                *owed = (*owed).max(backlog);
+                *had = *charged >= *owed;
                 Ok(())
             }
             Phase::Idle => Ok(()),
         }
     }
-}
-
-/// How long `bytes` may take to arrive over a path whose round trip is `rtt`, at the least a live
-/// sender delivers: two datagrams of the least size a round trip (focal `frame.rs` `residency`).
-pub(crate) fn residency(bytes: u64, rtt: Duration) -> Duration {
-    let per_round_trip = LEAST_PROGRESS.saturating_mul(MINIMUM_WINDOW_DATAGRAMS);
-    let round_trips = bytes.div_ceil(per_round_trip);
-    rtt.saturating_mul(u32::try_from(round_trips).unwrap_or(u32::MAX))
 }
 
 #[cfg(test)]
@@ -229,7 +274,11 @@ mod tests {
 
     const PERIOD: Duration = Duration::from_millis(100);
     fn moved(sent: u64, received: u64) -> Moved {
-        Moved { sent, received }
+        Moved {
+            sent,
+            received,
+            delivered: received,
+        }
     }
 
     /// focal's `carried`: a megabyte over a path that carries a megabit a second is given its eight
@@ -248,14 +297,14 @@ mod tests {
                     now,
                     moved(sent, period * 100),
                     1_000_000 - sent.min(1_000_000),
-                    PERIOD,
+                    0,
                 )
                 .unwrap();
         }
         // Everything was sent by the 80th period: the peer had the request and the 81st to answer.
         let now = start + PERIOD * 81;
         assert_eq!(
-            carry.judge(now, moved(1_000_000 + 1_200, 8_200), 0, PERIOD),
+            carry.judge(now, moved(1_000_000 + 1_200, 8_200), 0, 0),
             Err(Refusal::Stalled)
         );
     }
@@ -271,7 +320,7 @@ mod tests {
         let mut carry = Carry::idle(Progress::new(PERIOD).unwrap(), start, moved(0, 0));
         carry.asking(start, moved(0, 0), 1_000_000);
         assert_eq!(
-            carry.judge(start + PERIOD, moved(13_776, 0), 1_000_000, PERIOD),
+            carry.judge(start + PERIOD, moved(13_776, 0), 1_000_000, 0),
             Err(Refusal::Stalled)
         );
     }
@@ -283,43 +332,74 @@ mod tests {
         carry.asking(start, moved(500, 0), 10_000);
         // Not yet due: no judgement.
         carry
-            .judge(start + PERIOD / 2, moved(500, 0), 10_000, PERIOD)
+            .judge(start + PERIOD / 2, moved(500, 0), 10_000, 0)
             .unwrap();
         assert_eq!(
-            carry.judge(start + PERIOD, moved(500 + 1_199, 300), 10_000, PERIOD),
+            carry.judge(start + PERIOD, moved(500 + 1_199, 300), 10_000, 0),
             Err(Refusal::Stalled)
         );
     }
 
+    /// An answer is charged with what the connection delivered against what the peer owed: a
+    /// body that takes many periods while bytes keep arriving is never cut off, however short the
+    /// path's round trip; one that stops arriving ends at the period that brought less than a
+    /// datagram.
     #[test]
-    fn an_answer_is_given_its_residency_and_must_keep_arriving() {
+    fn an_answer_is_charged_with_what_arrives_and_must_keep_arriving() {
         let start = Instant::now();
-        let rtt = Duration::from_millis(40);
         let mut carry = Carry::idle(Progress::new(PERIOD).unwrap(), start, moved(0, 0));
-        carry.answering(start, moved(0, 0), 24_000, rtt);
-        // 24,000 bytes are ten round trips of two datagrams: 400 ms.
-        assert_eq!(residency(24_000, rtt), Duration::from_millis(400));
-        for period in 1..=4u32 {
+        // 1 MB at 12,000 bytes a period: 84 periods.
+        carry.answering(start, moved(0, 0), 1_000_000, 1_000_000);
+        for period in 1..=83u32 {
+            let arrived = 12_000 * u64::from(period);
             carry
                 .judge(
                     start + PERIOD * period,
-                    moved(0, 2_400 * u64::from(period)),
+                    moved(0, arrived),
                     0,
-                    rtt,
+                    1_000_000 - arrived,
                 )
                 .unwrap();
-            carry.arrived(2_400);
+            carry.arrived(12_000);
         }
-        // Past its residency.
-        assert_eq!(
-            carry.judge(start + PERIOD * 5, moved(0, 12_000), 0, rtt),
-            Err(Refusal::Stalled)
-        );
         // A body that stops arriving ends at the period that brought less than a datagram.
         let mut carry = Carry::idle(Progress::new(PERIOD).unwrap(), start, moved(0, 0));
-        carry.answering(start, moved(0, 0), 24_000, rtt);
+        carry.answering(start, moved(0, 0), 24_000, 24_000);
         assert_eq!(
-            carry.judge(start + PERIOD, moved(0, 100), 0, rtt),
+            carry.judge(start + PERIOD, moved(0, 100), 0, 24_000),
+            Err(Refusal::Stalled)
+        );
+    }
+
+    /// A body the peer withholds while it delivers others: once the connection has delivered
+    /// everything the peer owed, a period more, and the exchange ends. What a more urgent class
+    /// delivers is not charged (`delivered` does not count it).
+    #[test]
+    fn a_withheld_body_ends_a_period_after_everything_owed_was_delivered() {
+        let start = Instant::now();
+        let mut carry = Carry::idle(Progress::new(PERIOD).unwrap(), start, moved(0, 0));
+        // This body of 10,000 and another of 50,000 owed.
+        carry.answering(start, moved(0, 0), 10_000, 60_000);
+        let busy = |received: u64, delivered: u64| Moved {
+            sent: 0,
+            received,
+            delivered,
+        };
+        // A more urgent class delivers a megabyte: none of it charged.
+        carry
+            .judge(start + PERIOD, busy(1_000_000, 0), 0, 60_000)
+            .unwrap();
+        // The other body's 50,000 arrive, and 10,000 of a third declared meanwhile.
+        carry
+            .judge(start + PERIOD * 2, busy(1_050_000, 50_000), 0, 20_000)
+            .unwrap();
+        // The third's 10,000: everything owed delivered by this period's end.
+        carry
+            .judge(start + PERIOD * 3, busy(1_060_000, 60_000), 0, 10_000)
+            .unwrap();
+        // A period more, still busy, and still not this body.
+        assert_eq!(
+            carry.judge(start + PERIOD * 4, busy(2_000_000, 60_000), 0, 10_000),
             Err(Refusal::Stalled)
         );
     }

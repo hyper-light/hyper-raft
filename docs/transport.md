@@ -218,7 +218,12 @@ starts at RFC 9002's initial window plus the reserve and doubles when consumed w
 trips (Chromium's rule; a round trip under the 1 ms timer granularity counts as 1 ms), each growth
 reserved from the budget; the stream window is quinn's assembler limit made explicit (patch Q5).
 Exchanges are judged by progress-charged deadlines (T39); a period's sent bytes count only if the
-peer was heard in it, so probes sent to a dead peer do not keep its exchanges alive; and a period
+peer was heard in it, so probes sent to a dead peer do not keep its exchanges alive; an answer is
+charged with the stream bytes the connection delivered of its class and the less urgent ones,
+against what the peer declared of them, and ends a period after all of that arrived without it, so
+a body its owner writes slowly, or that waits behind the peer's other replies, is not refused while
+it moves (focal's residency, priced by the path's round trip, refused an 8 MiB reply at 5.5 MB read
+on a loaded runner; `src/progress.rs`); and a period
 that moved nothing through this side's own doing (an owner not reading a body, or bytes the peer's
 credit would take but this side has not sent) is no evidence against the peer and is not judged. Replication frames travel on lanes, unidirectional streams as wide as the core's
 window, always read; a frame its class or the budget cannot take is skipped and counted. Admission

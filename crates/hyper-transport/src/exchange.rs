@@ -16,6 +16,10 @@ use crate::frame::{BodySum, PREFIX_BYTES, Prefix, TRAILER_BYTES};
 use crate::progress::Carry;
 use crate::{PeerId, Reservation};
 
+fn length(bytes: usize) -> u64 {
+    u64::try_from(bytes).unwrap_or(u64::MAX)
+}
+
 /// How a read from a stream ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum End {
@@ -203,6 +207,24 @@ impl Incoming {
             sum: BodySum::default(),
             trailer: [0; TRAILER_BYTES],
             trailer_filled: 0,
+        }
+    }
+    /// What of the message is declared and has still to arrive: its head, body and trailer once
+    /// its prefix is in; nothing before.
+    pub(crate) fn owed(&self) -> u64 {
+        let trailer = |filled: usize| length(TRAILER_BYTES.saturating_sub(filled));
+        match self.state {
+            In::Prefix | In::Whole | In::Finished => 0,
+            In::Head => {
+                let head = self.head.as_ref().map_or(0, Reservation::room);
+                let body = self.decoded.and_then(|prefix| prefix.body);
+                body.map_or(head, |body| {
+                    head.saturating_add(body)
+                        .saturating_add(trailer(self.trailer_filled))
+                })
+            }
+            In::Body => self.left.saturating_add(trailer(self.trailer_filled)),
+            In::Trailer => trailer(self.trailer_filled),
         }
     }
     /// Whether the message, its body's checksum included, has been read and verified.

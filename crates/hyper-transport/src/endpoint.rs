@@ -24,7 +24,7 @@ use crate::credit::{MIN_DATAGRAM, Window, class_reserve, initial_window, stream_
 use crate::exchange::{End, Exchange, In, Incoming, Out, Outgoing, Pushed, abandon, pull, push};
 use crate::frame::{PREFIX_BYTES, Prefix};
 use crate::lane::{LaneIn, LaneOut, OPENER_BYTES, Reading, opened};
-use crate::progress::{Carry, Moved, Progress};
+use crate::progress::{Carry, Delivered, Moved, Progress};
 use crate::receive::Receive;
 use crate::timing::PeerTiming;
 use crate::tls::{self, Credentials};
@@ -186,6 +186,8 @@ struct Conn<R> {
     lanes_out: Vec<LaneOut>,
     lanes_in: Vec<LaneIn>,
     window: Window,
+    /// The stream bytes read on it, by class.
+    delivered: Delivered,
     /// The budget's grants for the receive window: the initial one and one per growth.
     grants: Vec<Reservation>,
     /// The connection was lost and its owner told.
@@ -237,11 +239,13 @@ struct Core<C: Classes, B, D> {
     stats: Stats,
 }
 
-fn moved(connection: &Connection) -> Moved {
-    let stats = connection.stats();
+/// What `conn` has moved, as the wait of an exchange of `rank` reads it.
+fn moved<R>(conn: &Conn<R>, rank: u8) -> Moved {
+    let stats = conn.quic.stats();
     Moved {
         sent: stats.udp_tx.bytes.saturating_sub(stats.path.lost_bytes),
         received: stats.udp_rx.bytes,
+        delivered: conn.delivered.from(rank),
     }
 }
 
@@ -707,6 +711,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
             lanes_out: Vec::new(),
             lanes_in: Vec::new(),
             window: Window::new(initial, limits.window_ceiling),
+            delivered: Delivered::new(C::RANKS),
             grants,
             lost: false,
         };
@@ -1086,13 +1091,9 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
         let Some((peer, _)) = conn.peer else {
             return;
         };
-        let mut carry = Carry::idle(self.serve, now, moved(&conn.quic));
-        carry.answering(
-            now,
-            moved(&conn.quic),
-            length(PREFIX_BYTES),
-            conn.quic.rtt(),
-        );
+        let mut carry = Carry::idle(self.serve, now, moved(conn, 0));
+        let backlog = self.backlog(conn, 0);
+        carry.answering(now, moved(conn, 0), length(PREFIX_BYTES), backlog);
         let exchange = Exchange {
             connection: key,
             peer,
@@ -1199,6 +1200,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
             incoming.filled = at.saturating_add(bytes.len());
         });
         conn.window.consumed(length(got));
+        conn.delivered.add(exchange.rank, length(got));
         ended(end, incoming.filled < PREFIX_BYTES)?;
         if incoming.filled < PREFIX_BYTES {
             return Ok(false);
@@ -1243,9 +1245,10 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
         exchange.incoming.decoded = Some(prefix);
         exchange.incoming.head = Some(head);
         exchange.incoming.state = In::Head;
-        exchange
-            .carry
-            .answering(now, moved(&conn.quic), prefix.length(), conn.quic.rtt());
+        let rank = exchange.rank;
+        let (at, backlog) = (moved(conn, rank), self.backlog(conn, rank));
+        let exchange = self.exchanges.get_mut(id).ok_or(Refusal::UnknownExchange)?;
+        exchange.carry.answering(now, at, prefix.length(), backlog);
         Ok(())
     }
 
@@ -1269,6 +1272,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
         let want = usize::try_from(head.room()).unwrap_or(usize::MAX);
         let (got, end) = pull(&mut conn.quic, stream, want, |bytes| head.fill(bytes));
         conn.window.consumed(length(got));
+        conn.delivered.add(exchange.rank, length(got));
         ended(end, head.room() > 0)?;
         if head.room() > 0 {
             return Ok(false);
@@ -1282,8 +1286,9 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
 
     /// The head arrived whole: the owner hears of the request or the reply.
     fn headed(&mut self, now: Instant, conn: &mut Conn<C::Role>, id: u64, prefix: Prefix) {
-        let rtt = conn.quic.rtt();
-        let at = moved(&conn.quic);
+        let rank = self.rank_of(id);
+        // Taken before the state moves on: the head is in, and its body and trailer still owed.
+        let (at, backlog) = (moved(conn, rank), self.backlog(conn, rank));
         let Some(exchange) = self.exchanges.get_mut(id) else {
             return;
         };
@@ -1295,7 +1300,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
         exchange.incoming.left = prefix.body.unwrap_or(0);
         exchange.ready_sent = true;
         match prefix.body {
-            Some(body) if body > 0 => exchange.carry.answering(now, at, body, rtt),
+            Some(body) if body > 0 => exchange.carry.answering(now, at, body, backlog),
             _ => exchange.carry.rest(),
         }
         let (opened, peer, class) = (exchange.opened, exchange.peer, exchange.class);
@@ -1336,6 +1341,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
             incoming.trailer_filled = at.saturating_add(bytes.len());
         });
         conn.window.consumed(length(got));
+        conn.delivered.add(exchange.rank, length(got));
         let short = incoming.trailer_filled < crate::frame::TRAILER_BYTES;
         ended(end, short)?;
         if short {
@@ -1406,6 +1412,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
         incoming.left = incoming.left.saturating_sub(taken);
         exchange.carry.arrived(taken);
         conn.window.consumed(taken);
+        conn.delivered.add(exchange.rank, taken);
         let failed = ended(end, incoming.left > 0).err();
         if let Some(failure) = failed {
             self.finish_exchange(conn, id, Some(failure));
@@ -1451,7 +1458,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
             rank: C::rank(class),
             out,
             incoming: Incoming::new(),
-            carry: Carry::idle(deadline, now, moved(&conn.quic)),
+            carry: Carry::idle(deadline, now, moved(conn, C::rank(class))),
             began: now,
             answered: false,
             ready_sent: false,
@@ -1464,8 +1471,9 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
         let id = self.exchanges.insert(exchange)?;
         conn.exchanges.push(id);
         let held = self.held(conn);
+        let at = moved(conn, C::rank(class));
         if let Some(exchange) = self.exchanges.get_mut(id) {
-            exchange.carry.asking(now, moved(&conn.quic), held);
+            exchange.carry.asking(now, at, held);
         }
         self.start(conn, id);
         self.mark_used(key, peer);
@@ -1508,6 +1516,18 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
             .filter_map(|id| self.exchanges.get(*id))
             .fold(0u64, |held, exchange| {
                 held.saturating_add(exchange.out.pending())
+            })
+    }
+
+    /// What the peer has declared on `conn` and not yet delivered, of the classes of `rank` and
+    /// the less urgent ones: what the answering wait of a class of `rank` may come after.
+    fn backlog(&self, conn: &Conn<C::Role>, rank: u8) -> u64 {
+        conn.exchanges
+            .iter()
+            .filter_map(|id| self.exchanges.get(*id))
+            .filter(|exchange| exchange.rank >= rank)
+            .fold(0u64, |owed, exchange| {
+                owed.saturating_add(exchange.incoming.owed())
             })
     }
 
@@ -1710,8 +1730,9 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
         exchange.out.left = body.unwrap_or(0);
         exchange.out.has_body = body.is_some();
         let held = self.held(conn);
+        let at = moved(conn, C::rank(class));
         if let Some(exchange) = self.exchanges.get_mut(id) {
-            exchange.carry.asking(now, moved(&conn.quic), held);
+            exchange.carry.asking(now, at, held);
         }
         if let Err(failure) = self.flush(conn, id) {
             self.finish_exchange(conn, id, Some(failure));
@@ -1836,18 +1857,19 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
         if !due {
             return;
         }
+        let rank = self.rank_of(id);
         let held = self.held(conn);
-        let at = moved(&conn.quic);
-        let rtt = conn.quic.rtt();
+        let backlog = self.backlog(conn, rank);
+        let at = moved(conn, rank);
         // What the peer's credit would take of this exchange's class now, before this side's own
         // classes are served: none means the peer is not taking what the exchange has to send.
-        let peer_takes = credit(&mut conn.quic, self.rank_of(id));
+        let peer_takes = credit(&mut conn.quic, rank);
         let judged = self.exchanges.get_mut(id).map_or(Ok(()), |exchange| {
             if Self::ours_to_move(exchange, peer_takes) {
-                exchange.carry.hold(now, at);
+                exchange.carry.hold(now, at, backlog);
                 return Ok(());
             }
-            exchange.carry.judge(now, at, held, rtt)
+            exchange.carry.judge(now, at, held, backlog)
         });
         if let Err(refusal) = judged {
             self.finish_exchange(conn, id, Some((refusal, false)));
@@ -2071,6 +2093,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
             lane.filled = from.saturating_add(bytes.len());
         });
         conn.window.consumed(length(got));
+        conn.delivered.add(0, length(got));
         lane_ended(end)?;
         if lane.filled < PREFIX_BYTES {
             return Ok(false);
@@ -2092,6 +2115,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
                 .ok()
         });
         let lane = conn.lanes_in.get_mut(at).ok_or(Refusal::Lanes)?;
+        lane.rank = fits.map_or(0, C::rank);
         lane.state = if frame.is_some() {
             Reading::Frame
         } else {
@@ -2107,6 +2131,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
         let want = usize::try_from(lane.left).unwrap_or(usize::MAX);
         let (got, end) = pull(&mut conn.quic, lane.stream, want, |bytes| frame.fill(bytes));
         conn.window.consumed(length(got));
+        conn.delivered.add(lane.rank, length(got));
         lane.left = lane.left.saturating_sub(length(got));
         lane_ended(end)?;
         if lane.left > 0 {
@@ -2142,6 +2167,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
         let want = usize::try_from(lane.left).unwrap_or(usize::MAX);
         let (got, end) = pull(&mut conn.quic, lane.stream, want, |_| {});
         conn.window.consumed(length(got));
+        conn.delivered.add(0, length(got));
         lane.left = lane.left.saturating_sub(length(got));
         lane_ended(end)?;
         if lane.left > 0 {
@@ -2164,6 +2190,7 @@ fn lane_opener<R>(conn: &mut Conn<R>, at: usize) -> Result<bool, Refusal> {
         lane.filled = from.saturating_add(bytes.len());
     });
     conn.window.consumed(length(got));
+    conn.delivered.add(0, length(got));
     lane_ended(end)?;
     if lane.filled < OPENER_BYTES {
         return Ok(false);

@@ -10,10 +10,19 @@
 //! keeps, against its disk as it is at each step: what a write holds is
 //! what the member held when it took the `Ready` (I7); a message waiting
 //! for a write leaves only once the disk holds the term, vote and entries
-//! it speaks for (I1, I2); a leader's own messages leave at once only while
-//! its term and vote are durable (I1); what is given to apply is committed
-//! and durable (I4). What a leader counts and commits is held to its
-//! voters' disks by the cluster (`Cluster::check_durable`, I3).
+//! it speaks for (I1, I2), and an answer's commit only once the disk states
+//! it (R-6); a leader's own messages leave at once only while its term and
+//! vote are durable (I1); what is given to apply is committed and durable,
+//! or a leader's own and committed where it applies before its write is
+//! durable (I4). What a leader counts and commits is held to its voters'
+//! disks by the cluster (`Cluster::check_durable`, I3).
+//!
+//! Its owner keeps the commit fence as a shell does (`docs/durable.md` §4.1,
+//! I5): it states a commit on its disk only as the core's `Ready`s give one,
+//! never the commit a notice moved, so a member's commit runs ahead of its
+//! disk's as a lazy shell's does; a change of configuration applies only
+//! once the disk states a commit covering it, held until then with every
+//! entry after it while the core is asked for no more (R-6's apply pause).
 use std::collections::VecDeque;
 
 use hyper_raft::proto::{Entry, HardState, Message, MessageType, Snapshot};
@@ -42,6 +51,14 @@ pub struct Coverage {
     pub held_back: u64,
     /// Writes out when their member stopped: lost.
     pub lost: u64,
+    /// Answers whose commit was held to the disk's.
+    pub answers: u64,
+    /// Entries a leader applied before its own write of them was durable.
+    pub unpersisted: u64,
+    /// Changes of configuration held behind the commit fence.
+    pub fenced: u64,
+    /// Writes of the hard state alone that the fence asked for.
+    pub stated: u64,
 }
 impl Coverage {
     pub fn add(&mut self, other: Self) {
@@ -53,6 +70,10 @@ impl Coverage {
         self.several += other.several;
         self.held_back += other.held_back;
         self.lost += other.lost;
+        self.answers += other.answers;
+        self.unpersisted += other.unpersisted;
+        self.fenced += other.fenced;
+        self.stated += other.stated;
     }
 }
 
@@ -82,17 +103,44 @@ pub struct Lagged {
     durable: VecDeque<Write>,
     output: Output,
     coverage: Coverage,
+    /// Committed entries given to apply and held behind the commit fence: a
+    /// change of configuration the disk's commit does not cover, and every
+    /// entry after it.
+    held: Vec<Entry>,
+    apply_unpersisted: bool,
 }
 
-/// A message is held to what the disk holds when it may leave (I1, I2).
-fn check_message(disk: &Disk, message: &Message, member: u64) {
+/// R-6: an answer says of its commit only what the disk states, so a
+/// leader that counts it counts what the member reopens with. True when the
+/// message is such an answer.
+fn check_commit(disk: &Disk, message: &Message, member: u64) -> bool {
+    let kind = message.msg_type;
+    if !matches!(
+        kind,
+        MessageType::MsgAppendResponse | MessageType::MsgHeartbeatResponse
+    ) {
+        return false;
+    }
+    assert!(
+        message.commit <= disk.hard_state.commit,
+        "member {member}: {kind:?} said commit {} with {} durable",
+        message.commit,
+        disk.hard_state.commit
+    );
+    true
+}
+
+/// A message is held to what the disk holds when it may leave (I1, I2,
+/// and R-6's commit).
+fn check_message(disk: &Disk, message: &Message, member: u64) -> bool {
+    let answer = check_commit(disk, message, member);
     let kind = message.msg_type;
     // A pre-vote is asked for a term the member does not take.
     if matches!(
         kind,
         MessageType::MsgRequestPreVote | MessageType::MsgRequestPreVoteResponse
     ) {
-        return;
+        return answer;
     }
     let hard = disk.hard_state;
     assert!(
@@ -137,6 +185,7 @@ fn check_message(disk: &Disk, message: &Message, member: u64) {
         }
         _ => {}
     }
+    answer
 }
 
 impl Lagged {
@@ -181,6 +230,7 @@ impl Lagged {
                 "member {id}: {:?} sent at once before its term was durable",
                 message.msg_type
             );
+            self.coverage.answers += u64::from(check_commit(disk, message, id));
         }
         for message in ready.messages().iter().chain(ready.persisted_messages()) {
             assert_eq!(
@@ -228,33 +278,87 @@ impl Lagged {
         true
     }
 
-    /// I4: what is given to apply is committed, and durable here. I5 is the
-    /// shell's (`docs/durable.md` §4.1, the commit fence): a change of
-    /// configuration is applied only on a commit its disk records, or a
-    /// member that stops reopens under the configuration before it. The
-    /// shell is not built yet, so its rule is kept here at its strictest, as
-    /// the synchronous members' harness keeps it: the disk records the
-    /// commit through what is applied before it is applied.
+    /// I4: what is given to apply is committed, and durable here, but for a
+    /// leader's own entries where it applies before its write is durable
+    /// (`Config::apply_unpersisted`, `docs/durable.md` §4.2), which a majority
+    /// holds durably (`Cluster::check_durable`). Then the commit fence
+    /// ([`Lagged::release`]).
     fn apply(&mut self, committed: Vec<Entry>) {
-        let raw = &mut self.node.raw;
+        let raw = &self.node.raw;
+        let raft = &raw.raft;
+        let leads = raft.state() == hyper_raft::StateRole::Leader;
         for entry in &committed {
+            let durable = holds(&raw.store().0, entry);
             assert!(
-                entry.index <= raw.raft.log().committed() && holds(&raw.store().0, entry),
+                entry.index <= raft.log().committed()
+                    && (durable || (self.apply_unpersisted && leads && entry.term == raft.term())),
                 "member {}: {} given to apply before it was committed and durable",
-                raw.raft.id(),
+                raft.id(),
                 entry.index
             );
+            self.coverage.unpersisted += u64::from(!durable);
         }
-        if let Some(last) = committed.last() {
-            let disk = &mut raw.store_mut().0;
-            disk.hard_state.commit = disk.hard_state.commit.max(last.index);
+        self.held.extend(committed);
+        self.release();
+    }
+
+    /// I5, the commit fence (`docs/durable.md` §4.1) as a shell keeps it: an
+    /// ordinary entry applies on the core's commit; a change of
+    /// configuration only once the disk states a commit covering it, or a
+    /// member that stops reopens under the configuration before it. Until
+    /// then the change and every entry after it are held, and the core is
+    /// asked for no more (R-6's apply pause); a write of the hard state
+    /// alone states the commit as soon as one can ([`Lagged::state_commit`]).
+    fn release(&mut self) {
+        let mut through = 0;
+        while let Some(entry) = self.held.get(through) {
+            let index = entry.index;
+            if super::change_of(entry).is_some()
+                && index > self.node.raw.durable_commit()
+                && !self.state_commit(index)
+            {
+                break;
+            }
+            through += 1;
         }
+        let ready: Vec<Entry> = self.held.drain(..through).collect();
         apply_to(
             &mut self.node.raw,
             &mut self.node.app,
-            committed,
+            ready,
             &mut self.output,
         );
+        let raw = &mut self.node.raw;
+        if self.held.is_empty() {
+            raw.resume_apply();
+        } else if !raw.apply_paused() {
+            raw.pause_apply();
+            self.coverage.fenced += 1;
+        }
+    }
+
+    /// A write of the hard state alone, durable at once, stating the core's
+    /// commit as far as the disk holds the core's log: true when it covers
+    /// `index`. Only with no write out: a write out may still replace on the
+    /// disk an entry the log holds again (etcd's ABA), and a write stated
+    /// behind it would be durable after it. The core is told the commit it
+    /// states.
+    fn state_commit(&mut self, index: u64) -> bool {
+        if !self.out.is_empty() {
+            return false;
+        }
+        let raw = &mut self.node.raw;
+        let log = raw.raft.log();
+        let disk = &raw.store().0;
+        let commit = log.committed().min(disk.last_index());
+        if commit < index || disk.term(commit) != log.term(commit).ok() {
+            return false;
+        }
+        let disk = &mut raw.store_mut().0;
+        disk.hard_state.commit = disk.hard_state.commit.max(commit);
+        raw.commit_durable(commit).expect("a commit the log holds");
+        self.coverage.stated += 1;
+        true
     }
 
     fn make_durable(&mut self) -> bool {
@@ -303,7 +407,7 @@ impl Lagged {
             }
         }
         for message in &write.messages {
-            check_message(disk, message, id);
+            self.coverage.answers += u64::from(check_message(disk, message, id));
         }
         self.durable.push_back(write);
         self.coverage.durable += 1;
@@ -323,6 +427,11 @@ impl Lagged {
                 let metadata = snapshot.metadata.clone().unwrap_or_default();
                 self.output.snapshots.push((metadata.index, metadata.term));
                 self.node.app = App::decode(&snapshot.data);
+                // The snapshot replaces what the fence held: every entry
+                // it held is at or below the snapshot, which states it
+                // (seed 730 of the narrow setting applied a held change
+                // over the snapshot after it).
+                self.held.retain(|entry| entry.index > metadata.index);
             }
         }
         let raw = &mut self.node.raw;
@@ -354,6 +463,7 @@ impl Lagged {
         }
         for message in &messages {
             if leads {
+                self.coverage.answers += u64::from(check_commit(&raw.store().0, message, id));
                 // A pre-vote's answer names the term asked about, which no
                 // member takes by it.
                 assert!(
@@ -366,7 +476,7 @@ impl Lagged {
                     raw.raft.term()
                 );
             } else {
-                check_message(&raw.store().0, message, id);
+                self.coverage.answers += u64::from(check_message(&raw.store().0, message, id));
             }
         }
         self.output.messages.extend(messages);
@@ -396,6 +506,8 @@ impl Replica for Lagged {
             durable: VecDeque::new(),
             output: Output::default(),
             coverage: Coverage::default(),
+            held: Vec::new(),
+            apply_unpersisted: settings.apply_unpersisted,
         }
     }
     fn id(&self) -> u64 {
@@ -482,7 +594,10 @@ impl Replica for Lagged {
         }
     }
     fn busy(&self) -> bool {
-        self.node.raw.has_ready() || !self.out.is_empty() || !self.durable.is_empty()
+        self.node.raw.has_ready()
+            || !self.out.is_empty()
+            || !self.durable.is_empty()
+            || !self.held.is_empty()
     }
     fn coverage(&self) -> Coverage {
         Coverage {
@@ -513,6 +628,24 @@ impl Replica for Lagged {
                 .get(raft.id())
                 .and_then(|own| entry_at(own.matched)),
         })
+    }
+    /// Everything applied becomes the snapshot, once the disk states a
+    /// commit covering it: what a restart replays is what was committed
+    /// durably, and the log's start never passes it (I8). A leader that
+    /// applied its own entries before they were durable here compacts none
+    /// of them (`docs/durable.md` §4.2).
+    fn compact(&mut self) -> bool {
+        let index = self.node.app().index;
+        let disk = &self.node.store().0;
+        if index <= disk.snapshot_index() {
+            return false;
+        }
+        if index > disk.hard_state.commit && !self.state_commit(index) {
+            return false;
+        }
+        let data = self.node.app().encode();
+        self.node.store_mut().0.compact(index, data);
+        true
     }
     fn view(&self) -> View {
         self.node.view()

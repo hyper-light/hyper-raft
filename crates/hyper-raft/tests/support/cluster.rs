@@ -81,6 +81,12 @@ pub struct Mix {
     /// Of a hundred steps, how many are a member's persistence steps
     /// ([`Step`]); none where every member persists what it takes at once.
     pub lag: u64,
+    /// Of a hundred persistence steps that would make a leader's write
+    /// durable, how many do: the rest are drawn again, so a leader's disk
+    /// is the slowest of its group and its followers commit its entries
+    /// before it holds them (`docs/durable.md` §4.2, §14.2). A hundred for a
+    /// leader whose disk is like the others'.
+    pub leader_durable: u64,
 }
 impl Mix {
     pub fn everything() -> Self {
@@ -97,6 +103,7 @@ impl Mix {
             lose: 8,
             repeat: 5,
             lag: 0,
+            leader_durable: 100,
         }
     }
 }
@@ -590,6 +597,15 @@ impl<R: Replica> Cluster<R> {
                     .filter(|id| self.peek(*id).is_some_and(Replica::busy))
                     .collect();
                 let member = rng.pick(&busy).unwrap_or_else(|| any(rng));
+                // Drawn only where a leader's disk is slow: every other
+                // schedule draws as it did.
+                if mix.leader_durable < 100
+                    && step == Step::Durable
+                    && leaders.contains(&member)
+                    && !rng.chance(mix.leader_durable)
+                {
+                    continue;
+                }
                 return Op::Persist(member, step);
             }
             let drawn = rng.below(100);

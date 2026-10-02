@@ -1,6 +1,7 @@
 # hyper-durable: the durable shell around the Raft core
 
-> Status (2026-10-02): design; of the core steps it needs, R-4 is built (§2.1), the shell is not.
+> Status (2026-10-02): design; of the core steps it needs, R-4 (§2.1) and R-6 (§4.4) are built,
+> the shell is not.
 > Sources and what each establishes are in
 > `docs/research/durable.md` ("research §n"). This replaces `docs/raft.md` §4's plan to extract
 > mantle's replica: the shell is designed from all three projects' shells and the literature, then
@@ -125,7 +126,8 @@ something into a replica or when a write completion woke it. Each call does, in 
 
 1. **Take completions.** The log's answers for this group, in submission order. For each durable
    write: release its persisted messages; tell the core `on_persist(number)`; record the commit the
-   write stated (§4). A failed write fences the replica (§2.4). Completions are taken only here, and
+   write stated (§4), which the core reads from the `Ready`'s hard state itself, and is told with
+   `commit_durable` for a write the shell made beyond it (§4.4). A failed write fences the replica (§2.4). Completions are taken only here, and
    a write submitted in this call is never polled in it: whether a flush happened to finish
    microseconds after submission must not decide what a call gives out (mantle's determinism
    finding, replica.md §5).
@@ -196,8 +198,10 @@ Where each is kept, as of R-4:
 | I1 | `RawNode::ready_given` (a leader's messages leave at once only with its term and vote durable; every other member's wait for the write); `RawNode::releases_now` for what a notice makes | `tests/support/lagged.rs`, `check_message` and `Lagged::take`, at every write's durability and every release; `a_leader_sends_nothing_at_once_before_its_term_is_durable` |
 | I2 | the same, and the write that takes a message holds everything the member held when it was made | `check_message` (acknowledgements, the fast track's word); `a_followers_answer_waits_for_the_write_that_holds_what_it_says` |
 | I3 | `Raft::on_persist_entries` moves a leader's own progress, reached only from a notice; `Raft::reset` starts it at what is durable | `Cluster::check_durable` (its own entry on its disk; each commit held durably by a majority of each half of its configuration); `readies_are_taken_while_writes_are_out` |
-| I4 | `Log::next_entries_since` and `next_range_since` give only what is committed and durable here | `Lagged::apply`, every entry given to apply |
-| I5, I6, I8 | the shell's (§4; D-1). The schedules' harness keeps I5 at its strictest, recording the commit before it applies, as the synchronous harness always did: without it a 4,000-step schedule (seed 19, `random_interleavings_keep_every_invariant` at three writes out) reproduced §4.1's hole, a sole voter that restarted without its commit reverting to the configuration before changes it had applied, electing itself by it, and leaving a group that cannot elect | — |
+| I4 | `Log::next_entries_since` and `next_range_since` give only what is committed and durable here, or a leader's own committed entries where it applies before its write is durable (`Log::unpersisted_after`, §4.4) | `Lagged::apply`, every entry given to apply; `a_leader_applies_its_own_committed_entries_before_its_write_is_durable` |
+| I5 | the shell's commit fence (§4.1), with the core's apply pause (`RawNode::pause_apply`) and durable commit (`RawNode::durable_commit`, `commit_durable`), R-6 | `Lagged::release`: the schedules' harness keeps the fence as a shell does, stating a commit only as `Ready`s give one, holding a change and every entry after it until its disk states a commit covering it, and paused meanwhile. Before R-6 it recorded the commit before every apply; without that, a 4,000-step schedule (seed 19, `random_interleavings_keep_every_invariant` at three writes out) reproduced §4.1's hole, a sole voter that restarted without its commit reverting to the configuration before changes it had applied, electing itself by it, and leaving a group that cannot elect. `an_owner_that_pauses_apply_is_given_nothing_more` |
+| Answers (R-6) | `node::state_durable_commit`: an answer to an append or a heartbeat states no commit beyond what is durable when it leaves | `check_commit` at every release; `an_answer_a_notice_releases_states_the_durable_commit` (fails on R-4); `an_answer_states_no_commit_that_no_durable_write_stated` (mantle's case) |
+| I6, I8 | the shell's (§4; D-1) | — |
 | I7 | `RawNode::on_persist` takes notices in issue order; a `Ready` gives only what no earlier one gave | `Lagged::make_durable`: once a write is durable the disk holds the term, vote and log the member held when it took the `Ready` |
 
 
@@ -220,9 +224,10 @@ and the index the state machine reports durable (`StateMachine::durable`). Then:
 - A change of configuration, and an entry the state machine marks as acted on at start
   (`StateMachine::acts_at_start`; a whole group says so for every entry, as focal's control groups
   do), is applied only once `C_d` covers it. Until then the shell holds that `Ready`'s committed
-  page and asks the core for no more (core step R-6, an apply pause like etcd's
-  `applyingEntsPaused`), and makes sure a write states the commit: the next `Ready`'s write carries
-  it, or, when none is due, a write of the hard state alone. Configuration changes are rare: the
+  page and asks the core for no more (core step R-6, `RawNode::pause_apply`, an apply pause like
+  etcd's `applyingEntsPaused`), and makes sure a write states the commit: the next `Ready`'s write
+  carries it, or, when none is due, a write of the hard state alone, which the shell then tells the
+  core (`RawNode::commit_durable`). Configuration changes are rare: the
   cost is one flush each (focal 27 §9).
 - A member campaigns only once it has applied every change it has committed (the core's rule), so a
   member holding a committed change behind the fence does not campaign by the configuration before
@@ -274,6 +279,74 @@ At open, from the log's view and the state machine's durable point `(index, term
    member where it could not (`ReplicaError::Damaged`), and `StateMachine::durable` returning the
    term removes that case.
 4. The core is opened at the state machine's applied index and configuration.
+
+### 4.4 As built (core step R-6)
+
+In `crates/hyper-raft` (`src/node.rs`, `src/raft.rs`, `src/log.rs`):
+
+- **The durable commit.** `RawNode::durable_commit` is the logged part of `C_d` as the core knows
+  it: the commit storage stated when the member opened; then, at each notice, the commit each
+  durable `Ready`'s hard state stated (the issue mark keeps it; it is durable whatever the term the
+  notice is heard in, for it names only entries that write or an earlier one holds and a committed
+  entry is never replaced, so etcd's term guard does not apply to it); and any commit the shell
+  made durable by a write of its own, which it says with `RawNode::commit_durable(commit)`: the
+  commit a `LightReady` gave (raft-rs's owners write it with the next record, mantle's never), the
+  fence's write of the hard state alone, `commit = last` in the write of a member that alone
+  decides, or the state machine's durable index folded in. It never goes back, and a commit beyond
+  the log is refused, fatally. The core rests on one rule of the shell's, which was already the
+  contract: a `Ready`'s hard state is written as given, its commit with it.
+- **Answers carry it.** `MsgAppendResponse` and `MsgHeartbeatResponse` are made with the commit
+  the member knows, as raft-rs's are, and held to the durable commit when they may leave: a
+  `Ready`'s persisted messages at that `Ready`, to `C_d` or the commit its own hard state states,
+  whichever is greater, for they leave once that write is durable; what a notice releases from a
+  member that does not lead, to `C_d` then. A leader's messages are not walked: an answer that
+  states a commit is made only by a member that follows, a member leads only in a later term, and
+  it sends at once only once the write of that term is durable, which took every answer it made
+  before. An answer states the lesser of the commit it was made with and the commit durable when
+  it leaves, never a commit no durable write stated. Where the durable commit covers the member's
+  commit nothing is walked at all, which is every `Ready` of an owner that writes every commit it
+  is given. Where the rule it
+  replaces said one:
+  - a heartbeat moves a follower's commit while its write is out, and that write's notice
+    releases the answer at once, nothing being left to write; no `Ready` states that commit, for
+    the notice reports it as `LightReady::commit_index` and folds it into the hard state the next
+    `Ready` is compared against. `an_answer_a_notice_releases_states_the_durable_commit` fails on
+    R-4 (it says 3 with 2 durable), and the schedules' oracle fails at once with the old rule in
+    ("member 1: MsgAppendResponse said commit 1 with 0 durable");
+  - a shell's own answers, such as mantle's lost-entries report, state `C_d` likewise.
+  mantle's case (`1c179e8`): a member commits as leader at a notice its owner never writes, and
+  steps down in the same term by check-quorum. It answers nothing in that term, no other member
+  leading it; its next answer is to a later term, and leaves with that term's write, whose hard
+  state names the commit. So the answer states the commit only as that write makes it durable,
+  and the core does not take the volatile commit for durable meanwhile
+  (`an_answer_states_no_commit_that_no_durable_write_stated`). A leader's own
+  `Progress::committed_index` stays its commit, as raft-rs's; its durable one is
+  `RawNode::durable_commit`.
+
+  **Against raft-rs.** raft-rs states the commit it knows. The two say the same wherever the owner
+  writes every commit it is given, as the differential's owners do (each `Ready`'s hard state and
+  each `LightReady` commit, told with `commit_durable`), so the differential compares unchanged at
+  every setting and `tests/support/convert.rs` translates nothing. They differ only where an owner
+  leaves a `LightReady` commit unwritten or hears notices behind its writes (depth above one),
+  which the differential never runs; `tests/pipeline.rs` holds this core there.
+- **The apply pause.** `RawNode::pause_apply`, `resume_apply` and `apply_paused`. While paused, no
+  `Ready` or notice gives committed entries (nor a range), `has_ready` does not count them, and
+  everything else goes on; `advance_apply_to` reports what the shell applied of the page it holds,
+  and a snapshot given meanwhile replaces that page. etcd pauses by the bytes given and not yet
+  acknowledged (`maxApplyingEntsSize`, research §3); here the shell pauses, since only it knows
+  its fence holds a page. With it the fence holds at most one `Ready`'s committed page (§6).
+- **Apply before local durability (§4.2).** `Config::apply_unpersisted`, off by default as
+  raft-rs's `max_apply_unpersisted_log_limit` is zero. A leader that has it notes the last index
+  before its term's entries (`Log::unpersisted_after`); once everything through it is durable here
+  the apply bound is the commit, not the lesser of the commit and what is durable. It is cleared at
+  every change of role (raft-rs PR #561). Given in place, a range's tail past storage is read where
+  the log holds it (`Log::next_range_since` over `Log::any_entry`). The shell's part: a
+  restart-acted entry still waits for `C_d`, which cannot cover an entry not durable here (I7); and
+  no compaction passes what the disk states committed (the schedules' harness compacts only what
+  its disk's commit covers, stating it first).
+
+**The gate as run** is `docs/raft.md` §3's R-6 row; counts in `crates/hyper-raft/ORIGIN.md` and
+`docs/benchmarks.md`, "The durable commit and the apply pause (R-6)".
 
 ## 5. Repair
 
@@ -449,8 +522,9 @@ slates measured a delta format not worth a second recovery path).
   `apply_entry`; `durable` returns the engine's durable index with its term, which the engine now
   keeps beside the index; `acts_at_start` is false for its layers. The replica's `Held`, `Rounds`,
   `Staged`, `commit_applied`, `complete_install` and repair move into the shell or go.
-  `configuration_known` counts each voter's durable commit, which the core's answers carry once the
-  shell tells it `C_d` (R-6). First test: kill a member inside the window between a replacement's
+  `configuration_known` counts each voter's durable commit, which the core's answers carry since R-6
+  (§4.4); mantle's replica is to tell the core the commits it writes beyond its `Ready`s' hard
+  states with `commit_durable`. First test: kill a member inside the window between a replacement's
   commit and its logged commit, in the range simulation and on real processes; it fails today if
   the hole of §1 is real.
 - **focal (D-2).** `DurableNode` becomes a `Replica` over hyper-log after F-1's WAL conversion; its
@@ -463,8 +537,8 @@ slates measured a delta format not worth a second recovery path).
   Its groups are re-founded (owner's decision 9).
 - **The core.** R-4 (readies ahead of persistence; built, §2.1), R-5 (a lost-entries refusal
   regresses a member's progress), R-6 (an apply pause; a leader's own-term entries given to apply
-  before its write is durable; the durable commit carried in answers, `docs/raft.md` §3), R-7
-  (CTRL's leader-side recovery).
+  before its write is durable; the durable commit carried in answers; built, §4.4), R-7 (CTRL's
+  leader-side recovery).
 - **hyper-log.** `GROUP_SUBMISSIONS` from `PIPELINE_FRAMES`; health per group; a damaged frame
   reported as marks through its range for the groups it touched.
 

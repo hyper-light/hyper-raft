@@ -195,6 +195,18 @@ pub struct Config {
     pub fast: bool,
     /// A commit alone is not sent; it goes with the next message.
     pub skip_bcast_commit: bool,
+    /// A leader is given the entries of its own term to apply once they
+    /// are committed, whether or not its own write of them is durable yet
+    /// (core step R-6, `docs/durable.md` §4.2): a committed entry is durable
+    /// on a quorum, and waiting for this member's copy adds nothing to its
+    /// durability (TiKV RFC 0112; raft-rs's `max_apply_unpersisted_log_limit`,
+    /// PR #537, enabled on a leader only, PR #561). Entries of earlier terms
+    /// wait for their durability here, since a write still out may replace
+    /// them (the ABA case of `docs/durable.md` §2.1). The entries it covers
+    /// are the leader's unstable entries, bounded by
+    /// [`Limits::unstable_entries`]. Off, as raft-rs's default (a limit of
+    /// zero), so the two cores compare under one setting.
+    pub apply_unpersisted: bool,
     /// What the election timeouts are drawn from.
     pub seed: u64,
     /// The bounds of what grows.
@@ -223,6 +235,7 @@ impl Config {
             heartbeat_answers: HeartbeatAnswers::Position,
             fast: false,
             skip_bcast_commit: false,
+            apply_unpersisted: false,
             seed: id,
             limits: Limits::default(),
         }
@@ -380,6 +393,11 @@ pub struct Raft<S> {
     /// has a term.
     priority_in_force: i64,
     pub(crate) promotable: bool,
+    /// The commit this member's storage states durably, as its owner said
+    /// (`docs/durable.md` §4.1's `C_d`): what a member that restarts reopens
+    /// with. Its answers state no more when they leave
+    /// (`RawNode::durable_commit`).
+    pub(crate) durable_commit: u64,
     /// The leader told this member to campaign, and it could not yet: a
     /// change it has committed is not applied. It campaigns once it is,
     /// unless it has heard of a leader or a term since.
@@ -782,6 +800,7 @@ impl<S: Storage> Raft<S> {
             priority: config.priority,
             priority_in_force: 0,
             promotable: false,
+            durable_commit: 0,
             told_to_campaign: false,
             log,
             tracker,
@@ -797,6 +816,9 @@ impl<S: Storage> Raft<S> {
         if initial.hard_state != HardState::default() {
             raft.load_state(&initial.hard_state)?;
         }
+        // What storage states is durable: the commit of its hard state, or
+        // the snapshot it begins after.
+        raft.durable_commit = raft.log.committed();
         if config.applied > 0 {
             // What was applied may be ahead of the commit that was durable.
             raft.log.applied_to_unchecked(config.applied);
@@ -899,6 +921,17 @@ impl<S: Storage> Raft<S> {
     /// drawn from `[election_tick, 2 election_tick)` by [`Config::seed`].
     pub fn randomized_election_timeout(&self) -> usize {
         self.randomized_election_timeout
+    }
+    /// The commit this member's storage states durably, as its owner said:
+    /// the commit of the last durable write's hard state, or a later one
+    /// the owner made durable ([`crate::RawNode::commit_durable`]).
+    pub fn durable_commit(&self) -> u64 {
+        self.durable_commit
+    }
+    /// A write stating `commit` is durable. The durable commit never goes
+    /// back.
+    pub(crate) fn commit_durable(&mut self, commit: u64) {
+        self.durable_commit = self.durable_commit.max(commit);
     }
     pub(crate) fn committed_bytes_per_ready(&self) -> u64 {
         self.config.max_committed_size_per_ready
@@ -1247,6 +1280,8 @@ impl<S: Storage> Raft<S> {
         self.pending_conf_index = 0;
         self.read_only.clear();
         self.pending_request_snapshot = 0;
+        // Only a leader applies before its own write is durable.
+        self.log.unpersisted_after = None;
         let next = self.log.last_index()?.saturating_add(1);
         let (committed, persisted, id) = (self.log.committed(), self.log.persisted(), self.id);
         for (member, progress) in self.tracker.iter_mut() {
@@ -1492,6 +1527,10 @@ impl<S: Storage> Raft<S> {
         let last = self.log.last_index()?;
         self.uncommitted_bytes = 0;
         self.leader_tail = last;
+        if self.config.apply_unpersisted {
+            // Every entry after `last` is of this term (`append_entries`).
+            self.log.unpersisted_after = Some(last);
+        }
         if let Some(progress) = self.tracker.get_mut(self.id) {
             progress.become_replicate();
         }

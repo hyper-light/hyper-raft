@@ -26,14 +26,21 @@
 //! - **I3, self-count.** A leader counts itself toward a commit only as its
 //!   own writes are durable (`Raft::on_persist_entries`; thesis §10.2.1).
 //! - **I4, apply.** Entries are given to apply only once committed and
-//!   durable here (`Log::next_entries_since`).
+//!   durable here (`Log::next_entries_since`), but for a leader's own, which
+//!   it may apply once committed (`Config::apply_unpersisted`,
+//!   `docs/durable.md` §4.2).
 //! - **I7, order.** Writes are durable in the order they were issued: a
 //!   notice for one is a notice for every one before it, and the owner
 //!   releases each write's messages after every earlier write's.
 //!
 //! The others (I5, a fenced apply; I6, answers; I8, a start the state
 //! machine holds) are the durable shell's, hyper-durable's (`docs/durable.md`
-//! §4).
+//! §4). The core gives it what the fence needs (core step R-6): the durable
+//! commit, `C_d`, which a durable `Ready`'s hard state states and the owner
+//! states for every other write ([`RawNode::commit_durable`]), and which a
+//! member's answers carry in place of its commit; and an apply pause
+//! ([`RawNode::pause_apply`]), so that a shell holds at most one page of
+//! committed entries behind the fence.
 use std::collections::VecDeque;
 
 use crate::wire::Record;
@@ -72,6 +79,47 @@ pub fn is_local(kind: MessageType) -> bool {
             | MessageType::MsgCheckQuorum
     )
 }
+/// What an answer says of its commit is held to what is durable when it
+/// leaves (core step R-6, `docs/durable.md` §4.1): `MsgAppendResponse` and
+/// `MsgHeartbeatResponse` state the commit the member knew when it made them
+/// only as far as `durable`, the commit its storage states once they may
+/// leave. A leader reads it as what the member reopens with
+/// (`Progress::committed_index`), so a commit the member holds only in
+/// memory is never said: one a leader made at a notice that its owner never
+/// wrote (`LightReady::commit_index`; mantle `1c179e8`), or one a follower's
+/// heartbeat moved while a write was out, whose answer a notice releases.
+/// raft-rs states the commit it knows; the two say the same wherever the
+/// owner writes every commit it is given. An answer was made with a commit
+/// no greater than `committed`, the member's now, so where that is durable
+/// there is nothing to hold and the messages are not walked.
+///
+/// What a leader sends at once or with a notice is not walked either: an
+/// answer that states a commit is made only by a member that follows
+/// (`Raft::handle_append_entries`, `handle_heartbeat`; a leader's answer to
+/// an older term states none), and a member leads only in a later term than
+/// it followed in. A leader sends at once only once its term and vote are
+/// durable (I1), so the write that stated them was taken after every answer
+/// it made as a follower, and took them all: none is left for it to send.
+#[inline]
+fn state_durable_commit(messages: &mut [Message], durable: u64, committed: u64) {
+    if durable < committed {
+        hold_answers(messages, durable);
+    }
+}
+/// Holds every answer among `messages` to `durable`: the walk an owner that
+/// writes every commit it is given never takes, kept off its path.
+#[cold]
+#[inline(never)]
+fn hold_answers(messages: &mut [Message], durable: u64) {
+    for message in messages {
+        if matches!(
+            message.msg_type,
+            MessageType::MsgAppendResponse | MessageType::MsgHeartbeatResponse
+        ) {
+            message.commit = message.commit.min(durable);
+        }
+    }
+}
 fn is_answer(kind: MessageType) -> bool {
     matches!(
         kind,
@@ -93,11 +141,15 @@ pub struct LightReady {
     messages: Vec<Message>,
 }
 impl LightReady {
-    /// The commit, when it moved. It need not be durable to be acted on.
+    /// The commit, when it moved. It need not be durable to be acted on, and
+    /// no `Ready`'s hard state states it: an owner that writes it says so
+    /// once the write is durable ([`RawNode::commit_durable`]); until a write
+    /// states it, the member's answers do not.
     pub fn commit_index(&self) -> Option<u64> {
         self.commit_index
     }
-    /// Committed and durable here: to apply.
+    /// Committed and durable here (or a leader's own, committed:
+    /// `Config::apply_unpersisted`): to apply.
     pub fn committed_entries(&self) -> &[Entry] {
         &self.committed_entries
     }
@@ -108,7 +160,10 @@ impl LightReady {
     /// Committed and durable here, to apply where storage holds them: the
     /// first and last index, for a `Ready` given in place
     /// ([`RawNode::ready_in_place`]), whose
-    /// [`LightReady::committed_entries`] are none.
+    /// [`LightReady::committed_entries`] are none. A leader's own entries
+    /// given before they are durable here (`Config::apply_unpersisted`) are
+    /// past what storage holds, and read where the log holds them
+    /// (`Log::next_range_since`).
     pub fn committed_range(&self) -> Option<(u64, u64)> {
         self.committed_range
     }
@@ -150,7 +205,9 @@ impl Ready {
     pub fn soft_state(&self) -> Option<&SoftState> {
         self.soft_state.as_ref()
     }
-    /// To persist, when it changed.
+    /// To persist, when it changed. Once this write is durable, the commit
+    /// it states is the member's durable commit
+    /// ([`RawNode::durable_commit`]), which its answers carry.
     pub fn hard_state(&self) -> Option<&HardState> {
         self.hard_state.as_ref()
     }
@@ -195,7 +252,8 @@ impl Ready {
     pub fn snapshot(&self) -> Option<&Snapshot> {
         self.snapshot.as_ref()
     }
-    /// Committed and durable here: to apply.
+    /// Committed and durable here (or a leader's own, committed:
+    /// `Config::apply_unpersisted`): to apply.
     pub fn committed_entries(&self) -> &[Entry] {
         self.light.committed_entries()
     }
@@ -305,6 +363,11 @@ struct Mark {
     snapshot: Option<u64>,
     /// The term and vote its hard state stated, when it changed them.
     vote: Option<(u64, u64)>,
+    /// The commit its hard state stated, when it gave one: durable with it,
+    /// whatever the term the notice is heard in, for it names only entries
+    /// this write or an earlier one holds, and a committed entry is never
+    /// replaced.
+    commit: Option<u64>,
     in_place: bool,
 }
 
@@ -348,6 +411,9 @@ pub struct RawNode<S> {
     durable_vote: (u64, u64),
     /// What was given to apply reaches this index.
     commit_since: u64,
+    /// The owner holds what it was given to apply and is given no more
+    /// ([`RawNode::pause_apply`]).
+    apply_paused: bool,
 }
 
 impl<S: Storage> RawNode<S> {
@@ -368,6 +434,7 @@ impl<S: Storage> RawNode<S> {
             taken: None,
             issued,
             commit_since: config.applied,
+            apply_paused: false,
         })
     }
     /// The storage the member reads.
@@ -387,9 +454,59 @@ impl<S: Storage> RawNode<S> {
     pub fn in_flight(&self) -> usize {
         self.issued.len()
     }
+    /// The commit this member's storage states durably (`C_d`,
+    /// `docs/durable.md` §4.1): the commit the hard state of the last durable
+    /// `Ready` stated, or a later one its owner made durable
+    /// ([`RawNode::commit_durable`]). A member's `MsgAppendResponse` and
+    /// `MsgHeartbeatResponse` state no commit beyond what is durable when
+    /// they leave: those a `Ready`'s write holds, beyond its own hard
+    /// state's; those sent at once or with a notice, beyond this. That
+    /// rests on the owner's part of the contract: it writes a `Ready`'s hard
+    /// state as given, its commit with it.
+    pub fn durable_commit(&self) -> u64 {
+        self.raft.durable_commit()
+    }
+    /// A write the owner made outside a `Ready`'s hard state is durable and
+    /// states `commit` (core step R-6): the commit a [`LightReady`] gave,
+    /// written with the next record or alone; a write of the hard state
+    /// alone that the commit fence asked for; the commit a write stated
+    /// ahead of its `Ready`'s (`commit = last` where the member alone
+    /// decides); or, folded in, the index the state machine holds durably.
+    /// A durable `Ready`'s own hard state needs no word: its notice says it.
+    /// The durable commit never goes back; a commit beyond the log is
+    /// refused, fatally, for no write can state it.
+    pub fn commit_durable(&mut self, commit: u64) -> Result<()> {
+        if commit > self.raft.log().last_index()? {
+            return Err(Error::Invariant("a durable commit beyond the log"));
+        }
+        self.raft.commit_durable(commit);
+        Ok(())
+    }
+    /// The owner holds what it was given to apply and takes no more until
+    /// [`RawNode::resume_apply`] (core step R-6, an apply pause as etcd's
+    /// `applyingEntsPaused`): `Ready`s and notices give nothing to apply
+    /// meanwhile, and everything else as before. A shell whose commit fence
+    /// holds a change of configuration behind the durable commit
+    /// (`docs/durable.md` §4.1) holds that `Ready`'s committed page and no
+    /// more. It applies what it holds as [`RawNode::advance_apply_to`] says,
+    /// and a snapshot given meanwhile replaces it.
+    pub fn pause_apply(&mut self) {
+        self.apply_paused = true;
+    }
+    /// The owner takes what is committed again ([`RawNode::pause_apply`]).
+    pub fn resume_apply(&mut self) {
+        self.apply_paused = false;
+    }
+    /// Whether the owner holds what it was given to apply and takes no more.
+    pub fn apply_paused(&self) -> bool {
+        self.apply_paused
+    }
     /// An operation on the member. The priority in force is settled before
     /// it and after, never within. While a `Ready` is taken and not yet
     /// issued the member does not change.
+    // Inlined into each operation, as it was before R-6 grew the member:
+    //  found it out of line on the proposal path.
+    #[inline]
     fn operate<T>(&mut self, operation: impl FnOnce(&mut Raft<S>) -> Result<T>) -> Result<T> {
         if self.taken.is_some() {
             return Err(Error::Invariant(
@@ -559,6 +676,9 @@ impl<S: Storage> RawNode<S> {
     /// those of a `Ready`, or those a notice may send at once
     /// ([`RawNode::releases_now`]).
     fn light(&mut self, in_place: bool, release: bool) -> Result<LightReady> {
+        if self.apply_paused {
+            return Ok(self.light_paused(release));
+        }
         if in_place {
             return self.light_in_place(release);
         }
@@ -576,6 +696,16 @@ impl<S: Storage> RawNode<S> {
             committed_range: None,
             messages: self.messages(release),
         })
+    }
+    /// As [`RawNode::light`] while the owner holds what it was given to
+    /// apply: the messages alone ([`RawNode::pause_apply`]).
+    #[cold]
+    #[inline(never)]
+    fn light_paused(&mut self, release: bool) -> LightReady {
+        LightReady {
+            messages: self.messages(release),
+            ..LightReady::default()
+        }
     }
     /// As [`RawNode::light`], giving what to apply as the range storage
     /// holds it, copied nowhere.
@@ -661,10 +791,11 @@ impl<S: Storage> RawNode<S> {
             || unstable
                 .unissued_snapshot()
                 .is_some_and(|snapshot| !proto::snapshot_is_empty(snapshot))
-            || raft
-                .log()
-                .has_next_entries_since(self.commit_since)
-                .unwrap_or(false)
+            || (!self.apply_paused
+                && raft
+                    .log()
+                    .has_next_entries_since(self.commit_since)
+                    .unwrap_or(false))
     }
     /// What there is to do. Nothing else is asked of the member until it is
     /// issued ([`RawNode::advance_issued`]); it may be taken while earlier
@@ -780,6 +911,19 @@ impl<S: Storage> RawNode<S> {
         // vote it leads in are durable, which no write out or this one
         // changes.
         ready.after_persisting = self.raft.state() != StateRole::Leader || !self.vote_durable();
+        // What leaves with this write is sent once it is durable, when the
+        // commit its hard state states is. What leaves at once is a leader's,
+        // and holds no answer that states a commit (`state_durable_commit`).
+        if ready.after_persisting {
+            let durable = ready.hard_state.map_or(self.raft.durable_commit(), |hard| {
+                hard.commit.max(self.raft.durable_commit())
+            });
+            state_durable_commit(
+                &mut ready.light.messages,
+                durable,
+                self.raft.log().committed(),
+            );
+        }
         self.taken = Some(Taken { number, in_place });
         Ok(ready)
     }
@@ -817,6 +961,7 @@ impl<S: Storage> RawNode<S> {
             }
             self.previous_hard = hard;
         }
+        let commit = ready.hard_state.map(|hard| hard.commit);
         let unstable = &mut self.raft.log.unstable;
         let mark = Mark {
             number: taken.number,
@@ -824,6 +969,7 @@ impl<S: Storage> RawNode<S> {
             last_entry: unstable.entries.last().map(|last| (last.index, last.term)),
             snapshot: unstable.snapshot.as_ref().map(proto::snapshot_index),
             vote,
+            commit,
             in_place: taken.in_place,
         };
         unstable.issue();
@@ -876,6 +1022,9 @@ impl<S: Storage> RawNode<S> {
             .take_while(|given| given.mark.number <= number)
         {
             given.stable = stabilize(&mut raft.log, term, durable_vote, &given.mark, &mut kept)?;
+            if let Some(commit) = given.mark.commit {
+                raft.commit_durable(commit);
+            }
             in_place = given.mark.in_place;
         }
         if kept.snapshot.is_some() || !kept.entries.is_empty() {
@@ -904,6 +1053,18 @@ impl<S: Storage> RawNode<S> {
         }
         self.raft.on_persist_proposals(proposals)
     }
+    /// What a notice releases leaves now: a member that does not lead
+    /// states no commit beyond what is durable (`state_durable_commit`).
+    #[inline]
+    fn hold_released(&self, light: &mut LightReady) {
+        if self.raft.state() != StateRole::Leader {
+            state_durable_commit(
+                &mut light.messages,
+                self.raft.durable_commit(),
+                self.raft.log().committed(),
+            );
+        }
+    }
     /// What follows writes made durable: what there is to apply, and what
     /// may be sent now.
     #[inline]
@@ -913,6 +1074,7 @@ impl<S: Storage> RawNode<S> {
         // follower has its last messages here.
         let release = self.releases_now();
         let mut light = self.light(in_place, release)?;
+        self.hold_released(&mut light);
         let hard = self.raft.hard_state();
         if hard.commit > self.previous_hard.commit {
             light.commit_index = Some(hard.commit);
@@ -951,6 +1113,7 @@ impl<S: Storage> RawNode<S> {
         if let Some(hard) = ready.hard_state {
             self.previous_hard = hard;
             self.durable_vote = (hard.term, hard.vote);
+            self.raft.commit_durable(hard.commit);
         }
         let mut kept = Kept::default();
         let log = &mut self.raft.log;
@@ -983,6 +1146,7 @@ impl<S: Storage> RawNode<S> {
         // Nothing is out and nothing is left to write: what follows leaves
         // now (`RawNode::releases_now`).
         let mut light = self.light(taken.in_place, true)?;
+        self.hold_released(&mut light);
         let hard = self.raft.hard_state();
         if hard.commit > self.previous_hard.commit {
             light.commit_index = Some(hard.commit);

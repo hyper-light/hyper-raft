@@ -95,6 +95,16 @@ Database Systems", SIGMOD 1984.**
   entry, then the member cannot be removed any more since the cluster cannot make progress." This
   is the same liveness hole focal's F17 met (§4).
 
+**etcd-io/raft, `log.go`, the apply pause (main, fetched 2026-10-02).** `raftLog` keeps
+`maxApplyingEntsSize` ("limits the outstanding byte size of the messages returned from calls to
+nextCommittedEnts that have not been acknowledged by a call to appliedTo"), `applyingEntsSize` and
+`applyingEntsPaused` ("true when entry application has been paused until enough progress is
+acknowledged"). While paused, `nextCommittedEnts` returns nothing and `hasNextCommittedEnts`
+false; `acceptApplying` pauses once `applyingEntsSize >= maxApplyingEntsSize`, and `appliedTo`
+lifts it once the application acknowledges enough. etcd pauses by bytes outstanding, on its own;
+hyper-raft's shell pauses where its commit fence holds a page (`docs/durable.md` §4.4), which only
+the shell can know.
+
 **etcd-io/raft PR #8, "raft: support asynchronous storage writes" (Nathan VanBenschoten; first
 etcd-io/etcd#14627).**
 - Design: storage work as messages; the unstable log "should remain true to its name. It should

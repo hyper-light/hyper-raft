@@ -486,6 +486,10 @@ pub struct Settings {
     /// `Ready`s a member driven ahead of its persistence ([`Lagged`]) has
     /// out at once (`Limits::readies_in_flight`); the others have one.
     pub depth: usize,
+    /// Whether a leader applies its own entries before its write of them
+    /// is durable (`Config::apply_unpersisted`); `raft-rs`'s default does
+    /// not.
+    pub apply_unpersisted: bool,
 }
 impl Settings {
     /// As focal's shell sets a group.
@@ -506,6 +510,7 @@ impl Settings {
             fast: false,
             in_place: false,
             depth: 1,
+            apply_unpersisted: false,
         }
     }
     /// As focal runs this core.
@@ -1001,8 +1006,22 @@ fn committed_of(
     );
     assert!(in_place, "a range given to apply by a ready that copies");
     let disk = &raw.store().0;
+    let log = raw.raft.log();
     (first..=last)
-        .map(|index| disk.entries[(index - disk.first_index()) as usize].clone())
+        .map(|index| {
+            // A leader's own entries given to apply before they are durable here
+            // (`Config::apply_unpersisted`) are read where the log holds them.
+            if index
+                >= log
+                    .unstable()
+                    .entries()
+                    .first()
+                    .map_or(u64::MAX, |e| e.index)
+            {
+                return log.slice(index, index + 1, u64::MAX).unwrap().remove(0);
+            }
+            disk.entries[(index - disk.first_index()) as usize].clone()
+        })
         .collect()
 }
 fn heard<T>(outcome: hyper_raft::Result<T>) -> Option<T> {
@@ -1068,6 +1087,7 @@ impl Replica for New {
                 hyper_raft::HeartbeatAnswers::Position
             },
             fast: settings.fast,
+            apply_unpersisted: settings.apply_unpersisted,
             seed,
             limits: hyper_raft::Limits {
                 readies_in_flight: settings.depth,
@@ -1223,6 +1243,10 @@ impl Replica for New {
                 output
                     .hard_states
                     .push((disk.hard_state.term, disk.hard_state.vote, commit));
+                // Written, and durable at once: the member's answers state it from here on.
+                self.raw
+                    .commit_durable(commit)
+                    .expect("a commit the log holds");
             }
             messages.extend(light.take_messages());
             let committed = self.committed(light.take_committed_entries(), light.committed_range());

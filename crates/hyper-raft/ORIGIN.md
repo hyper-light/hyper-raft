@@ -390,3 +390,50 @@ Not a port: this repository's change, the first of the core steps the durable sh
   raft-rs draws its election timeouts from the thread.
 - **Measured**: allocations identical on every workload, time within the noise
   (`docs/benchmarks.md`, "Readies in flight").
+
+## R-6: the durable commit, the apply pause, applying before durability
+
+Not a port: this repository's change (`docs/durable.md` §4.4, which states the design as built;
+`docs/raft.md` §3).
+
+- **The durable commit** (`src/node.rs`, `src/raft.rs`): `RawNode::durable_commit` and
+  `commit_durable`; the issue mark keeps the commit each `Ready`'s hard state states, and its notice
+  makes it durable; `Raft::durable_commit` opens at what storage states.
+- **Answers** (`src/node.rs`, `state_durable_commit`): `MsgAppendResponse` and
+  `MsgHeartbeatResponse` are made as before and held, where they leave, to the durable commit: at
+  the `Ready` that takes them, with its own hard state's commit; at a notice, for a member that does
+  not lead. Nothing is walked where the durable commit covers the commit, nor for a leader.
+- **The apply pause**: `RawNode::pause_apply`, `resume_apply`, `apply_paused`.
+- **Applying before durability**: `Config::apply_unpersisted` (off by default), `Log::unpersisted_after`,
+  the apply bound and `Log::next_range_since` reading a range's tail where the log holds it.
+- `RawNode::operate` is `#[inline]`: `sample` found it out of line on the proposal path once the
+  member grew.
+- **Tests**: four directed unit tests (`an_answer_states_no_commit_that_no_durable_write_stated`,
+  mantle's case; `an_answer_a_notice_releases_states_the_durable_commit`, which fails on R-4;
+  `an_owner_that_pauses_apply_is_given_nothing_more`, with a snapshot given while paused;
+  `a_leader_applies_its_own_committed_entries_before_its_write_is_durable`). In `tests/support/lagged.rs`
+  the oracle holds every answer's commit to the disk's when it leaves (`check_commit`), and the
+  owner keeps the commit fence as a shell does: it states a commit only as `Ready`s give one, holds a
+  change and every entry after it behind the fence with the core paused, writes the hard state
+  alone to state the commit once no write is out, drops what it holds when a snapshot replaces it,
+  and compacts only what its disk states committed. With the old answer rule in, the oracle fails
+  at once ("member 1: MsgAppendResponse said commit 1 with 0 durable"). `tests/pipeline.rs` gains a
+  fourth setting, a leader applying before its write in place with its disk the slowest
+  (`Mix::leader_durable`), and the crash enumeration runs with and without it. A schedule draws
+  exactly as before wherever a leader's disk is not slow.
+- **Recorded on 2026-10-02** (`HYPER_RAFT_SEEDS=1000 HYPER_RAFT_STEPS=4000 HYPER_RAFT_CRASH_SEEDS=40`):
+  1,000 schedules of 4,000 steps at each of four settings, 73,634, 72,589, 60,657 and 62,565 entries
+  committed; answers held to the disk 308,533, 237,150, 293,537 and 222,532; changes held behind the
+  fence 1,813, 905, 1,003 and 1,471; commits stated by a write of the hard state alone 7,781, 7,126,
+  2,604 and 4,598; entries a leader applied before its write was durable 303 in the fourth. Twice
+  1,000 fast-track schedules, 21,352 entries committed each. The crash at every persistence step of
+  40 schedules: 1,689 crashes (1,656 writes lost) and, with a leader applying before its write,
+  1,642 (2,030 lost, 58 entries applied ahead). Seed 730 of the narrow setting found the harness
+  applying a held change over the snapshot that replaced it; the owner now drops it.
+- **Equivalence of the synchronous path**: `HYPER_RAFT_SEEDS=300 HYPER_RAFT_SEED=1000` over the
+  differential, group and fast suites prints what `main` prints but for the one line that differs
+  between two runs of `main` itself. The differential needs no translation: where the owner writes
+  every commit it is given, answers state what raft-rs's do.
+- **Measured**: allocations identical on every workload; time in `docs/benchmarks.md`, "The durable
+  commit and the apply pause (R-6)".
+

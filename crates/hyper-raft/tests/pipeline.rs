@@ -17,9 +17,16 @@
 //! - I3: a leader counts itself for no entry its disk does not hold, and
 //!   commits nothing a majority of each half of its configuration does not
 //!   hold durably;
-//! - I4: nothing is given to apply that is not committed and durable here;
+//! - I4: nothing is given to apply that is not committed and durable here,
+//!   but a leader's own entries where it applies before its write is durable
+//!   (core step R-6, `docs/durable.md` §4.2);
+//! - I5: a change of configuration applies only once the disk states a
+//!   commit covering it, the member holding it and asked for nothing more
+//!   to apply meanwhile (R-6's apply pause, §4.1);
 //! - I7: once a write is durable the disk holds what the member held when
 //!   it took the `Ready`;
+//! - R-6: an answer to an append or a heartbeat states no commit its disk
+//!   does not state when it leaves;
 //!
 //! and to what every schedule is held to (`Cluster::report`): no two members
 //! commit different entries at one index, no term has two leaders, every
@@ -55,6 +62,14 @@ fn count(name: &str, default: u64) -> u64 {
 /// group still elects and commits between them.
 const LAG: u64 = 35;
 
+/// Of a hundred chances to make a leader's write durable, how many are
+/// taken where its disk is the slowest of its group. Measured: at a hundred
+/// (a disk like the others') 24 schedules of the setting that applies before
+/// durability never once committed a leader's entry by its followers before
+/// its own write (no entry applied ahead); at a quarter they do at the
+/// default size (10 entries) and at 1,000 schedules (303).
+const SLOW_LEADER: u64 = 25;
+
 fn mix(fast: u64) -> Mix {
     Mix {
         leader_leaves: true,
@@ -63,6 +78,19 @@ fn mix(fast: u64) -> Mix {
         fast,
         lag: LAG,
         ..Mix::everything()
+    }
+}
+
+/// The schedules of `settings`: where a leader applies before its own write
+/// is durable, its disk is the slowest of its group.
+fn mix_for(settings: &Settings, fast: u64) -> Mix {
+    Mix {
+        leader_durable: if settings.apply_unpersisted {
+            SLOW_LEADER
+        } else {
+            100
+        },
+        ..mix(fast)
     }
 }
 
@@ -113,7 +141,14 @@ fn schedules(name: &str, settings: Settings, voters: &[u64], fast: u64) -> (Cove
     let mut coverage = Coverage::default();
     let mut committed = 0;
     for seed in first..first + seeds {
-        let (group, _) = schedule(settings, voters, seed, steps, &mix(fast), None);
+        let (group, _) = schedule(
+            settings,
+            voters,
+            seed,
+            steps,
+            &mix_for(&settings, fast),
+            None,
+        );
         coverage.add(group.coverage());
         committed += group.chosen.len();
     }
@@ -132,6 +167,15 @@ fn schedules(name: &str, settings: Settings, voters: &[u64], fast: u64) -> (Cove
         "{name}: {coverage:?}"
     );
     assert!(coverage.held_back > 0, "{name}: {coverage:?}");
+    // R-6 reached: answers held to the disk's commit, changes held behind
+    // the fence, and the commit stated for them.
+    assert!(
+        coverage.answers > seeds && coverage.fenced > 0 && coverage.stated > 0,
+        "{name}: {coverage:?}"
+    );
+    if settings.apply_unpersisted {
+        assert!(coverage.unpersisted > 0, "{name}: {coverage:?}");
+    }
     (coverage, committed)
 }
 
@@ -160,6 +204,15 @@ fn random_interleavings_keep_every_invariant() {
                 max_inflight_msgs: 2,
                 max_size_per_msg: 1,
                 max_committed_size_per_ready: 64,
+                ..Settings::focal()
+            },
+        ),
+        (
+            "focal, three writes out, in place, a leader applying before its write",
+            Settings {
+                depth: 3,
+                in_place: true,
+                apply_unpersisted: true,
                 ..Settings::focal()
             },
         ),
@@ -196,23 +249,35 @@ fn the_fast_track_with_readies_persisted_at_random_lags_is_safe_and_settles() {
 fn a_crash_at_every_persistence_step_loses_nothing_durable() {
     let seeds = count("HYPER_RAFT_CRASH_SEEDS", 3);
     let steps = count("HYPER_RAFT_CRASH_STEPS", 400);
-    let settings = Settings {
-        depth: 3,
-        ..Settings::focal()
-    };
-    let mix = mix(0);
-    let mut crashes = 0u64;
-    let mut lost = 0u64;
-    for seed in 0..seeds {
-        let (_, events) = schedule(settings, &[1, 2, 3], seed, steps, &mix, None);
-        for at in 0..events {
-            let (group, _) = schedule(settings, &[1, 2, 3], seed, steps, &mix, Some(at));
-            crashes += 1;
-            lost += group.coverage().lost;
+    // The second has a leader apply its own entries before its write of them
+    // is durable: a crash between the two (`docs/durable.md` §12).
+    for apply_unpersisted in [false, true] {
+        let settings = Settings {
+            depth: 3,
+            apply_unpersisted,
+            ..Settings::focal()
+        };
+        let mix = mix_for(&settings, 0);
+        let mut crashes = 0u64;
+        let mut lost = 0u64;
+        let mut reached = Coverage::default();
+        for seed in 0..seeds {
+            let (_, events) = schedule(settings, &[1, 2, 3], seed, steps, &mix, None);
+            for at in 0..events {
+                let (group, _) = schedule(settings, &[1, 2, 3], seed, steps, &mix, Some(at));
+                crashes += 1;
+                let coverage = group.coverage();
+                lost += coverage.lost;
+                reached.add(coverage);
+            }
         }
+        println!(
+            "applying before durable {apply_unpersisted}: {crashes} crashes, one at each persistence step, lost {lost} writes out; {reached:?}"
+        );
+        assert!(crashes > seeds * 20 && lost > 0, "{crashes} {lost}");
+        assert!(reached.answers > 0 && reached.fenced > 0, "{reached:?}");
+        assert!(!apply_unpersisted || reached.unpersisted > 0, "{reached:?}");
     }
-    println!("{crashes} crashes, one at each persistence step, lost {lost} writes out");
-    assert!(crashes > seeds * 20 && lost > 0, "{crashes} {lost}");
 }
 
 /// A notice of a write heard after a crash is never given: the member opens

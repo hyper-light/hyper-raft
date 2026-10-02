@@ -40,6 +40,14 @@ takes operations again, and the store's answers come back in order (`RawNode::on
 A message that waits for a write is a `Ready`'s persisted message, and the owner sends it once that
 write and every earlier one are durable.
 
+A member's answers to appends and heartbeats state no commit beyond what its storage states when
+they leave (`RawNode::durable_commit`; `docs/durable.md` §4.4). The member reads that from each
+durable `Ready`'s hard state, which the owner writes as given; a commit the owner writes otherwise
+(the one a `LightReady` gives, a write of the hard state alone) it states with
+`RawNode::commit_durable`. An owner whose commit fence holds a committed page asks for no more with
+`RawNode::pause_apply` until `resume_apply`, and `Config::apply_unpersisted` gives a leader its own
+term's committed entries before its own write of them is durable.
+
 ## Rules
 
 - Nothing unwinds. `Error` says whether an operation was refused and changed nothing,

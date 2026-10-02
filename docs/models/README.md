@@ -56,6 +56,16 @@ What the model leaves out, and why it is sound to:
   to I3 and I7). So a run of the core with writes out maps to a run of the model in which each
   member's step happens when the write that carries it is durable, and a crash that loses the writes
   out is the model's crash. No action changes; the pending write is not a state of the model.
+- **The durable commit, the apply pause and applying before durability** (core step R-6,
+  `docs/durable.md` §4.4). An answer's commit is what a leader learns of a member's commit; no
+  action of the model reads it, nor any decision of the core, so holding it to the durable commit
+  changes no run. The apply pause only defers applying, and a member campaigns only once every
+  change it committed is applied (`Raft::hup`), as before; `ConfigurationOf(s)` is the
+  configuration of what `s` committed and applied, and a deferred apply is a later step of the
+  model. A leader that applies its own committed entries before its write is durable applies
+  what a quorum holds durably, which `ClassicCommit` and `FastCommit` already require; the model has no
+  state machine but the configuration, and a change waits for the durable commit (I5), which
+  cannot cover an entry not durable at the member (I7). No action changes.
 - **Pre-vote, check-quorum, priority and leader transfer** only refuse or bring forward a
   campaign, which the model may take at any time. **Learners** do not vote and are not counted.
   **ReadIndex** commits nothing. **A snapshot** stands for a committed prefix of a log.

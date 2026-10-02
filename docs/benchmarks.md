@@ -455,6 +455,59 @@ time the better of three, at load 7.3–8.4 (01:19 PDT):
 - The core's CPU per committed entry, with the harness, is the same at every depth: 1,190 to
   2,110 ns, unordered by depth.
 
+## The durable commit and the apply pause (R-6)
+
+Core step R-6 (`docs/durable.md` §4.4). Measured on 2026-10-02, 01:59–02:26 PDT, on the machine
+above, against `main` at `b73e18b` built the same way; another session's work held the load at 21
+to 27 for most of it, and each figure says its load.
+
+**Allocations did not move.** `hyper-raft-compare one <core> <workload> 3|5 ... 1000 count`, `main`
+and R-6, every workload (steady at batch 1 with 64 B and 4 KiB, steady at batch 64, transfer,
+failover, catch-up, snapshot, fast), in place and copying, three and five voters: allocations,
+reallocations, bytes asked for, peak and the whole loop's totals identical in all 32 cells, before
+and after the last change. Minor faults are single digits a run, either way by cell; no major fault.
+
+**`benches/pipeline.rs`**: every simulated figure identical at every cell (p50, p99, entries a
+second, flushes an entry, both devices, depths one to three); the CPU an entry is noisy at load 24 and
+not ordered by tree.
+
+**Time per op.** What R-6 adds on the synchronous path is a few loads and branches a `Ready`: the
+pause's check in `has_ready` and `light`, the durable commit compared with the commit (the walk that
+holds answers runs only where the durable commit is behind it, never for a leader, and out of line),
+the `max` at a notice, the apply bound's match. Two instruments:
+
+- The one-voter loop R-4 timed (a proposal, `ready_in_place`, `advance_append_keeping`), built with
+  LTO against each tree, the best of five passes of 400,000 proposals, 12 interleaved runs at load
+  23–25: `main` median 112.6 ns, minimum 109.5; R-6 114.1 and 109.3; R-6 with only its new fields
+  111.1 and 105.5. At 4 KiB, six runs at load 25–27: minimum 181.5 against 189.2.
+- The comparison, `main` and R-6 interleaved in fresh processes, the order alternated, minimum, lower
+  quartile and median, ratio R-6 to `main`, at load 21–24 (02:25 PDT):
+
+  | Workload | Core | runs | min | q1 | median |
+  |---|---|---|---|---|---|
+  | steady batch 1, 64 B | in place | 30 | 1.00 | 1.03 | 1.02 |
+  | | copying | 30 | 1.08 | 1.04 | 1.05 |
+  | steady batch 1, 4 KiB | in place | 30 | 1.01 | 1.00 | 0.98 |
+  | | copying | 30 | 1.01 | 1.03 | 1.04 |
+  | transfer | in place | 30 | 1.02 | 1.03 | 1.05 |
+  | | copying | 30 | 1.02 | 1.01 | 1.03 |
+  | steady batch 64, 64 B | in place | 10 | 1.01 | 1.01 | 0.97 |
+  | catch-up | in place | 10 | 0.99 | 1.02 | 1.02 |
+  | snapshot | in place | 10 | 0.94 | 1.02 | 1.08 |
+  | fast | in place | 10 | 1.05 | 1.02 | 1.01 |
+  | failover | in place | 10 | 1.03 | 1.02 | 1.02 |
+
+  `main` against itself the same way, at load 2 (02:01 PDT): 1.00 to 1.02 on the steady cells and
+  fast. At load 2–3, an earlier build of R-6 (the walk guarded, not yet out of line) ranged 0.98 to
+  1.03 with every median inside `main`'s range.
+
+So: no core function grew in `sample`'s profile of the steady 4 KiB cell (`ready_given` 82 samples
+against 90, `light` 63 against 52, `slice_page` 89 against 57, of four seconds each), the harness's
+own unchanged functions moved more than that (`flush` 156 against 189, `quiet` 113 against 151), and
+`RawNode::operate` had fallen out of line on the proposal path, which `#[inline]` restored. Under the
+load of these runs R-6's medians lean 1–3 % above `main`'s on the comparison and within 1 % on the
+core alone; the noise band measured at load 2 is 2 %.
+
 ## Where hyper-raft does not win, and why
 
 hyper-raft in place allocates less than every other core in every row. It is faster than raft-rs
@@ -646,6 +699,11 @@ HYPER_RAFT_SEEDS=1000 HYPER_RAFT_SEED=1000 cargo test -p hyper-raft --release --
 # Readies in flight (R-4): the schedules, the crash at every persistence step, and the bench.
 HYPER_RAFT_SEEDS=1000 HYPER_RAFT_STEPS=4000 HYPER_RAFT_CRASH_SEEDS=40 cargo test -p hyper-raft --release --test pipeline -- --nocapture
 cargo bench -p hyper-raft --bench pipeline
+
+# The durable commit and the apply pause (R-6): the same schedules, crash enumeration and bench,
+# and the comparison's counts and times against main built the same way.
+HYPER_RAFT_SEEDS=1000 HYPER_RAFT_STEPS=4000 HYPER_RAFT_CRASH_SEEDS=40 cargo test -p hyper-raft --release --test pipeline -- --nocapture
+$B one hyper steady 3 1 64 20000 1000 count
 
 # The end-to-end scenarios, and every gate.
 cargo test -p hyper-raft-e2e --test cluster

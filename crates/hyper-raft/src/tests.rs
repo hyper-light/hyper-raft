@@ -1089,6 +1089,219 @@ fn a_leader_sends_nothing_at_once_before_its_term_is_durable() {
     assert_eq!(sent(ready.messages(), 2), vec![3]);
 }
 
+/// The answers to `leader`'s heartbeats among `messages`.
+fn beat_answers(messages: &[Message]) -> Vec<u64> {
+    messages
+        .iter()
+        .filter(|message| message.msg_type == MessageType::MsgHeartbeatResponse)
+        .map(|message| message.commit)
+        .collect()
+}
+/// A heartbeat of `term` from `from`, telling member 1 of `commit`.
+fn beat_from(from: u64, term: u64, commit: u64) -> Message {
+    let mut beat = answer(MessageType::MsgHeartbeat, from, 1, term);
+    beat.commit = commit;
+    beat
+}
+
+/// R-6, mantle's case (`1c179e8`): a member commits as leader in
+/// `advance_append`, at the notice that its own write is durable, and its
+/// owner writes no record of that commit (`LightReady::commit_index` is
+/// volatile). It steps down in the same term by check-quorum. The core does
+/// not take that commit for durable, and an answer states it only once a
+/// write states it: here the write that carries the answer, whose hard
+/// state names the next term, states it with it.
+#[test]
+fn an_answer_states_no_commit_that_no_durable_write_stated() {
+    let mut node = leader_with(with_depth(1, 2));
+    node.propose(vec![], b"x".to_vec()).unwrap();
+    let mut ready = node.ready().unwrap();
+    assert_eq!(held(ready.entries()), vec![(2, 1)]);
+    let written = ready.entries().to_vec();
+    ready.take_messages();
+    node.advance_issued(ready).unwrap();
+    // Member 2 holds both entries; the leader's write of the second is out.
+    let mut acked = answer(MessageType::MsgAppendResponse, 2, 1, 1);
+    acked.index = 2;
+    node.step(acked).unwrap();
+    assert_eq!(node.raft.log().committed(), 1);
+    let mut ready = node.ready().unwrap();
+    // The commit of 1 rides this write.
+    assert_eq!(ready.hard_state().map(|hard| hard.commit), Some(1));
+    ready.take_messages();
+    node.store_mut().append(&written);
+    node.store_mut().hard_state.commit = 1;
+    let light = node.advance_append(ready).unwrap();
+    // Its own write durable, it commits 2 in `advance_append`: no write
+    // states it, and the owner writes none.
+    assert_eq!(light.commit_index(), Some(2));
+    assert_eq!(node.raft.log().committed(), 2);
+    assert_eq!(node.durable_commit(), 1);
+    // No quorum heard for two checks: it steps down, in the same term.
+    for _ in 0..40 {
+        if node.raft.state() != StateRole::Leader {
+            break;
+        }
+        node.tick().unwrap();
+    }
+    assert_eq!(node.raft.state(), StateRole::Follower);
+    assert_eq!(node.raft.term(), 1);
+    drain(&mut node);
+    assert_eq!(node.durable_commit(), 1);
+    assert_eq!(node.store().hard_state.commit, 1);
+    // Member 3 leads term 2 and beats with the commit of 2. The answer
+    // leaves with the write of the new term, which states 2.
+    node.step(beat_from(3, 2, 2)).unwrap();
+    let mut ready = node.ready().unwrap();
+    let said = beat_answers(&ready.take_persisted_messages());
+    let hard = *ready.hard_state().unwrap();
+    assert_eq!((hard.term, hard.commit), (2, 2));
+    assert_eq!(said, vec![2]);
+    node.store_mut().hard_state = hard;
+    node.advance_append(ready).unwrap();
+    assert_eq!(node.durable_commit(), 2);
+    // Every answer states no more than the disk states when it leaves.
+    node.step(beat_from(3, 2, 2)).unwrap();
+    let said = beat_answers(&drain(&mut node));
+    assert_eq!(said, vec![2]);
+    assert!(
+        said.iter()
+            .all(|commit| *commit <= node.store().hard_state.commit)
+    );
+}
+
+/// R-6: a heartbeat moves a follower's commit while its write is out. The
+/// notice of that write releases the answer at once, nothing being left to
+/// write, and no `Ready` will state that commit (the notice gives it as
+/// `LightReady::commit_index`). The answer states the commit the follower's
+/// storage states, not the one the heartbeat moved; once its owner writes
+/// that and says so (`RawNode::commit_durable`), its answers state it.
+#[test]
+fn an_answer_a_notice_releases_states_the_durable_commit() {
+    let mut node = follower_with(with_depth(2, 2));
+    assert_eq!(node.durable_commit(), 2);
+    let mut append = answer(MessageType::MsgAppend, 1, 2, 1);
+    append.index = 3;
+    append.log_term = 1;
+    append.commit = 2;
+    append.entries = vec![entry(4, 1)];
+    node.step(append).unwrap();
+    let mut ready = node.ready().unwrap();
+    let written = ready.entries().to_vec();
+    ready.take_persisted_messages();
+    node.advance_issued(ready).unwrap();
+    let mut beat = answer(MessageType::MsgHeartbeat, 1, 2, 1);
+    beat.commit = 3;
+    node.step(beat).unwrap();
+    assert_eq!(node.raft.log().committed(), 3);
+    node.store_mut().append(&written);
+    let mut light = node.on_persist(1).unwrap();
+    assert_eq!(light.commit_index(), Some(3));
+    let sent = light.take_messages();
+    assert_eq!(beat_answers(&sent), vec![2]);
+    assert_eq!(node.store().hard_state.commit, 2);
+    assert!(!node.has_ready());
+    // The owner writes the commit and says so.
+    node.store_mut().hard_state.commit = 3;
+    node.commit_durable(3).unwrap();
+    assert_eq!(node.durable_commit(), 3);
+    // The durable commit never goes back, and none is beyond the log.
+    node.commit_durable(2).unwrap();
+    assert_eq!(node.durable_commit(), 3);
+    assert!(matches!(node.commit_durable(5), Err(Error::Invariant(_))));
+    // A heartbeat that moves nothing: its write states no commit, and its
+    // answer states what the owner said is durable.
+    let mut beat = answer(MessageType::MsgHeartbeat, 1, 2, 1);
+    beat.commit = 3;
+    node.step(beat).unwrap();
+    let mut ready = node.ready().unwrap();
+    assert!(ready.hard_state().is_none());
+    assert_eq!(beat_answers(&ready.take_persisted_messages()), vec![3]);
+}
+
+/// R-6's apply pause (etcd's `applyingEntsPaused`): while the owner holds
+/// what it was given to apply, no `Ready` or notice gives more and
+/// everything else goes on; resumed, it is given what follows what it was
+/// given.
+#[test]
+fn an_owner_that_pauses_apply_is_given_nothing_more() {
+    let mut node = follower();
+    let ready = node.ready().unwrap();
+    assert_eq!(held(ready.committed_entries()), vec![(1, 1), (2, 1)]);
+    node.pause_apply();
+    assert!(node.apply_paused());
+    let light = node.advance_append(ready).unwrap();
+    assert!(light.committed_entries().is_empty());
+    // It applied the first and holds the second.
+    node.advance_apply_to(1).unwrap();
+    let mut beat = answer(MessageType::MsgHeartbeat, 1, 2, 1);
+    beat.commit = 3;
+    node.step(beat).unwrap();
+    let mut ready = node.ready().unwrap();
+    assert!(ready.committed_entries().is_empty());
+    assert_eq!(ready.take_persisted_messages().len(), 1);
+    let light = node.advance_append(ready).unwrap();
+    assert!(light.committed_entries().is_empty());
+    assert!(!node.has_ready());
+    node.resume_apply();
+    assert!(node.has_ready());
+    let ready = node.ready().unwrap();
+    assert_eq!(held(ready.committed_entries()), vec![(3, 1)]);
+    node.advance_append(ready).unwrap();
+    node.advance_apply_to(2).unwrap();
+    // A snapshot is given while paused, and replaces what the owner holds.
+    node.pause_apply();
+    let mut sent = answer(MessageType::MsgSnapshot, 1, 2, 1);
+    sent.snapshot = Some(Box::new(snapshot(7, 1, &[1, 2, 3])));
+    node.step(sent).unwrap();
+    let ready = node.ready().unwrap();
+    let installed = ready.snapshot().cloned().unwrap();
+    assert!(ready.committed_entries().is_empty());
+    node.store_mut().install(installed);
+    node.advance_append(ready).unwrap();
+    assert_eq!(node.given_to_apply(), 7);
+    node.resume_apply();
+    assert!(!node.has_ready());
+}
+
+/// R-6, `docs/durable.md` §4.2: a leader that applies before its own write
+/// is durable is given its own term's entries once a majority of followers
+/// commits them, copied or where the log holds them; without it, only once
+/// its own write is durable (`readies_are_taken_while_writes_are_out`).
+#[test]
+fn a_leader_applies_its_own_committed_entries_before_its_write_is_durable() {
+    for in_place in [false, true] {
+        let mut config = with_depth(1, 2);
+        config.apply_unpersisted = true;
+        let mut node = leader_with(config);
+        node.propose(vec![], b"x".to_vec()).unwrap();
+        let ready = node.ready().unwrap();
+        node.advance_issued(ready).unwrap();
+        for member in [2, 3] {
+            let mut acked = answer(MessageType::MsgAppendResponse, member, 1, 1);
+            acked.index = 2;
+            node.step(acked).unwrap();
+        }
+        assert_eq!(node.raft.log().committed(), 2);
+        assert_eq!(node.raft.log().persisted(), 1);
+        let ready = if in_place {
+            node.ready_in_place().unwrap()
+        } else {
+            node.ready().unwrap()
+        };
+        if in_place {
+            assert_eq!(ready.committed_range(), Some((1, 2)));
+            assert_eq!(crate::Storage::last_index(node.store()).unwrap(), 1);
+        } else {
+            assert_eq!(held(ready.committed_entries()), vec![(1, 1), (2, 1)]);
+        }
+        node.advance_issued(ready).unwrap();
+        // Not a leader: it waits for its writes again.
+        node.step(beat_from(3, 2, 2)).unwrap();
+        assert_eq!(node.raft.log().unpersisted_after, None);
+    }
+}
+
 #[test]
 fn notices_and_issues_the_member_did_not_give_are_refused() {
     let mut config = with_depth(1, 0);

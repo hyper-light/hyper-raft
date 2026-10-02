@@ -2,8 +2,10 @@
 //! not yet durable.
 //!
 //! `applied <= committed`, and nothing is given to apply that is not both
-//! committed and durable here. `persisted` is the highest index known
-//! durable; an entry that replaces a durable one lowers it.
+//! committed and durable here, but for a leader's own entries where it
+//! applies them before its own write is durable ([`Log::unpersisted_after`],
+//! core step R-6). `persisted` is the highest index known durable; an entry
+//! that replaces a durable one lowers it.
 //!
 //! What is not durable stays in [`Unstable`] until it is, whatever writes
 //! of it were issued (etcd's rule for asynchronous storage writes: the
@@ -393,6 +395,13 @@ pub struct Log<S> {
     pub(crate) committed: u64,
     pub(crate) persisted: u64,
     pub(crate) applied: u64,
+    /// A leader that applies its own entries before its write of them is
+    /// durable (`Config::apply_unpersisted`): the last index before its
+    /// term's entries. What is committed after it is given to apply once
+    /// everything through it is durable here; the entries through it are of
+    /// earlier terms, which a write still out may replace. None for a member
+    /// that does not lead, or does not apply so.
+    pub(crate) unpersisted_after: Option<u64>,
     /// The most entries held that are not yet durable.
     max_unstable: usize,
 }
@@ -416,6 +425,7 @@ impl<S: Storage> Log<S> {
                 issued: last.saturating_add(1),
                 ..Unstable::default()
             },
+            unpersisted_after: None,
             max_unstable,
         })
     }
@@ -766,8 +776,15 @@ impl<S: Storage> Log<S> {
         let held = self.last_term()?;
         Ok(term > held || (term == held && last_index >= self.last_index()?))
     }
+    /// The last index that may be given to apply: committed, and durable
+    /// here, or of a leader's own term once all before it is durable
+    /// ([`Log::unpersisted_after`]).
+    #[inline]
     fn apply_bound(&self) -> u64 {
-        self.committed.min(self.persisted)
+        match self.unpersisted_after {
+            Some(tail) if self.persisted >= tail => self.committed,
+            _ => self.committed.min(self.persisted),
+        }
     }
     /// Whether entries after `since` are committed and durable.
     pub fn has_next_entries_since(&self, since: u64) -> Result<bool> {
@@ -793,7 +810,11 @@ impl<S: Storage> Log<S> {
     ///
     /// Entries committed and durable are always in storage: `persisted` is
     /// below the first entry not yet durable whatever replaced what, so what
-    /// is given to apply is read where storage holds it.
+    /// is given to apply is read where storage holds it. A leader's own
+    /// entries given to apply before they are durable here
+    /// ([`Log::unpersisted_after`]) are not in storage yet: the range's tail
+    /// past [`Unstable::entries`]' offset is read where the log holds it
+    /// ([`Log::any_entry`], [`Log::slice`]).
     pub fn next_range_since(
         &self,
         since: u64,
@@ -805,13 +826,10 @@ impl<S: Storage> Log<S> {
         if high <= offset {
             return Ok(None);
         }
-        if high > self.unstable.offset {
-            return Err(Error::Invariant("committed entries not yet durable"));
-        }
         let mut taken = 0u64;
         let mut bytes = 0u64;
         let mut data_above = 0usize;
-        self.store.any_entry(offset, high, &mut |entry| {
+        let mut page = |entry: &Entry| {
             let next = bytes.saturating_add(proto::encoded_bytes(entry));
             if taken > 0 && max_bytes != u64::MAX && next > max_bytes {
                 return true;
@@ -822,7 +840,14 @@ impl<S: Storage> Log<S> {
                 data_above = data_above.saturating_add(entry.data.len());
             }
             false
-        })?;
+        };
+        if high <= self.unstable.offset {
+            self.store.any_entry(offset, high, &mut page)?;
+        } else if self.unpersisted_after.is_some() {
+            self.any_entry(offset, high, &mut page)?;
+        } else {
+            return Err(Error::Invariant("committed entries not yet durable"));
+        }
         let last = offset
             .checked_add(taken)
             .and_then(|end| end.checked_sub(1))

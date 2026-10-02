@@ -186,7 +186,11 @@ pub struct Progress {
     pub recent_active: bool,
     /// The messages sent and not answered.
     pub inflights: Inflights,
-    /// The member's commit as it last said.
+    /// The commit the member last said its storage states durably: a
+    /// member's answers carry its durable commit, not its commit (core step
+    /// R-6, `docs/durable.md` §4.1), so a member that restarts reopens with
+    /// at least this. For the leader itself, its commit; its own durable
+    /// commit is `RawNode::durable_commit`.
     pub committed_index: u64,
     /// The leader's ticks since something sent to the member was out and
     /// none of it was answered for: a full window, or a probe

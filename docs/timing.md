@@ -604,26 +604,82 @@ heartbeat due; those it skipped are losses to the receiver, which they are.
   its own clock, `A − s_echo − hold` (a path for the election law's ballot, `round_trip`), and the
   sum of the two directions' delays from their schedules, `round trip + late_echo + late`, which
   bounds this heartbeat's delay since both are positive.
-- **Judged before its own evidence: the node's pool** (§3, item 10). A link whose own estimator
-  has not configured is judged by the margin its node's pool configures for it. The pool is one more
-  `LinkEstimator`, fed the prediction errors `A − EA` of every link without a configuration of its
-  own, and of every link until the pool has its evidence (hyper-swim's rule, §2.7; a pool fed by the
-  young links alone, whose links all configured before it could measure, never measured, and a peer
-  never heard from was never judged: found by `a_peer_never_heard_from_is_suspected`), numbered by
-  the heartbeats due across the links so a heartbeat lost on any is a loss to it
-  (`LinkEstimator::on_offset`). The errors carry no clock offset, so links whose clocks differ pool.
-  The pool's behaviour for link `L` is its own with the deviation scaled by `√(1 + 1/n_L)` for `L`'s
-  window `n_L`: the prediction errors' variance at a window of `n` is `V(D)(1 + 1/n)` for independent
-  delays and the pool's is at least `V(D)`, so the scaled variance bounds `L`'s from above, the side
-  Cantelli's inequality may err on. Its margin is `detector_at` at `L`'s interval, costs and floors,
-  imposed on `L`'s estimator (`LinkEstimator::impose`), renewed on the doubling schedule, at a poll
-  as soon as the pool can give one, and charged to the allowance at `β` from the scaled behaviour. What
-  the pool measured stands when a later stretch makes its `τ_int` unmeasured again
-  (`pool_measured`), as hyper-swim's verdict and `configure`'s margin stand. A peer from which no
-  heartbeat has come is judged from the node's first poll with the pair attached: one interval at
-  the node's own floor (the pool's premise is that the stalls, and the floors, are the hosts') and
-  the pool's margin for a window of one; its suspicion states that time as its bound, from the
-  attach. `PairReport::judged` says a margin judges, `PairReport::freshness` the `η + α` in force.
+- **Judged before its own evidence: what the node measured of its links** (§3, item 10). A link
+  whose own estimator has not configured is judged by the margin its node's evidence configures for
+  it. That evidence is of two kinds, and the link takes the wider of them, each measure the larger
+  (`Liveness::evidence`):
+  - *the node's pool*, one more `LinkEstimator`, fed the prediction errors `A − EA` of every link
+    without a configuration of its own, and of every link until the pool has its evidence
+    (hyper-swim's rule, §2.7; a pool fed by the young links alone, whose links all configured
+    before it could measure, never measured, and a peer never heard from was never judged: found by
+    `a_peer_never_heard_from_is_suspected`), numbered by the heartbeats due across the links so a
+    heartbeat lost on any is a loss to it (`LinkEstimator::on_offset`). The errors carry no clock
+    offset, so links whose clocks differ pool. What it measured stands when a later stretch makes
+    its `τ_int` unmeasured again (`pool_measured`), as hyper-swim's verdict and `configure`'s
+    margin stand;
+  - *the widest configured link*: the behaviour each of the node's links configured its own
+    detector from (`Configuration::link`), each measure the largest over the pairs that have one,
+    kept at each configuration made and each pair let go.
+
+  The young link's margin is `detector_at` at its interval, costs and floors, from that behaviour
+  with the deviation scaled by `√(1 + 1/n_L)` for its window `n_L` (the prediction errors' variance
+  at a window of `n` is `V(D)(1 + 1/n)` for independent delays and the measured errors' is at least
+  `V(D)`, so the scaled variance bounds `L`'s from above, the side Cantelli's inequality may err
+  on), widened by what the link's own errors and losses show so far (their deviation, at its own
+  window already, and Jeffreys' loss over what it was sent); imposed on its estimator
+  (`LinkEstimator::impose`), renewed on the doubling schedule, at a poll as soon as the node has
+  evidence, and charged to the allowance at `β` from the behaviour it was imposed from.
+
+  *Why the widest, and why it keeps Theorem 7's bound.* `β = Π (V + p·x_j²)/(V + x_j²)` grows with
+  the loss `p` and with the variance `V` at every margin (each factor's derivative is `x²/(V + x²)`
+  in `p` and `x²(1 − p)/(V + x²)²` in `V`, neither negative), so a margin configured from any
+  componentwise upper bound on the young link's `(p, V)` promises a mistake bound no lower than the
+  truth's: Theorem 7's bound holds wherever the evidence bounds the link. What makes a node's
+  evidence a bound on a link it has not measured is the pool's premise, measured in §2.6: the
+  stalls are the hosts', the receiver's and the senders' alike, not the paths'. The widest
+  configured link needs no premise beyond the pool's, and dominates the pool over the same links:
+  the pool's loss is a weighted mean of its links' and the variance of its zero-mean errors a
+  weighted mean of theirs, each no more than the largest. It is the better-founded measurement
+  besides: a configured link measured itself at one interval, its `τ_int` within Madras and
+  Sokal's window and its unseen-delay term counted (§2.6, item 3), the conditions its estimator
+  refuses to configure without; the pool's levels mix links and intervals. The young link's own
+  errors widen it again, so it is never judged narrower than it has shown itself to be: in the
+  simulation's stalling world they were wider than the node's evidence often enough to move the
+  survivors' 90th-percentile detection from 997 ms to 1,141 ms.
+
+  *What the pool alone missed* (the Windows E2E, every platform). With three members, a survivor
+  whose leader died in its links' first heartbeats has one live link, the only feed of its pool.
+  That link configures once it has its own evidence, and its configuration asks the peer to send at
+  its best interval, 0.25–7.4 s on Windows' 15.625 ms timer; from then the pool's errors came at
+  that rate, and the dead leader's pair, unconfigured, was trusted (`Trust::Unconfigured`), its
+  survivor refusing the other's pre-vote, until the pool had its own evidence: 43–118 s to elect on
+  macOS, up to 29 minutes on Windows. Now the dead pair is judged at the first poll once its
+  freshness point has passed and the node holds any link's own evidence. Held in the simulation
+  (`a_peer_dead_before_its_links_have_evidence_is_suspected_once_a_sibling_has_its_own`: three
+  nodes, the victim killed after a seeded share of the heartbeats it sent before any pair
+  configured, seeds 0–31 of four worlds, Windows' timer and flush among them, every survivor
+  noticing the death no later than its first poll past both its freshness point and its live
+  link's configuration), in the real processes (`tests/processes.rs`) and in hyper-durable's shell
+  (`a_leader_killed_before_its_links_have_evidence_is_replaced`). The time from the kill to every
+  survivor's suspicion, median, 90th percentile and most over the 64 survivors of each world:
+
+  | world | the pool alone | the node's evidence |
+  |---|---|---|
+  | LAN | 33 / 349 / 576 ms | 23 / 39 / 86 ms |
+  | hosts frozen up to 50 ms | 6 / 63 / 831 ms | 5 / 32 / 207 ms |
+  | flushes stalled up to 60 ms | 89 / 1,199 / 13,829 ms | 107 / 1,141 / 3,919 ms |
+  | Windows' timer and flush | 578 / 4,468 / 33,828 ms | 578 / 2,080 / 5,867 ms |
+
+  What remains is the live link's own evidence, which no rule can lend it: in the slow worlds it is
+  the link's correlation, which the moves of "The interval the evidence needs" resolve.
+
+  A peer from which no heartbeat has come is judged from the node's first poll with the pair
+  attached: one interval at the node's own floor (the pool's premise is that the stalls, and the
+  floors, are the hosts') and the evidence's margin for a window of one; its suspicion states that
+  time as its bound, from the attach. `PairReport::judged` says a margin judges,
+  `PairReport::freshness` the `η + α` in force, and `PairReport::interval` the interval the peer's
+  heartbeats come at, or a longer one asked, judged or not: what an owner waiting on a young link's
+  evidence waits past.
 - **A restart** (§3, item 10). A heartbeat of a new run (`boot`) is reported as
   `Change::Restarted { peer, at_ns }` before the trust the heartbeat leaves, for the owner to call
   the core's `restarted` (trusted, and leading nothing it led); the owner is then told a suspicion
@@ -645,7 +701,8 @@ detection, detector })`, `Change::Trusted { peer, at_ns }` and `Change::Restarte
 `trust(peer)`, `suspected()`,
 `configuration(peer)` (the election law's base is `current.interval + current.margin`),
 `round_trip(peer)`, `report(peer)` (`sent`, `taken`, `unproven`, `suspicions`, `allowance`,
-`configurations`, `configured`, `judged`, `freshness`), `set_election(peer, T_E)`, `flush_mean()`, `granularity()`, `floor()`, `mtbf()`.
+`configurations`, `configured`, `judged`, `freshness`, `interval`), `set_election(peer, T_E)`,
+`flush_mean()`, `granularity()`, `floor()`, `mtbf()`.
 Every refusal is typed. The owner's contract: feed every message stamped before a time before
 polling at it (hyper-tokio's `PlaneSocket::receive_ready`); the core takes `suspect(node)`,
 `trust(node)` and `restarted(node)` from the changes (hyper-durable's `Owner::believe`).
@@ -670,22 +727,29 @@ milliseconds to a device that stalls one flush in fifty for up to 60 ms
 (`every_link_configures_or_suspects_a_crash_within_its_bound`): every pair configures, none taking
 more heartbeats unconfigured than any window holds (`WINDOW_LIMIT`, the drift bound's ceiling: a link
 whose estimator has not measured its correlation in as many heartbeats as any window could average
-is one no window resolves), at most 302 heartbeats; then one node is killed after a share of the
-heartbeats it sent before every pair configured in the same seed's run, drawn between none and twice
-as many, and every survivor suspects it, each suspicion within the bound it states, by its own
-configuration's margin (169), the pool's (117), or, for a node never heard from, from the attach (2).
+is one no window resolves), at most 315 heartbeats (302 under the pool alone: the simulation draws
+every delay and lateness from one seeded stream, and wider margins wake the owners at other times,
+so a seed's world differs); then one node is killed after a share of the heartbeats it sent before
+every pair configured in the same seed's run, drawn between none and twice as many, and every
+survivor suspects it, each suspicion within the bound it states, by its own configuration's margin
+(165), the node's evidence's (121), or, for a node never heard from, from the attach (2).
 Before the fix, the stalling world kept a link unconfigured for 5,775 heartbeats (its floor
 followed down with each decaying mean, the estimator started again at each move), and a world
 that is too correlated at its floor is refused by the estimator however long it runs
 (`link::tests`). A peer never heard from is suspected by every other within the bound from the
-attach (16 seeds).
+attach (16 seeds). A peer dead in its links' first heartbeats, in a group of three, is suspected by
+both survivors once their live link has its own evidence (above, "Judged before its own evidence";
+32 seeds of four worlds).
 Property tests: the codec reads back what it writes and refuses every truncation, extension, kind
 and version; the bound is its window's mean. `tests/processes.rs`, real processes over UDP on the
 sealed plane through hyper-tokio's kernel-stamped socket, each liveness write a real write and
 platform flush of a real file: one member's disk is stalled (its device thread stops completing
 flushes) and every other suspects it within its stated bound from the last schedule, on the host's
 monotonic clock, which the processes share; then one is SIGKILLed and every survivor suspects it so;
-live members keep the allowance. The test derives nothing; it waits on facts.
+live members keep the allowance. A second group of three kills a member as soon as it has heard
+every peer and sent to each, and each survivor suspects it no later than its first poll past its
+freshness point (plus the latest lateness of its wakes) and the state line in which it stated its
+live link configured. The test derives nothing; it waits on facts.
 
 ### 2.9 Elections by suspicion in the core (L-2, as built)
 
@@ -814,13 +878,18 @@ campaigns, a leader that suspects too many followers steps down), and a pair nev
 configured, so a leader's detectors of its followers, which check-quorum reads, judged nothing.
 Held to it in `crates/hyper-durable/tests/liveness.rs`, three nodes on one simulated clock with
 seeded delays, flushes and wake lateness, 1,000 seeds (64 in the gates): a group elects from nothing,
-sends no Raft message while idle but after a detector's change (2,156 over 7,142 changes), its
+sends no Raft message while idle but after a detector's change (2,150 over 7,146 changes), its
 leader's node killed, every survivor suspects it within the bound the suspicion states and the
 survivors elect and commit, and the killed node started again on its store, a new run of its
-stream, every survivor's stream reports its restart to its core and the node catches up. The quiet
+stream, every survivor's stream reports its restart to its core and the node catches up; and,
+in a second test, the leader's node killed as soon as the group elects it, before any survivor's
+link to it has evidence of its own, every survivor suspects it and the survivors elect and commit
+(`a_leader_killed_before_its_links_have_evidence_is_replaced`: over the 1,000 seeds replaced
+within 855 ms of the kill at the most, against 243.8 s judged by the pool alone, §2.8). The quiet
 period its waits use is the stream's own: the longest `η + α` in force (`PairReport::freshness`,
-which counts an interval asked and not yet taken), the election's span and rounds, a flush and a
-network round.
+which counts an interval asked and not yet taken) or, for a pair no margin judges, the interval its
+heartbeats come at (`PairReport::interval`), the election's span and rounds, a flush and a network
+round.
 
 What the first form of this wiring found of the stream, each closed in hyper-liveness (§2.8):
 - **A link could stay unconfigured for good.** The receiver asked a longer interval only once its
@@ -838,6 +907,12 @@ What the first form of this wiring found of the stream, each closed in hyper-liv
 - **A false suspicion at every move the receiver asked.** Found once the intervals moved: a
   receiver that asked a longer interval suspected its peer at the old spacing (§2.8, "A moved
   interval"); the receiver now expects the move.
+- **A link that stopped before its evidence waited on its sibling's interval.** Found by the
+  Windows E2E: with three members a survivor's pool is fed by its one live link, which, once
+  configured, asks its best interval, seconds on Windows, so the dead leader's pair stayed
+  unjudged, trusted, for minutes, and its survivor refused the other's pre-vote. The young link is
+  now judged by the widest of what its node measured, the pool's and its configured links' (§2.8,
+  "Judged before its own evidence").
 - **Its kill test killed during a mistake.** Seed 26 of
   `a_killed_peer_is_suspected_within_the_stated_bound` killed the victim while a survivor suspected
   it by a mistake; the test now kills once every survivor trusts the victim. In this test, likewise,
@@ -851,8 +926,10 @@ stops the heartbeats with it. The test tells no member what to believe and deriv
 period measurement, its 95/95 tolerance bounds and its count caps are gone. It waits on facts and
 goes on while the group moves — any member's term, commit, applied index, last index or restarts
 seen, or, while a member has a pair no margin judges, the heartbeats it has taken — and gives up
-after a quiet period of the members' own law (the longest `η + α` any member states, its election's
-span and three rounds, an ask's three), never less than its own retransmission timeout (RFC 6298:
+after a quiet period of the members' own law (the longest `η + α` any member states, or the longest
+interval at which a pair no margin judges takes heartbeats, since the wait goes on while those
+move; its election's span and three rounds; an ask's three), never less than its own
+retransmission timeout (RFC 6298:
 one second before a round trip is measured and never less after, §2.1, §2.4). An ask is resent at
 that timeout. A member just started is waited on while its process runs. Its count bounds are the
 protocol's: a member passes each durability point at least once for each turn of writes it takes
@@ -864,10 +941,12 @@ the restarted one reports the restart its stream saw. A member waits for its dat
 takes them without waiting, for a receive that times out on Windows can lose the datagram arriving
 as it does, which lost the test's asks on the windows-11-arm runner (`docs/raft.md`, "The harness's
 receive"). A wait that gives up prints each member's last report (its suspicions, the peers heard,
-its unjudged pairs, heartbeats taken, stated detection, span and round) with the quiet period in
-force. The member's shell writes its commit alone at
-the first moment no write is out (`Settings::quiet` zero): an owner woken by events has no period.
-Measured in `docs/benchmarks.md`, "hyper-durable-e2e on its own detectors".
+its unjudged pairs and the longest interval they take heartbeats at, heartbeats taken, stated
+detection, span and round) with the quiet period in force. The member's shell writes its commit
+alone at the first moment no write is out (`Settings::quiet` zero): an owner woken by events has no
+period. Measured in `docs/benchmarks.md`, "hyper-durable-e2e on its own detectors" and "A link
+younger than its evidence" (the stalled member's scenarios, 0.7–112 s on main across the six
+targets, 0.3–18.8 s with a young link judged by what its node measured).
 
 **The model.** These rules only bring forward or refuse a campaign, or forget a leader, which is
 volatile; the TLA+ model's `Elect` may be taken at any time with any quorum the log comparison
@@ -950,35 +1029,44 @@ and election law; the remaining items keep their numbers, and item 10 is what L-
     `rttvar` (§5.3); the node-pair stream's echo gives one with its first answered heartbeat
     (`Liveness::round_trip`, §2.8). Before a path has a sample no member campaigns, and none could
     hear its vote.
-  - *A link that stopped before its evidence is judged by its node's pool.* The evidence about a
-    link's delays is not only the link's: §2.6 measured that the stalls are the hosts', and
-    hyper-swim already judges a pair with no verdict of its own by its member's pool (§2.7), item 3's
-    candidate. Until a link's own estimator configures, its trust is judged by the margin the node's
-    pool configures, scaled to the link's window (the prediction errors' variance is
-    `V(D)(1 + 1/n)` at a window of `n`), against the link's own expected arrival — anchored at its
-    first heartbeat, or, for a peer from which none has arrived, one interval past the moment the
-    node first attached the pair: built, with the pool's own behaviour scaled by `√(1 + 1/n)`, an
-    upper bound on the link's (§2.8, "Judged before its own evidence"). That suffices, by this
-    argument: a group elects only with a live
-    majority of its voters. For `n ≥ 3` a live majority holds at least two members, so every live
-    voter that must detect its leader's crash has a live peer in the group, and the node-pair
-    stream between them (L-3 runs one between every two nodes that share a group) feeds its node's
-    pool. The pool reaches its evidence — two prediction errors and an Allan level of seven windows
-    at Madras and Sokal's `m ≥ 6τ_int`, at least 56 heartbeats, at `T_c` or more apart, sooner
-    when several live links feed it — and from then the dead link, unconfigured, is suspected at its
-    next freshness point. Two voters cannot elect without both, one never suspects, and a node whose
-    pool has no live link has no peer to elect with. A crash in a link's first heartbeats is so
-    suspected within the later of the pool's evidence and the link's freshness point, both measured.
-    The pool's evidence is itself bounded by the interval the evidence needs (§2.8): a live link
-    too correlated at its floor moves to where its heartbeats are independent instead of refusing,
-    so the pool, which needs the same evidence, reaches it. Held in hyper-liveness's simulation
-    (`every_link_configures_or_suspects_a_crash_within_its_bound`, `a_peer_never_heard_from_is_suspected`).
+  - *A link that stopped before its evidence is judged by what its node measured.* The evidence
+    about a link's delays is not only the link's: §2.6 measured that the stalls are the hosts', and
+    hyper-swim already judges a pair with no verdict of its own by its member's pool (§2.7), item
+    3's candidate. Until a link's own estimator configures, its trust is judged by the margin the
+    node's evidence configures — the wider of its pool's measure and the widest behaviour its
+    configured links measured, scaled to the link's window (the prediction errors' variance is
+    `V(D)(1 + 1/n)` at a window of `n`) and widened by the link's own errors — against the link's
+    own expected arrival, anchored at its first heartbeat, or, for a peer from which none has
+    arrived, one interval past the moment the node first attached the pair: an upper bound on the
+    link's behaviour wherever the pool's premise holds, and so on its `β` (§2.8, "Judged before its
+    own evidence"). That suffices, by this argument: a group elects only with a live majority of
+    its voters. For `n ≥ 3` a live majority holds at least two members, so every live voter that
+    must detect its leader's crash has a live peer in the group, and the node-pair stream between
+    them (L-3 runs one between every two nodes that share a group) gathers its node's evidence: it
+    feeds the node's pool, and it configures its own detector — two prediction errors and an Allan
+    level of seven windows at Madras and Sokal's `m ≥ 6τ_int`, at least 56 heartbeats, at `T_c` or
+    more apart. From the first of the two, the dead link, unconfigured, is judged and suspected at
+    its next freshness point. The live link's own configuration is the one to count on: once it
+    configures it asks its best interval, seconds on a coarse timer, and the pool, fed at that rate,
+    could take minutes more (found by the Windows E2E: 43–118 s to elect on macOS, up to 29 minutes
+    on Windows, §2.9). Two voters cannot elect without both, one never suspects, and a node with no
+    live link has no peer to elect with. A crash in a link's first heartbeats is so suspected
+    within the later of its node's first evidence and the link's freshness point, both measured.
+    That evidence is itself bounded by the interval the evidence needs (§2.8): a live link too
+    correlated at its floor moves to where its heartbeats are independent instead of refusing, and
+    configures there. Held in hyper-liveness's simulation
+    (`every_link_configures_or_suspects_a_crash_within_its_bound`,
+    `a_peer_never_heard_from_is_suspected`,
+    `a_peer_dead_before_its_links_have_evidence_is_suspected_once_a_sibling_has_its_own`), its real
+    processes and hyper-durable's shell (`a_leader_killed_before_its_links_have_evidence_is_replaced`).
   - *A restart is not a crash the detectors can miss.* The stream carries the sender's run
     (`boot`, §2.8), and a new run is an incarnation's end: told to the core (`restarted`), the node is
     trusted and leads nothing it led before. hyper-liveness reports it, `Change::Restarted`, and
     hyper-durable's owner takes it to the core (§2.8, §2.9), as the E2E's members do.
-  What stays open is §2.7's for the pool: its mean is wrong for a pair far from the node's other
-  peers until that pair configures, and while a history is young the allowance is loose (item 3).
+  What stays open is §2.7's for the pool, and so for the widest configured link: its mean is wrong
+  for a pair far from the node's other peers until that pair configures (the young link's own
+  errors widen the margin as they come, but a peer that dies first has shown few), and while a
+  history is young the allowance is loose (item 3).
 
 ## 4. Steps
 

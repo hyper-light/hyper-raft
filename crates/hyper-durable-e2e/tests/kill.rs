@@ -215,10 +215,12 @@ impl Cluster {
     }
 
     /// Takes what a report says of the member's law: the longest its detectors state to suspect
-    /// a crash, then its election's span and rounds, and an ask's rounds.
+    /// a crash, or, while a pair no margin judges takes heartbeats at a longer interval, that
+    /// interval, the most a wait that goes on while those heartbeats move can see none; then its
+    /// election's span and rounds, and an ask's rounds.
     fn heard_law(&mut self, id: u64, report: &Report) {
         let round = Duration::from_nanos(report.round_ns);
-        let law = Duration::from_nanos(report.detection_ns)
+        let law = Duration::from_nanos(report.detection_ns.max(report.unjudged_interval_ns))
             + Duration::from_nanos(report.span_ns)
             + round * (ELECTION_ROUNDS + ANSWER_ROUNDS);
         self.law.insert(id, law);
@@ -312,8 +314,8 @@ impl Cluster {
             let s = &r.status;
             out.push_str(&format!(
                 "\n  member {id}, {:?} ago: term {} leads {} commit {} applied {} last {}; \
-                 suspected {:?} heard {:?} unjudged {} taken {} restarts {}; detection {:?} \
-                 span {:?} round {:?}",
+                 suspected {:?} heard {:?} unjudged {} at up to {:?} taken {} restarts {}; \
+                 detection {:?} span {:?} round {:?}",
                 at.elapsed(),
                 s.term,
                 s.leads,
@@ -323,6 +325,7 @@ impl Cluster {
                 r.suspected,
                 r.heard,
                 r.unjudged,
+                Duration::from_nanos(r.unjudged_interval_ns),
                 r.taken,
                 r.restarts,
                 Duration::from_nanos(r.detection_ns),
@@ -978,9 +981,16 @@ fn main() -> ExitCode {
         }
     }
     if runs("stall") {
-        stalled_disk(true);
-        stalled_disk(false);
-        println!("stall: ok");
+        for leader in [true, false] {
+            let at = Instant::now();
+            stalled_disk(leader);
+            let name = if leader {
+                "stall-leader"
+            } else {
+                "stall-follower"
+            };
+            println!("{name}: ok in {:?}", at.elapsed());
+        }
     }
     if runs("founder") {
         founder();

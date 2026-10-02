@@ -102,6 +102,17 @@ const BUSY: World = World {
     ..LAN
 };
 
+/// A Windows host: a timed wait ends on the next 15.625 ms clock interrupt (Microsoft,
+/// `timeBeginPeriod`, `docs/research/timing.md`), so a wake is up to that late, and a full flush
+/// (`FlushFileBuffers`) takes 10 to 30 ms, as the members of hyper-durable-e2e measured their floors
+/// `E[flush] + G` at 20 to 32 ms, with `G` at 2 to 8 ms, on the windows-2025 and windows-11-arm
+/// runners (`docs/timing.md` §2.9, "On real detectors").
+const WINDOWS: World = World {
+    late: (0, 15_625 * US),
+    flush: (10 * MS, 20 * MS),
+    ..LAN
+};
+
 enum Event {
     /// A message reaches `to`, received by its kernel at `stamp`.
     Arrive {
@@ -169,6 +180,8 @@ struct Sim {
     queue: BinaryHeap<Reverse<(u64, u64)>>,
     events: BTreeMap<u64, Event>,
     next_event: u64,
+    /// When each node first held each pair configured: `(node, peer)` to the time.
+    configured_at: BTreeMap<(usize, PeerId), u64>,
 }
 
 impl Sim {
@@ -216,6 +229,7 @@ impl Sim {
             queue: BinaryHeap::new(),
             events: BTreeMap::new(),
             next_event: 0,
+            configured_at: BTreeMap::new(),
         };
         if let Some(every) = world.organic {
             for node in 0..count {
@@ -399,6 +413,21 @@ impl Sim {
                 self.poll(node);
             }
             self.elect();
+            self.note_configured();
+        }
+    }
+
+    /// Notes the pairs each live node has newly configured.
+    fn note_configured(&mut self) {
+        let count = self.nodes.len() as u64;
+        for (index, node) in self.nodes.iter().enumerate().filter(|(_, n)| n.alive) {
+            for peer in (1..=count).filter(|p| *p != node.owner.id) {
+                if !self.configured_at.contains_key(&(index, peer))
+                    && node.liveness.report(peer).is_some_and(|r| r.configured)
+                {
+                    self.configured_at.insert((index, peer), self.now);
+                }
+            }
         }
     }
 
@@ -916,7 +945,7 @@ fn every_link_configures_or_suspects_a_crash_within_its_bound() {
                 let bound = suspicion.detection.map(|d| d.as_nanos() as u64);
                 match (suspicion.last, bound) {
                     (Some(last), Some(bound)) => {
-                        // Its own configuration's or the pool's margin: either states its bound,
+                        // Its own configuration's or the node's evidence's margin: either states its bound,
                         // from the last heartbeat taken (a later one may have been lost).
                         assert!(Some(last.due_ns) <= *last_due, "{name} seed {seed}");
                         assert!(
@@ -933,7 +962,7 @@ fn every_link_configures_or_suspects_a_crash_within_its_bound() {
                         judged_by[usize::from(!own)] += 1;
                     }
                     (None, Some(bound)) => {
-                        // Never heard: from the start, an interval and the pool's margin.
+                        // Never heard: from the start, an interval and the evidence's margin.
                         assert!(suspicion.at_ns <= bound, "{name} seed {seed}");
                         judged_by[2] += 1;
                     }
@@ -950,14 +979,14 @@ fn every_link_configures_or_suspects_a_crash_within_its_bound() {
     }
     println!(
         "most heartbeats a link took to configure: {} ({} seed {}); suspicions of the killed node \
-         by its own detector {}, by the pool's margin {}, never heard {}",
+         by its own detector {}, by the node's evidence's margin {}, never heard {}",
         slowest.0, slowest.2, slowest.1, judged_by[0], judged_by[1], judged_by[2]
     );
 }
 
 /// Item 10 of `docs/timing.md` §3: a peer from which no heartbeat ever comes (dead before its
 /// first) is suspected by every other, once its node's pool can give a margin, within the bound
-/// the suspicion states from the start: one interval at the node's own floor and the pool's margin.
+/// the suspicion states from the start: one interval at the node's own floor and the margin of the node's evidence.
 #[test]
 fn a_peer_never_heard_from_is_suspected() {
     for seed in 0..16u64 {
@@ -983,5 +1012,96 @@ fn a_peer_never_heard_from_is_suspected() {
             assert!(suspicion.at_ns <= bound.as_nanos() as u64, "seed {seed}");
             assert_eq!(sim.nodes[node].liveness.report(4).unwrap().taken, 0);
         }
+    }
+}
+
+/// Item 10 of `docs/timing.md` §3, with three nodes: a peer that dies in its links' first
+/// heartbeats, before any pair has its own evidence, leaves each survivor one live link, whose
+/// configuration lengthens its interval to its best (seconds, on Windows' timer), and a pool fed at
+/// that rate. Every survivor suspects it no later than the first poll once both its freshness point
+/// has passed and the node holds a link's own evidence (a pair it has configured): the young link
+/// is judged by the widest behaviour the node has measured (`docs/timing.md` §2.8, "Judged before
+/// its own evidence"). In four worlds, Windows' timer among them, 32 seeds each, the victim killed
+/// after a share, drawn from the seed, of the heartbeats it sent before any pair configured in the
+/// same seed's run.
+#[test]
+fn a_peer_dead_before_its_links_have_evidence_is_suspected_once_a_sibling_has_its_own() {
+    for (name, world) in [
+        ("lan", LAN),
+        ("frozen", FROZEN),
+        ("busy", BUSY),
+        ("windows", WINDOWS),
+    ] {
+        let mut noticed = Vec::new();
+        for seed in 0..32u64 {
+            let victim = 2usize;
+            let mut twin = Sim::new(3, world, seed);
+            twin.run_while(|sim| sim.configured_at.is_empty(), None);
+            let young = twin.nodes[victim].log.len() as u64;
+            let mut draw = Noise(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+            let kill_after = 1 + draw.below(young.saturating_sub(1).max(1));
+            let mut sim = Sim::new(3, world, seed);
+            sim.run_while(
+                |sim| (sim.nodes[victim].log.len() as u64) < kill_after,
+                None,
+            );
+            assert!(
+                sim.configured_at.is_empty(),
+                "{name} seed {seed}: killed after a pair configured"
+            );
+            let killed_at = sim.now;
+            sim.nodes[victim].alive = false;
+            sim.run_while(
+                |sim| {
+                    let stuck = sim.unresolved();
+                    assert!(stuck.is_empty(), "{name} seed {seed}: {stuck:?}");
+                    (0..2).any(|node| {
+                        sim.nodes[node].liveness.trust(victim as u64 + 1) != Some(Trust::Suspected)
+                    })
+                },
+                None,
+            );
+            // A poll comes at most a wake's lateness, or a freeze, past what it waits for.
+            let late = world.late.0 + world.late.1 + world.freeze.map_or(0, |(_, longest)| longest);
+            for node in 0..2usize {
+                let suspicion = sim.nodes[node]
+                    .suspicions
+                    .iter()
+                    .rfind(|s| s.peer == victim as u64 + 1)
+                    .copied()
+                    .unwrap_or_else(|| panic!("{name} seed {seed}: {node} holds no suspicion"));
+                if let (Some(last), Some(bound)) = (suspicion.last, suspicion.detection) {
+                    assert!(
+                        suspicion.at_ns - last.due_ns <= bound.as_nanos() as u64,
+                        "{name} seed {seed}: node {node} past its stated bound"
+                    );
+                }
+                let sibling = (1 - node) as u64 + 1;
+                // Suspected before its sibling configured: the pool had its evidence first.
+                let evidence = sim
+                    .configured_at
+                    .get(&(node, sibling))
+                    .copied()
+                    .unwrap_or(u64::MAX);
+                assert!(
+                    suspicion.noticed_ns <= suspicion.at_ns.max(evidence).saturating_add(late),
+                    "{name} seed {seed}: node {node} noticed {} ms after the kill, its freshness \
+                     point {} ms and its sibling's configuration {} ms after it",
+                    suspicion.noticed_ns.saturating_sub(killed_at) / MS,
+                    suspicion.at_ns.saturating_sub(killed_at) / MS,
+                    evidence.saturating_sub(killed_at) / MS,
+                );
+                // A suspicion held from before the kill (a mistake) counts as at the kill.
+                noticed.push(suspicion.noticed_ns.saturating_sub(killed_at));
+            }
+        }
+        noticed.sort_unstable();
+        println!(
+            "{name}: survivors noticed the victim's death {} ms after the kill at the median, {} ms \
+             at the 90th percentile, {} ms at the most",
+            noticed[noticed.len() / 2] / MS,
+            noticed[noticed.len() * 9 / 10] / MS,
+            noticed[noticed.len() - 1] / MS
+        );
     }
 }

@@ -178,6 +178,10 @@ pub struct Report {
     pub taken: u64,
     /// The pairs no margin judges yet: neither a configuration of their own nor the pool's.
     pub unjudged: u64,
+    /// The longest interval the heartbeats of a pair no margin judges come at
+    /// (`hyper_liveness::PairReport::interval`), nanoseconds: how long the evidence such a pair is
+    /// to be judged from may go without moving; zero while none is heard and unjudged.
+    pub unjudged_interval_ns: u64,
     /// The restarts of its peers its stream has seen.
     pub restarts: u64,
     /// The peers its detectors suspect.
@@ -211,6 +215,7 @@ pub fn put_report(buffer: &mut Vec<u8>, id: u64, report: &Report) {
         report.detection_ns,
         report.taken,
         report.unjudged,
+        report.unjudged_interval_ns,
         report.restarts,
         u64::try_from(report.voters.len()).unwrap_or(u64::MAX),
     ] {
@@ -256,6 +261,7 @@ pub fn read_report(body: &[u8], max_voters: usize) -> Option<(u64, Report)> {
     let detection_ns = reader.u64()?;
     let taken = reader.u64()?;
     let unjudged = reader.u64()?;
+    let unjudged_interval_ns = reader.u64()?;
     let restarts = reader.u64()?;
     let list = |reader: &mut Reader<'_>| {
         let count = usize::try_from(reader.u64()?).ok()?;
@@ -281,6 +287,7 @@ pub fn read_report(body: &[u8], max_voters: usize) -> Option<(u64, Report)> {
             detection_ns,
             taken,
             unjudged,
+            unjudged_interval_ns,
             restarts,
             suspected,
             heard,

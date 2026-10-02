@@ -19,6 +19,12 @@
 //! - then it kills another member with SIGKILL (TerminateProcess on Windows) and waits for every
 //!   survivor to suspect it, each within its stated bound the same way.
 //!
+//! A second supervisor (`a_node_killed_in_its_first_heartbeats_is_suspected_once_a_sibling_has_its_evidence`)
+//! starts three members and kills one with SIGKILL as soon as it says it has heard every peer and
+//! sent to each, before any of its links could have its own evidence: each survivor, left one live
+//! link, suspects it no later than its first poll once the link's freshness point has passed and
+//! its live link has configured (`docs/timing.md` §3, item 10).
+//!
 //! Of live members it asserts what the configured detectors promise: Theorem 7 bounds the expected
 //! number of suspicions of a live peer by the allowance `Σβ`, and a run refutes that only when the
 //! 95 % lower limit of its count, summed over the live pairs, passes the summed allowance (the rule
@@ -169,12 +175,13 @@ fn member_process() {
 )]
 async fn member(me: u64, ports: Vec<u16>, file: std::path::PathBuf) {
     let address = |id: u64| SocketAddr::from(([127, 0, 0, 1], ports[(id - 1) as usize]));
+    let nodes = ports.len() as u64;
     let mut socket = PlaneSocket::bind(address(me), Io { batch: 64 }).unwrap();
     let clock = *socket.clock();
     let mut plane = Plane::new(
         me,
         PlaneLimits {
-            max_peers: NODES as usize,
+            max_peers: nodes as usize,
             epochs_per_peer: 2,
             window_limit: 1_024,
         },
@@ -183,11 +190,11 @@ async fn member(me: u64, ports: Vec<u16>, file: std::path::PathBuf) {
     let mut liveness = Liveness::new(Settings {
         local: me,
         boot: clock.now_ns() ^ u64::from(std::process::id()),
-        max_peers: NODES as usize,
+        max_peers: nodes as usize,
         history: Exposure::new(),
     })
     .unwrap();
-    let peers: Vec<u64> = (1..=NODES).filter(|peer| *peer != me).collect();
+    let peers: Vec<u64> = (1..=nodes).filter(|peer| *peer != me).collect();
     for &peer in &peers {
         let role = if me < peer {
             Role::Initiator
@@ -223,6 +230,7 @@ async fn member(me: u64, ports: Vec<u16>, file: std::path::PathBuf) {
 
     let mut flushing = false;
     let mut reported_at = 0u64;
+    let mut heard_all = false;
     let mut command = [0u8; 16];
     // The first poll: it asks for the flush that proves the first heartbeats.
     let mut first = Asked {
@@ -317,6 +325,22 @@ async fn member(me: u64, ports: Vec<u16>, file: std::path::PathBuf) {
         {
             return;
         }
+        // Once it has heard every peer and sent to each: its links' first heartbeats.
+        if !heard_all
+            && peers.iter().all(|peer| {
+                liveness
+                    .report(*peer)
+                    .is_some_and(|r| r.taken > 0 && r.sent > 0)
+            })
+        {
+            heard_all = true;
+            if writeln!(stdout, "heard {me}")
+                .and_then(|()| stdout.flush())
+                .is_err()
+            {
+                return;
+            }
+        }
     }
 }
 
@@ -330,7 +354,7 @@ fn elect(liveness: &mut Liveness, peers: &[u64]) {
         .iter()
         .filter_map(|peer| liveness.round_trip(*peer).copied())
         .collect();
-    let Some(span) = Ballot::measure(paths.iter(), NODES as usize, durable, granularity)
+    let Some(span) = Ballot::measure(paths.iter(), peers.len() + 1, durable, granularity)
         .and_then(|ballot| ballot.span(granularity))
     else {
         return;
@@ -357,12 +381,14 @@ fn report(
             let last = suspicion.last;
             writeln!(
                 out,
-                "suspect {me} {} {} {} {} {}",
+                "suspect {me} {} {} {} {} {} {} {}",
                 suspicion.peer,
                 suspicion.at_ns,
                 last.map_or(0, |l| l.due_ns),
                 last.map_or(0, |l| l.sent_ns),
                 suspicion.detection.map_or(0, |d| d.as_nanos() as u64),
+                suspicion.noticed_ns,
+                liveness.latest_wake(suspicion.noticed_ns).as_nanos() as u64,
             )?;
         }
     }
@@ -418,11 +444,16 @@ struct Suspected {
     due: u64,
     sent: u64,
     detection: u64,
+    /// When the member's poll noticed it.
+    noticed: u64,
+    /// The latest the member had woken past a wake it asked, when it noticed.
+    late: u64,
 }
 
 enum Line {
     State(u64, u64, BTreeMap<u64, Seen>),
     Suspect(u64, u64, Suspected),
+    Heard(u64),
 }
 
 fn parse(line: &str) -> Option<Line> {
@@ -451,7 +482,7 @@ fn parse(line: &str) -> Option<Line> {
         }
         "suspect" => {
             let numbers: Vec<u64> = fields.map(|f| f.parse().ok()).collect::<Option<_>>()?;
-            let [member, peer, at, due, sent, detection] = numbers[..] else {
+            let [member, peer, at, due, sent, detection, noticed, late] = numbers[..] else {
                 return None;
             };
             Some(Line::Suspect(
@@ -462,16 +493,19 @@ fn parse(line: &str) -> Option<Line> {
                     due,
                     sent,
                     detection,
+                    noticed,
+                    late,
                 },
             ))
         }
+        "heard" => Some(Line::Heard(fields.next()?.parse().ok()?)),
         _ => None,
     }
 }
 
 /// Free loopback ports, one per member: bound, read and released.
-fn free_ports() -> Vec<u16> {
-    let sockets: Vec<UdpSocket> = (0..NODES)
+fn free_ports(nodes: u64) -> Vec<u16> {
+    let sockets: Vec<UdpSocket> = (0..nodes)
         .map(|_| UdpSocket::bind("127.0.0.1:0").unwrap())
         .collect();
     sockets
@@ -488,6 +522,11 @@ struct Supervisor {
     /// When each member's latest state line was written, on the host clock.
     stated: BTreeMap<u64, u64>,
     suspicions: Vec<(u64, u64, Suspected)>,
+    /// The members that said they heard every peer and sent to each.
+    heard: Vec<u64>,
+    /// The first state line in which each member stated each pair configured: `(member, peer)` to
+    /// its time on the host clock, which is no earlier than the configuration.
+    configured_since: BTreeMap<(u64, u64), u64>,
 }
 
 impl Supervisor {
@@ -499,12 +538,18 @@ impl Supervisor {
         }
         match parse(&line) {
             Some(Line::State(member, now, peers)) => {
+                for (peer, seen) in &peers {
+                    if seen.configured {
+                        self.configured_since.entry((member, *peer)).or_insert(now);
+                    }
+                }
                 self.latest.insert(member, peers);
                 self.stated.insert(member, now);
             }
             Some(Line::Suspect(member, peer, suspected)) => {
                 self.suspicions.push((member, peer, suspected));
             }
+            Some(Line::Heard(member)) => self.heard.push(member),
             None => {}
         }
     }
@@ -537,23 +582,29 @@ impl Supervisor {
     }
 }
 
-#[test]
+/// A group of `nodes` member processes, started: each ready, its disk's command port known, and
+/// told to begin. The directory holds their files.
+struct Group {
+    _directory: tempfile::TempDir,
+    members: Members,
+    supervisor: Supervisor,
+    /// Where each member's disk takes commands.
+    wakes: BTreeMap<u64, u64>,
+}
+
 #[allow(
     clippy::disallowed_methods,
     reason = "real processes on the host's clock, threads and environment (CLAUDE.md §1a, end to end)"
 )]
-fn a_stalled_disk_and_a_killed_node_are_suspected_and_no_live_one_is() {
-    if std::env::var("HYPER_LIVENESS_NODE").is_ok() {
-        return;
-    }
+fn start(nodes: u64) -> Group {
     let directory = tempfile::tempdir().unwrap();
-    let ports = free_ports()
+    let ports = free_ports(nodes)
         .iter()
         .map(u16::to_string)
         .collect::<Vec<_>>()
         .join(",");
     let mut members = Members(
-        (1..=NODES)
+        (1..=nodes)
             .map(|id| {
                 let child = Command::new(std::env::current_exe().unwrap())
                     .args([
@@ -591,7 +642,7 @@ fn a_stalled_disk_and_a_killed_node_are_suspected_and_no_live_one_is() {
     drop(sender);
     // Every member ready: its sockets bound, and where its disk takes commands.
     let mut wakes = BTreeMap::new();
-    while wakes.len() < NODES as usize {
+    while wakes.len() < nodes as usize {
         let line = lines.recv().expect("a member ended before it was ready");
         // libtest prints "test member_process ... " before the body runs, without a newline.
         if let Some((_, ready)) = line.split_once("ready ") {
@@ -602,13 +653,37 @@ fn a_stalled_disk_and_a_killed_node_are_suspected_and_no_live_one_is() {
     for child in members.0.values_mut() {
         writeln!(child.stdin.as_mut().unwrap(), "start").unwrap();
     }
-    let mut supervisor = Supervisor {
-        lines,
-        trace: std::env::var_os("HYPER_LIVENESS_TRACE").is_some(),
-        latest: BTreeMap::new(),
-        stated: BTreeMap::new(),
-        suspicions: Vec::new(),
-    };
+    Group {
+        _directory: directory,
+        members,
+        supervisor: Supervisor {
+            lines,
+            trace: std::env::var_os("HYPER_LIVENESS_TRACE").is_some(),
+            latest: BTreeMap::new(),
+            stated: BTreeMap::new(),
+            suspicions: Vec::new(),
+            heard: Vec::new(),
+            configured_since: BTreeMap::new(),
+        },
+        wakes,
+    }
+}
+
+#[test]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "real processes on the host's clock, threads and environment (CLAUDE.md §1a, end to end)"
+)]
+fn a_stalled_disk_and_a_killed_node_are_suspected_and_no_live_one_is() {
+    if std::env::var("HYPER_LIVENESS_NODE").is_ok() {
+        return;
+    }
+    let Group {
+        _directory,
+        mut members,
+        mut supervisor,
+        wakes,
+    } = start(NODES);
     let clock = Clock::new().unwrap();
 
     // Every pair configured.
@@ -717,4 +792,79 @@ fn a_stalled_disk_and_a_killed_node_are_suspected_and_no_live_one_is() {
         "{suspicions} suspicions of live members refute the {allowance} the configured detectors \
          allow"
     );
+}
+
+/// Members of the group whose victim dies young: the fewest that elect without one of them, so each
+/// survivor has one live link, whose configuration lengthens its interval and with it the rate its
+/// node's pool is fed at (`docs/timing.md` §3, item 10).
+const YOUNG_NODES: u64 = 3;
+
+/// A member killed in its links' first heartbeats, once it has heard every peer and sent to each,
+/// before any pair could have its own evidence (a configuration needs an Allan level of seven
+/// windows, 56 heartbeats at the least): every survivor suspects it, within the bound it states
+/// where it states one, and no later than the first poll once both its freshness point has passed
+/// and a pair of its own has configured, the evidence the young link is judged by
+/// (`docs/timing.md` §2.8, "Judged before its own evidence").
+#[test]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "real processes on the host's clock, threads and environment (CLAUDE.md §1a, end to end)"
+)]
+fn a_node_killed_in_its_first_heartbeats_is_suspected_once_a_sibling_has_its_evidence() {
+    if std::env::var("HYPER_LIVENESS_NODE").is_ok() {
+        return;
+    }
+    let victim = YOUNG_NODES;
+    let Group {
+        _directory,
+        mut members,
+        mut supervisor,
+        ..
+    } = start(YOUNG_NODES);
+    let clock = Clock::new().unwrap();
+    supervisor.until(|s| s.heard.contains(&victim));
+    let mut child = members.0.remove(&victim).unwrap();
+    let killed_at = clock.now_ns();
+    child.kill().unwrap();
+    child.wait().unwrap();
+    let survivors: Vec<u64> = (1..YOUNG_NODES).collect();
+    supervisor.until(|s| {
+        survivors
+            .iter()
+            .all(|m| s.holds_suspected(*m, victim, killed_at))
+    });
+    drop(members);
+    let mut noticed = Vec::new();
+    for member in &survivors {
+        let found = supervisor.suspicion(*member, victim);
+        if found.due > 0 && found.detection > 0 {
+            assert!(
+                found.at - found.due <= found.detection,
+                "member {member} suspected the young victim {} ns after its last heartbeat was \
+                 due, past its stated bound of {} ns",
+                found.at - found.due,
+                found.detection
+            );
+        }
+        let sibling = survivors.iter().copied().find(|m| m != member).unwrap();
+        let evidence = supervisor
+            .configured_since
+            .get(&(*member, sibling))
+            .copied()
+            .unwrap_or(u64::MAX);
+        assert!(
+            found.noticed <= (found.at + found.late).max(evidence),
+            "member {member} noticed the young victim's death {:?} after the kill: its freshness \
+             point {:?} after it, its wakes up to {:?} late, its sibling configured {:?} after it",
+            Duration::from_nanos(found.noticed.saturating_sub(killed_at)),
+            Duration::from_nanos(found.at.saturating_sub(killed_at)),
+            Duration::from_nanos(found.late),
+            Duration::from_nanos(evidence.saturating_sub(killed_at)),
+        );
+        noticed.push((
+            member,
+            Duration::from_nanos(found.noticed.saturating_sub(killed_at)),
+        ));
+    }
+    println!("a node killed in its first heartbeats was noticed dead after {noticed:?}");
 }

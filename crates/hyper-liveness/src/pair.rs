@@ -31,8 +31,8 @@ pub(crate) struct Context<'a> {
     /// The node's failure evidence, whose MTBF is read only where a configuration needs it: a
     /// float division and a conversion, at every heartbeat it was read for none.
     pub(crate) exposure: &'a Exposure,
-    /// What the node's pool of its links measured, while this pair has no configuration of its own
-    /// (`docs/timing.md` §3, item 10).
+    /// What the node measured of its links (`Liveness::evidence`), while this pair has no
+    /// configuration of its own (`docs/timing.md` §3, item 10).
     pub(crate) pool: Option<LinkBehaviour>,
 }
 
@@ -47,13 +47,31 @@ pub(crate) struct Taken {
     pub(crate) error: Option<(u64, i64)>,
     /// Whether the pair judges by a configuration of its own.
     pub(crate) own: bool,
+    /// Whether it configured the pair's detector anew.
+    pub(crate) configured: bool,
 }
 
-/// The behaviour of the node's pool, for a link whose prediction errors are over a window of
-/// `window` heartbeats: the pool's deviation scaled by `√(1 + 1/n)`. For independent delays the
-/// prediction errors' variance at a window of `n` is `V(D)(1 + 1/n)`, and the pool's own, over the
-/// links' errors, is at least `V(D)`: so the scaled deviation bounds the link's from above, which
-/// is the side Cantelli's inequality may err on (a larger variance only loosens the bound).
+/// The wider of two behaviours, each measure the larger: an upper bound on both. Theorem 7's `β`
+/// grows with the loss and with the variance at every margin (each factor `(V + p·x²)/(V + x²)`
+/// has derivative `x²/(V + x²)` in `p` and `x²(1 − p)/(V + x²)²` in `V`, neither negative), so a
+/// margin configured from the wider promises no less than one from either would.
+pub(crate) fn wider(a: Option<LinkBehaviour>, b: Option<LinkBehaviour>) -> Option<LinkBehaviour> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(LinkBehaviour {
+            loss: a.loss.max(b.loss),
+            mean_delay: a.mean_delay.max(b.mean_delay),
+            delay_deviation: a.delay_deviation.max(b.delay_deviation),
+        }),
+        (one, None) | (None, one) => one,
+    }
+}
+
+/// The behaviour the node measured of its links, for a link whose prediction errors are over a
+/// window of `window` heartbeats: the deviation scaled by `√(1 + 1/n)`. For independent delays the
+/// prediction errors' variance at a window of `n` is `V(D)(1 + 1/n)`, and the variance of the
+/// errors the node measured, the pool's or a configured link's, is at least `V(D)`: so the scaled
+/// deviation bounds the link's from above, which is the side Cantelli's inequality may err on (a
+/// larger variance only loosens the bound).
 pub(crate) fn scaled(pool: &LinkBehaviour, window: u64) -> LinkBehaviour {
     // u64 → f64 rounds only past 2⁵³, far past any window (`hyper_timing::WINDOW_LIMIT`).
     let n = window.max(1) as f64;
@@ -141,8 +159,9 @@ struct Received {
     /// whatever the configuration's best, so the link is never asked back to an interval its
     /// estimator showed it cannot measure.
     evidence_ns: u64,
-    /// While the pair has no configuration of its own: the pool's behaviour its margin was
-    /// imposed from, scaled to the link's window, and the heartbeats taken then.
+    /// While the pair has no configuration of its own: the behaviour its margin was imposed from,
+    /// the node's evidence scaled to the link's window and widened by the link's own, and the
+    /// heartbeats taken then.
     pooled: Option<(LinkBehaviour, u64)>,
 }
 
@@ -195,8 +214,8 @@ impl Pair {
         self.unheard.since_ns.get_or_insert(now_ns);
     }
 
-    /// Whether the pair has heard its peer and judges it by no margin yet: the pool's is imposed
-    /// at the next poll, so a link whose peer stopped before its own evidence is judged all the
+    /// Whether the pair has heard its peer and judges it by no margin yet: the node's evidence's is
+    /// imposed at the next poll, so a link whose peer stopped before its own evidence is judged all the
     /// same (`docs/timing.md` §3, item 10).
     pub(crate) fn wants_pool_margin(&self) -> bool {
         self.received.configuration.is_none()
@@ -204,7 +223,7 @@ impl Pair {
             && self.received.link.is_some()
     }
 
-    /// Whether the pair waits for the pool's margin for a peer it has not heard from.
+    /// Whether the pair waits for the node's evidence's margin for a peer it has not heard from.
     pub(crate) fn wants_unheard_margin(&self) -> bool {
         self.received.link.is_none() && self.unheard.until_ns.is_none()
     }
@@ -212,8 +231,8 @@ impl Pair {
     /// The freshness point of a peer from which no heartbeat has come: one interval past the first
     /// poll with the pair attached, at this node's own floor (the interval the peer starts at
     /// is its floor, and the pool's premise is that the stalls are the hosts', so a host's floor is
-    /// the measure of its peers' before they say theirs), plus the pool's margin at it for a window
-    /// of one.
+    /// the measure of its peers' before they say theirs), plus the margin the node's evidence gives
+    /// at it for a window of one.
     pub(crate) fn judge_unheard(
         &mut self,
         pool: &LinkBehaviour,
@@ -254,6 +273,11 @@ impl Pair {
             groups: self.groups,
             configured: self.received.configuration.is_some(),
             judged: !matches!(self.trust(), Trust::Unconfigured),
+            interval: self
+                .received
+                .link
+                .as_ref()
+                .map(|link| link.estimator.next_interval()),
             freshness: self.received.link.as_ref().and_then(|link| {
                 Some(
                     link.estimator
@@ -473,7 +497,7 @@ impl Pair {
         let link = self.received.link.as_ref()?;
         let margin = link.estimator.margin()?;
         let behaviour = match self.received.pooled {
-            // Judged by the pool's margin: the bound it promised, from the pool's behaviour.
+            // Judged by the node's evidence: the bound its margin promised, from that behaviour.
             Some((pooled, _)) if self.received.configuration.is_none() => pooled,
             _ => link.estimator.behaviour().ok().or(self
                 .received
@@ -585,7 +609,7 @@ impl Pair {
         let beta = self.beta_now();
         self.account(mapped, beta);
         if self.renewal_due(beta) {
-            self.configure(context, granularity);
+            taken.configured = self.configure(context, granularity);
         }
         if self.received.configuration.is_none()
             && let Some(pool) = context.pool
@@ -599,11 +623,12 @@ impl Pair {
         Ok(())
     }
 
-    /// While the pair has no configuration of its own, the margin the node's pool configures for
-    /// it, imposed on its estimator (`docs/timing.md` §3, item 10): the pool's behaviour scaled to
-    /// the link's window (`scaled`), at the link's interval, its costs and its floors, as its own
-    /// configuration would be. Renewed on the configuration's doubling schedule: at the first, and
-    /// once the heartbeats taken have doubled since.
+    /// While the pair has no configuration of its own, the margin the node's evidence configures
+    /// for it, imposed on its estimator (`docs/timing.md` §3, item 10): what the node measured of
+    /// its links (`Liveness::evidence`) scaled to the link's window (`scaled`), widened by what the
+    /// link's own prediction errors and losses show so far, at the link's interval, its costs and
+    /// its floors, as its own configuration would be. Renewed on the configuration's doubling
+    /// schedule: at the first, and once the heartbeats taken have doubled since.
     pub(crate) fn pool_margin(
         &mut self,
         pool: &LinkBehaviour,
@@ -625,7 +650,17 @@ impl Pair {
         let Some(link) = self.received.link.as_mut() else {
             return;
         };
-        let behaviour = scaled(pool, link.estimator.estimates().window.length);
+        let own = link.estimator.estimates();
+        // Its own errors are at its own window already, and its loss is Jeffreys' over what it
+        // was sent: before its `τ_int` is measured, the unseen term has no count to stand on.
+        let shown = own.delay_deviation.map(|delay_deviation| LinkBehaviour {
+            loss: own.loss,
+            mean_delay: own.mean_delay.unwrap_or(Duration::ZERO),
+            delay_deviation,
+        });
+        let Some(behaviour) = wider(Some(scaled(pool, own.window.length)), shown) else {
+            return;
+        };
         let floors = Floors {
             granularity,
             sender: Duration::from_nanos(floor_ns).max(granularity),
@@ -719,11 +754,11 @@ impl Pair {
     /// product of a many-heartbeat margin promise a mistake rate that six runs in ten broke under a
     /// one-CPU throttle, whose stalls the history had not yet held (`docs/benchmarks.md`,
     /// "hyper-liveness"). hyper-swim judges each probe on its own for the same reason (§2.7). A
-    /// refusal leaves the detector in force (`LinkEstimator::configure`).
-    fn configure(&mut self, context: &Context<'_>, granularity: Duration) {
+    /// refusal leaves the detector in force (`LinkEstimator::configure`). Whether it configured.
+    fn configure(&mut self, context: &Context<'_>, granularity: Duration) -> bool {
         let floor_ns = self.received.floor_ns;
         let Some(link) = self.received.link.as_mut() else {
-            return;
+            return false;
         };
         // The evidence is asked for only where it is wanting: refused for want of `τ_int`, or no
         // cost to configure by yet. The estimator says what it wants before any cost is read, as
@@ -735,9 +770,9 @@ impl Pair {
                 if let Some(next) = link.estimator.independent_interval() {
                     self.received.evidence_ns = self.received.evidence_ns.max(nanos(next));
                 }
-                return;
+                return false;
             }
-            Err(_) => return,
+            Err(_) => return false,
             Ok(_) => {}
         }
         // Measured, so no interval is wanting for evidence (`independent_interval` says none).
@@ -746,18 +781,20 @@ impl Pair {
             .zip(context.exposure.mtbf())
             .map(|(election, mtbf)| Costs { election, mtbf })
         else {
-            return;
+            return false;
         };
         let floors = Floors {
             granularity,
             sender: Duration::from_nanos(floor_ns).max(granularity),
             correlation: Duration::MAX,
         };
-        if let Ok(configured) = link.estimator.configure(&costs, &floors) {
-            self.received.configuration = Some(configured);
-            self.report.configurations = self.report.configurations.saturating_add(1);
-            let beta = self.beta_now().unwrap_or(1.0);
-            self.received.renewed = Some((self.report.taken, beta));
-        }
+        let Ok(configured) = link.estimator.configure(&costs, &floors) else {
+            return false;
+        };
+        self.received.configuration = Some(configured);
+        self.report.configurations = self.report.configurations.saturating_add(1);
+        let beta = self.beta_now().unwrap_or(1.0);
+        self.received.renewed = Some((self.report.taken, beta));
+        true
     }
 }

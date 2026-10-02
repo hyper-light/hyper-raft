@@ -716,8 +716,14 @@ impl Node {
                         .max()
                         .unwrap_or(0),
                     taken: pairs.clone().map(|pair| pair.taken).sum(),
-                    unjudged: u64::try_from(pairs.filter(|pair| !pair.judged).count())
+                    unjudged: u64::try_from(pairs.clone().filter(|pair| !pair.judged).count())
                         .unwrap_or(u64::MAX),
+                    unjudged_interval_ns: pairs
+                        .filter(|pair| !pair.judged)
+                        .filter_map(|pair| pair.interval)
+                        .map(nanos)
+                        .max()
+                        .unwrap_or(0),
                     restarts: self.restarts,
                     suspected: self
                         .attached

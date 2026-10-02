@@ -34,8 +34,9 @@
 //! correlated at its interval for its estimator to measure its evidence asks the interval its Allan
 //! levels say they would be independent at (`LinkEstimator::independent_interval`), and a sender
 //! follows its floor up, not down, so the receiver's evidence is not started again at each move of
-//! a mean. Until a link configures, it is judged by the margin its node's pool of links configures
-//! for it, and a peer from which nothing has come is judged from the attach. A receiver expects
+//! a mean. Until a link configures, it is judged by the margin what its node measured of its links
+//! configures for it: the wider of its pool's measure and the widest of its configured links', and
+//! of what the link's own errors show; a peer from which nothing has come is judged from the attach. A receiver expects
 //! the interval it asked (`LinkEstimator::expect_interval`), and a peer's new run is reported
 //! ([`Change::Restarted`]).
 //!
@@ -164,7 +165,7 @@ pub struct Suspicion {
     /// by the echoed round trips of the window's heartbeats (the `bound` module); `None` while a
     /// heartbeat in the window carried no echo. For a peer from which no heartbeat came (`last` is
     /// `None`), the time from the node's first poll with the pair attached, an interval and the
-    /// pool's margin (`docs/timing.md` §3, item 10).
+    /// margin of the node's evidence (`docs/timing.md` §3, item 10).
     pub detection: Option<Duration>,
     /// The detector in force when it suspected, if configured (the pair's configuration's
     /// `current`, [`Liveness::configuration`]).
@@ -231,8 +232,12 @@ pub struct PairReport {
     /// Whether a configured detector of the pair's own judges the peer.
     pub configured: bool,
     /// Whether a margin judges the peer: its own configuration's, or, while it has none, the one
-    /// its node's pool of links configures for it (`docs/timing.md` §3, item 10).
+    /// what its node measured of its links configures for it (`docs/timing.md` §3, item 10).
     pub judged: bool,
+    /// The interval the peer's heartbeats come at, or a longer one this node asked it to move to,
+    /// once one has come, whether or not a margin judges: how long the evidence a pair is judged
+    /// from may go without moving, which an owner waiting on that evidence must wait past.
+    pub interval: Option<Duration>,
     /// The interval the peer's heartbeats come at, or a longer one this node asked it to move to,
     /// and the margin in force, `η + α`: how long past a heartbeat's expected arrival less its
     /// delay the peer is trusted, the election law's base (`docs/timing.md` §2.3); `None` while no
@@ -243,10 +248,10 @@ pub struct PairReport {
     /// Suspicions of the peer.
     pub suspicions: u64,
     /// Theorem 7's allowance for them: `Σβ` over every freshness point judged while a margin was in
-    /// force, each `β` at that margin from the estimates as they stood (the pool's, scaled to the
-    /// link's window, while the margin was the pool's), the expected number of suspicions were the
-    /// peer alive throughout (`β` bounds the chance of a mistake at each, `η/β` the mistake
-    /// recurrence).
+    /// force, each `β` at that margin from the estimates as they stood (the node's evidence, scaled
+    /// to the link's window and widened by its own, while the margin was the evidence's), the
+    /// expected number of suspicions were the peer alive throughout (`β` bounds the chance of a
+    /// mistake at each, `η/β` the mistake recurrence).
     pub allowance: f64,
 }
 
@@ -300,6 +305,10 @@ pub struct Liveness {
     /// again, and a pair judged by its margin would then judge nothing, a peer it had suspected
     /// before it was heard never trusted again on its heartbeats.
     pool_measured: Option<LinkBehaviour>,
+    /// The widest behaviour the node's links configured their own detectors from, each measure
+    /// the largest over the pairs that have a configuration: kept at each configuration made and
+    /// at each pair let go, so it is read without walking the pairs.
+    configured: Option<LinkBehaviour>,
 }
 
 /// The margins a pair that waits for one takes from its node's pool: its own link's, or, for a
@@ -359,7 +368,30 @@ impl Liveness {
             pool: None,
             pool_seq: 0,
             pool_measured: None,
+            configured: None,
         })
+    }
+
+    /// What the node has measured of its links, which judges a link with no configuration of its
+    /// own (`docs/timing.md` §2.8, "Judged before its own evidence"): the wider of its pool's
+    /// measure and the widest configured link's (`pair::wider`). A configured link measured its own
+    /// behaviour at one interval with its `τ_int` within Madras and Sokal's window, the evidence its
+    /// estimator refuses to configure without; the pool, fed by the same links' errors, mixes
+    /// intervals and links, and once the links configure it is fed at the intervals they asked,
+    /// seconds apart on a coarse timer. Under the pool's premise, that the stalls are the hosts'
+    /// (§2.6), the widest configured link bounds what the pool would measure of them: the pool's
+    /// loss and the variance of its zero-mean errors are weighted means of the links', no more than
+    /// the largest of each.
+    fn evidence(&self) -> Option<LinkBehaviour> {
+        pair::wider(self.pool_measured, self.configured)
+    }
+
+    /// The widest behaviour the pairs' configurations were made from.
+    fn widest_configured(&self) -> Option<LinkBehaviour> {
+        self.pairs
+            .values()
+            .filter_map(|pair| pair.configuration().map(|configured| configured.link))
+            .fold(None, |widest, link| pair::wider(widest, Some(link)))
     }
 
     /// Feeds the pool a link's prediction error, `due` heartbeats after the link's previous one.
@@ -407,6 +439,8 @@ impl Liveness {
                 self.exposure.on_failure();
             }
             self.pairs.remove(&peer);
+            // Its configuration may have been the widest.
+            self.configured = self.widest_configured();
             // Its wake may have been the earliest.
             self.next_wake = self.wake_after(self.last_poll_ns.unwrap_or(0));
         }
@@ -456,7 +490,7 @@ impl Liveness {
             return Err(Refusal::FromSelf);
         }
         let beat = Heartbeat::decode(message)?;
-        let (granularity, pool) = (self.wakes.granularity(), self.pool_measured);
+        let (granularity, pool) = (self.wakes.granularity(), self.evidence());
         let pair = self.pairs.get_mut(&from).ok_or(Refusal::UnknownPeer)?;
         let context = pair::Context {
             granularity,
@@ -479,8 +513,11 @@ impl Liveness {
         if taken.restarted {
             self.exposure.on_failure();
         }
+        if taken.configured {
+            self.configured = self.widest_configured();
+        }
         if let Some((due, error)) = taken.error
-            && (!taken.own || pool.is_none())
+            && (!taken.own || self.pool_measured.is_none())
         {
             self.feed_pool(due, error, Duration::from_nanos(beat.interval_ns));
         }
@@ -503,8 +540,8 @@ impl Liveness {
             durable_count: self.durable.count,
             durable_ns: self.durable.latest_ns,
         };
-        let pool = self.pool_measured;
-        // The MTBF only for a pair that waits for a margin from the pool, which a configured node
+        let pool = self.evidence();
+        // The MTBF only for a pair that waits for a margin from the node's evidence, which a configured node
         // has none of: read at every poll, it was a float division and a conversion a poll.
         let mut mtbf = None;
         // The wake to ask, gathered in the same walk: each pair is final once it has been judged

@@ -3996,6 +3996,97 @@ HYPER_DURABLE_LIVENESS_SEEDS=1000 cargo test --release -p hyper-durable --test l
 cargo test -p hyper-durable-e2e --test kill      # in Linux: docker run --cpus N rust:1.98.0 ...
 ```
 
+## A link younger than its evidence, judged by what its node measured (2026-10-02)
+
+`docs/timing.md` §2.8, "Judged before its own evidence", and §3 item 10: a link with no
+configuration of its own is judged by the widest of its node's pool and its configured links,
+widened by its own errors, where it was judged by the pool alone. Before is main at `0eaac7e`
+(hyper-liveness as at `4769074`).
+
+**The cost.** `cargo bench -p hyper-liveness --bench allocs` and `--bench cost`, main and this change
+built the same way and run alternately, three rounds each, Apple M5 Max, load average 43 (other
+sessions' builds). The bench's world configures every pair, so both send the same heartbeats
+(216, 612 and 3,139); a heartbeat reads one more `Option` pair, and a configuration made walks the
+pairs once for the widest.
+
+| nodes | groups a pair | allocs, reallocs, faults | ns, main | ns, now | boot ns, main | boot ns, now |
+|---|---|---|---|---|---|---|
+| 2 | 1 | 0, 0, 0 | 104–112 | 109–118 | 235–252 | 222–275 |
+| 4 | 1 | 0, 0, 0 | 123–131 | 126–148 | 173–198 | 175–207 |
+| 8 | 1 | 0, 0, 0 | 166–172 | 170–173 | 211–253 | 219–234 |
+| 8 | 1,000 | 0, 0, 0 | 162–174 | 171–188 | 213–219 | 212–230 |
+
+Pair µs a node a second (`cost`): two peers 9.6–10.1 against 10.0–10.3 now (one main run at 31.1
+for 64 groups, an outlier of the load), eight peers 55.4–64.3 against 57.7–63.9; the per-group and
+SWIM columns moved as much between rounds. Zero allocations a heartbeat, kept.
+
+**The simulation** (`cargo test --release -p hyper-liveness --test sim`,
+`a_peer_dead_before_its_links_have_evidence_is_suspected_once_a_sibling_has_its_own`): three nodes,
+the victim killed in its links' first heartbeats, seeds 0–31 of four worlds; the time from the kill
+to each survivor's suspicion, median / 90th percentile / most over 64 survivors. Under the pool
+alone the test's bound (no later than the first poll once the live link configured) failed for 33
+survivors of 256.
+
+| world | the pool alone | the node's evidence |
+|---|---|---|
+| LAN | 33 / 349 / 576 ms | 23 / 39 / 86 ms |
+| hosts frozen up to 50 ms | 6 / 63 / 831 ms | 5 / 32 / 207 ms |
+| flushes stalled up to 60 ms | 89 / 1,199 / 13,829 ms | 107 / 1,141 / 3,919 ms |
+| Windows' timer and flush | 578 / 4,468 / 33,828 ms | 578 / 2,080 / 5,867 ms |
+
+Without the link's own errors in the widening the stalling world's row was 89 / 997 / 3,919 ms, the
+others unchanged; the prototype's rule, the pool preferred to the configured links
+(`pool.or(configured)`) and no widening by the link's own, gave the same rows as that on these
+seeds: the link's own errors cost the stalling world's slowest survivors 0.1–0.2 s, the price of
+never judging a link narrower than it has shown itself to be.
+
+**The shell** (`HYPER_DURABLE_LIVENESS_SEEDS=1000 cargo test --release -p hyper-durable --test
+liveness`, `a_leader_killed_before_its_links_have_evidence_is_replaced`): the leader killed as soon as
+it is elected, replaced within 855 ms of the kill at the most over 1,000 seeds (707 ms over the 64 of
+the gates), against 243.8 s (47.7 s) under the pool alone.
+
+**The real processes** (`tests/processes.rs`,
+`a_node_killed_in_its_first_heartbeats_is_suspected_once_a_sibling_has_its_evidence`, three
+members, SIGKILL once the victim has heard every peer and sent to each). Main failed its bound in 2
+runs of 3 on this machine (a survivor noticing 200 ms after its live link configured). Now, the time
+from the kill to each survivor's suspicion:
+
+| host | runs | passed | noticed after the kill |
+|---|---|---|---|
+| macOS, load 31–61 | 7 | 7 | 1.4–15.2 s |
+| macos-15 (CI) | 5 | 5 | 0.31–2.81 s |
+| ubuntu-24.04 (CI) | 5 | 5 | 0.06–21.9 s |
+| ubuntu-24.04-arm (CI) | 5 | 5 | 0.04–0.53 s |
+| windows-2025 (CI) | 5 | 5 | 3.2–7.8 s |
+| windows-11-arm (CI) | 5 | 5 | 2.4–7.6 s |
+
+**hyper-durable-e2e**, `cargo test -p hyper-durable-e2e --test kill -- stall` (the stalled leader
+and the stalled follower, each a member whose links may be young when its disk stops) and the whole
+binary; main from `diag-young-base`, this change from `diag-young-links`, the same hour, on GitHub's
+runners, and on this machine at load 26–61:
+
+| host | stall, main | stall, now | whole, main | whole, now |
+|---|---|---|---|---|
+| macOS (this machine) | 8.2–112.0 s (8 runs; 3 past 25 s) | 5.9–15.3 s (8) | – | 41.5 s (1) |
+| macos-15 | – | 0.68–3.05 s (8) | – | 15.1–21.8 s (3) |
+| ubuntu-24.04 | 0.70–56.4 s (6) | 0.95–5.48 s (8) | 15.0–25.7 s (2) | 27.1–59.7 s (3) |
+| ubuntu-24.04-arm | 1.1–6.3 s (6) | 0.27–0.46 s (8) | 23.0–25.7 s (2) | 18.4–23.5 s (3) |
+| windows-2025 | 6.8–89.3 s (6) | 4.3–8.2 s (8) | 56.9 s, and one failed (2) | 37.4–49.7 s (3) |
+| windows-11-arm | 7.8–76.6 s (6) | 9.5–18.8 s (8) | 69.2–120.9 s (2) | 60.0–71.8 s (3) |
+
+Every run of this change passed. Its quiet period now covers an unjudged pair's interval
+(`PairReport::interval`), so a wait no longer gives up between the heartbeats of a young link moved
+to a long interval.
+
+```sh
+cargo bench -p hyper-liveness --bench allocs     # and the same binary built from main, alternately
+cargo bench -p hyper-liveness --bench cost
+cargo test --release -p hyper-liveness --test sim -- --nocapture a_peer_dead
+cargo test -p hyper-liveness --test processes -- --nocapture
+HYPER_DURABLE_LIVENESS_SEEDS=1000 cargo test --release -p hyper-durable --test liveness -- --nocapture
+cargo test -p hyper-durable-e2e --test kill -- stall
+```
+
 ## Simulation harnesses as they are (2026-10-02)
 
 The baseline `hyper-sim` and `hyper-check` are measured against when the harnesses move onto them

@@ -13,7 +13,9 @@
 //! every other node judges the leader's node by a configured detector, the leader's node killed,
 //! every survivor's stream suspects it within the bound the suspicion states, and the survivors
 //! elect and commit; started again, a new run of its stream, every survivor's stream reports the
-//! restart to its core and the node catches up. Every wait is on progress (`docs/sim.md` §4.2).
+//! restart to its core and the node catches up. A leader killed as soon as it is elected, before
+//! any node's link to it has evidence of its own, is suspected by every survivor, which elect and
+//! commit (`docs/timing.md` §3, item 10). Every wait is on progress (`docs/sim.md` §4.2).
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -411,15 +413,24 @@ impl World {
     }
 
     /// The quiet period (`docs/sim.md` §4.2): the longest any live node trusts a peer past its
-    /// heartbeat's expected arrival, the slowest election's span and rounds, and a round of the
-    /// network and a flush, by the nodes' own measurements; doubled, as a node acts on them only
-    /// at its next wake.
+    /// heartbeat's expected arrival, or, for a pair no margin judges yet, the interval its
+    /// evidence comes at, the slowest election's span and rounds, and a round of the network and a
+    /// flush, by the nodes' own measurements; doubled, as a node acts on them only at its next
+    /// wake.
     fn quiet(&self) -> u64 {
         let (mut freshness, mut election) = (0u64, 0u64);
         for node in self.nodes.iter().filter(|n| n.alive) {
             for peer in 1..=3u64 {
-                if let Some(trusted) = node.liveness.report(peer).and_then(|r| r.freshness) {
-                    freshness = freshness.max(trusted.as_nanos() as u64);
+                let Some(report) = node.liveness.report(peer) else {
+                    continue;
+                };
+                let waits = if report.judged {
+                    report.freshness
+                } else {
+                    report.interval
+                };
+                if let Some(waits) = waits {
+                    freshness = freshness.max(waits.as_nanos() as u64);
                 }
             }
             if let Some(t) = node.owner.get(node.handle).unwrap().core().raft.timing() {
@@ -542,5 +553,56 @@ fn the_shell_elects_sleeps_and_fails_over_on_the_liveness_stream() {
     println!(
         "idle: {} Raft messages, all after {} detectors' changes",
         idle.0, idle.1
+    );
+}
+
+/// Item 10 of `docs/timing.md` §3 in the shell: the leader's node killed as soon as the group has
+/// elected it, before any survivor's link to it has evidence of its own. Each survivor has one live
+/// link left, and the leader's link is judged by what its node measured of its links once that one
+/// has its evidence: every survivor suspects the dead leader, each suspicion within the bound it
+/// states, and the survivors elect and commit.
+#[test]
+fn a_leader_killed_before_its_links_have_evidence_is_replaced() {
+    let mut slowest = 0u64;
+    let first = support::count("HYPER_DURABLE_LIVENESS_SEED", 0);
+    for seed in first..first + support::count("HYPER_DURABLE_LIVENESS_SEEDS", 64) {
+        let mut world = World::new(seed);
+        world.run_until(|w| w.leader().is_some());
+        let leader = world.leader().unwrap();
+        assert!(
+            world
+                .nodes
+                .iter()
+                .filter(|n| n.id != leader)
+                .all(|n| n.liveness.report(leader).is_some_and(|r| !r.configured)),
+            "seed {seed}: a link to the leader had its evidence when the group elected"
+        );
+        let killed_at = world.now;
+        world.nodes[(leader - 1) as usize].alive = false;
+        world.suspicions.clear();
+        world.run_until(|w| {
+            w.leader().is_some_and(|l| l != leader)
+                && w.nodes
+                    .iter()
+                    .filter(|n| n.alive)
+                    .all(|n| n.liveness.trust(leader) == Some(hyper_timing::Trust::Suspected))
+        });
+        for (_, suspicion) in world.suspicions.iter().filter(|(_, s)| s.peer == leader) {
+            if let (Some(bound), Some(last)) = (suspicion.detection, suspicion.last) {
+                assert!(
+                    suspicion.at_ns <= last.due_ns + bound.as_nanos() as u64 + LATE_NS,
+                    "seed {seed}: suspected at {} past the bound {bound:?} from {}",
+                    suspicion.at_ns,
+                    last.due_ns
+                );
+            }
+        }
+        slowest = slowest.max(world.now - killed_at);
+        assert!(world.propose(b"after"));
+        world.run_until(|w| w.applied_everywhere(b"after"));
+    }
+    println!(
+        "a leader killed young: replaced within {} ms of the kill at the most",
+        slowest / 1_000_000
     );
 }

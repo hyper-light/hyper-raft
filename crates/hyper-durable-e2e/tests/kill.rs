@@ -39,6 +39,12 @@ use std::process::{Child, Command, ExitCode, Stdio};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, sync_channel};
 use std::time::{Duration, Instant};
 
+/// What a wait last saw of each member's progress, and until when it waits without seeing more.
+struct Watch {
+    seen: BTreeMap<u64, (u64, u64, u64, u64)>,
+    until: Instant,
+}
+
 use hyper_durable_e2e::control::{self, Order, Point, Report};
 use hyper_durable_e2e::node::{ELECTION_TICKS, HEARTBEAT_TICKS};
 use hyper_raft::proto::ConfChangeType;
@@ -55,11 +61,6 @@ const ANSWER_TICKS: u32 = 2 * ELECTION_TICKS + BROADCAST_TICKS;
 /// The ticks one election takes at most: the longest randomized timeout and its two vote rounds
 /// (pre-vote and vote).
 const ELECTION_ROUND_TICKS: u32 = 2 * ELECTION_TICKS + 2 * BROADCAST_TICKS;
-/// The elections a wait allows for: a killed leader's, a restarted member's term and the split
-/// votes behind them. Each election fails to elect with a split vote at most with the probability
-/// Ongaro's §9.2 bounds below one half for three voters at the timeout's range; four rounds make
-/// a failure of all one in sixteen at worst, and the scenario's own retries cover the rest.
-const ELECTIONS: u32 = 4;
 /// The share of a time's distribution its measured bound covers, and the confidence: the 95/95
 /// one-sided tolerance limit (Wilks 1941), hyper-raft-e2e's.
 const COVERAGE: f64 = 0.95;
@@ -290,7 +291,7 @@ impl Cluster {
         self.next_id += 1;
         let ask = self.next_id;
         control::put_order(&mut self.buffer, ask, &Order::Report);
-        let body = self.exchange(id, ask, self.ticks(ANSWER_TICKS))?;
+        let body = self.exchange_resent(id, ask)?;
         control::read_report(&body, hyper_raft::MAX_MEMBERS).map(|(_, report)| report)
     }
 
@@ -302,22 +303,88 @@ impl Cluster {
             let ask = self.next_id;
             wire::put_control(&mut self.buffer, ask, &Control::Peers(peers.clone()));
             assert!(
-                self.exchange(id, ask, self.ticks(ANSWER_TICKS)).is_some(),
+                self.exchange_resent(id, ask).is_some(),
                 "{}: member {id} was not told its peers",
                 self.name
             );
         }
     }
 
-    /// The budget of a wait that may span elections.
-    fn elections(&self) -> Duration {
-        self.ticks(ELECTION_ROUND_TICKS * ELECTIONS + ANSWER_TICKS)
+    /// How long the group may go with no member's term, commit, applied index or last index
+    /// moving before a wait gives up: one election round and an answer, from the members' own
+    /// settings. A live group elects or starts a new term within a round (Raft §5.2, under its
+    /// randomized timeout), so a round in which nothing moves is a group that is stuck, not one
+    /// that drew a split vote. A wait has no count of elections: it goes on while the group moves.
+    fn quiet(&self) -> Duration {
+        self.ticks(ELECTION_ROUND_TICKS + ANSWER_TICKS)
+    }
+
+    /// A fresh watch over the group's progress.
+    fn watch(&self) -> Watch {
+        Watch {
+            seen: BTreeMap::new(),
+            until: Instant::now() + self.quiet(),
+        }
+    }
+
+    /// Whether the group is still moving: asks every member up for its report, and extends the
+    /// watch by a quiet period whenever any member's term, commit, applied index or last index
+    /// has moved since it last looked.
+    fn moving(&mut self, watch: &mut Watch) -> bool {
+        let mut moved = false;
+        for id in self.up() {
+            if let Some(report) = self.report(id) {
+                let at = (
+                    report.status.term,
+                    report.status.commit,
+                    report.status.applied,
+                    report.status.last_index,
+                );
+                if watch.seen.insert(id, at) != Some(at) {
+                    moved = true;
+                }
+            }
+        }
+        if moved {
+            watch.until = Instant::now() + self.quiet();
+        }
+        Instant::now() < watch.until
+    }
+
+    /// A line `id` prints that starts with `prefix`, waited for while the group moves.
+    fn line_while_moving(&mut self, id: u64, prefix: &str) -> Option<String> {
+        let mut watch = self.watch();
+        loop {
+            let quiet = self.quiet();
+            if let Some(line) = self.line(id, prefix, quiet) {
+                return Some(line);
+            }
+            if !self.moving(&mut watch) {
+                return None;
+            }
+        }
+    }
+
+    /// Sends what is in the buffer to `id` until it answers `ask`: an instruction is an
+    /// idempotent datagram, which a loaded runner may drop or deliver late, so it is sent again
+    /// each answer's time, for as long as a quiet period.
+    fn exchange_resent(&mut self, id: u64, ask: u64) -> Option<Vec<u8>> {
+        let until = Instant::now() + self.quiet();
+        loop {
+            let answer = self.ticks(ANSWER_TICKS);
+            if let Some(body) = self.exchange(id, ask, answer) {
+                return Some(body);
+            }
+            if Instant::now() >= until {
+                return None;
+            }
+        }
     }
 
     /// The member that leads, once one does, within the elections' budget.
     fn leader(&mut self) -> Option<u64> {
-        let deadline = Instant::now() + self.elections();
-        while Instant::now() < deadline {
+        let mut watch = self.watch();
+        while self.moving(&mut watch) {
             for id in self.up() {
                 if self.report(id).is_some_and(|r| r.status.leads) {
                     return Some(id);
@@ -330,8 +397,8 @@ impl Cluster {
     /// Writes `key` = `value` through the leader until a member answers it, within the
     /// elections' budget; the index it was applied at.
     fn put(&mut self, key: &[u8], value: &[u8]) -> Option<u64> {
-        let deadline = Instant::now() + self.elections();
-        while Instant::now() < deadline {
+        let mut watch = self.watch();
+        while self.moving(&mut watch) {
             let Some(leader) = self.leader() else {
                 continue;
             };
@@ -345,8 +412,8 @@ impl Cluster {
 
     /// Reads `key` linearizably through the leader.
     fn get(&mut self, key: &[u8]) -> Option<Option<Vec<u8>>> {
-        let deadline = Instant::now() + self.elections();
-        while Instant::now() < deadline {
+        let mut watch = self.watch();
+        while self.moving(&mut watch) {
             let Some(leader) = self.leader() else {
                 continue;
             };
@@ -419,7 +486,7 @@ impl Cluster {
             );
         }
         let index = self.put(b"last", b"write").expect("a last write");
-        let deadline = Instant::now() + self.elections();
+        let mut watch = self.watch();
         loop {
             let reports: Vec<Report> = self
                 .up()
@@ -443,8 +510,8 @@ impl Cluster {
                 return;
             }
             assert!(
-                Instant::now() < deadline,
-                "{}: members never caught up to {index}: {reports:?}",
+                self.moving(&mut watch),
+                "{}: members stopped moving before they caught up to {index}: {reports:?}",
                 self.name
             );
         }
@@ -518,7 +585,7 @@ fn founder(tick: Duration) {
         cluster.order(founder, Order::Change(ConfChangeType::RemoveNode, peer)),
         Some(Outcome::Done)
     );
-    let stopped = cluster.line(founder, "stopped", cluster.elections());
+    let stopped = cluster.line_while_moving(founder, "stopped");
     assert_eq!(
         stopped.as_deref(),
         Some("stopped changed"),
@@ -528,7 +595,7 @@ fn founder(tick: Duration) {
     cluster.kill(peer);
     cluster.kill(founder);
     cluster.restart(founder, true);
-    let deadline = Instant::now() + cluster.elections();
+    let mut watch = cluster.watch();
     loop {
         if let Some(report) = cluster.report(founder)
             && report.status.leads
@@ -537,8 +604,8 @@ fn founder(tick: Duration) {
             break;
         }
         assert!(
-            Instant::now() < deadline,
-            "the founder never elected itself after the kill"
+            cluster.moving(&mut watch),
+            "the founder stopped moving without electing itself after the kill"
         );
     }
     cluster.members.retain(|m| m.id != peer);
@@ -561,11 +628,11 @@ fn founder_fenced(tick: Duration) {
         cluster.order(founder, Order::Change(ConfChangeType::RemoveNode, peer)),
         Some(Outcome::Done)
     );
-    let stopped = cluster.line(founder, "stopped", cluster.elections());
+    let stopped = cluster.line_while_moving(founder, "stopped");
     assert_eq!(stopped.as_deref(), Some("stopped fenced"));
     cluster.kill(founder);
     cluster.restart(founder, true);
-    let deadline = Instant::now() + cluster.elections();
+    let mut watch = cluster.watch();
     let mut asked = Instant::now();
     loop {
         if let Some(leader) = cluster.leader()
@@ -582,8 +649,8 @@ fn founder_fenced(tick: Duration) {
             asked = Instant::now();
         }
         assert!(
-            Instant::now() < deadline,
-            "the removal never finished after the kill"
+            cluster.moving(&mut watch),
+            "the group stopped moving without finishing the removal after the kill"
         );
     }
     cluster.kill(peer);
@@ -618,10 +685,10 @@ fn fence_host(tick: Duration, leader: bool) {
     );
     let _ = cluster.put(b"fence/upgrade", b"7");
     let acted = cluster
-        .line(host, "acted", cluster.elections())
+        .line_while_moving(host, "acted")
         .expect("the host never acted on the fence");
     let acted: u64 = acted.trim_start_matches("acted ").parse().unwrap();
-    let stopped = cluster.line(host, "stopped", cluster.elections());
+    let stopped = cluster.line_while_moving(host, "stopped");
     assert_eq!(stopped.as_deref(), Some("stopped acted"));
     cluster.kill(host);
     // Restarted on its log and told of no one: whatever it reaches, it reaches alone.

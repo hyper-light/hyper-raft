@@ -169,6 +169,22 @@ fn beta(loss: f64, variance: f64, eta: f64, alpha: f64) -> f64 {
     product
 }
 
+/// The normal distribution's two-sided 95 % point, `Φ⁻¹(0.975)`.
+pub const Z95: f64 = 1.959_963_984_540_054;
+
+/// The 95 % score interval of a Poisson count `k`, `k + z²/2 ∓ z√(k + z²/4)` (Brown, Cai and
+/// DasGupta, "Interval estimation in exponential families", Statistica Sinica 13, 2003), whose
+/// coverage is close to nominal down to small counts. A run refutes Theorem 7's allowance for its
+/// mistakes only when the interval's lower end passes it: the rule the replay, the trace analyser
+/// and the cluster tests of hyper-swim and hyper-liveness all apply (`docs/timing.md` §2.6).
+pub fn poisson95(k: u64) -> (f64, f64) {
+    // u64 → f64 rounds only past 2⁵³ mistakes.
+    let k = k as f64;
+    let centre = k + Z95 * Z95 / 2.0;
+    let half = Z95 * (k + Z95 * Z95 / 4.0).sqrt();
+    ((centre - half).max(0.0), centre + half)
+}
+
 /// The expected share of time a group cannot commit with detector `(eta, alpha)`, seconds.
 fn unavailability(link: &LinkBehaviour, costs: &Costs, eta: f64, alpha: f64) -> f64 {
     let variance = link.delay_deviation.as_secs_f64().powi(2);
@@ -424,6 +440,18 @@ mod tests {
                 "{voters} voters, {available} up, l/W {x}: simulated {simulated}, closed {closed}"
             );
         }
+    }
+
+    #[test]
+    fn the_poisson_interval_is_the_score_interval() {
+        // k = 0: the lower end is zero and the upper z², the score interval's own closed form.
+        let (low, high) = poisson95(0);
+        assert_eq!(low, 0.0);
+        assert!((high - Z95 * Z95).abs() < 1e-12);
+        // Around a large count it is close to the normal interval k ± z√k.
+        let (low, high) = poisson95(10_000);
+        assert!((low - (10_000.0 - Z95 * 100.0)).abs() < 2.0);
+        assert!((high - (10_000.0 + Z95 * 100.0)).abs() < 2.0);
     }
 
     #[test]

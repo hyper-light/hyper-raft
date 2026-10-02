@@ -35,7 +35,7 @@
 //! tells each so; a live one refutes in its answer.
 //!
 //! **The member's own lateness** is measured, not multiplied: every wake the member is late for is
-//! folded into its granularity `G` ([`Lateness`]), which floors the margins; the member's own
+//! folded into its granularity `G` ([`Wakes`]), which floors the margins; the member's own
 //! delay in reading acknowledgements is in the round trips it measures; and a probe is resolved
 //! when the member wakes, with every acknowledgement delivered by then, so a late member does not
 //! blame its peers for its own lateness.
@@ -50,8 +50,8 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use hyper_timing::{
-    Costs, Exposure, Floors, Lateness, LinkBehaviour, LinkEstimator, Refusal, Schedule,
-    detector_at, mistake_bound,
+    Costs, Exposure, Floors, LinkBehaviour, LinkEstimator, Refusal, Schedule, Wakes, detector_at,
+    mistake_bound,
 };
 
 use crate::HostId;
@@ -399,13 +399,10 @@ pub struct Detector {
     /// Probes relayed for others, counted down from the top of the nonce space so they never meet
     /// the member's own.
     relayed: u64,
-    lateness: Lateness,
-    /// The wake last asked of the caller, to measure how late it came.
-    asked: Option<u64>,
+    /// The wakes asked of the caller and how late each came: `G` and the latest lateness.
+    wakes: Wakes,
     /// The latest round trip measured, to anyone.
     last_rtt_ns: Option<u64>,
-    /// The latest this member has woken past a wake it asked, nanoseconds.
-    latest_wake: u64,
     /// The longest span `μ + α` any verdict of this member has had, nanoseconds.
     longest_span: u64,
     periods: Periods,
@@ -493,10 +490,8 @@ impl Detector {
             peer_coordinates: BTreeMap::new(),
             nonce: 0,
             relayed: u64::MAX,
-            lateness: Lateness::new(),
-            asked: None,
+            wakes: Wakes::new(),
             last_rtt_ns: None,
-            latest_wake: 0,
             longest_span: 0,
             periods: Periods::default(),
             exposure: history,
@@ -514,7 +509,7 @@ impl Detector {
     /// [`wake`](Detector::wake) and after every message the caller feeds in.
     pub fn poll(&mut self, now_ns: u64, requests: &mut Vec<PingReq>) -> Option<Ping> {
         requests.clear();
-        self.measure_wake(now_ns);
+        self.wakes.woke(now_ns);
         let ping = match self.stage(now_ns) {
             Stage::Wait => None,
             Stage::Indirect => {
@@ -527,7 +522,7 @@ impl Detector {
             }
             Stage::Over => self.next_period(now_ns),
         };
-        self.asked = self.wake();
+        self.wakes.ask(self.wake());
         ping
     }
 
@@ -543,18 +538,6 @@ impl Detector {
             return probe.due_ns();
         }
         probe.indirect_until.or_else(|| probe.due_ns())
-    }
-
-    /// A wake that came at or after the one asked is a timed wait's lateness, `G`'s sample.
-    fn measure_wake(&mut self, now_ns: u64) {
-        if let Some(at) = self.asked
-            && now_ns >= at
-        {
-            // A full fold keeps its mean: `G` stands as measured.
-            let _ = self.lateness.on_wait(at, now_ns);
-            self.latest_wake = self.latest_wake.max(now_ns.saturating_sub(at));
-            self.asked = None;
-        }
     }
 
     fn stage(&self, now_ns: u64) -> Stage {
@@ -826,10 +809,7 @@ impl Detector {
         let running = self
             .probe
             .map_or(0, |probe| now_ns.saturating_sub(probe.sent_ns));
-        let late = self
-            .asked
-            .map_or(0, |at| now_ns.saturating_sub(at))
-            .max(self.latest_wake);
+        let late = self.wakes.latest_ns(now_ns);
         let unanswered = self.longest_span.saturating_mul(3).saturating_add(late);
         let period = self.periods.longest.max(running).max(unanswered);
         Some(Duration::from_nanos(period.saturating_mul(periods)))
@@ -903,7 +883,7 @@ impl Detector {
 
     /// `G`, the mean lateness of this member's wakes, once measured and not zero.
     pub fn granularity(&self) -> Option<Duration> {
-        self.lateness.granularity().filter(|g| !g.is_zero())
+        self.wakes.granularity()
     }
 
     /// Records an indirect acknowledgement that `target` answered the probe `nonce` through a

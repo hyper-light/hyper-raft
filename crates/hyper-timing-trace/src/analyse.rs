@@ -19,14 +19,12 @@ use std::path::Path;
 use std::time::Duration;
 
 use hyper_timing::{
-    Costs, Event, Floors, LinkBehaviour, LinkEstimator, Refusal, Schedule, Window, configure,
-    election_span, mistake_bound,
+    Costs, Event, Floors, LinkBehaviour, LinkEstimator, Refusal, Schedule, Window, Z95, configure,
+    election_span, mistake_bound, poisson95,
 };
 
 use crate::{HEARTBEAT_BYTES, WAIT_BYTES};
 
-/// The normal distribution's two-sided 95 % point.
-const Z95: f64 = 1.959_963_984_540_054;
 /// The lags the startup table reaches: 4,096 heartbeats.
 const MAX_LAG: usize = 4_096;
 /// The tail-dependence search reaches lags up to a sixteenth of the run, so each lag still has
@@ -708,14 +706,6 @@ fn extremal(trace: &Table, threshold: f64) -> (f64, u64, usize) {
         gaps.first().copied().unwrap_or(1) + 1
     };
     (theta, run, n)
-}
-
-/// The 95 % score interval of a Poisson count `k`: `k + z²/2 ∓ z√(k + z²/4)`.
-fn poisson95(k: u64) -> (f64, f64) {
-    let k = k as f64;
-    let centre = k + Z95 * Z95 / 2.0;
-    let half = Z95 * (k + Z95 * Z95 / 4.0).sqrt();
-    ((centre - half).max(0.0), centre + half)
 }
 
 fn secs(d: Duration) -> String {

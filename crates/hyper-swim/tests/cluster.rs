@@ -53,15 +53,10 @@ const NODES: u64 = 4;
 const VICTIM: u64 = NODES;
 /// The path's datagram size: QUIC's minimum, which every path carries (RFC 9000 §14.1).
 const DATAGRAM: usize = 1_200;
-/// The normal distribution's two-sided 95 % point, for the Poisson score interval with which the
-/// trace analyser and `hyper-timing`'s replay refute Theorem 7 (Brown, Cai and DasGupta 2003;
-/// `docs/timing.md` §2.6).
-const Z95: f64 = 1.959_963_984_540_054;
-
-/// The 95 % score interval's lower end for a Poisson count `k`: `k + z²/2 − z√(k + z²/4)`.
+/// The 95 % score interval's lower end for a Poisson count `k` (`hyper_timing::poisson95`), with
+/// which the trace analyser and `hyper-timing`'s replay refute Theorem 7 (`docs/timing.md` §2.6).
 fn poisson_lower(k: u64) -> f64 {
-    let k = k as f64;
-    (k + Z95 * Z95 / 2.0 - Z95 * (k + Z95 * Z95 / 4.0).sqrt()).max(0.0)
+    hyper_timing::poisson95(k).0
 }
 
 fn secret_between(a: u64, b: u64) -> ExporterSecret {

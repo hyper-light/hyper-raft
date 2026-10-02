@@ -90,6 +90,72 @@ impl Lateness {
     }
 }
 
+/// The wakes a sans-io detector asks of its owner and how late each came: the fold of `G`
+/// ([`Lateness`]) and the latest lateness seen, which a detection bound adds (Lifeguard's local
+/// health, measured: `docs/timing.md` §2.7). The detector says which wake it asked
+/// ([`ask`](Self::ask)) each time it is polled and tells the fold when it was next polled
+/// ([`woke`](Self::woke)): a poll at or past the wake asked is that wait's end, and one before it is
+/// a poll for something else (a message), which measures nothing. hyper-swim's detector and
+/// hyper-liveness's streams both measure their owner's timer through it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Wakes {
+    lateness: Lateness,
+    asked: Option<u64>,
+    latest: u64,
+}
+
+impl Wakes {
+    /// No wake asked or measured.
+    pub const fn new() -> Self {
+        Self {
+            lateness: Lateness::new(),
+            asked: None,
+            latest: 0,
+        }
+    }
+
+    /// The detector was polled at `now_ns`: a wake asked for at or before it ended there, and its
+    /// lateness is folded.
+    pub fn woke(&mut self, now_ns: u64) {
+        if let Some(at) = self.asked
+            && now_ns >= at
+        {
+            // A full fold keeps its mean: `G` stands as measured.
+            let _ = self.lateness.on_wait(at, now_ns);
+            self.latest = self.latest.max(now_ns.saturating_sub(at));
+            self.asked = None;
+        }
+    }
+
+    /// The wake the detector now asks of its owner, if any.
+    pub fn ask(&mut self, at_ns: Option<u64>) {
+        self.asked = at_ns;
+    }
+
+    /// The wake asked and not yet measured.
+    pub const fn asked(&self) -> Option<u64> {
+        self.asked
+    }
+
+    /// `G`, the mean lateness of the wakes, once measured and not zero.
+    pub fn granularity(&self) -> Option<Duration> {
+        self.lateness.granularity().filter(|g| !g.is_zero())
+    }
+
+    /// The fold itself.
+    pub const fn lateness(&self) -> &Lateness {
+        &self.lateness
+    }
+
+    /// The latest any wake has come past the one asked, or the owner is past it at `now_ns`:
+    /// a stall the detector is in when it states a bound is in the bound.
+    pub fn latest_ns(&self, now_ns: u64) -> u64 {
+        self.asked
+            .map_or(0, |at| now_ns.saturating_sub(at))
+            .max(self.latest)
+    }
+}
+
 /// The sender's flush before each heartbeat: the mean time from waking to send, the write and the
 /// platform's full flush (`docs/timing.md` §2.1, §2.6).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -229,6 +295,30 @@ mod tests {
         };
         assert_eq!(mean.add(5), Err(FoldFull));
         assert_eq!(mean.count, u64::MAX);
+    }
+
+    #[test]
+    fn a_wake_is_measured_once_and_only_at_or_past_its_ask() {
+        let mut wakes = Wakes::new();
+        wakes.woke(5);
+        assert_eq!(wakes.granularity(), None, "nothing asked");
+        wakes.ask(Some(1_000));
+        wakes.woke(900);
+        assert_eq!(
+            wakes.asked(),
+            Some(1_000),
+            "a poll for a message measures nothing"
+        );
+        assert_eq!(wakes.latest_ns(1_500), 500, "late now counts");
+        wakes.woke(1_300);
+        assert_eq!(wakes.granularity(), Some(Duration::from_nanos(300)));
+        assert_eq!(wakes.asked(), None);
+        wakes.woke(9_000);
+        assert_eq!(wakes.lateness().waits(), 1, "one wake, one sample");
+        wakes.ask(Some(10_000));
+        wakes.woke(10_100);
+        assert_eq!(wakes.granularity(), Some(Duration::from_nanos(200)));
+        assert_eq!(wakes.latest_ns(0), 300);
     }
 
     #[test]

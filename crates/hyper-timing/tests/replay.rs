@@ -20,10 +20,6 @@ use std::time::Duration;
 
 use hyper_timing::{Costs, Event, Floors, LinkEstimator, Refusal, Schedule};
 
-/// The normal distribution's two-sided 95 % point, for the Poisson score interval the analyser
-/// uses (Brown, Cai and DasGupta 2003).
-const Z95: f64 = 1.959_963_984_540_054;
-
 /// A delay model: a body (a floor plus an exponential), occasional hiccups, and stalls. A stall
 /// starts at Poisson times, lasts a Pareto time capped at the run's longest, and delays every
 /// heartbeat scheduled inside it to its end, as a sender blocked on its scheduler or its disk does.
@@ -131,8 +127,7 @@ fn summary(arrivals: &[u64], interval_us: f64) -> (f64, f64, f64, f64) {
 
 /// The 95 % score interval's lower end for a Poisson count.
 fn poisson_lower(k: u64) -> f64 {
-    let k = k as f64;
-    (k + Z95 * Z95 / 2.0 - Z95 * (k + Z95 * Z95 / 4.0).sqrt()).max(0.0)
+    hyper_timing::poisson95(k).0
 }
 
 struct Replay {

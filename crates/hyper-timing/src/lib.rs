@@ -48,11 +48,11 @@ mod round;
 pub use round::{DeadlineExtender, ProgressWitness, RoundAnchors, RoundBudget, RoundWait, Verdict};
 mod qos;
 pub use qos::{
-    Costs, Detector, Floors, LinkBehaviour, Span, configure, detector_at, election_span,
-    mistake_bound,
+    Costs, Detector, Floors, LinkBehaviour, Span, Z95, configure, detector_at, election_span,
+    mistake_bound, poisson95,
 };
 mod folds;
-pub use folds::{Exposure, Flushes, FoldFull, Lateness};
+pub use folds::{Exposure, Flushes, FoldFull, Lateness, Wakes};
 mod link;
 pub use link::{
     Configuration, EstimateError, Estimates, Event, LinkEstimator, Refusal, Schedule, Trust,

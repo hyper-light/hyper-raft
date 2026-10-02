@@ -320,7 +320,9 @@ owner that wakes late does not blame its peer (`docs/timing.md` §2.4).
 - Linux: `SO_TIMESTAMPNS`, its `SCM_TIMESTAMPNS` read from each `recvmmsg` message's control
   buffer beside `UDP_GRO`'s (seven words, `CMSG_SPACE(4) + CMSG_SPACE(16)`). The stamp is
   `CLOCK_REALTIME`; it is carried to `CLOCK_MONOTONIC` by its age, both clocks read once a batch
-  after the receive, and held within the read and no earlier than the stamp before it (a socket's
+  after the receive, the realtime one first so that a preemption between the reads makes a stamp
+  late and never early (read the other way, a container throttled to two CPUs put a stamp before
+  its datagram was sent, one run in fifty), and held within the read and no earlier than the stamp before it (a socket's
   queue is first in, first out), so a step of the realtime clock moves one stamp within those
   limits. Linux turns stamping on through a static key flipped from a work queue
   (`net_enable_timestamp`), so the first datagrams after the option is set may be stamped when read,
@@ -346,6 +348,22 @@ owner that wakes late does not blame its peer (`docs/timing.md` §2.4).
 - On Linux a `sendmmsg` call carries 7.5 to 8 datagrams and a `recvmmsg` call 13 to 19.
 - Draining the socket before surfacing an event, rather than one batch a turn, cut a 64 KiB round
   from 762 to 648 µs and its datagrams from 108.6 to 97.0.
+
+## 4c. Node-pair liveness on the plane: `hyper-liveness` (timing step L-3, 2026-10-02)
+
+Built: `crates/hyper-liveness`, sans-io (`docs/timing.md` §2.8 holds the design, the API and the
+tests). One heartbeat stream per pair of nodes that share a consensus group, shared by every group
+they share; a pair that shares none sends nothing, and a group sends no heartbeat of its own. Each
+heartbeat is one plane message (first byte `KIND`, `'L'`, so an owner multiplexing the plane tells
+it apart; 75 bytes, 99 with its echo), sealed and checksummed by the plane, and leaves only once
+the sender's log made a write durable after the previous heartbeat was due. The plane carries it
+because QUIC's datagrams share the connection's congestion window (RFC 9221 §5): a heartbeat must
+not wait behind bulk. The receiver judges it by the kernel's receive stamp (§4b, `PlaneSocket`'s
+`Arrival`), feeding what `receive_ready` gives before it polls a deadline.
+
+Measured (`docs/benchmarks.md`, "hyper-liveness"): no allocation a heartbeat once configured, about
+0.7 to 1.0 µs of the crate's work a heartbeat; per node, two plane messages a pair an interval whatever the
+groups, against per-group heartbeats that grow with the groups.
 
 ## 5. Consumers
 

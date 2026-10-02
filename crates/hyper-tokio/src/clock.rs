@@ -6,7 +6,8 @@
 //! which every process on the host reads alike (so two processes' times compare, as the end-to-end
 //! tests compare them):
 //! - Linux: `CLOCK_MONOTONIC`. Its receive stamps (`SO_TIMESTAMPNS`) are `CLOCK_REALTIME`, so a
-//!   stamp is carried over by its age: read with both clocks after the receive, it is
+//!   stamp is carried over by its age: with both clocks read after the receive, the realtime one
+//!   first so that a preemption between the reads makes the stamp late and never early, it is
 //!   `monotonic − (realtime − stamp)`, held within the read's time and no earlier than the stamp of
 //!   the datagram read before it from the socket, whose queue is first in, first out. A step of the
 //!   realtime clock between a datagram's arrival and its read moves only that stamp, within those

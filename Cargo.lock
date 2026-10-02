@@ -658,6 +658,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "hyper-liveness"
+version = "0.1.0"
+dependencies = [
+ "hyper-datagram",
+ "hyper-measure",
+ "hyper-raft",
+ "hyper-swim",
+ "hyper-timing",
+ "hyper-tokio",
+ "proptest",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "hyper-log"
 version = "0.1.0"
 dependencies = [

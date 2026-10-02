@@ -3445,3 +3445,126 @@ HYPER_DURABLE_ROUNDS=1 ./target/release/hyper-durable-compare --devices file --m
 for o in mantle hyper; do HYPER_DURABLE_ONLY=$o /usr/bin/time -l ./target/release/hyper-durable-compare \
   --devices file --members 3 --shapes register --rounds 3 --entries 300; done
 ```
+
+# hyper-liveness: node-pair heartbeats against per-group heartbeats and slates' detector
+
+`crates/hyper-liveness` (`docs/timing.md` §2.8), timing step L-3. Measured on 2026-10-02: an Apple
+M5 Max, macOS 26.4.1, rustc 1.98.0, release builds, shared with other sessions (load average 22–28
+throughout, recorded beside each run); Linux in Docker Desktop's VM (linuxkit 6.12.76, aarch64,
+`rust:1.98.0`), its load recorded by each soak.
+
+## What a node pays a second
+
+`cargo bench -p hyper-liveness --bench cost`. Per node per second, messages sent and received and
+the CPU time of the calls, for `G` groups a node over `P` peers, each design put at the same
+interval between heartbeats on a pair, 50 ms (the macOS trace's configured `η`, `docs/timing.md`
+§2.6), so each detects as fast:
+- **pair**: this crate, `P + 1` nodes on one simulated clock (`benches/support/world.rs`: seeded LAN
+  delays, `fdatasync`-sized flushes, wakes 50–100 µs late), each pair sharing the node's groups;
+  its measured cost per heartbeat times `P` sent and `P` taken each interval; `flushes` the liveness
+  writes an interval the idle node asked for, shared by its pairs.
+- **group**: the Raft core mantle and focal run (`hyper-raft`, which mantle vendors and into which
+  focal's core changes are ported), `election_tick` 10 and `heartbeat_tick` 2 (focal-consensus's
+  defaults), `G` groups a node of three voters placed round robin, every group with its leader and
+  nothing to replicate; ticks, readies and deliveries timed, a tick every 25 ms.
+- **swim**: slates' detector (`hyper-swim`), `P + 1` members, a member's round of `P` periods every
+  50 ms; the detector's calls only, each member judging every peer by a configured verdict.
+
+| P | G | pair msgs | pair µs | liveness flushes / η | group msgs | group µs | swim msgs | swim µs |
+|---|---|---|---|---|---|---|---|---|
+| 2 | 1 | 80 | 12.0 | 1.11 | 53 | 3.6 | 160 | 12.5 |
+| 2 | 64 | 80 | 11.4 | 1.11 | 3,413 | 291.4 | 160 | 12.5 |
+| 2 | 1,024 | 80 | 11.1 | 1.11 | 54,613 | 5,209.4 | 160 | 12.5 |
+| 8 | 1 | 320 | 60.6 | 1.53 | 53 | 3.4 | 640 | 50.3 |
+| 8 | 64 | 320 | 59.6 | 1.53 | 3,413 | 304.7 | 640 | 50.3 |
+| 8 | 1,024 | 320 | 60.4 | 1.53 | 54,613 | 5,900.3 | 640 | 50.3 |
+
+- The pair stream's cost does not move with `G`: its messages are `2P/η` and its work per
+  heartbeat is the same whatever the groups (the counts below are identical at one group a pair and
+  a thousand).
+- Per-group heartbeats grow linearly with `G`, about 4.6 µs and 53 messages a second per group. The
+  pair stream is cheaper from about 3 groups a node at two peers and 13 at eight, and 18 to 470
+  times cheaper at 1,024. At one group a node per-group heartbeats cost less (3.5 µs against 12 and
+  60): the stream's estimator and configurator are what a group's tick does not do.
+- Against slates' detector the stream is even: a SWIM member probes and answers, two messages a
+  peer a round as the stream's two, at 12.5 against 12.0 µs (two peers) and 50.3 against 60.6
+  (eight). The stream's row includes its codec; the detector's does not include its gossip, codec or
+  coordinates.
+- What the stream adds that neither does: an idle node's liveness write and flush, 1.1 to 1.5 an
+  interval, shared by all its pairs; a node whose groups write makes none.
+
+## Allocations and time a heartbeat
+
+`cargo bench -p hyper-liveness --bench allocs`, the same world, counted over 10 s of simulated time
+after every pair is configured and 10 s more; per heartbeat sent or taken, with the time of the
+crate's calls (which includes the configurations the doubling schedule makes in that span):
+
+| nodes | groups a pair | sent | taken | allocs | reallocs | bytes | minor faults | ns |
+|---|---|---|---|---|---|---|---|---|
+| 2 | 1 | 282 | 282 | 0 | 0 | 0 | 0 | 727 |
+| 4 | 1 | 960 | 960 | 0 | 0 | 0 | 0 | 814 |
+| 8 | 1 | 4,109 | 4,108 | 0 | 0 | 0 | 0 | 944 |
+| 8 | 1,000 | 4,109 | 4,108 | 0 | 0 | 0 | 0 | 980 |
+
+`tests/alloc.rs` holds the law in the gates. A heartbeat without a configuration costs about 0.3 µs
+(the configurator held off, 2–8 nodes, load 24); the rest is the configurations.
+
+## Two costs found and removed
+
+- **The configurator's margin search** (`hyper-timing`, `qos::best_margin`). Its bracket
+  `[0, MTBF·U(η, η)]` held, on the lossy young links the stream configures at bootstrap, margins of
+  thousands of heartbeats for `β`'s product to multiply: a configuration took 150–360 µs. Closing the
+  bracket by probing doublings while `α/MTBF` is below the least `U` seen keeps every margin that
+  could do better (a property test against the whole bracket): 6–15 µs (`examples` timing at load
+  20–26, four link shapes, MTBF 100 s to 30 days).
+- **The renewal cadence.** Configuring once a window of heartbeats, `LinkEstimator`'s cadence,
+  configured every few heartbeats at short intervals (the drift bound held the window to nine at
+  0.47 ms): 24 µs a heartbeat with the slow search, 1.5–2.1 µs with the fast one. On the doubling
+  schedule of §2.8, 0.29–0.32 µs at those intervals; at the longer intervals one-heartbeat margins
+  choose, fewer heartbeats share each configuration, 0.7–1.0 µs (the table above).
+
+## The real-process test
+
+`crates/hyper-liveness/tests/processes.rs`: four member processes on the sealed plane through
+hyper-tokio's kernel-stamped socket, each liveness write a 4 KiB write and the platform's flush of a
+real file on a device thread; one member's disk stalled, then another SIGKILLed. Each run reports,
+for every other member, the time from the stalled or killed member's last heartbeat's schedule to the
+suspicion and the bound the detector stated; and the suspicions of live members against Theorem 7's
+allowance. The soak runs the test binary in a loop, each run a fresh supervisor:
+
+| host | runs | passed | detection, median (most) | stated bound less detection, least (median) |
+|---|---|---|---|---|
+| macOS, load 20–33 | 50, then 50 | 49 (one wait that could not end, the first defect below), then 50 | 189 ms (311 ms) | 0.30 ms (5.4 ms) |
+| Linux, one CPU, two busy loops | 50, then 100 | 50, then 100 (after the clock-order fix) | 102 ms (733 ms) | 0.011 ms (3.0 ms) |
+| Linux, two CPUs, four busy loops | 50, then 100 | 49 (the third defect below), then 100 | 43 ms (204 ms) | 0.054 ms (2.1 ms) |
+| Linux, four CPUs, eight busy loops | 50 | 50 | 95 ms (371 ms) | 0.053 ms (3.3 ms) |
+
+The stated bound always held: its least slack is the reverse direction's delay, which the echo's sum
+adds and the heartbeat's own delay does not have (§2.8); on loopback that is tens of microseconds.
+
+What failed on the way, each a defect fixed at its cause:
+- **A wait on a suspicion that could not come** (macOS, one run in fifty): a survivor that falsely
+  suspected a member just before it was killed, and never trusted it again, reported no new
+  suspicion after the kill. The supervisor now waits for each member to state, after the event, that
+  it holds the peer suspected, and checks the suspicion it holds.
+- **Many-heartbeat margins on a young link** (Linux at one CPU, two busy loops, six runs in ten
+  refuted the allowance): taking the link's own `τ_int·η` for the correlation time let the
+  configurator multiply Theorem 7's factors over heartbeats a throttle's 100 ms stall delays
+  together, which the young history had not seen. The margin now holds one heartbeat, a single
+  Cantelli factor with no independence assumed, as hyper-swim's probes (`docs/timing.md` §2.8): 50
+  of 50 after.
+- **A stamp before its datagram** (Linux at two CPUs, one run in fifty): the realtime and monotonic
+  clocks were read monotonic first, and a preemption between the reads aged the stamp too much, so
+  the echo said a heartbeat arrived before the one it echoed was sent and the bound went unstated.
+  Read realtime first, a preemption makes a stamp late, never early (`docs/transport.md` §4b).
+
+```sh
+cargo bench -p hyper-liveness --bench cost
+cargo bench -p hyper-liveness --bench allocs
+cargo test -p hyper-liveness --release                    # sim, processes, alloc, codec, bound
+cargo test -p hyper-tokio --test stamps                   # kernel stamps (macOS, Linux)
+# The soak: the binary from `cargo test --release -p hyper-liveness --test processes --no-run`, run
+# in a loop with `--exact a_stalled_disk_and_a_killed_node_are_suspected_and_no_live_one_is`; in
+# Linux, the same in rust:1.98.0 with `docker run --cpus N` and busy loops (`while :; do :; done`)
+# beside it. HYPER_LIVENESS_TRACE=1 echoes every member's lines.
+```

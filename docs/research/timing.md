@@ -135,6 +135,17 @@ heartbeat requires a disk write, so a stalled disk cannot be supported. A Raft l
 *fortified* by its followers' support and elections follow store liveness instead of per-group
 timers. Reported: up to 85 % less lease-maintenance CPU at scale.
 
+The node-pair stream (`docs/timing.md` §2.8) takes store liveness's rule that a heartbeat requires a
+durable write, so a stalled disk loses support as a crash does, and carries the evidence (the count
+of durable writes and the age of the latest) for the receiver to check, rather than a lease epoch:
+support and leases are the core's and the shell's (L-2), not the detector's.
+
+**RFC 3550 (Schulzrinne et al.), RTP, §6.4.1 (read 2026-10-02).** A receiver report carries the
+middle of the NTP timestamp of the last sender report received (LSR) and the delay since receiving
+it (DLSR); the sender computes the round trip as `A − LSR − DLSR` on its own clock, so neither
+clock's offset enters. The node-pair stream's echo is the same three fields (`docs/timing.md` §2.8),
+with each side's lateness past its schedule added back to bound the delay NFD-E measures.
+
 **TiKV, "Best Practices for TiKV Performance Tuning with Massive Regions" (docs.pingcap.com).**
 Hibernate Region: idle regions get no ticks, so their leaders send no heartbeats; enabled by
 default; `peer-stale-state-check-interval` sets the check between hibernated peers.
@@ -258,6 +269,29 @@ time. macOS's `setsockopt(2)` page documents neither.
 and `# CONFIG_HIGH_RES_TIMERS is not set`; `/proc/timer_list` reports a resolution of 1,000,000 ns
 for every clock base, so every timed wait in that VM ends on a 1 ms tick whatever the 50 µs timer
 slack would allow.
+
+**Microsoft, "Winsock timestamping" (learn.microsoft.com/windows/win32/winsock/winsock-timestamping,
+updated 2025-03-11; read 2026-10-02).** Receive timestamps are enabled per socket with the
+`SIO_TIMESTAMPING` IOCTL (`TIMESTAMPING_CONFIG`, `TIMESTAMPING_FLAG_RX` 0x1; minimum Windows 10
+build 20348, client and server) and returned by `WSARecvMsg` as an `SO_TIMESTAMP` (0x300A) control
+message, a `UINT64`; UDP only. They are "a software timestamp at the interface between the miniport
+and NDIS, and a hardware timestamp in the NIC hardware"; software stamps are QPC values. "In addition
+to socket-level configuration ... system-level configuration is also needed." **"Attaching
+timestamps to packets" (Windows driver documentation, updated 2025-03-25)**: the miniport driver
+attaches software stamps (`KeQueryPerformanceCounter`) only when it reports the `AllReceiveSw`
+capability and it is enabled; nothing in the stack stamps for a driver that does not. Microsoft Q&A
+(question 5790088) reports `WSAEOPNOTSUPP` from `SIO_TIMESTAMPING` on Windows 10 21H2 for that
+reason, and that virtual NICs almost never report the capability. So no receive stamp is available
+on a loopback path or a virtual machine's NIC, CI's runners among them: `docs/timing.md` §3 item 5.
+
+**Linux `net/core/dev.c` (torvalds/linux master, read 2026-10-02), `net_enable_timestamp`,
+`netstamp_clear`, `net_timestamp_set` and `net_timestamp_check`.** With jump labels, the first
+socket to ask for stamps increments `netstamp_needed_deferred` and schedules `netstamp_work`, whose
+`netstamp_clear` enables the static key `netstamp_needed_key`; only once it is enabled does the
+receive path set `skb->tstamp = ktime_get_real()`. A datagram received before the work ran carries
+no stamp, and the socket layer (`__sock_recv_timestamp`, `net/socket.c`) stamps it when it is read:
+late, never early. Observed in Docker's linuxkit 6.12.76 on the first datagram after the option;
+hyper-tokio's stamp test sends one datagram through first (`docs/transport.md` §4b).
 
 ## What the sources leave to us
 

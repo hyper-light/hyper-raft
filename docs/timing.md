@@ -494,6 +494,120 @@ so the periods grow with it; two members cannot condemn each other, as neither c
 failure from the other's; the pool's mean is wrong for a pair far from the member's others until
 that pair configures; and the allowance is loose while a history is young (§3, item 3).
 
+### 2.8 The node-pair stream (L-3)
+
+`crates/hyper-liveness`, sans-io: §2.1's one stream per pair of nodes that share a group, shared by
+every group they share, each heartbeat proving a recent durable flush, each pair judged by §2.2's
+NFD-E detector.
+
+**Where it lives, and why a crate of its own.** The heartbeat is a message on the sealed datagram
+plane (`hyper-datagram`), which escapes QUIC's congestion window (RFC 9221 §5) so a heartbeat never
+waits behind bulk; not on `hyper-transport`'s streams for that reason. Not in `hyper-datagram`
+either: the plane seals, authenticates and replays-checks opaque messages for Raft control, SWIM
+and this alike, and slates uses it without consensus groups; putting a detector in it would tie the
+seal to `hyper-timing` and to the shell's flush evidence. Not in `hyper-timing`, which holds the
+laws and estimators both detectors use and no wire or per-peer protocol state. Not in `hyper-swim`:
+a SWIM member probes a random peer each period and measures a round trip on its own clock, its
+acknowledgements unflushed, with indirect probes, gossip and the membership's suspicion and death;
+this stream is one-way, scheduled, flushed, per pair of consensus nodes, and its consumers are the
+core (L-2) and the shell. What the two share is in `hyper-timing` and both use it: the estimator
+(`LinkEstimator`), the configurator (`qos`), the timer fold (`Wakes`, moved out of hyper-swim for
+this), the MTBF fold (`Exposure`) and the refutation rule (`poisson95`, which was written out three
+times). The wire is the crate's own (`codec.rs`, one plane message, its first byte `KIND`), so an
+owner multiplexing the plane tells it apart; the kernel stamps come from the owner's socket
+(hyper-tokio's `PlaneSocket`, §2.4; slates' runtime its own).
+
+**The stream.** A node sends each peer heartbeat `k` due at `σ_k = σ_{k−1} + η`, carrying its run
+(`boot`), `k`, `η`, its stability floor `E[flush] + G`, the interval it asks of the peer, its send
+time and lateness past `σ_k`, and the flush proof. A sender behind its schedule sends the latest
+heartbeat due; those it skipped are losses to the receiver, which they are.
+- **The interval** is the receiver's: its configurator's best (`Configuration::best`), asked in its
+  own heartbeats (Chen et al.'s adaptive scheme), never below the sender's floor; until the receiver
+  asks, the floor. A change within `G`, the configurator's resolution, is none. Bootstrap: the
+  first heartbeat waits on the first flush, whose time is the first `E[flush]`; the first wake
+  measures `G`.
+- **The flush proof** (§2.1; CockroachDB's store liveness). A heartbeat leaves only once a write on
+  the sender's log became durable after the previous heartbeat to that peer was due and is newer
+  than the one the previous heartbeat carried. The owner reports every durable completion
+  (`on_durable`, `Write::Log` for the shell's, the log's completions of `docs/durable.md` §8); when
+  none came in time the stream asks for one (`Output::flush`, a liveness write the owner makes on
+  its log device) and sends on its completion. A heartbeat carries the sender's count of durable
+  writes and the age of the latest; the receiver takes it only if the count moved and the age is at
+  most `late + η`, so the flush came after the previous heartbeat was due. A node whose disk stalls
+  stops heartbeating and is suspected as a crashed one is; a sender that heartbeats without
+  flushing is not trusted either (`Refusal::Unproven`). Idle, a node makes at most one liveness
+  write per smallest interval among its pairs, shared by every pair; a node whose groups write makes
+  none.
+- **The receiver** feeds each heartbeat to the pair's `LinkEstimator` at the sender's interval (a
+  new interval or a new run re-anchors it; a restarted peer's heartbeats are numbered on from its
+  last run's, so the link's history, the hosts' and the path's, stays and the peer is judged at
+  once). It judges the peer at the arrival first, so a freshness point that passed before a
+  heartbeat came is a suspicion in whatever order the owner feeds messages and polls. Configured
+  through `qos::configure` with `Floors { G: the receiver's measured G, sender: the sender's
+  advertised floor, correlation: unbounded }`, so the margin holds one heartbeat (`α < η`) and
+  Theorem 7's bound is a single Cantelli factor that assumes no independence, as hyper-swim judges
+  each probe (§2.7). `T_c` is the spacing past the longest stall a run saw (item 6), which a young
+  link has not seen; a first form took the link's own `τ_int·η` for it, and under a one-CPU throttle
+  the many-heartbeat margins it allowed broke their allowance in most runs (`docs/benchmarks.md`,
+  "hyper-liveness"). A link may count on the product once `T_c` is measured online; that is open.
+  `Costs { election: T_E from the owner (set_election, the
+  election law's span over the groups whose leader that node is), mtbf: the Jeffreys posterior over
+  the node time the pairs watched and the restarts and abandoned suspicions seen, seeded with the
+  fleet's history }`.
+- **Renewal on a doubling schedule.** The configurator runs when never configured, when the peer
+  moved to the interval asked, when the heartbeats taken have doubled since the last configuration
+  (the history the inputs are estimated over, and the exposure the MTBF is, doubled with them), or
+  when `β` at the margin in force has doubled past the configured one. The estimator's window
+  cadence configured every few heartbeats at short intervals and spent five times the stream's own
+  work on the configurator (`docs/benchmarks.md`, "hyper-liveness"). The allowance is kept sound
+  between configurations: each freshness point is charged `β` at the margin in force from the
+  estimates as they stand, not as the configuration assumed.
+- **The echo** (RFC 5905 §8's on-wire round trip; RFC 3550 §6.4.1's LSR and DLSR). Each heartbeat
+  echoes the latest heartbeat its sender had from the receiver: that one's send time and lateness on
+  the receiver's clock, and the hold since its arrival. The receiver gets the network round trip on
+  its own clock, `A − s_echo − hold` (a path for the election law's ballot, `round_trip`), and the
+  sum of the two directions' delays from their schedules, `round trip + late_echo + late`, which
+  bounds this heartbeat's delay since both are positive.
+- **The detection bound** each suspicion states: NFD-E suspects at `τ_{h+1} = EA_{h+1} + α`, which is
+  `η + α + mean(D)` past the last heartbeat's schedule over the expected arrival's window, whatever
+  the clocks' offset; the mean of the echoed sums over the same window bounds `mean(D)`, so
+  `η + α + ⌈mean of the sums⌉` bounds the time from the sender's last schedule, and so from its
+  crash, to the suspicion. No clock synchronization or path symmetry enters it. Unstated while a
+  heartbeat in the window carried no echo.
+
+**The API** the core's suspicion-started elections (L-2) and the shell consume (`src/lib.rs`):
+`attach`/`detach` a group's peer; `on_durable(write, started, durable)`; `on_heartbeat(from, message,
+arrival_ns, out)`; `poll(now, out)` and `wake()`, with `Output::{heartbeat, flush, change}`;
+`Change::Suspected(Suspicion { peer, at_ns, noticed_ns, last: { seq, arrival_ns, due_ns, sent_ns },
+detection, detector })` and `Change::Trusted { peer, at_ns }`; `trust(peer)`, `suspected()`,
+`configuration(peer)` (the election law's base is `current.interval + current.margin`),
+`round_trip(peer)`, `report(peer)` (`sent`, `taken`, `unproven`, `suspicions`, `allowance`,
+`configurations`), `set_election(peer, T_E)`, `flush_mean()`, `granularity()`, `floor()`, `mtbf()`.
+Every refusal is typed. The owner's contract: feed every message stamped before a time before
+polling at it (hyper-tokio's `PlaneSocket::receive_ready`); the core takes `suspect(node)` and
+`trust(node)` from the changes, and the shell withholds a suspicion while the member is marked,
+stalled or fenced (`docs/durable.md` §8); both are L-2's to define.
+
+**Bounds.** Pairs at most `Settings::max_peers` (placement's), typed refusal past it; groups per pair
+a `u32`; one liveness write out at a time; per pair one boxed estimator and a ring of delay sums the
+estimator's own size (the drift bound, §2.6), both resized in place for a longer interval. Once each
+pair is configured, a heartbeat sent and one taken allocate nothing.
+
+**Tests.** `tests/sim.rs`, one clock, seeded delays, stalls, losses, flushes and wake lateness, the
+owners computing `T_E` from the library's law: live peers keep Theorem 7's allowance (8 seeds); no
+heartbeat leaves without a newer flush made after the previous was due (with and without the
+groups' own writes); a killed peer is suspected by every survivor within the bound each states from
+the peer's last schedule (16 seeds); a stalled disk is suspected so too, and the stalled node still
+trusts its live peers (8 seeds); a thousand groups send what one does and an unshared pair is
+silent; a restarted peer is trusted again by the detector in force and counted; every refusal.
+Property tests: the codec reads back what it writes and refuses every truncation, extension, kind
+and version; the bound is its window's mean. `tests/processes.rs`, real processes over UDP on the
+sealed plane through hyper-tokio's kernel-stamped socket, each liveness write a real write and
+platform flush of a real file: one member's disk is stalled (its device thread stops completing
+flushes) and every other suspects it within its stated bound from the last schedule, on the host's
+monotonic clock, which the processes share; then one is SIGKILLed and every survivor suspects it so;
+live members keep the allowance. The test derives nothing; it waits on facts.
+
 ## 3. Open, to be measured before it is fixed
 
 Items 2, 6 and 7 and part of 3 are settled by the traces (§2.6) and implemented in L-1's estimator
@@ -505,7 +619,14 @@ and election law; the remaining items keep their numbers, and item 10 is what L-
   floor (`qos::tests`). On the measured links the optimum is again the floor, now the correlation
   time. At one heartbeat per peer per floor, a node with many peers spends its network on
   liveness. Placement bounds the peers per node, and the cost per heartbeat must be measured
-  against the data path and enter `U` before the fleet step.
+  against the data path and enter `U` before the fleet step. Measured for the node-pair stream
+  (§2.8): 0.7 to 1.0 µs of the crate's work a heartbeat sent or taken, configurations included, two plane messages a pair an
+  interval, and, on an idle node, one liveness write and flush an interval shared by all its pairs.
+  The flush makes the floor `E[flush] + G` the bootstrap interval, until the receiver's first
+  configuration asks for its optimum: in the simulation, a few tens of milliseconds once one
+  heartbeat holds the margin (§2.8), and the floor itself while the many-heartbeat margins were
+  allowed, a flush every half millisecond. What a flush costs a device's other work is the
+  measurement to make before `U` prices it.
 - **3. The first variance, in part.** A link with no history underestimates `V(D)` by an order of
   magnitude until it has seen a stall (§2.6), and Theorem 7's bound with too small a variance is
   not a bound. Closed by L-1: a delay past everything the history has seen, which no variance
@@ -522,8 +643,13 @@ and election law; the remaining items keep their numbers, and item 10 is what L-
 - **4. A group stalled on a live node.** Node-pair detection does not see one group wedged while
   its node is healthy; groups with work still exchange appends, and a follower whose forwarded
   proposals make no progress needs a rule that is not a timer constant.
-- **5. Kernel receive timestamps on Windows**, to confirm against Microsoft's documentation, and
-  every measurement of §2.6 on Windows.
+- **5. Kernel receive timestamps on Windows.** Confirmed against Microsoft's documentation
+  (`docs/research/timing.md`, "Winsock timestamping"): `SIO_TIMESTAMPING` exists from build 20348,
+  but its receive stamps are attached by a NIC miniport driver that reports timestamping
+  capabilities, with system configuration, and on no loopback path or virtual NIC. hyper-tokio
+  therefore stamps a Windows datagram when it is read (§2.8, `docs/transport.md` §4b): its read
+  delay is counted as the sender's, in the delays the detector measures and so in its margin. Open:
+  every measurement of §2.6 on Windows, that read delay among them.
 - **8. Strict timers.** A finer `G` shortens detection and costs power; on a laptop on battery
   that trade is measured, not assumed. On Windows the request is `timeBeginPeriod`; on macOS a
   timer with no leeway (real-time or critical urgency, or a strict dispatch timer), without which
@@ -561,8 +687,15 @@ and election law; the remaining items keep their numbers, and item 10 is what L-
   Theorem 7's bound, and the trace analyser takes its window, loss and bound from the crate.
 - **L-2** the core: elections started by suspicion with the randomized delay of §2.3,
   check-quorum from the detectors, no per-group timers, idle groups silent.
-- **L-3** the transport: one heartbeat stream per node pair on the datagram plane, stamped on
-  receipt by the kernel, carrying proof of a recent log flush.
+- **L-3** the transport, done (§2.8): `crates/hyper-liveness`, one heartbeat stream per node pair on
+  the datagram plane, shared by every group the pair shares and silent for a pair that shares none;
+  each heartbeat proving a durable flush made after the previous was due; stamped on receipt by the
+  kernel through hyper-tokio's plane socket (`SO_TIMESTAMPNS` on Linux, `SO_TIMESTAMP_MONOTONIC` on
+  macOS, read-time on Windows, item 5); each pair's NFD-E estimator configured by `qos::configure`
+  from measured floors on a doubling schedule; each suspicion stating its bound from the echoed
+  round trips. A heartbeat allocates nothing once configured and costs 0.7 to 1.0 µs of the crate's
+  work; per node, the stream's cost does not grow with the groups (`docs/benchmarks.md`,
+  "hyper-liveness").
 - **L-4** the E2E member and harness on L-1–L-3 (§2.5); the harness's computed tick and budgets
   go.
 - **L-5** mantle, focal and slates on it.

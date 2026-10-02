@@ -379,13 +379,16 @@ impl Socket {
             linux::receive(fd, buffers, &mut linux.receive, &mut linux.received)
         })?;
         stats.receive_calls = stats.receive_calls.saturating_add(1);
-        // Both clocks once a batch, after the receive: a stamp is carried over by its age.
-        let read_ns = linux::monotonic_ns()?;
+        // Both clocks once a batch, after the receive: a stamp is carried over by its age. The
+        // realtime clock first: a thread preempted between the two reads then makes the age's end
+        // later, so a stamp comes out late, never early (the order mattered: read the other way, a
+        // throttled container's preemption put a stamp before its datagram was sent).
         let realtime_ns = if stats.kernel_stamps {
             linux::realtime_ns()?
         } else {
             0
         };
+        let read_ns = linux::monotonic_ns()?;
         let mut delivered = 0usize;
         let mut buffers = std::mem::take(&mut self.buffers);
         let received = std::mem::take(&mut self.linux.received);

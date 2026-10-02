@@ -1,35 +1,58 @@
-//! The SWIM failure detector (§4.8, Part 4 "Cluster plane") — the protocol-period machine that probes
-//! members and drives the [`Membership`] view from alive to suspect to dead. Sans-io and driven by
-//! `tick` (one protocol period per call) and message events, so it is deterministic and oracle-tested
-//! at N=1 before any timer or datagram is involved; the caller sends the [`Ping`]/[`Ack`] it returns
-//! over the control plane and feeds received messages back in.
+//! The SWIM failure detector, its timing measured (`docs/timing.md` §2.7): the protocol-period
+//! machine that probes members and drives the [`Membership`] view from alive to suspect to dead.
+//! Sans-io: it is fed `now`, acknowledgements and pings, and returns the pings and ping-requests to
+//! send and the time to be polled again ([`wake`](Detector::wake)).
 //!
-//! Evidence: SWIM (Das/Gupta/Motivala, DSN 2002) and Lifeguard (Dadgar/Phillips/Currey, DSN 2018),
-//! tier A. Built: **direct probing** (each period pings the next member round-robin; an unanswered
-//! probe suspects, a suspicion held for the window kills); the **indirect probe** (a ping-request
-//! through `k` peers, so a lost packet is not a failure); **infection-style gossip** (each membership
-//! change piggybacks on ping/ack a bounded number of times, spreading the view); and the **Lifeguard
-//! local-health multiplier** (a bounded score, raised when the node's own probes fail or it is falsely
-//! suspected and lowered when they succeed, that dilates the suspicion window — and, through
-//! [`health_multiplier`](Detector::health_multiplier), the caller's probe cadence — so a node that
-//! itself looks unhealthy is slower to declare others dead); and the **confirmation-count suspicion
-//! timeout** `max − (max−min)·log(C+1)/log(K+1)` (the window shrinks from the base toward its floor as
-//! `C` distinct peers independently suspect a member — corroboration declares a real failure sooner while
-//! a lone suspicion waits the full window; the logarithm is computed in deterministic fixed point,
-//! [`crate::fixed`]). The two window mechanisms compose: corroboration shortens it, local ill-health
-//! lengthens it. And **randomized probe order** (SWIM §4): each round probes a fresh shuffled permutation
-//! of the members rather than a fixed rotation, so every member is probed once per round and the
-//! worst-case wait for a first probe is one round; the shuffle is a deterministic xorshift seeded from
-//! the node id, so the simulation stays reproducible. This completes the §4.8 membership mechanism set.
+//! Evidence: SWIM (Das, Gupta and Motivala, DSN 2002) for the probe, the indirect probe, the
+//! suspicion and infection-style dissemination; Lifeguard (Dadgar, Phillips and Currey, DSN 2018)
+//! for the buddy system and for local health; Chen, Toueg and Aguilera (2002) for the detector each
+//! probe stream is; `docs/research/timing.md` holds what each establishes.
 //!
-//! Coordinate-aware indirect probing: the detector carries a Vivaldi coordinate engine ([`crate::coordinates`])
-//! fed by measured round-trip times ([`observe_rtt`](Detector::observe_rtt)) and the coordinates it learns
-//! for peers ([`learn_coordinate`](Detector::learn_coordinate)). When a direct probe is lost, the
-//! indirect-probe relays are chosen **nearest the target** in coordinate space rather than arbitrarily,
-//! so the retry goes through a proxy likeliest to reach the target and a slow far peer is not mistaken for
-//! a failed near one. With no coordinates learned it falls back to a deterministic id order.
+//! **Each pair is an NFD-E detector.** A member's probes to one peer and that peer's
+//! acknowledgements are a heartbeat stream on the member's own clock: probe `k` sent at `s_k`,
+//! answered at `A_k`, so NFD-E's delay `A_k − σ_k` is the probe's round trip, with no second clock
+//! in it. A [`LinkEstimator`] per peer holds its mean, variance, loss, correlation and window, and
+//! [`detector_at`] chooses the margin `α` that minimizes unavailability at the pair's probe
+//! interval. A probe's acknowledgement is due at `s + μ + α`; if none came, the indirect probe asks
+//! relays, and a probe answered by neither suspects the peer. The period is what its probe needs:
+//! the direct deadline, and the indirect one when the direct passed unanswered (SWIM §3.1: the
+//! protocol's properties hold for the average period).
+//!
+//! **Before a pair can be judged.** A pair's estimator refuses until it has its evidence
+//! ([`Refusal`]). Its probes are then judged by the member's pooled estimator, every round trip the
+//! member measured to anyone (the hosts' stalls, which the traces found dominate, are in it); and
+//! while that too refuses, nobody is judged: a probe is measurement only. Its period ends when it
+//! is answered or at its expected arrival from the latest round trip (NFD-E's estimate over a
+//! window of one), whichever is first; unanswered then, it is a loss to the estimators unless its
+//! answer comes later, and it judges nothing. Its wake measures the member's timer. Before any
+//! round trip, the first probe waits on its answer or on another member.
+//!
+//! **Dead.** A suspected peer is told by the member's next probe to it (Lifeguard's buddy system);
+//! it is condemned when that probe also goes unanswered, and only once the member has since had an
+//! answer from someone else, so a member whose own network has failed condemns nobody (Lifeguard's
+//! local health, decided by evidence). A gossiped suspicion is a hint: only a member's own probes
+//! condemn. A member with nobody alive or suspected left probes the members it holds dead and
+//! tells each so; a live one refutes in its answer.
+//!
+//! **The member's own lateness** is measured, not multiplied: every wake the member is late for is
+//! folded into its granularity `G` ([`Lateness`]), which floors the margins; the member's own
+//! delay in reading acknowledgements is in the round trips it measures; and a probe is resolved
+//! when the member wakes, with every acknowledgement delivered by then, so a late member does not
+//! blame its peers for its own lateness.
+//!
+//! Coordinate-aware indirect probing: the detector carries a Vivaldi coordinate engine
+//! ([`crate::coordinates`]) fed by the round trips it measures and the coordinates it learns for
+//! peers ([`learn_coordinate`](Detector::learn_coordinate)). Indirect-probe relays are chosen
+//! nearest the target in coordinate space, with a deterministic id order where coordinates are
+//! unknown.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
+use std::time::Duration;
+
+use hyper_timing::{
+    Costs, Exposure, Floors, Lateness, LinkBehaviour, LinkEstimator, Refusal, Schedule,
+    detector_at, mistake_bound,
+};
 
 use crate::HostId;
 
@@ -39,11 +62,13 @@ use crate::extension::{ExtensionDecision, ExtensionDenial, ExtensionTracker};
 use crate::gossip::Gossip;
 use crate::membership::{Change, Liveness, MemberState, Membership};
 
-/// A ping to send to `to` — probe it this period.
+/// A ping to send to `to` — the period's probe of it, or a probe relayed for another member.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Ping {
     /// The member to probe.
     pub to: HostId,
+    /// The nonce the acknowledgement echoes.
+    pub nonce: u64,
 }
 
 /// An acknowledgement to send to `to` — the reply to a received [`Ping`].
@@ -53,90 +78,351 @@ pub struct Ack {
     pub to: HostId,
 }
 
-/// A ping-request: ask `relay` to ping `target` on our behalf and relay the acknowledgement back. SWIM
-/// sends these to a few peers when a direct ping goes unanswered, so a single lost packet — rather than
-/// a failed member — does not cause a false suspicion.
+/// A ping-request: ask `relay` to ping `target` on our behalf and relay the acknowledgement back,
+/// echoing `nonce`. SWIM sends these when a direct ping goes unanswered, so a lost packet on the
+/// direct path is not taken for a failed member.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PingReq {
     /// The peer asked to probe on our behalf.
     pub relay: HostId,
     /// The member to probe indirectly.
     pub target: HostId,
+    /// The nonce of the probe the request is for.
+    pub nonce: u64,
 }
 
-/// The derived SWIM/Lifeguard timing parameters (§4.8 "Derived constants") — each measured from the
-/// fleet, never a hidden constant. The caller derives them and hands them in.
-#[derive(Clone, Copy, Debug)]
-pub struct DetectorTiming {
-    /// The base suspicion window: periods a member stays suspected, at full local health, before it is
-    /// declared dead. Derived from RTT p99 × k. Dilated by the local-health multiplier (an unhealthy node
-    /// waits longer).
-    pub suspicion_periods: u32,
-    /// How many times each membership change is disseminated by gossip — SWIM's `λ·ln(n+1)` infection
-    /// bound. Derived from the measured convergence and fleet size.
-    pub gossip_transmits: u32,
-    /// The cap on the Lifeguard local-health multiplier: the most the suspicion window (and the caller's
-    /// probe cadence) may be dilated when the local node itself looks unhealthy. The effective multiplier
-    /// is `health + 1` up to `health_max + 1`, so this is the cap minus one.
-    ///
-    /// Derived: keep it **small** — 2 or 3, a cap of 3×–4×. The raw Lifeguard formula `(LHM + 1)` at the
-    /// paper's saturation `S = 8` reaches 9×, which pushes suspicion timers and probe timeouts off the
-    /// cliff under sustained probe failure; hyperscale's SWIM measured this and softened its multiplier to
-    /// `1 + score × 0.25` (a 3× cap at S = 8). This integer form reaches the same modest cap by deriving a
-    /// small `health_max` instead of a fractional weight — determinism-clean, and matching the design's
-    /// "bounded local-health multiplier" (§4.8). Anchor: hyperscale `local_health_multiplier.py`
-    /// (`get_multiplier`), the Backpressure & Degradation table (NORMAL 1× … CRITICAL 3×).
-    pub health_max: u32,
-    /// The floor of the suspicion window: the fewest periods a member stays suspected even when its
-    /// failure is fully corroborated, from the confirmation-count timeout `max − (max−min)·log(C+1)/log(K+1)`
-    /// (§4.8). Set equal to `suspicion_periods` to switch the confirmation curve off. Derived from RTT.
-    pub suspicion_min: u32,
-    /// The number of independent suspicions (`K`) at which the suspicion window reaches its floor — the
-    /// count of confirming peers that makes a failure certain enough to declare sooner. Derived from the
-    /// indirect-probe fan-out.
-    pub confirmations_expected: u32,
+/// The detector configured for a probe: NFD-E's margin at the pair's interval, and what it
+/// promises (`docs/timing.md` §2.7).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Verdict {
+    /// The mean round trip `μ`, the expected arrival's offset from the probe.
+    pub round_trip: Duration,
+    /// The margin `α` past it: the acknowledgement is due at `s + μ + α`.
+    pub margin: Duration,
+    /// The pair's probe interval `η` it was configured at: the round, `m` periods.
+    pub interval: Duration,
+    /// The loss the configurator was fed: lost, or later than anything the history has seen.
+    pub loss: f64,
+    /// Theorem 7's bound on the probability that a probe of a live peer goes unanswered by its
+    /// deadline, `(V + p·α²)/(V + α²)`: the margin holds one probe.
+    pub mistake: f64,
 }
 
-/// The failure detector for one node: it owns the node's [`Membership`] view, a cursor over the current
-/// randomized probe permutation, the member being probed this period and whether it has acknowledged,
-/// how many periods each suspected member has gone unrefuted, and its Lifeguard **local health** — a
-/// bounded multiplier, raised when the node's own probes fail (or it is falsely suspected) and lowered
-/// when they succeed, that dilates the suspicion window so a node that itself looks unhealthy is slower
-/// to declare others dead. A member suspected for `suspicion_periods × (health + 1)` periods is dead.
+impl Verdict {
+    /// `μ + α` in nanoseconds: from the probe to its deadline.
+    fn span_ns(&self) -> u64 {
+        nanos(self.round_trip.saturating_add(self.margin))
+    }
+}
+
+/// What a member has done and promised about one peer, for its owner and its tests.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct PeerReport {
+    /// Whether the pair's own estimator configures its probes (rather than the pool's, or none).
+    pub configured: bool,
+    /// Suspicions this member's own probes started.
+    pub suspicions: u64,
+    /// Theorem 7's allowance for them: `Σβ` over every judged probe, the expected number of
+    /// suspicions of the peer were it alive throughout.
+    pub suspicion_allowance: f64,
+    /// Times this member condemned the peer by its own probes.
+    pub condemnations: u64,
+    /// The allowance for condemnations of a live peer: over every judged probe, the bound on it
+    /// and the probe before both going unanswered.
+    pub condemnation_allowance: f64,
+    /// From the peer's last answer to its condemnation, on this member's clock.
+    pub condemned_after: Option<Duration>,
+    /// The detection bound the member stated when it condemned: [`Detector::detection_bound`]
+    /// plus the wait it measured for an answer from another member.
+    pub condemned_within: Option<Duration>,
+    /// When the peer last answered one of this member's probes, on the caller's clock.
+    pub last_answer_ns: Option<u64>,
+    /// When the probe that told the peer it was suspected went unanswered, on the caller's clock:
+    /// from then the condemnation waits on an answer from another member, which nothing bounds in
+    /// advance. Kept once the peer is dead; cleared when it is alive again.
+    pub pending_since_ns: Option<u64>,
+}
+
+/// Probes of one peer that may still be answered: the one that suspected it, the one that told it,
+/// and the one more an extension can grant (at most one base window of one probe,
+/// [`crate::extension`]). An older probe's acknowledgement is past every deadline that could use
+/// it and is not kept for.
+const OUTSTANDING: usize = 3;
+
+/// A probe sent and not yet answered.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Sent {
+    seq: u64,
+    nonce: u64,
+    at_ns: u64,
+}
+
+/// A stream of round trips and the verdict configured from it: one peer's, or the pool's.
+#[derive(Debug, Default)]
+struct Stream {
+    /// Boxed: the estimator's Allan levels are a kilobyte, and a peer's other fields are read
+    /// every period, so they stay small and together (the allocation is made with the ring's).
+    estimator: Option<Box<LinkEstimator>>,
+    /// The sequence number the estimator was anchored at.
+    anchor: u64,
+    /// The granularity the estimator was last given, nanoseconds.
+    granularity_ns: u64,
+    verdict: Option<Verdict>,
+    /// Round trips taken.
+    samples: u64,
+    /// Round trips taken at the last configuration, and the window then: the verdict is renewed
+    /// once a window's worth more have come (Chen et al.'s adaptive detector, §6).
+    configured_at: u64,
+    renewal: u64,
+}
+
+impl Stream {
+    /// Takes the round trip of heartbeat `seq`, building the estimator at the stream's interval
+    /// on the first.
+    fn take(&mut self, seq: u64, rtt: u64, granularity: Duration, interval: Duration) {
+        if self.estimator.is_none() {
+            self.anchor = seq;
+            self.granularity_ns = nanos(granularity);
+            self.estimator =
+                LinkEstimator::new(interval, granularity, Some(Schedule { seq, at_ns: 0 }))
+                    .ok()
+                    .map(Box::new);
+        }
+        let Some(estimator) = self.estimator.as_mut() else {
+            return;
+        };
+        if nanos(granularity) != self.granularity_ns {
+            self.granularity_ns = nanos(granularity);
+            estimator.set_granularity(granularity);
+        }
+        // A sample from before the anchor, or past what a window can sum, is not taken.
+        if feed(estimator, seq, self.anchor, rtt).is_ok() {
+            self.samples = self.samples.saturating_add(1);
+        }
+    }
+
+    /// Whether the verdict is due: never configured, or a window's worth of samples since.
+    fn due(&self) -> bool {
+        self.verdict.is_none() || self.samples.saturating_sub(self.configured_at) >= self.renewal
+    }
+
+    /// Configures the verdict from the estimates as they stand. A refusal leaves the verdict in
+    /// force, as `LinkEstimator::configure` leaves its margin: a stall can make `τ_int` unmeasured
+    /// again, and a probe that went unjudged then would suspect nobody.
+    fn configure(&mut self, mtbf: Option<Duration>, floors: &Floors, interval: Duration) {
+        let Some(estimator) = self.estimator.as_ref() else {
+            return;
+        };
+        self.configured_at = self.samples;
+        self.renewal = estimator.estimates().window.length;
+        if let Ok(renewed) = verdict(estimator, mtbf, floors, interval) {
+            self.verdict = Some(renewed);
+        }
+    }
+}
+
+/// What this member holds about one peer.
+#[derive(Debug)]
+struct Peer {
+    stream: Stream,
+    /// Probes sent to the peer.
+    sent: u64,
+    outstanding: [Option<Sent>; OUTSTANDING],
+    /// The probes sent when the current suspicion took hold: a probe numbered from it on told the
+    /// peer (it carried the suspicion).
+    suspected_from: Option<u64>,
+    told_missed: u32,
+    /// When the probe that told the peer went unanswered: its condemnation waits on an answer
+    /// from another member.
+    pending_since: Option<u64>,
+    /// The previous judged probe's bound.
+    last_mistake: Option<f64>,
+    last_answer_ns: Option<u64>,
+    report: PeerReport,
+}
+
+impl Peer {
+    fn new() -> Self {
+        Self {
+            stream: Stream::default(),
+            sent: 0,
+            outstanding: [None; OUTSTANDING],
+            suspected_from: None,
+            told_missed: 0,
+            pending_since: None,
+            last_mistake: None,
+            last_answer_ns: None,
+            report: PeerReport::default(),
+        }
+    }
+
+    /// The outstanding probe `nonce`, taken.
+    fn take(&mut self, nonce: u64) -> Option<Sent> {
+        self.outstanding
+            .iter_mut()
+            .find(|slot| slot.is_some_and(|sent| sent.nonce == nonce))
+            .and_then(Option::take)
+    }
+
+    /// Records a probe sent, over the oldest still outstanding.
+    fn send(&mut self, sent: Sent) {
+        let slots = u64::try_from(OUTSTANDING).unwrap_or(1);
+        let at = usize::try_from(sent.seq.checked_rem(slots).unwrap_or(0)).unwrap_or(0);
+        if let Some(slot) = self.outstanding.get_mut(at) {
+            *slot = Some(sent);
+        }
+    }
+
+    fn clear_pending(&mut self) {
+        self.told_missed = 0;
+        self.pending_since = None;
+        self.report.pending_since_ns = None;
+    }
+
+    fn clear_suspicion(&mut self) {
+        self.suspected_from = None;
+        self.clear_pending();
+    }
+}
+
+/// The period's probe.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Probe {
+    target: HostId,
+    nonce: u64,
+    seq: u64,
+    sent_ns: u64,
+    answered: bool,
+    verdict: Option<Verdict>,
+    /// When the indirect probe's answers are due, once it was asked.
+    indirect_until: Option<u64>,
+    /// A measurement probe's expected arrival from the latest round trip: where its period ends,
+    /// answered or not, judging nothing; its wake measures the member's timer.
+    expected: Option<u64>,
+}
+
+impl Probe {
+    fn due_ns(&self) -> Option<u64> {
+        self.verdict
+            .map(|verdict| self.sent_ns.saturating_add(verdict.span_ns()))
+    }
+}
+
+/// The member's periods: count, total and longest, nanoseconds.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Periods {
+    count: u64,
+    total: u128,
+    longest: u64,
+}
+
+impl Periods {
+    fn add(&mut self, length: u64) {
+        self.count = self.count.saturating_add(1);
+        self.total = self.total.saturating_add(u128::from(length));
+        self.longest = self.longest.max(length);
+    }
+
+    fn mean_ns(&self) -> Option<u64> {
+        self.total
+            .checked_div(u128::from(self.count))
+            .and_then(|mean| u64::try_from(mean).ok())
+            .filter(|mean| *mean > 0)
+    }
+}
+
+/// `duration` in nanoseconds, saturating at `u64::MAX` (584 years).
+fn nanos(duration: Duration) -> u64 {
+    u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
+}
+
+/// SWIM §4.1's dissemination budget for `members`: an update piggybacked for `λ·ln n` periods
+/// leaves at most `n^{−((2−4/n)λ−2)}` members uninfected in expectation, which is below one member
+/// once `λ > n/(n−2)`. The budget is the least whole count past `n·ln n/(n−2)`. With two members
+/// or fewer every message reaches the only other one, and one transmission is all there is to
+/// send. The logarithm is the fixed-point one ([`crate::fixed`]), so every host computes the same
+/// budget.
+pub fn gossip_transmits(members: usize) -> u32 {
+    let n = u64::try_from(members).unwrap_or(u64::MAX);
+    if n <= 2 {
+        return 1;
+    }
+    let fraction = f64::from(1u32 << crate::fixed::FRACTION_BITS);
+    // u64 → f64 rounds only past 2⁵³ members.
+    let ln = crate::fixed::log2_fixed(n) as f64 / fraction * std::f64::consts::LN_2;
+    let rounds = n as f64 * ln / (n.saturating_sub(2)) as f64;
+    // `rounds` is at most about 45 (ln 2⁶⁴ with n/(n−2) near one), so the count ends quickly.
+    let mut budget = 1u32;
+    while f64::from(budget) <= rounds && budget < u32::MAX {
+        budget = budget.saturating_add(1);
+    }
+    budget
+}
+
+/// The relays an indirect probe asks: the fewest whose paths together fail no more often than the
+/// direct probe did. A relayed probe is two round trips, so with per-probe loss `p` one relay fails
+/// with `1 − (1 − p)²`; `k` relays all fail with that to the `k`th, and the retry is at least as
+/// reliable as the try it backs up once that is at most `p`. Bounded by the relays there are.
+fn relay_count(loss: f64, available: usize) -> usize {
+    let through = 1.0 - (1.0 - loss) * (1.0 - loss);
+    let mut all_fail = through;
+    let mut count = 1usize;
+    while all_fail > loss && count < available {
+        all_fail *= through;
+        count = count.saturating_add(1);
+    }
+    count.min(available)
+}
+
+/// The failure detector for one node: its [`Membership`] view, its probe rotation, the period's
+/// probe, and per peer the estimator and verdict that time its probes.
 pub struct Detector {
     membership: Membership,
     local: HostId,
     order: Vec<HostId>,
     cursor: usize,
-    probing: Option<HostId>,
-    acked: bool,
-    suspicion: BTreeMap<HostId, u32>,
-    confirmations: BTreeMap<HostId, BTreeSet<HostId>>,
+    probe: Option<Probe>,
+    /// Whether another member was heard from during a measurement probe.
+    heard_other: bool,
+    peers: BTreeMap<HostId, Peer>,
+    /// Every round trip the member measured, to anyone: the judge of a pair that cannot configure
+    /// yet. Its sequence numbers are the member's probe nonces, so a probe never answered is a
+    /// loss.
+    pool: Stream,
     gossip: Gossip,
-    health: u32,
+    transmits: u32,
     shuffler: RandomizedOrder,
     coordinates: CoordinateEngine,
     peer_coordinates: BTreeMap<HostId, NetworkCoordinate>,
-    timing: DetectorTiming,
-    /// Protocol periods this detector has run: the clock an extension's rate limit counts in.
+    /// Probes this member has sent: the next probe's nonce.
+    nonce: u64,
+    /// Probes relayed for others, counted down from the top of the nonce space so they never meet
+    /// the member's own.
+    relayed: u64,
+    lateness: Lateness,
+    /// The wake last asked of the caller, to measure how late it came.
+    asked: Option<u64>,
+    /// The latest round trip measured, to anyone.
+    last_rtt_ns: Option<u64>,
+    /// The latest this member has woken past a wake it asked, nanoseconds.
+    latest_wake: u64,
+    /// The longest span `μ + α` any verdict of this member has had, nanoseconds.
+    longest_span: u64,
+    periods: Periods,
+    exposure: Exposure,
+    /// Protocol periods run: the clock an extension's rate limit counts in.
     period: u64,
-    /// The extensions granted to each suspected member (mantle note 32 S13), dropped when the
-    /// suspicion ends.
+    /// The extensions granted to each suspected member (mantle note 32 S13).
     extensions: BTreeMap<HostId, ExtensionTracker>,
-    /// This node's own handling delay in whole periods: the time between a probe's arrival and its
-    /// handling, as the owner measured it (mantle `node.md` §3.5).
-    self_lag_periods: u32,
-    /// The suspects a tick ages, held across ticks so ageing allocates nothing once grown.
+    /// The suspects a condemnation visits, held across periods so it allocates nothing once grown.
     aging: Vec<(HostId, u64)>,
     /// The relays an indirect probe ranks, held for the same reason.
     relays: Vec<HostId>,
 }
 
-/// A deterministic pseudo-random order over the members to probe (SWIM §4): each protocol period probes
-/// the next member of a shuffled permutation, and a fresh permutation is drawn each round, so every
-/// member is probed once per round and the worst-case time to first probe is one round — not the
-/// unbounded wait a fixed rotation can suffer. The generator is a deterministic xorshift seeded from the
-/// node id, so the simulation replays failure histories identically (the timing must be portable).
+/// A deterministic pseudo-random order over the members to probe (SWIM §4.3): each round probes a
+/// fresh shuffled permutation, so every member is probed once a round and successive probes of one
+/// member are at most `2m − 1` periods apart. Seeded from the node id, so a simulation replays.
 struct RandomizedOrder {
     state: u64,
 }
@@ -177,49 +463,505 @@ impl RandomizedOrder {
     }
 }
 
+/// Where the period's probe stands.
+enum Stage {
+    /// Waiting for an answer or a deadline.
+    Wait,
+    /// The direct deadline passed unanswered: ask relays.
+    Indirect,
+    /// The period is over.
+    Over,
+}
+
 impl Detector {
-    /// A detector for `local` under the derived [`DetectorTiming`]. The node starts at full health
-    /// (multiplier zero); a member is declared dead after it has been suspected for
-    /// `suspicion_periods × (health + 1)` protocol periods.
-    pub fn new(local: HostId, timing: DetectorTiming) -> Detector {
+    /// A detector for `local`, with the fleet's failure history so far (`history`, the node time it
+    /// has run and the failures it has had; [`Exposure::new`] for a fleet with none).
+    pub fn new(local: HostId, history: Exposure) -> Detector {
         Detector {
             membership: Membership::new(local),
             local,
             order: Vec::new(),
             cursor: 0,
-            probing: None,
-            acked: false,
-            suspicion: BTreeMap::new(),
-            confirmations: BTreeMap::new(),
+            probe: None,
+            heard_other: false,
+            peers: BTreeMap::new(),
+            pool: Stream::default(),
             gossip: Gossip::default(),
-            health: 0,
+            transmits: 1,
             shuffler: RandomizedOrder::seeded(local),
             coordinates: CoordinateEngine::new(),
             peer_coordinates: BTreeMap::new(),
-            timing,
+            nonce: 0,
+            relayed: u64::MAX,
+            lateness: Lateness::new(),
+            asked: None,
+            last_rtt_ns: None,
+            latest_wake: 0,
+            longest_span: 0,
+            periods: Periods::default(),
+            exposure: history,
             period: 0,
             extensions: BTreeMap::new(),
-            self_lag_periods: 0,
             aging: Vec::new(),
             relays: Vec::new(),
         }
     }
 
-    /// Records this node's own lag: `lag_ns` between a probe's arrival and its handling, in a
-    /// protocol period of `period_ns`, as whole periods rounded up (mantle `node.md` §3.5).
-    ///
-    /// Lifeguard's local-health score counts missed and refuted probes, which say the node looks
-    /// unhealthy to others. The lag measures its own slowness directly, which needs no heuristic
-    /// limit. The two measure different things, so the effective health is the larger of the two,
-    /// within `health_max`.
-    pub fn observe_self_lag(&mut self, lag_ns: u64, period_ns: u64) {
-        let periods = lag_ns.div_ceil(period_ns.max(1));
-        self.self_lag_periods = u32::try_from(periods).unwrap_or(u32::MAX);
+    /// Advances the detector to `now_ns` (the caller's monotonic clock): ends the period when its
+    /// probe is answered past its deadline, or unanswered past the indirect probe's; asks relays
+    /// when the direct deadline passes unanswered (`requests`, replaced); and starts the next
+    /// period, returning its [`Ping`] for the caller to send now. Called at every
+    /// [`wake`](Detector::wake) and after every message the caller feeds in.
+    pub fn poll(&mut self, now_ns: u64, requests: &mut Vec<PingReq>) -> Option<Ping> {
+        requests.clear();
+        self.measure_wake(now_ns);
+        let ping = match self.stage(now_ns) {
+            Stage::Wait => None,
+            Stage::Indirect => {
+                self.request_indirect(now_ns, requests);
+                if requests.is_empty() {
+                    self.next_period(now_ns)
+                } else {
+                    None
+                }
+            }
+            Stage::Over => self.next_period(now_ns),
+        };
+        self.asked = self.wake();
+        ping
+    }
+
+    /// When to [`poll`](Detector::poll) next, on the caller's clock: the probe's deadline, or the
+    /// indirect probe's once asked. `None` while a probe is measurement only (poll on the next
+    /// message), or before the first poll.
+    pub fn wake(&self) -> Option<u64> {
+        let probe = self.probe?;
+        if probe.verdict.is_none() {
+            return probe.expected.filter(|_| !probe.answered);
+        }
+        if probe.answered {
+            return probe.due_ns();
+        }
+        probe.indirect_until.or_else(|| probe.due_ns())
+    }
+
+    /// A wake that came at or after the one asked is a timed wait's lateness, `G`'s sample.
+    fn measure_wake(&mut self, now_ns: u64) {
+        if let Some(at) = self.asked
+            && now_ns >= at
+        {
+            // A full fold keeps its mean: `G` stands as measured.
+            let _ = self.lateness.on_wait(at, now_ns);
+            self.latest_wake = self.latest_wake.max(now_ns.saturating_sub(at));
+            self.asked = None;
+        }
+    }
+
+    fn stage(&self, now_ns: u64) -> Stage {
+        let Some(probe) = self.probe else {
+            return Stage::Over;
+        };
+        let due = probe.due_ns();
+        match (probe.answered, due, probe.indirect_until) {
+            // Measurement: over when answered or at its expected arrival; before any round trip,
+            // when another member is heard from.
+            (true, None, _) => Stage::Over,
+            (false, None, _) => match probe.expected {
+                Some(at) if now_ns < at => Stage::Wait,
+                Some(_) => Stage::Over,
+                None if self.heard_other => Stage::Over,
+                None => Stage::Wait,
+            },
+            (true, Some(due), _) | (false, Some(due), None) if now_ns < due => Stage::Wait,
+            (true, Some(_), _) => Stage::Over,
+            (false, Some(_), None) => Stage::Indirect,
+            (false, Some(_), Some(until)) if now_ns < until => Stage::Wait,
+            (false, Some(_), Some(_)) => Stage::Over,
+        }
+    }
+
+    /// Resolves the period's probe and starts the next.
+    fn next_period(&mut self, now_ns: u64) -> Option<Ping> {
+        if let Some(probe) = self.probe.take() {
+            self.resolve(probe, now_ns);
+        }
+        self.period = self.period.saturating_add(1);
+        let membership = &self.membership;
+        self.extensions.retain(|host, _| {
+            membership.state(*host).map(|state| state.liveness) == Some(Liveness::Suspect)
+        });
+        self.start(now_ns)
+    }
+
+    /// Starts a probe of the next member in the rotation at `now_ns`.
+    fn start(&mut self, now_ns: u64) -> Option<Ping> {
+        let target = self.next_target()?;
+        let nonce = self.nonce;
+        self.nonce = self.nonce.saturating_add(1);
+        let own = self.peers.get(&target).and_then(|peer| peer.stream.verdict);
+        let verdict = match own {
+            Some(own) => Some(own),
+            None => self.pooled(),
+        };
+        let peer = self.peers.entry(target).or_insert_with(Peer::new);
+        let seq = peer.sent;
+        peer.sent = peer.sent.saturating_add(1);
+        peer.send(Sent {
+            seq,
+            nonce,
+            at_ns: now_ns,
+        });
+        self.probe = Some(Probe {
+            target,
+            nonce,
+            seq,
+            sent_ns: now_ns,
+            answered: false,
+            verdict,
+            indirect_until: None,
+            expected: self.last_rtt_ns.map(|rtt| now_ns.saturating_add(rtt)),
+        });
+        self.heard_other = false;
+        Some(Ping { to: target, nonce })
+    }
+
+    /// Fills `requests` with the relays to ask for the period's probe, and sets when their answers
+    /// are due: the slowest relay's own deadline span (the leg to it and back) plus the target's
+    /// (the relay's leg to the target, whose stalls are the target's own).
+    fn request_indirect(&mut self, now_ns: u64, requests: &mut Vec<PingReq>) {
+        let Some(mut probe) = self.probe else {
+            return;
+        };
+        let Some(verdict) = probe.verdict else {
+            return;
+        };
+        self.rank_relays(probe.target);
+        let count = relay_count(verdict.loss, self.relays.len());
+        let mut slowest = 0u64;
+        for &relay in self.relays.iter().take(count) {
+            requests.push(PingReq {
+                relay,
+                target: probe.target,
+                nonce: probe.nonce,
+            });
+            let span = self
+                .peers
+                .get(&relay)
+                .and_then(|peer| peer.stream.verdict)
+                .or(self.pool.verdict)
+                .map_or(verdict.span_ns(), |relayed| relayed.span_ns());
+            slowest = slowest.max(span);
+        }
+        let until = now_ns
+            .saturating_add(slowest)
+            .saturating_add(verdict.span_ns());
+        probe.indirect_until = Some(until);
+        self.probe = Some(probe);
+    }
+
+    /// Ranks the alive peers other than `target` as relays, nearest the target first.
+    fn rank_relays(&mut self, target: HostId) {
+        let mut relays = std::mem::take(&mut self.relays);
+        relays.clear();
+        relays.extend(
+            self.membership
+                .alive()
+                .filter(|host| *host != self.local && *host != target),
+        );
+        relays.sort_by(|a, b| {
+            match (
+                self.predicted_between(*a, target),
+                self.predicted_between(*b, target),
+            ) {
+                (Some(x), Some(y)) => x.total_cmp(&y).then(a.0.cmp(&b.0)),
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => a.0.cmp(&b.0),
+            }
+        });
+        self.relays = relays;
+    }
+
+    /// The period ends: its length is folded, the exposure grows, and an unanswered judged probe
+    /// suspects its target or, when it had told the target, condemns it.
+    fn resolve(&mut self, probe: Probe, now_ns: u64) {
+        let length = now_ns.saturating_sub(probe.sent_ns);
+        self.periods.add(length);
+        let watched = u32::try_from(self.order.len()).unwrap_or(u32::MAX);
+        self.exposure
+            .on_exposure(Duration::from_nanos(length).saturating_mul(watched));
+        let Some(peer) = self.peers.get_mut(&probe.target) else {
+            return;
+        };
+        Self::account(peer, probe.verdict);
+        if probe.answered {
+            peer.clear_pending();
+            self.condemn_pending(probe.target, now_ns);
+        } else if probe.verdict.is_some() {
+            self.missed(probe, now_ns);
+        }
+    }
+
+    /// Theorem 7's allowance for a judged probe: its bound for a suspicion, and for a
+    /// condemnation the bound on it and the previous probe both missing, the lesser of the two
+    /// (Fréchet's bound). Not their product: a pair's probes are a few periods apart, inside the
+    /// stalls' correlation time the traces measured (20 to 250 ms, `docs/timing.md` §2.6), and a
+    /// short history's `τ_int` of one has not yet seen a stall.
+    fn account(peer: &mut Peer, verdict: Option<Verdict>) {
+        let Some(verdict) = verdict else {
+            peer.last_mistake = None;
+            return;
+        };
+        let report = &mut peer.report;
+        report.suspicion_allowance += verdict.mistake;
+        if let Some(previous) = peer.last_mistake {
+            report.condemnation_allowance += previous.min(verdict.mistake);
+        }
+        peer.last_mistake = Some(verdict.mistake);
+    }
+
+    /// A judged probe went unanswered.
+    fn missed(&mut self, probe: Probe, now_ns: u64) {
+        let Some(state) = self.membership.state(probe.target) else {
+            return;
+        };
+        match state.liveness {
+            Liveness::Alive => {
+                if let Some(peer) = self.peers.get_mut(&probe.target) {
+                    peer.report.suspicions = peer.report.suspicions.saturating_add(1);
+                }
+                self.record(
+                    probe.target,
+                    MemberState {
+                        liveness: Liveness::Suspect,
+                        incarnation: state.incarnation,
+                    },
+                );
+            }
+            Liveness::Suspect => {
+                let granted = self
+                    .extensions
+                    .get(&probe.target)
+                    .map_or(0, ExtensionTracker::total);
+                if let Some(peer) = self.peers.get_mut(&probe.target)
+                    && peer.suspected_from.is_some_and(|from| probe.seq >= from)
+                {
+                    peer.told_missed = peer.told_missed.saturating_add(1);
+                    if peer.told_missed > granted && peer.pending_since.is_none() {
+                        peer.pending_since = Some(now_ns);
+                        peer.report.pending_since_ns = Some(now_ns);
+                    }
+                }
+            }
+            Liveness::Dead => {}
+        }
+    }
+
+    /// An answer from `answered` proves this member's own network works: every suspect whose told
+    /// probe went unanswered is condemned now.
+    fn condemn_pending(&mut self, answered: HostId, now_ns: u64) {
+        let mut suspects = std::mem::take(&mut self.aging);
+        suspects.clear();
+        suspects.extend(self.membership.suspects());
+        let mut bound = None;
+        for &(host, incarnation) in &suspects {
+            let Some(peer) = self.peers.get_mut(&host) else {
+                continue;
+            };
+            let Some(pending) = peer.pending_since else {
+                continue;
+            };
+            if host == answered {
+                continue;
+            }
+            let after = peer
+                .last_answer_ns
+                .map(|at| Duration::from_nanos(now_ns.saturating_sub(at)));
+            // The bound to the pending condemnation, and the wait for an answer from another
+            // member, measured as it happened.
+            let within = bound
+                .get_or_insert_with(|| self.detection_bound(now_ns))
+                .map(|bound| {
+                    bound.saturating_add(Duration::from_nanos(now_ns.saturating_sub(pending)))
+                });
+            if let Some(peer) = self.peers.get_mut(&host) {
+                peer.report.condemnations = peer.report.condemnations.saturating_add(1);
+                peer.report.condemned_after = after;
+                peer.report.condemned_within = within;
+            }
+            self.record(
+                host,
+                MemberState {
+                    liveness: Liveness::Dead,
+                    incarnation,
+                },
+            );
+        }
+        self.aging = suspects;
+    }
+
+    /// The bound on the time from a peer's last answer to this member's condemnation of it pending,
+    /// were it to crash then, `m` the members the view holds besides this one: its next probe is
+    /// at most `2m − 1` periods away (SWIM §4.3),
+    /// unanswered it suspects; the probe that tells it starts at most as far again, and when its
+    /// own period resolves it unanswered the condemnation is pending. It then waits on an answer from another member, the evidence that
+    /// this member's own network works, which nothing bounds in advance: the member measures that
+    /// wait ([`PeerReport::pending_since_ns`]) and adds it. A period lasts at most the longest this
+    /// member has run, or, where longer, what an unanswered probe's deadlines allow: its target's
+    /// span, then the slowest relay's and the target's again, at most three times the longest
+    /// span any of its verdicts has had, plus the latest this member has woken past a wake it
+    /// asked, or is late for now; the period in progress counts as run. `None` before a period.
+    pub fn detection_bound(&self, now_ns: u64) -> Option<Duration> {
+        if self.periods.count == 0 {
+            return None;
+        }
+        // Every member the view holds but this one: no round is larger, whatever the rounds in
+        // the window were (a member that condemned another, even falsely, runs smaller ones).
+        let watched = u64::try_from(self.membership.len().saturating_sub(1)).unwrap_or(u64::MAX);
+        let spacing = watched.saturating_mul(2).saturating_sub(1);
+        // The told probe's own period resolves it: one more.
+        let periods = spacing.saturating_mul(2).saturating_add(1);
+        // The period in progress and the wake it is late for are measured too: a stall the
+        // member is in when it states the bound is in the bound.
+        let running = self
+            .probe
+            .map_or(0, |probe| now_ns.saturating_sub(probe.sent_ns));
+        let late = self
+            .asked
+            .map_or(0, |at| now_ns.saturating_sub(at))
+            .max(self.latest_wake);
+        let unanswered = self.longest_span.saturating_mul(3).saturating_add(late);
+        let period = self.periods.longest.max(running).max(unanswered);
+        Some(Duration::from_nanos(period.saturating_mul(periods)))
+    }
+
+    /// Records an acknowledgement from `from` of the probe `nonce`, received at `at_ns` (the
+    /// kernel's receive stamp where the caller has one, else when it was read). It answers the
+    /// period's probe if it is that probe's, and its round trip is measured whatever probe it
+    /// answers, however late: a late answer is the tail the margin must cover.
+    pub fn on_ack(&mut self, from: HostId, nonce: u64, at_ns: u64) {
+        match self.probe.as_mut() {
+            Some(probe) if probe.target == from && probe.nonce == nonce => probe.answered = true,
+            Some(probe) if probe.target != from => self.heard_other = true,
+            _ => {}
+        }
+        let measure = self.granularity().zip(self.periods.mean_ns());
+        let interval = measure.map(|(_, period)| self.pair_interval(period));
+        let mtbf = self.exposure.mtbf();
+        let Some(peer) = self.peers.get_mut(&from) else {
+            return;
+        };
+        // Any answer is evidence of life when it arrives, even one too late to be measured.
+        peer.last_answer_ns = Some(peer.last_answer_ns.map_or(at_ns, |last| last.max(at_ns)));
+        let Some(sent) = peer.take(nonce) else {
+            return;
+        };
+        let rtt = at_ns.saturating_sub(sent.at_ns);
+        self.last_rtt_ns = Some(rtt);
+        if let Some(((granularity, period), interval)) = measure.zip(interval) {
+            peer.stream.take(sent.seq, rtt, granularity, interval);
+            if peer.stream.due() {
+                peer.stream.configure(mtbf, &floors(granularity), interval);
+                peer.report.configured = peer.stream.verdict.is_some();
+                if let Some(verdict) = peer.stream.verdict {
+                    self.longest_span = self.longest_span.max(verdict.span_ns());
+                }
+            }
+            // The pool is fed while it judges: by pairs with no verdict of their own, until it has
+            // one.
+            if !peer.report.configured || self.pool.verdict.is_none() {
+                self.pool
+                    .take(sent.nonce, rtt, granularity, Duration::from_nanos(period));
+            }
+        }
+        let seconds = Duration::from_nanos(rtt).as_secs_f64();
+        if let Some(coordinate) = self.peer_coordinates.get(&from) {
+            self.coordinates.update_with_rtt(coordinate, seconds);
+        }
+    }
+
+    /// The pool's verdict for a probe of a pair that has none of its own, renewed when due.
+    fn pooled(&mut self) -> Option<Verdict> {
+        if self.pool.due()
+            && let Some((granularity, period)) = self.granularity().zip(self.periods.mean_ns())
+        {
+            let interval = self.pair_interval(period);
+            self.pool
+                .configure(self.exposure.mtbf(), &floors(granularity), interval);
+            if let Some(verdict) = self.pool.verdict {
+                self.longest_span = self.longest_span.max(verdict.span_ns());
+            }
+        }
+        self.pool.verdict
+    }
+
+    /// The pair's probe interval: the round, one period for each member watched.
+    fn pair_interval(&self, period_ns: u64) -> Duration {
+        let watched = u64::try_from(self.order.len()).unwrap_or(1).max(1);
+        Duration::from_nanos(period_ns.saturating_mul(watched))
+    }
+
+    /// `G`, the mean lateness of this member's wakes, once measured and not zero.
+    pub fn granularity(&self) -> Option<Duration> {
+        self.lateness.granularity().filter(|g| !g.is_zero())
+    }
+
+    /// Records an indirect acknowledgement that `target` answered the probe `nonce` through a
+    /// relay, at `at_ns`: the period's probe is answered. A relayed round trip is two paths' and
+    /// is not the pair's sample.
+    pub fn on_indirect_ack(&mut self, target: HostId, nonce: u64, at_ns: u64) {
+        if let Some(probe) = self.probe.as_mut()
+            && probe.target == target
+            && probe.nonce == nonce
+        {
+            probe.answered = true;
+            if let Some(peer) = self.peers.get_mut(&target) {
+                peer.last_answer_ns = Some(at_ns);
+            }
+        }
+    }
+
+    /// Responds to a ping from `from` with the acknowledgement to send back. A ping from a member
+    /// other than the one being measured shows the network carries this member's traffic.
+    pub fn on_ping(&mut self, from: HostId) -> Ack {
+        if self.probe.is_some_and(|probe| probe.target != from) {
+            self.heard_other = true;
+        }
+        Ack { to: from }
+    }
+
+    /// As a relay, the ping to send `target` for a ping-request; its nonce is the relay's own,
+    /// from a range its own probes never use, and the caller maps the answer back to the asker.
+    pub fn on_ping_req(&mut self, target: HostId) -> Ping {
+        let nonce = self.relayed;
+        self.relayed = self.relayed.saturating_sub(1);
+        Ping { to: target, nonce }
+    }
+
+    /// What this member has done and promised about `peer`.
+    pub fn report(&self, peer: HostId) -> Option<PeerReport> {
+        self.peers.get(&peer).map(|held| PeerReport {
+            last_answer_ns: held.last_answer_ns,
+            ..held.report
+        })
+    }
+
+    /// The verdict that times this member's probes of `peer` now: the pair's, else the pool's.
+    pub fn verdict(&self, peer: HostId) -> Option<Verdict> {
+        self.peers
+            .get(&peer)
+            .and_then(|held| held.stream.verdict)
+            .or(self.pool.verdict)
+    }
+
+    /// The mean of this member's periods, once one has ended.
+    pub fn mean_period(&self) -> Option<Duration> {
+        self.periods.mean_ns().map(Duration::from_nanos)
     }
 
     /// A suspected `subject` asks for more time with a progress `witness` it cannot fake while
     /// stuck, saying whether it is `overloaded` (mantle note 32 S13; focal's witnessed extensions).
-    /// A grant lengthens the subject's suspicion window by the granted periods.
+    /// The base window is the one probe that tells a suspect, so a grant is one more probe.
     pub fn request_extension(
         &mut self,
         subject: HostId,
@@ -233,12 +975,10 @@ impl Detector {
         if !suspected {
             return ExtensionDecision::Denied(ExtensionDenial::NotSuspected);
         }
-        self.extensions.entry(subject).or_default().request(
-            self.period,
-            self.timing.suspicion_periods,
-            witness,
-            overloaded,
-        )
+        self.extensions
+            .entry(subject)
+            .or_default()
+            .request(self.period, 1, witness, overloaded)
     }
 
     /// This node's own network coordinate, to gossip so peers can predict the round-trip time to it.
@@ -246,11 +986,9 @@ impl Detector {
         self.coordinates.coordinate()
     }
 
-    /// Learns `peer`'s network coordinate (from a probe reply or gossip), so this node can predict the
-    /// round-trip time to it and rank it among indirect-probe relays by proximity. Only a member this
-    /// node probes is learned, and a member's coordinate is forgotten when it is declared dead, so the
-    /// coordinates held are bounded by the membership. A coordinate already held is overwritten in
-    /// place.
+    /// Learns `peer`'s network coordinate (from a probe reply or gossip). Only a member this node
+    /// probes is learned, and a member's coordinate is forgotten when it is declared dead, so the
+    /// coordinates held are bounded by the membership.
     pub fn learn_coordinate(&mut self, peer: HostId, coordinate: Coordinate<'_>) {
         if peer == self.local || !self.is_probed(peer) {
             return;
@@ -264,24 +1002,15 @@ impl Detector {
         }
     }
 
-    /// Folds a measured round-trip `rtt` to `peer` into this node's own coordinate (Vivaldi), when `peer`'s
-    /// coordinate is known — so the coordinate learns to predict RTTs from real samples. A sample to a peer
-    /// whose coordinate is not yet known is skipped (there is nothing to relax against).
-    pub fn observe_rtt(&mut self, peer: HostId, rtt: f64) {
-        if let Some(coordinate) = self.peer_coordinates.get(&peer) {
-            self.coordinates.update_with_rtt(coordinate, rtt);
-        }
-    }
-
-    /// The predicted round-trip time from this node to `peer`, when `peer`'s coordinate is known.
+    /// The predicted round-trip time from this node to `peer`, in seconds, when `peer`'s coordinate
+    /// is known.
     pub fn predicted_rtt(&self, peer: HostId) -> Option<f64> {
         self.peer_coordinates
             .get(&peer)
             .map(|coordinate| self.coordinates.predict(coordinate))
     }
 
-    /// The predicted round-trip time between two peers whose coordinates this node has learned — the basis
-    /// for picking indirect-probe relays that sit near the target.
+    /// The predicted round-trip time between two peers whose coordinates this node has learned.
     fn predicted_between(&self, from: HostId, to: HostId) -> Option<f64> {
         let from_coordinate = self.peer_coordinates.get(&from)?;
         let to_coordinate = self.peer_coordinates.get(&to)?;
@@ -291,63 +1020,16 @@ impl Detector {
         ))
     }
 
-    /// The Lifeguard local-health multiplier, `health + 1` — how much the node's own timing is dilated
-    /// because it looks unhealthy. One at full health. The caller multiplies its probe-period timer by
-    /// this so a degraded node also probes less aggressively (the design's dilation of the probe cadence,
-    /// which is the caller's clock; the suspicion window is dilated internally).
-    pub fn health_multiplier(&self) -> u32 {
-        self.health
-            .max(self.self_lag_periods.min(self.timing.health_max))
-            .saturating_add(1)
-    }
-
-    /// Raises the local-health multiplier toward its cap — the node just looked unhealthy (a probe it
-    /// sent went wholly unanswered, or it had to refute a suspicion about itself).
-    fn worsen_health(&mut self) {
-        self.health = self.health.saturating_add(1).min(self.timing.health_max);
-    }
-
-    /// Lowers the local-health multiplier toward zero — the node just looked healthy (a probe succeeded).
-    fn improve_health(&mut self) {
-        self.health = self.health.saturating_sub(1);
-    }
-
-    /// The effective suspicion window for a member with `confirmations` independent suspicions this period
-    /// (§4.8): the confirmation-count timeout `max − (max−min)·log(C+1)/log(K+1)` — shrinking from the base
-    /// window toward the floor as independent peers corroborate the failure — then dilated by the Lifeguard
-    /// local-health multiplier (a node that itself looks unhealthy waits longer before declaring a peer
-    /// dead). The two mechanisms compose: corroboration shortens the wait, local ill-health lengthens it.
-    fn suspicion_window(&self, confirmations: u64) -> u32 {
-        let corroborated = crate::fixed::suspicion_window(
-            confirmations,
-            self.timing.suspicion_periods,
-            self.timing.suspicion_min,
-            self.timing.confirmations_expected,
-        );
-        corroborated.saturating_mul(self.health_multiplier())
-    }
-
-    /// Records that `by` — a member *other* than this node's own originating probe — independently
-    /// suspects `subject`, a distinct confirmation that shortens `subject`'s window through the
-    /// confirmation-count timeout. The originator (this node, when its own probe started the suspicion) is
-    /// never recorded here: its evidence is the suspicion itself, so counting it would collapse a lone
-    /// suspicion to the floor. Only tracked while `subject` is actually suspected.
-    fn confirm(&mut self, subject: HostId, by: HostId) {
-        self.confirmations.entry(subject).or_default().insert(by);
-    }
-
-    /// Applies a membership update and enqueues the resulting change for gossip dissemination.
+    /// Applies a membership update, enqueues the change for gossip, and keeps the peer's suspicion
+    /// state in step with the view.
     fn record(&mut self, subject: HostId, update: MemberState) -> Option<Change> {
         let change = self.membership.apply(subject, update);
         match change {
             Some(Change::Adopted { member, state }) => {
                 self.gossip.record(member, state);
+                self.adopted(member, state.liveness);
             }
             Some(Change::Refuted { incarnation }) => {
-                // A peer suspected us: our acknowledgements are not reaching the fleet, so we look unhealthy —
-                // raise the local-health multiplier (Lifeguard) and gossip the refutation so the fleet learns
-                // we are alive at the new incarnation.
-                self.worsen_health();
                 let state = MemberState {
                     liveness: Liveness::Alive,
                     incarnation,
@@ -359,25 +1041,40 @@ impl Detector {
         change
     }
 
-    /// The batch of membership updates to piggyback on an outgoing ping or acknowledgement: up to `max`,
-    /// the least-disseminated first, each with its remaining-transmit count decremented and dropped once
-    /// exhausted — so the buffer is bounded and each change spreads a fixed number of times (§4.8; SWIM
-    /// infection-style dissemination).
-    /// The batch replaces what `batch` held; `batch` keeps its capacity.
-    pub fn gossip_into(&mut self, max: usize, batch: &mut Vec<(HostId, MemberState)>) {
-        self.gossip.drain(max, self.timing.gossip_transmits, batch);
+    fn adopted(&mut self, member: HostId, liveness: Liveness) {
+        let peer = self.peers.entry(member).or_insert_with(Peer::new);
+        match liveness {
+            Liveness::Alive => peer.clear_suspicion(),
+            // A suspicion already held, adopted again at a newer incarnation, keeps the probes
+            // that told the peer: they carried a suspicion and went unanswered all the same.
+            Liveness::Suspect if peer.suspected_from.is_none() => {
+                peer.suspected_from = Some(peer.sent);
+                peer.clear_pending();
+            }
+            Liveness::Suspect => {}
+            Liveness::Dead => {
+                // The report keeps when the condemnation was pending, for the bound it is held to.
+                peer.suspected_from = None;
+                peer.told_missed = 0;
+                peer.pending_since = None;
+                self.exposure.on_failure();
+                self.extensions.remove(&member);
+                self.peer_coordinates.remove(&member);
+            }
+        }
     }
 
-    /// The gossip batch to piggyback on a direct ping to `target`: the ordinary batch
-    /// ([`gossip_into`](Detector::gossip_into)) plus, whenever this node currently **suspects** `target`, that
-    /// suspicion — even after its transmit budget is spent (Lifeguard's **buddy system**; memberlist's
-    /// `probeNode` sends a suspect message with every ping to a node it suspects). The suspected member then
-    /// hears it from the very probe it answers and refutes at once, the refutation riding the acknowledgement
-    /// back. Without it a member that comes back from a stall after the suspicion's `λ·ln(n+1)` transmits are
-    /// exhausted is never told it is suspected, never refutes, and is declared dead while answering every probe:
-    /// a direct acknowledgement does not clear a suspicion (only an alive at a higher incarnation does, SWIM
-    /// §4.2), so the refutation is the only way back. The batch stays within `max`: the least-fresh entry makes
-    /// room.
+    /// The batch of membership updates to piggyback on an outgoing message: up to `max`, the
+    /// least-disseminated first, each sent its budget ([`gossip_transmits`]) and then dropped.
+    /// The batch replaces what `batch` held; `batch` keeps its capacity.
+    pub fn gossip_into(&mut self, max: usize, batch: &mut Vec<(HostId, MemberState)>) {
+        self.gossip.drain(max, self.transmits, batch);
+    }
+
+    /// The gossip batch to piggyback on a direct ping to `target`: the ordinary batch plus, while
+    /// this node suspects `target` or holds it dead, that belief — even after its transmit budget
+    /// is spent (Lifeguard's buddy system), so the target hears it from the probe it answers and
+    /// refutes at once. Within `max`: the least-fresh entry makes room.
     pub fn ping_gossip_into(
         &mut self,
         target: HostId,
@@ -386,7 +1083,7 @@ impl Detector {
     ) {
         self.gossip_into(max, batch);
         if let Some(state) = self.membership.state(target)
-            && state.liveness == Liveness::Suspect
+            && state.liveness != Liveness::Alive
             && !batch.iter().any(|(host, _)| *host == target)
         {
             if batch.len() >= max {
@@ -396,31 +1093,11 @@ impl Detector {
         }
     }
 
-    /// Applies a received gossip batch, folding each update into the view (and re-enqueueing anything it
-    /// adopts so the change spreads onward — the infection continues).
+    /// Applies a received gossip batch, folding each update into the view (and re-enqueueing
+    /// anything it adopts so the change spreads onward).
     pub fn apply_gossip(&mut self, updates: impl IntoIterator<Item = (HostId, MemberState)>) {
         for (subject, state) in updates {
             self.apply(subject, state);
-        }
-    }
-
-    /// Applies a received gossip batch that arrived **from** `sender`, folding each update into the view
-    /// and, for every `Suspect` it carries, recording `sender` as an independent confirmer of that
-    /// suspicion — so a failure many peers suspect is declared dead sooner (the confirmation-count timeout,
-    /// §4.8). A `sender` that holds and gossips a suspicion is corroborating it; the count is of distinct
-    /// senders, so re-hearing the same sender does not inflate it.
-    pub fn apply_gossip_from(
-        &mut self,
-        sender: HostId,
-        updates: impl IntoIterator<Item = (HostId, MemberState)>,
-    ) {
-        for (subject, state) in updates {
-            self.apply(subject, state);
-            if state.liveness == Liveness::Suspect
-                && self.membership.state(subject).map(|s| s.liveness) == Some(Liveness::Suspect)
-            {
-                self.confirm(subject, sender);
-            }
         }
     }
 
@@ -429,7 +1106,7 @@ impl Detector {
         &self.membership
     }
 
-    /// Learns a peer (alive at incarnation zero) — a join. The next round will probe it.
+    /// Learns a peer (alive at incarnation zero) — a join. A later round will probe it.
     pub fn join(&mut self, peer: HostId) {
         if peer != self.local {
             self.record(
@@ -442,182 +1119,17 @@ impl Detector {
         }
     }
 
-    /// Applies a gossiped membership update (from a ping/ack payload), returning the change and enqueuing
-    /// it for onward gossip; an alive adoption clears any local suspicion of that peer.
+    /// Applies a gossiped membership update, returning the change and enqueuing it for onward
+    /// gossip.
     pub fn apply(&mut self, subject: HostId, update: MemberState) -> Option<Change> {
-        let change = self.record(subject, update);
-        if let Some(Change::Adopted { member, state }) = change
-            && state.liveness == Liveness::Alive
-        {
-            self.suspicion.remove(&member);
-            self.confirmations.remove(&member);
-        }
-        change
+        self.record(subject, update)
     }
 
-    /// Advances one protocol period: resolves the previous probe (a member that did not acknowledge is
-    /// suspected at its current incarnation), ages every suspected member toward death (declaring one
-    /// dead once it has been suspected for the suspicion window), then picks the next member to probe in
-    /// round-robin over the alive peers and returns the [`Ping`] to send — or `None` when there are no
-    /// peers to probe.
-    pub fn tick(&mut self) -> Option<Ping> {
-        self.period = self.period.saturating_add(1);
-        // A suspected member whose probe was answered this period is not aged toward death by the same tick
-        // that credits the answer: the acknowledgement is direct evidence of life. The suspicion itself stands
-        // until the member refutes it (SWIM §4.2 — a direct acknowledgement never clears a suspicion), so a
-        // member back from a stall stays in doubt, but it cannot be declared dead on a period that heard from
-        // it — which is what a late-but-answered probe used to do when the answer landed exactly as the
-        // window expired (`docs/bugs/2026-09-13-reused-stream-id-collides-behind-an-unacked-reply.md`).
-        let mut heard_from: Option<HostId> = None;
-        if let Some(target) = self.probing.take() {
-            if self.acked {
-                // The probe was answered (directly or through a relay): the node looks healthy.
-                self.improve_health();
-                heard_from = Some(target);
-            } else {
-                // The probe went wholly unanswered: raise the local-health multiplier (Lifeguard — this is as
-                // much a signal about us as about the target) and suspect a still-alive target.
-                self.worsen_health();
-                if let Some(current) = self.membership.state(target)
-                    && current.liveness == Liveness::Alive
-                {
-                    self.record(
-                        target,
-                        MemberState {
-                            liveness: Liveness::Suspect,
-                            incarnation: current.incarnation,
-                        },
-                    );
-                    // We are the ORIGINATOR of this suspicion, not a confirmer: our failed probe is the suspicion
-                    // itself, so it does not shrink the window. Only *other* members' independent confirmations do
-                    // (Lifeguard/memberlist; hyperscale's chaos tests showed self-counting collapses a lone
-                    // suspicion straight to the floor and evicts a peer mid-partition). C therefore starts at zero.
-                }
-            }
-        }
-        self.age_suspicions(heard_from);
-
-        let target = self.next_target()?;
-        self.probing = Some(target);
-        self.acked = false;
-        Some(Ping { to: target })
-    }
-
-    /// Records an acknowledgement from `from`: if it is this period's probe target, the probe succeeded.
-    pub fn on_ack(&mut self, from: HostId) {
-        if self.probing == Some(from) {
-            self.acked = true;
-        }
-    }
-
-    /// Responds to a received ping from `from` with the acknowledgement to send back.
-    pub fn on_ping(&self, from: HostId) -> Ack {
-        Ack { to: from }
-    }
-
-    /// When a direct ping has gone unanswered this period, asks up to `fanout` other alive peers to ping
-    /// the current target on our behalf (SWIM's indirect probe). Returns the ping-requests to send;
-    /// empty if there is no current target or no eligible relay. The caller sends them, and relays any
-    /// acknowledgement back as an indirect ack ([`on_indirect_ack`](Detector::on_indirect_ack)). The
-    /// requests replace what `requests` held.
-    pub fn request_indirect_into(&mut self, fanout: usize, requests: &mut Vec<PingReq>) {
-        requests.clear();
-        let Some(target) = self.probing else {
-            return;
-        };
-        if self.acked {
-            return;
-        }
-        let mut relays = std::mem::take(&mut self.relays);
-        relays.clear();
-        relays.extend(
-            self.membership
-                .alive()
-                .filter(|host| *host != self.local && *host != target),
-        );
-        // Prefer relays that sit nearest the target in coordinate space — they are the likeliest to reach it,
-        // so a lost direct packet is retried through a near proxy rather than an arbitrary one. A relay whose
-        // distance to the target is unknown sorts last, keeping a deterministic id-order fallback.
-        relays.sort_by(|a, b| {
-            match (
-                self.predicted_between(*a, target),
-                self.predicted_between(*b, target),
-            ) {
-                (Some(x), Some(y)) => x.total_cmp(&y).then(a.0.cmp(&b.0)),
-                (Some(_), None) => std::cmp::Ordering::Less,
-                (None, Some(_)) => std::cmp::Ordering::Greater,
-                (None, None) => a.0.cmp(&b.0),
-            }
-        });
-        requests.extend(
-            relays
-                .iter()
-                .take(fanout)
-                .map(|&relay| PingReq { relay, target }),
-        );
-        self.relays = relays;
-    }
-
-    /// As a relay, responds to a ping-request for `target` with the ping to send it; the caller relays
-    /// the resulting acknowledgement back to the requester (that relay-back routing is the caller's).
-    pub fn on_ping_req(&self, target: HostId) -> Ping {
-        Ping { to: target }
-    }
-
-    /// Records an indirect acknowledgement that `target` is alive (a relay reached it): if `target` is
-    /// this period's probe, the probe succeeded, so the target will not be suspected — a lost direct
-    /// packet is not mistaken for a failure.
-    pub fn on_indirect_ack(&mut self, target: HostId) {
-        if self.probing == Some(target) {
-            self.acked = true;
-        }
-    }
-
-    /// Ages each suspected member's counter by one period — except `heard_from`, the member whose probe was
-    /// answered this period (see [`tick`](Detector::tick)) — and a member suspected for its whole suspicion
-    /// window — the confirmation-count timeout for how many independent peers suspect it, dilated by the
-    /// local-health multiplier — is declared dead (at the incarnation it was suspected under). Counters and
-    /// confirmations for members no longer suspected (refuted or already dead) are dropped.
-    fn age_suspicions(&mut self, heard_from: Option<HostId>) {
-        let mut suspects = std::mem::take(&mut self.aging);
-        suspects.clear();
-        suspects.extend(self.membership.suspects());
-        let membership = &self.membership;
-        let suspected = |host: &HostId| {
-            membership.state(*host).map(|state| state.liveness) == Some(Liveness::Suspect)
-        };
-        self.suspicion.retain(|host, _| suspected(host));
-        self.confirmations.retain(|host, _| suspected(host));
-        self.extensions.retain(|host, _| suspected(host));
-        for &(host, incarnation) in &suspects {
-            if heard_from == Some(host) {
-                continue;
-            }
-            let confirmations = self.confirmations.get(&host).map_or(0, BTreeSet::len);
-            let granted = self
-                .extensions
-                .get(&host)
-                .map_or(0, ExtensionTracker::total);
-            let window = self
-                .suspicion_window(u64::try_from(confirmations).unwrap_or(u64::MAX))
-                .saturating_add(granted);
-            let periods = self.suspicion.entry(host).or_insert(0);
-            *periods = periods.saturating_add(1);
-            if *periods >= window {
-                self.record(
-                    host,
-                    MemberState {
-                        liveness: Liveness::Dead,
-                        incarnation,
-                    },
-                );
-                self.suspicion.remove(&host);
-                self.confirmations.remove(&host);
-                self.extensions.remove(&host);
-                self.peer_coordinates.remove(&host);
-            }
-        }
-        self.aging = suspects;
+    /// Whether this node holds no other member alive or suspected.
+    fn isolated(&self) -> bool {
+        let local = self.local;
+        self.membership.alive().all(|host| host == local)
+            && self.membership.suspects().next().is_none()
     }
 
     /// Whether `member` is one this node probes: alive or suspected — a member until it is dead.
@@ -628,31 +1140,19 @@ impl Detector {
         )
     }
 
-    /// The next peer to probe — alive **or suspected** — in **randomized** order (SWIM §4). A suspected
-    /// member is still a member and is probed until it is dead (SWIM §4.2; memberlist's `probe` skips only
-    /// dead and left nodes): its direct acknowledgement then counts ([`on_ack`](Detector::on_ack) credits the
-    /// member being probed), and each further miss keeps raising the local-health multiplier. Dropping a
-    /// suspect from the rotation left the suspicion to age with no probe going out in the detector's name —
-    /// no acknowledgement could register, the multiplier froze where the first miss left it, and a peer
-    /// starved for two seconds died at a window of four periods instead of the cap's six
-    /// (`docs/bugs/2026-09-13-swim-fixed-probe-deadline-kills-a-starved-live-peer.md`). Each round is a fresh
-    /// shuffled permutation of those peers, advanced one per period; when the round is exhausted a new
-    /// permutation is drawn — so every member is probed once per round and the worst-case wait for a first
-    /// probe is one round, not the unbounded delay a fixed rotation can suffer. Members that died mid-round
-    /// are skipped, and `None` is returned only when no live-or-suspected peer remains.
+    /// The next peer to probe — alive or suspected — in randomized order (SWIM §4.3). A suspect is
+    /// still a member and is probed until it is dead, so the probe that tells it is sent and its
+    /// answer counts. Each round is a fresh permutation; members dead mid-round are skipped. A
+    /// member with nobody alive or suspected left probes those it holds dead. The dissemination
+    /// budget follows the membership at each round.
     fn next_target(&mut self) -> Option<HostId> {
         loop {
-            // Advance through the current shuffled round, skipping any member that died mid-round.
             while let Some(&candidate) = self.order.get(self.cursor) {
                 self.cursor = self.cursor.saturating_add(1);
-                if self.is_probed(candidate) {
+                if self.is_probed(candidate) || self.isolated() {
                     return Some(candidate);
                 }
             }
-            // The round is exhausted. Draw a fresh permutation from the current live-or-suspected peers; if none
-            // remain, there is no target. The fresh set is drawn from them, so the next pass returns its first
-            // member — the loop makes at most one further pass, and terminates without a step count.
-            // The fresh round reuses the last round's vector.
             let local = self.local;
             let suspected = self.membership.suspects().map(|(host, _)| host);
             self.order.clear();
@@ -663,353 +1163,607 @@ impl Detector {
                     .filter(|host| *host != local),
             );
             if self.order.is_empty() {
+                // Nobody left alive in this member's view: it is likelier the one cut off than
+                // every other member dead (Lifeguard §IV), so it probes the members it holds dead;
+                // each ping tells its target so, and a live one refutes in its answer.
+                self.order.extend(self.membership.dead());
+            }
+            if self.order.is_empty() {
                 return None;
             }
+            self.transmits = gossip_transmits(self.order.len().saturating_add(1));
             self.shuffler.shuffle(&mut self.order);
             self.cursor = 0;
         }
     }
 }
 
+/// Feeds a round trip as heartbeat `seq` on the estimator's schedule: arrival
+/// `(seq − anchor)·η + rtt`, so the offset it measures is the round trip itself. The schedule is
+/// the estimator's own interval, which tracks the pair's real spacing on average; a probe's
+/// spacing does not enter NFD-E's offset.
+fn feed(
+    estimator: &mut LinkEstimator,
+    seq: u64,
+    anchor: u64,
+    rtt: u64,
+) -> Result<(), hyper_timing::EstimateError> {
+    let interval = nanos(estimator.interval());
+    let arrival = seq
+        .checked_sub(anchor)
+        .and_then(|steps| steps.checked_mul(interval))
+        .and_then(|scheduled| scheduled.checked_add(rtt))
+        .ok_or(hyper_timing::EstimateError::OutOfRange)?;
+    estimator.on_heartbeat(seq, arrival).map(|_| ())
+}
+
+/// The floors under a verdict: the member's granularity `G`, and the sender's `E[flush] + G = G`
+/// (an acknowledgement is not flushed). The suspicion's margin holds one probe: SWIM judges each
+/// probe on its own, and the condemnation that follows is the multi-probe rule
+/// (`docs/timing.md` §2.7), so no correlation time enters.
+fn floors(granularity: Duration) -> Floors {
+    Floors {
+        granularity,
+        sender: granularity,
+        correlation: Duration::MAX,
+    }
+}
+
+/// The verdict for a probe stream: the margin minimizing unavailability at the pair's interval,
+/// where a false suspicion costs the time until it is refuted — the pair's next probe, which
+/// carries it, answered: `η + μ` — and a crash costs its detection.
+fn verdict(
+    estimator: &LinkEstimator,
+    mtbf: Option<Duration>,
+    floors: &Floors,
+    interval: Duration,
+) -> Result<Verdict, Refusal> {
+    let link: LinkBehaviour = estimator.behaviour()?;
+    let mtbf = mtbf.ok_or(Refusal::Unconfigurable)?;
+    let costs = Costs {
+        election: interval.saturating_add(link.mean_delay),
+        mtbf,
+    };
+    let configured = detector_at(&link, &costs, floors, interval).ok_or(Refusal::Unconfigurable)?;
+    let variance = link.delay_deviation.as_secs_f64().powi(2);
+    let mistake = mistake_bound(
+        link.loss,
+        variance,
+        interval.as_secs_f64(),
+        configured.margin.as_secs_f64(),
+    );
+    Ok(Verdict {
+        round_trip: link.mean_delay,
+        margin: configured.margin,
+        interval,
+        loss: link.loss,
+        mistake,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// The batch and request calls as values of their own, for the tests that read them.
-    impl Detector {
-        fn gossip(&mut self, max: usize) -> Vec<(HostId, MemberState)> {
-            let mut batch = Vec::new();
-            self.gossip_into(max, &mut batch);
-            batch
-        }
-
-        fn ping_gossip(&mut self, target: HostId, max: usize) -> Vec<(HostId, MemberState)> {
-            let mut batch = Vec::new();
-            self.ping_gossip_into(target, max, &mut batch);
-            batch
-        }
-
-        fn request_indirect(&mut self, fanout: usize) -> Vec<PingReq> {
-            let mut requests = Vec::new();
-            self.request_indirect_into(fanout, &mut requests);
-            requests
-        }
-    }
 
     const LOCAL: HostId = HostId(1);
     const A: HostId = HostId(2);
     const B: HostId = HostId(3);
     const C: HostId = HostId(4);
+    const MS: u64 = 1_000_000;
 
-    /// Timing for the pure-SWIM tests: the given suspicion window and gossip transmits, with the Lifeguard
-    /// local-health multiplier disabled (`health_max = 0`) and the confirmation curve off (the floor equals
-    /// the ceiling), so those tests exercise probing, suspicion and gossip in isolation. The LHM tests set
-    /// `health_max` and the confirmation test sets `suspicion_min` directly.
-    fn timing(suspicion_periods: u32, gossip_transmits: u32) -> DetectorTiming {
-        DetectorTiming {
-            suspicion_periods,
-            gossip_transmits,
-            health_max: 0,
-            suspicion_min: suspicion_periods,
-            confirmations_expected: 1,
+    /// A xorshift stream (Marsaglia 2003): deterministic test noise.
+    fn noise(state: &mut u64) -> u64 {
+        *state ^= *state << 13;
+        *state ^= *state >> 7;
+        *state ^= *state << 17;
+        *state
+    }
+
+    /// A detector for `LOCAL` that knows `peers`.
+    fn detector(peers: &[HostId]) -> Detector {
+        let mut detector = Detector::new(LOCAL, Exposure::new());
+        for &peer in peers {
+            detector.join(peer);
+        }
+        detector
+    }
+
+    /// The driver of one detector over simulated time: answers each probe after the round trip
+    /// `answer` gives (none for silence), wakes `late` after each wake asked, and, when nothing
+    /// is due, hears a ping from `heard`.
+    struct World {
+        now: u64,
+        late: u64,
+        heard: HostId,
+        pings: Vec<Ping>,
+        requests: Vec<PingReq>,
+        asked: Vec<PingReq>,
+    }
+
+    impl World {
+        fn new() -> Self {
+            Self {
+                now: MS,
+                late: MS / 10,
+                heard: C,
+                pings: Vec::new(),
+                requests: Vec::new(),
+                asked: Vec::new(),
+            }
+        }
+
+        /// Runs `periods` periods.
+        fn run(
+            &mut self,
+            detector: &mut Detector,
+            periods: usize,
+            mut answer: impl FnMut(HostId) -> Option<u64>,
+        ) {
+            let mut pending: Option<(HostId, u64, u64)> = None;
+            let mut started = 0;
+            while started <= periods {
+                if let Some(ping) = detector.poll(self.now, &mut self.requests) {
+                    self.pings.push(ping);
+                    started += 1;
+                    pending = answer(ping.to).map(|rtt| (ping.to, ping.nonce, self.now + rtt));
+                }
+                self.asked.extend(self.requests.iter().copied());
+                let ack = pending.map(|(_, _, at)| at);
+                match (detector.wake().map(|w| w + self.late), ack) {
+                    (Some(wake), Some(at)) => self.now = wake.min(at).max(self.now),
+                    (Some(wake), None) => self.now = wake.max(self.now),
+                    (None, Some(at)) => self.now = at.max(self.now),
+                    (None, None) => {
+                        self.now += MS;
+                        detector.on_ping(self.heard);
+                    }
+                }
+                if let Some((from, nonce, at)) = pending
+                    && at <= self.now
+                {
+                    detector.on_ack(from, nonce, at);
+                    pending = None;
+                }
+            }
         }
     }
 
-    /// A suspicion update about the local node at its current incarnation — the input that forces a
-    /// self-refutation (and, with it, a local-health worsening).
-    fn self_suspicion(detector: &Detector) -> MemberState {
-        MemberState {
-            liveness: Liveness::Suspect,
-            incarnation: detector.membership().local_incarnation(),
+    /// A round trip of 1 ms and up to 0.5 ms of jitter.
+    fn jitter(state: &mut u64) -> u64 {
+        MS + noise(state) % (MS / 2)
+    }
+
+    /// Runs until every pair is configured by its own estimator, everyone answering.
+    fn configured(detector: &mut Detector, world: &mut World, peers: &[HostId]) {
+        let mut state = 0x2545_F491_4F6C_DD1D;
+        for _ in 0..100 {
+            world.run(detector, 100, |_| Some(jitter(&mut state)));
+            if peers
+                .iter()
+                .all(|peer| detector.report(*peer).is_some_and(|r| r.configured))
+            {
+                return;
+            }
         }
+        panic!("the pairs never configured");
     }
 
-    /// A member that never acknowledges is suspected after its probe, then declared dead once it has been
-    /// suspected for the suspicion window — Alive → Suspect → Dead, driven by ticks.
-    #[test]
-    fn an_unresponsive_member_is_suspected_then_declared_dead() {
-        let mut detector = Detector::new(LOCAL, timing(2, 3));
-        detector.join(A);
-
-        // Period 1 probes A (the only peer); A never acknowledges.
-        assert_eq!(detector.tick(), Some(Ping { to: A }));
-        assert_eq!(
-            detector.membership().state(A).unwrap().liveness,
-            Liveness::Alive
-        );
-
-        // Period 2 resolves the missed probe: A is suspected. (It probes A again — still the only peer.)
-        detector.tick();
-        assert_eq!(
-            detector.membership().state(A).unwrap().liveness,
-            Liveness::Suspect
-        );
-
-        // Two more periods of suspicion reach the window (2), and A is declared dead.
-        detector.tick();
-        detector.tick();
-        assert_eq!(
-            detector.membership().state(A).unwrap().liveness,
-            Liveness::Dead
-        );
-        assert_eq!(
-            detector.membership().alive().collect::<Vec<_>>(),
-            vec![LOCAL],
-            "the dead member left the neighbourhood"
-        );
+    /// The direct deadline of the period's probe.
+    fn ping_sent(detector: &Detector) -> u64 {
+        detector.probe.unwrap().due_ns().unwrap()
     }
 
-    /// A member that acknowledges each probe stays alive — never suspected.
+    fn liveness(detector: &Detector, peer: HostId) -> Liveness {
+        detector.membership().state(peer).unwrap().liveness
+    }
+
+    /// A measurement probe whose ping or answer was lost ends at its expected arrival: with every
+    /// member's probe lost at once (a throttled container dropping a burst), waiting for another
+    /// member left all of them waiting for ever.
     #[test]
-    fn a_responsive_member_stays_alive() {
-        let mut detector = Detector::new(LOCAL, timing(2, 3));
-        detector.join(A);
-        for _ in 0..5 {
-            let ping = detector.tick().expect("a peer to probe");
-            detector.on_ack(ping.to); // A answers within the period
-        }
+    fn a_lost_measurement_probe_ends_at_its_expected_arrival() {
+        let mut detector = detector(&[A, B]);
+        let mut requests = Vec::new();
+        let first = detector.poll(0, &mut requests).unwrap();
+        detector.on_ack(first.to, first.nonce, MS);
+        let lost = detector.poll(MS, &mut requests).unwrap();
+        assert_eq!(detector.verdict(lost.to), None, "measurement only");
+        let expected = detector.wake().unwrap();
+        assert_eq!(expected, 2 * MS, "the latest round trip on");
+        assert_eq!(detector.poll(expected - 1, &mut requests), None);
+        let next = detector.poll(expected, &mut requests);
+        assert!(next.is_some(), "the period ended at the expected arrival");
         assert_eq!(
-            detector.membership().state(A).unwrap().liveness,
-            Liveness::Alive
-        );
-    }
-
-    /// Probing is round-robin across the alive peers, so no member starves — over two periods both peers
-    /// are probed.
-    #[test]
-    fn probing_rotates_across_peers() {
-        let mut detector = Detector::new(LOCAL, timing(3, 3));
-        detector.join(A);
-        detector.join(B);
-        let first = detector.tick().unwrap().to;
-        detector.on_ack(first);
-        let second = detector.tick().unwrap().to;
-        detector.on_ack(second);
-        assert_ne!(first, second, "the two periods probe different peers");
-        assert!([A, B].contains(&first) && [A, B].contains(&second));
-    }
-
-    /// A ping is answered with an acknowledgement to the sender.
-    #[test]
-    fn a_ping_is_acknowledged() {
-        let detector = Detector::new(LOCAL, timing(2, 3));
-        assert_eq!(detector.on_ping(A), Ack { to: A });
-    }
-
-    /// An indirect acknowledgement prevents a false suspicion: A's direct ping is lost, but a relay
-    /// reaches A and relays the ack, so the next period does not suspect A — a lost packet is not a
-    /// failure. The ping-request is aimed at another alive peer, not the target.
-    #[test]
-    fn an_indirect_ack_prevents_a_false_suspicion() {
-        let mut detector = Detector::new(LOCAL, timing(2, 3));
-        detector.join(A);
-        detector.join(B);
-
-        // Probe A. Suppose its direct ack is lost (we do not call on_ack for A).
-        let ping = detector.tick().unwrap();
-        let target = ping.to;
-        // Ask the other alive peer to probe the target indirectly.
-        let requests = detector.request_indirect(1);
-        assert_eq!(requests.len(), 1, "one relay is asked");
-        assert_eq!(requests[0].target, target);
-        assert_ne!(requests[0].relay, target, "the relay is a different peer");
-        // The relay reaches the target and relays the acknowledgement.
-        detector.on_indirect_ack(target);
-
-        // The next period must not suspect the target — the indirect ack saved it.
-        detector.tick();
-        assert_eq!(
-            detector.membership().state(target).unwrap().liveness,
+            liveness(&detector, lost.to),
             Liveness::Alive,
-            "an indirectly-acknowledged member is not suspected"
+            "and judged nothing"
         );
     }
 
-    /// A membership change is disseminated a bounded number of times, then dropped — the gossip buffer
-    /// does not grow without end (infection-style dissemination, bounded).
+    /// A reconfiguration the estimator refuses leaves the verdict in force: under a CPU throttle a
+    /// stall made `τ_int` unmeasured again, the verdict went, and the probe that would have
+    /// suspected a crashed member was not judged (one Linux run in three hundred at one CPU).
     #[test]
-    fn a_change_is_gossiped_a_bounded_number_of_times() {
-        let mut detector = Detector::new(LOCAL, timing(2, 2)); // two transmits per change
-        detector.join(A); // learning A is a change to disseminate
-
-        assert!(
-            detector.gossip(10).iter().any(|(host, _)| *host == A),
-            "the change is gossiped (transmit 1)"
+    fn a_refused_reconfiguration_leaves_the_verdict_in_force() {
+        let in_force = Verdict {
+            round_trip: Duration::from_millis(1),
+            margin: Duration::from_millis(2),
+            interval: Duration::from_millis(30),
+            loss: 0.01,
+            mistake: 0.01,
+        };
+        let mut stream = Stream {
+            verdict: Some(in_force),
+            ..Stream::default()
+        };
+        let g = Duration::from_micros(50);
+        stream.take(0, MS, g, Duration::from_millis(30));
+        let refused = stream.estimator.as_ref().unwrap().behaviour();
+        assert_eq!(refused.err(), Some(Refusal::TooFewHeartbeats));
+        stream.configure(
+            Some(Duration::from_secs(60)),
+            &floors(g),
+            Duration::from_millis(30),
         );
-        assert!(
-            detector.gossip(10).iter().any(|(host, _)| *host == A),
-            "and again (transmit 2)"
-        );
-        assert!(
-            detector.gossip(10).iter().all(|(host, _)| *host != A),
-            "after its transmit budget the change is dropped — the buffer is bounded"
-        );
+        assert_eq!(stream.verdict, Some(in_force));
     }
 
-    /// A suspected member is still probed (SWIM §4.2): the period after a member is suspected still pings it,
-    /// its direct acknowledgement counts as a successful probe (the local health recovers), and a further miss
-    /// keeps worsening the local health (the suspicion window keeps dilating) — it leaves the rotation only when
-    /// it is dead.
+    /// A suspicion re-adopted at a newer incarnation keeps the probes that already told the peer,
+    /// and its pending condemnation: resetting them made a crashed member be told again from the
+    /// start, past the detection bound (Linux at one CPU, where live members were suspected and
+    /// refuted often).
     #[test]
-    fn a_suspected_member_is_still_probed_and_its_acknowledgement_counts() {
-        let mut detector = Detector::new(
-            LOCAL,
-            DetectorTiming {
-                suspicion_periods: 10,
-                gossip_transmits: 2,
-                health_max: 3,
-                suspicion_min: 10,
-                confirmations_expected: 1,
-            },
-        );
-        detector.join(A);
-        detector.tick(); // probe A; A never answers
-        // Suspected on the resolving tick — and that tick still probes it; the miss worsened the local health.
-        let while_suspected = detector.tick();
-        let state = detector.membership().state(A).map(|s| s.liveness);
-        let health = [detector.health_multiplier()];
-        // A further miss keeps worsening the local health, so the suspicion window keeps dilating.
-        let again = detector.tick();
-        let worsened = detector.health_multiplier();
-        // A's direct acknowledgement of the probe it is still sent counts: the local health recovers a step,
-        // while the suspicion itself stands (only the member's refutation clears it, SWIM §4.2).
-        detector.on_ack(A);
-        let after_ack = detector.tick();
-        let recovered = detector.health_multiplier();
-        let still = detector.membership().state(A).map(|s| s.liveness);
-
-        assert_eq!(state, Some(Liveness::Suspect), "A was suspected");
-        assert_eq!(
-            (while_suspected, again, after_ack),
-            (
-                Some(Ping { to: A }),
-                Some(Ping { to: A }),
-                Some(Ping { to: A })
-            ),
-            "a suspected member stays in the probe rotation"
-        );
-        assert_eq!(
-            (health, worsened, recovered),
-            ([2], 3, 2),
-            "each miss worsened the local health and the suspected member's acknowledgement was credited"
-        );
-        assert_eq!(
-            still,
-            Some(Liveness::Suspect),
-            "an acknowledgement alone does not clear a suspicion"
-        );
-    }
-
-    /// A suspected member whose probe is **answered** on the very period its window would expire is not
-    /// declared dead by that tick — an acknowledgement is evidence of life — while the suspicion itself
-    /// stands (only a refutation clears it), and a further silent period does declare it dead. The rule that
-    /// kept a peer back from a CPU stall alive when its first answered probe landed as the window ran out.
-    #[test]
-    fn an_answered_probe_does_not_age_a_suspect_to_death_that_period() {
-        // Window of two periods: suspected on the resolving tick, aged once, then dead on the next.
-        let mut detector = Detector::new(LOCAL, timing(2, 2));
-        detector.join(A);
-        detector.tick(); // probe A; unanswered
-        detector.tick(); // A suspected (aged 1); probes A again; unanswered
-        // This tick would age A to 2 = the window and kill it — but A answered the probe just resolved.
-        detector.on_ack(A);
-        detector.tick();
-        assert_eq!(
-            detector.membership().state(A).map(|s| s.liveness),
-            Some(Liveness::Suspect),
-            "an answered probe spares the suspect this period; the suspicion stands"
-        );
-        // Silent again: the next tick ages it to the window and declares it dead.
-        detector.tick();
-        assert_eq!(
-            detector.membership().state(A).map(|s| s.liveness),
-            Some(Liveness::Dead),
-            "a further silent period declares the suspect dead"
-        );
-    }
-
-    /// A dead member leaves the probe rotation: with its only peer dead, the detector has nothing to probe.
-    #[test]
-    fn a_dead_member_is_not_probed() {
-        let mut detector = Detector::new(LOCAL, timing(2, 2));
-        detector.join(A);
-        assert_eq!(
-            detector.tick(),
-            Some(Ping { to: A }),
-            "an alive peer is probed"
-        );
+    fn a_suspicion_adopted_again_keeps_its_told_probes() {
+        let peers = [A, B, C];
+        let mut detector = detector(&peers);
+        let mut world = World::new();
+        configured(&mut detector, &mut world, &peers);
+        let mut state = 21;
+        while detector.report(A).unwrap().pending_since_ns.is_none() {
+            world.run(&mut detector, 0, |peer| {
+                (peer != A).then(|| jitter(&mut state))
+            });
+            assert_ne!(liveness(&detector, A), Liveness::Dead, "pending first");
+        }
+        let incarnation = detector.membership().state(A).unwrap().incarnation;
         detector.apply(
             A,
             MemberState {
-                liveness: Liveness::Dead,
-                incarnation: 0,
+                liveness: Liveness::Suspect,
+                incarnation: incarnation + 1,
             },
         );
-        assert_eq!(detector.tick(), None, "a dead member is not probed");
+        assert!(detector.report(A).unwrap().pending_since_ns.is_some());
     }
 
-    /// Lifeguard's buddy system: a direct ping to a member this node **suspects** carries the suspicion even
-    /// after its gossip transmit budget is spent, so the member can refute it from the very probe it answers —
-    /// a member that comes back late is told it is suspected rather than dying while answering every probe.
+    /// The detection bound counts every member the view holds, not the current round's: a member
+    /// that condemned two others (falsely, under a CPU throttle) ran rounds of one while the
+    /// victim's last probe had been in a round of three, and stated a bound a third as long.
     #[test]
-    fn a_ping_to_a_suspected_member_always_carries_the_suspicion() {
-        // One transmit per change: the suspicion's ordinary dissemination is spent after a single batch.
-        let mut detector = Detector::new(LOCAL, timing(10, 1));
-        detector.join(A);
-        detector.tick(); // probe A
-        detector.tick(); // A never answered: suspected, the suspicion enqueued for its one transmit
-        let suspicion = detector.membership().state(A).expect("A is known");
-        assert_eq!(suspicion.liveness, Liveness::Suspect);
+    fn the_detection_bound_does_not_shrink_with_the_round() {
+        let peers = [A, B, C];
+        let mut detector = detector(&peers);
+        let mut world = World::new();
+        configured(&mut detector, &mut world, &peers);
+        let before = detector.detection_bound(world.now).unwrap();
+        for peer in [B, C] {
+            detector.apply(
+                peer,
+                MemberState {
+                    liveness: Liveness::Dead,
+                    incarnation: 0,
+                },
+            );
+        }
+        let mut state = 17;
+        world.run(&mut detector, 4, |_| Some(jitter(&mut state)));
+        assert_eq!(detector.order.len(), 1, "a round of one");
+        assert!(detector.detection_bound(world.now).unwrap() >= before);
+    }
 
-        let first = detector.ping_gossip(A, 10);
-        assert!(
-            first.contains(&(A, suspicion)),
-            "the first ping carries the suspicion (its one transmit)"
-        );
-        assert!(
-            detector.gossip(10).iter().all(|(host, _)| *host != A),
-            "the transmit budget is spent: ordinary gossip no longer carries it"
-        );
-        let again = detector.ping_gossip(A, 10);
-        assert!(
-            again.contains(&(A, suspicion)),
-            "a ping to the suspected member still carries the suspicion — the buddy system"
-        );
+    #[test]
+    fn nothing_is_judged_before_the_estimates_exist() {
+        let mut detector = detector(&[A, B]);
+        let mut world = World::new();
+        world.heard = B;
+        let mut state = 7;
+        world.run(&mut detector, 40, |peer| {
+            (peer == B).then(|| jitter(&mut state))
+        });
+        assert_eq!(detector.verdict(A), None, "no verdict from no evidence");
+        assert_eq!(liveness(&detector, A), Liveness::Alive);
+        assert_eq!(detector.report(A).unwrap().suspicions, 0);
+    }
 
-        // A ping to another member gets only the ordinary batch — the suspicion is not injected into it.
-        detector.join(B);
-        let other = detector.ping_gossip(B, 10);
-        assert!(
-            other.iter().all(|(host, _)| *host != A),
-            "a ping to a member not suspected carries no injected suspicion"
-        );
+    #[test]
+    fn the_deadline_is_the_mean_round_trip_plus_the_margin() {
+        let peers = [A, B, C];
+        let mut detector = detector(&peers);
+        let mut world = World::new();
+        configured(&mut detector, &mut world, &peers);
+        let ping = detector.poll(world.now, &mut world.requests);
+        let ping = ping.or_else(|| {
+            world.now = detector.wake().unwrap();
+            detector.on_ack(
+                world.pings.last().unwrap().to,
+                world.pings.last().unwrap().nonce,
+                world.now,
+            );
+            detector.poll(world.now, &mut world.requests)
+        });
+        let ping = ping.unwrap();
+        let verdict = detector.verdict(ping.to).unwrap();
+        assert_eq!(detector.wake(), Some(world.now + verdict.span_ns()));
+        assert!(verdict.round_trip >= Duration::from_millis(1));
+        assert!(verdict.round_trip <= Duration::from_micros(1_500));
+        assert!(verdict.mistake > 0.0 && verdict.mistake < 1.0);
+        assert!(verdict.margin < verdict.interval, "one probe in the margin");
+        // G is the lateness of the wakes: the world's, or less where an answer woke it first.
+        let g = detector.granularity().unwrap();
+        assert!(g > Duration::ZERO && g <= Duration::from_nanos(world.late));
+    }
 
-        // Once A refutes (alive at a higher incarnation) the injection stops: after the refutation's own single
-        // transmit, a ping to A carries nothing about it.
+    #[test]
+    fn a_silent_member_is_suspected_told_and_condemned() {
+        let peers = [A, B, C];
+        let mut detector = detector(&peers);
+        let mut world = World::new();
+        configured(&mut detector, &mut world, &peers);
+        let mut state = 11;
+        let mut suspected_first = false;
+        for _ in 0..200 {
+            world.run(&mut detector, 1, |peer| {
+                (peer != A).then(|| jitter(&mut state))
+            });
+            match liveness(&detector, A) {
+                Liveness::Suspect => suspected_first = true,
+                Liveness::Dead => break,
+                Liveness::Alive => {}
+            }
+        }
+        assert!(suspected_first, "suspected before condemned");
+        assert_eq!(liveness(&detector, A), Liveness::Dead);
+        let report = detector.report(A).unwrap();
+        assert_eq!((report.suspicions, report.condemnations), (1, 1));
+        assert!(report.condemned_after.unwrap() <= report.condemned_within.unwrap());
+        assert!(
+            world.asked.iter().any(|r| r.target == A && r.relay != A),
+            "relays were asked before the suspicion"
+        );
+        for peer in [B, C] {
+            assert_eq!(liveness(&detector, peer), Liveness::Alive);
+        }
+    }
+
+    #[test]
+    fn an_isolated_member_condemns_nobody() {
+        let peers = [A, B, C];
+        let mut detector = detector(&peers);
+        let mut world = World::new();
+        configured(&mut detector, &mut world, &peers);
+        world.run(&mut detector, 60, |_| None);
+        for peer in peers {
+            assert_eq!(liveness(&detector, peer), Liveness::Suspect, "{peer:?}");
+            assert_eq!(detector.report(peer).unwrap().condemnations, 0);
+        }
+    }
+
+    #[test]
+    fn an_indirect_answer_spares_the_target() {
+        let peers = [A, B, C];
+        let mut detector = detector(&peers);
+        let mut world = World::new();
+        configured(&mut detector, &mut world, &peers);
+        // Run until a probe of A is out, unanswered directly.
+        let mut state = 3;
+        while world.pings.last().map(|p| p.to) != Some(A) {
+            world.run(&mut detector, 0, |peer| {
+                (peer != A).then(|| jitter(&mut state))
+            });
+        }
+        let ping = *world.pings.last().unwrap();
+        world.now = ping_sent(&detector);
+        assert_eq!(detector.poll(world.now, &mut world.requests), None);
+        assert!(!world.requests.is_empty(), "relays asked at the deadline");
+        assert!(
+            world
+                .requests
+                .iter()
+                .all(|r| r.target == A && r.nonce == ping.nonce)
+        );
+        let until = detector.wake().unwrap();
+        assert!(until > world.now);
+        detector.on_indirect_ack(A, ping.nonce, until - 1);
+        world.now = until;
+        assert!(detector.poll(world.now, &mut world.requests).is_some());
+        assert_eq!(liveness(&detector, A), Liveness::Alive);
+    }
+
+    #[test]
+    fn a_refutation_clears_the_suspicion_and_its_pending_condemnation() {
+        let peers = [A, B, C];
+        let mut detector = detector(&peers);
+        let mut world = World::new();
+        configured(&mut detector, &mut world, &peers);
+        let mut state = 5;
+        while liveness(&detector, A) != Liveness::Suspect {
+            world.run(&mut detector, 1, |peer| {
+                (peer != A).then(|| jitter(&mut state))
+            });
+        }
         detector.apply(
             A,
             MemberState {
                 liveness: Liveness::Alive,
-                incarnation: suspicion.incarnation + 1,
+                incarnation: 1,
             },
         );
-        let _ = detector.gossip(10);
-        assert!(
-            detector
-                .ping_gossip(A, 10)
-                .iter()
-                .all(|(host, _)| *host != A),
-            "a refuted suspicion is no longer injected"
+        world.run(&mut detector, 30, |_| Some(jitter(&mut state)));
+        assert_eq!(liveness(&detector, A), Liveness::Alive);
+        assert_eq!(detector.report(A).unwrap().condemnations, 0);
+    }
+
+    #[test]
+    fn an_extension_buys_one_more_told_probe() {
+        let peers = [A, B, C];
+        let silent_after = |extend: bool| {
+            let mut detector = detector(&peers);
+            let mut world = World::new();
+            configured(&mut detector, &mut world, &peers);
+            let mut state = 9;
+            while liveness(&detector, A) != Liveness::Suspect {
+                world.run(&mut detector, 1, |peer| {
+                    (peer != A).then(|| jitter(&mut state))
+                });
+            }
+            if extend {
+                assert_eq!(
+                    detector.request_extension(A, 1, false),
+                    ExtensionDecision::Granted { periods: 1 }
+                );
+                assert_eq!(
+                    detector.request_extension(A, 2, false),
+                    ExtensionDecision::Denied(ExtensionDenial::RateLimited)
+                );
+            }
+            let mut probes = 0;
+            while liveness(&detector, A) != Liveness::Dead {
+                let before = world.pings.len();
+                world.run(&mut detector, 1, |peer| {
+                    (peer != A).then(|| jitter(&mut state))
+                });
+                probes += world.pings[before..].iter().filter(|p| p.to == A).count();
+                assert!(probes < 10, "never condemned");
+            }
+            probes
+        };
+        assert!(silent_after(true) > silent_after(false));
+        let mut detector = detector(&peers);
+        assert_eq!(
+            detector.request_extension(A, 1, false),
+            ExtensionDecision::Denied(ExtensionDenial::NotSuspected)
         );
     }
 
-    /// Gossip carries a change to another node: one node declares a peer dead, gossips it, and a second
-    /// node that applies the batch adopts the death — the view spreads.
+    #[test]
+    fn the_allowance_is_the_sum_of_the_judged_probes_bounds() {
+        let peers = [A, B, C];
+        let mut detector = detector(&peers);
+        let mut world = World::new();
+        configured(&mut detector, &mut world, &peers);
+        let before = detector.report(A).unwrap();
+        let in_force = |detector: &Detector| {
+            detector
+                .probe
+                .filter(|probe| probe.target == A)
+                .and_then(|probe| probe.verdict)
+                .map(|verdict| verdict.mistake)
+        };
+        let mut pending = in_force(&detector);
+        let (mut sum, mut state) = (0.0, 13);
+        for _ in 0..60 {
+            // One new probe a call: the one before it is resolved by then.
+            world.run(&mut detector, 0, |_| Some(jitter(&mut state)));
+            sum += pending.take().unwrap_or(0.0);
+            pending = in_force(&detector);
+        }
+        let after = detector.report(A).unwrap();
+        assert!(sum > 0.0);
+        assert!(
+            (after.suspicion_allowance - before.suspicion_allowance - sum).abs() < 1e-12,
+            "{} against {sum}",
+            after.suspicion_allowance - before.suspicion_allowance
+        );
+        assert_eq!(after.suspicions, 0);
+    }
+
+    #[test]
+    fn the_dissemination_budget_is_swims_bound() {
+        assert_eq!(gossip_transmits(1), 1);
+        assert_eq!(gossip_transmits(2), 1);
+        for n in 3..2_000usize {
+            let t = gossip_transmits(n);
+            let nf = n as f64;
+            let lambda = f64::from(t) / nf.ln();
+            // SWIM §4.1: at most n^{−((2−4/n)λ−2)} members uninfected in expectation, below one.
+            let uninfected = nf.powf(-((2.0 - 4.0 / nf) * lambda - 2.0));
+            assert!(uninfected < 1.0, "{n}: {t} transmits leave {uninfected}");
+            // And one fewer would not (to within the fixed-point logarithm).
+            let fewer = f64::from(t - 1) / nf.ln();
+            assert!(
+                nf.powf(-((2.0 - 4.0 / nf) * fewer - 2.0)) >= 0.99,
+                "{n}: {t} is not the least"
+            );
+        }
+        assert_eq!(gossip_transmits(4), 3);
+        assert_eq!(gossip_transmits(256), 6);
+    }
+
+    #[test]
+    fn the_relays_are_the_fewest_at_least_as_reliable_as_the_direct_probe() {
+        for loss in [1e-6, 1e-3, 0.05, 0.3] {
+            let k = relay_count(loss, 100);
+            let through = 1.0 - (1.0 - loss) * (1.0 - loss);
+            assert!(through.powi(k as i32) <= loss, "{loss}: {k}");
+            assert!(k == 1 || through.powi(k as i32 - 1) > loss, "{loss}: {k}");
+        }
+        assert_eq!(relay_count(0.3, 1), 1);
+        assert_eq!(relay_count(0.3, 0), 0);
+    }
+
+    /// A membership change is disseminated its budget of times, then dropped.
+    #[test]
+    fn a_change_is_gossiped_a_bounded_number_of_times() {
+        let mut detector = detector(&[]);
+        detector.join(A);
+        let mut batch = Vec::new();
+        detector.gossip_into(10, &mut batch);
+        assert!(batch.iter().any(|(host, _)| *host == A), "sent once");
+        detector.gossip_into(10, &mut batch);
+        assert!(
+            batch.iter().all(|(host, _)| *host != A),
+            "one member and us: one transmit"
+        );
+    }
+
+    /// Lifeguard's buddy system: a ping to a suspected member carries the suspicion even after its
+    /// transmit budget is spent; a ping to another member does not.
+    #[test]
+    fn a_ping_to_a_suspected_member_always_carries_the_suspicion() {
+        let mut detector = detector(&[A, B]);
+        let suspicion = MemberState {
+            liveness: Liveness::Suspect,
+            incarnation: 0,
+        };
+        detector.apply(A, suspicion);
+        let mut batch = Vec::new();
+        for _ in 0..5 {
+            detector.gossip_into(10, &mut batch);
+        }
+        detector.ping_gossip_into(A, 10, &mut batch);
+        assert!(batch.contains(&(A, suspicion)), "the buddy system");
+        detector.ping_gossip_into(B, 10, &mut batch);
+        assert!(batch.iter().all(|(host, _)| *host != A));
+        detector.apply(
+            A,
+            MemberState {
+                liveness: Liveness::Alive,
+                incarnation: 1,
+            },
+        );
+        for _ in 0..5 {
+            detector.gossip_into(10, &mut batch);
+        }
+        detector.ping_gossip_into(A, 10, &mut batch);
+        assert!(
+            batch.iter().all(|(host, _)| *host != A),
+            "refuted: not injected"
+        );
+    }
+
     #[test]
     fn gossip_carries_a_change_to_another_node() {
-        let mut source = Detector::new(LOCAL, timing(2, 2));
-        source.join(A);
-        // The source declares A dead (adopts it), enqueuing the change for gossip.
+        let mut source = detector(&[A]);
         source.apply(
             A,
             MemberState {
@@ -1017,253 +1771,109 @@ mod tests {
                 incarnation: 0,
             },
         );
-        let batch = source.gossip(10);
-
-        let mut other = Detector::new(B, timing(2, 2));
+        let mut batch = Vec::new();
+        source.gossip_into(10, &mut batch);
+        let mut other = Detector::new(B, Exposure::new());
         other.apply_gossip(batch);
-        assert_eq!(
-            other.membership().state(A).map(|s| s.liveness),
-            Some(Liveness::Dead),
-            "the second node learns A is dead through gossip"
-        );
+        assert_eq!(liveness(&other, A), Liveness::Dead);
     }
 
-    /// The Lifeguard local health multiplier rises when the node must refute a suspicion about itself and
-    /// falls when its probes succeed: a node repeatedly (and falsely) suspected looks unhealthy, then
-    /// recovers as it reaches peers again. The multiplier starts at one (full health).
     #[test]
-    fn self_refutation_raises_health_and_successful_probes_lower_it() {
-        let mut detector = Detector::new(
-            LOCAL,
-            DetectorTiming {
-                suspicion_periods: 10,
-                gossip_transmits: 2,
-                health_max: 3,
-                suspicion_min: 10,
-                confirmations_expected: 1,
+    fn a_dead_member_is_not_probed_while_another_lives() {
+        let mut detector = detector(&[A, B]);
+        detector.apply(
+            A,
+            MemberState {
+                liveness: Liveness::Dead,
+                incarnation: 0,
             },
         );
-        assert_eq!(
-            detector.health_multiplier(),
-            1,
-            "the node starts at full health"
-        );
-
-        // Two peers keep (falsely) suspecting us; each refutation raises the multiplier.
-        let suspicion = self_suspicion(&detector);
-        detector.apply(LOCAL, suspicion);
-        let suspicion = self_suspicion(&detector);
-        detector.apply(LOCAL, suspicion);
-        assert_eq!(
-            detector.health_multiplier(),
-            3,
-            "refuting suspicions raised the multiplier"
-        );
-
-        // Now our probes of A succeed period after period; the multiplier falls back to full health.
-        detector.join(A);
-        for _ in 0..3 {
-            let ping = detector.tick().expect("a peer to probe");
-            detector.on_ack(ping.to);
+        let mut requests = Vec::new();
+        for at in 0..6 {
+            let ping = detector.poll(at, &mut requests).unwrap();
+            assert_eq!(ping.to, B);
+            detector.on_ack(B, ping.nonce, at);
         }
-        assert_eq!(
-            detector.health_multiplier(),
-            1,
-            "successful probes restored full health"
-        );
     }
 
-    /// Failed probes raise the multiplier one step each, and it is bounded at `health_max + 1` — a
-    /// wholly-isolated node backs off but does not dilate without end.
+    /// Two members that hold each other dead: neither has anyone else to probe, so each probes the
+    /// other and tells it, and each refutes in its answer. Without it neither ever sent again
+    /// (the cluster test's deadlock under a one-CPU throttle).
     #[test]
-    fn repeated_failed_probes_raise_the_multiplier_to_its_cap() {
-        let mut detector = Detector::new(
-            LOCAL,
-            DetectorTiming {
-                suspicion_periods: 10,
-                gossip_transmits: 2,
-                health_max: 2,
-                suspicion_min: 10,
-                confirmations_expected: 1,
-            },
-        );
-        detector.join(A);
-        detector.join(B);
-        detector.join(C);
-
-        // Never acknowledge: every probe fails, so each period raises the multiplier until it caps.
-        for _ in 0..6 {
-            detector.tick();
-        }
-        assert_eq!(
-            detector.health_multiplier(),
-            3,
-            "the multiplier is bounded at health_max + 1 however many probes fail"
-        );
-    }
-
-    /// An unhealthy node dilates its suspicion window: a peer that would be declared dead after the base
-    /// window at full health stays suspected longer while the node's own health multiplier is raised —
-    /// so the node does not mass-declare peers dead on its own degradation.
-    #[test]
-    fn an_unhealthy_node_is_slower_to_declare_a_peer_dead() {
-        let mut detector = Detector::new(
-            LOCAL,
-            DetectorTiming {
-                // Base window of one period: at full health a suspect dies the first period it is aged.
-                suspicion_periods: 1,
-                gossip_transmits: 2,
-                health_max: 3,
-                suspicion_min: 1,
-                confirmations_expected: 1,
-            },
-        );
-        // Make the node unhealthy through self-refutations, so its window dilates past one period.
-        for _ in 0..2 {
-            let suspicion = self_suspicion(&detector);
-            detector.apply(LOCAL, suspicion);
-        }
-        assert!(detector.health_multiplier() > 1, "the node is unhealthy");
-
-        // A falls silent and is suspected; at full health a single further ageing period would kill it.
-        detector.join(A);
-        detector.tick();
-        detector.tick();
-        assert_eq!(
-            detector.membership().state(A).map(|s| s.liveness),
-            Some(Liveness::Suspect),
-            "A is suspected"
-        );
-        detector.tick();
-        detector.tick();
-        assert_eq!(
-            detector.membership().state(A).map(|s| s.liveness),
-            Some(Liveness::Suspect),
-            "the dilated window keeps A in doubt past the base window rather than declaring it dead"
-        );
-    }
-
-    /// The confirmation-count timeout (§4.8): a suspicion many peers independently corroborate is declared
-    /// dead sooner than a lone one. With a base window of six and a floor of two reached at three
-    /// confirmations, a suspicion confirmed by two more peers dies at the floor, while the same suspicion
-    /// held alone is still merely suspected at that point.
-    #[test]
-    fn a_corroborated_suspicion_dies_sooner_than_a_lone_one() {
-        // Base window six, floor two, reached at two *independent* confirmations (the originator's own probe
-        // does not count — Lifeguard/memberlist).
-        let timing = DetectorTiming {
-            suspicion_periods: 6,
-            gossip_transmits: 2,
-            health_max: 0,
-            suspicion_min: 2,
-            confirmations_expected: 2,
+    fn members_that_hold_each_other_dead_heal() {
+        let (mut x, mut y) = (detector(&[A]), Detector::new(A, Exposure::new()));
+        y.join(LOCAL);
+        let dead = |host| {
+            (
+                host,
+                MemberState {
+                    liveness: Liveness::Dead,
+                    incarnation: 0,
+                },
+            )
         };
-
-        // Corroborated: two *other* peers confirm the suspicion, shrinking the window to its floor of two.
-        let mut corroborated = Detector::new(LOCAL, timing);
-        corroborated.join(A);
-        corroborated.tick(); // probe A
-        corroborated.tick(); // A unanswered → suspected (originator only, C = 0)
-        let incarnation = corroborated.membership().state(A).unwrap().incarnation;
-        let suspect = MemberState {
-            liveness: Liveness::Suspect,
-            incarnation,
-        };
-        corroborated.apply_gossip_from(B, [(A, suspect)]); // C = 1
-        corroborated.apply_gossip_from(C, [(A, suspect)]); // C = 2 → the floor
-        corroborated.tick(); // window is now two; the second aged period declares A dead
-        assert_eq!(
-            corroborated.membership().state(A).map(|s| s.liveness),
-            Some(Liveness::Dead),
-            "a corroborated failure is declared dead at the floor"
-        );
-
-        // Lone: only this node's own probe suspects A (C = 0), so the full window of six applies — a lone
-        // suspicion rides the honest maximum rather than collapsing to the floor (the eviction bug fixed).
-        let mut lone = Detector::new(LOCAL, timing);
-        lone.join(A);
-        lone.tick();
-        lone.tick(); // suspected, C = 0
-        lone.tick(); // period 2 of 6 — nowhere near the window
-        assert_eq!(
-            lone.membership().state(A).map(|s| s.liveness),
-            Some(Liveness::Suspect),
-            "a lone suspicion waits the full, unshrunk window"
-        );
+        x.apply_gossip([dead(A)]);
+        y.apply_gossip([dead(LOCAL)]);
+        let mut detectors = [x, y];
+        let mut requests = Vec::new();
+        let mut batch = Vec::new();
+        for at in 1..4u64 {
+            for prober in 0..2 {
+                let [first, second] = &mut detectors;
+                let (prober, answering) = if prober == 0 {
+                    (first, second)
+                } else {
+                    (second, first)
+                };
+                let Some(ping) = prober.poll(at * MS, &mut requests) else {
+                    continue;
+                };
+                prober.ping_gossip_into(ping.to, 10, &mut batch);
+                answering.apply_gossip(batch.iter().copied());
+                answering.gossip_into(10, &mut batch);
+                prober.apply_gossip(batch.iter().copied());
+                prober.on_ack(ping.to, ping.nonce, at * MS + 1);
+            }
+        }
+        let [x, y] = detectors;
+        assert_eq!(liveness(&x, A), Liveness::Alive);
+        assert_eq!(liveness(&y, LOCAL), Liveness::Alive);
     }
 
-    /// Randomized probe order (SWIM §4) still probes every peer exactly once per round — the coverage
-    /// guarantee that bounds the worst-case time to a first probe — and the next round reshuffles into
-    /// another full permutation.
     #[test]
     fn every_peer_is_probed_once_per_round() {
         let peers = [A, B, C];
-        let mut detector = Detector::new(LOCAL, timing(4, 2));
-        for &peer in &peers {
-            detector.join(peer);
+        let mut detector = detector(&peers);
+        let mut world = World::new();
+        let mut state = 1;
+        for _ in 0..3 {
+            let before = world.pings.len();
+            world.run(&mut detector, peers.len() - 1, |_| Some(jitter(&mut state)));
+            let mut round: Vec<u64> = world.pings[before..].iter().map(|p| p.to.0).collect();
+            round.sort_unstable();
+            assert_eq!(round, vec![2, 3, 4]);
         }
-
-        // One round is exactly as many probes as there are peers — the loop length is the peer count, not a
-        // literal.
-        let round = |detector: &mut Detector| {
-            let mut probed = Vec::new();
-            for _ in 0..peers.len() {
-                let ping = detector.tick().expect("a peer to probe");
-                detector.on_ack(ping.to); // keep every peer alive so the round is not disturbed
-                probed.push(ping.to);
-            }
-            probed.sort_by_key(|host| host.0);
-            probed
-        };
-
-        let mut expected = peers.to_vec();
-        expected.sort_by_key(|host| host.0);
-        assert_eq!(
-            round(&mut detector),
-            expected,
-            "the first round probes every peer once"
-        );
-        assert_eq!(
-            round(&mut detector),
-            expected,
-            "the next round reshuffles and covers them again"
-        );
     }
 
-    /// A peer at a known coordinate has a predicted RTT; feeding consistent RTT samples converges the
-    /// prediction toward them, and an unknown peer has no prediction.
     #[test]
-    fn observing_rtts_lets_the_node_predict_a_peer() {
-        let mut detector = Detector::new(LOCAL, timing(3, 2));
-        detector.join(A);
+    fn measured_round_trips_teach_the_coordinate() {
+        let mut detector = detector(&[A]);
         let mut peer = NetworkCoordinate::origin(8);
-        peer.vec[0] = 30.0;
+        peer.vec[0] = 0.030;
         peer.error = 0.05;
         detector.learn_coordinate(A, Coordinate::Held(&peer));
-
-        assert!(
-            detector.predicted_rtt(A).is_some(),
-            "a known peer has a prediction"
-        );
-        assert_eq!(detector.predicted_rtt(B), None, "an unknown peer has none");
-
-        for _ in 0..200 {
-            detector.observe_rtt(A, 35.0);
-        }
-        let predicted = detector.predicted_rtt(A).expect("A is known");
-        assert!(
-            (predicted - 35.0).abs() < 35.0 * 0.2,
-            "the prediction {predicted} converged near the measured RTT 35"
-        );
+        assert!(detector.predicted_rtt(A).is_some());
+        assert_eq!(detector.predicted_rtt(B), None);
+        let mut world = World::new();
+        world.run(&mut detector, 400, |_| Some(35 * MS));
+        let predicted = detector.predicted_rtt(A).unwrap();
+        assert!((predicted - 0.035).abs() < 0.035 * 0.2, "{predicted}");
     }
 
-    /// When a direct probe is lost, the indirect-probe relays are ordered nearest-first to the target in
-    /// coordinate space — a near proxy is likeliest to reach the target.
     #[test]
-    fn indirect_probe_prefers_relays_near_the_target() {
-        let mut detector = Detector::new(LOCAL, timing(3, 2));
-        // Peers on a line at increasing positions; the coordinate distance is the position gap.
+    fn relays_are_ranked_nearest_the_target_first() {
         let positions = [(A, 0.0), (B, 1.0), (C, 2.0), (HostId(5), 10.0)];
+        let mut detector = detector(&[]);
         for &(host, x) in &positions {
             detector.join(host);
             let mut coordinate = NetworkCoordinate::origin(8);
@@ -1271,97 +1881,8 @@ mod tests {
             coordinate.error = 0.05;
             detector.learn_coordinate(host, Coordinate::Held(&coordinate));
         }
-        let position = |host: HostId| {
-            positions
-                .iter()
-                .find(|(candidate, _)| *candidate == host)
-                .map(|(_, x)| *x)
-                .expect("a known peer")
-        };
-
-        detector.tick(); // opens a probe of some target (its ack is then withheld)
-        let requests = detector.request_indirect(positions.len());
-        assert!(requests.len() >= 2, "several relays are available");
-
-        // The relays must be non-decreasing in distance to the target — nearest first.
-        let target = requests[0].target;
-        let mut previous = 0.0;
-        for request in &requests {
-            let distance = (position(request.relay) - position(target)).abs();
-            assert!(
-                distance + f64::EPSILON >= previous,
-                "relays are ordered nearest-first to the target"
-            );
-            previous = distance;
-        }
-    }
-
-    /// Ticks until `member` is no longer suspected and returns how many ticks that took.
-    fn ticks_until_dead(detector: &mut Detector, member: HostId) -> u32 {
-        let mut ticks = 0;
-        while detector.membership().state(member).unwrap().liveness != Liveness::Dead {
-            detector.tick();
-            ticks += 1;
-            assert!(ticks < 1_000, "{member:?} never died");
-        }
-        ticks
-    }
-
-    /// A witnessed extension moves the suspicion back by exactly the periods granted; an overloaded
-    /// host is not extended, and a host that is not suspected has nothing to extend.
-    #[test]
-    fn a_witnessed_extension_delays_death_by_exactly_its_grant() {
-        let mut baseline = Detector::new(LOCAL, timing(8, 3));
-        baseline.join(A);
-        baseline.tick();
-        baseline.tick();
-        assert_eq!(
-            baseline.membership().state(A).unwrap().liveness,
-            Liveness::Suspect
-        );
-        let unextended = ticks_until_dead(&mut baseline, A);
-
-        let mut detector = Detector::new(LOCAL, timing(8, 3));
-        detector.join(A);
-        assert_eq!(
-            detector.request_extension(A, 1, false),
-            ExtensionDecision::Denied(ExtensionDenial::NotSuspected)
-        );
-        detector.tick();
-        detector.tick();
-        assert_eq!(
-            detector.request_extension(A, 1, true),
-            ExtensionDecision::Denied(ExtensionDenial::Overloaded)
-        );
-        assert_eq!(
-            detector.request_extension(A, 1, false),
-            ExtensionDecision::Granted { periods: 4 }
-        );
-        assert_eq!(ticks_until_dead(&mut detector, A), unextended + 4);
-    }
-
-    /// The node's own measured lag dilates the suspicion window like Lifeguard's score does, within
-    /// the same cap, and a lag inside one period changes nothing.
-    #[test]
-    fn the_nodes_own_lag_dilates_the_window_within_the_cap() {
-        let lagging = DetectorTiming {
-            health_max: 2,
-            ..timing(4, 3)
-        };
-        let mut detector = Detector::new(LOCAL, lagging);
-        detector.observe_self_lag(40, 100);
-        assert_eq!(
-            detector.health_multiplier(),
-            2,
-            "a lag inside one period rounds up to one"
-        );
-        detector.observe_self_lag(0, 100);
-        assert_eq!(detector.health_multiplier(), 1);
-        detector.observe_self_lag(1_000, 100);
-        assert_eq!(
-            detector.health_multiplier(),
-            3,
-            "ten periods of lag, capped at health_max"
-        );
+        detector.rank_relays(A);
+        let ranked: Vec<HostId> = detector.relays.clone();
+        assert_eq!(ranked, vec![B, C, HostId(5)]);
     }
 }

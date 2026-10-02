@@ -166,6 +166,25 @@ impl Membership {
             .map(|(&host, _)| host)
     }
 
+    /// The members believed dead, in id order: a scan of the membership, for a member that has
+    /// nobody else left to probe.
+    pub fn dead(&self) -> impl Iterator<Item = HostId> + '_ {
+        self.members
+            .iter()
+            .filter(|(_, state)| state.liveness == Liveness::Dead)
+            .map(|(&host, _)| host)
+    }
+
+    /// The members known, the local node included, whatever their liveness.
+    pub fn len(&self) -> usize {
+        self.members.len()
+    }
+
+    /// Whether no member is known: never, as the local node always is.
+    pub fn is_empty(&self) -> bool {
+        self.members.is_empty()
+    }
+
     /// The known state of `member`, if any.
     pub fn state(&self, member: HostId) -> Option<MemberState> {
         self.members.get(&member).copied()

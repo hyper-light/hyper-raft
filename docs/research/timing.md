@@ -41,15 +41,50 @@ extended in IEEE Transactions on Computers 51(5), May 2002, pp. 561–580.**
 continuous suspicion level adapted to observed inter-arrival times instead of a boolean;
 evaluated over an intercontinental link. Leaves the threshold on φ to the application.
 
+**Das, Gupta, Motivala, "SWIM: Scalable Weakly-consistent Infection-style Process Group Membership
+Protocol", DSN 2002 (read 2026-10-01).**
+- §3.1: each protocol period `T'` a member pings one member and waits for an ack "within a
+  prespecified time-out (determined by the message round-trip time, which is chosen smaller than the
+  protocol period)", then asks `k` members to ping it (ping-req); with no ack, direct or indirect,
+  by the period's end the member is declared failed. "Properties of the protocol hold if `T'` is the
+  average protocol period." The time-out "is based on an estimate of the distribution of round-trip
+  time ... e.g. an average or 99th percentile"; "`T'` has to be at least three times the round-trip
+  estimate". The experiments set the time-out from the average measured round trip.
+- §4.1: infection-style dissemination piggybacks updates on ping, ping-req and ack, each element at
+  most `λ log n` times. From Bailey's epidemic, with contact rate `1 − (1 − 1/n)²` a period, after
+  `λ log n` periods the expected infected number is at least `n(1 − n^{−((2−4/n)λ−1)})`, so at most
+  `n^{−((2−4/n)λ−2)}` members are uninfected in expectation; "setting `λ` to a small constant
+  suffices". The experiments used `3⌈log(N + 1)⌉`.
+- §4.2: suspicion: an unanswered member is suspected and the suspicion gossiped; a member that
+  pings a suspect successfully un-marks it; the suspect refutes with a higher incarnation; a
+  suspicion that times out is confirmed. The time-out "trades off an increase in failure detection
+  time for a reduction in frequency of false failure detections"; its value is "prespecified".
+- §4.3: round-robin target selection over a list re-permuted after each traversal, new members
+  inserted at random positions: "successive selections of the same target are at most
+  `(2·n_i − 1)` protocol periods apart."
+- Left open: the time-out and the suspicion time-out are picked; `λ` is "a small constant".
+
 **Dadgar, Phillips, Currey, "Lifeguard: Local Health Awareness for More Accurate Failure
-Detection", DSN 2018 (arXiv:1707.00788).** SWIM marks healthy members failed when the *detecting*
-member is slow (CPU exhaustion, pauses). Lifeguard makes the detector account for its own
-health: a local health multiplier raises probe interval and timeout while the member misses acks
-or must refute suspicions of itself; a suspicion's timeout falls logarithmically as independent
-suspicions arrive; a suspected member is told first. Its constants (multiplier cap `S = 8`,
-`K = 3` confirmations, `α`, `β` of the suspicion bounds) were chosen by trying combinations; the
-mechanism carries over, the constants do not. hyper-swim already applies it with measured
-parameters (`crates/hyper-swim/src/detector.rs`).
+Detection", DSN 2018 (arXiv:1707.00788; §IV read 2026-10-01).** SWIM marks healthy members failed
+when the *detecting* member is slow (CPU exhaustion, pauses). §IV: "missing expected responses
+could indicate a member is experiencing slow message processing, and ... an episode of slow message
+processing at a given member is likely to impact multiple of its interactions with other members
+in a short period of time"; the authors call this the member's *local health*.
+- LHA-Probe: a saturating counter `LHM ∈ [0, S]`, raised by a failed probe, a refutation of a
+  suspicion about oneself and a missed nack, lowered by a successful probe; the probe interval and
+  time-out are the base values times `LHM + 1`. memberlist's bases are 1 s and 500 ms, `S = 8`.
+- LHA-Suspicion: time-out `max(Min, Max − (Max − Min)·log(C + 1)/log(K + 1))` over `C` independent
+  suspicions, `K = 3` by default; the time-out "will fall to its minimum level as long as the local
+  member is receiving and processing gossip messages in a timely manner".
+- Buddy system: a suspected member is told of the suspicion first, to shorten the time to refute.
+- The constants were chosen by trying combinations; the mechanism carries over, the constants do
+  not. `docs/timing.md` §2.7 keeps the buddy system and measures local health instead of counting
+  it.
+
+**Fréchet, "Sur les tableaux de corrélation dont les marges sont données", Ann. Univ. Lyon A 14,
+1951, pp. 53–77.** For any two events, `Pr(A ∩ B) ≤ min(Pr(A), Pr(B))` whatever their dependence:
+the bound `docs/timing.md` §2.7 uses for two consecutive missed probes when the pair's probes are
+not measured independent.
 
 ## Raft's timing
 
@@ -234,7 +269,8 @@ slack would allow.
 4. How heartbeat cost bounds `η` once a node has many peers.
 5. The first estimates, before a link has history.
 
-`docs/timing.md` answers 1–3, answers 5 for the loss, the mean delay and the MTBF from the traces
+`docs/timing.md` answers 1–3 (and, for SWIM in §2.7, its time-outs, suspicion, `λ` and `k`),
+answers 5 for the loss, the mean delay and the MTBF from the traces
 and the sources above (§3), answers the part of the first variance a history has not yet seen by
 Rényi's record probability (§2.6), and states 4 and the rest of the first variance as measurements
 still to make.

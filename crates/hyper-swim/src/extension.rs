@@ -9,12 +9,15 @@
 //! - a grant needs the witness to have risen since the last grant;
 //! - there is at most one grant per protocol period.
 //!
-//! focal measured grants in milliseconds and capped them at five. Here they are in the detector's
-//! own periods and every bound is derived:
-//! - grants halve, from half the base suspicion window (Lifeguard's logarithmically decaying
-//!   extensions, Dadgar et al., DSN 2018), never below one period;
+//! focal measured grants in milliseconds and capped them at five. Here they are counted in the
+//! base window's unit and every bound is derived:
+//! - grants halve, from half the base window (Lifeguard's logarithmically decaying extensions,
+//!   Dadgar et al., DSN 2018), never below one;
 //! - all grants together never exceed one base window, so a stuck host can at most double the time
 //!   before it is declared dead. That replaces the literal count.
+//!
+//! The detector's base window is the one probe that tells a suspect it is suspected
+//! (`docs/timing.md` §2.7), so a grant is one more such probe, and one is all a suspect gets.
 
 /// Why an extension was refused.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -34,9 +37,9 @@ pub enum ExtensionDenial {
 /// What a request for more time decided.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ExtensionDecision {
-    /// The suspicion window moved out by this many periods.
+    /// The suspicion window moved out by this many of its units.
     Granted {
-        /// The periods granted.
+        /// The units granted: probes, for the detector.
         periods: u32,
     },
     /// Refused, and why.
@@ -53,13 +56,13 @@ pub struct ExtensionTracker {
 }
 
 impl ExtensionTracker {
-    /// The periods granted so far.
+    /// The units granted so far.
     pub fn total(&self) -> u32 {
         self.total
     }
 
     /// Decides one request at protocol period `period`, under a base suspicion window of `base`
-    /// periods. A grant is committed here.
+    /// units. A grant is committed here.
     pub fn request(
         &mut self,
         period: u64,

@@ -6,14 +6,16 @@ use slates_cluster::membership::{Liveness, MemberState};
 use slates_cluster::swim::SwimMessage;
 use slates_db::register::HostId;
 
-use crate::{Cluster, GOSSIP_PER_MESSAGE, RTT, transmits};
+use crate::{Cluster, RTT, gossip_per_message, transmits};
 
 pub struct Members {
     detectors: Vec<Detector>,
+    gossip: usize,
 }
 
 impl Cluster for Members {
     fn new(members: usize) -> Self {
+        // slates' own timing, as its detector takes it from its caller.
         let timing = DetectorTiming {
             suspicion_periods: 6,
             gossip_transmits: transmits(members),
@@ -30,7 +32,10 @@ impl Cluster for Members {
                 detector
             })
             .collect();
-        Self { detectors }
+        Self {
+            detectors,
+            gossip: gossip_per_message(),
+        }
     }
 
     fn period(&mut self, nonce: u64) {
@@ -45,7 +50,7 @@ impl Cluster for Members {
                 nonce,
                 boot_nonce: 1,
                 configuration_version: 1,
-                gossip: detectors[prober].ping_gossip(ping.to, GOSSIP_PER_MESSAGE),
+                gossip: detectors[prober].ping_gossip(ping.to, self.gossip),
             }
             .encode();
             let SwimMessage::Ping { from, gossip, .. } = SwimMessage::decode(&bytes).unwrap()
@@ -60,7 +65,7 @@ impl Cluster for Members {
                 boot_nonce: 1,
                 configuration_version: 1,
                 standing: None,
-                gossip: answering.gossip(GOSSIP_PER_MESSAGE),
+                gossip: answering.gossip(self.gossip),
                 coordinate: answering.coordinate(),
             }
             .encode();

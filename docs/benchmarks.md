@@ -1159,70 +1159,138 @@ target/armv8/release/hyper-datagram-compare table 7 20000
 The law (`CLAUDE.md` §1a) for the SWIM detector, ported from slates' (`crates/hyper-swim/ORIGIN.md`):
 its allocations, reallocations and page faults a member a period, before and after, and its cost
 against slates' own detector and wire at `5cce86a` (unchanged since in slates `main` `bfa7298`).
+Since its timing is measured (`docs/timing.md` §2.7, ORIGIN change 5), a hyper-swim period does
+more than slates': it is polled at its own deadline, takes the round trip it is answered in into
+the pair's NFD-E estimator (and the pool's, while the pool judges), and reconfigures the pair when
+its estimates renew; on a LAN-like link whose variance is under `G²` that is every probe.
 
 ## The machine
 
-The same Apple M5 Max, macOS 26.4.1, rustc 1.98.0, 2026-10-01 at 10:39 to 10:41 PDT, shared with
-two other sessions: the load average was 35 to 37. The allocation counts are exact; the times are
-medians of seven fresh processes, with the least and the most beside them.
+The same Apple M5 Max, macOS 26.4.1, rustc 1.98.0, shared with other sessions. The allocation
+counts are exact; the times are medians of seven fresh processes, with the least and the most
+beside them.
 
 ## The workload
 
-`N` detectors in one process run whole periods as a member's driver does (`tests/cluster.rs`):
-each ticks, sends its probe target a ping carrying up to eight gossip entries, the target applies
-them and answers with an acknowledgement carrying its own gossip and coordinate, and the prober
-applies that, credits the probe and folds the round trip into its Vivaldi coordinate. Every
-message goes through the wire codec. The transmit budget is λ·ln(n+1) for λ = 3 (SWIM §4.4); the
-count starts after twice the periods the joins' gossip takes to drain. Quiet has no membership
-changes; churning has one member refute a suspicion every period, so its new incarnation spreads.
+`N` detectors in one process run whole periods as a member's driver does (`tests/cluster.rs`),
+each on its own simulated clock: it is polled at the wake its detector asks, 50 µs late (Linux's
+default timer slack), which ends its period and starts the next; its ping goes through the wire
+codec to its target, which applies the gossip and answers with an acknowledgement carrying its
+own gossip and coordinate; the acknowledgement lands a round trip of 200 to 300 µs later and the
+prober applies it and measures it. A message carries the gossip that fits a 1,200-byte datagram
+beside an acknowledgement, 60 entries, and each update is sent SWIM §4.1's budget, as
+`tests/cluster.rs` derives both; slates' detector is given the same. Counting starts once every
+pair is configured by its own estimator. Quiet has no membership changes; churning has one member
+refute a suspicion every period, so its new incarnation spreads.
 
 ## Allocations
 
 `cargo bench -p hyper-swim --bench allocs`, 400 periods, the calling thread's count (the detector
-has no threads), per member per period:
+has no threads), per member per period, 2026-10-01 at 23:18 PDT (load 36.5):
 
-| Members | Workload | Allocations before | Reallocations before | Allocations after | Reallocations after |
+| Members | Workload | Allocations, slates as ported | Reallocations, as ported | Allocations now | Reallocations now |
 |---|---|---|---|---|---|
 | 4 | quiet | 6.67 | 8.00 | 0 | 0 |
-| 4 | churning | 12.56 | 8.76 | 0.00 (0.8 B a period) | 0 |
+| 4 | churning | 12.56 | 8.76 | 0.00 (0.9 B a period) | 0 |
 | 16 | quiet | 6.13 | 8.26 | 0 | 0 |
-| 16 | churning | 12.14 | 10.46 | 0 | 0 |
+| 16 | churning | 12.14 | 10.46 | 0.00 (0.1 B a period) | 0 |
 | 64 | quiet | 6.03 | 8.12 | 0 | 0 |
-| 64 | churning | 13.37 | 11.91 | 0 | 0 |
+| 64 | churning | 13.37 | 11.91 | 0.00 (0.2 B a period) | 0 |
 | 256 | quiet | 7.52 | 8.95 | 0 | 0 |
-| 256 | churning | 14.74 | 12.91 | 0.00 (4.5 B a period) | 0 |
+| 256 | churning | 14.74 | 12.91 | 0 | 0 |
 
-The "before" counts were taken on the detector as ported, with a warm-up of 200 periods, which at
-256 members had not yet drained the joins; the "after" counts use the derived warm-up. Minor page
-faults were below 0.003 a member a period throughout. The two churning rows that are not exactly
-zero are a queue growing once, within the first counted periods, to the most reports a member has
-held. What each change removed is in `crates/hyper-swim/ORIGIN.md`, change 4.
+Minor page faults were below 0.001 a member a period throughout. The churning rows that are not
+exactly zero are a queue growing once, within the first counted periods, to the most reports a
+member has held. A pair's estimator is built, boxed with its ring, when the peer first answers,
+and the pool's when the member first measures a round trip: allocations at a join, not in a
+period. What each earlier change removed is in `crates/hyper-swim/ORIGIN.md`, change 4.
 
 ## Against slates
 
 `crates/hyper-swim-compare`, a workspace of its own, runs the workload above on both detectors,
-each through its own API (7 runs of 400 periods each):
+each through its own API (7 runs of 400 periods each), 2026-10-01 at 23:18–23:24 PDT, load 36.6
+before and 32.1 after (other sessions):
 
 | Members | Workload | Detector | ns a member a period | Allocations a member a period |
 |---|---|---|---|---|
-| 16 | quiet | hyper | 121 (109–145) | 0 |
-| 16 | quiet | slates | 598 (567–693) | 6.13 |
-| 16 | churning | hyper | 547 (492–618) | 0 |
-| 16 | churning | slates | 1,556 (1,411–1,670) | 12.17 |
-| 64 | quiet | hyper | 179 (161–188) | 0 |
-| 64 | quiet | slates | 920 (787–972) | 6.04 |
-| 64 | churning | hyper | 821 (718–1,521) | 0 |
-| 64 | churning | slates | 3,010 (2,564–6,898) | 13.45 |
-| 256 | quiet | hyper | 448 (330–1,596) | 0 |
-| 256 | quiet | slates | 2,662 (1,606–5,681) | 6.01 |
-| 256 | churning | hyper | 1,639 (1,510–2,009) | 0 |
-| 256 | churning | slates | 5,078 (4,592–6,192) | 14.48 |
+| 16 | quiet | hyper | 413 (358–422) | 0 |
+| 16 | quiet | slates | 511 (467–604) | 6.13 |
+| 16 | churning | hyper | 627 (563–651) | 0 |
+| 16 | churning | slates | 920 (859–1,027) | 11.24 |
+| 64 | quiet | hyper | 648 (596–902) | 0 |
+| 64 | quiet | slates | 700 (591–748) | 6.03 |
+| 64 | churning | hyper | 934 (910–973) | 0 |
+| 64 | churning | slates | 1,199 (1,147–1,283) | 11.43 |
+| 256 | quiet | hyper | 1,384 (1,172–3,983) | 0 |
+| 256 | quiet | slates | 1,489 (1,328–3,464) | 6.01 |
+| 256 | churning | hyper | 2,030 (1,855–2,362) | 0 |
+| 256 | churning | slates | 2,141 (2,094–2,247) | 11.63 |
 
-hyper-swim's period costs 2.8 to 5.9 times less. Besides the allocations, the quiet period no
-longer scans the membership: slates' tick collected every suspect by walking all members, each
-period, which is what made its quiet cost grow with the membership; hyper-swim's membership
-indexes its suspects. The 256-member quiet period was 768 ns before that index and 374 to 448 ns
-after.
+hyper-swim's median is below slates' at every point, 5 to 32 % less: ahead at 16 members and at 64
+churning, even at 64 quiet and both 256-member rows, where the ranges overlap. It allocates nothing
+where slates allocates 6 to 11.6 times a period. Two earlier runs of the same table during the work
+(load 20–45) had the same order. Before the timing was measured hyper-swim was 2.8 to 5.9 times faster; the difference is the estimation
+and the configuration, which slates does not do. Two changes kept it ahead, measured on the 16- and
+64-member quiet points (load 30–39): configuring the pool only when a probe needs it and feeding it
+only while it judges took 16 members from 575 to 430 ns; boxing each pair's estimator, whose Allan
+levels are a kilobyte, so that a peer's other fields stay small and together, took 64 members from
+815 to 678 ns (a profile had shown the period's time in cache misses on the peers' map, not in
+arithmetic). A configuration is about 175 ns of the 16-member period: a golden-section search of
+`detector_at`, made each time a pair's window renews.
+
+## The cluster test
+
+`tests/cluster.rs`, four member processes over hyper-datagram on loopback UDP, each run a fresh
+supervisor; the detector as the library configures it, the supervisor waiting on every member
+judging every peer by a configured verdict (its own or the pool's), then on every survivor holding
+the killed member dead. "Suspicions" and
+"condemnations" are of live members, summed over the cluster and the runs, against Theorem 7's
+allowance `Σβ` the configured detectors stated; "detection" is from the victim's last answer to
+each survivor holding it dead, on the survivor's clock, against the bound each stated.
+
+Each run is counted on the final code, 2026-10-01 at 23:15–23:18 PDT, the macOS and Linux series
+running at the same time (Docker Desktop's VM shares the Mac's cores, so each loaded the other).
+A run passes when every survivor holds the victim dead within the bound it stated, and neither the
+suspicions nor the condemnations of live members refute their allowance (the 95 % rule).
+
+| Platform | Limits and competing load | Runs | Passed | Load (1 min) | Suspicions (allowed) | Condemnations (allowed) | Detection median / p95 / max | Stated bound median / max |
+|---|---|---|---|---|---|---|---|---|
+| macOS 26.4.1, M5 Max | none added | 400 | 400 | 26.6–28.2 | 0 (407) | 0 (277) | 3.8 / 9.2 / 18.3 ms | 13.3 / 53.0 ms |
+| macOS 26.4.1, M5 Max | 24 busy loops on 18 cores | 300 | 300 | 33.9–36.4 | 0 (349) | 0 (247) | 3.7 / 5.2 / 7.3 ms | 12.7 / 47.8 ms |
+| Linux 6.12.76 (Docker Desktop), rust:1.98.0 | `--cpus 1`, 2 busy loops | 500 | 500 | 4.2–4.6 | 444 (1,887) | 41 (1,224) | 17.0 / 93.9 / 196.4 ms | 54.5 / 2,074.6 ms |
+| Linux 6.12.76 (Docker Desktop), rust:1.98.0 | `--cpus 2`, 4 busy loops | 500 | 500 | 3.7–4.4 | 168 (4,129) | 21 (2,892) | 18.2 / 86.7 / 200.0 ms | 57.1 / 1,914.2 ms |
+| Linux 6.12.76 (Docker Desktop), rust:1.98.0 | `--cpus 4`, beside macOS's 24 busy loops | 300 | 300 | 3.4–3.8 | 91 (781) | 71 (594) | 16.0 / 22.4 / 44.7 ms | 47.6 / 261.6 ms |
+
+The kill comes as soon as every member judges every peer, which on loopback is within a few hundred
+milliseconds, mostly by the pool: at the kill a mean of 0.0 to 0.3 of the twelve pairs had their
+own verdict. The allowance is loose: it is dominated by the loss term, Jeffreys' `(k + ½)/(m + 1)`
+and the chance `1/(m + 1)` of a delay past everything a history of `m` has seen, which a run that
+young keeps near a percent a probe; it tightens as `1/m`. The suspicions and condemnations of live
+members are the throttled series', where every member stalls at once; each condemned member was
+told and refuted, and came back.
+
+**What the runs found.** Each earlier version of the code and of the test was run the same way, and
+every failure was traced to its cause and fixed, with a test that fails without the fix where the
+cause is in the library (`docs/timing.md` §2.7 records each):
+- members holding one another dead, with nobody left to probe, never sent again (`--cpus 1`):
+  the isolation rule, `members_that_hold_each_other_dead_heal`;
+- every member's measurement probe lost to a throttled burst, all waiting for one another for ever
+  (`--cpus 2`): the measurement period ends at its expected arrival,
+  `a_lost_measurement_probe_ends_at_its_expected_arrival`;
+- the kill waited on every pair's own estimator, which under a throttle can refuse for as long as
+  the round trips stay correlated: the kill now waits on every peer judged;
+- one run's count against its expected-count bound is not a promise: the 95 % rule, after twelve
+  runs in a hundred at `--cpus 1` failed so while the series kept far inside its bound;
+- the condemnation allowance took two consecutive probes as independent where `τ_int` was one:
+  refuted twice in three hundred at `--cpus 1`, now Fréchet's bound;
+- the detection bound, five times: the longest period run so far (one macOS run in a hundred), one
+  period for the answer from another member (four Linux runs in four hundred), the periods ended
+  only (seven in three hundred), a verdict dropped when a renewal was refused
+  (`a_refused_reconfiguration_leaves_the_verdict_in_force`), a suspicion re-adopted resetting its told
+  probes (`a_suspicion_adopted_again_keeps_its_told_probes`), and the current round's size for `m`
+  (`the_detection_bound_does_not_shrink_with_the_round`);
+- in the test itself: a death adopted by gossip was noted only at the next period's report, and a
+  member's last answer was recorded only for a probe it still held outstanding.
 
 ## Commands for the detector
 
@@ -1236,6 +1304,16 @@ cargo bench -p hyper-swim --bench allocs
 # The comparison.
 cd crates/hyper-swim-compare && cargo build --release
 target/release/hyper-swim-compare table 7 400
+
+# The cluster test, repeated (the binary from `cargo test -p hyper-swim --test cluster --no-run`):
+# each run a fresh supervisor, the load average read before it. In Linux, the same in rust:1.98.0
+# with the repository at /src, `docker update --cpus N` between series, and `2N` busy loops
+# (`while :; do :; done`) running beside it.
+for i in $(seq 1 100); do
+  sysctl -n vm.loadavg
+  target/debug/deps/cluster-<hash> --exact \
+    a_killed_member_is_declared_dead_by_every_survivor_and_no_live_one_is --nocapture
+done
 ```
 
 # hyper-timing against focal-timing and slates' timing

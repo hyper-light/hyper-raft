@@ -17,17 +17,15 @@
      (`Detector::request_extension`).
    - An overloaded host is never extended.
    - The witness must rise, and a grant is made at most once a period.
-   - focal's millisecond grants and its literal cap of five are replaced by derived bounds in
-     periods:
-     - grants halve from half the base suspicion window, never below one period;
+   - focal's millisecond grants and its literal cap of five are replaced by derived bounds in the
+     base window's unit:
+     - grants halve from half the base window, never below one;
      - all grants together never exceed one base window.
-   - A grant lengthens the subject's window, composing with corroboration and health dilation.
-3. **The node's own lag** (mantle `node.md` §3.5).
-   - `Detector::observe_self_lag` takes the measured delay between a probe's arrival and its
-     handling.
-   - The effective health multiplier is the larger of Lifeguard's score (missed and refuted
-     probes) and the lag in whole periods, within `health_max`. They measure different things, so
-     both stand (note 32 §6, item 4).
+   - Since change 5 the base window is the one probe that tells a suspect, so a grant is one more
+     told probe.
+3. **The node's own lag** (mantle `node.md` §3.5). Superseded by change 5: the node's lateness is
+   measured into its granularity, its round trips and the moment it judges, so
+   `observe_self_lag` and the health multiplier are gone.
 
 4. **No allocation in a period** (`CLAUDE.md` §1a; `docs/benchmarks.md`, "hyper-swim"). slates'
    detector allocated 6 times a member a period in a quiet cluster and 12 to 14.5 times while
@@ -55,14 +53,41 @@
      queues are purged whenever a record finds them over twice the pending reports, which bounds
      them at twice the membership.
 
+5. **Timing from measurement** (`docs/timing.md` §2.7). slates' detector ticked once a period its
+   caller picked and took `DetectorTiming` (suspicion window, its floor, Lifeguard's `K` and
+   multiplier cap, the dissemination budget) from its caller. Now:
+   - each member's probes of a peer are that pair's NFD-E detector: a `hyper_timing::LinkEstimator`
+     per peer fed the probes' round trips, a pool estimator over all of them for pairs not yet
+     configured, and `detector_at`'s margin at the pair's interval;
+   - the detector is polled (`poll(now)`) and says when next (`wake`): a probe's acknowledgement is
+     due at `s + μ + α`, relays are asked past it and their answers are due after the slowest
+     relay's span plus the target's; a period lasts what its probe needs;
+   - a suspect is condemned when the probe that told it also misses and the member has since had
+     an answer from another member; the confirmation curve, the multiplier and `fixed.rs`'s
+     suspicion window are gone;
+   - a member with nobody alive or suspected left probes the members it holds dead and tells
+     them, so a live one refutes;
+   - the dissemination budget is SWIM §4.1's bound in the membership size, and the relay count the
+     fewest at least as reliable as the direct probe;
+   - pings and ping-requests carry the detector's nonce, and acknowledgements are matched to it.
+
 ## Tests
 
-- 46 unit tests: slates' 39, plus the extension series and its bounds, exact delay by a grant, the
-  lag's dilation, and the gossip queue's order, replacement and bound.
+- 46 unit tests: slates' membership, gossip, codec and coordinate tests, the extension series and
+  its bounds, the gossip queue's order, replacement and bound, and the measured timing's: nothing
+  judged before the estimates exist, the deadline is `μ + α`, a silent member is suspected, told and
+  condemned, an isolated member condemns nobody, an indirect answer spares, a refutation clears a
+  pending condemnation, an extension buys one told probe, the allowance is `Σβ`, the dissemination
+  budget is SWIM's bound and the relay count the fewest that suffice; and one for each failure the
+  cluster runs found (`docs/benchmarks.md`, "The cluster test"): members holding one another dead
+  heal, a lost measurement probe ends at its expected arrival, a refused reconfiguration leaves the
+  verdict in force, a re-adopted suspicion keeps its told probes, and the detection bound does not
+  shrink with the round.
 - `tests/cluster.rs`: four real member processes run the detector over hyper-datagram on real
-  UDP sockets.
-  - The supervisor starts them together, lets them settle, and SIGKILLs one.
-  - Every survivor must report it dead within a bound derived from the timing: a probe round, the
-    widest suspicion window, and a gossip spread (33 periods here).
-  - No live member may ever be suspected.
-  - Measured over six runs: 3 to 5 periods after the kill, with no false suspicion.
+  UDP sockets, as the library configures it.
+  - The supervisor starts them together, waits until every member judges every peer by a
+    configured verdict, and SIGKILLs one.
+  - Every survivor must hold it dead within the detection bound its own detector stated.
+  - Suspicions and condemnations of live members, summed over the cluster, must stay within the
+    configured detectors' allowance `Σβ`.
+  - The counts over hundreds of runs on macOS and Linux are in `docs/benchmarks.md`.

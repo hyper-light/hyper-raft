@@ -10,6 +10,9 @@ rust-version.workspace = true
 [lints]
 workspace = true
 
+[dependencies]
+hyper-timing = { path = "../hyper-timing" }
+
 [dev-dependencies]
 hyper-datagram = { path = "../hyper-datagram" }
 hyper-measure = { path = "../hyper-measure" }

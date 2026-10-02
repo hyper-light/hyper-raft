@@ -326,6 +326,174 @@ against 49 s). `T_E` is far below `η` everywhere, so detection, not the electio
 crash's cost. The macOS rows would not shrink much with strict timers (item 8): their floor is
 the stalls' correlation time, not the timer's `G`.
 
+### 2.7 SWIM: each member's probes of a peer are that pair's NFD-E detector
+
+`crates/hyper-swim/src/detector.rs`. SWIM (Das, Gupta and Motivala 2002) and Lifeguard (Dadgar,
+Phillips and Currey 2018) stay: the probe, the indirect probe through relays, suspicion before
+death, infection-style dissemination, the randomized round-robin, the buddy system and local health.
+What goes is every number hyper-swim's caller picked: the protocol period (40 ms in the cluster
+test), the acknowledgement timeout (half of it), the suspicion window in periods (3), its floor (2),
+Lifeguard's confirmations `K` (2) and multiplier cap (2), the dissemination multiplier `λ` (3), the
+relay fan-out (every member) and the gossip entries a message carries (8).
+
+**What failed.** CI run 36960011977 (commit 63cb65d, windows-2025): "member 4 saw live member 3 as S
+in period 7". A timed wait on Windows ends on the 15.625 ms clock interrupt (`timeBeginPeriod`), so
+on a loaded runner a live member's acknowledgement missed a picked 20 ms window. A bigger period
+would have moved the threshold, not removed it.
+
+**The stream.** Member `p`'s probes of `q` and `q`'s acknowledgements are a heartbeat stream on
+`p`'s own clock: probe `k` sent at `s_k`, answered at `A_k`. NFD-E's delay `A_k − σ_k` is then the
+probe's round trip, with `q`'s handling and both hosts' stalls in it and no second clock: `E(D)` is
+measured, not only `V(D)`. Each pair has a `LinkEstimator` fed the round trips as heartbeat `k`'s
+offset on a schedule at the pair's interval, so everything §2.6 settled holds for it: mean and
+variance (item 7), the window `min(n_G, n_A)` (item 2), the loss by Jeffreys and the unseen-delay
+chance (item 3). SWIM probes a peer once a round of `m` periods in a fresh permutation (§4.3), so
+the spacing varies; NFD-E's offset does not depend on it, and SWIM's own analysis needs only the
+average period (§3.1). The pair's interval is the mean round, `η = m·T̄`, with `T̄` the member's
+mean period.
+
+**Each period's probe.** The acknowledgement of a probe sent at `s` is due at `s + μ + α`: `μ` the
+window's mean round trip, `α` the margin `detector_at` chooses at `η`. Unanswered then, the relays
+are asked, and their answers are due after the slowest relay's own span `μ + α` (the leg to it and
+back) plus the target's (the relay's leg to the target, whose stalls are the target's own, §2.6). A
+probe answered by neither suspects its target. The period ends at the direct deadline, or the
+indirect one when that was needed: each period is what its probe needs, which replaces SWIM's "at
+least three round trips" rule of thumb (§3.1) by the measured deadlines.
+
+**The margin.** `α` minimizes `U` (§2.2) at the pair's interval, with:
+- a false suspicion costing the time until it is refuted: the member's next probe of the peer
+  carries it (the buddy system) and its answer carries the refutation, `η + μ`;
+- the MTBF from the member's `Exposure` fold, the node time it watched and the deaths it learned,
+  seeded with the fleet's history by the owner (Jeffreys' `2T` before the first failure);
+- the floors `G` (§2.4, measured) and the sender's `E[flush] + G = G`, since an acknowledgement
+  is not flushed;
+- one probe in the margin (`α < η`): SWIM judges each probe on its own, and Theorem 7's single
+  factor `β = (V + p·α²)/(V + α²)` needs no independence between probes.
+
+`β` is the configured bound on a live peer missing a probe's deadline; the member reports `Σβ` over
+its judged probes as the expected number of suspicions of a live peer it allows.
+
+**Indirect probes** are not counted in that bound. Their paths share the target's host and its
+stalls, which the traces found dominate, so they are not independent of the direct one, and the
+bound holds whatever they add. Their number: the fewest relays whose paths together fail no more
+often than the direct probe did. A relayed probe is two round trips, so with the configured loss `p`
+one fails with `1 − (1 − p)²`, and `k` relays are asked where `(1 − (1 − p)²)^k ≤ p` (two for any
+loss below 0.38, where `p(2 − p)² ≤ 1`), nearest the target in Vivaldi coordinates.
+
+**Death.** A suspected peer is told by the member's next probe of it, which carries the suspicion
+(Lifeguard's buddy system); if that probe too goes unanswered, the peer is condemned at the next
+answer the member has from another member. Lifeguard found that "an episode of slow message
+processing at a given member is likely to impact multiple of its interactions" (§IV) and counted
+independent suspicions as evidence the local member processes messages in time; an answer from
+another member is that evidence, measured on the member's own round trips. A member whose own
+network has failed suspects everyone and condemns nobody. Gossiped suspicions are hints: only a
+member's own probes condemn. A suspicion re-adopted at a newer incarnation keeps the probes that
+already told the peer and its pending condemnation: they carried a suspicion and went unanswered all
+the same, and resetting them had a crashed member told again from the start. Any answer from a peer,
+even one too late to be measured, is evidence of its life when it arrives. A member with nobody
+alive or suspected left in its view probes the members it holds dead, and each ping tells its target
+so, as a suspicion is told: the member is likelier the one cut off than everyone else dead, and a
+live target refutes in its answer. Without it, members that had condemned one another under a
+one-CPU throttle, each holding the rest dead, never sent again (found in the Linux runs,
+`docs/benchmarks.md`). The bound on condemning a live peer at a probe is the bound on it and the
+previous probe both missing, the lesser of the two (Fréchet's bound, which needs no independence).
+Not their product: a pair's probes are a few periods apart, inside the stalls' correlation time of
+§2.6 (20 to 250 ms), and a short history's `τ_int` of one has not yet seen a stall; the product,
+taken where `τ_int` was one, was refuted twice in three hundred runs at one CPU. This replaces the
+suspicion window, its floor, `K`, the confirmation curve and the multiplier cap. A witnessed
+extension (§S13 of mantle note 32) grants one more told probe, the base window's worth.
+
+**The detection bound** the member states has two parts. To the condemnation pending, with `m` the
+members its view holds besides itself (no round is larger): a peer's next probe is at most `2m − 1`
+periods after its last answer (§4.3), unanswered it suspects, and the told probe starts at most as
+far again, and its own period resolves it: `2(2m − 1) + 1` periods. A period is at most the longest
+the member has run or, where longer, what an unanswered probe's deadlines allow: its target's span
+`μ + α`, then the slowest relay's and the target's again, at most three times the longest span any
+of its verdicts has had, plus the latest the member has woken past a wake it asked; the period in
+progress, and how late the member is now for the wake it asked, count as measured. Then the wait for
+an answer from another member, the evidence that the member's own network works, which nothing
+bounds in advance (a member truly cut off waits for ever, by design): the member measures it and
+adds it. Earlier forms failed under load and are recorded so they are not tried again: the longest
+period run so far (one macOS run in a hundred: early on every period had been answered, and the
+first unanswered one, waiting on its relays, was longer than any yet), and one more period for the
+answer from another member (four Linux runs in four hundred under a CPU throttle, where the next
+probes missed too); periods already ended only (seven runs in three hundred at one CPU, where a
+throttle's freeze of some 40 ms was inside the period still running when the death was noted); and
+the current round's size for `m` (a member that had condemned another, falsely, under the throttle
+ran rounds of one, while the victim's last probe had been in a round of three).
+
+**Before a pair can be judged.** A pair's estimator refuses until it has two prediction errors and a
+measured `τ_int` (`Refusal::TooFewHeartbeats`, `CorrelationUnmeasured`). Until then its probes are
+judged by the member's pool: one more `LinkEstimator`, fed every round trip the member measured, its
+sequence the member's probe count so an unanswered probe to anyone is a loss. The pool is the
+candidate of §3, item 3 (the stalls are the host's); it configures within a few dozen round trips of
+the member's first, and a pair then within a few dozen of its own. The pool is fed while it judges:
+by pairs with no verdict of their own, and by every pair until it has one; its verdict is renewed
+when a probe needs it. A renewal the estimator refuses leaves the verdict in force, as
+`LinkEstimator::configure` leaves its margin: a stall can make `τ_int` unmeasured again, and the
+first form, which dropped the verdict then, left a probe of a crashed member unjudged (one Linux run
+in three hundred at one CPU). While the pool refuses too, nothing is judged: a probe is measurement
+only, and its period ends when it is answered or at its expected arrival from the latest round trip
+(NFD-E over a window of one), whichever is first. Unanswered then, it is a loss to the estimators
+unless its answer comes later; it judges nothing, and its wake measures `G`. The very first probe,
+before any round trip, waits on an answer or another member. An earlier rule ended an unanswered
+measurement period only when another member was next heard from, assuming no time at all; in Linux
+at two CPUs with four busy loops, a throttled container dropped a burst of datagrams, every member's
+probe was lost at once, and all four waited for one another for ever
+(`a_lost_measurement_probe_ends_at_its_expected_arrival`). A member that hears nothing has nothing
+to judge with and nobody to probe usefully, and waits on the network.
+
+**The member's own lateness** (Lifeguard's local health) is measured, not multiplied:
+- every wake it asked for and got late is a sample of `G` ([`Lateness`]), which floors `α`;
+- its delay in reading acknowledgements is in the round trips it measures, so a slow member's own
+  `V(D)` and `α` grow with it;
+- a probe is resolved when the member wakes, with every acknowledgement delivered by then, so a
+  member that wakes late does not blame its peers for its own lateness (a kernel receive stamp,
+  §2.4, removes the read delay where the caller has one).
+Lifeguard's multiplier (`S = 8`, "chosen by trying combinations") and hyper-swim's own lag in
+whole periods are gone.
+
+**Dissemination.** SWIM §4.1: after `λ·ln n` periods of infection-style dissemination at most
+`n^{−((2−4/n)λ−2)}` members are uninfected in expectation, which is below one member once `λ > n/(n
+− 2)`. Each update is piggybacked the least whole number of times past `n·ln n/(n − 2)`: 3 at four
+members, 6 at 256. With two members every message reaches the only other one. The logarithm is
+computed in fixed point, so every host gets the same budget. A message carries the gossip that fits
+its datagram beside the largest message, an acknowledgement with its coordinate
+(`codec::gossip_capacity`): 60 entries at QUIC's 1,200-byte minimum.
+
+**Memory.** Each peer's estimator holds a ring of `G/(PHI·η) − 1` sums at the pair's interval `η =
+m·T̄` (§2.6, the drift bound), so a member's rings together hold about `G/(PHI·T̄)` whatever its
+membership, and the pool as many again: at most `2/PHI` slots (1.1 MB) when `T̄` is at its floor
+`G`. Each estimator is boxed, so the fields a period reads stay together. A period allocates nothing
+once each peer has answered once (`docs/benchmarks.md`, "hyper-swim").
+
+**What the cluster test asserts** (`crates/hyper-swim/tests/cluster.rs`, §2.5). Four member
+processes run the detector as the library configures it. The supervisor waits on facts: every member
+judging every peer by a configured verdict (the pair's own, or the pool's while the pair's estimator
+refuses), then it kills one; every survivor holds it dead, each within the bound its detector
+stated, measured on the member's clock from the victim's last answer. Waiting for every pair's own
+estimator was not a fact to wait on: under a CPU throttle a pair's round trips can stay too
+correlated for `τ_int` to be measured, and the estimator rightly refuses for as long as that lasts.
+Of live members it asserts what the configuration promises: Theorem 7 bounds the expected number of
+suspicions and of condemnations by `Σβ`, and a run refutes that only when the 95 % lower limit of
+its count (the Poisson score interval, as the replay and the trace analyser use, §2.6) passes it. A
+first form asserted the count itself within `Σβ`, which no detector can promise of one run: at an
+allowance of 1.8, two mistakes are ordinary, and twelve runs in a hundred at one CPU failed so while
+the series as a whole kept far inside its bound. The rule itself refutes a bound that holds with
+probability at most 2.5 % an assertion, under the Poisson model the replay uses; on unloaded hosts
+the runs' counts are far below their allowance and it does not arise. A member whose supervisor is
+gone ends when its report cannot be written.
+
+**Measured** (`docs/benchmarks.md`, "hyper-swim"): on loopback a period is 0.1–1 ms, `μ` 60–100 µs
+and `α` growing from about 0.3 ms with the MTBF; a period costs no allocation and less time than
+slates' at every point; 2,000 runs of the cluster test on macOS and on Linux at one, two and four
+CPUs with busy loops beside them all passed, detection a median 4 ms on macOS and 16–18 ms in
+Docker's VM after the victim's last answer. Open: §3, item 1 governs the probe rate too, since a
+period is its probe's deadline and nothing yet prices a probe, and as the MTBF grows the margins and
+so the periods grow with it; two members cannot condemn each other, as neither can tell its own
+failure from the other's; the pool's mean is wrong for a pair far from the member's others until
+that pair configures; and the allowance is loose while a history is young (§3, item 3).
+
 ## 3. Open, to be measured before it is fixed
 
 Items 2, 6 and 7 and part of 3 are settled by the traces (§2.6) and implemented in L-1's estimator

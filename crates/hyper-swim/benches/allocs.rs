@@ -21,121 +21,211 @@
     missing_docs
 )]
 
+use hyper_datagram::{LENGTH_BYTES, OVERHEAD_BYTES};
 use hyper_measure::{alloc, faults};
 use hyper_swim::HostId;
-use hyper_swim::codec::{Coordinate, GossipBatch, SwimMessage};
-use hyper_swim::detector::{Detector, DetectorTiming};
+use hyper_swim::codec::{Coordinate, GossipBatch, SwimMessage, gossip_capacity};
+use hyper_swim::coordinates::NetworkCoordinate;
+use hyper_swim::detector::{Detector, Ping, PingReq};
 use hyper_swim::membership::{Liveness, MemberState};
+use hyper_timing::Exposure;
 
 #[global_allocator]
 static ALLOCATOR: alloc::Counting = alloc::Counting;
 
-/// Periods counted per row, after the warm-up periods.
+/// Periods counted per row, after the warm-up.
 const PERIODS: u64 = 400;
-/// Gossip entries a message carries at most, as `tests/cluster.rs` sends.
-const GOSSIP_PER_MESSAGE: usize = 8;
-/// A round trip to fold into the coordinate, in seconds: any constant serves, the count is the
-/// same.
-const RTT: f64 = 0.000_2;
+/// The path's datagram size: QUIC's minimum (RFC 9000 §14.1), as `tests/cluster.rs` sets it.
+const DATAGRAM: usize = 1_200;
+/// The workload's round trip: 200 µs, a LAN's.
+const RTT_NS: u64 = 200_000;
+/// The workload's jitter: up to half the round trip more, from a xorshift stream.
+const JITTER_NS: u64 = RTT_NS / 2;
+/// How late each wake comes: Linux's default timer slack, 50 µs (`PR_SET_TIMERSLACK(2const)`).
+const LATE_NS: u64 = 50_000;
 
-/// The transmit budget λ·ln(n+1) for λ = 3 (SWIM §4.4).
-fn transmits(members: usize) -> u32 {
-    (3.0 * ((members + 1) as f64).ln()).ceil() as u32
+/// One member: its detector and its own clock.
+struct Member {
+    detector: Detector,
+    now: u64,
+    /// The acknowledgement in flight: when it lands.
+    landing: Option<u64>,
 }
 
-/// Periods run before counting: twice what the joins take to drain. Each member holds a report of
-/// every member, sent `transmits` times, and sends at most two batches a period (its ping and the
-/// acknowledgement of the ping it receives).
-fn warm(members: usize) -> u64 {
-    let reports = (members * transmits(members) as usize) as u64;
-    2 * reports.div_ceil(2 * GOSSIP_PER_MESSAGE as u64)
+/// Gossip entries a message carries: what the datagram holds beside an acknowledgement, as
+/// `tests/cluster.rs` derives it.
+fn gossip_per_message() -> usize {
+    let mut bare = Vec::new();
+    SwimMessage::Ack {
+        from: HostId(0),
+        nonce: u64::MAX,
+        boot_nonce: 1,
+        configuration_version: 1,
+        standing: None,
+        gossip: GossipBatch::Entries(&[]),
+        coordinate: Coordinate::Held(&NetworkCoordinate::origin(8)),
+    }
+    .encode_into(&mut bare);
+    gossip_capacity(DATAGRAM - OVERHEAD_BYTES - LENGTH_BYTES, bare.len())
 }
 
-fn timing(members: usize) -> DetectorTiming {
-    // The cluster test's timing.
-    let transmits = transmits(members);
-    DetectorTiming {
-        suspicion_periods: 6,
-        gossip_transmits: transmits,
-        health_max: 8,
-        suspicion_min: 2,
-        confirmations_expected: 3,
+/// What a member's driver holds across periods: the gossip batch it fills, the bytes it encodes,
+/// the relays it is asked for, and the workload's noise.
+struct Buffers {
+    gossip: usize,
+    batch: Vec<(HostId, MemberState)>,
+    ping: Vec<u8>,
+    ack: Vec<u8>,
+    requests: Vec<PingReq>,
+    noise: u64,
+}
+
+impl Buffers {
+    fn new() -> Self {
+        Self {
+            gossip: gossip_per_message(),
+            batch: Vec::new(),
+            ping: Vec::new(),
+            ack: Vec::new(),
+            requests: Vec::new(),
+            noise: 0x2545_F491_4F6C_DD1D,
+        }
+    }
+
+    /// A xorshift step (Marsaglia 2003).
+    fn round_trip(&mut self) -> u64 {
+        self.noise ^= self.noise << 13;
+        self.noise ^= self.noise >> 7;
+        self.noise ^= self.noise << 17;
+        RTT_NS + self.noise % JITTER_NS
     }
 }
 
-fn cluster(members: usize) -> Vec<Detector> {
+fn cluster(members: usize) -> Vec<Member> {
     (0..members as u64)
         .map(|id| {
-            let mut detector = Detector::new(HostId(id), timing(members));
+            let mut detector = Detector::new(HostId(id), Exposure::new());
             for peer in 0..members as u64 {
                 detector.join(HostId(peer));
             }
-            detector
+            Member {
+                detector,
+                now: 1,
+                landing: None,
+            }
         })
         .collect()
 }
 
-/// What a member's driver holds across periods: the gossip batch it fills and the bytes it encodes.
-#[derive(Default)]
-struct Buffers {
-    batch: Vec<(HostId, MemberState)>,
-    ping: Vec<u8>,
-    ack: Vec<u8>,
+/// Advances member `prober` to its next period and runs the probe it starts: the ping through
+/// the codec to its target, which applies its gossip and answers, and the acknowledgement back.
+fn step(members: &mut [Member], prober: usize, buffers: &mut Buffers) {
+    let ping = loop {
+        let member = &mut members[prober];
+        let at = match (member.detector.wake(), member.landing) {
+            (Some(wake), _) => wake + LATE_NS,
+            (None, Some(landing)) => landing,
+            (None, None) => member.now,
+        };
+        member.now = member.now.max(at);
+        if let Some(ping) = member.detector.poll(member.now, &mut buffers.requests) {
+            break ping;
+        }
+    };
+    exchange(members, prober, ping, buffers);
 }
 
-fn period(detectors: &mut [Detector], buffers: &mut Buffers, nonce: u64) {
-    for prober in 0..detectors.len() {
-        let Some(ping) = detectors[prober].tick() else {
-            continue;
-        };
-        let target = ping.to.0 as usize;
-        detectors[prober].ping_gossip_into(ping.to, GOSSIP_PER_MESSAGE, &mut buffers.batch);
-        let message = SwimMessage::Ping {
-            from: HostId(prober as u64),
-            nonce,
-            boot_nonce: 1,
-            configuration_version: 1,
-            gossip: GossipBatch::Entries(&buffers.batch),
-        };
-        message.encode_into(&mut buffers.ping);
-        let SwimMessage::Ping { from, gossip, .. } = SwimMessage::decode(&buffers.ping).unwrap()
-        else {
-            unreachable!()
-        };
-        let answering = &mut detectors[target];
-        answering.apply_gossip_from(from, gossip);
-        answering.gossip_into(GOSSIP_PER_MESSAGE, &mut buffers.batch);
-        let ack = SwimMessage::Ack {
-            from: ping.to,
-            nonce,
-            boot_nonce: 1,
-            configuration_version: 1,
-            standing: None,
-            gossip: GossipBatch::Entries(&buffers.batch),
-            coordinate: Coordinate::Held(answering.coordinate()),
-        };
-        ack.encode_into(&mut buffers.ack);
-        let SwimMessage::Ack {
-            from,
-            gossip,
-            coordinate,
-            ..
-        } = SwimMessage::decode(&buffers.ack).unwrap()
-        else {
-            unreachable!()
-        };
-        let probing = &mut detectors[prober];
-        probing.apply_gossip_from(from, gossip);
-        probing.on_ack(from);
-        probing.learn_coordinate(from, coordinate);
-        probing.observe_rtt(from, RTT);
+fn exchange(members: &mut [Member], prober: usize, ping: Ping, buffers: &mut Buffers) {
+    let target = ping.to.0 as usize;
+    let landing = members[prober].now + buffers.round_trip();
+    members[prober]
+        .detector
+        .ping_gossip_into(ping.to, buffers.gossip, &mut buffers.batch);
+    SwimMessage::Ping {
+        from: HostId(prober as u64),
+        nonce: ping.nonce,
+        boot_nonce: 1,
+        configuration_version: 1,
+        gossip: GossipBatch::Entries(&buffers.batch),
+    }
+    .encode_into(&mut buffers.ping);
+    let SwimMessage::Ping {
+        from,
+        gossip,
+        nonce,
+        ..
+    } = SwimMessage::decode(&buffers.ping).unwrap()
+    else {
+        unreachable!()
+    };
+    let answering = &mut members[target].detector;
+    answering.apply_gossip(gossip);
+    let ack = answering.on_ping(from);
+    answering.gossip_into(buffers.gossip, &mut buffers.batch);
+    SwimMessage::Ack {
+        from: ping.to,
+        nonce,
+        boot_nonce: 1,
+        configuration_version: 1,
+        standing: None,
+        gossip: GossipBatch::Entries(&buffers.batch),
+        coordinate: Coordinate::Held(answering.coordinate()),
+    }
+    .encode_into(&mut buffers.ack);
+    let SwimMessage::Ack {
+        from,
+        gossip,
+        coordinate,
+        nonce,
+        ..
+    } = SwimMessage::decode(&buffers.ack).unwrap()
+    else {
+        unreachable!()
+    };
+    let probing = &mut members[prober];
+    probing.detector.apply_gossip(gossip);
+    probing.detector.learn_coordinate(from, coordinate);
+    probing.detector.on_ack(from, nonce, landing);
+    probing.landing = Some(landing);
+    let _ = ack;
+}
+
+/// One period of every member.
+fn period(members: &mut [Member], buffers: &mut Buffers) {
+    for prober in 0..members.len() {
+        step(members, prober, buffers);
+    }
+}
+
+/// Runs whole rounds until every member's every pair is configured by its own estimator: the
+/// fact the counted periods start from.
+fn warm(members: &mut [Member], buffers: &mut Buffers) {
+    let n = members.len() as u64;
+    let configured = |members: &[Member]| {
+        members.iter().enumerate().all(|(id, member)| {
+            (0..n).filter(|peer| *peer != id as u64).all(|peer| {
+                member
+                    .detector
+                    .report(HostId(peer))
+                    .is_some_and(|report| report.configured)
+            })
+        })
+    };
+    while !configured(members) {
+        for _ in 0..n {
+            period(members, buffers);
+        }
+    }
+    // A further round for every report the configuration's gossip queued to drain.
+    for _ in 0..n {
+        period(members, buffers);
     }
 }
 
 /// One member hears itself suspected and refutes, so a new incarnation spreads.
-fn churn(detectors: &mut [Detector], at: u64) {
-    let member = (at as usize) % detectors.len();
-    let detector = &mut detectors[member];
+fn churn(members: &mut [Member], at: u64) {
+    let member = (at as usize) % members.len();
+    let detector = &mut members[member].detector;
     let incarnation = detector.membership().local_incarnation();
     detector.apply(
         HostId(member as u64),
@@ -176,32 +266,28 @@ fn row(what: &str, members: usize, cost: &Cost) {
 }
 
 fn point(members: usize) {
-    let mut detectors = cluster(members);
-    let mut buffers = Buffers::default();
-    let mut nonce = 0;
-    for _ in 0..warm(members) {
-        nonce += 1;
-        period(&mut detectors, &mut buffers, nonce);
-    }
+    let mut cluster = cluster(members);
+    let mut buffers = Buffers::new();
+    warm(&mut cluster, &mut buffers);
     let n = PERIODS * members as u64;
     let cost = counted(n, || {
         for _ in 0..PERIODS {
-            nonce += 1;
-            period(&mut detectors, &mut buffers, nonce);
+            period(&mut cluster, &mut buffers);
         }
     });
     row("quiet", members, &cost);
+    let mut at = 0;
     let cost = counted(n, || {
         for _ in 0..PERIODS {
-            nonce += 1;
-            churn(&mut detectors, nonce);
-            period(&mut detectors, &mut buffers, nonce);
+            at += 1;
+            churn(&mut cluster, at);
+            period(&mut cluster, &mut buffers);
         }
     });
     row("churning", members, &cost);
-    for detector in &detectors {
+    for member in &cluster {
         assert_eq!(
-            detector.membership().alive().count(),
+            member.detector.membership().alive().count(),
             members,
             "every member stays alive"
         );
@@ -212,7 +298,8 @@ fn main() {
     assert!(alloc::installed(), "the counting allocator is installed");
     println!(
         "hyper-swim: allocations, reallocations, bytes asked and minor faults per member per \
-         period ({PERIODS} periods, after twice the joins' drain)"
+         period ({PERIODS} periods, after every pair is configured); {} gossip entries a message",
+        gossip_per_message()
     );
     println!(
         "  {:<12} {:>8} {:>10} {:>10} {:>10} {:>10}",

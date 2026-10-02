@@ -7,11 +7,14 @@
 //! ```
 //!
 //! The workload is `crates/hyper-swim/benches/allocs.rs`'s: `N` detectors in one process run
-//! whole periods as a member's driver does. Each ticks, sends its probe target a ping carrying
-//! gossip, the target applies it and answers with an acknowledgement carrying its own gossip and
-//! coordinate, and the prober applies that, credits the probe and folds the round trip into its
-//! coordinate. Every message goes through the wire codec. Quiet has no membership changes;
-//! churning has one member refute a suspicion every period, so its new incarnation spreads.
+//! whole periods as a member's driver does. Each starts a period, sends its probe target a ping
+//! carrying gossip, the target applies it and answers with an acknowledgement carrying its own
+//! gossip and coordinate, and the prober applies that, credits the probe and folds the round trip
+//! into its coordinate. Every message goes through the wire codec. Quiet has no membership
+//! changes; churning has one member refute a suspicion every period, so its new incarnation
+//! spreads. hyper-swim's period does more than slates': it is polled at its own deadline, measures
+//! the round trip into the pair's estimator and the pool, and reconfigures each when its estimates
+//! renew; slates' period is a tick at a period its caller picked.
 //!
 //! - **hyper**: hyper-swim, reusing its gossip batch and encode buffers across periods.
 //! - **slates**: slates-cluster's `Detector` and `SwimMessage` at `5cce86a`, the source hyper-swim
@@ -48,22 +51,26 @@ static ALLOCATOR: Counting = Counting;
 
 /// The detectors, by the name the command line gives them.
 const DETECTORS: [&str; 2] = ["hyper", "slates"];
-/// Gossip entries a message carries at most, as hyper-swim's `tests/cluster.rs` sends.
-pub const GOSSIP_PER_MESSAGE: usize = 8;
-/// A round trip to fold into the coordinate, in seconds: any constant serves, the work is the
-/// same.
-pub const RTT: f64 = 0.000_2;
+/// A round trip for slates' detector to fold into its coordinate, in seconds: the workload's mean
+/// (hyper-swim measures its own from the simulated clock).
+pub const RTT: f64 = 0.000_25;
 
-/// The transmit budget λ·ln(n+1) for λ = 3 (SWIM §4.4).
+/// The transmit budget both detectors use: hyper-swim's, SWIM §4.1's bound.
 pub fn transmits(members: usize) -> u32 {
-    (3.0 * ((members + 1) as f64).ln()).ceil() as u32
+    hyper_swim::detector::gossip_transmits(members)
+}
+
+/// Gossip entries a message carries: what hyper-swim's driver fits in a datagram.
+pub fn gossip_per_message() -> usize {
+    hyper::gossip_per_message()
 }
 
 /// Periods run before measuring: twice what the joins take to drain. Each member holds a report
-/// of every member, sent `transmits` times, and sends at most two batches a period.
+/// of every member, sent `transmits` times, and sends at most two batches a period. hyper-swim's
+/// cluster has run further already, until every pair is configured.
 pub fn warm(members: usize) -> u64 {
     let reports = (members * transmits(members) as usize) as u64;
-    2 * reports.div_ceil(2 * GOSSIP_PER_MESSAGE as u64)
+    2 * reports.div_ceil(2 * gossip_per_message() as u64)
 }
 
 /// A detector cluster the comparison drives.

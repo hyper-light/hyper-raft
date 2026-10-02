@@ -13,6 +13,8 @@ publish = false
 
 [dependencies]
 hyper-swim = { path = "../hyper-swim" }
+hyper-timing = { path = "../hyper-timing" }
+hyper-datagram = { path = "../hyper-datagram" }
 hyper-measure = { path = "../hyper-measure" }
 # slates' detector, gossip, membership, coordinates and SWIM wire at slates `5cce86a`, unchanged
 # in those files since.

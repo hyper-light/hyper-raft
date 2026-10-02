@@ -169,6 +169,14 @@ const GOSSIP_ENTRY_BYTES: usize = size_of::<u64>() + size_of::<u8>() + size_of::
 /// Format: the piggybacked batch is prefixed by its entry count as a u32.
 const GOSSIP_COUNT_BYTES: usize = size_of::<u32>();
 
+/// The gossip entries a message can carry in `room` bytes when its encoding with an empty batch is
+/// `bare` bytes long: what is left, in whole entries.
+pub fn gossip_capacity(room: usize, bare: usize) -> usize {
+    room.saturating_sub(bare)
+        .checked_div(GOSSIP_ENTRY_BYTES)
+        .unwrap_or(0)
+}
+
 /// A piggybacked gossip batch: the entries a sender holds, or a received batch read in place.
 #[derive(Clone, Copy, Debug)]
 pub enum GossipBatch<'a> {

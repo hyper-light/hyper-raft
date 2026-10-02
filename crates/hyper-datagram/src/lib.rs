@@ -71,7 +71,7 @@ pub const TAG_BYTES: usize = 16;
 /// The CRC-32C at the head of the sealed body.
 const CHECKSUM_BYTES: usize = 4;
 /// Each message's length prefix.
-const LENGTH_BYTES: usize = 2;
+pub const LENGTH_BYTES: usize = 2;
 /// What every datagram spends besides its messages.
 pub const OVERHEAD_BYTES: usize = PROLOGUE_BYTES + CHECKSUM_BYTES + TAG_BYTES;
 /// RFC 8085 §3.2's fallback when a path is unmeasured: IPv4's 576-byte minimum reassembly size,

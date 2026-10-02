@@ -50,11 +50,15 @@ pub mod tls;
 pub use admission::{AdmissionLimits, AdmissionStats};
 pub use budget::{Budget, Fixed, Lane, Reservation};
 pub use credit::{
-    MIN_DATAGRAM, STREAM_BYTES_PER_PACKET, class_reserve, initial_window, stream_window_ceiling,
+    K_GRANULARITY, MIN_DATAGRAM, STREAM_BYTES_PER_PACKET, class_reserve, initial_window,
+    stream_window_ceiling,
 };
 pub use endpoint::{Config, Endpoint, Limits, PathFacts, Stats};
 pub use error::Refusal;
 pub use hyper_quic::{EcnCodepoint, Transmit};
+/// The fold an owner measures its timer granularity `G` with, for [`Endpoint::set_granularity`]
+/// and [`Endpoint::exchange_tail`].
+pub use hyper_timing::Lateness;
 pub use progress::{LEAST_PROGRESS, Progress};
 pub use receive::RECEIVE_CHUNK;
 pub use round::{Round, RoundEnd};

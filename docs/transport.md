@@ -193,7 +193,8 @@ each ported test's origin, and what was left out).
   `handle_timeout` and `poll_event`, every one taking the caller's `now`; its owner calls `connect`,
   `disconnect`, `open`, `head`, `write_body`, `read_body`, `body_complete`, `reply`, `end`,
   `reserve`, `release`, `send_frame`, `export_keying_material`, `path`, `credit`, `exchange_tail`
-  (over the caller's measured timer granularity) and `stats`.
+  (over the caller's measured timer granularity), `set_granularity` (that granularity, for tuning
+  receive windows) and `stats`.
 - Events: `Connected { peer, role, epoch }`, `Request`, `Reply`, `BodyReady`, `Writable`,
   `Frame { peer, lane, kind, frame }`, `Refused { exchange, refusal, by_peer }`,
   `Closed { peer, epoch }`, `Unreachable`.
@@ -215,7 +216,8 @@ after every more urgent class on the connection has what it declared and not yet
 its owner or not (strict priority at the point credit is taken, which the end-to-end run showed
 quinn's send-order priority alone does not give). The receive window
 starts at RFC 9002's initial window plus the reserve and doubles when consumed within two round
-trips (Chromium's rule; a round trip under the 1 ms timer granularity counts as 1 ms), each growth
+trips (Chromium's rule; a round trip under the owner's measured timer granularity `G` counts as
+`G`, RFC 9002's 1 ms `kGranularity` until the owner reports one through `set_granularity`), each growth
 reserved from the budget; the stream window is quinn's assembler limit made explicit (patch Q5).
 Exchanges are judged by progress-charged deadlines (T39); a period's sent bytes count only if the
 peer was heard in it, so probes sent to a dead peer do not keep its exchanges alive; an answer is
@@ -267,6 +269,8 @@ never depends on it.
 - `PlaneSocket`: a hyper-datagram `Plane`'s own socket. `flush(plane, route, refused)` seals and
   sends; `receive(plane, fence, deliver).await` opens a batch.
 - `Io { batch }`: the datagrams one system call carries either way, 1 to `UIO_MAXIOV` (1,024).
+- The driver folds how late its timer fires (`hyper_timing::Lateness`) and gives the endpoint that
+  `G` (`Endpoint::set_granularity`) each time it fires.
 
 **Shape.** The owner's task holds the driver and awaits it. tokio wakes that task through the
 socket's and the timer's wakers. Inside there is no task, thread, channel, lock or `Arc`, and no

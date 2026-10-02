@@ -277,6 +277,8 @@ pub trait Drive {
     fn transmit(&mut self, now: Instant, out: &mut Vec<u8>) -> Option<Transmit>;
     fn timeout(&mut self) -> Option<Instant>;
     fn fire(&mut self, now: Instant);
+    /// The driver measured its timer granularity: what has a use for it takes it.
+    fn granularity(&mut self, _granularity: Duration) {}
 }
 
 impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Drive for Endpoint<C, B, D> {
@@ -291,6 +293,9 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Drive for En
     }
     fn fire(&mut self, now: Instant) {
         self.handle_timeout(now);
+    }
+    fn granularity(&mut self, granularity: Duration) {
+        self.set_granularity(granularity);
     }
 }
 

@@ -2793,6 +2793,29 @@ dead peer's exchange now ends at the first judgement (it took two, the first hav
 bytes sent into silence), and `progress::tests::what_is_sent_into_silence_is_not_progress` fails
 without the change.
 
+**An answer is charged with what arrives (2026-10-01).** The `exchanges` scenario's asker refused
+its 8 MiB bulk reply as stalled at 5.6 and 5.5 MB read on two CI runs (ubuntu-24.04 at `ac10f6f`,
+windows-11-arm at `35d35d8`). Nothing was lost and the server had not stopped: the answering wait
+gave a body its residency at two datagrams a round trip, 1.38 s for 8 MiB at the 395 µs QUIC measured,
+so one period, and the body was moving at 2.7 MB/s. The law is now charged with the bytes delivered
+against what the peer declared (`src/progress.rs`). Runs of the scenario (debug builds; macOS on
+this machine at load 33–39; Linux in `rust:1.98.0` containers on it):
+
+| Where | Before | After |
+|---|---|---|
+| macOS, three at once under background QoS (`taskpolicy -c background`) | 21 of 24 passed (a 64 KiB reply refused with none of it read while its period brought 464 KB) | 90 of 90, the longest 5.3 s |
+| Linux, `--cpus=0.5`, three at once | 8 of 15 (the server refusing requests queued in the asker's upload) | 45 of 45, the longest 11.0 s |
+| Linux, `--cpu-period=100000 --cpu-quota=20000`, two at once | 5 of 30 | 30 of 30, the longest 22.9 s |
+| Linux, `--cpus=4`, one at a time | | 20 of 20; every scenario 10 of 10 |
+| Linux, `--cpus=1`, every scenario | | 5 of 5 |
+
+The receive window is tuned under the owner's measured timer granularity `G` since the same date
+(`Endpoint::set_granularity`; RFC 9002's 1 ms until the first report). In these scenarios neither
+driver's timed wait ran out while bodies moved (each turn ended on a datagram), so `G` stayed at
+1 ms and the windows grew as before: hyper-tokio's exchanges on Linux at `--cpus=4`, 16 runs of each
+build alternated at load 30–37, took 0.77–1.20 s before and 0.82–1.28 s after, the same law
+throughout; the allocation bench is unchanged at every size.
+
 ## Commands for the transport
 
 ```sh

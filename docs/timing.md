@@ -114,7 +114,9 @@ design, with nothing picked between them:
 - **The granularity** under every tail (`PathRtt`, `ExchangeRtt`: RFC 9002 §6.2.1's
   `max(4·rttvar, kGranularity)`, whose Appendix A.2 defines `kGranularity` as "Timer granularity.
   This is a system-dependent value" and §6.1.2 recommends 1 ms for it) is the owner's measured
-  `G`, passed in. hyper-transport's `exchange_tail` takes it from its caller.
+  `G`, passed in. hyper-transport's `exchange_tail` takes it from its caller, and its receive
+  windows are tuned under it (`Endpoint::set_granularity`, which hyper-tokio's driver feeds from its
+  timer; RFC 9002's 1 ms until the first report).
 - **A round's extensions** were capped at `ELECTION_MARGIN`, "so a round never outlasts the
   election timeout it would displace a leader over". The ceiling already bounds a round, so a round
   with that purpose takes the base as its ceiling and the cap goes.

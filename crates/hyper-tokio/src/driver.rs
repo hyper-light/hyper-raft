@@ -6,7 +6,7 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Instant;
 
-use hyper_transport::{Budget, Classes, Directory, Endpoint, Event};
+use hyper_transport::{Budget, Classes, Directory, Endpoint, Event, Lateness};
 use tokio::time::Sleep;
 
 use crate::Error;
@@ -32,6 +32,11 @@ pub struct Driver<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>>
     sleep: Pin<Box<Sleep>>,
     /// The deadline the timer is armed for.
     armed: Option<Instant>,
+    /// How late the timer fires: the owner's timer granularity `G`, which the endpoint tunes its
+    /// receive windows under (`docs/timing.md` §2.4).
+    late: Lateness,
+    /// The instant the lateness fold's nanoseconds count from.
+    epoch: Instant,
 }
 
 impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Driver<C, B, D> {
@@ -59,6 +64,8 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Driver<C, B,
             socket,
             sleep,
             armed: None,
+            late: Lateness::new(),
+            epoch: Instant::now(),
         })
     }
 
@@ -137,11 +144,24 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Driver<C, B,
             if self.sleep.as_mut().poll(context).is_pending() {
                 return Poll::Pending;
             }
+            self.fired(due);
             self.armed = None;
         }
         // The budget is spent with work still to do: come back after the runtime's other tasks.
         context.waker().wake_by_ref();
         Poll::Pending
+    }
+
+    /// The timer armed for `due` fired: its lateness is folded into `G`, and the endpoint told.
+    fn fired(&mut self, due: Instant) {
+        let nanos = |at: Instant| {
+            u64::try_from(at.saturating_duration_since(self.epoch).as_nanos()).unwrap_or(u64::MAX)
+        };
+        // A full fold keeps the mean it has: 2^64 waits, or nanoseconds, are past any process.
+        let _ = self.late.on_wait(nanos(due), nanos(Instant::now()));
+        if let Some(granularity) = self.late.granularity() {
+            self.endpoint.set_granularity(granularity);
+        }
     }
 
     /// Takes the datagrams that have arrived, a batch at a time, until the socket has none or

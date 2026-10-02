@@ -43,10 +43,13 @@ pub const STREAM_BYTES_PER_PACKET: u64 =
 /// The two round trips within which a consumed window says the window was the limit (Chromium
 /// QUIC's auto-tuning trigger, slates `flow.rs` `AUTOTUNE_RTT_MULTIPLE`).
 const AUTOTUNE_ROUND_TRIPS: u32 = 2;
-/// The timer granularity below which a round trip is not resolved (RFC 9002 §6.1.2, `kGranularity`
-/// = 1 ms): a loopback path's round trip of tens of microseconds would otherwise leave no time in
-/// which a consumed window counts as quick, and the window would never grow.
-const GRANULARITY: Duration = Duration::from_millis(1);
+/// RFC 9002's `kGranularity` (Appendix A.2: "Timer granularity. This is a system-dependent
+/// value"; 1 ms, as §6.1.2 recommends): the granularity a window is
+/// tuned under until the owner reports the one it measured (`Endpoint::set_granularity`, the mean
+/// lateness of its timed waits, `hyper_timing::Lateness`; `docs/timing.md` §2.4). Below it a round
+/// trip is not resolved: a loopback path's round trip of tens of microseconds would otherwise
+/// leave no time in which a consumed window counts as quick, and the window would never grow.
+pub const K_GRANULARITY: Duration = Duration::from_millis(1);
 /// The window doubles at a growth (Chromium QUIC's auto-tuning step, slates `flow.rs`).
 const AUTOTUNE_GROWTH: u64 = 2;
 /// RFC 9002 §7.2's floor on the initial window, `max(14720, 2 * max_datagram_size)`'s constant.
@@ -106,15 +109,21 @@ impl Window {
         self.consumed = self.consumed.saturating_add(bytes);
     }
     /// The window the next growth would give, if the application consumed a whole window within
-    /// two round trips of `rtt` by `now`; `None` when the window stays. A new epoch begins once a
-    /// whole window was consumed, whether or not the window grows.
-    pub(crate) fn tune(&mut self, now: Instant, rtt: Duration) -> Option<u64> {
+    /// two round trips of `rtt`, a round trip under the owner's timer `granularity` counting as
+    /// that, by `now`; `None` when the window stays. A new epoch begins once a whole window was
+    /// consumed, whether or not the window grows.
+    pub(crate) fn tune(
+        &mut self,
+        now: Instant,
+        rtt: Duration,
+        granularity: Duration,
+    ) -> Option<u64> {
         let (began, consumed_then) = *self.epoch.get_or_insert((now, self.consumed));
         if self.consumed.saturating_sub(consumed_then) < self.window {
             return None;
         }
         self.epoch = Some((now, self.consumed));
-        let rtt = rtt.max(GRANULARITY);
+        let rtt = rtt.max(granularity);
         let quick =
             now.saturating_duration_since(began) <= rtt.saturating_mul(AUTOTUNE_ROUND_TRIPS);
         let grown = self
@@ -132,6 +141,29 @@ impl Window {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A path whose round trip is under the owner's timer granularity is tuned under that
+    /// granularity: on Windows' 15.6 ms timer a window consumed in 20 ms, past two round trips of
+    /// a 400 µs path and past RFC 9002's 1 ms, is still within two of the owner's granularity, the
+    /// finest time in which it sees the window consumed.
+    #[test]
+    fn a_round_trip_under_the_granularity_counts_as_the_granularity() {
+        let start = Instant::now();
+        let rtt = Duration::from_micros(400);
+        let consumed_in = Duration::from_millis(20);
+        let mut coarse = Window::new(1_000, 4_000);
+        assert_eq!(coarse.tune(start, rtt, K_GRANULARITY), None);
+        coarse.consumed(1_000);
+        assert_eq!(coarse.tune(start + consumed_in, rtt, K_GRANULARITY), None);
+        let mut measured = Window::new(1_000, 4_000);
+        let windows = Duration::from_micros(15_625);
+        assert_eq!(measured.tune(start, rtt, windows), None);
+        measured.consumed(1_000);
+        assert_eq!(
+            measured.tune(start + consumed_in, rtt, windows),
+            Some(2_000)
+        );
+    }
 
     #[test]
     fn the_derived_numbers() {
@@ -151,25 +183,36 @@ mod tests {
         let start = Instant::now();
         let rtt = Duration::from_millis(10);
         let mut window = Window::new(1_000, 3_000);
-        assert_eq!(window.tune(start, rtt), None);
+        assert_eq!(window.tune(start, rtt, K_GRANULARITY), None);
         window.consumed(999);
-        assert_eq!(window.tune(start + Duration::from_millis(5), rtt), None);
+        assert_eq!(
+            window.tune(start + Duration::from_millis(5), rtt, K_GRANULARITY),
+            None
+        );
         window.consumed(1);
-        let grown = window.tune(start + Duration::from_millis(15), rtt).unwrap();
+        let grown = window
+            .tune(start + Duration::from_millis(15), rtt, K_GRANULARITY)
+            .unwrap();
         assert_eq!(grown, 2_000);
         window.grew(grown);
         // Slowly: a whole window over three round trips is no reason to grow.
         window.consumed(2_000);
-        assert_eq!(window.tune(start + Duration::from_millis(45), rtt), None);
+        assert_eq!(
+            window.tune(start + Duration::from_millis(45), rtt, K_GRANULARITY),
+            None
+        );
         assert_eq!(window.window(), 2_000);
         // Quickly again: capped at the ceiling, and no growth past it.
         window.consumed(2_000);
         assert_eq!(
-            window.tune(start + Duration::from_millis(50), rtt),
+            window.tune(start + Duration::from_millis(50), rtt, K_GRANULARITY),
             Some(3_000)
         );
         window.grew(3_000);
         window.consumed(3_000);
-        assert_eq!(window.tune(start + Duration::from_millis(51), rtt), None);
+        assert_eq!(
+            window.tune(start + Duration::from_millis(51), rtt, K_GRANULARITY),
+            None
+        );
     }
 }

@@ -46,7 +46,7 @@ use std::time::{Duration, Instant};
 
 use common::*;
 use hyper_transport::{
-    Classes, Config, Endpoint, Fixed, Limits, PeerId, Progress, Refusal, class_reserve,
+    Classes, Config, Endpoint, Fixed, Lateness, Limits, PeerId, Progress, Refusal, class_reserve,
     initial_window,
 };
 
@@ -69,6 +69,9 @@ struct Wire {
     buffer: Vec<u8>,
     out: Vec<u8>,
     errors: u64,
+    /// How late the socket's timed waits end: the driver's timer granularity `G`.
+    late: Lateness,
+    epoch: Instant,
 }
 
 impl Wire {
@@ -78,6 +81,8 @@ impl Wire {
             buffer: vec![0; 65_536],
             out: Vec::with_capacity(65_536),
             errors: 0,
+            late: Lateness::new(),
+            epoch: Instant::now(),
         }
     }
     fn address(&self) -> SocketAddr {
@@ -91,22 +96,26 @@ impl Wire {
                 .send_to(&self.out[..transmit.size], transmit.destination);
         }
     }
-    fn receive<E: Drive>(&mut self, endpoint: &mut E, most: usize) {
+    /// Takes at most `most` datagrams; how many it took.
+    fn receive<E: Drive>(&mut self, endpoint: &mut E, most: usize) -> usize {
+        let mut taken = 0;
         for _ in 0..most {
             match self.socket.recv_from(&mut self.buffer) {
                 Ok((length, from)) => {
+                    taken += 1;
                     endpoint.datagram(Instant::now(), from, &self.buffer[..length])
                 }
                 Err(error)
                     if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) =>
                 {
-                    return;
+                    return taken;
                 }
                 // A connection reset (Windows, after a send to a closed port) and the like: the
                 // socket is still good, and what else arrived is still to be read.
                 Err(_) => self.errors += 1,
             }
         }
+        taken
     }
     /// Sends what is due, waits for a datagram until the next timer, takes everything that has
     /// arrived (also when the timer is already due), fires the timers due, and sends again.
@@ -120,7 +129,14 @@ impl Wire {
         if !wait.is_zero() {
             self.socket.set_nonblocking(false).unwrap();
             self.socket.set_read_timeout(Some(wait)).unwrap();
-            self.receive(endpoint, 1);
+            if self.receive(endpoint, 1) == 0 {
+                // The wait ran to its end: how late it ended is the timer's granularity.
+                let nanos = |at: Instant| (at - self.epoch).as_nanos() as u64;
+                let _ = self.late.on_wait(nanos(until), nanos(Instant::now()));
+                if let Some(granularity) = self.late.granularity() {
+                    endpoint.granularity(granularity);
+                }
+            }
         }
         self.socket.set_nonblocking(true).unwrap();
         self.receive(endpoint, DRAIN);

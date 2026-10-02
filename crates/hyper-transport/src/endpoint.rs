@@ -20,7 +20,9 @@ use hyper_quic::{
 use crate::admission::{Admission, AdmissionLimits, AdmissionStats};
 use crate::arena::Arena;
 use crate::budget::{Budget, Lane, Reservation};
-use crate::credit::{MIN_DATAGRAM, Window, class_reserve, initial_window, stream_window_ceiling};
+use crate::credit::{
+    K_GRANULARITY, MIN_DATAGRAM, Window, class_reserve, initial_window, stream_window_ceiling,
+};
 use crate::exchange::{End, Exchange, In, Incoming, Out, Outgoing, Pushed, abandon, pull, push};
 use crate::frame::{PREFIX_BYTES, Prefix};
 use crate::lane::{LaneIn, LaneOut, OPENER_BYTES, Reading, opened};
@@ -233,6 +235,8 @@ struct Core<C: Classes, B, D> {
     /// The last `now` the endpoint was given; operations the owner calls between driving calls
     /// take it as theirs.
     now: Instant,
+    /// The owner's timer granularity, as it last reported it: what receive windows are tuned under.
+    granularity: Duration,
     tick: u64,
     dialing: usize,
     ids: Vec<u64>,
@@ -296,6 +300,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
                 events: VecDeque::new(),
                 peers: Vec::with_capacity(peers),
                 now,
+                granularity: K_GRANULARITY,
                 tick: 0,
                 dialing: 0,
                 ids: Vec::new(),
@@ -640,6 +645,17 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
             .binary_search_by_key(&peer, |entry| entry.peer)
             .ok()?;
         self.core.peers.get(at)?.timing.tail(granularity)
+    }
+
+    /// The owner's timer granularity `G` moved: the mean lateness of its timed waits
+    /// (`hyper_timing::Lateness`, `docs/timing.md` §2.4). A round trip shorter than it is not
+    /// resolved when a receive window is tuned; until the first report RFC 9002's `kGranularity`
+    /// stands in ([`crate::K_GRANULARITY`]). A zero granularity, a clock that resolved nothing
+    /// finer, is ignored.
+    pub fn set_granularity(&mut self, granularity: Duration) {
+        if !granularity.is_zero() {
+            self.core.granularity = granularity;
+        }
     }
 
     /// QUIC's counters for the connection to `peer` (its path's round trip, congestion window,
@@ -1891,7 +1907,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
     /// Grow the receive window if the owner consumed a whole one within two round trips and the
     /// budget funds the growth: the window is `min(BDP, share)` (node.md §3.3).
     fn tune(&mut self, now: Instant, conn: &mut Conn<C::Role>) {
-        let Some(grown) = conn.window.tune(now, conn.quic.rtt()) else {
+        let Some(grown) = conn.window.tune(now, conn.quic.rtt(), self.granularity) else {
             return;
         };
         let more = grown.saturating_sub(conn.window.window());

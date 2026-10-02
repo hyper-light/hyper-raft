@@ -54,6 +54,8 @@ markedjoint  MarkedJoint.cfg                -
 markedself   MarkedSelf.cfg                 LeaderHolds
 markedwhole  MarkedWhole.cfg                LeaderHolds
 markedreach  MarkedReached.cfg              NoMarkedLeader
+changereach  MarkedChangeReached.cfg        NoMarkedLeader
+jointreach   MarkedJointReached.cfg         NoMarkedLeader
 "
 
 if ! command -v java >/dev/null 2>&1; then
@@ -136,6 +138,9 @@ check() { # NAME CONFIGURATION REFUSED
 if [ "$#" -eq 0 ]; then
   set -- $(echo "$configurations" | awk 'NF { print $1 }')
 fi
+# Every configuration named runs, whatever an earlier one did, so that one run reports every
+# count; the script fails at the end if any did not end as it states.
+failed=""
 for name in "$@"; do
   row="$(echo "$configurations" | awk -v name="$name" '$1 == name')"
   if [ -z "$row" ]; then
@@ -143,5 +148,15 @@ for name in "$@"; do
     exit 2
   fi
   # shellcheck disable=SC2086
-  check $row
+  if ! check $row; then
+    failed="$failed $name"
+    if [ -n "$work" ]; then
+      rm -rf "${work:?}"
+      work=""
+    fi
+  fi
 done
+if [ -n "$failed" ]; then
+  echo "did not end as stated:$failed" >&2
+  exit 1
+fi

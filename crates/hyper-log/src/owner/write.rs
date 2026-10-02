@@ -175,14 +175,26 @@ impl<F: BlockFile + 'static> Owner<F> {
             self.schedule.backlog = self.queued(inbox);
             return true;
         }
-        // The backlog is empty: the busy period ends at the largest finish tag [SFQ96 §2], and
-        // no group's past service counts against it any longer.
+        self.end_busy_period();
+        self.parked = true;
+        false
+    }
+
+    /// The backlog is empty: the busy period ends at the largest finish tag [SFQ96 §2], and no
+    /// group's past service counts against it any longer.
+    fn end_busy_period(&mut self) {
         let schedule = &mut self.schedule;
         let last = schedule.finish.values().copied().max().unwrap_or(0);
         schedule.virtual_time = schedule.virtual_time.max(last);
         schedule.finish.clear();
-        self.parked = true;
-        false
+    }
+
+    /// Submissions queued when the device answered: every message sent before the device's word
+    /// has been heard before it (the inbox in order, the side channel before each message), so
+    /// they are those taken. What comes after the word comes from callers who may have heard
+    /// their answers, and joins the next batch at the next step.
+    fn backlog_at_answers(&self) -> u64 {
+        u64::try_from(self.intake.len()).unwrap_or(u64::MAX)
     }
 
     /// Submissions sent before the answers about to go out: they are queued ahead of any the
@@ -737,7 +749,7 @@ impl<F: BlockFile + 'static> Owner<F> {
         schedule.frames = schedule.frames.saturating_add(1);
         let updates = u64::try_from(taken.len()).unwrap_or(u64::MAX);
         schedule.updates = schedule.updates.saturating_add(updates);
-        let backlog = self.queued(inbox);
+        let backlog = self.backlog_at_answers();
         let confirmed = match self.unconfirmed.take() {
             Some(before) => self.settle(before, Ok(())),
             None => 0,
@@ -920,7 +932,12 @@ impl<F: BlockFile + 'static> Owner<F> {
             return;
         };
         frame.answering = these;
-        let backlog = self.queued(inbox);
+        let backlog = self.backlog_at_answers();
+        // Nothing was queued when the answers went out: the busy period ended then, whenever
+        // the answered callers' next submissions reach the inbox.
+        if backlog == 0 && self.schedule.held.is_empty() && self.unconfirmed.is_none() {
+            self.end_busy_period();
+        }
         self.schedule.answered = match result {
             Ok(()) => self.settle(frame, Ok(())),
             Err(_) => {

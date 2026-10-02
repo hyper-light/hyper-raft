@@ -427,11 +427,15 @@ impl<F: BlockFile + 'static> Owner<F> {
         let mut admitted = std::mem::take(&mut self.buffers.admitted);
         match self.room.take(s.group, s.bytes, wait, &mut admitted) {
             Ok(Take::Admitted) => {
-                if s.admit {
-                    s.ticket.admit();
-                }
+                // The device hears that another frame follows before the caller hears it is
+                // admitted: whatever the caller does on hearing it, releasing a held flush among
+                // them, comes after the word.
+                let admit = s.admit;
                 self.intake.push_back(s);
                 self.tell_more();
+                if admit && let Some(s) = self.intake.back() {
+                    s.ticket.admit();
+                }
             }
             Ok(Take::Waiting(seq)) => {
                 self.waiting.insert(seq, s);
@@ -446,11 +450,12 @@ impl<F: BlockFile + 'static> Owner<F> {
     fn let_in(&mut self, admitted: &mut Vec<u64>) {
         for seq in admitted.drain(..) {
             if let Some(s) = self.waiting.remove(&seq) {
-                if s.admit {
-                    s.ticket.admit();
-                }
+                let admit = s.admit;
                 self.intake.push_back(s);
                 self.tell_more();
+                if admit && let Some(s) = self.intake.back() {
+                    s.ticket.admit();
+                }
             }
         }
     }

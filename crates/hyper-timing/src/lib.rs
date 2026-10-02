@@ -1,25 +1,29 @@
-//! A group's timing, derived from the round trips it measures (27 §3.1 P2).
+//! A group's timing, derived from what its links and paths measure (`docs/timing.md`).
 //!
-//! Raft needs `broadcast time ≪ election timeout ≪ MTBF` (Ongaro and
-//! Ousterhout, ATC 2014, §5.6): a leader must reach its followers several
-//! times inside one election timeout, or followers presume it dead and
-//! campaign against a live leader. The ratio is an order of magnitude, fixed
-//! here at ten ([`ELECTION_MARGIN`]).
+//! Raft needs `broadcast time ≪ election timeout ≪ MTBF` (Ongaro and Ousterhout, ATC 2014, §5.6).
+//! Each side of that is measured here and none is a picked multiple of another:
+//! - **When a leader is gone** is the failure detector's answer ([`LinkEstimator`], [`configure`]):
+//!   NFD-E on the leader's node-pair link, its interval `η` and margin `α` chosen to minimize the
+//!   time a group cannot commit from the link's measured loss, delay and variance, the timer's
+//!   measured granularity ([`Lateness`]) and the fleet's measured MTBF ([`Exposure`]). A follower's
+//!   base election timeout is the detector's freshness horizon, `η + α` past the leader's latest
+//!   heartbeat.
+//! - **How long the voters that suspected together spread their campaigns** is the span `W` that
+//!   minimizes the expected time to a leader, Ongaro's split-vote probability on the measured
+//!   one-way latency and vote round ([`Ballot`], [`election_span`]). Its expected election `T_E` is
+//!   the detector's election cost, so the detector and the election law are one minimization.
+//! - **The granularity** under every tail is the measured lateness of the owner's own timed waits,
+//!   passed in, never RFC 9002's assumed 1 ms.
 //!
-//! The broadcast time is measured per voter path by an RFC 9002 §5.3
-//! estimator ([`PathRtt`]); its probe-timeout form `smoothed + 4 · rttvar` is
-//! Jacobson's mean-deviation bound on the round-trip tail. A round completes
-//! when its last voter answers, so the slowest path bounds the broadcast.
+//! The round trips to the other voters are measured per path by two estimators:
+//! [`PathRtt`], the median and median absolute deviation of a window derived from the link's
+//! correlation time, which orders voters ([`quorum_priority`]) and which one stall does not reorder;
+//! and [`ExchangeRtt`], RFC 9002 §5.3's smoothed estimator, which follows a peer that became slow at
+//! once, as an exchange's deadline wants. Both give the mean round trip the split-vote span needs.
 //!
-//! The Raft core counts ticks, and its tick counts are fixed when a node
-//! opens. What is derived is therefore the **tick period**
-//! ([`TickPace::derive`]): the period is stretched until
-//! `election_tick × period ≥ ELECTION_MARGIN × tail`. On a loopback or a LAN,
-//! where every round trip sits inside the configured period, the period is
-//! the configured one and nothing changes. A far group's period grows with
-//! its measured tail. Because the owner ticks once per period, a node whose
-//! own thread is starved ticks late and waits longer instead of campaigning
-//! on its own slowness.
+//! The Raft core counts ticks. [`ElectionTiming`] gives a period-counting core its base and span in
+//! the owner's periods, so a starved owner waits instead of campaigning on its own slowness;
+//! [`TickPace`] gives a core whose tick counts are fixed when it opens the period that covers them.
 
 #![cfg_attr(
     test,
@@ -56,16 +60,12 @@ pub use link::{
 };
 mod election;
 pub use election::{
-    ElectionPriority, ElectionTimer, ElectionTiming, FollowerStep, PathEstimate,
+    Ballot, ElectionPriority, ElectionTimer, ElectionTiming, FollowerStep, PathEstimate,
     REPAIR_ROUND_TRIPS, quorum_priority,
 };
 
 use std::time::Duration;
 
-/// Raft's order-of-magnitude ratio of election timeout to broadcast time.
-pub const ELECTION_MARGIN: u64 = 10;
-/// The estimator's timer granularity (RFC 9002 §6.1.2, `kGranularity`).
-pub const GRANULARITY_NS: u64 = 1_000_000;
 /// RFC 9002 §5.3: `smoothed_rtt = 7/8 · smoothed_rtt + 1/8 · sample`, the 1/8 as a shift of 3.
 const SMOOTHED_SHIFT: u32 = 3;
 /// RFC 9002 §5.3: `rttvar = 3/4 · rttvar + 1/4 · |smoothed_rtt − sample|`, the 1/4 as a shift of 2.
@@ -73,71 +73,129 @@ const VARIATION_SHIFT: u32 = 2;
 /// RFC 9002 §6.2.1: the probe timeout's variation term, `4 · rttvar`.
 const TAIL_VARIATION_MULTIPLIER: u64 = 4;
 
-/// How many of a path's latest round trips its estimate is taken over.
-pub const PATH_WINDOW: usize = 16;
+/// Why a path's window could not be derived or built.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PathWindowError {
+    /// A zero probe interval: no spacing to count a stall's samples in.
+    ZeroInterval,
+    /// A window of no samples.
+    Empty,
+    /// A window past [`WINDOW_LIMIT`], the most heartbeats any link's estimator holds: a path probed
+    /// more than about 33,000 times within one correlation time. No measured link comes near it
+    /// (the longest correlation time measured, 250 ms, over the finest granularity measured, 45 µs,
+    /// is 5,556 probes; `docs/timing.md` §2.6).
+    TooLong,
+}
 
-/// The measured path to one peer: the median of its latest round trips and
-/// their median absolute deviation.
+impl std::fmt::Display for PathWindowError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::ZeroInterval => "a probe interval of zero",
+            Self::Empty => "a path window of no samples",
+            Self::TooLong => "a path window past the longest a link's estimator holds",
+        })
+    }
+}
+
+impl std::error::Error for PathWindowError {}
+
+/// The measured path to one peer: the median of its latest round trips and their median absolute
+/// deviation, over a window derived from the link's correlation time.
 ///
-/// A path's estimate sets a group's election timeout, so it has to say what
-/// the path is and not what one answer took. A peer that is starting, or
-/// stalled on its disk, answers a probe seconds late; an estimator that
-/// smooths (RFC 9002's, [`ExchangeRtt`]) is built to react to exactly that,
-/// and one such answer puts its tail at seconds for as long as it takes the
-/// smoothing to forget. The median and the median absolute deviation do not
-/// move until half of the window says so: fewer than half of the latest
-/// [`PATH_WINDOW`] answers, however late, leave the estimate where the path
-/// is, and a path that has become slow is followed once most of the window
-/// has seen it.
+/// It orders voters ([`quorum_priority`]), whose purpose is that one stall does not reorder them:
+/// a peer that is starting, or stalled on its disk, answers late, and an estimator that smooths
+/// (RFC 9002's, [`ExchangeRtt`]) is built to follow exactly that. The median does not move until
+/// half of its window says so (its breakdown point is one half: Hampel 1971; Rousseeuw and Croux
+/// 1993), so the window is the shortest that holds more than twice the samples one stall can make
+/// late ([`PathRtt::new`]). A path that has become slow is followed once half of the window has
+/// seen it, about one correlation time: as fast as any estimate one stall cannot move.
 ///
-/// Karn's rule is the caller's: only an answered probe is a sample. A path
-/// with no sample contributes nothing to a derivation.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// Karn's rule is the caller's: only an answered probe is a sample. A path with no sample
+/// contributes nothing to a derivation.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PathRtt {
-    window: [u64; PATH_WINDOW],
+    /// The window's samples in arrival order, a ring.
+    window: Vec<u64>,
     /// Where the next sample goes.
     next: usize,
     samples: u64,
     /// The samples the window holds, in order: the first `held` slots. A sample replaces the one
     /// it evicts by two shifts, so the window is never sorted whole.
-    ordered: [u64; PATH_WINDOW],
+    ordered: Vec<u64>,
+    /// The sum of the samples the window holds: the mean the split-vote span needs.
+    sum: u128,
     /// The window's median and median absolute deviation, computed when a sample changes the
-    /// window: a path is read several times a period (the election timing, the priority, the
-    /// round budget) and sampled about once, so each read is a field
-    /// (`docs/benchmarks.md`, "hyper-timing").
+    /// window: a path is read several times a period (the priority, the ballot, the round budget)
+    /// and sampled about once, so each read is a field (`docs/benchmarks.md`, "hyper-timing").
     median: u64,
     deviation: u64,
 }
+
 impl PathRtt {
-    /// A path with no sample.
-    pub const fn new() -> Self {
-        Self {
-            window: [0; PATH_WINDOW],
+    /// A path probed every `interval` on a link whose correlation time is `correlation` (`T_c`,
+    /// `docs/timing.md` §2.6, item 6). The window is `2k + 1`, `k = max(1, ⌈T_c / interval⌉)`.
+    ///
+    /// `T_c` is measured as the spacing past the longest stall, so a stall shorter than it makes at
+    /// most `⌈T_c / interval⌉` consecutive probes late, and at least one where `T_c` is under the
+    /// interval or none was seen. The median of `2k + 1` outvotes `k`, and no shorter window does.
+    /// The two buffers are allocated here, once.
+    pub fn new(correlation: Duration, interval: Duration) -> Result<Self, PathWindowError> {
+        let interval_ns = nanos(interval);
+        if interval_ns == 0 {
+            return Err(PathWindowError::ZeroInterval);
+        }
+        let late = nanos(correlation).div_ceil(interval_ns).max(1);
+        let window = late
+            .checked_mul(2)
+            .and_then(|twice| twice.checked_add(1))
+            .ok_or(PathWindowError::TooLong)?;
+        Self::with_window(usize::try_from(window).map_err(|_| PathWindowError::TooLong)?)
+    }
+
+    /// A path whose window holds `window` samples, at most [`WINDOW_LIMIT`].
+    fn with_window(window: usize) -> Result<Self, PathWindowError> {
+        if window == 0 {
+            return Err(PathWindowError::Empty);
+        }
+        if u64::try_from(window).map_or(true, |w| w > WINDOW_LIMIT) {
+            return Err(PathWindowError::TooLong);
+        }
+        Ok(Self {
+            window: vec![0; window],
             next: 0,
             samples: 0,
-            ordered: [0; PATH_WINDOW],
+            ordered: vec![0; window],
+            sum: 0,
             median: 0,
             deviation: 0,
-        }
+        })
     }
-    /// Fold one answered round trip in, in place of the oldest of the
-    /// window.
+
+    /// The samples the window holds once full.
+    pub fn window(&self) -> usize {
+        self.window.len()
+    }
+
+    /// Fold one answered round trip in, in place of the oldest of the window.
     pub fn on_sample(&mut self, round_trip_ns: u64) {
+        let capacity = self.window.len();
         let mut held = self.held();
-        if held == PATH_WINDOW
+        if held == capacity
             && let Some(&evicted) = self.window.get(self.next)
         {
             self.remove_ordered(evicted, held);
+            self.sum = self.sum.saturating_sub(u128::from(evicted));
             held = held.saturating_sub(1);
         }
         self.insert_ordered(round_trip_ns, held);
+        self.sum = self.sum.saturating_add(u128::from(round_trip_ns));
         if let Some(slot) = self.window.get_mut(self.next) {
             *slot = round_trip_ns;
         }
         self.next = self
             .next
             .saturating_add(1)
-            .checked_rem(PATH_WINDOW)
+            .checked_rem(capacity)
             .unwrap_or(0);
         self.samples = self.samples.saturating_add(1);
         let held = self.held();
@@ -154,9 +212,10 @@ impl PathRtt {
     }
     /// How many samples the window holds.
     fn held(&self) -> usize {
+        let capacity = self.window.len();
         usize::try_from(self.samples)
-            .unwrap_or(PATH_WINDOW)
-            .min(PATH_WINDOW)
+            .unwrap_or(capacity)
+            .min(capacity)
     }
     /// Takes `value`, which the first `held` ordered slots hold, out of them.
     fn remove_ordered(&mut self, value: u64, held: usize) {
@@ -228,15 +287,22 @@ impl PathRtt {
     pub const fn variation_ns(&self) -> u64 {
         self.deviation
     }
-    /// The bound on this path's round-trip tail,
-    /// `median + max(4 · deviation, granularity)`, or `None` before a
-    /// sample.
-    pub fn tail_ns(&self) -> Option<u64> {
+    /// The mean of the window's round trips; zero before a sample.
+    pub fn mean_ns(&self) -> u64 {
+        let held = u128::try_from(self.held()).unwrap_or(u128::MAX);
+        self.sum
+            .checked_div(held)
+            .and_then(|mean| u64::try_from(mean).ok())
+            .unwrap_or(0)
+    }
+    /// The bound on this path's round-trip tail, `median + max(4 · deviation, G)` with `G` the
+    /// owner's measured timer granularity ([`Lateness`]), or `None` before a sample.
+    pub fn tail_ns(&self, granularity_ns: u64) -> Option<u64> {
         (self.samples > 0).then(|| {
             self.smoothed_ns().saturating_add(
                 TAIL_VARIATION_MULTIPLIER
                     .saturating_mul(self.variation_ns())
-                    .max(GRANULARITY_NS),
+                    .max(granularity_ns),
             )
         })
     }
@@ -292,67 +358,69 @@ impl ExchangeRtt {
     pub const fn variation_ns(&self) -> u64 {
         self.variation_ns
     }
-    /// The bound on this path's round-trip tail,
-    /// `smoothed + max(4 · rttvar, granularity)`, or `None` before a sample.
-    pub fn tail_ns(&self) -> Option<u64> {
+    /// The bound on this path's round-trip tail, `smoothed + max(4 · rttvar, G)` (RFC 9002
+    /// §6.2.1), or `None` before a sample. `G` is RFC 9002's `kGranularity`, "Timer granularity.
+    /// This is a system-dependent value" (Appendix A.2; §6.1.2 recommends 1 ms for a timer it
+    /// cannot see): here the owner's measured lateness of its own timed waits ([`Lateness`]).
+    pub fn tail_ns(&self, granularity_ns: u64) -> Option<u64> {
         (self.samples > 0).then(|| {
             self.smoothed_ns.saturating_add(
                 TAIL_VARIATION_MULTIPLIER
                     .saturating_mul(self.variation_ns)
-                    .max(GRANULARITY_NS),
+                    .max(granularity_ns),
             )
         })
     }
 }
 
-/// A group's tick period for now, with what it was derived from.
+/// A group's tick period for now, for a core whose tick counts are fixed when it opens, with what
+/// it was derived from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TickPace {
     /// How long the owner waits between ticks.
     pub period: Duration,
-    /// The slowest measured voter path's tail; zero when none is measured.
-    pub broadcast_tail_ns: u64,
-    /// Round trips measured across the voter paths that fed this pace: the
-    /// witness that the pace is measured and not the floor it defaults to.
+    /// The election time the period covers in `election_tick` ticks: the longer of the base
+    /// election timeout and the span; zero when nothing is measured.
+    pub covered: Duration,
+    /// Round trips measured across the voter paths that fed this pace: the witness that the pace
+    /// is measured and not the floor it defaults to.
     pub samples: u64,
 }
 
 impl TickPace {
-    /// The pace with no voter path measured: the configured period.
+    /// The pace with nothing measured: the configured period.
     pub fn floor(configured: Duration) -> Self {
-        Self::derive(configured, configured, 1, core::iter::empty())
+        Self {
+            period: configured,
+            covered: Duration::ZERO,
+            samples: 0,
+        }
     }
 
-    /// Derive the period from the measured `paths` to the group's other
-    /// voters: the smallest period, no shorter than `configured` and no
-    /// longer than `ceiling`, for which
-    /// `election_tick × period ≥ ELECTION_MARGIN × tail`.
+    /// The period, no shorter than `configured` and no longer than `ceiling`, at which
+    /// `election_tick` ticks cover both the base election timeout and the span of `timing`.
     ///
-    /// The ceiling bounds how long a dead leader can go unnoticed; a path
-    /// slower than the ceiling allows keeps the ceiling and the measurement
-    /// beside it shows the shortfall.
-    pub fn derive<'a>(
+    /// A core shaped as raft-rs draws its timeout uniformly from `[election_tick,
+    /// 2·election_tick)` ticks, so one tick count is both its base and its span: the base must not
+    /// fire before the detector would suspect the leader, and the span must be at least the one
+    /// that minimizes the expected election (`docs/timing.md` §2.3), so the period covers the
+    /// longer of the two. The ceiling bounds how long a dead leader can go unnoticed; a timing
+    /// past what the ceiling allows keeps the ceiling, and `covered` shows the shortfall.
+    pub fn derive(
         configured: Duration,
         ceiling: Duration,
         election_tick: usize,
-        paths: impl IntoIterator<Item = &'a PathRtt>,
+        timing: &ElectionTiming,
     ) -> Self {
-        let mut tail = 0u64;
-        let mut samples = 0u64;
-        for path in paths {
-            if let Some(path_tail) = path.tail_ns() {
-                tail = tail.max(path_tail);
-                samples = samples.saturating_add(path.samples());
-            }
-        }
+        let covered = timing.base.max(timing.span);
         let ticks = u64::try_from(election_tick).unwrap_or(u64::MAX).max(1);
-        let needed = ELECTION_MARGIN.saturating_mul(tail).div_ceil(ticks);
+        let needed = nanos(covered).div_ceil(ticks);
         let floor = nanos(configured).max(1);
         let ceiling = nanos(ceiling).max(floor);
         Self {
             period: Duration::from_nanos(needed.clamp(floor, ceiling)),
-            broadcast_tail_ns: tail,
-            samples,
+            covered,
+            samples: timing.samples,
         }
     }
     /// The election timeout this pace gives a node of `election_tick` ticks.
@@ -369,225 +437,250 @@ fn nanos(duration: Duration) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     const MS: u64 = 1_000_000;
+    /// The timer granularity the tests' owner measured: macOS's 45 µs at a 40 µs wait
+    /// (`docs/timing.md` §2.4).
+    const G: u64 = 45_000;
     const TICK: Duration = Duration::from_millis(100);
     const CEILING: Duration = Duration::from_secs(5);
     const ELECTION_TICK: usize = 10;
-    /// Loopback round trips: probe tail 17 ms, broadcast 11 to 33 ms.
-    const LOOPBACK_MS: [u64; 4] = [11, 17, 11, 33];
-    /// An inter-region path of 80 ms ± 20 ms one way.
-    const REGIONAL_MS: [u64; 6] = [160, 200, 120, 160, 190, 130];
-    /// A geographic path of 500 ms ± 100 ms one way.
-    const GEOGRAPHIC_MS: [u64; 6] = [1000, 1200, 800, 1000, 1150, 850];
 
-    fn path_of(samples_ms: &[u64]) -> PathRtt {
-        let mut path = PathRtt::new();
+    fn path_of(window: usize, samples_ms: &[u64]) -> PathRtt {
+        let mut path = PathRtt::with_window(window).unwrap();
         for sample in samples_ms {
             path.on_sample(sample * MS);
         }
         path
     }
 
-    /// The window kept in order and the merged deviations give what sorting the window gave.
+    fn timing(base_ms: u64, span_ms: u64) -> ElectionTiming {
+        ElectionTiming {
+            base_periods: 1,
+            span_periods: 1,
+            base: Duration::from_millis(base_ms),
+            span: Duration::from_millis(span_ms),
+            detection: Duration::from_millis(base_ms),
+            election: Duration::from_millis(span_ms),
+            broadcast_tail: Duration::ZERO,
+            samples: 6,
+        }
+    }
+
+    /// The window is `2·max(1, ⌈T_c/p⌉) + 1`: the measured links' correlation times at their
+    /// probe intervals, and the refusals.
     #[test]
-    fn the_ordered_window_is_the_sorted_window() {
-        let middle = |values: &mut Vec<u64>| {
-            values.sort_unstable();
-            values.get(values.len() / 2).copied().unwrap_or(0)
+    fn the_window_outvotes_the_samples_one_stall_makes_late() {
+        let window = |tc_ms: f64, p_ms: f64| {
+            PathRtt::new(
+                Duration::from_secs_f64(tc_ms / 1e3),
+                Duration::from_secs_f64(p_ms / 1e3),
+            )
+            .map(|path| path.window())
         };
-        let mut state = 0x2545_F491_4F6C_DD1Du64;
-        for _ in 0..200 {
-            let mut path = PathRtt::new();
+        // At or past the correlation time a stall makes one probe late: three.
+        assert_eq!(window(50.0, 50.0), Ok(3));
+        assert_eq!(window(50.0, 200.0), Ok(3));
+        assert_eq!(
+            window(0.0, 10.0),
+            Ok(3),
+            "no stall seen: one late probe still"
+        );
+        // macOS at a 10 ms probe, T_c 50 ms: five late, eleven.
+        assert_eq!(window(50.0, 10.0), Ok(11));
+        // Linux with fdatasync, T_c 200 ms, at a 2 ms probe: a hundred late, 201.
+        assert_eq!(window(200.0, 2.0), Ok(201));
+        assert_eq!(window(50.0, 0.0), Err(PathWindowError::ZeroInterval));
+        assert_eq!(
+            PathRtt::new(Duration::from_secs(1), Duration::from_nanos(1)).err(),
+            Some(PathWindowError::TooLong)
+        );
+        assert_eq!(
+            PathRtt::new(Duration::MAX, Duration::from_nanos(1)).err(),
+            Some(PathWindowError::TooLong)
+        );
+        assert_eq!(PathRtt::with_window(0).err(), Some(PathWindowError::Empty));
+    }
+
+    proptest! {
+        /// The window kept in order and the merged deviations give what sorting the window gave,
+        /// and the mean is the window's, at every derived window.
+        #[test]
+        fn the_ordered_window_is_the_sorted_window(
+            k in 1usize..12,
+            samples in prop::collection::vec(1u64..8, 1..120),
+        ) {
+            let window = 2 * k + 1;
+            let middle = |values: &mut Vec<u64>| {
+                values.sort_unstable();
+                values.get(values.len() / 2).copied().unwrap_or(0)
+            };
+            let mut path = PathRtt::with_window(window).unwrap();
             let mut latest: std::collections::VecDeque<u64> = std::collections::VecDeque::new();
-            for _ in 0..60 {
-                state ^= state << 13;
-                state ^= state >> 7;
-                state ^= state << 17;
+            for sample in samples {
                 // Few distinct values, so ties are common.
-                let sample = (state % 7 + 1) * MS;
+                let sample = sample * MS;
                 path.on_sample(sample);
                 latest.push_back(sample);
-                if latest.len() > PATH_WINDOW {
+                if latest.len() > window {
                     latest.pop_front();
                 }
                 let median = middle(&mut latest.iter().copied().collect());
                 let deviation = middle(&mut latest.iter().map(|s| s.abs_diff(median)).collect());
-                assert_eq!(
-                    (path.smoothed_ns(), path.variation_ns()),
-                    (median, deviation)
-                );
+                prop_assert_eq!((path.smoothed_ns(), path.variation_ns()), (median, deviation));
+                let mean = latest.iter().map(|&s| u128::from(s)).sum::<u128>() / latest.len() as u128;
+                prop_assert_eq!(u128::from(path.mean_ns()), mean);
             }
+        }
+
+        /// A stall of up to `k` consecutive late answers, however late, leaves a path of `2k + 1`
+        /// where it was; `k + 1` move it.
+        #[test]
+        fn a_stall_the_window_outvotes_moves_nothing(k in 1usize..20, late in 1u64..10_000) {
+            let mut path = PathRtt::with_window(2 * k + 1).unwrap();
+            for _ in 0..2 * k + 1 {
+                path.on_sample(5 * MS);
+            }
+            for _ in 0..k {
+                path.on_sample((5 + late) * MS);
+            }
+            prop_assert_eq!(path.smoothed_ns(), 5 * MS);
+            path.on_sample((5 + late) * MS);
+            prop_assert_eq!(path.smoothed_ns(), (5 + late) * MS);
         }
     }
 
     #[test]
     fn a_path_is_the_median_of_its_latest_answers_and_their_deviation() {
-        let mut path = PathRtt::new();
-        assert_eq!(path.tail_ns(), None, "no sample, no tail");
+        let mut path = PathRtt::with_window(5).unwrap();
+        assert_eq!(path.tail_ns(G), None, "no sample, no tail");
         assert_eq!((path.smoothed_ns(), path.variation_ns()), (0, 0));
         path.on_sample(80 * MS);
         assert_eq!(path.smoothed_ns(), 80 * MS);
         assert_eq!(path.variation_ns(), 0);
-        assert_eq!(path.tail_ns(), Some(81 * MS), "the granularity at least");
+        assert_eq!(
+            path.tail_ns(G),
+            Some(80 * MS + G),
+            "the granularity at least"
+        );
         for sample in [100, 60, 90, 70] {
             path.on_sample(sample * MS);
         }
         // 60 70 80 90 100: the median 80, the deviations 0 10 10 20 20.
         assert_eq!(path.smoothed_ns(), 80 * MS);
         assert_eq!(path.variation_ns(), 10 * MS);
-        assert_eq!(path.tail_ns(), Some(120 * MS));
+        assert_eq!(path.mean_ns(), 80 * MS);
+        assert_eq!(path.tail_ns(G), Some(120 * MS));
         assert_eq!(path.samples(), 5);
     }
 
     #[test]
-    fn answers_that_came_late_do_not_move_a_path() {
-        // A peer that was starting answered three probes seconds late.
-        let mut path = PathRtt::new();
-        for _ in 0..PATH_WINDOW {
-            path.on_sample(5 * MS);
-        }
-        let before = path.tail_ns().unwrap();
-        assert_eq!(before, 6 * MS);
-        for late in [2_900, 1_400, 800] {
-            path.on_sample(late * MS);
-            assert_eq!(path.tail_ns(), Some(before));
-        }
-        // The smoothing estimator, given the same, is at seconds.
-        let mut exchange = ExchangeRtt::new();
-        for _ in 0..PATH_WINDOW {
-            exchange.on_sample(5 * MS);
-        }
-        exchange.on_sample(2_900 * MS);
-        assert!(exchange.tail_ns().unwrap() > 3_000 * MS);
-        // Fewer than half of the window, however late, are outvoted.
-        let mut path = PathRtt::new();
-        for _ in 0..PATH_WINDOW {
-            path.on_sample(5 * MS);
-        }
-        for _ in 0..PATH_WINDOW / 2 - 1 {
-            path.on_sample(10_000 * MS);
-        }
-        assert_eq!(path.smoothed_ns(), 5 * MS);
-    }
-
-    #[test]
-    fn a_path_that_became_slow_is_followed_within_its_window() {
-        let mut path = PathRtt::new();
-        for _ in 0..PATH_WINDOW {
+    fn a_path_that_became_slow_is_followed_within_half_its_window() {
+        let window = 11;
+        let mut path = PathRtt::with_window(window).unwrap();
+        for _ in 0..window {
             path.on_sample(5 * MS);
         }
         let mut followed = None;
-        for sample in 1..=PATH_WINDOW {
+        for sample in 1..=window {
             path.on_sample(160 * MS);
             if followed.is_none() && path.smoothed_ns() == 160 * MS {
                 followed = Some(sample);
             }
         }
-        assert_eq!(followed, Some(PATH_WINDOW / 2), "at half of the window");
-        assert_eq!(path.tail_ns(), Some(161 * MS));
-        assert_eq!(path.samples(), 2 * PATH_WINDOW as u64);
+        assert_eq!(followed, Some(window / 2 + 1), "past half of the window");
+        assert_eq!(path.tail_ns(G), Some(160 * MS + G));
+        assert_eq!(path.samples(), 2 * window as u64);
     }
 
     #[test]
     fn the_exchange_estimator_follows_rfc_9002() {
         let mut path = ExchangeRtt::new();
-        assert_eq!(path.tail_ns(), None, "no sample, no tail");
+        assert_eq!(path.tail_ns(G), None, "no sample, no tail");
         path.on_sample(80 * MS);
         assert_eq!(path.smoothed_ns(), 80 * MS, "the first sample seeds it");
         assert_eq!(path.variation_ns(), 40 * MS, "half the first sample");
-        assert_eq!(path.tail_ns(), Some(240 * MS));
+        assert_eq!(path.tail_ns(G), Some(240 * MS));
         path.on_sample(160 * MS);
         assert_eq!(path.variation_ns(), 50 * MS);
         assert_eq!(path.smoothed_ns(), 90 * MS);
-        assert_eq!(path.tail_ns(), Some(290 * MS));
+        assert_eq!(path.tail_ns(G), Some(290 * MS));
         assert_eq!(path.samples(), 2);
     }
 
+    /// The floor under the variation term is the granularity passed in: none invented where none
+    /// was measured, and the measured one where it was.
     #[test]
-    fn a_steady_path_keeps_at_least_the_granularity_above_its_mean() {
-        let mut path = PathRtt::new();
+    fn a_steady_path_keeps_the_measured_granularity_above_its_centre() {
+        let mut path = path_of(3, &[]);
+        let mut exchange = ExchangeRtt::new();
         for _ in 0..200 {
             path.on_sample(20 * MS);
+            exchange.on_sample(20 * MS);
         }
         assert_eq!(path.smoothed_ns(), 20 * MS);
-        assert_eq!(path.tail_ns(), Some(20 * MS + GRANULARITY_NS));
+        assert_eq!(path.tail_ns(G), Some(20 * MS + G));
+        assert_eq!(path.tail_ns(0), Some(20 * MS));
+        assert_eq!(path.tail_ns(MS), Some(21 * MS), "Linux's 1 ms tick");
+        assert_eq!(exchange.tail_ns(G), Some(20 * MS + G));
     }
 
     #[test]
-    fn with_no_measured_path_the_pace_is_the_configured_period() {
-        let pace = TickPace::derive(TICK, CEILING, ELECTION_TICK, core::iter::empty());
-        assert_eq!(pace, TickPace::floor(TICK));
+    fn with_nothing_measured_the_pace_is_the_configured_period() {
+        let pace = TickPace::floor(TICK);
         assert_eq!(pace.period, TICK);
         assert_eq!(pace.samples, 0);
         assert_eq!(pace.election_timeout(ELECTION_TICK), Duration::from_secs(1));
-        // An unmeasured path beside nothing else contributes nothing.
-        let unmeasured = PathRtt::new();
-        assert_eq!(
-            TickPace::derive(TICK, CEILING, ELECTION_TICK, [&unmeasured]),
-            pace
-        );
     }
 
     #[test]
-    fn a_path_inside_the_period_leaves_the_pace_unchanged() {
-        let path = path_of(&LOOPBACK_MS);
-        let pace = TickPace::derive(TICK, CEILING, ELECTION_TICK, [&path]);
+    fn a_timing_inside_the_ticks_leaves_the_pace_unchanged() {
+        // A 50 ms detector with a 65.8 ms margin, as on macOS (§2.6): 116 ms in ten 100 ms ticks.
+        let pace = TickPace::derive(TICK, CEILING, ELECTION_TICK, &timing(116, 1));
         assert_eq!(pace.period, TICK, "a LAN group runs as configured");
-        assert_eq!(pace.samples, 4, "and records that it measured");
-        assert!(pace.broadcast_tail_ns > 0);
+        assert_eq!(pace.samples, 6, "and records that it measured");
+        assert_eq!(pace.covered, Duration::from_millis(116));
     }
 
     #[test]
-    fn a_far_path_stretches_the_period_to_ten_tails_per_election_timeout() {
-        for samples in [&REGIONAL_MS, &GEOGRAPHIC_MS] {
-            let path = path_of(samples);
-            let tail = path.tail_ns().unwrap();
-            let pace = TickPace::derive(TICK, CEILING, ELECTION_TICK, [&path]);
+    fn the_ticks_cover_the_longer_of_the_base_and_the_span() {
+        for (base, span) in [(2_400, 3), (400, 2_400), (1_500, 1_500)] {
+            let timing = timing(base, span);
+            let pace = TickPace::derive(TICK, CEILING, ELECTION_TICK, &timing);
+            let timeout = pace.election_timeout(ELECTION_TICK);
+            let covered = timing.base.max(timing.span);
             assert!(pace.period > TICK);
-            let timeout = nanos(pace.election_timeout(ELECTION_TICK));
+            assert!(timeout >= covered, "{timeout:?} under {covered:?}");
             assert!(
-                timeout >= ELECTION_MARGIN * tail,
-                "election timeout {timeout} under ten tails of {tail}"
-            );
-            assert!(
-                timeout < ELECTION_MARGIN * tail + ELECTION_TICK as u64,
+                timeout < covered + Duration::from_nanos(ELECTION_TICK as u64),
                 "and no longer than rounding requires"
             );
         }
     }
 
     #[test]
-    fn the_slowest_voter_path_bounds_the_broadcast() {
-        let near = path_of(&LOOPBACK_MS);
-        let far = path_of(&REGIONAL_MS);
-        let both = TickPace::derive(TICK, CEILING, ELECTION_TICK, [&near, &far]);
-        let alone = TickPace::derive(TICK, CEILING, ELECTION_TICK, [&far]);
-        assert_eq!(both.period, alone.period);
-        assert_eq!(both.broadcast_tail_ns, far.tail_ns().unwrap());
-        assert_eq!(both.samples, 10);
-    }
-
-    #[test]
     fn the_ceiling_bounds_the_period_and_the_measurement_shows_the_shortfall() {
-        let path = path_of(&GEOGRAPHIC_MS);
+        let timing = timing(10_000, 3);
         let tight = Duration::from_millis(500);
-        let pace = TickPace::derive(TICK, tight, ELECTION_TICK, [&path]);
+        let pace = TickPace::derive(TICK, tight, ELECTION_TICK, &timing);
         assert_eq!(pace.period, tight);
-        assert!(
-            nanos(pace.election_timeout(ELECTION_TICK)) < ELECTION_MARGIN * pace.broadcast_tail_ns
-        );
+        assert!(pace.election_timeout(ELECTION_TICK) < pace.covered);
         // A ceiling below the configured period is the configured period.
-        let pace = TickPace::derive(TICK, Duration::from_millis(1), ELECTION_TICK, [&path]);
+        let pace = TickPace::derive(TICK, Duration::from_millis(1), ELECTION_TICK, &timing);
         assert_eq!(pace.period, TICK);
     }
 
     #[test]
     fn extreme_inputs_saturate() {
-        let mut path = PathRtt::new();
+        let mut path = path_of(3, &[]);
         path.on_sample(u64::MAX);
         path.on_sample(u64::MAX);
-        let pace = TickPace::derive(TICK, CEILING, 0, [&path]);
+        assert_eq!(path.mean_ns(), u64::MAX);
+        assert_eq!(path.tail_ns(u64::MAX), Some(u64::MAX));
+        let mut timing = timing(0, 0);
+        timing.base = Duration::MAX;
+        let pace = TickPace::derive(TICK, CEILING, 0, &timing);
         assert_eq!(pace.period, CEILING);
         assert_eq!(
             pace.election_timeout(usize::MAX),

@@ -626,15 +626,16 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
     }
 
     /// What an exchange with `peer` is expected to take, its work included: the tail of the
-    /// exchanges it answered, doubled for each given up on since (T40). `None` while it has
+    /// exchanges it answered over the caller's measured timer `granularity`
+    /// (`hyper_timing::Lateness`), doubled for each given up on since (T40). `None` while it has
     /// answered none.
-    pub fn exchange_tail(&self, peer: PeerId) -> Option<Duration> {
+    pub fn exchange_tail(&self, peer: PeerId, granularity: Duration) -> Option<Duration> {
         let at = self
             .core
             .peers
             .binary_search_by_key(&peer, |entry| entry.peer)
             .ok()?;
-        self.core.peers.get(at)?.timing.tail()
+        self.core.peers.get(at)?.timing.tail(granularity)
     }
 
     /// QUIC's counters for the connection to `peer` (its path's round trip, congestion window,

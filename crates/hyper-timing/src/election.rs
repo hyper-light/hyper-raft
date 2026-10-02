@@ -1,34 +1,46 @@
-//! Election timing counted in the owner's periods, from slates' timing law (slates
+//! Election timing from the failure detector and the split-vote span (`docs/timing.md` §2.1–§2.3),
+//! counted in the owner's periods, with slates' timer, priority and window budget (slates
 //! `crates/cluster/src/timing.rs` at `c4e2c52`, §4.8 "Derived constants").
 //!
-//! Raft needs `broadcastTime ≪ electionTimeout ≪ MTBF` (Ongaro and Ousterhout, ATC 2014, §5.6).
-//! [`ElectionTiming::derive`] sets the base election timeout to `ELECTION_MARGIN × max(tail,
-//! heartbeat)` and the randomization span (Raft §5.2, §9.3) to `ELECTION_MARGIN × max(spread,
-//! heartbeat)`, both in whole periods of the owner's heartbeat, from the measured paths to the
-//! group's other voters.
-//! - On a loopback or a LAN every tail sits inside one period, so the timing is the floor of
-//!   [`ELECTION_MARGIN`] periods by construction.
-//! - A far group's base grows with its slowest path's tail, and its span with that path's
-//!   variation, so the worst-case leader-loss detection is `base + span`, not `2 × base`.
+//! One design, three measurements:
+//! - **The base** is when the follower's detector of the leader's node suspects it: NFD-E trusts the
+//!   leader until the next heartbeat's freshness point, `η + α` past the latest heartbeat for the
+//!   detector the link runs ([`crate::Configuration::current`]). A follower silent for the base has
+//!   lost its leader, as its detector says, and a leader judges its quorum on the same cadence
+//!   (check-quorum). The crash is detected within the detector's bound `E(D) + α + η`.
+//! - **The span** `W` is the one that minimizes the expected time to a leader once the voters that
+//!   suspected together start campaigning, Ongaro's split-vote probability (dissertation §9.2–§9.3)
+//!   on the one-way latency and vote round the voters' paths measure ([`Ballot`]). Its expected
+//!   election `T_E` is what [`crate::Costs::election`] charges each detection, so the detector's
+//!   `η` and `α` are chosen knowing what an election costs here, and the election waits only as
+//!   long as that choice assumed.
+//! - **The granularity** under the tails is the owner's measured timer lateness, passed in.
 //!
-//! The broadcast time includes the time a follower takes to make an entry durable before it
+//! The broadcast includes the time a voter takes to make its vote or entry durable before it
 //! answers (mantle audit §11.7). A path measured by a probe that touches no disk does not hold it,
-//! so the caller passes the durable-acknowledgement tail the samples lack.
+//! so the caller passes the measured mean flush ([`crate::Flushes`]).
 //!
 //! The timer ([`ElectionTimer`]) counts periods, not wall time. A node whose own periods are
 //! starved waits longer instead of campaigning on its own slowness, which is the Lifeguard direction
-//! (slates `docs/bugs/2026-09-13-swim-fixed-probe-deadline-kills-a-starved-live-peer.md`).
+//! (slates `docs/bugs/2026-09-13-swim-fixed-probe-deadline-kills-a-starved-live-peer.md`). A core
+//! that campaigns on its detector's suspicion instead (L-2) draws the same span in time
+//! ([`ElectionTiming::delay`]), and a detector fed kernel receive stamps does not blame a peer for
+//! its own late wake (`docs/timing.md` §2.4).
 //!
-//! This is the period-counting form, for a core whose election timer is driven from outside.
-//! [`TickPace`](crate::TickPace) is the period-stretching form, for a core whose tick counts are
-//! fixed when it opens. The derivations take any [`PathEstimate`], so the estimator that feeds them
-//! is chosen by measurement (mantle note 32 §3.7), not by this module.
+//! The derivations take any [`PathEstimate`], so the estimator that feeds them is chosen by
+//! measurement (mantle note 32 §3.7), not by this module.
 
-use crate::{ELECTION_MARGIN, ExchangeRtt, PathRtt};
+use std::time::Duration;
 
-/// Derived: two, the round trips a lost batch takes to repair when the leader sends batches ahead:
-/// the follower's refusal of the batch after the lost one reaches the leader, and the resend
-/// reaches the follower (slates `docs/wip/research/consensus-enhancements.md` §3.5).
+use crate::qos::{Detector, Span, election_span};
+use crate::{ExchangeRtt, PathRtt};
+
+/// A protocol fact, not a tunable: two, the round trips a lost batch takes to repair when the
+/// leader sends batches ahead: the follower's refusal of the batch after the lost one reaches the
+/// leader, and the resend reaches the follower (slates `docs/wip/research/consensus-enhancements.md`
+/// §3.5). Raft's append consistency check (Ongaro and Ousterhout 2014, §5.3) makes the follower
+/// refuse rather than buffer, so no shorter repair exists, and one refusal names the gap, so none
+/// longer is needed.
 pub const REPAIR_ROUND_TRIPS: u64 = 2;
 
 /// What a timing law reads from a measured path. A path with no sample contributes nothing to a
@@ -38,12 +50,15 @@ pub trait PathEstimate {
     fn samples(&self) -> u64;
     /// The central round trip, in nanoseconds; zero before any sample.
     fn smoothed_ns(&self) -> u64;
-    /// The bound on the path's round-trip tail, in nanoseconds, or `None` before any sample.
-    fn tail_ns(&self) -> Option<u64>;
-    /// The tail's width above the central round trip, or `None` before any sample: the design's
-    /// "RTT variance", in the tail's own units.
-    fn spread_ns(&self) -> Option<u64> {
-        self.tail_ns()
+    /// The mean round trip, in nanoseconds; zero before any sample. An expected time, the
+    /// split-vote span's, is a sum of means.
+    fn mean_ns(&self) -> u64;
+    /// The bound on the path's round-trip tail, in nanoseconds, with the owner's measured timer
+    /// granularity under its variation term, or `None` before any sample.
+    fn tail_ns(&self, granularity_ns: u64) -> Option<u64>;
+    /// The tail's width above the central round trip, or `None` before any sample.
+    fn spread_ns(&self, granularity_ns: u64) -> Option<u64> {
+        self.tail_ns(granularity_ns)
             .map(|tail| tail.saturating_sub(self.smoothed_ns()))
     }
 }
@@ -55,8 +70,11 @@ impl PathEstimate for PathRtt {
     fn smoothed_ns(&self) -> u64 {
         PathRtt::smoothed_ns(self)
     }
-    fn tail_ns(&self) -> Option<u64> {
-        PathRtt::tail_ns(self)
+    fn mean_ns(&self) -> u64 {
+        PathRtt::mean_ns(self)
+    }
+    fn tail_ns(&self, granularity_ns: u64) -> Option<u64> {
+        PathRtt::tail_ns(self, granularity_ns)
     }
 }
 
@@ -67,8 +85,12 @@ impl PathEstimate for ExchangeRtt {
     fn smoothed_ns(&self) -> u64 {
         ExchangeRtt::smoothed_ns(self)
     }
-    fn tail_ns(&self) -> Option<u64> {
-        ExchangeRtt::tail_ns(self)
+    /// RFC 9002's `smoothed_rtt`, an exponentially weighted mean.
+    fn mean_ns(&self) -> u64 {
+        ExchangeRtt::smoothed_ns(self)
+    }
+    fn tail_ns(&self, granularity_ns: u64) -> Option<u64> {
+        ExchangeRtt::tail_ns(self, granularity_ns)
     }
 }
 
@@ -99,131 +121,200 @@ impl ElectionPriority {
     }
 }
 
+/// The `position`-th smallest of `keys`, from zero, ties broken by their order. The rank is
+/// counted rather than sorted, so the call allocates nothing: a key's position is the number of
+/// keys ordered before it, and a count stops once it passes `position`. That is at most quadratic
+/// in a group's voters, a handful.
+#[inline]
+fn nth_smallest<K: Ord + Copy>(
+    keys: impl Iterator<Item = K> + Clone,
+    position: usize,
+) -> Option<K> {
+    for (index, key) in keys.clone().enumerate() {
+        let mut rank = 0usize;
+        let mut past = false;
+        for (other, other_key) in keys.clone().enumerate() {
+            if other_key < key || (other_key == key && other < index) {
+                rank = rank.saturating_add(1);
+                if rank > position {
+                    past = true;
+                    break;
+                }
+            }
+        }
+        if !past && rank == position {
+            return Some(key);
+        }
+    }
+    None
+}
+
 /// A voter's election priority from its measured paths to the other voters of a group of
 /// `voters`: the `⌊voters/2⌋`-th smallest central round trip among `paths`, with that path's
-/// spread. Unknown while a sole voter, or while fewer measured paths than that exist.
+/// spread over the owner's measured granularity. Unknown while a sole voter, or while fewer
+/// measured paths than that exist. It allocates nothing.
 ///
-/// The rank is counted rather than sorted, so the call allocates nothing: each measured path's
-/// position is the number of paths ordered before it, ties broken by their order in `paths`.
-/// That is quadratic in a group's voters, a handful.
+/// The paths are ranked by their spread without the floor and the floor is applied to the one
+/// chosen: the floored spread, `max(4·deviation, G)`, never falls as the unfloored one rises, so
+/// the two rankings choose paths of the same round trip and floored spread.
 pub fn quorum_priority<'a, P: PathEstimate + 'a>(
     paths: impl IntoIterator<Item = Option<&'a P>, IntoIter: Clone>,
     voters: usize,
+    granularity_ns: u64,
 ) -> ElectionPriority {
     let measured = paths
         .into_iter()
         .flatten()
-        .filter_map(|path| path.spread_ns().map(|spread| (path.smoothed_ns(), spread)));
-    let Some(position) = (voters / 2).checked_sub(1) else {
-        return ElectionPriority::default();
-    };
-    measured
-        .clone()
-        .enumerate()
-        .find(|&(index, key)| {
-            let rank = measured
-                .clone()
-                .enumerate()
-                .filter(|&(other, other_key)| {
-                    other_key < key || (other_key == key && other < index)
-                })
-                .count();
-            rank == position
-        })
-        .map_or_else(ElectionPriority::default, |(_, (quorum_ns, spread_ns))| {
+        .filter_map(|path| path.spread_ns(0).map(|spread| (path.smoothed_ns(), spread)));
+    (voters / 2)
+        .checked_sub(1)
+        .and_then(|position| nth_smallest(measured, position))
+        .map_or_else(ElectionPriority::default, |(quorum_ns, spread_ns)| {
             ElectionPriority {
                 quorum_ns,
-                spread_ns,
+                spread_ns: spread_ns.max(granularity_ns),
             }
         })
 }
 
-/// A group's election timing for one period, derived from the measured paths to its other voters.
-/// Periods are the owner's, one heartbeat or longer each.
+/// A group's election as its voters' paths measure it: the inputs of the split-vote span
+/// (`docs/timing.md` §2.3) and the broadcast the window budget repairs over.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Ballot {
+    /// The group's voters, `n`.
+    pub voters: u32,
+    /// The voters the span is chosen for, `s`: all but the leader whose crash the detector exists
+    /// to find, where they are still a majority; all of them otherwise (a group of two elects only
+    /// with both).
+    pub available: u32,
+    /// The one-way latency `l`: half the slowest measured path's mean round trip. A candidate's
+    /// request reaches the voter on that path last; a round trip is what one clock can measure, and
+    /// half of it is a symmetric path's one-way delay, the half NTP's offset takes (RFC 5905 §8,
+    /// `θ = ½[(T2 − T1) + (T3 − T4)]`).
+    pub latency: Duration,
+    /// The vote round: the candidate's quorum, the `⌊n/2⌋`-th smallest mean round trip, since a
+    /// candidate wins with `⌊n/2⌋` votes beside its own; plus the mean flush a voter makes its vote
+    /// durable in before it answers (Raft's `votedFor` is persistent state, Figure 2).
+    pub round: Duration,
+    /// The slowest measured path's tail over the granularity, plus the mean flush: what the window
+    /// budget repairs over.
+    pub broadcast_tail: Duration,
+    /// The round trips measured across the paths: the witness that the ballot is measured.
+    pub samples: u64,
+}
+
+impl Ballot {
+    /// The ballot of a group of `voters` from this voter's measured `paths` to the others, with
+    /// the mean `durable` flush of a vote or entry and the owner's measured `granularity`. `None`
+    /// for a sole voter, which never campaigns against anyone, and while fewer paths are measured
+    /// than a candidate's quorum needs: no span is chosen for a latency nobody measured.
+    pub fn measure<'a, P: PathEstimate + 'a>(
+        paths: impl IntoIterator<Item = &'a P, IntoIter: Clone>,
+        voters: usize,
+        durable: Duration,
+        granularity: Duration,
+    ) -> Option<Self> {
+        let voters = u32::try_from(voters).ok().filter(|count| *count >= 2)?;
+        let granularity_ns = nanos(granularity);
+        let measured = paths.into_iter().filter(|path| path.samples() > 0);
+        let (mut slowest, mut tail, mut samples) = (0u64, 0u64, 0u64);
+        for path in measured.clone() {
+            slowest = slowest.max(path.mean_ns());
+            tail = tail.max(path.tail_ns(granularity_ns).unwrap_or(0));
+            samples = samples.saturating_add(path.samples());
+        }
+        let position = usize::try_from(voters / 2).ok()?.checked_sub(1)?;
+        let quorum = nth_smallest(measured.map(|path| path.mean_ns()), position)?;
+        let durable_ns = nanos(durable);
+        let others = voters.saturating_sub(1);
+        Some(Self {
+            voters,
+            available: if others > voters / 2 { others } else { voters },
+            latency: Duration::from_nanos(slowest / 2),
+            round: Duration::from_nanos(quorum.saturating_add(durable_ns)),
+            broadcast_tail: Duration::from_nanos(tail.saturating_add(durable_ns)),
+            samples,
+        })
+    }
+
+    /// The span that minimizes the expected time to a leader on this ballot, searched to within the
+    /// owner's measured `granularity`, finer than which no wait can be told apart
+    /// ([`election_span`]). `None` where no election can succeed.
+    ///
+    /// Its expected election is the cost the leader's link's detector is configured for, so it is
+    /// computed when that detector is ([`crate::LinkEstimator::reconfigure_due`]): between
+    /// configurations a new span would change nothing the detector does. A search costs a few
+    /// hundred nanoseconds; the timing derived from a held span is a few nanoseconds a period
+    /// (`docs/benchmarks.md`, "hyper-timing").
+    pub fn span(&self, granularity: Duration) -> Option<Span> {
+        election_span(
+            self.voters,
+            self.available,
+            self.latency,
+            self.round,
+            granularity,
+        )
+    }
+}
+
+/// A group's election timing, from the detector of the leader's link and the group's span, in the
+/// owner's periods.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ElectionTiming {
     /// The base election timeout in periods: a follower campaigns after this many periods without
     /// leader contact, plus its jitter, and a leader judges its quorum every this many.
     pub base_periods: u32,
     /// The randomization span in periods: a node's timeout is `base + jitter`, `jitter ∈ [0,
-    /// span)`.
+    /// span)`. One where a period is at least the span: such an owner cannot resolve the span in
+    /// its periods, and only the phases of the owners' periods spread their campaigns.
     pub span_periods: u32,
-    /// The broadcast round-trip tail the base was derived from, nanoseconds: the slowest measured
-    /// voter path's tail plus the durable-acknowledgement tail; zero when no voter path has a
-    /// sample.
-    pub broadcast_rtt_tail_ns: u64,
-    /// The variation the span was derived from, nanoseconds: the widest measured voter path's
-    /// spread; zero when no voter path has a sample.
-    pub broadcast_rtt_spread_ns: u64,
-    /// The round trips measured across the voter paths that fed this derivation: the witness that
-    /// tells a measured timing from the floor it would default to.
+    /// The base: the detector's freshness horizon past the leader's latest heartbeat, `η + α`.
+    pub base: Duration,
+    /// The span `W` that minimizes the expected time to a leader.
+    pub span: Duration,
+    /// The detector's bound on detecting a crash, `E(D) + α + η`.
+    pub detection: Duration,
+    /// The expected time from a suspicion to a leader with the span, `T_E(W)`.
+    pub election: Duration,
+    /// The broadcast tail the window budget repairs over ([`Ballot::broadcast_tail`]).
+    pub broadcast_tail: Duration,
+    /// The round trips measured across the voter paths that fed the ballot.
     pub samples: u64,
 }
 
 impl ElectionTiming {
-    /// The timing with no voter path measured, as on a sole voter or before a group's first probe
-    /// is answered: [`ELECTION_MARGIN`] periods for both the base and the span, since the
-    /// heartbeat is the smallest broadcast time the owner can observe.
-    pub fn floor() -> Self {
-        Self::derive::<PathRtt>(1, 0, std::iter::empty())
-    }
-
-    /// The timing from the measured `paths` to the group's other voters:
-    /// `base = ELECTION_MARGIN × max(tail + durable, heartbeat)` and
-    /// `span = ELECTION_MARGIN × max(spread, heartbeat)`, each rounded up to whole periods of
-    /// `heartbeat_ns`.
-    ///
-    /// The slowest path bounds the broadcast, since a round completes when its last voter answers.
-    /// `durable_tail_ns` is the tail of making an entry durable that the path samples do not
-    /// already include (mantle audit §11.7); it is added only once some path is measured. A path
-    /// with no sample contributes nothing, and with none measured the result is the floor.
-    pub fn derive<'a, P: PathEstimate + 'a>(
-        heartbeat_ns: u64,
-        durable_tail_ns: u64,
-        paths: impl IntoIterator<Item = &'a P>,
-    ) -> Self {
-        let heartbeat = heartbeat_ns.max(1);
-        let mut tail = 0u64;
-        let mut spread = 0u64;
-        let mut samples = 0u64;
-        for path in paths {
-            if let (Some(path_tail), Some(path_spread)) = (path.tail_ns(), path.spread_ns()) {
-                tail = tail.max(path_tail);
-                spread = spread.max(path_spread);
-                samples = samples.saturating_add(path.samples());
-            }
-        }
-        if samples > 0 {
-            tail = tail.saturating_add(durable_tail_ns);
-        }
+    /// The timing for an owner whose period is `period`, from the `detector` the follower runs on
+    /// its link to the leader's node (the margin in force at the link's interval,
+    /// [`crate::Configuration::current`]), the group's `span` and its `ballot`. The base and the
+    /// span are rounded up to whole periods, so the base never ends before the detector would
+    /// suspect. The detector's [`crate::Costs::election`] is to be `span.election`: the election it
+    /// planned for is the one this timing runs.
+    pub fn derive(period: Duration, detector: &Detector, span: &Span, ballot: &Ballot) -> Self {
+        let period_ns = nanos(period);
+        let base = detector.interval.saturating_add(detector.margin);
         Self {
-            base_periods: periods_of(
-                ELECTION_MARGIN.saturating_mul(tail.max(heartbeat)),
-                heartbeat,
-            ),
-            span_periods: periods_of(
-                ELECTION_MARGIN.saturating_mul(spread.max(heartbeat)),
-                heartbeat,
-            ),
-            broadcast_rtt_tail_ns: tail,
-            broadcast_rtt_spread_ns: spread,
-            samples,
+            base_periods: periods_of(nanos(base), period_ns),
+            span_periods: periods_of(nanos(span.span), period_ns),
+            base,
+            span: span.span,
+            detection: detector.detection,
+            election: span.election,
+            broadcast_tail: ballot.broadcast_tail,
+            samples: ballot.samples,
         }
     }
 
-    /// The window a leader keeps ahead, in bytes: one `batch_bytes` for each period a lost batch
-    /// takes to repair on the slowest measured voter path ([`REPAIR_ROUND_TRIPS`] round trips),
-    /// and at least one.
+    /// The window a leader keeps ahead, in bytes: one `batch_bytes` for each period of
+    /// `period_ns` a lost batch takes to repair on the slowest measured voter path
+    /// ([`REPAIR_ROUND_TRIPS`] round trips), and at least one.
     ///
     /// It is one batch on a LAN, where an acknowledgement is back within the period. slates
     /// measured four across five Azure regions, where four cut the commit tail under 1 % loss from
     /// 458 to 321 ms at 2,000 proposals a second (slates `crates/cluster/tests/pipelining.rs`,
     /// 2026-09-29).
-    pub fn window_budget(&self, heartbeat_ns: u64, batch_bytes: usize) -> usize {
-        let repair = self
-            .broadcast_rtt_tail_ns
-            .saturating_mul(REPAIR_ROUND_TRIPS);
-        let batches = usize::try_from(periods_of(repair, heartbeat_ns)).unwrap_or(usize::MAX);
+    pub fn window_budget(&self, period_ns: u64, batch_bytes: usize) -> usize {
+        let repair = nanos(self.broadcast_tail).saturating_mul(REPAIR_ROUND_TRIPS);
+        let batches = usize::try_from(periods_of(repair, period_ns)).unwrap_or(usize::MAX);
         batch_bytes.saturating_mul(batches)
     }
 
@@ -236,10 +327,24 @@ impl ElectionTiming {
     /// `docs/bugs/2026-09-28-correlated-election-jitter-livelocked-a-split-vote.md`).
     pub fn timeout_periods(&self, local: u64, attempt: u32) -> u32 {
         let span = u64::from(self.span_periods.max(1));
-        let draw = splitmix64(local ^ u64::from(attempt).wrapping_mul(GOLDEN_GAMMA));
-        let jitter = u32::try_from(draw.checked_rem(span).unwrap_or(0)).unwrap_or(0);
+        let jitter =
+            u32::try_from(draw(local, attempt).checked_rem(span).unwrap_or(0)).unwrap_or(0);
         self.base_periods.saturating_add(jitter)
     }
+
+    /// This node's delay from a suspicion to its `attempt`-th campaign, uniform on `[0, W)` from
+    /// the same draw as [`timeout_periods`](Self::timeout_periods) (`docs/timing.md` §2.3): the form
+    /// for a core that campaigns on its detector's suspicion and waits in time, to the owner's
+    /// granularity, rather than in periods.
+    pub fn delay(&self, local: u64, attempt: u32) -> Duration {
+        let scaled = u128::from(nanos(self.span)).saturating_mul(u128::from(draw(local, attempt)));
+        Duration::from_nanos(u64::try_from(scaled >> u64::BITS).unwrap_or(u64::MAX))
+    }
+}
+
+/// The draw for `local`'s `attempt`-th campaign.
+fn draw(local: u64, attempt: u32) -> u64 {
+    splitmix64(local ^ u64::from(attempt).wrapping_mul(GOLDEN_GAMMA))
 }
 
 /// Format: splitmix64's increment, the odd integer nearest 2^64/φ (Steele, Lea and Flood, "Fast
@@ -259,11 +364,15 @@ fn splitmix64(word: u64) -> u64 {
     z ^ (z >> 31)
 }
 
-/// `span_ns` in whole periods of `heartbeat_ns`, rounded up, at least one; saturating.
-fn periods_of(span_ns: u64, heartbeat_ns: u64) -> u32 {
-    let heartbeat = heartbeat_ns.max(1);
-    let periods = span_ns.div_ceil(heartbeat).max(1);
+/// `span_ns` in whole periods of `period_ns`, rounded up, at least one; saturating.
+fn periods_of(span_ns: u64, period_ns: u64) -> u32 {
+    let period = period_ns.max(1);
+    let periods = span_ns.div_ceil(period).max(1);
     u32::try_from(periods).unwrap_or(u32::MAX)
+}
+
+fn nanos(duration: Duration) -> u64 {
+    u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
 }
 
 /// What a follower's period asks of its node ([`ElectionTimer::follower_period`]).
@@ -386,23 +495,24 @@ impl ElectionTimer {
 
 #[cfg(test)]
 mod tests {
-    //! slates' timing-law tests (`crates/cluster/src/timing.rs` at `c4e2c52`), on [`ExchangeRtt`],
-    //! the RFC 9002 estimator they were written against, plus the durable-acknowledgement term,
-    //! the median-and-MAD estimator under the same law, and the unified round budget.
+    //! slates' timer and priority tests (`crates/cluster/src/timing.rs` at `c4e2c52`), on
+    //! [`ExchangeRtt`], the RFC 9002 estimator they were written against; the ballot, the span and
+    //! the base from a configured detector; and the unified round budget.
     use super::*;
-    use crate::{RoundAnchors, RoundBudget};
+    use crate::{Costs, Floors, LinkEstimator, RoundAnchors, RoundBudget, Schedule, configure};
+    use proptest::prelude::*;
 
     /// A millisecond in nanoseconds, so the samples read as round times.
     const MS: u64 = 1_000_000;
     /// slates' daemon heartbeat, its owner period: 100 ms.
     const HEARTBEAT: u64 = 100 * MS;
+    /// The timer granularity: macOS's 45 µs at a 40 µs wait (`docs/timing.md` §2.4).
+    const G: Duration = Duration::from_micros(45);
     /// The loopback round trips slates measured on 2026-09-13: SWIM p99 17 ms, consensus broadcast
     /// p50 11 ms and p99 33 ms.
     const LOOPBACK_SAMPLES_MS: [u64; 4] = [11, 17, 11, 33];
     /// An inter-region path of 80 ms ± 20 ms one way.
     const WAN_SAMPLES_MS: [u64; 6] = [160, 200, 120, 160, 190, 130];
-    /// The same path once the estimate has settled within its ± 40 ms spread.
-    const WAN_SETTLED_CYCLE_MS: [u64; 6] = [160, 200, 140, 180, 120, 160];
 
     fn path_of(samples_ms: &[u64]) -> ExchangeRtt {
         let mut path = ExchangeRtt::new();
@@ -412,144 +522,274 @@ mod tests {
         path
     }
 
-    fn derive(paths: &[&ExchangeRtt]) -> ElectionTiming {
-        ElectionTiming::derive(HEARTBEAT, 0, paths.iter().copied())
+    fn ms(value: u64) -> Duration {
+        Duration::from_millis(value)
+    }
+
+    /// The detector the traces configured on macOS at 100 µs (`docs/timing.md` §2.6): a 50 ms
+    /// interval and a 65.8 ms margin.
+    fn macos_detector() -> Detector {
+        Detector {
+            interval: ms(50),
+            margin: Duration::from_micros(65_800),
+            detection: Duration::from_micros(115_900),
+            mistake_recurrence: Duration::from_secs(8 * 86_400),
+            unavailability: 4.5e-8,
+        }
+    }
+
+    fn timing_of(period: u64, paths: &[&ExchangeRtt], voters: usize) -> ElectionTiming {
+        let ballot = Ballot::measure(paths.iter().copied(), voters, Duration::ZERO, G).unwrap();
+        let span = ballot.span(G).unwrap();
+        ElectionTiming::derive(
+            Duration::from_nanos(period),
+            &macos_detector(),
+            &span,
+            &ballot,
+        )
+    }
+
+    /// A five-voter group across regions, its timer counted in 1 ms periods.
+    fn wan_timing() -> ElectionTiming {
+        let paths: Vec<ExchangeRtt> = (0..4).map(|_| path_of(&WAN_SAMPLES_MS)).collect();
+        timing_of(MS, &paths.iter().collect::<Vec<_>>(), 5)
     }
 
     #[test]
-    fn with_no_measured_voter_path_the_timing_is_the_floor() {
-        let timing = derive(&[]);
-        assert_eq!(timing, ElectionTiming::floor());
-        assert_eq!(timing.base_periods, 10);
-        assert_eq!(timing.span_periods, 10);
-        assert_eq!(timing.samples, 0);
+    fn a_ballot_is_the_slowest_latency_and_the_quorums_round() {
+        let near = path_of(&[10, 10]);
+        let middle = path_of(&[40, 40]);
+        let far = path_of(&[160, 160]);
+        let durable = ms(3);
+        let ballot = Ballot::measure([&far, &near, &middle, &near], 5, durable, G).unwrap();
+        assert_eq!(ballot.voters, 5);
+        assert_eq!(ballot.available, 4, "all but the leader that crashed");
+        assert_eq!(ballot.latency, ms(80), "half the slowest mean round trip");
+        // Five voters: a candidate wins with two votes beside its own, the second-nearest.
+        assert_eq!(ballot.round, ms(10) + durable);
+        let tail = far.tail_ns(nanos(G)).unwrap();
+        assert_eq!(ballot.broadcast_tail, Duration::from_nanos(tail) + durable);
+        assert_eq!(ballot.samples, 8);
+        // Three voters: one vote beside its own, the nearest; two still up of three.
+        let three = Ballot::measure([&middle, &near], 3, durable, G).unwrap();
+        assert_eq!((three.available, three.round), (2, ms(10) + durable));
+        // Two voters: the survivor alone is no majority, so the span is chosen for both.
+        let two = Ballot::measure([&near], 2, durable, G).unwrap();
+        assert_eq!(two.available, 2);
+        assert!(two.span(G).is_some());
     }
 
     #[test]
-    fn a_path_inside_the_heartbeat_leaves_the_timing_at_the_floor() {
-        let lan = path_of(&LOOPBACK_SAMPLES_MS);
-        let timing = derive(&[&lan]);
-        assert!(timing.broadcast_rtt_tail_ns < HEARTBEAT);
-        assert_eq!(timing.base_periods, ElectionTiming::floor().base_periods);
-        assert_eq!(timing.span_periods, ElectionTiming::floor().span_periods);
-        assert_eq!(timing.samples, 4, "the floor was measured, not defaulted");
-    }
-
-    #[test]
-    fn a_wan_path_raises_the_base_to_ten_times_its_tail_in_whole_periods() {
-        let wan = path_of(&WAN_SAMPLES_MS);
-        let timing = derive(&[&wan]);
-        let tail = wan.tail_ns().unwrap();
-        assert!(tail > HEARTBEAT, "a WAN tail exceeds one period: {tail}");
+    fn no_ballot_without_the_paths_a_quorum_needs() {
+        let near = path_of(&[10]);
+        let fresh = ExchangeRtt::new();
         assert_eq!(
-            timing.base_periods,
-            u32::try_from((10 * tail).div_ceil(HEARTBEAT)).unwrap()
+            Ballot::measure([&near], 1, Duration::ZERO, G),
+            None,
+            "a sole voter"
         );
-        assert!(u64::from(timing.base_periods) * HEARTBEAT >= 10 * tail);
-        assert_eq!(timing.broadcast_rtt_tail_ns, tail);
+        assert_eq!(
+            Ballot::measure::<ExchangeRtt>([], 3, Duration::ZERO, G),
+            None
+        );
+        assert_eq!(
+            Ballot::measure([&fresh, &fresh], 3, Duration::ZERO, G),
+            None
+        );
+        // Five voters need two measured paths; one is not a quorum's round.
+        assert_eq!(
+            Ballot::measure([&near, &fresh, &fresh, &fresh], 5, Duration::ZERO, G),
+            None
+        );
+        assert!(Ballot::measure([&near, &fresh, &near, &fresh], 5, Duration::ZERO, G).is_some());
+    }
+
+    /// The span is the split-vote minimum on the ballot's own inputs: what `election_span` gives.
+    #[test]
+    fn the_span_is_the_minimum_on_the_ballots_inputs() {
+        let paths = [path_of(&WAN_SAMPLES_MS), path_of(&LOOPBACK_SAMPLES_MS)];
+        let ballot = Ballot::measure(&paths, 3, ms(2), G).unwrap();
+        let span = ballot.span(G).unwrap();
+        assert_eq!(
+            Some(span),
+            election_span(3, 2, ballot.latency, ballot.round, G)
+        );
+        assert!(
+            span.span >= ballot.latency,
+            "wider than the latency, or every vote splits"
+        );
+        assert!(span.split < 1.0);
     }
 
     #[test]
-    fn the_durable_acknowledgement_joins_the_tail_once_a_path_is_measured() {
-        let wan = path_of(&WAN_SAMPLES_MS);
-        let tail = wan.tail_ns().unwrap();
-        let durable = 40 * MS;
-        let timing = ElectionTiming::derive(HEARTBEAT, durable, [&wan]);
-        assert_eq!(timing.broadcast_rtt_tail_ns, tail + durable);
-        assert_eq!(
-            timing.base_periods,
-            u32::try_from((10 * (tail + durable)).div_ceil(HEARTBEAT)).unwrap()
-        );
-        // With nothing measured there is no broadcast to lengthen: the floor stands.
-        assert_eq!(
-            ElectionTiming::derive::<ExchangeRtt>(HEARTBEAT, durable, std::iter::empty()),
-            derive(&[])
-        );
+    fn the_base_is_the_detectors_freshness_horizon_in_whole_periods() {
+        let detector = macos_detector();
+        let paths = [path_of(&LOOPBACK_SAMPLES_MS), path_of(&LOOPBACK_SAMPLES_MS)];
+        let ballot = Ballot::measure(&paths, 3, Duration::ZERO, G).unwrap();
+        let span = ballot.span(G).unwrap();
+        // 115.8 ms in 10 ms periods: twelve; in 100 ms periods: two; in 1 ms periods: 116.
+        for (period_ms, base) in [(10, 12), (100, 2), (1, 116)] {
+            let timing = ElectionTiming::derive(ms(period_ms), &detector, &span, &ballot);
+            assert_eq!(timing.base, Duration::from_micros(115_800));
+            assert_eq!(timing.base_periods, base, "{period_ms} ms periods");
+            assert_eq!(timing.detection, detector.detection);
+            assert_eq!(timing.election, span.election);
+        }
+        // A period longer than the span cannot resolve it: one period, the owners' phases only.
+        let coarse = ElectionTiming::derive(ms(100), &detector, &span, &ballot);
+        assert!(span.span < ms(100));
+        assert_eq!(coarse.span_periods, 1);
+        assert_eq!(coarse.timeout_periods(3, 0), coarse.base_periods);
+    }
+
+    proptest! {
+        /// The base is never shorter than the detector's horizon and short of it by under a period;
+        /// the timeout lies in `[base, base + span)` and the delay in `[0, W)`.
+        #[test]
+        fn the_timing_rounds_up_and_the_draws_stay_in_range(
+            interval_us in 1u64..1_000_000,
+            margin_us in 0u64..1_000_000,
+            span_us in 1u64..100_000,
+            period_us in 1u64..200_000,
+            local in any::<u64>(),
+            attempt in any::<u32>(),
+        ) {
+            let detector = Detector {
+                interval: Duration::from_micros(interval_us),
+                margin: Duration::from_micros(margin_us),
+                ..macos_detector()
+            };
+            let span = Span {
+                span: Duration::from_micros(span_us),
+                election: Duration::from_micros(span_us),
+                split: 0.1,
+            };
+            let near = path_of(&[1]);
+            let ballot = Ballot::measure([&near], 2, Duration::ZERO, G).unwrap();
+            let period = Duration::from_micros(period_us);
+            let timing = ElectionTiming::derive(period, &detector, &span, &ballot);
+            let base = detector.interval + detector.margin;
+            let covered = period * timing.base_periods;
+            prop_assert!(covered >= base);
+            prop_assert!(timing.base_periods == 1 || covered < base + period);
+            let timeout = timing.timeout_periods(local, attempt);
+            prop_assert!(timeout >= timing.base_periods);
+            prop_assert!(timeout < timing.base_periods + timing.span_periods);
+            prop_assert!(timing.delay(local, attempt) < span.span);
+        }
+    }
+
+    /// The delays of many nodes spread uniformly over the span: the model `election_span` assumes.
+    #[test]
+    fn the_delays_are_uniform_over_the_span() {
+        let timing = wan_timing();
+        let span = nanos(timing.span);
+        let mut bins = [0u32; 10];
+        for local in 0..20_000u64 {
+            let delay = nanos(timing.delay(local.wrapping_mul(0x2545_f491_4f6c_dd1d), 0));
+            bins[usize::try_from(delay * 10 / span).unwrap()] += 1;
+        }
+        // 2,000 a bin; a bin past 2,000 ± 5σ (σ ≈ 42) is not uniform.
+        for bin in bins {
+            assert!((1_790..=2_210).contains(&bin), "{bins:?}");
+        }
+    }
+
+    /// One design: the timing derived from a link estimator's configured detector, with the
+    /// election its configuration was charged, lapses its leader at the period the estimator
+    /// suspects it, on a link whose heartbeats arrive with a constant delay.
+    #[test]
+    fn the_base_lapses_where_the_link_suspects() {
+        let interval = ms(50);
+        let granularity = ms(1);
+        let floors = Floors {
+            granularity,
+            sender: granularity,
+            correlation: interval,
+        };
+        let mut link =
+            LinkEstimator::new(interval, granularity, Some(Schedule { seq: 0, at_ns: 0 })).unwrap();
+        let delay = 2 * MS;
+        let mut seq = 0;
+        while seq < 200 {
+            link.on_heartbeat(seq, seq * 50 * MS + delay).unwrap();
+            seq += 1;
+        }
+        let paths = [path_of(&[4, 4, 4]), path_of(&[4, 4, 4])];
+        let ballot = Ballot::measure(&paths, 3, ms(1), granularity).unwrap();
+        let span = ballot.span(granularity).unwrap();
+        let costs = Costs {
+            election: span.election,
+            mtbf: Duration::from_secs(30 * 86_400),
+        };
+        let configured = link.configure(&costs, &floors).unwrap();
+        let timing = ElectionTiming::derive(granularity, &configured.current, &span, &ballot);
+        // The latest heartbeat arrived at `last`; the link trusts its sender until the next one's
+        // freshness point, `η + α` later on a link whose delays do not vary.
+        let last = (seq - 1) * 50 * MS + delay;
+        let until = link.deadline().unwrap();
+        assert_eq!(Duration::from_nanos(until - last), timing.base);
+        assert_eq!(link.poll(until - 1), None);
+        // The period-counting timer, one period a millisecond from the latest contact, lapses at
+        // the first period at or past the suspicion.
+        let mut timer = ElectionTimer::new();
+        let _ = timer.follower_period(1, &timing, 1, 0);
+        let lapsed = (1..=10_000u32)
+            .find(|_| timer.follower_period(1, &timing, 1, 0) != FollowerStep::Follow)
+            .unwrap();
+        assert_eq!(lapsed, timing.base_periods);
+        let lapsed_at = last + u64::from(lapsed) * MS;
+        assert!(lapsed_at >= until && lapsed_at < until + MS);
+        assert_eq!(link.poll(until), Some(crate::Event::Suspected));
+        // And the configurator was charged the election this timing runs.
+        assert_eq!(timing.election, costs.election);
+        let best = configure(&configured.link, &costs, &floors).unwrap();
+        assert_eq!(best, configured.best);
     }
 
     #[test]
     fn the_window_holds_a_repairs_worth_of_batches_on_the_slowest_path() {
         const BATCH: usize = 4_367;
-        assert_eq!(
-            ElectionTiming::floor().window_budget(HEARTBEAT, BATCH),
-            BATCH
-        );
-        let lan = derive(&[&path_of(&LOOPBACK_SAMPLES_MS)]);
+        let lan = timing_of(HEARTBEAT, &[&path_of(&LOOPBACK_SAMPLES_MS)], 3);
         assert_eq!(lan.window_budget(HEARTBEAT, BATCH), BATCH);
         let wan = path_of(&WAN_SAMPLES_MS);
-        let timing = derive(&[&wan]);
-        let tail = wan.tail_ns().unwrap();
+        let timing = timing_of(HEARTBEAT, &[&wan], 3);
+        let tail = wan.tail_ns(nanos(G)).unwrap();
         let batches = usize::try_from((2 * tail).div_ceil(HEARTBEAT)).unwrap();
         assert_eq!(timing.window_budget(HEARTBEAT, BATCH), BATCH * batches);
         assert!(batches >= 3);
     }
 
+    /// One stall of three answers moves the median path's priority nowhere and the smoothed one's
+    /// by seconds: the reason the priority orders voters by the median (`docs/timing.md` §2.6,
+    /// item 7).
     #[test]
-    fn the_span_follows_the_paths_variation_and_settles_to_the_floor() {
-        let early = path_of(&WAN_SAMPLES_MS);
-        let timing = derive(&[&early]);
-        let spread = early.spread_ns().unwrap();
-        assert!(spread > HEARTBEAT, "the early variation is above a period");
+    fn a_stall_reorders_no_voter_by_the_median_and_does_by_the_smoothed_estimate() {
+        let correlation = ms(150);
+        let probe = ms(50);
+        let mut median = PathRtt::new(correlation, probe).unwrap();
         assert_eq!(
-            timing.span_periods,
-            u32::try_from((10 * spread).div_ceil(HEARTBEAT)).unwrap()
+            median.window(),
+            7,
+            "three late in a stall, seven to outvote them"
         );
-        let mut settled = ExchangeRtt::new();
-        for sample in WAN_SETTLED_CYCLE_MS.iter().cycle().take(40) {
-            settled.on_sample(sample * MS);
-        }
-        let converged = derive(&[&settled]);
-        assert!(settled.spread_ns().unwrap() < HEARTBEAT);
-        assert_eq!(converged.span_periods, 10);
-        assert!(converged.base_periods > 10);
-    }
-
-    #[test]
-    fn the_slowest_voter_path_bounds_the_broadcast() {
-        let near = path_of(&LOOPBACK_SAMPLES_MS);
-        let far = path_of(&WAN_SAMPLES_MS);
-        let mixed = derive(&[&near, &far]);
-        let far_only = derive(&[&far]);
-        assert_eq!(mixed.base_periods, far_only.base_periods);
-        assert_eq!(mixed.broadcast_rtt_tail_ns, far.tail_ns().unwrap());
-        assert_eq!(mixed.samples, near.samples() + far.samples());
-    }
-
-    #[test]
-    fn a_voter_without_a_sample_contributes_nothing() {
-        let fresh = ExchangeRtt::new();
-        let lan = path_of(&LOOPBACK_SAMPLES_MS);
-        let timing = derive(&[&fresh, &lan]);
-        assert_eq!(timing.base_periods, 10);
-        assert_eq!(fresh.tail_ns(), None);
-    }
-
-    /// The law takes either estimator. A path that answered three probes seconds late moves the
-    /// RFC 9002 estimate's tail by seconds and the median and MAD's not at all: the difference the
-    /// timed simulation of note 32 §3.7 weighs.
-    #[test]
-    fn the_law_takes_either_estimator_and_late_answers_move_only_the_smoothed_one() {
-        let mut median = PathRtt::new();
         let mut smoothed = ExchangeRtt::new();
-        for _ in 0..crate::PATH_WINDOW {
+        for _ in 0..median.window() {
             median.on_sample(5 * MS);
             smoothed.on_sample(5 * MS);
         }
+        let g = nanos(G);
+        let before = quorum_priority([Some(&median), Some(&median)], 3, g);
         for late in [2_900, 1_400, 800] {
             median.on_sample(late * MS);
             smoothed.on_sample(late * MS);
         }
-        let by_median = ElectionTiming::derive(HEARTBEAT, 0, [&median]);
-        let by_smoothed = ElectionTiming::derive(HEARTBEAT, 0, [&smoothed]);
         assert_eq!(
-            by_median.base_periods, 10,
-            "three late answers of 16 move nothing"
+            quorum_priority([Some(&median), Some(&median)], 3, g),
+            before
         );
-        assert!(
-            by_smoothed.base_periods > 100,
-            "the smoothed tail carries the late answers: {}",
-            by_smoothed.base_periods
-        );
+        let moved = quorum_priority([Some(&smoothed), Some(&smoothed)], 3, g);
+        assert!(moved.quorum_ns > 500 * MS, "{moved:?}");
     }
 
     fn ages_without_firing(
@@ -565,7 +805,7 @@ mod tests {
 
     #[test]
     fn a_follower_campaigns_after_its_jittered_timeout() {
-        let timing = ElectionTiming::floor();
+        let timing = wan_timing();
         let local = 3;
         let timeout = timing.timeout_periods(local, 0);
         assert!(
@@ -588,7 +828,7 @@ mod tests {
 
     #[test]
     fn contact_resets_the_follower_and_the_next_attempt_draws_afresh() {
-        let timing = ElectionTiming::floor();
+        let timing = wan_timing();
         let local = 3;
         let mut timer = ElectionTimer::new();
         let first = timing.timeout_periods(local, 0);
@@ -623,21 +863,23 @@ mod tests {
         );
     }
 
-    /// Over every pair of 32 ids and every attempt offset (4,960 trials of 64 shared attempts),
-    /// independent draws collide about once in `span`: a mean of 6.4 per 64, and a maximum of 24 has
-    /// probability 2.2 × 10⁻⁵ (slates' derivation).
+    /// Over every pair of 32 ids and every attempt offset, independent draws collide about once in
+    /// `span` shared attempts, as slates derived for a span of ten: here the span is the WAN
+    /// group's, in 1 ms periods, and the expected collisions in 64 attempts `64 / span`.
     #[test]
     fn two_nodes_draws_stay_independent_across_shared_attempts() {
-        let timing = ElectionTiming::floor();
+        let timing = wan_timing();
+        let span = timing.span_periods;
+        assert!(span > 10, "the WAN span resolves in 1 ms periods: {span}");
         let ids: Vec<u64> = (1..=16)
             .chain((1..=16).map(|seed: u64| seed.wrapping_mul(0x2545_f491_4f6c_dd1d)))
             .collect();
         let mut worst = 0;
-        let mut total = 0;
-        let mut trials = 0;
+        let mut total = 0u64;
+        let mut trials = 0u64;
         for (index, left) in ids.iter().enumerate() {
             for right in ids.iter().skip(index + 1) {
-                for offset in 0..timing.span_periods {
+                for offset in 0..8 {
                     let collisions = (0..64u32)
                         .filter(|attempt| {
                             timing.timeout_periods(*left, *attempt)
@@ -645,37 +887,40 @@ mod tests {
                         })
                         .count();
                     worst = worst.max(collisions);
-                    total += collisions;
+                    total += collisions as u64;
                     trials += 1;
                 }
             }
         }
+        // Binomial(64, 1/span): a pair that collides on more than eight is not independent.
         assert!(
-            worst < 24,
+            worst <= 8,
             "a pair collided on {worst} of 64 shared attempts"
         );
-        let mean_tenths = total * 10 / trials;
+        let expected = 64.0 / f64::from(span);
+        let mean = total as f64 / trials as f64;
         assert!(
-            (54..=74).contains(&mean_tenths),
-            "{mean_tenths} tenths per 64"
+            (mean - expected).abs() < expected / 2.0,
+            "{mean} against {expected}"
         );
     }
 
     #[test]
     fn a_leader_checks_its_quorum_every_base_period() {
-        let floor = ElectionTiming::floor();
+        let timing = timing_of(10 * MS, &[&path_of(&LOOPBACK_SAMPLES_MS)], 3);
         let mut timer = ElectionTimer::new();
-        let fired = (1..=20).filter(|_| timer.leader_period(&floor)).count();
-        assert_eq!(fired, 2);
-        let wan = derive(&[&path_of(&WAN_SAMPLES_MS)]);
+        let fired = (1..=10 * timing.base_periods)
+            .filter(|_| timer.leader_period(&timing))
+            .count();
+        assert_eq!(fired, 10);
         let mut timer = ElectionTimer::new();
-        let first = (1..=100).find(|_| timer.leader_period(&wan)).unwrap();
-        assert_eq!(first, wan.base_periods);
+        let first = (1..=1_000).find(|_| timer.leader_period(&timing)).unwrap();
+        assert_eq!(first, timing.base_periods);
     }
 
     #[test]
     fn a_follower_yields_one_timeout_per_rank() {
-        let timing = ElectionTiming::floor();
+        let timing = wan_timing();
         let local = 9;
         let mut timer = ElectionTimer::new();
         let mut fired = Vec::new();
@@ -689,7 +934,7 @@ mod tests {
                     fired.push(campaign);
                     break;
                 }
-                assert!(periods < 1_000);
+                assert!(periods < 10_000);
             }
         }
         assert_eq!(fired, vec![false, false, true]);
@@ -702,13 +947,13 @@ mod tests {
         let mut periods = 0;
         while rank_zero.follower_period(0, &timing, local, 0) != FollowerStep::Campaign {
             periods += 1;
-            assert!(periods < 1_000);
+            assert!(periods < 10_000);
         }
     }
 
     #[test]
     fn a_followers_lease_lapses_at_the_minimum_election_timeout() {
-        let timing = ElectionTiming::floor();
+        let timing = wan_timing();
         let local = 9;
         let mut timer = ElectionTimer::new();
         let steps: Vec<FollowerStep> = (1..=timing.base_periods)
@@ -724,13 +969,9 @@ mod tests {
                 FollowerStep::Campaign => break,
                 step => assert_eq!(step, FollowerStep::LeaderLapsed, "period {periods}"),
             }
-            assert!(periods < 1_000);
+            assert!(periods < 10_000);
         }
         assert_eq!(timer.yielded(), 2);
-        assert_eq!(
-            timer.follower_period(1, &timing, local, 2),
-            FollowerStep::Follow
-        );
         assert_eq!(
             timer.follower_period(1, &timing, local, 2),
             FollowerStep::Follow
@@ -746,20 +987,21 @@ mod tests {
             }
             path
         };
+        let g = nanos(G);
         let near = path(72);
         let middle = path(162);
         let far = path(262);
-        let three = quorum_priority([Some(&middle), Some(&near)], 3);
+        let three = quorum_priority([Some(&middle), Some(&near)], 3, g);
         assert_eq!(three.quorum_ns, near.smoothed_ns());
-        assert_eq!(Some(three.spread_ns), near.spread_ns());
-        let five = quorum_priority([Some(&far), None, Some(&near), Some(&middle)], 5);
+        assert_eq!(Some(three.spread_ns), near.spread_ns(g));
+        let five = quorum_priority([Some(&far), None, Some(&near), Some(&middle)], 5, g);
         assert_eq!(five.quorum_ns, middle.smoothed_ns());
         assert_eq!(
-            quorum_priority([None, None, Some(&near), None], 5),
+            quorum_priority([None, None, Some(&near), None], 5, g),
             ElectionPriority::default()
         );
         assert_eq!(
-            quorum_priority::<ExchangeRtt>(std::iter::empty(), 1),
+            quorum_priority::<ExchangeRtt>(std::iter::empty(), 1, g),
             ElectionPriority::default()
         );
     }
@@ -774,6 +1016,7 @@ mod tests {
             state ^= state << 17;
             state
         };
+        let g = nanos(G);
         for _ in 0..2_000 {
             let voters = usize::try_from(next() % 9).unwrap() + 1;
             let paths: Vec<Option<ExchangeRtt>> = (1..voters)
@@ -792,7 +1035,7 @@ mod tests {
             let mut sorted: Vec<(u64, u64)> = paths
                 .iter()
                 .flatten()
-                .filter_map(|p| p.spread_ns().map(|spread| (p.smoothed_ns(), spread)))
+                .filter_map(|p| p.spread_ns(g).map(|spread| (p.smoothed_ns(), spread)))
                 .collect();
             sorted.sort_unstable();
             let expected = (voters / 2)
@@ -805,8 +1048,24 @@ mod tests {
                     }
                 });
             assert_eq!(
-                quorum_priority(paths.iter().map(Option::as_ref), voters),
+                quorum_priority(paths.iter().map(Option::as_ref), voters, g),
                 expected
+            );
+            // And the ballot's quorum round is the same counted rank over the means.
+            let mut means: Vec<u64> = paths
+                .iter()
+                .flatten()
+                .map(ExchangeRtt::smoothed_ns)
+                .collect();
+            means.sort_unstable();
+            let ballot = Ballot::measure(paths.iter().flatten(), voters, Duration::ZERO, G);
+            let quorum = (voters / 2)
+                .checked_sub(1)
+                .and_then(|p| means.get(p))
+                .copied();
+            assert_eq!(
+                ballot.map(|b| nanos(b.round)),
+                quorum.filter(|_| voters >= 2)
             );
         }
     }
@@ -834,9 +1093,9 @@ mod tests {
         );
     }
 
-    /// slates' round-budget cases under the unified law, with slates' ceiling: the deadline plus
-    /// [`ELECTION_MARGIN`] periods, so a measured round is exactly slates' budget. An unmeasured
-    /// round is given the whole ceiling, as focal's law gives it.
+    /// slates' round-budget cases under the unified law, with the ceiling the election timing
+    /// gives: the base election timeout, so a round never outlasts the timeout it would displace a
+    /// leader over. An unmeasured round is given the whole ceiling, as focal's law gives it.
     #[test]
     fn a_round_budget_opens_to_the_measured_tail_within_its_ceiling() {
         let anchors = RoundAnchors {
@@ -845,23 +1104,28 @@ mod tests {
             polls_per_period: 10,
             lookahead: (3, 4),
         };
-        let ceiling =
-            |tail: Option<u64>| HEARTBEAT.max(tail.unwrap_or(0)) + ELECTION_MARGIN * HEARTBEAT;
+        let g = nanos(G);
+        let lan = path_of(&LOOPBACK_SAMPLES_MS);
+        let timing = timing_of(HEARTBEAT, &[&lan], 3);
+        let ceiling = HEARTBEAT * u64::from(timing.base_periods);
         assert_eq!(anchors.poll_interval_ns(), HEARTBEAT / 10);
-        let lan_tail = path_of(&LOOPBACK_SAMPLES_MS).tail_ns();
-        let lan = RoundBudget::derive(&anchors, lan_tail, ceiling(lan_tail));
+        let budget = RoundBudget::derive(&anchors, lan.tail_ns(g), ceiling);
         assert_eq!(
-            lan.deadline_ns, HEARTBEAT,
+            budget.deadline_ns, HEARTBEAT,
             "a tail inside a period changes nothing"
         );
-        assert_eq!(lan.max_deadline_ns(), HEARTBEAT + 10 * HEARTBEAT);
-        assert_eq!(lan.stall_window_ns, 2 * HEARTBEAT);
-        let wan = path_of(&WAN_SAMPLES_MS).tail_ns();
-        let far = RoundBudget::derive(&anchors, wan, ceiling(wan));
+        assert_eq!(
+            budget.max_deadline_ns(),
+            ceiling,
+            "extended to the base, no further"
+        );
+        assert_eq!(budget.stall_window_ns, 2 * HEARTBEAT);
+        let wan = path_of(&WAN_SAMPLES_MS).tail_ns(g);
+        let far = RoundBudget::derive(&anchors, wan, 10 * ceiling);
         assert_eq!(far.deadline_ns, wan.unwrap(), "the base opens to the tail");
-        assert_eq!(far.max_deadline_ns(), wan.unwrap() + 10 * HEARTBEAT);
-        let unmeasured = RoundBudget::derive(&anchors, None, ceiling(None));
-        assert_eq!(unmeasured.deadline_ns, ceiling(None));
+        assert!(far.max_deadline_ns() <= 10 * ceiling);
+        let unmeasured = RoundBudget::derive(&anchors, None, ceiling);
+        assert_eq!(unmeasured.deadline_ns, ceiling);
         assert_eq!(unmeasured.max_extensions, 0);
     }
 }

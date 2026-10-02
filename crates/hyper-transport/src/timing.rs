@@ -33,9 +33,11 @@ impl PeerTiming {
         self.abandoned = self.abandoned.saturating_add(1).min(MAX_DOUBLINGS);
     }
     /// The tail of the exchanges the peer answered, doubled for each given up on since; `None`
-    /// while it has answered none.
-    pub(crate) fn tail(&self) -> Option<Duration> {
-        let tail = self.taken.tail_ns()?;
+    /// while it has answered none. `granularity` is the caller's measured timer granularity
+    /// (`hyper_timing::Lateness`), RFC 9002's `kGranularity` under the variation term.
+    pub(crate) fn tail(&self, granularity: Duration) -> Option<Duration> {
+        let granularity_ns = u64::try_from(granularity.as_nanos()).unwrap_or(u64::MAX);
+        let tail = self.taken.tail_ns(granularity_ns)?;
         let factor = 1u64.checked_shl(self.abandoned)?;
         Some(Duration::from_nanos(tail.saturating_mul(factor)))
     }
@@ -87,21 +89,22 @@ mod tests {
     /// an answer resets it; without focal's cap of six.
     #[test]
     fn an_abandoned_exchange_doubles_what_the_peer_is_expected_to_take() {
+        let g = Duration::from_micros(45);
         let mut timing = PeerTiming::default();
-        assert_eq!(timing.tail(), None);
+        assert_eq!(timing.tail(g), None);
         timing.answered(Duration::from_millis(10));
-        let tail = timing.tail().unwrap();
+        let tail = timing.tail(g).unwrap();
         timing.abandoned();
-        assert_eq!(timing.tail(), Some(tail * 2));
+        assert_eq!(timing.tail(g), Some(tail * 2));
         for _ in 0..7 {
             timing.abandoned();
         }
-        assert_eq!(timing.tail(), Some(tail * 256));
+        assert_eq!(timing.tail(g), Some(tail * 256));
         for _ in 0..100 {
             timing.abandoned();
         }
-        assert_eq!(timing.tail(), Some(Duration::from_nanos(u64::MAX)));
+        assert_eq!(timing.tail(g), Some(Duration::from_nanos(u64::MAX)));
         timing.answered(Duration::from_millis(10));
-        assert!(timing.tail().unwrap() < tail * 2);
+        assert!(timing.tail(g).unwrap() < tail * 2);
     }
 }

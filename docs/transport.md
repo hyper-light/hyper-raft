@@ -193,7 +193,7 @@ each ported test's origin, and what was left out).
   `handle_timeout` and `poll_event`, every one taking the caller's `now`; its owner calls `connect`,
   `disconnect`, `open`, `head`, `write_body`, `read_body`, `body_complete`, `reply`, `end`,
   `reserve`, `release`, `send_frame`, `export_keying_material`, `path`, `credit`, `exchange_tail`
-  and `stats`.
+  (over the caller's measured timer granularity) and `stats`.
 - Events: `Connected { peer, role, epoch }`, `Request`, `Reply`, `BodyReady`, `Writable`,
   `Frame { peer, lane, kind, frame }`, `Refused { exchange, refusal, by_peer }`,
   `Closed { peer, epoch }`, `Unreachable`.

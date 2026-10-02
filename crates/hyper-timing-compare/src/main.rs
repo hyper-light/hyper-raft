@@ -12,7 +12,15 @@
 //! budget derived, and a follower's period of the election timer. Each implementation runs the
 //! operations it has:
 //!
-//! - **hyper**: hyper-timing, this repository's.
+//! - **hyper**: hyper-timing, this repository's. Its election timing from the paths is L-1's law
+//!   (`docs/timing.md` §2.3): the ballot, the split-vote span's search and the timing from the
+//!   link's configured detector; `ballot`, `span` and `timing` are its three steps alone, `timing`
+//!   from a ballot and span held since the paths last changed. Its paths' window is derived from the link's correlation time, 50 ms
+//!   as macOS measured it, at the 10 ms heartbeat: eleven. Its tails take macOS's measured
+//!   granularity, 45 µs.
+//!
+//!   The same harness built at `35d35d8`, before L-1's election law, measures that law under the
+//!   name `hyper` (`docs/benchmarks.md`, "Commands for the timing").
 //! - **focal**: focal-timing at `a8e95f7`, the source of hyper-timing's paths, pace and rounds.
 //! - **slates**: slates-cluster's `timing.rs` at `5cce86a`, the source of hyper-timing's election
 //!   timing, priority and timer.
@@ -52,10 +60,13 @@ const ROUND_TRIPS: [u64; 8] = [
     41_000_000, 43_500_000, 39_800_000, 47_200_000, 40_100_000, 44_900_000, 42_300_000, 58_000_000,
 ];
 /// The operations and the implementations that have each.
-const OPERATIONS: [(&str, &[&str]); 7] = [
+const OPERATIONS: [(&str, &[&str]); 10] = [
     ("sample", &["hyper", "focal", "slates"]),
     ("tail", &["hyper", "focal", "slates"]),
     ("election", &["hyper", "slates"]),
+    ("ballot", &["hyper"]),
+    ("span", &["hyper"]),
+    ("timing", &["hyper"]),
     ("priority", &["hyper", "slates"]),
     ("pace", &["hyper", "focal"]),
     ("round", &["hyper", "focal", "slates"]),
@@ -85,10 +96,10 @@ fn round_trip(index: u64) -> u64 {
 }
 
 /// Four paths fed the round trips, each from its own offset.
-fn paths<P: Default>(sample: impl Fn(&mut P, u64)) -> Vec<P> {
+fn paths<P>(new: impl Fn() -> P, sample: impl Fn(&mut P, u64)) -> Vec<P> {
     (0..VOTERS as u64 - 1)
         .map(|path| {
-            let mut estimate = P::default();
+            let mut estimate = new();
             for index in 0..ROUND_TRIPS.len() as u64 * 2 {
                 sample(&mut estimate, round_trip(index + path));
             }
@@ -100,41 +111,97 @@ fn paths<P: Default>(sample: impl Fn(&mut P, u64)) -> Vec<P> {
 mod hyper {
     use super::*;
     use hyper_timing::{
-        ElectionTimer, ElectionTiming, PathRtt, RoundAnchors, RoundBudget, TickPace,
-        quorum_priority,
+        Ballot, Costs, ElectionTimer, ElectionTiming, Floors, LinkBehaviour, PathRtt, RoundAnchors,
+        RoundBudget, TickPace, configure, quorum_priority,
     };
 
+    /// The correlation time macOS measured at 100 µs heartbeats (`docs/timing.md` §2.6, item 6).
+    const CORRELATION: Duration = Duration::from_millis(50);
+    /// The granularity macOS measured at a 40 µs wait (`docs/timing.md` §2.4).
+    const GRANULARITY: Duration = Duration::from_micros(45);
+
     pub fn run(operation: &str, iterations: u64) -> (f64, f64) {
-        let paths = paths(|path: &mut PathRtt, rtt| path.on_sample(rtt));
+        let heartbeat = Duration::from_nanos(HEARTBEAT_NS);
+        let g = GRANULARITY.as_nanos() as u64;
+        let paths = paths(
+            || PathRtt::new(CORRELATION, heartbeat).unwrap(),
+            |path: &mut PathRtt, rtt| path.on_sample(rtt),
+        );
         let anchors = RoundAnchors {
             heartbeat_ns: HEARTBEAT_NS,
             stall_periods: 6,
             polls_per_period: 4,
             lookahead: (3, 4),
         };
+        let ballot = Ballot::measure(&paths, VOTERS, Duration::ZERO, GRANULARITY).unwrap();
+        let span = ballot.span(GRANULARITY).unwrap();
+        // The link to the leader, as the paths see it one way, configured once.
+        let link = LinkBehaviour {
+            loss: 1e-5,
+            mean_delay: ballot.latency,
+            delay_deviation: Duration::from_millis(2),
+        };
+        let costs = Costs {
+            election: span.election,
+            mtbf: Duration::from_secs(30 * 86_400),
+        };
+        let floors = Floors {
+            granularity: GRANULARITY,
+            sender: GRANULARITY,
+            correlation: CORRELATION,
+        };
+        let detector = configure(&link, &costs, &floors).unwrap();
+        let timing = ElectionTiming::derive(heartbeat, &detector, &span, &ballot);
         match operation {
             "sample" => {
-                let mut path = PathRtt::new();
+                let mut path = PathRtt::new(CORRELATION, heartbeat).unwrap();
                 measure(iterations, |index| {
                     path.on_sample(black_box(round_trip(index)));
                     black_box(&path);
                 })
             }
             "tail" => measure(iterations, |index| {
-                black_box(paths[(index as usize) % paths.len()].tail_ns());
+                black_box(paths[(index as usize) % paths.len()].tail_ns(g));
             }),
             "election" => measure(iterations, |_| {
-                black_box(ElectionTiming::derive(HEARTBEAT_NS, 0, black_box(&paths)));
+                let ballot =
+                    Ballot::measure(black_box(&paths), VOTERS, Duration::ZERO, GRANULARITY)
+                        .unwrap();
+                let span = ballot.span(GRANULARITY).unwrap();
+                black_box(ElectionTiming::derive(heartbeat, &detector, &span, &ballot));
+            }),
+            "ballot" => measure(iterations, |_| {
+                black_box(Ballot::measure(
+                    black_box(&paths),
+                    VOTERS,
+                    Duration::ZERO,
+                    GRANULARITY,
+                ));
+            }),
+            "span" => measure(iterations, |_| {
+                black_box(black_box(&ballot).span(GRANULARITY));
+            }),
+            "timing" => measure(iterations, |_| {
+                black_box(ElectionTiming::derive(
+                    heartbeat,
+                    black_box(&detector),
+                    black_box(&span),
+                    black_box(&ballot),
+                ));
             }),
             "priority" => measure(iterations, |_| {
-                black_box(quorum_priority(black_box(&paths).iter().map(Some), VOTERS));
+                black_box(quorum_priority(
+                    black_box(&paths).iter().map(Some),
+                    VOTERS,
+                    g,
+                ));
             }),
             "pace" => measure(iterations, |_| {
                 black_box(TickPace::derive(
-                    Duration::from_nanos(HEARTBEAT_NS),
+                    heartbeat,
                     Duration::from_secs(1),
                     10,
-                    black_box(&paths),
+                    black_box(&timing),
                 ));
             }),
             "round" => measure(iterations, |index| {
@@ -145,7 +212,6 @@ mod hyper {
                 ));
             }),
             "follower" => {
-                let timing = ElectionTiming::derive(HEARTBEAT_NS, 0, &paths);
                 let mut timer = ElectionTimer::new();
                 measure(iterations, |index| {
                     let _ = black_box(timer.follower_period(index / 4, &timing, 1, 0));
@@ -161,7 +227,9 @@ mod focal {
     use focal_timing::{PathRtt, RoundBudget, TickPace};
 
     pub fn run(operation: &str, iterations: u64) -> (f64, f64) {
-        let paths = paths(|path: &mut PathRtt, rtt| path.on_sample(rtt));
+        let paths = paths(PathRtt::default, |path: &mut PathRtt, rtt| {
+            path.on_sample(rtt)
+        });
         match operation {
             "sample" => {
                 let mut path = PathRtt::new();
@@ -201,7 +269,9 @@ mod slates {
     use slates_db::register::HostId;
 
     pub fn run(operation: &str, iterations: u64) -> (f64, f64) {
-        let paths = paths(|path: &mut PathRtt, rtt| path.on_sample(rtt));
+        let paths = paths(PathRtt::default, |path: &mut PathRtt, rtt| {
+            path.on_sample(rtt)
+        });
         let anchors = RoundAnchors {
             heartbeat_ns: HEARTBEAT_NS,
             stall_periods: 6,

@@ -148,7 +148,23 @@ exceedances alone, and the `⌊θN⌋ − 1` longest of those times separate the
 
 **Rousseeuw and Croux, "Alternatives to the median absolute deviation", JASA 88(424), 1993.**
 `1.4826 · MAD` estimates `σ` consistently for normal data; for a distribution with a heavy tail it
-estimates the spread of the body, not the variance.
+estimates the spread of the body, not the variance. The MAD has the best possible breakdown point,
+50 %, as the median has.
+
+**Hampel, "A general qualitative definition of robustness", Annals of Mathematical Statistics
+42(6), 1971, pp. 1887–1896.** Defines the breakdown point, the share of a sample that can be moved
+arbitrarily far before the estimate is; the median's is one half. `PathRtt`'s window is the
+shortest whose median the late probes of one stall cannot move: `2k + 1` for `k` late.
+
+**RFC 9002 (Iyengar, Swett), QUIC Loss Detection and Congestion Control, Appendix A.2 and §6.1.2
+(read 2026-10-01).** "kGranularity: Timer granularity. This is a system-dependent value, and
+Section 6.1.2 recommends a value of 1 ms." The 1 ms is a recommendation for a timer the RFC cannot
+see; hyper-timing's tails take the owner's measured lateness instead.
+
+**RFC 5905, §8, On-Wire Protocol (read 2026-10-01).** The offset `θ = ½[(T2 − T1) + (T3 − T4)]` and
+round-trip delay `δ = (T4 − T1) − (T3 − T2)`: halving the round trip is exact only on a path whose
+two directions take equally long, which the formula takes without stating. The ballot's one-way
+latency is half a measured round trip on the same footing.
 
 **Lindley, "The theory of queues with a single server", Proc. Cambridge Philos. Soc. 48(2), 1952,
 pp. 277–289.** A single server fed at regular intervals `η` with independent service times `S`

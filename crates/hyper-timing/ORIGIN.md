@@ -37,7 +37,8 @@
 6. **One round-budget law.** `RoundBudget::derive(&RoundAnchors, tail_ns, ceiling_ns)` replaces
    focal's `derive(period, tail, ceiling)` and slates' `round_budget(anchors, tail)`.
    - From focal: the caller's ceiling bounds everything; an unmeasured round gets the whole ceiling,
-     hard; and extensions are capped at `ELECTION_MARGIN` and at the room left under the ceiling.
+     hard; and extensions were capped at `ELECTION_MARGIN` and at the room left under the ceiling
+     (the first cap went in change 9).
    - From slates: the stall window is `stall_periods` periods (derived from the SWIM suspicion span,
      where focal fixed it at two), the lookahead and poll rate come from the anchors, and
      `RoundAnchors::poll_interval_ns` is kept.
@@ -69,7 +70,37 @@
      variance over the history, the Jeffreys loss, the unseen-delay term, freshness and suspicion.
    - `src/folds.rs`: the timer-lateness, flush and exposure folds.
 
+9. **The election law from measurement** (`docs/timing.md` §2.3, "The election law"; L-1).
+   - `ELECTION_MARGIN`, `PATH_WINDOW` and `GRANULARITY_NS` are gone.
+   - `Ballot` measures a group's election from the voters' paths: the one-way latency (half the
+     slowest mean round trip), the vote round (the quorum's mean round trip plus the mean flush)
+     and the broadcast tail; `Ballot::span` is `election_span` on it.
+   - `ElectionTiming::derive(period, &Detector, &Span, &Ballot)` replaces `derive(heartbeat_ns,
+     durable_tail_ns, paths)`: the base is the configured detector's `η + α`, the span `W`, both in
+     whole periods, with the detection bound, `T_E` and the broadcast tail beside them.
+     `ElectionTiming::floor` is gone: nothing measured, no timing (`docs/timing.md` §3, item 10).
+     `ElectionTiming::delay` draws the same jitter in time on `[0, W)`.
+   - `TickPace::derive(configured, ceiling, election_tick, &ElectionTiming)` replaces the paths
+     argument; its period covers the longer of the base and the span. `broadcast_tail_ns` becomes
+     `covered`.
+   - `PathRtt::new(correlation, interval)` derives the window, `2·max(1, ⌈T_c/p⌉) + 1`, and allocates
+     its two buffers once; it is no longer `Copy` or `Default`. `PathRtt::mean_ns` is new.
+   - `tail_ns`, `spread_ns` and `quorum_priority` take the measured granularity; `PathEstimate` has
+     `mean_ns`.
+   - `RoundBudget::derive` no longer caps extensions at `ELECTION_MARGIN`: the ceiling bounds them.
+   - `quorum_priority` stops counting a rank once it passes the position, and ranks the paths on
+     their spread without the granularity floor, applied once to the path chosen (the floored
+     spread never falls as the unfloored one rises, so the choice is the same): even with the law
+     before on the same samples (`docs/benchmarks.md`, "hyper-timing").
+   - Tests: the window against sorting at every derived window and against a stall of `k` and
+     `k + 1` (property), the ballot's latency, round and availability, its refusals, the span as the
+     ballot's `election_span`, the base in whole periods and its rounding (property), the delay's
+     range (property) and uniformity, the base lapsing at the period the link estimator suspects,
+     the priority unmoved by a stall, slates' timer tests on the derived timing; and the allocation
+     law over every operation of the law (`tests/alloc.rs`).
+
 ## Planned
 
-- **The estimator that feeds election timing** is decided by the timed simulation in note 32 §3.7,
-  with the judged outputs fixed before the run.
+- **The estimator that feeds the priority** stays the median (`docs/timing.md` §2.6, item 7); the
+  base and span no longer read a path's tail. Whether `PathRtt` or `ExchangeRtt` feeds the ballot's
+  means is for the timed simulation in note 32 §3.7, with the judged outputs fixed before the run.

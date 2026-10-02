@@ -17,10 +17,11 @@ minute, and per-group heartbeats grow with the number of groups, not the number 
 a group's timing from it, and is the place this design lands: its `PathEstimate` trait, the
 durable-acknowledgement tail it adds to a path's round trip (mantle audit §11.7), its election
 timer counted in the owner's periods so a starved node waits instead of campaigning, its election
-priority and its window budget (`REPAIR_ROUND_TRIPS`, a protocol fact) stay. What goes are its
-picked numbers: `ELECTION_MARGIN = 10` (Raft's "order of magnitude" read as a multiplier, for the
-base and the span alike), `PATH_WINDOW = 16`, and `GRANULARITY_NS`, RFC 9002's 1 ms, which is
-QUIC's assumption and not this machine's timer.
+priority and its window budget (`REPAIR_ROUND_TRIPS`, a protocol fact) stay. Its picked numbers
+went in L-1 (§2.3, "The election law"): `ELECTION_MARGIN = 10` (Raft's "order of magnitude" read
+as a multiplier, for the base and the span alike, and a cap on a round's extensions),
+`PATH_WINDOW = 16`, and `GRANULARITY_NS`, RFC 9002's 1 ms, which is QUIC's assumption and not this
+machine's timer.
 
 ## 2. The design
 
@@ -81,6 +82,51 @@ first candidate. hyper-raft takes the `W` that minimizes it, with `l` and the vo
 broadcast: round trip and flush) measured per link. Ongaro's "10–20× the one-way latency" is a
 rule of thumb from the same formula; L-1 computes the optimum on his assumptions and checks it
 against his figures before any measured link relies on it.
+
+**The election law** (`crates/hyper-timing/src/election.rs`) is the detector and the span, one
+design, with nothing picked between them:
+- **The ballot.** From a voter's measured paths to the others: `l` is half the slowest path's mean
+  round trip (a round trip is what one clock measures; half of it is a symmetric path's one-way
+  delay, the half NTP's offset takes, RFC 5905 §8), and the vote round is the candidate's quorum,
+  the `⌊n/2⌋`-th smallest mean round trip, plus the mean flush a voter makes its vote durable in (Raft's
+  `votedFor` is persistent, Figure 2; `Flushes`). Means, because `T_E` is an expectation. The span
+  is chosen for `s = n − 1`, the voters left when the leader's node crashed, which is the case the
+  detector exists for; a group of two, whose survivor is no majority, for `s = n`. No ballot before
+  a quorum's paths are measured, and none for a sole voter.
+- **The span** `W` is `election_span` on the ballot, searched to within `G`. Its `T_E` is the
+  election cost the detector's configurator is charged (`Costs::election`), so `η` and `α` are
+  chosen knowing what an election costs this group, and the election waits only as long as that
+  choice assumed.
+- **The base** is when the follower's detector of the leader's node suspects it: NFD-E trusts the
+  sender until the next heartbeat's freshness point, `η + α` past the latest heartbeat (exactly, on
+  a link whose delay does not vary: `the_base_lapses_where_the_link_suspects`), for the detector
+  in force on the link (`Configuration::current`). A follower silent that long has lost its leader,
+  as its detector says; a leader judges its quorum on the same cadence. A crash is detected within
+  `E(D) + α + η`.
+- **Periods.** A core that counts its owner's periods takes the base and the span rounded up to
+  whole periods, so its base never ends before the detector would suspect, and a starved owner
+  waits instead of campaigning. An owner whose period is longer than `W` cannot resolve the span
+  in periods (one period of jitter; the owners' unsynchronized phases spread their campaigns), so
+  the same draw is given in time, uniform on `[0, W)` (`ElectionTiming::delay`), for the core of
+  L-2 that campaigns on its detector's suspicion and waits to the owner's `G`. A core whose tick
+  counts are fixed when it opens draws its timeout from `[election_tick, 2·election_tick)` ticks,
+  one count for both base and span, so its period covers the longer of the two (`TickPace`).
+- **The granularity** under every tail (`PathRtt`, `ExchangeRtt`: RFC 9002 §6.2.1's
+  `max(4·rttvar, kGranularity)`, whose Appendix A.2 defines `kGranularity` as "Timer granularity.
+  This is a system-dependent value" and §6.1.2 recommends 1 ms for it) is the owner's measured
+  `G`, passed in. hyper-transport's `exchange_tail` takes it from its caller.
+- **A round's extensions** were capped at `ELECTION_MARGIN`, "so a round never outlasts the
+  election timeout it would displace a leader over". The ceiling already bounds a round, so a round
+  with that purpose takes the base as its ceiling and the cap goes.
+- **What stays.** `REPAIR_ROUND_TRIPS = 2` is a protocol fact, not a tunable: Raft's consistency
+  check (§5.3) makes a follower refuse the batch after a lost one rather than buffer it, so the
+  repair is that refusal reaching the leader and the resend reaching the follower, and no shorter
+  or longer one exists. RFC 9002's gains and its `4·rttvar` are the standard's constants, cited.
+
+On the comparison workload (five voters, four WAN paths of 40–58 ms, a 10 ms heartbeat, macOS's
+`G` and `T_c`), the law before L-1 gave a base of `10 × tail` and a span of `10 × spread`; the law
+now gives the base from the detector and the span from the ballot (`docs/benchmarks.md`,
+"hyper-timing against focal-timing and slates' timing", has the values and the costs).
 
 ### 2.4 The local clock and the local machine
 
@@ -154,9 +200,14 @@ every run with a tail, making mistakes 26 (macOS flush) to 880 (macOS at 50 µs)
 than their bound promised (the table in `docs/benchmarks.md`). The late answers are delay the
 detector must cover in its accounting: a suspicion during a stall costs an election whether or not
 the stall is later called a failure, so it belongs in `U`'s second term, whose bound needs the true
-variance. `PathRtt`'s median and MAD stay where they are, in the election timing, whose purpose is
-the opposite (one late answer must not move a group's timeout); the detector's estimator is a
-separate `PathEstimate` over mean and variance.
+variance. `PathRtt`'s median and MAD stay where the purpose is the opposite, ordering voters (the
+election priority), where one stall must not reorder a group; the base and the span now come from
+the detector and from means (§2.3, "The election law"). Its window is the shortest whose median one
+stall cannot move: a stall shorter than `T_c` (item 6) makes at most `k = max(1, ⌈T_c/p⌉)`
+consecutive probes at interval `p` late, and the median of `2k + 1` outvotes `k` (its breakdown
+point is one half: Hampel 1971; Rousseeuw and Croux 1993), so three at `p ≥ T_c` and eleven for
+macOS's 50 ms at a 10 ms probe. A path that moved is followed in `k + 1` probes, about one
+correlation time, as fast as any estimate one stall cannot move.
 
 **Item 6: the correlation time, and the rule it gives.** Theorem 7's `β` is a product over the
 heartbeats inside the margin, each factor a Cantelli bound: it takes them as independent. In the
@@ -275,8 +326,8 @@ the stalls' correlation time, not the timer's `G`.
 
 ## 3. Open, to be measured before it is fixed
 
-Items 2, 6 and 7 and part of 3 are settled by the traces (§2.6) and implemented in L-1's estimator;
-the remaining items keep their numbers.
+Items 2, 6 and 7 and part of 3 are settled by the traces (§2.6) and implemented in L-1's estimator
+and election law; the remaining items keep their numbers, and item 10 is what L-1 left to L-2.
 
 - **1. Heartbeat cost.** `η` minimizing `U` ignores what heartbeats cost, and the configurator
   shows what that means: on a LAN-like link (0.2 ms mean delay, 0.1 ms deviation, 1 % loss,
@@ -310,10 +361,16 @@ the remaining items keep their numbers.
   timers.
 - **9. Bare Linux.** Every Linux number here is from Docker Desktop's VM: 1 ms ticks, and a disk
   image that is a file on the Mac. A Linux host with its own disk is to be traced the same way.
+- **10. A link younger than its evidence.** The election law has nothing to run on before a
+  quorum's paths have answered (no ballot) or before the leader's link has configured its detector
+  (a few dozen heartbeats at `T_c`, §2.6, item 3): a crash of the leader's node in that time is
+  suspected by nothing, since a link that stopped receiving never gathers its evidence. L-1 picks no
+  timeout for it. Closed in L-2 with the core's bootstrap: candidates for the first election, and a
+  rule for a link that stopped before it was configured, measured, not picked.
 
 ## 4. Steps
 
-- **L-1** in `hyper-timing`, sans-io (in part: `qos.rs` holds the Theorem 7 bound, the configurator
+- **L-1** in `hyper-timing`, sans-io, done. `qos.rs` holds the Theorem 7 bound, the configurator
   and the split-vote span, each checked against a brute-force search and the split probability
   against a Monte Carlo; the configurator takes the measured floors (`Floors`: `G`, `E[flush] + G`,
   `T_c`) and searches both regimes, one heartbeat in the margin at the base floors and any margin at
@@ -323,17 +380,15 @@ the remaining items keep their numbers.
   of the prediction errors, `p_L` by Jeffreys, the unseen-delay term, freshness and suspicion events,
   feeding the configurator when its estimates have renewed, refusing it without evidence;
   `folds.rs` the timer-lateness fold for `G`, the flush fold for the sender's floor and the
-  exposure fold for the MTBF. Each is bounded; a heartbeat costs 77–129 ns and no allocation
-  (`docs/benchmarks.md`); a replay of synthetic traces of the recorded shapes keeps Theorem 7's
-  bound, and the trace analyser takes its window, loss and bound from the crate. Still to do in
-  L-1: `W` and the detector replacing `ELECTION_MARGIN`'s base and span and `PATH_WINDOW` in the
-  election law, the granularity fold replacing `GRANULARITY_NS`, and the comparison with the
-  current derivation): the NFD-E estimator as a
-  `PathEstimate` over mean and variance with the window `min(n_G, n_A)`, the floors `G` and
-  `E[flush] + G` and the independence rule `η ≥ T_c` when `α ≥ η`, the Theorem 7 bounds, the
-  configurator minimizing `U`, the split-vote model and `W` replacing `ELECTION_MARGIN`'s base and
-  span, the granularity probe replacing `GRANULARITY_NS`. Unit and property tests; benchmarks
-  under the allocation law against the current derivation (`hyper-timing-compare`).
+  exposure fold for the MTBF. `election.rs` holds the election law (§2.3): the ballot from the
+  paths' means, the span `W` charged to the detector as `T_E`, the base from the configured
+  detector's `η + α`, the delay drawn in time beside the period-counting timer, the priority over
+  `PathRtt`'s median with its window from `T_c` (§2.6, item 7); every tail takes the measured `G`.
+  `ELECTION_MARGIN`, `PATH_WINDOW` and `GRANULARITY_NS` are gone. Each is bounded and nothing
+  allocates once built: a heartbeat costs 77–129 ns, and the law's operations are measured against
+  the law before it, focal-timing and slates' (`docs/benchmarks.md`, "hyper-timing against
+  focal-timing and slates' timing"); a replay of synthetic traces of the recorded shapes keeps
+  Theorem 7's bound, and the trace analyser takes its window, loss and bound from the crate.
 - **L-2** the core: elections started by suspicion with the randomized delay of §2.3,
   check-quorum from the detectors, no per-group timers, idle groups silent.
 - **L-3** the transport: one heartbeat stream per node pair on the datagram plane, stamped on

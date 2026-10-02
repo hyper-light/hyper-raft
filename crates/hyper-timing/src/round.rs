@@ -18,7 +18,6 @@
 //! ([`RoundBudget::derive`], one law for focal and slates), so a slow machine or a far group stretches its
 //! own rounds. Nothing here reads a clock or sleeps: the caller says what
 //! time it is.
-use crate::ELECTION_MARGIN;
 use std::time::Duration;
 
 fn nanos(duration: Duration) -> u64 {
@@ -90,9 +89,10 @@ impl RoundBudget {
     ///   while nothing has arrived. A fixed one-period deadline expired every WAN round with every
     ///   reply in flight (slates `docs/bugs/2026-09-14-consensus-round-expires-inside-the-wan-rtt.md`).
     /// - Once something has arrived, it is judged at `anchors.lookahead` of the deadline in force,
-    ///   and extended a period at a time while replies arrive. The extensions are capped at
-    ///   [`ELECTION_MARGIN`], so a round never outlasts the election timeout it would displace a
-    ///   leader over, and at the room the ceiling leaves.
+    ///   and extended a period at a time while replies arrive, for as long as the ceiling leaves
+    ///   room. A round that must not outlast the election timeout it would displace a leader over
+    ///   is given that timeout as its ceiling ([`crate::ElectionTiming::base`]); no count of
+    ///   extensions is picked beside it.
     /// - `anchors.stall_periods` periods, or one tail, without a reply are a stall.
     /// - No measurement yet gives the round the whole ceiling, hard: a peer nothing is known about
     ///   is never cut off before the caller's bound.
@@ -104,10 +104,7 @@ impl RoundBudget {
         };
         let deadline_ns = period_ns.max(tail_ns).min(ceiling_ns);
         let room = ceiling_ns.saturating_sub(deadline_ns);
-        let extensions = room
-            .checked_div(period_ns)
-            .unwrap_or(0)
-            .min(ELECTION_MARGIN);
+        let extensions = room.checked_div(period_ns).unwrap_or(0);
         Self {
             deadline_ns,
             lookahead: anchors.lookahead,
@@ -288,13 +285,14 @@ mod tests {
     fn derive(anchors: &RoundAnchors, tail: Option<Duration>, ceiling: Duration) -> RoundBudget {
         RoundBudget::derive(anchors, tail.map(nanos), nanos(ceiling))
     }
+    /// A near group whose election timeout, its ceiling, is 1.1 s.
     fn budget() -> RoundBudget {
-        derive(&FOCAL, Some(ms(10)), ms(5_000))
+        derive(&FOCAL, Some(ms(10)), ms(1_100))
     }
 
     #[test]
     fn a_budget_is_derived_from_the_period_the_tail_and_the_ceiling() {
-        // A near group: one period, extended a period at a time, ten times.
+        // A near group: one period, extended a period at a time to its ceiling.
         assert_eq!(
             budget(),
             RoundBudget {
@@ -310,7 +308,11 @@ mod tests {
         let far = derive(&FOCAL, Some(ms(1_300)), ms(5_000));
         assert_eq!(far.deadline_ns, 1_300 * MS);
         assert_eq!(far.stall_window_ns, 1_300 * MS);
-        assert_eq!(far.max_deadline_ns(), 2_300 * MS);
+        assert_eq!(
+            far.max_extensions, 37,
+            "the room under the ceiling, a period each"
+        );
+        assert_eq!(far.max_deadline_ns(), 5_000 * MS);
         // Nothing past the ceiling: the extensions are what room is left.
         let tight = derive(&FOCAL, Some(ms(4_750)), ms(5_000));
         assert_eq!((tight.deadline_ns, tight.max_extensions), (4_750 * MS, 2));

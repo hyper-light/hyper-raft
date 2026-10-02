@@ -1241,58 +1241,107 @@ target/release/hyper-swim-compare table 7 400
 # hyper-timing against focal-timing and slates' timing
 
 The law (`CLAUDE.md` §1a) for the timing crate (`crates/hyper-timing/ORIGIN.md`): the operations a
-member runs each period of a group, measured against focal-timing at `a8e95f7` (the source of the
-paths, the tick pace and the rounds) and slates' `crates/cluster/src/timing.rs` at `5cce86a` (the
-source of the election timing, the priority and the timer).
+member runs each period of a group, measured against hyper-timing's own law before L-1's election
+law (`35d35d8`: `ELECTION_MARGIN`, `PATH_WINDOW`, `GRANULARITY_NS`), focal-timing at `a8e95f7`
+(the source of the paths, the tick pace and the rounds) and slates' `crates/cluster/src/timing.rs`
+at `5cce86a` (the source of the election timing, the priority and the timer).
 
 ## The machine and the workload
 
-The same Apple M5 Max, macOS 26.4.1, rustc 1.98.0, 2026-10-01 at 10:52 PDT, shared with two other
-sessions (load average 17 to 28). `crates/hyper-timing-compare`, a workspace of its own, runs each
-operation two million times in a fresh process of its own, seven runs, the implementations rotated
-each run, and counts allocations over a further two million. A five-voter group, so four paths from
-each member, fed the same eight WAN round trips of 40 to 58 ms; a 10 ms heartbeat.
+The Apple M5 Max, macOS 26.4.1, rustc 1.98.0, 2026-10-01 at 21:30 PDT, shared with other sessions
+(load average 12.6 to 20.6 over the run, beside each row below). `crates/hyper-timing-compare`, a
+workspace of its own, runs each operation two million times in a fresh process of its own and
+counts allocations over a further two million. The law before L-1 is the same harness built at
+`35d35d8` in a detached worktree, where it is named `hyper`; a driver ran every implementation of
+an operation in turn, seven runs, the order rotated each run (the commands are below). A
+five-voter group, so four paths from each member, fed the same eight WAN round trips of 40 to
+58 ms; a 10 ms heartbeat. The new law's paths take the window derived from macOS's measured
+correlation time, 50 ms, at the 10 ms probe (eleven; the law before kept sixteen), its tails
+macOS's measured granularity, 45 µs (before: 1 ms), and its detector is configured once for a link
+of the paths' one-way latency, a 2 ms deviation and a loss of 10⁻⁵.
 
 ## Results
 
-Medians (least–most), nanoseconds a call; no implementation allocates in any operation but slates'
+Medians (least–most), nanoseconds a call. No implementation allocates in any operation but slates'
 priority, once a call.
 
-| Operation | hyper | focal | slates |
-|---|---|---|---|
-| a sample folded into a path | 29.2 (28.3–30.6) | 0.9 (0.8–1.1) | 2.1 (1.7–2.4) |
-| a path's tail read | 1.2 (0.8–1.2) | 87.5 (82.2–93.0) | 1.2 (0.8–1.3) |
-| the election timing from four paths | 10.9 (10.7–12.0) | — | 10.9 (10.9–11.4) |
-| the quorum priority over four paths | 12.5 (11.8–13.5) | — | 24.8 (24.2–26.3), 1 allocation |
-| the tick pace from four paths | 5.5 (4.1–6.4) | 356.2 (284.5–386.0) | — |
-| a round's budget | 1.0 (0.9–1.2) | 1.1 (0.9–1.2) | 1.0 (0.9–1.1) |
-| a follower's period of the election timer | 1.6 (1.0–1.6) | — | 1.7 (1.0–1.7) |
+| Operation | hyper | before L-1's law | focal | slates | load |
+|---|---|---|---|---|---|
+| a sample folded into a path | 28.0 (27.5–29.5) | 32.7 (32.0–33.2) | 2.3 (2.2–2.5) | 3.4 (3.3–3.6) | 13 |
+| a path's tail read | 1.1 (1.0–1.2) | 0.7 (0.6–1.0) | 74.6 (73.1–75.6) | 0.7 (0.6–0.8) | 13 |
+| the election timing from four paths | 341.3 (334.8–344.9) | 8.4 (8.2–8.7) | — | 8.7 (8.4–9.2) | 13 |
+| — of it, the ballot | 28.2 (27.6–28.3) | | | | 13 |
+| — of it, the span's search | 305.8 (301.0–308.4) | | | | 13 |
+| — of it, the timing from a held ballot and span | 3.8 (3.7–4.0) | | | | 13 |
+| the quorum priority over four paths | 21.3 (20.3–22.2) | 12.3 (11.2–35.8) | — | 22.8 (22.1–39.7), 1 allocation | 13 |
+| the tick pace | 2.0 (1.6–2.6) | 5.0 (4.1–6.6) | 315.7 (282.4–718.7) | — | 13–21 |
+| a round's budget | 0.8 (0.7–1.1) | 1.0 (0.9–1.1) | 1.0 (0.9–1.2) | 1.0 (0.9–1.0) | 21 |
+| a follower's period of the election timer | 1.0 (1.0–1.7) | 1.0 (1.0–1.7) | — | 1.0 (1.0–1.7) | 21 |
+
+What the two laws derive on this workload (`hyper-timing`'s own derivations, printed once):
+
+| | before L-1's law | L-1's law |
+|---|---|---|
+| base | `10 × tail` = 58 periods, 580 ms (tail 57.1 ms) | the detector's `η + α`: at the 10 ms heartbeat, `η` 10 ms and `α` 9.96 ms, 2 periods, 20 ms |
+| span | `10 × spread` = 14 periods, 140 ms | `W` = 151 ms, 16 periods, `T_E` 100 ms, a split in 11 % of attempts |
+| detection of a crash | not stated | `E(D) + α + η` = 42.8 ms |
+| the detector's best interval | — | `η` 50 ms, `α` 123 ms (the correlation time binds) |
+
+The law before L-1 waited ten tails to decide a leader was gone whatever the link did; the detector
+decides at its freshness point, from the link's own variance and loss, and the span is the one
+that minimizes the time to a leader on these paths rather than ten spreads.
 
 ## Where hyper-timing does not win, and why
 
-A sample costs 29 ns, against focal's 0.9 and slates' 2.1. focal stores the sample and leaves the
-work to every read; slates' path is RFC 9002's smoothed estimator, two multiplies a sample. hyper's
-path is focal's median window, kept because one late answer from a starting or stalled peer must not
-move a group's election timeout (`PathRtt`'s documentation, from focal), and it now does the work of
-the median once a sample instead of three sorts a read. A member samples a path about once a period
-and reads it several times (the election timing, the priority, the tick pace, the round budget), so
-over a period of the four paths hyper spends about 150 ns (four samples and every derivation), focal about 360 ns (four samples, the tick pace and a round) and slates about 45 ns
-for an estimate that one late answer moves.
+- **The election timing from the paths** is a search where the law before was a multiply: 341 ns
+  against 8.4, of which the span's golden-section search over Ongaro's split-vote expectation is
+  306. The span is the election cost the detector is configured for (`Costs::election`), so it is
+  computed when the detector is (`LinkEstimator::reconfigure_due`, every window's worth of
+  heartbeats), beside a configuration that itself costs 715–2,418 ns ("The detector's estimator").
+  What a member runs every period is the timing from a held ballot and span: 3.8 ns against the
+  8.4 and 8.7 of the laws it replaces.
+- **A path's tail read** is 1.1 ns against 0.7. Both compile to the same inlined arithmetic; the
+  difference survived a `u64` sum in place of the `u128`, the granularity as a literal, and every
+  loop aligned to 64 bytes in both builds. It is under two cycles and not explained.
+- **The quorum priority** is 21.3 ns against 12.3, a difference in the data, not the code: with
+  windows of sixteen the four paths held the same samples and the counted rank found its answer at
+  the second path; with the derived window of eleven they differ and the count runs further. Fed
+  the eleven samples the derived window holds and the same 1 ms floor, the law before costs
+  20.0–21.0 ns and this one 20.7–21.2 (six runs each, the order alternated, load 20–28). Two changes
+  bought that: the count stops once a rank passes the position, and paths are ranked on the
+  spread without the granularity floor, which is applied once to the path chosen (the floored
+  spread never falls as the unfloored one rises, so both choose paths of the same round trip and
+  floored spread; the property test against a sort holds over 2,000 groups).
+- **A sample** costs 28 ns against focal's 2.3 and slates' 3.4, the cost of the median window: focal
+  stores the sample and leaves the work to every read, slates' path is RFC 9002's smoothed
+  estimator. The median stays where one stall must not reorder voters (`docs/timing.md` §2.6,
+  item 7), and the derived window of eleven makes it cheaper than the sixteen before (32.7 ns).
 
-Before these changes hyper-timing's tail read was focal's (71.7 ns), the election timing 940 ns and
-the priority 1,384 ns: the first measurement of this comparison found them, and the changes are in
-`crates/hyper-timing/ORIGIN.md`, change 7. The first measurement also timed a sample that the
-optimizer had removed, since nothing read the path afterwards; the harness now observes the path
-after every sample.
+Over a period of the four paths, hyper spends about 140 ns (four samples, the priority, the timing,
+the pace and a round), the law before about 160, focal about 330 (four samples, the pace and a
+round) and slates about 45 for an estimate that one late answer moves.
+
+Before change 7 of `crates/hyper-timing/ORIGIN.md` hyper-timing's tail read was focal's (71.7 ns),
+the election timing 940 ns and the priority 1,384 ns. The first measurement also timed a sample
+that the optimizer had removed, since nothing read the path afterwards; the harness observes the
+path after every sample.
 
 ## Commands for the timing
 
 ```sh
 cargo test -p hyper-timing
+cargo test -p hyper-timing --test alloc                 # the allocation law, the election law included
 cargo bench -p hyper-timing --bench estimator           # the detector's estimator, per heartbeat
 cargo test -p hyper-timing --test replay -- --nocapture # the replay against Theorem 7
 cd crates/hyper-timing-compare && cargo build --release
 target/release/hyper-timing-compare table 7 2000000
+# The law before L-1: the same harness at 35d35d8, built in a detached worktree.
+git worktree add --detach <before> 35d35d8
+(cd <before>/crates/hyper-timing-compare && cargo build --release)
+# Then, for each operation, seven runs of every implementation in a fresh process, the order
+# rotated each run, the load average read before each process:
+#   <after>/target/release/hyper-timing-compare one <operation> <hyper|focal|slates> 2000000
+#   <before>/target/release/hyper-timing-compare one <operation> hyper 2000000
 ```
 
 # The detector's estimator
@@ -1307,7 +1356,8 @@ does, a path estimator's sample, is timed in the same run for reference.
 ## Per heartbeat, under the allocation law
 
 `cargo bench -p hyper-timing --bench estimator`, the Apple M5 Max, macOS 26.4.1, rustc 1.98.0,
-2026-10-01 at 20:50 PDT, shared with other sessions (load average 27.8 to 29.6). A link at a 50 ms
+2026-10-01 at 20:50 PDT, shared with other sessions (load average 27.8 to 29.6); the reference
+rows again at 21:32 PDT (load 22.8 to 28.3) after L-1's election law. A link at a 50 ms
 interval, fed a millisecond of jitter and one heartbeat in a thousand stalled 40 ms, warmed past its
 window and configured; each heartbeat is the driver's work (poll the deadline if it passed, feed the
 heartbeat, check whether a configuration is due). Two million heartbeats a run, seven runs, the two
@@ -1318,8 +1368,11 @@ minor faults per heartbeat, configurations included.
 |---|---|---|---|---|---|
 | 1 ms granularity (window bound 1,332) | 77.2 (75.7–81.7) | 0 | 0 | 0 | 2,407 (2,347–2,549) |
 | granularity at the interval (window bound 66,665) | 129.2 (122.0–135.8) | 0 | 0 | 0 | 711 (677–753) |
-| `PathRtt::on_sample`, for reference | 65.5 (65.3–84.2) | | | | |
-| `ExchangeRtt::on_sample`, for reference | 6.1 (5.7–7.5) | | | | |
+| `PathRtt::on_sample`, for reference (window of sixteen; at 21:32, the derived three) | 65.5 (65.3–84.2); 18.3 (17.9–19.2) | | | | |
+| `ExchangeRtt::on_sample`, for reference | 6.1 (5.7–7.5); 5.7 (5.7–7.3) | | | | |
+
+At 21:32 the two rings measured 80.1 (78.4–82.7) and 125.5 (124.2–144.0) ns a heartbeat, 2,418 and
+715 ns a configuration, with no allocation, reallocation or fault: the estimator did not change.
 
 A heartbeat is a step on each Allan level it finishes (one on average, seventeen at most), a ring
 write, and the window read from the levels; the larger bound costs more because more levels

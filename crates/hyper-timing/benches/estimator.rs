@@ -187,7 +187,14 @@ fn main() {
             row[3].push(cost.faults);
             row[4].push(configure as f64);
         }
-        path.push(path_sample(PathRtt::new(), PathRtt::on_sample, seed));
+        // A path probed at the interval on a link whose correlation time is the interval: the
+        // window of three the derivation gives at the configurator's multi-heartbeat floor.
+        let interval = Duration::from_nanos(INTERVAL);
+        path.push(path_sample(
+            PathRtt::new(interval, interval).unwrap(),
+            PathRtt::on_sample,
+            seed,
+        ));
         exchange.push(path_sample(
             ExchangeRtt::new(),
             ExchangeRtt::on_sample,

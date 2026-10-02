@@ -27,6 +27,8 @@ use hyper_transport::{Event, Limits, Refusal};
 
 const PERIOD: Duration = Duration::from_secs(2);
 const TURNS: usize = 10_000;
+/// The simulated clock's timed waits end exactly when asked: its measured granularity is zero.
+const GRANULARITY: Duration = Duration::ZERO;
 
 /// Node 1 and node 2, both nodes, connected.
 fn connected<A, B>(pair: &Pair, limits: Limits, budget: u64) -> Net<Node<A>, Node<B>>
@@ -152,7 +154,7 @@ fn a_request_and_its_reply_cross_in_every_class_with_streaming_bodies() {
         net.a.stats().exchanges == 0 && net.b.stats().exchanges == 0
     });
     assert!(
-        net.a.exchange_tail(2).is_some(),
+        net.a.exchange_tail(2, GRANULARITY).is_some(),
         "answered exchanges were timed"
     );
     let path = net.a.path(2).unwrap();
@@ -474,7 +476,7 @@ fn a_peer_that_stops_answering_is_given_up_within_its_period() {
         )
         .unwrap();
     run(&mut net, &mut asker, &mut server);
-    let tail = net.a.exchange_tail(2).unwrap();
+    let tail = net.a.exchange_tail(2, GRANULARITY).unwrap();
     net.b_dead = true;
     let began = net.now;
     asker
@@ -497,7 +499,7 @@ fn a_peer_that_stops_answering_is_given_up_within_its_period() {
     // The first judgement finds a period in which the peer said nothing: what was sent into its
     // silence (the flight in the air and the probe timeout's probes) is no progress.
     assert!(took <= PERIOD, "given up after {took:?}");
-    assert_eq!(net.a.exchange_tail(2), Some(tail * 2));
+    assert_eq!(net.a.exchange_tail(2, GRANULARITY), Some(tail * 2));
 }
 
 /// Replication frames on lanes arrive in order, each lane on its own stream; a lane is as wide as

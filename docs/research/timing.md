@@ -122,6 +122,75 @@ default; never early.
 may delay them by to coalesce wakeups; the default depends on the timer and QoS class;
 `DISPATCH_TIMER_STRICT` asks the system to keep a smaller leeway.
 
+## Estimating from traces
+
+**Allan, "Statistics of atomic frequency standards", Proc. IEEE 54(2), 1966, pp. 221–230; IEEE Std
+1139-2008.** The two-sample (Allan) variance `σ²_A(m) = ½ E[(ȳ_{k+1} − ȳ_k)²]` over consecutive
+means of `m` samples separates noise that averaging removes from drift that it does not: for
+uncorrelated stationary samples it falls as `σ²/m`, and where it stops falling, a longer average
+tracks a quantity that has moved. The window at its minimum is the averaging length past which the
+estimate gets no better. The relative uncertainty of `σ_A` from `K` windows is about
+`1/√(2(K−1))`.
+
+**Madras and Sokal, "The pivot algorithm", J. Stat. Phys. 50, 1988; Sokal, *Monte Carlo Methods
+in Statistical Mechanics: Foundations and New Algorithms*, Cargèse lectures, 1997, §3.** A
+correlated series' mean has variance `σ² τ_int / n`, `τ_int = 1 + 2 Σ_{k≥1} ρ_k`; summing the
+sample autocorrelation over the self-consistent window `M ≥ c τ_int(M)`, `c ≈ 6`, keeps the
+estimator's bias and variance both small.
+
+**Box, Jenkins and Reinsel, *Time Series Analysis*, 4th ed., 2008, §2.1.6.** For white noise the
+sample autocorrelation at any lag is within `±1.96/√n` with 95 % probability (Bartlett).
+
+**Ferro and Segers, "Inference for clusters of extreme values", JRSS B 65(2), 2003, pp. 545–556.**
+Exceedances of a high threshold by a stationary series come in clusters whose mean size is the
+inverse of the extremal index `θ`; the intervals estimator gives `θ` from the times between
+exceedances alone, and the `⌊θN⌋ − 1` longest of those times separate the clusters.
+
+**Rousseeuw and Croux, "Alternatives to the median absolute deviation", JASA 88(424), 1993.**
+`1.4826 · MAD` estimates `σ` consistently for normal data; for a distribution with a heavy tail it
+estimates the spread of the body, not the variance.
+
+**Lindley, "The theory of queues with a single server", Proc. Cambridge Philos. Soc. 48(2), 1952,
+pp. 277–289.** A single server fed at regular intervals `η` with independent service times `S`
+reaches a stationary waiting time iff `E[S] < η`; otherwise the wait grows without bound. A sender
+that must wake and flush before each heartbeat is such a server.
+
+**Jeffreys, "An invariant form for the prior probability in estimation problems", Proc. R. Soc.
+A 186, 1946, pp. 453–461; Brown, Cai and DasGupta, "Interval estimation for a binomial
+proportion", Statistical Science 16(2), 2001, pp. 101–133.** The Jeffreys prior is the
+parameterization-invariant prior; for a proportion it is `Beta(½, ½)`, posterior mean
+`(k + ½)/(n + 1)` after `k` events in `n` trials, and its interval has the coverage Brown, Cai and
+DasGupta recommend; for a Poisson rate it is `∝ λ^{−½}`, posterior `Gamma(k + ½, T)` after `k`
+events in exposure `T`, mean `(k + ½)/T`.
+
+**Brown, Cai and DasGupta, "Interval estimation in exponential families", Statistica Sinica 13,
+2003, pp. 19–49.** The score interval for a Poisson mean from a count `k`,
+`k + z²/2 ± z√(k + z²/4)`, has close to nominal coverage down to small counts.
+
+## The machines' timers, from their sources
+
+**XNU `osfmk/kern/timer_call.c`, `timer_call_slop` and `timer_compute_leeway`
+(apple-oss-distributions/xnu, main, read 2026-10-01).** A user thread's timer is given a leeway of
+`min((deadline − now) >> shift, max)` unless coalescing is off or the timer is critical; the shift
+and the cap come from the thread's class: real-time and critical urgency get shift 0 and cap 0 (no
+leeway), time-share threads `timer_coalesce_ts_shift`, and a thread with a latency-QoS tier that
+tier's scale. **`osfmk/arm/arm_timer.c`, `tcoal_prio_params_init`**: on macOS, time-share shift 3
+with a 1 ms cap; latency tiers 0–5 scale `{3, 2, 1, −2, 3, 3}`, caps `{1, 5, 20, 75, 1, 1}` ms.
+`sysctl kern.timer_coalesce_*` on the machine reports the same values.
+
+**XNU `bsd/netinet/ip_input.c`, `ip_savecontrol`**, called from `udp_input`
+(`bsd/netinet/udp_usrreq.c`): with `SO_TIMESTAMP_MONOTONIC` set the kernel attaches
+`mach_absolute_time()` when UDP input queues the datagram on the socket (`SCM_TIMESTAMP_MONOTONIC`,
+a `uint64_t`; `<sys/socket.h>`); `SO_TIMESTAMP` attaches `getmicrotime()`, microseconds of wall
+time. macOS's `setsockopt(2)` page documents neither.
+
+**Linux `socket(7)`, `SO_TIMESTAMPNS`**: an `SCM_TIMESTAMPNS` control message with a
+`struct timespec` of `CLOCK_REALTIME` at the datagram's reception. **The kernel configuration**
+(`/proc/config.gz`) of Docker Desktop's linuxkit 6.12.76 has `CONFIG_HZ=1000`, `CONFIG_NO_HZ_IDLE=y`
+and `# CONFIG_HIGH_RES_TIMERS is not set`; `/proc/timer_list` reports a resolution of 1,000,000 ns
+for every clock base, so every timed wait in that VM ends on a 1 ms tick whatever the 50 µs timer
+slack would allow.
+
 ## What the sources leave to us
 
 1. Where the QoS requirements come from. Chen et al. take them from the application; etcd,
@@ -132,4 +201,5 @@ may delay them by to coalesce wakeups; the default depends on the timer and QoS 
 4. How heartbeat cost bounds `η` once a node has many peers.
 5. The first estimates, before a link has history.
 
-`docs/timing.md` answers 1–3 and states 4–5 as measurements still to make.
+`docs/timing.md` answers 1–3, answers 5 for the loss, the mean delay and the MTBF from the traces
+and the sources above (§3), and states 4 and the first variance as measurements still to make.

@@ -3,7 +3,8 @@
 use std::time::Duration;
 
 use hyper_timing::{
-    Configuration, Costs, Event, ExchangeRtt, Floors, LinkEstimator, Trust, mistake_bound,
+    Configuration, Costs, Event, ExchangeRtt, Floors, LinkBehaviour, LinkEstimator, Trust,
+    detector_at, mistake_bound,
 };
 
 use crate::bound::Sums;
@@ -28,6 +29,36 @@ pub(crate) struct Sender {
 pub(crate) struct Context {
     pub(crate) granularity: Option<Duration>,
     pub(crate) mtbf: Option<Duration>,
+    /// What the node's pool of its links measured, while this pair has no configuration of its own
+    /// (`docs/timing.md` §3, item 10).
+    pub(crate) pool: Option<LinkBehaviour>,
+}
+
+/// What a heartbeat taken did, for the node.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct Taken {
+    /// It began a new run of the peer: the peer restarted.
+    pub(crate) restarted: bool,
+    /// Its prediction error, nanoseconds, and the heartbeats its number says were due since the
+    /// latest taken (one, or more where some were lost): what the node's pool is fed, while the
+    /// pool or this pair needs it.
+    pub(crate) error: Option<(u64, i64)>,
+    /// Whether the pair judges by a configuration of its own.
+    pub(crate) own: bool,
+}
+
+/// The behaviour of the node's pool, for a link whose prediction errors are over a window of
+/// `window` heartbeats: the pool's deviation scaled by `√(1 + 1/n)`. For independent delays the
+/// prediction errors' variance at a window of `n` is `V(D)(1 + 1/n)`, and the pool's own, over the
+/// links' errors, is at least `V(D)`: so the scaled deviation bounds the link's from above, which
+/// is the side Cantelli's inequality may err on (a larger variance only loosens the bound).
+pub(crate) fn scaled(pool: &LinkBehaviour, window: u64) -> LinkBehaviour {
+    // u64 → f64 rounds only past 2⁵³, far past any window (`hyper_timing::WINDOW_LIMIT`).
+    let n = window.max(1) as f64;
+    LinkBehaviour {
+        delay_deviation: pool.delay_deviation.mul_f64((1.0 + 1.0 / n).sqrt()),
+        ..*pool
+    }
 }
 
 /// What a poll's send did.
@@ -51,6 +82,17 @@ struct Stream {
     asked_ns: u64,
     /// The durable count the latest heartbeat carried: the next must carry more.
     proof: u64,
+}
+
+/// How a peer from which no heartbeat has come is judged: from when the node first attached the
+/// pair, one interval and the pool's margin at it (`docs/timing.md` §3, item 10).
+#[derive(Clone, Copy, Debug, Default)]
+struct Unheard {
+    /// When the node first polled with the pair attached.
+    since_ns: Option<u64>,
+    /// The freshness point of the first heartbeat, once the pool can give a margin.
+    until_ns: Option<u64>,
+    suspected: bool,
 }
 
 /// The estimator of the peer's stream and the ring of its delay sums, boxed together: the
@@ -90,6 +132,15 @@ struct Received {
     /// When the detector was last configured: the heartbeats taken then, and `β` at its margin.
     renewed: Option<(u64, f64)>,
     round_trip: ExchangeRtt,
+    /// The interval the link's own evidence needs, nanoseconds: the longest its estimator has
+    /// said its heartbeats would be independent at, at an interval too correlated to measure
+    /// (`LinkEstimator::independent_interval`); zero while it has said none. Asked of the peer,
+    /// whatever the configuration's best, so the link is never asked back to an interval its
+    /// estimator showed it cannot measure.
+    evidence_ns: u64,
+    /// While the pair has no configuration of its own: the pool's behaviour its margin was
+    /// imposed from, scaled to the link's window, and the heartbeats taken then.
+    pooled: Option<(LinkBehaviour, u64)>,
 }
 
 /// One pair.
@@ -99,6 +150,10 @@ pub(crate) struct Pair {
     pub(crate) election: Option<Duration>,
     stream: Stream,
     received: Received,
+    unheard: Unheard,
+    /// Whether the owner was last told the peer is suspected: a change is reported only where
+    /// what the owner was told differs, and the owner trusts a peer until told otherwise.
+    told: bool,
     report: PairReport,
 }
 
@@ -109,15 +164,78 @@ impl Pair {
             election: None,
             stream: Stream::default(),
             received: Received::default(),
+            unheard: Unheard::default(),
+            told: false,
             report: PairReport::default(),
         }
     }
 
     pub(crate) fn trust(&self) -> Trust {
-        self.received
-            .link
-            .as_ref()
-            .map_or(Trust::Unconfigured, |link| link.estimator.trust())
+        match self.received.link.as_ref() {
+            Some(link) => link.estimator.trust(),
+            None if self.unheard.suspected => Trust::Suspected,
+            None => match self.unheard.until_ns {
+                Some(until_ns) => Trust::Trusted { until_ns },
+                None => Trust::Unconfigured,
+            },
+        }
+    }
+
+    /// Whether the pair judges by a configuration of its own.
+    pub(crate) fn configured(&self) -> bool {
+        self.received.configuration.is_some()
+    }
+
+    /// The node polled with the pair attached at `now_ns`: a peer from which nothing has come is
+    /// judged from the first such poll.
+    pub(crate) fn attached(&mut self, now_ns: u64) {
+        self.unheard.since_ns.get_or_insert(now_ns);
+    }
+
+    /// Whether the pair has heard its peer and judges it by no margin yet: the pool's is imposed
+    /// at the next poll, so a link whose peer stopped before its own evidence is judged all the
+    /// same (`docs/timing.md` §3, item 10).
+    pub(crate) fn wants_pool_margin(&self) -> bool {
+        self.received.configuration.is_none()
+            && self.received.pooled.is_none()
+            && self.received.link.is_some()
+    }
+
+    /// Whether the pair waits for the pool's margin for a peer it has not heard from.
+    pub(crate) fn wants_unheard_margin(&self) -> bool {
+        self.received.link.is_none() && self.unheard.until_ns.is_none()
+    }
+
+    /// The freshness point of a peer from which no heartbeat has come: one interval past the first
+    /// poll with the pair attached, at this node's own floor (the interval the peer starts at
+    /// is its floor, and the pool's premise is that the stalls are the hosts', so a host's floor is
+    /// the measure of its peers' before they say theirs), plus the pool's margin at it for a window
+    /// of one.
+    pub(crate) fn judge_unheard(
+        &mut self,
+        pool: &LinkBehaviour,
+        floor: Duration,
+        granularity: Duration,
+        mtbf: Option<Duration>,
+    ) {
+        let (Some(since), Some(election), Some(mtbf)) =
+            (self.unheard.since_ns, self.election, mtbf)
+        else {
+            return;
+        };
+        let floors = Floors {
+            granularity,
+            sender: floor.max(granularity),
+            correlation: Duration::MAX,
+        };
+        let costs = Costs { election, mtbf };
+        if let Some(detector) = detector_at(&scaled(pool, 1), &costs, &floors, floors.sender) {
+            self.unheard.until_ns = Some(
+                since
+                    .saturating_add(nanos(floors.sender))
+                    .saturating_add(nanos(detector.margin)),
+            );
+        }
     }
 
     pub(crate) fn configuration(&self) -> Option<Configuration> {
@@ -132,6 +250,14 @@ impl Pair {
         PairReport {
             groups: self.groups,
             configured: self.received.configuration.is_some(),
+            judged: !matches!(self.trust(), Trust::Unconfigured),
+            freshness: self.received.link.as_ref().and_then(|link| {
+                Some(
+                    link.estimator
+                        .next_interval()
+                        .saturating_add(link.estimator.margin()?),
+                )
+            }),
             ..self.report
         }
     }
@@ -143,20 +269,29 @@ impl Pair {
 
     /// The peer's freshness point, while trusted.
     pub(crate) fn deadline(&self) -> Option<u64> {
-        self.received
-            .link
-            .as_ref()
-            .and_then(|link| link.estimator.deadline())
+        match self.trust() {
+            Trust::Trusted { until_ns } => Some(until_ns),
+            _ => None,
+        }
     }
 
-    /// The interval to send at: the one the peer asked, never below this node's floor; the floor
-    /// until the peer asks. A change smaller than `G`, the configurator's resolution, is none.
+    /// The interval to send at: the one the peer asked, where its floor allows it; where the floor
+    /// binds (before the peer asks, or past what it asked), the floor, which the interval follows up
+    /// and not down. A sender must keep its interval above its floor to be stable (Lindley 1952), so
+    /// a floor that rose past the interval moves it; a floor that fell is a mean that moved with a
+    /// sample, and following it would start the peer's estimator again at each
+    /// (`LinkEstimator::retime`), which is how a link at its floor could go unconfigured for as long
+    /// as its flushes kept moving their mean (`docs/timing.md` §2.9). The peer asks from what this
+    /// node's floor was, so once it asks past it the interval is the peer's again. A change smaller
+    /// than `G`, the configurator's resolution, is none.
     fn interval(&self, sender: &Sender) -> Option<u64> {
         let floor = nanos(sender.floor?);
-        let wanted = self.stream.asked_ns.max(floor);
-        if wanted == 0 {
-            return None;
-        }
+        let asked = self.stream.asked_ns;
+        let wanted = if asked >= floor {
+            asked
+        } else {
+            floor.max(self.stream.interval_ns)
+        };
         let current = self.stream.interval_ns;
         let resolution = sender.granularity.map_or(0, nanos);
         Some(if current != 0 && wanted.abs_diff(current) <= resolution {
@@ -215,15 +350,23 @@ impl Pair {
                 late_ns,
                 hold_ns: now_ns.saturating_sub(arrival_ns),
             });
+        let ask_ns = self
+            .received
+            .configuration
+            .map_or(0, |configured| nanos(configured.best.interval))
+            .max(self.received.evidence_ns);
+        if let Some(link) = self.received.link.as_mut() {
+            // The peer moves to what this heartbeat asks, never below its floor, from its next
+            // heartbeat on: this node expects it so, not suspecting it for the move.
+            link.estimator
+                .expect_interval(Duration::from_nanos(ask_ns.max(self.received.floor_ns)));
+        }
         let beat = Heartbeat {
             boot: sender.local_boot,
             seq,
             interval_ns: spacing,
             floor_ns: sender.floor.map_or(0, nanos),
-            ask_ns: self
-                .received
-                .configuration
-                .map_or(0, |configured| nanos(configured.best.interval)),
+            ask_ns,
             sent_ns: now_ns,
             late_ns: now_ns.saturating_sub(due),
             flushes: sender.durable_count,
@@ -240,7 +383,15 @@ impl Pair {
 
     /// The peer's freshness at `now_ns`: a suspicion when it passed.
     pub(crate) fn judge(&mut self, peer: PeerId, now_ns: u64) -> Option<Change> {
-        let link = self.received.link.as_mut()?;
+        let Some(link) = self.received.link.as_mut() else {
+            // Nothing heard: suspected once its first freshness point passes.
+            let until = self.unheard.until_ns.filter(|until| now_ns >= *until)?;
+            if self.unheard.suspected {
+                return None;
+            }
+            self.unheard.suspected = true;
+            return self.tell_suspected(peer, until, now_ns);
+        };
         let until = link.estimator.deadline()?;
         if link.estimator.poll(now_ns) != Some(Event::Suspected) {
             return None;
@@ -250,18 +401,47 @@ impl Pair {
             let beta = self.beta_now();
             self.account(next, beta);
         }
+        self.tell_suspected(peer, until, now_ns)
+    }
+
+    /// The suspicion to tell the owner, unless it was told already.
+    fn tell_suspected(&mut self, peer: PeerId, at_ns: u64, noticed_ns: u64) -> Option<Change> {
+        if self.told {
+            return None;
+        }
+        self.told = true;
         self.report.suspicions = self.report.suspicions.saturating_add(1);
-        Some(Change::Suspected(self.suspicion(peer, until, now_ns)))
+        Some(Change::Suspected(self.suspicion(peer, at_ns, noticed_ns)))
+    }
+
+    /// What the owner is to be told after a heartbeat taken at `at_ns`: the trust it now has,
+    /// where it differs from what the owner was told.
+    fn settle(&mut self, peer: PeerId, at_ns: u64) -> Option<Change> {
+        match self.trust() {
+            Trust::Trusted { .. } if self.told => {
+                self.told = false;
+                Some(Change::Trusted { peer, at_ns })
+            }
+            Trust::Suspected => self.tell_suspected(peer, at_ns, at_ns),
+            _ => None,
+        }
     }
 
     fn suspicion(&self, peer: PeerId, at_ns: u64, noticed_ns: u64) -> Suspicion {
-        let detection = self.received.link.as_ref().and_then(|link| {
-            let margin = link.estimator.margin()?;
-            link.sums.detection(
-                link.estimator.estimates().window.length,
-                link.estimator.interval(),
-                margin,
-            )
+        let unheard = self
+            .unheard
+            .since_ns
+            .filter(|_| self.received.link.is_none())
+            .map(|since| Duration::from_nanos(at_ns.saturating_sub(since)));
+        let detection = unheard.or_else(|| {
+            self.received.link.as_ref().and_then(|link| {
+                let margin = link.estimator.margin()?;
+                link.sums.detection(
+                    link.estimator.estimates().window.length,
+                    link.estimator.next_interval(),
+                    margin,
+                )
+            })
         });
         Suspicion {
             peer,
@@ -282,10 +462,14 @@ impl Pair {
     fn beta_now(&self) -> Option<f64> {
         let link = self.received.link.as_ref()?;
         let margin = link.estimator.margin()?;
-        let behaviour = link.estimator.behaviour().ok().or(self
-            .received
-            .configuration
-            .map(|configured| configured.link))?;
+        let behaviour = match self.received.pooled {
+            // Judged by the pool's margin: the bound it promised, from the pool's behaviour.
+            Some((pooled, _)) if self.received.configuration.is_none() => pooled,
+            _ => link.estimator.behaviour().ok().or(self
+                .received
+                .configuration
+                .map(|configured| configured.link))?,
+        };
         let variance = behaviour.delay_deviation.as_secs_f64().powi(2);
         Some(mistake_bound(
             behaviour.loss,
@@ -333,17 +517,27 @@ impl Pair {
 
     /// Takes heartbeat `beat` from `peer`, received at `arrival_ns`, after judging the peer at
     /// that arrival: a freshness point that passed before the heartbeat came is a suspicion
-    /// whatever order the owner fed them in.
+    /// whatever order the owner fed them in. The changes are, in order, a suspicion at the
+    /// arrival, the peer's restart, and the trust the heartbeat leaves.
     pub(crate) fn take(
         &mut self,
         peer: PeerId,
         beat: &Heartbeat,
         arrival_ns: u64,
         context: &Context,
-        changes: &mut [Option<Change>; 2],
-    ) -> Result<bool, Refusal> {
+        changes: &mut [Option<Change>; 3],
+        taken: &mut Taken,
+    ) -> Result<(), Refusal> {
         changes[0] = self.judge(peer, arrival_ns);
-        let restarted = self.begin_run(beat.boot);
+        if self.begin_run(beat.boot) {
+            // A new incarnation, which the owner's core trusts and holds to lead nothing it led.
+            self.told = false;
+            taken.restarted = true;
+            changes[1] = Some(Change::Restarted {
+                peer,
+                at_ns: arrival_ns,
+            });
+        }
         if self.received.last.is_some_and(|last| beat.seq <= last.seq) {
             return Err(Refusal::Stale);
         }
@@ -363,12 +557,13 @@ impl Pair {
             .base
             .checked_add(beat.seq)
             .ok_or(Refusal::OutOfRange)?;
+        let previous = self.received.last_mapped;
         let link = self.link(beat.interval_ns, granularity)?;
-        let event = link
-            .estimator
+        link.estimator
             .on_heartbeat(mapped, arrival_ns)
             .map_err(|_| Refusal::OutOfRange)?;
         link.sums.push(sum);
+        let error = link.estimator.latest_error();
         self.received.last = Some(Last {
             seq: beat.seq,
             arrival_ns,
@@ -382,20 +577,56 @@ impl Pair {
         if self.renewal_due(beta) {
             self.configure(context, granularity);
         }
-        changes[1] = match event {
-            Some(Event::Trusted) => Some(Change::Trusted {
-                peer,
-                at_ns: arrival_ns,
-            }),
-            Some(Event::Suspected) => {
-                self.report.suspicions = self.report.suspicions.saturating_add(1);
-                Some(Change::Suspected(
-                    self.suspicion(peer, arrival_ns, arrival_ns),
-                ))
-            }
-            None => None,
+        if self.received.configuration.is_none()
+            && let Some(pool) = context.pool
+        {
+            self.pool_margin(&pool, granularity, context.mtbf);
+        }
+        let due = previous.map_or(1, |previous| mapped.saturating_sub(previous).max(1));
+        taken.error = error.map(|error| (due, error));
+        taken.own = self.received.configuration.is_some();
+        changes[2] = self.settle(peer, arrival_ns);
+        Ok(())
+    }
+
+    /// While the pair has no configuration of its own, the margin the node's pool configures for
+    /// it, imposed on its estimator (`docs/timing.md` §3, item 10): the pool's behaviour scaled to
+    /// the link's window (`scaled`), at the link's interval, its costs and its floors, as its own
+    /// configuration would be. Renewed on the configuration's doubling schedule: at the first, and
+    /// once the heartbeats taken have doubled since.
+    pub(crate) fn pool_margin(
+        &mut self,
+        pool: &LinkBehaviour,
+        granularity: Duration,
+        mtbf: Option<Duration>,
+    ) {
+        let (Some(election), Some(mtbf)) = (self.election, mtbf) else {
+            return;
         };
-        Ok(restarted)
+        let taken = self.report.taken;
+        if self
+            .received
+            .pooled
+            .is_some_and(|(_, at)| taken < at.saturating_mul(2))
+        {
+            return;
+        }
+        let floor_ns = self.received.floor_ns;
+        let Some(link) = self.received.link.as_mut() else {
+            return;
+        };
+        let behaviour = scaled(pool, link.estimator.estimates().window.length);
+        let floors = Floors {
+            granularity,
+            sender: Duration::from_nanos(floor_ns).max(granularity),
+            correlation: Duration::MAX,
+        };
+        let costs = Costs { election, mtbf };
+        if let Some(detector) = detector_at(&behaviour, &costs, &floors, link.estimator.interval())
+        {
+            link.estimator.impose(detector.margin);
+            self.received.pooled = Some((behaviour, taken));
+        }
     }
 
     /// The delay sum of `beat`'s echo (the `bound` module): the round trip on this node's clock,
@@ -480,25 +711,35 @@ impl Pair {
     /// "hyper-liveness"). hyper-swim judges each probe on its own for the same reason (§2.7). A
     /// refusal leaves the detector in force (`LinkEstimator::configure`).
     fn configure(&mut self, context: &Context, granularity: Duration) {
-        let (Some(election), Some(mtbf)) = (self.election, context.mtbf) else {
-            return;
-        };
         let floor_ns = self.received.floor_ns;
+        let costs = self
+            .election
+            .zip(context.mtbf)
+            .map(|(election, mtbf)| Costs { election, mtbf });
         let Some(link) = self.received.link.as_mut() else {
             return;
         };
-        let estimator = &mut link.estimator;
         let floors = Floors {
             granularity,
             sender: Duration::from_nanos(floor_ns).max(granularity),
             correlation: Duration::MAX,
         };
-        let costs = Costs { election, mtbf };
-        if let Ok(configured) = estimator.configure(&costs, &floors) {
-            self.received.configuration = Some(configured);
-            self.report.configurations = self.report.configurations.saturating_add(1);
-            let beta = self.beta_now().unwrap_or(1.0);
-            self.received.renewed = Some((self.report.taken, beta));
+        // The evidence is asked for only where it is wanting: refused for want of `τ_int`, or no
+        // cost to configure by yet.
+        let outcome = costs.map(|costs| link.estimator.configure(&costs, &floors));
+        match outcome {
+            Some(Ok(configured)) => {
+                self.received.configuration = Some(configured);
+                self.report.configurations = self.report.configurations.saturating_add(1);
+                let beta = self.beta_now().unwrap_or(1.0);
+                self.received.renewed = Some((self.report.taken, beta));
+            }
+            Some(Err(hyper_timing::Refusal::CorrelationUnmeasured)) | None => {
+                if let Some(next) = link.estimator.independent_interval() {
+                    self.received.evidence_ns = self.received.evidence_ns.max(nanos(next));
+                }
+            }
+            Some(Err(_)) => {}
         }
     }
 }

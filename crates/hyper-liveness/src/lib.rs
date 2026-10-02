@@ -30,6 +30,15 @@
 //! the pairs watched and the restarts seen (`hyper_timing::Exposure`), and the election cost the
 //! owner's (`Liveness::set_election`, the election law's `T_E`).
 //!
+//! **Every link judged** (`docs/timing.md` §2.8–§2.9, §3 item 10). A link whose heartbeats are too
+//! correlated at its interval for its estimator to measure its evidence asks the interval its Allan
+//! levels say they would be independent at (`LinkEstimator::independent_interval`), and a sender
+//! follows its floor up, not down, so the receiver's evidence is not started again at each move of
+//! a mean. Until a link configures, it is judged by the margin its node's pool of links configures
+//! for it, and a peer from which nothing has come is judged from the attach. A receiver expects
+//! the interval it asked (`LinkEstimator::expect_interval`), and a peer's new run is reported
+//! ([`Change::Restarted`]).
+//!
 //! **The bound.** Each suspicion states when the sender's last heartbeat was due on the sender's
 //! clock and the bound past it within which NFD-E suspects, `η + α + E(D)`, with `E(D)` bounded by
 //! the echoed round trip of the heartbeats in the expected arrival's window (`bound`), which no
@@ -63,7 +72,10 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 pub use codec::{Echo, Heartbeat, KIND, MAX_BYTES, VERSION, is_liveness};
-use hyper_timing::{Configuration, Detector, ExchangeRtt, Exposure, Flushes, Trust, Wakes};
+use hyper_timing::{
+    Configuration, Detector, ExchangeRtt, Exposure, Flushes, LinkBehaviour, LinkEstimator, Trust,
+    Wakes,
+};
 use pair::Pair;
 
 /// A node's identity, as the owner names it (the datagram plane's `PeerId`).
@@ -150,7 +162,9 @@ pub struct Suspicion {
     pub last: Option<Last>,
     /// The bound from the last heartbeat's schedule to `at_ns`, `η + α + E(D)` with `E(D)` bounded
     /// by the echoed round trips of the window's heartbeats (the `bound` module); `None` while a
-    /// heartbeat in the window carried no echo.
+    /// heartbeat in the window carried no echo. For a peer from which no heartbeat came (`last` is
+    /// `None`), the time from the node's first poll with the pair attached, an interval and the
+    /// pool's margin (`docs/timing.md` §3, item 10).
     pub detection: Option<Duration>,
     /// The detector in force when it suspected, if configured (the pair's configuration's
     /// `current`, [`Liveness::configuration`]).
@@ -175,13 +189,32 @@ pub struct Last {
 pub enum Change {
     /// The peer's freshness passed: suspected.
     Suspected(Suspicion),
-    /// A fresh heartbeat came from a peer suspected or not yet trusted.
+    /// A fresh heartbeat came from a peer the owner was told is suspected.
     Trusted {
         /// The peer.
         peer: PeerId,
         /// The heartbeat's arrival.
         at_ns: u64,
     },
+    /// A heartbeat came from a new run of the peer: it restarted, a new incarnation, which the
+    /// owner's core trusts and holds to lead nothing it led before (`RawNode::restarted`). What the
+    /// heartbeat leaves the peer's trust at follows, if it is not trusted.
+    Restarted {
+        /// The peer.
+        peer: PeerId,
+        /// The new run's first heartbeat's arrival.
+        at_ns: u64,
+    },
+}
+
+impl Change {
+    /// The peer the change is about.
+    pub fn peer(&self) -> PeerId {
+        match self {
+            Self::Suspected(suspicion) => suspicion.peer,
+            Self::Trusted { peer, .. } | Self::Restarted { peer, .. } => *peer,
+        }
+    }
 }
 
 /// What a pair has done and promised, for the owner and its tests.
@@ -195,16 +228,25 @@ pub struct PairReport {
     pub taken: u64,
     /// Heartbeats refused for their flush proof.
     pub unproven: u64,
-    /// Whether a configured detector judges the peer.
+    /// Whether a configured detector of the pair's own judges the peer.
     pub configured: bool,
+    /// Whether a margin judges the peer: its own configuration's, or, while it has none, the one
+    /// its node's pool of links configures for it (`docs/timing.md` §3, item 10).
+    pub judged: bool,
+    /// The interval the peer's heartbeats come at, or a longer one this node asked it to move to,
+    /// and the margin in force, `η + α`: how long past a heartbeat's expected arrival less its
+    /// delay the peer is trusted, the election law's base (`docs/timing.md` §2.3); `None` while no
+    /// margin judges.
+    pub freshness: Option<Duration>,
     /// Configurations made.
     pub configurations: u64,
     /// Suspicions of the peer.
     pub suspicions: u64,
     /// Theorem 7's allowance for them: `Σβ` over every freshness point judged while a margin was in
-    /// force, each `β` at that margin from the estimates as they stood, the expected number of
-    /// suspicions were the peer alive throughout (`β` bounds the chance of a mistake at each,
-    /// `η/β` the mistake recurrence).
+    /// force, each `β` at that margin from the estimates as they stood (the pool's, scaled to the
+    /// link's window, while the margin was the pool's), the expected number of suspicions were the
+    /// peer alive throughout (`β` bounds the chance of a mistake at each, `η/β` the mistake
+    /// recurrence).
     pub allowance: f64,
 }
 
@@ -240,6 +282,21 @@ pub struct Liveness {
     exposure: Exposure,
     last_poll_ns: Option<u64>,
     message: [u8; MAX_BYTES],
+    /// The node's pool of its links (`docs/timing.md` §3, item 10): one more estimator, fed the
+    /// prediction errors of every link that has no configuration of its own, the links it exists
+    /// to judge, and of every link until it has its evidence (hyper-swim's rule, §2.7), numbered by
+    /// the heartbeats due across them so a heartbeat lost on any is a loss to it. Fed by the young
+    /// links alone, a pool whose links configured before it could measure would never measure,
+    /// and a peer never heard from would never be judged. Built on the first error fed: one
+    /// allocation, boxed with its ring.
+    pool: Option<Box<LinkEstimator>>,
+    pool_seq: u64,
+    /// What the pool measured, as of the latest error fed that it could say it from. A refusal
+    /// leaves it in force, as `LinkEstimator::configure` leaves its margin and hyper-swim's pool
+    /// its verdict (`docs/timing.md` §2.7): more of a stall can make the pool's `τ_int` unmeasured
+    /// again, and a pair judged by its margin would then judge nothing, a peer it had suspected
+    /// before it was heard never trusted again on its heartbeats.
+    pool_measured: Option<LinkBehaviour>,
 }
 
 impl Liveness {
@@ -260,7 +317,32 @@ impl Liveness {
             exposure: settings.history,
             last_poll_ns: None,
             message: [0; MAX_BYTES],
+            pool: None,
+            pool_seq: 0,
+            pool_measured: None,
         })
+    }
+
+    /// Feeds the pool a link's prediction error, `due` heartbeats after the link's previous one.
+    fn feed_pool(&mut self, due: u64, error: i64, interval: Duration) {
+        let Some(granularity) = self.wakes.granularity() else {
+            return;
+        };
+        if self.pool.is_none() {
+            self.pool = LinkEstimator::new(interval, granularity, None)
+                .ok()
+                .map(Box::new);
+        }
+        let Some(pool) = self.pool.as_mut() else {
+            return;
+        };
+        pool.set_granularity(granularity);
+        self.pool_seq = self.pool_seq.saturating_add(due);
+        // An error past what a window can sum is refused, as any estimator refuses such an offset.
+        let _ = pool.on_offset(self.pool_seq, error);
+        if let Ok(measured) = pool.behaviour() {
+            self.pool_measured = Some(measured);
+        }
     }
 
     /// One more group shared with `peer`: the pair's stream starts with its first.
@@ -333,20 +415,32 @@ impl Liveness {
             return Err(Refusal::FromSelf);
         }
         let beat = Heartbeat::decode(message)?;
+        let (granularity, mtbf, pool) = (
+            self.wakes.granularity(),
+            self.exposure.mtbf(),
+            self.pool_measured,
+        );
         let pair = self.pairs.get_mut(&from).ok_or(Refusal::UnknownPeer)?;
         let context = pair::Context {
-            granularity: self.wakes.granularity(),
-            mtbf: self.exposure.mtbf(),
+            granularity,
+            mtbf,
+            pool: if pair.configured() { None } else { pool },
         };
-        let mut changes = [None, None];
-        let taken = pair.take(from, &beat, arrival_ns, &context, &mut changes);
+        let mut changes = [None, None, None];
+        let mut taken = pair::Taken::default();
+        let outcome = pair.take(from, &beat, arrival_ns, &context, &mut changes, &mut taken);
         for change in changes.into_iter().flatten() {
             out.change(change);
         }
-        if taken? {
+        if taken.restarted {
             self.exposure.on_failure();
         }
-        Ok(())
+        if let Some((due, error)) = taken.error
+            && (!taken.own || pool.is_none())
+        {
+            self.feed_pool(due, error, Duration::from_nanos(beat.interval_ns));
+        }
+        outcome
     }
 
     /// Advances to `now_ns`: suspects peers whose freshness passed, sends the heartbeats due that
@@ -363,7 +457,20 @@ impl Liveness {
             durable_count: self.durable.count,
             durable_ns: self.durable.latest_ns,
         };
+        let pool = self.pool_measured;
+        let (floor, granularity, mtbf) = (self.floor(), self.wakes.granularity(), self.mtbf());
         for (&peer, pair) in &mut self.pairs {
+            pair.attached(now_ns);
+            if let (Some(pool), Some(granularity)) = (&pool, granularity) {
+                if pair.wants_pool_margin() {
+                    pair.pool_margin(pool, granularity, mtbf);
+                }
+                if let Some(floor) = floor
+                    && pair.wants_unheard_margin()
+                {
+                    pair.judge_unheard(pool, floor, granularity, mtbf);
+                }
+            }
             if let Some(change) = pair.judge(peer, now_ns) {
                 out.change(change);
             }

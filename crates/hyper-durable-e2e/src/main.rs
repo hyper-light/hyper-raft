@@ -1,8 +1,8 @@
 //! A member of a hyper-durable group, as a process (`hyper_durable_e2e::node`).
 //!
 //! ```text
-//! hyper-durable-node --id N --voters 1,2,3 --listen 127.0.0.1:0 --log PATH --period-ms T
-//!                    --max-keys K --max-pending P
+//! hyper-durable-node --id N --voters 1,2,3 --listen 127.0.0.1:0 --log PATH --max-keys K
+//!                    --max-pending P
 //! ```
 //!
 //! It prints `listening <port>` once its socket is bound, then serves until its standard input
@@ -14,7 +14,6 @@ use std::net::UdpSocket;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::mpsc::{Receiver, sync_channel};
-use std::time::Duration;
 
 use hyper_durable_e2e::control::{self, Order};
 use hyper_durable_e2e::node::{Node, NodeError, Settings, open_log};
@@ -50,7 +49,6 @@ fn parse(arguments: &[String]) -> Result<Arguments, String> {
         settings: Settings {
             id: value(arguments, "--id")?,
             voters,
-            period: Duration::from_millis(value(arguments, "--period-ms")?),
             max_keys: value(arguments, "--max-keys")?,
             max_pending: value(arguments, "--max-pending")?,
         },
@@ -60,18 +58,27 @@ fn parse(arguments: &[String]) -> Result<Arguments, String> {
 }
 
 /// Watches standard input until it ends: the parent holds its end for as long as it lives, so a
-/// member never outlives its test. One thread, blocked on the pipe.
+/// member never outlives its test. One thread, blocked on the pipe; at its end it wakes the member,
+/// which waits on its socket for as long as nothing is due.
 #[allow(
     clippy::disallowed_methods,
     reason = "real processes on the host's clock, threads and environment (CLAUDE.md §1a, end to end)"
 )]
-fn watch_parent() -> std::io::Result<Receiver<()>> {
+fn watch_parent(socket: &UdpSocket) -> std::io::Result<Receiver<()>> {
     let (gone, parent) = sync_channel(1);
+    let me = socket.local_addr()?;
+    let out = UdpSocket::bind("127.0.0.1:0")?;
+    let mut datagram = Vec::new();
+    control::put_order(&mut datagram, 0, &Order::Wake);
+    let sealed = wire::seal(&mut datagram, wire::MAX_DATAGRAM);
     std::thread::Builder::new()
         .name("parent".to_owned())
         .spawn(move || {
             let _ = std::io::copy(&mut std::io::stdin().lock(), &mut std::io::sink());
             let _ = gone.try_send(());
+            if sealed {
+                let _ = out.send_to(&datagram, me);
+            }
         })
         .map(|_| parent)
 }
@@ -107,12 +114,12 @@ fn serve(arguments: Arguments) -> Result<(), Box<dyn std::error::Error>> {
     let socket = UdpSocket::bind(&arguments.listen)?;
     let port = socket.local_addr()?.port();
     let waker = relay(&socket)?;
+    let parent = watch_parent(&socket)?;
     let mut node = Node::open(arguments.settings, socket, log, waker)?;
     let mut stdout = std::io::stdout().lock();
     writeln!(stdout, "listening {port}")?;
     stdout.flush()?;
     drop(stdout);
-    let parent = watch_parent()?;
     if let Some(point) = node.run(&parent)? {
         let mut stdout = std::io::stdout().lock();
         writeln!(stdout, "stopped {}", point.name())?;

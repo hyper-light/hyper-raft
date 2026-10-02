@@ -12,8 +12,11 @@ publish = false
 hyper-block = { path = "../hyper-block" }
 hyper-durable = { path = "../hyper-durable" }
 hyper-log = { path = "../hyper-log" }
+# The node-pair liveness stream the members' detectors are (timing step L-3).
+hyper-liveness = { path = "../hyper-liveness" }
 hyper-raft = { path = "../hyper-raft" }
-# The election law the members derive their timing by (timing step L-2).
+# The election law's types, and the round trips the test times its asks by (RFC 6298's estimator,
+# `ExchangeRtt`).
 hyper-timing = { path = "../hyper-timing" }
 # The datagram framing, client requests and commands of hyper-raft's own end-to-end harness, so a
 # client speaks to this member as to that one.

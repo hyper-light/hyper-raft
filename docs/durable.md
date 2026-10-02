@@ -453,9 +453,10 @@ flight. The clock is the owner's monotonic clock in nanoseconds, a `u64`, as the
 hyper-liveness's are (`docs/timing.md` §2.9: one type a simulated world drives every sans-io crate
 by; an owner with an `Instant` converts at its edge). The node's liveness stream (L-3) is wired by
 the owner: `Owner::pairs` keeps the stream told which peers each replica's group has,
-`Owner::believe` takes each of its changes to the replicas with a member on that node,
-`Owner::measure` derives each group's timing from what the stream measured
-(`Replica::measure`) and charges the leaders' pairs their groups' expected election, and
+`Owner::believe` takes each of its changes to the replicas with a member on that node (a
+suspicion, trust again, a restart to `Replica::restarted`), `Owner::measure` derives each group's
+timing from what the stream measured (`Replica::measure`) and charges every pair its groups'
+expected election (`docs/timing.md` §2.9: a pair never charged never configured), and
 `Driven::flushed` is the flush each heartbeat proves (`crates/hyper-durable/tests/liveness.rs`). The shell holds the core's campaigns while the member is marked or stalled
 (`RawNode::hold_campaigns`), and the core already holds one while a committed change is unapplied.
 It does not withhold the detectors' words, as the plan here said it would: a marked follower that
@@ -721,18 +722,21 @@ Tests (`crates/hyper-durable/tests`):
   restarted.
 - `crates/hyper-durable-e2e`, real processes: each member a `Replica` on hyper-log over a real,
   fully flushed file (`DeviceFile`), over UDP in hyper-raft-e2e's datagrams, woken by its log's
-  answers through a datagram to its own socket (four threads a process, whatever it holds). The
-  members elect by suspicion: each times its paths to the others by probes once a period and
-  derives its group's timing by hyper-timing's law, and the test, which kills and starts them, tells
-  the others it suspects a member it killed and that one it started is a new incarnation (L-3's
-  stream and L-4's harness replace it). The
-  test (`tests/kill.rs`) kills the leader and a follower with `SIGKILL` at each named durability
+  answers through a datagram to its own socket (five threads a process, whatever it holds, with the
+  one that watches for its test to go). The members elect by suspicion on their own detectors:
+  each runs the node-pair liveness stream, its heartbeats proved by its replica's writes or, idle,
+  by an empty update of a group of the stream's own on the same log, and takes the stream's changes
+  to its replica and its group's timing from what the stream measured, as `Owner` does
+  (`docs/timing.md` §2.9, "On real detectors"). The test tells no member what to believe and
+  derives nothing: it waits on facts while the group moves, for a quiet period of the members'
+  own law. The test (`tests/kill.rs`) kills the leader and a follower with `SIGKILL` at each named durability
   point (a write submitted; a write durable whose answer was not taken; messages released), and at
   seeded random points and counts; focal's F17 cases (the founder killed once it applied the
   removal of its only peer, the peer stopped for good, elects itself alone; killed with the removal
   behind its fence, the group finishes it; a host that acted on a fence, restarted told of no one,
-  acts on it again from its own log); and a failed flush, after which the member fences, exits
-  and rejoins. Every answered write reads back linearizably and every member applies the same
+  acts on it again from its own log); a failed flush, after which the member fences, exits
+  and rejoins; and a stalled disk, whose member every other suspects and the group elects without.
+  At every restart, every member that heard the last run reports the restart its stream saw. Every answered write reads back linearizably and every member applies the same
   history. With the fence taken out the fence host reopens below the fence it acted on; the
   founder's window is too narrow between processes to fail there (its write is on its way when it
   applies), which `directed.rs` covers deterministically.

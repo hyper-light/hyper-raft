@@ -524,10 +524,43 @@ owner multiplexing the plane tells it apart; the kernel stamps come from the own
 time and lateness past `σ_k`, and the flush proof. A sender behind its schedule sends the latest
 heartbeat due; those it skipped are losses to the receiver, which they are.
 - **The interval** is the receiver's: its configurator's best (`Configuration::best`), asked in its
-  own heartbeats (Chen et al.'s adaptive scheme), never below the sender's floor; until the receiver
-  asks, the floor. A change within `G`, the configurator's resolution, is none. Bootstrap: the
-  first heartbeat waits on the first flush, whose time is the first `E[flush]`; the first wake
-  measures `G`.
+  own heartbeats (Chen et al.'s adaptive scheme), never below the sender's floor, nor below the
+  interval its own evidence needs (below, "The interval the evidence needs"). Where the floor binds
+  (before the receiver asks, or past what it asked) the interval is the floor, followed up and not
+  down: an interval below the floor is unstable (Lindley 1952), but a floor that fell is a mean that
+  moved with a sample, and following it down started the receiver's estimator again at every move
+  (`LinkEstimator::retime`), which kept a link whose flushes stalled now and then unconfigured for
+  thousands of heartbeats (§2.9). A change within `G`, the configurator's resolution, is none.
+  Bootstrap: the first heartbeat waits on the first flush, whose time is the first `E[flush]`; the
+  first wake measures `G`.
+- **The interval the evidence needs** (`T_c`, measured online: §2.6 item 6 left it open). The
+  estimator configures only once it has measured `τ_int` (§2.6, item 3), at Madras and Sokal's
+  self-consistent window `m ≥ 6·τ̂(m)` among Allan levels of at least seven windows; heartbeats so
+  correlated at their interval that no level the history holds reaches that window are refused
+  (`Refusal::CorrelationUnmeasured`) for as long as the correlation outgrows the levels, and the
+  receiver, which asked for a longer interval only once configured, never asked. Now the estimator
+  says where its heartbeats would be independent (`LinkEstimator::independent_interval`): `τ_int`
+  heartbeats at `η` carry what one independent one does (an `m`-mean's variance is `V·τ_int/m`,
+  Sokal 1997 §3), so at `η·τ̂` consecutive heartbeats are independent and the window is met at the
+  first level that can hold it, eight windows of eight, 56 heartbeats. `τ̂` is the longest qualified
+  level's, which sees the most of the correlation and is low, never high, where it is shorter than
+  the correlation; it is taken at the low end of its uncertainty (the level's Allan variance to
+  within `(1 + 1/√(2(K−1)))²` for `K` windows, the tolerance `n_A` takes), and a refusal within that
+  uncertainty waits for longer levels instead of moving. A significant refusal has `τ̂` past `8/6`
+  there, so each move lengthens the interval by more than a third, and a link still too correlated
+  at the interval given moves again: the moves end at the first interval its history can tell apart.
+  The receiver asks at least that interval from then on (`max(best, evidence)`), never one it showed
+  it cannot measure at. On an AR(1) delay of correlation time 199 ms with heartbeats at 1 ms, which
+  refuses at that interval past a thousand heartbeats, 64 seeds configured within 576 heartbeats, at
+  a final interval of 166 ms at the median and 1.26 s at the most (`link::tests`). The margin still
+  holds one heartbeat: the measured `T_c` is the evidence's floor, not a licence for Theorem 7's
+  product, which a young link's history cannot vouch for (below).
+- **A moved interval.** A receiver that asks for a longer interval expects the next heartbeat that
+  much later (`LinkEstimator::expect_interval`): until a heartbeat at the new interval comes, each
+  freshness point is put back by the difference, and the stated bound counts it. Before, the
+  freshness point at the old spacing passed before the first heartbeat at the new one came, and the
+  receiver suspected its peer for having done as asked (in `crates/hyper-durable/tests/liveness.rs`,
+  seed 56: a 2 ms margin against a 73 ms move, a false suspicion and an election in an idle group).
 - **The flush proof** (§2.1; CockroachDB's store liveness). A heartbeat leaves only once a write on
   the sender's log became durable after the previous heartbeat to that peer was due and is newer
   than the one the previous heartbeat carried. The owner reports every durable completion
@@ -551,9 +584,10 @@ heartbeat due; those it skipped are losses to the receiver, which they are.
   each probe (§2.7). `T_c` is the spacing past the longest stall a run saw (item 6), which a young
   link has not seen; a first form took the link's own `τ_int·η` for it, and under a one-CPU throttle
   the many-heartbeat margins it allowed broke their allowance in most runs (`docs/benchmarks.md`,
-  "hyper-liveness"). A link may count on the product once `T_c` is measured online; that is open.
-  `Costs { election: T_E from the owner (set_election, the
-  election law's span over the groups whose leader that node is), mtbf: the Jeffreys posterior over
+  "hyper-liveness"). `T_c` measured online (above) is where a link's evidence is resolved, not the
+  spacing past every stall its host will see; whether a link may count on the product past it stays
+  open. `Costs { election: T_E from the owner (set_election, the election law's span over the
+  groups the pair shares), mtbf: the Jeffreys posterior over
   the node time the pairs watched and the restarts and abandoned suspicions seen, seeded with the
   fleet's history }`.
 - **Renewal on a doubling schedule.** The configurator runs when never configured, when the peer
@@ -570,6 +604,32 @@ heartbeat due; those it skipped are losses to the receiver, which they are.
   its own clock, `A − s_echo − hold` (a path for the election law's ballot, `round_trip`), and the
   sum of the two directions' delays from their schedules, `round trip + late_echo + late`, which
   bounds this heartbeat's delay since both are positive.
+- **Judged before its own evidence: the node's pool** (§3, item 10). A link whose own estimator
+  has not configured is judged by the margin its node's pool configures for it. The pool is one more
+  `LinkEstimator`, fed the prediction errors `A − EA` of every link without a configuration of its
+  own, and of every link until the pool has its evidence (hyper-swim's rule, §2.7; a pool fed by the
+  young links alone, whose links all configured before it could measure, never measured, and a peer
+  never heard from was never judged: found by `a_peer_never_heard_from_is_suspected`), numbered by
+  the heartbeats due across the links so a heartbeat lost on any is a loss to it
+  (`LinkEstimator::on_offset`). The errors carry no clock offset, so links whose clocks differ pool.
+  The pool's behaviour for link `L` is its own with the deviation scaled by `√(1 + 1/n_L)` for `L`'s
+  window `n_L`: the prediction errors' variance at a window of `n` is `V(D)(1 + 1/n)` for independent
+  delays and the pool's is at least `V(D)`, so the scaled variance bounds `L`'s from above, the side
+  Cantelli's inequality may err on. Its margin is `detector_at` at `L`'s interval, costs and floors,
+  imposed on `L`'s estimator (`LinkEstimator::impose`), renewed on the doubling schedule, at a poll
+  as soon as the pool can give one, and charged to the allowance at `β` from the scaled behaviour. What
+  the pool measured stands when a later stretch makes its `τ_int` unmeasured again
+  (`pool_measured`), as hyper-swim's verdict and `configure`'s margin stand. A peer from which no
+  heartbeat has come is judged from the node's first poll with the pair attached: one interval at
+  the node's own floor (the pool's premise is that the stalls, and the floors, are the hosts') and
+  the pool's margin for a window of one; its suspicion states that time as its bound, from the
+  attach. `PairReport::judged` says a margin judges, `PairReport::freshness` the `η + α` in force.
+- **A restart** (§3, item 10). A heartbeat of a new run (`boot`) is reported as
+  `Change::Restarted { peer, at_ns }` before the trust the heartbeat leaves, for the owner to call
+  the core's `restarted` (trusted, and leading nothing it led); the owner is then told a suspicion
+  only if the heartbeat leaves the peer suspected. Changes are reported only where what the owner
+  was told differs: the owner trusts a peer until told otherwise, so trust after a suspicion is told
+  and trust after nothing is not.
 - **The detection bound** each suspicion states: NFD-E suspects at `τ_{h+1} = EA_{h+1} + α`, which is
   `η + α + mean(D)` past the last heartbeat's schedule over the expected arrival's window, whatever
   the clocks' offset; the mean of the echoed sums over the same window bounds `mean(D)`, so
@@ -581,19 +641,20 @@ heartbeat due; those it skipped are losses to the receiver, which they are.
 `attach`/`detach` a group's peer; `on_durable(write, started, durable)`; `on_heartbeat(from, message,
 arrival_ns, out)`; `poll(now, out)` and `wake()`, with `Output::{heartbeat, flush, change}`;
 `Change::Suspected(Suspicion { peer, at_ns, noticed_ns, last: { seq, arrival_ns, due_ns, sent_ns },
-detection, detector })` and `Change::Trusted { peer, at_ns }`; `trust(peer)`, `suspected()`,
+detection, detector })`, `Change::Trusted { peer, at_ns }` and `Change::Restarted { peer, at_ns }`;
+`trust(peer)`, `suspected()`,
 `configuration(peer)` (the election law's base is `current.interval + current.margin`),
 `round_trip(peer)`, `report(peer)` (`sent`, `taken`, `unproven`, `suspicions`, `allowance`,
-`configurations`), `set_election(peer, T_E)`, `flush_mean()`, `granularity()`, `floor()`, `mtbf()`.
+`configurations`, `configured`, `judged`, `freshness`), `set_election(peer, T_E)`, `flush_mean()`, `granularity()`, `floor()`, `mtbf()`.
 Every refusal is typed. The owner's contract: feed every message stamped before a time before
-polling at it (hyper-tokio's `PlaneSocket::receive_ready`); the core takes `suspect(node)` and
-`trust(node)` from the changes, and the shell withholds a suspicion while the member is marked,
-stalled or fenced (`docs/durable.md` §8); both are L-2's to define.
+polling at it (hyper-tokio's `PlaneSocket::receive_ready`); the core takes `suspect(node)`,
+`trust(node)` and `restarted(node)` from the changes (hyper-durable's `Owner::believe`).
 
 **Bounds.** Pairs at most `Settings::max_peers` (placement's), typed refusal past it; groups per pair
 a `u32`; one liveness write out at a time; per pair one boxed estimator and a ring of delay sums the
-estimator's own size (the drift bound, §2.6), both resized in place for a longer interval. Once each
-pair is configured, a heartbeat sent and one taken allocate nothing.
+estimator's own size (the drift bound, §2.6), both resized in place for a longer interval; per node
+one pool, an estimator at the first fed link's interval, boxed. Once each pair is configured, a
+heartbeat sent and one taken allocate nothing.
 
 **Tests.** `tests/sim.rs`, one clock, seeded delays, stalls, losses, flushes and wake lateness, the
 owners computing `T_E` from the library's law: live peers keep Theorem 7's allowance (8 seeds); no
@@ -601,7 +662,23 @@ heartbeat leaves without a newer flush made after the previous was due (with and
 groups' own writes); a killed peer is suspected by every survivor within the bound each states from
 the peer's last schedule (16 seeds); a stalled disk is suspected so too, and the stalled node still
 trusts its live peers (8 seeds); a thousand groups send what one does and an unshared pair is
-silent; a restarted peer is trusted again by the detector in force and counted; every refusal.
+silent; a restarted peer is reported restarted once by each other node, trusted again by the
+detector in force and counted; every refusal. Problem 1 and item 10, over seeds 0 to 31 in each of
+three worlds, a LAN, one whose hosts freeze for up to 50 ms about every 250 ms (macOS's measured
+`T_c`, a hundred heartbeats at the floor in each freeze), and one whose groups write every few
+milliseconds to a device that stalls one flush in fifty for up to 60 ms
+(`every_link_configures_or_suspects_a_crash_within_its_bound`): every pair configures, none taking
+more heartbeats unconfigured than any window holds (`WINDOW_LIMIT`, the drift bound's ceiling: a link
+whose estimator has not measured its correlation in as many heartbeats as any window could average
+is one no window resolves), at most 302 heartbeats; then one node is killed after a share of the
+heartbeats it sent before every pair configured in the same seed's run, drawn between none and twice
+as many, and every survivor suspects it, each suspicion within the bound it states, by its own
+configuration's margin (169), the pool's (117), or, for a node never heard from, from the attach (2).
+Before the fix, the stalling world kept a link unconfigured for 5,775 heartbeats (its floor
+followed down with each decaying mean, the estimator started again at each move), and a world
+that is too correlated at its floor is refused by the estimator however long it runs
+(`link::tests`). A peer never heard from is suspected by every other within the bound from the
+attach (16 seeds).
 Property tests: the codec reads back what it writes and refuses every truncation, extension, kind
 and version; the bound is its window's mean. `tests/processes.rs`, real processes over UDP on the
 sealed plane through hyper-tokio's kernel-stamped socket, each liveness write a real write and
@@ -717,36 +794,66 @@ schedules persist at once and never saw it.
 
 **Driven by hyper-liveness (L-3).** `crates/hyper-durable`'s owner keeps each replica's node pairs
 attached to the node's stream from its configuration (`Owner::pairs`), takes each `Change` to every
-replica with a member on that node (`Owner::believe`; a fenced replica reopened is told the stream's
-beliefs, `Replica::believe_all`), derives each group's timing by this law from what the stream
-measured, its echoed round trips, mean flush and granularity (`Replica::measure`, `Owner::measure`),
-charges each leader's pair the mean `T_E` of the groups it leads (`Liveness::set_election`), and
-hands the stream each replica's durable writes as its flush proof (`Driven::flushed`). Held to it in
-`crates/hyper-durable/tests/liveness.rs`, three nodes on one simulated clock with seeded delays,
-flushes and wake lateness, 64 seeds: a group elects from nothing, sends no Raft message while idle
-but after a detector's change (1,900 over 248 changes, the stream's one-heartbeat margins erring
-within their allowance), and its leader's node killed, every survivor suspects it within the bound
-the suspicion states and the survivors elect and commit. What it found of the stream, for L-3:
-- **A link can stay unconfigured for good.** The receiver asks the sender's interval only once its
-  estimator configures, and until it asks the sender sends at its floor; where the heartbeats at the
-  floor are too correlated for `τ_int` to be measured (item 6), the estimator refuses for ever and
-  never asks for the longer interval that would let it configure. In the test, seed 0, one node's
-  link to another took 3,000,000 heartbeats unconfigured; in hyper-durable-e2e's processes on this
-  machine, both followers' links to one member took 2,700 each unconfigured while the reverse links
-  configured within a few hundred. A crash of that member is suspected by nothing (item 10). The
-  test waits, as the fact a crash needs, until the leader's node is judged.
-- **A new run is not surfaced.** The stream sees a peer's restart (a new `boot` re-anchors the pair
-  and counts in the MTBF) but reports no change for it, so the owner has nothing to give the core's
-  `restarted`; the core's own rule (a member that voted for itself in its term hands over or
-  campaigns) covers a restarted leader without it.
-- **The pool** of item 10 is not there yet.
-- **Its kill test killed during a mistake.** With the law's latency corrected the `T_E` its owners
-  charge moved, and seed 26 of `a_killed_peer_is_suspected_within_the_stated_bound` killed the
-  victim while a survivor suspected it by a mistake; that survivor held the suspicion through the
-  kill and made no new one to measure. The test now kills once every survivor trusts the victim,
-  the fact its assertion needs.
-hyper-durable-e2e therefore still takes its detectors' words from the test, which kills the members
-and so knows, until the first of these is closed (L-4).
+replica with a member on that node (`Owner::believe`: `suspect`, `trust`, and `restarted` for
+`Change::Restarted`; a fenced replica reopened is told the stream's beliefs,
+`Replica::believe_all`), derives each group's timing by this law from what the stream measured, its
+echoed round trips, mean flush and granularity (`Replica::measure`, `Owner::measure`), charges every
+pair the mean `T_E` of the groups it shares (`Liveness::set_election`), and hands the stream each
+replica's durable writes as its flush proof (`Driven::flushed`). Every pair, not only the leaders':
+a mistake about any member costs its group an election at most (a follower that suspects its leader
+campaigns, a leader that suspects too many followers steps down), and a pair never charged never
+configured, so a leader's detectors of its followers, which check-quorum reads, judged nothing.
+Held to it in `crates/hyper-durable/tests/liveness.rs`, three nodes on one simulated clock with
+seeded delays, flushes and wake lateness, 1,000 seeds (64 in the gates): a group elects from nothing,
+sends no Raft message while idle but after a detector's change (2,156 over 7,142 changes), its
+leader's node killed, every survivor suspects it within the bound the suspicion states and the
+survivors elect and commit, and the killed node started again on its store, a new run of its
+stream, every survivor's stream reports its restart to its core and the node catches up. The quiet
+period its waits use is the stream's own: the longest `η + α` in force (`PairReport::freshness`,
+which counts an interval asked and not yet taken), the election's span and rounds, a flush and a
+network round.
+
+What the first form of this wiring found of the stream, each closed in hyper-liveness (§2.8):
+- **A link could stay unconfigured for good.** The receiver asked a longer interval only once its
+  estimator configured, and until it asked the sender sent at its floor; where the heartbeats at the
+  floor were too correlated for `τ_int` to be measured (item 6), or the floor itself moved with
+  each stall of the flushes it is the mean of, so that the estimator started again at each move, the
+  link was refused for as long as either lasted. In this test, seed 0, one node's link to another
+  took 3,000,000 heartbeats unconfigured; in hyper-durable-e2e's processes on this machine, both
+  followers' links to one member took 2,700 each. Closed at both causes: the floor is followed up
+  and not down, and a link that refuses for want of `τ_int` asks the interval its own levels say its
+  heartbeats would be independent at (§2.8, "The interval the evidence needs"); meanwhile it is
+  judged by its node's pool, and a peer never heard from is judged from the attach.
+- **A new run was not surfaced.** Now `Change::Restarted`, to the core's `restarted`.
+- **The pool** of item 10: built (§2.8).
+- **A false suspicion at every move the receiver asked.** Found once the intervals moved: a
+  receiver that asked a longer interval suspected its peer at the old spacing (§2.8, "A moved
+  interval"); the receiver now expects the move.
+- **Its kill test killed during a mistake.** Seed 26 of
+  `a_killed_peer_is_suspected_within_the_stated_bound` killed the victim while a survivor suspected
+  it by a mistake; the test now kills once every survivor trusts the victim. In this test, likewise,
+  a suspicion held from before the kill is not one the kill's bound applies to (seed 607).
+
+**On real detectors** (L-4's harness half, `crates/hyper-durable-e2e`). Each member process runs
+the stream itself, wired as the owner wires it for one replica: heartbeats travel as the harness's
+datagrams, stamped when read (as hyper-tokio stamps where the kernel cannot, item 5); the stream's
+own writes go to a group of their own on the member's log, on the same device, so a disk that stops
+stops the heartbeats with it. The test tells no member what to believe and derives nothing: its
+period measurement, its 95/95 tolerance bounds and its count caps are gone. It waits on facts and
+goes on while the group moves — any member's term, commit, applied index, last index or restarts
+seen, or, while a member has a pair no margin judges, the heartbeats it has taken — and gives up
+after a quiet period of the members' own law (the longest `η + α` any member states, its election's
+span and three rounds, an ask's three), never less than its own retransmission timeout (RFC 6298:
+one second before a round trip is measured and never less after, §2.1, §2.4). An ask is resent at
+that timeout. A member just started is waited on while its process runs. Its count bounds are the
+protocol's: a member passes each durability point at least once for each turn of writes it takes
+(the most a turn takes, `max_pending + voters + 1`), so a target that has not stopped after that
+many answered writes is a failure. New scenarios: a stalled disk (the member's file stops
+completing flushes, so its heartbeats stop; every other member suspects it and the group elects
+without it) and, at every restart, every member that heard the last run and shares a group with
+the restarted one reports the restart its stream saw. The member's shell writes its commit alone at
+the first moment no write is out (`Settings::quiet` zero): an owner woken by events has no period.
+Measured in `docs/benchmarks.md`, "hyper-durable-e2e on its own detectors".
 
 **The model.** These rules only bring forward or refuse a campaign, or forget a leader, which is
 volatile; the TLA+ model's `Elect` may be taken at any time with any quorum the log comparison
@@ -815,7 +922,7 @@ and election law; the remaining items keep their numbers, and item 10 is what L-
 - **9. Bare Linux.** Every Linux number here is from Docker Desktop's VM: 1 ms ticks, and a disk
   image that is a file on the Mac. A Linux host with its own disk is to be traced the same way.
 - **10. A link younger than its evidence. Resolved; the core's half built in L-2, the detector's
-  half owed in hyper-liveness.** The election law has nothing to run on
+  half in hyper-liveness (§2.8).** The election law has nothing to run on
   before a quorum's paths have answered (no ballot) or before the leader's link has configured its
   detector (a few dozen heartbeats at `T_c`, §2.6, item 3), and a link that stopped receiving never
   gathers its evidence. The cause is that a link's detector judges only from its own history. The
@@ -836,9 +943,9 @@ and election law; the remaining items keep their numbers, and item 10 is what L-
     pool configures, scaled to the link's window (the prediction errors' variance is
     `V(D)(1 + 1/n)` at a window of `n`), against the link's own expected arrival — anchored at its
     first heartbeat, or, for a peer from which none has arrived, one interval past the moment the
-    node first attached the pair. hyper-liveness as merged (§2.8) judges a pair by its own
-    estimator only, `Trust::Unconfigured` and no change until it configures; the pool is what it
-    owes for this item. That suffices, by this argument: a group elects only with a live
+    node first attached the pair: built, with the pool's own behaviour scaled by `√(1 + 1/n)`, an
+    upper bound on the link's (§2.8, "Judged before its own evidence"). That suffices, by this
+    argument: a group elects only with a live
     majority of its voters. For `n ≥ 3` a live majority holds at least two members, so every live
     voter that must detect its leader's crash has a live peer in the group, and the node-pair
     stream between them (L-3 runs one between every two nodes that share a group) feeds its node's
@@ -848,12 +955,14 @@ and election law; the remaining items keep their numbers, and item 10 is what L-
     next freshness point. Two voters cannot elect without both, one never suspects, and a node whose
     pool has no live link has no peer to elect with. A crash in a link's first heartbeats is so
     suspected within the later of the pool's evidence and the link's freshness point, both measured.
+    The pool's evidence is itself bounded by the interval the evidence needs (§2.8): a live link
+    too correlated at its floor moves to where its heartbeats are independent instead of refusing,
+    so the pool, which needs the same evidence, reaches it. Held in hyper-liveness's simulation
+    (`every_link_configures_or_suspects_a_crash_within_its_bound`, `a_peer_never_heard_from_is_suspected`).
   - *A restart is not a crash the detectors can miss.* The stream carries the sender's run
     (`boot`, §2.8), and a new run is an incarnation's end: told to the core (`restarted`), the node is
-    trusted and leads nothing it led before. hyper-liveness sees it (a new run re-anchors the pair
-    and counts in the MTBF) and does not yet surface it; until it does, the core needs it only for
-    a restarted leader held from campaigning, whose own vote for itself in its term already makes
-    it hand over (§2.9).
+    trusted and leads nothing it led before. hyper-liveness reports it, `Change::Restarted`, and
+    hyper-durable's owner takes it to the core (§2.8, §2.9), as the E2E's members do.
   What stays open is §2.7's for the pool: its mean is wrong for a pair far from the node's other
   peers until that pair configures, and while a history is young the allowance is loose (item 3).
 
@@ -888,7 +997,10 @@ and election law; the remaining items keep their numbers, and item 10 is what L-
   from measured floors on a doubling schedule; each suspicion stating its bound from the echoed
   round trips. A heartbeat allocates nothing once configured and costs 0.7 to 1.0 µs of the crate's
   work; per node, the stream's cost does not grow with the groups (`docs/benchmarks.md`,
-  "hyper-liveness").
-- **L-4** the E2E member and harness on L-1–L-3 (§2.5); the harness's computed tick and budgets
-  go.
+  "hyper-liveness"). Its follow-ups (§2.9) done: every link configures or is judged by its node's
+  pool, the interval its evidence needs measured online, a moved interval expected, a restart
+  reported (`Change::Restarted`).
+- **L-4** the E2E member and harness on L-1–L-3 (§2.5): hyper-raft-e2e's harness still computes its
+  tick and budgets; hyper-durable-e2e's runs on its members' own detectors, its computed period and
+  budgets gone (§2.9, "On real detectors").
 - **L-5** mantle, focal and slates on it.

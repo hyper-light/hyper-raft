@@ -12,7 +12,8 @@
 //! once it is idle its members send no message of Raft at all, only the stream's heartbeats; once
 //! every other node judges the leader's node by a configured detector, the leader's node killed,
 //! every survivor's stream suspects it within the bound the suspicion states, and the survivors
-//! elect and commit. Every wait is on progress (`docs/sim.md` §4.2).
+//! elect and commit; started again, a new run of its stream, every survivor's stream reports the
+//! restart to its core and the node catches up. Every wait is on progress (`docs/sim.md` §4.2).
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -99,8 +100,11 @@ struct World {
     /// Raft messages sent, all told.
     raft_sent: u64,
     suspicions: Vec<(u64, hyper_liveness::Suspicion)>,
+    /// Restarts the streams reported: who saw whom start again.
+    restarts: Vec<(u64, u64)>,
     /// Changes the streams reported, all told.
     changes: u64,
+    seed: u64,
 }
 
 impl World {
@@ -148,7 +152,60 @@ impl World {
             rng: Seeded(seed),
             raft_sent: 0,
             suspicions: Vec::new(),
+            restarts: Vec::new(),
             changes: 0,
+            seed,
+        }
+    }
+
+    /// The node `id` starts again on what its store holds durable, a new run of its liveness
+    /// stream (a new boot): the process it was is gone, the node is not.
+    fn restart(&mut self, id: u64) {
+        let at = (id - 1) as usize;
+        let node = &mut self.nodes[at];
+        let mut old = node.owner.remove(node.handle).unwrap();
+        let disk = old.log_mut().disk.clone();
+        let machine = old.machine().crashed();
+        drop(old);
+        let replica: Member = Replica::open(
+            &settings(id, self.seed),
+            SimStore::from_disk(disk, DEPTH),
+            machine,
+            Unbounded,
+        )
+        .unwrap();
+        let mut owner = Owner::new(vec![Waker::noop().clone()]);
+        let handle = owner.insert(replica).map_err(|_| ()).unwrap();
+        let mut liveness = Liveness::new(LiveSettings {
+            local: id,
+            boot: self
+                .seed
+                .wrapping_mul(31)
+                .wrapping_add(id)
+                .wrapping_add(self.now),
+            max_peers: 3,
+            history: Exposure::new(),
+        })
+        .unwrap();
+        owner.pairs(handle, &mut liveness, false).unwrap();
+        *node = Node {
+            id,
+            owner,
+            handle,
+            liveness,
+            flushing: None,
+            durable_at: None,
+            alarm: Some(self.now),
+            alive: true,
+        };
+    }
+
+    fn record(&mut self, at: u64, change: &Change) {
+        self.changes += 1;
+        match change {
+            Change::Suspected(suspicion) => self.suspicions.push((at, *suspicion)),
+            Change::Restarted { peer, .. } => self.restarts.push((at, *peer)),
+            Change::Trusted { .. } => {}
         }
     }
 
@@ -164,7 +221,7 @@ impl World {
         let at = (id - 1) as usize;
         let mut live = Live::default();
         let mut outgoing: Vec<(u64, u64, Payload)> = Vec::new();
-        {
+        let (changes, me) = {
             let node = &mut self.nodes[at];
             if !node.alive {
                 return;
@@ -186,12 +243,10 @@ impl World {
                 node.flushing = Some((now, now + FLUSH_NS));
             }
             for change in &live.changes {
-                self.changes += 1;
-                if let Change::Suspected(suspicion) = change {
-                    self.suspicions.push((node.id, *suspicion));
-                }
                 node.owner.believe(change);
             }
+            let changes = std::mem::take(&mut live.changes);
+            let me = node.id;
             node.owner.measure(&mut node.liveness);
             node.owner.schedule(node.handle);
             let mut out = Output::default();
@@ -235,6 +290,10 @@ impl World {
             .flatten()
             .filter(|at| *at > now)
             .min();
+            (changes, me)
+        };
+        for change in &changes {
+            self.record(me, change);
         }
         for (to, from, payload) in outgoing {
             if matches!(payload, Payload::Raft(_)) {
@@ -257,6 +316,7 @@ impl World {
             (Some((at, seq)), alarm) if alarm.is_none_or(|(due, _)| at <= due) => {
                 self.now = self.now.max(at);
                 let (to, from, payload) = self.flight.remove(&(at, seq)).unwrap();
+                let mut seen = Vec::new();
                 let node = &mut self.nodes[(to - 1) as usize];
                 if !node.alive {
                     return;
@@ -273,13 +333,13 @@ impl World {
                             .liveness
                             .on_heartbeat(from, &bytes, self.now, &mut live);
                         for change in &live.changes {
-                            self.changes += 1;
-                            if let Change::Suspected(suspicion) = change {
-                                self.suspicions.push((to, *suspicion));
-                            }
                             node.owner.believe(change);
                         }
+                        seen = live.changes;
                     }
+                }
+                for change in &seen {
+                    self.record(to, change);
                 }
                 self.act(to);
             }
@@ -343,25 +403,30 @@ impl World {
             }
             assert!(
                 self.now <= moved + self.quiet(),
-                "nothing moved for a quiet period: {:?}",
+                "seed {}: nothing moved for a quiet period: {:?}",
+                self.seed,
                 self.progress()
             );
         }
     }
 
+    /// The quiet period (`docs/sim.md` §4.2): the longest any live node trusts a peer past its
+    /// heartbeat's expected arrival, the slowest election's span and rounds, and a round of the
+    /// network and a flush, by the nodes' own measurements; doubled, as a node acts on them only
+    /// at its next wake.
     fn quiet(&self) -> u64 {
-        let mut quiet = FLUSH_NS + 2 * (DELAY_NS + JITTER_NS);
+        let (mut freshness, mut election) = (0u64, 0u64);
         for node in self.nodes.iter().filter(|n| n.alive) {
             for peer in 1..=3u64 {
-                if let Some(c) = node.liveness.configuration(peer) {
-                    quiet = quiet.max(c.current.detection.as_nanos() as u64);
+                if let Some(trusted) = node.liveness.report(peer).and_then(|r| r.freshness) {
+                    freshness = freshness.max(trusted.as_nanos() as u64);
                 }
             }
             if let Some(t) = node.owner.get(node.handle).unwrap().core().raft.timing() {
-                quiet = quiet.max((t.span + t.round * 4).as_nanos() as u64);
+                election = election.max((t.span + t.round * 4).as_nanos() as u64);
             }
         }
-        2 * quiet
+        2 * (freshness + election + FLUSH_NS + 2 * (DELAY_NS + JITTER_NS))
     }
 
     /// Whether every other live node judges `peer` by a configured detector: the fact a crash of
@@ -443,7 +508,11 @@ fn the_shell_elects_sleeps_and_fails_over_on_the_liveness_stream() {
         });
         // A suspicion made after the kill states its bound; one a survivor held already (a
         // mistake just before it) stands.
-        for (_, suspicion) in world.suspicions.iter().filter(|(_, s)| s.peer == leader) {
+        for (_, suspicion) in world
+            .suspicions
+            .iter()
+            .filter(|(_, s)| s.peer == leader && s.at_ns >= killed_at)
+        {
             if let (Some(bound), Some(last)) = (suspicion.detection, suspicion.last) {
                 // The bound runs from the sender's last schedule; on one clock that is its due.
                 assert!(
@@ -453,11 +522,22 @@ fn the_shell_elects_sleeps_and_fails_over_on_the_liveness_stream() {
                     last.due_ns
                 );
             }
-            assert!(suspicion.at_ns >= killed_at);
         }
-        let _ = seed;
         assert!(world.propose(b"after"));
         world.run_until(|w| w.applied_everywhere(b"after"));
+        // The killed node starts again: every survivor's stream reports the restart, which reaches
+        // the survivors' cores (`Replica::restarted`), and the node catches up.
+        world.restarts.clear();
+        world.restart(leader);
+        world.run_until(|w| {
+            [1, 2, 3]
+                .iter()
+                .filter(|id| **id != leader)
+                .all(|id| w.restarts.contains(&(*id, leader)))
+        });
+        world.run_until(|w| w.leader().is_some());
+        assert!(world.propose(b"rejoined"));
+        world.run_until(|w| w.applied_everywhere(b"rejoined"));
     }
     println!(
         "idle: {} Raft messages, all after {} detectors' changes",

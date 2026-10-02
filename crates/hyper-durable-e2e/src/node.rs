@@ -1,20 +1,25 @@
 //! One member as a process: a hyper-durable `Replica` over hyper-log on a real file, a UDP socket,
-//! and the key-value store of [`crate::machine`]. One thread does the member's work: it waits on
-//! its socket until the replica's deadline or the end of its period, steps what arrived, and drives
-//! the replica, which submits its writes with the member's waker and returns. The log's answer
-//! wakes the waker, which a relay thread turns into a datagram to the member's own socket, so the
-//! one wait the member makes covers both. The log runs its own two threads. A process runs these
-//! four, whatever it holds.
+//! the node-pair liveness stream (`hyper_liveness`), and the key-value store of [`crate::machine`].
+//! One thread does the member's work: it waits on its socket until the replica's deadline or the
+//! stream's wake, whichever is first, takes what arrived, polls the stream, and drives the replica,
+//! which submits its writes with the member's waker and returns. The log's answer wakes the waker,
+//! which a relay thread turns into a datagram to the member's own socket, so the one wait the
+//! member makes covers both. The log runs its own two threads. A process runs these four and the
+//! one that watches for its test to go, whatever it holds.
 //!
-//! The replica elects by suspicion (timing step L-2, `docs/timing.md` §2.8) and takes no ticks.
-//! What its detectors believe of its peers the test tells it (`control::Order::Suspect`, `Trust`,
-//! `Restarted`): the test kills the members, so it knows, and stands for L-3's node-pair stream
-//! until L-4. Its group's timing is hyper-timing's law over what the member measures: each period
-//! it probes each peer and times the answer (`ExchangeRtt`), its wakes give the granularity
-//! (`Wakes`: every wake at or past the one it asked, whatever woke it), and its replica's vote
-//! writes the mean flush (`Flushes`); the ballot and its span
-//! are derived again whenever a measurement moves, and a group with no measured quorum of paths
-//! draws no delay and so does not campaign (`docs/timing.md` §3, item 10).
+//! The replica elects by suspicion (timing step L-2, `docs/timing.md` §2.9) and takes no ticks.
+//! What its detectors believe of its peers is the node-pair stream's word (L-3, §2.8), wired as
+//! hyper-durable's `Owner` wires it for an owner of one replica: the pairs attached from the
+//! replica's configuration, each change taken to the replica (`suspect`, `trust`, `restarted`),
+//! the group's timing derived by hyper-timing's law over what the stream measured (its echoed round
+//! trips, its granularity, the mean flush: `Replica::measure`) and each pair charged the group's
+//! expected election, and every durable write of the replica handed to the stream as its flush
+//! proof. A heartbeat leaves only once the member's log made a write durable after the previous was
+//! due: where the group wrote none, the member makes one on the same log, an empty update of a group
+//! of the stream's own ([`LIVENESS_GROUP`]), so a disk that stops stops the heartbeats with it.
+//! Heartbeats travel as this harness's datagrams ([`control::put_heartbeat`]), stamped when the
+//! member reads them, as hyper-tokio stamps a datagram where the kernel cannot (`docs/timing.md`
+//! §3, item 5): the read delay counts as the sender's.
 //!
 //! A write is answered once it is applied, so an answered write is committed; a read once a
 //! quorum confirmed the leader and the member applied through the index it was confirmed at.
@@ -28,15 +33,20 @@ use std::sync::mpsc::Receiver;
 use std::task::Waker;
 use std::time::{Duration, Instant};
 
+use hyper_liveness::{
+    Change, Liveness, Output as LiveOutput, PeerId, Settings as LiveSettings, Write as LiveWrite,
+};
+use hyper_log::{Class, Pending, Update};
+use hyper_timing::{Exposure, Trust};
+
 use hyper_durable::{
     Cause, GroupStore, Output, Replica, ReplicaError, Settings as Shell, Unbounded,
 };
 use hyper_log::{Config as LogConfig, Log, Waits};
 use hyper_raft::proto::{ConfChangeSingle, ConfChangeTransition, ConfChangeV2, ConfState, Message};
 use hyper_raft::wire::Record;
-use hyper_raft::{Config, StateRole, Timing};
+use hyper_raft::{Config, StateRole};
 use hyper_raft_e2e::wire::{self, Command, Control, Kind, Op, Outcome, Status};
-use hyper_timing::{Ballot, ExchangeRtt, Wakes};
 
 use crate::control::{self, Order, Point, Report};
 use crate::file::{self, FaultFile};
@@ -44,6 +54,10 @@ use crate::machine::{Applied, Kv};
 
 /// The group every member's log holds: one group a log.
 pub const GROUP: u128 = 1;
+/// The group the node-pair stream's own writes go to, on the same log and device as the replica's,
+/// where no write of the replica's came in time to prove a heartbeat: a group of no records, so
+/// its writes hold nothing a reopened member reads.
+pub const LIVENESS_GROUP: u128 = 2;
 /// The log's id.
 const LOG_ID: u128 = 0x0068_7970_6572_2d64_7572_6162_6c65;
 
@@ -55,13 +69,14 @@ const MESSAGE_ROOM: usize = wire::HEADER
     + hyper_raft::wire::MESSAGE_FIXED_BYTES
     + hyper_raft::wire::CHECKSUM_BYTES;
 
-/// The log's settings: segments of 64 blocks, sixty-four of them (16 MiB), one group, and the
-/// writer's measured waits (`Waits::Measured`, a node's).
+/// The log's settings: segments of 64 blocks, sixty-four of them (16 MiB), the replica's group and
+/// the liveness stream's ([`LIVENESS_GROUP`]), and the writer's measured waits (`Waits::Measured`, a
+/// node's).
 pub fn log_config() -> LogConfig {
     LogConfig {
         segment_bytes: 64 * 4096,
         max_segments: 64,
-        max_groups: 1,
+        max_groups: 2,
         group_entries: 1 << 16,
         group_bytes: 1 << 24,
         group_cache: 1 << 20,
@@ -81,8 +96,8 @@ pub enum NodeError {
     Open(hyper_durable::OpenError),
     /// The socket refused.
     Io(std::io::Error),
-    /// The next period is past what the clock counts.
-    Clock,
+    /// The liveness stream refused: a peer it cannot keep.
+    Liveness(hyper_liveness::Refusal),
 }
 
 impl std::fmt::Display for NodeError {
@@ -92,7 +107,7 @@ impl std::fmt::Display for NodeError {
             Self::Log(e) => write!(f, "the log: {e}"),
             Self::Open(e) => write!(f, "open: {e}"),
             Self::Io(e) => write!(f, "the socket: {e}"),
-            Self::Clock => write!(f, "the next period is past what the clock counts"),
+            Self::Liveness(e) => write!(f, "the liveness stream: {e}"),
         }
     }
 }
@@ -112,9 +127,6 @@ pub struct Settings {
     pub id: u64,
     /// The voters a new group is founded with.
     pub voters: Vec<u64>,
-    /// The owner's period: a commit no write stated for a period is written, and each peer is
-    /// probed once a period.
-    pub period: Duration,
     /// The most keys the store holds.
     pub max_keys: usize,
     /// The most writes and reads one member waits to answer.
@@ -150,18 +162,40 @@ pub struct Node {
     sending: Vec<u8>,
     datagram: usize,
     command: Vec<u8>,
-    /// The member's clock's origin: probes are stamped in nanoseconds since.
+    /// The member's clock's origin: its times are nanoseconds since.
     epoch: Instant,
-    /// The round trips measured to each peer, in the order of `peers`.
-    paths: Vec<(u64, ExchangeRtt)>,
-    /// How late the member wakes past what it asked: the granularity `G`. A wake counts whenever
-    /// it comes at or past the time asked, whatever woke it: a member whose waits a datagram ended
-    /// each time, as the test's own asks do while it waits on the group, measured no `G` when only
-    /// a wait that timed out counted, so it derived no timing and never campaigned (CI run
-    /// 37026031322, Linux and Windows).
-    wakes: Wakes,
-    /// The timing last given to the replica.
-    timing: Option<Timing>,
+    /// The node-pair liveness stream.
+    liveness: Liveness,
+    /// The peers the stream was told the group shares, in order.
+    attached: Vec<PeerId>,
+    /// What the stream asked of the member during one call.
+    asked: Asked,
+    /// The stream's write out, and when it was submitted.
+    liveness_write: Option<(Pending, u64)>,
+    /// A write of the stream's failed: the log is fenced, and no heartbeat is proved again.
+    liveness_failed: bool,
+    /// The restarts of its peers the stream reported.
+    restarts: u64,
+}
+
+/// What the liveness stream asks of the member: heartbeats to send, a write to make, changes.
+#[derive(Default)]
+struct Asked {
+    heartbeats: Vec<(PeerId, Vec<u8>)>,
+    flush: bool,
+    changes: Vec<Change>,
+}
+
+impl LiveOutput for Asked {
+    fn heartbeat(&mut self, peer: PeerId, message: &[u8]) {
+        self.heartbeats.push((peer, message.to_vec()));
+    }
+    fn flush(&mut self) {
+        self.flush = true;
+    }
+    fn change(&mut self, change: Change) {
+        self.changes.push(change);
+    }
 }
 
 /// Opens the log at `path`, or creates it when the file is new.
@@ -201,7 +235,10 @@ impl Node {
                 seed: settings.id,
                 ..Config::new(settings.id)
             },
-            quiet: settings.period,
+            // An owner woken by events has no period: the commit is written alone at the first
+            // moment no write is out, the soonest a member that stops can reopen with what it
+            // applied, at one write a lull (`docs/durable.md` §4.1).
+            quiet: Duration::ZERO,
         };
         let store = GroupStore::claim(&log, GROUP).map_err(|e| match e {
             hyper_durable::ClaimError::Log(e) => NodeError::Log(e),
@@ -215,6 +252,16 @@ impl Node {
         };
         let machine = Kv::new(configuration, settings.max_keys);
         let replica = Replica::open(&shell, store, machine, Unbounded).map_err(NodeError::Open)?;
+        // A run the node never reuses: its process, and the port its socket took, which a member
+        // started again on its log does not keep.
+        let port = socket.local_addr()?.port();
+        let liveness = Liveness::new(LiveSettings {
+            local: settings.id,
+            boot: u64::from(std::process::id()) ^ (u64::from(port) << 32),
+            max_peers: hyper_raft::MAX_MEMBERS,
+            history: Exposure::new(),
+        })
+        .map_err(NodeError::Liveness)?;
         Ok(Self {
             replica,
             log,
@@ -234,68 +281,140 @@ impl Node {
             datagram,
             command: Vec::new(),
             epoch: Instant::now(),
-            paths: Vec::new(),
-            wakes: Wakes::new(),
-            timing: None,
+            liveness,
+            attached: Vec::new(),
+            asked: Asked::default(),
+            liveness_write: None,
+            liveness_failed: false,
+            restarts: 0,
             settings,
         })
     }
 
-    /// Nanoseconds on the member's clock.
-    fn nanos(&self, at: Instant) -> u64 {
-        u64::try_from(at.saturating_duration_since(self.epoch).as_nanos()).unwrap_or(u64::MAX)
-    }
-
-    /// Probes every peer, stamped now: each answers at once, and the answer times the path.
+    /// Nanoseconds on the member's clock, now.
     #[allow(
         clippy::disallowed_methods,
         reason = "real processes on the host's clock, threads and environment (CLAUDE.md §1a, end to end)"
     )]
-    fn probe(&mut self) -> Result<(), NodeError> {
-        if self.isolated {
+    fn now(&self) -> u64 {
+        u64::try_from(
+            Instant::now()
+                .saturating_duration_since(self.epoch)
+                .as_nanos(),
+        )
+        .unwrap_or(u64::MAX)
+    }
+
+    /// The group's timing from what the stream measured, given to the replica when it moved, and
+    /// each pair charged the group's expected election (hyper-durable's `Owner::measure` for one
+    /// replica): none before a quorum's paths and the granularity are measured.
+    fn measure(&mut self) -> Result<(), NodeError> {
+        let Some(span) = heard(self.replica.measure(&self.liveness))?.flatten() else {
             return Ok(());
-        }
-        let stamp = self.nanos(Instant::now());
-        for at in 0..self.peers.len() {
-            let Some(&(peer, address)) = self.peers.get(at) else {
-                continue;
-            };
-            if peer == self.settings.id {
-                continue;
-            }
-            control::put_order(&mut self.sending, 0, &Order::Probe(stamp));
-            if wire::seal(&mut self.sending, self.datagram) {
-                self.send(address)?;
-            }
+        };
+        for peer in &self.attached {
+            // Every attached peer has its pair.
+            let _ = self.liveness.set_election(*peer, span.election);
         }
         Ok(())
     }
 
-    /// The group's timing from what the member measured: the ballot over its paths to the other
-    /// voters, the span it chooses, given to the replica when it moved. None before a quorum's
-    /// paths and a wait are measured.
-    fn measure(&mut self) -> Result<(), NodeError> {
-        let Some(granularity) = self.wakes.granularity() else {
-            return Ok(());
-        };
-        let voters = &self.replica.configuration().voters;
-        let paths = self
-            .paths
-            .iter()
-            .filter(|(peer, _)| voters.contains(peer))
-            .map(|(_, path)| path);
-        let durable = self.replica.flushes().mean().unwrap_or(Duration::ZERO);
-        let Some(ballot) = Ballot::measure(paths, voters.len(), durable, granularity) else {
-            return Ok(());
-        };
-        let Some(span) = ballot.span(granularity) else {
-            return Ok(());
-        };
-        let timing = Timing::of(&ballot, &span);
-        if self.timing != Some(timing) {
-            self.timing = Some(timing);
-            heard(self.replica.set_timing(timing))?;
+    /// Keeps the stream told which peers the group has: its configuration's other members,
+    /// attached as they join and detached as they leave (hyper-durable's `Owner::pairs`).
+    fn pairs(&mut self) -> Result<(), NodeError> {
+        let mut now: Vec<PeerId> = self.replica.peers().collect();
+        now.sort_unstable();
+        now.dedup();
+        for peer in &now {
+            if self.attached.binary_search(peer).is_err() {
+                self.liveness.attach(*peer).map_err(NodeError::Liveness)?;
+            }
         }
+        for peer in &self.attached {
+            if now.binary_search(peer).is_err() {
+                self.liveness.detach(*peer).map_err(NodeError::Liveness)?;
+            }
+        }
+        self.attached = now;
+        Ok(())
+    }
+
+    /// Polls the stream at the member's clock: what its write made durable first, then what is
+    /// due; sends the heartbeats it gives, makes the write it asks for, and takes its changes to
+    /// the replica.
+    fn live(&mut self) -> Result<(), NodeError> {
+        if let Some((pending, started)) = &self.liveness_write
+            && let Some(answer) = pending.poll()
+        {
+            let started = *started;
+            self.liveness_write = None;
+            match answer {
+                Ok(()) => {
+                    let now = self.now();
+                    self.liveness.on_durable(LiveWrite::Liveness, started, now);
+                }
+                // The device failed: the log is fenced, and the replica fences at its next
+                // write. No heartbeat is proved again, so its peers suspect it.
+                Err(_) => self.liveness_failed = true,
+            }
+        }
+        let now = self.now();
+        self.liveness.poll(now, &mut self.asked);
+        self.act_on_liveness()
+    }
+
+    /// Carries out what the stream asked during the last call into it.
+    fn act_on_liveness(&mut self) -> Result<(), NodeError> {
+        if std::mem::take(&mut self.asked.flush)
+            && self.liveness_write.is_none()
+            && !self.liveness_failed
+        {
+            let started = self.now();
+            match self.log.submit_waking(
+                LIVENESS_GROUP,
+                Class::Latency,
+                Update::default(),
+                self.waker.clone(),
+            ) {
+                Ok(pending) => self.liveness_write = Some((pending, started)),
+                Err(_) => self.liveness_failed = true,
+            }
+        }
+        let heartbeats = std::mem::take(&mut self.asked.heartbeats);
+        for (peer, message) in &heartbeats {
+            if self.isolated {
+                break;
+            }
+            let Some(address) = self
+                .peers
+                .iter()
+                .find(|(id, _)| id == peer)
+                .map(|(_, address)| *address)
+            else {
+                // A peer whose address the member was not told: the heartbeat is lost to it.
+                continue;
+            };
+            control::put_heartbeat(&mut self.sending, self.settings.id, message);
+            if wire::seal(&mut self.sending, self.datagram) {
+                self.send(address)?;
+            }
+        }
+        self.asked.heartbeats = heartbeats;
+        self.asked.heartbeats.clear();
+        let changes = std::mem::take(&mut self.asked.changes);
+        for change in &changes {
+            let peer = change.peer();
+            match change {
+                Change::Suspected(_) => heard(self.replica.suspect(peer))?,
+                Change::Trusted { .. } => heard(self.replica.trust(peer))?,
+                Change::Restarted { .. } => {
+                    self.restarts = self.restarts.saturating_add(1);
+                    heard(self.replica.restarted(peer))?
+                }
+            };
+        }
+        self.asked.changes = changes;
+        self.asked.changes.clear();
         Ok(())
     }
 
@@ -306,32 +425,22 @@ impl Node {
 
     /// Runs until `parent` says the test is gone, or until the member stops at an armed point
     /// (`Ok(Some(point))`), or fails.
-    #[allow(
-        clippy::disallowed_methods,
-        reason = "real processes on the host's clock, threads and environment (CLAUDE.md §1a, end to end)"
-    )]
     pub fn run(&mut self, parent: &Receiver<()>) -> Result<Option<Point>, NodeError> {
-        let period = self.settings.period;
-        let mut next_period = Instant::now();
         // The member drives once before it waits: a reopened member replays its log alone.
+        self.pairs()?;
         if let Some(point) = self.drive()? {
             return Ok(Some(point));
         }
         while parent.try_recv().is_err() {
-            let now = Instant::now();
-            if now >= next_period {
-                self.probe()?;
-                next_period = now.checked_add(period).ok_or(NodeError::Clock)?;
-            }
-            // Woken at the replica's deadline, or at the period's end, whichever is first.
-            let until = self
-                .replica
-                .deadline()
-                .and_then(|at| self.epoch.checked_add(Duration::from_nanos(at)))
-                .map_or(next_period, |deadline| deadline.min(next_period));
-            self.wakes.ask(Some(self.nanos(until)));
+            self.live()?;
+            // Woken at the replica's deadline or the stream's, whichever is first; by a datagram
+            // otherwise, the test's going among them.
+            let until = [self.replica.deadline(), self.liveness.wake()]
+                .into_iter()
+                .flatten()
+                .min();
             self.receive_until(until)?;
-            self.wakes.woke(self.nanos(Instant::now()));
+            self.live()?;
             if std::mem::take(&mut self.woken) && self.stops_at(Point::Durable) {
                 return Ok(Some(Point::Durable));
             }
@@ -358,16 +467,13 @@ impl Node {
         }
     }
 
-    /// Waits for a datagram until `until`, then takes what else has arrived, at most a turn's
-    /// worth (hyper-raft-e2e's `receive_until`).
-    #[allow(
-        clippy::disallowed_methods,
-        reason = "real processes on the host's clock, threads and environment (CLAUDE.md §1a, end to end)"
-    )]
-    fn receive_until(&mut self, until: Instant) -> Result<(), NodeError> {
-        let wait = until.saturating_duration_since(Instant::now());
-        if !wait.is_zero() {
-            self.socket.set_read_timeout(Some(wait))?;
+    /// Waits for a datagram until `until` on the member's clock, or for one however long when
+    /// nothing is due, then takes what else has arrived, at most a turn's worth (hyper-raft-e2e's
+    /// `receive_until`).
+    fn receive_until(&mut self, until: Option<u64>) -> Result<(), NodeError> {
+        let wait = until.map(|at| Duration::from_nanos(at.saturating_sub(self.now())));
+        if wait.is_none_or(|wait| !wait.is_zero()) {
+            self.socket.set_read_timeout(wait)?;
             if !self.receive_one()? {
                 return Ok(());
             }
@@ -544,6 +650,18 @@ impl Node {
     }
 
     fn hear_test(&mut self, body: &[u8], from: SocketAddr) -> Result<(), NodeError> {
+        if let Some((peer, message)) = control::read_heartbeat(body) {
+            if self.isolated {
+                return Ok(());
+            }
+            // Stamped as it is read; a refusal is the stream's to make (a stale or unproven
+            // heartbeat, a peer that shares no group), and the message is dropped.
+            let now = self.now();
+            let _ = self
+                .liveness
+                .on_heartbeat(peer, message, now, &mut self.asked);
+            return self.act_on_liveness();
+        }
         if let Some((id, order)) = control::read_order(body) {
             return self.obey(id, order, from);
         }
@@ -577,13 +695,44 @@ impl Node {
             }
             Order::Report => {
                 let nanos = |d: Duration| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX);
+                let timing = self.replica.core().raft.timing();
+                let pairs = self
+                    .attached
+                    .iter()
+                    .filter_map(|peer| self.liveness.report(*peer));
                 let report = Report {
                     status: self.status(),
                     durable_commit: self.replica.durable_commit(),
                     known: self.replica.configuration_known(),
                     voters: self.replica.configuration().voters.clone(),
-                    span_ns: self.timing.map_or(0, |t| nanos(t.span)),
-                    round_ns: self.timing.map_or(0, |t| nanos(t.round)),
+                    span_ns: timing.map_or(0, |t| nanos(t.span)),
+                    round_ns: timing.map_or(0, |t| nanos(t.round)),
+                    detection_ns: pairs
+                        .clone()
+                        .filter_map(|pair| pair.freshness)
+                        .map(nanos)
+                        .max()
+                        .unwrap_or(0),
+                    taken: pairs.clone().map(|pair| pair.taken).sum(),
+                    unjudged: u64::try_from(pairs.filter(|pair| !pair.judged).count())
+                        .unwrap_or(u64::MAX),
+                    restarts: self.restarts,
+                    suspected: self
+                        .attached
+                        .iter()
+                        .copied()
+                        .filter(|peer| self.liveness.trust(*peer) == Some(Trust::Suspected))
+                        .collect(),
+                    heard: self
+                        .attached
+                        .iter()
+                        .copied()
+                        .filter(|peer| {
+                            self.liveness
+                                .report(*peer)
+                                .is_some_and(|pair| pair.taken > 0)
+                        })
+                        .collect(),
                 };
                 control::put_report(&mut self.sending, id, &report);
                 if wire::seal(&mut self.sending, self.datagram) {
@@ -610,48 +759,9 @@ impl Node {
                 };
                 self.respond(from, id, &outcome)
             }
-            Order::Suspect(member) => {
-                heard(self.replica.suspect(member))?;
+            Order::StallFlush => {
+                file::stall_flushes();
                 self.respond(from, id, &Outcome::Done)
-            }
-            Order::Trust(member) => {
-                heard(self.replica.trust(member))?;
-                self.respond(from, id, &Outcome::Done)
-            }
-            Order::Restarted(member) => {
-                heard(self.replica.restarted(member))?;
-                self.respond(from, id, &Outcome::Done)
-            }
-            Order::Probe(stamp) => {
-                if self.isolated {
-                    return Ok(());
-                }
-                control::put_order(&mut self.sending, id, &Order::Echo(stamp));
-                if wire::seal(&mut self.sending, self.datagram) {
-                    self.send(from)?;
-                }
-                Ok(())
-            }
-            Order::Echo(stamp) => {
-                let Some(peer) = self
-                    .peers
-                    .iter()
-                    .find(|(_, address)| *address == from)
-                    .map(|(peer, _)| *peer)
-                else {
-                    return Ok(());
-                };
-                let took = self.nanos(Instant::now()).saturating_sub(stamp);
-                match self.paths.iter_mut().find(|(at, _)| *at == peer) {
-                    Some((_, path)) => path.on_sample(took),
-                    None => {
-                        let mut path = ExchangeRtt::new();
-                        path.on_sample(took);
-                        // One a peer, and the peers are bounded by `MAX_MEMBERS` (`hear_test`).
-                        self.paths.push((peer, path));
-                    }
-                }
-                Ok(())
             }
         }
     }
@@ -680,25 +790,22 @@ impl Node {
         Ok(())
     }
 
-    /// Drives the replica until it has nothing more to do now, stopping at an armed point.
-    #[allow(
-        clippy::disallowed_methods,
-        reason = "real processes on the host's clock, threads and environment (CLAUDE.md §1a, end to end)"
-    )]
+    /// Drives the replica until it has nothing more to do now, stopping at an armed point. Each
+    /// write the replica made durable is a flush the stream's heartbeats may prove.
     fn drive(&mut self) -> Result<Option<Point>, NodeError> {
         loop {
             let out_before = self.replica.in_flight();
             let configuration = self.replica.configuration().clone();
             self.out.clear();
-            let driven =
-                match self
-                    .replica
-                    .drive(self.nanos(Instant::now()), &self.waker, &mut self.out)
-                {
-                    Ok(driven) => driven,
-                    Err(ReplicaError::Fenced(cause)) => return Err(NodeError::Fenced(cause)),
-                    Err(_) => return Ok(None),
-                };
+            let now = self.now();
+            let driven = match self.replica.drive(now, &self.waker, &mut self.out) {
+                Ok(driven) => driven,
+                Err(ReplicaError::Fenced(cause)) => return Err(NodeError::Fenced(cause)),
+                Err(_) => return Ok(None),
+            };
+            if let Some((started, durable)) = driven.flushed {
+                self.liveness.on_durable(LiveWrite::Log, started, durable);
+            }
             let submitted = self.replica.in_flight() > out_before;
             let messages = std::mem::take(&mut self.out.messages);
             let released = !messages.is_empty();
@@ -707,6 +814,9 @@ impl Node {
             let acted = self.replica.machine_mut().take_acted();
             self.say_acted(&acted)?;
             let changed = self.replica.configuration() != &configuration;
+            if changed {
+                self.pairs()?;
+            }
             for (point, passed) in [
                 (Point::Submitted, submitted),
                 (Point::Released, released),

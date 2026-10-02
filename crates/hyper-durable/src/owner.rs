@@ -23,7 +23,7 @@
 //! keeps its replicas' pairs attached ([`Owner::pairs`]), takes each change the stream reports to
 //! every replica that has a member on that node ([`Owner::believe`]; a member's id is its node's,
 //! as in focal and the E2E), derives each group's timing from what the stream measured and charges
-//! each leader's pair its groups' expected election ([`Owner::measure`]), and feeds the stream each
+//! each pair its groups' expected election ([`Owner::measure`]), and feeds the stream each
 //! replica's durable writes from [`Driven::flushed`]. A change reaches the replicas of that node
 //! only: the node's standing changed, which is rare, and an idle group is touched by nothing else.
 use std::collections::VecDeque;
@@ -235,14 +235,12 @@ impl<L: LogStore, M: StateMachine, B: Budget> Owner<L, M, B> {
     }
 
     /// A change the node's liveness stream reported, taken to every replica with a member on that
-    /// node, each queued for its next turn. A replica that refuses it is fenced and reopened by
-    /// its owner, which tells the new one what the stream believes
-    /// ([`Replica::believe_all`](crate::Replica::believe_all)).
+    /// node, each queued for its next turn: a suspicion, trust again, or the node's restart, a new
+    /// incarnation the core trusts and holds to lead nothing it led (`Replica::restarted`). A
+    /// replica that refuses it is fenced and reopened by its owner, which tells the new one what
+    /// the stream believes ([`Replica::believe_all`](crate::Replica::believe_all)).
     pub fn believe(&mut self, change: &Change) {
-        let (peer, suspected) = match change {
-            Change::Suspected(suspicion) => (suspicion.peer, true),
-            Change::Trusted { peer, .. } => (*peer, false),
-        };
+        let peer = change.peer();
         for at in 0..self.slots.len() {
             let Some(entry) = self.slots.get_mut(at) else {
                 continue;
@@ -253,10 +251,10 @@ impl<L: LogStore, M: StateMachine, B: Budget> Owner<L, M, B> {
             if entry.attached.binary_search(&peer).is_err() {
                 continue;
             }
-            let _ = if suspected {
-                replica.suspect(peer)
-            } else {
-                replica.trust(peer)
+            let _ = match change {
+                Change::Suspected(_) => replica.suspect(peer),
+                Change::Trusted { .. } => replica.trust(peer),
+                Change::Restarted { .. } => replica.restarted(peer),
             };
             if let Ok(slot) = u32::try_from(at) {
                 self.queue_slot(slot);
@@ -265,12 +263,16 @@ impl<L: LogStore, M: StateMachine, B: Budget> Owner<L, M, B> {
     }
 
     /// Each group's timing from what the node's liveness stream measured
-    /// ([`Replica::measure`](crate::Replica::measure)), and each leader's pair charged the mean
-    /// expected election `T_E` of the groups it leads here (`Liveness::set_election`: the mean
-    /// minimizes their summed unavailability, which is linear in `T_E`). Called when the stream's
-    /// estimates move: a pair configured again, a granularity or a flush mean that changed.
+    /// ([`Replica::measure`](crate::Replica::measure)), and each pair charged the mean expected
+    /// election `T_E` of the groups it shares (`Liveness::set_election`: the mean minimizes their
+    /// summed unavailability, which is linear in `T_E`). A mistake about any member can cost its
+    /// group an election, at most: a follower that suspects its leader campaigns, and a leader
+    /// that suspects too many of its followers steps down. Every pair is charged, not only the
+    /// leaders', so every pair's detector configures (`docs/timing.md` §2.9: a pair never
+    /// charged is never configured). Called when the stream's estimates move: a pair configured
+    /// again, a granularity or a flush mean that changed.
     pub fn measure(&mut self, liveness: &mut Liveness) {
-        // The leaders' nodes and their groups' elections: at most one entry a peer the node keeps.
+        // Each peer's groups' elections: at most one entry a peer the node keeps.
         let mut charged: Vec<(PeerId, Duration, u32)> = Vec::new();
         for entry in &mut self.slots {
             let Some(replica) = entry.replica.as_mut() else {
@@ -279,16 +281,14 @@ impl<L: LogStore, M: StateMachine, B: Budget> Owner<L, M, B> {
             let Ok(Some(span)) = replica.measure(liveness) else {
                 continue;
             };
-            let leader = replica.leader();
-            if leader == 0 || leader == replica.id() {
-                continue;
-            }
-            match charged.iter_mut().find(|(peer, ..)| *peer == leader) {
-                Some((_, sum, count)) => {
-                    *sum = sum.saturating_add(span.election);
-                    *count = count.saturating_add(1);
+            for peer in &entry.attached {
+                match charged.iter_mut().find(|(at, ..)| at == peer) {
+                    Some((_, sum, count)) => {
+                        *sum = sum.saturating_add(span.election);
+                        *count = count.saturating_add(1);
+                    }
+                    None => charged.push((*peer, span.election, 1)),
                 }
-                None => charged.push((leader, span.election, 1)),
             }
         }
         for (peer, sum, count) in charged {

@@ -1,7 +1,7 @@
 //! What the test tells a member beyond hyper-raft-e2e's own controls (`wire::Control`: where its
 //! peers listen, whether it is cut off), on the same framing and checksum: where to stop, a change
-//! of configuration, a flush to fail, what its failure detectors believe of its peers, and what the
-//! member is, at length; and the probes members time their paths by.
+//! of configuration, a flush to fail or a disk to stall, and what the member is, at length; and the
+//! node-pair liveness heartbeats members send one another (`hyper_liveness`).
 use hyper_raft::proto::ConfChangeType;
 use hyper_raft_e2e::wire::{self, Kind, Reader, Status};
 
@@ -73,17 +73,8 @@ pub enum Order {
     Report,
     /// The log answered a write: the member's own waker, relayed to its socket.
     Wake,
-    /// The member's detectors suspect this member's node (timing step L-2). The test kills
-    /// members, so it knows: it is the members' detector until L-3's stream and L-4's harness.
-    Suspect(u64),
-    /// The member's detectors trust this member's node again.
-    Trust(u64),
-    /// The member's detectors saw this member's node start again, a new incarnation.
-    Restarted(u64),
-    /// A peer times its path to this member: answered at once with the same stamp.
-    Probe(u64),
-    /// The answer to a probe stamped as it was sent, on the prober's clock.
-    Echo(u64),
+    /// Stall the member's log file: no flush completes again, as a disk that stops.
+    StallFlush,
 }
 
 /// The first tag this harness's orders take: past those of `wire::Control`.
@@ -111,18 +102,29 @@ pub fn put_order(buffer: &mut Vec<u8>, id: u64, order: &Order) {
         Order::FailFlush => buffer.push(FIRST_TAG.saturating_add(2)),
         Order::Report => buffer.push(FIRST_TAG.saturating_add(3)),
         Order::Wake => buffer.push(FIRST_TAG.saturating_add(4)),
-        Order::Suspect(word) => tagged(buffer, 5, *word),
-        Order::Trust(word) => tagged(buffer, 6, *word),
-        Order::Restarted(word) => tagged(buffer, 7, *word),
-        Order::Probe(word) => tagged(buffer, 8, *word),
-        Order::Echo(word) => tagged(buffer, 9, *word),
+        Order::StallFlush => buffer.push(FIRST_TAG.saturating_add(5)),
     }
 }
 
-/// An order's tag, `FIRST_TAG` and `offset`, and its one word.
-fn tagged(buffer: &mut Vec<u8>, offset: u8, word: u64) {
-    buffer.push(FIRST_TAG.saturating_add(offset));
-    wire::put_u64(buffer, word);
+/// The tag a liveness heartbeat takes: past the orders'.
+const HEARTBEAT: u8 = FIRST_TAG.saturating_add(6);
+
+/// Puts a node-pair liveness heartbeat from member `from`, its message as `hyper_liveness` made it.
+pub fn put_heartbeat(buffer: &mut Vec<u8>, from: u64, message: &[u8]) {
+    wire::begin(buffer, Kind::Control);
+    wire::put_u64(buffer, from);
+    buffer.push(HEARTBEAT);
+    buffer.extend_from_slice(message);
+}
+
+/// Reads a heartbeat's sender and message; none for anything else.
+pub fn read_heartbeat(body: &[u8]) -> Option<(u64, &[u8])> {
+    let mut reader = Reader::new(body);
+    let from = reader.u64()?;
+    if reader.u8()? != HEARTBEAT {
+        return None;
+    }
+    Some((from, reader.rest()))
 }
 
 /// Reads an order's body; none for one of `wire::Control`'s.
@@ -144,11 +146,7 @@ pub fn read_order(body: &[u8]) -> Option<(u64, Order)> {
         2 => Order::FailFlush,
         3 => Order::Report,
         4 => Order::Wake,
-        5 => Order::Suspect(reader.u64()?),
-        6 => Order::Trust(reader.u64()?),
-        7 => Order::Restarted(reader.u64()?),
-        8 => Order::Probe(reader.u64()?),
-        9 => Order::Echo(reader.u64()?),
+        5 => Order::StallFlush,
         _ => return None,
     };
     Some((id, order))
@@ -171,6 +169,21 @@ pub struct Report {
     /// The round tail its elections and beats run by, nanoseconds; zero before its paths are
     /// measured.
     pub round_ns: u64,
+    /// The longest its detectors in force trust a peer past its last heartbeat's expected arrival,
+    /// `η + α` over its pairs (`hyper_liveness::PairReport::freshness`), nanoseconds: how long a
+    /// peer's crash goes unsuspected past its last heartbeat's delay; zero before any margin
+    /// judges.
+    pub detection_ns: u64,
+    /// The heartbeats its node-pair stream has taken from its peers, all told.
+    pub taken: u64,
+    /// The pairs no margin judges yet: neither a configuration of their own nor the pool's.
+    pub unjudged: u64,
+    /// The restarts of its peers its stream has seen.
+    pub restarts: u64,
+    /// The peers its detectors suspect.
+    pub suspected: Vec<u64>,
+    /// The peers its stream has taken a heartbeat from.
+    pub heard: Vec<u64>,
 }
 
 /// The response tag a report takes: past those of `wire::Outcome`.
@@ -195,12 +208,22 @@ pub fn put_report(buffer: &mut Vec<u8>, id: u64, report: &Report) {
         u64::from(report.known),
         report.span_ns,
         report.round_ns,
+        report.detection_ns,
+        report.taken,
+        report.unjudged,
+        report.restarts,
         u64::try_from(report.voters.len()).unwrap_or(u64::MAX),
     ] {
         wire::put_u64(buffer, word);
     }
     for voter in &report.voters {
         wire::put_u64(buffer, *voter);
+    }
+    for list in [&report.suspected, &report.heard] {
+        wire::put_u64(buffer, u64::try_from(list.len()).unwrap_or(u64::MAX));
+        for peer in list {
+            wire::put_u64(buffer, *peer);
+        }
     }
 }
 
@@ -218,7 +241,7 @@ fn read_status(reader: &mut Reader<'_>) -> Option<Status> {
     })
 }
 
-/// Reads a report from a response's body; at most `max_voters` voters.
+/// Reads a report from a response's body; at most `max_voters` voters and as many suspected.
 pub fn read_report(body: &[u8], max_voters: usize) -> Option<(u64, Report)> {
     let mut reader = Reader::new(body);
     let id = reader.u64()?;
@@ -230,13 +253,22 @@ pub fn read_report(body: &[u8], max_voters: usize) -> Option<(u64, Report)> {
     let known = reader.u64()? != 0;
     let span_ns = reader.u64()?;
     let round_ns = reader.u64()?;
-    let count = usize::try_from(reader.u64()?).ok()?;
-    if count > max_voters {
-        return None;
-    }
-    let voters = (0..count)
-        .map(|_| reader.u64())
-        .collect::<Option<Vec<u64>>>()?;
+    let detection_ns = reader.u64()?;
+    let taken = reader.u64()?;
+    let unjudged = reader.u64()?;
+    let restarts = reader.u64()?;
+    let list = |reader: &mut Reader<'_>| {
+        let count = usize::try_from(reader.u64()?).ok()?;
+        if count > max_voters {
+            return None;
+        }
+        (0..count)
+            .map(|_| reader.u64())
+            .collect::<Option<Vec<u64>>>()
+    };
+    let voters = list(&mut reader)?;
+    let suspected = list(&mut reader)?;
+    let heard = list(&mut reader)?;
     Some((
         id,
         Report {
@@ -246,6 +278,12 @@ pub fn read_report(body: &[u8], max_voters: usize) -> Option<(u64, Report)> {
             voters,
             span_ns,
             round_ns,
+            detection_ns,
+            taken,
+            unjudged,
+            restarts,
+            suspected,
+            heard,
         },
     ))
 }

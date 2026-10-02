@@ -3636,6 +3636,90 @@ cargo test -p hyper-tokio --test stamps                   # kernel stamps (macOS
 # beside it. HYPER_LIVENESS_TRACE=1 echoes every member's lines.
 ```
 
+## After the follow-ups: the evidence's interval, the pool, restarts (2026-10-02)
+
+`docs/timing.md` §2.8–§2.9. The same benches, this branch against main built the same way, each
+binary run alternately in the same minutes on the same machine, now under heavier load (load average
+40–60, other sessions' builds and a Linux VM running the E2E beside them).
+
+Allocations and time a heartbeat (`cargo bench -p hyper-liveness --bench allocs`), three
+alternating runs each, ns the range:
+
+| nodes | groups a pair | sent (main / now) | allocs | reallocs | faults | ns, main | ns, now |
+|---|---|---|---|---|---|---|---|
+| 2 | 1 | 178 / 216 | 0 | 0 | 0 | 837–996 | 931–1,094 |
+| 4 | 1 | 628 / 612 | 0 | 0 | 0 | 968–1,152 | 1,298–1,407 |
+| 8 | 1 | 3,174 / 3,139 | 0 | 0 | 0 | 1,037–1,154 | 1,575–1,739 |
+| 8 | 1,000 | 3,174 / 3,139 | 0 | 0 | 0 | 1,032–1,201 | 1,547–1,747 |
+
+Zero allocations a heartbeat, kept. On the way a ring grew: a link's rings were resized at a move
+by the latest `G`, larger than the one they were built with, so a move to a longer interval could
+allocate; they are now sized by the granularity they were built with (`LinkEstimator::retime`).
+Both builds showed, in one run in a few at two nodes, one allocation in the window (main too, with
+a minor fault): not from this branch, not yet found. The time a heartbeat is higher by about 0.1 µs
+at two nodes and 0.5 µs at eight: the configure calls are as many (3,070 against 3,116 at eight
+nodes, 41 against 48 of them configuring), the pool is fed nothing once every pair is configured
+(counted), and the evidence is asked for only on a refusal for want of `τ_int`; what is left is the
+links' dynamics, which the moves and the floor rule change (the heartbeats sent differ), and
+per-heartbeat bookkeeping (the expected move, the told trust). Measured, not removed.
+
+What a node pays a second (`cargo bench -p hyper-liveness --bench cost`, both at load 47, one run
+each, the same minute):
+
+| P | G | pair µs, main | pair µs, now | group µs | swim µs |
+|---|---|---|---|---|---|
+| 2 | 1 | 11.1 | 14.3 | 3.6–4.4 | 12.1 |
+| 2 | 1,024 | 10.7 | 13.3 | 9,531–10,201 | 12.1 |
+| 8 | 1 | 88.6 | 70.8 | 3.7 | 66.1–106.7 |
+| 8 | 1,024 | 66.0 | 96.8 | 13,736–21,891 | 66.1–106.7 |
+
+At this load the per-group and SWIM baselines themselves moved by up to two times between runs a
+minute apart; the stream's cost stays flat in the groups, and at two peers is about 3 µs a second
+more than main's, some 40 ns a message.
+
+The simulation (`cargo test --release -p hyper-liveness --test sim`): every pair configured within
+302 heartbeats over seeds 0–31 of three worlds (a LAN; hosts frozen up to 50 ms about every 250 ms;
+groups writing every 2 ms to a device that stalls one flush in fifty for up to 60 ms), every killed
+node suspected by every survivor within the bound it stated (169 by the link's own configuration,
+117 by the pool's margin, 2 never heard from). The stalling world under the old interval rule (the
+floor followed down, no evidence asked): a link took 5,775 heartbeats unconfigured and the run took
+453 s against 1 s. The real processes (`tests/processes.rs`, load 45–50): the stalled disk
+suspected in 694–719 ms against stated bounds of 698–727 ms, the killed node in 64–580 ms against
+65–591 ms, live members 18 suspicions against an allowance of 98.6.
+
+## hyper-durable-e2e on its own detectors
+
+`crates/hyper-durable-e2e` with each member running the stream itself (`docs/timing.md` §2.9, "On
+real detectors"), the test telling no member what to believe. Every scenario: the six kills at named
+points, the stalled disk (leader and follower), F17's two founder cases, the fence host, the failed
+flush, six random kills. A run is the whole binary, `cargo test -p hyper-durable-e2e --test kill`.
+
+| host | runs | passed | a run |
+|---|---|---|---|
+| Linux (Docker, rust:1.98.0, aarch64), four CPUs | 4 | 4 | 32–108 s |
+| Linux, two CPUs | 4 | 4 | 16–42 s |
+| macOS, load 39–48 | 3 | 3 | 63–107 s |
+
+On the way to this code, 19 more Linux runs (two and four CPUs) and 2 on macOS, each found defect
+fixed at its cause before the runs above: a restart expected of a member that had not heard the
+last run, or whose configuration did not name the restarted member (founder-fenced), and the
+false suspicion at a moved interval (`docs/timing.md` §2.8), which had made single scenarios take
+up to 85 s.
+
+Before (main, the test the members' detector), the first scenario of every Linux run in Docker
+failed: no member measured its timer, as described in the commit that fixed it; after that fix the
+same eight runs passed in 2–23 s. A run on real detectors is slower: a member's links begin at its
+flush floor and move to the interval their evidence needs, and the group is judged only once its
+links or their pools have it, seconds under this load.
+
+```sh
+cargo bench -p hyper-liveness --bench allocs     # and the same binary built from main, alternately
+cargo bench -p hyper-liveness --bench cost
+cargo test --release -p hyper-liveness           # sim, processes, alloc
+HYPER_DURABLE_LIVENESS_SEEDS=1000 cargo test --release -p hyper-durable --test liveness
+cargo test -p hyper-durable-e2e --test kill      # in Linux: docker run --cpus N rust:1.98.0 ...
+```
+
 ## Simulation harnesses as they are (2026-10-02)
 
 The baseline `hyper-sim` and `hyper-check` are measured against when the harnesses move onto them

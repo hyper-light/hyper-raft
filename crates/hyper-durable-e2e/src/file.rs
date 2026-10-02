@@ -1,6 +1,7 @@
 //! The member's log file: a real file on the machine's disk, read and written with direct I/O
 //! where the file system takes it and flushed with the platform's full flush (hyper-block's
-//! `DeviceFile`), whose next flush the test can make fail, as a device's can.
+//! `DeviceFile`), whose next flush the test can make fail, as a device's can, or whose flushes it can
+//! stall for good, as a device that stops.
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -21,6 +22,15 @@ static FAIL_NEXT_FLUSH: AtomicBool = AtomicBool::new(false);
 /// Makes the next flush of this process's log file fail.
 pub fn fail_next_flush() {
     FAIL_NEXT_FLUSH.store(true, Ordering::Release);
+}
+
+/// Set by the test (`control::Order::StallFlush`): no flush of the file completes again. Read by
+/// the log's device thread, set once by the member's thread; nothing else rides on it.
+static STALL: AtomicBool = AtomicBool::new(false);
+
+/// Stalls every flush of this process's log file from now on.
+pub fn stall_flushes() {
+    STALL.store(true, Ordering::Release);
 }
 
 /// The log's file, whose next flush fails when the test says so.
@@ -49,6 +59,11 @@ impl BlockFile for FaultFile {
         BlockFile::write_all_at(&self.0, buf, offset)
     }
     fn sync_data(&self) -> Result<(), DiskError> {
+        // A disk that stopped: the device thread holds its flush for as long as the process
+        // lives, as a device that never answers holds its thread.
+        while STALL.load(Ordering::Acquire) {
+            std::thread::park();
+        }
         if FAIL_NEXT_FLUSH.swap(false, Ordering::AcqRel) {
             return Err(DiskError::Io {
                 op: "flush",

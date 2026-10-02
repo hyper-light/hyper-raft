@@ -30,3 +30,7 @@ harness = false
 
 [lints]
 workspace = true
+
+[[bench]]
+name = "idle"
+harness = false

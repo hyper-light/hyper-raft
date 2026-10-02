@@ -617,6 +617,73 @@ steady (rounds 40,000), transfer (20,000), steady batch 64 (20,000), catch-up (4
 (4,000), fast (20,000), failover (5,000); `micro <bytes> 400000|200000`; each under `taskpolicy -c
 background` for the performance-core pass.
 
+## Elections by suspicion (L-2)
+
+Timing step L-2 (`docs/timing.md` §2.9). Measured on 2026-10-02 on the machine above (Apple M5 Max,
+macOS 26.4.1), with other sessions' work holding the load at 19 to 21 throughout; each figure says
+its load.
+
+**The core did not regress.** On ticks the member carries one more field, `watch: Option<Box<Watch>>`
+(eight bytes, none on ticks), and a test of it where a tick, a reset, a vote, a lease and a
+heartbeat's answer branch on the mode.
+- **Allocations**: `hyper-raft-compare one <core> <workload> 3|5 ... 1000 1000 count`, `main` at
+  `edb920b` (the core is unchanged to `634d45c`) and L-2, every workload in place and copying where
+  the tables run both, three and five voters: allocations, reallocations, bytes asked for, peak
+  and the whole loop's totals identical in all 22 cells.
+- **Time, instructions and cycles**, `main` and L-2 interleaved in fresh processes, the order
+  alternated round to round; per round the ratio L-2 to `main`; the geometric mean with its
+  Student-t 95 % interval on the logarithms (the median and its sign-test interval agree); time is
+  the loop's own (`ns=`), instructions retired and cycles the whole process's (`/usr/bin/time -l`,
+  the PMU's counts), set-up included; load 21.1 at the start and 20.2 at the end:
+
+  | Cell | rounds | time | instructions | cycles |
+  |---|---|---|---|---|
+  | steady 64 B, in place | 30 | 1.002 [0.982, 1.024] | 1.001 [1.001, 1.001] | 0.990 [0.973, 1.007] |
+  | steady 64 B, copying | 30 | 0.977 [0.960, 0.994] | 0.999 [0.998, 1.000] | 0.983 [0.964, 1.002] |
+  | steady 4 KiB, in place | 30 | 0.957 [0.946, 0.968] | 1.001 [1.001, 1.001] | 0.968 [0.947, 0.989] |
+  | steady 4 KiB, copying | 30 | 0.967 [0.957, 0.977] | 1.004 [1.002, 1.006] | 0.983 [0.969, 0.998] |
+  | transfer, in place | 30 | 0.989 [0.977, 1.001] | 1.001 [1.001, 1.002] | 1.002 [0.988, 1.017] |
+  | transfer, copying | 30 | 0.983 [0.972, 0.994] | 1.000 [1.000, 1.001] | 1.000 [0.983, 1.018] |
+  | steady batch 64 | 10 | 0.970 [0.948, 0.992] | 1.001 [1.000, 1.001] | 0.970 [0.933, 1.008] |
+  | catch-up | 10 | 1.002 [0.994, 1.010] | 1.001 [1.001, 1.001] | 1.004 [0.992, 1.016] |
+  | snapshot | 10 | 1.003 [0.990, 1.017] | 1.001 [1.000, 1.001] | 0.994 [0.977, 1.011] |
+  | fast | 10 | 0.989 [0.957, 1.021] | 0.999 [0.997, 1.001] | 0.982 [0.951, 1.013] |
+  | failover | 10 | 1.008 [0.986, 1.031] | 1.002 [1.001, 1.003] | 0.999 [0.965, 1.035] |
+
+  No interval of time or cycles lies above 1; four of time lie below it, which is the layout
+  sensitivity the R-6 section measured (inert bytes move these loops by 1–4 %), not a gain claimed.
+  Instructions rise by 0.1 % in most cells and 0.4 % on the copying 4 KiB cell, the whole process's
+  count with the set-up in it: the mode's tests.
+- **`benches/pipeline.rs`**: every simulated figure (p50, p99, entries a second, flushes an entry,
+  both devices, depths one to three) identical to `main`'s.
+
+**What an idle group costs** (`cargo bench -p hyper-raft --bench idle`, `benches/idle.rs`): 10,000
+groups of three voters in one process, each elected and holding one committed entry, every member
+caught up; then 400 of the owner's periods with nothing proposed. On ticks (`Settings::focal`, a
+heartbeat every two ticks) the owner ticks every member each period, takes what each gives and
+delivers every message within the group; by suspicion it asks each member's `deadline()`, the most
+an owner without a timer queue does, and finds none due. Each process run with 0 and with 400
+periods under `/usr/bin/time -l`, the difference taken, five interleaved rounds, load 19.0–19.3:
+
+| | CPU a group a period | instructions | cycles | messages a group a period |
+|---|---|---|---|---|
+| ticks | 542.5 ns (535–545) | 7,327 | 1,574 | 2.0 |
+| by suspicion, an owner that scans | 25.0 ns (22.5–25.0) | 234 | 69 | 0 |
+| by suspicion, an owner with a timer queue | none | none | none | 0 |
+
+At a tick of 15 ms, hyper-durable-e2e's measured period on this machine, a group on ticks costs its
+owner 36 µs of CPU each second (10,000 groups, 36 % of a core) and 133 messages; at etcd's 100 ms
+heartbeat, 5.4 µs and 20 messages. By suspicion an idle group costs nothing it does not ask for: no
+message, no wake (its deadline is none); a scanning owner pays 25 ns a group a scan, and one that
+keeps deadlines in a queue nothing. Liveness is then the node pairs' (below, "hyper-liveness: node-pair
+heartbeats against per-group heartbeats and slates' detector"), whose cost does not grow with the
+groups.
+
+Commands: `crates/hyper-raft-compare` built `--release` in both trees; the interleaved runs and the
+counting runs are a scratch harness over `hyper-raft-compare one hyper[-copy] <workload> 3 <batch>
+<bytes> <rounds> 1000 time|count`; `cargo bench -p hyper-raft --bench idle -- <ticks|suspicion>
+10000 <0|400>` under `/usr/bin/time -l`; `cargo bench -p hyper-raft --bench pipeline` in both trees.
+
 ## Where hyper-raft does not win, and why
 
 hyper-raft in place allocates less than every other core in every row. It is faster than raft-rs

@@ -497,3 +497,8 @@ source of each rule; `docs/raft.md` §3).
   schedules: 943 crashes (1,078 writes lost) and, with a leader applying before its write, 904
   (1,178). The split rate over 1,000 crashes of a five-voter leader: 135 first rounds split
   against 110.8 expected.
+- **Measured** (`docs/benchmarks.md`, "Elections by suspicion (L-2)"): allocations identical on all
+  22 cells of the comparison; time and cycles within `main`'s intervals or below them, instructions
+  0.1–0.4 % above; `benches/pipeline.rs`'s simulated figures identical. `benches/idle.rs`: an idle
+  group costs its owner 542.5 ns and two messages a tick on ticks, 25 ns a scan and no message by
+  suspicion, nothing with a timer queue.

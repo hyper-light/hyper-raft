@@ -24,3 +24,29 @@ jobs:
       - run: rustup show active-toolchain || rustup toolchain install
       - run: bash scripts/gates.sh
         shell: bash
+  model:
+    # The core's TLA+ model (docs/models/README.md): every configuration that passes, each at
+    # exactly the states it states, and every one the checker must refuse. TLC runs here only
+    # (CLAUDE.md §1, "Model checking"); one OS suffices, for the model is not the code.
+    runs-on: ubuntu-24.04
+    # The state bound is what bounds the work; this catches a checker that stopped making
+    # progress: twice the suite's measured time at one worker (docs/models/README.md).
+    timeout-minutes: 131
+    env:
+      TLA_TOOLS: ${{ github.workspace }}/target/tla
+      # The runner's four vCPUs (GitHub's standard Linux runner, public repository); a refused
+      # configuration runs with one whatever this says.
+      TLC_WORKERS: 4
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-java@v6.0.1
+        with:
+          distribution: temurin
+          java-version: '21'
+      # tla2tools.jar v1.7.4; scripts/check-model.sh checks its SHA-256 whether it came from
+      # the cache or the release.
+      - uses: actions/cache@v6.1.0
+        with:
+          path: target/tla/tla2tools.jar
+          key: tla2tools-v1.7.4-936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88
+      - run: bash scripts/check-model.sh

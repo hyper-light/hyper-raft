@@ -96,12 +96,14 @@ The R-numbers are note 32 §2.13's ledger.
 **The fast track** stays focal's algorithm, with the safety fix below, until note 32 §3.8's tests
 decide, and no owner enables it until then. The tests:
 - slates' exhaustive search applied to it;
-- the reconfiguration and liveness the TLA+ model lacks;
+- the liveness the TLA+ model lacks (it has a change of configuration since it moved here: `docs/models/README.md`);
 - slates' five-region crossover;
 - mantle's admitted-request accounting.
 
-TLC runs in this repository's CI only (owner's decision 7), beside `hyper-check`'s explorer. The model
-`FastTrack.tla` is still in focal (`docs/models/`) and moves here with that work.
+TLC runs in this repository's CI only (owner's decision 7), beside `hyper-check`'s explorer, once
+that is here. The model is `docs/models/FastTrack.tla`, moved from focal (`7ea6f63`) with a change of
+configuration and both rules below; `docs/models/README.md` maps its actions to this crate's functions
+and records every configuration's states.
 
 ### 3.1 The wire format (R-2)
 
@@ -256,24 +258,18 @@ five terms and many changes in every 4,000 steps); in the comparison's fast work
 one leader and no change, the rules commit every proposal by the fast quorum as before
 (`docs/benchmarks.md`).
 
-**Why the model missed them.** The model has no change of configuration, so the second defect is
-outside it; covering it needs a configuration per member, the configuration a member has applied
-(its commit), and a single change of one voter. For the first: `FastTrack.tla` checks three voters (where the fast quorum is all of
-them, so no member outside it can hold an older entry at the index) and five voters at `MaxTerm = 2`
-and `MaxLen = 1`. The defect needs three terms on five voters: one in which a member takes an entry
-at the index from a leader, one in which another leader commits a different entry there by a fast
-quorum without that member, and one in which that member is elected. The model change:
-- `FastCommit`'s `HoldsByItself(l, m, i)` also requires that `m` acknowledged `l`'s log through an
-  index of `l`'s term: `LET a == acks[m][term[l]] IN a >= 1 /\ a <= Len(log[l]) /\ log[l][a].term =
-  term[l]`;
-- a configuration of five voters at `MaxTerm = 3` and `MaxLen = 2` (two indexes, so that a member can
-  hold an entry beside a log of the leader's term), checked for `Agreement`, `Committed` and
-  `LeaderHolds`;
-- a configuration with the old `HoldsByItself`, at the same bounds, which TLC must find violating
-  `Agreement`, as `FastTrackWrong.cfg` does for the recovery rule.
-
-TLC runs in this repository's CI only, so the model change is to be made with the model's move here;
-it was not run on this machine.
+**Why the model missed them, and what it checks now.** focal's model had no step by which a deposed
+leader campaigns again with the log it led with, so no member whose log holds what no other took was
+ever elected again, and the first defect was unreachable at any bound; it had no change of
+configuration, so the second was outside it. focal added the step and the first rule (`7ea6f63`), and
+the model came here with both (`docs/models/FastTrack.tla`), with the configuration a member counts
+by (the one its committed log states), a change by one entry or through a joint configuration, and
+the second rule. TLC finds each defect with its rule taken out and passes the same bounds with it in:
+`FastTrackAnyRound.cfg` (four voters, three terms) is refused for `LeaderHolds` and
+`FastTrackFour.cfg` passes, 3,207,204 states; `FastTrackAnyConfig.cfg` (three voters, of which a
+change removes one; seed 54104's run with three voters for five) is refused for `LeaderHolds` and
+`FastTrackChange.cfg` passes, 3,304,320 states. `docs/models/README.md` has every configuration,
+its states and the run that counted them.
 
 **Evidence.** The directed test `an_election_never_commits_a_second_entry_at_a_committed_index` runs
 seed 9843's schedule with the rules it was found under (a round of reads for each read, no byte

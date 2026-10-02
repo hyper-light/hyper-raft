@@ -27,8 +27,13 @@ The law's four columns:
 Timing (`docs/timing.md`, sources in `docs/research/timing.md`): elections and failure detection
 move from picked constants to measurement — one NFD-E detector per node pair configured to
 minimize unavailability, the election span from Ongaro's split-vote probability, the timer
-granularity measured. Steps L-1 (`hyper-timing`) to L-5 (the consumers); not started. Until L-4
+granularity measured. Steps L-1 (`hyper-timing`) to L-5 (the consumers); L-1 in part (`qos.rs`: the bound, the configurator, the span). Until L-4
 the E2E harness computes its own tick and budgets, which this replaces.
+
+The core's TLA+ model (`docs/models/`, from focal `7ea6f63`): the classic track, a change of
+configuration by one entry or through a joint configuration, and the fast track with both of its
+rules. Seven configurations pass at their stated states and five are refused as they must be, among
+them each fast-track rule taken out (`docs/models/README.md`). CI's `model` job runs them on Linux.
 
 ## Consumers
 

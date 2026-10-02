@@ -17,9 +17,7 @@
 
 mod support;
 
-use std::sync::OnceLock;
 use std::task::Waker;
-use std::time::Instant;
 
 use hyper_durable::{
     Budget, Bytes, Cause, EntryRef, Fatal, Fault, LogStore, OpenError, Output, Owner, Point,
@@ -737,10 +735,16 @@ fn a_leader_applies_its_own_term_before_its_write_is_durable() {
     }
 }
 
-/// The owner's clock in nanoseconds: the test reads the host's monotonic clock at its edge, as an
-/// owner does, and hands the shell nanoseconds since the first reading.
+/// The owner's clock in nanoseconds, simulated: each reading a nanosecond after the one before, so
+/// time only moves forward, as an owner's monotonic clock does, and every run reads the same times.
+/// No test here waits on elapsed time; those that judge time state it outright.
 fn now() -> u64 {
-    static EPOCH: OnceLock<Instant> = OnceLock::new();
-    let epoch = *EPOCH.get_or_init(Instant::now);
-    u64::try_from(epoch.elapsed().as_nanos()).unwrap_or(u64::MAX)
+    thread_local! {
+        static CLOCK: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    }
+    CLOCK.with(|clock| {
+        let now = clock.get() + 1;
+        clock.set(now);
+        now
+    })
 }

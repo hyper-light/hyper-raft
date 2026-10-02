@@ -574,6 +574,10 @@ impl<F: BlockFile + 'static> Log<F> {
 
     /// Starts the log's two threads, then hands the owner, with the device and its file, to the
     /// owner's thread: a thread the OS refuses leaves the file with the caller.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "hyper-log owns its owner's and its device's threads (CLAUDE.md §1, sans-io's one exception)"
+    )]
     fn spawn(
         file: F,
         p: Params,

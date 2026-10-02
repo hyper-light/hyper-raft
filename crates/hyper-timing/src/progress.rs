@@ -111,7 +111,7 @@ mod tests {
 
     #[test]
     fn a_slow_fleet_is_charged_its_periods_and_not_the_wall_clock() {
-        let start = Instant::now();
+        let start = hyper_sim::Anchor::new().instant(0).unwrap();
         let mut wait = ProgressDeadline::begin_at(&[10, 10, 10], 100, FROZEN, start);
         // An hour of wall time in which every owner keeps running periods,
         // slowly: twenty seconds a period, fifty periods. Never spent.
@@ -128,7 +128,7 @@ mod tests {
     }
     #[test]
     fn the_slowest_owner_holds_the_wait_open() {
-        let start = Instant::now();
+        let start = hyper_sim::Anchor::new().instant(0).unwrap();
         let mut wait = ProgressDeadline::begin_at(&[0, 0, 0], 100, FROZEN, start);
         // Two owners ran ten budgets; the third is starved but moving.
         let now = start + Duration::from_secs(10);
@@ -143,7 +143,7 @@ mod tests {
     }
     #[test]
     fn an_owner_that_began_ahead_does_not_pay_for_one_that_stalled() {
-        let start = Instant::now();
+        let start = hyper_sim::Anchor::new().instant(0).unwrap();
         // The least absolute count would charge 5; the least advance is 0.
         let mut wait = ProgressDeadline::begin_at(&[5000, 5], 100, FROZEN, start);
         let now = start + Duration::from_secs(1);
@@ -152,7 +152,7 @@ mod tests {
     }
     #[test]
     fn an_owner_that_runs_no_period_is_frozen_after_the_window() {
-        let start = Instant::now();
+        let start = hyper_sim::Anchor::new().instant(0).unwrap();
         let mut wait = ProgressDeadline::begin_at(&[7, 7], 100, FROZEN, start);
         let now = start + Duration::from_secs(29);
         assert_eq!(wait.check_at(&[90, 7], now), Ok(()));
@@ -167,7 +167,7 @@ mod tests {
     }
     #[test]
     fn progress_restarts_the_frozen_window() {
-        let start = Instant::now();
+        let start = hyper_sim::Anchor::new().instant(0).unwrap();
         let mut wait = ProgressDeadline::begin_at(&[0], 100, FROZEN, start);
         assert_eq!(wait.check_at(&[0], start + Duration::from_secs(29)), Ok(()));
         assert_eq!(wait.check_at(&[1], start + Duration::from_secs(31)), Ok(()));
@@ -179,7 +179,7 @@ mod tests {
     }
     #[test]
     fn a_replaced_owner_is_charged_its_new_count() {
-        let start = Instant::now();
+        let start = hyper_sim::Anchor::new().instant(0).unwrap();
         let mut wait = ProgressDeadline::begin_at(&[500], 100, FROZEN, start);
         // Reopened: its count restarted below where the wait began.
         assert_eq!(wait.check_at(&[40], start + Duration::from_secs(1)), Ok(()));
@@ -191,7 +191,7 @@ mod tests {
     }
     #[test]
     fn no_observed_owner_leaves_only_the_frozen_window() {
-        let start = Instant::now();
+        let start = hyper_sim::Anchor::new().instant(0).unwrap();
         let mut wait = ProgressDeadline::begin_at(&[], 1, FROZEN, start);
         assert_eq!(wait.check_at(&[], start + Duration::from_secs(29)), Ok(()));
         assert!(matches!(

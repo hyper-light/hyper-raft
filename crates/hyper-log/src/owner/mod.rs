@@ -413,6 +413,10 @@ impl<F: BlockFile + 'static> Owner<F> {
 
     /// The next message, or `None` once the writer's wait for returning submitters is over;
     /// an error once the inbox has closed.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "hyper-log's owner waits on its own deadline (CLAUDE.md §1, sans-io's one exception)"
+    )]
     fn next(&self, inbox: &Receiver<Message<F>>) -> Result<Option<Message<F>>, RecvTimeoutError> {
         let Some(deadline) = self.gather.as_ref().map(|g| g.deadline) else {
             return inbox

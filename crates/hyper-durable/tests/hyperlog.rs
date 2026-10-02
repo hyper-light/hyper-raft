@@ -15,10 +15,8 @@
 
 mod support;
 
-use std::sync::OnceLock;
 use std::sync::mpsc::{Receiver, sync_channel};
 use std::task::Waker;
-use std::time::Instant;
 
 use hyper_block::sim::SimFile;
 use hyper_durable::{GroupStore, LogStore, Output, Replica, Unbounded};
@@ -134,10 +132,16 @@ fn a_refusal_for_the_groups_bound_stalls_until_a_compaction_frees_it() {
     assert_eq!(view.last, r.applied().index);
 }
 
-/// The owner's clock in nanoseconds: the test reads the host's monotonic clock at its edge, as an
-/// owner does, and hands the shell nanoseconds since the first reading.
+/// The owner's clock in nanoseconds, simulated: each reading a nanosecond after the one before, so
+/// time only moves forward, as an owner's monotonic clock does, and every run reads the same times.
+/// No test here waits on elapsed time; those that judge time state it outright.
 fn now() -> u64 {
-    static EPOCH: OnceLock<Instant> = OnceLock::new();
-    let epoch = *EPOCH.get_or_init(Instant::now);
-    u64::try_from(epoch.elapsed().as_nanos()).unwrap_or(u64::MAX)
+    thread_local! {
+        static CLOCK: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    }
+    CLOCK.with(|clock| {
+        let now = clock.get() + 1;
+        clock.set(now);
+        now
+    })
 }

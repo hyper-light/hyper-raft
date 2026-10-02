@@ -68,6 +68,10 @@ fn send_queued(plane: &mut Plane, socket: &UdpSocket, to: &str) {
 /// The peer process: echoes every message of every datagram back, sealed under its own key,
 /// until it has echoed `DATAGRAMS` datagrams.
 #[test]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "real processes on the host's clock, threads and environment (CLAUDE.md §1a, end to end)"
+)]
 fn peer_process() {
     let Ok(parent) = std::env::var("HYPER_DATAGRAM_PEER") else {
         return;

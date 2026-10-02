@@ -132,7 +132,7 @@ mod tests {
         budget: RoundBudget,
         need: usize,
     ) -> (Round, Vec<usize>, Duration) {
-        let start = Instant::now();
+        let start = hyper_sim::Anchor::new().instant(0).unwrap();
         let mut round = Round::begin(&budget, peers.len(), start);
         let mut order: Vec<usize> = (0..peers.len())
             .filter(|&peer| peers[peer].0 != NEVER)

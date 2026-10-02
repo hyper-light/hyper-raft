@@ -59,6 +59,17 @@ disallowed-methods = [
   { path = "std::fs::File::set_len", reason = "sans-io; see std::fs::write." },
   { path = "std::env::temp_dir", reason = "no /tmp; tests name and remove their own directories." },
   { path = "std::thread::sleep", reason = "sans-io: time is an input, never a blocking sleep." },
+  # Determinism, enforced (docs/sim.md §3.9): a crate here reads no host clock, spawns no thread and
+  # reads no environment. The places that must (hyper-log's device, hyper-tokio, the E2E crates and
+  # tests of real processes, benchmarks timing themselves, a simulation world's Instant anchor) allow
+  # the lint at the site, with the reason in place. Builder::spawn and var_os are the same acts by
+  # other names.
+  { path = "std::time::Instant::now", reason = "time is an input: take `now` from the caller, or the simulation's clock (docs/sim.md §3.9)." },
+  { path = "std::time::SystemTime::now", reason = "time is an input: take it from the caller, or the simulation's clock (docs/sim.md §3.9)." },
+  { path = "std::thread::spawn", reason = "sans-io: no thread of a crate's own, and never one per unit (docs/sim.md §3.9)." },
+  { path = "std::thread::Builder::spawn", reason = "as std::thread::spawn." },
+  { path = "std::env::var", reason = "configuration is an input, not the environment (docs/sim.md §3.9)." },
+  { path = "std::env::var_os", reason = "as std::env::var." },
   # The accessors generated for the enumerations of raft-proto's wire and log types unwind on a value
   # they do not know, and a peer chooses the value; hyper_raft::proto reads them as options (focal's
   # clippy.toml, carried with the core).

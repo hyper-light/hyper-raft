@@ -263,6 +263,10 @@ impl Node {
     }
 
     /// Runs until `stop` is set, which it reads once a turn, or until the member fails.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "real processes on the host's clock, threads and environment (CLAUDE.md §1a, end to end)"
+    )]
     pub fn run(&mut self, stop: &AtomicBool) -> Result<(), NodeError> {
         let tick = self.settings.tick;
         let mut ticked = Instant::now();
@@ -299,6 +303,10 @@ impl Node {
     /// loaded machine a turn can take longer than a tick, so the tick is due at every turn; a
     /// member that then skipped its socket ticked on deaf, and as leader stepped down by its
     /// quorum check with its followers' answers waiting unread in its socket.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "real processes on the host's clock, threads and environment (CLAUDE.md §1a, end to end)"
+    )]
     pub fn receive_until(&mut self, until: Instant) -> Result<(), NodeError> {
         let wait = until.saturating_duration_since(Instant::now());
         if !wait.is_zero() {

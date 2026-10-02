@@ -77,6 +77,10 @@ fn tolerance_samples() -> usize {
     ((1.0 - CONFIDENCE).ln() / COVERAGE.ln()).ceil() as usize
 }
 
+#[allow(
+    clippy::disallowed_methods,
+    reason = "real processes on the host's clock, threads and environment (CLAUDE.md §1a, end to end)"
+)]
 fn bound(mut sample: impl FnMut()) -> Duration {
     let mut slowest = Duration::ZERO;
     for _ in 0..tolerance_samples() {
@@ -167,6 +171,10 @@ impl Drop for Cluster {
 }
 
 /// Starts the member `id` of `voters` on its log; its port and the lines it prints after.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "real processes on the host's clock, threads and environment (CLAUDE.md §1a, end to end)"
+)]
 fn spawn(id: u64, voters: &[u64], log: &Path, period: Duration) -> (Child, u16, Receiver<String>) {
     let list: Vec<String> = voters.iter().map(u64::to_string).collect();
     let mut child = Command::new(NODE)
@@ -268,6 +276,10 @@ impl Cluster {
     }
 
     /// Sends what is in the buffer to `id` and waits for its answer to `ask`, at most `wait`.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "real processes on the host's clock, threads and environment (CLAUDE.md §1a, end to end)"
+    )]
     fn exchange(&mut self, id: u64, ask: u64, wait: Duration) -> Option<Vec<u8>> {
         let to = self.member(id).address;
         let sealed = wire::seal(&mut self.buffer, self.datagram);
@@ -370,6 +382,10 @@ impl Cluster {
     }
 
     /// A fresh watch over the group's progress.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "real processes on the host's clock, threads and environment (CLAUDE.md §1a, end to end)"
+    )]
     fn watch(&self) -> Watch {
         Watch {
             seen: BTreeMap::new(),
@@ -380,6 +396,10 @@ impl Cluster {
     /// Whether the group is still moving: asks every member up for its report, and extends the
     /// watch by a quiet period whenever any member's term, commit, applied index or last index
     /// has moved since it last looked.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "real processes on the host's clock, threads and environment (CLAUDE.md §1a, end to end)"
+    )]
     fn moving(&mut self, watch: &mut Watch) -> bool {
         let mut moved = false;
         for id in self.up() {
@@ -418,6 +438,10 @@ impl Cluster {
     /// Sends what is in the buffer to `id` until it answers `ask`: an instruction is an
     /// idempotent datagram, which a loaded runner may drop or deliver late, so it is sent again
     /// each answer's time, for as long as a quiet period.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "real processes on the host's clock, threads and environment (CLAUDE.md §1a, end to end)"
+    )]
     fn exchange_resent(&mut self, id: u64, ask: u64) -> Option<Vec<u8>> {
         let until = Instant::now() + self.quiet();
         loop {
@@ -475,6 +499,10 @@ impl Cluster {
     }
 
     /// A line `id` prints that starts with `prefix`, within `wait`.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "real processes on the host's clock, threads and environment (CLAUDE.md §1a, end to end)"
+    )]
     fn line(&mut self, id: u64, prefix: &str, wait: Duration) -> Option<String> {
         let deadline = Instant::now() + wait;
         let lines = self.member(id).lines.as_ref()?;
@@ -674,6 +702,10 @@ fn founder(period: Duration) {
 
 /// The same founder killed while the removal waits behind its commit fence: it applied nothing,
 /// so the operator stops no one; restarted, the group finishes the removal.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "real processes on the host's clock, threads and environment (CLAUDE.md §1a, end to end)"
+)]
 fn founder_fenced(period: Duration) {
     let mut cluster = Cluster::start("founder-fenced", 2, period);
     cluster.write_some("before", 4);
@@ -818,6 +850,10 @@ fn random_kills(period: Duration, rounds: u64) {
     }
 }
 
+#[allow(
+    clippy::disallowed_methods,
+    reason = "real processes on the host's clock, threads and environment (CLAUDE.md §1a, end to end)"
+)]
 fn main() -> ExitCode {
     let period = measure_period();
     println!("period {period:?}; elections by suspicion, the test the members' detector");

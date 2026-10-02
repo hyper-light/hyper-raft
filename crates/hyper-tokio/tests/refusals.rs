@@ -14,7 +14,6 @@
 mod common;
 
 use std::net::SocketAddr;
-use std::time::Instant;
 
 use common::*;
 use hyper_tokio::{Driver, Error, Io, MAX_BATCH, PlaneSocket};
@@ -31,7 +30,7 @@ fn node() -> Node<Mantle> {
         pair.book(Role::Node, Role::Node),
         limits(),
         1 << 20,
-        Instant::now(),
+        hyper_sim::Anchor::new().instant(0).unwrap(),
     )
 }
 

@@ -116,6 +116,10 @@ impl Group {
     }
 }
 
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a benchmark measures real time on the host"
+)]
 fn run(suspicion: bool, groups: u64, periods: u64) {
     let settings = if suspicion {
         Settings::focal().by_suspicion()

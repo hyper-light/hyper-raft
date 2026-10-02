@@ -65,7 +65,7 @@ struct Net {
 impl Net {
     fn new(client: Endpoint, server: Endpoint) -> Self {
         Self {
-            now: Instant::now(),
+            now: hyper_sim::Anchor::new().instant(0).unwrap(),
             client: Peer::new(client, 4433),
             server: Peer::new(server, 4434),
             buf: Vec::with_capacity(1500),

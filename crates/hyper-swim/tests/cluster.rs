@@ -79,6 +79,10 @@ fn liveness_letter(liveness: Liveness) -> char {
 /// One member process: runs until it is killed, or until its supervisor is gone (its output
 /// closes), when it ends.
 #[test]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "real processes on the host's clock, threads and environment (CLAUDE.md §1a, end to end)"
+)]
 fn member_process() {
     let Ok(me) = std::env::var("HYPER_SWIM_NODE") else {
         return;
@@ -488,6 +492,10 @@ fn parse(line: &str) -> Option<(u64, BTreeMap<u64, Seen>)> {
 }
 
 #[test]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "real processes on the host's clock, threads and environment (CLAUDE.md §1a, end to end)"
+)]
 fn a_killed_member_is_declared_dead_by_every_survivor_and_no_live_one_is() {
     if std::env::var("HYPER_SWIM_NODE").is_ok() {
         return;

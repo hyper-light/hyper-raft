@@ -88,6 +88,10 @@ pub struct KeyLogFile(KeyLogFileInner);
 impl KeyLogFile {
     /// Makes a new `KeyLogFile`.  The environment variable is
     /// inspected and the named file is opened during this call.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "SSLKEYLOGFILE, read only when an owner installs KeyLogFile (rustls; VENDORED.md)"
+    )]
     pub fn new() -> Self {
         let var = var_os("SSLKEYLOGFILE");
         Self(KeyLogFileInner::new(var))

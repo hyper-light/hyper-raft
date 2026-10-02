@@ -75,6 +75,10 @@ struct Wire {
 }
 
 impl Wire {
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "real processes on the host's clock, threads and environment (CLAUDE.md §1a, end to end)"
+    )]
     fn bind() -> Self {
         Self {
             socket: UdpSocket::bind("127.0.0.1:0").unwrap(),
@@ -88,6 +92,10 @@ impl Wire {
     fn address(&self) -> SocketAddr {
         self.socket.local_addr().unwrap()
     }
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "real processes on the host's clock, threads and environment (CLAUDE.md §1a, end to end)"
+    )]
     fn flush<E: Drive>(&mut self, endpoint: &mut E) {
         while let Some(transmit) = endpoint.transmit(Instant::now(), &mut self.out) {
             // A datagram the kernel refuses is a lost datagram: QUIC recovers it.
@@ -97,6 +105,10 @@ impl Wire {
         }
     }
     /// Takes at most `most` datagrams; how many it took.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "real processes on the host's clock, threads and environment (CLAUDE.md §1a, end to end)"
+    )]
     fn receive<E: Drive>(&mut self, endpoint: &mut E, most: usize) -> usize {
         let mut taken = 0;
         for _ in 0..most {
@@ -119,6 +131,10 @@ impl Wire {
     }
     /// Sends what is due, waits for a datagram until the next timer, takes everything that has
     /// arrived (also when the timer is already due), fires the timers due, and sends again.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "real processes on the host's clock, threads and environment (CLAUDE.md §1a, end to end)"
+    )]
     fn turn<E: Drive>(&mut self, endpoint: &mut E) {
         self.flush(endpoint);
         let now = Instant::now();
@@ -148,6 +164,10 @@ impl Wire {
     }
 }
 
+#[allow(
+    clippy::disallowed_methods,
+    reason = "real processes on the host's clock, threads and environment (CLAUDE.md §1a, end to end)"
+)]
 fn parse<T: std::str::FromStr>(name: &str, default: T) -> T {
     std::env::var(name)
         .ok()
@@ -158,6 +178,10 @@ fn parse<T: std::str::FromStr>(name: &str, default: T) -> T {
 // ---------------------------------------------------------------------------------------------
 // The answering side.
 
+#[allow(
+    clippy::disallowed_methods,
+    reason = "real processes on the host's clock, threads and environment (CLAUDE.md §1a, end to end)"
+)]
 fn peer_process() {
     let root = unhex(&std::env::var("HT_ROOT").unwrap());
     let certificate = unhex(&std::env::var("HT_CERT").unwrap());
@@ -200,6 +224,10 @@ fn peer_process() {
     }
 }
 
+#[allow(
+    clippy::disallowed_methods,
+    reason = "real processes on the host's clock, threads and environment (CLAUDE.md §1a, end to end)"
+)]
 fn serve<C: Classes<Kind = Kind, Class = Class, Role = Role>>(mut node: Node<C>, hold: bool) {
     let mut wire = Wire::bind();
     println!("listening {}", wire.address().port());
@@ -312,6 +340,10 @@ impl Setup {
         }
     }
     /// An asking endpoint for identity `which`, with `role`, knowing node 2.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "real processes on the host's clock, threads and environment (CLAUDE.md §1a, end to end)"
+    )]
     fn asker<C: Classes<Kind = Kind, Class = Class, Role = Role>>(
         &self,
         which: PeerId,
@@ -332,6 +364,10 @@ impl Setup {
 }
 
 /// Turns `node` until `fact` holds; panics past the failure guard.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "real processes on the host's clock, threads and environment (CLAUDE.md §1a, end to end)"
+)]
 fn wait<C: Classes<Kind = Kind, Class = Class, Role = Role>>(
     wire: &mut Wire,
     node: &mut Node<C>,
@@ -356,6 +392,10 @@ fn wait<C: Classes<Kind = Kind, Class = Class, Role = Role>>(
     }
 }
 
+#[allow(
+    clippy::disallowed_methods,
+    reason = "real processes on the host's clock, threads and environment (CLAUDE.md §1a, end to end)"
+)]
 fn connect<C: Classes<Kind = Kind, Class = Class, Role = Role>>(
     wire: &mut Wire,
     node: &mut Node<C>,
@@ -373,6 +413,10 @@ fn period() -> Progress {
     Progress::new(PERIOD).unwrap()
 }
 
+#[allow(
+    clippy::disallowed_methods,
+    reason = "real processes on the host's clock, threads and environment (CLAUDE.md §1a, end to end)"
+)]
 fn exchanges() -> String {
     let setup = Setup::new(&[(1, Role::Node)]);
     let peer = setup.spawn(&[]);
@@ -456,6 +500,10 @@ fn exchanges() -> String {
     )
 }
 
+#[allow(
+    clippy::disallowed_methods,
+    reason = "real processes on the host's clock, threads and environment (CLAUDE.md §1a, end to end)"
+)]
 fn reserve() -> String {
     let setup = Setup::new(&[(1, Role::Node)]);
     let peer = setup.spawn(&[("HT_HOLD", "1".into())]);
@@ -548,6 +596,10 @@ fn reserve() -> String {
     )
 }
 
+#[allow(
+    clippy::disallowed_methods,
+    reason = "real processes on the host's clock, threads and environment (CLAUDE.md §1a, end to end)"
+)]
 fn refusals() -> String {
     // A peer with a strict request bound and a budget of its window and a little more, that knows
     // node 1 as a client.
@@ -708,6 +760,10 @@ fn refusals() -> String {
         .to_owned()
 }
 
+#[allow(
+    clippy::disallowed_methods,
+    reason = "real processes on the host's clock, threads and environment (CLAUDE.md §1a, end to end)"
+)]
 fn killed() -> String {
     let setup = Setup::new(&[(1, Role::Node)]);
     let peer = setup.spawn(&[]);
@@ -779,6 +835,10 @@ fn killed() -> String {
     )
 }
 
+#[allow(
+    clippy::disallowed_methods,
+    reason = "real processes on the host's clock, threads and environment (CLAUDE.md §1a, end to end)"
+)]
 fn lanes() -> String {
     const FRAMES: u32 = 4_000;
     let setup = Setup::new(&[(1, Role::Node)]);
@@ -834,6 +894,10 @@ fn lanes() -> String {
     )
 }
 
+#[allow(
+    clippy::disallowed_methods,
+    reason = "real processes on the host's clock, threads and environment (CLAUDE.md §1a, end to end)"
+)]
 fn main() {
     if std::env::var("HT_PEER").is_ok() {
         peer_process();

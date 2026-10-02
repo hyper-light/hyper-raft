@@ -98,6 +98,10 @@ fn update(replica: &Replica, size: usize) -> Update {
 }
 
 /// One driver: the replicas `driver`, `driver + drivers`, ... of `count`.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a benchmark measures real time on the host"
+)]
 fn drive(
     log: &Log<DeviceFile>,
     driver: usize,
@@ -195,6 +199,10 @@ fn nanos(ns: u64) -> String {
     }
 }
 
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a benchmark measures real time on the host"
+)]
 fn point(dir: &Path, step: Duration, size: usize, count: usize, most: usize, id: u128) {
     let scratch = Scratch::create(dir, ".hyper-bench-log").unwrap();
     let log = Log::create(open(scratch.path()), config(most), id).unwrap();

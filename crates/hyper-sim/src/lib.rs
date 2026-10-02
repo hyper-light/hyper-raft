@@ -37,7 +37,7 @@ mod twice;
 mod wakes;
 mod world;
 
-pub use clock::{Clock, Lateness, PPM};
+pub use clock::{Anchor, Clock, Lateness, PPM};
 pub use error::SimError;
 pub use queue::Discipline;
 pub use rng::Seeded;

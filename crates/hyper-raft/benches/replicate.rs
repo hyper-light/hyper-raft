@@ -37,6 +37,10 @@ fn quiet<R: Replica>(group: &mut Cluster<R>) {
     }
 }
 /// Nanoseconds for each entry committed by every member.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a benchmark measures real time on the host"
+)]
 fn replicate<R: Replica>(members: u64, batch: usize, bytes: usize, rounds: usize) -> f64 {
     let voters: Vec<u64> = (1..=members).collect();
     let mut group: Cluster<R> = Cluster::new(members, &voters, Settings::shell(), 1);

@@ -27,6 +27,10 @@ use hyper_raft::proto::{
 };
 use support::{Cluster, Either, Mix, New, Old, Op, Replica, Seeded, Settings};
 
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a soak sets the seed count from the environment; the default is the gate's"
+)]
 fn count(name: &str, default: u64) -> u64 {
     std::env::var(name)
         .ok()

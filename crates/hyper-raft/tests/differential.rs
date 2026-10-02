@@ -34,6 +34,10 @@ use std::collections::VecDeque;
 use hyper_raft::proto::MessageType;
 use support::{Cluster, Mix, New, Old, Op, Replica, Report, Seeded, Settings};
 
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a soak sets the seed count from the environment; the default is the gate's"
+)]
 fn count(name: &str, default: u64) -> u64 {
     std::env::var(name)
         .ok()

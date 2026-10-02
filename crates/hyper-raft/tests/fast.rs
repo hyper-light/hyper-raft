@@ -35,6 +35,10 @@ fn add(total: &mut hyper_raft::FastStats, more: hyper_raft::FastStats) {
     total.committed += more.committed;
     total.recovered += more.recovered;
 }
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a soak sets the seed count from the environment; the default is the gate's"
+)]
 fn count(name: &str, default: u64) -> u64 {
     std::env::var(name)
         .ok()

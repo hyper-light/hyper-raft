@@ -604,6 +604,10 @@ impl QlogConfig {
 }
 
 impl Default for QlogConfig {
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "qlog's start time, taken when a qlog configuration is made (quinn-proto; VENDORED.md)"
+    )]
     fn default() -> Self {
         Self {
             writer: None,

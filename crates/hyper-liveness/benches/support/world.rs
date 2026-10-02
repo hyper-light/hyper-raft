@@ -168,6 +168,10 @@ impl World {
         }
     }
 
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "a benchmark measures real time on the host"
+    )]
     fn poll(&mut self, node: usize) {
         let now = self.now;
         let n = &mut self.nodes[node];
@@ -235,6 +239,10 @@ impl World {
         }
     }
 
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "a benchmark measures real time on the host"
+    )]
     fn handle(&mut self, event: Event) {
         let now = self.now;
         match event {

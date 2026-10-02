@@ -328,6 +328,10 @@ fn main() {
     }
 }
 
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a benchmark measures real time on the host"
+)]
 fn table(confirmed: bool) {
     println!(
         "{:<10} {:<8} {:>7} {:>10} {:>10} {:>14} {:>16} {:>12}",

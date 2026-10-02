@@ -84,6 +84,10 @@ static PARENT_GONE: AtomicBool = AtomicBool::new(false);
 /// Watches standard input until it ends. The parent holds the pipe's other end for as long as it
 /// lives, so a member never outlives the test that started it, however the test ends (a test
 /// killed outright runs no clean-up of its own). One thread for the process, blocked on the pipe.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "real processes on the host's clock, threads and environment (CLAUDE.md §1a, end to end)"
+)]
 fn watch_parent() -> std::io::Result<()> {
     std::thread::Builder::new()
         .name("parent".to_owned())

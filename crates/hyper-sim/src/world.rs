@@ -6,9 +6,9 @@
 //! Every choice the loop's run makes — which enabled event runs next, every fate drawn — is made
 //! through the world, so the run is its seed, or its trace.
 
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
-use crate::clock::{Clock, PPM};
+use crate::clock::{Anchor, Clock, PPM};
 use crate::error::SimError;
 use crate::queue::{Discipline, Key, Queue};
 use crate::trace::{Chooser, Digest, Trace};
@@ -250,7 +250,7 @@ pub struct World<E> {
     schedule: u32,
     /// The one host clock read a run makes, for crates whose `now` is an `Instant`
     /// (`docs/sim.md` §3.2): only differences of the instants it gives may enter a decision.
-    anchor: Instant,
+    anchor: Anchor,
     tie_events: Vec<Key>,
     tie_wakes: Vec<Armed>,
     stack: Vec<usize>,
@@ -274,7 +274,7 @@ impl<E> World<E> {
             nodes: Vec::new(),
             chooser,
             schedule,
-            anchor: anchor(),
+            anchor: Anchor::new(),
             tie_events: Vec::new(),
             tie_wakes: Vec::new(),
             stack: Vec::new(),
@@ -381,10 +381,7 @@ impl<E> World<E> {
 
     /// `node`'s monotonic clock now as an `Instant`: the world's anchor plus the reading.
     pub fn instant(&self, node: NodeId) -> Result<Instant, SimError> {
-        let reading = Duration::from_nanos(self.monotonic(node)?);
-        self.anchor
-            .checked_add(reading)
-            .ok_or(SimError::TimeOverflow)
+        self.anchor.instant(self.monotonic(node)?)
     }
 
     /// `node`'s wall clock stepped by `by_ns`, forward or back.
@@ -642,14 +639,4 @@ fn pick<S: Strategy>(
         return Err(SimError::Pick { picked, candidates });
     }
     Ok(picked)
-}
-
-/// The host's monotonic clock, read once when a world is made: the anchor of the `Instant`s it
-/// gives (`docs/sim.md` §3.2). The run never reads it again.
-#[allow(
-    clippy::disallowed_methods,
-    reason = "the one host clock read of a world, its Instant anchor (docs/sim.md §3.2)"
-)]
-fn anchor() -> Instant {
-    Instant::now()
 }

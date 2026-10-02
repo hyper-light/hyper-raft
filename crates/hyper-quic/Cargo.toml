@@ -31,6 +31,9 @@ tracing = { version = "0.1.10", default-features = false, features = ["std"] }
 assert_matches = "1.1"
 hex-literal = "1"
 hyper-measure = { path = "../hyper-measure" }
+# Tests that need an Instant epoch take it from simulated time's one anchor, not the host clock
+# (docs/sim.md §3.2, §12.6).
+hyper-sim = { path = "../hyper-sim" }
 lazy_static = "1"
 rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem"] }
 tracing-subscriber = { version = "0.3.0", default-features = false, features = ["env-filter", "fmt", "ansi", "time", "local-time"] }

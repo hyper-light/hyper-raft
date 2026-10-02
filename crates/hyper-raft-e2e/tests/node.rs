@@ -36,6 +36,10 @@ fn remove(path: &std::path::Path) {
 /// is on a loaded machine. It ticked on without reading its peers' answers, and as leader it
 /// stepped down by its quorum check while those answers waited unread in its socket.
 #[test]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "real processes on the host's clock, threads and environment (CLAUDE.md §1a, end to end)"
+)]
 fn a_member_behind_its_tick_still_reads_what_arrived() {
     let path = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
         .join(format!("node-{}-behind-its-tick.wal", std::process::id()));

@@ -162,6 +162,10 @@ fn peer_process() {
     runtime().block_on(serve());
 }
 
+#[allow(
+    clippy::disallowed_methods,
+    reason = "real processes on the host's clock, threads and environment (CLAUDE.md §1a, end to end)"
+)]
 async fn serve() {
     let root = unhex(&std::env::var("HK_ROOT").unwrap());
     let certificate = unhex(&std::env::var("HK_CERT").unwrap());
@@ -306,6 +310,10 @@ impl Setup {
         }
     }
 
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "real processes on the host's clock, threads and environment (CLAUDE.md §1a, end to end)"
+    )]
     fn driver(&self) -> Drv<Mantle> {
         let mut book = Book::default();
         book.add(&self.two.0, 2, Role::Node);
@@ -322,6 +330,10 @@ impl Setup {
 }
 
 /// Runs the driver until `fact` holds; panics past the failure guard.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "real processes on the host's clock, threads and environment (CLAUDE.md §1a, end to end)"
+)]
 async fn wait(
     driver: &mut Drv<Mantle>,
     asker: &mut Asker,
@@ -357,6 +369,10 @@ async fn wait(
     }
 }
 
+#[allow(
+    clippy::disallowed_methods,
+    reason = "real processes on the host's clock, threads and environment (CLAUDE.md §1a, end to end)"
+)]
 async fn connect(driver: &mut Drv<Mantle>, asker: &mut Asker, peer: &Peer) -> Duration {
     driver
         .endpoint()
@@ -382,6 +398,10 @@ fn batching(stats: IoStats) -> String {
     )
 }
 
+#[allow(
+    clippy::disallowed_methods,
+    reason = "real processes on the host's clock, threads and environment (CLAUDE.md §1a, end to end)"
+)]
 async fn exchanges() -> String {
     let setup = Setup::new();
     let peer = setup.spawn(SocketAddr::from(([127, 0, 0, 1], 0)));
@@ -461,6 +481,10 @@ async fn exchanges() -> String {
     )
 }
 
+#[allow(
+    clippy::disallowed_methods,
+    reason = "real processes on the host's clock, threads and environment (CLAUDE.md §1a, end to end)"
+)]
 async fn lanes() -> String {
     const FRAMES: u32 = 4_000;
     let setup = Setup::new();
@@ -513,6 +537,10 @@ async fn lanes() -> String {
     )
 }
 
+#[allow(
+    clippy::disallowed_methods,
+    reason = "real processes on the host's clock, threads and environment (CLAUDE.md §1a, end to end)"
+)]
 async fn plane() -> String {
     let setup = Setup::new();
     let mut socket = PlaneSocket::bind("127.0.0.1:0".parse().unwrap(), IO).unwrap();
@@ -578,6 +606,10 @@ async fn plane() -> String {
     )
 }
 
+#[allow(
+    clippy::disallowed_methods,
+    reason = "real processes on the host's clock, threads and environment (CLAUDE.md §1a, end to end)"
+)]
 async fn killed() -> String {
     let setup = Setup::new();
     let peer = setup.spawn(SocketAddr::from(([127, 0, 0, 1], 0)));
@@ -636,6 +668,10 @@ async fn killed() -> String {
     )
 }
 
+#[allow(
+    clippy::disallowed_methods,
+    reason = "real processes on the host's clock, threads and environment (CLAUDE.md §1a, end to end)"
+)]
 fn main() {
     if std::env::var("HK_PEER").is_ok() {
         peer_process();

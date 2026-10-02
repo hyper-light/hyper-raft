@@ -588,6 +588,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "hyper-sim"
+version = "0.1.0"
+
+[[package]]
 name = "hyper-timing"
 version = "0.1.0"
 
@@ -615,6 +619,7 @@ dependencies = [
  "hyper-transport",
  "libc",
  "tokio",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -634,6 +639,7 @@ version = "0.1.0"
 dependencies = [
  "focal-wire",
  "hyper-measure",
+ "hyper-sim",
  "hyper-tokio",
  "hyper-transport",
  "quinn",

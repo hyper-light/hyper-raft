@@ -524,6 +524,10 @@ pub fn same_configuration(a: &ConfState, b: &ConfState) -> bool {
 }
 
 /// A count from the environment, for longer soaks.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a soak sets the seed count from the environment; the default is the gate's"
+)]
 pub fn count(name: &str, default: u64) -> u64 {
     std::env::var(name)
         .ok()

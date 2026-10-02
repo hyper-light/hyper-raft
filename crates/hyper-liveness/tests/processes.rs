@@ -141,6 +141,10 @@ impl Output for Asked<'_> {
 
 /// One member process: runs until it is killed or its supervisor is gone.
 #[test]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "real processes on the host's clock, threads and environment (CLAUDE.md §1a, end to end)"
+)]
 fn member_process() {
     let Ok(me) = std::env::var("HYPER_LIVENESS_NODE") else {
         return;
@@ -159,6 +163,10 @@ fn member_process() {
     runtime.block_on(member(me, ports, file));
 }
 
+#[allow(
+    clippy::disallowed_methods,
+    reason = "real processes on the host's clock, threads and environment (CLAUDE.md §1a, end to end)"
+)]
 async fn member(me: u64, ports: Vec<u16>, file: std::path::PathBuf) {
     let address = |id: u64| SocketAddr::from(([127, 0, 0, 1], ports[(id - 1) as usize]));
     let mut socket = PlaneSocket::bind(address(me), Io { batch: 64 }).unwrap();
@@ -530,6 +538,10 @@ impl Supervisor {
 }
 
 #[test]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "real processes on the host's clock, threads and environment (CLAUDE.md §1a, end to end)"
+)]
 fn a_stalled_disk_and_a_killed_node_are_suspected_and_no_live_one_is() {
     if std::env::var("HYPER_LIVENESS_NODE").is_ok() {
         return;

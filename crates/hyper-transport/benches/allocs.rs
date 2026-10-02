@@ -131,6 +131,10 @@ fn exchange(net: &mut Net<Node<Mantle>, Node<Mantle>>, body: Option<u64>, piece:
     panic!("the exchange never completed");
 }
 
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a benchmark measures real time on the host"
+)]
 fn transport_net() -> Net<Node<Mantle>, Node<Mantle>> {
     let pair = Pair::new();
     let now = Instant::now();
@@ -176,6 +180,10 @@ fn report(rows: &[Row]) {
     }
 }
 
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a benchmark measures real time on the host"
+)]
 fn measure(name: &str, rounds: u64, mut work: impl FnMut()) -> Row {
     for _ in 0..WARM {
         work();
@@ -342,6 +350,10 @@ fn raw_exchange(net: &mut Net<Raw, Raw>, body: u64, piece: &[u8]) {
     panic!("the raw exchange never completed");
 }
 
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a benchmark measures real time on the host"
+)]
 fn raw_net() -> Net<Raw, Raw> {
     let pki = Pki::new();
     let (certificate, key) = pki.issue("node-2");

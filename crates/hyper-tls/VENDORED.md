@@ -296,3 +296,10 @@ but a store shared by connections may replace it between a ClientHello and its r
 8446 §4.1.2 forbids changing. The chain has two owners, the store and `peer_certificates`;
 without shared ownership one of them copies, unless `peer_certificates` borrows the
 configuration's store, an API change left for the consumers to ask for.
+
+## 4. The environment, stated (2026-10-02)
+
+The workspace denies `Instant::now`, `SystemTime::now`, thread spawns and environment reads
+(`clippy.toml`, `docs/sim.md` §3.9). Upstream reads `SSLKEYLOGFILE` in `key_log_file.rs`, only when
+an owner installs `KeyLogFile`; it is kept and allowed at the site with its reason. No behaviour
+changes.

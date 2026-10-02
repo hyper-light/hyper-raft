@@ -175,6 +175,10 @@ pub fn open_log(path: &Path) -> Result<Log<FaultFile>, NodeError> {
 
 impl Node {
     /// The member `settings` names on `socket`, opened on `log`, woken by `waker`.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "real processes on the host's clock, threads and environment (CLAUDE.md §1a, end to end)"
+    )]
     pub fn open(
         settings: Settings,
         socket: UdpSocket,
@@ -238,6 +242,10 @@ impl Node {
     }
 
     /// Probes every peer, stamped now: each answers at once, and the answer times the path.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "real processes on the host's clock, threads and environment (CLAUDE.md §1a, end to end)"
+    )]
     fn probe(&mut self) -> Result<(), NodeError> {
         if self.isolated {
             return Ok(());
@@ -293,6 +301,10 @@ impl Node {
 
     /// Runs until `parent` says the test is gone, or until the member stops at an armed point
     /// (`Ok(Some(point))`), or fails.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "real processes on the host's clock, threads and environment (CLAUDE.md §1a, end to end)"
+    )]
     pub fn run(&mut self, parent: &Receiver<()>) -> Result<Option<Point>, NodeError> {
         let period = self.settings.period;
         let mut next_period = Instant::now();
@@ -346,6 +358,10 @@ impl Node {
 
     /// Waits for a datagram until `until`, then takes what else has arrived, at most a turn's
     /// worth (hyper-raft-e2e's `receive_until`). False when the wait timed out with nothing.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "real processes on the host's clock, threads and environment (CLAUDE.md §1a, end to end)"
+    )]
     fn receive_until(&mut self, until: Instant) -> Result<bool, NodeError> {
         let wait = until.saturating_duration_since(Instant::now());
         if !wait.is_zero() {
@@ -539,6 +555,10 @@ impl Node {
         self.respond(from, id, &Outcome::Done)
     }
 
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "real processes on the host's clock, threads and environment (CLAUDE.md §1a, end to end)"
+    )]
     fn obey(&mut self, id: u64, order: Order, from: SocketAddr) -> Result<(), NodeError> {
         match order {
             Order::Wake => {
@@ -659,6 +679,10 @@ impl Node {
     }
 
     /// Drives the replica until it has nothing more to do now, stopping at an armed point.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "real processes on the host's clock, threads and environment (CLAUDE.md §1a, end to end)"
+    )]
     fn drive(&mut self) -> Result<Option<Point>, NodeError> {
         loop {
             let out_before = self.replica.in_flight();

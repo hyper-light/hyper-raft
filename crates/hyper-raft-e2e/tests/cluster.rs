@@ -107,6 +107,10 @@ fn tolerance_samples() -> usize {
 }
 
 /// The 95/95 upper bound of `sample`'s time.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "real processes on the host's clock, threads and environment (CLAUDE.md §1a, end to end)"
+)]
 fn bound(mut sample: impl FnMut()) -> Duration {
     let mut slowest = Duration::ZERO;
     for _ in 0..tolerance_samples() {
@@ -303,6 +307,10 @@ impl Cluster {
         self.members[(id - 1) as usize].address
     }
     /// Sends `buffer` to member `id` and waits for the answer to `request`.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "real processes on the host's clock, threads and environment (CLAUDE.md §1a, end to end)"
+    )]
     fn ask(&mut self, id: u64, request: u64) -> Option<Outcome> {
         if !wire::seal(&mut self.buffer, self.datagram) {
             panic!("a request too long for a datagram");
@@ -352,6 +360,10 @@ impl Cluster {
     /// member descheduled on a slow runner may answer late or a full socket may drop, so it is
     /// sent again, under the same request, for as long as a write is given; setting peers or
     /// isolation twice changes nothing, so the instruction is idempotent.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "real processes on the host's clock, threads and environment (CLAUDE.md §1a, end to end)"
+    )]
     fn control(&mut self, id: u64, control: &Control) {
         self.next_id += 1;
         let request = self.next_id;
@@ -416,6 +428,10 @@ impl Cluster {
     }
     /// Waits until the members in `among` agree on one leader of one term, which is among
     /// them, and says which.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "real processes on the host's clock, threads and environment (CLAUDE.md §1a, end to end)"
+    )]
     fn leader_among(&mut self, among: &[u64]) -> (u64, u64) {
         let until = Instant::now() + self.budget();
         while Instant::now() < until {
@@ -447,6 +463,10 @@ impl Cluster {
     /// Lets `ticks` pass. The test's socket is asked nothing, so the wait is its timeout; an
     /// answer that comes late to a request already given up on is dropped, and the wait goes on
     /// to its end.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "real processes on the host's clock, threads and environment (CLAUDE.md §1a, end to end)"
+    )]
     fn wait_ticks(&mut self, ticks: u32) {
         let until = Instant::now() + self.tick * ticks;
         let mut sink = vec![0u8; wire::MAX_DATAGRAM];
@@ -498,6 +518,10 @@ impl Cluster {
     /// Waits until every member in `among` applied the same history through the same index.
     /// A member behind catches up at least an entry a broadcast, so the wait is the elections'
     /// budget and a tick for each entry the group's log holds.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "real processes on the host's clock, threads and environment (CLAUDE.md §1a, end to end)"
+    )]
     fn converged(&mut self, among: &[u64]) -> Status {
         let entries = among
             .iter()
@@ -563,6 +587,10 @@ impl Client {
         self.next(cluster, from)
     }
     /// Writes `key`; true once a member answered that it is committed.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "real processes on the host's clock, threads and environment (CLAUDE.md §1a, end to end)"
+    )]
     fn put(
         &mut self,
         cluster: &mut Cluster,
@@ -594,6 +622,10 @@ impl Client {
         false
     }
     /// Reads `key` linearizably through the leader.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "real processes on the host's clock, threads and environment (CLAUDE.md §1a, end to end)"
+    )]
     fn get(&mut self, cluster: &mut Cluster, key: &[u8]) -> Option<Vec<u8>> {
         let mut target = self.leader;
         let until = Instant::now() + cluster.budget();
@@ -644,6 +676,10 @@ fn verify(cluster: &mut Cluster, client: &mut Client, history: &History) -> usiz
 }
 
 /// Writes and reads back keys `keys`; says the slowest write and read.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "real processes on the host's clock, threads and environment (CLAUDE.md §1a, end to end)"
+)]
 fn write_range(
     cluster: &mut Cluster,
     client: &mut Client,
@@ -674,6 +710,10 @@ fn write_range(
 }
 
 /// A group of `voters` commits a workload, and every member applies it alike.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "real processes on the host's clock, threads and environment (CLAUDE.md §1a, end to end)"
+)]
 fn commits(voters: usize, run: Run, name: &'static str) -> String {
     let writes = workload();
     let mut cluster = Cluster::start(name, voters, run, writes);
@@ -696,6 +736,10 @@ fn commits(voters: usize, run: Run, name: &'static str) -> String {
 
 /// The leader is killed while writes are in flight; the others elect, and nothing answered is
 /// lost. The killed member comes back on its log and applies the same history.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "real processes on the host's clock, threads and environment (CLAUDE.md §1a, end to end)"
+)]
 fn leader_killed(run: Run) -> String {
     let name = "leader-killed";
     let phase = workload();
@@ -898,6 +942,10 @@ fn all_killed(run: Run) -> String {
 /// A scenario: run at a tick, it says what it saw.
 type Scenario = fn(Run) -> String;
 
+#[allow(
+    clippy::disallowed_methods,
+    reason = "real processes on the host's clock, threads and environment (CLAUDE.md §1a, end to end)"
+)]
 fn main() -> ExitCode {
     let tick = measure_tick();
     let mut out = std::io::stdout().lock();

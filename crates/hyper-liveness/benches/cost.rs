@@ -245,6 +245,10 @@ struct Rate {
     cpu_us: f64,
 }
 
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a benchmark measures real time on the host"
+)]
 fn per_group(nodes: usize, per_node: usize) -> Rate {
     let mut groups = Groups::new(nodes, per_node);
     let total = groups.members.len();
@@ -308,6 +312,10 @@ fn per_pair(nodes: usize, per_node: usize) -> (Rate, f64) {
 }
 
 /// slates' detector at `ETA`: a member probes each of its `P` peers once a round of `P` periods.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a benchmark measures real time on the host"
+)]
 fn swim(nodes: usize) -> Rate {
     let peers = nodes - 1;
     let mut members: Vec<Detector> = (0..nodes as u64)

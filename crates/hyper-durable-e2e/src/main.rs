@@ -61,6 +61,10 @@ fn parse(arguments: &[String]) -> Result<Arguments, String> {
 
 /// Watches standard input until it ends: the parent holds its end for as long as it lives, so a
 /// member never outlives its test. One thread, blocked on the pipe.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "real processes on the host's clock, threads and environment (CLAUDE.md §1a, end to end)"
+)]
 fn watch_parent() -> std::io::Result<Receiver<()>> {
     let (gone, parent) = sync_channel(1);
     std::thread::Builder::new()
@@ -74,6 +78,10 @@ fn watch_parent() -> std::io::Result<Receiver<()>> {
 
 /// Turns the member's waker into a datagram to its own socket, so its one wait on the socket
 /// covers the log's answers too. One thread, blocked on the waker's channel.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "real processes on the host's clock, threads and environment (CLAUDE.md §1a, end to end)"
+)]
 fn relay(socket: &UdpSocket) -> std::io::Result<std::task::Waker> {
     let (tell, told) = sync_channel::<usize>(1024);
     let (waker, _) = hyper_measure::wake::waker(0, tell);

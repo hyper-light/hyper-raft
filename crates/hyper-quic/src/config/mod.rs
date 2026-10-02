@@ -658,6 +658,10 @@ pub trait TimeSource: Send + Sync {
 pub struct StdSystemTime;
 
 impl TimeSource for StdSystemTime {
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "quinn-proto's default TimeSource for address-validation tokens, which an owner replaces (VENDORED.md)"
+    )]
     fn now(&self) -> SystemTime {
         SystemTime::now()
     }

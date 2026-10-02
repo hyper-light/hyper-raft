@@ -148,7 +148,7 @@ mod tests {
     /// finest time in which it sees the window consumed.
     #[test]
     fn a_round_trip_under_the_granularity_counts_as_the_granularity() {
-        let start = Instant::now();
+        let start = hyper_sim::Anchor::new().instant(0).unwrap();
         let rtt = Duration::from_micros(400);
         let consumed_in = Duration::from_millis(20);
         let mut coarse = Window::new(1_000, 4_000);
@@ -180,7 +180,7 @@ mod tests {
     /// the ceiling; one consumed slower starts a new epoch at the same window.
     #[test]
     fn a_window_consumed_quickly_doubles_up_to_its_ceiling() {
-        let start = Instant::now();
+        let start = hyper_sim::Anchor::new().instant(0).unwrap();
         let rtt = Duration::from_millis(10);
         let mut window = Window::new(1_000, 3_000);
         assert_eq!(window.tune(start, rtt, K_GRANULARITY), None);

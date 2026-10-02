@@ -94,6 +94,10 @@ struct Cost {
 
 /// `BEATS` heartbeats: the driver's poll, the heartbeat and the due check, configurations set
 /// aside from the time but not from the counts.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a benchmark measures real time on the host"
+)]
 fn heartbeats(granularity: Duration, seed: u64) -> (Cost, u64) {
     let mut delays = Delays(seed);
     let (mut link, start) = warm(granularity, &mut delays);
@@ -135,6 +139,10 @@ fn heartbeats(granularity: Duration, seed: u64) -> (Cost, u64) {
 }
 
 /// A path estimator's sample, the same delays as round trips.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a benchmark measures real time on the host"
+)]
 fn path_sample<P>(mut path: P, sample: impl Fn(&mut P, u64), seed: u64) -> f64 {
     let mut delays = Delays(seed);
     let samples: Vec<u64> = (0..BEATS).map(|_| delays.next()).collect();

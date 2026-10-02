@@ -704,7 +704,7 @@ impl Asker {
         Self {
             asked: Vec::new(),
             frames: Vec::new(),
-            clock: Instant::now(),
+            clock: hyper_sim::Anchor::new().instant(0).unwrap(),
             events: Vec::new(),
             connected: Vec::new(),
             unreachable: Vec::new(),

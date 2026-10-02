@@ -714,6 +714,7 @@ dependencies = [
  "fastbloom",
  "hex-literal",
  "hyper-measure",
+ "hyper-sim",
  "hyper-tls",
  "lazy_static",
  "lru-slab",
@@ -772,6 +773,7 @@ name = "hyper-timing"
 version = "0.1.0"
 dependencies = [
  "hyper-measure",
+ "hyper-sim",
  "proptest",
 ]
 
@@ -820,6 +822,7 @@ version = "0.1.0"
 dependencies = [
  "hyper-datagram",
  "hyper-measure",
+ "hyper-sim",
  "hyper-transport",
  "libc",
  "rcgen",
@@ -835,6 +838,7 @@ dependencies = [
  "crc32c",
  "hyper-measure",
  "hyper-quic",
+ "hyper-sim",
  "hyper-timing",
  "rcgen",
  "thiserror 2.0.20",

@@ -14,6 +14,8 @@ publish = false
 [dependencies]
 hyper-transport = { path = "../hyper-transport" }
 hyper-measure = { path = "../hyper-measure" }
+# hyper-transport's test support, which this binary includes, takes its Instant epoch here.
+hyper-sim = { path = "../hyper-sim" }
 hyper-tokio = { path = "../hyper-tokio" }
 rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem"] }
 # focal-wire at focal `99191da` (branch slates-port), the source this crate was ported from.

@@ -18,6 +18,9 @@ thiserror.workspace = true
 
 [dev-dependencies]
 hyper-measure = { path = "../hyper-measure" }
+# Tests that need an Instant epoch take it from simulated time's one anchor, not the host clock
+# (docs/sim.md §3.2, §12.6).
+hyper-sim = { path = "../hyper-sim" }
 # Certificates for the tests' mutual TLS (hyper-quic's own dev-dependency).
 rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem"] }
 

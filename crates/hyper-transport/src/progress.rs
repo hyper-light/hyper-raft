@@ -285,7 +285,7 @@ mod tests {
     /// seconds and more; it is never cut off at a fixed time while it moves.
     #[test]
     fn a_slow_transfer_that_moves_is_never_cut_off() {
-        let start = Instant::now();
+        let start = hyper_sim::Anchor::new().instant(0).unwrap();
         let mut carry = Carry::idle(Progress::new(PERIOD).unwrap(), start, moved(0, 0));
         carry.asking(start, moved(0, 0), 1_000_000);
         // 12,500 bytes a period: a megabit a second.
@@ -316,7 +316,7 @@ mod tests {
     /// end-to-end scenario, four on another.
     #[test]
     fn what_is_sent_into_silence_is_not_progress() {
-        let start = Instant::now();
+        let start = hyper_sim::Anchor::new().instant(0).unwrap();
         let mut carry = Carry::idle(Progress::new(PERIOD).unwrap(), start, moved(0, 0));
         carry.asking(start, moved(0, 0), 1_000_000);
         assert_eq!(
@@ -327,7 +327,7 @@ mod tests {
 
     #[test]
     fn a_period_that_moves_less_than_a_datagram_ends_the_exchange() {
-        let start = Instant::now();
+        let start = hyper_sim::Anchor::new().instant(0).unwrap();
         let mut carry = Carry::idle(Progress::new(PERIOD).unwrap(), start, moved(0, 0));
         carry.asking(start, moved(500, 0), 10_000);
         // Not yet due: no judgement.
@@ -346,7 +346,7 @@ mod tests {
     /// datagram.
     #[test]
     fn an_answer_is_charged_with_what_arrives_and_must_keep_arriving() {
-        let start = Instant::now();
+        let start = hyper_sim::Anchor::new().instant(0).unwrap();
         let mut carry = Carry::idle(Progress::new(PERIOD).unwrap(), start, moved(0, 0));
         // 1 MB at 12,000 bytes a period: 84 periods.
         carry.answering(start, moved(0, 0), 1_000_000, 1_000_000);
@@ -376,7 +376,7 @@ mod tests {
     /// delivers is not charged (`delivered` does not count it).
     #[test]
     fn a_withheld_body_ends_a_period_after_everything_owed_was_delivered() {
-        let start = Instant::now();
+        let start = hyper_sim::Anchor::new().instant(0).unwrap();
         let mut carry = Carry::idle(Progress::new(PERIOD).unwrap(), start, moved(0, 0));
         // This body of 10,000 and another of 50,000 owed.
         carry.answering(start, moved(0, 0), 10_000, 60_000);
@@ -406,7 +406,7 @@ mod tests {
 
     #[test]
     fn an_idle_wait_is_never_due() {
-        let start = Instant::now();
+        let start = hyper_sim::Anchor::new().instant(0).unwrap();
         let carry = Carry::idle(Progress::new(PERIOD).unwrap(), start, moved(0, 0));
         assert_eq!(carry.due(), None);
         assert_eq!(Progress::new(Duration::ZERO), Err(Refusal::Configuration));

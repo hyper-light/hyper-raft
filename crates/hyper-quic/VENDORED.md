@@ -354,3 +354,13 @@ Three items made public for hyper-transport (mantle note 32 §3.4); no behaviour
   §18.2; the default before its parameters arrive), which the connection already computed for its
   own timers. hyper-transport judges an exchange by whether its period heard the peer, so it
   refuses a period no longer than this (`Endpoint::open`, `Refusal::Configuration`).
+
+## 6. The host clock, stated (2026-10-02)
+
+The workspace denies `Instant::now`, `SystemTime::now`, thread spawns and environment reads
+(`clippy.toml`, `docs/sim.md` §3.9). Upstream reads the host clock in two shipped places, each kept
+and allowed at the site with its reason; no behaviour changes:
+- `config/mod.rs`, `StdSystemTime::now`: the default `TimeSource` of address-validation tokens,
+  which an owner replaces through `ServerConfig`.
+- `config/transport.rs`, `QlogConfig::default`: qlog's start time, taken when a qlog configuration
+  is made (the `qlog` feature).

@@ -36,7 +36,7 @@ where
     A: hyper_transport::Classes<Kind = Kind, Class = Class, Role = Role>,
     B: hyper_transport::Classes<Kind = Kind, Class = Class, Role = Role>,
 {
-    let now = Instant::now();
+    let now = hyper_sim::Anchor::new().instant(0).unwrap();
     let a = pair.node::<A>(
         1,
         Role::Node,
@@ -314,7 +314,7 @@ fn a_period_no_longer_than_the_peers_acknowledgement_delay_is_refused() {
 #[test]
 fn a_role_that_may_not_send_a_kind_is_refused_on_both_sides() {
     let pair = Pair::new();
-    let now = Instant::now();
+    let now = hyper_sim::Anchor::new().instant(0).unwrap();
     let book = || pair.book(Role::Client, Role::Node);
     let a = pair.node::<Lax>(1, Role::Client, book(), limits(), 64 << 20, now);
     let b = pair.node::<Mantle>(2, Role::Node, book(), limits(), 64 << 20, now);
@@ -361,7 +361,7 @@ fn a_role_that_may_not_send_a_kind_is_refused_on_both_sides() {
 #[test]
 fn a_budget_that_cannot_fund_a_head_refuses_it() {
     let pair = Pair::new();
-    let now = Instant::now();
+    let now = hyper_sim::Anchor::new().instant(0).unwrap();
     let a = pair.node::<Mantle>(
         1,
         Role::Node,
@@ -588,7 +588,7 @@ fn a_lane_refuses_a_frame_past_the_core_s_window() {
 #[test]
 fn a_certificate_the_directory_does_not_know_is_refused_and_charged_to_no_one() {
     let pair = Pair::new();
-    let now = Instant::now();
+    let now = hyper_sim::Anchor::new().instant(0).unwrap();
     let a = pair.node::<Mantle>(
         1,
         Role::Node,
@@ -618,7 +618,7 @@ fn a_certificate_the_directory_does_not_know_is_refused_and_charged_to_no_one() 
 #[test]
 fn an_identity_past_its_bound_replaces_its_connection_used_least() {
     let pair = Pair::new();
-    let now = Instant::now();
+    let now = hyper_sim::Anchor::new().instant(0).unwrap();
     let mut one = limits();
     one.admission.per_identity = 1;
     let book = || pair.book(Role::Node, Role::Node);

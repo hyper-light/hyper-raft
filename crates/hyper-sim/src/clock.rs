@@ -6,6 +6,8 @@
 //! wall clock is the monotonic clock moved to the node's epoch, and may also be stepped forward or
 //! back (mantle's ±2 s steps; Antithesis's clock skips).
 
+use std::time::{Duration, Instant};
+
 use crate::error::SimError;
 
 /// Parts per million in one: the unit of a clock's rate and of every probability (focal's rule,
@@ -111,5 +113,37 @@ impl Clock {
             .and_then(|n| n.checked_add(i128::from(stepped_ns)))
             .ok_or(SimError::TimeOverflow)?;
         u64::try_from(wall).map_err(|_| SimError::TimeOverflow)
+    }
+}
+
+/// Virtual time as `Instant`s, for crates whose `now` is a `std::time::Instant` (hyper-transport,
+/// hyper-quic, hyper-timing's waits): one host clock read, taken when the anchor is made, plus
+/// virtual nanoseconds. Only differences of the instants it gives may enter a decision
+/// (`docs/sim.md` §3.2), and a test that only needs an epoch takes it here rather than reading the
+/// host clock itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Anchor(Instant);
+
+impl Anchor {
+    /// The anchor: the host's monotonic clock, read once.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "the one host clock read of simulated time, its Instant anchor (docs/sim.md §3.2)"
+    )]
+    pub fn new() -> Self {
+        Self(Instant::now())
+    }
+
+    /// The instant `virtual_ns` after the anchor.
+    pub fn instant(&self, virtual_ns: u64) -> Result<Instant, SimError> {
+        self.0
+            .checked_add(Duration::from_nanos(virtual_ns))
+            .ok_or(SimError::TimeOverflow)
+    }
+}
+
+impl Default for Anchor {
+    fn default() -> Self {
+        Self::new()
     }
 }

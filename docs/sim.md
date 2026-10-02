@@ -2,8 +2,8 @@
 
 > Status (2026-10-02): **S-1 built** (`crates/hyper-sim`: the generator and named streams, time and
 > node clocks, the world under both disciplines, the trace, the digest and the run-twice check; §12
-> records it as built and where it departs from this design). Its lints of §3.9 are prepared and
-> wait on the timing work's crates (§12.6). S-2 to S-8 are designed, not built. Sources and what each
+> records it as built and where it departs from this design), and its lints of §3.9 are in the
+> workspace (§12.6). S-2 to S-8 are designed, not built. Sources and what each
 > establishes are in `docs/research/sim.md`. The plan's starting point was mantle note 32 §3.10 and
 > `docs/raft.md` §5; this design keeps their list of pieces and departs from it where §1 below shows
 > a piece falls short. No existing test has moved onto the world yet.
@@ -775,24 +775,40 @@ among them) and the step benchmark (`benches/step.rs`). What §9 assigns S-1, an
   proptest's failure file off so the tests touch no file system. It passed on the owner's machine in
   9 min 20 s, with no undefined behaviour reported.
 
-### 12.6 The lints (§3.9), prepared and not yet landed
+### 12.6 The lints (§3.9)
 
 `clippy.toml` gains `std::time::Instant::now`, `std::time::SystemTime::now`, `std::thread::spawn`
 and `std::env::var` as §3.9 states, and `std::thread::Builder::spawn` and `std::env::var_os`, the
-same acts by other names. **Departure:** the two extra methods. They fire at 209 sites. Each site
-outside the timing work's crates is allowed at its function, with the reason stated:
-- hyper-log's device, owner and threads (CLAUDE.md §1's exception), and hyper-block's issuer workers;
+same acts by other names. **Departure:** the two extra methods. They landed after the timing step
+L-2, and on that tree they fire at 193 sites.
+
+**27 sites moved to simulated time**, where a host read was not the boundary:
+- **Instant epochs:** 24 sites took `Instant::now()` only as an epoch for an API whose `now` is an
+  `Instant`. They now take it from `hyper_sim::Anchor`, the one anchor of simulated time (§3.2), so
+  the host is read in one stated place. The world's own `instant()` uses the same anchor.
+  - hyper-timing's progress waits: 7.
+  - hyper-transport's progress, credit and round tests (9), its exchange tests (5) and its
+    simulated `Net` (1).
+  - hyper-quic's in-process handshake: 1.
+  - hyper-tokio's refusals: 1.
+- **The shell's owner clock:** 3 sites: hyper-durable's shell, hyperlog and threads tests drove the shell
+  with nanoseconds since a host reading. They now drive it with a simulated owner clock, each
+  reading a nanosecond after the last, deterministic. No test there waits on elapsed time, and those
+  that judge time state it outright.
+
+**166 sites are the boundary**, and are allowed at their function (105 functions), with the reason
+stated:
+- hyper-log's device, owner and threads (`CLAUDE.md` §1's exception), and hyper-block's issuer
+  workers;
 - hyper-tokio's driver (the runtime adapter);
 - quinn-proto's default `TimeSource` and qlog start time, and rustls's `SSLKEYLOGFILE` (recorded in
   each `VENDORED.md`);
-- the E2E crates, the real-process tests and the benchmarks;
-- tests taking an `Instant` epoch for an API whose `now` is an `Instant`;
-- hyper-raft's soaks reading their seed count.
-
-The remaining 41 sites are in `crates/hyper-durable` and `crates/hyper-durable-e2e`, which the
-timing step L-2 is changing, so the change is held as a patch to land after L-2. Among those sites,
-`tests/shell.rs`, `tests/hyperlog.rs` and `tests/threads.rs` drive the shell with `Instant::now()`
-at every turn, and `tests/support/cluster.rs` and `device.rs` take their epoch from it.
+- the E2E crates and the real-process tests (hyper-raft-e2e, hyper-durable-e2e, and the e2e,
+  process and cluster tests of hyper-transport, hyper-tokio, hyper-liveness, hyper-swim and
+  hyper-datagram);
+- the benchmarks timing themselves;
+- the soaks of hyper-raft and hyper-durable, which read their seed counts from the environment,
+  and hyper-log's equivalence test, which reads an opt-in output directory from it.
 
 ### 12.7 Cost against the harnesses it replaces (§10)
 

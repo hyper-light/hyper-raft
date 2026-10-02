@@ -48,6 +48,10 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Driver<C, B,
     }
 
     /// A driver for `endpoint` on `socket`, which it takes onto tokio's reactor.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "hyper-tokio is the runtime adapter: it reads the host's clock for the sans-io crates it drives"
+    )]
     pub fn new(
         endpoint: Endpoint<C, B, D>,
         socket: std::net::UdpSocket,
@@ -87,6 +91,10 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Driver<C, B,
 
     /// Sends what the endpoint has to send now, as far as the socket takes it without waiting;
     /// the rest goes at the next [`Driver::event`].
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "hyper-tokio is the runtime adapter: it reads the host's clock for the sans-io crates it drives"
+    )]
     pub fn flush(&mut self) {
         let _ = self.send(Instant::now());
     }
@@ -105,6 +113,10 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Driver<C, B,
     /// each turn takes what has arrived, up to [`TURNS`] batches, so that the socket's receive
     /// buffer is drained before anything is surfaced; then fires the timers due, sends, and hands
     /// out the next event, or parks.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "hyper-tokio is the runtime adapter: it reads the host's clock for the sans-io crates it drives"
+    )]
     pub fn poll_event(&mut self, context: &mut Context<'_>) -> Poll<Result<Event<C>, Error>> {
         // Events already queued go first: the owner's work on them is what the next datagrams
         // and window updates wait for, and handing them out costs no system call.
@@ -153,6 +165,10 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Driver<C, B,
     }
 
     /// The timer armed for `due` fired: its lateness is folded into `G`, and the endpoint told.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "hyper-tokio is the runtime adapter: it reads the host's clock for the sans-io crates it drives"
+    )]
     fn fired(&mut self, due: Instant) {
         let nanos = |at: Instant| {
             u64::try_from(at.saturating_duration_since(self.epoch).as_nanos()).unwrap_or(u64::MAX)
@@ -166,6 +182,10 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Driver<C, B,
 
     /// Takes the datagrams that have arrived, a batch at a time, until the socket has none or
     /// [`TURNS`] batches are taken.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "hyper-tokio is the runtime adapter: it reads the host's clock for the sans-io crates it drives"
+    )]
     fn drain(&mut self, context: &mut Context<'_>) -> Result<(), Error> {
         for _ in 0..TURNS {
             let Poll::Ready(ready) = self.socket.poll_ready(context, false) else {

@@ -1,0 +1,19 @@
+[package]
+name = "hyper-timing-trace"
+description = "Heartbeat traces between two processes on loopback, and their analysis: the measured inputs of hyper-timing's detector (docs/timing.md §3)."
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+license = "MIT"
+publish = false
+
+# A workspace of its own: a measurement tool, run by hand and in a Linux container, outside the
+# gates (docs/benchmarks.md, "Heartbeat traces"). It takes nothing but std, the platform's C
+# library through `src/sys.rs`, and hyper-timing for the configurator.
+[workspace]
+
+[dependencies]
+hyper-timing = { path = "../hyper-timing" }
+
+[profile.release]
+debug = "line-tables-only"

@@ -36,6 +36,10 @@ UNSAFE_ALLOWED = {
         "sendmmsg(2), recvmmsg(2) and the UDP_SEGMENT and UDP_GRO options and control messages (udp(7))",
     "crates/hyper-block/src/threads/windows.rs":
         "ToolHelp snapshots and GetThreadTimes (the process's threads and a thread's CPU time)",
+    "crates/hyper-timing-trace/src/sys.rs":
+        "recvmsg(2) with SO_TIMESTAMPNS / SO_TIMESTAMP_MONOTONIC, select(2), clock_gettime(2), "
+        "mach_absolute_time, fdatasync(2) / F_FULLFSYNC and getloadavg(3) (the trace recorder; "
+        "measurement only)",
 }
 
 ALLOW_UNSAFE = re.compile(r"(allow|expect)\s*\(\s*unsafe_code\b")

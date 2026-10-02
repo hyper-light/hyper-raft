@@ -195,6 +195,7 @@ async fn serve() {
     let began = Instant::now();
     let mut server = Server::new();
     let mut ever = false;
+    let mut told = 0;
     loop {
         match next(&mut driver, Some((&mut socket, &mut plane))).await {
             Woke::Event(event) => {
@@ -221,6 +222,16 @@ async fn serve() {
             }
             Woke::Tick => server.advance_all(driver.endpoint()),
         }
+        // A refusal is reported with what this side saw at that moment, for the asker's failure
+        // to be read beside it.
+        for (refusal, by_peer) in server.refused.iter().skip(told) {
+            eprintln!(
+                "peer: refused {refusal:?} (by the asker: {by_peer}); {:?}; {:?}",
+                driver.endpoint().stats(),
+                driver.endpoint().connection_stats(1)
+            );
+        }
+        told = server.refused.len();
         for (peer, lane, frame) in server.frames.drain(..) {
             driver
                 .endpoint()
@@ -426,7 +437,13 @@ async fn exchanges() -> String {
     )
     .await;
     for asked in &asker.asked {
-        assert_eq!(asked.refused, None, "{asked:?}");
+        assert_eq!(
+            asked.refused,
+            None,
+            "{asked:?}; {:?}; {:?}",
+            driver.endpoint().stats(),
+            driver.endpoint().connection_stats(2)
+        );
         assert_eq!(
             (asked.reply, asked.read),
             (Some(asked.body), asked.body),

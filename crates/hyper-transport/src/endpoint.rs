@@ -637,6 +637,13 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
         self.core.peers.get(at)?.timing.tail()
     }
 
+    /// QUIC's counters for the connection to `peer` (its path's round trip, congestion window,
+    /// losses and frames), or `None` without one: what a refused exchange is diagnosed from.
+    pub fn connection_stats(&self, peer: PeerId) -> Option<hyper_quic::ConnectionStats> {
+        let key = self.core.connection_of(peer)?;
+        Some(self.conns.get(key)?.as_ref()?.quic.stats())
+    }
+
     /// What the endpoint holds and what it refused.
     pub fn stats(&self) -> Stats {
         Stats {

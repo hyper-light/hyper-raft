@@ -191,9 +191,20 @@ fn serve<C: Classes<Kind = Kind, Class = Class, Role = Role>>(mut node: Node<C>,
     let mut server = Server::new();
     server.hold_bulk = hold;
     let mut ever = false;
+    let mut told = 0;
     loop {
         wire.turn(&mut node);
         server.serve(&mut node);
+        // A refusal is reported with what this side saw at that moment, for the asker's failure
+        // to be read beside it.
+        for (refusal, by_peer) in server.refused.iter().skip(told) {
+            eprintln!(
+                "peer: refused {refusal:?} (by the asker: {by_peer}); {:?}; {:?}",
+                node.stats(),
+                node.connection_stats(1)
+            );
+        }
+        told = server.refused.len();
         for (peer, lane, frame) in server.frames.drain(..) {
             node.send_frame(peer, lane, Kind::Append, &frame).unwrap();
         }
@@ -407,7 +418,13 @@ fn exchanges() -> String {
         |_, asker| asker.finished(),
     );
     for asked in &asker.asked {
-        assert_eq!(asked.refused, None, "{asked:?}");
+        assert_eq!(
+            asked.refused,
+            None,
+            "{asked:?}; {:?}; {:?}",
+            node.stats(),
+            node.connection_stats(2)
+        );
         assert_eq!(
             (asked.reply, asked.read),
             (Some(asked.body), asked.body),

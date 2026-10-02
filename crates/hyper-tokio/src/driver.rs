@@ -53,7 +53,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Driver<C, B,
         socket: std::net::UdpSocket,
         io: Io,
     ) -> Result<Self, Error> {
-        let socket = Socket::new(socket, io)?;
+        let socket = Socket::new(socket, io, false)?;
         let sleep = registered(|| {
             Ok(Box::pin(tokio::time::sleep_until(
                 tokio::time::Instant::now(),
@@ -175,8 +175,8 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Driver<C, B,
                 return Ok(());
             }
             let endpoint = &mut self.endpoint;
-            let taken = self.socket.receive(|from, bytes| {
-                endpoint.handle_datagram(Instant::now(), from, None, bytes);
+            let taken = self.socket.receive(|arrival, bytes| {
+                endpoint.handle_datagram(Instant::now(), arrival.from, None, bytes);
             })?;
             if taken == 0 {
                 return Ok(());

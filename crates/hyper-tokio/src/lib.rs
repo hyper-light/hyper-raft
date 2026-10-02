@@ -39,12 +39,14 @@
     )
 )]
 
+mod clock;
 mod driver;
 mod error;
 mod plane;
 mod socket;
 mod sys;
 
+pub use clock::{Arrival, Clock};
 pub use driver::{Driver, TURNS};
 pub use error::Error;
 pub use plane::PlaneSocket;

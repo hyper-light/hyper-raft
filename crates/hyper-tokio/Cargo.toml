@@ -21,6 +21,18 @@ tokio = { version = "1.48", default-features = false, features = ["net", "time"]
 # its ancillary buffers carry neither control message (its sendmmsg cannot send a GSO batch).
 libc = "0.2.189"
 
+[target.'cfg(target_os = "macos")'.dependencies]
+# recvmsg(2) and SO_TIMESTAMP_MONOTONIC for the kernel's receive stamps, and mach_absolute_time and
+# mach_timebase_info for the clock they are on (src/sys/macos.rs), which neither std, tokio nor
+# rustix expose (rustix's recvmsg drops the timestamp control message).
+libc = "0.2.189"
+
+[target.'cfg(windows)'.dependencies]
+# QueryPerformanceCounter and QueryPerformanceFrequency, the host's monotonic clock
+# (src/sys/windows.rs): the workspace's windows-sys, already in the graph through hyper-block,
+# hyper-measure and tokio's mio.
+windows-sys.workspace = true
+
 [dev-dependencies]
 hyper-measure = { path = "../hyper-measure" }
 tokio = { version = "1.48", default-features = false, features = ["net", "time", "rt"] }

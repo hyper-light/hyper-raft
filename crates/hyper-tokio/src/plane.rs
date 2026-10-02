@@ -1,4 +1,7 @@
-//! The datagram plane's socket: its own, beside the endpoint's (note 32 §3.5).
+//! The datagram plane's socket: its own, beside the endpoint's (note 32 §3.5). Each datagram it
+//! opens comes with when it arrived on the host's monotonic clock, the kernel's receive stamp where
+//! the platform gives one ([`crate::clock`]): what a node-pair heartbeat is judged by
+//! (`docs/timing.md` §2.4).
 
 use std::future::poll_fn;
 use std::net::SocketAddr;
@@ -7,6 +10,7 @@ use std::task::{Context, Poll};
 use hyper_datagram::{Fence, Opened, PeerId, Plane, Refusal};
 
 use crate::Error;
+use crate::clock::{Arrival, Clock};
 use crate::socket::{Io, IoStats, Socket};
 
 /// Carries a [`Plane`]'s datagrams on a UDP socket on tokio. The owner keeps the plane and lends
@@ -22,11 +26,17 @@ impl PlaneSocket {
         Self::new(socket, io)
     }
 
-    /// The plane's socket on `socket`, which it takes onto tokio's reactor.
+    /// The plane's socket on `socket`, which it takes onto tokio's reactor, with the kernel's
+    /// receive stamps asked for ([`IoStats::kernel_stamps`] says whether the kernel agreed).
     pub fn new(socket: std::net::UdpSocket, io: Io) -> Result<Self, Error> {
         Ok(Self {
-            socket: Socket::new(socket, io)?,
+            socket: Socket::new(socket, io, true)?,
         })
+    }
+
+    /// The clock the arrivals are stamped on: the owner's `now` for what it judges by them.
+    pub fn clock(&self) -> &Clock {
+        self.socket.clock()
     }
 
     /// The address the socket is bound to.
@@ -69,16 +79,38 @@ impl PlaneSocket {
     }
 
     /// Waits for datagrams and opens one batch of them with `plane` under `fence`, handing each
-    /// result to `deliver` with the address it came from; returns how many. Sends what the outbox
-    /// holds whenever the socket takes it. Cancel-safe: a batch is taken and delivered without an
-    /// await in between.
+    /// result to `deliver` with its arrival (the address it came from and when); returns how many.
+    /// Sends what the outbox holds whenever the socket takes it. Cancel-safe: a batch is taken and
+    /// delivered without an await in between.
     pub async fn receive(
         &mut self,
         plane: &mut Plane,
         fence: &dyn Fence,
-        mut deliver: impl FnMut(SocketAddr, Result<Opened<'_>, Refusal>),
+        mut deliver: impl FnMut(Arrival, Result<Opened<'_>, Refusal>),
     ) -> Result<usize, Error> {
         poll_fn(|context| self.poll_receive(context, plane, fence, &mut deliver)).await
+    }
+
+    /// Opens every datagram already queued on the socket, without waiting: what an owner feeds its
+    /// detectors before it judges a deadline, since a datagram stamped before the deadline counts
+    /// however late it is read. At most [`crate::TURNS`] batches; returns how many datagrams.
+    pub fn receive_ready(
+        &mut self,
+        plane: &mut Plane,
+        fence: &dyn Fence,
+        mut deliver: impl FnMut(Arrival, Result<Opened<'_>, Refusal>),
+    ) -> Result<usize, Error> {
+        let mut total = 0usize;
+        for _ in 0..crate::TURNS {
+            let count = self.socket.receive(|arrival, datagram| {
+                deliver(arrival, plane.open(datagram, fence));
+            })?;
+            if count == 0 {
+                break;
+            }
+            total = total.saturating_add(count);
+        }
+        Ok(total)
     }
 
     fn poll_receive(
@@ -86,7 +118,7 @@ impl PlaneSocket {
         context: &mut Context<'_>,
         plane: &mut Plane,
         fence: &dyn Fence,
-        deliver: &mut impl FnMut(SocketAddr, Result<Opened<'_>, Refusal>),
+        deliver: &mut impl FnMut(Arrival, Result<Opened<'_>, Refusal>),
     ) -> Poll<Result<usize, Error>> {
         for _ in 0..crate::TURNS {
             let ready = match self.socket.poll_ready(context, self.socket.pending()) {
@@ -97,8 +129,8 @@ impl PlaneSocket {
                 let _ = self.socket.send();
             }
             if ready.readable {
-                let count = self.socket.receive(|from, datagram| {
-                    deliver(from, plane.open(datagram, fence));
+                let count = self.socket.receive(|arrival, datagram| {
+                    deliver(arrival, plane.open(datagram, fence));
                 })?;
                 if count > 0 {
                     return Poll::Ready(Ok(count));

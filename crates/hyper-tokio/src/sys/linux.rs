@@ -2,7 +2,10 @@
 //! offloads where it has them (`udp(7)`): generic segmentation (`UDP_SEGMENT`, Linux 4.18), one
 //! send of equal-sized datagrams to one destination that the kernel or the NIC cuts, and generic
 //! receive (`UDP_GRO`, Linux 5.0), consecutive datagrams of one flow delivered as one buffer with
-//! their size in a control message. Neither std nor tokio exposes these.
+//! their size in a control message. The kernel's receive timestamp, `SO_TIMESTAMPNS` (socket(7)):
+//! an `SCM_TIMESTAMPNS` control message with a `struct timespec` of `CLOCK_REALTIME` taken when the
+//! datagram was received. And the host's monotonic clock, `clock_gettime(CLOCK_MONOTONIC)`, which
+//! every process on the host reads alike. Neither std nor tokio exposes these.
 
 #![allow(unsafe_code)]
 
@@ -23,11 +26,64 @@ pub(crate) const MAX_SEGMENTS: usize = 64;
 /// a larger send with `EMSGSIZE`. IPv6's bound is larger, so this one holds for both.
 pub(crate) const SEGMENTED_BYTES: usize = 65_507;
 /// The control buffer of one message, in 8-byte words for `cmsghdr`'s alignment: room for one
-/// `UDP_SEGMENT` (a `u16`) or one `UDP_GRO` (an `int`), `CMSG_SPACE` of either being 24 bytes on
-/// a 64-bit target and 16 on a 32-bit one.
-const CONTROL_WORDS: usize = 4;
+/// `UDP_SEGMENT` (a `u16`) or one `UDP_GRO` (an `int`) beside one `SCM_TIMESTAMPNS` (a
+/// `struct timespec`): `CMSG_SPACE(4) + CMSG_SPACE(16)`, 24 + 32 = 56 bytes on a 64-bit target
+/// (a 16-byte header) and less on a 32-bit one, seven words (`the_control_buffer_holds_both`).
+const CONTROL_WORDS: usize = 7;
 
 type Control = [u64; CONTROL_WORDS];
+
+/// Nanoseconds in a second, the unit of `struct timespec`'s `tv_nsec` (POSIX <time.h>).
+const NANOS_PER_SECOND: u64 = 1_000_000_000;
+
+/// Nanoseconds of a `struct timespec`, `None` when negative or past `u64`.
+fn timespec_ns(time: &libc::timespec) -> Option<u64> {
+    u64::try_from(time.tv_sec)
+        .ok()?
+        .checked_mul(NANOS_PER_SECOND)?
+        .checked_add(u64::try_from(time.tv_nsec).ok()?)
+}
+
+/// `clock_gettime(clock)` in nanoseconds.
+fn clock_ns(clock: libc::clockid_t) -> io::Result<u64> {
+    let mut time = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `time` is a live, writable `timespec` for the call, which writes that one structure
+    // (clock_gettime(2)).
+    let status = unsafe { libc::clock_gettime(clock, &raw mut time) };
+    if status != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    timespec_ns(&time).ok_or_else(|| io::Error::other("clock out of range"))
+}
+
+/// `CLOCK_MONOTONIC`, nanoseconds.
+pub(crate) fn monotonic_ns() -> io::Result<u64> {
+    clock_ns(libc::CLOCK_MONOTONIC)
+}
+
+/// `CLOCK_REALTIME`, nanoseconds: the clock `SO_TIMESTAMPNS` stamps on.
+pub(crate) fn realtime_ns() -> io::Result<u64> {
+    clock_ns(libc::CLOCK_REALTIME)
+}
+
+/// Asks the kernel to stamp each datagram `fd` receives (`SO_TIMESTAMPNS`). Whether it agreed.
+pub(crate) fn enable_stamps(fd: RawFd) -> bool {
+    let on: libc::c_int = 1;
+    // SAFETY: `on` is a live `c_int` and the length passed is its size; setsockopt only reads it.
+    let status = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_TIMESTAMPNS,
+            ptr::addr_of!(on).cast(),
+            socklen(size_of::<libc::c_int>()),
+        )
+    };
+    status == 0
+}
 
 /// What the kernel offers this socket.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -324,6 +380,8 @@ pub(crate) struct Received {
     pub(crate) length: usize,
     /// The size of each coalesced datagram, when the kernel coalesced them.
     pub(crate) segment: Option<usize>,
+    /// The kernel's receive stamp, nanoseconds of `CLOCK_REALTIME`, when it attached one.
+    pub(crate) stamp: Option<u64>,
 }
 
 /// Receives up to one message into each of `buffers` with one `recvmmsg`, appending what arrived
@@ -394,29 +452,74 @@ pub(crate) fn receive(
         let Ok(length) = usize::try_from(message.msg_len) else {
             continue;
         };
+        let (segment, stamp) = controls_of(&message.msg_hdr);
         out.push(Received {
             from,
             length,
-            segment: coalesced(&message.msg_hdr),
+            segment,
+            stamp,
         });
     }
     Ok(received)
 }
 
-/// The `UDP_GRO` segment size of a received message, if the kernel coalesced it.
-fn coalesced(header: &libc::msghdr) -> Option<usize> {
+/// A length the C library gives as `size_t` (glibc's `cmsg_len`) or `socklen_t` (musl's), as a
+/// `usize`; zero for one that does not fit, which no control message is.
+fn width<T: TryInto<usize>>(length: T) -> usize {
+    length.try_into().unwrap_or(0)
+}
+
+/// `CMSG_LEN(bytes)`: the `cmsg_len` of a whole control message of `bytes` of data.
+fn whole(bytes: usize) -> usize {
+    // SAFETY: CMSG_LEN only computes a length.
+    let length = unsafe { libc::CMSG_LEN(socklen_u32(bytes)) };
+    usize::try_from(length).unwrap_or(usize::MAX)
+}
+
+/// The `UDP_GRO` segment size of a received message, if the kernel coalesced it, and its
+/// `SCM_TIMESTAMPNS` stamp in nanoseconds, if the kernel stamped it. A message whose `cmsg_len`
+/// does not cover its data (a truncated control buffer) is not read.
+fn controls_of(header: &libc::msghdr) -> (Option<usize>, Option<u64>) {
+    let (mut segment, mut stamp) = (None, None);
     // SAFETY: `header` was filled by recvmmsg, whose control buffer and length are its own;
-    // CMSG_FIRSTHDR and CMSG_NXTHDR stay within `msg_controllen`, and a `UDP_GRO` message's data
-    // is an `int`, read unaligned.
+    // CMSG_FIRSTHDR and CMSG_NXTHDR stay within `msg_controllen`; a `UDP_GRO` message's data is
+    // an `int` and an `SCM_TIMESTAMPNS` message's a `timespec`, each read unaligned once its
+    // `cmsg_len` is checked to cover it.
     unsafe {
         let mut at = libc::CMSG_FIRSTHDR(header);
-        while !at.is_null() {
-            if (*at).cmsg_level == libc::SOL_UDP && (*at).cmsg_type == libc::UDP_GRO {
+        while let Some(control) = at.as_ref() {
+            let length = width(control.cmsg_len);
+            if control.cmsg_level == libc::SOL_UDP
+                && control.cmsg_type == libc::UDP_GRO
+                && length >= whole(size_of::<libc::c_int>())
+            {
                 let size = ptr::read_unaligned(libc::CMSG_DATA(at).cast::<libc::c_int>());
-                return usize::try_from(size).ok().filter(|size| *size > 0);
+                segment = usize::try_from(size).ok().filter(|size| *size > 0);
+            } else if control.cmsg_level == libc::SOL_SOCKET
+                && control.cmsg_type == libc::SCM_TIMESTAMPNS
+                && length >= whole(size_of::<libc::timespec>())
+            {
+                let time = ptr::read_unaligned(libc::CMSG_DATA(at).cast::<libc::timespec>());
+                stamp = timespec_ns(&time);
             }
             at = libc::CMSG_NXTHDR(header, at);
         }
     }
-    None
+    (segment, stamp)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The control buffer holds a `UDP_GRO` message beside an `SCM_TIMESTAMPNS` one.
+    #[test]
+    fn the_control_buffer_holds_both() {
+        // SAFETY: CMSG_SPACE only computes a length.
+        let both = unsafe {
+            libc::CMSG_SPACE(socklen_u32(size_of::<libc::c_int>()))
+                + libc::CMSG_SPACE(socklen_u32(size_of::<libc::timespec>()))
+        };
+        assert!(usize::try_from(both).unwrap() <= size_of::<Control>());
+    }
 }

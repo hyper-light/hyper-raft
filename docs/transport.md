@@ -267,7 +267,13 @@ never depends on it.
   - `endpoint()` lends the endpoint for the owner's calls between events; `flush()` sends what
     those calls queued without waiting; `stats()` counts datagrams, system calls and drops.
 - `PlaneSocket`: a hyper-datagram `Plane`'s own socket. `flush(plane, route, refused)` seals and
-  sends; `receive(plane, fence, deliver).await` opens a batch.
+  sends; `receive(plane, fence, deliver).await` opens a batch; `receive_ready(plane, fence,
+  deliver)` opens what the reactor has seen queued without waiting, for an owner to feed its
+  detectors before it judges a deadline. Each datagram is delivered with its `Arrival`: the
+  address and when it arrived on the socket's `Clock` (`clock()`), the kernel's receive stamp where
+  the platform gives one (`docs/timing.md` §2.4, §2.8).
+- `Clock`: the host's monotonic clock in nanoseconds, which every process on the host reads alike:
+  `CLOCK_MONOTONIC` on Linux, `mach_absolute_time` on macOS, `QueryPerformanceCounter` on Windows.
 - `Io { batch }`: the datagrams one system call carries either way, 1 to `UIO_MAXIOV` (1,024).
 - The driver folds how late its timer fires (`hyper_timing::Lateness`) and gives the endpoint that
   `G` (`Endpoint::set_granularity`) each time it fires.
@@ -303,9 +309,33 @@ reactor); no io_uring; no AF_XDP.
   65,507 bytes). Coalesced receives (`UDP_GRO`) are split by the segment size the kernel reports.
   Each offload is used only where the kernel accepts the socket option (`src/sys/linux.rs`, the
   one file with `unsafe`).
-- macOS and Windows send and receive one datagram a system call through tokio.
+- macOS and Windows send and receive one datagram a system call through tokio (macOS's plane socket
+  through `recvmsg(2)`, for the stamp: `src/sys/macos.rs`).
 - Owed: Windows' `UDP_SEND_MSG_SIZE` and `UDP_RECV_MAX_COALESCED_SIZE`. ECN marks are not set or
   read, so the endpoint is handed none.
+
+**Receive stamps** (the plane socket; the endpoint's is not stamped, as QUIC's own clock reads are
+its own). A heartbeat is judged by when the kernel received it, not when its owner read it, so an
+owner that wakes late does not blame its peer (`docs/timing.md` §2.4).
+- Linux: `SO_TIMESTAMPNS`, its `SCM_TIMESTAMPNS` read from each `recvmmsg` message's control
+  buffer beside `UDP_GRO`'s (seven words, `CMSG_SPACE(4) + CMSG_SPACE(16)`). The stamp is
+  `CLOCK_REALTIME`; it is carried to `CLOCK_MONOTONIC` by its age, both clocks read once a batch
+  after the receive, and held within the read and no earlier than the stamp before it (a socket's
+  queue is first in, first out), so a step of the realtime clock moves one stamp within those
+  limits. Linux turns stamping on through a static key flipped from a work queue
+  (`net_enable_timestamp`), so the first datagrams after the option is set may be stamped when read,
+  late and never early.
+- macOS: `SO_TIMESTAMP_MONOTONIC`, `mach_absolute_time` taken as UDP input queues the datagram,
+  read through `recvmsg(2)` (`src/sys/macos.rs`; `SCM_TIMESTAMP_MONOTONIC`, 0x04, declared there as
+  hyper-timing-trace declares it, since libc does not).
+- Windows: none taken; a datagram is stamped when it is read. Winsock's receive timestamps
+  (`SIO_TIMESTAMPING`, build 20348 and later) are attached by a NIC miniport driver that reports
+  timestamping capabilities, with system configuration, and on no loopback path or virtual NIC
+  (`docs/research/timing.md`, "Winsock timestamping"). The cost is the read's delay counted in the
+  delays the detector measures, and so in its margin.
+- Tested on macOS and Linux (`tests/stamps.rs`): a datagram held 20 ms in the socket before it is
+  read is stamped within the send-to-read span and before the read, on the kernel's stamp; the
+  stamps never go back; what is queued is taken without a wait.
 
 **Measured** (`docs/benchmarks.md`, "Against focal-wire" and "hyper-tokio end to end").
 - In steady state the adapter allocates nothing a round: a 64 B round is 12.4 allocations under it,

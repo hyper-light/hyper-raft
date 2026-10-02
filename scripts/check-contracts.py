@@ -35,7 +35,15 @@ UNSAFE_ALLOWED = {
     "crates/hyper-block/src/threads/macos.rs":
         "proc_pidinfo and sysctlbyname (the process's threads and the workqueue's thread ceiling)",
     "crates/hyper-tokio/src/sys/linux.rs":
-        "sendmmsg(2), recvmmsg(2) and the UDP_SEGMENT and UDP_GRO options and control messages (udp(7))",
+        "sendmmsg(2), recvmmsg(2) and the UDP_SEGMENT and UDP_GRO options and control messages (udp(7)); "
+        "SO_TIMESTAMPNS and its SCM_TIMESTAMPNS control message (socket(7)); clock_gettime(2)",
+    "crates/hyper-tokio/src/sys/macos.rs":
+        "recvmsg(2), SO_TIMESTAMP_MONOTONIC and its SCM_TIMESTAMP_MONOTONIC control message (the "
+        "kernel's receive stamp, which rustix's recvmsg drops); mach_absolute_time and "
+        "mach_timebase_info (the clock it stamps on)",
+    "crates/hyper-tokio/src/sys/windows.rs":
+        "QueryPerformanceCounter and QueryPerformanceFrequency through windows-sys (the host's "
+        "monotonic clock)",
     "crates/hyper-block/src/threads/windows.rs":
         "ToolHelp snapshots and GetThreadTimes (the process's threads and a thread's CPU time)",
     "crates/hyper-timing-trace/src/sys.rs":

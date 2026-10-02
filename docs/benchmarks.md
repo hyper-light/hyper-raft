@@ -3568,3 +3568,27 @@ cargo test -p hyper-tokio --test stamps                   # kernel stamps (macOS
 # Linux, the same in rust:1.98.0 with `docker run --cpus N` and busy loops (`while :; do :; done`)
 # beside it. HYPER_LIVENESS_TRACE=1 echoes every member's lines.
 ```
+
+## Simulation harnesses as they are (2026-10-02)
+
+The baseline `hyper-sim` and `hyper-check` are measured against when the harnesses move onto them
+(`docs/sim.md` §10, step S-6). Each figure is the wall time of one test binary at its default scale in
+the debug gate run (`bash scripts/gates.sh`, `CARGO_BUILD_JOBS=4`), the binary's tests on the
+harness's threads; Apple M5 Max, 18 cores, 128 GiB, macOS, rustc 1.98.0, load average 21–22 from
+other work on the machine; hyper-raft `634d45c`. Per-step time, allocations and page faults in release,
+on the same schedules, are S-6's measurement.
+
+| Binary | Scale | Wall |
+|---|---|---|
+| `hyper-raft` `tests/differential.rs` | 7 tests, most of 96 seeds × 4,000 steps | 25.5 s |
+| `hyper-raft` `tests/fast.rs` | 96 × 4,000, and directed cases | 5.4 s |
+| `hyper-raft` `tests/group.rs` | 96 × 4,000, and directed cases | 4.4 s |
+| `hyper-raft` `tests/pipeline.rs` | 24 × 2,000 at four settings; a crash at every persistence step of 3 × 400 at two | 1.2 s |
+| `hyper-durable` `tests/sim.rs` | 128 × 5,000 at five shapes; a crash after every event of 4 × 800 at two | 2.0 s |
+| `hyper-liveness` `tests/sim.rs` | seven timed scenarios | 0.9 s |
+| `hyper-log` `tests/equivalence.rs` | the recorded seeds against mantle-log's hashes | 1.6 s |
+| `hyper-log-e2e` `tests/kill.rs` | 24 SIGKILLs of a real writer | 9.0 s |
+
+```sh
+CARGO_BUILD_JOBS=4 bash scripts/gates.sh   # each binary's "finished in" line
+```

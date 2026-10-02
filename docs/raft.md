@@ -313,6 +313,7 @@ derivations:
 | `hyper-durable` | The shell, designed from all three projects' shells and the literature, not extracted from one: `docs/durable.md`, sources in `docs/research/durable.md`. Readies ahead of their persistence, the commit fence over the durable commit, protocol-aware repair, derived bounds. | The core steps it needs first (R-4 to R-7, `docs/durable.md` §11); then mantle (D-1), focal (D-2) and slates (X-1) onto it, each gated by its own suites' outcomes and measured against its own shell (`docs/durable.md` §12–§13). |
 | `hyper-block` | mantle-disk's block layer, on which the log is written: `BlockFile`, the device file with its direct I/O and full flush, aligned buffers, group commit's wait, the device issuer, the simulated device (`crates/hyper-block/ORIGIN.md`). | Moved with L-1, from mantle `147f035`; on `main` once the `log` branch lands. |
 | `hyper-log` | mantle's per-device log, with its `BlockFile` trait. It is the one crate that owns its device writer and files (`CLAUDE.md` §1). | **Done on branch `log`** (`crates/hyper-log/ORIGIN.md`): L-1 and L-2 as below, with one change of plan: the owner never waits on the device, so the log runs two threads, the owner and a device thread that owns the file, until its writes go through hyper-block's issuer. **L-1**: move it. Gate: mantle's `crates/log/tests/log.rs`, `fairness.rs` and the range simulation; bytes on the simulated device identical per seed. **L-2**: an owner thread in place of `Arc`, `RwLock`, `Mutex` and `Condvar`, and `Waker` tickets in place of the mpsc `Pending`. Gate: L-1's suite; a test that a completion wakes only its submitter; mantle's log benchmark against its recorded baseline; frame contents per seed identical. **F-1**: focal's WAL converted to it, one way. Gate: recorded focal data directories converted and read back equal, and focal's restart and restore runbooks on real processes. |
+| `hyper-sim`, `hyper-check` | The deterministic simulation and the checks every crate's tests and every consumer's simulations run on (§5, `docs/sim.md`). | Steps S-1 to S-8 (`docs/sim.md` §9); this core's harnesses move at S-6; its known defects (seeds 9843 and 54104) become planted mutants each strategy must catch. |
 | `hyper-multilog` | slates' MLRaft layer: one group's log divided into `n` logs with barriers (note 32 R25). | Moved with X-1. Gate: slates' `tests/multilog*.rs` and its explorer (200 seeds × 3,000 steps), retargeted at this crate. No consumer enables it until an owner shows a gain; slates measured it worse for its own groups. |
 
 slates' consensus moves onto `hyper-raft` in **X-1**. Gate: slates' explorer, conformance, prevote,
@@ -325,7 +326,20 @@ no release to keep (owner's decision 9).
 The allocation-count bench (focal-memory's counting global allocator) came back as `hyper-measure`,
 rewritten without its lock and with its `unsafe` listed in the contract script; with it,
 `hyper-raft-compare` measures this crate against each core it replaces, and `hyper-raft-e2e` runs it
-as real processes (`docs/benchmarks.md`). The same
-applies to the timed simulation, the safety explorer and the exhaustive models from slates, and to
-mantle's linearizability checker. Each joins under the production lints, as focal requires of
-`focal-sim`.
+as real processes (`docs/benchmarks.md`).
+
+The simulation and the checks are two crates, designed in `docs/sim.md` (sources in
+`docs/research/sim.md`), not yet built:
+- **`hyper-sim`**, the world under a test's control: one seeded generator with a stream per source,
+  virtual time and node clocks, a network of focal's and slates' path model with VOPR's partitions,
+  a write-queue device and a block device with the storage faults of the literature (lost and
+  misdirected writes, torn sectors, failed flushes), processes that crash, pause and restart, and
+  forks of a world.
+- **`hyper-check`**: the oracles every project checks today, made one set, among them this core's
+  durability oracle (`tests/support/lagged.rs`, generalized); the witness and search linearizability
+  checkers; liveness bounds derived from the election law; and the strategies — random under swarm
+  configurations, PCT, coverage over this core's TLA+ action map, slates' exhaustive search.
+
+This crate's harnesses (`tests/support`, `pipeline.rs`, `group.rs`, `fast.rs`, the differential)
+move onto them at step S-6 (`docs/sim.md` §8–§9), gated by outcome over the same seed counts.
+Both crates are held to the production lints, as focal requires of `focal-sim`.

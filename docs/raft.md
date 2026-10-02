@@ -15,12 +15,19 @@
 >
 > Step R-6 is done (2026-10-02): the durable commit carried in answers, an apply pause, and a
 > leader's own entries applied before its write is durable (§3, `docs/durable.md` §4.4).
+>
+> Timing step L-2 is done (2026-10-02): elections started by the owner's failure detectors, not by
+> ticks (`Config::elections`, `docs/timing.md` §2.9).
 
 ## 1. What `hyper-raft` is
 
 `hyper-raft` is the Raft core that slates, focal and mantle share. It is a state machine with no
 clock, no disk and no network:
-- `RawNode::tick` says that time has passed;
+- `RawNode::tick` says that time has passed, for a member that elects on ticks (raft-rs's rule,
+  kept for the differential); one that elects by suspicion (timing step L-2, `docs/timing.md` §2.9)
+  is told what its owner's detectors believe of the other members (`suspect`, `trust`,
+  `restarted`), given its group's measured `Timing`, and woken at its owner's clock (`wake`,
+  `deadline`): an idle group is woken for nothing;
 - `RawNode::step` gives it what arrived;
 - a `Ready` says what to persist, send and apply; one is taken at a time, and once its write is
   issued (`advance_issued`) the member takes operations again and the next may be taken, up to
@@ -43,7 +50,10 @@ A leader's proposals and a follower's appends move into the log uncopied (`Log::
 `Log::append_after_owned`).
 
 It is Raft as Ongaro's thesis states it, with these extensions:
-- pre-vote and check-quorum;
+- pre-vote and check-quorum; and, by suspicion, campaigns started by the owner's failure detectors
+  after the election law's draw, check-quorum from the detectors, a leader that beats only while
+  its group has work in flight, and a lead that ends in its term handed over (`docs/timing.md`
+  §2.9);
 - election priority with `Precedence::Log`;
 - learners and joint consensus (`ConfChangeV2`);
 - leader transfer;
@@ -112,6 +122,7 @@ The durable shell needs four more core steps, R-4 to R-7. Their design and gates
 | **R-4** (done, 2026-10-02) | `Ready`s taken ahead of their persistence: `advance_issued`, `on_persist`, `on_persist_keeping`, `Limits::readies_in_flight`; the unstable log keeps its entries until they are durable, with an issue mark; etcd's term guard and raft-rs's `maybe_persist` against ABA; a leader sends at once only while its term and vote are durable; what a notice makes leaves with it only when nothing is out or unwritten (`docs/durable.md` §2.1, where each invariant is kept in §3). | Run: the raft-rs differential unchanged at depth one; the recorded-seed equivalence of the synchronous path; `tests/pipeline.rs` (random interleavings of proposals, ticks, deliveries and persistence steps at depths two and three, held to a durability oracle against each member's disk; a crash at every persistence step of a schedule in turn; the fast-track schedules at random lags); allocation counts identical on every workload; `benches/pipeline.rs` (`docs/benchmarks.md`, "Readies in flight"). raft-rs is no oracle at depth `k` (`docs/durable.md` §2.1). |
 | **R-5** | A lost-entries refusal regresses a member's progress (CTRL's follower repair, `docs/durable.md` §5). | `docs/durable.md` §12. |
 | **R-6** (done, 2026-10-02) | An apply pause (etcd's `applyingEntsPaused`): `RawNode::pause_apply`, `resume_apply`; a leader's own-term entries given to apply before its own write is durable (`Config::apply_unpersisted`, off by default as raft-rs's limit is zero); and the durable commit carried in answers: `MsgAppendResponse` and `MsgHeartbeatResponse` state no commit beyond the durable commit (`C_d`, `docs/durable.md` §4.1) when they leave, not `log.committed()`. The core knows `C_d` from each durable `Ready`'s hard state and from `RawNode::commit_durable`, by which the shell states every other commit it writes (`docs/durable.md` §4.4). The case found in mantle (`1c179e8`, its F17 commit fence): a member commits alone as leader in `advance_append`, then steps down in the same term (check-quorum), and holds a commit no write states; a shell's `configuration_known` must not count it. R-4 did not carry it: the core was told which writes are durable, not which commit a write stated. | Run: the directed tests `an_answer_states_no_commit_that_no_durable_write_stated` (mantle's case), `an_answer_a_notice_releases_states_the_durable_commit` (fails on R-4), `an_owner_that_pauses_apply_is_given_nothing_more`, `a_leader_applies_its_own_committed_entries_before_its_write_is_durable`; `tests/pipeline.rs` with the oracle holding every answer's commit to the sender's disk and the harness keeping the commit fence with the pause, at four settings (the fourth a leader applying before its write, its disk the slowest) and the crash at every persistence step with and without it; the raft-rs differential unchanged with no translation (`docs/durable.md` §4.4, "Against raft-rs"); allocations identical on every workload; `benches/pipeline.rs` (`docs/benchmarks.md`, "The durable commit and the apply pause (R-6)"). |
+| **L-2** (timing, done, 2026-10-02) | Elections by suspicion: `Config::elections` (`Elections::Ticks`, raft-rs's, the default and the differential's; `Elections::Suspicion`), `RawNode::suspect`, `trust`, `restarted`, `set_timing`, `hold_campaigns`, `wake`, `deadline` (`src/watch.rs`; `docs/timing.md` §2.9 has the rules and their sources). On ticks nothing changes: every tick-path suite passes unchanged. | Run: the raft-rs differential, `tests/group.rs`, `tests/fast.rs` and `tests/pipeline.rs` on ticks, unchanged; `tests/suspicion.rs` (15 directed tests in time, the delay's distribution against the law and the split rate against `election_span`); `tests/pipeline.rs` by suspicion: the durability oracle at the four settings (10,000 schedules of 4,000 steps from seed 1,000, and 1,000 from 0), the fast track (2,000 schedules), the crash at every persistence step (20 seeds); counts in `crates/hyper-raft/ORIGIN.md`. |
 | **R-7** | CTRL's leader-side recovery of a marked member's own lost entries (`docs/durable.md` §5). | `docs/durable.md` §12, behind the TLA+ model extended with a marked member. |
 
 **The fast track** stays focal's algorithm, with the safety fix below, until note 32 §3.8's tests

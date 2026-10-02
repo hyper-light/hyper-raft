@@ -98,6 +98,19 @@ not measured independent.
 - §6.3, leases for reads: a leader whose heartbeats a majority acknowledged assumes no other leader
   for an election timeout divided by a clock-drift bound; safe only under a drift bound, which
   scheduling pauses, VM migration and clock slewing make hard to maintain.
+- Figure 2 (Followers): "If election timeout elapses without receiving AppendEntries RPC from
+  current leader or granting vote to candidate: convert to candidate": granting a vote resets the
+  timer, which `docs/timing.md` §2.9 keeps as a round before a member that granted competes.
+- §3.10, leadership transfer: the leader sends `TimeoutNow`, the target campaigns at once; "if the
+  transfer does not complete within an election timeout, the prior leader aborts the transfer".
+  §2.9 uses the order to hand over a lead that ends in its term.
+- §4.2.2, removing the current leader: the leader steps down once the change commits, and "a
+  server in Cnew will time out and become the new leader"; by suspicion nothing times out, so the
+  leader hands over (§2.9).
+- §4.2.3 and §9.6, disruptive servers and pre-vote: a server grants a pre-vote only if the
+  candidate's log is up to date and it has not heard from a leader within the minimum election
+  timeout; a server that has neither updates its term nor grants a vote. §2.9 reads "heard" as
+  "trusts".
 - Chapter 9: with no split vote an election ends about a third of the way into the timeout range;
   a split vote occurs when too many servers time out within the one-way latency `l` of the first:
   with `s` servers available of `n`, a split needs `c > s − ⌊n/2⌋` of them within `l`, so
@@ -145,6 +158,15 @@ middle of the NTP timestamp of the last sender report received (LSR) and the del
 it (DLSR); the sender computes the round trip as `A − LSR − DLSR` on its own clock, so neither
 clock's offset enters. The node-pair stream's echo is the same three fields (`docs/timing.md` §2.8),
 with each side's lateness past its schedule added back to bound the delay NFD-E measures.
+
+**CockroachDB, `pkg/kv/kvserver/replica_raft_quiesce.go` (master, read 2026-10-02).** A leader
+quiesces a range, sending nothing, once its live replicas are caught up: "A range may be quiesced
+in the presence of non-live replicas if the remaining live replicas all meet the quiescence
+requirements"; a non-live node is skipped and recorded as lagging. "When a node considered non-live
+becomes live, the node liveness instance invokes a callback which causes all nodes to wake up any
+ranges containing replicas owned by the newly-live node that were out-of-date at the time of
+quiescence" (`Store.nodeIsLiveCallback`). `docs/timing.md` §2.9's leader beats only while its group
+has work in flight, leaves out members it suspects, and sends a heartbeat to one trusted again.
 
 **TiKV, "Best Practices for TiKV Performance Tuning with Massive Regions" (docs.pingcap.com).**
 Hibernate Region: idle regions get no ticks, so their leaders send no heartbeats; enabled by
@@ -201,6 +223,13 @@ estimates the spread of the body, not the variance. The MAD has the best possibl
 42(6), 1971, pp. 1887–1896.** Defines the breakdown point, the share of a sample that can be moved
 arbitrarily far before the estimate is; the median's is one half. `PathRtt`'s window is the
 shortest whose median the late probes of one stall cannot move: `2k + 1` for `k` late.
+
+**RFC 9002, §5.1 and §5.3 (read 2026-10-02).** "An endpoint generates an RTT sample on receiving an
+ACK frame that meets the following two conditions: the largest acknowledged packet number is newly
+acknowledged, and at least one of the newly acknowledged packets was ack-eliciting"; "on the first
+RTT sample after initialization, smoothed_rtt = latest_rtt, rttvar = latest_rtt / 2". The
+handshake's packets carry CRYPTO frames, which are ack-eliciting, so a path has a sample before any
+application data: the ballot's first (`docs/timing.md` §3, item 10).
 
 **RFC 9002 (Iyengar, Swett), QUIC Loss Detection and Congestion Control, Appendix A.2 and §6.1.2
 (read 2026-10-01).** "kGranularity: Timer granularity. This is a system-dependent value, and

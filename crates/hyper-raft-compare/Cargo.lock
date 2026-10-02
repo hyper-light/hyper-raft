@@ -385,6 +385,7 @@ name = "hyper-raft"
 version = "0.1.0"
 dependencies = [
  "crc32c",
+ "hyper-timing",
  "thiserror 2.0.21",
 ]
 
@@ -402,6 +403,10 @@ dependencies = [
  "slates-db",
  "slog",
 ]
+
+[[package]]
+name = "hyper-timing"
+version = "0.1.0"
 
 [[package]]
 name = "indexmap"

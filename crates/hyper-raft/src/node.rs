@@ -543,6 +543,41 @@ impl<S: Storage> RawNode<S> {
     pub fn tick(&mut self) -> Result<bool> {
         self.operate(Raft::tick)
     }
+    /// The owner's detectors suspect `member`'s node (elections by
+    /// suspicion, `crate::raft::Elections::Suspicion`; refused on ticks).
+    pub fn suspect(&mut self, member: NodeId) -> Result<()> {
+        self.operate(|raft| raft.suspect(member))
+    }
+    /// The owner's detectors trust `member`'s node again.
+    pub fn trust(&mut self, member: NodeId) -> Result<()> {
+        self.operate(|raft| raft.trust(member))
+    }
+    /// The owner's detectors saw `member`'s node start again
+    /// ([`Raft::restarted`]): trusted, and leading nothing it led before.
+    pub fn restarted(&mut self, member: NodeId) -> Result<()> {
+        self.operate(|raft| raft.restarted(member))
+    }
+    /// What the owner's measurements give this group's elections
+    /// ([`crate::Timing`]).
+    pub fn set_timing(&mut self, timing: crate::Timing) -> Result<()> {
+        self.raft.set_timing(timing)
+    }
+    /// The owner holds this member's campaigns, or lets them go
+    /// ([`Raft::hold_campaigns`]).
+    pub fn hold_campaigns(&mut self, held: bool) -> Result<()> {
+        self.raft.hold_campaigns(held)
+    }
+    /// The owner's clock reads `now`, nanoseconds ([`Raft::wake`]): called
+    /// after each call the owner makes, once the `Ready` it took is issued,
+    /// and at [`RawNode::deadline`].
+    pub fn wake(&mut self, now: u64) -> Result<bool> {
+        self.operate(|raft| raft.wake(now))
+    }
+    /// When the member is next to be woken, on the owner's clock
+    /// ([`Raft::deadline`]).
+    pub fn deadline(&self) -> Option<u64> {
+        self.raft.deadline()
+    }
     /// Campaigns now, by pre-vote when the group runs it.
     pub fn campaign(&mut self) -> Result<()> {
         self.operate(|raft| raft.step(proto::message(0, MessageType::MsgHup)))

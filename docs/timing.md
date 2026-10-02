@@ -608,6 +608,113 @@ flushes) and every other suspects it within its stated bound from the last sched
 monotonic clock, which the processes share; then one is SIGKILLed and every survivor suspects it so;
 live members keep the allowance. The test derives nothing; it waits on facts.
 
+### 2.9 Elections by suspicion in the core (L-2, as built)
+
+`crates/hyper-raft/src/watch.rs` and `src/raft.rs` (`Config::elections`). A member that elects by
+suspicion (`Elections::Suspicion`) takes no ticks: `RawNode::tick` is refused. `Elections::Ticks`
+stays, raft-rs's rule, for the raft-rs differential (which compares against raft-rs's tick timer)
+and the owners that still tick.
+
+**What the owner gives the core.**
+- `RawNode::suspect(member)` and `RawNode::trust(member)`: what its detector of `member`'s node now
+  believes. Per member of a group; the owner fans each node's event out to the groups with a member
+  on that node, which is per group only when a node's standing changes. A member is trusted until
+  its owner says otherwise, so a member opened with no word from any detector trusts everyone.
+- `RawNode::restarted(member)`: the node came back as a new incarnation. It is trusted, and leads
+  nothing it led before.
+- `RawNode::set_timing(Timing { span, round })`: `Timing::of(&ballot, &span)` from the law of §2.3,
+  `span` the `W` the ballot chose and `round` the ballot's `broadcast_tail` (the slowest voter path's
+  tail over `G`, plus the mean flush). Given again whenever the ballot moves.
+- `RawNode::wake(now)`, the owner's monotonic clock in nanoseconds, after each call it makes and at
+  `RawNode::deadline()`; the core reads no clock, and what a call arms is timed at the next wake.
+  A group with nothing timed has no deadline and is woken for nothing.
+- `RawNode::hold_campaigns(held)`: the owner holds the member's campaigns (a log that may lack
+  what it acknowledged, a write that waits for room). Everything else goes on.
+
+`Config::validate` refuses elections by suspicion without pre-vote and check-quorum: a member that
+opens knowing no leader campaigns, and without pre-vote one that restarted in an idle group would
+spend a term and depose a leader that never left.
+
+**The rules**, each with its source and, where the schedules found it, the run that did:
+- **A follower campaigns when it trusts no leader**, after the law's draw, `election_delay(W, seed,
+  attempt)` uniform on `[0, W)` (`ElectionTiming::delay` is the same draw). It trusts a leader while
+  it knows one, its detector does not suspect it, and the configuration it applied names it a voter
+  (a leader that is none steps down once it applies that, and a member that applied it knows it was
+  committed). A suspicion withdrawn before the delay ends cancels the campaign.
+- **When the delay is counted from.** From now where the event is common to the followers: the
+  detectors suspected the leader, or the members opened together. After any other reset — a new
+  term, a campaign lost or refused, a vote granted, a leader that stopped leading — a round
+  (`Timing::round`) and then the draw, as a reset gives a whole election timeout on ticks (Raft
+  Figure 2: granting a vote resets the timer). A candidate whose campaign is unresolved draws again
+  a round after it began. Without the round, five-voter fast-track schedules held a leader in 5 %
+  of their steps against 17 % on ticks, their candidates rising within one another's rounds; with
+  it, and a round tail that covers the schedules' vote round, 18 % (`tests/pipeline.rs`;
+  `crates/hyper-raft/ORIGIN.md`, "L-2").
+- **A member campaigns only while it and the members it trusts are a quorum** of each half of its
+  configuration: a campaign that cannot win is not run, and costs nothing while a partition lasts.
+- **A leader steps down** once it and those it trusts are no quorum of either half (check-quorum
+  from the detectors, Raft §6.2), at once: the detector already waited its `η + α`.
+- **A leader that stops leading in its term hands over**: a transfer's order (`MsgTimeoutNow`,
+  dissertation §3.10) to the voter it trusts that holds the most of its log. Its followers trust
+  its node, which lives, and on ticks their lease would have run out; nothing else would make them
+  campaign. The schedules found it twice: a leader that removed itself with no voter holding its
+  whole log (seed 7 of the four settings), and one that stepped down for want of a quorum. The
+  heir's campaign moves its voters to a later term, where they know no leader, and an heir that
+  cannot win leaves them there all the same. Until its term moves or it follows another leader of
+  it, a member that led its term and cannot campaign hands over again a round and a draw after the
+  last, as a candidate asks again, for the order may be lost; a member of a later term answers an
+  old order (as it answers an old leader's heartbeat), which moves the sender's term.
+- **What ends a follower's trust in its leader**, besides its detector: a request for votes from
+  that leader (a member asks only while it does not lead, and terms only rise at it); its
+  incarnation's end (`restarted`); a configuration that names it no voter; and a request from a
+  member already in a later term than the follower's (`message.term > term + 1`: with pre-vote a term
+  moves only by a campaign a majority let through, and the leader of the follower's term is deposed
+  once it and the asker speak). The schedules found each: a leader stepped down and its followers
+  kept refusing its own campaign (seed 1); a removed leader's follower trusting it (seed 7); a new
+  voter with an empty log trusting a leader of an older term and refusing the one candidate that
+  could win (seed 2313 of 10,000).
+- **A member that voted for itself in its term may have led it.** It opens treating the term as
+  one it led — it campaigns, or hands over if held or not a voter — until its term moves or it
+  follows another leader of the term (a term has one leader). Messages it sent before it stopped
+  may still arrive and make a follower trust it again; its followers' detectors seeing its restart
+  cannot undo a heartbeat delivered after (seed 1322).
+- **Pre-vote keeps its role.** A member that trusts its leader neither grants a pre-vote nor moves
+  its term for a vote request (dissertation §9.6: no pre-vote is granted while a leader is heard;
+  here, while it is trusted). A leader asked for a vote by a member of its group answers with a
+  heartbeat: that member knows no leader, as one that restarted while its group was idle does, and
+  nothing else would tell it.
+- **A leader beats only while its group has work in flight**: a transfer, a read, or a member it
+  trusts that is behind it, has not said it holds the commit, is probed, sent a snapshot or has
+  messages out. Its beat is a round of heartbeats once a round tail after the last (the
+  retransmission timeout RFC 6298 §2 computes, mean plus four deviations over the granularity, as
+  RFC 9002 §6.2.1's), which recovers what was lost. A group with nothing in flight is sent nothing
+  and woken for nothing. A member the leader suspects is left out, as CockroachDB quiesces a range
+  whose behind replicas are on non-live nodes, and a leader that trusts a member again sends it a
+  heartbeat, as CockroachDB wakes such ranges when the node becomes live
+  (`replica_raft_quiesce.go`, `Store.nodeIsLiveCallback`; `docs/research/timing.md`).
+- **A transfer** is given up `TRANSFER_ROUNDS` (two) rounds after it began, the order reaching the
+  transferee and the new leader's append coming back with the transferee's vote round between
+  (dissertation §3.10: given up when not finished within an election), or at once when the
+  transferee is suspected.
+- **A sole voter** campaigns at once, timed or not: it has no one to split a vote with.
+
+**The model.** These rules only bring forward or refuse a campaign, or forget a leader, which is
+volatile; the TLA+ model's `Elect` may be taken at any time with any quorum the log comparison
+admits, so it needs no change (`docs/models/README.md`).
+
+**Evidence.** `crates/hyper-raft/tests/suspicion.rs`, a group in time on one-way latencies: an idle
+group sends nothing and is due for nothing for a simulated day; elections start only on suspicion;
+the delay is the law's draw exactly and uniform over 20,000 members; split votes resolve, the first
+rounds of 1,000 crashes of a five-voter leader splitting 135 times against Ongaro's 110.8 (`split`
+of `election_span` on the same latency and round, inside the 99.9 % interval); a withdrawn
+suspicion cancels; pre-vote refused by members that trust the leader; step-down on a suspected
+majority of either half of a joint configuration; hand-overs; a held member campaigns for nothing;
+a restarted leader forgotten; a leader that beats while work is in flight and then sleeps.
+`tests/pipeline.rs` runs the R-4 durability oracle with suspicion-driven elections at its four
+settings, the fast track and the crash at every persistence step, its detectors right nine times in
+ten about a member that is down or cut off and wrong one time in ten about one that is not
+(`crates/hyper-raft/ORIGIN.md`, "L-2", has the counts).
+
 ## 3. Open, to be measured before it is fixed
 
 Items 2, 6 and 7 and part of 3 are settled by the traces (§2.6) and implemented in L-1's estimator
@@ -657,12 +764,48 @@ and election law; the remaining items keep their numbers, and item 10 is what L-
   timers.
 - **9. Bare Linux.** Every Linux number here is from Docker Desktop's VM: 1 ms ticks, and a disk
   image that is a file on the Mac. A Linux host with its own disk is to be traced the same way.
-- **10. A link younger than its evidence.** The election law has nothing to run on before a
-  quorum's paths have answered (no ballot) or before the leader's link has configured its detector
-  (a few dozen heartbeats at `T_c`, §2.6, item 3): a crash of the leader's node in that time is
-  suspected by nothing, since a link that stopped receiving never gathers its evidence. L-1 picks no
-  timeout for it. Closed in L-2 with the core's bootstrap: candidates for the first election, and a
-  rule for a link that stopped before it was configured, measured, not picked.
+- **10. A link younger than its evidence. Resolved; the core's half built in L-2, the detector's
+  half owed in hyper-liveness.** The election law has nothing to run on
+  before a quorum's paths have answered (no ballot) or before the leader's link has configured its
+  detector (a few dozen heartbeats at `T_c`, §2.6, item 3), and a link that stopped receiving never
+  gathers its evidence. The cause is that a link's detector judges only from its own history. The
+  resolution, with no startup timeout:
+  - *The first election needs no detector.* A member that knows no leader campaigns after its draw
+    (§2.9): a group opened on links with no history elects as followers that suspected together do.
+    It needs only `W`, and the ballot needs one measured round trip on each path of a candidate's
+    quorum. QUIC gives every path its first sample in the handshake, before any group message: an
+    RTT sample is taken on each ACK that newly acknowledges an ack-eliciting packet (RFC 9002 §5.1),
+    the handshake's CRYPTO frames are ack-eliciting, and the first sample sets `smoothed_rtt` and
+    `rttvar` (§5.3); the node-pair stream's echo gives one with its first answered heartbeat
+    (`Liveness::round_trip`, §2.8). Before a path has a sample no member campaigns, and none could
+    hear its vote.
+  - *A link that stopped before its evidence is judged by its node's pool.* The evidence about a
+    link's delays is not only the link's: §2.6 measured that the stalls are the hosts', and
+    hyper-swim already judges a pair with no verdict of its own by its member's pool (§2.7), item 3's
+    candidate. Until a link's own estimator configures, its trust is judged by the margin the node's
+    pool configures, scaled to the link's window (the prediction errors' variance is
+    `V(D)(1 + 1/n)` at a window of `n`), against the link's own expected arrival — anchored at its
+    first heartbeat, or, for a peer from which none has arrived, one interval past the moment the
+    node first attached the pair. hyper-liveness as merged (§2.8) judges a pair by its own
+    estimator only, `Trust::Unconfigured` and no change until it configures; the pool is what it
+    owes for this item. That suffices, by this argument: a group elects only with a live
+    majority of its voters. For `n ≥ 3` a live majority holds at least two members, so every live
+    voter that must detect its leader's crash has a live peer in the group, and the node-pair
+    stream between them (L-3 runs one between every two nodes that share a group) feeds its node's
+    pool. The pool reaches its evidence — two prediction errors and an Allan level of seven windows
+    at Madras and Sokal's `m ≥ 6τ_int`, at least 56 heartbeats, at `T_c` or more apart, sooner
+    when several live links feed it — and from then the dead link, unconfigured, is suspected at its
+    next freshness point. Two voters cannot elect without both, one never suspects, and a node whose
+    pool has no live link has no peer to elect with. A crash in a link's first heartbeats is so
+    suspected within the later of the pool's evidence and the link's freshness point, both measured.
+  - *A restart is not a crash the detectors can miss.* The stream carries the sender's run
+    (`boot`, §2.8), and a new run is an incarnation's end: told to the core (`restarted`), the node is
+    trusted and leads nothing it led before. hyper-liveness sees it (a new run re-anchors the pair
+    and counts in the MTBF) and does not yet surface it; until it does, the core needs it only for
+    a restarted leader held from campaigning, whose own vote for itself in its term already makes
+    it hand over (§2.9).
+  What stays open is §2.7's for the pool: its mean is wrong for a pair far from the node's other
+  peers until that pair configures, and while a history is young the allowance is loose (item 3).
 
 ## 4. Steps
 
@@ -685,8 +828,8 @@ and election law; the remaining items keep their numbers, and item 10 is what L-
   the law before it, focal-timing and slates' (`docs/benchmarks.md`, "hyper-timing against
   focal-timing and slates' timing"); a replay of synthetic traces of the recorded shapes keeps
   Theorem 7's bound, and the trace analyser takes its window, loss and bound from the crate.
-- **L-2** the core: elections started by suspicion with the randomized delay of §2.3,
-  check-quorum from the detectors, no per-group timers, idle groups silent.
+- **L-2** the core, done (§2.9): elections started by suspicion with the randomized delay of §2.3,
+  check-quorum from the detectors, no per-group timers, idle groups silent, item 10 closed.
 - **L-3** the transport, done (§2.8): `crates/hyper-liveness`, one heartbeat stream per node pair on
   the datagram plane, shared by every group the pair shares and silent for a pair that shares none;
   each heartbeat proving a durable flush made after the previous was due; stamped on receipt by the

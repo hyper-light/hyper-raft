@@ -67,7 +67,13 @@ What the model leaves out, and why it is sound to:
   state machine but the configuration, and a change waits for the durable commit (I5), which
   cannot cover an entry not durable at the member (I7). No action changes.
 - **Pre-vote, check-quorum, priority and leader transfer** only refuse or bring forward a
-  campaign, which the model may take at any time. **Learners** do not vote and are not counted.
+  campaign, which the model may take at any time. So do **elections by suspicion** (timing step
+  L-2, `docs/timing.md` §2.9): a campaign started by a detector's suspicion after a drawn delay,
+  refused while a member and those it trusts are no quorum, brought forward by a hand-over's order;
+  a leader stepping down when its detectors suspect a majority, which is a leader that stops acting;
+  a lease that refuses votes while the leader is trusted rather than while it is heard; a follower
+  forgetting its leader, which no action reads. None grants a vote the log comparison would refuse,
+  so `Elect` is unchanged and so is every configuration's state count. **Learners** do not vote and are not counted.
   **ReadIndex** commits nothing. **A snapshot** stands for a committed prefix of a log.
 - **The leader's first entry** is an entry it takes like any other, so the model's leader may
   write a change before it; the core writes its first entry at once. The model has every run of

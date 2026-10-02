@@ -574,6 +574,11 @@ impl Tracker {
                 members.binary_search(&member).ok().map(|_| true)
             }) == Tally::Won
     }
+    /// Whether the members for which `holds` is true hold the quorum of
+    /// both halves.
+    pub fn quorum_of(&self, holds: impl Fn(NodeId) -> bool + Copy) -> bool {
+        self.decided(|member| holds(member).then_some(true)) == Tally::Won
+    }
     /// Whether `members`, in order, hold the quorum of both halves.
     pub fn has_quorum(&self, members: &[NodeId]) -> bool {
         self.decided(|member| members.binary_search(&member).ok().map(|_| true)) == Tally::Won

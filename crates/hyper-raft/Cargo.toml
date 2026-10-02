@@ -9,6 +9,8 @@ repository.workspace = true
 
 [dependencies]
 crc32c.workspace = true
+# The election law's draw (`election_delay`); a crate of this repository with no dependencies.
+hyper-timing = { path = "../hyper-timing" }
 thiserror.workspace = true
 
 [dev-dependencies]

@@ -95,7 +95,7 @@ struct Write {
 }
 
 pub struct Lagged {
-    node: New,
+    pub node: New,
     depth: usize,
     /// Writes issued and not yet durable, oldest first.
     out: VecDeque<Write>,
@@ -557,6 +557,21 @@ impl Replica for Lagged {
     }
     fn set_window(&mut self, member: u64, bytes: u64) {
         self.node.set_window(member, bytes);
+    }
+    fn suspect(&mut self, member: u64) {
+        self.node.suspect(member);
+    }
+    fn trust(&mut self, member: u64) {
+        self.node.trust(member);
+    }
+    fn restarted(&mut self, member: u64) {
+        self.node.restarted(member);
+    }
+    fn wake(&mut self, now: u64) -> bool {
+        self.node.wake(now)
+    }
+    fn deadline(&self) -> Option<u64> {
+        self.node.deadline()
     }
     fn set_timeout(&mut self, ticks: usize) {
         self.node.set_timeout(ticks);

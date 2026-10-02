@@ -140,6 +140,7 @@ fn schedules(name: &str, settings: Settings, voters: &[u64], fast: u64) -> (Cove
     let first = count("HYPER_RAFT_SEED", 0);
     let mut coverage = Coverage::default();
     let mut committed = 0;
+    let mut terms = 0;
     for seed in first..first + seeds {
         let (group, _) = schedule(
             settings,
@@ -151,9 +152,10 @@ fn schedules(name: &str, settings: Settings, voters: &[u64], fast: u64) -> (Cove
         );
         coverage.add(group.coverage());
         committed += group.chosen.len();
+        terms += group.leaders.len();
     }
     println!(
-        "{name}: {seeds} schedules of {steps} steps committed {committed} entries; {coverage:?}"
+        "{name}: {seeds} schedules of {steps} steps committed {committed} entries in {terms} terms led; {coverage:?}"
     );
     // A schedule that never had two writes out, never heard of several at
     // once and never lost one proves nothing of R-4.
@@ -179,9 +181,9 @@ fn schedules(name: &str, settings: Settings, voters: &[u64], fast: u64) -> (Cove
     (coverage, committed)
 }
 
-#[test]
-fn random_interleavings_keep_every_invariant() {
-    for (name, settings) in [
+/// The four settings the schedules run at.
+fn settings() -> [(&'static str, Settings); 4] {
+    [
         (
             "shell, three writes out",
             Settings {
@@ -216,8 +218,26 @@ fn random_interleavings_keep_every_invariant() {
                 ..Settings::focal()
             },
         ),
-    ] {
+    ]
+}
+
+#[test]
+fn random_interleavings_keep_every_invariant() {
+    for (name, settings) in settings() {
         schedules(name, settings, &[1, 2, 3], 0);
+    }
+}
+
+/// The same schedules with every member electing by suspicion (timing step
+/// L-2, `docs/timing.md` §2.3): no member ticks; a tick of the schedule is
+/// its clock moving, and its detectors suspect and trust, right nine times
+/// in ten about a member that is down or cut off and wrong one time in ten
+/// about one that is not. The invariants are the same, and the group
+/// settles once the network is whole and the detectors trust every member.
+#[test]
+fn random_interleavings_by_suspicion_keep_every_invariant() {
+    for (name, settings) in settings() {
+        schedules(name, settings.by_suspicion(), &[1, 2, 3], 0);
     }
 }
 
@@ -226,17 +246,20 @@ fn random_interleavings_keep_every_invariant() {
 /// holds it (I2), and the fast quorum commits only what is durable.
 #[test]
 fn the_fast_track_with_readies_persisted_at_random_lags_is_safe_and_settles() {
-    for in_place in [false, true] {
-        schedules(
-            "fast",
-            Settings {
-                depth: 3,
-                in_place,
-                ..Settings::fast()
-            },
-            &[1, 2, 3, 4, 5],
-            60,
-        );
+    for suspicion in [false, true] {
+        for in_place in [false, true] {
+            schedules(
+                "fast",
+                Settings {
+                    depth: 3,
+                    in_place,
+                    suspicion,
+                    ..Settings::fast()
+                },
+                &[1, 2, 3, 4, 5],
+                60,
+            );
+        }
     }
 }
 
@@ -247,14 +270,20 @@ fn the_fast_track_with_readies_persisted_at_random_lags_is_safe_and_settles() {
 /// safe and settles.
 #[test]
 fn a_crash_at_every_persistence_step_loses_nothing_durable() {
-    let seeds = count("HYPER_RAFT_CRASH_SEEDS", 3);
+    // Four: the fewest from seed zero at which every variant below, on ticks
+    // and by suspicion, holds a change behind the fence at some crash.
+    let seeds = count("HYPER_RAFT_CRASH_SEEDS", 4);
     let steps = count("HYPER_RAFT_CRASH_STEPS", 400);
     // The second has a leader apply its own entries before its write of them
-    // is durable: a crash between the two (`docs/durable.md` §12).
-    for apply_unpersisted in [false, true] {
+    // is durable: a crash between the two (`docs/durable.md` §12). Each on
+    // ticks and by suspicion.
+    for (apply_unpersisted, suspicion) in
+        [(false, false), (true, false), (false, true), (true, true)]
+    {
         let settings = Settings {
             depth: 3,
             apply_unpersisted,
+            suspicion,
             ..Settings::focal()
         };
         let mix = mix_for(&settings, 0);
@@ -272,7 +301,7 @@ fn a_crash_at_every_persistence_step_loses_nothing_durable() {
             }
         }
         println!(
-            "applying before durable {apply_unpersisted}: {crashes} crashes, one at each persistence step, lost {lost} writes out; {reached:?}"
+            "applying before durable {apply_unpersisted}, by suspicion {suspicion}: {crashes} crashes, one at each persistence step, lost {lost} writes out; {reached:?}"
         );
         assert!(crashes > seeds * 20 && lost > 0, "{crashes} {lost}");
         assert!(reached.answers > 0 && reached.fenced > 0, "{reached:?}");

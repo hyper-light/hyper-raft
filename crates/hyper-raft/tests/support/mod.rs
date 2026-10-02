@@ -490,6 +490,32 @@ pub struct Settings {
     /// is durable (`Config::apply_unpersisted`); `raft-rs`'s default does
     /// not.
     pub apply_unpersisted: bool,
+    /// Whether this core's members elect by suspicion
+    /// (`Elections::Suspicion`, timing step L-2): a tick advances the
+    /// schedule's clock by [`TICK_NS`] and wakes the member, and the
+    /// schedule's detectors suspect and trust. `raft-rs` has only ticks.
+    pub suspicion: bool,
+}
+
+/// A member's clock, in the schedule's nanoseconds, by suspicion: the span a
+/// suspicion's delay is drawn over, the round tail, and a tick's advance of
+/// the member's clock. Each member's clock moves only at its own ticks, as
+/// its ticks do on ticks, so a round is two of its ticks and the span ten,
+/// as `Settings::shell`'s beat (two) and the range its timeouts are drawn
+/// over (ten): measured in the schedule's steps, a member's wait is as long
+/// on either. What they are is the schedule's, not a member's.
+pub const SPAN_NS: u64 = 5_000;
+/// The round tail ([`SPAN_NS`]).
+pub const ROUND_NS: u64 = 5_000;
+/// A tick's advance of the clock ([`SPAN_NS`]).
+pub const TICK_NS: u64 = 500;
+
+/// The timing the schedule gives each member that elects by suspicion.
+pub fn timing() -> hyper_raft::Timing {
+    hyper_raft::Timing {
+        span: std::time::Duration::from_nanos(SPAN_NS),
+        round: std::time::Duration::from_nanos(ROUND_NS),
+    }
 }
 impl Settings {
     /// As focal's shell sets a group.
@@ -511,6 +537,14 @@ impl Settings {
             in_place: false,
             depth: 1,
             apply_unpersisted: false,
+            suspicion: false,
+        }
+    }
+    /// The same, electing by suspicion.
+    pub fn by_suspicion(self) -> Self {
+        Self {
+            suspicion: true,
+            ..self
         }
     }
     /// As focal runs this core.
@@ -561,6 +595,20 @@ pub trait Replica: Sized {
     /// What the path to `member` carries before it answers. `raft-rs` has
     /// no such bound and does nothing.
     fn set_window(&mut self, _member: u64, _bytes: u64) {}
+    /// The member's detectors suspect `member` (by suspicion only).
+    fn suspect(&mut self, _member: u64) {}
+    /// The member's detectors trust `member` again (by suspicion only).
+    fn trust(&mut self, _member: u64) {}
+    /// The member's detectors saw `member` start again (by suspicion only).
+    fn restarted(&mut self, _member: u64) {}
+    /// The clock reads `now` (by suspicion only); true when it acted.
+    fn wake(&mut self, _now: u64) -> bool {
+        false
+    }
+    /// When the member is next to be woken (by suspicion only).
+    fn deadline(&self) -> Option<u64> {
+        None
+    }
     fn set_timeout(&mut self, ticks: usize);
     fn drain(&mut self) -> Output;
     /// A persistence step ([`Step`]); true when it did something.
@@ -1088,6 +1136,11 @@ impl Replica for New {
             },
             fast: settings.fast,
             apply_unpersisted: settings.apply_unpersisted,
+            elections: if settings.suspicion {
+                hyper_raft::Elections::Suspicion
+            } else {
+                hyper_raft::Elections::Ticks
+            },
             seed,
             limits: hyper_raft::Limits {
                 readies_in_flight: settings.depth,
@@ -1095,7 +1148,10 @@ impl Replica for New {
             },
             ..hyper_raft::Config::new(id)
         };
-        let raw = hyper_raft::RawNode::new(&config, store).expect("hyper-raft opens");
+        let mut raw = hyper_raft::RawNode::new(&config, store).expect("hyper-raft opens");
+        if settings.suspicion {
+            raw.set_timing(timing()).expect("by suspicion");
+        }
         Self {
             raw,
             app,
@@ -1154,6 +1210,21 @@ impl Replica for New {
     }
     fn set_window(&mut self, member: u64, bytes: u64) {
         self.raw.set_inflight_bytes(member, bytes);
+    }
+    fn suspect(&mut self, member: u64) {
+        heard(self.raw.suspect(member));
+    }
+    fn trust(&mut self, member: u64) {
+        heard(self.raw.trust(member));
+    }
+    fn restarted(&mut self, member: u64) {
+        heard(self.raw.restarted(member));
+    }
+    fn wake(&mut self, now: u64) -> bool {
+        heard(self.raw.wake(now)).unwrap_or(false)
+    }
+    fn deadline(&self) -> Option<u64> {
+        self.raw.deadline()
     }
     fn set_timeout(&mut self, ticks: usize) {
         self.raw

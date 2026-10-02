@@ -61,7 +61,7 @@ pub use link::{
 mod election;
 pub use election::{
     Ballot, ElectionPriority, ElectionTimer, ElectionTiming, FollowerStep, PathEstimate,
-    REPAIR_ROUND_TRIPS, quorum_priority,
+    REPAIR_ROUND_TRIPS, election_delay, quorum_priority,
 };
 
 use std::time::Duration;

@@ -10,7 +10,8 @@ use hyper_raft::proto::{
 };
 
 use super::{
-    Coverage, Disk, Output, Replica, Said, Seeded, Settings, Step, Store, View, members, votes,
+    Coverage, Disk, Output, Replica, Said, Seeded, Settings, Step, Store, TICK_NS, View, members,
+    votes,
 };
 
 /// The most messages the network holds; the oldest is lost for a new one.
@@ -46,7 +47,19 @@ pub enum Op {
     Ping(u64),
     /// A step of the member's persistence ([`Step`]).
     Persist(u64, Step),
+    /// By suspicion: the first member's detectors suspect the second.
+    Suspect(u64, u64),
+    /// By suspicion: the first member's detectors trust the second again.
+    Trust(u64, u64),
 }
+
+/// By suspicion, of a hundred steps, how many are a detector's word: as
+/// many as the members' changes of role want, so each has its own.
+const DETECTION: u64 = 10;
+/// By suspicion, of a hundred words about a peer that is down or cut off
+/// from the member, how many are right: a detector is wrong now and then
+/// both ways, and the schedule is safe whatever it says.
+const ACCURATE: u64 = 90;
 
 /// What one member did in an operation.
 #[derive(Debug, PartialEq)]
@@ -148,6 +161,8 @@ pub struct Cluster<R> {
     counted_by: BTreeMap<u64, ConfState>,
     /// What the persistence steps of members since stopped reached.
     stopped: Coverage,
+    /// Each member's clock, by suspicion: its ticks advance it.
+    pub clocks: BTreeMap<u64, u64>,
 }
 
 impl<R: Replica> Cluster<R> {
@@ -173,6 +188,7 @@ impl<R: Replica> Cluster<R> {
             checked: BTreeMap::new(),
             counted_by: BTreeMap::new(),
             stopped: Coverage::default(),
+            clocks: BTreeMap::new(),
         };
         for id in 1..=count {
             let node = cluster.open(id, Store::new(boot.clone()));
@@ -267,7 +283,13 @@ impl<R: Replica> Cluster<R> {
     /// What the member did, recorded and checked against what the group
     /// holds true whatever the schedule.
     fn report(&mut self, member: u64, accepted: Option<bool>) -> Report {
+        let suspicion = self.settings.suspicion;
+        let now = self.clocks.get(&member).copied().unwrap_or(0);
         let node = self.node(member).expect("a member that is up");
+        if suspicion {
+            // After each call, the owner wakes the member at its clock.
+            node.wake(now);
+        }
         let output = node.drain();
         let view = node.view();
         for committed in &output.committed {
@@ -354,9 +376,28 @@ impl<R: Replica> Cluster<R> {
                     reports.push(self.report(from, None));
                 }
             }
+            Op::Tick(id) if self.settings.suspicion => {
+                // Time passes on the member's clock; it is woken at it.
+                *self.clocks.entry(*id).or_insert(0) += TICK_NS;
+                if self.peek(*id).is_some() {
+                    reports.push(self.report(*id, None));
+                }
+            }
             Op::Tick(id) => {
                 let accepted = self.node(*id).map(|node| node.tick());
                 reports.push(self.report(*id, accepted));
+            }
+            Op::Suspect(id, peer) => {
+                if let Some(node) = self.node(*id) {
+                    node.suspect(*peer);
+                    reports.push(self.report(*id, None));
+                }
+            }
+            Op::Trust(id, peer) => {
+                if let Some(node) = self.node(*id) {
+                    node.trust(*peer);
+                    reports.push(self.report(*id, None));
+                }
             }
             Op::Propose(id, data) => {
                 let accepted = self.node(*id).map(|node| node.propose(data.clone()));
@@ -400,6 +441,17 @@ impl<R: Replica> Cluster<R> {
                 // What was not durable is gone; what was is what it opens on.
                 self.restart(*id);
                 reports.push(self.report(*id, None));
+                if self.settings.suspicion {
+                    // The others' detectors see its new incarnation.
+                    for other in self.up() {
+                        if other != *id
+                            && let Some(node) = self.node(other)
+                        {
+                            node.restarted(*id);
+                            reports.push(self.report(other, None));
+                        }
+                    }
+                }
             }
             Op::Compact(id) => {
                 let accepted = self.node(*id).map(|node| node.compact());
@@ -582,6 +634,24 @@ impl<R: Replica> Cluster<R> {
             }
         };
         for _ in 0..16 {
+            // Drawn only by suspicion: a schedule on ticks draws as it did.
+            if self.settings.suspicion && !up.is_empty() && rng.chance(DETECTION) {
+                let member = any(rng);
+                let peer = rng.pick(&all).unwrap_or(1);
+                if peer != member {
+                    let gone = self.peek(peer).is_none() || self.is_blocked(peer, member);
+                    let suspect = if gone {
+                        rng.chance(ACCURATE)
+                    } else {
+                        !rng.chance(ACCURATE)
+                    };
+                    return if suspect {
+                        Op::Suspect(member, peer)
+                    } else {
+                        Op::Trust(member, peer)
+                    };
+                }
+            }
             // Drawn only where members persist in steps: a schedule of
             // members that do not draws as it always did.
             if mix.lag > 0 && !up.is_empty() && rng.chance(mix.lag) {
@@ -688,6 +758,17 @@ impl<R: Replica> Cluster<R> {
                 self.act(&Op::Restart(id));
             }
         }
+        if self.settings.suspicion {
+            // Every member up and the network whole: the detectors trust
+            // every peer.
+            for id in self.ids() {
+                for peer in self.ids() {
+                    if peer != id {
+                        self.act(&Op::Trust(id, peer));
+                    }
+                }
+            }
+        }
         // The index the proposal took, and the term of the leader that
         // took it.
         let mut proposed: Option<(u64, u64)> = None;
@@ -763,7 +844,11 @@ impl<R: Replica> Cluster<R> {
         for id in self.ids() {
             let view = self.peek(id).map(|node| node.view());
             let conf = self.disk(id).conf.clone();
-            println!("member {id}: proposed {proposed:?} {conf:?}\n  {view:?}");
+            let deadline = self.peek(id).map(|node| node.deadline());
+            println!(
+                "member {id}: deadline {deadline:?} clock {:?} proposed {proposed:?} {conf:?}\n  {view:?}",
+                self.clocks.get(&id)
+            );
         }
         false
     }

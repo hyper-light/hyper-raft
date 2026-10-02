@@ -437,3 +437,63 @@ Not a port: this repository's change (`docs/durable.md` §4.4, which states the 
 - **Measured**: allocations identical on every workload; time in `docs/benchmarks.md`, "The durable
   commit and the apply pause (R-6)".
 
+
+## L-2: elections by suspicion
+
+Not a port: timing step L-2 (`docs/timing.md` §2.9, which states the design as built and the
+source of each rule; `docs/raft.md` §3).
+
+- **The mode** (`src/raft.rs`): `Config::elections`, `Elections::Ticks` (raft-rs's rule, the
+  default, every existing suite and the differential) or `Elections::Suspicion`, which
+  `Config::validate` refuses without pre-vote and check-quorum. On ticks nothing changes; the member
+  carries `watch: Option<Box<Watch>>`, none on ticks, eight bytes.
+- **What a member keeps by suspicion** (`src/watch.rs`, `Watch`): the members suspected (at most
+  `MAX_MEMBERS`, refused past it), the timing (`Timing { span, round }`, `Timing::of` from
+  hyper-timing's ballot and span), three timers on the owner's clock (a campaign, a leader's beat, a
+  transfer's end: `Arm`), the campaign count the draw takes, the term it last led, and whether its
+  owner holds its campaigns. `TRANSFER_ROUNDS` is two, a protocol fact.
+- **The calls** (`src/node.rs`, `src/raft.rs`): `suspect`, `trust`, `restarted`, `set_timing`,
+  `hold_campaigns`, `wake(now)`, `deadline()`; `tick` is refused. `Tracker::quorum_of` counts a
+  quorum of each half by a predicate, for the trusted quorum.
+- **Where the rules sit**: the lease (`step_newer_term`): while leading, or trusting a leader the
+  request is not from, and the asker no later than this member's term; a leader asked for a vote
+  answers with a heartbeat (`probe`). Granting a vote and every `reset` arm a campaign a round out;
+  opening arms one from now, and a member that voted for itself in its term opens as one that led it
+  (`led`), cleared when it follows another leader of the term (`followed`). Check-quorum and
+  hand-over (`step_down`, `hand_over`; `post_conf_change` hands over where no voter holds the whole
+  log). An older-term `MsgTimeoutNow` is answered as an older leader's heartbeat is
+  (`step_older_term`), by suspicion only. A heartbeat's answer counts a beat as one tick by
+  suspicion. hyper-timing gains `election_delay`, the draw `ElectionTiming::delay` makes, for a
+  core given the span alone; hyper-raft depends on hyper-timing for it (a crate of this repository
+  with no dependencies).
+- **Tests**: `tests/suspicion.rs`, 15 directed tests in time (§2.9's list). The schedules' harness
+  (`tests/support`) gains `Settings::suspicion` and each member's own clock (a tick moves it by
+  `TICK_NS` and wakes the member), the detectors' words (`Op::Suspect`, `Op::Trust`; right nine in
+  ten about a member down or cut off, wrong one in ten about one that is not) and the others told of
+  a restart; it settles with every detector trusting every member. Its round tail and span are ten
+  of a member's ticks, as `Settings::shell`'s election waits ten ticks and draws over ten more:
+  measured on 24 five-voter fast-track schedules of 2,000 steps, a round of two ticks (the beat)
+  held a leader in 7 % of their steps, of five 10 %, of ten 18 %, against 17 % on ticks (5 % at two
+  before a reset waited a round). `tests/pipeline.rs` runs its
+  three schedule tests by suspicion as well; the crash enumeration's default rises from three seeds
+  to four, the fewest from zero at which every variant holds a change behind the fence.
+- **Found by the schedules, each fixed in the core before the counts below**: a leader that stepped
+  down kept its followers' trust (seed 1, `random_interleavings_by_suspicion`: its own campaign now
+  ends their lease and makes them forget it); a leader that removed itself with no voter holding its
+  whole log left followers trusting it (seed 7: hand-over); campaigns drawn from now after every
+  reset overlapped in five-voter groups (a round first); a restarted leader whose old heartbeat
+  arrived after its restart was trusted again (seed 1,322: `led` at open, and the older-term order
+  answered); a voter with an empty log trusting a leader of an older term refused the one candidate
+  that could win (seed 2,313: the asker's later term ends the lease).
+- **Recorded on 2026-10-02**: on ticks, `HYPER_RAFT_SEEDS=1000 HYPER_RAFT_STEPS=4000` prints R-6's
+  counts exactly (73,634, 72,589, 60,657 and 62,565 entries committed at the four settings), and
+  `HYPER_RAFT_SEEDS=300 HYPER_RAFT_SEED=1000` over the differential, group and fast suites prints
+  what `main` prints but for the mixed group's line, which differs between two runs of `main`
+  itself (raft-rs draws its timeouts from its thread). By suspicion: 1,000 schedules of 4,000 steps
+  at the four settings committed 75,539, 76,083, 67,930 and 66,354 entries in 4,561, 4,666, 4,482 and
+  4,635 terms led, with 1,791, 793, 902 and 1,593 changes held behind the fence; 10,000 more from
+  seed 1,000 committed 733,867, 746,577, 679,846 and 667,082. The fast track, twice 2,000 schedules
+  of five voters, 39,691 entries each (42,064 on ticks). The crash at every persistence step of 20
+  schedules: 943 crashes (1,078 writes lost) and, with a leader applying before its write, 904
+  (1,178). The split rate over 1,000 crashes of a five-voter leader: 135 first rounds split
+  against 110.8 expected.

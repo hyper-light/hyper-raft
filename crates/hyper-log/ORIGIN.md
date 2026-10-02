@@ -176,6 +176,16 @@ when it waited for the device left the count where it was, since the wake was th
 
 The 48 equivalence files are byte-identical to mantle-log's throughout.
 
+## A group's handle splits its own updates
+
+- **`GroupLog::parts`** (`src/group.rs`): an update in the parts that each fit a frame, exactly as
+  `Log::parts` gives them, both now `parts` of `src/lib.rs` over the frame's room, which the handle
+  holds; no message to the owner. mantle's range store kept the log beside the handle only to call
+  `Log::parts`: a replica needs nothing but its handle.
+- **Test** `a_handle_splits_an_update_as_the_log_does`: a property test over updates that fit, split
+  into several frames, or are refused as too large; the handle's parts are the log's, and it asks
+  the owner nothing.
+
 ## Not done
 
 - The writes through hyper-block's device issuer (mantle `docs/design/node.md` §1.2): the log does

@@ -278,6 +278,102 @@ pub(crate) struct Params {
     pub(crate) queue_bytes: u64,
 }
 
+/// `update` for `group` in parts that each fit a frame of `room` payload bytes
+/// (`Log::parts`, `GroupLog::parts`).
+pub(crate) fn parts(room: usize, group: u128, update: Update) -> Result<Vec<Update>, LogError> {
+    let len_of = |u: &Update| writer::update_len(group, u).ok_or(LogError::TooLarge(usize::MAX));
+    if update.remove || len_of(&update)? <= room {
+        return Ok(vec![update]);
+    }
+    let record =
+        |r: &format::Record<'_>| format::encoded_len(r).ok_or(LogError::TooLarge(usize::MAX));
+    let Update {
+        start,
+        entries,
+        hard_state,
+        proposals,
+        ..
+    } = update;
+    let mut parts = Vec::new();
+    let mut part = Update {
+        start,
+        ..Update::default()
+    };
+    let mut used = len_of(&part)?;
+    if let Some(e) = entries {
+        let none = record(&format::Record::Entries {
+            group,
+            first: e.first,
+            entries: &[],
+        })?;
+        let mut first = e.first;
+        let mut held: Vec<Entry> = Vec::new();
+        let mut held_len = none;
+        for (index, entry) in (e.first..).zip(e.entries) {
+            let cost = record(&format::Record::Entries {
+                group,
+                first: index,
+                entries: &[(entry.term, &entry.bytes)],
+            })?
+            .saturating_sub(none);
+            if used.saturating_add(held_len).saturating_add(cost) > room {
+                if held.is_empty() && used == 0 {
+                    return Err(LogError::TooLarge(none.saturating_add(cost)));
+                }
+                if !held.is_empty() {
+                    part.entries = Some(Entries {
+                        first,
+                        entries: std::mem::take(&mut held),
+                    });
+                }
+                parts.push(std::mem::take(&mut part));
+                used = 0;
+                held_len = none;
+                first = index;
+                if none.saturating_add(cost) > room {
+                    return Err(LogError::TooLarge(none.saturating_add(cost)));
+                }
+            }
+            held.push(entry);
+            held_len = held_len.saturating_add(cost);
+        }
+        // Entries of none still say where the group's entries end.
+        part.entries = Some(Entries {
+            first,
+            entries: held,
+        });
+        used = used.saturating_add(held_len);
+    }
+    if let Some(state) = hard_state {
+        let cost = record(&format::Record::HardState { group, state })?;
+        if used.saturating_add(cost) > room {
+            parts.push(std::mem::take(&mut part));
+            used = 0;
+        }
+        part.hard_state = Some(state);
+        used = used.saturating_add(cost);
+    }
+    for p in proposals {
+        let cost = record(&format::Record::Proposal {
+            group,
+            index: p.index,
+            term: p.term,
+            bytes: &p.bytes,
+        })?;
+        if cost > room {
+            return Err(LogError::TooLarge(cost));
+        }
+        if used.saturating_add(cost) > room {
+            parts.push(std::mem::take(&mut part));
+            used = 0;
+        }
+        part.proposals.push(p);
+        used = used.saturating_add(cost);
+    }
+    parts.push(part);
+    Ok(parts)
+}
+
 /// Payload bytes one frame holds: a segment less its header block and the frame's header.
 pub(crate) fn frame_room(config: &Config, align: Alignment) -> Result<usize, LogError> {
     let block = u64::try_from(align.get()).map_err(|_| LogError::Config("block"))?;
@@ -711,99 +807,7 @@ impl<F: BlockFile + 'static> Log<F> {
     /// never done, so never acknowledged. `TooLarge` when one entry or proposal alone is
     /// more than a frame holds.
     pub fn parts(&self, group: u128, update: Update) -> Result<Vec<Update>, LogError> {
-        let room = self.frame_room()?;
-        let len_of =
-            |u: &Update| writer::update_len(group, u).ok_or(LogError::TooLarge(usize::MAX));
-        if update.remove || len_of(&update)? <= room {
-            return Ok(vec![update]);
-        }
-        let record =
-            |r: &format::Record<'_>| format::encoded_len(r).ok_or(LogError::TooLarge(usize::MAX));
-        let Update {
-            start,
-            entries,
-            hard_state,
-            proposals,
-            ..
-        } = update;
-        let mut parts = Vec::new();
-        let mut part = Update {
-            start,
-            ..Update::default()
-        };
-        let mut used = len_of(&part)?;
-        if let Some(e) = entries {
-            let none = record(&format::Record::Entries {
-                group,
-                first: e.first,
-                entries: &[],
-            })?;
-            let mut first = e.first;
-            let mut held: Vec<Entry> = Vec::new();
-            let mut held_len = none;
-            for (index, entry) in (e.first..).zip(e.entries) {
-                let cost = record(&format::Record::Entries {
-                    group,
-                    first: index,
-                    entries: &[(entry.term, &entry.bytes)],
-                })?
-                .saturating_sub(none);
-                if used.saturating_add(held_len).saturating_add(cost) > room {
-                    if held.is_empty() && used == 0 {
-                        return Err(LogError::TooLarge(none.saturating_add(cost)));
-                    }
-                    if !held.is_empty() {
-                        part.entries = Some(Entries {
-                            first,
-                            entries: std::mem::take(&mut held),
-                        });
-                    }
-                    parts.push(std::mem::take(&mut part));
-                    used = 0;
-                    held_len = none;
-                    first = index;
-                    if none.saturating_add(cost) > room {
-                        return Err(LogError::TooLarge(none.saturating_add(cost)));
-                    }
-                }
-                held.push(entry);
-                held_len = held_len.saturating_add(cost);
-            }
-            // Entries of none still say where the group's entries end.
-            part.entries = Some(Entries {
-                first,
-                entries: held,
-            });
-            used = used.saturating_add(held_len);
-        }
-        if let Some(state) = hard_state {
-            let cost = record(&format::Record::HardState { group, state })?;
-            if used.saturating_add(cost) > room {
-                parts.push(std::mem::take(&mut part));
-                used = 0;
-            }
-            part.hard_state = Some(state);
-            used = used.saturating_add(cost);
-        }
-        for p in proposals {
-            let cost = record(&format::Record::Proposal {
-                group,
-                index: p.index,
-                term: p.term,
-                bytes: &p.bytes,
-            })?;
-            if cost > room {
-                return Err(LogError::TooLarge(cost));
-            }
-            if used.saturating_add(cost) > room {
-                parts.push(std::mem::take(&mut part));
-                used = 0;
-            }
-            part.proposals.push(p);
-            used = used.saturating_add(cost);
-        }
-        parts.push(part);
-        Ok(parts)
+        parts(self.p.frame_room, group, update)
     }
 
     /// Submits `update` and waits until it is durable; refused at once when the queue is

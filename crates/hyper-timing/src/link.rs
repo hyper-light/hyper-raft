@@ -463,25 +463,33 @@ impl LinkEstimator {
     /// The heartbeats now come every `interval`, from the next one taken, with the sender's new
     /// schedule where it is known. The window and the Allan levels start again, since both are at
     /// the interval; the loss, the history of prediction errors and the margin in force carry over
-    /// until the next [`configure`](Self::configure). The ring is resized for the new interval: an
-    /// allocation, once a change of interval.
+    /// until the next [`configure`](Self::configure). The ring is resized for the new interval, in
+    /// place where it holds the new capacity already (a longer interval needs fewer slots, the
+    /// drift bound): an allocation only for a shorter interval than any it held.
     pub fn retime(
         &mut self,
         interval: Duration,
         schedule: Option<Schedule>,
     ) -> Result<(), EstimateError> {
-        let fresh = Self::new(
-            interval,
-            Duration::from_nanos(self.granularity_ns),
-            schedule,
-        )?;
-        self.interval_ns = fresh.interval_ns;
+        let interval_ns = nanos(interval);
+        if interval_ns == 0 {
+            return Err(EstimateError::ZeroInterval);
+        }
+        let capacity = drift_bound(self.granularity_ns, interval_ns);
+        let slots = usize::try_from(capacity.saturating_add(1)).unwrap_or(usize::MAX);
+        self.sums.clear();
+        self.sums.resize(slots, 0);
+        self.interval_ns = interval_ns;
         self.schedule = schedule;
         self.anchor = schedule;
-        self.sums = fresh.sums;
         self.taken = 0;
-        self.allan = fresh.allan;
-        self.window = fresh.window;
+        self.allan = Allan::new();
+        self.window = Window {
+            length: 0,
+            granularity: None,
+            allan: None,
+            drift: capacity,
+        };
         self.correlation = None;
         self.configured_at = self.received;
         Ok(())

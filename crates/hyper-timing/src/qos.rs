@@ -278,9 +278,16 @@ fn detector(link: &LinkBehaviour, eta: f64, alpha: f64, value: f64) -> Option<De
     })
 }
 
-/// The best margin for interval `eta` and its `U`, to within `resolution`. `U ≥ α / MTBF`, so a
-/// margin past `MTBF · U(η, η)` costs more than any it could save. With `single`, the margin stays
-/// below the interval.
+/// The best margin for interval `eta` and its `U`, to within `resolution`. With `single`, the
+/// margin stays below the interval.
+///
+/// `U ≥ α / MTBF`, so a margin past `MTBF · U*` for any `U*` reached costs more than the margin
+/// that reached it. The bracket is therefore closed from above by probing `α = η, 2η, 4η, …` while
+/// `α / MTBF` is below the least `U` seen: each probe can only lower that least `U`, so the bracket
+/// keeps every margin that could do better. On a lossy link, where `U(η, η)` is large (one
+/// heartbeat in the margin bounds a mistake by little more than the loss), it is far tighter than
+/// `MTBF · U(η, η)`, whose margins hold thousands of heartbeats for `β`'s product to multiply. The
+/// probes end once a doubling would pass `MTBF · U*`, at most the doublings an `f64` holds.
 fn best_margin(
     link: &LinkBehaviour,
     costs: &Costs,
@@ -291,7 +298,18 @@ fn best_margin(
     let high = if single {
         (eta - resolution).max(0.0)
     } else {
-        (costs.mtbf.as_secs_f64() * unavailability(link, costs, eta, eta)).max(eta)
+        let mtbf = costs.mtbf.as_secs_f64();
+        let mut least = unavailability(link, costs, eta, eta);
+        let mut alpha = eta;
+        loop {
+            let next = alpha * 2.0;
+            if !next.is_finite() || next >= mtbf * least {
+                break;
+            }
+            least = least.min(unavailability(link, costs, eta, next));
+            alpha = next;
+        }
+        (mtbf * least).max(eta)
     };
     minimize(0.0, high, resolution, |alpha| {
         unavailability(link, costs, eta, alpha)
@@ -438,6 +456,49 @@ mod tests {
             assert!(
                 (simulated - closed).abs() < 0.005,
                 "{voters} voters, {available} up, l/W {x}: simulated {simulated}, closed {closed}"
+            );
+        }
+    }
+
+    /// The margin's bracket closed by probing finds the margin the whole bracket `[0, MTBF·U(η,η)]`
+    /// finds, to within the search's resolution, on links from lossless to lossy.
+    #[test]
+    fn the_probed_bracket_keeps_the_best_margin() {
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        let mut draw = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 11) as f64 / (1u64 << 53) as f64
+        };
+        for _ in 0..24 {
+            let link = LinkBehaviour {
+                loss: draw() * 0.6,
+                mean_delay: Duration::ZERO,
+                delay_deviation: Duration::from_secs_f64(1e-5 + draw() * 2e-2),
+            };
+            let costs = Costs {
+                election: Duration::from_secs_f64(1e-4 + draw() * 1e-2),
+                mtbf: Duration::from_secs_f64(10.0 + draw() * 3e6),
+            };
+            let resolution = 1e-5 + draw() * 1e-3;
+            let eta = resolution * (1.0 + draw() * 500.0);
+            let (alpha, value) = best_margin(&link, &costs, resolution, eta, false);
+            let whole =
+                (costs.mtbf.as_secs_f64() * unavailability(&link, &costs, eta, eta)).max(eta);
+            let (_, before) = minimize(0.0, whole, resolution, |a| {
+                unavailability(&link, &costs, eta, a)
+            });
+            // Within the resolution: the better of the two is no more than a step of `G` better.
+            let step = unavailability(&link, &costs, eta, alpha + resolution).min(unavailability(
+                &link,
+                &costs,
+                eta,
+                (alpha - resolution).max(0.0),
+            ));
+            assert!(
+                value <= before.max(step) * (1.0 + 1e-9),
+                "{link:?} {costs:?} η {eta}: {value} against {before}"
             );
         }
     }

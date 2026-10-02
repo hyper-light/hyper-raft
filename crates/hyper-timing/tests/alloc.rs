@@ -149,3 +149,31 @@ fn the_election_law_allocates_nothing_once_its_paths_are_built() {
         "{counts:?}"
     );
 }
+
+/// A link moved to a longer interval keeps its ring: the drift bound needs fewer slots, so the
+/// move allocates nothing, and nor do the heartbeats after it.
+#[test]
+fn a_longer_interval_reuses_the_ring() {
+    assert!(alloc::installed());
+    let granularity = Duration::from_micros(50);
+    let mut link = LinkEstimator::new(Duration::from_millis(1), granularity, None).unwrap();
+    for seq in 0..100u64 {
+        link.on_heartbeat(seq, seq * MS + 3_000).unwrap();
+    }
+    alloc::begin();
+    let mut seq = 100u64;
+    for step in 2..40u64 {
+        link.retime(Duration::from_millis(step), None).unwrap();
+        for _ in 0..10 {
+            link.on_heartbeat(seq, seq * step * MS).unwrap();
+            seq += 1;
+        }
+    }
+    let counts = alloc::end();
+    assert_eq!(
+        (counts.allocations, counts.reallocations),
+        (0, 0),
+        "{counts:?}"
+    );
+    assert_eq!(link.interval(), Duration::from_millis(39));
+}

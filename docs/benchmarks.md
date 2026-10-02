@@ -3592,3 +3592,75 @@ on the same schedules, are S-6's measurement.
 ```sh
 CARGO_BUILD_JOBS=4 bash scripts/gates.sh   # each binary's "finished in" line
 ```
+
+## hyper-sim's world against the harnesses (S-1, 2026-10-02)
+
+What a step of `hyper-sim`'s world costs against the harnesses it will replace (`docs/sim.md` §10,
+§12.7). Three workloads, each run on the replaced harness's own machinery and on the world, with
+the same process logic, the same draws a step and the same payloads:
+- **untimed**: hyper-raft's `tests/support` schedule. The harness's machinery is its multiply-shift
+  `Seeded`, a `Vec` network of 144-byte messages taken at a drawn index with `Vec::remove`, and the
+  oldest dropped at 2,048. The world runs it under the free discipline with `Random`. Each step
+  delivers one message and draws its loss, and the receiver sends one to a peer it draws, so the
+  messages in flight stay at the population.
+- **timed**: hyper-liveness's `tests/sim.rs` world. The harness's machinery is a `BinaryHeap` of
+  `(time, key)` with the events in a `BTreeMap`, a xorshift with `% span`, and each node's wake
+  found by a scan with its lateness drawn every turn. The world runs it under the ordered
+  discipline. Every node heartbeats every peer each 10 ms with the test's `LAN` delays, stalls and
+  loss, 64-byte payloads held inline.
+- **hyper-liveness**: the crate itself on its test's `Sim` (copied, its assertion records left out)
+  and on the world. Three nodes are configured, then a minute of virtual time is measured. It is
+  counted per heartbeat sent: the two schedules come from different generators and differ in steps
+  a heartbeat.
+
+Counted after a warm-up: time, allocations and reallocations by the counting allocator, and page
+faults by `getrusage`. The variants run in an order rotated by one each round, with the one-minute
+load average read before each round. Seven rounds, median and range. Apple M5 Max (Mac17,6), 18
+cores, macOS, rustc 1.98.0, release with LTO, hyper-raft `c4aea65` with S-1; load 22.6 from other
+work on the machine.
+
+| workload | ns a step | allocations | reallocations | page faults | the machinery's allocations and reallocations |
+|---|---|---|---|---|---|
+| untimed 16 in flight, hyper-raft's support | 29.2 (22.6-29.2) | 0.000 | 0.000 | 0.0000 | 0.0000 |
+| untimed 16 in flight, world (free) | 23.6 (22.1-23.8) | 0.000 | 0.000 | 0.0000 | 0.0000 |
+| untimed 256 in flight, hyper-raft's support | 235.6 (222.0-237.2) | 0.000 | 0.000 | 0.0000 | 0.0000 |
+| untimed 256 in flight, world (free) | 23.1 (21.1-23.8) | 0.000 | 0.000 | 0.0000 | 0.0000 |
+| untimed 2048 in flight, hyper-raft's support | 2677.0 (2656.7-2684.8) | 0.000 | 0.000 | 0.0000 | 0.0000 |
+| untimed 2048 in flight, world (free) | 26.0 (25.6-27.1) | 0.000 | 0.000 | 0.0000 | 0.0000 |
+| timed 3 nodes, hyper-liveness's sim | 14.8 (12.1-14.8) | 0.000 | 0.000 | 0.0000 | 0.0000 |
+| timed 3 nodes, world (ordered) | 22.0 (20.0-22.9) | 0.000 | 0.000 | 0.0000 | 0.0000 |
+| timed 8 nodes, hyper-liveness's sim | 34.4 (28.9-34.6) | 0.000 | 0.000 | 0.0000 | 0.0000 |
+| timed 8 nodes, world (ordered) | 33.2 (29.0-33.6) | 0.000 | 0.000 | 0.0000 | 0.0000 |
+| timed 64 nodes, hyper-liveness's sim | 135.2 (119.0-135.8) | 0.158 | 0.000 | 0.0000 | 0.0000 |
+| timed 64 nodes, world (ordered) | 45.5 (45.3-45.8) | 0.000 | 0.000 | 0.0000 | 0.0000 |
+| hyper-liveness 3 nodes a heartbeat, its sim | 553.1 (537.3-565.8) | 2.772 | 0.000 | 0.0000 | 0.0000 |
+| hyper-liveness 3 nodes a heartbeat, world (ordered) | 538.2 (524.2-546.2) | 2.848 | 0.000 | 0.0000 | 0.0000 |
+
+The last column counts the machinery's own calls apart (`alloc::aside` around every queue and world
+call). It is measured for the hyper-liveness pair; in the synthetic workloads every allocation is
+the machinery's.
+
+- **Untimed.** The world is flat in the messages in flight: 23 to 26 ns at 16, 256 and 2,048 against
+  29, 236 and 2,677. The harness's `Vec::remove` shifts the network behind the drawn message, about
+  1.3 ns a message in flight. Neither allocates a step.
+- **Timed.** The world is even at 8 nodes and three times faster at 64, where the harness's scan of
+  every node's wake is the step's cost and its `BTreeMap` allocates 0.16 times a step. At 3 nodes the
+  world costs 7 ns a step more (22.0 against 14.8). Taking each part out in turn and measuring
+  (5 rounds each, same load) attributes 3 ns to recording the trace (20.9 without it) and 2.4 ns to
+  the exact `below`'s two divisions (19.6 with a multiply-shift instead). The harness has neither a
+  trace nor exact draws. Before two changes the world cost 40.8 ns a step there: folding every
+  decision into the digest as it was made (now folded from the trace at the end, 25.2) and 128-bit
+  division in the node clocks (now `u64`, 22.8). An open item for S-2, when hyper-liveness's
+  simulation moves.
+- **hyper-liveness.** Even: 538 ns a heartbeat on the world against 553 on its harness, with
+  overlapping ranges, since the crate's own work is the step's cost. The machinery allocates nothing
+  on either. The totals differ (2.85 against 2.77 allocations a heartbeat) in the harness's own work
+  between the two schedules: the election law the harness runs every 100 ms of virtual time
+  allocates its peer lists. On the world it ran 533 times over configuration and the minute, and
+  the minute sent 3,846 heartbeats; on the harness it ran 513 times, and the minute sent 3,994.
+
+```sh
+cargo bench -p hyper-sim --bench step -- 7            # all workloads, seven rotated rounds
+cargo bench -p hyper-sim --bench step -- 5 "timed 3"  # one workload by name
+```
+

@@ -1,9 +1,12 @@
 # Simulation and checking: `hyper-sim` and `hyper-check`
 
-> Status (2026-10-02): **designed, not built.** Sources and what each establishes are in
-> `docs/research/sim.md`. The plan's starting point was mantle note 32 §3.10 and `docs/raft.md` §5;
-> this design keeps their list of pieces and departs from it where §1 below shows a piece falls
-> short. Steps S-1 to S-8 (§9) build it; nothing here has changed a test yet.
+> Status (2026-10-02): **S-1 built** (`crates/hyper-sim`: the generator and named streams, time and
+> node clocks, the world under both disciplines, the trace, the digest and the run-twice check; §12
+> records it as built and where it departs from this design). Its lints of §3.9 are prepared and
+> wait on the timing work's crates (§12.6). S-2 to S-8 are designed, not built. Sources and what each
+> establishes are in `docs/research/sim.md`. The plan's starting point was mantle note 32 §3.10 and
+> `docs/raft.md` §5; this design keeps their list of pieces and departs from it where §1 below shows
+> a piece falls short. No existing test has moved onto the world yet.
 
 The two crates are the test infrastructure every other crate here and every consumer runs its
 deterministic simulations and checks on. **`hyper-sim`** is the world under the test's control: time,
@@ -683,3 +686,126 @@ allocations in release are measured at S-6 with the same schedules. The table an
 8. **The time type.** Whether the sans-io crates should take time as nanoseconds rather than
    `std::time::Instant`, which removes the anchor of §3.2; it touches every crate's API and is the
    timing work's to decide.
+
+## 12. S-1 as built (2026-10-02)
+
+`crates/hyper-sim`, `std` only, held to the production lints, no `unsafe`; 23 tests (property tests
+among them) and the step benchmark (`benches/step.rs`). What §9 assigns S-1, and what was built:
+
+### 12.1 Randomness (§3.1)
+
+- `Seeded` is focal's `focal-sim` `Seeded` line for line: SplitMix64 (Steele, Lea and Flood, OOPSLA
+  2014) and `below` by redraw with `REDRAWS` = 64. A test holds it equal to a verbatim copy of
+  focal's draw for draw, over bounds 0 to `u64::MAX`, and at focal's fixture value.
+- A stream's first state is the SplitMix64 finalizer folded over the seed, the label's length and
+  bytes, the count of parts and each part. The length and the count make the encoding prefix-free.
+  A name given twice is refused (`DuplicateStream`), since two sources on one sequence would draw
+  each other's values.
+- The stream-independence test: a world with a new fault stream named first and drawn between
+  every other draw, and one link drawing more often, gives every other stream the same sequence.
+- Exactness: at bound 3·2⁶², where a bare remainder gives `[0, 2⁶²)` half the draws, the share
+  measured is a third.
+
+### 12.2 The trace and the digest (§3.1, §3.9)
+
+- Every draw with a bound of 2 or more is a decision: one `u32` word when the bound is at most 2³²,
+  two above. A bound of 0 or 1 is no decision and takes no word (a bound of 1 still advances its
+  stream, as focal's `below` does). A replay reads the words back. A word not below the bound asked
+  is `Diverged`, and a trace that runs out is `TraceEnded`.
+- The trace's room is the run's stated bound (`Limits::trace_words`), reserved when the world is
+  made. Decisions never allocate, and a bound the host cannot hold is refused before the run.
+- **Departure.** The digest folds each event the world runs (its time, node and kind) and each
+  observation as they happen. It folds the decisions once, from the trace, when the run finishes,
+  not as they are made. Folded inline they were a third of a decision's cost: the 3-node timed
+  workload went from 40.8 to 25.2 ns a step with the change. The digest still covers every decision,
+  and `twice` compares the traces word for word as well.
+- `twice(seed, run)` runs a seed twice and its first trace once, and refuses a run whose digest or
+  trace differs: `Twice::Seed` names the first word where the traces part, and `Twice::Replay`
+  catches a draw made outside the world. Tests hold both refusals, the first with state leaking
+  between runs and the second with a draw from the seed directly.
+
+### 12.3 Time and node clocks (§3.2)
+
+- Virtual time is `u64` nanoseconds. A node's monotonic clock is `offset + ⌊v · (10⁶ + rate) / 10⁶⌋`,
+  and `virtual_at` gives the first virtual time it reads a deadline, exactly. A property test checks
+  each against the formula in 128-bit arithmetic. Both are computed in `u64` by splitting at 10⁶ and
+  at the pace: the 128-bit division they first used cost the 3-node timed workload about 3 ns a
+  step (25.6 to 22.8 ns).
+- The wall clock is the monotonic clock moved to the node's epoch, and steps forward or back. A rate
+  at or below −10⁶ ppm is refused.
+- `instant(node)` is the anchor plus the node's monotonic reading. The anchor is the run's one host
+  clock read, taken when the world is made, and the one allowed `Instant::now` in the crate.
+
+### 12.4 The world, its events and its choice points (§3.3)
+
+- Events are a slab of payloads with their keys `(time, scheduling ordinal, node, slot)`. Under the
+  ordered discipline the keys sit in a binary heap; under the free discipline they sit in a dense
+  vector, any key taken by `swap_remove`. A switch moves the keys, once.
+- **A timer per node**, as a sans-io crate states its timer (`wake()`, `poll_timeout()`). The timers
+  sit in an indexed min-heap by `(time, node)`: re-arming moves one entry, a node holds one entry
+  for the whole run, and the bound is the node count. Lateness is drawn from the node's own stream
+  when the timer is armed. Setting the deadline a timer already has draws nothing, so a harness may
+  re-arm after every poll without moving the trace.
+- **Ordered**: the events and timers at the earliest time are the candidates. A lone one runs
+  without a choice, which is most steps. A tie goes to the strategy, events in scheduling order and
+  then timers in node order. **Free**: every pending event and every armed timer is a candidate, and
+  the clock moves to `max(now, at)`, never backward.
+- A `Strategy` is asked only when two or more candidates are enabled, and it draws through `Draw`,
+  from the world's `schedule` stream, into the trace. `Random` and `Fifo` are built. `Fifo` is
+  earliest due, events first, then send order, with no draw: focal's network order, for directed
+  tests. A strategy's out-of-range pick is refused, and nothing is taken.
+- `earliest()` and `advance(to)` serve a harness that runs until a time (hyper-liveness's
+  `run(until)`). Under the ordered discipline a jump past something due is refused (`Skips`).
+- Bounds (§7): events, nodes, streams, steps and trace words are each stated in `Limits` and
+  refused at their bound (`Full`, or `Step::Spent` for steps).
+- Not in S-1: processes and their adapter (§3.6), the observation sink beyond the digest (§4.1),
+  forks (§3.7, though `World` is `Clone` when its payload is). These come with S-2 to S-5.
+
+### 12.5 Determinism, enforced (§3.9)
+
+- **Run twice.** `twice` is the check. `scripts/check-contracts.py` refuses any test file that makes
+  a `hyper_sim` world and never calls `twice`, so every simulation ported from S-2 on runs its first
+  seed twice and its trace once. **Departure from §9's gate:** no existing simulation is ported at
+  S-1 (ports are S-2 and S-6), so the run-twice gate holds over the crate's own simulations: a token
+  ring of five nodes with drifting clocks, late timers, losses and per-link delays, 5,000 steps under
+  each discipline.
+- **No unordered iteration.** `check-contracts.py` also refuses `HashMap`, `HashSet` and
+  `RandomState` anywhere in `crates/hyper-sim` and `crates/hyper-check`.
+- **Miri.** CI's `miri` job runs `cargo miri test -p hyper-sim` on nightly-2026-09-05, with
+  proptest's failure file off so the tests touch no file system. It passed on the owner's machine in
+  9 min 20 s, with no undefined behaviour reported.
+
+### 12.6 The lints (§3.9), prepared and not yet landed
+
+`clippy.toml` gains `std::time::Instant::now`, `std::time::SystemTime::now`, `std::thread::spawn`
+and `std::env::var` as §3.9 states, and `std::thread::Builder::spawn` and `std::env::var_os`, the
+same acts by other names. **Departure:** the two extra methods. They fire at 209 sites. Each site
+outside the timing work's crates is allowed at its function, with the reason stated:
+- hyper-log's device, owner and threads (CLAUDE.md §1's exception), and hyper-block's issuer workers;
+- hyper-tokio's driver (the runtime adapter);
+- quinn-proto's default `TimeSource` and qlog start time, and rustls's `SSLKEYLOGFILE` (recorded in
+  each `VENDORED.md`);
+- the E2E crates, the real-process tests and the benchmarks;
+- tests taking an `Instant` epoch for an API whose `now` is an `Instant`;
+- hyper-raft's soaks reading their seed count.
+
+The remaining 41 sites are in `crates/hyper-durable` and `crates/hyper-durable-e2e`, which the
+timing step L-2 is changing, so the change is held as a patch to land after L-2. Among those sites,
+`tests/shell.rs`, `tests/hyperlog.rs` and `tests/threads.rs` drive the shell with `Instant::now()`
+at every turn, and `tests/support/cluster.rs` and `device.rs` take their epoch from it.
+
+### 12.7 Cost against the harnesses it replaces (§10)
+
+`docs/benchmarks.md`, "hyper-sim's world against the harnesses (S-1)". In brief, at load 22.6, in
+ns a step:
+
+| Workload | Replaced harness | World |
+|---|---|---|
+| hyper-raft's support, 16 / 256 / 2,048 messages in flight | 29 / 236 / 2,677 | 24 / 23 / 26 |
+| hyper-liveness's sim, 3 / 8 / 64 nodes | 14.8 / 34.4 / 135 | 22.0 / 33.2 / 45.5 |
+| hyper-liveness itself, 3 nodes, a heartbeat | 553 | 538 |
+
+The world allocates nothing a step in any workload. At three timed nodes it costs 7 ns a step more
+than hyper-liveness's harness: about 3 ns recording the trace and 2.4 ns the exact draws (measured
+by taking each out), neither of which that harness has. This is to be closed or justified when
+hyper-liveness's simulation moves at S-2.

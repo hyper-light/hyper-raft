@@ -24,6 +24,17 @@ jobs:
       - run: rustup show active-toolchain || rustup toolchain install
       - run: bash scripts/gates.sh
         shell: bash
+  miri:
+    # hyper-sim under Miri (docs/sim.md §9, S-1's gate): the crate has no `unsafe` and no platform
+    # code, so one OS suffices; Miri checks it keeps Rust's rules, and its isolation refuses the
+    # file, environment and entropy calls a simulation must not make inside a run.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      # Miri is nightly-only, so it is installed here and not in rust-toolchain.toml; this is the
+      # nightly the suite was run on (9 min 20 s on the owner's machine, 2026-10-02).
+      - run: rustup toolchain install nightly-2026-09-05 --component miri --profile minimal
+      - run: cargo +nightly-2026-09-05 miri test -p hyper-sim --locked
   model:
     # The core's TLA+ model (docs/models/README.md): every configuration that passes, each at
     # exactly the states it states, and every one the checker must refuse. TLC runs here only

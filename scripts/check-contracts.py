@@ -10,6 +10,11 @@
   including the ones a machine's clippy run did not compile.
 - Every `const` in a crate's `src/` outside a test module carries a `///` doc comment: its
   derivation or its citation (CLAUDE.md §1, "No arbitrary numbers").
+- The simulation crates (`hyper-sim`, and `hyper-check` when it lands) hold no `HashMap`,
+  `HashSet` or `RandomState`: their iteration order is seeded by the OS, which would make a run's
+  decisions depend on more than its seed (docs/sim.md §3.9).
+- Every test file that makes a `hyper_sim` world runs its first seed through `twice`, the
+  run-twice check (docs/sim.md §3.9): determinism is checked by every simulation, not trusted.
 """
 import pathlib
 from pathlib import PurePosixPath
@@ -154,6 +159,28 @@ def check_constants(rel, lines, test_files):
     return failures
 
 
+SIM_CRATES = ("crates/hyper-sim/", "crates/hyper-check/")
+UNORDERED = re.compile(r"\b(HashMap|HashSet|RandomState)\b")
+MAKES_WORLD = re.compile(r"\bWorld\s*(::\s*<[^>]*>\s*)?::\s*new\b")
+
+
+def check_simulation(rel, lines):
+    failures = []
+    text = "\n".join(code_of(line) for line in lines)
+    if rel.startswith(SIM_CRATES):
+        for n, line in enumerate(lines):
+            if UNORDERED.search(code_of(line)):
+                failures.append(
+                    f"{rel}:{n + 1}: an unordered map or set in a simulation crate (docs/sim.md §3.9)"
+                )
+    if re.match(r"crates/[^/]+/tests/", rel) and "hyper_sim" in text and MAKES_WORLD.search(text):
+        if not re.search(r"\btwice\s*\(", text):
+            failures.append(
+                f"{rel}: makes a hyper_sim world but never runs a seed through twice (docs/sim.md §3.9)"
+            )
+    return failures
+
+
 def main():
     failures = []
     all_sources = list(sources())
@@ -161,6 +188,7 @@ def main():
     for rel, lines in all_sources:
         failures.extend(check_unsafe(rel, lines))
         failures.extend(check_constants(rel, lines, test_files))
+        failures.extend(check_simulation(rel, lines))
     for rel in UNSAFE_ALLOWED:
         if not (ROOT / rel).exists():
             failures.append(f"{rel}: listed in UNSAFE_ALLOWED but missing")

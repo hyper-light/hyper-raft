@@ -746,6 +746,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "hyper-sim"
+version = "0.1.0"
+dependencies = [
+ "hyper-liveness",
+ "hyper-measure",
+ "hyper-timing",
+ "proptest",
+]
+
+[[package]]
 name = "hyper-swim"
 version = "0.1.0"
 dependencies = [

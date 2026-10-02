@@ -337,6 +337,25 @@ functions of `crates/hyper-raft` that perform it (`Hold`, `Take`, `FastCommit`, 
 `Replicate`, `Elect`, ...). That map is the `map` Gulcan et al.'s Algorithm 1 asks the developer to
 write.
 
+## 6a. The generator
+
+**[PR] Steele, Lea, Flood, "Fast Splittable Pseudorandom Number Generators", OOPSLA 2014,
+doi:10.1145/2714064.2660195.** SplitMix: a state advanced by an odd gamma and each output mixed.
+Read through its two primary-source implementations on 2026-10-02:
+- **[PS] OpenJDK `java.util.SplittableRandom`** (`openjdk/jdk` master). `GOLDEN_GAMMA` =
+  `0x9e3779b97f4a7c15`, "the golden ratio scaled to 64bits". `mix64` "computes Stafford variant 13
+  of 64bit mix function": shifts 30, 27 and 31, multipliers `0xbf58476d1ce4e5b9` and
+  `0x94d049bb133111eb`.
+- **[PS] Vigna, `splitmix64.c`** (<https://prng.di.unimi.it/splitmix64.c>, 2015). "A fixed-increment
+  version of Java 8's SplittableRandom generator", with the same constants and a citation of the
+  paper's DOI.
+
+These are the constants of focal's `Seeded`, of hyper-raft's and hyper-durable's harnesses and of
+`hyper-sim`. The finalizer is a bijection of `u64`, which `hyper-sim` uses to derive each stream's
+first state and to fold the digest. Two streams of one gamma overlap only if their first states
+differ by a small multiple of the gamma, so two streams of `L` draws each overlap with probability
+about `2L / 2⁶⁴` (inference from the construction, not a statement of the sources).
+
 ## 7. The projects' own evidence about their harnesses
 
 - **slates `docs/bugs/2026-09-25-simulated-parks-read-the-host-clock.md`** (slates `ec5e0df`): a

@@ -171,31 +171,41 @@ fn unavailability(link: &LinkBehaviour, costs: &Costs, eta: f64, alpha: f64) -> 
     detected / mtbf + election * beta(link.loss, variance, eta, alpha) / eta
 }
 
-/// The detector that minimizes a group's expected unavailability on `link`, with heartbeats no
-/// closer than `floor` (the timer granularity and the link's correlation time), searched to
-/// within `floor`. `None` when nothing can be configured: a link that loses every heartbeat, or a
-/// floor, MTBF or election time that is not a positive finite time.
-pub fn configure(link: &LinkBehaviour, costs: &Costs, floor: Duration) -> Option<Detector> {
-    let resolution = floor.as_secs_f64();
+/// The measured floors under a detector's interval (`docs/timing.md` §2.6).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Floors {
+    /// The timer's granularity `G`: how late a timed wait ends. The search's resolution too, as
+    /// nothing finer can be kept.
+    pub granularity: Duration,
+    /// The sender's stability floor, `E[flush] + G`: a sender that flushes before each heartbeat
+    /// cannot keep a shorter interval (Lindley's condition).
+    pub sender: Duration,
+    /// The link's correlation time `T_c`: heartbeats closer than this are late together, so a margin
+    /// holding two or more of them may count on Theorem 7's product only at `η ≥ T_c`.
+    pub correlation: Duration,
+}
+
+/// The detector that minimizes a group's expected unavailability on `link`, within `floors`.
+///
+/// Two regimes, the better kept. With one heartbeat in the margin (`α < η`) Theorem 7's product has
+/// one factor and assumes no independence, so `η` need only clear `G` and the sender's floor. With
+/// more, the heartbeats it multiplies must be independent, so `η ≥ T_c` as well. `None` when nothing
+/// can be configured: a link that loses every heartbeat, or a granularity, MTBF or election time that
+/// is not a positive finite time.
+pub fn configure(link: &LinkBehaviour, costs: &Costs, floors: &Floors) -> Option<Detector> {
+    let resolution = floors.granularity.as_secs_f64();
     let mtbf = costs.mtbf.as_secs_f64();
     let election = costs.election.as_secs_f64();
     if !(0.0..1.0).contains(&link.loss) || resolution <= 0.0 || mtbf <= 0.0 || election <= 0.0 {
         return None;
     }
-    // The best margin for an interval: `U ≥ α / MTBF`, so a margin past `MTBF · U(η, η)` costs
-    // more than any it could save.
-    let best_margin = |eta: f64| {
-        let high = mtbf * unavailability(link, costs, eta, eta);
-        minimize(0.0, high.max(eta), resolution, |alpha| {
-            unavailability(link, costs, eta, alpha)
-        })
-    };
-    // Likewise for the interval: `U ≥ η / MTBF`.
-    let (_, at_floor) = best_margin(resolution);
-    let high = (mtbf * at_floor).max(resolution);
-    let (eta, _) = minimize(resolution, high, resolution, |eta| best_margin(eta).1);
-    let eta = eta.max(resolution);
-    let (alpha, value) = best_margin(eta);
+    let base = resolution.max(floors.sender.as_secs_f64());
+    let independent = base.max(floors.correlation.as_secs_f64());
+    // One heartbeat in the margin: `α` below `η`.
+    let single = search(link, costs, resolution, base, true);
+    // Any margin, its heartbeats independent.
+    let any = search(link, costs, resolution, independent, false);
+    let (eta, alpha, value) = if single.2 <= any.2 { single } else { any };
     let variance = link.delay_deviation.as_secs_f64().powi(2);
     let beta = beta(link.loss, variance, eta, alpha);
     Some(Detector {
@@ -209,6 +219,38 @@ pub fn configure(link: &LinkBehaviour, costs: &Costs, floor: Duration) -> Option
         },
         unavailability: value,
     })
+}
+
+/// The interval at or above `floor` and its margin that minimize `U`, to within `resolution`: the
+/// interval, the margin and `U`. With `single`, the margin stays below the interval.
+fn search(
+    link: &LinkBehaviour,
+    costs: &Costs,
+    resolution: f64,
+    floor: f64,
+    single: bool,
+) -> (f64, f64, f64) {
+    let mtbf = costs.mtbf.as_secs_f64();
+    // The best margin for an interval: `U ≥ α / MTBF`, so a margin past `MTBF · U(η, η)` costs more
+    // than any it could save.
+    let best_margin = |eta: f64| {
+        let high = (mtbf * unavailability(link, costs, eta, eta)).max(eta);
+        let high = if single {
+            (eta - resolution).max(0.0)
+        } else {
+            high
+        };
+        minimize(0.0, high, resolution, |alpha| {
+            unavailability(link, costs, eta, alpha)
+        })
+    };
+    // Likewise for the interval: `U ≥ η / MTBF`.
+    let (_, at_floor) = best_margin(floor);
+    let high = (mtbf * at_floor).max(floor);
+    let (eta, _) = minimize(floor, high, resolution, |eta| best_margin(eta).1);
+    let eta = eta.max(floor);
+    let (alpha, value) = best_margin(eta);
+    (eta, alpha, value)
 }
 
 /// `Pr(Binomial(trials, p) ≥ at_least)`.
@@ -400,7 +442,12 @@ mod tests {
             election: ms(10.0),
             mtbf: Duration::from_secs(30 * 24 * 3600),
         };
-        let found = configure(&link, &monthly, floor).unwrap();
+        let floors = Floors {
+            granularity: floor,
+            sender: floor,
+            correlation: floor,
+        };
+        let found = configure(&link, &monthly, &floors).unwrap();
         // It does at least as well as the neighbours of its choice.
         let u = |eta: f64, alpha: f64| unavailability(&link, &monthly, eta, alpha);
         let (eta, alpha) = (found.interval.as_secs_f64(), found.margin.as_secs_f64());
@@ -415,8 +462,51 @@ mod tests {
             mtbf: Duration::from_secs(24 * 3600),
             ..monthly
         };
-        let sooner = configure(&link, &daily, floor).unwrap();
+        let sooner = configure(&link, &daily, &floors).unwrap();
         assert!(sooner.detection <= found.detection);
+    }
+
+    #[test]
+    fn heartbeats_counted_together_are_a_correlation_time_apart() {
+        // A link with a heavy tail, as the traces measured on a flushing macOS link (mean 7 ms,
+        // deviation 10.8 ms), and correlation times from none to past any useful interval.
+        let link = LinkBehaviour {
+            loss: 0.0005,
+            mean_delay: ms(7.0),
+            delay_deviation: ms(10.8),
+        };
+        let costs = Costs {
+            election: ms(5.7),
+            mtbf: Duration::from_secs(30 * 24 * 3600),
+        };
+        for correlation in [0.0, 50.0, 200.0, 2_000.0, 60_000.0] {
+            let floors = Floors {
+                granularity: ms(1.6),
+                sender: ms(7.0),
+                correlation: ms(correlation),
+            };
+            let found = configure(&link, &costs, &floors).unwrap();
+            assert!(
+                found.margin < found.interval || found.interval >= floors.correlation,
+                "T_c {correlation} ms: {found:?}"
+            );
+            assert!(found.interval >= floors.sender && found.interval >= floors.granularity);
+        }
+        // With no correlation the floors alone bind, and a correlation time can only cost.
+        let free = Floors {
+            granularity: ms(1.6),
+            sender: ms(7.0),
+            correlation: Duration::ZERO,
+        };
+        let bound = Floors {
+            correlation: ms(200.0),
+            ..free
+        };
+        let (a, b) = (
+            configure(&link, &costs, &free).unwrap(),
+            configure(&link, &costs, &bound).unwrap(),
+        );
+        assert!(a.unavailability <= b.unavailability);
     }
 
     #[test]
@@ -430,8 +520,17 @@ mod tests {
             mean_delay: ms(1.0),
             delay_deviation: ms(1.0),
         };
-        assert_eq!(configure(&dead, &costs, ms(1.0)), None);
+        let floors = Floors {
+            granularity: ms(1.0),
+            sender: ms(1.0),
+            correlation: ms(1.0),
+        };
+        assert_eq!(configure(&dead, &costs, &floors), None);
         let link = LinkBehaviour { loss: 0.0, ..dead };
-        assert_eq!(configure(&link, &costs, Duration::ZERO), None);
+        let zero = Floors {
+            granularity: Duration::ZERO,
+            ..floors
+        };
+        assert_eq!(configure(&link, &costs, &zero), None);
     }
 }

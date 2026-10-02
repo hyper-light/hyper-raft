@@ -18,7 +18,7 @@ use std::io;
 use std::path::Path;
 use std::time::Duration;
 
-use hyper_timing::{Costs, LinkBehaviour, configure, election_span};
+use hyper_timing::{Costs, Floors, LinkBehaviour, configure, election_span};
 
 use crate::{HEARTBEAT_BYTES, WAIT_BYTES};
 
@@ -918,6 +918,11 @@ pub fn main(dirs: &[String]) -> io::Result<()> {
         let floor = Duration::from_secs_f64(floor_ns / 1e9);
         let base_floor = Duration::from_secs_f64(g.max(lindley) / 1e9);
         let resolution = Duration::from_secs_f64(g / 1e9);
+        let floors = Floors {
+            granularity: resolution,
+            sender: base_floor,
+            correlation: Duration::from_secs_f64(t_c / 1e9),
+        };
         // A vote travels as a heartbeat does from send to read, and its voter persists the vote
         // before answering (Raft §3.4 / Figure 2): one way, and a round of two ways and a flush.
         let deliver = s_net.mean + s_gap.mean;
@@ -1011,17 +1016,9 @@ pub fn main(dirs: &[String]) -> io::Result<()> {
                     election,
                     mtbf: Duration::from_secs(mtbf),
                 };
-                // Theorem 7's product needs the heartbeats inside the margin independent: a margin
-                // under one interval holds one, else the interval is at least the correlation time.
-                let Some(mut det) = configure(&link, &costs, base_floor) else {
+                let Some(det) = configure(&link, &costs, &floors) else {
                     continue;
                 };
-                if det.margin >= det.interval && det.interval < floor {
-                    let Some(again) = configure(&link, &costs, floor) else {
-                        continue;
-                    };
-                    det = again;
-                }
                 let stride = ((det.interval.as_nanos() as f64 / eta).round() as u64).max(1);
                 let (window, n_g_at, n_allan_at) = window_parts(&trace, stride, g);
                 let (mistakes, suspected, replayed, points) = replay(

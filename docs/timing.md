@@ -267,8 +267,10 @@ numbers.
 
 - **L-1** in `hyper-timing`, sans-io (in part: `qos.rs` holds the Theorem 7 bound, the configurator
   and the split-vote span, each checked against a brute-force search and the split probability
-  against a Monte Carlo; the traces settled the estimator's inputs, window and floors (§2.6), which
-  it is still to implement, and the first variance stays open): the NFD-E estimator as a
+  against a Monte Carlo; the configurator takes the measured floors (`Floors`: `G`, `E[flush] + G`,
+  `T_c`) and searches both regimes, one heartbeat in the margin at the base floors and any margin at
+  `η ≥ T_c`, keeping the better; the estimator the traces specified (§2.6) is still to implement,
+  and the first variance stays open): the NFD-E estimator as a
   `PathEstimate` over mean and variance with the window `min(n_G, n_A)`, the floors `G` and
   `E[flush] + G` and the independence rule `η ≥ T_c` when `α ≥ η`, the Theorem 7 bounds, the
   configurator minimizing `U`, the split-vote model and `W` replacing `ELECTION_MARGIN`'s base and

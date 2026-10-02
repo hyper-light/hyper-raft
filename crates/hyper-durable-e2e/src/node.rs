@@ -468,24 +468,26 @@ impl Node {
     }
 
     /// Waits for a datagram until `until` on the member's clock, or for one however long when
-    /// nothing is due, then takes what else has arrived, at most a turn's worth (hyper-raft-e2e's
-    /// `receive_until`).
+    /// nothing is due, then takes it and what else has arrived, at most a turn's worth
+    /// (hyper-raft-e2e's `receive_until`). The wait is a peek, and every datagram is taken without
+    /// waiting: a receive that waits can lose what arrives as it times out (`wire::arrives`).
     fn receive_until(&mut self, until: Option<u64>) -> Result<(), NodeError> {
-        let wait = until.map(|at| Duration::from_nanos(at.saturating_sub(self.now())));
-        if wait.is_none_or(|wait| !wait.is_zero()) {
-            self.socket.set_read_timeout(wait)?;
-            if !self.receive_one()? {
-                return Ok(());
-            }
-        }
-        self.socket.set_nonblocking(true)?;
         let turn = self
             .settings
             .max_pending
             .saturating_add(self.settings.voters.len())
             .saturating_add(1);
+        let mut most = turn;
+        let wait = until.map(|at| Duration::from_nanos(at.saturating_sub(self.now())));
+        if wait.is_none_or(|wait| !wait.is_zero()) {
+            most = turn.saturating_add(1);
+            if !wire::arrives(&self.socket, wait, &mut self.received)? {
+                return Ok(());
+            }
+        }
+        self.socket.set_nonblocking(true)?;
         let mut outcome = Ok(());
-        for _ in 0..turn {
+        for _ in 0..most {
             match self.receive_one() {
                 Ok(true) => {}
                 Ok(false) => break,

@@ -860,7 +860,12 @@ protocol's: a member passes each durability point at least once for each turn of
 many answered writes is a failure. New scenarios: a stalled disk (the member's file stops
 completing flushes, so its heartbeats stop; every other member suspects it and the group elects
 without it) and, at every restart, every member that heard the last run and shares a group with
-the restarted one reports the restart its stream saw. The member's shell writes its commit alone at
+the restarted one reports the restart its stream saw. A member waits for its datagrams by a peek and
+takes them without waiting, for a receive that times out on Windows can lose the datagram arriving
+as it does, which lost the test's asks on the windows-11-arm runner (`docs/raft.md`, "The harness's
+receive"). A wait that gives up prints each member's last report (its suspicions, the peers heard,
+its unjudged pairs, heartbeats taken, stated detection, span and round) with the quiet period in
+force. The member's shell writes its commit alone at
 the first moment no write is out (`Settings::quiet` zero): an owner woken by events has no period.
 Measured in `docs/benchmarks.md`, "hyper-durable-e2e on its own detectors".
 

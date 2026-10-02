@@ -142,10 +142,26 @@ impl Wire {
             .timeout()
             .map_or(now + IDLE_TURN, |due| due.min(now + IDLE_TURN));
         let wait = until.saturating_duration_since(now);
+        let mut most = DRAIN;
         if !wait.is_zero() {
             self.socket.set_nonblocking(false).unwrap();
             self.socket.set_read_timeout(Some(wait)).unwrap();
-            if self.receive(endpoint, 1) == 0 {
+            // The wait is a peek and the datagram is taken with the rest: on Windows a receive
+            // that times out can lose the datagram that arrives as it times out (`setsockopt`,
+            // `SO_RCVTIMEO`; hyper-raft's `docs/raft.md`, "The harness's receive").
+            let arrived = match self.socket.peek_from(&mut self.buffer) {
+                Ok(_) => true,
+                Err(error)
+                    if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) =>
+                {
+                    false
+                }
+                // A reset and the like: what else arrived is still to be taken.
+                Err(_) => true,
+            };
+            if arrived {
+                most = DRAIN.saturating_add(1);
+            } else {
                 // The wait ran to its end: how late it ended is the timer's granularity.
                 let nanos = |at: Instant| (at - self.epoch).as_nanos() as u64;
                 let _ = self.late.on_wait(nanos(until), nanos(Instant::now()));
@@ -155,7 +171,7 @@ impl Wire {
             }
         }
         self.socket.set_nonblocking(true).unwrap();
-        self.receive(endpoint, DRAIN);
+        self.receive(endpoint, most);
         let now = Instant::now();
         if endpoint.timeout().is_some_and(|due| due <= now) {
             endpoint.fire(now);

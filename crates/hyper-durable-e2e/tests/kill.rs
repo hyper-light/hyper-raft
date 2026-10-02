@@ -44,7 +44,7 @@
 )]
 
 use std::collections::BTreeMap;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, ErrorKind};
 use std::net::{SocketAddr, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitCode, Stdio};
@@ -103,6 +103,8 @@ struct Cluster {
     /// What each member's latest report says its law takes: its stated detection, its election's
     /// span and rounds, and an ask's rounds.
     law: BTreeMap<u64, Duration>,
+    /// Each member's latest report and when it came: what a failed wait prints.
+    last: BTreeMap<u64, (Instant, Report)>,
     test: UdpSocket,
     datagram: usize,
     next_id: u64,
@@ -188,6 +190,7 @@ impl Cluster {
             members,
             voters: ids,
             law: BTreeMap::new(),
+            last: BTreeMap::new(),
             test,
             datagram,
             next_id: 0,
@@ -239,9 +242,22 @@ impl Cluster {
             if left.is_zero() {
                 return None;
             }
-            self.test.set_read_timeout(Some(left)).unwrap();
-            let Ok((length, _)) = self.test.recv_from(&mut received) else {
+            // Waited for by a peek, taken without waiting (`wire::arrives`). A reset is an
+            // earlier send's, to a member gone (Windows reports it on the next receive).
+            if !wire::arrives(&self.test, Some(left), &mut received).unwrap() {
                 return None;
+            }
+            let length = match wire::take(&self.test, &mut received) {
+                Ok((length, _)) => length,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        ErrorKind::ConnectionReset | ErrorKind::WouldBlock
+                    ) =>
+                {
+                    continue;
+                }
+                Err(error) => panic!("{}: the test's socket: {error}", self.name),
             };
             let Some((Kind::Response, body)) = wire::open(&received[..length]) else {
                 continue;
@@ -269,6 +285,10 @@ impl Cluster {
         wire::read_response(&body).map(|(_, outcome)| outcome)
     }
 
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "real processes on the host's clock, threads and environment (CLAUDE.md §1a, end to end)"
+    )]
     fn report(&mut self, id: u64) -> Option<Report> {
         self.next_id += 1;
         let ask = self.next_id;
@@ -276,7 +296,41 @@ impl Cluster {
         let body = self.exchange(id, ask)?;
         let report = control::read_report(&body, hyper_raft::MAX_MEMBERS).map(|(_, r)| r)?;
         self.heard_law(id, &report);
+        self.last.insert(id, (Instant::now(), report.clone()));
         Some(report)
+    }
+
+    /// What a failed wait saw: each member's latest report, how long ago it came, and the quiet
+    /// period in force.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "real processes on the host's clock, threads and environment (CLAUDE.md §1a, end to end)"
+    )]
+    fn state(&self) -> String {
+        let mut out = format!("quiet {:?}", self.quiet());
+        for (id, (at, r)) in &self.last {
+            let s = &r.status;
+            out.push_str(&format!(
+                "\n  member {id}, {:?} ago: term {} leads {} commit {} applied {} last {}; \
+                 suspected {:?} heard {:?} unjudged {} taken {} restarts {}; detection {:?} \
+                 span {:?} round {:?}",
+                at.elapsed(),
+                s.term,
+                s.leads,
+                s.commit,
+                s.applied,
+                s.last_index,
+                r.suspected,
+                r.heard,
+                r.unjudged,
+                r.taken,
+                r.restarts,
+                Duration::from_nanos(r.detection_ns),
+                Duration::from_nanos(r.span_ns),
+                Duration::from_nanos(r.round_ns),
+            ));
+        }
+        out
     }
 
     /// Tells every member up where the others listen, sent again each retransmission timeout until
@@ -496,6 +550,7 @@ impl Cluster {
         member.lines = None;
         self.stopped.retain(|&stopped| stopped != id);
         self.law.remove(&id);
+        self.last.remove(&id);
     }
 
     /// The exit status of a member that fenced and exited, once it printed `fenced` within
@@ -506,6 +561,7 @@ impl Cluster {
         let status = member.child.take()?.wait().ok()?;
         member.lines = None;
         self.law.remove(&id);
+        self.last.remove(&id);
         status.code()
     }
 
@@ -550,7 +606,8 @@ impl Cluster {
         });
         assert!(
             seen,
-            "{name}: a member's stream never reported {id}'s restart"
+            "{name}: a member's stream never reported {id}'s restart; {}",
+            self.state()
         );
     }
 
@@ -590,7 +647,8 @@ impl Cluster {
         });
         assert!(
             caught,
-            "{name}: members stopped moving before they caught up to {index}"
+            "{name}: members stopped moving before they caught up to {index}; {}",
+            self.state()
         );
     }
 
@@ -600,8 +658,9 @@ impl Cluster {
             assert!(
                 self.put(key.as_bytes(), format!("v{i}").as_bytes())
                     .is_some(),
-                "{}: a write was never answered",
-                self.name
+                "{}: a write was never answered; {}",
+                self.name,
+                self.state()
             );
         }
     }
@@ -690,7 +749,8 @@ fn stalled_disk(leader: bool) {
     });
     assert!(
         suspected,
-        "{name}: the stalled member was not suspected by every other"
+        "{name}: the stalled member was not suspected by every other; {}",
+        cluster.state()
     );
     cluster.write_some("while-stalled", WRITES);
     cluster.kill(target);
@@ -733,7 +793,8 @@ fn founder() {
     });
     assert!(
         alone,
-        "the founder stopped moving without electing itself after the kill"
+        "the founder stopped moving without electing itself after the kill; {}",
+        cluster.state()
     );
     cluster.write_some("alone", WRITES);
     cluster.verify();
@@ -780,7 +841,8 @@ fn founder_fenced() {
         }
         assert!(
             cluster.moving(&mut watch),
-            "the group stopped moving without finishing the removal after the kill"
+            "the group stopped moving without finishing the removal after the kill; {}",
+            cluster.state()
         );
     }
     cluster.kill(peer);

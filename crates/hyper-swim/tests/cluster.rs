@@ -33,7 +33,7 @@
 )]
 
 use std::collections::BTreeMap;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, ErrorKind, Write};
 use std::net::UdpSocket;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -260,7 +260,20 @@ impl Member {
             None => None,
         };
         self.socket.set_read_timeout(timeout).unwrap();
-        let Ok((length, _)) = self.socket.recv_from(&mut self.buffer) else {
+        // Waited for by a peek and taken once there: on Windows a receive that times out can lose
+        // the datagram that arrives as it times out (`setsockopt`, `SO_RCVTIMEO`; `docs/raft.md`,
+        // "The harness's receive"), which this detector would count as a heartbeat lost.
+        // A peek leaves a reset in place, so whatever it found is taken by a receive that does not
+        // wait, which clears it.
+        if let Err(error) = self.socket.peek_from(&mut self.buffer)
+            && matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut)
+        {
+            return;
+        }
+        self.socket.set_nonblocking(true).unwrap();
+        let taken = self.socket.recv_from(&mut self.buffer);
+        self.socket.set_nonblocking(false).unwrap();
+        let Ok((length, _)) = taken else {
             return;
         };
         let stamp = self.now();

@@ -348,6 +348,31 @@ rewritten without its lock and with its `unsafe` listed in the contract script; 
 `hyper-raft-compare` measures this crate against each core it replaces, and `hyper-raft-e2e` runs it
 as real processes (`docs/benchmarks.md`).
 
+**The harness's receive.** A member of `hyper-raft-e2e` or `hyper-durable-e2e`, and each test that
+asks one, waits for a datagram by peeking with a timeout (`wire::arrives`) and takes what the peek
+found without waiting; it never waits in a receive. On Windows a receive that times out can lose the
+datagram that arrives as it times out. Microsoft's `setsockopt` reference says of `SO_RCVTIMEO`: "If
+a blocking receive call times out, the socket is left in an indeterminate state, and should not be
+used; TCP sockets in this state have a potential for data loss, since the operation could be
+canceled at the same moment the operation was to be completed." Measured on GitHub's windows-11-arm
+runner (2026-10-02, 20,000 numbered datagrams a run, each sent at a random moment and acknowledged,
+the receiver waiting a millisecond at a time): the receive lost 46 and 19 of them, 65 of 40,000 over
+4,664 waits that timed out; the peek lost none of 40,000 over 3,799. ubuntu-24.04-arm lost none
+either way (20,023 and 20,062 timeouts), and windows-2025, whose waits of a millisecond never timed
+out before the next datagram came, none. In `hyper-durable-e2e` the receive lost the test's asks:
+each one lost cost the test its whole retransmission timeout, one second, which is its quiet period
+at the start of a scenario, so the wait gave up while the members moved (the stall scenarios failed
+18 of 26 runs there, and the members' records of the asks they took showed that no timed-out ask had
+reached its member); it lost heartbeats, wakes and Raft messages too. A peek takes no error either:
+after a send to a closed port, both Windows runners' peeks reported the reset three times in a row,
+and the receive after it took it, the next receive finding nothing; so whatever the peek found, a
+datagram or an error, is taken by a receive that does not wait (`wire::take`), never by peeking
+again (a first form of this change peeked again, and spun on the reset to the end of each wait: on
+both Windows runners the E2E did not finish within fifteen minutes once a member had exited).
+`tests/arrives.rs` holds the wait to losing no datagram and to taking a reset and the datagram
+behind it. The tests of `hyper-transport` and `hyper-swim` that drive real sockets wait the same
+way.
+
 The simulation and the checks are two crates, designed in `docs/sim.md` (sources in
 `docs/research/sim.md`), not yet built:
 - **`hyper-sim`**, the world under a test's control: one seeded generator with a stream per source,

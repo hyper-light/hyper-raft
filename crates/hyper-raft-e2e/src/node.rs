@@ -308,22 +308,26 @@ impl Node {
         reason = "real processes on the host's clock, threads and environment (CLAUDE.md §1a, end to end)"
     )]
     pub fn receive_until(&mut self, until: Instant) -> Result<(), NodeError> {
-        let wait = until.saturating_duration_since(Instant::now());
-        if !wait.is_zero() {
-            self.socket.set_read_timeout(Some(wait))?;
-            if !self.receive_one()? {
-                return Ok(());
-            }
-        }
-        self.socket.set_nonblocking(true)?;
         // A turn takes as many datagrams as the member has voters to hear from and askers to
-        // answer, so that one busy peer never holds the others' answers back past a turn.
+        // answer, so that one busy peer never holds the others' answers back past a turn; and the
+        // one it waited for, when it waited.
         let turn = self
             .settings
             .max_pending
             .saturating_add(self.settings.voters.len());
+        let mut most = turn;
+        let wait = until.saturating_duration_since(Instant::now());
+        if !wait.is_zero() {
+            most = turn.saturating_add(1);
+            if !wire::arrives(&self.socket, Some(wait), &mut self.received)? {
+                return Ok(());
+            }
+        }
+        // The datagram waited for is taken with the rest, none of them waited on: a receive that
+        // waits can lose what arrives as it times out (`wire::arrives`).
+        self.socket.set_nonblocking(true)?;
         let mut outcome = Ok(());
-        for _ in 0..turn {
+        for _ in 0..most {
             match self.receive_one() {
                 Ok(true) => {}
                 Ok(false) => break,
@@ -337,7 +341,7 @@ impl Node {
         outcome
     }
 
-    /// One datagram, if one arrives in time; false when none did.
+    /// One datagram, if one is there; false when none is.
     fn receive_one(&mut self) -> Result<bool, NodeError> {
         let (length, from) = match self.socket.recv_from(&mut self.received) {
             Ok(received) => received,

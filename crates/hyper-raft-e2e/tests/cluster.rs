@@ -324,19 +324,19 @@ impl Cluster {
             if wait.is_zero() {
                 return None;
             }
-            self.test.set_read_timeout(Some(wait)).unwrap();
-            let length = match self.test.recv_from(&mut received) {
+            // Waited for by a peek, taken without waiting (`wire::arrives`).
+            if !wire::arrives(&self.test, Some(wait), &mut received).unwrap() {
+                return None;
+            }
+            let length = match wire::take(&self.test, &mut received) {
                 Ok((length, _)) => length,
                 Err(error)
                     if matches!(
                         error.kind(),
-                        ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::ConnectionReset
+                        ErrorKind::ConnectionReset | ErrorKind::WouldBlock
                     ) =>
                 {
-                    if error.kind() == ErrorKind::ConnectionReset {
-                        continue;
-                    }
-                    return None;
+                    continue;
                 }
                 Err(error) => panic!("the test's socket: {error}"),
             };

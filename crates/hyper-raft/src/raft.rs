@@ -231,6 +231,9 @@ pub struct Config {
     pub apply_unpersisted: bool,
     /// What starts elections ([`Elections`]).
     pub elections: Elections,
+    /// What storage found the log to lack when the member opened ([`Lost`]); none for a whole
+    /// log. The member keeps it until its durable log holds what it marks.
+    pub lost: Option<Lost>,
     /// What the election timeouts are drawn from.
     pub seed: u64,
     /// The bounds of what grows.
@@ -261,6 +264,7 @@ impl Config {
             skip_bcast_commit: false,
             apply_unpersisted: false,
             elections: Elections::Ticks,
+            lost: None,
             seed: id,
             limits: Limits::default(),
         }
@@ -338,6 +342,31 @@ pub struct FastStats {
     pub committed: u64,
     /// Entries this member took at its election from what the voters held.
     pub recovered: u64,
+}
+
+/// What a member's log may lack: entries it acknowledged and lost at rest, through `index`, of
+/// terms up to `term` (`docs/durable.md` §5). It is what its store found when it opened:
+/// hyper-log's uncertainty mark, a lost last frame whose persist record survived (Protocol-Aware
+/// Recovery's faulty entry, Alagappan et al., FAST 2018, §3.3.3). While it lasts the member is
+/// held by what it acknowledged, not by its shorter log: it judges votes by the mark, and tells a
+/// leader that counts the entries that it lost them (core step R-5).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Lost {
+    /// The highest index the log may lack.
+    pub index: u64,
+    /// The highest term an entry it lacks may be of.
+    pub term: u64,
+}
+impl Lost {
+    /// Whether a durable log whose last entry is `index`, of `term`, holds again what the mark
+    /// says it may lack: past the mark's index it holds those entries, received again; with an
+    /// entry of a later term, from a leader, it matches that leader's log through that entry,
+    /// and that leader's log holds every entry committed in the mark's terms (Leader
+    /// Completeness), all before it since terms never fall along a log. hyper-log's rule
+    /// (`resolves`, mantle `docs/design/raft-log.md` §6).
+    pub fn resolved_by(self, index: u64, term: u64) -> bool {
+        index >= self.index || term > self.term
+    }
 }
 
 /// What a member is in its group.
@@ -432,6 +461,8 @@ pub struct Raft<S> {
     /// with. Its answers state no more when they leave
     /// (`RawNode::durable_commit`).
     pub(crate) durable_commit: u64,
+    /// What this member's durable log may lack of what it acknowledged ([`Lost`]).
+    lost: Option<Lost>,
     /// The leader told this member to campaign, and it could not yet: a
     /// change it has committed is not applied. It campaigns once it is,
     /// unless it has heard of a leader or a term since.
@@ -864,6 +895,7 @@ impl<S: Storage> Raft<S> {
             priority_in_force: 0,
             promotable: false,
             durable_commit: 0,
+            lost: config.lost,
             told_to_campaign: false,
             log,
             tracker,
@@ -897,6 +929,7 @@ impl<S: Storage> Raft<S> {
                 raft.held.hold(held, true, false)?;
             }
         }
+        raft.settle_lost()?;
         let term = raft.term;
         raft.become_follower(term, 0)?;
         if let Some(watch) = raft.watch.as_mut() {
@@ -1012,6 +1045,44 @@ impl<S: Storage> Raft<S> {
     }
     /// A write stating `commit` is durable. The durable commit never goes
     /// back.
+    /// What this member's durable log may lack of what it acknowledged; none once it holds it.
+    pub fn lost(&self) -> Option<Lost> {
+        self.lost
+    }
+    /// The mark ends once the durable log holds what it marks ([`Lost::resolved_by`]): read
+    /// at open and at every notice, from storage, which holds what is durable.
+    #[inline]
+    pub(crate) fn settle_lost(&mut self) -> Result<()> {
+        match self.lost {
+            None => Ok(()),
+            Some(lost) => self.end_lost(lost),
+        }
+    }
+    fn end_lost(&mut self, lost: Lost) -> Result<()> {
+        let store = self.log.store();
+        let last = store.last_index()?;
+        if lost.resolved_by(last, store.term(last)?) {
+            self.lost = None;
+        }
+        Ok(())
+    }
+    /// Whether this member may campaign as far as what it lost goes: not
+    /// while its log may lack entries it acknowledged, for a log that
+    /// short could lead without an entry it helped commit (mantle's rule,
+    /// `docs/durable.md` §5).
+    fn may_campaign(&self) -> bool {
+        self.lost.is_none()
+    }
+    /// The last entry this member answers for in an election, `(index, term)`: its log's last,
+    /// or what it marks lost, which is later (`docs/durable.md` §5). It may have acknowledged
+    /// through the mark, and been counted toward a commit there, so it votes for no log behind
+    /// it.
+    fn claim(&self) -> Result<(u64, u64)> {
+        match self.lost {
+            Some(lost) => Ok((lost.index, lost.term)),
+            None => Ok((self.log.last_index()?, self.log.last_term()?)),
+        }
+    }
     pub(crate) fn commit_durable(&mut self, commit: u64) {
         self.durable_commit = self.durable_commit.max(commit);
     }
@@ -1759,7 +1830,8 @@ impl<S: Storage> Raft<S> {
     /// detectors leave it no quorum, or on ticks.
     pub fn deadline(&self) -> Option<u64> {
         let watch = self.watch.as_ref()?;
-        let campaigns = self.promotable && !watch.held && self.trusted_quorum();
+        let campaigns =
+            self.promotable && !watch.held && self.may_campaign() && self.trusted_quorum();
         let campaign = if campaigns || (watch.led == self.term && self.term != 0) {
             Watch::due(watch.campaign)
         } else {
@@ -1863,6 +1935,7 @@ impl<S: Storage> Raft<S> {
     }
     fn wake_follower(&mut self, now: u64) -> Result<bool> {
         let (promotable, local, term) = (self.promotable, self.config.seed, self.term);
+        let may = self.may_campaign();
         let alone = self.tracker.is_singleton() && self.tracker.configuration().votes(self.id);
         let quorum = self.trusted_quorum();
         let trusts = self
@@ -1903,7 +1976,7 @@ impl<S: Storage> Raft<S> {
         if !due {
             return Ok(false);
         }
-        let campaigns = promotable && quorum && !watch.held;
+        let campaigns = promotable && quorum && may && !watch.held;
         if !campaigns {
             if !led {
                 return Ok(false);
@@ -2096,6 +2169,12 @@ impl<S: Storage> Raft<S> {
         if !self.promotable {
             return Err(Error::NotPromotable);
         }
+        if !self.may_campaign() {
+            // Its leader is gone, or it would not be asked: it holds no
+            // lease on one.
+            self.leader_id = 0;
+            return Err(Error::Lost);
+        }
         // A member does not campaign on a configuration it has not
         // applied.
         if self.change_unapplied()? {
@@ -2280,7 +2359,8 @@ impl<S: Storage> Raft<S> {
         // judges a transfer, which is a decision that a member shall lead.
         let transfer =
             kind == MessageType::MsgRequestVote && message.context.as_slice() == CAMPAIGN_TRANSFER;
-        let (last_index, last_term) = (self.log.last_index()?, self.log.last_term()?);
+        // Judged against what this member answers for: its log, or what it marks lost.
+        let (last_index, last_term) = self.claim()?;
         let ahead = match self.config.precedence {
             Precedence::Log => {
                 message.log_term > last_term
@@ -2288,8 +2368,21 @@ impl<S: Storage> Raft<S> {
             }
             Precedence::Length => message.index > last_index,
         };
-        let ranked = transfer || ahead || self.priority_in_force <= priority_of(message);
-        if can_vote && ranked && self.log.is_up_to_date(message.index, message.log_term)? {
+        // A member whose log may lack what it acknowledged refuses no one
+        // for priority: a voter that refuses for priority must be one the
+        // group could elect instead (`Precedence::Log`), and a marked member
+        // may not be (a schedule, seed 560, found one of the highest
+        // priority refusing every candidate it was not behind). Judged
+        // here, where votes are, and not settled on every operation.
+        let priority = if self.lost.is_some() {
+            0
+        } else {
+            self.priority_in_force
+        };
+        let ranked = transfer || ahead || priority <= priority_of(message);
+        let current = message.log_term > last_term
+            || (message.log_term == last_term && message.index >= last_index);
+        if can_vote && ranked && current {
             // With the asker's term: the member's own is behind it when
             // it is asked about a term to come, and the asker drops what
             // is behind.
@@ -2516,17 +2609,55 @@ impl<S: Storage> Raft<S> {
         }
         Ok(())
     }
+    /// A member says it lost entries it acknowledged (core step R-5): if
+    /// this leader counts them, its progress goes back to the last entry
+    /// the member holds and the entries after it are sent again, not a
+    /// snapshot. True when it did. Lowering a member's match revokes no
+    /// commit (the commit never goes back, and the entries are this
+    /// leader's), so a word that is false costs resends and nothing else.
+    fn take_lost(&mut self, message: &Message) -> Result<bool> {
+        let held = message.reject_hint;
+
+        if self
+            .tracker
+            .get(message.from)
+            .is_none_or(|progress| progress.matched <= held)
+        {
+            return Ok(false);
+        }
+        // What it holds is a prefix of what it acknowledged, which was this
+        // leader's log, and a leader never cuts its own: the same entry,
+        // where this log still holds it (or its snapshot's point).
+        let kept = held.saturating_add(1) >= self.log.first_index()?;
+        if kept && self.log.term(held)? != message.log_term {
+            return Err(Error::Violation(
+                "a member that lost entries holds another log than it acknowledged",
+            ));
+        }
+        if let Some(progress) = self.tracker.get_mut(message.from) {
+            progress.lost(held, message.commit);
+        }
+        self.send_append(message.from)?;
+        Ok(true)
+    }
     fn handle_append_response(&mut self, message: &Message) -> Result<()> {
         let mut next_probe = message.reject_hint;
-        if message.reject && message.log_term > 0 {
-            // The member holds `log_term` at its hint. No index of this
-            // log at or below the hint with a higher term can match it,
-            // for terms only rise along a log: probe at the last one that
-            // may.
-            next_probe = self
-                .log
-                .find_conflict_by_term(message.reject_hint, message.log_term)?
-                .0;
+        if message.reject {
+            // Asked for on a refusal only: an acknowledgement checks nothing
+            // more than before.
+            if message.lost && self.take_lost(message)? {
+                return Ok(());
+            }
+            if message.log_term > 0 {
+                // The member holds `log_term` at its hint. No index of this
+                // log at or below the hint with a higher term can match it,
+                // for terms only rise along a log: probe at the last one
+                // that may.
+                next_probe = self
+                    .log
+                    .find_conflict_by_term(message.reject_hint, message.log_term)?
+                    .0;
+            }
         }
         let last = self.log.last_index()?;
         let Some(progress) = self.tracker.get_mut(message.from) else {
@@ -2851,6 +2982,11 @@ impl<S: Storage> Raft<S> {
                 let held = self.log.last_index()?;
                 self.release_proposals(held)?;
             }
+            None if self.lost.is_some() && message.index > self.log.last_index()? => {
+                // What it refuses follows entries it may have acknowledged
+                // and lost: it says so.
+                return self.send_lost(message.from, message.index);
+            }
             None => {
                 // The leader's log before its index has terms at most the
                 // one it names: the last index here of such a term is
@@ -2867,7 +3003,29 @@ impl<S: Storage> Raft<S> {
         answer.commit = self.log.committed();
         self.send(answer)
     }
+    /// A member whose log lost entries it acknowledged refuses `index`
+    /// and says it lost them, naming the last entry it holds: a leader
+    /// that counts them takes its progress back there and resends them
+    /// (core step R-5, CTRL's follower repair, Alagappan et al. §3.4). It
+    /// is an ordinary refusal besides, for a leader that counts none of
+    /// them.
+    fn send_lost(&mut self, to: NodeId, index: u64) -> Result<()> {
+        let mut answer = proto::message(to, MessageType::MsgAppendResponse);
+        answer.index = index;
+        answer.reject = true;
+        answer.lost = true;
+        answer.reject_hint = self.log.last_index()?;
+        answer.log_term = self.log.last_term()?;
+        answer.commit = self.log.committed();
+        self.send(answer)
+    }
     fn handle_heartbeat(&mut self, mut message: Message) -> Result<()> {
+        if let Some(lost) = self.lost
+            && message.commit > self.log.last_index()?
+        {
+            // The leader counts entries this member lost: it says so.
+            return self.send_lost(message.from, lost.index);
+        }
         self.log.commit_to(message.commit)?;
         if self.pending_request_snapshot != 0 {
             return self.send_request_snapshot();

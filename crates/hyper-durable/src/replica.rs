@@ -39,11 +39,13 @@ use std::time::Duration;
 
 use hyper_liveness::{Liveness, PeerId};
 use hyper_raft::proto::{
-    self, ConfChange, ConfChangeV2, ConfState, Entry, EntryType, HardState, Message, MessageType,
-    Snapshot, SnapshotMetadata,
+    self, ConfChange, ConfChangeV2, ConfState, Entry, EntryType, HardState, Message, Snapshot,
+    SnapshotMetadata,
 };
 use hyper_raft::wire::Record;
-use hyper_raft::{Config, Elections, RawNode, SnapshotStatus, StateRole, StorageError, Timing};
+use hyper_raft::{
+    Config, Elections, Lost, RawNode, SnapshotStatus, StateRole, StorageError, Timing,
+};
 use hyper_timing::{Ballot, Flushes, Span, Trust};
 
 use crate::budget::{Budget, Unbounded};
@@ -295,9 +297,6 @@ pub struct Replica<L: LogStore, M: StateMachine, B: Budget = Unbounded> {
     reads: VecDeque<(u64, Vec<u8>)>,
     /// Snapshot reports that came while stalled: one a member.
     reports: Vec<(u64, bool)>,
-    mark: Option<Point>,
-    /// The leader whose heartbeat counted entries this marked member lost.
-    repair: Option<u64>,
     fenced: Option<Cause>,
     /// When the applied index first ran past the durable commit with nothing out.
     quiet_since: Option<u64>,
@@ -330,14 +329,6 @@ fn change_of(entry: &EntryRef<'_>) -> Result<ConfChangeV2, Cause> {
     decoded.map_err(|_| Cause::Invariant("a committed change does not decode"))
 }
 
-/// Whether `message` asks for votes for its sender's campaign.
-fn campaigns(message: &Message) -> bool {
-    matches!(
-        message.msg_type,
-        MessageType::MsgRequestVote | MessageType::MsgRequestPreVote
-    )
-}
-
 /// Bytes as the budget counts them.
 fn bytes(len: usize) -> u64 {
     u64::try_from(len).unwrap_or(u64::MAX)
@@ -365,6 +356,15 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
         config.applied = durable.index;
         config.limits.readies_in_flight = depth;
         config.elections = Elections::Suspicion;
+        // The core keeps what the log may lack and acts on it (`docs/durable.md` §5): it judges
+        // votes by it, and tells a leader that counts the entries that they are lost (R-5).
+        config.lost = match view.health {
+            Health::Marked(mark) => Some(Lost {
+                index: mark.index,
+                term: mark.term,
+            }),
+            Health::Whole => None,
+        };
         // A walk of the log reads a page the size of what one `Ready` gives to apply.
         let page = config.max_committed_size_per_ready;
         let held = Held::new(log, machine.configuration().clone(), view.hard_state, page);
@@ -391,11 +391,6 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
             fence: None,
             reads: VecDeque::new(),
             reports: Vec::new(),
-            mark: match view.health {
-                Health::Marked(mark) => Some(mark),
-                Health::Whole => None,
-            },
-            repair: None,
             fenced: None,
             quiet_since: None,
             flushes: Flushes::new(),
@@ -475,9 +470,13 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
         self.fenced.as_ref()
     }
 
-    /// The point through which the member's log may lack entries it acknowledged.
+    /// The point through which the member's log may lack entries it acknowledged: the core's,
+    /// which ends it once its durable log holds what it marks.
     pub fn mark(&self) -> Option<Point> {
-        self.mark
+        self.node.raft.lost().map(|lost| Point {
+            index: lost.index,
+            term: lost.term,
+        })
     }
 
     /// The flushes of the writes that made a term or vote durable, submit to durable, on the
@@ -784,68 +783,26 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
 
     /// Wakes the core at the owner's clock (timing step L-2): what it armed since the last
     /// drive is timed, and a campaign, a beat or a transfer's end that is due is done. Its
-    /// campaigns are held while the member's log may lack what it acknowledged or a write waits
-    /// for room: a marked member takes no part in elections (§5), a stalled one in nothing.
+    /// campaigns are held while a write waits for room: a stalled member takes part in nothing.
+    /// A marked one's are the core's to judge (§5).
     fn wake(&mut self, now: u64) -> Result<(), ReplicaError> {
-        let held = self.mark.is_some() || self.stall.is_some();
+        let held = self.stall.is_some();
         let told = self.node.hold_campaigns(held);
         self.must(told)?;
         let woken = self.node.wake(now);
         self.must(woken).map(drop)
     }
 
-    /// A message from the network, bound to its authenticated sender by the transport. While the
-    /// member's log may lack entries it acknowledged, it judges a request for its vote against
-    /// the last of them, and takes no order to campaign (`docs/durable.md` §5).
+    /// A message from the network, bound to its authenticated sender by the transport.
     pub fn step(&mut self, message: Message) -> Result<(), ReplicaError> {
         self.guarded(|r| {
             r.takes()?;
-            if r.judged_by_mark(&message)? {
-                return Ok(());
-            }
             r.reserve(bytes(proto::message_bytes(&message)))?;
             let stepped = r.node.step(message);
             let outcome = r.heard(stepped);
             r.settle();
             outcome
         })
-    }
-
-    /// Whether a marked member drops `message`: a vote asked by a candidate behind its mark, or
-    /// an order to campaign. A heartbeat whose commit passes the member's log names its leader
-    /// for repair.
-    fn judged_by_mark(&mut self, message: &Message) -> Result<bool, ReplicaError> {
-        let Some(mark) = self.refresh_mark()? else {
-            return Ok(false);
-        };
-        let behind = message.log_term < mark.term
-            || (message.log_term == mark.term && message.index < mark.index);
-        match message.msg_type {
-            MessageType::MsgRequestVote | MessageType::MsgRequestPreVote => Ok(behind),
-            MessageType::MsgTimeoutNow => Ok(true),
-            MessageType::MsgHeartbeat => {
-                let last = self.last_index()?;
-                if message.commit > last {
-                    self.repair = Some(message.from);
-                }
-                Ok(false)
-            }
-            _ => Ok(false),
-        }
-    }
-
-    /// The mark, read again while it lasts: the log ends it once it holds the entries again or
-    /// one of a later term.
-    fn refresh_mark(&mut self) -> Result<Option<Point>, ReplicaError> {
-        if self.mark.is_some() {
-            let view = self.node.store().log.view();
-            let view = view.map_err(|fault| self.fence(Cause::Write(fault)))?;
-            self.mark = match view.health {
-                Health::Marked(mark) => Some(mark),
-                Health::Whole => None,
-            };
-        }
-        Ok(self.mark)
     }
 
     fn last_index(&mut self) -> Result<u64, ReplicaError> {
@@ -855,15 +812,15 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
             .map_err(|error| self.fence(Cause::Core(hyper_raft::Error::Storage(error))))
     }
 
-    /// Campaigns now.
+    /// Campaigns now; refused [`ReplicaError::Marked`] while the core finds that what the
+    /// member's log may lack keeps it from leading (`docs/durable.md` §5).
     pub fn campaign(&mut self) -> Result<(), ReplicaError> {
         self.guarded(|r| {
             r.takes()?;
-            if r.refresh_mark()?.is_some() {
-                return Err(ReplicaError::Marked);
+            match r.node.campaign() {
+                Err(hyper_raft::Error::Lost) => Err(ReplicaError::Marked),
+                campaigned => r.heard(campaigned),
             }
-            let campaigned = r.node.campaign();
-            r.heard(campaigned)
         })
     }
 
@@ -997,7 +954,6 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
             if r.stall.is_some() {
                 r.make_again(now, waker)?;
             }
-            r.refresh_mark()?;
             r.wake(now)?;
             if r.stall.is_none() {
                 r.take_reports()?;
@@ -1005,8 +961,6 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
                 r.take_ready(now, waker, out)?;
                 r.quiet_commit(now, waker)?;
             }
-            r.serve_requests()?;
-            r.ask_repair(out)?;
             r.release_reads(out);
             r.settle();
             Ok(r.driven())
@@ -1689,17 +1643,11 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
         Ok(())
     }
 
-    /// Gives out `messages`: a marked member's campaigns ask no one, its election timer still
-    /// running so that it holds no lease on a leader that is gone. The emptied vector goes back to
-    /// the core as its next queue (`RawNode::recycle_messages`), so the queue's room is not grown
-    /// again for every ready taken ahead.
+    /// Gives out `messages`. The emptied vector goes back to the core as its next queue
+    /// (`RawNode::recycle_messages`), so the queue's room is not grown again for every ready taken
+    /// ahead.
     fn emit(&mut self, mut messages: Vec<Message>, out: &mut Output<M::Answer>) {
-        if self.mark.is_some() {
-            out.messages
-                .extend(messages.drain(..).filter(|m| !campaigns(m)));
-        } else {
-            out.messages.append(&mut messages);
-        }
+        out.messages.append(&mut messages);
         self.node.recycle_messages(messages);
     }
 
@@ -1716,67 +1664,6 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
                 out.reads.push((context, index));
             }
         }
-    }
-
-    /// Repair of a marked member by snapshot, as mantle repairs (`docs/durable.md` §5): once its
-    /// leader's heartbeat counts entries the member lost, it refuses the leader's appends
-    /// through its mark and asks for a snapshot reaching it. Sent only with nothing out, so the
-    /// term it names is durable (I1). Core step R-5 replaces the snapshot with the lost entries:
-    /// a refusal flagged lost that regresses the member's progress.
-    fn ask_repair(&mut self, out: &mut Output<M::Answer>) -> Result<(), ReplicaError> {
-        let Some(leader) = self.repair else {
-            return Ok(());
-        };
-        if !self.writes.is_empty() {
-            return Ok(());
-        }
-        self.repair = None;
-        let Some(mark) = self.refresh_mark()? else {
-            return Ok(());
-        };
-        if leader != self.leader() {
-            return Ok(());
-        }
-        let last = self.last_index()?;
-        out.messages.push(Message {
-            msg_type: MessageType::MsgAppendResponse,
-            to: leader,
-            from: self.id(),
-            term: self.term(),
-            reject: true,
-            index: mark.index,
-            reject_hint: last,
-            request_snapshot: mark.index,
-            commit: self.durable_commit(),
-            ..Message::default()
-        });
-        Ok(())
-    }
-
-    /// A leader prepares the snapshot a member asked for when the one prepared does not reach
-    /// it and it has applied as far.
-    fn serve_requests(&mut self) -> Result<(), ReplicaError> {
-        if !self.is_leader() {
-            return Ok(());
-        }
-        let prepared = self
-            .node
-            .store()
-            .snapshot
-            .as_ref()
-            .map_or(0, proto::snapshot_index);
-        let asked = self
-            .node
-            .raft
-            .tracker()
-            .iter()
-            .map(|(_, progress)| progress.pending_request_snapshot)
-            .max()
-            .unwrap_or(0);
-        if asked > prepared && asked <= self.applied.index {
-            self.prepare()?;
-        }
-        Ok(())
     }
 
     /// Prepares the snapshot the core serves to members behind the log's start: the state

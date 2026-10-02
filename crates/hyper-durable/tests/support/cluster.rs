@@ -31,7 +31,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::task::Waker;
 use std::time::Duration;
 
-use hyper_durable::{Cause, Fault, Output, Replica, ReplicaError, Settings, Unbounded};
+use hyper_durable::{Cause, Fault, Output, Point, Replica, ReplicaError, Settings, Unbounded};
 use hyper_raft::proto::{
     ConfChangeSingle, ConfChangeTransition, ConfChangeType, ConfChangeV2, ConfState, Message,
     MessageType,
@@ -492,10 +492,39 @@ impl Cluster {
         true
     }
 
+    /// A fault at rest on `id`'s log: it loses power, and its last `lose` entries above what its
+    /// state machine holds durably are gone though written and acknowledged, their persist
+    /// record kept (hyper-log's mark, `docs/durable.md` §5). It reopens marked through what it
+    /// held. The mark, if any.
+    pub fn rot(&mut self, id: u64, lose: u64) -> Option<Point> {
+        self.crash(id);
+        let node = self.node(id);
+        let (mut disk, kv) = node.down.take()?;
+        let last = disk.last();
+        let mark = Point {
+            index: last,
+            term: disk.term(last).unwrap_or(0),
+        };
+        let floor = kv.durable.applied.index.max(disk.start.index);
+        let cut = lose.min(last.saturating_sub(floor)) as usize;
+        let keep = disk.entries.len() - cut;
+        disk.entries.truncate(keep);
+        disk.hard.commit = disk.hard.commit.min(disk.last());
+        node.down = Some((disk, kv));
+        let marked = (cut > 0).then_some(mark);
+        self.reopen(id, marked);
+        marked
+    }
+
     /// Opens a member that is down on what its crash left, and drives it alone until it applies
     /// nothing more: I5 across the crash, every entry it acted on at start applied again from its
     /// own durable state before it hears from anyone.
     pub fn restart(&mut self, id: u64) {
+        self.reopen(id, None);
+    }
+
+    /// [`Cluster::restart`], its store reporting `mark`.
+    fn reopen(&mut self, id: u64, mark: Option<Point>) {
         let seed = self.seed;
         let depth = self.shape.depth;
         let shape = self.shape;
@@ -504,13 +533,10 @@ impl Cluster {
         let Some((disk, kv)) = node.down.take() else {
             return;
         };
-        let mut replica = Replica::open(
-            &shaped(id, seed, &shape),
-            SimStore::from_disk(disk, depth),
-            kv,
-            Unbounded,
-        )
-        .unwrap_or_else(|e| panic!("member {id} does not reopen: {e}"));
+        let mut store = SimStore::from_disk(disk, depth);
+        store.mark = mark;
+        let mut replica = Replica::open(&shaped(id, seed, &shape), store, kv, Unbounded)
+            .unwrap_or_else(|e| panic!("member {id} does not reopen: {e}"));
         replica.set_timing(timing()).expect("timing");
         let mut out = Output::default();
         for _ in 0..64 {

@@ -510,9 +510,9 @@ fn a_log_that_starts_past_the_state_machine_does_not_open() {
 }
 
 /// A marked member (its log may lack entries it acknowledged) takes no part in elections: it
-/// refuses to campaign, drops a vote asked by a candidate behind its mark, and sends no request
+/// refuses to campaign, refuses its vote to a candidate behind its mark, and sends no request
 /// for votes of its own, though it opened knowing no leader and its detectors suspect every
-/// peer: its campaigns are held, and it is due for nothing.
+/// peer: the core holds its campaigns, and it is due for nothing.
 #[test]
 fn a_marked_member_takes_no_part_in_elections() {
     let mut store = SimStore::new(1);
@@ -567,12 +567,11 @@ fn a_marked_member_takes_no_part_in_elections() {
     }
     let out = pump(&mut r);
     assert!(
-        out.messages.iter().all(|m| !matches!(
-            m.msg_type,
-            MessageType::MsgRequestVote
-                | MessageType::MsgRequestVoteResponse
-                | MessageType::MsgRequestPreVote
-        )),
+        out.messages.iter().all(|m| match m.msg_type {
+            MessageType::MsgRequestVote | MessageType::MsgRequestPreVote => false,
+            MessageType::MsgRequestVoteResponse => m.reject,
+            _ => true,
+        }),
         "{:?}",
         out.messages
     );

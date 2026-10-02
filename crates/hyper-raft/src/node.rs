@@ -1101,6 +1101,8 @@ impl<S: Storage> RawNode<S> {
         {
             self.persisted(&given.proposals, given.stable)?;
         }
+        // What storage holds now may hold what the member lost.
+        self.raft.settle_lost()?;
         self.raft.settle_priority();
         self.after_persist(in_place)
     }
@@ -1218,6 +1220,7 @@ impl<S: Storage> RawNode<S> {
                 entries: last,
             },
         )?;
+        self.raft.settle_lost()?;
         self.raft.settle_priority();
         // Nothing is out and nothing is left to write: what follows leaves
         // now (`RawNode::releases_now`).

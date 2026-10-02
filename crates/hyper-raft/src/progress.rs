@@ -277,6 +277,16 @@ impl Progress {
         self.next_index = self.next_index.max(index.saturating_add(1));
         news
     }
+    /// The member lost what it acknowledged after `held`, and states
+    /// `committed` durable now (core step R-5): it is probed again from
+    /// past `held`, and what it said of its commit before is forgotten.
+    pub fn lost(&mut self, held: u64, committed: u64) {
+        self.matched = held;
+        self.committed_index = committed;
+        self.pending_request_snapshot = 0;
+        self.reset_state(ProgressState::Probe);
+        self.next_index = held.saturating_add(1);
+    }
     /// The member says it committed `committed`; the highest said is kept.
     pub fn update_committed(&mut self, committed: u64) {
         self.committed_index = self.committed_index.max(committed);

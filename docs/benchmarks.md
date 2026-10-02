@@ -684,6 +684,90 @@ counting runs are a scratch harness over `hyper-raft-compare one hyper[-copy] <w
 <bytes> <rounds> 1000 time|count`; `cargo bench -p hyper-raft --bench idle -- <ticks|suspicion>
 10000 <0|400>` under `/usr/bin/time -l`; `cargo bench -p hyper-raft --bench pipeline` in both trees.
 
+## Repair by entries (R-5)
+
+Core step R-5 (`docs/durable.md` §5.1). Measured on 2026-10-02 on the machine above (Apple M5 Max,
+macOS 26.4.1), with other sessions' work holding the load at 24 to 52; each figure says its load.
+
+**What a repair costs** (`cargo bench -p hyper-raft --bench repair`, `benches/repair.rs`; load 24.0
+at the start, 23.4 at the end). Protocol-Aware Recovery's workload (Alagappan et al., FAST 2018,
+§5.2: 30,000 entries, a snapshot of 32 MB, so a kibibyte an entry): three voters hold 30,000
+entries of 1 KiB; the third loses its last `lost` entries at rest and reopens marked. By entries,
+the leader sends them again (R-5); by a snapshot, the leader has compacted its log into an image of
+the state (every entry's bytes) and sends that, mantle's repair before R-5. Every message is written
+in the wire format and read back as a transport carries it; the time is the repair's on one thread
+from the member's reopening until its log holds the leader's, the median of five; no device, no
+network: the bytes are what they would carry.
+
+| Lost | By entries | | By a snapshot | |
+|---|---|---|---|---|
+| | time | bytes | time | bytes |
+| 1 | 32.4 µs | 1,817 | 8,886 µs | 30,720,830 |
+| 10 | 89.4 µs | 11,258 | 9,059 µs | 30,720,830 |
+| 100 | 444.7 µs | 105,668 | 8,380 µs | 30,720,830 |
+| 1,000 | 3,885 µs | 1,049,768 | 8,318 µs | 30,720,830 |
+| 10,000 | 38,797 µs | 10,490,960 | 8,238 µs | 30,720,830 |
+
+- One lost entry: 1.8 KB and 32 µs against 30.7 MB and 8.9 ms, a seventeen-thousandth of the bytes
+  and a two-hundred-seventy-fifth of the time. PAR's stock LogCabin moved 32 MB in 1.24 s over its
+  network and disk, CTRL 7 KB in 1.2 ms; the bytes here are the same order as theirs, the time is
+  this machine's in-process cost alone.
+- Bytes by entries grow with what was lost, about 1,050 a kibibyte entry (its record and its share
+  of the append's), so they stay below the snapshot's until the member lost nearly the whole log.
+  In-process time crosses near 2,000 lost entries (3.9 µs an entry carried, written and read
+  against a snapshot's copies at 0.27 ns a byte); on a network or a disk the bytes decide, and the
+  snapshot's time here leaves out what making and installing a real state machine's image costs.
+  The leader sends a snapshot only where it compacted the entries (§5.1); whether it should choose
+  one past a measured crossover on a real path is open (§14.5).
+
+**The core did not regress.** Unmarked, R-5 adds to the core a test of an `Option` at each notice
+and each heartbeat, a flag read only on a refused append's answer, and one byte in the message's
+padding (it stays 144 bytes).
+- **Allocations**: `hyper-raft-compare one <core> <workload> 3|5 ... 1000 1000 count`, `main` at
+  `5aea1a3` and R-5, every workload in place and copying, three and five voters: allocations,
+  reallocations, bytes asked for, peak and the whole loop's totals identical in all 32 cells; minor
+  faults single digits a run either way, no major fault.
+- **A cost found and removed.** The first build of R-5 retired 1.0–1.2 % more instructions in every
+  cell, 300 an op net of set-up on the steady 64 B cell in place (24,451 against 24,149, the mean
+  of three runs each). Built variant by variant: the out-of-line mark check at every write made durable cost
+  about 50 (a call where a test does), the flag tested on every acknowledgement about 30, and the
+  marked member's priority folded into `settle_priority`, which runs at every operation's edges,
+  about 210. The check is now a test in line with the rest out of it, called once a notice; the
+  flag is read inside the refusal's branch; and priority is judged in `step_vote`, where votes are.
+  Then 24,204 against 24,160 in place and 30,333 against 30,277 copying (five runs each, load
+  42–50): 44 and 56 instructions an op, 0.2 %.
+- **Time, instructions and cycles**, `main` and R-5 interleaved in fresh processes as the L-2
+  section runs them (per round the ratio R-5 to `main`; the geometric mean and its Student-t 95 %
+  interval; time the loop's own, instructions and cycles the whole process's), load 49.8 at the
+  start and 42.7 at the end:
+
+  | Cell | rounds | time | instructions | cycles |
+  |---|---|---|---|---|
+  | steady 64 B, in place | 30 | 1.008 [0.992, 1.024] | 1.002 [1.002, 1.002] | 0.992 [0.975, 1.010] |
+  | steady 64 B, copying | 30 | 1.008 [0.992, 1.023] | 1.003 [1.002, 1.004] | 1.001 [0.982, 1.021] |
+  | steady 4 KiB, in place | 30 | 1.014 [0.997, 1.032] | 1.002 [1.001, 1.002] | 1.022 [1.005, 1.040] |
+  | steady 4 KiB, copying | 30 | 1.009 [1.000, 1.018] | 1.001 [0.999, 1.003] | 1.002 [0.982, 1.022] |
+  | transfer, in place | 30 | 1.005 [0.993, 1.017] | 1.000 [1.000, 1.001] | 1.007 [0.989, 1.026] |
+  | transfer, copying | 30 | 0.993 [0.983, 1.002] | 1.000 [1.000, 1.001] | 1.005 [0.986, 1.025] |
+  | steady batch 64 | 10 | 0.989 [0.938, 1.043] | 1.000 [1.000, 1.000] | 0.980 [0.935, 1.027] |
+  | catch-up | 10 | 0.982 [0.961, 1.003] | 1.002 [1.001, 1.002] | 1.013 [0.985, 1.042] |
+  | snapshot | 10 | 0.990 [0.933, 1.051] | 1.001 [1.001, 1.002] | 1.022 [0.999, 1.046] |
+  | fast | 10 | 0.980 [0.939, 1.023] | 1.001 [1.000, 1.002] | 1.026 [0.981, 1.074] |
+  | failover | 10 | 1.020 [0.971, 1.071] | 1.000 [0.999, 1.001] | 0.947 [0.898, 0.998] |
+
+  No interval of time lies above 1. One of cycles does, the steady 4 KiB in-place cell (1.022
+  [1.005, 1.040]) at a load of 42–50, with instructions 1.002 and time's interval including 1: the
+  cell the R-6 section found moving 1–4 % with inert bytes alone, and the member is 48 bytes larger
+  (the mark and its copy in the configuration). One of cycles lies below (failover). Not a cost
+  claimed, nor a gain; the R-7 section measures it again.
+- **`benches/pipeline.rs`**: every simulated figure (p50, p99, entries a second, flushes an entry,
+  both devices, depths one to three) identical to `main`'s.
+
+Commands: `cargo bench -p hyper-raft --bench repair`; `crates/hyper-raft-compare` built `--release`
+in both trees; the counting and interleaved runs are a scratch harness over `hyper-raft-compare one
+hyper[-copy] <workload> 3|5 <batch> <bytes> <rounds> 1000 time|count` under `/usr/bin/time -l`,
+instructions an op `(I(R) − I(R/5)) / (ops(R) − ops(R/5))` at R = 40,000.
+
 ## Where hyper-raft does not win, and why
 
 hyper-raft in place allocates less than every other core in every row. It is faster than raft-rs
@@ -880,6 +964,11 @@ cargo bench -p hyper-raft --bench pipeline
 # and the comparison's counts and times against main built the same way.
 HYPER_RAFT_SEEDS=1000 HYPER_RAFT_STEPS=4000 HYPER_RAFT_CRASH_SEEDS=40 cargo test -p hyper-raft --release --test pipeline -- --nocapture
 $B one hyper steady 3 1 64 20000 1000 count
+
+# Repair by entries (R-5): the schedules with faults at rest, the repair's cost, and the
+# comparison's counts and times against main built the same way.
+HYPER_RAFT_SEEDS=1000 HYPER_RAFT_STEPS=4000 HYPER_RAFT_CRASH_SEEDS=40 cargo test -p hyper-raft --release --test pipeline --test repair -- --nocapture
+cargo bench -p hyper-raft --bench repair
 
 # The end-to-end scenarios, and every gate.
 cargo test -p hyper-raft-e2e --test cluster

@@ -83,3 +83,25 @@ pre-vote of its group. The owner wires the node's `hyper_liveness::Liveness`: `O
 `Driven::flushed`. The simulation's settle resumed a stalled replica once and never again, so a
 refusal taken after it stalled the replica for good; found by the suspicion soak (seed 5, crash 4),
 it now resumes each round.
+
+## R-5: a marked member repaired by entries
+
+Core step R-5 (`docs/durable.md` §5.1). The repair path moves into the core; the shell's part is
+what it tells the core at open. The edits, all in `src/replica.rs` but the tests:
+
+- `Replica::open` sets `Config::lost` from the store's `Health::Marked` (a `hyper_raft::Lost`).
+- Gone: the fields `mark` and `repair`; `judged_by_mark` (a vote request behind the mark dropped,
+  an order to campaign dropped, a heartbeat that counts lost entries naming its leader for repair),
+  `refresh_mark`, `ask_repair` (a refusal carrying `request_snapshot`, mantle's repair),
+  `serve_requests` (a leader preparing the snapshot asked for), the campaign filter in `emit` and
+  the free function `campaigns`. The core judges a vote request by the mark (it answers it
+  refused, where the shell dropped it), holds the campaigns, and sends the refusal flagged lost.
+- `Replica::mark` reads the core's (`RawNode::raft().lost()`), which ends by hyper-log's rule as the
+  durable log reaches it; `Replica::wake` holds campaigns only while stalled; `Replica::campaign`
+  maps the core's `Error::Lost` to `ReplicaError::Marked`.
+- Tests: `tests/shell.rs`, `a_marked_member_takes_no_part_in_elections`, now asserts a refused vote
+  answer where it asserted none; `tests/support/cluster.rs` gains `Cluster::rot` (power lost, the
+  last entries above the state machine's durable point gone with their persist record kept, reopened
+  marked) and `tests/sim.rs` `a_member_whose_last_writes_were_lost_at_rest_is_repaired_by_entries`:
+  the leader resends every lost entry, sends no snapshot, the mark ends and the group settles.
+

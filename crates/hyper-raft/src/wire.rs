@@ -30,6 +30,9 @@ pub const MESSAGE_FIXED_BYTES: usize = 1 + 1 + 9 * 8 + 8 + 4 + 4;
 const REJECT: u8 = 1;
 /// Flag bit of a message: a snapshot follows the entries.
 const HAS_SNAPSHOT: u8 = 1 << 1;
+/// Flag bit of a message: a refused append's answer from a member whose log lost entries it
+/// acknowledged (core step R-5).
+const LOST: u8 = 1 << 2;
 /// Presence bit of a snapshot: its metadata follows.
 const HAS_METADATA: u8 = 1;
 /// Presence bit of a snapshot: the metadata's configuration follows its index and term.
@@ -486,6 +489,9 @@ impl Record for Message {
         if self.snapshot.is_some() {
             flags |= HAS_SNAPSHOT;
         }
+        if self.lost {
+            flags |= LOST;
+        }
         out.push(flags);
         for field in [
             self.to,
@@ -514,7 +520,7 @@ impl Record for Message {
     fn take_body(reader: &mut Reader<'_>) -> Result<Self, DecodeError> {
         let msg_type = take_message_kind(reader.byte()?)?;
         let flags = reader.byte()?;
-        if flags & !(REJECT | HAS_SNAPSHOT) != 0 {
+        if flags & !(REJECT | HAS_SNAPSHOT | LOST) != 0 {
             return Err(DecodeError::Unknown {
                 what: "message flags",
                 value: flags,
@@ -567,6 +573,7 @@ impl Record for Message {
             snapshot,
             request_snapshot,
             reject: flags & REJECT != 0,
+            lost: flags & LOST != 0,
             reject_hint,
             context,
             priority,
@@ -682,9 +689,27 @@ mod tests {
             snapshot: Some(Box::new(snapshot())),
             request_snapshot: 9,
             reject: true,
+            lost: false,
             reject_hint: 39,
             context: b"read".to_vec(),
             priority: -5,
+        }
+    }
+
+    /// A member's word that its log lost entries it acknowledged (core step R-5).
+    fn lost() -> Message {
+        Message {
+            msg_type: MessageType::MsgAppendResponse,
+            to: 1,
+            from: 3,
+            term: 7,
+            log_term: 6,
+            index: 44,
+            commit: 38,
+            reject: true,
+            lost: true,
+            reject_hint: 40,
+            ..Message::default()
         }
     }
 
@@ -752,6 +777,16 @@ mod tests {
         let encoded = message().encode_to_vec();
         assert_eq!(encoded, sealed(1, &body));
         assert_eq!(encoded.len(), message().encoded_len());
+
+        // The lost refusal: the answer's kind, the reject and lost flags, the words.
+        let mut body = vec![4, REJECT | LOST];
+        for field in [1u64, 3, 7, 6, 44, 38, 0, 0, 40] {
+            body.extend_from_slice(&field.to_le_bytes());
+        }
+        body.extend_from_slice(&0i64.to_le_bytes());
+        body.extend_from_slice(&0u32.to_le_bytes());
+        body.extend_from_slice(&0u32.to_le_bytes());
+        assert_eq!(lost().encode_to_vec(), sealed(1, &body));
     }
 
     /// A record and whether bytes read back to its value.
@@ -763,6 +798,7 @@ mod tests {
         }
         vec![
             (message().encode_to_vec(), |b| round(b, &message())),
+            (lost().encode_to_vec(), |b| round(b, &lost())),
             (entry().encode_to_vec(), |b| round(b, &entry())),
             (snapshot().encode_to_vec(), |b| round(b, &snapshot())),
             (change().encode_to_vec(), |b| round(b, &change())),
@@ -868,7 +904,7 @@ mod tests {
             Message::decode(&sealed(1, &body)),
             Err(DecodeError::Unknown { .. })
         ));
-        let mut body = vec![3, 1 << 7];
+        let mut body = vec![3, 1 << 3];
         body.extend_from_slice(&[0; 9 * 8 + 8 + 8]);
         assert!(matches!(
             Message::decode(&sealed(1, &body)),

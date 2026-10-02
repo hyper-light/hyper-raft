@@ -34,3 +34,7 @@ workspace = true
 [[bench]]
 name = "idle"
 harness = false
+
+[[bench]]
+name = "repair"
+harness = false

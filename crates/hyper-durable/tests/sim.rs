@@ -183,3 +183,77 @@ fn a_crash_after_every_durability_event_loses_nothing_durable() {
     }
     assert!(crashes > seeds * 50, "{crashes}");
 }
+
+/// A member whose last writes were lost at rest, their persist record kept, reopens marked; once
+/// its leader's heartbeat counts what it lost it says so, and the leader sends the lost entries
+/// again, not a snapshot (core step R-5, `docs/durable.md` §5): its mark ends, and every member
+/// applies the same history.
+#[test]
+fn a_member_whose_last_writes_were_lost_at_rest_is_repaired_by_entries() {
+    use hyper_raft::proto::MessageType;
+    let shape = SHAPES[1].1;
+    let mut group = Cluster::new(shape, 1);
+    assert!(group.settles(4_000));
+    let ids: Vec<u64> = (1..=shape.members).collect();
+    let leader = group.leader().expect("a leader");
+    for at in 0..12 {
+        group
+            .replica(leader)
+            .unwrap()
+            .propose(Vec::new(), format!("entry {at}").into_bytes())
+            .unwrap();
+        group.round(&ids);
+    }
+    // What the last round sent is answered.
+    for _ in 0..4 {
+        group.round(&ids);
+    }
+    let member = (1..=shape.voters).find(|id| *id != leader).unwrap();
+    let last = group.disk(leader).last();
+    assert_eq!(group.disk(member).last(), last);
+    let mark = group.rot(member, 6).expect("entries lost");
+    let held = group.disk(member).last();
+    assert_eq!(held, last - 6);
+    assert_eq!(group.replica(member).unwrap().mark(), Some(mark));
+    let mut resent = Vec::new();
+    let mut snapshots = 0;
+    for _ in 0..2_000 {
+        if group.replica(member).unwrap().mark().is_none() {
+            break;
+        }
+        group.now += 1_000_000;
+        for &id in &ids {
+            group.act(Op::Drive(id));
+            while group.act(Op::Durable(id)) {}
+            group.act(Op::Drive(id));
+        }
+        for message in group
+            .net
+            .iter()
+            .filter(|m| m.to == member && m.from == leader)
+        {
+            match message.msg_type {
+                MessageType::MsgSnapshot => snapshots += 1,
+                MessageType::MsgAppend => resent.extend(message.entries.iter().map(|e| e.index)),
+                _ => {}
+            }
+        }
+        while !group.net.is_empty() {
+            group.act(Op::Deliver(0));
+        }
+    }
+    assert_eq!(
+        group.replica(member).unwrap().mark(),
+        None,
+        "the mark never ended"
+    );
+    assert_eq!(snapshots, 0);
+    resent.sort_unstable();
+    resent.dedup();
+    assert!(
+        (held + 1..=last).all(|index| resent.contains(&index)),
+        "lost {}..={last}, sent {resent:?}",
+        held + 1
+    );
+    assert!(group.settles(4_000));
+}

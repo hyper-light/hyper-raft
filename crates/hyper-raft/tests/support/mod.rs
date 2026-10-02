@@ -70,8 +70,46 @@ pub struct Disk {
     pub boot: ConfState,
     pub snapshot: Snapshot,
     pub entries: Vec<Entry>,
+    /// Each entry's checksum as it was written, beside it, as a log keeps
+    /// one with every record (`docs/durable.md` §5): what a fault at rest
+    /// changes no longer matches it.
+    pub sums: Vec<u64>,
+    /// What the log found it lacks of what it acknowledged, as a log that
+    /// tells crashes from damage records it (hyper-log's uncertainty mark):
+    /// the member opens with it ([`hyper_raft::Lost`]).
+    pub lost: Option<hyper_raft::Lost>,
     /// What the member approved by itself.
     pub proposals: Vec<Entry>,
+}
+
+/// An entry's checksum: FNV-1a over everything it states.
+pub fn sum(entry: &Entry) -> u64 {
+    let mut digest = 0xcbf2_9ce4_8422_2325u64;
+    for byte in entry
+        .index
+        .to_le_bytes()
+        .iter()
+        .chain(&entry.term.to_le_bytes())
+        .chain(&[entry.entry_type as u8])
+        .chain(&entry.data)
+        .chain(&entry.context)
+    {
+        digest = (digest ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    digest
+}
+
+/// What a fault at rest does to a member's disk (Ganesan et al., FAST 2017;
+/// `docs/durable.md` §5, §12).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Fault {
+    /// A bit of the entry at this index flips: the last write's or an
+    /// earlier one's.
+    Flip(u64),
+    /// The last entries, this many, are gone though they were written and
+    /// acknowledged: a lost write, or a misdirected one that wrote them
+    /// elsewhere.
+    Lose(u64),
 }
 impl Disk {
     pub fn snapshot_index(&self) -> u64 {
@@ -106,9 +144,11 @@ impl Disk {
                 entry.index <= self.last_index() + 1,
                 "a gap in what is persisted"
             );
-            self.entries
-                .truncate((entry.index - self.first_index()) as usize);
+            let at = (entry.index - self.first_index()) as usize;
+            self.entries.truncate(at);
+            self.sums.truncate(at);
             self.entries.push(entry.clone());
+            self.sums.push(sum(entry));
         }
         let last = self.last_index();
         self.proposals.retain(|held| held.index > last);
@@ -123,8 +163,10 @@ impl Disk {
             first.index >= self.first_index() && first.index <= self.last_index() + 1,
             "a gap in what is kept"
         );
-        self.entries
-            .truncate((first.index - self.first_index()) as usize);
+        let at = (first.index - self.first_index()) as usize;
+        self.entries.truncate(at);
+        self.sums.truncate(at);
+        self.sums.extend(entries.iter().map(sum));
         self.entries.extend(entries);
         self.trim_proposals();
     }
@@ -142,6 +184,7 @@ impl Disk {
         self.conf = sorted(metadata.conf_state.unwrap_or_default());
         self.hard_state.commit = self.hard_state.commit.max(metadata.index);
         self.entries.clear();
+        self.sums.clear();
         self.snapshot = snapshot;
         self.proposals.retain(|held| held.index > metadata.index);
     }
@@ -150,6 +193,7 @@ impl Disk {
         let term = self.term(index).expect("the compacted index is held");
         let keep = (index + 1 - self.first_index()) as usize;
         self.entries.drain(..keep);
+        self.sums.drain(..keep);
         self.snapshot = Snapshot {
             data,
             metadata: Some(SnapshotMetadata {
@@ -159,9 +203,84 @@ impl Disk {
             }),
         };
     }
+    /// The mark the log keeps, while its entries do not yet hold what it
+    /// marks (`Lost::resolved_by`, hyper-log's rule).
+    pub fn mark(&self) -> Option<hyper_raft::Lost> {
+        let last = self.last_index();
+        self.lost
+            .filter(|lost| !lost.resolved_by(last, self.term(last).unwrap_or(0)))
+    }
+    /// A fault at rest, while the member is stopped: the bytes change, or
+    /// the last entries are gone, and nothing else is told.
+    pub fn suffer(&mut self, fault: Fault) {
+        match fault {
+            Fault::Flip(index) => {
+                let at = (index - self.first_index()) as usize;
+                let entry = &mut self.entries[at];
+                // Its data, or for one that states nothing its kind: never its
+                // term or index, which the persist record holds apart.
+                match entry.data.first_mut() {
+                    Some(byte) => *byte ^= 1,
+                    None => {
+                        entry.entry_type = match entry.entry_type {
+                            EntryType::EntryNormal => EntryType::EntryConfChange,
+                            _ => EntryType::EntryNormal,
+                        }
+                    }
+                }
+            }
+            Fault::Lose(count) => {
+                // Its persist record survived, apart from it (PAR §3.3.4): the log
+                // knows what it acknowledged.
+                let marked = self.lost_through();
+                let keep = self.entries.len() - count as usize;
+                self.entries.truncate(keep);
+                self.sums.truncate(keep);
+                self.lost = Some(marked);
+                self.hard_state.commit = self.hard_state.commit.min(self.last_index());
+            }
+        }
+    }
+    /// The mark that covers everything the log holds now and what it marked.
+    fn lost_through(&self) -> hyper_raft::Lost {
+        let last = self.last_index();
+        let now = hyper_raft::Lost {
+            index: last,
+            term: self.term(last).unwrap_or(0),
+        };
+        match self.mark() {
+            Some(lost) => hyper_raft::Lost {
+                index: lost.index.max(now.index),
+                term: lost.term.max(now.term),
+            },
+            None => now,
+        }
+    }
+    /// What the log does when it opens: every entry is read against its
+    /// checksum, and from the first that does not match nothing is kept,
+    /// marked through what it held (PAR §3.3.3: a mismatch with later
+    /// records is a corruption, never a crash, and what was acknowledged
+    /// is marked, not forgotten). The commit stated past what is kept is
+    /// cut back to it; the leader tells it again.
+    pub fn verify(&mut self) {
+        let Some(bad) = self
+            .entries
+            .iter()
+            .zip(&self.sums)
+            .position(|(entry, written)| sum(entry) != *written)
+        else {
+            return;
+        };
+        let marked = self.lost_through();
+        self.entries.truncate(bad);
+        self.sums.truncate(bad);
+        self.lost = Some(marked);
+        self.hard_state.commit = self.hard_state.commit.min(self.last_index());
+    }
     /// What a member that opens finds applied: the snapshot's
     /// configuration, or the one the group began with.
     pub fn reopen(&mut self) {
+        self.verify();
         self.conf = match self.snapshot.metadata.as_ref() {
             Some(metadata) if metadata.index > 0 => {
                 sorted(metadata.conf_state.clone().unwrap_or_default())
@@ -1146,6 +1265,7 @@ impl Replica for New {
                 readies_in_flight: settings.depth,
                 ..hyper_raft::Limits::default()
             },
+            lost: store.0.mark(),
             ..hyper_raft::Config::new(id)
         };
         let mut raw = hyper_raft::RawNode::new(&config, store).expect("hyper-raft opens");

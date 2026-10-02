@@ -1,7 +1,7 @@
 # hyper-durable: the durable shell around the Raft core
 
 > Status (2026-10-02): the shell's D-1 core is built (`crates/hyper-durable`, §15) on core steps
-> R-4 (§2.1) and R-6 (§4.4); R-5 and R-7 are not built, and §15 says what waits on each.
+> R-4 (§2.1), R-5 (§5.1) and R-6 (§4.4); R-7 is not built, and §15 says what waits on it.
 > Sources and what each establishes are in
 > `docs/research/durable.md` ("research §n"). This replaces `docs/raft.md` §4's plan to extract
 > mantle's replica: the shell is designed from all three projects' shells and the literature, then
@@ -213,7 +213,7 @@ Where the shell keeps each, as built (D-1, `crates/hyper-durable`; the oracle an
 
 | | Enforced in the shell | Tested |
 |---|---|---|
-| I1 | a `Ready`'s persisted messages leave with its write's answer, answers taken in submission order (`Replica::take_answers`, `durable`); a write refused for room releases nothing until it is made again (`refused`, `make_again`); the repair message leaves only with no write out (`ask_repair`) | `check_promises` on every release, against the sender's disk; mutated to release a `Ready`'s persisted messages at once, the schedules fail ("MsgRequestVote of term 1 left with term 0 durable") |
+| I1 | a `Ready`'s persisted messages leave with its write's answer, answers taken in submission order (`Replica::take_answers`, `durable`); a write refused for room releases nothing until it is made again (`refused`, `make_again`); a marked member's refusal flagged lost is a persisted message of the core's like any other (R-5) | `check_promises` on every release, against the sender's disk; mutated to release a `Ready`'s persisted messages at once, the schedules fail ("MsgRequestVote of term 1 left with term 0 durable") |
 | I2 | the same | `check_acknowledgement` on every release |
 | I3 | the core's; the shell tells it a write is durable only from that write's answer | `check_leader_commit`: every commit new to the group, held by a majority of each half of the configuration that decided it, through steps in which the leader stepped down |
 | I4 | the shell applies only what the core gives (`walk`), reading a leader's own entries past the store where the core holds them (`Config::apply_unpersisted`) | `check_applied`: every member applies the same entry at an index; `a_leader_applies_its_own_term_before_its_write_is_durable` |
@@ -398,6 +398,52 @@ calls for:
   the frame's range rather than refuse to open the log (a hyper-log change, open in mantle replica.md
   §7). The shell's rules above then repair each group in place.
 
+### 5.1 As built (core step R-5)
+
+In `crates/hyper-raft` (`src/raft.rs`, `src/progress.rs`, `src/node.rs`, `src/proto.rs`,
+`src/wire.rs`):
+
+- **The core keeps the mark.** `Config::lost: Option<Lost>` is what storage found when the member
+  opened (`Lost { index, term }`: hyper-log's uncertainty mark, entries through `index`, of terms up
+  to `term`, that the log may lack of what it acknowledged); `Raft::lost` reads it. It ends by
+  hyper-log's own rule (`Lost::resolved_by`, mantle `docs/design/raft-log.md` §6) read from storage
+  at open and at every notice (`Raft::settle_lost`): the durable log reaches the mark's index, or
+  holds an entry of a later term from a leader, whose log holds every entry committed in the
+  mark's terms before that one (Leader Completeness; terms never fall along a log). mantle's rules
+  for a marked member (§5) move from the shell into the core: it judges a vote request against
+  its claim, the mark (`Raft::claim`, in `step_vote`, for the vote and for `Precedence`), refuses
+  to campaign (`Error::Lost`, and its deadline is none), forgets the leader whose silence asked it
+  to (so it holds no lease on one that is gone), and refuses no one for priority (a voter that
+  refuses for priority must be one the group could elect instead; a schedule of seed 560 found a
+  marked member of the highest priority refusing every candidate as long as it was marked). The
+  mark costs an unmarked member a test of an `Option` at each notice and each heartbeat, and nothing on an
+  acknowledgement: the flag is read only on a refusal, and priority is judged where votes are.
+- **The follower's word.** While marked, a member that is sent a heartbeat whose commit passes its
+  log, or an append after a point past its log, answers with a refusal flagged lost
+  (`Message::lost`, the format's flag bit 2, `docs/raft.md` §3.1), naming the last entry it holds
+  (`reject_hint`, `log_term`) and its commit (held to the durable commit as every answer is, R-6).
+  It is an ordinary refusal besides, so a leader that counts none of the lost entries probes as it
+  always did.
+- **The leader's repair** (`Raft::take_lost`, `Progress::lost`). A leader whose progress for the
+  member is past the named entry takes it back there: `matched` falls to it, the member is probed
+  from the entry after, its window and any snapshot under way are dropped, and its stated commit is
+  the one the refusal names. The named entry must be the leader's own where the leader still holds
+  it (what the member holds is a prefix of what it acknowledged, which was this leader's log, and a
+  leader never cuts its own); a mismatch is a violation, dropped. It then sends from there: the lost
+  entries, paged as any append; a snapshot only where it compacted them. Lowering `matched` revokes
+  no commit (the commit never goes back, and the entries are the leader's), so a false word costs
+  resends from an authenticated peer and nothing else (§5). Without the flag the refusal is one for
+  an index the leader counts as held, which it takes for a stale answer
+  (`Progress::maybe_decrease_to`): the group reaches a fixed point where the member never holds the
+  entries again (`without_the_flag_a_leader_never_sends_the_lost_entries_again`).
+- **The shell** (`crates/hyper-durable`, `Replica`) passes the store's health into `Config::lost` at
+  open and keeps nothing of the mark: `Replica::mark` reads the core's. Its own rules (`judged_by_mark`,
+  `refresh_mark`, the campaign filter in `emit`, the snapshot request `ask_repair` and its leader's
+  `serve_requests`) are gone; `Replica::campaign` maps the core's `Error::Lost` to `ReplicaError::Marked`.
+
+**The gate as run** is `docs/raft.md` §3's R-5 row; counts in `crates/hyper-raft/ORIGIN.md` and
+`crates/hyper-durable/ORIGIN.md`, cost in `docs/benchmarks.md`, "Repair by entries (R-5)".
+
 Ganesan et al.'s findings are the tests' checklist (research §5): every fault detected (checksums on
 every record and payload, R-2's CRC-32C), crash and corruption never conflated, redundancy always
 used before a member is given up, and no protocol path (election, catch-up) that spreads a local
@@ -457,8 +503,9 @@ the owner: `Owner::pairs` keeps the stream told which peers each replica's group
 suspicion, trust again, a restart to `Replica::restarted`), `Owner::measure` derives each group's
 timing from what the stream measured (`Replica::measure`) and charges every pair its groups'
 expected election (`docs/timing.md` §2.9: a pair never charged never configured), and
-`Driven::flushed` is the flush each heartbeat proves (`crates/hyper-durable/tests/liveness.rs`). The shell holds the core's campaigns while the member is marked or stalled
-(`RawNode::hold_campaigns`), and the core already holds one while a committed change is unapplied.
+`Driven::flushed` is the flush each heartbeat proves (`crates/hyper-durable/tests/liveness.rs`). The shell holds the core's campaigns while the member is stalled
+(`RawNode::hold_campaigns`); the core holds them itself while the member is marked (§5.1) or a
+committed change is unapplied.
 It does not withhold the detectors' words, as the plan here said it would: a marked follower that
 kept trusting a leader its detector suspected would refuse every pre-vote for that leader's group,
 and a group whose other voter is a candidate could not elect; words change nothing durable, so a
@@ -577,7 +624,7 @@ slates measured a delta format not worth a second recovery path).
   `poll` answering at once; `SavedRaft` carries what the core's `Storage` and `InitialState` read.
   Its groups are re-founded (owner's decision 9).
 - **The core.** R-4 (readies ahead of persistence; built, §2.1), R-5 (a lost-entries refusal
-  regresses a member's progress), R-6 (an apply pause; a leader's own-term entries given to apply
+  regresses a member's progress; built, §5.1), R-6 (an apply pause; a leader's own-term entries given to apply
   before its write is durable; the durable commit carried in answers; built, §4.4), R-7 (CTRL's
   leader-side recovery).
 - **hyper-log.** `GROUP_SUBMISSIONS` from `PIPELINE_FRAMES`; health per group; a damaged frame
@@ -604,7 +651,15 @@ slates measured a delta format not worth a second recovery path).
 - **Faults at rest** (Ganesan et al.'s checklist, research §5): a flipped bit in each kind of record,
   the last frame and an earlier one, a lost write, a misdirected write; every fault detected, every
   marked member repaired in place by entries (R-5), every damaged one rebuilt, and Figure 4(b)'s
-  schedules electing a leader once R-7 is in.
+  schedules electing a leader once R-7 is in. As built for the core (`crates/hyper-raft/tests`): the
+  schedules' disk keeps a checksum beside every entry and verifies it when the member opens
+  (`Disk::verify`), cutting at the first mismatch and marking through what it held; a fault is a
+  bit flipped in an entry of the last write or an earlier one, or the last writes lost though
+  acknowledged with their persist record kept (`Fault::Flip`, `Fault::Lose`, `Op::Corrupt`), one
+  marked member at a time. The oracle counts a member's mark for what it acknowledged before the
+  fault (I3), and once settled every member holds every committed entry as it was committed
+  (`Cluster::check_kept`); a group that does not settle is accepted only where no member's election
+  the rule admits (`Cluster::electable`), and counted.
 - **Real processes.** `hyper-raft-e2e` members on hyper-log and real disks, SIGKILL at named
   durability points (a hook that stops the process at the point and the harness kills it) and at
   random, every acknowledged write recovered, F17's two cases, a failed flush injected on a device.
@@ -640,7 +695,13 @@ and allocates no more on that project's workload.
 4. **Apply on the owner.** Apply time per `Ready` against the owner's quantum under mantle's metadata
    workload; a split only if it is exceeded.
 5. **Repair.** Bytes and time to repair a marked member by entries (R-5) against a snapshot, and the
-   simulation's unavailable runs before and after R-7.
+   simulation's unavailable runs before and after R-7. Measured for R-5 (`docs/benchmarks.md`,
+   "Repair by entries (R-5)"): one lost entry of 30,000 repaired in 1.8 KB and 32 µs in process
+   against a snapshot's 30.7 MB and 8.9 ms; the bytes stay below the snapshot's until nearly the
+   whole log is lost, and in-process time crosses near 2,000 entries. Open: whether a leader should
+   choose a snapshot past a crossover measured on a real path. Before R-7, 116 to 192 of 1,000
+   schedules a setting with faults at rest end with a group that must wait on a mark
+   (`crates/hyper-raft/ORIGIN.md`, R-5).
 6. **The idle confirmation flush.** Whether hyper-log can drop the confirmation a lone frame needs
    when nothing follows it, by PAR's identifiers stored apart, or whether depth makes it rare enough
    (with depth, under load, the next frame confirms).
@@ -671,7 +732,8 @@ and allocates no more on that project's workload.
   only then, applies what the fence allows, takes at most one `Ready` (§7's quantum), and writes the
   commit alone when the fence or a quiet period asks. `Settings::quiet` is the owner's period.
   Elections are by suspicion (L-2, §8): no ticks; a drive wakes the core and `Driven::wake` says
-  when to drive again, and a stalled or marked replica's campaigns are held.
+  when to drive again; a stalled replica's campaigns are held by the shell, a marked one's by the
+  core (§5.1).
 - **`Owner`** (`src/owner.rs`): an arena by generational handle, one waker a slot made by the
   embedder, turns by deficit round robin with a quantum of one `Ready`. The crate spawns nothing.
 - **`Budget`**: reserved before an input, settled to the replica's resident bytes after each call;
@@ -679,10 +741,8 @@ and allocates no more on that project's workload.
 
 What waits on core steps not built:
 
-- **R-5.** A marked member asks for a snapshot reaching its mark, mantle's repair
-  (`Replica::ask_repair`, a refusal with `request_snapshot`); a leader prepares one when asked
-  (`serve_requests`). R-5 replaces the message with a refusal flagged lost that regresses the
-  member's progress, so the leader resends the lost entries; nothing else in the shell changes.
+- **R-5** (built, §5.1): a marked member's repair is the core's, by entries; the shell's snapshot
+  request and its serving are gone.
 - **R-7.** A marked member does not campaign and drops vote requests behind its mark, so a group
   whose only up-to-date log is marked waits, as mantle's does.
 - **Asked of the core besides:** `RawNode::into_store`, so a closed replica gives back its store;

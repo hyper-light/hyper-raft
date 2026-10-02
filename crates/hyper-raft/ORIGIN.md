@@ -502,3 +502,58 @@ source of each rule; `docs/raft.md` §3).
   0.1–0.4 % above; `benches/pipeline.rs`'s simulated figures identical. `benches/idle.rs`: an idle
   group costs its owner 542.5 ns and two messages a tick on ticks, 25 ns a scan and no message by
   suspicion, nothing with a timer queue.
+
+## R-5: repair by entries
+
+Not a port: this repository's change (`docs/durable.md` §5.1, which states the design as built and
+its sources; `docs/raft.md` §3).
+
+- **The mark** (`src/raft.rs`): `Lost { index, term }`, `Config::lost`, `Raft::lost`,
+  `Raft::settle_lost` (at open and at every notice, from storage: `Lost::resolved_by`, hyper-log's
+  rule), `Raft::claim` (what a member answers for in an election). mantle's rules for a marked
+  member, until now the shell's, are the core's: `step_vote` judges by the claim (the vote and
+  `Precedence`), `hup` refuses (`Error::Lost`) and forgets the leader that asked it to campaign by
+  its silence, `deadline` and `wake_follower` arm no campaign, and `step_vote` refuses no one for
+  priority while marked.
+- **The word** (`src/proto.rs`, `src/wire.rs`): `Message::lost`, flag bit 2 of the message body; an
+  older reader refuses it as an unknown flag. `Raft::send_lost` answers a heartbeat whose commit
+  passes the log, or an append after a point past it, while marked.
+- **The repair** (`src/raft.rs`, `src/progress.rs`): `Raft::take_lost` and `Progress::lost`; the
+  named entry checked against the leader's log where it still holds it (a schedule found the
+  leader's compacted log reading term zero there, read as a mismatch, before the check asked
+  first whether it holds the entry); `RawNode`'s notice settles the mark (`src/node.rs`).
+- **Tests**: `tests/repair.rs` (four directed); `src/wire.rs` pins the lost refusal's layout and
+  round-trips it. The schedules' harness (`tests/support`): a checksum beside every entry of the
+  disk (`Disk::sums`), verified when a member opens (`Disk::verify`, cut at the first mismatch and
+  marked through what it held); `Fault::Flip` and `Fault::Lose`, `Op::Corrupt` and
+  `Mix::corrupt`, one marked member at a time; the oracle counts a mark for what its member
+  acknowledged (`check_durable`); `Cluster::check_kept` after every settled schedule;
+  `Cluster::electable`, which a group that does not settle must leave empty (a group whose marks
+  the rule must wait on is counted, not failed). `tests/pipeline.rs`:
+  `faults_at_rest_lose_nothing_acknowledged` (the four settings on ticks) and the crash at every
+  persistence step with faults (two variants on ticks: by suspicion a marked member that led cannot
+  end its followers' lease on its node until R-7 lets it campaign). A schedule without faults draws
+  as before: no draw is taken where `Mix::corrupt` is zero.
+- **Found by the schedules, fixed before the counts below**: the leader's term check of the named
+  entry where its log was compacted (seed 1); a marked member of the highest priority refusing
+  every candidate it was not behind, which no one else could then be elected past (seed 560, the
+  shell setting).
+- **Recorded on 2026-10-02** (`HYPER_RAFT_SEEDS=1000 HYPER_RAFT_STEPS=4000 HYPER_RAFT_CRASH_SEEDS=40`,
+  load 27–33): every schedule without faults prints R-6's and L-2's counts exactly (on ticks 73,634,
+  72,589, 60,657 and 62,565 entries committed; by suspicion 75,539, 76,083, 67,930 and 66,354; the
+  crash enumeration 1,689 crashes and 1,656 writes lost, and 1,642 and 2,030, on ticks; 1,867 and
+  1,889, 1,764 and 2,049 by suspicion). With faults at rest, 1,000 schedules of 4,000 steps at each
+  setting: 61,806, 53,933, 43,583 and 50,087 entries committed through 2,815, 2,878, 2,979 and 2,880
+  faults; 1,953, 1,880, 2,132 and 1,999 marks ended, after 967, 952, 890 and 968 steps on average;
+  134, 192, 116 and 128 groups left waiting on a mark the rule could elect past no one (§14.5's
+  measure, before R-7). The crash at every persistence step of 40 schedules that suffered a fault:
+  1,878 crashes (2,374 writes lost, 1,277 faults) and, with a leader applying before its write, 1,769
+  (2,478, 1,067). `HYPER_RAFT_SEEDS=300 HYPER_RAFT_SEED=1000` over the differential, group and fast
+  suites prints what `main` prints but for the mixed group's line, which differs between two runs of
+  `main` itself.
+- **Measured** (`docs/benchmarks.md`, "Repair by entries (R-5)"): one lost entry of 30,000
+  repaired in 1.8 KB and 32 µs in process against a snapshot's 30.7 MB and 8.9 ms; allocations,
+  reallocations and bytes identical on all 32 cells of the comparison; instructions 0.2 % above
+  `main` an op after three hot-path costs found and removed (the first build was 1.2 % above); no
+  interval of time above 1; `benches/pipeline.rs`'s simulated figures identical.
+

@@ -126,10 +126,18 @@ fn schedule(
             persisted += 1;
         }
     }
-    assert!(
-        group.settles(400),
-        "seed {seed}, crash {crash:?}: the group did not settle"
-    );
+    if group.settles(400) {
+        group.check_kept();
+    } else {
+        // Only a group whose marks leave no member the election rule admits
+        // may wait (`docs/durable.md` §5): it is counted, and is no failure.
+        let electable = group.electable();
+        assert!(
+            group.faults > 0 && electable.is_empty(),
+            "seed {seed}, crash {crash:?}: the group did not settle, and {electable:?} could lead"
+        );
+        group.waits += 1;
+    }
     assert_eq!(
         group.deposed, 0,
         "seed {seed}: a member led a group it left"
@@ -139,28 +147,43 @@ fn schedule(
 
 /// Schedules of `settings` at the depth it states; what they reached.
 fn schedules(name: &str, settings: Settings, voters: &[u64], fast: u64) -> (Coverage, usize) {
+    schedules_of(name, settings, voters, &mix_for(&settings, fast))
+}
+
+/// Schedules of `settings` drawn from `mix`; what they reached.
+fn schedules_of(name: &str, settings: Settings, voters: &[u64], mix: &Mix) -> (Coverage, usize) {
     let seeds = count("HYPER_RAFT_SEEDS", 24);
     let steps = count("HYPER_RAFT_STEPS", 2_000);
     let first = count("HYPER_RAFT_SEED", 0);
     let mut coverage = Coverage::default();
     let mut committed = 0;
     let mut terms = 0;
+    let mut faults = 0;
+    let mut repaired = 0;
+    let mut marked_steps = 0;
+    let mut waits = 0;
     for seed in first..first + seeds {
-        let (group, _) = schedule(
-            settings,
-            voters,
-            seed,
-            steps,
-            &mix_for(&settings, fast),
-            None,
-        );
+        let (group, _) = schedule(settings, voters, seed, steps, mix, None);
         coverage.add(group.coverage());
         committed += group.chosen.len();
         terms += group.leaders.len();
+        faults += group.faults;
+        repaired += group.repaired;
+        marked_steps += group.marked_steps;
+        waits += group.waits;
     }
     println!(
-        "{name}: {seeds} schedules of {steps} steps committed {committed} entries in {terms} terms led; {coverage:?}"
+        "{name}: {seeds} schedules of {steps} steps committed {committed} entries in {terms} terms led, {faults} faults at rest, {repaired} marks ended after {} steps each, {waits} groups left waiting on a mark; {coverage:?}",
+        marked_steps.checked_div(repaired).unwrap_or(0)
     );
+    if mix.corrupt > 0 {
+        // Every schedule suffered faults at rest, and marks ended: members
+        // were repaired in place.
+        assert!(
+            faults >= seeds && repaired > 0,
+            "{name}: {faults} {repaired}"
+        );
+    }
     // A schedule that never had two writes out, never heard of several at
     // once and never lost one proves nothing of R-4.
     assert!(committed as u64 > seeds * 8, "{name}: {committed}");
@@ -225,6 +248,47 @@ fn settings() -> [(&'static str, Settings); 4] {
     ]
 }
 
+/// Of ten thousand steps, how many are a fault at rest (`Mix::corrupt`):
+/// one in as many steps as a mark lasts, so that faults come as often as the
+/// rule of one marked member at a time lets them. Measured: at fifty, 200
+/// schedules of each setting ended 1,194 marks after 640 steps each on
+/// average (`faults_at_rest_lose_nothing_acknowledged`); 10,000 / 640 is
+/// sixteen. `HYPER_RAFT_CORRUPT` sets it to measure again.
+fn corrupt_rate() -> u64 {
+    count("HYPER_RAFT_CORRUPT", 16)
+}
+
+/// The same schedules, with faults at rest besides (Ganesan et al., FAST
+/// 2017, the checklist of `docs/durable.md` §12): a bit flipped in the last
+/// write's entries or an earlier one's, and the last writes lost though
+/// acknowledged, each found when the member opens (`Disk::verify`) and
+/// marked (`hyper_raft::Lost`). The member judges votes by its mark and tells
+/// a leader that counts what it lost (core step R-5), which sends it the
+/// entries again. Held to every invariant above, with a leader's commit
+/// counted by a mark where the copy was lost at rest, and once settled every
+/// member holds every committed entry as it was committed: nothing
+/// acknowledged is lost, and no damaged entry was applied or sent, or the
+/// group would hold another at its index.
+#[test]
+fn faults_at_rest_lose_nothing_acknowledged() {
+    for suspicion in [false] {
+        // By suspicion only once a marked member may campaign (R-7): one that
+        // led and restarted marked cannot otherwise end the lease its
+        // followers keep on its node, which lives.
+        for (name, settings) in settings() {
+            let settings = Settings {
+                suspicion,
+                ..settings
+            };
+            let mix = Mix {
+                corrupt: corrupt_rate(),
+                ..mix_for(&settings, 0)
+            };
+            schedules_of(name, settings, &[1, 2, 3], &mix);
+        }
+    }
+}
+
 #[test]
 fn random_interleavings_keep_every_invariant() {
     for (name, settings) in settings() {
@@ -274,39 +338,82 @@ fn the_fast_track_with_readies_persisted_at_random_lags_is_safe_and_settles() {
 /// safe and settles.
 #[test]
 fn a_crash_at_every_persistence_step_loses_nothing_durable() {
+    crashes_at_every_persistence_step(false);
+}
+
+/// The same crashes, in schedules with faults at rest besides: a crash
+/// between any two persistence steps of a member marked, or of its leader
+/// while it repairs it, loses nothing acknowledged. A schedule here is
+/// shorter than a mark lasts ([`corrupt_rate`]), so each suffers one fault in
+/// its steps, as many as there are.
+#[test]
+fn a_crash_at_every_persistence_step_with_faults_at_rest_loses_nothing_acknowledged() {
+    crashes_at_every_persistence_step(true);
+}
+
+fn crashes_at_every_persistence_step(faults_at_rest: bool) {
     // Four: the fewest from seed zero at which every variant below, on ticks
     // and by suspicion, holds a change behind the fence at some crash.
     let seeds = count("HYPER_RAFT_CRASH_SEEDS", 4);
     let steps = count("HYPER_RAFT_CRASH_STEPS", 400);
+    let corrupt = if faults_at_rest { 10_000 / steps } else { 0 };
     // The second has a leader apply its own entries before its write of them
     // is durable: a crash between the two (`docs/durable.md` §12). Each on
     // ticks and by suspicion.
     for (apply_unpersisted, suspicion) in
         [(false, false), (true, false), (false, true), (true, true)]
     {
+        if corrupt > 0 && suspicion {
+            // A marked member does not campaign (`docs/durable.md` §5): one
+            // that led, restarted marked, cannot end the lease its followers
+            // keep on its node, which lives.
+            continue;
+        }
         let settings = Settings {
             depth: 3,
             apply_unpersisted,
             suspicion,
             ..Settings::focal()
         };
-        let mix = mix_for(&settings, 0);
+        let mix = Mix {
+            corrupt,
+            ..mix_for(&settings, 0)
+        };
         let mut crashes = 0u64;
         let mut lost = 0u64;
+        let mut faults = 0u64;
         let mut reached = Coverage::default();
-        for seed in 0..seeds {
-            let (_, events) = schedule(settings, &[1, 2, 3], seed, steps, &mix, None);
+        // With faults at rest, the first seeds whose schedule suffers one:
+        // a fault finds a disk that holds entries only between compactions,
+        // and one schedule in twenty did (measured, from seed zero), so the
+        // search is bounded at sixty-four times as many.
+        let mut taken = 0;
+        for seed in 0..seeds * 64 {
+            if taken == seeds {
+                break;
+            }
+            let (whole, events) = schedule(settings, &[1, 2, 3], seed, steps, &mix, None);
+            if faults_at_rest && whole.faults == 0 {
+                continue;
+            }
+            taken += 1;
             for at in 0..events {
                 let (group, _) = schedule(settings, &[1, 2, 3], seed, steps, &mix, Some(at));
                 crashes += 1;
+                faults += group.faults;
                 let coverage = group.coverage();
                 lost += coverage.lost;
                 reached.add(coverage);
             }
         }
         println!(
-            "applying before durable {apply_unpersisted}, by suspicion {suspicion}: {crashes} crashes, one at each persistence step, lost {lost} writes out; {reached:?}"
+            "applying before durable {apply_unpersisted}, by suspicion {suspicion}: {crashes} crashes, one at each persistence step, lost {lost} writes out, {faults} faults at rest; {reached:?}"
         );
+        assert_eq!(
+            taken, seeds,
+            "seeds whose schedule suffered a fault at rest"
+        );
+        assert!(!faults_at_rest || faults > 0, "{faults} {crashes}");
         assert!(crashes > seeds * 20 && lost > 0, "{crashes} {lost}");
         assert!(reached.answers > 0 && reached.fenced > 0, "{reached:?}");
         assert!(!apply_unpersisted || reached.unpersisted > 0, "{reached:?}");

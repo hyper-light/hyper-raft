@@ -10,7 +10,7 @@ use hyper_raft::proto::{
 };
 
 use super::{
-    Coverage, Disk, Output, ROUND_NS, Replica, SPAN_NS, Said, Seeded, Settings, Step, Store,
+    Coverage, Disk, Fault, Output, ROUND_NS, Replica, SPAN_NS, Said, Seeded, Settings, Step, Store,
     TICK_NS, View, members, votes,
 };
 
@@ -51,6 +51,9 @@ pub enum Op {
     Suspect(u64, u64),
     /// By suspicion: the first member's detectors trust the second again.
     Trust(u64, u64),
+    /// A fault at rest on the member's disk, found when it opens again
+    /// (`Disk::verify`): it stops, suffers it, and opens marked.
+    Corrupt(u64, Fault),
 }
 
 /// By suspicion, of a hundred steps, how many are a detector's word: as
@@ -100,6 +103,9 @@ pub struct Mix {
     /// before it holds them (`docs/durable.md` §4.2, §14.2). A hundred for a
     /// leader whose disk is like the others'.
     pub leader_durable: u64,
+    /// Of ten thousand steps, how many are a fault at rest ([`Op::Corrupt`]);
+    /// none where the cores are compared, `raft-rs` having no marks.
+    pub corrupt: u64,
 }
 impl Mix {
     pub fn everything() -> Self {
@@ -117,6 +123,7 @@ impl Mix {
             repeat: 5,
             lag: 0,
             leader_durable: 100,
+            corrupt: 0,
         }
     }
 }
@@ -163,6 +170,19 @@ pub struct Cluster<R> {
     stopped: Coverage,
     /// Each member's clock, by suspicion: its ticks advance it.
     pub clocks: BTreeMap<u64, u64>,
+    /// Faults at rest suffered.
+    pub faults: u64,
+    /// Schedules whose group was left waiting on a mark, as the election rule
+    /// must (`Cluster::electable`).
+    pub waits: u64,
+    /// Marks ended: the member's log holds again what it lost.
+    pub repaired: u64,
+    /// The steps the ended marks lasted, all together.
+    pub marked_steps: u64,
+    /// For each member whose disk is marked, the step it was marked at.
+    marked_since: BTreeMap<u64, u64>,
+    /// Operations acted on.
+    steps: u64,
 }
 
 impl<R: Replica> Cluster<R> {
@@ -189,6 +209,12 @@ impl<R: Replica> Cluster<R> {
             counted_by: BTreeMap::new(),
             stopped: Coverage::default(),
             clocks: BTreeMap::new(),
+            faults: 0,
+            waits: 0,
+            repaired: 0,
+            marked_steps: 0,
+            marked_since: BTreeMap::new(),
+            steps: 0,
         };
         for id in 1..=count {
             let node = cluster.open(id, Store::new(boot.clone()));
@@ -354,6 +380,7 @@ impl<R: Replica> Cluster<R> {
 
     pub fn act(&mut self, op: &Op) -> Vec<Report> {
         let mut reports = Vec::new();
+
         match op {
             Op::Deliver { at, keep, lose } => {
                 let message = if *keep {
@@ -495,9 +522,32 @@ impl<R: Replica> Cluster<R> {
                 let accepted = self.node(*id).map(|node| node.persist(*step));
                 reports.push(self.report(*id, accepted));
             }
+            Op::Corrupt(id, fault) => {
+                self.stop(*id);
+                if let Member::Down(store) = &mut self.members[(*id - 1) as usize] {
+                    store.0.suffer(*fault);
+                }
+                self.faults += 1;
+                reports.extend(self.act(&Op::Restart(*id)));
+            }
         }
         if R::LAGGED {
             self.check_durable();
+        }
+        self.steps += 1;
+        for id in self.ids() {
+            let marked = self.disk(id).mark().is_some();
+            match self.marked_since.get(&id).copied() {
+                None if marked => {
+                    self.marked_since.insert(id, self.steps);
+                }
+                Some(since) if !marked => {
+                    self.marked_since.remove(&id);
+                    self.repaired += 1;
+                    self.marked_steps += self.steps - since;
+                }
+                _ => {}
+            }
         }
         reports
     }
@@ -530,14 +580,18 @@ impl<R: Replica> Cluster<R> {
             if last.is_none_or(|(term, index)| term != led.term || index == committed.index) {
                 continue;
             }
+            // A member whose disk lost the entry at rest after it acknowledged it
+            // was counted for what it held then: its mark says so.
+            let kept = |disk: &Disk| {
+                holds(disk, committed)
+                    || disk
+                        .mark()
+                        .is_some_and(|lost| lost.index >= committed.index)
+            };
             let held = |conf: &ConfState| {
                 [&conf.voters, &conf.voters_outgoing].iter().all(|half| {
                     half.is_empty()
-                        || half
-                            .iter()
-                            .filter(|voter| holds(self.disk(**voter), committed))
-                            .count()
-                            * 2
+                        || half.iter().filter(|voter| kept(self.disk(**voter))).count() * 2
                             > half.len()
                 })
             };
@@ -650,6 +704,32 @@ impl<R: Replica> Cluster<R> {
                     } else {
                         Op::Trust(member, peer)
                     };
+                }
+            }
+            // Drawn only where faults at rest are: a schedule without draws as
+            // it always did. One member's disk at a time is marked: with two,
+            // what both acknowledged may be lost to both, and the group then
+            // waits for good (`docs/durable.md` §5).
+            if mix.corrupt > 0 && rng.below(10_000) < mix.corrupt {
+                // A member whose disk holds entries.
+                let holding: Vec<u64> = all
+                    .iter()
+                    .copied()
+                    .filter(|id| !self.disk(*id).entries.is_empty())
+                    .collect();
+                let member = rng.pick(&holding).unwrap_or(1);
+                let others_marked = all
+                    .iter()
+                    .any(|id| *id != member && self.disk(*id).mark().is_some());
+                let disk = self.disk(member);
+                let held = disk.entries.len() as u64;
+                if !others_marked && held > 0 {
+                    let fault = if rng.chance(50) {
+                        Fault::Flip(disk.first_index() + rng.below(held))
+                    } else {
+                        Fault::Lose(1 + rng.below(held))
+                    };
+                    return Op::Corrupt(member, fault);
                 }
             }
             // Drawn only where members persist in steps: a schedule of
@@ -868,11 +948,80 @@ impl<R: Replica> Cluster<R> {
             let conf = self.disk(id).conf.clone();
             let deadline = self.peek(id).map(|node| node.deadline());
             println!(
-                "member {id}: deadline {deadline:?} clock {:?} proposed {proposed:?} {conf:?}\n  {view:?}",
-                self.clocks.get(&id)
+                "member {id}: deadline {deadline:?} clock {:?} proposed {proposed:?} {conf:?} mark {:?}\n  {view:?}",
+                self.clocks.get(&id),
+                self.disk(id).lost
             );
         }
         false
+    }
+}
+
+impl<R: Replica> Cluster<R> {
+    /// The members the election rule admits, read from every member's disk
+    /// whatever runs (`docs/durable.md` §5): a voter of the configuration it
+    /// applied, unmarked, for which a quorum of each half of that
+    /// configuration answers for no more than its log holds — each voter for
+    /// its log's last entry, or for its mark where its log may lack what it
+    /// acknowledged. A group with none must wait, for its logs cannot show
+    /// that an entry one of its marked members helped commit is held
+    /// elsewhere; with one, once the network is whole and every member up,
+    /// it elects.
+    pub fn electable(&self) -> Vec<u64> {
+        let claim = |disk: &Disk| {
+            let last = disk.last_index();
+            let whole = (disk.term(last).unwrap_or(0), last);
+            disk.mark()
+                .map_or(whole, |lost| (lost.term, lost.index).max(whole))
+        };
+        self.ids()
+            .into_iter()
+            .filter(|candidate| {
+                let disk = self.disk(*candidate);
+                let conf = &disk.conf;
+                if !votes(conf, *candidate) || disk.mark().is_some() {
+                    return false;
+                }
+                let last = disk.last_index();
+                let whole = (disk.term(last).unwrap_or(0), last);
+                [&conf.voters, &conf.voters_outgoing].iter().all(|half| {
+                    half.is_empty()
+                        || half
+                            .iter()
+                            .filter(|voter| claim(self.disk(**voter)) <= whole)
+                            .count()
+                            * 2
+                            > half.len()
+                })
+            })
+            .collect()
+    }
+    /// Nothing acknowledged is lost: once the group settled, every member of
+    /// the configuration holds every entry committed, at its index, as it
+    /// was committed (under its snapshot, or in its log), whatever its disk
+    /// suffered.
+    pub fn check_kept(&self) {
+        let Some(leader) = self.leaders_now().into_iter().next() else {
+            return;
+        };
+        let conf = self.disk(leader).conf.clone();
+        for member in members(&conf) {
+            let disk = self.disk(member);
+            for (index, said) in &self.chosen {
+                if *index <= disk.snapshot_index() {
+                    continue;
+                }
+                let held = disk
+                    .entries
+                    .get((*index - disk.first_index()) as usize)
+                    .is_some_and(|entry| entry.entry_type == said.2 && entry.data == said.3);
+                assert!(
+                    held,
+                    "seed {}: member {member} lost {index}, committed",
+                    self.seed
+                );
+            }
+        }
     }
 }
 

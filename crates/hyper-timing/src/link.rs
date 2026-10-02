@@ -370,6 +370,16 @@ pub struct LinkEstimator {
     trust: Trust,
     last_arrival_ns: Option<u64>,
     configured_at: u64,
+    /// The latest heartbeat's prediction error, `A − EA` in nanoseconds against the expected
+    /// arrival as the freshness test takes it (its mean truncated to the nanosecond): what a
+    /// node's pool of its links is fed (`docs/timing.md` §3, item 10).
+    latest_error: Option<i64>,
+    /// A longer interval the sender may move to from its next heartbeat on, nanoseconds; zero for
+    /// none ([`expect_interval`](Self::expect_interval)).
+    next_interval_ns: u64,
+    /// The granularity the ring was sized by when the estimator was built: a retime sizes it by
+    /// the same, so a move to a longer interval never grows it.
+    ring_granularity_ns: u64,
 }
 
 /// `duration` in nanoseconds, saturating at `u64::MAX` (584 years).
@@ -457,6 +467,9 @@ impl LinkEstimator {
             trust: Trust::Unconfigured,
             last_arrival_ns: None,
             configured_at: 0,
+            latest_error: None,
+            next_interval_ns: 0,
+            ring_granularity_ns: granularity_ns,
         })
     }
 
@@ -475,7 +488,12 @@ impl LinkEstimator {
         if interval_ns == 0 {
             return Err(EstimateError::ZeroInterval);
         }
-        let capacity = drift_bound(self.granularity_ns, interval_ns);
+        // The ring is sized by the granularity it was built with, not the latest: a `G` measured
+        // larger since would grow it at a move to a longer interval, an allocation on a heartbeat
+        // the law forbids (`docs/benchmarks.md`, "hyper-liveness"). Where `G` grew, the window is
+        // held below its drift bound by the ring, as any window is (`update_window`); `n_A` binds
+        // far below either on every trace (§2.6).
+        let capacity = drift_bound(self.ring_granularity_ns, interval_ns);
         let slots = usize::try_from(capacity.saturating_add(1)).unwrap_or(usize::MAX);
         self.sums.clear();
         self.sums.resize(slots, 0);
@@ -492,7 +510,37 @@ impl LinkEstimator {
         };
         self.correlation = None;
         self.configured_at = self.received;
+        self.next_interval_ns = 0;
         Ok(())
+    }
+
+    /// The sender may space its next heartbeats `interval` apart, from any heartbeat on: the
+    /// receiver asked it to (Chen et al.'s adaptive scheme, the receiver asking in its own
+    /// heartbeats). A sender that moved to a longer interval sends its next heartbeat that much
+    /// later than the expected arrival at the interval in force, and a freshness point at the old
+    /// spacing would suspect it for the move; so until a heartbeat at the new interval comes
+    /// ([`retime`](Self::retime)), each freshness point is put back by the difference, which the
+    /// bound on detection counts ([`next_interval`](Self::next_interval)). An interval no longer
+    /// than the one in force changes nothing: the next heartbeat comes no later.
+    pub fn expect_interval(&mut self, interval: Duration) {
+        let interval_ns = nanos(interval);
+        let next = if interval_ns > self.interval_ns {
+            interval_ns
+        } else {
+            0
+        };
+        if next != self.next_interval_ns {
+            self.next_interval_ns = next;
+            if let (Trust::Trusted { .. }, Some(until_ns)) = (self.trust, self.fresh_until()) {
+                self.trust = Trust::Trusted { until_ns };
+            }
+        }
+    }
+
+    /// The longest the next heartbeat may be spaced from the latest: the interval in force, or a
+    /// longer one the sender may move to ([`expect_interval`](Self::expect_interval)).
+    pub fn next_interval(&self) -> Duration {
+        Duration::from_nanos(self.interval_ns.max(self.next_interval_ns))
     }
 
     /// The receiver's granularity `G` moved ([`crate::Lateness`]): `n_G` and the drift bound follow
@@ -525,6 +573,34 @@ impl LinkEstimator {
         });
         let offset = Self::offset(anchor, self.interval_ns, seq, arrival_ns)?;
         self.last_arrival_ns = Some(arrival_ns);
+        self.count(seq, offset);
+        Ok(self.refresh(arrival_ns))
+    }
+
+    /// Heartbeat `seq`'s offset from its schedule, `offset_ns`, given rather than measured: what a
+    /// node's pool takes of each of its links, their prediction errors, which carry no clock of
+    /// their own (`docs/timing.md` §3, item 10). The estimates move as for a heartbeat; the trust
+    /// does not, since the offsets are no sender's. A heartbeat no newer than the latest is not
+    /// taken, as with [`on_heartbeat`](Self::on_heartbeat).
+    pub fn on_offset(&mut self, seq: u64, offset_ns: i64) -> Result<(), EstimateError> {
+        if self.highest.is_some_and(|highest| seq <= highest) {
+            return Ok(());
+        }
+        if offset_ns.unsigned_abs() > OFFSET_LIMIT {
+            return Err(EstimateError::OutOfRange);
+        }
+        self.anchor.get_or_insert(Schedule { seq, at_ns: 0 });
+        self.count(seq, offset_ns);
+        Ok(())
+    }
+
+    /// Folds heartbeat `seq`'s `offset` into the prediction errors, the ring, the levels and the
+    /// loss.
+    fn count(&mut self, seq: u64, offset: i64) {
+        self.latest_error = self.window_sum().and_then(|(length, sum)| {
+            let mean = sum.checked_div(i64::try_from(length).ok()?)?;
+            offset.checked_sub(mean)
+        });
         if let Some(predicted) = self.window_mean() {
             self.errors.add(offset as f64 - predicted);
         }
@@ -532,7 +608,12 @@ impl LinkEstimator {
         self.first_seq.get_or_insert(seq);
         self.highest = Some(seq);
         self.received = self.received.saturating_add(1);
-        Ok(self.refresh(arrival_ns))
+    }
+
+    /// The latest heartbeat's prediction error `A − EA`, nanoseconds: `None` for the first at an
+    /// interval, which has no window to be predicted from.
+    pub fn latest_error(&self) -> Option<i64> {
+        self.latest_error
     }
 
     /// `A − σ`: the arrival less its schedule, from `anchor`, in nanoseconds.
@@ -639,13 +720,16 @@ impl LinkEstimator {
         scheduled.checked_add(mean)
     }
 
-    /// The freshness point of the heartbeat after the latest: `τ_{h+1} = EA_{h+1} + α`.
+    /// The freshness point of the heartbeat after the latest: `τ_{h+1} = EA_{h+1} + α`, put back by
+    /// a longer interval the sender may have moved to ([`expect_interval`](Self::expect_interval)).
     fn fresh_until(&self) -> Option<u64> {
         let margin = self.margin_ns?;
         let next = self.highest?.checked_add(1)?;
+        let moved = self.next_interval_ns.saturating_sub(self.interval_ns);
         let until = self
             .expected_arrival(next)?
-            .checked_add(i128::from(margin))?;
+            .checked_add(i128::from(margin))?
+            .checked_add(i128::from(moved))?;
         Some(clock(until))
     }
 
@@ -710,6 +794,64 @@ impl LinkEstimator {
     /// The margin in force, once configured.
     pub fn margin(&self) -> Option<Duration> {
         self.margin_ns.map(Duration::from_nanos)
+    }
+
+    /// The interval at which this link's heartbeats would be independent, while its integrated
+    /// autocorrelation time cannot be measured at the interval it is at
+    /// ([`Refusal::CorrelationUnmeasured`]); `None` while it is measured, before an Allan level
+    /// long enough to say has its windows, and while the refusal is within the levels' own
+    /// uncertainty.
+    ///
+    /// The variance of an `m`-mean of a correlated series is `V·τ_int/m` (Sokal 1997, §3): `τ_int`
+    /// consecutive heartbeats carry what one independent heartbeat does, so heartbeats `τ_int`
+    /// intervals apart are independent, and at that spacing the history measures its own `τ_int`
+    /// within Madras and Sokal's window `m ≥ c·τ̂(m)`, `c = 6`, at the first level that can hold
+    /// it, windows of eight, once it has seven: 56 heartbeats. The longest level with its windows
+    /// gives the estimate, `τ̂(m) = m·σ²_A(m)/V`, the most of the correlation the history has seen;
+    /// a level shorter than the correlation sees only part of it, so the estimate is low, never
+    /// high. It is taken at the low end of its uncertainty: the level's Allan deviation is known
+    /// to within `1/√(2(K−1))` for its `K` windows (the tolerance `n_A` takes, Allan 1966), so
+    /// `τ̂` to within that factor squared, and a link whose `τ̂` fails the window by less than that
+    /// waits for longer levels, which narrow it. Where it fails by more, `τ̂` at the low end is
+    /// past `m/c ≥ 8/6`, so each move lengthens the interval by more than a third, and a link still
+    /// too correlated at the interval given is moved again; the moves end at the first interval
+    /// whose heartbeats its history can tell apart, the link's correlation time measured online
+    /// (`docs/timing.md` §2.8).
+    pub fn independent_interval(&self) -> Option<Duration> {
+        if self.correlation.is_some() {
+            return None;
+        }
+        let variance = self.errors.variance()?;
+        let (window, allan, windows) = self
+            .allan
+            .qualified(u64::MAX)
+            .filter(|(window, ..)| *window as f64 >= SOKAL_C)
+            .last()?;
+        let m = window as f64;
+        let tau = if variance > 0.0 {
+            (m * allan / variance).max(1.0)
+        } else {
+            1.0
+        };
+        let spread = 1.0 + 1.0 / (2.0 * windows.saturating_sub(1) as f64).sqrt();
+        let least = tau / (spread * spread);
+        if least <= m / SOKAL_C {
+            return None;
+        }
+        let spacing = self.interval_ns as f64 * least;
+        // f64 → Duration: an interval past what a Duration holds is held at its maximum.
+        Some(Duration::try_from_secs_f64(spacing.ceil() / 1e9).unwrap_or(Duration::MAX))
+    }
+
+    /// A margin from elsewhere, in force until [`configure`](Self::configure) gives the link its
+    /// own: the margin a node's pool of its links configures for this one while this one's own
+    /// evidence is short (`docs/timing.md` §3, item 10). The trust follows it as a configuration's
+    /// does: a trusted sender is trusted to the new freshness point, a suspected one stays
+    /// suspected until a heartbeat comes, and a first margin judges the latest heartbeat by its
+    /// own stamp.
+    pub fn impose(&mut self, margin: Duration) {
+        self.margin_ns = Some(nanos(margin));
+        self.trust = self.retrusted();
     }
 
     /// Whether the estimates have renewed since the last configuration: a window's worth of
@@ -1003,6 +1145,152 @@ mod tests {
             link.trust(),
             Trust::Trusted { .. } | Trust::Suspected
         ));
+    }
+
+    /// A link whose heartbeats are correlated far past any window its history holds at its
+    /// interval (an AR(1) delay with a correlation time of about 200 ms, heartbeats every
+    /// millisecond) refuses for want of `τ_int` until a level of thousands of heartbeats has its
+    /// windows, and a link whose correlation outgrows every level, never; moved to the interval its
+    /// levels give each time it refuses, it reaches one its history can measure and configures, in
+    /// a few hundred heartbeats, each move longer than the last by more than a third. Over 64
+    /// seeds: configured within 576 heartbeats, at a final interval of 166 ms at the median
+    /// (the correlation time is 199 ms) and 1.26 s at the most.
+    #[test]
+    fn a_link_too_correlated_to_measure_moves_to_the_interval_its_levels_give() {
+        // The delay at fine steps of one millisecond: x' = ρx + ε, ρ = 0.99, τ_int = 199 steps.
+        let step = MS;
+        let rho = 0.99f64;
+        for seed in 1..=64u64 {
+            let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+            let mut x = 0.0f64;
+            let mut fine = |state: &mut u64| {
+                // A uniform innovation of mean zero and deviation 100 µs.
+                let u = (noise(state) >> 11) as f64 / (1u64 << 53) as f64 - 0.5;
+                x = rho * x + u * 100_000.0 * 12f64.sqrt();
+                x
+            };
+            let fixed = || {
+                LinkEstimator::new(Duration::from_millis(1), Duration::from_micros(50), None)
+                    .unwrap()
+            };
+            // At the interval it starts at, the seeds' first link refuses after a thousand heartbeats,
+            // more than any moved link takes: its levels measure `τ_int` once one of `6·τ_int`
+            // heartbeats has its seven windows, some 8,000 heartbeats, unless a short one's estimate
+            // falls under its window by chance (`docs/timing.md` §3, item 3).
+            let mut t = 0u64;
+            if seed == 1 {
+                let mut stuck = fixed();
+                for seq in 0..1_000u64 {
+                    let delay = 5 * MS as i64 + fine(&mut state) as i64;
+                    t += step;
+                    stuck.on_heartbeat(seq, (t as i64 + delay) as u64).unwrap();
+                }
+                assert_eq!(
+                    stuck.configure(&costs(), &floors(Duration::from_millis(1))),
+                    Err(Refusal::CorrelationUnmeasured)
+                );
+                assert!(stuck.independent_interval().unwrap() > Duration::from_millis(1));
+            }
+            // Moved each time it refuses with a level to say, it configures.
+            let mut link = fixed();
+            let (mut seq, mut taken, mut moves) = (0u64, 0u64, Vec::new());
+            let mut every = 1u64;
+            loop {
+                let mut latest = 0.0;
+                for _ in 0..every {
+                    t += step;
+                    latest = fine(&mut state);
+                }
+                let delay = 5 * MS as i64 + latest as i64;
+                link.on_heartbeat(seq, (t as i64 + delay) as u64).unwrap();
+                seq += 1;
+                taken += 1;
+                let interval = link.interval();
+                match link.configure(&costs(), &floors(interval)) {
+                    Ok(_) => break,
+                    Err(Refusal::CorrelationUnmeasured) => {
+                        if let Some(next) = link.independent_interval() {
+                            assert!(next.as_secs_f64() > interval.as_secs_f64() * 4.0 / 3.0);
+                            every = (next.as_nanos() as u64).div_ceil(step);
+                            link.retime(Duration::from_nanos(every * step), None)
+                                .unwrap();
+                            moves.push(every);
+                        }
+                    }
+                    Err(Refusal::TooFewHeartbeats) => {}
+                    Err(Refusal::Unconfigurable) => panic!("unconfigurable"),
+                }
+                assert!(
+                    taken < 1_000,
+                    "not configured after {taken}: moves {moves:?}"
+                );
+            }
+            println!("seed {seed}: configured after {taken} heartbeats, moves {moves:?}");
+        }
+    }
+
+    /// Offsets given are estimated as the same offsets measured: a pool of links' prediction
+    /// errors is a link's history like any other, signed, with no trust of its own.
+    #[test]
+    fn offsets_given_are_estimated_as_offsets_measured() {
+        let interval = Duration::from_millis(5);
+        let mut measured = LinkEstimator::new(
+            interval,
+            Duration::from_micros(50),
+            Some(Schedule { seq: 0, at_ns: 0 }),
+        )
+        .unwrap();
+        let mut given = LinkEstimator::new(interval, Duration::from_micros(50), None).unwrap();
+        let mut state = 0xC0FF_EE00_1234_5678;
+        for seq in 0..400u64 {
+            let offset = (noise(&mut state) % (2 * MS)) as i64 - MS as i64;
+            measured
+                .on_heartbeat(seq, seq * 5 * MS + (offset + 10 * MS as i64) as u64)
+                .unwrap();
+            given.on_offset(seq, offset + 10 * MS as i64).unwrap();
+            assert_eq!(measured.latest_error(), given.latest_error());
+        }
+        let (a, b) = (measured.estimates(), given.estimates());
+        assert_eq!(a.received, b.received);
+        assert_eq!(a.delay_deviation, b.delay_deviation);
+        assert_eq!(a.correlation, b.correlation);
+        assert_eq!(a.window, b.window);
+        assert_eq!(given.trust(), Trust::Unconfigured);
+        assert_eq!(
+            given.on_offset(400, OFFSET_LIMIT as i64 + 1),
+            Err(EstimateError::OutOfRange)
+        );
+    }
+
+    /// A margin imposed from elsewhere judges the link as its own would, until its own replaces it.
+    #[test]
+    fn an_imposed_margin_judges_until_the_link_configures_its_own() {
+        let interval = Duration::from_millis(50);
+        let mut link = LinkEstimator::new(
+            interval,
+            Duration::from_micros(50),
+            Some(Schedule { seq: 0, at_ns: 0 }),
+        )
+        .unwrap();
+        link.on_heartbeat(0, 2 * MS).unwrap();
+        link.on_heartbeat(1, 50 * MS + 2 * MS).unwrap();
+        assert_eq!(
+            link.configure(&costs(), &floors(interval)),
+            Err(Refusal::TooFewHeartbeats)
+        );
+        link.impose(Duration::from_millis(10));
+        let until = link.deadline().unwrap();
+        assert_eq!(
+            until,
+            100 * MS + 2 * MS + 10 * MS,
+            "EA of the next plus the margin"
+        );
+        assert_eq!(link.poll(until), Some(Event::Suspected));
+        assert_eq!(link.on_heartbeat(2, until + MS), Ok(Some(Event::Trusted)));
+        let mut state = 5;
+        white(&mut link, 300, 2 * MS, MS, &mut state);
+        let own = link.configure(&costs(), &floors(interval)).unwrap();
+        assert_eq!(link.margin(), Some(own.current.margin));
     }
 
     #[test]

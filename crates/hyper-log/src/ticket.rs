@@ -12,15 +12,22 @@
 //! no channel per call. Each thread keeps the ports it has finished with; it holds at most as many
 //! as it once had calls out at a time, which the log's queue bounds for submissions and which is
 //! one for a call that waits (`Log::view`, `Log::term`, ...).
+//!
+//! A caller that waits on its answer from the moment it submits may be handed its frame's I/O
+//! through its port (`Reply::Io`): it does the I/O on its own thread, as mantle's writer did on
+//! its, and hears its answer when the I/O is done (`owner::Owner::start`).
 
 use std::cell::{Cell, RefCell};
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, sync_channel};
 use std::task::Waker;
 
+use crate::device::Io;
 use crate::group::Mirror;
 use crate::{Entry, Fetched, LogError, View};
 
-/// Replies one ticket carries at most: its admission, for a submission, and its answer.
+/// Replies one ticket carries at most: its admission, for a submission whose caller hears of it,
+/// or its frame's I/O, for one whose caller waits on its answer and never hears of its admission
+/// (the two are never the same ticket's); and its answer.
 const REPLIES: usize = 2;
 
 /// A reply through a ticket.
@@ -29,6 +36,8 @@ pub(crate) enum Reply {
     Admitted,
     /// The call's answer, and the port's sending end, given back with it.
     Answer(Result<Answer, LogError>, SyncSender<Reply>),
+    /// The I/O of the frame that carries the submission, for its caller to do.
+    Io(Box<dyn Io>),
 }
 
 /// What a call is answered.
@@ -95,6 +104,12 @@ impl Ticket {
         }
     }
 
+    /// Where the caller hears its replies, for a caller that waits on them from the moment it
+    /// submits: its frame's I/O may go there. `None` once answered.
+    pub(crate) fn port(&self) -> Option<SyncSender<Reply>> {
+        self.reply.clone()
+    }
+
     /// Tells the caller its submission is admitted.
     pub(crate) fn admit(&self) {
         if let Some(reply) = &self.reply {
@@ -157,6 +172,7 @@ impl Waiting {
         loop {
             match receive.recv() {
                 Ok(Reply::Admitted) => {}
+                Ok(Reply::Io(io)) => io.run(),
                 Ok(Reply::Answer(answer, back)) => return self.took(answer, back),
                 Err(_) => return Err(LogError::Closed),
             }
@@ -174,6 +190,7 @@ impl Waiting {
         loop {
             match receive.try_recv() {
                 Ok(Reply::Admitted) => {}
+                Ok(Reply::Io(io)) => io.run(),
                 Ok(Reply::Answer(answer, back)) => return Some(self.took(answer, back)),
                 Err(TryRecvError::Empty) => return None,
                 Err(TryRecvError::Disconnected) => return Some(Err(LogError::Closed)),
@@ -184,10 +201,15 @@ impl Waiting {
     /// Waits for a submission's admission: `Ok` once admitted, its refusal otherwise.
     pub(crate) fn admitted(&self) -> Result<(), LogError> {
         let receive = self.receive.as_ref().ok_or(LogError::Closed)?;
-        match receive.recv() {
-            Ok(Reply::Admitted) => Ok(()),
-            Ok(Reply::Answer(answer, back)) => self.took(answer, back).and(Err(LogError::Closed)),
-            Err(_) => Err(LogError::Closed),
+        loop {
+            match receive.recv() {
+                Ok(Reply::Admitted) => return Ok(()),
+                Ok(Reply::Io(io)) => io.run(),
+                Ok(Reply::Answer(answer, back)) => {
+                    return self.took(answer, back).and(Err(LogError::Closed));
+                }
+                Err(_) => return Err(LogError::Closed),
+            }
         }
     }
 
@@ -207,6 +229,16 @@ impl Drop for Waiting {
         // Answered: both ends are here and the port is empty, so it serves the next call.
         if let (Some(back), Some(receive)) = (self.back.take(), self.receive.take()) {
             keep((back, receive));
+            return;
+        }
+        // A caller that leaves before its answer does any I/O handed to it, which holds the
+        // log's device and other callers' answers.
+        if let Some(receive) = self.receive.take() {
+            while let Ok(reply) = receive.try_recv() {
+                if let Reply::Io(io) = reply {
+                    io.run();
+                }
+            }
         }
     }
 }

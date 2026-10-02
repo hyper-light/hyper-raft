@@ -8,9 +8,9 @@
 //! the batch is laid into a frame after the sweep's copies, and the frame is written and flushed
 //! on the device; once it is, the frame is published, the frame before it answered, and the loop
 //! goes round. Mantle's writer did each of these in turn on its own thread, blocking on the
-//! device; here the owner hands each I/O to the device, done by the thread that does not lead
-//! (`owner.rs`), and goes on answering callers until it comes back, and the order of everything
-//! the log decides is the same. The device finishes a frame as the writer did after its flush
+//! device; here the owner hands each I/O to the device, done by a caller of the frame that waits
+//! on its answer or by the log's I/O thread (`owner.rs`), and goes on answering callers until it
+//! comes back, and the order of everything the log decides is the same. The device finishes a frame as the writer did after its flush
 //! (`device.rs`): the frame before is answered, its confirmation being this frame's record, and
 //! this frame confirmed on its own unless the owner has said another follows, which is when
 //! submissions were admitted while the frame was on the device: what the writer found queued
@@ -327,7 +327,7 @@ impl<F: BlockFile + 'static> Owner<F> {
 
     /// Hands a write-path job to the device: one at a time, the owner waiting for each.
     fn dispatch(&mut self, job: Job<F>) {
-        self.io.push_back(job);
+        self.io.push_back((job, None));
     }
 
     /// The tail is read: its live pieces go first in the payload, then the batch.
@@ -558,6 +558,11 @@ impl<F: BlockFile + 'static> Owner<F> {
                 let Laid {
                     sweep, mut taken, ..
                 } = laid;
+                // A caller of the frame that waits on its answer does the frame's I/O.
+                let doer = taken
+                    .iter()
+                    .find(|(s, _)| s.waits)
+                    .and_then(|(s, _)| s.ticket.port());
                 let these = self.answers_of(&mut taken);
                 let before = self
                     .unconfirmed
@@ -573,17 +578,20 @@ impl<F: BlockFile + 'static> Owner<F> {
                     tail,
                     sequence,
                 });
-                self.dispatch(Job::Frame(Frame {
-                    frame,
-                    at,
-                    record,
-                    record_at,
-                    sequence,
-                    confirm,
-                    before,
-                    these,
-                    more,
-                }));
+                self.io.push_back((
+                    Job::Frame(Frame {
+                        frame,
+                        at,
+                        record,
+                        record_at,
+                        sequence,
+                        confirm,
+                        before,
+                        these,
+                        more,
+                    }),
+                    doer,
+                ));
             }
             Err(e) => self.failed(VecDeque::new(), laid.taken, e, inbox),
         }

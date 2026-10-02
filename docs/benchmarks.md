@@ -621,6 +621,11 @@ transcripts and the device images:
 With the three fixed (`d04934e`, `7585e19`) the branch passed 200 of 200 runs pinned to one core
 and 50 of 50 unpinned, every hash mantle's.
 
+With the owner on its own thread and blocking callers flushing their own frames (`log-switch`),
+the same: built once in `rust:1.98.0` (aarch64 Linux in Docker on this Mac, 18 cores), the test
+binary passed 200 of 200 runs pinned to core 0 (`taskset -c 0`) and 50 of 50 unpinned, every hash
+mantle's, 18:06–18:16 PDT.
+
 ## Allocations
 
 `cargo bench -p hyper-log --bench allocs`: a log on a real file, closed-loop appends from 1 and 16
@@ -832,15 +837,57 @@ most. Load average 27 (17:18 PDT, other sessions building).
 - Reads cost nothing: the handle answers all 97 of an entry's reads where the replica is.
 - A write is two hand-offs, caller to the thread that flushes and back, as mantle's writer had
   it; it was seven (an admission and two device round trips).
-- The 2% left to mantle-log, within the runs' spread, is one context switch a write (19.5 an entry
-  against 12.1, six writes): while one of the log's threads flushes, the other holds the owner so
-  that callers are answered meanwhile, and it sleeps and is woken once more than a single writer
-  does. A design that lets a waiting caller do the flush itself, with no hand-off of the owner, is
-  the next step (`ORIGIN.md`, "Not done"). A protocol that woke the owner only when it waited for
-  the device was tried and measured: it left the count at 19.4, since the switch is the
-  hand-off's, and was not kept.
+- The 2% left to mantle-log, within the runs' spread, was one context switch a write (19.5 an
+  entry against 12.1, six writes). Its cause was the hand-off: the thread that took a submission
+  handed the owner to the other before flushing, so the other woke, took the owner and slept on
+  the inbox while the frame was flushed, and both log threads slept for every write besides the
+  caller, where mantle's writer had one. A protocol that woke the owner only when it waited for
+  the device left the count at 19.4, since the wake was the hand-off's. The next section removes
+  it.
 - Allocations are a third of mantle-log's and reallocations a hundredth: hyper-log's appends
   allocate nothing (below), and the rest are the core's and the store's.
+
+### The owner on its own thread, the caller flushing its own frame
+
+The owner now stays on one thread and never does I/O (`crates/hyper-log/ORIGIN.md`, "The owner on
+its own thread"): a frame's I/O goes to a caller of the frame that waits on its answer from the
+moment it submitted, which does the write, flush, confirmation and answers on its own thread as
+mantle's writer did on its, and any other job to the log's I/O thread; the job comes back through
+returns the owner reads before every message, waking the owner only for a completion it must
+answer, or when the owner has asked to be woken because work waits on the device. A blocking write
+with no one else submitting now wakes two threads, its caller and the owner, as mantle-log's did.
+
+The same run as above, three binaries rotated each round, nine rounds, each run a fresh process:
+**before** is main `8e1fd9d` (leader/followers), **after** this branch, **mantle-log** as above.
+Medians, with the least and the most.
+
+| | wall µs a committed entry | writes, views, terms, fetches | reads another thread answered | allocations | reallocations | context switches |
+|---|---|---|---|---|---|---|
+| run 1, 18:05 PDT, load 34 | | | | | | |
+| before | 79 (67–127) | 6, 82, 12, 3 | 0 | 72.2 | 0.20 | 19.7 |
+| **after** | **69** (58–83) | 6, 82, 12, 3 | 0 | 72.2 | 0.20 | **12.0** |
+| mantle-log | 81 (72–138) | 6, 82, 12, 3 | 0 | 213.2 | 21.17 | 12.0 |
+| run 2, 18:10 PDT, load 14–16, the Linux equivalence running beside it | | | | | | |
+| before | 228 (149–243) | 6, 82, 12, 3 | 0 | 72.2 | 0.20 | 19.5 |
+| **after** | **197** (130–216) | 6, 82, 12, 3 | 0 | 72.2 | 0.20 | **12.6** |
+| mantle-log | 224 (152–237) | 6, 82, 12, 3 | 0 | 213.2 | 21.17 | 12.6 |
+
+An earlier two-way run (`replicas 9`, 17:56 PDT, load 44–48) gave after 156 µs (147–292) against
+mantle-log's 169 (110–189), 12.0 switches each. The wall times move with the machine's load from
+run to run; within a run hyper-log is at or below mantle-log each time, with mantle-log's switch
+count, a third of its allocations and a hundredth of its reallocations, the allocations and
+reallocations unchanged by this work.
+
+mantle's throughput workload (`hyper-log-compare one hyper DIR 128 N 1.0`, before and after
+alternated, 18:05–18:06 PDT, load 31–34) drives the log through `submit_waking`, whose callers do
+not wait on their answers, so its frames are flushed by the I/O thread. Appends a second: at one
+replica 113 before and 98 after over three runs, and over eight more of two seconds each 68 before
+and 69 after (p50 14.38 and 14.35 ms: the device's flush); at 16 replicas 1412 and 1850; at 256,
+23694 and 23847 (medians of three; the spreads overlap at every point). `cargo bench -p hyper-log
+--bench allocs`, before and after alternated twice (load 15–19): allocations per append and per
+fetch are the same at every row; a fetch from the file at 16 replicas carries 121 bytes more
+(1090 against 969 at 128 B), the carrier box a log allocates at its first job, spread over the
+bench's fetches.
 
 ## End to end
 
@@ -884,6 +931,17 @@ cargo bench -p hyper-log --bench log -- DIR 1.0
 # The comparison: mantle's binary built at 147f035 in a clone (cargo build --release -p mantle).
 cd crates/hyper-log-compare && cargo build --release
 target/release/hyper-log-compare table DIR 5 1.0 path/to/mantle
+
+# The replica's path: hyper-log and mantle-log rotated, nine rounds, each run a fresh process; one
+# run of either log, and one point of mantle's workload on hyper-log.
+target/release/hyper-log-compare replicas 9
+target/release/hyper-log-compare replica <hyper|mantle>
+target/release/hyper-log-compare one hyper DIR 128 <replicas> 1.0
+
+# The equivalence on Linux, pinned to one core 200 times and unpinned 50 times, in rust:1.98.0
+# with the repository at /src: build the test binary once, then from crates/hyper-log run
+# `taskset -c 0 <binary>` 200 times and `<binary>` 50 times.
+cargo test -p hyper-log --test equivalence --all-features --locked --no-run
 ```
 
 # hyper-datagram against slates' seal

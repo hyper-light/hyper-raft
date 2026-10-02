@@ -187,7 +187,7 @@ impl<F: BlockFile + 'static> Owner<F> {
             return;
         };
         let reads = std::mem::replace(&mut fetch.reads, Reads::none());
-        self.io.push_back(Job::Read(reads));
+        self.io.push_back((Job::Read(reads), None));
     }
 
     /// A fetch's reads are back: entries that missed their place are looked up again, once, as

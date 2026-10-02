@@ -8,12 +8,12 @@
 //!
 //! From mantle-log at mantle `147f035` (`ORIGIN.md`), with its state held by one owner instead of
 //! a lock (mantle note 32 §3.9, L-2): callers reach the owner by message and hear back through
-//! tickets, one to one (`ticket.rs`). The owner runs the writer as steps between messages; the
-//! log's two threads take turns holding it, the one that has I/O to do handing it to the other
-//! and doing the I/O itself, so the owner answers callers while a frame is flushed and a write
-//! crosses from its caller to the thread that flushes it and back, as mantle's writer had it
-//! (`owner.rs`, `device.rs`). A log runs those two threads, whatever its number of groups or
-//! callers. A group's replica reads its group through the group's handle ([`GroupLog`]), which
+//! tickets, one to one (`ticket.rs`). The owner runs the writer as steps between messages on a
+//! thread of its own and hands each I/O, with the device, to a caller of the frame that waits on
+//! its answer, or else to the log's I/O thread, so the owner answers callers while a frame is
+//! flushed, and a blocking write crosses from its caller to the owner and back, the caller doing
+//! its frame's flush as mantle's writer did (`owner.rs`, `device.rs`). A log runs those two
+//! threads, whatever its number of groups or callers. A group's replica reads its group through the group's handle ([`GroupLog`]), which
 //! answers from the group's state as its writes left it, with no message to the owner
 //! (`group.rs`).
 #![cfg_attr(
@@ -325,11 +325,21 @@ impl<F> Refused<F> {
     }
 }
 
+/// What a submitter hears, and how it waits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Hears {
+    /// Its admission, waited for as it submits, then its answer.
+    Admission,
+    /// Only its answer, which it waits for from the moment it submits: its frame's I/O may be
+    /// given to it to do (`owner::Owner::start`).
+    Waits,
+}
+
 /// The log: a handle to its owner, which any number of threads may share by reference.
 pub struct Log<F: BlockFile + 'static> {
     inbox: SyncSender<Message<F>>,
-    /// The log's two threads, leading in turn; the one that leads when the log closes gives
-    /// back the file.
+    /// The log's two threads: the owner's, which gives back the file when the log closes, and
+    /// the I/O thread.
     threads: [Option<JoinHandle<Option<F>>>; 2],
     p: Params,
 }
@@ -450,6 +460,7 @@ impl<F: BlockFile + 'static> Log<F> {
                 admit: false,
                 handle: false,
                 lens: (0, 0),
+                waits: false,
             });
         }
         Ok(Prepared {
@@ -461,7 +472,7 @@ impl<F: BlockFile + 'static> Log<F> {
     }
 
     /// Starts the log's two threads, then hands the owner, with the device and its file, to the
-    /// first to lead: a thread the OS refuses leaves the file with the caller.
+    /// owner's thread: a thread the OS refuses leaves the file with the caller.
     fn spawn(
         file: F,
         p: Params,
@@ -471,8 +482,9 @@ impl<F: BlockFile + 'static> Log<F> {
     ) -> Result<Self, Refused<F>> {
         let config = p.config;
         // Everything that may wait in the inbox at once: every submission the queue admits,
-        // every waiter for room, the device's answers and its word that a frame is settled, and
-        // a release from each group's handle.
+        // every waiter for room, the device's words (its word that a frame is settled, its call
+        // for a completion to be answered, the I/O thread's word that a job is back), and a
+        // release from each group's handle.
         let capacity = config
             .queue_submissions
             .max(1)
@@ -481,22 +493,26 @@ impl<F: BlockFile + 'static> Log<F> {
             .saturating_add(1)
             .saturating_add(config.max_groups);
         let (inbox, messages) = sync_channel(capacity);
-        // Each thread waits for the owner on its own channel, which holds the one owner there is.
-        let (to_first, first_batons) = sync_channel::<Box<Owner<F>>>(1);
-        let (to_second, second_batons) = sync_channel::<Box<Owner<F>>>(1);
-        let worker = |batons, peer: SyncSender<Box<Owner<F>>>, name: &str| {
-            let done = inbox.clone();
-            std::thread::Builder::new()
-                .name(name.into())
-                .spawn(move || owner::follow(&batons, &peer, &done))
-        };
-        let Ok(leader) = worker(first_batons, to_second.clone(), "hyper-log") else {
+        // The owner's thread waits for the owner, which holds the file, until both threads run.
+        let (to_owner, owned) = sync_channel::<Box<Owner<F>>>(1);
+        let (requests, asked) = sync_channel(device::REQUESTS);
+        let Ok(owner_thread) = std::thread::Builder::new()
+            .name("hyper-log".into())
+            .spawn(move || owned.recv().ok().and_then(|owner| Owner::lead(*owner)))
+        else {
             return Err(Refused::with(LogError::Closed, file));
         };
-        let Ok(follower) = worker(second_batons, to_first.clone(), "hyper-log-io") else {
-            // The first thread ends once nothing can hand it the owner.
-            drop((to_first, to_second));
-            let _ = leader.join();
+        let done = inbox.clone();
+        let Ok(io) = std::thread::Builder::new()
+            .name("hyper-log-io".into())
+            .spawn(move || {
+                device::serve(&asked, &done);
+                None
+            })
+        else {
+            // The owner's thread ends once nothing can hand it the owner.
+            drop(to_owner);
+            let _ = owner_thread.join();
             return Err(Refused::with(LogError::Closed, file));
         };
         let largest = usize::try_from(config.segment_bytes).unwrap_or(usize::MAX);
@@ -504,6 +520,9 @@ impl<F: BlockFile + 'static> Log<F> {
         let (more, told) = sync_channel(device::MORE);
         // One frame's flush is told at a time: the owner reads it before the next frame goes out.
         let (flushed, flushes) = sync_channel(1);
+        // One job is out at a time, and comes back before the next goes out.
+        let (back, returns) = sync_channel(1);
+        let (token, tokens) = sync_channel(device::TOKENS);
         let device = device::Device::new(
             file,
             pool,
@@ -511,20 +530,25 @@ impl<F: BlockFile + 'static> Log<F> {
             told,
             flushed,
             inbox.clone(),
+            device::Returns {
+                returns: back,
+                tokens: token,
+            },
         );
         let wiring = owner::Wiring {
             device,
             more,
             inbox: messages,
             flushes,
+            returns,
+            tokens,
+            requests,
         };
         let owner = Box::new(Owner::new(p, state, room, first, wiring));
-        // The first thread waits with room for the owner. Should the send fail, the owner, and
+        // The owner's thread waits with room for the owner. Should the send fail, the owner, and
         // the file in it, ended with the thread.
-        let sent = to_first.send(owner);
-        drop((to_first, to_second));
-        if sent.is_err() {
-            let _ = (leader.join(), follower.join());
+        if to_owner.send(owner).is_err() {
+            let _ = (owner_thread.join(), io.join());
             return Err(Refused {
                 error: LogError::Closed,
                 file: None,
@@ -532,7 +556,7 @@ impl<F: BlockFile + 'static> Log<F> {
         }
         Ok(Self {
             inbox,
-            threads: [Some(leader), Some(follower)],
+            threads: [Some(owner_thread), Some(io)],
             p,
         })
     }
@@ -542,7 +566,7 @@ impl<F: BlockFile + 'static> Log<F> {
     /// answered through the returned handle once it is durable and a later record confirms
     /// so.
     pub fn submit(&self, group: u128, update: Update) -> Result<Pending, LogError> {
-        self.send(group, Class::Normal, update, false, None, true)
+        self.send(group, Class::Normal, update, false, None, Hears::Admission)
     }
 
     /// Submits `update` for `group` as `submit` does, in `class`.
@@ -552,7 +576,7 @@ impl<F: BlockFile + 'static> Log<F> {
         class: Class,
         update: Update,
     ) -> Result<Pending, LogError> {
-        self.send(group, class, update, false, None, true)
+        self.send(group, class, update, false, None, Hears::Admission)
     }
 
     /// Submits `update` for `group`, waiting for room in the queue rather than refusing. A
@@ -561,7 +585,7 @@ impl<F: BlockFile + 'static> Log<F> {
     /// order, each told alone, and a fence tells each once, so the wait lasts no longer than the
     /// writer's progress (mantle docs/design/raft-log.md §3).
     pub fn submit_waiting(&self, group: u128, update: Update) -> Result<Pending, LogError> {
-        self.send(group, Class::Normal, update, true, None, true)
+        self.send(group, Class::Normal, update, true, None, Hears::Admission)
     }
 
     /// Submits `update` for `group` as `submit_waiting` does, in `class`.
@@ -571,7 +595,7 @@ impl<F: BlockFile + 'static> Log<F> {
         class: Class,
         update: Update,
     ) -> Result<Pending, LogError> {
-        self.send(group, class, update, true, None, true)
+        self.send(group, class, update, true, None, Hears::Admission)
     }
 
     /// Submits `update` for `group` in `class` as `submit_waiting` does, and wakes `waker` once
@@ -585,11 +609,11 @@ impl<F: BlockFile + 'static> Log<F> {
         update: Update,
         waker: Waker,
     ) -> Result<Pending, LogError> {
-        self.send(group, class, update, true, Some(waker), true)
+        self.send(group, class, update, true, Some(waker), Hears::Admission)
     }
 
-    /// Sends `update` to the owner; with `admit`, the caller is told once it is admitted or
-    /// refused, and waits for that here.
+    /// Sends `update` to the owner; the caller hears as `hears` says, and waits here for its
+    /// admission when it hears of that.
     fn send(
         &self,
         group: u128,
@@ -597,7 +621,7 @@ impl<F: BlockFile + 'static> Log<F> {
         update: Update,
         wait: bool,
         waker: Option<Waker>,
-        admit: bool,
+        hears: Hears,
     ) -> Result<Pending, LogError> {
         // Refused before it holds any room: no frame could take it, and every admitted
         // submission fits the byte bound alone, so none waits for a queue that cannot hold it.
@@ -617,9 +641,10 @@ impl<F: BlockFile + 'static> Log<F> {
             class,
             tags: writer::Tags::default(),
             ticket: Ticket::new(reply, waker),
-            admit,
+            admit: hears == Hears::Admission,
             handle: false,
             lens: (0, 0),
+            waits: hears == Hears::Waits,
         };
         let message = Message::Submit { submission, wait };
         let sent = if wait {
@@ -631,7 +656,7 @@ impl<F: BlockFile + 'static> Log<F> {
             })
         };
         sent?;
-        if admit {
+        if hears == Hears::Admission {
             waiting.admitted()?;
         }
         Ok(Pending(waiting))
@@ -785,14 +810,14 @@ impl<F: BlockFile + 'static> Log<F> {
     /// full. The caller hears only the answer, a refusal included, and is not woken for the
     /// admission between.
     pub fn write(&self, group: u128, update: Update) -> Result<(), LogError> {
-        self.send(group, Class::Normal, update, false, None, false)?
+        self.send(group, Class::Normal, update, false, None, Hears::Waits)?
             .wait()
     }
 
     /// Submits `update`, waiting for room, and waits until it is durable, hearing only the
     /// answer.
     pub fn write_waiting(&self, group: u128, update: Update) -> Result<(), LogError> {
-        self.send(group, Class::Normal, update, true, None, false)?
+        self.send(group, Class::Normal, update, true, None, Hears::Waits)?
             .wait()
     }
 

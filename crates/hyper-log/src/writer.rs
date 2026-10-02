@@ -54,6 +54,9 @@ pub(crate) struct Submission {
     /// For a handle's write laid into a frame, where its entries' terms and lengths are in the
     /// frame's list (`owner::Buffers::lens`), the entries having gone back with its answer.
     pub(crate) lens: (usize, usize),
+    /// Whether its caller waits on its ticket from the moment it sends it until its answer, so
+    /// that its frame's I/O may be given to it to do (`owner::Owner::start`).
+    pub(crate) waits: bool,
 }
 
 /// Where the writer's fair queue placed a submission (mantle docs/design/raft-log.md §3).

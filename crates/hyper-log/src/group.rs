@@ -321,18 +321,21 @@ impl<F: BlockFile + 'static> GroupLog<F> {
     /// taken with [`GroupLog::wait`] or [`GroupLog::poll`], in the order submitted. `Busy` when
     /// the handle already has as many writes out as the log would take for one group.
     pub fn submit(&mut self, update: Update) -> Result<(), LogError> {
-        self.send(update, None)
+        self.send(update, None, false)
     }
 
     /// Submits `update` as [`GroupLog::submit`] does, and wakes `waker` once its answer has
     /// come.
     pub fn submit_waking(&mut self, update: Update, waker: Waker) -> Result<(), LogError> {
-        self.send(update, Some(waker))
+        self.send(update, Some(waker), false)
     }
 
     /// Submits `update` and waits until it is durable, or refused.
     pub fn write(&mut self, update: Update) -> Result<(), LogError> {
-        self.submit(update)?;
+        // With nothing else out, the wait below is on this write's own ticket from the moment
+        // it is sent, so its frame's I/O may be given to this thread to do.
+        let waits = self.out.is_empty();
+        self.send(update, None, waits)?;
         self.wait().unwrap_or(Err(LogError::Closed))
     }
 
@@ -350,7 +353,7 @@ impl<F: BlockFile + 'static> GroupLog<F> {
         Some(self.took(out.write, answer))
     }
 
-    fn send(&mut self, update: Update, waker: Option<Waker>) -> Result<(), LogError> {
+    fn send(&mut self, update: Update, waker: Option<Waker>, waits: bool) -> Result<(), LogError> {
         if self.out.len() >= OUT {
             return Err(LogError::Busy);
         }
@@ -379,6 +382,7 @@ impl<F: BlockFile + 'static> GroupLog<F> {
             admit: false,
             handle: true,
             lens: (0, 0),
+            waits,
         };
         self.inbox
             .send(Message::Submit {

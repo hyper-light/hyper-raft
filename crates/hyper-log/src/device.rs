@@ -1,7 +1,18 @@
-//! The log's file and what is done with it: the I/O the log's owner asks for, done by whichever
-//! of the log's two threads is not leading (`owner::follow`, Leader/Followers).
-//! The device is one owner's: it travels with the job to the thread that does it and comes back
-//! to the owner with the completion (hyper-raft CLAUDE.md §1, the sans-io rule's exception).
+//! The log's file and what is done with it: the I/O the log's owner asks for, done by a caller
+//! that waits on the frame's answer or by the log's I/O thread (`serve`), never by the owner's.
+//! The device is one owner's: it travels with the job, in a [`Carrier`], to the thread that does
+//! it and comes back to the owner with the completion (hyper-raft CLAUDE.md §1, the sans-io rule's
+//! exception).
+//!
+//! The completion comes back through the owner's returns, which wake no one: the owner reads them
+//! before every message it takes, so anything a caller sends after hearing an answer the device
+//! gave is heard after the completion that freed its room, as when the writer answered under its
+//! lock. The thread that did the job wakes the owner only when the completion leaves the owner
+//! something to answer (a frame another frame will confirm, a failure, a sweep, a read, a look);
+//! the owner, when it has work waiting on the device, asks the I/O thread to wake it once the job
+//! is back (`Request::Watch`). So a write whose frame confirms itself, with no one else
+//! submitting, crosses from its caller to the owner and back: the owner sleeps once and the
+//! caller once, as mantle's writer and its caller did.
 //!
 //! The operations of a frame are mantle's, in mantle's order: the frame, its persist record, then
 //! one flush, nothing after a failed write, and a failed flush never retried (mantle
@@ -15,6 +26,7 @@
 //! caller that submits again on hearing it finds the room given back, as it did when the writer
 //! answered under its lock.
 
+use std::cell::RefCell;
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, TrySendError};
 use std::time::Instant;
 
@@ -36,8 +48,127 @@ pub(crate) const JOBS: usize = 3;
 /// and a stale word about the frame before, which the device drops.
 pub(crate) const MORE: usize = 2;
 
+/// Requests the I/O thread holds at most: the job out, and the owner's ask to be woken once it is
+/// back; the owner has one job out at a time and asks once for it.
+pub(crate) const REQUESTS: usize = 2;
+
+/// Tokens the owner's token channel holds while the owner holds its receiver: the owner empties
+/// it as it takes each job back and as a watch gives it back, one job is out at a time, and a
+/// job's token is sent after the job is back, so the last job's token can follow the emptying and
+/// the next job's join it before the next. While the I/O thread watches, it takes each token as
+/// it comes, so a job's thread that finds the channel full waits only for it.
+pub(crate) const TOKENS: usize = 2;
+
 /// A look at the file a caller runs on the thread that holds the device.
 pub(crate) type Look<F> = Box<dyn FnOnce(&F) + Send>;
+
+/// I/O handed to a thread to do: a job and the device, which go back to the owner once done.
+pub(crate) trait Io: Send {
+    /// Does the job, gives the owner back the device and the completion, and gives the answers
+    /// the job gave.
+    fn run(self: Box<Self>);
+}
+
+/// What the I/O thread is asked to do.
+pub(crate) enum Request {
+    /// A job, no caller doing it.
+    Job(Box<dyn Io>),
+    /// Wake the owner once the job of this sequence is back, the token of each job back coming
+    /// through this receiver; the receiver goes back to the owner with the word.
+    Watch(u64, Receiver<u64>),
+}
+
+/// A job and the device on their way to the thread that does it, and the completion and the
+/// device on their way back: one box, kept by the owner from job to job.
+pub(crate) struct Carrier<F> {
+    pub(crate) job: Option<Job<F>>,
+    pub(crate) device: Option<Device<F>>,
+    pub(crate) completion: Option<Completion>,
+    /// The job's place among the jobs the owner has given out.
+    pub(crate) sequence: u64,
+}
+
+impl<F> Carrier<F> {
+    pub(crate) fn new(job: Job<F>, device: Device<F>, sequence: u64) -> Self {
+        Self {
+            job: Some(job),
+            device: Some(device),
+            completion: None,
+            sequence,
+        }
+    }
+}
+
+thread_local! {
+    /// The answers a job gives once the owner holds its completion, kept by each thread that does
+    /// jobs from one job to the next: at most one frame's updates and the frame's before it.
+    static ANSWERS: RefCell<Vec<Answering>> = const { RefCell::new(Vec::new()) };
+}
+
+impl<F: BlockFile + Send + 'static> Io for Carrier<F> {
+    fn run(mut self: Box<Self>) {
+        let (Some(job), Some(mut device)) = (self.job.take(), self.device.take()) else {
+            return;
+        };
+        let mut answers = ANSWERS
+            .try_with(|a| a.try_borrow_mut().map(|mut a| std::mem::take(&mut *a)).ok())
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        let completion = device.execute(job, &mut answers);
+        // A confirmation that held answered every caller it confirms: the owner has only room to
+        // give back and the frame to settle, which it does before the next message it takes.
+        let tell = !matches!(completion, Completion::Confirm { result: Ok(()), .. });
+        let (returns, tokens, inbox) = (
+            device.returns.clone(),
+            device.tokens.clone(),
+            device.inbox.clone(),
+        );
+        let sequence = self.sequence;
+        self.completion = Some(completion);
+        self.device = Some(device);
+        // The owner holds the completion before anyone hears an answer the job gave; should the
+        // owner have gone, the answers are dropped and each caller hears the log closed.
+        if returns.send(self).is_ok() {
+            // Every token is sent, so a watch for this job ends (`TOKENS`).
+            let _ = tokens.send(sequence);
+            if tell {
+                let _ = inbox.send(Message::Returned);
+            }
+            for answering in answers.drain(..) {
+                answering.durable();
+            }
+        }
+        answers.clear();
+        let _ = ANSWERS.try_with(|a| {
+            if let Ok(mut a) = a.try_borrow_mut() {
+                *a = answers;
+            }
+        });
+    }
+}
+
+/// The log's I/O thread: it does the jobs no caller does, and wakes the owner when it asks to be
+/// woken for a job back. It ends once the owner has.
+pub(crate) fn serve<F>(requests: &Receiver<Request>, inbox: &SyncSender<Message<F>>) {
+    while let Ok(request) = requests.recv() {
+        match request {
+            Request::Job(io) => io.run(),
+            Request::Watch(sequence, tokens) => {
+                loop {
+                    match tokens.recv() {
+                        Ok(back) if back >= sequence => break,
+                        Ok(_) => {}
+                        Err(_) => return,
+                    }
+                }
+                if inbox.send(Message::Watched(tokens)).is_err() {
+                    return;
+                }
+            }
+        }
+    }
+}
 
 /// One caller's answer for an update of a frame: its ticket, and the entries a handle's write
 /// gets back.
@@ -206,8 +337,19 @@ pub(crate) struct Device<F> {
     /// Where the owner hears of a frame's flush while the device confirms it, before the frame
     /// before's callers do (`owner::Owner::flushes`).
     flushed: SyncSender<Completion>,
-    /// The owner's inbox, for a word that cannot wait in `flushed`.
+    /// The owner's inbox, for a word that cannot wait in `flushed`, and to wake the owner for a
+    /// completion it must answer.
     inbox: SyncSender<Message<F>>,
+    /// Where the carrier goes back to the owner, and where each job back is told by its
+    /// sequence, for a watch (`serve`).
+    returns: SyncSender<Box<Carrier<F>>>,
+    tokens: SyncSender<u64>,
+}
+
+/// Where a device's jobs go back to the owner (`Device::returns`, `Device::tokens`).
+pub(crate) struct Returns<F> {
+    pub(crate) returns: SyncSender<Box<Carrier<F>>>,
+    pub(crate) tokens: SyncSender<u64>,
 }
 
 impl<F: BlockFile> Device<F> {
@@ -218,6 +360,7 @@ impl<F: BlockFile> Device<F> {
         more: Receiver<u64>,
         flushed: SyncSender<Completion>,
         inbox: SyncSender<Message<F>>,
+        back: Returns<F>,
     ) -> Self {
         Self {
             file,
@@ -226,6 +369,8 @@ impl<F: BlockFile> Device<F> {
             more,
             flushed,
             inbox,
+            returns: back.returns,
+            tokens: back.tokens,
         }
     }
 
@@ -323,7 +468,7 @@ impl<F: BlockFile> Device<F> {
         let heard = match self.flushed.try_send(flushed) {
             Ok(()) => true,
             Err(TrySendError::Full(word) | TrySendError::Disconnected(word)) => {
-                self.inbox.send(Message::Done(word, None)).is_ok()
+                self.inbox.send(Message::Done(word)).is_ok()
             }
         };
         if heard {

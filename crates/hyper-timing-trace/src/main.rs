@@ -9,8 +9,8 @@
 //! ```
 //!
 //! `timer` measures how late the two timed waits the recorder uses end (a sleep, and a socket wait
-//! in `select`), for asked durations on the 1-2-5 grid from 1 µs to 10 ms, and how long one write
-//! and full flush of a log block takes.
+//! in `select` on macOS, `ppoll` on Linux), for asked durations on the 1-2-5 grid from 1 µs to
+//! 10 ms, and how long one write and full flush of a log block takes.
 //!
 //! `run` binds a UDP socket on loopback with the kernel's receive timestamps on, starts a sender
 //! process (`send`, the same binary), and records every heartbeat until the sender's count or the
@@ -50,8 +50,6 @@ mod sys;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::net::UdpSocket;
-use std::os::fd::AsRawFd;
-use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -64,9 +62,9 @@ const CHUNK_RECORDS: usize = 1 << 16;
 /// A heartbeat datagram: six little-endian `u64`s.
 const PACKET_BYTES: usize = 48;
 /// A heartbeat record: the packet's six fields and the receiver's three.
-pub const HEARTBEAT_BYTES: usize = 72;
+pub(crate) const HEARTBEAT_BYTES: usize = 72;
 /// A receiver wait record: began, asked deadline, woke.
-pub const WAIT_BYTES: usize = 24;
+pub(crate) const WAIT_BYTES: usize = 24;
 /// The sequence number that ends a run.
 const END: u64 = u64::MAX;
 /// The asked durations of the timer sweep, nanoseconds: the 1-2-5 grid (IEC 60063's E3 series)
@@ -189,21 +187,19 @@ fn realtime_ns() -> u64 {
 
 /// One block of the flush file, the file's preferred I/O size.
 fn log_block(path: &Path) -> io::Result<(File, Vec<u8>)> {
-    use std::os::unix::fs::MetadataExt;
     let file = OpenOptions::new()
         .create(true)
         .truncate(false)
         .read(true)
         .write(true)
         .open(path)?;
-    let block = usize::try_from(file.metadata()?.blksize()).unwrap_or(4096);
+    let block = sys::preferred_block(&file)?;
     Ok((file, vec![0xa5; block]))
 }
 
 fn write_and_flush(file: &File, block: &mut [u8], i: u64) -> io::Result<()> {
     block[..8].copy_from_slice(&i.to_le_bytes());
-    file.write_all_at(block, 0)?;
-    sys::full_flush(file.as_raw_fd())
+    sys::write_and_flush(file, block)
 }
 
 fn quantile(sorted: &[u64], q: f64) -> u64 {
@@ -217,7 +213,6 @@ fn quantile(sorted: &[u64], q: f64) -> u64 {
 fn timer(flush: &Path) -> io::Result<()> {
     let clock = Clock::new()?;
     let socket = UdpSocket::bind("127.0.0.1:0")?;
-    let fd = socket.as_raw_fd();
     let load = sys::load_average();
     println!(
         "# timer sweep, {} {}, load {:.2} {:.2} {:.2}",
@@ -230,17 +225,17 @@ fn timer(flush: &Path) -> io::Result<()> {
     println!("| wait | asked µs | n | late p50 µs | p90 | p99 | p99.9 | max | mean |");
     println!("|---|---|---|---|---|---|---|---|---|");
     let mut late = Vec::with_capacity(SWEEP_WAITS);
-    for (name, select) in [("sleep", false), ("select", true)] {
+    for (name, select) in [("sleep", false), (sys::SOCKET_WAIT, true)] {
         for asked in SWEEP_NS {
             late.clear();
             for _ in 0..SWEEP_WAITS {
-                let began = clock.now();
+                let began = clock.now()?;
                 if select {
-                    sys::wait_readable(fd, asked)?;
+                    sys::wait_readable(&socket, asked)?;
                 } else {
                     std::thread::sleep(Duration::from_nanos(asked));
                 }
-                late.push(clock.now().saturating_sub(began).saturating_sub(asked));
+                late.push(clock.now()?.saturating_sub(began).saturating_sub(asked));
             }
             late.sort_unstable();
             let mean = late.iter().sum::<u64>() as f64 / late.len() as f64;
@@ -260,9 +255,9 @@ fn timer(flush: &Path) -> io::Result<()> {
     let (file, mut block) = log_block(flush)?;
     late.clear();
     for i in 0..SWEEP_WAITS as u64 {
-        let began = clock.now();
+        let began = clock.now()?;
         write_and_flush(&file, &mut block, i)?;
-        late.push(clock.now().saturating_sub(began));
+        late.push(clock.now()?.saturating_sub(began));
     }
     late.sort_unstable();
     let mean = late.iter().sum::<u64>() as f64 / late.len() as f64;
@@ -285,16 +280,15 @@ fn word(packet: &[u8], at: usize) -> u64 {
 }
 
 fn run(dir: &Path, interval_us: u64, seconds: u64, flush: Option<PathBuf>) -> io::Result<()> {
-    std::fs::create_dir_all(dir)?;
     let clock = Clock::new()?;
+    std::fs::create_dir_all(dir)?;
     let interval = interval_us * 1_000;
     let count = seconds * 1_000_000 / interval_us.max(1);
     let socket = UdpSocket::bind("127.0.0.1:0")?;
-    let fd = socket.as_raw_fd();
-    sys::enable_receive_timestamps(fd)?;
+    sys::enable_receive_timestamps(&socket)?;
     socket.set_nonblocking(true)?;
     let port = socket.local_addr()?.port();
-    let started = clock.now();
+    let started = clock.now()?;
     let load_path = dir.join("load.txt");
     let _ = std::fs::remove_file(&load_path);
     let mut beats = Chunked::create(&dir.join("hb.bin"), HEARTBEAT_BYTES, &load_path, started)?;
@@ -334,13 +328,13 @@ fn run(dir: &Path, interval_us: u64, seconds: u64, flush: Option<PathBuf>) -> io
     let mut received = 0u64;
     let mut stamped = 0u64;
     'run: loop {
-        let began = clock.now();
+        let began = clock.now()?;
         if began >= end_by {
             break;
         }
         let asked = deadline.saturating_sub(began);
-        if !sys::wait_readable(fd, asked)? {
-            let woke = clock.now();
+        if !sys::wait_readable(&socket, asked)? {
+            let woke = clock.now()?;
             if asked > 0 {
                 waits.push(&[began, deadline, woke], woke)?;
             }
@@ -348,9 +342,9 @@ fn run(dir: &Path, interval_us: u64, seconds: u64, flush: Option<PathBuf>) -> io
             continue;
         }
         loop {
-            match sys::recv_stamped(fd, &mut packet) {
+            match sys::recv_stamped(&socket, &mut packet) {
                 Ok((PACKET_BYTES, kernel)) => {
-                    let read = clock.now();
+                    let read = clock.now()?;
                     let read_real = realtime_ns();
                     let seq = word(&packet, 0);
                     if seq == END {
@@ -382,7 +376,7 @@ fn run(dir: &Path, interval_us: u64, seconds: u64, flush: Option<PathBuf>) -> io
             }
         }
     }
-    let now = clock.now();
+    let now = clock.now()?;
     beats.finish(now)?;
     waits.finish(now)?;
     let status = child.wait()?;
@@ -412,22 +406,22 @@ fn send(port: u16, interval_us: u64, count: u64, flush: Option<PathBuf>) -> io::
         None => None,
     };
     let interval = interval_us * 1_000;
-    let start = clock.now() + interval;
+    let start = clock.now()? + interval;
     let mut packet = [0u8; PACKET_BYTES];
     for i in 0..=count {
         let seq = if i == count { END } else { i };
         let sched = start + i * interval;
-        let began = clock.now();
+        let began = clock.now()?;
         if sched > began {
             std::thread::sleep(Duration::from_nanos(sched - began));
         }
-        let woke = clock.now();
+        let woke = clock.now()?;
         if let Some((file, block)) = log.as_mut()
             && seq != END
         {
             write_and_flush(file, block, i)?;
         }
-        let sent = clock.now();
+        let sent = clock.now()?;
         for (at, value) in [seq, sched, began, woke, sent, realtime_ns()]
             .into_iter()
             .enumerate()

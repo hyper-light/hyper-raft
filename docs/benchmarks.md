@@ -1518,12 +1518,14 @@ five-minute macOS runs.
 # Heartbeat traces: hyper-timing's measured inputs
 
 The traces that settle `docs/timing.md` §3 items 2, 6 and 7 and part of 3; the derivations are in
-`docs/timing.md` §2.6. `crates/hyper-timing-trace`, a workspace of its own, records two processes
+`docs/timing.md` §2.6. `crates/hyper-timing-trace`, a workspace member the gates lint and test on all
+six targets (the recorder runs on Linux and macOS and refuses elsewhere), records two processes
 exchanging sequence-numbered heartbeats over UDP on loopback. The sender sleeps to each scheduled
 time `σ_i = start + iη` (absolute, so lateness never accumulates into the schedule), optionally
 writes one block of a log file and fully flushes it (`F_FULLFSYNC` on macOS, `fdatasync` on Linux),
 and sends `(i, σ_i, began waiting, woke, sent, realtime at send)`. The receiver, with the kernel's
-receive timestamps on (`SO_TIMESTAMP_MONOTONIC`, `SO_TIMESTAMPNS`), waits in `select(2)` until the
+receive timestamps on (`SO_TIMESTAMP_MONOTONIC`, `SO_TIMESTAMPNS`), waits in `select(2)` on macOS
+and `ppoll(2)` on Linux (one timer path in the kernel's `fs/select.c`; `src/sys.rs`) until the
 next scheduled heartbeat, as a detector waits for its next freshness point, records each wait
 that ended on its timeout, and records each heartbeat with the kernel's stamp and the time it read
 it. Both processes read the same monotonic clock, so every difference is exact. Records go to a
@@ -2608,7 +2610,7 @@ floors: G 899.0 µs, correlation time 200000.0 µs, flush stability E[flush]+G 1
 ## Commands for the traces
 
 ```sh
-cd crates/hyper-timing-trace && cargo build --release
+cargo build --release -p hyper-timing-trace
 B=target/release/hyper-timing-trace
 $B timer <dir>/flush.log                        # the sweeps
 $B run <dir>/mac-plain 100 300                  # interval µs, seconds
@@ -2617,9 +2619,9 @@ $B analyse <dir>/mac-plain <dir>/mac-flush      # the tables above
 # The loaded runs: the same, while a loop rebuilds the workspace from clean in another target:
 #   while :; do CARGO_TARGET_DIR=<dir>/load CARGO_BUILD_JOBS=4 cargo build --workspace --all-targets; rm -rf <dir>/load; done
 # Linux, from the repository root:
-docker run --rm -v "$PWD":/work -w /work/crates/hyper-timing-trace \
-  -v trace-target:/work/crates/hyper-timing-trace/target -v trace-disk:/disk rust:1.98.0 bash -c \
-  'cargo build --release && B=target/release/hyper-timing-trace &&
+docker run --rm -v "$PWD":/work -w /work \
+  -v trace-target:/work/target -v trace-disk:/disk rust:1.98.0 bash -c \
+  'cargo build --release -p hyper-timing-trace && B=target/release/hyper-timing-trace &&
    $B timer /disk/flush.log && $B run /disk/linux-plain 2000 300 &&
    $B run /disk/linux-flush 2000 600 /disk/flush.log && $B analyse /disk/linux-plain /disk/linux-flush'
 ```

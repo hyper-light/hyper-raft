@@ -729,38 +729,59 @@ fn secs(d: Duration) -> String {
     }
 }
 
-pub fn main(dirs: &[String]) -> io::Result<()> {
+pub(crate) fn main(dirs: &[String]) -> io::Result<()> {
     for dir in dirs {
-        let path = Path::new(dir);
+        print!("{}", report(dir)?);
+    }
+    Ok(())
+}
+
+/// One run's analysis, every table in the order the report gives them.
+fn report(dir: &str) -> io::Result<String> {
+    let run = Run::load(Path::new(dir))?;
+    let mut out = String::new();
+    header(&mut out, dir, &run);
+    delays(&mut out, &run);
+    correlation(&mut out, &run);
+    stationarity(&mut out, &run);
+    startup(&mut out, &run);
+    let t_c_stride = correlation_time(&mut out, &run);
+    let inputs = floors(&mut out, &run, t_c_stride);
+    theorem7(&mut out, &run, t_c_stride);
+    let t_e = elections(&mut out, &inputs);
+    detectors(&mut out, &run, &inputs, t_e);
+    online_detectors(&mut out, &run, &inputs, t_e);
+    Ok(out)
+}
+
+/// A run's records and what every table reads of them.
+struct Run {
+    meta: Meta,
+    beats: Vec<Beat>,
+    /// The receiver's waits: asked, and late past it.
+    waits: Vec<(f64, f64)>,
+    trace: Table,
+    /// G, the mean lateness of the receiver's own waits.
+    g: f64,
+    /// The estimator's loss over the whole trace.
+    loss: f64,
+    /// The interval, nanoseconds.
+    eta: f64,
+    /// `D` by the kernel's stamp, in arrival order and sorted.
+    kd: Vec<f64>,
+    sorted_kd: Vec<f64>,
+    s_kd: Stats,
+    s_net: Stats,
+    s_gap: Stats,
+    s_flush: Stats,
+}
+
+impl Run {
+    fn load(path: &Path) -> io::Result<Self> {
         let meta = meta(path)?;
         let linux = meta.os == "linux";
         let beats = beats(path, linux)?;
         let waits = waits(path)?;
-        let mut out = String::new();
-        let _ = writeln!(
-            out,
-            "\n## {dir}\n\n{} {}, η = {} µs, flush {}, {} s, load {} → {}\n",
-            meta.os,
-            std::env::consts::ARCH,
-            meta.interval_ns / 1_000,
-            meta.flush,
-            meta.seconds,
-            meta.load_start,
-            meta.load_end
-        );
-        // Loss and order.
-        let received = beats.len() as u64;
-        let mut reordered = 0u64;
-        let mut last = None;
-        for b in &beats {
-            if let Some(prev) = last
-                && b.seq < prev
-            {
-                reordered += 1;
-            }
-            last = Some(b.seq);
-        }
-        let lost = meta.count.saturating_sub(received);
         // G, the mean lateness of the receiver's own waits, and the estimator over the whole
         // trace at its interval: its loss is the Jeffreys posterior mean `(k + ½)/(m + 1)` over the
         // sequence numbers from the first received to the latest.
@@ -768,423 +789,554 @@ pub fn main(dirs: &[String]) -> io::Result<()> {
         let trace = table(&beats, meta.count, meta.interval_ns);
         let full = estimator(&trace, meta.interval_ns, 1, 0, g);
         let loss = full.as_ref().map_or(0.5, |link| link.estimates().loss);
-        let _ = writeln!(
-            out,
-            "sent {}, received {received}, lost {lost}, reordered {reordered}; p_L (Jeffreys mean) {loss:.3e}\n",
-            meta.count
-        );
-        let _ = writeln!(out, "{HEADER}");
         let kd: Vec<f64> = beats.iter().map(|b| b.kernel_delay).collect();
-        let rd: Vec<f64> = beats.iter().map(|b| b.read_delay).collect();
         let net: Vec<f64> = beats.iter().map(|b| b.network).collect();
         let gap: Vec<f64> = beats.iter().map(|b| b.gap).collect();
-        let late: Vec<f64> = beats.iter().filter_map(|b| b.sender_late).collect();
         let flush: Vec<f64> = beats.iter().map(|b| b.flush).collect();
-        let behind = beats.iter().filter(|b| b.sender_late.is_none()).count();
-        let s_kd = stats(&kd, MAX_LAG);
-        let s_rd = stats(&rd, MAX_LAG);
-        for (name, series) in [
-            ("D (kernel stamp − σ)", &s_kd),
-            ("D (process read − σ)", &s_rd),
-        ] {
-            let _ = writeln!(out, "{}", row(name, series));
-        }
-        let s_net = stats(&net, MAX_LAG);
-        let s_gap = stats(&gap, MAX_LAG);
-        let s_late = stats(&late, MAX_LAG);
-        let s_flush = stats(&flush, MAX_LAG);
-        let _ = writeln!(out, "{}", row("send → kernel", &s_net));
-        let _ = writeln!(out, "{}", row("kernel → read (gap)", &s_gap));
-        let _ = writeln!(out, "{}", row("sender timer lateness", &s_late));
-        let _ = writeln!(out, "{}", row("sender write+flush", &s_flush));
-        let wl: Vec<f64> = waits.iter().map(|w| w.1).collect();
-        let s_wait = stats(&wl, 0);
-        let _ = writeln!(out, "{}", row("receiver wait lateness", &s_wait));
-        let asked: Vec<f64> = waits.iter().map(|w| w.0).collect();
-        let s_asked = stats(&asked, 0);
-        let ratio: Vec<f64> = waits.iter().map(|w| w.1 / w.0).collect();
-        let s_ratio = stats(&ratio, 0);
-        let _ = writeln!(
-            out,
-            "\nsender behind its schedule (no wait) {behind}; receiver waits asked median {} µs, lateness/asked median {:.3}\n",
-            us(s_asked.median),
-            s_ratio.median
-        );
-
-        // Correlation: of the values, of their ranks, and of the tail exceedances, which is what
-        // Theorem 7's product over the heartbeats inside the margin takes as independent.
-        let eta = meta.interval_ns as f64;
-        let reach = kd.len() / LAG_SHARE;
-        let rho = autocorrelation(&kd, reach);
-        let rank_rho = autocorrelation(&ranks(&kd), reach);
-        let lags: Vec<usize> = (0..12)
-            .flat_map(|e| [1usize, 2, 5].map(|f| f * 10usize.pow(e)))
-            .take_while(|&k| k <= reach)
-            .collect();
-        let show = |v: &[f64]| {
-            lags.iter()
-                .map(|&k| v.get(k).map_or("—".into(), |r| format!("{r:.3}")))
-                .collect::<Vec<_>>()
-                .join(" | ")
-        };
-        let _ = writeln!(
-            out,
-            "\n| lag (heartbeats) | {} |\n|---|{}",
-            lags.iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-                .join(" | "),
-            "---|".repeat(lags.len())
-        );
-        let _ = writeln!(out, "| ρ of D | {} |", show(&rho));
-        let _ = writeln!(out, "| ρ of ranks | {} |", show(&rank_rho));
         let mut sorted_kd = kd.clone();
         sorted_kd.sort_by(f64::total_cmp);
-        let mut tail_lag = 1u64;
-        for q in [0.99, 0.999] {
-            let x = quantile(&sorted_kd, q);
-            let (ratio, _) = exceedance(&beats, x, reach);
-            let _ = writeln!(
-                out,
-                "| P(both > p{}) / P(>p{})² | {} |",
-                q * 100.0,
-                q * 100.0,
-                show(&ratio)
-            );
-            let (theta, run, count) = extremal(&trace, x);
-            let _ = writeln!(
-                out,
-                "\nexceedances of p{} ({} µs): {count}, extremal index θ {theta:.4} (mean cluster {:.1} heartbeats), clusters separated by ≥ {run} heartbeats = {} µs",
-                q * 100.0,
-                us(x),
-                1.0 / theta,
-                us(run as f64 * eta)
-            );
-            tail_lag = tail_lag.max(run);
-        }
-        let _ = tail_lag;
-        let _ = writeln!(
-            out,
-            "τ_int {:.1} heartbeats = {} µs; Bartlett band ±{:.4}, values inside from lag {:?}, ranks from {:?}\n",
-            s_kd.tau,
-            us(s_kd.tau * eta),
-            Z95 / (kd.len() as f64).sqrt(),
-            decorrelation_lag(&rho, kd.len()),
-            decorrelation_lag(&rank_rho, kd.len()),
-        );
-
-        // Stationarity.
-        let a_mean = allan(&kd, mean_of);
-        let a_median = allan(&kd, median_of);
-        let _ = writeln!(
-            out,
-            "| window m | windows | Allan dev of mean, µs | white-noise σ/√m, µs | Allan dev of median, µs |\n|---|---|---|---|---|"
-        );
-        for ((m, dev, k), (_, dmed, _)) in a_mean.iter().zip(&a_median) {
-            let _ = writeln!(
-                out,
-                "| {m} ({} ms) | {k} | {:.2} | {:.2} | {:.2} |",
-                *m as f64 * eta / 1e6,
-                dev / 1e3,
-                s_kd.sd / (*m as f64).sqrt() / 1e3,
-                dmed / 1e3
-            );
-        }
-        let (n_allan, dev_allan) = allan_minimum(&a_mean);
-        let (n_allan_med, _) = allan_minimum(&a_median);
-        let t_stat = n_allan as f64 * eta;
-        let n_g = (s_kd.tau * s_kd.sd.powi(2) / (g * g)).ceil().max(1.0);
-        let _ = writeln!(
-            out,
-            "\nAllan minimum (mean): window {n_allan} = {} ms, deviation {:.2} µs; (median): window {n_allan_med}\nG (mean lateness of the receiver's own waits) {} µs; n_G = τ_int·V/G² = {n_g}\n",
-            t_stat / 1e6,
-            dev_allan / 1e3,
-            us(g)
-        );
-
-        // Startup: how far the deviation of the first m heartbeats falls short.
-        let _ = writeln!(
-            out,
-            "| m | blocks | median sd_m/sd | p05 sd_m/sd |\n|---|---|---|---|"
-        );
-        let mut m = 2usize;
-        while kd.len() / m >= 16 && m <= MAX_LAG {
-            let mut r: Vec<f64> = kd
-                .chunks_exact(m)
-                .map(|c| {
-                    let mu = c.iter().sum::<f64>() / m as f64;
-                    (c.iter().map(|v| (v - mu).powi(2)).sum::<f64>() / (m as f64 - 1.0)).sqrt()
-                        / s_kd.sd
-                })
-                .collect();
-            r.sort_by(f64::total_cmp);
-            let _ = writeln!(
-                out,
-                "| {m} | {} | {:.3} | {:.3} |",
-                r.len(),
-                quantile(&r, 0.5),
-                quantile(&r, 0.05)
-            );
-            m *= 4;
-        }
-
-        // The correlation time: the least spacing from which Theorem 7's product, which takes the
-        // heartbeats inside the margin as independent, is not refuted by the replay at any margin
-        // that holds two heartbeats or more.
-        let mut sweep_rows = String::new();
-        let mut t_c_stride = 1u64;
-        let strides: Vec<u64> = (0..12)
-            .flat_map(|e| [1u64, 2, 5].map(|f| f * 10u64.pow(e)))
-            .take_while(|&k| k <= (kd.len() / LAG_SHARE) as u64)
-            .collect();
-        for &stride in &strides {
-            let spacing = eta * stride as f64;
-            let window = window_for(&trace, meta.interval_ns, stride, g);
-            let mut refuted = false;
-            let mut tests = 0;
-            // The margins tested: the trace's own tail quantiles, and margins holding 2, 3, 5, 10
-            // and 20 heartbeats, so a dependence the quantiles miss is still exercised.
-            let margins: Vec<(String, f64)> = [0.99, 0.999, 0.9999]
-                .iter()
-                .map(|q| {
-                    (
-                        format!("p{}", q * 100.0),
-                        quantile(&sorted_kd, *q) - s_kd.mean,
-                    )
-                })
-                .chain(
-                    [2.0, 3.0, 5.0, 10.0, 20.0]
-                        .iter()
-                        .map(|k: &f64| (format!("{k} beats"), (k - 0.5) * spacing)),
-                )
-                .collect();
-            for (label, alpha) in margins {
-                if alpha < spacing || alpha > sorted_kd.last().copied().unwrap_or(0.0) {
-                    continue;
-                }
-                tests += 1;
-                let (mistakes, _, _, points) =
-                    replay(&trace, meta.interval_ns, stride, window, alpha, false);
-                let bound = mistake_bound(loss, s_kd.sd * s_kd.sd, spacing, alpha);
-                let (lower, _) = poisson95(mistakes);
-                let no = lower / points.max(1) as f64 > bound;
-                refuted |= no;
-                let _ = writeln!(
-                    sweep_rows,
-                    "| {} | {label} {} | {:.0} | {window} | {bound:.2e} | {mistakes} / {points} | {} |",
-                    secs(Duration::from_secs_f64(spacing / 1e9)),
-                    secs(Duration::from_secs_f64(alpha / 1e9)),
-                    (alpha / spacing).floor() + 1.0,
-                    if no { "**refuted**" } else { "holds" }
-                );
-            }
-            if refuted {
-                t_c_stride = stride.saturating_mul(2).max(
-                    strides
-                        .iter()
-                        .copied()
-                        .find(|&k| k > stride)
-                        .unwrap_or(stride),
-                );
-            }
-            if tests == 0 {
-                break;
-            }
-        }
-        let t_c = t_c_stride as f64 * eta;
-        let _ = writeln!(
-            out,
-            "\n| spacing η | α (quantile) | heartbeats in margin | window | Theorem 7 β (mean/sd) | replayed mistakes / points | verdict |\n|---|---|---|---|---|---|---|\n{sweep_rows}\ncorrelation time (least spacing past every refutation) {} µs\n",
-            us(t_c)
-        );
-
-        // The floors on η.
-        let lindley = if meta.flush { s_flush.mean + g } else { 0.0 };
-        let floor_ns = g.max(t_c).max(lindley);
-        let floor = Duration::from_secs_f64(floor_ns / 1e9);
-        let base_floor = Duration::from_secs_f64(g.max(lindley) / 1e9);
-        let resolution = Duration::from_secs_f64(g / 1e9);
-        let floors = Floors {
-            granularity: resolution,
-            sender: base_floor,
-            correlation: Duration::from_secs_f64(t_c / 1e9),
-        };
-        // A vote travels as a heartbeat does from send to read, and its voter persists the vote
-        // before answering (Raft §3.4 / Figure 2): one way, and a round of two ways and a flush.
-        let deliver = s_net.mean + s_gap.mean;
-        let latency = Duration::from_secs_f64(deliver.max(0.0) / 1e9);
-        let round = Duration::from_secs_f64((2.0 * deliver + s_flush.mean).max(0.0) / 1e9);
-        let _ = writeln!(
-            out,
-            "\nfloors: G {} µs, correlation time {} µs, flush stability E[flush]+G {} µs → floor {}; election inputs: l = {}, vote round = {}\n",
-            us(g),
-            us(t_c),
-            us(lindley),
-            secs(floor),
-            secs(latency),
-            secs(round)
-        );
-
-        // Theorem 7 against the replay: the bound on the probability that a freshness point is a
-        // mistake, from each estimate pair, and the rate the replayed detector made.
-        let robust_sd = MAD_NORMAL * s_kd.mad;
-        let window_at = |stride: u64| window_for(&trace, meta.interval_ns, stride, g);
-        let _ = writeln!(
-            out,
-            "| estimate | η | α (at quantile) | window | Theorem 7 β | replayed mistakes / points | replayed rate (95 %) | bound holds |\n|---|---|---|---|---|---|---|---|"
-        );
-        for (name, centre, sd, robust) in [
-            ("mean/sd", s_kd.mean, s_kd.sd, false),
-            ("median/1.4826·MAD", s_kd.median, robust_sd, true),
-        ] {
-            for stride in [1u64, t_c_stride] {
-                for q in [0.9, 0.99, 0.999, 0.9999] {
-                    let alpha = quantile(&sorted_kd, q) - centre;
-                    if alpha <= 0.0 {
-                        continue;
-                    }
-                    let window = window_at(stride);
-                    let (mistakes, _, _, points) =
-                        replay(&trace, meta.interval_ns, stride, window, alpha, robust);
-                    let bound = mistake_bound(loss, sd * sd, eta * stride as f64, alpha);
-                    let rate = mistakes as f64 / points.max(1) as f64;
-                    let (lower, upper) = poisson95(mistakes);
-                    let (lower, upper) =
-                        (lower / points.max(1) as f64, upper / points.max(1) as f64);
-                    let _ = writeln!(
-                        out,
-                        "| {name} | {} | {} (p{}) | {window} | {bound:.2e} | {mistakes} / {points} | {rate:.2e} ({lower:.2e}–{upper:.2e}) | {} |",
-                        secs(Duration::from_secs_f64(eta * stride as f64 / 1e9)),
-                        secs(Duration::from_secs_f64(alpha / 1e9)),
-                        q * 100.0,
-                        if lower <= bound { "yes" } else { "**no**" }
-                    );
-                }
-            }
-        }
-
-        // The configurator on the measured inputs.
-        let _ = writeln!(
-            out,
-            "\n| voters/up | span W | T_E | split |\n|---|---|---|---|"
-        );
-        let mut t_e = None;
-        for (v, a) in [(3u32, 3u32), (3, 2), (5, 5), (5, 4)] {
-            if let Some(span) = election_span(v, a, latency, round, resolution) {
-                let _ = writeln!(
-                    out,
-                    "| {v}/{a} | {} | {} | {:.3} |",
-                    secs(span.span),
-                    secs(span.election),
-                    span.split
-                );
-                if (v, a) == (3, 2) {
-                    t_e = Some(span.election);
-                }
-            }
-        }
-        let _ = writeln!(
-            out,
-            "\n| estimate | MTBF | η | α | window | detection bound | T_MR bound | U | replayed mistakes / points | replayed T_MR | bound holds | suspected share |\n|---|---|---|---|---|---|---|---|---|---|---|---|"
-        );
-        for (name, mean, sd, robust) in [
-            ("mean/sd", s_kd.mean, s_kd.sd, false),
-            ("median/1.4826·MAD", s_kd.median, robust_sd, true),
-        ] {
-            let link = LinkBehaviour {
-                loss,
-                mean_delay: Duration::from_secs_f64(mean.max(0.0) / 1e9),
-                delay_deviation: Duration::from_secs_f64(sd.max(0.0) / 1e9),
-            };
-            for mtbf in [3_600u64, 86_400, 30 * 86_400, 365 * 86_400] {
-                let Some(election) = t_e else { continue };
-                let costs = Costs {
-                    election,
-                    mtbf: Duration::from_secs(mtbf),
-                };
-                let Some(det) = configure(&link, &costs, &floors) else {
-                    continue;
-                };
-                let stride = ((det.interval.as_nanos() as f64 / eta).round() as u64).max(1);
-                let parts = window_parts(&trace, meta.interval_ns, stride, g);
-                let window = parts.length;
-                let (n_g_at, n_allan_at, drift) = (
-                    parts.granularity.map_or("—".into(), |n| n.to_string()),
-                    parts.allan.map_or("—".into(), |n| n.to_string()),
-                    parts.drift,
-                );
-                let (mistakes, suspected, replayed, points) = replay(
-                    &trace,
-                    meta.interval_ns,
-                    stride,
-                    window as usize,
-                    det.margin.as_nanos() as f64,
-                    robust,
-                );
-                let _ = writeln!(
-                    out,
-                    "| {name} | {} | {} | {} | {window} (n_G {n_g_at}, n_Allan {n_allan_at}, drift {drift}) | {} | {} | {:.3e} | {mistakes} / {points} | {} | {} | {:.2e} |",
-                    secs(Duration::from_secs(mtbf)),
-                    secs(det.interval),
-                    secs(det.margin),
-                    secs(det.detection),
-                    secs(det.mistake_recurrence),
-                    det.unavailability,
-                    if mistakes > 0 {
-                        secs(Duration::from_secs_f64(replayed / mistakes as f64 / 1e9))
-                    } else {
-                        format!("> {}", secs(Duration::from_secs_f64(replayed / 1e9)))
-                    },
-                    {
-                        // The bound is on the share of freshness points that start a mistake,
-                        // `β = η / E(T_MR)`.
-                        let beta = det.interval.as_secs_f64()
-                            / det.mistake_recurrence.as_secs_f64().max(f64::MIN_POSITIVE);
-                        let (lower, _) = poisson95(mistakes);
-                        if lower / points.max(1) as f64 <= beta {
-                            "yes"
-                        } else {
-                            "**no**"
-                        }
-                    },
-                    suspected / replayed.max(1.0)
-                );
-            }
-        }
-
-        // The estimator itself as the detector, online: its own window, estimates and
-        // configurations as the heartbeats come, at each interval the configurator chose above.
-        let _ = writeln!(
-            out,
-            "\n| online, MTBF | η | configurations | mistakes / points | Theorem 7 allows (Σβ) | bound holds |\n|---|---|---|---|---|---|"
-        );
-        let mean_link = LinkBehaviour {
+        Ok(Self {
+            eta: meta.interval_ns as f64,
+            s_kd: stats(&kd, MAX_LAG),
+            s_net: stats(&net, MAX_LAG),
+            s_gap: stats(&gap, MAX_LAG),
+            s_flush: stats(&flush, MAX_LAG),
+            meta,
+            beats,
+            waits,
+            trace,
+            g,
             loss,
-            mean_delay: Duration::from_secs_f64(s_kd.mean.max(0.0) / 1e9),
-            delay_deviation: Duration::from_secs_f64(s_kd.sd.max(0.0) / 1e9),
+            kd,
+            sorted_kd,
+        })
+    }
+}
+
+/// The run's title line, and its loss and order.
+fn header(out: &mut String, dir: &str, run: &Run) {
+    let meta = &run.meta;
+    let _ = writeln!(
+        out,
+        "\n## {dir}\n\n{} {}, η = {} µs, flush {}, {} s, load {} → {}\n",
+        meta.os,
+        std::env::consts::ARCH,
+        meta.interval_ns / 1_000,
+        meta.flush,
+        meta.seconds,
+        meta.load_start,
+        meta.load_end
+    );
+    // Loss and order.
+    let received = run.beats.len() as u64;
+    let mut reordered = 0u64;
+    let mut last = None;
+    for b in &run.beats {
+        if let Some(prev) = last
+            && b.seq < prev
+        {
+            reordered += 1;
+        }
+        last = Some(b.seq);
+    }
+    let lost = meta.count.saturating_sub(received);
+    let _ = writeln!(
+        out,
+        "sent {}, received {received}, lost {lost}, reordered {reordered}; p_L (Jeffreys mean) {:.3e}\n",
+        meta.count, run.loss
+    );
+}
+
+/// The delay and its parts, and the receiver's own waits.
+fn delays(out: &mut String, run: &Run) {
+    let _ = writeln!(out, "{HEADER}");
+    let rd: Vec<f64> = run.beats.iter().map(|b| b.read_delay).collect();
+    let late: Vec<f64> = run.beats.iter().filter_map(|b| b.sender_late).collect();
+    let behind = run.beats.iter().filter(|b| b.sender_late.is_none()).count();
+    let s_rd = stats(&rd, MAX_LAG);
+    for (name, series) in [
+        ("D (kernel stamp − σ)", &run.s_kd),
+        ("D (process read − σ)", &s_rd),
+    ] {
+        let _ = writeln!(out, "{}", row(name, series));
+    }
+    let s_late = stats(&late, MAX_LAG);
+    let _ = writeln!(out, "{}", row("send → kernel", &run.s_net));
+    let _ = writeln!(out, "{}", row("kernel → read (gap)", &run.s_gap));
+    let _ = writeln!(out, "{}", row("sender timer lateness", &s_late));
+    let _ = writeln!(out, "{}", row("sender write+flush", &run.s_flush));
+    let wl: Vec<f64> = run.waits.iter().map(|w| w.1).collect();
+    let s_wait = stats(&wl, 0);
+    let _ = writeln!(out, "{}", row("receiver wait lateness", &s_wait));
+    let asked: Vec<f64> = run.waits.iter().map(|w| w.0).collect();
+    let s_asked = stats(&asked, 0);
+    let ratio: Vec<f64> = run.waits.iter().map(|w| w.1 / w.0).collect();
+    let s_ratio = stats(&ratio, 0);
+    let _ = writeln!(
+        out,
+        "\nsender behind its schedule (no wait) {behind}; receiver waits asked median {} µs, lateness/asked median {:.3}\n",
+        us(s_asked.median),
+        s_ratio.median
+    );
+}
+
+/// Correlation: of the values, of their ranks, and of the tail exceedances, which is what
+/// Theorem 7's product over the heartbeats inside the margin takes as independent.
+fn correlation(out: &mut String, run: &Run) {
+    let kd = &run.kd;
+    let reach = kd.len() / LAG_SHARE;
+    let rho = autocorrelation(kd, reach);
+    let rank_rho = autocorrelation(&ranks(kd), reach);
+    let lags: Vec<usize> = (0..12)
+        .flat_map(|e| [1usize, 2, 5].map(|f| f * 10usize.pow(e)))
+        .take_while(|&k| k <= reach)
+        .collect();
+    let show = |v: &[f64]| {
+        lags.iter()
+            .map(|&k| v.get(k).map_or("—".into(), |r| format!("{r:.3}")))
+            .collect::<Vec<_>>()
+            .join(" | ")
+    };
+    let _ = writeln!(
+        out,
+        "\n| lag (heartbeats) | {} |\n|---|{}",
+        lags.iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(" | "),
+        "---|".repeat(lags.len())
+    );
+    let _ = writeln!(out, "| ρ of D | {} |", show(&rho));
+    let _ = writeln!(out, "| ρ of ranks | {} |", show(&rank_rho));
+    for q in [0.99, 0.999] {
+        let x = quantile(&run.sorted_kd, q);
+        let (ratio, _) = exceedance(&run.beats, x, reach);
+        let _ = writeln!(
+            out,
+            "| P(both > p{}) / P(>p{})² | {} |",
+            q * 100.0,
+            q * 100.0,
+            show(&ratio)
+        );
+        let (theta, cluster, count) = extremal(&run.trace, x);
+        let _ = writeln!(
+            out,
+            "\nexceedances of p{} ({} µs): {count}, extremal index θ {theta:.4} (mean cluster {:.1} heartbeats), clusters separated by ≥ {cluster} heartbeats = {} µs",
+            q * 100.0,
+            us(x),
+            1.0 / theta,
+            us(cluster as f64 * run.eta)
+        );
+    }
+    let _ = writeln!(
+        out,
+        "τ_int {:.1} heartbeats = {} µs; Bartlett band ±{:.4}, values inside from lag {:?}, ranks from {:?}\n",
+        run.s_kd.tau,
+        us(run.s_kd.tau * run.eta),
+        Z95 / (kd.len() as f64).sqrt(),
+        decorrelation_lag(&rho, kd.len()),
+        decorrelation_lag(&rank_rho, kd.len()),
+    );
+}
+
+/// Stationarity: the Allan deviation of the mean and the median over windows of growing length.
+fn stationarity(out: &mut String, run: &Run) {
+    let (eta, g, s_kd) = (run.eta, run.g, &run.s_kd);
+    let a_mean = allan(&run.kd, mean_of);
+    let a_median = allan(&run.kd, median_of);
+    let _ = writeln!(
+        out,
+        "| window m | windows | Allan dev of mean, µs | white-noise σ/√m, µs | Allan dev of median, µs |\n|---|---|---|---|---|"
+    );
+    for ((m, dev, k), (_, dmed, _)) in a_mean.iter().zip(&a_median) {
+        let _ = writeln!(
+            out,
+            "| {m} ({} ms) | {k} | {:.2} | {:.2} | {:.2} |",
+            *m as f64 * eta / 1e6,
+            dev / 1e3,
+            s_kd.sd / (*m as f64).sqrt() / 1e3,
+            dmed / 1e3
+        );
+    }
+    let (n_allan, dev_allan) = allan_minimum(&a_mean);
+    let (n_allan_med, _) = allan_minimum(&a_median);
+    let t_stat = n_allan as f64 * eta;
+    let n_g = (s_kd.tau * s_kd.sd.powi(2) / (g * g)).ceil().max(1.0);
+    let _ = writeln!(
+        out,
+        "\nAllan minimum (mean): window {n_allan} = {} ms, deviation {:.2} µs; (median): window {n_allan_med}\nG (mean lateness of the receiver's own waits) {} µs; n_G = τ_int·V/G² = {n_g}\n",
+        t_stat / 1e6,
+        dev_allan / 1e3,
+        us(g)
+    );
+}
+
+/// Startup: how far the deviation of the first m heartbeats falls short.
+fn startup(out: &mut String, run: &Run) {
+    let kd = &run.kd;
+    let _ = writeln!(
+        out,
+        "| m | blocks | median sd_m/sd | p05 sd_m/sd |\n|---|---|---|---|"
+    );
+    let mut m = 2usize;
+    while kd.len() / m >= 16 && m <= MAX_LAG {
+        let mut r: Vec<f64> = kd
+            .chunks_exact(m)
+            .map(|c| {
+                let mu = c.iter().sum::<f64>() / m as f64;
+                (c.iter().map(|v| (v - mu).powi(2)).sum::<f64>() / (m as f64 - 1.0)).sqrt()
+                    / run.s_kd.sd
+            })
+            .collect();
+        r.sort_by(f64::total_cmp);
+        let _ = writeln!(
+            out,
+            "| {m} | {} | {:.3} | {:.3} |",
+            r.len(),
+            quantile(&r, 0.5),
+            quantile(&r, 0.05)
+        );
+        m *= 4;
+    }
+}
+
+/// The correlation time: the least spacing from which Theorem 7's product, which takes the
+/// heartbeats inside the margin as independent, is not refuted by the replay at any margin that
+/// holds two heartbeats or more. Returns it in heartbeats.
+fn correlation_time(out: &mut String, run: &Run) -> u64 {
+    let mut sweep_rows = String::new();
+    let mut t_c_stride = 1u64;
+    let strides: Vec<u64> = (0..12)
+        .flat_map(|e| [1u64, 2, 5].map(|f| f * 10u64.pow(e)))
+        .take_while(|&k| k <= (run.kd.len() / LAG_SHARE) as u64)
+        .collect();
+    for &stride in &strides {
+        let (refuted, tests) = stride_rows(&mut sweep_rows, run, stride);
+        if refuted {
+            t_c_stride = stride.saturating_mul(2).max(
+                strides
+                    .iter()
+                    .copied()
+                    .find(|&k| k > stride)
+                    .unwrap_or(stride),
+            );
+        }
+        if tests == 0 {
+            break;
+        }
+    }
+    let t_c = t_c_stride as f64 * run.eta;
+    let _ = writeln!(
+        out,
+        "\n| spacing η | α (quantile) | heartbeats in margin | window | Theorem 7 β (mean/sd) | replayed mistakes / points | verdict |\n|---|---|---|---|---|---|---|\n{sweep_rows}\ncorrelation time (least spacing past every refutation) {} µs\n",
+        us(t_c)
+    );
+    t_c_stride
+}
+
+/// The margins tested at `spacing`: the trace's own tail quantiles, and margins holding 2, 3, 5,
+/// 10 and 20 heartbeats, so a dependence the quantiles miss is still exercised.
+fn margins(run: &Run, spacing: f64) -> Vec<(String, f64)> {
+    [0.99, 0.999, 0.9999]
+        .iter()
+        .map(|q| {
+            (
+                format!("p{}", q * 100.0),
+                quantile(&run.sorted_kd, *q) - run.s_kd.mean,
+            )
+        })
+        .chain(
+            [2.0, 3.0, 5.0, 10.0, 20.0]
+                .iter()
+                .map(|k: &f64| (format!("{k} beats"), (k - 0.5) * spacing)),
+        )
+        .collect()
+}
+
+/// The sweep's rows at one spacing: whether any margin refuted Theorem 7's product there, and
+/// how many margins were tested.
+fn stride_rows(rows: &mut String, run: &Run, stride: u64) -> (bool, usize) {
+    let interval = run.meta.interval_ns;
+    let spacing = run.eta * stride as f64;
+    let window = window_for(&run.trace, interval, stride, run.g);
+    let mut refuted = false;
+    let mut tests = 0;
+    let largest = run.sorted_kd.last().copied().unwrap_or(0.0);
+    for (label, alpha) in margins(run, spacing) {
+        if alpha < spacing || alpha > largest {
+            continue;
+        }
+        tests += 1;
+        let (mistakes, _, _, points) = replay(&run.trace, interval, stride, window, alpha, false);
+        let bound = mistake_bound(run.loss, run.s_kd.sd * run.s_kd.sd, spacing, alpha);
+        let (lower, _) = poisson95(mistakes);
+        let no = lower / points.max(1) as f64 > bound;
+        refuted |= no;
+        let _ = writeln!(
+            rows,
+            "| {} | {label} {} | {:.0} | {window} | {bound:.2e} | {mistakes} / {points} | {} |",
+            secs(Duration::from_secs_f64(spacing / 1e9)),
+            secs(Duration::from_secs_f64(alpha / 1e9)),
+            (alpha / spacing).floor() + 1.0,
+            if no { "**refuted**" } else { "holds" }
+        );
+    }
+    (refuted, tests)
+}
+
+/// What the configurator takes from the trace: the floors on η and the election's inputs.
+struct Inputs {
+    floors: Floors,
+    latency: Duration,
+    round: Duration,
+    resolution: Duration,
+}
+
+/// The floors on η.
+fn floors(out: &mut String, run: &Run, t_c_stride: u64) -> Inputs {
+    let g = run.g;
+    let t_c = t_c_stride as f64 * run.eta;
+    let lindley = if run.meta.flush {
+        run.s_flush.mean + g
+    } else {
+        0.0
+    };
+    let floor_ns = g.max(t_c).max(lindley);
+    let floor = Duration::from_secs_f64(floor_ns / 1e9);
+    let base_floor = Duration::from_secs_f64(g.max(lindley) / 1e9);
+    let resolution = Duration::from_secs_f64(g / 1e9);
+    let floors = Floors {
+        granularity: resolution,
+        sender: base_floor,
+        correlation: Duration::from_secs_f64(t_c / 1e9),
+    };
+    // A vote travels as a heartbeat does from send to read, and its voter persists the vote
+    // before answering (Raft §3.4 / Figure 2): one way, and a round of two ways and a flush.
+    let deliver = run.s_net.mean + run.s_gap.mean;
+    let latency = Duration::from_secs_f64(deliver.max(0.0) / 1e9);
+    let round = Duration::from_secs_f64((2.0 * deliver + run.s_flush.mean).max(0.0) / 1e9);
+    let _ = writeln!(
+        out,
+        "\nfloors: G {} µs, correlation time {} µs, flush stability E[flush]+G {} µs → floor {}; election inputs: l = {}, vote round = {}\n",
+        us(g),
+        us(t_c),
+        us(lindley),
+        secs(floor),
+        secs(latency),
+        secs(round)
+    );
+    Inputs {
+        floors,
+        latency,
+        round,
+        resolution,
+    }
+}
+
+/// The two estimate pairs Theorem 7 is fed: the mean and deviation, and the median and the
+/// normal-consistent MAD. Each is (name, centre, deviation, robust).
+fn estimate_pairs(run: &Run) -> [(&'static str, f64, f64, bool); 2] {
+    [
+        ("mean/sd", run.s_kd.mean, run.s_kd.sd, false),
+        (
+            "median/1.4826·MAD",
+            run.s_kd.median,
+            MAD_NORMAL * run.s_kd.mad,
+            true,
+        ),
+    ]
+}
+
+/// Theorem 7 against the replay: the bound on the probability that a freshness point is a
+/// mistake, from each estimate pair, and the rate the replayed detector made.
+fn theorem7(out: &mut String, run: &Run, t_c_stride: u64) {
+    let _ = writeln!(
+        out,
+        "| estimate | η | α (at quantile) | window | Theorem 7 β | replayed mistakes / points | replayed rate (95 %) | bound holds |\n|---|---|---|---|---|---|---|---|"
+    );
+    for (name, centre, sd, robust) in estimate_pairs(run) {
+        for stride in [1u64, t_c_stride] {
+            for q in [0.9, 0.99, 0.999, 0.9999] {
+                theorem7_row(out, run, (name, centre, sd, robust), stride, q);
+            }
+        }
+    }
+}
+
+/// One row of [`theorem7`]: the estimate pair at a spacing of `stride` heartbeats and a margin at
+/// quantile `q`, when that margin is positive.
+fn theorem7_row(
+    out: &mut String,
+    run: &Run,
+    (name, centre, sd, robust): (&str, f64, f64, bool),
+    stride: u64,
+    q: f64,
+) {
+    let alpha = quantile(&run.sorted_kd, q) - centre;
+    if alpha <= 0.0 {
+        return;
+    }
+    let interval = run.meta.interval_ns;
+    let window = window_for(&run.trace, interval, stride, run.g);
+    let (mistakes, _, _, points) = replay(&run.trace, interval, stride, window, alpha, robust);
+    let bound = mistake_bound(run.loss, sd * sd, run.eta * stride as f64, alpha);
+    let rate = mistakes as f64 / points.max(1) as f64;
+    let (lower, upper) = poisson95(mistakes);
+    let (lower, upper) = (lower / points.max(1) as f64, upper / points.max(1) as f64);
+    let _ = writeln!(
+        out,
+        "| {name} | {} | {} (p{}) | {window} | {bound:.2e} | {mistakes} / {points} | {rate:.2e} ({lower:.2e}–{upper:.2e}) | {} |",
+        secs(Duration::from_secs_f64(run.eta * stride as f64 / 1e9)),
+        secs(Duration::from_secs_f64(alpha / 1e9)),
+        q * 100.0,
+        if lower <= bound { "yes" } else { "**no**" }
+    );
+}
+
+/// The configurator on the measured inputs: the election span for each cluster shape, and the
+/// election time of three voters with two up, which the detectors below are configured for.
+fn elections(out: &mut String, inputs: &Inputs) -> Option<Duration> {
+    let _ = writeln!(
+        out,
+        "\n| voters/up | span W | T_E | split |\n|---|---|---|---|"
+    );
+    let mut t_e = None;
+    for (v, a) in [(3u32, 3u32), (3, 2), (5, 5), (5, 4)] {
+        if let Some(span) = election_span(v, a, inputs.latency, inputs.round, inputs.resolution) {
+            let _ = writeln!(
+                out,
+                "| {v}/{a} | {} | {} | {:.3} |",
+                secs(span.span),
+                secs(span.election),
+                span.split
+            );
+            if (v, a) == (3, 2) {
+                t_e = Some(span.election);
+            }
+        }
+    }
+    t_e
+}
+
+/// The mean times between failures the detectors are configured for: an hour, a day, thirty
+/// days and a year.
+const MTBFS: [u64; 4] = [3_600, 86_400, 30 * 86_400, 365 * 86_400];
+
+/// The configured detector, from each estimate pair and each MTBF, replayed over the trace.
+fn detectors(out: &mut String, run: &Run, inputs: &Inputs, t_e: Option<Duration>) {
+    let _ = writeln!(
+        out,
+        "\n| estimate | MTBF | η | α | window | detection bound | T_MR bound | U | replayed mistakes / points | replayed T_MR | bound holds | suspected share |\n|---|---|---|---|---|---|---|---|---|---|---|---|"
+    );
+    let Some(election) = t_e else { return };
+    for (name, mean, sd, robust) in estimate_pairs(run) {
+        let link = LinkBehaviour {
+            loss: run.loss,
+            mean_delay: Duration::from_secs_f64(mean.max(0.0) / 1e9),
+            delay_deviation: Duration::from_secs_f64(sd.max(0.0) / 1e9),
         };
-        for mtbf in [3_600u64, 86_400, 30 * 86_400, 365 * 86_400] {
-            let Some(election) = t_e else { continue };
+        for mtbf in MTBFS {
             let costs = Costs {
                 election,
                 mtbf: Duration::from_secs(mtbf),
             };
-            let Some(det) = configure(&mean_link, &costs, &floors) else {
-                continue;
-            };
-            let stride = ((det.interval.as_nanos() as f64 / eta).round() as u64).max(1);
-            let (mistakes, points, allowed, configurations) =
-                online(&trace, meta.interval_ns, stride, g, &costs, &floors);
-            let (lower, _) = poisson95(mistakes);
-            let _ = writeln!(
-                out,
-                "| {} | {} | {configurations} | {mistakes} / {points} | {allowed:.2} | {} |",
-                secs(Duration::from_secs(mtbf)),
-                secs(Duration::from_secs_f64(eta * stride as f64 / 1e9)),
-                if lower <= allowed { "yes" } else { "**no**" }
-            );
+            if let Some(det) = configure(&link, &costs, &inputs.floors) {
+                detector_row(out, run, (name, robust), mtbf, &det);
+            }
         }
-        print!("{out}");
     }
-    Ok(())
+}
+
+/// One row of [`detectors`]: the detector configured from the pair `name` for `mtbf` seconds,
+/// replayed over the trace.
+fn detector_row(
+    out: &mut String,
+    run: &Run,
+    (name, robust): (&str, bool),
+    mtbf: u64,
+    det: &hyper_timing::Detector,
+) {
+    let interval = run.meta.interval_ns;
+    let stride = ((det.interval.as_nanos() as f64 / run.eta).round() as u64).max(1);
+    let parts = window_parts(&run.trace, interval, stride, run.g);
+    let window = parts.length;
+    let (n_g_at, n_allan_at, drift) = (
+        parts.granularity.map_or("—".into(), |n| n.to_string()),
+        parts.allan.map_or("—".into(), |n| n.to_string()),
+        parts.drift,
+    );
+    let (mistakes, suspected, replayed, points) = replay(
+        &run.trace,
+        interval,
+        stride,
+        window as usize,
+        det.margin.as_nanos() as f64,
+        robust,
+    );
+    let replayed_t_mr = if mistakes > 0 {
+        secs(Duration::from_secs_f64(replayed / mistakes as f64 / 1e9))
+    } else {
+        format!("> {}", secs(Duration::from_secs_f64(replayed / 1e9)))
+    };
+    // The bound is on the share of freshness points that start a mistake, `β = η / E(T_MR)`.
+    let beta =
+        det.interval.as_secs_f64() / det.mistake_recurrence.as_secs_f64().max(f64::MIN_POSITIVE);
+    let (lower, _) = poisson95(mistakes);
+    let holds = if lower / points.max(1) as f64 <= beta {
+        "yes"
+    } else {
+        "**no**"
+    };
+    let _ = writeln!(
+        out,
+        "| {name} | {} | {} | {} | {window} (n_G {n_g_at}, n_Allan {n_allan_at}, drift {drift}) | {} | {} | {:.3e} | {mistakes} / {points} | {replayed_t_mr} | {holds} | {:.2e} |",
+        secs(Duration::from_secs(mtbf)),
+        secs(det.interval),
+        secs(det.margin),
+        secs(det.detection),
+        secs(det.mistake_recurrence),
+        det.unavailability,
+        suspected / replayed.max(1.0)
+    );
+}
+
+/// The estimator itself as the detector, online: its own window, estimates and configurations as
+/// the heartbeats come, at each interval the configurator chose above.
+fn online_detectors(out: &mut String, run: &Run, inputs: &Inputs, t_e: Option<Duration>) {
+    let _ = writeln!(
+        out,
+        "\n| online, MTBF | η | configurations | mistakes / points | Theorem 7 allows (Σβ) | bound holds |\n|---|---|---|---|---|---|"
+    );
+    let Some(election) = t_e else { return };
+    let mean_link = LinkBehaviour {
+        loss: run.loss,
+        mean_delay: Duration::from_secs_f64(run.s_kd.mean.max(0.0) / 1e9),
+        delay_deviation: Duration::from_secs_f64(run.s_kd.sd.max(0.0) / 1e9),
+    };
+    for mtbf in MTBFS {
+        let costs = Costs {
+            election,
+            mtbf: Duration::from_secs(mtbf),
+        };
+        let Some(det) = configure(&mean_link, &costs, &inputs.floors) else {
+            continue;
+        };
+        let stride = ((det.interval.as_nanos() as f64 / run.eta).round() as u64).max(1);
+        let (mistakes, points, allowed, configurations) = online(
+            &run.trace,
+            run.meta.interval_ns,
+            stride,
+            run.g,
+            &costs,
+            &inputs.floors,
+        );
+        let (lower, _) = poisson95(mistakes);
+        let _ = writeln!(
+            out,
+            "| {} | {} | {configurations} | {mistakes} / {points} | {allowed:.2} | {} |",
+            secs(Duration::from_secs(mtbf)),
+            secs(Duration::from_secs_f64(run.eta * stride as f64 / 1e9)),
+            if lower <= allowed { "yes" } else { "**no**" }
+        );
+    }
 }

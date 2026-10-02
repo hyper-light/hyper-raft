@@ -37,9 +37,10 @@ UNSAFE_ALLOWED = {
     "crates/hyper-block/src/threads/windows.rs":
         "ToolHelp snapshots and GetThreadTimes (the process's threads and a thread's CPU time)",
     "crates/hyper-timing-trace/src/sys.rs":
-        "recvmsg(2) with SO_TIMESTAMPNS / SO_TIMESTAMP_MONOTONIC, select(2), clock_gettime(2), "
-        "mach_absolute_time, fdatasync(2) / F_FULLFSYNC and getloadavg(3) (the trace recorder; "
-        "measurement only)",
+        "libc's setsockopt(2) of SO_TIMESTAMPNS / SO_TIMESTAMP_MONOTONIC, recvmsg(2) and the "
+        "CMSG_* walk of its receive-timestamp control message (rustix's recvmsg drops it); on "
+        "macOS libc's mach_absolute_time, mach_timebase_info and getloadavg(3), and rustix's "
+        "select(2), unsafe for I/O safety only (the trace recorder; measurement only)",
 }
 
 ALLOW_UNSAFE = re.compile(r"(allow|expect)\s*\(\s*unsafe_code\b")

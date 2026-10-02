@@ -723,6 +723,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "hyper-timing-trace"
+version = "0.1.0"
+dependencies = [
+ "hyper-timing",
+ "libc",
+ "rustix 1.1.4",
+ "tempfile",
+]
+
+[[package]]
 name = "hyper-tls"
 version = "0.1.0"
 dependencies = [

@@ -1,19 +1,29 @@
 [package]
 name = "hyper-timing-trace"
 description = "Heartbeat traces between two processes on loopback, and their analysis: the measured inputs of hyper-timing's detector (docs/timing.md §3)."
-version = "0.1.0"
-edition = "2024"
-rust-version = "1.98"
-license = "MIT"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
 publish = false
 
-# A workspace of its own: a measurement tool, run by hand and in a Linux container, outside the
-# gates (docs/benchmarks.md, "Heartbeat traces"). It takes nothing but std, the platform's C
-# library through `src/sys.rs`, and hyper-timing for the configurator.
-[workspace]
-
+# A measurement tool, run by hand (docs/benchmarks.md, "Heartbeat traces"), and a workspace member so
+# the gates lint and test it on all six targets. The recorder runs on Linux and macOS; elsewhere it
+# refuses and `analyse` still runs (src/sys.rs).
 [dependencies]
 hyper-timing = { path = "../hyper-timing" }
 
-[profile.release]
-debug = "line-tables-only"
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
+# The clock, the socket wait, the full flush and Linux's load average through safe calls; `event`
+# adds poll(2) and select(2) to the workspace's features.
+rustix = { workspace = true, features = ["event"] }
+# setsockopt(2) and recvmsg(2) for the kernel's receive timestamps and their control messages, the
+# Mach clock and getloadavg(3), which rustix does not cover (hyper-measure's own dependency).
+libc = "0.2.189"
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

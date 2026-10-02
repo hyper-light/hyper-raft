@@ -16,7 +16,9 @@ tokio = { version = "1.48", default-features = false, features = ["net", "time"]
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # sendmmsg(2), recvmmsg(2) and the UDP_SEGMENT and UDP_GRO socket options and control messages,
-# which neither std nor tokio expose (hyper-measure's own dependency, already in the graph).
+# which neither std nor tokio expose (hyper-measure's own dependency, already in the graph), nor
+# rustix 1.1: it lists recvmmsg as not yet implemented, has no UDP_SEGMENT or UDP_GRO option, and
+# its ancillary buffers carry neither control message (its sendmmsg cannot send a GSO batch).
 libc = "0.2.189"
 
 [dev-dependencies]

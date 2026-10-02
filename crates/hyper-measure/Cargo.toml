@@ -9,7 +9,8 @@ repository.workspace = true
 publish = false
 
 [target.'cfg(unix)'.dependencies]
-# getrusage(2) and, on macOS, task_info(3) from the Mach interface.
+# getrusage(2) and, on macOS, task_info(3) from the Mach interface: rustix 1.1 has neither
+# (no getrusage, and no Mach calls).
 libc = "0.2.189"
 
 [lints]

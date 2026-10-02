@@ -87,6 +87,9 @@ pub(crate) struct World {
     pub(crate) flushes: u64,
     /// Time spent in the crate's calls since the last read.
     pub(crate) busy: Duration,
+    /// The bootstrap, once [`warm`](Self::warm) has seen every pair configured: the simulated
+    /// time it took, the heartbeats sent and taken in it, and the time of the crate's calls.
+    pub(crate) bootstrap: Option<(Duration, u64, Duration)>,
 }
 
 impl World {
@@ -128,6 +131,7 @@ impl World {
             taken: 0,
             flushes: 0,
             busy: Duration::ZERO,
+            bootstrap: None,
         };
         for node in 0..nodes {
             world.poll(node);
@@ -283,12 +287,18 @@ impl World {
         })
     }
 
-    /// Runs until every pair is configured and then a further ten seconds, electing every 100 ms.
+    /// Runs until every pair is configured and then a further ten seconds, electing every 100 ms;
+    /// the bootstrap is recorded apart.
     pub(crate) fn warm(&mut self) {
         while !self.configured() {
             self.elect();
             self.run(Duration::from_millis(100));
         }
+        self.bootstrap = Some((
+            Duration::from_nanos(self.now),
+            self.sent + self.taken,
+            self.busy,
+        ));
         for _ in 0..100 {
             self.elect();
             self.run(Duration::from_millis(100));

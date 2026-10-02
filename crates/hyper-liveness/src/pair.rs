@@ -3,8 +3,8 @@
 use std::time::Duration;
 
 use hyper_timing::{
-    Configuration, Costs, Event, ExchangeRtt, Floors, LinkBehaviour, LinkEstimator, Trust,
-    detector_at, mistake_bound,
+    Configuration, Costs, Event, ExchangeRtt, Exposure, Floors, LinkBehaviour, LinkEstimator,
+    Trust, detector_at, mistake_bound,
 };
 
 use crate::bound::Sums;
@@ -26,9 +26,11 @@ pub(crate) struct Sender {
 }
 
 /// What the node gives a pair's receiver with a heartbeat.
-pub(crate) struct Context {
+pub(crate) struct Context<'a> {
     pub(crate) granularity: Option<Duration>,
-    pub(crate) mtbf: Option<Duration>,
+    /// The node's failure evidence, whose MTBF is read only where a configuration needs it: a
+    /// float division and a conversion, at every heartbeat it was read for none.
+    pub(crate) exposure: &'a Exposure,
     /// What the node's pool of its links measured, while this pair has no configuration of its own
     /// (`docs/timing.md` §3, item 10).
     pub(crate) pool: Option<LinkBehaviour>,
@@ -96,7 +98,8 @@ struct Unheard {
 }
 
 /// The estimator of the peer's stream and the ring of its delay sums, boxed together: the
-/// estimator's Allan levels are a kilobyte, and the pair's other fields are read every poll.
+/// estimator's Allan levels are most of a kilobyte, and the pair's other fields are read every
+/// poll.
 #[derive(Debug)]
 struct Link {
     estimator: LinkEstimator,
@@ -267,11 +270,12 @@ impl Pair {
         self.stream.next.map(|(_, due)| due)
     }
 
-    /// The peer's freshness point, while trusted.
+    /// The peer's freshness point, while trusted: [`trust`](Self::trust)'s, read without
+    /// building it, since every wake asked reads it of every pair.
     pub(crate) fn deadline(&self) -> Option<u64> {
-        match self.trust() {
-            Trust::Trusted { until_ns } => Some(until_ns),
-            _ => None,
+        match self.received.link.as_ref() {
+            Some(link) => link.estimator.deadline(),
+            None => self.unheard.until_ns.filter(|_| !self.unheard.suspected),
         }
     }
 
@@ -307,6 +311,12 @@ impl Pair {
     /// is what they are.
     pub(crate) fn send(&mut self, sender: &Sender, now_ns: u64, out: &mut [u8; MAX_BYTES]) -> Sent {
         if self.groups == 0 {
+            return Sent::Nothing;
+        }
+        // Not due: every poll asks every pair, and most have nothing due. A heartbeat is scheduled
+        // only once a floor is measured, and a measured floor stays measured, so nothing below
+        // could be asked of a pair with one scheduled and not yet due.
+        if self.stream.next.is_some_and(|(_, due)| due > now_ns) {
             return Sent::Nothing;
         }
         let Some(interval) = self.interval(sender) else {
@@ -524,7 +534,7 @@ impl Pair {
         peer: PeerId,
         beat: &Heartbeat,
         arrival_ns: u64,
-        context: &Context,
+        context: &Context<'_>,
         changes: &mut [Option<Change>; 3],
         taken: &mut Taken,
     ) -> Result<(), Refusal> {
@@ -580,7 +590,7 @@ impl Pair {
         if self.received.configuration.is_none()
             && let Some(pool) = context.pool
         {
-            self.pool_margin(&pool, granularity, context.mtbf);
+            self.pool_margin(&pool, granularity, context.exposure.mtbf());
         }
         let due = previous.map_or(1, |previous| mapped.saturating_sub(previous).max(1));
         taken.error = error.map(|error| (due, error));
@@ -710,13 +720,32 @@ impl Pair {
     /// one-CPU throttle, whose stalls the history had not yet held (`docs/benchmarks.md`,
     /// "hyper-liveness"). hyper-swim judges each probe on its own for the same reason (§2.7). A
     /// refusal leaves the detector in force (`LinkEstimator::configure`).
-    fn configure(&mut self, context: &Context, granularity: Duration) {
+    fn configure(&mut self, context: &Context<'_>, granularity: Duration) {
         let floor_ns = self.received.floor_ns;
-        let costs = self
-            .election
-            .zip(context.mtbf)
-            .map(|(election, mtbf)| Costs { election, mtbf });
         let Some(link) = self.received.link.as_mut() else {
+            return;
+        };
+        // The evidence is asked for only where it is wanting: refused for want of `τ_int`, or no
+        // cost to configure by yet. The estimator says what it wants before any cost is read, as
+        // its `configure` would refuse: a link that moved is configured again at each heartbeat
+        // until its levels measure `τ_int` at the new interval, and the costs and floors were
+        // built for every one of those refusals.
+        match link.estimator.behaviour() {
+            Err(hyper_timing::Refusal::CorrelationUnmeasured) => {
+                if let Some(next) = link.estimator.independent_interval() {
+                    self.received.evidence_ns = self.received.evidence_ns.max(nanos(next));
+                }
+                return;
+            }
+            Err(_) => return,
+            Ok(_) => {}
+        }
+        // Measured, so no interval is wanting for evidence (`independent_interval` says none).
+        let Some(costs) = self
+            .election
+            .zip(context.exposure.mtbf())
+            .map(|(election, mtbf)| Costs { election, mtbf })
+        else {
             return;
         };
         let floors = Floors {
@@ -724,22 +753,11 @@ impl Pair {
             sender: Duration::from_nanos(floor_ns).max(granularity),
             correlation: Duration::MAX,
         };
-        // The evidence is asked for only where it is wanting: refused for want of `τ_int`, or no
-        // cost to configure by yet.
-        let outcome = costs.map(|costs| link.estimator.configure(&costs, &floors));
-        match outcome {
-            Some(Ok(configured)) => {
-                self.received.configuration = Some(configured);
-                self.report.configurations = self.report.configurations.saturating_add(1);
-                let beta = self.beta_now().unwrap_or(1.0);
-                self.received.renewed = Some((self.report.taken, beta));
-            }
-            Some(Err(hyper_timing::Refusal::CorrelationUnmeasured)) | None => {
-                if let Some(next) = link.estimator.independent_interval() {
-                    self.received.evidence_ns = self.received.evidence_ns.max(nanos(next));
-                }
-            }
-            Some(Err(_)) => {}
+        if let Ok(configured) = link.estimator.configure(&costs, &floors) {
+            self.received.configuration = Some(configured);
+            self.report.configurations = self.report.configurations.saturating_add(1);
+            let beta = self.beta_now().unwrap_or(1.0);
+            self.received.renewed = Some((self.report.taken, beta));
         }
     }
 }

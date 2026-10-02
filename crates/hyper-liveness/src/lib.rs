@@ -281,6 +281,9 @@ pub struct Liveness {
     flushing: bool,
     exposure: Exposure,
     last_poll_ns: Option<u64>,
+    /// The earliest heartbeat due and freshness point, as the last poll left them: what
+    /// [`wake`](Self::wake) answers without walking the pairs, which an owner asks after every call.
+    next_wake: Option<u64>,
     message: [u8; MAX_BYTES],
     /// The node's pool of its links (`docs/timing.md` §3, item 10): one more estimator, fed the
     /// prediction errors of every link that has no configuration of its own, the links it exists
@@ -297,6 +300,41 @@ pub struct Liveness {
     /// again, and a pair judged by its margin would then judge nothing, a peer it had suspected
     /// before it was heard never trusted again on its heartbeats.
     pool_measured: Option<LinkBehaviour>,
+}
+
+/// The margins a pair that waits for one takes from its node's pool: its own link's, or, for a
+/// peer it has not heard from, the first freshness point's. The MTBF is read once a poll, and only
+/// for such a pair.
+fn pool_margins(
+    pair: &mut Pair,
+    pool: &LinkBehaviour,
+    granularity: Duration,
+    floor: Option<Duration>,
+    mtbf: &mut Option<Option<Duration>>,
+    exposure: &Exposure,
+) {
+    if pair.wants_pool_margin() {
+        let mtbf = *mtbf.get_or_insert_with(|| exposure.mtbf());
+        pair.pool_margin(pool, granularity, mtbf);
+    }
+    if let Some(floor) = floor
+        && pair.wants_unheard_margin()
+    {
+        let mtbf = *mtbf.get_or_insert_with(|| exposure.mtbf());
+        pair.judge_unheard(pool, floor, granularity, mtbf);
+    }
+}
+
+/// The earlier of `wake` and `pair`'s next heartbeat due after `now_ns` and freshness point.
+fn earliest(wake: Option<u64>, pair: &Pair, now_ns: u64) -> Option<u64> {
+    [
+        wake,
+        pair.next_due().filter(|due| *due > now_ns),
+        pair.deadline(),
+    ]
+    .into_iter()
+    .flatten()
+    .min()
 }
 
 impl Liveness {
@@ -316,6 +354,7 @@ impl Liveness {
             flushing: false,
             exposure: settings.history,
             last_poll_ns: None,
+            next_wake: None,
             message: [0; MAX_BYTES],
             pool: None,
             pool_seq: 0,
@@ -368,6 +407,8 @@ impl Liveness {
                 self.exposure.on_failure();
             }
             self.pairs.remove(&peer);
+            // Its wake may have been the earliest.
+            self.next_wake = self.wake_after(self.last_poll_ns.unwrap_or(0));
         }
         Ok(())
     }
@@ -415,15 +456,11 @@ impl Liveness {
             return Err(Refusal::FromSelf);
         }
         let beat = Heartbeat::decode(message)?;
-        let (granularity, mtbf, pool) = (
-            self.wakes.granularity(),
-            self.exposure.mtbf(),
-            self.pool_measured,
-        );
+        let (granularity, pool) = (self.wakes.granularity(), self.pool_measured);
         let pair = self.pairs.get_mut(&from).ok_or(Refusal::UnknownPeer)?;
         let context = pair::Context {
             granularity,
-            mtbf,
+            exposure: &self.exposure,
             pool: if pair.configured() { None } else { pool },
         };
         let mut changes = [None, None, None];
@@ -432,6 +469,13 @@ impl Liveness {
         for change in changes.into_iter().flatten() {
             out.change(change);
         }
+        // The heartbeat moved this pair's freshness point; the others are as the last poll left
+        // them. The earliest of the last poll's wake and this pair's is never past the earliest of
+        // them all, so an owner that asks before it polls is woken in time, if early.
+        self.next_wake = [self.next_wake, pair.deadline()]
+            .into_iter()
+            .flatten()
+            .min();
         if taken.restarted {
             self.exposure.on_failure();
         }
@@ -450,26 +494,26 @@ impl Liveness {
         self.wakes.woke(now_ns);
         self.expose(now_ns);
         let mut wants_flush = false;
+        let granularity = self.wakes.granularity();
+        let floor = self.floor_at(granularity);
         let sender = pair::Sender {
             local_boot: self.boot,
-            floor: self.floor(),
-            granularity: self.wakes.granularity(),
+            floor,
+            granularity,
             durable_count: self.durable.count,
             durable_ns: self.durable.latest_ns,
         };
         let pool = self.pool_measured;
-        let (floor, granularity, mtbf) = (self.floor(), self.wakes.granularity(), self.mtbf());
+        // The MTBF only for a pair that waits for a margin from the pool, which a configured node
+        // has none of: read at every poll, it was a float division and a conversion a poll.
+        let mut mtbf = None;
+        // The wake to ask, gathered in the same walk: each pair is final once it has been judged
+        // and has sent, and a second walk of the map was a tenth of a poll.
+        let mut wake: Option<u64> = None;
         for (&peer, pair) in &mut self.pairs {
             pair.attached(now_ns);
             if let (Some(pool), Some(granularity)) = (&pool, granularity) {
-                if pair.wants_pool_margin() {
-                    pair.pool_margin(pool, granularity, mtbf);
-                }
-                if let Some(floor) = floor
-                    && pair.wants_unheard_margin()
-                {
-                    pair.judge_unheard(pool, floor, granularity, mtbf);
-                }
+                pool_margins(pair, pool, granularity, floor, &mut mtbf, &self.exposure);
             }
             if let Some(change) = pair.judge(peer, now_ns) {
                 out.change(change);
@@ -483,12 +527,19 @@ impl Liveness {
                 pair::Sent::NeedsFlush => wants_flush = true,
                 pair::Sent::Nothing => {}
             }
+            wake = earliest(wake, pair, now_ns);
         }
         if wants_flush && !self.flushing {
             self.flushing = true;
             out.flush();
         }
-        self.wakes.ask(self.wake_after(now_ns));
+        self.wakes.ask(wake);
+        self.next_wake = if self.last_poll_ns == Some(now_ns) {
+            wake
+        } else {
+            // A poll fed a time before an earlier one's: the wake is past the latest.
+            self.wake_after(self.last_poll_ns.unwrap_or(0))
+        };
     }
 
     /// The node time watched since the last poll: each pair's peer, for the time between polls.
@@ -503,9 +554,12 @@ impl Liveness {
     }
 
     /// When to [`poll`](Self::poll) next: the earliest heartbeat due and freshness point. A
-    /// heartbeat waiting on a flush is sent when the flush is reported.
+    /// heartbeat waiting on a flush is sent when the flush is reported. Kept by each poll, and by
+    /// each heartbeat taken no later than its pair's new freshness point, so it costs nothing to
+    /// ask; an owner that polls after every message, as [`poll`](Self::poll) asks, gets the
+    /// earliest exactly.
     pub fn wake(&self) -> Option<u64> {
-        self.wake_after(self.last_poll_ns.unwrap_or(0))
+        self.next_wake
     }
 
     fn wake_after(&self, now_ns: u64) -> Option<u64> {
@@ -518,8 +572,13 @@ impl Liveness {
 
     /// The sender's stability floor, `E[flush] + G`: `None` before a flush is measured.
     pub fn floor(&self) -> Option<Duration> {
+        self.floor_at(self.wakes.granularity())
+    }
+
+    /// The floor at the granularity `G` already read.
+    fn floor_at(&self, granularity: Option<Duration>) -> Option<Duration> {
         let flush = self.flushes.mean()?;
-        Some(flush.saturating_add(self.wakes.granularity().unwrap_or(Duration::ZERO)))
+        Some(flush.saturating_add(granularity.unwrap_or(Duration::ZERO)))
     }
 
     /// `E[flush]`, the mean time from a log write's start to its durability, once one is reported:

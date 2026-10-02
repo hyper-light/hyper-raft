@@ -218,8 +218,10 @@ pub struct Configuration {
 /// One Allan level: windows of `2^j` heartbeats.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 struct Level {
-    /// A finished window's sum waiting for its neighbour, to make one window of the next level.
-    half: Option<i128>,
+    /// A finished window's sum waiting for its neighbour, to make one window of the next level. An
+    /// `i64`: every offset is within [`OFFSET_LIMIT`], `i64::MAX / WINDOW_LIMIT`, and the longest
+    /// window kept, `2^(LEVELS−1)`, is within [`WINDOW_LIMIT`], so every window's sum fits.
+    half: Option<i64>,
     /// The latest finished window's mean.
     previous: Option<f64>,
     /// The sum of squared differences of consecutive window means.
@@ -255,13 +257,14 @@ impl Allan {
         }
     }
 
-    /// One offset: a finished window at level 0, and at each level above whose window it finishes.
+    /// One offset, within [`OFFSET_LIMIT`]: a finished window at level 0, and at each level above
+    /// whose window it finishes.
     fn push(&mut self, offset: i64) {
-        let mut carry = Some(i128::from(offset));
+        let mut carry = Some(offset);
         let mut width = 1.0f64;
         for level in &mut self.levels {
             let Some(sum) = carry.take() else { break };
-            // i128 → f64 rounds past 2⁵³ ns of summed offset; the mean keeps its leading digits.
+            // i64 → f64 rounds past 2⁵³ ns of summed offset; the mean keeps its leading digits.
             let mean = sum as f64 / width;
             if let Some(previous) = level.previous {
                 level.squares += (mean - previous) * (mean - previous);
@@ -273,26 +276,28 @@ impl Allan {
                     level.half = Some(sum);
                     None
                 }
-                // Two windows of up to 2¹⁶ offsets of at most 2⁶³: far inside an i128.
+                // Two windows of a level below the last make one of at most 2^(LEVELS−1) offsets,
+                // which fits (`Level::half`); the last level's carry is never read, and wraps.
                 Some(first) => Some(first.wrapping_add(sum)),
             };
             width *= 2.0;
         }
     }
 
-    /// The levels with enough windows, as `(window, Allan variance, windows)`, up to `limit`.
+    /// The levels with enough windows, as `(window, Allan variance, windows)`, up to `limit`. A
+    /// level's finished windows are `⌊taken/2^j⌋`, fewer at each level up, so the levels with their
+    /// windows are the first ones: the walk ends at the first without, not at the last level. It is
+    /// made three times a heartbeat (`n_A`, `τ_int`, and the interval the evidence needs), and a
+    /// link a few hundred heartbeats from its last move has six or seven of the seventeen.
     fn qualified(&self, limit: u64) -> impl Iterator<Item = (u64, f64, u64)> + Clone + '_ {
-        self.levels
-            .iter()
-            .enumerate()
-            .map_while(move |(j, level)| {
-                let window = u32::try_from(j)
-                    .ok()
-                    .and_then(|j| 1u64.checked_shl(j))
-                    .filter(|w| *w <= limit)?;
-                Some((window, level))
-            })
-            .filter_map(|(window, level)| level.variance().map(|(v, k)| (window, v, k)))
+        self.levels.iter().enumerate().map_while(move |(j, level)| {
+            let window = u32::try_from(j)
+                .ok()
+                .and_then(|j| 1u64.checked_shl(j))
+                .filter(|w| *w <= limit)?;
+            let (variance, windows) = level.variance()?;
+            Some((window, variance, windows))
+        })
     }
 
     /// `n_A`: the shortest window whose Allan deviation is within the statistical tolerance of the
@@ -395,29 +400,30 @@ fn whole_up_to(value: f64, limit: u64) -> u64 {
         return limit;
     }
     let up = value.ceil().max(0.0);
-    let mut count = 0u64;
-    let mut bit = 1u64
-        .checked_shl(u64::BITS.saturating_sub(limit.leading_zeros()).min(63))
-        .unwrap_or(0);
-    // Bisect `up` into an integer without a narrowing cast.
-    while bit > 0 {
-        let candidate = count | bit;
-        if (candidate as f64) <= up {
-            count = candidate;
-        }
-        bit >>= 1;
-    }
-    count.min(limit)
+    // A whole number of seconds below 2⁶⁴ converts exactly, and its seconds are the integer: no
+    // narrowing cast, and, at every placement of the window, no bisection bit by bit.
+    Duration::try_from_secs_f64(up)
+        .map_or(limit, |whole| whole.as_secs())
+        .min(limit)
 }
 
-/// The drift bound `G/(PHI·η) − 1`, at least one and at most [`WINDOW_LIMIT`].
+/// The drift bound `G/(PHI·η) − 1`, at least one and at most [`WINDOW_LIMIT`]. Computed at every
+/// heartbeat and every move of `G`: in `u64` where both products fit one (a `G` under five hours),
+/// which the hardware divides, and in `u128` past it, a call into the compiler's runtime; the
+/// quotient is the same.
 fn drift_bound(granularity_ns: u64, interval_ns: u64) -> u64 {
-    let scaled = u128::from(granularity_ns).saturating_mul(u128::from(MILLION));
-    let per = u128::from(interval_ns).saturating_mul(u128::from(PHI_PER_MILLION));
-    let bound = scaled.checked_div(per).unwrap_or(0).saturating_sub(1);
-    u64::try_from(bound)
-        .unwrap_or(u64::MAX)
-        .clamp(1, WINDOW_LIMIT)
+    let bound = match (
+        granularity_ns.checked_mul(MILLION),
+        interval_ns.checked_mul(PHI_PER_MILLION),
+    ) {
+        (Some(scaled), Some(per)) => scaled.checked_div(per).unwrap_or(0),
+        _ => {
+            let scaled = u128::from(granularity_ns).saturating_mul(u128::from(MILLION));
+            let per = u128::from(interval_ns).saturating_mul(u128::from(PHI_PER_MILLION));
+            u64::try_from(scaled.checked_div(per).unwrap_or(0)).unwrap_or(u64::MAX)
+        }
+    };
+    bound.saturating_sub(1).clamp(1, WINDOW_LIMIT)
 }
 
 /// A time in `i128` nanoseconds on a `u64` clock: zero before its start, `u64::MAX` past its end.
@@ -549,7 +555,8 @@ impl LinkEstimator {
         let granularity_ns = nanos(granularity);
         if granularity_ns > 0 {
             self.granularity_ns = granularity_ns;
-            self.update_window();
+            // `τ_int` is the levels' and the variance's, which `G` does not move.
+            self.place_window();
         }
     }
 
@@ -597,12 +604,14 @@ impl LinkEstimator {
     /// Folds heartbeat `seq`'s `offset` into the prediction errors, the ring, the levels and the
     /// loss.
     fn count(&mut self, seq: u64, offset: i64) {
-        self.latest_error = self.window_sum().and_then(|(length, sum)| {
+        let window = self.window_sum();
+        self.latest_error = window.and_then(|(length, sum)| {
             let mean = sum.checked_div(i64::try_from(length).ok()?)?;
             offset.checked_sub(mean)
         });
-        if let Some(predicted) = self.window_mean() {
-            self.errors.add(offset as f64 - predicted);
+        if let Some((length, sum)) = window {
+            // The window's mean, as `window_mean` gives it.
+            self.errors.add(offset as f64 - sum as f64 / length as f64);
         }
         self.take(offset);
         self.first_seq.get_or_insert(seq);
@@ -685,10 +694,19 @@ impl LinkEstimator {
     /// measured, and until then every offset taken, up to the drift bound (NFD-E's window filling to
     /// `n`).
     fn update_window(&mut self) {
+        self.correlation = self
+            .errors
+            .variance()
+            .and_then(|v| self.allan.correlation(v));
+        self.place_window();
+    }
+
+    /// The window from `τ_int` as it stands, the levels, the variance and `G`: `update_window`
+    /// less `τ_int`, which only an offset taken moves.
+    fn place_window(&mut self) {
         let capacity = u64::try_from(self.sums.len().saturating_sub(1)).unwrap_or(1);
         let drift = drift_bound(self.granularity_ns, self.interval_ns).min(capacity);
         let variance = self.errors.variance();
-        self.correlation = variance.and_then(|v| self.allan.correlation(v));
         let allan = self.allan.window(drift);
         let granularity = self.correlation.zip(variance).map(|(tau, v)| {
             let g = self.granularity_ns as f64;
@@ -882,19 +900,22 @@ impl LinkEstimator {
         Some(1.0 / (self.errors.count as f64 / tau + 1.0))
     }
 
+    /// `E(D)` over the window, where the sender's schedule is known.
+    fn mean_delay(&self) -> Option<Duration> {
+        self.schedule?;
+        let mean = self.window_mean()?;
+        Duration::try_from_secs_f64(mean.max(0.0) / 1e9).ok()
+    }
+
     /// What the estimator holds now.
     pub fn estimates(&self) -> Estimates {
         let (lost, loss) = self.loss();
-        let mean_delay = self
-            .schedule
-            .and(self.window_mean())
-            .and_then(|mean| Duration::try_from_secs_f64(mean.max(0.0) / 1e9).ok());
         Estimates {
             received: self.received,
             lost,
             loss,
             unseen: self.unseen(),
-            mean_delay,
+            mean_delay: self.mean_delay(),
             delay_deviation: self
                 .errors
                 .variance()
@@ -911,10 +932,10 @@ impl LinkEstimator {
     pub fn behaviour(&self) -> Result<LinkBehaviour, Refusal> {
         let variance = self.errors.variance().ok_or(Refusal::TooFewHeartbeats)?;
         let unseen = self.unseen().ok_or(Refusal::CorrelationUnmeasured)?;
-        let estimates = self.estimates();
+        let (_, loss) = self.loss();
         Ok(LinkBehaviour {
-            loss: 1.0 - (1.0 - estimates.loss) * (1.0 - unseen),
-            mean_delay: estimates.mean_delay.unwrap_or(Duration::ZERO),
+            loss: 1.0 - (1.0 - loss) * (1.0 - unseen),
+            mean_delay: self.mean_delay().unwrap_or(Duration::ZERO),
             delay_deviation: Duration::try_from_secs_f64(variance.sqrt() / 1e9)
                 .map_err(|_| Refusal::Unconfigurable)?,
         })
@@ -975,9 +996,110 @@ mod tests {
         assert_eq!(whole_up_to(1e300, 10), 10);
         assert_eq!(whole_up_to(f64::NAN, 10), 10);
         assert_eq!(whole_up_to(65_535.5, WINDOW_LIMIT), 65_536);
+        assert_eq!(whole_up_to(-0.5, 10), 0);
+        assert_eq!(whole_up_to(f64::NEG_INFINITY, 10), 0);
     }
 
     use proptest::prelude::*;
+
+    /// The bisection `whole_up_to` replaced: the reference its conversion is held to.
+    fn bisected(value: f64, limit: u64) -> u64 {
+        if value.is_nan() || value >= limit as f64 {
+            return limit;
+        }
+        let up = value.ceil().max(0.0);
+        let mut count = 0u64;
+        let mut bit = 1u64
+            .checked_shl(u64::BITS.saturating_sub(limit.leading_zeros()).min(63))
+            .unwrap_or(0);
+        while bit > 0 {
+            if ((count | bit) as f64) <= up {
+                count |= bit;
+            }
+            bit >>= 1;
+        }
+        count.min(limit)
+    }
+
+    /// The drift bound in `u128` throughout, as it was computed before its `u64` path.
+    fn drift_wide(granularity_ns: u64, interval_ns: u64) -> u64 {
+        let scaled = u128::from(granularity_ns) * u128::from(MILLION);
+        let per = u128::from(interval_ns) * u128::from(PHI_PER_MILLION);
+        let bound = scaled.checked_div(per).unwrap_or(0).saturating_sub(1);
+        u64::try_from(bound)
+            .unwrap_or(u64::MAX)
+            .clamp(1, WINDOW_LIMIT)
+    }
+
+    proptest! {
+        /// The conversion is the bisection, at every value a window's `n_G` can be.
+        #[test]
+        fn whole_counts_are_the_bisection(value in -10.0f64..1e6, limit in 1u64..=WINDOW_LIMIT) {
+            prop_assert_eq!(whole_up_to(value, limit), bisected(value, limit));
+        }
+
+        /// The `u64` path of the drift bound is the `u128` computation, over the whole range of
+        /// both, its fallback included.
+        #[test]
+        fn the_drift_bound_is_the_wide_computation(
+            granularity in 1u64..100_000_000,
+            interval in 0u64..10_000_000_000,
+            wide_granularity in any::<u64>(),
+            wide_interval in any::<u64>(),
+        ) {
+            for (g, i) in [
+                (granularity, interval),
+                (wide_granularity, interval),
+                (granularity, wide_interval),
+                (wide_granularity, wide_interval),
+            ] {
+                prop_assert_eq!(drift_bound(g, i), drift_wide(g, i));
+            }
+        }
+
+        /// The levels walked to the first without its windows are the levels with their windows:
+        /// they are the first ones, whatever the offsets.
+        #[test]
+        fn the_qualified_levels_are_a_prefix(
+            x in prop::collection::vec(-1_000_000_000i64..1_000_000_000, 0..3_000),
+            limit in 1u64..=WINDOW_LIMIT,
+        ) {
+            let mut allan = Allan::new();
+            for &v in &x {
+                allan.push(v);
+            }
+            let every: Vec<_> = allan
+                .levels
+                .iter()
+                .enumerate()
+                .filter(|(j, _)| (1u64 << j) <= limit)
+                .filter_map(|(j, level)| level.variance().map(|(v, k)| (1u64 << j, v, k)))
+                .collect();
+            let walked: Vec<_> = allan.qualified(limit).collect();
+            prop_assert_eq!(walked, every);
+        }
+
+        /// A move of `G` places the window as the whole update would: `τ_int` is not `G`'s.
+        #[test]
+        fn a_new_granularity_places_the_window_as_a_full_update(
+            delays in prop::collection::vec(0u64..3 * MS, 2..300),
+            moves in prop::collection::vec(1u64..5 * MS, 1..20),
+        ) {
+            let interval = 10 * MS;
+            let mut link =
+                LinkEstimator::new(Duration::from_nanos(interval), Duration::from_micros(50), None)
+                    .unwrap();
+            for (i, (seq, delay)) in delays.iter().enumerate().map(|(s, d)| (s as u64, d)).enumerate() {
+                link.on_heartbeat(seq, seq * interval + delay).unwrap();
+                let g = moves[i % moves.len()];
+                link.set_granularity(Duration::from_nanos(g));
+                let mut full = link.clone();
+                full.update_window();
+                prop_assert_eq!(link.window, full.window);
+                prop_assert_eq!(link.correlation, full.correlation);
+            }
+        }
+    }
 
     const MS: u64 = 1_000_000;
 

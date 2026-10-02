@@ -3712,7 +3712,9 @@ interval between heartbeats on a pair, 50 ms (the macOS trace's configured `η`,
 
 `cargo bench -p hyper-liveness --bench allocs`, the same world, counted over 10 s of simulated time
 after every pair is configured and 10 s more; per heartbeat sent or taken, with the time of the
-crate's calls (which includes the configurations the doubling schedule makes in that span):
+crate's calls (which includes the configurations the doubling schedule makes in that span; the
+bench then also counted the warm-up's calls against the window's heartbeats, a defect found and
+fixed below, "The cost of a heartbeat, settled"):
 
 | nodes | groups a pair | sent | taken | allocs | reallocs | bytes | minor faults | ns |
 |---|---|---|---|---|---|---|---|---|
@@ -3809,7 +3811,9 @@ at two nodes and 0.5 µs at eight: the configure calls are as many (3,070 agains
 nodes, 41 against 48 of them configuring), the pool is fed nothing once every pair is configured
 (counted), and the evidence is asked for only on a refusal for want of `τ_int`; what is left is the
 links' dynamics, which the moves and the floor rule change (the heartbeats sent differ), and
-per-heartbeat bookkeeping (the expected move, the told trust). Measured, not removed.
+per-heartbeat bookkeeping (the expected move, the told trust). Measured, not removed. (Settled
+below, "The cost of a heartbeat, settled": the ns column counted the warm-up's calls, and the rest
+was real per-heartbeat cost, now removed.)
 
 What a node pays a second (`cargo bench -p hyper-liveness --bench cost`, both at load 47, one run
 each, the same minute):
@@ -3834,6 +3838,130 @@ floor followed down, no evidence asked): a link took 5,775 heartbeats unconfigur
 453 s against 1 s. The real processes (`tests/processes.rs`, load 45–50): the stalled disk
 suspected in 694–719 ms against stated bounds of 698–727 ms, the killed node in 64–580 ms against
 65–591 ms, live members 18 suspicions against an allowance of 98.6.
+
+## The cost of a heartbeat, settled (2026-10-02)
+
+The section above left a rise in the time a heartbeat, 0.84–1.0 µs to 0.93–1.09 at two nodes and
+1.04–1.20 to 1.55–1.75 at eight, attributed to the links' dynamics and bookkeeping. Settled here,
+on the commits `634d45c` (L-3), `798c481` (before the follow-ups) and `e7638c5` (after them), and
+this change.
+
+**The method.** A scratch probe (not committed: it reads the PMU through `unsafe` FFI) runs one cell
+of `benches/allocs.rs`'s world in a fresh process and reads, around the measured window alone, the
+time of the crate's calls (the world's clock, as the bench), and instructions retired and cycles
+from `proc_pid_rusage(RUSAGE_INFO_V4)` on itself (`ri_instructions`, `ri_cycles`, the core's PMU;
+they include the world's own work, the same code in every variant). The bootstrap, from the first
+poll to every pair configured, is measured apart. Two worlds:
+- **adaptive**: the bench's own, where each receiver asks the interval its configuration chooses,
+  so the heartbeats sent differ between the commits (the follow-ups changed the dynamics);
+- **fixed**: the same world with every receiver asking 50 ms, so every variant sends the same
+  heartbeats at the same intervals (400 a pair in the window), the cost a heartbeat at fixed
+  intervals.
+
+Each round runs every variant once a cell and world, the order rotated by one each round and
+reversed every other; 30 rounds. Stated: per round the ratio of a variant to `634d45c` (adjacent
+runs), the geometric mean with its Student-t 95 % interval on the logarithms. Apple M5 Max, macOS,
+rustc 1.98.0, release with LTO, load average 84–86 throughout (other sessions' builds).
+
+**It was a real per-heartbeat cost, and a measurement defect besides.**
+- *The defect.* `benches/allocs.rs` zeroed the heartbeats after the warm-up and not the time, so its
+  ns was the warm-up's and the window's calls over the window's heartbeats; the warm-up ran
+  0.8 s simulated at eight nodes after the follow-ups against 0.2 s before, with the pool fed, so
+  most of the reported rise was the bootstrap. The bench now times the window alone and reports
+  the bootstrap apart (`boot ns`, `boot s`).
+- *The real cost.* At fixed intervals, the same heartbeats, `e7638c5` against `634d45c`: time
+  1.185–1.255, instructions 1.090–1.150, cycles 1.096–1.142 in every cell; `798c481` was 1.00 of
+  `634d45c` in instructions. Counted per call (instrumented scratch builds), in the window:
+  configure was called on 3,070 of 3,139 heartbeats taken at eight nodes after and 3,116 of 3,174
+  before (a link that moved is configured at each heartbeat until its levels measure `τ_int` at
+  the new interval), each refusal now also asking `independent_interval`, a walk of all seventeen
+  Allan levels; every poll read the MTBF (a float division and a conversion) and the floor twice,
+  each a `u128` mean (`__udivti3`, which a profile showed growing); `deadline` built the pair's
+  trust; and the pool was fed nothing (0 of 3,139). The links' dynamics are a different workload,
+  not a cost a heartbeat: at fixed intervals the commits send identical heartbeats and the rise is
+  the same size.
+
+**Removed at the causes**, every change leaving what the crates compute exactly as it was (the
+heartbeats sent, taken, configured and the bootstrap's length are identical to `e7638c5`'s in every
+cell of both worlds, and the simulation passes its seeds unchanged):
+- the Allan levels are walked to the first level without its windows, not all seventeen: a level's
+  windows are `⌊taken/2^j⌋`, so those with enough are the first ones (a property test against the
+  full walk); three walks a heartbeat (`n_A`, `τ_int`, the evidence's interval);
+- a level's sums are `i64` (every offset is within `OFFSET_LIMIT`, so a window of `2^16` fits), so
+  its mean is one conversion, not `__floattidf`;
+- a fold's mean and the drift bound divide in `u64` where the sum fits, the `u128` division only
+  past it (property tests against the wide computation);
+- a move of `G`, which comes with nearly every heartbeat (the mean lateness moves at each wake),
+  places the window without recomputing `τ_int`, which `G` does not move (a property test against
+  the full update); `n_G`'s rounding converts once instead of bisecting seventeen bits;
+- `behaviour` builds only what it returns; a heartbeat's prediction reads the window's sum once;
+- a pair asks its estimator whether it has its evidence before building costs and floors, so a link
+  waiting for `τ_int` pays one refusal and the evidence's interval, as before, and nothing else;
+- a poll reads `G` and the floor once and the MTBF only for a pair waiting for a pool margin; a pair
+  not due returns before its interval is computed; the wake is gathered in the poll's one walk of
+  the pairs;
+- `wake()` answers what the last poll found, kept by each heartbeat taken no later than its pair's
+  freshness point, instead of walking every pair at every call (an owner asks after every call; the
+  bench's world asks every node at every event).
+
+**After** (`fix`), against `634d45c`, ratio [95 % interval], and medians a heartbeat sent or taken
+(ns of the crate's calls; instructions and cycles of the window, world included):
+
+| world | cell | time | instructions | cycles | ns, 634 / e76 / fix | instructions, 634 / e76 / fix |
+|---|---|---|---|---|---|---|
+| fixed | 2 nodes | 0.823 [0.799, 0.848] | 0.750 [0.749, 0.750] | 0.766 [0.742, 0.790] | 131 / 164 / 107 | 3,449 / 3,967 / 2,586 |
+| fixed | 4 nodes | 0.877 [0.866, 0.889] | 0.667 [0.667, 0.667] | 0.656 [0.638, 0.674] | 125 / 151 / 110 | 3,641 / 4,094 / 2,429 |
+| fixed | 8 nodes | 0.915 [0.894, 0.937] | 0.494 [0.494, 0.494] | 0.576 [0.541, 0.613] | 142 / 171 / 130 | 5,203 / 5,673 / 2,573 |
+| fixed | 8 nodes, 1,000 groups | 0.971 [0.871, 1.082] | 0.494 [0.494, 0.495] | 0.584 [0.557, 0.612] | 142 / 171 / 131 | 5,203 / 5,673 / 2,573 |
+| adaptive | 2 nodes | 0.775 [0.758, 0.792] | 0.700 [0.699, 0.701] | 0.712 [0.687, 0.738] | 134 / 164 / 103 | 3,504 / 4,022 / 2,452 |
+| adaptive | 4 nodes | 0.975 [0.957, 0.992] | 0.648 [0.648, 0.648] | 0.694 [0.667, 0.723] | 123 / 172 / 120 | 3,989 / 4,806 / 2,584 |
+| adaptive | 8 nodes | 0.899 [0.877, 0.922] | 0.425 [0.425, 0.425] | 0.482 [0.453, 0.514] | 187 / 222 / 164 | 7,631 / 8,283 / 3,243 |
+| adaptive | 8 nodes, 1,000 groups | 0.866 [0.844, 0.890] | 0.425 [0.425, 0.425] | 0.480 [0.456, 0.506] | 187 / 224 / 159 | 7,632 / 8,284 / 3,243 |
+
+Against `e7638c5` the time is 0.63–0.81 in every cell. The time a heartbeat includes the world's two
+clock reads around each call, the same in every variant, which narrows its ratios; instructions and
+cycles do not depend on the load. The one interval that reaches past 1 (fixed, 1,000 groups) is two
+slow rounds of thirty; its median is 131 ns against 142. Allocations, reallocations and faults a
+heartbeat: zero in every run of every variant.
+
+The bootstrap a heartbeat (ns; instructions), which the follow-ups' pool adds to: at fixed intervals
+`634d45c` 177, 136, 151, 152; `e7638c5` 250, 192, 217, 212; now 181, 141, 172, 171 (instructions
+4,244, 3,998, 5,729, 5,729 against now 3,709, 3,089, 3,451, 3,450); in the adaptive world now 224,
+171, 207, 205 against `634d45c`'s 252, 195, 202, 204, at a bootstrap four times as long at eight
+nodes (0.8 s against 0.2 s simulated: the floor followed up and not down, §2.9).
+
+`cargo bench -p hyper-liveness --bench allocs` after (load 80–84):
+
+| nodes | groups a pair | sent | taken | allocs | reallocs | bytes | minor faults | ns | boot ns | boot s |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 2 | 1 | 216 | 216 | 0 | 0 | 0 | 0 | 115 | 253 | 0.2 |
+| 4 | 1 | 612 | 612 | 0 | 0 | 0 | 0 | 127 | 179 | 0.2 |
+| 8 | 1 | 3,139 | 3,139 | 0 | 0 | 0 | 0 | 168 | 206 | 0.8 |
+| 8 | 1,000 | 3,139 | 3,139 | 0 | 0 | 0 | 0 | 164 | 200 | 0.8 |
+
+`cargo bench -p hyper-liveness --bench cost`, `e7638c5` and now alternately, two runs each, load
+56–60, pair µs a node a second: two peers 13.4–15.1 against 9.4–14.3; eight peers 67.6–75.1
+against 54.7–66.9. SWIM's column moved too (12.4–14.5 to 9.3–10.2 at two peers, 53.2–54.2 to
+44.7–46.3 at eight): hyper-swim reads the same folds' means.
+
+**The allocation at two nodes.** The earlier section saw one allocation in the window in one run in
+a few at two nodes, on `798c481` too. Hunted with `hyper_measure`'s counting allocator patched in a
+scratch build to capture a backtrace at every allocation and reallocation while counting (not
+committed): 5,300 sequential and 6,000 concurrent runs (six at once) of `e7638c5`'s `allocs` bench
+at load 30–60, 3,000 more of the plain `e7638c5` and `798c481` binaries, and 960 two-node windows of
+the probe: no allocation or reallocation in any window. The world and the crates are deterministic
+from the seed (the counts above are identical run to run), so an allocation that comes in some runs
+and not others is not the crate's logic; it does not reproduce on these builds, and no source in
+the crates was found. `tests/alloc.rs` now holds the law at two nodes as well as three and five, so
+the gate would catch it.
+
+```sh
+cargo bench -p hyper-liveness --bench allocs
+cargo bench -p hyper-liveness --bench cost
+cargo test --release -p hyper-liveness -p hyper-timing
+# The probe and its runner are scratch: one cell a process, `proc_pid_rusage(getpid(),
+# RUSAGE_INFO_V4)` before and after the window; the fixed world asks 50 ms in `Pair::send`.
+```
 
 ## hyper-durable-e2e on its own detectors
 

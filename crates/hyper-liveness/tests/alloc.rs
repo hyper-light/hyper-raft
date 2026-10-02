@@ -27,7 +27,7 @@ static ALLOCATOR: alloc::Counting = alloc::Counting;
 #[test]
 fn a_configured_heartbeat_allocates_nothing() {
     assert!(alloc::installed());
-    for (nodes, groups) in [(3usize, 1u32), (5, 64)] {
+    for (nodes, groups) in [(2usize, 1u32), (3, 1), (5, 64)] {
         let mut world = World::new(nodes, groups, 0x2545_F491_4F6C_DD1D);
         world.warm();
         world.sent = 0;

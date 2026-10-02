@@ -33,9 +33,15 @@ impl Mean {
         Ok(())
     }
 
+    /// The mean, read at every poll and heartbeat of a detector: divided in `u64` while the sum
+    /// fits one (2⁶⁴ ns is 584 years of summed samples), which the hardware divides, and in `u128`
+    /// past it, which is a call into the compiler's runtime (`__udivti3`); the quotient is the same.
     fn mean(&self) -> Option<Duration> {
-        let mean = self.sum.checked_div(u128::from(self.count))?;
-        Some(Duration::from_nanos(u64::try_from(mean).ok()?))
+        let mean = match u64::try_from(self.sum) {
+            Ok(sum) => sum.checked_div(self.count)?,
+            Err(_) => u64::try_from(self.sum.checked_div(u128::from(self.count))?).ok()?,
+        };
+        Some(Duration::from_nanos(mean))
     }
 }
 
@@ -258,6 +264,22 @@ impl Exposure {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_mean_past_a_u64_sum_is_the_wide_quotient() {
+        let mut mean = Mean::default();
+        mean.add(u64::MAX).unwrap();
+        mean.add(u64::MAX).unwrap();
+        mean.add(1).unwrap();
+        let wide = (2 * u128::from(u64::MAX) + 1) / 3;
+        assert_eq!(mean.mean(), Some(Duration::from_nanos(wide as u64)));
+        let mut small = Mean::default();
+        for sample in [3, 4, 4] {
+            small.add(sample).unwrap();
+        }
+        assert_eq!(small.mean(), Some(Duration::from_nanos(3)));
+        assert_eq!(Mean::default().mean(), None);
+    }
 
     #[test]
     fn the_granularity_is_the_mean_lateness_and_never_negative() {

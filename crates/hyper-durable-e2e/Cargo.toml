@@ -1,0 +1,32 @@
+[package]
+name = "hyper-durable-e2e"
+description = "hyper-durable in real use: members as processes over UDP, each a replica on hyper-log over a real, fully flushed file, killed with SIGKILL at named durability points and at random."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+hyper-block = { path = "../hyper-block" }
+hyper-durable = { path = "../hyper-durable" }
+hyper-log = { path = "../hyper-log" }
+hyper-raft = { path = "../hyper-raft" }
+# The datagram framing, client requests and commands of hyper-raft's own end-to-end harness, so a
+# client speaks to this member as to that one.
+hyper-raft-e2e = { path = "../hyper-raft-e2e" }
+# A waker the log's answer wakes the member's thread by (its leaked slot is one a process).
+hyper-measure = { path = "../hyper-measure" }
+
+[[bin]]
+name = "hyper-durable-node"
+path = "src/main.rs"
+
+[[test]]
+name = "kill"
+# The scenarios run one after another in one thread: one group of processes at a time.
+harness = false
+
+[lints]
+workspace = true

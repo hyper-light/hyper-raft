@@ -685,6 +685,19 @@ Tests (`crates/hyper-durable/tests`):
   freed, a refusal a drive), and one in the harness's own model of hyper-log's refusals.
 - `directed.rs`: mantle's four cases and focal's two, on hyper-log over simulated devices with the
   power cut at each write and flush in turn, both ways of taking readies.
+- `crates/hyper-durable-e2e`, real processes: each member a `Replica` on hyper-log over a real,
+  fully flushed file (`DeviceFile`), over UDP in hyper-raft-e2e's datagrams, woken by its log's
+  answers through a datagram to its own socket (four threads a process, whatever it holds). The
+  test (`tests/kill.rs`) kills the leader and a follower with `SIGKILL` at each named durability
+  point (a write submitted; a write durable whose answer was not taken; messages released), and at
+  seeded random points and counts; focal's F17 cases (the founder killed once it applied the
+  removal of its only peer, the peer stopped for good, elects itself alone; killed with the removal
+  behind its fence, the group finishes it; a host that acted on a fence, restarted told of no one,
+  acts on it again from its own log); and a failed flush, after which the member fences, exits
+  and rejoins. Every answered write reads back linearizably and every member applies the same
+  history. With the fence taken out the fence host reopens below the fence it acted on; the
+  founder's window is too narrow between processes to fail there (its write is on its way when it
+  applies), which `directed.rs` covers deterministically.
 - `shell.rs`, `hyperlog.rs`, `threads.rs`: each bound of §6 at its edge, the open repairs of §4.3,
   marks, the unwind boundary, the owner's turns, parts and refusals on hyper-log, and the threads
   an owner's sixty-four groups cost (none of their own).

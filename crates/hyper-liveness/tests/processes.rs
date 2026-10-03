@@ -1019,6 +1019,8 @@ impl Supervisor {
         let mut unheard = self.unheard(self.clock.now_ns());
         // When the wait looks next: the quiet period's end, or a check's look again.
         let mut look = deadline;
+        // A check under way: when it began, and the members whose line it awaits.
+        let mut checking: Option<(u64, Vec<u64>)> = None;
         while !fact(self) {
             let now = self.clock.now_ns();
             let wake = look.min(self.silent_at(&unheard).unwrap_or(u64::MAX));
@@ -1046,12 +1048,34 @@ impl Supervisor {
                 seen = signature;
                 deadline = now.saturating_add(nanos(self.quiet()));
                 look = deadline;
+                checking = None;
                 continue;
             }
             if now < deadline {
                 look = deadline;
                 continue;
             }
+            // A check is a look: a member whose line is past its due when it begins is awaited,
+            // for that line or a retransmission timeout past its due, as an ask waits for its
+            // answer; the others were heard within their period. Each is awaited once, so a check
+            // ends within a timeout of its beginning.
+            let (began, awaited) = checking.get_or_insert_with(|| (now, self.overdue(now)));
+            let began = *began;
+            awaited.retain(|member| {
+                self.latest.get(member).is_some_and(|stated| {
+                    stated.at < began
+                        && now
+                            <= stated
+                                .at
+                                .saturating_add(due_after(stated))
+                                .saturating_add(nanos(RTO))
+                })
+            });
+            if let Some(at) = self.answer_by(awaited) {
+                look = at.max(now.saturating_add(1));
+                continue;
+            }
+            checking = None;
             match self
                 .check(what, now, deadline, &unheard, &mut blocked)
                 .inspect_err(|stuck| self.stuck = Some(*stuck))?
@@ -1064,6 +1088,35 @@ impl Supervisor {
             }
         }
         Ok(())
+    }
+
+    /// The members up whose latest line is past its due at `now` but not yet by a retransmission
+    /// timeout: those a check begun now awaits.
+    fn overdue(&self, now: u64) -> Vec<u64> {
+        let rto = nanos(RTO);
+        self.latest
+            .iter()
+            .filter(|(member, _)| self.members.0.contains_key(member))
+            .filter(|(_, stated)| {
+                let due = stated.at.saturating_add(due_after(stated));
+                due < now && now.saturating_sub(due) <= rto
+            })
+            .map(|(member, _)| *member)
+            .collect()
+    }
+
+    /// When the first of the members in `awaited` is past its due by a retransmission timeout.
+    fn answer_by(&self, awaited: &[u64]) -> Option<u64> {
+        awaited
+            .iter()
+            .filter_map(|member| self.latest.get(member))
+            .map(|stated| {
+                stated
+                    .at
+                    .saturating_add(due_after(stated))
+                    .saturating_add(nanos(RTO))
+            })
+            .min()
     }
 
     /// The members up whose latest line is past its due ([`due_after`]) by more than a
@@ -1134,13 +1187,12 @@ impl Supervisor {
         Ok(())
     }
 
-    /// A check at `now`, once the quiet period passed at `deadline` with nothing moved: when the
-    /// wait looks again, or why it gives up. A check while a member is unheard, or has stated
-    /// nothing yet, decides nothing: the wait looks again once the first unheard member would be
-    /// silent past the excuse, if no line comes first. A check while a member's line is past its
-    /// due, but not yet by a retransmission timeout, is a look still waiting for its answer: it
-    /// looks again at that line, or once that timeout has passed. Otherwise the time the members'
-    /// writes took since the last check extends the deadline by the most any one took.
+    /// A check at `now`, once the quiet period passed at `deadline` with nothing moved and every
+    /// line the check awaited came or timed out: when the wait looks again, or why it gives up. A
+    /// check while a member is unheard, or has stated nothing yet, decides nothing: the wait looks
+    /// again once the first unheard member would be silent past the excuse, if no line comes first.
+    /// Otherwise the time the members' writes took since the last check extends the deadline by the
+    /// most any one took.
     fn check(
         &mut self,
         what: &str,
@@ -1159,18 +1211,6 @@ impl Supervisor {
                 .silent_at(unheard)
                 .unwrap_or(now.saturating_add(nanos(self.quiet())));
             return Ok(Next::Look(again.max(now.saturating_add(1))));
-        }
-        let rto = nanos(RTO);
-        let answer_by = self
-            .latest
-            .iter()
-            .filter(|(member, _)| self.members.0.contains_key(member))
-            .map(|(_, stated)| stated.at.saturating_add(due_after(stated)))
-            .filter(|due| *due < now)
-            .map(|due| due.saturating_add(rto))
-            .min();
-        if let Some(at) = answer_by {
-            return Ok(Next::Look(at.max(now.saturating_add(1))));
         }
         let excused = self
             .latest

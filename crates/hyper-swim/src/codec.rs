@@ -2,7 +2,8 @@
 //! [`Detector`](crate::detector::Detector)'s [`Ping`](crate::detector::Ping),
 //! [`Ack`](crate::detector::Ack) and [`PingReq`](crate::detector::PingReq) can ride the fleet
 //! transport, each piggybacking a bounded batch of gossiped membership updates (SWIM's infection-style
-//! dissemination shares the probe traffic). The live driver that sends these over authenticated
+//! dissemination shares the probe traffic), and the chunks of a member's view its anti-entropy
+//! exchanges ([`SwimMessage::Sync`]). The live driver that sends these over authenticated
 //! sessions and feeds replies back into the detector is composed on top; this module is the pure codec.
 //!
 //! An acknowledgement also carries the sender's Vivaldi network coordinate ([`crate::coordinates`]), so
@@ -112,6 +113,26 @@ pub enum SwimMessage<'a> {
         /// The membership updates piggybacked on this answer.
         gossip: GossipBatch<'a>,
     },
+    /// Anti-entropy (Demers et al. 1987, §1.3 and §1.5): the digest of `from`'s view, and a chunk
+    /// of the view itself, members it holds, alive, suspected or dead within their records'
+    /// windows, each with its state, as gossip entries are. An exchange opens with the digest alone
+    /// and a pull; a partner whose digest differs answers with its whole view, chunk by chunk, its
+    /// first chunk asking a pull, and the opener answers that with its own
+    /// ([`Detector::sync_into`](crate::detector::Detector::sync_into)).
+    Sync {
+        /// The member whose view this is.
+        from: HostId,
+        /// The sender's daemon boot_nonce, its identity announcement, as every message it originates
+        /// makes.
+        boot_nonce: u64,
+        /// The digest of the sender's whole view when it sent this
+        /// ([`Membership::digest`](crate::membership::Membership::digest)).
+        digest: u64,
+        /// Whether the sender asks the receiver's view in return.
+        pull: bool,
+        /// The members of the sender's view this chunk carries, in id order; none in an opening.
+        gossip: GossipBatch<'a>,
+    },
 }
 
 /// A refusal to decode a SWIM message from received bytes (the closed hostile-input taxonomy).
@@ -140,6 +161,11 @@ pub enum SwimWireError {
         /// The presence byte that arrived.
         presence: u8,
     },
+    /// A view chunk's pull byte is neither asked nor not.
+    UnknownPull {
+        /// The pull byte that arrived.
+        pull: u8,
+    },
 }
 
 /// Format: the message tag occupies one leading byte; a ping's.
@@ -150,6 +176,13 @@ const TAG_ACK: u8 = 2;
 const TAG_PING_REQ: u8 = 3;
 /// Format: an indirect acknowledgement's tag.
 const TAG_INDIRECT_ACK: u8 = 4;
+/// Format: a view chunk's tag.
+const TAG_SYNC: u8 = 5;
+
+/// Format: a view chunk's pull is one byte; a chunk that asks no view in return.
+const PULL_NONE: u8 = 0;
+/// Format: the pull byte of a chunk that asks the receiver's view in return.
+const PULL_ASKED: u8 = 1;
 
 /// Format: an acknowledgement's standing is one presence byte, then the eight-byte version when present.
 const STANDING_ABSENT: u8 = 0;
@@ -308,7 +341,8 @@ impl<'a> SwimMessage<'a> {
             SwimMessage::Ping { from, .. }
             | SwimMessage::Ack { from, .. }
             | SwimMessage::PingReq { from, .. }
-            | SwimMessage::IndirectAck { from, .. } => *from,
+            | SwimMessage::IndirectAck { from, .. }
+            | SwimMessage::Sync { from, .. } => *from,
         }
     }
 
@@ -318,7 +352,8 @@ impl<'a> SwimMessage<'a> {
             SwimMessage::Ping { gossip, .. }
             | SwimMessage::Ack { gossip, .. }
             | SwimMessage::PingReq { gossip, .. }
-            | SwimMessage::IndirectAck { gossip, .. } => gossip,
+            | SwimMessage::IndirectAck { gossip, .. }
+            | SwimMessage::Sync { gossip, .. } => gossip,
         }
     }
 
@@ -328,7 +363,8 @@ impl<'a> SwimMessage<'a> {
             SwimMessage::Ack { coordinate, .. } => Some(coordinate),
             SwimMessage::Ping { .. }
             | SwimMessage::PingReq { .. }
-            | SwimMessage::IndirectAck { .. } => None,
+            | SwimMessage::IndirectAck { .. }
+            | SwimMessage::Sync { .. } => None,
         }
     }
 
@@ -342,6 +378,7 @@ impl<'a> SwimMessage<'a> {
             | SwimMessage::Ack { nonce, .. }
             | SwimMessage::PingReq { nonce, .. }
             | SwimMessage::IndirectAck { nonce, .. } => Some(*nonce),
+            SwimMessage::Sync { .. } => None,
         }
     }
 
@@ -353,7 +390,8 @@ impl<'a> SwimMessage<'a> {
         match self {
             SwimMessage::Ping { boot_nonce, .. }
             | SwimMessage::Ack { boot_nonce, .. }
-            | SwimMessage::IndirectAck { boot_nonce, .. } => Some(*boot_nonce),
+            | SwimMessage::IndirectAck { boot_nonce, .. }
+            | SwimMessage::Sync { boot_nonce, .. } => Some(*boot_nonce),
             SwimMessage::PingReq { .. } => None,
         }
     }
@@ -371,7 +409,9 @@ impl<'a> SwimMessage<'a> {
                 configuration_version,
                 ..
             } => Some(*configuration_version),
-            SwimMessage::PingReq { .. } | SwimMessage::IndirectAck { .. } => None,
+            SwimMessage::PingReq { .. }
+            | SwimMessage::IndirectAck { .. }
+            | SwimMessage::Sync { .. } => None,
         }
     }
 
@@ -383,7 +423,7 @@ impl<'a> SwimMessage<'a> {
             SwimMessage::PingReq { target, .. } | SwimMessage::IndirectAck { target, .. } => {
                 Some(*target)
             }
-            SwimMessage::Ping { .. } | SwimMessage::Ack { .. } => None,
+            SwimMessage::Ping { .. } | SwimMessage::Ack { .. } | SwimMessage::Sync { .. } => None,
         }
     }
 
@@ -459,6 +499,20 @@ impl<'a> SwimMessage<'a> {
                 out.extend_from_slice(&boot_nonce.to_le_bytes());
                 encode_gossip(out, *gossip);
             }
+            SwimMessage::Sync {
+                from,
+                boot_nonce,
+                digest,
+                pull,
+                gossip,
+            } => {
+                out.push(TAG_SYNC);
+                out.extend_from_slice(&from.0.to_le_bytes());
+                out.extend_from_slice(&boot_nonce.to_le_bytes());
+                out.extend_from_slice(&digest.to_le_bytes());
+                out.push(if *pull { PULL_ASKED } else { PULL_NONE });
+                encode_gossip(out, *gossip);
+            }
         }
     }
 
@@ -531,6 +585,28 @@ impl<'a> SwimMessage<'a> {
                     target,
                     nonce,
                     boot_nonce,
+                    gossip,
+                })
+            }
+            TAG_SYNC => {
+                let (from, rest) = take_host(rest)?;
+                let (boot_nonce, rest) = take_word(rest)?;
+                let (digest, rest) = take_word(rest)?;
+                let (&pull, rest) = rest.split_first().ok_or(SwimWireError::Truncated)?;
+                let pull = match pull {
+                    PULL_NONE => false,
+                    PULL_ASKED => true,
+                    pull => return Err(SwimWireError::UnknownPull { pull }),
+                };
+                let (gossip, leftover) = decode_gossip(rest)?;
+                if !leftover.is_empty() {
+                    return Err(SwimWireError::GossipLengthMismatch);
+                }
+                Ok(SwimMessage::Sync {
+                    from,
+                    boot_nonce,
+                    digest,
+                    pull,
                     gossip,
                 })
             }
@@ -919,6 +995,55 @@ mod tests {
             Ok(message),
             "and decodes back"
         );
+    }
+
+    /// A view chunk's encoding is fixed and little-endian, a golden vector pins it (host 2 at daemon
+    /// boot_nonce 7, view digest 11, asking a pull, carrying host 3 suspected at incarnation 1); a
+    /// pull byte that is neither is refused, and a chunk cut inside its header is truncated.
+    #[test]
+    fn sync_has_a_golden_encoding() {
+        let entries = [(
+            HostId(3),
+            MemberState {
+                liveness: Liveness::Suspect,
+                incarnation: 1,
+            },
+        )];
+        let message = SwimMessage::Sync {
+            from: HostId(2),
+            boot_nonce: 7,
+            digest: 11,
+            pull: true,
+            gossip: GossipBatch::Entries(&entries),
+        };
+        let mut expected = vec![TAG_SYNC];
+        expected.extend_from_slice(&2u64.to_le_bytes()); // from = 2
+        expected.extend_from_slice(&7u64.to_le_bytes()); // boot_nonce = 7
+        expected.extend_from_slice(&11u64.to_le_bytes()); // digest = 11
+        expected.push(PULL_ASKED); // pull
+        expected.extend_from_slice(&1u32.to_le_bytes()); // gossip count = 1
+        expected.extend_from_slice(&3u64.to_le_bytes()); // host 3
+        expected.push(LIVENESS_SUSPECT);
+        expected.extend_from_slice(&1u64.to_le_bytes()); // incarnation 1
+        assert_eq!(message.encoded(), expected, "the byte layout is fixed");
+        assert_eq!(
+            SwimMessage::decode(&expected),
+            Ok(message),
+            "and decodes back"
+        );
+        let pull = 1 + 3 * size_of::<u64>();
+        let mut bad = expected.clone();
+        bad[pull] = 2;
+        assert_eq!(
+            SwimMessage::decode(&bad),
+            Err(SwimWireError::UnknownPull { pull: 2 })
+        );
+        for cut in 1..=pull {
+            assert_eq!(
+                SwimMessage::decode(&expected[..cut]),
+                Err(SwimWireError::Truncated)
+            );
+        }
     }
 
     /// A ping-request and an indirect acknowledgement cut short anywhere inside their fixed header — after

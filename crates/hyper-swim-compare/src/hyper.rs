@@ -56,6 +56,9 @@ struct Buffers {
     batch: Vec<(HostId, MemberState)>,
     ping: Vec<u8>,
     ack: Vec<u8>,
+    /// Members a chunk of a view carries, and the chunk's bytes.
+    view_room: usize,
+    view: Vec<u8>,
     requests: Vec<PingReq>,
     noise: u64,
 }
@@ -67,6 +70,8 @@ impl Buffers {
             batch: Vec::new(),
             ping: Vec::new(),
             ack: Vec::new(),
+            view_room: view_room(),
+            view: Vec::new(),
             requests: Vec::new(),
             noise: 0x2545_F491_4F6C_DD1D,
         }
@@ -117,6 +122,54 @@ fn step(members: &mut [Member], prober: usize, buffers: &mut Buffers) {
         }
     };
     exchange(members, prober, ping, buffers);
+    sync(members, prober, buffers);
+}
+
+/// Members a chunk of a view carries: what the datagram holds beside an empty one, as
+/// `tests/cluster.rs` derives it.
+fn view_room() -> usize {
+    let mut bare = Vec::new();
+    SwimMessage::Sync {
+        from: HostId(0),
+        boot_nonce: 1,
+        digest: 0,
+        pull: true,
+        gossip: GossipBatch::Entries(&[]),
+    }
+    .encode_into(&mut bare);
+    gossip_capacity(DATAGRAM - OVERHEAD_BYTES - LENGTH_BYTES, bare.len())
+}
+
+/// Delivers, through the codec, every chunk of member `sender`'s view its anti-entropy exchanges
+/// ask now: the answer it owes a pull and the exchange it began, as a member's driver does after
+/// each poll. A pull it carries is answered at the receiver's next step.
+fn sync(members: &mut [Member], sender: usize, buffers: &mut Buffers) {
+    while let Some(chunk) = members[sender]
+        .detector
+        .sync_into(buffers.view_room, &mut buffers.batch)
+    {
+        SwimMessage::Sync {
+            from: HostId(sender as u64),
+            boot_nonce: 1,
+            digest: chunk.digest,
+            pull: chunk.pull,
+            gossip: GossipBatch::Entries(&buffers.batch),
+        }
+        .encode_into(&mut buffers.view);
+        let SwimMessage::Sync {
+            from,
+            digest,
+            pull,
+            gossip,
+            ..
+        } = SwimMessage::decode(&buffers.view).unwrap()
+        else {
+            unreachable!()
+        };
+        members[chunk.to.0 as usize]
+            .detector
+            .on_sync(from, digest, pull, gossip);
+    }
 }
 
 fn exchange(members: &mut [Member], prober: usize, ping: Ping, buffers: &mut Buffers) {
@@ -134,7 +187,10 @@ fn exchange(members: &mut [Member], prober: usize, ping: Ping, buffers: &mut Buf
     }
     .encode_into(&mut buffers.ping);
     let SwimMessage::Ping {
-        from, gossip, nonce, ..
+        from,
+        gossip,
+        nonce,
+        ..
     } = SwimMessage::decode(&buffers.ping).unwrap()
     else {
         unreachable!()
@@ -184,14 +240,12 @@ fn warm(members: &mut [Member], buffers: &mut Buffers) {
     let n = members.len() as u64;
     let configured = |members: &[Member]| {
         members.iter().enumerate().all(|(id, member)| {
-            (0..n)
-                .filter(|peer| *peer != id as u64)
-                .all(|peer| {
-                    member
-                        .detector
-                        .report(HostId(peer))
-                        .is_some_and(|report| report.configured)
-                })
+            (0..n).filter(|peer| *peer != id as u64).all(|peer| {
+                member
+                    .detector
+                    .report(HostId(peer))
+                    .is_some_and(|report| report.configured)
+            })
         })
     };
     while !configured(members) {

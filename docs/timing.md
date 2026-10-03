@@ -562,11 +562,51 @@ suspect hears it at the first probe. Now:
   only into the room left, so no rumor is counted sent that was not: one entry on every probe, and
   one on an answer only to a member held suspected or dead.
 
-Demers et al. back a rumor up with anti-entropy, each site resolving every difference with another
-chosen at random, and memberlist exchanges its whole state with one member every 30 s, a chosen
-number. Between two members that probe each other these two entries are that exchange, for the two
-states that concern them; two live members that each hold the other dead, both refutations missed,
-probe neither each other nor anyone about each other, and anti-entropy through a third is not built.
+Between two members that probe each other these two entries reconcile the two states that concern
+them. Two live members that each hold the other dead, both refutations missed, probe neither each
+other nor anyone about each other; Demers et al. back a rumor up with anti-entropy for this, each
+site resolving every difference with another chosen at random (§1.5), and memberlist exchanges its
+whole state with one member every 30 s, a chosen number.
+
+**Anti-entropy.** Each member reconciles its whole view with one other, push and pull, once a
+dissemination window (`Detector::sync_into`, `Detector::on_sync`):
+- **Why the window.** A rumor is sent on its adopter's next `T` messages, at least one a period, so
+  past `W = T` of the member's longest periods (the window its dead records are kept for) after its
+  last adoption it reaches nobody new, and a member it missed then never hears it by rumor. For a
+  rumor sent a fixed count, Demers et al.'s relationship between traffic and residue (§1.4,
+  `s = e^{−m}` with `m = T(1 − s)` sent a member) gives the fraction it misses: `s = e^{−T(1−s)}`,
+  6.0 % at the five-member cluster's `T = 3`, 0.09 % at `T = 7`, a thousand members'. An exchange
+  each `W` is anti-entropy at the rumor's own pace.
+- **With whom.** The next partner of a shuffled cycle of the members it holds alive, rebuilt when it
+  runs out, as the probe order is: over a cycle of `m` exchanges, `m` the members it holds alive,
+  it exchanges with each.
+- **What.** The exchange opens with the digest of the view (`Membership::digest`): the wrapping
+  sum, over every member it holds, of SplitMix64's output function (Steele, Lea and Flood 2014)
+  applied to the member, its incarnation and its liveness in turn, kept as the view changes, so
+  two views of the same states have the same digest whatever order they changed in, and two that
+  differ in any have the same with odds of one in 2⁶⁴. "Only if the checksums disagree do the sites
+  compare their entire databases" (Demers et al., §1.3): a partner whose digest is the same answers
+  nothing; one whose digest differs answers with its view, and the opener answers that with its
+  own. A view goes in id order, every member it holds, alive, suspected or dead inside its
+  record's window, its own state included, in chunks of what a datagram holds beside a bare chunk
+  (`SwimMessage::Sync`), each entry applied as gossip is. A member owes one push at a time: a pull
+  from another while it owes one is refused and counted (`Detector::pulls_refused`), and one
+  opening is let go before the next, so the exchanges hold a cursor, an opening and a cycle no
+  larger than the view, and allocate nothing once grown.
+- **How long a split lasts.** A member a rumor missed learns the update at its first exchange with a
+  member that holds it, which each partner does unless the rumor missed it too: the split outlasts
+  the rumor's window by more than `k` windows with probability at most `s^k`, and by one in
+  expectation `1/(1 − s)`. Deterministically, it ends within one cycle, `W + m·W` past the rumor's
+  last adoption, when the rumor reached any member it holds alive, and within two when only the
+  update's origin holds it, whose own cycle carries it to every member it holds alive first.
+- **What it costs.** Views that agree exchange one opening of 30 bytes a member a window; views
+  that differ, `⌈n/r⌉` datagrams each way, `r` the entries a chunk holds (66 in a 1,200-byte
+  datagram). A first form pushed whole views at every exchange, `2⌈n/r⌉/T` datagrams a period
+  beside the two a member sends probing, and its period cost 7.5 entries a member a period at 64
+  members and 25 at 256; with the digest, none in a quiet cluster, and 5.1 and 16.4 where a member
+  refutes a suspicion every period (`docs/benchmarks.md`). A stale alive state an exchange carries
+  can add back a dead member already forgotten, as a late rumor could (above): it is probed and
+  condemned again within the detection bound, the cost probes, not safety.
 
 **What the cluster test asserts** (`crates/hyper-swim/tests/cluster.rs`, §2.5). Five member
 processes run the detector as the library configures it, in two phases. The supervisor waits on
@@ -616,8 +656,9 @@ governs the probe rate too, since a period is its probe's deadline and nothing y
 and as the MTBF grows the margins and so the periods grow with it; two members cannot condemn each
 other, as neither can tell its own failure from the other's; the pool's mean is wrong for a pair far
 from the member's others until that pair configures; the allowance is loose while a history is
-young (§3, item 3); and two live members that each hold the other dead, both refutations missed,
-are told by nothing, since anti-entropy through a third member is not built (above).
+young (§3, item 3); and views that differ are pushed whole, so under heavy churn the exchanges
+carry `2⌈n/r⌉` datagrams a member a window, where digests of ranges of the view would push only
+the ranges that differ.
 
 ### 2.8 The node-pair stream (L-3)
 

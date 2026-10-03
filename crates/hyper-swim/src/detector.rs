@@ -412,6 +412,50 @@ fn relay_count(loss: f64, available: usize) -> usize {
     count.min(available)
 }
 
+/// A push of this member's view to `to`, chunk by chunk ([`Detector::sync_into`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Push {
+    to: HostId,
+    /// The last member sent; `None` before the first chunk.
+    after: Option<HostId>,
+    /// Whether the next chunk asks the partner's view in return: the first chunk of the answer to
+    /// an opening whose digest differed.
+    pull: bool,
+}
+
+/// A message of anti-entropy to send ([`Detector::sync_into`]): to whom, whether it asks the
+/// receiver's view in return, and the digest of this member's view. The owner sends it as a
+/// [`SwimMessage::Sync`](crate::codec::SwimMessage::Sync), carrying the members the call put in
+/// its batch: none in an exchange's opening.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ViewChunk {
+    /// The member to send the chunk to.
+    pub to: HostId,
+    /// Whether the chunk asks the receiver's view in return.
+    pub pull: bool,
+    /// The digest of this member's view ([`Membership::digest`]).
+    pub digest: u64,
+}
+
+/// Anti-entropy (Demers et al. 1987, §1.3 and §1.5): once a dissemination window, an exchange with
+/// one member, the partners in a shuffled cycle of the members this one holds alive. It opens with
+/// the view's digest; only views whose digests differ are pushed, both ways.
+#[derive(Debug, Default)]
+struct Exchanges {
+    /// When this member last began an exchange.
+    began_ns: Option<u64>,
+    /// The cycle of partners, rebuilt and shuffled when it runs out, like the probe order.
+    partners: Vec<HostId>,
+    cursor: usize,
+    /// The partner of the exchange this member began, while its opening is still to send.
+    opening: Option<HostId>,
+    /// The push of its view it owes: to an opening whose digest differed from its own, asking the
+    /// opener's view, or to a push that asked its own.
+    answer: Option<Push>,
+    /// Pulls refused because an answer to another member was owed.
+    refused: u64,
+}
+
 /// The failure detector for one node: its [`Membership`] view, its probe rotation, the period's
 /// probe, and per peer the estimator and verdict that time its probes.
 pub struct Detector {
@@ -467,6 +511,8 @@ pub struct Detector {
     most_transmits: u32,
     /// Updates refused at the view's bound.
     refused: u64,
+    /// The anti-entropy exchanges.
+    exchanges: Exchanges,
 }
 
 /// A deterministic pseudo-random order over the members to probe (SWIM §4.3): each round probes a
@@ -559,6 +605,11 @@ impl Detector {
             most_watched: 0,
             most_transmits: 1,
             refused: 0,
+            // The cycle never holds more than the view: sized once, so no exchange grows it.
+            exchanges: Exchanges {
+                partners: Vec::with_capacity(members.get()),
+                ..Exchanges::default()
+            },
         }
     }
 
@@ -573,6 +624,7 @@ impl Detector {
         self.clock_ns = self.clock_ns.max(now_ns);
         self.stamp_deaths(now_ns);
         self.forget_expired(now_ns);
+        self.begin_exchange(now_ns);
         let ping = match self.stage(now_ns) {
             Stage::Wait => None,
             Stage::Indirect => {
@@ -929,11 +981,14 @@ impl Detector {
         Some(self.periods.longest.max(running).max(unanswered))
     }
 
-    /// How long a dead member's record is kept: while gossip of it from before its death can still
-    /// arrive, SWIM's dissemination budget `T = λ ln n` periods, the largest budget this member's
-    /// reports have had, each the longest a period of this member lasts (`docs/timing.md` §2.7).
-    /// `None` before a period.
-    fn record_window_ns(&self, now_ns: u64) -> Option<u64> {
+    /// The dissemination window: SWIM's budget `T = λ ln n` periods, the largest budget this
+    /// member's reports have had, each the longest a period of this member lasts (`docs/timing.md`
+    /// §2.7). A rumor is sent on its adopter's next `T` messages, at least one a period, so past
+    /// this after its last adoption it reaches nobody new. A dead member's record is kept for it,
+    /// while gossip of the member from before its death can still arrive, and this member begins
+    /// an anti-entropy exchange once each, so an update a rumor missed reaches the member it missed
+    /// at the pace the rumor itself kept. `None` before a period.
+    fn dissemination_window_ns(&self, now_ns: u64) -> Option<u64> {
         let period = self.period_bound(now_ns)?;
         Some(period.saturating_mul(u64::from(self.most_transmits)))
     }
@@ -951,7 +1006,7 @@ impl Detector {
     /// The oldest death record past its window at `now_ns`, taken off the queue with the records
     /// before it that the member has since left; `None` while the oldest held is inside its window.
     fn expired(&mut self, now_ns: u64) -> Option<HostId> {
-        let window = self.record_window_ns(now_ns)?;
+        let window = self.dissemination_window_ns(now_ns)?;
         while let Some(&death) = self.deaths.front() {
             if !death.held(&self.membership) {
                 self.deaths.pop_front();
@@ -1350,6 +1405,145 @@ impl Detector {
     /// holds while no dead member's record was past its window.
     pub fn refused(&self) -> u64 {
         self.refused
+    }
+
+    /// The next message of anti-entropy to send (Demers et al. 1987, §1.3 and §1.5), and to whom:
+    /// the push of its view this member owes first, then the opening of an exchange it began.
+    /// Fills `batch` with up to `max` members of its view, each with its state, its own included,
+    /// in id order after the last it sent, replacing what `batch` held: none for an opening, which
+    /// carries the view's digest alone. `None` once nothing is left to send. The owner sends each as
+    /// a [`SwimMessage::Sync`](crate::codec::SwimMessage::Sync) and asks again until `None`, after
+    /// each [`poll`](Detector::poll) and each message it takes. An exchange begins once a
+    /// dissemination window after the last, with the next partner of a shuffled cycle of the
+    /// members this one holds alive; one whose opening the owner has not taken is let go first.
+    pub fn sync_into(
+        &mut self,
+        max: usize,
+        batch: &mut Vec<(HostId, MemberState)>,
+    ) -> Option<ViewChunk> {
+        batch.clear();
+        let digest = self.membership.digest();
+        if let Some(push) = self.exchanges.answer.take()
+            && max > 0
+        {
+            batch.extend(self.membership.after(push.after).take(max));
+            if let Some(&(last, _)) = batch.last() {
+                let more = self.membership.after(Some(last)).next().is_some();
+                self.exchanges.answer = more.then_some(Push {
+                    after: Some(last),
+                    pull: false,
+                    ..push
+                });
+                return Some(ViewChunk {
+                    to: push.to,
+                    pull: push.pull,
+                    digest,
+                });
+            }
+        }
+        let to = self.exchanges.opening.take()?;
+        Some(ViewChunk {
+            to,
+            pull: true,
+            digest,
+        })
+    }
+
+    /// Takes a message of anti-entropy from `from` (a
+    /// [`SwimMessage::Sync`](crate::codec::SwimMessage::Sync)) carrying the digest of its view:
+    /// each member's state it carries applied as gossip is. An opening, carrying none, whose digest
+    /// differs from this member's earns a push of this view asking `from`'s in return; one whose
+    /// digest is the same earns nothing, the views agreeing. A push that asks a pull earns a push of
+    /// this view. A member owes one push at a time: a pull from another while it owes one is
+    /// refused and counted ([`pulls_refused`](Detector::pulls_refused)).
+    pub fn on_sync(
+        &mut self,
+        from: HostId,
+        digest: u64,
+        pull: bool,
+        entries: impl IntoIterator<Item = (HostId, MemberState)>,
+    ) {
+        let mut carried = false;
+        for (subject, state) in entries {
+            carried = true;
+            // An update about one member more than the view holds is refused, and counted.
+            let _refused_and_counted = self.apply(subject, state);
+        }
+        if !pull {
+            return;
+        }
+        let ask = if carried {
+            false
+        } else if digest != self.membership.digest() {
+            true
+        } else {
+            return;
+        };
+        match self.exchanges.answer {
+            None => {
+                self.exchanges.answer = Some(Push {
+                    to: from,
+                    after: None,
+                    pull: ask,
+                });
+            }
+            Some(answer) if answer.to == from => {}
+            Some(_) => self.exchanges.refused = self.exchanges.refused.saturating_add(1),
+        }
+    }
+
+    /// Pulls refused because an answer to another member was owed ([`on_sync`](Detector::on_sync)).
+    pub fn pulls_refused(&self) -> u64 {
+        self.exchanges.refused
+    }
+
+    /// Begins an exchange once a dissemination window has passed since the last began: an opening
+    /// to the next partner, carrying this view's digest and asking the partner's view if its own
+    /// differs. One whose opening the owner has not taken is let go first.
+    fn begin_exchange(&mut self, now_ns: u64) {
+        if self.exchanges.opening.is_some() {
+            return;
+        }
+        let Some(window) = self.dissemination_window_ns(now_ns) else {
+            return;
+        };
+        if self
+            .exchanges
+            .began_ns
+            .is_some_and(|began| now_ns.saturating_sub(began) < window)
+        {
+            return;
+        }
+        self.exchanges.began_ns = Some(now_ns);
+        self.exchanges.opening = self.next_partner();
+    }
+
+    /// The next partner in a shuffled cycle of the members this one holds alive, besides itself,
+    /// rebuilt when it runs out: over a cycle the member exchanges with every member it held alive
+    /// when the cycle began. `None` when it holds nobody else alive.
+    fn next_partner(&mut self) -> Option<HostId> {
+        loop {
+            while let Some(&candidate) = self.exchanges.partners.get(self.exchanges.cursor) {
+                self.exchanges.cursor = self.exchanges.cursor.saturating_add(1);
+                if self
+                    .membership
+                    .state(candidate)
+                    .is_some_and(|state| state.liveness == Liveness::Alive)
+                {
+                    return Some(candidate);
+                }
+            }
+            let local = self.local;
+            self.exchanges.partners.clear();
+            self.exchanges
+                .partners
+                .extend(self.membership.alive().filter(|host| *host != local));
+            if self.exchanges.partners.is_empty() {
+                return None;
+            }
+            self.shuffler.shuffle(&mut self.exchanges.partners);
+            self.exchanges.cursor = 0;
+        }
     }
 
     /// The membership view this detector maintains.
@@ -1852,7 +2046,7 @@ mod tests {
                 (peer != A).then(|| jitter(&mut state))
             });
         };
-        let window = detector.record_window_ns(world.now).unwrap();
+        let window = detector.dissemination_window_ns(world.now).unwrap();
         while detector.membership().state(A).is_some() {
             assert_eq!(
                 detector.apply(A, alive(died)),
@@ -1889,7 +2083,7 @@ mod tests {
             .back()
             .and_then(|death| death.at_ns)
             .unwrap();
-        while world.now - stamped <= 2 * detector.record_window_ns(world.now).unwrap() {
+        while world.now - stamped <= 2 * detector.dissemination_window_ns(world.now).unwrap() {
             world.run(&mut detector, 1, |_| None);
         }
         for peer in peers {
@@ -1924,7 +2118,7 @@ mod tests {
             .back()
             .and_then(|death| death.at_ns)
             .unwrap();
-        while world.now - stamped <= detector.record_window_ns(world.now).unwrap() {
+        while world.now - stamped <= detector.dissemination_window_ns(world.now).unwrap() {
             world.run(&mut detector, 1, |_| None);
         }
         assert_eq!(detector.membership().len(), 4);
@@ -2367,6 +2561,182 @@ mod tests {
         refuted.ping_gossip_into(B, 10, &mut batch);
         forgot.apply_gossip(batch.iter().copied());
         assert_eq!(liveness(&forgot, LOCAL), Liveness::Alive, "forgotten");
+    }
+
+    /// Carries every message of anti-entropy `from` has for `to`, as its owner would. Whether any.
+    fn deliver(from: &mut Detector, to: &mut Detector, room: usize) -> bool {
+        let mut batch = Vec::new();
+        let mut any = false;
+        while let Some(chunk) = from.sync_into(room, &mut batch) {
+            assert_eq!(chunk.to, to.local);
+            assert_eq!(chunk.digest, from.membership().digest());
+            to.on_sync(from.local, chunk.digest, chunk.pull, batch.iter().copied());
+            any = true;
+        }
+        any
+    }
+
+    /// Carries anti-entropy both ways between `first` and `second` until neither owes the other.
+    fn exchange_views(first: &mut Detector, second: &mut Detector, room: usize) {
+        for _ in 0..8 {
+            let there = deliver(first, second, room);
+            let back = deliver(second, first, room);
+            if !there && !back {
+                return;
+            }
+        }
+        panic!("the exchange did not end");
+    }
+
+    /// A detector for `local` that knows `peers` and has run a few periods, everyone answering: it
+    /// has a dissemination window.
+    fn running(local: HostId, peers: &[HostId], world: &mut World) -> Detector {
+        let mut detector = Detector::new(local, Exposure::new(), room());
+        for &peer in peers {
+            detector.join(peer).unwrap();
+        }
+        world.run(&mut detector, 4, |_| Some(MS));
+        assert!(detector.dissemination_window_ns(world.now).is_some());
+        // The exchange the run began, which the world does not carry.
+        while detector.sync_into(64, &mut Vec::new()).is_some() {}
+        detector
+    }
+
+    /// Runs `detector`'s periods, everyone it probes answering, until it begins an exchange: the
+    /// partner its opening is for.
+    fn until_exchange(detector: &mut Detector, world: &mut World) -> HostId {
+        for _ in 0..1_000 {
+            world.run(detector, 1, |_| Some(MS));
+            if let Some(partner) = detector.exchanges.opening {
+                return partner;
+            }
+        }
+        panic!("no exchange began");
+    }
+
+    /// Two live members that each hold the other dead, both refutations missed, probe neither each
+    /// other nor anyone about each other: a rumor can end known to some members and not all
+    /// (Demers et al. 1987, §1.5), and the prober's own state reaches only the members it probes.
+    /// An exchange with a third member that holds both alive revives each at the other: the
+    /// digests differ, so the third answers with its view.
+    #[test]
+    fn a_mutual_split_heals_through_a_third_member() {
+        let dead = MemberState {
+            liveness: Liveness::Dead,
+            incarnation: 0,
+        };
+        let mut world = World::new();
+        let (x, y, z) = (LOCAL, A, B);
+        let mut first = running(x, &[y, z], &mut world);
+        let mut second = running(y, &[x, z], &mut world);
+        let mut third = running(z, &[x, y], &mut world);
+        // Each was condemned and refuted; the refutations reached the third member only.
+        first.apply(x, dead).unwrap();
+        second.apply(y, dead).unwrap();
+        first.apply(y, dead).unwrap();
+        second.apply(x, dead).unwrap();
+        third.apply(x, alive(1)).unwrap();
+        third.apply(y, alive(1)).unwrap();
+        // The third member is the only one either holds alive, so the partner each exchange finds.
+        assert_eq!(until_exchange(&mut first, &mut world), z);
+        exchange_views(&mut first, &mut third, 4);
+        assert_eq!(first.membership().state(y), Some(alive(1)));
+        assert_eq!(until_exchange(&mut second, &mut world), z);
+        exchange_views(&mut second, &mut third, 4);
+        assert_eq!(second.membership().state(x), Some(alive(1)));
+        assert_eq!(first.membership().digest(), third.membership().digest());
+    }
+
+    /// Two views that agree exchange their digests and nothing more: the opening earns no answer.
+    #[test]
+    fn agreeing_views_exchange_only_their_digests() {
+        let mut world = World::new();
+        let mut first = running(LOCAL, &[A], &mut world);
+        let mut second = running(A, &[LOCAL], &mut world);
+        assert_eq!(first.membership().digest(), second.membership().digest());
+        assert_eq!(until_exchange(&mut first, &mut world), A);
+        let mut batch = Vec::new();
+        let opening = first.sync_into(64, &mut batch).unwrap();
+        assert!(opening.pull && batch.is_empty(), "the digest alone");
+        second.on_sync(LOCAL, opening.digest, opening.pull, batch.iter().copied());
+        assert_eq!(second.sync_into(64, &mut batch), None, "nothing owed");
+    }
+
+    /// A view goes in chunks of the room, in id order, its own state included; only the first
+    /// chunk of the answer to a differing opening asks a pull, and the push ends with the view.
+    #[test]
+    fn a_view_goes_in_chunks_of_the_room() {
+        let peers: Vec<HostId> = (2..=10).map(HostId).collect();
+        let mut world = World::new();
+        let mut detector = running(LOCAL, &peers, &mut world);
+        detector.on_sync(A, !detector.membership().digest(), true, []);
+        let mut batch = Vec::new();
+        let mut sent = Vec::new();
+        let mut pulls = Vec::new();
+        while let Some(chunk) = detector.sync_into(3, &mut batch) {
+            assert_eq!(chunk.to, A);
+            assert!(!batch.is_empty() && batch.len() <= 3);
+            pulls.push(chunk.pull);
+            sent.extend(batch.iter().map(|(host, _)| host.0));
+        }
+        assert_eq!(
+            sent,
+            (1..=10).collect::<Vec<_>>(),
+            "the whole view, in id order"
+        );
+        assert_eq!(pulls, [true, false, false, false]);
+    }
+
+    /// A member owes one push at a time: a pull from another while it owes one is refused and
+    /// counted, and answered once the first push is sent. A push that asks a pull earns one that
+    /// asks nothing.
+    #[test]
+    fn a_member_owes_one_answer_at_a_time() {
+        let mut detector = detector(&[A, B]);
+        let other = !detector.membership().digest();
+        detector.on_sync(A, other, true, []);
+        detector.on_sync(A, other, true, []);
+        detector.on_sync(B, other, true, []);
+        assert_eq!(detector.pulls_refused(), 1);
+        let mut batch = Vec::new();
+        let first = detector.sync_into(10, &mut batch).unwrap();
+        assert_eq!((first.to, first.pull), (A, true));
+        assert_eq!(batch.len(), 3, "the whole view in one chunk");
+        assert_eq!(detector.sync_into(10, &mut batch), None);
+        detector.on_sync(B, other, true, [(B, alive(0))]);
+        let answer = detector.sync_into(10, &mut batch).unwrap();
+        assert_eq!((answer.to, answer.pull), (B, false));
+    }
+
+    /// An exchange begins once a dissemination window after the last began, and over a cycle of
+    /// exchanges every member held alive is a partner once.
+    #[test]
+    fn an_exchange_begins_once_a_dissemination_window_and_cycles_its_partners() {
+        let peers = [A, B, C];
+        let mut world = World::new();
+        let mut detector = running(LOCAL, &peers, &mut world);
+        // A cycle starts afresh: the run began one, with its first partner.
+        detector.exchanges.partners.clear();
+        detector.exchanges.cursor = 0;
+        let mut requests = Vec::new();
+        let mut batch = Vec::new();
+        let mut partners = Vec::new();
+        for _ in 0..peers.len() {
+            let partner = until_exchange(&mut detector, &mut world);
+            let began = detector.exchanges.began_ns.unwrap();
+            let window = detector.dissemination_window_ns(world.now).unwrap();
+            partners.push(partner);
+            let opening = detector.sync_into(10, &mut batch).unwrap();
+            assert_eq!((opening.to, opening.pull), (partner, true));
+            detector.poll(world.now, &mut requests);
+            assert!(
+                detector.exchanges.opening.is_none() || world.now - began >= window,
+                "not again inside the window"
+            );
+            while detector.sync_into(10, &mut batch).is_some() {}
+        }
+        partners.sort();
+        assert_eq!(partners, peers, "each partner once in a cycle");
     }
 
     /// A member held dead at its own incarnation, which it never heard, is told so by the answer to

@@ -109,8 +109,63 @@ for Replicated Database Maintenance", PODC 1987 (checked 2026-10-03).**
   does: it refutes, and its next probe revives it.
 - Between two members that probe each other, these two entries are Demers et al.'s anti-entropy for
   the two states that concern them, at every exchange. Two live members that each hold the other
-  dead, both refutations missed, exchange nothing; a third member that holds both alive would need
-  to pass its view of each to the other, the full exchange memberlist runs every 30 s. Not built.
+  dead, both refutations missed, exchange nothing; a third member that holds both alive must pass
+  its view of each to the other: the full exchange memberlist runs every 30 s.
+
+**Derived here (2026-10-03): anti-entropy, and how long a split lasts.**
+
+- The window a rumor can still arrive in. A member piggybacks an update on its next `T` messages
+  and drops it, and sends at least one message a period, its probe; so an update is spent within `T`
+  of its adopter's periods, and past the dissemination window `W` (`T` of the member's longest
+  periods, the window its dead records are kept for) after its last adoption it reaches nobody new.
+- What a rumor misses. A rumor sent a fixed count is Demers et al.'s blind counter variant (§1.4),
+  whose residue follows their traffic relationship `s = e^{−m}`: a member sends `T` copies when it
+  knows the update, a fraction `1 − s` of them do, so `m = T(1 − s)` and `s = e^{−T(1−s)}`. At the
+  budgets `gossip_transmits` gives, `T = 3` for five members, 4 for 16, 5 for 64, 6 for 256 and 7 for
+  a thousand, the residue is 6.0, 2.0, 0.70, 0.25 and 0.092 %. The relationship is the large-`n`
+  limit; the cluster test's five members are where it is roughest, and its runs are the check.
+- The exchange's period. A member the rumor missed never hears it by rumor once `W` has passed, so
+  an exchange begun once each `W` is anti-entropy at the rumor's own pace: the window after which
+  waiting longer for the rumor gains nothing is the period at which the backup runs. memberlist's
+  30 s is a chosen number; `W` is the crate's own law, measured in the member's own periods.
+- With whom, and the bound. The partner is the next of a shuffled cycle of the members the initiator
+  holds alive, so over `m` exchanges, `m` those members, it exchanges with each; the exchange is
+  push-pull, which Demers et al. find far better than push when few sites are left susceptible
+  (§1.3: "either pull or push-pull is greatly preferable to push"). A member the rumor missed
+  learns the update at its first exchange with a member that holds it, which each partner does
+  unless the rumor missed it too: the split outlasts `W` by more than `k` exchanges with
+  probability at most `s^k`, and by `1/(1 − s)` exchanges in expectation. Deterministically, one
+  cycle ends it, `W + m·W` past the last adoption, when the update reached any member it holds
+  alive; two, when only the update's origin holds it, whose own cycle reaches the others first.
+- Checksums first. Demers et al. §1.3: "Only if the checksums disagree do the sites compare their
+  entire databases." The view's digest is the wrapping sum, over its members, of SplitMix64's output
+  function (Steele, Lea and Flood, OOPSLA 2014: a bijection on 64 bits whose every output bit
+  depends on every input bit) applied to the member's id, incarnation and liveness in turn: order
+  free, so kept by subtracting and adding one member's share at each change, and two views that
+  differ in any state collide with odds of one in 2⁶⁴. An exchange opens with the digest alone;
+  only views that differ are pushed, each way. A first form pushed whole views at every exchange,
+  `2⌈n/r⌉/T` datagrams a member a period, `r` the entries a datagram holds beside a bare chunk:
+  7.5 entries a member a period at 64 members and 25 at 256 in the comparison's quiet cluster, now
+  none (`docs/benchmarks.md`).
+- What is bounded. A member owes one push at a time, refusing and counting a second pull, and lets
+  one opening go before the next: a cursor, an opening and a cycle no larger than the view.
+- Left open: §1.3's refinement for churn, recent-update lists exchanged before the checksums, or
+  digests of ranges of the view, which would push only what differs; under a refutation every
+  period the views mostly differ, and the exchanges carry 5.1 entries a member a period at 64
+  members and 16.4 at 256.
+- What is left. An exchange carries a member's whole view, so a stale alive state at a member that
+  has neither heard nor found a death yet can add back a member already forgotten, as a late rumor
+  could; it is probed and condemned again within the detection bound. memberlist's push/pull has the
+  same property (its `aliveNode` adds an unknown node whatever its incarnation).
+
+**The wire, and its argument (2026-10-03).** No consumer runs hyper-swim yet (slates' session owns
+its integration, `docs/STATUS.md`), so the wire changes in place:
+- a probe's gossip carries the prober's own state, and an answer's the answering member's suspicion
+  or death of the prober: entries of the existing gossip encoding, which a receiver of the earlier
+  form applies as any gossip, so neither changes the message format;
+- a view chunk is a new message, `Sync` (tag 5): the sender, its boot nonce, its view's digest, a
+  pull byte and a gossip batch, empty in an opening, a golden vector pinning its layout (`codec.rs`,
+  `sync_has_a_golden_encoding`).
 
 **Derived here (2026-10-02): how long a dead member's record is kept, and what bounds the view.**
 

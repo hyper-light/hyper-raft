@@ -24,6 +24,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroUsize;
+use std::ops::Bound;
 
 use crate::HostId;
 
@@ -99,27 +100,60 @@ pub struct Membership {
     suspected: BTreeSet<HostId>,
     /// The most members the view holds, this one included: the owner's placement.
     capacity: NonZeroUsize,
+    /// The view's digest ([`Membership::digest`]), kept as the view changes.
+    digest: u64,
+}
+
+/// SplitMix64's output function (Steele, Lea and Flood, "Fast splittable pseudorandom number
+/// generators", OOPSLA 2014): a bijection on 64 bits whose every output bit depends on every input
+/// bit, its constants theirs.
+fn mix(mut z: u64) -> u64 {
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    z ^ (z >> 31)
+}
+
+/// One member's share of the view's digest: its id, incarnation and liveness, each mixed in turn.
+fn entry_digest(member: HostId, state: MemberState) -> u64 {
+    mix(mix(mix(member.0) ^ state.incarnation) ^ u64::from(state.liveness.rank()))
 }
 
 impl Membership {
     /// A view of a lone node — itself, alive, incarnation zero (the laptop degenerate) — that holds at
     /// most `capacity` members, itself included.
     pub fn new(local: HostId, capacity: NonZeroUsize) -> Membership {
+        let alive = MemberState {
+            liveness: Liveness::Alive,
+            incarnation: 0,
+        };
         let mut members = BTreeMap::new();
-        members.insert(
-            local,
-            MemberState {
-                liveness: Liveness::Alive,
-                incarnation: 0,
-            },
-        );
+        members.insert(local, alive);
         Membership {
             local,
             local_incarnation: 0,
             members,
             suspected: BTreeSet::new(),
             capacity,
+            digest: entry_digest(local, alive),
         }
+    }
+
+    /// The view's digest: the wrapping sum, over every member it holds, of a mix of the member and
+    /// its state, kept as the view changes. Two views of the same members in the same states have
+    /// the same digest, whatever order they changed in; two that differ in any state have the same
+    /// with odds of one in 2⁶⁴. Anti-entropy compares digests before it exchanges views (Demers et
+    /// al. 1987, §1.3: "Only if the checksums disagree do the sites compare their entire
+    /// databases").
+    pub fn digest(&self) -> u64 {
+        self.digest
+    }
+
+    /// Holds `state` for `member`, keeping the digest.
+    fn hold(&mut self, member: HostId, state: MemberState) {
+        if let Some(old) = self.members.insert(member, state) {
+            self.digest = self.digest.wrapping_sub(entry_digest(member, old));
+        }
+        self.digest = self.digest.wrapping_add(entry_digest(member, state));
     }
 
     /// Applies a gossiped `update` about `subject`, returning the change it made or `None` if the update
@@ -144,7 +178,7 @@ impl Membership {
         if !overrides {
             return Ok(None);
         }
-        self.members.insert(subject, update);
+        self.hold(subject, update);
         if update.liveness == Liveness::Suspect {
             self.suspected.insert(subject);
         } else {
@@ -164,8 +198,8 @@ impl Membership {
                 .members
                 .get(&member)
                 .is_some_and(|state| state.liveness == Liveness::Dead);
-        if dead {
-            self.members.remove(&member);
+        if dead && let Some(old) = self.members.remove(&member) {
+            self.digest = self.digest.wrapping_sub(entry_digest(member, old));
         }
         dead
     }
@@ -183,7 +217,7 @@ impl Membership {
             return None;
         }
         self.local_incarnation = update.incarnation.saturating_add(1);
-        self.members.insert(
+        self.hold(
             self.local,
             MemberState {
                 liveness: Liveness::Alive,
@@ -242,11 +276,64 @@ impl Membership {
     pub fn local_incarnation(&self) -> u64 {
         self.local_incarnation
     }
+
+    /// The members the view holds after `after` in id order, from the first when `None`, each with
+    /// its state, the local node's own included: a chunk of the view for anti-entropy, read where it
+    /// stands without a copy.
+    pub fn after(&self, after: Option<HostId>) -> impl Iterator<Item = (HostId, MemberState)> + '_ {
+        let start = after.map_or(Bound::Unbounded, Bound::Excluded);
+        self.members
+            .range((start, Bound::Unbounded))
+            .map(|(&host, &state)| (host, state))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn recomputed(view: &Membership) -> u64 {
+        view.after(None).fold(0u64, |sum, (member, state)| {
+            sum.wrapping_add(entry_digest(member, state))
+        })
+    }
+
+    /// The digest kept as the view changes is the one its states give, whatever order they came
+    /// in, and two views apart in one state differ.
+    #[test]
+    fn the_digest_follows_the_view_and_not_the_order() {
+        let room = NonZeroUsize::new(8).unwrap();
+        let state = |liveness, incarnation| MemberState {
+            liveness,
+            incarnation,
+        };
+        let mut first = Membership::new(HostId(1), room);
+        let mut second = Membership::new(HostId(9), room);
+        let updates = [
+            (HostId(2), state(Liveness::Alive, 0)),
+            (HostId(3), state(Liveness::Suspect, 1)),
+            (HostId(2), state(Liveness::Dead, 0)),
+            (HostId(4), state(Liveness::Alive, 3)),
+        ];
+        for (member, update) in updates {
+            first.apply(member, update).unwrap();
+            assert_eq!(first.digest(), recomputed(&first));
+        }
+        // The same states, another order, through another member's view of the first.
+        second.apply(HostId(1), state(Liveness::Alive, 0)).unwrap();
+        for (member, update) in updates.iter().rev() {
+            second.apply(*member, *update).unwrap();
+        }
+        second.apply(HostId(2), state(Liveness::Dead, 0)).unwrap();
+        assert_eq!(second.digest(), recomputed(&second));
+        // Both hold 1, 2, 3, 4 in the same states; 9 only in the second.
+        assert_ne!(first.digest(), second.digest());
+        assert!(second.forget(HostId(2)));
+        assert_eq!(second.digest(), recomputed(&second));
+        first.apply(HostId(1), state(Liveness::Suspect, 0)).unwrap();
+        assert_eq!(first.local_incarnation(), 1);
+        assert_eq!(first.digest(), recomputed(&first));
+    }
 
     const LOCAL: HostId = HostId(1);
     const PEER: HostId = HostId(2);

@@ -4,7 +4,8 @@
 //! The supervisor (`a_killed_member_is_declared_dead_by_every_survivor_and_no_live_one_is`)
 //! starts `NODES` copies of this test binary as member processes (`member_process`, selected by
 //! `HYPER_SWIM_NODE`). Each runs the detector as the library configures it: it polls when the
-//! detector asks, sends what the detector returns, and prints, every period, its view, the
+//! detector asks, sends what the detector returns (its probes, the answers, and the chunks of its
+//! view its anti-entropy exchanges ask), and prints, every period, its view, the
 //! detection bound its detector states and what it reports of each peer. The test measures nothing
 //! of its own and derives no bound. The supervisor waits on facts, each for as long as the members
 //! move toward it: a quiet period derived from what they state (the longest detection bound a live
@@ -156,6 +157,7 @@ fn member_process() {
         address: Box::new(address),
         started: Instant::now(),
         gossip: 0,
+        view_room: 0,
         buffer: vec![0u8; DATAGRAM],
         batch: Vec::new(),
         encoded: Vec::new(),
@@ -165,6 +167,7 @@ fn member_process() {
         tallies: BTreeMap::new(),
     };
     member.gossip = member.gossip_room();
+    member.view_room = member.view_room();
     let mut period = 0u64;
     loop {
         let began = member.step();
@@ -191,6 +194,8 @@ struct Member {
     started: Instant,
     /// Gossip entries a message carries: what fits the datagram.
     gossip: usize,
+    /// Members a chunk of this member's view carries: what fits the datagram beside it.
+    view_room: usize,
     buffer: Vec<u8>,
     batch: Vec<(HostId, MemberState)>,
     encoded: Vec<u8>,
@@ -293,6 +298,20 @@ impl Member {
         gossip_capacity(DATAGRAM - OVERHEAD_BYTES - LENGTH_BYTES, self.encoded.len())
     }
 
+    /// The members a chunk of this member's view carries: what fits the datagram beside an empty
+    /// one.
+    fn view_room(&mut self) -> usize {
+        SwimMessage::Sync {
+            from: HostId(self.me),
+            boot_nonce: self.me,
+            digest: 0,
+            pull: true,
+            gossip: GossipBatch::Entries(&[]),
+        }
+        .encode_into(&mut self.encoded);
+        gossip_capacity(DATAGRAM - OVERHEAD_BYTES - LENGTH_BYTES, self.encoded.len())
+    }
+
     fn send(&mut self, to: u64, message: &SwimMessage<'_>) {
         message.encode_into(&mut self.encoded);
         // A refused message is a lost one; the detector measures losses.
@@ -331,6 +350,22 @@ impl Member {
             );
             self.batch = batch;
         }
+        // The chunks of this member's view its anti-entropy exchanges ask: the answer it owes a
+        // pull, the exchange it began.
+        let mut batch = std::mem::take(&mut self.batch);
+        while let Some(chunk) = self.detector.sync_into(self.view_room, &mut batch) {
+            self.send(
+                chunk.to.0,
+                &SwimMessage::Sync {
+                    from: HostId(self.me),
+                    boot_nonce: self.me,
+                    digest: chunk.digest,
+                    pull: chunk.pull,
+                    gossip: GossipBatch::Entries(&batch),
+                },
+            );
+        }
+        self.batch = batch;
         flush(&mut self.plane, &self.socket, &*self.address);
         ping.is_some()
     }
@@ -454,6 +489,13 @@ impl Member {
                     },
                 );
             }
+            SwimMessage::Sync {
+                from,
+                digest,
+                pull,
+                gossip,
+                ..
+            } => self.detector.on_sync(from, digest, pull, gossip),
             SwimMessage::IndirectAck {
                 target,
                 nonce,

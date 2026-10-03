@@ -98,9 +98,32 @@
    before the ordinary batch, which is drained only into the room left: slates drained it and then
    dropped its least-fresh entry for the suspicion, counting a rumor sent that was not.
 
+9. **No detection bound while a probe would go unjudged** (`docs/timing.md` §2.7).
+   `detection_bound` is `None` until every probe the member makes is judged, by its pair's verdict
+   or the pool's: an unjudged probe that goes unanswered suspects nobody, so the bound it stated
+   before covered periods that judged nothing, and a death held then was another member's, adopted.
+
+10. **Measurement periods back off** (`docs/timing.md` §2.7). A measurement period that ends
+    unanswered doubles the next one's wait (RFC 6298 §5.5), up to the 60 s §2.5 allows as a cap,
+    and a measured round trip ends it: round trips that outran the periods were never matched, and a
+    member probed on at a stale pace with nothing judged.
+
+11. **Anti-entropy** (`docs/timing.md` §2.7, `docs/research/swim.md`). Each member reconciles its
+    whole view, push and pull, with the next partner of a shuffled cycle of the members it holds
+    alive, once a dissemination window (`sync_into`, `on_sync`; a new message, `SwimMessage::Sync`),
+    so two members that each hold the other dead, both refutations missed, are revived through a
+    third. It opens with the view's digest (`Membership::digest`), and only views that differ are
+    pushed, in chunks. slates had none: memberlist's push/pull is the nearest, every 30 s, whole
+    states each time.
+
+The wire changed in place with 8 and 11: a probe and an answer carry entries of the existing gossip
+encoding, which a receiver of the earlier form applies as any gossip, and `Sync` is a new tag with
+its own golden vector. No consumer runs hyper-swim yet (slates' session owns its integration), so
+there is no earlier form in service to keep.
+
 ## Tests
 
-- 59 unit tests: slates' membership, gossip, codec and coordinate tests, the extension series and
+- 68 unit tests: slates' membership, gossip, codec and coordinate tests, the extension series and
   its bounds, the gossip queue's order, replacement and bound, and the measured timing's: nothing
   judged before the estimates exist, the deadline is `μ + α`, a silent member is suspected, told and
   condemned, an isolated member condemns nobody, an indirect answer spares, a refutation clears a
@@ -109,8 +132,12 @@
   cluster runs found (`docs/benchmarks.md`, "The cluster test"): members holding one another dead
   heal, a lost measurement probe ends at its expected arrival, a refused reconfiguration leaves the
   verdict in force, a re-adopted suspicion keeps its told probes, the detection bound does not
-  shrink with the round, a member a refutation missed hears it from the refuted member, and an
-  answer tells a member it is held dead.
+  shrink with the round, a member a refutation missed hears it from the refuted member, an
+  answer tells a member it is held dead, a member that judges nothing states no bound, measurement
+  periods follow round trips that lengthen, and a mutual split heals through a third member; and
+  the view's digest follows the view and not the order of its changes, agreeing views exchange
+  only their digests, the exchanges' chunks, answers and cycle, and the view chunk's golden
+  encoding.
 - `tests/cluster.rs`: five real member processes run the detector over hyper-datagram on real
   UDP sockets, as the library configures it.
   - The supervisor starts them together, waits until every member judges every peer by a

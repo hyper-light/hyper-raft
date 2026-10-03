@@ -39,7 +39,7 @@ fn exercise_key_log_file_for_client() {
     serialized(|| {
         let provider = provider::default_provider();
         let server_config = Shared::new(make_server_config(KeyType::Rsa2048, &provider));
-        env::set_var("SSLKEYLOGFILE", "./sslkeylogfile.txt");
+        env::set_var("SSLKEYLOGFILE", key_log());
 
         for version in hyper_tls::ALL_VERSIONS {
             let mut client_config =
@@ -64,7 +64,7 @@ fn exercise_key_log_file_for_server() {
         let provider = provider::default_provider();
         let mut server_config = make_server_config(KeyType::Rsa2048, &provider);
 
-        env::set_var("SSLKEYLOGFILE", "./sslkeylogfile.txt");
+        env::set_var("SSLKEYLOGFILE", key_log());
         server_config.key_log = Box::new(hyper_tls::KeyLogFile::new());
 
         let server_config = Shared::new(server_config);

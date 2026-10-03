@@ -250,6 +250,9 @@ out at the crate root (`#![cfg_attr(test, allow(...))]`, and each integration te
 12. **Tests**: the in-crate `unsafe` in `alloc_per_handshake` is replaced by
     `hyper_measure::alloc::Counting` (a dev-dependency); `key_log_file_env` calls `env::set_var`
     without `unsafe` (edition 2021); the `read_buf` attributes of the removed feature are gone.
+    `key_log_file_env` writes its key log to a file in the test's own target directory, under its
+    process id, removed when the test lets it go: upstream's `./sslkeylogfile.txt` was left in the
+    crate's directory by every run.
 
 ### Behaviour changes: former panics and what they are now
 

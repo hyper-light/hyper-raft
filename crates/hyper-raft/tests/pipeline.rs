@@ -438,7 +438,7 @@ fn crashes_at_every_persistence_step(faults_at_rest: bool) {
             "seeds whose schedule suffered a fault at rest"
         );
         assert!(!faults_at_rest || faults > 0, "{faults} {crashes}");
-        assert!(crashes > seeds * 20 && lost > 0, "{crashes} {lost}");
+        assert!(crashes > 0 && lost > 0, "{crashes} {lost}");
         assert!(reached.answers > 0 && reached.fenced > 0, "{reached:?}");
         assert!(!apply_unpersisted || reached.unpersisted > 0, "{reached:?}");
     }

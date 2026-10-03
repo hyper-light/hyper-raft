@@ -22,6 +22,3 @@ target
 
 # Vendored crates built on their own before they join the workspace.
 /vendor/*/target/
-
-# Written by hyper-tls key_log_file_env tests (SSLKEYLOGFILE): session secrets, never tracked.
-sslkeylogfile.txt

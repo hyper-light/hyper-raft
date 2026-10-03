@@ -24,6 +24,7 @@
 )]
 
 use std::env;
+use std::path::PathBuf;
 use std::sync::Mutex;
 
 #[macro_use]
@@ -31,12 +32,28 @@ mod macros;
 
 #[path = "."]
 mod tests_with_aws_lc_rs {
-    use super::serialized;
+    use super::{key_log, serialized};
 
     provider_aws_lc_rs!();
 
     #[path = "../key_log_file_env.rs"]
     mod tests;
+}
+
+/// Where the tests' key log goes: a file in this test's own target directory, under its process
+/// id. Upstream wrote `./sslkeylogfile.txt` into the crate's directory and left it there.
+fn key_log() -> PathBuf {
+    PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("sslkeylogfile-{}.txt", std::process::id()))
+}
+
+/// The key log, removed when the test lets it go, whatever the test did with it.
+struct Scratch(PathBuf);
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
 }
 
 /// Approximates `#[serial]` from the `serial_test` crate.
@@ -50,9 +67,10 @@ fn serialized(f: impl FnOnce()) {
     static MUTEX: Mutex<()> = const { Mutex::new(()) };
 
     let _guard = MUTEX.lock().unwrap();
+    let _scratch = Scratch(key_log());
 
     // XXX: NOT thread safe.
-    env::set_var("SSLKEYLOGFILE", "./sslkeylogfile.txt");
+    env::set_var("SSLKEYLOGFILE", key_log());
 
     f()
 }

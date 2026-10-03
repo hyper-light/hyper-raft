@@ -816,6 +816,14 @@ impl LinkEstimator {
         }
     }
 
+    /// The freshness point of the heartbeat after the latest, `τ_{h+1} = EA_{h+1} + α`, once a margin
+    /// is in force, whatever the trust: where a margin given ([`configure`](Self::configure),
+    /// [`impose`](Self::impose)) found the latest heartbeat already past it, the point the sender
+    /// was suspected from, which no [`poll`](Self::poll) reports.
+    pub fn freshness(&self) -> Option<u64> {
+        self.fresh_until()
+    }
+
     /// What the detector believes of the sender now.
     pub fn trust(&self) -> Trust {
         self.trust

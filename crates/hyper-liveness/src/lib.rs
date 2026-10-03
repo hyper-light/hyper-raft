@@ -190,7 +190,8 @@ pub struct Last {
 pub enum Change {
     /// The peer's freshness passed: suspected.
     Suspected(Suspicion),
-    /// A fresh heartbeat came from a peer the owner was told is suspected.
+    /// A fresh heartbeat came from a peer the owner was told is suspected, and left it trusted or
+    /// judged by no margin: a peer no detector judges is one the owner trusts.
     Trusted {
         /// The peer.
         peer: PeerId,

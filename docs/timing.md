@@ -694,7 +694,16 @@ heartbeat due; those it skipped are losses to the receiver, which they are.
   the core's `restarted` (trusted, and leading nothing it led); the owner is then told a suspicion
   only if the heartbeat leaves the peer suspected. Changes are reported only where what the owner
   was told differs: the owner trusts a peer until told otherwise, so trust after a suspicion is told
-  and trust after nothing is not.
+  and trust after nothing is not. Both ways, at every heartbeat and every poll:
+  - a peer no margin judges is one the owner trusts, so a heartbeat that leaves a peer told
+    suspected judged by no margin (its first, from a peer suspected from the attach, when the
+    node's evidence went with a detach or gives no margin at its interval) tells it trusted;
+  - a margin imposed at a poll (the node's evidence's) that finds a young link's latest heartbeat
+    already past the next freshness point leaves the peer suspected with no freshness point passing
+    then, and the poll tells it, from that point (`LinkEstimator::freshness`). Untold, the detector
+    held the peer suspected while its owner trusted it, and a peer that died in its links' first
+    heartbeats was never reported (a pair's unit test; the simulation's worlds had not reached it).
+  The simulation holds every node's owner to it after every step (`told_is_believed`).
 - **The detection bound** each suspicion states: NFD-E suspects at `τ_{h+1} = EA_{h+1} + α`, which is
   `η + α + mean(D)` past the last heartbeat's schedule over the expected arrival's window, whatever
   the clocks' offset; the mean of the echoed sums over the same window bounds `mean(D)`, so

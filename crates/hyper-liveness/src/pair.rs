@@ -441,10 +441,22 @@ impl Pair {
             self.unheard.suspected = true;
             return self.tell_suspected(peer, until, now_ns);
         };
-        let until = link.estimator.deadline()?;
-        if link.estimator.poll(now_ns) != Some(Event::Suspected) {
-            return None;
-        }
+        let until = match link.estimator.deadline() {
+            Some(until) => {
+                if link.estimator.poll(now_ns) != Some(Event::Suspected) {
+                    return None;
+                }
+                until
+            }
+            // Suspected with no freshness point passing at a poll, and not told: a margin imposed
+            // at a poll (the node's evidence's, `pool_margin`) found the latest heartbeat already
+            // past the next freshness point. Told as any suspicion, from that point; untold, a
+            // peer that died young was suspected and never reported.
+            None if !self.told && link.estimator.trust() == Trust::Suspected => {
+                link.estimator.freshness()?
+            }
+            None => return None,
+        };
         // The freshness point of the heartbeat after the latest passed: one more point judged.
         if let Some(next) = self.received.last_mapped.map(|seq| seq.saturating_add(1)) {
             let beta = self.beta_now();
@@ -464,10 +476,13 @@ impl Pair {
     }
 
     /// What the owner is to be told after a heartbeat taken at `at_ns`: the trust it now has,
-    /// where it differs from what the owner was told.
+    /// where it differs from what the owner was told. A peer no margin judges
+    /// (`Trust::Unconfigured`: its first heartbeat came with no evidence of the node's to judge it
+    /// by, the evidence gone with a detach, or no margin found at its interval) is one the owner
+    /// trusts by default, so a suspicion told before is withdrawn as for a trusted one.
     fn settle(&mut self, peer: PeerId, at_ns: u64) -> Option<Change> {
         match self.trust() {
-            Trust::Trusted { .. } if self.told => {
+            Trust::Trusted { .. } | Trust::Unconfigured if self.told => {
                 self.told = false;
                 Some(Change::Trusted { peer, at_ns })
             }
@@ -817,5 +832,141 @@ impl Pair {
         let beta = self.beta_now().unwrap_or(1.0);
         self.received.renewed = Some((self.counts.taken, beta));
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hyper_timing::Exposure;
+
+    const MS: u64 = 1_000_000;
+
+    /// The node's evidence a test judges by: a link of a millisecond's deviation that loses
+    /// one heartbeat in a thousand.
+    fn evidence() -> LinkBehaviour {
+        LinkBehaviour {
+            loss: 0.001,
+            mean_delay: Duration::ZERO,
+            delay_deviation: Duration::from_millis(1),
+        }
+    }
+
+    /// A pair sharing a group whose elections cost a millisecond.
+    fn pair() -> Pair {
+        let mut pair = Pair::new();
+        pair.groups = 1;
+        pair.election = Some(Duration::from_millis(1));
+        pair
+    }
+
+    /// An hour of node time watched, so the MTBF is measured.
+    fn exposure() -> Exposure {
+        let mut exposure = Exposure::new();
+        exposure.on_exposure(Duration::from_secs(3_600));
+        exposure
+    }
+
+    /// Heartbeat `seq` of run `boot` at a 10 ms interval, sent on time with a fresh flush.
+    fn beat(boot: u64, seq: u64) -> Heartbeat {
+        Heartbeat {
+            boot,
+            seq,
+            interval_ns: 10 * MS,
+            floor_ns: MS,
+            ask_ns: 0,
+            sent_ns: seq * 10 * MS,
+            late_ns: 0,
+            flushes: seq + 1,
+            flush_age_ns: 0,
+            echo: None,
+        }
+    }
+
+    /// A peer suspected before any heartbeat came from it, whose first heartbeat leaves no margin
+    /// to judge it by (the node's evidence went, with the pairs whose configurations it was), is no
+    /// longer suspected: the owner, told it was, is told it is trusted, its default for a peer no
+    /// detector judges.
+    #[test]
+    fn a_suspicion_told_is_withdrawn_when_a_heartbeat_leaves_the_peer_unjudged() {
+        let mut pair = pair();
+        let exposure = exposure();
+        let granularity = Duration::from_micros(50);
+        pair.attached(0);
+        pair.judge_unheard(
+            &evidence(),
+            Duration::from_millis(10),
+            granularity,
+            exposure.mtbf(),
+        );
+        let until = pair.deadline().expect("judged from the attach");
+        assert!(matches!(pair.judge(2, until), Some(Change::Suspected(_))));
+        let context = Context {
+            granularity: Some(granularity),
+            exposure: &exposure,
+            evidence: None,
+        };
+        let (mut changes, mut taken) = ([None, None, None], Taken::default());
+        let arrival = until + MS;
+        pair.take(2, &beat(7, 0), arrival, &context, &mut changes, &mut taken)
+            .unwrap();
+        assert_eq!(pair.trust(), Trust::Unconfigured);
+        assert_eq!(
+            changes,
+            [
+                None,
+                None,
+                Some(Change::Trusted {
+                    peer: 2,
+                    at_ns: arrival
+                })
+            ]
+        );
+    }
+
+    /// A young link whose latest heartbeat came later than the freshness point of the one after it,
+    /// judged at a poll by the margin of the node's evidence once the node has some, is suspected,
+    /// and the owner is told so, from that freshness point. Untold, the detector held the peer
+    /// suspected while the owner trusted it: a peer that died young was never reported.
+    #[test]
+    fn a_young_link_suspected_by_a_margin_imposed_at_a_poll_is_told() {
+        let exposure = exposure();
+        let granularity = Duration::from_micros(50);
+        let context = Context {
+            granularity: Some(granularity),
+            exposure: &exposure,
+            evidence: None,
+        };
+        let mut pair = pair();
+        let mut latest = 0;
+        // Ten heartbeats on their schedule, and the eleventh 50 ms late at a 10 ms interval.
+        for seq in 0..=10 {
+            let arrival = seq * 10 * MS + if seq == 10 { 50 * MS } else { 0 };
+            let (mut changes, mut taken) = ([None, None, None], Taken::default());
+            pair.take(
+                2,
+                &beat(7, seq),
+                arrival,
+                &context,
+                &mut changes,
+                &mut taken,
+            )
+            .unwrap();
+            assert_eq!(changes, [None, None, None]);
+            latest = arrival;
+        }
+        assert_eq!(pair.trust(), Trust::Unconfigured);
+        // The node's evidence comes, and the next poll imposes its margin and judges.
+        pair.pool_margin(&evidence(), granularity, exposure.mtbf());
+        assert_eq!(pair.trust(), Trust::Suspected, "the margin finds it late");
+        let Some(Change::Suspected(suspicion)) = pair.judge(2, latest + MS) else {
+            panic!("the suspicion is told");
+        };
+        assert!(
+            suspicion.at_ns <= latest,
+            "from the point before the late heartbeat"
+        );
+        assert_eq!(suspicion.last.map(|last| last.seq), Some(10));
+        assert_eq!(pair.judge(2, latest + 2 * MS), None, "told once");
     }
 }

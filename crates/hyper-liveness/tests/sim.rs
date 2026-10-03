@@ -170,6 +170,9 @@ struct Node {
     suspicions: Vec<Suspicion>,
     /// The peers whose restart the node's stream reported.
     restarts: Vec<PeerId>,
+    /// What the owner believes of each peer from the changes it was told: suspected or not. The
+    /// owner trusts a peer until told otherwise, and a restarted one is trusted (`Change`).
+    believed: BTreeMap<PeerId, bool>,
 }
 
 struct Sim {
@@ -218,6 +221,7 @@ impl Sim {
                     durable: Vec::new(),
                     suspicions: Vec::new(),
                     restarts: Vec::new(),
+                    believed: BTreeMap::new(),
                 }
             })
             .collect();
@@ -315,10 +319,41 @@ impl Sim {
         }
         let changes = std::mem::take(&mut self.nodes[node].owner.changes);
         for change in changes {
+            let n = &mut self.nodes[node];
+            n.believed
+                .insert(change.peer(), matches!(change, Change::Suspected(_)));
             match change {
-                Change::Suspected(suspicion) => self.nodes[node].suspicions.push(suspicion),
-                Change::Restarted { peer, .. } => self.nodes[node].restarts.push(peer),
+                Change::Suspected(suspicion) => n.suspicions.push(suspicion),
+                Change::Restarted { peer, .. } => n.restarts.push(peer),
                 Change::Trusted { .. } => {}
+            }
+        }
+    }
+
+    /// The owner's contract (`docs/timing.md` §2.8): what each live node's owner was told of each
+    /// peer is what its stream believes, after every step. A peer no margin judges is one the owner
+    /// trusts.
+    fn told_is_believed(&self) {
+        let count = self.nodes.len() as u64;
+        for node in self.nodes.iter().filter(|n| n.alive) {
+            for peer in (1..=count).filter(|p| *p != node.owner.id) {
+                let Some(trust) = node.liveness.trust(peer) else {
+                    continue;
+                };
+                let told = node.believed.get(&peer).copied().unwrap_or(false);
+                assert_eq!(
+                    trust == Trust::Suspected,
+                    told,
+                    "node {} at {} ns: its stream holds peer {peer} {trust:?}, its owner was told \
+                     {}",
+                    node.owner.id,
+                    self.now,
+                    if told {
+                        "suspected"
+                    } else {
+                        "nothing against it"
+                    }
+                );
             }
         }
     }
@@ -414,6 +449,7 @@ impl Sim {
             }
             self.elect();
             self.note_configured();
+            self.told_is_believed();
         }
     }
 
@@ -776,6 +812,7 @@ fn a_restarted_peer_is_trusted_again_and_counted() {
     liveness.attach(1).unwrap();
     liveness.attach(2).unwrap();
     sim.nodes[victim].liveness = liveness;
+    sim.nodes[victim].believed.clear();
     sim.nodes[victim].alive = true;
     sim.nodes[victim].disk_busy_until = sim.now;
     sim.poll(victim);

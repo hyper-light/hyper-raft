@@ -12,21 +12,49 @@
 use std::{
     fs::OpenOptions,
     io::{Read, Seek, SeekFrom, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
 
 use hyper_raft::proto::{Entry, HardState};
 use hyper_raft_e2e::wal::{Wal, WalError};
 
+/// A file the test makes in its own target directory, under its process id, removed when the
+/// test lets it go: whatever the test does with it, it leaves nothing behind (a run left one of
+/// each file a run, on a disk with little room).
+struct Scratch(PathBuf);
+
+impl std::ops::Deref for Scratch {
+    type Target = Path;
+    fn deref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl AsRef<Path> for Scratch {
+    fn as_ref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for Scratch {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "a test removes the file it made in its own target directory"
+    )]
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
 #[expect(
     clippy::disallowed_methods,
     reason = "a test removes the files it made in its own target directory"
 )]
-fn fresh(name: &str) -> PathBuf {
+fn fresh(name: &str) -> Scratch {
     let path = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
         .join(format!("wal-{}-{name}", std::process::id()));
     let _ = std::fs::remove_file(&path);
-    path
+    Scratch(path)
 }
 
 fn entry(index: u64, term: u64) -> Entry {

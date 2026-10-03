@@ -251,8 +251,6 @@ struct Peer {
     last_mistake: Option<f64>,
     last_answer_ns: Option<u64>,
     report: PeerReport,
-    /// The count of the death record the view holds of it, while it is held dead.
-    death: Option<u64>,
 }
 
 impl Peer {
@@ -267,7 +265,6 @@ impl Peer {
             last_mistake: None,
             last_answer_ns: None,
             report: PeerReport::default(),
-            death: None,
         }
     }
 
@@ -323,13 +320,25 @@ impl Probe {
     }
 }
 
-/// A death the view adopted: the member, the record's count, and when the first poll after it saw
-/// it, on the caller's clock.
+/// A death the view adopted: the member, the incarnation it died at, which names the death (a
+/// member leaves `Dead` only at a higher incarnation, so dies again only at one), and when the first
+/// poll after it saw it, on the caller's clock.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Death {
     member: HostId,
-    count: u64,
+    incarnation: u64,
     at_ns: Option<u64>,
+}
+
+impl Death {
+    /// Whether the view still holds the member dead at this death's incarnation.
+    fn held(&self, membership: &Membership) -> bool {
+        membership.state(self.member)
+            == Some(MemberState {
+                liveness: Liveness::Dead,
+                incarnation: self.incarnation,
+            })
+    }
 }
 
 /// The member's periods: count, total and longest, nanoseconds.
@@ -442,8 +451,6 @@ pub struct Detector {
     /// The deaths the view adopted, oldest first: the order their records are forgotten in. A
     /// record the member has since left (a refutation, a newer death) is skipped when reached.
     deaths: VecDeque<Death>,
-    /// Deaths adopted so far: the next record's count.
-    died: u64,
     /// The latest time the caller gave, nanoseconds.
     clock_ns: u64,
     /// The most members the view has held at once besides this one: no round has been larger.
@@ -539,7 +546,6 @@ impl Detector {
             aging: Vec::new(),
             relays: Vec::new(),
             deaths: VecDeque::new(),
-            died: 0,
             clock_ns: 0,
             most_watched: 0,
             most_transmits: 1,
@@ -897,8 +903,7 @@ impl Detector {
     fn expired(&mut self, now_ns: u64) -> Option<HostId> {
         let window = self.record_window_ns(now_ns)?;
         while let Some(&death) = self.deaths.front() {
-            let held = self.peers.get(&death.member).and_then(|peer| peer.death);
-            if held != Some(death.count) {
+            if !death.held(&self.membership) {
                 self.deaths.pop_front();
                 continue;
             }
@@ -1152,7 +1157,7 @@ impl Detector {
         match change {
             Some(Change::Adopted { member, state }) => {
                 self.gossip.record(member, state);
-                self.adopted(member, state.liveness);
+                self.adopted(member, state);
             }
             Some(Change::Refuted { incarnation }) => {
                 let state = MemberState {
@@ -1166,19 +1171,15 @@ impl Detector {
         Ok(change)
     }
 
-    fn adopted(&mut self, member: HostId, liveness: Liveness) {
+    fn adopted(&mut self, member: HostId, state: MemberState) {
         let peer = self.peers.entry(member).or_insert_with(Peer::new);
-        match liveness {
-            Liveness::Alive => {
-                peer.clear_suspicion();
-                peer.death = None;
-            }
+        match state.liveness {
+            Liveness::Alive => peer.clear_suspicion(),
             // A suspicion already held, adopted again at a newer incarnation, keeps the probes
             // that told the peer: they carried a suspicion and went unanswered all the same.
             Liveness::Suspect if peer.suspected_from.is_none() => {
                 peer.suspected_from = Some(peer.sent);
                 peer.clear_pending();
-                peer.death = None;
             }
             Liveness::Suspect => {}
             Liveness::Dead => {
@@ -1186,31 +1187,26 @@ impl Detector {
                 peer.suspected_from = None;
                 peer.told_missed = 0;
                 peer.pending_since = None;
-                let count = self.died;
-                peer.death = Some(count);
-                self.died = count.saturating_add(1);
                 self.exposure.on_failure();
                 self.extensions.remove(&member);
                 self.peer_coordinates.remove(&member);
-                self.record_death(member, count);
+                self.record_death(Death {
+                    member,
+                    incarnation: state.incarnation,
+                    at_ns: None,
+                });
             }
         }
     }
 
-    /// Queues the death record `count` of `member`. Records the member has since left are purged
-    /// once the queue holds twice the view's bound, so it holds at most that, plus one.
-    fn record_death(&mut self, member: HostId, count: u64) {
+    /// Queues a death's record. Records the member has since left are purged once the queue holds
+    /// twice the view's bound, so it holds at most that, plus one.
+    fn record_death(&mut self, death: Death) {
         if self.deaths.len() >= self.membership.capacity().saturating_mul(2) {
-            let peers = &self.peers;
-            self.deaths.retain(|death| {
-                peers.get(&death.member).and_then(|peer| peer.death) == Some(death.count)
-            });
+            let membership = &self.membership;
+            self.deaths.retain(|held| held.held(membership));
         }
-        self.deaths.push_back(Death {
-            member,
-            count,
-            at_ns: None,
-        });
+        self.deaths.push_back(death);
     }
 
     /// The batch of membership updates to piggyback on an outgoing message: up to `max`, the

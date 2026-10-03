@@ -1157,10 +1157,11 @@ hyper-raft-e2e's had, each failing on CI once in a way a re-run passed:
   ("nothing moved for 1s", every member with a flush in flight, its longest 459–468 ms), and with
   1.2 s more in 2 of 2 ("nothing moved for 2.4 s", once waiting on a first flush); under the new it
   passed 3 of 3 and 2 of 2, in 43–78 s and 75–197 s, the victim noticed dead 28–193 s after the kill
-  at that pace of flushes. A new test stops a member once every pair is configured (`SIGSTOP`; on
-  Windows it holds its thread until a byte comes on its standard input): the wait for a line only it
-  can state fails naming it, and let go, its first line awaited while its process runs (what it
-  stated before it stopped is no word of it since), it is trusted again.
+  at that pace of flushes. A new test stops a member once every pair is configured (`SIGSTOP`, the
+  stop taken from the system's word that the process stopped, `ps`'s state `T`; on Windows it holds
+  its thread until a byte comes on its standard input, and says when it holds): the wait for a line
+  only it can state fails naming it, and let go, its first line awaited while its process runs (what
+  it stated before it stopped is no word of it since), it is trusted again.
 
 **What the runs measured of the detectors** (every scenario prints, for each member, its floors,
 longest flush and longest time between two reads of its socket, and for each pair what the

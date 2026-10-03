@@ -366,8 +366,14 @@ async fn member(me: u64, nodes: u64, file: std::path::PathBuf) {
             continue;
         }
         if said == Some(HOLD) {
-            // Held, answering nothing, until the supervisor writes a byte on standard input (or
-            // closes it, gone).
+            // Says it is held, then holds, answering nothing, until the supervisor writes a byte
+            // on standard input (or closes it, gone): no line it states can be stamped later.
+            if writeln!(stdout, "held {me} {}", clock.now_ns())
+                .and_then(|()| stdout.flush())
+                .is_err()
+            {
+                return;
+            }
             let _ = std::io::Read::read(&mut std::io::stdin(), &mut [0u8; 1]);
             continue;
         }
@@ -667,6 +673,8 @@ enum Line {
     State(u64, Stated),
     Suspect(u64, u64, Suspected),
     Heard(u64),
+    /// A member held, and when it said so on the host clock.
+    Held(u64, u64),
 }
 
 fn parse(line: &str) -> Option<Line> {
@@ -739,6 +747,10 @@ fn parse(line: &str) -> Option<Line> {
             ))
         }
         "heard" => Some(Line::Heard(fields.next()?.parse().ok()?)),
+        "held" => Some(Line::Held(
+            fields.next()?.parse().ok()?,
+            fields.next()?.parse().ok()?,
+        )),
         _ => None,
     }
 }
@@ -838,6 +850,8 @@ struct Supervisor {
     /// What the checks have seen, and why the latest wait that gave up did.
     checks: Checks,
     stuck: Option<Stuck>,
+    /// The member that last said it is held, and when.
+    held: Option<(u64, u64)>,
 }
 
 impl Supervisor {
@@ -887,6 +901,10 @@ impl Supervisor {
             }
             Some(Line::Heard(member)) => {
                 self.heard.push(member);
+                member
+            }
+            Some(Line::Held(member, at)) => {
+                self.held = Some((member, at));
                 member
             }
             None => 0,
@@ -1425,6 +1443,7 @@ fn start(nodes: u64) -> Group {
             configured_since: BTreeMap::new(),
             checks: Checks::default(),
             stuck: None,
+            held: None,
         },
         wakes,
     }
@@ -1635,24 +1654,66 @@ const STOPPED_NODES: u64 = 3;
 
 impl Supervisor {
     /// Stops member `id` without ending it: it stays up and states nothing, as a member deadlocked
-    /// does. `SIGSTOP` on Unix.
+    /// does. `SIGSTOP` on Unix, then the system's word that the process stopped (`ps`'s state
+    /// `T`), the signal taking effect when the process next enters its kernel; when, on the host
+    /// clock, the stop was a fact: no line of the member's is stamped later.
     #[cfg(unix)]
-    fn stop_member(&mut self, id: u64, _wake: u16) {
+    fn stop_member(&mut self, id: u64, _wake: u16, what: &str) -> u64 {
         self.signal(id, "-STOP");
+        let pid = self.members.0[&id].id().to_string();
+        loop {
+            let state = Command::new("ps")
+                .args(["-o", "stat=", "-p", &pid])
+                .output()
+                .unwrap();
+            if String::from_utf8_lossy(&state.stdout)
+                .trim_start()
+                .starts_with('T')
+            {
+                return self.clock.now_ns();
+            }
+            // Not stopped yet: a line meanwhile, or a retransmission timeout, and the system is
+            // asked again, while the process runs.
+            if self.next(RTO, what).is_none() {
+                let ended = self
+                    .members
+                    .0
+                    .get_mut(&id)
+                    .and_then(|child| child.try_wait().unwrap());
+                assert!(ended.is_none(), "{what}: member {id} ended");
+            }
+        }
     }
 
     /// Windows has no signal that stops a process: the member is told on its wake socket to hold
-    /// its thread until a byte comes on its standard input.
+    /// its thread until a byte comes on its standard input, and says when it holds; when it said
+    /// so: no line of the member's is stamped later.
     #[cfg(windows)]
     #[allow(
         clippy::disallowed_methods,
         reason = "real processes on the host's clock, threads and environment (CLAUDE.md §1a, end to end)"
     )]
-    fn stop_member(&mut self, _id: u64, wake: u16) {
+    fn stop_member(&mut self, id: u64, wake: u16, what: &str) -> u64 {
+        self.held = None;
         UdpSocket::bind("127.0.0.1:0")
             .unwrap()
             .send_to(HOLD, ("127.0.0.1", wake))
             .unwrap();
+        loop {
+            if let Some((member, at)) = self.held
+                && member == id
+            {
+                return at;
+            }
+            if self.next(RTO, what).is_none() {
+                let ended = self
+                    .members
+                    .0
+                    .get_mut(&id)
+                    .and_then(|child| child.try_wait().unwrap());
+                assert!(ended.is_none(), "{what}: member {id} ended");
+            }
+        }
     }
 
     /// Lets member `id` go on after [`Supervisor::stop_member`], and waits, while its process runs,
@@ -1725,8 +1786,7 @@ fn a_stopped_member_fails_the_wait_that_needs_it_by_name() {
             })
     });
     let stopped = STOPPED_NODES;
-    supervisor.stop_member(stopped, wakes[&stopped] as u16);
-    let stopped_at = clock.now_ns();
+    let stopped_at = supervisor.stop_member(stopped, wakes[&stopped] as u16, "the member stops");
     let outcome = supervisor.until("the stopped member states again", |s| {
         s.latest
             .get(&stopped)

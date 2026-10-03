@@ -385,6 +385,13 @@ pub struct LinkEstimator {
     /// The granularity the ring was sized by when the estimator was built: a retime sizes it by
     /// the same, so a move to a longer interval never grows it.
     ring_granularity_ns: u64,
+    /// `n_A` as last found: the offsets taken then, the levels the drift bound let in (a level of
+    /// `2^j` heartbeats while `2^j` is within it), and the window. The levels move only with an
+    /// offset taken, so a placement for a move of `G` alone, which comes with nearly every
+    /// heartbeat and every feed of a node's pool, reads it instead of walking the levels again: the
+    /// walk was the most of a placement, and a placement a quarter of a node's time at bootstrap
+    /// (`docs/benchmarks.md`, "The node's evidence, kept").
+    allan_found: Option<(u64, u32, Option<u64>)>,
 }
 
 /// `duration` in nanoseconds, saturating at `u64::MAX` (584 years).
@@ -476,6 +483,7 @@ impl LinkEstimator {
             latest_error: None,
             next_interval_ns: 0,
             ring_granularity_ns: granularity_ns,
+            allan_found: None,
         })
     }
 
@@ -508,6 +516,7 @@ impl LinkEstimator {
         self.anchor = schedule;
         self.taken = 0;
         self.allan = Allan::new();
+        self.allan_found = None;
         self.window = Window {
             length: 0,
             granularity: None,
@@ -707,7 +716,15 @@ impl LinkEstimator {
         let capacity = u64::try_from(self.sums.len().saturating_sub(1)).unwrap_or(1);
         let drift = drift_bound(self.granularity_ns, self.interval_ns).min(capacity);
         let variance = self.errors.variance();
-        let allan = self.allan.window(drift);
+        let admitted = u64::BITS.saturating_sub(drift.leading_zeros());
+        let allan = match self.allan_found {
+            Some((taken, levels, found)) if taken == self.taken && levels == admitted => found,
+            _ => {
+                let found = self.allan.window(drift);
+                self.allan_found = Some((self.taken, admitted, found));
+                found
+            }
+        };
         let granularity = self.correlation.zip(variance).map(|(tau, v)| {
             let g = self.granularity_ns as f64;
             whole_up_to(tau * v / (g * g), drift).max(1)
@@ -1097,6 +1114,34 @@ mod tests {
                 full.update_window();
                 prop_assert_eq!(link.window, full.window);
                 prop_assert_eq!(link.correlation, full.correlation);
+            }
+        }
+
+        /// The `n_A` a placement reads is the levels' own at the drift bound in force, whatever
+        /// came between: heartbeats, moves of `G` and moves of the interval.
+        #[test]
+        fn the_window_found_is_the_levels_own(
+            steps in prop::collection::vec((0u8..6, 0u64..3 * MS, 1u64..5 * MS), 1..400),
+        ) {
+            let mut interval = 10 * MS;
+            let mut link =
+                LinkEstimator::new(Duration::from_nanos(interval), Duration::from_micros(50), None)
+                    .unwrap();
+            let (mut seq, mut at) = (0u64, 0u64);
+            for (kind, delay, g) in steps {
+                match kind {
+                    0 => link.set_granularity(Duration::from_nanos(g)),
+                    1 => {
+                        interval = (interval + g).min(200 * MS);
+                        link.retime(Duration::from_nanos(interval), None).unwrap();
+                    }
+                    _ => {
+                        seq += 1;
+                        at += interval;
+                        link.on_heartbeat(seq, at + delay).unwrap();
+                    }
+                }
+                prop_assert_eq!(link.window.allan, link.allan.window(link.window.drift));
             }
         }
     }

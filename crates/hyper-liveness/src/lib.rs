@@ -309,6 +309,12 @@ pub struct Liveness {
     /// the largest over the pairs that have a configuration: kept at each configuration made and
     /// at each pair let go, so it is read without walking the pairs.
     configured: Option<LinkBehaviour>,
+    /// What the node has measured of its links, the wider of `pool_measured` and `configured`
+    /// ([`renew_evidence`](Self::renew_evidence)): kept where either changes, so a heartbeat and a
+    /// poll read it, and only for a pair with no configuration of its own. Computed at every
+    /// heartbeat, it was three maxima a heartbeat that every configured pair threw away
+    /// (`docs/benchmarks.md`, "The node's evidence, kept").
+    evidence: Option<LinkBehaviour>,
 }
 
 /// The margins a pair that waits for one takes from its node's pool: its own link's, or, for a
@@ -369,21 +375,22 @@ impl Liveness {
             pool_seq: 0,
             pool_measured: None,
             configured: None,
+            evidence: None,
         })
     }
 
     /// What the node has measured of its links, which judges a link with no configuration of its
-    /// own (`docs/timing.md` §2.8, "Judged before its own evidence"): the wider of its pool's
-    /// measure and the widest configured link's (`pair::wider`). A configured link measured its own
-    /// behaviour at one interval with its `τ_int` within Madras and Sokal's window, the evidence its
-    /// estimator refuses to configure without; the pool, fed by the same links' errors, mixes
-    /// intervals and links, and once the links configure it is fed at the intervals they asked,
-    /// seconds apart on a coarse timer. Under the pool's premise, that the stalls are the hosts'
-    /// (§2.6), the widest configured link bounds what the pool would measure of them: the pool's
-    /// loss and the variance of its zero-mean errors are weighted means of the links', no more than
-    /// the largest of each.
-    fn evidence(&self) -> Option<LinkBehaviour> {
-        pair::wider(self.pool_measured, self.configured)
+    /// own (`docs/timing.md` §2.8, "Judged before its own evidence"), renewed after either of its
+    /// parts moved: the wider of its pool's measure and the widest configured link's
+    /// (`pair::wider`). A configured link measured its own behaviour at one interval with its
+    /// `τ_int` within Madras and Sokal's window, the evidence its estimator refuses to configure
+    /// without; the pool, fed by the same links' errors, mixes intervals and links, and once the
+    /// links configure it is fed at the intervals they asked, seconds apart on a coarse timer. Under
+    /// the pool's premise, that the stalls are the hosts' (§2.6), the widest configured link bounds
+    /// what the pool would measure of them: the pool's loss and the variance of its zero-mean errors
+    /// are weighted means of the links', no more than the largest of each.
+    fn renew_evidence(&mut self) {
+        self.evidence = pair::wider(self.pool_measured, self.configured);
     }
 
     /// The widest behaviour the pairs' configurations were made from.
@@ -413,6 +420,7 @@ impl Liveness {
         let _ = pool.on_offset(self.pool_seq, error);
         if let Ok(measured) = pool.behaviour() {
             self.pool_measured = Some(measured);
+            self.renew_evidence();
         }
     }
 
@@ -441,6 +449,7 @@ impl Liveness {
             self.pairs.remove(&peer);
             // Its configuration may have been the widest.
             self.configured = self.widest_configured();
+            self.renew_evidence();
             // Its wake may have been the earliest.
             self.next_wake = self.wake_after(self.last_poll_ns.unwrap_or(0));
         }
@@ -490,12 +499,12 @@ impl Liveness {
             return Err(Refusal::FromSelf);
         }
         let beat = Heartbeat::decode(message)?;
-        let (granularity, pool) = (self.wakes.granularity(), self.evidence());
+        let granularity = self.wakes.granularity();
         let pair = self.pairs.get_mut(&from).ok_or(Refusal::UnknownPeer)?;
         let context = pair::Context {
             granularity,
             exposure: &self.exposure,
-            pool: if pair.configured() { None } else { pool },
+            evidence: self.evidence.as_ref(),
         };
         let mut changes = [None, None, None];
         let mut taken = pair::Taken::default();
@@ -515,6 +524,7 @@ impl Liveness {
         }
         if taken.configured {
             self.configured = self.widest_configured();
+            self.renew_evidence();
         }
         if let Some((due, error)) = taken.error
             && (!taken.own || self.pool_measured.is_none())
@@ -540,17 +550,24 @@ impl Liveness {
             durable_count: self.durable.count,
             durable_ns: self.durable.latest_ns,
         };
-        let pool = self.evidence();
-        // The MTBF only for a pair that waits for a margin from the node's evidence, which a configured node
-        // has none of: read at every poll, it was a float division and a conversion a poll.
+        // The MTBF only for a pair that waits for a margin from the node's evidence, which a
+        // configured node has none of: read at every poll, it was a float division and a
+        // conversion a poll.
         let mut mtbf = None;
         // The wake to ask, gathered in the same walk: each pair is final once it has been judged
         // and has sent, and a second walk of the map was a tenth of a poll.
         let mut wake: Option<u64> = None;
         for (&peer, pair) in &mut self.pairs {
             pair.attached(now_ns);
-            if let (Some(pool), Some(granularity)) = (&pool, granularity) {
-                pool_margins(pair, pool, granularity, floor, &mut mtbf, &self.exposure);
+            if let (Some(evidence), Some(granularity)) = (&self.evidence, granularity) {
+                pool_margins(
+                    pair,
+                    evidence,
+                    granularity,
+                    floor,
+                    &mut mtbf,
+                    &self.exposure,
+                );
             }
             if let Some(change) = pair.judge(peer, now_ns) {
                 out.change(change);

@@ -4087,6 +4087,99 @@ HYPER_DURABLE_LIVENESS_SEEDS=1000 cargo test --release -p hyper-durable --test l
 cargo test -p hyper-durable-e2e --test kill -- stall
 ```
 
+## The node's evidence, kept (2026-10-02)
+
+The section above measured a heartbeat at 109–118 ns against 104–112 (two nodes), 126–148 against
+123–131 (four), 170–173 against 166–172 (eight) and 171–188 against 162–174 (eight, a thousand
+groups), three rounds each. Its causes, each removed:
+- `Liveness::on_heartbeat` and `poll` computed the node's evidence, `pair::wider` of the pool's
+  measure and the widest configured link's (three maxima), at every heartbeat and poll, and a
+  configured pair threw it away. It is now a field, renewed where either part moves (a pool error
+  fed, a configuration made, a pair let go) and read by reference, only for a pair with no
+  configuration of its own.
+- A pair kept a whole `PairReport` for its six counters; `7a8812c` added an interval to it, and a
+  pair grew from 632 to 648 bytes, which a poll's walk of the pairs moves through. It keeps the
+  counters and builds the report when asked: 608 bytes.
+
+And two found on the way, in the bootstrap's profile (`sample` of a loop of the eight-node
+bootstrap, 600 times, `bootloop.rs` below):
+- A move of `G`, which comes with nearly every heartbeat and every feed of the node's pool, placed
+  the estimator's window by walking the Allan levels again (`LinkEstimator::set_granularity`), and the
+  heartbeat that followed placed it again: the placements were 292 of the 2,226 samples, the most
+  of any of the crate's functions but the poll's own walk. The levels move only with an offset taken, and `G` reaches `n_A` only through the power
+  of two of the drift bound, so a placement now reads the `n_A` last found while neither moved
+  (`hyper-timing`, a property test holds it to the walk after every heartbeat, move of `G` and move
+  of the interval).
+- A heartbeat on a pair with no configuration of its own read the MTBF (a float division) for the
+  margin of the node's evidence, which is renewed on the doubling schedule only: it is read only
+  at a renewal.
+
+**The method**, as "The cost of a heartbeat, settled" above: `benches/allocs.rs` and
+`benches/cost.rs` built at `4769074`, `7a8812c` and this change, and the scratch probe (one cell of
+the allocs world in a fresh process, the PMU's instructions and cycles from
+`proc_pid_rusage(RUSAGE_INFO_V4)` around the window and around the bootstrap), each round running
+every variant once a bench and cell, the order rotated by one each round and reversed every other;
+the one-minute load average read before each process. Stated: per round the ratio of a variant to a
+reference (adjacent runs), the geometric mean with its Student-t 95 % interval on the logarithms.
+Apple M5 Max, macOS 26.4.1, rustc 1.98.0, release with LTO; 60 rounds at load 30–48 (median 40.5).
+
+A heartbeat sent or taken, the adaptive world (the bench's own; every variant sends the same
+heartbeats, 216, 612 and 3,139), medians and ratios to `4769074` and to `7a8812c`:
+
+| cell | ns (allocs), 4769 / 7a88 / now | now / 4769 | now / 7a88 | instructions, 4769 / 7a88 / now | now / 4769 | cycles, now / 4769 |
+|---|---|---|---|---|---|---|
+| 2 nodes | 105.0 / 109.0 / 101.5 | 0.970 [0.955, 0.985] | 0.935 [0.921, 0.949] | 2,453 / 2,518 / 2,397 | 0.977 | 0.977 [0.963, 0.992] |
+| 4 nodes | 122.0 / 126.0 / 119.0 | 0.982 [0.971, 0.993] | 0.946 [0.934, 0.958] | 2,585 / 2,624 / 2,516 | 0.973 | 0.980 [0.960, 1.000] |
+| 8 nodes | 161.0 / 170.0 / 164.0 | 1.008 [0.991, 1.026] | 0.950 [0.925, 0.976] | 3,245 / 3,252 / 3,159 | 0.974 | 1.003 [0.974, 1.032] |
+| 8 nodes, 1,000 groups | 166.0 / 170.0 / 169.0 | 1.011 [0.979, 1.043] | 0.996 [0.976, 1.016] | 3,244 / 3,252 / 3,159 | 0.973 | 0.993 [0.964, 1.022] |
+
+Instructions are the window's, the world's own work included (the same code in every variant), and
+their intervals are within ±0.001. Against `7a8812c` the instructions are 0.951, 0.959, 0.971 and
+0.971, the cycles 0.954, 0.968, 0.940 and 0.969. In the fixed world (every receiver asking 50 ms,
+so every variant sends the same heartbeats at the same intervals; 30 rounds at load 57–61) the
+instructions are 0.948, 0.943, 0.943 and 0.944 of `4769074`'s and the time 0.965 [0.939, 0.993],
+0.995 [0.935, 1.058], 0.935 [0.897, 0.974] and 1.005 [0.965, 1.046]. Allocations, reallocations
+and faults a heartbeat: zero in every run of every variant.
+
+`cost`, pair µs a node a second: at two peers 9.7, 9.5 and 9.5 against `4769074`'s 9.8, 9.6 and 9.7
+(0.982–0.988); at eight peers 59.8, 59.2 and 59.5 against 57.2, 56.6 and 56.6 (1.037 [1.026, 1.049]
+to 1.045 [1.033, 1.057]). The eight-peer rows run after the per-group and SWIM baselines in the same
+process. The same `per_pair` alone in a fresh process (`costpair.rs` below, 40 rounds at load
+43–45) is 1.000 [0.972, 1.029], 0.967 [0.928, 1.008] and 0.983 [0.946, 1.021] of `4769074` at eight
+peers, and the probe at the cost bench's seed and its nine-node cells (30 rounds, load 38) 1.011
+[0.972, 1.052], 1.004 [0.977, 1.032] and 0.997 [0.963, 1.032] in time at 0.974 of its
+instructions: the rise in `cost` follows what the process ran before, not the stream's work.
+
+**The bootstrap against L-3** (`634d45c`), which "The cost of a heartbeat, settled" left above it
+in some cells. The allocs bench times the crate's calls, and at L-3 an owner's `wake()` walked every
+pair at every call, outside them (in the bootstrap's profile, 1,428 of L-3's 3,350 samples); since
+`4769074` the poll gathers the wake in its own walk, inside them. Timed as the bench times it, the
+bootstrap a heartbeat is now 1.04–1.12 of L-3's in the fixed world and 0.88–0.99 in the adaptive
+one. With the owners' asks for the wake timed too (a scratch world, `world-timed.rs` below; 20
+rounds at load 65–66), what an owner pays a heartbeat of the bootstrap is now 0.909 [0.846, 0.977],
+0.763 [0.745, 0.782] and 0.607 [0.592, 0.622] of L-3's at two, four and eight nodes in the fixed
+world, and 0.802 [0.776, 0.829], 0.694 [0.678, 0.710] and 0.595 [0.569, 0.623] in the adaptive one,
+at 0.56–0.86 of its instructions. Against `4769074` the bootstrap's instructions are 0.956–0.972
+and its time 0.964–0.981. At eight nodes the adaptive bootstrap is four times as long as L-3's
+(0.8 s simulated, 21,129 heartbeats, against 0.2 s and 16,863): the moves to the interval the
+evidence needs (`docs/timing.md` §2.8), and while a link is young its errors also feed the node's
+pool, an estimator update a heartbeat L-3 did not make, which the design needs (§3, item 10).
+
+`hyper-timing`'s own estimator bench, whose heartbeats move no `G`, pays the placement's check and
+gains nothing from it: 0.15 % more instructions over the whole process, cycles within its
+run-to-run spread (three alternating runs each, `/usr/bin/time -l`).
+
+```sh
+cargo bench -p hyper-liveness --bench allocs     # and the same at 4769074 and 7a8812c, alternately
+cargo bench -p hyper-liveness --bench cost
+cargo test --release -p hyper-liveness -p hyper-timing
+# Scratch, not committed: the probe (one cell a process, its PMU counts from
+# proc_pid_rusage(getpid(), RUSAGE_INFO_V4) around the window and the bootstrap; args nodes groups
+# seconds [seed]), costpair.rs (cost's per_pair alone), bootloop.rs (the bootstrap in a loop, for
+# `sample <pid> 4`), world-timed.rs (the bench's world with the owners' wake asks timed), and the
+# fixed world (every receiver asking 50 ms in Pair::send).
+```
+
 ## Simulation harnesses as they are (2026-10-02)
 
 The baseline `hyper-sim` and `hyper-check` are measured against when the harnesses move onto them

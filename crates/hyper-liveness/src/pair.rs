@@ -31,9 +31,9 @@ pub(crate) struct Context<'a> {
     /// The node's failure evidence, whose MTBF is read only where a configuration needs it: a
     /// float division and a conversion, at every heartbeat it was read for none.
     pub(crate) exposure: &'a Exposure,
-    /// What the node measured of its links (`Liveness::evidence`), while this pair has no
-    /// configuration of its own (`docs/timing.md` §3, item 10).
-    pub(crate) pool: Option<LinkBehaviour>,
+    /// What the node measured of its links (`Liveness::renew_evidence`), read only while this pair
+    /// has no configuration of its own (`docs/timing.md` §3, item 10).
+    pub(crate) evidence: Option<&'a LinkBehaviour>,
 }
 
 /// What a heartbeat taken did, for the node.
@@ -165,6 +165,20 @@ struct Received {
     pooled: Option<(LinkBehaviour, u64)>,
 }
 
+/// What a pair counts: the counters of its [`PairReport`], the rest of which is read from the
+/// pair when a report is made. Kept whole, the report carried two intervals and three flags a
+/// poll's walk of the pairs moved through and nothing read (`docs/benchmarks.md`, "The node's
+/// evidence, kept").
+#[derive(Clone, Copy, Debug, Default)]
+struct Counts {
+    sent: u64,
+    taken: u64,
+    unproven: u64,
+    configurations: u64,
+    suspicions: u64,
+    allowance: f64,
+}
+
 /// One pair.
 #[derive(Debug)]
 pub(crate) struct Pair {
@@ -176,7 +190,7 @@ pub(crate) struct Pair {
     /// Whether the owner was last told the peer is suspected: a change is reported only where
     /// what the owner was told differs, and the owner trusts a peer until told otherwise.
     told: bool,
-    report: PairReport,
+    counts: Counts,
 }
 
 impl Pair {
@@ -188,7 +202,7 @@ impl Pair {
             received: Received::default(),
             unheard: Unheard::default(),
             told: false,
-            report: PairReport::default(),
+            counts: Counts::default(),
         }
     }
 
@@ -201,11 +215,6 @@ impl Pair {
                 None => Trust::Unconfigured,
             },
         }
-    }
-
-    /// Whether the pair judges by a configuration of its own.
-    pub(crate) fn configured(&self) -> bool {
-        self.received.configuration.is_some()
     }
 
     /// The node polled with the pair attached at `now_ns`: a peer from which nothing has come is
@@ -269,8 +278,12 @@ impl Pair {
     }
 
     pub(crate) fn report(&self) -> PairReport {
+        let counts = self.counts;
         PairReport {
             groups: self.groups,
+            sent: counts.sent,
+            taken: counts.taken,
+            unproven: counts.unproven,
             configured: self.received.configuration.is_some(),
             judged: !matches!(self.trust(), Trust::Unconfigured),
             interval: self
@@ -285,7 +298,9 @@ impl Pair {
                         .saturating_add(link.estimator.margin()?),
                 )
             }),
-            ..self.report
+            configurations: counts.configurations,
+            suspicions: counts.suspicions,
+            allowance: counts.allowance,
         }
     }
 
@@ -411,7 +426,7 @@ impl Pair {
         self.stream.proof = sender.durable_count;
         self.stream.interval_ns = interval;
         self.stream.next = Some((seq.saturating_add(1), due.saturating_add(interval)));
-        self.report.sent = self.report.sent.saturating_add(1);
+        self.counts.sent = self.counts.sent.saturating_add(1);
         Sent::Message(length)
     }
 
@@ -444,7 +459,7 @@ impl Pair {
             return None;
         }
         self.told = true;
-        self.report.suspicions = self.report.suspicions.saturating_add(1);
+        self.counts.suspicions = self.counts.suspicions.saturating_add(1);
         Some(Change::Suspected(self.suspicion(peer, at_ns, noticed_ns)))
     }
 
@@ -524,7 +539,7 @@ impl Pair {
         };
         if let Some(beta) = beta {
             // u64 → f64 rounds only past 2⁵³ heartbeats.
-            self.report.allowance += beta.clamp(0.0, 1.0) * points as f64;
+            self.counts.allowance += beta.clamp(0.0, 1.0) * points as f64;
         }
         self.received.accounted = Some(seq);
     }
@@ -577,7 +592,7 @@ impl Pair {
         }
         let fresh_flush = beat.flush_age_ns <= beat.late_ns.saturating_add(beat.interval_ns);
         if beat.flushes <= self.received.flushes || !fresh_flush {
-            self.report.unproven = self.report.unproven.saturating_add(1);
+            self.counts.unproven = self.counts.unproven.saturating_add(1);
             return Err(Refusal::Unproven);
         }
         self.received.flushes = beat.flushes;
@@ -605,16 +620,18 @@ impl Pair {
             sent_ns: beat.sent_ns,
         });
         self.received.last_mapped = Some(mapped);
-        self.report.taken = self.report.taken.saturating_add(1);
+        self.counts.taken = self.counts.taken.saturating_add(1);
         let beta = self.beta_now();
         self.account(mapped, beta);
         if self.renewal_due(beta) {
             taken.configured = self.configure(context, granularity);
         }
+        // The MTBF is a float division: read only where the margin is renewed.
         if self.received.configuration.is_none()
-            && let Some(pool) = context.pool
+            && let Some(evidence) = context.evidence
+            && self.pool_margin_due()
         {
-            self.pool_margin(&pool, granularity, context.exposure.mtbf());
+            self.pool_margin(evidence, granularity, context.exposure.mtbf());
         }
         let due = previous.map_or(1, |previous| mapped.saturating_sub(previous).max(1));
         taken.error = error.map(|error| (due, error));
@@ -623,9 +640,17 @@ impl Pair {
         Ok(())
     }
 
+    /// Whether the margin of the node's evidence is due, on the configuration's doubling schedule:
+    /// never imposed, or the heartbeats taken have doubled since it was.
+    fn pool_margin_due(&self) -> bool {
+        self.received
+            .pooled
+            .is_none_or(|(_, at)| self.counts.taken >= at.saturating_mul(2))
+    }
+
     /// While the pair has no configuration of its own, the margin the node's evidence configures
     /// for it, imposed on its estimator (`docs/timing.md` §3, item 10): what the node measured of
-    /// its links (`Liveness::evidence`) scaled to the link's window (`scaled`), widened by what the
+    /// its links (`Liveness::renew_evidence`) scaled to the link's window (`scaled`), widened by what the
     /// link's own prediction errors and losses show so far, at the link's interval, its costs and
     /// its floors, as its own configuration would be. Renewed on the configuration's doubling
     /// schedule: at the first, and once the heartbeats taken have doubled since.
@@ -638,14 +663,10 @@ impl Pair {
         let (Some(election), Some(mtbf)) = (self.election, mtbf) else {
             return;
         };
-        let taken = self.report.taken;
-        if self
-            .received
-            .pooled
-            .is_some_and(|(_, at)| taken < at.saturating_mul(2))
-        {
+        if !self.pool_margin_due() {
             return;
         }
+        let taken = self.counts.taken;
         let floor_ns = self.received.floor_ns;
         let Some(link) = self.received.link.as_mut() else {
             return;
@@ -742,7 +763,7 @@ impl Pair {
             return true;
         };
         interval != Some(configured.current.interval)
-            || self.report.taken >= taken.saturating_mul(2)
+            || self.counts.taken >= taken.saturating_mul(2)
             || beta.is_some_and(|now| now >= 2.0 * renewed_beta)
     }
 
@@ -792,9 +813,9 @@ impl Pair {
             return false;
         };
         self.received.configuration = Some(configured);
-        self.report.configurations = self.report.configurations.saturating_add(1);
+        self.counts.configurations = self.counts.configurations.saturating_add(1);
         let beta = self.beta_now().unwrap_or(1.0);
-        self.received.renewed = Some((self.report.taken, beta));
+        self.received.renewed = Some((self.counts.taken, beta));
         true
     }
 }

@@ -256,7 +256,10 @@ the expected arrival's error against how fast it follows the link. Two measureme
   the curve falls.
 
 The estimator (`crates/hyper-timing/src/link.rs`, `LinkEstimator`) computes both online, in bounded
-memory and bounded work a heartbeat, and the trace analyser now takes its window from it:
+memory and bounded work a heartbeat, and the trace analyser now takes its window from it (a move of
+`G` alone, which comes with nearly every heartbeat a detector takes, places the window from the
+`n_A` the levels last gave, since only an offset moves them and `G` reaches `n_A` only through the
+drift bound's power of two):
 - `n_A` from Allan levels at windows `1, 2, 4, …`, each holding its unfinished window's sum and the
   running sum of squared differences of consecutive window means: one step a level a heartbeat. A
   level enters the comparison at seven windows, where its relative uncertainty `1/√(2(K−1))` is
@@ -611,7 +614,9 @@ heartbeat due; those it skipped are losses to the receiver, which they are.
 - **Judged before its own evidence: what the node measured of its links** (§3, item 10). A link
   whose own estimator has not configured is judged by the margin its node's evidence configures for
   it. That evidence is of two kinds, and the link takes the wider of them, each measure the larger
-  (`Liveness::evidence`):
+  (`Liveness::renew_evidence`, kept where either kind moves and read only for a link with no
+  configuration of its own: computed at every heartbeat, it cost every configured pair three maxima
+  it threw away, `docs/benchmarks.md`, "The node's evidence, kept"):
   - *the node's pool*, one more `LinkEstimator`, fed the prediction errors `A − EA` of every link
     without a configuration of its own, and of every link until the pool has its evidence
     (hyper-swim's rule, §2.7; a pool fed by the young links alone, whose links all configured

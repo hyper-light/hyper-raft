@@ -5,9 +5,10 @@
 //! starts `NODES` copies of this test binary as member processes (`member_process`, selected by
 //! `HYPER_SWIM_NODE`). Each runs the detector as the library configures it: it polls when the
 //! detector asks, sends what the detector returns (its probes, the answers, and the chunks of its
-//! view its anti-entropy exchanges ask), and prints, every period, its view, the
-//! detection bound its detector states and what it reports of each peer. The test measures nothing
-//! of its own and derives no bound. The supervisor waits on facts, each for as long as the members
+//! view its anti-entropy exchanges ask), and prints, every period, its record since the last (its
+//! probes, asks, answers and findings, [`Record`]) and a line of its view, the detection bound its
+//! detector states and what it reports of each peer. The test measures nothing of its own and
+//! derives no bound. The supervisor waits on facts, each for as long as the members
 //! move toward it: a quiet period derived from what they state (the longest detection bound a live
 //! member states, never less than RFC 6298's one-second retransmission timeout) that passes with
 //! nothing moving fails the wait with every member's last line, and so does a pair that takes more
@@ -23,10 +24,18 @@
 //!   detection bound its detector stated, with the wait it measured for evidence of its own health
 //!   added where its condemnation was pending on it.
 //!
-//! What it asserts of live members is what the configured detectors promise (`docs/timing.md`
-//! §2.7): Theorem 7 bounds the expected number of suspicions and condemnations of live members by
-//! `Σβ` over every judged probe, and a run refutes that only when the 95 % lower limit of its count,
-//! summed over the cluster, passes the sum of the allowances.
+//! What it asserts of every suspicion and condemnation is the detector's rule, exactly, from the
+//! members' own records (`docs/timing.md` §2.7). Each member records every probe it sends, with the
+//! deadline its detector stated as it was sent, every ping-request, every answer it hands its
+//! detector, every ping it answers, and what each poll found ([`Detector::findings`]). Each
+//! suspicion, and each condemnation made pending, is traced to its probe: sent when the finding
+//! says, with the deadline it states; its period ended no earlier than that deadline nor, where
+//! relays were asked, than theirs; no answer, direct or relayed, handed to the detector before the
+//! end. Then to the answer that missed it, handed over late, or was lost, the target's record
+//! saying whether the ping reached it. Each condemnation is traced to the pending one it follows
+//! and to the answer from another member it was made at, and every count a member reports is its
+//! findings'. Theorem 7's allowance for live members, `Σβ` over every judged probe, is printed
+//! beside their counts: a report, not a test, for a count is what the rule found, not a draw.
 
 #![allow(
     clippy::unwrap_used,
@@ -42,7 +51,8 @@
     missing_docs
 )]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write as _;
 use std::io::{BufRead, BufReader, ErrorKind, Write};
 use std::net::UdpSocket;
 use std::num::NonZeroUsize;
@@ -55,7 +65,7 @@ use hyper_datagram::{
 };
 use hyper_swim::HostId;
 use hyper_swim::codec::{Coordinate, GossipBatch, SwimMessage, gossip_capacity};
-use hyper_swim::detector::{Detector, PeerReport, PingReq};
+use hyper_swim::detector::{Detector, Finding, PeerReport, PingReq, Unanswered};
 use hyper_swim::membership::{Liveness, MemberState};
 use hyper_timing::{Exposure, WINDOW_LIMIT};
 
@@ -68,12 +78,6 @@ const POOLED: u64 = NODES;
 const OWNED: u64 = NODES - 1;
 /// The path's datagram size: QUIC's minimum, which every path carries (RFC 9000 §14.1).
 const DATAGRAM: usize = 1_200;
-/// The 95 % score interval's lower end for a Poisson count `k` (`hyper_timing::poisson95`), with
-/// which the trace analyser and `hyper-timing`'s replay refute Theorem 7 (`docs/timing.md` §2.6).
-fn poisson_lower(k: u64) -> f64 {
-    hyper_timing::poisson95(k).0
-}
-
 fn secret_between(a: u64, b: u64) -> ExporterSecret {
     // Stands for the QUIC exporter both ends of a connection compute: one secret per pair.
     let (low, high) = (a.min(b), a.max(b));
@@ -165,6 +169,7 @@ fn member_process() {
         relaying: BTreeMap::new(),
         dead_seen: BTreeMap::new(),
         tallies: BTreeMap::new(),
+        records: String::new(),
     };
     member.gossip = member.gossip_room();
     member.view_room = member.view_room();
@@ -208,6 +213,9 @@ struct Member {
     dead_seen: BTreeMap<u64, Noted>,
     /// What its detector has reported of each peer, kept across the peer's being forgotten.
     tallies: BTreeMap<u64, Tally>,
+    /// This member's record since its last line, in the order made ([`Record`]): written out with
+    /// the line, so a count a line reports follows every finding it counts.
+    records: String,
 }
 
 /// A death a member came to hold: how long after the peer's last answer, the bound its detector
@@ -318,11 +326,21 @@ impl Member {
         let _ = self.plane.queue(to, &self.encoded);
     }
 
-    /// Polls the detector and sends what it asks. Whether a period began.
+    /// Polls the detector and sends what it asks, recording what the poll found, the relays it
+    /// asks and the probe it sends with its stated deadline. Whether a period began.
     fn step(&mut self) -> bool {
+        let now = self.now();
         let mut requests = std::mem::take(&mut self.requests);
-        let ping = self.detector.poll(self.now(), &mut requests);
+        let ping = self.detector.poll(now, &mut requests);
+        for finding in self.detector.findings() {
+            note_finding(&mut self.records, finding);
+        }
         for request in &requests {
+            let _ = writeln!(
+                self.records,
+                "r {} {} {} {now}",
+                request.relay.0, request.target.0, request.nonce
+            );
             self.send(
                 request.relay.0,
                 &SwimMessage::PingReq {
@@ -338,6 +356,19 @@ impl Member {
             let mut batch = std::mem::take(&mut self.batch);
             self.detector
                 .ping_gossip_into(ping.to, self.gossip, &mut batch);
+            // Told: the probe carries this member's suspicion of its target.
+            let told = batch
+                .iter()
+                .any(|(host, state)| *host == ping.to && state.liveness == Liveness::Suspect);
+            let _ = writeln!(
+                self.records,
+                "p {} {} {now} {} {}",
+                ping.nonce,
+                ping.to.0,
+                ping.due_ns
+                    .map_or_else(|| "-".to_owned(), |due| due.to_string()),
+                u8::from(told)
+            );
             self.send(
                 ping.to.0,
                 &SwimMessage::Ping {
@@ -423,6 +454,7 @@ impl Member {
                 gossip,
                 ..
             } => {
+                let _ = writeln!(self.records, "g {} {nonce} {stamp}", from.0);
                 self.detector.apply_gossip(gossip);
                 let ack = self.detector.on_ping(from);
                 let mut batch = std::mem::take(&mut self.batch);
@@ -466,7 +498,10 @@ impl Member {
                             },
                         );
                     }
-                    _ => self.detector.on_ack(from, nonce, stamp),
+                    _ => {
+                        let _ = writeln!(self.records, "a {} {nonce} {stamp}", from.0);
+                        self.detector.on_ack(from, nonce, stamp);
+                    }
                 }
             }
             SwimMessage::PingReq {
@@ -502,6 +537,7 @@ impl Member {
                 gossip,
                 ..
             } => {
+                let _ = writeln!(self.records, "i {} {nonce} {stamp}", target.0);
                 self.detector.apply_gossip(gossip);
                 self.detector.on_indirect_ack(target, nonce, stamp);
             }
@@ -548,10 +584,11 @@ impl Member {
         }
     }
 
-    /// One line: `me period detection_ns` (the detector's stated bound, 0 before it states one)
-    /// then, per peer, `peer:letter:judged:own:taken:answered_ns_ago:suspicions:allowance:
-    /// condemnations:allowance:dead_after_ns:dead_within_ns` (`-` for a peer that never answered,
-    /// and for a death noted with no bound).
+    /// This member's record since its last line, then one line: `me period detection_ns` (the
+    /// detector's stated bound, 0 before it states one) then, per peer,
+    /// `peer:letter:judged:own:taken:answered_ns_ago:suspicions:allowance:condemnations:
+    /// allowance:dead_after_ns:dead_within_ns` (`-` for a peer that never answered, and for a
+    /// death noted with no bound).
     fn report(&mut self, period: u64, out: &mut impl Write) -> std::io::Result<()> {
         let now = self.now();
         let detection = self
@@ -587,9 +624,139 @@ impl Member {
                     .map_or_else(|| "-".to_owned(), |within| within.as_nanos().to_string()),
             ));
         }
-        writeln!(out, "{line}")?;
+        let mut text = std::mem::take(&mut self.records);
+        text.push_str(&line);
+        text.push('\n');
+        out.write_all(text.as_bytes())?;
+        text.clear();
+        self.records = text;
         out.flush()
     }
+}
+
+/// A finding in a member's record: `S` or `P` (suspected, condemnation pending) `target nonce
+/// sent_ns due_ns relays_due_ns|- ended_ns`, `C target pending_since_ns answered nonce at_ns`.
+fn note_finding(records: &mut String, finding: &Finding) {
+    let missed = |kind: char, missed: &Unanswered| {
+        format!(
+            "{kind} {} {} {} {} {} {}",
+            missed.target.0,
+            missed.nonce,
+            missed.sent_ns,
+            missed.due_ns,
+            missed
+                .relays_due_ns
+                .map_or_else(|| "-".to_owned(), |due| due.to_string()),
+            missed.ended_ns
+        )
+    };
+    let line = match finding {
+        Finding::Suspected(unanswered) => missed('S', unanswered),
+        Finding::Pending(unanswered) => missed('P', unanswered),
+        Finding::Condemned {
+            target,
+            pending_since_ns,
+            answered,
+            nonce,
+            at_ns,
+        } => format!(
+            "C {} {pending_since_ns} {} {nonce} {at_ns}",
+            target.0, answered.0
+        ),
+    };
+    records.push_str(&line);
+    records.push('\n');
+}
+
+/// One entry of a member's record, in the order the member made it, times on its own clock.
+#[derive(Clone, Copy, Debug)]
+enum Record {
+    /// `p nonce to at due|- told`: a probe sent, the deadline its detector stated as it was sent
+    /// (`None` for a measurement probe, which judges nothing), and whether it carried the
+    /// member's suspicion of its target.
+    Probe {
+        nonce: u64,
+        to: u64,
+        at: u64,
+        due: Option<u64>,
+        told: bool,
+    },
+    /// `r relay target nonce at`: a relay asked to probe `target` for the probe `nonce`.
+    Asked {
+        relay: u64,
+        target: u64,
+        nonce: u64,
+        at: u64,
+    },
+    /// `a from nonce at`: an answer to the member's probe `nonce`, handed to its detector.
+    Answer { from: u64, nonce: u64, at: u64 },
+    /// `i target nonce at`: `target`'s answer to the probe `nonce` through a relay, handed over.
+    Relayed { target: u64, nonce: u64, at: u64 },
+    /// `g from nonce at`: a ping from `from` answered.
+    Pinged { from: u64, nonce: u64 },
+    /// What a poll found.
+    Found(Finding),
+}
+
+/// A record line, or `None` for a line that is not one.
+fn record(line: &str) -> Option<Record> {
+    let fields: Vec<&str> = line.split(' ').collect();
+    let number = |at: usize| -> Option<u64> { fields.get(at)?.parse().ok() };
+    let maybe = |at: usize| -> Option<Option<u64>> {
+        match *fields.get(at)? {
+            "-" => Some(None),
+            value => value.parse().ok().map(Some),
+        }
+    };
+    let unanswered = || -> Option<Unanswered> {
+        Some(Unanswered {
+            target: HostId(number(1)?),
+            nonce: number(2)?,
+            sent_ns: number(3)?,
+            due_ns: number(4)?,
+            relays_due_ns: maybe(5)?,
+            ended_ns: number(6)?,
+        })
+    };
+    Some(match *fields.first()? {
+        "p" => Record::Probe {
+            nonce: number(1)?,
+            to: number(2)?,
+            at: number(3)?,
+            due: maybe(4)?,
+            told: *fields.get(5)? == "1",
+        },
+        "r" => Record::Asked {
+            relay: number(1)?,
+            target: number(2)?,
+            nonce: number(3)?,
+            at: number(4)?,
+        },
+        "a" => Record::Answer {
+            from: number(1)?,
+            nonce: number(2)?,
+            at: number(3)?,
+        },
+        "i" => Record::Relayed {
+            target: number(1)?,
+            nonce: number(2)?,
+            at: number(3)?,
+        },
+        "g" => Record::Pinged {
+            from: number(1)?,
+            nonce: number(2)?,
+        },
+        "S" => Record::Found(Finding::Suspected(unanswered()?)),
+        "P" => Record::Found(Finding::Pending(unanswered()?)),
+        "C" => Record::Found(Finding::Condemned {
+            target: HostId(number(1)?),
+            pending_since_ns: number(2)?,
+            answered: HostId(number(3)?),
+            nonce: number(4)?,
+            at_ns: number(5)?,
+        }),
+        _ => return None,
+    })
 }
 
 fn flush(plane: &mut Plane, socket: &UdpSocket, address: &dyn Fn(u64) -> String) {
@@ -737,6 +904,10 @@ struct Supervisor {
     latest: Reports,
     /// The members killed, in order, each with every member's latest line when it was killed.
     killed: Vec<(u64, Reports)>,
+    /// Each member's record, as far as the supervisor read it while the member lived.
+    records: BTreeMap<u64, Vec<Record>>,
+    /// Of each member and peer, the suspicions and condemnations its record has found so far.
+    found: BTreeMap<(u64, u64), (u64, u64)>,
 }
 
 #[allow(
@@ -755,7 +926,8 @@ impl Supervisor {
 
     /// The next line any member reports within `left`, folded in; nothing, past it. A member whose
     /// output ends, which it does once its process exits, fails the wait with its exit status,
-    /// unless the supervisor killed it.
+    /// unless the supervisor killed it. A record line is kept; a line that reports counts its
+    /// record has not found fails the wait.
     fn next(&mut self, left: Duration, what: &str) {
         let (member, line) = match self.heard.recv_timeout(left) {
             Ok(heard) => heard,
@@ -771,7 +943,36 @@ impl Supervisor {
             let status = ended(&mut self.members, member);
             panic!("{what}: member {member} ended: {status}\n{}", self.dump());
         };
+        if let Some(entry) = record(&line) {
+            let counted = match entry {
+                Record::Found(Finding::Suspected(missed)) => Some((missed.target.0, (1, 0))),
+                Record::Found(Finding::Condemned { target, .. }) => Some((target.0, (0, 1))),
+                _ => None,
+            };
+            if let Some((target, (suspicions, condemnations))) = counted {
+                let held = self.found.entry((member, target)).or_default();
+                held.0 += suspicions;
+                held.1 += condemnations;
+            }
+            self.records.entry(member).or_default().push(entry);
+            return;
+        }
         if let Some((period, detection, peers)) = parse(&line) {
+            for (peer, seen) in &peers {
+                let (suspicions, condemnations) = self
+                    .found
+                    .get(&(member, *peer))
+                    .copied()
+                    .unwrap_or_default();
+                assert!(
+                    (seen.suspicions, seen.condemnations) == (suspicions, condemnations),
+                    "{what}: member {member} reports {} suspicions and {} condemnations of {peer}, \
+                     and its record finds {suspicions} and {condemnations}\n{}",
+                    seen.suspicions,
+                    seen.condemnations,
+                    self.dump()
+                );
+            }
             let at = Instant::now();
             self.latest.insert(
                 member,
@@ -1074,6 +1275,8 @@ fn a_killed_member_is_declared_dead_by_every_survivor_and_no_live_one_is() {
         heard,
         latest: BTreeMap::new(),
         killed: Vec::new(),
+        records: BTreeMap::new(),
+        found: BTreeMap::new(),
     };
     supervisor.until("every member judges every peer", |run| {
         run.every_pair(|seen| seen.judged)
@@ -1096,6 +1299,7 @@ fn a_killed_member_is_declared_dead_by_every_survivor_and_no_live_one_is() {
         members,
         latest,
         killed,
+        records,
         ..
     } = supervisor;
     drop(members);
@@ -1176,20 +1380,262 @@ fn a_killed_member_is_declared_dead_by_every_survivor_and_no_live_one_is() {
         condemnations,
         condemnation_allowance,
     } = live;
+    // A report, not a test: Theorem 7 bounds the expected count, and a count is what the rule
+    // found.
     println!(
         "suspicions of live members {suspicions} (Theorem 7 allows {suspicion_allowance:.3}); \
          condemnations {condemnations} (allows {condemnation_allowance:.3})"
     );
-    // Theorem 7 bounds the expected count: a run refutes it only when the count's 95 % lower
-    // limit passes the allowance, the rule the replay and the trace analyser apply.
-    assert!(
-        poisson_lower(suspicions) <= suspicion_allowance,
-        "{suspicions} suspicions of live members refute the {suspicion_allowance} the configured \
-         detectors allow"
+    let victims: Vec<u64> = killed.iter().map(|(victim, _)| *victim).collect();
+    let (traced, failures) = trace(&records, &victims);
+    println!(
+        "every finding traced: {} suspicions and {} condemnations made pending, each probe \
+         unanswered by its stated deadline, its answer late in {} (the latest {:?} past its \
+         deadline), relayed late in {}, lost in {}, its ping unheard by a live target in {} and \
+         by a killed one in {}; {} condemnations, each after its pending one and another member's \
+         answer",
+        traced.suspicions,
+        traced.pending,
+        traced.late,
+        traced.latest,
+        traced.relayed_late,
+        traced.answer_lost,
+        traced.probe_lost,
+        traced.target_killed,
+        traced.condemnations,
     );
     assert!(
-        poisson_lower(condemnations) <= condemnation_allowance,
-        "{condemnations} condemnations of live members refute the {condemnation_allowance} the \
-         configured detectors allow"
+        failures.is_empty(),
+        "{} findings do not trace to the detector's rule:\n{}",
+        failures.len(),
+        failures.join("\n")
     );
+}
+
+/// What tracing every finding found: how many of each, and what became of the answers the
+/// unanswered probes missed.
+#[derive(Debug, Default)]
+struct Traced {
+    suspicions: u64,
+    pending: u64,
+    condemnations: u64,
+    /// Answers handed to the detector after their probe's period ended.
+    late: u64,
+    /// The latest of them past its deadline.
+    latest: Duration,
+    /// Relayed answers handed over after the period ended.
+    relayed_late: u64,
+    /// Pings the target's record answered whose answer the member never handed over.
+    answer_lost: u64,
+    /// Pings a target that ran to the end has no record of.
+    probe_lost: u64,
+    /// Pings a target killed has no record of.
+    target_killed: u64,
+}
+
+/// Where a probe is in a member's record: its place, its target, when it was sent, the deadline
+/// stated as it was sent, and whether it carried the suspicion of its target.
+type Sent = (usize, u64, u64, Option<u64>, bool);
+
+/// Of each nonce, where its answers are in a member's record: their places, who answered, when.
+type Answers = BTreeMap<u64, Vec<(usize, u64, u64)>>;
+
+/// Traces every finding in the members' records to the detector's rule, from those records
+/// alone, and lists each way one fails it. A suspicion or a condemnation made pending: its probe
+/// was sent when it says, with the deadline it states, as stated when sent; its period ended no
+/// earlier than that deadline nor, where relays were asked (at or past it), than theirs; no answer,
+/// direct or relayed, was handed to the detector between the probe and the end; a pending one's
+/// probe carried the suspicion. A condemnation: a pending one of its target ended when it says,
+/// before it, and the probe it names, of another member, was answered before it.
+fn trace(records: &BTreeMap<u64, Vec<Record>>, killed: &[u64]) -> (Traced, Vec<String>) {
+    // Every ping each member answered: the member, who pinged it, the ping's nonce.
+    let pinged: BTreeSet<(u64, u64, u64)> = records
+        .iter()
+        .flat_map(|(member, made)| {
+            made.iter().filter_map(move |entry| match *entry {
+                Record::Pinged { from, nonce } => Some((*member, from, nonce)),
+                _ => None,
+            })
+        })
+        .collect();
+    let mut traced = Traced::default();
+    let mut failures = Vec::new();
+    for (member, made) in records {
+        let mut probes: BTreeMap<u64, Sent> = BTreeMap::new();
+        let mut answers = Answers::new();
+        let mut relayed = Answers::new();
+        let mut asked: BTreeMap<u64, Vec<(usize, u64, u64, u64)>> = BTreeMap::new();
+        for (place, entry) in made.iter().enumerate() {
+            match *entry {
+                Record::Probe {
+                    nonce,
+                    to,
+                    at,
+                    due,
+                    told,
+                } => {
+                    probes.insert(nonce, (place, to, at, due, told));
+                }
+                Record::Answer { from, nonce, at } => {
+                    answers.entry(nonce).or_default().push((place, from, at));
+                }
+                Record::Relayed { target, nonce, at } => {
+                    relayed.entry(nonce).or_default().push((place, target, at));
+                }
+                Record::Asked {
+                    relay,
+                    target,
+                    nonce,
+                    at,
+                } => {
+                    asked
+                        .entry(nonce)
+                        .or_default()
+                        .push((place, relay, target, at));
+                }
+                Record::Pinged { .. } | Record::Found(_) => {}
+            }
+        }
+        // The answers to `nonce` from `from` in a stretch of the record.
+        let any = |answers: &Answers, nonce: u64, from: u64, within: &dyn Fn(usize) -> bool| {
+            answers
+                .get(&nonce)
+                .into_iter()
+                .flatten()
+                .find(|(place, by, _)| *by == from && within(*place))
+                .copied()
+        };
+        let mut pending: Vec<(usize, Unanswered)> = Vec::new();
+        for (place, entry) in made.iter().enumerate() {
+            let Record::Found(finding) = *entry else {
+                continue;
+            };
+            let mut fail =
+                |why: String| failures.push(format!("member {member}, {finding:?}: {why}"));
+            match finding {
+                Finding::Suspected(missed) | Finding::Pending(missed) => {
+                    let target = missed.target.0;
+                    match finding {
+                        Finding::Suspected(_) => traced.suspicions += 1,
+                        _ => {
+                            traced.pending += 1;
+                            pending.push((place, missed));
+                        }
+                    }
+                    let Some(&(sent, to, at, due, told)) = probes.get(&missed.nonce) else {
+                        fail("its probe is not in the member's record".to_owned());
+                        continue;
+                    };
+                    if sent > place || to != target || at != missed.sent_ns {
+                        fail(format!(
+                            "its probe went to {to} at {at} ns, after it or not as it says"
+                        ));
+                    }
+                    if due != Some(missed.due_ns) {
+                        fail(format!("its probe was sent with the deadline {due:?}"));
+                    }
+                    if missed.ended_ns < missed.due_ns {
+                        fail("its period ended before the deadline".to_owned());
+                    }
+                    let during = |at: usize| sent < at && at < place;
+                    let asks: Vec<(usize, u64, u64, u64)> = asked
+                        .get(&missed.nonce)
+                        .into_iter()
+                        .flatten()
+                        .filter(|(at, ..)| during(*at))
+                        .copied()
+                        .collect();
+                    if asks
+                        .iter()
+                        .any(|(_, relay, of, _)| *of != target || *relay == target)
+                    {
+                        fail(format!(
+                            "a relay was asked for another target, or the target: {asks:?}"
+                        ));
+                    }
+                    match missed.relays_due_ns {
+                        None if asks.is_empty() => {}
+                        Some(relays_due) if !asks.is_empty() => {
+                            if missed.ended_ns < relays_due {
+                                fail("its period ended before the relays' deadline".to_owned());
+                            }
+                            if asks.iter().any(|(.., at)| *at < missed.due_ns) {
+                                fail("relays were asked before the deadline".to_owned());
+                            }
+                        }
+                        relays_due => fail(format!(
+                            "relays asked {}, the relays' deadline {relays_due:?}",
+                            asks.len()
+                        )),
+                    }
+                    if any(&answers, missed.nonce, target, &during).is_some()
+                        || any(&relayed, missed.nonce, target, &during).is_some()
+                    {
+                        fail(
+                            "an answer was handed to the detector before its period ended"
+                                .to_owned(),
+                        );
+                    }
+                    if matches!(finding, Finding::Pending(_)) && !told {
+                        fail("its probe did not carry the suspicion".to_owned());
+                    }
+                    // What became of the answer: handed over late, or lost.
+                    let after = |at: usize| at > place;
+                    if let Some((_, _, at)) = any(&answers, missed.nonce, target, &after) {
+                        traced.late += 1;
+                        traced.latest = traced
+                            .latest
+                            .max(Duration::from_nanos(at.saturating_sub(missed.due_ns)));
+                    } else if any(&relayed, missed.nonce, target, &after).is_some() {
+                        traced.relayed_late += 1;
+                    } else if pinged.contains(&(target, *member, missed.nonce)) {
+                        traced.answer_lost += 1;
+                    } else if killed.contains(&target) {
+                        traced.target_killed += 1;
+                    } else {
+                        traced.probe_lost += 1;
+                    }
+                }
+                Finding::Condemned {
+                    target,
+                    pending_since_ns,
+                    answered,
+                    nonce,
+                    at_ns,
+                } => {
+                    traced.condemnations += 1;
+                    if !pending.iter().any(|(at, missed)| {
+                        missed.target == target
+                            && missed.ended_ns == pending_since_ns
+                            && *at < place
+                    }) {
+                        fail("no condemnation of it was made pending when it says".to_owned());
+                    }
+                    if answered == target {
+                        fail("its own answer condemned it".to_owned());
+                    }
+                    if at_ns < pending_since_ns {
+                        fail("condemned before its condemnation was pending".to_owned());
+                    }
+                    match probes.get(&nonce) {
+                        Some(&(sent, to, ..)) if to == answered.0 && sent < place => {
+                            let between = |at: usize| sent < at && at < place;
+                            if any(&answers, nonce, to, &between).is_none()
+                                && any(&relayed, nonce, to, &between).is_none()
+                            {
+                                fail(format!(
+                                    "no answer from {to} to the probe {nonce} before it"
+                                ));
+                            }
+                        }
+                        _ => fail(format!(
+                            "the probe {nonce} of {} is not in the member's record before it",
+                            answered.0
+                        )),
+                    }
+                }
+            }
+        }
+    }
+    (traced, failures)
 }

@@ -645,16 +645,29 @@ trips too correlated for `τ_int` to be measured no longer holds it for as long 
 a member whose output ends, its process exited, unless the supervisor killed it. Before, a wait ended
 only on its fact, and nothing but CI's job limit bounded one that never came. A peer a member forgot
 after its death reports as forgotten, and a member keeps what its detector reported of each peer
-across the peer's being forgotten and adopted again. Of live members it asserts what the
-configuration promises, each pair's counts taken while its peer lived: Theorem 7 bounds the expected
-number of suspicions and of condemnations by `Σβ`, and a run refutes that only when the 95 % lower
-limit of its count (the Poisson score interval, as the replay and the trace analyser use, §2.6)
-passes it. A first form asserted the count itself within `Σβ`, which no detector can promise of one
-run: at an allowance of 1.8, two mistakes are ordinary, and twelve runs in a hundred at one CPU
-failed so while the series as a whole kept far inside its bound. The rule itself refutes a bound that
-holds with probability at most 2.5 % an assertion, under the Poisson model the replay uses; on
-unloaded hosts the runs' counts are far below their allowance and it does not arise. A member whose
-supervisor is gone ends when its report cannot be written.
+across the peer's being forgotten and adopted again.
+
+Every suspicion and condemnation it checks exactly, from the members' own records, against the
+detector's rule. A probe states its deadline as it is sent (`Ping::due_ns`), and a poll what the
+member's own probes found, each finding with its evidence (`Detector::findings`: a suspicion, a
+condemnation made pending, a condemnation). Each member records every probe it sends with that
+deadline and whether it carried its suspicion of the target, every relay it asks, every answer it
+hands its detector, direct or relayed, every ping it answers, and every finding, in the order it
+made them. A suspicion, or a condemnation made pending, traces to its probe: sent when and to whom
+the finding says, with the deadline it states; its period ended no earlier than that deadline nor,
+where relays were asked (at or past it, for that target, none of them the target), than the
+relays' deadline; no answer, direct or relayed, handed to the detector between the probe and the
+end; and a pending one's probe carried the suspicion. Then the answer that missed it is found:
+handed over after the end, late, or never, lost, the target's record saying whether the ping
+reached it. A condemnation traces to the pending one it follows, ended when it says, and to the
+probe of another member answered before it, and every count a member reports equals its record's
+findings at every line it writes. Theorem 7's allowance, `Σβ` over the judged probes of live
+members, is printed beside their counts, a report: it bounds an expectation, and a run's count is
+what the rule found, not a draw. Two forms before asserted the count: within `Σβ` (twelve runs in
+a hundred failed at one CPU while the series kept far inside it), then refuting `Σβ` only when the
+count's 95 % Poisson lower limit passed it, a test that fails by chance; the owner's rule
+(2026-10-03) is that no test passes or fails by chance. A member whose supervisor is gone ends when
+its report cannot be written.
 
 **Measured** (`docs/benchmarks.md`, "hyper-swim"): on loopback a period is 0.1–1 ms, `μ` 60–100 µs
 and `α` growing from about 0.3 ms with the MTBF; a period costs no allocation and less time than

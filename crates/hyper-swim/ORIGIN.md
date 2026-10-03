@@ -121,6 +121,13 @@
     its own as a newcomer's, restarting its window, and pushed it on in turn: the record went round
     for as long as any member held it (Demers et al. §2's death certificates, resurrected).
 
+13. **A probe states its deadline, and a poll what it found** (`docs/timing.md` §2.7).
+    `Ping::due_ns` is the probe's deadline as stated when it is sent, and `Detector::findings` what
+    the latest poll found by the member's own probes, a suspicion, a condemnation made pending or a
+    condemnation, each with its evidence: the probe, its deadline, when its period ended with no
+    answer delivered, and for a condemnation the answer from another member it was made at. An
+    owner can say why; the cluster test traces every one. slates' detector stated neither.
+
 The wire changed in place with 8 and 11: a probe and an answer carry entries of the existing gossip
 encoding, which a receiver of the earlier form applies as any gossip, and `Sync` is a new tag with
 its own golden vector. No consumer runs hyper-swim yet (slates' session owns its integration), so
@@ -128,12 +135,16 @@ there is no earlier form in service to keep.
 
 ## Tests
 
-- 70 unit tests: slates' membership, gossip, codec and coordinate tests, the extension series and
+- 70 unit tests: slates' membership, gossip, codec and coordinate tests (the engine's update checked
+  bit for bit, on values whose every step is exact: Dabek's Fig. 3, an error estimate the same at
+  scales 2¹⁰ apart, a quarter of the gap closed at each sample), the extension series and
   its bounds, the gossip queue's order, replacement and bound, and the measured timing's: nothing
   judged before the estimates exist, the deadline is `μ + α`, a silent member is suspected, told and
   condemned, an isolated member condemns nobody, an indirect answer spares, a refutation clears a
-  pending condemnation, an extension buys one told probe, the allowance is `Σβ`, the dissemination
-  budget is SWIM's bound and the relay count the fewest that suffice; and one for each failure the
+  pending condemnation, an extension buys exactly one more told probe, its findings naming each, the
+  allowance is `Σβ` summed bit for bit, the dissemination budget is the least count past SWIM's
+  bound and the relay count the fewest that suffice, and every round trip measured teaches the
+  coordinate, bit for bit the engine's update; and one for each failure the
   cluster runs found (`docs/benchmarks.md`, "The cluster test"): members holding one another dead
   heal, a lost measurement probe ends at its expected arrival, a refused reconfiguration leaves the
   verdict in force, a re-adopted suspicion keeps its told probes, the detection bound does not
@@ -155,6 +166,10 @@ there is no earlier form in service to keep.
     configuration than any window of its estimator holds (`hyper_timing::WINDOW_LIMIT`), or a
     member whose process exits, fails it at once.
   - Every survivor must hold each victim dead within the detection bound its own detector stated.
-  - Suspicions and condemnations of live members, summed over the cluster, must stay within the
-    configured detectors' allowance `Σβ`.
+  - Every suspicion and condemnation must trace, from the members' own records, to the
+    detector's rule: its probe, the deadline stated when it was sent, its period's end with no
+    answer handed to the detector, and the answer that missed it or was lost; a condemnation to the
+    pending one it follows and another member's answer; and every count a member reports must be
+    its record's findings. Theorem 7's allowance `Σβ` for live members is printed beside their
+    counts, a report, not a test.
   - The counts over hundreds of runs on macOS and Linux are in `docs/benchmarks.md`.

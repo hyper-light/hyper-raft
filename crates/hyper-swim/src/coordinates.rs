@@ -226,69 +226,95 @@ mod tests {
         }
     }
 
-    /// One update is Dabek's Fig. 3 line by line, the height moving inside the spring (§5.4).
+    /// Seconds in a millisecond's binary neighbourhood: 2⁻¹⁰ s, 0.98 ms. Every value below is a
+    /// multiple of it with a short binary fraction, and a round trip of whole multiples converts
+    /// from a `Duration` exactly, so each step of the update is exact and is checked bit for bit.
+    const K: f64 = 1.0 / 1024.0;
+
+    /// A round trip of `multiples` of [`K`], an even number: a whole count of nanoseconds, which
+    /// converts back to seconds exactly.
+    fn of(multiples: u32) -> Duration {
+        let seconds = f64::from(multiples) * K;
+        let rtt = Duration::from_secs_f64(seconds);
+        assert_eq!(rtt.as_secs_f64(), seconds, "{multiples} converts exactly");
+        rtt
+    }
+
+    /// One update is Dabek's Fig. 3 line by line, the height moving inside the spring (§5.4), and
+    /// it moves the prediction `δ = c_c·w` of the way to the measured round trip.
     #[test]
     fn one_update_is_dabeks_figure_3() {
         let mut engine = CoordinateEngine::new(1);
-        engine.coordinate = at(0.0, 0.0, 1.0 * MS, 0.5);
-        let peer = at(3.0 * MS, 4.0 * MS, 1.0 * MS, 0.25);
-        let rtt = Duration::from_millis(10);
-        assert!(engine.update(&peer, rtt, 3));
-        // ‖x_i − x_j‖ = 5 ms, so the prediction is 5 + 1 + 1 = 7 ms against 10 measured.
-        let w = 0.5 / (0.5 + 0.25);
-        let e_s = 3.0 / 10.0;
-        let c_e = 2.0 / 4.0;
-        let error = e_s * c_e * w + 0.5 * (1.0 - c_e * w);
-        let force = 0.25 * w * (10.0 - 7.0) * MS;
-        let unit = [-3.0 / 7.0, -4.0 / 7.0, 2.0 / 7.0];
-        let got = engine.coordinate();
-        assert!((got.error - error).abs() < 1e-15, "{}", got.error);
-        assert!((got.position[0] - force * unit[0]).abs() < 1e-15);
-        assert!((got.position[1] - force * unit[1]).abs() < 1e-15);
-        assert!((got.height - (1.0 * MS + force * unit[2])).abs() < 1e-15);
-        // The step moves the prediction δ of the way to the measured round trip.
-        let moved = engine.predict(&peer);
-        assert!((moved - (7.0 * MS + force)).abs() < 1e-12, "{moved}");
+        engine.coordinate = at(0.0, 0.0, 1.0 * K, 0.75);
+        let peer = at(3.0 * K, 4.0 * K, 2.0 * K, 0.25);
+        assert!(engine.update(&peer, of(16), 3));
+        // ‖x_i − x_j‖ = 5, so the prediction is 5 + 1 + 2 = 8 against 16 measured;
+        // w = 0.75/(0.75 + 0.25) = 0.75; e_s = |8 − 16|/16 = 0.5; c_e = 2/(3 + 1) = 0.5;
+        // e_i = 0.5·0.5·0.75 + 0.75·(1 − 0.5·0.75) = 0.65625;
+        // force = c_c·w·(16 − 8) = 0.25·0.75·8 = 1.5, along [−3, −4, 1 + 2]/8.
+        assert_eq!(
+            *engine.coordinate(),
+            at(-0.5625 * K, -0.75 * K, 1.5625 * K, 0.65625)
+        );
+        assert_eq!(engine.predict(&peer), (8.0 + 1.5) * K);
     }
 
-    /// The error estimate is a relative error: round trips alternating 10 % either side of a peer's
-    /// leave a node whose predictions are a tenth or so off, and its estimate says so, the same at a
-    /// LAN's scale as at a WAN's. The engine before folded the error in seconds and floored it at
+    /// The error estimate is a relative error, scale-free: the same round trips at a LAN's scale
+    /// and at 2¹⁰ times it, a WAN's, leave the same estimate bit for bit at every sample, and
+    /// heights 2¹⁰ times apart. The engine before folded the error in seconds and floored it at
     /// 0.05, 50 ms: both scales read 0.05.
     #[test]
     fn the_error_estimate_is_a_relative_error() {
-        let settled = |scale: f64| {
-            let peer = at(0.0, 0.0, scale / 2.0, 0.0);
-            let mut engine = CoordinateEngine::new(7);
-            for sample in 0..4_000 {
-                let rtt = if sample % 2 == 0 { 1.1 } else { 0.9 } * scale;
-                engine.update(&peer, Duration::from_secs_f64(rtt), 15);
-            }
-            engine.coordinate().error
+        let step = |engine: &mut CoordinateEngine, scale: u64, sample: u64| {
+            // 100 µs at the LAN's scale, 10 % either side by turns.
+            let base = if sample.is_multiple_of(2) {
+                110_000
+            } else {
+                90_000
+            };
+            let rtt_ns = base * scale;
+            let peer = at(0.0, 0.0, 50e-6 * scale as f64, 0.0);
+            assert!(engine.update(&peer, Duration::from_nanos(rtt_ns), 15));
+            *engine.coordinate()
         };
-        let (lan, wan) = (settled(100e-6), settled(100e-3));
-        assert!((0.09..0.14).contains(&lan), "{lan}");
-        assert!(
-            (lan - wan).abs() < 1e-6 * lan,
-            "{lan} against {wan}: scale-free"
-        );
+        let (mut lan, mut wan) = (CoordinateEngine::new(7), CoordinateEngine::new(7));
+        for sample in 0..4_000 {
+            let (near, far) = (step(&mut lan, 1, sample), step(&mut wan, 1_024, sample));
+            assert_eq!(near.error, far.error, "sample {sample}");
+            assert_eq!(near.height * 1_024.0, far.height, "sample {sample}");
+            assert_eq!((near.position, far.position), ([0.0; 2], [0.0; 2]));
+        }
+        // From a peer with no error, at a round of one, the estimate is the sample's error.
+        let mut engine = CoordinateEngine::new(7);
+        let peer = at(0.0, 0.0, 2.0 * K, 0.0);
+        let predicted = engine.predict(&peer);
+        assert!(engine.update(&peer, of(8), 1));
+        assert_eq!(engine.coordinate().error, (8.0 * K - predicted) / (8.0 * K));
     }
 
-    /// Fed a fixed peer's round trip, a coordinate converges to predict it.
+    /// Fed a fixed peer's round trip, a coordinate closes the same share of the gap at every
+    /// sample: from a peer with no error `w = 1`, so `δ = c_c`, a quarter, and the gap after `k`
+    /// samples is `(3/4)^k` of the first. Exact while the gap's binary fraction fits a double's.
     #[test]
     fn a_coordinate_converges_to_predict_a_peer() {
-        let peer = at(20.0 * MS, 0.0, 0.5 * MS, 0.0);
-        let rtt = Duration::from_millis(25);
+        let peer = at(0.0, 0.0, 8.0 * K, 0.0);
+        let rtt = of(16);
         let mut engine = CoordinateEngine::new(3);
-        for _ in 0..200 {
-            engine.update(&peer, rtt, 1);
+        let mut gap = 8.0 * K;
+        assert_eq!(engine.predict(&peer), 16.0 * K - gap);
+        for sample in 1..=25 {
+            assert!(engine.update(&peer, rtt, 1));
+            gap *= 0.75;
+            assert_eq!(engine.predict(&peer), 16.0 * K - gap, "sample {sample}");
+            // At a round of one the estimate is the sample's relative error, the gap before it.
+            assert_eq!(engine.coordinate().error, gap / 0.75 / (16.0 * K));
         }
-        let predicted = engine.predict(&peer);
-        assert!((predicted - 0.025).abs() < 1e-9, "{predicted}");
     }
 
-    /// Two fresh nodes at the origin separate along a drawn direction, each its own, and replay from
-    /// their seeds.
+    /// Two fresh nodes at the origin meet the zero vector, and each steps along its own draw of
+    /// Dabek's `u(0)` (§2.4) from its stream: an angle uniform in the plane and a height of density
+    /// `2(1 − h)`. The step is `δ·rtt` along it, `δ = c_c·w = 0.125` with both errors one, the
+    /// height floored at the resolution; bit for bit, and replayed from the seed.
     #[test]
     fn two_fresh_nodes_separate_and_replay() {
         let rtt = Duration::from_millis(4);
@@ -300,15 +326,20 @@ mod tests {
         let (a, b) = (first(1), first(2));
         assert_ne!(a.position, b.position, "different directions");
         assert_eq!(first(1), a, "replayed");
-        for coordinate in [a, b] {
-            // Moved δ = c_c·w = 0.125 of the way: the new prediction from the origin is 0.5 ms.
-            let predicted =
-                CoordinateEngine::estimate_rtt(&coordinate, &NetworkCoordinate::origin());
-            // To within the height's floor, the resolution.
-            assert!(
-                (predicted - 0.5 * MS).abs() < 2.0 * RESOLUTION,
-                "{predicted}"
+        for (seed, coordinate) in [(1, a), (2, b)] {
+            // The node's stream, drawn in the engine's order: the angle, then the height.
+            let mut stream = CoordinateEngine::new(seed);
+            let (sin, cos) = (TAU * stream.uniform()).sin_cos();
+            let height = 1.0 - (1.0 - stream.uniform()).sqrt();
+            let force = 0.125 * rtt.as_secs_f64();
+            assert_eq!(
+                coordinate.position,
+                [
+                    force * (cos * (1.0 - height)),
+                    force * (sin * (1.0 - height))
+                ]
             );
+            assert_eq!(coordinate.height, (force * height).max(RESOLUTION));
             assert!(coordinate.height > 0.0, "a height of its own");
         }
     }
@@ -355,17 +386,18 @@ mod tests {
         let b = at(-1.0, 0.0, 2.0, 1.0);
         let forward = CoordinateEngine::estimate_rtt(&a, &b);
         let backward = CoordinateEngine::estimate_rtt(&b, &a);
-        assert!((forward - backward).abs() < f64::EPSILON, "symmetric");
+        assert_eq!(forward, backward, "symmetric");
         assert!(forward >= 0.0, "never negative");
     }
 
-    /// `c_e` remembers one round: an EWMA of its weight has an `m`-sample mean's variance.
+    /// `c_e` remembers one round: an EWMA of its weight has an `m`-sample mean's variance. With
+    /// `m + 1` a power of two every operation is exact, and so is the equality.
     #[test]
     fn the_error_weight_remembers_one_round() {
         for m in [1usize, 3, 15, 255] {
             let c = error_weight(m);
             let variance = c / (2.0 - c);
-            assert!((variance - 1.0 / m as f64).abs() < 1e-15, "{m}");
+            assert_eq!(variance, 1.0 / m as f64, "{m}");
         }
         assert_eq!(error_weight(0), error_weight(1));
     }

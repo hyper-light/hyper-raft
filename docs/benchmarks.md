@@ -1793,6 +1793,34 @@ levels are a kilobyte, so that a peer's other fields stay small and together, to
 arithmetic). A configuration is about 175 ns of the 16-member period: a golden-section search of
 `detector_at`, made each time a pair's window renews.
 
+## The bounded view and the corrected engine (2026-10-03)
+
+The same workload through `crates/hyper-swim-compare`'s `one hyper` points, for `main` (`2525538`),
+the bounded view (`2711836`), the corrected engine on it (`40602db`), and the branch's head
+(`617d70a`: a death named by its incarnation, and the engine's overflow guard). Each point a fresh
+process of 400 periods, the four builds' order rotated each round, nine rounds at 16 and 64 members
+and three at 256, 2026-10-03 at 00:35–01:25 PDT, load 33.5–42.4 (other sessions; no build of mine
+running); ns a member a period, medians with the least and the most:
+
+| Members | Workload | `main` | Bounded view | With the engine | Head |
+|---|---|---|---|---|---|
+| 16 | quiet | 398 (367–757) | 436 (372–617), +9.4 % | 387 (350–494), −2.8 % | 384 (360–572), −3.5 % |
+| 16 | churning | 628 (588–668) | 686 (588–701), +9.3 % | 663 (583–1,023), +5.7 % | 638 (568–664), +1.7 % |
+| 64 | quiet | 625 (548–3,455) | 722 (534–3,397), +15.4 % | 582 (481–1,410), −6.9 % | 543 (513–3,009), −13.1 % |
+| 64 | churning | 1,118 (875–2,793) | 1,528 (900–5,463), +36.6 % | 1,231 (861–2,120), +10.0 % | 1,130 (871–2,752), +1.0 % |
+| 256 | quiet | 980 (855–1,656) | 1,167 (874–1,303), +19.0 % | 876 (853–891), −10.7 % | 933 (850–1,535), −4.8 % |
+| 256 | churning | 1,460 (1,438–1,551) | 1,468 (1,420–1,587), +0.6 % | 1,340 (1,339–1,651), −8.2 % | 1,481 (1,333–1,820), +1.4 % |
+
+Every build allocates nothing a period at every point, and `benches/allocs.rs` counts 0 allocations,
+reallocations and faults a member a period at 4 to 256 members, quiet and churning, at each commit
+(load 50–52). The bounded view's periods came out slower in every median, as in an earlier series at
+load 35.5–50.0 (+1 to +15 %): it had added 16 bytes to every peer's state, a count telling a death's
+record from one its member had left, and the period's time is in reading the peers' map (the boxing
+of the estimators above). The incarnation names a death already, so the head keeps no count, and its
+medians are 1.0 to 1.7 % over `main` churning and 3.5 to 13.1 % under it quiet, within the series'
+spread: the engine's two dimensions cost less a sample than eight, and its acknowledgement is 56
+bytes shorter, 63 gossip entries a 1,200-byte message where there were 60.
+
 ## The cluster test
 
 `tests/cluster.rs`, four member processes over hyper-datagram on loopback UDP, each run a fresh

@@ -653,3 +653,34 @@ Not a port: found when `tests/suspicion.rs`'s split test was made exact (the own
   that it was reached a picked number of times: 24 fast-track schedules by suspicion committed 185
   entries, under the eight a schedule the check had asked since R-4. "Every schedule suffered faults
   at rest" was never what it checked, nor true: seed 11 of the shell's three writes out draws none.
+
+## A campaign supersedes the requests still waiting
+
+Not a port: found moving mantle's range replica onto the durable shell (mantle's D-1,
+2026-10-03). mantle's replica held the ticks that came while a `Ready` flushed and capped them at
+the longest election timeout the core draws, after a follower whose device stalled for 100 timeouts
+replayed them as 116 vote requests at once (mantle `docs/design/replica.md` §3). Since R-4 the shell
+steps ticks into the core while its writes are out, and a follower whose device holds its writes
+through many timeouts campaigns at each, as its clock says. Its requests wait in the core's queue,
+for every message of a member that does not lead leaves with the write of the `Ready` that takes it,
+and once the device goes on every campaign's leave together: 234 requests, two for each of 117
+campaigns, after a hundred of the longest timeouts the core draws, with three writes out, measured
+on mantle's range group of three over hyper-log with one member's store answers withheld (mantle
+`crates/range/tests/group.rs`,
+`a_member_whose_writes_stay_out_through_many_timeouts_sends_one_campaign_a_write`).
+
+- **The rule** (`src/raft.rs`: `Outgoing::supersede_requests`, called by `Raft::campaign`): a
+  campaign drops the member's own vote requests, pre-vote or vote, that wait to be taken. Each asked
+  every voter, and the campaign asks each again; an answer to a campaign the member gave up can win
+  it nothing, for its votes were reset when it campaigned anew (`become_pre_candidate`,
+  `become_candidate`). Dropping a message that has not left is what the network may do to one that
+  has, so no invariant moves and the TLA+ model is unchanged.
+- **The test.** `a_campaign_supersedes_the_requests_of_those_before_it_still_waiting`: a follower
+  ticked through a hundred of the longest timeouts it draws, no `Ready` taken, holds its last
+  campaign's two pre-vote requests. Before the rule it held 400, two for each of 200 campaigns.
+- **Where it shows.** Only to an owner that leaves the core's queue untaken across campaigns, as the
+  shell does while its writes fill its store's depth: after a stall the member sends at most one
+  campaign's requests for each write it had out and its last campaign's. The raft-rs differential
+  drains every `Ready` after each operation and compares unchanged, as does every suite of this
+  crate. The cost is one walk of the queue a campaign, over what the member queued since its last
+  `Ready`; nothing is allocated.

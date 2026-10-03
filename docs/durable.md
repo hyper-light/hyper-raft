@@ -664,6 +664,12 @@ The shell runs the core's tick path as an owner's setting (`Settings::elections`
   (`Replica::set_randomized_election_timeout`), as focal-consensus's `DurableNode` does.
 - A stalled replica is not ticked: a member that cannot persist takes no part. The ticks it missed
   are never replayed, for mantle's replay of them was a defect (§10).
+- A replica whose writes are out is ticked as its owner's period comes, its core campaigning as its
+  clock says; each campaign supersedes the vote requests of the one before that have not left
+  (`crates/hyper-raft/ORIGIN.md`, "A campaign supersedes the requests still waiting"), so a member
+  whose device held its writes through many timeouts sends at most one campaign's requests for each
+  write it had out and its last campaign's when the device goes on: before the rule, mantle's range
+  group sent 234 requests after a hundred of the longest timeouts with three writes out.
 - `Replica::deadline` says nothing of ticks, which the owner's period drives.
 - It goes once the last owner elects by suspicion.
 

@@ -561,6 +561,28 @@ impl Outgoing {
         self.msgs.push(message);
         Ok(())
     }
+    /// Drops the vote requests of `id`'s own that wait, which a campaign it
+    /// begins supersedes: each asked every voter, and the campaign asks each
+    /// again, so an answer to one it gave up can win it nothing. A member
+    /// whose writes stay out through many election timeouts, its owner
+    /// ticking it, would otherwise send one campaign's requests for every
+    /// timeout once a `Ready` takes them again. Their bytes leave the
+    /// counter; the queue keeps its room.
+    fn supersede_requests(&mut self, id: NodeId) {
+        let mut dropped = 0usize;
+        self.msgs.retain(|message| {
+            let superseded = message.from == id
+                && matches!(
+                    message.msg_type,
+                    MessageType::MsgRequestVote | MessageType::MsgRequestPreVote
+                );
+            if superseded {
+                dropped = dropped.saturating_add(proto::message_bytes(message));
+            }
+            !superseded
+        });
+        self.payload = self.payload.saturating_sub(dropped);
+    }
     /// Everything queued, given up: the queue that remains holds nothing,
     /// with the room of the spare an owner gave back, if any.
     pub fn take(&mut self) -> Vec<Message> {
@@ -2174,6 +2196,9 @@ impl<S: Storage> Raft<S> {
         let (index, log_term) = (self.log.last_index()?, self.log.last_term()?);
         let (id, own_term, priority) = (self.id, self.term, self.priority_in_force);
         let Self { tracker, msgs, .. } = self;
+        // This campaign asks every voter: what an earlier one asked and has
+        // not yet left is superseded.
+        msgs.supersede_requests(id);
         let configuration = tracker.configuration();
         // Every voter of either half, once.
         for voter in configuration

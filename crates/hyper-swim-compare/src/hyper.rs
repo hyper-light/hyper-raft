@@ -2,6 +2,8 @@
 //! simulated clock, polled at the wake its detector asks, measuring the round trips it is
 //! answered in. A cluster is built and run until every pair is configured by its own estimator.
 
+use std::num::NonZeroUsize;
+
 use hyper_datagram::{LENGTH_BYTES, OVERHEAD_BYTES};
 use hyper_swim::HostId;
 use hyper_swim::codec::{Coordinate, GossipBatch, SwimMessage, gossip_capacity};
@@ -82,9 +84,13 @@ impl Buffers {
 fn cluster(members: usize) -> Vec<Member> {
     (0..members as u64)
         .map(|id| {
-            let mut detector = Detector::new(HostId(id), Exposure::new());
+            let mut detector = Detector::new(
+                HostId(id),
+                Exposure::new(),
+                NonZeroUsize::new(members).unwrap(),
+            );
             for peer in 0..members as u64 {
-                detector.join(HostId(peer));
+                detector.join(HostId(peer)).unwrap();
             }
             Member {
                 detector,
@@ -220,13 +226,15 @@ impl Cluster for Members {
         let member = (at as usize) % self.members.len();
         let detector = &mut self.members[member].detector;
         let incarnation = detector.membership().local_incarnation();
-        detector.apply(
-            HostId(member as u64),
-            MemberState {
-                liveness: Liveness::Suspect,
-                incarnation,
-            },
-        );
+        detector
+            .apply(
+                HostId(member as u64),
+                MemberState {
+                    liveness: Liveness::Suspect,
+                    incarnation,
+                },
+            )
+            .unwrap();
     }
 
     fn alive(&self) -> usize {

@@ -71,6 +71,13 @@
      fewest at least as reliable as the direct probe;
    - pings and ping-requests carry the detector's nonce, and acknowledgements are matched to it.
 
+6. **A bounded view that forgets the dead** (`docs/timing.md` §2.7, `docs/research/swim.md`).
+   slates' view, and this crate's until then, adopted every member gossip named and never forgot
+   one. The view now holds at most the members the owner's placement says this node can know
+   (`Detector::new`'s `members`) and refuses one more, typed (`membership::Full`); a dead member's
+   record is kept for SWIM's dissemination budget of this member's longest periods past its adoption
+   of the death, then forgotten with its estimator, coordinate, extensions and gossip report.
+
 ## Tests
 
 - 46 unit tests: slates' membership, gossip, codec and coordinate tests, the extension series and

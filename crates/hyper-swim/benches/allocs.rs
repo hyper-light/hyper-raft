@@ -21,6 +21,8 @@
     missing_docs
 )]
 
+use std::num::NonZeroUsize;
+
 use hyper_datagram::{LENGTH_BYTES, OVERHEAD_BYTES};
 use hyper_measure::{alloc, faults};
 use hyper_swim::HostId;
@@ -104,9 +106,13 @@ impl Buffers {
 fn cluster(members: usize) -> Vec<Member> {
     (0..members as u64)
         .map(|id| {
-            let mut detector = Detector::new(HostId(id), Exposure::new());
+            let mut detector = Detector::new(
+                HostId(id),
+                Exposure::new(),
+                NonZeroUsize::new(members).unwrap(),
+            );
             for peer in 0..members as u64 {
-                detector.join(HostId(peer));
+                detector.join(HostId(peer)).unwrap();
             }
             Member {
                 detector,
@@ -227,13 +233,15 @@ fn churn(members: &mut [Member], at: u64) {
     let member = (at as usize) % members.len();
     let detector = &mut members[member].detector;
     let incarnation = detector.membership().local_incarnation();
-    detector.apply(
-        HostId(member as u64),
-        MemberState {
-            liveness: Liveness::Suspect,
-            incarnation,
-        },
-    );
+    detector
+        .apply(
+            HostId(member as u64),
+            MemberState {
+                liveness: Liveness::Suspect,
+                incarnation,
+            },
+        )
+        .unwrap();
 }
 
 struct Cost {

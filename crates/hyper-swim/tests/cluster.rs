@@ -35,6 +35,7 @@
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, ErrorKind, Write};
 use std::net::UdpSocket;
+use std::num::NonZeroUsize;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -68,11 +69,13 @@ fn secret_between(a: u64, b: u64) -> ExporterSecret {
     ExporterSecret::new(bytes)
 }
 
-fn liveness_letter(liveness: Liveness) -> char {
+/// A peer's liveness as a member reports it; `F` for one its view has forgotten, once dead.
+fn liveness_letter(liveness: Option<Liveness>) -> char {
     match liveness {
-        Liveness::Alive => 'A',
-        Liveness::Suspect => 'S',
-        Liveness::Dead => 'D',
+        Some(Liveness::Alive) => 'A',
+        Some(Liveness::Suspect) => 'S',
+        Some(Liveness::Dead) => 'D',
+        None => 'F',
     }
 }
 
@@ -102,7 +105,9 @@ fn member_process() {
         window_limit: 1_024,
     };
     let mut plane = Plane::new(me, limits).unwrap();
-    let mut detector = Detector::new(HostId(me), Exposure::new());
+    // The cluster is the placement: every member knows the others and no more.
+    let members = NonZeroUsize::new(NODES as usize).unwrap();
+    let mut detector = Detector::new(HostId(me), Exposure::new(), members);
     for peer in (1..=NODES).filter(|peer| *peer != me) {
         let role = if me < peer {
             Role::Initiator
@@ -113,7 +118,7 @@ fn member_process() {
             .install_epoch(peer, 1, &secret_between(me, peer), role)
             .unwrap();
         plane.set_path(peer, DATAGRAM).unwrap();
-        detector.join(HostId(peer));
+        detector.join(HostId(peer)).unwrap();
     }
 
     // Ready, then wait for the supervisor's start: a member joins its peers only once they are up,
@@ -386,8 +391,11 @@ impl Member {
     fn note_deaths(&mut self) {
         let now = self.now();
         for peer in (1..=NODES).filter(|peer| *peer != self.me) {
-            let state = self.detector.membership().state(HostId(peer)).unwrap();
-            if state.liveness != Liveness::Dead || self.dead_seen.contains_key(&peer) {
+            // A peer forgotten was held dead first, and noted then.
+            let held = self.detector.membership().state(HostId(peer));
+            if held.is_none_or(|state| state.liveness != Liveness::Dead)
+                || self.dead_seen.contains_key(&peer)
+            {
                 continue;
             }
             let report = self.detector.report(HostId(peer)).unwrap_or_default();
@@ -410,7 +418,7 @@ impl Member {
     fn report(&mut self, period: u64, out: &mut impl Write) -> std::io::Result<()> {
         let mut line = format!("{} {period}", self.me);
         for peer in (1..=NODES).filter(|peer| *peer != self.me) {
-            let state = self.detector.membership().state(HostId(peer)).unwrap();
+            let state = self.detector.membership().state(HostId(peer));
             let report = self.detector.report(HostId(peer)).unwrap_or_default();
             let (after, within) = self.dead_seen.get(&peer).copied().unwrap_or_default();
             // Judged: a configured verdict times this member's probes of the peer, the pair's own
@@ -418,7 +426,7 @@ impl Member {
             let judged = self.detector.verdict(HostId(peer)).is_some();
             line.push_str(&format!(
                 " {peer}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
-                liveness_letter(state.liveness),
+                liveness_letter(state.map(|state| state.liveness)),
                 u8::from(judged),
                 u8::from(report.configured),
                 report.suspicions,
@@ -583,7 +591,7 @@ fn a_killed_member_is_declared_dead_by_every_survivor_and_no_live_one_is() {
             latest
                 .get(&member)
                 .and_then(|peers| peers.get(&VICTIM))
-                .is_some_and(|seen| seen.letter == 'D')
+                .is_some_and(|seen| matches!(seen.letter, 'D' | 'F'))
         })
     };
     while !(killed && detected(&latest)) {

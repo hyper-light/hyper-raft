@@ -476,6 +476,30 @@ membership, and the pool as many again: at most `2/PHI` slots (1.1 MB) when `T̄
 `G`. Each estimator is boxed, so the fields a period reads stay together. A period allocates nothing
 once each peer has answered once (`docs/benchmarks.md`, "hyper-swim").
 
+**The view's bound, and the dead forgotten** (`docs/research/swim.md`). The view held every member
+gossip named and never forgot one: a fleet's churn and any peer's gossip grew every member's view,
+its peers' estimators, coordinates and gossip reports without bound. Now:
+- the view holds at most the members the owner's placement says this node can know, itself
+  included (`Detector::new`'s `members`), and refuses an update about one more, typed (`Full`) and
+  counted (`Detector::refused`); every map keyed by a member holds only members the view holds;
+- a dead member's record is kept while gossip of it from before its death can still arrive, and then
+  forgotten with everything held of it. That gossip, at an incarnation at or below the death's, would
+  otherwise add the member back: probed, suspected and condemned again, and passed to members that
+  forgot it too. A report from before the death survives only at members the death has not reached,
+  one pending report a member being replaced by the death; by SWIM §4.1 the death reaches all but
+  `n^{−((2−4/n)λ−2)}` in expectation, below one, within `λ ln n` periods of its first adoption, and an
+  earlier report's own epidemic ends within as many of its start. So the record is kept the
+  dissemination budget `T` (the largest this member's reports have had) times the longest a period of
+  this member lasts, the period the detection bound uses, past this member's adoption: a peer slowed
+  by its own host is slow in this member's round trips to it too, which that period covers. What is
+  left is the expected straggler fraction: a straggler's stale update adds the member back, and this
+  member's own probes condemn it again within its bound. memberlist keeps a dead node 30 s, a chosen
+  number, and adds any node an alive message names;
+- a record past its window makes room for a newcomer at once; a member with nobody alive or suspected
+  left keeps its dead, which are the members it probes;
+- the detection bound counts the most members the view has held at once, not the members it holds:
+  a member forgotten since was in the rounds before.
+
 **What the cluster test asserts** (`crates/hyper-swim/tests/cluster.rs`, §2.5). Four member
 processes run the detector as the library configures it. The supervisor waits on facts: every member
 judging every peer by a configured verdict (the pair's own, or the pool's while the pair's estimator

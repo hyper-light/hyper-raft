@@ -14,10 +14,23 @@
 //!
 //! The merge is a pure, deterministic state machine — no clock, no I/O — so it is oracle-tested at
 //! N=1 and over a simulated exchange before any timer or datagram is involved.
+//!
+//! **The view is bounded** by the owner's placement: how many hosts this node can know, itself
+//! included ([`Membership::capacity`]). An update about a member past it is refused, typed
+//! ([`Full`]), whoever names it. A dead member's record stays until the detector forgets it
+//! ([`Membership::forget`]), once gossip of it from before its death can no longer arrive
+//! (`docs/timing.md` §2.7): a record that went earlier would let such gossip, at an incarnation at or
+//! below the death's, add the member back.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::num::NonZeroUsize;
 
 use crate::HostId;
+
+/// The view's refusal of an update about a member it does not hold: it holds its bound of
+/// members, this one included ([`Membership::capacity`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Full;
 
 /// A member's liveness in the SWIM sense. The override order **at equal incarnation** is
 /// `Alive < Suspect < Dead`: a suspicion overrides a same-incarnation alive belief, a death overrides
@@ -84,11 +97,14 @@ pub struct Membership {
     /// The members `members` holds suspected, so the detector ages them each period without
     /// scanning the membership.
     suspected: BTreeSet<HostId>,
+    /// The most members the view holds, this one included: the owner's placement.
+    capacity: NonZeroUsize,
 }
 
 impl Membership {
-    /// A view of a lone node — itself, alive, incarnation zero (the laptop degenerate).
-    pub fn new(local: HostId) -> Membership {
+    /// A view of a lone node — itself, alive, incarnation zero (the laptop degenerate) — that holds at
+    /// most `capacity` members, itself included.
+    pub fn new(local: HostId, capacity: NonZeroUsize) -> Membership {
         let mut members = BTreeMap::new();
         members.insert(
             local,
@@ -102,6 +118,7 @@ impl Membership {
             local_incarnation: 0,
             members,
             suspected: BTreeSet::new(),
+            capacity,
         }
     }
 
@@ -109,12 +126,14 @@ impl Membership {
     /// was stale (a lower incarnation, or an equal incarnation that does not override). An update about
     /// the **local** node that would suspect or declare it dead — at an incarnation the local node has
     /// reached — is refuted: the local node raises its incarnation past the suspicion and re-asserts
-    /// `Alive` (SWIM self-refutation), so a false suspicion cannot persist.
-    pub fn apply(&mut self, subject: HostId, update: MemberState) -> Option<Change> {
+    /// `Alive` (SWIM self-refutation), so a false suspicion cannot persist. An update about a member
+    /// the view does not hold, while it holds its bound, is refused.
+    pub fn apply(&mut self, subject: HostId, update: MemberState) -> Result<Option<Change>, Full> {
         if subject == self.local {
-            return self.refute(update);
+            return Ok(self.refute(update));
         }
         let overrides = match self.members.get(&subject) {
+            None if self.members.len() >= self.capacity.get() => return Err(Full),
             None => true,
             Some(current) => {
                 update.incarnation > current.incarnation
@@ -123,7 +142,7 @@ impl Membership {
             }
         };
         if !overrides {
-            return None;
+            return Ok(None);
         }
         self.members.insert(subject, update);
         if update.liveness == Liveness::Suspect {
@@ -131,10 +150,29 @@ impl Membership {
         } else {
             self.suspected.remove(&subject);
         }
-        Some(Change::Adopted {
+        Ok(Some(Change::Adopted {
             member: subject,
             state: update,
-        })
+        }))
+    }
+
+    /// Forgets `member`, held dead: the view holds it no more, and an update about it is a
+    /// newcomer's. A member alive or suspected, and this one, are never forgotten. Whether it was.
+    pub fn forget(&mut self, member: HostId) -> bool {
+        let dead = member != self.local
+            && self
+                .members
+                .get(&member)
+                .is_some_and(|state| state.liveness == Liveness::Dead);
+        if dead {
+            self.members.remove(&member);
+        }
+        dead
+    }
+
+    /// The most members the view holds, this one included.
+    pub fn capacity(&self) -> usize {
+        self.capacity.get()
     }
 
     /// Refutes a suspicion or death about the local node: if the `update` is not `Alive` and reaches the
@@ -220,23 +258,32 @@ mod tests {
         }
     }
 
+    /// A view with room for every member a test names.
+    fn view() -> Membership {
+        Membership::new(LOCAL, NonZeroUsize::new(16).unwrap())
+    }
+
     /// A never-seen member is adopted; a higher incarnation wins and a lower one is ignored.
     #[test]
     fn a_higher_incarnation_wins_and_a_lower_is_ignored() {
-        let mut view = Membership::new(LOCAL);
+        let mut view = view();
         assert_eq!(
             view.apply(PEER, state(Liveness::Alive, 5)),
-            Some(Change::Adopted {
+            Ok(Some(Change::Adopted {
                 member: PEER,
                 state: state(Liveness::Alive, 5)
-            }),
+            })),
             "a new member is adopted"
         );
         // A higher incarnation is adopted even if it is only alive-vs-alive.
-        assert!(view.apply(PEER, state(Liveness::Alive, 6)).is_some());
+        assert!(
+            view.apply(PEER, state(Liveness::Alive, 6))
+                .unwrap()
+                .is_some()
+        );
         assert_eq!(view.state(PEER).unwrap().incarnation, 6);
         // A lower incarnation is stale — ignored.
-        assert_eq!(view.apply(PEER, state(Liveness::Dead, 5)), None);
+        assert_eq!(view.apply(PEER, state(Liveness::Dead, 5)), Ok(None));
         assert_eq!(view.state(PEER).unwrap().liveness, Liveness::Alive);
     }
 
@@ -244,19 +291,23 @@ mod tests {
     /// never over a same-incarnation Suspect.
     #[test]
     fn the_override_order_holds_at_equal_incarnation() {
-        let mut view = Membership::new(LOCAL);
-        view.apply(PEER, state(Liveness::Alive, 3));
+        let mut view = view();
+        view.apply(PEER, state(Liveness::Alive, 3)).unwrap();
         assert!(
-            view.apply(PEER, state(Liveness::Suspect, 3)).is_some(),
+            view.apply(PEER, state(Liveness::Suspect, 3))
+                .unwrap()
+                .is_some(),
             "suspect overrides alive at the same incarnation"
         );
         assert_eq!(
             view.apply(PEER, state(Liveness::Alive, 3)),
-            None,
+            Ok(None),
             "alive does not override a same-incarnation suspicion"
         );
         assert!(
-            view.apply(PEER, state(Liveness::Dead, 3)).is_some(),
+            view.apply(PEER, state(Liveness::Dead, 3))
+                .unwrap()
+                .is_some(),
             "dead overrides suspect at the same incarnation"
         );
         assert_eq!(view.state(PEER).unwrap().liveness, Liveness::Dead);
@@ -266,29 +317,65 @@ mod tests {
     /// re-asserts alive, and a suspicion below its incarnation is ignored.
     #[test]
     fn the_local_node_refutes_a_suspicion_about_itself() {
-        let mut view = Membership::new(LOCAL);
+        let mut view = view();
         assert_eq!(view.local_incarnation(), 0);
         assert_eq!(
             view.apply(LOCAL, state(Liveness::Suspect, 0)),
-            Some(Change::Refuted { incarnation: 1 }),
+            Ok(Some(Change::Refuted { incarnation: 1 })),
             "a suspicion at the local incarnation is refuted with a higher one"
         );
         assert_eq!(view.state(LOCAL).unwrap(), state(Liveness::Alive, 1));
         // A stale suspicion (below the refuted incarnation) changes nothing.
-        assert_eq!(view.apply(LOCAL, state(Liveness::Suspect, 0)), None);
+        assert_eq!(view.apply(LOCAL, state(Liveness::Suspect, 0)), Ok(None));
         assert_eq!(view.local_incarnation(), 1);
     }
 
     /// The alive set reflects the merge — the local node plus alive peers, and not the dead.
     #[test]
     fn the_alive_set_reflects_the_view() {
-        let mut view = Membership::new(LOCAL);
-        view.apply(PEER, state(Liveness::Alive, 1));
-        view.apply(HostId(3), state(Liveness::Dead, 1));
+        let mut view = view();
+        view.apply(PEER, state(Liveness::Alive, 1)).unwrap();
+        view.apply(HostId(3), state(Liveness::Dead, 1)).unwrap();
         assert_eq!(
             view.alive().collect::<Vec<_>>(),
             vec![LOCAL, PEER],
             "the dead member is excluded"
         );
+    }
+
+    /// The view holds its bound and no more: an update about one more member is refused, whoever
+    /// names it, while updates about the members it holds, itself included, still apply.
+    #[test]
+    fn a_member_past_the_bound_is_refused_and_one_held_is_not() {
+        let mut view = Membership::new(LOCAL, NonZeroUsize::new(3).unwrap());
+        assert!(view.apply(PEER, state(Liveness::Alive, 0)).is_ok());
+        assert!(view.apply(HostId(3), state(Liveness::Dead, 0)).is_ok());
+        assert_eq!(view.apply(HostId(4), state(Liveness::Alive, 0)), Err(Full));
+        assert_eq!(view.apply(HostId(4), state(Liveness::Dead, 0)), Err(Full));
+        assert_eq!((view.len(), view.capacity()), (3, 3));
+        assert!(
+            view.apply(PEER, state(Liveness::Suspect, 0))
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            view.apply(LOCAL, state(Liveness::Dead, 0)),
+            Ok(Some(Change::Refuted { incarnation: 1 }))
+        );
+    }
+
+    /// Only a dead member is forgotten, never this one, and its place takes a newcomer.
+    #[test]
+    fn only_a_dead_member_is_forgotten() {
+        let mut view = Membership::new(LOCAL, NonZeroUsize::new(3).unwrap());
+        view.apply(PEER, state(Liveness::Alive, 0)).unwrap();
+        view.apply(HostId(3), state(Liveness::Dead, 2)).unwrap();
+        assert!(!view.forget(PEER), "alive");
+        assert!(!view.forget(LOCAL), "this one");
+        assert!(!view.forget(HostId(9)), "never held");
+        assert!(view.forget(HostId(3)));
+        assert_eq!(view.state(HostId(3)), None);
+        assert!(view.dead().next().is_none());
+        assert!(view.apply(HostId(4), state(Liveness::Alive, 0)).is_ok());
     }
 }

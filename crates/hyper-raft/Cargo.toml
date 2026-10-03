@@ -19,6 +19,8 @@ thiserror.workspace = true
 raft.workspace = true
 raft-proto.workspace = true
 slog.workspace = true
+# The counting allocator: what a proposal allocates at any backlog (`tests/backlog.rs`).
+hyper-measure = { path = "../hyper-measure" }
 
 [[bench]]
 name = "replicate"
@@ -37,4 +39,8 @@ harness = false
 
 [[bench]]
 name = "repair"
+harness = false
+
+[[bench]]
+name = "backlog"
 harness = false

@@ -421,6 +421,13 @@ pub struct Raft<S> {
     /// The index this member asked a snapshot to reach; zero for none.
     pub(crate) pending_request_snapshot: u64,
     pub(crate) election_elapsed: usize,
+    /// Ticks since this member last heard its leader: what its lease counts (Ongaro's thesis
+    /// §4.2.3, etcd's `inLease`: a vote is refused only within the minimum election timeout of
+    /// hearing a current leader). Apart from [`Raft::election_elapsed`], its own election timer,
+    /// which its own campaigns restart: one counter for both let a member whose campaign waited
+    /// for a change to apply keep its lease, and refuse the voter that campaigned (mantle note 32
+    /// R4; slates `docs/bugs/2026-09-29-a-yielding-voter-refused-the-voter-it-yielded-to.md`).
+    silence: usize,
     heartbeat_elapsed: usize,
     randomized_election_timeout: usize,
     /// Ticks this member waits beyond its election timeout before it
@@ -942,6 +949,7 @@ impl<S: Storage> Raft<S> {
             pending_conf_index: 0,
             pending_request_snapshot: 0,
             election_elapsed: 0,
+            silence: 0,
             heartbeat_elapsed: 0,
             randomized_election_timeout: config.election_tick,
             patience: 0,
@@ -1098,6 +1106,11 @@ impl<S: Storage> Raft<S> {
     /// Ticks since this member last heard its leader, or last campaigned.
     pub fn election_elapsed(&self) -> usize {
         self.election_elapsed
+    }
+    /// Ticks since this member last heard its leader, whatever its own timer did: what its lease
+    /// counts.
+    pub fn silence(&self) -> usize {
+        self.silence
     }
     /// The ticks this member waits, in this term, before it campaigns:
     /// drawn from `[election_tick, 2 election_tick)` by [`Config::seed`].
@@ -1533,6 +1546,7 @@ impl<S: Storage> Raft<S> {
         self.leader_id = 0;
         self.reset_randomized_election_timeout();
         self.election_elapsed = 0;
+        self.silence = 0;
         self.heartbeat_elapsed = 0;
         if let Some(watch) = self.watch.as_mut() {
             // A new role or term: the member trusts no leader until it hears
@@ -1699,6 +1713,7 @@ impl<S: Storage> Raft<S> {
     }
     fn tick_election(&mut self) -> Result<bool> {
         self.election_elapsed = self.election_elapsed.saturating_add(1);
+        self.silence = self.silence.saturating_add(1);
         if self.election_elapsed
             < self
                 .randomized_election_timeout
@@ -2417,7 +2432,7 @@ impl<S: Storage> Raft<S> {
                 None => {
                     self.config.check_quorum
                         && self.leader_id != 0
-                        && self.election_elapsed < self.config.election_tick
+                        && self.silence < self.config.election_tick
                 }
                 // While it leads, or trusts the leader it knows (Ongaro
                 // §9.6) and the request is not that leader's own. A member
@@ -3030,6 +3045,7 @@ impl<S: Storage> Raft<S> {
             }
             MessageType::MsgAppend => {
                 self.election_elapsed = 0;
+                self.silence = 0;
                 self.leader_id = message.from;
                 self.told_to_campaign = false;
                 self.followed(message.from);
@@ -3038,6 +3054,7 @@ impl<S: Storage> Raft<S> {
             }
             MessageType::MsgHeartbeat => {
                 self.election_elapsed = 0;
+                self.silence = 0;
                 self.leader_id = message.from;
                 self.told_to_campaign = false;
                 self.followed(message.from);
@@ -3046,6 +3063,7 @@ impl<S: Storage> Raft<S> {
             }
             MessageType::MsgSnapshot => {
                 self.election_elapsed = 0;
+                self.silence = 0;
                 self.leader_id = message.from;
                 self.told_to_campaign = false;
                 self.followed(message.from);

@@ -64,9 +64,11 @@ term's committed entries before its own write of them is durable.
 | `tests/differential.rs` | this core and `raft-rs` on one schedule, compared after every step, with `Ready`s copied and given in place |
 | `tests/group.rs` | groups of this core, and of both cores together, under schedules: safe whatever the schedule, and settled once the network is whole; the decisions of focal 27 §4.5 |
 | `tests/fast.rs` | the fast track: committed by the fast quorum, taken again by the leader that follows, and groups that propose by it under schedules |
+| `tests/backlog.rs` | a proposal costs its leader the same allocations at any backlog (slates' R21) |
 | `tests/pipeline.rs` | members that take `Ready`s ahead of their persistence, under schedules that interleave persistence with everything else and crash at every persistence step: held at every step to what their disks hold (`docs/durable.md` §3) |
 | `benches/replicate.rs` | what replication costs with either core |
 | `benches/pipeline.rs` | readies in flight against one at a time, on simulated devices and a simulated network |
+| `benches/backlog.rs` | slates' measurement of a proposal's cost as a leader's backlog grows |
 
 The fast track's TLA+ model is still in focal (`docs/models/FastTrack.tla`). It moves here
 with the fast-track decision (`docs/raft.md`).

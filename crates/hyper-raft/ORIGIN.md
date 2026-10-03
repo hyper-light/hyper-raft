@@ -779,3 +779,55 @@ them. slates is read at `ec5e0df` (its `main`, 2026-10-03).
 - **The divergence table.** focal 27 §4.5's table of where this core and raft-rs decide differently
   had no copy here; `docs/raft.md` §3.3 now carries it, with the ports since (F41, F42, F43), R-2's
   wire, R6's row, and the test that holds each.
+
+### R4, R5, R20 and R21: slates' tests, and a lease its member's own timer kept
+
+- **R4, a lease lapses at the minimum election timeout whatever the member's own timer does**
+  (slates `docs/bugs/2026-09-29-a-yielding-voter-refused-the-voter-it-yielded-to.md`: a voter
+  that yielded its timeout to a more central one kept its lost leader's lease until its own
+  campaign, and refused that voter; thesis §4.2.3, etcd's `inLease`). slates' test as this core
+  states priorities, `the_most_central_survivor_wins_its_first_campaign` (the outranked survivor
+  given patience past its timeout, slates' yield), passes on `main`, as does
+  `a_member_that_heard_its_leader_within_the_minimum_timeout_refuses`. Its sibling
+  `a_member_whose_campaign_waits_for_a_change_holds_no_lease` failed on `main`: a member whose
+  timeout ran out while a change it committed was not yet applied did not campaign (`Raft::hup`
+  waits for the change), but `tick_election` had restarted its one counter, which was also its
+  lease's, so it refused the voter that campaigned ("PreCandidate" where "Leader" was expected).
+  An owner whose commit fence holds a change (`RawNode::pause_apply`, R-6) makes that common at a
+  leader's loss. Cause: one counter for the member's own timer and for its silence since its
+  leader. `Raft::silence` counts the latter, reset only by its leader's messages and a new term
+  or role; the lease reads it. By suspicion the lease is the detectors' trust, which no timer
+  touches. raft-rs reads its one counter, so this is a divergence (`docs/raft.md` §3.3): the
+  differential never reaches it (its owner applies every change at once), and of the schedules'
+  500 printed lines one moved, the pipeline mix whose committed pages are 64 bytes, where a change
+  waits longest unapplied (719 → 715 entries committed in 66 terms both).
+- **R5, a member that missed its promotion still votes** (slates
+  `docs/bugs/2026-09-29-a-member-that-missed-its-promotion-refused-every-election.md`; thesis
+  §4.1: "servers process incoming RPC requests without consulting their current
+  configurations"). `a_member_that_missed_its_promotion_still_votes_for_a_candidate_that_has_it`
+  (on ticks where C never heard a leader, and where it heard B as a learner and its lease lapses at
+  the minimum election timeout; by suspicion where its lease lapses as its detectors suspect B) and
+  `a_member_outside_its_configuration_never_campaigns_and_its_vote_counts_nowhere_else` pass on
+  `main`: this core, as raft-rs and etcd, lets any member vote and counts only the candidate's own
+  voters (`Tracker::record_vote`).
+- **R20, replication against compaction, with R19's hints** (slates
+  `docs/bugs/2026-09-28-a-late-append-could-land-compacted-entries-on-a-log.md`). slates' five
+  tests pass on `main`: `a_late_append_below_a_compacted_prefix_leaves_the_log_whole` (answered
+  with the member's commit, raft-rs's rule), `an_empty_follower_is_found_in_one_refusal`,
+  `a_stale_terms_run_is_skipped_in_one_refusal` (one refusal each, the conflict hints),
+  `late_replies_never_move_progress_back`, `a_snapshot_reply_credits_what_the_follower_holds`
+  (credited 3, the member's, while the leader compacted to 4, and sent the snapshot at 4).
+- **R21, a proposal's cost at any backlog** (slates
+  `docs/bugs/2026-09-29-a-leaders-commit-rule-scanned-its-backlog.md`: 129 µs a proposal at a
+  backlog of 1,000 and 20 ms at 5,000). slates' measurement tool on this core, `benches/backlog.rs`
+  (a leader of five whose followers answer nothing, `tests/support/backlog.rs`), and the exact
+  test `tests/backlog.rs`: a thousand proposals cost the leader the same allocations,
+  reallocations and bytes at a backlog of 1,000 as at 49,000, counted by `hyper-measure`'s
+  allocator (now a dev-dependency, this repository's crate). This core's commit rule sorts the
+  voters' matches (`Tracker::quorum_index`, raft-rs's) and its configuration is the tracker's, not
+  a scan of the log; it passes on `main`.
+- **Measured** (`docs/benchmarks.md`, "slates' tests for R4, R5, R20 and R21 (R-3)"): allocations
+  identical to `main`'s on all 36 cells; slates' backlog tool on this core 160–330 ns a proposal
+  from a backlog of 1,000 to 50,000, 4 allocations and 160 bytes a proposal at every backlog (load
+  4.7–6.5; slates measured 129 µs at 1,000 and 20 ms at 5,000 before its fix, 61–102 ns after, its
+  `append_command` alone where this is the owner's whole turn).

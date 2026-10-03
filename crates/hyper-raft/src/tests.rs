@@ -2067,3 +2067,639 @@ fn survivors_whose_timeouts_collide_elect_at_the_first_round_their_draws_differ(
     }
     assert!(splits >= 1, "the forced round split");
 }
+
+// slates' regression tests for leases (mantle note 32 §2.13, R4; slates
+// `docs/bugs/2026-09-29-a-yielding-voter-refused-the-voter-it-yielded-to.md`). slates cleared a
+// follower's belief in its leader only at its own campaign, so a voter that yielded its timeout to a
+// more central one kept its lease and refused the very voter it yielded to. The thesis's rule
+// (§4.2.3, etcd's `inLease`): a member refuses a vote only within the minimum election timeout of
+// hearing from a current leader, whatever its own timer does.
+
+/// Steps every member in `up` one tick, and then lets them hear each other at once; the members
+/// that campaigned in it.
+fn tick_all(nodes: &mut [RawNode<Memory>], up: &[u64]) -> Vec<u64> {
+    let mut campaigned = Vec::new();
+    for id in up {
+        let node = &mut nodes[*id as usize - 1];
+        let before = node.raft.state();
+        node.tick().unwrap();
+        let after = node.raft.state();
+        if before == StateRole::Follower && after != StateRole::Follower {
+            campaigned.push(*id);
+        }
+    }
+    exchange(nodes, up);
+    campaigned
+}
+/// Three voters led by 1 in term 1, every member holding its log; then 1 is gone.
+fn led_three(priorities: [i64; 3]) -> Vec<RawNode<Memory>> {
+    let mut nodes: Vec<RawNode<Memory>> = (1..=3)
+        .map(|id| {
+            let config = Config {
+                priority: priorities[id as usize - 1],
+                ..config(id)
+            };
+            RawNode::new(&config, Memory::with_voters(&[1, 2, 3])).unwrap()
+        })
+        .collect();
+    nodes[0].campaign().unwrap();
+    exchange(&mut nodes, &[1, 2, 3]);
+    assert_eq!(nodes[0].raft.state(), StateRole::Leader);
+    nodes[0].propose(vec![], b"entry".to_vec()).unwrap();
+    exchange(&mut nodes, &[1, 2, 3]);
+    // The leader's heartbeat carries its commit to both, the last they hear of it.
+    nodes[0].ping().unwrap();
+    exchange(&mut nodes, &[1, 2, 3]);
+    for id in [2usize, 3] {
+        assert_eq!(nodes[id - 1].raft.election_elapsed(), 0);
+        assert_eq!(nodes[id - 1].raft.leader_id(), 1);
+    }
+    nodes
+}
+
+/// slates' `the_most_central_survivor_wins_its_first_campaign`, as this core states priorities: the
+/// leader is lost; the survivor it outranks would time out first, but its owner gives it patience
+/// past its timeout (slates' yield: one timeout per voter that outranks it), and the most central
+/// survivor campaigns at its own. The yielding voter has not heard a leader for the minimum election
+/// timeout, so it grants the pre-vote and the vote, and the most central survivor leads at its first
+/// campaign, the only campaign of the group. Before slates' fix the central survivor was refused at
+/// its first two campaigns and the outranked one led.
+#[test]
+fn the_most_central_survivor_wins_its_first_campaign() {
+    let mut nodes = led_three([0, 2, 1]);
+    let election = nodes[1].raft.config().election_tick;
+    nodes[1]
+        .raft
+        .set_randomized_election_timeout(2 * election - 1)
+        .unwrap();
+    nodes[2]
+        .raft
+        .set_randomized_election_timeout(election)
+        .unwrap();
+    nodes[2].raft.set_patience(2 * election);
+    let mut campaigns = Vec::new();
+    for tick in 1..=4 * election {
+        campaigns.extend(
+            tick_all(&mut nodes, &[2, 3])
+                .into_iter()
+                .map(|id| (tick, id)),
+        );
+        if nodes[1].raft.state() == StateRole::Leader {
+            break;
+        }
+    }
+    assert_eq!(nodes[1].raft.state(), StateRole::Leader, "{campaigns:?}");
+    assert_eq!(campaigns, vec![(2 * election - 1, 2)]);
+}
+
+/// A member whose timeout runs out while a change it committed is not yet applied does not campaign
+/// on the configuration before it (`Raft::hup`), and it has not heard its leader for an election
+/// timeout: it holds no lease, and grants a voter that campaigns. An owner whose commit fence holds
+/// the change (`RawNode::pause_apply`, `docs/durable.md` §4.1) makes this common at a leader's loss.
+#[test]
+fn a_member_whose_campaign_waits_for_a_change_holds_no_lease() {
+    let mut nodes = led_three([0, 0, 0]);
+    let election = nodes[1].raft.config().election_tick;
+    // Member 3's owner holds what it is given to apply; a change is committed everywhere.
+    nodes[2].pause_apply();
+    let change = ConfChangeV2 {
+        changes: vec![ConfChangeSingle {
+            change_type: crate::proto::ConfChangeType::AddLearnerNode,
+            node_id: 4,
+        }],
+        ..Default::default()
+    };
+    nodes[0].propose_conf_change(vec![], &change).unwrap();
+    exchange(&mut nodes, &[1, 2, 3]);
+    nodes[0].ping().unwrap();
+    exchange(&mut nodes, &[1, 2, 3]);
+    let committed = nodes[0].raft.log().committed();
+    assert_eq!(nodes[2].raft.log().committed(), committed);
+    assert!(nodes[2].raft.log().applied() < committed);
+    // 1 is gone. 3 runs out first and waits for the change; 2 runs out later and campaigns.
+    nodes[2]
+        .raft
+        .set_randomized_election_timeout(election)
+        .unwrap();
+    nodes[1]
+        .raft
+        .set_randomized_election_timeout(election + election / 2)
+        .unwrap();
+    let mut campaigns = Vec::new();
+    for tick in 1..=2 * election {
+        campaigns.extend(
+            tick_all(&mut nodes, &[2, 3])
+                .into_iter()
+                .map(|id| (tick, id)),
+        );
+        if nodes[1].raft.state() == StateRole::Leader {
+            break;
+        }
+    }
+    assert_eq!(nodes[2].raft.state(), StateRole::Follower);
+    assert_eq!(nodes[1].raft.state(), StateRole::Leader, "{campaigns:?}");
+    assert_eq!(campaigns, vec![(election + election / 2, 2)]);
+}
+
+/// The lease still holds where the thesis says it does: a member that heard its leader within the
+/// minimum election timeout refuses a pre-vote (Ongaro §4.2.3, §9.6), whatever its own timer drew.
+#[test]
+fn a_member_that_heard_its_leader_within_the_minimum_timeout_refuses() {
+    let mut nodes = led_three([0, 0, 0]);
+    let election = nodes[1].raft.config().election_tick;
+    nodes[2]
+        .raft
+        .set_randomized_election_timeout(2 * election - 1)
+        .unwrap();
+    for _ in 0..election - 1 {
+        nodes[2].tick().unwrap();
+    }
+    // 2 is told to campaign by its owner one tick inside 3's lease.
+    nodes[1].campaign().unwrap();
+    exchange(&mut nodes, &[2, 3]);
+    assert_eq!(nodes[2].raft.state(), StateRole::Follower);
+    assert_eq!(nodes[2].raft.term(), 1);
+    assert_ne!(nodes[1].raft.state(), StateRole::Leader);
+}
+
+// slates' regression tests for votes across a change (mantle note 32 §2.13, R5; slates
+// `docs/bugs/2026-09-29-a-member-that-missed-its-promotion-refused-every-election.md`). slates'
+// member refused a vote when its own configuration did not name it a voter, and kept the lease of a
+// leader it heard as a learner for good; a member promoted by entries committed without it then
+// refused every election of the voter that held the promotion. Thesis §4.1: "servers process
+// incoming RPC requests without consulting their current configurations"; the candidate's
+// configuration decides whether a vote counts.
+
+/// Persists and applies what there is, as `drain` does, applying every committed change of the
+/// configuration as its owner would; the messages.
+fn drain_applying(node: &mut RawNode<Memory>) -> Vec<Message> {
+    use crate::wire::Record;
+    let mut messages = Vec::new();
+    while node.has_ready() {
+        let mut ready: Ready = node.ready().unwrap();
+        let entries = ready.entries().to_vec();
+        node.store_mut().append(&entries);
+        if let Some(hard) = ready.hard_state() {
+            let hard = *hard;
+            node.store_mut().hard_state = hard;
+        }
+        messages.extend(ready.take_messages());
+        messages.extend(ready.take_persisted_messages());
+        let mut committed = ready.take_committed_entries();
+        let mut light = node.advance_append(ready).unwrap();
+        messages.extend(light.take_messages());
+        committed.extend(light.take_committed_entries());
+        for entry in &committed {
+            if entry.entry_type == EntryType::EntryConfChangeV2 {
+                let change = if entry.data.is_empty() {
+                    ConfChangeV2::default()
+                } else {
+                    ConfChangeV2::decode(&entry.data).unwrap()
+                };
+                let state = node.apply_conf_change(&change).unwrap();
+                node.store_mut().configuration = state;
+            }
+        }
+        if let Some(last) = committed.last() {
+            node.advance_apply_to(last.index).unwrap();
+        }
+    }
+    messages
+}
+/// As `exchange`, applying every committed change.
+fn exchange_applying(nodes: &mut [RawNode<Memory>], up: &[u64]) {
+    for _ in 0..1_000 {
+        let mut said = Vec::new();
+        for id in up {
+            said.extend(drain_applying(&mut nodes[*id as usize - 1]));
+        }
+        if said.is_empty() {
+            return;
+        }
+        for message in said {
+            if up.contains(&message.to) {
+                let _ = nodes[message.to as usize - 1].step(message);
+            }
+        }
+    }
+    panic!("the members never fell quiet");
+}
+
+/// slates' `a_member_that_missed_its_promotion_still_votes_for_a_candidate_that_has_it`: B leads
+/// {A, B} and moves the group to {A, B, C} through the joint and final configurations, each
+/// committed with A's acknowledgement alone; C, which knows only {A, B} and so is no voter by its own
+/// configuration, hears none of it. B is lost and A campaigns: C grants the pre-vote and the vote,
+/// and A, whose configuration names C a voter, leads by it. On ticks where C never heard a leader,
+/// and where it heard B as a learner and its lease lapses at the minimum election timeout; by
+/// suspicion where it heard B as a learner and its lease lapses when its detectors suspect B.
+#[test]
+fn a_member_that_missed_its_promotion_still_votes_for_a_candidate_that_has_it() {
+    let timing = crate::Timing {
+        span: std::time::Duration::from_millis(10),
+        round: std::time::Duration::from_millis(2),
+    };
+    for (heard_as_learner, suspicion) in [(false, false), (true, false), (true, true)] {
+        let (a, b, c) = (1u64, 2u64, 3u64);
+        let mut nodes: Vec<RawNode<Memory>> = (1..=3)
+            .map(|id| {
+                let mut store = Memory::with_voters(&[a, b]);
+                if heard_as_learner {
+                    store.configuration.learners = vec![c];
+                }
+                let elections = if suspicion {
+                    crate::Elections::Suspicion
+                } else {
+                    crate::Elections::Ticks
+                };
+                let mut node = RawNode::new(
+                    &Config {
+                        elections,
+                        ..config(id)
+                    },
+                    store,
+                )
+                .unwrap();
+                if suspicion {
+                    node.set_timing(timing).unwrap();
+                }
+                node
+            })
+            .collect();
+        nodes[b as usize - 1].campaign().unwrap();
+        let first = if heard_as_learner {
+            vec![a, b, c]
+        } else {
+            vec![a, b]
+        };
+        exchange_applying(&mut nodes, &first);
+        assert_eq!(nodes[b as usize - 1].raft.state(), StateRole::Leader);
+        if heard_as_learner {
+            assert_eq!(nodes[c as usize - 1].raft.leader_id(), b);
+        }
+        // The joint change and the one that leaves it, committed with A alone.
+        let promote = ConfChangeV2 {
+            transition: crate::proto::ConfChangeTransition::Explicit,
+            changes: vec![ConfChangeSingle {
+                change_type: crate::proto::ConfChangeType::AddNode,
+                node_id: c,
+            }],
+            ..Default::default()
+        };
+        nodes[b as usize - 1]
+            .propose_conf_change(vec![], &promote)
+            .unwrap();
+        exchange_applying(&mut nodes, &[a, b]);
+        nodes[b as usize - 1]
+            .propose_conf_change(vec![], &ConfChangeV2::default())
+            .unwrap();
+        exchange_applying(&mut nodes, &[a, b]);
+        nodes[b as usize - 1].ping().unwrap();
+        exchange_applying(&mut nodes, &[a, b]);
+        let configuration = nodes[a as usize - 1].raft.configuration();
+        assert!(configuration.votes(c) && !configuration.is_joint());
+        assert!(!nodes[c as usize - 1].raft.configuration().votes(c));
+        // B is lost. A's and C's leases of it lapse; A campaigns.
+        if suspicion {
+            for id in [a, c] {
+                nodes[id as usize - 1].suspect(b).unwrap();
+                drain_applying(&mut nodes[id as usize - 1]);
+            }
+        } else {
+            let election = nodes[a as usize - 1].raft.config().election_tick;
+            for _ in 0..election {
+                for id in [a, c] {
+                    nodes[id as usize - 1].tick().unwrap();
+                    drain_applying(&mut nodes[id as usize - 1]);
+                }
+            }
+        }
+        nodes[a as usize - 1].campaign().unwrap();
+        exchange_applying(&mut nodes, &[a, c]);
+        assert_eq!(
+            nodes[a as usize - 1].raft.state(),
+            StateRole::Leader,
+            "heard as a learner: {heard_as_learner}, by suspicion: {suspicion}"
+        );
+        assert_eq!(nodes[c as usize - 1].raft.vote(), a);
+    }
+}
+
+/// slates' `a_member_outside_its_configuration_never_campaigns_and_its_vote_counts_nowhere_else`: a
+/// member its configuration does not name never campaigns, on its timer or asked; it answers a vote
+/// request as any server does, and the candidate, whose configuration does not name it either,
+/// counts its grant toward nothing: it still needs a voter of its own.
+#[test]
+fn a_member_outside_its_configuration_never_campaigns_and_its_vote_counts_nowhere_else() {
+    let mut nodes: Vec<RawNode<Memory>> = (1..=4)
+        .map(|id| RawNode::new(&config(id), Memory::with_voters(&[1, 2, 3])).unwrap())
+        .collect();
+    let stranger = 4usize;
+    assert_eq!(nodes[stranger - 1].campaign(), Err(Error::NotPromotable));
+    for _ in 0..4 * nodes[stranger - 1].raft.config().election_tick {
+        nodes[stranger - 1].tick().unwrap();
+    }
+    assert_eq!(nodes[stranger - 1].raft.state(), StateRole::Follower);
+    assert!(drain(&mut nodes[stranger - 1]).is_empty());
+    // 1 asks 4 alone, which grants; 1 is not elected by it.
+    nodes[0].campaign().unwrap();
+    let mut asked = drain(&mut nodes[0])
+        .into_iter()
+        .find(|message| message.msg_type == MessageType::MsgRequestPreVote)
+        .unwrap();
+    asked.to = 4;
+    nodes[stranger - 1].step(asked).unwrap();
+    let answers = drain(&mut nodes[stranger - 1]);
+    assert_eq!(answers.len(), 1);
+    assert!(!answers[0].reject, "it answers as any server does");
+    for answer in answers {
+        let _ = nodes[0].step(answer);
+    }
+    assert_eq!(nodes[0].raft.state(), StateRole::PreCandidate);
+    assert_eq!(
+        nodes[0].raft.term(),
+        0,
+        "a grant from outside counts for nothing"
+    );
+}
+
+// slates' regression tests for replication against compaction (mantle note 32 §2.13, R20, with
+// R19's conflict hints; slates `docs/bugs/2026-09-28-a-late-append-could-land-compacted-entries-on-a-log.md`).
+// slates' follower appended a late append's entries below its snapshot at the end of its log, backed
+// up one entry a refusal, let late replies move progress back, and credited a snapshot's recipient
+// with the leader's own later snapshot.
+
+/// A member at `term` whose log holds entries of the terms `terms` from index 1, and voters 1 to 3.
+fn holding(id: u64, term: u64, terms: &[u64]) -> RawNode<Memory> {
+    let mut store = Memory::with_voters(&[1, 2, 3]);
+    let entries: Vec<Entry> = terms
+        .iter()
+        .enumerate()
+        .map(|(at, term)| entry(at as u64 + 1, *term))
+        .collect();
+    store.append(&entries);
+    store.hard_state = HardState {
+        term,
+        vote: 0,
+        commit: 0,
+    };
+    RawNode::new(&config(id), store).unwrap()
+}
+/// Member 1 holding `terms`, elected by member 3's vote alone, its first entry appended.
+fn elected_holding(term: u64, terms: &[u64]) -> RawNode<Memory> {
+    let mut leader = holding(1, term, terms);
+    leader.campaign().unwrap();
+    drain(&mut leader);
+    leader
+        .step(answer(
+            MessageType::MsgRequestPreVoteResponse,
+            3,
+            1,
+            term + 1,
+        ))
+        .unwrap();
+    drain(&mut leader);
+    leader
+        .step(answer(MessageType::MsgRequestVoteResponse, 3, 1, term + 1))
+        .unwrap();
+    assert_eq!(leader.raft.state(), StateRole::Leader);
+    leader
+}
+/// What the leader sends `to` now; if nothing, what a beat of its clock sends (a member whose probe
+/// went unanswered is probed again once a beat has passed, `HeartbeatAnswers::Position`).
+fn sent_to(leader: &mut RawNode<Memory>, to: u64) -> Vec<Message> {
+    let sent: Vec<Message> = drain(leader)
+        .into_iter()
+        .filter(|message| message.to == to)
+        .collect();
+    if !sent.is_empty() {
+        return sent;
+    }
+    for _ in 0..leader.raft.config().heartbeat_tick {
+        leader.tick().unwrap();
+    }
+    drain(leader)
+        .into_iter()
+        .filter(|message| message.to == to)
+        .collect()
+}
+/// The leader's messages to `to` and `to`'s answers, back and forth until it accepts an append;
+/// the refusals it took on the way. Bounded by the leader's log.
+fn refusals_until_accepted(leader: &mut RawNode<Memory>, follower: &mut RawNode<Memory>) -> u64 {
+    let to = follower.raft.id();
+    let mut refusals = 0;
+    let mut sent = sent_to(leader, to);
+    for _ in 0..=leader.raft.log().last_index().unwrap() {
+        for message in sent.drain(..) {
+            follower.step(message).unwrap();
+        }
+        let answers = drain(follower);
+        let refused = answers
+            .iter()
+            .filter(|answer| answer.msg_type == MessageType::MsgAppendResponse && answer.reject)
+            .count();
+        let accepted = answers
+            .iter()
+            .any(|answer| answer.msg_type == MessageType::MsgAppendResponse && !answer.reject);
+        refusals += refused as u64;
+        for answer in answers {
+            leader.step(answer).unwrap();
+        }
+        if accepted {
+            return refusals;
+        }
+        sent = sent_to(leader, to);
+    }
+    panic!("never accepted");
+}
+/// The leader and `follower` exchange messages until the follower holds the leader's log and its
+/// commit; every append that carried entries to it, in order. Bounded by the leader's log: a round
+/// for each entry, and four more for a probe, its refusal, the commit and a beat.
+fn caught_up(leader: &mut RawNode<Memory>, follower: &mut RawNode<Memory>) -> Vec<Message> {
+    let to = follower.raft.id();
+    let mut carried = Vec::new();
+    for _ in 0..=leader.raft.log().last_index().unwrap() + 4 {
+        let done = follower.raft.log().last_index().unwrap()
+            == leader.raft.log().last_index().unwrap()
+            && follower.raft.log().committed() == leader.raft.log().committed();
+        if done {
+            return carried;
+        }
+        for message in sent_to(leader, to) {
+            if message.msg_type == MessageType::MsgAppend && !message.entries.is_empty() {
+                carried.push(message.clone());
+            }
+            follower.step(message).unwrap();
+        }
+        for answer in drain(follower) {
+            leader.step(answer).unwrap();
+        }
+    }
+    panic!("never caught up");
+}
+
+/// slates' `a_late_append_below_a_compacted_prefix_leaves_the_log_whole`: a late copy of an append
+/// anchored below a follower's commit, after the follower compacted past its anchor, leaves the log
+/// exactly as it was, and is answered with the follower's commit: every committed entry is the
+/// same on every member. slates' follower pushed the compacted entries onto its log's end.
+#[test]
+fn a_late_append_below_a_compacted_prefix_leaves_the_log_whole() {
+    let mut leader = leader();
+    for value in 0..5u8 {
+        leader.propose(vec![], vec![value]).unwrap();
+    }
+    let mut follower = RawNode::new(&config(2), Memory::with_voters(&[1, 2, 3])).unwrap();
+    // The first append that carried entries to 2: its late copy comes after all the rest.
+    let late = caught_up(&mut leader, &mut follower).remove(0);
+    let last = leader.raft.log().last_index().unwrap();
+    assert_eq!(follower.raft.log().committed(), last);
+    // The follower compacts past the late copy's anchor.
+    follower.store_mut().compact(last - 2, b"state".to_vec());
+    let follower_config = config(2);
+    let store = std::mem::take(follower.store_mut());
+    let mut follower = RawNode::new(&follower_config, store).unwrap();
+    let before = (
+        follower.raft.log().first_index().unwrap(),
+        follower.raft.log().last_index().unwrap(),
+        follower.raft.hard_state(),
+    );
+    assert!(late.index < before.0);
+    follower.step(late).unwrap();
+    let answers = drain(&mut follower);
+    assert_eq!(answers.len(), 1);
+    assert!(!answers[0].reject);
+    assert_eq!(
+        answers[0].index, last,
+        "it matches the leader through its commit"
+    );
+    let after = (
+        follower.raft.log().first_index().unwrap(),
+        follower.raft.log().last_index().unwrap(),
+        follower.raft.hard_state(),
+    );
+    assert_eq!(after, before, "the log is exactly as it was");
+}
+
+/// slates' `an_empty_follower_is_found_in_one_refusal` (thesis §4.2.1, Raft §5.3): a follower whose
+/// log does not reach the leader's previous index says where its log ends, and the leader backs up
+/// to it in one round trip: an empty follower behind twenty entries costs one refusal, not twenty.
+#[test]
+fn an_empty_follower_is_found_in_one_refusal() {
+    let mut leader = elected_holding(1, &[1; 20]);
+    let mut follower = RawNode::new(&config(2), Memory::with_voters(&[1, 2, 3])).unwrap();
+    follower
+        .step(answer(MessageType::MsgHeartbeat, 1, 2, 2))
+        .unwrap();
+    drain(&mut follower);
+    assert_eq!(refusals_until_accepted(&mut leader, &mut follower), 1);
+    assert_eq!(follower.raft.log().last_index().unwrap(), 21);
+}
+
+/// slates' `a_stale_terms_run_is_skipped_in_one_refusal` (Raft §5.3): a follower holding a run of a
+/// stale term names the term and where it may still agree, so the leader skips the whole run in one
+/// round trip: eight diverged entries cost one refusal, not eight, and the follower's log ends as
+/// the leader's.
+#[test]
+fn a_stale_terms_run_is_skipped_in_one_refusal() {
+    let mut leader = elected_holding(3, &[1, 1, 3, 3, 3, 3, 3, 3, 3, 3]);
+    let mut follower = holding(2, 2, &[1, 1, 2, 2, 2, 2, 2, 2, 2, 2]);
+    assert_eq!(refusals_until_accepted(&mut leader, &mut follower), 1);
+    assert_eq!(
+        crate::raft::held(&follower.raft),
+        crate::raft::held(&leader.raft)
+    );
+}
+
+/// slates' `late_replies_never_move_progress_back` (thesis §3.5): after a follower matched through
+/// ten, a late success through four and a late refusal hinting at the log's start leave its progress
+/// where it was, and the next append to it is anchored at ten.
+#[test]
+fn late_replies_never_move_progress_back() {
+    let mut leader = leader();
+    for value in 0..9u8 {
+        leader.propose(vec![], vec![value]).unwrap();
+    }
+    let mut follower = RawNode::new(&config(2), Memory::with_voters(&[1, 2, 3])).unwrap();
+    caught_up(&mut leader, &mut follower);
+    let progress = |leader: &RawNode<Memory>| {
+        let progress = leader.raft.tracker().get(2).unwrap();
+        (progress.matched, progress.next_index)
+    };
+    assert_eq!(progress(&leader), (10, 11));
+    let mut late = answer(MessageType::MsgAppendResponse, 2, 1, 1);
+    late.index = 4;
+    leader.step(late).unwrap();
+    let mut refused = answer(MessageType::MsgAppendResponse, 2, 1, 1);
+    refused.index = 3;
+    refused.reject = true;
+    refused.reject_hint = 0;
+    leader.step(refused).unwrap();
+    assert_eq!(progress(&leader), (10, 11));
+    drain(&mut leader);
+    leader.propose(vec![], b"next".to_vec()).unwrap();
+    let next = drain(&mut leader)
+        .into_iter()
+        .find(|message| message.to == 2 && message.msg_type == MessageType::MsgAppend)
+        .unwrap();
+    assert_eq!(next.index, 10);
+}
+
+/// slates' `a_snapshot_reply_credits_what_the_follower_holds`: the leader credits a snapshot's
+/// recipient with what the recipient says it holds, never with the leader's own snapshot when the
+/// answer arrives. A leader that compacted further while the snapshot was on its way owes the
+/// follower the newer one, and sends it.
+#[test]
+fn a_snapshot_reply_credits_what_the_follower_holds() {
+    let mut leader = leader();
+    for value in 0..3u8 {
+        leader.propose(vec![], vec![value]).unwrap();
+    }
+    let mut b = RawNode::new(&config(2), Memory::with_voters(&[1, 2, 3])).unwrap();
+    caught_up(&mut leader, &mut b);
+    assert_eq!(leader.raft.log().committed(), 4);
+    drain(&mut leader);
+    // The leader compacts through 3; C is empty, and is probed into needing the snapshot.
+    leader.store_mut().compact(3, b"state-3".to_vec());
+    let mut c = RawNode::new(&config(3), Memory::with_voters(&[1, 2, 3])).unwrap();
+    leader.ping().unwrap();
+    let mut snapshot = None;
+    for _ in 0..8 {
+        for message in drain(&mut leader) {
+            if message.to != 3 {
+                continue;
+            }
+            if message.msg_type == MessageType::MsgSnapshot {
+                snapshot = Some(message);
+            } else {
+                c.step(message).unwrap();
+            }
+        }
+        if snapshot.is_some() {
+            break;
+        }
+        for answer in drain(&mut c) {
+            leader.step(answer).unwrap();
+        }
+    }
+    let snapshot = snapshot.expect("C was sent the snapshot");
+    assert_eq!(
+        proto::snapshot_index(snapshot.snapshot.as_ref().unwrap()),
+        3
+    );
+    c.step(snapshot).unwrap();
+    let answers = drain(&mut c);
+    let answer = answers
+        .iter()
+        .find(|answer| answer.msg_type == MessageType::MsgAppendResponse)
+        .unwrap()
+        .clone();
+    assert_eq!(answer.index, 3);
+    // Meanwhile the leader compacts through 4.
+    leader.store_mut().compact(4, b"state-4".to_vec());
+    leader.step(answer).unwrap();
+    assert_eq!(leader.raft.tracker().get(3).unwrap().matched, 3);
+    let again = drain(&mut leader)
+        .into_iter()
+        .find(|message| message.to == 3 && message.msg_type == MessageType::MsgSnapshot)
+        .expect("C holds only through 3, below the leader's snapshot at 4");
+    assert_eq!(proto::snapshot_index(again.snapshot.as_ref().unwrap()), 4);
+}

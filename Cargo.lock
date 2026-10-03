@@ -740,6 +740,7 @@ name = "hyper-raft"
 version = "0.1.0"
 dependencies = [
  "crc32c",
+ "hyper-measure",
  "hyper-timing",
  "raft",
  "raft-proto",

@@ -854,6 +854,36 @@ away. Asking them only where `Watch::due` finds a campaign armed, and in `wake_f
 one is due, leaves the scan at three timer reads a member: a sixth of `main`'s instructions. The
 answers are the same wherever they are used, so every schedule decides as on `main` (above).
 
+## slates' tests for R4, R5, R20 and R21 (R-3)
+
+Core step R-3's second commit (`crates/hyper-raft/ORIGIN.md`, "R-3"). Measured on 2026-10-03 on the
+machine above. It adds a counter a follower ticks (`Raft::silence`) and the tests.
+
+**Allocations**: identical to `main`'s on all 36 cells (as R6 and R7's, above).
+
+**The schedules**: of the 500 lines the suites print at their default seeds, one moved: the
+pipeline mix whose committed pages are 64 bytes (`focal, three writes out, narrow`), where a change
+waits longest unapplied and so a deferred campaign keeps a lease longest under raft-rs's counter: 719
+→ 715 entries committed, in 66 terms both. Every other line is `main`'s.
+
+**A proposal's cost at any backlog** (slates' measurement tool on this core, `cargo bench -p
+hyper-raft --bench backlog -- 50000`, `benches/backlog.rs`): a leader of five whose followers
+answer nothing, each proposal taken and written out as an owner does and its messages dropped; three
+runs, load 4.7–6.5:
+
+| Backlog | this core, ns a proposal (three runs) | allocations, reallocations, bytes a proposal | slates before its fix | slates after |
+|---|---|---|---|---|
+| 1,000 | 260 / 329 / 247 | 4.00, 0.00, 160 | 129 µs | 102 ns |
+| 5,000 | 229 / 293 / 228 | 4.00, 0.00, 160 | 20.0 ms | 96 ns |
+| 10,000 | 264 / 222 / 216 | 4.00, 0.00, 160 | not reached | 61–67 ns |
+| 50,000 | 170 / 258 / 206 | 4.00, 0.00, 160 | not reached | 61–67 ns |
+
+Flat, as slates' fix made its own: this core's commit rule sorts the voters' matches and its
+configuration is its tracker's. Its figure is the owner's whole turn (the proposal, the `Ready`, the
+write to the harness's memory, `advance_append`) where slates' is `append_command` alone, so the two
+compare in shape, not in nanoseconds. The allocations are counted exactly (`tests/backlog.rs` holds
+them equal at backlogs of 1,000 and 49,000).
+
 ## Where hyper-raft does not win, and why
 
 hyper-raft in place allocates less than every other core in every row. It is faster than raft-rs
@@ -1160,6 +1190,9 @@ HYPER_RAFT_SEEDS=1000 HYPER_RAFT_STEPS=4000 HYPER_RAFT_CRASH_SEEDS=40 cargo test
 $B one hyper steady 3 1 64 20000 1 count
 cargo test -p hyper-raft --test differential --test group --test fast --test pipeline --test repair --test suspicion -- --nocapture --test-threads=1
 /usr/bin/time -l target/release/deps/idle-<hash> suspicion 10000 400
+
+# slates' tests for R4, R5, R20 and R21 (R-3): as above, and slates' backlog tool on this core.
+cargo bench -p hyper-raft --bench backlog -- 50000
 
 # The end-to-end scenarios, and every gate.
 cargo test -p hyper-raft-e2e --test cluster

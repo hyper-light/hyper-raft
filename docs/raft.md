@@ -27,8 +27,9 @@
 > Timing step L-2 is done (2026-10-02): elections started by the owner's failure detectors, not by
 > ticks (`Config::elections`, `docs/timing.md` §2.9).
 >
-> Step R-3 is under way (2026-10-03, §3.2): slates' regression tests for R6 and R7 pass, and three
-> defects at the end of what a member counts, which their siblings found, are fixed.
+> Step R-3 is under way (2026-10-03, §3.2): slates' regression tests for R6, R7, R4, R5, R20 and
+> R21 pass; three defects at the end of what a member counts and a lease kept by a member's own
+> timer, which their siblings found, are fixed.
 
 ## 1. What `hyper-raft` is
 
@@ -245,6 +246,30 @@ stream at every reset (`Config::seed`); by suspicion every arming draws anew fro
 (`Watch::draw`). Two members that drew alike draw apart at their next campaign, whatever their
 seeds: slates' `(id + attempt) mod span` kept members congruent modulo the span together for good.
 
+**A lease lapses at the minimum election timeout (R4).** A member refuses a vote only within the
+minimum election timeout of hearing its leader (thesis §4.2.3, etcd's `inLease`), whatever its own
+timer does: a member that waits past its timeout (its owner's patience, slates' yield to a more
+central voter) or whose campaign waits for a committed change to apply (`Raft::hup`; an owner's
+commit fence makes that common at a leader's loss) grants the voter that campaigns. On ticks the
+lease reads `Raft::silence`, the ticks since the member last heard its leader, apart from its own
+election timer, which its campaigns restart; one counter for both kept such a member's lease alive.
+By suspicion the lease is the detectors' trust in the leader, which no timer touches.
+
+**Votes across a change (R5).** A member votes without consulting its own configuration (thesis
+§4.1): one that missed its promotion grants the candidate whose configuration names it, and a
+candidate counts only its own voters' grants (`Tracker::record_vote`). A learner's lease lapses as
+a voter's does.
+
+**Replication against compaction (R20, with R19's hints).** An append anchored below a member's
+commit is answered with the commit and changes nothing (raft-rs's rule); a refusal carries the
+conflict hint of §5.3, so an empty member or a stale term's run costs one refusal; progress never
+moves back on a late answer; a snapshot's recipient is credited with what it says it holds.
+
+**A proposal's cost at any backlog (R21).** The commit rule sorts the voters' matches
+(`Tracker::quorum_index`) and the configuration is the tracker's, never a scan of the log: a
+proposal costs a leader the same allocations at any backlog (`tests/backlog.rs`), and its time is
+flat (`benches/backlog.rs`, `docs/benchmarks.md`).
+
 ### 3.3 Where this core and raft-rs differ
 
 `tests/differential.rs` runs this core and raft-rs on one schedule and compares them field by field
@@ -268,6 +293,7 @@ table for focal-raft; it lives here since the core moved (R-1), with every decis
 | A round of heartbeats for each read as it is asked, and again as it is asked again | One round when the member is next asked what there is to do, for every read since (`ReadRounds::Shared`, focal F43); raft-rs's rule is kept as `ReadRounds::Each` | `reads_asked_together_leave_in_one_round_and_one_answer_confirms_them`; `tests/group.rs`: `a_round_confirms_no_read_asked_after_it_left` |
 | A window of messages alone | Of messages and of bytes, the bytes what the owner says the path carries (`RawNode::set_inflight_bytes`, focal F41); the differential runs with no byte bound | `a_member_is_sent_no_more_bytes_ahead_of_its_answers_than_its_path_carries` |
 | A heartbeat's answer says nothing of the log, and a full window frees its first message at every answer | The answer says how far the log goes and is taken as an append's answer (`HeartbeatAnswers::Position`, focal F42); raft-rs's rule is kept as `HeartbeatAnswers::Bare` | `a_heartbeats_answer_gives_back_what_the_member_holds_and_nothing_more` |
+| A follower's lease reads its one election counter, which its own campaign restarts: one whose campaign waits for a committed change to apply keeps its lease another election timeout, and refuses the voter that campaigns | The lease reads the ticks since the member heard its leader (`Raft::silence`), apart from its own timer (R4, §3.2); the differential's owner applies every change at once and never reaches it | `a_member_whose_campaign_waits_for_a_change_holds_no_lease` |
 | A term or an index may be counted to `u64::MAX` | The last of each is `u64::MAX − 1`; a campaign, an append or a proposal past it is refused before anything changes, by suspicion no campaign is armed that would be, and the fast track holds nothing at the last index (R6, §3.2) | `a_term_with_no_successor_cannot_campaign_and_keeps_one_leader`, `a_member_with_no_index_for_a_leaders_first_entry_does_not_campaign`, `by_suspicion_a_member_with_no_successor_is_due_for_no_campaign`, `the_fast_track_proposes_and_holds_nothing_at_the_last_index` |
 
 Kept although it could be otherwise, as focal kept it: a member that a change removes and adds

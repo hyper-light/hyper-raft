@@ -1603,6 +1603,7 @@ impl Replica for Either {
     }
 }
 
+pub mod backlog;
 pub mod cluster;
 pub mod lagged;
 #[allow(unused_imports)]

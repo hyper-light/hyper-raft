@@ -25,8 +25,8 @@ const REPORT: u8 = 7;
 const ACCOUNT_ASK: u8 = 4;
 /// The control tag of the test's order that a member's device answer no flush for a time.
 const STALL: u8 = 5;
-/// The control tag of the test's order that a member hold its thread for a time, outside any
-/// write of its log.
+/// The control tag of the test's order that a member hold its thread, outside any write of its
+/// log, until released.
 const HOLD: u8 = 6;
 /// The response tag an [`Account`] takes.
 const ACCOUNT: u8 = 8;
@@ -97,25 +97,21 @@ pub fn read_stall(body: &[u8]) -> Option<(u64, Duration)> {
     reader.rest().is_empty().then_some((id, stall))
 }
 
-/// Puts the test's order that a member hold its thread for `hold`, outside any write of its log,
-/// once it has answered `Done`: a member that stays up and answers nothing, as one deadlocked
-/// does, on a platform with no signal that stops a process (Windows).
-pub fn put_hold(buffer: &mut Vec<u8>, id: u64, hold: Duration) {
+/// Puts the test's order that a member hold its thread, outside any write of its log, until a
+/// byte comes on its standard input, once it has answered `Done`: a member that stays up and
+/// answers nothing, as one deadlocked does, on a platform with no signal that stops a process
+/// (Windows).
+pub fn put_hold(buffer: &mut Vec<u8>, id: u64) {
     wire::begin(buffer, Kind::Control);
     wire::put_u64(buffer, id);
     buffer.push(HOLD);
-    wire::put_u64(buffer, u64::try_from(hold.as_nanos()).unwrap_or(u64::MAX));
 }
 
-/// The id and the time of an order that a member hold its thread; none for anything else.
-pub fn read_hold(body: &[u8]) -> Option<(u64, Duration)> {
+/// The id of an order that a member hold its thread; none for anything else.
+pub fn read_hold(body: &[u8]) -> Option<u64> {
     let mut reader = Reader::new(body);
     let id = reader.u64()?;
-    if reader.u8()? != HOLD {
-        return None;
-    }
-    let hold = Duration::from_nanos(reader.u64()?);
-    reader.rest().is_empty().then_some((id, hold))
+    (reader.u8()? == HOLD && reader.rest().is_empty()).then_some(id)
 }
 
 /// What the node-pair stream asked of its member during one call into it.

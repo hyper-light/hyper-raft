@@ -96,14 +96,19 @@ impl From<std::io::Error> for NodeError {
     }
 }
 
-/// Holds the member's thread for `hold`, as the test ordered (`stream::put_hold`): it reads
-/// nothing and answers nothing meanwhile, as a member deadlocked outside a write of its log.
-#[allow(
-    clippy::disallowed_methods,
-    reason = "the member holds its thread for a hang the test ordered, as a deadlocked member holds it"
-)]
-fn hold_thread(hold: Duration) {
-    std::thread::sleep(hold);
+/// Set once the process's standard input ends: its parent is gone, and the member's loop returns.
+pub static PARENT_GONE: AtomicBool = AtomicBool::new(false);
+/// Set when a byte comes on the process's standard input: a member held by the test
+/// (`stream::put_hold`) goes on.
+pub static RELEASED: AtomicBool = AtomicBool::new(false);
+
+/// Holds the member's thread until the test releases it or goes ([`RELEASED`], [`PARENT_GONE`],
+/// each set by the process's parent watcher, which unparks this thread): it reads nothing and
+/// answers nothing meanwhile, as a member deadlocked outside a write of its log.
+fn hold_until_released() {
+    while !RELEASED.swap(false, Ordering::AcqRel) && !PARENT_GONE.load(Ordering::Acquire) {
+        std::thread::park();
+    }
 }
 
 /// A refusal changed nothing and is the asker's to hear; only a fatal error stops the member.
@@ -829,9 +834,9 @@ impl Node {
                 .on_heartbeat(peer, message, now, &mut self.asked);
             return self.act_on_liveness().map(drop);
         }
-        if let Some((id, hold)) = stream::read_hold(body) {
+        if let Some(id) = stream::read_hold(body) {
             self.respond(from, id, &Outcome::Done)?;
-            hold_thread(hold);
+            hold_until_released();
             return Ok(());
         }
         if let Some((id, stall)) = stream::read_stall(body) {

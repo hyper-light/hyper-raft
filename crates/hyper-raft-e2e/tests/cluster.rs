@@ -672,18 +672,26 @@ impl Cluster {
         self.signal(id, "-STOP");
     }
     /// Windows has no signal that stops a process: the member is ordered to hold its thread,
-    /// outside any write of its log, past what a wait excuses (the members' longest write and the
-    /// quiet period, then a quiet period more).
+    /// outside any write of its log, until a byte comes on its standard input.
     #[cfg(windows)]
     fn freeze(&mut self, id: u64) {
-        let hold = self.quiet() * 2 + Duration::from_nanos(self.write_most).max(self.stall);
-        self.order(id, |buffer, ask| stream::put_hold(buffer, ask, hold));
+        self.order(id, stream::put_hold);
     }
     /// Lets member `id` go on after [`Cluster::freeze`], and waits, while its process runs, for its
     /// first answer: what it said before it stopped is no word of it since.
     fn thaw(&mut self, id: u64) {
         #[cfg(unix)]
         self.signal(id, "-CONT");
+        #[cfg(windows)]
+        {
+            let stdin = self.members[(id - 1) as usize]
+                .child
+                .as_mut()
+                .and_then(|child| child.stdin.as_mut())
+                .expect("a member up, its standard input the test's");
+            stdin.write_all(&[1]).unwrap();
+            stdin.flush().unwrap();
+        }
         while self.report(id).is_none() {
             self.running(id);
         }

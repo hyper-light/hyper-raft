@@ -9,15 +9,16 @@
 //! ends — its parent closed it or died, so a member never outlives the test that started it — or
 //! it is killed. Where the others listen it is told by the test (`Control::Peers`).
 use std::{
-    io::Write,
+    io::{Read, Write},
     net::{SocketAddr, UdpSocket},
     path::PathBuf,
     process::ExitCode,
-    sync::atomic::{AtomicBool, Ordering},
+    sync::atomic::Ordering,
+    thread::Thread,
 };
 
 use hyper_raft_e2e::{
-    node::{Node, NodeError, Settings},
+    node::{Node, NodeError, PARENT_GONE, RELEASED, Settings},
     run,
     wal::Wal,
     wire::{self, Kind},
@@ -76,24 +77,22 @@ fn serve(arguments: Arguments) -> Result<(), Box<dyn std::error::Error>> {
     writeln!(stdout, "listening {port}")?;
     stdout.flush()?;
     drop(stdout);
-    watch_parent(me)?;
+    watch_parent(me, std::thread::current())?;
     node.run(&PARENT_GONE)?;
     Ok(())
 }
 
-/// Set once standard input ends: the member's loop then returns, and the process with it.
-static PARENT_GONE: AtomicBool = AtomicBool::new(false);
-
 /// Watches standard input until it ends. The parent holds the pipe's other end for as long as it
 /// lives, so a member never outlives the test that started it, however the test ends (a test
-/// killed outright runs no clean-up of its own). One thread for the process, blocked on the pipe;
-/// at its end it sets [`PARENT_GONE`] and wakes the member with an empty datagram to `me`, its
-/// socket, on which the member waits for as long as nothing is due.
+/// killed outright runs no clean-up of its own). One thread for the process, blocked on the pipe.
+/// A byte on it releases a member the test held (`RELEASED`); at its end it sets `PARENT_GONE`
+/// and wakes the member, by unparking `member` (its thread, if held) and with an empty datagram
+/// to `me`, its socket, on which it waits for as long as nothing is due.
 #[allow(
     clippy::disallowed_methods,
     reason = "real processes on the host's clock, threads and environment (CLAUDE.md §1a, end to end)"
 )]
-fn watch_parent(me: SocketAddr) -> std::io::Result<()> {
+fn watch_parent(me: SocketAddr, member: Thread) -> std::io::Result<()> {
     let out = UdpSocket::bind(SocketAddr::new(me.ip(), 0))?;
     let mut wake = Vec::new();
     wire::begin(&mut wake, Kind::Control);
@@ -101,8 +100,14 @@ fn watch_parent(me: SocketAddr) -> std::io::Result<()> {
     std::thread::Builder::new()
         .name("parent".to_owned())
         .spawn(move || {
-            let _ = std::io::copy(&mut std::io::stdin().lock(), &mut std::io::sink());
+            let mut stdin = std::io::stdin().lock();
+            let mut byte = [0u8; 1];
+            while let Ok(1) = stdin.read(&mut byte) {
+                RELEASED.store(true, Ordering::Release);
+                member.unpark();
+            }
             PARENT_GONE.store(true, Ordering::Release);
+            member.unpark();
             if sealed {
                 let _ = out.send_to(&wake, me);
             }

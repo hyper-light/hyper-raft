@@ -1821,6 +1821,46 @@ medians are 1.0 to 1.7 % over `main` churning and 3.5 to 13.1 % under it quiet, 
 spread: the engine's two dimensions cost less a sample than eight, and its acknowledgement is 56
 bytes shorter, 63 gossip entries a 1,200-byte message where there were 60.
 
+## The split closed: the period (2026-10-03)
+
+The same workload through `crates/hyper-swim-compare`'s `one` points for slates' detector, `main`
+(`c539a19`, whose hyper-swim is `2525538`'s), the head before this work (`617d70a`'s detector) and the
+head with it (`2605c89`: the directed gossip, the bound's precondition, the measurement backoff and
+the digest-first exchanges, which the comparison's members run as the cluster test's do). Each point
+a fresh process of 400 periods, the four builds' order rotated each round, nine rounds at 16 and 64
+members and three at 256, 2026-10-03 at 04:18–04:23 PDT, load 20.6–27.1 (other sessions; none of my
+builds or soaks running); ns a member a period, medians with the least and the most:
+
+| Members | Workload | slates | `main` | Before | With the work | Against slates | Against before | Against `main` |
+|---|---|---|---|---|---|---|---|---|
+| 16 | quiet | 571 (567–588) | 409 (377–423) | 388 (349–396) | 431 (401–449) | −24.6 % | +11.1 % | +5.4 % |
+| 16 | churning | 990 (982–1,056) | 670 (587–696) | 653 (580–660) | 732 (666–749) | −26.0 % | +12.1 % | +9.3 % |
+| 64 | quiet | 700 (668–765) | 527 (522–539) | 507 (491–530) | 572 (570–597) | −18.2 % | +12.9 % | +8.5 % |
+| 64 | churning | 1,280 (1,258–1,464) | 857 (846–881) | 845 (834–862) | 1,008 (987–1,019) | −21.3 % | +19.4 % | +17.7 % |
+| 256 | quiet | 1,457 (1,426–1,564) | 867 (866–871) | 846 (821–853) | 1,047 (1,002–1,050) | −28.1 % | +23.7 % | +20.7 % |
+| 256 | churning | 2,249 (2,239–2,255) | 1,324 (1,314–1,358) | 1,306 (1,290–1,408) | 1,866 (1,761–2,047) | −17.0 % | +42.8 % | +40.9 % |
+
+Nine rounds at 256 members, at 04:31–04:43 at load 21.5–64.5 (another session's work arriving
+midway): quiet 1,187 against `main`'s 1,008, +17.8 %, churning 2,208 against 1,717, +28.6 %, and
+slates 30.7 and 12.8 % slower. The period stays under slates' at every point. Its cost over `main`
+has two parts:
+- the directed gossip: one more entry on every probe, applied at the target, and a lookup of the
+  prober's state at every answer. Against the head before, in three series at load 20–26 with the
+  directed gossip alone, it cost +4.9 to +17.1 % at 16 and 64 members, a median of +8 %, and from
+  −4.0 to +20.7 % at 256, over three rounds a point;
+- the exchanges: an opening of 30 bytes a member a window where views agree, 0.07, 0.06 and 0.05
+  messages a member a period at 16, 64 and 256 members and no entries, which the comparison counts;
+  against the directed gossip alone, interleaved, nine rounds at load 28.5–73.6, −2.4, −2.5 and
+  −12.5 % quiet, nothing beyond noise. Under a refutation every period the views mostly differ, and
+  they carry 1.5, 5.1 and 16.4 entries a member a period: +8.1, +10.9 and +26.0 %. A first form
+  that pushed whole views at every exchange carried 2.3, 7.5 and 25.0 even in the quiet cluster,
+  +72 % at 256 members quiet in an interleaved series at load 74; the digest took that away.
+
+Every build allocates nothing a period at every point. `benches/allocs.rs`, which runs the exchanges
+as an owner does, counts 0 allocations, reallocations and faults a member a period at 4 to 256
+members, quiet and churning; the bytes asked under churn (0.3 a member a period at 16 and 64
+members) are one-time growths, falling tenfold over 4,000 periods instead of 400.
+
 ## The cluster test
 
 `tests/cluster.rs`, four member processes over hyper-datagram on loopback UDP, each run a fresh
@@ -1929,8 +1969,47 @@ of a build that also printed each member's view as it changed (for the trace, no
 once the same way: member 4 condemned member 1 at incarnation 4 after member 1 had refuted at 5;
 the refutation reached members 2, 3 and 5 and not member 4, which forgot member 1 17 ms later. A
 refutation is a rumor, and a rumor can end known to some members and not all (Demers et al. 1987,
-§1.5); hyper-swim has no anti-entropy to back it up, which is open (`docs/timing.md` §2.7). Before
-the waits were bounded, such a run waited until CI's job limit.
+§1.5); hyper-swim had no anti-entropy to back it up (closed below). Before the waits were bounded,
+such a run waited until CI's job limit.
+
+**The split closed, and the soak (2026-10-03).** A probe now states its prober's own state and an
+answer the answerer's suspicion or death of the prober (`e563ef1`), which closes the split where the
+live member still probes the survivor that holds it dead; anti-entropy closes the one where neither
+probes the other (`2605c89`, `f93e9d7`; `docs/timing.md` §2.7). The runs along the way:
+- the directed gossip: a prototype 1,000 of 1,000, two further forms 999 and 998 of 1,000, no
+  split; the three failures each held the first victim dead 0.2 to 2.2 ms past a bound of 2.3 to
+  3.3 ms. A build that kept a ring of each member's probes, answers and views, dumped at an
+  overshoot, found one 490 runs in: a live member falsely condemned 7 ms into the run, adopted by
+  gossip at members whose probes were still measurement only, against a bound covering periods
+  that judged nothing. Members now state no bound until every probe they make is judged, and the
+  test checks the death that stands (`a3a043f`);
+- two instrumented builds, 455 and 2,323 runs in, had a member 43,557 and 39,560 periods into a run
+  with nothing judged, condemned 95 and 94 times: measurement periods outrun by round trips that
+  had lengthened, which the detector alone reproduces; unanswered measurement periods now back off
+  (`d4992fa`);
+- with those three, 1,000 runs, all passing (03:03–03:25, load 20.1–65.7);
+- the exchanges, pushing whole views at every exchange: 950 runs on macOS (load 31.0–118.2) and 109,
+  156 and 205 on Linux at one, two and four CPUs, all passing; with digests first, 77, 26, 39 and 49,
+  all passing, before a death of a member not held was found to bring a forgotten record back
+  around through the exchanges (`f93e9d7`) and the soak was begun again.
+
+The soak, on `f93e9d7`, each run a fresh supervisor, 2026-10-03 at 04:54–07:09 PDT, the macOS and
+Linux series running at the same time beside other sessions' work; Linux in Docker Desktop's VM
+(rust:1.98.0), each container at its CPU limit with twice as many busy loops beside the test, its
+load the VM's:
+
+| Platform | Limits and competing load | Runs | Passed | Splits | Overshoots | Load (1 min) | Suspicions (allowed) | Condemnations (allowed) | Detection, first kill, median / p95 / max | Second kill | Largest share of the stated bound |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| macOS 26.4.1, M5 Max | other sessions | 2,000 | 2,000 | 0 | 0 | 27.6–95.2 | 2,333 (226,062) | 41 (218,868) | 11.5 / 53.1 / 333.8 ms | 127.8 / 507.6 / 1,663.5 ms | 0.38 |
+| Linux 6.12.76 (Docker Desktop) | `--cpus 1`, 2 busy loops | 500 | 500 | 0 | 0 | 3.4–52.9 | 853 (82,340) | 49 (77,052) | 60.9 / 145.7 / 571.9 ms | 898.0 / 2,312.5 / 5,256.0 ms | 0.38 |
+| Linux 6.12.76 (Docker Desktop) | `--cpus 2`, 4 busy loops | 655 | 655 | 0 | 0 | 3.6–52.8 | 1,369 (103,423) | 83 (96,842) | 52.1 / 115.0 / 390.2 ms | 646.2 / 2,036.9 / 4,506.4 ms | 0.40 |
+| Linux 6.12.76 (Docker Desktop) | `--cpus 4`, 8 busy loops | 638 | 638 | 0 | 0 | 3.5–52.8 | 934 (97,068) | 42 (90,989) | 53.1 / 112.9 / 316.3 ms | 532.0 / 2,341.2 / 6,741.7 ms | 0.55 |
+
+Every survivor held each victim dead within the bound it stated, at most 0.55 of it; the stillest
+any wait went was 0.27 of its quiet period. A run took a median 1.9 s on macOS and 8.4 to 12.7 s in
+the throttled containers, the longest 166 s, waiting on the pairs' evidence. The suspicions and
+condemnations of live members are the load's: the machine ran at up to 95, and the throttled
+members stall together.
 
 ## Commands for the detector
 

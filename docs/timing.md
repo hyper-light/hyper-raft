@@ -615,6 +615,11 @@ dissemination window (`Detector::sync_into`, `Detector::on_sync`):
   can add back a dead member already forgotten, as a late rumor could (above): it is probed and
   condemned again within the detection bound, the cost probes, not safety.
 
+Both change what the wire carries: a probe and an answer carry entries of the existing gossip
+encoding, which a receiver of the earlier form applies as any gossip, and the exchanges a new
+message, `Sync`, with its own golden vector (`docs/research/swim.md`, "The wire, and its
+argument"). No consumer runs hyper-swim yet, so the wire changed in place.
+
 **What the cluster test asserts** (`crates/hyper-swim/tests/cluster.rs`, §2.5). Five member
 processes run the detector as the library configures it, in two phases. The supervisor waits on
 facts: every member judging every peer by a configured verdict (the pair's own, or the pool's while
@@ -658,7 +663,9 @@ four CPUs with busy loops beside them all passed, detection a median 4 ms on mac
 Docker's VM after the victim's last answer; of the two-phase form on macOS, 300 runs with two
 failing and 819 traced with one, each on a refutation a rumor missed; with probes stating their
 sender, three forms of 1,000 each, 1,000, 999 and 998 passing, no split, the three failures each
-the first victim held dead past its stated bound by 0.2 to 2.2 ms, cause open. Open: §3, item 1
+the first victim held dead past a bound its member's unjudged probes could not keep (above); and
+with the split closed, the soak: 2,000 runs on macOS and 500, 655 and 638 on Linux at one, two and
+four CPUs with busy loops, every one passing, no split and no overshoot. Open: §3, item 1
 governs the probe rate too, since a period is its probe's deadline and nothing yet prices a probe,
 and as the MTBF grows the margins and so the periods grow with it; two members cannot condemn each
 other, as neither can tell its own failure from the other's; the pool's mean is wrong for a pair far

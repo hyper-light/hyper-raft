@@ -35,8 +35,8 @@
 //! after counts as movement; the time the members report having a write of their logs out extends
 //! the watch, for a group moves through a member only as its writes become durable; and a member
 //! silent, or heard with its oldest write out, past the longest one write any member has reported
-//! (or the hold the test ordered) and the quiet period fails the wait, named. A fact holds only of
-//! members a look heard.
+//! (or the hold the test ordered) and the quiet period, each counted less the timeout a look waits
+//! for its answer, fails the wait, named. A fact holds only of members a look heard.
 //!
 //! The scenarios run one after another in this one thread (`harness = false`), one group at a
 //! time; the test reads each member's output on a thread of its own, one a process, at most three.

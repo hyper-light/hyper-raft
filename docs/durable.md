@@ -912,8 +912,8 @@ Tests (`crates/hyper-durable/tests`):
   had a write of its log out extends the wait, for the log's threads make its writes and its group
   moves through it only as they become durable; and a member silent, or heard with its oldest write
   out, past the longest one write any member has reported (or the hold the test ordered) and the
-  quiet period fails the wait, named (`docs/timing.md` §2.9, "The same rule in the other
-  harnesses"). The test (`tests/kill.rs`) kills the leader and a follower with `SIGKILL` at each named durability
+  quiet period, each counted less the timeout a look waits for its answer, fails the wait, named
+  (`docs/timing.md` §2.9, "The same rule in the other harnesses"). The test (`tests/kill.rs`) kills the leader and a follower with `SIGKILL` at each named durability
   point (a write submitted; a write durable whose answer was not taken; messages released), and at
   seeded random points and counts; focal's F17 cases (the founder killed once it applied the
   removal of its only peer, the peer stopped for good, elects itself alone; killed with the removal

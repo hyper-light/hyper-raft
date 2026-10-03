@@ -1103,35 +1103,38 @@ committed once the devices went on, in each of five.
 
 **The same rule in the other harnesses.** Two more harnesses called silence quiet as
 hyper-raft-e2e's had, each failing on CI once in a way a re-run passed:
-- **hyper-durable-e2e.** `stall-leader` on ubuntu-24.04 ("a write was never answered; quiet 1s":
-  the stalled leader's two survivors heard a moment before, in term 4 with no leader, nothing moved
-  for a second) and `stall-follower` on windows-11-arm ("the stalled member was not suspected by
-  every other; quiet 1s": every pair still unjudged, the two members up last heard 1.01 s before).
-  Its waits now keep hyper-raft-e2e's rule, moved where both harnesses read it
+- **hyper-durable-e2e.** `stall-leader` on ubuntu-24.04 ("a write was never answered; quiet 1s": the
+  stalled leader's two survivors heard a moment before, in term 4 with no leader, nothing moved for
+  a second) and `stall-follower` on windows-11-arm ("the stalled member was not suspected by every
+  other; quiet 1s": every pair still unjudged, the two members up last heard 1.01 s before). Its
+  waits now keep hyper-raft-e2e's rule, moved where both harnesses read it
   (`hyper_raft_e2e::quiet`), with its heartbeat framing (`hyper_raft_e2e::stream`), its run's record
   (`hyper_raft_e2e::run`) and its parent watch and hold (`hyper_raft_e2e::parent`). Its members'
   threads do no write of their own (the log's threads do), so a member held in a write still
   answers: the fault file held every member's flushes seven seconds (`file::hold_flushes`, ordered
   by `hyper_raft_e2e::stream::put_stall`) and each answered every look within 120 µs, its longest
   time between two reads of its socket 7 ms, while its group moved nothing through it. The time a
-  member reports in its writes is therefore the time it had a write of its log out, the replica's
-  or the stream's, measured at its turns; and since a write that never ends would extend the watch
-  for good, a member heard with its oldest write out past the members' longest write (or the hold
-  the test ordered) and the quiet period ends the wait, named (`Stuck::Held`), as a silent one does.
-  On macOS that time ran to 37–90 % of a scenario's (the stream's own writes every `η`). A fact no
-  longer holds of a member that did not answer: the stalled member's suspicion and a restart's
-  report were true of a look that heard no one. `stalled-devices` (the leader's disk stalled, the
-  survivors' devices held the quiet period and two looks' timeouts, 7 s, as they elect, once every
-  pair is judged) failed under the old rule in 3 of 3 runs on macOS with CI's message, the survivors
-  heard 14–88 µs before, each suspecting the other and the leader, and passes under the new;
+  member reports in its writes is therefore the time it had a write of its log out, the replica's or
+  the stream's, measured at its turns, which on macOS ran to 37–90 % of a scenario's (the stream's
+  own writes every `η`). Since a write that never ends would extend the watch for good, a member
+  heard with its oldest write out past the members' longest write (or the hold the test ordered) and
+  the quiet period ends the wait, named (`Stuck::Held`), as a silent one does, its write's time
+  counted less the timeout a look waits for an answer, as a silent member's silence is: on CI's
+  windows-2025 every member of a fresh group had its first writes out 1.0–1.3 s while the longest
+  any had finished took 154 ms, which the bound without the timeout called held. A fact no longer
+  holds of a member that did not answer: the stalled member's suspicion and a restart's report were
+  true of a look that heard no one. `stalled-devices` (the leader's disk stalled, the survivors'
+  devices held the quiet period and two looks' timeouts, 7 s, as they elect, once every pair is
+  judged) failed under the old rule in 3 of 3 runs on macOS with CI's message, the survivors heard
+  14–88 µs before, each suspecting the other and the leader, and passes under the new;
   `member-stopped` (`SIGSTOP`; on Windows the member holds its thread until released over stdin)
   fails the wait naming the stopped member after 2.0–3.0 s of its silence against 1.04–1.05 s
   excused, then converges. CI's windows-11-arm form, the survivors silent while the test waits, was
   reproduced by a helper that stopped one of them 2.5 s during stall-follower's wait (not
-  committed): 5 of 5 failed under the old rule with CI's message, its last report 1.0–2.0 s old,
-  and 5 of 5 passed under the new. Held on young links, the survivors trusted the stalled leader
-  44 s: a link younger than its evidence, its heartbeats stopped by the hold, is judged only once
-  its node's links have evidence again (§2.8), so the scenario holds once every pair is judged.
+  committed): 5 of 5 failed under the old rule with CI's message, its last report 1.0–2.0 s old, and
+  5 of 5 passed under the new. Held on young links, the survivors trusted the stalled leader 44 s: a
+  link younger than its evidence, its heartbeats stopped by the hold, is judged only once its node's
+  links have evidence again (§2.8), so the scenario holds once every pair is judged.
 - **hyper-liveness's process test.** The young victim's test,
   `a_node_killed_in_its_first_heartbeats_is_suspected_once_a_sibling_has_its_evidence`, on
   windows-2025 ("the victim heard every peer: nothing moved for 1s", every member with a flush in

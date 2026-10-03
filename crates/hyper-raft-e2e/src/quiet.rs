@@ -16,9 +16,11 @@
 //!   test, not the member), is excused only up to the longest one write any member has reported, or
 //!   the stall the test ordered, and the quiet period. Past it the member answers nothing, whatever
 //!   holds it, and the wait fails naming it rather than waiting for good. So is a member that
-//!   answers while its oldest write has been out that long (hyper-durable-e2e's, whose log's
-//!   threads do its writes): its group moves through it only once the write is durable, and a
-//!   write that never ends would otherwise extend the watch for good.
+//!   answers while its oldest write has been out that long, less the same timeout
+//!   (hyper-durable-e2e's, whose log's threads do its writes): its group moves through it only once
+//!   the write is durable, a write that never ends would otherwise extend the watch for good, and
+//!   the timeout keeps the write judged as a member's thread held in it would be, by a look whose
+//!   ask waits that long for its answer.
 //!
 //! The harnesses feed it what their looks saw ([`Quiet::look`]) and the asks they made
 //! ([`Quiet::asked`]); it reads no clock of its own.
@@ -129,8 +131,9 @@ pub enum Stuck {
         /// What the members' own measures excused.
         excuse: Duration,
     },
-    /// A member answered with a write out for `writing`, past the `excuse` the members' longest
-    /// write (or the stall the test ordered) and the quiet period make.
+    /// A member answered with a write out for `writing`, which less a retransmission timeout is
+    /// past the `excuse` the members' longest write (or the stall the test ordered) and the quiet
+    /// period make.
     Held {
         /// The member.
         member: u64,
@@ -159,7 +162,7 @@ impl std::fmt::Display for Stuck {
                 excuse,
             } => write!(
                 f,
-                "member {member} had a write out for {writing:?}, past the {excuse:?} the members' longest write and the quiet period excuse"
+                "member {member} had a write out for {writing:?}, past a retransmission timeout and the {excuse:?} the members' longest write and the quiet period excuse"
             ),
         }
     }
@@ -310,7 +313,9 @@ impl Quiet {
         let period = self.period();
         let excuse = period.saturating_add(self.write_most().max(self.stall));
         let silent = self.silence(unheard, excuse);
-        let held = held.filter(|(_, writing)| *writing > excuse);
+        // Judged as a member's thread held in the write would be: its silence is counted less the
+        // timeout a look's ask waits for its answer.
+        let held = held.filter(|(_, writing)| writing.saturating_sub(RTO) > excuse);
         if !unheard.is_empty() {
             self.seen.unheard_looks = self.seen.unheard_looks.saturating_add(1);
         }

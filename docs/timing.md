@@ -897,7 +897,15 @@ lateness, the stall's delay (§2.2; `PairReport::skipped` counts them).
   the receiver's clock, and the hold since its arrival. The receiver gets the network round trip on
   its own clock, `A − s_echo − hold` (a path for the election law's ballot, `round_trip`), and the
   sum of the two directions' delays from their schedules, `round trip + late_echo + late`, which
-  bounds this heartbeat's delay since both are positive.
+  bounds this heartbeat's delay since both are positive. The hold runs from the echoed heartbeat's
+  arrival stamp. A kernel stamp is when it reached the host, so the hold covers any time it sat in
+  the socket, a stopped receiver's included, and the round trip is the path's. A stamp taken at
+  the read is when it left the socket: the hold misses the time it sat there, and the round trip
+  counts it as the path's. The E2E harnesses' members stamped at the read on every platform, and
+  a member stopped and let go left its peers' `T_E`, which their round trips to it enter, at up to
+  1.5 s on macOS and 2.1 s on Linux (§2.9); they read the kernel's stamps on Linux and macOS since, as
+  hyper-tokio's plane socket does, through its `Stamped` (a standard socket's receive with the
+  stamps, for an owner that runs no tokio). On Windows the read is all there is (§3, item 5).
 - **Judged before its own evidence: what the node measured of its links** (§3, item 10). A link
   whose own estimator has not configured is judged by the margin its node's evidence configures for
   it. That evidence is of two kinds, and the link takes the wider of them, each measure the larger
@@ -1546,7 +1554,8 @@ pairs, macOS first:
   the member cut off, and those of leader-killed, follower-restarts, all-killed and member-stopped
   the true ones of the members killed or stopped.
 - **A member stopped and let go.** The heartbeats that waited in a socket's buffer through the stop
-  are stamped as they are read, so the round trips both ends measured took in the stop, and their
+  are stamped as they are read (the kernel's stamps since, §2.8, "The echo"), so the round trips
+  both ends measured took in the stop, and their
   law's `T_E` at the scenario's end stood at 0.06–1.5 s on its peers and 2.9–5.7 s on the member
   stopped on macOS, 0.01–2.1 s and 0.4–6.6 s on Linux.
 The detectors keep their bound, and the bound is loose; the configurator, minimizing `U` with
@@ -1618,8 +1627,10 @@ and election law; the remaining items keep their numbers, and item 10 is what L-
   but its receive stamps are attached by a NIC miniport driver that reports timestamping
   capabilities, with system configuration, and on no loopback path or virtual NIC. hyper-tokio
   therefore stamps a Windows datagram when it is read (§2.8, `docs/transport.md` §4b): its read
-  delay is counted as the sender's, in the delays the detector measures and so in its margin. Open:
-  every measurement of §2.6 on Windows, that read delay among them.
+  delay is counted as the sender's, in the delays the detector measures and so in its margin, and
+  in the round trip of an echo of it (§2.8, "The echo": a receiver stopped with heartbeats in its
+  socket gives its peers a round trip that holds the stop). Open: every measurement of §2.6 on
+  Windows, that read delay among them.
 - **8. Strict timers.** A finer `G` shortens detection and costs power; on a laptop on battery
   that trade is measured, not assumed. On Windows the request is `timeBeginPeriod`; on macOS a
   timer with no leeway (real-time or critical urgency, or a strict dispatch timer), without which

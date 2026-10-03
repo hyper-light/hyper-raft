@@ -309,6 +309,9 @@ never depends on it.
   suspected its sender; `docs/benchmarks.md`, "The detector model, at its causes"). Each datagram is delivered with its `Arrival`: the
   address and when it arrived on the socket's `Clock` (`clock()`), the kernel's receive stamp where
   the platform gives one (`docs/timing.md` §2.4, §2.8).
+- `Stamped`: a standard UDP socket's receive with the same arrivals, for an owner that waits on its
+  socket itself and runs no tokio (the E2E harnesses' members): `receive(socket, buffer)` takes
+  the next datagram queued without waiting and gives its length and `Arrival`.
 - `Clock`: the host's monotonic clock in nanoseconds, which every process on the host reads alike:
   `CLOCK_MONOTONIC` on Linux, `mach_absolute_time` on macOS, `QueryPerformanceCounter` on Windows.
 - `Io { batch }`: the datagrams one system call carries either way, 1 to `UIO_MAXIOV` (1,024).

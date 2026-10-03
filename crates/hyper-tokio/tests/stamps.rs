@@ -15,7 +15,7 @@
 use std::net::{SocketAddr, UdpSocket};
 
 use hyper_datagram::{AdmitAll, ExporterSecret, Plane, PlaneLimits, Role, SECRET_BYTES};
-use hyper_tokio::{Arrival, Clock, Io, PlaneSocket};
+use hyper_tokio::{Arrival, Clock, Io, PlaneSocket, Stamped, Taken};
 
 /// The datagrams the test sends.
 const DATAGRAMS: u64 = 16;
@@ -116,6 +116,83 @@ fn a_datagram_is_stamped_when_it_arrived_not_when_it_was_read() {
             previous = arrival.at_ns;
         }
     });
+}
+
+/// Blocks until a datagram is queued on `socket`: a peek, which takes nothing.
+fn until_queued(socket: &UdpSocket) {
+    socket.set_nonblocking(false).unwrap();
+    socket.peek_from(&mut [0u8; 1]).unwrap();
+    socket.set_nonblocking(true).unwrap();
+}
+
+/// What a held datagram's read found: its arrival, and the clock before the send, once it was
+/// queued and when the read began.
+struct Held {
+    arrival: Arrival,
+    before: u64,
+    in_socket: u64,
+    read_from: u64,
+}
+
+/// Sends `body` to `to`, holds the reader `HELD_NS` once it is queued, and reads it.
+fn held_then_read(stamped: &mut Stamped, socket: &UdpSocket, out: &UdpSocket, body: u8) -> Held {
+    let mut buffer = [0u8; 64];
+    let before = stamped.clock().now_ns();
+    out.send_to(&[body], socket.local_addr().unwrap()).unwrap();
+    until_queued(socket);
+    let in_socket = stamped.clock().now_ns();
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "the reader stopped while the datagram waits in its socket"
+    )]
+    std::thread::sleep(std::time::Duration::from_nanos(HELD_NS));
+    let read_from = stamped.clock().now_ns();
+    let Some(Taken::Datagram(length, arrival)) = stamped.receive(socket, &mut buffer).unwrap()
+    else {
+        panic!("the datagram is queued");
+    };
+    assert_eq!(&buffer[..length], &[body]);
+    Held {
+        arrival,
+        before,
+        in_socket,
+        read_from,
+    }
+}
+
+/// A standard socket its owner drives itself, without tokio (the E2E harnesses' members): a
+/// datagram held in the socket while its reader is stopped is stamped when it arrived where the
+/// kernel stamps, so an echo of it states a hold that covers the stop; elsewhere when it was read.
+/// The stop here is the reader asleep for `HELD_NS` once the datagram is queued, which a blocking
+/// peek says.
+#[test]
+fn a_standard_sockets_datagram_is_stamped_when_it_arrived_not_when_it_was_read() {
+    let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let mut stamped = Stamped::new(&socket).unwrap();
+    let kernel = cfg!(any(target_os = "linux", target_os = "macos"));
+    assert_eq!(stamped.kernel(), kernel);
+    let out = UdpSocket::bind("127.0.0.1:0").unwrap();
+    // One datagram through first, as the plane socket's test sends (Linux's stamping key).
+    held_then_read(&mut stamped, &socket, &out, u8::MAX);
+    let mut previous = 0;
+    for body in 0..8u8 {
+        let held = held_then_read(&mut stamped, &socket, &out, body);
+        let at = held.arrival.at_ns;
+        assert_eq!(held.arrival.from, out.local_addr().unwrap());
+        assert_eq!(held.arrival.kernel, kernel);
+        assert!(at >= previous, "stamps go back");
+        let (low, high) = if kernel {
+            (held.before, held.in_socket)
+        } else {
+            (held.read_from, u64::MAX)
+        };
+        assert!(
+            at >= low && at <= high,
+            "stamped at {at}, not within {low} to {high}"
+        );
+        previous = at;
+    }
+    assert_eq!(stamped.receive(&socket, &mut [0u8; 64]).unwrap(), None);
 }
 
 /// Two clocks made apart read one clock: the host's.

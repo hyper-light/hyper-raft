@@ -32,18 +32,19 @@
 //! own, but its group moves through it only as its writes become durable, and a device a machine's
 //! processes share holds them all at once.
 use std::collections::{BTreeMap, VecDeque};
-use std::io::{ErrorKind, Write as _};
+use std::io::{self, ErrorKind, Write as _};
 use std::net::{SocketAddr, UdpSocket};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::Waker;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use hyper_liveness::{
     Change, Liveness, Output as LiveOutput, PeerId, Settings as LiveSettings, Write as LiveWrite,
 };
 use hyper_log::{Class, Pending, Update};
 use hyper_timing::{Exposure, Trust};
+use hyper_tokio::{Stamped, Taken};
 
 use hyper_durable::{
     Cause, GroupStore, Output, Replica, ReplicaError, Settings as Shell, Unbounded,
@@ -174,7 +175,8 @@ pub struct Node {
     datagram: usize,
     command: Vec<u8>,
     /// The member's clock's origin: its times are nanoseconds since.
-    epoch: Instant,
+    /// The socket's receive stamps and the clock they are on, which is the member's.
+    stamped: Stamped,
     /// The node-pair liveness stream.
     liveness: Liveness,
     /// The peers the stream was told the group shares, in order.
@@ -252,6 +254,8 @@ impl Node {
         waker: Waker,
     ) -> Result<Self, NodeError> {
         let datagram = wire::largest(&socket)?;
+        let stamped =
+            Stamped::new(&socket).map_err(|error| NodeError::Io(io::Error::other(error)))?;
         let max_size_per_msg =
             u64::try_from(datagram.saturating_sub(MESSAGE_ROOM)).unwrap_or(u64::MAX);
         let shell = Shell {
@@ -305,7 +309,7 @@ impl Node {
             sending: Vec::with_capacity(datagram),
             datagram,
             command: Vec::new(),
-            epoch: Instant::now(),
+            stamped,
             liveness,
             attached: Vec::new(),
             asked: Asked::default(),
@@ -385,18 +389,10 @@ impl Node {
         }
     }
 
-    /// Nanoseconds on the member's clock, now.
-    #[allow(
-        clippy::disallowed_methods,
-        reason = "real processes on the host's clock, threads and environment (CLAUDE.md §1a, end to end)"
-    )]
+    /// Nanoseconds on the member's clock, now: the host's monotonic clock, which its socket's
+    /// receive stamps are on.
     fn now(&self) -> u64 {
-        u64::try_from(
-            Instant::now()
-                .saturating_duration_since(self.epoch)
-                .as_nanos(),
-        )
-        .unwrap_or(u64::MAX)
+        self.stamped.clock().now_ns()
     }
 
     /// The group's timing from what the stream measured, given to the replica when it moved, and
@@ -618,19 +614,20 @@ impl Node {
     }
 
     fn receive_one(&mut self) -> Result<bool, NodeError> {
-        let (length, from) = match self.socket.recv_from(&mut self.received) {
-            Ok(received) => received,
-            Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
-                return Ok(false);
-            }
+        let (length, arrival) = match self.stamped.receive(&self.socket, &mut self.received) {
+            Ok(Some(Taken::Datagram(length, arrival))) => (length, arrival),
+            // Truncated, or from an address that is not an internet one: lost, read past.
+            Ok(Some(Taken::Unreadable)) => return Ok(true),
+            Ok(None) => return Ok(false),
             Err(e) if e.kind() == ErrorKind::ConnectionReset => return Ok(true),
             Err(e) => return Err(e.into()),
         };
+        let from = arrival.from;
         let datagram = std::mem::take(&mut self.received);
         let outcome = match datagram.get(..length).and_then(wire::open) {
             Some((Kind::Raft, body)) => self.hear_peer(body),
             Some((Kind::Request, body)) => self.hear_client(body, from),
-            Some((Kind::Control, body)) => self.hear_test(body, from),
+            Some((Kind::Control, body)) => self.hear_test(body, from, arrival.at_ns),
             Some((Kind::Response, _)) | None => Ok(()),
         };
         self.received = datagram;
@@ -767,17 +764,17 @@ impl Node {
         }
     }
 
-    fn hear_test(&mut self, body: &[u8], from: SocketAddr) -> Result<(), NodeError> {
+    fn hear_test(&mut self, body: &[u8], from: SocketAddr, at_ns: u64) -> Result<(), NodeError> {
         if let Some((peer, message)) = stream::read_heartbeat(body) {
             if self.isolated {
                 return Ok(());
             }
-            // Stamped as it is read; a refusal is the stream's to make (a stale or unproven
+            // Stamped when the kernel received it where the platform stamps, else as it was read
+            // (`hyper_tokio::Stamped`); a refusal is the stream's to make (a stale or unproven
             // heartbeat, a peer that shares no group), and the message is dropped.
-            let now = self.now();
             let _ = self
                 .liveness
-                .on_heartbeat(peer, message, now, &mut self.asked);
+                .on_heartbeat(peer, message, at_ns, &mut self.asked);
             return self.act_on_liveness();
         }
         if let Some((id, order)) = control::read_order(body) {

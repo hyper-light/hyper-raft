@@ -389,7 +389,7 @@ pub(crate) struct Received {
 /// is skipped: QUIC and the plane treat it as lost.
 pub(crate) fn receive(
     fd: RawFd,
-    buffers: &mut [Vec<u8>],
+    buffers: &mut [impl AsMut<[u8]>],
     headers: &mut Headers,
     out: &mut Vec<Received>,
 ) -> io::Result<usize> {
@@ -404,6 +404,7 @@ pub(crate) fn receive(
     iovecs.clear();
     let count = buffers.len().min(names.len());
     for buffer in buffers.iter_mut().take(count) {
+        let buffer = buffer.as_mut();
         iovecs.push(libc::iovec {
             iov_base: buffer.as_mut_ptr().cast(),
             iov_len: buffer.len(),

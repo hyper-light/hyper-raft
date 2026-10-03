@@ -1132,6 +1132,35 @@ hyper-raft-e2e's had, each failing on CI once in a way a re-run passed:
   and 5 of 5 passed under the new. Held on young links, the survivors trusted the stalled leader
   44 s: a link younger than its evidence, its heartbeats stopped by the hold, is judged only once
   its node's links have evidence again (§2.8), so the scenario holds once every pair is judged.
+- **hyper-liveness's process test.** The young victim's test,
+  `a_node_killed_in_its_first_heartbeats_is_suspected_once_a_sibling_has_its_evidence`, on
+  windows-2025 ("the victim heard every peer: nothing moved for 1s", every member with a flush in
+  flight, its longest 372–467 ms; CI run 37104550192, its first attempt). A member's heartbeats wait
+  on its flushes: its first, proved by a first flush of 372–467 ms, were refused by peers whose own
+  wakes had not yet measured their timers (`Refusal::Unmeasured`), and the next waited a floor and a
+  second flush, so the first heartbeat taken came about three flushes in, past one quiet second,
+  through flushes each begun after the quiet period did, which the old rule excused only for a flush
+  begun before it (and waited on without bound). Its members push lines rather than answer asks, so
+  the rule is brought there in those terms. A member's line is due once its statement period (its
+  shortest interval, its floor before any) and its wakes' lateness have passed since its latest, and
+  it now states one at each flush completed; a line past its due by a retransmission timeout, the
+  time an E2E harness waits for an answer, is a member unheard: in a write, held, or not scheduled.
+  A check while a member is unheard decides nothing, and its line after counts as movement; one
+  while a member's line is past its due, not yet by that timeout, waits for that line or that
+  timeout, as a look waits for an answer; the time each member's writes took since the last check
+  (its run's record, kept durably before its stream sent anything, then its flushes) extends the
+  wait by the most any member took; and a member silent past its due by more than the longest write
+  any member stated and the quiet period ends the wait, named, whatever else moves
+  (`Stuck::Silent`). A member that has stated nothing yet is still waited on while its process runs.
+  With every flush held 450 ms more by the member's device thread (the flushes CI's runner took; not
+  committed), the young-victim test failed under the old rule in 3 of 3 runs on macOS as on CI
+  ("nothing moved for 1s", every member with a flush in flight, its longest 459–468 ms), and with
+  1.2 s more in 2 of 2 ("nothing moved for 2.4 s", once waiting on a first flush); under the new it
+  passed 3 of 3 and 2 of 2, in 43–78 s and 75–197 s, the victim noticed dead 28–193 s after the kill
+  at that pace of flushes. A new test stops a member once every pair is configured (`SIGSTOP`; on
+  Windows it holds its thread until a byte comes on its standard input): the wait for a line only it
+  can state fails naming it, and let go, its first line awaited while its process runs (what it
+  stated before it stopped is no word of it since), it is trusted again.
 
 **What the runs measured of the detectors** (every scenario prints, for each member, its floors,
 longest flush and longest time between two reads of its socket, and for each pair what the

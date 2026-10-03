@@ -10,12 +10,17 @@
 //! its own device thread (one thread, writing and flushing one file: `fdatasync` on Linux,
 //! `F_FULLFSYNC` on macOS, `FlushFileBuffers` on Windows, through std), and charges each detector
 //! the election the library's law gives over the round trips its streams measured. It reports what
-//! the crate reports, its disk's state and its flushes. The test times nothing of its own and
-//! derives no bound. The supervisor waits on facts, each for as long as the members move toward
-//! it: a quiet period derived from what they state (the longest of their judged pairs' `η + α`
-//! and their unjudged pairs' intervals, past their longest flush, their wakes' lateness and their
-//! reporting period) that passes with nothing moving fails the wait with every member's last
-//! state, as hyper-durable-e2e's waits do; a wait for a disk on one flush is the disk's, and goes on:
+//! the crate reports, its disk's state and its writes: its run's record and its flushes, the longest
+//! and all told. The test times nothing of its own and derives no bound. The supervisor waits on
+//! facts, each for as long as the members move toward it: a quiet period derived from what they
+//! state (the longest of their judged pairs' `η + α` and their unjudged pairs' intervals, past
+//! their longest write, their wakes' lateness and their reporting period) that passes with nothing
+//! moving fails the wait with every member's last state. Quiet is only time in which the supervisor
+//! heard every member, by the E2E harnesses' rule (`hyper_raft_e2e::quiet`) in this test's terms:
+//! a member whose line is past its due by a retransmission timeout is unheard, and a check decides
+//! nothing while one is; the time the members' writes took extends the wait; and a member silent
+//! past its due by more than the longest write any member stated and the quiet period fails the
+//! wait, named (`Supervisor::until`):
 //! - every member's every pair configured; then it stalls one member's disk (its device thread
 //!   stops completing flushes, as a disk that stops does) and waits for every other member to
 //!   suspect it, each within the bound its detector stated, measured from the stalled member's
@@ -28,6 +33,10 @@
 //! sent to each, before any of its links could have its own evidence: each survivor, left one live
 //! link, suspects it no later than its first poll once the link's freshness point has passed and
 //! its live link has configured (`docs/timing.md` §3, item 10).
+//!
+//! A third (`a_stopped_member_fails_the_wait_that_needs_it_by_name`) stops one of three members once
+//! every pair is configured and holds the waits to their bound: the wait for a line only the
+//! stopped member can state fails, naming it; let go, it is trusted again.
 //!
 //! Of live members it asserts what the configured detectors promise: Theorem 7 bounds the expected
 //! number of suspicions of a live peer by the allowance `Σβ`, and a run refutes that only when the
@@ -82,9 +91,15 @@ fn secret_between(a: u64, b: u64) -> ExporterSecret {
 }
 
 /// What the device thread sends the owner's wake socket: a flush completed, or the disk stopped.
-/// The supervisor's commands are longer.
+/// The supervisor's commands are longer: [`STALL`] and [`HOLD`].
 const COMPLETED: u8 = 0;
 const STOPPED: u8 = 1;
+/// The supervisor's command that the member's disk stop.
+const STALL: &[u8] = b"stall";
+/// The supervisor's command that the member hold its thread, answering nothing, until a byte comes
+/// on its standard input: a member stopped on a platform with no signal that stops a process
+/// (Windows), as hyper-raft-e2e's members are held (`hyper_raft_e2e::parent`).
+const HOLD: &[u8] = b"hold";
 
 /// The member's disk: one thread writing and flushing one file, a request at a time.
 enum Request {
@@ -199,9 +214,12 @@ async fn member(me: u64, nodes: u64, file: std::path::PathBuf) {
         },
     )
     .unwrap();
+    // Its first write: its run, kept durably before its stream sends anything under it, on the
+    // device its liveness writes go to. The first measure of that device it has.
+    let (run, run_write) = raise_run(&file, &clock);
     let mut liveness = Liveness::new(Settings {
         local: me,
-        run: raise_run(&file),
+        run,
         max_peers: nodes as usize,
         history: Exposure::new(),
     })
@@ -258,7 +276,9 @@ async fn member(me: u64, nodes: u64, file: std::path::PathBuf) {
     // When the flush in flight was asked for, on the host clock.
     let mut flight: Option<u64> = None;
     let mut disk = Disk::Running;
-    let mut flush_most = 0u64;
+    let mut flush_most = run_write;
+    // The time its writes took, all told: time its heartbeats waited on its device.
+    let mut blocked = run_write;
     let mut reported_at = 0u64;
     let mut heard_all = false;
     let mut command = [0u8; 16];
@@ -280,6 +300,8 @@ async fn member(me: u64, nodes: u64, file: std::path::PathBuf) {
         disk,
         flight,
         flush_most,
+        blocked,
+        flushed: false,
     };
     if report(
         &member,
@@ -331,20 +353,22 @@ async fn member(me: u64, nodes: u64, file: std::path::PathBuf) {
             })
             .await;
         }
-        let stall = match woke_with {
-            Some(1) if command[0] == STOPPED => {
-                disk = Disk::Stopped;
-                false
-            }
-            Some(length) => length > 1,
-            None => false,
-        };
-        if stall {
+        let said = woke_with.and_then(|length| command.get(..length));
+        if said == Some(&[STOPPED][..]) {
+            disk = Disk::Stopped;
+        }
+        if said == Some(STALL) {
             disk = if requests.try_send(Request::Stall).is_ok() {
                 Disk::Asked
             } else {
                 Disk::Refused
             };
+            continue;
+        }
+        if said == Some(HOLD) {
+            // Held, answering nothing, until the supervisor writes a byte on standard input (or
+            // closes it, gone).
+            let _ = std::io::Read::read(&mut std::io::stdin(), &mut [0u8; 1]);
             continue;
         }
         let mut asked = Asked {
@@ -364,9 +388,12 @@ async fn member(me: u64, nodes: u64, file: std::path::PathBuf) {
         for (from, at, message) in &inbox {
             let _ = liveness.on_heartbeat(*from, message, *at, &mut asked);
         }
+        let mut flushed = false;
         while let Ok((started, durable)) = completions.try_recv() {
             flight = None;
+            flushed = true;
             flush_most = flush_most.max(durable.saturating_sub(started));
+            blocked = blocked.saturating_add(durable.saturating_sub(started));
             liveness.on_durable(Write::Liveness, started, durable);
         }
         let now = clock.now_ns();
@@ -382,6 +409,8 @@ async fn member(me: u64, nodes: u64, file: std::path::PathBuf) {
             disk,
             flight,
             flush_most,
+            blocked,
+            flushed,
         };
         if report(
             &member,
@@ -417,9 +446,11 @@ async fn member(me: u64, nodes: u64, file: std::path::PathBuf) {
 
 /// The member's run: the count kept beside its file raised by one (one where there is none), a
 /// record kept whole and durable before the stream sends anything under it, as an owner keeps it
-/// (`hyper_liveness::Settings::run`; hyper-raft-e2e's `run`). A member started once on a fresh
+/// (`hyper_liveness::Settings::run`; hyper-raft-e2e's `run`), and how long the record's write took
+/// on `clock`, nanoseconds: written whole, flushed with the platform's full flush and its directory
+/// flushed after, on the device its liveness writes go to. A member started once on a fresh
 /// directory is in its first.
-fn raise_run(file: &std::path::Path) -> u64 {
+fn raise_run(file: &std::path::Path, clock: &Clock) -> (u64, u64) {
     let mut name = file.as_os_str().to_owned();
     name.push(".run");
     let path = std::path::PathBuf::from(name);
@@ -427,8 +458,9 @@ fn raise_run(file: &std::path::Path) -> u64 {
         .unwrap()
         .map_or(0, |count| u64::from_le_bytes(count.try_into().unwrap()));
     let run = previous + 1;
+    let started = clock.now_ns();
     hyper_block::record::write(&path, &run.to_le_bytes()).unwrap();
-    run
+    (run, clock.now_ns().saturating_sub(started))
 }
 
 /// Charges each detector the election the library's law gives this member's group, over the round
@@ -481,13 +513,19 @@ struct Member {
     disk: Disk,
     /// When the flush in flight was asked for, on the host clock.
     flight: Option<u64>,
-    /// The longest flush its disk has taken, nanoseconds.
+    /// The longest write its disk has taken, its run's record's or a flush, nanoseconds.
     flush_most: u64,
+    /// The time its writes took, all told, nanoseconds: time its heartbeats waited on its device.
+    blocked: u64,
+    /// Whether a flush completed since its last turn.
+    flushed: bool,
 }
 
-/// A line for each suspicion as it happens, and a state line with each change and otherwise once
-/// the member's shortest interval has passed since the last (its floor before any pair has one),
-/// the soonest its evidence can move again; the supervisor waits on what they say.
+/// A line for each suspicion as it happens, and a state line with each change, at each flush
+/// completed (what the write took), and otherwise once the member's shortest interval has passed
+/// since the last (its floor before any pair has one), the soonest its evidence can move again; the
+/// supervisor waits on what they say. A member whose thread runs states at least once a period; one
+/// that states nothing is in a write, held, or not scheduled.
 fn report(
     member: &Member,
     liveness: &Liveness,
@@ -521,16 +559,17 @@ fn report(
         .min()
         .or_else(|| liveness.floor())
         .map_or(0, nanos);
-    if changes.is_empty() && now < reported_at.saturating_add(period) {
+    if changes.is_empty() && !member.flushed && now < reported_at.saturating_add(period) {
         return out.flush();
     }
     *reported_at = now;
     let mut line = format!(
-        "state {me} {now} {} {} {} {} {}",
+        "state {me} {now} {} {} {} {} {} {}",
         member.disk.letter(),
         member.flight.unwrap_or(0),
         liveness.floor().map_or(0, nanos),
         member.flush_most,
+        member.blocked,
         nanos(liveness.latest_wake(now)),
     );
     for peer in peers {
@@ -602,10 +641,11 @@ struct Stated {
     /// the host clock.
     disk: char,
     flight: u64,
-    /// Its floor `E[flush] + G`, its longest flush, and the latest its wakes came past what they
-    /// asked, nanoseconds.
+    /// Its floor `E[flush] + G`, its longest write, the time its writes took all told, and the
+    /// latest its wakes came past what they asked, nanoseconds.
     floor: u64,
     flush_most: u64,
+    blocked: u64,
     late: u64,
     peers: BTreeMap<u64, Seen>,
 }
@@ -640,6 +680,7 @@ fn parse(line: &str) -> Option<Line> {
                 flight: fields.next()?.parse().ok()?,
                 floor: fields.next()?.parse().ok()?,
                 flush_most: fields.next()?.parse().ok()?,
+                blocked: fields.next()?.parse().ok()?,
                 late: fields.next()?.parse().ok()?,
                 peers: BTreeMap::new(),
             };
@@ -703,9 +744,81 @@ fn parse(line: &str) -> Option<Line> {
 }
 
 /// RFC 6298 §2.1 and §2.4: the retransmission timeout before any round trip is measured, and the
-/// least it is ever set to after, one second: the quiet period before any member has stated a law
-/// (hyper-durable-e2e's waits take it so).
+/// least it is ever set to after, one second: the quiet period before any member has stated a law,
+/// and how long past its due a member's line may be before a check calls it unheard, as an ask the
+/// E2E harnesses wait that long for its answer (`hyper_raft_e2e::quiet`).
 const RTO: Duration = Duration::from_secs(1);
+
+/// The nanoseconds of `d`, the most a `u64` holds where it holds no more.
+fn nanos(d: Duration) -> u64 {
+    u64::try_from(d.as_nanos()).unwrap_or(u64::MAX)
+}
+
+/// Why a wait gave up.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Stuck {
+    /// Nothing moved for the quiet period, at a check that heard every member.
+    Quiet(Duration),
+    /// A member stated nothing for `silence` past its due, past the `excuse` the members' longest
+    /// write and the quiet period make.
+    Silent {
+        member: u64,
+        silence: Duration,
+        excuse: Duration,
+    },
+}
+
+impl std::fmt::Display for Stuck {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Quiet(period) => write!(f, "nothing moved for {period:?}"),
+            Self::Silent {
+                member,
+                silence,
+                excuse,
+            } => write!(
+                f,
+                "member {member} stated nothing for {silence:?} past its due, past the {excuse:?} \
+                 the members' longest write and the quiet period excuse"
+            ),
+        }
+    }
+}
+
+/// What a check leaves a wait to do: look again at a time (or at a line that comes first), or wait
+/// on to a quiet period's end the members' writes extended.
+#[derive(Clone, Copy, Debug)]
+enum Next {
+    Look(u64),
+    Extended(u64),
+}
+
+/// What the waits' checks have seen, for the dumps.
+#[derive(Clone, Copy, Debug, Default)]
+struct Checks {
+    /// Checks that did not hear every member.
+    unheard: u64,
+    /// The longest a check found a member silent past its due, and what was excused then.
+    silence_most: Duration,
+    excused_then: Duration,
+    /// The time waits were extended for members' writes, all told, and the most at one check.
+    extended_ns: u64,
+    extended_most_ns: u64,
+}
+
+/// When a member's next line is due, nanoseconds after its latest: once its statement period, its
+/// shortest interval (its floor before any pair has one), has passed, and its wakes' latest
+/// lateness past that. A member whose thread runs states at least so often.
+fn due_after(stated: &Stated) -> u64 {
+    let period = stated
+        .peers
+        .values()
+        .map(|seen| seen.interval)
+        .filter(|interval| *interval > 0)
+        .min()
+        .unwrap_or(stated.floor);
+    period.saturating_add(stated.late)
+}
 
 struct Supervisor {
     /// The member processes still running, killed when the supervisor ends however it ends.
@@ -722,22 +835,41 @@ struct Supervisor {
     /// The first state line in which each member stated each pair configured: `(member, peer)` to
     /// its time on the host clock, which is no earlier than the configuration.
     configured_since: BTreeMap<(u64, u64), u64>,
+    /// What the checks have seen, and why the latest wait that gave up did.
+    checks: Checks,
+    stuck: Option<Stuck>,
 }
 
 impl Supervisor {
-    /// The next line any member reports within `left`, folded in; nothing, past it.
-    fn next(&mut self, left: Duration, what: &str) {
+    /// The next line any member reports within `left`, folded in: the member that stated it;
+    /// nothing, past it.
+    fn next(&mut self, left: Duration, what: &str) -> Option<u64> {
         let line = match self.lines.recv_timeout(left) {
             Ok(line) => line,
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => return,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => return None,
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                 panic!("{what}: every member stopped reporting\n{}", self.dump())
             }
         };
+        Some(self.fold(&line))
+    }
+
+    /// Every line already come, folded in: the members that stated one. A check judges what the
+    /// members wrote before it, not what waits in the supervisor's own queue.
+    fn drain(&mut self) -> Vec<u64> {
+        let mut stated = Vec::new();
+        while let Ok(line) = self.lines.try_recv() {
+            stated.push(self.fold(&line));
+        }
+        stated
+    }
+
+    /// Folds `line` in; the member that stated it (zero for a line that does not parse).
+    fn fold(&mut self, line: &str) -> u64 {
         if self.trace {
             eprintln!("{line}");
         }
-        match parse(&line) {
+        match parse(line) {
             Some(Line::State(member, stated)) => {
                 for (peer, seen) in &stated.peers {
                     if seen.configured {
@@ -747,12 +879,17 @@ impl Supervisor {
                     }
                 }
                 self.latest.insert(member, stated);
+                member
             }
             Some(Line::Suspect(member, peer, suspected)) => {
                 self.suspicions.push((member, peer, suspected));
+                member
             }
-            Some(Line::Heard(member)) => self.heard.push(member),
-            None => {}
+            Some(Line::Heard(member)) => {
+                self.heard.push(member);
+                member
+            }
+            None => 0,
         }
     }
 
@@ -832,88 +969,276 @@ impl Supervisor {
         })
     }
 
-    /// Waits until `fact` holds of what the members stated, while they move toward it. Fails
-    /// with every member's last state once a quiet period passes with nothing moving, or once a
-    /// pair takes more heartbeats unconfigured than any window holds. A quiet period through which
-    /// a member whose disk runs waited on one flush is that disk's, not the members' law: the
-    /// slowest part of a member's law is its flush, which it measures only once the flush
-    /// completes. One through which a member has stated nothing yet is its scheduler's, while its
-    /// process runs. The wait goes on through either, saying on stderr what it waits for.
-    fn until(&mut self, what: &str, fact: impl Fn(&Self) -> bool) {
+    /// Waits until `fact` holds of what the members stated, while they move toward it, by the rule
+    /// the E2E harnesses' waits keep (`hyper_raft_e2e::quiet`), in this test's terms: the members
+    /// state lines, and the supervisor reads them.
+    ///
+    /// The wait goes on while the members' statements move (`signature`), and once a quiet period
+    /// passes with nothing moved it checks, over every line already come. Quiet is only time in
+    /// which the supervisor heard every member: a member's line is due once its statement period
+    /// and its wakes' lateness have passed since its latest, and one past its due by a
+    /// retransmission timeout, the time an E2E harness waits for an answer, is unheard: in a
+    /// write, held, or not scheduled. A check while a member is unheard decides nothing, and a line
+    /// from a member that was unheard counts as movement. The time the members say their writes
+    /// took since the last check extends the wait by the most any one of them took: a member's
+    /// heartbeats wait on its flushes, so time in them moves nothing. A member silent past its due
+    /// by more than the longest write any member has stated (its run's record or a flush) and the
+    /// quiet period ends the wait, named, whatever else moves, rather than waiting for good. A
+    /// member that has stated nothing yet has no law to bound the wait: it states once its process
+    /// is scheduled, and one whose process ended fails the wait. A pair that takes more heartbeats
+    /// unconfigured than any window holds fails it at once.
+    fn until(&mut self, what: &str, fact: impl Fn(&Self) -> bool) -> Result<(), Stuck> {
+        self.stuck = None;
         let mut seen = self.signature();
-        let mut moved_at = self.clock.now_ns();
+        let mut deadline = self.clock.now_ns().saturating_add(nanos(self.quiet()));
+        // What each member said its writes had taken when the last check heard it, or at its
+        // first line of the wait.
+        let mut blocked: BTreeMap<u64, u64> = self
+            .latest
+            .iter()
+            .map(|(member, stated)| (*member, stated.blocked))
+            .collect();
+        let mut unheard = self.unheard(self.clock.now_ns());
+        // When the wait looks next: the quiet period's end, or a check's look again.
+        let mut look = deadline;
         while !fact(self) {
-            let quiet = u64::try_from(self.quiet().as_nanos()).unwrap_or(u64::MAX);
             let now = self.clock.now_ns();
-            let left = moved_at.saturating_add(quiet).saturating_sub(now);
-            if left == 0 {
-                // A member that has stated nothing yet has no law to bound the wait: it states
-                // once its process is scheduled, and one whose process ended fails the wait.
-                let silent: Vec<u64> = self
-                    .members
-                    .0
-                    .keys()
-                    .copied()
-                    .filter(|id| !self.latest.contains_key(id))
-                    .collect();
-                for id in &silent {
-                    let ended = self
-                        .members
-                        .0
-                        .get_mut(id)
-                        .and_then(|child| child.try_wait().unwrap());
-                    if let Some(status) = ended {
-                        panic!(
-                            "{what}: member {id} ended before it stated anything: {status}\n{}",
-                            self.dump()
-                        );
-                    }
+            let wake = look.min(self.silent_at(&unheard).unwrap_or(u64::MAX));
+            let stated: Vec<u64> = if now < wake {
+                self.next(Duration::from_nanos(wake - now), what)
+                    .into_iter()
+                    .collect()
+            } else {
+                self.drain()
+            };
+            self.unresolved_fails(what);
+            // A member's first line of the wait is where its writes' time is counted from.
+            for member in &stated {
+                if let Some(latest) = self.latest.get(member) {
+                    blocked.entry(*member).or_insert(latest.blocked);
                 }
-                let on_disk = self.latest.values().any(|stated| {
-                    matches!(stated.disk, 'R' | 'X')
-                        && stated.flight != 0
-                        && stated.flight <= moved_at
-                });
-                assert!(
-                    on_disk || !silent.is_empty(),
-                    "{what}: nothing moved for {:?}\n{}",
-                    self.quiet(),
-                    self.dump()
-                );
-                if silent.is_empty() {
-                    eprintln!("{what}: waiting on a flush\n{}", self.dump());
-                } else {
-                    eprintln!("{what}: waiting for members {silent:?} to state anything");
-                }
-                moved_at = now;
+            }
+            let now = self.clock.now_ns();
+            let back = stated.iter().any(|member| unheard.contains(member));
+            unheard = self.unheard(now);
+            self.silence(now, &unheard)
+                .inspect_err(|stuck| self.stuck = Some(*stuck))?;
+            let signature = self.signature();
+            if signature != seen || back {
+                seen = signature;
+                deadline = now.saturating_add(nanos(self.quiet()));
+                look = deadline;
                 continue;
             }
-            self.next(Duration::from_nanos(left), what);
-            if let Some((member, peer, taken)) = self.unresolved() {
-                panic!(
-                    "{what}: member {member} took {taken} heartbeats from {peer} unconfigured, \
-                     more than any window holds\n{}",
-                    self.dump()
-                );
+            if now < deadline {
+                look = deadline;
+                continue;
             }
-            let now = self.signature();
-            if now != seen {
-                seen = now;
-                moved_at = self.clock.now_ns();
+            match self
+                .check(what, now, deadline, &unheard, &mut blocked)
+                .inspect_err(|stuck| self.stuck = Some(*stuck))?
+            {
+                Next::Look(at) => look = at,
+                Next::Extended(to) => {
+                    deadline = to;
+                    look = to;
+                }
             }
+        }
+        Ok(())
+    }
+
+    /// The members up whose latest line is past its due ([`due_after`]) by more than a
+    /// retransmission timeout at `now`: the members the supervisor does not hear.
+    fn unheard(&self, now: u64) -> Vec<u64> {
+        let rto = nanos(RTO);
+        self.latest
+            .iter()
+            .filter(|(member, _)| self.members.0.contains_key(member))
+            .filter(|(_, stated)| {
+                let due = stated.at.saturating_add(due_after(stated));
+                now.saturating_sub(due) > rto
+            })
+            .map(|(member, _)| *member)
+            .collect()
+    }
+
+    /// What the members' own measures excuse of a member's silence past its due: the longest write
+    /// any member has stated, and the quiet period.
+    fn excuse(&self) -> u64 {
+        let write_most = self
+            .latest
+            .values()
+            .map(|stated| stated.flush_most)
+            .max()
+            .unwrap_or(0);
+        nanos(self.quiet()).saturating_add(write_most)
+    }
+
+    /// When the first of the members in `unheard` would be silent past the excuse.
+    fn silent_at(&self, unheard: &[u64]) -> Option<u64> {
+        let past = nanos(RTO).saturating_add(self.excuse());
+        unheard
+            .iter()
+            .filter_map(|member| self.latest.get(member))
+            .map(|stated| {
+                stated
+                    .at
+                    .saturating_add(due_after(stated))
+                    .saturating_add(past)
+            })
+            .min()
+    }
+
+    /// Ends the wait once a member in `unheard` has been silent past its due, less the
+    /// retransmission timeout a check waits past it, for longer than the excuse.
+    fn silence(&mut self, now: u64, unheard: &[u64]) -> Result<(), Stuck> {
+        let excuse = self.excuse();
+        for member in unheard {
+            let Some(stated) = self.latest.get(member) else {
+                continue;
+            };
+            let silence = now
+                .saturating_sub(stated.at.saturating_add(due_after(stated)))
+                .saturating_sub(nanos(RTO));
+            if silence > nanos(self.checks.silence_most) {
+                self.checks.silence_most = Duration::from_nanos(silence);
+                self.checks.excused_then = Duration::from_nanos(excuse);
+            }
+            if silence > excuse {
+                return Err(Stuck::Silent {
+                    member: *member,
+                    silence: Duration::from_nanos(silence),
+                    excuse: Duration::from_nanos(excuse),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// A check at `now`, once the quiet period passed at `deadline` with nothing moved: when the
+    /// wait looks again, or why it gives up. A check while a member is unheard, or has stated
+    /// nothing yet, decides nothing: the wait looks again once the first unheard member would be
+    /// silent past the excuse, if no line comes first. A check while a member's line is past its
+    /// due, but not yet by a retransmission timeout, is a look still waiting for its answer: it
+    /// looks again at that line, or once that timeout has passed. Otherwise the time the members'
+    /// writes took since the last check extends the deadline by the most any one took.
+    fn check(
+        &mut self,
+        what: &str,
+        now: u64,
+        deadline: u64,
+        unheard: &[u64],
+        blocked: &mut BTreeMap<u64, u64>,
+    ) -> Result<Next, Stuck> {
+        let unstated = self.unstated(what);
+        if !unheard.is_empty() || !unstated.is_empty() {
+            self.checks.unheard = self.checks.unheard.saturating_add(1);
+            if !unstated.is_empty() {
+                eprintln!("{what}: waiting for members {unstated:?} to state anything");
+            }
+            let again = self
+                .silent_at(unheard)
+                .unwrap_or(now.saturating_add(nanos(self.quiet())));
+            return Ok(Next::Look(again.max(now.saturating_add(1))));
+        }
+        let rto = nanos(RTO);
+        let answer_by = self
+            .latest
+            .iter()
+            .filter(|(member, _)| self.members.0.contains_key(member))
+            .map(|(_, stated)| stated.at.saturating_add(due_after(stated)))
+            .filter(|due| *due < now)
+            .map(|due| due.saturating_add(rto))
+            .min();
+        if let Some(at) = answer_by {
+            return Ok(Next::Look(at.max(now.saturating_add(1))));
+        }
+        let excused = self
+            .latest
+            .iter()
+            .map(|(member, stated)| {
+                let before = blocked.insert(*member, stated.blocked);
+                before.map_or(0, |before| stated.blocked.saturating_sub(before))
+            })
+            .max()
+            .unwrap_or(0);
+        self.checks.extended_ns = self.checks.extended_ns.saturating_add(excused);
+        self.checks.extended_most_ns = self.checks.extended_most_ns.max(excused);
+        let deadline = deadline.saturating_add(excused);
+        if now < deadline {
+            Ok(Next::Extended(deadline))
+        } else {
+            Err(Stuck::Quiet(self.quiet()))
         }
     }
 
-    /// Every member's last state and the suspicions reported, for a wait that failed.
+    /// The members that have stated nothing yet, each waited on while its process runs: one whose
+    /// process ended fails the wait.
+    fn unstated(&mut self, what: &str) -> Vec<u64> {
+        let unstated: Vec<u64> = self
+            .members
+            .0
+            .keys()
+            .copied()
+            .filter(|id| !self.latest.contains_key(id))
+            .collect();
+        for id in &unstated {
+            let ended = self
+                .members
+                .0
+                .get_mut(id)
+                .and_then(|child| child.try_wait().unwrap());
+            if let Some(status) = ended {
+                panic!(
+                    "{what}: member {id} ended before it stated anything: {status}\n{}",
+                    self.dump()
+                );
+            }
+        }
+        unstated
+    }
+
+    /// Fails the wait once a pair has taken more heartbeats unconfigured than any window holds.
+    fn unresolved_fails(&self, what: &str) {
+        if let Some((member, peer, taken)) = self.unresolved() {
+            panic!(
+                "{what}: member {member} took {taken} heartbeats from {peer} unconfigured, \
+                 more than any window holds\n{}",
+                self.dump()
+            );
+        }
+    }
+
+    /// Waits until `fact` holds, as [`Supervisor::until`] does, and fails the test with every
+    /// member's last state if the wait gives up.
+    fn wait(&mut self, what: &str, fact: impl Fn(&Self) -> bool) {
+        if let Err(stuck) = self.until(what, fact) {
+            panic!("{what}: {stuck}\n{}", self.dump());
+        }
+    }
+
+    /// Every member's last state and the suspicions reported, for a wait that failed: why it gave
+    /// up, the quiet period, what the checks saw, and each member's latest line.
     fn dump(&self) -> String {
         let now = self.clock.now_ns();
         let ms = |ns: u64| ns as f64 / 1e6;
-        let mut out = format!("quiet period {:?}", self.quiet());
+        let mut out = match &self.stuck {
+            Some(stuck) => format!("{stuck}; "),
+            None => String::new(),
+        };
+        out.push_str(&format!(
+            "quiet period {:?}; {}",
+            self.quiet(),
+            self.account()
+        ));
         for (member, stated) in &self.latest {
             out.push_str(&format!(
-                "\n  member {member}, stated {:.1} ms ago: disk {} flush in flight {} floor \
-                 {:.3} ms longest flush {:.3} ms wakes up to {:.3} ms late",
+                "\n  member {member}, stated {:.1} ms ago, due {:.1} ms after: disk {} flush in \
+                 flight {} floor {:.3} ms longest write {:.3} ms writes {:.1} ms all told wakes up \
+                 to {:.3} ms late",
                 ms(now.saturating_sub(stated.at)),
+                ms(due_after(stated)),
                 stated.disk,
                 if stated.flight == 0 {
                     "none".to_owned()
@@ -922,6 +1247,7 @@ impl Supervisor {
                 },
                 ms(stated.floor),
                 ms(stated.flush_most),
+                ms(stated.blocked),
                 ms(stated.late),
             ));
             for (peer, seen) in &stated.peers {
@@ -956,6 +1282,23 @@ impl Supervisor {
             ));
         }
         out
+    }
+
+    /// What the checks have seen: the checks that did not hear every member, the longest silence
+    /// past a member's due and what was excused then, and how far waits were extended for the
+    /// members' writes.
+    fn account(&self) -> String {
+        let c = self.checks;
+        format!(
+            "checks that did not hear every member {}, the longest silence past a due {:.1} ms \
+             against {:.1} ms excused, waits extended {:.1} ms for members' writes (at most {:.1} \
+             ms at once)",
+            c.unheard,
+            c.silence_most.as_secs_f64() * 1e3,
+            c.excused_then.as_secs_f64() * 1e3,
+            c.extended_ns as f64 / 1e6,
+            c.extended_most_ns as f64 / 1e6,
+        )
     }
 
     /// Whether `member` stated, at or after `since` on the host clock, that it holds `peer`
@@ -1080,6 +1423,8 @@ fn start(nodes: u64) -> Group {
             suspicions: Vec::new(),
             heard: Vec::new(),
             configured_since: BTreeMap::new(),
+            checks: Checks::default(),
+            stuck: None,
         },
         wakes,
     }
@@ -1102,7 +1447,7 @@ fn a_stalled_disk_and_a_killed_node_are_suspected_and_no_live_one_is() {
     let clock = Clock::new().unwrap();
 
     // Every pair configured.
-    supervisor.until("every pair configured", |s| {
+    supervisor.wait("every pair configured", |s| {
         s.latest.len() == NODES as usize
             && s.latest.values().all(|stated| {
                 stated.peers.len() == NODES as usize - 1
@@ -1117,7 +1462,7 @@ fn a_stalled_disk_and_a_killed_node_are_suspected_and_no_live_one_is() {
         .send_to(b"stall", ("127.0.0.1", wakes[&STALLED] as u16))
         .unwrap();
     let watchers: Vec<u64> = (1..=NODES).filter(|m| *m != STALLED).collect();
-    supervisor.until("every other member suspects the stalled disk", |s| {
+    supervisor.wait("every other member suspects the stalled disk", |s| {
         watchers
             .iter()
             .all(|m| s.holds_suspected(*m, STALLED, stalled_at))
@@ -1141,7 +1486,7 @@ fn a_stalled_disk_and_a_killed_node_are_suspected_and_no_live_one_is() {
     victim.kill().unwrap();
     victim.wait().unwrap();
     let survivors: Vec<u64> = (1..=NODES).filter(|m| *m != KILLED).collect();
-    supervisor.until("every survivor suspects the killed member", |s| {
+    supervisor.wait("every survivor suspects the killed member", |s| {
         survivors
             .iter()
             .all(|m| s.holds_suspected(*m, KILLED, killed_at))
@@ -1161,7 +1506,7 @@ fn a_stalled_disk_and_a_killed_node_are_suspected_and_no_live_one_is() {
     let live: Vec<u64> = (1..=NODES)
         .filter(|m| *m != STALLED && *m != KILLED)
         .collect();
-    supervisor.until("each live member states both suspected", |s| {
+    supervisor.wait("each live member states both suspected", |s| {
         live.iter().all(|m| {
             s.holds_suspected(*m, STALLED, killed_at) && s.holds_suspected(*m, KILLED, killed_at)
         })
@@ -1237,13 +1582,13 @@ fn a_node_killed_in_its_first_heartbeats_is_suspected_once_a_sibling_has_its_evi
         ..
     } = start(YOUNG_NODES);
     let clock = Clock::new().unwrap();
-    supervisor.until("the victim heard every peer", |s| s.heard.contains(&victim));
+    supervisor.wait("the victim heard every peer", |s| s.heard.contains(&victim));
     let mut child = supervisor.members.0.remove(&victim).unwrap();
     let killed_at = clock.now_ns();
     child.kill().unwrap();
     child.wait().unwrap();
     let survivors: Vec<u64> = (1..YOUNG_NODES).collect();
-    supervisor.until("every survivor suspects the young victim", |s| {
+    supervisor.wait("every survivor suspects the young victim", |s| {
         survivors
             .iter()
             .all(|m| s.holds_suspected(*m, victim, killed_at))
@@ -1282,4 +1627,141 @@ fn a_node_killed_in_its_first_heartbeats_is_suspected_once_a_sibling_has_its_evi
         ));
     }
     println!("a node killed in its first heartbeats was noticed dead after {noticed:?}");
+}
+
+/// Members of the group one of which the supervisor stops: the fewest that judge a member by the
+/// others' word, as the young victim's group.
+const STOPPED_NODES: u64 = 3;
+
+impl Supervisor {
+    /// Stops member `id` without ending it: it stays up and states nothing, as a member deadlocked
+    /// does. `SIGSTOP` on Unix.
+    #[cfg(unix)]
+    fn stop_member(&mut self, id: u64, _wake: u16) {
+        self.signal(id, "-STOP");
+    }
+
+    /// Windows has no signal that stops a process: the member is told on its wake socket to hold
+    /// its thread until a byte comes on its standard input.
+    #[cfg(windows)]
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "real processes on the host's clock, threads and environment (CLAUDE.md §1a, end to end)"
+    )]
+    fn stop_member(&mut self, _id: u64, wake: u16) {
+        UdpSocket::bind("127.0.0.1:0")
+            .unwrap()
+            .send_to(HOLD, ("127.0.0.1", wake))
+            .unwrap();
+    }
+
+    /// Lets member `id` go on after [`Supervisor::stop_member`], and waits, while its process runs,
+    /// for its first line since: what it stated before it stopped is no word of it since, and the
+    /// silence the supervisor ordered is not the member's (as hyper-raft-e2e's `thaw`).
+    fn release_member(&mut self, id: u64, what: &str) {
+        let released = self.clock.now_ns();
+        #[cfg(unix)]
+        self.signal(id, "-CONT");
+        #[cfg(windows)]
+        {
+            let child = self.members.0.get_mut(&id).unwrap();
+            let stdin = child.stdin.as_mut().unwrap();
+            stdin.write_all(&[1]).unwrap();
+            stdin.flush().unwrap();
+        }
+        while !self
+            .latest
+            .get(&id)
+            .is_some_and(|stated| stated.at > released)
+        {
+            if self.next(RTO, what).is_none() {
+                let ended = self
+                    .members
+                    .0
+                    .get_mut(&id)
+                    .and_then(|child| child.try_wait().unwrap());
+                assert!(ended.is_none(), "{what}: member {id} ended while stopped");
+            }
+        }
+    }
+
+    /// Sends `signal` to member `id`'s process with the system's `kill`.
+    #[cfg(unix)]
+    fn signal(&mut self, id: u64, signal: &str) {
+        let pid = self.members.0[&id].id();
+        let status = Command::new("kill")
+            .args([signal, &pid.to_string()])
+            .status()
+            .unwrap();
+        assert!(status.success(), "kill {signal} {pid} failed: {status}");
+    }
+}
+
+/// A member stopped (`SIGSTOP`; on Windows, which has no signal that stops a process, it holds its
+/// thread until a byte comes on its standard input), once every pair is configured: the wait for a
+/// line only it can state fails, naming it, once its silence past its due passes what the members'
+/// longest write and the quiet period excuse, rather than waiting for good. Let go, it states
+/// again, and every other member states it trusted.
+#[test]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "real processes on the host's clock, threads and environment (CLAUDE.md §1a, end to end)"
+)]
+fn a_stopped_member_fails_the_wait_that_needs_it_by_name() {
+    if std::env::var("HYPER_LIVENESS_NODE").is_ok() {
+        return;
+    }
+    let Group {
+        _directory,
+        mut supervisor,
+        wakes,
+    } = start(STOPPED_NODES);
+    let clock = Clock::new().unwrap();
+    supervisor.wait("every pair configured", |s| {
+        s.latest.len() == STOPPED_NODES as usize
+            && s.latest.values().all(|stated| {
+                stated.peers.len() == STOPPED_NODES as usize - 1
+                    && stated.peers.values().all(|p| p.configured)
+            })
+    });
+    let stopped = STOPPED_NODES;
+    supervisor.stop_member(stopped, wakes[&stopped] as u16);
+    let stopped_at = clock.now_ns();
+    let outcome = supervisor.until("the stopped member states again", |s| {
+        s.latest
+            .get(&stopped)
+            .is_some_and(|stated| stated.at > stopped_at)
+    });
+    let Err(Stuck::Silent {
+        member,
+        silence,
+        excuse,
+    }) = outcome
+    else {
+        panic!(
+            "the wait for the stopped member ended {outcome:?}, not naming it silent\n{}",
+            supervisor.dump()
+        );
+    };
+    assert_eq!(
+        member, stopped,
+        "the wait named member {member}, not member {stopped}, which was stopped"
+    );
+    let released_at = clock.now_ns();
+    supervisor.release_member(stopped, "the released member states again");
+    let others: Vec<u64> = (1..STOPPED_NODES).collect();
+    supervisor.wait("the released member is trusted", |s| {
+        others.iter().all(|m| {
+            s.latest.get(m).is_some_and(|stated| {
+                stated.at > released_at
+                    && stated.peers.get(&stopped).is_some_and(|p| p.trust == 'T')
+            })
+        })
+    });
+    supervisor.members.stop();
+    println!(
+        "a member stopped: the wait for it failed after {silence:?} of its silence past its due \
+         against {excuse:?} excused, naming it; let go, it was trusted again; {}",
+        supervisor.account()
+    );
 }

@@ -1847,10 +1847,29 @@ cause is in the library (`docs/timing.md` §2.7 records each):
 - in the test itself: a death adopted by gossip was noted only at the next period's report, and a
   member's last answer was recorded only for a probe it still held outstanding.
 
+**A kill under the pairs' own estimators (2026-10-03).** The series above killed once, as soon as
+every pair was judged, which on loopback is mostly by the pools (a mean of 0.0 to 0.3 of the twelve
+pairs judged by their own estimators at the kill), so the end-to-end test never condemned under a
+pair's own detector. The test now runs five members in two phases: the kill as before, then, once
+every survivor holds that victim dead, a wait until every surviving pair is judged by its own
+estimator and a second kill (`docs/timing.md` §2.7). 40 runs on this machine, each a fresh
+supervisor, 2026-10-03 at 00:20–00:25 PDT, load 45.2–57.6, every run passing:
+
+| Phase | Pairs judged by their own estimator at the kill | Detection median / p95 / max | Stated bound median / max |
+|---|---|---|---|
+| the pools' | a mean of 1.2 of 20, at most 11 | 4.8 / 11.0 / 14.5 ms | 22.7 / 79.6 ms |
+| the pairs' own | 12 of 12, every run | 15.6 / 46.8 / 87.8 ms | 84.5 / 517.5 ms |
+
+Suspicions of live members, summed over the runs, 2 (Theorem 7 allowed 5,080), condemnations 0
+(allowed 4,989): the longer run's young histories make the allowance loose, as before. A run took a
+median 0.58 s, the longest 5.0 s, waiting on the pairs' evidence. Detection under the pairs' own
+estimators is slower than under the pools': each pair's margin is configured at its own interval and
+grows with the MTBF the run has accrued (§2.7, "Open").
+
 ## Commands for the detector
 
 ```sh
-# The suites and the four-process kill test.
+# The suites and the five-process kill test.
 cargo test -p hyper-swim
 
 # Allocations a member a period.

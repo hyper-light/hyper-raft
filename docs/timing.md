@@ -522,14 +522,21 @@ its peers' estimators, coordinates and gossip reports without bound. Now:
 - the detection bound counts the most members the view has held at once, not the members it holds:
   a member forgotten since was in the rounds before.
 
-**What the cluster test asserts** (`crates/hyper-swim/tests/cluster.rs`, §2.5). Four member
-processes run the detector as the library configures it. The supervisor waits on facts: every member
-judging every peer by a configured verdict (the pair's own, or the pool's while the pair's estimator
-refuses), then it kills one; every survivor holds it dead, each within the bound its detector
-stated, measured on the member's clock from the victim's last answer. Waiting for every pair's own
-estimator was not a fact to wait on: under a CPU throttle a pair's round trips can stay too
-correlated for `τ_int` to be measured, and the estimator rightly refuses for as long as that lasts.
-Of live members it asserts what the configuration promises: Theorem 7 bounds the expected number of
+**What the cluster test asserts** (`crates/hyper-swim/tests/cluster.rs`, §2.5). Five member
+processes run the detector as the library configures it, in two phases. The supervisor waits on
+facts: every member judging every peer by a configured verdict (the pair's own, or the pool's while
+the pair's estimator refuses), then it kills one; every survivor holding it dead; then every surviving
+pair judged by its own estimator, then it kills another; every survivor holding that one dead too.
+Each survivor holds each victim dead within the bound its detector stated, measured on the member's
+clock from the victim's last answer. The first kill comes within a few hundred milliseconds of the
+start, when most pairs are judged by the pools, and the test had only it: three local runs ended with
+none of the twelve pairs judged by its own estimator, so the end-to-end test never killed under a
+pair's own detector. The second phase is that kill; it is a longer run, which waits for the pairs' own
+evidence rather than a duration, and under a throttle that keeps a pair's round trips too correlated
+for `τ_int` to be measured it waits for as long as that lasts. A peer a member forgot after its
+death reports as forgotten, and a member keeps what its detector reported of each peer across the
+peer's being forgotten and adopted again. Of live members it asserts what the configuration promises,
+each pair's counts taken while its peer lived: Theorem 7 bounds the expected number of
 suspicions and of condemnations by `Σβ`, and a run refutes that only when the 95 % lower limit of
 its count (the Poisson score interval, as the replay and the trace analyser use, §2.6) passes it. A
 first form asserted the count itself within `Σβ`, which no detector can promise of one run: at an

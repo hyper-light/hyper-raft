@@ -98,11 +98,12 @@
   heal, a lost measurement probe ends at its expected arrival, a refused reconfiguration leaves the
   verdict in force, a re-adopted suspicion keeps its told probes, and the detection bound does not
   shrink with the round.
-- `tests/cluster.rs`: four real member processes run the detector over hyper-datagram on real
+- `tests/cluster.rs`: five real member processes run the detector over hyper-datagram on real
   UDP sockets, as the library configures it.
   - The supervisor starts them together, waits until every member judges every peer by a
-    configured verdict, and SIGKILLs one.
-  - Every survivor must hold it dead within the detection bound its own detector stated.
+    configured verdict, and SIGKILLs one; once every survivor holds it dead, it waits until every
+    surviving pair is judged by its own estimator, and SIGKILLs another.
+  - Every survivor must hold each victim dead within the detection bound its own detector stated.
   - Suspicions and condemnations of live members, summed over the cluster, must stay within the
     configured detectors' allowance `Σβ`.
   - The counts over hundreds of runs on macOS and Linux are in `docs/benchmarks.md`.

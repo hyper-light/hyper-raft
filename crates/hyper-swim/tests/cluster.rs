@@ -6,12 +6,15 @@
 //! `HYPER_SWIM_NODE`). Each runs the detector as the library configures it: it polls when the
 //! detector asks, sends what the detector returns, and prints, every period, its view and what its
 //! detector reports of each peer. The test times nothing of its own. The supervisor waits on
-//! facts:
+//! facts, in two phases:
 //! - every member judges every peer by a configured verdict, the pair's own or, while the pair's
-//!   estimator refuses, the pool's; then it SIGKILLs one member;
-//! - every survivor reports the victim dead, each within the detection bound its detector stated,
-//!   with the wait it measured for evidence of its own health added where its condemnation was
-//!   pending on it.
+//!   estimator refuses, the pool's; then it SIGKILLs one member ([`POOLED`]), which within a few
+//!   hundred milliseconds of the start is judged mostly by the pools;
+//! - every survivor reports it dead; then the run goes on until every surviving pair is judged by
+//!   its own estimator, and the supervisor SIGKILLs another ([`OWNED`]);
+//! - every survivor reports that one dead too. Each survivor holds each victim dead within the
+//!   detection bound its detector stated, with the wait it measured for evidence of its own health
+//!   added where its condemnation was pending on it.
 //!
 //! What it asserts of live members is what the configured detectors promise (`docs/timing.md`
 //! §2.7): Theorem 7 bounds the expected number of suspicions and condemnations of live members by
@@ -44,14 +47,17 @@ use hyper_datagram::{
 };
 use hyper_swim::HostId;
 use hyper_swim::codec::{Coordinate, GossipBatch, SwimMessage, gossip_capacity};
-use hyper_swim::detector::{Detector, PingReq};
+use hyper_swim::detector::{Detector, PeerReport, PingReq};
 use hyper_swim::membership::{Liveness, MemberState};
 use hyper_timing::Exposure;
 
-/// Members in the test cluster: the victim, a prober, and two members it can ask to relay.
-const NODES: u64 = 4;
-/// The member the supervisor kills.
-const VICTIM: u64 = NODES;
+/// Members in the test cluster: two victims, a prober, and two members it can ask to relay once both
+/// are dead.
+const NODES: u64 = 5;
+/// The member killed once every pair is judged, mostly by the pools.
+const POOLED: u64 = NODES;
+/// The member killed once every surviving pair is judged by its own estimator.
+const OWNED: u64 = NODES - 1;
 /// The path's datagram size: QUIC's minimum, which every path carries (RFC 9000 §14.1).
 const DATAGRAM: usize = 1_200;
 /// The 95 % score interval's lower end for a Poisson count `k` (`hyper_timing::poisson95`), with
@@ -149,6 +155,7 @@ fn member_process() {
         requests: Vec::new(),
         relaying: BTreeMap::new(),
         dead_seen: BTreeMap::new(),
+        tallies: BTreeMap::new(),
     };
     member.gossip = member.gossip_room();
     let mut period = 0u64;
@@ -186,6 +193,64 @@ struct Member {
     relaying: BTreeMap<u64, (u64, HostId, u64)>,
     /// When this member first saw each peer dead, and the bound its detector stated then.
     dead_seen: BTreeMap<u64, (Duration, Option<Duration>)>,
+    /// What its detector has reported of each peer, kept across the peer's being forgotten.
+    tallies: BTreeMap<u64, Tally>,
+}
+
+/// The suspicions and condemnations a member's detector reports of a peer, with their allowances.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct Counts {
+    suspicions: u64,
+    suspicion_allowance: f64,
+    condemnations: u64,
+    condemnation_allowance: f64,
+}
+
+impl Counts {
+    fn of(report: Option<PeerReport>) -> Self {
+        report.map_or_else(Self::default, |report| Self {
+            suspicions: report.suspicions,
+            suspicion_allowance: report.suspicion_allowance,
+            condemnations: report.condemnations,
+            condemnation_allowance: report.condemnation_allowance,
+        })
+    }
+
+    fn plus(self, other: Self) -> Self {
+        Self {
+            suspicions: self.suspicions + other.suspicions,
+            suspicion_allowance: self.suspicion_allowance + other.suspicion_allowance,
+            condemnations: self.condemnations + other.condemnations,
+            condemnation_allowance: self.condemnation_allowance + other.condemnation_allowance,
+        }
+    }
+
+    /// Whether any count is below `other`'s: counts only grow while a report lives.
+    fn below(self, other: Self) -> bool {
+        self.suspicions < other.suspicions
+            || self.suspicion_allowance < other.suspicion_allowance
+            || self.condemnations < other.condemnations
+            || self.condemnation_allowance < other.condemnation_allowance
+    }
+}
+
+/// A peer's counts across its reports: a report that goes with its member, forgotten once dead
+/// (a live member falsely condemned, then refuting late), or starts over, carries what it reached.
+#[derive(Clone, Copy, Debug, Default)]
+struct Tally {
+    carried: Counts,
+    last: Counts,
+}
+
+impl Tally {
+    fn update(&mut self, report: Option<PeerReport>) -> Counts {
+        let now = Counts::of(report);
+        if now.below(self.last) {
+            self.carried = self.carried.plus(self.last);
+        }
+        self.last = now;
+        self.carried.plus(now)
+    }
 }
 
 impl Member {
@@ -419,7 +484,9 @@ impl Member {
         let mut line = format!("{} {period}", self.me);
         for peer in (1..=NODES).filter(|peer| *peer != self.me) {
             let state = self.detector.membership().state(HostId(peer));
-            let report = self.detector.report(HostId(peer)).unwrap_or_default();
+            let held = self.detector.report(HostId(peer));
+            let counts = self.tallies.entry(peer).or_default().update(held);
+            let report = held.unwrap_or_default();
             let (after, within) = self.dead_seen.get(&peer).copied().unwrap_or_default();
             // Judged: a configured verdict times this member's probes of the peer, the pair's own
             // or, while the pair's estimator refuses, the pool's.
@@ -429,10 +496,10 @@ impl Member {
                 liveness_letter(state.map(|state| state.liveness)),
                 u8::from(judged),
                 u8::from(report.configured),
-                report.suspicions,
-                report.suspicion_allowance,
-                report.condemnations,
-                report.condemnation_allowance,
+                counts.suspicions,
+                counts.suspicion_allowance,
+                counts.condemnations,
+                counts.condemnation_allowance,
                 after.as_nanos(),
                 within.map_or(0, |w| w.as_nanos()),
             ));
@@ -578,82 +645,119 @@ fn a_killed_member_is_declared_dead_by_every_survivor_and_no_live_one_is() {
         writeln!(child.stdin.as_mut().unwrap(), "start").unwrap();
     }
 
-    let mut latest: BTreeMap<u64, BTreeMap<u64, Seen>> = BTreeMap::new();
-    let mut killed = false;
-    let judged_by = |latest: &BTreeMap<u64, BTreeMap<u64, Seen>>| {
-        latest.len() == NODES as usize
-            && latest
-                .values()
-                .all(|peers| peers.values().all(|seen| seen.judged))
-    };
-    let detected = |latest: &BTreeMap<u64, BTreeMap<u64, Seen>>| {
-        (1..NODES).all(|member| {
-            latest
-                .get(&member)
-                .and_then(|peers| peers.get(&VICTIM))
-                .is_some_and(|seen| matches!(seen.letter, 'D' | 'F'))
-        })
-    };
-    while !(killed && detected(&latest)) {
+    // Every member's latest report, and the members killed, in order, each with every member's
+    // latest report when it was killed.
+    let mut latest: Reports = BTreeMap::new();
+    let mut killed: Vec<(u64, Reports)> = Vec::new();
+    loop {
         let line = receiver.recv().expect("a member stopped reporting");
         let Some((member, peers)) = parse(&line) else {
             continue;
         };
-        if killed && member == VICTIM {
+        if killed.iter().any(|(victim, _)| *victim == member) {
             continue;
         }
         latest.insert(member, peers);
-        if !killed && judged_by(&latest) {
-            let mut victim = members.0.remove(&VICTIM).unwrap();
-            victim.kill().unwrap();
-            victim.wait().unwrap();
-            killed = true;
+        let alive: Vec<u64> = (1..=NODES)
+            .filter(|member| killed.iter().all(|(victim, _)| victim != member))
+            .collect();
+        let settled = alive.iter().all(|member| latest.contains_key(member))
+            && killed
+                .iter()
+                .all(|(victim, _)| held_dead(&latest, &alive, *victim));
+        if !settled {
+            continue;
+        }
+        // Each phase waits on its fact: every pair judged, then every pair judged by its own
+        // estimator; then its victim is killed.
+        let (victim, ready) = match killed.len() {
+            0 => (POOLED, every_pair(&latest, &alive, |seen| seen.judged)),
+            1 => (OWNED, every_pair(&latest, &alive, |seen| seen.own)),
+            _ => break,
+        };
+        if ready {
+            let mut child = members.0.remove(&victim).unwrap();
+            child.kill().unwrap();
+            child.wait().unwrap();
+            killed.push((victim, latest.clone()));
         }
     }
     drop(members);
 
-    for member in 1..NODES {
-        let seen = latest[&member][&VICTIM];
-        assert!(
-            seen.dead_after <= seen.dead_within,
-            "member {member} saw the victim dead {:?} after its last answer, past its stated \
-             bound of {:?}",
-            seen.dead_after,
-            seen.dead_within
-        );
-    }
-    let (mut suspicions, mut suspicion_allowance) = (0u64, 0.0f64);
-    let (mut condemnations, mut condemnation_allowance) = (0u64, 0.0f64);
-    for peers in latest.values() {
-        for (peer, seen) in peers {
-            if *peer == VICTIM {
+    let killed_at = |member: u64| killed.iter().position(|(victim, _)| *victim == member);
+    for (index, (victim, _)) in killed.iter().enumerate() {
+        // Every member alive at the kill, and its own record of the death, kept to its last line.
+        for (member, peers) in &latest {
+            if killed_at(*member).is_some_and(|at| at <= index) {
                 continue;
             }
-            suspicions += seen.suspicions;
-            suspicion_allowance += seen.suspicion_allowance;
-            condemnations += seen.condemnations;
-            condemnation_allowance += seen.condemnation_allowance;
+            let seen = peers[victim];
+            assert!(
+                seen.dead_after <= seen.dead_within,
+                "member {member} saw {victim} dead {:?} after its last answer, past its stated \
+                 bound of {:?}",
+                seen.dead_after,
+                seen.dead_within
+            );
         }
     }
-    let own = latest
-        .values()
-        .flat_map(BTreeMap::values)
-        .filter(|seen| seen.own)
-        .count();
-    println!(
-        "pairs judged by their own estimator at the end: {own} of {}",
-        NODES * (NODES - 1)
-    );
-    println!(
-        "detection, from the victim's last answer: {:?}; suspicions of live members {suspicions} \
-         (Theorem 7 allows {suspicion_allowance:.3}); condemnations {condemnations} (allows \
-         {condemnation_allowance:.3})",
-        (1..NODES)
-            .map(|member| {
-                let seen = latest[&member][&VICTIM];
-                (member, seen.dead_after, seen.dead_within)
+    // Of live members: each pair's counts while its peer lived, at the peer's kill where the member
+    // outlived it.
+    let mut live = Counts::default();
+    for (member, peers) in &latest {
+        for (peer, seen) in peers {
+            let seen = match killed_at(*peer) {
+                Some(at) if killed_at(*member).is_none_or(|own| own > at) => {
+                    killed[at].1[member][peer]
+                }
+                _ => *seen,
+            };
+            live = live.plus(Counts {
+                suspicions: seen.suspicions,
+                suspicion_allowance: seen.suspicion_allowance,
+                condemnations: seen.condemnations,
+                condemnation_allowance: seen.condemnation_allowance,
+            });
+        }
+    }
+    for (index, (victim, reports)) in killed.iter().enumerate() {
+        // The members alive when it was killed: it, and every member killed after it or never.
+        let alive: Vec<u64> = (1..=NODES)
+            .filter(|member| killed_at(*member).is_none_or(|at| at >= index))
+            .collect();
+        let pairs = alive.len() * (alive.len() - 1);
+        let own = alive
+            .iter()
+            .flat_map(|member| {
+                let alive = &alive;
+                reports[member]
+                    .iter()
+                    .filter(move |(peer, _)| alive.contains(peer))
             })
-            .collect::<Vec<_>>()
+            .filter(|(_, seen)| seen.own)
+            .count();
+        println!(
+            "member {victim} killed with {own} of {pairs} pairs judged by their own estimator; \
+             detection, from its last answer: {:?}",
+            alive
+                .iter()
+                .filter(|member| *member != victim)
+                .map(|member| {
+                    let seen = latest[member][victim];
+                    (*member, seen.dead_after, seen.dead_within)
+                })
+                .collect::<Vec<_>>()
+        );
+    }
+    let Counts {
+        suspicions,
+        suspicion_allowance,
+        condemnations,
+        condemnation_allowance,
+    } = live;
+    println!(
+        "suspicions of live members {suspicions} (Theorem 7 allows {suspicion_allowance:.3}); \
+         condemnations {condemnations} (allows {condemnation_allowance:.3})"
     );
     // Theorem 7 bounds the expected count: a run refutes it only when the count's 95 % lower
     // limit passes the allowance, the rule the replay and the trace analyser apply.
@@ -667,4 +771,29 @@ fn a_killed_member_is_declared_dead_by_every_survivor_and_no_live_one_is() {
         "{condemnations} condemnations of live members refute the {condemnation_allowance} the \
          configured detectors allow"
     );
+}
+
+/// Every member's latest report of each peer.
+type Reports = BTreeMap<u64, BTreeMap<u64, Seen>>;
+
+/// Whether every member alive reports `victim` dead, or forgotten once dead.
+fn held_dead(latest: &Reports, alive: &[u64], victim: u64) -> bool {
+    alive.iter().all(|member| {
+        latest
+            .get(member)
+            .and_then(|peers| peers.get(&victim))
+            .is_some_and(|seen| matches!(seen.letter, 'D' | 'F'))
+    })
+}
+
+/// Whether `judged` holds of every pair of members alive.
+fn every_pair(latest: &Reports, alive: &[u64], judged: impl Fn(&Seen) -> bool) -> bool {
+    alive.iter().all(|member| {
+        alive.iter().filter(|peer| *peer != member).all(|peer| {
+            latest
+                .get(member)
+                .and_then(|peers| peers.get(peer))
+                .is_some_and(&judged)
+        })
+    })
 }

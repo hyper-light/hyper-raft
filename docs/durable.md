@@ -160,7 +160,8 @@ whole, with the writes after it untaken (hyper-log refuses each one sent behind 
 the replica refuses calls `Stalled` until room may have been freed: its own compaction durable, or
 its owner's word (`Replica::resume`); made again before, the writes would only be refused again, a
 refusal a drive. They are made again as one write of everything the core holds not yet durable,
-whose notice is the last refused `Ready`'s: a member that cannot persist takes no part (mantle, audit S04). A
+the fast track's proposals among it (`RawNode::issued_proposals`: the core keeps those of every
+write issued until its notice), whose notice is the last refused `Ready`'s: a member that cannot persist takes no part (mantle, audit S04). A
 snapshot report that arrives meanwhile is kept, the latest per member, since replication to that
 member pauses until its fate is known (a mantle simulation seed found a lost report pausing it for
 good). Any other failure fences the replica: a failed flush leaves the device's contents unknown

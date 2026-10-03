@@ -212,8 +212,6 @@ struct Out {
     commit: Option<u64>,
     /// Whether it changed the term or the vote: its time to durable is a vote's flush.
     vote: bool,
-    /// Whether it held fast-track proposals.
-    proposals: bool,
     /// Whether it moves the log's start: a snapshot's install or a compaction.
     start: bool,
     submitted: u64,
@@ -255,7 +253,6 @@ struct Stall {
     /// The last `Ready` refused: its notice says every refused one is durable.
     ready: Option<u64>,
     messages: Vec<Message>,
-    proposals: bool,
 }
 
 /// Where a walk of committed entries stopped.
@@ -1111,12 +1108,10 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
             freed: false,
             ready: None,
             messages: Vec::new(),
-            proposals: false,
         });
         if let Kind::Ready(number) = write.kind {
             stall.ready = Some(number);
             stall.messages.extend(write.messages);
-            stall.proposals |= write.proposals;
         }
     }
 
@@ -1132,12 +1127,6 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
         let Some(stall) = self.stall.take() else {
             return Ok(());
         };
-        if stall.proposals {
-            // The core gives the fast track's proposals once, and holds no copy to give again.
-            return Err(self.fence(Cause::Invariant(
-                "fast-track proposals refused for room; the core cannot give them again",
-            )));
-        }
         let Some(number) = stall.ready else {
             // Only the shell's own writes were refused: a commit is stated again when it is
             // needed, and a compaction is the owner's to ask again.
@@ -1155,11 +1144,16 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
             term: proto::snapshot_term(s),
         });
         let held: Vec<Entry> = unstable.entries().to_vec();
+        // The fast track's proposals the refused writes held: the core keeps those of every
+        // write issued until its notice, and every write out has been answered, so those it
+        // keeps are the refused ones'. Fenced here before, a full log cost a fast group its
+        // replica.
+        let proposals: Vec<Entry> = self.node.issued_proposals().cloned().collect();
         let write = Write {
             start,
             entries: entries_of(&held, start),
             hard_state: Some(hard),
-            proposals: &[],
+            proposals: &proposals,
         };
         let submitted = self.node.store_mut().log.submit(&write, waker);
         let state = self.submitted_state(submitted)?;
@@ -1170,7 +1164,6 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
             messages: stall.messages,
             commit: Some(hard.commit),
             vote: true,
-            proposals: false,
             start: start.is_some(),
             submitted: now,
         });
@@ -1282,7 +1275,6 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
         let messages = ready.take_persisted_messages();
         let range = ready.committed_range();
         let (hard, vote) = self.hard_of(ready.hard_state())?;
-        let proposals = !ready.proposals().is_empty();
         let installs = self
             .node
             .raft
@@ -1307,7 +1299,6 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
             messages,
             commit: hard.map(|h| h.commit),
             vote,
-            proposals,
             start: installs,
             submitted: now,
         });
@@ -1433,7 +1424,6 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
             messages: Vec::new(),
             commit: Some(hard.commit),
             vote: false,
-            proposals: false,
             start: false,
             submitted: now,
         });
@@ -1728,7 +1718,6 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
                 messages: Vec::new(),
                 commit: hard.map(|h| h.commit),
                 vote: false,
-                proposals: false,
                 start: true,
                 submitted: now,
             });

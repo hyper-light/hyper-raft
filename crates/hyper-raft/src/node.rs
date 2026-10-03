@@ -972,6 +972,13 @@ impl<S: Storage> RawNode<S> {
         self.taken = Some(Taken { number, in_place });
         Ok(ready)
     }
+    /// What this member approved by itself and gave in the `Ready`s issued
+    /// and not yet known durable, in issue order: kept until their notice
+    /// ([`RawNode::on_persist`]), so an owner whose write of them was refused
+    /// makes it again with them (hyper-durable's `make_again`).
+    pub fn issued_proposals(&self) -> impl Iterator<Item = &Entry> + '_ {
+        self.issued.iter().flat_map(|given| given.proposals.iter())
+    }
     /// The write of what `ready` gave to persist is issued: the member takes
     /// operations again, and the next `Ready` gives only what this one did
     /// not. The owner keeps what it needs of `ready` (the persisted messages

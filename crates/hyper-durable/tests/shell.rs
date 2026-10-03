@@ -292,6 +292,64 @@ fn a_write_refused_for_room_stalls_the_replica_until_it_is_made_again() {
     assert_eq!(r.machine().now.entries.len(), 5);
 }
 
+/// A write that held the fast track's proposals, refused for room, is made again with them once
+/// the log has room: the core keeps the proposals of every write issued until its notice
+/// (`RawNode::issued_proposals`). The replica was fenced here before, so a full log cost a fast
+/// group its member.
+#[test]
+fn a_write_of_fast_proposals_refused_for_room_is_made_again_with_them() {
+    let mut s = settings(1, 7);
+    s.core.fast = true;
+    let mut r: Sim = Replica::open(
+        &s,
+        SimStore::new(3),
+        Kv::new(voters(&[1, 2, 3]), false),
+        Unbounded,
+    )
+    .unwrap();
+    // Member 2 leads term 1: a member proposes by the fast track only knowing a leader.
+    r.step(Message {
+        msg_type: MessageType::MsgHeartbeat,
+        from: 2,
+        to: 1,
+        term: 1,
+        ..Message::default()
+    })
+    .unwrap();
+    pump(&mut r);
+    let index = r.propose_fast(Vec::new(), b"held".to_vec()).unwrap();
+    let mut out = Output::default();
+    r.drive(now(), waker(), &mut out).unwrap();
+    assert!(
+        r.core().issued_proposals().any(|p| p.index == index),
+        "the write out holds the proposal"
+    );
+    r.log_mut().refuse = Some(Fault::Room("the group's retained bound"));
+    r.log_mut().make_durable();
+    r.log_mut().full = true;
+    out.clear();
+    r.drive(now(), waker(), &mut out).unwrap();
+    assert!(r.is_stalled());
+    assert!(
+        r.log_mut().disk.proposals.iter().all(|p| p.index != index),
+        "the refused write left nothing"
+    );
+    r.log_mut().full = false;
+    r.resume();
+    pump(&mut r);
+    assert_eq!(r.fenced(), None);
+    assert!(!r.is_stalled());
+    assert!(
+        r.log_mut()
+            .disk
+            .proposals
+            .iter()
+            .any(|p| p.index == index && p.data == b"held"),
+        "made again, the write holds the proposal"
+    );
+    assert_eq!(r.core().issued_proposals().count(), 0);
+}
+
 /// Reads past the core's bound are refused, counting those the replica holds for its apply.
 #[test]
 fn reads_past_the_bound_are_refused() {

@@ -235,9 +235,11 @@ impl DeviceFile {
     }
 
     /// Direct transfers move straight between the device and the buffer, so its address
-    /// must be aligned as well (open(2) NOTES; Windows "File Buffering").
+    /// must be aligned as well (open(2) NOTES; Windows "File Buffering"). A transfer of no
+    /// bytes moves none and reaches no system call: an empty buffer, which allocates nothing,
+    /// has no first byte to align, and its address is the empty slice's, one.
     fn check_address(&self, addr: usize, offset: u64, len: usize) -> Result<(), DiskError> {
-        if self.align.is_aligned(addr) {
+        if len == 0 || self.align.is_aligned(addr) {
             return Ok(());
         }
         Err(DiskError::Misaligned {
@@ -507,6 +509,28 @@ mod tests {
 
     fn align() -> Alignment {
         Alignment::new(4096).unwrap()
+    }
+
+    /// A transfer of no bytes from an empty buffer, whose address is the empty slice's, is no
+    /// misaligned transfer: it moves nothing at every alignment. proptest drew a capacity of
+    /// zero only now and then, and windows-2025 found the address check refusing it.
+    #[test]
+    fn an_empty_buffer_transfers_nothing_at_every_alignment() {
+        let dir = tempfile::tempdir().unwrap();
+        // Direct where the file system takes it (a buffered file is aligned to a byte).
+        let file = DeviceFile::open(
+            &dir.path().join("empty"),
+            true,
+            CachingRequest::PreferDirect,
+            align(),
+        )
+        .unwrap();
+        for shift in 0..=crate::buf::MAX_ALIGNMENT.trailing_zeros() {
+            let mut empty = AlignedBuf::zeroed(0, Alignment::new(1 << shift).unwrap()).unwrap();
+            file.write_all_at(empty.as_slice(), 0).unwrap();
+            file.read_exact_at(empty.as_mut_capacity(), 0).unwrap();
+            assert_eq!(file.read_at(empty.as_mut_capacity(), 0).unwrap(), 0);
+        }
     }
 
     /// A host-managed device node and a zonefs file are refused; a file on a file system

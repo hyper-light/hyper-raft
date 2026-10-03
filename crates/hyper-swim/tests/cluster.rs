@@ -198,10 +198,20 @@ struct Member {
     /// Probes this member relays: the target, the relay's nonce, who asked and with which nonce.
     /// One a target, so bounded by the membership.
     relaying: BTreeMap<u64, (u64, HostId, u64)>,
-    /// When this member first saw each peer dead, and the bound its detector stated then.
-    dead_seen: BTreeMap<u64, (Duration, Option<Duration>)>,
+    /// Each peer's death as this member last came to hold it, and whether it holds it still: how
+    /// long after the peer's last answer, and the bound its detector stated then.
+    dead_seen: BTreeMap<u64, Noted>,
     /// What its detector has reported of each peer, kept across the peer's being forgotten.
     tallies: BTreeMap<u64, Tally>,
+}
+
+/// A death a member came to hold: how long after the peer's last answer, the bound its detector
+/// stated then (none while its probes judged nothing), and whether it holds the peer dead still.
+#[derive(Clone, Copy, Debug, Default)]
+struct Noted {
+    after: Duration,
+    within: Option<Duration>,
+    held: bool,
 }
 
 /// The suspicions and condemnations a member's detector reports of a peer, with their allowances.
@@ -456,19 +466,29 @@ impl Member {
         }
     }
 
-    /// Notes, the moment this member first holds a peer dead, how long after the peer's last
+    /// Notes, each time this member comes to hold a peer dead, how long after the peer's last
     /// answer that is, and the bound its detector states: to a pending condemnation, plus, where
     /// this member's own had become pending, the wait since for an answer from another member,
-    /// which it measures.
+    /// which it measures. The last note is the death that stands: a live member falsely condemned
+    /// and alive again dies afresh, and a death held before this member's probes judged anything
+    /// is noted with no bound, since its own probes could not have found it.
     fn note_deaths(&mut self) {
         let now = self.now();
         for peer in (1..=NODES).filter(|peer| *peer != self.me) {
-            // A peer forgotten was held dead first, and noted then.
-            let held = self.detector.membership().state(HostId(peer));
-            if held.is_none_or(|state| state.liveness != Liveness::Dead)
-                || self.dead_seen.contains_key(&peer)
+            let noted = self.dead_seen.entry(peer).or_default();
+            match self
+                .detector
+                .membership()
+                .state(HostId(peer))
+                .map(|state| state.liveness)
             {
-                continue;
+                Some(Liveness::Dead) if !noted.held => {}
+                Some(Liveness::Alive | Liveness::Suspect) => {
+                    noted.held = false;
+                    continue;
+                }
+                // Held dead and noted, or forgotten once dead, which was noted then.
+                _ => continue,
             }
             let report = self.detector.report(HostId(peer)).unwrap_or_default();
             let since =
@@ -477,17 +497,19 @@ impl Member {
             let bound = self.detector.detection_bound(now);
             self.dead_seen.insert(
                 peer,
-                (
-                    since(report.last_answer_ns),
-                    bound.map(|bound| bound.saturating_add(waited)),
-                ),
+                Noted {
+                    after: since(report.last_answer_ns),
+                    within: bound.map(|bound| bound.saturating_add(waited)),
+                    held: true,
+                },
             );
         }
     }
 
     /// One line: `me period detection_ns` (the detector's stated bound, 0 before it states one)
     /// then, per peer, `peer:letter:judged:own:taken:answered_ns_ago:suspicions:allowance:
-    /// condemnations:allowance:dead_after_ns:dead_within_ns` (`-` for a peer that never answered).
+    /// condemnations:allowance:dead_after_ns:dead_within_ns` (`-` for a peer that never answered,
+    /// and for a death noted with no bound).
     fn report(&mut self, period: u64, out: &mut impl Write) -> std::io::Result<()> {
         let now = self.now();
         let detection = self
@@ -500,7 +522,7 @@ impl Member {
             let held = self.detector.report(HostId(peer));
             let counts = self.tallies.entry(peer).or_default().update(held);
             let report = held.unwrap_or_default();
-            let (after, within) = self.dead_seen.get(&peer).copied().unwrap_or_default();
+            let noted = self.dead_seen.get(&peer).copied().unwrap_or_default();
             // Judged: a configured verdict times this member's probes of the peer, the pair's own
             // or, while the pair's estimator refuses, the pool's.
             let judged = self.detector.verdict(HostId(peer)).is_some();
@@ -517,8 +539,10 @@ impl Member {
                 counts.suspicion_allowance,
                 counts.condemnations,
                 counts.condemnation_allowance,
-                after.as_nanos(),
-                within.map_or(0, |w| w.as_nanos()),
+                noted.after.as_nanos(),
+                noted
+                    .within
+                    .map_or_else(|| "-".to_owned(), |within| within.as_nanos().to_string()),
             ));
         }
         writeln!(out, "{line}")?;
@@ -585,7 +609,8 @@ struct Seen {
     condemnations: u64,
     condemnation_allowance: f64,
     dead_after: Duration,
-    dead_within: Duration,
+    /// The bound the member stated at the death that stands; `None` if it stated none.
+    dead_within: Option<Duration>,
 }
 
 /// A member's latest line: when the supervisor read it, the member's period, the detection bound
@@ -643,7 +668,10 @@ fn parse(line: &str) -> Option<(u64, Duration, BTreeMap<u64, Seen>)> {
                 condemnations: c.parse().ok()?,
                 condemnation_allowance: ca.parse().ok()?,
                 dead_after: Duration::from_nanos(after.parse().ok()?),
-                dead_within: Duration::from_nanos(within.parse().ok()?),
+                dead_within: match within {
+                    "-" => None,
+                    bound => Some(Duration::from_nanos(bound.parse().ok()?)),
+                },
             },
         );
     }
@@ -1038,12 +1066,16 @@ fn a_killed_member_is_declared_dead_by_every_survivor_and_no_live_one_is() {
                 continue;
             }
             let seen = stated.peers[victim];
+            let Some(within) = seen.dead_within else {
+                panic!(
+                    "member {member} holds {victim} dead from before its probes judged anything"
+                );
+            };
             assert!(
-                seen.dead_after <= seen.dead_within,
+                seen.dead_after <= within,
                 "member {member} saw {victim} dead {:?} after its last answer, past its stated \
-                 bound of {:?}",
+                 bound of {within:?}",
                 seen.dead_after,
-                seen.dead_within
             );
         }
     }

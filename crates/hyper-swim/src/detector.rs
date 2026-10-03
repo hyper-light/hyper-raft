@@ -841,16 +841,24 @@ impl Detector {
 
     /// The bound on the time from a peer's last answer to this member's condemnation of it pending,
     /// were it to crash then, `m` the members the view holds besides this one: its next probe is
-    /// at most `2m − 1` periods away (SWIM §4.3),
-    /// unanswered it suspects; the probe that tells it starts at most as far again, and when its
-    /// own period resolves it unanswered the condemnation is pending. It then waits on an answer from another member, the evidence that
+    /// at most `2m − 1` periods away (SWIM §4.3), unanswered it suspects; the probe that tells it
+    /// starts at most as far again, and when its own period resolves it unanswered the
+    /// condemnation is pending. It then waits on an answer from another member, the evidence that
     /// this member's own network works, which nothing bounds in advance: the member measures that
     /// wait ([`PeerReport::pending_since_ns`]) and adds it. A period lasts at most the longest this
     /// member has run, or, where longer, what an unanswered probe's deadlines allow: its target's
     /// span, then the slowest relay's and the target's again, at most three times the longest
     /// span any of its verdicts has had, plus the latest this member has woken past a wake it
-    /// asked, or is late for now; the period in progress counts as run. `None` before a period.
+    /// asked, or is late for now; the period in progress counts as run.
+    ///
+    /// `None` before a period, and while a probe this member makes would go unjudged, neither its
+    /// pair nor the pool holding a verdict: an unjudged probe that goes unanswered suspects nobody,
+    /// so until every probe is judged this member detects nothing by its own probes, and a death
+    /// it holds then is another member's, adopted.
     pub fn detection_bound(&self, now_ns: u64) -> Option<Duration> {
+        if !self.judges_every_probe() {
+            return None;
+        }
         // The most members the view has held besides this one: no round is larger, whatever the
         // rounds in the window were (a member that condemned another, even falsely, runs smaller
         // ones, and a member forgotten since was in rounds before).
@@ -859,6 +867,17 @@ impl Detector {
         let periods = spacing.saturating_mul(2).saturating_add(1);
         let period = self.period_bound(now_ns)?;
         Some(Duration::from_nanos(period.saturating_mul(periods)))
+    }
+
+    /// Whether every probe this member makes is judged by a configured verdict: the pool holds
+    /// one, or every member it probes has its own.
+    fn judges_every_probe(&self) -> bool {
+        self.pool.verdict.is_some()
+            || self
+                .peers
+                .iter()
+                .filter(|(host, _)| self.is_probed(**host))
+                .all(|(_, peer)| peer.stream.verdict.is_some())
     }
 
     /// The longest a period of this member lasts, nanoseconds: the longest it has run or, where
@@ -1647,6 +1666,24 @@ mod tests {
             )
             .unwrap();
         assert!(detector.report(A).unwrap().pending_since_ns.is_some());
+    }
+
+    /// A member whose probes judge nothing yet states no detection bound: an unanswered probe
+    /// suspects nobody until a verdict times it, so a death the member holds then is another's,
+    /// adopted, on that member's timeline (the cluster test noted such a death, held from a
+    /// gossiped condemnation 7 ms into the run, against a bound of 2.5 ms its probes could not
+    /// keep).
+    #[test]
+    fn a_member_that_judges_nothing_states_no_bound() {
+        let peers = [A, B];
+        let mut detector = detector(&peers);
+        let mut world = World::new();
+        world.run(&mut detector, 2, |_| Some(MS));
+        assert!(detector.periods.count > 0);
+        assert!(peers.iter().all(|peer| detector.verdict(*peer).is_none()));
+        assert_eq!(detector.detection_bound(world.now), None);
+        configured(&mut detector, &mut world, &peers);
+        assert!(detector.detection_bound(world.now).is_some());
     }
 
     /// The detection bound counts every member the view holds, not the current round's: a member

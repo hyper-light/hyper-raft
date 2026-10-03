@@ -454,7 +454,15 @@ answer from another member (four Linux runs in four hundred under a CPU throttle
 probes missed too); periods already ended only (seven runs in three hundred at one CPU, where a
 throttle's freeze of some 40 ms was inside the period still running when the death was noted); and
 the current round's size for `m` (a member that had condemned another, falsely, under the throttle
-ran rounds of one, while the victim's last probe had been in a round of three).
+ran rounds of one, while the victim's last probe had been in a round of three). The member states
+the bound only while every probe it makes is judged, by its pair's verdict or the pool's: an
+unjudged probe that goes unanswered suspects nobody, so before then the member detects nothing by
+its own probes, and a death it holds is another member's condemnation, adopted on that member's
+timeline. Stating its own bound for one was the last form to fail: with the directed gossip below,
+three runs in 2,000 noted a death 0.2 to 2.2 ms past a bound of 2.3 to 3.3 ms, and a build that kept
+a ring of each member's probes, answers and views, dumped at the overshoot, showed why: a live
+member falsely condemned in the run's first milliseconds, adopted by gossip at a member whose probes
+were still measurement only (`a_member_that_judges_nothing_states_no_bound`).
 
 **Before a pair can be judged.** A pair's estimator refuses until it has two prediction errors and a
 measured `τ_int` (`Refusal::TooFewHeartbeats`, `CorrelationUnmeasured`). Until then its probes are
@@ -557,7 +565,10 @@ facts: every member judging every peer by a configured verdict (the pair's own, 
 the pair's estimator refuses), then it kills one; every survivor holding it dead; then every surviving
 pair judged by its own estimator, then it kills another; every survivor holding that one dead too.
 Each survivor holds each victim dead within the bound its detector stated, measured on the member's
-clock from the victim's last answer. The first kill comes within a few hundred milliseconds of the
+clock from the victim's last answer: the death that stands, since a member notes every death it
+comes to hold and a live member falsely condemned and alive again dies afresh. A first form noted
+only the first, which could be such a false death, held before the member's probes judged
+anything. The first kill comes within a few hundred milliseconds of the
 start, when most pairs are judged by the pools, and the test had only it: three local runs ended with
 none of the twelve pairs judged by its own estimator, so the end-to-end test never killed under a
 pair's own detector. The second phase is that kill; it is a longer run, which waits for the pairs' own

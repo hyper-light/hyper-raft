@@ -201,6 +201,11 @@ unknown kind, version or flag is refused, and a record whose bytes run past its 
 raft-rs's `deprecated_priority`, `sync_log` and change `id` are not carried: hyper-raft never read
 them; the test adapter folds `deprecated_priority` into the priority as raft-rs does.
 
+An owner that prices what a committed change will add before the core applies it reads the change
+in place (`wire::changes_stated`): each change's kind and member from the entry's record, nothing
+allocated, after the whole record is checked as decoding checks it (focal's memory accounting,
+which priced raft-rs's encoding the same way before its core moved here).
+
 ### The fast track's election defect, and its fix
 
 **The defect.** In a fast group an election could commit a second, different entry at an index that

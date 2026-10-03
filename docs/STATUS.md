@@ -41,10 +41,30 @@ out; eight more for the marked members, three that pass and five refused, at the
 as CI counted them (`docs/models/README.md`). CI's `model` job runs
 them on Linux.
 
+## Open defects
+
+Found under load on `main` `9893679`, each once, not yet reproduced. They are being traced to
+their causes; none is worked around.
+
+- **hyper-raft-e2e `stalled-devices`.** Seen on macOS, under the load of other builds. After the
+  7 s stall the old leader had stepped down in its term (leader 0), its followers still trusted
+  it, every detector trusted every member, and no member campaigned through the members' quiet
+  period (2.6 s). The core's step-down and re-campaign alone elect in every order of suspicion
+  and trust a simulation tried, so the trace looks for what the real processes add.
+- **hyper-durable-e2e `kill-durable-leader`.** Seen in Linux Docker at 2 CPUs with load 6.8. Both
+  survivors had a write of their log out for 2 s, against 58 ms for the longest write before it,
+  so their flush-proven heartbeats stopped and each came to suspect the other. The wait judged the
+  member stuck, because its rule excuses a write only up to the longest write seen. Open: whether
+  the write was with the device (a slow disk under the host's I/O) or waited elsewhere.
+- **hyper-transport e2e `refusals`.** Seen in a gate at load 3–6. The peer's refusal of an ask
+  for a kind it does not take came after the asker's own progress period. The test judges every
+  exchange at a fixed two seconds (`PERIOD`), a picked number the refusal raced and lost. The test
+  is to wait for the refusal itself, bounded by its guard, not race it against a picked period.
+
 ## Consumers
 
 | Consumer | Takes | State |
 |---|---|---|
 | mantle | hyper-raft as `vendor/hyper-raft` (Cargo rename `focal-raft`), snapshot `cec55a6` | on mantle `dev` (`590f475`). The next snapshot takes the in-place `Ready` and the core ports |
-| focal | hyper-raft (R-1, F-1) | blocked: changes in `~/Projects/focal` need the owner's permission rule. focal's core changes since R-1 are ported here (`crates/hyper-raft/ORIGIN.md`, "Ports from focal"): F43 (one ReadIndex heartbeat round per `Ready`), F41 (an inflight window bounded in bytes), F42 (heartbeat answers that say where the member is; no priority for a member that left); and the fast track's election defect is fixed here (`docs/raft.md`) |
+| focal | hyper-raft and hyper-timing vendored (`vendor/`, `SNAPSHOT` 9893679), `crates/focal-raft` removed | step 1 of the owner's order (the core; then F-1 and D-2 as one PR, focal's WAL onto hyper-log and its shell onto hyper-durable; then timing and liveness; then the transport), open as focal PR #4 (branch `hyper-raft-core` into `slates-port`), its data directories resumed across the old and new binaries both ways: focal's WAL and wire keep raft-rs's protocol-buffer bytes through focal's own codec (`focal-consensus/src/envelope.rs`, held to raft-proto byte for byte; no protocol-buffer runtime ships); the accounting reads a change in place (`wire::changes_stated`); every focal-consensus suite passes. The format switch comes with F-1, by layer: a wire profile per connection, new WAL record kinds behind focal's upgrade fence (focal 27 §14) |
 | slates | hyper-quic, hyper-datagram, hyper-swim, hyper-timing | slates' session owns the integration (slates A-52 §5) |

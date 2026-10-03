@@ -716,6 +716,19 @@ impl Cluster {
         }
     }
 
+    /// Takes `id` out of the cluster for good, as an operator removes a node: killed, and its log
+    /// and run's record removed with it.
+    fn forget(&mut self, id: u64) {
+        self.kill(id);
+        self.members.retain(|member| {
+            if member.id == id {
+                remove(&member.log);
+                remove(&run::path(&member.log));
+            }
+            member.id != id
+        });
+    }
+
     /// Kills `id` with `SIGKILL`. Nobody is told: the others' detectors find out.
     fn kill(&mut self, id: u64) {
         let member = self.member(id);
@@ -1068,9 +1081,8 @@ fn founder() -> String {
         "the founder never applied the removal"
     );
     // The operator acts on the founder's word: the peer goes for good, then the founder dies.
-    cluster.kill(peer);
+    cluster.forget(peer);
     cluster.kill(founder);
-    cluster.members.retain(|m| m.id != peer);
     cluster.restart(founder, true);
     let alone = cluster.until(|reports| {
         reports
@@ -1132,8 +1144,7 @@ fn founder_fenced() -> String {
             cluster.state()
         );
     }
-    cluster.kill(peer);
-    cluster.members.retain(|m| m.id != peer);
+    cluster.forget(peer);
     cluster.write_some("alone", WRITES);
     cluster.verify();
     cluster.looks()

@@ -17,10 +17,24 @@ fn fresh(name: &str) -> PathBuf {
     wal
 }
 
+/// Removes the run's record it holds when the test ends, however it ends.
+struct Gone(PathBuf);
+
+impl Drop for Gone {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "a test removes the files it made in its own target directory"
+    )]
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
 #[test]
 fn each_start_raises_the_run_kept_beside_the_log() {
     let wal = fresh("raise");
     let at = run::path(&wal);
+    let _gone = Gone(at.clone());
     assert_eq!(at, PathBuf::from(format!("{}.run", wal.display())));
     assert_eq!(run::raise(&at).unwrap(), 1);
     assert_eq!(run::raise(&at).unwrap(), 2);
@@ -35,6 +49,7 @@ fn each_start_raises_the_run_kept_beside_the_log() {
 fn a_record_that_is_not_one_count_is_refused() {
     let wal = fresh("damaged");
     let at = run::path(&wal);
+    let _gone = Gone(at.clone());
     run::raise(&at).unwrap();
     let mut bytes = std::fs::read(&at).unwrap();
     let last = bytes.len() - 1;

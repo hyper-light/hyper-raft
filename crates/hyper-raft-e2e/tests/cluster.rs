@@ -58,6 +58,7 @@ use hyper_raft::proto::{self, Entry};
 use hyper_raft_e2e::{
     node,
     quiet::{self, Heard, Progress, Quiet, RTO, Stuck, Watch},
+    run,
     stream::{self, Report},
     wire::{self, Control, Kind, Op, Outcome},
 };
@@ -138,6 +139,7 @@ impl Drop for Cluster {
                 let _ = child.wait();
             }
             remove(&member.wal);
+            remove(&run::path(&member.wal));
         }
     }
 }
@@ -182,6 +184,7 @@ impl Cluster {
             let wal =
                 PathBuf::from(TMP).join(format!("e2e-{}-{name}-{id}.wal", std::process::id()));
             remove(&wal);
+            remove(&run::path(&wal));
             let (child, port) = spawn(id, voters, "127.0.0.1:0", &wal, room);
             members.push(Member {
                 child: Some(child),

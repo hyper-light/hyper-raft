@@ -159,7 +159,10 @@ variance `s²`. An `m`-observation mean has variance `s²/m`; the two are equal 
   trip: a smaller error cannot be measured, and an estimate of zero would fix `w = 0`, a node that
   never moves again. With it the estimate is positive whatever the samples, so `w` is defined
   without a neutral case, and no ceiling is needed: a large estimate is a node with no confidence,
-  which its peers weigh accordingly.
+  which its peers weigh accordingly. What keeps it finite is that a sample which would leave the
+  coordinate infinite or not a number, a peer's point so far out that the distance or the sample's
+  error overflows, is not taken: Vivaldi defends against peers in error (§6.2), and one such sample
+  would otherwise make every later weight `∞/∞`.
 - No gravity. Ledlie's `G` carries its units' scale: `(‖x‖/ρ)²` is a number read as milliseconds, so
   in seconds the same `ρ` pulls a thousand times harder, and a pull that is a small fraction of
   PlanetLab's diameter in milliseconds moves a LAN's coordinates across the network in one update.

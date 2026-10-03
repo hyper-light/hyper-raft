@@ -408,7 +408,8 @@ a rigid motion, leaves alone: there is none. A sample's error is floored at the 
 is measured in, which keeps the estimate positive, and a height at it, which keeps the height
 positive (§5.4). Two fresh nodes at the origin separate along `u(0)`, drawn at random from each node's
 own seeded stream. A peer's coordinate that is not a number, or has a negative height or error, is not
-learned and moves nothing.
+learned and moves nothing, and a sample that would leave the coordinate infinite or not a number (a
+peer's point so far out that the distance overflows) is not taken.
 
 **Death.** A suspected peer is told by the member's next probe of it, which carries the suspicion
 (Lifeguard's buddy system); if that probe too goes unanswered, the peer is condemned at the next

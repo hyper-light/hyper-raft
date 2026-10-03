@@ -123,31 +123,40 @@ impl CoordinateEngine {
 
     /// Moves this node's coordinate by a round trip `rtt` measured to `peer`, Dabek's Fig. 3 whole
     /// (the module's documentation), with `c_e` the weight of one round of `round` probes. A round
-    /// trip of zero, or a peer coordinate that is not usable, is no sample: whether this one was
-    /// taken.
+    /// trip of zero, a peer coordinate that is not usable, or a sample that would leave this
+    /// coordinate infinite or not a number (a peer's point so far out that the distance overflows)
+    /// is no sample: whether this one was taken.
     pub fn update(&mut self, peer: &NetworkCoordinate, rtt: Duration, round: usize) -> bool {
         let rtt = rtt.as_secs_f64();
         if rtt <= 0.0 || !peer.is_usable() {
             return false;
         }
         let local = self.coordinate;
-        // Line 1. The node's own error is positive (it starts at one, and every sample's is at
-        // least the resolution's), so the sum is.
+        let mut next = local;
+        // Line 1. The node's own error is positive and finite (it starts at one, every sample's is
+        // at least the resolution's, and a sample that is not finite is not taken), so the sum is
+        // positive.
         let weight = local.error / (local.error + peer.error);
         // Line 2.
         let predicted = CoordinateEngine::estimate_rtt(&local, peer);
         let sample = (predicted - rtt).abs().max(RESOLUTION) / rtt;
         // Line 3.
         let moving = error_weight(round) * weight;
-        self.coordinate.error = sample * moving + local.error * (1.0 - moving);
+        next.error = sample * moving + local.error * (1.0 - moving);
         // Line 4: the step along the unit vector of the height-vector difference.
         let force = TIMESTEP * weight * (rtt - predicted);
         let (planar, height) = self.direction(&local, peer, predicted);
-        for (component, unit) in self.coordinate.position.iter_mut().zip(planar) {
+        for (component, unit) in next.position.iter_mut().zip(planar) {
             *component += force * unit;
         }
-        self.coordinate.height = (local.height + force * height).max(RESOLUTION);
-        true
+        next.height = (local.height + force * height).max(RESOLUTION);
+        let finite = next.position.iter().all(|component| component.is_finite())
+            && next.height.is_finite()
+            && next.error.is_finite();
+        if finite {
+            self.coordinate = next;
+        }
+        finite
     }
 
     /// The unit vector of `local − peer` in the height-vector space, as its plane part and its
@@ -330,6 +339,13 @@ mod tests {
             1
         ));
         assert_eq!(engine.coordinate().position, before.position);
+        // A peer whose point or height is finite but so far out that the distance or the sample's
+        // error overflows would leave this coordinate not a number: not taken.
+        let taken = *engine.coordinate();
+        for far in [at(1e300, 1e300, 0.0, 0.1), at(0.0, 0.0, 1e308, 0.1)] {
+            assert!(!engine.update(&far, Duration::from_nanos(1), 1));
+        }
+        assert_eq!(engine.coordinate(), &taken);
     }
 
     /// The estimate is symmetric and never negative.

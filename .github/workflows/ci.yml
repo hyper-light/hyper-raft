@@ -18,6 +18,11 @@ jobs:
           - windows-2025
           - windows-11-arm
     runs-on: ${{ matrix.runner }}
+    # A wait that never ends fails here, not at GitHub's six-hour default: twice the slowest gates
+    # job measured on main, the model job's rule (windows-2025, 31.9 min, the slowest of the last
+    # 12 green runs, 2026-10-02; one hung for 110 min on ubuntu-24.04-arm, run 37087273821, in
+    # hyper-liveness's processes test).
+    timeout-minutes: 64
     steps:
       - uses: actions/checkout@v5
       # The toolchain comes from rust-toolchain.toml, pinned exactly.
@@ -29,6 +34,9 @@ jobs:
     # code, so one OS suffices; Miri checks it keeps Rust's rules, and its isolation refuses the
     # file, environment and entropy calls a simulation must not make inside a run.
     runs-on: ubuntu-24.04
+    # Twice the job measured on main, the model job's rule (17.7 min, the slowest of the last 8
+    # green runs, 2026-10-02).
+    timeout-minutes: 36
     steps:
       - uses: actions/checkout@v5
       # Miri is nightly-only, so it is installed here and not in rust-toolchain.toml; this is the

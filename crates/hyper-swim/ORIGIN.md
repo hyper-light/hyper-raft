@@ -78,6 +78,14 @@
    record is kept for SWIM's dissemination budget of this member's longest periods past its adoption
    of the death, then forgotten with its estimator, coordinate, extensions and gossip report.
 
+7. **The Vivaldi engine as the paper gives it** (`docs/timing.md` §2.7, `docs/research/swim.md`).
+   slates' engine followed hyperscale's: the error folded in seconds into an estimate floored at
+   0.05 as a relative one (50 ms, so on a LAN the confidence weights did nothing), eight dimensions,
+   a separate height share, an adjustment term with a ±1 s clamp, and a 0.99 gravity. It is now
+   Dabek's Fig. 3 in §5.4's height vectors, two dimensions and a height, `c_c` §4.1's and `c_e` one
+   round's moving average; a received coordinate must have exactly the engine's dimensions, and one
+   that is not a number is not learned.
+
 ## Tests
 
 - 46 unit tests: slates' membership, gossip, codec and coordinate tests, the extension series and

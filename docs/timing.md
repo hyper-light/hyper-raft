@@ -389,6 +389,27 @@ often than the direct probe did. A relayed probe is two round trips, so with the
 one fails with `1 − (1 − p)²`, and `k` relays are asked where `(1 − (1 − p)²)^k ≤ p` (two for any
 loss below 0.38, where `p(2 − p)² ≤ 1`), nearest the target in Vivaldi coordinates.
 
+**The coordinates** (`crates/hyper-swim/src/coordinates.rs`, `docs/research/swim.md`) rank those
+relays: the predicted round trip between two peers is the distance between their learned coordinates.
+The engine is Dabek, Cox, Kaashoek and Morris's (SIGCOMM 2004) as the paper gives it: Fig. 3's update
+whole, `w = e_i/(e_i + e_j)`, the sample's relative error `|‖x_i − x_j‖ − rtt|/rtt`, the error a
+moving average of those with weight `c_e·w`, and the step `c_c·w` along the unit vector, in §5.4's
+height vectors, two dimensions and a height, the height moving inside the step. `c_c = 0.25` is
+§4.1's. `c_e`, which neither Dabek nor Ledlie, Gardner and Seltzer give, is `2/(m + 1)`: the estimate
+tracks the node's error over its links, which SWIM samples once each a round of `m` probes, and that
+weight's moving average has the variance of an `m`-sample mean. The engine it replaced (hyperscale's,
+copied) folded the error in seconds into an estimate documented and floored as a relative one, so on a
+LAN every node's error sat at its floor of 0.05, 50 ms, and the confidence weights did nothing; it had
+eight dimensions against §5.2's finding that extra dimensions past three add nothing, a separate share
+of each step for the height, an adjustment term with its smoothing and an uncommented ±1 s clamp, and a
+gravity that multiplied every coordinate by 0.99 an update. Ledlie's gravity carries the unit its
+paper measured in, and the engine predicts only between coordinates a round old at most, which drift,
+a rigid motion, leaves alone: there is none. A sample's error is floored at the nanosecond a round trip
+is measured in, which keeps the estimate positive, and a height at it, which keeps the height
+positive (§5.4). Two fresh nodes at the origin separate along `u(0)`, drawn at random from each node's
+own seeded stream. A peer's coordinate that is not a number, or has a negative height or error, is not
+learned and moves nothing.
+
 **Death.** A suspected peer is told by the member's next probe of it, which carries the suspicion
 (Lifeguard's buddy system); if that probe too goes unanswered, the peer is condemned at the next
 answer the member has from another member. Lifeguard found that "an episode of slow message
@@ -468,7 +489,8 @@ whole periods are gone.
 members, 6 at 256. With two members every message reaches the only other one. The logarithm is
 computed in fixed point, so every host gets the same budget. A message carries the gossip that fits
 its datagram beside the largest message, an acknowledgement with its coordinate
-(`codec::gossip_capacity`): 60 entries at QUIC's 1,200-byte minimum.
+(`codec::gossip_capacity`): 63 entries at QUIC's 1,200-byte minimum (60 while the coordinate carried
+eight dimensions and an adjustment).
 
 **Memory.** Each peer's estimator holds a ring of `G/(PHI·η) − 1` sums at the pair's interval `η =
 m·T̄` (§2.6, the drift bound), so a member's rings together hold about `G/(PHI·T̄)` whatever its

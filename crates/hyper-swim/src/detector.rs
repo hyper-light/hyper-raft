@@ -525,7 +525,7 @@ impl Detector {
             gossip: Gossip::default(),
             transmits: 1,
             shuffler: RandomizedOrder::seeded(local),
-            coordinates: CoordinateEngine::new(),
+            coordinates: CoordinateEngine::new(local.0),
             peer_coordinates: BTreeMap::new(),
             nonce: 0,
             relayed: u64::MAX,
@@ -973,9 +973,11 @@ impl Detector {
                     .take(sent.nonce, rtt, granularity, Duration::from_nanos(period));
             }
         }
-        let seconds = Duration::from_nanos(rtt).as_secs_f64();
+        // The error estimate remembers one round: one probe of each member the round holds.
         if let Some(coordinate) = self.peer_coordinates.get(&from) {
-            self.coordinates.update_with_rtt(coordinate, seconds);
+            let round = self.order.len();
+            self.coordinates
+                .update(coordinate, Duration::from_nanos(rtt), round);
         }
     }
 
@@ -1088,16 +1090,20 @@ impl Detector {
 
     /// Learns `peer`'s network coordinate (from a probe reply or gossip). Only a member this node
     /// probes is learned, and a member's coordinate is forgotten when it is declared dead, so the
-    /// coordinates held are bounded by the membership.
+    /// coordinates held are bounded by the membership. A coordinate that cannot be used
+    /// ([`NetworkCoordinate::is_usable`]) is not learned: the one held, if any, stays.
     pub fn learn_coordinate(&mut self, peer: HostId, coordinate: Coordinate<'_>) {
         if peer == self.local || !self.is_probed(peer) {
             return;
         }
+        let coordinate = coordinate.to_coordinate();
+        if !coordinate.is_usable() {
+            return;
+        }
         match self.peer_coordinates.get_mut(&peer) {
-            Some(held) => coordinate.write_into(held),
+            Some(held) => *held = coordinate,
             None => {
-                self.peer_coordinates
-                    .insert(peer, coordinate.to_coordinate());
+                self.peer_coordinates.insert(peer, coordinate);
             }
         }
     }
@@ -2174,8 +2180,8 @@ mod tests {
     #[test]
     fn measured_round_trips_teach_the_coordinate() {
         let mut detector = detector(&[A]);
-        let mut peer = NetworkCoordinate::origin(8);
-        peer.vec[0] = 0.030;
+        let mut peer = NetworkCoordinate::origin();
+        peer.position[0] = 0.030;
         peer.error = 0.05;
         detector.learn_coordinate(A, Coordinate::Held(&peer));
         assert!(detector.predicted_rtt(A).is_some());
@@ -2192,13 +2198,82 @@ mod tests {
         let mut detector = detector(&[]);
         for &(host, x) in &positions {
             detector.join(host).unwrap();
-            let mut coordinate = NetworkCoordinate::origin(8);
-            coordinate.vec[0] = x;
+            let mut coordinate = NetworkCoordinate::origin();
+            coordinate.position[0] = x;
             coordinate.error = 0.05;
             detector.learn_coordinate(host, Coordinate::Held(&coordinate));
         }
         detector.rank_relays(A);
         let ranked: Vec<HostId> = detector.relays.clone();
         assert_eq!(ranked, vec![B, C, HostId(5)]);
+    }
+
+    /// A coordinate that cannot be used is not learned, and the one held stays.
+    #[test]
+    fn an_unusable_coordinate_is_not_learned() {
+        let mut detector = detector(&[A]);
+        let mut held = NetworkCoordinate::origin();
+        held.position[0] = 0.002;
+        detector.learn_coordinate(A, Coordinate::Held(&held));
+        let mut broken = held;
+        broken.height = f64::NAN;
+        detector.learn_coordinate(A, Coordinate::Held(&broken));
+        assert_eq!(detector.peer_coordinates.get(&A), Some(&held));
+    }
+
+    /// Relays are ranked by coordinates the engine learned from round trips: three regions of three
+    /// members, a round trip the distance between two members' points and both their access heights,
+    /// with a little jitter. Once every member has sampled the others, round after round, the relays
+    /// a member ranks first for a target are the target's region-mates.
+    #[test]
+    fn relays_learned_from_round_trips_are_the_target_s_region() {
+        // Points in milliseconds: regions 30 to 50 ms apart, members within a millisecond.
+        let points: [(f64, f64); 9] = [
+            (0.0, 0.0),
+            (0.6, 0.2),
+            (0.3, 0.7),
+            (40.0, 0.0),
+            (40.5, 0.4),
+            (39.6, 0.6),
+            (0.0, 30.0),
+            (0.4, 30.5),
+            (0.8, 29.8),
+        ];
+        let heights = [0.2, 0.3, 0.1, 0.25, 0.15, 0.35, 0.3, 0.2, 0.1];
+        let rtt = |i: usize, j: usize| {
+            let (a, b) = (points[i], points[j]);
+            ((a.0 - b.0).hypot(a.1 - b.1) + heights[i] + heights[j]) / 1e3
+        };
+        let mut engines: Vec<CoordinateEngine> = (0..9u64).map(CoordinateEngine::new).collect();
+        let mut state = 0x2545_F491_4F6C_DD1D;
+        for _ in 0..300 {
+            for i in 0..9 {
+                for j in (0..9).filter(|j| *j != i) {
+                    // Up to 2 % either way.
+                    let jitter = 1.0 + ((noise(&mut state) % 41) as f64 - 20.0) / 1e3;
+                    let peer = *engines[j].coordinate();
+                    let sample = Duration::from_secs_f64(rtt(i, j) * jitter);
+                    assert!(engines[i].update(&peer, sample, 8));
+                }
+            }
+        }
+        let hosts: Vec<HostId> = (0..9u64).map(|i| HostId(100 + i)).collect();
+        let mut detector = Detector::new(hosts[0], Exposure::new(), room());
+        for (index, &host) in hosts.iter().enumerate().skip(1) {
+            detector.join(host).unwrap();
+            detector.learn_coordinate(host, Coordinate::Held(engines[index].coordinate()));
+        }
+        for target in 1..9 {
+            detector.rank_relays(hosts[target]);
+            let region = target / 3 * 3;
+            let mut mates: Vec<HostId> = (region..region + 3)
+                .filter(|member| *member != target && *member != 0)
+                .map(|member| hosts[member])
+                .collect();
+            let mut first = detector.relays[..mates.len()].to_vec();
+            mates.sort_unstable();
+            first.sort_unstable();
+            assert_eq!(first, mates, "target {target}: {:?}", detector.relays);
+        }
     }
 }

@@ -1,8 +1,9 @@
-# Research: SWIM's membership bound
+# Research: SWIM's membership bound and its network coordinates
 
-Source notes for `docs/timing.md` §2.7 (hyper-swim): how many members a view holds, and how long it
-keeps what it learned of a dead one. Each entry says what the source establishes, verified against
-the source text on 2026-10-02, and what it leaves open.
+Source notes for `docs/timing.md` §2.7 (hyper-swim): how many members a view holds, how long it keeps
+what it learned of a dead one, and the Vivaldi engine that ranks indirect-probe relays. Each entry
+says what the source establishes, verified against the source text on 2026-10-02, and what it leaves
+open.
 
 ## The membership: dissemination, and forgetting the dead
 
@@ -85,3 +86,97 @@ Detection", arXiv 1707.00788 (2018).**
   window makes room for a newcomer at once; one inside it does not, since forgetting it early is what
   the window prevents. Every map keyed by a member (the detector's peers, coordinates, extensions, the
   gossip's reports) holds only members the view holds, so all are bounded by it.
+
+## The network coordinates
+
+**Dabek, Cox, Kaashoek, Morris, "Vivaldi: A Decentralized Network Coordinate System", SIGCOMM
+2004.**
+
+- §2.3: the squared-error function `E = Σ (L_ij − ‖x_i − x_j‖)²` is a spring network's energy.
+- §2.4: every node starts at the origin; "Vivaldi does this [separates them] by defining `u(0)` to
+  be a unit-length vector in a randomly chosen direction".
+- §2.5, Eq. 2: `δ = c_c × local error / (local error + remote error)`: "an accurate node sampling
+  an inaccurate node will not move much, an inaccurate node sampling an accurate node will move a
+  lot, and two nodes of similar accuracy will split the difference."
+- §2.6: each node keeps "a moving average of recent relative errors (absolute error divided by
+  actual latency)", each sample weighted as in `δ`; "the estimate is always within a small constant
+  factor of the actual error".
+- §2.7, Fig. 3: `w = e_i/(e_i + e_j)`; `e_s = |‖x_i − x_j‖ − rtt| / rtt`;
+  `e_i = e_s × c_e × w + e_i × (1 − c_e × w)`; `δ = c_c × w`;
+  `x_i = x_i + δ × (rtt − ‖x_i − x_j‖) × u(x_i − x_j)`. "The constants `c_e` and `c_c` are tuning
+  parameters."
+- §3.2: a node's error is "the median of the link errors for links involving that node".
+- §4.1, Fig. 5(b): "Empirically, a `c_c` value of 0.25 yields both quick error reduction and low
+  oscillation."
+- §5.2: by principal components "the coordinates primarily use two to three dimensions"; "Adding
+  extra dimensions past three does not make a significant improvement in the fit", and more
+  dimensions cost more communication: "we prefer the lowest dimensional coordinates that allow for
+  accurate predictions".
+- §5.4: height vectors, `[x, x_h] − [y, y_h] = [(x − y), x_h + y_h]`, `‖[x, x_h]‖ = ‖x‖ + x_h`,
+  `α × [x, x_h] = [αx, αx_h]`; "Each node has a positive height element in its coordinates, so that
+  its height can always be scaled up or down." Fig. 15: height vectors predict better than 2-D and
+  3-D Euclidean coordinates on PlanetLab and King.
+- §6.2: "Vivaldi defends against high-error nodes, but not malicious nodes."
+- Left open: `c_e`'s value; a node's first height; `u(0)` in the height-vector space.
+
+**Ledlie, Gardner, Seltzer, "Network Coordinates in the Wild", NSDI 2007.**
+
+- §2.1, Fig. 1: Vivaldi's update as Dabek's; "Constants `c_e` and `c_c` affect the maximum impact an
+  observation can have on the confidence and the coordinate"; no values.
+- §3.4: by scree plots "Azureus, in particular, is dominated by a single dimension, and MIT King by
+  two".
+- §6.1: removing height (2-D + H to 5-D) "damaged accuracy more than the filters aided it"; 4-D + H
+  came with neighbour decay and the filters at once, so the dimensions are not separated from them.
+- §7.2: drift: the centroid "drifted constantly and repeatedly in a vector away from the origin";
+  gravity `G = (‖x_i‖/ρ)² × u(x_i)` applied toward the origin after each update, "where `ρ` tunes
+  `G` so that its pull is a small fraction of the expected diameter of the network". Table 1 (a 24-hour
+  PlanetLab trace): `ρ = 2⁶` ms, 25 % error; `2⁸`, `2¹⁰`, `2¹²` and none, 10 %; centroid migration 8,
+  17, 74, 163 and 179 ms. "Drift does not occur in simulation."
+- Left open: `c_e`; a gravity free of units: `(‖x‖/ρ)²` is a number, read as milliseconds.
+
+**NIST/SEMATECH e-Handbook of Statistical Methods, §6.3.2.4, "EWMA Control Charts".**
+`EWMA_t = λY_t + (1 − λ)EWMA_{t−1}`, and `s²_EWMA = (λ/(2 − λ)) s²` over independent observations of
+variance `s²`. An `m`-observation mean has variance `s²/m`; the two are equal at `λ = 2/(m + 1)`.
+
+**Derived here (2026-10-02): the engine's constants.**
+
+- `c_c = 0.25`: Dabek §4.1.
+- Dimensions: two and a height, Dabek §5.2 and §5.4 (Fig. 15), with Ledlie §3.4's one to two
+  intrinsic dimensions. The repository cannot record a wide-area round-trip matrix to measure against;
+  its loopback and container round trips are one link's, all alike.
+- `c_e`: what the estimate tracks is the node's relative error over its links (Dabek §2.6, §3.2). SWIM
+  samples each link once a round of `m` periods, in a fresh permutation (§4.3), so a shorter memory
+  sees a random part of the links and a longer one averages errors of coordinates since replaced. The
+  estimate's memory is one round: the weight whose EWMA has the variance of an `m`-sample mean,
+  `c_e = 2/(m + 1)`, the weight a sample of full trust (`w → 1`) gets.
+- The first height and `u(0)`. A node starts at the origin of the height-vector space, height zero
+  (Dabek §2.4). Two such nodes' difference is the zero vector, so `u(0)` applies: a unit vector of
+  the height-vector space in a random direction, uniform on its unit sphere `‖v‖ + h = 1, h ≥ 0`
+  (`h` of density `2(1 − h)`), drawn from the node's own seeded stream so that a simulation replays.
+  After an update a height is kept at least one nanosecond, the unit round trips are measured in, so it
+  stays positive (§5.4).
+- The error estimate stays positive. A sample's error is floored at one nanosecond over the round
+  trip: a smaller error cannot be measured, and an estimate of zero would fix `w = 0`, a node that
+  never moves again. With it the estimate is positive whatever the samples, so `w` is defined
+  without a neutral case, and no ceiling is needed: a large estimate is a node with no confidence,
+  which its peers weigh accordingly.
+- No gravity. Ledlie's `G` carries its units' scale: `(‖x‖/ρ)²` is a number read as milliseconds, so
+  in seconds the same `ρ` pulls a thousand times harder, and a pull that is a small fraction of
+  PlanetLab's diameter in milliseconds moves a LAN's coordinates across the network in one update.
+  Nothing in the paper fixes the unit, so no `ρ` derived from a measured diameter makes it free of
+  one. And the engine does not need it. Drift is a rigid motion of every coordinate, which leaves every
+  distance and height, so every prediction, unchanged; the engine predicts only between its own
+  coordinate and peers' learned at their last acknowledgement, at most a round old. Vivaldi's update is
+  homogeneous in the coordinates and the round trips (scaling every round trip by `k` scales every
+  coordinate and step by `k`), so drift is a fraction of the round trips whatever their scale: Ledlie's
+  179 ms in 24 hours without gravity (Table 1) is 2.1 µs a second, under three hundred-thousandths of
+  PlanetLab's 76 ms median round trip (Dabek §3.1) for a round of a second. What drift costs is a node
+  that joins at the origin far from a drifted centroid: it closes the distance by `1 − c_c·w` a sample,
+  `w` near one while its error dwarfs its peers', so about `log(D/r)/log(1/(1 − c_c))` samples more
+  for a drift of `D` against round trips `r`: two to three for each doubling.
+- Removed with gravity, being in neither paper: a separate share of each step for the height (the
+  height moves inside the step by its share of the predicted round trip, §5.4's algebra), an
+  "adjustment" term added to every prediction and its smoothing and clamp, and the bounds on the error
+  estimate (positive by the resolution's floor; a ceiling is only less confidence). The wire carries
+  what is left, the point's two components, the height and the error, and a decoder takes a coordinate
+  of exactly the engine's dimensions: a point of another space means nothing in this one.

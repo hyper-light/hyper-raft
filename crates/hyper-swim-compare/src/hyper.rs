@@ -43,7 +43,7 @@ pub fn gossip_per_message() -> usize {
         configuration_version: 1,
         standing: None,
         gossip: GossipBatch::Entries(&[]),
-        coordinate: Coordinate::Held(&NetworkCoordinate::origin(8)),
+        coordinate: Coordinate::Held(&NetworkCoordinate::origin()),
     }
     .encode_into(&mut bare);
     gossip_capacity(DATAGRAM - OVERHEAD_BYTES - LENGTH_BYTES, bare.len())

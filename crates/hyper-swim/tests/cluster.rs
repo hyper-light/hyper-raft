@@ -197,7 +197,7 @@ impl Member {
     /// The gossip entries that fit the datagram beside the largest message, an acknowledgement
     /// with this member's coordinate.
     fn gossip_room(&mut self) -> usize {
-        let coordinate = self.detector.coordinate().clone();
+        let coordinate = *self.detector.coordinate();
         SwimMessage::Ack {
             from: HostId(self.me),
             nonce: u64::MAX,
@@ -310,7 +310,7 @@ impl Member {
                 let ack = self.detector.on_ping(from);
                 let mut batch = std::mem::take(&mut self.batch);
                 self.detector.gossip_into(self.gossip, &mut batch);
-                let coordinate = self.detector.coordinate().clone();
+                let coordinate = *self.detector.coordinate();
                 self.send(
                     ack.to.0,
                     &SwimMessage::Ack {

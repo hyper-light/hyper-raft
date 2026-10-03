@@ -325,6 +325,19 @@ round-trip delay `δ = (T4 − T1) − (T3 − T2)`: halving the round trip is e
 two directions take equally long, which the formula takes without stating. The ballot's one-way
 latency is half a measured round trip on the same footing.
 
+**Kaplan and Meier, "Nonparametric estimation from incomplete observations", JASA 53(282), 1958,
+pp. 457–481.** A lifetime observed only until something else ends the watch is censored: known to
+exceed the time watched, not equal to it. Dropping the censored and keeping the rest biases the
+estimate toward the short lifetimes, and the product-limit estimator is what recovers the
+distribution. A timed wait that a message ends past its deadline is such an observation of the
+timer's lateness: it would have been at least that late. Counted only where the timer ended them,
+the waits were a sample of the timer's lateness biased short, and empty where messages come
+oftener than the timer is late (hyper-durable-e2e's members on Linux's 1 ms tick, `docs/timing.md`
+§2.9). The stream's `G` does not estimate the timer's lateness, though: it stands for the lateness
+of the polls its queues see (the sender's schedule, the detector's checks, §2.4), and a poll a
+message brought past a wake is a complete observation of that, so every wait the owner began
+before a wake and that reached it counts as it ended, with nothing to recover.
+
 **Lindley, "The theory of queues with a single server", Proc. Cambridge Philos. Soc. 48(2), 1952,
 pp. 277–289.** A single server fed at regular intervals `η` with independent service times `S`
 reaches a stationary waiting time iff `E[S] < η`; otherwise the wait grows without bound. A sender

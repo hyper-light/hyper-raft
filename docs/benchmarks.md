@@ -5083,11 +5083,10 @@ one; the members' own, before and after, are in the end-to-end accounts below.
 `docs/timing.md` §2.4 and §2.9 ("hyper-durable-e2e's `kill`, no `G` where messages end the
 waits"). hyper-durable-e2e's `kill` in Docker's Linux at two CPUs (`docker run --cpus 2`, the
 VM's load 4.3–5.5 as the runs began and ended, the Mac's 9–13), from a diagnostic build of its
-member that
-counts, every half second, the waits it began for the stream's wake, how each ended, what it
-reported and the heartbeats its stream refused (not committed: `scratch/dm-notes/diag`), first as
-`dc42e0e` reports its waits, only those the deadline ended, then reporting every wait it began
-before the wake that ended at or past it. Three runs each, 11:39–11:43, before and after in turn
+member that counts, every half second, the waits it began for the stream's wake, how each ended,
+what it reported and the heartbeats its stream refused (not committed: `scratch/dm-notes/diag`),
+first as `dc42e0e` reports its waits, only those the deadline ended, then reporting every wait it
+began before the wake that ended at or past it. Three runs each, 11:39–11:43, before and after in turn
 as far as the switch of builds allowed (before, after three times, before twice):
 
 | the member reports | runs passing | member processes a second or more without `G` | heartbeats refused as unmeasured | waits for the wake ended on the timer / reported / all |
@@ -5099,8 +5098,121 @@ A member's `G` came a median 79–137 ms into its start before (where it came at
 108–143 ms after; in `stall-leader`'s failed run the member that never measured it began 21,901
 waits for its wake, none ended on its timer, and refused 1,360 heartbeats. The waits that reached
 the wake on an ask past it are what the timer-only count missed: a fifth to a third of the reports
-after.
-`a_wait_a_message_ends_past_its_wake_measures_the_wake` (`tests/sim.rs`) pins the rule: an owner
-whose every wait a message ends 300 µs past its wake, its timer 1 ms late, has `G` 300 µs from the
-first wake and takes every heartbeat; counted only as the timer ended them, it measures none and
-refuses every heartbeat.
+after. The members' `G` over their half-second lines, where measured: a median of 1.23–1.36 ms
+before, the tick, which alone ended the waits counted; 0.20–0.95 ms after, the asks ending waits
+past the wake sooner than the tick. `a_wait_a_message_ends_past_its_wake_measures_the_wake`
+(`tests/sim.rs`) pins the rule: an owner whose every wait a message ends 300 µs past its wake, its
+timer 1 ms late, has `G` 300 µs from the first wake and takes every heartbeat; counted only as the
+timer ended them, it measures none and refuses every heartbeat.
+
+
+## The detectors' account end to end, main against this branch (2026-10-03)
+
+hyper-raft-e2e's `cluster`, whose members print each pair's account, once on main `9893679` and
+once on this branch's head `d712a5f`, on macOS (Apple M5 Max, `F_FULLFSYNC`) and in Docker
+Desktop's Linux VM at four, two and one CPUs (`docker run --cpus`; 1 ms ticks, `fdatasync` on a
+disk image), under the machine's ambient load alone: other sessions' builds and tests, the load
+recorded as each run began and ended (main: macOS 10:27, load 4.7–8.3; Linux 10:36–10:48, the VM's
+4.3–7.8. The head: macOS 14:22, load 7.0–7.2; Linux 14:14–14:22, the VM's 4.2–7.2). Main's later
+commits up to `418851a` change none of the code these runs exercise. Read by
+`scratch/dm-notes/accounts2.py` (`table.py`): the configured pairs' (`own`) account lines, and the
+members' `G`, `E[flush]` and `T_E`.
+
+| | macOS main | macOS head | Linux 4 main | Linux 4 head | Linux 2 main | Linux 2 head | Linux 1 main | Linux 1 head |
+|---|---|---|---|---|---|---|---|---|
+| run, s | 60 | 58 | 39 | 73 | 86 | 76 | 101 | 280 |
+| pairs own / pool / unjudged | 64/2/10 | 63/3/10 | 71/1/4 | 72/2/2 | 69/3/4 | 70/2/4 | 65/5/6 | 66/2/8 |
+| configured with `α = 0`; `U > 1` | 0; 51 of 64 | 0; 0 of 63 | 0; 5 of 71 | 0; 0 of 72 | 1; 19 of 69 | 0; 0 of 70 | 0; 22 of 65 | 0; 0 of 66 |
+| `η` median (p90), ms | 14.9 (27.7) | 12.6 (79.2) | 9.18 (19.4) | 16.6 (25.4) | 18.2 (63.2) | 13.4 (20.1) | 14 (40.3) | 75.9 (373) |
+| `α` median (p90), ms | 9.75 (20.4) | 110 (200) | 4.55 (13.4) | 19.3 (1.07e+03) | 10.6 (60.4) | 15.8 (931) | 7.89 (33.2) | 86.7 (406) |
+| `U` median (max) | 1.59 (4.64) | 0.0692 (0.195) | 0.0265 (5.87) | 0.0031 (0.161) | 0.236 (5.53) | 0.00228 (0.143) | 0.472 (8.23) | 0.00332 (0.0471) |
+| fed `p_L` / unseen share, median | 0.102 | 0.0132 | 0.0896 | 0.0029 | 0.0632 | 0.0029 | 0.158 | 0.0037 |
+| slots skipped, share median (p90) | - | 0.137 (0.259) | - | 0.0259 (0.36) | - | 0.028 (0.36) | - | 0.0275 (0.124) |
+| suspicions / allowance, commits-3/5 | 147 / 772.7 | 0 / 49.5 | 216 / 851.3 | 20 / 146.3 | 434 / 1460.1 | 6 / 139.2 | 207 / 1177.8 | 0 / 135.4 |
+| all scenarios | 382 / 2373.5 | 39 / 135.0 | 655 / 2756.0 | 83 / 415.9 | 1020 / 4066.3 | 85 / 547.1 | 2347 / 8535.7 | 503 / 343.9 |
+| `G` median ms, commits-3/5; stalled-devices | 5.03; 47.7 | 0.439; 0.399 | 0.339; 15.5 | 0.699; 0.775 | 2.44; 18.3 | 0.646; 0.788 | 0.42; 37.8 | 0.731; 1.35 |
+| `T_E` of a stopped member's peers, ms | 1.43e+03 | 46 | 2.9 | 4.8 | 340 | 2.9 | 1.23e+03 | 26 |
+| leader's term at leader-killed's kill | 3 | 1 | 9 | 29 | 13 | 21 | 20 | 14 |
+
+- **No detector that promises nothing.** Main configured `U > 1` in 51 of 64 pairs on macOS and in
+  5, 19 and 22 of 65–71 in Linux at four, two and one CPUs, and `α = 0` once (two CPUs); the head
+  in none (`docs/timing.md` §2.2).
+- **What the configurator is fed.** Main's `p_L`, a median of 0.10 on macOS and 0.06–0.16 in
+  Linux, was mostly slots its senders skipped. The head takes each skipped slot as the next
+  heartbeat's lateness, and its unseen share is a median of 0.003–0.013. The senders skipped a
+  median of 13.7 % of their slots on macOS, where a flush is about three quarters of the
+  interval, and 2.6–2.8 % in Linux, the members' synchronous log writes holding their threads past
+  a slot.
+- **Wider margins, fewer mistakes.** `α` is a median of 110 ms on macOS and 15.8–86.7 ms in Linux,
+  against main's 4.6–10.6 ms: the latenesses are heavy-tailed, and one Cantelli factor bounds them
+  at the margin that minimizes `U`. In commits-3 and commits-5, where no member is down or cut
+  off, the head's members suspected live peers 0, 20, 6 and 0 times, against main's 147, 216, 434
+  and 207 (macOS; Linux at four, two and one CPUs). The runs took 58, 73, 76 and 280 s against
+  main's 60, 39, 86 and 101 s: the test's waits follow the members' stated detection bounds, which
+  wider margins lengthen, and at one CPU `follower-restarts`, `partition` and `stalled-devices`
+  took 62–78 s each.
+- **`G` is the timer's or the messages', never the owner's stalls**: 0.44 ms in commits-3/5 and
+  0.40 ms through `stalled-devices` on macOS, 0.65–0.73 ms and 0.78–1.35 ms in Linux, against
+  main's 5.0 and 47.7 ms, and 0.34–2.4 and 15.5–37.8 ms.
+- **A stopped member's peers' `T_E`**: 46 ms on macOS and 2.9–26 ms in Linux, against main's
+  1.43 s, and 2.9 ms, 340 ms and 1.23 s. Main's echoes of heartbeats that sat in the stopped
+  member's socket counted the stop as the path; the kernel's stamp leaves it out (`dc42e0e`).
+- **The leader's term at `leader-killed`'s kill**: 1 on macOS against main's 3, and 29, 21 and 14
+  in Linux against main's 9, 13 and 20. A follower that suspects its leader campaigns, so the term
+  counts the suspicions of leaders; in `leader-killed` the head's members suspected 39, 30 and 28
+  times against allowances of 58.7, 85.6 and 69.1 (main 41, 229 and 138 against 120, 629 and
+  332), the members killed included. One run each: on `dc42e0e`'s tree the same column read 5,
+  48 and 1.
+- **Suspicions against the allowance**, reported, never asserted: 39 / 135.0 on macOS, and 83 /
+  415.9, 85 / 547.1 and 503 / 343.9 in Linux, against main's 382 / 2,373.5, and 655 / 2,756.0, 1,020
+  / 4,066.3 and 2,347 / 8,535.7; the scenarios with a member down count its true suspicions too. At
+  one CPU `follower-restarts` made 457 against 27.4: 287 by one member of the follower restarted,
+  the pair at a 9 ms interval (that member skipped 707 of its 1,461 slots to the follower), and 107
+  and 57 between the two live members. The exact check held (every report's `unread` zero), so each
+  was the stream's, a heartbeat that came past its point by the kernel's stamp. A rerun of the
+  scenario at one CPU, the members printing each suspicion (not committed), made 8 against 11.3,
+  every one a heartbeat 18–188 ms past its point after a pause of every member at once, or the kill:
+  the burst of the first run did not come again.
+- **The members' polls past what they had read** (`docs/timing.md` §2.9, "The E2E members polled
+  their streams past what they had read"): on `09e8316`, before the drain rule, `stalled-devices`
+  made 465, 392 and 9 suspicions at four, two and one CPUs (main 19, 124 and 60); on the head 10,
+  16 and 8.
+
+**hyper-durable-e2e's `kill` and hyper-liveness's `processes`**, the same runs. `kill` passed on
+the head on every platform, in 46.5 s on macOS and 20.6–21.0 s in Linux; main's failed once in
+Linux at two CPUs (`kill-durable-leader`, a write never answered, open on main). `processes` passed
+on both: the head's live members suspected 0, 0, 0 and 2 times against allowances of 2.0, 7.7, 2.0
+and 1.5 (macOS; Linux at four, two and one CPUs), every suspicion traced to the rule, and main's 0,
+1, 22 and 0 against 12.2, 19.9, 56.7 and 3.0.
+
+**`G` on the traces** (`hyper-timing-trace run`; the recorder's waits are each begun before their
+deadline and ended by it, nothing else waking them, so its `G` is the timer's alone): 194.5 µs on
+macOS at 1 ms for 60 s (11:58–11:59, load 2.9–4.2; 59,224 waits asked a median of 753 µs, late a
+median of 198.1 µs) and 932.0 µs in Docker's Linux at two CPUs at 2 ms for 60 s (14:24–14:25, the
+VM's load 5.7–6.1; 26,764 waits asked a median of 668 µs, late a median of 844 µs, the VM's 1 ms
+tick). The members' `G` in the table is how late past each wake the stream was polled while they
+waited, by the timer or by the first message past the wake: below the recorder's in Linux, where
+messages end most waits before the tick does.
+
+**Per heartbeat** (`benches/allocs.rs`, its world of calm links: nodes every pair of which shares a
+group, ten simulated seconds past every pair's configuration; three rounds, main `9893679` and the
+head alternating, 14:25, load 5.8–6.0): nanoseconds of the crate's work a heartbeat sent or taken,
+and the heartbeats of the window, which this model's shorter intervals send ten times as many of on
+these links. Neither allocates, reallocates or faults a page.
+
+| nodes, groups | main: heartbeats sent | ns | head: heartbeats sent | ns |
+|---|---|---|---|---|
+| 2, 1 | 216 | 71–83 | 2,362 | 71–74 |
+| 4, 1 | 608 | 89–94 | 5,094 | 77–79 |
+| 8, 1 | 2,952 | 118–123 | 29,785 | 108–112 |
+| 8, 1,000 | 2,952 | 116–121 | 29,785 | 107–110 |
+
+```sh
+# Each binary once a side and platform, the load recorded (scratch/dm-notes/e2e, linux.sh and
+# mac-branch.sh); the accounts read by table.py over accounts2.py:
+cargo test --locked -p hyper-raft-e2e --test cluster -- --nocapture
+cargo test --locked -p hyper-durable-e2e --test kill -- --nocapture --test-threads=4
+cargo test --locked -p hyper-liveness --test processes -- --nocapture --test-threads=4
+hyper-timing-trace run <dir> <interval-us> 60 && hyper-timing-trace analyse <dir>
+cargo bench -p hyper-liveness --bench allocs   # on each tree, alternating
+```

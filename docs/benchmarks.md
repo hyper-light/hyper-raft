@@ -1861,6 +1861,29 @@ as an owner does, counts 0 allocations, reallocations and faults a member a peri
 members, quiet and churning; the bytes asked under churn (0.3 a member a period at 16 and 64
 members) are one-time growths, falling tenfold over 4,000 periods instead of 400.
 
+**The findings** (`f9aff67`: a probe's stated deadline and each poll's findings, `docs/timing.md`
+§2.7), against the head before them as measured above (`2605c89`), `main` and slates, the same
+rotation, 2026-10-03 at 09:19–09:24 PDT at load 8.5–17.9, nine rounds at 16 and 64 members, then
+nine at 256 at 09:25–09:37, load 5.0–16.0. The machine was quieter than for the series above:
+sixteen busy loops an earlier load test had orphaned, running since 2026-10-02 05:08, were ended at
+08:13. ns a member a period, medians with the least and the most:
+
+| Members | Workload | slates | `main` | Before | With the findings | Against before |
+|---|---|---|---|---|---|---|
+| 16 | quiet | 565 (448–591) | 385 (311–428) | 367 (340–385) | 374 (335–394) | +2.0 % |
+| 16 | churning | 997 (860–1,116) | 582 (540–700) | 675 (600–712) | 665 (569–970) | −1.4 % |
+| 64 | quiet | 668 (623–832) | 573 (434–675) | 660 (469–1,603) | 603 (559–2,079) | −8.6 % |
+| 64 | churning | 1,147 (1,057–1,430) | 779 (739–1,008) | 1,002 (834–1,443) | 978 (853–2,194) | −2.5 % |
+| 256 | quiet | 1,017 (932–1,395) | 714 (687–1,126) | 913 (748–1,789) | 892 (756–1,232) | −2.2 % |
+| 256 | churning | 1,566 (1,515–4,526) | 1,015 (973–1,234) | 1,363 (1,287–2,340) | 1,396 (1,282–4,421) | +2.5 % |
+
+Nothing beyond the spread: a poll clears a vector, and a probe carries one more word; a finding is
+pushed only where a probe goes unanswered, which neither workload has. Three rounds at 256 members
+first read +17.7 % churning, 1,646–2,393 ns against 1,424–1,884, which the nine put at +2.5 %. The
+period stays under slates' at every point, 9.7 to 33.8 % less. `benches/allocs.rs` counts 0
+allocations, reallocations and faults a member a period at 4 to 256 members, quiet and churning,
+the same profile as the head before, to the bytes asked.
+
 ## The cluster test
 
 `tests/cluster.rs`, four member processes over hyper-datagram on loopback UDP, each run a fresh
@@ -2010,6 +2033,29 @@ any wait went was 0.27 of its quiet period. A run took a median 1.9 s on macOS a
 the throttled containers, the longest 166 s, waiting on the pairs' evidence. The suspicions and
 condemnations of live members are the load's: the machine ran at up to 95, and the throttled
 members stall together.
+
+**Every finding traced (2026-10-03).** From `f9aff67` the test decides nothing by a statistical
+level: it traces every suspicion, every condemnation made pending and every condemnation, from the
+members' own records, to the detector's rule, and prints Theorem 7's allowance beside the counts of
+live members as a report (`docs/timing.md` §2.7). Runs of that form, each a fresh supervisor, the
+binaries built from the library and test `f9aff67` holds, under the machine's ambient load alone,
+nothing added; macOS and Linux at the same time from 09:37 PDT, the Linux series ended at 09:49 so
+as not to load another session's timing-sensitive gate:
+
+| Platform | Limits | Runs | Passed | Load (1 min) | Traced: suspicions, pending, condemnations | Live members' answers: late (latest past its deadline), lost | Suspicions of live members (allowed) | Condemnations (allowed) | Detection, first kill, median / p95 / max | Second kill |
+|---|---|---|---|---|---|---|---|---|---|---|
+| macOS 26.4.1, M5 Max | none | 2,000 | 2,000 | 3.5–10.4 | 6,721, 7,593, 5,078 | 18 (9.7 ms), 0 | 15 (163,566) | 1 (160,064) | 5.9 / 9.0 / 24.6 ms | 10.4 / 20.2 / 356.4 ms |
+| Linux 6.12.76 (Docker Desktop) | `--cpus 1` | 454 | 454 | 1.2–3.7 | 1,633, 1,775, 1,165 | 49 (54.9 ms), 0 | 45 (28,255) | 1 (27,390) | 19.0 / 26.9 / 71.0 ms | 51.1 / 104.1 / 576.2 ms |
+| Linux 6.12.76 (Docker Desktop) | `--cpus 2` | 475 | 475 | 1.2–3.7 | 1,646, 1,936, 1,277 | 19 (73.5 ms), 0 | 16 (24,974) | 1 (24,116) | 19.6 / 27.1 / 43.3 ms | 50.0 / 105.1 / 230.9 ms |
+| Linux 6.12.76 (Docker Desktop) | `--cpus 4` | 468 | 468 | 1.2–3.7 | 1,656, 1,815, 1,195 | 36 (72.1 ms), 0 | 33 (25,730) | 1 (24,858) | 19.0 / 26.8 / 61.9 ms | 49.9 / 104.7 / 239.8 ms |
+
+No finding failed its trace, and every count a member reported was its record's at every line it
+wrote. The probes the findings name were unanswered by their stated deadlines and, where relays were
+asked, by theirs; every answer that missed a live member's probe came, after its period had ended,
+none lost; the others were probes of the killed members, whose records hold no such ping. A run took
+a median 0.34 s on macOS and 1.0 to 1.2 s in the containers. The checks bite: a detector made to
+ignore one answer in five fails the trace at once (524 findings named in one run), and one that
+drops its suspicions' findings fails the count at the first line that reports one.
 
 ## Commands for the detector
 

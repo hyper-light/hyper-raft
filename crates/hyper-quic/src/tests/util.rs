@@ -340,6 +340,10 @@ pub(super) fn validate_incoming(incoming: &Incoming) -> IncomingConnectionBehavi
 }
 
 impl TestEndpoint {
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "a capture socket, made only with SSLKEYLOGFILE and drained of whatever arrives: nothing it receives is read, so a timed receive has nothing to lose"
+    )]
     fn new(endpoint: Endpoint, addr: SocketAddr) -> Self {
         let socket = if env::var_os("SSLKEYLOGFILE").is_some() {
             let socket = UdpSocket::bind(addr).expect("failed to bind UDP socket");

@@ -134,6 +134,10 @@ fn bound(mut sample: impl FnMut()) -> Duration {
 ///   `timeBeginPeriod`). The leader's heartbeat goes out on a tick, so a tick finer than the
 ///   timer keeps is a heartbeat interval the leader cannot keep: a tick is at least the bound of
 ///   a wait asked for `LEAST_TICK`.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "real processes on the host's clock (CLAUDE.md §1a, end to end); a timed receive on a socket nothing sends to measures the wait's lateness, and has nothing to lose"
+)]
 fn measure_tick() -> Duration {
     let path = PathBuf::from(TMP).join(format!("e2e-{}-probe", std::process::id()));
     let mut file = OpenOptions::new()
@@ -465,7 +469,7 @@ impl Cluster {
     /// to its end.
     #[allow(
         clippy::disallowed_methods,
-        reason = "real processes on the host's clock, threads and environment (CLAUDE.md §1a, end to end)"
+        reason = "real processes on the host's clock, threads and environment (CLAUDE.md §1a, end to end); the timed receives drop whatever arrives while the test waits out its ticks, so none has a datagram to lose"
     )]
     fn wait_ticks(&mut self, ticks: u32) {
         let until = Instant::now() + self.tick * ticks;

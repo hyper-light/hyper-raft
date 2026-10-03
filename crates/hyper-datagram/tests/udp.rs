@@ -47,14 +47,24 @@ fn secret() -> ExporterSecret {
 }
 
 fn bound() -> UdpSocket {
-    let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
-    socket.set_read_timeout(Some(RECEIVE_TIMEOUT)).unwrap();
-    socket
+    UdpSocket::bind("127.0.0.1:0").unwrap()
 }
 
+/// The next datagram, waited for by a peek and taken by a receive that does not wait: on Windows a
+/// receive that times out can lose the datagram that arrives as it is cancelled (hyper-raft's
+/// `docs/raft.md`, "The harness's receive").
+#[allow(
+    clippy::disallowed_methods,
+    reason = "the socket waits by a peek with the timeout, never a timed receive"
+)]
 fn receive(socket: &UdpSocket) -> Vec<u8> {
     let mut buffer = vec![0u8; 65_536];
-    let (length, _) = socket.recv_from(&mut buffer).expect("a datagram arrives");
+    socket.set_read_timeout(Some(RECEIVE_TIMEOUT)).unwrap();
+    socket.peek_from(&mut buffer).expect("a datagram arrives");
+    socket.set_nonblocking(true).unwrap();
+    let taken = socket.recv_from(&mut buffer);
+    socket.set_nonblocking(false).unwrap();
+    let (length, _) = taken.expect("the datagram peeked is taken");
     buffer.truncate(length);
     buffer
 }

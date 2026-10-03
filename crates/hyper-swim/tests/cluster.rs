@@ -251,6 +251,10 @@ impl Member {
     /// Waits for one datagram until the detector's wake (or for one datagram, when it asks no
     /// wake), and handles it. Only a timeout or a datagram ends the wait: any other error
     /// (Windows reports a reset on the next receive after a send to a closed port) skips it.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "the socket waits by a peek with the timeout, never a timed receive"
+    )]
     fn receive(&mut self) {
         let timeout = match self.detector.wake() {
             Some(at) => match at.checked_sub(self.now()).filter(|left| *left > 0) {

@@ -369,9 +369,13 @@ and the receive after it took it, the next receive finding nothing; so whatever 
 datagram or an error, is taken by a receive that does not wait (`wire::take`), never by peeking
 again (a first form of this change peeked again, and spun on the reset to the end of each wait: on
 both Windows runners the E2E did not finish within fifteen minutes once a member had exited).
-`tests/arrives.rs` holds the wait to losing no datagram and to taking a reset and the datagram
-behind it. The tests of `hyper-transport` and `hyper-swim` that drive real sockets wait the same
-way.
+That no wait in the workspace is a timed receive the lint holds: `clippy.toml` disallows
+`UdpSocket::set_read_timeout`, and each site that sets one states why its wait cannot lose a
+datagram (a peek: `wire::arrives`, the real-socket tests of `hyper-transport`, `hyper-swim` and
+`hyper-datagram`; or a socket whose receives drop what arrives). A test that sent 4,251 datagrams
+to catch a loss with a picked probability is gone: a peek removes nothing, so none is lost to a
+cancelled one, and the count measured nothing the lint does not hold. `tests/arrives.rs` holds the
+taking of a reset and the datagram behind it.
 
 The simulation and the checks are two crates, designed in `docs/sim.md` (sources in
 `docs/research/sim.md`), not yet built:

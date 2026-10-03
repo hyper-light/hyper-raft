@@ -127,6 +127,10 @@ pub fn largest(socket: &UdpSocket) -> io::Result<usize> {
 /// each. A peek takes nothing, so one cancelled with it loses nothing. A peek takes no error
 /// either: a reset it reports is reported again until a receive takes it, so the receive follows
 /// whatever the peek found.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "the wait the lint points to: a peek with the timeout, never a timed receive"
+)]
 pub fn arrives(socket: &UdpSocket, wait: Option<Duration>, buffer: &mut [u8]) -> io::Result<bool> {
     socket.set_read_timeout(wait)?;
     match socket.peek_from(buffer) {

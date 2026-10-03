@@ -133,7 +133,7 @@ impl Wire {
     /// arrived (also when the timer is already due), fires the timers due, and sends again.
     #[allow(
         clippy::disallowed_methods,
-        reason = "real processes on the host's clock, threads and environment (CLAUDE.md §1a, end to end)"
+        reason = "real processes on the host's clock, threads and environment (CLAUDE.md §1a, end to end); the socket waits by a peek with the timeout, never a timed receive"
     )]
     fn turn<E: Drive>(&mut self, endpoint: &mut E) {
         self.flush(endpoint);

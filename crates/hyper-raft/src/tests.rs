@@ -2708,3 +2708,487 @@ fn a_snapshot_reply_credits_what_the_follower_holds() {
         .expect("C holds only through 3, below the leader's snapshot at 4");
     assert_eq!(proto::snapshot_index(again.snapshot.as_ref().unwrap()), 4);
 }
+
+// slates' out-of-order acknowledgement within a term (mantle note 32 R17; slates
+// `docs/wip/research/consensus-enhancements.md` §3.5; `crate::ahead`): a member keeps a leader's
+// entries that arrive ahead of a hole in its log, and takes them in when the hole is filled.
+
+/// A leader and member 2 caught up with it, in a group of three; the leader proposes `count`
+/// entries, and its appends to 2 are given back unsent.
+fn ahead_of(
+    config_of: impl Fn(u64) -> Config,
+    count: u8,
+) -> (RawNode<Memory>, RawNode<Memory>, Vec<Message>) {
+    let mut leader = leader_with(config_of(1));
+    let mut follower = RawNode::new(&config_of(2), Memory::with_voters(&[1, 2, 3])).unwrap();
+    caught_up(&mut leader, &mut follower);
+    let mut sent = Vec::new();
+    for value in 0..count {
+        leader.propose(vec![], vec![value]).unwrap();
+        sent.extend(
+            drain(&mut leader)
+                .into_iter()
+                .filter(|message| message.to == 2 && message.msg_type == MessageType::MsgAppend),
+        );
+    }
+    (leader, follower, sent)
+}
+/// The entries the leader's appends among `messages` carry to member 2.
+fn carried(messages: &[Message]) -> Vec<u64> {
+    messages
+        .iter()
+        .filter(|message| message.to == 2 && message.msg_type == MessageType::MsgAppend)
+        .flat_map(|message| message.entries.iter().map(|entry| entry.index))
+        .collect()
+}
+
+/// slates' `a_follower_buffers_the_leaders_entries_ahead_of_a_hole_and_absorbs_them`: an append that
+/// arrives ahead of the one before it is refused, and its entry kept; the one before it, once it
+/// arrives, is taken with the kept entry, and its answer acknowledges both.
+#[test]
+fn a_follower_keeps_the_leaders_entries_ahead_of_a_hole_and_takes_them_in() {
+    let (_, mut follower, sent) = ahead_of(config, 2);
+    assert_eq!(sent.len(), 2, "one append an entry");
+    let (behind, ahead) = (sent[0].clone(), sent[1].clone());
+    let last = follower.raft.log().last_index().unwrap();
+    follower.step(ahead).unwrap();
+    let refused = drain(&mut follower);
+    assert!(
+        !refused.is_empty() && refused.iter().all(|answer| answer.reject),
+        "the hole at {}",
+        last + 1
+    );
+    assert_eq!(
+        follower.raft.kept_ahead().collect::<Vec<_>>(),
+        vec![last + 2]
+    );
+    assert_eq!(follower.raft.log().last_index().unwrap(), last);
+    follower.step(behind).unwrap();
+    let answers = drain(&mut follower);
+    assert_eq!(answers.len(), 1);
+    assert!(!answers[0].reject);
+    assert_eq!(answers[0].index, last + 2, "the kept entry joined the log");
+    assert_eq!(follower.raft.log().last_index().unwrap(), last + 2);
+    assert_eq!(follower.raft.kept_ahead().count(), 0);
+    assert_eq!(follower.raft.taken_ahead(), 1);
+    follower.check_accounting().unwrap();
+}
+
+/// slates' `a_lost_batch_costs_one_resend_and_the_buffered_ones_are_not_sent_again`: a leader sends
+/// three appends ahead of their answers, and the first is lost. The member refuses the other two and
+/// keeps their entries; the leader sends the hole's entry again, alone; the member takes the kept
+/// two with it and acknowledges all three; and nothing is sent again. Under raft-rs's rule
+/// (`Ahead::Refused`, the differential's) the two are sent again after the hole is filled: the
+/// divergence of `docs/raft.md` §3.3.
+#[test]
+fn a_lost_append_costs_its_own_resend_and_what_was_kept_is_not_sent_again() {
+    for refused in [false, true] {
+        let config_of = |id: u64| Config {
+            // An append an entry, three ahead of their answers.
+            max_size_per_msg: 1,
+            max_inflight_msgs: 3,
+            ahead: if refused {
+                crate::Ahead::Refused
+            } else {
+                crate::Ahead::Kept
+            },
+            ..config(id)
+        };
+        let (mut leader, mut follower, sent) = ahead_of(config_of, 3);
+        assert_eq!(carried(&sent).len(), 3, "three appends, one entry each");
+        let hole = carried(&sent)[0];
+        // The first is lost; the other two are refused.
+        for append in sent.into_iter().skip(1) {
+            follower.step(append).unwrap();
+        }
+        let answers = drain(&mut follower);
+        assert!(answers.iter().all(|answer| answer.reject));
+        let kept: Vec<u64> = follower.raft.kept_ahead().collect();
+        let expected = if refused {
+            vec![]
+        } else {
+            vec![hole + 1, hole + 2]
+        };
+        assert_eq!(kept, expected);
+        for answer in answers {
+            leader.step(answer).unwrap();
+        }
+        let resend = drain(&mut leader);
+        assert_eq!(carried(&resend), vec![hole], "the hole's entry, alone");
+        for message in resend.into_iter().filter(|message| message.to == 2) {
+            follower.step(message).unwrap();
+        }
+        for answer in drain(&mut follower) {
+            if !refused {
+                assert_eq!(answer.index, hole + 2, "the kept two joined the log");
+            }
+            leader.step(answer).unwrap();
+        }
+        // What follows, until the member holds the leader's log.
+        let mut after = Vec::new();
+        for _ in 0..4 {
+            let messages: Vec<Message> = drain(&mut leader)
+                .into_iter()
+                .filter(|message| message.to == 2)
+                .collect();
+            after.extend(carried(&messages));
+            for message in messages {
+                follower.step(message).unwrap();
+            }
+            for answer in drain(&mut follower) {
+                leader.step(answer).unwrap();
+            }
+        }
+        assert_eq!(follower.raft.log().last_index().unwrap(), hole + 2);
+        let again = if refused {
+            vec![hole + 1, hole + 2]
+        } else {
+            vec![]
+        };
+        assert_eq!(after, again, "refused: {refused}");
+    }
+}
+
+/// The leader's half: a member that keeps what arrives ahead of a hole refuses each append it
+/// keeps, and its leader sends the hole alone again, once: what it sent ahead is not sent again,
+/// and each append the member kept leaves the window, as a segment the receiver says it holds
+/// leaves RFC 6675's pipe. The answer to the hole frees what is left. raft-rs's leader probes from
+/// the member's match and sends the window again (`Ahead::Refused`).
+#[test]
+fn a_refusal_sends_the_hole_alone_and_what_was_kept_leaves_the_window() {
+    let config_of = |id: u64| Config {
+        max_size_per_msg: 1,
+        max_inflight_msgs: 8,
+        ..config(id)
+    };
+    let (mut leader, mut follower, sent) = ahead_of(config_of, 4);
+    let hole = carried(&sent)[0];
+    let window = |leader: &RawNode<Memory>| {
+        let progress = leader.raft.tracker().get(2).unwrap();
+        (
+            progress.state,
+            progress.next_index,
+            progress.inflights.bytes(),
+        )
+    };
+    let (state, next, bytes) = window(&leader);
+    // One entry an append, each charged alike.
+    let each = bytes / 4;
+    assert_eq!(bytes, 4 * each);
+    // The first is lost: the other three are kept, and each is refused.
+    for append in sent.iter().skip(1) {
+        follower.step(append.clone()).unwrap();
+    }
+    let refusals = drain(&mut follower);
+    assert_eq!(refusals.len(), 3);
+    assert!(
+        refusals
+            .iter()
+            .all(|refusal| refusal.reject && refusal.reject_hint == hole - 1)
+    );
+    let mut resent = Vec::new();
+    for refusal in refusals {
+        leader.step(refusal).unwrap();
+        resent.extend(
+            drain(&mut leader)
+                .into_iter()
+                .filter(|message| message.to == 2),
+        );
+    }
+    assert_eq!(carried(&resent), vec![hole], "the hole alone, once");
+    assert_eq!(
+        window(&leader),
+        (state, next, each),
+        "what was kept left the window; the hole's first sending is out"
+    );
+    assert_eq!(leader.raft.tracker().get(2).unwrap().repaired, hole);
+    // The hole's entry comes: the member takes the kept three with it, and its answer frees the
+    // window.
+    for message in resent {
+        follower.step(message).unwrap();
+    }
+    let answers = drain(&mut follower);
+    assert_eq!(answers.last().unwrap().index, hole + 3);
+    for answer in answers {
+        leader.step(answer).unwrap();
+    }
+    let progress = leader.raft.tracker().get(2).unwrap();
+    assert_eq!(
+        (progress.matched, progress.inflights.count()),
+        (hole + 3, 0)
+    );
+}
+
+/// The hole sent again may be lost too: a beat with no answer for it, the member answering
+/// heartbeats and nothing of the hole, probes it from its match, as a full window that goes
+/// unanswered is.
+#[test]
+fn a_hole_sent_again_and_unanswered_for_a_beat_is_probed() {
+    let config_of = |id: u64| Config {
+        max_size_per_msg: 1,
+        max_inflight_msgs: 8,
+        ..config(id)
+    };
+    let (mut leader, mut follower, sent) = ahead_of(config_of, 3);
+    let hole = carried(&sent)[0];
+    follower.step(sent[1].clone()).unwrap();
+    for refusal in drain(&mut follower) {
+        leader.step(refusal).unwrap();
+    }
+    let lost = drain(&mut leader);
+    assert_eq!(carried(&lost), vec![hole], "sent again, and lost");
+    let beat = leader.raft.config().heartbeat_tick;
+    let mut probe = Vec::new();
+    for tick in 1..=beat {
+        leader.tick().unwrap();
+        for message in drain(&mut leader) {
+            match message.msg_type {
+                MessageType::MsgHeartbeat if message.to == 2 => {
+                    follower.step(message).unwrap();
+                    for answer in drain(&mut follower) {
+                        leader.step(answer).unwrap();
+                        probe.extend(
+                            drain(&mut leader)
+                                .into_iter()
+                                .filter(|message| message.to == 2),
+                        );
+                    }
+                }
+                _ => {}
+            }
+        }
+        if tick < beat {
+            assert!(probe.is_empty(), "tick {tick}: not before a beat");
+        }
+    }
+    let progress = leader.raft.tracker().get(2).unwrap();
+    assert_eq!(progress.state, crate::progress::ProgressState::Probe);
+    assert_eq!(carried(&probe).first(), Some(&hole), "probed from the hole");
+}
+
+/// A refusal the member made before it took more still tells what it kept. Here the member kept
+/// the second and fourth appends, refusing each, and the first took the second with it but not the
+/// fourth, past the third, which was lost: its answer reaches the leader before the refusal of the
+/// fourth. The leader sends the third again, the append that carried it first and no more, keeping
+/// its window, and the member takes the fourth with it; raft-rs's leader probes from the member's
+/// match and sends all that followed again.
+#[test]
+fn a_refusal_older_than_the_members_progress_sends_what_it_lacks_and_no_more() {
+    let config_of = |id: u64| Config {
+        max_size_per_msg: 1,
+        max_inflight_msgs: 8,
+        ..config(id)
+    };
+    let (mut leader, mut follower, sent) = ahead_of(config_of, 4);
+    let hole = carried(&sent)[0];
+    follower.step(sent[1].clone()).unwrap();
+    follower.step(sent[3].clone()).unwrap();
+    let refusals = drain(&mut follower);
+    assert_eq!(refusals.len(), 2);
+    follower.step(sent[0].clone()).unwrap();
+    let answers = drain(&mut follower);
+    assert_eq!(
+        answers.last().unwrap().index,
+        hole + 1,
+        "the fourth waits on the third"
+    );
+    for answer in answers {
+        leader.step(answer).unwrap();
+    }
+    drain(&mut leader);
+    let window = |leader: &RawNode<Memory>| {
+        let progress = leader.raft.tracker().get(2).unwrap();
+        (
+            progress.state,
+            progress.next_index,
+            progress.inflights.count(),
+        )
+    };
+    let before = window(&leader);
+    // The refusal of the fourth: it names the end the member had, before the hole it now has.
+    let late = refusals.last().unwrap().clone();
+    assert_eq!((late.index, late.reject_hint), (hole + 2, hole - 1));
+    leader.step(late).unwrap();
+    let resent: Vec<Message> = drain(&mut leader)
+        .into_iter()
+        .filter(|message| message.to == 2)
+        .collect();
+    assert_eq!(carried(&resent), vec![hole + 2], "the third, alone");
+    assert_eq!(
+        window(&leader),
+        before,
+        "the window keeps what it sent ahead"
+    );
+    for message in resent {
+        follower.step(message).unwrap();
+    }
+    assert_eq!(drain(&mut follower).last().unwrap().index, hole + 3);
+}
+
+/// Two appends of a window lost: each goes again, once, as the refusal of an append sent after it
+/// arrives, not one hole a round trip; the member keeps the second resend ahead of the first hole
+/// and takes everything once the first arrives.
+#[test]
+fn every_hole_before_what_was_kept_goes_again_at_once() {
+    let config_of = |id: u64| Config {
+        max_size_per_msg: 1,
+        max_inflight_msgs: 8,
+        ..config(id)
+    };
+    let (mut leader, mut follower, sent) = ahead_of(config_of, 5);
+    let hole = carried(&sent)[0];
+    // The first and third are lost.
+    for at in [1, 3, 4] {
+        follower.step(sent[at].clone()).unwrap();
+    }
+    let mut repairs = Vec::new();
+    for refusal in drain(&mut follower) {
+        leader.step(refusal).unwrap();
+        repairs.extend(
+            drain(&mut leader)
+                .into_iter()
+                .filter(|message| message.to == 2),
+        );
+    }
+    assert_eq!(
+        carried(&repairs),
+        vec![hole, hole + 2],
+        "both holes, each once"
+    );
+    // The second arrives first and is kept; the first takes everything.
+    for message in repairs.into_iter().rev() {
+        follower.step(message).unwrap();
+    }
+    assert_eq!(drain(&mut follower).last().unwrap().index, hole + 4);
+}
+
+/// A member that keeps nothing ahead of a hole (raft-rs's rule, `Ahead::Refused`, as in a group of
+/// both cores) refuses an append past its end without saying it kept it; its leader probes from
+/// the member's match as raft-rs does, sends what the member dropped again, and the member catches
+/// up. A leader that took every refusal for a kept append would mark the dropped ones arrived and
+/// never send them.
+#[test]
+fn a_member_that_keeps_nothing_ahead_is_probed_and_caught_up() {
+    let config_of = |id: u64| Config {
+        max_size_per_msg: 1,
+        max_inflight_msgs: 8,
+        ahead: if id == 2 {
+            crate::Ahead::Refused
+        } else {
+            crate::Ahead::Kept
+        },
+        ..config(id)
+    };
+    let (mut leader, mut follower, sent) = ahead_of(config_of, 3);
+    // The first is lost; the other two are refused, and nothing is kept.
+    for append in sent.iter().skip(1) {
+        follower.step(append.clone()).unwrap();
+    }
+    let refusals = drain(&mut follower);
+    assert!(
+        refusals
+            .iter()
+            .all(|refusal| refusal.reject && !refusal.kept)
+    );
+    assert_eq!(follower.raft.kept_ahead().count(), 0);
+    for refusal in refusals {
+        leader.step(refusal).unwrap();
+    }
+    for _ in 0..16 {
+        let messages: Vec<Message> = drain(&mut leader)
+            .into_iter()
+            .filter(|message| message.to == 2)
+            .collect();
+        if messages.is_empty() {
+            break;
+        }
+        for message in messages {
+            follower.step(message).unwrap();
+        }
+        for answer in drain(&mut follower) {
+            leader.step(answer).unwrap();
+        }
+    }
+    assert_eq!(
+        follower.raft.log().last_index().unwrap(),
+        leader.raft.log().last_index().unwrap()
+    );
+}
+
+/// The answer that acknowledges kept entries leaves with the write that holds them: they are in
+/// the `Ready`'s entries, and the answer among the messages that wait for its persistence
+/// (`docs/durable.md` I2 and §10: the window's slots are in the write before the acknowledgement).
+#[test]
+fn what_was_kept_is_acknowledged_only_with_the_write_that_holds_it() {
+    let mut node = follower_with(with_depth(2, 2));
+    let append = |index: u64| {
+        let mut append = answer(MessageType::MsgAppend, 1, 2, 1);
+        append.index = index - 1;
+        append.log_term = 1;
+        append.commit = 2;
+        append.entries = vec![entry(index, 1)];
+        append
+    };
+    // 5 arrives ahead of 4: refused, and kept.
+    node.step(append(5)).unwrap();
+    let mut ready = node.ready().unwrap();
+    assert!(ready.entries().is_empty());
+    let refusals = ready.take_persisted_messages();
+    assert!(refusals.iter().all(|message| message.reject));
+    node.advance_append(ready).unwrap();
+    // 4 fills the hole: the write holds 4 and 5, and the answer for 5 waits for it.
+    node.step(append(4)).unwrap();
+    let mut ready = node.ready().unwrap();
+    let written: Vec<u64> = ready.entries().iter().map(|entry| entry.index).collect();
+    assert_eq!(written, vec![4, 5]);
+    assert!(
+        ready.messages().is_empty(),
+        "nothing leaves before the write"
+    );
+    let answers = ready.take_persisted_messages();
+    assert_eq!(answers.len(), 1);
+    assert_eq!((answers[0].index, answers[0].reject), (5, false));
+}
+
+/// What a member keeps ahead of a hole is bounded as what its log holds not yet durable is
+/// (`Limits::unstable_entries`): the entries nearest the hole are kept, the furthest dropped,
+/// whatever order the appends arrive in.
+#[test]
+fn what_is_kept_ahead_of_a_hole_has_a_bound() {
+    let config_of = |id: u64| {
+        let mut config = Config {
+            max_size_per_msg: 1,
+            max_inflight_msgs: 8,
+            ..config(id)
+        };
+        config.limits.unstable_entries = 2;
+        config.limits.entries_per_message = 2;
+        config
+    };
+    let (_, mut follower, sent) = ahead_of(config_of, 5);
+    let hole = carried(&sent)[0];
+    // The last first, then the others but the hole.
+    for append in sent[2..].iter().rev().chain(sent[1..2].iter()) {
+        follower.step(append.clone()).unwrap();
+    }
+    assert_eq!(
+        follower.raft.kept_ahead().collect::<Vec<_>>(),
+        vec![hole + 1, hole + 2]
+    );
+    follower.check_accounting().unwrap();
+}
+
+/// What was kept was one leader's in one term: a member that moves to a later term forgets it.
+#[test]
+fn what_was_kept_goes_with_its_term() {
+    let (_, mut follower, sent) = ahead_of(config, 2);
+    follower.step(sent[1].clone()).unwrap();
+    drain(&mut follower);
+    assert_eq!(follower.raft.kept_ahead().count(), 1);
+    let term = follower.raft.term();
+    follower
+        .step(answer(MessageType::MsgHeartbeat, 3, 2, term + 1))
+        .unwrap();
+    assert_eq!(follower.raft.term(), term + 1);
+    assert_eq!(follower.raft.kept_ahead().count(), 0);
+}

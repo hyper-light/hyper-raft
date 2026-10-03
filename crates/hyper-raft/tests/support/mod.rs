@@ -598,6 +598,9 @@ pub struct Settings {
     /// Whether a heartbeat's answer says nothing of the member's log and
     /// frees a full window's first message, as in `raft-rs`.
     pub bare_answers: bool,
+    /// Whether a member keeps nothing of an append that arrives ahead of a
+    /// hole in its log, as in `raft-rs` (`Ahead::Refused`).
+    pub refuse_ahead: bool,
     /// Whether the group has the fast track.
     pub fast: bool,
     /// Whether this core's members are driven by `RawNode::ready_in_place`,
@@ -654,6 +657,7 @@ impl Settings {
             by_length: true,
             round_each: true,
             bare_answers: true,
+            refuse_ahead: true,
             fast: false,
             in_place: false,
             depth: 1,
@@ -674,6 +678,7 @@ impl Settings {
             by_length: false,
             round_each: false,
             bare_answers: false,
+            refuse_ahead: false,
             // A few of a schedule's entries: the window fills by its
             // bytes long before it fills by its places.
             max_inflight_bytes: 256,
@@ -1256,6 +1261,11 @@ impl Replica for New {
                 hyper_raft::HeartbeatAnswers::Bare
             } else {
                 hyper_raft::HeartbeatAnswers::Position
+            },
+            ahead: if settings.refuse_ahead {
+                hyper_raft::Ahead::Refused
+            } else {
+                hyper_raft::Ahead::Kept
             },
             fast: settings.fast,
             apply_unpersisted: settings.apply_unpersisted,

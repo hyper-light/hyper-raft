@@ -881,3 +881,68 @@ them. slates is read at `ec5e0df` (its `main`, 2026-10-03).
   long schedules, a tenth (`SCHEDULES_SLOW_LEADER`, measured: 15 at the default size, on ticks 8),
   and stays a quarter in the crashes' and faults' schedules, each of which still holds a change
   behind the fence there.
+
+### R17: what arrives ahead of a hole is kept, and acknowledged with the write that holds it
+
+- **The rule** (slates `docs/wip/research/consensus-enhancements.md` §3.5, after ParallelRaft-CE,
+  Gu et al., IJSI 2021, and PolarFS's ParallelRaft, Cao et al., VLDB 2018 §5). A member refuses an
+  append that begins past the end of its log, as Raft's consistency check does, and keeps its
+  entries beside its log (`crate::ahead::Early`, `Ahead::Kept`), as many as its log may hold not yet
+  durable (`Limits::unstable_entries`), those nearest the hole first; once an append of the same
+  term fills the hole, the kept entries that continue it are taken into the log with it
+  (`Raft::take_ahead`), and the answer acknowledges them all, with the write that holds them
+  (`docs/durable.md` I2 and §10). A change of term or role or a snapshot forgets what was kept; a
+  marked member (R-5) keeps nothing. raft-rs's rule is `Ahead::Refused`, which the differential and
+  the schedules found under it run.
+- **The leader's half, found by the timed simulation.** With the member's half alone, on paths that
+  reorder, the group collapsed at 1,000 proposals a second (99.5 % of what was sent sent again, 384
+  committed a second): most refusals were older than what the leader knew the member held yet
+  named an append past its match, so raft-rs's staleness rule probed at each, and each probe and the
+  replication after it sent the window again. A leader whose members keep what arrives ahead
+  (`Ahead::Kept`) keeps a scoreboard in its window (RFC 2018, RFC 6675): an append the member
+  refused and kept leaves the window's bytes and keeps its place (`Inflights::delivered`), and every
+  message sent before it and neither answered nor kept goes again, once (`Outbox::repair_before`,
+  `Progress::repaired`), anchored past what the member answered or was sent again, as RFC 6675 sends
+  again what `IsLost` names and counts it in the pipe in the lost segment's place. Where the window
+  holds no record of the refused append, what follows the member's end goes again as far as its
+  start; a resend unanswered for a beat is probed, as an unanswered full window (liveness for a lost
+  resend). Measured and rejected on the way: a hole sent only at refusals, once for each end (a 717
+  ms median at 2,000 a second with 1 % loss against R16's 191), and the next hole sent at the answer
+  filling the first, one hole a round trip (1,574 ms). raft-rs's leader is kept for
+  `Ahead::Refused`.
+- **The member's word** (found by `tests/group.rs`'s group of both cores, whose seed 40 at times did
+  not settle). A leader that took every refusal past a member's end for a kept append marked arrived
+  what a raft-rs follower had dropped and never sent it again; whether it happened turned on
+  raft-rs's own random timeouts, which leader a schedule made. A member's refusal now says it kept
+  the append (`Message::kept`, flag bit 3 of the wire format, its golden vector pinned), and the
+  leader acts on that word: a member that keeps nothing is probed as raft-rs probes it
+  (`a_member_that_keeps_nothing_ahead_is_probed_and_caught_up`, which fails on the leader's own
+  setting). One schedule line moved, a marked member that keeps nothing now probed; the timed sweep
+  and every count are as below.
+- **Designed from both, and the literature.** slates keeps only entries of the leader's own term,
+  behind ParallelRaft-CE's sync rule; this core keeps any of the leader's entries, since a leader
+  never rewrites its log in its term and the append that fills the hole checks the log through its
+  end, and nothing here commits or applies out of order, which is what that rule guards
+  (commitment out of order stays out, note 32 R18). slates bounds what it keeps by its window's
+  bytes; this core by what its log may hold not yet durable, the bound its log already keeps.
+- **Tests**: `a_refusal_sends_the_hole_alone_and_what_was_kept_leaves_the_window`,
+  `a_hole_sent_again_and_unanswered_for_a_beat_is_probed`,
+  `a_refusal_older_than_the_members_progress_sends_what_it_lacks_and_no_more` and
+  `every_hole_before_what_was_kept_goes_again_at_once` for the leader's half (each fails with its rule
+  taken out); slates' `a_follower_buffers_the_leaders_entries_ahead_of_a_hole_and_absorbs_them` and
+  `a_lost_batch_costs_one_resend_and_the_buffered_ones_are_not_sent_again` as this core states them
+  (the second runs raft-rs's rule beside, which sends the kept entries again: the divergence's
+  test), `what_was_kept_is_acknowledged_only_with_the_write_that_holds_it` (I2),
+  `what_is_kept_ahead_of_a_hole_has_a_bound`, `what_was_kept_goes_with_its_term`; the schedules of
+  `tests/pipeline.rs` hold every acknowledgement to the member's disk and now ask that kept entries
+  were taken (`Coverage::ahead`).
+- **Measured** (`docs/benchmarks.md`, "What arrives ahead of a hole (R17)"): on slates' five regions
+  in time, paths that reorder with no loss, the rule's window commits every proposal at 123 / 126 ms
+  at 2,000 and 4,000 a second (R16: 264 / 2,084 ms, and 1,588 a second at 4,000), 38–44 % of entries
+  sent again against 95–96 %; with 1 % loss on paths that keep order 227 / 462 ms at 2,000 a second
+  against 202.5 / 328, 12 % sent again against 31 %, more bytes (each repair a message of its own).
+  The gate test `on_paths_that_reorder_what_arrives_ahead_is_not_sent_again` holds it exactly; under
+  `Ahead::Refused` the core gives R16's numbers exactly. Allocations R16's on 28 of 36 cells; the
+  catch-up cells 40 fewer allocations and a 41 kB higher peak (the returning member's kept entries),
+  the snapshot cells 8 bytes a member more a tracker. The schedules of `tests/pipeline.rs` moved,
+  R17 reached in every setting that keeps; every other suite's lines are R16's.

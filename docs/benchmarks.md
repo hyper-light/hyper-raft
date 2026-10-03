@@ -980,6 +980,74 @@ Here a member refuses every append that arrives ahead of one still on its way, a
 it all again: of what is sent, 31–41 % again with one batch and 86–95 % with any larger window, before
 R16 and after. That is R17's.
 
+## What arrives ahead of a hole (R17)
+
+Core step R-3's fourth commit (`crates/hyper-raft/ORIGIN.md`, "R17"). Measured on 2026-10-03 on the
+machine above; the timed sweep ran 14:53–15:06 at load 3.9–10.3 (777 s).
+
+**Allocations**: R16's on 28 of the 36 cells. The four snapshot cells allocate 8 bytes a member
+more each time a tracker is built (`Progress::repaired`). The four catch-up cells make 40 fewer
+allocations (20,680 → 20,640 at three voters, 23 kB fewer bytes) and peak 41 kB higher: the
+returning member keeps what its leader sends past its end, and its leader sends the hole alone
+where it probed and sent what followed again; what is kept is held until the hole fills.
+
+**The schedules**: the 31 lines of the differential and the other suites are R16's. The 31 of
+`tests/pipeline.rs` moved, R17 reached in every setting whose members keep what arrives ahead: 40 to
+244 entries a line taken from what was kept (`Coverage::ahead`), each acknowledged only with the
+write that holds it (the durability oracle at every step). With faults at rest 9,997 entries were
+committed and 50 of 384 groups left waiting on a mark (R16: 10,179 and 57); without faults, 4,920
+committed (5,131).
+
+**slates' measurement on this core** (as R16's section above; `tests/timed.rs`). Under raft-rs's
+rule (`Ahead::Refused`) this core gives R16's numbers exactly (all 80 runs of seed 0 compared). On
+paths that reorder:
+
+| Offered, loss | Window | R16: median / p99, commits a second, MB sent, entries resent | R17: median / p99, commits a second, MB sent, entries resent |
+|---|---|---|---|
+| 1,000/s, none | one batch | 1,531 / 3,298 ms, 923.5/s, 218.9, 69% | 190 / 256 ms, 1,000/s, 110.0, 31% |
+| 1,000/s, none | the rule | 147 / 228 ms, 1,000/s, 1,091.7, 92% | 122 / 126 ms, 1,000/s, 541.9, 29% |
+| 2,000/s, none | one batch | 8,525 / 16,913 ms, 926.5/s, 104.0, 31% | 7,784.5 / 15,194 ms, 1,043/s, 107.7, 26% |
+| 2,000/s, none | the rule | 264 / 2,083.5 ms, 1,947/s, 3,085.3, 95% | 123 / 126 ms, 2,000/s, 1,126.0, 38% |
+| 4,000/s, none | one batch | 12,154 / 23,779 ms, 925.5/s, 103.4, 31% | 11,706 / 22,941 ms, 1,044/s, 107.9, 26% |
+| 4,000/s, none | the rule | 5,099.5 / 18,542 ms, 1,588/s, 4,244.3, 96% | 123 / 126 ms, 4,000/s, 2,346.6, 44% |
+| 1,000/s, 1 % | one batch | 1,908.5 / 3,570 ms, 914/s, 210.0, 68% | 247 / 468 ms, 1,000/s, 108.7, 31% |
+| 1,000/s, 1 % | the rule | 146 / 231 ms, 1,000/s, 1,044.9, 91% | 185.5 / 432.5 ms, 1,000/s, 459.7, 38% |
+| 2,000/s, 1 % | one batch | 8,778.5 / 17,058.5 ms, 914/s, 102.0, 32% | 7,926.5 / 15,496 ms, 1,023/s, 107.6, 27% |
+| 2,000/s, 1 % | the rule | 191 / 325.5 ms, 2,000/s, 2,364.5, 93% | 216 / 403 ms, 2,000/s, 995.9, 42% |
+| 4,000/s, 1 % | one batch | 12,148.5 / 23,806 ms, 922/s, 102.4, 31% | 11,748.5 / 23,073 ms, 1,026.5/s, 107.5, 27% |
+| 4,000/s, 1 % | the rule | 5,181 / 18,902 ms, 1,588.5/s, 4,242.5, 96% | 235 / 448.5 ms, 4,000/s, 2,076.8, 45% |
+
+On paths that keep order, with 1 % loss:
+
+| Offered, loss | Window | R16: median / p99, commits a second, MB sent, entries resent | R17: median / p99, commits a second, MB sent, entries resent |
+|---|---|---|---|
+| 1,000/s, 1 % | one batch | 443 / 737 ms, 1,000/s, 76.3, 4% | 376 / 606 ms, 1,000/s, 75.9, 3% |
+| 1,000/s, 1 % | four batches | 168 / 260.5 ms, 1,000/s, 249.6, 26% | 190 / 402 ms, 1,000/s, 295.9, 12% |
+| 1,000/s, 1 % | the rule | 168 / 255 ms, 1,000/s, 305.5, 28% | 200.5 / 493 ms, 1,000/s, 354.0, 15% |
+| 2,000/s, 1 % | one batch | 8,109 / 15,728 ms, 1,008/s, 79.2, 2% | 8,069.5 / 15,640.5 ms, 1,016/s, 79.9, 3% |
+| 2,000/s, 1 % | four batches | 197.5 / 333 ms, 2,000/s, 272.5, 19% | 176.5 / 341.5 ms, 2,000/s, 309.0, 7% |
+| 2,000/s, 1 % | the rule | 202.5 / 328 ms, 2,000/s, 548.4, 31% | 227 / 462 ms, 2,000/s, 640.1, 12% |
+| 4,000/s, 1 % | one batch | 11,813 / 23,186.5 ms, 1,008/s, 79.2, 2% | 11,799.5 / 23,186.5 ms, 1,013.5/s, 80.0, 3% |
+| 4,000/s, 1 % | four batches | 3,246 / 6,486.5 ms, 3,266.5/s, 267.3, 8% | 1,676.5 / 2,903 ms, 3,736/s, 291.1, 5% |
+| 4,000/s, 1 % | the rule | 246 / 418 ms, 4,000/s, 1,057.8, 36% | 245 / 505.5 ms, 4,000/s, 1,241.4, 12% |
+
+Where paths reorder, a member refuses every append that overtakes one still on its way; with R17 it
+keeps it, and its leader sends again only what is missing before it, so the rule's window commits
+every proposal at 123 / 126 ms up to 4,000 a second, where R16 fell behind at 4,000 (1,588 a second)
+sending nearly everything twice. With 1 % loss on paths that keep order, R17 sends 12 % of entries
+again against 31 %, but its p99 is higher (462 ms against 328 at 2,000 a second) and its bytes too
+(640 MB against 548): each repair is a message of its own, with its fixed bytes, where raft-rs's
+sending of what followed a hole goes in pages and covers a second loss behind the first by chance;
+and this harness sends each proposal as its own message, so a loss in a hundred messages is a hole
+every hundred entries. With four batches, whose window makes proposals wait and go together, R17's
+median is ahead at 2,000 a second (176.5 ms against 197.5) and its commits at 4,000 (3,736 a second
+against 3,266.5), and behind at 1,000 (190 / 402 ms against 168 / 260.5).
+
+The member's half alone, with raft-rs's leader, was measured first and collapsed on paths that
+reorder: at 1,000 a second the rule's window committed 384 a second at a 4,988 ms median, 99.5 % of
+what it sent sent again (20 seeds), where R16 committed every proposal at 147 ms (`docs/raft.md`
+§3.2 has why, and the two leader's halves measured and rejected after it).
+
 ## Where hyper-raft does not win, and why
 
 hyper-raft in place allocates less than every other core in every row. It is faster than raft-rs
@@ -1294,6 +1362,10 @@ cargo bench -p hyper-raft --bench backlog -- 50000
 # measurement on this core; before, the harness on commit 2's tree with focal's 128 places.
 HYPER_RAFT_TIMED_SEEDS=20 HYPER_RAFT_TIMED_STREAM_S=30 cargo test -p hyper-raft --release --test timed -- --ignored --exact replication_across_rates_and_loss --nocapture
 HYPER_RAFT_TIMED_PLACES=128 HYPER_RAFT_TIMED_SEEDS=20 HYPER_RAFT_TIMED_STREAM_S=30 cargo test -p hyper-raft --release --test timed -- --ignored --exact replication_across_rates_and_loss --nocapture
+
+# What arrives ahead of a hole (R17): as above, and the same sweep under raft-rs's rule, which gives
+# R16's numbers.
+HYPER_RAFT_TIMED_AHEAD=refused HYPER_RAFT_TIMED_SEEDS=1 HYPER_RAFT_TIMED_STREAM_S=30 cargo test -p hyper-raft --release --test timed -- --ignored --exact replication_across_rates_and_loss --nocapture
 
 # The end-to-end scenarios, and every gate.
 cargo test -p hyper-raft-e2e --test cluster

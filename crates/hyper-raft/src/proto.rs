@@ -151,6 +151,10 @@ pub struct Message {
     /// rest (core step R-5, `docs/durable.md` §5). `reject_hint` and `log_term` name the last
     /// entry it holds; its leader takes the member's progress back to it and resends from there.
     pub lost: bool,
+    /// On a refused append's answer: the append began past the end of the member's log, and the
+    /// member keeps what arrives ahead of a hole (`Ahead::Kept`, R17): it kept the append's
+    /// entries, and its leader sends what it lacks before them, not them.
+    pub kept: bool,
     /// Where a refused append may resume.
     pub reject_hint: u64,
     /// What the sender attached.

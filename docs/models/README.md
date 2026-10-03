@@ -49,6 +49,13 @@ their terms.
 | `Own(c)`, `Quorums(c, Q)` | `Raft::campaign` polling a marked candidate's own vote as a refusal (R-7): its quorum is of the others. `Marks = "self"` counts it (refused). `Raft::may_campaign`'s further limits (the others can be a quorum; not in a fast group) only refuse campaigns the model may take and win nothing by. |
 
 What the model leaves out, and why it is sound to:
+- **What a member keeps ahead of a hole** (core step R-3's R17, `Ahead::Kept`). The core's member
+  takes kept entries into its log once an append of the same term fills the hole before them; the
+  entries are the leader's own log at those indexes, which a leader never rewrites in its term, and
+  the answer acknowledges them with the write that holds them. That leaves the member where one
+  append carrying the hole's entries and the kept ones would, sent when the leader sent the last of
+  them and delivered late: what `Replicate(l, m, p)` stands for whenever an append arrives late. No
+  action changes.
 - **Messages** are not modelled one by one: what was said stays said and may be acted on at any
   later time or never, which is every order, delay, repetition and loss.
 - **A crash** is a member that does nothing for a while; what is durable is all a member has.

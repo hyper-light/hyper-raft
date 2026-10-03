@@ -121,6 +121,42 @@ fn a_window_of_two_round_trips_keeps_up_where_one_batch_does_not() {
     }
 }
 
+/// R17 on paths that reorder each message by its own jitter, at 2,000 proposals a second with the
+/// rule's window: where members keep what arrives ahead of a hole and the leader sends the hole
+/// alone, every proposal commits and less is sent again than where members refuse it and the
+/// leader probes and sends what followed again (raft-rs's rule, `Ahead::Refused`). Exact for each
+/// seed: the simulation is its seed.
+#[test]
+fn on_paths_that_reorder_what_arrives_ahead_is_not_sent_again() {
+    let stream_ns = SECOND;
+    for seed in 0..2 {
+        let kept = run(&scenario(
+            seed,
+            Window::RoundTrips(2),
+            500_000,
+            stream_ns,
+            0,
+        ));
+        eprintln!("seed {seed}, kept: {}", describe(&kept, stream_ns));
+        let mut refusing = scenario(seed, Window::RoundTrips(2), 500_000, stream_ns, 0);
+        refusing.settings.refuse_ahead = true;
+        let refused = run(&refusing);
+        eprintln!("seed {seed}, refused: {}", describe(&refused, stream_ns));
+        assert_eq!(
+            kept.uncommitted,
+            0,
+            "seed {seed}: {}",
+            describe(&kept, stream_ns)
+        );
+        assert!(
+            kept.entries_resent < refused.entries_resent,
+            "seed {seed}: kept {}, refused {}",
+            describe(&kept, stream_ns),
+            describe(&refused, stream_ns)
+        );
+    }
+}
+
 /// A measurement tool: every window × rate × loss × path order, printed a line a run, for
 /// `docs/benchmarks.md`. `HYPER_RAFT_TIMED_SEEDS=4 HYPER_RAFT_TIMED_STREAM_S=10 cargo test -p hyper-raft
 /// --release --test timed -- --ignored --exact replication_across_rates_and_loss --nocapture`.
@@ -132,6 +168,9 @@ fn replication_across_rates_and_loss() {
     let places = std::env::var("HYPER_RAFT_TIMED_PLACES")
         .ok()
         .and_then(|value| value.parse::<usize>().ok());
+    // raft-rs's rule for what arrives ahead of a hole (`Ahead::Refused`), to compare.
+    let refuse_ahead =
+        std::env::var("HYPER_RAFT_TIMED_AHEAD").is_ok_and(|value| value == "refused");
     let stream_ns = count("HYPER_RAFT_TIMED_STREAM_S", 5) * SECOND;
     for ordered in [false, true] {
         for loss_ppm in [0, 10_000] {
@@ -150,6 +189,7 @@ fn replication_across_rates_and_loss() {
                         if let Some(places) = places {
                             run_of.settings.max_inflight_msgs = places;
                         }
+                        run_of.settings.refuse_ahead = refuse_ahead;
                         let outcome = run(&run_of);
                         eprintln!(
                             "ordered {ordered}, loss {loss_ppm} ppm, every {every_us} us, {window:?}, seed {seed}: {}",

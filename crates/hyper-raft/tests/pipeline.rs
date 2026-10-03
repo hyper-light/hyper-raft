@@ -231,6 +231,12 @@ fn schedules_of(name: &str, settings: Settings, voters: &[u64], mix: &Mix) -> (C
         coverage.answers > 0 && coverage.fenced > 0 && coverage.stated > 0,
         "{name}: {coverage:?}"
     );
+    // R17 reached: members that keep what arrives ahead of a hole took some
+    // of it into their logs, each acknowledged only with the write that held
+    // it (`check_message` holds every acknowledgement to the member's disk).
+    if !settings.refuse_ahead {
+        assert!(coverage.ahead > 0, "{name}: {coverage:?}");
+    }
     // With faults at rest a leader's term is short, and its own entries are
     // rarely committed before its write of them: the schedules without
     // faults are the ones that hold applying before durability to its

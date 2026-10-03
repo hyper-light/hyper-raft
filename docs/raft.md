@@ -30,7 +30,8 @@
 > Step R-3 is under way (2026-10-03, §3.2): slates' regression tests for R6, R7, R4, R5, R20 and
 > R21 pass; three defects at the end of what a member counts and a lease kept by a member's own
 > timer, which their siblings found, are fixed; the window a member is sent ahead of its answers is
-> one rule from focal's and slates' (R16).
+> one rule from focal's and slates' (R16); a member keeps what arrives ahead of a hole and
+> acknowledges it with the write that holds it (R17).
 
 ## 1. What `hyper-raft` is
 
@@ -197,7 +198,8 @@ values (a message's entries, a snapshot's configuration) are bodies without thei
 checksum.
 
 - **Message body**: kind (1), flags (1: bit 0 reject, bit 1 snapshot present, bit 2 a refused
-  append's answer from a member whose log lost what it acknowledged, core step R-5; any other bit set
+  append's answer from a member whose log lost what it acknowledged, core step R-5, bit 3 a refused
+  append's answer from a member that kept the append ahead of a hole, R-3's R17; any other bit set
   is refused), then nine `u64` (to, from, term, log term, index, commit, commit term, request snapshot,
   reject hint) and an `i64` priority, then the entry count (`u32`) and context length (`u32`), the
   context bytes, the entries, and the snapshot body when its flag is set.
@@ -321,6 +323,75 @@ the bytes at 2,000 a second and four times at 4,000. On paths that reorder, a me
 arrives ahead of an append still on its way, and 86–95 % of what a larger window sends is sent
 again: R17.
 
+**Out-of-order acknowledgement within a term (R17).** A member that receives a leader's append past
+the end of its log refuses it, as Raft's consistency check does (§5.3), and keeps its entries beside
+its log (`Ahead::Kept`, `crate::ahead`): as many as its log may hold not yet durable
+(`Limits::unstable_entries`), those nearest the hole first. Once an append of the same term fills
+the hole, the kept entries that continue it are taken into the log with it, as the leader's next
+append would have carried them, and the answer to it acknowledges them all. This is slates' reading
+of ParallelRaft-CE (Gu et al., IJSI 2021, after PolarFS's ParallelRaft, Cao et al., VLDB 2018 §5),
+checked by its prefix model: acknowledgement out of order within one leader's term, commitment and
+application in order; commitment out of order lost a committed entry in twelve steps and stays out
+(note 32 R18).
+
+What is kept is the leader of this term's own log: a leader never rewrites its log within its term,
+so the entry it sent for an index is its entry there whenever it is taken, and the append that fills
+the hole has checked the member's log against the leader's through its end. So this core keeps
+whatever entries of the leader's log arrive, where slates kept only those of the leader's own term,
+behind its sync rule: nothing here commits or applies out of order, which is what that rule guards.
+Nothing kept is acknowledged before it is in the log: a refusal acknowledges nothing, and the answer
+that covers a kept entry leaves with the write that holds it as a log entry (`docs/durable.md` I2
+and §10: the window's slots are in the write before the acknowledgement), so they need no write of
+their own, and a member that restarts has lost only resends. A change of term or role, or a snapshot,
+forgets what was kept, and a marked member (R-5) keeps nothing. A member that takes what it kept is
+where one append carrying the hole's entries and the kept ones would leave it, sent when the leader
+sent the last of them and delivered late, as any append may be: the TLA+ model's `Replicate` stands
+for it as it stands for a late append, and the model is unchanged (`docs/models/README.md`).
+raft-rs's rule is `Ahead::Refused`, which the differential runs.
+
+The leader's half. A member's refusal names the end of its log (its hint) and the append it
+refused; where that append began past the end, a member that keeps what arrives ahead kept it, and
+says so (`Message::kept`, bit 3 of §3.1). Its leader acts on the member's word, not on its own
+setting: a member that keeps nothing (raft-rs's, or one of `Ahead::Refused`, in a group of both
+cores or across an upgrade) is probed as raft-rs probes it. The group of both cores found this:
+taking every refusal past a member's end for a kept append, a leader of this core marked arrived what
+a raft-rs follower had dropped and never sent it again, and seed 40 did not settle whenever raft-rs's
+own random timeouts made such a leader. The leader keeps a scoreboard in its window, as TCP's selective acknowledgement does (RFC 2018, RFC
+6675): the kept append is in flight no more and leaves the window's bytes, keeping its place
+(`Inflights::delivered`); every message sent before it and neither answered nor kept is a hole, lost
+or late, and goes again, once (`Outbox::repair_before`, `Progress::repaired`), as RFC 6675 sends again
+every segment its `IsLost` names once data sent after it arrived, and its pipe counts a
+retransmission in the lost segment's place. Each goes anchored past what the member answered or was
+sent again, so that a resend arriving ahead of an earlier hole is kept too, and every hole of a
+window is repaired in the round trip its refusals arrive in. Where the window holds no message that
+began there (it was emptied since), what follows the member's end goes again as far as the refused
+append's start. A resend that goes a beat with no answer is probed from the member's match, as a
+full window that goes unanswered is: it may itself have been lost. raft-rs's leader probes from the
+member's match at every refusal and sends what followed again, which it must where its member kept
+none of it. Where its member keeps it, that sending made the member's half cost more than it saved
+on paths that reorder: with the member keeping and the leader probing, the group collapsed at 1,000
+proposals a second, 99.5 % of what was sent sent again and 384 committed a second, where R16
+committed every proposal at a 147 ms median. Counted in one run, most refusals were older than what
+the leader knew the member held yet named an append past its match, so raft-rs's staleness rule took
+each for a new hole, and each probe and the replication after it sent the window again. Two earlier
+leader's halves were measured and rejected, on paths that reorder with 1 % loss at 2,000 a second:
+one that sent a hole only at a refusal and once for each end of the member's log left every later
+hole of a window waiting a beat (a 717 ms median against R16's 191); one that sent the next hole at
+the answer filling the first repaired one hole a round trip, behind a loss every hundred entries, and
+fell further behind (1,574 ms).
+
+Measured on slates' five regions in time (`docs/benchmarks.md`, "What arrives ahead of a hole (R17)";
+`tests/timed.rs`, `on_paths_that_reorder_what_arrives_ahead_is_not_sent_again`): on paths that
+reorder, with no loss, the rule's window commits every proposal at 123 / 126 ms at 2,000 and at
+4,000 a second, sending 38 % and 44 % of entries again, where R16 took 264 / 2,084 ms at 2,000 and
+fell behind at 4,000 (1,588 a second), sending 95 % and 96 % again; with 1 % loss, 216 / 403 ms at
+2,000 a second against 191 / 325.5 ms, with 42 % of the bytes. On paths that keep order with
+1 % loss, 227 / 462 ms at 2,000 a second against 202.5 / 328 ms, 12 % of entries sent again against
+31 %: raft-rs's sending of what followed a hole covers a second loss behind it by chance, at two and
+a half times the resends, where the scoreboard repairs each loss on its own refusals; and this
+harness sends each proposal as its own message, so a loss in a hundred messages is a hole every
+hundred entries.
+
 ### 3.3 Where this core and raft-rs differ
 
 `tests/differential.rs` runs this core and raft-rs on one schedule and compares them field by field
@@ -343,6 +414,7 @@ table for focal-raft; it lives here since the core moved (R-1), with every decis
 | Queues without a bound of their own | `Limits`; a member takes of a message what it may hold, and answers with the last entry taken | `what_waits_to_be_taken_has_a_bound`, `what_is_not_durable_has_a_bound`, `reads_that_wait_have_a_bound` |
 | A round of heartbeats for each read as it is asked, and again as it is asked again | One round when the member is next asked what there is to do, for every read since (`ReadRounds::Shared`, focal F43); raft-rs's rule is kept as `ReadRounds::Each` | `reads_asked_together_leave_in_one_round_and_one_answer_confirms_them`; `tests/group.rs`: `a_round_confirms_no_read_asked_after_it_left` |
 | A window of messages alone | Of bytes, each append charged its record, what the owner says the path carries (`RawNode::set_inflight_bytes`, focal F41; R16's rule, §3.2), and of messages unless it counts none; a window that filled waits for room for a whole append or half of it; the differential runs with no byte bound | `a_member_is_sent_no_more_bytes_ahead_of_its_answers_than_its_path_carries`; `src/progress.rs`: `a_window_that_filled_waits_for_a_whole_append_or_half_of_it`; `tests/timed.rs` |
+| A follower refuses an append that begins past the end of its log and keeps nothing; at the refusal its leader probes from the member's match and sends what followed again | It keeps the entries, as many as its log may hold not yet durable, and takes them in when an append of the same term fills the hole, acknowledging them with it; its refusal says it kept the append (`Message::kept`), and its leader takes what the member kept out of its window and sends every hole before it again, once, and probes only a resend a beat leaves unanswered (`Ahead::Kept`, R17, §3.2); raft-rs's rule is kept as `Ahead::Refused`, which the differential runs | `a_lost_append_costs_its_own_resend_and_what_was_kept_is_not_sent_again`, `a_refusal_sends_the_hole_alone_and_what_was_kept_leaves_the_window`, `a_hole_sent_again_and_unanswered_for_a_beat_is_probed`, `a_refusal_older_than_the_members_progress_sends_what_it_lacks_and_no_more`, `every_hole_before_what_was_kept_goes_again_at_once`, `a_member_that_keeps_nothing_ahead_is_probed_and_caught_up`, `what_was_kept_is_acknowledged_only_with_the_write_that_holds_it`; `src/wire.rs`: the kept refusal's golden vector |
 | A heartbeat's answer says nothing of the log, and a full window frees its first message at every answer | The answer says how far the log goes and is taken as an append's answer (`HeartbeatAnswers::Position`, focal F42); raft-rs's rule is kept as `HeartbeatAnswers::Bare` | `a_heartbeats_answer_gives_back_what_the_member_holds_and_nothing_more` |
 | A follower's lease reads its one election counter, which its own campaign restarts: one whose campaign waits for a committed change to apply keeps its lease another election timeout, and refuses the voter that campaigns | The lease reads the ticks since the member heard its leader (`Raft::silence`), apart from its own timer (R4, §3.2); the differential's owner applies every change at once and never reaches it | `a_member_whose_campaign_waits_for_a_change_holds_no_lease` |
 | A term or an index may be counted to `u64::MAX` | The last of each is `u64::MAX − 1`; a campaign, an append or a proposal past it is refused before anything changes, by suspicion no campaign is armed that would be, and the fast track holds nothing at the last index (R6, §3.2) | `a_term_with_no_successor_cannot_campaign_and_keeps_one_leader`, `a_member_with_no_index_for_a_leaders_first_entry_does_not_campaign`, `by_suspicion_a_member_with_no_successor_is_due_for_no_campaign`, `the_fast_track_proposes_and_holds_nothing_at_the_last_index` |

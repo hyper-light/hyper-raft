@@ -15,7 +15,8 @@ ReadIndex and snapshots. Reads asked before the member is next asked what there 
 share one round of heartbeats (`ReadRounds`). What a member is sent ahead of its
 answers is bounded in bytes, each append charged its record, by what its owner says the path to
 it carries over the two round trips a lost append takes to repair (`RawNode::set_inflight_bytes`,
-`hyper_timing::inflight_window`), and in messages unless the window counts none. It keeps the log and speaks the messages of `raft-rs` 0.7
+`hyper_timing::inflight_window`), and in messages unless the window counts none. What arrives ahead of a hole in a member's log is kept and taken in when the hole is filled
+(`Ahead`). It keeps the log and speaks the messages of `raft-rs` 0.7
 (`raft-proto`), which focal's groups ran on before. What it decides differently, and
 why, is in the module header of `src/raft.rs` and in focal's
 `docs/archictecutre/27-consensus-roadmap-and-slates-port.md` §4.5 (focal `a8e95f7`).
@@ -66,7 +67,7 @@ term's committed entries before its own write of them is durable.
 | `tests/group.rs` | groups of this core, and of both cores together, under schedules: safe whatever the schedule, and settled once the network is whole; the decisions of focal 27 §4.5 |
 | `tests/fast.rs` | the fast track: committed by the fast quorum, taken again by the leader that follows, and groups that propose by it under schedules |
 | `tests/backlog.rs` | a proposal costs its leader the same allocations at any backlog (slates' R21) |
-| `tests/timed.rs` | replication across five Azure regions in time (`tests/support/timed.rs`): a window of what the path carries over two round trips keeps up where one batch does not (slates' R16), and the measurement tool behind `docs/benchmarks.md` |
+| `tests/timed.rs` | replication across five Azure regions in time (`tests/support/timed.rs`): a window of what the path carries over two round trips keeps up where one batch does not (slates' R16); on paths that reorder, what arrives ahead of a hole is not sent again (R17); and the measurement tool behind `docs/benchmarks.md` |
 | `tests/pipeline.rs` | members that take `Ready`s ahead of their persistence, under schedules that interleave persistence with everything else and crash at every persistence step: held at every step to what their disks hold (`docs/durable.md` §3) |
 | `benches/replicate.rs` | what replication costs with either core |
 | `benches/pipeline.rs` | readies in flight against one at a time, on simulated devices and a simulated network |

@@ -160,6 +160,45 @@ impl Inflights {
         }
         Ok(())
     }
+    /// The message out that carried what followed `after` arrived, though
+    /// it is not answered: the member kept it ahead of a hole
+    /// (`Ahead::Kept`). It is in flight no more, and its bytes leave the
+    /// window, as RFC 6675's pipe leaves out a segment the receiver says it
+    /// holds (RFC 2018); it keeps its place, its bytes nothing, for every
+    /// message costs its fixed bytes and none other costs nothing. The
+    /// message is the one after the message that ended at `after`, or the
+    /// first out when all through `after` was answered; its last index, or
+    /// nothing where no message out began after `after`.
+    pub fn delivered(&mut self, after: u64, answered: u64) -> Option<u64> {
+        let at = self.buffer.iter().position(|(last, _)| *last > after)?;
+        let begins_after = match at.checked_sub(1) {
+            Some(before) => self
+                .buffer
+                .get(before)
+                .is_some_and(|(last, _)| *last == after),
+            None => answered == after,
+        };
+        if !begins_after {
+            return None;
+        }
+        let (last, held) = self.buffer.get_mut(at)?;
+        self.bytes = self.bytes.saturating_sub(*held);
+        *held = 0;
+        let last = *last;
+        self.settle();
+        Some(last)
+    }
+    /// Whether the message out at `position` arrived and was kept
+    /// ([`Inflights::delivered`]).
+    pub fn delivered_at(&self, position: usize) -> bool {
+        self.buffer
+            .get(position)
+            .is_some_and(|(_, held)| *held == 0)
+    }
+    /// The last index of the message out at `position`, in the order sent.
+    pub fn last_at(&self, position: usize) -> Option<u64> {
+        self.buffer.get(position).map(|(last, _)| *last)
+    }
     /// Everything at or below `to` is answered, and its bytes are in
     /// flight no more.
     pub fn free_to(&mut self, to: u64) {
@@ -237,6 +276,11 @@ pub struct Progress {
     /// ticks is time enough, on whatever path, for what was sent to have
     /// been answered.
     pub stalled: usize,
+    /// The furthest index sent again for a hole before what the member kept
+    /// (`Ahead::Kept`): each message out goes again once at most. While the
+    /// member holds less, a resend is out, and a beat with no answer for it
+    /// probes the member, as a full window does: the resend may be lost.
+    pub repaired: u64,
 }
 impl Progress {
     /// A member probed from `next_index`, with a window of `window`
@@ -253,11 +297,13 @@ impl Progress {
             inflights: Inflights::new(window, window_bytes),
             committed_index: 0,
             stalled: 0,
+            repaired: 0,
         }
     }
     fn reset_state(&mut self, state: ProgressState) {
         self.paused = false;
         self.stalled = 0;
+        self.repaired = 0;
         self.pending_snapshot = 0;
         self.state = state;
         self.inflights.reset();
@@ -271,6 +317,7 @@ impl Progress {
         self.pending_request_snapshot = 0;
         self.recent_active = false;
         self.stalled = 0;
+        self.repaired = 0;
         self.inflights.reset();
     }
     /// Probes again from past what the member is known to hold, or past
@@ -381,6 +428,14 @@ impl Progress {
                 if self.state == ProgressState::Replicate && self.inflights.full() {
                     self.inflights.free_first_one();
                 }
+                // A hole sent again and answered for nothing in a beat: the
+                // resend may be lost, and the member is probed.
+                if self.state == ProgressState::Replicate
+                    && self.repaired > self.matched
+                    && self.stalled >= beat
+                {
+                    self.become_probe();
+                }
             }
             HeartbeatAnswers::Position => match self.state {
                 ProgressState::Replicate => {
@@ -394,7 +449,12 @@ impl Progress {
                     // of it, the member is not being reached by it — what
                     // its owner was not told was lost — and it is asked
                     // where it is.
-                    if !news && self.inflights.full() && self.stalled >= beat {
+                    // So too once a hole sent again went a beat with no
+                    // answer for it.
+                    if !news
+                        && (self.inflights.full() || self.repaired > self.matched)
+                        && self.stalled >= beat
+                    {
                         self.become_probe();
                     }
                 }
@@ -413,12 +473,12 @@ impl Progress {
             },
         }
     }
-    /// A tick of the leader passed: counted for a member with a probe out
-    /// or a window that is full, and for no other.
+    /// A tick of the leader passed: counted for a member with a probe out,
+    /// a window that is full or a hole sent again, and for no other.
     pub fn tick(&mut self) {
         let waits = match self.state {
             ProgressState::Probe => self.paused,
-            ProgressState::Replicate => self.inflights.full(),
+            ProgressState::Replicate => self.inflights.full() || self.repaired > self.matched,
             ProgressState::Snapshot => false,
         };
         self.stalled = if waits {

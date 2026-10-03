@@ -59,6 +59,9 @@ pub struct Coverage {
     pub fenced: u64,
     /// Writes of the hard state alone that the fence asked for.
     pub stated: u64,
+    /// Entries a member took into its log from what it kept ahead of a
+    /// hole (`Ahead::Kept`, R17), acknowledged with the write that held them.
+    pub ahead: u64,
 }
 impl Coverage {
     pub fn add(&mut self, other: Self) {
@@ -74,6 +77,7 @@ impl Coverage {
         self.unpersisted += other.unpersisted;
         self.fenced += other.fenced;
         self.stated += other.stated;
+        self.ahead += other.ahead;
     }
 }
 
@@ -523,7 +527,10 @@ impl Replica for Lagged {
         self.node.tick()
     }
     fn step(&mut self, message: Message) -> bool {
-        self.node.step(message)
+        let before = self.node.raw.raft.taken_ahead();
+        let stepped = self.node.step(message);
+        self.coverage.ahead += self.node.raw.raft.taken_ahead() - before;
+        stepped
     }
     fn propose(&mut self, data: Vec<u8>) -> bool {
         self.node.propose(data)

@@ -16,6 +16,7 @@
 //! - what is queued has a bound ([`Limits`]).
 use crate::{
     Configuration, NodeId, Tally,
+    ahead::Early,
     error::{Error, Result, StorageError},
     fast::{self, Decided, Proposals, Votes},
     log::Log,
@@ -153,6 +154,25 @@ pub enum HeartbeatAnswers {
     Bare,
 }
 
+/// What a member does with a leader's append that begins past the end of
+/// its log: entries that arrived ahead of a hole, one of the leader's
+/// appends before them lost or late (mantle note 32 R17, `crate::ahead`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Ahead {
+    /// It refuses the append as Raft does, and keeps its entries beside its
+    /// log, as many as its log may hold not yet durable
+    /// ([`Limits::unstable_entries`]); once an append of the same term fills
+    /// the hole it takes them into its log with it, and acknowledges them
+    /// with it. One lost append costs its own resend, not the window's (slates
+    /// `docs/wip/research/consensus-enhancements.md` §3.5).
+    #[default]
+    Kept,
+    /// It refuses the append and keeps nothing: the rule of `raft-rs`, whose
+    /// leader sends every entry after the hole again. Kept to compare the two
+    /// cores under one rule.
+    Refused,
+}
+
 /// What starts a member's elections and ends a leader's term for want of
 /// a quorum.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -222,6 +242,9 @@ pub struct Config {
     /// What a member says when it answers a heartbeat, and what its leader
     /// makes of a full window.
     pub heartbeat_answers: HeartbeatAnswers,
+    /// What a member does with a leader's entries that arrive ahead of a
+    /// hole in its log.
+    pub ahead: Ahead,
     /// Whether the group has the fast track ([`crate::fast`]). It is part
     /// of what the group is: every member is opened with the same.
     pub fast: bool,
@@ -270,6 +293,7 @@ impl Config {
             precedence: Precedence::Log,
             read_rounds: ReadRounds::Shared,
             heartbeat_answers: HeartbeatAnswers::Position,
+            ahead: Ahead::Kept,
             fast: false,
             skip_bcast_commit: false,
             apply_unpersisted: false,
@@ -448,6 +472,12 @@ pub struct Raft<S> {
     /// ticks and not by a longer tick, so nothing else the member counts
     /// in ticks grows with it.
     patience: usize,
+    /// What this member keeps of its leader's appends that arrived ahead of
+    /// a hole in its log ([`Ahead::Kept`]).
+    early: Early,
+    /// Entries this member took into its log from what it kept ahead of a
+    /// hole.
+    taken_ahead: u64,
     /// What this member approved by itself.
     pub(crate) held: Proposals,
     /// What the voters hold above this member's log, as it was told.
@@ -874,6 +904,95 @@ impl<S: Storage> Outbox<'_, S> {
         }
         Ok(true)
     }
+    /// What `message`, a refusal of an append that began past the end of the
+    /// refuser's log, asks of this leader ([`Ahead::Kept`]): the append
+    /// arrived and is held there, so it leaves the window, and each message
+    /// sent before it and neither answered nor kept is a hole, lost or late,
+    /// and goes again, once (RFC 6675's `IsLost`: data sent after it
+    /// arrived). Where the window holds no message that began there (it was
+    /// emptied since, or the append carried nothing), what follows the
+    /// member's end goes again as far as that append's start, once: from
+    /// its hint where its log `agrees` with this one there, else from what it
+    /// answered. False when the log no longer holds what goes again.
+    fn repair(&mut self, message: &Message, progress: &mut Progress, agrees: bool) -> Result<bool> {
+        let matched = progress.matched;
+        if let Some(held) = progress.inflights.delivered(message.index, matched) {
+            return self.repair_before(message.from, progress, held);
+        }
+        let end = if agrees && message.reject_hint >= matched {
+            message.reject_hint
+        } else {
+            matched
+        };
+        let after = end.max(progress.repaired);
+        if after >= message.index {
+            return Ok(true);
+        }
+        if !self.resend(message.from, after, message.index)? {
+            return Ok(false);
+        }
+        progress.repaired = message.index;
+        Ok(true)
+    }
+    /// Sends `to` again each message out before the one that ended at
+    /// `kept`, which `to` kept ahead of a hole ([`Ahead::Kept`]), that it has
+    /// neither answered nor been sent again: what it lacks before what it
+    /// kept, as RFC 6675 sends again every segment `IsLost` names once later
+    /// data arrived (RFC 2018). Each goes from past what `to` answered or was
+    /// sent again, anchored there, so that `to` keeps one that arrives ahead
+    /// of an earlier hole too. False when the log no longer holds one.
+    fn repair_before(&mut self, to: NodeId, progress: &mut Progress, kept: u64) -> Result<bool> {
+        let mut before = progress.matched;
+        let mut position = 0usize;
+        while let Some(last) = progress.inflights.last_at(position) {
+            if last >= kept {
+                break;
+            }
+            let delivered = progress.inflights.delivered_at(position);
+            position = position.saturating_add(1);
+            let after = before.max(progress.matched).max(progress.repaired);
+            before = last;
+            if last <= after || delivered {
+                continue;
+            }
+            if !self.resend(to, after, last)? {
+                return Ok(false);
+            }
+            progress.repaired = last;
+        }
+        Ok(true)
+    }
+    /// Sends `to` again the entries after `after` through `through`, a page
+    /// of them at most, its progress and window as they were: the window
+    /// still counts their first sending, as RFC 6675's pipe counts a
+    /// retransmission in place of the lost segment. False when the log no
+    /// longer holds them.
+    fn resend(&mut self, to: NodeId, after: u64, through: u64) -> Result<bool> {
+        let held = usize::try_from(through.saturating_sub(after)).unwrap_or(usize::MAX);
+        let page = self.log.page(
+            after.saturating_add(1),
+            self.max_bytes,
+            self.max_entries.min(held),
+        );
+        let term = self.log.term(after);
+        let (Ok(term), Ok(page)) = (term, page) else {
+            return Ok(false);
+        };
+        if page.entries.is_empty() {
+            return Ok(false);
+        }
+        let message = Message {
+            to,
+            msg_type: MessageType::MsgAppend,
+            index: after,
+            log_term: term,
+            commit: self.log.committed(),
+            entries: page.entries,
+            ..Message::default()
+        };
+        self.send_page(message, page.payload)?;
+        Ok(true)
+    }
     /// As many messages as the window admits, and none that is empty.
     fn append_all(&mut self, to: NodeId, progress: &mut Progress, window: usize) -> Result<()> {
         // Each message sent takes a place in the window, so the window
@@ -964,6 +1083,8 @@ impl<S: Storage> Raft<S> {
             heartbeat_elapsed: 0,
             randomized_election_timeout: config.election_tick,
             patience: 0,
+            early: Early::default(),
+            taken_ahead: 0,
             held: Proposals::new(config.limits.proposals, config.limits.proposal_bytes),
             votes: Votes::new(
                 usize::try_from(config.limits.fast_window).unwrap_or(usize::MAX),
@@ -1335,6 +1456,7 @@ impl<S: Storage> Raft<S> {
             .saturating_add(reads)
             .saturating_add(self.read_only.resident_bytes())
             .saturating_add(self.held.resident_bytes())
+            .saturating_add(self.early.resident_bytes())
             .saturating_add(self.votes.resident_bytes())
             .saturating_add(self.decided.resident_bytes())
             .saturating_add(
@@ -1367,6 +1489,7 @@ impl<S: Storage> Raft<S> {
         }
         self.msgs.check()?;
         self.log.unstable().check()?;
+        self.early.check()?;
         self.held.check()?;
         self.votes.check()
     }
@@ -1575,6 +1698,8 @@ impl<S: Storage> Raft<S> {
         }
         self.lead_transferee = None;
         self.told_to_campaign = false;
+        // What was kept ahead of a hole was one leader's, in one term.
+        self.early.clear();
         self.votes.clear();
         self.decided.clear();
         self.tracker.reset_votes();
@@ -2833,23 +2958,8 @@ impl<S: Storage> Raft<S> {
         Ok(true)
     }
     fn handle_append_response(&mut self, message: &Message) -> Result<()> {
-        let mut next_probe = message.reject_hint;
         if message.reject {
-            // Asked for on a refusal only: an acknowledgement checks nothing
-            // more than before.
-            if message.lost && self.take_lost(message)? {
-                return Ok(());
-            }
-            if message.log_term > 0 {
-                // The member holds `log_term` at its hint. No index of this
-                // log at or below the hint with a higher term can match it,
-                // for terms only rise along a log: probe at the last one
-                // that may.
-                next_probe = self
-                    .log
-                    .find_conflict_by_term(message.reject_hint, message.log_term)?
-                    .0;
-            }
+            return self.handle_append_refusal(message);
         }
         let last = self.log.last_index()?;
         let Some(progress) = self.tracker.get_mut(message.from) else {
@@ -2857,15 +2967,6 @@ impl<S: Storage> Raft<S> {
         };
         progress.recent_active = true;
         progress.update_committed(message.commit);
-        if message.reject {
-            if progress.maybe_decrease_to(message.index, next_probe, message.request_snapshot) {
-                if progress.state == ProgressState::Replicate {
-                    progress.become_probe();
-                }
-                self.send_append(message.from)?;
-            }
-            return Ok(());
-        }
         let paused = progress.is_paused();
         if !progress.maybe_update(message.index) {
             return Ok(());
@@ -2895,6 +2996,58 @@ impl<S: Storage> Raft<S> {
                 .is_some_and(|progress| progress.matched == last)
         {
             self.send(proto::message(message.from, MessageType::MsgTimeoutNow))?;
+        }
+        Ok(())
+    }
+    /// A member refused an append.
+    fn handle_append_refusal(&mut self, message: &Message) -> Result<()> {
+        // Asked for on a refusal only: an acknowledgement checks nothing
+        // more than before.
+        if message.lost && self.take_lost(message)? {
+            return Ok(());
+        }
+        let mut next_probe = message.reject_hint;
+        if message.log_term > 0 {
+            // The member holds `log_term` at its hint. No index of this log
+            // at or below the hint with a higher term can match it, for terms
+            // only rise along a log: probe at the last one that may.
+            next_probe = self
+                .log
+                .find_conflict_by_term(message.reject_hint, message.log_term)?
+                .0;
+        }
+        // The member refused an append that began past the end of its log
+        // (`message.index`, after its hint), and says it kept it (R17): it
+        // holds entries past it. Not a conflict inside its log, nor a member
+        // that keeps nothing ahead (raft-rs's, or one of `Ahead::Refused`),
+        // which the probe below serves.
+        let ahead =
+            message.kept && message.request_snapshot == 0 && message.index > message.reject_hint;
+        // Its log ends at the hint and holds this log's entry there.
+        let agrees = ahead
+            && self
+                .log
+                .term(message.reject_hint)
+                .is_ok_and(|term| term == message.log_term);
+        let (mut outbox, tracker) = self.outbox();
+        let Some(progress) = tracker.get_mut(message.from) else {
+            return Ok(());
+        };
+        progress.recent_active = true;
+        progress.update_committed(message.commit);
+        if ahead
+            && progress.state == ProgressState::Replicate
+            && outbox.repair(message, progress, agrees)?
+        {
+            return Ok(());
+        }
+        // A conflict, a member that keeps nothing ahead, or a hole the log no
+        // longer holds: probed (raft-rs's rule), for a snapshot where needed.
+        if progress.maybe_decrease_to(message.index, next_probe, message.request_snapshot) {
+            if progress.state == ProgressState::Replicate {
+                progress.become_probe();
+            }
+            self.send_append(message.from)?;
         }
         Ok(())
     }
@@ -3164,6 +3317,19 @@ impl<S: Storage> Raft<S> {
         // leader to send again: the answer names the last entry taken.
         let mut taken = std::mem::take(&mut message.entries);
         taken.truncate(self.config.limits.unstable_entries);
+        let end = self.log.last_index()?;
+        let kept = message.index > end && self.config.ahead == Ahead::Kept && self.lost.is_none();
+        answer.kept = kept;
+        if kept {
+            // Past the end of the log: the append is refused below, and its
+            // entries, this term's leader's, are kept to take in once the
+            // hole is filled (`crate::ahead`), as many as the log may hold
+            // not yet durable.
+            let ahead = std::mem::take(&mut taken);
+            let bound = self.config.limits.unstable_entries;
+            self.early
+                .keep(self.term, message.index, end, ahead, bound)?;
+        }
         // The leader's entries move into the log uncopied.
         match self.log.append_after_owned(
             message.index,
@@ -3173,6 +3339,7 @@ impl<S: Storage> Raft<S> {
             self.config.fast,
         )? {
             Some((_, last)) => {
+                let last = self.take_ahead(last, message.commit)?;
                 answer.index = last;
                 let held = self.log.last_index()?;
                 self.release_proposals(held)?;
@@ -3197,6 +3364,48 @@ impl<S: Storage> Raft<S> {
         }
         answer.commit = self.log.committed();
         self.send(answer)
+    }
+    /// Takes into the log what this member kept ahead of a hole that now
+    /// continues the entries an append of this term placed through `last`,
+    /// as the leader's next append would have, to what the log may hold not
+    /// yet durable; the last index it then holds of the leader's log. The
+    /// answer that says so leaves with the write that holds them (I2).
+    fn take_ahead(&mut self, last: u64, commit: u64) -> Result<u64> {
+        if self.early.is_empty() {
+            return Ok(last);
+        }
+        let room = self
+            .config
+            .limits
+            .unstable_entries
+            .saturating_sub(self.log.unstable().count_through(last));
+        let run = self.early.take_after(last, room);
+        if run.is_empty() {
+            return Ok(last);
+        }
+        let term = self.log.term(last)?;
+        match self
+            .log
+            .append_after_owned(last, term, commit, run, self.config.fast)?
+        {
+            Some((_, taken)) => {
+                self.taken_ahead = self.taken_ahead.saturating_add(taken.saturating_sub(last));
+                Ok(taken)
+            }
+            None => Err(Error::Invariant(
+                "the log does not hold what an append just placed in it",
+            )),
+        }
+    }
+    /// The indexes of what this member keeps ahead of a hole in its log, in
+    /// order ([`Ahead::Kept`]).
+    pub fn kept_ahead(&self) -> impl Iterator<Item = u64> + '_ {
+        self.early.indexes()
+    }
+    /// The entries this member took into its log from what it kept ahead of
+    /// a hole, since it opened.
+    pub fn taken_ahead(&self) -> u64 {
+        self.taken_ahead
     }
     /// A member whose log lost entries it acknowledged refuses `index`
     /// and says it lost them, naming the last entry it holds: a leader
@@ -3281,6 +3490,9 @@ impl<S: Storage> Raft<S> {
             return Ok(false);
         }
         self.log.restore(snapshot)?;
+        // What was kept ahead of the old log's end follows a log no longer
+        // held.
+        self.early.clear();
         let last = self.log.last_index()?;
         self.release_proposals(last)?;
         self.tracker = Tracker::new(

@@ -30,6 +30,7 @@
 //! Nothing here unwinds ([`Error`]), and everything that grows has a bound
 //! stated in [`Limits`].
 
+mod ahead;
 pub mod configuration;
 pub mod error;
 pub mod fast;
@@ -50,8 +51,8 @@ pub use error::{Error, Result, StorageError};
 pub use node::{Kept, LightReady, RawNode, Ready, SnapshotStatus, ToPersist};
 pub use quorum::{Quorum, Tally};
 pub use raft::{
-    Config, Elections, FastStats, HeartbeatAnswers, Limits, Lost, Outgoing, Precedence, Raft,
-    ReadRounds, SoftState, StateRole,
+    Ahead, Config, Elections, FastStats, HeartbeatAnswers, Limits, Lost, Outgoing, Precedence,
+    Raft, ReadRounds, SoftState, StateRole,
 };
 pub use read::ReadState;
 pub use storage::{InitialState, Storage};

@@ -1018,12 +1018,22 @@ lateness, the stall's delay (§2.2; `PairReport::skipped` counts them).
     held the peer suspected while its owner trusted it, and a peer that died in its links' first
     heartbeats was never reported (a pair's unit test; the simulation's worlds had not reached it).
   The simulation holds every node's owner to it after every step (`told_is_believed`).
-- **The detection bound** each suspicion states: NFD-E suspects at `τ_{h+1} = EA_{h+1} + α`, which is
-  `η + α + mean(D)` past the last heartbeat's schedule over the expected arrival's window, whatever
-  the clocks' offset; the mean of the echoed sums over the same window bounds `mean(D)`, so
-  `η + α + ⌈mean of the sums⌉` bounds the time from the sender's last schedule, and so from its
-  crash, to the suspicion. No clock synchronization or path symmetry enters it. Unstated while a
-  heartbeat in the window carried no echo.
+- **The detection bound** each suspicion states: NFD-E suspects at `τ_{h+1} = EA_{h+1} + α` on the
+  receiver's clock, and the sender's last heartbeat was due at `σ_h` on its own; the time between
+  is `τ_{h+1} − σ_h − θ`, `θ` the clocks' offset. Each echoed heartbeat `j` bounds `θ` from below:
+  its delay `A_j − σ_j − θ` is at most the sum of the two directions' delays the echo gives,
+  `S_j`, so `θ ≥ A_j − σ_j − S_j` when it came, and the clocks drift apart by at most RFC 5905's
+  `PHI` each since. So `(τ_{h+1} − σ_h) − (A_j − σ_j − S_j) + PHI/(1 − PHI)·((τ_{h+1} − A_j) +
+  (σ_h − σ_j))` bounds the time from the sender's last schedule, and so from its crash, to the
+  suspicion, for every echoed `j` of the run; the tightest is kept, its order among the `j`s the
+  same at every suspicion (`bound`). No clock synchronization or path symmetry enters it, and
+  heartbeats that carried no echo (a peer's first, before it heard from this node) leave it
+  stated. Its form before, `η + α` and the mean of the echoed sums over the expected arrival's
+  window, was unstated while any heartbeat in the window carried no echo: a survivor's suspicion of
+  a stalled member at one CPU stated none, once in twenty runs (`docs/benchmarks.md`, "Quiet only
+  while every member is heard"; `a_suspicion_states_its_bound_once_any_heartbeat_was_echoed` fails
+  on it). And it kept a ring of the window's sums a pair, the estimator's own size, which the
+  running best replaces.
 
 **The API** the core's suspicion-started elections (L-2) and the shell consume (`src/lib.rs`):
 `Liveness::new(Settings { local, run, max_peers, history })`, `run` the node's durable count of
@@ -1045,8 +1055,9 @@ come: traced in the process test once its mistakes were checked exactly); the co
 `trust(node)` and `restarted(node)` from the changes (hyper-durable's `Owner::believe`).
 
 **Bounds.** Pairs at most `Settings::max_peers` (placement's), typed refusal past it; groups per pair
-a `u32`; one liveness write out at a time; per pair one boxed estimator and a ring of delay sums the
-estimator's own size (the drift bound, §2.6), both resized in place for a longer interval; per node
+a `u32`; one liveness write out at a time; per pair one boxed estimator (its ring the drift bound's
+size, §2.6, resized in place for a longer interval) and the echoes' best bound on the clocks'
+offset; per node
 one pool, an estimator at the first fed link's interval, boxed. Once each pair is configured, a
 heartbeat sent and one taken allocate nothing.
 

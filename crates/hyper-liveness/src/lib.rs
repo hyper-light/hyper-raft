@@ -47,9 +47,9 @@
 //! ([`Change::Restarted`]).
 //!
 //! **The bound.** Each suspicion states when the sender's last heartbeat was due on the sender's
-//! clock and the bound past it within which NFD-E suspects, `η + α + E(D)`, with `E(D)` bounded by
-//! the echoed round trip of the heartbeats in the expected arrival's window (`bound`), which no
-//! clock synchronization or path symmetry enters.
+//! clock and the bound past it within which NFD-E suspected: the difference of the two clocks'
+//! readings less their offset, which the echoed round trips bound from below and the clocks' drift
+//! ages (`bound`); no clock synchronization or path symmetry enters it.
 //!
 //! **Sans-io.** The crate is fed `now`, messages with their kernel receive stamps (hyper-tokio's
 //! `PlaneSocket`), and durable completions, and returns heartbeats to queue on the datagram plane,
@@ -175,11 +175,12 @@ pub struct Suspicion {
     /// The latest heartbeat taken from the peer: its number, its arrival (the kernel's stamp) on
     /// this node's clock, and when it was due and sent on the peer's.
     pub last: Option<Last>,
-    /// The bound from the last heartbeat's schedule to `at_ns`, `η + α + E(D)` with `E(D)` bounded
-    /// by the echoed round trips of the window's heartbeats (the `bound` module); `None` while a
-    /// heartbeat in the window carried no echo. For a peer from which no heartbeat came (`last` is
-    /// `None`), the time from the node's first poll with the pair attached, an interval and the
-    /// margin of the node's evidence (`docs/timing.md` §3, item 10).
+    /// The bound on the time from the last heartbeat's schedule, on the peer's clock, to `at_ns`, on
+    /// this node's: their difference less the clocks' offset, bounded from below by the echoed round
+    /// trips of the run's heartbeats and aged by the clocks' drift (the `bound` module); `None`
+    /// before any heartbeat of the run carried an echo. For a peer from which no heartbeat came
+    /// (`last` is `None`), the time from the node's first poll with the pair attached, an interval
+    /// and the margin of the node's evidence (`docs/timing.md` §3, item 10).
     pub detection: Option<Duration>,
     /// The detector in force when it suspected, if configured (the pair's configuration's
     /// `current`, [`Liveness::configuration`]).

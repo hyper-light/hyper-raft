@@ -89,9 +89,9 @@ use crate::qos::{
 
 /// RFC 5905 §7.2, `PHI`: the frequency tolerance NTP assumes of a clock, 15 ppm, in parts per
 /// [`MILLION`].
-const PHI_PER_MILLION: u64 = 15;
+pub const PHI_PER_MILLION: u64 = 15;
 /// The unit of [`PHI_PER_MILLION`].
-const MILLION: u64 = 1_000_000;
+pub const MILLION: u64 = 1_000_000;
 /// The longest window any link's estimator can hold: `n + 1 ≤ G/(PHI·η)` and `η ≥ G`, so
 /// `n ≤ 1/PHI − 1` (the module's derivation).
 pub const WINDOW_LIMIT: u64 = (MILLION / PHI_PER_MILLION).saturating_sub(1);

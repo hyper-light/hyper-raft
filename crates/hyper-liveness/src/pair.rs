@@ -7,7 +7,7 @@ use hyper_timing::{
     arrival_detector_at, lateness_bound,
 };
 
-use crate::bound::Sums;
+use crate::bound::Offset;
 use crate::codec::{Echo, Heartbeat, MAX_BYTES};
 use crate::{Change, Last, PairReport, PeerId, Refusal, Suspicion};
 
@@ -122,13 +122,11 @@ struct Unheard {
     suspected: bool,
 }
 
-/// The estimator of the peer's stream and the ring of its delay sums, boxed together: the
-/// estimator's Allan levels are most of a kilobyte, and the pair's other fields are read every
-/// poll.
+/// The estimator of the peer's stream, boxed: its Allan levels are most of a kilobyte, and the
+/// pair's other fields are read every poll.
 #[derive(Debug)]
 struct Link {
     estimator: LinkEstimator,
-    sums: Sums,
     granularity_ns: u64,
 }
 
@@ -155,6 +153,9 @@ struct Received {
     /// The latest heartbeat to echo back: its send and lateness on the peer's clock, and its
     /// arrival on this node's.
     echo: Option<(u64, u64, u64)>,
+    /// The clocks' offset, bounded by the echoes the run's heartbeats carried (the `bound`
+    /// module): what a suspicion states its bound from.
+    offset: Offset,
     configuration: Option<Configuration>,
     /// The interval the link was at when the configuration was made: a link that moved since is
     /// configured again at its new interval.
@@ -513,14 +514,8 @@ impl Pair {
             .filter(|_| self.received.link.is_none())
             .map(|since| Duration::from_nanos(at_ns.saturating_sub(since)));
         let detection = unheard.or_else(|| {
-            self.received.link.as_ref().and_then(|link| {
-                let margin = link.estimator.margin()?;
-                link.sums.detection(
-                    link.estimator.estimates().window.length,
-                    link.estimator.next_interval(),
-                    margin,
-                )
-            })
+            let last = self.received.last?;
+            self.received.offset.detection(at_ns, last.due_ns)
         });
         Suspicion {
             peer,
@@ -579,6 +574,8 @@ impl Pair {
         self.received.flushes = 0;
         self.received.last = None;
         self.received.echo = None;
+        // A new run's clock is its host's, which a restart may have changed.
+        self.received.offset = Offset::default();
         self.received.reanchor = restarted;
         Ok(restarted)
     }
@@ -618,7 +615,11 @@ impl Pair {
         self.received.floor_ns = beat.floor_ns;
         self.stream.asked_ns = beat.ask_ns;
         self.received.echo = Some((beat.sent_ns, beat.late_ns, arrival_ns));
-        let sum = self.round_trip_sum(beat, arrival_ns);
+        if let Some(sum) = self.round_trip_sum(beat, arrival_ns) {
+            self.received
+                .offset
+                .echoed(arrival_ns, beat.sent_ns.saturating_sub(beat.late_ns), sum);
+        }
         let granularity = context.granularity.ok_or(Refusal::Unmeasured)?;
         let mapped = self
             .received
@@ -640,7 +641,6 @@ impl Pair {
         link.estimator
             .on_heartbeat(mapped, arrival_ns)
             .map_err(|_| Refusal::OutOfRange)?;
-        link.sums.push(sum);
         let lateness = link.estimator.latest_lateness();
         self.received.last = Some(Last {
             seq: beat.seq,
@@ -739,10 +739,8 @@ impl Pair {
             None => {
                 let estimator = LinkEstimator::new(interval, granularity, None)
                     .map_err(|_| Refusal::Malformed)?;
-                let sums = Sums::new(estimator.estimates().window.drift);
                 self.received.link = Some(Box::new(Link {
                     estimator,
-                    sums,
                     granularity_ns: nanos(granularity),
                 }));
             }
@@ -755,7 +753,6 @@ impl Pair {
                     link.estimator
                         .retime(interval, None)
                         .map_err(|_| Refusal::Malformed)?;
-                    link.sums.restart(link.estimator.estimates().window.drift);
                 }
             }
         }
@@ -918,6 +915,52 @@ mod tests {
                 })
             ]
         );
+    }
+
+    /// A suspicion states its bound once any heartbeat of the run has carried an echo, whatever the
+    /// rest carried: here a peer whose first heartbeats came before it had heard from this node
+    /// (no echo), then one echoing a heartbeat of this node's, then nothing. The suspicion at the
+    /// next freshness point states the time from the peer's last schedule plus the echo's slack and
+    /// the drift, on one clock never below the time itself. Bounded by the mean of the echoed sums
+    /// over the expected arrival's window, it stated none while a heartbeat in the window had no
+    /// echo: a survivor's suspicion of a stalled member, once in twenty runs at one CPU.
+    #[test]
+    fn a_suspicion_states_its_bound_once_any_heartbeat_was_echoed() {
+        let exposure = exposure();
+        let granularity = Duration::from_micros(50);
+        let context = Context {
+            granularity: Some(granularity),
+            exposure: &exposure,
+            evidence: None,
+        };
+        let mut pair = pair();
+        let mut latest = 0;
+        for seq in 0..6 {
+            let mut heartbeat = beat(7, seq);
+            // Delays of 1 ms on one clock; the last heartbeat, sent at 50 ms, echoes one this node
+            // sent at 20 ms, 1 ms late, which reached the peer at 21 ms.
+            let arrival = seq * 10 * MS + MS;
+            if seq == 5 {
+                heartbeat.echo = Some(Echo {
+                    sent_ns: 20 * MS,
+                    late_ns: MS,
+                    hold_ns: 50 * MS - 21 * MS,
+                });
+            }
+            let (mut changes, mut taken) = ([None, None, None], Taken::default());
+            pair.take(2, &heartbeat, arrival, &context, &mut changes, &mut taken)
+                .unwrap();
+            latest = arrival;
+        }
+        pair.pool_margin(&evidence(), granularity, exposure.mtbf());
+        let until = pair.deadline().expect("judged by the node's evidence");
+        assert!(until > latest);
+        let Some(Change::Suspected(suspicion)) = pair.judge(2, until) else {
+            panic!("suspected at the freshness point");
+        };
+        let last = suspicion.last.expect("heard from");
+        let bound = suspicion.detection.expect("a bound is stated");
+        assert!(Duration::from_nanos(suspicion.at_ns - last.due_ns) <= bound);
     }
 
     /// A young link whose latest heartbeat came later than the freshness point of the one after it,

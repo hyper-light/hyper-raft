@@ -56,8 +56,8 @@ mod folds;
 pub use folds::{Exposure, Flushes, FoldFull, Lateness, Wakes};
 mod link;
 pub use link::{
-    Configuration, EstimateError, Estimates, Event, LinkEstimator, Refusal, Schedule, Trust,
-    WINDOW_LIMIT, Window,
+    Configuration, EstimateError, Estimates, Event, LinkEstimator, MILLION, PHI_PER_MILLION,
+    Refusal, Schedule, Trust, WINDOW_LIMIT, Window,
 };
 mod election;
 pub use election::{

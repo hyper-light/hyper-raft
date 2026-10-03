@@ -357,7 +357,9 @@ one observation at a time, without the cancellation of the sum-of-squares formul
 **RFC 5905 (Mills, Martin, Burbank, Kasch), Network Time Protocol Version 4, §7.2, Figure 6
 (read 2026-10-01).** `TOLERANCE`, "frequency tolerance PHI (s/s)", 15e-6: the frequency error NTP
 assumes of a clock. Two clocks within it of true time drift apart by up to 30 ppm; the estimator's
-window bound takes it as the drift a link's expected arrival must follow.
+window bound takes it as the drift a link's expected arrival must follow, and a suspicion's bound
+as the drift between the echo that bounded the clocks' offset and the suspicion
+(`crates/hyper-liveness/src/bound.rs`).
 
 ## The machines' timers, from their sources
 

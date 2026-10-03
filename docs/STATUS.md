@@ -43,8 +43,8 @@ them on Linux.
 
 ## Open defects
 
-Found under load on `main` `9893679`, each once, not yet reproduced. They are being traced to
-their causes; none is worked around.
+Found under load, each once, not yet reproduced. They are being traced to their causes; none is
+worked around.
 
 - **hyper-raft-e2e `stalled-devices`.** Seen on macOS, under the load of other builds. After the
   7 s stall the old leader had stepped down in its term (leader 0), its followers still trusted
@@ -56,6 +56,16 @@ their causes; none is worked around.
   so their flush-proven heartbeats stopped and each came to suspect the other. The wait judged the
   member stuck, because its rule excuses a write only up to the longest write seen. Open: whether
   the write was with the device (a slow disk under the host's I/O) or waited elsewhere.
+- **hyper-raft-e2e `member-stopped`, windows-11-arm CI (`1967cd9`, run 37152466424).** Live
+  members 2 and 3 each sat 5.1 s in a single flush. Member 3 lost its leadership (leader 0, term
+  1). Member 2 still named 3 its leader and suspected it, and no term moved in the next 3 s.
+  Windows stamps a datagram as it is read, not as it arrived (timing §3 item 5), so heartbeats
+  drained after the flush are late by it. Open: why member 2, suspecting its leader, did not
+  campaign; that is the core's elections.
+- **hyper-durable-e2e `kill` `member-stopped`, ubuntu-24.04 CI (`36e01cd`, run 37152765895).**
+  Member 1 was stopped. Member 2, at term 5, suspected it, with a longest write of 597 ms. The two
+  members up took no write within the 2.88 s the test excuses. Member 3's report is not in the
+  failure's output.
 
 ## Consumers
 

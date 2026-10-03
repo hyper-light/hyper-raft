@@ -941,7 +941,9 @@ bounds derived from that budget. What derives each count now:
   but only to a leader that answered since: on Linux a phase overflows a socket's buffer, and the
   leadership moves under such a burst.
 - **A member restarted** takes a port the system gives, and every member up is told where it
-  listens: a port freed by a process killed is the system's to give to whoever binds next.
+  listens: a port freed by a process killed is the system's to give to whoever binds next. It runs
+  under the next count of its starts, kept beside its log (`src/run.rs`), so its peers report one
+  restart and refuse a heartbeat of its last run as stale.
 
 | Scenario | Asserts |
 |---|---|
@@ -958,39 +960,94 @@ between two reads of its socket, and for each pair what the configurator was fed
 force, and its suspicions against Theorem 7's allowance (`docs/timing.md` §2.9).
 
 Runs of the whole binary, `cargo test -p hyper-raft-e2e --test cluster`, on the code as committed
-(over hyper-raft `7a8812c`), 2026-10-02:
+(`c4530be`, over hyper-raft `2525538`), 2026-10-03. The Linux runs are containers in Docker
+Desktop's virtual machine on the same Mac (18 CPUs, Linux 6.12.76), each limited to the CPUs named,
+with as many busy loops beside the test; the load is the one-minute average as each run began on
+macOS and as it ended on Linux (the virtual machine's). The binaries were built once, before the
+runs.
 
 | host | runs | passed | a run |
 |---|---|---|---|
-| macOS 26.4.1, Apple M5 Max, load 30–40 | 10 | 10 | 31–48 s |
-| Linux (Docker, rust:1.98.0, aarch64), four CPUs and four busy loops, VM load 9.4–12.3 | 10 | 10 | 35–201 s |
-| Linux, two CPUs and two busy loops, load 6.1–8.8 | 10 | 10 | 34–57 s |
-| Linux, one CPU and one busy loop, load 4.4–7.5 | 10 | 9 | 37–79 s |
-| CI: ubuntu-24.04, ubuntu-24.04-arm, macos-15, macos-15-intel, windows-2025, windows-11-arm (the gates, one run each) | 6 | 6 | |
+| macOS 26.4.1, Apple M5 Max, load 25–66 | 10 | 10 | 51–69 s |
+| Linux (Docker, rust:1.98.0, aarch64), four CPUs and four busy loops, load 8.6–11.0 | 10 | 10 | 62–163 s |
+| Linux, two CPUs and two busy loops, load 4.2–8.8 | 10 | 10 | 46–106 s |
+| Linux, one CPU and one busy loop, load 4.0–9.2 | 30 | 30 | 61–225 s |
+| CI, the gates once on each of ubuntu-24.04, ubuntu-24.04-arm, macos-15, macos-15-intel, windows-2025 and windows-11-arm | 6 | 6 | 43, 44, 24, 38, 235 and 588 s |
 
-The one Linux failure is the open stall below. The same code before its last fix (a wait that read
-the members again after its fact held, and found the leader a mistake had deposed since; CI's
-ubuntu-24.04 found it) passed 30 of 30 Linux runs and 10 of 10 on macOS (load 31–40), and over
-hyper-raft `0eaac7e` 30 of 30 and 10 of 10 (load 34–78).
-
-The macOS runs shared the machine with other sessions' builds and with the Linux runs. One macOS
-run's output:
+A scenario took, on macOS, 3.5–5.2 s (commits-3), 3.8–6.8 s (commits-5), 5.6–9.5 s (leader-killed),
+5.0–10.7 s (follower-restarts), 8.1–12.0 s (partition), 3.6–5.5 s (all-killed), 13.1–15.4 s
+(stalled-devices, whose devices held their flushes 7.0 s) and 8.0–9.7 s (member-stopped); on Linux,
+in the same order, 1.9–33.5 s, 2.6–19.6 s, 12.3–40.3 s, 3.4–44.3 s, 5.6–39.2 s, 1.9–39.0 s,
+10.9–41.7 s and 4.9–26.7 s. CI's windows-2025 job was run twice: the first failed in
+hyper-liveness's `tests/processes.rs` (a member killed in its first heartbeats: the wait gave up
+after one quiet second with every member's flush in flight, the longest 372–467 ms on that runner),
+before this crate's tests ran; the second passed. The macOS runs shared the machine with other
+sessions' builds and with the Linux runs. One macOS run's output (58.6 s; each scenario prints its
+line, the looks that did not hear every member and how far waits were extended for members in their
+logs' writes, then each member's floors, longest flush and longest time between two reads of its
+socket, and each pair's account; commits-3 in full, the others' first lines):
 
 ```
-ok commits-3: 3 members; 136 writes answered and read back (24.05 ms per write and read, 43.70 ms the slowest); all applied index 137 alike [3.7 s]
-ok commits-5: 5 members; 136 writes answered and read back (33.26 ms per write and read, 66.13 ms the slowest); all applied index 137 alike [4.8 s]
-ok leader-killed: leader 3 (term 1) killed with the 129 writes in flight in its log; 1 elected in term 2; 261 answered writes read back; 3 of them answered before the kill, and 126 of those unanswered committed by the new leader; member 3 restarted on its log, its restart reported, and applied index 391 alike [8.6 s]
-ok follower-restarts: follower 1 killed after 122 writes, 122 written without it, restarted on its log, its restart reported, caught up to index 245 alike; 244 writes read back [6.7 s]
-ok partition: leader 5 of 5 cut off; at once it answered a read with Some(NotLeader(0)) and a write with Some(NotLeader(0)), and later the read of a replaced key with Some(NotLeader(0)); it suspected all four and all four suspected it; 4 elected in term 7; after the filter lifted, 4 leads and all applied index 281 alike; 273 writes read back [11.7 s]
-ok all-killed: every member killed after 134 answered writes and restarted on its log; 1 leads in term 2; 134 writes read back; all applied index 136 alike [4.8 s]
+ok commits-3: 3 members; 136 writes answered and read back (22.66 ms per write and read, 39.58 ms the slowest); all applied index 137 alike
+  looks that did not hear every member: 0, the longest silence 0.0 ms against 0.0 ms excused; waits extended 45.2 ms for members in their logs' writes, at most 23.1 ms at once
+  member 1: G 3.564 ms, E[flush] 8.041 ms, T_E 78.2 ms; longest flush 16.3 ms, longest between two reads 18.2 ms
+    1->2: own, 1 configurations, 148 sent, 134 taken, 0 refused unproven; fed p_L 0.0421, E(D) 0.000 ms, sd 4.586 ms; eta 19.149 ms, alpha 15.549 ms, recurrence 161.2 ms, U 4.94e-1; 3 suspicions, allowance 23.70
+    1->3: own, 1 configurations, 96 sent, 162 taken, 0 refused unproven; fed p_L 0.0527, E(D) 0.000 ms, sd 5.017 ms; eta 20.994 ms, alpha 17.438 ms, recurrence 167.9 ms, U 4.99e-1; 1 suspicions, allowance 23.10
+  member 2: G 5.408 ms, E[flush] 9.913 ms, T_E 89.4 ms; longest flush 18.1 ms, longest between two reads 18.2 ms
+    2->1: own, 1 configurations, 137 sent, 142 taken, 0 refused unproven; fed p_L 0.0784, E(D) 0.000 ms, sd 4.390 ms; eta 26.205 ms, alpha 20.712 ms, recurrence 222.0 ms, U 4.22e-1; 4 suspicions, allowance 56.25
+    2->3: own, 1 configurations, 140 sent, 158 taken, 0 refused unproven; fed p_L 0.0530, E(D) 0.000 ms, sd 4.404 ms; eta 20.668 ms, alpha 15.159 ms, recurrence 163.1 ms, U 5.74e-1; 6 suspicions, allowance 43.11
+  member 3: G 5.440 ms, E[flush] 10.431 ms, T_E 96.4 ms; longest flush 20.6 ms, longest between two reads 23.3 ms
+    3->1: own, 1 configurations, 163 sent, 89 taken, 0 refused unproven; fed p_L 0.1311, E(D) 0.000 ms, sd 3.986 ms; eta 10.376 ms, alpha 5.973 ms, recurrence 26.0 ms, U 3.84e0; 0 suspicions, allowance 28.81
+    3->2: own, 1 configurations, 159 sent, 136 taken, 0 refused unproven; fed p_L 0.0421, E(D) 0.000 ms, sd 4.722 ms; eta 16.768 ms, alpha 11.727 ms, recurrence 95.4 ms, U 9.59e-1; 4 suspicions, allowance 38.85 [4.6 s]
+…
+ok commits-5: 5 members; 136 writes answered and read back (28.10 ms per write and read, 51.31 ms the slowest); all applied index 137 alike
+ok leader-killed: leader 2 (term 1) killed with the 129 writes in flight in its log; 3 elected in term 2; 387 answered writes read back; 129 of them answered before the kill, and 0 of those unanswered committed by the new leader; member 2 restarted on its log, its restart reported, and applied index 390 alike
+ok follower-restarts: follower 1 killed after 122 writes, 122 written without it, restarted on its log, its restart reported, caught up to index 245 alike; 244 writes read back
+ok partition: leader 1 of 5 cut off; at once it answered a read with Some(NotLeader(0)) and a write with Some(NotLeader(0)), and later the read of a replaced key with Some(NotLeader(0)); it suspected all four and all four suspected it; 2 elected in term 2; after the filter lifted, 5 leads and all applied index 277 alike; 273 writes read back
+ok all-killed: every member killed after 134 answered writes and restarted on its log; 1 leads in term 2; 134 writes read back; all applied index 136 alike
+ok stalled-devices: every member's device held its flushes 7.0 s after 125 writes; a write sent into the stall committed once the devices went on; 250 writes read back; all applied index 253 alike
+ok member-stopped: member 2 stopped after 127 writes; the wait for it failed after 3.0 s of its silence, naming it; let go, it applied index 129 with the others; 128 writes read back
 ```
 
-A write and its read took 1.7–33 ms on average a run on Linux (the slowest under the busy loops and the macOS runs beside them) and 22–46 ms on macOS (`F_FULLFSYNC` under load).
-On Linux the detectors mistake often (`docs/timing.md` §2.9): in the 30 Linux runs over `0eaac7e`
-the terms reached at the end of leader-killed ran from 1 to 18, where the scenario causes two elections, and the
-leader-killed's writes in flight were all answered before the kill in 9 of them (a burst moves the
-leadership, and each new leader commits what it took); in the other 21 the leader died holding 20
-to 208 unanswered. On macOS the terms stayed at 1 to 7.
+A write and its read took 1.7–34 ms on average a run on Linux (977 writes a phase, on a 65,507-byte
+datagram) and 22–46 ms on macOS (136 a phase, `F_FULLFSYNC` under load). The detectors mistake often
+(`docs/timing.md` §2.9), and a mistake about a leader can cost an election. In leader-killed the
+leader's term at the kill was 1–2 on macOS and 2–22 on Linux, where the scenario's first election
+makes term 1; a burst of writes in flight moves the leadership, and each new leader commits what it
+took: the writes in flight were all answered before the kill in 5 of 10 macOS runs and 30 of 50
+Linux runs, and in the others the leader died holding 116–129 unanswered on macOS and 30–208 on
+Linux, every one of which the new leader committed. The stopped member's wait failed, naming it,
+after 3.0 s of its silence on macOS, 1.0–3.1 s on Linux and 1.0–3.1 s across CI. The excuse it
+passed is the members' own (their longest write and the quiet period): 1.0 s on macOS and 1.0–1.9 s
+on Linux; in a macOS run over `ecbf071` under load 60, whose members flushed for up to 551 ms and
+stated a round of 868 ms, it was 6.9 s.
+
+**The stall, found and fixed.** Before this change four runs in about 160 on Linux (none on macOS)
+stopped with the group judged quiet while the test still had writes to land; a recurrence's last
+look was a healthy idle group (one leader in term 11 trusted by both followers, every member at
+commit, applied and last index 1,411, the leader's log holding 1,400 of the scenario's 1,844 writes,
+the 444 left resent to it on every look and none taken). The bookkeeping lead (a write the leader
+keeps waiting that no apply would answer) was checked and is not it: every report now asserts it
+(`stray`, above), and it never broke. With each member reporting its longest flush and its longest
+time between two reads of its socket, 101 runs in four to six one-CPU containers at once, each with
+a busy loop, passed and showed the cause: flushes of up to 1.8 s, the same 1,807 ms on members of
+groups in different containers at once, and each member's longest time between two reads its longest
+flush, to within a millisecond, whenever that flush passed half a second. The virtual machine's
+disk, one file on the host shared by every container, held every member's one thread in a write
+together; the test, hearing no member, counted the silence as the group's quiet. The rule above
+counts as quiet only time in which the test saw the group (`docs/timing.md` §2.9, "The stall it
+found, and its cause"), and `stalled-devices` holds it: under the old rule the test failed there in
+each of five runs on macOS, under the new it passed in each of five. After the fix, 50 of 50 runs
+passed in six one-CPU containers at once, each with a busy loop (113–412 s a run); at `2ca93e8` 10
+of 10 at four CPUs (66–219 s), 9 of 9 at two (52–89 s; the matrix stopped by hand before the tenth)
+and 10 of 10 on macOS at load 52–143 (44–51 s); over `ecbf071`, before main's ordered runs (§2.8 of
+`docs/timing.md`, "A restart"), the code with the silence bound passed 10 of 10 on macOS at load
+33–68 (54–75 s), 10 of 10 at four CPUs, 10 of 10 at two and 30 of 30 at one (45–193 s), and the
+gates on CI's six targets; then the table above. Not counted: the one-CPU row at `2ca93e8`, whose
+binaries were rebuilt under it while the silence bound was written (four of its 16 runs failed in
+their first 10–27 s, on that work in progress), a later matrix's two-CPU row rebuilt under it the
+same way (one failure in ten), and a set in which two matrices ran at once on the same volumes by
+mistake, writing over each other's logs and outputs (no failure among what was left).
 
 On the way, 17 of 18, 28 of 30 and 15 of 15 Linux runs passed on earlier forms of this code; each
 defect found was fixed at its cause before the runs above:
@@ -1002,19 +1059,18 @@ defect found was fixed at its cause before the runs above:
   looks begun after it);
 - a member released the askers it kept waiting only when it saw itself stop leading, so one that
   stepped down and led again between two looks kept askers whose entries its new term had replaced
-  (they are now released when the term it leads changes).
-
-**Open: a stall in the writes in flight.** Four runs in about 160 on Linux (none on macOS) stopped
-with the group judged quiet while the test still had writes to land: three before the last look
-was printed, and one after, at one CPU over `7a8812c`. Its last look is a healthy idle group: one
-leader in term 11 trusted by both followers, every member at commit, applied and last index 1,411,
-no pair suspected or unjudged, the leader's log holding 1,400 of the scenario's 1,844 writes, and
-nothing moved for the quiet period (the leader's stated detection 721 ms) while the test resent the
-444 unanswered writes in flight on every look. The leader took none of them. The cause is not
-established: 40 runs of `leader-killed` alone at one CPU with every proposal the core refused and
-every refusal for room logged did not reproduce it and logged none. A recurrence prints the
-members' reports; what it lacks is the leader's count of askers kept waiting, the next thing to
-report.
+  (they are now released when the term it leads changes);
+- the test counted as quiet time in which it heard no member (the stall above);
+- the silence bound's first form charged a member the retransmission timeout the test waited on
+  its own lost ask, 2.05 s of silence against 1.05 s excused in a one-CPU probe (the timeout waited
+  on the latest ask is now the test's);
+- a member restarted at the port its killed run had held found the port taken ("Address already in
+  use", in the first run of a matrix at four CPUs): a port freed by a process killed is the system's
+  to give to whoever binds next (a member restarted now takes a port the system gives, and every
+  member up is told);
+- on Windows, which has no stop signal, the stopped member was held for a stated time, which ran
+  out before the test's wait had judged its silence (CI's windows-2025): it is now held until the
+  test releases it.
 
 `tests/wal.rs` covers the log's torn-tail cut, its refusal of a damaged record that is not the
 last, and its bound; `tests/wire.rs` damaged and cut datagrams; `tests/node.rs` a member whose

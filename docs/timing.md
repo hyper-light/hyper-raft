@@ -1042,7 +1042,9 @@ hyper-raft-e2e's members (`crates/hyper-raft-e2e`, a `RawNode` over a file log o
 own) run the same wiring on the core directly: `Config::elections = Suspicion` with pre-vote and
 check-quorum, the pairs attached from the configuration (each told to the core as the stream
 believes it when attached, as hyper-durable's `Owner::pairs` tells a replica), each `Change`
-taken to `suspect`, `trust` or `restarted`, the timing derived by this law from the stream's
+taken to `suspect`, `trust` or `restarted`, its run (`Settings::run`) the count of its starts kept
+beside its log and raised before its stream's first heartbeat (`src/run.rs`, as hyper-durable-e2e's
+members keep theirs; §2.8, "A restart"), the timing derived by this law from the stream's
 echoed round trips, mean flush and granularity (`stream::timing`, as `Replica::measure` derives
 it) and every pair charged the span's `T_E`, each log write handed to the stream as a flush proof,
 and, where the group wrote none in time, the log's hard state written again and flushed on the
@@ -1079,12 +1081,12 @@ look later was healthy and idle, its leader having taken none of the writes rese
 cause was the test's, not the group's. A member's one thread answers nothing while it is in a
 write of its log; on Docker Desktop's virtual machine, whose disk is one file on the host shared
 by every container, a flush took up to 1.8 s, the same 1,807 ms on members of groups in different
-containers at once (each member's longest flush and longest time between two reads of its socket
-were the same number, in every run that reported them): the device held them all together; macOS's
-own disk, under that load, held one flush 1.9 s. The test then
-heard no one (the last look before one failure was empty), its quiet period (one second, RTO's
-floor, above the law's) passed with nothing seen to move, and it called the group stuck; the
-group was waiting on its device, and went on with it. The bookkeeping lead (a write kept waiting
+containers at once (each member's longest time between two reads of its socket was its longest
+flush, to within a millisecond, whenever that flush passed half a second): the device held them all
+together; macOS's own disk, under that load, held one flush 1.9 s. The test then heard no one (the
+last look before one failure was empty), its quiet period (one second, RTO's floor, above the
+law's) passed with nothing seen to move, and it called the group stuck; the group was waiting on
+its device, and went on with it. The bookkeeping lead (a write kept waiting
 that no apply would answer) was checked and is not it: the invariant never broke in any run. The
 fix is the rule above, which counts as quiet only time in which the test saw the group. The
 `stalled-devices` scenario holds it: every member's device answers no flush for the quiet period in
@@ -1093,34 +1095,72 @@ waits for every member to apply it. Under the old rule the test failed there wit
 last look in each of five runs on macOS; under the new it waited through the silence and the write
 committed once the devices went on, in each of five.
 
-**What the runs measured of the detectors** (every scenario prints, for each member, its floors
-and longest flush, and for each pair what the configurator was fed, the detector in force and its
-suspicions against Theorem 7's allowance, `PairReport::allowance`). On macOS, under load 45–62
-from other sessions and six Docker containers running these tests beside them (ten runs,
-`docs/benchmarks.md`, "End to end"):
-- **Floors.** `G` 4–29 ms (median 6–7 ms), `E[flush]` 9–34 ms (median 11–26 ms), so the sender's
-  floor `E[flush] + G` sits near 20 ms; the expected election `T_E` charged to every pair 55–248 ms.
-- **What the pairs measured.** `p_L` 1–39 % (median 8–14 %) on loopback, none of it refused for its
-  proof: the stream numbers each heartbeat slot, and a sender held past its slots (in a flush, or
-  unscheduled) skips them, which its receiver counts as lost. `E(D)` enters the configurator as zero:
-  the expected arrival absorbs the mean delay. The deviation of the prediction errors 3.6–25 ms
-  (185 ms on a pair of the stalled-devices scenario).
-- **What was configured.** `η` 9.6–117 ms (median 16–23 ms) and `α` 4–105 ms (median 10–15 ms):
-  mostly one heartbeat in the margin, so a single skipped slot is a suspicion. The mistake
-  recurrence each detector promises, `η/β`, 15–2,550 ms (median 45–113 ms), shorter than an
-  election in many pairs; the unavailability `U` it was chosen for exceeds 1 (a model that charges
-  more election time than there is time) in 39 of 53 configured pairs of commits-3, 80 of 176 of
-  commits-5 and 104 of 194 of the partition.
-- **Mistakes against the allowance.** Every pair stayed within Theorem 7's allowance, with room:
-  261 suspicions against 1,805 allowed over commits-3's pairs, 1,033 against 8,545 over
-  commits-5's, 1,519 against 10,119 over the partition's (none of these suspicions is of a member
-  down: those scenarios kill no one).
+**What the runs measured of the detectors** (every scenario prints, for each member, its floors,
+longest flush and longest time between two reads of its socket, and for each pair what the
+configurator was fed, the detector in force and its suspicions against Theorem 7's allowance,
+`PairReport::allowance`). The runs are `docs/benchmarks.md`'s, "End to end", on `c4530be`: ten on
+macOS under load 25–66 from other sessions and Docker's Linux runs beside them, and fifty in
+Docker's Linux at four, two and one CPUs with as many busy loops (the virtual machine's load
+4.0–11.0). Of macOS's 760 pairs 608 were configured (`own`), 52 judged by their node's pool and 100
+still unjudged when their scenario ended; of Linux's 3,800, 3,398, 168 and 234. Over the configured
+pairs, macOS first:
+- **Floors.** In the scenarios without a stall or a stop, `G` 0.06–11.4 ms (median 1.6–6.8 ms by
+  scenario) on macOS and 0.2–11.3 ms (median 1.5–3.5 ms) on Linux; `E[flush]` 3.7–20.3 ms (median
+  9.6–13.5 ms; `F_FULLFSYNC`) and 0.35–19.5 ms (median 0.8–1.2 ms); so the sender's floor
+  `E[flush] + G` near 20 ms on macOS and 4 ms on Linux. The expected election `T_E` charged to every
+  pair, where a member's law was derived, 30–155 ms (median 61–99 ms) and 3.3–217 ms (median
+  19–51 ms).
+- **`G` takes in the owner's own stalls.** `G` is the mean lateness of every wake the stream asked
+  (`hyper_timing::Wakes::granularity`), and a wake that falls while the member's one thread is in a
+  flush comes late by the rest of the flush. The stall `stalled-devices` orders took `G` to 32–65 ms
+  on macOS (median 45 ms) and 15–76 ms on Linux (median 29 ms), against medians of 5.4 ms and
+  2.6 ms in commits-3; a member stopped took its own to 30–62 ms on macOS and 9.5–47 ms on Linux,
+  its peers' staying at 0.9–8 ms. The sender's floor follows `G`, and a sender's interval follows
+  its floor up and not down (§2.9, "Every link judged"). In one run over `ecbf071`, of a set
+  `docs/benchmarks.md` does not count (two matrices ran at once in the virtual machine),
+  stalled-devices' members ended with `G` 4.8–7.4 s, every pair unjudged after 12–18 heartbeats
+  sent each in the scenario's 94 s, and the quiet period their law stated before the test's order
+  was 76 s, so the test ordered a stall of 82 s, and waited it out.
+- **What the pairs measured.** `p_L` 0.9–24 % (median 6–8 % by scenario) on macOS, 67 % on one pair
+  through the ordered stall, and 0.6–87 % (median 23–45 %) on Linux, where 1,121 of the 3,398
+  configured pairs were fed more than 40 %; none of it refused for its proof. Most of it is not the
+  link's: the stream numbers each heartbeat slot, and a sender held past its slots (in a flush, or
+  unscheduled) skips them, which its receiver counts as lost. From each pair's two ends, one minus
+  what the receiver took over what the sender sent, in commits-3, commits-5, stalled-devices and
+  member-stopped, is 0.4–12.5 % (median 1.8–4.2 %) on macOS and 0.2–43 % (median 1.1–2.0 %) on
+  Linux. `E(D)` enters the configurator as zero (the expected arrival absorbs the mean delay). The
+  deviation of the prediction errors 3.3–22.5 ms on macOS and 0.1–37 ms on Linux (611 ms on
+  stalled-devices, 1,020 ms on member-stopped).
+- **What was configured.** `η` 7.3–121 ms (median 16–22 ms) and `α` 3.5–84 ms (median 10–14 ms) on
+  macOS, `η` 0.36–385 ms (median 1.5–55 ms) and `α` 0–323 ms (median 0.6–50 ms) on Linux: mostly one
+  heartbeat in the margin, so a single skipped slot is a suspicion. The mistake recurrence each
+  detector promises, `η/β`, median 52–116 ms on macOS (11 ms–7.5 s) and 2–218 ms on Linux (0.4 ms
+  to 28 s), shorter than an election in many pairs; the unavailability `U` it was chosen for exceeds
+  1 (a model that charges more election time than there is time) in 312 of the 608 configured pairs
+  on macOS and 1,475 of the 3,398 on Linux. On Linux 268 pairs were configured with `α = 0`, a
+  detector that suspects at each expected arrival (`η` median 1.8 ms, its recurrence `η` itself: a
+  mistake promised at every freshness point), fed `p_L` of 5–72 % (median 51 %), `U` median 6.1; on
+  macOS one, the pair fed 67 % through the stall.
+- **Mistakes against the allowance.** 2,846 suspicions against 26,424 allowed on macOS, 65,834
+  against 446,673 on Linux. No pair's count refutes its allowance: the 95 % lower limit of every
+  count (the Poisson score interval, as the hyper-swim test above judges) is below its `Σβ`. Four
+  Linux pairs' counts passed `Σβ` itself: three counted the true suspicion of a member killed (2
+  against 1.2, 3 against 2.2, 2 against 1.7), and one was of a pair whose ends were both up, 51
+  against 39.6 (lower limit 38.8); none on macOS. The suspicions of commits-3 and commits-5 are all
+  mistakes (no member is down or cut off there); the partition's include the true ones of and by
+  the member cut off, and those of leader-killed, follower-restarts, all-killed and member-stopped
+  the true ones of the members killed or stopped.
+- **A member stopped and let go.** The heartbeats that waited in a socket's buffer through the stop
+  are stamped as they are read, so the round trips both ends measured took in the stop, and their
+  law's `T_E` at the scenario's end stood at 0.06–1.5 s on its peers and 2.9–5.7 s on the member
+  stopped on macOS, 0.01–2.1 s and 0.4–6.6 s on Linux.
 The detectors keep their bound, and the bound is loose; the configurator, minimizing `U` with
 elections this cheap and losses this high, accepts detectors that mistake many times a second, and
-each mistake about a leader can cost an election (terms to 18 in leader-killed on Linux, where the
-scenario causes two). Nothing here was tuned to hide it. What it asks of the configurator is §3's
-items 1 and 3: the cost of a mistake beyond `T_E` (a leader change moves every client), and a
-loss estimate that tells a sender's skipped slots from the link's.
+each mistake about a leader can cost an election (the leader's term at leader-killed's kill reached
+22 on Linux and 2 on macOS, where the scenario's first election makes term 1). Nothing here was
+tuned to hide it. What it asks is §3's items 1 and 3 of the configurator (the cost of a mistake
+beyond `T_E`: a leader change moves every client), a loss estimate that tells a sender's skipped
+slots from the link's, and a `G` that does not count the owner's own stalls as its timer's lateness.
 
 **The model.** These rules only bring forward or refuse a campaign, or forget a leader, which is
 volatile; the TLA+ model's `Elect` may be taken at any time with any quorum the log comparison

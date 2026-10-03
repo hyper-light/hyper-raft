@@ -939,16 +939,21 @@ bounds derived from that budget. What derives each count now:
 | partition | the leader of five cut off by a drop filter inside its process, its heartbeats with its Raft messages: a read it is asked at once is never answered with a value and a write never acknowledged; the others elect; the member cut off suspects all four and all four suspect it; a key written after the cut never reads stale from it; once lifted it follows and every member applies the same history |
 | all-killed | every member killed at once and restarted on its log: every answered write reads back |
 
-Runs of the whole binary, `cargo test -p hyper-raft-e2e --test cluster`, on this change over hyper-raft
-`0eaac7e`, 2026-10-02 (the runs over `7a8812c`, with the unjudged interval in the quiet period, are
-below the table):
+Runs of the whole binary, `cargo test -p hyper-raft-e2e --test cluster`, on the code as committed
+(over hyper-raft `7a8812c`), 2026-10-02:
 
 | host | runs | passed | a run |
 |---|---|---|---|
-| macOS 26.4.1, Apple M5 Max, load 34–78 | 10 | 10 | 31–53 s |
-| Linux (Docker, rust:1.98.0, aarch64), four CPUs and four busy loops, VM load 9.7–11.8 | 10 | 10 | 51–189 s |
-| Linux, two CPUs and two busy loops, load 6.3–9.6 | 10 | 10 | 47–130 s |
-| Linux, one CPU and one busy loop, load 4.5–9.7 | 10 | 10 | 42–68 s |
+| macOS 26.4.1, Apple M5 Max, load 30–40 | 10 | 10 | 31–48 s |
+| Linux (Docker, rust:1.98.0, aarch64), four CPUs and four busy loops, VM load 9.4–12.3 | 10 | 10 | 35–201 s |
+| Linux, two CPUs and two busy loops, load 6.1–8.8 | 10 | 10 | 34–57 s |
+| Linux, one CPU and one busy loop, load 4.4–7.5 | 10 | 9 | 37–79 s |
+| CI: ubuntu-24.04, ubuntu-24.04-arm, macos-15, macos-15-intel, windows-2025, windows-11-arm (the gates, one run each) | 6 | 6 | |
+
+The one Linux failure is the open stall below. The same code before its last fix (a wait that read
+the members again after its fact held, and found the leader a mistake had deposed since; CI's
+ubuntu-24.04 found it) passed 30 of 30 Linux runs and 10 of 10 on macOS (load 31–40), and over
+hyper-raft `0eaac7e` 30 of 30 and 10 of 10 (load 34–78).
 
 The macOS runs shared the machine with other sessions' builds and with the Linux runs. One macOS
 run's output:
@@ -963,8 +968,8 @@ ok all-killed: every member killed after 134 answered writes and restarted on it
 ```
 
 A write and its read took 1.7–33 ms on average a run on Linux (the slowest under the busy loops and the macOS runs beside them) and 22–46 ms on macOS (`F_FULLFSYNC` under load).
-On Linux the detectors mistake often (`docs/timing.md` §2.9): the terms reached at the end of
-leader-killed ran from 1 to 18 across the 30 runs, where the scenario causes two elections, and the
+On Linux the detectors mistake often (`docs/timing.md` §2.9): in the 30 Linux runs over `0eaac7e`
+the terms reached at the end of leader-killed ran from 1 to 18, where the scenario causes two elections, and the
 leader-killed's writes in flight were all answered before the kill in 9 of them (a burst moves the
 leadership, and each new leader commits what it took); in the other 21 the leader died holding 20
 to 208 unanswered. On macOS the terms stayed at 1 to 7.
@@ -980,9 +985,18 @@ defect found was fixed at its cause before the runs above:
 - a member released the askers it kept waiting only when it saw itself stop leading, so one that
   stepped down and led again between two looks kept askers whose entries its new term had replaced
   (they are now released when the term it leads changes).
-Three of those runs stopped with the group judged quiet, a write or the writes in flight unanswered,
-before the dump of the last look was added; none has recurred in the 45 Linux runs since, and the
-cause is not established. A recurrence prints the members' reports.
+
+**Open: a stall in the writes in flight.** Four runs in about 160 on Linux (none on macOS) stopped
+with the group judged quiet while the test still had writes to land: three before the last look
+was printed, and one after, at one CPU over `7a8812c`. Its last look is a healthy idle group: one
+leader in term 11 trusted by both followers, every member at commit, applied and last index 1,411,
+no pair suspected or unjudged, the leader's log holding 1,400 of the scenario's 1,844 writes, and
+nothing moved for the quiet period (the leader's stated detection 721 ms) while the test resent the
+444 unanswered writes in flight on every look. The leader took none of them. The cause is not
+established: 40 runs of `leader-killed` alone at one CPU with every proposal the core refused and
+every refusal for room logged did not reproduce it and logged none. A recurrence prints the
+members' reports; what it lacks is the leader's count of askers kept waiting, the next thing to
+report.
 
 `tests/wal.rs` covers the log's torn-tail cut, its refusal of a damaged record that is not the
 last, and its bound; `tests/wire.rs` damaged and cut datagrams; `tests/node.rs` a member whose

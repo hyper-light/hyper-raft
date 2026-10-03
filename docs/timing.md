@@ -1067,7 +1067,9 @@ then about 10 ms and 4 ms, recurrence 150–480 ms on Linux in Docker), and a bu
 writes delays a leader's reads of its heartbeats, which this harness stamps when read: the leader
 changed at many bursts of the leader-killed scenario's writes in flight (terms up to 18 at its end
 across 30 Linux runs, where the scenario causes two; 1 to 7 on macOS). Every answered write still read back. Whether the mistakes'
-cost is priced right by `U` with elections this cheap is §3's item 1 and item 3.
+cost is priced right by `U` with elections this cheap is §3's item 1 and item 3. Open in the harness: a
+rare stall of the leader-killed scenario's writes in flight on Linux, a healthy idle group whose
+leader takes none of the writes resent to it (`docs/benchmarks.md`, "End to end").
 
 **The model.** These rules only bring forward or refuse a campaign, or forget a leader, which is
 volatile; the TLA+ model's `Elect` may be taken at any time with any quorum the log comparison

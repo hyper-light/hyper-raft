@@ -72,17 +72,20 @@ use crate::{
     log::{copy_entries_of, copy_entry},
     proto::{self, Entry, EntryType, Message},
     quorum,
-    raft::{FastStats, Raft, StateRole},
+    raft::{FastStats, LAST, Raft, StateRole},
     storage::Storage,
 };
 
-/// Whether `entry` may go by the fast track: it states something, and it
-/// is no change of the configuration.
+/// Whether `entry` may go by the fast track: it states something, it is no
+/// change of the configuration, and it lies below the last index a member
+/// reaches ([`crate::raft::LAST`]): a leader that recovers it at its election
+/// writes its own first entry after it, which needs an index of its own
+/// (mantle note 32 R6).
 fn proposable(entry: &Entry) -> bool {
     entry.entry_type == EntryType::EntryNormal
         && !entry.data.is_empty()
         && entry.index != 0
-        && entry.index != u64::MAX
+        && entry.index < LAST
 }
 
 impl<S: Storage> Raft<S> {
@@ -161,7 +164,7 @@ impl<S: Storage> Raft<S> {
             .last_index()?
             .max(self.held.last_index())
             .checked_add(1)
-            .filter(|index| *index != u64::MAX)
+            .filter(|index| *index < LAST)
             .ok_or(Error::Capacity("the log's indexes"))?;
         if index > self.window() {
             return Err(Error::Capacity("indexes open to proposals"));

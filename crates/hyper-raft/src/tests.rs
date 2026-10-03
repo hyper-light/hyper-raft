@@ -1702,3 +1702,368 @@ fn messages_given_back_are_the_next_queue() {
     node.recycle_messages(Vec::with_capacity(9));
     assert_eq!(node.raft.msgs.resident_bytes(), before);
 }
+
+// slates' regression tests for terms and indexes that have no successor (mantle note 32 §2.13,
+// R6; slates `docs/bugs/2026-09-30-a-saturated-term-let-two-leaders-share-it.md`, AUD-29-26).
+// slates saturated a term at its last value, and a member that campaigned there led the term a
+// leader already held. Here a message naming `u64::MAX` is beyond what is counted
+// (`counts_beyond_bound`), so the last term and the last index a member may reach are
+// `u64::MAX - 1`, and the step past either is refused before anything changes.
+
+/// The last term or index a message may name: one less than `u64::MAX`, which no member reaches.
+const LAST: u64 = u64::MAX - 1;
+
+/// Every message the members give is stepped into the member it is to, as if they heard each
+/// other at once, until none is given. A member not in `up` hears nothing and is asked nothing.
+fn exchange(nodes: &mut [RawNode<Memory>], up: &[u64]) {
+    for _ in 0..1_000 {
+        let mut said = Vec::new();
+        for id in up {
+            said.extend(drain(&mut nodes[*id as usize - 1]));
+        }
+        if said.is_empty() {
+            return;
+        }
+        for message in said {
+            if up.contains(&message.to) {
+                // What a member refuses changes nothing; the schedule goes on.
+                let _ = nodes[message.to as usize - 1].step(message);
+            }
+        }
+    }
+    panic!("the members never fell quiet");
+}
+/// Three voters, each at `term` and having voted for no one.
+fn three_at(term: u64) -> Vec<RawNode<Memory>> {
+    (1..=3)
+        .map(|id| {
+            let mut store = Memory::with_voters(&[1, 2, 3]);
+            store.hard_state = HardState {
+                term,
+                vote: 0,
+                commit: 0,
+            };
+            RawNode::new(&config(id), store).unwrap()
+        })
+        .collect()
+}
+/// What a member is: its term, its vote and its role.
+fn standing(node: &RawNode<Memory>) -> (u64, u64, StateRole) {
+    (node.raft.term(), node.raft.vote(), node.raft.state())
+}
+
+/// A member elected in the last term holds it alone. Every later campaign of the others is
+/// refused with nothing changed: asked of it by its owner, run out by its own timer, or ordered by
+/// the leader that hands over. slates' member saturated its term at the last value and won it a
+/// second time with the third voter's vote.
+#[test]
+fn a_term_with_no_successor_cannot_campaign_and_keeps_one_leader() {
+    let mut nodes = three_at(LAST - 1);
+    nodes[0].campaign().unwrap();
+    exchange(&mut nodes, &[1, 2, 3]);
+    assert_eq!(standing(&nodes[0]), (LAST, 1, StateRole::Leader));
+    for id in [2u64, 3] {
+        let node = &mut nodes[id as usize - 1];
+        let before = standing(node);
+        assert_eq!(before, (LAST, before.1, StateRole::Follower));
+        assert_eq!(node.campaign(), Err(Error::Capacity("terms")));
+        assert_eq!(standing(node), before);
+        // Its own timer runs out, twice over: nothing is asked of anyone.
+        for _ in 0..2 * 2 * node.raft.config().election_tick {
+            node.tick().unwrap();
+        }
+        assert_eq!(standing(node), before);
+        assert!(drain(node).is_empty());
+        // The leader hands over to it: refused, and nothing moves.
+        assert_eq!(
+            node.step(answer(MessageType::MsgTimeoutNow, 1, id, LAST)),
+            Err(Error::Capacity("terms"))
+        );
+        assert_eq!(standing(node), before);
+        assert!(drain(node).is_empty());
+    }
+    let leaders: Vec<u64> = nodes
+        .iter()
+        .filter(|node| node.raft.state() == StateRole::Leader)
+        .map(|node| node.raft.id())
+        .collect();
+    assert_eq!(leaders, vec![1], "one leader of the last term");
+}
+
+/// A request to be voted for in a term with no successor, or anything else that names one, is
+/// refused as beyond what is counted, and changes nothing: the asker could not have reached it.
+#[test]
+fn a_vote_asked_for_a_term_with_no_successor_is_refused() {
+    let mut nodes = three_at(LAST);
+    let voter = &mut nodes[1];
+    let before = standing(voter);
+    for kind in [
+        MessageType::MsgRequestPreVote,
+        MessageType::MsgRequestVote,
+        MessageType::MsgAppend,
+        MessageType::MsgHeartbeat,
+    ] {
+        assert_eq!(
+            voter.step(answer(kind, 1, 2, u64::MAX)),
+            Err(Error::Violation(
+                "a term or an index beyond what is counted"
+            ))
+        );
+        assert_eq!(standing(voter), before);
+        assert!(drain(voter).is_empty());
+    }
+    // Nor does it ask for one itself.
+    assert_eq!(voter.campaign(), Err(Error::Capacity("terms")));
+    assert_eq!(standing(voter), before);
+}
+
+/// A member whose log ends at the last index refuses whole an append that would run past it:
+/// the log is unchanged, and no entry takes an index another holds. slates' follower noted its
+/// next index with a saturating sum, and two entries shared one index.
+#[test]
+fn an_append_past_the_last_index_is_refused_whole() {
+    for (start, sent) in [
+        (LAST, vec![u64::MAX]),
+        (LAST - 2, vec![LAST - 1, LAST, u64::MAX]),
+    ] {
+        let mut store = Memory::with_voters(&[1, 2, 3]);
+        store.install(snapshot(start, 3, &[1, 2, 3]));
+        store.hard_state = HardState {
+            term: 3,
+            vote: 1,
+            commit: start,
+        };
+        let mut follower = RawNode::new(&config(2), store).unwrap();
+        let hard = follower.raft.hard_state();
+        let mut append = answer(MessageType::MsgAppend, 1, 2, 3);
+        append.index = start;
+        append.log_term = 3;
+        append.commit = start;
+        append.entries = sent.iter().map(|index| entry(*index, 3)).collect();
+        assert_eq!(
+            follower.step(append),
+            Err(Error::Violation(
+                "a term or an index beyond what is counted"
+            ))
+        );
+        unchanged(&follower, &hard, start);
+    }
+}
+
+/// A leader whose log ends at the last index refuses every entry more: a proposal and a change
+/// alike, the log unchanged and no change taken for pending.
+#[test]
+fn a_leader_at_the_last_index_refuses_new_entries() {
+    let mut store = Memory::with_voters(&[1]);
+    store.install(snapshot(LAST - 1, 3, &[1]));
+    store.hard_state = HardState {
+        term: 3,
+        vote: 1,
+        commit: LAST - 1,
+    };
+    let mut leader = RawNode::new(&config(1), store).unwrap();
+    leader.campaign().unwrap();
+    drain(&mut leader);
+    assert_eq!(leader.raft.state(), StateRole::Leader);
+    // Its first entry took the last index.
+    assert_eq!(leader.raft.log().last_index().unwrap(), LAST);
+    let pending = leader.raft.pending_conf_index();
+    assert_eq!(
+        leader.propose(vec![], b"one more".to_vec()),
+        Err(Error::Capacity("the log's indexes"))
+    );
+    let change = ConfChangeV2 {
+        changes: vec![ConfChangeSingle {
+            change_type: crate::proto::ConfChangeType::AddNode,
+            node_id: 2,
+        }],
+        ..Default::default()
+    };
+    assert_eq!(
+        leader.propose_conf_change(vec![], &change),
+        Err(Error::Capacity("the log's indexes"))
+    );
+    assert_eq!(leader.raft.log().last_index().unwrap(), LAST);
+    assert_eq!(leader.raft.pending_conf_index(), pending);
+    assert!(drain(&mut leader).is_empty());
+}
+
+/// A member whose log already ends at the last index could not write the entry a leader's term
+/// begins with: its campaign is refused before it changes anything, as a campaign for a term with
+/// no successor is.
+#[test]
+fn a_member_with_no_index_for_a_leaders_first_entry_does_not_campaign() {
+    let mut store = Memory::with_voters(&[1]);
+    store.install(snapshot(LAST, 3, &[1]));
+    store.hard_state = HardState {
+        term: 3,
+        vote: 1,
+        commit: LAST,
+    };
+    let mut node = RawNode::new(&config(1), store).unwrap();
+    let before = standing(&node);
+    assert_eq!(node.campaign(), Err(Error::Capacity("the log's indexes")));
+    assert_eq!(standing(&node), before);
+    assert_eq!(node.raft.log().last_index().unwrap(), LAST);
+    assert!(drain(&mut node).is_empty());
+}
+
+/// By suspicion (timing step L-2) a member with no term or no index to lead in is due for no
+/// campaign: its detectors suspecting its leader arm nothing it could do, and a wake does nothing
+/// and refuses nothing. hyper-durable fences a replica on any error its wake returns, so a refusal
+/// here would stop a member for being at the end of what it may count.
+#[test]
+fn by_suspicion_a_member_with_no_successor_is_due_for_no_campaign() {
+    let timing = crate::Timing {
+        span: std::time::Duration::from_millis(10),
+        round: std::time::Duration::from_millis(2),
+    };
+    for (term, last) in [(LAST, 0), (3, LAST)] {
+        let mut store = Memory::with_voters(&[1, 2, 3]);
+        if last > 0 {
+            store.install(snapshot(last, 3, &[1, 2, 3]));
+        }
+        store.hard_state = HardState {
+            term,
+            vote: 1,
+            commit: last,
+        };
+        let suspicion = Config {
+            elections: crate::Elections::Suspicion,
+            ..config(2)
+        };
+        let mut node = RawNode::new(&suspicion, store).unwrap();
+        node.set_timing(timing).unwrap();
+        // It hears its leader, and then suspects it.
+        let mut beat = answer(MessageType::MsgHeartbeat, 1, 2, term);
+        beat.commit = last;
+        node.step(beat).unwrap();
+        node.wake(0).unwrap();
+        drain(&mut node);
+        node.suspect(1).unwrap();
+        let before = standing(&node);
+        for now in [0, 1_000_000_000, 10_000_000_000] {
+            assert_eq!(node.wake(now), Ok(false), "term {term}, last {last}");
+            assert_eq!(node.deadline(), None);
+            assert_eq!(standing(&node), before);
+            assert!(drain(&mut node).is_empty());
+        }
+    }
+}
+
+/// The fast track proposes and holds nothing at the last index: a leader that recovered such an
+/// entry at its election would have no index for its own first entry after it. A proposal stops
+/// one short, refused for the log's indexes, and a peer's proposal at the last index is a
+/// violation, held nowhere. slates' fast track chose the next index with a saturating sum.
+#[test]
+fn the_fast_track_proposes_and_holds_nothing_at_the_last_index() {
+    let fast = Config {
+        fast: true,
+        ..config(2)
+    };
+    let mut store = Memory::with_voters(&[1, 2, 3]);
+    store.install(snapshot(LAST - 2, 3, &[1, 2, 3]));
+    store.hard_state = HardState {
+        term: 3,
+        vote: 1,
+        commit: LAST - 2,
+    };
+    let mut node = RawNode::new(&fast, store).unwrap();
+    let mut beat = answer(MessageType::MsgHeartbeat, 1, 2, 3);
+    beat.commit = LAST - 2;
+    node.step(beat).unwrap();
+    drain(&mut node);
+    // One below the last index may be proposed; the last may not.
+    assert_eq!(node.propose_fast(vec![], b"x".to_vec()), Ok(LAST - 1));
+    assert_eq!(
+        node.propose_fast(vec![], b"y".to_vec()),
+        Err(Error::Capacity("the log's indexes"))
+    );
+    let held: Vec<u64> = node.raft.proposals().map(|entry| entry.index).collect();
+    assert_eq!(held, vec![LAST - 1]);
+    // A peer's proposal at the last index is refused, and not held.
+    let mut proposal = answer(crate::fast::FAST_PROPOSE, 3, 2, 0);
+    proposal.entries = vec![Entry {
+        data: b"z".to_vec(),
+        ..entry(LAST, 3)
+    }];
+    assert!(matches!(node.step(proposal), Err(Error::Violation(_))));
+    let held: Vec<u64> = node.raft.proposals().map(|entry| entry.index).collect();
+    assert_eq!(held, vec![LAST - 1]);
+}
+
+// slates' regression test for independent election draws (mantle note 32 §2.13, R7; slates
+// `docs/bugs/2026-09-28-correlated-election-jitter-livelocked-a-split-vote.md`). slates drew a
+// follower's jitter as `(id + attempt) mod span`: two members whose ids were congruent modulo the
+// span timed out together at every attempt, and their split vote never resolved (19 s on its
+// multi-region profile). Here each member draws from its own SplitMix64 stream (`Config::seed`) at
+// every reset; by suspicion each arming draws anew from hyper-timing's law
+// (`tests/suspicion.rs`, `every_arming_draws_anew` and
+// `split_votes_resolve_and_split_exactly_when_the_law_says`).
+
+/// Two survivors of a leader, seeded congruently modulo the span their timeouts are drawn over
+/// (slates' worst case), are made to time out together; they split the vote, and every later
+/// round is decided by the draws each makes anew at its campaign: one in which they draw the same
+/// timeout splits again, and the first in which they differ elects the one that drew the shorter,
+/// at exactly its timeout. Every round is predicted from the draws before it runs, and the group
+/// elects within the rounds the test allows.
+#[test]
+fn survivors_whose_timeouts_collide_elect_at_the_first_round_their_draws_differ() {
+    let span = config(1).election_tick as u64;
+    let seeded = |id: u64, seed: u64| Config { seed, ..config(id) };
+    let mut nodes: Vec<RawNode<Memory>> = [(1, 1), (2, 7), (3, 7 + span)]
+        .into_iter()
+        .map(|(id, seed)| RawNode::new(&seeded(id, seed), Memory::with_voters(&[1, 2, 3])).unwrap())
+        .collect();
+    nodes[0].campaign().unwrap();
+    exchange(&mut nodes, &[1, 2, 3]);
+    assert_eq!(nodes[0].raft.state(), StateRole::Leader);
+    // The leader is gone. Both survivors heard it last at the same moment, and are made to time
+    // out together (a harness that orders elections).
+    let survivors = [2u64, 3];
+    for id in survivors {
+        let node = &mut nodes[id as usize - 1];
+        assert_eq!(node.raft.election_elapsed(), 0);
+        node.raft.set_randomized_election_timeout(15).unwrap();
+    }
+    let (mut splits, mut rounds) = (0, 0);
+    loop {
+        rounds += 1;
+        assert!(rounds <= 64, "no round elected: the draws stay together");
+        let drawn: Vec<usize> = survivors
+            .iter()
+            .map(|id| nodes[*id as usize - 1].raft.randomized_election_timeout())
+            .collect();
+        let term = nodes[1].raft.term();
+        assert_eq!(nodes[2].raft.term(), term);
+        let first = *drawn.iter().min().unwrap();
+        // Ticks in lockstep, everything said heard at once, until a member campaigns.
+        for _ in 0..first {
+            for id in survivors {
+                nodes[id as usize - 1].tick().unwrap();
+            }
+            exchange(&mut nodes, &survivors);
+        }
+        let roles: Vec<StateRole> = survivors
+            .iter()
+            .map(|id| nodes[*id as usize - 1].raft.state())
+            .collect();
+        for id in survivors {
+            assert_eq!(nodes[id as usize - 1].raft.term(), term + 1);
+        }
+        if drawn[0] == drawn[1] {
+            // Together: each was granted the other's pre-vote, and then refused its vote.
+            assert_eq!(roles, vec![StateRole::Candidate; 2], "round {rounds}");
+            splits += 1;
+            continue;
+        }
+        let shorter = if drawn[0] < drawn[1] { 2 } else { 3 };
+        let leader = survivors
+            .iter()
+            .copied()
+            .find(|id| nodes[*id as usize - 1].raft.state() == StateRole::Leader);
+        assert_eq!(leader, Some(shorter), "round {rounds}: drawn {drawn:?}");
+        break;
+    }
+    assert!(splits >= 1, "the forced round split");
+}

@@ -716,3 +716,66 @@ and a follower that queued more than four answers while its writes were out grew
   After only 50 entries the first 3,000 still grow each circulating queue to its high water once,
   about 18 growths a group of three more than mantle's shell makes, 0.01–0.02 an entry over those
   3,000; they are done by 3,000 entries, after which the counts are mantle's.
+
+## R-3: slates' enhancements
+
+Core step R-3 (`docs/raft.md` §3; mantle note 32 §2.13's ledger, R4–R7, R13, R16, R17, R20–R22).
+slates' core stays in slates until X-1; what it found and fixed comes here as slates' tests run on
+this core, and as rules designed from slates', focal's and the literature where this core lacked
+them. slates is read at `ec5e0df` (its `main`, 2026-10-03).
+
+### R6 and R7: slates' regression tests, and the end of what is counted
+
+- **R6, a term with no successor** (slates `docs/bugs/2026-09-30-a-saturated-term-let-two-leaders-share-it.md`,
+  AUD-29-26: slates saturated a term at `u64::MAX`, and a member that campaigned there led a term a
+  leader held). Here a message naming `u64::MAX` is beyond what is counted (`counts_beyond_bound`),
+  so the last term and index a member reaches are `u64::MAX - 1` (`raft::LAST`). slates' four tests,
+  in this core's terms (`src/tests.rs`), pass on `main` (`9893679`) as expected:
+  `a_term_with_no_successor_cannot_campaign_and_keeps_one_leader` (a campaign asked of a member, run
+  out by its timer or ordered by the leader's hand-over is refused `Capacity("terms")` with term,
+  vote and role unchanged; one leader of the last term), `a_vote_asked_for_a_term_with_no_successor_is_refused`,
+  `an_append_past_the_last_index_is_refused_whole` and `a_leader_at_the_last_index_refuses_new_entries`.
+- **Three siblings that failed on `main`, and the cause of each.**
+  - `a_member_with_no_index_for_a_leaders_first_entry_does_not_campaign`: a member whose log ended
+    at the last index campaigned, was elected, and could not write the entry its term begins with:
+    `Raft::become_leader` returned `Capacity("the log's indexes")`, a refusal, with the member left
+    `Leader` of a new term and no entry of it ("(4, 1, Leader)" where "(3, 1, Follower)" was
+    expected). Cause: the campaign asked whether the term had a successor and not whether the log
+    had an index for the first entry. `Raft::lead_refusal` asks both before a campaign changes
+    anything (`Raft::hup`), and the first entry's append failing for room is now a fatal
+    `Invariant`, since nothing that reaches it may lack room.
+  - `by_suspicion_a_member_with_no_successor_is_due_for_no_campaign`: by suspicion, a follower at
+    the last term (or at the last index) whose leader was suspected armed a campaign
+    (`deadline` was `Some`) that its wake then refused; hyper-durable fences a replica on any error
+    its wake returns, so the member would have been stopped for being at the end of what it may
+    count. `Raft::deadline` and `wake_follower` arm and run no campaign `lead_refusal` refuses
+    (`Raft::may_lead`).
+  - `the_fast_track_proposes_and_holds_nothing_at_the_last_index`: the fast track proposed and held
+    entries at the last index, and a leader that recovered one at its election would have had no
+    index for its own first entry after it (slates' "the fast track refuses its proposal").
+    `track::proposable` and `Raft::propose_fast` stop one index short.
+- **R7, independent election draws** (slates
+  `docs/bugs/2026-09-28-correlated-election-jitter-livelocked-a-split-vote.md`: a jitter of
+  `(id + attempt) mod span` kept two members congruent modulo the span timing out together at
+  every attempt, 19 s on slates' multi-region profile). On ticks each member draws from its own
+  SplitMix64 stream at every reset (`Config::seed`); by suspicion every arming draws anew from
+  hyper-timing's law, which `tests/suspicion.rs` already holds exactly
+  (`every_arming_draws_anew`; `split_votes_resolve_and_split_exactly_when_the_law_says`, each of
+  1,000 crashes' first round split exactly when the law's event holds). The new test,
+  `survivors_whose_timeouts_collide_elect_at_the_first_round_their_draws_differ` (`src/tests.rs`),
+  is slates' case on ticks: two survivors seeded congruently modulo the span (slates' worst case),
+  made to time out together, split; every later round is predicted from the draws each made at its
+  campaign before the round runs (the same draw splits again, the first that differs elects the
+  shorter at exactly its timeout), and the group must elect within 64 rounds. It passes on `main`
+  (the forced split, then elected in round 2). With slates' old draw put into
+  `reset_randomized_election_timeout` it fails: "no round elected: the draws stay together".
+- **Measured** (`docs/benchmarks.md`, "slates' regression tests, R6 and R7 (R-3)"): allocations,
+  reallocations and bytes identical to `main`'s on all 36 cells; every count the schedules print at
+  their default seeds identical. The check first cost an owner's idle scan by suspicion 84
+  instructions a group a period (327 → 411), since `deadline` asked every rule that holds a campaign
+  of every member though only one with a campaign armed uses the answer; asked only there (and in
+  `wake_follower` only once a campaign is due), the scan is 51–54 instructions, a sixth of `main`'s,
+  with every decision as before.
+- **The divergence table.** focal 27 §4.5's table of where this core and raft-rs decide differently
+  had no copy here; `docs/raft.md` §3.3 now carries it, with the ports since (F41, F42, F43), R-2's
+  wire, R6's row, and the test that holds each.

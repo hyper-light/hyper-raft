@@ -26,6 +26,9 @@
 >
 > Timing step L-2 is done (2026-10-02): elections started by the owner's failure detectors, not by
 > ticks (`Config::elections`, `docs/timing.md` §2.9).
+>
+> Step R-3 is under way (2026-10-03, §3.2): slates' regression tests for R6 and R7 pass, and three
+> defects at the end of what a member counts, which their siblings found, are fixed.
 
 ## 1. What `hyper-raft` is
 
@@ -214,6 +217,62 @@ An owner that prices what a committed change will add before the core applies it
 in place (`wire::changes_stated`): each change's kind and member from the entry's record, nothing
 allocated, after the whole record is checked as decoding checks it (focal's memory accounting,
 which priced raft-rs's encoding the same way before its core moved here).
+
+### 3.2 slates' enhancements (R-3)
+
+Each of note 32's R-numbers comes in as slates states it: its regression test run on this core, or
+a rule designed from slates', focal's and the literature where this core lacked one. The record of
+each, with the tests that failed before, is `crates/hyper-raft/ORIGIN.md`, "R-3".
+
+**The end of what is counted (R6).** A message naming `u64::MAX` is beyond what is counted
+(`counts_beyond_bound`), so the last term and the last index a member reaches are `u64::MAX - 1`
+(`raft::LAST`). The step past either is refused before anything changes, never saturated (slates'
+AUD-29-26: a term saturated at its last value let two leaders share it):
+- a campaign is refused `Capacity("terms")` at the last term, and `Capacity("the log's indexes")`
+  where the log has no index left for the entry a leader's term begins with (`Raft::lead_refusal`,
+  asked in `Raft::hup` before anything moves); by suspicion no campaign is armed that it would
+  refuse (`Raft::may_lead` in `deadline` and `wake_follower`), since an owner's wake that returned
+  the refusal fences the replica;
+- an append whose entries would run past the last index is refused whole, and a leader at the last
+  index refuses every proposal and change;
+- the fast track proposes and holds nothing at the last index (`track::proposable`,
+  `Raft::propose_fast`): a leader that recovered such an entry at its election would have no index
+  for its own first entry after it. With that and `lead_refusal`, a leader's first entry always has
+  an index, and its append failing for room is a fatal `Invariant`, not a refusal.
+
+**Independent election draws (R7).** On ticks each member draws its timeout from its own SplitMix64
+stream at every reset (`Config::seed`); by suspicion every arming draws anew from hyper-timing's law
+(`Watch::draw`). Two members that drew alike draw apart at their next campaign, whatever their
+seeds: slates' `(id + attempt) mod span` kept members congruent modulo the span together for good.
+
+### 3.3 Where this core and raft-rs differ
+
+`tests/differential.rs` runs this core and raft-rs on one schedule and compares them field by field
+(§1). Where the two decide differently it is by decision, and each decision is held by a test of its
+own; where a schedule can reach one, the differential runs raft-rs's rule, which this core keeps for
+that purpose, or loses for both cores the message that would reach it. focal 27 §4.5 began this
+table for focal-raft; it lives here since the core moved (R-1), with every decision since.
+
+| raft-rs 0.7 | This core | Test |
+|---|---|---|
+| Asserts; the shell contains the unwind and stops the replica | An error of one of three kinds: a refusal that changed nothing, a peer's message that contradicts the member, or a state that no longer adds up, which alone stops the replica (`Error`) | `src/tests.rs`: `what_a_peer_may_not_say_is_refused_and_changes_nothing`, `storage_that_fails_stops_no_one_and_is_said` |
+| Its generated accessors unwind on an enumeration value they do not know, which a peer chooses | Its own types and wire format (R-2, §3.1): an unknown kind, flag or version is refused | `src/wire.rs`: `unknown_kinds_flags_and_versions_are_refused`, `arbitrary_bodies_never_panic` |
+| A leader that applies a change which leaves it no voter leads on, and unwinds when it next commits | It tells the voter that holds the whole log to campaign, and follows | `tests/group.rs`: `a_leader_a_change_leaves_no_voter_hands_the_group_over_and_follows` |
+| One told to campaign while a change it committed is not applied forgets it was told | It campaigns once the change is applied, unless it heard of a leader since | `one_told_to_campaign_before_it_applied_a_change_campaigns_once_it_has` |
+| One told to campaign while it asks whether it could be elected ignores it, and the leader waits an election timeout | It campaigns; the differential loses that message for both cores | `one_told_to_campaign_while_it_asks_whether_it_could_does` |
+| A voter refuses a candidate of lower priority unless the candidate has more entries | Unless the candidate's log is more current, by its last term and then its length (`Precedence::Log`); raft-rs's rule is kept as `Precedence::Length` | `tests/group.rs`: `priority_yields_to_a_log_that_is_more_current` |
+| Priority judges the vote a transfer asks for; a member without a term, or one that left, may refuse for priority | Priority never judges a transfer, and is in force only for a member with a term that may campaign | `tests/group.rs`: `priority_orders_an_election_and_never_judges_a_transfer`, `a_member_that_has_no_term_refuses_no_one_for_priority`, `a_member_that_left_refuses_no_one_for_priority` |
+| One that is no voter may campaign, and unwinds when it wins | Refused, `NotPromotable` | `only_a_voter_campaigns` |
+| Election timeouts from the thread's generator | From a seed the owner gives (`Config::seed`): a run is its seed | `election_timeouts_are_drawn_from_the_seed` |
+| Queues without a bound of their own | `Limits`; a member takes of a message what it may hold, and answers with the last entry taken | `what_waits_to_be_taken_has_a_bound`, `what_is_not_durable_has_a_bound`, `reads_that_wait_have_a_bound` |
+| A round of heartbeats for each read as it is asked, and again as it is asked again | One round when the member is next asked what there is to do, for every read since (`ReadRounds::Shared`, focal F43); raft-rs's rule is kept as `ReadRounds::Each` | `reads_asked_together_leave_in_one_round_and_one_answer_confirms_them`; `tests/group.rs`: `a_round_confirms_no_read_asked_after_it_left` |
+| A window of messages alone | Of messages and of bytes, the bytes what the owner says the path carries (`RawNode::set_inflight_bytes`, focal F41); the differential runs with no byte bound | `a_member_is_sent_no_more_bytes_ahead_of_its_answers_than_its_path_carries` |
+| A heartbeat's answer says nothing of the log, and a full window frees its first message at every answer | The answer says how far the log goes and is taken as an append's answer (`HeartbeatAnswers::Position`, focal F42); raft-rs's rule is kept as `HeartbeatAnswers::Bare` | `a_heartbeats_answer_gives_back_what_the_member_holds_and_nothing_more` |
+| A term or an index may be counted to `u64::MAX` | The last of each is `u64::MAX − 1`; a campaign, an append or a proposal past it is refused before anything changes, by suspicion no campaign is armed that would be, and the fast track holds nothing at the last index (R6, §3.2) | `a_term_with_no_successor_cannot_campaign_and_keeps_one_leader`, `a_member_with_no_index_for_a_leaders_first_entry_does_not_campaign`, `by_suspicion_a_member_with_no_successor_is_due_for_no_campaign`, `the_fast_track_proposes_and_holds_nothing_at_the_last_index` |
+
+Kept although it could be otherwise, as focal kept it: a member that a change removes and adds
+again is known anew, and a member added by a change is first probed one entry before the log's
+end. Both are raft-rs's, harmless, and keep the comparison free of an exception for them.
 
 ### The fast track's election defect, and its fix
 

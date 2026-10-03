@@ -823,6 +823,37 @@ today.
 Commands: as R-5's; the second pass `CELLS=... RUNS=16` over the same harness, `main` built with
 `inert: [u64; 6]` in `Raft`.
 
+## slates' regression tests, R6 and R7 (R-3)
+
+Core step R-3's first commit (`crates/hyper-raft/ORIGIN.md`, "R-3"). Measured on 2026-10-03 on the
+machine above; each figure says its load. It adds a check where a campaign starts and where one is
+armed by suspicion (`Raft::lead_refusal`), bounds the fast track's proposals below the last index,
+and asks the rules that hold a campaign only of a member that has one armed or due.
+
+**Allocations**: identical to `main`'s (`9893679`) on all 36 cells (the 18 workloads of the tables
+at three and five voters, in place and copying), allocations, reallocations and bytes, the counting
+run of seed 1 (a scratch loop over `hyper-raft-compare one <core> <workload> <voters> <batch>
+<bytes> <rounds> 1 count`, `crates/hyper-raft-compare` built `--release` in both trees).
+
+**The schedules**: every count `tests/differential.rs`, `group.rs`, `fast.rs`, `pipeline.rs`,
+`repair.rs` and `suspicion.rs` print at their default seeds, 500 lines, identical to `main`'s.
+
+**What an idle group costs, by suspicion** (`benches/idle.rs`, `suspicion 10000 <0|400>` under
+`/usr/bin/time -l`, the difference taken, five interleaved rounds, load 10.5 and 14.3–14.9):
+
+| | instructions a group a period | cycles a group a period |
+|---|---|---|
+| `main` | 326–333 | 156–335 |
+| the check asked as `main` asked its rules, of every member at every scan | 410–411 | 202–219 |
+| the rules asked only of a member with a campaign armed (as committed) | 51–54 | 32–73 |
+
+The check alone added 84 instructions a group a period to an owner's scan: `deadline` asked every
+rule that holds a campaign (`may_campaign`, the detectors' quorum, and now the room to lead) of every
+member, though a follower that trusts its leader has no campaign armed and its answer was thrown
+away. Asking them only where `Watch::due` finds a campaign armed, and in `wake_follower` only once
+one is due, leaves the scan at three timer reads a member: a sixth of `main`'s instructions. The
+answers are the same wherever they are used, so every schedule decides as on `main` (above).
+
 ## Where hyper-raft does not win, and why
 
 hyper-raft in place allocates less than every other core in every row. It is faster than raft-rs
@@ -1123,6 +1154,12 @@ cargo bench -p hyper-raft --bench repair
 # A marked member's election (R-7): the same schedules, faults at rest on two members at once
 # among them, and the comparison of main, R-5 and R-7 interleaved.
 HYPER_RAFT_SEEDS=1000 HYPER_RAFT_STEPS=4000 HYPER_RAFT_CRASH_SEEDS=40 cargo test -p hyper-raft --release --test pipeline --test repair --test suspicion -- --nocapture
+
+# slates' regression tests, R6 and R7 (R-3): the counting runs of every cell in both trees, the
+# schedules' printed counts in both, and the idle scan by suspicion, each process timed whole.
+$B one hyper steady 3 1 64 20000 1 count
+cargo test -p hyper-raft --test differential --test group --test fast --test pipeline --test repair --test suspicion -- --nocapture --test-threads=1
+/usr/bin/time -l target/release/deps/idle-<hash> suspicion 10000 400
 
 # The end-to-end scenarios, and every gate.
 cargo test -p hyper-raft-e2e --test cluster

@@ -892,6 +892,14 @@ enum TermChecked {
     Done,
 }
 
+/// The last term, and the last index, a member reaches: a message that names `u64::MAX` is beyond
+/// what is counted ([`counts_beyond_bound`]), so `u64::MAX` is never a term or an index, and the
+/// step past this one has no successor and is refused before anything changes (slates
+/// `docs/bugs/2026-09-30-a-saturated-term-let-two-leaders-share-it.md`, mantle note 32 R6: a term
+/// saturated at its last value let two leaders share it, and an index saturated there gave two
+/// entries one index).
+pub(crate) const LAST: u64 = u64::MAX - 1;
+
 /// Whether a message carries a term or an index at the end of what is
 /// counted, past which the next could not be named.
 fn counts_beyond_bound(message: &Message) -> bool {
@@ -1139,6 +1147,24 @@ impl<S: Storage> Raft<S> {
         }
         let id = self.id;
         !self.config.fast && self.tracker.quorum_of(|member| member != id)
+    }
+    /// Why this member could not lead a term it campaigned for, if it could not (mantle note 32
+    /// R6): its term has no successor a message may name, or its log has no index for the entry
+    /// a leader's term begins with. Asked before a campaign changes anything, so that the refusal
+    /// is one; and by suspicion before a campaign is armed, so that none is due that cannot be
+    /// made.
+    fn lead_refusal(&self) -> Result<Option<Error>> {
+        if self.term >= LAST {
+            return Ok(Some(Error::Capacity("terms")));
+        }
+        if self.log.last_index()? >= LAST {
+            return Ok(Some(Error::Capacity("the log's indexes")));
+        }
+        Ok(None)
+    }
+    /// Whether this member could lead a term it campaigned for ([`Raft::lead_refusal`]).
+    fn may_lead(&self) -> bool {
+        matches!(self.lead_refusal(), Ok(None))
     }
     /// The last entry this member answers for in an election, `(index, term)`: its log's last,
     /// or what it marks lost, which is later (`docs/durable.md` §5). It may have acknowledged
@@ -1599,7 +1625,7 @@ impl<S: Storage> Raft<S> {
     ) -> Result<bool> {
         let last = self.log.last_index()?;
         let count = u64::try_from(entries.len()).unwrap_or(u64::MAX);
-        if last.checked_add(count).is_none_or(|end| end == u64::MAX) {
+        if last.checked_add(count).is_none_or(|end| end > LAST) {
             return Err(Error::Capacity("the log's indexes"));
         }
         let bytes = entries.iter().fold(0usize, |bytes, entry| {
@@ -1939,13 +1965,16 @@ impl<S: Storage> Raft<S> {
     /// detectors leave it no quorum, or on ticks.
     pub fn deadline(&self) -> Option<u64> {
         let watch = self.watch.as_ref()?;
-        let campaigns =
-            self.promotable && !watch.held && self.may_campaign() && self.trusted_quorum();
-        let campaign = if campaigns || (watch.led == self.term && self.term != 0) {
-            Watch::due(watch.campaign)
-        } else {
-            None
-        };
+        // The rules that hold a campaign are asked only of one that is armed: an owner that scans
+        // its idle groups asks each member, and a follower that trusts its leader has none.
+        let campaign = Watch::due(watch.campaign).filter(|_| {
+            (watch.led == self.term && self.term != 0)
+                || (self.promotable
+                    && !watch.held
+                    && self.may_campaign()
+                    && self.may_lead()
+                    && self.trusted_quorum())
+        });
         [campaign, Watch::due(watch.beat), Watch::due(watch.transfer)]
             .into_iter()
             .flatten()
@@ -2044,9 +2073,7 @@ impl<S: Storage> Raft<S> {
     }
     fn wake_follower(&mut self, now: u64) -> Result<bool> {
         let (promotable, local, term) = (self.promotable, self.config.seed, self.term);
-        let may = self.may_campaign();
         let alone = self.tracker.is_singleton() && self.tracker.configuration().votes(self.id);
-        let quorum = self.trusted_quorum();
         let trusts = self
             .watch
             .as_deref()
@@ -2088,7 +2115,11 @@ impl<S: Storage> Raft<S> {
         if !due {
             return Ok(false);
         }
-        let campaigns = promotable && quorum && may && !watch.held;
+        // The rules that hold a campaign are asked only of one that is due: the owner wakes a
+        // member after every call it makes (`Raft::deadline` likewise).
+        let held = watch.held;
+        let campaigns =
+            promotable && !held && self.trusted_quorum() && self.may_campaign() && self.may_lead();
         if !campaigns {
             if !led {
                 return Ok(false);
@@ -2096,6 +2127,7 @@ impl<S: Storage> Raft<S> {
             // It cannot campaign, and its followers trust it: it hands over
             // again, a round and a draw after the last, as a candidate asks
             // again, for the order may have been lost.
+            let watch = self.watch_mut()?;
             watch.campaign = match (watch.round(), watch.draw(local)) {
                 (Some(tail), Some(delay)) => {
                     Arm::At(now.saturating_add(tail).saturating_add(delay))
@@ -2139,7 +2171,7 @@ impl<S: Storage> Raft<S> {
         let term = self
             .term
             .checked_add(1)
-            .filter(|term| *term != u64::MAX)
+            .filter(|term| *term <= LAST)
             .ok_or(Error::Capacity("terms"))?;
         self.reset(term)?;
         self.vote = self.id;
@@ -2150,7 +2182,7 @@ impl<S: Storage> Raft<S> {
         if self.state == StateRole::Leader {
             return Err(Error::Invariant("a leader that campaigns"));
         }
-        if self.term.checked_add(1).is_none_or(|term| term == u64::MAX) {
+        if self.term.checked_add(1).is_none_or(|term| term > LAST) {
             return Err(Error::Capacity("terms"));
         }
         // Asking changes neither the term nor the vote.
@@ -2203,7 +2235,16 @@ impl<S: Storage> Raft<S> {
         let mut first = self.recover(reports, last)?;
         first.try_reserve(1).map_err(|_| Error::Memory)?;
         first.push(Entry::default());
-        if !self.append_entries(first, true)? {
+        // A member campaigns only with an index for this entry (`Raft::lead_refusal`), and what it
+        // recovers lies below the last index (`track::proposable`): no index here is a state that
+        // no longer adds up, never a refusal of something that changed nothing.
+        let appended = self
+            .append_entries(first, true)
+            .map_err(|error| match error {
+                Error::Capacity(_) => Error::Invariant("a leader's first entry has no index"),
+                other => other,
+            });
+        if !appended? {
             return Err(Error::Invariant("a leader's first entry was refused"));
         }
         let last = self.log.last_index()?;
@@ -2286,6 +2327,9 @@ impl<S: Storage> Raft<S> {
         // a group it is no member of.
         if !self.promotable {
             return Err(Error::NotPromotable);
+        }
+        if let Some(refusal) = self.lead_refusal()? {
+            return Err(refusal);
         }
         if !self.may_campaign() {
             // Its leader is gone, or it would not be asked: it holds no

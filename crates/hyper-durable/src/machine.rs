@@ -1,5 +1,5 @@
 //! What the shell asks of the state machine a group applies to (`docs/durable.md` §9).
-use hyper_raft::proto::ConfState;
+use hyper_raft::proto::{ConfChangeV2, ConfState};
 
 use crate::store::{EntryRef, Point};
 
@@ -24,10 +24,18 @@ pub trait StateMachine {
     fn apply(&mut self, entry: &EntryRef<'_>, answers: &mut Vec<Self::Answer>)
     -> Result<(), Fatal>;
 
-    /// A committed change of configuration at `at` left the group with `configuration`, which
-    /// the machine keeps with its state from this index on. A change the core refused, alike on
-    /// every member, leaves the configuration it had.
-    fn apply_change(&mut self, at: Point, configuration: &ConfState) -> Result<(), Fatal>;
+    /// A committed change of configuration at `at`, as its entry stated it (`change`, its
+    /// context among it), left the group with `configuration`, which the machine keeps with its
+    /// state from this index on; the configuration before is the machine's own
+    /// ([`StateMachine::configuration`]). A change the core refused, alike on every member,
+    /// leaves the configuration it had. An owner that reports each change with what it carried,
+    /// as focal's does, reads it here.
+    fn apply_change(
+        &mut self,
+        at: Point,
+        change: &ConfChangeV2,
+        configuration: &ConfState,
+    ) -> Result<(), Fatal>;
 
     /// The last entry a restart opens with applied, and its term.
     fn durable(&self) -> Point;

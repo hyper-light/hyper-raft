@@ -1664,7 +1664,7 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
             Err(error) if !error.is_fatal() => self.machine.configuration().clone(),
             Err(error) => return Err(self.fence(Cause::Core(error))),
         };
-        let kept = self.machine.apply_change(at, &configuration);
+        let kept = self.machine.apply_change(at, change, &configuration);
         self.machine_did(kept)?;
         self.applied = at;
         self.conf_index = at.index;

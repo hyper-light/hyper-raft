@@ -16,7 +16,7 @@ use hyper_durable::{
 use hyper_log::{Config as LogConfig, Log, Waits};
 use hyper_raft::Config;
 use hyper_raft::StorageError;
-use hyper_raft::proto::{ConfState, Message};
+use hyper_raft::proto::{ConfChangeV2, ConfState, Message};
 use mantle_meta::apply::apply_entry;
 use mantle_meta::engine::{Engine, Model, Rows};
 use mantle_meta::wire::Entry;
@@ -70,7 +70,12 @@ impl StateMachine for RangeMachine {
         };
         Ok(())
     }
-    fn apply_change(&mut self, at: Point, configuration: &ConfState) -> Result<(), Fatal> {
+    fn apply_change(
+        &mut self,
+        at: Point,
+        _change: &ConfChangeV2,
+        configuration: &ConfState,
+    ) -> Result<(), Fatal> {
         self.engine
             .apply(at.index, &[])
             .map_err(|_| Fatal("the engine"))?;

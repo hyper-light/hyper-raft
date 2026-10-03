@@ -399,8 +399,13 @@ impl StateMachine for Boom {
         }
         self.0.apply(entry, answers)
     }
-    fn apply_change(&mut self, at: Point, c: &ConfState) -> Result<(), Fatal> {
-        self.0.apply_change(at, c)
+    fn apply_change(
+        &mut self,
+        at: Point,
+        change: &ConfChangeV2,
+        c: &ConfState,
+    ) -> Result<(), Fatal> {
+        self.0.apply_change(at, change, c)
     }
     fn durable(&self) -> Point {
         self.0.durable()
@@ -1204,4 +1209,20 @@ fn a_replica_on_ticks_elects_by_its_owners_ticks_and_hears_no_detector() {
 fn a_replica_by_suspicion_takes_no_ticks() {
     let mut r = sole(1, Unbounded, |_| {});
     assert!(matches!(r.tick(), Err(ReplicaError::Refused(_))));
+}
+
+/// The state machine is given each change as its entry stated it: an owner that reports a change
+/// with what it carried (focal reports its context with the configurations before and after)
+/// reads it from the change itself.
+#[test]
+fn a_machine_is_given_the_change_it_applies() {
+    let mut r = sole(1, Unbounded, |_| {});
+    let mut learner = change(ConfChangeType::AddLearnerNode, 2);
+    learner.context = b"where 2 listens".to_vec();
+    r.change(Vec::new(), &learner).unwrap();
+    pump(&mut r);
+    let (index, context) = r.machine().changes.last().cloned().unwrap();
+    assert_eq!(context, b"where 2 listens");
+    assert_eq!(r.machine().configuration().learners, vec![2]);
+    assert_eq!(r.machine().now.applied.index, index);
 }

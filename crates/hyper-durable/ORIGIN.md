@@ -135,3 +135,14 @@ mantle's D-1 where its owner cannot yet carry the node-pair stream.
   - `a_member_stopped_between_release_and_the_write_made_again_reopens_without_it`;
   - `a_replica_on_ticks_elects_by_its_owners_ticks_and_hears_no_detector`;
   - `a_replica_by_suspicion_takes_no_ticks`.
+
+## A machine sees the change it applies (2026-10-03)
+
+focal's owners report each change of configuration with the context its entry carried and the
+configurations before and after it (focal-consensus's `AppliedMembership`). Over the shell, focal's
+hand-over machine produces that report (focal 27 §15.7, option (B)), and it was given only the
+point and the configuration the change left. `StateMachine::apply_change` now takes the change as
+its entry stated it, decoded once by the replica as before; the configuration before is the
+machine's own. mantle's range machine gains the same view. Test:
+`a_machine_is_given_the_change_it_applies` (`tests/shell.rs`), the context of an added learner's
+change read by the machine.

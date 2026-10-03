@@ -29,7 +29,7 @@ use hyper_durable::{
     EntryRef, Fatal, Fault, Health, LogStore, Point, StateMachine, StoreView, Write,
 };
 use hyper_raft::StorageError;
-use hyper_raft::proto::{ConfState, Entry, HardState};
+use hyper_raft::proto::{ConfChangeV2, ConfState, Entry, HardState};
 
 /// A seeded generator: SplitMix64, so a schedule replays exactly from its seed.
 #[derive(Clone, Debug)]
@@ -373,6 +373,8 @@ pub struct Kv {
     pub fenced_applied: Vec<u64>,
     /// Every entry acted on at start, ever, by index.
     pub acted: Vec<u64>,
+    /// Each change applied since the member opened, by index, with the context its entry stated.
+    pub changes: Vec<(u64, Vec<u8>)>,
 }
 
 /// What a fenced entry's data begins with: a member acts on it at its next start.
@@ -391,6 +393,7 @@ impl Kv {
             control: false,
             fenced_applied: Vec::new(),
             acted: Vec::new(),
+            changes: Vec::new(),
         }
     }
     /// What a crash leaves.
@@ -402,6 +405,7 @@ impl Kv {
             control: self.control,
             fenced_applied: Vec::new(),
             acted: Vec::new(),
+            changes: Vec::new(),
         }
     }
 }
@@ -449,10 +453,16 @@ impl StateMachine for Kv {
         answers.push((entry.index, entry.data.to_vec()));
         Ok(())
     }
-    fn apply_change(&mut self, at: Point, configuration: &ConfState) -> Result<(), Fatal> {
+    fn apply_change(
+        &mut self,
+        at: Point,
+        change: &ConfChangeV2,
+        configuration: &ConfState,
+    ) -> Result<(), Fatal> {
         if at.index != self.now.applied.index + 1 {
             return Err(Fatal("a change applied out of order"));
         }
+        self.changes.push((at.index, change.context.clone()));
         self.fenced_applied.push(at.index);
         self.now.configuration = configuration.clone();
         self.now.applied = at;

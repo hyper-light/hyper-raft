@@ -689,7 +689,9 @@ pub trait LogStore: hyper_raft::Storage {
 pub trait StateMachine {
     type Answer;
     fn apply(&mut self, entry: &Entry, answers: &mut Vec<Self::Answer>) -> Result<(), Fatal>;
-    fn apply_change(&mut self, index: u64, configuration: &ConfState) -> Result<(), Fatal>;
+    /// The change as its entry stated it, and the configuration it left.
+    fn apply_change(&mut self, at: Point, change: &ConfChangeV2, configuration: &ConfState)
+        -> Result<(), Fatal>;
     /// The index and term a restart opens at (§4.3).
     fn durable(&self) -> Point;
     /// Whether a member acts on this entry at its next start (§4.1).
@@ -884,8 +886,9 @@ and allocates no more on that project's workload.
   `Fault::Held` (§2.4). hyper-log's handle, the RAM store and the tests' stores hold nothing
   (`Infallible`). `tests/shell.rs` holds a write whose entry needs a precondition until its
   owner meets it, and stops a member between the release and the write made again.
-- **`StateMachine`** (`src/machine.rs`) applies an `EntryRef`, borrowed, with no copy; its
-  `durable` point carries its term (§4.3); `image`, `install` (durable before it returns) and
+- **`StateMachine`** (`src/machine.rs`) applies an `EntryRef`, borrowed, with no copy, and each
+  change with the change its entry stated (its context among it); its `durable` point carries its
+  term (§4.3); `image`, `install` (durable before it returns) and
   `persist` are its snapshot and compaction.
 - **`Replica`** (`src/replica.rs`): `open`, `step`, `suspect`, `trust`, `restarted`,
   `set_timing`, `deadline`, `campaign`, `propose`, `propose_fast`, `change`, `read`, `transfer`,

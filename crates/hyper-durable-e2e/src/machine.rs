@@ -6,7 +6,7 @@
 use std::collections::BTreeMap;
 
 use hyper_durable::{EntryRef, Fatal, Point, StateMachine};
-use hyper_raft::proto::ConfState;
+use hyper_raft::proto::{ConfChangeV2, ConfState};
 use hyper_raft_e2e::wire;
 
 /// What a key under which a member acts at its next start begins with.
@@ -104,7 +104,12 @@ impl StateMachine for Kv {
         Ok(())
     }
 
-    fn apply_change(&mut self, at: Point, configuration: &ConfState) -> Result<(), Fatal> {
+    fn apply_change(
+        &mut self,
+        at: Point,
+        _change: &ConfChangeV2,
+        configuration: &ConfState,
+    ) -> Result<(), Fatal> {
         self.applied = at;
         self.configuration = configuration.clone();
         Ok(())

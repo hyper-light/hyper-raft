@@ -42,27 +42,83 @@ does.
 
 Each detector is Chen, Toueg and Aguilera's NFD-E: heartbeats every `η`; the receiver trusts the
 sender while a heartbeat is fresh, freshness point `τ_i = EA_i + α` from the expected arrival
-time `EA_i`, estimated from recent arrivals. Its quality follows from the measured loss
-probability `p_L` and delay variance `V(D)` without knowing the delay distribution (Theorems 7–8):
-detection within `E(D) + α + η`, and mistakes no more often than a bound in `η`, `α`, `p_L`,
-`V(D)`.
+time `EA_i`, estimated from recent arrivals. A crash is detected within `E(D) + α + η`
+(Theorem 4), whatever delays and losses do.
 
-Chen et al. configure `η` and `α` from requirements an application states. hyper-raft has no
-such application, and a requirement it chose would be a constant it picked. Instead it chooses
-`η` and `α` to minimize what the requirements stand for, the time a group cannot commit:
+**Where it errs.** After heartbeat `h`, the latest taken, the freshness point in force is
+`τ_{h+1} = EA_{h+1} + α`, and the next heartbeat taken ends the gap it judges. The receiver
+suspects a live sender exactly when that heartbeat comes past `τ_{h+1}`: each heartbeat taken is
+the one mistake its predecessor's freshness point can make, and its lateness
+`ℓ = A − EA_{h+1}` past the expected arrival the point was set from (with any move of the
+sender's interval expected, §2.8) is the one quantity the detector compares with `α`. A slot the
+sender skipped while it was stalled, or one the network lost, is no heartbeat taken: it lengthens
+the next one's lateness and is nothing else. A sender's stall is delay, as Chen et al.'s model has
+it (a process that is slow is not crashed, and its messages are delayed), not a run of losses.
 
-    U(η, α) = (E(D) + α + η + T_E) / MTBF  +  T_E / E(T_MR)(η, α)
+**The bound, per arrival.** For latenesses of mean `μ` and variance `V`, Cantelli's one-sided
+inequality bounds `Pr(ℓ − μ ≥ x) ≤ V/(V + x²)` for any distribution with those moments, and a
+lateness past every one the estimate has seen, which no variance can know of, is counted at its
+distribution-free chance `u = 1/(m + 1)` over the estimate's `m` independent arrivals (Rényi's
+record law; §2.6, item 3):
+
+    β(α) = u + (1 − u)·V/(V + (α − μ)²)   past the mean, and 1 at or below it.
+
+One factor, whatever the heartbeats the margin holds: it assumes no independence between
+heartbeats, so any margin is admitted and no correlation time floors the interval, and it has no
+loss term, a lost heartbeat being the next one's lateness. The bound on detection still holds for a
+sender that stops for good: its last heartbeat's freshness point passes `E(D) + α + η` after its
+schedule, whatever the latenesses were.
+
+Theorem 7 bounded the mistakes through a product over the heartbeats still fresh at a freshness
+point, each factor `(V + p_L·x_j²)/(V + x_j²)`, `x_j = α − jη`, with the loss `p_L`: the detector
+judged at every freshness point, its heartbeats lost independently of their delays. On a stream
+from a host that stalls, two things defeat it (§2.9, "On real detectors", and `docs/benchmarks.md`,
+"The detector model, at its causes"). A stall is one late sender, a burst of consecutive slots it
+skipped, and counted as independent losses it fed `p_L` at 23–45 % on Linux and 6–8 % on macOS, of
+which 1–4 % was lost on the wire; every factor is at least `p_L`, so margin bought nothing. And the
+product's independence, refuted on every trace below the correlation time `T_c` (§2.6, item 6),
+held the margin to one heartbeat, `α < η − G`, a cap that left no margin at all where `G ≥ η`. Of
+3,398 configured Linux pairs, 268 got `α = 0`, a detector that suspects at every expected arrival,
+and 1,475 a `U` above one; on macOS 1 and 312 of 608. Each cause holds its share of them: with the
+wire's loss in place of the skipped slots and the cap kept, `U`'s mistake term stayed at one or more
+in 1,294 of the 1,475 Linux pairs (283 of 312 on macOS); without the cap, a margin brought it below
+one in 534 of them with the skipped slots as losses (253 on macOS) and in 1,377 with the wire's loss
+(306). The per-arrival bound has neither: each freshness point is judged by the one heartbeat that
+ends its gap. SWIM's probe detector (§2.7) keeps Theorem 7's product for its probes,
+each answered or not within its period (`qos::detector_at`).
+
+**What it minimizes.** Chen et al. configure `η` and `α` from requirements an application states.
+hyper-raft has no such application, and a requirement it chose would be a constant it picked.
+Instead it chooses `η` and `α` to minimize what the requirements stand for, the time a group cannot
+commit:
+
+    U(η, α) = (E(D) + α + η + T_E) / MTBF  +  T_E · β(α) / η
 
 The first term is a crash: detected within `E(D) + α + η`, then an election of `T_E`, once per
-`MTBF` of the leader's node. The second is a false suspicion: an election for nothing, once per
-mistake recurrence time, bounded by Theorem 7. Every input is measured: `E(D)`, `V(D)`, `p_L`
-from the link's heartbeats, `T_E` from elections (§2.3), `MTBF` from the membership's failure
-history. `η` has floors, each measured (§2.6): the timer granularity `G` (§2.4); the sender's
-stability, `η > E[flush] + G`; and Chen et al.'s independence assumption, which holds only for
-heartbeats at least the link's correlation time `T_c` apart, so `η ≥ T_c` whenever the margin
-holds more than one heartbeat.
-The minimum is found numerically each time the estimates move, as Chen et al.'s adaptive scheme
-does.
+`MTBF` of the leader's node. The second is a false suspicion: an election for nothing, at most once
+a heartbeat taken, so at most once every `η`, each with chance at most `β(α)`. Every input is
+measured: the latenesses from the link's heartbeats (§2.8, over its history, §3 item 11),
+`T_E` from elections (§2.3), `MTBF` from the membership's failure history. `η` has floors, each
+measured (§2.6): the timer granularity `G` (§2.4) and the sender's stability, `η > E[flush] + G`.
+At an interval, past the mean `U` is `y/MTBF + c·V/(V + y²)` and a constant, `y = α − μ`,
+`c = T_E(1 − u)/η`: falling while `c·2Vy/(V + y²)²`, which rises to its peak at `y = √(V/3)` and
+falls after, is past `1/MTBF`, and rising again from where it falls back, one valley, whose floor
+is found by bisection on the falling side; the better of it and `α = 0` is the margin. The interval
+is searched above its floors by golden section. The configuration is renewed as its estimates renew
+(§2.8), as Chen et al.'s adaptive scheme reconfigures.
+
+**A `U` of one or more is no configuration.** By Little's law (Little 1961: the mean number in a
+system is its arrival rate times the mean time in it, for any system in a steady state), `U` is the
+mean number of elections in progress, crash-caused and mistaken, and so bounds from above the share
+of time one is. At one or more it bounds nothing: the evidence says the group may never commit, and
+a detector configured there promises nothing at all. So the configurator admits a detector only
+below one. The detector in force is the best at the interval the link is at where its `U` is below
+one; where it is not, no margin at that interval is a configuration, and the detector in force is
+the best over every interval the floors allow, whose interval the receiver asks of the sender and
+expects at once (`LinkEstimator::expect_interval`); where even that one's `U` is one or more, there
+is none (`Refusal::Unavailable`): the detector in force stays, and the configurator is asked again
+once the estimate has renewed. A pair with no detector in force yet is judged by its node's
+evidence meanwhile (§2.8, "Judged before its own evidence").
 
 An availability target, where an operator states one, is a check on the result (`U ≤ 1 − A`),
 reported when it fails, never a parameter.
@@ -141,7 +197,22 @@ now gives the base from the detector and the span from the ballot (`docs/benchma
 - **Granularity.** A timed wait ends on the OS's timer, not when asked. `G` is the mean lateness
   of the detector's own waits, measured: the mean because the waits feed queues (the sender's
   schedule, the detector's checks) whose stability and expected delay depend on it (§2.6). It
-  floors `η`, `α` and the estimates, as RFC 6298 floors its variance term by `G`. Measured on
+  floors `η`, `α` and the estimates, as RFC 6298 floors its variance term by `G`. A wait counts
+  when the owner began it before its deadline and it ended at or past it, whatever ended it: the
+  deadline, or a message or completion that came after it, the stream then polled that late past
+  its wake while its owner waited for it (`hyper_liveness::Liveness::on_wait`). A wait that ended
+  before its deadline reached nothing, and a wake the owner came to late because its one thread
+  was in its own write is the write's lateness, which the sender's floor counts as `E[flush]`, not
+  the timer's. Taken from every poll past a wake, `G` was the owners' own stalls: 32–65 ms on macOS
+  and 15–76 ms on Linux through the stall `stalled-devices` orders, and 4.8–7.4 s in a run whose
+  timer was late by milliseconds (§2.9). Counted only where the deadline ended them, as the trace
+  recorder's are (nothing else wakes it), the waits of an owner woken past its wakes by messages
+  before its timer fired counted nothing: hyper-durable-e2e's members, asked for reports every few
+  hundred microseconds on Linux's 1 ms ticks, went without `G` and refused every heartbeat as
+  unmeasured, a group that never formed or a stalled member a peer never suspected (§2.9). A stop
+  of the process or a
+  frozen host inside a wait does count: the OS ran nothing then, and the queues the waits feed saw
+  the delay; one such wait weighs `1/n` of `n`. Measured on
   2026-10-01 (`docs/benchmarks.md`, "Heartbeat traces"):
   - **macOS 26.4.1** (Apple M5 Max). A user thread's wait ends late by half its length plus about
     10 µs: 1 ms waits 0.51 ms late at the median, 10 ms waits 2.6–5 ms. This is XNU's timer
@@ -235,7 +306,9 @@ margin under one interval holds one heartbeat, a single Cantelli bound, which ne
 independence). The configurator searches with the floors `G` and `E[flush] + G`, and searches
 again with `T_c` added when its answer has `α ≥ η` and `η < T_c`. Every configured detector
 below kept its bound on replay with this rule; without it, the bound failed at the trace's own
-interval on every run.
+interval on every run. The rule is the product's, and stands for SWIM's probes (§2.7); the
+node-pair stream bounds each freshness point by the one heartbeat that ends its gap (§2.2), which
+asks no independence, so no `T_c` floors its interval.
 
 **Item 2: NFD-E's window is `n = min(n_G, n_A)` at the configured interval.** The window trades
 the expected arrival's error against how fast it follows the link. Two measurements bound it:
@@ -307,12 +380,14 @@ On a 120 s macOS trace at 100 µs recorded with the estimator in place (2026-10-
   distribution (the first record indicator; Rényi 1962), with `m = count / τ_int` independent
   heartbeats. A heartbeat that late is to Theorem 7 as good as lost:
   `Pr(lost or later than x) ≤ p + (1 − p)·V/(V + x²)`, `p = 1 − (1 − p_L)(1 − 1/(m + 1))`, which is
-  Theorem 7's factor with `p` for `p_L`. The estimator feeds the configurator `p` as the loss, so a
-  young link's margin cannot promise better than its history excludes, and the configurator spreads
-  the margin over more heartbeats until the history has shown more. It refuses to configure until
-  it has the evidence `m` needs: two prediction errors (a variance) and a measured `τ_int` (an Allan
-  level holding Madras and Sokal's window), a few dozen heartbeats at the correlation-time floor.
-  What stays open is §3, item 3.
+  Theorem 7's factor with `p` for `p_L`. The estimator feeds a probe detector `p` as the loss
+  (`LinkEstimator::behaviour`, SWIM's, §2.7), so a young link's margin cannot promise better than
+  its history excludes. The node-pair stream's configurator takes the same count over its
+  latenesses, `u = 1/(m + 1)` beside Cantelli's factor on the lateness (§2.2), with no loss: a lost
+  heartbeat is the next one's lateness. It refuses to configure until it has the evidence `m`
+  needs: two latenesses (a variance) and a measured `τ_int` (an Allan level holding Madras and
+  Sokal's window), a few dozen heartbeats at the correlation-time floor. What stays open is §3,
+  item 3.
 
 **The configurator on the measured inputs.** With `p_L`, `E(D)` and `V(D)` from each trace, the
 floors above, `T_E` from `election_span` (three voters, two up, one-way latency the measured mean
@@ -706,26 +781,29 @@ a SWIM member probes a random peer each period and measures a round trip on its 
 acknowledgements unflushed, with indirect probes, gossip and the membership's suspicion and death;
 this stream is one-way, scheduled, flushed, per pair of consensus nodes, and its consumers are the
 core (L-2) and the shell. What the two share is in `hyper-timing` and both use it: the estimator
-(`LinkEstimator`), the configurator (`qos`), the timer fold (`Wakes`, moved out of hyper-swim for
-this), the MTBF fold (`Exposure`) and the refutation rule (`poisson95`, which was written out three
-times). The wire is the crate's own (`codec.rs`, one plane message, its first byte `KIND`), so an
+(`LinkEstimator`), the configurator (`qos`: the stream's bound per arrival, SWIM's probes'
+Theorem 7 product, §2.2), the timer fold (`Wakes`, moved out of hyper-swim for this) and the MTBF
+fold (`Exposure`). The wire is the crate's own (`codec.rs`, one plane message, its first byte `KIND`), so an
 owner multiplexing the plane tells it apart; the kernel stamps come from the owner's socket
 (hyper-tokio's `PlaneSocket`, §2.4; slates' runtime its own).
 
 **The stream.** A node sends each peer heartbeat `k` due at `σ_k = σ_{k−1} + η`, carrying its run
 (a count raised at every start, below), `k`, `η`, its stability floor `E[flush] + G`, the interval it asks of the peer, its send
 time and lateness past `σ_k`, and the flush proof. A sender behind its schedule sends the latest
-heartbeat due; those it skipped are losses to the receiver, which they are.
+heartbeat due; those it skipped are never sent, and the receiver takes them as that heartbeat's
+lateness, the stall's delay (§2.2; `PairReport::skipped` counts them).
 - **The interval** is the receiver's: its configurator's best (`Configuration::best`), asked in its
   own heartbeats (Chen et al.'s adaptive scheme), never below the sender's floor, nor below the
-  interval its own evidence needs (below, "The interval the evidence needs"). Where the floor binds
+  interval its own evidence needs (below, "The interval the evidence needs"), nor, while its node's
+  evidence judges the link and its margin at the link's interval promises nothing, below the best
+  interval that evidence gives ("Judged before its own evidence"). Where the floor binds
   (before the receiver asks, or past what it asked) the interval is the floor, followed up and not
   down: an interval below the floor is unstable (Lindley 1952), but a floor that fell is a mean that
   moved with a sample, and following it down started the receiver's estimator again at every move
   (`LinkEstimator::retime`), which kept a link whose flushes stalled now and then unconfigured for
   thousands of heartbeats (§2.9). A change within `G`, the configurator's resolution, is none.
   Bootstrap: the first heartbeat waits on the first flush, whose time is the first `E[flush]`; the
-  first wake measures `G`.
+  first wait for a wake that the owner reports measures `G` (§2.4).
 - **The interval the evidence needs** (`T_c`, measured online: §2.6 item 6 left it open). The
   estimator configures only once it has measured `τ_int` (§2.6, item 3), at Madras and Sokal's
   self-consistent window `m ≥ 6·τ̂(m)` among Allan levels of at least seven windows; heartbeats so
@@ -742,12 +820,19 @@ heartbeat due; those it skipped are losses to the receiver, which they are.
   uncertainty waits for longer levels instead of moving. A significant refusal has `τ̂` past `8/6`
   there, so each move lengthens the interval by more than a third, and a link still too correlated
   at the interval given moves again: the moves end at the first interval its history can tell apart.
-  The receiver asks at least that interval from then on (`max(best, evidence)`), never one it showed
-  it cannot measure at. On an AR(1) delay of correlation time 199 ms with heartbeats at 1 ms, which
+  The receiver asks at least that interval until the link configures (`max(best, evidence)`); from
+  the first configuration on it asks the best alone, and a refusal of a configured link moves
+  nothing: the configuration in force judges the link while its levels at the interval grow until
+  they measure `τ_int` again. Held past the first configuration, the interval asked was the longest
+  estimate every later refusal drew, a maximum of noisy estimates that grows with the refusals
+  sampled: in the simulation's world whose host freezes begin once its links configure it held a
+  link at 31 s against its configuration's best of 0.57 s, its pairs took a heartbeat every 5.6 s
+  on average against 0.32 s without it, and survivors noticed a killed peer up to 23.8 s after the
+  kill against 1.9 s (`docs/benchmarks.md`, "The detector model, at its causes"). On an AR(1) delay of correlation time 199 ms with heartbeats at 1 ms, which
   refuses at that interval past a thousand heartbeats, 64 seeds configured within 576 heartbeats, at
-  a final interval of 166 ms at the median and 1.26 s at the most (`link::tests`). The margin still
-  holds one heartbeat: the measured `T_c` is the evidence's floor, not a licence for Theorem 7's
-  product, which a young link's history cannot vouch for (below).
+  a final interval of 166 ms at the median and 1.26 s at the most (`link::tests`). The measured
+  `T_c` is the evidence's floor and nothing else: the margin's bound asks no independence of the
+  heartbeats it holds (§2.2), and the unseen share counts the window's arrivals in `τ_int`'s units.
 - **A moved interval.** A receiver that asks for a longer interval expects the next heartbeat that
   much later (`LinkEstimator::expect_interval`): until a heartbeat at the new interval comes, each
   freshness point is put back by the difference, and the stated bound counts it. Before, the
@@ -770,29 +855,31 @@ heartbeat due; those it skipped are losses to the receiver, which they are.
   new interval or a new run re-anchors it; a restarted peer's heartbeats are numbered on from its
   last run's, so the link's history, the hosts' and the path's, stays and the peer is judged at
   once). It judges the peer at the arrival first, so a freshness point that passed before a
-  heartbeat came is a suspicion in whatever order the owner feeds messages and polls. Configured
-  through `qos::configure` with `Floors { G: the receiver's measured G, sender: the sender's
-  advertised floor, correlation: unbounded }`, so the margin holds one heartbeat (`α < η`) and
-  Theorem 7's bound is a single Cantelli factor that assumes no independence, as hyper-swim judges
-  each probe (§2.7). `T_c` is the spacing past the longest stall a run saw (item 6), which a young
-  link has not seen; a first form took the link's own `τ_int·η` for it, and under a one-CPU throttle
-  the many-heartbeat margins it allowed broke their allowance in most runs (`docs/benchmarks.md`,
-  "hyper-liveness"). `T_c` measured online (above) is where a link's evidence is resolved, not the
-  spacing past every stall its host will see; whether a link may count on the product past it stays
-  open. `Costs { election: T_E from the owner (set_election, the election law's span over the
-  groups the pair shares), mtbf: the Jeffreys posterior over
-  the node time the pairs watched and the restarts and abandoned suspicions seen, seeded with the
-  fleet's history }`.
+  heartbeat came is a suspicion in whatever order the owner feeds messages and polls. Each
+  heartbeat taken has its lateness past the expected arrival the freshness point in force was set
+  from (§2.2; none for a peer's first, nor for the first of a new run, whose gap was its absence),
+  kept over the link's history (§3, item 11). Configured through `LinkEstimator::configure`, which
+  runs `qos::configure_arrivals` on those latenesses at intervals above the receiver's measured `G` and
+  the sender's advertised floor, any margin admitted, the bound one Cantelli factor on a lateness,
+  which assumes no independence: the detector in force is the best at the link's interval where
+  its `U` is below one and the best over the intervals otherwise, and there is none where that
+  one's `U` is one or more (§2.2, `Refusal::Unavailable`). Theorem 7's product, which a first form
+  allowed past the link's own `τ_int·η`, broke its allowance under a one-CPU throttle in most runs
+  (`docs/benchmarks.md`, "hyper-liveness"): its factors took the heartbeats in a margin as
+  independent, which a stall makes them not; the per-arrival bound asks it of none. `Costs
+  { election: T_E from the owner (set_election, the election law's span over the groups the pair
+  shares), mtbf: the Jeffreys posterior over the node time the pairs watched and the restarts and
+  abandoned suspicions seen, seeded with the fleet's history }`.
 - **Renewal once a configuration is as stale as its estimates are uncertain.** The configurator
-  runs when never configured, when the peer moved to the interval asked, when the heartbeats taken
-  have doubled since the last configuration, or when `β` at the margin in force has doubled past
-  the configured one. The doubling is derived, not picked: every input is estimated over the link's
-  whole history (the prediction errors' variance, the loss and its unseen term, `τ_int`'s levels,
-  the exposure the MTBF is), and an estimate over `n` heartbeats, with the one over the first `n_k`
-  nested in it, has moved since by a variance `σ²(1/n_k − 1/n)` while its own variance is `σ²/n`
-  (`σ²` per heartbeat, `τ_int` the same factor in both). The two meet at `n = 2n_k`. Renewed sooner,
-  a configuration follows moves smaller than the estimates' own error; later, it lags the evidence
-  by more than that error. The rule asks nothing of the delays' distribution, which a heavy tail
+  runs when never configured, when the peer moved to the interval asked, and when the latenesses
+  have doubled since it last ran (`LinkEstimator::reconfigure_due`); a configurator that found no
+  availability (`Refusal::Unavailable`) is asked again on the same schedule. The doubling is
+  derived, not picked: every input is estimated over the link's whole history (the latenesses'
+  moments and their unseen share, `τ_int`'s levels, the exposure the MTBF is), and an estimate
+  over `n` arrivals, with the one over the first `n_k` nested in it, has moved since by a variance
+  `σ²(1/n_k − 1/n)` while its own variance is `σ²/n` (`σ²` per arrival, `τ_int` the same factor
+  in both). The two meet at `n = 2n_k`. Renewed sooner, a configuration follows moves smaller than
+  the estimates' own error; later, it lags the evidence by more than that error. The rule asks nothing of the delays' distribution, which a heavy tail
   makes hard to estimate (a rule on an estimated standard error would need the errors' fourth
   moment). Measured against the alternatives (`docs/benchmarks.md`, "The renewal schedule"):
   hyper-swim's once a window, half a window (the same rule for an estimate over a sliding window,
@@ -802,60 +889,83 @@ heartbeat due; those it skipped are losses to the receiver, which they are.
   11 and moved the link's interval 23, 24 and 28 times against its 22, each move restarting the
   evidence at the new interval; they cost up to half again a heartbeat, allocated nothing either
   way, and detected and erred alike (suspicions of live peers 1,160 to 1,235 against allowances of
-  8,915 to 9,072 over 40 seeds; every detection test the same). The second rule's
-  factor is not derived; a link that changes, which it stands for, is §3 item 11. The allowance is
-  kept sound between configurations as far as the estimates are: each freshness point is charged
-  `β` at the margin in force from the estimates as they stand, not as the configuration assumed.
+  8,915 to 9,072 over 40 seeds; every detection test the same). The rule that stood beside the
+  doubling, `β` at the margin in force doubled past the configured one, had a factor no rule gave;
+  it is gone, and in the simulation's worlds that change the detectors keep their allowance
+  without it (§3, item 11). **The allowance** is the sum, over every heartbeat taken that ended a
+  gap a freshness point judged, of the bound that point put on the heartbeat's coming past it: `β`
+  at the margin in force on the arrivals as they stood when it came (the link's latenesses; the
+  behaviour a margin of the node's evidence was imposed from, while that margin judged; for a
+  peer's first heartbeat, the bound its judgment from the attach put on it), not as the
+  configuration assumed. Each heartbeat taken is the one mistake its predecessor's freshness point
+  can make, so the allowance is the expected number of suspicions of a peer alive throughout,
+  wherever the bound holds.
 - **The echo** (RFC 5905 §8's on-wire round trip; RFC 3550 §6.4.1's LSR and DLSR). Each heartbeat
   echoes the latest heartbeat its sender had from the receiver: that one's send time and lateness on
   the receiver's clock, and the hold since its arrival. The receiver gets the network round trip on
   its own clock, `A − s_echo − hold` (a path for the election law's ballot, `round_trip`), and the
   sum of the two directions' delays from their schedules, `round trip + late_echo + late`, which
-  bounds this heartbeat's delay since both are positive.
+  bounds this heartbeat's delay since both are positive. The hold runs from the echoed heartbeat's
+  arrival stamp. A kernel stamp is when it reached the host, so the hold covers any time it sat in
+  the socket, a stopped receiver's included, and the round trip is the path's. A stamp taken at
+  the read is when it left the socket: the hold misses the time it sat there, and the round trip
+  counts it as the path's. The E2E harnesses' members stamped at the read on every platform, and
+  a member stopped and let go left its peers' `T_E`, which their round trips to it enter, at up to
+  1.5 s on macOS and 2.1 s on Linux (§2.9); they read the kernel's stamps on Linux and macOS since, as
+  hyper-tokio's plane socket does, through its `Stamped` (a standard socket's receive with the
+  stamps, for an owner that runs no tokio). On Windows the read is all there is (§3, item 5).
 - **Judged before its own evidence: what the node measured of its links** (§3, item 10). A link
   whose own estimator has not configured is judged by the margin its node's evidence configures for
   it. That evidence is of two kinds, and the link takes the wider of them, each measure the larger
   (`Liveness::renew_evidence`, kept where either kind moves and read only for a link with no
   configuration of its own: computed at every heartbeat, it cost every configured pair three maxima
   it threw away, `docs/benchmarks.md`, "The node's evidence, kept"):
-  - *the node's pool*, one more `LinkEstimator`, fed the prediction errors `A − EA` of every link
-    without a configuration of its own, and of every link until the pool has its evidence
+  - *the node's pool*, one more `LinkEstimator`, fed the lateness of every heartbeat taken on a
+    link without a configuration of its own, and on every link until the pool has its evidence
     (hyper-swim's rule, §2.7; a pool fed by the young links alone, whose links all configured
     before it could measure, never measured, and a peer never heard from was never judged: found by
-    `a_peer_never_heard_from_is_suspected`), numbered by the heartbeats due across the links so a
-    heartbeat lost on any is a loss to it (`LinkEstimator::on_offset`). The errors carry no clock
-    offset, so links whose clocks differ pool. What it measured stands when a later stretch makes
-    its `τ_int` unmeasured again (`pool_measured`), as hyper-swim's verdict and `configure`'s
-    margin stand;
-  - *the widest configured link*: the behaviour each of the node's links configured its own
+    `a_peer_never_heard_from_is_suspected`), one an arrival (`LinkEstimator::on_lateness`). The
+    latenesses carry no clock offset, so links whose clocks differ pool. What it measured stands
+    when a later stretch makes its `τ_int` unmeasured again (`pool_measured`), as hyper-swim's
+    verdict and `configure`'s margin stand;
+  - *the widest configured link*: the arrivals each of the node's links configured its own
     detector from (`Configuration::link`), each measure the largest over the pairs that have one,
     kept at each configuration made and each pair let go.
 
-  The young link's margin is `detector_at` at its interval, costs and floors, from that behaviour
-  with the deviation scaled by `√(1 + 1/n_L)` for its window `n_L` (the prediction errors' variance
-  at a window of `n` is `V(D)(1 + 1/n)` for independent delays and the measured errors' is at least
-  `V(D)`, so the scaled variance bounds `L`'s from above, the side Cantelli's inequality may err
-  on), widened by what the link's own errors and losses show so far (their deviation, at its own
-  window already, and Jeffreys' loss over what it was sent); imposed on its estimator
-  (`LinkEstimator::impose`), renewed on the doubling schedule, at a poll as soon as the node has
-  evidence, and charged to the allowance at `β` from the behaviour it was imposed from.
+  The young link's margin is `qos::arrival_detector_at` at its interval and costs, from those
+  arrivals with the deviation scaled by `√(1 + 1/n_L)` for its window `n_L` (a lateness's variance
+  at a window of `n` is `V(D)(1 + 1/n)` for independent delays and the measured latenesses' is at
+  least `V(D)`, so the scaled variance bounds `L`'s from above, the side Cantelli's inequality may
+  err on), widened by what the link's own latenesses show so far (their mean and deviation, at its
+  own window already); put in force as a configuration of the link's own is: the best at its
+  interval while its unavailability is below one, the best over every interval the floors allow
+  where it is one or more (which promises nothing), that interval asked of the peer, none where
+  that is one or more too. Imposed at the link's interval alone, 8 of the simulation's 6,786 such
+  margins had a `U` past one, at most 1.6; in a pair's unit test, elections of a second and one
+  lateness in fifty unseen at a 10 ms interval, the margin so imposed was 1.28 s and still promised
+  nothing, where the best's is 121 ms at its longer interval
+  (`a_margin_of_the_nodes_evidence_that_promises_nothing_at_the_links_interval_is_not_its_margin`).
+  It is imposed on the link's estimator (`LinkEstimator::impose`), renewed on the doubling
+  schedule, at a poll as soon as the node has evidence, and charged to the allowance at `β` from
+  the arrivals it was imposed from.
 
-  *Why the widest, and why it keeps Theorem 7's bound.* `β = Π (V + p·x_j²)/(V + x_j²)` grows with
-  the loss `p` and with the variance `V` at every margin (each factor's derivative is `x²/(V + x²)`
-  in `p` and `x²(1 − p)/(V + x²)²` in `V`, neither negative), so a margin configured from any
-  componentwise upper bound on the young link's `(p, V)` promises a mistake bound no lower than the
-  truth's: Theorem 7's bound holds wherever the evidence bounds the link. What makes a node's
-  evidence a bound on a link it has not measured is the pool's premise, measured in §2.6: the
-  stalls are the hosts', the receiver's and the senders' alike, not the paths'. The widest
-  configured link needs no premise beyond the pool's, and dominates the pool over the same links:
-  the pool's loss is a weighted mean of its links' and the variance of its zero-mean errors a
-  weighted mean of theirs, each no more than the largest. It is the better-founded measurement
-  besides: a configured link measured itself at one interval, its `τ_int` within Madras and
-  Sokal's window and its unseen-delay term counted (§2.6, item 3), the conditions its estimator
-  refuses to configure without; the pool's levels mix links and intervals. The young link's own
-  errors widen it again, so it is never judged narrower than it has shown itself to be: in the
-  simulation's former stalling world they were wider than the node's evidence often enough to move the
-  survivors' 90th-percentile detection from 997 ms to 1,141 ms.
+  *Why the widest, and why it keeps the bound.* `β = u + (1 − u)·V/(V + (α − μ)²)` grows with the
+  unseen share `u`, the variance `V` and the mean `μ` at every margin (its derivatives in them are
+  `1 − V/(V + x²)`, `(1 − u)x²/(V + x²)²` and `(1 − u)·2Vx/(V + x²)²`, `x = α − μ`, none negative),
+  so a margin configured from any componentwise upper bound on the young link's `(u, μ, V)`
+  promises a mistake bound no lower than the truth's: the bound holds wherever the evidence bounds
+  the link. What makes a node's evidence a bound on a link it has not measured is the pool's
+  premise, measured in §2.6: the stalls are the hosts', the receiver's and the senders' alike, not
+  the paths'. The widest configured link needs no premise beyond the pool's, and dominates the pool
+  over the same links: the pool's latenesses are a mixture of its links', so their chance of
+  passing a margin is a weighted mean of the links' chances, each at most its link's bound and so
+  at most the widest's. It is the better-founded measurement besides: a configured link measured
+  itself at one interval, its `τ_int` within Madras and Sokal's window and its unseen share counted
+  (§2.6, item 3), the conditions its estimator refuses to configure without; the pool's levels mix
+  links and intervals. The young link's own latenesses widen it again, so it is never judged
+  narrower than it has shown itself to be: in the simulation's former stalling world they were
+  wider than the node's evidence often enough to move the survivors' 90th-percentile detection
+  from 997 ms to 1,141 ms.
 
   *What the pool alone missed* (the Windows E2E, every platform). With three members, a survivor
   whose leader died in its links' first heartbeats has one live link, the only feed of its pool.
@@ -932,17 +1042,28 @@ heartbeat due; those it skipped are losses to the receiver, which they are.
     held the peer suspected while its owner trusted it, and a peer that died in its links' first
     heartbeats was never reported (a pair's unit test; the simulation's worlds had not reached it).
   The simulation holds every node's owner to it after every step (`told_is_believed`).
-- **The detection bound** each suspicion states: NFD-E suspects at `τ_{h+1} = EA_{h+1} + α`, which is
-  `η + α + mean(D)` past the last heartbeat's schedule over the expected arrival's window, whatever
-  the clocks' offset; the mean of the echoed sums over the same window bounds `mean(D)`, so
-  `η + α + ⌈mean of the sums⌉` bounds the time from the sender's last schedule, and so from its
-  crash, to the suspicion. No clock synchronization or path symmetry enters it. Unstated while a
-  heartbeat in the window carried no echo.
+- **The detection bound** each suspicion states: NFD-E suspects at `τ_{h+1} = EA_{h+1} + α` on the
+  receiver's clock, and the sender's last heartbeat was due at `σ_h` on its own; the time between
+  is `τ_{h+1} − σ_h − θ`, `θ` the clocks' offset. Each echoed heartbeat `j` bounds `θ` from below:
+  its delay `A_j − σ_j − θ` is at most the sum of the two directions' delays the echo gives,
+  `S_j`, so `θ ≥ A_j − σ_j − S_j` when it came, and the clocks drift apart by at most RFC 5905's
+  `PHI` each since. So `(τ_{h+1} − σ_h) − (A_j − σ_j − S_j) + PHI/(1 − PHI)·((τ_{h+1} − A_j) +
+  (σ_h − σ_j))` bounds the time from the sender's last schedule, and so from its crash, to the
+  suspicion, for every echoed `j` of the run; the tightest is kept, its order among the `j`s the
+  same at every suspicion (`bound`). No clock synchronization or path symmetry enters it, and
+  heartbeats that carried no echo (a peer's first, before it heard from this node) leave it
+  stated. Its form before, `η + α` and the mean of the echoed sums over the expected arrival's
+  window, was unstated while any heartbeat in the window carried no echo: a survivor's suspicion of
+  a stalled member at one CPU stated none, once in twenty runs (`docs/benchmarks.md`, "Quiet only
+  while every member is heard"; `a_suspicion_states_its_bound_once_any_heartbeat_was_echoed` fails
+  on it). And it kept a ring of the window's sums a pair, the estimator's own size, which the
+  running best replaces.
 
 **The API** the core's suspicion-started elections (L-2) and the shell consume (`src/lib.rs`):
 `Liveness::new(Settings { local, run, max_peers, history })`, `run` the node's durable count of
 its starts; `attach`/`detach` a group's peer; `on_durable(write, started, durable)`; `on_heartbeat(from, message,
-arrival_ns, out)`; `poll(now, out)` and `wake()`, with `Output::{heartbeat, flush, change}`;
+arrival_ns, out)`; `on_wait(deadline, woke)`, a wait for `wake()` the owner began before it and that
+ended at or past it, whatever ended it (§2.4: what `G` is made of); `poll(now, out)` and `wake()`, with `Output::{heartbeat, flush, change}`;
 `Change::Suspected(Suspicion { peer, at_ns, noticed_ns, last: { seq, arrival_ns, due_ns, sent_ns },
 detection, detector })`, `Change::Trusted { peer, at_ns }` and `Change::Restarted { peer, at_ns }`;
 `trust(peer)`, `suspected()`,
@@ -951,12 +1072,16 @@ detection, detector })`, `Change::Trusted { peer, at_ns }` and `Change::Restarte
 `configurations`, `configured`, `judged`, `freshness`, `interval`), `set_election(peer, T_E)`,
 `flush_mean()`, `granularity()`, `floor()`, `mtbf()`.
 Every refusal is typed. The owner's contract: feed every message stamped before a time before
-polling at it (hyper-tokio's `PlaneSocket::receive_ready`); the core takes `suspect(node)`,
+polling at it, reading the clock for that time before the socket, which then holds every datagram
+stamped before it (hyper-tokio's `PlaneSocket::receive_ready`; read after the socket, a stop
+between the two left the stop's datagrams unread, and the poll suspected a peer whose heartbeat had
+come: traced in the process test once its mistakes were checked exactly); the core takes `suspect(node)`,
 `trust(node)` and `restarted(node)` from the changes (hyper-durable's `Owner::believe`).
 
 **Bounds.** Pairs at most `Settings::max_peers` (placement's), typed refusal past it; groups per pair
-a `u32`; one liveness write out at a time; per pair one boxed estimator and a ring of delay sums the
-estimator's own size (the drift bound, §2.6), both resized in place for a longer interval; per node
+a `u32`; one liveness write out at a time; per pair one boxed estimator (its ring the drift bound's
+size, §2.6, resized in place for a longer interval) and the echoes' best bound on the clocks'
+offset; per node
 one pool, an estimator at the first fed link's interval, boxed. Once each pair is configured, a
 heartbeat sent and one taken allocate nothing.
 
@@ -982,14 +1107,39 @@ a change in one node's timing moves no other source's draws. Each test's seeds a
 own, `HYPER_LIVENESS_SEEDS` of them for a soak (from the `HYPER_LIVENESS_SEED`-th); each runs until
 the facts it asserts on hold (every pair configured, every live pair through a renewal of its
 configuration, every survivor holding the victim suspected), never to a picked horizon; and every
-node's owner is held to the contract after every step. Live peers keep Theorem 7's allowance (8
-seeds); no heartbeat leaves without a newer flush made after the previous was due (with and
-without the groups' own writes); a killed peer is suspected by every survivor within the bound each
-states from the peer's last schedule (16 seeds); a stalled disk is suspected so too, and the stalled
-node still hears its live peers and keeps the allowance for them (8 seeds; the disk stalls while
-every peer trusts the node, since a peer that suspected it in a freeze just before held that
-suspicion through the stall, seed 86 of 800); a thousand groups send what one does and an unshared
-pair is silent; a restarted peer is reported restarted once by each other node, trusted again by
+node's owner is held to the contract after every step. No test decides by a confidence level. Each
+node keeps a record (`tests/support/record.rs`, the process test's members too): every heartbeat it
+fed its stream, with its run, number, kernel stamp, schedule and send, what the stream made of it
+and the trust it held of the peer after; every poll that told a change, moved a trust or came at or
+past a point a peer was held trusted to; every change told; every heartbeat sent. Every suspicion
+in the records is traced to NFD-E's rule exactly: its heartbeat is the latest the node took from
+the peer before the call that told it (or the one that call took, where it came at or past its own
+successor's point, a configuration the take made having restated it); its freshness point is the one
+the stream held the peer trusted to before that call (where it held none, the point the margin
+given in that call set); the call came at or past the point and noticed it then; and no heartbeat of
+the peer's taken after was stamped before the point. Every heartbeat and every poll at or past the
+point a peer was held trusted to told its suspicion there, so none is missed. Every count a node's
+report states of a peer (the suspicions, the heartbeats taken, refused for their proof and sent, the
+slots skipped) is its record's, after every step of the simulation and at every state line of the
+process test. What became of the heartbeat each point awaited is reported: taken late and how late,
+its slot skipped by its sender, refused, lost, a new run's, none sent. The suspicions of live peers
+against their allowance are the model's figures, reported (`docs/benchmarks.md`), never asserted,
+since no run's count tests a bound on an expectation. A stream made to suspect 20 ms early, to
+judge at half its polls, to drop one heartbeat in five it says it took, or to leave a suspicion
+uncounted fails the trace or the count at once. Live peers configure and are
+trusted (8 seeds); no heartbeat leaves without a newer flush made after the previous was due (with
+and without the groups' own writes); a killed peer is suspected by every survivor within the bound
+each states from the peer's last schedule (16 seeds); a stalled disk is suspected so too, and the
+stalled node still hears its live peers (8 seeds; the disk stalls while every peer trusts the node,
+since a peer that suspected it in a freeze just before held that suspicion through the stall, seed
+86 of 800); a sender behind its schedule for every other slot, at a receiver whose timer is late
+past the interval, has a margin past the skipped slot configured, an unavailability below one, and
+no suspicion once configured (`a_sender_that_skips_slots_is_late_not_lost`: under the product
+bound it was fed half its slots as losses and configured `α = 0`, `U` 10); an owner whose every
+wait for a wake a message ends 300 µs past it, before its 1 ms timer, has `G` 300 µs from the first
+and takes every heartbeat, where counted only as the timer ended them none counts and every
+heartbeat is refused (`a_wait_a_message_ends_past_its_wake_measures_the_wake`); a thousand groups
+send what one does and an unshared pair is silent; a restarted peer is reported restarted once by each other node, trusted again by
 the detector in force and counted, its old run's last heartbeat refused as stale; every refusal.
 Problem 1 and item 10, over seeds 0 to 31 in each of three worlds, macOS, macOS with its groups
 keeping its log busy (its flushes back to back) and Linux in its VM
@@ -1014,7 +1164,10 @@ sealed plane through hyper-tokio's kernel-stamped socket, each liveness write a 
 platform flush of a real file: one member's disk is stalled (its device thread stops completing
 flushes) and every other suspects it within its stated bound from the last schedule, on the host's
 monotonic clock, which the processes share; then one is SIGKILLed and every survivor suspects it so;
-live members keep the allowance. A second group of three kills a member as soon as it has heard
+each member traces every suspicion it makes to the detector's rule as it happens, from its kernel
+stamps (the first heartbeat it takes from the peer after the one the suspicion judged from was
+stamped no earlier than the freshness point), and one that does not trace fails the test; the live
+members' suspicions against their allowance are reported. A second group of three kills a member as soon as it has heard
 every peer and sent to each, and each survivor suspects it no later than its first poll past its
 freshness point (plus the latest lateness of its wakes) and the state line in which it stated its
 live link configured. The test derives nothing; it waits on facts, each for as long as the members
@@ -1377,6 +1530,44 @@ hyper-raft-e2e's had, each failing on CI once in a way a re-run passed:
   failed 5 of 5 that way on macOS; counted as listened, the held supervisor passes 5 of 5, deaf
   3.01 s at most, and beside the same load 40 of 40 passed, the supervisor deaf up to 6.08 s at
   once (`docs/benchmarks.md`, "Quiet only while every member is heard").
+- **hyper-durable-e2e's `kill`, no `G` where messages end the waits** (2026-10-03, over
+  `dc42e0e`). In Docker's Linux, one scenario a run failed at one, two and four CPUs ("a write was
+  never answered" or "the stalled member was not suspected by every other"; "nothing moved for 1s"),
+  each time with a member at its start that had taken no heartbeat, its pairs unjudged. The owners
+  reported to the stream only the waits their deadline ended, as `on_wait` asked (§2.4). The test
+  asks each member for its report back to back, and on the VM's 1 ms tick a timer ends a wait
+  0.12 ms to past 1 ms late (`worlds::LINUX_TIMER`), so nearly every wait for the stream's wake
+  ended on an ask, before or past its deadline. With no wait counted, `G` stayed unmeasured, and the
+  stream refuses every heartbeat until it is measured (`Refusal::Unmeasured`: the estimator's ring
+  and window are `G`'s): nothing taken, nothing judged, no timing derived, no campaign. A diagnostic
+  build (counters in the member, not committed) ran the test three times at two CPUs and failed all
+  three (`stall-leader`, `stalled-devices`, `flush-leader`): 11 of 59 member processes went a second
+  or more without `G`, one through 21,901 waits for its wake, none of them ended on its timer, and
+  the runs refused 4,020, 2,575 and 2,370 heartbeats as unmeasured. On main every poll past a wake
+  was a sample. A wait the owner began before the wake and that ended at or past it, whatever ended
+  it, now counts (§2.4): the E2E members report it as the wait ends, before what it brought is fed
+  (`receive_until`), the process test's member likewise, and the simulation's owner reports a wait
+  an arrival or a completion ended past its wake. With it the same build passed three runs of
+  three, `G` measured a median 108–143 ms into a member's start, 51, 9 and 18 heartbeats refused in
+  all (`docs/benchmarks.md`, "`G` from every wait that reached its wake").
+- **The E2E members polled their streams past what they had read** (2026-10-03, over `09e8316`).
+  hyper-raft-e2e's `cluster` on that head, once in Docker's Linux at each of four, two and one CPUs
+  beside main's runs, counted 465 and 392 suspicions in `stalled-devices` at four and two CPUs,
+  against main's 19 and 124, and the leader killed in `leader-killed` was in term 19 and 29, against
+  main's 9 and 13. Both members polled the stream at the top of their loop, after their drive, which
+  a write of the log holds as long as the device takes, and again after a drain that a turn's budget
+  may have cut with datagrams left. `Liveness::poll` asks that every datagram stamped before the
+  time it is polled at be fed first (§2.8): stamped as they were read (main), unread heartbeats had
+  no stamp yet and the rule held of itself; stamped by the kernel (`dc42e0e`), a heartbeat that came
+  in time and sat unread was a suspicion. A scratch diagnostic on macOS (prints in the member, not
+  committed) showed the suspicions told 113–203 ms after the member's last drain, the next heartbeat
+  taken stamped before the suspicion's point. The members now read the clock, drain the socket, and
+  poll at that clock only when the drain emptied it; a drain cut at its budget polls nothing, and
+  the next that empties the socket does. Each member counts the suspicions it told while a heartbeat
+  stamped before their point sat unread, found as that heartbeat is taken (`Report::unread`), and
+  both tests hold every report's count to zero, exactly. On `09e8316`'s loops the count failed both
+  tests on macOS in `member-stopped`: 35 in hyper-raft-e2e's member stopped 3 s, 4 in
+  hyper-durable-e2e's; with the loops so, both tests passed whole, every count zero.
 
 **What the runs measured of the detectors** (every scenario prints, for each member, its floors,
 longest flush and longest time between two reads of its socket, and for each pair what the
@@ -1434,7 +1625,8 @@ pairs, macOS first:
   the member cut off, and those of leader-killed, follower-restarts, all-killed and member-stopped
   the true ones of the members killed or stopped.
 - **A member stopped and let go.** The heartbeats that waited in a socket's buffer through the stop
-  are stamped as they are read, so the round trips both ends measured took in the stop, and their
+  are stamped as they are read (the kernel's stamps since, §2.8, "The echo"), so the round trips
+  both ends measured took in the stop, and their
   law's `T_E` at the scenario's end stood at 0.06–1.5 s on its peers and 2.9–5.7 s on the member
   stopped on macOS, 0.01–2.1 s and 0.4–6.6 s on Linux.
 The detectors keep their bound, and the bound is loose; the configurator, minimizing `U` with
@@ -1487,8 +1679,9 @@ and election law; the remaining items keep their numbers, and item 10 is what L-
 - **3. The first variance, in part.** A link with no history underestimates `V(D)` by an order of
   magnitude until it has seen a stall (§2.6), and Theorem 7's bound with too small a variance is
   not a bound. Closed by L-1: a delay past everything the history has seen, which no variance
-  estimate can know of, is counted with the loss at its distribution-free probability
-  `1/(m + 1)` (§2.6), and the estimator refuses to configure before `τ_int` is measured. Open: the
+  estimate can know of, is counted at its distribution-free probability `1/(m + 1)` (§2.6; for the
+  node-pair stream a lateness past every one in its window, beside Cantelli's factor, §2.2), and
+  the estimator refuses to configure before `τ_int` is measured. Open: the
   sampling error of the variance within the range seen, which a heavy tail skews low. On synthetic
   traces of the recorded macOS shapes (`crates/hyper-timing/tests/replay.rs`), 40 seeds of 2, 10
   and 60 minutes each kept Theorem 7's bound with the unseen term and also without it, the term
@@ -1505,8 +1698,10 @@ and election law; the remaining items keep their numbers, and item 10 is what L-
   but its receive stamps are attached by a NIC miniport driver that reports timestamping
   capabilities, with system configuration, and on no loopback path or virtual NIC. hyper-tokio
   therefore stamps a Windows datagram when it is read (§2.8, `docs/transport.md` §4b): its read
-  delay is counted as the sender's, in the delays the detector measures and so in its margin. Open:
-  every measurement of §2.6 on Windows, that read delay among them.
+  delay is counted as the sender's, in the delays the detector measures and so in its margin, and
+  in the round trip of an echo of it (§2.8, "The echo": a receiver stopped with heartbeats in its
+  socket gives its peers a round trip that holds the stop). Open: every measurement of §2.6 on
+  Windows, that read delay among them.
 - **8. Strict timers.** A finer `G` shortens detection and costs power; on a laptop on battery
   that trade is measured, not assumed. On Windows the request is `timeBeginPeriod`; on macOS a
   timer with no leeway (real-time or critical urgency, or a strict dispatch timer), without which
@@ -1568,32 +1763,59 @@ and election law; the remaining items keep their numbers, and item 10 is what L-
   errors widen the margin as they come, but a peer that dies first has shown few), and while a
   history is young the allowance is loose (item 3).
 
-- **11. A link that changes.** Every estimate the configurator reads is over the link's whole
-  history, which is what makes the doubling the right renewal (§2.8) and its configurations few.
-  It is also what makes a link that changes slow to be followed: once `V` has a history of `n`
-  heartbeats, a regime of `V' = rV` from heartbeat `n_c` on moves it to
-  `(n_c V + (n − n_c)V')/n`, so the change counts fully only once the new regime is most of the
-  history, and the doubling's renewals grow as far apart as the history is long. Between them the
-  allowance is charged `β` from the same estimates, so on a link that got worse it understates the
-  bound the new regime would give, and the mistakes counted against it are the new regime's. The
-  `β`-doubled rule stands for this case today, with a factor no rule gives: `V̂`'s relative standard
-  error is `√((κ − 1)τ_int/n)` for errors of kurtosis `κ`, so at `n = 1,000` independent heartbeats
-  a doubling of `V` is 1.7 standard errors for delays of the kurtosis the 1 ms macOS trace measured
-  (357, its freezes) and 22 for Gaussian ones.
-  What the literature does: Chen, Toueg and Aguilera re-estimate `p_L` and `V(D)` from the `n`
-  most recent heartbeats and leave `n` open (`docs/research/timing.md`); the estimator's own
-  Allan levels measure the horizon past which averaging stops helping (`n_A`, §2.6), the
-  stationarity horizon such an `n` would be; and the staleness rule above, for an estimate over a
-  sliding window of `n`, renews every `n/2` heartbeats. A change-point test on the prediction
-  errors (Page's CUSUM, Biometrika 41, 1954) would need a stated average run length, a picked
-  number. The design to build and measure: estimate `V` and the loss over a sliding window of the
-  Allan horizon (a second ring beside the offsets', bounded by the same drift bound), renew every
-  half window by the staleness rule, and drop the `β` rule, which the window's renewals subsume;
-  measured in the simulation on worlds that change (a host whose freezes begin after its links
-  configure, a path whose delays step), for the mistakes against the allowance, the detection and
-  the cost, against the history estimate. hyper-swim's verdict, renewed once a window over
-  estimates of the whole history, renews oftener than the staleness rule asks and is as slow to
-  follow a change; the same design serves it.
+- **11. A link that changes. Measured: the history stays, the `β` rule goes.** Every estimate the
+  configurator reads is over the link's whole history, which is what makes the doubling the right
+  renewal (§2.8) and its configurations few, and what makes a link that changes slow to be
+  followed: once `V` has a history of `n` heartbeats, a regime of `V' = rV` from heartbeat `n_c` on
+  moves it to `(n_c V + (n − n_c)V')/n`, so the change counts fully only once the new regime is
+  most of the history. The `β`-doubled rule stood for this case, with a factor no rule gave
+  (`V̂`'s relative standard error is `√((κ − 1)τ_int/n)` for errors of kurtosis `κ`: at
+  `n = 1,000` independent heartbeats a doubling of `V` is 1.7 standard errors for the kurtosis of
+  the 1 ms macOS trace, 357, and 22 for Gaussian delays). Chen, Toueg and Aguilera re-estimate from
+  the `n` most recent heartbeats and leave `n` open (`docs/research/timing.md`); the estimator's own
+  Allan levels measure the horizon past which averaging stops helping; and the staleness rule, for
+  an estimate over a sliding window of `n`, renews every `n/2`. That design was built with the
+  per-arrival bound (§2.2) and measured on 2026-10-03: the latenesses over a window sliding at the
+  stationarity horizon the link's levels show (the longest level within the least deviation's
+  tolerance before a longer one rises past it; the whole history where none rises), kept in
+  half-window blocks combined by Chan, Golub and LeVeque's formulas, renewed at each block's close,
+  the `β` rule dropped. Against it, the history with the doubling, the `β` rule dropped too, both
+  with the evidence interval held until the first configuration (§2.8). In the simulation, worlds
+  that change once every pair has configured (a calm macOS host whose freezes then begin; Linux's
+  one-way delays stepping tenfold), 16 seeds of four nodes, every node's MTBF held at an hour or a
+  day by a seeded fleet history of a thousand failures (left to the run's own exposure, the MTBF
+  grew with each run's length and the comparisons followed it), after the change
+  (`docs/benchmarks.md`, "The detector model, at its causes"):
+
+  | world, MTBF | estimate | suspicions of live peers / allowance | a pair's an hour | mean spacing | a killed peer noticed (median / 90th / most) | `U` realized |
+  |---|---|---|---|---|---|---|
+  | freezes begin, an hour | history | 111 / 1,285 | 1.92 | 0.90 s | 1.52 / 1.86 / 2.09 s | 4.5·10⁻⁴ |
+  | | sliding window | 614 / 15,563 | 2.40 | 1.65 s | 2.92 / 5.81 / 22.6 s | 1.1·10⁻³ |
+  | delays step, an hour | history | 10 / 1,185 | 0.32 | 0.43 s | 0.65 / 1.08 / 1.40 s | 2.1·10⁻⁴ |
+  | | sliding window | 38 / 6,906 | 0.45 | 0.63 s | 1.02 / 1.86 / 2.83 s | 3.0·10⁻⁴ |
+  | freezes begin, a day | history | 0 / 1,482 | 0 | 2.95 s | 4.55 / 7.14 / 8.16 s | 5.7·10⁻⁵ |
+  | | sliding window | 365 / 24,611 | 0.16 | 6.58 s | 10.3 / 26.6 / 101 s | 1.6·10⁻⁴ |
+  | delays step, a day | history | 16 / 1,481 | 0.06 | 1.42 s | 2.54 / 4.04 / 5.20 s | 3.0·10⁻⁵ |
+  | | sliding window | 25 / 19,116 | 0.02 | 3.23 s | 5.15 / 9.41 / 45.9 s | 7.4·10⁻⁵ |
+
+  "`U` realized" is the measured unavailability: the elections the mistakes caused
+  (`T_E` times the suspicions a second) and those a crash costs (the mean time to notice it plus
+  `T_E`, once an MTBF). The history did better on every row: fewer suspicions in all four, a crash
+  noticed 1.6 to 2.3 times sooner at the median and 2 to 12 times at the most, and `U` 1.5 to 2.8
+  times lower, its allowance 12 to 119 times its suspicions (one row had none) against the
+  window's 25 to 765.
+  The window's cause: its unseen share counts only the window's arrivals, `u ≥ 1/(m_w + 1)`, which
+  floors `β` at every margin, and the configurator bought that floor down with longer intervals and
+  wider margins. And its horizon is read on levels that keep the whole history at the interval, so
+  once a change has shown in them the window never grows back while the link stays at its interval,
+  however long the new regime holds. The history's promise just after a change is the looser
+  argument (its old latenesses are not exchangeable with the new ones, so its unseen share
+  understates a record's chance until the history has doubled past the change), but it kept its
+  allowance on every row, and the doubling renews it as the new regime fills the history. So the
+  estimate stays over the history, renewed at each doubling, and the `β` rule is gone. A change-point
+  test on the latenesses (Page's CUSUM, Biometrika 41, 1954) would need a stated average run length,
+  a picked number. hyper-swim's verdict, renewed once a window over estimates of the whole history,
+  is as slow to follow a change.
 - **12. A campaign on a wrong suspicion.** The election law's expected time to a leader takes the
   suspicion as right: the span minimizes it for a leader that is gone (§2.3). A campaign on a wrong
   suspicion costs what the law does not count: the member knows no leader from its pre-vote until
@@ -1608,7 +1830,8 @@ and election law; the remaining items keep their numbers, and item 10 is what L-
 
 - **L-1** in `hyper-timing`, sans-io, done. `qos.rs` holds the Theorem 7 bound, the configurator
   and the split-vote span, each checked against a brute-force search and the split probability
-  against a Monte Carlo; the configurator takes the measured floors (`Floors`: `G`, `E[flush] + G`,
+  against its order statistic's law, exactly (rationals, every group of two to seven voters); the
+  configurator takes the measured floors (`Floors`: `G`, `E[flush] + G`,
   `T_c`) and searches both regimes, one heartbeat in the margin at the base floors and any margin at
   `η ≥ T_c`, keeping the better, and `detector_at` gives the best margin at the interval a link
   sends at now. `link.rs` holds the estimator the traces specified (§2.6): `LinkEstimator`, NFD-E's
@@ -1631,8 +1854,9 @@ and election law; the remaining items keep their numbers, and item 10 is what L-
   the datagram plane, shared by every group the pair shares and silent for a pair that shares none;
   each heartbeat proving a durable flush made after the previous was due; stamped on receipt by the
   kernel through hyper-tokio's plane socket (`SO_TIMESTAMPNS` on Linux, `SO_TIMESTAMP_MONOTONIC` on
-  macOS, read-time on Windows, item 5); each pair's NFD-E estimator configured by `qos::configure`
-  from measured floors on a doubling schedule; each suspicion stating its bound from the echoed
+  macOS, read-time on Windows, item 5); each pair's NFD-E estimator configured from measured
+  floors, by `qos::configure_arrivals` over its latenesses since 2026-10-03 (§2.2, §3 item 11),
+  renewed as the window renews; each suspicion stating its bound from the echoed
   round trips. A heartbeat allocates nothing once configured and costs 0.7 to 1.0 µs of the crate's
   work; per node, the stream's cost does not grow with the groups (`docs/benchmarks.md`,
   "hyper-liveness"). Its follow-ups (§2.9) done: every link configures or is judged by its node's

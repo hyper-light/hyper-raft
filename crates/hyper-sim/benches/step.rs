@@ -521,6 +521,24 @@ mod live {
         /// Heartbeats sent: the unit the two harnesses are compared in, since their schedules
         /// (drawn from different generators) differ in how many steps a heartbeat takes.
         pub(super) sent: u64,
+        /// The wake the owner's timer was set to, and whether it was set before it: the wait that
+        /// reaches the wake, by the timer or by what came after it, is then reported to the stream
+        /// (`Liveness::on_wait`).
+        pub(super) armed: Option<(u64, bool)>,
+    }
+
+    /// `node`'s owner woken at `now` by what came: a wait it began before the stream's wake that
+    /// this ends at or past the wake is reported, whatever ended it (`Liveness::on_wait`), and
+    /// its timer is spent.
+    fn woken(node: &mut Node, now: u64) {
+        if let Some((deadline, began_before)) = node.armed
+            && deadline <= now
+        {
+            node.armed = None;
+            if began_before {
+                node.liveness.on_wait(deadline, now);
+            }
+        }
     }
 
     fn nodes() -> Vec<Node> {
@@ -551,6 +569,7 @@ mod live {
                     disk_busy_until: 0,
                     suspicions: 0,
                     sent: 0,
+                    armed: None,
                 }
             })
             .collect()
@@ -695,6 +714,8 @@ mod live {
                 }
             }
             best.map(|(at, i)| {
+                // The timer is set at the present: before its deadline, or past it.
+                self.nodes[i].armed = Some((at, at >= self.now));
                 (
                     at.max(self.now) + super::LATE.0 + self.noise.below(super::LATE.1),
                     i,
@@ -727,6 +748,11 @@ mod live {
                     alloc::back();
                     self.handle(event);
                 } else if let Some((_, node)) = wake {
+                    let now = self.now;
+                    let n = &mut self.nodes[node];
+                    if let Some((deadline, true)) = n.armed.take() {
+                        n.liveness.on_wait(deadline, now);
+                    }
                     self.poll(node);
                 }
                 if self.now >= self.elected_at {
@@ -740,6 +766,7 @@ mod live {
                 Event::Arrive { to, from, bytes } => {
                     let now = self.now;
                     let n = &mut self.nodes[to];
+                    woken(n, now);
                     let _ = n
                         .liveness
                         .on_heartbeat(from as u64 + 1, &bytes, now, &mut n.owner);
@@ -753,6 +780,7 @@ mod live {
                 } => {
                     let now = self.now;
                     let n = &mut self.nodes[node];
+                    woken(n, now);
                     n.liveness.on_durable(write, started, now);
                     n.liveness.poll(now, &mut n.owner);
                     self.drain(node);
@@ -891,6 +919,8 @@ mod live {
                 }
             }
             let wake = self.nodes[node].liveness.wake();
+            let now = self.world.now();
+            self.nodes[node].armed = wake.map(|at| (at, at >= now));
             alloc::aside();
             self.world.wake(self.ids[node], wake).unwrap();
             alloc::back();
@@ -914,7 +944,14 @@ mod live {
                 alloc::back();
                 match step {
                     Step::Event { event, .. } => self.handle(event),
-                    Step::Wake { node } => self.poll(node.0 as usize),
+                    Step::Wake { node } => {
+                        let (now, node) = (self.world.now(), node.0 as usize);
+                        let n = &mut self.nodes[node];
+                        if let Some((deadline, true)) = n.armed.take() {
+                            n.liveness.on_wait(deadline, now);
+                        }
+                        self.poll(node);
+                    }
                     Step::Idle | Step::Spent => break,
                 }
                 let now = self.world.now();
@@ -929,6 +966,7 @@ mod live {
             match event {
                 Event::Arrive { to, from, bytes } => {
                     let n = &mut self.nodes[to];
+                    woken(n, now);
                     let _ = n
                         .liveness
                         .on_heartbeat(from as u64 + 1, &bytes, now, &mut n.owner);
@@ -941,6 +979,7 @@ mod live {
                     started,
                 } => {
                     let n = &mut self.nodes[node];
+                    woken(n, now);
                     n.liveness.on_durable(write, started, now);
                     n.liveness.poll(now, &mut n.owner);
                     self.drain(node);

@@ -10,6 +10,8 @@
 //! - a member started again is reported restarted to every other member's core;
 //! - a group whose devices all stall goes on once they do;
 //! - every write a member keeps waiting is one an apply will answer (each report's `stray`).
+//! - every suspicion is the member's stream's: none was told while a heartbeat the kernel stamped
+//!   before its point sat unread in the member's socket (each report's `unread`).
 //!
 //! The members elect by suspicion on their own failure detectors: each runs the node-pair
 //! liveness stream (`hyper_liveness`, timing step L-3) and takes its words to its core, with the
@@ -295,6 +297,14 @@ impl Cluster {
             "{}: member {id} keeps writes no apply will answer: {report:?}",
             self.name
         );
+        // Every suspicion is the stream's: none told while a heartbeat the kernel stamped before
+        // its point sat unread in the member's socket.
+        assert_eq!(
+            report.unread, 0,
+            "{}: member {id} suspected a peer whose heartbeat, stamped before the point, it had \
+             not read: {report:?}",
+            self.name
+        );
         let law = quiet::law(
             report.detection_ns,
             report.unjudged_interval_ns,
@@ -501,9 +511,10 @@ impl Cluster {
         agreed.get()
     }
     /// What every member up says its detectors measured and were configured to, a line a pair:
-    /// what the configurator was fed (`p_L`, `E(D)`, `√V(D)`), the detector in force (`η`, `α`,
-    /// the mistake recurrence it promises, the unavailability it was chosen for), and the pair's
-    /// suspicions against Theorem 7's allowance for a peer alive throughout.
+    /// the heartbeats it sent the peer and the slots it skipped, what the configurator was fed (the
+    /// arrivals' unseen share, their mean lateness and its deviation), the detector in force (`η`,
+    /// `α`, the mistake recurrence it promises, the unavailability it was chosen for), and the
+    /// pair's suspicions against the allowance its detectors promised for a peer alive throughout.
     fn detectors(&mut self) -> String {
         let ms = |ns: u64| ns as f64 / 1e6;
         let looks = self.quiet.seen();
@@ -549,16 +560,17 @@ impl Cluster {
                     "unjudged"
                 };
                 out.push_str(&format!(
-                    "\n    {id}->{}: {own}, {} configurations, {} sent, {} taken, {} refused unproven; fed p_L {:.4}, \
-                     E(D) {:.3} ms, sd {:.3} ms; eta {:.3} ms, alpha {:.3} ms, recurrence {:.1} ms, U {:.2e}; \
-                     {} suspicions, allowance {:.2}",
+                    "\n    {id}->{}: {own}, {} configurations, {} sent, {} skipped, {} taken, {} refused unproven; \
+                     fed unseen {:.4}, lateness {:.3} ms, sd {:.3} ms; eta {:.3} ms, alpha {:.3} ms, \
+                     recurrence {:.1} ms, U {:.2e}; {} suspicions, allowance {:.2}",
                     pair.peer,
                     pair.configurations,
                     pair.sent,
+                    pair.skipped,
                     pair.taken,
                     pair.unproven,
-                    pair.loss,
-                    ms(pair.mean_delay_ns),
+                    pair.unseen,
+                    ms(pair.lateness_ns),
                     ms(pair.deviation_ns),
                     ms(pair.interval_ns),
                     ms(pair.margin_ns),

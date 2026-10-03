@@ -111,8 +111,8 @@ fn paths<P>(new: impl Fn() -> P, sample: impl Fn(&mut P, u64)) -> Vec<P> {
 mod hyper {
     use super::*;
     use hyper_timing::{
-        Ballot, Costs, ElectionTimer, ElectionTiming, Floors, LinkBehaviour, PathRtt, RoundAnchors,
-        RoundBudget, TickPace, configure, quorum_priority,
+        Arrivals, Ballot, Costs, ElectionTimer, ElectionTiming, PathRtt, RoundAnchors, RoundBudget,
+        TickPace, configure_arrivals, quorum_priority,
     };
 
     /// The correlation time macOS measured at 100 µs heartbeats (`docs/timing.md` §2.6, item 6).
@@ -136,21 +136,17 @@ mod hyper {
         let ballot = Ballot::measure(&paths, VOTERS, Duration::ZERO, GRANULARITY).unwrap();
         let span = ballot.span(GRANULARITY).unwrap();
         // The link to the leader, as the paths see it one way, configured once.
-        let link = LinkBehaviour {
-            loss: 1e-5,
+        let link = Arrivals {
+            unseen: 1e-5,
+            lateness: Duration::ZERO,
+            deviation: Duration::from_millis(2),
             mean_delay: ballot.latency,
-            delay_deviation: Duration::from_millis(2),
         };
         let costs = Costs {
             election: span.election,
             mtbf: Duration::from_secs(30 * 86_400),
         };
-        let floors = Floors {
-            granularity: GRANULARITY,
-            sender: GRANULARITY,
-            correlation: CORRELATION,
-        };
-        let detector = configure(&link, &costs, &floors).unwrap();
+        let detector = configure_arrivals(&link, &costs, GRANULARITY, GRANULARITY).unwrap();
         let timing = ElectionTiming::derive(heartbeat, &detector, &span, &ballot);
         match operation {
             "sample" => {

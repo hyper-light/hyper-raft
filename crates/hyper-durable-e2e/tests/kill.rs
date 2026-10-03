@@ -16,7 +16,9 @@
 //! - a group whose survivors' devices hold their flushes while they elect goes on once they do;
 //! - a member stopped mid-scenario fails the wait for what it cannot do, named, and once let go
 //!   applies the same history;
-//! - a member started again is reported restarted to every other member's core.
+//! - a member started again is reported restarted to every other member's core;
+//! - every suspicion is the member's stream's: none was told while a heartbeat the kernel stamped
+//!   before its point sat unread in the member's socket (each report's `unread`).
 //!
 //! The members' failure detectors are their own: each runs the node-pair liveness stream
 //! (`hyper_liveness`, timing step L-3) and takes its words to its replica, and the test tells no
@@ -311,6 +313,14 @@ impl Cluster {
         control::put_order(&mut self.buffer, ask, &Order::Report);
         let body = self.exchange(id, ask)?;
         let report = control::read_report(&body, hyper_raft::MAX_MEMBERS).map(|(_, r)| r)?;
+        // Every suspicion is the stream's: none told while a heartbeat the kernel stamped before
+        // its point sat unread in the member's socket.
+        assert_eq!(
+            report.unread, 0,
+            "{}: member {id} suspected a peer whose heartbeat, stamped before the point, it had \
+             not read: {report:?}",
+            self.name
+        );
         let law = quiet::law(
             report.detection_ns,
             report.unjudged_interval_ns,

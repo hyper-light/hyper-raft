@@ -93,7 +93,11 @@ impl PlaneSocket {
 
     /// Opens every datagram already queued on the socket, without waiting: what an owner feeds its
     /// detectors before it judges a deadline, since a datagram stamped before the deadline counts
-    /// however late it is read. At most [`crate::TURNS`] batches; returns how many datagrams.
+    /// however late it is read. The kernel is asked, not the reactor, whose readiness is as of its
+    /// last turn: a datagram that came through a stop of the process was in the socket, stamped
+    /// before the owner's time, while the reactor said it was empty, and the owner, fed nothing,
+    /// suspected the datagram's sender (hyper-liveness's process test, its mistakes traced). At most
+    /// [`crate::TURNS`] batches; returns how many datagrams.
     pub fn receive_ready(
         &mut self,
         plane: &mut Plane,
@@ -102,7 +106,7 @@ impl PlaneSocket {
     ) -> Result<usize, Error> {
         let mut total = 0usize;
         for _ in 0..crate::TURNS {
-            let count = self.socket.receive(|arrival, datagram| {
+            let count = self.socket.receive_queued(|arrival, datagram| {
                 deliver(arrival, plane.open(datagram, fence));
             })?;
             if count == 0 {

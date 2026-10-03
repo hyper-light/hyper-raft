@@ -13,9 +13,11 @@
 //! the log made a write durable after the previous was due: where the group wrote none, the member
 //! writes its hard state again ([`Wal::prove`]), on the same file, so a disk that stops stops the
 //! heartbeats with it. Heartbeats travel as the test's control datagrams
-//! ([`stream::put_heartbeat`]), stamped when the member reads them, as hyper-tokio stamps a
-//! datagram where the kernel cannot (`docs/timing.md` §3, item 5): the read delay counts as the
-//! sender's. A member cut off ([`Control::Isolate`]) drops its heartbeats in and out with its Raft
+//! ([`stream::put_heartbeat`]), stamped by the kernel when they arrived on Linux and macOS, as
+//! hyper-tokio's plane socket stamps them (`hyper_tokio::Stamped`), and when they are read on
+//! Windows, where the kernel cannot (`docs/timing.md` §3, item 5): a heartbeat that waited in a
+//! stopped member's socket is then echoed with a hold that covers the stop, and its peers' round
+//! trips are the path's. A member cut off ([`Control::Isolate`]) drops its heartbeats in and out with its Raft
 //! messages, so its detectors and its peers' see the cut.
 //!
 //! A write is answered once it is committed and applied, so an answered write is on a majority
@@ -26,10 +28,10 @@
 //! entry that holds it, so the log holds each write once ([`Wal`]'s bound).
 use std::{
     collections::BTreeMap,
-    io::ErrorKind,
+    io::{self, ErrorKind},
     net::{SocketAddr, UdpSocket},
     sync::atomic::{AtomicBool, Ordering},
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use hyper_liveness::{Change, Liveness, PeerId, Settings as LiveSettings, Write as LiveWrite};
@@ -39,6 +41,7 @@ use hyper_raft::{
     wire::Record,
 };
 use hyper_timing::{Exposure, Trust};
+use hyper_tokio::{Stamped, Taken};
 
 use crate::{
     stream::{self, Asked, Report},
@@ -228,7 +231,8 @@ pub struct Node {
     datagram: usize,
     command: Vec<u8>,
     /// The member's clock's origin: its times are nanoseconds since.
-    epoch: Instant,
+    /// The socket's receive stamps and the clock they are on, which is the member's.
+    stamped: Stamped,
     /// The node-pair liveness stream.
     liveness: Liveness,
     /// The peers the stream was told the group shares, in order.
@@ -237,6 +241,12 @@ pub struct Node {
     asked: Asked,
     /// The restarts of its peers the stream reported.
     restarts: u64,
+    /// Each peer's latest suspicion's freshness point, held until the next heartbeat taken from
+    /// the peer: one a peer, of the peers attached, a detached one's dropped.
+    told: Vec<(PeerId, u64)>,
+    /// The suspicions it told while a heartbeat stamped before their point was unread
+    /// ([`Report::unread`]).
+    unread: u64,
     /// The time its thread has spent in the writes of its log, all told: time it could neither
     /// read its socket nor move its group.
     blocked: u64,
@@ -244,6 +254,8 @@ pub struct Node {
     flush_most: u64,
     /// The longest it went between two reads of its socket: how long it could not answer.
     turn_most: u64,
+    /// When it last read its socket or ended a wait on it.
+    read_ns: u64,
 }
 
 impl Node {
@@ -260,6 +272,8 @@ impl Node {
         wal: Wal,
     ) -> Result<Self, NodeError> {
         let datagram = wire::largest(&socket)?;
+        let stamped =
+            Stamped::new(&socket).map_err(|error| NodeError::Io(io::Error::other(error)))?;
         let max_size_per_msg =
             u64::try_from(datagram.saturating_sub(MESSAGE_ROOM)).unwrap_or(u64::MAX);
         let config = Config {
@@ -300,30 +314,25 @@ impl Node {
             sending: Vec::with_capacity(datagram),
             datagram,
             command: Vec::new(),
-            epoch: Instant::now(),
+            stamped,
             liveness,
             attached: Vec::new(),
             asked: Asked::default(),
             restarts: 0,
+            told: Vec::new(),
+            unread: 0,
             blocked: 0,
             flush_most: 0,
             turn_most: 0,
+            read_ns: 0,
             settings,
         })
     }
 
-    /// Nanoseconds on the member's clock, now.
-    #[allow(
-        clippy::disallowed_methods,
-        reason = "real processes on the host's clock, threads and environment (CLAUDE.md §1a, end to end)"
-    )]
+    /// Nanoseconds on the member's clock, now: the host's monotonic clock, which its socket's
+    /// receive stamps are on.
     fn now(&self) -> u64 {
-        u64::try_from(
-            Instant::now()
-                .saturating_duration_since(self.epoch)
-                .as_nanos(),
-        )
-        .unwrap_or(u64::MAX)
+        self.stamped.clock().now_ns()
     }
 
     /// Runs until `stop` is set, which it reads once a turn, or until the member fails.
@@ -331,19 +340,20 @@ impl Node {
         self.pairs()?;
         // The member drives once before it waits: a reopened member replays its log alone.
         self.drive()?;
-        let mut read = self.now();
+        self.read_ns = self.now();
         while !stop.load(Ordering::Acquire) {
-            self.live()?;
-            self.turn_most = self.turn_most.max(self.now().saturating_sub(read));
+            // What came while it drove is read before the stream is polled: the stream judges by
+            // the heartbeats it was given (`Liveness::poll`).
+            if let Some(clock) = self.drain(self.turn())? {
+                self.live(clock)?;
+            }
             // Woken at the core's deadline or the stream's, whichever is first; by a datagram
             // otherwise, the parent's going among them.
-            let until = [self.raw.deadline(), self.liveness.wake()]
-                .into_iter()
-                .flatten()
-                .min();
-            self.receive_until(until)?;
-            read = self.now();
-            self.live()?;
+            let wake = self.liveness.wake();
+            let until = [self.raw.deadline(), wake].into_iter().flatten().min();
+            if let Some(clock) = self.receive_until(until)? {
+                self.live(clock)?;
+            }
             self.measure()?;
             self.drive()?;
         }
@@ -381,6 +391,9 @@ impl Node {
                 self.liveness.detach(*peer).map_err(NodeError::Liveness)?;
             }
         }
+        // A suspicion waits for its peer's next heartbeat only while the peer is attached.
+        self.told
+            .retain(|(peer, _)| now.binary_search(peer).is_ok());
         self.attached = now;
         Ok(())
     }
@@ -403,14 +416,16 @@ impl Node {
         Ok(())
     }
 
-    /// Polls the stream at the member's clock and does what it asks; once more after a write it
-    /// asked for, which proves the heartbeats that waited on it.
-    fn live(&mut self) -> Result<(), NodeError> {
-        let now = self.now();
-        self.liveness.poll(now, &mut self.asked);
-        if self.act_on_liveness()? {
-            let now = self.now();
-            self.liveness.poll(now, &mut self.asked);
+    /// Polls the stream at `clock`, read before a drain that emptied the socket ([`Self::drain`]),
+    /// and does what it asks; once more after a write it asked for, which proves the heartbeats
+    /// that waited on it, at the clock of a drain after the write, if that one empties the socket
+    /// too: what came during the write is read before the stream judges past it.
+    fn live(&mut self, clock: u64) -> Result<(), NodeError> {
+        self.liveness.poll(clock, &mut self.asked);
+        if self.act_on_liveness()?
+            && let Some(clock) = self.drain(self.turn())?
+        {
+            self.liveness.poll(clock, &mut self.asked);
             self.act_on_liveness()?;
         }
         Ok(())
@@ -474,7 +489,11 @@ impl Node {
     fn believe(&mut self, change: &Change) -> Result<(), NodeError> {
         let peer = change.peer();
         let told = match change {
-            Change::Suspected(_) => self.raw.suspect(peer),
+            Change::Suspected(suspicion) => {
+                self.told.retain(|(told, _)| *told != peer);
+                self.told.push((peer, suspicion.at_ns));
+                self.raw.suspect(peer)
+            }
             Change::Trusted { .. } => self.raw.trust(peer),
             Change::Restarted { .. } => {
                 self.restarts = self.restarts.saturating_add(1);
@@ -486,37 +505,78 @@ impl Node {
 
     /// Waits for a datagram until `until` on the member's clock, or for one however long when
     /// nothing is due, then takes what else has arrived without waiting, at most what one turn
-    /// of the loop takes before it drives the member again.
+    /// of the loop takes before it drives the member again: the clock the stream may be polled at,
+    /// as [`Self::drain`] gives it. A wait begun before the stream's wake
+    /// and ended at or past it, whatever ended it, is reported to the stream as it ends
+    /// (`Liveness::on_wait`).
     ///
     /// A member whose deadline is already due waits for nothing, but it still takes what has
     /// arrived: its peers' answers and heartbeats are what its commits and its detectors are made
     /// of. A member that skipped its socket when behind (as one on a loaded machine is, at every
     /// turn) acted deaf: on ticks, as leader it stepped down by its quorum check with its
     /// followers' answers waiting unread in its socket.
-    pub fn receive_until(&mut self, until: Option<u64>) -> Result<(), NodeError> {
-        // A turn takes as many datagrams as the member has askers to answer and, from each
-        // voter, a Raft message and a heartbeat, so that one busy peer never holds the others'
-        // back past a turn; and the one it waited for, when it waited.
-        let turn = self
-            .settings
-            .max_pending
-            .saturating_add(self.settings.voters.len().saturating_mul(2));
+    pub fn receive_until(&mut self, until: Option<u64>) -> Result<Option<u64>, NodeError> {
+        // A turn's datagrams, and the one it waited for, when it waited.
+        let turn = self.turn();
         let mut most = turn;
-        let wait = until.map(|at| Duration::from_nanos(at.saturating_sub(self.now())));
+        let wake = self.liveness.wake();
+        let began = self.now();
+        let wait = until.map(|at| Duration::from_nanos(at.saturating_sub(began)));
         if wait.is_none_or(|wait| !wait.is_zero()) {
             most = turn.saturating_add(1);
-            if !wire::arrives(&self.socket, wait, &mut self.received)? {
-                return Ok(());
+            self.turn_most = self.turn_most.max(began.saturating_sub(self.read_ns));
+            let came = wire::arrives(&self.socket, wait, &mut self.received)?;
+            // A wait begun before the stream's wake and ended at or past it, by its deadline or
+            // by a datagram that came after it, is what the stream's `G` is made of
+            // (`Liveness::on_wait`), reported before anything it brought is fed: how late past
+            // the wake the member came to it while it waited, its own work not counted.
+            let woke = self.now();
+            self.read_ns = woke;
+            if let Some(at) = wake
+                && began < at
+                && woke >= at
+            {
+                self.liveness.on_wait(at, woke);
+            }
+            if !came {
+                most = turn;
             }
         }
         // The datagram waited for is taken with the rest, none of them waited on: a receive that
-        // waits can lose what arrives as it times out (`wire::arrives`).
+        // waits can lose what arrives as it times out (`wire::arrives`). A wait that ran out is
+        // drained too, for the clock the stream is polled at.
+        self.drain(most)
+    }
+
+    /// The datagrams a turn takes: as many as the member has askers to answer and, from each
+    /// voter, a Raft message and a heartbeat, so that one busy peer never holds the others' back
+    /// past a turn.
+    fn turn(&self) -> usize {
+        self.settings
+            .max_pending
+            .saturating_add(self.settings.voters.len().saturating_mul(2))
+    }
+
+    /// Reads the member's clock, then takes what has arrived without waiting, at most `most`
+    /// datagrams: the clock when the socket emptied first, since every datagram the kernel stamped
+    /// before it is then taken and the stream may be polled at it (`Liveness::poll`); none when
+    /// `most` ran out first, the stream then waiting for a drain that empties the socket. A stream
+    /// polled past a heartbeat still unread suspects a peer whose heartbeat came in time, as one
+    /// polled after the member's drive, which a write of its log holds for as long as its device
+    /// takes, did (`Report::unread`).
+    fn drain(&mut self, most: usize) -> Result<Option<u64>, NodeError> {
+        let clock = self.now();
+        self.turn_most = self.turn_most.max(clock.saturating_sub(self.read_ns));
         self.socket.set_nonblocking(true)?;
+        let mut emptied = false;
         let mut outcome = Ok(());
         for _ in 0..most {
             match self.receive_one() {
                 Ok(true) => {}
-                Ok(false) => break,
+                Ok(false) => {
+                    emptied = true;
+                    break;
+                }
                 Err(error) => {
                     outcome = Err(error);
                     break;
@@ -524,25 +584,27 @@ impl Node {
             }
         }
         self.socket.set_nonblocking(false)?;
-        outcome
+        self.read_ns = self.now();
+        outcome.map(|()| emptied.then_some(clock))
     }
 
     /// One datagram, if one is there; false when none is.
     fn receive_one(&mut self) -> Result<bool, NodeError> {
-        let (length, from) = match self.socket.recv_from(&mut self.received) {
-            Ok(received) => received,
-            Err(error) if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
-                return Ok(false);
-            }
+        let (length, arrival) = match self.stamped.receive(&self.socket, &mut self.received) {
+            Ok(Some(Taken::Datagram(length, arrival))) => (length, arrival),
+            // Truncated, or from an address that is not an internet one: lost, read past.
+            Ok(Some(Taken::Unreadable)) => return Ok(true),
+            Ok(None) => return Ok(false),
             // A datagram this member sent was refused by a peer that is gone; nothing to read.
             Err(error) if error.kind() == ErrorKind::ConnectionReset => return Ok(true),
             Err(error) => return Err(error.into()),
         };
+        let from = arrival.from;
         let datagram = std::mem::take(&mut self.received);
         let outcome = match datagram.get(..length).and_then(wire::open) {
             Some((Kind::Raft, body)) => self.hear_peer(body),
             Some((Kind::Request, body)) => self.hear_client(body, from),
-            Some((Kind::Control, body)) => self.hear_test(body, from),
+            Some((Kind::Control, body)) => self.hear_test(body, from, arrival.at_ns),
             Some((Kind::Response, _)) | None => Ok(()),
         };
         self.received = datagram;
@@ -656,6 +718,7 @@ impl Node {
             waiting: u64::try_from(self.app.writes.len().saturating_add(self.reads.len()))
                 .unwrap_or(u64::MAX),
             stray: self.stray(),
+            unread: self.unread,
             suspected: peers(&|peer| self.liveness.trust(peer) == Some(Trust::Suspected)),
             heard: peers(&|peer| {
                 self.liveness
@@ -806,17 +869,28 @@ impl Node {
         Ok(())
     }
 
-    fn hear_test(&mut self, body: &[u8], from: SocketAddr) -> Result<(), NodeError> {
+    fn hear_test(&mut self, body: &[u8], from: SocketAddr, at_ns: u64) -> Result<(), NodeError> {
         if let Some((peer, message)) = stream::read_heartbeat(body) {
             if self.isolated {
                 return Ok(());
             }
-            // Stamped as it is read; a refusal is the stream's to make (a stale or unproven
+            // Stamped when the kernel received it where the platform stamps, else as it was read
+            // (`hyper_tokio::Stamped`); a refusal is the stream's to make (a stale or unproven
             // heartbeat, a peer that shares no group), and the message is dropped.
-            let now = self.now();
-            let _ = self
+            let taken = self
                 .liveness
-                .on_heartbeat(peer, message, now, &mut self.asked);
+                .on_heartbeat(peer, message, at_ns, &mut self.asked);
+            // The first heartbeat taken from a suspected peer says whether the suspicion was the
+            // stream's or the member's: one the kernel stamped before the suspicion's point was in
+            // the socket, unread, when the stream was polled past the point.
+            if taken.is_ok()
+                && let Some(index) = self.told.iter().position(|(told, _)| *told == peer)
+            {
+                let (_, point) = self.told.swap_remove(index);
+                if at_ns < point {
+                    self.unread = self.unread.saturating_add(1);
+                }
+            }
             return self.act_on_liveness().map(drop);
         }
         if let Some(id) = stream::read_hold(body) {

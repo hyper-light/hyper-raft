@@ -44,6 +44,7 @@ mod driver;
 mod error;
 mod plane;
 mod socket;
+mod stamped;
 mod sys;
 
 pub use clock::{Arrival, Clock};
@@ -51,3 +52,4 @@ pub use driver::{Driver, TURNS};
 pub use error::Error;
 pub use plane::PlaneSocket;
 pub use socket::{Io, IoStats, MAX_BATCH, RECEIVE_BYTES};
+pub use stamped::{Stamped, Taken};

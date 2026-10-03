@@ -53,6 +53,65 @@ uncertain as it makes `V̂`; a rule on the expected staleness needs nothing of i
 (`crates/hyper-swim/src/detector.rs`, `Stream::due`) renews its verdict once a window's worth of
 round trips have come, over estimates of the whole history.
 
+**Where a freshness detector errs: one bound a heartbeat taken (derived here, 2026-10-03).**
+NFD-E trusts at `t ∈ [τ_i, τ_{i+1})` iff some heartbeat numbered `i` or more has arrived (Chen et
+al.'s rule). Let `h` be the latest heartbeat taken; the freshness point in force is
+`τ_{h+1} = EA_{h+1} + α`. A suspicion of a live sender (an S-transition) happens at `τ_{h+1}` exactly
+when no heartbeat numbered past `h` has arrived by then, and it ends at the next heartbeat taken,
+`h' > h`, which arrived past `τ_{h+1}`: so each mistake is matched to the one heartbeat taken that
+ends it, and a heartbeat taken `h'` ends a mistake exactly when its lateness
+`ℓ = A_{h'} − EA_{h+1}` passes `α`. The count of mistakes is the count of heartbeats taken with
+`ℓ > α`, and by linearity of expectation, which asks nothing of the dependence between them, its
+expectation over `N` heartbeats taken is at most `N·β` for any `β` that bounds each one's
+`Pr(ℓ > α)`. Cantelli's one-sided inequality gives such a `β` from the latenesses' mean and variance
+alone, and Rényi's record law adds what the variance cannot know of (below). At most one heartbeat
+is taken an interval, so mistakes recur no oftener than every `η/β`: Theorem 7's form, with no
+product over the heartbeats in the margin and no loss term. A heartbeat the network lost, or a slot
+the sender skipped while it stalled, is no heartbeat taken: it puts the next one taken an interval
+or a stall later past `EA_{h+1}`, which its lateness measures. Chen et al.'s model has a sender
+that is slow and not crashed send late (their delay `D` is measured from the sender's schedule,
+`σ_i = iη`), and its messages lost or delayed independently; a sender whose stall makes it skip the
+slots it was behind for sends none of them, and the per-arrival view needs neither the
+independence nor the distinction. Detection is untouched: a sender that stops for good is
+suspected at the freshness point after its last heartbeat, `E(D) + α + η` past its schedule.
+
+**Little, "A proof for the queuing formula L = λW", Operations Research 9(3), 1961, pp.
+383–387.** For any queueing system in a steady state, the long-run mean number in the system is
+the arrival rate times the mean time each spends in it, whatever the distributions. With the
+elections a group runs as the system, a crash of the leader's node entering once every MTBF and
+staying `E(D) + α + η + T_E` (detection, then the election), and a mistake entering at most once
+every `η/β` and staying `T_E`, the mean number of elections in progress is
+`U = (E(D) + α + η + T_E)/MTBF + T_E·β/η`. The share of time one or more is in progress is
+`Pr(N ≥ 1) ≤ E[N] = U` (Markov's inequality): `U` bounds the time a group cannot commit from
+above, and at one or more bounds nothing.
+
+**Chan, Golub and LeVeque, "Algorithms for computing the sample variance: analysis and
+recommendations", The American Statistician 37(3), 1983, pp. 242–247.** The means and sums of
+squared deviations of two sets combine exactly: `n = n_a + n_b`, `δ = x̄_b − x̄_a`,
+`x̄ = x̄_a + δ·n_b/n`, `M₂ = M₂,a + M₂,b + δ²·n_a·n_b/n`, as stable as Welford's update. The
+sliding window measured below kept its latenesses in half-window blocks, Welford's moments each,
+and combined the two it held, so it slid with no ring of its samples.
+
+**The arrivals' window: derived, built, measured and not kept (2026-10-03).** A configuration's
+estimate should average over as much of the link as is stationary, and no more. The Allan deviation of the link's window means
+falls with every doubling of the window while averaging still removes noise, and rises where the
+series has moved (Allan 1966, above); so the levels give the horizon past which a longer window
+averages over a link that changed: the longest level, from the least deviation's on, within the
+least's statistical tolerance `1/√(2(K−1))` before a longer level with its windows rises past it.
+Where no level rises, the whole history is stationary as far as it reaches, and the window is all
+of it. The horizon is read on the offsets' levels, which a drift between the two clocks also
+raises at long windows, so a drifting pair slides its window sooner than its latenesses (which
+carry no drift) need: a shorter window, a larger unseen share, a looser bound, never a tighter one.
+The window slides in blocks of half the horizon, the last two closed, and its configuration is
+renewed at each close: the staleness rule above for a window sliding at `n` asks it every `n/2`.
+Growing, it is renewed once it has doubled, the same rule for a history. Chen et al.'s adaptive
+detector re-estimates over the `n` most recent heartbeats and leaves `n` open; Hayashibara et al.
+keep a sliding window of inter-arrival times of a fixed size, picked. Measured against the history
+in the simulation's worlds that change (`docs/timing.md` §3, item 11) it lost on every count: the
+window's unseen share, `1/(m_w + 1)` over its own arrivals only, floors the bound at every margin,
+and its horizon, read on levels that keep the whole history at the interval, never lets the window
+grow back once a change has shown in them. The estimator keeps the history.
+
 **Page, "Continuous inspection schemes", Biometrika 41 (1954).** The CUSUM test for a change in a
 process's mean: the cumulative sum of deviations from a reference, a change declared at a
 threshold `h` chosen for the average run length to a false alarm. The threshold is a design choice
@@ -60,7 +119,11 @@ the test does not give; it is not used here (`docs/timing.md` §3, item 11).
 
 **Hayashibara, Défago, Yared, Katayama, "The φ accrual failure detector", SRDS 2004.** Outputs a
 continuous suspicion level adapted to observed inter-arrival times instead of a boolean;
-evaluated over an intercontinental link. Leaves the threshold on φ to the application.
+evaluated over an intercontinental link. Leaves the threshold on φ to the application. Its level is
+a function of the time since the latest arrival against the distribution of the gaps between
+arrivals, kept over a sliding window of a fixed size: each arrival judged against the one before it, as
+the per-arrival bound above judges each heartbeat taken, but through a normal distribution fitted
+to the gaps where Cantelli's inequality assumes none.
 
 **Das, Gupta, Motivala, "SWIM: Scalable Weakly-consistent Infection-style Process Group Membership
 Protocol", DSN 2002 (read 2026-10-01).**
@@ -262,6 +325,19 @@ round-trip delay `δ = (T4 − T1) − (T3 − T2)`: halving the round trip is e
 two directions take equally long, which the formula takes without stating. The ballot's one-way
 latency is half a measured round trip on the same footing.
 
+**Kaplan and Meier, "Nonparametric estimation from incomplete observations", JASA 53(282), 1958,
+pp. 457–481.** A lifetime observed only until something else ends the watch is censored: known to
+exceed the time watched, not equal to it. Dropping the censored and keeping the rest biases the
+estimate toward the short lifetimes, and the product-limit estimator is what recovers the
+distribution. A timed wait that a message ends past its deadline is such an observation of the
+timer's lateness: it would have been at least that late. Counted only where the timer ended them,
+the waits were a sample of the timer's lateness biased short, and empty where messages come
+oftener than the timer is late (hyper-durable-e2e's members on Linux's 1 ms tick, `docs/timing.md`
+§2.9). The stream's `G` does not estimate the timer's lateness, though: it stands for the lateness
+of the polls its queues see (the sender's schedule, the detector's checks, §2.4), and a poll a
+message brought past a wake is a complete observation of that, so every wait the owner began
+before a wake and that reached it counts as it ended, with nothing to recover.
+
 **Lindley, "The theory of queues with a single server", Proc. Cambridge Philos. Soc. 48(2), 1952,
 pp. 277–289.** A single server fed at regular intervals `η` with independent service times `S`
 reaches a stationary waiting time iff `E[S] < η`; otherwise the wait grows without bound. A sender
@@ -294,7 +370,9 @@ one observation at a time, without the cancellation of the sum-of-squares formul
 **RFC 5905 (Mills, Martin, Burbank, Kasch), Network Time Protocol Version 4, §7.2, Figure 6
 (read 2026-10-01).** `TOLERANCE`, "frequency tolerance PHI (s/s)", 15e-6: the frequency error NTP
 assumes of a clock. Two clocks within it of true time drift apart by up to 30 ppm; the estimator's
-window bound takes it as the drift a link's expected arrival must follow.
+window bound takes it as the drift a link's expected arrival must follow, and a suspicion's bound
+as the drift between the echo that bounded the clocks' offset and the suspicion
+(`crates/hyper-liveness/src/bound.rs`).
 
 ## The machines' timers, from their sources
 

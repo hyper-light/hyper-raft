@@ -11,8 +11,10 @@ repository.workspace = true
 hyper-transport = { path = "../hyper-transport" }
 hyper-datagram = { path = "../hyper-datagram" }
 # The runtime this adapter serves (mantle note 32 §6 item 6: a separate crate; the sans-io crates
-# never name a runtime). Only its reactor (epoll, kqueue, IOCP) and its timer are used.
-tokio = { version = "1.48", default-features = false, features = ["net", "time"] }
+# never name a runtime). Only its reactor (epoll, kqueue, IOCP) and its timer are used, and
+# `runtime::Handle::try_current` (`rt`), which a socket asks before it registers: built alone, as a
+# dependency of a crate that names no runtime itself, the crate needs it named here.
+tokio = { version = "1.48", default-features = false, features = ["net", "rt", "time"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # sendmmsg(2), recvmmsg(2) and the UDP_SEGMENT and UDP_GRO socket options and control messages,

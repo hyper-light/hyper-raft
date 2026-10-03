@@ -659,6 +659,7 @@ dependencies = [
  "hyper-raft",
  "hyper-raft-e2e",
  "hyper-timing",
+ "hyper-tokio",
 ]
 
 [[package]]
@@ -754,6 +755,7 @@ dependencies = [
  "hyper-liveness",
  "hyper-raft",
  "hyper-timing",
+ "hyper-tokio",
 ]
 
 [[package]]

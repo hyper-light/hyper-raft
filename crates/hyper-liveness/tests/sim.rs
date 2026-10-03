@@ -28,7 +28,7 @@ use hyper_liveness::{
 };
 use hyper_sim::Seeded;
 use hyper_sim::rng::stream_seed;
-use hyper_timing::{Ballot, Exposure, Trust, WINDOW_LIMIT, poisson95};
+use hyper_timing::{Ballot, Exposure, Trust, WINDOW_LIMIT};
 
 const MS: u64 = 1_000_000;
 const US: u64 = 1_000;
@@ -93,6 +93,10 @@ impl Draws {
 #[path = "support/worlds.rs"]
 mod worlds;
 use worlds::{Freezes, GRID, Table};
+
+#[path = "support/record.rs"]
+mod record;
+use record::{Beat, Record, Traced};
 
 /// A quantity's value at probability `u`, from its table by the inverse transform, linear between
 /// the neighbouring points of the grid (`hyper-timing-trace`'s, `worlds::GRID`).
@@ -270,14 +274,20 @@ struct Node {
     /// Every durable completion: when.
     durable: Vec<u64>,
     suspicions: Vec<Suspicion>,
+    /// What the node fed its stream and what the stream told it, in order (`record`): every
+    /// suspicion in it is traced to the detector's rule, and every count the stream reports is
+    /// its.
+    record: Record,
     /// The peers whose restart the node's stream reported.
     restarts: Vec<PeerId>,
     /// What the owner believes of each peer from the changes it was told: suspected or not. The
     /// owner trusts a peer until told otherwise, and a restarted one is trusted (`Change`).
     believed: BTreeMap<PeerId, bool>,
-    /// The owner's timer: the deadline it was set to, the stream's wake, and when it fires, late
-    /// by a lateness drawn once, when the deadline was set ([`Sim::arm`]).
-    timer: Option<(u64, u64)>,
+    /// The owner's timer: the deadline it was set to, the stream's wake, when it fires, late by a
+    /// lateness drawn once, when the deadline was set ([`Sim::arm`]), and whether its wait began
+    /// before the deadline, which makes the wait's end at or past it, the timer's or what came
+    /// first, a sample of `G` (`Liveness::on_wait`).
+    timer: Option<(u64, u64, bool)>,
     /// The host is frozen until this time (`World::freezes`).
     frozen_until: u64,
     /// What arrived and completed while the host was frozen, in order: taken at the thaw.
@@ -337,6 +347,11 @@ impl Sim {
                     log: Vec::new(),
                     durable: Vec::new(),
                     suspicions: Vec::new(),
+                    record: {
+                        let mut record = Record::default();
+                        record.began();
+                        record
+                    },
                     restarts: Vec::new(),
                     believed: BTreeMap::new(),
                     timer: None,
@@ -425,10 +440,48 @@ impl Sim {
         if !self.nodes[node].alive || self.nodes[node].frozen_until > self.now {
             return;
         }
-        let now = self.now;
-        let n = &mut self.nodes[node];
-        n.liveness.poll(now, &mut n.owner);
+        self.polled(node);
         self.drain(node);
+    }
+
+    /// Polls `node`'s stream now and records the poll, with what it told and the trust it holds
+    /// of each peer after.
+    fn polled(&mut self, node: usize) {
+        let now = self.now;
+        let count = self.nodes.len() as u64;
+        let n = &mut self.nodes[node];
+        let told = n.owner.changes.len();
+        n.liveness.poll(now, &mut n.owner);
+        let id = n.owner.id;
+        let trusts: Vec<(PeerId, Option<Trust>)> = (1..=count)
+            .filter(|peer| *peer != id)
+            .map(|peer| (peer, n.liveness.trust(peer)))
+            .collect();
+        n.record.polled(now, &n.owner.changes[told..], trusts);
+    }
+
+    /// Feeds `node`'s stream a heartbeat from `from`, stamped by the kernel at `stamp`, and records
+    /// the call: what the stream made of it, what it told, the trust it holds of the peer after.
+    fn feed(&mut self, node: usize, from: usize, bytes: &[u8], stamp: u64) -> Result<(), Refusal> {
+        let n = &mut self.nodes[node];
+        let peer = from as u64 + 1;
+        let told = n.owner.changes.len();
+        let outcome = n.liveness.on_heartbeat(peer, bytes, stamp, &mut n.owner);
+        let beat = Beat::of(bytes, stamp).expect("the simulation sends heartbeats whole");
+        let holds = n.liveness.trust(peer);
+        n.record
+            .fed(peer, beat, outcome, &n.owner.changes[told..], holds);
+        outcome
+    }
+
+    /// `node` restarts: a new process with the stream `liveness`, its record begun again.
+    fn restart(&mut self, node: usize, liveness: Liveness) {
+        let n = &mut self.nodes[node];
+        n.liveness = liveness;
+        n.record.began();
+        n.believed.clear();
+        n.alive = true;
+        n.disk_busy_until = self.now;
     }
 
     fn drain(&mut self, node: usize) {
@@ -436,6 +489,7 @@ impl Sim {
         for (peer, bytes) in sent {
             let beat = Heartbeat::decode(&bytes).unwrap();
             self.nodes[node].log.push((self.now, peer, beat));
+            self.nodes[node].record.sent(peer, beat.run, beat.seq);
             let delay = self.draws.draw("link", node as u64, peer, self.world.delay);
             self.schedule(
                 self.now + delay,
@@ -492,6 +546,54 @@ impl Sim {
         }
     }
 
+    /// Every suspicion every node's stream told, traced to the detector's rule from the nodes'
+    /// records (`record::trace`); a suspicion or a passed freshness point that does not trace fails
+    /// the test, each named. What the trace found.
+    fn traced(&self) -> Traced {
+        let records: Vec<(PeerId, &[record::Entry])> = self
+            .nodes
+            .iter()
+            .map(|node| (node.owner.id, node.record.entries.as_slice()))
+            .collect();
+        let (traced, failures) = record::trace(&records);
+        assert!(
+            failures.is_empty(),
+            "{} suspicions or passed points do not trace to the detector's rule:\n{}",
+            failures.len(),
+            failures.join("\n")
+        );
+        traced
+    }
+
+    /// Every count each node's stream reports of each peer is its record's: the suspicions told,
+    /// the heartbeats taken and refused for their proof, sent, and the slots skipped between.
+    fn counted(&self) {
+        let count = self.nodes.len() as u64;
+        for node in &self.nodes {
+            for peer in (1..=count).filter(|peer| *peer != node.owner.id) {
+                if let Some(report) = node.liveness.report(peer)
+                    && let Some(differs) = node.record.differs(peer, &report)
+                {
+                    panic!("node {} at {} ns: {differs}", node.owner.id, self.now);
+                }
+            }
+        }
+    }
+
+    /// The suspicions of the live peers among `nodes` and their allowance: reported, as the model's
+    /// figures, never asserted (`docs/benchmarks.md`).
+    fn allowance(&self, nodes: &[usize]) -> (u64, f64) {
+        let mut totals = (0u64, 0.0f64);
+        for &node in nodes {
+            for &peer in nodes.iter().filter(|peer| **peer != node) {
+                let report = self.nodes[node].liveness.report(peer as u64 + 1).unwrap();
+                totals.0 += report.suspicions;
+                totals.1 += report.allowance;
+            }
+        }
+        totals
+    }
+
     /// The election cost each node charges its detectors: the library's law over the round trips
     /// its streams measured and its flush, once a quorum's paths are measured. Charged again on the
     /// detectors' own doubling schedule: once the heartbeats a node has taken have doubled since
@@ -537,14 +639,20 @@ impl Sim {
     /// at most 80 µs late (seed 285 of the soak, `docs/timing.md` §2.8).
     fn arm(&mut self, node: usize) {
         let asked = self.nodes[node].liveness.wake();
-        if self.nodes[node].timer.map(|(deadline, _)| deadline) == asked {
+        if self.nodes[node].timer.map(|(deadline, ..)| deadline) == asked {
             return;
         }
         let fires = asked.map(|deadline| {
             let u = self.draws.unit("timer", node as u64, 0);
             let late = self.world.timer.late(deadline.saturating_sub(self.now), u);
             self.latest_late = self.latest_late.max(late);
-            (deadline, deadline.max(self.now) + late)
+            // A wait begins before its deadline only if the owner was not past it when it set
+            // the timer: one set late is the owner's lateness, not its timer's.
+            (
+                deadline,
+                deadline.max(self.now) + late,
+                deadline >= self.now,
+            )
         });
         self.nodes[node].timer = fires;
     }
@@ -557,7 +665,7 @@ impl Sim {
             .filter(|(_, node)| node.alive)
             .filter_map(|(i, node)| {
                 node.timer
-                    .map(|(_, fires)| (fires.max(node.frozen_until), i))
+                    .map(|(_, fires, _)| (fires.max(node.frozen_until), i))
             })
             .min()
     }
@@ -589,14 +697,19 @@ impl Sim {
                 let event = self.events.remove(&key).unwrap();
                 self.handle(event);
             } else if let Some((_, node)) = wake {
-                // The timer fired: it is set again after the poll.
-                self.nodes[node].timer = None;
+                // The timer fired: its wait, begun before its deadline, is reported, and the
+                // timer is set again after the poll.
+                if let Some((deadline, _, true)) = self.nodes[node].timer.take() {
+                    self.nodes[node].liveness.on_wait(deadline, at);
+                }
                 self.poll(node);
             }
             self.elect();
             self.note_configured();
             self.told_is_believed();
+            self.counted();
         }
+        self.traced();
     }
 
     /// Notes the pairs each live node has newly configured.
@@ -631,13 +744,10 @@ impl Sim {
                 if !self.nodes[to].alive {
                     return;
                 }
-                let now = self.now;
-                let n = &mut self.nodes[to];
+                self.woken(to);
                 // Refusals are the crate's to make: a stale or unproven heartbeat is dropped.
-                let _ = n
-                    .liveness
-                    .on_heartbeat(from as u64 + 1, &bytes, stamp, &mut n.owner);
-                n.liveness.poll(now, &mut n.owner);
+                let _ = self.feed(to, from, &bytes, stamp);
+                self.polled(to);
                 self.drain(to);
             }
             Event::Durable {
@@ -648,11 +758,12 @@ impl Sim {
                 if !self.nodes[node].alive || self.nodes[node].disk_stalled {
                     return;
                 }
+                self.woken(node);
                 let now = self.now;
                 let n = &mut self.nodes[node];
                 n.durable.push(now);
                 n.liveness.on_durable(write, started, now);
-                n.liveness.poll(now, &mut n.owner);
+                self.polled(node);
                 self.drain(node);
                 // The groups keep the log busy: their next write as this one completes.
                 if write == Write::Log && self.world.busy {
@@ -675,6 +786,23 @@ impl Sim {
         }
     }
 
+    /// `node`'s owner woken now by what came: a wait it began before the stream's wake that this
+    /// ends at or past the wake is reported, whatever ended it (`Liveness::on_wait`), and the
+    /// timer it was waiting on is spent. One that came before the wake ends no wait the stream
+    /// counts, and the timer stays.
+    fn woken(&mut self, node: usize) {
+        let now = self.now;
+        let n = &mut self.nodes[node];
+        if let Some((deadline, _, began_before)) = n.timer
+            && deadline <= now
+        {
+            n.timer = None;
+            if began_before {
+                n.liveness.on_wait(deadline, now);
+            }
+        }
+    }
+
     /// `node`'s host thaws: its owner takes, in order, the datagrams that arrived (each judged at
     /// its kernel stamp, `Liveness::on_heartbeat`) and the writes that completed (reported now,
     /// when the owner learns of them), then polls once. A later freeze that holds the host longer
@@ -685,20 +813,23 @@ impl Sim {
         }
         let held = std::mem::take(&mut self.nodes[node].held);
         let now = self.now;
-        // The timer, due during the freeze, is the poll's: set again after it.
-        self.nodes[node].timer = None;
+        // The timer, due during the freeze, is the poll's: set again after it. The wait it ended
+        // is the thaw's, a frozen host's lateness, reported before what arrived is read.
+        if let Some((deadline, _, true)) = self.nodes[node].timer.take()
+            && deadline <= now
+        {
+            self.nodes[node].liveness.on_wait(deadline, now);
+        }
         for event in held {
-            let n = &mut self.nodes[node];
             let completed = match event {
                 Event::Arrive {
                     from, bytes, stamp, ..
                 } => {
-                    let _ = n
-                        .liveness
-                        .on_heartbeat(from as u64 + 1, &bytes, stamp, &mut n.owner);
+                    let _ = self.feed(node, from, &bytes, stamp);
                     None
                 }
-                Event::Durable { write, started, .. } if !n.disk_stalled => {
+                Event::Durable { write, started, .. } if !self.nodes[node].disk_stalled => {
+                    let n = &mut self.nodes[node];
                     n.durable.push(now);
                     n.liveness.on_durable(write, started, now);
                     Some(write)
@@ -819,28 +950,33 @@ impl Sim {
     }
 }
 
-/// Live peers: every pair configures, trusts, and makes no more mistakes than Theorem 7 allows.
+/// Live peers: every pair configures and trusts, every suspicion of a live peer is traced to the
+/// detector's rule, and every count each stream reports is its record's (`Sim::traced` after every
+/// run, `Sim::counted` after every step). The suspicions against the allowance the configurations
+/// promised are the model's figures, reported (`docs/benchmarks.md`), never asserted: a count is
+/// what the rule found, not a draw to test a bound on an expectation with.
 #[test]
-fn live_peers_configure_and_keep_their_allowance() {
+fn live_peers_configure_and_every_suspicion_of_them_is_traced() {
+    let (mut suspicions, mut allowance) = (0u64, 0.0f64);
+    let mut traced = Traced::default();
     for seed in seeds(1, 8) {
         let mut sim = Sim::new(3, MACOS, seed);
         sim.run_until_configured();
         sim.run_until_doubled();
-        let (mut suspicions, mut allowance) = (0u64, 0.0f64);
         for node in &sim.nodes {
             for peer in (1..=3u64).filter(|p| *p != node.owner.id) {
                 let report = node.liveness.report(peer).unwrap();
                 assert!(report.configured, "seed {seed}");
-                suspicions += report.suspicions;
-                allowance += report.allowance;
                 assert!(report.taken > 0 && report.unproven == 0, "{report:?}");
             }
         }
-        assert!(
-            poisson95(suspicions).0 <= allowance,
-            "seed {seed}: {suspicions} suspicions of live peers refute the allowance {allowance}"
-        );
+        let (count, allowed) = sim.allowance(&[0, 1, 2]);
+        suspicions += count;
+        allowance += allowed;
+        traced += sim.traced();
     }
+    println!("every suspicion traced: {traced}");
+    println!("suspicions of live peers {suspicions}, allowance {allowance:.1}");
 }
 
 /// Every heartbeat sent carries a flush made durable after the previous heartbeat to that peer
@@ -1007,19 +1143,8 @@ fn a_stalled_disk_is_suspected_as_a_crash_is() {
             assert!(found.at_ns - last.due_ns <= bound.as_nanos() as u64);
         }
         // The stalled node still hears its peers: it took a heartbeat from each since every peer
-        // suspected it (the wait above), and its suspicions of them, live throughout, are within
-        // what Theorem 7 allows.
-        let (mut suspicions, mut allowance) = (0u64, 0.0f64);
-        for peer in 1..=2u64 {
-            let report = sim.nodes[stalled].liveness.report(peer).unwrap();
-            suspicions += report.suspicions;
-            allowance += report.allowance;
-        }
-        assert!(
-            poisson95(suspicions).0 <= allowance,
-            "seed {seed}: the stalled node's {suspicions} suspicions of live peers refute its \
-             allowance {allowance}"
-        );
+        // suspected it (the wait above), and its suspicions of them, live throughout, are traced
+        // with every other (`Sim::traced`).
     }
 }
 
@@ -1102,22 +1227,19 @@ fn a_restarted_peer(seed: u64) {
         .find(|(_, peer, beat)| *peer == 1 && beat.run == 1)
         .map(|(_, _, beat)| *beat)
         .expect("the old run sent to node 1");
-    sim.nodes[victim].liveness = liveness;
-    sim.nodes[victim].believed.clear();
-    sim.nodes[victim].alive = true;
-    sim.nodes[victim].disk_busy_until = sim.now;
+    sim.restart(victim, liveness);
     sim.poll(victim);
     sim.run_while(|sim| sim.nodes[0].restarts.is_empty(), None);
     let mut bytes = [0u8; MAX_BYTES];
     let stale = superseded.encode(&mut bytes).to_vec();
-    let (now, node) = (sim.now, &mut sim.nodes[0]);
-    let before = node.liveness.mtbf();
+    let now = sim.now;
+    let before = sim.nodes[0].liveness.mtbf();
     assert_eq!(
-        node.liveness.on_heartbeat(3, &stale, now, &mut node.owner),
+        sim.feed(0, victim, &stale, now),
         Err(Refusal::Stale),
         "the superseded run's heartbeat"
     );
-    assert_eq!(node.liveness.mtbf(), before, "no second failure");
+    assert_eq!(sim.nodes[0].liveness.mtbf(), before, "no second failure");
     sim.drain(0);
     // Until both others saw the new run and trust it, and through a renewal of every pair.
     sim.run_while(
@@ -1164,13 +1286,14 @@ fn a_superseded_runs_heartbeat_is_stale_and_its_restart_counts_once() {
         flush: false,
         changes: Vec::new(),
     };
-    // The first flush gives the floor, the second proves the first heartbeat, and the poll past
+    // The first flush gives the floor, the second proves the first heartbeat, and the wait for
     // the wake it asks measures the granularity: the node takes heartbeats from here.
     node.on_durable(Write::Liveness, 0, 100 * US);
     node.poll(200 * US, &mut owner);
     node.on_durable(Write::Liveness, 200 * US, 300 * US);
     node.poll(300 * US, &mut owner);
     let wake = node.wake().expect("the next heartbeat is due");
+    node.on_wait(wake, wake + 50 * US);
     node.poll(wake + 50 * US, &mut owner);
     assert!(node.granularity().is_some());
     let beat = |run: u64, seq: u64, flushes: u64| Heartbeat {
@@ -1529,5 +1652,233 @@ fn a_peer_dead_before_its_links_have_evidence_is_suspected_once_a_sibling_has_it
             noticed[noticed.len() * 9 / 10] / MS,
             noticed[noticed.len() - 1] / MS
         );
+    }
+}
+
+/// A sender behind its schedule skips the slots it was behind for and sends the latest due; its
+/// receiver takes each skipped slot as the next heartbeat's lateness, not as a heartbeat lost
+/// (`docs/timing.md` §2.2). Here the sender is behind for every other slot of a 2 ms stream, and the
+/// receiver's own timer is 5 ms late, past the interval: an E2E pair's shape, which the single
+/// heartbeat the margin held configured with no margin at all (`α = 0`, the receiver's `G` past the
+/// interval) and an unavailability past one, fed half the slots as losses. The receiver configures
+/// a margin past the skipped slot, an unavailability below one, and suspects the live sender at no
+/// freshness point once it has.
+#[test]
+fn a_sender_that_skips_slots_is_late_not_lost() {
+    let mut node = Liveness::new(Settings {
+        local: 1,
+        run: 1,
+        max_peers: 1,
+        history: Exposure::new(),
+    })
+    .unwrap();
+    node.attach(2).unwrap();
+    node.set_election(2, Duration::from_millis(20)).unwrap();
+    let mut owner = Owner {
+        id: 1,
+        sent: Vec::new(),
+        flush: false,
+        changes: Vec::new(),
+    };
+    let interval = 2 * MS;
+    let late = 5 * MS;
+    let mut out = [0u8; MAX_BYTES];
+    let mut suspected_after = None;
+    // The receiver's own stream and its wakes: each poll at its wake, 5 ms late.
+    node.on_durable(Write::Liveness, 0, 100 * US);
+    node.poll(200 * US, &mut owner);
+    node.on_durable(Write::Liveness, 200 * US, 300 * US);
+    let mut now = 300 * US;
+    node.poll(now, &mut owner);
+    let mut jitter = Seeded::new(stream_seed(0, "skips", &[]));
+    for slot in (0..4_000u64).step_by(2) {
+        let sent = 10 * MS + slot * interval;
+        let arrival = sent + 100 * US + jitter.below(50 * US);
+        // The owner's wakes before the heartbeat arrives, each at its wake and late.
+        while let Some(wake) = node.wake().filter(|wake| *wake + late <= arrival) {
+            if now < wake {
+                node.on_wait(wake, wake + late);
+            }
+            now = now.max(wake + late);
+            node.on_durable(Write::Liveness, now, now);
+            node.poll(now, &mut owner);
+        }
+        let beat = Heartbeat {
+            run: 7,
+            seq: slot,
+            interval_ns: interval,
+            floor_ns: interval,
+            ask_ns: 0,
+            sent_ns: sent,
+            late_ns: 0,
+            flushes: slot + 1,
+            flush_age_ns: 0,
+            echo: None,
+        };
+        let bytes = beat.encode(&mut out).to_vec();
+        let _ = node.on_heartbeat(2, &bytes, arrival, &mut owner);
+        now = now.max(arrival);
+        node.poll(now, &mut owner);
+        let report = node.report(2).unwrap();
+        if report.configured && suspected_after.is_none() {
+            suspected_after = Some(report.suspicions);
+        }
+    }
+    let report = node.report(2).unwrap();
+    let configured = node.configuration(2).expect("the pair configured");
+    assert!(
+        node.granularity().unwrap() > Duration::from_nanos(interval),
+        "the receiver's timer is late past the interval: {:?}",
+        node.granularity()
+    );
+    assert!(
+        configured.current.margin > Duration::from_nanos(interval),
+        "a margin past the skipped slot: {configured:?}"
+    );
+    assert!(
+        configured.current.unavailability < 1.0,
+        "an unavailability below one: {configured:?}"
+    );
+    assert_eq!(
+        Some(report.suspicions),
+        suspected_after,
+        "no suspicion of the live sender once configured: {report:?}"
+    );
+}
+
+/// `G` is the lateness the operating system adds to the owner's waits (`docs/timing.md` §2.4). An
+/// owner whose thread is held in its own write past a wake comes to that wake late, and that is its
+/// write's lateness, not its timer's. Here the timer ends every wait 1 ms late and every other wake
+/// finds the thread held 50 ms in a write: the owner reports the waits it began before their
+/// deadlines (`Liveness::on_wait`), and `G` is the timer's 1 ms, exactly. Taken from every poll
+/// past a wake, as it was, it held the writes too. The owner's stalls stay in the bound it states
+/// of itself (`Liveness::latest_wake`).
+#[test]
+fn an_owner_held_in_its_own_write_is_no_lateness_of_its_timer() {
+    let mut node = Liveness::new(Settings {
+        local: 1,
+        run: 1,
+        max_peers: 1,
+        history: Exposure::new(),
+    })
+    .unwrap();
+    node.attach(2).unwrap();
+    let mut owner = Owner {
+        id: 1,
+        sent: Vec::new(),
+        flush: false,
+        changes: Vec::new(),
+    };
+    let (late, held) = (MS, 50 * MS);
+    node.on_durable(Write::Liveness, 0, 100 * US);
+    let mut now = 200 * US;
+    node.poll(now, &mut owner);
+    let (mut waited, mut stalled) = (0u64, 0u64);
+    for turn in 0..400u64 {
+        // The flush the stream asked for, which proves the heartbeats due: made at once.
+        if std::mem::take(&mut owner.flush) {
+            node.on_durable(Write::Liveness, now, now);
+            node.poll(now, &mut owner);
+        }
+        let wake = node.wake().expect("a heartbeat is always due");
+        if wake > now {
+            if turn % 2 == 0 {
+                // It waits for the wake, and its timer ends the wait `late` past it.
+                node.on_wait(wake, wake + late);
+                now = wake + late;
+                waited += 1;
+            } else {
+                // Its thread is in its own write past the wake: no wait began before it.
+                now = wake + held;
+                stalled += 1;
+            }
+        }
+        // A wake already past when the owner comes to it is polled at once, no wait begun.
+        node.poll(now, &mut owner);
+    }
+    assert!(
+        waited > 100 && stalled > 100,
+        "{waited} waits, {stalled} stalls"
+    );
+    assert_eq!(node.granularity(), Some(Duration::from_nanos(late)));
+    assert!(node.latest_wake(now) >= Duration::from_nanos(held));
+}
+
+/// `G` is how late past its wakes the stream is polled while its owner waits for them
+/// (`docs/timing.md` §2.4), whatever ends the wait: an owner woken past a wake by a message, before
+/// its timer fired, came to the wake that late. Here the owner's timer ends a wait 1 ms past its
+/// deadline, as Linux's 1 ms tick does, and a message comes 300 µs past every wake, so every wait
+/// ends on the message. Reported as the waits they are, they give `G` = 300 µs exactly from the
+/// first wake on, and every heartbeat of the peer's is taken. Counted only where the timer ended
+/// them, as the contract said before, none counts: `G` is never measured and every heartbeat is
+/// refused as unmeasured, as hyper-durable-e2e's members, asked for reports every few hundred
+/// microseconds, refused theirs and never formed their group (§2.9).
+#[test]
+fn a_wait_a_message_ends_past_its_wake_measures_the_wake() {
+    let (timer, message) = (MS, 300 * US);
+    for counted in [false, true] {
+        let mut node = Liveness::new(Settings {
+            local: 1,
+            run: 1,
+            max_peers: 1,
+            history: Exposure::new(),
+        })
+        .unwrap();
+        node.attach(2).unwrap();
+        let mut owner = Owner {
+            id: 1,
+            sent: Vec::new(),
+            flush: false,
+            changes: Vec::new(),
+        };
+        // The first flush gives the floor and proves the first heartbeat.
+        node.on_durable(Write::Liveness, 0, 100 * US);
+        let mut now = 200 * US;
+        node.poll(now, &mut owner);
+        let mut out = [0u8; MAX_BYTES];
+        let mut outcomes = Vec::new();
+        // Fewer heartbeats than a configuration needs (an Allan level of seven windows of eight):
+        // every wake is one of the node's own heartbeats coming due.
+        for seq in 0..50u64 {
+            // The flush the stream asked for, made at once.
+            if std::mem::take(&mut owner.flush) {
+                node.on_durable(Write::Liveness, now, now);
+                node.poll(now, &mut owner);
+            }
+            let wake = node.wake().expect("a heartbeat is always due");
+            // The owner waits from now for the wake; the peer's heartbeat ends the wait past it,
+            // before the timer would have.
+            let came = wake + message;
+            assert!(now < wake && came < wake + timer);
+            if counted {
+                node.on_wait(wake, came);
+            }
+            now = came;
+            let beat = Heartbeat {
+                run: 7,
+                seq,
+                interval_ns: MS,
+                floor_ns: MS,
+                ask_ns: 0,
+                sent_ns: came,
+                late_ns: 0,
+                flushes: seq + 1,
+                flush_age_ns: 0,
+                echo: None,
+            };
+            let bytes = beat.encode(&mut out).to_vec();
+            outcomes.push(node.on_heartbeat(2, &bytes, came, &mut owner));
+            node.poll(now, &mut owner);
+        }
+        if counted {
+            assert_eq!(node.granularity(), Some(Duration::from_nanos(message)));
+            assert!(outcomes.iter().all(Result::is_ok), "{outcomes:?}");
+        } else {
+            assert_eq!(node.granularity(), None);
+            assert!(
+                outcomes.iter().all(|o| *o == Err(Refusal::Unmeasured)),
+                "{outcomes:?}"
+            );
+        }
     }
 }

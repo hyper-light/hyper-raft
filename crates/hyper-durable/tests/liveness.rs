@@ -351,6 +351,12 @@ impl World {
             }
             (_, Some((due, id))) => {
                 self.now = self.now.max(due) + self.rng.below(LATE_NS);
+                // An alarm is set only past the present (`act`), so its wait began before it: the
+                // stream's own wait where the alarm is its wake (`Liveness::on_wait`).
+                let node = &mut self.nodes[(id - 1) as usize];
+                if node.liveness.wake() == Some(due) {
+                    node.liveness.on_wait(due, self.now);
+                }
                 self.act(id);
             }
             (Some(_), None) => unreachable!("matched above"),

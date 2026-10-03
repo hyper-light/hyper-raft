@@ -14,6 +14,9 @@ hyper-durable = { path = "../hyper-durable" }
 hyper-log = { path = "../hyper-log" }
 # The node-pair liveness stream the members' detectors are (timing step L-3).
 hyper-liveness = { path = "../hyper-liveness" }
+# The kernel's receive stamps on the host's clock, for the heartbeats a member reads from its own
+# socket: an echo of one that waited in the socket through a stop states a hold that covers it.
+hyper-tokio = { path = "../hyper-tokio" }
 hyper-raft = { path = "../hyper-raft" }
 # The election law's types, and the round trips the test times its asks by (RFC 6298's estimator,
 # `ExchangeRtt`).

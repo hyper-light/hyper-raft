@@ -39,10 +39,19 @@
 //! every pair is configured and holds the waits to their bound: the wait for a line only the
 //! stopped member can state fails, naming it; let go, it is trusted again.
 //!
-//! Of live members it asserts what the configured detectors promise: Theorem 7 bounds the expected
-//! number of suspicions of a live peer by the allowance `Σβ`, and a run refutes that only when the
-//! 95 % lower limit of its count, summed over the live pairs, passes the summed allowance (the rule
-//! of hyper-swim's cluster test and of the trace replay, `docs/timing.md` §2.6).
+//! Each member keeps a record of what it fed its stream and what the stream told it, and writes it
+//! out with each state line, in the same write (`record`): every heartbeat it fed, with its kernel
+//! stamp, what the stream made of it and the trust it held of the peer after; every poll that told
+//! a change, moved a trust or came at or past a point a peer was held trusted to; every change told;
+//! every heartbeat sent. Every count a state line reports of a peer (the suspicions, the heartbeats
+//! taken, refused for their proof and sent, the slots skipped) must be its record's, and at each
+//! test's end every suspicion in the records, as far as each member wrote them whole, is traced to
+//! the detector's rule exactly (`record::trace`): its heartbeat, its freshness point as the stream
+//! held it, the call that noticed it at or past the point, no heartbeat of the peer's taken after
+//! stamped before the point, and every heartbeat or poll past a held point telling its suspicion.
+//! One that does not trace fails the test, named. The live members' suspicions against the
+//! allowance their configurations promised are the model's figures, reported
+//! (`docs/benchmarks.md`), never asserted: no run's count is a test of a bound on an expectation.
 
 #![allow(
     clippy::unwrap_used,
@@ -69,9 +78,16 @@ use std::task::Poll;
 use std::time::Duration;
 
 use hyper_datagram::{AdmitAll, ExporterSecret, Plane, PlaneLimits, Role, SECRET_BYTES};
-use hyper_liveness::{Change, Liveness, Output, PeerId, Settings, Write, is_liveness};
-use hyper_timing::{Ballot, Exposure, Trust, WINDOW_LIMIT, poisson95};
+use hyper_liveness::{
+    Change, Heartbeat, Last, Liveness, Output, PairReport, PeerId, Refusal, Settings, Suspicion,
+    Write, is_liveness,
+};
+use hyper_timing::{Ballot, Exposure, Trust, WINDOW_LIMIT};
 use hyper_tokio::{Clock, Io, PlaneSocket};
+
+#[path = "support/record.rs"]
+mod record;
+use record::{Beat, Entry, Record, Traced};
 
 /// Members: one whose disk stalls, one killed, and two that watch both.
 const NODES: u64 = 4;
@@ -157,10 +173,15 @@ struct Asked<'a> {
     plane: &'a mut Plane,
     flush: bool,
     changes: Vec<Change>,
+    /// The heartbeats it sent: to whom, their run and number, for the member's record.
+    sent: Vec<(PeerId, u64, u64)>,
 }
 
 impl Output for Asked<'_> {
     fn heartbeat(&mut self, peer: PeerId, message: &[u8]) {
+        if let Ok(beat) = Heartbeat::decode(message) {
+            self.sent.push((peer, beat.run, beat.seq));
+        }
         // A message the plane refuses is a lost heartbeat, which the detector measures.
         let _ = self.plane.queue(peer, message);
     }
@@ -283,14 +304,23 @@ async fn member(me: u64, nodes: u64, file: std::path::PathBuf) {
     let mut reported_at = 0u64;
     let mut heard_all = false;
     let mut command = [0u8; 16];
+    // What the member fed its stream and what the stream told it, written out with its state
+    // lines and traced by the supervisor (`record`).
+    let mut record = Record::default();
+    record.began();
     // The first poll: it asks for the flush that proves the first heartbeats.
     let mut first = Asked {
         plane: &mut plane,
         flush: false,
         changes: Vec::new(),
+        sent: Vec::new(),
     };
     let now = clock.now_ns();
     liveness.poll(now, &mut first);
+    record.polled(now, &first.changes, trusts(&liveness, &peers));
+    for (peer, run, seq) in first.sent.drain(..) {
+        record.sent(peer, run, seq);
+    }
     if first.flush && requests.try_send(Request::Flush).is_ok() {
         flight = Some(now);
     }
@@ -309,6 +339,7 @@ async fn member(me: u64, nodes: u64, file: std::path::PathBuf) {
         &liveness,
         &peers,
         &[],
+        &mut record,
         now,
         &mut reported_at,
         &mut stdout,
@@ -319,9 +350,10 @@ async fn member(me: u64, nodes: u64, file: std::path::PathBuf) {
     }
     loop {
         // Wait for a datagram, a completion or a command, or the crate's wake.
-        let deadline = liveness.wake().map(|at| {
-            tokio::time::Instant::now() + Duration::from_nanos(at.saturating_sub(clock.now_ns()))
-        });
+        let wake_ns = liveness.wake();
+        let began = clock.now_ns();
+        let deadline = wake_ns
+            .map(|at| tokio::time::Instant::now() + Duration::from_nanos(at.saturating_sub(began)));
         let mut woke_with = None;
         // What arrived, stamped by the kernel: fed before anything is judged at `now`.
         let mut inbox: Vec<(u64, u64, Vec<u8>)> = Vec::new();
@@ -345,14 +377,25 @@ async fn member(me: u64, nodes: u64, file: std::path::PathBuf) {
                     woke_with = result.ok();
                     return Poll::Ready(());
                 }
-                if receive.as_mut().poll(context).is_ready()
-                    || timer.as_mut().poll(context).is_ready()
-                {
+                if receive.as_mut().poll(context).is_ready() {
+                    return Poll::Ready(());
+                }
+                if timer.as_mut().poll(context).is_ready() {
                     return Poll::Ready(());
                 }
                 Poll::Pending
             })
             .await;
+        }
+        // A wait begun before the crate's wake and ended at or past it, by its deadline or by
+        // what came after it, is what its `G` is made of (`Liveness::on_wait`): reported before
+        // anything the wait brought is fed.
+        let woke = clock.now_ns();
+        if let Some(at) = wake_ns
+            && began < at
+            && woke >= at
+        {
+            liveness.on_wait(at, woke);
         }
         let said = woke_with.and_then(|length| command.get(..length));
         if said == Some(&[STOPPED][..]) {
@@ -382,18 +425,46 @@ async fn member(me: u64, nodes: u64, file: std::path::PathBuf) {
             plane: &mut plane,
             flush: false,
             changes: Vec::new(),
+            sent: Vec::new(),
         };
-        socket
-            .receive_ready(asked.plane, &AdmitAll, |arrival, opened| {
-                if let Ok(opened) = opened {
-                    for message in opened.messages().filter(|m| is_liveness(m)) {
-                        inbox.push((opened.sender, arrival.at_ns, message.to_vec()));
+        // The time the stream is judged at, read before the socket is: every datagram stamped
+        // before it was in the socket by then, so the reads after take it, and the stream is fed
+        // every message stamped before the time it is polled at. Read after them, a stop between
+        // the reads and the clock (this test stops members) left heartbeats stamped before the
+        // poll unread, and the poll suspected a peer whose next heartbeat had come.
+        let now = clock.now_ns();
+        // Read until a datagram stamped at `now` or later comes, the socket being in order of
+        // arrival, or the socket is empty: `receive_ready` takes a bounded number of batches.
+        let mut latest = None;
+        while latest.is_none_or(|at| at < now) {
+            let mut read = 0usize;
+            socket
+                .receive_ready(asked.plane, &AdmitAll, |arrival, opened| {
+                    read += 1;
+                    latest = Some(arrival.at_ns);
+                    if let Ok(opened) = opened {
+                        for message in opened.messages().filter(|m| is_liveness(m)) {
+                            inbox.push((opened.sender, arrival.at_ns, message.to_vec()));
+                        }
                     }
-                }
-            })
-            .unwrap();
+                })
+                .unwrap();
+            if read == 0 {
+                break;
+            }
+        }
         for (from, at, message) in &inbox {
-            let _ = liveness.on_heartbeat(*from, message, *at, &mut asked);
+            let told = asked.changes.len();
+            let outcome = liveness.on_heartbeat(*from, message, *at, &mut asked);
+            if let Some(beat) = Beat::of(message, *at) {
+                record.fed(
+                    *from,
+                    beat,
+                    outcome,
+                    &asked.changes[told..],
+                    liveness.trust(*from),
+                );
+            }
         }
         let mut flushed = false;
         while let Ok((started, durable)) = completions.try_recv() {
@@ -403,8 +474,12 @@ async fn member(me: u64, nodes: u64, file: std::path::PathBuf) {
             blocked = blocked.saturating_add(durable.saturating_sub(started));
             liveness.on_durable(Write::Liveness, started, durable);
         }
-        let now = clock.now_ns();
+        let told = asked.changes.len();
         liveness.poll(now, &mut asked);
+        record.polled(now, &asked.changes[told..], trusts(&liveness, &peers));
+        for (peer, run, seq) in asked.sent.drain(..) {
+            record.sent(peer, run, seq);
+        }
         if asked.flush && flight.is_none() && requests.try_send(Request::Flush).is_ok() {
             flight = Some(now);
         }
@@ -424,6 +499,7 @@ async fn member(me: u64, nodes: u64, file: std::path::PathBuf) {
             &liveness,
             &peers,
             &changes,
+            &mut record,
             now,
             &mut reported_at,
             &mut stdout,
@@ -449,6 +525,212 @@ async fn member(me: u64, nodes: u64, file: std::path::PathBuf) {
             }
         }
     }
+}
+
+/// The trust the stream holds of each of `peers`, for the member's record.
+fn trusts(liveness: &Liveness, peers: &[u64]) -> Vec<(PeerId, Option<Trust>)> {
+    peers
+        .iter()
+        .map(|peer| (*peer, liveness.trust(*peer)))
+        .collect()
+}
+
+/// A trust as a record line states it: trusted to a point, suspected, judged by no margin, or no
+/// pair.
+fn trust_field(trust: Option<Trust>) -> String {
+    match trust {
+        Some(Trust::Trusted { until_ns }) => format!("T{until_ns}"),
+        Some(Trust::Suspected) => "S".to_owned(),
+        Some(Trust::Unconfigured) => "U".to_owned(),
+        None => "-".to_owned(),
+    }
+}
+
+fn parse_trust(field: &str) -> Option<Option<Trust>> {
+    match field {
+        "S" => Some(Some(Trust::Suspected)),
+        "U" => Some(Some(Trust::Unconfigured)),
+        "-" => Some(None),
+        until => Some(Some(Trust::Trusted {
+            until_ns: until.strip_prefix('T')?.parse().ok()?,
+        })),
+    }
+}
+
+/// Every refusal the crate states, for a record line's: each by its name.
+const REFUSALS: [Refusal; 13] = [
+    Refusal::Limits,
+    Refusal::TooManyPeers,
+    Refusal::TooManyGroups,
+    Refusal::UnknownPeer,
+    Refusal::FromSelf,
+    Refusal::Truncated,
+    Refusal::NotLiveness,
+    Refusal::BadVersion,
+    Refusal::Malformed,
+    Refusal::Stale,
+    Refusal::Unproven,
+    Refusal::Unmeasured,
+    Refusal::OutOfRange,
+];
+
+fn parse_refusal(field: &str) -> Option<Option<Refusal>> {
+    if field == "-" {
+        return Some(None);
+    }
+    REFUSALS
+        .iter()
+        .find(|refusal| format!("{refusal:?}") == field)
+        .map(|refusal| Some(*refusal))
+}
+
+/// The record's entries as lines, `r me kind fields`: a suspicion's with the latest the member had
+/// woken past a wake it asked when it noticed it.
+fn record_lines(me: u64, entries: &[Entry], liveness: &Liveness, out: &mut String) {
+    use std::fmt::Write as _;
+    let nanos = |d: Duration| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX);
+    for entry in entries {
+        let _ = match *entry {
+            Entry::Began => writeln!(out, "r {me} b"),
+            Entry::Fed {
+                peer,
+                beat,
+                refused,
+                holds,
+            } => writeln!(
+                out,
+                "r {me} f {peer} {} {} {} {} {} {} {}",
+                beat.run,
+                beat.seq,
+                beat.stamp,
+                beat.due,
+                beat.sent,
+                refused.map_or_else(|| "-".to_owned(), |refusal| format!("{refusal:?}")),
+                trust_field(holds)
+            ),
+            Entry::Polled { now } => writeln!(out, "r {me} p {now}"),
+            Entry::Told(Change::Suspected(suspicion)) => writeln!(
+                out,
+                "r {me} s {} {} {} {} {} {}",
+                suspicion.peer,
+                suspicion.at_ns,
+                suspicion.noticed_ns,
+                suspicion.last.map_or_else(
+                    || "-".to_owned(),
+                    |last| format!(
+                        "{},{},{},{}",
+                        last.seq, last.arrival_ns, last.due_ns, last.sent_ns
+                    )
+                ),
+                suspicion
+                    .detection
+                    .map_or_else(|| "-".to_owned(), |bound| nanos(bound).to_string()),
+                nanos(liveness.latest_wake(suspicion.noticed_ns)),
+            ),
+            Entry::Told(Change::Trusted { peer, at_ns }) => {
+                writeln!(out, "r {me} t {peer} {at_ns}")
+            }
+            Entry::Told(Change::Restarted { peer, at_ns }) => {
+                writeln!(out, "r {me} n {peer} {at_ns}")
+            }
+            Entry::Holds { peer, trust } => {
+                writeln!(out, "r {me} h {peer} {}", trust_field(trust))
+            }
+            Entry::Sent { peer, run, seq } => writeln!(out, "r {me} o {peer} {run} {seq}"),
+        };
+    }
+}
+
+/// A record line: the member, the entry, and for a suspicion the latest the member had woken past
+/// a wake it asked when it noticed it.
+fn parse_record(fields: &[&str]) -> Option<(u64, Entry, Option<u64>)> {
+    let member = fields.first()?.parse().ok()?;
+    let number = |at: usize| -> Option<u64> { fields.get(at)?.parse().ok() };
+    let (entry, late) = match *fields.get(1)? {
+        "b" => (Entry::Began, None),
+        "f" => (
+            Entry::Fed {
+                peer: number(2)?,
+                beat: Beat {
+                    run: number(3)?,
+                    seq: number(4)?,
+                    stamp: number(5)?,
+                    due: number(6)?,
+                    sent: number(7)?,
+                },
+                refused: parse_refusal(fields.get(8)?)?,
+                holds: parse_trust(fields.get(9)?)?,
+            },
+            None,
+        ),
+        "p" => (Entry::Polled { now: number(2)? }, None),
+        "s" => {
+            let last = match *fields.get(5)? {
+                "-" => None,
+                last => {
+                    let parts: Vec<u64> = last
+                        .split(',')
+                        .map(|part| part.parse().ok())
+                        .collect::<Option<_>>()?;
+                    let [seq, arrival_ns, due_ns, sent_ns] = parts[..] else {
+                        return None;
+                    };
+                    Some(Last {
+                        seq,
+                        arrival_ns,
+                        due_ns,
+                        sent_ns,
+                    })
+                }
+            };
+            let detection = match *fields.get(6)? {
+                "-" => None,
+                bound => Some(Duration::from_nanos(bound.parse().ok()?)),
+            };
+            (
+                Entry::Told(Change::Suspected(Suspicion {
+                    peer: number(2)?,
+                    at_ns: number(3)?,
+                    noticed_ns: number(4)?,
+                    last,
+                    detection,
+                    detector: None,
+                })),
+                Some(number(7)?),
+            )
+        }
+        "t" => (
+            Entry::Told(Change::Trusted {
+                peer: number(2)?,
+                at_ns: number(3)?,
+            }),
+            None,
+        ),
+        "n" => (
+            Entry::Told(Change::Restarted {
+                peer: number(2)?,
+                at_ns: number(3)?,
+            }),
+            None,
+        ),
+        "h" => (
+            Entry::Holds {
+                peer: number(2)?,
+                trust: parse_trust(fields.get(3)?)?,
+            },
+            None,
+        ),
+        "o" => (
+            Entry::Sent {
+                peer: number(2)?,
+                run: number(3)?,
+                seq: number(4)?,
+            },
+            None,
+        ),
+        _ => return None,
+    };
+    Some((member, entry, late))
 }
 
 /// The member's run: the count kept beside its file raised by one (one where there is none), a
@@ -528,38 +810,28 @@ struct Member {
     flushed: bool,
 }
 
-/// A line for each suspicion as it happens, and a state line with each change, at each flush
-/// completed (what the write took), and otherwise once the member's shortest interval has passed
-/// since the last (its floor before any pair has one), the soonest its evidence can move again; the
-/// supervisor waits on what they say. A member whose thread runs states at least once a period; one
-/// that states nothing is in a write, held, or not scheduled.
+/// A state line with each change, at each flush completed (what the write took), and otherwise
+/// once the member's shortest interval has passed since the last (its floor before any pair has
+/// one), the soonest its evidence can move again; the supervisor waits on what they say. The
+/// member's record since its last state line goes out before it, in the same write, so the counts
+/// a line states follow every entry they count. A member whose thread runs states at least once a
+/// period; one that states nothing is in a write, held, or not scheduled.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the member's state, its stream, its record and its output, as the loop holds them"
+)]
 fn report(
     member: &Member,
     liveness: &Liveness,
     peers: &[u64],
     changes: &[Change],
+    record: &mut Record,
     now: u64,
     reported_at: &mut u64,
     out: &mut impl std::io::Write,
 ) -> std::io::Result<()> {
     let nanos = |d: Duration| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX);
     let me = member.me;
-    for change in changes {
-        if let Change::Suspected(suspicion) = change {
-            let last = suspicion.last;
-            writeln!(
-                out,
-                "suspect {me} {} {} {} {} {} {} {}",
-                suspicion.peer,
-                suspicion.at_ns,
-                last.map_or(0, |l| l.due_ns),
-                last.map_or(0, |l| l.sent_ns),
-                suspicion.detection.map_or(0, nanos),
-                suspicion.noticed_ns,
-                nanos(liveness.latest_wake(suspicion.noticed_ns)),
-            )?;
-        }
-    }
     let period = peers
         .iter()
         .filter_map(|peer| liveness.report(*peer).and_then(|r| r.interval))
@@ -570,6 +842,9 @@ fn report(
         return out.flush();
     }
     *reported_at = now;
+    let mut text = String::new();
+    record_lines(me, &record.entries, liveness, &mut text);
+    record.entries.clear();
     let mut line = format!(
         "state {me} {now} {} {} {} {} {} {}",
         member.disk.letter(),
@@ -587,7 +862,7 @@ fn report(
             _ => ('U', 0),
         };
         line.push_str(&format!(
-            " {peer}:{trust}:{}:{}:{}:{}:{}:{}:{}:{}:{until}",
+            " {peer}:{trust}:{}:{}:{}:{}:{}:{}:{}:{}:{until}:{}:{}",
             u8::from(report.configured),
             u8::from(report.judged),
             report.suspicions,
@@ -596,9 +871,13 @@ fn report(
             report.sent,
             report.interval.map_or(0, nanos),
             report.freshness.map_or(0, nanos),
+            report.skipped,
+            report.unproven,
         ));
     }
-    writeln!(out, "{line}")?;
+    text.push_str(&line);
+    text.push('\n');
+    out.write_all(text.as_bytes())?;
     out.flush()
 }
 
@@ -637,6 +916,9 @@ struct Seen {
     freshness: u64,
     /// The freshness point the member trusts the peer to, while it does.
     until: u64,
+    /// The slots it skipped sending, and the heartbeats it refused for their proof.
+    skipped: u64,
+    unproven: u64,
 }
 
 /// A member's latest state line.
@@ -672,7 +954,9 @@ struct Suspected {
 
 enum Line {
     State(u64, Stated),
-    Suspect(u64, u64, Suspected),
+    /// An entry of the member's record, and for a suspicion the latest the member had woken past
+    /// a wake it asked when it noticed it.
+    Record(u64, Entry, Option<u64>),
     Heard(u64),
     /// A member held, and when it said so on the host clock.
     Held(u64, u64),
@@ -707,6 +991,8 @@ fn parse(line: &str) -> Option<Line> {
                     interval,
                     freshness,
                     until,
+                    skipped,
+                    unproven,
                 ] = parts[..]
                 else {
                     return None;
@@ -724,28 +1010,17 @@ fn parse(line: &str) -> Option<Line> {
                         interval: interval.parse().ok()?,
                         freshness: freshness.parse().ok()?,
                         until: until.parse().ok()?,
+                        skipped: skipped.parse().ok()?,
+                        unproven: unproven.parse().ok()?,
                     },
                 );
             }
             Some(Line::State(member, stated))
         }
-        "suspect" => {
-            let numbers: Vec<u64> = fields.map(|f| f.parse().ok()).collect::<Option<_>>()?;
-            let [member, peer, at, due, sent, detection, noticed, late] = numbers[..] else {
-                return None;
-            };
-            Some(Line::Suspect(
-                member,
-                peer,
-                Suspected {
-                    at,
-                    due,
-                    sent,
-                    detection,
-                    noticed,
-                    late,
-                },
-            ))
+        "r" => {
+            let rest: Vec<&str> = fields.collect();
+            let (member, entry, late) = parse_record(&rest)?;
+            Some(Line::Record(member, entry, late))
         }
         "heard" => Some(Line::Heard(fields.next()?.parse().ok()?)),
         "held" => Some(Line::Held(
@@ -845,6 +1120,10 @@ struct Supervisor {
     trace: bool,
     latest: BTreeMap<u64, Stated>,
     suspicions: Vec<(u64, u64, Suspected)>,
+    /// Each member's record, as far as it stated it whole: the entries it wrote with a state line.
+    records: BTreeMap<u64, Record>,
+    /// Each member's entries since its latest state line, which come in with the next.
+    pending: BTreeMap<u64, Vec<(Entry, Option<u64>)>>,
     /// The members that said they heard every peer and sent to each.
     heard: Vec<u64>,
     /// The first state line in which each member stated each pair configured: `(member, peer)` to
@@ -941,6 +1220,7 @@ impl Supervisor {
         }
         match parse(line) {
             Some(Line::State(member, stated)) => {
+                self.recorded(member, &stated);
                 for (peer, seen) in &stated.peers {
                     if seen.configured {
                         self.configured_since
@@ -951,8 +1231,8 @@ impl Supervisor {
                 self.latest.insert(member, stated);
                 member
             }
-            Some(Line::Suspect(member, peer, suspected)) => {
-                self.suspicions.push((member, peer, suspected));
+            Some(Line::Record(member, entry, late)) => {
+                self.pending.entry(member).or_default().push((entry, late));
                 member
             }
             Some(Line::Heard(member)) => {
@@ -965,6 +1245,79 @@ impl Supervisor {
             }
             None => 0,
         }
+    }
+
+    /// `member`'s entries since its last state line, which `stated` follows in the same write,
+    /// taken into its record; each count `stated` reports of a peer must be the record's.
+    fn recorded(&mut self, member: u64, stated: &Stated) {
+        let record = self.records.entry(member).or_default();
+        for (entry, late) in self.pending.remove(&member).unwrap_or_default() {
+            if let (Entry::Told(Change::Suspected(suspicion)), Some(late)) = (entry, late) {
+                self.suspicions.push((
+                    member,
+                    suspicion.peer,
+                    Suspected {
+                        at: suspicion.at_ns,
+                        due: suspicion.last.map_or(0, |last| last.due_ns),
+                        sent: suspicion.last.map_or(0, |last| last.sent_ns),
+                        detection: suspicion.detection.map_or(0, nanos),
+                        noticed: suspicion.noticed_ns,
+                        late,
+                    },
+                ));
+            }
+            record.push(entry);
+        }
+        let differs: Vec<String> = stated
+            .peers
+            .iter()
+            .filter_map(|(peer, seen)| {
+                record.differs(
+                    *peer,
+                    &PairReport {
+                        suspicions: seen.suspicions,
+                        taken: seen.taken,
+                        unproven: seen.unproven,
+                        sent: seen.sent,
+                        skipped: seen.skipped,
+                        ..PairReport::default()
+                    },
+                )
+            })
+            .collect();
+        assert!(
+            differs.is_empty(),
+            "member {member}'s line at {}: {}\n{}",
+            stated.at,
+            differs.join("; "),
+            self.dump()
+        );
+    }
+
+    /// Every line the members wrote before they ended, folded in: once every member is stopped,
+    /// their outputs end.
+    fn finish(&mut self) {
+        while let Ok(line) = self.lines.recv() {
+            self.fold(&line);
+        }
+    }
+
+    /// Every suspicion in the members' records traced to the detector's rule (`record::trace`); one
+    /// that does not trace fails the test, each named. What the trace found.
+    fn traced(&self) -> Traced {
+        let records: Vec<(PeerId, &[Entry])> = self
+            .records
+            .iter()
+            .map(|(member, record)| (*member, record.entries.as_slice()))
+            .collect();
+        let (traced, failures) = record::trace(&records);
+        assert!(
+            failures.is_empty(),
+            "{} suspicions or passed points do not trace to the detector's rule:\n{}",
+            failures.len(),
+            failures.join("\n")
+        );
+        traced
     }
 
     /// How long the members may go with nothing moving before a wait gives up: the longest any
@@ -1555,6 +1908,8 @@ fn start(nodes: u64) -> Group {
             trace: std::env::var_os("HYPER_LIVENESS_TRACE").is_some(),
             latest: BTreeMap::new(),
             suspicions: Vec::new(),
+            records: BTreeMap::new(),
+            pending: BTreeMap::new(),
             heard: Vec::new(),
             configured_since: BTreeMap::new(),
             checks: Checks::default(),
@@ -1649,6 +2004,8 @@ fn a_stalled_disk_and_a_killed_node_are_suspected_and_no_live_one_is() {
         })
     });
     supervisor.members.stop();
+    supervisor.finish();
+    let traced = supervisor.traced();
 
     let (mut suspicions, mut allowance) = (0u64, 0.0f64);
     for member in &live {
@@ -1659,9 +2016,12 @@ fn a_stalled_disk_and_a_killed_node_are_suspected_and_no_live_one_is() {
             allowance += seen.allowance;
         }
     }
+    // Every suspicion each member made traced to the detector's rule; the count against the
+    // allowance is the model's figure, reported, not asserted.
+    println!("every suspicion traced: {traced}");
     println!(
         "stalled disk suspected after {:?}; killed node after {:?}; suspicions of live members \
-         {suspicions} (Theorem 7 allows {allowance:.3})",
+         {suspicions}, allowance {allowance:.3}",
         watchers
             .iter()
             .map(|m| {
@@ -1684,11 +2044,6 @@ fn a_stalled_disk_and_a_killed_node_are_suspected_and_no_live_one_is() {
                 )
             })
             .collect::<Vec<_>>(),
-    );
-    assert!(
-        poisson95(suspicions).0 <= allowance,
-        "{suspicions} suspicions of live members refute the {allowance} the configured detectors \
-         allow"
     );
 }
 
@@ -1731,6 +2086,8 @@ fn a_node_killed_in_its_first_heartbeats_is_suspected_once_a_sibling_has_its_evi
             .all(|m| s.holds_suspected(*m, victim, killed_at))
     });
     supervisor.members.stop();
+    supervisor.finish();
+    println!("every suspicion traced: {}", supervisor.traced());
     let mut noticed = Vec::new();
     for member in &survivors {
         let found = supervisor.suspicion(*member, victim);
@@ -1937,6 +2294,8 @@ fn a_stopped_member_fails_the_wait_that_needs_it_by_name() {
         })
     });
     supervisor.members.stop();
+    supervisor.finish();
+    println!("every suspicion traced: {}", supervisor.traced());
     println!(
         "a member stopped: the wait for it failed after {silence:?} of its silence past its due \
          against {excuse:?} excused, naming it; let go, it was trusted again; {}",

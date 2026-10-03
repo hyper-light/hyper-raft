@@ -336,14 +336,42 @@ impl Socket {
     }
 
     /// Takes one batch of datagrams that have arrived, handing each to `deliver` with its arrival;
-    /// returns how many, 0 when none had.
+    /// returns how many, 0 when none had. Through the reactor's readiness: what a wake for the
+    /// socket's readiness takes, the readiness cleared when the socket is found empty.
     pub(crate) fn receive(
         &mut self,
+        deliver: impl FnMut(Arrival, &mut [u8]),
+    ) -> Result<usize, Error> {
+        self.receive_batch(Through::Reactor, deliver)
+    }
+
+    /// [`receive`](Self::receive), asking the kernel whatever the reactor last saw: what an owner
+    /// reads before it judges a time, which must take every datagram the kernel stamped before it.
+    /// The reactor's readiness is what it saw at its last turn, and a datagram that came after
+    /// (through a stop of the process, say) is in the socket with a stamp before the owner's time
+    /// while the reactor says the socket is empty. Where the stamp is the read's (Windows, or a
+    /// kernel that refused the stamps), a datagram not yet read has no stamp before the owner's
+    /// time, and the reactor's readiness serves.
+    pub(crate) fn receive_queued(
+        &mut self,
+        deliver: impl FnMut(Arrival, &mut [u8]),
+    ) -> Result<usize, Error> {
+        let through = if self.stats.kernel_stamps {
+            Through::Kernel
+        } else {
+            Through::Reactor
+        };
+        self.receive_batch(through, deliver)
+    }
+
+    fn receive_batch(
+        &mut self,
+        through: Through,
         mut deliver: impl FnMut(Arrival, &mut [u8]),
     ) -> Result<usize, Error> {
         let mut delivered = 0usize;
         for _ in 0..self.batch {
-            match self.receive_some(&mut deliver) {
+            match self.receive_some(through, &mut deliver) {
                 Ok(0) => break,
                 Ok(count) => {
                     delivered = delivered.saturating_add(count);
@@ -364,7 +392,11 @@ impl Socket {
     }
 
     #[cfg(target_os = "linux")]
-    fn receive_some(&mut self, deliver: &mut impl FnMut(Arrival, &mut [u8])) -> io::Result<usize> {
+    fn receive_some(
+        &mut self,
+        through: Through,
+        deliver: &mut impl FnMut(Arrival, &mut [u8]),
+    ) -> io::Result<usize> {
         use std::os::fd::AsRawFd;
         let fd = self.udp.as_raw_fd();
         let Self {
@@ -375,9 +407,11 @@ impl Socket {
             ..
         } = self;
         linux.received.clear();
-        udp.try_io(tokio::io::Interest::READABLE, || {
-            linux::receive(fd, buffers, &mut linux.receive, &mut linux.received)
-        })?;
+        let mut take = || linux::receive(fd, buffers, &mut linux.receive, &mut linux.received);
+        match through {
+            Through::Reactor => udp.try_io(tokio::io::Interest::READABLE, take),
+            Through::Kernel => take(),
+        }?;
         stats.receive_calls = stats.receive_calls.saturating_add(1);
         // Both clocks once a batch, after the receive: a stamp is carried over by its age. The
         // realtime clock first: a thread preempted between the two reads then makes the age's end
@@ -419,7 +453,11 @@ impl Socket {
     }
 
     #[cfg(target_os = "macos")]
-    fn receive_some(&mut self, deliver: &mut impl FnMut(Arrival, &mut [u8])) -> io::Result<usize> {
+    fn receive_some(
+        &mut self,
+        through: Through,
+        deliver: &mut impl FnMut(Arrival, &mut [u8]),
+    ) -> io::Result<usize> {
         if !self.stats.kernel_stamps {
             return self.receive_portable(deliver);
         }
@@ -428,9 +466,12 @@ impl Socket {
         let mut buffers = std::mem::take(&mut self.buffers);
         let result = match buffers.first_mut() {
             None => Ok(None),
-            Some(buffer) => self
-                .udp
-                .try_io(tokio::io::Interest::READABLE, || macos::receive(fd, buffer)),
+            Some(buffer) => match through {
+                Through::Reactor => self
+                    .udp
+                    .try_io(tokio::io::Interest::READABLE, || macos::receive(fd, buffer)),
+                Through::Kernel => macos::receive(fd, buffer),
+            },
         };
         let delivered = match result {
             Err(error) => Err(error),
@@ -474,9 +515,22 @@ impl Socket {
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    fn receive_some(&mut self, deliver: &mut impl FnMut(Arrival, &mut [u8])) -> io::Result<usize> {
+    fn receive_some(
+        &mut self,
+        _through: Through,
+        deliver: &mut impl FnMut(Arrival, &mut [u8]),
+    ) -> io::Result<usize> {
         self.receive_portable(deliver)
     }
+}
+
+/// Whom a receive asks whether the socket holds a datagram.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Through {
+    /// The reactor's readiness, as of its last turn.
+    Reactor,
+    /// The kernel itself: a receive that does not block, whatever the reactor last saw.
+    Kernel,
 }
 
 /// Which way the socket is ready.

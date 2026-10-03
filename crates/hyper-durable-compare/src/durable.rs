@@ -105,6 +105,16 @@ impl StateMachine for RangeMachine {
 pub struct Depth<F: BlockFile + 'static>(GroupStore<F>, usize);
 
 impl<F: BlockFile + 'static> LogStore for Depth<F> {
+    type Hold = std::convert::Infallible;
+
+    fn held(&self) -> Option<&Self::Hold> {
+        None
+    }
+
+    fn release(&mut self, met: &Self::Hold) {
+        match *met {}
+    }
+
     fn depth(&self) -> usize {
         self.1
     }
@@ -186,6 +196,7 @@ fn settings(id: u64) -> Settings {
             ..Config::new(id)
         },
         quiet: std::time::Duration::from_millis(10),
+        elections: hyper_raft::Elections::Suspicion,
     }
 }
 

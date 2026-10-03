@@ -266,6 +266,7 @@ impl Node {
             // moment no write is out, the soonest a member that stops can reopen with what it
             // applied, at one write a lull (`docs/durable.md` §4.1).
             quiet: Duration::ZERO,
+            elections: hyper_raft::Elections::Suspicion,
         };
         let store = GroupStore::claim(&log, GROUP).map_err(|e| match e {
             hyper_durable::ClaimError::Log(e) => NodeError::Log(e),

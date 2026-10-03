@@ -21,8 +21,9 @@ use std::task::Waker;
 
 use hyper_durable::{
     Budget, Bytes, Cause, EntryRef, Fatal, Fault, LogStore, OpenError, Output, Owner, Point,
-    RamStore, Replica, ReplicaError, Settings, StateMachine, Unbounded, Write,
+    RamStore, Replica, ReplicaError, Settings, StateMachine, StoreView, Unbounded, Write,
 };
+use hyper_raft::StorageError;
 use hyper_raft::proto::{
     ConfChangeSingle, ConfChangeTransition, ConfChangeType, ConfChangeV2, ConfState, Entry,
     HardState, Message, MessageType,
@@ -845,4 +846,362 @@ fn now() -> u64 {
         clock.set(now);
         now
     })
+}
+
+/// What an entry's data says it needs: `NEEDS` and then the eight bytes of the precondition.
+const NEEDS: &[u8] = b"needs";
+
+/// A store that holds a write until its owner meets what the write's entries need, as focal's
+/// store holds the first entry that needs a successor decoder until the group's record of that
+/// floor is durable (focal 27 §15.5, O2). An entry whose data starts with [`NEEDS`] names its
+/// precondition in the next eight bytes. While it holds a write, every write submitted behind it
+/// is refused behind it, as hyper-log refuses a handle's writes sent after a refused one.
+struct Holding {
+    inner: SimStore,
+    met: Vec<u64>,
+    holding: Option<u64>,
+}
+
+impl Holding {
+    fn new(depth: usize) -> Self {
+        Self {
+            inner: SimStore::new(depth),
+            met: Vec::new(),
+            holding: None,
+        }
+    }
+    /// The first precondition `write`'s entries need that the owner has not met.
+    fn needs(&self, write: &Write<'_>) -> Option<u64> {
+        write
+            .entries
+            .iter()
+            .flat_map(|e| e.entries)
+            .filter_map(|e| e.data.strip_prefix(NEEDS))
+            .filter_map(|rest| rest.get(..8))
+            .map(|id| u64::from_le_bytes(id.try_into().unwrap()))
+            .find(|id| !self.met.contains(id))
+    }
+}
+
+impl LogStore for Holding {
+    type Hold = u64;
+
+    fn held(&self) -> Option<&u64> {
+        self.holding.as_ref()
+    }
+
+    fn release(&mut self, met: &u64) {
+        self.met.push(*met);
+        if self.holding == Some(*met) {
+            self.holding = None;
+        }
+    }
+
+    fn depth(&self) -> usize {
+        self.inner.depth()
+    }
+
+    fn view(&self) -> Result<StoreView, Fault> {
+        self.inner.view()
+    }
+
+    fn bounds(&self) -> Result<(Point, u64), StorageError> {
+        self.inner.bounds()
+    }
+
+    fn term(&self, index: u64) -> Result<u64, StorageError> {
+        self.inner.term(index)
+    }
+
+    fn entries(
+        &self,
+        low: u64,
+        high: u64,
+        max_bytes: u64,
+        into: &mut Vec<Entry>,
+    ) -> Result<(), StorageError> {
+        self.inner.entries(low, high, max_bytes, into)
+    }
+
+    fn visit(
+        &self,
+        low: u64,
+        high: u64,
+        page: u64,
+        visit: &mut dyn FnMut(EntryRef<'_>) -> bool,
+    ) -> Result<(), StorageError> {
+        self.inner.visit(low, high, page, visit)
+    }
+
+    fn proposals(&self, into: &mut Vec<Entry>) -> Result<(), StorageError> {
+        self.inner.proposals(into)
+    }
+
+    fn room(&self) -> bool {
+        self.inner.room()
+    }
+
+    fn submit(&mut self, write: &Write<'_>, waker: &Waker) -> Result<(), Fault> {
+        if self.holding.is_some() {
+            return Err(Fault::Behind);
+        }
+        if let Some(needs) = self.needs(write) {
+            self.holding = Some(needs);
+            return Err(Fault::Held);
+        }
+        self.inner.submit(write, waker)
+    }
+
+    fn poll(&mut self) -> Option<Result<(), Fault>> {
+        self.inner.poll()
+    }
+
+    fn write_now(&mut self, write: &Write<'_>) -> Result<(), Fault> {
+        self.inner.write_now(write)
+    }
+}
+
+/// Drives `r` and makes every write durable until nothing is out and nothing more to do, or it
+/// stalls.
+fn pump_holding(r: &mut Replica<Holding, Kv>) -> Output<(u64, Vec<u8>)> {
+    let mut all = Output::default();
+    let mut out = Output::default();
+    for _ in 0..10_000 {
+        out.clear();
+        let driven = r.drive(now(), waker(), &mut out).unwrap();
+        all.messages.append(&mut out.messages);
+        all.answers.append(&mut out.answers);
+        let mut made = false;
+        while r.log_mut().inner.make_durable() {
+            made = true;
+        }
+        if !made && !driven.more && driven.out == 0 && r.log_mut().inner.unanswered() == 0 {
+            return all;
+        }
+    }
+    panic!("the replica never rested");
+}
+
+fn needing(id: u64) -> Vec<u8> {
+    let mut data = NEEDS.to_vec();
+    data.extend_from_slice(&id.to_le_bytes());
+    data
+}
+
+/// A write the store holds for its owner stalls the replica whole, as a refusal for room does,
+/// but names what it waits for in the store's own type: inputs are refused `Stalled`, nothing
+/// that depends on the write is answered, and it is counted once. Once the owner meets the
+/// precondition the write is made again, and what it held is committed and applied.
+#[test]
+fn a_write_the_store_holds_waits_whole_until_its_owner_meets_what_it_holds_for() {
+    let mut r = Replica::open(
+        &settings(1, 7),
+        Holding::new(1),
+        Kv::new(voters(&[1]), false),
+        Unbounded,
+    )
+    .unwrap();
+    r.campaign().unwrap();
+    pump_holding(&mut r);
+    assert!(r.is_leader());
+    r.propose(Vec::new(), b"plain".to_vec()).unwrap();
+    pump_holding(&mut r);
+    let applied = r.machine().now.applied.index;
+    r.propose(Vec::new(), needing(7)).unwrap();
+    // The drive that submits the write learns of the hold at once from the store; the next takes
+    // the refusal, in order with the writes before it, and stalls.
+    let mut out = Output::default();
+    r.drive(now(), waker(), &mut out).unwrap();
+    assert_eq!(r.held(), Some(&7));
+    let driven = r.drive(now(), waker(), &mut out).unwrap();
+    assert!(r.is_stalled());
+    assert_eq!(driven.stalled, Some(Fault::Held));
+    assert!(out.answers.is_empty());
+    assert_eq!(
+        r.propose(Vec::new(), b"no".to_vec()),
+        Err(ReplicaError::Stalled)
+    );
+    for _ in 0..100 {
+        let mut out = Output::default();
+        let driven = r.drive(now(), waker(), &mut out).unwrap();
+        assert_eq!(driven.stalled, Some(Fault::Held), "held until it is met");
+        assert!(out.answers.is_empty() && out.messages.is_empty());
+    }
+    assert_eq!(
+        r.machine().now.applied.index,
+        applied,
+        "nothing held was applied"
+    );
+    assert_eq!(r.writes().held, 1, "a held write is counted once");
+    r.release(&7);
+    let out = pump_holding(&mut r);
+    assert!(!r.is_stalled() && r.held().is_none());
+    assert_eq!(r.machine().now.applied.index, applied + 1);
+    assert_eq!(
+        out.answers.len(),
+        1,
+        "the held entry was answered once it was durable"
+    );
+    assert_eq!(r.writes().held, 1);
+}
+
+/// A member that stops after its owner met the precondition and before the held write was made
+/// again reopens with nothing of it: the write never changed the store, so the member holds
+/// what it held before it, and goes on from there.
+#[test]
+fn a_member_stopped_between_release_and_the_write_made_again_reopens_without_it() {
+    let mut r = Replica::open(
+        &settings(1, 7),
+        Holding::new(1),
+        Kv::new(voters(&[1]), false),
+        Unbounded,
+    )
+    .unwrap();
+    r.campaign().unwrap();
+    pump_holding(&mut r);
+    r.propose(Vec::new(), b"plain".to_vec()).unwrap();
+    pump_holding(&mut r);
+    let before = r.log_mut().inner.disk.clone();
+    r.propose(Vec::new(), needing(9)).unwrap();
+    let mut out = Output::default();
+    r.drive(now(), waker(), &mut out).unwrap();
+    assert_eq!(r.held(), Some(&9));
+    r.release(&9);
+    // Stopped here: the store keeps what was durable, which the held write never touched.
+    let disk = r.log_mut().inner.disk.clone();
+    assert_eq!(disk, before, "a held write changed nothing");
+    drop(r);
+    let mut again = Holding::new(1);
+    again.inner = SimStore::from_disk(disk, 1);
+    let mut r = Replica::open(
+        &settings(1, 7),
+        again,
+        Kv::new(voters(&[1]), false),
+        Unbounded,
+    )
+    .unwrap();
+    r.campaign().unwrap();
+    pump_holding(&mut r);
+    assert!(r.is_leader());
+    // The owner meets the precondition again, as it does whenever it learns what a write needs.
+    r.propose(Vec::new(), needing(9)).unwrap();
+    let mut out = Output::default();
+    r.drive(now(), waker(), &mut out).unwrap();
+    // Released before the replica took the refusal: the release is not lost.
+    r.release(&9);
+    pump_holding(&mut r);
+    assert!(!r.is_stalled());
+}
+
+/// On ticks the replica elects by the owner's ticks and takes no detector's word, no timing and
+/// no deadline: the two ways never mix. A stalled replica is not ticked, and the ticks it missed
+/// are not given again.
+#[test]
+fn a_replica_on_ticks_elects_by_its_owners_ticks_and_hears_no_detector() {
+    let mut s = settings(1, 7);
+    s.elections = hyper_raft::Elections::Ticks;
+    let election = s.core.election_tick;
+    let mut r: Sim = Replica::open(
+        &s,
+        SimStore::new(1),
+        Kv::new(voters(&[1, 2, 3]), false),
+        Unbounded,
+    )
+    .unwrap();
+    assert!(matches!(r.suspect(2), Err(ReplicaError::Refused(_))));
+    assert!(matches!(r.trust(2), Err(ReplicaError::Refused(_))));
+    assert!(matches!(r.restarted(2), Err(ReplicaError::Refused(_))));
+    assert!(matches!(
+        r.set_timing(hyper_raft::Timing {
+            span: std::time::Duration::from_millis(100),
+            round: std::time::Duration::from_millis(10),
+        }),
+        Err(ReplicaError::Refused(_))
+    ));
+    assert_eq!(r.deadline(), None);
+    r.set_randomized_election_timeout(election).unwrap();
+    assert!(
+        matches!(
+            r.set_randomized_election_timeout(election * 2),
+            Err(ReplicaError::Refused(_))
+        ),
+        "a timeout outside one to two election ticks"
+    );
+    // One tick short of its timeout it asks nothing; the tick that reaches it campaigns.
+    for _ in 1..election {
+        assert!(!r.tick().unwrap());
+        assert!(pump(&mut r).messages.is_empty());
+    }
+    assert!(r.tick().unwrap());
+    let asked = pump(&mut r).messages;
+    let pre_votes: Vec<&Message> = asked
+        .iter()
+        .filter(|m| m.msg_type == MessageType::MsgRequestPreVote)
+        .collect();
+    assert_eq!(pre_votes.len(), 2);
+    // Its pre-votes and then its votes answered as if by the other two: it leads.
+    for m in pre_votes {
+        r.step(Message {
+            msg_type: MessageType::MsgRequestPreVoteResponse,
+            from: m.to,
+            to: 1,
+            term: m.term,
+            ..Message::default()
+        })
+        .unwrap();
+    }
+    let votes = pump(&mut r).messages;
+    for m in votes
+        .iter()
+        .filter(|m| m.msg_type == MessageType::MsgRequestVote)
+    {
+        r.step(Message {
+            msg_type: MessageType::MsgRequestVoteResponse,
+            from: m.to,
+            to: 1,
+            term: m.term,
+            ..Message::default()
+        })
+        .unwrap();
+    }
+    pump(&mut r);
+    assert!(r.is_leader());
+    // Stalled for room, it is not ticked: however many ticks pass, it beats no one.
+    r.propose(Vec::new(), b"x".to_vec()).unwrap();
+    let mut out = Output::default();
+    r.drive(now(), waker(), &mut out).unwrap();
+    r.log_mut().refuse = Some(Fault::Room("the group's retained bound"));
+    r.log_mut().make_durable();
+    r.log_mut().full = true;
+    let mut out = Output::default();
+    r.drive(now(), waker(), &mut out).unwrap();
+    assert!(r.is_stalled());
+    for _ in 0..election * 4 {
+        assert!(!r.tick().unwrap(), "a stalled member takes no part");
+        let mut out = Output::default();
+        r.drive(now(), waker(), &mut out).unwrap();
+        assert!(out.messages.is_empty(), "a stalled leader beats no one");
+    }
+    // Room again: the refused write is made again, and the ticks it missed are not given again.
+    r.log_mut().full = false;
+    r.resume();
+    pump(&mut r);
+    assert!(!r.is_stalled() && r.is_leader());
+    // Between ticks, the owner may have the leader beat.
+    r.beat().unwrap();
+    let beats = pump(&mut r).messages;
+    assert_eq!(
+        beats
+            .iter()
+            .filter(|m| m.msg_type == MessageType::MsgHeartbeat)
+            .count(),
+        2
+    );
+}
+
+/// By suspicion the replica takes no ticks.
+#[test]
+fn a_replica_by_suspicion_takes_no_ticks() {
+    let mut r = sole(1, Unbounded, |_| {});
+    assert!(matches!(r.tick(), Err(ReplicaError::Refused(_))));
 }

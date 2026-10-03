@@ -26,6 +26,10 @@
 //! each pair its groups' expected election ([`Owner::measure`]), and feeds the stream each
 //! replica's durable writes from [`Driven::flushed`]. A change reaches the replicas of that node
 //! only: the node's standing changed, which is rare, and an idle group is touched by nothing else.
+//!
+//! **Ticks** (`docs/durable.md` §8). A replica that elects on ticks takes none of this: its owner
+//! gives it a tick once a period ([`Replica::tick`]), and the stream's words and timing are
+//! refused by it, which [`Owner::believe`] and [`Owner::measure`] pass over.
 use std::collections::VecDeque;
 use std::task::Waker;
 use std::time::Duration;

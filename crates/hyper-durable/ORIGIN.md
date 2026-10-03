@@ -109,3 +109,29 @@ behind its mark and asks its pre-votes naming its log's last entry) and
 `a_marked_member_of_two_takes_no_part_in_elections` (two voters: refused `Marked`, due for nothing,
 asking no one).
 
+
+## Ticks and a store's hold, for focal's D-2 (2026-10-03)
+
+Asked by focal's design for F-1 and D-2 (focal 27 §15, reviewed by focal's session), and needed by
+mantle's D-1 where its owner cannot yet carry the node-pair stream.
+
+- **Ticks** (`docs/durable.md` §8). `Settings::elections` replaces the shell's fixed choice of
+  suspicion. It has no default, so every owner states it, and it is fixed while the replica runs.
+  On ticks, `Replica::tick`, `beat`, `set_randomized_election_timeout` and `set_patience` are
+  focal-consensus's `DurableNode` calls of the same meaning. The detectors' words are refused, as
+  the core refuses them, so there is no mixed mode. A stalled replica is not ticked, and the ticks
+  it missed are never given again: mantle's replay of them was a defect (§10). The tick mode goes
+  once the last owner elects by suspicion.
+- **A store's hold** (§2.4). focal's `DurableNode` refuses to persist the first entry that needs a
+  successor decoder until the group's floor is durable (focal 18 §4–§5, `decoder.rs`). In the shell
+  that rule is the store's: `LogStore::Hold` names what a write waits for, `Fault::Held` refuses
+  it, changing nothing, and `Replica::held` and `release` let the owner see it and meet it. The
+  replica stalls whole, as for room; the held write is counted (`Writes::held`); a store refuses
+  every write behind a held one. A release that comes before the shell took the refusal is kept:
+  the stall starts freed when the store holds nothing. The second test below failed without that,
+  a replica waiting for a release that had come.
+- Tests (`tests/shell.rs`):
+  - `a_write_the_store_holds_waits_whole_until_its_owner_meets_what_it_holds_for`;
+  - `a_member_stopped_between_release_and_the_write_made_again_reopens_without_it`;
+  - `a_replica_on_ticks_elects_by_its_owners_ticks_and_hears_no_detector`;
+  - `a_replica_by_suspicion_takes_no_ticks`.

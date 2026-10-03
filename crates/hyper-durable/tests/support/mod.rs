@@ -237,6 +237,16 @@ impl SimStore {
 }
 
 impl LogStore for SimStore {
+    type Hold = std::convert::Infallible;
+
+    fn held(&self) -> Option<&Self::Hold> {
+        None
+    }
+
+    fn release(&mut self, met: &Self::Hold) {
+        match *met {}
+    }
+
     fn depth(&self) -> usize {
         self.depth
     }

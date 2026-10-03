@@ -149,6 +149,11 @@ pub enum Fault {
     /// Submitted behind a write that was refused: it changed nothing.
     #[error("a write submitted behind a refused one")]
     Behind,
+    /// Held by the store for its owner: a precondition of the store's own, which it names in its
+    /// own type ([`LogStore::held`]), is not yet met. It changed nothing, and the replica waits,
+    /// whole, until the owner meets it ([`LogStore::release`], `docs/durable.md` §2.4).
+    #[error("held by the store for its owner")]
+    Held,
     /// The write failed: the device's contents are unknown, and the replica is fenced until it
     /// is reopened from what is durable (Rebello et al., ATC 2020; `docs/research/durable.md`
     /// §5).
@@ -157,9 +162,10 @@ pub enum Fault {
 }
 
 impl Fault {
-    /// Whether the write changed nothing and may be made again once there is room.
+    /// Whether the write changed nothing and may be made again once there is room, or once the
+    /// owner met what the store held it for.
     pub fn changed_nothing(&self) -> bool {
-        matches!(self, Self::Room(_) | Self::Behind)
+        matches!(self, Self::Room(_) | Self::Behind | Self::Held)
     }
 }
 
@@ -168,6 +174,18 @@ impl Fault {
 /// Reads answer from what the answered writes left: a write is in the store's state once its
 /// answer has been taken with [`LogStore::poll`].
 pub trait LogStore {
+    /// What the store may hold a write for until its owner meets it, outside the log: focal's
+    /// store holds the first entry that needs a successor decoder until the group's record of
+    /// that floor is durable (focal 27 §15.5, O2). [`std::convert::Infallible`] for a store that
+    /// holds nothing.
+    type Hold;
+
+    /// What the store holds its refused write for, while it holds one ([`Fault::Held`]).
+    fn held(&self) -> Option<&Self::Hold>;
+
+    /// The owner met `met`: the store takes the write it held when it is made again.
+    fn release(&mut self, met: &Self::Hold);
+
     /// The writes this store keeps out for the group at once (`docs/durable.md` §6): the core
     /// takes `Ready`s ahead of their persistence up to this many. hyper-log's handle gives one
     /// for each of the log's pipeline frames; a store that completes each write before `submit`

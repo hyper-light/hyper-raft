@@ -164,7 +164,22 @@ the fast track's proposals among it (`RawNode::issued_proposals`: the core keeps
 write issued until its notice), whose notice is the last refused `Ready`'s: a member that cannot persist takes no part (mantle, audit S04). A
 snapshot report that arrives meanwhile is kept, the latest per member, since replication to that
 member pauses until its fate is known (a mantle simulation seed found a lost report pausing it for
-good). Any other failure fences the replica: a failed flush leaves the device's contents unknown
+good).
+
+A write the store holds for its owner (`Fault::Held`) waits the same way, whole. It is not a
+refusal for room: the store refuses it until its owner meets a precondition of the store's own,
+which the store names in its own type (`LogStore::Hold`, read through `Replica::held`). focal's
+store holds the first entry that needs a successor decoder until the group's record of that floor
+is durable (focal 27 §15.5, O2). The owner meets the precondition outside the log and gives the
+store what it met (`Replica::release`), which resumes the replica. The owner may learn of a hold
+from the store as the write is submitted and release it before the shell has taken the refusal:
+the release is kept then, for the store holds nothing when the refusal is taken, and the writes
+are made again at the next drive. The shell counts such writes (`Writes::held`). A store that holds a write refuses every write submitted behind it
+(`Fault::Behind`), as hyper-log does behind a refusal, so no later write is durable before the
+held one. Nothing that depends on the held write leaves before it is durable (I1, I2), for it is
+one of the refused writes made again.
+
+Any other failure fences the replica: a failed flush leaves the device's contents unknown
 and the page cache marked clean (Rebello et al., research §5), so the shell drops every write out
 with what waited for it, answers every call `Fenced`, and the node reopens the log and the member
 from what is durable.
@@ -597,7 +612,8 @@ Every call into the core and the state machine runs inside an unwind boundary (f
 
 **hyper-timing (L-2, built).** The core elects by suspicion (`docs/timing.md` §2.8): it campaigns
 when it trusts no leader, after the election law's randomized delay, and takes no ticks; the shell
-opens every core so (`Elections::Suspicion`) and has no `tick`. The owner tells a replica what its
+opens a core so when its owner says so (`Settings::elections`), and gives it no tick (an owner on
+ticks, below). The owner tells a replica what its
 node's detectors believe (`Replica::suspect`, `trust`, `restarted`) and its group's measured timing
 (`Replica::set_timing`); `drive` wakes the core at the owner's clock, and `Driven::wake` and
 `Replica::deadline` say when to drive again though nothing arrives, none for a group with nothing in
@@ -625,6 +641,24 @@ replica what its detectors believe. A vote's latency is a flush (I1), which the 
 the mean flush (`Flushes`): the shell feeds that fold with each hard-state write's
 submit-to-durable time, on the owner's clock passed into `drive`. A node heartbeats only after its log took a write and a flush
 within the period (`docs/timing.md` §2.1, L-3): the log's completions are that evidence.
+
+**Ticks, until each owner elects by suspicion.** focal elects on ticks until its timing and
+liveness step (focal 27 §14), and mantle until its owner carries the node-pair stream (§11, D-1).
+The shell runs the core's tick path as an owner's setting (`Settings::elections`):
+- It is fixed when the replica opens and never changed while it runs. On ticks the shell refuses
+  the detectors' words (`suspect`, `trust`, `restarted`, `set_timing`), as the core does
+  (`ticks_and_suspicion_do_not_mix`): there is no mixed mode.
+- The owner ticks it once a period (`Replica::tick`), and may send a leader's heartbeats between
+  ticks (`Replica::beat`) and set the randomized election timeout from its own pace
+  (`Replica::set_randomized_election_timeout`), as focal-consensus's `DurableNode` does.
+- A stalled replica is not ticked: a member that cannot persist takes no part. The ticks it missed
+  are never replayed, for mantle's replay of them was a defect (§10).
+- `Replica::deadline` says nothing of ticks, which the owner's period drives.
+- It goes once the last owner elects by suspicion.
+
+The core's semantics on ticks are raft-rs's, which the differential holds it to. focal's election
+suites run on the shell to show that its own (pre-vote, check-quorum, the timeout from its pace)
+are unchanged.
 
 **hyper-transport.** Messages leave as the shell releases them; the transport may lose or reorder
 them, which Raft tolerates. A message from the network is bound to its authenticated sender before
@@ -726,11 +760,17 @@ slates measured a delta format not worth a second recovery path).
   states with `commit_durable`. First test: kill a member inside the window between a replacement's
   commit and its logged commit, in the range simulation and on real processes; it fails today if
   the hole of §1 is real.
-- **focal (D-2).** `DurableNode` becomes a `Replica` over hyper-log after F-1's WAL conversion; its
-  memory budget is the `Budget`; `apply_on_written_commit` is `acts_at_start` for every entry of a
-  control group; `PersistencePending` goes, and with it the owners' ingress queues for it; decoder
-  floors and checkpoints become state-machine records written through the shell. Changes in focal
-  need the owner's permission (`docs/STATUS.md`).
+  It elects on ticks (§8) until mantle's owner carries the node-pair stream.
+- **focal (D-2).** Designed with F-1 as one step (focal 27 §15, reviewed by focal's session on
+  2026-10-03). `DurableNode` becomes a `Replica` over hyper-log, one log per data directory:
+  - its memory budget is the `Budget`;
+  - `apply_on_written_commit` is `acts_at_start` for every entry of a control group;
+  - `PersistencePending` goes, and with it the owners' ingress queues for it;
+  - each group's image and records (identity, fast track, decoder floor and transition) are files
+    of their own, ordered by rules rather than written together;
+  - focal's store wraps `GroupStore` and holds the first entry that needs a successor decoder
+    until the floor's record is durable (`Fault::Held`, §2.4);
+  - it elects on ticks (§8) until focal's timing and liveness step.
 - **slates (X-1).** A `LogStore` over its anchor publication, depth one, `submit` publishing and
   `poll` answering at once; `SavedRaft` carries what the core's `Storage` and `InitialState` read.
   Its groups are re-founded (owner's decision 9).
@@ -840,15 +880,22 @@ and allocates no more on that project's workload.
   `GroupStore` (`src/hyperlog.rs`) is hyper-log's group handle, each write one update cut into
   frame-sized parts and answered once every part is; `RamStore` (`src/memory.rs`) completes each
   write as it is submitted, depth one, slates' case and the simplest test store.
+- **A store's hold** (`src/store.rs`): `LogStore::Hold`, `held` and `release`, and
+  `Fault::Held` (§2.4). hyper-log's handle, the RAM store and the tests' stores hold nothing
+  (`Infallible`). `tests/shell.rs` holds a write whose entry needs a precondition until its
+  owner meets it, and stops a member between the release and the write made again.
 - **`StateMachine`** (`src/machine.rs`) applies an `EntryRef`, borrowed, with no copy; its
   `durable` point carries its term (§4.3); `image`, `install` (durable before it returns) and
   `persist` are its snapshot and compaction.
 - **`Replica`** (`src/replica.rs`): `open`, `step`, `suspect`, `trust`, `restarted`,
   `set_timing`, `deadline`, `campaign`, `propose`, `propose_fast`, `change`, `read`, `transfer`,
-  `report_unreachable`, `report_snapshot`, `drive`, `compact`, `resume`. Every call runs inside the unwind boundary. A drive takes the log's answers first and
+  `report_unreachable`, `report_snapshot`, `drive`, `compact`, `resume`, `held`, `release`; and
+  on ticks (§8), `tick`, `beat`, `set_randomized_election_timeout`, `set_patience`.
+  `Settings::elections` is stated by every owner, with no default. Every call runs inside the unwind boundary. A drive takes the log's answers first and
   only then, applies what the fence allows, takes at most one `Ready` (§7's quantum), and writes the
   commit alone when the fence or a quiet period asks. `Settings::quiet` is the owner's period.
-  Elections are by suspicion (L-2, §8): no ticks; a drive wakes the core and `Driven::wake` says
+  Elections are by suspicion (L-2, §8), or on the owner's ticks until it elects so: by suspicion, no
+  ticks; a drive wakes the core and `Driven::wake` says
   when to drive again; a stalled replica's campaigns are held by the shell, a marked one's by the
   core (§5.1).
 - **`Owner`** (`src/owner.rs`): an arena by generational handle, one waker a slot made by the

@@ -57,10 +57,14 @@ use crate::store::{Entries, EntryRef, Fault, Health, LogStore, Point, Write};
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Settings {
     /// The core's settings. Its `applied` is the state machine's durable index, its
-    /// `limits.readies_in_flight` the store's depth, and its elections by suspicion (timing step
-    /// L-2, `docs/timing.md` §2.3), whatever is given here: the shell runs no election ticks, so
-    /// pre-vote and check-quorum must be on, or the replica does not open.
+    /// `limits.readies_in_flight` the store's depth and its `elections` this setting's, whatever
+    /// is given here.
     pub core: Config,
+    /// How the replica elects, fixed for as long as it runs: by suspicion (timing step L-2,
+    /// `docs/timing.md` §2.3), with pre-vote and check-quorum on or the replica does not open; or
+    /// on ticks, which the owner gives ([`Replica::tick`]) until it elects by suspicion
+    /// (`docs/durable.md` §8). Stated by every owner: there is no default.
+    pub elections: Elections,
     /// The owner's period: a commit no write has stated while the applied index ran past the
     /// durable commit for this long is written then, so a member that stops reopens with what it
     /// applied (`docs/durable.md` §4.1; focal F17's period).
@@ -199,6 +203,8 @@ pub struct Writes {
     pub quiet: u64,
     /// Compactions' starts.
     pub starts: u64,
+    /// Writes the store held for its owner ([`Fault::Held`]), each counted once as it was held.
+    pub held: u64,
 }
 
 /// A write the replica made, oldest first, with what waits for it.
@@ -352,7 +358,7 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
         let mut config = settings.core.clone();
         config.applied = durable.index;
         config.limits.readies_in_flight = depth;
-        config.elections = Elections::Suspicion;
+        config.elections = settings.elections;
         // The core keeps what the log may lack and acts on it (`docs/durable.md` §5): it judges
         // votes by it, and tells a leader that counts the entries that they are lost (R-5).
         config.lost = match view.health {
@@ -783,6 +789,9 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
     /// campaigns are held while a write waits for room: a stalled member takes part in nothing.
     /// A marked one's are the core's to judge (§5).
     fn wake(&mut self, now: u64) -> Result<(), ReplicaError> {
+        if self.node.raft.config().elections == Elections::Ticks {
+            return Ok(());
+        }
         let held = self.stall.is_some();
         let told = self.node.hold_campaigns(held);
         self.must(told)?;
@@ -887,6 +896,64 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
         if let Some(stall) = self.stall.as_mut() {
             stall.freed = true;
         }
+    }
+
+    /// What the store holds the replica's refused write for, while it does ([`Fault::Held`]):
+    /// a precondition of the store's own, which its owner meets outside the log.
+    pub fn held(&self) -> Option<&L::Hold> {
+        self.node.store().log.held()
+    }
+
+    /// The owner met `met`, what the store held a write for: the store takes it, and the
+    /// replica makes its refused writes again at its next drive.
+    pub fn release(&mut self, met: &L::Hold) {
+        self.node.store_mut().log.release(met);
+        self.resume();
+    }
+
+    /// One tick of the owner's period, for a replica that elects on ticks (`docs/durable.md`
+    /// §8): the core campaigns or beats as its counts say. True when it acted. A stalled
+    /// replica is not ticked, for a member that cannot persist takes no part, and the ticks it
+    /// missed are not given again. Refused by suspicion.
+    pub fn tick(&mut self) -> Result<bool, ReplicaError> {
+        self.guarded(|r| {
+            if r.node.raft.config().elections != Elections::Ticks {
+                return Err(ReplicaError::Refused(hyper_raft::Error::Settings(
+                    "elections by suspicion take no ticks",
+                )));
+            }
+            if r.stall.is_some() {
+                return Ok(false);
+            }
+            let ticked = r.node.tick();
+            r.heard(ticked)
+        })
+    }
+
+    /// A leader sends its heartbeats now, between ticks: for an owner whose period is
+    /// stretched, the heartbeats keep the cadence its followers expect. Any other role does
+    /// nothing.
+    pub fn beat(&mut self) -> Result<(), ReplicaError> {
+        self.guarded(|r| {
+            r.takes()?;
+            let beat = r.node.ping();
+            r.heard(beat)
+        })
+    }
+
+    /// The election timeout, in ticks, from the owner's own pace: within one to two of the
+    /// core's `election_tick`, or refused.
+    pub fn set_randomized_election_timeout(&mut self, ticks: usize) -> Result<(), ReplicaError> {
+        self.guarded(|r| {
+            let set = r.node.raft.set_randomized_election_timeout(ticks);
+            r.heard(set)
+        })
+    }
+
+    /// Ticks of patience beyond the election timeout, for the stalls the owner has seen in
+    /// itself.
+    pub fn set_patience(&mut self, ticks: usize) {
+        self.node.raft.set_patience(ticks);
     }
 
     /// Hands the lead to `to`.
@@ -1101,11 +1168,18 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
     /// A write was refused, changing nothing: it, and every write after it, waits to be made
     /// again once there is room.
     fn refused(&mut self, write: Out, fault: Fault) {
+        // A store's hold its owner already met, before this refusal was taken (the owner learns
+        // of a hold from the store as the write is submitted): the writes are made again at the
+        // next drive, or the replica would wait for a release that has come.
+        let released = fault == Fault::Held && self.node.store().log.held().is_none();
+        if fault == Fault::Held {
+            self.writes_made.held = self.writes_made.held.saturating_add(1);
+        }
         let behind = self.writes.len();
         let stall = self.stall.get_or_insert_with(|| Stall {
             fault,
             behind,
-            freed: false,
+            freed: released,
             ready: None,
             messages: Vec::new(),
         });

@@ -156,6 +156,7 @@ pub fn settings(id: u64, seed: u64) -> Settings {
             ..Config::new(id)
         },
         quiet: Duration::from_millis(50),
+        elections: hyper_raft::Elections::Suspicion,
     }
 }
 

@@ -284,6 +284,16 @@ fn update_of(write: &Write<'_>) -> Result<Update, Fault> {
 }
 
 impl<F: BlockFile + 'static> LogStore for GroupStore<F> {
+    type Hold = std::convert::Infallible;
+
+    fn held(&self) -> Option<&Self::Hold> {
+        None
+    }
+
+    fn release(&mut self, met: &Self::Hold) {
+        match *met {}
+    }
+
     fn depth(&self) -> usize {
         self.group.depth()
     }

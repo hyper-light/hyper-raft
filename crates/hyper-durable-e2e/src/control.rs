@@ -164,6 +164,17 @@ pub struct Report {
     pub unjudged_interval_ns: u64,
     /// The restarts of its peers its stream has seen.
     pub restarts: u64,
+    /// The time it has had a write of its log out, all told, nanoseconds: time its group's
+    /// progress through it waited on its device (`hyper_raft_e2e::quiet`).
+    pub blocked_ns: u64,
+    /// How long its oldest write still out has been out, nanoseconds; zero when none is.
+    pub writing_ns: u64,
+    /// The longest one write of its log took, from its submission to the answer taken,
+    /// nanoseconds.
+    pub flush_most_ns: u64,
+    /// The longest it went between two reads of its socket, nanoseconds: the longest it could not
+    /// answer.
+    pub turn_most_ns: u64,
     /// The peers its detectors suspect.
     pub suspected: Vec<u64>,
     /// The peers its stream has taken a heartbeat from.
@@ -197,6 +208,10 @@ pub fn put_report(buffer: &mut Vec<u8>, id: u64, report: &Report) {
         report.unjudged,
         report.unjudged_interval_ns,
         report.restarts,
+        report.blocked_ns,
+        report.writing_ns,
+        report.flush_most_ns,
+        report.turn_most_ns,
         u64::try_from(report.voters.len()).unwrap_or(u64::MAX),
     ] {
         wire::put_u64(buffer, word);
@@ -234,15 +249,25 @@ pub fn read_report(body: &[u8], max_voters: usize) -> Option<(u64, Report)> {
         return None;
     }
     let status = read_status(&mut reader)?;
-    let durable_commit = reader.u64()?;
-    let known = reader.u64()? != 0;
-    let span_ns = reader.u64()?;
-    let round_ns = reader.u64()?;
-    let detection_ns = reader.u64()?;
-    let taken = reader.u64()?;
-    let unjudged = reader.u64()?;
-    let unjudged_interval_ns = reader.u64()?;
-    let restarts = reader.u64()?;
+    let mut words = [0u64; 13];
+    for word in &mut words {
+        *word = reader.u64()?;
+    }
+    let [
+        durable_commit,
+        known,
+        span_ns,
+        round_ns,
+        detection_ns,
+        taken,
+        unjudged,
+        unjudged_interval_ns,
+        restarts,
+        blocked_ns,
+        writing_ns,
+        flush_most_ns,
+        turn_most_ns,
+    ] = words;
     let list = |reader: &mut Reader<'_>| {
         let count = usize::try_from(reader.u64()?).ok()?;
         if count > max_voters {
@@ -260,7 +285,7 @@ pub fn read_report(body: &[u8], max_voters: usize) -> Option<(u64, Report)> {
         Report {
             status,
             durable_commit,
-            known,
+            known: known != 0,
             voters,
             span_ns,
             round_ns,
@@ -269,6 +294,10 @@ pub fn read_report(body: &[u8], max_voters: usize) -> Option<(u64, Report)> {
             unjudged,
             unjudged_interval_ns,
             restarts,
+            blocked_ns,
+            writing_ns,
+            flush_most_ns,
+            turn_most_ns,
             suspected,
             heard,
         },

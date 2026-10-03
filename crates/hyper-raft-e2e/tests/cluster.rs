@@ -27,7 +27,8 @@
 //! not wait for. An ask waits that timeout for its answer. Quiet is only time in which the test
 //! saw the group: a member's one thread answers nothing while it is in a write of its log, so a
 //! look that did not hear every member decides nothing, and the time the members say they spent in
-//! their logs' writes is not quiet either (`Cluster::moving`).
+//! their logs' writes is not quiet either (`hyper_raft_e2e::quiet`, which hyper-durable-e2e's waits
+//! keep too).
 //!
 //! The scenarios run one after another in this one thread (`harness = false`), one group at a
 //! time: at most five member processes at once.
@@ -56,22 +57,13 @@ use std::{
 use hyper_raft::proto::{self, Entry};
 use hyper_raft_e2e::{
     node,
+    quiet::{self, Heard, Progress, Quiet, RTO, Stuck, Watch},
     stream::{self, Report},
     wire::{self, Control, Kind, Op, Outcome},
 };
 
 const NODE: &str = env!("CARGO_BIN_EXE_hyper-raft-node");
 const TMP: &str = env!("CARGO_TARGET_TMPDIR");
-
-/// RFC 6298 §2.1 and §2.4: the retransmission timeout before any round trip is measured, and the
-/// least it is ever set to after, one second.
-const RTO: Duration = Duration::from_secs(1);
-/// The rounds an ask and its answer take beside an election: the ask, the broadcast that commits
-/// it, and the answer.
-const ANSWER_ROUNDS: u32 = 3;
-/// The rounds an election takes past its delay: pre-vote, vote, and the new leader's first
-/// append (`docs/timing.md` §2.3).
-const ELECTION_ROUNDS: u32 = 3;
 
 #[expect(
     clippy::disallowed_methods,
@@ -122,40 +114,15 @@ struct Member {
     wal: PathBuf,
 }
 
-/// What a wait last saw of each member's progress, and until when it waits without seeing more.
-struct Watch {
-    seen: BTreeMap<u64, [u64; 7]>,
-    /// What each member said its thread had spent in its log's writes when this watch last
-    /// heard it.
-    blocked: BTreeMap<u64, u64>,
-    /// The members a look of this watch did not hear since it last heard them.
-    unheard: std::collections::BTreeSet<u64>,
-    until: Instant,
-}
-
 struct Cluster {
     name: &'static str,
     members: Vec<Member>,
     room: Room,
-    /// What each member's latest report says its law takes: its stated detection, its election's
-    /// span and rounds, and an ask's rounds.
-    law: BTreeMap<u64, Duration>,
-    /// Looks at the group in which a member up did not answer, the time the watches were
-    /// extended for members in their logs' writes, and the most in one look.
-    unheard_looks: u64,
-    excused_total: u64,
-    excused_most: u64,
-    /// For each member that left asks unanswered since it last answered: when the first of them
-    /// was sent, and when the latest gave up.
-    unanswered: BTreeMap<u64, (Instant, Instant)>,
-    /// The longest one write of its log any member has reported, nanoseconds.
-    write_most: u64,
-    /// The stall the test ordered every member's device into, if it did (`stalled_devices`).
-    stall: Duration,
-    /// A member a look found silent past what the members' own measures excuse, and how long.
-    silent: Option<(u64, Duration)>,
-    /// The longest a look found a member up silent, and what the members' measures excused then.
-    silence_most: (Duration, Duration),
+    /// Each member's law, the asks each left unanswered, the longest write any reported, the stall
+    /// the test ordered, and what the looks have seen.
+    quiet: Quiet,
+    /// Why the latest wait that gave up did.
+    stuck: Option<Stuck>,
     test: UdpSocket,
     /// The most bytes the test's socket sends in one datagram ([`wire::largest`]).
     datagram: usize,
@@ -228,15 +195,8 @@ impl Cluster {
             name,
             members,
             room,
-            law: BTreeMap::new(),
-            unheard_looks: 0,
-            excused_total: 0,
-            excused_most: 0,
-            unanswered: BTreeMap::new(),
-            write_most: 0,
-            stall: Duration::ZERO,
-            silent: None,
-            silence_most: (Duration::ZERO, Duration::ZERO),
+            quiet: Quiet::new(),
+            stuck: None,
             test,
             datagram,
             next_id: 0,
@@ -271,15 +231,8 @@ impl Cluster {
     fn exchange(&mut self, id: u64, ask: u64) -> Option<Vec<u8>> {
         let sent = Instant::now();
         let answer = self.answer(id, ask);
-        if answer.is_some() {
-            self.unanswered.remove(&id);
-        } else {
-            let gave_up = Instant::now();
-            self.unanswered
-                .entry(id)
-                .and_modify(|(_, latest)| *latest = gave_up)
-                .or_insert((sent, gave_up));
-        }
+        self.quiet
+            .asked(id, sent, answer.is_none().then(Instant::now));
         answer
     }
     /// Sends what is in the buffer to `id` and waits for its answer to `ask`, one retransmission
@@ -333,21 +286,19 @@ impl Cluster {
         stream::put_report_ask(&mut self.buffer, ask);
         let body = self.exchange(id, ask)?;
         let (_, report) = stream::read_report(&body, hyper_raft::MAX_MEMBERS)?;
-        self.write_most = self.write_most.max(report.flush_most_ns);
         // Every write a member keeps waiting is one an apply will answer.
         assert_eq!(
             report.stray, 0,
             "{}: member {id} keeps writes no apply will answer: {report:?}",
             self.name
         );
-        let round = Duration::from_nanos(report.round_ns);
-        // The longest its detectors state to suspect a crash, or, while a pair no margin judges
-        // takes heartbeats at a longer interval, that interval: the most a wait that goes on
-        // while those heartbeats move can see none.
-        let law = Duration::from_nanos(report.detection_ns.max(report.unjudged_interval_ns))
-            + Duration::from_nanos(report.span_ns)
-            + round * (ELECTION_ROUNDS + ANSWER_ROUNDS);
-        self.law.insert(id, law);
+        let law = quiet::law(
+            report.detection_ns,
+            report.unjudged_interval_ns,
+            report.span_ns,
+            report.round_ns,
+        );
+        self.quiet.reported(id, law, report.flush_most_ns);
         Some(report)
     }
     /// Sends an instruction to `id` until it answers, each retransmission timeout, for as long as
@@ -388,30 +339,25 @@ impl Cluster {
     }
 
     /// How long the group may go with nothing moving before a wait gives up: the longest any
-    /// member's law takes, from its latest report, and never less than a retransmission timeout.
-    /// A live group suspects a dead leader within its stated detection, elects or starts a new
-    /// term within an election, and answers within an ask's rounds, so a quiet period in which
-    /// nothing moves is a group that is stuck, not one that drew a split vote. A wait has no count
-    /// of elections: it goes on while the group moves.
+    /// member's law takes (`quiet::law`), from its latest report, and never less than a
+    /// retransmission timeout. A live group suspects a dead leader within its stated detection,
+    /// elects or starts a new term within an election, and answers within an ask's rounds, so a
+    /// quiet period in which nothing moves is a group that is stuck, not one that drew a split
+    /// vote. A wait has no count of elections: it goes on while the group moves.
     fn quiet(&self) -> Duration {
-        self.law.values().copied().max().unwrap_or(RTO).max(RTO)
+        self.quiet.period()
     }
     #[allow(
         clippy::disallowed_methods,
         reason = "real processes on the host's clock, threads and environment (CLAUDE.md §1a, end to end)"
     )]
     fn watch(&self) -> Watch {
-        Watch {
-            seen: BTreeMap::new(),
-            blocked: BTreeMap::new(),
-            unheard: std::collections::BTreeSet::new(),
-            until: Instant::now() + self.quiet(),
-        }
+        self.quiet.watch(Instant::now())
     }
-    /// Whether the group is still moving: asks every member up for its report, and extends the
-    /// watch by a quiet period whenever any member's term, commit, applied index, last index or
-    /// restarts seen has moved since it last looked, or, while it has a pair no margin judges,
-    /// the heartbeats it has taken.
+    /// Whether the group is still moving: asks every member up for its report, and judges the look
+    /// by `hyper_raft_e2e::quiet`'s rule. The watch is extended by a quiet period whenever any
+    /// member's term, commit, applied index, last index or restarts seen has moved since it last
+    /// looked, or, while it has a pair no margin judges, the heartbeats it has taken.
     ///
     /// Quiet is time in which the test saw the group and nothing moved. A look that began before
     /// the quiet period ended counts as movement unseen: an ask whose answer was lost spends a
@@ -430,91 +376,47 @@ impl Cluster {
     )]
     fn moving(&mut self, watch: &mut Watch) -> bool {
         let looked = Instant::now();
-        let mut moved = false;
-        let mut excused = 0u64;
         let mut seen = Vec::new();
+        let mut heard = Vec::new();
         let mut unheard = Vec::new();
         for id in self.up_members() {
             let Some(report) = self.report(id) else {
                 unheard.push(id);
                 continue;
             };
-            let judging = if report.unjudged > 0 { report.taken } else { 0 };
-            let at = [
-                report.status.term,
-                report.status.commit,
-                report.status.applied,
-                report.status.last_index,
-                report.restarts,
-                report.unjudged,
-                judging,
-            ];
-            let changed = watch.seen.insert(id, at) != Some(at);
-            let back = watch.unheard.remove(&id);
-            if changed || back {
-                moved = true;
-            }
-            if let Some(before) = watch.blocked.insert(id, report.blocked_ns) {
-                excused = excused.max(report.blocked_ns.saturating_sub(before));
-            }
+            heard.push(Heard {
+                id,
+                progress: Progress::of(
+                    &report.status,
+                    report.restarts,
+                    report.unjudged,
+                    report.taken,
+                ),
+                blocked_ns: report.blocked_ns,
+                // Its one thread makes its writes, and answers only between them.
+                writing_ns: 0,
+            });
             seen.push(report);
         }
         for id in &unheard {
             self.running(*id);
-            watch.unheard.insert(*id);
         }
-        // A member unheard is excused only as long as the members' own measures allow: the
-        // longest one write of a log any member has reported (or the stall the test ordered),
-        // and the quiet period. Past it, it is a member that does not answer, whatever holds it.
-        let excuse = self.quiet() + Duration::from_nanos(self.write_most).max(self.stall);
-        let mut silent = None;
-        for id in &unheard {
-            // How long it left asks unanswered: from the first since it last answered to the
-            // latest, less the retransmission timeout the test waited on the latest, which an ask
-            // whose answer was lost costs the test, not the member. One lost ask is no silence;
-            // each ask after it adds the time between them.
-            let Some((first, latest)) = self.unanswered.get(id) else {
-                continue;
-            };
-            let silence = latest.saturating_duration_since(*first).saturating_sub(RTO);
-            if silence > self.silence_most.0 {
-                self.silence_most = (silence, excuse);
-            }
-            if silence > excuse && silent.is_none() {
-                silent = Some((*id, silence));
-            }
-        }
-        if silent.is_some() {
-            self.silent = silent;
-        }
-        if !unheard.is_empty() {
-            self.unheard_looks += 1;
-        }
-        self.excused_total += excused;
-        self.excused_most = self.excused_most.max(excused);
-        if moved {
-            watch.until = Instant::now() + self.quiet();
-        } else {
-            watch.until += Duration::from_nanos(excused);
-        }
-        let moving = silent.is_none() && (looked < watch.until || !unheard.is_empty());
-        if !moving {
-            // What the group was when it was judged stuck, and what it says a look later, for the
-            // failure that follows.
-            let up = self.up_members();
-            let after = self.reports(&up);
-            let why = match silent {
-                Some((id, silence)) => format!(
-                    "member {id} answered nothing for {silence:?}, past the {excuse:?} the members' longest write and the quiet period excuse"
-                ),
-                None => format!("nothing moved for {:?}", self.quiet()),
-            };
-            eprintln!(
-                "{}: {why}; the last look: {seen:?}; a look after: {after:?}",
-                self.name
-            );
-        }
-        moving
+        let Err(stuck) = self
+            .quiet
+            .look(watch, looked, Instant::now(), &heard, &unheard)
+        else {
+            return true;
+        };
+        // What the group was when it was judged stuck, and what it says a look later, for the
+        // failure that follows.
+        let up = self.up_members();
+        let after = self.reports(&up);
+        eprintln!(
+            "{}: {stuck}; the last look: {seen:?}; a look after: {after:?}",
+            self.name
+        );
+        self.stuck = Some(stuck);
+        false
     }
     /// Fails the test if member `id`'s process has ended: one that did not answer is waited on
     /// only while it runs.
@@ -601,15 +503,16 @@ impl Cluster {
     /// suspicions against Theorem 7's allowance for a peer alive throughout.
     fn detectors(&mut self) -> String {
         let ms = |ns: u64| ns as f64 / 1e6;
+        let looks = self.quiet.seen();
         let mut out = format!(
             "\n  looks that did not hear every member: {}, the longest silence {:.1} ms against \
              {:.1} ms excused; waits extended {:.1} ms for members in their logs' writes, at most \
              {:.1} ms at once",
-            self.unheard_looks,
-            self.silence_most.0.as_secs_f64() * 1e3,
-            self.silence_most.1.as_secs_f64() * 1e3,
-            ms(self.excused_total),
-            ms(self.excused_most)
+            looks.unheard_looks,
+            looks.silence_most.as_secs_f64() * 1e3,
+            looks.excused_then.as_secs_f64() * 1e3,
+            ms(looks.extended_ns),
+            ms(looks.extended_most_ns)
         );
         for id in self.up_members() {
             self.next_id += 1;
@@ -719,8 +622,7 @@ impl Cluster {
             .expect("a member that is up");
         child.kill().unwrap();
         child.wait().unwrap();
-        self.law.remove(&id);
-        self.unanswered.remove(&id);
+        self.quiet.gone(id);
     }
     /// Starts member `id` again on its log, at a port the system gives it, and tells every member
     /// up where it listens now: a port freed by a process killed is the system's to give to
@@ -1284,7 +1186,7 @@ fn stalled_devices() -> String {
     // Longer than a wait can be quiet and still look: the quiet period in force, then the members
     // asked for their reports and for a look, each ask unanswered for a retransmission timeout.
     let stall = cluster.quiet() + RTO * 2 * all.len() as u32;
-    cluster.stall = stall;
+    cluster.quiet.order_stall(stall);
     for id in &all {
         cluster.order(*id, |buffer, ask| stream::put_stall(buffer, ask, stall));
     }
@@ -1315,7 +1217,7 @@ fn stalled_devices() -> String {
         "{name}: the group did not go on after its devices did"
     );
     assert!(
-        cluster.unheard_looks > 0,
+        cluster.quiet.seen().unheard_looks > 0,
         "{name}: no look missed a member through a stall of {stall:?}"
     );
     write_range(&mut cluster, &mut client, &mut history, phase..2 * phase);
@@ -1366,10 +1268,14 @@ fn member_stopped() -> String {
         !applied,
         "{name}: member {stopped}, stopped, applied what it cannot have"
     );
-    let (silent, silence) = cluster
-        .silent
-        .take()
-        .unwrap_or_else(|| panic!("{name}: the wait ended without naming a member silent"));
+    let Some(Stuck::Silent {
+        member: silent,
+        silence,
+        ..
+    }) = cluster.stuck.take()
+    else {
+        panic!("{name}: the wait ended without naming a member silent");
+    };
     assert_eq!(
         silent, stopped,
         "{name}: the wait named member {silent}, not member {stopped}, which was stopped"

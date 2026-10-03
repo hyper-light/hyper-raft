@@ -925,7 +925,9 @@ bounds derived from that budget. What derives each count now:
   test waited on the latest) is excused only up to the longest one write of a log any member has
   reported, or the stall the test ordered, and the quiet period; past it the wait fails, naming
   the member. An ask waits that timeout for its answer, by a peek (`wire::arrives`). A wait that
-  gives up prints each member's last report and the reports of a look after.
+  gives up prints each member's last report and the reports of a look after. The rule is one
+  module, `hyper_raft_e2e::quiet`, which hyper-durable-e2e's waits keep too (`docs/timing.md` §2.9,
+  "The same rule in the other harnesses").
 - **Every report** holds the member to its bookkeeping: each write it keeps waiting has an entry
   above what it applied in the log of the term it leads (`stray`, asserted zero on every report).
 - **A phase** writes one entry more than an append carries: the datagram the platform allows

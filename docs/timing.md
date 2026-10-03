@@ -1020,19 +1020,24 @@ after a quiet period of the members' own law (the longest `η + α` any member s
 interval at which a pair no margin judges takes heartbeats, since the wait goes on while those
 move; its election's span and three rounds; an ask's three), never less than its own
 retransmission timeout (RFC 6298:
-one second before a round trip is measured and never less after, §2.1, §2.4). An ask is resent at
+one second before a round trip is measured and never less after, §2.1, §2.4). Quiet is only time in
+which the test heard every member, by hyper-raft-e2e's rule, one module both harnesses' waits keep
+(`hyper_raft_e2e::quiet`; "The same rule in the other harnesses", below). An ask is resent at
 that timeout. A member just started is waited on while its process runs. Its count bounds are the
 protocol's: a member passes each durability point at least once for each turn of writes it takes
 (the most a turn takes, `max_pending + voters + 1`), so a target that has not stopped after that
 many answered writes is a failure. New scenarios: a stalled disk (the member's file stops
 completing flushes, so its heartbeats stop; every other member suspects it and the group elects
-without it) and, at every restart, every member that heard the last run and shares a group with
-the restarted one reports the restart its stream saw. A member waits for its datagrams by a peek and
+without it), devices held while the survivors of a stalled leader elect, a member stopped (both
+below), and, at every restart, every member that heard the last run and shares a group with the
+restarted one reports the restart its stream saw. A member waits for its datagrams by a peek and
 takes them without waiting, for a receive that times out on Windows can lose the datagram arriving
 as it does, which lost the test's asks on the windows-11-arm runner (`docs/raft.md`, "The harness's
-receive"). A wait that gives up prints each member's last report (its suspicions, the peers heard,
-its unjudged pairs and the longest interval they take heartbeats at, heartbeats taken, stated
-detection, span and round) with the quiet period in force. The member's shell writes its commit
+receive"). A wait that gives up prints why, what its looks saw, and each member's last report (its
+suspicions, the peers heard, its unjudged pairs and the longest interval they take heartbeats at,
+heartbeats taken, stated detection, span and round, the time it has had a write of its log out, how
+long its oldest write still out has been, its longest write and its longest time between two reads
+of its socket) with the quiet period in force. The member's shell writes its commit
 alone at the first moment no write is out (`Settings::quiet` zero): an owner woken by events has no
 period. Measured in `docs/benchmarks.md`, "hyper-durable-e2e on its own detectors" and "A link
 younger than its evidence" (the stalled member's scenarios, 0.7–112 s on main across the six
@@ -1066,7 +1071,8 @@ against its silence counted from its first unanswered ask to its latest, less th
 timeout the test waited on the latest (a lost ask costs the test, not the member). Past it the wait
 fails, naming the member, with the group's state: `member-stopped` stops a follower (`SIGSTOP`
 on Unix; on Windows, which has no stop signal, the member holds its thread outside any write) and
-asserts the wait fails naming it, then lets it go and the group converges. The partition is also seen by the
+asserts the wait fails naming it, then lets it go and the group converges. The rule is one module,
+`hyper_raft_e2e::quiet`, which hyper-durable-e2e's waits keep as well. The partition is also seen by the
 detectors: the member cut off suspects every other and every other suspects it. Its bounds stay the
 scenario's: the keys it writes, the asks it keeps waiting, and a log of one entry a write and one a
 term, for a leader proposes no write its log already holds and each term's leader appends one
@@ -1094,6 +1100,38 @@ force and two looks' worth of retransmission timeouts, a write is sent into the 
 waits for every member to apply it. Under the old rule the test failed there with the same empty
 last look in each of five runs on macOS; under the new it waited through the silence and the write
 committed once the devices went on, in each of five.
+
+**The same rule in the other harnesses.** Two more harnesses called silence quiet as
+hyper-raft-e2e's had, each failing on CI once in a way a re-run passed:
+- **hyper-durable-e2e.** `stall-leader` on ubuntu-24.04 ("a write was never answered; quiet 1s":
+  the stalled leader's two survivors heard a moment before, in term 4 with no leader, nothing moved
+  for a second) and `stall-follower` on windows-11-arm ("the stalled member was not suspected by
+  every other; quiet 1s": every pair still unjudged, the two members up last heard 1.01 s before).
+  Its waits now keep hyper-raft-e2e's rule, moved where both harnesses read it
+  (`hyper_raft_e2e::quiet`), with its heartbeat framing (`hyper_raft_e2e::stream`), its run's record
+  (`hyper_raft_e2e::run`) and its parent watch and hold (`hyper_raft_e2e::parent`). Its members'
+  threads do no write of their own (the log's threads do), so a member held in a write still
+  answers: the fault file held every member's flushes seven seconds (`file::hold_flushes`, ordered
+  by `hyper_raft_e2e::stream::put_stall`) and each answered every look within 120 µs, its longest
+  time between two reads of its socket 7 ms, while its group moved nothing through it. The time a
+  member reports in its writes is therefore the time it had a write of its log out, the replica's
+  or the stream's, measured at its turns; and since a write that never ends would extend the watch
+  for good, a member heard with its oldest write out past the members' longest write (or the hold
+  the test ordered) and the quiet period ends the wait, named (`Stuck::Held`), as a silent one does.
+  On macOS that time ran to 37–90 % of a scenario's (the stream's own writes every `η`). A fact no
+  longer holds of a member that did not answer: the stalled member's suspicion and a restart's
+  report were true of a look that heard no one. `stalled-devices` (the leader's disk stalled, the
+  survivors' devices held the quiet period and two looks' timeouts, 7 s, as they elect, once every
+  pair is judged) failed under the old rule in 3 of 3 runs on macOS with CI's message, the survivors
+  heard 14–88 µs before, each suspecting the other and the leader, and passes under the new;
+  `member-stopped` (`SIGSTOP`; on Windows the member holds its thread until released over stdin)
+  fails the wait naming the stopped member after 2.0–3.0 s of its silence against 1.04–1.05 s
+  excused, then converges. CI's windows-11-arm form, the survivors silent while the test waits, was
+  reproduced by a helper that stopped one of them 2.5 s during stall-follower's wait (not
+  committed): 5 of 5 failed under the old rule with CI's message, its last report 1.0–2.0 s old,
+  and 5 of 5 passed under the new. Held on young links, the survivors trusted the stalled leader
+  44 s: a link younger than its evidence, its heartbeats stopped by the hold, is judged only once
+  its node's links have evidence again (§2.8), so the scenario holds once every pair is judged.
 
 **What the runs measured of the detectors** (every scenario prints, for each member, its floors,
 longest flush and longest time between two reads of its socket, and for each pair what the

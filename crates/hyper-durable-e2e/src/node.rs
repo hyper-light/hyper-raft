@@ -25,11 +25,17 @@
 //! quorum confirmed the leader and the member applied through the index it was confirmed at.
 //! Where the test armed a point (`control::Point`), the member stops there, prints `stopped
 //! <point>`, and waits to be killed.
-use std::collections::BTreeMap;
+//!
+//! The member reports what the test's waits read of it (`hyper_raft_e2e::quiet`): the time it has
+//! had a write of its log out, how long its oldest write still out has been, the longest one write
+//! took, and the longest it went between two reads of its socket. Its thread does no write of its
+//! own, but its group moves through it only as its writes become durable, and a device a machine's
+//! processes share holds them all at once.
+use std::collections::{BTreeMap, VecDeque};
 use std::io::{ErrorKind, Write as _};
 use std::net::{SocketAddr, UdpSocket};
 use std::path::Path;
-use std::sync::mpsc::Receiver;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::Waker;
 use std::time::{Duration, Instant};
 
@@ -181,6 +187,20 @@ pub struct Node {
     liveness_failed: bool,
     /// The restarts of its peers the stream reported.
     restarts: u64,
+    /// Since when the member has had a write of its log out, the replica's or the stream's, while
+    /// it has one.
+    writing_since: Option<u64>,
+    /// When each of the replica's writes still out was submitted, oldest first: they become
+    /// durable in the order made (`hyper_durable::Replica`), so the first is the oldest. At most
+    /// the replica's writes out.
+    outs: VecDeque<u64>,
+    /// The time it has had a write of its log out, all told, the one out not counted: time its
+    /// group's progress through it waited on its device, whatever its thread did meanwhile.
+    blocked: u64,
+    /// The longest one write of its log took, from its submission to the answer taken.
+    flush_most: u64,
+    /// The longest it went between two reads of its socket: the longest it could not answer.
+    turn_most: u64,
 }
 
 /// What the liveness stream asks of the member: heartbeats to send, a write to make, changes.
@@ -291,8 +311,77 @@ impl Node {
             liveness_write: None,
             liveness_failed: false,
             restarts: 0,
+            writing_since: None,
+            outs: VecDeque::new(),
+            blocked: 0,
+            flush_most: 0,
+            turn_most: 0,
             settings,
         })
+    }
+
+    /// Notes whether a write of the member's log is out, the replica's or the stream's: the time
+    /// one is, all told, is the time the member reports spending in its writes. Read at each of
+    /// its turns, as they go.
+    fn writing(&mut self) {
+        let out = self.replica.in_flight() > 0 || self.liveness_write.is_some();
+        let now = self.now();
+        match (out, self.writing_since) {
+            (true, None) => self.writing_since = Some(now),
+            (false, Some(since)) => {
+                self.blocked = self.blocked.saturating_add(now.saturating_sub(since));
+                self.writing_since = None;
+            }
+            _ => {}
+        }
+    }
+
+    /// The time the member has had a write of its log out, all told, the one out counted to now.
+    fn blocked_now(&self) -> u64 {
+        let out = self
+            .writing_since
+            .map_or(0, |since| self.now().saturating_sub(since));
+        self.blocked.saturating_add(out)
+    }
+
+    /// How long the member's oldest write still out, the replica's or the stream's, has been out;
+    /// zero when none is.
+    fn writing_now(&self) -> u64 {
+        let replica = self.outs.front().copied();
+        let stream = self.liveness_write.as_ref().map(|(_, started)| *started);
+        [replica, stream]
+            .into_iter()
+            .flatten()
+            .min()
+            .map_or(0, |oldest| self.now().saturating_sub(oldest))
+    }
+
+    /// The writes the replica has made, all told: each is a write out until the log answers it.
+    fn made(&self) -> u64 {
+        let w = self.replica.writes();
+        [w.readies, w.empty, w.fenced, w.quiet, w.starts]
+            .into_iter()
+            .fold(0u64, u64::saturating_add)
+    }
+
+    /// Takes a drive at `now` into the writes out: the writes it made, submitted at `now`, and those
+    /// the log answered, the oldest, each one write's time from its submission to its answer taken.
+    /// `made_before` and `out_before` are what the replica had made and had out before the drive.
+    /// The oldest writes out whose submission the member did not see (made as the replica opened)
+    /// are answered first, and their time is not known.
+    fn track(&mut self, now: u64, made_before: u64, out_before: usize) {
+        let made = usize::try_from(self.made().saturating_sub(made_before)).unwrap_or(0);
+        let unseen = out_before.saturating_sub(self.outs.len());
+        let answered = out_before
+            .saturating_add(made)
+            .saturating_sub(self.replica.in_flight());
+        self.outs.extend(std::iter::repeat_n(now, made));
+        for _ in 0..answered.saturating_sub(unseen) {
+            let Some(submitted) = self.outs.pop_front() else {
+                break;
+            };
+            self.flush_most = self.flush_most.max(now.saturating_sub(submitted));
+        }
     }
 
     /// Nanoseconds on the member's clock, now.
@@ -362,6 +451,7 @@ impl Node {
             match answer {
                 Ok(()) => {
                     let now = self.now();
+                    self.flush_most = self.flush_most.max(now.saturating_sub(started));
                     self.liveness.on_durable(LiveWrite::Liveness, started, now);
                 }
                 // The device failed: the log is fenced, and the replica fences at its next
@@ -371,7 +461,9 @@ impl Node {
         }
         let now = self.now();
         self.liveness.poll(now, &mut self.asked);
-        self.act_on_liveness()
+        self.act_on_liveness()?;
+        self.writing();
+        Ok(())
     }
 
     /// Carries out what the stream asked during the last call into it.
@@ -434,16 +526,18 @@ impl Node {
         &self.log
     }
 
-    /// Runs until `parent` says the test is gone, or until the member stops at an armed point
-    /// (`Ok(Some(point))`), or fails.
-    pub fn run(&mut self, parent: &Receiver<()>) -> Result<Option<Point>, NodeError> {
+    /// Runs until `stop` is set, which it reads once a turn (the test is gone), or until the
+    /// member stops at an armed point (`Ok(Some(point))`), or fails.
+    pub fn run(&mut self, stop: &AtomicBool) -> Result<Option<Point>, NodeError> {
         // The member drives once before it waits: a reopened member replays its log alone.
         self.pairs()?;
         if let Some(point) = self.drive()? {
             return Ok(Some(point));
         }
-        while parent.try_recv().is_err() {
+        let mut read = self.now();
+        while !stop.load(Ordering::Acquire) {
             self.live()?;
+            self.turn_most = self.turn_most.max(self.now().saturating_sub(read));
             // Woken at the replica's deadline or the stream's, whichever is first; by a datagram
             // otherwise, the test's going among them.
             let until = [self.replica.deadline(), self.liveness.wake()]
@@ -451,6 +545,7 @@ impl Node {
                 .flatten()
                 .min();
             self.receive_until(until)?;
+            read = self.now();
             self.live()?;
             if std::mem::take(&mut self.woken) && self.stops_at(Point::Durable) {
                 return Ok(Some(Point::Durable));
@@ -678,6 +773,15 @@ impl Node {
         if let Some((id, order)) = control::read_order(body) {
             return self.obey(id, order, from);
         }
+        if let Some((id, hold)) = stream::read_stall(body) {
+            file::hold_flushes(hold);
+            return self.respond(from, id, &Outcome::Done);
+        }
+        if let Some(id) = stream::read_hold(body) {
+            self.respond(from, id, &Outcome::Done)?;
+            hyper_raft_e2e::parent::hold_until_released();
+            return Ok(());
+        }
         let Some((id, control)) = wire::read_control(body, hyper_raft::MAX_MEMBERS) else {
             return Ok(());
         };
@@ -736,6 +840,10 @@ impl Node {
                         .max()
                         .unwrap_or(0),
                     restarts: self.restarts,
+                    blocked_ns: self.blocked_now(),
+                    writing_ns: self.writing_now(),
+                    flush_most_ns: self.flush_most,
+                    turn_most_ns: self.turn_most,
                     suspected: self
                         .attached
                         .iter()
@@ -814,6 +922,7 @@ impl Node {
     fn drive(&mut self) -> Result<Option<Point>, NodeError> {
         loop {
             let out_before = self.replica.in_flight();
+            let made_before = self.made();
             let configuration = self.replica.configuration().clone();
             self.out.clear();
             let now = self.now();
@@ -825,6 +934,8 @@ impl Node {
             if let Some((started, durable)) = driven.flushed {
                 self.liveness.on_durable(LiveWrite::Log, started, durable);
             }
+            self.track(now, made_before, out_before);
+            self.writing();
             let submitted = self.replica.in_flight() > out_before;
             let messages = std::mem::take(&mut self.out.messages);
             let released = !messages.is_empty();

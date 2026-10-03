@@ -1,9 +1,12 @@
 //! The member's log file: a real file on the machine's disk, read and written with direct I/O
 //! where the file system takes it and flushed with the platform's full flush (hyper-block's
-//! `DeviceFile`), whose next flush the test can make fail, as a device's can, or whose flushes it can
+//! `DeviceFile`), whose next flush the test can make fail, as a device's can, whose flushes it can
+//! hold for a time, as a device a machine's processes share holds them all, or whose flushes it can
 //! stall for good, as a device that stops.
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use hyper_block::DiskError;
 use hyper_block::block::BlockFile;
@@ -31,6 +34,51 @@ static STALL: AtomicBool = AtomicBool::new(false);
 /// Stalls every flush of this process's log file from now on.
 pub fn stall_flushes() {
     STALL.store(true, Ordering::Release);
+}
+
+/// When the process's clock for the hold began: the first hold the test ordered.
+static ORIGIN: OnceLock<Instant> = OnceLock::new();
+
+/// Set by the test (`hyper_raft_e2e::stream::put_stall`): until when, in nanoseconds since
+/// [`ORIGIN`], the file answers no flush. Read by whichever thread does the log's device job, set
+/// by the member's thread; a store with release ordering hands the time over, and nothing else
+/// rides on it.
+static HELD_UNTIL: AtomicU64 = AtomicU64::new(0);
+
+/// Holds every flush of this process's log file for `hold` from now: a flush begun meanwhile ends
+/// when the hold does, as on a device a machine's processes share, which holds them all at once
+/// (Docker Desktop's virtual machine held every member's flush 1.8 s together,
+/// `docs/timing.md` §2.9).
+#[allow(
+    clippy::disallowed_methods,
+    reason = "the harness's device keeps the host's clock for a hold the test asked for"
+)]
+pub fn hold_flushes(hold: Duration) {
+    let origin = *ORIGIN.get_or_init(Instant::now);
+    let until = Instant::now()
+        .saturating_duration_since(origin)
+        .saturating_add(hold);
+    HELD_UNTIL.store(
+        u64::try_from(until.as_nanos()).unwrap_or(u64::MAX),
+        Ordering::Release,
+    );
+}
+
+/// Holds the calling thread, the one doing a flush, until the hold the test ordered ends, if one
+/// was ordered and has not.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "the harness's device holds its thread through a hold the test asked for, as a device that stalls holds it"
+)]
+fn held() {
+    let Some(origin) = ORIGIN.get() else {
+        return;
+    };
+    let until = Duration::from_nanos(HELD_UNTIL.load(Ordering::Acquire));
+    let left = until.saturating_sub(Instant::now().saturating_duration_since(*origin));
+    if !left.is_zero() {
+        std::thread::sleep(left);
+    }
 }
 
 /// The log's file, whose next flush fails when the test says so.
@@ -64,6 +112,7 @@ impl BlockFile for FaultFile {
         while STALL.load(Ordering::Acquire) {
             std::thread::park();
         }
+        held();
         if FAIL_NEXT_FLUSH.swap(false, Ordering::AcqRel) {
             return Err(DiskError::Io {
                 op: "flush",

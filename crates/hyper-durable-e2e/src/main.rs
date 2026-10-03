@@ -6,18 +6,19 @@
 //! ```
 //!
 //! It prints `listening <port>` once its socket is bound, then serves until its standard input
-//! ends (the test is gone) or it is killed. Stopped at an armed point it prints `stopped <point>`
-//! and waits to be killed; fenced by a failed write it prints `fenced` and exits with status 3,
-//! for the test to start it again on its log.
+//! ends (the test is gone) or it is killed (`hyper_raft_e2e::parent`, as hyper-raft-e2e's members
+//! watch theirs). Stopped at an armed point it prints `stopped <point>` and waits to be killed;
+//! fenced by a failed write it prints `fenced` and exits with status 3, for the test to start it
+//! again on its log.
 use std::io::Write;
 use std::net::UdpSocket;
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::sync::mpsc::{Receiver, sync_channel};
+use std::sync::mpsc::sync_channel;
 
 use hyper_durable_e2e::control::{self, Order};
 use hyper_durable_e2e::node::{Node, NodeError, Settings, open_log};
-use hyper_raft_e2e::{run, wire};
+use hyper_raft_e2e::{parent, run, wire};
 
 /// The status a member exits with once a failed write fenced it.
 const FENCED: u8 = 3;
@@ -57,30 +58,15 @@ fn parse(arguments: &[String]) -> Result<Arguments, String> {
     })
 }
 
-/// Watches standard input until it ends: the parent holds its end for as long as it lives, so a
-/// member never outlives its test. One thread, blocked on the pipe; at its end it wakes the member,
-/// which waits on its socket for as long as nothing is due.
-#[allow(
-    clippy::disallowed_methods,
-    reason = "real processes on the host's clock, threads and environment (CLAUDE.md §1a, end to end)"
-)]
-fn watch_parent(socket: &UdpSocket) -> std::io::Result<Receiver<()>> {
-    let (gone, parent) = sync_channel(1);
-    let me = socket.local_addr()?;
-    let out = UdpSocket::bind("127.0.0.1:0")?;
+/// The member's own wake, as a datagram to its socket: what its log's answers and its parent's
+/// going send it. One too long to seal is sent with no bytes, which wakes the member as well.
+fn wake() -> Vec<u8> {
     let mut datagram = Vec::new();
     control::put_order(&mut datagram, 0, &Order::Wake);
-    let sealed = wire::seal(&mut datagram, wire::MAX_DATAGRAM);
-    std::thread::Builder::new()
-        .name("parent".to_owned())
-        .spawn(move || {
-            let _ = std::io::copy(&mut std::io::stdin().lock(), &mut std::io::sink());
-            let _ = gone.try_send(());
-            if sealed {
-                let _ = out.send_to(&datagram, me);
-            }
-        })
-        .map(|_| parent)
+    if !wire::seal(&mut datagram, wire::MAX_DATAGRAM) {
+        datagram.clear();
+    }
+    datagram
 }
 
 /// Turns the member's waker into a datagram to its own socket, so its one wait on the socket
@@ -94,16 +80,12 @@ fn relay(socket: &UdpSocket) -> std::io::Result<std::task::Waker> {
     let (waker, _) = hyper_measure::wake::waker(0, tell);
     let me = socket.local_addr()?;
     let out = UdpSocket::bind("127.0.0.1:0")?;
-    let mut datagram = Vec::new();
-    control::put_order(&mut datagram, 0, &Order::Wake);
-    let sealed = wire::seal(&mut datagram, wire::MAX_DATAGRAM);
+    let datagram = wake();
     std::thread::Builder::new()
         .name("wake".to_owned())
         .spawn(move || {
             while told.recv().is_ok() {
-                if sealed {
-                    let _ = out.send_to(&datagram, me);
-                }
+                let _ = out.send_to(&datagram, me);
             }
         })?;
     Ok(waker)
@@ -114,21 +96,21 @@ fn serve(arguments: Arguments) -> Result<(), Box<dyn std::error::Error>> {
     // Raised and durable before the member's liveness stream sends anything under it.
     let run = run::raise(&run::path(&arguments.log)).map_err(NodeError::Run)?;
     let socket = UdpSocket::bind(&arguments.listen)?;
-    let port = socket.local_addr()?.port();
+    let me = socket.local_addr()?;
     let waker = relay(&socket)?;
-    let parent = watch_parent(&socket)?;
+    parent::watch(me, std::thread::current(), wake())?;
     let mut node = Node::open(arguments.settings, run, socket, log, waker)?;
     let mut stdout = std::io::stdout().lock();
-    writeln!(stdout, "listening {port}")?;
+    writeln!(stdout, "listening {}", me.port())?;
     stdout.flush()?;
     drop(stdout);
-    if let Some(point) = node.run(&parent)? {
+    if let Some(point) = node.run(&parent::PARENT_GONE)? {
         let mut stdout = std::io::stdout().lock();
         writeln!(stdout, "stopped {}", point.name())?;
         stdout.flush()?;
         drop(stdout);
         // Stopped where the test armed it: it waits to be killed, or for the test to go.
-        let _ = parent.recv();
+        parent::wait_gone();
     }
     Ok(())
 }

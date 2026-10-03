@@ -8,18 +8,11 @@
 //! It prints `listening <port>` once its socket is bound, then serves until its standard input
 //! ends — its parent closed it or died, so a member never outlives the test that started it — or
 //! it is killed. Where the others listen it is told by the test (`Control::Peers`).
-use std::{
-    io::{Read, Write},
-    net::{SocketAddr, UdpSocket},
-    path::PathBuf,
-    process::ExitCode,
-    sync::atomic::Ordering,
-    thread::Thread,
-};
+use std::{io::Write, net::UdpSocket, path::PathBuf, process::ExitCode};
 
 use hyper_raft_e2e::{
-    node::{Node, NodeError, PARENT_GONE, RELEASED, Settings},
-    run,
+    node::{Node, NodeError, Settings},
+    parent, run,
     wal::Wal,
     wire::{self, Kind},
 };
@@ -77,42 +70,17 @@ fn serve(arguments: Arguments) -> Result<(), Box<dyn std::error::Error>> {
     writeln!(stdout, "listening {port}")?;
     stdout.flush()?;
     drop(stdout);
-    watch_parent(me, std::thread::current())?;
-    node.run(&PARENT_GONE)?;
-    Ok(())
-}
-
-/// Watches standard input until it ends. The parent holds the pipe's other end for as long as it
-/// lives, so a member never outlives the test that started it, however the test ends (a test
-/// killed outright runs no clean-up of its own). One thread for the process, blocked on the pipe.
-/// A byte on it releases a member the test held (`RELEASED`); at its end it sets `PARENT_GONE`
-/// and wakes the member, by unparking `member` (its thread, if held) and with an empty datagram
-/// to `me`, its socket, on which it waits for as long as nothing is due.
-#[allow(
-    clippy::disallowed_methods,
-    reason = "real processes on the host's clock, threads and environment (CLAUDE.md §1a, end to end)"
-)]
-fn watch_parent(me: SocketAddr, member: Thread) -> std::io::Result<()> {
-    let out = UdpSocket::bind(SocketAddr::new(me.ip(), 0))?;
+    // The parent's going wakes the member with an empty control datagram, which it takes and
+    // drops (`hyper_raft_e2e::parent`); one too long to seal is sent with no bytes, which wakes
+    // the member as well.
     let mut wake = Vec::new();
     wire::begin(&mut wake, Kind::Control);
-    let sealed = wire::seal(&mut wake, wire::MAX_DATAGRAM);
-    std::thread::Builder::new()
-        .name("parent".to_owned())
-        .spawn(move || {
-            let mut stdin = std::io::stdin().lock();
-            let mut byte = [0u8; 1];
-            while let Ok(1) = stdin.read(&mut byte) {
-                RELEASED.store(true, Ordering::Release);
-                member.unpark();
-            }
-            PARENT_GONE.store(true, Ordering::Release);
-            member.unpark();
-            if sealed {
-                let _ = out.send_to(&wake, me);
-            }
-        })
-        .map(drop)
+    if !wire::seal(&mut wake, wire::MAX_DATAGRAM) {
+        wake.clear();
+    }
+    parent::watch(me, std::thread::current(), wake)?;
+    node.run(&parent::PARENT_GONE)?;
+    Ok(())
 }
 
 fn main() -> ExitCode {

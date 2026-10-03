@@ -96,21 +96,6 @@ impl From<std::io::Error> for NodeError {
     }
 }
 
-/// Set once the process's standard input ends: its parent is gone, and the member's loop returns.
-pub static PARENT_GONE: AtomicBool = AtomicBool::new(false);
-/// Set when a byte comes on the process's standard input: a member held by the test
-/// (`stream::put_hold`) goes on.
-pub static RELEASED: AtomicBool = AtomicBool::new(false);
-
-/// Holds the member's thread until the test releases it or goes ([`RELEASED`], [`PARENT_GONE`],
-/// each set by the process's parent watcher, which unparks this thread): it reads nothing and
-/// answers nothing meanwhile, as a member deadlocked outside a write of its log.
-fn hold_until_released() {
-    while !RELEASED.swap(false, Ordering::AcqRel) && !PARENT_GONE.load(Ordering::Acquire) {
-        std::thread::park();
-    }
-}
-
 /// A refusal changed nothing and is the asker's to hear; only a fatal error stops the member.
 fn heard<T>(outcome: hyper_raft::Result<T>) -> Result<Option<T>, NodeError> {
     match outcome {
@@ -836,7 +821,7 @@ impl Node {
         }
         if let Some(id) = stream::read_hold(body) {
             self.respond(from, id, &Outcome::Done)?;
-            hold_until_released();
+            crate::parent::hold_until_released();
             return Ok(());
         }
         if let Some((id, stall)) = stream::read_stall(body) {

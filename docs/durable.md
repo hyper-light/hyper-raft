@@ -907,13 +907,22 @@ Tests (`crates/hyper-durable/tests`):
   to its replica and its group's timing from what the stream measured, as `Owner` does
   (`docs/timing.md` §2.9, "On real detectors"). The test tells no member what to believe and
   derives nothing: it waits on facts while the group moves, for a quiet period of the members'
-  own law. The test (`tests/kill.rs`) kills the leader and a follower with `SIGKILL` at each named durability
+  own law, quiet only while the test hears every member, by hyper-raft-e2e's rule
+  (`hyper_raft_e2e::quiet`): a look that did not hear a member decides nothing; the time a member
+  had a write of its log out extends the wait, for the log's threads make its writes and its group
+  moves through it only as they become durable; and a member silent, or heard with its oldest write
+  out, past the longest one write any member has reported (or the hold the test ordered) and the
+  quiet period fails the wait, named (`docs/timing.md` §2.9, "The same rule in the other
+  harnesses"). The test (`tests/kill.rs`) kills the leader and a follower with `SIGKILL` at each named durability
   point (a write submitted; a write durable whose answer was not taken; messages released), and at
   seeded random points and counts; focal's F17 cases (the founder killed once it applied the
   removal of its only peer, the peer stopped for good, elects itself alone; killed with the removal
   behind its fence, the group finishes it; a host that acted on a fence, restarted told of no one,
   acts on it again from its own log); a failed flush, after which the member fences, exits
-  and rejoins; and a stalled disk, whose member every other suspects and the group elects without.
+  and rejoins; a stalled disk, whose member every other suspects and the group elects without;
+  the survivors of a stalled leader electing while their devices hold every flush past a quiet
+  period (the fault file's hold); and a member stopped, which the wait for what it cannot do names
+  before it lets it go.
   At every restart, every member that heard the last run reports the restart its stream saw. Every answered write reads back linearizably and every member applies the same
   history. With the fence taken out the fence host reopens below the fence it acted on; the
   founder's window is too narrow between processes to fail there (its write is on its way when it

@@ -67,9 +67,6 @@ const STALLED: u64 = 3;
 const KILLED: u64 = 4;
 /// The plane's datagram on the path: QUIC's minimum, which every path carries (RFC 9000 §14.1).
 const DATAGRAM: usize = 1_200;
-/// The block a liveness write writes: 4 KiB, the page and the logical block of every device the
-/// projects run on, so the write is one block and the flush is the device's.
-const BLOCK: usize = 4_096;
 
 fn secret_between(a: u64, b: u64) -> ExporterSecret {
     // Stands for the QUIC exporter both ends of a connection compute: one secret per pair.
@@ -95,13 +92,17 @@ fn device(
 ) {
     use std::io::{Seek, SeekFrom, Write};
     let clock = Clock::new().unwrap();
+    // Read access too: Windows answers a query of the file's volume on a handle that may read.
     let mut file = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
+        .read(true)
         .write(true)
-        .open(path)
+        .open(&path)
         .unwrap();
-    let block = vec![0xa5u8; BLOCK];
+    // A liveness write is one block of the size the system reports for the file, so the device
+    // takes it whole and the flush is of that block alone.
+    let block = vec![0xa5u8; hyper_block::file::preferred_block(&file, &path).unwrap()];
     while let Ok(request) = requests.recv() {
         match request {
             Request::Flush => {

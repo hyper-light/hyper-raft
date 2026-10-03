@@ -61,6 +61,11 @@ caller hands in the alignment, queue and measured depth it found.
    checked on read (`DiskError::Corrupt`); mantle keeps its node's records the same way
    (`crates/node/src/layout.rs`, `write_record`). Its first record is a node's run, the count its
    liveness stream orders runs by (`hyper_liveness::Settings::run`, `docs/timing.md` §2.8).
+6. **The block a file is written in** (`file::preferred_block`, new): the size the system reports
+   for a file, `st_blksize` on Unix and the volume's physical sector for performance on Windows
+   (`GetFileInformationByHandleEx`'s `FILE_STORAGE_INFO`, bound in `node/windows.rs`), for a writer
+   that writes one block a flush and has no device geometry of its own (hyper-liveness's process
+   test, whose 4 KiB had been asserted of every device).
 
 ## Planned
 

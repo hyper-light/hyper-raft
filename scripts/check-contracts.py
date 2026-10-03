@@ -36,7 +36,8 @@ UNSAFE_ALLOWED = {
     "crates/hyper-block/src/node/macos.rs":
         "the disk ioctls of <sys/disk.h> (a device node's capacity and cache flush)",
     "crates/hyper-block/src/node/windows.rs":
-        "IOCTL_DISK_GET_LENGTH_INFO (a device's capacity)",
+        "IOCTL_DISK_GET_LENGTH_INFO (a device's capacity) and GetFileInformationByHandleEx's "
+        "FileStorageInfo (the sector sizes of a file's volume)",
     "crates/hyper-block/src/threads/macos.rs":
         "proc_pidinfo and sysctlbyname (the process's threads and the workqueue's thread ceiling)",
     "crates/hyper-tokio/src/sys/linux.rs":

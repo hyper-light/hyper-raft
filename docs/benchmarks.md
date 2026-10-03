@@ -3743,7 +3743,8 @@ fixed below, "The cost of a heartbeat, settled"):
 ## The real-process test
 
 `crates/hyper-liveness/tests/processes.rs`: four member processes on the sealed plane through
-hyper-tokio's kernel-stamped socket, each liveness write a 4 KiB write and the platform's flush of a
+hyper-tokio's kernel-stamped socket, each liveness write a block (the size the system reports for the
+file, `hyper_block::file::preferred_block`: 4 KiB on these hosts) and the platform's flush of a
 real file on a device thread; one member's disk stalled, then another SIGKILLed. Each run reports,
 for every other member, the time from the stalled or killed member's last heartbeat's schedule to the
 suspicion and the bound the detector stated; and the suspicions of live members against Theorem 7's
@@ -4193,7 +4194,7 @@ hosts frozen up to 50 ms about every 250 ms, a device stalling one flush in fift
 | quantity | macOS (`MACOS`, `BUSY`) | Linux in Docker Desktop's VM (`LINUX`) | Windows (`WINDOWS`) |
 |---|---|---|---|
 | one-way delay, send to the kernel's stamp | the 1 ms run: median 14.7 µs, p99 44 µs, p99.9 195 µs, most 12.4 ms | the 2 ms run: median 4.9 µs, p99 13 µs, p99.9 86 µs, most 2.7 ms | Linux's: not measured, three orders below its timer and flush |
-| a 4 KiB write and full flush | `F_FULLFSYNC` every 10 ms: median 4.7 ms, p99 15.9 ms, most 205 ms; `BUSY`, back to back (the sweep): median 11.7 ms, p99 29.8 ms, most 54 ms | `fdatasync` every 2 ms: median 0.52 ms, p99 16.0 ms, most 3.66 s | uniform over 12–30 ms: the means hyper-durable-e2e's floors give on the runners, no shape within them measured (Jaynes 1957) |
+| a block's write and full flush (4 KiB, the file's `st_blksize`) | `F_FULLFSYNC` every 10 ms: median 4.7 ms, p99 15.9 ms, most 205 ms; `BUSY`, back to back (the sweep): median 11.7 ms, p99 29.8 ms, most 54 ms | `fdatasync` every 2 ms: median 0.52 ms, p99 16.0 ms, most 3.66 s | uniform over 12–30 ms: the means hyper-durable-e2e's floors give on the runners, no shape within them measured (Jaynes 1957) |
 | an owner's timer past its deadline | `select(2)`, 2,000 waits at each asked wait from 1 µs to 10 ms; at 1 ms median 255 µs, most 9.3 ms; at 10 ms median 1.8 ms, most 7.1 ms | `ppoll(2)`, the same sweep; at 1 ms median 0.99 ms, most 10.0 ms; at 10 ms median 1.17 ms, most 54 ms | the next 15.625 ms clock interrupt, its phase uniform (`timeBeginPeriod`) |
 | the host's freezes | the 1 ms run: 103 in 300 s, 3.59 s frozen; 26 of 10 ms or more, 7 of 100 ms or more, the longest 575 ms and 1.21 s; 67 of them in 31 s of the run | the 2 ms run: 3 in 300 s, of 27, 48 and 126 ms | not measured; none |
 | loss | none: 0 of 300,000 | none: 0 of 150,000 | none |

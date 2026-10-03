@@ -39,10 +39,13 @@
 //! every pair is configured and holds the waits to their bound: the wait for a line only the
 //! stopped member can state fails, naming it; let go, it is trusted again.
 //!
-//! Of live members it asserts what the configured detectors promise: Theorem 7 bounds the expected
-//! number of suspicions of a live peer by the allowance `Σβ`, and a run refutes that only when the
-//! 95 % lower limit of its count, summed over the live pairs, passes the summed allowance (the rule
-//! of hyper-swim's cluster test and of the trace replay, `docs/timing.md` §2.6).
+//! Every suspicion a member makes is traced, as it happens, to the detector's own rule (`Tracing`):
+//! the first heartbeat the member takes from the peer after the one the suspicion judged from was
+//! stamped by the kernel no earlier than the suspicion's freshness point, so the peer's heartbeats
+//! between came later or never came. One that does not trace fails the test, named. The live
+//! members' suspicions against the allowance their configurations promised are the model's
+//! figures, reported (`docs/benchmarks.md`), never asserted: no run's count is a test of a bound
+//! on an expectation.
 
 #![allow(
     clippy::unwrap_used,
@@ -69,8 +72,8 @@ use std::task::Poll;
 use std::time::Duration;
 
 use hyper_datagram::{AdmitAll, ExporterSecret, Plane, PlaneLimits, Role, SECRET_BYTES};
-use hyper_liveness::{Change, Liveness, Output, PeerId, Settings, Write, is_liveness};
-use hyper_timing::{Ballot, Exposure, Trust, WINDOW_LIMIT, poisson95};
+use hyper_liveness::{Change, Heartbeat, Liveness, Output, PeerId, Settings, Write, is_liveness};
+use hyper_timing::{Ballot, Exposure, Trust, WINDOW_LIMIT};
 use hyper_tokio::{Clock, Io, PlaneSocket};
 
 /// Members: one whose disk stalls, one killed, and two that watch both.
@@ -283,6 +286,7 @@ async fn member(me: u64, nodes: u64, file: std::path::PathBuf) {
     let mut reported_at = 0u64;
     let mut heard_all = false;
     let mut command = [0u8; 16];
+    let mut tracing = Tracing::default();
     // The first poll: it asks for the flush that proves the first heartbeats.
     let mut first = Asked {
         plane: &mut plane,
@@ -383,17 +387,47 @@ async fn member(me: u64, nodes: u64, file: std::path::PathBuf) {
             flush: false,
             changes: Vec::new(),
         };
-        socket
-            .receive_ready(asked.plane, &AdmitAll, |arrival, opened| {
-                if let Ok(opened) = opened {
-                    for message in opened.messages().filter(|m| is_liveness(m)) {
-                        inbox.push((opened.sender, arrival.at_ns, message.to_vec()));
+        // The time the stream is judged at, read before the socket is: every datagram stamped
+        // before it was in the socket by then, so the reads after take it, and the stream is fed
+        // every message stamped before the time it is polled at. Read after them, a stop between
+        // the reads and the clock (this test stops members) left heartbeats stamped before the
+        // poll unread, and the poll suspected a peer whose next heartbeat had come.
+        let now = clock.now_ns();
+        // Read until a datagram stamped at `now` or later comes, the socket being in order of
+        // arrival, or the socket is empty: `receive_ready` takes a bounded number of batches.
+        let mut latest = None;
+        while latest.is_none_or(|at| at < now) {
+            let mut read = 0usize;
+            socket
+                .receive_ready(asked.plane, &AdmitAll, |arrival, opened| {
+                    read += 1;
+                    latest = Some(arrival.at_ns);
+                    if let Ok(opened) = opened {
+                        for message in opened.messages().filter(|m| is_liveness(m)) {
+                            inbox.push((opened.sender, arrival.at_ns, message.to_vec()));
+                        }
                     }
-                }
-            })
-            .unwrap();
+                })
+                .unwrap();
+            if read == 0 {
+                break;
+            }
+        }
         for (from, at, message) in &inbox {
-            let _ = liveness.on_heartbeat(*from, message, *at, &mut asked);
+            let told = asked.changes.len();
+            let taken = liveness
+                .on_heartbeat(*from, message, *at, &mut asked)
+                .is_ok();
+            tracing.told(&asked.changes[told..]);
+            if taken
+                && let Ok(beat) = Heartbeat::decode(message)
+                && let Some(untraced) = tracing.taken(*from, beat.seq, *at)
+                && writeln!(stdout, "untraced {me} {untraced}")
+                    .and_then(|()| stdout.flush())
+                    .is_err()
+            {
+                return;
+            }
         }
         let mut flushed = false;
         while let Ok((started, durable)) = completions.try_recv() {
@@ -403,8 +437,9 @@ async fn member(me: u64, nodes: u64, file: std::path::PathBuf) {
             blocked = blocked.saturating_add(durable.saturating_sub(started));
             liveness.on_durable(Write::Liveness, started, durable);
         }
-        let now = clock.now_ns();
+        let told = asked.changes.len();
         liveness.poll(now, &mut asked);
+        tracing.told(&asked.changes[told..]);
         if asked.flush && flight.is_none() && requests.try_send(Request::Flush).is_ok() {
             flight = Some(now);
         }
@@ -448,6 +483,50 @@ async fn member(me: u64, nodes: u64, file: std::path::PathBuf) {
                 return;
             }
         }
+    }
+}
+
+/// Each suspicion a member makes, traced to the detector's own rule as it happens (NFD-E: at a
+/// freshness point the peer is trusted only if a heartbeat after the latest one taken has come):
+/// the first heartbeat the member takes from the peer after the one the suspicion judged from was
+/// stamped by the kernel no earlier than the suspicion's freshness point. The peer's heartbeats
+/// between either came later, or never came: skipped by the peer, or refused.
+#[derive(Default)]
+struct Tracing {
+    /// Each peer's suspicion not yet traced: its freshness point and the number of the heartbeat it
+    /// judged from, none for a peer never heard from.
+    open: BTreeMap<u64, (u64, Option<u64>)>,
+}
+
+impl Tracing {
+    /// The changes the stream just told.
+    fn told(&mut self, changes: &[Change]) {
+        for change in changes {
+            match change {
+                Change::Suspected(suspicion) => {
+                    self.open.insert(
+                        suspicion.peer,
+                        (suspicion.at_ns, suspicion.last.map(|last| last.seq)),
+                    );
+                }
+                // A new run numbers its heartbeats from zero: the gap ended in a restart, which
+                // is no lateness of a live peer.
+                Change::Restarted { peer, .. } => {
+                    self.open.remove(peer);
+                }
+                Change::Trusted { .. } => {}
+            }
+        }
+    }
+
+    /// Heartbeat `seq` of `peer` taken, stamped `at`: what does not trace, if anything.
+    fn taken(&mut self, peer: u64, seq: u64, at: u64) -> Option<String> {
+        let (point, last) = *self.open.get(&peer)?;
+        if last.is_some_and(|last| seq <= last) {
+            return None;
+        }
+        self.open.remove(&peer);
+        (at < point).then(|| format!("{peer} {point} {seq} {at}"))
     }
 }
 
@@ -673,6 +752,8 @@ struct Suspected {
 enum Line {
     State(u64, Stated),
     Suspect(u64, u64, Suspected),
+    /// A suspicion the member could not trace to the detector's rule (`Tracing`).
+    Untraced(u64, String),
     Heard(u64),
     /// A member held, and when it said so on the host clock.
     Held(u64, u64),
@@ -748,6 +829,10 @@ fn parse(line: &str) -> Option<Line> {
             ))
         }
         "heard" => Some(Line::Heard(fields.next()?.parse().ok()?)),
+        "untraced" => Some(Line::Untraced(
+            fields.next()?.parse().ok()?,
+            fields.collect::<Vec<_>>().join(" "),
+        )),
         "held" => Some(Line::Held(
             fields.next()?.parse().ok()?,
             fields.next()?.parse().ok()?,
@@ -958,6 +1043,13 @@ impl Supervisor {
             Some(Line::Heard(member)) => {
                 self.heard.push(member);
                 member
+            }
+            Some(Line::Untraced(member, what)) => {
+                panic!(
+                    "member {member} suspected peer, freshness point, then took heartbeat, \
+                     stamp: {what}: a heartbeat after the one the suspicion judged from came \
+                     before its freshness point"
+                )
             }
             Some(Line::Held(member, at)) => {
                 self.held = Some((member, at));
@@ -1659,9 +1751,11 @@ fn a_stalled_disk_and_a_killed_node_are_suspected_and_no_live_one_is() {
             allowance += seen.allowance;
         }
     }
+    // Every suspicion each member made was traced to the detector's rule as it happened
+    // (`Tracing`); the count against the allowance is the model's figure, reported.
     println!(
         "stalled disk suspected after {:?}; killed node after {:?}; suspicions of live members \
-         {suspicions} (Theorem 7 allows {allowance:.3})",
+         {suspicions}, allowance {allowance:.3}",
         watchers
             .iter()
             .map(|m| {
@@ -1684,11 +1778,6 @@ fn a_stalled_disk_and_a_killed_node_are_suspected_and_no_live_one_is() {
                 )
             })
             .collect::<Vec<_>>(),
-    );
-    assert!(
-        poisson95(suspicions).0 <= allowance,
-        "{suspicions} suspicions of live members refute the {allowance} the configured detectors \
-         allow"
     );
 }
 

@@ -313,8 +313,8 @@ pub fn read_report(body: &[u8], max_peers: usize) -> Option<(u64, Report)> {
     ))
 }
 
-/// What one of a member's pairs measured, the detector it runs, and its suspicions against
-/// Theorem 7's allowance (`hyper_liveness::PairReport`, `hyper_timing::Configuration`).
+/// What one of a member's pairs measured, the detector it runs, and its suspicions against the
+/// allowance its detectors promised (`hyper_liveness::PairReport`, `hyper_timing::Configuration`).
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct PairAccount {
     /// The peer.
@@ -325,6 +325,8 @@ pub struct PairAccount {
     pub judged: bool,
     /// Heartbeats sent to the peer.
     pub sent: u64,
+    /// Slots of the stream to the peer this member was behind for and never sent.
+    pub skipped: u64,
     /// Heartbeats taken from the peer.
     pub taken: u64,
     /// Heartbeats from the peer refused for their flush proof.
@@ -333,13 +335,14 @@ pub struct PairAccount {
     pub configurations: u64,
     /// Suspicions of the peer.
     pub suspicions: u64,
-    /// Theorem 7's allowance for them: the suspicions expected were the peer alive throughout.
+    /// The allowance for them: the suspicions expected were the peer alive throughout.
     pub allowance: f64,
-    /// What the configurator was last fed: `p_L`.
-    pub loss: f64,
-    /// `E(D)`, nanoseconds.
-    pub mean_delay_ns: u64,
-    /// `√V(D)`, nanoseconds.
+    /// What the configurator was last fed: the chance the next arrival's lateness is past every
+    /// one seen.
+    pub unseen: f64,
+    /// The mean lateness of an arrival past its expected arrival, nanoseconds.
+    pub lateness_ns: u64,
+    /// Its standard deviation, nanoseconds.
     pub deviation_ns: u64,
     /// The detector in force: `η`, nanoseconds.
     pub interval_ns: u64,
@@ -380,14 +383,15 @@ pub fn account(liveness: &Liveness, peers: &[PeerId], election: Option<Duration>
                 configured: report.configured,
                 judged: report.judged,
                 sent: report.sent,
+                skipped: report.skipped,
                 taken: report.taken,
                 unproven: report.unproven,
                 configurations: report.configurations,
                 suspicions: report.suspicions,
                 allowance: report.allowance,
-                loss: link.map_or(0.0, |l| l.loss),
-                mean_delay_ns: link.map_or(0, |l| nanos(l.mean_delay)),
-                deviation_ns: link.map_or(0, |l| nanos(l.delay_deviation)),
+                unseen: link.map_or(0.0, |l| l.unseen),
+                lateness_ns: link.map_or(0, |l| nanos(l.lateness)),
+                deviation_ns: link.map_or(0, |l| nanos(l.deviation)),
                 interval_ns: current.map_or(0, |d| nanos(d.interval)),
                 margin_ns: current.map_or(0, |d| nanos(d.margin)),
                 recurrence_ns: current.map_or(0, |d| nanos(d.mistake_recurrence)),
@@ -422,13 +426,14 @@ pub fn put_account(buffer: &mut Vec<u8>, id: u64, account: &Account) {
             u64::from(pair.configured),
             u64::from(pair.judged),
             pair.sent,
+            pair.skipped,
             pair.taken,
             pair.unproven,
             pair.configurations,
             pair.suspicions,
             pair.allowance.to_bits(),
-            pair.loss.to_bits(),
-            pair.mean_delay_ns,
+            pair.unseen.to_bits(),
+            pair.lateness_ns,
             pair.deviation_ns,
             pair.interval_ns,
             pair.margin_ns,
@@ -456,7 +461,7 @@ pub fn read_account(body: &[u8], max_peers: usize) -> Option<(u64, Account)> {
     }
     let mut pairs = Vec::with_capacity(count);
     for _ in 0..count {
-        let mut words = [0u64; 16];
+        let mut words = [0u64; 17];
         for word in &mut words {
             *word = reader.u64()?;
         }
@@ -465,13 +470,14 @@ pub fn read_account(body: &[u8], max_peers: usize) -> Option<(u64, Account)> {
             configured,
             judged,
             sent,
+            skipped,
             taken,
             unproven,
             configurations,
             suspicions,
             allowance,
-            loss,
-            mean_delay_ns,
+            unseen,
+            lateness_ns,
             deviation_ns,
             interval_ns,
             margin_ns,
@@ -483,13 +489,14 @@ pub fn read_account(body: &[u8], max_peers: usize) -> Option<(u64, Account)> {
             configured: configured != 0,
             judged: judged != 0,
             sent,
+            skipped,
             taken,
             unproven,
             configurations,
             suspicions,
             allowance: f64::from_bits(allowance),
-            loss: f64::from_bits(loss),
-            mean_delay_ns,
+            unseen: f64::from_bits(unseen),
+            lateness_ns,
             deviation_ns,
             interval_ns,
             margin_ns,

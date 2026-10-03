@@ -302,8 +302,11 @@ never depends on it.
     those calls queued without waiting; `stats()` counts datagrams, system calls and drops.
 - `PlaneSocket`: a hyper-datagram `Plane`'s own socket. `flush(plane, route, refused)` seals and
   sends; `receive(plane, fence, deliver).await` opens a batch; `receive_ready(plane, fence,
-  deliver)` opens what the reactor has seen queued without waiting, for an owner to feed its
-  detectors before it judges a deadline. Each datagram is delivered with its `Arrival`: the
+  deliver)` opens what is queued without waiting, for an owner to feed its detectors before it
+  judges a deadline: on a kernel-stamped socket it asks the kernel, not the reactor, whose
+  readiness is as of its last turn (a datagram that came through a stop of the process was queued
+  with a stamp before the owner's time while the reactor said the socket was empty, and the owner
+  suspected its sender; `docs/benchmarks.md`, "The detector model, at its causes"). Each datagram is delivered with its `Arrival`: the
   address and when it arrived on the socket's `Clock` (`clock()`), the kernel's receive stamp where
   the platform gives one (`docs/timing.md` §2.4, §2.8).
 - `Clock`: the host's monotonic clock in nanoseconds, which every process on the host reads alike:
@@ -393,7 +396,7 @@ it apart; 75 bytes, 99 with its echo), sealed and checksummed by the plane, and 
 the sender's log made a write durable after the previous heartbeat was due. The plane carries it
 because QUIC's datagrams share the connection's congestion window (RFC 9221 §5): a heartbeat must
 not wait behind bulk. The receiver judges it by the kernel's receive stamp (§4b, `PlaneSocket`'s
-`Arrival`), feeding what `receive_ready` gives before it polls a deadline.
+`Arrival`), reading its clock, then feeding what `receive_ready` gives, then polling at that time.
 
 Measured (`docs/benchmarks.md`, "hyper-liveness"): no allocation a heartbeat once configured, about
 0.7 to 1.0 µs of the crate's work a heartbeat; per node, two plane messages a pair an interval whatever the

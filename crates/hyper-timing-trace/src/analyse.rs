@@ -19,8 +19,8 @@ use std::path::Path;
 use std::time::Duration;
 
 use hyper_timing::{
-    Costs, Event, Floors, LinkBehaviour, LinkEstimator, Refusal, Schedule, Window, Z95, configure,
-    election_span, mistake_bound, poisson95,
+    Arrivals, Costs, Event, LinkEstimator, Refusal, Schedule, Window, configure_arrivals,
+    election_span, lateness_bound, mistake_bound,
 };
 
 use crate::{HEARTBEAT_BYTES, WAIT_BYTES};
@@ -36,6 +36,22 @@ const SOKAL_C: f64 = 6.0;
 /// The normal-consistency factor of the median absolute deviation, `1 / Φ⁻¹(3/4)`: `1.4826 · MAD`
 /// estimates `σ` for normal data (Rousseeuw and Croux, JASA 88, 1993).
 const MAD_NORMAL: f64 = 1.482_602_218_505_602;
+/// The normal distribution's two-sided 95 % point, `Φ⁻¹(0.975)`: the level of the intervals this
+/// analyser reports.
+const Z95: f64 = 1.959_963_984_540_054;
+
+/// The 95 % score interval of a Poisson count `k`, `k + z²/2 ∓ z√(k + z²/4)` (Brown, Cai and
+/// DasGupta, "Interval estimation in exponential families", Statistica Sinica 13, 2003), whose
+/// coverage is close to nominal down to small counts: reported beside a replayed mistake count. No
+/// test decides by it or by any confidence level: the tests trace each mistake to the detector's
+/// rule and report the allowance (`docs/timing.md` §2.8, "Tests").
+fn poisson95(k: u64) -> (f64, f64) {
+    // u64 → f64 rounds only past 2⁵³ mistakes.
+    let k = k as f64;
+    let centre = k + Z95 * Z95 / 2.0;
+    let half = Z95 * (k + Z95 * Z95 / 4.0).sqrt();
+    ((centre - half).max(0.0), centre + half)
+}
 
 struct Meta {
     os: String,
@@ -596,24 +612,26 @@ fn window_for(trace: &Table, interval: u64, stride: u64, g: f64) -> usize {
 
 /// The estimator run as the detector over every phase of the trace at interval `stride · η`, as a
 /// sans-io driver runs it: deadlines polled before each arrival, the arrival fed, and the detector
-/// configured from its own estimates whenever they have renewed. The sender never failed, so every
-/// suspicion is a mistake. Returns (mistakes, freshness points, the mistakes Theorem 7 allows summed
-/// over the points at the configuration then in force, configurations).
+/// configured from its own arrivals whenever their window has renewed. The sender never failed, so
+/// every suspicion is a mistake. Returns (mistakes, heartbeats taken under a margin, the bound each
+/// such heartbeat's freshness point put on it summed at the margin in force on the arrivals as they
+/// stood, configurations).
 fn online(
     trace: &Table,
     interval: u64,
     stride: u64,
     g: f64,
     costs: &Costs,
-    floors: &Floors,
+    floor: Duration,
 ) -> (u64, u64, f64, u64) {
     let eta = interval * stride;
+    let granularity = Duration::from_nanos(g.max(1.0) as u64);
     let mut total = (0u64, 0u64, 0.0f64, 0u64);
     for phase in 0..stride {
         let origin = trace.origin + (phase * interval) as f64;
         let Ok(mut link) = LinkEstimator::new(
             Duration::from_nanos(eta),
-            Duration::from_nanos(g.max(1.0) as u64),
+            granularity,
             Some(Schedule {
                 seq: 0,
                 at_ns: origin.max(0.0) as u64,
@@ -621,7 +639,6 @@ fn online(
         ) else {
             continue;
         };
-        let mut beta = None;
         for (i, d) in trace
             .delay
             .iter()
@@ -638,22 +655,23 @@ fn online(
                     total.0 += 1;
                 }
             }
+            let promised = link
+                .margin()
+                .zip(link.arrivals().ok())
+                .map(|(margin, arrivals)| lateness_bound(&arrivals, margin));
             let _ = link.on_heartbeat(i as u64, arrival);
-            if let Some(beta) = beta {
+            if let (Some(bound), Some(_)) = (promised, link.latest_lateness()) {
                 total.1 += 1;
-                total.2 += beta;
+                total.2 += bound;
             }
             if link.reconfigure_due() {
-                match link.configure(costs, floors) {
-                    Ok(configured) => {
-                        let current = configured.current;
-                        beta = Some(
-                            current.interval.as_secs_f64()
-                                / current.mistake_recurrence.as_secs_f64(),
-                        );
-                        total.3 += 1;
-                    }
-                    Err(Refusal::TooFewHeartbeats | Refusal::CorrelationUnmeasured) => {}
+                match link.configure(costs, granularity, floor.max(granularity)) {
+                    Ok(_) => total.3 += 1,
+                    Err(
+                        Refusal::TooFewHeartbeats
+                        | Refusal::CorrelationUnmeasured
+                        | Refusal::Unavailable,
+                    ) => {}
                     Err(Refusal::Unconfigurable) => break,
                 }
             }
@@ -1296,13 +1314,17 @@ fn stride_rows(rows: &mut String, run: &Run, stride: u64) -> (bool, usize) {
 
 /// What the configurator takes from the trace: the floors on η and the election's inputs.
 struct Inputs {
-    floors: Floors,
+    /// The receiver's `G`, the search's resolution.
+    granularity: Duration,
+    /// The sender's stability floor, `E[flush] + G` where it flushes, `G` where it does not.
+    floor: Duration,
     latency: Duration,
     round: Duration,
-    resolution: Duration,
 }
 
-/// The floors on η.
+/// The floors on η. The correlation time is reported beside them: the configurator's bound is one
+/// Cantelli factor on an arrival's lateness, which no independence between heartbeats enters, so
+/// no correlation time floors the interval (`docs/timing.md` §2.2).
 fn floors(out: &mut String, run: &Run, t_c_stride: u64) -> Inputs {
     let g = run.g;
     let t_c = t_c_stride as f64 * run.eta;
@@ -1311,15 +1333,8 @@ fn floors(out: &mut String, run: &Run, t_c_stride: u64) -> Inputs {
     } else {
         0.0
     };
-    let floor_ns = g.max(t_c).max(lindley);
-    let floor = Duration::from_secs_f64(floor_ns / 1e9);
-    let base_floor = Duration::from_secs_f64(g.max(lindley) / 1e9);
-    let resolution = Duration::from_secs_f64(g / 1e9);
-    let floors = Floors {
-        granularity: resolution,
-        sender: base_floor,
-        correlation: Duration::from_secs_f64(t_c / 1e9),
-    };
+    let floor = Duration::from_secs_f64(g.max(lindley) / 1e9);
+    let granularity = Duration::from_secs_f64(g / 1e9);
     // A vote travels as a heartbeat does from send to read, and its voter persists the vote
     // before answering (Raft §3.4 / Figure 2): one way, and a round of two ways and a flush.
     let deliver = run.s_net.mean + run.s_gap.mean;
@@ -1327,19 +1342,19 @@ fn floors(out: &mut String, run: &Run, t_c_stride: u64) -> Inputs {
     let round = Duration::from_secs_f64((2.0 * deliver + run.s_flush.mean).max(0.0) / 1e9);
     let _ = writeln!(
         out,
-        "\nfloors: G {} µs, correlation time {} µs, flush stability E[flush]+G {} µs → floor {}; election inputs: l = {}, vote round = {}\n",
+        "\nfloors: G {} µs, flush stability E[flush]+G {} µs → floor {}; correlation time {} µs (reported); election inputs: l = {}, vote round = {}\n",
         us(g),
-        us(t_c),
         us(lindley),
         secs(floor),
+        us(t_c),
         secs(latency),
         secs(round)
     );
     Inputs {
-        floors,
+        granularity,
+        floor,
         latency,
         round,
-        resolution,
     }
 }
 
@@ -1412,7 +1427,7 @@ fn elections(out: &mut String, inputs: &Inputs) -> Option<Duration> {
     );
     let mut t_e = None;
     for (v, a) in [(3u32, 3u32), (3, 2), (5, 5), (5, 4)] {
-        if let Some(span) = election_span(v, a, inputs.latency, inputs.round, inputs.resolution) {
+        if let Some(span) = election_span(v, a, inputs.latency, inputs.round, inputs.granularity) {
             let _ = writeln!(
                 out,
                 "| {v}/{a} | {} | {} | {:.3} |",
@@ -1432,37 +1447,36 @@ fn elections(out: &mut String, inputs: &Inputs) -> Option<Duration> {
 /// days and a year.
 const MTBFS: [u64; 4] = [3_600, 86_400, 30 * 86_400, 365 * 86_400];
 
-/// The configured detector, from each estimate pair and each MTBF, replayed over the trace.
+/// The configured detector, from the trace's arrivals at its own interval and each MTBF, replayed
+/// over the trace.
 fn detectors(out: &mut String, run: &Run, inputs: &Inputs, t_e: Option<Duration>) {
     let _ = writeln!(
         out,
-        "\n| estimate | MTBF | η | α | window | detection bound | T_MR bound | U | replayed mistakes / points | replayed T_MR | bound holds | suspected share |\n|---|---|---|---|---|---|---|---|---|---|---|---|"
+        "\n| MTBF | η | α | window | detection bound | T_MR bound | U | replayed mistakes / arrivals | allowed | replayed T_MR | suspected share |\n|---|---|---|---|---|---|---|---|---|---|---|"
     );
     let Some(election) = t_e else { return };
-    for (name, mean, sd, robust) in estimate_pairs(run) {
-        let link = LinkBehaviour {
-            loss: run.loss,
-            mean_delay: Duration::from_secs_f64(mean.max(0.0) / 1e9),
-            delay_deviation: Duration::from_secs_f64(sd.max(0.0) / 1e9),
+    let Some(arrivals) = estimator(&run.trace, run.meta.interval_ns, 1, 0, run.g)
+        .and_then(|link| link.arrivals().ok())
+    else {
+        return;
+    };
+    for mtbf in MTBFS {
+        let costs = Costs {
+            election,
+            mtbf: Duration::from_secs(mtbf),
         };
-        for mtbf in MTBFS {
-            let costs = Costs {
-                election,
-                mtbf: Duration::from_secs(mtbf),
-            };
-            if let Some(det) = configure(&link, &costs, &inputs.floors) {
-                detector_row(out, run, (name, robust), mtbf, &det);
-            }
+        if let Some(det) = configure_arrivals(&arrivals, &costs, inputs.granularity, inputs.floor) {
+            detector_row(out, run, &arrivals, mtbf, &det);
         }
     }
 }
 
-/// One row of [`detectors`]: the detector configured from the pair `name` for `mtbf` seconds,
-/// replayed over the trace.
+/// One row of [`detectors`]: the detector configured for `mtbf` seconds, replayed over the trace,
+/// its mistakes against the bound its freshness points put on them, one an arrival.
 fn detector_row(
     out: &mut String,
     run: &Run,
-    (name, robust): (&str, bool),
+    arrivals: &Arrivals,
     mtbf: u64,
     det: &hyper_timing::Detector,
 ) {
@@ -1481,25 +1495,17 @@ fn detector_row(
         stride,
         window as usize,
         det.margin.as_nanos() as f64,
-        robust,
+        false,
     );
     let replayed_t_mr = if mistakes > 0 {
         secs(Duration::from_secs_f64(replayed / mistakes as f64 / 1e9))
     } else {
         format!("> {}", secs(Duration::from_secs_f64(replayed / 1e9)))
     };
-    // The bound is on the share of freshness points that start a mistake, `β = η / E(T_MR)`.
-    let beta =
-        det.interval.as_secs_f64() / det.mistake_recurrence.as_secs_f64().max(f64::MIN_POSITIVE);
-    let (lower, _) = poisson95(mistakes);
-    let holds = if lower / points.max(1) as f64 <= beta {
-        "yes"
-    } else {
-        "**no**"
-    };
+    let allowed = lateness_bound(arrivals, det.margin) * points as f64;
     let _ = writeln!(
         out,
-        "| {name} | {} | {} | {} | {window} (n_G {n_g_at}, n_Allan {n_allan_at}, drift {drift}) | {} | {} | {:.3e} | {mistakes} / {points} | {replayed_t_mr} | {holds} | {:.2e} |",
+        "| {} | {} | {} | {window} (n_G {n_g_at}, n_Allan {n_allan_at}, drift {drift}) | {} | {} | {:.3e} | {mistakes} / {points} | {allowed:.2} | {replayed_t_mr} | {:.2e} |",
         secs(Duration::from_secs(mtbf)),
         secs(det.interval),
         secs(det.margin),
@@ -1510,25 +1516,26 @@ fn detector_row(
     );
 }
 
-/// The estimator itself as the detector, online: its own window, estimates and configurations as
+/// The estimator itself as the detector, online: its own window, arrivals and configurations as
 /// the heartbeats come, at each interval the configurator chose above.
 fn online_detectors(out: &mut String, run: &Run, inputs: &Inputs, t_e: Option<Duration>) {
     let _ = writeln!(
         out,
-        "\n| online, MTBF | η | configurations | mistakes / points | Theorem 7 allows (Σβ) | bound holds |\n|---|---|---|---|---|---|"
+        "\n| online, MTBF | η | configurations | mistakes / arrivals | allowed | 95 % lower limit of the mistakes |\n|---|---|---|---|---|---|"
     );
     let Some(election) = t_e else { return };
-    let mean_link = LinkBehaviour {
-        loss: run.loss,
-        mean_delay: Duration::from_secs_f64(run.s_kd.mean.max(0.0) / 1e9),
-        delay_deviation: Duration::from_secs_f64(run.s_kd.sd.max(0.0) / 1e9),
+    let Some(arrivals) = estimator(&run.trace, run.meta.interval_ns, 1, 0, run.g)
+        .and_then(|link| link.arrivals().ok())
+    else {
+        return;
     };
     for mtbf in MTBFS {
         let costs = Costs {
             election,
             mtbf: Duration::from_secs(mtbf),
         };
-        let Some(det) = configure(&mean_link, &costs, &inputs.floors) else {
+        let Some(det) = configure_arrivals(&arrivals, &costs, inputs.granularity, inputs.floor)
+        else {
             continue;
         };
         let stride = ((det.interval.as_nanos() as f64 / run.eta).round() as u64).max(1);
@@ -1538,15 +1545,14 @@ fn online_detectors(out: &mut String, run: &Run, inputs: &Inputs, t_e: Option<Du
             stride,
             run.g,
             &costs,
-            &inputs.floors,
+            inputs.floor,
         );
         let (lower, _) = poisson95(mistakes);
         let _ = writeln!(
             out,
-            "| {} | {} | {configurations} | {mistakes} / {points} | {allowed:.2} | {} |",
+            "| {} | {} | {configurations} | {mistakes} / {points} | {allowed:.2} | {lower:.2} |",
             secs(Duration::from_secs(mtbf)),
             secs(Duration::from_secs_f64(run.eta * stride as f64 / 1e9)),
-            if lower <= allowed { "yes" } else { "**no**" }
         );
     }
 }
@@ -1554,6 +1560,26 @@ fn online_detectors(out: &mut String, run: &Run, inputs: &Inputs, t_e: Option<Du
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The interval's ends are the score interval's: the rates `λ` at which the count is `z`
+    /// standard errors away, `(k − λ)² = z²λ`, the zero end held at zero.
+    #[test]
+    fn the_poisson_interval_is_the_score_interval() {
+        let (low, high) = poisson95(0);
+        assert_eq!(low, 0.0);
+        assert!((high - Z95 * Z95).abs() <= 4.0 * f64::EPSILON * Z95 * Z95);
+        for k in [1u64, 2, 15, 10_000] {
+            let (low, high) = poisson95(k);
+            let count = k as f64;
+            for end in [low, high] {
+                let gap = (count - end).powi(2) - Z95 * Z95 * end;
+                assert!(
+                    gap.abs() <= 64.0 * f64::EPSILON * count.max(1.0).powi(2),
+                    "k {k}: end {end} off by {gap}"
+                );
+            }
+        }
+    }
 
     const MS: u64 = 1_000_000;
 

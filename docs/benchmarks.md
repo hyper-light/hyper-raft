@@ -4898,3 +4898,149 @@ cargo test -p hyper-raft-e2e --test cluster
 # sleep 2.5; kill -CONT <pid>` from `sh -c` while stall-follower waits, once every pair is judged;
 # the held supervisor, `std::thread::sleep(3 s)` in `Supervisor::until` after its reads, once.
 ```
+
+## The detector model, at its causes (2026-10-03)
+
+`docs/timing.md` §2.2 (the bound per arrival, no configuration at `U ≥ 1`), §2.8 (skipped slots as
+lateness, the allowance per heartbeat taken, the evidence interval held until the first
+configuration) and §3 item 11 (the history against a sliding window). Apple M5 Max (Mac17,6), 18
+cores, 128 GiB, macOS 26.4.1, rustc 1.98.0, release, against main `0e746d1` (the detector code as
+`c4530be`, on which the end-to-end runs below were recorded), each set run on both trees one after
+the other; the machine shared with other sessions' builds and tests, no load of this work's own
+making, the load average recorded with each set.
+
+**The causes, on the recorded runs** (hyper-raft-e2e's "End to end" runs on `c4530be`, ten on macOS
+and fifty in Docker's Linux at four, two and one CPUs; each pair's account line read for what the
+configurator was fed and returned, each pair's two ends for what the wire lost):
+
+| | Linux (3,398 configured pairs) | macOS (608) |
+|---|---|---|
+| `α = 0` | 268; `η` at most the receiver's `G` in 244 of them | 1 |
+| `U > 1` | 1,475, 1,447 of them at their first configuration | 312, 311 |
+| margins at the cap `η − G` (within 5 %), of `α > 0` | 1,347 of 3,130 | 387 of 607 |
+| `p_L` fed, median (`U > 1` / `U ≤ 1`) | 42.4 % / 21.1 % | 12.2 % / 5.2 % |
+| what the wire lost, from both ends, median (`U > 1`) | 1.9 % | 4.5 % |
+| `β` at the configured margin, median (`U > 1`) | 0.936, 2.06 times `p_L` | 0.359, 3.1 times |
+| `β` at the cap `η − G`, median (`U > 1`) | 0.997 | 0.422 |
+| `U`'s mistake term still ≥ 1 with the wire's loss for `p_L`, the cap kept | 1,294 of 1,475 | 283 of 312 |
+| a margin, uncapped, brings it below 1: `p_L` as fed / the wire's | 534 / 1,377 | 253 / 306 |
+
+`α = 0` is the cap: `α < η − G`, a margin held to one heartbeat, is no margin where `G ≥ η`. `U > 1`
+is both causes at once: the skipped slots fed as losses put every factor of `β` above `p_L`, and
+the cap held the margin where `β` is near one.
+
+**The simulation's worlds** (`tests/sim.rs`'s four, seeds 0–39 of the live-peers test's space, three
+nodes, run until every pair is configured and through a renewal; 240 configured pairs a world;
+load 3–6, 08:52–09:01):
+
+| world | code | suspicions of live peers / allowance | `α = 0` | `U > 1` | `α` median (most) | `η` median (most) | fed: `p_L` or `u`, median |
+|---|---|---|---|---|---|---|---|
+| macOS | main | 1,163 / 8,932 | 0 | 44 | 35.6 ms (505) | 138.9 ms (2,963) | `p_L` 15.7 % |
+| | this | 65 / 577 | 0 | 0 | 72.7 ms (565) | 44.8 ms (376) | `u` 0.9 % |
+| macOS, its log busy | main | 157 / 1,099 | 0 | 0 | 39.4 ms (249) | 124.9 ms (965) | 1.3 % |
+| | this | 84 / 565 | 0 | 0 | 127.9 ms (1,003) | 98.6 ms (671) | 0.9 % |
+| Linux | main | 4,770 / 20,357 | 1 | 48 | 26.4 ms (271) | 60.5 ms (5,046) | 23.0 % |
+| | this | 73 / 899 | 0 | 0 | 45.9 ms (324) | 21.5 ms (177) | 0.8 % |
+| Windows | main | 1,391 / 13,951 | 0 | 44 | 138.4 ms (250) | 645.9 ms (6,053) | 22.6 % |
+| | this | 0 / 553 | 0 | 0 | 264.2 ms (375) | 170.0 ms (364) | 0.9 % |
+
+**The pair that skips slots** (`a_sender_that_skips_slots_is_late_not_lost`: a sender behind its
+schedule for every other slot of a 2 ms stream, the receiver's timer 5 ms late). On main's model, the
+same scenario fed `p_L` 0.5001, configured `α = 0` at the 2 ms interval with `U` 10.0 and a best of
+379 ms; now a margin past the skipped slot, `U` below one, and no suspicion once configured.
+
+**Worlds that change** (`docs/timing.md` §3, item 11): a calm macOS host whose freezes begin, and
+Linux's one-way delays stepping tenfold, once every pair has configured; 16 seeds, four nodes, run
+until the pairs' heartbeats have doubled twice after the change, then one node killed once every
+survivor trusts it. Counted after the change. With each node's MTBF its own exposure (as the tests
+run), the MTBF grew with each run's length, and the comparisons followed it; so the decision rests
+on runs whose every node is seeded with a fleet history of a thousand failures over a thousand hours
+or days (load 7–15, 09:10–09:20):
+
+| world, MTBF | code | suspicions / allowance | a pair's an hour | mean spacing | a kill noticed: median / 90th / most | `U` realized |
+|---|---|---|---|---|---|---|
+| freezes begin, an hour | this (history) | 111 / 1,285 | 1.92 | 0.90 s | 1.52 / 1.86 / 2.09 s | 4.5·10⁻⁴ |
+| | sliding window | 614 / 15,563 | 2.40 | 1.65 s | 2.92 / 5.81 / 22.6 s | 1.1·10⁻³ |
+| | main | 20,399 / 150,041 | 0.65 | 14.5 s | 7.82 / 34.2 / 112 s | 4.3·10⁻³ |
+| delays step, an hour | this (history) | 10 / 1,185 | 0.32 | 0.43 s | 0.65 / 1.08 / 1.40 s | 2.1·10⁻⁴ |
+| | sliding window | 38 / 6,906 | 0.45 | 0.63 s | 1.02 / 1.86 / 2.83 s | 3.0·10⁻⁴ |
+| | main | 4,544 / 218,153 | 0.12 | 5.80 s | 2.62 / 45.9 / 651 s | 9.1·10⁻³ |
+| freezes begin, a day | this (history) | 0 / 1,482 | 0 | 2.95 s | 4.55 / 7.14 / 8.16 s | 5.7·10⁻⁵ |
+| | sliding window | 365 / 24,611 | 0.16 | 6.58 s | 10.3 / 26.6 / 101 s | 1.6·10⁻⁴ |
+| delays step, a day | this (history) | 16 / 1,481 | 0.06 | 1.42 s | 2.54 / 4.04 / 5.20 s | 3.0·10⁻⁵ |
+| | sliding window | 25 / 19,116 | 0.02 | 3.23 s | 5.15 / 9.41 / 45.9 s | 7.4·10⁻⁵ |
+
+Main's rows at a day's MTBF did not finish in 31 minutes of a CPU and were stopped: its intervals
+asked the simulated hours to run long, and the host's freezes are replayed over all of them.
+
+"`U` realized" is `T_E` times the suspicions a second plus the mean time to notice the kill and
+`T_E` over the MTBF, `T_E` the law's election over the paths the run measured (44 ms in the frozen
+world, 13 ms in the stepped one). No suspicion stated a bound the kill's notice passed, in any row.
+The sliding window is the estimator of item 11 (`link.rs` with an `ArrivalWindow` of half-window
+blocks at the levels' horizon, kept in the scratch notes, not committed), both with the evidence
+interval held until the first configuration.
+
+The evidence interval held past the first configuration (main's rule), on the history estimate,
+each node's MTBF its own exposure (load 3–6, 08:53–09:03):
+
+| world | evidence interval | suspicions / allowance | a pair's an hour | mean spacing | a kill noticed: median / 90th / most |
+|---|---|---|---|---|---|
+| freezes begin | held until the first configuration | 267 / 807 | 18.0 | 0.32 s | 0.63 / 1.30 / 1.88 s |
+| | held for good, the longest of every refusal's | 1,507 / 7,096 | 0.3 | 5.60 s | 4.37 / 11.3 / 23.8 s |
+| delays step | held until the first configuration | 41 / 1,375 | 3.0 | 0.16 s | 0.19 / 0.34 / 0.75 s |
+| | held for good | 98 / 2,858 | 0.9 | 0.38 s | 0.28 / 0.93 / 1.29 s |
+
+In the frozen world one link held for good sat at 31 s against its configuration's best of 0.57 s.
+These runs' MTBFs grew with their length (the shorter spacing ran fewer simulated hours), so their
+rates an hour are not comparable across rows; the spacing and the notice are what the rule moved.
+
+**The process test, checked exactly** (`tests/processes.rs`, every suspicion traced as it is
+made). Its first gated run failed: the stopped member suspected a peer at a freshness point after
+the peer's next heartbeat had come, by the kernel's stamp, 111 ms before it. Two causes, each
+shown by a scratch window of 2 ms held between the member's reads of its socket and its poll
+(not committed), ten runs of the stop test each, load 6–15 (09:28–09:41):
+
+| the member reads | the drain asks | runs failing so |
+|---|---|---|
+| its socket, then its clock | the reactor | 7 of 10 |
+| its clock, then its socket | the reactor | 4 of 10 |
+| its socket, then its clock | the kernel | 3 of 10 |
+| its clock, then its socket | the kernel | 0 of 10 |
+
+Unwindowed, the whole binary passed 10 of 10 after (load 12.4). The causes: hyper-tokio's `receive_ready`
+asked the reactor whether the socket held anything, and the reactor's readiness was as of its last
+turn, before the stop's datagrams came, so the drain read nothing while the socket held
+heartbeats stamped before the poll; and the member read its clock after its socket, so a stop
+between the two left the stop's datagrams for the next turn. `receive_ready` now asks the kernel
+on a kernel-stamped socket, and the member reads its clock first.
+
+**The replay** (`crates/hyper-timing/tests/replay.rs`, four simulated hours at each interval of
+each shape, its stalls sent late or skipped, MTBF an hour or a month): every suspicion traced to the
+rule. Suspicions against the allowance, an hour's MTBF: macOS 100 µs shape at 5 ms, 2 / 57.0 (late)
+and 6 / 30.8 (skipped); at 50 ms, 54 / 146.4 both ways; the flush shape at 20 ms, 0 / 109.1 and
+0 / 60.5; at 200 ms, 2 / 399.6 and 1 / 398.9. A month's MTBF: none anywhere, allowances 8.8–34.1.
+13 configurations in each run of 288,000 heartbeats.
+
+**Per heartbeat** (`benches/allocs.rs`, its world of calm links: nodes every pair of which shares a
+group, ten simulated seconds past every pair's configuration; three rounds, main and this commit
+alternating, load 13.8 / 9.6 / 7.9 at 09:21): nanoseconds of the crate's work a heartbeat sent or
+taken, and the heartbeats of the window, which this model's shorter intervals send ten times as many
+of on these links. Neither allocates, reallocates or faults a page.
+
+| nodes, groups | main: heartbeats sent | ns | this: heartbeats sent | ns |
+|---|---|---|---|---|
+| 2, 1 | 216 | 76–80 | 2,362 | 71–92 |
+| 4, 1 | 608 | 88–100 | 5,127 | 80–87 |
+| 8, 1 | 2,952 | 122–150 | 29,089 | 97–101 |
+| 8, 1,000 | 2,952 | 112–136 | 29,089 | 104–121 |
+
+```sh
+# The causes: scratch/dm-notes/causes1.py over the recorded runs' account lines
+python3 causes1.py 'l4-notes/final/linux-*.txt'; python3 causes1.py 'l4-notes/final/mac*.txt'
+# The worlds, the changing worlds, the fixed MTBF: scratch tests appended to tests/sim.rs and
+# removed (diag_account, diag_changing_worlds, diag_fixed_mtbf, the last seeding Settings::history);
+# the sliding window and the evidence held for good put back by hand. On each tree:
+cargo test --release -p hyper-liveness --test sim diag_ -- --nocapture
+cargo test --release -p hyper-timing --test replay -- --nocapture --test-threads=1
+cargo bench -p hyper-liveness --bench allocs --no-run   # then each binary with --bench, alternating
+```

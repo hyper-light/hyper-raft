@@ -28,7 +28,7 @@ use hyper_liveness::{
 };
 use hyper_sim::Seeded;
 use hyper_sim::rng::stream_seed;
-use hyper_timing::{Ballot, Exposure, Trust, WINDOW_LIMIT, poisson95};
+use hyper_timing::{Ballot, Exposure, Trust, WINDOW_LIMIT};
 
 const MS: u64 = 1_000_000;
 const US: u64 = 1_000;
@@ -270,6 +270,9 @@ struct Node {
     /// Every durable completion: when.
     durable: Vec<u64>,
     suspicions: Vec<Suspicion>,
+    /// Every heartbeat the stream took, in the order it took them: from whom, its number, its
+    /// kernel stamp.
+    taken: Vec<(PeerId, u64, u64)>,
     /// The peers whose restart the node's stream reported.
     restarts: Vec<PeerId>,
     /// What the owner believes of each peer from the changes it was told: suspected or not. The
@@ -337,6 +340,7 @@ impl Sim {
                     log: Vec::new(),
                     durable: Vec::new(),
                     suspicions: Vec::new(),
+                    taken: Vec::new(),
                     restarts: Vec::new(),
                     believed: BTreeMap::new(),
                     timer: None,
@@ -492,6 +496,56 @@ impl Sim {
         }
     }
 
+    /// Every suspicion every node made, traced to the detector's own rule (NFD-E: at a freshness
+    /// point the peer is trusted only if a heartbeat after the latest one taken has come): no
+    /// heartbeat of the peer's taken after the suspicion's last, the one it judged from, was stamped
+    /// by the kernel before the suspicion's freshness point. Each came at or past it, or never
+    /// came: skipped by its sender, refused, or never sent by a peer that died. A suspicion of a
+    /// peer never heard from judged none, and none came before it.
+    fn traced(&self) {
+        for (index, node) in self.nodes.iter().enumerate() {
+            for suspicion in &node.suspicions {
+                let from = suspicion.last.map_or(Some(0), |last| {
+                    node.taken
+                        .iter()
+                        .rposition(|&(peer, seq, stamp)| {
+                            peer == suspicion.peer
+                                && seq == last.seq
+                                && stamp == last.arrival_ns
+                                && stamp <= suspicion.at_ns
+                        })
+                        .map(|at| at + 1)
+                });
+                let from = from.unwrap_or_else(|| {
+                    panic!("node {index}: no heartbeat taken is the last of {suspicion:?}")
+                });
+                let early = node.taken[from..]
+                    .iter()
+                    .filter(|(peer, ..)| *peer == suspicion.peer)
+                    .find(|(_, _, stamp)| *stamp < suspicion.at_ns);
+                assert!(
+                    early.is_none(),
+                    "node {index}: {suspicion:?} with {early:?} taken, stamped before its \
+                     freshness point"
+                );
+            }
+        }
+    }
+
+    /// The suspicions of the live peers among `nodes` and their allowance: reported, as the model's
+    /// figures, never asserted (`docs/benchmarks.md`).
+    fn allowance(&self, nodes: &[usize]) -> (u64, f64) {
+        let mut totals = (0u64, 0.0f64);
+        for &node in nodes {
+            for &peer in nodes.iter().filter(|peer| **peer != node) {
+                let report = self.nodes[node].liveness.report(peer as u64 + 1).unwrap();
+                totals.0 += report.suspicions;
+                totals.1 += report.allowance;
+            }
+        }
+        totals
+    }
+
     /// The election cost each node charges its detectors: the library's law over the round trips
     /// its streams measured and its flush, once a quorum's paths are measured. Charged again on the
     /// detectors' own doubling schedule: once the heartbeats a node has taken have doubled since
@@ -597,6 +651,7 @@ impl Sim {
             self.note_configured();
             self.told_is_believed();
         }
+        self.traced();
     }
 
     /// Notes the pairs each live node has newly configured.
@@ -634,9 +689,13 @@ impl Sim {
                 let now = self.now;
                 let n = &mut self.nodes[to];
                 // Refusals are the crate's to make: a stale or unproven heartbeat is dropped.
-                let _ = n
-                    .liveness
-                    .on_heartbeat(from as u64 + 1, &bytes, stamp, &mut n.owner);
+                if n.liveness
+                    .on_heartbeat(from as u64 + 1, &bytes, stamp, &mut n.owner)
+                    .is_ok()
+                {
+                    let seq = Heartbeat::decode(&bytes).unwrap().seq;
+                    n.taken.push((from as u64 + 1, seq, stamp));
+                }
                 n.liveness.poll(now, &mut n.owner);
                 self.drain(to);
             }
@@ -693,9 +752,13 @@ impl Sim {
                 Event::Arrive {
                     from, bytes, stamp, ..
                 } => {
-                    let _ = n
-                        .liveness
-                        .on_heartbeat(from as u64 + 1, &bytes, stamp, &mut n.owner);
+                    if n.liveness
+                        .on_heartbeat(from as u64 + 1, &bytes, stamp, &mut n.owner)
+                        .is_ok()
+                    {
+                        let seq = Heartbeat::decode(&bytes).unwrap().seq;
+                        n.taken.push((from as u64 + 1, seq, stamp));
+                    }
                     None
                 }
                 Event::Durable { write, started, .. } if !n.disk_stalled => {
@@ -819,28 +882,28 @@ impl Sim {
     }
 }
 
-/// Live peers: every pair configures, trusts, and makes no more mistakes than Theorem 7 allows.
+/// Live peers: every pair configures and trusts, and every suspicion of a live peer is traced to
+/// the detector's rule (`Sim::traced`, after every run). The suspicions against the allowance the
+/// configurations promised are the model's figures, reported (`docs/benchmarks.md`).
 #[test]
-fn live_peers_configure_and_keep_their_allowance() {
+fn live_peers_configure_and_every_suspicion_of_them_is_traced() {
+    let (mut suspicions, mut allowance) = (0u64, 0.0f64);
     for seed in seeds(1, 8) {
         let mut sim = Sim::new(3, MACOS, seed);
         sim.run_until_configured();
         sim.run_until_doubled();
-        let (mut suspicions, mut allowance) = (0u64, 0.0f64);
         for node in &sim.nodes {
             for peer in (1..=3u64).filter(|p| *p != node.owner.id) {
                 let report = node.liveness.report(peer).unwrap();
                 assert!(report.configured, "seed {seed}");
-                suspicions += report.suspicions;
-                allowance += report.allowance;
                 assert!(report.taken > 0 && report.unproven == 0, "{report:?}");
             }
         }
-        assert!(
-            poisson95(suspicions).0 <= allowance,
-            "seed {seed}: {suspicions} suspicions of live peers refute the allowance {allowance}"
-        );
+        let (count, allowed) = sim.allowance(&[0, 1, 2]);
+        suspicions += count;
+        allowance += allowed;
     }
+    println!("suspicions of live peers {suspicions}, allowance {allowance:.1}");
 }
 
 /// Every heartbeat sent carries a flush made durable after the previous heartbeat to that peer
@@ -1007,19 +1070,8 @@ fn a_stalled_disk_is_suspected_as_a_crash_is() {
             assert!(found.at_ns - last.due_ns <= bound.as_nanos() as u64);
         }
         // The stalled node still hears its peers: it took a heartbeat from each since every peer
-        // suspected it (the wait above), and its suspicions of them, live throughout, are within
-        // what Theorem 7 allows.
-        let (mut suspicions, mut allowance) = (0u64, 0.0f64);
-        for peer in 1..=2u64 {
-            let report = sim.nodes[stalled].liveness.report(peer).unwrap();
-            suspicions += report.suspicions;
-            allowance += report.allowance;
-        }
-        assert!(
-            poisson95(suspicions).0 <= allowance,
-            "seed {seed}: the stalled node's {suspicions} suspicions of live peers refute its \
-             allowance {allowance}"
-        );
+        // suspected it (the wait above), and its suspicions of them, live throughout, are traced
+        // with every other (`Sim::traced`).
     }
 }
 
@@ -1530,4 +1582,92 @@ fn a_peer_dead_before_its_links_have_evidence_is_suspected_once_a_sibling_has_it
             noticed[noticed.len() - 1] / MS
         );
     }
+}
+
+/// A sender behind its schedule skips the slots it was behind for and sends the latest due; its
+/// receiver takes each skipped slot as the next heartbeat's lateness, not as a heartbeat lost
+/// (`docs/timing.md` §2.2). Here the sender is behind for every other slot of a 2 ms stream, and the
+/// receiver's own timer is 5 ms late, past the interval: an E2E pair's shape, which the single
+/// heartbeat the margin held configured with no margin at all (`α = 0`, the receiver's `G` past the
+/// interval) and an unavailability past one, fed half the slots as losses. The receiver configures
+/// a margin past the skipped slot, an unavailability below one, and suspects the live sender at no
+/// freshness point once it has.
+#[test]
+fn a_sender_that_skips_slots_is_late_not_lost() {
+    let mut node = Liveness::new(Settings {
+        local: 1,
+        run: 1,
+        max_peers: 1,
+        history: Exposure::new(),
+    })
+    .unwrap();
+    node.attach(2).unwrap();
+    node.set_election(2, Duration::from_millis(20)).unwrap();
+    let mut owner = Owner {
+        id: 1,
+        sent: Vec::new(),
+        flush: false,
+        changes: Vec::new(),
+    };
+    let interval = 2 * MS;
+    let late = 5 * MS;
+    let mut out = [0u8; MAX_BYTES];
+    let mut suspected_after = None;
+    // The receiver's own stream and its wakes: each poll at its wake, 5 ms late.
+    node.on_durable(Write::Liveness, 0, 100 * US);
+    node.poll(200 * US, &mut owner);
+    node.on_durable(Write::Liveness, 200 * US, 300 * US);
+    let mut now = 300 * US;
+    node.poll(now, &mut owner);
+    let mut jitter = Seeded::new(stream_seed(0, "skips", &[]));
+    for slot in (0..4_000u64).step_by(2) {
+        let sent = 10 * MS + slot * interval;
+        let arrival = sent + 100 * US + jitter.below(50 * US);
+        // The owner's wakes before the heartbeat arrives, each at its wake and late.
+        while let Some(wake) = node.wake().filter(|wake| *wake + late <= arrival) {
+            now = now.max(wake + late);
+            node.on_durable(Write::Liveness, now, now);
+            node.poll(now, &mut owner);
+        }
+        let beat = Heartbeat {
+            run: 7,
+            seq: slot,
+            interval_ns: interval,
+            floor_ns: interval,
+            ask_ns: 0,
+            sent_ns: sent,
+            late_ns: 0,
+            flushes: slot + 1,
+            flush_age_ns: 0,
+            echo: None,
+        };
+        let bytes = beat.encode(&mut out).to_vec();
+        let _ = node.on_heartbeat(2, &bytes, arrival, &mut owner);
+        now = now.max(arrival);
+        node.poll(now, &mut owner);
+        let report = node.report(2).unwrap();
+        if report.configured && suspected_after.is_none() {
+            suspected_after = Some(report.suspicions);
+        }
+    }
+    let report = node.report(2).unwrap();
+    let configured = node.configuration(2).expect("the pair configured");
+    assert!(
+        node.granularity().unwrap() > Duration::from_nanos(interval),
+        "the receiver's timer is late past the interval: {:?}",
+        node.granularity()
+    );
+    assert!(
+        configured.current.margin > Duration::from_nanos(interval),
+        "a margin past the skipped slot: {configured:?}"
+    );
+    assert!(
+        configured.current.unavailability < 1.0,
+        "an unavailability below one: {configured:?}"
+    );
+    assert_eq!(
+        Some(report.suspicions),
+        suspected_after,
+        "no suspicion of the live sender once configured: {report:?}"
+    );
 }

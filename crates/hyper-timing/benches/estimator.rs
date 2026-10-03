@@ -25,7 +25,7 @@ use std::hint::black_box;
 use std::time::{Duration, Instant};
 
 use hyper_measure::{alloc, faults};
-use hyper_timing::{Costs, ExchangeRtt, Floors, LinkEstimator, PathRtt, Schedule};
+use hyper_timing::{Costs, ExchangeRtt, LinkEstimator, PathRtt, Schedule};
 
 #[global_allocator]
 static ALLOCATOR: alloc::Counting = alloc::Counting;
@@ -60,14 +60,6 @@ fn costs() -> Costs {
     }
 }
 
-fn floors(granularity: Duration) -> Floors {
-    Floors {
-        granularity,
-        sender: granularity,
-        correlation: Duration::from_nanos(INTERVAL),
-    }
-}
-
 /// A configured link and the next sequence number.
 fn warm(granularity: Duration, delays: &mut Delays) -> (LinkEstimator, u64) {
     let mut link = LinkEstimator::new(
@@ -81,7 +73,7 @@ fn warm(granularity: Duration, delays: &mut Delays) -> (LinkEstimator, u64) {
         link.on_heartbeat(seq, seq * INTERVAL + delays.next())
             .unwrap();
     }
-    link.configure(&costs(), &floors(granularity)).unwrap();
+    link.configure(&costs(), granularity, granularity).unwrap();
     (link, warm)
 }
 
@@ -104,7 +96,6 @@ fn heartbeats(granularity: Duration, seed: u64) -> (Cost, u64) {
     let arrivals: Vec<u64> = (start..start + BEATS)
         .map(|seq| seq * INTERVAL + delays.next())
         .collect();
-    let floors = floors(granularity);
     let costs = costs();
     let mut configure_time = Duration::ZERO;
     let mut configurations = 0u64;
@@ -118,7 +109,7 @@ fn heartbeats(granularity: Duration, seed: u64) -> (Cost, u64) {
         black_box(link.on_heartbeat(start + i as u64, arrival).unwrap());
         if link.reconfigure_due() {
             let at = Instant::now();
-            black_box(link.configure(&costs, &floors).unwrap());
+            black_box(link.configure(&costs, granularity, granularity).unwrap());
             configure_time += at.elapsed();
             configurations += 1;
         }

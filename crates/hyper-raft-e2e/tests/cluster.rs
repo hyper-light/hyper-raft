@@ -501,9 +501,10 @@ impl Cluster {
         agreed.get()
     }
     /// What every member up says its detectors measured and were configured to, a line a pair:
-    /// what the configurator was fed (`p_L`, `E(D)`, `√V(D)`), the detector in force (`η`, `α`,
-    /// the mistake recurrence it promises, the unavailability it was chosen for), and the pair's
-    /// suspicions against Theorem 7's allowance for a peer alive throughout.
+    /// the heartbeats it sent the peer and the slots it skipped, what the configurator was fed (the
+    /// arrivals' unseen share, their mean lateness and its deviation), the detector in force (`η`,
+    /// `α`, the mistake recurrence it promises, the unavailability it was chosen for), and the
+    /// pair's suspicions against the allowance its detectors promised for a peer alive throughout.
     fn detectors(&mut self) -> String {
         let ms = |ns: u64| ns as f64 / 1e6;
         let looks = self.quiet.seen();
@@ -549,16 +550,17 @@ impl Cluster {
                     "unjudged"
                 };
                 out.push_str(&format!(
-                    "\n    {id}->{}: {own}, {} configurations, {} sent, {} taken, {} refused unproven; fed p_L {:.4}, \
-                     E(D) {:.3} ms, sd {:.3} ms; eta {:.3} ms, alpha {:.3} ms, recurrence {:.1} ms, U {:.2e}; \
-                     {} suspicions, allowance {:.2}",
+                    "\n    {id}->{}: {own}, {} configurations, {} sent, {} skipped, {} taken, {} refused unproven; \
+                     fed unseen {:.4}, lateness {:.3} ms, sd {:.3} ms; eta {:.3} ms, alpha {:.3} ms, \
+                     recurrence {:.1} ms, U {:.2e}; {} suspicions, allowance {:.2}",
                     pair.peer,
                     pair.configurations,
                     pair.sent,
+                    pair.skipped,
                     pair.taken,
                     pair.unproven,
-                    pair.loss,
-                    ms(pair.mean_delay_ns),
+                    pair.unseen,
+                    ms(pair.lateness_ns),
                     ms(pair.deviation_ns),
                     ms(pair.interval_ns),
                     ms(pair.margin_ns),

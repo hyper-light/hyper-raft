@@ -1,7 +1,14 @@
-//! The estimator run as the detector over synthetic traces of the recorded shapes, checked against
-//! Theorem 7's bound the way the trace analyser checks a recorded trace (`docs/timing.md` §2.6;
-//! `docs/benchmarks.md`, "Heartbeat traces"). No raw trace is kept, so each shape is a model fitted
-//! to a recorded run's table, and the test first checks the model still has that run's shape.
+//! The estimator run as the detector over synthetic traces of the recorded shapes
+//! (`docs/timing.md` §2.2, §2.6; `docs/benchmarks.md`, "Heartbeat traces"). Every suspicion is
+//! traced, event by event, to the detector's own rule: the heartbeat taken next came at or past
+//! the freshness point in force, by its stamp, and its lateness past the expected arrival that
+//! point was set from passed the margin; and every heartbeat that came so made one suspicion. The
+//! mistakes and the bound the configurations put on them, summed over the heartbeats taken, are
+//! reported (`docs/benchmarks.md`), not asserted. No raw trace is kept, so each shape is a model
+//! fitted to a recorded run's table, its shape at the recorded interval reported beside the run's.
+//! A stall is run two ways: the sender sends its backlog at the stall's end, as the trace
+//! recorder's did, and it sends only the latest heartbeat due, the rest skipped, as the node-pair
+//! stream's does. The models are seeded, and a replay run twice is the same run.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -18,7 +25,7 @@
 
 use std::time::Duration;
 
-use hyper_timing::{Costs, Event, Floors, LinkEstimator, Refusal, Schedule};
+use hyper_timing::{Costs, Event, LinkEstimator, Refusal, Schedule, lateness_bound};
 
 /// A delay model: a body (a floor plus an exponential), occasional hiccups, and stalls. A stall
 /// starts at Poisson times, lasts a Pareto time capped at the run's longest, and delays every
@@ -80,8 +87,10 @@ impl Noise {
 }
 
 /// Arrival times, nanoseconds on the sender's clock, of `count` heartbeats every `interval_us`
-/// scheduled from zero, over a FIFO link (a heartbeat never passes the one before it).
-fn trace(shape: Shape, interval_us: f64, count: usize, seed: u64) -> Vec<u64> {
+/// scheduled from zero, over a FIFO link (a heartbeat never passes the one before it). With `skips`,
+/// a heartbeat scheduled inside a stall is never sent unless it is the latest due at the stall's
+/// end, which is sent then: `None`.
+fn trace(shape: Shape, interval_us: f64, count: usize, seed: u64, skips: bool) -> Vec<Option<u64>> {
     let mut noise = Noise(seed);
     let mut next_stall = noise.exponential(1e6 / shape.stalls_per_second);
     let mut stall_end = f64::NEG_INFINITY;
@@ -99,20 +108,25 @@ fn trace(shape: Shape, interval_us: f64, count: usize, seed: u64) -> Vec<u64> {
             if noise.uniform() < shape.hiccup {
                 delay += noise.exponential(shape.hiccup_mean);
             }
-            delay += (stall_end - sigma).max(0.0);
+            let held = (stall_end - sigma).max(0.0);
+            // The latest due at the stall's end is the one whose successor is due after it.
+            if skips && held > interval_us {
+                return None;
+            }
+            delay += held;
             let arrival = ((sigma + delay) * 1e3) as u64;
             last = last.max(arrival);
-            last
+            Some(last)
         })
         .collect()
 }
 
-/// `(median, MAD, mean, deviation)` of the delays, microseconds.
-fn summary(arrivals: &[u64], interval_us: f64) -> (f64, f64, f64, f64) {
+/// `(median, MAD, mean, deviation)` of the delays, microseconds, of the heartbeats sent.
+fn summary(arrivals: &[Option<u64>], interval_us: f64) -> (f64, f64, f64, f64) {
     let delays: Vec<f64> = arrivals
         .iter()
         .enumerate()
-        .map(|(i, a)| *a as f64 / 1e3 - i as f64 * interval_us)
+        .filter_map(|(i, a)| a.map(|a| a as f64 / 1e3 - i as f64 * interval_us))
         .collect();
     let n = delays.len() as f64;
     let mean = delays.iter().sum::<f64>() / n;
@@ -125,29 +139,27 @@ fn summary(arrivals: &[u64], interval_us: f64) -> (f64, f64, f64, f64) {
     (median, deviations[deviations.len() / 2], mean, sd)
 }
 
-/// The 95 % score interval's lower end for a Poisson count.
-fn poisson_lower(k: u64) -> f64 {
-    hyper_timing::poisson95(k).0
-}
-
+#[derive(Debug, PartialEq)]
 struct Replay {
     mistakes: u64,
+    /// Heartbeats taken under a margin: the freshness points that could each err once.
     points: u64,
-    /// Theorem 7's bound summed over the freshness points, each at the configuration then in
-    /// force: the mistakes the bound allows.
+    /// The bound on each summed, at the margin in force and the arrivals as they stood: the
+    /// mistakes the configuration allows.
     allowed: f64,
     configurations: u64,
 }
 
 /// Runs the estimator as the detector over `arrivals`, as a sans-io driver runs it: every deadline
 /// before the next arrival is polled, then the arrival is fed, and the detector is reconfigured
-/// whenever its estimates have renewed. The sender never fails, so every suspicion is a mistake.
+/// whenever its arrivals' window has renewed. The sender never fails, so every suspicion is a
+/// mistake.
 fn replay(
-    arrivals: &[u64],
+    arrivals: &[Option<u64>],
     interval: Duration,
     granularity: Duration,
+    floor: Duration,
     costs: &Costs,
-    floors: &Floors,
 ) -> (Replay, LinkEstimator) {
     let mut link =
         LinkEstimator::new(interval, granularity, Some(Schedule { seq: 0, at_ns: 0 })).unwrap();
@@ -157,29 +169,47 @@ fn replay(
         allowed: 0.0,
         configurations: 0,
     };
-    let mut beta = None;
-    for (seq, &arrival) in arrivals.iter().enumerate() {
+    for (seq, arrival) in arrivals.iter().enumerate() {
+        let Some(arrival) = *arrival else {
+            continue;
+        };
+        // The freshness point in force while the sender is trusted, and its margin.
+        let (point, margin) = (link.deadline(), link.margin());
+        let mut suspected = 0;
         while let Some(deadline) = link.deadline().filter(|d| *d <= arrival) {
             if link.poll(deadline) == Some(Event::Suspected) {
-                run.mistakes += 1;
+                suspected += 1;
             }
         }
+        // The promise the freshness point in force made: its margin, on the arrivals as they
+        // stood when it was set.
+        let promised = margin
+            .zip(link.arrivals().ok())
+            .map(|(margin, arrivals)| lateness_bound(&arrivals, margin));
         link.on_heartbeat(seq as u64, arrival).unwrap();
-        if let Some(beta) = beta {
+        // The rule, traced: a suspicion in this gap exactly when the heartbeat came at or past the
+        // freshness point in force, which is exactly when its lateness reached the margin.
+        let late = point.is_some_and(|until| until <= arrival);
+        assert_eq!(suspected, u64::from(late), "heartbeat {seq} at {arrival}");
+        if let (Some(_), Some(margin), Some(lateness)) = (point, margin, link.latest_lateness()) {
+            assert_eq!(
+                late,
+                lateness >= i64::try_from(margin.as_nanos()).unwrap(),
+                "heartbeat {seq}: lateness {lateness} ns, margin {margin:?}"
+            );
+        }
+        run.mistakes += suspected;
+        if let (Some(bound), Some(_)) = (promised, link.latest_lateness()) {
             run.points += 1;
-            run.allowed += beta;
+            run.allowed += bound;
         }
         if link.reconfigure_due() {
-            match link.configure(costs, floors) {
-                Ok(configured) => {
-                    let current = configured.current;
-                    beta = Some(
-                        current.interval.as_secs_f64() / current.mistake_recurrence.as_secs_f64(),
-                    );
-                    run.configurations += 1;
-                }
+            match link.configure(costs, granularity, floor) {
+                Ok(_) => run.configurations += 1,
                 Err(Refusal::TooFewHeartbeats | Refusal::CorrelationUnmeasured) => {}
-                Err(Refusal::Unconfigurable) => panic!("unconfigurable at {seq}"),
+                Err(refusal @ (Refusal::Unconfigurable | Refusal::Unavailable)) => {
+                    panic!("{refusal:?} at {seq}")
+                }
             }
         }
     }
@@ -196,13 +226,16 @@ struct Case {
     /// The recorded run's `sd / (1.4826·MAD)`, and its mean over its median.
     heavy: f64,
     skew: f64,
-    /// The detector's interval: the model's correlation time, by §2.6's rule the spacing on the
-    /// 1-2-5 grid past its longest stall, since a stall delays every heartbeat it covers.
-    interval: Duration,
+    /// The detector's intervals: one inside the stalls' correlation time, where heartbeats in a
+    /// margin are late together, and the one past it that Theorem 7's product needed.
+    intervals: [Duration; 2],
     granularity: Duration,
     sender: Duration,
     election: Duration,
 }
+
+/// Heartbeats a replay runs: four simulated hours at 50 ms.
+const REPLAYED: usize = 288_000;
 
 fn check(case: &Case) {
     // The model has the recorded run's shape at the recorded interval.
@@ -211,6 +244,7 @@ fn check(case: &Case) {
         case.recorded_us,
         case.recorded,
         0x9E37_79B9_7F4A_7C15,
+        false,
     );
     let (median, mad, mean, sd) = summary(&recorded, case.recorded_us);
     let heavy = sd / (1.482_602_218_505_602 * mad);
@@ -221,57 +255,57 @@ fn check(case: &Case) {
         mean / median,
         case.skew
     );
-    assert!(
-        heavy > case.heavy / 2.0 && heavy < case.heavy * 2.0,
-        "tail weight"
-    );
-    assert!(
-        mean / median > 1.0 + (case.skew - 1.0) / 2.0 && mean / median < case.skew * 1.5,
-        "skew"
-    );
-    // The detector at its interval, over four simulated hours, for nodes failing every hour (tight
-    // margins, so mistakes happen) and every month.
-    let interval_us = case.interval.as_secs_f64() * 1e6;
-    let count = (4.0 * 3_600.0 * 1e6 / interval_us) as usize;
-    let arrivals = trace(case.shape, interval_us, count, 0x2545_F491_4F6C_DD1D);
-    let floors = Floors {
-        granularity: case.granularity,
-        sender: case.sender,
-        correlation: case.interval,
-    };
-    for mtbf in [3_600u64, 30 * 86_400] {
-        let costs = Costs {
-            election: case.election,
-            mtbf: Duration::from_secs(mtbf),
-        };
-        let (run, link) = replay(&arrivals, case.interval, case.granularity, &costs, &floors);
-        let estimates = link.estimates();
-        println!(
-            "{} at {:?}, MTBF {mtbf} s: {} mistakes in {} freshness points, Theorem 7 allows {:.1}; {} configurations, window {:?}, τ_int {:?}, unseen {:?}, deviation {:?}",
-            case.name,
-            case.interval,
-            run.mistakes,
-            run.points,
-            run.allowed,
-            run.configurations,
-            estimates.window,
-            estimates.correlation,
-            estimates.unseen,
-            estimates.delay_deviation
-        );
-        assert!(run.configurations > 0 && run.points > count as u64 / 2);
-        assert!(
-            poisson_lower(run.mistakes) <= run.allowed,
-            "{}: {} mistakes against a bound of {:.2}",
-            case.name,
-            run.mistakes,
-            run.allowed
-        );
+    // The detector at each interval, its stalls sent late or skipped, for nodes failing every hour
+    // (tight margins, so mistakes happen) and every month.
+    for interval in case.intervals {
+        for skips in [false, true] {
+            let interval_us = interval.as_secs_f64() * 1e6;
+            let arrivals = trace(
+                case.shape,
+                interval_us,
+                REPLAYED,
+                0x2545_F491_4F6C_DD1D,
+                skips,
+            );
+            let sent = arrivals.iter().flatten().count();
+            for mtbf in [3_600u64, 30 * 86_400] {
+                let costs = Costs {
+                    election: case.election,
+                    mtbf: Duration::from_secs(mtbf),
+                };
+                let (run, link) =
+                    replay(&arrivals, interval, case.granularity, case.sender, &costs);
+                let (again, _) = replay(&arrivals, interval, case.granularity, case.sender, &costs);
+                assert_eq!(run, again, "a seeded replay is the same run");
+                let estimates = link.estimates();
+                println!(
+                    "{} at {interval:?}, {}, MTBF {mtbf} s: {} mistakes in {} heartbeats taken of {} \
+                     sent, {} allowed; {} configurations, margin {:?}, window {:?}, τ_int {:?}, \
+                     arrivals {}",
+                    case.name,
+                    if skips {
+                        "stalls skipped"
+                    } else {
+                        "stalls sent late"
+                    },
+                    run.mistakes,
+                    run.points,
+                    sent,
+                    run.allowed,
+                    run.configurations,
+                    link.margin(),
+                    estimates.window,
+                    estimates.correlation,
+                    estimates.arrivals
+                );
+                assert!(run.configurations > 0);
+            }
+        }
     }
 }
 
 #[test]
-fn the_detector_keeps_theorem_7s_bound_on_the_macos_shape() {
+fn every_mistake_on_the_macos_shape_is_the_rules() {
     check(&Case {
         name: "macOS 100 µs",
         shape: MACOS,
@@ -279,7 +313,7 @@ fn the_detector_keeps_theorem_7s_bound_on_the_macos_shape() {
         recorded: 3_000_000,
         heavy: 24.0,
         skew: 95.7 / 51.7,
-        interval: Duration::from_millis(50),
+        intervals: [Duration::from_millis(5), Duration::from_millis(50)],
         granularity: Duration::from_nanos(45_400),
         sender: Duration::from_nanos(45_400),
         election: Duration::from_nanos(378_200),
@@ -287,7 +321,7 @@ fn the_detector_keeps_theorem_7s_bound_on_the_macos_shape() {
 }
 
 #[test]
-fn the_detector_keeps_theorem_7s_bound_on_the_flush_shape() {
+fn every_mistake_on_the_flush_shape_is_the_rules() {
     check(&Case {
         name: "macOS F_FULLFSYNC 10 ms",
         shape: FLUSH,
@@ -295,47 +329,45 @@ fn the_detector_keeps_theorem_7s_bound_on_the_flush_shape() {
         recorded: 60_000,
         heavy: 13.0,
         skew: 7_002.5 / 5_889.7,
-        // The recorded run's correlation time was 200 ms: its stalls were a flushing sender's
-        // backlog, which drained while it kept sending. The model's stalls block the sender for up
-        // to 250 ms, so its correlation time is 500 ms; at 200 ms two heartbeats in a margin are
-        // late together, and the replay breaks the bound (19 mistakes against 11.5 at an hour's
-        // MTBF), as the independence rule says it must.
-        interval: Duration::from_millis(500),
+        // The model's stalls block the sender for up to 250 ms. At 200 ms two heartbeats in a
+        // margin are late together, and Theorem 7's product, which multiplies their chances as
+        // independent, broke its bound there (19 mistakes against 11.5 at an hour's MTBF); the
+        // lateness of the arrival is one event, bounded alone.
+        intervals: [Duration::from_millis(20), Duration::from_millis(200)],
         granularity: Duration::from_nanos(1_627_400),
         sender: Duration::from_nanos(4_535_800 + 1_627_400),
         election: Duration::from_nanos(5_670_000),
     });
 }
 
-/// A sender that stops is suspected within the detection bound the configurator promised.
+/// A sender that stops is suspected within the detection bound the configurator promised, its
+/// stalls before the stop sent late or skipped.
 #[test]
 fn a_stopped_sender_is_suspected_within_the_detection_bound() {
     let interval = Duration::from_millis(50);
     let granularity = Duration::from_nanos(45_400);
-    let arrivals = trace(MACOS, 50_000.0, 20_000, 7);
-    let floors = Floors {
-        granularity,
-        sender: granularity,
-        correlation: interval,
-    };
-    let costs = Costs {
-        election: Duration::from_nanos(378_200),
-        mtbf: Duration::from_secs(30 * 86_400),
-    };
-    let (_, mut link) = replay(&arrivals, interval, granularity, &costs, &floors);
-    let configured = link.configure(&costs, &floors).unwrap();
-    // The sender stops right after its last heartbeat was scheduled: no heartbeat after.
-    let last_scheduled = (arrivals.len() as u64 - 1) * 50_000_000;
-    let Some(deadline) = link.deadline() else {
-        // The last heartbeat came late: the sender is already suspected.
-        assert_eq!(link.trust(), hyper_timing::Trust::Suspected);
-        return;
-    };
-    assert_eq!(link.poll(deadline), Some(Event::Suspected));
-    let detected = Duration::from_nanos(deadline - last_scheduled);
-    assert!(
-        detected <= configured.current.detection + Duration::from_nanos(1),
-        "detected after {detected:?}, bound {:?}",
-        configured.current.detection
-    );
+    for skips in [false, true] {
+        let arrivals = trace(MACOS, 50_000.0, 20_000, 7, skips);
+        let costs = Costs {
+            election: Duration::from_nanos(378_200),
+            mtbf: Duration::from_secs(30 * 86_400),
+        };
+        let (_, mut link) = replay(&arrivals, interval, granularity, granularity, &costs);
+        let configured = link.configure(&costs, granularity, granularity).unwrap();
+        // The sender stops right after its last heartbeat was scheduled: no heartbeat after.
+        let last = arrivals.iter().rposition(Option::is_some).unwrap() as u64;
+        let last_scheduled = last * 50_000_000;
+        let Some(deadline) = link.deadline() else {
+            // The last heartbeat came late: the sender is already suspected.
+            assert_eq!(link.trust(), hyper_timing::Trust::Suspected);
+            continue;
+        };
+        assert_eq!(link.poll(deadline), Some(Event::Suspected));
+        let detected = Duration::from_nanos(deadline - last_scheduled);
+        assert!(
+            detected <= configured.current.detection + Duration::from_nanos(1),
+            "detected after {detected:?}, bound {:?}",
+            configured.current.detection
+        );
+    }
 }

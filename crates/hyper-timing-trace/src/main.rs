@@ -6,6 +6,8 @@
 //! hyper-timing-trace timer <flush-file>
 //! hyper-timing-trace run <dir> <interval-us> <seconds> [<flush-file>]
 //! hyper-timing-trace analyse <dir> [<dir>...]
+//! hyper-timing-trace quantiles <dir> [<dir>...]
+//! hyper-timing-trace freezes <timer-output> <dir> [<dir>...]
 //! ```
 //!
 //! `timer` measures how late the two timed waits the recorder uses end (a sleep, and a socket wait
@@ -26,6 +28,12 @@
 //!
 //! Records go to a fixed buffer written out a chunk at a time: memory is bounded whatever the run's
 //! length. The load average is recorded with each chunk.
+//!
+//! `quantiles` prints a run's one-way delays and flushes, and `timer` each row of its sweep, as
+//! quantiles at a fixed grid of probabilities (`analyse::GRID`), and `freezes` the spans in which
+//! the run's host ran neither of its processes, read against the sweep's output: what
+//! hyper-liveness's simulation draws its worlds from
+//! (`crates/hyper-liveness/tests/support/worlds.rs`).
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -94,9 +102,11 @@ fn main() -> io::Result<()> {
             args.get(5).map(PathBuf::from),
         ),
         Some("analyse") => analyse::main(&args[2..]),
+        Some("quantiles") => analyse::quantiles(&args[2..]),
+        Some("freezes") => analyse::freezes(&args[2..]),
         _ => {
             eprintln!(
-                "usage: hyper-timing-trace timer <flush-file> | run <dir> <interval-us> <seconds> [<flush-file>] | analyse <dir>..."
+                "usage: hyper-timing-trace timer <flush-file> | run <dir> <interval-us> <seconds> [<flush-file>] | analyse <dir>... | quantiles <dir>... | freezes <timer-output> <dir>..."
             );
             Ok(())
         }
@@ -225,6 +235,9 @@ fn timer(flush: &Path) -> io::Result<()> {
     println!("| wait | asked µs | n | late p50 µs | p90 | p99 | p99.9 | max | mean |");
     println!("|---|---|---|---|---|---|---|---|---|");
     let mut late = Vec::with_capacity(SWEEP_WAITS);
+    // Each row's quantiles at the analyser's grid, printed after the table: what a simulated
+    // owner's timer is drawn from.
+    let mut rows = Vec::new();
     for (name, select) in [("sleep", false), (sys::SOCKET_WAIT, true)] {
         for asked in SWEEP_NS {
             late.clear();
@@ -239,6 +252,7 @@ fn timer(flush: &Path) -> io::Result<()> {
             }
             late.sort_unstable();
             let mean = late.iter().sum::<u64>() as f64 / late.len() as f64;
+            rows.push(format!("late {name} {asked} {}", grid(&late)));
             println!(
                 "| {name} | {} | {} | {:.1} | {:.1} | {:.1} | {:.1} | {:.1} | {:.1} |",
                 asked / 1_000,
@@ -261,6 +275,7 @@ fn timer(flush: &Path) -> io::Result<()> {
     }
     late.sort_unstable();
     let mean = late.iter().sum::<u64>() as f64 / late.len() as f64;
+    rows.push(format!("flush {} {}", block.len(), grid(&late)));
     println!(
         "| write+flush {} B | — | {} | {:.1} | {:.1} | {:.1} | {:.1} | {:.1} | {:.1} |",
         block.len(),
@@ -272,7 +287,20 @@ fn timer(flush: &Path) -> io::Result<()> {
         late.last().copied().unwrap_or(0) as f64 / 1e3,
         mean / 1e3
     );
+    println!();
+    for row in rows {
+        println!("{row}");
+    }
     Ok(())
+}
+
+/// `sorted`'s quantiles at the analyser's grid (`analyse::GRID`), whole nanoseconds.
+fn grid(sorted: &[u64]) -> String {
+    analyse::GRID
+        .iter()
+        .map(|q| quantile(sorted, *q).to_string())
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn word(packet: &[u8], at: usize) -> u64 {

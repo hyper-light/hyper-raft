@@ -1,9 +1,9 @@
-//! Node pairs under a deterministic simulation: one clock, a network with seeded delays, stalls
-//! and losses, a disk per node with seeded flush times, and owners that wake late by a seeded
-//! amount. The owners run the crate as a real one does (poll at its wake, feed what arrives and what
-//! becomes durable, make the liveness write it asks for) and compute the election cost from the
-//! library's own law over the round trips the streams measure; the tests assert what the crate
-//! promises and derive no bound of their own.
+//! Node pairs under a deterministic simulation: one clock, and a world as a host's heartbeat traces
+//! measured it (`support/worlds.rs`): one-way delays, a disk per node and its flushes, owners whose
+//! timers fire late, and hosts that freeze. The owners run the crate as a real one does (poll at
+//! its wake, feed what arrives and what becomes durable, make the liveness write it asks for) and
+//! compute the election cost from the library's own law over the round trips the streams measure;
+//! the tests assert what the crate promises and derive no bound of their own.
 
 #![allow(
     clippy::unwrap_used,
@@ -14,6 +14,7 @@
     clippy::disallowed_macros,
     clippy::cast_possible_truncation,
     clippy::cast_precision_loss,
+    clippy::cast_sign_loss,
     clippy::cognitive_complexity,
     missing_docs
 )]
@@ -77,78 +78,143 @@ impl Draws {
             .or_insert_with(|| Seeded::new(stream_seed(seed, label, &[a, b])))
     }
 
-    /// Uniform in `[0, bound)`, zero for a zero bound.
-    fn below(&mut self, label: &'static str, a: u64, b: u64, bound: u64) -> u64 {
-        self.stream(label, a, b).below(bound)
+    /// Uniform in `[0, 1)`: 53 bits.
+    fn unit(&mut self, label: &'static str, a: u64, b: u64) -> f64 {
+        (self.stream(label, a, b).next_u64() >> 11) as f64 / (1u64 << 53) as f64
     }
 
-    /// True with probability `p`: a uniform of 53 bits below it.
-    fn chance(&mut self, label: &'static str, a: u64, b: u64, p: f64) -> bool {
-        ((self.stream(label, a, b).next_u64() >> 11) as f64 / (1u64 << 53) as f64) < p
+    /// A value of `table` at a probability drawn from the stream.
+    fn draw(&mut self, label: &'static str, a: u64, b: u64, table: &Table) -> u64 {
+        let u = self.unit(label, a, b);
+        quantile(table, u)
     }
 }
 
-/// How the simulated world behaves.
+#[path = "support/worlds.rs"]
+mod worlds;
+use worlds::{Freezes, GRID, Table};
+
+/// A quantity's value at probability `u`, from its table by the inverse transform, linear between
+/// the neighbouring points of the grid (`hyper-timing-trace`'s, `worlds::GRID`).
+fn quantile(table: &Table, u: f64) -> u64 {
+    let at = GRID
+        .partition_point(|point| *point <= u)
+        .saturating_sub(1)
+        .min(GRID.len() - 2);
+    let (low, high) = (GRID[at], GRID[at + 1]);
+    let share = if high > low {
+        (u - low) / (high - low)
+    } else {
+        0.0
+    };
+    let (from, to) = (table[at] as f64, table[at + 1] as f64);
+    (from + share * (to - from)).round().max(0.0) as u64
+}
+
+/// How late an owner's timer fires past the deadline it was set to, as its host's measured waits
+/// were (`hyper-timing-trace timer`, the socket wait an owner's timer is).
+#[derive(Clone, Copy, Debug)]
+enum Timer {
+    /// The sweep's rows: each asked wait, nanoseconds, and its lateness's quantiles. A wait between
+    /// two rows is late as both are at the same probability, interpolated in the wait; a wait past
+    /// the longest row as that row, no lateness past what was measured being taken: the sweep
+    /// ends at 10 ms, and extrapolating macOS's coalescing in proportion to the wait (its leeway
+    /// is `min(wait >> shift, cap)`, `docs/timing.md` §2.4, the cap unmeasured) made the lateness
+    /// grow with every interval a link moved to, so its correlation never fell and it never
+    /// configured.
+    Sweep(&'static [(u64, Table)]),
+    /// A wait ends on the next clock interrupt of this period, its phase against the interrupts
+    /// uniform: late by up to the period.
+    Tick(u64),
+}
+
+impl Timer {
+    /// The lateness of a wait of `asked` at probability `u`.
+    fn late(&self, asked: u64, u: f64) -> u64 {
+        match *self {
+            Self::Tick(period) => (u * period as f64) as u64,
+            Self::Sweep(rows) => {
+                let above = rows.partition_point(|(wait, _)| *wait <= asked);
+                match (above.checked_sub(1).map(|at| &rows[at]), rows.get(above)) {
+                    (None, Some((_, first))) => quantile(first, u),
+                    (Some((low, below)), Some((high, upper))) => {
+                        let (from, to) = (quantile(below, u) as f64, quantile(upper, u) as f64);
+                        let share = (asked - low) as f64 / (high - low) as f64;
+                        (from + share * (to - from)).round() as u64
+                    }
+                    (Some((_, longest)), None) => quantile(longest, u),
+                    (None, None) => 0,
+                }
+            }
+        }
+    }
+}
+
+/// How the simulated world behaves: each quantity drawn from a host's measured distribution
+/// (`worlds`, the heartbeat traces of `docs/benchmarks.md`, "The simulation's worlds").
 #[derive(Clone, Copy, Debug)]
 struct World {
-    /// One-way delay: a floor and a uniform spread.
-    delay: (u64, u64),
-    /// The chance a message meets a stall, and the stall's length bound.
-    stall: (f64, u64),
-    /// The chance a message is lost.
-    loss: f64,
-    /// A flush: a floor and a uniform spread.
-    flush: (u64, u64),
-    /// The chance a flush meets a stall of the device, and the stall's length bound.
-    flush_stall: (f64, u64),
-    /// How late an owner's wake comes: a floor and a spread.
-    late: (u64, u64),
-    /// How often a node's groups write to its log on their own, if they do.
-    organic: Option<u64>,
-    /// Host freezes, if any: each node is frozen (wakes, sends, reads and completions held; the
-    /// kernel still stamps what arrives) for up to the bound, about once a period. The stalls of
-    /// the traces are the hosts' (`docs/timing.md` §2.6): a frozen sender's heartbeats leave late
-    /// together, which makes those at a short interval correlated over the freeze.
-    freeze: Option<(u64, u64)>,
+    name: &'static str,
+    /// One-way delay, from the send to the receiver's kernel stamp. No world loses a message: no
+    /// trace lost one of millions; a sender behind its schedule skips heartbeats, which its
+    /// receiver counts lost.
+    delay: &'static Table,
+    /// A write of a block and the platform's full flush.
+    flush: &'static Table,
+    /// The owner's timer.
+    timer: Timer,
+    /// The host's freezes, where its trace measured them (`hyper-timing-trace freezes`), each
+    /// node's replayed from a phase of its own: a frozen node's owner does nothing, its timer and
+    /// what arrives and completes held until the thaw, when it takes them in order and polls once,
+    /// as an owner that drains its socket before it polls does (`LinkEstimator::on_heartbeat`).
+    freezes: Option<&'static Freezes>,
+    /// Whether the node's groups keep its log busy: each write submitted as the last completes, so
+    /// a heartbeat waits for no liveness write of its own.
+    busy: bool,
 }
 
-const LAN: World = World {
-    delay: (80 * US, 60 * US),
-    stall: (0.002, 20 * MS),
-    loss: 0.001,
-    flush: (200 * US, 400 * US),
-    flush_stall: (0.0, 0),
-    late: (20 * US, 60 * US),
-    organic: None,
-    freeze: None,
+/// macOS on the M5 Max, loopback: the traces of 2026-10-02 at load 42–81 (`worlds`).
+const MACOS: World = World {
+    name: "macos",
+    delay: &worlds::MACOS_DELAY,
+    flush: &worlds::MACOS_FLUSH,
+    timer: Timer::Sweep(&worlds::MACOS_TIMER),
+    freezes: Some(&worlds::MACOS_FREEZES),
+    busy: false,
 };
 
-/// A LAN whose hosts freeze for up to 50 ms about every 250 ms: macOS's measured correlation time
-/// under load (`docs/timing.md` §2.6, item 6), with heartbeats at a floor of under a millisecond,
-/// a hundred of them in each freeze.
-const FROZEN: World = World {
-    freeze: Some((250 * MS, 50 * MS)),
-    ..LAN
-};
-
-/// A node whose groups write every few milliseconds to a device that stalls one flush in fifty for
-/// up to 60 ms, as a loaded disk does (`docs/timing.md` §2.6: flushes stalled up to 117 and 139 ms):
-/// the mean flush, and the floor `E[flush] + G` with it, moves by more than `G` with each stall.
+/// macOS with its groups keeping its log busy: its flushes back to back, as the trace tool's sweep
+/// made them.
 const BUSY: World = World {
-    organic: Some(2 * MS),
-    flush_stall: (0.02, 60 * MS),
-    ..LAN
+    name: "busy",
+    flush: &worlds::MACOS_BUSY_FLUSH,
+    busy: true,
+    ..MACOS
 };
 
-/// A Windows host: a timed wait ends on the next 15.625 ms clock interrupt (Microsoft,
-/// `timeBeginPeriod`, `docs/research/timing.md`), so a wake is up to that late, and a full flush
-/// (`FlushFileBuffers`) takes 10 to 30 ms, as the members of hyper-durable-e2e measured their floors
-/// `E[flush] + G` at 20 to 32 ms, with `G` at 2 to 8 ms, on the windows-2025 and windows-11-arm
-/// runners (`docs/timing.md` §2.9, "On real detectors").
+/// Linux in Docker Desktop's VM on the same machine: 1 ms ticks, `fdatasync` on a disk image
+/// (`worlds`).
+const LINUX: World = World {
+    name: "linux",
+    delay: &worlds::LINUX_DELAY,
+    flush: &worlds::LINUX_FLUSH,
+    timer: Timer::Sweep(&worlds::LINUX_TIMER),
+    freezes: Some(&worlds::LINUX_FREEZES),
+    busy: false,
+};
+
+/// A Windows host, which the trace tool cannot record (`worlds`): a timed wait ends on the next
+/// 15.625 ms clock interrupt (Microsoft, `timeBeginPeriod`), and a full flush takes what
+/// hyper-durable-e2e's members measured on the windows-2025 and windows-11-arm runners. Its loopback
+/// delay is not measured: it takes Linux's, three orders below its timer and its flush. Nor are its
+/// freezes, and it has none.
 const WINDOWS: World = World {
-    late: (0, 15_625 * US),
-    flush: (10 * MS, 20 * MS),
-    ..LAN
+    name: "windows",
+    delay: &worlds::LINUX_DELAY,
+    flush: &worlds::WINDOWS_FLUSH,
+    timer: Timer::Tick(worlds::WINDOWS_TICK),
+    freezes: None,
+    busy: false,
 };
 
 enum Event {
@@ -165,10 +231,10 @@ enum Event {
         write: Write,
         started: u64,
     },
-    /// A node's groups write on their own.
-    Organic { node: usize },
-    /// A node's host freezes.
+    /// A node's host freezes: the next freeze of its replay.
     Freeze { node: usize },
+    /// A node's host thaws, unless a later freeze holds it longer.
+    Thaw { node: usize },
 }
 
 struct Owner {
@@ -195,8 +261,6 @@ struct Node {
     owner: Owner,
     alive: bool,
     disk_stalled: bool,
-    /// The host is frozen until this time.
-    frozen_until: u64,
     /// The heartbeats taken when the node last charged its detectors an election.
     charged: u64,
     /// The disk's flush queue: one write at a time, as one device.
@@ -214,6 +278,14 @@ struct Node {
     /// The owner's timer: the deadline it was set to, the stream's wake, and when it fires, late
     /// by a lateness drawn once, when the deadline was set ([`Sim::arm`]).
     timer: Option<(u64, u64)>,
+    /// The host is frozen until this time (`World::freezes`).
+    frozen_until: u64,
+    /// What arrived and completed while the host was frozen, in order: taken at the thaw.
+    held: Vec<Event>,
+    /// The node's replay of its host's freezes: the point of the trace it starts at, and the
+    /// freezes replayed so far.
+    phase: u64,
+    replayed: u64,
 }
 
 struct Sim {
@@ -226,6 +298,10 @@ struct Sim {
     next_event: u64,
     /// When each node first held each pair configured: `(node, peer)` to the time.
     configured_at: BTreeMap<(usize, PeerId), u64>,
+    /// The latest any timer was set to fire past its deadline, and the longest any host froze:
+    /// how late past what it waits for a poll can come in this run.
+    latest_late: u64,
+    longest_freeze: u64,
 }
 
 impl Sim {
@@ -256,7 +332,6 @@ impl Sim {
                     },
                     alive: true,
                     disk_stalled: false,
-                    frozen_until: 0,
                     charged: 0,
                     disk_busy_until: 0,
                     log: Vec::new(),
@@ -265,6 +340,10 @@ impl Sim {
                     restarts: Vec::new(),
                     believed: BTreeMap::new(),
                     timer: None,
+                    frozen_until: 0,
+                    held: Vec::new(),
+                    phase: 0,
+                    replayed: 0,
                 }
             })
             .collect();
@@ -277,20 +356,42 @@ impl Sim {
             events: BTreeMap::new(),
             next_event: 0,
             configured_at: BTreeMap::new(),
+            latest_late: 0,
+            longest_freeze: 0,
         };
-        if let Some(every) = world.organic {
-            for node in 0..count {
-                let at = sim.draws.below("organic", node as u64, 0, every);
-                sim.schedule(at, Event::Organic { node });
+        for node in 0..count {
+            if world.busy {
+                sim.submit(node, Write::Log);
             }
-        }
-        if let Some((every, _)) = world.freeze {
-            for node in 0..count {
-                let at = sim.draws.below("freeze", node as u64, 0, 2 * every);
-                sim.schedule(at, Event::Freeze { node });
+            if let Some(freezes) = world.freezes {
+                // A uniform point of the trace: 53 bits of the node's own stream.
+                let u = sim.draws.unit("freeze", node as u64, 0);
+                sim.nodes[node].phase = (u * freezes.span as f64) as u64;
+                sim.schedule_freeze(node);
             }
         }
         sim
+    }
+
+    /// The next freeze of `node`'s replay, when it begins and how long it lasts: the trace's
+    /// freezes from the node's phase on, round the trace again past its end, so the host freezes
+    /// as the trace's did, a span apart.
+    fn next_freeze(&self, node: usize) -> Option<(u64, u64)> {
+        let freezes = self.world.freezes?;
+        let count = freezes.at.len() as u64;
+        if count == 0 {
+            return None;
+        }
+        let n = &self.nodes[node];
+        let index = freezes.at.partition_point(|(onset, _)| *onset < n.phase) as u64 + n.replayed;
+        let (onset, length) = freezes.at[(index % count) as usize];
+        Some(((index / count) * freezes.span + onset - n.phase, length))
+    }
+
+    fn schedule_freeze(&mut self, node: usize) {
+        if let Some((at, _)) = self.next_freeze(node) {
+            self.schedule(at, Event::Freeze { node });
+        }
     }
 
     fn schedule(&mut self, at: u64, event: Event) {
@@ -305,13 +406,8 @@ impl Sim {
         if self.nodes[node].disk_stalled {
             return;
         }
-        let (floor, spread) = self.world.flush;
         let start = self.now.max(self.nodes[node].disk_busy_until);
-        let disk = node as u64;
-        let mut done = start + floor + self.draws.below("disk", disk, 0, spread);
-        if self.draws.chance("disk", disk, 0, self.world.flush_stall.0) {
-            done += self.draws.below("disk", disk, 0, self.world.flush_stall.1);
-        }
+        let done = start + self.draws.draw("disk", node as u64, 0, self.world.flush);
         self.nodes[node].disk_busy_until = done;
         let started = self.now;
         self.schedule(
@@ -324,7 +420,7 @@ impl Sim {
         );
     }
 
-    /// Polls `node` and carries out what it asked.
+    /// Polls `node` and carries out what it asked; a frozen node polls at its thaw.
     fn poll(&mut self, node: usize) {
         if !self.nodes[node].alive || self.nodes[node].frozen_until > self.now {
             return;
@@ -340,18 +436,7 @@ impl Sim {
         for (peer, bytes) in sent {
             let beat = Heartbeat::decode(&bytes).unwrap();
             self.nodes[node].log.push((self.now, peer, beat));
-            let link = (node as u64, peer);
-            if self.draws.chance("link", link.0, link.1, self.world.loss) {
-                continue;
-            }
-            let (floor, spread) = self.world.delay;
-            let mut delay = floor + self.draws.below("link", link.0, link.1, spread);
-            if self
-                .draws
-                .chance("link", link.0, link.1, self.world.stall.0)
-            {
-                delay += self.draws.below("link", link.0, link.1, self.world.stall.1);
-            }
+            let delay = self.draws.draw("link", node as u64, peer, self.world.delay);
             self.schedule(
                 self.now + delay,
                 Event::Arrive {
@@ -455,15 +540,16 @@ impl Sim {
         if self.nodes[node].timer.map(|(deadline, _)| deadline) == asked {
             return;
         }
-        let (floor, spread) = self.world.late;
         let fires = asked.map(|deadline| {
-            let late = floor + self.draws.below("timer", node as u64, 0, spread);
+            let u = self.draws.unit("timer", node as u64, 0);
+            let late = self.world.timer.late(deadline.saturating_sub(self.now), u);
+            self.latest_late = self.latest_late.max(late);
             (deadline, deadline.max(self.now) + late)
         });
         self.nodes[node].timer = fires;
     }
 
-    /// The earliest timer of a live node, held while its host is frozen.
+    /// The earliest timer of a live node, held while its host is frozen: the thaw polls.
     fn next_wake(&self) -> Option<(u64, usize)> {
         self.nodes
             .iter()
@@ -474,11 +560,6 @@ impl Sim {
                     .map(|(_, fires)| (fires.max(node.frozen_until), i))
             })
             .min()
-    }
-
-    /// Runs until `until`, polling every node first.
-    fn run(&mut self, until: u64) {
-        self.run_while(|sim| sim.now < until, Some(until));
     }
 
     /// Runs while `keep` holds of the world, an event or a wake at a time, polling every node
@@ -533,17 +614,11 @@ impl Sim {
     }
 
     fn handle(&mut self, event: Event) {
-        // A frozen host takes what happens to it once it thaws, in order.
-        let held = match &event {
-            Event::Arrive { to, .. } => Some(*to),
-            Event::Durable { node, .. } => Some(*node),
-            Event::Organic { .. } | Event::Freeze { .. } => None,
-        };
-        if let Some(node) = held
+        // A frozen host's owner takes what arrives and completes at its thaw.
+        if let Event::Arrive { to: node, .. } | Event::Durable { node, .. } = event
             && self.nodes[node].frozen_until > self.now
         {
-            let until = self.nodes[node].frozen_until;
-            self.schedule(until, event);
+            self.nodes[node].held.push(event);
             return;
         }
         match event {
@@ -579,24 +654,63 @@ impl Sim {
                 n.liveness.on_durable(write, started, now);
                 n.liveness.poll(now, &mut n.owner);
                 self.drain(node);
-            }
-            Event::Organic { node } => {
-                if let Some(every) = self.world.organic {
+                // The groups keep the log busy: their next write as this one completes.
+                if write == Write::Log && self.world.busy {
                     self.submit(node, Write::Log);
-                    let next =
-                        self.now + every / 2 + self.draws.below("organic", node as u64, 0, every);
-                    self.schedule(next, Event::Organic { node });
                 }
             }
             Event::Freeze { node } => {
-                if let Some((every, longest)) = self.world.freeze {
-                    let until = self.now + self.draws.below("freeze", node as u64, 0, longest);
-                    self.nodes[node].frozen_until = self.nodes[node].frozen_until.max(until);
-                    let next = until + self.draws.below("freeze", node as u64, 0, 2 * every);
-                    self.schedule(next, Event::Freeze { node });
+                let Some((_, length)) = self.next_freeze(node) else {
+                    return;
+                };
+                self.longest_freeze = self.longest_freeze.max(length);
+                let n = &mut self.nodes[node];
+                n.frozen_until = n.frozen_until.max(self.now + length);
+                n.replayed += 1;
+                let thaw = n.frozen_until;
+                self.schedule(thaw, Event::Thaw { node });
+                self.schedule_freeze(node);
+            }
+            Event::Thaw { node } => self.thaw(node),
+        }
+    }
+
+    /// `node`'s host thaws: its owner takes, in order, the datagrams that arrived (each judged at
+    /// its kernel stamp, `Liveness::on_heartbeat`) and the writes that completed (reported now,
+    /// when the owner learns of them), then polls once. A later freeze that holds the host longer
+    /// thaws it instead.
+    fn thaw(&mut self, node: usize) {
+        if self.nodes[node].frozen_until > self.now || !self.nodes[node].alive {
+            return;
+        }
+        let held = std::mem::take(&mut self.nodes[node].held);
+        let now = self.now;
+        // The timer, due during the freeze, is the poll's: set again after it.
+        self.nodes[node].timer = None;
+        for event in held {
+            let n = &mut self.nodes[node];
+            let completed = match event {
+                Event::Arrive {
+                    from, bytes, stamp, ..
+                } => {
+                    let _ = n
+                        .liveness
+                        .on_heartbeat(from as u64 + 1, &bytes, stamp, &mut n.owner);
+                    None
                 }
+                Event::Durable { write, started, .. } if !n.disk_stalled => {
+                    n.durable.push(now);
+                    n.liveness.on_durable(write, started, now);
+                    Some(write)
+                }
+                _ => None,
+            };
+            // The groups keep the log busy: their next write as they learn this one completed.
+            if completed == Some(Write::Log) && self.world.busy {
+                self.submit(node, Write::Log);
             }
         }
+        self.poll(node);
     }
 
     fn configured(&self) -> bool {
@@ -631,6 +745,66 @@ impl Sim {
         stuck
     }
 
+    /// Whether nothing is left to happen but the hosts' freezes: no message or write in flight or
+    /// held, and no timer set.
+    fn quiet(&self) -> bool {
+        self.events
+            .values()
+            .all(|event| matches!(event, Event::Freeze { .. } | Event::Thaw { .. }))
+            && self
+                .nodes
+                .iter()
+                .all(|node| node.timer.is_none() && node.held.is_empty())
+    }
+
+    /// Runs until every live pair has taken twice the heartbeats it had: as much history again as
+    /// it holds, the span the doubling schedule renews a configuration over (`pair.rs`,
+    /// `renewal_due`), so a run measured to here crosses a renewal of every configuration.
+    fn run_until_doubled(&mut self) {
+        let count = self.nodes.len() as u64;
+        let pairs: Vec<(usize, PeerId, u64)> = self
+            .nodes
+            .iter()
+            .enumerate()
+            .filter(|(_, node)| node.alive)
+            .flat_map(|(index, node)| {
+                (1..=count)
+                    .filter(move |peer| *peer != node.owner.id)
+                    .filter_map(move |peer| {
+                        node.liveness
+                            .report(peer)
+                            .map(|report| (index, peer, report.taken))
+                    })
+            })
+            .filter(|(_, peer, _)| self.nodes[*peer as usize - 1].alive)
+            .collect();
+        self.run_while(
+            |sim| {
+                pairs.iter().any(|(node, peer, taken)| {
+                    sim.nodes[*node]
+                        .liveness
+                        .report(*peer)
+                        .is_some_and(|report| report.taken < (2 * taken).max(taken + 1))
+                })
+            },
+            None,
+        );
+    }
+
+    /// Runs until every live node but `victim` holds it suspected.
+    fn run_until_suspected(&mut self, victim: usize) {
+        self.run_while(
+            |sim| {
+                (0..sim.nodes.len())
+                    .filter(|node| *node != victim && sim.nodes[*node].alive)
+                    .any(|node| {
+                        sim.nodes[node].liveness.trust(victim as u64 + 1) != Some(Trust::Suspected)
+                    })
+            },
+            None,
+        );
+    }
+
     /// Runs until every live pair is configured; a pair that takes more heartbeats than any window
     /// holds unconfigured fails it (`unresolved`).
     fn run_until_configured(&mut self) {
@@ -649,10 +823,9 @@ impl Sim {
 #[test]
 fn live_peers_configure_and_keep_their_allowance() {
     for seed in seeds(1, 8) {
-        let mut sim = Sim::new(3, LAN, seed);
+        let mut sim = Sim::new(3, MACOS, seed);
         sim.run_until_configured();
-        let end = sim.now + 60_000 * MS;
-        sim.run(end);
+        sim.run_until_doubled();
         let (mut suspicions, mut allowance) = (0u64, 0.0f64);
         for node in &sim.nodes {
             for peer in (1..=3u64).filter(|p| *p != node.owner.id) {
@@ -674,12 +847,10 @@ fn live_peers_configure_and_keep_their_allowance() {
 /// was due, newer than the previous one's, and none leaves without one.
 #[test]
 fn no_heartbeat_leaves_without_a_newer_flush() {
-    for (seed, organic) in seeds(2, 1)
-        .flat_map(|seed| [None, Some(7 * MS), Some(300 * US)].map(|organic| (seed, organic)))
-    {
-        let world = World { organic, ..LAN };
+    for (seed, world) in seeds(2, 1).flat_map(|seed| [MACOS, BUSY].map(|world| (seed, world))) {
         let mut sim = Sim::new(3, world, seed);
-        sim.run(5_000 * MS);
+        sim.run_until_configured();
+        sim.run_until_doubled();
         for node in &sim.nodes {
             let mut previous: BTreeMap<PeerId, Heartbeat> = BTreeMap::new();
             for (at, peer, beat) in &node.log {
@@ -710,10 +881,9 @@ fn no_heartbeat_leaves_without_a_newer_flush() {
 #[test]
 fn a_killed_peer_is_suspected_within_the_stated_bound() {
     for seed in seeds(3, 16) {
-        let mut sim = Sim::new(4, LAN, seed);
+        let mut sim = Sim::new(4, MACOS, seed);
         sim.run_until_configured();
-        let settle = sim.now + 2_000 * MS;
-        sim.run(settle);
+        sim.run_until_doubled();
         let victim = 3usize;
         // Killed while every survivor trusts it: one that suspected it by a mistake just before
         // would hold that suspicion through the kill and make no new one to measure.
@@ -725,10 +895,7 @@ fn a_killed_peer_is_suspected_within_the_stated_bound() {
                 )
             })
         };
-        while !trusted(&sim) {
-            let next = sim.now + MS;
-            sim.run(next);
-        }
+        sim.run_while(|sim| !trusted(sim), None);
         let killed_at = sim.now;
         sim.nodes[victim].alive = false;
         let last_sent: Vec<u64> = (0..4usize)
@@ -742,15 +909,21 @@ fn a_killed_peer_is_suspected_within_the_stated_bound() {
                     .unwrap_or(0)
             })
             .collect();
-        let end = sim.now + 10_000 * MS;
-        sim.run(end);
+        sim.run_until_suspected(victim);
         for (node, last_sent) in last_sent.iter().enumerate().take(3) {
+            // The suspicion the survivor holds: a first one after the kill can be a mistake, the
+            // victim's last heartbeat still in flight past its freshness point, which that
+            // heartbeat ended.
             let found = sim.nodes[node]
                 .suspicions
                 .iter()
-                .find(|s| s.peer == victim as u64 + 1 && s.at_ns >= killed_at)
+                .rfind(|s| s.peer == victim as u64 + 1)
                 .copied()
                 .unwrap_or_else(|| panic!("seed {seed}: node {node} never suspected the victim"));
+            assert!(
+                found.at_ns >= killed_at,
+                "seed {seed}: held from before the kill"
+            );
             let last = found.last.unwrap();
             assert_eq!(
                 last.sent_ns, *last_sent,
@@ -777,22 +950,39 @@ fn a_killed_peer_is_suspected_within_the_stated_bound() {
 #[test]
 fn a_stalled_disk_is_suspected_as_a_crash_is() {
     for seed in seeds(4, 8) {
-        let mut sim = Sim::new(
-            3,
-            World {
-                organic: Some(5 * MS),
-                ..LAN
-            },
-            seed,
-        );
+        let mut sim = Sim::new(3, BUSY, seed);
         sim.run_until_configured();
-        let settle = sim.now + 2_000 * MS;
-        sim.run(settle);
+        sim.run_until_doubled();
         let stalled = 2usize;
+        // Stalled while every peer trusts it: one that suspected it just before (its host frozen,
+        // say) would hold that suspicion through the stall and make no new one to measure.
+        sim.run_while(
+            |sim| {
+                (0..2).any(|node| {
+                    !matches!(
+                        sim.nodes[node].liveness.trust(stalled as u64 + 1),
+                        Some(Trust::Trusted { .. })
+                    )
+                })
+            },
+            None,
+        );
         let stalled_at = sim.now;
         sim.nodes[stalled].disk_stalled = true;
-        let end = sim.now + 10_000 * MS;
-        sim.run(end);
+        sim.run_until_suspected(stalled);
+        // And on, until the stalled node has taken a heartbeat from each peer since: it still hears.
+        let heard: Vec<u64> = (1..=2u64)
+            .map(|peer| sim.nodes[stalled].liveness.report(peer).unwrap().taken)
+            .collect();
+        sim.run_while(
+            |sim| {
+                (1..=2u64).any(|peer| {
+                    sim.nodes[stalled].liveness.report(peer).unwrap().taken
+                        <= heard[peer as usize - 1]
+                })
+            },
+            None,
+        );
         // At most the heartbeats an in-flight flush had proved left after the stall.
         let late_sends = sim.nodes[stalled]
             .log
@@ -816,10 +1006,19 @@ fn a_stalled_disk_is_suspected_as_a_crash_is() {
             let bound = found.detection.unwrap();
             assert!(found.at_ns - last.due_ns <= bound.as_nanos() as u64);
         }
-        // The stalled node still hears its peers.
+        // The stalled node still hears its peers: it took a heartbeat from each since every peer
+        // suspected it (the wait above), and its suspicions of them, live throughout, are within
+        // what Theorem 7 allows.
+        let (mut suspicions, mut allowance) = (0u64, 0.0f64);
+        for peer in 1..=2u64 {
+            let report = sim.nodes[stalled].liveness.report(peer).unwrap();
+            suspicions += report.suspicions;
+            allowance += report.allowance;
+        }
         assert!(
-            sim.nodes[stalled].liveness.suspected().next().is_none(),
-            "seed {seed}: the stalled node suspected a live peer"
+            poisson95(suspicions).0 <= allowance,
+            "seed {seed}: the stalled node's {suspicions} suspicions of live peers refute its \
+             allowance {allowance}"
         );
     }
 }
@@ -835,26 +1034,29 @@ fn groups_share_one_stream_and_an_unshared_pair_is_silent() {
 
 fn groups_share_one_stream(seed: u64) {
     let sent = |groups: u32| {
-        let mut sim = Sim::new(2, LAN, seed);
+        let mut sim = Sim::new(2, MACOS, seed);
         for node in &mut sim.nodes {
             let peer = 3 - node.owner.id;
             for _ in 1..groups {
                 node.liveness.attach(peer).unwrap();
             }
         }
-        sim.run(3_000 * MS);
+        sim.run_until_configured();
+        sim.run_until_doubled();
         (sim.nodes[0].log.len(), sim.nodes[1].log.len())
     };
     assert_eq!(sent(1), sent(1_000));
-    let mut sim = Sim::new(2, LAN, seed);
-    sim.run(1_000 * MS);
+    let mut sim = Sim::new(2, MACOS, seed);
+    sim.run_until_configured();
     for node in &mut sim.nodes {
         let peer = 3 - node.owner.id;
         node.liveness.detach(peer).unwrap();
         assert_eq!(node.liveness.report(peer), None);
     }
     let before = sim.nodes[0].log.len();
-    sim.run(3_000 * MS);
+    // Until nothing is left to happen but the hosts' freezes: what was in flight lands, and no
+    // timer is set.
+    sim.run_while(|sim| !sim.quiet(), None);
     assert_eq!(
         sim.nodes[0].log.len(),
         before,
@@ -863,10 +1065,11 @@ fn groups_share_one_stream(seed: u64) {
     assert_eq!(sim.nodes[0].liveness.wake(), None);
 }
 
-/// A restarted peer is reported restarted (`Change::Restarted`, for the core's `restarted`), is
-/// judged at once by the detector in force, and its restart is a failure in the MTBF's evidence.
-/// The old run's last heartbeat to a survivor, delivered after the new run's first (the plane
-/// keeps two epochs a peer), is refused as stale and reports nothing.
+/// A restarted peer is reported restarted (`Change::Restarted`, for the core's `restarted`) once
+/// by each other node and is judged at once by the detector in force. The old run's last heartbeat
+/// to a survivor, delivered after the new run's first (the plane keeps two epochs a peer), is
+/// refused as stale and counts no second failure (the count itself is
+/// `a_superseded_runs_heartbeat_is_stale_and_its_restart_counts_once`'s).
 #[test]
 fn a_restarted_peer_is_trusted_again_and_counted() {
     for seed in seeds(6, 1) {
@@ -875,13 +1078,11 @@ fn a_restarted_peer_is_trusted_again_and_counted() {
 }
 
 fn a_restarted_peer(seed: u64) {
-    let mut sim = Sim::new(3, LAN, seed);
+    let mut sim = Sim::new(3, MACOS, seed);
     sim.run_until_configured();
-    let mtbf = sim.nodes[0].liveness.mtbf().unwrap();
     let victim = 2usize;
     sim.nodes[victim].alive = false;
-    let end = sim.now + 3_000 * MS;
-    sim.run(end);
+    sim.run_until_suspected(victim);
     assert_eq!(sim.nodes[0].liveness.trust(3), Some(Trust::Suspected));
     // A new run: a new process, the same node.
     let mut liveness = Liveness::new(Settings {
@@ -918,12 +1119,20 @@ fn a_restarted_peer(seed: u64) {
     );
     assert_eq!(node.liveness.mtbf(), before, "no second failure");
     sim.drain(0);
-    let end = sim.now + 2_000 * MS;
-    sim.run(end);
-    assert!(matches!(
-        sim.nodes[0].liveness.trust(3),
-        Some(Trust::Trusted { .. })
-    ));
+    // Until both others saw the new run and trust it, and through a renewal of every pair.
+    sim.run_while(
+        |sim| {
+            (0..2).any(|node| {
+                sim.nodes[node].restarts.is_empty()
+                    || !matches!(
+                        sim.nodes[node].liveness.trust(3),
+                        Some(Trust::Trusted { .. })
+                    )
+            })
+        },
+        None,
+    );
+    sim.run_until_doubled();
     for node in 0..2 {
         assert_eq!(
             sim.nodes[node].restarts,
@@ -932,10 +1141,6 @@ fn a_restarted_peer(seed: u64) {
         );
     }
     assert!(sim.nodes[0].liveness.report(3).unwrap().configured);
-    assert!(
-        sim.nodes[0].liveness.mtbf().unwrap() < mtbf + Duration::from_secs(60),
-        "the restart counted"
-    );
 }
 
 /// A heartbeat of a superseded run, delivered after the new run's first (the plane keeps two
@@ -1088,9 +1293,10 @@ fn heartbeats_without_their_proof_are_refused() {
 }
 
 /// Problem 1 and item 10 of `docs/timing.md` (§2.9, §3): every link configures, or a crash on it
-/// is suspected within the bound its suspicion states. On a LAN, and on one whose hosts freeze for
-/// tens of milliseconds at a time, which makes the heartbeats at a sub-millisecond floor too
-/// correlated for any window to measure (`LinkEstimator::independent_interval`), seeds from zero:
+/// is suspected within the bound its suspicion states. On the measured hosts, macOS (whose freezes
+/// make heartbeats at a short floor late together, too correlated for a window to measure,
+/// `LinkEstimator::independent_interval`), macOS with its groups keeping its log busy, and Linux
+/// in its VM:
 /// - before any kill, every pair configures, none taking more heartbeats unconfigured than any
 ///   window holds (`Sim::unresolved`);
 /// - one node is killed after a share of the heartbeats it sent before every pair had configured
@@ -1102,7 +1308,9 @@ fn heartbeats_without_their_proof_are_refused() {
 fn every_link_configures_or_suspects_a_crash_within_its_bound() {
     let mut slowest = (0u64, 0u64, "");
     let mut judged_by = [0u64; 3];
-    for (name, world) in [("lan", LAN), ("frozen", FROZEN), ("busy", BUSY)] {
+    let mut longest_freeze = 0u64;
+    for world in [MACOS, BUSY, LINUX] {
+        let name = world.name;
         for seed in seeds(7, 32) {
             // The heartbeats the victim sends before every pair is configured, in this seed's run.
             let mut twin = Sim::new(4, world, seed);
@@ -1146,6 +1354,9 @@ fn every_link_configures_or_suspects_a_crash_within_its_bound() {
                 },
                 None,
             );
+            longest_freeze = longest_freeze
+                .max(twin.longest_freeze)
+                .max(sim.longest_freeze);
             for (node, last_due) in last_due.iter().enumerate() {
                 let suspicion = sim.nodes[node]
                     .suspicions
@@ -1190,8 +1401,15 @@ fn every_link_configures_or_suspects_a_crash_within_its_bound() {
     }
     println!(
         "most heartbeats a link took to configure: {} ({} seed {}); suspicions of the killed node \
-         by its own detector {}, by the node's evidence's margin {}, never heard {}",
-        slowest.0, slowest.2, slowest.1, judged_by[0], judged_by[1], judged_by[2]
+         by its own detector {}, by the node's evidence's margin {}, never heard {}; the longest \
+         freeze replayed {} ms",
+        slowest.0,
+        slowest.2,
+        slowest.1,
+        judged_by[0],
+        judged_by[1],
+        judged_by[2],
+        longest_freeze / MS
     );
 }
 
@@ -1201,7 +1419,7 @@ fn every_link_configures_or_suspects_a_crash_within_its_bound() {
 #[test]
 fn a_peer_never_heard_from_is_suspected() {
     for seed in seeds(8, 16) {
-        let mut sim = Sim::new(4, LAN, seed);
+        let mut sim = Sim::new(4, MACOS, seed);
         sim.nodes[3].alive = false;
         sim.run_while(
             |sim| {
@@ -1232,17 +1450,13 @@ fn a_peer_never_heard_from_is_suspected() {
 /// that rate. Every survivor suspects it no later than the first poll once both its freshness point
 /// has passed and the node holds a link's own evidence (a pair it has configured): the young link
 /// is judged by the widest behaviour the node has measured (`docs/timing.md` §2.8, "Judged before
-/// its own evidence"). In four worlds, Windows' timer among them, 32 seeds each, the victim killed
-/// after a share, drawn from the seed, of the heartbeats it sent before any pair configured in the
-/// same seed's run.
+/// its own evidence"). In the four worlds, Windows' timer among them, the victim killed after a
+/// share, drawn from the seed, of the heartbeats it sent before any pair configured in the same
+/// seed's run.
 #[test]
 fn a_peer_dead_before_its_links_have_evidence_is_suspected_once_a_sibling_has_its_own() {
-    for (name, world) in [
-        ("lan", LAN),
-        ("frozen", FROZEN),
-        ("busy", BUSY),
-        ("windows", WINDOWS),
-    ] {
+    for world in [MACOS, BUSY, LINUX, WINDOWS] {
+        let name = world.name;
         let mut noticed = Vec::new();
         for seed in seeds(9, 32) {
             let victim = 2usize;
@@ -1272,8 +1486,9 @@ fn a_peer_dead_before_its_links_have_evidence_is_suspected_once_a_sibling_has_it
                 },
                 None,
             );
-            // A poll comes at most a wake's lateness, or a freeze, past what it waits for.
-            let late = world.late.0 + world.late.1 + world.freeze.map_or(0, |(_, longest)| longest);
+            // A poll comes at most a timer's lateness, or a freeze, past what it waits for: the
+            // latest and the longest this run drew.
+            let late = sim.latest_late + sim.longest_freeze;
             for node in 0..2usize {
                 let suspicion = sim.nodes[node]
                     .suspicions

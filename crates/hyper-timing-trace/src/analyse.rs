@@ -726,6 +726,226 @@ pub(crate) fn main(dirs: &[String]) -> io::Result<()> {
     Ok(())
 }
 
+/// The probabilities a quantile table is given at (`quantiles`): every hundredth, and past the
+/// 99th the tail a run's stalls live in, to the most. `hyper-liveness`'s simulation draws its
+/// worlds from these tables by the inverse transform, linear between neighbouring points.
+pub(crate) const GRID: [f64; 107] = {
+    let mut grid = [0.0; 107];
+    let mut i = 0;
+    while i < 100 {
+        grid[i] = i as f64 / 100.0;
+        i += 1;
+    }
+    let tail = [0.995, 0.999, 0.9995, 0.9999, 0.99995, 0.99999, 1.0];
+    let mut j = 0;
+    while j < tail.len() {
+        grid[100 + j] = tail[j];
+        j += 1;
+    }
+    grid
+};
+
+/// `sorted`'s quantiles at [`GRID`], whole nanoseconds, space-separated.
+pub(crate) fn grid_row(sorted: &[f64]) -> String {
+    GRID.iter()
+        .map(|q| format!("{:.0}", quantile(sorted, *q).max(0.0)))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// What a simulated world is drawn from, per run (`hyper-timing-trace quantiles`): the quantiles at
+/// [`GRID`] of the one-way delay from the send to the kernel's stamp, and of the sender's write and
+/// flush where the run flushed. The host's freezes are [`freezes`]'s.
+pub(crate) fn quantiles(dirs: &[String]) -> io::Result<()> {
+    for dir in dirs {
+        let run = Run::load(Path::new(dir))?;
+        println!(
+            "# {dir}: {} {}, interval {} ns, {} s, load {} → {}",
+            run.meta.os,
+            std::env::consts::ARCH,
+            run.meta.interval_ns,
+            run.meta.seconds,
+            run.meta.load_start,
+            run.meta.load_end
+        );
+        let mut net: Vec<f64> = run.beats.iter().map(|b| b.network).collect();
+        net.sort_by(f64::total_cmp);
+        println!("delay {}", grid_row(&net));
+        if run.meta.flush {
+            let mut flush: Vec<f64> = run.beats.iter().map(|b| b.flush).collect();
+            flush.sort_by(f64::total_cmp);
+            println!("flush {}", grid_row(&flush));
+        }
+    }
+    Ok(())
+}
+
+/// The longest lateness the timer sweep measured of each kind of wait (`hyper-timing-trace
+/// timer`'s `late` rows): `(asked, longest)`, nanoseconds, by asked wait.
+struct Body {
+    sleep: Vec<(u64, u64)>,
+    socket: Vec<(u64, u64)>,
+}
+
+impl Body {
+    /// From the sweep's printed rows: each `late <kind> <asked> <quantiles>`, the last quantile
+    /// its longest.
+    fn read(path: &Path) -> io::Result<Self> {
+        let text = std::fs::read_to_string(path)?;
+        let (mut sleep, mut socket) = (Vec::new(), Vec::new());
+        for line in text.lines() {
+            let mut words = line.split_whitespace();
+            if words.next() != Some("late") {
+                continue;
+            }
+            let kind = words.next();
+            let asked = words.next().and_then(|w| w.parse::<u64>().ok());
+            let longest = words.last().and_then(|w| w.parse::<u64>().ok());
+            if let (Some(kind), Some(asked), Some(longest)) = (kind, asked, longest) {
+                if kind == "sleep" {
+                    &mut sleep
+                } else {
+                    &mut socket
+                }
+                .push((asked, longest));
+            }
+        }
+        sleep.sort_unstable();
+        socket.sort_unstable();
+        if sleep.is_empty() || socket.is_empty() {
+            return Err(io::Error::other("the sweep has no late rows of both kinds"));
+        }
+        Ok(Self { sleep, socket })
+    }
+
+    /// The longest lateness `rows` measured of a wait of `asked`: linear between the rows around
+    /// it, the nearest row's past either end.
+    fn longest(rows: &[(u64, u64)], asked: u64) -> f64 {
+        let above = rows.partition_point(|(wait, _)| *wait <= asked);
+        match (
+            above.checked_sub(1).and_then(|at| rows.get(at)),
+            rows.get(above),
+        ) {
+            (Some(&(low, from)), Some(&(high, to))) => {
+                let share = (asked - low) as f64 / (high - low) as f64;
+                from as f64 + share * (to as f64 - from as f64)
+            }
+            (Some(&(_, only)), None) | (None, Some(&(_, only))) => only as f64,
+            (None, None) => 0.0,
+        }
+    }
+}
+
+/// `spans` sorted and merged where they overlap.
+fn merged(mut spans: Vec<(u64, u64)>) -> Vec<(u64, u64)> {
+    spans.sort_unstable();
+    let mut out: Vec<(u64, u64)> = Vec::with_capacity(spans.len());
+    for (from, to) in spans {
+        match out.last_mut() {
+            Some(last) if from <= last.1 => last.1 = last.1.max(to),
+            _ => out.push((from, to)),
+        }
+    }
+    out
+}
+
+/// The host's freezes in each run (`hyper-timing-trace freezes <timer-output> <dir>...`): the spans
+/// in which both of the run's processes were behind past what a wait of theirs is late by, the
+/// sender past a heartbeat's schedule without having sent it and the receiver past a timed wait's
+/// deadline without having woken, each by more than the timer sweep on that host measured of a wait
+/// of that length at the most (`Body`; a send that did not wait, by more than the shortest sleep's
+/// longest). Either process alone late is its own timer's lateness, which the sweep measured and a
+/// simulated owner draws by the wait; a timer coalesced with the other process's (their deadlines
+/// fall together, a heartbeat apart) is late by what the sweep showed. Both late past it at once,
+/// in two processes, the host ran neither: a freeze, which holds everything a simulated node does.
+/// Each is printed as its onset from the run's first schedule and its length, nanoseconds, after
+/// the run's span.
+pub(crate) fn freezes(args: &[String]) -> io::Result<()> {
+    let Some((sweep, dirs)) = args.split_first() else {
+        return Err(io::Error::other("freezes <timer-output> <dir>..."));
+    };
+    let body = Body::read(Path::new(sweep))?;
+    for dir in dirs {
+        let path = Path::new(dir);
+        let meta = meta(path)?;
+        let bytes = std::fs::read(path.join("hb.bin"))?;
+        let sends: Vec<(u64, u64, u64)> = words(&bytes, HEARTBEAT_BYTES)
+            .filter_map(|w| Some((*w.get(1)?, *w.get(2)?, *w.get(4)?)))
+            .collect();
+        let bytes = std::fs::read(path.join("wait.bin"))?;
+        let waits: Vec<(u64, u64, u64)> = words(&bytes, WAIT_BYTES)
+            .filter_map(|w| Some((*w.first()?, *w.get(1)?, *w.get(2)?)))
+            .collect();
+        let freezes = freeze_spans(&body, &sends, &waits);
+        let origin = sends.iter().map(|s| s.0).min().unwrap_or(0);
+        let end = sends.iter().map(|s| s.2).max().unwrap_or(origin);
+        println!(
+            "# {dir}: {} {}, interval {} ns, {} s, load {} → {}; {} freezes, {} ns frozen",
+            meta.os,
+            std::env::consts::ARCH,
+            meta.interval_ns,
+            meta.seconds,
+            meta.load_start,
+            meta.load_end,
+            freezes.len(),
+            freezes.iter().map(|(from, to)| to - from).sum::<u64>()
+        );
+        println!("span {}", end.saturating_sub(origin));
+        for (from, to) in freezes {
+            println!("freeze {} {}", from.saturating_sub(origin), to - from);
+        }
+    }
+    Ok(())
+}
+
+/// The spans both processes were behind past `body` ([`freezes`]): `sends` each heartbeat's
+/// schedule, when its sender began its wait for it, and when it sent it; `waits` each of the
+/// receiver's timed waits, when it began, its deadline and when it woke.
+fn freeze_spans(
+    body: &Body,
+    sends: &[(u64, u64, u64)],
+    waits: &[(u64, u64, u64)],
+) -> Vec<(u64, u64)> {
+    let sender = merged(
+        sends
+            .iter()
+            .filter(|&&(sched, began, sent)| {
+                let asked = sched.saturating_sub(began);
+                sent.saturating_sub(sched) as f64 > Body::longest(&body.sleep, asked)
+            })
+            .map(|&(sched, _, sent)| (sched, sent))
+            .collect(),
+    );
+    let receiver = merged(
+        waits
+            .iter()
+            .filter(|&&(began, deadline, woke)| {
+                began < deadline
+                    && woke.saturating_sub(deadline) as f64
+                        > Body::longest(&body.socket, deadline - began)
+            })
+            .map(|&(_, deadline, woke)| (deadline, woke))
+            .collect(),
+    );
+    let mut both = Vec::new();
+    let mut first = 0;
+    for &(from, to) in &sender {
+        while receiver.get(first).is_some_and(|r| r.1 < from) {
+            first += 1;
+        }
+        for &(r_from, r_to) in receiver.iter().skip(first) {
+            if r_from >= to {
+                break;
+            }
+            let (start, end) = (from.max(r_from), to.min(r_to));
+            if end > start {
+                both.push((start, end));
+            }
+        }
+    }
+    merged(both)
+}
+
 /// One run's analysis, every table in the order the report gives them.
 fn report(dir: &str) -> io::Result<String> {
     let run = Run::load(Path::new(dir))?;
@@ -1327,6 +1547,82 @@ fn online_detectors(out: &mut String, run: &Run, inputs: &Inputs, t_e: Option<Du
             secs(Duration::from_secs(mtbf)),
             secs(Duration::from_secs_f64(run.eta * stride as f64 / 1e9)),
             if lower <= allowed { "yes" } else { "**no**" }
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const MS: u64 = 1_000_000;
+
+    /// A body whose waits are late by at most 2 ms asleep and 1 ms on the socket.
+    fn body() -> Body {
+        Body {
+            sleep: vec![(1_000, 2 * MS), (10 * MS, 2 * MS)],
+            socket: vec![(1_000, MS), (10 * MS, MS)],
+        }
+    }
+
+    /// Heartbeats every millisecond for a second, each slept for from half a millisecond before its
+    /// schedule and sent `late` past it.
+    fn sends(late: impl Fn(u64) -> u64) -> Vec<(u64, u64, u64)> {
+        (1..1_000)
+            .map(|i| {
+                let sched = i * MS;
+                (sched, sched - MS / 2, sched + late(sched))
+            })
+            .collect()
+    }
+
+    /// The receiver's timed waits, each from half a millisecond before a heartbeat's schedule to
+    /// it, woken `late` past it.
+    fn waits(late: impl Fn(u64) -> u64) -> Vec<(u64, u64, u64)> {
+        (1..1_000)
+            .map(|i| {
+                let deadline = i * MS;
+                (deadline - MS / 2, deadline, deadline + late(deadline))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_freeze_is_both_processes_late_past_what_their_waits_are_at_the_most() {
+        // Both frozen from 100 ms to 150 ms; the sender alone late 20 ms at 300 ms; the receiver
+        // alone at 500 ms; both late by what their waits are at 700 ms.
+        let frozen = |at: u64| (100 * MS..150 * MS).contains(&at).then(|| 150 * MS - at);
+        let sends = sends(|at| {
+            frozen(at)
+                .or((at == 300 * MS).then_some(20 * MS))
+                .or((at == 700 * MS).then_some(MS))
+                .unwrap_or(0)
+        });
+        let waits = waits(|at| {
+            frozen(at)
+                .or((at == 500 * MS).then_some(20 * MS))
+                .or((at == 700 * MS).then_some(MS / 2))
+                .unwrap_or(0)
+        });
+        let freezes = freeze_spans(&body(), &sends, &waits);
+        // The freeze, to where the first process past its body woke: the last heartbeats due in
+        // it are late by what a wait is, the sender's within 2 ms of the thaw and the receiver's
+        // within 1 ms.
+        assert_eq!(freezes.len(), 1, "{freezes:?}");
+        let (from, to) = freezes[0];
+        assert_eq!(from, 100 * MS);
+        assert!((148 * MS..=150 * MS).contains(&to), "{to}");
+    }
+
+    #[test]
+    fn the_sweeps_longest_is_read_between_its_rows() {
+        let rows = [(1_000, MS), (3_000, 3 * MS)];
+        assert_eq!(Body::longest(&rows, 0), MS as f64);
+        assert_eq!(Body::longest(&rows, 2_000), 2.0 * MS as f64);
+        assert_eq!(Body::longest(&rows, 9_000), 3.0 * MS as f64);
+        assert_eq!(
+            merged(vec![(5, 9), (1, 3), (2, 4), (9, 10)]),
+            vec![(1, 4), (5, 10)]
         );
     }
 }

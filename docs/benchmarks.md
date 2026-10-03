@@ -4180,6 +4180,128 @@ cargo test --release -p hyper-liveness -p hyper-timing
 # fixed world (every receiver asking 50 ms in Pair::send).
 ```
 
+## The simulation's worlds (2026-10-02)
+
+`crates/hyper-liveness/tests/sim.rs` draws every quantity of a world from a host's measured
+distribution: its quantiles at 107 probabilities (every hundredth, then 0.995, 0.999, 0.9995,
+0.9999, 0.99995, 0.99999 and the most), by the inverse transform, linear between neighbouring
+points. The tables are `tests/support/worlds.rs`, which `scripts/liveness-worlds.py` writes from
+the trace tool's output and nobody edits. The worlds had been picked: delays of 80–140 µs, one
+message in 500 stalled up to 20 ms, one in 1,000 lost, flushes of 0.2–0.6 ms, wakes 20–80 µs late,
+hosts frozen up to 50 ms about every 250 ms, a device stalling one flush in fifty for up to 60 ms.
+
+| quantity | macOS (`MACOS`, `BUSY`) | Linux in Docker Desktop's VM (`LINUX`) | Windows (`WINDOWS`) |
+|---|---|---|---|
+| one-way delay, send to the kernel's stamp | the 1 ms run: median 14.7 µs, p99 44 µs, p99.9 195 µs, most 12.4 ms | the 2 ms run: median 4.9 µs, p99 13 µs, p99.9 86 µs, most 2.7 ms | Linux's: not measured, three orders below its timer and flush |
+| a 4 KiB write and full flush | `F_FULLFSYNC` every 10 ms: median 4.7 ms, p99 15.9 ms, most 205 ms; `BUSY`, back to back (the sweep): median 11.7 ms, p99 29.8 ms, most 54 ms | `fdatasync` every 2 ms: median 0.52 ms, p99 16.0 ms, most 3.66 s | uniform over 12–30 ms: the means hyper-durable-e2e's floors give on the runners, no shape within them measured (Jaynes 1957) |
+| an owner's timer past its deadline | `select(2)`, 2,000 waits at each asked wait from 1 µs to 10 ms; at 1 ms median 255 µs, most 9.3 ms; at 10 ms median 1.8 ms, most 7.1 ms | `ppoll(2)`, the same sweep; at 1 ms median 0.99 ms, most 10.0 ms; at 10 ms median 1.17 ms, most 54 ms | the next 15.625 ms clock interrupt, its phase uniform (`timeBeginPeriod`) |
+| the host's freezes | the 1 ms run: 103 in 300 s, 3.59 s frozen; 26 of 10 ms or more, 7 of 100 ms or more, the longest 575 ms and 1.21 s; 67 of them in 31 s of the run | the 2 ms run: 3 in 300 s, of 27, 48 and 126 ms | not measured; none |
+| loss | none: 0 of 300,000 | none: 0 of 150,000 | none |
+
+A wait between two rows of the sweep is late as both are at the same probability, interpolated in
+the wait, and one longer than the longest row as that row: extrapolating macOS's coalescing in
+proportion to the wait (its leeway grows with it, the cap unmeasured, `docs/timing.md` §2.4) made
+the lateness grow with every interval a link moved to, and the links never configured. A link's
+delays are drawn one by one: no trace showed a delay correlated past what the freezes make.
+
+**A freeze**, as `hyper-timing-trace freezes` reads it, is a span in which both of a run's processes
+were behind past what a wait of theirs is late by: the sender past a heartbeat's schedule without
+having sent it, the receiver past a timed wait's deadline without having woken, each by more than
+the sweep measured of a wait of that length at the most (a send that did not wait, more than the
+shortest sleep's most). One process late alone is its own timer's lateness, which the sweep measured
+and the owner's timer draws; the two processes' timers fall together, a heartbeat apart, and macOS
+coalesces them, so both are late together by a fraction of a millisecond at nearly every heartbeat,
+which the sweep's bound keeps out. Both late past it at once, the host ran neither: in the 1 ms run
+the sender's wait and the receiver's, due at the same instant, ended 574.6 ms past it within 23 µs
+of each other, two processes. Each node replays its host's freezes from a point of the trace drawn from its own
+stream, round the trace again past its end; a frozen node's owner does nothing, and at the thaw it
+takes what arrived, each datagram judged at its kernel stamp, and what completed, reported then,
+and polls once.
+
+Two readings of the stalls came first and were wrong. Clusters of heartbeats past the run's 99th
+percentile of delay, each from its first schedule to its last arrival, held the sender's backlog
+after each stall as well, and the run length that declustered them merged distinct stalls (in the
+1 ms run, two "stalls" over 300 s, of 28.6 ms and 35.9 s). And either process's waits late past the
+sweep's most, alone, counted every scheduling delay of one process as the host's: 646 episodes in
+the 1 ms run, two in three of 1–5 ms, against the 103 freezes both processes saw.
+
+**Found on the way, each at its cause.** The owner thawed with a poll after each datagram it had
+held, so each poll found the freshness point of a datagram whose successor it had not yet taken:
+59 suspicions of live peers against an allowance of 10 in seed 5 of the stalled-disk test. It now
+takes everything held, then polls once, as `LinkEstimator::on_heartbeat` asks of its caller. And
+with freezes replayed, a peer could suspect the node whose disk was about to stall, its host frozen,
+and hold that suspicion through the stall, so the test found no suspicion after the stall to
+measure (seed 86 of 800); the disk now stalls while every peer trusts the node, as the killed node
+is killed.
+
+**Horizons are facts.** Every test runs until what it asserts on has happened: every pair
+configured, every live pair through a renewal of its configuration (`run_until_doubled`: as many
+heartbeats again as it holds), every survivor holding the victim suspected, the stalled node having
+taken a heartbeat from each peer since, or nothing left in flight but the hosts' freezes. A pair
+that takes more heartbeats unconfigured than any window holds (`WINDOW_LIMIT`) fails the test that
+waits on it.
+
+**The soak**, every test of `tests/sim.rs` at ten and at a hundred times its seeds
+(`HYPER_LIVENESS_SEEDS`), each test a process, three at a time, load average 49–78:
+
+| test | seeds, gate / soak | 10× | 100× |
+|---|---|---|---|
+| `live_peers_configure_and_keep_their_allowance` | 8 / 80, 800 | passed | passed |
+| `no_heartbeat_leaves_without_a_newer_flush` (two worlds) | 1 / 10, 100 | passed | passed |
+| `a_killed_peer_is_suspected_within_the_stated_bound` | 16 / 160, 1,600 | passed | passed |
+| `a_stalled_disk_is_suspected_as_a_crash_is` | 8 / 80, 800 | passed | seed 86 failed (above), then passed |
+| `groups_share_one_stream_and_an_unshared_pair_is_silent` | 1 / 10, 100 | passed | passed |
+| `a_restarted_peer_is_trusted_again_and_counted` | 1 / 10, 100 | passed | passed |
+| `every_link_configures_or_suspects_a_crash_within_its_bound` (three worlds) | 32 / 320, 3,200 | passed | passed |
+| `a_peer_never_heard_from_is_suspected` | 16 / 160, 1,600 | passed | passed |
+| `a_peer_dead_before_its_links_have_evidence_is_suspected_once_a_sibling_has_its_own` (four worlds) | 32 / 320, 3,200 | passed | passed |
+
+The 10× soak took 5.7 s, the 100× 70 s. At 100×, the most heartbeats any link took to configure was
+1,113 (Linux, seed index 1,940 of the configure test), the longest freeze replayed 1.21 s, and the
+killed node was suspected by its own detector's margin 15,989 times, by the node's evidence's 12,497
+and as never heard 314 times. From the kill of a node dead in its links' first heartbeats to each
+survivor's notice, median, 90th percentile and most:
+
+| world | 10× (640 survivors) | 100× (6,400 survivors) |
+|---|---|---|
+| macOS | 144 / 549 / 7,038 ms | 128 / 543 / 23,191 ms |
+| macOS, its log busy | 299 / 1,321 / 5,843 ms | 362 / 1,369 / 34,530 ms |
+| Linux | 61 / 305 / 2,544 ms | 66 / 291 / 18,840 ms |
+| Windows | 448 / 2,067 / 8,136 ms | 422 / 2,141 / 13,160 ms |
+
+The most is the time a survivor took to hold evidence of its own to judge the dead link by: its
+live link's configuration, or its pool's own measure where that came first (every freshness point
+had passed within 70 ms of the kill). It is the live link's evidence, which no rule can lend it
+(`docs/timing.md` §2.8, "What the pool alone missed").
+
+**The runs**, on the Apple M5 Max of "Heartbeat traces", macOS 26.4.1, 2026-10-02 (PDT): the macOS
+sweep from 18:36:59, load 49.14; the flushed run from 18:40:59 to 18:45:59, load 54.08 to 80.81; the
+1 ms run from 19:36:02 to 19:41:02, load 42.46 to 59.76. In Docker Desktop's VM (linuxkit 6.12.76,
+aarch64, `rust:1.98.0`, the log on a Docker volume): the sweep at 18:50, the VM's load 20.15; the
+flushed run from 18:52 to 18:57, 23.35 to 18.52; the 2 ms run from 20:07 to 20:12, the VM's load 8.50
+to 11.97 and the Mac's 56.08 to 71.83. The macOS world is the 1 ms run's, not the 100 µs run of
+18:38 (load 44.19 to 54.08, the table these worlds first drew delays from): at 100 µs the sender's
+service is near its interval, so its backlog after each lateness, not the host, fills its record.
+The runs of "Heartbeat traces" (2026-10-01) are summaries only; a freeze is read from raw records.
+
+```sh
+cargo build --release -p hyper-timing-trace
+B=target/release/hyper-timing-trace
+$B timer <dir>/flush.log > mac-timer.txt
+$B run <dir>/mac-plain 1000 300 && $B quantiles <dir>/mac-plain > mac-plain.txt
+$B freezes mac-timer.txt <dir>/mac-plain > mac-freezes.txt
+$B run <dir>/mac-flush 10000 300 <dir>/flush.log && $B quantiles <dir>/mac-flush > mac-flush.txt
+# Linux: the same in rust:1.98.0 as in "Commands for the traces", at 2 ms, the freezes read
+# against the Linux sweep; then
+python3 scripts/liveness-worlds.py mac-timer.txt mac-plain.txt mac-flush.txt mac-freezes.txt \
+    linux-timer.txt linux-plain.txt linux-flush.txt linux-freezes.txt \
+    > crates/hyper-liveness/tests/support/worlds.rs && cargo fmt --all
+# The soak: the binary from `cargo test --release -p hyper-liveness --test sim --no-run`, each
+# test with `--exact <test>` and HYPER_LIVENESS_SEEDS at ten and a hundred times its default;
+# HYPER_LIVENESS_SEED=<n> with HYPER_LIVENESS_SEEDS=1 reruns the seed a failure printed (its low
+# 32 bits).
+```
+
 ## Simulation harnesses as they are (2026-10-02)
 
 The baseline `hyper-sim` and `hyper-check` are measured against when the harnesses move onto them

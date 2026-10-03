@@ -653,7 +653,7 @@ heartbeat due; those it skipped are losses to the receiver, which they are.
   Sokal's window and its unseen-delay term counted (§2.6, item 3), the conditions its estimator
   refuses to configure without; the pool's levels mix links and intervals. The young link's own
   errors widen it again, so it is never judged narrower than it has shown itself to be: in the
-  simulation's stalling world they were wider than the node's evidence often enough to move the
+  simulation's former stalling world they were wider than the node's evidence often enough to move the
   survivors' 90th-percentile detection from 997 ms to 1,141 ms.
 
   *What the pool alone missed* (the Windows E2E, every platform). With three members, a survivor
@@ -670,7 +670,8 @@ heartbeat due; those it skipped are losses to the receiver, which they are.
   noticing the death no later than its first poll past both its freshness point and its live
   link's configuration), in the real processes (`tests/processes.rs`) and in hyper-durable's shell
   (`a_leader_killed_before_its_links_have_evidence_is_replaced`). The time from the kill to every
-  survivor's suspicion, median, 90th percentile and most over the 64 survivors of each world:
+  survivor's suspicion, median, 90th percentile and most over the 64 survivors of each world, in the
+  worlds the simulation then had, whose parameters were picked:
 
   | world | the pool alone | the node's evidence |
   |---|---|---|
@@ -678,6 +679,12 @@ heartbeat due; those it skipped are losses to the receiver, which they are.
   | hosts frozen up to 50 ms | 6 / 63 / 831 ms | 5 / 32 / 207 ms |
   | flushes stalled up to 60 ms | 89 / 1,199 / 13,829 ms | 107 / 1,141 / 3,919 ms |
   | Windows' timer and flush | 578 / 4,468 / 33,828 ms | 578 / 2,080 / 5,867 ms |
+
+  In the worlds the traces measured (`docs/benchmarks.md`, "The simulation's worlds"), the node's
+  evidence: macOS 198 / 606 / 1,404 ms, macOS with its log busy 436 / 1,312 / 3,302 ms, Linux in
+  its VM 37 / 304 / 1,363 ms, Windows' timer and flush 677 / 1,990 / 2,301 ms; over a hundred times
+  the seeds the most reaches 13–35 s, each the time a survivor took to hold evidence of its own (its
+  live link's configuration or its pool's measure), every freshness point long passed.
 
   What remains is the live link's own evidence, which no rule can lend it: in the slow worlds it is
   the link's correlation, which the moves of "The interval the evidence needs" resolve.
@@ -752,42 +759,54 @@ estimator's own size (the drift bound, §2.6), both resized in place for a longe
 one pool, an estimator at the first fed link's interval, boxed. Once each pair is configured, a
 heartbeat sent and one taken allocate nothing.
 
-**Tests.** `tests/sim.rs`, one clock, seeded delays, stalls, losses, flushes and wake lateness, the
-owners computing `T_E` from the library's law. An owner's timer is set to the stream's wake after
-every call and fires late by a lateness drawn once, when its deadline is set, as hyper-sim's world
-fires a timer (`World::wake`); the harness had drawn the lateness again at every turn of its loop
-and anchored it at the present, so while other nodes' events kept coming a due wake was pushed past
-the world's bound (a death noticed 84 µs past its freshness point where wakes are at most 80 µs
-late), and the soak at ten times the seeds failed two tests under that model and passes all under
-this one. Its draws are hyper-sim's SplitMix64, a stream a source (a node's timer, disk, groups'
-writes and host, a directed link), so a change in one node's timing moves no other source's draws.
-Each test's seeds are a space of its own, `HYPER_LIVENESS_SEEDS` of them for a soak (from the
-`HYPER_LIVENESS_SEED`-th), and every node's owner is held to the contract after every step: live peers keep Theorem 7's allowance (8 seeds); no
-heartbeat leaves without a newer flush made after the previous was due (with and without the
-groups' own writes); a killed peer is suspected by every survivor within the bound each states from
-the peer's last schedule (16 seeds); a stalled disk is suspected so too, and the stalled node still
-trusts its live peers (8 seeds); a thousand groups send what one does and an unshared pair is
-silent; a restarted peer is reported restarted once by each other node, trusted again by the
-detector in force and counted; every refusal. Problem 1 and item 10, over seeds 0 to 31 in each of
-three worlds, a LAN, one whose hosts freeze for up to 50 ms about every 250 ms (macOS's measured
-`T_c`, a hundred heartbeats at the floor in each freeze), and one whose groups write every few
-milliseconds to a device that stalls one flush in fifty for up to 60 ms
+**Tests.** `tests/sim.rs`, one clock, and a world as a host's traces measured it
+(`tests/support/worlds.rs`; `docs/benchmarks.md`, "The simulation's worlds"): one-way delays,
+flushes and an owner's timer lateness drawn by the inverse transform from measured quantiles, and
+the host's measured freezes replayed from a point of the trace each node draws; the owners compute
+`T_E` from the library's law. The worlds had been picked (uniform delays, a stall chance and
+length, a loss rate, hosts frozen up to 50 ms about every 250 ms); macOS's trace has 103 freezes in
+300 s, 67 of them in one 31 s burst, the longest 575 ms and 1.21 s, and no loss. An owner's timer is
+set to the stream's wake after every call and fires late by a lateness drawn once, when its
+deadline is set, as hyper-sim's world fires a timer (`World::wake`); the harness had drawn the
+lateness again at every turn of its loop and anchored it at the present, so while other nodes'
+events kept coming a due wake was pushed past the world's bound (a death noticed 84 µs past its
+freshness point where wakes are at most 80 µs late), and the soak at ten times the seeds failed two
+tests under that model and passes all under this one. A frozen node's owner does nothing, and at
+the thaw takes what arrived, each datagram judged at its kernel stamp, and what completed, then
+polls once, as `LinkEstimator::on_heartbeat` asks of its caller: a poll after each held datagram
+found the freshness point of one whose successor it had not yet taken, a false suspicion a
+datagram (59 of live peers against an allowance of 10, one seed). The draws are hyper-sim's
+SplitMix64, a stream a source (a node's timer, disk, groups' writes and host, a directed link), so
+a change in one node's timing moves no other source's draws. Each test's seeds are a space of its
+own, `HYPER_LIVENESS_SEEDS` of them for a soak (from the `HYPER_LIVENESS_SEED`-th); each runs until
+the facts it asserts on hold (every pair configured, every live pair through a renewal of its
+configuration, every survivor holding the victim suspected), never to a picked horizon; and every
+node's owner is held to the contract after every step. Live peers keep Theorem 7's allowance (8
+seeds); no heartbeat leaves without a newer flush made after the previous was due (with and
+without the groups' own writes); a killed peer is suspected by every survivor within the bound each
+states from the peer's last schedule (16 seeds); a stalled disk is suspected so too, and the stalled
+node still hears its live peers and keeps the allowance for them (8 seeds; the disk stalls while
+every peer trusts the node, since a peer that suspected it in a freeze just before held that
+suspicion through the stall, seed 86 of 800); a thousand groups send what one does and an unshared
+pair is silent; a restarted peer is reported restarted once by each other node, trusted again by
+the detector in force and counted, its old run's last heartbeat refused as stale; every refusal.
+Problem 1 and item 10, over seeds 0 to 31 in each of three worlds, macOS, macOS with its groups
+keeping its log busy (its flushes back to back) and Linux in its VM
 (`every_link_configures_or_suspects_a_crash_within_its_bound`): every pair configures, none taking
 more heartbeats unconfigured than any window holds (`WINDOW_LIMIT`, the drift bound's ceiling: a link
 whose estimator has not measured its correlation in as many heartbeats as any window could average
-is one no window resolves), at most 315 heartbeats (302 under the pool alone: the simulation draws
-every delay and lateness from one seeded stream, and wider margins wake the owners at other times,
-so a seed's world differs); then one node is killed after a share of the heartbeats it sent before
-every pair configured in the same seed's run, drawn between none and twice as many, and every
-survivor suspects it, each suspicion within the bound it states, by its own configuration's margin
-(165), the node's evidence's (121), or, for a node never heard from, from the attach (2).
-Before the fix, the stalling world kept a link unconfigured for 5,775 heartbeats (its floor
-followed down with each decaying mean, the estimator started again at each move), and a world
+is one no window resolves), at most 486 heartbeats; then one node is killed after a share of the
+heartbeats it sent before every pair configured in the same seed's run, drawn between none and twice
+as many, and every survivor suspects it, each suspicion within the bound it states, by its own
+configuration's margin (156), the node's evidence's (129), or, for a node never heard from, from the
+attach (3). Before the fix, the former stalling world kept a link unconfigured for 5,775 heartbeats (its
+floor followed down with each decaying mean, the estimator started again at each move), and a world
 that is too correlated at its floor is refused by the estimator however long it runs
 (`link::tests`). A peer never heard from is suspected by every other within the bound from the
 attach (16 seeds). A peer dead in its links' first heartbeats, in a group of three, is suspected by
-both survivors once their live link has its own evidence (above, "Judged before its own evidence";
-32 seeds of four worlds).
+both survivors once they hold evidence of their own (above, "Judged before its own evidence"; 32
+seeds of four worlds). At ten and at a hundred times every test's seeds, each passes: links
+configured within 1,113 heartbeats, freezes of up to 1.21 s replayed (`docs/benchmarks.md`).
 Property tests: the codec reads back what it writes and refuses every truncation, extension, kind
 and version; the bound is its window's mean. `tests/processes.rs`, real processes over UDP on the
 sealed plane through hyper-tokio's kernel-stamped socket, each liveness write a real write and

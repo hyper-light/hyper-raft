@@ -24,9 +24,10 @@
 //! **Timing, all measured.** The sender's interval is the one the receiver's configurator chose
 //! (Chen et al.'s adaptive scheme, the receiver asking in its own heartbeats), never shorter than
 //! the sender's stability floor `E[flush] + G` (Lindley 1952; `docs/timing.md` §2.6); before the
-//! receiver has chosen, the floor. `G` is the mean lateness of the owner's timed waits for the
-//! stream's wakes, each begun before its deadline and ended by it ([`Liveness::on_wait`]): what the
-//! operating system adds to a wait, not what the owner's own work does. `E[flush]` the mean of the
+//! receiver has chosen, the floor. `G` is the mean lateness of the owner's waits for the stream's
+//! wakes, each begun before its deadline and ended at or past it, whatever ended it
+//! ([`Liveness::on_wait`]): how late past its wakes the stream is polled while its owner waits for
+//! them, not what the owner's own work adds. `E[flush]` the mean of the
 //! durable completions reported, the margin
 //! bounded by one Cantelli factor on each heartbeat's lateness past its expected arrival (a slot
 //! the sender skipped or the network lost being the next one's lateness), which assumes no
@@ -680,15 +681,19 @@ impl Liveness {
         self.flushes.mean()
     }
 
-    /// A timed wait the owner began before `deadline_ns`, the stream's [`wake`](Self::wake), that
-    /// the deadline ended at `woke_ns`, on the clock the stream is polled by: no message,
-    /// completion or command ended it first. Reported before the poll the wake calls for. `G` is
-    /// the mean lateness of these waits (`docs/timing.md` §2.4): what the operating system adds to
-    /// a wait, a stop or a frozen host included, and nothing the owner's own work adds. A wake the
-    /// owner came to late because its thread was in its own write began no wait before its
-    /// deadline, so it is no sample; taken from every poll past a wake, such wakes made `G` the
-    /// owner's stalls, 4.8–7.4 s in a run whose timer was late by milliseconds (§2.9). A wait for
-    /// a deadline other than the wake asked is not the stream's and measures nothing.
+    /// A wait the owner began before `deadline_ns`, the stream's [`wake`](Self::wake), that ended
+    /// at `woke_ns`, at or past it, on the clock the stream is polled by, whatever ended it: the
+    /// deadline, or a message, a completion or a command that came after it. Reported as the wait
+    /// ends, before anything it brought is fed. `G` is the mean lateness of these waits
+    /// (`docs/timing.md` §2.4): how late past its wakes the stream is polled while its owner waits
+    /// for them, a stop or a frozen host included, and nothing the owner's own work adds. A wait
+    /// that ended before its deadline reached nothing, and a wake the owner came to late because
+    /// its thread was in its own work began no wait before it: neither is a sample. Taken from
+    /// every poll past a wake, such wakes made `G` the owner's stalls, 4.8–7.4 s in a run whose
+    /// timer was late by milliseconds; counted only where the deadline ended them, the waits of an
+    /// owner woken past its wakes by messages before its timer fired counted nothing, and its
+    /// stream refused every heartbeat as unmeasured (§2.9). A wait for a deadline other than the
+    /// wake asked is not the stream's and measures nothing.
     pub fn on_wait(&mut self, deadline_ns: u64, woke_ns: u64) {
         if self.next_wake == Some(deadline_ns) {
             // A full fold keeps its mean: `G` stands as measured.
@@ -696,7 +701,7 @@ impl Liveness {
         }
     }
 
-    /// `G`, the mean lateness of the owner's timed waits for the stream's wakes
+    /// `G`, the mean lateness of the owner's waits for the stream's wakes
     /// ([`on_wait`](Self::on_wait)), once measured and not zero.
     pub fn granularity(&self) -> Option<Duration> {
         self.timer.granularity().filter(|g| !g.is_zero())

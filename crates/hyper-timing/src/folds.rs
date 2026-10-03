@@ -104,8 +104,9 @@ impl Lateness {
 /// a poll for something else (a message), which measures nothing. hyper-swim's detector measures
 /// its owner's timer through it. A poll past the wake is also how late an owner held in its own
 /// work came to it, which is no lateness of its timer: hyper-liveness's stream takes `G` from the
-/// waits its owner reports instead, each begun before its deadline and ended by it, a [`Lateness`]
-/// of its own (`hyper_liveness::Liveness::on_wait`, `docs/timing.md` §2.4).
+/// waits its owner reports instead, each begun before its deadline and ended at or past it,
+/// whatever ended it, a [`Lateness`] of its own (`hyper_liveness::Liveness::on_wait`,
+/// `docs/timing.md` §2.4).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Wakes {
     lateness: Lateness,

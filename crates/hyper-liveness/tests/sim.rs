@@ -285,7 +285,8 @@ struct Node {
     believed: BTreeMap<PeerId, bool>,
     /// The owner's timer: the deadline it was set to, the stream's wake, when it fires, late by a
     /// lateness drawn once, when the deadline was set ([`Sim::arm`]), and whether its wait began
-    /// before the deadline, which makes its end a measure of the timer (`Liveness::on_wait`).
+    /// before the deadline, which makes the wait's end at or past it, the timer's or what came
+    /// first, a sample of `G` (`Liveness::on_wait`).
     timer: Option<(u64, u64, bool)>,
     /// The host is frozen until this time (`World::freezes`).
     frozen_until: u64,
@@ -743,6 +744,7 @@ impl Sim {
                 if !self.nodes[to].alive {
                     return;
                 }
+                self.woken(to);
                 // Refusals are the crate's to make: a stale or unproven heartbeat is dropped.
                 let _ = self.feed(to, from, &bytes, stamp);
                 self.polled(to);
@@ -756,6 +758,7 @@ impl Sim {
                 if !self.nodes[node].alive || self.nodes[node].disk_stalled {
                     return;
                 }
+                self.woken(node);
                 let now = self.now;
                 let n = &mut self.nodes[node];
                 n.durable.push(now);
@@ -780,6 +783,23 @@ impl Sim {
                 self.schedule_freeze(node);
             }
             Event::Thaw { node } => self.thaw(node),
+        }
+    }
+
+    /// `node`'s owner woken now by what came: a wait it began before the stream's wake that this
+    /// ends at or past the wake is reported, whatever ended it (`Liveness::on_wait`), and the
+    /// timer it was waiting on is spent. One that came before the wake ends no wait the stream
+    /// counts, and the timer stays.
+    fn woken(&mut self, node: usize) {
+        let now = self.now;
+        let n = &mut self.nodes[node];
+        if let Some((deadline, _, began_before)) = n.timer
+            && deadline <= now
+        {
+            n.timer = None;
+            if began_before {
+                n.liveness.on_wait(deadline, now);
+            }
         }
     }
 
@@ -1782,4 +1802,83 @@ fn an_owner_held_in_its_own_write_is_no_lateness_of_its_timer() {
     );
     assert_eq!(node.granularity(), Some(Duration::from_nanos(late)));
     assert!(node.latest_wake(now) >= Duration::from_nanos(held));
+}
+
+/// `G` is how late past its wakes the stream is polled while its owner waits for them
+/// (`docs/timing.md` §2.4), whatever ends the wait: an owner woken past a wake by a message, before
+/// its timer fired, came to the wake that late. Here the owner's timer ends a wait 1 ms past its
+/// deadline, as Linux's 1 ms tick does, and a message comes 300 µs past every wake, so every wait
+/// ends on the message. Reported as the waits they are, they give `G` = 300 µs exactly from the
+/// first wake on, and every heartbeat of the peer's is taken. Counted only where the timer ended
+/// them, as the contract said before, none counts: `G` is never measured and every heartbeat is
+/// refused as unmeasured, as hyper-durable-e2e's members, asked for reports every few hundred
+/// microseconds, refused theirs and never formed their group (§2.9).
+#[test]
+fn a_wait_a_message_ends_past_its_wake_measures_the_wake() {
+    let (timer, message) = (MS, 300 * US);
+    for counted in [false, true] {
+        let mut node = Liveness::new(Settings {
+            local: 1,
+            run: 1,
+            max_peers: 1,
+            history: Exposure::new(),
+        })
+        .unwrap();
+        node.attach(2).unwrap();
+        let mut owner = Owner {
+            id: 1,
+            sent: Vec::new(),
+            flush: false,
+            changes: Vec::new(),
+        };
+        // The first flush gives the floor and proves the first heartbeat.
+        node.on_durable(Write::Liveness, 0, 100 * US);
+        let mut now = 200 * US;
+        node.poll(now, &mut owner);
+        let mut out = [0u8; MAX_BYTES];
+        let mut outcomes = Vec::new();
+        // Fewer heartbeats than a configuration needs (an Allan level of seven windows of eight):
+        // every wake is one of the node's own heartbeats coming due.
+        for seq in 0..50u64 {
+            // The flush the stream asked for, made at once.
+            if std::mem::take(&mut owner.flush) {
+                node.on_durable(Write::Liveness, now, now);
+                node.poll(now, &mut owner);
+            }
+            let wake = node.wake().expect("a heartbeat is always due");
+            // The owner waits from now for the wake; the peer's heartbeat ends the wait past it,
+            // before the timer would have.
+            let came = wake + message;
+            assert!(now < wake && came < wake + timer);
+            if counted {
+                node.on_wait(wake, came);
+            }
+            now = came;
+            let beat = Heartbeat {
+                run: 7,
+                seq,
+                interval_ns: MS,
+                floor_ns: MS,
+                ask_ns: 0,
+                sent_ns: came,
+                late_ns: 0,
+                flushes: seq + 1,
+                flush_age_ns: 0,
+                echo: None,
+            };
+            let bytes = beat.encode(&mut out).to_vec();
+            outcomes.push(node.on_heartbeat(2, &bytes, came, &mut owner));
+            node.poll(now, &mut owner);
+        }
+        if counted {
+            assert_eq!(node.granularity(), Some(Duration::from_nanos(message)));
+            assert!(outcomes.iter().all(Result::is_ok), "{outcomes:?}");
+        } else {
+            assert_eq!(node.granularity(), None);
+            assert!(
+                outcomes.iter().all(|o| *o == Err(Refusal::Unmeasured)),
+                "{outcomes:?}"
+            );
+        }
+    }
 }

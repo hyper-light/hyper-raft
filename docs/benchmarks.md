@@ -5077,3 +5077,30 @@ whose stream folded every poll past a wake, measured 25.5 ms, the mean of the tw
 recorder (`hyper-timing-trace run`) has always kept only waits begun before their deadline and
 ended on their timeout, so the `G` of "Heartbeat traces" and "The simulation's worlds" is this
 one; the members' own, before and after, are in the end-to-end accounts below.
+
+## `G` from every wait that reached its wake (2026-10-03)
+
+`docs/timing.md` §2.4 and §2.9 ("hyper-durable-e2e's `kill`, no `G` where messages end the
+waits"). hyper-durable-e2e's `kill` in Docker's Linux at two CPUs (`docker run --cpus 2`, the
+VM's load 4.3–5.5 as the runs began and ended, the Mac's 9–13), from a diagnostic build of its
+member that
+counts, every half second, the waits it began for the stream's wake, how each ended, what it
+reported and the heartbeats its stream refused (not committed: `scratch/dm-notes/diag`), first as
+`dc42e0e` reports its waits, only those the deadline ended, then reporting every wait it began
+before the wake that ended at or past it. Three runs each, 11:39–11:43, before and after in turn
+as far as the switch of builds allowed (before, after three times, before twice):
+
+| the member reports | runs passing | member processes a second or more without `G` | heartbeats refused as unmeasured | waits for the wake ended on the timer / reported / all |
+|---|---|---|---|---|
+| waits the deadline ended | 0 of 3 (`stall-leader`, `stalled-devices`, `flush-leader`) | 4 of 12, 2 of 15, 5 of 32 | 4,020, 2,575, 2,370 | 3,208 / 3,208 / 51,729; 2,603 / 2,603 / 75,882; 3,335 / 3,335 / 127,961 |
+| waits that reached the wake | 3 of 3 (40.1, 23.1, 22.5 s) | 1 of 19, 1 of 19, 1 of 24, each refusing none | 51, 9, 18 | 4,273 / 6,169 / 94,726; 3,872 / 4,792 / 19,380; 4,605 / 5,798 / 20,902 |
+
+A member's `G` came a median 79–137 ms into its start before (where it came at all, once 14 s) and
+108–143 ms after; in `stall-leader`'s failed run the member that never measured it began 21,901
+waits for its wake, none ended on its timer, and refused 1,360 heartbeats. The waits that reached
+the wake on an ask past it are what the timer-only count missed: a fifth to a third of the reports
+after.
+`a_wait_a_message_ends_past_its_wake_measures_the_wake` (`tests/sim.rs`) pins the rule: an owner
+whose every wait a message ends 300 µs past its wake, its timer 1 ms late, has `G` 300 µs from the
+first wake and takes every heartbeat; counted only as the timer ended them, it measures none and
+refuses every heartbeat.

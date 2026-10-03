@@ -198,13 +198,19 @@ now gives the base from the detector and the span from the ballot (`docs/benchma
   of the detector's own waits, measured: the mean because the waits feed queues (the sender's
   schedule, the detector's checks) whose stability and expected delay depend on it (§2.6). It
   floors `η`, `α` and the estimates, as RFC 6298 floors its variance term by `G`. A wait counts
-  only when the owner began it before its deadline and the deadline ended it
-  (`hyper_liveness::Liveness::on_wait`; the trace recorder has always kept only such waits): a
-  wake the owner came to late because its one thread was in its own write is the write's
-  lateness, which the sender's floor counts as `E[flush]`, not the timer's. Taken from every poll
-  past a wake, `G` was the owners' own stalls: 32–65 ms on macOS and 15–76 ms on Linux through the
-  stall `stalled-devices` orders, and 4.8–7.4 s in a run whose timer was late by milliseconds
-  (§2.9). A stop of the process or a
+  when the owner began it before its deadline and it ended at or past it, whatever ended it: the
+  deadline, or a message or completion that came after it, the stream then polled that late past
+  its wake while its owner waited for it (`hyper_liveness::Liveness::on_wait`). A wait that ended
+  before its deadline reached nothing, and a wake the owner came to late because its one thread
+  was in its own write is the write's lateness, which the sender's floor counts as `E[flush]`, not
+  the timer's. Taken from every poll past a wake, `G` was the owners' own stalls: 32–65 ms on macOS
+  and 15–76 ms on Linux through the stall `stalled-devices` orders, and 4.8–7.4 s in a run whose
+  timer was late by milliseconds (§2.9). Counted only where the deadline ended them, as the trace
+  recorder's are (nothing else wakes it), the waits of an owner woken past its wakes by messages
+  before its timer fired counted nothing: hyper-durable-e2e's members, asked for reports every few
+  hundred microseconds on Linux's 1 ms ticks, went without `G` and refused every heartbeat as
+  unmeasured, a group that never formed or a stalled member a peer never suspected (§2.9). A stop
+  of the process or a
   frozen host inside a wait does count: the OS ran nothing then, and the queues the waits feed saw
   the delay; one such wait weighs `1/n` of `n`. Measured on
   2026-10-01 (`docs/benchmarks.md`, "Heartbeat traces"):
@@ -1046,8 +1052,8 @@ lateness, the stall's delay (§2.2; `PairReport::skipped` counts them).
 **The API** the core's suspicion-started elections (L-2) and the shell consume (`src/lib.rs`):
 `Liveness::new(Settings { local, run, max_peers, history })`, `run` the node's durable count of
 its starts; `attach`/`detach` a group's peer; `on_durable(write, started, durable)`; `on_heartbeat(from, message,
-arrival_ns, out)`; `on_wait(deadline, woke)`, a timed wait for `wake()` the owner began before it
-and the deadline ended (§2.4: what `G` is made of); `poll(now, out)` and `wake()`, with `Output::{heartbeat, flush, change}`;
+arrival_ns, out)`; `on_wait(deadline, woke)`, a wait for `wake()` the owner began before it and that
+ended at or past it, whatever ended it (§2.4: what `G` is made of); `poll(now, out)` and `wake()`, with `Output::{heartbeat, flush, change}`;
 `Change::Suspected(Suspicion { peer, at_ns, noticed_ns, last: { seq, arrival_ns, due_ns, sent_ns },
 detection, detector })`, `Change::Trusted { peer, at_ns }` and `Change::Restarted { peer, at_ns }`;
 `trust(peer)`, `suspected()`,
@@ -1119,8 +1125,11 @@ since a peer that suspected it in a freeze just before held that suspicion throu
 86 of 800); a sender behind its schedule for every other slot, at a receiver whose timer is late
 past the interval, has a margin past the skipped slot configured, an unavailability below one, and
 no suspicion once configured (`a_sender_that_skips_slots_is_late_not_lost`: under the product
-bound it was fed half its slots as losses and configured `α = 0`, `U` 10); a thousand groups send
-what one does and an unshared pair is silent; a restarted peer is reported restarted once by each other node, trusted again by
+bound it was fed half its slots as losses and configured `α = 0`, `U` 10); an owner whose every
+wait for a wake a message ends 300 µs past it, before its 1 ms timer, has `G` 300 µs from the first
+and takes every heartbeat, where counted only as the timer ended them none counts and every
+heartbeat is refused (`a_wait_a_message_ends_past_its_wake_measures_the_wake`); a thousand groups
+send what one does and an unshared pair is silent; a restarted peer is reported restarted once by each other node, trusted again by
 the detector in force and counted, its old run's last heartbeat refused as stale; every refusal.
 Problem 1 and item 10, over seeds 0 to 31 in each of three worlds, macOS, macOS with its groups
 keeping its log busy (its flushes back to back) and Linux in its VM
@@ -1511,6 +1520,26 @@ hyper-raft-e2e's had, each failing on CI once in a way a re-run passed:
   failed 5 of 5 that way on macOS; counted as listened, the held supervisor passes 5 of 5, deaf
   3.01 s at most, and beside the same load 40 of 40 passed, the supervisor deaf up to 6.08 s at
   once (`docs/benchmarks.md`, "Quiet only while every member is heard").
+- **hyper-durable-e2e's `kill`, no `G` where messages end the waits** (2026-10-03, over
+  `dc42e0e`). In Docker's Linux, one scenario a run failed at one, two and four CPUs ("a write was
+  never answered" or "the stalled member was not suspected by every other"; "nothing moved for 1s"),
+  each time with a member at its start that had taken no heartbeat, its pairs unjudged. The owners
+  reported to the stream only the waits their deadline ended, as `on_wait` asked (§2.4). The test
+  asks each member for its report back to back, and on the VM's 1 ms tick a timer ends a wait
+  0.12 ms to past 1 ms late (`worlds::LINUX_TIMER`), so nearly every wait for the stream's wake
+  ended on an ask, before or past its deadline. With no wait counted, `G` stayed unmeasured, and the
+  stream refuses every heartbeat until it is measured (`Refusal::Unmeasured`: the estimator's ring
+  and window are `G`'s): nothing taken, nothing judged, no timing derived, no campaign. A diagnostic
+  build (counters in the member, not committed) ran the test three times at two CPUs and failed all
+  three (`stall-leader`, `stalled-devices`, `flush-leader`): 11 of 59 member processes went a second
+  or more without `G`, one through 21,901 waits for its wake, none of them ended on its timer, and
+  the runs refused 4,020, 2,575 and 2,370 heartbeats as unmeasured. On main every poll past a wake
+  was a sample. A wait the owner began before the wake and that ended at or past it, whatever ended
+  it, now counts (§2.4): the E2E members report it as the wait ends, before what it brought is fed
+  (`receive_until`), the process test's member likewise, and the simulation's owner reports a wait
+  an arrival or a completion ended past its wake. With it the same build passed three runs of
+  three, `G` measured a median 108–143 ms into a member's start, 51, 9 and 18 heartbeats refused in
+  all (`docs/benchmarks.md`, "`G` from every wait that reached its wake").
 
 **What the runs measured of the detectors** (every scenario prints, for each member, its floors,
 longest flush and longest time between two reads of its socket, and for each pair what the

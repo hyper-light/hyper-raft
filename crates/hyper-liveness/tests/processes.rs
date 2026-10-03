@@ -355,7 +355,6 @@ async fn member(me: u64, nodes: u64, file: std::path::PathBuf) {
         let deadline = wake_ns
             .map(|at| tokio::time::Instant::now() + Duration::from_nanos(at.saturating_sub(began)));
         let mut woke_with = None;
-        let mut timed_out = false;
         // What arrived, stamped by the kernel: fed before anything is judged at `now`.
         let mut inbox: Vec<(u64, u64, Vec<u8>)> = Vec::new();
         {
@@ -382,20 +381,21 @@ async fn member(me: u64, nodes: u64, file: std::path::PathBuf) {
                     return Poll::Ready(());
                 }
                 if timer.as_mut().poll(context).is_ready() {
-                    timed_out = true;
                     return Poll::Ready(());
                 }
                 Poll::Pending
             })
             .await;
         }
-        // A wait for the crate's wake, begun before it and ended by it, is what its `G` is made
-        // of (`Liveness::on_wait`): reported before anything else is fed.
-        if timed_out
-            && let Some(at) = wake_ns
+        // A wait begun before the crate's wake and ended at or past it, by its deadline or by
+        // what came after it, is what its `G` is made of (`Liveness::on_wait`): reported before
+        // anything the wait brought is fed.
+        let woke = clock.now_ns();
+        if let Some(at) = wake_ns
             && began < at
+            && woke >= at
         {
-            liveness.on_wait(at, clock.now_ns());
+            liveness.on_wait(at, woke);
         }
         let said = woke_with.and_then(|length| command.get(..length));
         if said == Some(&[STOPPED][..]) {

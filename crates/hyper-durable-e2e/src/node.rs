@@ -539,18 +539,8 @@ impl Node {
             // otherwise, the test's going among them.
             let wake = self.liveness.wake();
             let until = [self.replica.deadline(), wake].into_iter().flatten().min();
-            let began = self.now();
-            let timed_out = self.receive_until(until)?;
+            self.receive_until(until)?;
             read = self.now();
-            // A wait for the stream's wake, begun before it and ended by it, is what its `G` is
-            // made of (`Liveness::on_wait`): the member's own work is no lateness of its timer.
-            if timed_out
-                && let Some(at) = wake
-                && until == Some(at)
-                && began < at
-            {
-                self.liveness.on_wait(at, read);
-            }
             self.live()?;
             if std::mem::take(&mut self.woken) && self.stops_at(Point::Durable) {
                 return Ok(Some(Point::Durable));
@@ -581,20 +571,35 @@ impl Node {
     /// Waits for a datagram until `until` on the member's clock, or for one however long when
     /// nothing is due, then takes it and what else has arrived, at most a turn's worth
     /// (hyper-raft-e2e's `receive_until`). The wait is a peek, and every datagram is taken without
-    /// waiting: a receive that waits can lose what arrives as it times out (`wire::arrives`).
-    /// Whether it waited and the wait ended on its timeout, no datagram having come.
-    fn receive_until(&mut self, until: Option<u64>) -> Result<bool, NodeError> {
+    /// waiting: a receive that waits can lose what arrives as it times out (`wire::arrives`). A
+    /// wait begun before the stream's wake and ended at or past it, whatever ended it, is reported
+    /// to the stream as it ends (`Liveness::on_wait`).
+    fn receive_until(&mut self, until: Option<u64>) -> Result<(), NodeError> {
         let turn = self
             .settings
             .max_pending
             .saturating_add(self.settings.voters.len())
             .saturating_add(1);
         let mut most = turn;
-        let wait = until.map(|at| Duration::from_nanos(at.saturating_sub(self.now())));
+        let wake = self.liveness.wake();
+        let began = self.now();
+        let wait = until.map(|at| Duration::from_nanos(at.saturating_sub(began)));
         if wait.is_none_or(|wait| !wait.is_zero()) {
             most = turn.saturating_add(1);
-            if !wire::arrives(&self.socket, wait, &mut self.received)? {
-                return Ok(true);
+            let came = wire::arrives(&self.socket, wait, &mut self.received)?;
+            // A wait begun before the stream's wake and ended at or past it, by its deadline or
+            // by a datagram that came after it, is what the stream's `G` is made of, reported
+            // before anything it brought is fed: how late past the wake the member came to it
+            // while it waited, its own work not counted.
+            let woke = self.now();
+            if let Some(at) = wake
+                && began < at
+                && woke >= at
+            {
+                self.liveness.on_wait(at, woke);
+            }
+            if !came {
+                return Ok(());
             }
         }
         self.socket.set_nonblocking(true)?;
@@ -610,7 +615,7 @@ impl Node {
             }
         }
         self.socket.set_nonblocking(false)?;
-        outcome.map(|()| false)
+        outcome
     }
 
     fn receive_one(&mut self) -> Result<bool, NodeError> {

@@ -268,9 +268,31 @@ async fn member(me: u64, nodes: u64, file: std::path::PathBuf) {
         flush: false,
         changes: Vec::new(),
     };
-    liveness.poll(clock.now_ns(), &mut first);
+    let now = clock.now_ns();
+    liveness.poll(now, &mut first);
     if first.flush && requests.try_send(Request::Flush).is_ok() {
-        flight = Some(clock.now_ns());
+        flight = Some(now);
+    }
+    // Its first state, before it waits: its first flush in flight, which proves its first
+    // heartbeats and on which a slow disk holds everything after.
+    let member = Member {
+        me,
+        disk,
+        flight,
+        flush_most,
+    };
+    if report(
+        &member,
+        &liveness,
+        &peers,
+        &[],
+        now,
+        &mut reported_at,
+        &mut stdout,
+    )
+    .is_err()
+    {
+        return;
     }
     loop {
         // Wait for a datagram, a completion or a command, or the crate's wake.
@@ -537,12 +559,20 @@ fn report(
 /// The member processes, killed when the supervisor ends however it ends.
 struct Members(BTreeMap<u64, Child>);
 
-impl Drop for Members {
-    fn drop(&mut self) {
+impl Members {
+    /// Every member killed and reaped: a dropped `Child` leaves its process running.
+    fn stop(&mut self) {
         for child in self.0.values_mut() {
             let _ = child.kill();
             let _ = child.wait();
         }
+        self.0.clear();
+    }
+}
+
+impl Drop for Members {
+    fn drop(&mut self) {
+        self.stop();
     }
 }
 
@@ -678,6 +708,8 @@ fn parse(line: &str) -> Option<Line> {
 const RTO: Duration = Duration::from_secs(1);
 
 struct Supervisor {
+    /// The member processes still running, killed when the supervisor ends however it ends.
+    members: Members,
     lines: std::sync::mpsc::Receiver<String>,
     /// The host's monotonic clock, which every member's lines are stated on.
     clock: Clock,
@@ -805,7 +837,8 @@ impl Supervisor {
     /// pair takes more heartbeats unconfigured than any window holds. A quiet period through which
     /// a member whose disk runs waited on one flush is that disk's, not the members' law: the
     /// slowest part of a member's law is its flush, which it measures only once the flush
-    /// completes. The wait goes on, saying on stderr what it waits for.
+    /// completes. One through which a member has stated nothing yet is its scheduler's, while its
+    /// process runs. The wait goes on through either, saying on stderr what it waits for.
     fn until(&mut self, what: &str, fact: impl Fn(&Self) -> bool) {
         let mut seen = self.signature();
         let mut moved_at = self.clock.now_ns();
@@ -814,18 +847,44 @@ impl Supervisor {
             let now = self.clock.now_ns();
             let left = moved_at.saturating_add(quiet).saturating_sub(now);
             if left == 0 {
+                // A member that has stated nothing yet has no law to bound the wait: it states
+                // once its process is scheduled, and one whose process ended fails the wait.
+                let silent: Vec<u64> = self
+                    .members
+                    .0
+                    .keys()
+                    .copied()
+                    .filter(|id| !self.latest.contains_key(id))
+                    .collect();
+                for id in &silent {
+                    let ended = self
+                        .members
+                        .0
+                        .get_mut(id)
+                        .and_then(|child| child.try_wait().unwrap());
+                    if let Some(status) = ended {
+                        panic!(
+                            "{what}: member {id} ended before it stated anything: {status}\n{}",
+                            self.dump()
+                        );
+                    }
+                }
                 let on_disk = self.latest.values().any(|stated| {
                     matches!(stated.disk, 'R' | 'X')
                         && stated.flight != 0
                         && stated.flight <= moved_at
                 });
                 assert!(
-                    on_disk,
+                    on_disk || !silent.is_empty(),
                     "{what}: nothing moved for {:?}\n{}",
                     self.quiet(),
                     self.dump()
                 );
-                eprintln!("{what}: waiting on a flush\n{}", self.dump());
+                if silent.is_empty() {
+                    eprintln!("{what}: waiting on a flush\n{}", self.dump());
+                } else {
+                    eprintln!("{what}: waiting for members {silent:?} to state anything");
+                }
                 moved_at = now;
                 continue;
             }
@@ -927,7 +986,6 @@ impl Supervisor {
 /// told to begin. The directory holds their files.
 struct Group {
     _directory: tempfile::TempDir,
-    members: Members,
     supervisor: Supervisor,
     /// Where each member's disk takes commands.
     wakes: BTreeMap<u64, u64>,
@@ -1013,8 +1071,8 @@ fn start(nodes: u64) -> Group {
     }
     Group {
         _directory: directory,
-        members,
         supervisor: Supervisor {
+            members,
             lines,
             clock: Clock::new().unwrap(),
             trace: std::env::var_os("HYPER_LIVENESS_TRACE").is_some(),
@@ -1038,7 +1096,6 @@ fn a_stalled_disk_and_a_killed_node_are_suspected_and_no_live_one_is() {
     }
     let Group {
         _directory,
-        mut members,
         mut supervisor,
         wakes,
     } = start(NODES);
@@ -1079,7 +1136,7 @@ fn a_stalled_disk_and_a_killed_node_are_suspected_and_no_live_one_is() {
     }
 
     // A node killed.
-    let mut victim = members.0.remove(&KILLED).unwrap();
+    let mut victim = supervisor.members.0.remove(&KILLED).unwrap();
     let killed_at = clock.now_ns();
     victim.kill().unwrap();
     victim.wait().unwrap();
@@ -1109,7 +1166,7 @@ fn a_stalled_disk_and_a_killed_node_are_suspected_and_no_live_one_is() {
             s.holds_suspected(*m, STALLED, killed_at) && s.holds_suspected(*m, KILLED, killed_at)
         })
     });
-    drop(members);
+    supervisor.members.stop();
 
     let (mut suspicions, mut allowance) = (0u64, 0.0f64);
     for member in &live {
@@ -1176,13 +1233,12 @@ fn a_node_killed_in_its_first_heartbeats_is_suspected_once_a_sibling_has_its_evi
     let victim = YOUNG_NODES;
     let Group {
         _directory,
-        mut members,
         mut supervisor,
         ..
     } = start(YOUNG_NODES);
     let clock = Clock::new().unwrap();
     supervisor.until("the victim heard every peer", |s| s.heard.contains(&victim));
-    let mut child = members.0.remove(&victim).unwrap();
+    let mut child = supervisor.members.0.remove(&victim).unwrap();
     let killed_at = clock.now_ns();
     child.kill().unwrap();
     child.wait().unwrap();
@@ -1192,7 +1248,7 @@ fn a_node_killed_in_its_first_heartbeats_is_suspected_once_a_sibling_has_its_evi
             .iter()
             .all(|m| s.holds_suspected(*m, victim, killed_at))
     });
-    drop(members);
+    supervisor.members.stop();
     let mut noticed = Vec::new();
     for member in &survivors {
         let found = supervisor.suspicion(*member, victim);

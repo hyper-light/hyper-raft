@@ -21,6 +21,12 @@ const HEARTBEAT: u8 = 16;
 const REPORT_ASK: u8 = 3;
 /// The response tag a [`Report`] takes: the next past `wire::Outcome`'s.
 const REPORT: u8 = 7;
+/// The control tag of the test's ask for a member's [`Account`] of its detectors.
+const ACCOUNT_ASK: u8 = 4;
+/// The control tag of the test's order that a member's device answer no flush for a time.
+const STALL: u8 = 5;
+/// The response tag an [`Account`] takes.
+const ACCOUNT: u8 = 8;
 
 /// Puts a node-pair liveness heartbeat from member `from`, its message as `hyper_liveness` made it.
 pub fn put_heartbeat(buffer: &mut Vec<u8>, from: u64, message: &[u8]) {
@@ -52,6 +58,40 @@ pub fn read_report_ask(body: &[u8]) -> Option<u64> {
     let mut reader = Reader::new(body);
     let id = reader.u64()?;
     (reader.u8()? == REPORT_ASK && reader.rest().is_empty()).then_some(id)
+}
+
+/// Puts the test's ask for a member's account of its detectors.
+pub fn put_account_ask(buffer: &mut Vec<u8>, id: u64) {
+    wire::begin(buffer, Kind::Control);
+    wire::put_u64(buffer, id);
+    buffer.push(ACCOUNT_ASK);
+}
+
+/// The id of an ask for an account; none for anything else.
+pub fn read_account_ask(body: &[u8]) -> Option<u64> {
+    let mut reader = Reader::new(body);
+    let id = reader.u64()?;
+    (reader.u8()? == ACCOUNT_ASK && reader.rest().is_empty()).then_some(id)
+}
+
+/// Puts the test's order that a member's device answer no flush for `stall`, answered `Done`.
+pub fn put_stall(buffer: &mut Vec<u8>, id: u64, stall: Duration) {
+    wire::begin(buffer, Kind::Control);
+    wire::put_u64(buffer, id);
+    buffer.push(STALL);
+    wire::put_u64(buffer, u64::try_from(stall.as_nanos()).unwrap_or(u64::MAX));
+}
+
+/// The id and the stall of an order that a member's device answer no flush for a time; none for
+/// anything else.
+pub fn read_stall(body: &[u8]) -> Option<(u64, Duration)> {
+    let mut reader = Reader::new(body);
+    let id = reader.u64()?;
+    if reader.u8()? != STALL {
+        return None;
+    }
+    let stall = Duration::from_nanos(reader.u64()?);
+    reader.rest().is_empty().then_some((id, stall))
 }
 
 /// What the node-pair stream asked of its member during one call into it.
@@ -124,6 +164,20 @@ pub struct Report {
     pub writes: u64,
     /// The restarts of its peers its stream has seen.
     pub restarts: u64,
+    /// The time its thread has spent in the writes of its log, all told, nanoseconds: time it
+    /// could neither answer nor move its group.
+    pub blocked_ns: u64,
+    /// The longest one write of its log took to be durable, nanoseconds.
+    pub flush_most_ns: u64,
+    /// The longest it went between two reads of its socket, nanoseconds: the longest it could not
+    /// answer.
+    pub turn_most_ns: u64,
+    /// The askers it keeps waiting, writes and reads.
+    pub waiting: u64,
+    /// The writes it keeps waiting that no apply will answer: with no entry above what it
+    /// applied in the log of the term it leads that writes the value asked, or kept while it
+    /// leads no term. Zero always; any other count is a write that waits for good.
+    pub stray: u64,
     /// The peers its detectors suspect.
     pub suspected: Vec<u64>,
     /// The peers its stream has taken a heartbeat from.
@@ -153,6 +207,11 @@ pub fn put_report(buffer: &mut Vec<u8>, id: u64, report: &Report) {
         report.unjudged_interval_ns,
         report.writes,
         report.restarts,
+        report.blocked_ns,
+        report.flush_most_ns,
+        report.turn_most_ns,
+        report.waiting,
+        report.stray,
     ] {
         wire::put_u64(buffer, word);
     }
@@ -181,7 +240,7 @@ pub fn read_report(body: &[u8], max_peers: usize) -> Option<(u64, Report)> {
         last_index: reader.u64()?,
         digest: reader.u64()?,
     };
-    let mut words = [0u64; 8];
+    let mut words = [0u64; 13];
     for word in &mut words {
         *word = reader.u64()?;
     }
@@ -194,6 +253,11 @@ pub fn read_report(body: &[u8], max_peers: usize) -> Option<(u64, Report)> {
         unjudged_interval_ns,
         writes,
         restarts,
+        blocked_ns,
+        flush_most_ns,
+        turn_most_ns,
+        waiting,
+        stray,
     ] = words;
     let mut list = || {
         let count = usize::try_from(reader.u64()?).ok()?;
@@ -218,8 +282,208 @@ pub fn read_report(body: &[u8], max_peers: usize) -> Option<(u64, Report)> {
             unjudged_interval_ns,
             writes,
             restarts,
+            blocked_ns,
+            flush_most_ns,
+            turn_most_ns,
+            waiting,
+            stray,
             suspected,
             heard,
+        },
+    ))
+}
+
+/// What one of a member's pairs measured, the detector it runs, and its suspicions against
+/// Theorem 7's allowance (`hyper_liveness::PairReport`, `hyper_timing::Configuration`).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct PairAccount {
+    /// The peer.
+    pub peer: u64,
+    /// Whether a configuration of the pair's own judges it.
+    pub configured: bool,
+    /// Whether a margin judges it, its own or its node's.
+    pub judged: bool,
+    /// Heartbeats sent to the peer.
+    pub sent: u64,
+    /// Heartbeats taken from the peer.
+    pub taken: u64,
+    /// Heartbeats from the peer refused for their flush proof.
+    pub unproven: u64,
+    /// Configurations made.
+    pub configurations: u64,
+    /// Suspicions of the peer.
+    pub suspicions: u64,
+    /// Theorem 7's allowance for them: the suspicions expected were the peer alive throughout.
+    pub allowance: f64,
+    /// What the configurator was last fed: `p_L`.
+    pub loss: f64,
+    /// `E(D)`, nanoseconds.
+    pub mean_delay_ns: u64,
+    /// `√V(D)`, nanoseconds.
+    pub deviation_ns: u64,
+    /// The detector in force: `η`, nanoseconds.
+    pub interval_ns: u64,
+    /// `α`, nanoseconds.
+    pub margin_ns: u64,
+    /// The mistake recurrence it promises, `η / β`, nanoseconds.
+    pub recurrence_ns: u64,
+    /// The unavailability `U` it was chosen for.
+    pub unavailability: f64,
+}
+
+/// What a member's detectors measured and were configured to: its node's floors and the expected
+/// election each pair is charged, and each pair's account.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Account {
+    /// `G`, the measured lateness of the member's wakes, nanoseconds.
+    pub granularity_ns: u64,
+    /// `E[flush]`, nanoseconds.
+    pub flush_ns: u64,
+    /// `T_E`, the expected election each pair is charged, nanoseconds; zero before it is derived.
+    pub election_ns: u64,
+    /// Each pair.
+    pub pairs: Vec<PairAccount>,
+}
+
+/// The account of `liveness`'s pairs with `peers`, each charged `election`.
+pub fn account(liveness: &Liveness, peers: &[PeerId], election: Option<Duration>) -> Account {
+    let nanos = |d: Duration| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX);
+    let pairs = peers
+        .iter()
+        .filter_map(|peer| {
+            let report = liveness.report(*peer)?;
+            let configuration = liveness.configuration(*peer);
+            let link = configuration.map(|c| c.link);
+            let current = configuration.map(|c| c.current);
+            Some(PairAccount {
+                peer: *peer,
+                configured: report.configured,
+                judged: report.judged,
+                sent: report.sent,
+                taken: report.taken,
+                unproven: report.unproven,
+                configurations: report.configurations,
+                suspicions: report.suspicions,
+                allowance: report.allowance,
+                loss: link.map_or(0.0, |l| l.loss),
+                mean_delay_ns: link.map_or(0, |l| nanos(l.mean_delay)),
+                deviation_ns: link.map_or(0, |l| nanos(l.delay_deviation)),
+                interval_ns: current.map_or(0, |d| nanos(d.interval)),
+                margin_ns: current.map_or(0, |d| nanos(d.margin)),
+                recurrence_ns: current.map_or(0, |d| nanos(d.mistake_recurrence)),
+                unavailability: current.map_or(0.0, |d| d.unavailability),
+            })
+        })
+        .collect();
+    Account {
+        granularity_ns: liveness.granularity().map_or(0, nanos),
+        flush_ns: liveness.flush_mean().map_or(0, nanos),
+        election_ns: election.map_or(0, nanos),
+        pairs,
+    }
+}
+
+/// Puts an account as a response to `id`.
+pub fn put_account(buffer: &mut Vec<u8>, id: u64, account: &Account) {
+    wire::begin(buffer, Kind::Response);
+    wire::put_u64(buffer, id);
+    buffer.push(ACCOUNT);
+    for word in [
+        account.granularity_ns,
+        account.flush_ns,
+        account.election_ns,
+        u64::try_from(account.pairs.len()).unwrap_or(u64::MAX),
+    ] {
+        wire::put_u64(buffer, word);
+    }
+    for pair in &account.pairs {
+        for word in [
+            pair.peer,
+            u64::from(pair.configured),
+            u64::from(pair.judged),
+            pair.sent,
+            pair.taken,
+            pair.unproven,
+            pair.configurations,
+            pair.suspicions,
+            pair.allowance.to_bits(),
+            pair.loss.to_bits(),
+            pair.mean_delay_ns,
+            pair.deviation_ns,
+            pair.interval_ns,
+            pair.margin_ns,
+            pair.recurrence_ns,
+            pair.unavailability.to_bits(),
+        ] {
+            wire::put_u64(buffer, word);
+        }
+    }
+}
+
+/// Reads an account from a response's body; at most `max_peers` pairs.
+pub fn read_account(body: &[u8], max_peers: usize) -> Option<(u64, Account)> {
+    let mut reader = Reader::new(body);
+    let id = reader.u64()?;
+    if reader.u8()? != ACCOUNT {
+        return None;
+    }
+    let granularity_ns = reader.u64()?;
+    let flush_ns = reader.u64()?;
+    let election_ns = reader.u64()?;
+    let count = usize::try_from(reader.u64()?).ok()?;
+    if count > max_peers {
+        return None;
+    }
+    let mut pairs = Vec::with_capacity(count);
+    for _ in 0..count {
+        let mut words = [0u64; 16];
+        for word in &mut words {
+            *word = reader.u64()?;
+        }
+        let [
+            peer,
+            configured,
+            judged,
+            sent,
+            taken,
+            unproven,
+            configurations,
+            suspicions,
+            allowance,
+            loss,
+            mean_delay_ns,
+            deviation_ns,
+            interval_ns,
+            margin_ns,
+            recurrence_ns,
+            unavailability,
+        ] = words;
+        pairs.push(PairAccount {
+            peer,
+            configured: configured != 0,
+            judged: judged != 0,
+            sent,
+            taken,
+            unproven,
+            configurations,
+            suspicions,
+            allowance: f64::from_bits(allowance),
+            loss: f64::from_bits(loss),
+            mean_delay_ns,
+            deviation_ns,
+            interval_ns,
+            margin_ns,
+            recurrence_ns,
+            unavailability: f64::from_bits(unavailability),
+        });
+    }
+    Some((
+        id,
+        Account {
+            granularity_ns,
+            flush_ns,
+            election_ns,
+            pairs,
         },
     ))
 }

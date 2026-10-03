@@ -25,6 +25,7 @@ use std::{
     fs::{File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
     path::Path,
+    time::{Duration, Instant},
 };
 
 use hyper_raft::{
@@ -215,6 +216,8 @@ pub struct Wal {
     max_writes: usize,
     /// Entries handed over that could not be placed.
     damaged: Option<WalError>,
+    /// Until when the device answers no flush, as the test asked ([`Wal::stall_flushes`]).
+    stalled: Option<Instant>,
 }
 
 impl Wal {
@@ -250,6 +253,7 @@ impl Wal {
             buffer: Vec::new(),
             max_writes,
             damaged: None,
+            stalled: None,
         })
     }
     /// Writes `entries` and `hard` and flushes them; then the log in memory holds them. The
@@ -287,7 +291,7 @@ impl Wal {
             record(&mut self.buffer, HARD_STATE, &hard)?;
         }
         self.file.write_all(&self.buffer)?;
-        self.file.sync_data()?;
+        self.flush()?;
         if let Some(hard) = hard {
             let commit = hard.commit.max(self.hard.commit);
             self.hard = *hard;
@@ -304,6 +308,35 @@ impl Wal {
         let hard = self.hard;
         record(&mut self.buffer, HARD_STATE, &hard)?;
         self.file.write_all(&self.buffer)?;
+        self.flush()?;
+        Ok(())
+    }
+    /// Makes the device answer no flush for `stall` from now, as a device that stalls: a flush
+    /// begun meanwhile ends when the stall does, and the member's thread is held in it, as a flush
+    /// that does not end holds it. A device a machine's processes share stalls all of them at once
+    /// (Docker Desktop's virtual machine held every member's flush 1.8 s together in the runs that
+    /// found it, `docs/benchmarks.md`, "End to end").
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "the harness's device writer keeps the host's clock for a stall the test asked for"
+    )]
+    pub fn stall_flushes(&mut self, stall: Duration) {
+        self.stalled = Instant::now().checked_add(stall);
+    }
+    /// The platform's full flush of the file, once the stall the test asked for, if any, ends.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "the harness's device writer holds its thread through a stall the test asked for, as a device that stalls holds it"
+    )]
+    fn flush(&mut self) -> Result<(), WalError> {
+        if let Some(until) = self.stalled {
+            let left = until.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                self.stalled = None;
+            } else {
+                std::thread::sleep(left);
+            }
+        }
         self.file.sync_data()?;
         Ok(())
     }

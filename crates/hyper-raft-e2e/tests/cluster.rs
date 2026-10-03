@@ -7,7 +7,9 @@
 //! - a member cut off from the group never answers a read with a value the group has replaced,
 //!   and its detectors and every other member's see the cut;
 //! - every member that is up applies the same history (the same digest at the same index);
-//! - a member started again is reported restarted to every other member's core.
+//! - a member started again is reported restarted to every other member's core;
+//! - a group whose devices all stall goes on once they do;
+//! - every write a member keeps waiting is one an apply will answer (each report's `stray`).
 //!
 //! The members elect by suspicion on their own failure detectors: each runs the node-pair
 //! liveness stream (`hyper_liveness`, timing step L-3) and takes its words to its core, with the
@@ -22,7 +24,10 @@
 //! rounds and an ask's rounds, by the members' own law; never less than the test's own
 //! retransmission timeout, RFC 6298's one second before any measurement and never less after
 //! (§2.1, §2.4), past which it could not tell a member that did not move from an answer it did
-//! not wait for. An ask waits that timeout for its answer.
+//! not wait for. An ask waits that timeout for its answer. Quiet is only time in which the test
+//! saw the group: a member's one thread answers nothing while it is in a write of its log, so a
+//! look that did not hear every member decides nothing, and the time the members say they spent in
+//! their logs' writes is not quiet either (`Cluster::moving`).
 //!
 //! The scenarios run one after another in this one thread (`harness = false`), one group at a
 //! time: at most five member processes at once.
@@ -120,6 +125,11 @@ struct Member {
 /// What a wait last saw of each member's progress, and until when it waits without seeing more.
 struct Watch {
     seen: BTreeMap<u64, [u64; 7]>,
+    /// What each member said its thread had spent in its log's writes when this watch last
+    /// heard it.
+    blocked: BTreeMap<u64, u64>,
+    /// The members a look of this watch did not hear since it last heard them.
+    unheard: std::collections::BTreeSet<u64>,
     until: Instant,
 }
 
@@ -130,6 +140,11 @@ struct Cluster {
     /// What each member's latest report says its law takes: its stated detection, its election's
     /// span and rounds, and an ask's rounds.
     law: BTreeMap<u64, Duration>,
+    /// Looks at the group in which a member up did not answer, the time the watches were
+    /// extended for members in their logs' writes, and the most in one look.
+    unheard_looks: u64,
+    excused_total: u64,
+    excused_most: u64,
     test: UdpSocket,
     /// The most bytes the test's socket sends in one datagram ([`wire::largest`]).
     datagram: usize,
@@ -199,6 +214,9 @@ impl Cluster {
             members,
             room,
             law: BTreeMap::new(),
+            unheard_looks: 0,
+            excused_total: 0,
+            excused_most: 0,
             test,
             datagram,
             next_id: 0,
@@ -271,6 +289,12 @@ impl Cluster {
         stream::put_report_ask(&mut self.buffer, ask);
         let body = self.exchange(id, ask)?;
         let (_, report) = stream::read_report(&body, hyper_raft::MAX_MEMBERS)?;
+        // Every write a member keeps waiting is one an apply will answer.
+        assert_eq!(
+            report.stray, 0,
+            "{}: member {id} keeps writes no apply will answer: {report:?}",
+            self.name
+        );
         let round = Duration::from_nanos(report.round_ns);
         // The longest its detectors state to suspect a crash, or, while a pair no margin judges
         // takes heartbeats at a longer interval, that interval: the most a wait that goes on
@@ -286,10 +310,14 @@ impl Cluster {
     /// drop or deliver late, and a member just started has no group yet whose progress could
     /// bound the wait. A member whose process ended fails it.
     fn instruct(&mut self, id: u64, control: &Control) {
+        self.order(id, |buffer, ask| wire::put_control(buffer, ask, control));
+    }
+    /// Sends what `put` puts, an instruction answered `Done`, as [`Cluster::instruct`] sends one.
+    fn order(&mut self, id: u64, put: impl Fn(&mut Vec<u8>, u64)) {
         self.next_id += 1;
         let ask = self.next_id;
         loop {
-            wire::put_control(&mut self.buffer, ask, control);
+            put(&mut self.buffer, ask);
             if let Some(body) = self.exchange(id, ask) {
                 let outcome = wire::read_response(&body).map(|(_, outcome)| outcome);
                 assert_eq!(
@@ -330,15 +358,25 @@ impl Cluster {
     fn watch(&self) -> Watch {
         Watch {
             seen: BTreeMap::new(),
+            blocked: BTreeMap::new(),
+            unheard: std::collections::BTreeSet::new(),
             until: Instant::now() + self.quiet(),
         }
     }
     /// Whether the group is still moving: asks every member up for its report, and extends the
     /// watch by a quiet period whenever any member's term, commit, applied index, last index or
     /// restarts seen has moved since it last looked, or, while it has a pair no margin judges,
-    /// the heartbeats it has taken. The group is quiet only once a look that began after the
-    /// quiet period ended saw nothing move: an ask whose answer was lost spends a retransmission
-    /// timeout of the test's own, not of the group's.
+    /// the heartbeats it has taken.
+    ///
+    /// Quiet is time in which the test saw the group and nothing moved. A look that began before
+    /// the quiet period ended counts as movement unseen: an ask whose answer was lost spends a
+    /// retransmission timeout of the test's own, not of the group's. A member's one thread
+    /// answers nothing and moves nothing while it is in a write of its log, so neither is quiet:
+    /// a look in which a member up did not answer decides nothing (the member is waited on while
+    /// its process runs, and its answer after counts as movement: it can act again), and the time
+    /// the members say they spent in their logs' writes since this watch last heard them extends
+    /// the watch by the most any one of them spent. A device that stalls stalls every member on
+    /// it at once, and the test hears no one.
     #[allow(
         clippy::disallowed_methods,
         reason = "real processes on the host's clock, threads and environment (CLAUDE.md §1a, end to end)"
@@ -346,38 +384,71 @@ impl Cluster {
     fn moving(&mut self, watch: &mut Watch) -> bool {
         let looked = Instant::now();
         let mut moved = false;
+        let mut excused = 0u64;
         let mut seen = Vec::new();
+        let mut unheard = Vec::new();
         for id in self.up_members() {
-            if let Some(report) = self.report(id) {
-                let judging = if report.unjudged > 0 { report.taken } else { 0 };
-                let at = [
-                    report.status.term,
-                    report.status.commit,
-                    report.status.applied,
-                    report.status.last_index,
-                    report.restarts,
-                    report.unjudged,
-                    judging,
-                ];
-                if watch.seen.insert(id, at) != Some(at) {
-                    moved = true;
-                }
-                seen.push(report);
+            let Some(report) = self.report(id) else {
+                unheard.push(id);
+                continue;
+            };
+            let judging = if report.unjudged > 0 { report.taken } else { 0 };
+            let at = [
+                report.status.term,
+                report.status.commit,
+                report.status.applied,
+                report.status.last_index,
+                report.restarts,
+                report.unjudged,
+                judging,
+            ];
+            let changed = watch.seen.insert(id, at) != Some(at);
+            let back = watch.unheard.remove(&id);
+            if changed || back {
+                moved = true;
             }
+            if let Some(before) = watch.blocked.insert(id, report.blocked_ns) {
+                excused = excused.max(report.blocked_ns.saturating_sub(before));
+            }
+            seen.push(report);
         }
+        for id in &unheard {
+            self.running(*id);
+            watch.unheard.insert(*id);
+        }
+        if !unheard.is_empty() {
+            self.unheard_looks += 1;
+        }
+        self.excused_total += excused;
+        self.excused_most = self.excused_most.max(excused);
         if moved {
             watch.until = Instant::now() + self.quiet();
+        } else {
+            watch.until += Duration::from_nanos(excused);
         }
-        let moving = looked < watch.until;
+        let moving = looked < watch.until || !unheard.is_empty();
         if !moving {
-            // What the group was when it was judged stuck, for the failure that follows.
+            // What the group was when it was judged stuck, and what it says a look later, for the
+            // failure that follows.
+            let up = self.up_members();
+            let after = self.reports(&up);
             eprintln!(
-                "{}: nothing moved for {:?}; the last look: {seen:?}",
+                "{}: nothing moved for {:?}; the last look: {seen:?}; a look after: {after:?}",
                 self.name,
                 self.quiet()
             );
         }
         moving
+    }
+    /// Fails the test if member `id`'s process has ended: one that did not answer is waited on
+    /// only while it runs.
+    fn running(&mut self, id: u64) {
+        let name = self.name;
+        if let Some(child) = self.members[(id - 1) as usize].child.as_mut()
+            && let Some(status) = child.try_wait().unwrap()
+        {
+            panic!("{name}: member {id} ended: {status}");
+        }
     }
     /// The reports of the members in `among` that answer.
     fn reports(&mut self, among: &[u64]) -> BTreeMap<u64, Report> {
@@ -447,6 +518,73 @@ impl Cluster {
             self.name
         );
         agreed.get()
+    }
+    /// What every member up says its detectors measured and were configured to, a line a pair:
+    /// what the configurator was fed (`p_L`, `E(D)`, `√V(D)`), the detector in force (`η`, `α`,
+    /// the mistake recurrence it promises, the unavailability it was chosen for), and the pair's
+    /// suspicions against Theorem 7's allowance for a peer alive throughout.
+    fn detectors(&mut self) -> String {
+        let ms = |ns: u64| ns as f64 / 1e6;
+        let mut out = format!(
+            "\n  looks that did not hear every member: {}; waits extended {:.1} ms for members in \
+             their logs' writes, at most {:.1} ms at once",
+            self.unheard_looks,
+            ms(self.excused_total),
+            ms(self.excused_most)
+        );
+        for id in self.up_members() {
+            self.next_id += 1;
+            let ask = self.next_id;
+            stream::put_account_ask(&mut self.buffer, ask);
+            let Some((_, account)) = self
+                .exchange(id, ask)
+                .and_then(|body| stream::read_account(&body, hyper_raft::MAX_MEMBERS))
+            else {
+                out.push_str(&format!("\n  member {id}: no account"));
+                continue;
+            };
+            let (flush_most, turn_most) = self
+                .report(id)
+                .map_or((0, 0), |r| (r.flush_most_ns, r.turn_most_ns));
+            out.push_str(&format!(
+                "\n  member {id}: G {:.3} ms, E[flush] {:.3} ms, T_E {:.1} ms; longest flush {:.1} ms, \
+                 longest between two reads {:.1} ms",
+                ms(account.granularity_ns),
+                ms(account.flush_ns),
+                ms(account.election_ns),
+                ms(flush_most),
+                ms(turn_most)
+            ));
+            for pair in &account.pairs {
+                let own = if pair.configured {
+                    "own"
+                } else if pair.judged {
+                    "pool"
+                } else {
+                    "unjudged"
+                };
+                out.push_str(&format!(
+                    "\n    {id}->{}: {own}, {} configurations, {} sent, {} taken, {} refused unproven; fed p_L {:.4}, \
+                     E(D) {:.3} ms, sd {:.3} ms; eta {:.3} ms, alpha {:.3} ms, recurrence {:.1} ms, U {:.2e}; \
+                     {} suspicions, allowance {:.2}",
+                    pair.peer,
+                    pair.configurations,
+                    pair.sent,
+                    pair.taken,
+                    pair.unproven,
+                    pair.loss,
+                    ms(pair.mean_delay_ns),
+                    ms(pair.deviation_ns),
+                    ms(pair.interval_ns),
+                    ms(pair.margin_ns),
+                    ms(pair.recurrence_ns),
+                    pair.unavailability,
+                    pair.suspicions,
+                    pair.allowance
+                ));
+            }
+        }
+        out
     }
     /// Kills member `id` with SIGKILL (TerminateProcess on Windows): no flush, no goodbye. Nobody
     /// is told: the others' detectors find out.
@@ -687,8 +825,9 @@ fn commits(voters: usize, name: &'static str) -> String {
     let elapsed = started.elapsed();
     let checked = verify(&mut cluster, &mut client, &history);
     let applied = cluster.converged(&all);
+    let detectors = cluster.detectors();
     format!(
-        "{name}: {voters} members; {checked} writes answered and read back ({:.2} ms per write and read, {:.2} ms the slowest); all applied index {applied} alike",
+        "{name}: {voters} members; {checked} writes answered and read back ({:.2} ms per write and read, {:.2} ms the slowest); all applied index {applied} alike{detectors}",
         elapsed.as_secs_f64() * 1e3 / writes as f64,
         slowest.as_secs_f64() * 1e3,
     )
@@ -840,8 +979,9 @@ fn leader_killed() -> String {
         .count();
     cluster.restart(old);
     let applied = cluster.converged(&all);
+    let detectors = cluster.detectors();
     format!(
-        "{name}: leader {old} (term {old_term}) killed with the {in_flight} writes in flight in its log; {new} elected in term {new_term}; {checked} answered writes read back; {answered} of them answered before the kill, and {unknown_present} of those unanswered committed by the new leader; member {old} restarted on its log, its restart reported, and applied index {applied} alike"
+        "{name}: leader {old} (term {old_term}) killed with the {in_flight} writes in flight in its log; {new} elected in term {new_term}; {checked} answered writes read back; {answered} of them answered before the kill, and {unknown_present} of those unanswered committed by the new leader; member {old} restarted on its log, its restart reported, and applied index {applied} alike{detectors}"
     )
 }
 
@@ -876,8 +1016,9 @@ fn follower_restarts() -> String {
     let applied = cluster.converged(&all);
     assert!(applied >= commit);
     let checked = verify(&mut cluster, &mut client, &history);
+    let detectors = cluster.detectors();
     format!(
-        "{name}: follower {follower} killed after {phase} writes, {phase} written without it, restarted on its log, its restart reported, caught up to index {applied} alike; {checked} writes read back"
+        "{name}: follower {follower} killed after {phase} writes, {phase} written without it, restarted on its log, its restart reported, caught up to index {applied} alike; {checked} writes read back{detectors}"
     )
 }
 
@@ -970,8 +1111,78 @@ fn partition() -> String {
     let applied = cluster.converged(&all);
     let (leader, _) = cluster.leader_among(&all);
     let checked = verify(&mut cluster, &mut client, &history);
+    let detectors = cluster.detectors();
     format!(
-        "{name}: leader {old} of 5 cut off; at once it answered a read with {early_read:?} and a write with {early_write:?}, and later the read of a replaced key with {stale:?}; it suspected all four and all four suspected it; {new} elected in term {new_term}; after the filter lifted, {leader} leads and all applied index {applied} alike; {checked} writes read back"
+        "{name}: leader {old} of 5 cut off; at once it answered a read with {early_read:?} and a write with {early_write:?}, and later the read of a replaced key with {stale:?}; it suspected all four and all four suspected it; {new} elected in term {new_term}; after the filter lifted, {leader} leads and all applied index {applied} alike; {checked} writes read back{detectors}"
+    )
+}
+
+/// Every member's device stalls at once, longer than the test can wait in quiet: none answers a
+/// flush until the stall ends. A device a machine's processes share stalls them all together (Docker
+/// Desktop's virtual machine held every member's flush 1.8 s at once in the runs that found
+/// this), and a member's one thread answers nothing in the meantime. A write sent as the devices
+/// stall commits once they go on: the test waits through the members' silence, which it cannot
+/// call quiet. Then the group takes a phase of writes, and nothing answered is lost.
+fn stalled_devices() -> String {
+    let name = "stalled-devices";
+    let phase = phase(name, datagram());
+    // A phase before the stall, the write sent into it, and a phase after.
+    let room = Room {
+        keys: 2 * phase + 1,
+        pending: 1,
+        writes: 2 * phase + 1,
+    };
+    let mut cluster = Cluster::start(name, 3, room);
+    let all = cluster.up_members();
+    let (leader, _) = cluster.leader_among(&all);
+    let mut client = Client { leader };
+    let mut history = History::default();
+    write_range(&mut cluster, &mut client, &mut history, 0..phase);
+    let (leader, _) = cluster.leader_among(&all);
+    let applied = cluster.converged(&all);
+    // Longer than a wait can be quiet and still look: the quiet period in force, then the members
+    // asked for their reports and for a look, each ask unanswered for a retransmission timeout.
+    let stall = cluster.quiet() + RTO * 2 * all.len() as u32;
+    for id in &all {
+        cluster.order(*id, |buffer, ask| stream::put_stall(buffer, ask, stall));
+    }
+    // A write the leader proposes, flushes, and its followers flush, each after its stall: sent,
+    // and waited for by what the members apply.
+    let key = format!("{name}-stalled");
+    cluster.next_id += 1;
+    wire::put_request(
+        &mut cluster.buffer,
+        cluster.next_id,
+        &Op::Put {
+            key: key.as_bytes(),
+            value: b"stalled",
+        },
+    );
+    assert!(wire::seal(&mut cluster.buffer, cluster.datagram));
+    let address = cluster.address(leader);
+    cluster.test.send_to(&cluster.buffer, address).unwrap();
+    history
+        .unknown
+        .insert(key.into_bytes(), b"stalled".to_vec());
+    let count = all.len();
+    let went_on = cluster.until(&all, |reports| {
+        reports.len() == count && reports.values().all(|r| r.status.applied > applied)
+    });
+    assert!(
+        went_on,
+        "{name}: the group did not go on after its devices did"
+    );
+    assert!(
+        cluster.unheard_looks > 0,
+        "{name}: no look missed a member through a stall of {stall:?}"
+    );
+    write_range(&mut cluster, &mut client, &mut history, phase..2 * phase);
+    let checked = verify(&mut cluster, &mut client, &history);
+    let applied = cluster.converged(&all);
+    let detectors = cluster.detectors();
+    format!(
+        "{name}: every member's device held its flushes {:.1} s after {phase} writes; a write sent into the stall committed once the devices went on; {checked} writes read back; all applied index {applied} alike{detectors}",
+        stall.as_secs_f64()
     )
 }
 
@@ -1000,8 +1211,9 @@ fn all_killed() -> String {
     client.leader = leader;
     let checked = verify(&mut cluster, &mut client, &history);
     let applied = cluster.converged(&all);
+    let detectors = cluster.detectors();
     format!(
-        "{name}: every member killed after {phase} answered writes and restarted on its log; {leader} leads in term {term}; {checked} writes read back; all applied index {applied} alike"
+        "{name}: every member killed after {phase} answered writes and restarted on its log; {leader} leads in term {term}; {checked} writes read back; all applied index {applied} alike{detectors}"
     )
 }
 
@@ -1022,13 +1234,14 @@ fn main() -> ExitCode {
     )
     .unwrap();
     drop(out);
-    let scenarios: [(&str, Scenario); 6] = [
+    let scenarios: [(&str, Scenario); 7] = [
         ("commits-3", || commits(3, "commits-3")),
         ("commits-5", || commits(5, "commits-5")),
         ("leader-killed", leader_killed),
         ("follower-restarts", follower_restarts),
         ("partition", partition),
         ("all-killed", all_killed),
+        ("stalled-devices", stalled_devices),
     ];
     let filter: Vec<String> = std::env::args()
         .skip(1)

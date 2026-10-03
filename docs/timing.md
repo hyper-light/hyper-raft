@@ -1040,36 +1040,81 @@ targets, 0.3–18.8 s with a young link judged by what its node measured).
 
 hyper-raft-e2e's members (`crates/hyper-raft-e2e`, a `RawNode` over a file log of the harness's
 own) run the same wiring on the core directly: `Config::elections = Suspicion` with pre-vote and
-check-quorum, the pairs attached from the configuration, each `Change` taken to `suspect`, `trust`
-or `restarted`, the timing derived by this law from the stream's echoed round trips, mean flush and
-granularity (`stream::timing`, as `Replica::measure` derives it) and every pair charged the span's
-`T_E`, each log write handed to the stream as a flush proof, and, where the group wrote none in
-time, the log's hard state written again and flushed on the same file (`Wal::prove`). The member
-wakes at the earlier of the core's deadline and the stream's, waiting by a peek and taking without
-waiting as hyper-durable-e2e's members do; a member cut off drops its heartbeats with its Raft
-messages. Its test is hyper-durable-e2e's in shape: no tick, no `--tick-ms`, no 95/95
-bounds of a flush, a datagram or a wake, no count of elections per wait or per run; waits go on
-while any member's term, commit, applied index, last index or restarts seen moves (or, while a pair
-is unjudged, its heartbeats), and fail once a quiet period of the members' stated law passes with
-nothing moved (the longer of a member's stated detection and an unjudged pair's interval, then its
-election's span and rounds and an ask's), a period that counts only looks begun after it ended, so that an ask whose answer
-was lost spends the test's retransmission timeout and not the group's. The partition is now also
-seen by the detectors: the member cut off suspects every other and every other suspects it. Its
-bounds stay the scenario's: the keys it writes, the asks it keeps waiting, and a log of one entry a
-write and one a term — a leader proposes no write its log already holds, so a write asked again is
-held once, and each term's leader appends one empty entry. A phase writes one entry more than an
-append carries on the platform's datagram, so a member that missed one catches up over more than
-one append. Measured in `docs/benchmarks.md`, "End to end".
+check-quorum, the pairs attached from the configuration (each told to the core as the stream
+believes it when attached, as hyper-durable's `Owner::pairs` tells a replica), each `Change`
+taken to `suspect`, `trust` or `restarted`, the timing derived by this law from the stream's
+echoed round trips, mean flush and granularity (`stream::timing`, as `Replica::measure` derives
+it) and every pair charged the span's `T_E`, each log write handed to the stream as a flush proof,
+and, where the group wrote none in time, the log's hard state written again and flushed on the
+same file (`Wal::prove`). The member wakes at the earlier of the core's deadline and the
+stream's, waiting by a peek and taking without waiting as hyper-durable-e2e's members do; a member
+cut off drops its heartbeats with its Raft messages. Its test is hyper-durable-e2e's in shape: no
+tick, no `--tick-ms`, no 95/95 bounds of a flush, a datagram or a wake, no count of elections per
+wait or per run; waits go on while any member's term, commit, applied index, last index or
+restarts seen moves (or, while a pair is unjudged, its heartbeats), and fail once a quiet period of
+the members' stated law passes with nothing moved (the longer of a member's stated detection and
+an unjudged pair's interval, then its election's span and rounds and an ask's, never below RFC
+6298's one second). Quiet is time in which the test saw the group and nothing moved: a look begun
+before the period ended counts as movement unseen; a look in which a member did not answer decides
+nothing (the member is waited on while its process runs, and its answer after counts as movement);
+and the time the members report their one thread spent in their logs' writes since the watch last
+heard them extends the watch by the most any one spent. The partition is also seen by the
+detectors: the member cut off suspects every other and every other suspects it. Its bounds stay the
+scenario's: the keys it writes, the asks it keeps waiting, and a log of one entry a write and one a
+term, for a leader proposes no write its log already holds and each term's leader appends one
+empty entry; and every report holds the member to its bookkeeping: each write it keeps waiting has
+an entry above what it applied in the log of the term it leads (`stray`, asserted zero). A phase
+writes one entry more than an append carries on the platform's datagram, so a member that missed
+one catches up over more than one append. Measured in `docs/benchmarks.md`, "End to end".
 
-What its runs found of the stream: with elections that cost tens of milliseconds, the configurator
-accepts detectors whose mistake recurrence is short (a 1 ms interval and a 0.5 ms margin at first,
-then about 10 ms and 4 ms, recurrence 150–480 ms on Linux in Docker), and a burst of hundreds of
-writes delays a leader's reads of its heartbeats, which this harness stamps when read: the leader
-changed at many bursts of the leader-killed scenario's writes in flight (terms up to 18 at its end
-across 30 Linux runs, where the scenario causes two; 1 to 7 on macOS). Every answered write still read back. Whether the mistakes'
-cost is priced right by `U` with elections this cheap is §3's item 1 and item 3. Open in the harness: a
-rare stall of the leader-killed scenario's writes in flight on Linux, a healthy idle group whose
-leader takes none of the writes resent to it (`docs/benchmarks.md`, "End to end").
+**The stall it found, and its cause.** About one run in forty on Linux in Docker stopped with the
+group judged stuck while the test still had writes to land; once a dump was printed, the group a
+look later was healthy and idle, its leader having taken none of the writes resent to it. The
+cause was the test's, not the group's. A member's one thread answers nothing while it is in a
+write of its log; on Docker Desktop's virtual machine, whose disk is one file on the host shared
+by every container, a flush took up to 1.8 s, the same 1,807 ms on members of groups in different
+containers at once (each member's longest flush and longest time between two reads of its socket
+were the same number, in every run that reported them): the device held them all together; macOS's
+own disk, under that load, held one flush 1.9 s. The test then
+heard no one (the last look before one failure was empty), its quiet period (one second, RTO's
+floor, above the law's) passed with nothing seen to move, and it called the group stuck; the
+group was waiting on its device, and went on with it. The bookkeeping lead (a write kept waiting
+that no apply would answer) was checked and is not it: the invariant never broke in any run. The
+fix is the rule above, which counts as quiet only time in which the test saw the group. The
+`stalled-devices` scenario holds it: every member's device answers no flush for the quiet period in
+force and two looks' worth of retransmission timeouts, a write is sent into the stall, and the test
+waits for every member to apply it. Under the old rule the test failed there with the same empty
+last look in each of five runs on macOS; under the new it waited through the silence and the write
+committed once the devices went on, in each of five.
+
+**What the runs measured of the detectors** (every scenario prints, for each member, its floors
+and longest flush, and for each pair what the configurator was fed, the detector in force and its
+suspicions against Theorem 7's allowance, `PairReport::allowance`). On macOS, under load 45–62
+from other sessions and six Docker containers running these tests beside them (ten runs,
+`docs/benchmarks.md`, "End to end"):
+- **Floors.** `G` 4–29 ms (median 6–7 ms), `E[flush]` 9–34 ms (median 11–26 ms), so the sender's
+  floor `E[flush] + G` sits near 20 ms; the expected election `T_E` charged to every pair 55–248 ms.
+- **What the pairs measured.** `p_L` 1–39 % (median 8–14 %) on loopback, none of it refused for its
+  proof: the stream numbers each heartbeat slot, and a sender held past its slots (in a flush, or
+  unscheduled) skips them, which its receiver counts as lost. `E(D)` enters the configurator as zero:
+  the expected arrival absorbs the mean delay. The deviation of the prediction errors 3.6–25 ms
+  (185 ms on a pair of the stalled-devices scenario).
+- **What was configured.** `η` 9.6–117 ms (median 16–23 ms) and `α` 4–105 ms (median 10–15 ms):
+  mostly one heartbeat in the margin, so a single skipped slot is a suspicion. The mistake
+  recurrence each detector promises, `η/β`, 15–2,550 ms (median 45–113 ms), shorter than an
+  election in many pairs; the unavailability `U` it was chosen for exceeds 1 (a model that charges
+  more election time than there is time) in 39 of 53 configured pairs of commits-3, 80 of 176 of
+  commits-5 and 104 of 194 of the partition.
+- **Mistakes against the allowance.** Every pair stayed within Theorem 7's allowance, with room:
+  261 suspicions against 1,805 allowed over commits-3's pairs, 1,033 against 8,545 over
+  commits-5's, 1,519 against 10,119 over the partition's (none of these suspicions is of a member
+  down: those scenarios kill no one).
+The detectors keep their bound, and the bound is loose; the configurator, minimizing `U` with
+elections this cheap and losses this high, accepts detectors that mistake many times a second, and
+each mistake about a leader can cost an election (terms to 18 in leader-killed on Linux, where the
+scenario causes two). Nothing here was tuned to hide it. What it asks of the configurator is §3's
+items 1 and 3: the cost of a mistake beyond `T_E` (a leader change moves every client), and a
+loss estimate that tells a sender's skipped slots from the link's.
 
 **The model.** These rules only bring forward or refuse a campaign, or forget a leader, which is
 volatile; the TLA+ model's `Elect` may be taken at any time with any quorum the log comparison

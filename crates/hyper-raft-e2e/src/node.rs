@@ -237,6 +237,13 @@ pub struct Node {
     asked: Asked,
     /// The restarts of its peers the stream reported.
     restarts: u64,
+    /// The time its thread has spent in the writes of its log, all told: time it could neither
+    /// read its socket nor move its group.
+    blocked: u64,
+    /// The longest one write of its log took to be durable.
+    flush_most: u64,
+    /// The longest it went between two reads of its socket: how long it could not answer.
+    turn_most: u64,
 }
 
 impl Node {
@@ -298,6 +305,9 @@ impl Node {
             attached: Vec::new(),
             asked: Asked::default(),
             restarts: 0,
+            blocked: 0,
+            flush_most: 0,
+            turn_most: 0,
             settings,
         })
     }
@@ -321,8 +331,10 @@ impl Node {
         self.pairs()?;
         // The member drives once before it waits: a reopened member replays its log alone.
         self.drive()?;
+        let mut read = self.now();
         while !stop.load(Ordering::Acquire) {
             self.live()?;
+            self.turn_most = self.turn_most.max(self.now().saturating_sub(read));
             // Woken at the core's deadline or the stream's, whichever is first; by a datagram
             // otherwise, the parent's going among them.
             let until = [self.raw.deadline(), self.liveness.wake()]
@@ -330,6 +342,7 @@ impl Node {
                 .flatten()
                 .min();
             self.receive_until(until)?;
+            read = self.now();
             self.live()?;
             self.measure()?;
             self.drive()?;
@@ -338,7 +351,9 @@ impl Node {
     }
 
     /// Keeps the stream told which peers the group has: its configuration's other members
-    /// (hyper-durable's `Owner::pairs`).
+    /// (hyper-durable's `Owner::pairs`). A peer attached is told to the core as the stream
+    /// believes it then: a change the stream reported while the pair was not attached never
+    /// reached the core.
     fn pairs(&mut self) -> Result<(), NodeError> {
         let id = self.settings.id;
         let mut now: Vec<PeerId> = self
@@ -353,6 +368,12 @@ impl Node {
         for peer in &now {
             if self.attached.binary_search(peer).is_err() {
                 self.liveness.attach(*peer).map_err(NodeError::Liveness)?;
+                let told = if self.liveness.trust(*peer) == Some(Trust::Suspected) {
+                    self.raw.suspect(*peer)
+                } else {
+                    self.raw.trust(*peer)
+                };
+                heard(told)?;
             }
         }
         for peer in &self.attached {
@@ -403,6 +424,7 @@ impl Node {
             let started = self.now();
             self.raw.store_mut().prove()?;
             let durable = self.now();
+            self.wrote(started, durable);
             self.liveness
                 .on_durable(LiveWrite::Liveness, started, durable);
         }
@@ -439,6 +461,13 @@ impl Node {
             self.reply().send(address)?;
         }
         Ok(())
+    }
+
+    /// A write of its log took from `started` to `durable`.
+    fn wrote(&mut self, started: u64, durable: u64) {
+        let took = durable.saturating_sub(started);
+        self.blocked = self.blocked.saturating_add(took);
+        self.flush_most = self.flush_most.max(took);
     }
 
     /// Takes a change the stream reported to the core.
@@ -621,6 +650,12 @@ impl Node {
             )
             .unwrap_or(u64::MAX),
             restarts: self.restarts,
+            blocked_ns: self.blocked,
+            flush_most_ns: self.flush_most,
+            turn_most_ns: self.turn_most,
+            waiting: u64::try_from(self.app.writes.len().saturating_add(self.reads.len()))
+                .unwrap_or(u64::MAX),
+            stray: self.stray(),
             suspected: peers(&|peer| self.liveness.trust(peer) == Some(Trust::Suspected)),
             heard: peers(&|peer| {
                 self.liveness
@@ -628,6 +663,35 @@ impl Node {
                     .is_some_and(|pair| pair.taken > 0)
             }),
         }
+    }
+
+    /// The writes this member waits to answer that no apply will answer: every one is to have an
+    /// entry in its log above what it applied that writes the value asked, while it leads the
+    /// term it took the asker in (`lead_or_let_go` lets them go when that term ends). A write
+    /// kept otherwise waits for good, and a client asking it again is told nothing.
+    fn stray(&self) -> u64 {
+        let raft = &self.raw.raft;
+        let leads = raft.state() == StateRole::Leader && self.leading == Some(raft.term());
+        let applied = self.app.applied;
+        let last = raft.log().last_index().unwrap_or(0);
+        let held = |key: &[u8], value: &[u8]| {
+            leads
+                && applied < last
+                && raft
+                    .log()
+                    .any_entry(applied.saturating_add(1), last.saturating_add(1), |entry| {
+                        wire::read_command(&entry.data)
+                            .is_some_and(|command| command.key == key && command.value == value)
+                    })
+                    .unwrap_or(false)
+        };
+        let stray = self
+            .app
+            .writes
+            .iter()
+            .filter(|(key, (value, _))| !held(key, value))
+            .count();
+        u64::try_from(stray).unwrap_or(u64::MAX)
     }
 
     /// Whether this member leads; the refusal sent when not.
@@ -755,7 +819,25 @@ impl Node {
                 .on_heartbeat(peer, message, now, &mut self.asked);
             return self.act_on_liveness().map(drop);
         }
+        if let Some((id, stall)) = stream::read_stall(body) {
+            self.raw.store_mut().stall_flushes(stall);
+            return self.respond(from, id, &Outcome::Done);
+        }
+        if let Some(id) = stream::read_account_ask(body) {
+            let voters = self.raw.raft.configuration().voters().to_vec();
+            let election = stream::timing(&self.liveness, self.settings.id, &voters)
+                .map(|(_, span)| span.election);
+            let account = stream::account(&self.liveness, &self.attached, election);
+            stream::put_account(&mut self.sending, id, &account);
+            if wire::seal(&mut self.sending, self.datagram) {
+                self.reply().send(from)?;
+            }
+            return Ok(());
+        }
         if let Some(id) = stream::read_report_ask(body) {
+            // Its askers settled first: a member that stopped leading in this turn lets them go
+            // before it says what it is.
+            self.lead_or_let_go()?;
             let report = self.report();
             stream::put_report(&mut self.sending, id, &report);
             if wire::seal(&mut self.sending, self.datagram) {
@@ -830,6 +912,7 @@ impl Node {
         persist.store.write(persist.entries, hard)?;
         if wrote {
             let durable = self.now();
+            self.wrote(started, durable);
             self.liveness.on_durable(LiveWrite::Log, started, durable);
         }
         for read in ready.take_read_states() {

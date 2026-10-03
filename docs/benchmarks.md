@@ -915,10 +915,16 @@ bounds derived from that budget. What derives each count now:
   a quiet period passes with nothing moved: the longest any member's report states for its
   detection (`η + α`) or, while a pair is unjudged, the interval its heartbeats come at
   (`PairReport::interval`), then its election's span and three rounds and an ask's three, never less than
-  RFC 6298's one-second retransmission timeout (§2.1, §2.4). A look that began before the quiet
-  period ended counts as movement unseen, so an ask whose answer was lost spends the test's own
-  timeout, not the group's. An ask waits that timeout for its answer, by a peek (`wire::arrives`).
-  A wait that gives up prints each member's last report.
+  RFC 6298's one-second retransmission timeout (§2.1, §2.4). Quiet is time in which the test saw
+  the group and nothing moved: a look that began before the quiet period ended counts as movement
+  unseen, so an ask whose answer was lost spends the test's own timeout, not the group's; a look in
+  which a member did not answer decides nothing (the member is waited on while its process runs,
+  and its answer after counts as movement); and the time the members report their one thread spent
+  in their logs' writes since the watch last heard them extends the watch by the most any one
+  spent. An ask waits that timeout for its answer, by a peek (`wire::arrives`). A wait that gives
+  up prints each member's last report and the reports of a look after.
+- **Every report** holds the member to its bookkeeping: each write it keeps waiting has an entry
+  above what it applied in the log of the term it leads (`stray`, asserted zero on every report).
 - **A phase** writes one entry more than an append carries: the datagram the platform allows
   (`wire::largest`) less a message's fixed bytes, over the scenario's shortest entry. A member that
   missed a phase catches up over more than one append. 136 writes on macOS (a 9,216-byte datagram),
@@ -938,6 +944,11 @@ bounds derived from that budget. What derives each count now:
 | follower-restarts | a follower killed, a phase answered without it, restarted on its log, its restart reported, caught up to the leader's commit with the same history |
 | partition | the leader of five cut off by a drop filter inside its process, its heartbeats with its Raft messages: a read it is asked at once is never answered with a value and a write never acknowledged; the others elect; the member cut off suspects all four and all four suspect it; a key written after the cut never reads stale from it; once lifted it follows and every member applies the same history |
 | all-killed | every member killed at once and restarted on its log: every answered write reads back |
+| stalled-devices | every member's device answers no flush for longer than a wait can be quiet and look (the quiet period in force and two looks' retransmission timeouts); a write sent into the stall commits once the devices go on; a phase after; every answered write reads back and every member applies the same history |
+
+Every scenario also prints, for each member, its floors and the longest it went in one flush and
+between two reads of its socket, and for each pair what the configurator was fed, the detector in
+force, and its suspicions against Theorem 7's allowance (`docs/timing.md` §2.9).
 
 Runs of the whole binary, `cargo test -p hyper-raft-e2e --test cluster`, on the code as committed
 (over hyper-raft `7a8812c`), 2026-10-02:

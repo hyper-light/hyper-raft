@@ -526,6 +526,31 @@ its peers' estimators, coordinates and gossip reports without bound. Now:
 - the detection bound counts the most members the view has held at once, not the members it holds:
   a member forgotten since was in the rounds before.
 
+**A refutation a rumor missed.** A refutation is an update like any other, gossiped `T` times by
+each member that adopts it and then dropped, and a rumor can end known to some members and not all
+(Demers et al. 1987, §1.4–§1.5; `docs/research/swim.md`): a member it missed holds the refuted
+member dead, past the record's window forgets it, and probes it no more. The cluster test found it
+three times in 1,119 runs (`docs/benchmarks.md`, "The cluster test"). Lifeguard's buddy system
+(§IV-C) makes a probe of a suspected member carry the suspicion whatever the rumor's budget, so the
+suspect hears it at the first probe. Now:
+- a probe also carries the prober's own state, alive at its incarnation
+  (`Detector::ping_gossip_into`), so a member a refutation missed hears it from the refuted
+  member's next probe: the refuted member holds it alive and probes it every round, held dead or
+  forgotten by it as it is;
+- an answer carries the answering member's suspicion or death of the prober
+  (`Detector::ack_gossip_into`), so a member held dead at the incarnation it died at, which never
+  heard so, is told by the answer to its probe, since nobody probes the dead; it refutes, and its
+  next probe revives it there;
+- the two take their room in a message's gossip before the ordinary batch does, which is drained
+  only into the room left, so no rumor is counted sent that was not: one entry on every probe, and
+  one on an answer only to a member held suspected or dead.
+
+Demers et al. back a rumor up with anti-entropy, each site resolving every difference with another
+chosen at random, and memberlist exchanges its whole state with one member every 30 s, a chosen
+number. Between two members that probe each other these two entries are that exchange, for the two
+states that concern them; two live members that each hold the other dead, both refutations missed,
+probe neither each other nor anyone about each other, and anti-entropy through a third is not built.
+
 **What the cluster test asserts** (`crates/hyper-swim/tests/cluster.rs`, §2.5). Five member
 processes run the detector as the library configures it, in two phases. The supervisor waits on
 facts: every member judging every peer by a configured verdict (the pair's own, or the pool's while
@@ -563,20 +588,16 @@ supervisor is gone ends when its report cannot be written.
 and `α` growing from about 0.3 ms with the MTBF; a period costs no allocation and less time than
 slates' at every point; 2,000 runs of the one-kill cluster test on macOS and on Linux at one, two and
 four CPUs with busy loops beside them all passed, detection a median 4 ms on macOS and 16–18 ms in
-Docker's VM after the victim's last answer; 300 runs of the two-phase form on macOS, two failing on
-the split below. Open: §3, item 1 governs the probe rate too, since a period is its probe's deadline
-and nothing yet prices a probe, and as the MTBF grows the margins and so the periods grow with it;
-two members cannot condemn each other, as neither can tell its own failure from the other's; the
-pool's mean is wrong for a pair far from the member's others until that pair configures; the
-allowance is loose while a history is young (§3, item 3); and a refutation can miss a member. A
-live member falsely condemned refutes, and its refutation is a rumor, sent `T` times by each member
-that adopts it and then dropped, which can end known to some members and not all (Demers et al.
-1987, §1.5, `docs/research/swim.md`): a member it misses holds the live member dead, past the
-record's window forgets it, and nothing tells it again, though the live member probes it every
-round. Demers et al. back a rumor up with anti-entropy, each site resolving every difference with
-another chosen at random, and memberlist exchanges its whole state with one member every 30 s, a
-chosen number; hyper-swim has neither yet. The cluster test's second phase, which waits on every
-surviving pair, found it twice in 300 runs (`docs/benchmarks.md`, "The cluster test").
+Docker's VM after the victim's last answer; of the two-phase form on macOS, 300 runs with two
+failing and 819 traced with one, each on a refutation a rumor missed; with probes stating their
+sender, three forms of 1,000 each, 1,000, 999 and 998 passing, no split, the three failures each
+the first victim held dead past its stated bound by 0.2 to 2.2 ms, cause open. Open: §3, item 1
+governs the probe rate too, since a period is its probe's deadline and nothing yet prices a probe,
+and as the MTBF grows the margins and so the periods grow with it; two members cannot condemn each
+other, as neither can tell its own failure from the other's; the pool's mean is wrong for a pair far
+from the member's others until that pair configures; the allowance is loose while a history is
+young (§3, item 3); and two live members that each hold the other dead, both refutations missed,
+are told by nothing, since anti-entropy through a third member is not built (above).
 
 ### 2.8 The node-pair stream (L-3)
 

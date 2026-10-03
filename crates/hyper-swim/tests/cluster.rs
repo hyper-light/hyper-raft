@@ -381,7 +381,7 @@ impl Member {
                 self.detector.apply_gossip(gossip);
                 let ack = self.detector.on_ping(from);
                 let mut batch = std::mem::take(&mut self.batch);
-                self.detector.gossip_into(self.gossip, &mut batch);
+                self.detector.ack_gossip_into(from, self.gossip, &mut batch);
                 let coordinate = *self.detector.coordinate();
                 self.send(
                     ack.to.0,

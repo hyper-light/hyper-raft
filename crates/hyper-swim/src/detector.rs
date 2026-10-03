@@ -1223,25 +1223,66 @@ impl Detector {
         self.gossip.drain(max, self.transmits, batch);
     }
 
-    /// The gossip batch to piggyback on a direct ping to `target`: the ordinary batch plus, while
-    /// this node suspects `target` or holds it dead, that belief — even after its transmit budget
-    /// is spent (Lifeguard's buddy system), so the target hears it from the probe it answers and
-    /// refutes at once. Within `max`: the least-fresh entry makes room.
+    /// The gossip batch to piggyback on a probe of `target`: the ordinary batch; this member's own
+    /// state, alive at its incarnation, so `target` learns it from every probe; and, while this
+    /// member suspects `target` or holds it dead, that belief, even after its transmit budget is
+    /// spent (Lifeguard's buddy system, §IV-C), so `target` hears it from the probe it answers and
+    /// refutes at once. A refutation is a rumor, and a rumor can end known to some members and not
+    /// all (Demers et al. 1987, §1.5): a member it missed holds the refuted member dead, or has
+    /// forgotten it, and probes it no more, but the refuted member still probes it, and its probes
+    /// carry the refutation. Within `max`: the two take their room first, the belief before the
+    /// state, and the ordinary batch the rest.
     pub fn ping_gossip_into(
         &mut self,
         target: HostId,
         max: usize,
         batch: &mut Vec<(HostId, MemberState)>,
     ) {
-        self.gossip_into(max, batch);
-        if let Some(state) = self.membership.state(target)
-            && state.liveness != Liveness::Alive
-            && !batch.iter().any(|(host, _)| *host == target)
-        {
-            if batch.len() >= max {
-                batch.pop();
+        let belief = self.belief(target);
+        let own = MemberState {
+            liveness: Liveness::Alive,
+            incarnation: self.membership.local_incarnation(),
+        };
+        self.gossip_with(max, [belief, Some((self.local, own))], batch);
+    }
+
+    /// The gossip batch to piggyback on the answer to a probe from `prober`: the ordinary batch
+    /// and, while this member suspects `prober` or holds it dead, that belief. Nobody probes the
+    /// dead, so the answer is where a member held dead hears it, at the incarnation it died at, and
+    /// refutes; its next probe revives it here. Within `max`: the belief takes its room first.
+    pub fn ack_gossip_into(
+        &mut self,
+        prober: HostId,
+        max: usize,
+        batch: &mut Vec<(HostId, MemberState)>,
+    ) {
+        let belief = self.belief(prober);
+        self.gossip_with(max, [belief, None], batch);
+    }
+
+    /// What this member holds against `peer`: its suspicion or death, if it holds either.
+    fn belief(&self, peer: HostId) -> Option<(HostId, MemberState)> {
+        self.membership
+            .state(peer)
+            .filter(|state| state.liveness != Liveness::Alive)
+            .map(|state| (peer, state))
+    }
+
+    /// The ordinary batch in the room `entries` leave of `max`, then `entries`, in order, within
+    /// `max`. A rumor is drained only into room it is sent in, so none is counted sent that was
+    /// not; an entry that repeats a rumor of the same state is applied twice, to no effect.
+    fn gossip_with(
+        &mut self,
+        max: usize,
+        entries: [Option<(HostId, MemberState)>; 2],
+        batch: &mut Vec<(HostId, MemberState)>,
+    ) {
+        let forced = entries.iter().flatten().count();
+        self.gossip_into(max.saturating_sub(forced), batch);
+        for entry in entries.into_iter().flatten() {
+            if batch.len() < max {
+                batch.push(entry);
             }
-            batch.insert(0, (target, state));
         }
     }
 
@@ -2145,17 +2186,17 @@ mod tests {
         for at in 1..4u64 {
             for prober in 0..2 {
                 let [first, second] = &mut detectors;
-                let (prober, answering) = if prober == 0 {
-                    (first, second)
+                let (prober, answering, from) = if prober == 0 {
+                    (first, second, LOCAL)
                 } else {
-                    (second, first)
+                    (second, first, A)
                 };
                 let Some(ping) = prober.poll(at * MS, &mut requests) else {
                     continue;
                 };
                 prober.ping_gossip_into(ping.to, 10, &mut batch);
                 answering.apply_gossip(batch.iter().copied());
-                answering.gossip_into(10, &mut batch);
+                answering.ack_gossip_into(from, 10, &mut batch);
                 prober.apply_gossip(batch.iter().copied());
                 prober.on_ack(ping.to, ping.nonce, at * MS + 1);
             }
@@ -2163,6 +2204,82 @@ mod tests {
         let [x, y] = detectors;
         assert_eq!(liveness(&x, A), Liveness::Alive);
         assert_eq!(liveness(&y, LOCAL), Liveness::Alive);
+    }
+
+    /// A refutation is a rumor, and a rumor can end known to some members and not all (Demers et
+    /// al. 1987, §1.5): a member it missed holds the refuted member dead, past the record's window
+    /// forgets it, and probes it no more. The refuted member's own messages carry its state, so
+    /// the first it sends there revives it, held dead or forgotten. Without it the cluster test's
+    /// second phase waited for ever, three runs in 1,119, on a member that had forgotten a live one.
+    #[test]
+    fn a_member_a_refutation_missed_hears_it_from_the_refuted_member() {
+        let dead = MemberState {
+            liveness: Liveness::Dead,
+            incarnation: 0,
+        };
+        let mut refuted = detector(&[A, B]);
+        refuted.apply(LOCAL, dead).unwrap();
+        assert_eq!(refuted.membership().local_incarnation(), 1);
+        // The refutation's rumor is spent before it reaches A or B.
+        let mut batch = Vec::new();
+        for _ in 0..8 {
+            refuted.gossip_into(10, &mut batch);
+        }
+        assert!(batch.is_empty());
+        let mut holds_dead = Detector::new(A, Exposure::new(), room());
+        holds_dead.join(LOCAL).unwrap();
+        holds_dead.apply(LOCAL, dead).unwrap();
+        let mut forgot = Detector::new(B, Exposure::new(), room());
+        forgot.join(LOCAL).unwrap();
+        forgot.apply(LOCAL, dead).unwrap();
+        forgot.forget(LOCAL);
+        assert!(forgot.membership().state(LOCAL).is_none());
+        let alive = (
+            LOCAL,
+            MemberState {
+                liveness: Liveness::Alive,
+                incarnation: 1,
+            },
+        );
+        refuted.ping_gossip_into(A, 10, &mut batch);
+        assert!(batch.contains(&alive));
+        holds_dead.apply_gossip(batch.iter().copied());
+        assert_eq!(liveness(&holds_dead, LOCAL), Liveness::Alive, "held dead");
+        refuted.ping_gossip_into(B, 10, &mut batch);
+        forgot.apply_gossip(batch.iter().copied());
+        assert_eq!(liveness(&forgot, LOCAL), Liveness::Alive, "forgotten");
+    }
+
+    /// A member held dead at its own incarnation, which it never heard, is told so by the answer to
+    /// its probe (the buddy system, on answers as on probes, since a member does not probe the
+    /// dead): it refutes, and its next message revives it.
+    #[test]
+    fn an_answer_tells_a_member_it_is_held_dead_and_its_next_probe_revives_it() {
+        let dead = MemberState {
+            liveness: Liveness::Dead,
+            incarnation: 0,
+        };
+        let mut prober = detector(&[A]);
+        let mut holder = Detector::new(A, Exposure::new(), room());
+        holder.join(LOCAL).unwrap();
+        holder.apply(LOCAL, dead).unwrap();
+        let mut batch = Vec::new();
+        for _ in 0..8 {
+            holder.gossip_into(10, &mut batch);
+        }
+        assert!(batch.is_empty());
+        // The probe states the prober alive at the incarnation it died at: the death stands.
+        prober.ping_gossip_into(A, 10, &mut batch);
+        holder.apply_gossip(batch.iter().copied());
+        assert_eq!(liveness(&holder, LOCAL), Liveness::Dead);
+        // The answer tells it so; it refutes.
+        holder.ack_gossip_into(LOCAL, 10, &mut batch);
+        assert!(batch.contains(&(LOCAL, dead)));
+        prober.apply_gossip(batch.iter().copied());
+        assert_eq!(prober.membership().local_incarnation(), 1);
+        prober.ping_gossip_into(A, 10, &mut batch);
+        holder.apply_gossip(batch.iter().copied());
+        assert_eq!(liveness(&holder, LOCAL), Liveness::Alive);
     }
 
     #[test]

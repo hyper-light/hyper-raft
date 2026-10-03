@@ -142,7 +142,7 @@ fn exchange(members: &mut [Member], prober: usize, ping: Ping, buffers: &mut Buf
     let answering = &mut members[target].detector;
     answering.apply_gossip(gossip);
     let ack = answering.on_ping(from);
-    answering.gossip_into(buffers.gossip, &mut buffers.batch);
+    answering.ack_gossip_into(from, buffers.gossip, &mut buffers.batch);
     SwimMessage::Ack {
         from: ping.to,
         nonce,

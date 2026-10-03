@@ -86,9 +86,21 @@
    round's moving average; a received coordinate must have exactly the engine's dimensions, and one
    that is not a number is not learned.
 
+8. **Every message states its sender** (`docs/timing.md` §2.7, `docs/research/swim.md`). A
+   refutation is a rumor, sent `T` times by each member that adopts it, and a rumor can end known to
+   some members and not all (Demers et al. 1987, §1.5): in the cluster test a member it missed held
+   a live member dead, forgot it past the record's window, and was told nothing again, three runs in
+   1,119. A probe's gossip (`ping_gossip_into`) now carries the prober's own state, alive at its
+   incarnation, so a member hears a refutation it missed from the refuted member's next probe; and
+   an answer's (`ack_gossip_into`, new) carries the answering member's suspicion or death of the
+   prober (Lifeguard's buddy system, §IV-C, which slates applied to probes only), so a member held
+   dead that never heard so is told by the answer to its probe. These entries take their room
+   before the ordinary batch, which is drained only into the room left: slates drained it and then
+   dropped its least-fresh entry for the suspicion, counting a rumor sent that was not.
+
 ## Tests
 
-- 46 unit tests: slates' membership, gossip, codec and coordinate tests, the extension series and
+- 59 unit tests: slates' membership, gossip, codec and coordinate tests, the extension series and
   its bounds, the gossip queue's order, replacement and bound, and the measured timing's: nothing
   judged before the estimates exist, the deadline is `μ + α`, a silent member is suspected, told and
   condemned, an isolated member condemns nobody, an indirect answer spares, a refutation clears a
@@ -96,8 +108,9 @@
   budget is SWIM's bound and the relay count the fewest that suffice; and one for each failure the
   cluster runs found (`docs/benchmarks.md`, "The cluster test"): members holding one another dead
   heal, a lost measurement probe ends at its expected arrival, a refused reconfiguration leaves the
-  verdict in force, a re-adopted suspicion keeps its told probes, and the detection bound does not
-  shrink with the round.
+  verdict in force, a re-adopted suspicion keeps its told probes, the detection bound does not
+  shrink with the round, a member a refutation missed hears it from the refuted member, and an
+  answer tells a member it is held dead.
 - `tests/cluster.rs`: five real member processes run the detector over hyper-datagram on real
   UDP sockets, as the library configures it.
   - The supervisor starts them together, waits until every member judges every peer by a

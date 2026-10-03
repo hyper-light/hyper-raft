@@ -38,7 +38,17 @@ Detection", arXiv 1707.00788 (2018).**
   which only the suspected member raises (SWIM §4.2).
 - §III-B: memberlist "retains the state of failed nodes for a period of time, so that information
   about failed nodes can be passed in a full state sync".
-- Left open: that period, memberlist's configuration.
+- §IV-C, "Buddy System" (checked 2026-10-03): "In SWIM, a suspected member is not guaranteed to
+  hear of the suspicion at the first opportunity. A suspected node only learns of the suspicion
+  when it receives a gossiped suspect message about itself. [...] the rules governing the
+  dissemination of gossip messages include a limited number of gossip messages per piggyback,
+  limited re-sends of each gossip message, and a preference for newer gossip messages. Buddy System
+  replaces SWIM's piggyback message selector with one that prioritizes notifying a suspected member
+  of the suspicion. This guarantees that any node that pings a suspected node (either on its own
+  behalf, or for the indirect path of another node) will communicate the suspicion as part of the
+  ping."
+- Left open: that period, memberlist's configuration; how a member that holds another dead hears
+  of its refutation, under the same limits.
 
 **hashicorp/memberlist (Go source, `master` on 2026-10-02: `config.go`, `state.go`, `util.go`).**
 
@@ -82,7 +92,25 @@ for Replicated Database Maintenance", PODC 1987 (checked 2026-10-03).**
 - What it settles here: a refutation is an update like any other, and the cluster test found the
   stable state §1.5 names (`docs/benchmarks.md`, "The cluster test"): a live member's refutation
   known to every member but one, which held it dead and, past the record's window, forgot it.
-  hyper-swim has no anti-entropy yet (`docs/timing.md` §2.7, open).
+
+**Derived here (2026-10-03): a refutation a rumor missed.**
+
+- A member that holds another dead hears of its refutation only from a gossiped alive message, under
+  the limits Lifeguard §IV-C names for a suspicion; and having adopted the death, it probes the
+  member no more, so the buddy system, which rides on its probes, never reaches the refuted member
+  from it.
+- The refuted member still holds it alive and probes it every round. Its probes now carry its own
+  state, alive at its incarnation, whatever the rumor's budget: the first one revives it there, held
+  dead (a higher incarnation overrides) or forgotten (an update about a member the view does not
+  hold adds it). This is the buddy system's guarantee turned round: any node a member pings learns
+  the member's own state.
+- A member held dead at the incarnation it died at, which never heard so, refutes only once told.
+  Nobody probes the dead, so the answer to its probe carries the belief, as a probe of a suspect
+  does: it refutes, and its next probe revives it.
+- Between two members that probe each other, these two entries are Demers et al.'s anti-entropy for
+  the two states that concern them, at every exchange. Two live members that each hold the other
+  dead, both refutations missed, exchange nothing; a third member that holds both alive would need
+  to pass its view of each to the other, the full exchange memberlist runs every 30 s. Not built.
 
 **Derived here (2026-10-02): how long a dead member's record is kept, and what bounds the view.**
 

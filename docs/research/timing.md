@@ -35,7 +35,28 @@ extended in IEEE Transactions on Computers 51(5), May 2002, pp. 561–580.**
   recent heartbeats; the QoS analysis is NFD-S's with `δ = E(D) + α`, and the configurator needs
   only `p_L` and `V(D)`.
 - Left open: the window `n` ("with appropriate n, the estimates can be very accurate"), and
-  where the requirements come from ("could be given by the application").
+  where the requirements come from ("could be given by the application"); and when to reconfigure,
+  which the adaptive detector does as its estimates are recomputed, each heartbeat.
+
+**When to renew an estimate's configuration (derived here, 2026-10-02).** For an estimator that is
+a mean over a growing history (sample means, the sample variance through its squares, a count's
+posterior), the estimate over `n` observations with the one over the first `n_k` nested in it
+differs from it by `((n − n_k)/n)(x̄_new − θ̂_k)`, whose variance is `σ²(1/n_k − 1/n)` for
+observations of variance `σ²`; correlated observations multiply both this and the estimate's own
+variance `σ²/n` by the same integrated autocorrelation time (Sokal 1997, §3). The configuration made
+at `n_k` is as stale as the current estimate is uncertain when the two are equal, at `n = 2n_k`,
+whatever the distribution. For a mean over a sliding window of `n`, the estimates `m` observations
+apart share `n − m` and differ by a variance `2mσ²/n²`, equal to `σ²/n` at `m = n/2`. The variance of
+a sample variance is `(μ₄ − σ⁴)/n` (Cramér, *Mathematical Methods of Statistics*, 1946, §27.4), so
+a rule on an estimated standard error of `V̂` needs the fourth moment, which a heavy tail makes as
+uncertain as it makes `V̂`; a rule on the expected staleness needs nothing of it. hyper-swim
+(`crates/hyper-swim/src/detector.rs`, `Stream::due`) renews its verdict once a window's worth of
+round trips have come, over estimates of the whole history.
+
+**Page, "Continuous inspection schemes", Biometrika 41 (1954).** The CUSUM test for a change in a
+process's mean: the cumulative sum of deviations from a reference, a change declared at a
+threshold `h` chosen for the average run length to a false alarm. The threshold is a design choice
+the test does not give; it is not used here (`docs/timing.md` §3, item 11).
 
 **Hayashibara, Défago, Yared, Katayama, "The φ accrual failure detector", SRDS 2004.** Outputs a
 continuous suspicion level adapted to observed inter-arrival times instead of a boolean;

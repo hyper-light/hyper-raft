@@ -761,15 +761,22 @@ impl Pair {
     }
 
     /// Whether the detector is to be configured again (Chen et al.'s adaptive detector, which
-    /// reconfigures as its estimates move, §6), on a doubling schedule: never configured; at an
-    /// interval the configuration was not made for (the peer moved to the one asked); once the
-    /// heartbeats taken have doubled since the last configuration, as the history the inputs are
-    /// estimated over, and the exposure the MTBF is, have; or once `β` at the margin in force has
-    /// doubled past the configured one, the link having got worse. Each doubling halves the
-    /// estimates' remaining weight of evidence at most once, so a link is configured
-    /// `O(log heartbeats)` times, not once a window: at a window of a few heartbeats, the window's
-    /// cadence spent five times the stream's own work on the configurator
-    /// (`docs/benchmarks.md`, "hyper-liveness").
+    /// reconfigures as its estimates move, §6): never configured; at an interval the configuration
+    /// was not made for (the peer moved to the one asked); once the configuration is as stale as
+    /// the estimates are uncertain; or once `β` at the margin in force has doubled past the
+    /// configured one, the link having got worse.
+    ///
+    /// Staleness: the inputs are estimated over the link's whole history (the prediction errors'
+    /// variance, the loss, `τ_int`'s levels, the exposure the MTBF is), and an estimate over `n`
+    /// heartbeats that the one over the first `n_k` is nested in has moved since by a variance of
+    /// `σ²(1/n_k − 1/n)` (`σ²` its variance from one heartbeat, `τ_int` folded in alike), while its
+    /// own is `σ²/n`. The two meet at `n = 2·n_k`: renewed sooner, a configuration follows moves
+    /// smaller than the estimates' own error; later, it lags the evidence by more than that error.
+    /// The rule asks nothing of the delays' distribution, so a link is configured
+    /// `O(log heartbeats)` times, where the estimator's window cadence configured every few
+    /// heartbeats and spent five times the stream's own work on the configurator
+    /// (`docs/benchmarks.md`, "hyper-liveness"). The second rule's factor is not derived: a link
+    /// that changes is `docs/timing.md` §3, item 11.
     fn renewal_due(&self, beta: Option<f64>) -> bool {
         let Some(configured) = self.received.configuration else {
             return true;

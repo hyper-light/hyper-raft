@@ -3775,6 +3775,20 @@ What failed on the way, each a defect fixed at its cause:
   clocks were read monotonic first, and a preemption between the reads aged the stamp too much, so
   the echo said a heartbeat arrived before the one it echoed was sent and the bound went unstated.
   Read realtime first, a preemption makes a stamp late, never early (`docs/transport.md` §4b).
+- **A stall the device thread never took** (CI run 37087273821, ubuntu-24.04-arm: the test ran 1 h
+  45 min, four members alive, until the run was cancelled). The member's device queue had room for
+  one request, so a stall that came while a flush waited for the device thread was refused and
+  dropped: the stalled member's disk ran on, its peers trusted it, and the supervisor waited for a
+  suspicion with no end. With every wait ended on the members' law and their states dumped, the
+  test looped on that runner (each supervisor 150 rounds, the queue at one request) failed in its
+  31st round with the stalled member's disk stated refused (CI run 37094848890); with room for every
+  request ever outstanding, the one flush in flight and the stall, it passed all 150 rounds there
+  and 25 on each other target (CI run 37095270328).
+- **A port taken between two supervisors** (Linux, four CPUs: run 96 of 150). The supervisor bound
+  free ports, released them and handed them to its members; the other test's supervisor, starting
+  at once, could be given the same port, and the member that bound second died before it was ready,
+  which the old wait for readiness waited on for ever. Each member now binds its own port and the
+  supervisor hands every port out at start.
 
 ```sh
 cargo bench -p hyper-liveness --bench cost
@@ -4301,6 +4315,43 @@ python3 scripts/liveness-worlds.py mac-timer.txt mac-plain.txt mac-flush.txt mac
 # test with `--exact <test>` and HYPER_LIVENESS_SEEDS at ten and a hundred times its default;
 # HYPER_LIVENESS_SEED=<n> with HYPER_LIVENESS_SEEDS=1 reruns the seed a failure printed (its low
 # 32 bits).
+```
+
+## The renewal schedule (2026-10-02)
+
+`docs/timing.md` §2.8, "Renewal once a configuration is as stale as its estimates are uncertain".
+The heartbeat rule of `Pair::renewal_due`, the doubling, against three others in a scratch build
+that took the rule from the environment (the `β` rule the same in all): hyper-swim's, a window's
+worth of heartbeats since the last configuration; half a window, the staleness rule for an
+estimate over a sliding window; and every heartbeat, Chen, Toueg and Aguilera's continuous
+re-estimation. The simulation's `live_peers_configure_and_keep_their_allowance`, seeds 0–39 of the
+macOS world (three nodes, run until every pair is configured and through a renewal), the
+configurations counted over its pairs; then its detection tests at their gate seeds; then
+`benches/allocs.rs`, three rounds, the rules alternated in each, load average 49–53.
+
+| rule | configurations a 1,000 taken | interval moves a 1,000 taken | suspicions of live peers / allowance (40 seeds) | ns a heartbeat, 2 nodes | 4 nodes | 8 nodes | 8 nodes, 1,000 groups |
+|---|---|---|---|---|---|---|---|
+| doubling | 11.1 | 22.2 | 1,160 / 8,916 | 107–130 | 126–150 | 170–191 | 172–200 |
+| a window | 15.3 | 22.9 | 1,202 / 8,963 | 107–109 | 138–141 | 216–222 | 214–259 |
+| half a window | 23.5 | 24.4 | 1,224 / 9,072 | 155–160 | 152–155 | 210–240 | 207–247 |
+| every heartbeat | 44.9 | 27.9 | 1,235 / 8,915 | 157–166 | 164–166 | 223–260 | 236–269 |
+
+None allocates. Under every rule 96 % of the configurator's asks found the estimator without
+`τ_int` at the interval its link had just moved to and returned before the configurator ran: these
+are young links (a run ends at the first renewal past every pair's configuration), moving to the
+interval their evidence needs every 36–45 heartbeats, each move starting the evidence again, and
+the oftener rules moved them the more. The detection tests were alike under every rule: the most heartbeats a
+link took to configure 424–509, the killed node suspected by its own detector 156–164 times and by
+the node's evidence's margin 124–129, and the notices of a death in a link's first heartbeats the
+same to the millisecond but one world's most (Linux, 1,363 ms under the doubling, 3,646 ms under
+the others).
+
+```sh
+# Scratch, not committed: Pair::renewal_due's heartbeat rule read from HYPER_LIVENESS_RENEWAL
+# (doubling, window, half, every), and the live-peers test printing its configurations. Then:
+HYPER_LIVENESS_RENEWAL=<rule> HYPER_LIVENESS_SEEDS=40 <sim binary> --exact \
+    live_peers_configure_and_keep_their_allowance --nocapture
+HYPER_LIVENESS_RENEWAL=<rule> <allocs bench binary> --bench
 ```
 
 ## Simulation harnesses as they are (2026-10-02)

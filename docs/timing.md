@@ -597,14 +597,29 @@ heartbeat due; those it skipped are losses to the receiver, which they are.
   groups the pair shares), mtbf: the Jeffreys posterior over
   the node time the pairs watched and the restarts and abandoned suspicions seen, seeded with the
   fleet's history }`.
-- **Renewal on a doubling schedule.** The configurator runs when never configured, when the peer
-  moved to the interval asked, when the heartbeats taken have doubled since the last configuration
-  (the history the inputs are estimated over, and the exposure the MTBF is, doubled with them), or
-  when `β` at the margin in force has doubled past the configured one. The estimator's window
-  cadence configured every few heartbeats at short intervals and spent five times the stream's own
-  work on the configurator (`docs/benchmarks.md`, "hyper-liveness"). The allowance is kept sound
-  between configurations: each freshness point is charged `β` at the margin in force from the
-  estimates as they stand, not as the configuration assumed.
+- **Renewal once a configuration is as stale as its estimates are uncertain.** The configurator
+  runs when never configured, when the peer moved to the interval asked, when the heartbeats taken
+  have doubled since the last configuration, or when `β` at the margin in force has doubled past
+  the configured one. The doubling is derived, not picked: every input is estimated over the link's
+  whole history (the prediction errors' variance, the loss and its unseen term, `τ_int`'s levels,
+  the exposure the MTBF is), and an estimate over `n` heartbeats, with the one over the first `n_k`
+  nested in it, has moved since by a variance `σ²(1/n_k − 1/n)` while its own variance is `σ²/n`
+  (`σ²` per heartbeat, `τ_int` the same factor in both). The two meet at `n = 2n_k`. Renewed sooner,
+  a configuration follows moves smaller than the estimates' own error; later, it lags the evidence
+  by more than that error. The rule asks nothing of the delays' distribution, which a heavy tail
+  makes hard to estimate (a rule on an estimated standard error would need the errors' fourth
+  moment). Measured against the alternatives (`docs/benchmarks.md`, "The renewal schedule"):
+  hyper-swim's once a window, half a window (the same rule for an estimate over a sliding window,
+  where the move after `m` new heartbeats has variance `2mσ²/n²` against `σ²/n`, `m = n/2`), and
+  Chen, Toueg and Aguilera's continuous re-estimation (§6), every heartbeat. In the simulation's
+  macOS world they configured 15, 24 and 45 times a thousand heartbeats against the doubling's
+  11 and moved the link's interval 23, 24 and 28 times against its 22, each move restarting the
+  evidence at the new interval; they cost up to half again a heartbeat, allocated nothing either
+  way, and detected and erred alike (suspicions of live peers 1,160 to 1,235 against allowances of
+  8,915 to 9,072 over 40 seeds; every detection test the same). The second rule's
+  factor is not derived; a link that changes, which it stands for, is §3 item 11. The allowance is
+  kept sound between configurations as far as the estimates are: each freshness point is charged
+  `β` at the margin in force from the estimates as they stand, not as the configuration assumed.
 - **The echo** (RFC 5905 §8's on-wire round trip; RFC 3550 §6.4.1's LSR and DLSR). Each heartbeat
   echoes the latest heartbeat its sender had from the receiver: that one's send time and lateness on
   the receiver's clock, and the hold since its arrival. The receiver gets the network round trip on
@@ -816,7 +831,15 @@ monotonic clock, which the processes share; then one is SIGKILLed and every surv
 live members keep the allowance. A second group of three kills a member as soon as it has heard
 every peer and sent to each, and each survivor suspects it no later than its first poll past its
 freshness point (plus the latest lateness of its wakes) and the state line in which it stated its
-live link configured. The test derives nothing; it waits on facts.
+live link configured. The test derives nothing; it waits on facts, each for as long as the members
+move toward it: a quiet period derived from their states (their pairs' `η + α` or intervals, their
+longest flush, their wakes' lateness, their reporting period) that passes with nothing moving fails
+the wait with every member's last state. Without that end, a stall the stalled member's device
+thread never took (its queue held a flush and refused the stall) left its peers trusting it and the
+supervisor waiting: 1 h 45 min on CI's ubuntu-24.04-arm before it was cancelled. The test looped on
+that runner reproduced it in its 31st round, the dump naming the refused stall; the queue now has
+room for every request ever outstanding, and each member binds its own port (a port picked and
+released for it was taken by the other test's member as both started).
 
 ### 2.9 Elections by suspicion in the core (L-2, as built)
 
@@ -1134,6 +1157,33 @@ and election law; the remaining items keep their numbers, and item 10 is what L-
   for a pair far from the node's other peers until that pair configures (the young link's own
   errors widen the margin as they come, but a peer that dies first has shown few), and while a
   history is young the allowance is loose (item 3).
+
+- **11. A link that changes.** Every estimate the configurator reads is over the link's whole
+  history, which is what makes the doubling the right renewal (§2.8) and its configurations few.
+  It is also what makes a link that changes slow to be followed: once `V` has a history of `n`
+  heartbeats, a regime of `V' = rV` from heartbeat `n_c` on moves it to
+  `(n_c V + (n − n_c)V')/n`, so the change counts fully only once the new regime is most of the
+  history, and the doubling's renewals grow as far apart as the history is long. Between them the
+  allowance is charged `β` from the same estimates, so on a link that got worse it understates the
+  bound the new regime would give, and the mistakes counted against it are the new regime's. The
+  `β`-doubled rule stands for this case today, with a factor no rule gives: `V̂`'s relative standard
+  error is `√((κ − 1)τ_int/n)` for errors of kurtosis `κ`, so at `n = 1,000` independent heartbeats
+  a doubling of `V` is 1.7 standard errors for delays of the kurtosis the 1 ms macOS trace measured
+  (357, its freezes) and 22 for Gaussian ones.
+  What the literature does: Chen, Toueg and Aguilera re-estimate `p_L` and `V(D)` from the `n`
+  most recent heartbeats and leave `n` open (`docs/research/timing.md`); the estimator's own
+  Allan levels measure the horizon past which averaging stops helping (`n_A`, §2.6), the
+  stationarity horizon such an `n` would be; and the staleness rule above, for an estimate over a
+  sliding window of `n`, renews every `n/2` heartbeats. A change-point test on the prediction
+  errors (Page's CUSUM, Biometrika 41, 1954) would need a stated average run length, a picked
+  number. The design to build and measure: estimate `V` and the loss over a sliding window of the
+  Allan horizon (a second ring beside the offsets', bounded by the same drift bound), renew every
+  half window by the staleness rule, and drop the `β` rule, which the window's renewals subsume;
+  measured in the simulation on worlds that change (a host whose freezes begin after its links
+  configure, a path whose delays step), for the mistakes against the allowance, the detection and
+  the cost, against the history estimate. hyper-swim's verdict, renewed once a window over
+  estimates of the whole history, renews oftener than the staleness rule asks and is as slow to
+  follow a change; the same design serves it.
 
 ## 4. Steps
 

@@ -2,7 +2,8 @@
 //! [`Detector`](crate::detector::Detector)'s [`Ping`](crate::detector::Ping),
 //! [`Ack`](crate::detector::Ack) and [`PingReq`](crate::detector::PingReq) can ride the fleet
 //! transport, each piggybacking a bounded batch of gossiped membership updates (SWIM's infection-style
-//! dissemination shares the probe traffic). The live driver that sends these over authenticated
+//! dissemination shares the probe traffic), and the chunks of a member's view its anti-entropy
+//! exchanges ([`SwimMessage::Sync`]). The live driver that sends these over authenticated
 //! sessions and feeds replies back into the detector is composed on top; this module is the pure codec.
 //!
 //! An acknowledgement also carries the sender's Vivaldi network coordinate ([`crate::coordinates`]), so
@@ -16,15 +17,14 @@
 //!
 //! Every decode is a parser of external bytes, so it checks the whole message's shape before it
 //! hands anything out and rejects a truncated header, an unknown tag, an unknown liveness byte, a gossip
-//! count that does not match the bytes that arrived, or a coordinate declaring more dimensions than the
-//! decoder accepts — a hostile datagram is a typed [`SwimWireError`], never a panic or an
-//! over-allocation. The encoding is little-endian throughout (floats as their bit pattern) so two hosts
+//! count that does not match the bytes that arrived, or a coordinate of other dimensions than the
+//! engine's — a hostile datagram is a typed [`SwimWireError`], never a panic or an over-allocation. The encoding is little-endian throughout (floats as their bit pattern) so two hosts
 //! encode a message identically.
 
 use std::mem::size_of;
 
 use crate::HostId;
-use crate::coordinates::NetworkCoordinate;
+use crate::coordinates::{DIMENSIONS, NetworkCoordinate};
 use crate::membership::{Liveness, MemberState};
 
 /// A SWIM message on the wire: a probe, its acknowledgement, or an indirect-probe request, each naming
@@ -113,6 +113,26 @@ pub enum SwimMessage<'a> {
         /// The membership updates piggybacked on this answer.
         gossip: GossipBatch<'a>,
     },
+    /// Anti-entropy (Demers et al. 1987, §1.3 and §1.5): the digest of `from`'s view, and a chunk
+    /// of the view itself, members it holds, alive, suspected or dead within their records'
+    /// windows, each with its state, as gossip entries are. An exchange opens with the digest alone
+    /// and a pull; a partner whose digest differs answers with its whole view, chunk by chunk, its
+    /// first chunk asking a pull, and the opener answers that with its own
+    /// ([`Detector::sync_into`](crate::detector::Detector::sync_into)).
+    Sync {
+        /// The member whose view this is.
+        from: HostId,
+        /// The sender's daemon boot_nonce, its identity announcement, as every message it originates
+        /// makes.
+        boot_nonce: u64,
+        /// The digest of the sender's whole view when it sent this
+        /// ([`Membership::digest`](crate::membership::Membership::digest)).
+        digest: u64,
+        /// Whether the sender asks the receiver's view in return.
+        pull: bool,
+        /// The members of the sender's view this chunk carries, in id order; none in an opening.
+        gossip: GossipBatch<'a>,
+    },
 }
 
 /// A refusal to decode a SWIM message from received bytes (the closed hostile-input taxonomy).
@@ -133,13 +153,18 @@ pub enum SwimWireError {
     /// The declared gossip-entry count does not match the number of bytes that followed — a truncated or
     /// over-long batch (the check that bounds allocation to what actually arrived).
     GossipLengthMismatch,
-    /// An acknowledgement's network coordinate was malformed: too many dimensions (a hostile
-    /// over-allocation), or a byte length that does not match the declared dimensions.
+    /// An acknowledgement's network coordinate was malformed: other dimensions than the engine's
+    /// ([`DIMENSIONS`]), or a byte length that does not match them.
     MalformedCoordinate,
     /// An acknowledgement's standing presence byte is neither absent nor present.
     UnknownPresence {
         /// The presence byte that arrived.
         presence: u8,
+    },
+    /// A view chunk's pull byte is neither asked nor not.
+    UnknownPull {
+        /// The pull byte that arrived.
+        pull: u8,
     },
 }
 
@@ -151,6 +176,13 @@ const TAG_ACK: u8 = 2;
 const TAG_PING_REQ: u8 = 3;
 /// Format: an indirect acknowledgement's tag.
 const TAG_INDIRECT_ACK: u8 = 4;
+/// Format: a view chunk's tag.
+const TAG_SYNC: u8 = 5;
+
+/// Format: a view chunk's pull is one byte; a chunk that asks no view in return.
+const PULL_NONE: u8 = 0;
+/// Format: the pull byte of a chunk that asks the receiver's view in return.
+const PULL_ASKED: u8 = 1;
 
 /// Format: an acknowledgement's standing is one presence byte, then the eight-byte version when present.
 const STANDING_ABSENT: u8 = 0;
@@ -266,40 +298,32 @@ pub enum Coordinate<'a> {
 }
 
 impl Coordinate<'_> {
-    /// Writes the coordinate into `into`, reusing its vector.
-    pub fn write_into(&self, into: &mut NetworkCoordinate) {
+    /// The coordinate as a value of its own. A received one's bits are as they arrived: whether
+    /// it can be used is [`NetworkCoordinate::is_usable`]'s to say.
+    pub fn to_coordinate(&self) -> NetworkCoordinate {
         match *self {
-            Coordinate::Held(held) => into.clone_from(held),
+            Coordinate::Held(held) => *held,
             Coordinate::Wire(WireCoordinate(bytes)) => {
-                let (dimensions, mut rest) = wire_dimensions(bytes);
-                into.vec.clear();
-                for _ in 0..dimensions {
-                    let Some((component, tail)) = take_f64(rest) else {
-                        break;
-                    };
-                    into.vec.push(component);
+                // The decoder checked the count and the length, so every scalar reads.
+                let mut rest = bytes.get(GOSSIP_COUNT_BYTES..).unwrap_or(&[]);
+                let mut next = || {
+                    let (value, tail) = take_f64(rest).unwrap_or((0.0, &[]));
                     rest = tail;
+                    value
+                };
+                let mut position = [0.0; DIMENSIONS];
+                for component in &mut position {
+                    *component = next();
                 }
-                let mut scalars = [0.0; COORDINATE_SCALARS];
-                for scalar in &mut scalars {
-                    if let Some((value, tail)) = take_f64(rest) {
-                        *scalar = value;
-                        rest = tail;
-                    }
+                let height = next();
+                let error = next();
+                NetworkCoordinate {
+                    position,
+                    height,
+                    error,
                 }
-                let [height, adjustment, error] = scalars;
-                into.height = height;
-                into.adjustment = adjustment;
-                into.error = error;
             }
         }
-    }
-
-    /// The coordinate as a value of its own.
-    pub fn to_coordinate(&self) -> NetworkCoordinate {
-        let mut coordinate = NetworkCoordinate::origin(0);
-        self.write_into(&mut coordinate);
-        coordinate
     }
 }
 
@@ -310,18 +334,6 @@ impl PartialEq for Coordinate<'_> {
     }
 }
 
-/// A received coordinate's declared dimensions and the bytes after the count. The decoder has checked
-/// the count, so a received coordinate always has one.
-fn wire_dimensions(bytes: &[u8]) -> (usize, &[u8]) {
-    match bytes.split_first_chunk::<GOSSIP_COUNT_BYTES>() {
-        Some((count, rest)) => (
-            usize::try_from(u32::from_le_bytes(*count)).unwrap_or(0),
-            rest,
-        ),
-        None => (0, &[]),
-    }
-}
-
 impl<'a> SwimMessage<'a> {
     /// The sender named in the message (`from`).
     pub fn from(&self) -> HostId {
@@ -329,7 +341,8 @@ impl<'a> SwimMessage<'a> {
             SwimMessage::Ping { from, .. }
             | SwimMessage::Ack { from, .. }
             | SwimMessage::PingReq { from, .. }
-            | SwimMessage::IndirectAck { from, .. } => *from,
+            | SwimMessage::IndirectAck { from, .. }
+            | SwimMessage::Sync { from, .. } => *from,
         }
     }
 
@@ -339,7 +352,8 @@ impl<'a> SwimMessage<'a> {
             SwimMessage::Ping { gossip, .. }
             | SwimMessage::Ack { gossip, .. }
             | SwimMessage::PingReq { gossip, .. }
-            | SwimMessage::IndirectAck { gossip, .. } => gossip,
+            | SwimMessage::IndirectAck { gossip, .. }
+            | SwimMessage::Sync { gossip, .. } => gossip,
         }
     }
 
@@ -349,7 +363,8 @@ impl<'a> SwimMessage<'a> {
             SwimMessage::Ack { coordinate, .. } => Some(coordinate),
             SwimMessage::Ping { .. }
             | SwimMessage::PingReq { .. }
-            | SwimMessage::IndirectAck { .. } => None,
+            | SwimMessage::IndirectAck { .. }
+            | SwimMessage::Sync { .. } => None,
         }
     }
 
@@ -363,6 +378,7 @@ impl<'a> SwimMessage<'a> {
             | SwimMessage::Ack { nonce, .. }
             | SwimMessage::PingReq { nonce, .. }
             | SwimMessage::IndirectAck { nonce, .. } => Some(*nonce),
+            SwimMessage::Sync { .. } => None,
         }
     }
 
@@ -374,7 +390,8 @@ impl<'a> SwimMessage<'a> {
         match self {
             SwimMessage::Ping { boot_nonce, .. }
             | SwimMessage::Ack { boot_nonce, .. }
-            | SwimMessage::IndirectAck { boot_nonce, .. } => Some(*boot_nonce),
+            | SwimMessage::IndirectAck { boot_nonce, .. }
+            | SwimMessage::Sync { boot_nonce, .. } => Some(*boot_nonce),
             SwimMessage::PingReq { .. } => None,
         }
     }
@@ -392,7 +409,9 @@ impl<'a> SwimMessage<'a> {
                 configuration_version,
                 ..
             } => Some(*configuration_version),
-            SwimMessage::PingReq { .. } | SwimMessage::IndirectAck { .. } => None,
+            SwimMessage::PingReq { .. }
+            | SwimMessage::IndirectAck { .. }
+            | SwimMessage::Sync { .. } => None,
         }
     }
 
@@ -404,7 +423,7 @@ impl<'a> SwimMessage<'a> {
             SwimMessage::PingReq { target, .. } | SwimMessage::IndirectAck { target, .. } => {
                 Some(*target)
             }
-            SwimMessage::Ping { .. } | SwimMessage::Ack { .. } => None,
+            SwimMessage::Ping { .. } | SwimMessage::Ack { .. } | SwimMessage::Sync { .. } => None,
         }
     }
 
@@ -480,6 +499,20 @@ impl<'a> SwimMessage<'a> {
                 out.extend_from_slice(&boot_nonce.to_le_bytes());
                 encode_gossip(out, *gossip);
             }
+            SwimMessage::Sync {
+                from,
+                boot_nonce,
+                digest,
+                pull,
+                gossip,
+            } => {
+                out.push(TAG_SYNC);
+                out.extend_from_slice(&from.0.to_le_bytes());
+                out.extend_from_slice(&boot_nonce.to_le_bytes());
+                out.extend_from_slice(&digest.to_le_bytes());
+                out.push(if *pull { PULL_ASKED } else { PULL_NONE });
+                encode_gossip(out, *gossip);
+            }
         }
     }
 
@@ -552,6 +585,28 @@ impl<'a> SwimMessage<'a> {
                     target,
                     nonce,
                     boot_nonce,
+                    gossip,
+                })
+            }
+            TAG_SYNC => {
+                let (from, rest) = take_host(rest)?;
+                let (boot_nonce, rest) = take_word(rest)?;
+                let (digest, rest) = take_word(rest)?;
+                let (&pull, rest) = rest.split_first().ok_or(SwimWireError::Truncated)?;
+                let pull = match pull {
+                    PULL_NONE => false,
+                    PULL_ASKED => true,
+                    pull => return Err(SwimWireError::UnknownPull { pull }),
+                };
+                let (gossip, leftover) = decode_gossip(rest)?;
+                if !leftover.is_empty() {
+                    return Err(SwimWireError::GossipLengthMismatch);
+                }
+                Ok(SwimMessage::Sync {
+                    from,
+                    boot_nonce,
+                    digest,
+                    pull,
                     gossip,
                 })
             }
@@ -652,18 +707,16 @@ fn read_entry(entry: &[u8]) -> Result<(HostId, MemberState), SwimWireError> {
     ))
 }
 
-/// Format: one coordinate component (and the height, adjustment and error) is a little-endian `f64`
-/// stored as its bit pattern.
+/// Format: one coordinate component (and the height and error) is a little-endian `f64` stored as its
+/// bit pattern.
 const F64_BYTES: usize = size_of::<u64>();
-/// Format: the coordinate is a `u32` dimension count, that many `f64` vector components, then the
-/// height, adjustment and error `f64`s.
-const COORDINATE_SCALARS: usize = 3;
-/// Shape: the largest coordinate dimension a decoder will accept before allocating — a hostile datagram
-/// cannot force an unbounded vector. Far above any sensible Vivaldi dimension (the engine uses eight).
-const MAX_COORDINATE_DIMS: usize = 64;
+/// Format: the coordinate is a `u32` dimension count, that many `f64` components of the point, then
+/// the height and error `f64`s.
+const COORDINATE_SCALARS: usize = 2;
 
-/// Appends a network coordinate: the u32 dimension count, each vector component, then height, adjustment
-/// and error — every scalar a little-endian `f64` bit pattern. A received coordinate is its bytes.
+/// Appends a network coordinate: the u32 dimension count, each component of the point, then the
+/// height and error — every scalar a little-endian `f64` bit pattern. A received coordinate is its
+/// bytes.
 fn encode_coordinate(out: &mut Vec<u8>, coordinate: Coordinate<'_>) {
     let coordinate = match coordinate {
         Coordinate::Held(held) => held,
@@ -672,23 +725,18 @@ fn encode_coordinate(out: &mut Vec<u8>, coordinate: Coordinate<'_>) {
             return;
         }
     };
-    let dims = u32::try_from(coordinate.vec.len()).unwrap_or(u32::MAX);
+    let dims = u32::try_from(DIMENSIONS).unwrap_or(u32::MAX);
     out.extend_from_slice(&dims.to_le_bytes());
-    for component in coordinate
-        .vec
-        .iter()
-        .take(usize::try_from(dims).unwrap_or(usize::MAX))
-    {
+    for component in coordinate.position {
         out.extend_from_slice(&component.to_bits().to_le_bytes());
     }
     out.extend_from_slice(&coordinate.height.to_bits().to_le_bytes());
-    out.extend_from_slice(&coordinate.adjustment.to_bits().to_le_bytes());
     out.extend_from_slice(&coordinate.error.to_bits().to_le_bytes());
 }
 
-/// Decodes a network coordinate from `bytes`, which must be exactly the coordinate — the dimension count
-/// is bounded by [`MAX_COORDINATE_DIMS`], and the byte length must match the declared dimensions plus
-/// the three scalars.
+/// Decodes a network coordinate from `bytes`, which must be exactly the coordinate: a dimension count
+/// equal to the engine's ([`DIMENSIONS`]), whose space the coordinate has to be in to mean anything,
+/// and that many components and the two scalars.
 fn decode_coordinate(bytes: &[u8]) -> Result<Coordinate<'_>, SwimWireError> {
     if bytes.len() < GOSSIP_COUNT_BYTES {
         return Err(SwimWireError::Truncated);
@@ -696,11 +744,10 @@ fn decode_coordinate(bytes: &[u8]) -> Result<Coordinate<'_>, SwimWireError> {
     let (dims_bytes, rest) = bytes.split_at(GOSSIP_COUNT_BYTES);
     let mut dims_word = [0u8; GOSSIP_COUNT_BYTES];
     dims_word.copy_from_slice(dims_bytes);
-    let dims = usize::try_from(u32::from_le_bytes(dims_word)).unwrap_or(usize::MAX);
-    if dims > MAX_COORDINATE_DIMS {
+    if usize::try_from(u32::from_le_bytes(dims_word)).ok() != Some(DIMENSIONS) {
         return Err(SwimWireError::MalformedCoordinate);
     }
-    let wanted = dims
+    let wanted = DIMENSIONS
         .checked_add(COORDINATE_SCALARS)
         .and_then(|scalars| scalars.checked_mul(F64_BYTES))
         .ok_or(SwimWireError::MalformedCoordinate)?;
@@ -741,8 +788,6 @@ fn liveness_from_byte(byte: u8) -> Result<Liveness, SwimWireError> {
     }
 }
 
-/// Format: the probe's request **kind** (the low bits of each exchange's fresh stream id); a probe session
-/// carries only probes, so the value is a label, not a tunable. Probes ride the `Control` class.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -782,15 +827,14 @@ mod tests {
 
     fn sample_coordinate() -> NetworkCoordinate {
         NetworkCoordinate {
-            vec: vec![1.5, -2.0, 0.0],
+            position: [1.5, -2.0],
             height: 3.25,
-            adjustment: -0.5,
             error: 0.75,
         }
     }
 
-    /// An acknowledgement's coordinate round-trips, and a coordinate declaring more dimensions than the
-    /// decoder accepts is refused before allocating.
+    /// An acknowledgement's coordinate round-trips, and a coordinate of other dimensions than the
+    /// engine's is refused.
     #[test]
     fn a_coordinate_round_trips_and_a_huge_one_is_refused() {
         let coordinate = sample_coordinate();
@@ -817,11 +861,24 @@ mod tests {
         hostile.extend_from_slice(&0u64.to_le_bytes()); // configuration_version
         hostile.push(STANDING_ABSENT); // no standing
         hostile.extend_from_slice(&0u32.to_le_bytes()); // empty gossip
+        let bare = hostile.clone();
         hostile.extend_from_slice(&u32::MAX.to_le_bytes()); // coordinate dims = huge
         assert_eq!(
             SwimMessage::decode(&hostile),
             Err(SwimWireError::MalformedCoordinate),
-            "an over-large coordinate is refused before allocating"
+            "an over-large coordinate is refused"
+        );
+        // One more dimension than the engine's, with the bytes to back it, is refused all the same:
+        // a point of another space means nothing in this one.
+        let mut wider = bare;
+        let dims = u32::try_from(DIMENSIONS + 1).unwrap();
+        wider.extend_from_slice(&dims.to_le_bytes());
+        for _ in 0..DIMENSIONS + 1 + COORDINATE_SCALARS {
+            wider.extend_from_slice(&1.0f64.to_bits().to_le_bytes());
+        }
+        assert_eq!(
+            SwimMessage::decode(&wider),
+            Err(SwimWireError::MalformedCoordinate)
         );
     }
 
@@ -938,6 +995,55 @@ mod tests {
             Ok(message),
             "and decodes back"
         );
+    }
+
+    /// A view chunk's encoding is fixed and little-endian, a golden vector pins it (host 2 at daemon
+    /// boot_nonce 7, view digest 11, asking a pull, carrying host 3 suspected at incarnation 1); a
+    /// pull byte that is neither is refused, and a chunk cut inside its header is truncated.
+    #[test]
+    fn sync_has_a_golden_encoding() {
+        let entries = [(
+            HostId(3),
+            MemberState {
+                liveness: Liveness::Suspect,
+                incarnation: 1,
+            },
+        )];
+        let message = SwimMessage::Sync {
+            from: HostId(2),
+            boot_nonce: 7,
+            digest: 11,
+            pull: true,
+            gossip: GossipBatch::Entries(&entries),
+        };
+        let mut expected = vec![TAG_SYNC];
+        expected.extend_from_slice(&2u64.to_le_bytes()); // from = 2
+        expected.extend_from_slice(&7u64.to_le_bytes()); // boot_nonce = 7
+        expected.extend_from_slice(&11u64.to_le_bytes()); // digest = 11
+        expected.push(PULL_ASKED); // pull
+        expected.extend_from_slice(&1u32.to_le_bytes()); // gossip count = 1
+        expected.extend_from_slice(&3u64.to_le_bytes()); // host 3
+        expected.push(LIVENESS_SUSPECT);
+        expected.extend_from_slice(&1u64.to_le_bytes()); // incarnation 1
+        assert_eq!(message.encoded(), expected, "the byte layout is fixed");
+        assert_eq!(
+            SwimMessage::decode(&expected),
+            Ok(message),
+            "and decodes back"
+        );
+        let pull = 1 + 3 * size_of::<u64>();
+        let mut bad = expected.clone();
+        bad[pull] = 2;
+        assert_eq!(
+            SwimMessage::decode(&bad),
+            Err(SwimWireError::UnknownPull { pull: 2 })
+        );
+        for cut in 1..=pull {
+            assert_eq!(
+                SwimMessage::decode(&expected[..cut]),
+                Err(SwimWireError::Truncated)
+            );
+        }
     }
 
     /// A ping-request and an indirect acknowledgement cut short anywhere inside their fixed header — after

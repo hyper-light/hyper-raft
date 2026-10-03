@@ -389,6 +389,31 @@ often than the direct probe did. A relayed probe is two round trips, so with the
 one fails with `1 − (1 − p)²`, and `k` relays are asked where `(1 − (1 − p)²)^k ≤ p` (two for any
 loss below 0.38, where `p(2 − p)² ≤ 1`), nearest the target in Vivaldi coordinates.
 
+**The coordinates** (`crates/hyper-swim/src/coordinates.rs`, `docs/research/swim.md`) rank those
+relays: the predicted round trip between two peers is the distance between their learned coordinates.
+The engine is Dabek, Cox, Kaashoek and Morris's (SIGCOMM 2004) as the paper gives it: Fig. 3's update
+whole, `w = e_i/(e_i + e_j)`, the sample's relative error `|‖x_i − x_j‖ − rtt|/rtt`, the error a
+moving average of those with weight `c_e·w`, and the step `c_c·w` along the unit vector, in §5.4's
+height vectors, two dimensions and a height, the height moving inside the step. `c_c = 0.25` is
+§4.1's. `c_e`, which neither Dabek nor Ledlie, Gardner and Seltzer give, is `2/(m + 1)`: the estimate
+tracks the node's error over its links, which SWIM samples once each a round of `m` probes, and that
+weight's moving average has the variance of an `m`-sample mean. The engine it replaced (hyperscale's,
+copied) folded the error in seconds into an estimate documented and floored as a relative one, so on a
+LAN every node's error sat at its floor of 0.05, 50 ms, and the confidence weights did nothing; it had
+eight dimensions against §5.2's finding that extra dimensions past three add nothing, a separate share
+of each step for the height, an adjustment term with its smoothing and an uncommented ±1 s clamp, and a
+gravity that multiplied every coordinate by 0.99 an update. There is no gravity: Ledlie's
+`G = (‖x_i‖/ρ)² × u(x_i)` is a dimensionless magnitude applied as a displacement in milliseconds, the
+unit its paper measured in, so no `ρ`, derived from a measured diameter or otherwise, makes it
+unit-free; and drift, a rigid motion of every coordinate, leaves every prediction between coordinates
+refreshed each round unchanged, which are the only predictions the engine makes. A sample's error is
+floored at the nanosecond a round trip is measured in, which keeps the estimate positive, and a height
+at it, which keeps the height positive (§5.4). Two fresh nodes at the origin separate along `u(0)`,
+drawn at random from each node's own seeded stream. A peer's coordinate that is not a number, or has
+a negative height or error, is not learned and moves nothing, and a sample that would leave the
+coordinate infinite or not a number (a peer's point so far out that the distance overflows) is not
+taken.
+
 **Death.** A suspected peer is told by the member's next probe of it, which carries the suspicion
 (Lifeguard's buddy system); if that probe too goes unanswered, the peer is condemned at the next
 answer the member has from another member. Lifeguard found that "an episode of slow message
@@ -429,7 +454,15 @@ answer from another member (four Linux runs in four hundred under a CPU throttle
 probes missed too); periods already ended only (seven runs in three hundred at one CPU, where a
 throttle's freeze of some 40 ms was inside the period still running when the death was noted); and
 the current round's size for `m` (a member that had condemned another, falsely, under the throttle
-ran rounds of one, while the victim's last probe had been in a round of three).
+ran rounds of one, while the victim's last probe had been in a round of three). The member states
+the bound only while every probe it makes is judged, by its pair's verdict or the pool's: an
+unjudged probe that goes unanswered suspects nobody, so before then the member detects nothing by
+its own probes, and a death it holds is another member's condemnation, adopted on that member's
+timeline. Stating its own bound for one was the last form to fail: with the directed gossip below,
+three runs in 2,000 noted a death 0.2 to 2.2 ms past a bound of 2.3 to 3.3 ms, and a build that kept
+a ring of each member's probes, answers and views, dumped at the overshoot, showed why: a live
+member falsely condemned in the run's first milliseconds, adopted by gossip at a member whose probes
+were still measurement only (`a_member_that_judges_nothing_states_no_bound`).
 
 **Before a pair can be judged.** A pair's estimator refuses until it has two prediction errors and a
 measured `τ_int` (`Refusal::TooFewHeartbeats`, `CorrelationUnmeasured`). Until then its probes are
@@ -444,7 +477,16 @@ first form, which dropped the verdict then, left a probe of a crashed member unj
 in three hundred at one CPU). While the pool refuses too, nothing is judged: a probe is measurement
 only, and its period ends when it is answered or at its expected arrival from the latest round trip
 (NFD-E over a window of one), whichever is first. Unanswered then, it is a loss to the estimators
-unless its answer comes later; it judges nothing, and its wake measures `G`. The very first probe,
+unless its answer comes later; it judges nothing, and its wake measures `G`. Each measurement period
+that ends unanswered doubles the next one's wait, as a retransmission timer backs off (RFC 6298
+§5.5), up to the 60 s at which §2.5 lets the doubling be capped, and a measured round trip ends the
+backing off. An answer is measured only while its probe is outstanding, the latest three of its
+peer's; without the backing off, round trips that lengthened past that, under load, came each for a
+probe written over, none was measured, the latest round trip never lengthened, and the member probed
+on at the stale pace with nothing judged, slow to answer the others, who condemned it: a member
+43,557 periods into a cluster run, condemned 95 times
+(`measurement_periods_follow_round_trips_that_lengthen`, which reproduces it in the detector alone,
+taking no round trip in 2,000 periods without it). The very first probe,
 before any round trip, waits on an answer or another member. An earlier rule ended an unanswered
 measurement period only when another member was next heard from, assuming no time at all; in Linux
 at two CPUs with four busy loops, a throttled container dropped a burst of datagrams, every member's
@@ -468,7 +510,8 @@ whole periods are gone.
 members, 6 at 256. With two members every message reaches the only other one. The logarithm is
 computed in fixed point, so every host gets the same budget. A message carries the gossip that fits
 its datagram beside the largest message, an acknowledgement with its coordinate
-(`codec::gossip_capacity`): 60 entries at QUIC's 1,200-byte minimum.
+(`codec::gossip_capacity`): 63 entries at QUIC's 1,200-byte minimum (60 while the coordinate carried
+eight dimensions and an adjustment).
 
 **Memory.** Each peer's estimator holds a ring of `G/(PHI·η) − 1` sums at the pair's interval `η =
 m·T̄` (§2.6, the drift bound), so a member's rings together hold about `G/(PHI·T̄)` whatever its
@@ -476,32 +519,175 @@ membership, and the pool as many again: at most `2/PHI` slots (1.1 MB) when `T̄
 `G`. Each estimator is boxed, so the fields a period reads stay together. A period allocates nothing
 once each peer has answered once (`docs/benchmarks.md`, "hyper-swim").
 
-**What the cluster test asserts** (`crates/hyper-swim/tests/cluster.rs`, §2.5). Four member
-processes run the detector as the library configures it. The supervisor waits on facts: every member
-judging every peer by a configured verdict (the pair's own, or the pool's while the pair's estimator
-refuses), then it kills one; every survivor holds it dead, each within the bound its detector
-stated, measured on the member's clock from the victim's last answer. Waiting for every pair's own
-estimator was not a fact to wait on: under a CPU throttle a pair's round trips can stay too
-correlated for `τ_int` to be measured, and the estimator rightly refuses for as long as that lasts.
-Of live members it asserts what the configuration promises: Theorem 7 bounds the expected number of
-suspicions and of condemnations by `Σβ`, and a run refutes that only when the 95 % lower limit of
-its count (the Poisson score interval, as the replay and the trace analyser use, §2.6) passes it. A
-first form asserted the count itself within `Σβ`, which no detector can promise of one run: at an
-allowance of 1.8, two mistakes are ordinary, and twelve runs in a hundred at one CPU failed so while
-the series as a whole kept far inside its bound. The rule itself refutes a bound that holds with
-probability at most 2.5 % an assertion, under the Poisson model the replay uses; on unloaded hosts
-the runs' counts are far below their allowance and it does not arise. A member whose supervisor is
-gone ends when its report cannot be written.
+**The view's bound, and the dead forgotten** (`docs/research/swim.md`). The view held every member
+gossip named and never forgot one: a fleet's churn and any peer's gossip grew every member's view,
+its peers' estimators, coordinates and gossip reports without bound. Now:
+- the view holds at most the members the owner's placement says this node can know, itself
+  included (`Detector::new`'s `members`), and refuses an update about one more, typed (`Full`) and
+  counted (`Detector::refused`); every map keyed by a member holds only members the view holds;
+- a dead member's record is kept while gossip of it from before its death can still arrive, and then
+  forgotten with everything held of it. That gossip, at an incarnation at or below the death's, would
+  otherwise add the member back: probed, suspected and condemned again, and passed to members that
+  forgot it too. A report from before the death survives only at members the death has not reached,
+  one pending report a member being replaced by the death; by SWIM §4.1 the death reaches all but
+  `n^{−((2−4/n)λ−2)}` in expectation, below one, within `λ ln n` periods of its first adoption, and an
+  earlier report's own epidemic ends within as many of its start. So the record is kept the
+  dissemination budget `T` (the largest this member's reports have had) times the longest a period of
+  this member lasts, the period the detection bound uses, past this member's adoption: a peer slowed
+  by its own host is slow in this member's round trips to it too, which that period covers. What is
+  left is the expected straggler fraction: a straggler's stale update adds the member back, and this
+  member's own probes condemn it again within its bound. memberlist keeps a dead node 30 s, a chosen
+  number, and adds any node an alive message names;
+- a record past its window makes room for a newcomer at once; a member with nobody alive or suspected
+  left keeps its dead, which are the members it probes;
+- a death of a member the view does not hold changes nothing: there is no state of it to override.
+  With anti-entropy (below) the rule is needed: a member past its window took a death back from one
+  still inside its own as a newcomer's, restarting its window, and pushed it on in turn, so a record
+  went round the members for as long as any held it, as Demers et al.'s death certificates do when
+  each site's threshold starts at its own receipt (§2); a certificate older than the time to reach
+  every site is one whose obsolete copies are unlikely anywhere (§2.1), which is the window's
+  premise (`an_exchange_does_not_bring_back_a_forgotten_record`);
+- the detection bound counts the most members the view has held at once, not the members it holds:
+  a member forgotten since was in the rounds before.
+
+**A refutation a rumor missed.** A refutation is an update like any other, gossiped `T` times by
+each member that adopts it and then dropped, and a rumor can end known to some members and not all
+(Demers et al. 1987, §1.4–§1.5; `docs/research/swim.md`): a member it missed holds the refuted
+member dead, past the record's window forgets it, and probes it no more. The cluster test found it
+three times in 1,119 runs (`docs/benchmarks.md`, "The cluster test"). Lifeguard's buddy system
+(§IV-C) makes a probe of a suspected member carry the suspicion whatever the rumor's budget, so the
+suspect hears it at the first probe. Now:
+- a probe also carries the prober's own state, alive at its incarnation
+  (`Detector::ping_gossip_into`), so a member a refutation missed hears it from the refuted
+  member's next probe: the refuted member holds it alive and probes it every round, held dead or
+  forgotten by it as it is;
+- an answer carries the answering member's suspicion or death of the prober
+  (`Detector::ack_gossip_into`), so a member held dead at the incarnation it died at, which never
+  heard so, is told by the answer to its probe, since nobody probes the dead; it refutes, and its
+  next probe revives it there;
+- the two take their room in a message's gossip before the ordinary batch does, which is drained
+  only into the room left, so no rumor is counted sent that was not: one entry on every probe, and
+  one on an answer only to a member held suspected or dead.
+
+Between two members that probe each other these two entries reconcile the two states that concern
+them. Two live members that each hold the other dead, both refutations missed, probe neither each
+other nor anyone about each other; Demers et al. back a rumor up with anti-entropy for this, each
+site resolving every difference with another chosen at random (§1.5), and memberlist exchanges its
+whole state with one member every 30 s, a chosen number.
+
+**Anti-entropy.** Each member reconciles its whole view with one other, push and pull, once a
+dissemination window (`Detector::sync_into`, `Detector::on_sync`):
+- **Why the window.** A rumor is sent on its adopter's next `T` messages, at least one a period, so
+  past `W = T` of the member's longest periods (the window its dead records are kept for) after its
+  last adoption it reaches nobody new, and a member it missed then never hears it by rumor. For a
+  rumor sent a fixed count, Demers et al.'s relationship between traffic and residue (§1.4,
+  `s = e^{−m}` with `m = T(1 − s)` sent a member) gives the fraction it misses: `s = e^{−T(1−s)}`,
+  6.0 % at the five-member cluster's `T = 3`, 0.09 % at `T = 7`, a thousand members'. An exchange
+  each `W` is anti-entropy at the rumor's own pace.
+- **With whom.** The next partner of a shuffled cycle of the members it holds alive, rebuilt when it
+  runs out, as the probe order is: over a cycle of `m` exchanges, `m` the members it holds alive,
+  it exchanges with each.
+- **What.** The exchange opens with the digest of the view (`Membership::digest`): the wrapping
+  sum, over every member it holds, of SplitMix64's output function (Steele, Lea and Flood 2014)
+  applied to the member, its incarnation and its liveness in turn, kept as the view changes, so
+  two views of the same states have the same digest whatever order they changed in, and two that
+  differ in any have the same with odds of one in 2⁶⁴. "Only if the checksums disagree do the sites
+  compare their entire databases" (Demers et al., §1.3): a partner whose digest is the same answers
+  nothing; one whose digest differs answers with its view, and the opener answers that with its
+  own. A view goes in id order, every member it holds, alive, suspected or dead inside its
+  record's window, its own state included, in chunks of what a datagram holds beside a bare chunk
+  (`SwimMessage::Sync`), each entry applied as gossip is. A member owes one push at a time: a pull
+  from another while it owes one is refused and counted (`Detector::pulls_refused`), and one
+  opening is let go before the next, so the exchanges hold a cursor, an opening and a cycle no
+  larger than the view, and allocate nothing once grown.
+- **How long a split lasts.** A member a rumor missed learns the update at its first exchange with a
+  member that holds it, which each partner does unless the rumor missed it too: the split outlasts
+  the rumor's window by more than `k` windows with probability at most `s^k`, and by one in
+  expectation `1/(1 − s)`. Deterministically, it ends within one cycle, `W + m·W` past the rumor's
+  last adoption, when the rumor reached any member it holds alive, and within two when only the
+  update's origin holds it, whose own cycle carries it to every member it holds alive first.
+- **What it costs.** Views that agree exchange one opening of 30 bytes a member a window; views
+  that differ, `⌈n/r⌉` datagrams each way, `r` the entries a chunk holds (66 in a 1,200-byte
+  datagram). A first form pushed whole views at every exchange, `2⌈n/r⌉/T` datagrams a period
+  beside the two a member sends probing, and its period cost 7.5 entries a member a period at 64
+  members and 25 at 256; with the digest, none in a quiet cluster, and 5.1 and 16.4 where a member
+  refutes a suspicion every period (`docs/benchmarks.md`). A stale alive state an exchange carries
+  can add back a dead member already forgotten, as a late rumor could (above): it is probed and
+  condemned again within the detection bound, the cost probes, not safety.
+
+Both change what the wire carries: a probe and an answer carry entries of the existing gossip
+encoding, which a receiver of the earlier form applies as any gossip, and the exchanges a new
+message, `Sync`, with its own golden vector (`docs/research/swim.md`, "The wire, and its
+argument"). No consumer runs hyper-swim yet, so the wire changed in place.
+
+**What the cluster test asserts** (`crates/hyper-swim/tests/cluster.rs`, §2.5). Five member
+processes run the detector as the library configures it, in two phases. The supervisor waits on
+facts: every member judging every peer by a configured verdict (the pair's own, or the pool's while
+the pair's estimator refuses), then it kills one; every survivor holding it dead; then every surviving
+pair judged by its own estimator, then it kills another; every survivor holding that one dead too.
+Each survivor holds each victim dead within the bound its detector stated, measured on the member's
+clock from the victim's last answer: the death that stands, since a member notes every death it
+comes to hold and a live member falsely condemned and alive again dies afresh. A first form noted
+only the first, which could be such a false death, held before the member's probes judged
+anything. The first kill comes within a few hundred milliseconds of the
+start, when most pairs are judged by the pools, and the test had only it: three local runs ended with
+none of the twelve pairs judged by its own estimator, so the end-to-end test never killed under a
+pair's own detector. The second phase is that kill; it is a longer run, which waits for the pairs' own
+evidence rather than a duration. Each wait goes on while the members move toward its fact, as
+hyper-liveness's process test does: a pair's judgement, its own configuration and the round trips it
+takes toward it, a victim's state in each survivor's view. Once a quiet period passes with nothing
+moving, the longest detection bound a live member states and never less than RFC 6298's one-second
+retransmission timeout, the wait fails with every member's last line: every step a wait waits on is
+stated within one probe spacing and two periods of the one before, and the bound spans two spacings
+and a period. A pair that takes more round trips without its own configuration than any window of
+its estimator holds (`WINDOW_LIMIT`) fails the wait at once, so a throttle that keeps a pair's round
+trips too correlated for `τ_int` to be measured no longer holds it for as long as that lasts; so does
+a member whose output ends, its process exited, unless the supervisor killed it. Before, a wait ended
+only on its fact, and nothing but CI's job limit bounded one that never came. A peer a member forgot
+after its death reports as forgotten, and a member keeps what its detector reported of each peer
+across the peer's being forgotten and adopted again.
+
+Every suspicion and condemnation it checks exactly, from the members' own records, against the
+detector's rule. A probe states its deadline as it is sent (`Ping::due_ns`), and a poll what the
+member's own probes found, each finding with its evidence (`Detector::findings`: a suspicion, a
+condemnation made pending, a condemnation). Each member records every probe it sends with that
+deadline and whether it carried its suspicion of the target, every relay it asks, every answer it
+hands its detector, direct or relayed, every ping it answers, and every finding, in the order it
+made them. A suspicion, or a condemnation made pending, traces to its probe: sent when and to whom
+the finding says, with the deadline it states; its period ended no earlier than that deadline nor,
+where relays were asked (at or past it, for that target, none of them the target), than the
+relays' deadline; no answer, direct or relayed, handed to the detector between the probe and the
+end; and a pending one's probe carried the suspicion. Then the answer that missed it is found:
+handed over after the end, late, or never, lost, the target's record saying whether the ping
+reached it. A condemnation traces to the pending one it follows, ended when it says, and to the
+probe of another member answered before it, and every count a member reports equals its record's
+findings at every line it writes. Theorem 7's allowance, `Σβ` over the judged probes of live
+members, is printed beside their counts, a report: it bounds an expectation, and a run's count is
+what the rule found, not a draw. Two forms before asserted the count: within `Σβ` (twelve runs in
+a hundred failed at one CPU while the series kept far inside it), then refuting `Σβ` only when the
+count's 95 % Poisson lower limit passed it, a test that fails by chance; the owner's rule
+(2026-10-03) is that no test passes or fails by chance. A member whose supervisor is gone ends when
+its report cannot be written.
 
 **Measured** (`docs/benchmarks.md`, "hyper-swim"): on loopback a period is 0.1–1 ms, `μ` 60–100 µs
 and `α` growing from about 0.3 ms with the MTBF; a period costs no allocation and less time than
-slates' at every point; 2,000 runs of the cluster test on macOS and on Linux at one, two and four
-CPUs with busy loops beside them all passed, detection a median 4 ms on macOS and 16–18 ms in
-Docker's VM after the victim's last answer. Open: §3, item 1 governs the probe rate too, since a
-period is its probe's deadline and nothing yet prices a probe, and as the MTBF grows the margins and
-so the periods grow with it; two members cannot condemn each other, as neither can tell its own
-failure from the other's; the pool's mean is wrong for a pair far from the member's others until
-that pair configures; and the allowance is loose while a history is young (§3, item 3).
+slates' at every point; 2,000 runs of the one-kill cluster test on macOS and on Linux at one, two and
+four CPUs with busy loops beside them all passed, detection a median 4 ms on macOS and 16–18 ms in
+Docker's VM after the victim's last answer; of the two-phase form on macOS, 300 runs with two
+failing and 819 traced with one, each on a refutation a rumor missed; with probes stating their
+sender, three forms of 1,000 each, 1,000, 999 and 998 passing, no split, the three failures each
+the first victim held dead past a bound its member's unjudged probes could not keep (above); and
+with the split closed, the soak: 2,000 runs on macOS and 500, 655 and 638 on Linux at one, two and
+four CPUs with busy loops, every one passing, no split and no overshoot; and with every finding
+traced, 2,000 runs on macOS and 454, 475 and 468 on Linux at one, two and four CPUs under ambient
+load, every one passing, every answer a live member's probe missed late and none lost. Open: §3, item 1
+governs the probe rate too, since a period is its probe's deadline and nothing yet prices a probe,
+and as the MTBF grows the margins and so the periods grow with it; two members cannot condemn each
+other, as neither can tell its own failure from the other's; the pool's mean is wrong for a pair far
+from the member's others until that pair configures; the allowance is loose while a history is
+young (§3, item 3); and views that differ are pushed whole, so under heavy churn the exchanges
+carry `2⌈n/r⌉` datagrams a member a window, where digests of ranges of the view would push only
+the ranges that differ.
 
 ### 2.8 The node-pair stream (L-3)
 

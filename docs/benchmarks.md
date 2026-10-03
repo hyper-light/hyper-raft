@@ -1793,6 +1793,97 @@ levels are a kilobyte, so that a peer's other fields stay small and together, to
 arithmetic). A configuration is about 175 ns of the 16-member period: a golden-section search of
 `detector_at`, made each time a pair's window renews.
 
+## The bounded view and the corrected engine (2026-10-03)
+
+The same workload through `crates/hyper-swim-compare`'s `one hyper` points, for `main` (`2525538`),
+the bounded view (`2711836`), the corrected engine on it (`40602db`), and the branch's head
+(`617d70a`: a death named by its incarnation, and the engine's overflow guard). Each point a fresh
+process of 400 periods, the four builds' order rotated each round, nine rounds at 16 and 64 members
+and three at 256, 2026-10-03 at 00:35–01:25 PDT, load 33.5–42.4 (other sessions; no build of mine
+running); ns a member a period, medians with the least and the most:
+
+| Members | Workload | `main` | Bounded view | With the engine | Head |
+|---|---|---|---|---|---|
+| 16 | quiet | 398 (367–757) | 436 (372–617), +9.4 % | 387 (350–494), −2.8 % | 384 (360–572), −3.5 % |
+| 16 | churning | 628 (588–668) | 686 (588–701), +9.3 % | 663 (583–1,023), +5.7 % | 638 (568–664), +1.7 % |
+| 64 | quiet | 625 (548–3,455) | 722 (534–3,397), +15.4 % | 582 (481–1,410), −6.9 % | 543 (513–3,009), −13.1 % |
+| 64 | churning | 1,118 (875–2,793) | 1,528 (900–5,463), +36.6 % | 1,231 (861–2,120), +10.0 % | 1,130 (871–2,752), +1.0 % |
+| 256 | quiet | 980 (855–1,656) | 1,167 (874–1,303), +19.0 % | 876 (853–891), −10.7 % | 933 (850–1,535), −4.8 % |
+| 256 | churning | 1,460 (1,438–1,551) | 1,468 (1,420–1,587), +0.6 % | 1,340 (1,339–1,651), −8.2 % | 1,481 (1,333–1,820), +1.4 % |
+
+Every build allocates nothing a period at every point, and `benches/allocs.rs` counts 0 allocations,
+reallocations and faults a member a period at 4 to 256 members, quiet and churning, at each commit
+(load 50–52). The bounded view's periods came out slower in every median, as in an earlier series at
+load 35.5–50.0 (+1 to +15 %): it had added 16 bytes to every peer's state, a count telling a death's
+record from one its member had left, and the period's time is in reading the peers' map (the boxing
+of the estimators above). The incarnation names a death already, so the head keeps no count, and its
+medians are 1.0 to 1.7 % over `main` churning and 3.5 to 13.1 % under it quiet, within the series'
+spread: the engine's two dimensions cost less a sample than eight, and its acknowledgement is 56
+bytes shorter, 63 gossip entries a 1,200-byte message where there were 60.
+
+## The split closed: the period (2026-10-03)
+
+The same workload through `crates/hyper-swim-compare`'s `one` points for slates' detector, `main`
+(`c539a19`, whose hyper-swim is `2525538`'s), the head before this work (`617d70a`'s detector) and the
+head with it (`2605c89`: the directed gossip, the bound's precondition, the measurement backoff and
+the digest-first exchanges, which the comparison's members run as the cluster test's do). Each point
+a fresh process of 400 periods, the four builds' order rotated each round, nine rounds at 16 and 64
+members and three at 256, 2026-10-03 at 04:18–04:23 PDT, load 20.6–27.1 (other sessions; none of my
+builds or soaks running); ns a member a period, medians with the least and the most:
+
+| Members | Workload | slates | `main` | Before | With the work | Against slates | Against before | Against `main` |
+|---|---|---|---|---|---|---|---|---|
+| 16 | quiet | 571 (567–588) | 409 (377–423) | 388 (349–396) | 431 (401–449) | −24.6 % | +11.1 % | +5.4 % |
+| 16 | churning | 990 (982–1,056) | 670 (587–696) | 653 (580–660) | 732 (666–749) | −26.0 % | +12.1 % | +9.3 % |
+| 64 | quiet | 700 (668–765) | 527 (522–539) | 507 (491–530) | 572 (570–597) | −18.2 % | +12.9 % | +8.5 % |
+| 64 | churning | 1,280 (1,258–1,464) | 857 (846–881) | 845 (834–862) | 1,008 (987–1,019) | −21.3 % | +19.4 % | +17.7 % |
+| 256 | quiet | 1,457 (1,426–1,564) | 867 (866–871) | 846 (821–853) | 1,047 (1,002–1,050) | −28.1 % | +23.7 % | +20.7 % |
+| 256 | churning | 2,249 (2,239–2,255) | 1,324 (1,314–1,358) | 1,306 (1,290–1,408) | 1,866 (1,761–2,047) | −17.0 % | +42.8 % | +40.9 % |
+
+Nine rounds at 256 members, at 04:31–04:43 at load 21.5–64.5 (another session's work arriving
+midway): quiet 1,187 against `main`'s 1,008, +17.8 %, churning 2,208 against 1,717, +28.6 %, and
+slates 30.7 and 12.8 % slower. The period stays under slates' at every point. Its cost over `main`
+has two parts:
+- the directed gossip: one more entry on every probe, applied at the target, and a lookup of the
+  prober's state at every answer. Against the head before, in three series at load 20–26 with the
+  directed gossip alone, it cost +4.9 to +17.1 % at 16 and 64 members, a median of +8 %, and from
+  −4.0 to +20.7 % at 256, over three rounds a point;
+- the exchanges: an opening of 30 bytes a member a window where views agree, 0.07, 0.06 and 0.05
+  messages a member a period at 16, 64 and 256 members and no entries, which the comparison counts;
+  against the directed gossip alone, interleaved, nine rounds at load 28.5–73.6, −2.4, −2.5 and
+  −12.5 % quiet, nothing beyond noise. Under a refutation every period the views mostly differ, and
+  they carry 1.5, 5.1 and 16.4 entries a member a period: +8.1, +10.9 and +26.0 %. A first form
+  that pushed whole views at every exchange carried 2.3, 7.5 and 25.0 even in the quiet cluster,
+  +72 % at 256 members quiet in an interleaved series at load 74; the digest took that away.
+
+Every build allocates nothing a period at every point. `benches/allocs.rs`, which runs the exchanges
+as an owner does, counts 0 allocations, reallocations and faults a member a period at 4 to 256
+members, quiet and churning; the bytes asked under churn (0.3 a member a period at 16 and 64
+members) are one-time growths, falling tenfold over 4,000 periods instead of 400.
+
+**The findings** (`f9aff67`: a probe's stated deadline and each poll's findings, `docs/timing.md`
+§2.7), against the head before them as measured above (`2605c89`), `main` and slates, the same
+rotation, 2026-10-03 at 09:19–09:24 PDT at load 8.5–17.9, nine rounds at 16 and 64 members, then
+nine at 256 at 09:25–09:37, load 5.0–16.0. The machine was quieter than for the series above:
+sixteen busy loops an earlier load test had orphaned, running since 2026-10-02 05:08, were ended at
+08:13. ns a member a period, medians with the least and the most:
+
+| Members | Workload | slates | `main` | Before | With the findings | Against before |
+|---|---|---|---|---|---|---|
+| 16 | quiet | 565 (448–591) | 385 (311–428) | 367 (340–385) | 374 (335–394) | +2.0 % |
+| 16 | churning | 997 (860–1,116) | 582 (540–700) | 675 (600–712) | 665 (569–970) | −1.4 % |
+| 64 | quiet | 668 (623–832) | 573 (434–675) | 660 (469–1,603) | 603 (559–2,079) | −8.6 % |
+| 64 | churning | 1,147 (1,057–1,430) | 779 (739–1,008) | 1,002 (834–1,443) | 978 (853–2,194) | −2.5 % |
+| 256 | quiet | 1,017 (932–1,395) | 714 (687–1,126) | 913 (748–1,789) | 892 (756–1,232) | −2.2 % |
+| 256 | churning | 1,566 (1,515–4,526) | 1,015 (973–1,234) | 1,363 (1,287–2,340) | 1,396 (1,282–4,421) | +2.5 % |
+
+Nothing beyond the spread: a poll clears a vector, and a probe carries one more word; a finding is
+pushed only where a probe goes unanswered, which neither workload has. Three rounds at 256 members
+first read +17.7 % churning, 1,646–2,393 ns against 1,424–1,884, which the nine put at +2.5 %. The
+period stays under slates' at every point, 9.7 to 33.8 % less. `benches/allocs.rs` counts 0
+allocations, reallocations and faults a member a period at 4 to 256 members, quiet and churning,
+the same profile as the head before, to the bytes asked.
+
 ## The cluster test
 
 `tests/cluster.rs`, four member processes over hyper-datagram on loopback UDP, each run a fresh
@@ -1847,10 +1938,129 @@ cause is in the library (`docs/timing.md` §2.7 records each):
 - in the test itself: a death adopted by gossip was noted only at the next period's report, and a
   member's last answer was recorded only for a probe it still held outstanding.
 
+**A kill under the pairs' own estimators (2026-10-03).** The series above killed once, as soon as
+every pair was judged, which on loopback is mostly by the pools (a mean of 0.0 to 0.3 of the twelve
+pairs judged by their own estimators at the kill), so the end-to-end test never condemned under a
+pair's own detector. The test now runs five members in two phases: the kill as before, then, once
+every survivor holds that victim dead, a wait until every surviving pair is judged by its own
+estimator and a second kill (`docs/timing.md` §2.7). 40 runs on this machine, each a fresh
+supervisor, 2026-10-03 at 00:20–00:25 PDT, load 45.2–57.6, every run passing:
+
+| Phase | Pairs judged by their own estimator at the kill | Detection median / p95 / max | Stated bound median / max |
+|---|---|---|---|
+| the pools' | a mean of 1.2 of 20, at most 11 | 4.8 / 11.0 / 14.5 ms | 22.7 / 79.6 ms |
+| the pairs' own | 12 of 12, every run | 15.6 / 46.8 / 87.8 ms | 84.5 / 517.5 ms |
+
+Suspicions of live members, summed over the runs, 2 (Theorem 7 allowed 5,080), condemnations 0
+(allowed 4,989): the longer run's young histories make the allowance loose, as before. A run took a
+median 0.58 s, the longest 5.0 s, waiting on the pairs' evidence. Detection under the pairs' own
+estimators is slower than under the pools': each pair's margin is configured at its own interval and
+grows with the MTBF the run has accrued (§2.7, "Open").
+
+**Bounded waits (2026-10-03).** Each wait now goes on while the members move toward its fact and
+fails with every member's last line once the longest detection bound a live member states, never
+less than RFC 6298's one second, passes with nothing moving; a pair that takes more round trips
+without its own configuration than any window of its estimator holds, or a member whose output
+ends, fails it at once (`docs/timing.md` §2.7). Each way of failing was checked with a fault put
+into a member for the check and taken out after: a member made to exit at its 200th period failed
+the wait at once with its exit status; one made to hang failed it 1.0 s after the last movement,
+with its own last line 1.5 s old; and the limit lowered to 16 round trips failed it at the first
+pair past it. 300 runs on this machine, each a fresh supervisor, 2026-10-03 at 01:09–01:12 PDT,
+load 21.9–40.7, 298 passing:
+
+| Wait | Median | p95 | Max |
+|---|---|---|---|
+| every member judges every peer | 9.1 ms | 35.7 ms | 218.3 ms |
+| every survivor holds the first victim dead | 4.2 ms | 8.2 ms | 22.8 ms |
+| every surviving pair is judged by its own estimator | 378.3 ms | 1,151.7 ms | 3,843.3 ms |
+| every survivor holds both victims dead | 11.8 ms | 24.5 ms | 105.7 ms |
+
+The longest any wait that held went with nothing moving was 44.9 ms, 4.5 % of its quiet period,
+the one-second floor at every wait's stillest stretch (a median 2.1 ms). At the first kill a mean
+of 1.1 of the 20 pairs were judged by their own estimator, at most 9, and detection took 4.2 / 8.3 /
+28.9 ms (median / p95 / max) against stated bounds of a median 19.5 and at most 202.0 ms; at the
+second, 12 of 12, detection 12.0 / 24.1 / 113.8 ms against 64.7 and 809.5 ms. Suspicions of live
+members, summed over the runs that passed, 114 (Theorem 7 allowed 41,182), condemnations 80
+(allowed 40,481). A run took a median 0.45 s, the longest 4.0 s.
+
+The two that failed each failed the wait for every surviving pair judged by its own estimator, one
+second after anything last moved, and their last lines say why: a live member had been falsely
+condemned, in both by the first victim before its kill, had refuted, and one survivor had
+missed the refutation, held it dead and, past the record's window, forgotten it. The others held it
+alive and it probed every member, but nothing told the one that forgot it again. A further 819 runs
+of a build that also printed each member's view as it changed (for the trace, not committed) failed
+once the same way: member 4 condemned member 1 at incarnation 4 after member 1 had refuted at 5;
+the refutation reached members 2, 3 and 5 and not member 4, which forgot member 1 17 ms later. A
+refutation is a rumor, and a rumor can end known to some members and not all (Demers et al. 1987,
+§1.5); hyper-swim had no anti-entropy to back it up (closed below). Before the waits were bounded,
+such a run waited until CI's job limit.
+
+**The split closed, and the soak (2026-10-03).** A probe now states its prober's own state and an
+answer the answerer's suspicion or death of the prober (`e563ef1`), which closes the split where the
+live member still probes the survivor that holds it dead; anti-entropy closes the one where neither
+probes the other (`2605c89`, `f93e9d7`; `docs/timing.md` §2.7). The runs along the way:
+- the directed gossip: a prototype 1,000 of 1,000, two further forms 999 and 998 of 1,000, no
+  split; the three failures each held the first victim dead 0.2 to 2.2 ms past a bound of 2.3 to
+  3.3 ms. A build that kept a ring of each member's probes, answers and views, dumped at an
+  overshoot, found one 490 runs in: a live member falsely condemned 7 ms into the run, adopted by
+  gossip at members whose probes were still measurement only, against a bound covering periods
+  that judged nothing. Members now state no bound until every probe they make is judged, and the
+  test checks the death that stands (`a3a043f`);
+- two instrumented builds, 455 and 2,323 runs in, had a member 43,557 and 39,560 periods into a run
+  with nothing judged, condemned 95 and 94 times: measurement periods outrun by round trips that
+  had lengthened, which the detector alone reproduces; unanswered measurement periods now back off
+  (`d4992fa`);
+- with those three, 1,000 runs, all passing (03:03–03:25, load 20.1–65.7);
+- the exchanges, pushing whole views at every exchange: 950 runs on macOS (load 31.0–118.2) and 109,
+  156 and 205 on Linux at one, two and four CPUs, all passing; with digests first, 77, 26, 39 and 49,
+  all passing, before a death of a member not held was found to bring a forgotten record back
+  around through the exchanges (`f93e9d7`) and the soak was begun again.
+
+The soak, on `f93e9d7`, each run a fresh supervisor, 2026-10-03 at 04:54–07:09 PDT, the macOS and
+Linux series running at the same time beside other sessions' work; Linux in Docker Desktop's VM
+(rust:1.98.0), each container at its CPU limit with twice as many busy loops beside the test, its
+load the VM's:
+
+| Platform | Limits and competing load | Runs | Passed | Splits | Overshoots | Load (1 min) | Suspicions (allowed) | Condemnations (allowed) | Detection, first kill, median / p95 / max | Second kill | Largest share of the stated bound |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| macOS 26.4.1, M5 Max | other sessions | 2,000 | 2,000 | 0 | 0 | 27.6–95.2 | 2,333 (226,062) | 41 (218,868) | 11.5 / 53.1 / 333.8 ms | 127.8 / 507.6 / 1,663.5 ms | 0.38 |
+| Linux 6.12.76 (Docker Desktop) | `--cpus 1`, 2 busy loops | 500 | 500 | 0 | 0 | 3.4–52.9 | 853 (82,340) | 49 (77,052) | 60.9 / 145.7 / 571.9 ms | 898.0 / 2,312.5 / 5,256.0 ms | 0.38 |
+| Linux 6.12.76 (Docker Desktop) | `--cpus 2`, 4 busy loops | 655 | 655 | 0 | 0 | 3.6–52.8 | 1,369 (103,423) | 83 (96,842) | 52.1 / 115.0 / 390.2 ms | 646.2 / 2,036.9 / 4,506.4 ms | 0.40 |
+| Linux 6.12.76 (Docker Desktop) | `--cpus 4`, 8 busy loops | 638 | 638 | 0 | 0 | 3.5–52.8 | 934 (97,068) | 42 (90,989) | 53.1 / 112.9 / 316.3 ms | 532.0 / 2,341.2 / 6,741.7 ms | 0.55 |
+
+Every survivor held each victim dead within the bound it stated, at most 0.55 of it; the stillest
+any wait went was 0.27 of its quiet period. A run took a median 1.9 s on macOS and 8.4 to 12.7 s in
+the throttled containers, the longest 166 s, waiting on the pairs' evidence. The suspicions and
+condemnations of live members are the load's: the machine ran at up to 95, and the throttled
+members stall together.
+
+**Every finding traced (2026-10-03).** From `f9aff67` the test decides nothing by a statistical
+level: it traces every suspicion, every condemnation made pending and every condemnation, from the
+members' own records, to the detector's rule, and prints Theorem 7's allowance beside the counts of
+live members as a report (`docs/timing.md` §2.7). Runs of that form, each a fresh supervisor, the
+binaries built from the library and test `f9aff67` holds, under the machine's ambient load alone,
+nothing added; macOS and Linux at the same time from 09:37 PDT, the Linux series ended at 09:49 so
+as not to load another session's timing-sensitive gate:
+
+| Platform | Limits | Runs | Passed | Load (1 min) | Traced: suspicions, pending, condemnations | Live members' answers: late (latest past its deadline), lost | Suspicions of live members (allowed) | Condemnations (allowed) | Detection, first kill, median / p95 / max | Second kill |
+|---|---|---|---|---|---|---|---|---|---|---|
+| macOS 26.4.1, M5 Max | none | 2,000 | 2,000 | 3.5–10.4 | 6,721, 7,593, 5,078 | 18 (9.7 ms), 0 | 15 (163,566) | 1 (160,064) | 5.9 / 9.0 / 24.6 ms | 10.4 / 20.2 / 356.4 ms |
+| Linux 6.12.76 (Docker Desktop) | `--cpus 1` | 454 | 454 | 1.2–3.7 | 1,633, 1,775, 1,165 | 49 (54.9 ms), 0 | 45 (28,255) | 1 (27,390) | 19.0 / 26.9 / 71.0 ms | 51.1 / 104.1 / 576.2 ms |
+| Linux 6.12.76 (Docker Desktop) | `--cpus 2` | 475 | 475 | 1.2–3.7 | 1,646, 1,936, 1,277 | 19 (73.5 ms), 0 | 16 (24,974) | 1 (24,116) | 19.6 / 27.1 / 43.3 ms | 50.0 / 105.1 / 230.9 ms |
+| Linux 6.12.76 (Docker Desktop) | `--cpus 4` | 468 | 468 | 1.2–3.7 | 1,656, 1,815, 1,195 | 36 (72.1 ms), 0 | 33 (25,730) | 1 (24,858) | 19.0 / 26.8 / 61.9 ms | 49.9 / 104.7 / 239.8 ms |
+
+No finding failed its trace, and every count a member reported was its record's at every line it
+wrote. The probes the findings name were unanswered by their stated deadlines and, where relays were
+asked, by theirs; every answer that missed a live member's probe came, after its period had ended,
+none lost; the others were probes of the killed members, whose records hold no such ping. A run took
+a median 0.34 s on macOS and 1.0 to 1.2 s in the containers. The checks bite: a detector made to
+ignore one answer in five fails the trace at once (524 findings named in one run), and one that
+drops its suspicions' findings fails the count at the first line that reports one.
+
 ## Commands for the detector
 
 ```sh
-# The suites and the four-process kill test.
+# The suites and the five-process kill test.
 cargo test -p hyper-swim
 
 # Allocations a member a period.

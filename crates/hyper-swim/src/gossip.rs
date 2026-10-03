@@ -10,7 +10,8 @@
 //! "hyper-swim"). A replaced report leaves its old queue entry behind; the entry is skipped when
 //! reached, and a record that finds the queues holding more than twice the pending reports purges
 //! them of such entries. A drain never adds entries, so the queues hold at most twice the most
-//! reports ever pending, plus one: twice the membership.
+//! reports ever pending, plus one: twice the membership, which its bound bounds. A member the view
+//! forgets takes its report with it.
 
 use std::collections::{HashMap, VecDeque};
 
@@ -65,6 +66,18 @@ impl Gossip {
         if self.queued > self.reports.len().saturating_mul(2) {
             self.purge();
         }
+    }
+
+    /// Drops `member`'s pending report: the view forgot it. Its queue entry is skipped when
+    /// reached, as a replaced report's is.
+    pub(crate) fn forget(&mut self, member: HostId) {
+        self.reports.remove(&member);
+    }
+
+    /// The reports pending.
+    #[cfg(test)]
+    pub(crate) fn pending(&self) -> usize {
+        self.reports.len()
     }
 
     /// Replaces `batch` with up to `max` reports, the least transmitted first, and counts each as

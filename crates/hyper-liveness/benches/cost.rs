@@ -31,6 +31,7 @@
     missing_docs
 )]
 
+use std::num::NonZeroUsize;
 use std::time::{Duration, Instant};
 
 use hyper_raft::proto::{ConfState, Entry, HardState, Message, Snapshot};
@@ -320,9 +321,13 @@ fn swim(nodes: usize) -> Rate {
     let peers = nodes - 1;
     let mut members: Vec<Detector> = (0..nodes as u64)
         .map(|id| {
-            let mut detector = Detector::new(HostId(id), Exposure::new());
+            let mut detector = Detector::new(
+                HostId(id),
+                Exposure::new(),
+                NonZeroUsize::new(nodes).unwrap(),
+            );
             for peer in 0..nodes as u64 {
-                detector.join(HostId(peer));
+                detector.join(HostId(peer)).unwrap();
             }
             detector
         })

@@ -83,7 +83,7 @@ mod tests {
             three > (1u64 << 16) && three < (2u64 << 16),
             "1 < log2(3) < 2"
         );
-        // 1.585 · 2^16 ≈ 103872; allow a small approximation tolerance.
-        assert!(three.abs_diff(103_872) < 64, "log2(3) ≈ 1.585 in Q16.16");
+        // log2(3)·2^16 = 103872.23…: the algorithm's sixteen bits are its floor.
+        assert_eq!(three, 103_872, "log2(3) in Q16.16");
     }
 }

@@ -34,11 +34,29 @@
 //! condemn. A member with nobody alive or suspected left probes the members it holds dead and
 //! tells each so; a live one refutes in its answer.
 //!
+//! **What it found, and why.** A probe states its deadline as it is sent ([`Ping::due_ns`]), and
+//! each poll states what the member's own probes found ([`Detector::findings`]): a suspicion, a
+//! condemnation made pending, a condemnation, each with its evidence: the probe, the deadline
+//! stated when it was sent, when its period ended with no answer delivered, and for a
+//! condemnation the answer from another member that proved this member's network. An owner can
+//! say why a member was suspected or condemned, and a test can trace every one to this rule.
+//!
 //! **The member's own lateness** is measured, not multiplied: every wake the member is late for is
 //! folded into its granularity `G` ([`Wakes`]), which floors the margins; the member's own
 //! delay in reading acknowledgements is in the round trips it measures; and a probe is resolved
 //! when the member wakes, with every acknowledgement delivered by then, so a late member does not
 //! blame its peers for its own lateness.
+//!
+//! **The view is bounded and forgets the dead.** It holds at most the members the owner's placement
+//! says this node can know ([`Detector::new`]'s `members`), and refuses an update about one more,
+//! typed ([`Full`], counted by [`Detector::refused`]); every map keyed by a member holds only members
+//! the view holds. A dead member's record is kept while gossip of it from before its death can still
+//! arrive: SWIM's dissemination budget `T = λ ln n` periods past this member's adoption of the death,
+//! each period as long as the longest this member runs ([`Detector::detection_bound`]'s period).
+//! Then it is forgotten, with everything held of the member; a record past its window also makes
+//! room for a newcomer at once. A member with nobody alive or suspected left keeps its dead: they are
+//! the members it probes. `docs/timing.md` §2.7 and `docs/research/swim.md` give the derivation and
+//! what is left of the risk.
 //!
 //! Coordinate-aware indirect probing: the detector carries a Vivaldi coordinate engine
 //! ([`crate::coordinates`]) fed by the round trips it measures and the coordinates it learns for
@@ -46,7 +64,8 @@
 //! nearest the target in coordinate space, with a deterministic id order where coordinates are
 //! unknown.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
+use std::num::NonZeroUsize;
 use std::time::Duration;
 
 use hyper_timing::{
@@ -60,7 +79,7 @@ use crate::codec::Coordinate;
 use crate::coordinates::{CoordinateEngine, NetworkCoordinate};
 use crate::extension::{ExtensionDecision, ExtensionDenial, ExtensionTracker};
 use crate::gossip::Gossip;
-use crate::membership::{Change, Liveness, MemberState, Membership};
+use crate::membership::{Change, Full, Liveness, MemberState, Membership};
 
 /// A ping to send to `to` — the period's probe of it, or a probe relayed for another member.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -69,6 +88,56 @@ pub struct Ping {
     pub to: HostId,
     /// The nonce the acknowledgement echoes.
     pub nonce: u64,
+    /// When its answer is due, on the caller's clock, as stated when it is sent: the probe's time
+    /// plus its verdict's `μ + α`. `None` for a probe no verdict judges, whose period judges
+    /// nothing, and for a probe relayed for another member, which that member times.
+    pub due_ns: Option<u64>,
+}
+
+/// A judged probe that went unanswered, as its period ended: the evidence for what it found.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Unanswered {
+    /// The member probed.
+    pub target: HostId,
+    /// The probe's nonce, which an answer echoes.
+    pub nonce: u64,
+    /// When it was sent, on the caller's clock.
+    pub sent_ns: u64,
+    /// When its answer was due, as stated when it was sent ([`Ping::due_ns`]).
+    pub due_ns: u64,
+    /// When the relays' answers were due, where the direct deadline passed and relays were asked
+    /// ([`PingReq`]).
+    pub relays_due_ns: Option<u64>,
+    /// When its period ended with no answer delivered, direct or relayed.
+    pub ended_ns: u64,
+}
+
+/// What a [`poll`](Detector::poll) found of a peer by this member's own probes, with its
+/// evidence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Finding {
+    /// The probe went unanswered and its target, alive in this member's view, is suspected:
+    /// counted in [`PeerReport::suspicions`].
+    Suspected(Unanswered),
+    /// The probe carried this member's suspicion of its target, telling it so, and went
+    /// unanswered: the target's condemnation is pending, from the probe's end, on an answer from
+    /// another member ([`PeerReport::pending_since_ns`]).
+    Pending(Unanswered),
+    /// `target`, its condemnation pending since `pending_since_ns`, is condemned at `at_ns`:
+    /// `answered` answered this member's probe `nonce`, so this member's own network works.
+    /// Counted in [`PeerReport::condemnations`].
+    Condemned {
+        /// The member condemned.
+        target: HostId,
+        /// When its told probe's period ended unanswered ([`Finding::Pending`]).
+        pending_since_ns: u64,
+        /// The member whose answer proved this member's network.
+        answered: HostId,
+        /// The probe it answered.
+        nonce: u64,
+        /// When the answered probe's period ended, condemning.
+        at_ns: u64,
+    },
 }
 
 /// An acknowledgement to send to `to` — the reply to a received [`Ping`].
@@ -148,6 +217,10 @@ pub struct PeerReport {
 /// [`crate::extension`]). An older probe's acknowledgement is past every deadline that could use
 /// it and is not kept for.
 const OUTSTANDING: usize = 3;
+
+/// The longest a measurement period's wait backs off to, nanoseconds: RFC 6298 (2.5) lets a
+/// retransmission timer's doubling be capped, provided the cap is at least 60 seconds.
+const MEASUREMENT_WAIT_CAP_NS: u64 = 60_000_000_000;
 
 /// A probe sent and not yet answered.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -296,7 +369,8 @@ struct Probe {
     verdict: Option<Verdict>,
     /// When the indirect probe's answers are due, once it was asked.
     indirect_until: Option<u64>,
-    /// A measurement probe's expected arrival from the latest round trip: where its period ends,
+    /// A measurement probe's expected arrival from the latest round trip, backed off while
+    /// measurement periods go unanswered ([`Detector::measurement_wait`]): where its period ends,
     /// answered or not, judging nothing; its wake measures the member's timer.
     expected: Option<u64>,
 }
@@ -305,6 +379,27 @@ impl Probe {
     fn due_ns(&self) -> Option<u64> {
         self.verdict
             .map(|verdict| self.sent_ns.saturating_add(verdict.span_ns()))
+    }
+}
+
+/// A death the view adopted: the member, the incarnation it died at, which names the death (a
+/// member leaves `Dead` only at a higher incarnation, so dies again only at one), and when the first
+/// poll after it saw it, on the caller's clock.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Death {
+    member: HostId,
+    incarnation: u64,
+    at_ns: Option<u64>,
+}
+
+impl Death {
+    /// Whether the view still holds the member dead at this death's incarnation.
+    fn held(&self, membership: &Membership) -> bool {
+        membership.state(self.member)
+            == Some(MemberState {
+                liveness: Liveness::Dead,
+                incarnation: self.incarnation,
+            })
     }
 }
 
@@ -374,6 +469,50 @@ fn relay_count(loss: f64, available: usize) -> usize {
     count.min(available)
 }
 
+/// A push of this member's view to `to`, chunk by chunk ([`Detector::sync_into`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Push {
+    to: HostId,
+    /// The last member sent; `None` before the first chunk.
+    after: Option<HostId>,
+    /// Whether the next chunk asks the partner's view in return: the first chunk of the answer to
+    /// an opening whose digest differed.
+    pull: bool,
+}
+
+/// A message of anti-entropy to send ([`Detector::sync_into`]): to whom, whether it asks the
+/// receiver's view in return, and the digest of this member's view. The owner sends it as a
+/// [`SwimMessage::Sync`](crate::codec::SwimMessage::Sync), carrying the members the call put in
+/// its batch: none in an exchange's opening.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ViewChunk {
+    /// The member to send the chunk to.
+    pub to: HostId,
+    /// Whether the chunk asks the receiver's view in return.
+    pub pull: bool,
+    /// The digest of this member's view ([`Membership::digest`]).
+    pub digest: u64,
+}
+
+/// Anti-entropy (Demers et al. 1987, §1.3 and §1.5): once a dissemination window, an exchange with
+/// one member, the partners in a shuffled cycle of the members this one holds alive. It opens with
+/// the view's digest; only views whose digests differ are pushed, both ways.
+#[derive(Debug, Default)]
+struct Exchanges {
+    /// When this member last began an exchange.
+    began_ns: Option<u64>,
+    /// The cycle of partners, rebuilt and shuffled when it runs out, like the probe order.
+    partners: Vec<HostId>,
+    cursor: usize,
+    /// The partner of the exchange this member began, while its opening is still to send.
+    opening: Option<HostId>,
+    /// The push of its view it owes: to an opening whose digest differed from its own, asking the
+    /// opener's view, or to a push that asked its own.
+    answer: Option<Push>,
+    /// Pulls refused because an answer to another member was owed.
+    refused: u64,
+}
+
 /// The failure detector for one node: its [`Membership`] view, its probe rotation, the period's
 /// probe, and per peer the estimator and verdict that time its probes.
 pub struct Detector {
@@ -403,6 +542,9 @@ pub struct Detector {
     wakes: Wakes,
     /// The latest round trip measured, to anyone.
     last_rtt_ns: Option<u64>,
+    /// Measurement periods ended unanswered since the latest round trip was measured: each doubles
+    /// the next one's wait (RFC 6298 §5.5), up to [`MEASUREMENT_WAIT_CAP_NS`].
+    measurement_misses: u32,
     /// The longest span `μ + α` any verdict of this member has had, nanoseconds.
     longest_span: u64,
     periods: Periods,
@@ -415,6 +557,23 @@ pub struct Detector {
     aging: Vec<(HostId, u64)>,
     /// The relays an indirect probe ranks, held for the same reason.
     relays: Vec<HostId>,
+    /// The deaths the view adopted, oldest first: the order their records are forgotten in. A
+    /// record the member has since left (a refutation, a newer death) is skipped when reached.
+    deaths: VecDeque<Death>,
+    /// The latest time the caller gave, nanoseconds.
+    clock_ns: u64,
+    /// The most members the view has held at once besides this one: no round has been larger.
+    most_watched: u64,
+    /// The largest dissemination budget any report of this member has been sent with.
+    most_transmits: u32,
+    /// Updates refused at the view's bound.
+    refused: u64,
+    /// The anti-entropy exchanges.
+    exchanges: Exchanges,
+    /// What the latest poll found, in order. A poll ends at most one probe's period, which finds
+    /// one suspicion or pending condemnation or, answered, condemns every other member with one
+    /// pending: fewer findings than the view holds members, its capacity from the start.
+    findings: Vec<Finding>,
 }
 
 /// A deterministic pseudo-random order over the members to probe (SWIM §4.3): each round probes a
@@ -472,10 +631,12 @@ enum Stage {
 
 impl Detector {
     /// A detector for `local`, with the fleet's failure history so far (`history`, the node time it
-    /// has run and the failures it has had; [`Exposure::new`] for a fleet with none).
-    pub fn new(local: HostId, history: Exposure) -> Detector {
+    /// has run and the failures it has had; [`Exposure::new`] for a fleet with none), whose view holds
+    /// at most `members`, itself included: how many hosts the owner's placement says this node can
+    /// know.
+    pub fn new(local: HostId, history: Exposure, members: NonZeroUsize) -> Detector {
         Detector {
-            membership: Membership::new(local),
+            membership: Membership::new(local, members),
             local,
             order: Vec::new(),
             cursor: 0,
@@ -486,12 +647,13 @@ impl Detector {
             gossip: Gossip::default(),
             transmits: 1,
             shuffler: RandomizedOrder::seeded(local),
-            coordinates: CoordinateEngine::new(),
+            coordinates: CoordinateEngine::new(local.0),
             peer_coordinates: BTreeMap::new(),
             nonce: 0,
             relayed: u64::MAX,
             wakes: Wakes::new(),
             last_rtt_ns: None,
+            measurement_misses: 0,
             longest_span: 0,
             periods: Periods::default(),
             exposure: history,
@@ -499,6 +661,17 @@ impl Detector {
             extensions: BTreeMap::new(),
             aging: Vec::new(),
             relays: Vec::new(),
+            deaths: VecDeque::new(),
+            clock_ns: 0,
+            most_watched: 0,
+            most_transmits: 1,
+            refused: 0,
+            // The cycle never holds more than the view: sized once, so no exchange grows it.
+            exchanges: Exchanges {
+                partners: Vec::with_capacity(members.get()),
+                ..Exchanges::default()
+            },
+            findings: Vec::with_capacity(members.get()),
         }
     }
 
@@ -506,10 +679,16 @@ impl Detector {
     /// probe is answered past its deadline, or unanswered past the indirect probe's; asks relays
     /// when the direct deadline passes unanswered (`requests`, replaced); and starts the next
     /// period, returning its [`Ping`] for the caller to send now. Called at every
-    /// [`wake`](Detector::wake) and after every message the caller feeds in.
+    /// [`wake`](Detector::wake) and after every message the caller feeds in. What its end of a
+    /// period found is in [`findings`](Detector::findings) until the next poll.
     pub fn poll(&mut self, now_ns: u64, requests: &mut Vec<PingReq>) -> Option<Ping> {
         requests.clear();
+        self.findings.clear();
         self.wakes.woke(now_ns);
+        self.clock_ns = self.clock_ns.max(now_ns);
+        self.stamp_deaths(now_ns);
+        self.forget_expired(now_ns);
+        self.begin_exchange(now_ns);
         let ping = match self.stage(now_ns) {
             Stage::Wait => None,
             Stage::Indirect => {
@@ -594,7 +773,7 @@ impl Detector {
             nonce,
             at_ns: now_ns,
         });
-        self.probe = Some(Probe {
+        let probe = Probe {
             target,
             nonce,
             seq,
@@ -602,15 +781,23 @@ impl Detector {
             answered: false,
             verdict,
             indirect_until: None,
-            expected: self.last_rtt_ns.map(|rtt| now_ns.saturating_add(rtt)),
-        });
+            expected: self
+                .last_rtt_ns
+                .map(|rtt| now_ns.saturating_add(self.measurement_wait(rtt))),
+        };
+        self.probe = Some(probe);
         self.heard_other = false;
-        Some(Ping { to: target, nonce })
+        Some(Ping {
+            to: target,
+            nonce,
+            due_ns: probe.due_ns(),
+        })
     }
 
     /// Fills `requests` with the relays to ask for the period's probe, and sets when their answers
     /// are due: the slowest relay's own deadline span (the leg to it and back) plus the target's
-    /// (the relay's leg to the target, whose stalls are the target's own).
+    /// (the relay's leg to the target, whose stalls are the target's own). With no relay to ask,
+    /// nothing is due, and the period ends at the direct deadline.
     fn request_indirect(&mut self, now_ns: u64, requests: &mut Vec<PingReq>) {
         let Some(mut probe) = self.probe else {
             return;
@@ -634,6 +821,9 @@ impl Detector {
                 .or(self.pool.verdict)
                 .map_or(verdict.span_ns(), |relayed| relayed.span_ns());
             slowest = slowest.max(span);
+        }
+        if requests.is_empty() {
+            return;
         }
         let until = now_ns
             .saturating_add(slowest)
@@ -668,6 +858,13 @@ impl Detector {
     /// The period ends: its length is folded, the exposure grows, and an unanswered judged probe
     /// suspects its target or, when it had told the target, condemns it.
     fn resolve(&mut self, probe: Probe, now_ns: u64) {
+        if probe.verdict.is_none()
+            && !probe.answered
+            && let Some(rtt) = self.last_rtt_ns
+            && self.measurement_wait(rtt) < MEASUREMENT_WAIT_CAP_NS
+        {
+            self.measurement_misses = self.measurement_misses.saturating_add(1);
+        }
         let length = now_ns.saturating_sub(probe.sent_ns);
         self.periods.add(length);
         let watched = u32::try_from(self.order.len()).unwrap_or(u32::MAX);
@@ -679,7 +876,7 @@ impl Detector {
         Self::account(peer, probe.verdict);
         if probe.answered {
             peer.clear_pending();
-            self.condemn_pending(probe.target, now_ns);
+            self.condemn_pending(probe.target, probe.nonce, now_ns);
         } else if probe.verdict.is_some() {
             self.missed(probe, now_ns);
         }
@@ -703,23 +900,35 @@ impl Detector {
         peer.last_mistake = Some(verdict.mistake);
     }
 
-    /// A judged probe went unanswered.
+    /// A judged probe went unanswered: its target, alive, is suspected; suspected and told by it,
+    /// its condemnation is pending. Each is found with the probe's evidence.
     fn missed(&mut self, probe: Probe, now_ns: u64) {
-        let Some(state) = self.membership.state(probe.target) else {
+        let (Some(state), Some(due_ns)) = (self.membership.state(probe.target), probe.due_ns())
+        else {
             return;
+        };
+        let unanswered = Unanswered {
+            target: probe.target,
+            nonce: probe.nonce,
+            sent_ns: probe.sent_ns,
+            due_ns,
+            relays_due_ns: probe.indirect_until,
+            ended_ns: now_ns,
         };
         match state.liveness {
             Liveness::Alive => {
                 if let Some(peer) = self.peers.get_mut(&probe.target) {
                     peer.report.suspicions = peer.report.suspicions.saturating_add(1);
                 }
-                self.record(
+                // An update about a member the view holds is never refused.
+                let _held = self.record(
                     probe.target,
                     MemberState {
                         liveness: Liveness::Suspect,
                         incarnation: state.incarnation,
                     },
                 );
+                self.findings.push(Finding::Suspected(unanswered));
             }
             Liveness::Suspect => {
                 let granted = self
@@ -733,6 +942,7 @@ impl Detector {
                     if peer.told_missed > granted && peer.pending_since.is_none() {
                         peer.pending_since = Some(now_ns);
                         peer.report.pending_since_ns = Some(now_ns);
+                        self.findings.push(Finding::Pending(unanswered));
                     }
                 }
             }
@@ -740,9 +950,9 @@ impl Detector {
         }
     }
 
-    /// An answer from `answered` proves this member's own network works: every suspect whose told
-    /// probe went unanswered is condemned now.
-    fn condemn_pending(&mut self, answered: HostId, now_ns: u64) {
+    /// An answer from `answered` to the probe `nonce` proves this member's own network works:
+    /// every suspect whose told probe went unanswered is condemned now.
+    fn condemn_pending(&mut self, answered: HostId, nonce: u64, now_ns: u64) {
         let mut suspects = std::mem::take(&mut self.aging);
         suspects.clear();
         suspects.extend(self.membership.suspects());
@@ -772,38 +982,87 @@ impl Detector {
                 peer.report.condemned_after = after;
                 peer.report.condemned_within = within;
             }
-            self.record(
+            // An update about a member the view holds is never refused.
+            let _held = self.record(
                 host,
                 MemberState {
                     liveness: Liveness::Dead,
                     incarnation,
                 },
             );
+            self.findings.push(Finding::Condemned {
+                target: host,
+                pending_since_ns: pending,
+                answered,
+                nonce,
+                at_ns: now_ns,
+            });
         }
         self.aging = suspects;
     }
 
     /// The bound on the time from a peer's last answer to this member's condemnation of it pending,
     /// were it to crash then, `m` the members the view holds besides this one: its next probe is
-    /// at most `2m − 1` periods away (SWIM §4.3),
-    /// unanswered it suspects; the probe that tells it starts at most as far again, and when its
-    /// own period resolves it unanswered the condemnation is pending. It then waits on an answer from another member, the evidence that
+    /// at most `2m − 1` periods away (SWIM §4.3), unanswered it suspects; the probe that tells it
+    /// starts at most as far again, and when its own period resolves it unanswered the
+    /// condemnation is pending. It then waits on an answer from another member, the evidence that
     /// this member's own network works, which nothing bounds in advance: the member measures that
     /// wait ([`PeerReport::pending_since_ns`]) and adds it. A period lasts at most the longest this
     /// member has run, or, where longer, what an unanswered probe's deadlines allow: its target's
     /// span, then the slowest relay's and the target's again, at most three times the longest
     /// span any of its verdicts has had, plus the latest this member has woken past a wake it
-    /// asked, or is late for now; the period in progress counts as run. `None` before a period.
+    /// asked, or is late for now; the period in progress counts as run.
+    ///
+    /// `None` before a period, and while a probe this member makes would go unjudged, neither its
+    /// pair nor the pool holding a verdict: an unjudged probe that goes unanswered suspects nobody,
+    /// so until every probe is judged this member detects nothing by its own probes, and a death
+    /// it holds then is another member's, adopted.
     pub fn detection_bound(&self, now_ns: u64) -> Option<Duration> {
+        if !self.judges_every_probe() {
+            return None;
+        }
+        // The most members the view has held besides this one: no round is larger, whatever the
+        // rounds in the window were (a member that condemned another, even falsely, runs smaller
+        // ones, and a member forgotten since was in rounds before).
+        let spacing = self.most_watched.saturating_mul(2).saturating_sub(1);
+        // The told probe's own period resolves it: one more.
+        let periods = spacing.saturating_mul(2).saturating_add(1);
+        let period = self.period_bound(now_ns)?;
+        Some(Duration::from_nanos(period.saturating_mul(periods)))
+    }
+
+    /// How long a measurement period waits past its probe: the latest round trip, doubled for each
+    /// measurement period since that ended unanswered, as a retransmission timer backs off (RFC 6298
+    /// §5.5), up to [`MEASUREMENT_WAIT_CAP_NS`]. An answer is measured only while its probe is
+    /// outstanding, the latest three of its peer's; when round trips lengthen past that, periods at
+    /// the latest round trip's pace see every answer come for a probe written over, measure none,
+    /// and never lengthen. A measured round trip ends the backing off.
+    fn measurement_wait(&self, rtt_ns: u64) -> u64 {
+        let factor = 1u64
+            .checked_shl(self.measurement_misses)
+            .unwrap_or(u64::MAX);
+        rtt_ns.saturating_mul(factor).min(MEASUREMENT_WAIT_CAP_NS)
+    }
+
+    /// Whether every probe this member makes is judged by a configured verdict: the pool holds
+    /// one, or every member it probes has its own.
+    fn judges_every_probe(&self) -> bool {
+        self.pool.verdict.is_some()
+            || self
+                .peers
+                .iter()
+                .filter(|(host, _)| self.is_probed(**host))
+                .all(|(_, peer)| peer.stream.verdict.is_some())
+    }
+
+    /// The longest a period of this member lasts, nanoseconds: the longest it has run or, where
+    /// longer, what an unanswered probe's deadlines allow, three times the longest span any of its
+    /// verdicts has had, plus how late it has woken; the period in progress counts as run. `None`
+    /// before a period.
+    fn period_bound(&self, now_ns: u64) -> Option<u64> {
         if self.periods.count == 0 {
             return None;
         }
-        // Every member the view holds but this one: no round is larger, whatever the rounds in
-        // the window were (a member that condemned another, even falsely, runs smaller ones).
-        let watched = u64::try_from(self.membership.len().saturating_sub(1)).unwrap_or(u64::MAX);
-        let spacing = watched.saturating_mul(2).saturating_sub(1);
-        // The told probe's own period resolves it: one more.
-        let periods = spacing.saturating_mul(2).saturating_add(1);
         // The period in progress and the wake it is late for are measured too: a stall the
         // member is in when it states the bound is in the bound.
         let running = self
@@ -811,8 +1070,69 @@ impl Detector {
             .map_or(0, |probe| now_ns.saturating_sub(probe.sent_ns));
         let late = self.wakes.latest_ns(now_ns);
         let unanswered = self.longest_span.saturating_mul(3).saturating_add(late);
-        let period = self.periods.longest.max(running).max(unanswered);
-        Some(Duration::from_nanos(period.saturating_mul(periods)))
+        Some(self.periods.longest.max(running).max(unanswered))
+    }
+
+    /// The dissemination window: SWIM's budget `T = λ ln n` periods, the largest budget this
+    /// member's reports have had, each the longest a period of this member lasts (`docs/timing.md`
+    /// §2.7). A rumor is sent on its adopter's next `T` messages, at least one a period, so past
+    /// this after its last adoption it reaches nobody new. A dead member's record is kept for it,
+    /// while gossip of the member from before its death can still arrive, and this member begins
+    /// an anti-entropy exchange once each, so an update a rumor missed reaches the member it missed
+    /// at the pace the rumor itself kept. `None` before a period.
+    fn dissemination_window_ns(&self, now_ns: u64) -> Option<u64> {
+        let period = self.period_bound(now_ns)?;
+        Some(period.saturating_mul(u64::from(self.most_transmits)))
+    }
+
+    /// The deaths adopted since the last poll are seen now: their windows start at `now_ns`.
+    fn stamp_deaths(&mut self, now_ns: u64) {
+        for death in self.deaths.iter_mut().rev() {
+            if death.at_ns.is_some() {
+                break;
+            }
+            death.at_ns = Some(now_ns);
+        }
+    }
+
+    /// The oldest death record past its window at `now_ns`, taken off the queue with the records
+    /// before it that the member has since left; `None` while the oldest held is inside its window.
+    fn expired(&mut self, now_ns: u64) -> Option<HostId> {
+        let window = self.dissemination_window_ns(now_ns)?;
+        while let Some(&death) = self.deaths.front() {
+            if !death.held(&self.membership) {
+                self.deaths.pop_front();
+                continue;
+            }
+            let at = death.at_ns?;
+            if now_ns.saturating_sub(at) < window {
+                return None;
+            }
+            self.deaths.pop_front();
+            return Some(death.member);
+        }
+        None
+    }
+
+    /// Forgets every dead member whose record is past its window, unless nobody alive or suspected
+    /// is left: then the dead are the members this one probes.
+    fn forget_expired(&mut self, now_ns: u64) {
+        if self.deaths.is_empty() || self.isolated() {
+            return;
+        }
+        while let Some(member) = self.expired(now_ns) {
+            self.forget(member);
+        }
+    }
+
+    /// Forgets `member`, held dead, and everything held of it.
+    fn forget(&mut self, member: HostId) {
+        if self.membership.forget(member) {
+            self.peers.remove(&member);
+            self.peer_coordinates.remove(&member);
+            self.extensions.remove(&member);
+            self.gossip.forget(member);
+        }
     }
 
     /// Records an acknowledgement from `from` of the probe `nonce`, received at `at_ns` (the
@@ -825,6 +1145,7 @@ impl Detector {
             Some(probe) if probe.target != from => self.heard_other = true,
             _ => {}
         }
+        self.clock_ns = self.clock_ns.max(at_ns);
         let measure = self.granularity().zip(self.periods.mean_ns());
         let interval = measure.map(|(_, period)| self.pair_interval(period));
         let mtbf = self.exposure.mtbf();
@@ -838,6 +1159,7 @@ impl Detector {
         };
         let rtt = at_ns.saturating_sub(sent.at_ns);
         self.last_rtt_ns = Some(rtt);
+        self.measurement_misses = 0;
         if let Some(((granularity, period), interval)) = measure.zip(interval) {
             peer.stream.take(sent.seq, rtt, granularity, interval);
             if peer.stream.due() {
@@ -854,9 +1176,11 @@ impl Detector {
                     .take(sent.nonce, rtt, granularity, Duration::from_nanos(period));
             }
         }
-        let seconds = Duration::from_nanos(rtt).as_secs_f64();
+        // The error estimate remembers one round: one probe of each member the round holds.
         if let Some(coordinate) = self.peer_coordinates.get(&from) {
-            self.coordinates.update_with_rtt(coordinate, seconds);
+            let round = self.order.len();
+            self.coordinates
+                .update(coordinate, Duration::from_nanos(rtt), round);
         }
     }
 
@@ -890,6 +1214,7 @@ impl Detector {
     /// relay, at `at_ns`: the period's probe is answered. A relayed round trip is two paths' and
     /// is not the pair's sample.
     pub fn on_indirect_ack(&mut self, target: HostId, nonce: u64, at_ns: u64) {
+        self.clock_ns = self.clock_ns.max(at_ns);
         if let Some(probe) = self.probe.as_mut()
             && probe.target == target
             && probe.nonce == nonce
@@ -915,7 +1240,17 @@ impl Detector {
     pub fn on_ping_req(&mut self, target: HostId) -> Ping {
         let nonce = self.relayed;
         self.relayed = self.relayed.saturating_sub(1);
-        Ping { to: target, nonce }
+        Ping {
+            to: target,
+            nonce,
+            due_ns: None,
+        }
+    }
+
+    /// What the latest [`poll`](Detector::poll) found by this member's own probes, in the order
+    /// found, each with its evidence; replaced at every poll.
+    pub fn findings(&self) -> &[Finding] {
+        &self.findings
     }
 
     /// What this member has done and promised about `peer`.
@@ -924,6 +1259,13 @@ impl Detector {
             last_answer_ns: held.last_answer_ns,
             ..held.report
         })
+    }
+
+    /// The round trips the pair's own estimator has taken of `peer`: the evidence it gathers
+    /// toward its own configuration, whose longest window, `hyper_timing::WINDOW_LIMIT`, bounds
+    /// what a configuration can need.
+    pub fn round_trips_taken(&self, peer: HostId) -> Option<u64> {
+        self.peers.get(&peer).map(|held| held.stream.samples)
     }
 
     /// The verdict that times this member's probes of `peer` now: the pair's, else the pool's.
@@ -968,16 +1310,20 @@ impl Detector {
 
     /// Learns `peer`'s network coordinate (from a probe reply or gossip). Only a member this node
     /// probes is learned, and a member's coordinate is forgotten when it is declared dead, so the
-    /// coordinates held are bounded by the membership.
+    /// coordinates held are bounded by the membership. A coordinate that cannot be used
+    /// ([`NetworkCoordinate::is_usable`]) is not learned: the one held, if any, stays.
     pub fn learn_coordinate(&mut self, peer: HostId, coordinate: Coordinate<'_>) {
         if peer == self.local || !self.is_probed(peer) {
             return;
         }
+        let coordinate = coordinate.to_coordinate();
+        if !coordinate.is_usable() {
+            return;
+        }
         match self.peer_coordinates.get_mut(&peer) {
-            Some(held) => coordinate.write_into(held),
+            Some(held) => *held = coordinate,
             None => {
-                self.peer_coordinates
-                    .insert(peer, coordinate.to_coordinate());
+                self.peer_coordinates.insert(peer, coordinate);
             }
         }
     }
@@ -1001,13 +1347,32 @@ impl Detector {
     }
 
     /// Applies a membership update, enqueues the change for gossip, and keeps the peer's suspicion
-    /// state in step with the view.
-    fn record(&mut self, subject: HostId, update: MemberState) -> Option<Change> {
-        let change = self.membership.apply(subject, update);
+    /// state in step with the view. An update about one member more than the view holds takes the
+    /// place of a dead member whose record is past its window, or is refused.
+    fn record(&mut self, subject: HostId, update: MemberState) -> Result<Option<Change>, Full> {
+        let change = match self.membership.apply(subject, update) {
+            Err(Full) => match self.expired(self.clock_ns) {
+                Some(member) => {
+                    self.forget(member);
+                    self.membership.apply(subject, update)
+                }
+                None => Err(Full),
+            },
+            applied => applied,
+        };
+        let change = match change {
+            Ok(change) => change,
+            Err(Full) => {
+                self.refused = self.refused.saturating_add(1);
+                return Err(Full);
+            }
+        };
+        let watched = u64::try_from(self.membership.len().saturating_sub(1)).unwrap_or(u64::MAX);
+        self.most_watched = self.most_watched.max(watched);
         match change {
             Some(Change::Adopted { member, state }) => {
                 self.gossip.record(member, state);
-                self.adopted(member, state.liveness);
+                self.adopted(member, state);
             }
             Some(Change::Refuted { incarnation }) => {
                 let state = MemberState {
@@ -1018,12 +1383,12 @@ impl Detector {
             }
             None => {}
         }
-        change
+        Ok(change)
     }
 
-    fn adopted(&mut self, member: HostId, liveness: Liveness) {
+    fn adopted(&mut self, member: HostId, state: MemberState) {
         let peer = self.peers.entry(member).or_insert_with(Peer::new);
-        match liveness {
+        match state.liveness {
             Liveness::Alive => peer.clear_suspicion(),
             // A suspicion already held, adopted again at a newer incarnation, keeps the probes
             // that told the peer: they carried a suspicion and went unanswered all the same.
@@ -1040,8 +1405,23 @@ impl Detector {
                 self.exposure.on_failure();
                 self.extensions.remove(&member);
                 self.peer_coordinates.remove(&member);
+                self.record_death(Death {
+                    member,
+                    incarnation: state.incarnation,
+                    at_ns: None,
+                });
             }
         }
+    }
+
+    /// Queues a death's record. Records the member has since left are purged once the queue holds
+    /// twice the view's bound, so it holds at most that, plus one.
+    fn record_death(&mut self, death: Death) {
+        if self.deaths.len() >= self.membership.capacity().saturating_mul(2) {
+            let membership = &self.membership;
+            self.deaths.retain(|held| held.held(membership));
+        }
+        self.deaths.push_back(death);
     }
 
     /// The batch of membership updates to piggyback on an outgoing message: up to `max`, the
@@ -1051,33 +1431,220 @@ impl Detector {
         self.gossip.drain(max, self.transmits, batch);
     }
 
-    /// The gossip batch to piggyback on a direct ping to `target`: the ordinary batch plus, while
-    /// this node suspects `target` or holds it dead, that belief — even after its transmit budget
-    /// is spent (Lifeguard's buddy system), so the target hears it from the probe it answers and
-    /// refutes at once. Within `max`: the least-fresh entry makes room.
+    /// The gossip batch to piggyback on a probe of `target`: the ordinary batch; this member's own
+    /// state, alive at its incarnation, so `target` learns it from every probe; and, while this
+    /// member suspects `target` or holds it dead, that belief, even after its transmit budget is
+    /// spent (Lifeguard's buddy system, §IV-C), so `target` hears it from the probe it answers and
+    /// refutes at once. A refutation is a rumor, and a rumor can end known to some members and not
+    /// all (Demers et al. 1987, §1.5): a member it missed holds the refuted member dead, or has
+    /// forgotten it, and probes it no more, but the refuted member still probes it, and its probes
+    /// carry the refutation. Within `max`: the two take their room first, the belief before the
+    /// state, and the ordinary batch the rest.
     pub fn ping_gossip_into(
         &mut self,
         target: HostId,
         max: usize,
         batch: &mut Vec<(HostId, MemberState)>,
     ) {
-        self.gossip_into(max, batch);
-        if let Some(state) = self.membership.state(target)
-            && state.liveness != Liveness::Alive
-            && !batch.iter().any(|(host, _)| *host == target)
-        {
-            if batch.len() >= max {
-                batch.pop();
+        let belief = self.belief(target);
+        let own = MemberState {
+            liveness: Liveness::Alive,
+            incarnation: self.membership.local_incarnation(),
+        };
+        self.gossip_with(max, [belief, Some((self.local, own))], batch);
+    }
+
+    /// The gossip batch to piggyback on the answer to a probe from `prober`: the ordinary batch
+    /// and, while this member suspects `prober` or holds it dead, that belief. Nobody probes the
+    /// dead, so the answer is where a member held dead hears it, at the incarnation it died at, and
+    /// refutes; its next probe revives it here. Within `max`: the belief takes its room first.
+    pub fn ack_gossip_into(
+        &mut self,
+        prober: HostId,
+        max: usize,
+        batch: &mut Vec<(HostId, MemberState)>,
+    ) {
+        let belief = self.belief(prober);
+        self.gossip_with(max, [belief, None], batch);
+    }
+
+    /// What this member holds against `peer`: its suspicion or death, if it holds either.
+    fn belief(&self, peer: HostId) -> Option<(HostId, MemberState)> {
+        self.membership
+            .state(peer)
+            .filter(|state| state.liveness != Liveness::Alive)
+            .map(|state| (peer, state))
+    }
+
+    /// The ordinary batch in the room `entries` leave of `max`, then `entries`, in order, within
+    /// `max`. A rumor is drained only into room it is sent in, so none is counted sent that was
+    /// not; an entry that repeats a rumor of the same state is applied twice, to no effect.
+    fn gossip_with(
+        &mut self,
+        max: usize,
+        entries: [Option<(HostId, MemberState)>; 2],
+        batch: &mut Vec<(HostId, MemberState)>,
+    ) {
+        let forced = entries.iter().flatten().count();
+        self.gossip_into(max.saturating_sub(forced), batch);
+        for entry in entries.into_iter().flatten() {
+            if batch.len() < max {
+                batch.push(entry);
             }
-            batch.insert(0, (target, state));
         }
     }
 
     /// Applies a received gossip batch, folding each update into the view (and re-enqueueing
-    /// anything it adopts so the change spreads onward).
+    /// anything it adopts so the change spreads onward). An update the view's bound refuses is
+    /// counted ([`Detector::refused`]) and the rest still apply.
     pub fn apply_gossip(&mut self, updates: impl IntoIterator<Item = (HostId, MemberState)>) {
         for (subject, state) in updates {
-            self.apply(subject, state);
+            let _refused_and_counted = self.apply(subject, state);
+        }
+    }
+
+    /// Updates the view's bound refused, as [`Full`]: an update about one member more than it
+    /// holds while no dead member's record was past its window.
+    pub fn refused(&self) -> u64 {
+        self.refused
+    }
+
+    /// The next message of anti-entropy to send (Demers et al. 1987, §1.3 and §1.5), and to whom:
+    /// the push of its view this member owes first, then the opening of an exchange it began.
+    /// Fills `batch` with up to `max` members of its view, each with its state, its own included,
+    /// in id order after the last it sent, replacing what `batch` held: none for an opening, which
+    /// carries the view's digest alone. `None` once nothing is left to send. The owner sends each as
+    /// a [`SwimMessage::Sync`](crate::codec::SwimMessage::Sync) and asks again until `None`, after
+    /// each [`poll`](Detector::poll) and each message it takes. An exchange begins once a
+    /// dissemination window after the last, with the next partner of a shuffled cycle of the
+    /// members this one holds alive; one whose opening the owner has not taken is let go first.
+    pub fn sync_into(
+        &mut self,
+        max: usize,
+        batch: &mut Vec<(HostId, MemberState)>,
+    ) -> Option<ViewChunk> {
+        batch.clear();
+        let digest = self.membership.digest();
+        if let Some(push) = self.exchanges.answer.take()
+            && max > 0
+        {
+            batch.extend(self.membership.after(push.after).take(max));
+            if let Some(&(last, _)) = batch.last() {
+                let more = self.membership.after(Some(last)).next().is_some();
+                self.exchanges.answer = more.then_some(Push {
+                    after: Some(last),
+                    pull: false,
+                    ..push
+                });
+                return Some(ViewChunk {
+                    to: push.to,
+                    pull: push.pull,
+                    digest,
+                });
+            }
+        }
+        let to = self.exchanges.opening.take()?;
+        Some(ViewChunk {
+            to,
+            pull: true,
+            digest,
+        })
+    }
+
+    /// Takes a message of anti-entropy from `from` (a
+    /// [`SwimMessage::Sync`](crate::codec::SwimMessage::Sync)) carrying the digest of its view:
+    /// each member's state it carries applied as gossip is. An opening, carrying none, whose digest
+    /// differs from this member's earns a push of this view asking `from`'s in return; one whose
+    /// digest is the same earns nothing, the views agreeing. A push that asks a pull earns a push of
+    /// this view. A member owes one push at a time: a pull from another while it owes one is
+    /// refused and counted ([`pulls_refused`](Detector::pulls_refused)).
+    pub fn on_sync(
+        &mut self,
+        from: HostId,
+        digest: u64,
+        pull: bool,
+        entries: impl IntoIterator<Item = (HostId, MemberState)>,
+    ) {
+        let mut carried = false;
+        for (subject, state) in entries {
+            carried = true;
+            // An update about one member more than the view holds is refused, and counted.
+            let _refused_and_counted = self.apply(subject, state);
+        }
+        if !pull {
+            return;
+        }
+        let ask = if carried {
+            false
+        } else if digest != self.membership.digest() {
+            true
+        } else {
+            return;
+        };
+        match self.exchanges.answer {
+            None => {
+                self.exchanges.answer = Some(Push {
+                    to: from,
+                    after: None,
+                    pull: ask,
+                });
+            }
+            Some(answer) if answer.to == from => {}
+            Some(_) => self.exchanges.refused = self.exchanges.refused.saturating_add(1),
+        }
+    }
+
+    /// Pulls refused because an answer to another member was owed ([`on_sync`](Detector::on_sync)).
+    pub fn pulls_refused(&self) -> u64 {
+        self.exchanges.refused
+    }
+
+    /// Begins an exchange once a dissemination window has passed since the last began: an opening
+    /// to the next partner, carrying this view's digest and asking the partner's view if its own
+    /// differs. One whose opening the owner has not taken is let go first.
+    fn begin_exchange(&mut self, now_ns: u64) {
+        if self.exchanges.opening.is_some() {
+            return;
+        }
+        let Some(window) = self.dissemination_window_ns(now_ns) else {
+            return;
+        };
+        if self
+            .exchanges
+            .began_ns
+            .is_some_and(|began| now_ns.saturating_sub(began) < window)
+        {
+            return;
+        }
+        self.exchanges.began_ns = Some(now_ns);
+        self.exchanges.opening = self.next_partner();
+    }
+
+    /// The next partner in a shuffled cycle of the members this one holds alive, besides itself,
+    /// rebuilt when it runs out: over a cycle the member exchanges with every member it held alive
+    /// when the cycle began. `None` when it holds nobody else alive.
+    fn next_partner(&mut self) -> Option<HostId> {
+        loop {
+            while let Some(&candidate) = self.exchanges.partners.get(self.exchanges.cursor) {
+                self.exchanges.cursor = self.exchanges.cursor.saturating_add(1);
+                if self
+                    .membership
+                    .state(candidate)
+                    .is_some_and(|state| state.liveness == Liveness::Alive)
+                {
+                    return Some(candidate);
+                }
+            }
+            let local = self.local;
+            self.exchanges.partners.clear();
+            self.exchanges
+                .partners
+                .extend(self.membership.alive().filter(|host| *host != local));
+            if self.exchanges.partners.is_empty() {
+                return None;
+            }
+            self.shuffler.shuffle(&mut self.exchanges.partners);
+            self.exchanges.cursor = 0;
         }
     }
 
@@ -1086,8 +1653,9 @@ impl Detector {
         &self.membership
     }
 
-    /// Learns a peer (alive at incarnation zero) — a join. A later round will probe it.
-    pub fn join(&mut self, peer: HostId) {
+    /// Learns a peer (alive at incarnation zero) — a join. A later round will probe it. Refused
+    /// when the view holds its bound ([`Full`]).
+    pub fn join(&mut self, peer: HostId) -> Result<(), Full> {
         if peer != self.local {
             self.record(
                 peer,
@@ -1095,13 +1663,14 @@ impl Detector {
                     liveness: Liveness::Alive,
                     incarnation: 0,
                 },
-            );
+            )?;
         }
+        Ok(())
     }
 
     /// Applies a gossiped membership update, returning the change and enqueuing it for onward
-    /// gossip.
-    pub fn apply(&mut self, subject: HostId, update: MemberState) -> Option<Change> {
+    /// gossip; refused, and counted, when it is about one member more than the view holds.
+    pub fn apply(&mut self, subject: HostId, update: MemberState) -> Result<Option<Change>, Full> {
         self.record(subject, update)
     }
 
@@ -1129,7 +1698,10 @@ impl Detector {
         loop {
             while let Some(&candidate) = self.order.get(self.cursor) {
                 self.cursor = self.cursor.saturating_add(1);
-                if self.is_probed(candidate) || self.isolated() {
+                // Isolated, it probes the dead it still holds; one forgotten mid-round is no target.
+                if self.is_probed(candidate)
+                    || (self.membership.state(candidate).is_some() && self.isolated())
+                {
                     return Some(candidate);
                 }
             }
@@ -1152,6 +1724,7 @@ impl Detector {
                 return None;
             }
             self.transmits = gossip_transmits(self.order.len().saturating_add(1));
+            self.most_transmits = self.most_transmits.max(self.transmits);
             self.shuffler.shuffle(&mut self.order);
             self.cursor = 0;
         }
@@ -1239,11 +1812,16 @@ mod tests {
         *state
     }
 
+    /// Room for every member a test names.
+    fn room() -> NonZeroUsize {
+        NonZeroUsize::new(16).unwrap()
+    }
+
     /// A detector for `LOCAL` that knows `peers`.
     fn detector(peers: &[HostId]) -> Detector {
-        let mut detector = Detector::new(LOCAL, Exposure::new());
+        let mut detector = Detector::new(LOCAL, Exposure::new(), room());
         for &peer in peers {
-            detector.join(peer);
+            detector.join(peer).unwrap();
         }
         detector
     }
@@ -1258,6 +1836,8 @@ mod tests {
         pings: Vec<Ping>,
         requests: Vec<PingReq>,
         asked: Vec<PingReq>,
+        /// What each poll found, in order.
+        found: Vec<Finding>,
     }
 
     impl World {
@@ -1269,6 +1849,7 @@ mod tests {
                 pings: Vec::new(),
                 requests: Vec::new(),
                 asked: Vec::new(),
+                found: Vec::new(),
             }
         }
 
@@ -1282,7 +1863,9 @@ mod tests {
             let mut pending: Option<(HostId, u64, u64)> = None;
             let mut started = 0;
             while started <= periods {
-                if let Some(ping) = detector.poll(self.now, &mut self.requests) {
+                let ping = detector.poll(self.now, &mut self.requests);
+                self.found.extend_from_slice(detector.findings());
+                if let Some(ping) = ping {
                     self.pings.push(ping);
                     started += 1;
                     pending = answer(ping.to).map(|rtt| (ping.to, ping.nonce, self.now + rtt));
@@ -1360,6 +1943,52 @@ mod tests {
         );
     }
 
+    /// Measurement periods follow round trips that lengthen. A measurement period ends at its
+    /// expected arrival from the latest round trip; when the round trips lengthen past what the
+    /// outstanding probes cover (three a peer), every answer comes for a probe written over, none
+    /// is measured, the latest round trip never lengthens, and the member probes on at the stale
+    /// pace and never configures: the cluster test's spin, a member 43,557 periods into a run with
+    /// nothing judged while the others condemned it, slow to answer, 95 times.
+    #[test]
+    fn measurement_periods_follow_round_trips_that_lengthen() {
+        let mut detector = detector(&[A, B]);
+        let mut requests = Vec::new();
+        // Answers in flight: when each arrives, from whom, for which probe.
+        let mut flight: Vec<(u64, HostId, u64)> = Vec::new();
+        let mut now = MS;
+        let mut periods = 0;
+        while periods < 2_000 {
+            // A quick first round trip, then the load arrives: a hundred times as long.
+            let rtt = if periods < 4 { MS / 20 } else { 5 * MS };
+            if let Some(ping) = detector.poll(now, &mut requests) {
+                periods += 1;
+                flight.push((now + rtt, ping.to, ping.nonce));
+            }
+            let arrival = flight.iter().map(|(at, _, _)| *at).min();
+            now = match (detector.wake().map(|wake| wake + MS / 100), arrival) {
+                (Some(wake), Some(at)) => wake.min(at),
+                (Some(wake), None) => wake,
+                (None, Some(at)) => at,
+                (None, None) => {
+                    detector.on_ping(C);
+                    now + MS
+                }
+            }
+            .max(now);
+            flight.retain(|&(at, from, nonce)| {
+                let due = at <= now;
+                if due {
+                    detector.on_ack(from, nonce, at);
+                }
+                !due
+            });
+        }
+        assert!(
+            detector.verdict(A).is_some() && detector.verdict(B).is_some(),
+            "configured from the lengthened round trips"
+        );
+    }
+
     /// A reconfiguration the estimator refuses leaves the verdict in force: under a CPU throttle a
     /// stall made `τ_int` unmeasured again, the verdict went, and the probe that would have
     /// suspected a crashed member was not judged (one Linux run in three hundred at one CPU).
@@ -1406,14 +2035,34 @@ mod tests {
             assert_ne!(liveness(&detector, A), Liveness::Dead, "pending first");
         }
         let incarnation = detector.membership().state(A).unwrap().incarnation;
-        detector.apply(
-            A,
-            MemberState {
-                liveness: Liveness::Suspect,
-                incarnation: incarnation + 1,
-            },
-        );
+        detector
+            .apply(
+                A,
+                MemberState {
+                    liveness: Liveness::Suspect,
+                    incarnation: incarnation + 1,
+                },
+            )
+            .unwrap();
         assert!(detector.report(A).unwrap().pending_since_ns.is_some());
+    }
+
+    /// A member whose probes judge nothing yet states no detection bound: an unanswered probe
+    /// suspects nobody until a verdict times it, so a death the member holds then is another's,
+    /// adopted, on that member's timeline (the cluster test noted such a death, held from a
+    /// gossiped condemnation 7 ms into the run, against a bound of 2.5 ms its probes could not
+    /// keep).
+    #[test]
+    fn a_member_that_judges_nothing_states_no_bound() {
+        let peers = [A, B];
+        let mut detector = detector(&peers);
+        let mut world = World::new();
+        world.run(&mut detector, 2, |_| Some(MS));
+        assert!(detector.periods.count > 0);
+        assert!(peers.iter().all(|peer| detector.verdict(*peer).is_none()));
+        assert_eq!(detector.detection_bound(world.now), None);
+        configured(&mut detector, &mut world, &peers);
+        assert!(detector.detection_bound(world.now).is_some());
     }
 
     /// The detection bound counts every member the view holds, not the current round's: a member
@@ -1427,18 +2076,168 @@ mod tests {
         configured(&mut detector, &mut world, &peers);
         let before = detector.detection_bound(world.now).unwrap();
         for peer in [B, C] {
-            detector.apply(
-                peer,
-                MemberState {
-                    liveness: Liveness::Dead,
-                    incarnation: 0,
-                },
-            );
+            detector
+                .apply(
+                    peer,
+                    MemberState {
+                        liveness: Liveness::Dead,
+                        incarnation: 0,
+                    },
+                )
+                .unwrap();
         }
         let mut state = 17;
         world.run(&mut detector, 4, |_| Some(jitter(&mut state)));
         assert_eq!(detector.order.len(), 1, "a round of one");
         assert!(detector.detection_bound(world.now).unwrap() >= before);
+        // Nor once the dead are forgotten: they were in the rounds before.
+        while detector.membership().len() > 2 {
+            world.run(&mut detector, 1, |_| Some(jitter(&mut state)));
+        }
+        assert!(detector.detection_bound(world.now).unwrap() >= before);
+    }
+
+    fn alive(incarnation: u64) -> MemberState {
+        MemberState {
+            liveness: Liveness::Alive,
+            incarnation,
+        }
+    }
+
+    fn dead(incarnation: u64) -> MemberState {
+        MemberState {
+            liveness: Liveness::Dead,
+            incarnation,
+        }
+    }
+
+    /// Gossip naming more members than the view holds is refused past its bound, typed and
+    /// counted, and nothing keyed by a member outgrows the view.
+    #[test]
+    fn gossip_of_more_members_than_the_view_holds_is_refused() {
+        let mut detector = Detector::new(LOCAL, Exposure::new(), NonZeroUsize::new(8).unwrap());
+        detector.apply_gossip((10..10_010u64).map(|id| (HostId(id), alive(0))));
+        assert_eq!(
+            detector.membership().len(),
+            8,
+            "the bound, this one included"
+        );
+        assert_eq!(detector.refused(), 10_000 - 7);
+        assert_eq!(detector.apply(HostId(1 << 40), alive(0)), Err(Full));
+        assert_eq!(
+            detector.apply(HostId(1 << 40), dead(0)),
+            Ok(None),
+            "a death of a member not held changes nothing"
+        );
+        assert_eq!(detector.join(HostId(1 << 41)), Err(Full));
+        assert!(detector.peers.len() <= 7);
+        assert!(detector.gossip.pending() <= 7);
+    }
+
+    /// A dead member's record is kept for the window in which gossip of it from before its death
+    /// can still arrive, and refuses that gossip; then it is forgotten, with everything held of
+    /// it, and a later incarnation's alive, a live member refuting, is a member again.
+    #[test]
+    fn a_dead_member_is_forgotten_once_its_window_has_passed() {
+        let peers = [A, B, C];
+        let mut detector = detector(&peers);
+        let mut world = World::new();
+        configured(&mut detector, &mut world, &peers);
+        let mut state = 23;
+        while liveness(&detector, A) != Liveness::Dead {
+            world.run(&mut detector, 1, |peer| {
+                (peer != A).then(|| jitter(&mut state))
+            });
+        }
+        let died = detector.membership().state(A).unwrap().incarnation;
+        let stamped = loop {
+            if let Some(at) = detector.deaths.back().and_then(|death| death.at_ns) {
+                break at;
+            }
+            world.run(&mut detector, 0, |peer| {
+                (peer != A).then(|| jitter(&mut state))
+            });
+        };
+        let window = detector.dissemination_window_ns(world.now).unwrap();
+        while detector.membership().state(A).is_some() {
+            assert_eq!(
+                detector.apply(A, alive(died)),
+                Ok(None),
+                "gossip from before the death is refused by its record"
+            );
+            world.run(&mut detector, 1, |peer| {
+                (peer != A).then(|| jitter(&mut state))
+            });
+        }
+        assert!(world.now - stamped >= window, "kept for its window");
+        assert_eq!(detector.report(A), None);
+        assert_eq!(detector.predicted_rtt(A), None);
+        assert!(!detector.peers.contains_key(&A));
+        assert!(detector.apply(A, alive(died + 1)).unwrap().is_some());
+        assert_eq!(liveness(&detector, A), Liveness::Alive, "a member again");
+    }
+
+    /// A member with nobody alive or suspected left keeps its dead past their windows: they are
+    /// the members it probes, and a live one among them refutes.
+    #[test]
+    fn an_isolated_member_keeps_its_dead() {
+        let peers = [A, B, C];
+        let mut detector = detector(&peers);
+        let mut world = World::new();
+        configured(&mut detector, &mut world, &peers);
+        for peer in peers {
+            let incarnation = detector.membership().state(peer).unwrap().incarnation;
+            detector.apply(peer, dead(incarnation)).unwrap();
+        }
+        world.run(&mut detector, 1, |_| None);
+        let stamped = detector
+            .deaths
+            .back()
+            .and_then(|death| death.at_ns)
+            .unwrap();
+        while world.now - stamped <= 2 * detector.dissemination_window_ns(world.now).unwrap() {
+            world.run(&mut detector, 1, |_| None);
+        }
+        for peer in peers {
+            assert_eq!(liveness(&detector, peer), Liveness::Dead, "{peer:?}");
+        }
+        let last = world.pings.last().unwrap().to;
+        assert!(peers.contains(&last), "it probes its dead");
+    }
+
+    /// At its bound, a member takes a newcomer in place of a dead member's record past its window,
+    /// and refuses one while the records are inside theirs.
+    #[test]
+    fn a_record_past_its_window_makes_room_and_one_inside_it_does_not() {
+        let peers = [A, B, C];
+        let mut detector = Detector::new(LOCAL, Exposure::new(), NonZeroUsize::new(4).unwrap());
+        for peer in peers {
+            detector.join(peer).unwrap();
+        }
+        let mut world = World::new();
+        configured(&mut detector, &mut world, &peers);
+        for peer in peers {
+            let incarnation = detector.membership().state(peer).unwrap().incarnation;
+            detector.apply(peer, dead(incarnation)).unwrap();
+        }
+        let newcomer = HostId(9);
+        assert_eq!(detector.apply(newcomer, alive(0)), Err(Full), "inside");
+        assert_eq!(detector.refused(), 1);
+        // Isolated, it forgets none of its dead on its own; the newcomer takes the oldest's place.
+        world.run(&mut detector, 1, |_| None);
+        let stamped = detector
+            .deaths
+            .back()
+            .and_then(|death| death.at_ns)
+            .unwrap();
+        while world.now - stamped <= detector.dissemination_window_ns(world.now).unwrap() {
+            world.run(&mut detector, 1, |_| None);
+        }
+        assert_eq!(detector.membership().len(), 4);
+        assert!(detector.apply(newcomer, alive(0)).unwrap().is_some());
+        assert_eq!(liveness(&detector, newcomer), Liveness::Alive);
+        assert_eq!(detector.membership().len(), 4, "one record gave its place");
+        assert_eq!(detector.refused(), 1);
     }
 
     #[test]
@@ -1534,12 +2333,16 @@ mod tests {
         let mut detector = detector(&peers);
         let mut world = World::new();
         configured(&mut detector, &mut world, &peers);
-        // Run until a probe of A is out, unanswered directly.
+        // Run until a probe of A is out, unanswered directly: one started in a run that leaves A
+        // unanswered, not the last of the configuring runs, which answered everyone.
         let mut state = 3;
-        while world.pings.last().map(|p| p.to) != Some(A) {
+        loop {
             world.run(&mut detector, 0, |peer| {
                 (peer != A).then(|| jitter(&mut state))
             });
+            if world.pings.last().map(|p| p.to) == Some(A) {
+                break;
+            }
         }
         let ping = *world.pings.last().unwrap();
         world.now = ping_sent(&detector);
@@ -1571,28 +2374,35 @@ mod tests {
                 (peer != A).then(|| jitter(&mut state))
             });
         }
-        detector.apply(
-            A,
-            MemberState {
-                liveness: Liveness::Alive,
-                incarnation: 1,
-            },
-        );
+        detector
+            .apply(
+                A,
+                MemberState {
+                    liveness: Liveness::Alive,
+                    incarnation: 1,
+                },
+            )
+            .unwrap();
         world.run(&mut detector, 30, |_| Some(jitter(&mut state)));
         assert_eq!(liveness(&detector, A), Liveness::Alive);
         assert_eq!(detector.report(A).unwrap().condemnations, 0);
     }
 
+    /// The probes of a suspect that tell it: its condemnation is pending once the first goes
+    /// unanswered, and made at the next answer from another member; an extension buys exactly one
+    /// more. Each finding carries its probe, and the condemnation the pending one's end.
     #[test]
     fn an_extension_buys_one_more_told_probe() {
         let peers = [A, B, C];
-        let silent_after = |extend: bool| {
+        // The told probe whose miss made the condemnation pending: the first after the suspicion,
+        // or with an extension the second.
+        let pending_after = |extend: bool| {
             let mut detector = detector(&peers);
             let mut world = World::new();
             configured(&mut detector, &mut world, &peers);
             let mut state = 9;
             while liveness(&detector, A) != Liveness::Suspect {
-                world.run(&mut detector, 1, |peer| {
+                world.run(&mut detector, 0, |peer| {
                     (peer != A).then(|| jitter(&mut state))
                 });
             }
@@ -1606,18 +2416,69 @@ mod tests {
                     ExtensionDecision::Denied(ExtensionDenial::RateLimited)
                 );
             }
-            let mut probes = 0;
+            // A's probes are at most 2m − 1 periods apart (SWIM §4.3), and the answer from another
+            // member that condemns comes at most two periods after the told probe's (A last in one
+            // round and first in the next): the condemnation within that many periods a told
+            // probe, and two.
+            let told = if extend { 2 } else { 1 };
+            let limit = (2 * peers.len() - 1) * told + 2;
+            let suspected = world.pings.len();
             while liveness(&detector, A) != Liveness::Dead {
-                let before = world.pings.len();
-                world.run(&mut detector, 1, |peer| {
+                world.run(&mut detector, 0, |peer| {
                     (peer != A).then(|| jitter(&mut state))
                 });
-                probes += world.pings[before..].iter().filter(|p| p.to == A).count();
-                assert!(probes < 10, "never condemned");
+                assert!(
+                    world.pings.len() - suspected <= limit,
+                    "not condemned within {limit} periods"
+                );
             }
-            probes
+            let suspicion = world
+                .found
+                .iter()
+                .rev()
+                .find_map(|found| match found {
+                    Finding::Suspected(missed) if missed.target == A => Some(*missed),
+                    _ => None,
+                })
+                .unwrap();
+            let told_probes: Vec<u64> = world
+                .pings
+                .iter()
+                .filter(|ping| ping.to == A && ping.nonce > suspicion.nonce)
+                .map(|ping| ping.nonce)
+                .collect();
+            let pending: Vec<Unanswered> = world
+                .found
+                .iter()
+                .filter_map(|found| match found {
+                    Finding::Pending(missed) if missed.target == A => Some(*missed),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(pending.len(), 1);
+            let condemned: Vec<(u64, HostId)> = world
+                .found
+                .iter()
+                .filter_map(|found| match found {
+                    Finding::Condemned {
+                        target,
+                        pending_since_ns,
+                        answered,
+                        ..
+                    } if *target == A => Some((*pending_since_ns, *answered)),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(condemned.len(), 1);
+            assert_eq!(condemned[0].0, pending[0].ended_ns);
+            assert_ne!(condemned[0].1, A, "another member's answer");
+            told_probes
+                .iter()
+                .position(|nonce| *nonce == pending[0].nonce)
+                .unwrap()
         };
-        assert!(silent_after(true) > silent_after(false));
+        assert_eq!(pending_after(false), 0, "the first told probe");
+        assert_eq!(pending_after(true), 1, "the second");
         let mut detector = detector(&peers);
         assert_eq!(
             detector.request_extension(A, 1, false),
@@ -1640,20 +2501,18 @@ mod tests {
                 .map(|verdict| verdict.mistake)
         };
         let mut pending = in_force(&detector);
-        let (mut sum, mut state) = (0.0, 13);
+        let (mut sum, mut state) = (before.suspicion_allowance, 13);
         for _ in 0..60 {
-            // One new probe a call: the one before it is resolved by then.
+            // One new probe a call: the one before it is resolved by then, its bound added.
             world.run(&mut detector, 0, |_| Some(jitter(&mut state)));
-            sum += pending.take().unwrap_or(0.0);
+            if let Some(mistake) = pending.take() {
+                sum += mistake;
+            }
             pending = in_force(&detector);
         }
         let after = detector.report(A).unwrap();
-        assert!(sum > 0.0);
-        assert!(
-            (after.suspicion_allowance - before.suspicion_allowance - sum).abs() < 1e-12,
-            "{} against {sum}",
-            after.suspicion_allowance - before.suspicion_allowance
-        );
+        assert!(sum > before.suspicion_allowance);
+        assert_eq!(after.suspicion_allowance, sum);
         assert_eq!(after.suspicions, 0);
     }
 
@@ -1661,19 +2520,27 @@ mod tests {
     fn the_dissemination_budget_is_swims_bound() {
         assert_eq!(gossip_transmits(1), 1);
         assert_eq!(gossip_transmits(2), 1);
+        let fraction = f64::from(1u32 << crate::fixed::FRACTION_BITS);
         for n in 3..2_000usize {
             let t = gossip_transmits(n);
             let nf = n as f64;
-            let lambda = f64::from(t) / nf.ln();
-            // SWIM §4.1: at most n^{−((2−4/n)λ−2)} members uninfected in expectation, below one.
-            let uninfected = nf.powf(-((2.0 - 4.0 / nf) * lambda - 2.0));
-            assert!(uninfected < 1.0, "{n}: {t} transmits leave {uninfected}");
-            // And one fewer would not (to within the fixed-point logarithm).
-            let fewer = f64::from(t - 1) / nf.ln();
+            // The least whole count past n·ln n/(n − 2), at the fixed-point logarithm every host
+            // computes alike.
+            let ln = crate::fixed::log2_fixed(n as u64) as f64 / fraction * std::f64::consts::LN_2;
+            let rounds = nf * ln / (nf - 2.0);
             assert!(
-                nf.powf(-((2.0 - 4.0 / nf) * fewer - 2.0)) >= 0.99,
-                "{n}: {t} is not the least"
+                f64::from(t - 1) <= rounds && rounds < f64::from(t),
+                "{n}: {t} against {rounds}"
             );
+            // SWIM §4.1: n^{−((2−4/n)λ−2)} members uninfected in expectation, below one exactly
+            // when the exponent is positive. At the true logarithm, t transmissions make it
+            // positive and t − 1 do not.
+            let exponent = |transmits: u32| (2.0 - 4.0 / nf) * f64::from(transmits) / nf.ln() - 2.0;
+            assert!(
+                exponent(t) > 0.0,
+                "{n}: {t} transmits leave a member uninfected"
+            );
+            assert!(exponent(t - 1) <= 0.0, "{n}: {t} is not the least");
         }
         assert_eq!(gossip_transmits(4), 3);
         assert_eq!(gossip_transmits(256), 6);
@@ -1695,7 +2562,7 @@ mod tests {
     #[test]
     fn a_change_is_gossiped_a_bounded_number_of_times() {
         let mut detector = detector(&[]);
-        detector.join(A);
+        detector.join(A).unwrap();
         let mut batch = Vec::new();
         detector.gossip_into(10, &mut batch);
         assert!(batch.iter().any(|(host, _)| *host == A), "sent once");
@@ -1715,7 +2582,7 @@ mod tests {
             liveness: Liveness::Suspect,
             incarnation: 0,
         };
-        detector.apply(A, suspicion);
+        detector.apply(A, suspicion).unwrap();
         let mut batch = Vec::new();
         for _ in 0..5 {
             detector.gossip_into(10, &mut batch);
@@ -1724,13 +2591,15 @@ mod tests {
         assert!(batch.contains(&(A, suspicion)), "the buddy system");
         detector.ping_gossip_into(B, 10, &mut batch);
         assert!(batch.iter().all(|(host, _)| *host != A));
-        detector.apply(
-            A,
-            MemberState {
-                liveness: Liveness::Alive,
-                incarnation: 1,
-            },
-        );
+        detector
+            .apply(
+                A,
+                MemberState {
+                    liveness: Liveness::Alive,
+                    incarnation: 1,
+                },
+            )
+            .unwrap();
         for _ in 0..5 {
             detector.gossip_into(10, &mut batch);
         }
@@ -1744,30 +2613,56 @@ mod tests {
     #[test]
     fn gossip_carries_a_change_to_another_node() {
         let mut source = detector(&[A]);
-        source.apply(
-            A,
-            MemberState {
-                liveness: Liveness::Dead,
-                incarnation: 0,
-            },
-        );
+        source
+            .apply(
+                A,
+                MemberState {
+                    liveness: Liveness::Dead,
+                    incarnation: 0,
+                },
+            )
+            .unwrap();
         let mut batch = Vec::new();
         source.gossip_into(10, &mut batch);
-        let mut other = Detector::new(B, Exposure::new());
+        let mut other = Detector::new(B, Exposure::new(), room());
+        other.join(A).unwrap();
         other.apply_gossip(batch);
         assert_eq!(liveness(&other, A), Liveness::Dead);
+    }
+
+    /// An exchange does not bring back a record a member has forgotten: a member still inside its
+    /// window pushes the death, and the one past it holds nothing of the member to override. Before,
+    /// it took the death as a newcomer's, restarting its window, and pushed it back in turn.
+    #[test]
+    fn an_exchange_does_not_bring_back_a_forgotten_record() {
+        let dead = MemberState {
+            liveness: Liveness::Dead,
+            incarnation: 0,
+        };
+        let mut world = World::new();
+        let mut first = running(LOCAL, &[A, C], &mut world);
+        let mut second = running(A, &[LOCAL, C], &mut world);
+        first.apply(C, dead).unwrap();
+        second.apply(C, dead).unwrap();
+        first.forget(C);
+        assert_eq!(first.membership().state(C), None);
+        assert_eq!(until_exchange(&mut first, &mut world), A);
+        exchange_views(&mut first, &mut second, 4);
+        assert_eq!(first.membership().state(C), None, "still forgotten");
     }
 
     #[test]
     fn a_dead_member_is_not_probed_while_another_lives() {
         let mut detector = detector(&[A, B]);
-        detector.apply(
-            A,
-            MemberState {
-                liveness: Liveness::Dead,
-                incarnation: 0,
-            },
-        );
+        detector
+            .apply(
+                A,
+                MemberState {
+                    liveness: Liveness::Dead,
+                    incarnation: 0,
+                },
+            )
+            .unwrap();
         let mut requests = Vec::new();
         for at in 0..6 {
             let ping = detector.poll(at, &mut requests).unwrap();
@@ -1781,8 +2676,8 @@ mod tests {
     /// (the cluster test's deadlock under a one-CPU throttle).
     #[test]
     fn members_that_hold_each_other_dead_heal() {
-        let (mut x, mut y) = (detector(&[A]), Detector::new(A, Exposure::new()));
-        y.join(LOCAL);
+        let (mut x, mut y) = (detector(&[A]), Detector::new(A, Exposure::new(), room()));
+        y.join(LOCAL).unwrap();
         let dead = |host| {
             (
                 host,
@@ -1800,17 +2695,17 @@ mod tests {
         for at in 1..4u64 {
             for prober in 0..2 {
                 let [first, second] = &mut detectors;
-                let (prober, answering) = if prober == 0 {
-                    (first, second)
+                let (prober, answering, from) = if prober == 0 {
+                    (first, second, LOCAL)
                 } else {
-                    (second, first)
+                    (second, first, A)
                 };
                 let Some(ping) = prober.poll(at * MS, &mut requests) else {
                     continue;
                 };
                 prober.ping_gossip_into(ping.to, 10, &mut batch);
                 answering.apply_gossip(batch.iter().copied());
-                answering.gossip_into(10, &mut batch);
+                answering.ack_gossip_into(from, 10, &mut batch);
                 prober.apply_gossip(batch.iter().copied());
                 prober.on_ack(ping.to, ping.nonce, at * MS + 1);
             }
@@ -1818,6 +2713,258 @@ mod tests {
         let [x, y] = detectors;
         assert_eq!(liveness(&x, A), Liveness::Alive);
         assert_eq!(liveness(&y, LOCAL), Liveness::Alive);
+    }
+
+    /// A refutation is a rumor, and a rumor can end known to some members and not all (Demers et
+    /// al. 1987, §1.5): a member it missed holds the refuted member dead, past the record's window
+    /// forgets it, and probes it no more. The refuted member's own messages carry its state, so
+    /// the first it sends there revives it, held dead or forgotten. Without it the cluster test's
+    /// second phase waited for ever, three runs in 1,119, on a member that had forgotten a live one.
+    #[test]
+    fn a_member_a_refutation_missed_hears_it_from_the_refuted_member() {
+        let dead = MemberState {
+            liveness: Liveness::Dead,
+            incarnation: 0,
+        };
+        let mut refuted = detector(&[A, B]);
+        refuted.apply(LOCAL, dead).unwrap();
+        assert_eq!(refuted.membership().local_incarnation(), 1);
+        // The refutation's rumor is spent before it reaches A or B.
+        let mut batch = Vec::new();
+        for _ in 0..8 {
+            refuted.gossip_into(10, &mut batch);
+        }
+        assert!(batch.is_empty());
+        let mut holds_dead = Detector::new(A, Exposure::new(), room());
+        holds_dead.join(LOCAL).unwrap();
+        holds_dead.apply(LOCAL, dead).unwrap();
+        let mut forgot = Detector::new(B, Exposure::new(), room());
+        forgot.join(LOCAL).unwrap();
+        forgot.apply(LOCAL, dead).unwrap();
+        forgot.forget(LOCAL);
+        assert!(forgot.membership().state(LOCAL).is_none());
+        let alive = (
+            LOCAL,
+            MemberState {
+                liveness: Liveness::Alive,
+                incarnation: 1,
+            },
+        );
+        refuted.ping_gossip_into(A, 10, &mut batch);
+        assert!(batch.contains(&alive));
+        holds_dead.apply_gossip(batch.iter().copied());
+        assert_eq!(liveness(&holds_dead, LOCAL), Liveness::Alive, "held dead");
+        refuted.ping_gossip_into(B, 10, &mut batch);
+        forgot.apply_gossip(batch.iter().copied());
+        assert_eq!(liveness(&forgot, LOCAL), Liveness::Alive, "forgotten");
+    }
+
+    /// Carries every message of anti-entropy `from` has for `to`, as its owner would. Whether any.
+    fn deliver(from: &mut Detector, to: &mut Detector, room: usize) -> bool {
+        let mut batch = Vec::new();
+        let mut any = false;
+        while let Some(chunk) = from.sync_into(room, &mut batch) {
+            assert_eq!(chunk.to, to.local);
+            assert_eq!(chunk.digest, from.membership().digest());
+            to.on_sync(from.local, chunk.digest, chunk.pull, batch.iter().copied());
+            any = true;
+        }
+        any
+    }
+
+    /// Carries anti-entropy both ways between `first` and `second` until neither owes the other.
+    fn exchange_views(first: &mut Detector, second: &mut Detector, room: usize) {
+        for _ in 0..8 {
+            let there = deliver(first, second, room);
+            let back = deliver(second, first, room);
+            if !there && !back {
+                return;
+            }
+        }
+        panic!("the exchange did not end");
+    }
+
+    /// A detector for `local` that knows `peers` and has run a few periods, everyone answering: it
+    /// has a dissemination window.
+    fn running(local: HostId, peers: &[HostId], world: &mut World) -> Detector {
+        let mut detector = Detector::new(local, Exposure::new(), room());
+        for &peer in peers {
+            detector.join(peer).unwrap();
+        }
+        world.run(&mut detector, 4, |_| Some(MS));
+        assert!(detector.dissemination_window_ns(world.now).is_some());
+        // The exchange the run began, which the world does not carry.
+        while detector.sync_into(64, &mut Vec::new()).is_some() {}
+        detector
+    }
+
+    /// Runs `detector`'s periods, everyone it probes answering, until it begins an exchange: the
+    /// partner its opening is for.
+    fn until_exchange(detector: &mut Detector, world: &mut World) -> HostId {
+        for _ in 0..1_000 {
+            world.run(detector, 1, |_| Some(MS));
+            if let Some(partner) = detector.exchanges.opening {
+                return partner;
+            }
+        }
+        panic!("no exchange began");
+    }
+
+    /// Two live members that each hold the other dead, both refutations missed, probe neither each
+    /// other nor anyone about each other: a rumor can end known to some members and not all
+    /// (Demers et al. 1987, §1.5), and the prober's own state reaches only the members it probes.
+    /// An exchange with a third member that holds both alive revives each at the other: the
+    /// digests differ, so the third answers with its view.
+    #[test]
+    fn a_mutual_split_heals_through_a_third_member() {
+        let dead = MemberState {
+            liveness: Liveness::Dead,
+            incarnation: 0,
+        };
+        let mut world = World::new();
+        let (x, y, z) = (LOCAL, A, B);
+        let mut first = running(x, &[y, z], &mut world);
+        let mut second = running(y, &[x, z], &mut world);
+        let mut third = running(z, &[x, y], &mut world);
+        // Each was condemned and refuted; the refutations reached the third member only.
+        first.apply(x, dead).unwrap();
+        second.apply(y, dead).unwrap();
+        first.apply(y, dead).unwrap();
+        second.apply(x, dead).unwrap();
+        third.apply(x, alive(1)).unwrap();
+        third.apply(y, alive(1)).unwrap();
+        // The third member is the only one either holds alive, so the partner each exchange finds.
+        assert_eq!(until_exchange(&mut first, &mut world), z);
+        exchange_views(&mut first, &mut third, 4);
+        assert_eq!(first.membership().state(y), Some(alive(1)));
+        assert_eq!(until_exchange(&mut second, &mut world), z);
+        exchange_views(&mut second, &mut third, 4);
+        assert_eq!(second.membership().state(x), Some(alive(1)));
+        assert_eq!(first.membership().digest(), third.membership().digest());
+    }
+
+    /// Two views that agree exchange their digests and nothing more: the opening earns no answer.
+    #[test]
+    fn agreeing_views_exchange_only_their_digests() {
+        let mut world = World::new();
+        let mut first = running(LOCAL, &[A], &mut world);
+        let mut second = running(A, &[LOCAL], &mut world);
+        assert_eq!(first.membership().digest(), second.membership().digest());
+        assert_eq!(until_exchange(&mut first, &mut world), A);
+        let mut batch = Vec::new();
+        let opening = first.sync_into(64, &mut batch).unwrap();
+        assert!(opening.pull && batch.is_empty(), "the digest alone");
+        second.on_sync(LOCAL, opening.digest, opening.pull, batch.iter().copied());
+        assert_eq!(second.sync_into(64, &mut batch), None, "nothing owed");
+    }
+
+    /// A view goes in chunks of the room, in id order, its own state included; only the first
+    /// chunk of the answer to a differing opening asks a pull, and the push ends with the view.
+    #[test]
+    fn a_view_goes_in_chunks_of_the_room() {
+        let peers: Vec<HostId> = (2..=10).map(HostId).collect();
+        let mut world = World::new();
+        let mut detector = running(LOCAL, &peers, &mut world);
+        detector.on_sync(A, !detector.membership().digest(), true, []);
+        let mut batch = Vec::new();
+        let mut sent = Vec::new();
+        let mut pulls = Vec::new();
+        while let Some(chunk) = detector.sync_into(3, &mut batch) {
+            assert_eq!(chunk.to, A);
+            assert!(!batch.is_empty() && batch.len() <= 3);
+            pulls.push(chunk.pull);
+            sent.extend(batch.iter().map(|(host, _)| host.0));
+        }
+        assert_eq!(
+            sent,
+            (1..=10).collect::<Vec<_>>(),
+            "the whole view, in id order"
+        );
+        assert_eq!(pulls, [true, false, false, false]);
+    }
+
+    /// A member owes one push at a time: a pull from another while it owes one is refused and
+    /// counted, and answered once the first push is sent. A push that asks a pull earns one that
+    /// asks nothing.
+    #[test]
+    fn a_member_owes_one_answer_at_a_time() {
+        let mut detector = detector(&[A, B]);
+        let other = !detector.membership().digest();
+        detector.on_sync(A, other, true, []);
+        detector.on_sync(A, other, true, []);
+        detector.on_sync(B, other, true, []);
+        assert_eq!(detector.pulls_refused(), 1);
+        let mut batch = Vec::new();
+        let first = detector.sync_into(10, &mut batch).unwrap();
+        assert_eq!((first.to, first.pull), (A, true));
+        assert_eq!(batch.len(), 3, "the whole view in one chunk");
+        assert_eq!(detector.sync_into(10, &mut batch), None);
+        detector.on_sync(B, other, true, [(B, alive(0))]);
+        let answer = detector.sync_into(10, &mut batch).unwrap();
+        assert_eq!((answer.to, answer.pull), (B, false));
+    }
+
+    /// An exchange begins once a dissemination window after the last began, and over a cycle of
+    /// exchanges every member held alive is a partner once.
+    #[test]
+    fn an_exchange_begins_once_a_dissemination_window_and_cycles_its_partners() {
+        let peers = [A, B, C];
+        let mut world = World::new();
+        let mut detector = running(LOCAL, &peers, &mut world);
+        // A cycle starts afresh: the run began one, with its first partner.
+        detector.exchanges.partners.clear();
+        detector.exchanges.cursor = 0;
+        let mut requests = Vec::new();
+        let mut batch = Vec::new();
+        let mut partners = Vec::new();
+        for _ in 0..peers.len() {
+            let partner = until_exchange(&mut detector, &mut world);
+            let began = detector.exchanges.began_ns.unwrap();
+            let window = detector.dissemination_window_ns(world.now).unwrap();
+            partners.push(partner);
+            let opening = detector.sync_into(10, &mut batch).unwrap();
+            assert_eq!((opening.to, opening.pull), (partner, true));
+            detector.poll(world.now, &mut requests);
+            assert!(
+                detector.exchanges.opening.is_none() || world.now - began >= window,
+                "not again inside the window"
+            );
+            while detector.sync_into(10, &mut batch).is_some() {}
+        }
+        partners.sort();
+        assert_eq!(partners, peers, "each partner once in a cycle");
+    }
+
+    /// A member held dead at its own incarnation, which it never heard, is told so by the answer to
+    /// its probe (the buddy system, on answers as on probes, since a member does not probe the
+    /// dead): it refutes, and its next message revives it.
+    #[test]
+    fn an_answer_tells_a_member_it_is_held_dead_and_its_next_probe_revives_it() {
+        let dead = MemberState {
+            liveness: Liveness::Dead,
+            incarnation: 0,
+        };
+        let mut prober = detector(&[A]);
+        let mut holder = Detector::new(A, Exposure::new(), room());
+        holder.join(LOCAL).unwrap();
+        holder.apply(LOCAL, dead).unwrap();
+        let mut batch = Vec::new();
+        for _ in 0..8 {
+            holder.gossip_into(10, &mut batch);
+        }
+        assert!(batch.is_empty());
+        // The probe states the prober alive at the incarnation it died at: the death stands.
+        prober.ping_gossip_into(A, 10, &mut batch);
+        holder.apply_gossip(batch.iter().copied());
+        assert_eq!(liveness(&holder, LOCAL), Liveness::Dead);
+        // The answer tells it so; it refutes.
+        holder.ack_gossip_into(LOCAL, 10, &mut batch);
+        assert!(batch.contains(&(LOCAL, dead)));
+        prober.apply_gossip(batch.iter().copied());
+        assert_eq!(prober.membership().local_incarnation(), 1);
+        prober.ping_gossip_into(A, 10, &mut batch);
+        holder.apply_gossip(batch.iter().copied());
+        assert_eq!(liveness(&holder, LOCAL), Liveness::Alive);
     }
 
     #[test]
@@ -1835,19 +2982,36 @@ mod tests {
         }
     }
 
+    /// Every round trip measured to a peer whose coordinate is held teaches this member's
+    /// coordinate once, by the engine's update with the peer's coordinate and the round's size:
+    /// the detector's coordinate is, bit for bit, an engine's fed the same round trips.
     #[test]
     fn measured_round_trips_teach_the_coordinate() {
         let mut detector = detector(&[A]);
-        let mut peer = NetworkCoordinate::origin(8);
-        peer.vec[0] = 0.030;
+        let mut peer = NetworkCoordinate::origin();
+        peer.position[0] = 0.030;
         peer.error = 0.05;
         detector.learn_coordinate(A, Coordinate::Held(&peer));
         assert!(detector.predicted_rtt(A).is_some());
         assert_eq!(detector.predicted_rtt(B), None);
-        let mut world = World::new();
-        world.run(&mut detector, 400, |_| Some(35 * MS));
-        let predicted = detector.predicted_rtt(A).unwrap();
-        assert!((predicted - 0.035).abs() < 0.035 * 0.2, "{predicted}");
+        let mut engine = CoordinateEngine::new(LOCAL.0);
+        let rtt = 35 * MS;
+        let mut requests = Vec::new();
+        let mut now = MS;
+        for _ in 0..400 {
+            let ping = loop {
+                if let Some(ping) = detector.poll(now, &mut requests) {
+                    break ping;
+                }
+                now = detector.wake().unwrap();
+            };
+            now += rtt;
+            detector.on_ack(ping.to, ping.nonce, now);
+            // A round of one: A is the only member probed.
+            assert!(engine.update(&peer, Duration::from_nanos(rtt), 1));
+            assert_eq!(detector.coordinate(), engine.coordinate());
+        }
+        assert_eq!(detector.predicted_rtt(A), Some(engine.predict(&peer)));
     }
 
     #[test]
@@ -1855,14 +3019,83 @@ mod tests {
         let positions = [(A, 0.0), (B, 1.0), (C, 2.0), (HostId(5), 10.0)];
         let mut detector = detector(&[]);
         for &(host, x) in &positions {
-            detector.join(host);
-            let mut coordinate = NetworkCoordinate::origin(8);
-            coordinate.vec[0] = x;
+            detector.join(host).unwrap();
+            let mut coordinate = NetworkCoordinate::origin();
+            coordinate.position[0] = x;
             coordinate.error = 0.05;
             detector.learn_coordinate(host, Coordinate::Held(&coordinate));
         }
         detector.rank_relays(A);
         let ranked: Vec<HostId> = detector.relays.clone();
         assert_eq!(ranked, vec![B, C, HostId(5)]);
+    }
+
+    /// A coordinate that cannot be used is not learned, and the one held stays.
+    #[test]
+    fn an_unusable_coordinate_is_not_learned() {
+        let mut detector = detector(&[A]);
+        let mut held = NetworkCoordinate::origin();
+        held.position[0] = 0.002;
+        detector.learn_coordinate(A, Coordinate::Held(&held));
+        let mut broken = held;
+        broken.height = f64::NAN;
+        detector.learn_coordinate(A, Coordinate::Held(&broken));
+        assert_eq!(detector.peer_coordinates.get(&A), Some(&held));
+    }
+
+    /// Relays are ranked by coordinates the engine learned from round trips: three regions of three
+    /// members, a round trip the distance between two members' points and both their access heights,
+    /// with a little jitter. Once every member has sampled the others, round after round, the relays
+    /// a member ranks first for a target are the target's region-mates.
+    #[test]
+    fn relays_learned_from_round_trips_are_the_target_s_region() {
+        // Points in milliseconds: regions 30 to 50 ms apart, members within a millisecond.
+        let points: [(f64, f64); 9] = [
+            (0.0, 0.0),
+            (0.6, 0.2),
+            (0.3, 0.7),
+            (40.0, 0.0),
+            (40.5, 0.4),
+            (39.6, 0.6),
+            (0.0, 30.0),
+            (0.4, 30.5),
+            (0.8, 29.8),
+        ];
+        let heights = [0.2, 0.3, 0.1, 0.25, 0.15, 0.35, 0.3, 0.2, 0.1];
+        let rtt = |i: usize, j: usize| {
+            let (a, b) = (points[i], points[j]);
+            ((a.0 - b.0).hypot(a.1 - b.1) + heights[i] + heights[j]) / 1e3
+        };
+        let mut engines: Vec<CoordinateEngine> = (0..9u64).map(CoordinateEngine::new).collect();
+        let mut state = 0x2545_F491_4F6C_DD1D;
+        for _ in 0..300 {
+            for i in 0..9 {
+                for j in (0..9).filter(|j| *j != i) {
+                    // Up to 2 % either way.
+                    let jitter = 1.0 + ((noise(&mut state) % 41) as f64 - 20.0) / 1e3;
+                    let peer = *engines[j].coordinate();
+                    let sample = Duration::from_secs_f64(rtt(i, j) * jitter);
+                    assert!(engines[i].update(&peer, sample, 8));
+                }
+            }
+        }
+        let hosts: Vec<HostId> = (0..9u64).map(|i| HostId(100 + i)).collect();
+        let mut detector = Detector::new(hosts[0], Exposure::new(), room());
+        for (index, &host) in hosts.iter().enumerate().skip(1) {
+            detector.join(host).unwrap();
+            detector.learn_coordinate(host, Coordinate::Held(engines[index].coordinate()));
+        }
+        for target in 1..9 {
+            detector.rank_relays(hosts[target]);
+            let region = target / 3 * 3;
+            let mut mates: Vec<HostId> = (region..region + 3)
+                .filter(|member| *member != target && *member != 0)
+                .map(|member| hosts[member])
+                .collect();
+            let mut first = detector.relays[..mates.len()].to_vec();
+            mates.sort_unstable();
+            first.sort_unstable();
+            assert_eq!(first, mates, "target {target}: {:?}", detector.relays);
+        }
     }
 }

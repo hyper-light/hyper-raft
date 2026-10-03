@@ -41,6 +41,7 @@ mod common;
 
 use std::io::{BufRead, BufReader, ErrorKind};
 use std::net::{SocketAddr, UdpSocket};
+use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -252,6 +253,10 @@ fn serve<C: Classes<Kind = Kind, Class = Class, Role = Role>>(mut node: Node<C>,
     server.hold_bulk = hold;
     let mut ever = false;
     let mut told = 0;
+    // Where the test asked for this side's refusals: each one, as the line `{refusal:?}
+    // {by_peer}`, read by a test that judges an exchange whose asker gave up before the refusal
+    // reached it.
+    let record = std::env::var("HT_REFUSALS").ok();
     loop {
         wire.turn(&mut node);
         server.serve(&mut node);
@@ -263,6 +268,16 @@ fn serve<C: Classes<Kind = Kind, Class = Class, Role = Role>>(mut node: Node<C>,
                 node.stats(),
                 node.connection_stats(1)
             );
+            if let Some(path) = &record {
+                use std::io::Write as _;
+                let mut file = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path)
+                    .unwrap();
+                file.write_all(format!("{refusal:?} {by_peer}\n").as_bytes())
+                    .unwrap();
+            }
         }
         told = server.refused.len();
         for (peer, lane, frame) in server.frames.drain(..) {
@@ -286,6 +301,20 @@ fn serve<C: Classes<Kind = Kind, Class = Class, Role = Role>>(mut node: Node<C>,
 struct Peer {
     child: Child,
     address: SocketAddr,
+}
+
+/// A file the test makes in its own target directory, removed when the test lets it go, whatever
+/// the test did with it (as hyper-raft-e2e's and hyper-log-e2e's are, 0e746d1).
+struct Scratch(PathBuf);
+
+impl Drop for Scratch {
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "a test removes the file it made in its own target directory"
+    )]
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
 }
 
 impl Drop for Peer {
@@ -626,9 +655,14 @@ fn refusals() -> String {
         (5, Role::Node),
     ]);
     let window = initial_window(1_200) + class_reserve(2);
+    let record = Scratch(
+        PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("refusals-{}", std::process::id())),
+    );
+    let _ = std::fs::remove_file(&record.0);
     let peer = setup.spawn(&[
         ("HT_CLASSES", "strict".into()),
         ("HT_BUDGET", (window + 4_000).to_string()),
+        ("HT_REFUSALS", record.0.display().to_string()),
     ]);
     let mut tight = limits();
     tight.exchanges = 3;
@@ -693,16 +727,45 @@ fn refusals() -> String {
             asker.asked[kind].done && asker.asked[bound].done && budget_refused.is_some()
         },
     );
-    assert_eq!(asker.asked[kind].refused, Some((Refusal::Kind, true)));
-    assert_eq!(
-        asker.asked[bound].refused,
-        Some((Refusal::FrameBound, true))
-    );
+    // Each ask ends by the peer's refusal, or by the asker's own progress period where the
+    // refusal came later than it: on a loaded host the peer's turn can come after the period, and
+    // the asker then gives up before the word arrives. Either way the peer refused it, which its
+    // own record of its refusals shows. Neither outcome is a race the test can lose.
     let budget_refused = budget_refused.unwrap();
-    assert!(
-        budget_refused.contains("refusal: Budget, by_peer: true"),
-        "{budget_refused}"
-    );
+    let budget = if budget_refused.contains("refusal: Budget, by_peer: true") {
+        Some((Refusal::Budget, true))
+    } else if budget_refused.contains("refusal: Stalled, by_peer: false") {
+        Some((Refusal::Stalled, false))
+    } else {
+        panic!("the budget's exchange: {budget_refused}")
+    };
+    for (what, ended, refusal) in [
+        ("the kind", asker.asked[kind].refused, Refusal::Kind),
+        (
+            "the frame bound",
+            asker.asked[bound].refused,
+            Refusal::FrameBound,
+        ),
+        ("the budget", budget, Refusal::Budget),
+    ] {
+        match ended {
+            Some((by, true)) => assert_eq!(by, refusal, "{what}: refused by the peer"),
+            Some((Refusal::Stalled, false)) => {
+                let line = format!("{refusal:?} false");
+                wait(
+                    &mut wire,
+                    &mut node,
+                    &mut asker,
+                    "the peer's own record of its refusal",
+                    |_, _| {
+                        std::fs::read_to_string(&record.0)
+                            .is_ok_and(|kept| kept.lines().any(|l| l == line))
+                    },
+                );
+            }
+            other => panic!("{what}: ended {other:?}"),
+        }
+    }
     node.disconnect(Instant::now(), 2);
     wire.flush(&mut node);
     drop(peer);

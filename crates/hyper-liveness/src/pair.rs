@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use hyper_timing::{
     Arrivals, Configuration, Costs, Event, ExchangeRtt, Exposure, LinkEstimator, Trust,
-    arrival_detector_at, lateness_bound,
+    arrival_detector_at, configure_arrivals, lateness_bound,
 };
 
 use crate::bound::Offset;
@@ -176,6 +176,10 @@ struct Received {
     /// the node's evidence scaled to the link's window and widened by the link's own, and the
     /// heartbeats taken then.
     pooled: Option<(Arrivals, u64)>,
+    /// The interval asked of the peer for the margin of the node's evidence, nanoseconds, where at
+    /// the link's own interval that margin promised nothing (`pool_margin`); zero otherwise, and
+    /// from the link's first configuration on.
+    pooled_ask_ns: u64,
 }
 
 /// What a pair counts: the counters of its [`PairReport`], the rest of which is read from the
@@ -416,7 +420,8 @@ impl Pair {
             .received
             .configuration
             .map_or(0, |configured| nanos(configured.best.interval))
-            .max(self.received.evidence_ns);
+            .max(self.received.evidence_ns)
+            .max(self.received.pooled_ask_ns);
         if let Some(link) = self.received.link.as_mut() {
             // The peer moves to what this heartbeat asks, never below its floor, from its next
             // heartbeat on: this node expects it so, not suspecting it for the move.
@@ -682,9 +687,14 @@ impl Pair {
     /// While the pair has no configuration of its own, the margin the node's evidence configures
     /// for it, imposed on its estimator (`docs/timing.md` §3, item 10): what the node measured of
     /// its links (`Liveness::renew_evidence`) scaled to the link's window (`scaled`), widened by what the
-    /// link's own latenesses show so far, at the link's interval, its costs and
-    /// its floors, as its own configuration would be. Renewed on the configuration's doubling
-    /// schedule: at the first, and once the heartbeats taken have doubled since.
+    /// link's own latenesses show so far, at its costs and its floors, put in force as its own
+    /// configuration would be (`LinkEstimator::configure`): the best at the link's interval while
+    /// its unavailability is below one; where it is one or more, which promises nothing, the best
+    /// over every interval the floors allow, that interval asked of the peer; none where that is
+    /// one or more too. Imposed at the link's interval alone, one in about a thousand of the
+    /// simulation's margins (8 of 6,786) had an unavailability past one. Renewed on the
+    /// configuration's doubling schedule: at the first, and once the heartbeats taken have doubled
+    /// since.
     pub(crate) fn pool_margin(
         &mut self,
         pool: &Arrivals,
@@ -698,6 +708,9 @@ impl Pair {
             return;
         }
         let taken = self.counts.taken;
+        // The floors the link's own configuration would be searched over: the peer's floor and
+        // this node's `G` (`configure`).
+        let floor = Duration::from_nanos(self.received.floor_ns).max(granularity);
         let Some(link) = self.received.link.as_mut() else {
             return;
         };
@@ -709,12 +722,22 @@ impl Pair {
             return;
         };
         let costs = Costs { election, mtbf };
-        if let Some(detector) =
+        let Some(at) =
             arrival_detector_at(&behaviour, &costs, granularity, link.estimator.interval())
-        {
-            link.estimator.impose(detector.margin);
-            self.received.pooled = Some((behaviour, taken));
-        }
+        else {
+            return;
+        };
+        let (detector, ask_ns) = if at.unavailability < 1.0 {
+            (at, 0)
+        } else {
+            match configure_arrivals(&behaviour, &costs, granularity, floor) {
+                Some(best) if best.unavailability < 1.0 => (best, nanos(best.interval)),
+                _ => return,
+            }
+        };
+        link.estimator.impose(detector.margin);
+        self.received.pooled = Some((behaviour, taken));
+        self.received.pooled_ask_ns = ask_ns;
     }
 
     /// The delay sum of `beat`'s echo (the `bound` module): the round trip on this node's clock,
@@ -817,6 +840,7 @@ impl Pair {
         match link.estimator.configure(&costs, granularity, floor) {
             Ok(configured) => {
                 self.received.evidence_ns = 0;
+                self.received.pooled_ask_ns = 0;
                 self.received.configuration = Some(configured);
                 self.received.configured_interval = Some(link.estimator.interval());
                 self.counts.configurations = self.counts.configurations.saturating_add(1);
@@ -1009,5 +1033,57 @@ mod tests {
         );
         assert_eq!(suspicion.last.map(|last| last.seq), Some(1));
         assert_eq!(pair.judge(2, latest + 2 * MS), None, "told once");
+    }
+
+    /// The node's evidence's margin is put in force as a configuration of the link's own is: where
+    /// at the link's interval it promises nothing (an unavailability of one or more), the best over
+    /// every interval the floors allow, that interval asked of the peer. Here elections cost a
+    /// second and the node's evidence leaves one lateness in fifty unseen, so at the link's 10 ms
+    /// every margin's mistakes cost more election than there is time (`T_E·β/η ≥ 1·0.02/0.01`).
+    /// Imposed at the link's interval alone, that margin was in force and no interval was asked.
+    #[test]
+    fn a_margin_of_the_nodes_evidence_that_promises_nothing_at_the_links_interval_is_not_its_margin()
+     {
+        let exposure = exposure();
+        let granularity = Duration::from_micros(50);
+        let context = Context {
+            granularity: Some(granularity),
+            exposure: &exposure,
+            evidence: None,
+        };
+        let mut pair = pair();
+        pair.election = Some(Duration::from_secs(1));
+        for seq in 0..2 {
+            let (mut changes, mut taken) = ([None, None, None], Taken::default());
+            pair.take(
+                2,
+                &beat(7, seq),
+                seq * 10 * MS,
+                &context,
+                &mut changes,
+                &mut taken,
+            )
+            .unwrap();
+        }
+        let evidence = Arrivals {
+            unseen: 0.02,
+            ..evidence()
+        };
+        pair.pool_margin(&evidence, granularity, exposure.mtbf());
+        let (behaviour, _) = pair.received.pooled.expect("a margin is in force");
+        let costs = Costs {
+            election: Duration::from_secs(1),
+            mtbf: exposure.mtbf().unwrap(),
+        };
+        let at = arrival_detector_at(&behaviour, &costs, granularity, Duration::from_millis(10))
+            .unwrap();
+        assert!(at.unavailability >= 1.0, "{at:?}");
+        let floor = Duration::from_millis(1).max(granularity);
+        let best = configure_arrivals(&behaviour, &costs, granularity, floor).unwrap();
+        assert!(best.unavailability < 1.0, "{best:?}");
+        let link = pair.received.link.as_ref().unwrap();
+        assert_eq!(link.estimator.margin(), Some(best.margin));
+        assert_eq!(pair.received.pooled_ask_ns, nanos(best.interval));
+        assert!(best.interval > Duration::from_millis(10));
     }
 }

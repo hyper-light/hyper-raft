@@ -794,7 +794,9 @@ heartbeat due; those it skipped are never sent, and the receiver takes them as t
 lateness, the stall's delay (§2.2; `PairReport::skipped` counts them).
 - **The interval** is the receiver's: its configurator's best (`Configuration::best`), asked in its
   own heartbeats (Chen et al.'s adaptive scheme), never below the sender's floor, nor below the
-  interval its own evidence needs (below, "The interval the evidence needs"). Where the floor binds
+  interval its own evidence needs (below, "The interval the evidence needs"), nor, while its node's
+  evidence judges the link and its margin at the link's interval promises nothing, below the best
+  interval that evidence gives ("Judged before its own evidence"). Where the floor binds
   (before the receiver asks, or past what it asked) the interval is the floor, followed up and not
   down: an interval below the floor is unstable (Lindley 1952), but a floor that fell is a mean that
   moved with a sample, and following it down started the receiver's estimator again at every move
@@ -935,7 +937,15 @@ lateness, the stall's delay (§2.2; `PairReport::skipped` counts them).
   at a window of `n` is `V(D)(1 + 1/n)` for independent delays and the measured latenesses' is at
   least `V(D)`, so the scaled variance bounds `L`'s from above, the side Cantelli's inequality may
   err on), widened by what the link's own latenesses show so far (their mean and deviation, at its
-  own window already); imposed on its estimator (`LinkEstimator::impose`), renewed on the doubling
+  own window already); put in force as a configuration of the link's own is: the best at its
+  interval while its unavailability is below one, the best over every interval the floors allow
+  where it is one or more (which promises nothing), that interval asked of the peer, none where
+  that is one or more too. Imposed at the link's interval alone, 8 of the simulation's 6,786 such
+  margins had a `U` past one, at most 1.6; in a pair's unit test, elections of a second and one
+  lateness in fifty unseen at a 10 ms interval, the margin so imposed was 1.28 s and still promised
+  nothing, where the best's is 121 ms at its longer interval
+  (`a_margin_of_the_nodes_evidence_that_promises_nothing_at_the_links_interval_is_not_its_margin`).
+  It is imposed on the link's estimator (`LinkEstimator::impose`), renewed on the doubling
   schedule, at a poll as soon as the node has evidence, and charged to the allowance at `β` from
   the arrivals it was imposed from.
 

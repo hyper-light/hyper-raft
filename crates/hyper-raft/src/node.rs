@@ -541,6 +541,11 @@ impl<S: Storage> RawNode<S> {
     pub fn set_inflight_bytes(&mut self, member: u64, bytes: u64) -> bool {
         self.raft.set_inflight_bytes(member, bytes)
     }
+    /// Where catching up the learner `member` stands, for its owner to
+    /// promote it once ready ([`Raft::catch_up`], `crate::CatchUp`).
+    pub fn catch_up(&mut self, member: NodeId) -> Result<crate::CatchUp> {
+        self.operate(|raft| raft.catch_up(member))
+    }
     /// One tick of time has passed. True when the member acted on it: it
     /// campaigned, checked its quorum or sent heartbeats.
     pub fn tick(&mut self) -> Result<bool> {

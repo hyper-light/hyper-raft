@@ -31,7 +31,8 @@
 > R21 pass; three defects at the end of what a member counts and a lease kept by a member's own
 > timer, which their siblings found, are fixed; the window a member is sent ahead of its answers is
 > one rule from focal's and slates' (R16); a member keeps what arrives ahead of a hole and
-> acknowledges it with the write that holds it (R17).
+> acknowledges it with the write that holds it (R17); a learner is caught up in rounds before it is
+> promoted (R13).
 
 ## 1. What `hyper-raft` is
 
@@ -391,6 +392,28 @@ fell behind at 4,000 (1,588 a second), sending 95 % and 96 % again; with 1 % los
 a half times the resends, where the scoreboard repairs each loss on its own refusals; and this
 harness sends each proposal as its own message, so a loss in a hundred messages is a hole every
 hundred entries.
+
+**A learner caught up in rounds (R13).** A member joins as a learner, which votes on nothing and
+counts toward no quorum, and its owner promotes it once it has caught up (thesis §4.2.1, "Catching up
+new servers": a voter added with an empty log can leave its group unable to commit until it catches
+up, Figure 4.4(a)). `RawNode::catch_up(member)` says where catching it up stands: replication to it
+goes in rounds, each to what the leader held when the round began; a round that lasts less than an
+election is the last, and the learner is `Ready`; one that lasts longer begins the next with what
+the leader holds then. A learner whose lag behind the leader did not shrink over a whole election is
+given up, `Aborted`, said once (slates' rule for the thesis's "unavailable, or so slow that it will
+never catch up", which needs no count of rounds where the thesis says "such as 10"); asked again it is
+staged afresh. An election is the member's own measure of one: on ticks the minimum election timeout
+(the thesis's "an election timeout"), by suspicion the time hyper-timing's law expects an election to
+take (`Timing::election`, `T_E`), the gap the group already accepts at its leader's loss. Each
+learner is judged alone, so one that cannot catch up holds back none that has (slates
+`docs/bugs/2026-09-30-one-lagging-member-held-back-every-council-promotion.md`). The rounds are the
+leader's alone: a leader that steps down forgets them (`crate::catchup`).
+
+Measured on slates' replay of Figure 4.4(a) (`a_staged_newcomer_leaves_no_availability_gap_where_a_direct_one_does`):
+voters 1, 2 and 3 hold forty entries, member 4 joins empty and voter 3 fails, two entries an append
+and one out at a time as slates' drive sent them. Added directly, the group cannot commit for 45
+rounds while 4 catches up (a round here carries messages one way; slates counted 21 round trips);
+staged first, it commits in the first round trip after the loss, as slates measured.
 
 ### 3.3 Where this core and raft-rs differ
 

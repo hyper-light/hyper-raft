@@ -660,6 +660,7 @@ fn a_marked_member_of_two_takes_no_part_in_elections() {
     r.set_timing(hyper_raft::Timing {
         span: std::time::Duration::from_millis(1),
         round: std::time::Duration::from_millis(1),
+        election: std::time::Duration::from_millis(2),
     })
     .unwrap();
     r.suspect(1).unwrap();
@@ -1187,6 +1188,7 @@ fn a_replica_on_ticks_elects_by_its_owners_ticks_and_hears_no_detector() {
         r.set_timing(hyper_raft::Timing {
             span: std::time::Duration::from_millis(100),
             round: std::time::Duration::from_millis(10),
+            election: std::time::Duration::from_millis(110),
         }),
         Err(ReplicaError::Refused(_))
     ));
@@ -1587,4 +1589,35 @@ fn the_window_to_a_member_is_twice_what_its_path_carries() {
     assert!(r.set_carriage(2, 125_000).unwrap());
     assert_eq!(window(&r), 250_000);
     assert!(!r.set_carriage(9, 125_000).unwrap(), "no member 9");
+}
+
+/// The shell says where catching up a learner stands, as the core judges it (thesis §4.2.1, mantle
+/// note 32 R13): a voter is ready, a stranger is no member, a member that does not lead is told so,
+/// and a learner the leader just added is staged.
+#[test]
+fn the_shell_says_where_catching_up_a_learner_stands() {
+    let mut r = led(1, false);
+    acknowledge(&mut r, 2);
+    acknowledge(&mut r, 3);
+    pump(&mut r);
+    assert_eq!(r.catch_up(2).unwrap(), hyper_raft::CatchUp::Ready);
+    assert_eq!(r.catch_up(9).unwrap(), hyper_raft::CatchUp::NotMember);
+    r.change(Vec::new(), &change(ConfChangeType::AddLearnerNode, 4))
+        .unwrap();
+    pump(&mut r);
+    acknowledge(&mut r, 2);
+    pump(&mut r);
+    assert!(r.configuration().learners.contains(&4));
+    assert_eq!(r.catch_up(4).unwrap(), hyper_raft::CatchUp::Pending);
+    let mut follower: Sim = Replica::open(
+        &settings(2, 7),
+        SimStore::new(1),
+        Kv::new(voters(&[1, 2, 3]), false),
+        Unbounded,
+    )
+    .unwrap();
+    assert_eq!(
+        follower.catch_up(4).unwrap(),
+        hyper_raft::CatchUp::NotLeader
+    );
 }

@@ -639,6 +639,8 @@ pub fn timing() -> hyper_raft::Timing {
     hyper_raft::Timing {
         span: std::time::Duration::from_nanos(SPAN_NS),
         round: std::time::Duration::from_nanos(ROUND_NS),
+        // A delay within the span and one vote round.
+        election: std::time::Duration::from_nanos(SPAN_NS + ROUND_NS),
     }
 }
 impl Settings {

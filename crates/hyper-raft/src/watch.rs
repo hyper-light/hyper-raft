@@ -59,6 +59,11 @@ pub struct Timing {
     /// (`hyper_timing::Ballot::broadcast_tail`): how long a vote round is given before a candidate
     /// draws again, and how often a leader with work in flight beats.
     pub round: Duration,
+    /// The time the group's election is expected to take from a suspicion, on the span
+    /// (`hyper_timing::Span::election`, `T_E`): the gap the group already accepts at its leader's
+    /// loss, against which a learner's catch-up round is judged (thesis §4.2.1,
+    /// `crate::CatchUp`).
+    pub election: Duration,
 }
 
 impl Timing {
@@ -68,6 +73,7 @@ impl Timing {
         Self {
             span: span.span,
             round: ballot.broadcast_tail,
+            election: span.election,
         }
     }
 }
@@ -92,8 +98,11 @@ pub(crate) enum Arm {
 pub(crate) struct Watch {
     /// The members the owner's detectors suspect, in order; at most [`MAX_MEMBERS`].
     suspected: Vec<NodeId>,
-    /// The span and the round tail, nanoseconds, once the owner gave them.
-    pub(crate) timing: Option<(u64, u64)>,
+    /// The span, the round tail and the expected election, nanoseconds, once the owner gave them.
+    pub(crate) timing: Option<(u64, u64, u64)>,
+    /// The owner's clock at the last wake, nanoseconds: what a learner's catch-up round is timed on
+    /// (`crate::CatchUp`).
+    pub(crate) now: u64,
     /// When this member campaigns.
     pub(crate) campaign: Arm,
     /// When this leader beats next.
@@ -169,11 +178,15 @@ impl Watch {
     }
     /// The round tail in nanoseconds, once given.
     pub(crate) fn round(&self) -> Option<u64> {
-        self.timing.map(|(_, round)| round)
+        self.timing.map(|(_, round, _)| round)
+    }
+    /// The expected election in nanoseconds, once given.
+    pub(crate) fn election(&self) -> Option<u64> {
+        self.timing.map(|(_, _, election)| election)
     }
     /// The delay before `local`'s next campaign, drawn anew over the span, once given.
     pub(crate) fn draw(&mut self, local: u64) -> Option<u64> {
-        let (span, _) = self.timing?;
+        let (span, _, _) = self.timing?;
         let delay = nanos(hyper_timing::election_delay(
             Duration::from_nanos(span),
             local,

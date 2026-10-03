@@ -1922,6 +1922,8 @@ fn by_suspicion_a_member_with_no_successor_is_due_for_no_campaign() {
     let timing = crate::Timing {
         span: std::time::Duration::from_millis(10),
         round: std::time::Duration::from_millis(2),
+        // A delay within the span and one vote round.
+        election: std::time::Duration::from_millis(12),
     };
     for (term, last) in [(LAST, 0), (3, LAST)] {
         let mut store = Memory::with_voters(&[1, 2, 3]);
@@ -2302,6 +2304,8 @@ fn a_member_that_missed_its_promotion_still_votes_for_a_candidate_that_has_it() 
     let timing = crate::Timing {
         span: std::time::Duration::from_millis(10),
         round: std::time::Duration::from_millis(2),
+        // A delay within the span and one vote round.
+        election: std::time::Duration::from_millis(12),
     };
     for (heard_as_learner, suspicion) in [(false, false), (true, false), (true, true)] {
         let (a, b, c) = (1u64, 2u64, 3u64);
@@ -3191,4 +3195,331 @@ fn what_was_kept_goes_with_its_term() {
         .unwrap();
     assert_eq!(follower.raft.term(), term + 1);
     assert_eq!(follower.raft.kept_ahead().count(), 0);
+}
+
+// slates' learner catch-up rounds (mantle note 32 R13; Ongaro's thesis §4.2.1; `crate::catchup`).
+
+/// Every message the members in `up` give is stepped into the member it is to, once: one round of
+/// replication. A message to a member that is down is lost, and its sender's owner is told
+/// (`RawNode::report_unreachable`), as a transport tells it. Whether anything was said.
+fn one_round(nodes: &mut [RawNode<Memory>], up: &[u64]) -> bool {
+    let mut said = Vec::new();
+    for id in up {
+        said.extend(drain_applying(&mut nodes[*id as usize - 1]));
+    }
+    let any = !said.is_empty();
+    for message in said {
+        if up.contains(&message.to) {
+            let _ = nodes[message.to as usize - 1].step(message);
+        } else if message.msg_type == MessageType::MsgAppend {
+            let _ = nodes[message.from as usize - 1].report_unreachable(message.to);
+        }
+    }
+    any
+}
+/// Rounds among `up` until no member says anything, and once more after a round of the leader's
+/// heartbeats, whose answers send what a member it was told it lost is behind by.
+fn rounds_among(nodes: &mut [RawNode<Memory>], up: &[u64]) {
+    for beat in [false, true] {
+        if beat && nodes[0].raft.state() == StateRole::Leader {
+            nodes[0].ping().unwrap();
+        }
+        let mut quiet = false;
+        for _ in 0..1_000 {
+            if !one_round(nodes, up) {
+                quiet = true;
+                break;
+            }
+        }
+        assert!(quiet, "the members never fell quiet");
+    }
+}
+/// Voters 1, 2 and 3 led by 1 holding `entries` committed entries, and `members` in all, those past
+/// 3 with empty logs that know the voters. Each append carries two entries and one is out to a
+/// member at a time, as slates' drive sent its followers a batch of about two entries a period
+/// (slates `raft.rs`, `GAP_BUDGET`): a member behind takes rounds to catch up.
+fn group_of(entries: u8, members: u64) -> Vec<RawNode<Memory>> {
+    let two_entries = 2 * proto::approximate_bytes(&Entry {
+        data: vec![0],
+        ..Entry::default()
+    }) as u64;
+    let mut nodes: Vec<RawNode<Memory>> = (1..=members)
+        .map(|id| {
+            let config = Config {
+                max_size_per_msg: two_entries,
+                max_inflight_msgs: 1,
+                ..config(id)
+            };
+            RawNode::new(&config, Memory::with_voters(&[1, 2, 3])).unwrap()
+        })
+        .collect();
+    nodes[0].campaign().unwrap();
+    rounds_among(&mut nodes, &[1, 2, 3]);
+    for value in 0..entries {
+        nodes[0].propose(vec![], vec![value]).unwrap();
+    }
+    rounds_among(&mut nodes, &[1, 2, 3]);
+    nodes[0].ping().unwrap();
+    rounds_among(&mut nodes, &[1, 2, 3]);
+    assert_eq!(
+        nodes[2].raft.log().committed(),
+        nodes[0].raft.log().last_index().unwrap()
+    );
+    nodes
+}
+fn single(kind: crate::proto::ConfChangeType, member: u64) -> ConfChangeV2 {
+    ConfChangeV2 {
+        changes: vec![ConfChangeSingle {
+            change_type: kind,
+            node_id: member,
+        }],
+        ..Default::default()
+    }
+}
+/// The leader of `nodes` adds `member` as a learner, committed with the voters alone. What it
+/// sent the learner meanwhile was lost, and its owner says so.
+fn add_learner(nodes: &mut [RawNode<Memory>], member: u64) {
+    nodes[0]
+        .propose_conf_change(
+            vec![],
+            &single(crate::proto::ConfChangeType::AddLearnerNode, member),
+        )
+        .unwrap();
+    rounds_among(nodes, &[1, 2, 3]);
+    let configuration = nodes[0].raft.configuration();
+    assert!(configuration.contains(member) && !configuration.votes(member));
+}
+/// The leader ticks once, and the voters exchange what follows: it stays in contact with them.
+fn tick_with_voters(nodes: &mut [RawNode<Memory>]) {
+    nodes[0].tick().unwrap();
+    rounds_among(nodes, &[1, 2, 3]);
+    assert_eq!(nodes[0].raft.state(), StateRole::Leader);
+}
+
+/// slates' `a_staged_member_counts_toward_no_commit` (thesis §4.2.1: "not yet counted towards
+/// majorities"): with voters 2 and 3 silent, a learner being caught up that takes every entry
+/// commits none of them.
+#[test]
+fn a_learner_being_caught_up_counts_toward_no_commit() {
+    let mut nodes = group_of(4, 4);
+    add_learner(&mut nodes, 4);
+    assert_eq!(nodes[0].catch_up(4).unwrap(), crate::CatchUp::Pending);
+    nodes[0].propose(vec![], b"new".to_vec()).unwrap();
+    let committed = nodes[0].raft.log().committed();
+    for _ in 0..16 {
+        if !one_round(&mut nodes, &[1, 4]) {
+            break;
+        }
+    }
+    assert_eq!(
+        nodes[3].raft.log().last_index().unwrap(),
+        nodes[0].raft.log().last_index().unwrap(),
+        "the learner took every entry"
+    );
+    assert_eq!(nodes[0].raft.log().committed(), committed);
+}
+
+/// slates' `a_member_that_never_answers_is_aborted_and_staged_afresh_after` (thesis §4.2.1: "the
+/// leader should also abort the change if the new server is unavailable"): a learner that never
+/// answers is given up once a whole election passes with its lag not shrinking, exactly at the
+/// minimum election timeout on ticks and not a tick before, said once; asked again, it is staged
+/// afresh.
+#[test]
+fn a_learner_that_never_answers_is_given_up_after_an_election_and_staged_afresh() {
+    let mut nodes = group_of(4, 4);
+    add_learner(&mut nodes, 4);
+    let election = nodes[0].raft.config().election_tick;
+    assert_eq!(nodes[0].catch_up(4).unwrap(), crate::CatchUp::Pending);
+    for tick in 1..=election {
+        tick_with_voters(&mut nodes);
+        let expected = if tick < election {
+            crate::CatchUp::Pending
+        } else {
+            crate::CatchUp::Aborted
+        };
+        assert_eq!(nodes[0].catch_up(4).unwrap(), expected, "tick {tick}");
+    }
+    assert_eq!(
+        nodes[0].catch_up(4).unwrap(),
+        crate::CatchUp::Pending,
+        "staged afresh"
+    );
+}
+
+/// slates' `a_round_that_spans_a_window_is_followed_by_one_that_counts`: a learner's first round
+/// lasts a whole election, the learner unheard, so it does not count; the round that follows
+/// ends at once, and does.
+#[test]
+fn a_round_that_spans_an_election_is_followed_by_one_that_counts() {
+    let mut nodes = group_of(4, 4);
+    add_learner(&mut nodes, 4);
+    let election = nodes[0].raft.config().election_tick;
+    assert_eq!(nodes[0].catch_up(4).unwrap(), crate::CatchUp::Pending);
+    for _ in 0..election {
+        tick_with_voters(&mut nodes);
+    }
+    // The learner takes the log in one exchange: its first round ends, an election late, and the
+    // next with it.
+    rounds_among(&mut nodes, &[1, 2, 3, 4]);
+    assert_eq!(
+        nodes[3].raft.log().last_index().unwrap(),
+        nodes[0].raft.log().last_index().unwrap()
+    );
+    assert_eq!(nodes[0].catch_up(4).unwrap(), crate::CatchUp::Ready);
+}
+
+/// slates' `staging_ends_with_leadership`: the rounds are a leader's; one that steps down forgets
+/// them and is told so.
+#[test]
+fn a_learners_rounds_end_with_their_leaders_term() {
+    let mut nodes = group_of(4, 4);
+    add_learner(&mut nodes, 4);
+    assert_eq!(nodes[0].catch_up(4).unwrap(), crate::CatchUp::Pending);
+    let term = nodes[0].raft.term();
+    nodes[0]
+        .step(answer(MessageType::MsgHeartbeat, 2, 1, term + 1))
+        .unwrap();
+    assert_eq!(nodes[0].raft.state(), StateRole::Follower);
+    assert_eq!(nodes[0].catch_up(4).unwrap(), crate::CatchUp::NotLeader);
+    assert_eq!(nodes[0].catch_up(9).unwrap(), crate::CatchUp::NotLeader);
+}
+
+/// slates `docs/bugs/2026-09-30-one-lagging-member-held-back-every-council-promotion.md`: each
+/// learner is judged alone. Learner 5 never answers and is given up; learner 4 catches up and is
+/// ready, whatever 5 does; a voter is ready, and a stranger is no member.
+#[test]
+fn one_learner_that_cannot_catch_up_holds_back_none_that_has() {
+    let mut nodes = group_of(4, 5);
+    add_learner(&mut nodes, 4);
+    add_learner(&mut nodes, 5);
+    assert_eq!(nodes[0].catch_up(4).unwrap(), crate::CatchUp::Pending);
+    assert_eq!(nodes[0].catch_up(5).unwrap(), crate::CatchUp::Pending);
+    rounds_among(&mut nodes, &[1, 2, 3, 4]);
+    assert_eq!(nodes[0].catch_up(4).unwrap(), crate::CatchUp::Ready);
+    let election = nodes[0].raft.config().election_tick;
+    for _ in 0..election {
+        tick_with_voters(&mut nodes);
+    }
+    assert_eq!(nodes[0].catch_up(5).unwrap(), crate::CatchUp::Aborted);
+    assert_eq!(nodes[0].catch_up(4).unwrap(), crate::CatchUp::Ready);
+    assert_eq!(nodes[0].catch_up(2).unwrap(), crate::CatchUp::Ready);
+    assert_eq!(nodes[0].catch_up(9).unwrap(), crate::CatchUp::NotMember);
+}
+
+/// By suspicion the rounds are on the owner's clock, and an election is the time the law expects
+/// one to take (`Timing::election`): a learner that never answers is given up once that much time
+/// passes with its lag not shrinking, and not a nanosecond before.
+#[test]
+fn by_suspicion_a_learners_rounds_are_judged_on_the_owners_clock() {
+    let timing = crate::Timing {
+        span: std::time::Duration::from_millis(10),
+        round: std::time::Duration::from_millis(2),
+        // A delay within the span and one vote round.
+        election: std::time::Duration::from_millis(12),
+    };
+    let mut nodes: Vec<RawNode<Memory>> = (1..=4)
+        .map(|id| {
+            let config = Config {
+                elections: crate::Elections::Suspicion,
+                ..config(id)
+            };
+            let mut node = RawNode::new(&config, Memory::with_voters(&[1, 2, 3])).unwrap();
+            node.set_timing(timing).unwrap();
+            node
+        })
+        .collect();
+    nodes[0].campaign().unwrap();
+    rounds_among(&mut nodes, &[1, 2, 3]);
+    assert_eq!(nodes[0].raft.state(), StateRole::Leader);
+    add_learner(&mut nodes, 4);
+    let election = u64::try_from(timing.election.as_nanos()).unwrap();
+    let start = 1_000_000_000;
+    nodes[0].wake(start).unwrap();
+    assert_eq!(nodes[0].catch_up(4).unwrap(), crate::CatchUp::Pending);
+    for (at, expected) in [
+        (start + election - 1, crate::CatchUp::Pending),
+        (start + election, crate::CatchUp::Aborted),
+    ] {
+        nodes[0].wake(at).unwrap();
+        rounds_among(&mut nodes, &[1, 2, 3]);
+        assert_eq!(nodes[0].raft.state(), StateRole::Leader);
+        assert_eq!(nodes[0].catch_up(4).unwrap(), expected, "at {at}");
+    }
+}
+
+/// The thesis's Figure 4.4(a): the rounds of replication from voter 3's loss to the first commit
+/// after it, where member 4 joined `staged` (a learner caught up first) or directly as a voter.
+fn rounds_to_commit_after_a_loss(staged: bool) -> u64 {
+    use crate::proto::ConfChangeType;
+    let mut nodes = group_of(40, 4);
+    let all = [1, 2, 3, 4];
+    if staged {
+        add_learner(&mut nodes, 4);
+        let mut rounds = 0;
+        while nodes[0].catch_up(4).unwrap() != crate::CatchUp::Ready {
+            if !one_round(&mut nodes, &all) {
+                nodes[0].ping().unwrap();
+            }
+            rounds += 1;
+            assert!(rounds < 1_000, "the learner never caught up");
+        }
+    }
+    nodes[0]
+        .propose_conf_change(vec![], &single(ConfChangeType::AddNode, 4))
+        .unwrap();
+    // Rounds among all four until the change commits, which the voters before it, 1, 2 and 3,
+    // commit without 4; then until all the leader holds is committed, as slates' test runs them.
+    for until in [false, true] {
+        let mut rounds = 0;
+        loop {
+            let held = nodes[0].raft.log().last_index().unwrap();
+            let committed = nodes[0].raft.log().committed();
+            let done = if until {
+                committed == held
+            } else {
+                nodes[0].raft.configuration().votes(4)
+            };
+            if done {
+                break;
+            }
+            if !one_round(&mut nodes, &all) {
+                nodes[0].ping().unwrap();
+            }
+            rounds += 1;
+            assert!(rounds < 1_000, "the change never committed");
+        }
+    }
+    // Voter 3 fails; the group of 1, 2 and 4 needs 4 for every commit.
+    nodes[0].propose(vec![], b"after".to_vec()).unwrap();
+    let index = nodes[0].raft.log().last_index().unwrap();
+    let mut rounds = 0;
+    while nodes[0].raft.log().committed() < index {
+        if !one_round(&mut nodes, &[1, 2, 4]) {
+            nodes[0].ping().unwrap();
+        }
+        rounds += 1;
+        assert!(rounds < 1_000, "nothing committed after the loss");
+    }
+    rounds
+}
+
+/// slates' `a_staged_newcomer_leaves_no_availability_gap_where_a_direct_one_does`, the thesis's
+/// Figure 4.4(a): voters 1, 2 and 3 hold forty entries, member 4 joins with an empty log and the
+/// voters become 1 to 4, then 3 fails. A round here carries messages one way, so a round trip is
+/// two, where slates' round was one, its reply taken at once. Added directly, 4 leaves the group
+/// unable to commit for 45 rounds while it catches up, two entries an append and one out at a time
+/// (slates: 21 round trips); staged first as a learner and promoted once caught up, the group
+/// commits in the first round trip after the loss (slates: one). Exact: the schedule is fixed.
+#[test]
+fn a_staged_newcomer_leaves_no_availability_gap_where_a_direct_one_does() {
+    let direct = rounds_to_commit_after_a_loss(false);
+    let staged = rounds_to_commit_after_a_loss(true);
+    assert_eq!(
+        staged, 2,
+        "one round trip: the staged newcomer held the log already"
+    );
+    assert_eq!(
+        direct, 45,
+        "the direct newcomer's catch-up held commits back"
+    );
 }

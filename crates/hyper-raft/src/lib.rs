@@ -31,6 +31,7 @@
 //! stated in [`Limits`].
 
 mod ahead;
+mod catchup;
 pub mod configuration;
 pub mod error;
 pub mod fast;
@@ -46,6 +47,7 @@ mod track;
 mod watch;
 pub mod wire;
 
+pub use catchup::CatchUp;
 pub use configuration::{Change, Changed, Configuration, ConfigurationError};
 pub use error::{Error, Result, StorageError};
 pub use node::{Kept, LightReady, RawNode, Ready, SnapshotStatus, ToPersist};

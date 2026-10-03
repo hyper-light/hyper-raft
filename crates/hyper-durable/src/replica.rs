@@ -734,6 +734,17 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
         self.guarded(|r| Ok(r.node.set_inflight_bytes(member, inflight_window(carried))))
     }
 
+    /// Where catching up the learner `member` stands, for the owner to promote it once ready
+    /// (`hyper_raft::CatchUp`, thesis §4.2.1, mantle note 32 R13): its rounds of replication are
+    /// judged against an election, the time `Timing::election` says the group's takes. Promoting it
+    /// is the owner's change to propose.
+    pub fn catch_up(&mut self, member: u64) -> Result<hyper_raft::CatchUp, ReplicaError> {
+        self.guarded(|r| {
+            let said = r.node.catch_up(member);
+            r.heard(said)
+        })
+    }
+
     /// What the owner's measurements give the group's elections: the span hyper-timing's law
     /// chose over the measured paths to its voters, and their round tail (`hyper_raft::Timing`,
     /// `Timing::of`). Given again whenever the law's ballot moves.

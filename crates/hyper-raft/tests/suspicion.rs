@@ -69,6 +69,7 @@ fn timing_for(voters: u32) -> (Timing, hyper_timing::Span) {
         Timing {
             span: span.span,
             round,
+            election: span.election,
         },
         span,
     )

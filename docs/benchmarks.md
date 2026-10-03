@@ -1048,6 +1048,28 @@ reorder: at 1,000 a second the rule's window committed 384 a second at a 4,988 m
 what it sent sent again (20 seeds), where R16 committed every proposal at 147 ms (`docs/raft.md`
 §3.2 has why, and the two leader's halves measured and rejected after it).
 
+## A learner caught up in rounds (R13)
+
+Core step R-3's fifth commit (`crates/hyper-raft/ORIGIN.md`, "R13"). Measured on 2026-10-03 on the
+machine above, load 4.7–4.8.
+
+**Allocations**: R17's on all 36 cells, bytes included: a leader with no learner staged counts
+nothing more than a tick.
+
+**The schedules**: every line the suites print at their default seeds is R17's: no schedule stages
+a learner, and the rule asks nothing of a leader that stages none.
+
+**slates' replay of the thesis's Figure 4.4(a)** (`a_staged_newcomer_leaves_no_availability_gap_where_a_direct_one_does`):
+voters 1, 2 and 3 hold forty entries, member 4 joins with an empty log and the voters become four,
+then voter 3 fails, so every commit needs member 4. Each append carries two entries and one is out
+to a member at a time, as slates' drive sent its followers. A round here carries messages one way,
+two to a round trip, where slates' round took its reply at once.
+
+| Newcomer | Rounds from voter 3's loss to the first commit after it | slates |
+|---|---|---|
+| added directly as a voter | 45 (22½ round trips) | 21 round trips |
+| caught up as a learner first (`RawNode::catch_up`), then promoted | 2 (one round trip) | 1 |
+
 ## Where hyper-raft does not win, and why
 
 hyper-raft in place allocates less than every other core in every row. It is faster than raft-rs
@@ -1366,6 +1388,10 @@ HYPER_RAFT_TIMED_PLACES=128 HYPER_RAFT_TIMED_SEEDS=20 HYPER_RAFT_TIMED_STREAM_S=
 # What arrives ahead of a hole (R17): as above, and the same sweep under raft-rs's rule, which gives
 # R16's numbers.
 HYPER_RAFT_TIMED_AHEAD=refused HYPER_RAFT_TIMED_SEEDS=1 HYPER_RAFT_TIMED_STREAM_S=30 cargo test -p hyper-raft --release --test timed -- --ignored --exact replication_across_rates_and_loss --nocapture
+
+# A learner caught up in rounds (R13): the counting runs and the schedules as above; the replay of
+# Figure 4.4(a) is a unit test.
+cargo test -p hyper-raft --lib a_staged_newcomer_leaves_no_availability_gap_where_a_direct_one_does
 
 # The end-to-end scenarios, and every gate.
 cargo test -p hyper-raft-e2e --test cluster

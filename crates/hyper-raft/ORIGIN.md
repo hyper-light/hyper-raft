@@ -946,3 +946,29 @@ them. slates is read at `ec5e0df` (its `main`, 2026-10-03).
   catch-up cells 40 fewer allocations and a 41 kB higher peak (the returning member's kept entries),
   the snapshot cells 8 bytes a member more a tracker. The schedules of `tests/pipeline.rs` moved,
   R17 reached in every setting that keeps; every other suite's lines are R16's.
+
+### R13: a learner caught up in rounds before it votes
+
+- **The rule** (Ongaro's thesis §4.2.1, "Catching up new servers"; slates `RaftNode::catch_up`,
+  `crate::catchup`): `RawNode::catch_up(member)` stages a learner at a leader and judges it.
+  Replication to it goes in rounds, each to what the leader held when the round began; a round
+  that lasts less than an election is the last, and the learner is `Ready`; a longer one begins the
+  next. A learner whose lag did not shrink over a whole election is `Aborted`, said once, and staged
+  afresh when asked again (slates' rule for the thesis's "unavailable, or so slow that it will never
+  catch up", needing no count of rounds where the thesis says "such as 10"). An election is the
+  member's own measure: on ticks the minimum election timeout, by suspicion the time the law
+  expects an election to take (`Timing::election`, `T_E`, a new field the owner gives with the
+  span). Each learner is judged alone (slates
+  `docs/bugs/2026-09-30-one-lagging-member-held-back-every-council-promotion.md`); the rounds are a
+  leader's and end with its term. hyper-durable passes it through (`Replica::catch_up`); promoting
+  is the owner's change to propose.
+- **Tests**: slates' `a_staged_member_counts_toward_no_commit`,
+  `a_member_that_never_answers_is_aborted_and_staged_afresh_after`,
+  `a_round_that_spans_a_window_is_followed_by_one_that_counts`, `staging_ends_with_leadership` and
+  `a_staged_newcomer_leaves_no_availability_gap_where_a_direct_one_does` as this core states them,
+  the bug's `one_learner_that_cannot_catch_up_holds_back_none_that_has`, and
+  `by_suspicion_a_learners_rounds_are_judged_on_the_owners_clock`; each fails with the rounds taken
+  out, three with the abort; the shell's `the_shell_says_where_catching_up_a_learner_stands`.
+- **Measured** (`docs/benchmarks.md`, "A learner caught up in rounds (R13)"): Figure 4.4(a)
+  replayed, 45 rounds without a commit after the loss with the newcomer added directly against one
+  round trip staged (slates: 21 round trips against one).

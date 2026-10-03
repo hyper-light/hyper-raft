@@ -16,7 +16,7 @@ share one round of heartbeats (`ReadRounds`). What a member is sent ahead of its
 answers is bounded in bytes, each append charged its record, by what its owner says the path to
 it carries over the two round trips a lost append takes to repair (`RawNode::set_inflight_bytes`,
 `hyper_timing::inflight_window`), and in messages unless the window counts none. What arrives ahead of a hole in a member's log is kept and taken in when the hole is filled
-(`Ahead`). It keeps the log and speaks the messages of `raft-rs` 0.7
+(`Ahead`). A learner is caught up in rounds before its owner promotes it (`RawNode::catch_up`). It keeps the log and speaks the messages of `raft-rs` 0.7
 (`raft-proto`), which focal's groups ran on before. What it decides differently, and
 why, is in the module header of `src/raft.rs` and in focal's
 `docs/archictecutre/27-consensus-roadmap-and-slates-port.md` §4.5 (focal `a8e95f7`).

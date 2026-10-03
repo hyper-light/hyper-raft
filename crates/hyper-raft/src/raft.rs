@@ -17,6 +17,7 @@
 use crate::{
     Configuration, NodeId, Tally,
     ahead::Early,
+    catchup::{CatchUp, Staging, Stagings},
     error::{Error, Result, StorageError},
     fast::{self, Decided, Proposals, Votes},
     log::Log,
@@ -475,6 +476,11 @@ pub struct Raft<S> {
     /// What this member keeps of its leader's appends that arrived ahead of
     /// a hole in its log ([`Ahead::Kept`]).
     early: Early,
+    /// The learners this leader catches up, in rounds ([`CatchUp`]).
+    stagings: Stagings,
+    /// The ticks this member has led through: the clock its learners' rounds
+    /// count on ticks.
+    ticks: u64,
     /// Entries this member took into its log from what it kept ahead of a
     /// hole.
     taken_ahead: u64,
@@ -1084,6 +1090,8 @@ impl<S: Storage> Raft<S> {
             randomized_election_timeout: config.election_tick,
             patience: 0,
             early: Early::default(),
+            stagings: Stagings::default(),
+            ticks: 0,
             taken_ahead: 0,
             held: Proposals::new(config.limits.proposals, config.limits.proposal_bytes),
             votes: Votes::new(
@@ -1457,6 +1465,7 @@ impl<S: Storage> Raft<S> {
             .saturating_add(self.read_only.resident_bytes())
             .saturating_add(self.held.resident_bytes())
             .saturating_add(self.early.resident_bytes())
+            .saturating_add(self.stagings.resident_bytes())
             .saturating_add(self.votes.resident_bytes())
             .saturating_add(self.decided.resident_bytes())
             .saturating_add(
@@ -1698,8 +1707,10 @@ impl<S: Storage> Raft<S> {
         }
         self.lead_transferee = None;
         self.told_to_campaign = false;
-        // What was kept ahead of a hole was one leader's, in one term.
+        // What was kept ahead of a hole was one leader's, in one term; a
+        // learner's rounds are one leader's too.
         self.early.clear();
+        self.stagings.clear();
         self.votes.clear();
         self.decided.clear();
         self.tracker.reset_votes();
@@ -1867,6 +1878,7 @@ impl<S: Storage> Raft<S> {
         Ok(true)
     }
     fn tick_heartbeat(&mut self) -> Result<bool> {
+        self.ticks = self.ticks.saturating_add(1);
         self.heartbeat_elapsed = self.heartbeat_elapsed.saturating_add(1);
         self.election_elapsed = self.election_elapsed.saturating_add(1);
         let mut ready = false;
@@ -2031,15 +2043,20 @@ impl<S: Storage> Raft<S> {
     /// it, as hyper-timing's law chooses no span before a quorum's paths
     /// are measured (`docs/timing.md` §2.3).
     pub fn set_timing(&mut self, timing: Timing) -> Result<()> {
-        self.watch_mut()?.timing = Some((nanos(timing.span), nanos(timing.round)));
+        self.watch_mut()?.timing = Some((
+            nanos(timing.span),
+            nanos(timing.round),
+            nanos(timing.election),
+        ));
         Ok(())
     }
     /// The timing the owner last gave, if any.
     pub fn timing(&self) -> Option<Timing> {
-        let (span, round) = self.watch.as_ref()?.timing?;
+        let (span, round, election) = self.watch.as_ref()?.timing?;
         Some(Timing {
             span: std::time::Duration::from_nanos(span),
             round: std::time::Duration::from_nanos(round),
+            election: std::time::Duration::from_nanos(election),
         })
     }
     /// The owner holds this member's campaigns, or lets them go: it is
@@ -2140,9 +2157,10 @@ impl<S: Storage> Raft<S> {
     /// the member acted: it campaigned, stepped down, beat or gave up a
     /// transfer. Nothing on ticks.
     pub fn wake(&mut self, now: u64) -> Result<bool> {
-        if self.watch.is_none() {
+        let Some(watch) = self.watch.as_mut() else {
             return Ok(false);
-        }
+        };
+        watch.now = watch.now.max(now);
         let mut acted = false;
         if self.state == StateRole::Leader {
             if self.trusted_quorum() {
@@ -2980,6 +2998,7 @@ impl<S: Storage> Raft<S> {
             }
             ProgressState::Replicate => progress.inflights.free_to(message.index),
         }
+        self.note_progress(message.from)?;
         if self.maybe_commit()? {
             if self.should_bcast_commit() {
                 self.bcast_append()?;
@@ -3423,6 +3442,126 @@ impl<S: Storage> Raft<S> {
         answer.commit = self.log.committed();
         self.send(answer)
     }
+    /// The member's clock for its learners' rounds: its own ticks; by
+    /// suspicion, the owner's clock at its last wake.
+    fn clock(&self) -> u64 {
+        match self.watch.as_ref() {
+            None => self.ticks,
+            Some(watch) => watch.now,
+        }
+    }
+    /// An election on that clock ([`CatchUp`]): the minimum election timeout
+    /// on ticks (thesis §4.2.1's "an election timeout"); by suspicion, the
+    /// election the law expects, once the owner gave it.
+    fn election_on_clock(&self) -> Option<u64> {
+        match self.watch.as_ref() {
+            None => u64::try_from(self.config.election_tick).ok(),
+            Some(watch) => watch.election(),
+        }
+    }
+    /// Where catching up `member` stands (Ongaro's thesis §4.2.1,
+    /// `crate::catchup`). Asked first while this member leads, it stages the
+    /// learner, its first round replicating what the leader holds now; asked
+    /// again, it judges the learner as an election passes, and gives it up
+    /// once its lag did not shrink over one (said once; asked again, it is
+    /// staged afresh). Its rounds end as its answers arrive. A voter is ready.
+    pub fn catch_up(&mut self, member: NodeId) -> Result<CatchUp> {
+        if self.state != StateRole::Leader {
+            return Ok(CatchUp::NotLeader);
+        }
+        let configuration = self.tracker.configuration();
+        if !configuration.contains(member) {
+            return Ok(CatchUp::NotMember);
+        }
+        if configuration.votes(member) {
+            return Ok(CatchUp::Ready);
+        }
+        let (last, clock, election) = (
+            self.log.last_index()?,
+            self.clock(),
+            self.election_on_clock(),
+        );
+        let matched = self
+            .tracker
+            .get(member)
+            .map_or(0, |progress| progress.matched);
+        let lag = last.saturating_sub(matched);
+        let Some(staging) = self.stagings.get_mut(member) else {
+            let ready = matched >= last;
+            self.stagings.put(
+                member,
+                Staging {
+                    round_end: last,
+                    began: clock,
+                    lag,
+                    judged: clock,
+                    ready,
+                },
+            )?;
+            return Ok(if ready {
+                CatchUp::Ready
+            } else {
+                CatchUp::Pending
+            });
+        };
+        if staging.ready {
+            return Ok(CatchUp::Ready);
+        }
+        if matched >= staging.round_end {
+            // The round ended with no answer since to note it (`note_progress`): a
+            // round that began holding what it replicates.
+            if election.is_some_and(|election| clock.saturating_sub(staging.began) < election) {
+                staging.ready = true;
+                return Ok(CatchUp::Ready);
+            }
+            staging.round_end = last;
+            staging.began = clock;
+        }
+        let due = election.is_some_and(|election| clock.saturating_sub(staging.judged) >= election);
+        if !due {
+            return Ok(CatchUp::Pending);
+        }
+        if lag >= staging.lag {
+            // Unavailable, or slower than the leader appends: "the leader should
+            // also abort the change" (§4.2.1).
+            self.stagings.remove(member);
+            return Ok(CatchUp::Aborted);
+        }
+        staging.lag = lag;
+        staging.judged = clock;
+        Ok(CatchUp::Pending)
+    }
+    /// An answer moved `member`'s progress: a round of its catch-up ends once
+    /// it holds the round's end. One that lasted less than an election is the
+    /// last; a longer one begins the next with what this leader holds now.
+    fn note_progress(&mut self, member: NodeId) -> Result<()> {
+        if self.stagings.is_empty() {
+            return Ok(());
+        }
+        let (last, clock, election) = (
+            self.log.last_index()?,
+            self.clock(),
+            self.election_on_clock(),
+        );
+        let matched = self
+            .tracker
+            .get(member)
+            .map_or(0, |progress| progress.matched);
+        let Some(staging) = self.stagings.get_mut(member) else {
+            return Ok(());
+        };
+        if staging.ready || matched < staging.round_end {
+            return Ok(());
+        }
+        let lasted = clock.saturating_sub(staging.began);
+        if election.is_some_and(|election| lasted < election) {
+            staging.ready = true;
+        } else {
+            staging.round_end = last;
+            staging.began = clock;
+        }
+        Ok(())
+    }
     fn handle_heartbeat(&mut self, mut message: Message) -> Result<()> {
         if let Some(lost) = self.lost
             && message.commit > self.log.last_index()?
@@ -3528,6 +3667,13 @@ impl<S: Storage> Raft<S> {
     fn post_conf_change(&mut self) -> Result<ConfState> {
         let stated = self.tracker.configuration().to_conf_state()?;
         self.forget_unnamed();
+        // Only a learner is caught up: one promoted, or no member any more, is
+        // staged no more.
+        let Self {
+            stagings, tracker, ..
+        } = self;
+        let configuration = tracker.configuration();
+        stagings.retain(|member| configuration.contains(member) && !configuration.votes(member));
         let votes = self.tracker.configuration().votes(self.id);
         self.promotable = votes;
         if self.state != StateRole::Leader {

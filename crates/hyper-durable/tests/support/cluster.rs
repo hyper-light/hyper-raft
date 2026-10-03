@@ -141,6 +141,8 @@ pub fn timing() -> hyper_raft::Timing {
     hyper_raft::Timing {
         span: Duration::from_millis(500),
         round: Duration::from_millis(500),
+        // A delay within the span and one vote round.
+        election: Duration::from_millis(1_000),
     }
 }
 

@@ -916,13 +916,16 @@ and allocates no more on that project's workload.
   term (§4.3); `image` (with the configuration held at its point, §2.3), `install` (durable
   before it returns) and `persist` are its snapshot and compaction.
 - **`Replica`** (`src/replica.rs`): `open`, `step`, `suspect`, `trust`, `restarted`,
-  `set_timing`, `deadline`, `campaign`, `propose`, `propose_fast`, `change`, `read`, `transfer`,
+  `set_timing`, `set_carriage` (the window a leader keeps in flight to a member, `docs/raft.md`
+  §3.2, R16), `deadline`, `campaign`, `propose`, `propose_fast`, `change`, `catch_up` (where
+  catching up a learner stands, for its owner to promote it, R13), `read`, `transfer`,
   `report_unreachable`, `report_snapshot`, `drive`, `compact`, `resume`, `held`, `release`;
   the owner's policy, `set_priority` and `set_inflight_bytes` (the core's, as focal's owners set
-  them from placement and from what a path carries); what the owner reads to admit and account,
-  `reads_held` (reads confirmed that wait for their apply, which an owner bounding reads counts
-  beside the core's) and `budget_mut` (an owner whose budget charges by lane says which before a
-  call); and on ticks (§8), `tick`, `beat`, `set_randomized_election_timeout`, `set_patience`.
+  them from placement and from what a path carries, a window stated outright where `set_carriage`
+  derives it); what the owner reads to admit and account, `reads_held` (reads confirmed that wait
+  for their apply, which an owner bounding reads counts beside the core's) and `budget_mut` (an
+  owner whose budget charges by lane says which before a call); and on ticks (§8), `tick`, `beat`,
+  `set_randomized_election_timeout`, `set_patience`.
   `Settings::elections` is stated by every owner, with no default. Every call runs inside the unwind boundary. A drive takes the log's answers first and
   only then, applies what the fence allows, one page at most (§2.2), takes at most one `Ready`
   (§7's quantum), and writes the

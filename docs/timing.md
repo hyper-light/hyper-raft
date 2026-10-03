@@ -1200,9 +1200,11 @@ and the owners that still tick.
   was in flight went with the incarnation that stopped (core step R-7; with a window of one byte, a
   leader waiting on ten such messages freed one a beat, `HeartbeatAnswers::Bare`, and the group
   looked stalled for longer than the schedules' quiet period, seed 478 of the faults at rest).
-- `RawNode::set_timing(Timing { span, round })`: `Timing::of(&ballot, &span)` from the law of §2.3,
-  `span` the `W` the ballot chose and `round` the ballot's `broadcast_tail` (the slowest voter path's
-  tail over `G`, plus the mean flush). Given again whenever the ballot moves.
+- `RawNode::set_timing(Timing { span, round, election })`: `Timing::of(&ballot, &span)` from the
+  law of §2.3, `span` the `W` the ballot chose, `round` the ballot's `broadcast_tail` (the slowest
+  voter path's tail over `G`, plus the mean flush) and `election` the `T_E` the law expects at that
+  span, against which a learner's catch-up round is judged (`RawNode::catch_up`, `docs/raft.md`
+  §3.2, R13). Given again whenever the ballot moves.
 - `RawNode::wake(now)`, the owner's monotonic clock in nanoseconds, after each call it makes and at
   `RawNode::deadline()`; the core reads no clock, and what a call arms is timed at the next wake.
   A group with nothing timed has no deadline and is woken for nothing.

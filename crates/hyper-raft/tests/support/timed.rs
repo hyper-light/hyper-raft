@@ -299,6 +299,8 @@ pub fn run(scenario: &Scenario) -> Outcome {
     let timing = hyper_raft::Timing {
         span: Duration::from_nanos(round),
         round: Duration::from_nanos(round),
+        // A delay within the span and one vote round.
+        election: Duration::from_nanos(2 * round),
     };
     let nodes: Vec<New> = (1..=count as u64)
         .map(|id| {

@@ -834,14 +834,21 @@ impl<R: Replica> Cluster<R> {
     }
 
     /// With the network whole and every member up, the group elects and
-    /// commits: within `budget` rounds of ticks and deliveries a proposal
-    /// is applied by every member of the configuration. By suspicion the
-    /// budget is no count but progress (`docs/sim.md` §4.2): the rounds go
-    /// on while any member's term, commit, applied index or last index
-    /// moves, and fail once a quiet period passes with none moving — the
+    /// commits: a proposal is applied by every member of the configuration.
+    /// The rounds of ticks and deliveries go on while any member's term,
+    /// commit, applied index or last index moves (`docs/sim.md` §4.2), and
+    /// fail once a quiet period passes with none moving. By suspicion, the
     /// longest draw of the members' span, the election's three rounds and a
-    /// replication round, in rounds of one tick of each member's clock.
-    pub fn settles(&mut self, budget: usize) -> bool {
+    /// replication round, in rounds of one tick of each member's clock. On
+    /// ticks, twice the longest timeout a member draws with its patience:
+    /// within one, every member's timer fires and its campaign ends its lease
+    /// on a leader (a campaigner knows none); within the second, every member
+    /// has campaigned with no lease left. A pre-vote's answers then turn on
+    /// the voters' terms, logs, marks and priorities, which a quiet group does
+    /// not move, so a group in which no member won one by then wins none
+    /// later. A round is a tick of each member, its messages delivered within
+    /// it.
+    pub fn settles(&mut self) -> bool {
         self.blocked.clear();
         for id in self.ids() {
             if self.peek(id).is_none() {
@@ -862,22 +869,28 @@ impl<R: Replica> Cluster<R> {
         // The index the proposal took, and the term of the leader that
         // took it.
         let mut proposed: Option<(u64, u64)> = None;
-        let quiet = (SPAN_NS + 4 * ROUND_NS).div_ceil(TICK_NS) as usize;
+        let quiet = if self.settings.suspicion {
+            (SPAN_NS + 4 * ROUND_NS).div_ceil(TICK_NS) as usize
+        } else {
+            let patience = self
+                .up()
+                .into_iter()
+                .filter_map(|id| self.peek(id).map(|node| node.view().patience))
+                .max()
+                .unwrap_or(0);
+            2 * (2 * self.settings.election_tick - 1 + patience) + 1
+        };
         let mut seen: BTreeMap<u64, (u64, u64, u64, u64)> = BTreeMap::new();
         let mut moved = 0usize;
         for round in 0.. {
-            if self.settings.suspicion {
-                for id in self.up() {
-                    let view = self.peek(id).map(|node| node.view()).expect("up");
-                    let at = (view.term, view.commit, view.applied, view.last_index);
-                    if seen.insert(id, at) != Some(at) {
-                        moved = round;
-                    }
+            for id in self.up() {
+                let view = self.peek(id).map(|node| node.view()).expect("up");
+                let at = (view.term, view.commit, view.applied, view.last_index);
+                if seen.insert(id, at) != Some(at) {
+                    moved = round;
                 }
-                if round > moved + quiet {
-                    break;
-                }
-            } else if round >= budget {
+            }
+            if round > moved + quiet {
                 break;
             }
             // A member that joined after the leader's snapshot was taken is

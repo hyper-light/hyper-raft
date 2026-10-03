@@ -110,6 +110,7 @@ fn schedule(
     mix: &Mix,
     crash: Option<u64>,
 ) -> (Cluster<Lagged>, u64) {
+    let by_length = settings.by_length;
     let mut group: Cluster<Lagged> = Cluster::new(5, voters, settings, seed);
     group.stop_who_left = true;
     let mut rng = Seeded(seed);
@@ -126,12 +127,24 @@ fn schedule(
             persisted += 1;
         }
     }
-    if group.settles(400) {
+    if group.settles() {
         group.check_kept();
     } else {
         // Only a group whose marks leave no member the election rule admits
         // may wait (`docs/durable.md` §5.2): it is counted, and is no failure.
-        let electable = group.electable();
+        // The rule's argument is by the log's precedence. By raft-rs's
+        // precedence of length a voter of higher priority refuses a candidate
+        // whose log is shorter however much more current, and may be one the
+        // group could not elect instead (`Precedence::Length`): with marks, a
+        // group with every member up may then wait with a member the rule
+        // admits. Seed 740 of 960: the voter of the longest log, of an older
+        // term, refused the candidate of the later term for priority, the
+        // marked voter refused it for its mark, and neither could be elected.
+        let electable = if by_length {
+            Vec::new()
+        } else {
+            group.electable()
+        };
         assert!(
             group.faults > 0 && electable.is_empty(),
             "seed {seed}, crash {crash:?}: the group did not settle, and {electable:?} could lead"
@@ -471,5 +484,5 @@ fn a_write_durable_and_never_heard_of_is_held_after_a_crash() {
     assert_eq!(disk.last_index(), before + 1);
     assert_eq!(disk.entries.last().unwrap().data, b"kept");
     assert_eq!(group.coverage().lost, 1);
-    assert!(group.settles(400));
+    assert!(group.settles());
 }

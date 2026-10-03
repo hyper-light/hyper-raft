@@ -263,7 +263,7 @@ fn what_a_leader_committed_by_the_fast_quorum_the_next_leader_takes() {
         }
         assert_eq!(group.chosen[&2].3, b"e");
         // Those that were away hold it when they are back.
-        assert!(group.settles(200));
+        assert!(group.settles());
         for member in 1..=5 {
             assert!(applied(&group, member) >= 2);
         }
@@ -477,7 +477,7 @@ fn fast_schedule(
         }
         group.act(&op);
     }
-    assert!(group.settles(400), "seed {seed}: the group did not settle");
+    assert!(group.settles(), "seed {seed}: the group did not settle");
     for member in group.up() {
         add(did, group.peek(member).unwrap().fast_stats());
     }

@@ -530,6 +530,16 @@ rebuilding the marked member, can end the wait. Where every copy of a committed 
 group waits for good, as PAR's does ("the system will remain unavailable", §3.4.2). The schedules
 count both (`docs/raft.md` §3's R-7 row).
 
+**By the log's precedence.** That a group with a member the rule admits elects rests on
+`Precedence::Log`, under which a voter refuses a candidate for priority only where it could be
+elected instead. Under raft-rs's precedence of length, which the core keeps only to compare itself
+with raft-rs, a voter of higher priority refuses a candidate whose log is shorter however much more
+current, and with a mark no member need be away for the group to elect no one: at 960 seeds of the
+faults at rest (seed 740), the voter of the longest log, of an older term, refused the candidate of
+the later term for priority, the marked voter refused it for its mark, and neither could be elected.
+The schedules hold the rule's election to the log's precedence and count such a group under the
+other as waiting (`tests/pipeline.rs`).
+
 **The model.** R-7 changes who counts toward an election, which is what the TLA+ model checks, so
 the model gains the marked member (`docs/models/README.md`): `Lose`, a member losing its log's tail
 at rest and marking through its last entry; a voter judging by its claim (`Claim`); a marked
@@ -754,7 +764,10 @@ slates measured a delta format not worth a second recovery path).
   marked member at a time. The oracle counts a member's mark for what it acknowledged before the
   fault (I3), and once settled every member holds every committed entry as it was committed
   (`Cluster::check_kept`); a group that does not settle is accepted only where no member's election
-  the rule admits (`Cluster::electable`), and counted.
+  the rule admits (`Cluster::electable`), or under the precedence of length (§5.2), and counted.
+  Whether a group settles is judged by its progress, never a count of rounds: on ticks a group
+  that moves no term, commit, applied index or last index for twice the longest timeout a member
+  draws has had every member campaign with no lease left, and wins no election later.
 - **Real processes.** `hyper-raft-e2e` members on hyper-log and real disks, SIGKILL at named
   durability points (a hook that stops the process at the point and the harness kills it) and at
   random, every acknowledged write recovered, F17's two cases, a failed flush injected on a device.

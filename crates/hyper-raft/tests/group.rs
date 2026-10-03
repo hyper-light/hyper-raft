@@ -63,7 +63,7 @@ fn schedules_of_this_core(settings: Settings) -> (usize, u64) {
         let mut group: Cluster<New> = Cluster::new(5, &[1, 2, 3], settings, seed);
         group.stop_who_left = true;
         scheduled(&mut group, seed, steps, &mix);
-        assert!(group.settles(400), "seed {seed}: the group did not settle");
+        assert!(group.settles(), "seed {seed}: the group did not settle");
         assert_eq!(
             group.deposed, 0,
             "seed {seed}: a member led a group it left"
@@ -116,7 +116,7 @@ fn a_group_of_both_cores_is_safe_and_settles() {
         // owner stops it, as the shell's fence did when it unwound.
         group.stop_who_left = true;
         scheduled(&mut group, seed, steps, &mix);
-        assert!(group.settles(400), "seed {seed}: the group did not settle");
+        assert!(group.settles(), "seed {seed}: the group did not settle");
         deposed += group.deposed;
         for leader in group.leaders.values() {
             if leader % 2 == 1 {
@@ -231,7 +231,7 @@ fn a_round_confirms_no_read_asked_after_it_left() {
     // which the members that follow another leader will not answer.
     assert_eq!(group.answered, 1);
     quiet(&mut group);
-    assert!(group.settles(400));
+    assert!(group.settles());
     assert_eq!(group.answered, 1);
 }
 
@@ -274,7 +274,7 @@ fn a_member_that_left_refuses_no_one_for_priority() {
     assert!(stayed.term > left.term);
     // Member 1 is elected by member 2's vote, commits the removal and leads
     // alone.
-    assert!(group.settles(400));
+    assert!(group.settles());
     assert_eq!(group.leaders_now(), vec![1]);
 }
 

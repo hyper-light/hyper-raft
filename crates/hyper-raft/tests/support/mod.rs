@@ -566,6 +566,8 @@ pub struct View {
     pub applied: u64,
     pub timeout: usize,
     pub elapsed: usize,
+    /// Ticks the member waits past its election timeout ([`hyper_raft::Raft::patience`]).
+    pub patience: usize,
     pub pending_conf: u64,
     pub transferee: Option<u64>,
     pub promotable: bool,
@@ -1061,6 +1063,8 @@ impl Replica for Old {
             applied: raft.raft_log.applied,
             timeout: raft.randomized_election_timeout(),
             elapsed: raft.election_elapsed,
+            // raft-rs waits no longer than its timeout.
+            patience: 0,
             pending_conf: raft.pending_conf_index,
             transferee: raft.lead_transferee,
             promotable: raft.promotable(),
@@ -1499,6 +1503,7 @@ fn view_of(raw: &hyper_raft::RawNode<Store>, app: App) -> View {
         applied: raft.log().applied(),
         timeout: raft.randomized_election_timeout(),
         elapsed: raft.election_elapsed(),
+        patience: raft.patience(),
         pending_conf: raft.pending_conf_index(),
         transferee: raft.lead_transferee(),
         promotable: raft.promotable(),

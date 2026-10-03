@@ -94,7 +94,12 @@ pub enum Precedence {
     /// `raft-rs`. Two voters whose logs are equally long and end in
     /// different terms refuse each other, the one for priority and the
     /// other for the log, and with the third away the group elects no one.
-    /// Kept to compare the two cores under one rule.
+    /// With a marked member (core step R-7) no member need be away: the
+    /// voter of the longest log, of an older term, refuses the candidate of
+    /// the later term for priority while the marked voter refuses it for its
+    /// mark, and neither of them can be elected. A marked member's election
+    /// is argued by [`Precedence::Log`] (`docs/durable.md` §5.2). Kept to
+    /// compare the two cores under one rule.
     Length,
 }
 
@@ -1043,8 +1048,6 @@ impl<S: Storage> Raft<S> {
     pub fn durable_commit(&self) -> u64 {
         self.durable_commit
     }
-    /// A write stating `commit` is durable. The durable commit never goes
-    /// back.
     /// What this member's durable log may lack of what it acknowledged; none once it holds it.
     pub fn lost(&self) -> Option<Lost> {
         self.lost
@@ -1093,6 +1096,8 @@ impl<S: Storage> Raft<S> {
             None => Ok((self.log.last_index()?, self.log.last_term()?)),
         }
     }
+    /// A write stating `commit` is durable. The durable commit never goes
+    /// back.
     pub(crate) fn commit_durable(&mut self, commit: u64) {
         self.durable_commit = self.durable_commit.max(commit);
     }
@@ -1800,10 +1805,12 @@ impl<S: Storage> Raft<S> {
             round: std::time::Duration::from_nanos(round),
         })
     }
-    /// The owner holds this member's campaigns, or lets them go: its log may
-    /// lack what it acknowledged, or it is stalled for room
-    /// (`docs/durable.md` §5, §8). Everything else goes on: it trusts and
-    /// suspects, votes, and steps down as a leader.
+    /// The owner holds this member's campaigns, or lets them go: it is
+    /// stalled for room (`docs/durable.md` §8). A log that may lack what it
+    /// acknowledged is the core's to judge since R-7 (`may_campaign`, §5.2):
+    /// held for it, a marked member could not be elected where the rule
+    /// admits it. Everything else goes on: it trusts and suspects, votes,
+    /// and steps down as a leader.
     pub fn hold_campaigns(&mut self, held: bool) -> Result<()> {
         self.watch_mut()?.held = held;
         Ok(())

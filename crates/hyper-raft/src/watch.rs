@@ -100,8 +100,18 @@ pub(crate) struct Watch {
     pub(crate) beat: Arm,
     /// When this leader gives up the transfer under way.
     pub(crate) transfer: Arm,
-    /// The campaigns this member started since it opened: the draw's attempt.
-    pub(crate) attempt: u32,
+    /// The delays this member drew since it opened: the next draw's index. Every arming of the
+    /// campaign draws anew, so a member's delays are independent across elections, as Raft's
+    /// randomized timeout is drawn anew at every reset (§5.2, §9.3) and as the law's split
+    /// probability takes them (`hyper_timing::election_span`). A draw kept until it fires is not:
+    /// a member whose delay never fired keeps a long one while those whose delays fired draw
+    /// again, so the delays the next election runs on lean long, and its first round splits more
+    /// often than the law says. Past `u32::MAX` it wraps, repeating this member's own sequence,
+    /// which nothing else is drawn from.
+    pub(crate) draws: u32,
+    /// The hand-overs this member made since it opened: whose turn, among the heirs that hold as
+    /// much, the next one names.
+    pub(crate) handovers: u32,
     /// The last term this member led: while it is the member's term and the
     /// member leads no more, its followers may trust it still, and it
     /// hands over.
@@ -161,15 +171,16 @@ impl Watch {
     pub(crate) fn round(&self) -> Option<u64> {
         self.timing.map(|(_, round)| round)
     }
-    /// The delay before `local`'s next campaign, drawn over the span, once given.
-    pub(crate) fn delay(&self, local: u64) -> Option<u64> {
-        self.timing.map(|(span, _)| {
-            nanos(hyper_timing::election_delay(
-                Duration::from_nanos(span),
-                local,
-                self.attempt,
-            ))
-        })
+    /// The delay before `local`'s next campaign, drawn anew over the span, once given.
+    pub(crate) fn draw(&mut self, local: u64) -> Option<u64> {
+        let (span, _) = self.timing?;
+        let delay = nanos(hyper_timing::election_delay(
+            Duration::from_nanos(span),
+            local,
+            self.draws,
+        ));
+        self.draws = self.draws.wrapping_add(1);
+        Some(delay)
     }
     /// When an armed timer is due, if it is timed.
     pub(crate) fn due(arm: Arm) -> Option<u64> {

@@ -20,6 +20,7 @@
 )]
 mod support;
 
+use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::time::Duration;
 
@@ -34,6 +35,17 @@ use support::{New, Replica, Settings, Store};
 const LATENCY: u64 = 1_000_000;
 /// The timer granularity the span is searched to: a microsecond, finer than any span here.
 const GRANULARITY: Duration = Duration::from_micros(1);
+
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a soak sets the seed count from the environment; the default is the gate's"
+)]
+fn count(name: &str, default: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(default)
+}
 
 /// The timing hyper-timing's law gives a group of `voters` on this network: the split-vote span
 /// for all but a crashed leader's voters, on the one-way latency and a vote round of one round
@@ -331,15 +343,13 @@ fn elections_start_only_on_suspicion() {
 }
 
 /// The delay from a suspicion to a campaign is the election law's draw, `election_delay` over
-/// the span, at the member's seed and its campaign count, exactly; over many members it is
-/// uniform on `[0, W)`.
+/// the span, at the member's seed and its campaign count, exactly. How the draws spread over
+/// `[0, W)` is the law's to show, in hyper-timing.
 #[test]
-fn the_delay_is_the_laws_draw_and_uniform_over_the_span() {
+fn the_delay_is_the_laws_draw() {
     let (timing, _) = timing_for(3);
-    let span = timing.span.as_nanos() as u64;
-    let mut bins = [0u32; 10];
-    let members = 20_000u64;
-    for seed in 0..members {
+    let first = count("HYPER_RAFT_SEED", 0);
+    for seed in first..first + count("HYPER_RAFT_SEEDS", 1_000) {
         let settings = Settings::focal().by_suspicion();
         let local = seed.wrapping_mul(0x2545_f491_4f6c_dd1d);
         let mut node = New::open(2, Store::new(Sim::voters(&[1, 2, 3])), &settings, local);
@@ -350,59 +360,129 @@ fn the_delay_is_the_laws_draw_and_uniform_over_the_span() {
             .deadline()
             .expect("a member that knows no leader is armed");
         let drawn = hyper_timing::election_delay(timing.span, local, 0);
-        assert_eq!(due - opened, drawn.as_nanos() as u64);
-        bins[((due - opened) * 10 / span) as usize] += 1;
-    }
-    // 2,000 a bin; a bin past 2,000 ± 5σ (σ ≈ 42) is not uniform.
-    for bin in bins {
-        assert!((1_790..=2_210).contains(&bin), "{bins:?}");
+        assert_eq!(due - opened, drawn.as_nanos() as u64, "seed {seed}");
     }
 }
 
-/// Split votes resolve, and as often as the law says they happen. Five voters; the leader
-/// crashes and the four others suspect it at the same instant; each campaigns after its own draw
-/// over the span `election_span` chose for this network. A first round fails exactly when three
-/// of the four start within the one-way latency of the first (Ongaro, dissertation §9.2), which
-/// the span's `split` is the probability of. Over a thousand crashes every group elects, and
-/// the share whose first round split is that probability, within a 99.9 % interval.
+/// Every arming draws anew, so a member's delays are independent across elections as the law
+/// takes them. A member draws when it opens, follows a leader it trusts, then twice suspects it
+/// and trusts it again: each suspicion's delay is the law's draw at the next index, from the wake
+/// that timed it. A draw kept until it fired leaned the next election's delays long, since the
+/// members whose delays fired drew again and the others kept theirs: 135 first rounds of the
+/// split test's 1,000 crashes split against the law's 110.8.
 #[test]
-fn split_votes_resolve_as_often_as_the_law_says() {
-    let (timing, span) = timing_for(5);
-    let trials = 1_000u64;
-    let mut split = 0u64;
-    let mut terms = 0u64;
-    for seed in 0..trials {
-        let mut sim = Sim::new(5, &Sim::voters(&[1, 2, 3, 4, 5]), timing, seed);
+fn every_arming_draws_anew() {
+    let (timing, _) = timing_for(3);
+    let settings = Settings::focal().by_suspicion();
+    let local = 0x2545_f491_4f6c_dd1d;
+    let draw = |index| hyper_timing::election_delay(timing.span, local, index).as_nanos() as u64;
+    let mut node = New::open(2, Store::new(Sim::voters(&[1, 2, 3])), &settings, local);
+    node.raw.set_timing(timing).unwrap();
+    let mut now = 7_000_000_000;
+    node.wake(now);
+    assert_eq!(node.deadline(), Some(now + draw(0)));
+    node.step(Message {
+        msg_type: MessageType::MsgHeartbeat,
+        from: 1,
+        to: 2,
+        term: 1,
+        ..Message::default()
+    });
+    node.wake(now);
+    node.drain();
+    assert_eq!(node.deadline(), None, "it trusts the leader it follows");
+    for index in 1..=2 {
+        now += timing.span.as_nanos() as u64;
+        node.suspect(1);
+        node.wake(now);
+        assert_eq!(
+            node.deadline(),
+            Some(now + draw(index)),
+            "suspicion {index}"
+        );
+        node.trust(1);
+        node.wake(now);
+        assert_eq!(node.deadline(), None, "trusted again {index}");
+    }
+}
+
+/// Split votes resolve, and a first round splits exactly when the law says it does. Five voters;
+/// the leader crashes and the four others suspect it at the same instant; each campaigns after its
+/// own draw over the span `election_span` chose for this network. The law's event (Ongaro,
+/// dissertation §9.2; the span's `split` is its probability): the round fails when `s − ⌊n/2⌋ + 1`
+/// of the `s` available start within the one-way latency `l` of the first. Here, with pre-vote:
+/// the first starter's vote requests leave a round trip after its draw and land `3l` after it; a
+/// member that started within `l` of it became a candidate `2l` after its own draw, before they
+/// land, and refuses; two such refusals leave the first short of three votes, and no one else can
+/// win the term, since each of the others either voted for itself or for the first. So each
+/// crash's first round is predicted from the four delays the members armed before it runs, and
+/// must come out as predicted. A start exactly `l` after the first makes the candidacy and the
+/// request coincide,
+/// which the harness's order breaks, and either outcome is the protocol's. Every crash elects, and
+/// the seeds must hold rounds of both kinds.
+#[test]
+fn split_votes_resolve_and_split_exactly_when_the_law_says() {
+    let voters = 5u64;
+    let (timing, span) = timing_for(voters as u32);
+    let crowd = (voters - 1 - voters / 2 + 1) as usize;
+    let first = count("HYPER_RAFT_SEED", 0);
+    let trials = count("HYPER_RAFT_SEEDS", 1_000);
+    let (mut split, mut whole, mut terms) = (0u64, 0u64, 0u64);
+    for seed in first..first + trials {
+        let mut sim = Sim::new(voters, &Sim::voters(&[1, 2, 3, 4, 5]), timing, seed);
         sim.found(1);
         let term = sim.term(1);
         sim.stop(1);
-        for id in 2..=5 {
+        for id in 2..=voters {
             sim.node(id).suspect(1);
         }
-        for id in 2..=5 {
+        for id in 2..=voters {
             sim.settle(id);
         }
+        let mut delays: Vec<u64> = (2..=voters)
+            .map(|id| {
+                sim.peek(id)
+                    .deadline()
+                    .expect("a member that suspects is armed")
+                    - sim.now
+            })
+            .collect();
+        delays.sort_unstable();
+        let crowded = delays[crowd - 1] - delays[0];
         assert!(
             sim.run_until(|sim| sim.leader().is_some_and(|l| l != 1)),
             "seed {seed}: no leader"
         );
         let elected = sim.term(sim.leader().unwrap());
         terms += elected - term;
-        if elected > term + 1 {
+        let splits = elected > term + 1;
+        match crowded.cmp(&LATENCY) {
+            Ordering::Less => assert!(
+                splits,
+                "seed {seed}: delays {delays:?} split the vote, and the first round elected"
+            ),
+            Ordering::Greater => assert!(
+                !splits,
+                "seed {seed}: delays {delays:?} elect in the first round, and it split"
+            ),
+            Ordering::Equal => {}
+        }
+        if splits {
             split += 1;
+        } else {
+            whole += 1;
         }
     }
-    let expected = span.split * trials as f64;
-    let sd = (trials as f64 * span.split * (1.0 - span.split)).sqrt();
     println!(
-        "{trials} crashes: {split} first rounds split, {expected:.1} expected (split {:.4}, span {:?}); {terms} terms",
-        span.split, span.span
+        "{trials} crashes: {split} first rounds split, the law's expectation {:.1} (split {:.4}, span {:?}); {terms} terms",
+        span.split * trials as f64,
+        span.split,
+        span.span
     );
-    // 3.29 standard deviations: a two-sided 99.9 % interval.
     assert!(
-        (split as f64 - expected).abs() <= 3.29 * sd + 1.0,
-        "{split} splits against {expected:.1} ± {:.1}",
-        3.29 * sd
+        split > 0 && whole > 0,
+        "seeds {first}..{}: {split} first rounds split and {whole} elected; the test needs both",
+        first + trials
     );
 }
 

@@ -874,10 +874,23 @@ spend a term and depose a leader that never left.
 
 **The rules**, each with its source and, where the schedules found it, the run that did:
 - **A follower campaigns when it trusts no leader**, after the law's draw, `election_delay(W, seed,
-  attempt)` uniform on `[0, W)` (`ElectionTiming::delay` is the same draw). It trusts a leader while
+  index)` uniform on `[0, W)` (`ElectionTiming::delay` is the same draw). It trusts a leader while
   it knows one, its detector does not suspect it, and the configuration it applied names it a voter
   (a leader that is none steps down once it applies that, and a member that applied it knows it was
   committed). A suspicion withdrawn before the delay ends cancels the campaign.
+- **Every arming draws anew** (`Watch::draws`, the next draw's index): a member's delays are
+  independent across elections, as Raft's randomized timeout is drawn anew at every reset (§5.2,
+  §9.3) and as the law's split probability takes them. A draw kept until it fired, as the campaign
+  count once indexed it, is not: a member whose delay never fired keeps a long one while those
+  whose delays fired draw again, so the delays an election runs on lean long. The split test below
+  found it, 135 first rounds of 1,000 splitting against the law's 110.8 with the draw kept, and 99
+  with a draw at every arming (`every_arming_draws_anew` fails on the kept draw). Where detectors
+  are often wrong the long delays had a use the law does not count: they outlasted short wrong
+  suspicions, so fewer campaigns ran on them, and a campaigning member knows no leader to forward a
+  proposal to. The schedules, wrong one time in ten, commit 5.5 % fewer fast-track entries by
+  suspicion with the draw anew (`crates/hyper-raft/ORIGIN.md`, "A draw at every arming"); the cost
+  of a campaign on a wrong suspicion is not in the law's expected time, which takes the suspicion
+  as right (§3 item 12).
 - **When the delay is counted from.** From now where the event is common to the followers: the
   detectors suspected the leader, or the members opened together. After any other reset — a new
   term, a campaign lost or refused, a vote granted, a leader that stopped leading — a round
@@ -893,7 +906,7 @@ spend a term and depose a leader that never left.
   from the detectors, Raft §6.2), at once: the detector already waited its `η + α`.
 - **A leader that stops leading in its term hands over**: a transfer's order (`MsgTimeoutNow`,
   dissertation §3.10) to the voter it trusts that holds the most of its log, and among those that
-  hold as much, to each in turn, one a hand-over (`Watch::attempt`): one that restarted knows nothing
+  hold as much, to each in turn, one a hand-over (`Watch::handovers`): one that restarted knows nothing
   of what its followers hold, and the first it named may be one that cannot campaign. A leader that
   restarted marked and could not campaign named a member that was a learner by its own
   configuration, again and again, while its followers kept their lease on its node (core step R-7,
@@ -1252,9 +1265,12 @@ admits, so it needs no change (`docs/models/README.md`).
 
 **Evidence.** `crates/hyper-raft/tests/suspicion.rs`, a group in time on one-way latencies: an idle
 group sends nothing and is due for nothing for a simulated day; elections start only on suspicion;
-the delay is the law's draw exactly and uniform over 20,000 members; split votes resolve, the first
-rounds of 1,000 crashes of a five-voter leader splitting 135 times against Ongaro's 110.8 (`split`
-of `election_span` on the same latency and round, inside the 99.9 % interval); a withdrawn
+the delay is the law's draw exactly, and every arming draws anew; split votes resolve, and each of
+1,000 crashes of a five-voter leader splits its first round exactly when the law's event holds on
+the delays its members armed (three of the four starting within the latency of the first), which
+is predicted before the crash runs. No count is judged against a level: 99 first rounds split,
+reported beside the law's expectation of 110.8 (`split` of `election_span` on the same latency and
+round); how the draws spread over the span is the law's to show (hyper-timing). A withdrawn
 suspicion cancels; pre-vote refused by members that trust the leader; step-down on a suspected
 majority of either half of a joint configuration; hand-overs; a held member campaigns for nothing;
 a restarted leader forgotten; a leader that beats while work is in flight and then sleeps.
@@ -1392,6 +1408,15 @@ and election law; the remaining items keep their numbers, and item 10 is what L-
   the cost, against the history estimate. hyper-swim's verdict, renewed once a window over
   estimates of the whole history, renews oftener than the staleness rule asks and is as slow to
   follow a change; the same design serves it.
+- **12. A campaign on a wrong suspicion.** The election law's expected time to a leader takes the
+  suspicion as right: the span minimizes it for a leader that is gone (§2.3). A campaign on a wrong
+  suspicion costs what the law does not count: the member knows no leader from its pre-vote until
+  its leader answers, so it forwards no proposal and casts no fast-track vote, and the delay that
+  outlasts a short wrong suspicion runs no campaign at all. With the detector's mistakes measured
+  (Theorem 7's rate and duration), the span could minimize the expected cost over both cases; how
+  the measured mistake durations compare with the span decides whether it would move.
+  `crates/hyper-raft/ORIGIN.md`, "A draw at every arming", has the first numbers, from schedules
+  whose detectors are wrong one time in ten.
 
 ## 4. Steps
 

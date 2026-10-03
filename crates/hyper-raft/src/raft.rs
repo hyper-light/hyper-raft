@@ -1722,12 +1722,12 @@ impl<S: Storage> Raft<S> {
     /// among themselves.
     ///
     /// Among heirs that hold as much, it takes them in turn, one a hand-over
-    /// (the campaign count, `Watch::attempt`): one that restarted knows
-    /// nothing of what its followers hold, and the heir it names first may
-    /// be one that cannot campaign (a learner by its own configuration) or
-    /// cannot win, while its followers keep their lease on it. A schedule
-    /// found that with a leader that restarted marked (R-7, seed 75 of the
-    /// faults at rest by suspicion): it named the same heir for good.
+    /// (`Watch::handovers`): one that restarted knows nothing of what its
+    /// followers hold, and the heir it names first may be one that cannot
+    /// campaign (a learner by its own configuration) or cannot win, while
+    /// its followers keep their lease on it. A schedule found that with a
+    /// leader that restarted marked (R-7, seed 75 of the faults at rest by
+    /// suspicion): it named the same heir for good.
     fn hand_over(&mut self) -> Result<()> {
         let configuration = self.tracker.configuration();
         let heirs = || {
@@ -1742,14 +1742,16 @@ impl<S: Storage> Raft<S> {
         let turn = self
             .watch
             .as_ref()
-            .map_or(0, |watch| usize::try_from(watch.attempt).unwrap_or(0))
+            .map_or(0, |watch| usize::try_from(watch.handovers).unwrap_or(0))
             .checked_rem(tied().count())
             .unwrap_or(0);
-        let heir = tied().map(|(member, _)| member).nth(turn);
-        match heir {
-            Some(heir) => self.send(proto::message(heir, MessageType::MsgTimeoutNow)),
-            None => Ok(()),
+        let Some(heir) = tied().map(|(member, _)| member).nth(turn) else {
+            return Ok(());
+        };
+        if let Some(watch) = self.watch.as_deref_mut() {
+            watch.handovers = watch.handovers.wrapping_add(1);
         }
+        self.send(proto::message(heir, MessageType::MsgTimeoutNow))
     }
     /// The owner's detectors saw `member`'s node start again: it is
     /// trusted, and leads nothing it led before it stopped. A follower that
@@ -2011,12 +2013,15 @@ impl<S: Storage> Raft<S> {
             Arm::Off => Arm::Unset { round: true },
             armed => armed,
         };
-        watch.campaign = match (armed, watch.delay(local), watch.round()) {
-            (Arm::Unset { round }, Some(delay), Some(tail)) => Arm::At(
-                now.saturating_add(if round { tail } else { 0 })
-                    .saturating_add(delay),
-            ),
-            (armed, ..) => armed,
+        watch.campaign = match armed {
+            Arm::Unset { round } => match (watch.round(), watch.draw(local)) {
+                (Some(tail), Some(delay)) => Arm::At(
+                    now.saturating_add(if round { tail } else { 0 })
+                        .saturating_add(delay),
+                ),
+                _ => armed,
+            },
+            armed => armed,
         };
         // A sole voter has no one to split a vote with, nor a leader to
         // suspect: it campaigns at once, timed or not.
@@ -2037,9 +2042,8 @@ impl<S: Storage> Raft<S> {
             // It cannot campaign, and its followers trust it: it hands over
             // again, a round and a draw after the last, as a candidate asks
             // again, for the order may have been lost.
-            watch.attempt = watch.attempt.wrapping_add(1);
-            watch.campaign = match (watch.delay(local), watch.round()) {
-                (Some(delay), Some(tail)) => {
+            watch.campaign = match (watch.round(), watch.draw(local)) {
+                (Some(tail), Some(delay)) => {
                     Arm::At(now.saturating_add(tail).saturating_add(delay))
                 }
                 _ => Arm::Unset { round: true },
@@ -2051,15 +2055,13 @@ impl<S: Storage> Raft<S> {
             self.watch_mut()?.campaign = Arm::Apply;
             return Ok(false);
         }
-        let watch = self.watch_mut()?;
-        watch.attempt = watch.attempt.wrapping_add(1);
-        watch.campaign = Arm::Off;
+        self.watch_mut()?.campaign = Arm::Off;
         self.hup(false)?;
         if self.state != StateRole::Leader {
             // Unresolved within a round, it draws again.
             let watch = self.watch_mut()?;
-            watch.campaign = match (watch.delay(local), watch.round()) {
-                (Some(delay), Some(tail)) => {
+            watch.campaign = match (watch.round(), watch.draw(local)) {
+                (Some(tail), Some(delay)) => {
                     Arm::At(now.saturating_add(tail).saturating_add(delay))
                 }
                 _ => Arm::Unset { round: true },

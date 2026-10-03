@@ -338,8 +338,8 @@ impl ElectionTiming {
         self.base_periods.saturating_add(jitter)
     }
 
-    /// This node's delay from a suspicion to its `attempt`-th campaign, uniform on `[0, W)` from
-    /// the same draw as [`timeout_periods`](Self::timeout_periods) (`docs/timing.md` §2.3): the form
+    /// This node's `attempt`-th delay from a suspicion to a campaign, uniform on `[0, W)` from the
+    /// same draw as [`timeout_periods`](Self::timeout_periods) (`docs/timing.md` §2.3): the form
     /// for a core that campaigns on its detector's suspicion and waits in time, to the owner's
     /// granularity, rather than in periods.
     pub fn delay(&self, local: u64, attempt: u32) -> Duration {
@@ -347,18 +347,21 @@ impl ElectionTiming {
     }
 }
 
-/// The delay from a suspicion to `local`'s `attempt`-th campaign, uniform on `[0, span)`
+/// `local`'s `attempt`-th delay from a suspicion to a campaign, uniform on `[0, span)`
 /// (`docs/timing.md` §2.3): the draw [`ElectionTiming::delay`] makes, for a core that is given the
 /// span alone (hyper-raft's elections by suspicion, L-2). The draw is a splitmix64 mix of the id and
 /// the attempt, deterministic so a simulation reproduces from its seed, and independent across
 /// nodes and attempts as Raft's randomized timeout is (§5.2, §9.3); the scaling takes the high half
 /// of the product, so every nanosecond of the span is equally likely to within one part in 2^64.
+/// The independence holds across elections only if the caller takes a new attempt at each one:
+/// hyper-raft takes one at every arming (`Watch::draws`), since a delay kept until it fires leans
+/// the next election's delays long.
 pub fn election_delay(span: Duration, local: u64, attempt: u32) -> Duration {
     let scaled = u128::from(nanos(span)).saturating_mul(u128::from(draw(local, attempt)));
     Duration::from_nanos(u64::try_from(scaled >> u64::BITS).unwrap_or(u64::MAX))
 }
 
-/// The draw for `local`'s `attempt`-th campaign.
+/// The draw for `local`'s `attempt`-th delay.
 fn draw(local: u64, attempt: u32) -> u64 {
     splitmix64(local ^ u64::from(attempt).wrapping_mul(GOLDEN_GAMMA))
 }

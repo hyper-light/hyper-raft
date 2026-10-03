@@ -610,3 +610,46 @@ argument, the configurations and marks it covers, and CTRL mapped onto it; `docs
   cycles above 1 in a second pass of the cells the first pass leaned on, where `main` with 48 inert
   bytes moved one by 3.4 %; `benches/pipeline.rs`'s simulated figures identical.
 
+
+## A draw at every arming
+
+Not a port: found when `tests/suspicion.rs`'s split test was made exact (the owner's rule,
+2026-10-03: no test passes or fails on a statistical level).
+
+- **The test.** It predicts each crash's first round from the four delays the members armed before
+  the crash runs: the law's event (Ongaro, dissertation §9.2), three of the four starting within the
+  one-way latency of the first, splits it, with pre-vote as well (the first starter's vote requests
+  land three latencies after its draw; a member that started within one latency of it is a
+  candidate two latencies after its own, before they land, and refuses). Every one of 1,000 crashes
+  came out as predicted, before and after the change below; the 99.9 % interval on the count it
+  replaced is gone. The delay test checks the law's draw exactly; its ten bins, judged within five
+  standard deviations, are gone (how the draws spread is the law's to show).
+- **The defect.** The draw's index was the member's campaign count (`Watch::attempt`), so a member
+  that did not campaign kept its delay from one election to the next. The members whose delays fired
+  drew again and the others kept theirs, so the delays an election ran on leaned long: 135 first
+  rounds of the 1,000 split, against the law's 110.8 for independent draws. Raft's randomized
+  timeout is drawn anew at every reset (§5.2, §9.3), and the law's split probability takes the draws
+  as independent.
+- **The rule** (`src/watch.rs`, `src/raft.rs`): every arming draws anew (`Watch::draw`, the index
+  `Watch::draws`); a campaign, a hand-over and an unresolved round each arm, and so draw, once. The
+  hand-over's turn among heirs that hold as much has its own count (`Watch::handovers`), taken in
+  `hand_over` itself, one a hand-over. `every_arming_draws_anew` (a member opens, follows a leader,
+  and twice suspects it and trusts it again: each delay is the law's draw at the next index) fails
+  on the kept draw ("suspicion 1": the opening's draw again) and passes. 99 first rounds of the 1,000
+  split.
+- **What it costs where the detectors are often wrong.** The schedules' detectors are wrong one time
+  in ten about a member that is up, and the kept draw had made campaigns on those suspicions rarer:
+  the long delays it kept outlasted short wrong suspicions. A member that campaigns knows no leader
+  until one answers it (raft-rs's and etcd's pre-candidate, `Raft::become_pre_candidate`), so a
+  proposal made to it is not forwarded, and it casts no fast-track vote (`Raft::hold` votes only as
+  a follower that knows its leader). Counted over the fast-track schedules by suspicion, 2,400 of
+  2,000 steps, with the draw kept and with it drawn anew: pre-vote requests 295,051 and 302,452,
+  proposals forwarded 6,170 and 5,665, fast-track votes 47,443 and 43,389, entries committed 25,732
+  and 24,309, terms led 4,608 and 4,534 (on ticks 26,384 in 4,628 for both; with the hand-over's turn
+  counted as before, 24,302). No message was lost to the schedules' network bound in either. The
+  kept draw bought those entries by electing later and splitting more on a real failure, which is
+  what the delay is for.
+- **The schedules' coverage checks** (`tests/pipeline.rs`) ask that each mechanism was reached, not
+  that it was reached a picked number of times: 24 fast-track schedules by suspicion committed 185
+  entries, under the eight a schedule the check had asked since R-4. "Every schedule suffered faults
+  at rest" was never what it checked, nor true: seed 11 of the shell's three writes out draws none.

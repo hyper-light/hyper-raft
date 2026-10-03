@@ -417,7 +417,7 @@ async fn member(me: u64, nodes: u64, file: std::path::PathBuf) {
 
 /// The member's run: the count kept beside its file raised by one (one where there is none), a
 /// record kept whole and durable before the stream sends anything under it, as an owner keeps it
-/// (`hyper_liveness::Settings::run`; hyper-durable-e2e's `run`). A member started once on a fresh
+/// (`hyper_liveness::Settings::run`; hyper-raft-e2e's `run`). A member started once on a fresh
 /// directory is in its first.
 fn raise_run(file: &std::path::Path) -> u64 {
     let mut name = file.as_os_str().to_owned();

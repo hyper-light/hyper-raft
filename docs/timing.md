@@ -726,8 +726,8 @@ heartbeat due; those it skipped are losses to the receiver, which they are.
   process id the operating system gave again) made the new run's heartbeats, numbered from zero,
   stale for good. How an owner keeps it: as a record of its node written whole before the run is
   used (to a temporary name, the platform's full flush, a rename, its directory's flush, its
-  CRC-32C checked on read: `hyper_block::record`), as hyper-durable-e2e's members keep theirs beside
-  their logs (`run.rs`) and hyper-liveness's real-process members beside their files; a start that
+  CRC-32C checked on read: `hyper_block::record`), as the E2E harnesses' members keep theirs beside
+  their logs (`hyper_raft_e2e::run`) and hyper-liveness's real-process members beside their files; a start that
   crashed before its run was durable sent nothing under it, so the next may take the same number.
   The run is the node's, not a group's, so it is not the shell's to keep: hyper-durable's `Kind::Start`
   is a compaction's new start of a group's log, written when the log is compacted, not when the
@@ -1043,8 +1043,8 @@ own) run the same wiring on the core directly: `Config::elections = Suspicion` w
 check-quorum, the pairs attached from the configuration (each told to the core as the stream
 believes it when attached, as hyper-durable's `Owner::pairs` tells a replica), each `Change`
 taken to `suspect`, `trust` or `restarted`, its run (`Settings::run`) the count of its starts kept
-beside its log and raised before its stream's first heartbeat (`src/run.rs`, as hyper-durable-e2e's
-members keep theirs; §2.8, "A restart"), the timing derived by this law from the stream's
+beside its log and raised before its stream's first heartbeat (`src/run.rs`, which hyper-durable-e2e's
+members share; §2.8, "A restart"), the timing derived by this law from the stream's
 echoed round trips, mean flush and granularity (`stream::timing`, as `Replica::measure` derives
 it) and every pair charged the span's `T_E`, each log write handed to the stream as a flush proof,
 and, where the group wrote none in time, the log's hard state written again and flushed on the

@@ -1,7 +1,8 @@
 //! What the test tells a member beyond hyper-raft-e2e's own controls (`wire::Control`: where its
 //! peers listen, whether it is cut off), on the same framing and checksum: where to stop, a change
-//! of configuration, a flush to fail or a disk to stall, and what the member is, at length; and the
-//! node-pair liveness heartbeats members send one another (`hyper_liveness`).
+//! of configuration, a flush to fail or a disk to stall, and what the member is, at length. The
+//! node-pair liveness heartbeats members send one another are framed as hyper-raft-e2e's members
+//! frame theirs (`hyper_raft_e2e::stream`), at the tag past these orders'.
 use hyper_raft::proto::ConfChangeType;
 use hyper_raft_e2e::wire::{self, Kind, Reader, Status};
 
@@ -104,27 +105,6 @@ pub fn put_order(buffer: &mut Vec<u8>, id: u64, order: &Order) {
         Order::Wake => buffer.push(FIRST_TAG.saturating_add(4)),
         Order::StallFlush => buffer.push(FIRST_TAG.saturating_add(5)),
     }
-}
-
-/// The tag a liveness heartbeat takes: past the orders'.
-const HEARTBEAT: u8 = FIRST_TAG.saturating_add(6);
-
-/// Puts a node-pair liveness heartbeat from member `from`, its message as `hyper_liveness` made it.
-pub fn put_heartbeat(buffer: &mut Vec<u8>, from: u64, message: &[u8]) {
-    wire::begin(buffer, Kind::Control);
-    wire::put_u64(buffer, from);
-    buffer.push(HEARTBEAT);
-    buffer.extend_from_slice(message);
-}
-
-/// Reads a heartbeat's sender and message; none for anything else.
-pub fn read_heartbeat(body: &[u8]) -> Option<(u64, &[u8])> {
-    let mut reader = Reader::new(body);
-    let from = reader.u64()?;
-    if reader.u8()? != HEARTBEAT {
-        return None;
-    }
-    Some((from, reader.rest()))
 }
 
 /// Reads an order's body; none for one of `wire::Control`'s.

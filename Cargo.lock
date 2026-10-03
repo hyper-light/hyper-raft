@@ -659,7 +659,6 @@ dependencies = [
  "hyper-raft",
  "hyper-raft-e2e",
  "hyper-timing",
- "tempfile",
 ]
 
 [[package]]

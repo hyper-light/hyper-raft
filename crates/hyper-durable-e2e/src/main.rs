@@ -17,8 +17,7 @@ use std::sync::mpsc::{Receiver, sync_channel};
 
 use hyper_durable_e2e::control::{self, Order};
 use hyper_durable_e2e::node::{Node, NodeError, Settings, open_log};
-use hyper_durable_e2e::run;
-use hyper_raft_e2e::wire;
+use hyper_raft_e2e::{run, wire};
 
 /// The status a member exits with once a failed write fenced it.
 const FENCED: u8 = 3;

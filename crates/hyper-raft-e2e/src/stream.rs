@@ -3,8 +3,9 @@
 //! timing hyper-timing's law derives from what the stream measured, and the report a member gives
 //! the test of its law and its detectors.
 //!
-//! Heartbeats go as the test's control datagrams, framed as hyper-durable-e2e frames its own, so
-//! the two harnesses' members carry the stream alike.
+//! Heartbeats go as the test's control datagrams, framed here for both harnesses: hyper-durable-e2e's
+//! members send and read theirs with [`put_heartbeat`] and [`read_heartbeat`], so the two harnesses'
+//! members carry the stream alike.
 use std::time::Duration;
 
 use hyper_liveness::{Change, Liveness, Output, PeerId};
@@ -13,9 +14,8 @@ use hyper_timing::{Ballot, Span};
 
 use crate::wire::{self, Kind, Reader, Status};
 
-/// The control tag a heartbeat takes: past the test's instructions and hyper-durable-e2e's
-/// orders (`wire::Control` takes 1 and 2, hyper-durable-e2e's orders 10 to 15), the tag
-/// hyper-durable-e2e's heartbeats take.
+/// The control tag a heartbeat takes, in both harnesses: past the test's instructions and
+/// hyper-durable-e2e's orders (`wire::Control` takes 1 and 2, hyper-durable-e2e's orders 10 to 15).
 const HEARTBEAT: u8 = 16;
 /// The control tag of the test's ask for a member's [`Report`]: the next past `wire::Control`'s.
 const REPORT_ASK: u8 = 3;

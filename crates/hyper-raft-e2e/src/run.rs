@@ -5,7 +5,7 @@
 //! "A restart"). The count is a record kept whole (`hyper_block::record`: written to a temporary
 //! name, flushed with the platform's full flush, renamed over the record, its directory flushed
 //! after), so a start that crashed before its run was durable sent nothing under it, and the next
-//! start may take the same number. hyper-durable-e2e's members keep theirs the same way, in the
+//! start may take the same number. hyper-durable-e2e's members keep theirs with this module, in the
 //! same record.
 
 use std::path::{Path, PathBuf};

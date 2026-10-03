@@ -52,8 +52,8 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError, sync_channel};
 use std::time::{Duration, Instant};
 
 use hyper_durable_e2e::control::{self, Order, Point, Report};
-use hyper_durable_e2e::run;
 use hyper_raft::proto::ConfChangeType;
+use hyper_raft_e2e::run;
 use hyper_raft_e2e::wire::{self, Control, Kind, Op, Outcome};
 
 /// What a wait last saw of each member's progress, and until when it waits without seeing more.

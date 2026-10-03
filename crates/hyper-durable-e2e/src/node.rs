@@ -17,7 +17,7 @@
 //! proof. A heartbeat leaves only once the member's log made a write durable after the previous was
 //! due: where the group wrote none, the member makes one on the same log, an empty update of a group
 //! of the stream's own ([`LIVENESS_GROUP`]), so a disk that stops stops the heartbeats with it.
-//! Heartbeats travel as this harness's datagrams ([`control::put_heartbeat`]), stamped when the
+//! Heartbeats travel as hyper-raft-e2e's members' do ([`stream::put_heartbeat`]), stamped when the
 //! member reads them, as hyper-tokio stamps a datagram where the kernel cannot (`docs/timing.md`
 //! §3, item 5): the read delay counts as the sender's.
 //!
@@ -46,6 +46,8 @@ use hyper_log::{Config as LogConfig, Log, Waits};
 use hyper_raft::proto::{ConfChangeSingle, ConfChangeTransition, ConfChangeV2, ConfState, Message};
 use hyper_raft::wire::Record;
 use hyper_raft::{Config, StateRole};
+use hyper_raft_e2e::run::RunError;
+use hyper_raft_e2e::stream;
 use hyper_raft_e2e::wire::{self, Command, Control, Kind, Op, Outcome, Status};
 
 use crate::control::{self, Order, Point, Report};
@@ -98,8 +100,8 @@ pub enum NodeError {
     Io(std::io::Error),
     /// The liveness stream refused: a peer it cannot keep.
     Liveness(hyper_liveness::Refusal),
-    /// The member has no run: its record could not be read or raised (`crate::run`).
-    Run(crate::run::RunError),
+    /// The member has no run: its record could not be read or raised (`hyper_raft_e2e::run`).
+    Run(RunError),
 }
 
 impl std::fmt::Display for NodeError {
@@ -217,7 +219,7 @@ pub fn open_log(path: &Path) -> Result<Log<FaultFile>, NodeError> {
 
 impl Node {
     /// The member `settings` names on `socket`, opened on `log`, woken by `waker`, in its run
-    /// `run` (`crate::run::raise`).
+    /// `run` (`hyper_raft_e2e::run::raise`).
     #[allow(
         clippy::disallowed_methods,
         reason = "real processes on the host's clock, threads and environment (CLAUDE.md §1a, end to end)"
@@ -403,7 +405,7 @@ impl Node {
                 // A peer whose address the member was not told: the heartbeat is lost to it.
                 continue;
             };
-            control::put_heartbeat(&mut self.sending, self.settings.id, message);
+            stream::put_heartbeat(&mut self.sending, self.settings.id, message);
             if wire::seal(&mut self.sending, self.datagram) {
                 self.send(address)?;
             }
@@ -661,7 +663,7 @@ impl Node {
     }
 
     fn hear_test(&mut self, body: &[u8], from: SocketAddr) -> Result<(), NodeError> {
-        if let Some((peer, message)) = control::read_heartbeat(body) {
+        if let Some((peer, message)) = stream::read_heartbeat(body) {
             if self.isolated {
                 return Ok(());
             }

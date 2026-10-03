@@ -903,7 +903,7 @@ Tests (`crates/hyper-durable/tests`):
   one that watches for its test to go). The members elect by suspicion on their own detectors:
   each runs the node-pair liveness stream, its heartbeats proved by its replica's writes or, idle,
   by an empty update of a group of the stream's own on the same log, in a run it keeps beside its
-  log and raises at each start (`src/run.rs`, a record kept whole), and takes the stream's changes
+  log and raises at each start (`hyper_raft_e2e::run`, a record kept whole), and takes the stream's changes
   to its replica and its group's timing from what the stream measured, as `Owner` does
   (`docs/timing.md` §2.9, "On real detectors"). The test tells no member what to believe and
   derives nothing: it waits on facts while the group moves, for a quiet period of the members'

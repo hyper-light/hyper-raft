@@ -368,6 +368,8 @@ pub struct Kv {
     pub volatile: bool,
     /// Every entry of the group is acted on at start (focal's control groups).
     pub control: bool,
+    /// Images what it persisted, not everything applied: an owner's checkpoint, focal's case.
+    pub checkpoints: bool,
     /// Entries applied that a member acts on at its next start, and changes, since the harness
     /// last looked: what I5 holds against the durable commit.
     pub fenced_applied: Vec<u64>,
@@ -391,6 +393,7 @@ impl Kv {
             durable: state,
             volatile,
             control: false,
+            checkpoints: false,
             fenced_applied: Vec::new(),
             acted: Vec::new(),
             changes: Vec::new(),
@@ -403,6 +406,7 @@ impl Kv {
             durable: self.durable.clone(),
             volatile: self.volatile,
             control: self.control,
+            checkpoints: self.checkpoints,
             fenced_applied: Vec::new(),
             acted: Vec::new(),
             changes: Vec::new(),
@@ -477,15 +481,20 @@ impl StateMachine for Kv {
     fn acts_at_start(&self, entry: &EntryRef<'_>) -> bool {
         self.control || entry.data.starts_with(ACTS)
     }
-    fn image(&mut self, into: &mut Vec<u8>) -> Result<Point, Fatal> {
-        put(into, self.now.entries.len() as u64);
-        for (index, term, data) in &self.now.entries {
+    fn image(&mut self, into: &mut Vec<u8>) -> Result<(Point, ConfState), Fatal> {
+        let state = if self.checkpoints {
+            &self.durable
+        } else {
+            &self.now
+        };
+        put(into, state.entries.len() as u64);
+        for (index, term, data) in &state.entries {
             put(into, *index);
             put(into, *term);
             put(into, data.len() as u64);
             into.extend_from_slice(data);
         }
-        Ok(self.now.applied)
+        Ok((state.applied, state.configuration.clone()))
     }
     fn install(&mut self, image: &[u8], at: Point, configuration: &ConfState) -> Result<(), Fatal> {
         let mut bytes = image;

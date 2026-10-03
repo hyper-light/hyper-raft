@@ -151,7 +151,10 @@ one acknowledged; the write is durable once every part is, and each part counts 
 group's depth (§6). A snapshot's state is made durable by the
 state machine before the write that moves the log's start to it (mantle's rule: the log never
 starts past what the state machine holds), and an install the log never recorded is finished at
-open.
+open. The snapshot a leader sends a member behind its log's start is the state machine's image,
+at a point it applied, with the configuration the group held there (research §1, the Raft paper's
+§7): a machine that keeps its owner's checkpoints, as focal's does, serves the latest, behind what
+it applied, and the member applies the changes after it from the log.
 
 ### 2.4 Failures
 
@@ -888,8 +891,8 @@ and allocates no more on that project's workload.
   owner meets it, and stops a member between the release and the write made again.
 - **`StateMachine`** (`src/machine.rs`) applies an `EntryRef`, borrowed, with no copy, and each
   change with the change its entry stated (its context among it); its `durable` point carries its
-  term (§4.3); `image`, `install` (durable before it returns) and
-  `persist` are its snapshot and compaction.
+  term (§4.3); `image` (with the configuration held at its point, §2.3), `install` (durable
+  before it returns) and `persist` are its snapshot and compaction.
 - **`Replica`** (`src/replica.rs`): `open`, `step`, `suspect`, `trust`, `restarted`,
   `set_timing`, `deadline`, `campaign`, `propose`, `propose_fast`, `change`, `read`, `transfer`,
   `report_unreachable`, `report_snapshot`, `drive`, `compact`, `resume`, `held`, `release`; and

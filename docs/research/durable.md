@@ -46,6 +46,18 @@ open. Where a source is a project of ours, the entry names the file and revision
   what a member may act on before its commit is durable; storage faults (the model is crash-stop
   with durable storage).
 
+**Ongaro and Ousterhout, "In Search of an Understandable Consensus Algorithm (Extended Version)",
+2014 (the USENIX ATC 2014 paper, extended; raft.github.io/raft.pdf, read 2026-10-03).**
+
+- **§7, log compaction.** "Each server takes snapshots independently, covering just the committed
+  entries in its log." The snapshot keeps the last included index and term, and "to enable cluster
+  membership changes (Section 6), the snapshot also includes the latest configuration in the log
+  as of last included index." A follower given one resets its "state machine using snapshot
+  contents (and load[s the] snapshot's cluster configuration)" (Figure 13). A snapshot of index
+  `i` therefore carries the configuration as of `i`, never one applied after it: a server whose
+  snapshot lags what it applied (focal's checkpoints) serves it with the configuration it held
+  there, and the follower applies the later changes from the log.
+
 ## 2. Group commit
 
 **DeWitt, Katz, Olken, Shapiro, Stonebraker, Wood, "Implementation Techniques for Main Memory

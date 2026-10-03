@@ -146,3 +146,18 @@ its entry stated it, decoded once by the replica as before; the configuration be
 machine's own. mantle's range machine gains the same view. Test:
 `a_machine_is_given_the_change_it_applies` (`tests/shell.rs`), the context of an added learner's
 change read by the machine.
+
+## An image carries the configuration held at its point (2026-10-03)
+
+The replica prepared the snapshot it serves to members behind the log's start from the state
+machine's image and the machine's current configuration, which holds only for a machine that
+images everything it applied. focal's hand-over machine images its owner's latest checkpoint,
+behind what it applied (focal 27 §15.7), and a change applied since would have ridden the
+snapshot at the image's point, to be applied again from the log by the member that installed it.
+The Raft paper's snapshot carries "the latest configuration in the log as of last included index"
+(Ongaro and Ousterhout 2014, §7; `docs/research/durable.md` §1). `StateMachine::image` now
+returns the configuration held at its point with the point. The tests' machine images what it
+persisted when it keeps checkpoints. Test: `a_snapshot_carries_the_configuration_held_at_its_images_point`
+(`tests/shell.rs`): before the change, its first snapshot named a learner added after the image;
+now it does not, and the learner, served once its leader checkpointed past the addition, ends
+holding what its leader holds.

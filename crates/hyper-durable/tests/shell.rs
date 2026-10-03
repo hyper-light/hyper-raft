@@ -416,7 +416,7 @@ impl StateMachine for Boom {
     fn acts_at_start(&self, entry: &EntryRef<'_>) -> bool {
         self.0.acts_at_start(entry)
     }
-    fn image(&mut self, into: &mut Vec<u8>) -> Result<Point, Fatal> {
+    fn image(&mut self, into: &mut Vec<u8>) -> Result<(Point, ConfState), Fatal> {
         self.0.image(into)
     }
     fn install(&mut self, image: &[u8], at: Point, c: &ConfState) -> Result<(), Fatal> {
@@ -1225,4 +1225,109 @@ fn a_machine_is_given_the_change_it_applies() {
     assert_eq!(context, b"where 2 listens");
     assert_eq!(r.machine().configuration().learners, vec![2]);
     assert_eq!(r.machine().now.applied.index, index);
+}
+
+/// What `r` sends learner 2 once the learner, which holds nothing, refuses `append`: the refusal
+/// takes its leader back past the log's start.
+fn refused(r: &mut Sim, append: &Message) -> Message {
+    r.step(Message {
+        msg_type: MessageType::MsgAppendResponse,
+        from: 2,
+        to: 1,
+        term: append.term,
+        index: append.index,
+        reject: true,
+        reject_hint: 0,
+        ..Message::default()
+    })
+    .unwrap();
+    pump(r)
+        .messages
+        .into_iter()
+        .find(|m| m.to == 2 && m.msg_type == MessageType::MsgSnapshot)
+        .expect("a snapshot for the learner")
+}
+
+/// A machine that keeps its owner's checkpoints images the latest, behind what it applied
+/// (focal's): the snapshot a member behind the log's start is sent carries the configuration the
+/// group held at the image's point, never one applied since (Ongaro and Ousterhout 2014, §7). A
+/// member added after the image is served once its owner checkpoints past the addition, and then
+/// holds what its leader holds, each change applied once.
+#[test]
+fn a_snapshot_carries_the_configuration_held_at_its_images_point() {
+    let mut r = sole(1, Unbounded, |_| {});
+    r.machine_mut().checkpoints = true;
+    for data in [b"a", b"b", b"c"] {
+        r.propose(Vec::new(), data.to_vec()).unwrap();
+    }
+    pump(&mut r);
+    let imaged = r.applied();
+    assert!(r.compact(0, now(), waker()).unwrap());
+    pump(&mut r);
+    r.change(Vec::new(), &change(ConfChangeType::AddLearnerNode, 2))
+        .unwrap();
+    // The leader probes the learner it added, which holds nothing.
+    let probe = pump(&mut r)
+        .messages
+        .into_iter()
+        .find(|m| m.to == 2 && m.msg_type == MessageType::MsgAppend)
+        .expect("a probe of the learner");
+    assert_eq!(r.configuration().learners, vec![2]);
+
+    let sent = refused(&mut r, &probe);
+    let metadata = sent.snapshot.unwrap().metadata.unwrap();
+    assert_eq!(metadata.index, imaged.index);
+    assert_eq!(
+        metadata.conf_state,
+        Some(voters(&[1])),
+        "the configuration held at the image's point"
+    );
+
+    // The owner checkpoints past the addition, and the next snapshot names the learner.
+    assert!(r.compact(0, now(), waker()).unwrap());
+    pump(&mut r);
+    let checkpointed = r.machine().durable.applied;
+    r.report_snapshot(2, false).unwrap();
+    r.report_unreachable(2).unwrap();
+    r.propose(Vec::new(), b"again".to_vec()).unwrap();
+    let sent = pump(&mut r)
+        .messages
+        .into_iter()
+        .find(|m| m.to == 2 && m.msg_type == MessageType::MsgSnapshot)
+        .expect("a snapshot for the learner");
+    let metadata = sent.snapshot.as_ref().unwrap().metadata.clone().unwrap();
+    assert_eq!(metadata.index, checkpointed.index);
+    assert_eq!(metadata.conf_state.unwrap().learners, vec![2]);
+
+    // The learner installs it, and is given the rest from the log.
+    let mut learner: Sim = Replica::open(
+        &settings(2, 7),
+        SimStore::new(1),
+        Kv::new(voters(&[1]), false),
+        Unbounded,
+    )
+    .unwrap();
+    let mut to_learner = vec![sent];
+    r.report_snapshot(2, true).unwrap();
+    for _ in 0..64 {
+        for m in to_learner.drain(..) {
+            learner.step(m).unwrap();
+        }
+        for m in pump(&mut learner).messages {
+            if m.to == 1 {
+                r.step(m).unwrap();
+            }
+        }
+        to_learner.extend(pump(&mut r).messages.into_iter().filter(|m| m.to == 2));
+        if to_learner.is_empty() && learner.applied() == r.applied() {
+            break;
+        }
+    }
+    assert_eq!(learner.applied(), r.applied());
+    assert_eq!(learner.machine().now.entries, r.machine().now.entries);
+    assert_eq!(learner.configuration(), r.configuration());
+    assert!(
+        learner.machine().changes.is_empty(),
+        "the addition came with the image"
+    );
 }

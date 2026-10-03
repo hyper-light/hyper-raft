@@ -130,7 +130,7 @@ impl StateMachine for Kv {
 
     /// The members compact nothing, so none is ever behind the log's start: a store rebuilt from
     /// the log could not hold an installed image durably.
-    fn image(&mut self, _into: &mut Vec<u8>) -> Result<Point, Fatal> {
+    fn image(&mut self, _into: &mut Vec<u8>) -> Result<(Point, ConfState), Fatal> {
         Err(Fatal("this store keeps no snapshots"))
     }
 

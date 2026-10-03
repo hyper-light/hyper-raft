@@ -1731,15 +1731,17 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
     }
 
     /// Prepares the snapshot the core serves to members behind the log's start: the state
-    /// machine's image of everything applied, with its configuration.
+    /// machine's image, with the configuration the group held at its point. Not the
+    /// configuration applied since: a member installing it applies the changes after the
+    /// image's point from the log, each once.
     fn prepare(&mut self) -> Result<(), ReplicaError> {
         let mut data = Vec::new();
         let imaged = self.machine.image(&mut data);
-        let point = self.machine_did(imaged)?;
+        let (point, configuration) = self.machine_did(imaged)?;
         let snapshot = Snapshot {
             data,
             metadata: Some(SnapshotMetadata {
-                conf_state: Some(self.machine.configuration().clone()),
+                conf_state: Some(configuration),
                 index: point.index,
                 term: point.term,
             }),

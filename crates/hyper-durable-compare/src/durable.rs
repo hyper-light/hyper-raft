@@ -92,7 +92,7 @@ impl StateMachine for RangeMachine {
     fn acts_at_start(&self, _: &EntryRef<'_>) -> bool {
         false
     }
-    fn image(&mut self, _: &mut Vec<u8>) -> Result<Point, Fatal> {
+    fn image(&mut self, _: &mut Vec<u8>) -> Result<(Point, ConfState), Fatal> {
         Err(Fatal("the run compacts nothing"))
     }
     fn install(&mut self, _: &[u8], _: Point, _: &ConfState) -> Result<(), Fatal> {

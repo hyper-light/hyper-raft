@@ -2016,7 +2016,12 @@ mod tests {
             "the bound, this one included"
         );
         assert_eq!(detector.refused(), 10_000 - 7);
-        assert_eq!(detector.apply(HostId(1 << 40), dead(0)), Err(Full));
+        assert_eq!(detector.apply(HostId(1 << 40), alive(0)), Err(Full));
+        assert_eq!(
+            detector.apply(HostId(1 << 40), dead(0)),
+            Ok(None),
+            "a death of a member not held changes nothing"
+        );
         assert_eq!(detector.join(HostId(1 << 41)), Err(Full));
         assert!(detector.peers.len() <= 7);
         assert!(detector.gossip.pending() <= 7);
@@ -2451,8 +2456,30 @@ mod tests {
         let mut batch = Vec::new();
         source.gossip_into(10, &mut batch);
         let mut other = Detector::new(B, Exposure::new(), room());
+        other.join(A).unwrap();
         other.apply_gossip(batch);
         assert_eq!(liveness(&other, A), Liveness::Dead);
+    }
+
+    /// An exchange does not bring back a record a member has forgotten: a member still inside its
+    /// window pushes the death, and the one past it holds nothing of the member to override. Before,
+    /// it took the death as a newcomer's, restarting its window, and pushed it back in turn.
+    #[test]
+    fn an_exchange_does_not_bring_back_a_forgotten_record() {
+        let dead = MemberState {
+            liveness: Liveness::Dead,
+            incarnation: 0,
+        };
+        let mut world = World::new();
+        let mut first = running(LOCAL, &[A, C], &mut world);
+        let mut second = running(A, &[LOCAL, C], &mut world);
+        first.apply(C, dead).unwrap();
+        second.apply(C, dead).unwrap();
+        first.forget(C);
+        assert_eq!(first.membership().state(C), None);
+        assert_eq!(until_exchange(&mut first, &mut world), A);
+        exchange_views(&mut first, &mut second, 4);
+        assert_eq!(first.membership().state(C), None, "still forgotten");
     }
 
     #[test]

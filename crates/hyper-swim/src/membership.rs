@@ -161,12 +161,17 @@ impl Membership {
     /// the **local** node that would suspect or declare it dead — at an incarnation the local node has
     /// reached — is refuted: the local node raises its incarnation past the suspicion and re-asserts
     /// `Alive` (SWIM self-refutation), so a false suspicion cannot persist. An update about a member
-    /// the view does not hold, while it holds its bound, is refused.
+    /// the view does not hold, while it holds its bound, is refused. A death of a member the view
+    /// does not hold changes nothing: there is no state of it to override, and holding the death
+    /// would start a record no member needs, which anti-entropy would carry back to every member
+    /// that had forgotten it, each restarting its window, for as long as any held it (Demers et
+    /// al. 1987, §2: a deletion's certificate, kept too widely, outlives what it deleted).
     pub fn apply(&mut self, subject: HostId, update: MemberState) -> Result<Option<Change>, Full> {
         if subject == self.local {
             return Ok(self.refute(update));
         }
         let overrides = match self.members.get(&subject) {
+            None if update.liveness == Liveness::Dead => return Ok(None),
             None if self.members.len() >= self.capacity.get() => return Err(Full),
             None => true,
             Some(current) => {
@@ -296,6 +301,32 @@ mod tests {
         view.after(None).fold(0u64, |sum, (member, state)| {
             sum.wrapping_add(entry_digest(member, state))
         })
+    }
+
+    /// A death of a member the view does not hold changes nothing; a newcomer alive is adopted.
+    #[test]
+    fn a_death_of_a_member_not_held_changes_nothing() {
+        let mut view = Membership::new(HostId(1), NonZeroUsize::new(4).unwrap());
+        let dead = MemberState {
+            liveness: Liveness::Dead,
+            incarnation: 3,
+        };
+        assert_eq!(view.apply(HostId(2), dead), Ok(None));
+        assert_eq!(view.state(HostId(2)), None);
+        let alive = MemberState {
+            liveness: Liveness::Alive,
+            incarnation: 4,
+        };
+        assert!(view.apply(HostId(2), alive).unwrap().is_some());
+        assert_eq!(view.apply(HostId(2), dead), Ok(None), "an older death");
+        let newer = MemberState {
+            liveness: Liveness::Dead,
+            incarnation: 4,
+        };
+        assert!(
+            view.apply(HostId(2), newer).unwrap().is_some(),
+            "a held one's"
+        );
     }
 
     /// The digest kept as the view changes is the one its states give, whatever order they came
@@ -436,9 +467,11 @@ mod tests {
     fn a_member_past_the_bound_is_refused_and_one_held_is_not() {
         let mut view = Membership::new(LOCAL, NonZeroUsize::new(3).unwrap());
         assert!(view.apply(PEER, state(Liveness::Alive, 0)).is_ok());
+        assert!(view.apply(HostId(3), state(Liveness::Alive, 0)).is_ok());
         assert!(view.apply(HostId(3), state(Liveness::Dead, 0)).is_ok());
         assert_eq!(view.apply(HostId(4), state(Liveness::Alive, 0)), Err(Full));
-        assert_eq!(view.apply(HostId(4), state(Liveness::Dead, 0)), Err(Full));
+        // A death of a member not held changes nothing, full or not.
+        assert_eq!(view.apply(HostId(4), state(Liveness::Dead, 0)), Ok(None));
         assert_eq!((view.len(), view.capacity()), (3, 3));
         assert!(
             view.apply(PEER, state(Liveness::Suspect, 0))
@@ -456,6 +489,7 @@ mod tests {
     fn only_a_dead_member_is_forgotten() {
         let mut view = Membership::new(LOCAL, NonZeroUsize::new(3).unwrap());
         view.apply(PEER, state(Liveness::Alive, 0)).unwrap();
+        view.apply(HostId(3), state(Liveness::Alive, 2)).unwrap();
         view.apply(HostId(3), state(Liveness::Dead, 2)).unwrap();
         assert!(!view.forget(PEER), "alive");
         assert!(!view.forget(LOCAL), "this one");

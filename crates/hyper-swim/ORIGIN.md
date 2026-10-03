@@ -116,6 +116,11 @@
     pushed, in chunks. slates had none: memberlist's push/pull is the nearest, every 30 s, whole
     states each time.
 
+12. **A death of a member the view does not hold changes nothing** (`docs/timing.md` §2.7). With
+    anti-entropy, a member past a dead record's window took the death back from one still inside
+    its own as a newcomer's, restarting its window, and pushed it on in turn: the record went round
+    for as long as any member held it (Demers et al. §2's death certificates, resurrected).
+
 The wire changed in place with 8 and 11: a probe and an answer carry entries of the existing gossip
 encoding, which a receiver of the earlier form applies as any gossip, and `Sync` is a new tag with
 its own golden vector. No consumer runs hyper-swim yet (slates' session owns its integration), so
@@ -123,7 +128,7 @@ there is no earlier form in service to keep.
 
 ## Tests
 
-- 68 unit tests: slates' membership, gossip, codec and coordinate tests, the extension series and
+- 70 unit tests: slates' membership, gossip, codec and coordinate tests, the extension series and
   its bounds, the gossip queue's order, replacement and bound, and the measured timing's: nothing
   judged before the estimates exist, the deadline is `μ + α`, a silent member is suspected, told and
   condemned, an isolated member condemns nobody, an indirect answer spares, a refutation clears a
@@ -136,7 +141,8 @@ there is no earlier form in service to keep.
   answer tells a member it is held dead, a member that judges nothing states no bound, measurement
   periods follow round trips that lengthen, and a mutual split heals through a third member; and
   the view's digest follows the view and not the order of its changes, agreeing views exchange
-  only their digests, the exchanges' chunks, answers and cycle, and the view chunk's golden
+  only their digests, a death of a member not held changes nothing and an exchange does not bring
+  back a forgotten record, the exchanges' chunks, answers and cycle, and the view chunk's golden
   encoding.
 - `tests/cluster.rs`: five real member processes run the detector over hyper-datagram on real
   UDP sockets, as the library configures it.

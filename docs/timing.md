@@ -540,6 +540,13 @@ its peers' estimators, coordinates and gossip reports without bound. Now:
   number, and adds any node an alive message names;
 - a record past its window makes room for a newcomer at once; a member with nobody alive or suspected
   left keeps its dead, which are the members it probes;
+- a death of a member the view does not hold changes nothing: there is no state of it to override.
+  With anti-entropy (below) the rule is needed: a member past its window took a death back from one
+  still inside its own as a newcomer's, restarting its window, and pushed it on in turn, so a record
+  went round the members for as long as any held it, as Demers et al.'s death certificates do when
+  each site's threshold starts at its own receipt (§2); a certificate older than the time to reach
+  every site is one whose obsolete copies are unlikely anywhere (§2.1), which is the window's
+  premise (`an_exchange_does_not_bring_back_a_forgotten_record`);
 - the detection bound counts the most members the view has held at once, not the members it holds:
   a member forgotten since was in the rounds before.
 

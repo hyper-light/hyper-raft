@@ -174,7 +174,22 @@ its integration, `docs/STATUS.md`), so the wire changes in place:
   at an incarnation at or below its death's, would add it back: probed, suspected and condemned
   again, and gossiped on to members that forgot it too. Its `Dead` record is what refuses those
   updates (an update at or below the death's incarnation does not override it, `membership.rs`), so
-  it is kept for as long as such an update can arrive.
+  it is kept for as long as such an update can arrive. A death of a member it does not hold changes
+  nothing (2026-10-03): with anti-entropy, a member past its window otherwise took the death back as
+  a newcomer's from one still inside its own, restarting its window, and pushed it on in turn, the
+  record going round for as long as any member held it.
+
+**Demers et al. 1987, §2 and §2.1 (checked 2026-10-03).** "We cannot delete an item from the
+database simply by removing a local copy of the item ... the propagation mechanism will spread old
+copies of the item from elsewhere in the database back to the site where we have deleted it", so
+deleted items become death certificates, held "for some fixed threshold of time ... and then
+discard[ed]", at the risk of obsolete items older than the threshold being resurrected; and "if a
+death certificate is older than the expected time required to propagate it to all sites, then the
+existence of an obsolete copy of the corresponding data item anywhere in the network is unlikely"
+(§2.1). Their certificates carry a time stamp; a member's record here starts its window at its own
+adoption, so a record taken again restarts it, and the record itself becomes the item resurrected.
+Taking no death for a member the view does not hold is the rule that keeps a discarded certificate
+discarded.
 - How long that is. A member holds one pending report per member, replaced when it adopts a newer
   state, so a report of the member from before its death survives only at members the death has not
   reached. By SWIM §4.1 the death reaches every member but `n^{−((2−4/n)λ−2)}` in expectation, below

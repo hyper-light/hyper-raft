@@ -92,6 +92,10 @@ pub(crate) struct LaneIn {
     pub(crate) left: u64,
     /// The rank of the frame's class; a skipped frame's counts as the most urgent's.
     pub(crate) rank: u8,
+    /// Its frames waiting for the owner: at most the core's window.
+    pub(crate) queued: usize,
+    /// It is not read until a seat for its next frame is free.
+    pub(crate) paused: bool,
 }
 
 impl LaneIn {
@@ -108,6 +112,8 @@ impl LaneIn {
             frame: None,
             left: 0,
             rank: 0,
+            queued: 0,
+            paused: false,
         }
     }
 }

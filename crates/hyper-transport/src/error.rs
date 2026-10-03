@@ -64,6 +64,11 @@ pub enum Refusal {
     /// The configuration is invalid.
     #[error("invalid configuration")]
     Configuration,
+    /// Every entry of the peer table is held by events the owner has not polled, or by the
+    /// connections and dials that will end in them: no new peer is taken until it polls them
+    /// (`Limits::event_bound`).
+    #[error("the owner's unpolled events hold every peer entry")]
+    Events,
     /// The peer refused with a code this side does not know.
     #[error("the peer refused with an unknown code")]
     Unknown,

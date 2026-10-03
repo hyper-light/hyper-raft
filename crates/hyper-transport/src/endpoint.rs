@@ -4,6 +4,25 @@
 //! layer's handle, and every exchange in a generational table. A connection is taken out of its
 //! slot while it is driven and put back after, so the code that drives it reaches the rest of the
 //! endpoint without sharing anything.
+//!
+//! **The events the owner has not polled** are bounded by the endpoint's limits
+//! ([`Limits::event_bound`], `docs/transport.md` §4a). Every event waits in a seat of a bounded
+//! table, held until the owner polls it:
+//! - an exchange's events hold its slot in the exchange table, removed or not; each kind waits at
+//!   most once ([`EXCHANGE_EVENTS`]): its head, `BodyReady` and `Writable` (a later one while one
+//!   waits says nothing the waiting one does not), and `Refused`;
+//! - a lane's frames are counted against the lane, at most the core's window of them, and against
+//!   its peer, at most its lanes' windows; a lane at either bound is not read, so its bytes wait
+//!   in QUIC, whose flow control holds the sender (RFC 9000 §4.1), and it is read again as the
+//!   owner polls the peer's frames;
+//! - a peer's lifecycle waits as one event, its latest state with its epoch: a change while it
+//!   waits replaces it and moves it to the back, after the refusals of the exchanges a closed
+//!   connection carried; its entry in the peer table is held until the owner polls it.
+//!
+//! A table at its bound refuses, typed, the stream, the connection or the dial that would need one
+//! more seat ([`Refusal::Exchanges`], [`Refusal::Events`]); no event is ever dropped, and nothing
+//! refuses a datagram, whose acknowledgements every connection's loss detection needs (RFC 9002
+//! §6).
 
 use std::collections::VecDeque;
 use std::marker::PhantomData;
@@ -72,6 +91,19 @@ pub struct Limits {
 }
 
 impl Limits {
+    /// The most events the endpoint holds for its owner at once: [`EXCHANGE_EVENTS`] for every
+    /// exchange the table holds, and, for every entry of the peer table (the larger of the
+    /// identity and connection bounds), its one lifecycle event and its lanes' windows of frames.
+    /// The queue never holds more (the module's documentation says how).
+    pub fn event_bound(&self) -> usize {
+        let peers = self.admission.identities.max(self.admission.connections);
+        let lanes = usize::try_from(self.lanes_per_peer).unwrap_or(usize::MAX);
+        let frames = lanes.saturating_mul(self.lane_window);
+        EXCHANGE_EVENTS
+            .saturating_mul(self.exchanges)
+            .saturating_add(peers.saturating_mul(frames.saturating_add(1)))
+    }
+
     fn validate(&self) -> Result<(), Refusal> {
         let zero = self.streams_per_connection == 0
             || self.exchanges == 0
@@ -161,6 +193,10 @@ pub struct Stats {
 
 /// The QUIC application error code a connection closes with when it ends without a fault.
 const CLOSE_NORMAL: u32 = 0;
+/// The kinds of event an exchange can have waiting at once, each at most once: its head
+/// (`Request` or `Reply`, once in its life), `BodyReady` and `Writable` (each replaced by none
+/// while one waits), and `Refused` (once, as it ends).
+const EXCHANGE_EVENTS: usize = 4;
 /// A message's incoming states, each of which a step leaves or stops at: the bound on the steps
 /// one read takes.
 const IN_STATES: usize = 6;
@@ -177,6 +213,11 @@ struct Ask<'a, K> {
 
 struct Conn<R> {
     quic: Connection,
+    /// The endpoint's key for it: the QUIC layer's handle, which a later connection may reuse.
+    key: usize,
+    /// It among every connection the endpoint has held, counted: what tells it from a later one
+    /// under the same key.
+    serial: u64,
     /// The peer this side dialed, if it dialed.
     dialed: Option<PeerId>,
     /// Whether an inbound handshake still holds its pending place.
@@ -196,14 +237,91 @@ struct Conn<R> {
     lost: bool,
 }
 
+/// A peer's lifecycle as the owner hears it: its newest connection up, that connection closed,
+/// or a dial to it failed with no connection up since.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Lifecycle {
+    Connected(Epoch),
+    Closed(Epoch),
+    Unreachable,
+}
+
 #[derive(Debug)]
-struct PeerEntry {
+struct PeerEntry<R> {
     peer: PeerId,
     timing: PeerTiming,
     epoch: Epoch,
     /// The established connection exchanges to the peer are opened on: its newest.
     connection: Option<usize>,
+    /// Its role, as its newest connection's certificate names it.
+    role: Option<R>,
     used: u64,
+    /// The connections identified as the peer and not lost, its newest or older ones not yet
+    /// gone.
+    held: u32,
+    /// A dial to it is in progress.
+    dialing: bool,
+    /// The last dial to it failed, and no connection to it has come up since.
+    unreachable: bool,
+    /// The state the owner was last told, by the lifecycle event it polled last.
+    reported: Option<Lifecycle>,
+    /// The state of the lifecycle event waiting for the owner, if one does.
+    waiting: Option<Lifecycle>,
+    /// Frames of its lanes waiting for the owner, on any of its connections, live or gone.
+    frames: usize,
+    /// Its lanes not read for want of a seat for their next frame.
+    paused: u32,
+}
+
+impl<R> PeerEntry<R> {
+    fn new(peer: PeerId, used: u64) -> Self {
+        Self {
+            peer,
+            timing: PeerTiming::default(),
+            epoch: 0,
+            connection: None,
+            role: None,
+            used,
+            held: 0,
+            dialing: false,
+            unreachable: false,
+            reported: None,
+            waiting: None,
+            frames: 0,
+            paused: 0,
+        }
+    }
+    /// The peer's state now: `None` before it ever connected or a dial to it failed.
+    fn lifecycle(&self) -> Option<Lifecycle> {
+        if self.connection.is_some() {
+            Some(Lifecycle::Connected(self.epoch))
+        } else if self.unreachable {
+            Some(Lifecycle::Unreachable)
+        } else {
+            (self.epoch > 0).then_some(Lifecycle::Closed(self.epoch))
+        }
+    }
+    /// Whether the entry must stay: a connection or a dial needs it, or events wait in it.
+    fn pinned(&self) -> bool {
+        self.held > 0 || self.dialing || self.waiting.is_some() || self.frames > 0
+    }
+}
+
+/// An event waiting for the owner. The seat it holds until it is polled is the one it names (its
+/// exchange's slot, its peer's entry), and for a frame also the lane it came on: the key and serial
+/// of its connection, and its stream.
+struct Waiting<C: Classes> {
+    event: Event<C>,
+    lane: Option<(usize, u64, StreamId)>,
+}
+
+impl<C: Classes> Waiting<C> {
+    /// Whether this is a lifecycle event of `peer`.
+    fn lifecycle_of(&self, peer: PeerId) -> bool {
+        matches!(self.event,
+            Event::Connected { peer: of, .. } | Event::Closed { peer: of, .. } | Event::Unreachable { peer: of }
+                if of == peer)
+    }
 }
 
 /// The endpoint: see the crate's documentation.
@@ -217,6 +335,10 @@ pub struct Endpoint<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role
     responses: VecDeque<(Transmit, Vec<u8>)>,
     spare: Vec<Vec<u8>>,
     next: usize,
+    /// The connections held so far: the next one's serial.
+    serials: u64,
+    /// A peer's connections, gathered to read its paused lanes again.
+    keys: Vec<usize>,
 }
 
 /// What the code driving one connection reaches besides it.
@@ -230,8 +352,9 @@ struct Core<C: Classes, B, D> {
     serve: Progress,
     admission: Admission,
     exchanges: Arena<Exchange<C::Class>>,
-    events: VecDeque<Event<C>>,
-    peers: Vec<PeerEntry>,
+    /// The events the owner has not polled, at most [`Limits::event_bound`].
+    events: VecDeque<Waiting<C>>,
+    peers: Vec<PeerEntry<C::Role>>,
     /// The last `now` the endpoint was given; operations the owner calls between driving calls
     /// take it as theirs.
     now: Instant,
@@ -311,6 +434,8 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
             responses: VecDeque::with_capacity(limits.max_responses),
             spare: Vec::with_capacity(limits.max_responses),
             next: 0,
+            serials: 0,
+            keys: Vec::with_capacity(limits.admission.per_identity),
         })
     }
 
@@ -402,13 +527,41 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
         }
     }
 
-    /// The next event for the owner.
+    /// The next event for the owner. Polling it gives back the seat it held (the module's
+    /// documentation): an exchange's slot, a peer's entry, or a seat of a lane's window, and a
+    /// lane paused for want of one is read again.
     pub fn poll_event(&mut self) -> Option<Event<C>> {
-        self.core.events.pop_front()
+        let Waiting { event, lane } = self.core.events.pop_front()?;
+        match event {
+            Event::Request { exchange, .. }
+            | Event::Reply { exchange, .. }
+            | Event::Refused { exchange, .. } => self.core.exchanges.release(exchange.0),
+            Event::BodyReady { exchange } => self
+                .core
+                .exchanges
+                .release_with(exchange.0, |waiting| waiting.ready_waiting = false),
+            Event::Writable { exchange } => self
+                .core
+                .exchanges
+                .release_with(exchange.0, |waiting| waiting.writable_waiting = false),
+            Event::Connected { peer, .. }
+            | Event::Closed { peer, .. }
+            | Event::Unreachable { peer } => {
+                self.core.lifecycle_polled(peer);
+            }
+            Event::Frame { peer, .. } => {
+                if let Some((key, serial, stream)) = lane {
+                    self.frame_polled(peer, (key, serial), stream);
+                }
+            }
+        }
+        Some(event)
     }
 
     /// Dial `peer` at `address`, unless a connection to it exists or is being dialed: concurrent
-    /// cold calls to one peer dial once and share the connection (T42, focal's F60).
+    /// cold calls to one peer dial once and share the connection (T42, focal's F60). The dial
+    /// holds the peer's entry for the lifecycle event it ends in; [`Refusal::Events`] when every
+    /// entry is held by events the owner has not polled.
     pub fn connect(
         &mut self,
         now: Instant,
@@ -423,6 +576,19 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
             return Ok(());
         }
         self.core.admission.may_dial(self.core.dialing)?;
+        let dialing = self.core.entry(peer).ok_or(Refusal::Events)?;
+        dialing.dialing = true;
+        let dialed = self.dial(now, peer, address);
+        if dialed.is_err()
+            && let Some(entry) = self.core.entry(peer)
+        {
+            entry.dialing = false;
+        }
+        dialed
+    }
+
+    /// The dial of [`Endpoint::connect`], once the peer's entry holds it.
+    fn dial(&mut self, now: Instant, peer: PeerId, address: SocketAddr) -> Result<(), Refusal> {
         let grant = self.core.window_grant()?;
         let Some(name) = self.core.directory.server_name(peer) else {
             self.core.budget.release(grant);
@@ -693,6 +859,41 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
         }
     }
 
+    /// The owner polled a frame of `peer`'s lane on the connection `key` held under `serial`:
+    /// its seats go back, and the peer's lanes paused for want of one are read again.
+    fn frame_polled(&mut self, peer: PeerId, (key, serial): (usize, u64), stream: StreamId) {
+        let paused = self.core.peer_entry_mut(peer).is_some_and(|entry| {
+            entry.frames = entry.frames.saturating_sub(1);
+            entry.paused > 0
+        });
+        if let Some(Some(conn)) = self.conns.get_mut(key)
+            && conn.serial == serial
+            && let Some(lane) = conn.lanes_in.iter_mut().find(|lane| lane.stream == stream)
+        {
+            lane.queued = lane.queued.saturating_sub(1);
+        }
+        if !paused {
+            return;
+        }
+        let mut keys = std::mem::take(&mut self.keys);
+        keys.clear();
+        keys.extend(self.core.admission.connections_of(peer));
+        for &key in &keys {
+            let Some(mut conn) = self.take(key) else {
+                continue;
+            };
+            // From the last: reading a lane removes at most that lane.
+            for at in (0..conn.lanes_in.len()).rev() {
+                let paused = conn.lanes_in.get(at).is_some_and(|lane| lane.paused);
+                if paused && self.core.frame_room(&conn, at) {
+                    self.core.resume_lane(&mut conn, at);
+                }
+            }
+            self.put(key, conn);
+        }
+        self.keys = keys;
+    }
+
     fn with_exchange<T>(
         &mut self,
         exchange: ExchangeId,
@@ -715,8 +916,12 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
         let limits = self.core.limits;
         let initial = initial_window(MIN_DATAGRAM);
         let grants = vec![grant];
+        let serial = self.serials;
+        self.serials = serial.saturating_add(1);
         let conn = Conn {
             quic,
+            key,
+            serial,
             dialed,
             pending: dialed.is_none(),
             peer: None,
@@ -862,8 +1067,8 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
     }
 
     /// The entry of `peer`, made if it has none; past the bound the entry used longest ago that
-    /// has no connection makes room, and with none such there is no entry.
-    fn entry(&mut self, peer: PeerId) -> Option<&mut PeerEntry> {
+    /// nothing pins ([`PeerEntry::pinned`]) makes room, and with none such there is no entry.
+    fn entry(&mut self, peer: PeerId) -> Option<&mut PeerEntry<C::Role>> {
         self.tick = self.tick.saturating_add(1);
         let at = match self.peers.binary_search_by_key(&peer, |entry| entry.peer) {
             Ok(at) => at,
@@ -886,7 +1091,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
                 .peers
                 .iter()
                 .enumerate()
-                .filter(|(_, entry)| entry.connection.is_none())
+                .filter(|(_, entry)| !entry.pinned())
                 .min_by_key(|(_, entry)| entry.used)
                 .map(|(at, _)| at)?;
             self.peers.remove(evict);
@@ -895,15 +1100,82 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
             .peers
             .binary_search_by_key(&peer, |entry| entry.peer)
             .err()?;
-        let entry = PeerEntry {
-            peer,
-            timing: PeerTiming::default(),
-            epoch: 0,
-            connection: None,
-            used: self.tick,
-        };
-        self.peers.insert(at, entry);
+        self.peers.insert(at, PeerEntry::new(peer, self.tick));
         Some(at)
+    }
+
+    /// The entry of `peer`, if it has one; none is made.
+    fn peer_entry_mut(&mut self, peer: PeerId) -> Option<&mut PeerEntry<C::Role>> {
+        let at = self
+            .peers
+            .binary_search_by_key(&peer, |entry| entry.peer)
+            .ok()?;
+        self.peers.get_mut(at)
+    }
+
+    /// The peer's lifecycle may have changed: the event of it waiting for the owner, if any, is
+    /// replaced by its state now and moved to the back, after every event queued before the
+    /// change; a state the owner was already told waits as nothing.
+    fn report_lifecycle(&mut self, peer: PeerId) {
+        let Ok(at) = self.peers.binary_search_by_key(&peer, |entry| entry.peer) else {
+            return;
+        };
+        let Some(entry) = self.peers.get_mut(at) else {
+            return;
+        };
+        let state = entry.lifecycle();
+        if state == entry.waiting {
+            return;
+        }
+        if entry.waiting.take().is_some()
+            && let Some(index) = self
+                .events
+                .iter()
+                .position(|waiting| waiting.lifecycle_of(peer))
+        {
+            let _ = self.events.remove(index);
+        }
+        let event = match state {
+            Some(state) if Some(state) == entry.reported => return,
+            Some(Lifecycle::Connected(epoch)) => match entry.role {
+                Some(role) => Event::Connected { peer, role, epoch },
+                None => return,
+            },
+            Some(Lifecycle::Closed(epoch)) => Event::Closed { peer, epoch },
+            Some(Lifecycle::Unreachable) => Event::Unreachable { peer },
+            None => return,
+        };
+        entry.waiting = state;
+        self.events.push_back(Waiting { event, lane: None });
+    }
+
+    /// The owner polled `peer`'s lifecycle event: what it was told is the state that waited.
+    fn lifecycle_polled(&mut self, peer: PeerId) {
+        if let Some(entry) = self.peer_entry_mut(peer) {
+            entry.reported = entry.waiting.take().or(entry.reported);
+        }
+    }
+
+    /// Queue an event of exchange `id`, holding its slot; nothing when `id` names no exchange.
+    fn push_exchange(&mut self, id: u64, event: Event<C>) {
+        if self.exchanges.hold(id) {
+            self.events.push_back(Waiting { event, lane: None });
+        }
+    }
+
+    /// Queue a `BodyReady` of exchange `id`, unless one waits: it says nothing more.
+    fn push_body_ready(&mut self, id: u64) {
+        let fresh = self.exchanges.hold_if(id, |exchange| {
+            !std::mem::replace(&mut exchange.ready_waiting, true)
+        });
+        if fresh {
+            self.events.push_back(Waiting {
+                event: Event::BodyReady {
+                    exchange: ExchangeId(id),
+                },
+                lane: None,
+            });
+        }
     }
 
     fn on_event(
@@ -987,20 +1259,30 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
             self.admission.unidentified();
             return self.refuse_connection(now, conn, Refusal::Identity);
         };
+        // The entry its lifecycle events and frames wait in, before anything is charged: a table
+        // whose every entry waits for the owner takes no new peer.
+        if self.entry(peer).is_none() {
+            return self.refuse_connection(now, conn, Refusal::Events);
+        }
         self.tick = self.tick.saturating_add(1);
         let replaced = match self.admission.admit(peer, key, self.tick) {
             Ok(replaced) => replaced,
             Err(refusal) => return self.refuse_connection(now, conn, refusal),
         };
         conn.peer = Some((peer, role));
+        let dialed = conn.dialed.is_some();
         let epoch = self.entry(peer).map_or(0, |entry| {
             entry.epoch = entry.epoch.saturating_add(1);
             entry.connection = Some(key);
+            entry.role = Some(role);
+            entry.held = entry.held.saturating_add(1);
+            // A connection the peer opened leaves a dial to it in progress, and its entry held.
+            entry.dialing &= !dialed;
+            entry.unreachable = false;
             entry.epoch
         });
         conn.epoch = epoch;
-        self.events
-            .push_back(Event::Connected { peer, role, epoch });
+        self.report_lifecycle(peer);
         self.accept_streams(now, key, conn, Dir::Bi);
         self.accept_streams(now, key, conn, Dir::Uni);
         replaced
@@ -1016,9 +1298,19 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
             .close(now, VarInt::from_u32(refusal.code()), bytes::Bytes::new());
         if let Some(peer) = conn.dialed {
             conn.lost = true;
-            self.events.push_back(Event::Unreachable { peer });
+            self.dial_failed(peer);
         }
         None
+    }
+
+    /// A dial to `peer` ended before a connection to it was up: unreachable, unless a connection
+    /// to it came up meanwhile.
+    fn dial_failed(&mut self, peer: PeerId) {
+        if let Some(entry) = self.peer_entry_mut(peer) {
+            entry.dialing = false;
+            entry.unreachable = entry.connection.is_none();
+        }
+        self.report_lifecycle(peer);
     }
 
     /// The connection was lost: every exchange on it is refused and its owner told, once.
@@ -1038,20 +1330,17 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
         match (conn.peer, conn.dialed) {
             (Some((peer, _)), _) => {
                 self.admission.release(peer, key);
-                if let Ok(at) = self.peers.binary_search_by_key(&peer, |entry| entry.peer)
-                    && let Some(entry) = self.peers.get_mut(at)
-                    && entry.connection == Some(key)
-                {
-                    entry.connection = None;
+                if let Some(entry) = self.peer_entry_mut(peer) {
+                    entry.held = entry.held.saturating_sub(1);
+                    if entry.connection == Some(key) {
+                        entry.connection = None;
+                    }
                 }
-                self.events.push_back(Event::Closed {
-                    peer,
-                    epoch: conn.epoch,
-                });
+                self.report_lifecycle(peer);
             }
             (None, Some(peer)) => {
                 self.dialing = self.dialing.saturating_sub(1);
-                self.events.push_back(Event::Unreachable { peer });
+                self.dial_failed(peer);
             }
             (None, None) => {}
         }
@@ -1075,10 +1364,9 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
                 self.budget.release(frame);
             }
         }
+        let peer = conn.peer.map(|(peer, _)| peer);
         for lane in conn.lanes_in.drain(..) {
-            if let Some(frame) = lane.frame {
-                self.budget.release(frame);
-            }
+            self.drop_lane_in(peer, lane);
         }
     }
 
@@ -1123,8 +1411,10 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
             began: now,
             answered: false,
             ready_sent: false,
+            ready_waiting: false,
             wants_write: false,
             writable_sent: false,
+            writable_waiting: false,
             stream_blocked: false,
             starved: false,
             ended: false,
@@ -1183,9 +1473,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
             In::Body => {
                 if !exchange.ready_sent {
                     exchange.ready_sent = true;
-                    self.events.push_back(Event::BodyReady {
-                        exchange: ExchangeId(id),
-                    });
+                    self.push_body_ready(id);
                 }
                 Ok(false)
             }
@@ -1326,18 +1614,24 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
             if let Some(entry) = self.entry(peer) {
                 entry.timing.answered(taken);
             }
-            self.events.push_back(Event::Reply {
-                exchange: ExchangeId(id),
-                body: prefix.body,
-            });
+            self.push_exchange(
+                id,
+                Event::Reply {
+                    exchange: ExchangeId(id),
+                    body: prefix.body,
+                },
+            );
         } else if let (Some(kind), Some(class)) = (C::kind_of(prefix.kind), class) {
-            self.events.push_back(Event::Request {
-                exchange: ExchangeId(id),
-                peer,
-                kind,
-                class,
-                body: prefix.body,
-            });
+            self.push_exchange(
+                id,
+                Event::Request {
+                    exchange: ExchangeId(id),
+                    peer,
+                    kind,
+                    class,
+                    body: prefix.body,
+                },
+            );
         }
     }
 
@@ -1369,9 +1663,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
             .map_err(|refusal| (refusal, false))?;
         incoming.state = In::Whole;
         exchange.carry.rest();
-        self.events.push_back(Event::BodyReady {
-            exchange: ExchangeId(id),
-        });
+        self.push_body_ready(id);
         Ok(true)
     }
 
@@ -1478,8 +1770,10 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
             began: now,
             answered: false,
             ready_sent: false,
+            ready_waiting: false,
             wants_write: false,
             writable_sent: false,
+            writable_waiting: false,
             stream_blocked: false,
             starved: false,
             ended: false,
@@ -1789,6 +2083,13 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
         id: u64,
         failure: Option<(Refusal, bool)>,
     ) {
+        // The refusal's seat is the exchange's slot, held before the exchange is removed from it.
+        let refused = failure.filter(|_| {
+            self.exchanges
+                .get(id)
+                .is_some_and(|exchange| !exchange.ended)
+        });
+        let held = refused.is_some() && self.exchanges.hold(id);
         let Some(exchange) = self.exchanges.remove(id) else {
             return;
         };
@@ -1816,13 +2117,16 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
         {
             self.budget.release(reservation);
         }
-        if let Some((refusal, by_peer)) = failure
-            && !exchange.ended
+        if let Some((refusal, by_peer)) = refused
+            && held
         {
-            self.events.push_back(Event::Refused {
-                exchange: ExchangeId(id),
-                refusal,
-                by_peer,
+            self.events.push_back(Waiting {
+                event: Event::Refused {
+                    exchange: ExchangeId(id),
+                    refusal,
+                    by_peer,
+                },
+                lane: None,
             });
         }
     }
@@ -1856,10 +2160,16 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
         if !wanted || self.allowed(conn, self.rank_of(id)) == 0 {
             return;
         }
-        if let Some(exchange) = self.exchanges.get_mut(id) {
+        let fresh = self.exchanges.hold_if(id, |exchange| {
             exchange.writable_sent = true;
-            self.events.push_back(Event::Writable {
-                exchange: ExchangeId(id),
+            !std::mem::replace(&mut exchange.writable_waiting, true)
+        });
+        if fresh {
+            self.events.push_back(Waiting {
+                event: Event::Writable {
+                    exchange: ExchangeId(id),
+                },
+                lane: None,
             });
         }
     }
@@ -2073,9 +2383,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
                             .quic
                             .recv_stream(lane.stream)
                             .stop(VarInt::from_u32(refusal.code()));
-                        if let Some(frame) = lane.frame {
-                            self.budget.release(frame);
-                        }
+                        self.drop_lane_in(conn.peer.map(|(peer, _)| peer), lane);
                     }
                     return;
                 }
@@ -2092,9 +2400,74 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
             .ok_or(Refusal::Lanes)?;
         match state {
             Reading::Opener => lane_opener(conn, at),
-            Reading::Prefix => self.lane_prefix(conn, at),
+            Reading::Prefix if self.frame_room(conn, at) => self.lane_prefix(conn, at),
+            Reading::Prefix => {
+                self.pause_lane(conn, at);
+                Ok(false)
+            }
             Reading::Frame => self.lane_frame(conn, at),
             Reading::Skipping => self.lane_skip(conn, at),
+        }
+    }
+
+    /// Whether lane `at` of `conn` has seats for its next frame: one of its window, the core's
+    /// (T37), and one of its peer's, every lane the peer may open at the core's window.
+    fn frame_room(&self, conn: &Conn<C::Role>, at: usize) -> bool {
+        let (Some(lane), Some((peer, _))) = (conn.lanes_in.get(at), conn.peer) else {
+            return false;
+        };
+        let Ok(index) = self.peers.binary_search_by_key(&peer, |entry| entry.peer) else {
+            return false;
+        };
+        let lanes = usize::try_from(self.limits.lanes_per_peer).unwrap_or(usize::MAX);
+        let peer_frames = lanes.saturating_mul(self.limits.lane_window);
+        lane.queued < self.limits.lane_window
+            && self
+                .peers
+                .get(index)
+                .is_some_and(|entry| entry.frames < peer_frames)
+    }
+
+    /// Lane `at` of `conn` waits for a seat: it is not read, and its bytes wait in QUIC, until
+    /// the owner polls one of its peer's frames.
+    fn pause_lane(&mut self, conn: &mut Conn<C::Role>, at: usize) {
+        let Some(lane) = conn.lanes_in.get_mut(at) else {
+            return;
+        };
+        if std::mem::replace(&mut lane.paused, true) {
+            return;
+        }
+        if let Some((peer, _)) = conn.peer
+            && let Some(entry) = self.peer_entry_mut(peer)
+        {
+            entry.paused = entry.paused.saturating_add(1);
+        }
+    }
+
+    /// Lane `at` of `conn` has its seats again: it is read.
+    fn resume_lane(&mut self, conn: &mut Conn<C::Role>, at: usize) {
+        let resumed = conn
+            .lanes_in
+            .get_mut(at)
+            .is_some_and(|lane| std::mem::replace(&mut lane.paused, false));
+        if resumed
+            && let Some((peer, _)) = conn.peer
+            && let Some(entry) = self.peer_entry_mut(peer)
+        {
+            entry.paused = entry.paused.saturating_sub(1);
+        }
+        self.read_lane(conn, at);
+    }
+
+    /// A lane from `peer` is gone: its frame in progress goes back, and its pause with it.
+    fn drop_lane_in(&mut self, peer: Option<PeerId>, lane: LaneIn) {
+        if let Some(frame) = lane.frame {
+            self.budget.release(frame);
+        }
+        if lane.paused
+            && let Some(entry) = peer.and_then(|peer| self.peer_entry_mut(peer))
+        {
+            entry.paused = entry.paused.saturating_sub(1);
         }
     }
 
@@ -2160,14 +2533,22 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
             .ok_or(Refusal::Order)?
             .verify(&lane.prefix, frame.bytes());
         let (peer, kind) = (conn.peer.map(|(peer, _)| peer), C::kind_of(lane.kind));
-        let lane_id = lane.lane;
+        let (lane_id, stream) = (lane.lane, lane.stream);
         match (verified, peer, kind) {
             (Ok(()), Some(peer), Some(kind)) => {
-                self.events.push_back(Event::Frame {
-                    peer,
-                    lane: lane_id,
-                    kind,
-                    frame,
+                // Its seats were found free before its prefix was read (`lane_step`).
+                lane.queued = lane.queued.saturating_add(1);
+                if let Some(entry) = self.peer_entry_mut(peer) {
+                    entry.frames = entry.frames.saturating_add(1);
+                }
+                self.events.push_back(Waiting {
+                    event: Event::Frame {
+                        peer,
+                        lane: lane_id,
+                        kind,
+                        frame,
+                    },
+                    lane: Some((conn.key, conn.serial, stream)),
                 });
                 Ok(true)
             }

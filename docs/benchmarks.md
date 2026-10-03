@@ -3226,6 +3226,33 @@ What the layer adds:
 - Time at 64 KiB is 27 % over the bare stream: the CRC-32C of 128 KiB and the copy of each body into
   the reader's reservation, which the bare stream drops without reading.
 
+### The events' bound (2026-10-02)
+
+The owner's unpolled events bounded (`docs/transport.md` §4a): every event holds a seat until it is
+polled. The same bench, `main` (`2525538`) against this tree, each built with the time printed to
+three places (a scratch edit of the bench's format, reverted), fifteen runs of each alternated in
+fresh processes, 2026-10-02 at 23:55 PDT, load 48.9–51.7 (other sessions); medians, with the least
+and the most:
+
+| Workload | Allocations, reallocations, bytes | `main` | This tree |
+|---|---|---|---|
+| exchange, no body | 8.35, 0, 1,143: the same | 3.254 µs (3.220–3.327) | 3.261 µs (3.217–3.422), +0.2 % |
+| exchange, 4 KiB bodies | 12.36, 0, 9,313: the same | 12.284 µs (12.197–12.381) | 12.249 µs (11.538–12.735), −0.3 % |
+| exchange, 64 KiB bodies | 26.40, 0, 148,633: the same | 147.87 µs (141.01–150.05) | 146.70 µs (139.07–149.62), −0.8 % |
+| lane frame, 512 B | 1.07, 0.09, 620: the same | 0.882 µs (0.851–0.916) | 0.897 µs (0.880–0.912), +1.7 % |
+| bare hyper-quic, 16 B | the same | 2.228 µs | 2.240 µs, +0.5 % |
+| bare hyper-quic, 4 KiB | the same | 9.578 µs | 9.527 µs, −0.5 % |
+| bare hyper-quic, 64 KiB | the same | 124.11 µs | 123.87 µs, −0.2 % |
+
+No allocation, reallocation or byte changed: the seats are counters in what the endpoint already
+holds, and the queue keeps its capacity. The bare rows run no code this change touched and move by up
+to 0.5 %, the noise of the comparison; the exchanges are within it. A lane frame is 15 ns over: it is
+counted against its lane's window and its peer's, a read of the peer table when its prefix is begun
+and when it is queued, and of its lane when it is polled. Two earlier series of the first form (load
+31–47) had the exchanges 1.2 to 2.0 % over, traced to two table reads for each `BodyReady` and
+`Writable`, a check of the flag and the hold; one read does both now (`Arena::hold_if`,
+`Arena::release_with`).
+
 ## Against focal-wire
 
 `crates/hyper-transport-compare` (a workspace of its own; focal-wire from focal at `99191da`): two

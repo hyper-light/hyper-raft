@@ -176,6 +176,15 @@ impl Admission {
         bump(&mut self.stats.admitted);
         Ok(replaced)
     }
+    /// The connections charged to `peer`.
+    pub(crate) fn connections_of(&self, peer: PeerId) -> impl Iterator<Item = ConnectionKey> + '_ {
+        self.identities
+            .binary_search_by_key(&peer, |identity| identity.peer)
+            .ok()
+            .and_then(|at| self.identities.get(at))
+            .into_iter()
+            .flat_map(|identity| identity.held.iter().map(|(connection, _)| *connection))
+    }
     /// `connection` of `peer` was used at `tick`.
     pub(crate) fn used(&mut self, peer: PeerId, connection: ConnectionKey, tick: u64) {
         let Ok(at) = self

@@ -1326,3 +1326,343 @@ fn a_body_the_peer_withholds_while_it_sends_others_is_given_up() {
         "the others kept the connection busy"
     );
 }
+
+/// The frames on the queue of `node`.
+fn frames_waiting(net: &Net<Node<Mantle>, Node<Mantle>>) -> usize {
+    net.b.stats().events
+}
+
+/// An owner that polls nothing is held a lane's window of its frames and no more: the rest wait
+/// in QUIC, whose flow control holds the sender, and each frame polled lets one more be read.
+#[test]
+fn a_lane_holds_an_owner_that_polls_nothing_to_its_window() {
+    let pair = Pair::new();
+    let mut narrow = limits();
+    narrow.lane_window = 8;
+    let mut net = connected::<Mantle, Mantle>(&pair, narrow, 256 << 20);
+    let mut sent = 0u32;
+    while sent < 100 {
+        match net.a.send_frame(2, 0, Kind::Append, &sent.to_be_bytes()) {
+            Ok(()) => sent += 1,
+            Err(Refusal::LaneFull) => {
+                net.exchange();
+            }
+            Err(other) => panic!("{other:?}"),
+        }
+        assert!(frames_waiting(&net) <= narrow.lane_window);
+    }
+    net.exchange();
+    assert_eq!(
+        frames_waiting(&net),
+        narrow.lane_window,
+        "the lane's window and no more"
+    );
+    let mut order = Vec::new();
+    while let Some(event) = net.b.poll_event() {
+        let Event::Frame { frame, .. } = event else {
+            panic!("{event:?}")
+        };
+        order.push(u32::from_be_bytes(frame.bytes().try_into().unwrap()));
+        net.b.release(frame);
+        let left = 100 - order.len();
+        assert_eq!(
+            frames_waiting(&net),
+            narrow.lane_window.min(left),
+            "the poll gave its seat to the next frame"
+        );
+        net.exchange();
+    }
+    assert_eq!(order, (0..100).collect::<Vec<_>>(), "in order");
+}
+
+/// A peer's frames wait against the peer whatever connection they came on: back on a new one, it
+/// has its lanes read only as the owner polls what the old one left.
+#[test]
+fn a_peer_is_held_to_its_lanes_windows_across_its_connections() {
+    let pair = Pair::new();
+    let mut narrow = limits();
+    narrow.lane_window = 4;
+    narrow.lanes_per_peer = 2;
+    let mut net = connected::<Mantle, Mantle>(&pair, narrow, 256 << 20);
+    let address = net.b_address;
+    for index in 0..8u32 {
+        net.a
+            .send_frame(2, index % 2, Kind::Append, &index.to_be_bytes())
+            .unwrap();
+    }
+    net.exchange();
+    let seats = 2 * narrow.lane_window;
+    assert_eq!(frames_waiting(&net), seats, "both lanes at their windows");
+    net.a.disconnect(net.now, 2);
+    net.exchange();
+    net.a.connect(net.now, 2, address).unwrap();
+    net.until(TURNS, |net| {
+        events(&mut net.a)
+            .iter()
+            .any(|event| matches!(event, Event::Connected { epoch: 2, .. }))
+    });
+    for index in 8..12u32 {
+        net.a
+            .send_frame(2, 0, Kind::Append, &index.to_be_bytes())
+            .unwrap();
+    }
+    net.exchange();
+    // The old connection's frames and the peer's one lifecycle event, its new connection.
+    assert_eq!(frames_waiting(&net), seats + 1, "the new lane is not read");
+    let Event::Frame { lane: 0, frame, .. } = net.b.poll_event().unwrap() else {
+        panic!("the first to wait is the old connection's first frame")
+    };
+    net.b.release(frame);
+    assert_eq!(frames_waiting(&net), seats + 1, "one seat, one frame read");
+    let mut order = Vec::new();
+    while let Some(event) = net.b.poll_event() {
+        match event {
+            Event::Frame { frame, .. } => {
+                order.push(u32::from_be_bytes(frame.bytes().try_into().unwrap()));
+                net.b.release(frame);
+            }
+            Event::Connected { peer: 1, epoch, .. } => assert_eq!(epoch, 2),
+            other => panic!("{other:?}"),
+        }
+        assert!(frames_waiting(&net) <= seats + 1);
+        net.exchange();
+    }
+    let new: Vec<u32> = order.iter().copied().filter(|index| *index >= 8).collect();
+    assert_eq!(
+        new,
+        vec![8, 9, 10, 11],
+        "the new connection's frames, in order"
+    );
+    assert_eq!(order.len(), 11);
+}
+
+/// An owner that polls nothing holds each exchange's slot with its events: the peer's exchanges
+/// past the table are refused, typed, and no more events wait than its slots hold.
+#[test]
+fn exchanges_wait_in_their_table_for_an_owner_that_polls_nothing() {
+    let pair = Pair::new();
+    let mut tight = limits();
+    tight.exchanges = 4;
+    let mut net = connected::<Mantle, Mantle>(&pair, tight, 256 << 20);
+    let mut asker = Asker::new();
+    for round in 0..10u8 {
+        while asker
+            .ask(
+                &mut net.a,
+                net.now,
+                2,
+                (Kind::Get, Class::Request),
+                round,
+                None,
+                PERIOD,
+            )
+            .is_ok()
+        {}
+        net.until(TURNS, |net| {
+            asker.drive(&mut net.a);
+            assert!(net.b.stats().events <= tight.event_bound());
+            asker.asked.iter().all(|asked| asked.done)
+        });
+    }
+    // Each slot holds the request it served and the refusal it ended in.
+    assert_eq!(net.b.stats().events, 2 * tight.exchanges);
+    assert_eq!(net.b.stats().exchanges, 0, "none is open");
+    assert!(
+        asker
+            .asked
+            .iter()
+            .any(|asked| asked.refused == Some((Refusal::Exchanges, true))),
+        "past the table the peer refused"
+    );
+    // The requests and refusals the owner now polls are of exchanges long gone.
+    assert_eq!(events(&mut net.b).len(), 2 * tight.exchanges);
+    let mut server = Server::new();
+    asker
+        .ask(
+            &mut net.a,
+            net.now,
+            2,
+            (Kind::Get, Class::Request),
+            99,
+            None,
+            PERIOD,
+        )
+        .unwrap();
+    run(&mut net, &mut asker, &mut server);
+    assert_eq!(
+        asker.asked.last().unwrap().refused,
+        None,
+        "served once polled"
+    );
+}
+
+/// An owner that reads a body without polling holds one `BodyReady` of it, however often more
+/// arrives: a later one says nothing the waiting one does not.
+#[test]
+fn an_owner_reading_without_polling_holds_one_body_ready() {
+    let pair = Pair::new();
+    let mut net = connected::<Mantle, Mantle>(&pair, limits(), 256 << 20);
+    let body = 4 << 20;
+    let mut asker = Asker::new();
+    asker
+        .ask(
+            &mut net.a,
+            net.now,
+            2,
+            (Kind::Put, Class::Request),
+            1,
+            Some(body),
+            PERIOD,
+        )
+        .unwrap();
+    let mut served = None;
+    net.until(TURNS, |net| {
+        asker.drive(&mut net.a);
+        served = events(&mut net.b)
+            .into_iter()
+            .find_map(|event| match event {
+                Event::Request { exchange, .. } => Some(exchange),
+                _ => None,
+            });
+        served.is_some()
+    });
+    let exchange = served.unwrap();
+    let mut read = 0u64;
+    for _ in 0..TURNS {
+        // Everything that has arrived, read without polling.
+        loop {
+            let mut into = net.b.reserve(Class::Request, PIECE as u64).unwrap();
+            let got = net.b.read_body(exchange, &mut into).unwrap() as u64;
+            net.b.release(into);
+            read += got;
+            if got == 0 {
+                break;
+            }
+        }
+        assert!(net.b.stats().events <= 1, "one BodyReady waits");
+        if net.b.body_complete(exchange) {
+            break;
+        }
+        asker.drive(&mut net.a);
+        if !net.exchange() {
+            net.advance();
+        }
+    }
+    assert_eq!(read, body);
+    assert!(matches!(
+        events(&mut net.b)[..],
+        [Event::BodyReady { exchange: waiting }] if waiting == exchange
+    ));
+}
+
+/// A peer that goes and comes back while the owner polls nothing waits as one event: its latest
+/// state, with its epoch.
+#[test]
+fn a_peers_lifecycle_waits_as_its_latest_state() {
+    let pair = Pair::new();
+    let mut net = connected::<Mantle, Mantle>(&pair, limits(), 256 << 20);
+    let address = net.b_address;
+    for epoch in 2..=6u64 {
+        net.a.disconnect(net.now, 2);
+        net.exchange();
+        net.a.connect(net.now, 2, address).unwrap();
+        net.until(TURNS, |net| {
+            events(&mut net.a)
+                .iter()
+                .any(|event| matches!(event, Event::Connected { epoch: e, .. } if *e == epoch))
+        });
+    }
+    let waiting = events(&mut net.b);
+    assert!(
+        matches!(
+            waiting[..],
+            [Event::Connected {
+                peer: 1,
+                epoch: 6,
+                ..
+            }]
+        ),
+        "{waiting:?}"
+    );
+    net.a.disconnect(net.now, 2);
+    net.exchange();
+    assert!(
+        matches!(
+            events(&mut net.b)[..],
+            [Event::Closed { peer: 1, epoch: 6 }]
+        ),
+        "a change after the poll waits again"
+    );
+}
+
+/// A peer table whose every entry is held by events the owner has not polled takes no new peer:
+/// its connection is refused before it is charged, and taken once the owner polls.
+#[test]
+fn a_peer_table_held_by_unpolled_events_refuses_a_new_peer() {
+    let pair = Pair::new();
+    let third = pair.pki.issue(&name(3));
+    let mut small = limits();
+    small.admission.identities = 1;
+    small.admission.connections = 1;
+    let book = || {
+        let mut book = pair.book(Role::Node, Role::Node);
+        book.add(&third.0, 3, Role::Node);
+        book
+    };
+    let now = hyper_sim::Anchor::new().instant(0).unwrap();
+    let a = pair.node::<Mantle>(1, Role::Node, book(), small, 256 << 20, now);
+    let b = pair.node::<Mantle>(2, Role::Node, book(), small, 256 << 20, now);
+    let mut net = Net::new(now, a, b);
+    let address = net.b_address;
+    net.a.connect(now, 2, address).unwrap();
+    net.until(TURNS, |net| {
+        events(&mut net.a)
+            .iter()
+            .any(|event| matches!(event, Event::Connected { peer: 2, .. }))
+    });
+    net.a.disconnect(net.now, 2);
+    net.exchange();
+    // Peer 3 dials in from where peer 1 was, while peer 1's lifecycle waits for b's owner.
+    let config = hyper_transport::Config {
+        credentials: credentials(&pair.pki.root, &third.0, &third.1),
+        role: Role::Node,
+        limits: small,
+        listen: true,
+    };
+    net.a = Node::<Mantle>::new(
+        config,
+        hyper_transport::Fixed::new(256 << 20, 64),
+        book(),
+        net.now,
+    )
+    .unwrap();
+    let admitted = net.b.stats().admission.admitted;
+    net.a.connect(net.now, 2, address).unwrap();
+    net.until(TURNS, |net| {
+        events(&mut net.a).iter().any(|event| {
+            matches!(
+                event,
+                Event::Closed { peer: 2, .. } | Event::Unreachable { peer: 2 }
+            )
+        })
+    });
+    assert_eq!(
+        net.b.stats().admission.admitted,
+        admitted,
+        "refused, not charged"
+    );
+    assert_eq!(net.b.connection_stats(3).map(|_| ()), None);
+    assert!(
+        matches!(
+            events(&mut net.b)[..],
+            [Event::Closed { peer: 1, epoch: 1 }]
+        ),
+        "only peer 1's state waited"
+    );
+    net.a.connect(net.now, 2, address).unwrap();
+    net.until(TURNS, |net| {
+        events(&mut net.b)
+            .iter()
+            .any(|event| matches!(event, Event::Connected { peer: 3, .. }))
+    });
+}

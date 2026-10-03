@@ -255,11 +255,15 @@ pub(crate) struct Exchange<K> {
     pub(crate) answered: bool,
     /// A [`crate::Event::BodyReady`] is outstanding.
     pub(crate) ready_sent: bool,
+    /// A [`crate::Event::BodyReady`] waits in the queue, unpolled: another says nothing more.
+    pub(crate) ready_waiting: bool,
     /// The owner was told it could not write all it offered; it hears [`crate::Event::Writable`]
     /// when it can write more.
     pub(crate) wants_write: bool,
     /// A [`crate::Event::Writable`] is outstanding; the owner's next write answers it.
     pub(crate) writable_sent: bool,
+    /// A [`crate::Event::Writable`] waits in the queue, unpolled: another says nothing more.
+    pub(crate) writable_waiting: bool,
     /// QUIC refused a write the connection's credit allowed: the stream's own window is spent,
     /// and only QUIC's `Writable` for the stream says it can take more.
     pub(crate) stream_blocked: bool,

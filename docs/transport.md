@@ -197,7 +197,7 @@ each ported test's origin, and what was left out).
   receive windows) and `stats`.
 - Events: `Connected { peer, role, epoch }`, `Request`, `Reply`, `BodyReady`, `Writable`,
   `Frame { peer, lane, kind, frame }`, `Refused { exchange, refusal, by_peer }`,
-  `Closed { peer, epoch }`, `Unreachable`.
+  `Closed { peer, epoch }`, `Unreachable`; at most `Limits::event_bound` wait for the owner (below).
 - Departures from §3.4's sketch, none of substance: `Directory` is the third type parameter (§3.4's
   `PeerId` presumed one); `Classes` gains `RANKS`, `rank`, `kind_code`, `kind_of` (the reserve counts
   the classes above, and the kind crosses the wire); `send_frame` takes the frame's kind (its class
@@ -232,6 +232,40 @@ window, always read; a frame its class or the budget cannot take is skipped and 
 bounds pending handshakes (Retry under load), identities, connections per identity (the one used
 longest ago replaced) and connections in all; every exchange and lane has a table bound. Every
 refusal is typed, and one that ends an exchange crosses the wire as the stream reset's code.
+
+**The events the owner has not polled** are bounded too (`Limits::event_bound`): at most
+`4·exchanges + peers·(1 + lanes_per_peer·lane_window)`, `peers` the peer table's bound (the larger
+of the identity and connection bounds). Before it the queue grew without one: an owner that did not
+poll kept every `Connected`, `Closed` and `Unreachable` a reconnecting peer caused, a `BodyReady` or
+`Writable` each time it read or wrote without polling, a request and a refusal of every exchange its
+peer opened and gave up on (a refused exchange's slot was reused at once), and every frame its peers'
+lanes carried. Each event now waits in a seat of a bounded table, given back when the owner polls it:
+- an exchange's events hold its slot in the exchange table, removed or not, so the slot is reused only
+  once its last event is polled; each kind waits at most once, its head (`Request` or `Reply`), a
+  `BodyReady` and a `Writable` (one arriving while one waits says nothing it does not) and its
+  `Refused`: four;
+- a lane's frames are counted against the lane, at most the core's window (T37's bound, enforced on
+  receipt), and against its peer, at most its lanes' windows, whatever connection they came on; a lane
+  at either bound is not read, so its bytes wait in QUIC, whose flow control holds the sender (RFC 9000
+  §4.1), and it is read again as the owner polls its peer's frames;
+- a peer's lifecycle waits as one event, its latest state with its epoch (its newest connection up;
+  that connection closed; a dial failed with no connection up since): a change while it waits
+  replaces it and moves it to the back, after the refusals of the exchanges a closed connection
+  carried, and a state the owner was already told waits as nothing; a state that came and went
+  between its polls is not reported, and a `Connected` of a later epoch says the earlier are not the
+  ones exchanges use. The peer's entry is held while the event waits, and while a connection or a
+  dial of the peer needs it.
+
+A table at its bound refuses, typed, the stream (`Refusal::Exchanges`, as before), the connection or
+the dial (`Refusal::Events`) that would need one more seat. No event is dropped, and no datagram is
+refused: a refused datagram would refuse the acknowledgements in it, which every connection's loss
+detection needs (RFC 9002 §6), so a backlog of one owner's events would stall every connection,
+where the seats stop only the entity whose events wait. The bound is tested at its edge in
+`tests/exchange.rs`: a lane's window of frames and no more, a peer back on a new connection read only
+as the old one's frames are polled, the exchange table's slots each holding its request and refusal
+with the peer's exchanges past it refused, one `BodyReady` for an owner reading without polling, a
+reconnecting peer waiting as its latest epoch, and a peer table held by unpolled events refusing a new
+peer until they are polled.
 
 **Measured** (`docs/benchmarks.md`, "hyper-transport against focal-wire's core"): an exchange adds
 0.27 allocations to the bare hyper-quic stream without a body and about 5 with one (three QUIC

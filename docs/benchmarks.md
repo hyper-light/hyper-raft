@@ -4571,3 +4571,120 @@ cargo bench -p hyper-sim --bench step -- 7            # all workloads, seven rot
 cargo bench -p hyper-sim --bench step -- 5 "timed 3"  # one workload by name
 ```
 
+
+## Quiet only while every member is heard: hyper-durable-e2e and the process test (2026-10-03)
+
+`docs/timing.md` §2.9, "The same rule in the other harnesses". The code: `e5a8bc4`
+(hyper-durable-e2e's heartbeat framing and run on hyper-raft-e2e's), `07f2287` (hyper-durable-e2e's
+waits on `hyper_raft_e2e::quiet`, shared with hyper-raft-e2e's), `4ef052c` (a write out judged less
+a look's timeout), and `2ca163b`, `a717e13`, `dd1e21e` and the commit that adds this section
+(hyper-liveness's process test in its own terms), over main `77e9b6c`. The machine as above (Apple
+M5 Max, macOS 26.4.1; Linux in Docker Desktop's virtual machine on it, 18 CPUs, aarch64,
+rust:1.98.0), shared with other sessions' builds and soaks and with the Linux containers below;
+binaries built once before each set.
+
+**The flakes, failing as on CI before and passing after.** Each reproduction holds members in a
+write, or keeps them unheard, past one quiet second; on macOS at load 19–37.
+
+| CI's failure | reproduction | old rule | new rule |
+|---|---|---|---|
+| hyper-durable-e2e `stall-leader`, ubuntu-24.04 (run 37095887346): "a write was never answered; quiet 1s", the survivors heard, term 4, no leader | `stalled-devices`: the leader's disk stalled, the survivors' devices held 7 s by the fault file as they elect, once every pair is judged | 3 of 3 failed with CI's message, the survivors heard 14–88 µs before | 5 of 5 passed, 9.1–12.0 s |
+| hyper-durable-e2e `stall-follower`, windows-11-arm (run 37095270328): "not suspected by every other; quiet 1s", the members up last heard 1.01 s before | one member up stopped 2.5 s by a helper process while the test waits for the suspicion (not committed) | 5 of 5 failed with CI's message, its last report 1.0–2.0 s old | 5 of 5 passed, 4.2–8.5 s |
+| the process test's young victim, windows-2025 (run 37104550192, first attempt): "nothing moved for 1s", every flush in flight, the longest 372–467 ms | every flush held 450 ms more by the member's device thread (not committed) | 3 of 3 failed with CI's message, the longest flush 459–468 ms | 3 of 3 passed, 43–78 s |
+| the same | every flush held 1.2 s more | 2 of 2 failed, "nothing moved for 2.4 s" | 2 of 2 passed, 75–197 s |
+
+In the held-flush runs every member's first heartbeats were refused for want of a measured timer
+(`Refusal::Unmeasured`, all six in a traced run), so the first heartbeat taken came about three
+flushes in.
+
+**The runs.** The whole binaries, `cargo test -p hyper-durable-e2e --test kill`, `-p hyper-liveness
+--test processes` (`--test-threads=4`, its four tests at once) and `-p hyper-raft-e2e --test
+cluster`. Linux: containers at `--cpus` 4, 2 and 1, each with as many busy loops, three at once
+(each its own volume for the tests' files) unless the row says otherwise; load as each run ended
+(the virtual machine's). macOS: load as each run began. "Beside the load": a container of eight busy
+loops ran beside, and every member line was traced to the run's file (`HYPER_LIVENESS_TRACE`).
+
+| host and code | kill | processes | cluster |
+|---|---|---|---|
+| macOS, `2ca163b`, load 34.7–52.0 | 10 of 10, 40.8–51.3 s | 20 of 20, 3.5–16.8 s | 5 of 5, 53.8–61.9 s |
+| Linux, four CPUs, `2ca163b`, load 5.4–40.9 | 10 of 10, 29.1–47.8 s | 20 of 20, 3.9–19.9 s | 5 of 5, 552–878 s |
+| Linux, two CPUs, `2ca163b`, load 5.4–39.2 | 10 of 10, 30.1–45.2 s | 20 of 20, 3.4–21.9 s | 5 of 5, 606–733 s |
+| Linux, one CPU, `2ca163b`, load 6.4–43.9 | 10 of 10, 33.7–49.3 s | 19 of 20, 2.6–7.2 s (one failed, below), and 39 of 40 more (the stop's race, below) | 5 of 5, 364–614 s |
+| Linux, `a717e13`, four, two and one CPUs, load 15.8–36.8 | | 20 of 20 each, 2.3–465.6 s | |
+| Linux, `dd1e21e`, four, two and one CPUs, traced, load 7.3–10.1 | | 20 of 20 each, 2.3–4.4 s | |
+| Linux, `dd1e21e` beside the load, four, two and one CPUs, load 11.6–32.4 | | 39 of 40, 38 of 40 and 16 of 16 (the 17th stopped by hand), 2.6–637.6 s: the three failures the supervisor's own lag (below) | |
+| Linux, four CPUs beside the load, the rule before (`77e9b6c`) and `dd1e21e` side by side, load 22.4–42.6 | | 40 of 40, 1.0–694.7 s, against 31 of 40, 2.3–29.2 s: the nine failures the supervisor's own lag | |
+| Linux, four CPUs beside the load, `dd1e21e` untraced, its members reporting any turn over 200 ms (none did; not committed), load 25.1–52.0 | | 20 of 20, 3.1–1,418.9 s | |
+| Linux, `4ef052c`, four, two and one CPUs, load 41.2–52.7 | 5 of 5 each, 48.0–76.0 s | | |
+| macOS, `4ef052c`, load 49.0–57.7 | 5 of 5, 47.0–54.7 s | | |
+| Linux, four CPUs beside the load, this section's commit as first built (its comments and one dump field since) and `dd1e21e` side by side, load 29.3–37.6 | | 40 of 40, 3.8–259.4 s, the supervisor deaf at most 0.15–6.08 s at once, against 25 of 26 (the one failure Theorem 7's check, below) | |
+| Linux, this section's commit, four, two and one CPUs, load 13.8–28.7 | | 20 of 20 each, 2.3–236.4 s | |
+| macOS, this section's commit, load 57.2–69.7 (as first built: 20 of 20 at load 58.5–66.7, 4.0–19.9 s) | | 20 of 20, 3.9–16.4 s, the supervisor deaf at most 17–36 ms at once | |
+| CI, the gates and then the binaries again (kill 4, processes 10, cluster 2) on each of the six targets: runs 37115140427 (`2ca163b`), 37118055070 (`a717e13`), 37119485933 (`dd1e21e`), 37122309780 (`4ef052c`) and 37125331924 (this section's commit as first built) | 149 of 150 (the one failure `4ef052c`'s cause, below) | 330 of 330 | 90 of 90 |
+
+In hyper-durable-e2e a look missed a member only in the scenarios that stop one (the three that kill
+a leader at a durability point, where the stopped leader answers nothing until the test reads its
+line, and `member-stopped`): 40 of 160 scenarios on each host. Its members' longest time between two
+reads of their sockets was 47 ms on macOS and 81–97 ms on Linux, and through the 7 s hold of
+`stalled-devices` the waits were extended 8.0–11.5 s for the members' writes. `member-stopped`
+failed its wait naming the stopped member after 1.05–4.14 s of silence against 1.02–2.12 s excused,
+in 40 of 40. hyper-raft-e2e's scenarios, on the same rule now one module, took on Linux, all three
+containers at once, 6–15 min a run where they took 1–4 min alone ("End to end"). The process test's
+runs of many minutes are hyper-liveness's own under that load, the rule before's too (694.7 s): its
+links' intervals grew to the 2–7 s their evidence needed, and the waits went on while their
+heartbeats and suspicions moved.
+
+**What failed on the way**, each a defect of this change found by these runs and fixed at its cause
+before the rows after it:
+- the process test's first form decided a check while a member's line was past its due by less than
+  a retransmission timeout: a stopped member was still "heard" when the quiet period ended, and the
+  wait gave up quiet rather than naming it (macOS, one run in ten). A check now waits for an overdue
+  line or that timeout, as a look waits for its answer, each overdue member once (`dd1e21e`);
+- it counted a member's writes only from the first check, so the writes before it extended nothing
+  and the held-flush reproduction failed under the new rule too: they count from its first line of
+  the wait;
+- a member released was judged on its silence from before it was stopped (the gates, once): the test
+  now waits, while its process runs, for its first line after the release, as hyper-raft-e2e's
+  `thaw` waits for its first answer;
+- the stopped member stated a line stamped after the test took the stop's time (Linux, one CPU, one
+  run in forty): `kill -STOP` had returned before the stop took effect. The stop's time is now the
+  system's word (`a717e13`);
+- hyper-durable-e2e called a fresh group's first writes held (CI's windows-2025, run 37119485933,
+  one run of five): every member had its first writes out 1.0–1.3 s while the longest any had
+  finished took 154 ms. A write out is now judged less the timeout a look waits for its answer, as a
+  silent member's silence is (`4ef052c`);
+- the process test counted its supervisor's own lag as the members' silence (Linux beside the load,
+  12 runs in 136, every member's latest line 2.08–2.26 s old at once, a supervisor in the same
+  process printing lines 1.6 s old as one failed). A member's silence now counts only time the
+  supervisor listened for lines: it reads every line already come before it judges, waits no longer
+  than it must listen before the first member would be silent past the excuse, and is deaf from when
+  a wait for a line ends (or the time it asked to end, if it woke past it) to when the next begins
+  (this section's commit). A supervisor held three seconds once every member had stated (a scratch
+  hold, not committed) failed 5 of 5 on macOS before ("member 1 stated nothing for 2.00–2.02 s past
+  its due, past the 1.02–1.04 s ...") and passes 5 of 5 after, deaf 3.01 s at most.
+
+Not of this change, as far as the runs show:
+- one run of the processes binary at one CPU (`2ca163b`) failed in
+  `a_stalled_disk_and_a_killed_node_are_suspected_and_no_live_one_is` at "member 4: a bound is
+  stated": a survivor's suspicion of the stalled member stated no bound, which
+  `Suspicion::detection` leaves unstated while a heartbeat in the window carried no echo (or an echo
+  whose round trip no clock can make). It did not recur in 80 more runs of the same binary at one
+  CPU, nor in 40 runs of the binary before this change; its cause is open;
+- one run of `dd1e21e` beside the load failed Theorem 7's check in the same test, 15 suspicions of
+  live members against an allowance of 8.2 in a run of 6.3 s: hyper-liveness's detectors under that
+  load, not the waits, which all passed.
+
+```sh
+cargo test -p hyper-durable-e2e --test kill                    # stalled-devices, member-stopped among them
+cargo test -p hyper-liveness --test processes -- --test-threads=4
+cargo test -p hyper-raft-e2e --test cluster
+# Linux: the binaries from `cargo test -p hyper-durable-e2e -p hyper-liveness -p hyper-raft-e2e
+# --no-run --locked` in rust:1.98.0 with the repository at /src read-only and CARGO_TARGET_DIR on a
+# volume; then each in a loop in `docker run --cpus N` with N busy loops (`while :; do :; done`),
+# each container its own volume over the target's tmp directory; "beside the load", a container of
+# eight busy loops (`docker run --cpus 8`) and HYPER_LIVENESS_TRACE=1 with --nocapture.
+# The reproductions not committed: the held flush, `std::thread::sleep(HYPER_LIVENESS_DELAY_NS)`
+# after the device thread's flush in tests/processes.rs; the stopped survivor, `kill -STOP <pid>;
+# sleep 2.5; kill -CONT <pid>` from `sh -c` while stall-follower waits, once every pair is judged;
+# the held supervisor, `std::thread::sleep(3 s)` in `Supervisor::until` after its reads, once.
+```

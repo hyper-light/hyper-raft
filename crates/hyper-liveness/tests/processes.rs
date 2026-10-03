@@ -20,7 +20,8 @@
 //! a member whose line is past its due by a retransmission timeout is unheard, and a check decides
 //! nothing while one is; the time the members' writes took extends the wait; and a member silent
 //! past its due by more than the longest write any member stated and the quiet period fails the
-//! wait, named (`Supervisor::until`):
+//! wait, named, its silence counted only over time the supervisor listened for its lines
+//! (`Supervisor::until`):
 //! - every member's every pair configured; then it stalls one member's disk (its device thread
 //!   stops completing flushes, as a disk that stops does) and waits for every other member to
 //!   suspect it, each within the bound its detector stated, measured from the stalled member's
@@ -816,6 +817,8 @@ struct Checks {
     /// The time waits were extended for members' writes, all told, and the most at one check.
     extended_ns: u64,
     extended_most_ns: u64,
+    /// The longest the supervisor itself was deaf at once.
+    deaf_most_ns: u64,
 }
 
 /// When a member's next line is due, nanoseconds after its latest: once its statement period, its
@@ -852,13 +855,33 @@ struct Supervisor {
     stuck: Option<Stuck>,
     /// The member that last said it is held, and when.
     held: Option<(u64, u64)>,
+    /// The supervisor's own deaf time, oldest first: each span from when a wait for a line ended
+    /// (or the time the wait asked to end, if it woke past it) to when the next wait began. Lines
+    /// that come meanwhile wait unread, so it is no member's silence. Kept back to the earliest due
+    /// of a running member's latest line, one span a wait for a line since: a wait that judges a
+    /// member ends once the member is silent past its excuse.
+    deaf: std::collections::VecDeque<(u64, u64)>,
+    /// When the supervisor's latest wait for a line ended: it has been deaf since.
+    deaf_from: u64,
 }
 
 impl Supervisor {
     /// The next line any member reports within `left`, folded in: the member that stated it;
-    /// nothing, past it.
+    /// nothing, past it. The supervisor listens only while it waits here: from when its latest
+    /// wait ended to when this one begins it was deaf, and so it was past the time this one asked
+    /// to end, when it was not scheduled.
     fn next(&mut self, left: Duration, what: &str) -> Option<u64> {
-        let line = match self.lines.recv_timeout(left) {
+        let began = self.clock.now_ns();
+        self.deaf.push_back((self.deaf_from, began));
+        self.checks.deaf_most_ns = self
+            .checks
+            .deaf_most_ns
+            .max(began.saturating_sub(self.deaf_from));
+        let received = self.lines.recv_timeout(left);
+        let ended = self.clock.now_ns();
+        self.deaf_from = ended.min(began.saturating_add(nanos(left)));
+        self.forget_deaf();
+        let line = match received {
             Ok(line) => line,
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => return None,
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
@@ -876,6 +899,39 @@ impl Supervisor {
             stated.push(self.fold(&line));
         }
         stated
+    }
+
+    /// The time in `(from, now]` the supervisor was deaf: lines that came then waited unread.
+    fn deaf_since(&self, from: u64, now: u64) -> u64 {
+        self.deaf
+            .iter()
+            .chain(std::iter::once(&(self.deaf_from, now)))
+            .map(|(start, end)| end.saturating_sub((*start).max(from)))
+            .fold(0, u64::saturating_add)
+    }
+
+    /// How long by `now` the supervisor has listened for a member's line past its due
+    /// ([`due_after`] its latest), its own deaf time not counted: the member's silence, as an E2E
+    /// harness counts it only over asks it waited on, and charges the member nothing for its own.
+    fn listened(&self, stated: &Stated, now: u64) -> u64 {
+        let due = stated.at.saturating_add(due_after(stated));
+        now.saturating_sub(due)
+            .saturating_sub(self.deaf_since(due, now))
+    }
+
+    /// Forgets the deaf spans that ended before the earliest due of a running member's latest
+    /// line, once every running member has stated one: no silence is counted from before it.
+    fn forget_deaf(&mut self) {
+        let mut earliest = u64::MAX;
+        for member in self.members.0.keys() {
+            let Some(stated) = self.latest.get(member) else {
+                return;
+            };
+            earliest = earliest.min(stated.at.saturating_add(due_after(stated)));
+        }
+        while self.deaf.front().is_some_and(|(_, end)| *end <= earliest) {
+            self.deaf.pop_front();
+        }
     }
 
     /// Folds `line` in; the member that stated it (zero for a line that does not parse).
@@ -1001,10 +1057,17 @@ impl Supervisor {
     /// took since the last check extends the wait by the most any one of them took: a member's
     /// heartbeats wait on its flushes, so time in them moves nothing. A member silent past its due
     /// by more than the longest write any member has stated (its run's record or a flush) and the
-    /// quiet period ends the wait, named, whatever else moves, rather than waiting for good. A
-    /// member that has stated nothing yet has no law to bound the wait: it states once its process
-    /// is scheduled, and one whose process ended fails the wait. A pair that takes more heartbeats
-    /// unconfigured than any window holds fails it at once.
+    /// quiet period ends the wait, named, whatever else moves, rather than waiting for good. Its
+    /// silence counts only the time the supervisor listened for its lines ([`Supervisor::listened`]),
+    /// as a lost ask costs an E2E harness's test and not the member: the supervisor reads every
+    /// line already come before it judges, waits for a line no longer than it must listen before
+    /// the first member would be silent past the excuse, and is deaf while it does anything else or
+    /// wakes past the time it asked (under load in Docker's virtual machine a supervisor that
+    /// counted the wall clock fell two seconds behind its members' lines and called them silent,
+    /// every member's latest line that old at once). A member that has stated nothing yet has no
+    /// law to bound the wait: it states once its process is scheduled, and one whose process ended
+    /// fails the wait. A pair that takes more heartbeats unconfigured than any window holds fails
+    /// it at once.
     fn until(&mut self, what: &str, fact: impl Fn(&Self) -> bool) -> Result<(), Stuck> {
         self.stuck = None;
         let mut seen = self.signature();
@@ -1023,14 +1086,23 @@ impl Supervisor {
         let mut checking: Option<(u64, Vec<u64>)> = None;
         while !fact(self) {
             let now = self.clock.now_ns();
-            let wake = look.min(self.silent_at(&unheard).unwrap_or(u64::MAX));
-            let stated: Vec<u64> = if now < wake {
-                self.next(Duration::from_nanos(wake - now), what)
+            let running: Vec<u64> = self
+                .latest
+                .keys()
+                .copied()
+                .filter(|member| self.members.0.contains_key(member))
+                .collect();
+            let left = look
+                .saturating_sub(now)
+                .min(self.silent_in(now, &running).unwrap_or(u64::MAX));
+            let mut stated: Vec<u64> = if left > 0 {
+                self.next(Duration::from_nanos(left), what)
                     .into_iter()
                     .collect()
             } else {
-                self.drain()
+                Vec::new()
             };
+            stated.extend(self.drain());
             self.unresolved_fails(what);
             // A member's first line of the wait is where its writes' time is counted from.
             for member in &stated {
@@ -1146,32 +1218,27 @@ impl Supervisor {
         nanos(self.quiet()).saturating_add(write_most)
     }
 
-    /// When the first of the members in `unheard` would be silent past the excuse.
-    fn silent_at(&self, unheard: &[u64]) -> Option<u64> {
-        let past = nanos(RTO).saturating_add(self.excuse());
-        unheard
+    /// How much longer the supervisor must listen from `now` before the first of `members` is
+    /// silent past the excuse: a wait for a line that long, if none comes, ends past it.
+    fn silent_in(&self, now: u64, members: &[u64]) -> Option<u64> {
+        let past = nanos(RTO).saturating_add(self.excuse()).saturating_add(1);
+        members
             .iter()
             .filter_map(|member| self.latest.get(member))
-            .map(|stated| {
-                stated
-                    .at
-                    .saturating_add(due_after(stated))
-                    .saturating_add(past)
-            })
+            .map(|stated| past.saturating_sub(self.listened(stated, now)))
             .min()
     }
 
-    /// Ends the wait once a member in `unheard` has been silent past its due, less the
-    /// retransmission timeout a check waits past it, for longer than the excuse.
+    /// Ends the wait once a member in `unheard` has been silent past its due, in time the
+    /// supervisor listened, less the retransmission timeout a check waits past it, for longer than
+    /// the excuse.
     fn silence(&mut self, now: u64, unheard: &[u64]) -> Result<(), Stuck> {
         let excuse = self.excuse();
         for member in unheard {
             let Some(stated) = self.latest.get(member) else {
                 continue;
             };
-            let silence = now
-                .saturating_sub(stated.at.saturating_add(due_after(stated)))
-                .saturating_sub(nanos(RTO));
+            let silence = self.listened(stated, now).saturating_sub(nanos(RTO));
             if silence > nanos(self.checks.silence_most) {
                 self.checks.silence_most = Duration::from_nanos(silence);
                 self.checks.excused_then = Duration::from_nanos(excuse);
@@ -1189,10 +1256,10 @@ impl Supervisor {
 
     /// A check at `now`, once the quiet period passed at `deadline` with nothing moved and every
     /// line the check awaited came or timed out: when the wait looks again, or why it gives up. A
-    /// check while a member is unheard, or has stated nothing yet, decides nothing: the wait looks
-    /// again once the first unheard member would be silent past the excuse, if no line comes first.
-    /// Otherwise the time the members' writes took since the last check extends the deadline by the
-    /// most any one took.
+    /// check while a member is unheard, or has stated nothing yet, decides nothing: the wait listens
+    /// on until the unheard member's line moves it or its silence ends it, and looks again a quiet
+    /// period on at a member that has stated nothing. Otherwise the time the members' writes took
+    /// since the last check extends the deadline by the most any one took.
     fn check(
         &mut self,
         what: &str,
@@ -1207,10 +1274,15 @@ impl Supervisor {
             if !unstated.is_empty() {
                 eprintln!("{what}: waiting for members {unstated:?} to state anything");
             }
-            let again = self
-                .silent_at(unheard)
-                .unwrap_or(now.saturating_add(nanos(self.quiet())));
-            return Ok(Next::Look(again.max(now.saturating_add(1))));
+            // An unheard member's line moves the wait, and its silence past the excuse ends it: the
+            // wait listens for either. One that has stated nothing is looked at again a quiet
+            // period on, while its process runs.
+            let again = if unstated.is_empty() {
+                u64::MAX
+            } else {
+                now.saturating_add(nanos(self.quiet()))
+            };
+            return Ok(Next::Look(again));
         }
         let excused = self
             .latest
@@ -1292,11 +1364,12 @@ impl Supervisor {
         ));
         for (member, stated) in &self.latest {
             out.push_str(&format!(
-                "\n  member {member}, stated {:.1} ms ago, due {:.1} ms after: disk {} flush in \
-                 flight {} floor {:.3} ms longest write {:.3} ms writes {:.1} ms all told wakes up \
-                 to {:.3} ms late",
+                "\n  member {member}, stated {:.1} ms ago, due {:.1} ms after, listened for {:.1} ms \
+                 past it: disk {} flush in flight {} floor {:.3} ms longest write {:.3} ms writes \
+                 {:.1} ms all told wakes up to {:.3} ms late",
                 ms(now.saturating_sub(stated.at)),
                 ms(due_after(stated)),
+                ms(self.listened(stated, now)),
                 stated.disk,
                 if stated.flight == 0 {
                     "none".to_owned()
@@ -1343,19 +1416,20 @@ impl Supervisor {
     }
 
     /// What the checks have seen: the checks that did not hear every member, the longest silence
-    /// past a member's due and what was excused then, and how far waits were extended for the
-    /// members' writes.
+    /// past a member's due and what was excused then, how far waits were extended for the
+    /// members' writes, and the longest the supervisor was deaf at once.
     fn account(&self) -> String {
         let c = self.checks;
         format!(
             "checks that did not hear every member {}, the longest silence past a due {:.1} ms \
              against {:.1} ms excused, waits extended {:.1} ms for members' writes (at most {:.1} \
-             ms at once)",
+             ms at once), the supervisor deaf at most {:.1} ms at once",
             c.unheard,
             c.silence_most.as_secs_f64() * 1e3,
             c.excused_then.as_secs_f64() * 1e3,
             c.extended_ns as f64 / 1e6,
             c.extended_most_ns as f64 / 1e6,
+            c.deaf_most_ns as f64 / 1e6,
         )
     }
 
@@ -1470,12 +1544,14 @@ fn start(nodes: u64) -> Group {
     for child in members.0.values_mut() {
         writeln!(child.stdin.as_mut().unwrap(), "start {ports}").unwrap();
     }
+    let clock = Clock::new().unwrap();
+    let deaf_from = clock.now_ns();
     Group {
         _directory: directory,
         supervisor: Supervisor {
             members,
             lines,
-            clock: Clock::new().unwrap(),
+            clock,
             trace: std::env::var_os("HYPER_LIVENESS_TRACE").is_some(),
             latest: BTreeMap::new(),
             suspicions: Vec::new(),
@@ -1484,6 +1560,8 @@ fn start(nodes: u64) -> Group {
             checks: Checks::default(),
             stuck: None,
             held: None,
+            deaf: std::collections::VecDeque::new(),
+            deaf_from,
         },
         wakes,
     }

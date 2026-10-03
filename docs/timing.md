@@ -1165,7 +1165,19 @@ hyper-raft-e2e's had, each failing on CI once in a way a re-run passed:
   the system's word that the process stopped, `ps`'s state `T`; on Windows it holds its thread until
   a byte comes on its standard input, and says when it holds): the wait for a line only it can state
   fails naming it, and let go, its first line awaited while its process runs (what it stated before
-  it stopped is no word of it since), it is trusted again.
+  it stopped is no word of it since), it is trusted again. A member's silence counts only time the
+  supervisor listened for lines, as an E2E harness's lost ask costs the test and not the member:
+  the supervisor reads every line already come before it judges, waits for a line no longer than
+  it must listen before the first member would be silent past the excuse, and is deaf from when a
+  wait for a line ends (or the time it asked to end, if it woke past it) to when the next begins,
+  lines that come meanwhile waiting unread. Counted against the wall clock, its own lag was the
+  members': in Docker's virtual machine (four CPUs and four busy loops, eight more in a container
+  beside, every line traced to the run's file) 9 of 40 runs failed `Stuck::Silent` with every
+  member's latest line 2.08–2.26 s old at once, where the rule before passed 40 of 40 beside it, and
+  a supervisor held three seconds once every member had stated (a scratch hold, not committed)
+  failed 5 of 5 that way on macOS; counted as listened, the held supervisor passes 5 of 5, deaf
+  3.01 s at most, and beside the same load 40 of 40 passed, the supervisor deaf up to 6.08 s at
+  once (`docs/benchmarks.md`, "Quiet only while every member is heard").
 
 **What the runs measured of the detectors** (every scenario prints, for each member, its floors,
 longest flush and longest time between two reads of its socket, and for each pair what the

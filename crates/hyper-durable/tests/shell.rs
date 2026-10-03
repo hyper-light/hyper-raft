@@ -26,7 +26,7 @@ use hyper_durable::{
 use hyper_raft::StorageError;
 use hyper_raft::proto::{
     ConfChangeSingle, ConfChangeTransition, ConfChangeType, ConfChangeV2, ConfState, Entry,
-    HardState, Message, MessageType,
+    EntryType, HardState, Message, MessageType,
 };
 use support::cluster::settings;
 use support::{Kv, SimStore};
@@ -1329,5 +1329,85 @@ fn a_snapshot_carries_the_configuration_held_at_its_images_point() {
     assert!(
         learner.machine().changes.is_empty(),
         "the addition came with the image"
+    );
+}
+
+/// The bytes the core counts for what `out` answered: each entry applied, as `EntryRef` counts it.
+fn applied_bytes(out: &Output<(u64, Vec<u8>)>) -> u64 {
+    out.answers
+        .iter()
+        .map(|(index, data)| {
+            EntryRef {
+                index: *index,
+                term: 0,
+                kind: EntryType::EntryNormal,
+                context: &[],
+                data,
+            }
+            .encoded_bytes()
+        })
+        .sum()
+}
+
+/// A drive applies one page of committed entries at most, the core's
+/// `max_committed_size_per_ready` as the core counts entries, or one entry larger than it, as it
+/// takes one `Ready` at most (§7's quantum): what is committed past the page waits for the next
+/// drive, which the drive says is due (`more`), and waits for no commit fence. So an owner
+/// bounds what one drive gives its state machine by a page and an entry: four writes answered in
+/// one drive gave it a page each before.
+#[test]
+fn a_drive_applies_one_page_and_the_next_drive_the_next() {
+    let mut r = sole(4, Unbounded, |_| {});
+    let page = settings(1, 7).core.max_committed_size_per_ready;
+    let mut out = Output::default();
+    for _ in 0..3 {
+        for _ in 0..5 {
+            r.propose(Vec::new(), vec![7; 100]).unwrap();
+        }
+        out.clear();
+        r.drive(now(), waker(), &mut out).unwrap();
+    }
+    r.propose(Vec::new(), vec![9; 3 * page as usize]).unwrap();
+    out.clear();
+    r.drive(now(), waker(), &mut out).unwrap();
+    assert_eq!(
+        r.in_flight(),
+        4,
+        "a write out at every place the depth allows"
+    );
+    let last = r.core().raft.log().last_index().unwrap();
+    while r.log_mut().make_durable() {}
+    let mut drives = 0;
+    while r.applied().index < last {
+        drives += 1;
+        assert!(
+            drives <= 1_000,
+            "applied through {} of {last}",
+            r.applied().index
+        );
+        out.clear();
+        let driven = r.drive(now(), waker(), &mut out).unwrap();
+        let bytes = applied_bytes(&out);
+        assert!(
+            bytes <= page || out.answers.len() == 1,
+            "drive {drives} applied {bytes} bytes in {} entries",
+            out.answers.len()
+        );
+        if r.applied().index < last {
+            assert!(
+                driven.more,
+                "drive {drives}: what waits past the page is due"
+            );
+            assert_eq!(r.behind_fence(), None, "a page waits for no fence");
+        }
+        while r.log_mut().make_durable() {}
+    }
+    assert!(
+        drives > 4,
+        "{drives} drives: the pages were not one a drive"
+    );
+    assert_eq!(
+        r.machine().now.entries.last().unwrap().2.len(),
+        3 * page as usize
     );
 }

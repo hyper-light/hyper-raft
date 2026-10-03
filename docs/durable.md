@@ -132,7 +132,13 @@ something into a replica or when a write completion woke it. Each call does, in 
    microseconds after submission must not decide what a call gives out (mantle's determinism
    finding, replica.md §5).
 2. **Apply** what the core gives to apply and the commit fence allows (§4), answering each entry's
-   callers.
+   callers: one page a drive at most, the core's committed page (`max_committed_size_per_ready`,
+   entries counted as the core counts them) or one entry larger than it, whatever the writes
+   answered in step 1 gave. What is committed past the page waits as entries behind the fence do,
+   with the core's apply paused (§4.4), and for the next drive only: the drive says it is due
+   (`Driven::more`). So what one drive hands the state machine is bounded as one `Ready` is (§7's
+   quantum), and an owner reserves a page and an entry for it before the drive (focal's hand-over
+   machine, focal 27 §15.7).
 3. **Take a `Ready`**, if the core has one and the group has fewer than the log's depth of writes
    out (§6): give out at once the messages that answer for no write (a leader's appends and
    heartbeats, snapshots, confirmed reads); attach the rest to the write; lay out the write
@@ -583,6 +589,8 @@ Every hold has a bound derived from a quantity the system already has:
 | Unstable entries in the core | `Limits` (uncommitted bytes at a leader; at a follower the leader's inflight window to it, since nothing past it is sent before acknowledgement) | existing core bounds; R-3's `Limits::derive` |
 | Persisted messages waiting on writes | the core's pending-message bound for each `Ready`, times the depth | core `Limits` × depth |
 | Committed entries behind the fence | one `Ready`'s committed page (`max_committed_size_per_ready`), and no more while it waits | R-6's apply pause |
+| Committed entries applied in one drive | one page (`max_committed_size_per_ready`), or one entry larger than it | §7's quantum: the rest waits for the next drive, the core's apply paused |
+| Committed entries waiting past a drive's page | the rest of the one range that crossed it, a page at most, and no more while they wait | R-6's apply pause: once they wait, no notice or `Ready` gives a range |
 | Snapshot reports while stalled or fenced | one per member of the configuration | at most `MAX_MEMBERS` |
 | Reads | the core's read bounds (rounds are the core's since F43; the shell keeps none) | core `Limits` |
 | Inputs while a write is out | none held: the core steps them | R-4 |
@@ -602,7 +610,7 @@ blocks: a write is submitted with the owner's waker (`GroupLog::submit_waking`; 
 `notify_persisted`, F45) and the owner drives the replica when woken, so one flush serves every
 group its owner submitted before it (the commit group, research §2), and nothing polls on a timer.
 The owner shares itself among replicas by deficit round robin with a quantum of one `Ready`'s work
-(mantle's `DRIVE_BUDGET`, Shreedhar and Varghese Theorem 4.5). Applying runs on the owner, as the
+and one page applied (mantle's `DRIVE_BUDGET`, Shreedhar and Varghese Theorem 4.5). Applying runs on the owner, as the
 state machine is the replica's own; CockroachDB and etcd move application to other threads, which
 here would need shared ownership of the state machine, and whether apply time ever exceeds what a
 quantum allows is measured before any such split (§13).
@@ -898,7 +906,8 @@ and allocates no more on that project's workload.
   `report_unreachable`, `report_snapshot`, `drive`, `compact`, `resume`, `held`, `release`; and
   on ticks (§8), `tick`, `beat`, `set_randomized_election_timeout`, `set_patience`.
   `Settings::elections` is stated by every owner, with no default. Every call runs inside the unwind boundary. A drive takes the log's answers first and
-  only then, applies what the fence allows, takes at most one `Ready` (§7's quantum), and writes the
+  only then, applies what the fence allows, one page at most (§2.2), takes at most one `Ready`
+  (§7's quantum), and writes the
   commit alone when the fence or a quiet period asks. `Settings::quiet` is the owner's period.
   Elections are by suspicion (L-2, §8), or on the owner's ticks until it elects so: by suspicion, no
   ticks; a drive wakes the core and `Driven::wake` says

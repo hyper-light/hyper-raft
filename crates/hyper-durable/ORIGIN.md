@@ -161,3 +161,21 @@ persisted when it keeps checkpoints. Test: `a_snapshot_carries_the_configuration
 (`tests/shell.rs`): before the change, its first snapshot named a learner added after the image;
 now it does not, and the learner, served once its leader checkpointed past the addition, ends
 holding what its leader holds.
+
+## One page applied a drive (2026-10-03)
+
+A drive took the answers of every write the log had made durable, and each answer's notice gave
+a committed page to apply; the fence's page and the `Ready`'s followed. One drive could hand the
+state machine a page for each write out and two more. An owner that reserves before a transition
+what it hands on (focal's R28, which its hand-over machine keeps, focal 27 §15.7 contract (g))
+would have to reserve all of them before every drive. A drive now applies one page at most: the
+core's `max_committed_size_per_ready`, entries counted as the core counts them, or one entry
+larger than it. This is the quantum the owner already gives a replica (one `Ready`, mantle's
+`DRIVE_BUDGET`), applied to what it applies. What is past the page waits with the core's apply
+paused, as entries behind the fence do, for the next drive only, and the drive says it is due.
+etcd bounds what it hands out and has not seen applied by bytes (`maxApplyingEntsSize`,
+`docs/research/durable.md` §3); here the shell bounds a drive's share. Test:
+`a_drive_applies_one_page_and_the_next_drive_the_next` (`tests/shell.rs`). Four writes answered
+in one drive gave it 16 entries, 3,436 bytes, against a page of 512. Now every drive stays within
+the page, or applies one larger entry alone.
+

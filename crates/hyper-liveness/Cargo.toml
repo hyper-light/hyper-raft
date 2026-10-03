@@ -22,6 +22,8 @@ hyper-datagram = { path = "../hyper-datagram" }
 hyper-tokio = { path = "../hyper-tokio" }
 # The real-process test's members keep their run as an owner does, a record kept whole.
 hyper-block = { path = "../hyper-block" }
+# The simulation's draws: SplitMix64 with an unbiased `below`, a named stream a source.
+hyper-sim = { path = "../hyper-sim" }
 tokio = { version = "1.48", default-features = false, features = ["net", "time", "rt"] }
 tempfile.workspace = true
 proptest.workspace = true

@@ -753,7 +753,16 @@ one pool, an estimator at the first fed link's interval, boxed. Once each pair i
 heartbeat sent and one taken allocate nothing.
 
 **Tests.** `tests/sim.rs`, one clock, seeded delays, stalls, losses, flushes and wake lateness, the
-owners computing `T_E` from the library's law: live peers keep Theorem 7's allowance (8 seeds); no
+owners computing `T_E` from the library's law. An owner's timer is set to the stream's wake after
+every call and fires late by a lateness drawn once, when its deadline is set, as hyper-sim's world
+fires a timer (`World::wake`); the harness had drawn the lateness again at every turn of its loop
+and anchored it at the present, so while other nodes' events kept coming a due wake was pushed past
+the world's bound (a death noticed 84 µs past its freshness point where wakes are at most 80 µs
+late), and the soak at ten times the seeds failed two tests under that model and passes all under
+this one. Its draws are hyper-sim's SplitMix64, a stream a source (a node's timer, disk, groups'
+writes and host, a directed link), so a change in one node's timing moves no other source's draws.
+Each test's seeds are a space of its own, `HYPER_LIVENESS_SEEDS` of them for a soak (from the
+`HYPER_LIVENESS_SEED`-th), and every node's owner is held to the contract after every step: live peers keep Theorem 7's allowance (8 seeds); no
 heartbeat leaves without a newer flush made after the previous was due (with and without the
 groups' own writes); a killed peer is suspected by every survivor within the bound each states from
 the peer's last schedule (16 seeds); a stalled disk is suspected so too, and the stalled node still

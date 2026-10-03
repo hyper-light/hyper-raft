@@ -670,6 +670,7 @@ dependencies = [
  "hyper-datagram",
  "hyper-measure",
  "hyper-raft",
+ "hyper-sim",
  "hyper-swim",
  "hyper-timing",
  "hyper-tokio",

@@ -25,28 +25,66 @@ use std::time::Duration;
 use hyper_liveness::{
     Change, Heartbeat, Liveness, MAX_BYTES, Output, PeerId, Refusal, Settings, Suspicion, Write,
 };
+use hyper_sim::Seeded;
+use hyper_sim::rng::stream_seed;
 use hyper_timing::{Ballot, Exposure, Trust, WINDOW_LIMIT, poisson95};
 
 const MS: u64 = 1_000_000;
 const US: u64 = 1_000;
 
-/// A xorshift stream (Marsaglia 2003): deterministic test noise.
-#[derive(Clone)]
-struct Noise(u64);
+/// The seeds a test runs: its default count of them, or `HYPER_LIVENESS_SEEDS` where a soak sets
+/// it, from the `HYPER_LIVENESS_SEED`-th on where that is set (a seed a failure printed is its low
+/// 32 bits). Each test's are in a space of their own, its `tag` above the low 32 bits, so no two
+/// tests run one seed whatever the counts.
+fn seeds(tag: u64, default: u64) -> impl Iterator<Item = u64> {
+    let first = from_environment("HYPER_LIVENESS_SEED", 0);
+    let count = from_environment("HYPER_LIVENESS_SEEDS", default);
+    (first..first.saturating_add(count)).map(move |index| (tag << 32) | index)
+}
 
-impl Noise {
-    fn next(&mut self) -> u64 {
-        self.0 ^= self.0 << 13;
-        self.0 ^= self.0 >> 7;
-        self.0 ^= self.0 << 17;
-        self.0
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a soak sets the seeds from the environment; the defaults are the gate's"
+)]
+fn from_environment(name: &str, default: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(default)
+}
+
+/// The world's draws: hyper-sim's SplitMix64 with its unbiased `below` (`hyper_sim::rng`), a
+/// stream a source, named for it (`stream_seed`): each node's timer, disk, groups' writes and host,
+/// each directed link, and a test's own. A source's draws depend on the seed and its name alone,
+/// so a change that makes one node send or wake differently moves no other source's.
+struct Draws {
+    seed: u64,
+    streams: BTreeMap<(&'static str, u64, u64), Seeded>,
+}
+
+impl Draws {
+    fn new(seed: u64) -> Self {
+        Self {
+            seed,
+            streams: BTreeMap::new(),
+        }
     }
-    /// Uniform in `[0, span)`.
-    fn below(&mut self, span: u64) -> u64 {
-        self.next() % span.max(1)
+
+    fn stream(&mut self, label: &'static str, a: u64, b: u64) -> &mut Seeded {
+        let seed = self.seed;
+        self.streams
+            .entry((label, a, b))
+            .or_insert_with(|| Seeded::new(stream_seed(seed, label, &[a, b])))
     }
-    fn chance(&mut self, p: f64) -> bool {
-        ((self.next() >> 11) as f64 / (1u64 << 53) as f64) < p
+
+    /// Uniform in `[0, bound)`, zero for a zero bound.
+    fn below(&mut self, label: &'static str, a: u64, b: u64, bound: u64) -> u64 {
+        self.stream(label, a, b).below(bound)
+    }
+
+    /// True with probability `p`: a uniform of 53 bits below it.
+    fn chance(&mut self, label: &'static str, a: u64, b: u64, p: f64) -> bool {
+        ((self.stream(label, a, b).next_u64() >> 11) as f64 / (1u64 << 53) as f64) < p
     }
 }
 
@@ -173,12 +211,15 @@ struct Node {
     /// What the owner believes of each peer from the changes it was told: suspected or not. The
     /// owner trusts a peer until told otherwise, and a restarted one is trusted (`Change`).
     believed: BTreeMap<PeerId, bool>,
+    /// The owner's timer: the deadline it was set to, the stream's wake, and when it fires, late
+    /// by a lateness drawn once, when the deadline was set ([`Sim::arm`]).
+    timer: Option<(u64, u64)>,
 }
 
 struct Sim {
     now: u64,
     world: World,
-    noise: Noise,
+    draws: Draws,
     nodes: Vec<Node>,
     queue: BinaryHeap<Reverse<(u64, u64)>>,
     events: BTreeMap<u64, Event>,
@@ -223,13 +264,14 @@ impl Sim {
                     suspicions: Vec::new(),
                     restarts: Vec::new(),
                     believed: BTreeMap::new(),
+                    timer: None,
                 }
             })
             .collect();
         let mut sim = Self {
             now: 0,
             world,
-            noise: Noise(seed | 1),
+            draws: Draws::new(seed),
             nodes,
             queue: BinaryHeap::new(),
             events: BTreeMap::new(),
@@ -238,13 +280,13 @@ impl Sim {
         };
         if let Some(every) = world.organic {
             for node in 0..count {
-                let at = sim.noise.below(every);
+                let at = sim.draws.below("organic", node as u64, 0, every);
                 sim.schedule(at, Event::Organic { node });
             }
         }
         if let Some((every, _)) = world.freeze {
             for node in 0..count {
-                let at = sim.noise.below(2 * every);
+                let at = sim.draws.below("freeze", node as u64, 0, 2 * every);
                 sim.schedule(at, Event::Freeze { node });
             }
         }
@@ -265,9 +307,10 @@ impl Sim {
         }
         let (floor, spread) = self.world.flush;
         let start = self.now.max(self.nodes[node].disk_busy_until);
-        let mut done = start + floor + self.noise.below(spread);
-        if self.noise.chance(self.world.flush_stall.0) {
-            done += self.noise.below(self.world.flush_stall.1);
+        let disk = node as u64;
+        let mut done = start + floor + self.draws.below("disk", disk, 0, spread);
+        if self.draws.chance("disk", disk, 0, self.world.flush_stall.0) {
+            done += self.draws.below("disk", disk, 0, self.world.flush_stall.1);
         }
         self.nodes[node].disk_busy_until = done;
         let started = self.now;
@@ -297,13 +340,17 @@ impl Sim {
         for (peer, bytes) in sent {
             let beat = Heartbeat::decode(&bytes).unwrap();
             self.nodes[node].log.push((self.now, peer, beat));
-            if self.noise.chance(self.world.loss) {
+            let link = (node as u64, peer);
+            if self.draws.chance("link", link.0, link.1, self.world.loss) {
                 continue;
             }
             let (floor, spread) = self.world.delay;
-            let mut delay = floor + self.noise.below(spread);
-            if self.noise.chance(self.world.stall.0) {
-                delay += self.noise.below(self.world.stall.1);
+            let mut delay = floor + self.draws.below("link", link.0, link.1, spread);
+            if self
+                .draws
+                .chance("link", link.0, link.1, self.world.stall.0)
+            {
+                delay += self.draws.below("link", link.0, link.1, self.world.stall.1);
             }
             self.schedule(
                 self.now + delay,
@@ -318,6 +365,7 @@ impl Sim {
         if std::mem::take(&mut self.nodes[node].owner.flush) {
             self.submit(node, Write::Liveness);
         }
+        self.arm(node);
         let changes = std::mem::take(&mut self.nodes[node].owner.changes);
         for change in changes {
             let n = &mut self.nodes[node];
@@ -395,23 +443,37 @@ impl Sim {
         }
     }
 
-    /// The next wake of each node, with its lateness drawn.
-    fn next_wake(&mut self) -> Option<(u64, usize)> {
-        let mut best: Option<(u64, usize)> = None;
-        for (i, node) in self.nodes.iter().enumerate() {
-            if !node.alive {
-                continue;
-            }
-            if let Some(at) = node.liveness.wake().map(|at| at.max(node.frozen_until))
-                && best.is_none_or(|(b, _)| at < b)
-            {
-                best = Some((at, i));
-            }
+    /// `node`'s timer set to its stream's wake, as an owner sets it after every call into the
+    /// stream: a deadline it already has changes nothing and draws nothing; a new one fires at
+    /// the later of it and now, late by a lateness drawn once, as a timer is (hyper-sim's
+    /// `World::wake`). Drawn again at every turn of the loop and anchored at the present, a due
+    /// wake was pushed past the world's lateness bound by every event handled before it, which
+    /// put a node's notice of a death 84 µs past its freshness point in a world whose wakes are
+    /// at most 80 µs late (seed 285 of the soak, `docs/timing.md` §2.8).
+    fn arm(&mut self, node: usize) {
+        let asked = self.nodes[node].liveness.wake();
+        if self.nodes[node].timer.map(|(deadline, _)| deadline) == asked {
+            return;
         }
-        best.map(|(at, i)| {
-            let (floor, spread) = self.world.late;
-            (at.max(self.now) + floor + self.noise.below(spread), i)
-        })
+        let (floor, spread) = self.world.late;
+        let fires = asked.map(|deadline| {
+            let late = floor + self.draws.below("timer", node as u64, 0, spread);
+            (deadline, deadline.max(self.now) + late)
+        });
+        self.nodes[node].timer = fires;
+    }
+
+    /// The earliest timer of a live node, held while its host is frozen.
+    fn next_wake(&self) -> Option<(u64, usize)> {
+        self.nodes
+            .iter()
+            .enumerate()
+            .filter(|(_, node)| node.alive)
+            .filter_map(|(i, node)| {
+                node.timer
+                    .map(|(_, fires)| (fires.max(node.frozen_until), i))
+            })
+            .min()
     }
 
     /// Runs until `until`, polling every node first.
@@ -446,6 +508,8 @@ impl Sim {
                 let event = self.events.remove(&key).unwrap();
                 self.handle(event);
             } else if let Some((_, node)) = wake {
+                // The timer fired: it is set again after the poll.
+                self.nodes[node].timer = None;
                 self.poll(node);
             }
             self.elect();
@@ -519,15 +583,16 @@ impl Sim {
             Event::Organic { node } => {
                 if let Some(every) = self.world.organic {
                     self.submit(node, Write::Log);
-                    let next = self.now + every / 2 + self.noise.below(every);
+                    let next =
+                        self.now + every / 2 + self.draws.below("organic", node as u64, 0, every);
                     self.schedule(next, Event::Organic { node });
                 }
             }
             Event::Freeze { node } => {
                 if let Some((every, longest)) = self.world.freeze {
-                    let until = self.now + self.noise.below(longest);
+                    let until = self.now + self.draws.below("freeze", node as u64, 0, longest);
                     self.nodes[node].frozen_until = self.nodes[node].frozen_until.max(until);
-                    let next = until + self.noise.below(2 * every);
+                    let next = until + self.draws.below("freeze", node as u64, 0, 2 * every);
                     self.schedule(next, Event::Freeze { node });
                 }
             }
@@ -583,8 +648,8 @@ impl Sim {
 /// Live peers: every pair configures, trusts, and makes no more mistakes than Theorem 7 allows.
 #[test]
 fn live_peers_configure_and_keep_their_allowance() {
-    for seed in 1..=8u64 {
-        let mut sim = Sim::new(3, LAN, seed * 0x9E37_79B9);
+    for seed in seeds(1, 8) {
+        let mut sim = Sim::new(3, LAN, seed);
         sim.run_until_configured();
         let end = sim.now + 60_000 * MS;
         sim.run(end);
@@ -609,7 +674,9 @@ fn live_peers_configure_and_keep_their_allowance() {
 /// was due, newer than the previous one's, and none leaves without one.
 #[test]
 fn no_heartbeat_leaves_without_a_newer_flush() {
-    for (seed, organic) in [(3u64, None), (5, Some(7 * MS)), (7, Some(300 * US))] {
+    for (seed, organic) in seeds(2, 1)
+        .flat_map(|seed| [None, Some(7 * MS), Some(300 * US)].map(|organic| (seed, organic)))
+    {
         let world = World { organic, ..LAN };
         let mut sim = Sim::new(3, world, seed);
         sim.run(5_000 * MS);
@@ -642,7 +709,7 @@ fn no_heartbeat_leaves_without_a_newer_flush() {
 /// last heartbeat's schedule (one clock in the simulation, so the peer's schedule is on it).
 #[test]
 fn a_killed_peer_is_suspected_within_the_stated_bound() {
-    for seed in 11..=26u64 {
+    for seed in seeds(3, 16) {
         let mut sim = Sim::new(4, LAN, seed);
         sim.run_until_configured();
         let settle = sim.now + 2_000 * MS;
@@ -709,7 +776,7 @@ fn a_killed_peer_is_suspected_within_the_stated_bound() {
 /// within the bound it states, while the node itself is still running and receiving.
 #[test]
 fn a_stalled_disk_is_suspected_as_a_crash_is() {
-    for seed in 31..=38u64 {
+    for seed in seeds(4, 8) {
         let mut sim = Sim::new(
             3,
             World {
@@ -761,8 +828,14 @@ fn a_stalled_disk_is_suspected_as_a_crash_is() {
 /// pair whose last group goes sends nothing.
 #[test]
 fn groups_share_one_stream_and_an_unshared_pair_is_silent() {
+    for seed in seeds(5, 1) {
+        groups_share_one_stream(seed);
+    }
+}
+
+fn groups_share_one_stream(seed: u64) {
     let sent = |groups: u32| {
-        let mut sim = Sim::new(2, LAN, 41);
+        let mut sim = Sim::new(2, LAN, seed);
         for node in &mut sim.nodes {
             let peer = 3 - node.owner.id;
             for _ in 1..groups {
@@ -773,7 +846,7 @@ fn groups_share_one_stream_and_an_unshared_pair_is_silent() {
         (sim.nodes[0].log.len(), sim.nodes[1].log.len())
     };
     assert_eq!(sent(1), sent(1_000));
-    let mut sim = Sim::new(2, LAN, 43);
+    let mut sim = Sim::new(2, LAN, seed);
     sim.run(1_000 * MS);
     for node in &mut sim.nodes {
         let peer = 3 - node.owner.id;
@@ -796,7 +869,13 @@ fn groups_share_one_stream_and_an_unshared_pair_is_silent() {
 /// keeps two epochs a peer), is refused as stale and reports nothing.
 #[test]
 fn a_restarted_peer_is_trusted_again_and_counted() {
-    let mut sim = Sim::new(3, LAN, 51);
+    for seed in seeds(6, 1) {
+        a_restarted_peer(seed);
+    }
+}
+
+fn a_restarted_peer(seed: u64) {
+    let mut sim = Sim::new(3, LAN, seed);
     sim.run_until_configured();
     let mtbf = sim.nodes[0].liveness.mtbf().unwrap();
     let victim = 2usize;
@@ -1024,7 +1103,7 @@ fn every_link_configures_or_suspects_a_crash_within_its_bound() {
     let mut slowest = (0u64, 0u64, "");
     let mut judged_by = [0u64; 3];
     for (name, world) in [("lan", LAN), ("frozen", FROZEN), ("busy", BUSY)] {
-        for seed in 0..32u64 {
+        for seed in seeds(7, 32) {
             // The heartbeats the victim sends before every pair is configured, in this seed's run.
             let mut twin = Sim::new(4, world, seed);
             twin.run_until_configured();
@@ -1038,7 +1117,7 @@ fn every_link_configures_or_suspects_a_crash_within_its_bound() {
                     }
                 }
             }
-            let mut draw = Noise(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+            let mut draw = Seeded::new(stream_seed(seed, "kill", &[]));
             let kill_after = draw.below(2 * configured_after + 1);
             let mut sim = Sim::new(4, world, seed);
             sim.run_while(
@@ -1121,7 +1200,7 @@ fn every_link_configures_or_suspects_a_crash_within_its_bound() {
 /// the suspicion states from the start: one interval at the node's own floor and the margin of the node's evidence.
 #[test]
 fn a_peer_never_heard_from_is_suspected() {
-    for seed in 0..16u64 {
+    for seed in seeds(8, 16) {
         let mut sim = Sim::new(4, LAN, seed);
         sim.nodes[3].alive = false;
         sim.run_while(
@@ -1165,12 +1244,12 @@ fn a_peer_dead_before_its_links_have_evidence_is_suspected_once_a_sibling_has_it
         ("windows", WINDOWS),
     ] {
         let mut noticed = Vec::new();
-        for seed in 0..32u64 {
+        for seed in seeds(9, 32) {
             let victim = 2usize;
             let mut twin = Sim::new(3, world, seed);
             twin.run_while(|sim| sim.configured_at.is_empty(), None);
             let young = twin.nodes[victim].log.len() as u64;
-            let mut draw = Noise(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+            let mut draw = Seeded::new(stream_seed(seed, "kill", &[]));
             let kill_after = 1 + draw.below(young.saturating_sub(1).max(1));
             let mut sim = Sim::new(3, world, seed);
             sim.run_while(

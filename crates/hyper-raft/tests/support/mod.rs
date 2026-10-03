@@ -1606,6 +1606,7 @@ impl Replica for Either {
 pub mod backlog;
 pub mod cluster;
 pub mod lagged;
+pub mod timed;
 #[allow(unused_imports)]
 pub use cluster::{Cluster, Mix, Op, Report};
 #[allow(unused_imports)]

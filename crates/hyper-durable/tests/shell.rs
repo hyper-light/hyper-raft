@@ -1561,3 +1561,30 @@ fn a_write_made_again_never_starts_the_log_past_the_state_machine() {
     assert_eq!(r.log_mut().disk.start.index, 8, "the snapshot's own write");
     assert_eq!(r.machine().durable.applied.index, 8);
 }
+
+/// The window a leader keeps in flight to a member is twice what the transport says the path to it
+/// carries in a round trip (mantle note 32 R16, `hyper_timing::inflight_window`): set as the owner
+/// says it, for a member of the group only.
+#[test]
+fn the_window_to_a_member_is_twice_what_its_path_carries() {
+    let mut s = settings(1, 7);
+    s.core.max_inflight_msgs = usize::MAX;
+    s.core.max_inflight_bytes = 4_096;
+    let mut r = Replica::open(
+        &s,
+        SimStore::new(1),
+        Kv::new(voters(&[1, 2, 3]), false),
+        Unbounded,
+    )
+    .unwrap();
+    elect_by_hand(&mut r);
+    let window = |r: &Sim| r.core().raft.tracker().get(2).unwrap().inflights.byte_cap();
+    assert_eq!(
+        window(&r),
+        4_096,
+        "the settings' bound, until the path is measured"
+    );
+    assert!(r.set_carriage(2, 125_000).unwrap());
+    assert_eq!(window(&r), 250_000);
+    assert!(!r.set_carriage(9, 125_000).unwrap(), "no member 9");
+}

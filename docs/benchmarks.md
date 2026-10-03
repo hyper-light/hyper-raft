@@ -884,6 +884,102 @@ write to the harness's memory, `advance_append`) where slates' is `append_comman
 compare in shape, not in nanoseconds. The allocations are counted exactly (`tests/backlog.rs` holds
 them equal at backlogs of 1,000 and 49,000).
 
+## The window a member is sent ahead of its answers (R16)
+
+Core step R-3's third commit (`crates/hyper-raft/ORIGIN.md`, "R16"). Measured on 2026-10-03 on the
+machine above (Apple M5 Max, 18 cores, 128 GB, macOS 26.4.1).
+
+**Allocations**: the same allocations and reallocations as `main`'s on all 36 cells; the bytes are
+`main`'s on 32 of them. The four snapshot cells allocate 24 bytes a round more at three voters and 40
+at five: 8 bytes a member, each time the tracker is built anew at a snapshot, for `Inflights` holds
+its page's cost and whether it is draining, and its `VecDeque` is a word shorter than the ring's two
+indexes beside a `Vec`.
+
+**The schedules**: of the 62 lines the suites print at their default seeds besides the members'
+states (519 with them), the 31 of the differential and the other suites are `main`'s. The 31 of
+`tests/pipeline.rs` moved, all of whose schedules set members' windows at run time to 1, 24, 96 or
+512 bytes or a megabyte (`Mix::windows`), and most run focal's window of 256 bytes: an
+append is charged its 96 fixed bytes now, so such a window holds an append or two where it held
+four to eight entries, and one that filled waits for half of it. Over the 16 summaries with faults at
+rest, 16,698 entries were committed and 44 of 384 groups were left waiting on a mark at a schedule's
+end; with R16, 15,958 and 57; with R16 but no wait for half a window, 16,369 and 50. A window of an
+append or two waits for both under the rule (its half is less than an append); no path the rule
+measures has one. Each summary's own checks pass, and the durability oracle holds at every step.
+
+**slates' measurement on this core** (`tests/timed.rs`, `tests/support/timed.rs`): five voters on
+Microsoft's published P50 round trips among East US, West Europe, Japan East, Southeast Asia and
+Brazil South, each path 10 Mbit/s with up to 5 ms of jitter, member 1 (East US) leading throughout,
+proposals of 8 bytes at the row's rate from 2 s for 30 s, and three of the slowest round trips after
+for what was proposed last to commit; 20 seeds a row, each row the median over seeds of each seed's
+median and 99th percentile commit latency and commits a second, bytes and resent entries summed.
+This core sends an append as each proposal is made, where slates' drive sent one batch a follower a
+period: its appends are one or a few entries, and its window holds them by their records. The
+simulation is deterministic, so a row's numbers are exact for its seeds; the load (10.5–12.4 for
+R16's run, 287 s; 7.5–9.8 for commit 2's, 202 s) moves only its wall time. "One batch" is a window
+of slates' batch budget, 4,367 bytes; "the rule" is `inflight_window` of each path's carriage, its
+rate over its round trip's tail.
+
+Paths that deliver in order, as one stream does (slates' simulation, whose appends a period apart
+never reordered). "Before" is commit 2's core with the harness put on it, its window charged its
+entries alone and bounded by focal's 128 places as well:
+
+| Offered, loss | Window | before: median / p99, commits a second, MB sent, entries resent | R16: median / p99, commits a second, MB sent, entries resent |
+|---|---|---|---|
+| 2,000/s, none | one batch | 7,384 / 14,507 ms, 1,089/s, 299.4, 0% | 7,908 / 15,437.5 ms, 1,023/s, 79.1, 0% |
+| 2,000/s, none | four batches | 125 / 153.5 ms, 2,000/s, 501.0, 0% | 135 / 170 ms, 2,000/s, 349.4, 0% |
+| 2,000/s, none | one round trip's carriage | 125 / 153.5 ms, 2,000/s, 501.0, 0% | 125 / 127 ms, 2,000/s, 1,082.0, 0% |
+| 2,000/s, none | the rule | 125 / 153.5 ms, 2,000/s, 501.0, 0% | 125 / 127 ms, 2,000/s, 1,082.0, 0% |
+| 4,000/s, none | one batch | 11,471.5 / 22,596 ms, 1,089/s, 295.9, 0% | 11,773.5 / 23,069 ms, 1,028/s, 79.1, 0% |
+| 4,000/s, none | four batches | 126 / 186.5 ms, 4,000/s, 549.7, 0% | 926.5 / 1,651.5 ms, 3,914/s, 292.3, 0% |
+| 4,000/s, none | one round trip's carriage | 126 / 180 ms, 4,000/s, 626.6, 1% | 126 / 127 ms, 4,000/s, 2,162.0, 0% |
+| 4,000/s, none | the rule | 126 / 180 ms, 4,000/s, 626.6, 1% | 126 / 127 ms, 4,000/s, 2,162.0, 0% |
+| 2,000/s, 1 % | one batch | 7,673.5 / 15,014.5 ms, 1,053.5/s, 100.4, 8% | 8,109 / 15,728 ms, 1,008/s, 79.2, 2% |
+| 2,000/s, 1 % | four batches | 200 / 340.5 ms, 2,000/s, 338.3, 24% | 197.5 / 333 ms, 2,000/s, 272.5, 19% |
+| 2,000/s, 1 % | one round trip's carriage | 197.5 / 319 ms, 2,000/s, 393.3, 29% | 202.5 / 328 ms, 2,000/s, 548.4, 31% |
+| 2,000/s, 1 % | the rule | 197.5 / 319 ms, 2,000/s, 393.3, 29% | 202.5 / 328 ms, 2,000/s, 548.4, 31% |
+| 4,000/s, 1 % | one batch | 11,575.5 / 22,818 ms, 1,060.5/s, 100.3, 8% | 11,813 / 23,186.5 ms, 1,008/s, 79.2, 2% |
+| 4,000/s, 1 % | four batches | 2,379.5 / 4,550 ms, 3,521/s, 336.0, 17% | 3,246 / 6,486.5 ms, 3,266.5/s, 267.3, 8% |
+| 4,000/s, 1 % | one round trip's carriage | 232 / 387.5 ms, 4,000/s, 620.1, 32% | 246.5 / 411 ms, 4,000/s, 1,056.0, 36% |
+| 4,000/s, 1 % | the rule | 232 / 387.5 ms, 4,000/s, 620.1, 32% | 246 / 418 ms, 4,000/s, 1,057.8, 36% |
+
+slates recorded, on its drive: at 2,000 a second, one batch out at a time 7,319 / 14,378 ms and
+1,029 a second, and its derived window 172 / 222 ms and 1,988 a second; with 1 % loss 7,357 ms and
+201 / 321 ms; at 4,000 a second its drive, one batch a period, caps the group near 2,058 a second.
+On this core one batch out at a time is 7,908 ms and 1,023 a second, and the rule 125 / 127 ms and
+every proposal, 202.5 / 328 ms with 1 % loss, and 126 / 127 ms at 4,000 a second: slates'
+improvement, on this core.
+
+What R16 changed against commit 2: the rule's window was bounded before by the 128 places, not its
+bytes (one round trip's carriage and two were alike), so proposals waited for a place and went
+together: the same medians, a p99 of 153.5 ms at 2,000 a second and 180 ms at 4,000 against 127 ms
+now, and half the bytes. With no count each proposal goes at once as its own append, its 96 fixed
+bytes beside an entry of 33: this harness's owner proposes one entry a turn, where an owner that
+takes every proposal of its turn into one `Ready` sends them in one append. A fixed window holds
+fewer entries now that it is charged what the path carries: four batches, 17,468 bytes, held 529
+entries' bytes before and holds 135 one-entry appends now, where a commit at 4,000 a second waits on
+the second-nearest follower, Brazil South at 117 ms, and so needs 468 entries in flight to it, 15.4
+kB of them besides their appends' fixed bytes. With 1 % loss at 4,000 a second the rule resends more
+small appends (36 % of entries against 32 %) and its median is 246 ms against 232: what follows a
+lost append is refused and sent again, which R17 is for.
+
+Paths that reorder, each message after its own jitter (as datagrams and messages on streams of their
+own do; focal sends a peer's frames each on its own stream, focal 27 §11), at 2,000 a second:
+
+| Offered, loss | Window | before: median / p99, commits a second, MB sent, entries resent | R16: median / p99, commits a second, MB sent, entries resent |
+|---|---|---|---|
+| 2,000/s, none | one batch | 8,280 / 16,226.5 ms, 973/s, 124.9, 41% | 8,525 / 16,913 ms, 926.5/s, 104.0, 31% |
+| 2,000/s, none | four batches | 171.5 / 302 ms, 2,000/s, 1,596.1, 90% | 168 / 362 ms, 2,000/s, 1,201.3, 87% |
+| 2,000/s, none | one round trip's carriage | 257 / 1,026.5 ms, 2,000/s, 2,768.7, 94% | 258 / 919 ms, 2,000/s, 2,779.7, 94% |
+| 2,000/s, none | the rule | 263.5 / 2,343.5 ms, 1,905/s, 3,200.4, 95% | 264 / 2,083.5 ms, 1,947/s, 3,085.3, 95% |
+| 2,000/s, 1 % | one batch | 8,367 / 16,612.5 ms, 951/s, 120.8, 40% | 8,778.5 / 17,058.5 ms, 914/s, 102.0, 32% |
+| 2,000/s, 1 % | four batches | 164.5 / 277.5 ms, 2,000/s, 1,384.4, 88% | 161.5 / 321 ms, 2,000/s, 1,127.1, 86% |
+| 2,000/s, 1 % | one round trip's carriage | 198.5 / 326.5 ms, 2,000/s, 2,293.7, 92% | 189 / 311.5 ms, 2,000/s, 2,244.8, 92% |
+| 2,000/s, 1 % | the rule | 198.5 / 312.5 ms, 2,000/s, 2,446.9, 93% | 191 / 325.5 ms, 2,000/s, 2,364.5, 93% |
+
+Here a member refuses every append that arrives ahead of one still on its way, and the leader sends
+it all again: of what is sent, 31–41 % again with one batch and 86–95 % with any larger window, before
+R16 and after. That is R17's.
+
 ## Where hyper-raft does not win, and why
 
 hyper-raft in place allocates less than every other core in every row. It is faster than raft-rs
@@ -1193,6 +1289,11 @@ cargo test -p hyper-raft --test differential --test group --test fast --test pip
 
 # slates' tests for R4, R5, R20 and R21 (R-3): as above, and slates' backlog tool on this core.
 cargo bench -p hyper-raft --bench backlog -- 50000
+
+# The window a member is sent ahead of its answers (R16): as above, and slates' pipelining
+# measurement on this core; before, the harness on commit 2's tree with focal's 128 places.
+HYPER_RAFT_TIMED_SEEDS=20 HYPER_RAFT_TIMED_STREAM_S=30 cargo test -p hyper-raft --release --test timed -- --ignored --exact replication_across_rates_and_loss --nocapture
+HYPER_RAFT_TIMED_PLACES=128 HYPER_RAFT_TIMED_SEEDS=20 HYPER_RAFT_TIMED_STREAM_S=30 cargo test -p hyper-raft --release --test timed -- --ignored --exact replication_across_rates_and_loss --nocapture
 
 # The end-to-end scenarios, and every gate.
 cargo test -p hyper-raft-e2e --test cluster

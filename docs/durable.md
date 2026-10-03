@@ -684,9 +684,11 @@ are unchanged.
 **hyper-transport.** Messages leave as the shell releases them; the transport may lose or reorder
 them, which Raft tolerates. A message from the network is bound to its authenticated sender before
 the core sees it (focal's `step_authenticated`). Snapshots go on the bulk class and their stream's
-fate is the `report_snapshot`. The window a leader keeps in flight to a member is twice what the
-transport's congestion window to it holds (focal 27 §11), passed to the core each round
-(`set_inflight_bytes`).
+fate is the `report_snapshot`. The window a leader keeps in flight to a member is what the path
+to it carries over the two round trips a lost append takes to repair, twice the transport's
+congestion window to it (`hyper_timing::inflight_window`; mantle note 32 R16, focal 27 §11): the
+owner says the window's carriage as the transport's measure moves (`Replica::set_carriage`), and
+the shell passes the rule's window to the core (`set_inflight_bytes`).
 
 **hyper-log.** The shell is generic over the log (§9); hyper-log is the disk implementation.
 

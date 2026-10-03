@@ -158,9 +158,25 @@ fn schedule(
     (group, persisted)
 }
 
+/// Of a hundred chances to make a leader's write durable, how many are
+/// taken in the long schedules where a leader applies before its write is
+/// durable ([`schedules`]); the crashes' and faults' schedules keep
+/// [`SLOW_LEADER`], at which each still holds a change behind the fence.
+/// Measured on R16's core, each append charged its record, which sends a
+/// member fewer appends ahead in the schedules' small windows, with a
+/// campaign superseding its own requests (`d254f78`): at a quarter, 24
+/// schedules by suspicion applied no entry ahead (22 of 240, where 61 before
+/// R16); at a tenth, 15 at the default size (on ticks, 12 at a quarter and
+/// 8 at a tenth).
+const SCHEDULES_SLOW_LEADER: u64 = 10;
+
 /// Schedules of `settings` at the depth it states; what they reached.
 fn schedules(name: &str, settings: Settings, voters: &[u64], fast: u64) -> (Coverage, usize) {
-    schedules_of(name, settings, voters, &mix_for(&settings, fast))
+    let mut mix = mix_for(&settings, fast);
+    if settings.apply_unpersisted {
+        mix.leader_durable = SCHEDULES_SLOW_LEADER;
+    }
+    schedules_of(name, settings, voters, &mix)
 }
 
 /// Schedules of `settings` drawn from `mix`; what they reached.

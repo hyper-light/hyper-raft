@@ -29,7 +29,8 @@
 >
 > Step R-3 is under way (2026-10-03, §3.2): slates' regression tests for R6, R7, R4, R5, R20 and
 > R21 pass; three defects at the end of what a member counts and a lease kept by a member's own
-> timer, which their siblings found, are fixed.
+> timer, which their siblings found, are fixed; the window a member is sent ahead of its answers is
+> one rule from focal's and slates' (R16).
 
 ## 1. What `hyper-raft` is
 
@@ -69,9 +70,11 @@ It is Raft as Ongaro's thesis states it, with these extensions:
 - election priority with `Precedence::Log`;
 - learners and joint consensus (`ConfChangeV2`);
 - leader transfer;
-- an inflight window with conflict hints, bounded per member in messages and in bytes
-  (`Config::max_inflight_bytes`, `RawNode::set_inflight_bytes`: what the owner says the path to
-  the member carries before it answers), and a heartbeat's answer that says how far the member's
+- an inflight window with conflict hints, bounded per member in bytes, each append charged its
+  record (`Config::max_inflight_bytes`, `RawNode::set_inflight_bytes`: what the owner says the path
+  to the member carries over the two round trips a lost append takes to repair, R16), and in
+  messages unless the window counts none (`Config::max_inflight_msgs`); a window that filled sends
+  again at room for a whole append or half of it; and a heartbeat's answer that says how far the member's
   log goes (`HeartbeatAnswers::Position`, the default; `HeartbeatAnswers::Bare` is raft-rs's,
   which the differential runs);
 - ReadIndex (quorum-confirmed, no lease), with one round of heartbeats for every read asked since
@@ -270,6 +273,54 @@ moves back on a late answer; a snapshot's recipient is credited with what it say
 proposal costs a leader the same allocations at any backlog (`tests/backlog.rs`), and its time is
 flat (`benches/backlog.rs`, `docs/benchmarks.md`).
 
+**The window a member is sent ahead of its answers (R16).** One rule, of which focal's (F41,
+focal 27 §11) and slates' (consensus-enhancements §3.5) are two readings: the bytes a leader keeps
+in flight to a member are what the path to it carries over the two round trips a lost append takes
+to repair (`hyper_timing::inflight_window`, `REPAIR_ROUND_TRIPS`). One round trip's carriage, the
+path's bandwidth-delay product, keeps a path that loses nothing full; a lost append is answered
+only once its resend is, a round trip for the refusal of the append after it to come back and
+another for the resend's answer. focal reads the carriage as the transport's congestion window to
+the member's node, and says twice it (as Linux's `tcp_sndbuf_expand` sizes a send buffer at twice
+the window); slates' drive sends one batch a period, carries a batch for each period of a round
+trip, and keeps ⌈2·tail/period⌉ batches (`ElectionTiming::window_budget`: the rule exactly on a
+tail of whole periods, at most a batch more between them). hyper-durable takes the carriage from
+its owner and gives the core the rule's window (`Replica::set_carriage`). What a member is sent
+while a lost append is repaired is refused, as raft-rs refuses it, until R17 keeps it.
+
+The core keeps the window in what the path carries: each append is charged its record, the
+message's fixed bytes and its entries' (`wire::MESSAGE_RECORD_FIXED_BYTES`, 96), as RFC 9002 §B.2
+counts a packet's bytes in flight. focal and slates counted the entries alone: for an append of one
+entry of eight bytes, a quarter of what the path carries (33 of 129 bytes). A window may count no
+messages of its own (`Config::max_inflight_msgs` of `usize::MAX`): its bytes bound it, for every
+append costs at least its fixed bytes and an entry's, and its ring grows to what they admit. A fixed
+count, focal's 128 or raft-rs's 256, is no measure of a path (note 32 R16); raft-rs's count is kept
+for the differential, which runs with no byte bound. A window bounded by neither is refused.
+
+A window that filled sends again once it has room for a whole append (its fixed bytes and
+`max_size_per_msg` of entries) or half of it is answered, whichever comes first (`Inflights`): the
+sender's avoidance of the silly window syndrome (Clark, RFC 813; RFC 1122 §4.2.3.4, which sends "if
+a maximum-sized segment can be sent" or "at least a fraction Fs of the maximum window", `Fs` "a
+fraction whose recommended value is 1/2"). Charged what the path carries, a window held at its bound
+by a path that carries no more opens by one small answer at a time, and each opening draws one
+small append, its fixed bytes beside one entry, so most of what the path carries is fixed bytes
+(found by `tests/timed.rs`). Below its bound a window sends at once, as before: this is no Nagle's
+rule (RFC 896), which would hold every small append behind an answer. A window of about two appends
+or fewer, which no path the rule measures has, sends them in turn and waits for both. raft-rs's
+rule frees a full window's first message at a heartbeat's answer and sends the next whatever the
+window holds (`HeartbeatAnswers::Bare`), and keeps doing so.
+
+Measured on slates' five Azure regions in time (`tests/timed.rs`, `docs/benchmarks.md`, "The window a
+member is sent ahead of its answers (R16)"), on paths that keep order as slates' did: at 2,000
+proposals a second one batch out at a time commits 1,023 a second at a 7,908 ms median (slates:
+1,029 at 7,319 ms) and the rule every proposal at 125 / 127 ms median and p99 (slates' derived
+window: 172 / 222 ms), 202.5 / 328 ms with 1 % loss (slates: 201 / 321 ms); at 4,000 a second the
+rule commits every proposal at 126 / 127 ms. Against focal's window of 128 places the medians are
+the same and the p99 lower (127 ms against 153.5 and 180), and with no count of places each proposal
+goes at once as its own append, so this harness, whose owner proposes one entry a turn, sends twice
+the bytes at 2,000 a second and four times at 4,000. On paths that reorder, a member refuses what
+arrives ahead of an append still on its way, and 86–95 % of what a larger window sends is sent
+again: R17.
+
 ### 3.3 Where this core and raft-rs differ
 
 `tests/differential.rs` runs this core and raft-rs on one schedule and compares them field by field
@@ -291,7 +342,7 @@ table for focal-raft; it lives here since the core moved (R-1), with every decis
 | Election timeouts from the thread's generator | From a seed the owner gives (`Config::seed`): a run is its seed | `election_timeouts_are_drawn_from_the_seed` |
 | Queues without a bound of their own | `Limits`; a member takes of a message what it may hold, and answers with the last entry taken | `what_waits_to_be_taken_has_a_bound`, `what_is_not_durable_has_a_bound`, `reads_that_wait_have_a_bound` |
 | A round of heartbeats for each read as it is asked, and again as it is asked again | One round when the member is next asked what there is to do, for every read since (`ReadRounds::Shared`, focal F43); raft-rs's rule is kept as `ReadRounds::Each` | `reads_asked_together_leave_in_one_round_and_one_answer_confirms_them`; `tests/group.rs`: `a_round_confirms_no_read_asked_after_it_left` |
-| A window of messages alone | Of messages and of bytes, the bytes what the owner says the path carries (`RawNode::set_inflight_bytes`, focal F41); the differential runs with no byte bound | `a_member_is_sent_no_more_bytes_ahead_of_its_answers_than_its_path_carries` |
+| A window of messages alone | Of bytes, each append charged its record, what the owner says the path carries (`RawNode::set_inflight_bytes`, focal F41; R16's rule, §3.2), and of messages unless it counts none; a window that filled waits for room for a whole append or half of it; the differential runs with no byte bound | `a_member_is_sent_no_more_bytes_ahead_of_its_answers_than_its_path_carries`; `src/progress.rs`: `a_window_that_filled_waits_for_a_whole_append_or_half_of_it`; `tests/timed.rs` |
 | A heartbeat's answer says nothing of the log, and a full window frees its first message at every answer | The answer says how far the log goes and is taken as an append's answer (`HeartbeatAnswers::Position`, focal F42); raft-rs's rule is kept as `HeartbeatAnswers::Bare` | `a_heartbeats_answer_gives_back_what_the_member_holds_and_nothing_more` |
 | A follower's lease reads its one election counter, which its own campaign restarts: one whose campaign waits for a committed change to apply keeps its lease another election timeout, and refuses the voter that campaigns | The lease reads the ticks since the member heard its leader (`Raft::silence`), apart from its own timer (R4, §3.2); the differential's owner applies every change at once and never reaches it | `a_member_whose_campaign_waits_for_a_change_holds_no_lease` |
 | A term or an index may be counted to `u64::MAX` | The last of each is `u64::MAX − 1`; a campaign, an append or a proposal past it is refused before anything changes, by suspicion no campaign is armed that would be, and the fast track holds nothing at the last index (R6, §3.2) | `a_term_with_no_successor_cannot_campaign_and_keeps_one_leader`, `a_member_with_no_index_for_a_leaders_first_entry_does_not_campaign`, `by_suspicion_a_member_with_no_successor_is_due_for_no_campaign`, `the_fast_track_proposes_and_holds_nothing_at_the_last_index` |

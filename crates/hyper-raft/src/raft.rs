@@ -188,12 +188,17 @@ pub struct Config {
     pub applied: u64,
     /// The bytes of entries one message carries, and one entry at least.
     pub max_size_per_msg: u64,
-    /// Messages sent to a member ahead of its answers.
+    /// Messages sent to a member ahead of its answers; `usize::MAX` for no
+    /// count of their own, the window's bytes bounding it (mantle note 32
+    /// R16: the window is what the path carries, and a fixed count, focal's
+    /// 128 or raft-rs's 256, is no measure of a path).
     pub max_inflight_msgs: usize,
-    /// The bytes of entries sent to a member ahead of its answers, until
-    /// its owner says what the path to it carries
+    /// The bytes sent to a member ahead of its answers, each append's
+    /// record ([`crate::wire::MESSAGE_RECORD_FIXED_BYTES`] and its entries),
+    /// until its owner says what the path to it carries
     /// ([`crate::RawNode::set_inflight_bytes`]); `u64::MAX` for no bound of
-    /// its own. One entry larger than the bound is still sent, alone.
+    /// its own, where the messages are counted. One entry larger than the
+    /// bound is still sent, alone.
     pub max_inflight_bytes: u64,
     /// The bytes of proposals a leader holds uncommitted; `u64::MAX` for no
     /// bound of its own.
@@ -296,6 +301,11 @@ impl Config {
         }
         if self.max_inflight_msgs == 0 || self.max_inflight_bytes == 0 {
             return Err(Error::Settings("a window that admits nothing"));
+        }
+        if self.max_inflight_msgs == usize::MAX && self.max_inflight_bytes == u64::MAX {
+            return Err(Error::Settings(
+                "a window bounded by neither its messages nor its bytes",
+            ));
         }
         if self.max_uncommitted_size < self.max_size_per_msg {
             return Err(Error::Settings(
@@ -933,12 +943,13 @@ impl<S: Storage> Raft<S> {
         let initial = store.initial_state()?;
         let configuration = Configuration::from_conf_state(&initial.configuration)?;
         let log = Log::new(store, config.limits.unstable_entries)?;
-        let tracker = Tracker::new(
+        let mut tracker = Tracker::new(
             configuration,
             log.last_index()?,
             config.max_inflight_msgs,
             config.max_inflight_bytes,
         )?;
+        tracker.set_page(config.max_size_per_msg);
         let mut raft = Self {
             id: config.id,
             term: 0,
@@ -1249,18 +1260,22 @@ impl<S: Storage> Raft<S> {
         self.priority = priority;
         self.settle_priority();
     }
-    /// The path to `member` carries `bytes` before it answers: no more of
-    /// entries is sent to it ahead of its answers, but for one entry that
-    /// is larger. False for a member the configuration does not name. What
-    /// is out stays counted; a bound that rose admits more with the
-    /// member's next answer, or the leader's next append.
+    /// The path to `member` carries `bytes` before it answers: no more is
+    /// sent to it ahead of its answers, each append counted at its record,
+    /// but for one entry that is larger. An owner says twice what the path
+    /// carries in a round trip (`hyper_timing::inflight_window`, mantle note
+    /// 32 R16). False, and nothing changed, for a member the configuration
+    /// does not name, and for no bound at all where the window counts no
+    /// messages of its own. What is out stays counted; a bound that rose
+    /// admits more with the member's next answer, or the leader's next
+    /// append.
     pub fn set_inflight_bytes(&mut self, member: NodeId, bytes: u64) -> bool {
         match self.tracker.get_mut(member) {
-            Some(progress) => {
+            Some(progress) if bytes != u64::MAX || progress.inflights.counts_messages() => {
                 progress.inflights.set_byte_cap(bytes);
                 true
             }
-            None => false,
+            _ => false,
         }
     }
     /// A member that has no term has no log to defend, and every candidate
@@ -3274,6 +3289,7 @@ impl<S: Storage> Raft<S> {
             self.config.max_inflight_msgs,
             self.config.max_inflight_bytes,
         )?;
+        self.tracker.set_page(self.config.max_size_per_msg);
         self.post_conf_change()?;
         if let Some(progress) = self.tracker.get_mut(self.id) {
             let held = progress.next_index.saturating_sub(1);

@@ -831,3 +831,53 @@ them. slates is read at `ec5e0df` (its `main`, 2026-10-03).
   from a backlog of 1,000 to 50,000, 4 allocations and 160 bytes a proposal at every backlog (load
   4.7–6.5; slates measured 129 µs at 1,000 and 20 ms at 5,000 before its fix, 61–102 ns after, its
   `append_command` alone where this is the owner's whole turn).
+
+### R16: the window a member is sent ahead of its answers, one rule
+
+- **Two rules, one.** focal's F41 bounds what a member is sent ahead of its answers by bytes its
+  owner says, and focal's owner said twice the transport's congestion window (focal 27 §11; Linux's
+  `tcp_sndbuf_expand`). slates' drive keeps ⌈2·tail/period⌉ batches ahead
+  (`ElectionTiming::window_budget`, from slates' `timing.rs`), one batch for each period a lost
+  batch takes to repair. Both are what the path carries over the two round trips a lost append
+  takes to repair: a rate-clocked sender's carriage in a round trip is its congestion window, a
+  paced one's is a batch for each period of the round trip. `hyper_timing::inflight_window(carried)`
+  states it; `ElectionTiming::window_budget` is it in whole batches
+  (`slates_window_and_focals_are_what_the_path_carries_over_the_repair`: equal on tails of whole
+  periods, at most a batch more between them); hyper-durable gives the core the rule's window from
+  its owner's measure (`Replica::set_carriage`, `the_window_to_a_member_is_twice_what_its_path_carries`).
+- **The window counts what the path carries.** Each append is charged its record: its fixed bytes
+  (`wire::MESSAGE_RECORD_FIXED_BYTES`, 96) and its entries' bodies, where F41 and slates counted the
+  entries alone, as RFC 9002 §B.2 counts a packet's bytes in flight; a page is cut to the room less
+  the append's fixed bytes (`Progress::page_bytes`, `Progress::sent`).
+- **No count of its own.** `Config::max_inflight_msgs` of `usize::MAX` counts no messages: the
+  bytes bound the window (an append costs at least its fixed bytes and an entry's), and its ring
+  grows as it is used (`Inflights` is a `VecDeque`; a finite count reserves its ring whole at the
+  first message, as before). A window bounded by neither is refused (`Config::validate`), and so is
+  a bound of none set on one that counts no messages (`set_inflight_bytes`).
+- **A window that filled waits for a whole append or half of it** (`Inflights::draining`,
+  `SILLY_WINDOW_DIVISOR`, `a_window_that_filled_waits_for_a_whole_append_or_half_of_it`): found by
+  the timed simulation, where a window of one batch, charged its appends' records, opened by one
+  small answer at a time and drew one small append each time. RFC 1122 §4.2.3.4's sender rules (1)
+  and (3), `Fs` = ½, after Clark's RFC 813; below its bound a window sends at once (no Nagle's
+  rule). raft-rs's forced opening at a heartbeat's answer (`HeartbeatAnswers::Bare`) is kept.
+- **Measured** (`docs/benchmarks.md`, "The window a member is sent ahead of its answers (R16)"):
+  slates' pipelining measurement on this core (`tests/timed.rs`, the harness its timed simulation
+  re-founded here, `tests/support/timed.rs`), on paths that keep order: at 2,000 proposals a
+  second one batch out at a time commits 1,023 a second at a 7,908 ms median (slates 1,029 at
+  7,319 ms) and the rule every proposal at 125 / 127 ms (slates' derived window 172 / 222 ms),
+  202.5 / 328 ms with 1 % loss (slates 201 / 321 ms), and at 4,000 a second 126 / 127 ms; the gate
+  test `a_window_of_two_round_trips_keeps_up_where_one_batch_does_not` holds it exactly. Against
+  commit 2's core (focal's 128 places, entries charged alone) the medians are the same, the p99
+  lower, and the bytes two to four times as many, each proposal going at once as its own append in
+  a harness whose owner proposes one entry a turn. Allocations and reallocations identical on all
+  36 cells, 8 bytes a member more each time a tracker is built; the schedules of
+  `tests/pipeline.rs`, all of which set byte windows, moved, every other suite's lines are
+  `main`'s.
+- **The schedules where a leader applies before its write.** Each append charged its record, a
+  member is sent fewer appends ahead in the schedules' small windows, so its leader's entries reach
+  a quorum later against its own slow write: in 240 schedules by suspicion 22 entries applied ahead
+  against 61 before, and at the default 24, with a campaign that supersedes its own requests
+  (`d254f78`), none, which their coverage check refused. Their leader's disk is now slower in the
+  long schedules, a tenth (`SCHEDULES_SLOW_LEADER`, measured: 15 at the default size, on ticks 8),
+  and stays a quarter in the crashes' and faults' schedules, each of which still holds a change
+  behind the fence there.

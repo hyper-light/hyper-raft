@@ -25,6 +25,11 @@ pub const ENTRY_FIXED_BYTES: usize = 1 + 8 + 8 + 4 + 4;
 /// Bytes of a message's body besides its context, entries and snapshot: the kind, the flags,
 /// nine `u64`, the priority, the entry count and the context length.
 pub const MESSAGE_FIXED_BYTES: usize = 1 + 1 + 9 * 8 + 8 + 4 + 4;
+/// Bytes of a message's record besides its context, entries and snapshot: its body's fixed part,
+/// the record's header and its checksum. A leader's append carries no context, so what it costs the
+/// path is this and its entries' bodies, the bytes a member's window is charged
+/// (`progress::Inflights`).
+pub const MESSAGE_RECORD_FIXED_BYTES: usize = HEADER_BYTES + MESSAGE_FIXED_BYTES + CHECKSUM_BYTES;
 
 /// Flag bit of a message: the request is refused.
 const REJECT: u8 = 1;

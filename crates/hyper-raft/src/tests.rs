@@ -465,7 +465,10 @@ fn a_round_that_was_lost_is_asked_again_by_the_leaders_clock() {
     assert!(rounds(&drain(&mut node)).is_empty());
 }
 
+/// The leader's appends to `to` among `messages` that carry entries: the last index of each, and
+/// what it costs the path, its record (what the window is charged).
 fn appends(messages: &[Message], to: u64) -> Vec<(u64, u64)> {
+    use crate::wire::Record;
     messages
         .iter()
         .filter(|message| {
@@ -476,7 +479,7 @@ fn appends(messages: &[Message], to: u64) -> Vec<(u64, u64)> {
         .map(|message| {
             (
                 message.entries.last().unwrap().index,
-                message.entries.iter().map(proto::encoded_bytes).sum(),
+                message.encoded_len() as u64,
             )
         })
         .collect()
@@ -486,8 +489,9 @@ fn window(node: &RawNode<Memory>, member: u64) -> (usize, u64) {
     (progress.inflights.count(), progress.inflights.bytes())
 }
 
-/// A member is sent no more bytes of entries ahead of its answers than the
-/// path to it carries, whatever their sizes; a member that answers nothing
+/// A member is sent no more bytes ahead of its answers than the path to it
+/// carries, each append charged its record, whatever their sizes (mantle
+/// note 32 R16); a member that answers nothing
 /// holds none of them back from a majority that does; an entry larger than
 /// the bound is sent, alone, and waited for without another being sent; an
 /// answer gives back what the messages it answers took, once, in whatever
@@ -510,9 +514,10 @@ fn a_member_is_sent_no_more_bytes_ahead_of_its_answers_than_its_path_carries() {
         sent.extend(appends(&messages, 2));
         node.check_accounting().unwrap();
         let (_, bytes) = window(&node, 2);
-        // What is out passes the bound by one entry at most: the page that
-        // took the last of the room.
-        assert!(bytes < 1_000 + 710, "{bytes} bytes are out");
+        // What is out passes the bound by one append at most, of one entry:
+        // the page that took the last of the room.
+        let most = crate::wire::MESSAGE_RECORD_FIXED_BYTES as u64 + 725;
+        assert!(bytes <= 1_000 + most, "{bytes} bytes are out");
     }
     // The window filled by its bytes, with places to spare, and the
     // entries behind it wait.

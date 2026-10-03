@@ -37,11 +37,31 @@ use crate::{ExchangeRtt, PathRtt};
 
 /// A protocol fact, not a tunable: two, the round trips a lost batch takes to repair when the
 /// leader sends batches ahead: the follower's refusal of the batch after the lost one reaches the
-/// leader, and the resend reaches the follower (slates `docs/wip/research/consensus-enhancements.md`
-/// §3.5). Raft's append consistency check (Ongaro and Ousterhout 2014, §5.3) makes the follower
-/// refuse rather than buffer, so no shorter repair exists, and one refusal names the gap, so none
-/// longer is needed.
+/// leader, and the resend reaches the follower and its answer the leader (slates
+/// `docs/wip/research/consensus-enhancements.md` §3.5). Raft's append consistency check (Ongaro and
+/// Ousterhout 2014, §5.3) makes the follower refuse what follows a hole, so no shorter repair
+/// exists, and one refusal names the gap, so none longer is needed.
 pub const REPAIR_ROUND_TRIPS: u64 = 2;
+
+/// The bytes a leader keeps in flight to a member (mantle note 32 R16): what the path to it carries
+/// over the [`REPAIR_ROUND_TRIPS`] round trips a lost append takes to repair, given `carried`, what
+/// it carries in one. One round trip's carriage, the path's bandwidth-delay product, keeps a path
+/// that loses nothing full; a lost append is answered only once its resend is, two round trips after
+/// it was sent, and the window is sized to that repair.
+///
+/// focal's rule and slates' are this one, each reading the carriage where its sender has it:
+/// - focal (focal 27 §11, F41): twice what the transport's congestion controller lets out in a round
+///   trip, its congestion window to the member's node (Linux's `tcp_sndbuf_expand` sizes a send
+///   buffer at the same twice the window: "Cubic needs 1.7 factor, rounded to 2 to include extra
+///   cushion"). `carried` is that window.
+/// - slates ([`ElectionTiming::window_budget`]): a sender that sends one batch a period carries a
+///   batch for each period of a round trip; over two round trips, ⌈2·tail/period⌉ batches.
+///
+/// The core charges each append its record (`hyper_raft::wire::MESSAGE_RECORD_FIXED_BYTES` and its
+/// entries), what the path carries of it, as RFC 9002 §B.2 counts a packet's bytes in flight.
+pub fn inflight_window(carried: u64) -> u64 {
+    carried.saturating_mul(REPAIR_ROUND_TRIPS)
+}
 
 /// What a timing law reads from a measured path. A path with no sample contributes nothing to a
 /// derivation: never an initial guess such as RFC 9002's 333 ms.
@@ -312,7 +332,8 @@ impl ElectionTiming {
 
     /// The window a leader keeps ahead, in bytes: one `batch_bytes` for each period of
     /// `period_ns` a lost batch takes to repair on the slowest measured voter path
-    /// ([`REPAIR_ROUND_TRIPS`] round trips), and at least one.
+    /// ([`REPAIR_ROUND_TRIPS`] round trips), and at least one: [`inflight_window`] for a sender that
+    /// sends a batch a period, in whole batches.
     ///
     /// It is one batch on a LAN, where an acknowledgement is back within the period. slates
     /// measured four across five Azure regions, where four cut the commit tail under 1 % loss from
@@ -815,6 +836,35 @@ mod tests {
         let batches = usize::try_from((2 * tail).div_ceil(HEARTBEAT)).unwrap();
         assert_eq!(timing.window_budget(HEARTBEAT, BATCH), BATCH * batches);
         assert!(batches >= 3);
+    }
+
+    /// slates' window and focal's are one rule (mantle note 32 R16): what the path carries over the
+    /// repair's round trips. A sender of a batch a period carries a batch for each period of a round
+    /// trip, and on a tail of whole periods slates' window is exactly [`inflight_window`] of that; on a
+    /// tail between them slates' counts whole batches, at least the rule's bytes and at most one
+    /// batch more. focal's is twice the transport's congestion window, its carriage.
+    #[test]
+    fn slates_window_and_focals_are_what_the_path_carries_over_the_repair() {
+        const BATCH: u64 = 4_367;
+        let period = HEARTBEAT;
+        let mut timing = wan_timing();
+        for periods in 1..=6u64 {
+            timing.broadcast_tail = Duration::from_nanos(periods * period);
+            let paced = timing.window_budget(period, BATCH as usize) as u64;
+            assert_eq!(paced, inflight_window(BATCH * periods), "{periods} periods");
+        }
+        for tail in [period / 3, period + 1, 5 * period / 2 + 7] {
+            timing.broadcast_tail = Duration::from_nanos(tail);
+            let paced = timing.window_budget(period, BATCH as usize) as u64;
+            let exact = (u128::from(BATCH) * u128::from(REPAIR_ROUND_TRIPS) * u128::from(tail)
+                / u128::from(period)) as u64;
+            assert!(
+                paced >= exact && paced <= exact + BATCH,
+                "a tail of {tail} ns"
+            );
+        }
+        let congestion_window = 1_250_000 / 10;
+        assert_eq!(inflight_window(congestion_window), 2 * congestion_window);
     }
 
     /// One stall of three answers moves the median path's priority nowhere and the smoothed one's

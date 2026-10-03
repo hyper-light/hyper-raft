@@ -184,8 +184,11 @@ design, with nothing picked between them:
   with that purpose takes the base as its ceiling and the cap goes.
 - **What stays.** `REPAIR_ROUND_TRIPS = 2` is a protocol fact, not a tunable: Raft's consistency
   check (§5.3) makes a follower refuse the batch after a lost one rather than buffer it, so the
-  repair is that refusal reaching the leader and the resend reaching the follower, and no shorter
-  or longer one exists. RFC 9002's gains and its `4·rttvar` are the standard's constants, cited.
+  repair is that refusal reaching the leader and the resend reaching the follower and its answer the
+  leader, and no shorter or longer one exists. The window a leader keeps in flight is what the path
+  carries over that repair (`inflight_window`, mantle note 32 R16): `window_budget` is it in whole
+  batches for a sender that sends a batch a period, and twice the transport's congestion window for
+  one the transport clocks (`docs/raft.md` §3.2). RFC 9002's gains and its `4·rttvar` are the standard's constants, cited.
 
 On the comparison workload (five voters, four WAN paths of 40–58 ms, a 10 ms heartbeat, macOS's
 `G` and `T_c`), the law before L-1 gave a base of `10 × tail` and a span of `10 × spread`; the law

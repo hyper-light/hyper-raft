@@ -46,7 +46,7 @@ use hyper_raft::wire::Record;
 use hyper_raft::{
     Config, Elections, Lost, RawNode, SnapshotStatus, StateRole, StorageError, Timing,
 };
-use hyper_timing::{Ballot, Flushes, Span, Trust};
+use hyper_timing::{Ballot, Flushes, Span, Trust, inflight_window};
 
 use crate::budget::{Budget, Unbounded};
 use crate::held::Held;
@@ -720,6 +720,18 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
             let told = r.node.restarted(member);
             r.heard(told)
         })
+    }
+
+    /// What the path to `member` carries in a round trip, as the node's transport measures it: its
+    /// congestion window to the member's node (mantle note 32 R16). The core keeps in flight to the
+    /// member twice that (`hyper_timing::inflight_window`), what the path carries over the two
+    /// round trips a lost append takes to repair. Said whenever the transport's measure
+    /// moves; false, and nothing changed, for a member the group does not name, or for a carriage
+    /// so large that the window would have no bound where the core counts no messages
+    /// (`RawNode::set_inflight_bytes`). Until it is said, a member is sent what the core's settings
+    /// give (`Config::max_inflight_bytes`).
+    pub fn set_carriage(&mut self, member: u64, carried: u64) -> Result<bool, ReplicaError> {
+        self.guarded(|r| Ok(r.node.set_inflight_bytes(member, inflight_window(carried))))
     }
 
     /// What the owner's measurements give the group's elections: the span hyper-timing's law

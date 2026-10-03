@@ -1056,9 +1056,15 @@ the members' stated law passes with nothing moved (the longer of a member's stat
 an unjudged pair's interval, then its election's span and rounds and an ask's, never below RFC
 6298's one second). Quiet is time in which the test saw the group and nothing moved: a look begun
 before the period ended counts as movement unseen; a look in which a member did not answer decides
-nothing (the member is waited on while its process runs, and its answer after counts as movement);
-and the time the members report their one thread spent in their logs' writes since the watch last
-heard them extends the watch by the most any one spent. The partition is also seen by the
+nothing (its answer after counts as movement); and the time the members report their one thread
+spent in their logs' writes since the watch last heard them extends the watch by the most any one
+spent. A member's silence is excused only as far as the members' own measures go: the longest one
+write of a log any member has reported (or the stall the test ordered) and the quiet period,
+against its silence counted from its first unanswered ask to its latest, less the retransmission
+timeout the test waited on the latest (a lost ask costs the test, not the member). Past it the wait
+fails, naming the member, with the group's state: `member-stopped` stops a follower (`SIGSTOP`
+on Unix; on Windows, which has no stop signal, the member holds its thread outside any write) and
+asserts the wait fails naming it, then lets it go and the group converges. The partition is also seen by the
 detectors: the member cut off suspects every other and every other suspects it. Its bounds stay the
 scenario's: the keys it writes, the asks it keeps waiting, and a log of one entry a write and one a
 term, for a leader proposes no write its log already holds and each term's leader appends one

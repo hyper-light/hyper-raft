@@ -96,6 +96,16 @@ impl From<std::io::Error> for NodeError {
     }
 }
 
+/// Holds the member's thread for `hold`, as the test ordered (`stream::put_hold`): it reads
+/// nothing and answers nothing meanwhile, as a member deadlocked outside a write of its log.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "the member holds its thread for a hang the test ordered, as a deadlocked member holds it"
+)]
+fn hold_thread(hold: Duration) {
+    std::thread::sleep(hold);
+}
+
 /// A refusal changed nothing and is the asker's to hear; only a fatal error stops the member.
 fn heard<T>(outcome: hyper_raft::Result<T>) -> Result<Option<T>, NodeError> {
     match outcome {
@@ -818,6 +828,11 @@ impl Node {
                 .liveness
                 .on_heartbeat(peer, message, now, &mut self.asked);
             return self.act_on_liveness().map(drop);
+        }
+        if let Some((id, hold)) = stream::read_hold(body) {
+            self.respond(from, id, &Outcome::Done)?;
+            hold_thread(hold);
+            return Ok(());
         }
         if let Some((id, stall)) = stream::read_stall(body) {
             self.raw.store_mut().stall_flushes(stall);

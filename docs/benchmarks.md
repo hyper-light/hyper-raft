@@ -921,8 +921,11 @@ bounds derived from that budget. What derives each count now:
   which a member did not answer decides nothing (the member is waited on while its process runs,
   and its answer after counts as movement); and the time the members report their one thread spent
   in their logs' writes since the watch last heard them extends the watch by the most any one
-  spent. An ask waits that timeout for its answer, by a peek (`wire::arrives`). A wait that gives
-  up prints each member's last report and the reports of a look after.
+  spent. A member's silence (from its first unanswered ask to its latest, less the timeout the
+  test waited on the latest) is excused only up to the longest one write of a log any member has
+  reported, or the stall the test ordered, and the quiet period; past it the wait fails, naming
+  the member. An ask waits that timeout for its answer, by a peek (`wire::arrives`). A wait that
+  gives up prints each member's last report and the reports of a look after.
 - **Every report** holds the member to its bookkeeping: each write it keeps waiting has an entry
   above what it applied in the log of the term it leads (`stray`, asserted zero on every report).
 - **A phase** writes one entry more than an append carries: the datagram the platform allows
@@ -934,8 +937,11 @@ bounds derived from that budget. What derives each count now:
   (`Wal::open`'s `max_writes`), for a leader proposes no write its log already holds and each term's
   leader appends one empty entry.
 - **Writes in flight** (`leader-killed`) go from a client of their own to whoever leads, and those
-  not answered are sent again while the leader's log holds fewer than all the scenario's writes: on
-  Linux a phase overflows a socket's buffer, and the leadership moves under such a burst.
+  not answered are sent again while the leader's log holds fewer than all the scenario's writes,
+  but only to a leader that answered since: on Linux a phase overflows a socket's buffer, and the
+  leadership moves under such a burst.
+- **A member restarted** takes a port the system gives, and every member up is told where it
+  listens: a port freed by a process killed is the system's to give to whoever binds next.
 
 | Scenario | Asserts |
 |---|---|
@@ -945,6 +951,7 @@ bounds derived from that budget. What derives each count now:
 | partition | the leader of five cut off by a drop filter inside its process, its heartbeats with its Raft messages: a read it is asked at once is never answered with a value and a write never acknowledged; the others elect; the member cut off suspects all four and all four suspect it; a key written after the cut never reads stale from it; once lifted it follows and every member applies the same history |
 | all-killed | every member killed at once and restarted on its log: every answered write reads back |
 | stalled-devices | every member's device answers no flush for longer than a wait can be quiet and look (the quiet period in force and two looks' retransmission timeouts); a write sent into the stall commits once the devices go on; a phase after; every answered write reads back and every member applies the same history |
+| member-stopped | a follower stopped mid-scenario (`SIGSTOP`; on Windows the member holds its thread outside any write): the wait for a write it cannot apply fails, naming it, once its silence passes what the members' longest write and the quiet period excuse, rather than hanging; let go, it applies the same history as the others |
 
 Every scenario also prints, for each member, its floors and the longest it went in one flush and
 between two reads of its socket, and for each pair what the configurator was fed, the detector in

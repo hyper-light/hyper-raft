@@ -398,14 +398,23 @@ pub fn election_span(
         return None;
     }
     let low = l.max(resolution);
-    // `T_E(W) ≥ W / (s + 1)`, so a span past `(s + 1) · T_E(low)` costs more than any it saves.
+    // `T_E(W) ≥ W / (s + 1)`, so a span past `(s + 1) · T_E(W₀)` costs more than `W₀` for any
+    // `W₀` with a finite time: the search's upper end. The narrowest span is one, unless every
+    // attempt at it splits (`W = l`: every start falls within the latency of the first); then
+    // `(s + 1) · low` is, a span past the latency, at which an attempt splits with probability
+    // below one.
+    let first = f64::from(available.saturating_add(1));
     let at_low = election_time(voters, available, l, b, low);
-    let high = if at_low.is_finite() {
-        (f64::from(available.saturating_add(1)) * at_low).max(low)
+    let (bounding, at) = if at_low.is_finite() {
+        (low, at_low)
     } else {
-        // Every attempt at the narrowest span splits: widen until one would not.
-        low * f64::from(available.saturating_add(1)) * f64::from(available.saturating_add(1))
+        let wider = first * low;
+        (wider, election_time(voters, available, l, b, wider))
     };
+    if !at.is_finite() {
+        return None;
+    }
+    let high = (first * at).max(bounding);
     let (w, time) = minimize(low, high, resolution, |w| {
         election_time(voters, available, l, b, w)
     });
@@ -425,6 +434,18 @@ mod tests {
 
     fn ms(value: f64) -> Duration {
         Duration::from_secs_f64(value / 1e3)
+    }
+
+    /// Where every attempt at the narrowest span splits, the search's upper end is bounded by a
+    /// span with a finite time. A vote round long against the latency, as one with a flush in it
+    /// is, puts the best span past `(s + 1)² · l`, where a fixed widening stopped: three voters,
+    /// two up, a round a hundred times the latency, best near 26 latencies, cut at 9.
+    #[test]
+    fn a_long_vote_round_is_searched_past_a_fixed_widening() {
+        let found = election_span(3, 2, ms(1.0), ms(100.0), Duration::from_micros(1)).unwrap();
+        assert!(found.span > ms(25.0), "{found:?}");
+        let at_fixed_edge = election_time(3, 2, 1e-3, 0.1, 9e-3);
+        assert!(found.election.as_secs_f64() < at_fixed_edge, "{found:?}");
     }
 
     #[test]

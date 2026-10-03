@@ -95,7 +95,11 @@ design, with nothing picked between them:
   is chosen for `s = n − 1`, the voters left when the leader's node crashed, which is the case the
   detector exists for; a group of two, whose survivor is no majority, for `s = n`. No ballot before
   a quorum's paths are measured, and none for a sole voter.
-- **The span** `W` is `election_span` on the ballot, searched to within `G`. Its `T_E` is the
+- **The span** `W` is `election_span` on the ballot, searched to within `G`, from the narrowest
+  span to `(s + 1) · T_E(W₀)` of a span `W₀` with a finite time (the narrowest, or `(s + 1)` times
+  it where every attempt at the narrowest splits), past which `T_E(W) ≥ W / (s + 1)` costs more
+  than `W₀`; a fixed widening of `(s + 1)²` there cut the best span off once the vote round passed
+  about ten latencies, which the ballot's latency, holding the flush, keeps it below. Its `T_E` is the
   election cost the detector's configurator is charged (`Costs::election`), so `η` and `α` are
   chosen knowing what an election costs this group, and the election waits only as long as that
   choice assumed.

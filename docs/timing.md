@@ -1550,6 +1550,24 @@ hyper-raft-e2e's had, each failing on CI once in a way a re-run passed:
   an arrival or a completion ended past its wake. With it the same build passed three runs of
   three, `G` measured a median 108–143 ms into a member's start, 51, 9 and 18 heartbeats refused in
   all (`docs/benchmarks.md`, "`G` from every wait that reached its wake").
+- **The E2E members polled their streams past what they had read** (2026-10-03, over `09e8316`).
+  hyper-raft-e2e's `cluster` on that head, once in Docker's Linux at each of four, two and one CPUs
+  beside main's runs, counted 465 and 392 suspicions in `stalled-devices` at four and two CPUs,
+  against main's 19 and 124, and the leader killed in `leader-killed` was in term 19 and 29, against
+  main's 9 and 13. Both members polled the stream at the top of their loop, after their drive, which
+  a write of the log holds as long as the device takes, and again after a drain that a turn's budget
+  may have cut with datagrams left. `Liveness::poll` asks that every datagram stamped before the
+  time it is polled at be fed first (§2.8): stamped as they were read (main), unread heartbeats had
+  no stamp yet and the rule held of itself; stamped by the kernel (`dc42e0e`), a heartbeat that came
+  in time and sat unread was a suspicion. A scratch diagnostic on macOS (prints in the member, not
+  committed) showed the suspicions told 113–203 ms after the member's last drain, the next heartbeat
+  taken stamped before the suspicion's point. The members now read the clock, drain the socket, and
+  poll at that clock only when the drain emptied it; a drain cut at its budget polls nothing, and
+  the next that empties the socket does. Each member counts the suspicions it told while a heartbeat
+  stamped before their point sat unread, found as that heartbeat is taken (`Report::unread`), and
+  both tests hold every report's count to zero, exactly. On `09e8316`'s loops the count failed both
+  tests on macOS in `member-stopped`: 35 in hyper-raft-e2e's member stopped 3 s, 4 in
+  hyper-durable-e2e's; with the loops so, both tests passed whole, every count zero.
 
 **What the runs measured of the detectors** (every scenario prints, for each member, its floors,
 longest flush and longest time between two reads of its socket, and for each pair what the

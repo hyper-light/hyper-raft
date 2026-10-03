@@ -198,6 +198,12 @@ pub struct Report {
     /// applied in the log of the term it leads that writes the value asked, or kept while it
     /// leads no term. Zero always; any other count is a write that waits for good.
     pub stray: u64,
+    /// The suspicions it told while a heartbeat of the peer's, stamped by the kernel before the
+    /// suspicion's freshness point, was still unread in its socket: each found when that heartbeat
+    /// is taken. Zero always: the stream judges by the heartbeats it was given, and is polled only
+    /// at a clock read before a drain that emptied the socket (`Liveness::poll`); any other count
+    /// is a suspicion the member's own reading made.
+    pub unread: u64,
     /// The peers its detectors suspect.
     pub suspected: Vec<u64>,
     /// The peers its stream has taken a heartbeat from.
@@ -232,6 +238,7 @@ pub fn put_report(buffer: &mut Vec<u8>, id: u64, report: &Report) {
         report.turn_most_ns,
         report.waiting,
         report.stray,
+        report.unread,
     ] {
         wire::put_u64(buffer, word);
     }
@@ -260,7 +267,7 @@ pub fn read_report(body: &[u8], max_peers: usize) -> Option<(u64, Report)> {
         last_index: reader.u64()?,
         digest: reader.u64()?,
     };
-    let mut words = [0u64; 13];
+    let mut words = [0u64; 14];
     for word in &mut words {
         *word = reader.u64()?;
     }
@@ -278,6 +285,7 @@ pub fn read_report(body: &[u8], max_peers: usize) -> Option<(u64, Report)> {
         turn_most_ns,
         waiting,
         stray,
+        unread,
     ] = words;
     let mut list = || {
         let count = usize::try_from(reader.u64()?).ok()?;
@@ -307,6 +315,7 @@ pub fn read_report(body: &[u8], max_peers: usize) -> Option<(u64, Report)> {
             turn_most_ns,
             waiting,
             stray,
+            unread,
             suspected,
             heard,
         },

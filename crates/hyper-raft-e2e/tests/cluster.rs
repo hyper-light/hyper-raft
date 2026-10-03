@@ -10,6 +10,8 @@
 //! - a member started again is reported restarted to every other member's core;
 //! - a group whose devices all stall goes on once they do;
 //! - every write a member keeps waiting is one an apply will answer (each report's `stray`).
+//! - every suspicion is the member's stream's: none was told while a heartbeat the kernel stamped
+//!   before its point sat unread in the member's socket (each report's `unread`).
 //!
 //! The members elect by suspicion on their own failure detectors: each runs the node-pair
 //! liveness stream (`hyper_liveness`, timing step L-3) and takes its words to its core, with the
@@ -293,6 +295,14 @@ impl Cluster {
         assert_eq!(
             report.stray, 0,
             "{}: member {id} keeps writes no apply will answer: {report:?}",
+            self.name
+        );
+        // Every suspicion is the stream's: none told while a heartbeat the kernel stamped before
+        // its point sat unread in the member's socket.
+        assert_eq!(
+            report.unread, 0,
+            "{}: member {id} suspected a peer whose heartbeat, stamped before the point, it had \
+             not read: {report:?}",
             self.name
         );
         let law = quiet::law(

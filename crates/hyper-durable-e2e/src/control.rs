@@ -175,6 +175,10 @@ pub struct Report {
     /// The longest it went between two reads of its socket, nanoseconds: the longest it could not
     /// answer.
     pub turn_most_ns: u64,
+    /// The suspicions it told while a heartbeat of the peer's, stamped by the kernel before the
+    /// suspicion's freshness point, was still unread in its socket (hyper-raft-e2e's
+    /// `Report::unread`). Zero always.
+    pub unread: u64,
     /// The peers its detectors suspect.
     pub suspected: Vec<u64>,
     /// The peers its stream has taken a heartbeat from.
@@ -212,6 +216,7 @@ pub fn put_report(buffer: &mut Vec<u8>, id: u64, report: &Report) {
         report.writing_ns,
         report.flush_most_ns,
         report.turn_most_ns,
+        report.unread,
         u64::try_from(report.voters.len()).unwrap_or(u64::MAX),
     ] {
         wire::put_u64(buffer, word);
@@ -249,7 +254,7 @@ pub fn read_report(body: &[u8], max_voters: usize) -> Option<(u64, Report)> {
         return None;
     }
     let status = read_status(&mut reader)?;
-    let mut words = [0u64; 13];
+    let mut words = [0u64; 14];
     for word in &mut words {
         *word = reader.u64()?;
     }
@@ -267,6 +272,7 @@ pub fn read_report(body: &[u8], max_voters: usize) -> Option<(u64, Report)> {
         writing_ns,
         flush_most_ns,
         turn_most_ns,
+        unread,
     ] = words;
     let list = |reader: &mut Reader<'_>| {
         let count = usize::try_from(reader.u64()?).ok()?;
@@ -298,6 +304,7 @@ pub fn read_report(body: &[u8], max_voters: usize) -> Option<(u64, Report)> {
             writing_ns,
             flush_most_ns,
             turn_most_ns,
+            unread,
             suspected,
             heard,
         },

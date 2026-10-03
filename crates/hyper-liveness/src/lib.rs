@@ -24,8 +24,10 @@
 //! **Timing, all measured.** The sender's interval is the one the receiver's configurator chose
 //! (Chen et al.'s adaptive scheme, the receiver asking in its own heartbeats), never shorter than
 //! the sender's stability floor `E[flush] + G` (Lindley 1952; `docs/timing.md` §2.6); before the
-//! receiver has chosen, the floor. `G` is the measured lateness of the owner's wakes
-//! (`hyper_timing::Wakes`), `E[flush]` the mean of the durable completions reported, the margin
+//! receiver has chosen, the floor. `G` is the mean lateness of the owner's timed waits for the
+//! stream's wakes, each begun before its deadline and ended by it ([`Liveness::on_wait`]): what the
+//! operating system adds to a wait, not what the owner's own work does. `E[flush]` the mean of the
+//! durable completions reported, the margin
 //! bounded by one Cantelli factor on each heartbeat's lateness past its expected arrival (a slot
 //! the sender skipped or the network lost being the next one's lateness), which assumes no
 //! independence between heartbeats (`docs/timing.md` §2.2), the MTBF the Jeffreys posterior over
@@ -78,7 +80,8 @@ use std::time::Duration;
 
 pub use codec::{Echo, Heartbeat, KIND, MAX_BYTES, VERSION, is_liveness};
 use hyper_timing::{
-    Arrivals, Configuration, Detector, ExchangeRtt, Exposure, Flushes, LinkEstimator, Trust, Wakes,
+    Arrivals, Configuration, Detector, ExchangeRtt, Exposure, Flushes, Lateness, LinkEstimator,
+    Trust,
 };
 use pair::Pair;
 
@@ -295,7 +298,13 @@ pub struct Liveness {
     run: u64,
     max_peers: usize,
     pairs: BTreeMap<PeerId, Pair>,
-    wakes: Wakes,
+    /// `G`: the lateness of the timed waits the owner reports ([`on_wait`](Self::on_wait)).
+    timer: Lateness,
+    /// The wake the latest poll asked of the owner, and the most the owner has been past one: what
+    /// a bound the owner states adds (Lifeguard's local health, measured: `docs/timing.md` §2.7),
+    /// its own stalls and all.
+    asked: Option<u64>,
+    late_most: u64,
     flushes: Flushes,
     durable: Durable,
     /// Whether a liveness write is out.
@@ -378,7 +387,9 @@ impl Liveness {
             run: settings.run,
             max_peers: settings.max_peers,
             pairs: BTreeMap::new(),
-            wakes: Wakes::new(),
+            timer: Lateness::new(),
+            asked: None,
+            late_most: 0,
             flushes: Flushes::new(),
             durable: Durable::default(),
             flushing: false,
@@ -419,7 +430,7 @@ impl Liveness {
 
     /// Feeds the pool a link's lateness.
     fn feed_pool(&mut self, lateness: i64, interval: Duration) {
-        let Some(granularity) = self.wakes.granularity() else {
+        let Some(granularity) = self.granularity() else {
             return;
         };
         if self.pool.is_none() {
@@ -517,7 +528,7 @@ impl Liveness {
             return Err(Refusal::FromSelf);
         }
         let beat = Heartbeat::decode(message)?;
-        let granularity = self.wakes.granularity();
+        let granularity = self.granularity();
         let pair = self.pairs.get_mut(&from).ok_or(Refusal::UnknownPeer)?;
         let context = pair::Context {
             granularity,
@@ -560,10 +571,15 @@ impl Liveness {
     /// polls. Read the other way round, a stop between the socket and the clock leaves the
     /// datagrams of the stop unread (`tests/processes.rs` traced one, a stopped member's).
     pub fn poll(&mut self, now_ns: u64, out: &mut impl Output) {
-        self.wakes.woke(now_ns);
+        if let Some(at) = self.asked
+            && now_ns >= at
+        {
+            self.late_most = self.late_most.max(now_ns.saturating_sub(at));
+            self.asked = None;
+        }
         self.expose(now_ns);
         let mut wants_flush = false;
-        let granularity = self.wakes.granularity();
+        let granularity = self.granularity();
         let floor = self.floor_at(granularity);
         let sender = pair::Sender {
             local_run: self.run,
@@ -609,7 +625,7 @@ impl Liveness {
             self.flushing = true;
             out.flush();
         }
-        self.wakes.ask(wake);
+        self.asked = wake;
         self.next_wake = if self.last_poll_ns == Some(now_ns) {
             wake
         } else {
@@ -648,7 +664,7 @@ impl Liveness {
 
     /// The sender's stability floor, `E[flush] + G`: `None` before a flush is measured.
     pub fn floor(&self) -> Option<Duration> {
-        self.floor_at(self.wakes.granularity())
+        self.floor_at(self.granularity())
     }
 
     /// The floor at the granularity `G` already read.
@@ -663,14 +679,32 @@ impl Liveness {
         self.flushes.mean()
     }
 
-    /// `G`, the measured lateness of the owner's wakes.
-    pub fn granularity(&self) -> Option<Duration> {
-        self.wakes.granularity()
+    /// A timed wait the owner began before `deadline_ns`, the stream's [`wake`](Self::wake), that
+    /// the deadline ended at `woke_ns`, on the clock the stream is polled by: no message,
+    /// completion or command ended it first. Reported before the poll the wake calls for. `G` is
+    /// the mean lateness of these waits (`docs/timing.md` §2.4): what the operating system adds to
+    /// a wait, a stop or a frozen host included, and nothing the owner's own work adds. A wake the
+    /// owner came to late because its thread was in its own write began no wait before its
+    /// deadline, so it is no sample; taken from every poll past a wake, such wakes made `G` the
+    /// owner's stalls, 4.8–7.4 s in a run whose timer was late by milliseconds (§2.9). A wait for
+    /// a deadline other than the wake asked is not the stream's and measures nothing.
+    pub fn on_wait(&mut self, deadline_ns: u64, woke_ns: u64) {
+        if self.next_wake == Some(deadline_ns) {
+            // A full fold keeps its mean: `G` stands as measured.
+            let _ = self.timer.on_wait(deadline_ns, woke_ns);
+        }
     }
 
-    /// The latest the owner has woken past a wake asked, or is past one at `now_ns`.
+    /// `G`, the mean lateness of the owner's timed waits for the stream's wakes
+    /// ([`on_wait`](Self::on_wait)), once measured and not zero.
+    pub fn granularity(&self) -> Option<Duration> {
+        self.timer.granularity().filter(|g| !g.is_zero())
+    }
+
+    /// The latest the owner has polled past a wake asked, or is past one at `now_ns`.
     pub fn latest_wake(&self, now_ns: u64) -> Duration {
-        Duration::from_nanos(self.wakes.latest_ns(now_ns))
+        let past = self.asked.map_or(0, |at| now_ns.saturating_sub(at));
+        Duration::from_nanos(past.max(self.late_most))
     }
 
     /// What this node believes of `peer`, if they share a group.

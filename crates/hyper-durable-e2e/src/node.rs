@@ -541,12 +541,20 @@ impl Node {
             self.turn_most = self.turn_most.max(self.now().saturating_sub(read));
             // Woken at the replica's deadline or the stream's, whichever is first; by a datagram
             // otherwise, the test's going among them.
-            let until = [self.replica.deadline(), self.liveness.wake()]
-                .into_iter()
-                .flatten()
-                .min();
-            self.receive_until(until)?;
+            let wake = self.liveness.wake();
+            let until = [self.replica.deadline(), wake].into_iter().flatten().min();
+            let began = self.now();
+            let timed_out = self.receive_until(until)?;
             read = self.now();
+            // A wait for the stream's wake, begun before it and ended by it, is what its `G` is
+            // made of (`Liveness::on_wait`): the member's own work is no lateness of its timer.
+            if timed_out
+                && let Some(at) = wake
+                && until == Some(at)
+                && began < at
+            {
+                self.liveness.on_wait(at, read);
+            }
             self.live()?;
             if std::mem::take(&mut self.woken) && self.stops_at(Point::Durable) {
                 return Ok(Some(Point::Durable));
@@ -578,7 +586,8 @@ impl Node {
     /// nothing is due, then takes it and what else has arrived, at most a turn's worth
     /// (hyper-raft-e2e's `receive_until`). The wait is a peek, and every datagram is taken without
     /// waiting: a receive that waits can lose what arrives as it times out (`wire::arrives`).
-    fn receive_until(&mut self, until: Option<u64>) -> Result<(), NodeError> {
+    /// Whether it waited and the wait ended on its timeout, no datagram having come.
+    fn receive_until(&mut self, until: Option<u64>) -> Result<bool, NodeError> {
         let turn = self
             .settings
             .max_pending
@@ -589,7 +598,7 @@ impl Node {
         if wait.is_none_or(|wait| !wait.is_zero()) {
             most = turn.saturating_add(1);
             if !wire::arrives(&self.socket, wait, &mut self.received)? {
-                return Ok(());
+                return Ok(true);
             }
         }
         self.socket.set_nonblocking(true)?;
@@ -605,7 +614,7 @@ impl Node {
             }
         }
         self.socket.set_nonblocking(false)?;
-        outcome
+        outcome.map(|()| false)
     }
 
     fn receive_one(&mut self) -> Result<bool, NodeError> {

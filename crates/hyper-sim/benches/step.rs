@@ -521,6 +521,9 @@ mod live {
         /// Heartbeats sent: the unit the two harnesses are compared in, since their schedules
         /// (drawn from different generators) differ in how many steps a heartbeat takes.
         pub(super) sent: u64,
+        /// The wake the owner's timer was set to, and whether it was set before it: the wait it
+        /// ends is then the timer's, reported to the stream (`Liveness::on_wait`).
+        pub(super) armed: Option<(u64, bool)>,
     }
 
     fn nodes() -> Vec<Node> {
@@ -551,6 +554,7 @@ mod live {
                     disk_busy_until: 0,
                     suspicions: 0,
                     sent: 0,
+                    armed: None,
                 }
             })
             .collect()
@@ -695,6 +699,8 @@ mod live {
                 }
             }
             best.map(|(at, i)| {
+                // The timer is set at the present: before its deadline, or past it.
+                self.nodes[i].armed = Some((at, at >= self.now));
                 (
                     at.max(self.now) + super::LATE.0 + self.noise.below(super::LATE.1),
                     i,
@@ -727,6 +733,11 @@ mod live {
                     alloc::back();
                     self.handle(event);
                 } else if let Some((_, node)) = wake {
+                    let now = self.now;
+                    let n = &mut self.nodes[node];
+                    if let Some((deadline, true)) = n.armed.take() {
+                        n.liveness.on_wait(deadline, now);
+                    }
                     self.poll(node);
                 }
                 if self.now >= self.elected_at {
@@ -891,6 +902,8 @@ mod live {
                 }
             }
             let wake = self.nodes[node].liveness.wake();
+            let now = self.world.now();
+            self.nodes[node].armed = wake.map(|at| (at, at >= now));
             alloc::aside();
             self.world.wake(self.ids[node], wake).unwrap();
             alloc::back();
@@ -914,7 +927,14 @@ mod live {
                 alloc::back();
                 match step {
                     Step::Event { event, .. } => self.handle(event),
-                    Step::Wake { node } => self.poll(node.0 as usize),
+                    Step::Wake { node } => {
+                        let (now, node) = (self.world.now(), node.0 as usize);
+                        let n = &mut self.nodes[node];
+                        if let Some((deadline, true)) = n.armed.take() {
+                            n.liveness.on_wait(deadline, now);
+                        }
+                        self.poll(node);
+                    }
                     Step::Idle | Step::Spent => break,
                 }
                 let now = self.world.now();

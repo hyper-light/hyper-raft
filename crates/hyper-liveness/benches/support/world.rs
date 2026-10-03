@@ -186,6 +186,22 @@ impl World {
         self.drain(node);
     }
 
+    /// The owner's wait for `node`'s wake ended late at `now`: reported, then polled, as an owner
+    /// does (`Liveness::on_wait`).
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "a benchmark measures real time on the host"
+    )]
+    fn woke(&mut self, node: usize, deadline: u64) {
+        let now = self.now;
+        let n = &mut self.nodes[node];
+        let started = Instant::now();
+        n.liveness.on_wait(deadline, now);
+        n.liveness.poll(now, &mut n.owner);
+        self.busy += started.elapsed();
+        self.drain(node);
+    }
+
     /// The election cost from the library's law over the measured round trips, as `tests/sim.rs`.
     pub(crate) fn elect(&mut self) {
         let count = self.nodes.len();
@@ -239,7 +255,7 @@ impl World {
                 self.handle(event);
             } else if let Some((w, node)) = wake {
                 self.now = w + LATE.0 + self.noise.below(LATE.1);
-                self.poll(node);
+                self.woke(node, w);
             }
         }
     }

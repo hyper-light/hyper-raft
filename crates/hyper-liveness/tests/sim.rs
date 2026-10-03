@@ -278,9 +278,10 @@ struct Node {
     /// What the owner believes of each peer from the changes it was told: suspected or not. The
     /// owner trusts a peer until told otherwise, and a restarted one is trusted (`Change`).
     believed: BTreeMap<PeerId, bool>,
-    /// The owner's timer: the deadline it was set to, the stream's wake, and when it fires, late
-    /// by a lateness drawn once, when the deadline was set ([`Sim::arm`]).
-    timer: Option<(u64, u64)>,
+    /// The owner's timer: the deadline it was set to, the stream's wake, when it fires, late by a
+    /// lateness drawn once, when the deadline was set ([`Sim::arm`]), and whether its wait began
+    /// before the deadline, which makes its end a measure of the timer (`Liveness::on_wait`).
+    timer: Option<(u64, u64, bool)>,
     /// The host is frozen until this time (`World::freezes`).
     frozen_until: u64,
     /// What arrived and completed while the host was frozen, in order: taken at the thaw.
@@ -591,14 +592,20 @@ impl Sim {
     /// at most 80 µs late (seed 285 of the soak, `docs/timing.md` §2.8).
     fn arm(&mut self, node: usize) {
         let asked = self.nodes[node].liveness.wake();
-        if self.nodes[node].timer.map(|(deadline, _)| deadline) == asked {
+        if self.nodes[node].timer.map(|(deadline, ..)| deadline) == asked {
             return;
         }
         let fires = asked.map(|deadline| {
             let u = self.draws.unit("timer", node as u64, 0);
             let late = self.world.timer.late(deadline.saturating_sub(self.now), u);
             self.latest_late = self.latest_late.max(late);
-            (deadline, deadline.max(self.now) + late)
+            // A wait begins before its deadline only if the owner was not past it when it set
+            // the timer: one set late is the owner's lateness, not its timer's.
+            (
+                deadline,
+                deadline.max(self.now) + late,
+                deadline >= self.now,
+            )
         });
         self.nodes[node].timer = fires;
     }
@@ -611,7 +618,7 @@ impl Sim {
             .filter(|(_, node)| node.alive)
             .filter_map(|(i, node)| {
                 node.timer
-                    .map(|(_, fires)| (fires.max(node.frozen_until), i))
+                    .map(|(_, fires, _)| (fires.max(node.frozen_until), i))
             })
             .min()
     }
@@ -643,8 +650,11 @@ impl Sim {
                 let event = self.events.remove(&key).unwrap();
                 self.handle(event);
             } else if let Some((_, node)) = wake {
-                // The timer fired: it is set again after the poll.
-                self.nodes[node].timer = None;
+                // The timer fired: its wait, begun before its deadline, is reported, and the
+                // timer is set again after the poll.
+                if let Some((deadline, _, true)) = self.nodes[node].timer.take() {
+                    self.nodes[node].liveness.on_wait(deadline, at);
+                }
                 self.poll(node);
             }
             self.elect();
@@ -744,8 +754,13 @@ impl Sim {
         }
         let held = std::mem::take(&mut self.nodes[node].held);
         let now = self.now;
-        // The timer, due during the freeze, is the poll's: set again after it.
-        self.nodes[node].timer = None;
+        // The timer, due during the freeze, is the poll's: set again after it. The wait it ended
+        // is the thaw's, a frozen host's lateness, reported before what arrived is read.
+        if let Some((deadline, _, true)) = self.nodes[node].timer.take()
+            && deadline <= now
+        {
+            self.nodes[node].liveness.on_wait(deadline, now);
+        }
         for event in held {
             let n = &mut self.nodes[node];
             let completed = match event {
@@ -1216,13 +1231,14 @@ fn a_superseded_runs_heartbeat_is_stale_and_its_restart_counts_once() {
         flush: false,
         changes: Vec::new(),
     };
-    // The first flush gives the floor, the second proves the first heartbeat, and the poll past
+    // The first flush gives the floor, the second proves the first heartbeat, and the wait for
     // the wake it asks measures the granularity: the node takes heartbeats from here.
     node.on_durable(Write::Liveness, 0, 100 * US);
     node.poll(200 * US, &mut owner);
     node.on_durable(Write::Liveness, 200 * US, 300 * US);
     node.poll(300 * US, &mut owner);
     let wake = node.wake().expect("the next heartbeat is due");
+    node.on_wait(wake, wake + 50 * US);
     node.poll(wake + 50 * US, &mut owner);
     assert!(node.granularity().is_some());
     let beat = |run: u64, seq: u64, flushes: u64| Heartbeat {
@@ -1625,6 +1641,9 @@ fn a_sender_that_skips_slots_is_late_not_lost() {
         let arrival = sent + 100 * US + jitter.below(50 * US);
         // The owner's wakes before the heartbeat arrives, each at its wake and late.
         while let Some(wake) = node.wake().filter(|wake| *wake + late <= arrival) {
+            if now < wake {
+                node.on_wait(wake, wake + late);
+            }
             now = now.max(wake + late);
             node.on_durable(Write::Liveness, now, now);
             node.poll(now, &mut owner);
@@ -1670,4 +1689,62 @@ fn a_sender_that_skips_slots_is_late_not_lost() {
         suspected_after,
         "no suspicion of the live sender once configured: {report:?}"
     );
+}
+
+/// `G` is the lateness the operating system adds to the owner's waits (`docs/timing.md` §2.4). An
+/// owner whose thread is held in its own write past a wake comes to that wake late, and that is its
+/// write's lateness, not its timer's. Here the timer ends every wait 1 ms late and every other wake
+/// finds the thread held 50 ms in a write: the owner reports the waits it began before their
+/// deadlines (`Liveness::on_wait`), and `G` is the timer's 1 ms, exactly. Taken from every poll
+/// past a wake, as it was, it held the writes too. The owner's stalls stay in the bound it states
+/// of itself (`Liveness::latest_wake`).
+#[test]
+fn an_owner_held_in_its_own_write_is_no_lateness_of_its_timer() {
+    let mut node = Liveness::new(Settings {
+        local: 1,
+        run: 1,
+        max_peers: 1,
+        history: Exposure::new(),
+    })
+    .unwrap();
+    node.attach(2).unwrap();
+    let mut owner = Owner {
+        id: 1,
+        sent: Vec::new(),
+        flush: false,
+        changes: Vec::new(),
+    };
+    let (late, held) = (MS, 50 * MS);
+    node.on_durable(Write::Liveness, 0, 100 * US);
+    let mut now = 200 * US;
+    node.poll(now, &mut owner);
+    let (mut waited, mut stalled) = (0u64, 0u64);
+    for turn in 0..400u64 {
+        // The flush the stream asked for, which proves the heartbeats due: made at once.
+        if std::mem::take(&mut owner.flush) {
+            node.on_durable(Write::Liveness, now, now);
+            node.poll(now, &mut owner);
+        }
+        let wake = node.wake().expect("a heartbeat is always due");
+        if wake > now {
+            if turn % 2 == 0 {
+                // It waits for the wake, and its timer ends the wait `late` past it.
+                node.on_wait(wake, wake + late);
+                now = wake + late;
+                waited += 1;
+            } else {
+                // Its thread is in its own write past the wake: no wait began before it.
+                now = wake + held;
+                stalled += 1;
+            }
+        }
+        // A wake already past when the owner comes to it is polled at once, no wait begun.
+        node.poll(now, &mut owner);
+    }
+    assert!(
+        waited > 100 && stalled > 100,
+        "{waited} waits, {stalled} stalls"
+    );
+    assert_eq!(node.granularity(), Some(Duration::from_nanos(late)));
+    assert!(node.latest_wake(now) >= Duration::from_nanos(held));
 }

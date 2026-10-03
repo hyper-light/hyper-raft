@@ -5044,3 +5044,15 @@ cargo test --release -p hyper-liveness --test sim diag_ -- --nocapture
 cargo test --release -p hyper-timing --test replay -- --nocapture --test-threads=1
 cargo bench -p hyper-liveness --bench allocs --no-run   # then each binary with --bench, alternating
 ```
+
+## `G` from the waits the owner began (2026-10-03)
+
+`docs/timing.md` §2.4. `Liveness::on_wait(deadline, woke)`: the owner reports each timed wait for
+the stream's wake that it began before the deadline and that the deadline ended, and `G` is their
+mean; a poll past a wake no longer counts. `an_owner_held_in_its_own_write_is_no_lateness_of_its_timer`
+(`tests/sim.rs`): an owner whose timer ends every wait 1 ms late and whose thread is held 50 ms in
+its own write at every other wake, 200 of each. Here `G` is 1 ms exactly; the same owner on main,
+whose stream folded every poll past a wake, measured 25.5 ms, the mean of the two. The trace
+recorder (`hyper-timing-trace run`) has always kept only waits begun before their deadline and
+ended on their timeout, so the `G` of "Heartbeat traces" and "The simulation's worlds" is this
+one; the members' own, before and after, are in the end-to-end accounts below.

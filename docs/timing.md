@@ -197,7 +197,16 @@ now gives the base from the detector and the span from the ballot (`docs/benchma
 - **Granularity.** A timed wait ends on the OS's timer, not when asked. `G` is the mean lateness
   of the detector's own waits, measured: the mean because the waits feed queues (the sender's
   schedule, the detector's checks) whose stability and expected delay depend on it (§2.6). It
-  floors `η`, `α` and the estimates, as RFC 6298 floors its variance term by `G`. Measured on
+  floors `η`, `α` and the estimates, as RFC 6298 floors its variance term by `G`. A wait counts
+  only when the owner began it before its deadline and the deadline ended it
+  (`hyper_liveness::Liveness::on_wait`; the trace recorder has always kept only such waits): a
+  wake the owner came to late because its one thread was in its own write is the write's
+  lateness, which the sender's floor counts as `E[flush]`, not the timer's. Taken from every poll
+  past a wake, `G` was the owners' own stalls: 32–65 ms on macOS and 15–76 ms on Linux through the
+  stall `stalled-devices` orders, and 4.8–7.4 s in a run whose timer was late by milliseconds
+  (§2.9). A stop of the process or a
+  frozen host inside a wait does count: the OS ran nothing then, and the queues the waits feed saw
+  the delay; one such wait weighs `1/n` of `n`. Measured on
   2026-10-01 (`docs/benchmarks.md`, "Heartbeat traces"):
   - **macOS 26.4.1** (Apple M5 Max). A user thread's wait ends late by half its length plus about
     10 µs: 1 ms waits 0.51 ms late at the median, 10 ms waits 2.6–5 ms. This is XNU's timer
@@ -786,7 +795,7 @@ lateness, the stall's delay (§2.2; `PairReport::skipped` counts them).
   (`LinkEstimator::retime`), which kept a link whose flushes stalled now and then unconfigured for
   thousands of heartbeats (§2.9). A change within `G`, the configurator's resolution, is none.
   Bootstrap: the first heartbeat waits on the first flush, whose time is the first `E[flush]`; the
-  first wake measures `G`.
+  first wait for a wake that the owner reports measures `G` (§2.4).
 - **The interval the evidence needs** (`T_c`, measured online: §2.6 item 6 left it open). The
   estimator configures only once it has measured `τ_int` (§2.6, item 3), at Madras and Sokal's
   self-consistent window `m ≥ 6·τ̂(m)` among Allan levels of at least seven windows; heartbeats so
@@ -1019,7 +1028,8 @@ lateness, the stall's delay (§2.2; `PairReport::skipped` counts them).
 **The API** the core's suspicion-started elections (L-2) and the shell consume (`src/lib.rs`):
 `Liveness::new(Settings { local, run, max_peers, history })`, `run` the node's durable count of
 its starts; `attach`/`detach` a group's peer; `on_durable(write, started, durable)`; `on_heartbeat(from, message,
-arrival_ns, out)`; `poll(now, out)` and `wake()`, with `Output::{heartbeat, flush, change}`;
+arrival_ns, out)`; `on_wait(deadline, woke)`, a timed wait for `wake()` the owner began before it
+and the deadline ended (§2.4: what `G` is made of); `poll(now, out)` and `wake()`, with `Output::{heartbeat, flush, change}`;
 `Change::Suspected(Suspicion { peer, at_ns, noticed_ns, last: { seq, arrival_ns, due_ns, sent_ns },
 detection, detector })`, `Change::Trusted { peer, at_ns }` and `Change::Restarted { peer, at_ns }`;
 `trust(peer)`, `suspected()`,

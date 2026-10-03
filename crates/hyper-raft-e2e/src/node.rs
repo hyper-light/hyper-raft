@@ -337,12 +337,20 @@ impl Node {
             self.turn_most = self.turn_most.max(self.now().saturating_sub(read));
             // Woken at the core's deadline or the stream's, whichever is first; by a datagram
             // otherwise, the parent's going among them.
-            let until = [self.raw.deadline(), self.liveness.wake()]
-                .into_iter()
-                .flatten()
-                .min();
-            self.receive_until(until)?;
+            let wake = self.liveness.wake();
+            let until = [self.raw.deadline(), wake].into_iter().flatten().min();
+            let began = self.now();
+            let timed_out = self.receive_until(until)?;
             read = self.now();
+            // A wait for the stream's wake, begun before it and ended by it, is what its `G` is
+            // made of (`Liveness::on_wait`): the member's own work is no lateness of its timer.
+            if timed_out
+                && let Some(at) = wake
+                && until == Some(at)
+                && began < at
+            {
+                self.liveness.on_wait(at, read);
+            }
             self.live()?;
             self.measure()?;
             self.drive()?;
@@ -486,14 +494,15 @@ impl Node {
 
     /// Waits for a datagram until `until` on the member's clock, or for one however long when
     /// nothing is due, then takes what else has arrived without waiting, at most what one turn
-    /// of the loop takes before it drives the member again.
+    /// of the loop takes before it drives the member again. Whether it waited and the wait ended
+    /// on its timeout, no datagram having come.
     ///
     /// A member whose deadline is already due waits for nothing, but it still takes what has
     /// arrived: its peers' answers and heartbeats are what its commits and its detectors are made
     /// of. A member that skipped its socket when behind (as one on a loaded machine is, at every
     /// turn) acted deaf: on ticks, as leader it stepped down by its quorum check with its
     /// followers' answers waiting unread in its socket.
-    pub fn receive_until(&mut self, until: Option<u64>) -> Result<(), NodeError> {
+    pub fn receive_until(&mut self, until: Option<u64>) -> Result<bool, NodeError> {
         // A turn takes as many datagrams as the member has askers to answer and, from each
         // voter, a Raft message and a heartbeat, so that one busy peer never holds the others'
         // back past a turn; and the one it waited for, when it waited.
@@ -506,7 +515,7 @@ impl Node {
         if wait.is_none_or(|wait| !wait.is_zero()) {
             most = turn.saturating_add(1);
             if !wire::arrives(&self.socket, wait, &mut self.received)? {
-                return Ok(());
+                return Ok(true);
             }
         }
         // The datagram waited for is taken with the rest, none of them waited on: a receive that
@@ -524,7 +533,7 @@ impl Node {
             }
         }
         self.socket.set_nonblocking(false)?;
-        outcome
+        outcome.map(|()| false)
     }
 
     /// One datagram, if one is there; false when none is.

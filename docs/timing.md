@@ -402,14 +402,17 @@ copied) folded the error in seconds into an estimate documented and floored as a
 LAN every node's error sat at its floor of 0.05, 50 ms, and the confidence weights did nothing; it had
 eight dimensions against §5.2's finding that extra dimensions past three add nothing, a separate share
 of each step for the height, an adjustment term with its smoothing and an uncommented ±1 s clamp, and a
-gravity that multiplied every coordinate by 0.99 an update. Ledlie's gravity carries the unit its
-paper measured in, and the engine predicts only between coordinates a round old at most, which drift,
-a rigid motion, leaves alone: there is none. A sample's error is floored at the nanosecond a round trip
-is measured in, which keeps the estimate positive, and a height at it, which keeps the height
-positive (§5.4). Two fresh nodes at the origin separate along `u(0)`, drawn at random from each node's
-own seeded stream. A peer's coordinate that is not a number, or has a negative height or error, is not
-learned and moves nothing, and a sample that would leave the coordinate infinite or not a number (a
-peer's point so far out that the distance overflows) is not taken.
+gravity that multiplied every coordinate by 0.99 an update. There is no gravity: Ledlie's
+`G = (‖x_i‖/ρ)² × u(x_i)` is a dimensionless magnitude applied as a displacement in milliseconds, the
+unit its paper measured in, so no `ρ`, derived from a measured diameter or otherwise, makes it
+unit-free; and drift, a rigid motion of every coordinate, leaves every prediction between coordinates
+refreshed each round unchanged, which are the only predictions the engine makes. A sample's error is
+floored at the nanosecond a round trip is measured in, which keeps the estimate positive, and a height
+at it, which keeps the height positive (§5.4). Two fresh nodes at the origin separate along `u(0)`,
+drawn at random from each node's own seeded stream. A peer's coordinate that is not a number, or has
+a negative height or error, is not learned and moves nothing, and a sample that would leave the
+coordinate infinite or not a number (a peer's point so far out that the distance overflows) is not
+taken.
 
 **Death.** A suspected peer is told by the member's next probe of it, which carries the suspicion
 (Lifeguard's buddy system); if that probe too goes unanswered, the peer is condemned at the next
@@ -533,29 +536,47 @@ clock from the victim's last answer. The first kill comes within a few hundred m
 start, when most pairs are judged by the pools, and the test had only it: three local runs ended with
 none of the twelve pairs judged by its own estimator, so the end-to-end test never killed under a
 pair's own detector. The second phase is that kill; it is a longer run, which waits for the pairs' own
-evidence rather than a duration, and under a throttle that keeps a pair's round trips too correlated
-for `τ_int` to be measured it waits for as long as that lasts. A peer a member forgot after its
-death reports as forgotten, and a member keeps what its detector reported of each peer across the
-peer's being forgotten and adopted again. Of live members it asserts what the configuration promises,
-each pair's counts taken while its peer lived: Theorem 7 bounds the expected number of
-suspicions and of condemnations by `Σβ`, and a run refutes that only when the 95 % lower limit of
-its count (the Poisson score interval, as the replay and the trace analyser use, §2.6) passes it. A
-first form asserted the count itself within `Σβ`, which no detector can promise of one run: at an
-allowance of 1.8, two mistakes are ordinary, and twelve runs in a hundred at one CPU failed so while
-the series as a whole kept far inside its bound. The rule itself refutes a bound that holds with
-probability at most 2.5 % an assertion, under the Poisson model the replay uses; on unloaded hosts
-the runs' counts are far below their allowance and it does not arise. A member whose supervisor is
-gone ends when its report cannot be written.
+evidence rather than a duration. Each wait goes on while the members move toward its fact, as
+hyper-liveness's process test does: a pair's judgement, its own configuration and the round trips it
+takes toward it, a victim's state in each survivor's view. Once a quiet period passes with nothing
+moving, the longest detection bound a live member states and never less than RFC 6298's one-second
+retransmission timeout, the wait fails with every member's last line: every step a wait waits on is
+stated within one probe spacing and two periods of the one before, and the bound spans two spacings
+and a period. A pair that takes more round trips without its own configuration than any window of
+its estimator holds (`WINDOW_LIMIT`) fails the wait at once, so a throttle that keeps a pair's round
+trips too correlated for `τ_int` to be measured no longer holds it for as long as that lasts; so does
+a member whose output ends, its process exited, unless the supervisor killed it. Before, a wait ended
+only on its fact, and nothing but CI's job limit bounded one that never came. A peer a member forgot
+after its death reports as forgotten, and a member keeps what its detector reported of each peer
+across the peer's being forgotten and adopted again. Of live members it asserts what the
+configuration promises, each pair's counts taken while its peer lived: Theorem 7 bounds the expected
+number of suspicions and of condemnations by `Σβ`, and a run refutes that only when the 95 % lower
+limit of its count (the Poisson score interval, as the replay and the trace analyser use, §2.6)
+passes it. A first form asserted the count itself within `Σβ`, which no detector can promise of one
+run: at an allowance of 1.8, two mistakes are ordinary, and twelve runs in a hundred at one CPU
+failed so while the series as a whole kept far inside its bound. The rule itself refutes a bound that
+holds with probability at most 2.5 % an assertion, under the Poisson model the replay uses; on
+unloaded hosts the runs' counts are far below their allowance and it does not arise. A member whose
+supervisor is gone ends when its report cannot be written.
 
 **Measured** (`docs/benchmarks.md`, "hyper-swim"): on loopback a period is 0.1–1 ms, `μ` 60–100 µs
 and `α` growing from about 0.3 ms with the MTBF; a period costs no allocation and less time than
-slates' at every point; 2,000 runs of the cluster test on macOS and on Linux at one, two and four
-CPUs with busy loops beside them all passed, detection a median 4 ms on macOS and 16–18 ms in
-Docker's VM after the victim's last answer. Open: §3, item 1 governs the probe rate too, since a
-period is its probe's deadline and nothing yet prices a probe, and as the MTBF grows the margins and
-so the periods grow with it; two members cannot condemn each other, as neither can tell its own
-failure from the other's; the pool's mean is wrong for a pair far from the member's others until
-that pair configures; and the allowance is loose while a history is young (§3, item 3).
+slates' at every point; 2,000 runs of the one-kill cluster test on macOS and on Linux at one, two and
+four CPUs with busy loops beside them all passed, detection a median 4 ms on macOS and 16–18 ms in
+Docker's VM after the victim's last answer; 300 runs of the two-phase form on macOS, two failing on
+the split below. Open: §3, item 1 governs the probe rate too, since a period is its probe's deadline
+and nothing yet prices a probe, and as the MTBF grows the margins and so the periods grow with it;
+two members cannot condemn each other, as neither can tell its own failure from the other's; the
+pool's mean is wrong for a pair far from the member's others until that pair configures; the
+allowance is loose while a history is young (§3, item 3); and a refutation can miss a member. A
+live member falsely condemned refutes, and its refutation is a rumor, sent `T` times by each member
+that adopts it and then dropped, which can end known to some members and not all (Demers et al.
+1987, §1.5, `docs/research/swim.md`): a member it misses holds the live member dead, past the
+record's window forgets it, and nothing tells it again, though the live member probes it every
+round. Demers et al. back a rumor up with anti-entropy, each site resolving every difference with
+another chosen at random, and memberlist exchanges its whole state with one member every 30 s, a
+chosen number; hyper-swim has neither yet. The cluster test's second phase, which waits on every
+surviving pair, found it twice in 300 runs (`docs/benchmarks.md`, "The cluster test").
 
 ### 2.8 The node-pair stream (L-3)
 

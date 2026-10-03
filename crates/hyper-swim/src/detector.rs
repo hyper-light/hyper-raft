@@ -1053,6 +1053,13 @@ impl Detector {
         })
     }
 
+    /// The round trips the pair's own estimator has taken of `peer`: the evidence it gathers
+    /// toward its own configuration, whose longest window, `hyper_timing::WINDOW_LIMIT`, bounds
+    /// what a configuration can need.
+    pub fn round_trips_taken(&self, peer: HostId) -> Option<u64> {
+        self.peers.get(&peer).map(|held| held.stream.samples)
+    }
+
     /// The verdict that times this member's probes of `peer` now: the pair's, else the pool's.
     pub fn verdict(&self, peer: HostId) -> Option<Verdict> {
         self.peers

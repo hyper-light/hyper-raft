@@ -103,6 +103,11 @@
   - The supervisor starts them together, waits until every member judges every peer by a
     configured verdict, and SIGKILLs one; once every survivor holds it dead, it waits until every
     surviving pair is judged by its own estimator, and SIGKILLs another.
+  - Each wait goes on while the members move toward its fact, and fails with every member's last
+    line once the longest detection bound a live member states (never less than RFC 6298's one
+    second) passes with nothing moving; a pair that takes more round trips without its own
+    configuration than any window of its estimator holds (`hyper_timing::WINDOW_LIMIT`), or a
+    member whose process exits, fails it at once.
   - Every survivor must hold each victim dead within the detection bound its own detector stated.
   - Suspicions and condemnations of live members, summed over the cluster, must stay within the
     configured detectors' allowance `Σβ`.

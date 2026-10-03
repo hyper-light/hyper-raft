@@ -1894,6 +1894,44 @@ median 0.58 s, the longest 5.0 s, waiting on the pairs' evidence. Detection unde
 estimators is slower than under the pools': each pair's margin is configured at its own interval and
 grows with the MTBF the run has accrued (§2.7, "Open").
 
+**Bounded waits (2026-10-03).** Each wait now goes on while the members move toward its fact and
+fails with every member's last line once the longest detection bound a live member states, never
+less than RFC 6298's one second, passes with nothing moving; a pair that takes more round trips
+without its own configuration than any window of its estimator holds, or a member whose output
+ends, fails it at once (`docs/timing.md` §2.7). Each way of failing was checked with a fault put
+into a member for the check and taken out after: a member made to exit at its 200th period failed
+the wait at once with its exit status; one made to hang failed it 1.0 s after the last movement,
+with its own last line 1.5 s old; and the limit lowered to 16 round trips failed it at the first
+pair past it. 300 runs on this machine, each a fresh supervisor, 2026-10-03 at 01:09–01:12 PDT,
+load 21.9–40.7, 298 passing:
+
+| Wait | Median | p95 | Max |
+|---|---|---|---|
+| every member judges every peer | 9.1 ms | 35.7 ms | 218.3 ms |
+| every survivor holds the first victim dead | 4.2 ms | 8.2 ms | 22.8 ms |
+| every surviving pair is judged by its own estimator | 378.3 ms | 1,151.7 ms | 3,843.3 ms |
+| every survivor holds both victims dead | 11.8 ms | 24.5 ms | 105.7 ms |
+
+The longest any wait that held went with nothing moving was 44.9 ms, 4.5 % of its quiet period,
+the one-second floor at every wait's stillest stretch (a median 2.1 ms). At the first kill a mean
+of 1.1 of the 20 pairs were judged by their own estimator, at most 9, and detection took 4.2 / 8.3 /
+28.9 ms (median / p95 / max) against stated bounds of a median 19.5 and at most 202.0 ms; at the
+second, 12 of 12, detection 12.0 / 24.1 / 113.8 ms against 64.7 and 809.5 ms. Suspicions of live
+members, summed over the runs that passed, 114 (Theorem 7 allowed 41,182), condemnations 80
+(allowed 40,481). A run took a median 0.45 s, the longest 4.0 s.
+
+The two that failed each failed the wait for every surviving pair judged by its own estimator, one
+second after anything last moved, and their last lines say why: a live member had been falsely
+condemned, in both by the first victim before its kill, had refuted, and one survivor had
+missed the refutation, held it dead and, past the record's window, forgotten it. The others held it
+alive and it probed every member, but nothing told the one that forgot it again. A further 819 runs
+of a build that also printed each member's view as it changed (for the trace, not committed) failed
+once the same way: member 4 condemned member 1 at incarnation 4 after member 1 had refuted at 5;
+the refutation reached members 2, 3 and 5 and not member 4, which forgot member 1 17 ms later. A
+refutation is a rumor, and a rumor can end known to some members and not all (Demers et al. 1987,
+§1.5); hyper-swim has no anti-entropy to back it up, which is open (`docs/timing.md` §2.7). Before
+the waits were bounded, such a run waited until CI's job limit.
+
 ## Commands for the detector
 
 ```sh

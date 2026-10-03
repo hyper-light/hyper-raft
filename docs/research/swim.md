@@ -52,8 +52,37 @@ Detection", arXiv 1707.00788 (2018).**
 - `DeadNodeReclaimTime` (0 by default, never): when a dead node's name may be taken by another
   address.
 - `retransmitLimit`: `RetransmitMult` (4) × `⌈log10(n + 1)⌉`.
+- `PushPullInterval` (checked 2026-10-03), 30 s in the LAN configuration, 60 s WAN, 15 s local: "the
+  interval between complete state syncs. Complete state syncs are done with a single node over TCP
+  and are quite expensive relative to standard gossiped messages." `pushPull` picks one node at
+  random among those it holds alive; `mergeState` applies the remote states through the same alive,
+  suspect and dead handlers as gossip, a remote dead or suspect as a suspicion.
 - Left: the 30 s and the multiplier are chosen, and the reap does not depend on what gossip can still
   carry.
+
+**Demers, Greene, Hauser, Irish, Larson, Shenker, Sturgis, Swinehart, Terry, "Epidemic Algorithms
+for Replicated Database Maintenance", PODC 1987 (checked 2026-10-03).**
+
+- §1.4, "Complex Epidemics": rumor mongering with a counter, a site "remaining infective for k
+  cycles independent of any feedback", and its other variations "share the same fundamental
+  relationship between traffic and residue: `s = e^{−m}`", `m` the updates sent a site, since a
+  site misses all `nm` of them with chance `(1 − 1/n)^{nm}`. SWIM's piggybacked update, sent
+  `λ log n` times and then dropped, is such a rumor: at `m` = 3, a twentieth of the members in this
+  model.
+- §1.5, "Backing Up a Complex Epidemic with Anti-entropy": "a complex epidemic can fail: that is,
+  there is a nonzero probability that the number of infective sites will fall to zero while some
+  sites remain susceptible. This event can be made extremely unlikely; nevertheless, if it occurs,
+  the system will be in a stable state in which an update is known by some, but not all, sites. To
+  eliminate this possibility, anti-entropy can be run infrequently to back up a complex epidemic
+  [...] This ensures with probability 1 that every update eventually reaches (or is superseded at)
+  every site." Anti-entropy: each site regularly chooses another at random and the two resolve every
+  difference between their contents.
+- §3: "the need to back up rumor mongering with anti-entropy to guarantee complete coverage".
+- Left open: how often anti-entropy runs; the paper's exchanges whole databases.
+- What it settles here: a refutation is an update like any other, and the cluster test found the
+  stable state §1.5 names (`docs/benchmarks.md`, "The cluster test"): a live member's refutation
+  known to every member but one, which held it dead and, past the record's window, forgot it.
+  hyper-swim has no anti-entropy yet (`docs/timing.md` §2.7, open).
 
 **Derived here (2026-10-02): how long a dead member's record is kept, and what bounds the view.**
 

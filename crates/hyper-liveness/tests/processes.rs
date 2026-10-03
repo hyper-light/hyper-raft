@@ -10,8 +10,12 @@
 //! its own device thread (one thread, writing and flushing one file: `fdatasync` on Linux,
 //! `F_FULLFSYNC` on macOS, `FlushFileBuffers` on Windows, through std), and charges each detector
 //! the election the library's law gives over the round trips its streams measured. It reports what
-//! the crate reports. The test times nothing of its own and derives no bound. The supervisor waits
-//! on facts:
+//! the crate reports, its disk's state and its flushes. The test times nothing of its own and
+//! derives no bound. The supervisor waits on facts, each for as long as the members move toward
+//! it: a quiet period derived from what they state (the longest of their judged pairs' `η + α`
+//! and their unjudged pairs' intervals, past their longest flush, their wakes' lateness and their
+//! reporting period) that passes with nothing moving fails the wait with every member's last
+//! state, as hyper-durable-e2e's waits do; a wait for a disk on one flush is the disk's, and goes on:
 //! - every member's every pair configured; then it stalls one member's disk (its device thread
 //!   stops completing flushes, as a disk that stops does) and waits for every other member to
 //!   suspect it, each within the bound its detector stated, measured from the stalled member's
@@ -56,7 +60,7 @@ use std::time::Duration;
 
 use hyper_datagram::{AdmitAll, ExporterSecret, Plane, PlaneLimits, Role, SECRET_BYTES};
 use hyper_liveness::{Change, Liveness, Output, PeerId, Settings, Write, is_liveness};
-use hyper_timing::{Ballot, Exposure, Trust, poisson95};
+use hyper_timing::{Ballot, Exposure, Trust, WINDOW_LIMIT, poisson95};
 use hyper_tokio::{Clock, Io, PlaneSocket};
 
 /// Members: one whose disk stalls, one killed, and two that watch both.
@@ -76,6 +80,11 @@ fn secret_between(a: u64, b: u64) -> ExporterSecret {
     bytes[8..16].copy_from_slice(&high.to_le_bytes());
     ExporterSecret::new(bytes)
 }
+
+/// What the device thread sends the owner's wake socket: a flush completed, or the disk stopped.
+/// The supervisor's commands are longer.
+const COMPLETED: u8 = 0;
+const STOPPED: u8 = 1;
 
 /// The member's disk: one thread writing and flushing one file, a request at a time.
 enum Request {
@@ -114,10 +123,11 @@ fn device(
                     return;
                 }
                 // A wake for the owner; lost only if the owner is gone.
-                let _ = wake.send(&[0]);
+                let _ = wake.send(&[COMPLETED]);
             }
             Request::Stall => {
-                // A disk that stopped: the thread holds its last request for ever.
+                // A disk that stopped: the thread says so, then holds its last request for ever.
+                let _ = wake.send(&[STOPPED]);
                 let (_keep, never) = sync_channel::<()>(0);
                 let _ = never.recv();
                 return;
@@ -157,27 +167,28 @@ fn member_process() {
         return;
     };
     let me: u64 = me.parse().unwrap();
-    let ports: Vec<u16> = std::env::var("HYPER_LIVENESS_PORTS")
+    let nodes: u64 = std::env::var("HYPER_LIVENESS_NODES")
         .unwrap()
-        .split(',')
-        .map(|port| port.parse().unwrap())
-        .collect();
+        .parse()
+        .unwrap();
     let file = std::path::PathBuf::from(std::env::var("HYPER_LIVENESS_FILE").unwrap());
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .unwrap();
-    runtime.block_on(member(me, ports, file));
+    runtime.block_on(member(me, nodes, file));
 }
 
 #[allow(
     clippy::disallowed_methods,
     reason = "real processes on the host's clock, threads and environment (CLAUDE.md §1a, end to end)"
 )]
-async fn member(me: u64, ports: Vec<u16>, file: std::path::PathBuf) {
-    let address = |id: u64| SocketAddr::from(([127, 0, 0, 1], ports[(id - 1) as usize]));
-    let nodes = ports.len() as u64;
-    let mut socket = PlaneSocket::bind(address(me), Io { batch: 64 }).unwrap();
+async fn member(me: u64, nodes: u64, file: std::path::PathBuf) {
+    // Its own port, the system's choice: a port picked for it and released could be taken in
+    // between, by another group's member as two supervisors start at once.
+    let mut socket =
+        PlaneSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0)), Io { batch: 64 }).unwrap();
+    let port = socket.local_addr().unwrap().port();
     let clock = *socket.clock();
     let mut plane = Plane::new(
         me,
@@ -213,23 +224,41 @@ async fn member(me: u64, ports: Vec<u16>, file: std::path::PathBuf) {
     let wake = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let waker = UdpSocket::bind("127.0.0.1:0").unwrap();
     waker.connect(wake.local_addr().unwrap()).unwrap();
-    let (requests, requested) = sync_channel::<Request>(1);
+    // Room for the most requests ever outstanding: the one flush the owner keeps in flight, and
+    // the stall. With room for one, a stall that came while a flush waited for the device thread
+    // was refused and lost, and the member's disk never stopped.
+    let (requests, requested) = sync_channel::<Request>(2);
     let (done, completions) = sync_channel::<(u64, u64)>(1);
     std::thread::spawn(move || device(file, requested, done, waker));
 
     let mut stdout = std::io::stdout();
-    if writeln!(stdout, "ready {me} {}", wake.local_addr().unwrap().port())
-        .and_then(|()| stdout.flush())
-        .is_err()
+    if writeln!(
+        stdout,
+        "ready {me} {} {port}",
+        wake.local_addr().unwrap().port()
+    )
+    .and_then(|()| stdout.flush())
+    .is_err()
     {
         return;
     }
+    // Told to start with every member's port.
     let mut start = String::new();
     if !matches!(std::io::stdin().read_line(&mut start), Ok(read) if read > 0) {
         return;
     }
+    let ports: Vec<u16> = start
+        .trim()
+        .trim_start_matches("start ")
+        .split(',')
+        .map(|port| port.parse().unwrap())
+        .collect();
+    let address = |id: u64| SocketAddr::from(([127, 0, 0, 1], ports[(id - 1) as usize]));
 
-    let mut flushing = false;
+    // When the flush in flight was asked for, on the host clock.
+    let mut flight: Option<u64> = None;
+    let mut disk = Disk::Running;
+    let mut flush_most = 0u64;
     let mut reported_at = 0u64;
     let mut heard_all = false;
     let mut command = [0u8; 16];
@@ -241,14 +270,14 @@ async fn member(me: u64, ports: Vec<u16>, file: std::path::PathBuf) {
     };
     liveness.poll(clock.now_ns(), &mut first);
     if first.flush && requests.try_send(Request::Flush).is_ok() {
-        flushing = true;
+        flight = Some(clock.now_ns());
     }
     loop {
         // Wait for a datagram, a completion or a command, or the crate's wake.
         let deadline = liveness.wake().map(|at| {
             tokio::time::Instant::now() + Duration::from_nanos(at.saturating_sub(clock.now_ns()))
         });
-        let mut stall = false;
+        let mut woke_with = None;
         // What arrived, stamped by the kernel: fed before anything is judged at `now`.
         let mut inbox: Vec<(u64, u64, Vec<u8>)> = Vec::new();
         {
@@ -268,7 +297,7 @@ async fn member(me: u64, ports: Vec<u16>, file: std::path::PathBuf) {
             });
             poll_fn(|context| {
                 if let Poll::Ready(result) = woken.as_mut().poll(context) {
-                    stall = matches!(result, Ok(length) if length > 1);
+                    woke_with = result.ok();
                     return Poll::Ready(());
                 }
                 if receive.as_mut().poll(context).is_ready()
@@ -280,8 +309,20 @@ async fn member(me: u64, ports: Vec<u16>, file: std::path::PathBuf) {
             })
             .await;
         }
+        let stall = match woke_with {
+            Some(1) if command[0] == STOPPED => {
+                disk = Disk::Stopped;
+                false
+            }
+            Some(length) => length > 1,
+            None => false,
+        };
         if stall {
-            let _ = requests.try_send(Request::Stall);
+            disk = if requests.try_send(Request::Stall).is_ok() {
+                Disk::Asked
+            } else {
+                Disk::Refused
+            };
             continue;
         }
         let mut asked = Asked {
@@ -302,19 +343,26 @@ async fn member(me: u64, ports: Vec<u16>, file: std::path::PathBuf) {
             let _ = liveness.on_heartbeat(*from, message, *at, &mut asked);
         }
         while let Ok((started, durable)) = completions.try_recv() {
-            flushing = false;
+            flight = None;
+            flush_most = flush_most.max(durable.saturating_sub(started));
             liveness.on_durable(Write::Liveness, started, durable);
         }
         let now = clock.now_ns();
         liveness.poll(now, &mut asked);
-        if asked.flush && !flushing && requests.try_send(Request::Flush).is_ok() {
-            flushing = true;
+        if asked.flush && flight.is_none() && requests.try_send(Request::Flush).is_ok() {
+            flight = Some(now);
         }
         let changes = std::mem::take(&mut asked.changes);
         socket.flush(&mut plane, |peer| Some(address(peer)), |_, _| {});
         elect(&mut liveness, &peers);
-        if report(
+        let member = Member {
             me,
+            disk,
+            flight,
+            flush_most,
+        };
+        if report(
+            &member,
             &liveness,
             &peers,
             &changes,
@@ -381,11 +429,45 @@ fn elect(liveness: &mut Liveness, peers: &[u64]) {
     }
 }
 
-/// A line for each suspicion as it happens, and a state line with each change and otherwise at
-/// most every 100 ms of the host clock, which bounds the pipe's traffic; the supervisor waits on
-/// what they say, not on the period.
-fn report(
+/// What the member's disk is doing, as its owner knows it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Disk {
+    Running,
+    /// Told to stop, the stop queued for the device thread behind any flush in flight.
+    Asked,
+    /// Told to stop, and the device thread's queue full: the stop was not taken, which its room
+    /// for every request outstanding rules out.
+    Refused,
+    /// The device thread said it stopped.
+    Stopped,
+}
+
+impl Disk {
+    fn letter(self) -> char {
+        match self {
+            Self::Running => 'R',
+            Self::Asked => 'A',
+            Self::Refused => 'X',
+            Self::Stopped => 'S',
+        }
+    }
+}
+
+/// The member's own state beside its stream's, for its report.
+struct Member {
     me: u64,
+    disk: Disk,
+    /// When the flush in flight was asked for, on the host clock.
+    flight: Option<u64>,
+    /// The longest flush its disk has taken, nanoseconds.
+    flush_most: u64,
+}
+
+/// A line for each suspicion as it happens, and a state line with each change and otherwise once
+/// the member's shortest interval has passed since the last (its floor before any pair has one),
+/// the soonest its evidence can move again; the supervisor waits on what they say.
+fn report(
+    member: &Member,
     liveness: &Liveness,
     peers: &[u64],
     changes: &[Change],
@@ -393,6 +475,8 @@ fn report(
     reported_at: &mut u64,
     out: &mut impl std::io::Write,
 ) -> std::io::Result<()> {
+    let nanos = |d: Duration| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX);
+    let me = member.me;
     for change in changes {
         if let Change::Suspected(suspicion) = change {
             let last = suspicion.last;
@@ -403,30 +487,47 @@ fn report(
                 suspicion.at_ns,
                 last.map_or(0, |l| l.due_ns),
                 last.map_or(0, |l| l.sent_ns),
-                suspicion.detection.map_or(0, |d| d.as_nanos() as u64),
+                suspicion.detection.map_or(0, nanos),
                 suspicion.noticed_ns,
-                liveness.latest_wake(suspicion.noticed_ns).as_nanos() as u64,
+                nanos(liveness.latest_wake(suspicion.noticed_ns)),
             )?;
         }
     }
-    if changes.is_empty() && now < reported_at.saturating_add(100_000_000) {
+    let period = peers
+        .iter()
+        .filter_map(|peer| liveness.report(*peer).and_then(|r| r.interval))
+        .min()
+        .or_else(|| liveness.floor())
+        .map_or(0, nanos);
+    if changes.is_empty() && now < reported_at.saturating_add(period) {
         return out.flush();
     }
     *reported_at = now;
-    let mut line = format!("state {me} {now}");
+    let mut line = format!(
+        "state {me} {now} {} {} {} {} {}",
+        member.disk.letter(),
+        member.flight.unwrap_or(0),
+        liveness.floor().map_or(0, nanos),
+        member.flush_most,
+        nanos(liveness.latest_wake(now)),
+    );
     for peer in peers {
         let report = liveness.report(*peer).unwrap_or_default();
-        let trust = match liveness.trust(*peer) {
-            Some(Trust::Trusted { .. }) => 'T',
-            Some(Trust::Suspected) => 'S',
-            _ => 'U',
+        let (trust, until) = match liveness.trust(*peer) {
+            Some(Trust::Trusted { until_ns }) => ('T', until_ns),
+            Some(Trust::Suspected) => ('S', 0),
+            _ => ('U', 0),
         };
         line.push_str(&format!(
-            " {peer}:{trust}:{}:{}:{}:{}",
+            " {peer}:{trust}:{}:{}:{}:{}:{}:{}:{}:{}:{until}",
             u8::from(report.configured),
+            u8::from(report.judged),
             report.suspicions,
             report.allowance,
             report.taken,
+            report.sent,
+            report.interval.map_or(0, nanos),
+            report.freshness.map_or(0, nanos),
         ));
     }
     writeln!(out, "{line}")?;
@@ -445,13 +546,38 @@ impl Drop for Members {
     }
 }
 
-/// What a member last reported of one peer.
+/// What a member last stated of one peer.
 #[derive(Clone, Copy, Debug, Default)]
 struct Seen {
     trust: char,
     configured: bool,
+    judged: bool,
     suspicions: u64,
     allowance: f64,
+    taken: u64,
+    sent: u64,
+    /// The interval the peer's heartbeats come at, and `η + α` while a margin judges, nanoseconds.
+    interval: u64,
+    freshness: u64,
+    /// The freshness point the member trusts the peer to, while it does.
+    until: u64,
+}
+
+/// A member's latest state line.
+#[derive(Clone, Debug, Default)]
+struct Stated {
+    /// When the member wrote it, on the host clock.
+    at: u64,
+    /// Its disk (`Disk::letter`), and when the flush in flight was asked for (zero for none), on
+    /// the host clock.
+    disk: char,
+    flight: u64,
+    /// Its floor `E[flush] + G`, its longest flush, and the latest its wakes came past what they
+    /// asked, nanoseconds.
+    floor: u64,
+    flush_most: u64,
+    late: u64,
+    peers: BTreeMap<u64, Seen>,
 }
 
 /// A suspicion a member reported.
@@ -468,7 +594,7 @@ struct Suspected {
 }
 
 enum Line {
-    State(u64, u64, BTreeMap<u64, Seen>),
+    State(u64, Stated),
     Suspect(u64, u64, Suspected),
     Heard(u64),
 }
@@ -478,24 +604,50 @@ fn parse(line: &str) -> Option<Line> {
     match fields.next()? {
         "state" => {
             let member = fields.next()?.parse().ok()?;
-            let now = fields.next()?.parse().ok()?;
-            let mut peers = BTreeMap::new();
+            let mut stated = Stated {
+                at: fields.next()?.parse().ok()?,
+                disk: fields.next()?.chars().next()?,
+                flight: fields.next()?.parse().ok()?,
+                floor: fields.next()?.parse().ok()?,
+                flush_most: fields.next()?.parse().ok()?,
+                late: fields.next()?.parse().ok()?,
+                peers: BTreeMap::new(),
+            };
             for field in fields {
                 let parts: Vec<&str> = field.split(':').collect();
-                let [peer, trust, configured, suspicions, allowance, _taken] = parts[..] else {
+                let [
+                    peer,
+                    trust,
+                    configured,
+                    judged,
+                    suspicions,
+                    allowance,
+                    taken,
+                    sent,
+                    interval,
+                    freshness,
+                    until,
+                ] = parts[..]
+                else {
                     return None;
                 };
-                peers.insert(
+                stated.peers.insert(
                     peer.parse().ok()?,
                     Seen {
                         trust: trust.chars().next()?,
                         configured: configured == "1",
+                        judged: judged == "1",
                         suspicions: suspicions.parse().ok()?,
                         allowance: allowance.parse().ok()?,
+                        taken: taken.parse().ok()?,
+                        sent: sent.parse().ok()?,
+                        interval: interval.parse().ok()?,
+                        freshness: freshness.parse().ok()?,
+                        until: until.parse().ok()?,
                     },
                 );
             }
-            Some(Line::State(member, now, peers))
+            Some(Line::State(member, stated))
         }
         "suspect" => {
             let numbers: Vec<u64> = fields.map(|f| f.parse().ok()).collect::<Option<_>>()?;
@@ -520,24 +672,18 @@ fn parse(line: &str) -> Option<Line> {
     }
 }
 
-/// Free loopback ports, one per member: bound, read and released.
-fn free_ports(nodes: u64) -> Vec<u16> {
-    let sockets: Vec<UdpSocket> = (0..nodes)
-        .map(|_| UdpSocket::bind("127.0.0.1:0").unwrap())
-        .collect();
-    sockets
-        .iter()
-        .map(|socket| socket.local_addr().unwrap().port())
-        .collect()
-}
+/// RFC 6298 §2.1 and §2.4: the retransmission timeout before any round trip is measured, and the
+/// least it is ever set to after, one second: the quiet period before any member has stated a law
+/// (hyper-durable-e2e's waits take it so).
+const RTO: Duration = Duration::from_secs(1);
 
 struct Supervisor {
     lines: std::sync::mpsc::Receiver<String>,
+    /// The host's monotonic clock, which every member's lines are stated on.
+    clock: Clock,
     /// Every member line echoed to stderr (`HYPER_LIVENESS_TRACE`), for a run to be read whole.
     trace: bool,
-    latest: BTreeMap<u64, BTreeMap<u64, Seen>>,
-    /// When each member's latest state line was written, on the host clock.
-    stated: BTreeMap<u64, u64>,
+    latest: BTreeMap<u64, Stated>,
     suspicions: Vec<(u64, u64, Suspected)>,
     /// The members that said they heard every peer and sent to each.
     heard: Vec<u64>,
@@ -547,21 +693,28 @@ struct Supervisor {
 }
 
 impl Supervisor {
-    /// The next line any member reports, folded in.
-    fn next(&mut self) {
-        let line = self.lines.recv().expect("every member stopped reporting");
+    /// The next line any member reports within `left`, folded in; nothing, past it.
+    fn next(&mut self, left: Duration, what: &str) {
+        let line = match self.lines.recv_timeout(left) {
+            Ok(line) => line,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => return,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                panic!("{what}: every member stopped reporting\n{}", self.dump())
+            }
+        };
         if self.trace {
             eprintln!("{line}");
         }
         match parse(&line) {
-            Some(Line::State(member, now, peers)) => {
-                for (peer, seen) in &peers {
+            Some(Line::State(member, stated)) => {
+                for (peer, seen) in &stated.peers {
                     if seen.configured {
-                        self.configured_since.entry((member, *peer)).or_insert(now);
+                        self.configured_since
+                            .entry((member, *peer))
+                            .or_insert(stated.at);
                     }
                 }
-                self.latest.insert(member, peers);
-                self.stated.insert(member, now);
+                self.latest.insert(member, stated);
             }
             Some(Line::Suspect(member, peer, suspected)) => {
                 self.suspicions.push((member, peer, suspected));
@@ -571,21 +724,192 @@ impl Supervisor {
         }
     }
 
-    /// Waits until `fact` holds of what the members reported.
-    fn until(&mut self, fact: impl Fn(&Self) -> bool) {
-        while !fact(self) {
-            self.next();
+    /// How long the members may go with nothing moving before a wait gives up: the longest any
+    /// member's law lets its evidence go still, from its latest state. A judged pair suspects a
+    /// peer gone silent within `η + α` of its last heartbeat's expected arrival, an unjudged one
+    /// takes a heartbeat each interval while its peer lives; a heartbeat waits for the flush that
+    /// proves it, the longest the member's disk has taken; a poll comes up to the latest its wakes
+    /// were late; and a state is stated at least once a reporting period, the member's shortest
+    /// interval. Never less than a retransmission timeout, the wait before any member states one.
+    fn quiet(&self) -> Duration {
+        let law = self
+            .latest
+            .values()
+            .map(|stated| {
+                let evidence = stated
+                    .peers
+                    .values()
+                    .map(|seen| {
+                        if seen.judged {
+                            seen.freshness
+                        } else {
+                            seen.interval
+                        }
+                    })
+                    .max()
+                    .unwrap_or(0);
+                let period = stated
+                    .peers
+                    .values()
+                    .map(|seen| seen.interval)
+                    .filter(|interval| *interval > 0)
+                    .min()
+                    .unwrap_or(stated.floor);
+                evidence
+                    .saturating_add(stated.flush_most)
+                    .saturating_add(stated.late)
+                    .saturating_add(period)
+            })
+            .max()
+            .unwrap_or(0);
+        Duration::from_nanos(law).max(RTO)
+    }
+
+    /// What moves the members toward a wait's fact: each peer's trust, judgement, configuration
+    /// and suspicions, the heartbeats taken on pairs not yet configured (the evidence they gather
+    /// toward it), each disk, and the suspicions and arrivals reported. A configured pair's
+    /// heartbeats are not progress: a peer that stops sending is then suspected within the law.
+    fn signature(&self) -> Vec<u64> {
+        let mut out = Vec::new();
+        for (member, stated) in &self.latest {
+            out.extend([*member, u64::from(u32::from(stated.disk))]);
+            for (peer, seen) in &stated.peers {
+                out.extend([
+                    *peer,
+                    u64::from(u32::from(seen.trust)),
+                    u64::from(seen.judged),
+                    u64::from(seen.configured),
+                    seen.suspicions,
+                    if seen.configured { 0 } else { seen.taken },
+                ]);
+            }
         }
+        out.extend([self.suspicions.len() as u64, self.heard.len() as u64]);
+        out
+    }
+
+    /// A pair that has taken more heartbeats unconfigured than any window holds
+    /// (`hyper_timing::WINDOW_LIMIT`): a link whose correlation no window of it resolves, which
+    /// the crate's moves to the interval its evidence needs exist to prevent.
+    fn unresolved(&self) -> Option<(u64, u64, u64)> {
+        self.latest.iter().find_map(|(member, stated)| {
+            stated.peers.iter().find_map(|(peer, seen)| {
+                (!seen.configured && seen.taken > WINDOW_LIMIT)
+                    .then_some((*member, *peer, seen.taken))
+            })
+        })
+    }
+
+    /// Waits until `fact` holds of what the members stated, while they move toward it. Fails
+    /// with every member's last state once a quiet period passes with nothing moving, or once a
+    /// pair takes more heartbeats unconfigured than any window holds. A quiet period through which
+    /// a member whose disk runs waited on one flush is that disk's, not the members' law: the
+    /// slowest part of a member's law is its flush, which it measures only once the flush
+    /// completes. The wait goes on, saying on stderr what it waits for.
+    fn until(&mut self, what: &str, fact: impl Fn(&Self) -> bool) {
+        let mut seen = self.signature();
+        let mut moved_at = self.clock.now_ns();
+        while !fact(self) {
+            let quiet = u64::try_from(self.quiet().as_nanos()).unwrap_or(u64::MAX);
+            let now = self.clock.now_ns();
+            let left = moved_at.saturating_add(quiet).saturating_sub(now);
+            if left == 0 {
+                let on_disk = self.latest.values().any(|stated| {
+                    matches!(stated.disk, 'R' | 'X')
+                        && stated.flight != 0
+                        && stated.flight <= moved_at
+                });
+                assert!(
+                    on_disk,
+                    "{what}: nothing moved for {:?}\n{}",
+                    self.quiet(),
+                    self.dump()
+                );
+                eprintln!("{what}: waiting on a flush\n{}", self.dump());
+                moved_at = now;
+                continue;
+            }
+            self.next(Duration::from_nanos(left), what);
+            if let Some((member, peer, taken)) = self.unresolved() {
+                panic!(
+                    "{what}: member {member} took {taken} heartbeats from {peer} unconfigured, \
+                     more than any window holds\n{}",
+                    self.dump()
+                );
+            }
+            let now = self.signature();
+            if now != seen {
+                seen = now;
+                moved_at = self.clock.now_ns();
+            }
+        }
+    }
+
+    /// Every member's last state and the suspicions reported, for a wait that failed.
+    fn dump(&self) -> String {
+        let now = self.clock.now_ns();
+        let ms = |ns: u64| ns as f64 / 1e6;
+        let mut out = format!("quiet period {:?}", self.quiet());
+        for (member, stated) in &self.latest {
+            out.push_str(&format!(
+                "\n  member {member}, stated {:.1} ms ago: disk {} flush in flight {} floor \
+                 {:.3} ms longest flush {:.3} ms wakes up to {:.3} ms late",
+                ms(now.saturating_sub(stated.at)),
+                stated.disk,
+                if stated.flight == 0 {
+                    "none".to_owned()
+                } else {
+                    format!("for {:.1} ms", ms(now.saturating_sub(stated.flight)))
+                },
+                ms(stated.floor),
+                ms(stated.flush_most),
+                ms(stated.late),
+            ));
+            for (peer, seen) in &stated.peers {
+                out.push_str(&format!(
+                    "\n    peer {peer}: trust {} judged {} configured {} taken {} sent {} \
+                     interval {:.3} ms freshness {:.3} ms trusted until {} suspicions {} \
+                     allowance {:.3}",
+                    seen.trust,
+                    seen.judged,
+                    seen.configured,
+                    seen.taken,
+                    seen.sent,
+                    ms(seen.interval),
+                    ms(seen.freshness),
+                    if seen.until == 0 {
+                        "-".to_owned()
+                    } else {
+                        format!("{:+.1} ms of the line", ms(seen.until) - ms(stated.at))
+                    },
+                    seen.suspicions,
+                    seen.allowance,
+                ));
+            }
+        }
+        for (member, peer, suspected) in &self.suspicions {
+            out.push_str(&format!(
+                "\n  suspicion by {member} of {peer}: {:.1} ms ago, {:.3} ms past the last \
+                 heartbeat's schedule, bound {:.3} ms",
+                ms(now.saturating_sub(suspected.at)),
+                ms(suspected.at.saturating_sub(suspected.due)),
+                ms(suspected.detection),
+            ));
+        }
+        out
     }
 
     /// Whether `member` stated, at or after `since` on the host clock, that it holds `peer`
     /// suspected: a fact about the run after `since`, whether the suspicion began before it (a
     /// live peer falsely suspected just before it stalled or died, never trusted again) or after.
     fn holds_suspected(&self, member: u64, peer: u64, since: u64) -> bool {
-        self.stated.get(&member).is_some_and(|at| *at >= since)
-            && self.latest[&member]
-                .get(&peer)
-                .is_some_and(|seen| seen.trust == 'S')
+        self.latest.get(&member).is_some_and(|stated| {
+            stated.at >= since
+                && stated
+                    .peers
+                    .get(&peer)
+                    .is_some_and(|seen| seen.trust == 'S')
+        })
     }
 
     /// The suspicion `member` holds of `peer`: the latest it reported.
@@ -615,11 +939,6 @@ struct Group {
 )]
 fn start(nodes: u64) -> Group {
     let directory = tempfile::tempdir().unwrap();
-    let ports = free_ports(nodes)
-        .iter()
-        .map(u16::to_string)
-        .collect::<Vec<_>>()
-        .join(",");
     let mut members = Members(
         (1..=nodes)
             .map(|id| {
@@ -631,7 +950,7 @@ fn start(nodes: u64) -> Group {
                         "--test-threads=1",
                     ])
                     .env("HYPER_LIVENESS_NODE", id.to_string())
-                    .env("HYPER_LIVENESS_PORTS", &ports)
+                    .env("HYPER_LIVENESS_NODES", nodes.to_string())
                     .env(
                         "HYPER_LIVENESS_FILE",
                         directory.path().join(format!("member-{id}.log")),
@@ -657,27 +976,49 @@ fn start(nodes: u64) -> Group {
         });
     }
     drop(sender);
-    // Every member ready: its sockets bound, and where its disk takes commands.
+    // Every member ready: its sockets bound, where its disk takes commands and where it listens.
+    // A member just started has no law yet to bound the wait: it is ready once its process is
+    // scheduled, and one whose process ended fails it, looked at every retransmission timeout.
     let mut wakes = BTreeMap::new();
+    let mut ports = BTreeMap::new();
     while wakes.len() < nodes as usize {
-        let line = lines.recv().expect("a member ended before it was ready");
+        let line = match lines.recv_timeout(RTO) {
+            Ok(line) => line,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                for (id, child) in &mut members.0 {
+                    if let Some(status) = child.try_wait().unwrap() {
+                        panic!("member {id} ended before it was ready: {status}");
+                    }
+                }
+                continue;
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                panic!("every member ended before it was ready")
+            }
+        };
         // libtest prints "test member_process ... " before the body runs, without a newline.
         if let Some((_, ready)) = line.split_once("ready ") {
             let fields: Vec<u64> = ready.split(' ').map(|f| f.parse().unwrap()).collect();
             wakes.insert(fields[0], fields[1]);
+            ports.insert(fields[0], fields[2]);
         }
     }
+    let ports = ports
+        .values()
+        .map(u64::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
     for child in members.0.values_mut() {
-        writeln!(child.stdin.as_mut().unwrap(), "start").unwrap();
+        writeln!(child.stdin.as_mut().unwrap(), "start {ports}").unwrap();
     }
     Group {
         _directory: directory,
         members,
         supervisor: Supervisor {
             lines,
+            clock: Clock::new().unwrap(),
             trace: std::env::var_os("HYPER_LIVENESS_TRACE").is_some(),
             latest: BTreeMap::new(),
-            stated: BTreeMap::new(),
             suspicions: Vec::new(),
             heard: Vec::new(),
             configured_since: BTreeMap::new(),
@@ -704,10 +1045,11 @@ fn a_stalled_disk_and_a_killed_node_are_suspected_and_no_live_one_is() {
     let clock = Clock::new().unwrap();
 
     // Every pair configured.
-    supervisor.until(|s| {
+    supervisor.until("every pair configured", |s| {
         s.latest.len() == NODES as usize
-            && s.latest.values().all(|peers| {
-                peers.len() == NODES as usize - 1 && peers.values().all(|p| p.configured)
+            && s.latest.values().all(|stated| {
+                stated.peers.len() == NODES as usize - 1
+                    && stated.peers.values().all(|p| p.configured)
             })
     });
 
@@ -718,7 +1060,7 @@ fn a_stalled_disk_and_a_killed_node_are_suspected_and_no_live_one_is() {
         .send_to(b"stall", ("127.0.0.1", wakes[&STALLED] as u16))
         .unwrap();
     let watchers: Vec<u64> = (1..=NODES).filter(|m| *m != STALLED).collect();
-    supervisor.until(|s| {
+    supervisor.until("every other member suspects the stalled disk", |s| {
         watchers
             .iter()
             .all(|m| s.holds_suspected(*m, STALLED, stalled_at))
@@ -742,7 +1084,7 @@ fn a_stalled_disk_and_a_killed_node_are_suspected_and_no_live_one_is() {
     victim.kill().unwrap();
     victim.wait().unwrap();
     let survivors: Vec<u64> = (1..=NODES).filter(|m| *m != KILLED).collect();
-    supervisor.until(|s| {
+    supervisor.until("every survivor suspects the killed member", |s| {
         survivors
             .iter()
             .all(|m| s.holds_suspected(*m, KILLED, killed_at))
@@ -762,7 +1104,7 @@ fn a_stalled_disk_and_a_killed_node_are_suspected_and_no_live_one_is() {
     let live: Vec<u64> = (1..=NODES)
         .filter(|m| *m != STALLED && *m != KILLED)
         .collect();
-    supervisor.until(|s| {
+    supervisor.until("each live member states both suspected", |s| {
         live.iter().all(|m| {
             s.holds_suspected(*m, STALLED, killed_at) && s.holds_suspected(*m, KILLED, killed_at)
         })
@@ -773,7 +1115,7 @@ fn a_stalled_disk_and_a_killed_node_are_suspected_and_no_live_one_is() {
     for member in &live {
         for peer in live.iter().filter(|p| *p != member) {
             // Whether a live peer is trusted at this moment is no promise; the count is.
-            let seen = supervisor.latest[member][peer];
+            let seen = supervisor.latest[member].peers[peer];
             suspicions += seen.suspicions;
             allowance += seen.allowance;
         }
@@ -839,13 +1181,13 @@ fn a_node_killed_in_its_first_heartbeats_is_suspected_once_a_sibling_has_its_evi
         ..
     } = start(YOUNG_NODES);
     let clock = Clock::new().unwrap();
-    supervisor.until(|s| s.heard.contains(&victim));
+    supervisor.until("the victim heard every peer", |s| s.heard.contains(&victim));
     let mut child = members.0.remove(&victim).unwrap();
     let killed_at = clock.now_ns();
     child.kill().unwrap();
     child.wait().unwrap();
     let survivors: Vec<u64> = (1..YOUNG_NODES).collect();
-    supervisor.until(|s| {
+    supervisor.until("every survivor suspects the young victim", |s| {
         survivors
             .iter()
             .all(|m| s.holds_suspected(*m, victim, killed_at))

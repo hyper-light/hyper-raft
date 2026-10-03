@@ -477,7 +477,16 @@ first form, which dropped the verdict then, left a probe of a crashed member unj
 in three hundred at one CPU). While the pool refuses too, nothing is judged: a probe is measurement
 only, and its period ends when it is answered or at its expected arrival from the latest round trip
 (NFD-E over a window of one), whichever is first. Unanswered then, it is a loss to the estimators
-unless its answer comes later; it judges nothing, and its wake measures `G`. The very first probe,
+unless its answer comes later; it judges nothing, and its wake measures `G`. Each measurement period
+that ends unanswered doubles the next one's wait, as a retransmission timer backs off (RFC 6298
+§5.5), up to the 60 s at which §2.5 lets the doubling be capped, and a measured round trip ends the
+backing off. An answer is measured only while its probe is outstanding, the latest three of its
+peer's; without the backing off, round trips that lengthened past that, under load, came each for a
+probe written over, none was measured, the latest round trip never lengthened, and the member probed
+on at the stale pace with nothing judged, slow to answer the others, who condemned it: a member
+43,557 periods into a cluster run, condemned 95 times
+(`measurement_periods_follow_round_trips_that_lengthen`, which reproduces it in the detector alone,
+taking no round trip in 2,000 periods without it). The very first probe,
 before any round trip, waits on an answer or another member. An earlier rule ended an unanswered
 measurement period only when another member was next heard from, assuming no time at all; in Linux
 at two CPUs with four busy loops, a throttled container dropped a burst of datagrams, every member's

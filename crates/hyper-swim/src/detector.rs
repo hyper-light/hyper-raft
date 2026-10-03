@@ -161,6 +161,10 @@ pub struct PeerReport {
 /// it and is not kept for.
 const OUTSTANDING: usize = 3;
 
+/// The longest a measurement period's wait backs off to, nanoseconds: RFC 6298 (2.5) lets a
+/// retransmission timer's doubling be capped, provided the cap is at least 60 seconds.
+const MEASUREMENT_WAIT_CAP_NS: u64 = 60_000_000_000;
+
 /// A probe sent and not yet answered.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Sent {
@@ -308,7 +312,8 @@ struct Probe {
     verdict: Option<Verdict>,
     /// When the indirect probe's answers are due, once it was asked.
     indirect_until: Option<u64>,
-    /// A measurement probe's expected arrival from the latest round trip: where its period ends,
+    /// A measurement probe's expected arrival from the latest round trip, backed off while
+    /// measurement periods go unanswered ([`Detector::measurement_wait`]): where its period ends,
     /// answered or not, judging nothing; its wake measures the member's timer.
     expected: Option<u64>,
 }
@@ -436,6 +441,9 @@ pub struct Detector {
     wakes: Wakes,
     /// The latest round trip measured, to anyone.
     last_rtt_ns: Option<u64>,
+    /// Measurement periods ended unanswered since the latest round trip was measured: each doubles
+    /// the next one's wait (RFC 6298 §5.5), up to [`MEASUREMENT_WAIT_CAP_NS`].
+    measurement_misses: u32,
     /// The longest span `μ + α` any verdict of this member has had, nanoseconds.
     longest_span: u64,
     periods: Periods,
@@ -538,6 +546,7 @@ impl Detector {
             relayed: u64::MAX,
             wakes: Wakes::new(),
             last_rtt_ns: None,
+            measurement_misses: 0,
             longest_span: 0,
             periods: Periods::default(),
             exposure: history,
@@ -656,7 +665,9 @@ impl Detector {
             answered: false,
             verdict,
             indirect_until: None,
-            expected: self.last_rtt_ns.map(|rtt| now_ns.saturating_add(rtt)),
+            expected: self
+                .last_rtt_ns
+                .map(|rtt| now_ns.saturating_add(self.measurement_wait(rtt))),
         });
         self.heard_other = false;
         Some(Ping { to: target, nonce })
@@ -722,6 +733,13 @@ impl Detector {
     /// The period ends: its length is folded, the exposure grows, and an unanswered judged probe
     /// suspects its target or, when it had told the target, condemns it.
     fn resolve(&mut self, probe: Probe, now_ns: u64) {
+        if probe.verdict.is_none()
+            && !probe.answered
+            && let Some(rtt) = self.last_rtt_ns
+            && self.measurement_wait(rtt) < MEASUREMENT_WAIT_CAP_NS
+        {
+            self.measurement_misses = self.measurement_misses.saturating_add(1);
+        }
         let length = now_ns.saturating_sub(probe.sent_ns);
         self.periods.add(length);
         let watched = u32::try_from(self.order.len()).unwrap_or(u32::MAX);
@@ -869,6 +887,19 @@ impl Detector {
         Some(Duration::from_nanos(period.saturating_mul(periods)))
     }
 
+    /// How long a measurement period waits past its probe: the latest round trip, doubled for each
+    /// measurement period since that ended unanswered, as a retransmission timer backs off (RFC 6298
+    /// §5.5), up to [`MEASUREMENT_WAIT_CAP_NS`]. An answer is measured only while its probe is
+    /// outstanding, the latest three of its peer's; when round trips lengthen past that, periods at
+    /// the latest round trip's pace see every answer come for a probe written over, measure none,
+    /// and never lengthen. A measured round trip ends the backing off.
+    fn measurement_wait(&self, rtt_ns: u64) -> u64 {
+        let factor = 1u64
+            .checked_shl(self.measurement_misses)
+            .unwrap_or(u64::MAX);
+        rtt_ns.saturating_mul(factor).min(MEASUREMENT_WAIT_CAP_NS)
+    }
+
     /// Whether every probe this member makes is judged by a configured verdict: the pool holds
     /// one, or every member it probes has its own.
     fn judges_every_probe(&self) -> bool {
@@ -981,6 +1012,7 @@ impl Detector {
         };
         let rtt = at_ns.saturating_sub(sent.at_ns);
         self.last_rtt_ns = Some(rtt);
+        self.measurement_misses = 0;
         if let Some(((granularity, period), interval)) = measure.zip(interval) {
             peer.stream.take(sent.seq, rtt, granularity, interval);
             if peer.stream.due() {
@@ -1610,6 +1642,52 @@ mod tests {
         );
     }
 
+    /// Measurement periods follow round trips that lengthen. A measurement period ends at its
+    /// expected arrival from the latest round trip; when the round trips lengthen past what the
+    /// outstanding probes cover (three a peer), every answer comes for a probe written over, none
+    /// is measured, the latest round trip never lengthens, and the member probes on at the stale
+    /// pace and never configures: the cluster test's spin, a member 43,557 periods into a run with
+    /// nothing judged while the others condemned it, slow to answer, 95 times.
+    #[test]
+    fn measurement_periods_follow_round_trips_that_lengthen() {
+        let mut detector = detector(&[A, B]);
+        let mut requests = Vec::new();
+        // Answers in flight: when each arrives, from whom, for which probe.
+        let mut flight: Vec<(u64, HostId, u64)> = Vec::new();
+        let mut now = MS;
+        let mut periods = 0;
+        while periods < 2_000 {
+            // A quick first round trip, then the load arrives: a hundred times as long.
+            let rtt = if periods < 4 { MS / 20 } else { 5 * MS };
+            if let Some(ping) = detector.poll(now, &mut requests) {
+                periods += 1;
+                flight.push((now + rtt, ping.to, ping.nonce));
+            }
+            let arrival = flight.iter().map(|(at, _, _)| *at).min();
+            now = match (detector.wake().map(|wake| wake + MS / 100), arrival) {
+                (Some(wake), Some(at)) => wake.min(at),
+                (Some(wake), None) => wake,
+                (None, Some(at)) => at,
+                (None, None) => {
+                    detector.on_ping(C);
+                    now + MS
+                }
+            }
+            .max(now);
+            flight.retain(|&(at, from, nonce)| {
+                let due = at <= now;
+                if due {
+                    detector.on_ack(from, nonce, at);
+                }
+                !due
+            });
+        }
+        assert!(
+            detector.verdict(A).is_some() && detector.verdict(B).is_some(),
+            "configured from the lengthened round trips"
+        );
+    }
+
     /// A reconfiguration the estimator refuses leaves the verdict in force: under a CPU throttle a
     /// stall made `τ_int` unmeasured again, the verdict went, and the probe that would have
     /// suspected a crashed member was not judged (one Linux run in three hundred at one CPU).
@@ -1949,12 +2027,16 @@ mod tests {
         let mut detector = detector(&peers);
         let mut world = World::new();
         configured(&mut detector, &mut world, &peers);
-        // Run until a probe of A is out, unanswered directly.
+        // Run until a probe of A is out, unanswered directly: one started in a run that leaves A
+        // unanswered, not the last of the configuring runs, which answered everyone.
         let mut state = 3;
-        while world.pings.last().map(|p| p.to) != Some(A) {
+        loop {
             world.run(&mut detector, 0, |peer| {
                 (peer != A).then(|| jitter(&mut state))
             });
+            if world.pings.last().map(|p| p.to) == Some(A) {
+                break;
+            }
         }
         let ping = *world.pings.last().unwrap();
         world.now = ping_sent(&detector);

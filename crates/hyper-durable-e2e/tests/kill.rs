@@ -52,6 +52,7 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError, sync_channel};
 use std::time::{Duration, Instant};
 
 use hyper_durable_e2e::control::{self, Order, Point, Report};
+use hyper_durable_e2e::run;
 use hyper_raft::proto::ConfChangeType;
 use hyper_raft_e2e::wire::{self, Control, Kind, Op, Outcome};
 
@@ -123,6 +124,7 @@ impl Drop for Cluster {
                 let _ = child.wait();
             }
             remove(&member.log);
+            remove(&run::path(&member.log));
         }
     }
 }
@@ -174,6 +176,7 @@ impl Cluster {
             let log =
                 PathBuf::from(TMP).join(format!("durable-{}-{name}-{id}.log", std::process::id()));
             remove(&log);
+            remove(&run::path(&log));
             let (child, port, lines) = spawn(id, &ids, &log);
             members.push(Member {
                 id,

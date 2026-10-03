@@ -98,6 +98,8 @@ pub enum NodeError {
     Io(std::io::Error),
     /// The liveness stream refused: a peer it cannot keep.
     Liveness(hyper_liveness::Refusal),
+    /// The member has no run: its record could not be read or raised (`crate::run`).
+    Run(crate::run::RunError),
 }
 
 impl std::fmt::Display for NodeError {
@@ -108,6 +110,7 @@ impl std::fmt::Display for NodeError {
             Self::Open(e) => write!(f, "open: {e}"),
             Self::Io(e) => write!(f, "the socket: {e}"),
             Self::Liveness(e) => write!(f, "the liveness stream: {e}"),
+            Self::Run(e) => write!(f, "{e}"),
         }
     }
 }
@@ -213,13 +216,15 @@ pub fn open_log(path: &Path) -> Result<Log<FaultFile>, NodeError> {
 }
 
 impl Node {
-    /// The member `settings` names on `socket`, opened on `log`, woken by `waker`.
+    /// The member `settings` names on `socket`, opened on `log`, woken by `waker`, in its run
+    /// `run` (`crate::run::raise`).
     #[allow(
         clippy::disallowed_methods,
         reason = "real processes on the host's clock, threads and environment (CLAUDE.md §1a, end to end)"
     )]
     pub fn open(
         settings: Settings,
+        run: u64,
         socket: UdpSocket,
         log: Log<FaultFile>,
         waker: Waker,
@@ -252,12 +257,9 @@ impl Node {
         };
         let machine = Kv::new(configuration, settings.max_keys);
         let replica = Replica::open(&shell, store, machine, Unbounded).map_err(NodeError::Open)?;
-        // A run the node never reuses: its process, and the port its socket took, which a member
-        // started again on its log does not keep.
-        let port = socket.local_addr()?.port();
         let liveness = Liveness::new(LiveSettings {
             local: settings.id,
-            boot: u64::from(std::process::id()) ^ (u64::from(port) << 32),
+            run,
             max_peers: hyper_raft::MAX_MEMBERS,
             history: Exposure::new(),
         })

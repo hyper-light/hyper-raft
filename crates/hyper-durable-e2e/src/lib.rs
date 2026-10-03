@@ -15,7 +15,20 @@
 //! A process runs five threads, whatever it holds: its own, the log's two, the relay that turns its
 //! waker into a datagram to its own socket, and the one that watches for its test to go.
 
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing,
+        clippy::arithmetic_side_effects,
+        clippy::disallowed_macros
+    )
+)]
+
 pub mod control;
 pub mod file;
 pub mod machine;
 pub mod node;
+pub mod run;

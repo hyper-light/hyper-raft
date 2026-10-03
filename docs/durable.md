@@ -609,7 +609,12 @@ the owner: `Owner::pairs` keeps the stream told which peers each replica's group
 suspicion, trust again, a restart to `Replica::restarted`), `Owner::measure` derives each group's
 timing from what the stream measured (`Replica::measure`) and charges every pair its groups'
 expected election (`docs/timing.md` §2.9: a pair never charged never configured), and
-`Driven::flushed` is the flush each heartbeat proves (`crates/hyper-durable/tests/liveness.rs`). The shell holds the core's campaigns while the member is stalled
+`Driven::flushed` is the flush each heartbeat proves (`crates/hyper-durable/tests/liveness.rs`).
+The stream's run (`hyper_liveness::Settings::run`) is the node's, not the shell's: a count of the
+node's starts it keeps whole beside its other records and raises before the stream's first
+heartbeat, so runs are ordered and a superseded run's heartbeat is refused (`docs/timing.md` §2.8,
+"A restart"); the shell has no record of the node's starts (its `Kind::Start` is a compaction's new
+start of one group's log), and a node's replicas come and go. The shell holds the core's campaigns while the member is stalled
 (`RawNode::hold_campaigns`); the core holds them itself while the member is marked (§5.1) or a
 committed change is unapplied.
 It does not withhold the detectors' words, as the plan here said it would: a marked follower that
@@ -897,7 +902,8 @@ Tests (`crates/hyper-durable/tests`):
   answers through a datagram to its own socket (five threads a process, whatever it holds, with the
   one that watches for its test to go). The members elect by suspicion on their own detectors:
   each runs the node-pair liveness stream, its heartbeats proved by its replica's writes or, idle,
-  by an empty update of a group of the stream's own on the same log, and takes the stream's changes
+  by an empty update of a group of the stream's own on the same log, in a run it keeps beside its
+  log and raises at each start (`src/run.rs`, a record kept whole), and takes the stream's changes
   to its replica and its group's timing from what the stream measured, as `Owner` does
   (`docs/timing.md` §2.9, "On real detectors"). The test tells no member what to believe and
   derives nothing: it waits on facts while the group moves, for a quiet period of the members'

@@ -527,7 +527,7 @@ owner multiplexing the plane tells it apart; the kernel stamps come from the own
 (hyper-tokio's `PlaneSocket`, §2.4; slates' runtime its own).
 
 **The stream.** A node sends each peer heartbeat `k` due at `σ_k = σ_{k−1} + η`, carrying its run
-(`boot`), `k`, `η`, its stability floor `E[flush] + G`, the interval it asks of the peer, its send
+(a count raised at every start, below), `k`, `η`, its stability floor `E[flush] + G`, the interval it asks of the peer, its send
 time and lateness past `σ_k`, and the flush proof. A sender behind its schedule sends the latest
 heartbeat due; those it skipped are losses to the receiver, which they are.
 - **The interval** is the receiver's: its configurator's best (`Configuration::best`), asked in its
@@ -689,10 +689,30 @@ heartbeat due; those it skipped are losses to the receiver, which they are.
   `PairReport::freshness` the `η + α` in force, and `PairReport::interval` the interval the peer's
   heartbeats come at, or a longer one asked, judged or not: what an owner waiting on a young link's
   evidence waits past.
-- **A restart** (§3, item 10). A heartbeat of a new run (`boot`) is reported as
-  `Change::Restarted { peer, at_ns }` before the trust the heartbeat leaves, for the owner to call
-  the core's `restarted` (trusted, and leading nothing it led); the owner is then told a suspicion
-  only if the heartbeat leaves the peer suspected. Changes are reported only where what the owner
+- **A restart** (§3, item 10). Runs are ordered: a node's run (`Settings::run`) is a count it keeps
+  durably and raises at every start, before its stream's first heartbeat. A heartbeat of a later
+  run than the latest taken from the peer is reported as `Change::Restarted { peer, at_ns }` before
+  the trust the heartbeat leaves, for the owner to call the core's `restarted` (trusted, and leading
+  nothing it led), and counted once in the MTBF's evidence; one of an earlier run is refused
+  (`Refusal::Stale`). The plane keeps two epochs a peer (`hyper-datagram`, `epochs_per_peer`), so a
+  heartbeat the old run sent can open after the new run's first: with a run that had no order (a
+  boot nonce from the OS's random source, a process id) it was taken as a restart back to the old
+  run, and the new run's next as another, two spurious restarts and two failures, each making the
+  followers of the restarted node's groups drop their leader and campaign (the wire is version 2
+  since; `a_superseded_runs_heartbeat_is_stale_and_its_restart_counts_once` counts three restarts
+  and three failures under the old rule, one and one now). A run number reused across starts (a
+  process id the operating system gave again) made the new run's heartbeats, numbered from zero,
+  stale for good. How an owner keeps it: as a record of its node written whole before the run is
+  used (to a temporary name, the platform's full flush, a rename, its directory's flush, its
+  CRC-32C checked on read: `hyper_block::record`), as hyper-durable-e2e's members keep theirs beside
+  their logs (`run.rs`) and hyper-liveness's real-process members beside their files; a start that
+  crashed before its run was durable sent nothing under it, so the next may take the same number.
+  The run is the node's, not a group's, so it is not the shell's to keep: hyper-durable's `Kind::Start`
+  is a compaction's new start of a group's log, written when the log is compacted, not when the
+  node starts, and a node's replicas come and go. mantle keeps it with its node's other records
+  (`crates/node/src/layout.rs`, written whole the same way); its random `Incarnation` has no order
+  and cannot be the run. The owner is then told a suspicion only if the heartbeat leaves the peer
+  suspected. Changes are reported only where what the owner
   was told differs: the owner trusts a peer until told otherwise, so trust after a suspicion is told
   and trust after nothing is not. Both ways, at every heartbeat and every poll:
   - a peer no margin judges is one the owner trusts, so a heartbeat that leaves a peer told
@@ -712,7 +732,8 @@ heartbeat due; those it skipped are losses to the receiver, which they are.
   heartbeat in the window carried no echo.
 
 **The API** the core's suspicion-started elections (L-2) and the shell consume (`src/lib.rs`):
-`attach`/`detach` a group's peer; `on_durable(write, started, durable)`; `on_heartbeat(from, message,
+`Liveness::new(Settings { local, run, max_peers, history })`, `run` the node's durable count of
+its starts; `attach`/`detach` a group's peer; `on_durable(write, started, durable)`; `on_heartbeat(from, message,
 arrival_ns, out)`; `poll(now, out)` and `wake()`, with `Output::{heartbeat, flush, change}`;
 `Change::Suspected(Suspicion { peer, at_ns, noticed_ns, last: { seq, arrival_ns, due_ns, sent_ns },
 detection, detector })`, `Change::Trusted { peer, at_ns }` and `Change::Restarted { peer, at_ns }`;
@@ -1077,8 +1098,8 @@ and election law; the remaining items keep their numbers, and item 10 is what L-
     `a_peer_never_heard_from_is_suspected`,
     `a_peer_dead_before_its_links_have_evidence_is_suspected_once_a_sibling_has_its_own`), its real
     processes and hyper-durable's shell (`a_leader_killed_before_its_links_have_evidence_is_replaced`).
-  - *A restart is not a crash the detectors can miss.* The stream carries the sender's run
-    (`boot`, §2.8), and a new run is an incarnation's end: told to the core (`restarted`), the node is
+  - *A restart is not a crash the detectors can miss.* The stream carries the sender's run, a
+    count it raises at every start (§2.8), and a later run is an incarnation's end: told to the core (`restarted`), the node is
     trusted and leads nothing it led before. hyper-liveness reports it, `Change::Restarted`, and
     hyper-durable's owner takes it to the core (§2.8, §2.9), as the E2E's members do.
   What stays open is §2.7's for the pool, and so for the widest configured link: its mean is wrong

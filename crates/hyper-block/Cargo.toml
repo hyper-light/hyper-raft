@@ -13,6 +13,8 @@ repository.workspace = true
 sim = []
 
 [dependencies]
+# A kept record's checksum (`record`), the log's CRC-32C.
+crc32c.workspace = true
 getrandom.workspace = true
 thiserror.workspace = true
 

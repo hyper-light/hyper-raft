@@ -103,7 +103,8 @@ impl World {
                     let id = i as u64 + 1;
                     let mut liveness = Liveness::new(Settings {
                         local: id,
-                        boot: seed ^ id,
+                        // Each node's first start.
+                        run: 1,
                         max_peers: nodes,
                         history: Exposure::new(),
                     })

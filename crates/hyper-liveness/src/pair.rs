@@ -18,7 +18,7 @@ fn nanos(duration: Duration) -> u64 {
 
 /// What the node gives every pair's sender at a poll.
 pub(crate) struct Sender {
-    pub(crate) local_boot: u64,
+    pub(crate) local_run: u64,
     pub(crate) floor: Option<Duration>,
     pub(crate) granularity: Option<Duration>,
     pub(crate) durable_count: u64,
@@ -131,7 +131,8 @@ struct Link {
 /// (`base`).
 #[derive(Debug, Default)]
 struct Received {
-    boot: Option<u64>,
+    /// The latest run of the peer taken: heartbeats of earlier runs are refused.
+    run: Option<u64>,
     link: Option<Box<Link>>,
     /// What the run's numbers are offset by in the estimator: one past the last run's latest.
     base: u64,
@@ -411,7 +412,7 @@ impl Pair {
                 .expect_interval(Duration::from_nanos(ask_ns.max(self.received.floor_ns)));
         }
         let beat = Heartbeat {
-            boot: sender.local_boot,
+            run: sender.local_run,
             seq,
             interval_ns: spacing,
             floor_ns: sender.floor.map_or(0, nanos),
@@ -559,15 +560,19 @@ impl Pair {
         self.received.accounted = Some(seq);
     }
 
-    /// A heartbeat of a run not seen before: the peer restarted, or this is its first. Its
-    /// numbers, proofs and echo start again; the link's history stays, its schedule anchored anew
-    /// at the run's first heartbeat. Whether the peer restarted.
-    fn begin_run(&mut self, boot: u64) -> bool {
-        if self.received.boot == Some(boot) {
-            return false;
+    /// Where a heartbeat of run `run` stands against the latest run taken from the peer: the same
+    /// run, or a later one, the peer restarted (or this is its first), whose numbers, proofs and
+    /// echo start again, the link's history staying and its schedule anchored anew at the run's
+    /// first heartbeat. Whether the peer restarted; a heartbeat of an earlier run, a superseded
+    /// run's delivered after the new run's first, is refused as stale and starts nothing.
+    fn begin_run(&mut self, run: u64) -> Result<bool, Refusal> {
+        match self.received.run {
+            Some(latest) if run == latest => return Ok(false),
+            Some(latest) if run < latest => return Err(Refusal::Stale),
+            _ => {}
         }
-        let restarted = self.received.boot.is_some();
-        self.received.boot = Some(boot);
+        let restarted = self.received.run.is_some();
+        self.received.run = Some(run);
         self.received.base = self
             .received
             .last_mapped
@@ -576,7 +581,7 @@ impl Pair {
         self.received.last = None;
         self.received.echo = None;
         self.received.reanchor = restarted;
-        restarted
+        Ok(restarted)
     }
 
     /// Takes heartbeat `beat` from `peer`, received at `arrival_ns`, after judging the peer at
@@ -593,7 +598,7 @@ impl Pair {
         taken: &mut Taken,
     ) -> Result<(), Refusal> {
         changes[0] = self.judge(peer, arrival_ns);
-        if self.begin_run(beat.boot) {
+        if self.begin_run(beat.run)? {
             // A new incarnation, which the owner's core trusts and holds to lead nothing it led.
             self.told = false;
             taken.restarted = true;
@@ -867,10 +872,10 @@ mod tests {
         exposure
     }
 
-    /// Heartbeat `seq` of run `boot` at a 10 ms interval, sent on time with a fresh flush.
-    fn beat(boot: u64, seq: u64) -> Heartbeat {
+    /// Heartbeat `seq` of run `run` at a 10 ms interval, sent on time with a fresh flush.
+    fn beat(run: u64, seq: u64) -> Heartbeat {
         Heartbeat {
-            boot,
+            run,
             seq,
             interval_ns: 10 * MS,
             floor_ns: MS,

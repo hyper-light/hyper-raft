@@ -189,7 +189,7 @@ async fn member(me: u64, ports: Vec<u16>, file: std::path::PathBuf) {
     .unwrap();
     let mut liveness = Liveness::new(Settings {
         local: me,
-        boot: clock.now_ns() ^ u64::from(std::process::id()),
+        run: raise_run(&file),
         max_peers: nodes as usize,
         history: Exposure::new(),
     })
@@ -342,6 +342,22 @@ async fn member(me: u64, ports: Vec<u16>, file: std::path::PathBuf) {
             }
         }
     }
+}
+
+/// The member's run: the count kept beside its file raised by one (one where there is none), a
+/// record kept whole and durable before the stream sends anything under it, as an owner keeps it
+/// (`hyper_liveness::Settings::run`; hyper-durable-e2e's `run`). A member started once on a fresh
+/// directory is in its first.
+fn raise_run(file: &std::path::Path) -> u64 {
+    let mut name = file.as_os_str().to_owned();
+    name.push(".run");
+    let path = std::path::PathBuf::from(name);
+    let previous = hyper_block::record::read(&path, 8)
+        .unwrap()
+        .map_or(0, |count| u64::from_le_bytes(count.try_into().unwrap()));
+    let run = previous + 1;
+    hyper_block::record::write(&path, &run.to_le_bytes()).unwrap();
+    run
 }
 
 /// Charges each detector the election the library's law gives this member's group, over the round

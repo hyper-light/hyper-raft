@@ -1,7 +1,7 @@
 //! The heartbeat's wire form: one plane message (`hyper-datagram`), little-endian, fixed fields.
 //!
 //! ```text
-//! kind (1) version (1) boot (8) seq (8) interval (8) floor (8) ask (8) sent (8) late (8)
+//! kind (1) version (1) run (8) seq (8) interval (8) floor (8) ask (8) sent (8) late (8)
 //! flushes (8) flush_age (8) echo flag (1) [echo sent (8) echo late (8) echo hold (8)]
 //! ```
 //!
@@ -15,8 +15,10 @@ use crate::Refusal;
 /// Format: the first byte of a liveness message, so an owner multiplexing the plane among Raft
 /// control, SWIM and liveness tells this one apart (`'L'`).
 pub const KIND: u8 = 0x4c;
-/// Format: the wire version this build reads and writes.
-pub const VERSION: u8 = 1;
+/// Format: the wire version this build reads and writes. Version 2 orders runs: its `run` is a
+/// count the sender raises at every start, where version 1's `boot` was any value its node never
+/// reused, which a receiver could not order; a version 1 heartbeat is refused, not misread.
+pub const VERSION: u8 = 2;
 /// The bytes before the echo: kind, version, nine eight-byte fields and the echo flag.
 const HEAD_BYTES: usize = 2 + 9 * 8 + 1;
 /// The echo's three eight-byte fields.
@@ -40,9 +42,10 @@ pub struct Echo {
 /// One heartbeat of a node pair's stream.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Heartbeat {
-    /// The sender's run: a value its node never reuses across restarts. A new one starts the
-    /// stream again.
-    pub boot: u64,
+    /// The sender's run: a count its node keeps durably and raises at every start
+    /// (`Settings::run`), so a later run's is greater. A later one than the receiver last took
+    /// starts the stream again; an earlier one is a superseded run's.
+    pub run: u64,
     /// The heartbeat's number in the run, from zero.
     pub seq: u64,
     /// The interval `η` the sender schedules at: heartbeat `seq` was due `η` after `seq − 1`.
@@ -88,7 +91,7 @@ impl Heartbeat {
             *head = [KIND, VERSION];
         }
         for value in [
-            self.boot,
+            self.run,
             self.seq,
             self.interval_ns,
             self.floor_ns,
@@ -128,7 +131,7 @@ impl Heartbeat {
             *field = take(&mut rest)?;
         }
         let [
-            boot,
+            run,
             seq,
             interval_ns,
             floor_ns,
@@ -152,7 +155,7 @@ impl Heartbeat {
             return Err(Refusal::Malformed);
         }
         Ok(Self {
-            boot,
+            run,
             seq,
             interval_ns,
             floor_ns,
@@ -182,7 +185,7 @@ mod tests {
             prop::option::of(prop::array::uniform3(any::<u64>())),
         )
             .prop_map(|(f, echo)| Heartbeat {
-                boot: f[0],
+                run: f[0],
                 seq: f[1],
                 interval_ns: f[2],
                 floor_ns: f[3],
@@ -233,7 +236,7 @@ mod tests {
     #[test]
     fn an_echo_flag_other_than_zero_or_one_is_malformed() {
         let beat = Heartbeat {
-            boot: 1,
+            run: 1,
             seq: 2,
             interval_ns: 3,
             floor_ns: 4,

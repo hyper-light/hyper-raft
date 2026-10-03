@@ -523,13 +523,14 @@ mod live {
         pub(super) sent: u64,
     }
 
-    fn nodes(seed: u64) -> Vec<Node> {
+    fn nodes() -> Vec<Node> {
         (0..NODES)
             .map(|i| {
                 let id = i as u64 + 1;
                 let mut liveness = Liveness::new(Settings {
                     local: id,
-                    boot: seed ^ id,
+                    // Each node's first start.
+                    run: 1,
                     max_peers: NODES,
                     history: Exposure::new(),
                 })
@@ -618,7 +619,7 @@ mod live {
             Self {
                 now: 0,
                 noise: super::Noise(seed | 1),
-                nodes: nodes(seed),
+                nodes: nodes(),
                 queue: BinaryHeap::new(),
                 events: BTreeMap::new(),
                 next_event: 0,
@@ -819,7 +820,7 @@ mod live {
             Self {
                 world,
                 ids,
-                nodes: nodes(seed),
+                nodes: nodes(),
                 links,
                 disks,
                 elected_at: 0,

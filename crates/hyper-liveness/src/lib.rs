@@ -103,7 +103,8 @@ pub enum Refusal {
     BadVersion,
     /// The message does not parse.
     Malformed,
-    /// A heartbeat no newer than the latest taken from the peer's run.
+    /// A heartbeat no newer than the latest taken from the peer's run, or of an earlier run than
+    /// the latest taken: a superseded run's.
     Stale,
     /// A heartbeat whose flush proof does not hold: its count of durable writes did not move, or
     /// its latest flush is older than the previous heartbeat's schedule.
@@ -129,9 +130,16 @@ impl std::error::Error for Refusal {}
 pub struct Settings {
     /// This node.
     pub local: PeerId,
-    /// This run: a value the node never reuses across restarts (a boot nonce from the OS's random
-    /// source, or the plane's epoch).
-    pub boot: u64,
+    /// This run of the node: a count it keeps durably and raises at every start, before the
+    /// stream's first heartbeat, so each run's is greater than every earlier run's (the owner's
+    /// record, written whole with the platform's full flush and its directory's: `docs/timing.md`
+    /// §2.8, "A restart"). Runs are ordered by it: a heartbeat of a later run than the latest taken
+    /// from the peer is the peer's restart, and one of an earlier run is refused
+    /// ([`Refusal::Stale`]), as a superseded run's heartbeat delivered after the new run's first
+    /// is (the plane keeps two epochs a peer). A value with no order, a boot nonce or a process id,
+    /// made such a heartbeat a restart back to the old run and the new run's next another, and a
+    /// value reused across runs made the new run's heartbeats, numbered from zero again, stale.
+    pub run: u64,
     /// The most pairs the node keeps: the nodes placement lets it share groups with. Past it,
     /// [`Liveness::attach`] refuses.
     pub max_peers: usize,
@@ -198,7 +206,7 @@ pub enum Change {
         /// The heartbeat's arrival.
         at_ns: u64,
     },
-    /// A heartbeat came from a new run of the peer: it restarted, a new incarnation, which the
+    /// A heartbeat came from a later run of the peer: it restarted, a new incarnation, which the
     /// owner's core trusts and holds to lead nothing it led before (`RawNode::restarted`). What the
     /// heartbeat leaves the peer's trust at follows, if it is not trusted.
     Restarted {
@@ -277,7 +285,7 @@ struct Durable {
 /// A node's pairs: what it sends each peer and what it believes of each.
 pub struct Liveness {
     local: PeerId,
-    boot: u64,
+    run: u64,
     max_peers: usize,
     pairs: BTreeMap<PeerId, Pair>,
     wakes: Wakes,
@@ -361,7 +369,7 @@ impl Liveness {
         }
         Ok(Self {
             local: settings.local,
-            boot: settings.boot,
+            run: settings.run,
             max_peers: settings.max_peers,
             pairs: BTreeMap::new(),
             wakes: Wakes::new(),
@@ -487,8 +495,9 @@ impl Liveness {
     /// A liveness message from `from`, received at `arrival_ns` on this node's clock (the kernel's
     /// stamp where the owner has one). The peer is judged at the arrival first, so a freshness
     /// point that passed before the message came is a suspicion in whatever order messages and
-    /// polls are fed; trust changes go to `out`. A heartbeat from a new run of the peer counts as
-    /// a failure in the MTBF's evidence: the peer restarted.
+    /// polls are fed; trust changes go to `out`. A heartbeat from a later run of the peer counts
+    /// as a failure in the MTBF's evidence, the peer having restarted, and one from an earlier
+    /// run than the latest taken is refused as stale.
     pub fn on_heartbeat(
         &mut self,
         from: PeerId,
@@ -545,7 +554,7 @@ impl Liveness {
         let granularity = self.wakes.granularity();
         let floor = self.floor_at(granularity);
         let sender = pair::Sender {
-            local_boot: self.boot,
+            local_run: self.run,
             floor,
             granularity,
             durable_count: self.durable.count,

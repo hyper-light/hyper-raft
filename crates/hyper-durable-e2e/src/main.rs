@@ -17,6 +17,7 @@ use std::sync::mpsc::{Receiver, sync_channel};
 
 use hyper_durable_e2e::control::{self, Order};
 use hyper_durable_e2e::node::{Node, NodeError, Settings, open_log};
+use hyper_durable_e2e::run;
 use hyper_raft_e2e::wire;
 
 /// The status a member exits with once a failed write fenced it.
@@ -111,11 +112,13 @@ fn relay(socket: &UdpSocket) -> std::io::Result<std::task::Waker> {
 
 fn serve(arguments: Arguments) -> Result<(), Box<dyn std::error::Error>> {
     let log = open_log(&arguments.log)?;
+    // Raised and durable before the member's liveness stream sends anything under it.
+    let run = run::raise(&run::path(&arguments.log)).map_err(NodeError::Run)?;
     let socket = UdpSocket::bind(&arguments.listen)?;
     let port = socket.local_addr()?.port();
     let waker = relay(&socket)?;
     let parent = watch_parent(&socket)?;
-    let mut node = Node::open(arguments.settings, socket, log, waker)?;
+    let mut node = Node::open(arguments.settings, run, socket, log, waker)?;
     let mut stdout = std::io::stdout().lock();
     writeln!(stdout, "listening {port}")?;
     stdout.flush()?;

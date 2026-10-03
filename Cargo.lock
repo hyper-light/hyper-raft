@@ -616,6 +616,7 @@ dependencies = [
 name = "hyper-block"
 version = "0.1.0"
 dependencies = [
+ "crc32c",
  "getrandom 0.4.3",
  "proptest",
  "rustix 1.1.4",
@@ -658,12 +659,14 @@ dependencies = [
  "hyper-raft",
  "hyper-raft-e2e",
  "hyper-timing",
+ "tempfile",
 ]
 
 [[package]]
 name = "hyper-liveness"
 version = "0.1.0"
 dependencies = [
+ "hyper-block",
  "hyper-datagram",
  "hyper-measure",
  "hyper-raft",

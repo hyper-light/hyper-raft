@@ -20,6 +20,8 @@ hyper-swim = { path = "../hyper-swim" }
 # socket, its kernel receive stamps and the host's clock, on a current-thread runtime.
 hyper-datagram = { path = "../hyper-datagram" }
 hyper-tokio = { path = "../hyper-tokio" }
+# The real-process test's members keep their run as an owner does, a record kept whole.
+hyper-block = { path = "../hyper-block" }
 tokio = { version = "1.48", default-features = false, features = ["net", "time", "rt"] }
 tempfile.workspace = true
 proptest.workspace = true

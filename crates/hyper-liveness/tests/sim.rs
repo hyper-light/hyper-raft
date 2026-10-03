@@ -194,7 +194,8 @@ impl Sim {
                 let id = i as u64 + 1;
                 let mut liveness = Liveness::new(Settings {
                     local: id,
-                    boot: seed ^ id,
+                    // The node's first start: its run record held none.
+                    run: 1,
                     max_peers: count,
                     history: Exposure::new(),
                 })
@@ -791,6 +792,8 @@ fn groups_share_one_stream_and_an_unshared_pair_is_silent() {
 
 /// A restarted peer is reported restarted (`Change::Restarted`, for the core's `restarted`), is
 /// judged at once by the detector in force, and its restart is a failure in the MTBF's evidence.
+/// The old run's last heartbeat to a survivor, delivered after the new run's first (the plane
+/// keeps two epochs a peer), is refused as stale and reports nothing.
 #[test]
 fn a_restarted_peer_is_trusted_again_and_counted() {
     let mut sim = Sim::new(3, LAN, 51);
@@ -804,18 +807,38 @@ fn a_restarted_peer_is_trusted_again_and_counted() {
     // A new run: a new process, the same node.
     let mut liveness = Liveness::new(Settings {
         local: 3,
-        boot: 0xB007,
+        // Its run record raised at the start.
+        run: 2,
         max_peers: 3,
         history: Exposure::new(),
     })
     .unwrap();
     liveness.attach(1).unwrap();
     liveness.attach(2).unwrap();
+    let superseded = sim.nodes[victim]
+        .log
+        .iter()
+        .rev()
+        .find(|(_, peer, beat)| *peer == 1 && beat.run == 1)
+        .map(|(_, _, beat)| *beat)
+        .expect("the old run sent to node 1");
     sim.nodes[victim].liveness = liveness;
     sim.nodes[victim].believed.clear();
     sim.nodes[victim].alive = true;
     sim.nodes[victim].disk_busy_until = sim.now;
     sim.poll(victim);
+    sim.run_while(|sim| sim.nodes[0].restarts.is_empty(), None);
+    let mut bytes = [0u8; MAX_BYTES];
+    let stale = superseded.encode(&mut bytes).to_vec();
+    let (now, node) = (sim.now, &mut sim.nodes[0]);
+    let before = node.liveness.mtbf();
+    assert_eq!(
+        node.liveness.on_heartbeat(3, &stale, now, &mut node.owner),
+        Err(Refusal::Stale),
+        "the superseded run's heartbeat"
+    );
+    assert_eq!(node.liveness.mtbf(), before, "no second failure");
+    sim.drain(0);
     let end = sim.now + 2_000 * MS;
     sim.run(end);
     assert!(matches!(
@@ -836,13 +859,85 @@ fn a_restarted_peer_is_trusted_again_and_counted() {
     );
 }
 
+/// A heartbeat of a superseded run, delivered after the new run's first (the plane keeps two
+/// epochs a peer, so the old run's last datagrams still open), is refused as stale: the peer's
+/// restart is reported once and counted once in the MTBF's evidence, and the new run's next
+/// heartbeat is taken as the same run's. With an unordered run (a boot nonce) it was a restart
+/// back to the old run and another to the new: three restarts reported, three failures counted.
+#[test]
+fn a_superseded_runs_heartbeat_is_stale_and_its_restart_counts_once() {
+    let mut node = Liveness::new(Settings {
+        local: 1,
+        run: 1,
+        max_peers: 1,
+        history: Exposure::new(),
+    })
+    .unwrap();
+    node.attach(2).unwrap();
+    let mut owner = Owner {
+        id: 1,
+        sent: Vec::new(),
+        flush: false,
+        changes: Vec::new(),
+    };
+    // The first flush gives the floor, the second proves the first heartbeat, and the poll past
+    // the wake it asks measures the granularity: the node takes heartbeats from here.
+    node.on_durable(Write::Liveness, 0, 100 * US);
+    node.poll(200 * US, &mut owner);
+    node.on_durable(Write::Liveness, 200 * US, 300 * US);
+    node.poll(300 * US, &mut owner);
+    let wake = node.wake().expect("the next heartbeat is due");
+    node.poll(wake + 50 * US, &mut owner);
+    assert!(node.granularity().is_some());
+    let beat = |run: u64, seq: u64, flushes: u64| Heartbeat {
+        run,
+        seq,
+        interval_ns: MS,
+        floor_ns: 100 * US,
+        ask_ns: 0,
+        sent_ns: 10 * MS + seq * MS,
+        late_ns: 0,
+        flushes,
+        flush_age_ns: 0,
+        echo: None,
+    };
+    let mut out = [0u8; MAX_BYTES];
+    let mut feed = |node: &mut Liveness, owner: &mut Owner, beat: Heartbeat, at: u64| {
+        let bytes = beat.encode(&mut out).to_vec();
+        node.on_heartbeat(2, &bytes, at, owner)
+    };
+    assert_eq!(feed(&mut node, &mut owner, beat(5, 0, 1), 11 * MS), Ok(()));
+    assert_eq!(feed(&mut node, &mut owner, beat(5, 1, 2), 12 * MS), Ok(()));
+    // The peer restarts: run 6, its numbers and flushes from the start.
+    assert_eq!(feed(&mut node, &mut owner, beat(6, 0, 1), 13 * MS), Ok(()));
+    // Run 5's last heartbeat, delivered late.
+    assert_eq!(
+        feed(&mut node, &mut owner, beat(5, 2, 3), 13 * MS + 500 * US),
+        Err(Refusal::Stale)
+    );
+    assert_eq!(feed(&mut node, &mut owner, beat(6, 1, 2), 14 * MS), Ok(()));
+    let end = 20 * MS;
+    node.poll(end, &mut owner);
+    let restarts = owner
+        .changes
+        .iter()
+        .filter(|change| matches!(change, Change::Restarted { .. }))
+        .count();
+    assert_eq!(restarts, 1, "{:?}", owner.changes);
+    // The node watched its one peer from its first poll to its last; one failure in that time.
+    let mut expected = Exposure::new();
+    expected.on_exposure(Duration::from_nanos(end - 200 * US));
+    expected.on_failure();
+    assert_eq!(node.mtbf(), expected.mtbf());
+}
+
 /// A heartbeat whose proof does not hold, or that is stale, from a stranger or from this node, is
 /// refused.
 #[test]
 fn heartbeats_without_their_proof_are_refused() {
     let mut node = Liveness::new(Settings {
         local: 1,
-        boot: 1,
+        run: 1,
         max_peers: 1,
         history: Exposure::new(),
     })
@@ -857,7 +952,7 @@ fn heartbeats_without_their_proof_are_refused() {
         changes: Vec::new(),
     };
     let beat = Heartbeat {
-        boot: 9,
+        run: 9,
         seq: 0,
         interval_ns: 10 * MS,
         floor_ns: MS,

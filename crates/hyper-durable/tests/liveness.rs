@@ -87,6 +87,9 @@ struct Node {
     /// When the node is next woken.
     alarm: Option<u64>,
     alive: bool,
+    /// The node's run, as its durable record holds it: one at its first start, raised at each
+    /// start again (`hyper_liveness::Settings::run`).
+    run: u64,
 }
 
 enum Payload {
@@ -130,7 +133,7 @@ impl World {
                 let handle = owner.insert(replica).map_err(|_| ()).unwrap();
                 let mut liveness = Liveness::new(LiveSettings {
                     local: id,
-                    boot: seed.wrapping_mul(31).wrapping_add(id),
+                    run: 1,
                     max_peers: 3,
                     history: Exposure::new(),
                 })
@@ -145,6 +148,7 @@ impl World {
                     durable_at: None,
                     alarm: Some(0),
                     alive: true,
+                    run: 1,
                 }
             })
             .collect();
@@ -163,7 +167,7 @@ impl World {
     }
 
     /// The node `id` starts again on what its store holds durable, a new run of its liveness
-    /// stream (a new boot): the process it was is gone, the node is not.
+    /// stream (its run record raised): the process it was is gone, the node is not.
     fn restart(&mut self, id: u64) {
         let at = (id - 1) as usize;
         let node = &mut self.nodes[at];
@@ -180,13 +184,10 @@ impl World {
         .unwrap();
         let mut owner = Owner::new(vec![Waker::noop().clone()]);
         let handle = owner.insert(replica).map_err(|_| ()).unwrap();
+        let run = node.run + 1;
         let mut liveness = Liveness::new(LiveSettings {
             local: id,
-            boot: self
-                .seed
-                .wrapping_mul(31)
-                .wrapping_add(id)
-                .wrapping_add(self.now),
+            run,
             max_peers: 3,
             history: Exposure::new(),
         })
@@ -201,6 +202,7 @@ impl World {
             durable_at: None,
             alarm: Some(self.now),
             alive: true,
+            run,
         };
     }
 

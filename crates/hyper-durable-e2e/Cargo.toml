@@ -24,6 +24,9 @@ hyper-raft-e2e = { path = "../hyper-raft-e2e" }
 # A waker the log's answer wakes the member's thread by (its leaked slot is one a process).
 hyper-measure = { path = "../hyper-measure" }
 
+[dev-dependencies]
+tempfile.workspace = true
+
 [[bin]]
 name = "hyper-durable-node"
 path = "src/main.rs"

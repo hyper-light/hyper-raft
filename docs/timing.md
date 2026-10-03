@@ -1091,12 +1091,26 @@ a change in one node's timing moves no other source's draws. Each test's seeds a
 own, `HYPER_LIVENESS_SEEDS` of them for a soak (from the `HYPER_LIVENESS_SEED`-th); each runs until
 the facts it asserts on hold (every pair configured, every live pair through a renewal of its
 configuration, every survivor holding the victim suspected), never to a picked horizon; and every
-node's owner is held to the contract after every step. No test decides by a confidence level: every
-suspicion every node makes is traced, after every run, to the detector's own rule (`Sim::traced`:
-no heartbeat of the peer taken after the one the suspicion judged from was stamped by the kernel
-before its freshness point, each came at or past it or never came), and the suspicions of live
-peers against their allowance are the model's figures, reported (`docs/benchmarks.md`), never
-asserted, since no run's count tests a bound on an expectation. Live peers configure and are
+node's owner is held to the contract after every step. No test decides by a confidence level. Each
+node keeps a record (`tests/support/record.rs`, the process test's members too): every heartbeat it
+fed its stream, with its run, number, kernel stamp, schedule and send, what the stream made of it
+and the trust it held of the peer after; every poll that told a change, moved a trust or came at or
+past a point a peer was held trusted to; every change told; every heartbeat sent. Every suspicion
+in the records is traced to NFD-E's rule exactly: its heartbeat is the latest the node took from
+the peer before the call that told it (or the one that call took, where it came at or past its own
+successor's point, a configuration the take made having restated it); its freshness point is the one
+the stream held the peer trusted to before that call (where it held none, the point the margin
+given in that call set); the call came at or past the point and noticed it then; and no heartbeat of
+the peer's taken after was stamped before the point. Every heartbeat and every poll at or past the
+point a peer was held trusted to told its suspicion there, so none is missed. Every count a node's
+report states of a peer (the suspicions, the heartbeats taken, refused for their proof and sent, the
+slots skipped) is its record's, after every step of the simulation and at every state line of the
+process test. What became of the heartbeat each point awaited is reported: taken late and how late,
+its slot skipped by its sender, refused, lost, a new run's, none sent. The suspicions of live peers
+against their allowance are the model's figures, reported (`docs/benchmarks.md`), never asserted,
+since no run's count tests a bound on an expectation. A stream made to suspect 20 ms early, to
+judge at half its polls, to drop one heartbeat in five it says it took, or to leave a suspicion
+uncounted fails the trace or the count at once. Live peers configure and are
 trusted (8 seeds); no heartbeat leaves without a newer flush made after the previous was due (with
 and without the groups' own writes); a killed peer is suspected by every survivor within the bound
 each states from the peer's last schedule (16 seeds); a stalled disk is suspected so too, and the

@@ -5014,6 +5014,27 @@ heartbeats stamped before the poll; and the member read its clock after its sock
 between the two left the stop's datagrams for the next turn. `receive_ready` now asks the kernel
 on a kernel-stamped socket, and the member reads its clock first.
 
+**Every suspicion traced from the records** (2026-10-03, 11:02–11:10, load 3.9–6.0). The
+simulation's nodes and the process test's members keep a record of what they fed their streams and
+what the streams told them (`tests/support/record.rs`), and each suspicion is traced to NFD-E's
+rule from it: its heartbeat, its freshness point as the stream held it before the call that told
+it, the call at or past the point, and no heartbeat of the peer's taken after stamped before the
+point; every heartbeat and poll past a held point told its suspicion; every count a report states
+is its record's, at every step and every state line. The simulation, 13 tests at their default
+seeds: the live peers' 10 suspicions (8 seeds) all told at a poll, each awaiting a slot its sender
+skipped in a freeze, the latest answer 1.10 s past its point; allowance 122.0, reported. The process
+test, one run of each supervisor: the stalled and killed members' 6 suspicions, none sent after;
+the young victim's 2, each by the point the margin given in the same poll set; the stopped
+member's 2, its slots skipped while it was stopped, the latest answer 1.97 s past its point. A
+stream made wrong, one way at a time (scratch edits to `pair.rs`, not committed), fails at once:
+
+| the stream made to | caught by | the live peers' simulation | the process test |
+|---|---|---|---|
+| suspect 20 ms early | the point | 13 suspicions named | |
+| judge at half its polls | a poll past a held point told none | 16 named | 14 named |
+| drop one heartbeat in five it says it took | the heartbeat judged from | 1 named | |
+| leave its suspicions uncounted | the count | at the first step past one | |
+
 **The replay** (`crates/hyper-timing/tests/replay.rs`, four simulated hours at each interval of
 each shape, its stalls sent late or skipped, MTBF an hour or a month): every suspicion traced to the
 rule. Suspicions against the allowance, an hour's MTBF: macOS 100 µs shape at 5 ms, 2 / 57.0 (late)

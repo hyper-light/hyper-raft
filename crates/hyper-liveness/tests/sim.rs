@@ -94,6 +94,10 @@ impl Draws {
 mod worlds;
 use worlds::{Freezes, GRID, Table};
 
+#[path = "support/record.rs"]
+mod record;
+use record::{Beat, Record, Traced};
+
 /// A quantity's value at probability `u`, from its table by the inverse transform, linear between
 /// the neighbouring points of the grid (`hyper-timing-trace`'s, `worlds::GRID`).
 fn quantile(table: &Table, u: f64) -> u64 {
@@ -270,9 +274,10 @@ struct Node {
     /// Every durable completion: when.
     durable: Vec<u64>,
     suspicions: Vec<Suspicion>,
-    /// Every heartbeat the stream took, in the order it took them: from whom, its number, its
-    /// kernel stamp.
-    taken: Vec<(PeerId, u64, u64)>,
+    /// What the node fed its stream and what the stream told it, in order (`record`): every
+    /// suspicion in it is traced to the detector's rule, and every count the stream reports is
+    /// its.
+    record: Record,
     /// The peers whose restart the node's stream reported.
     restarts: Vec<PeerId>,
     /// What the owner believes of each peer from the changes it was told: suspected or not. The
@@ -341,7 +346,11 @@ impl Sim {
                     log: Vec::new(),
                     durable: Vec::new(),
                     suspicions: Vec::new(),
-                    taken: Vec::new(),
+                    record: {
+                        let mut record = Record::default();
+                        record.began();
+                        record
+                    },
                     restarts: Vec::new(),
                     believed: BTreeMap::new(),
                     timer: None,
@@ -430,10 +439,48 @@ impl Sim {
         if !self.nodes[node].alive || self.nodes[node].frozen_until > self.now {
             return;
         }
-        let now = self.now;
-        let n = &mut self.nodes[node];
-        n.liveness.poll(now, &mut n.owner);
+        self.polled(node);
         self.drain(node);
+    }
+
+    /// Polls `node`'s stream now and records the poll, with what it told and the trust it holds
+    /// of each peer after.
+    fn polled(&mut self, node: usize) {
+        let now = self.now;
+        let count = self.nodes.len() as u64;
+        let n = &mut self.nodes[node];
+        let told = n.owner.changes.len();
+        n.liveness.poll(now, &mut n.owner);
+        let id = n.owner.id;
+        let trusts: Vec<(PeerId, Option<Trust>)> = (1..=count)
+            .filter(|peer| *peer != id)
+            .map(|peer| (peer, n.liveness.trust(peer)))
+            .collect();
+        n.record.polled(now, &n.owner.changes[told..], trusts);
+    }
+
+    /// Feeds `node`'s stream a heartbeat from `from`, stamped by the kernel at `stamp`, and records
+    /// the call: what the stream made of it, what it told, the trust it holds of the peer after.
+    fn feed(&mut self, node: usize, from: usize, bytes: &[u8], stamp: u64) -> Result<(), Refusal> {
+        let n = &mut self.nodes[node];
+        let peer = from as u64 + 1;
+        let told = n.owner.changes.len();
+        let outcome = n.liveness.on_heartbeat(peer, bytes, stamp, &mut n.owner);
+        let beat = Beat::of(bytes, stamp).expect("the simulation sends heartbeats whole");
+        let holds = n.liveness.trust(peer);
+        n.record
+            .fed(peer, beat, outcome, &n.owner.changes[told..], holds);
+        outcome
+    }
+
+    /// `node` restarts: a new process with the stream `liveness`, its record begun again.
+    fn restart(&mut self, node: usize, liveness: Liveness) {
+        let n = &mut self.nodes[node];
+        n.liveness = liveness;
+        n.record.began();
+        n.believed.clear();
+        n.alive = true;
+        n.disk_busy_until = self.now;
     }
 
     fn drain(&mut self, node: usize) {
@@ -441,6 +488,7 @@ impl Sim {
         for (peer, bytes) in sent {
             let beat = Heartbeat::decode(&bytes).unwrap();
             self.nodes[node].log.push((self.now, peer, beat));
+            self.nodes[node].record.sent(peer, beat.run, beat.seq);
             let delay = self.draws.draw("link", node as u64, peer, self.world.delay);
             self.schedule(
                 self.now + delay,
@@ -497,38 +545,36 @@ impl Sim {
         }
     }
 
-    /// Every suspicion every node made, traced to the detector's own rule (NFD-E: at a freshness
-    /// point the peer is trusted only if a heartbeat after the latest one taken has come): no
-    /// heartbeat of the peer's taken after the suspicion's last, the one it judged from, was stamped
-    /// by the kernel before the suspicion's freshness point. Each came at or past it, or never
-    /// came: skipped by its sender, refused, or never sent by a peer that died. A suspicion of a
-    /// peer never heard from judged none, and none came before it.
-    fn traced(&self) {
-        for (index, node) in self.nodes.iter().enumerate() {
-            for suspicion in &node.suspicions {
-                let from = suspicion.last.map_or(Some(0), |last| {
-                    node.taken
-                        .iter()
-                        .rposition(|&(peer, seq, stamp)| {
-                            peer == suspicion.peer
-                                && seq == last.seq
-                                && stamp == last.arrival_ns
-                                && stamp <= suspicion.at_ns
-                        })
-                        .map(|at| at + 1)
-                });
-                let from = from.unwrap_or_else(|| {
-                    panic!("node {index}: no heartbeat taken is the last of {suspicion:?}")
-                });
-                let early = node.taken[from..]
-                    .iter()
-                    .filter(|(peer, ..)| *peer == suspicion.peer)
-                    .find(|(_, _, stamp)| *stamp < suspicion.at_ns);
-                assert!(
-                    early.is_none(),
-                    "node {index}: {suspicion:?} with {early:?} taken, stamped before its \
-                     freshness point"
-                );
+    /// Every suspicion every node's stream told, traced to the detector's rule from the nodes'
+    /// records (`record::trace`); a suspicion or a passed freshness point that does not trace fails
+    /// the test, each named. What the trace found.
+    fn traced(&self) -> Traced {
+        let records: Vec<(PeerId, &[record::Entry])> = self
+            .nodes
+            .iter()
+            .map(|node| (node.owner.id, node.record.entries.as_slice()))
+            .collect();
+        let (traced, failures) = record::trace(&records);
+        assert!(
+            failures.is_empty(),
+            "{} suspicions or passed points do not trace to the detector's rule:\n{}",
+            failures.len(),
+            failures.join("\n")
+        );
+        traced
+    }
+
+    /// Every count each node's stream reports of each peer is its record's: the suspicions told,
+    /// the heartbeats taken and refused for their proof, sent, and the slots skipped between.
+    fn counted(&self) {
+        let count = self.nodes.len() as u64;
+        for node in &self.nodes {
+            for peer in (1..=count).filter(|peer| *peer != node.owner.id) {
+                if let Some(report) = node.liveness.report(peer)
+                    && let Some(differs) = node.record.differs(peer, &report)
+                {
+                    panic!("node {} at {} ns: {differs}", node.owner.id, self.now);
+                }
             }
         }
     }
@@ -660,6 +706,7 @@ impl Sim {
             self.elect();
             self.note_configured();
             self.told_is_believed();
+            self.counted();
         }
         self.traced();
     }
@@ -696,17 +743,9 @@ impl Sim {
                 if !self.nodes[to].alive {
                     return;
                 }
-                let now = self.now;
-                let n = &mut self.nodes[to];
                 // Refusals are the crate's to make: a stale or unproven heartbeat is dropped.
-                if n.liveness
-                    .on_heartbeat(from as u64 + 1, &bytes, stamp, &mut n.owner)
-                    .is_ok()
-                {
-                    let seq = Heartbeat::decode(&bytes).unwrap().seq;
-                    n.taken.push((from as u64 + 1, seq, stamp));
-                }
-                n.liveness.poll(now, &mut n.owner);
+                let _ = self.feed(to, from, &bytes, stamp);
+                self.polled(to);
                 self.drain(to);
             }
             Event::Durable {
@@ -721,7 +760,7 @@ impl Sim {
                 let n = &mut self.nodes[node];
                 n.durable.push(now);
                 n.liveness.on_durable(write, started, now);
-                n.liveness.poll(now, &mut n.owner);
+                self.polled(node);
                 self.drain(node);
                 // The groups keep the log busy: their next write as this one completes.
                 if write == Write::Log && self.world.busy {
@@ -762,21 +801,15 @@ impl Sim {
             self.nodes[node].liveness.on_wait(deadline, now);
         }
         for event in held {
-            let n = &mut self.nodes[node];
             let completed = match event {
                 Event::Arrive {
                     from, bytes, stamp, ..
                 } => {
-                    if n.liveness
-                        .on_heartbeat(from as u64 + 1, &bytes, stamp, &mut n.owner)
-                        .is_ok()
-                    {
-                        let seq = Heartbeat::decode(&bytes).unwrap().seq;
-                        n.taken.push((from as u64 + 1, seq, stamp));
-                    }
+                    let _ = self.feed(node, from, &bytes, stamp);
                     None
                 }
-                Event::Durable { write, started, .. } if !n.disk_stalled => {
+                Event::Durable { write, started, .. } if !self.nodes[node].disk_stalled => {
+                    let n = &mut self.nodes[node];
                     n.durable.push(now);
                     n.liveness.on_durable(write, started, now);
                     Some(write)
@@ -897,12 +930,15 @@ impl Sim {
     }
 }
 
-/// Live peers: every pair configures and trusts, and every suspicion of a live peer is traced to
-/// the detector's rule (`Sim::traced`, after every run). The suspicions against the allowance the
-/// configurations promised are the model's figures, reported (`docs/benchmarks.md`).
+/// Live peers: every pair configures and trusts, every suspicion of a live peer is traced to the
+/// detector's rule, and every count each stream reports is its record's (`Sim::traced` after every
+/// run, `Sim::counted` after every step). The suspicions against the allowance the configurations
+/// promised are the model's figures, reported (`docs/benchmarks.md`), never asserted: a count is
+/// what the rule found, not a draw to test a bound on an expectation with.
 #[test]
 fn live_peers_configure_and_every_suspicion_of_them_is_traced() {
     let (mut suspicions, mut allowance) = (0u64, 0.0f64);
+    let mut traced = Traced::default();
     for seed in seeds(1, 8) {
         let mut sim = Sim::new(3, MACOS, seed);
         sim.run_until_configured();
@@ -917,7 +953,9 @@ fn live_peers_configure_and_every_suspicion_of_them_is_traced() {
         let (count, allowed) = sim.allowance(&[0, 1, 2]);
         suspicions += count;
         allowance += allowed;
+        traced += sim.traced();
     }
+    println!("every suspicion traced: {traced}");
     println!("suspicions of live peers {suspicions}, allowance {allowance:.1}");
 }
 
@@ -1169,22 +1207,19 @@ fn a_restarted_peer(seed: u64) {
         .find(|(_, peer, beat)| *peer == 1 && beat.run == 1)
         .map(|(_, _, beat)| *beat)
         .expect("the old run sent to node 1");
-    sim.nodes[victim].liveness = liveness;
-    sim.nodes[victim].believed.clear();
-    sim.nodes[victim].alive = true;
-    sim.nodes[victim].disk_busy_until = sim.now;
+    sim.restart(victim, liveness);
     sim.poll(victim);
     sim.run_while(|sim| sim.nodes[0].restarts.is_empty(), None);
     let mut bytes = [0u8; MAX_BYTES];
     let stale = superseded.encode(&mut bytes).to_vec();
-    let (now, node) = (sim.now, &mut sim.nodes[0]);
-    let before = node.liveness.mtbf();
+    let now = sim.now;
+    let before = sim.nodes[0].liveness.mtbf();
     assert_eq!(
-        node.liveness.on_heartbeat(3, &stale, now, &mut node.owner),
+        sim.feed(0, victim, &stale, now),
         Err(Refusal::Stale),
         "the superseded run's heartbeat"
     );
-    assert_eq!(node.liveness.mtbf(), before, "no second failure");
+    assert_eq!(sim.nodes[0].liveness.mtbf(), before, "no second failure");
     sim.drain(0);
     // Until both others saw the new run and trust it, and through a renewal of every pair.
     sim.run_while(

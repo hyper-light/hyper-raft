@@ -189,9 +189,11 @@ fn main() {
         // A path probed at the interval on a link whose correlation time is the interval: the
         // window of three the derivation gives at the configurator's multi-heartbeat floor.
         let interval = Duration::from_nanos(INTERVAL);
+        // Its answers stamped at one instant: none ages past the span, as on a path probed at its
+        // interval.
         path.push(path_sample(
             PathRtt::new(interval, interval).unwrap(),
-            PathRtt::on_sample,
+            |path: &mut PathRtt, rtt| path.on_sample(rtt, 0, 0),
             seed,
         ));
         exchange.push(path_sample(

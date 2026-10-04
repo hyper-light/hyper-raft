@@ -37,6 +37,19 @@ hyper-sim = { path = "../hyper-sim" }
 lazy_static = "1"
 rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem"] }
 tracing-subscriber = { version = "0.3.0", default-features = false, features = ["env-filter", "fmt", "ansi", "time", "local-time"] }
+# Upstream quinn-proto 0.11.18, unmodified, on rustls with AWS-LC and the token log hyper-quic always
+# builds: the other process of the interoperation test (`tests/e2e.rs`; slates'
+# docs/wip/transport-quic.md §4, stage 5). A test dependency only, never shipped.
+upstream-quinn-proto = { package = "quinn-proto", version = "=0.11.18", default-features = false, features = ["bloom", "rustls-aws-lc-rs"] }
+# The rustls upstream quinn-proto runs on, with hyper-tls's one build path, as hyper-tls's own tests
+# take it: one feature set for it whichever crates a build includes.
+upstream-rustls = { package = "rustls", version = "=0.23.45", default-features = false, features = ["aws_lc_rs", "brotli", "logging", "prefer-post-quantum", "std", "tls12", "zlib"] }
+
+[[test]]
+name = "e2e"
+# Real processes over UDP: the binary is the client and spawns itself as the server, the relay and,
+# for one scenario, the client (CLAUDE.md §1a), one peer process at a time.
+harness = false
 
 [lints]
 workspace = true

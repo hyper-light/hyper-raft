@@ -372,3 +372,53 @@ spent TLS 1.3 ticket's certificate chain moves into the connection where it was 
 (`crates/hyper-tls/VENDORED.md` §5). `tests/handshake.rs`, debug profile, this machine: 492
 allocations a full handshake (494 before), 497 a resumed one (501 before), against 526c2cc's 505 and
 511.
+
+## 8. End to end, against upstream (2026-10-03)
+
+`tests/e2e.rs` (`harness = false`): real processes over real UDP sockets on loopback (CLAUDE.md
+§1a). The test binary is the client and spawns itself as the server, as a relay and, for one
+scenario, as the client, each a process that shares nothing with it but the kernel's sockets.
+Every scenario runs three ways: hyper-quic on both sides, a hyper-quic client against an upstream
+quinn-proto 0.11.18 server, and an upstream client against a hyper-quic server (the
+`upstream-quinn-proto` dev-dependency, unmodified, on rustls 0.23.45 with AWS-LC; slates'
+`docs/wip/transport-quic.md` §4, stage 5). A killed peer runs where hyper-quic is the survivor.
+The scenarios follow the QUIC interop runner's cases (quic-interop-runner `testcases_quic.py` at
+`740c05a`):
+
+| Scenario | What it does and checks |
+|---|---|
+| `handshake` | a full handshake with a mebibyte each way, then a resumed one whose stream takes its bytes before the handshake ends: the client's `accepted_0rtt` and the server's 0-RTT keys both say the early data was taken (`resumption`, `zerortt`) |
+| `streams` | three bidirectional streams at once, 2, 3 and 5 MiB each way (`transfer`'s files) |
+| `lossy` | 2 MiB each way through a relay process that drops one full-size datagram in fifty in each direction (`transferloss`'s 2 %) and holds one in fifty until the next in its direction has passed; the relay reports its drops and holds, and both senders report packets lost and recovered |
+| `migration` | 2 MiB each way while the client moves to a new socket mid-transfer and tells its connection (RFC 9000 §9.5: a new connection ID on the new path); the server sends PATH_CHALLENGE on the new path and follows the client to it, the client answers and retires a connection ID (`connectionmigration`) |
+| `rebinding` | the same with the client's socket replaced unannounced, as a NAT rebinding does (RFC 9000 §9.3, `rebind-port`) |
+| `killed-server` | the server process is killed with SIGKILL mid-upload; the client's connection ends `TimedOut` no sooner than its idle timeout after the server's last datagram (RFC 9000 §10.1), and a new server process answers |
+| `killed-client` | the client process is killed mid-upload; the server's connection ends the same way, and the server serves the next client |
+
+Every stream carries a pattern no lost, duplicated or misplaced byte can match, checked byte by
+byte on both sides. A process is killed mid-stream on a fact: the server once a stream has brought
+it a mebibyte, the client once flow control (RFC 9000 §4.1) shows the server has taken a stream
+window of its upload.
+
+Every wait is for a fact: a datagram, a timer the connection set, or an event it reports. A wait
+ends when its fact holds or when the connection reports its end; the quiet rule (as
+`hyper_raft_e2e::quiet`, in the protocol's terms) fails it once no stream byte has moved for the
+connection's idle timeout of listening, 30 s (`TransportConfig`'s default; RFC 9308 §3.2 finds
+shorter timeouts make transient interruptions harder to survive): QUIC itself ends a connection
+that hears nothing that long, so one that hears its peer and moves nothing that long is stuck.
+Only time the driver spent listening on its socket counts, so a starved process does not count its
+starvation as the peer's silence. A wait for a killed peer's end is the connection's own idle
+timer; its failure guard is a second idle timeout of listening.
+
+Results, debug profile, this machine, four runs of all 19 at load 21–46 (other sessions building
+and testing), every one passing: a full and a 0-RTT handshake with a mebibyte each way in 0.33–0.56
+s; 10 MiB each way on three streams in 0.47–1.30 s; through the relay 0.28–0.56 s, the relay
+dropping 30 and holding 30 of about 1,515 full-size datagrams each way and the senders recovering
+30 losses each (31 once); a migration or rebinding in 0.23–0.31 s, the server sending two
+PATH_CHALLENGE frames (three twice) and the client answering, and retiring a connection ID after an
+announced move; a killed server timed out 30.050–30.062 s after its last datagram, a killed client
+30.001–30.029 s after its own. Earlier runs found four defects in the harness itself, each fixed
+before these: a connection forgotten as it drained before its end was read (the killed scenarios
+waited for an end already gone), a server that took its client's stream mark for the end of its
+connection, and two hooks that read a stream before the server's limits let it open (one run in
+four at load 58).

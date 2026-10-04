@@ -186,6 +186,12 @@ Each stage lands with its tests, its GAPS row and its design status in the same 
      past its reservation refused before it is retained).
    - qlog output decodable by standard tooling.
 
+   Interop and migration are proved at the crate: `crates/hyper-quic/tests/e2e.rs` runs every
+   scenario between processes three ways, hyper-quic against itself and against unmodified upstream
+   quinn-proto as client and as server, an active migration and an unannounced rebinding among them,
+   each validated by the server (crates/hyper-quic/VENDORED.md §8). The defect regressions and qlog
+   remain stage 5's in slates' fleet suite.
+
 ## 4a. The application layer: `hyper-transport` (T-1, 2026-10-01)
 
 Built: `crates/hyper-transport`, mantle note 32 §3.4's application layer, a sans-io state machine

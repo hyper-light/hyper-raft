@@ -1,0 +1,7267 @@
+# The clients' histories of mantle's range simulation, every default seed (1 to 48), with mantle's
+# own commit order as the witness (docs/sim.md §14.7).
+# Recorded from mantle origin/dev 21ae613ade7c6542d93eee7d9e4153ff4068e511, crates/range/tests/sim.rs
+# with a recorder added and nothing else changed (its run, its faults and its own checks the same:
+# `a_group_under_faults_is_linearizable_and_applies_every_put_once` and
+# `a_seed_runs_the_same_every_time` pass on the recorded copy), by the test `record_histories`,
+# 2026-10-04. The recorder appends, in program order:
+#   s <seed>                        a seed's history begins
+#   i w <op> <key> <value>          a gateway's put called (its first send; retries are the same op)
+#   i r <op> <key>                  a gateway's get called
+#   p <op> <key> <sequence>         the put first applied by any member: published as the key's
+#                                   <sequence>-th put (later applications of a retry are the
+#                                   session's deduplicated answer and change nothing)
+#   c w <op>                        the put answered committed
+#   c r <op> <sequence> <value|->   the get answered with the key's value at the member's applied
+#                                   index, the <sequence>-th put's state
+s 1
+i w 1 k1 g0o2
+i r 2 k0
+i r 3 k1
+c r 2 0 -
+c r 3 0 -
+i r 4 k1
+i w 5 k0 g2o2
+p 1 k1 1
+c w 1
+i w 6 k0 g0o3
+p 5 k0 1
+c w 5
+i w 7 k0 g2o3
+c r 4 1 g0o2
+i w 8 k0 g1o3
+p 6 k0 2
+c w 6
+i r 9 k0
+p 7 k0 3
+c w 7
+i w 10 k1 g2o4
+p 8 k0 4
+c w 8
+i r 11 k1
+p 10 k1 2
+c w 10
+c r 9 4 g1o3
+c r 11 2 g2o4
+i r 12 k1
+i r 13 k1
+i w 14 k1 g2o5
+c r 12 2 g2o4
+i r 15 k1
+c r 15 2 g2o4
+c r 13 2 g2o4
+i r 16 k0
+i r 17 k1
+c r 16 4 g1o3
+i w 18 k1 g0o8
+c r 17 2 g2o4
+i w 19 k0 g1o7
+p 14 k1 3
+c w 14
+p 18 k1 4
+c w 18
+p 19 k0 5
+c w 19
+i r 20 k0
+i w 21 k1 g1o8
+i r 22 k0
+c r 20 5 g1o7
+i r 23 k0
+p 21 k1 5
+c w 21
+i r 24 k0
+c r 22 5 g1o7
+i w 25 k0 g2o7
+c r 23 5 g1o7
+i w 26 k0 g0o11
+c r 24 5 g1o7
+i r 27 k1
+c r 27 5 g1o8
+i w 28 k1 g1o11
+p 25 k0 6
+c w 25
+p 26 k0 7
+c w 26
+i w 29 k1 g0o12
+i r 30 k0
+p 28 k1 6
+c w 28
+p 29 k1 7
+c w 29
+c r 30 7 g0o11
+i w 31 k1 g0o13
+i w 32 k0 g1o12
+i r 33 k0
+c r 33 7 g0o11
+i w 34 k0 g2o10
+p 31 k1 8
+c w 31
+i w 35 k0 g0o14
+p 32 k0 8
+c w 32
+i r 36 k1
+p 34 k0 9
+c w 34
+i w 37 k0 g2o11
+c r 36 8 g0o13
+i r 38 k0
+p 35 k0 10
+c w 35
+i w 39 k1 g0o15
+p 37 k0 11
+c w 37
+c r 38 11 g2o11
+i r 40 k1
+i r 41 k0
+c r 40 8 g0o13
+i w 42 k1 g1o16
+p 39 k1 9
+c w 39
+i w 43 k0 g0o16
+c r 41 11 g2o11
+i w 44 k0 g2o13
+p 42 k1 10
+c w 42
+i r 45 k0
+p 43 k0 12
+c w 43
+p 44 k0 13
+c w 44
+i r 46 k1
+i r 47 k1
+c r 45 13 g2o13
+i r 48 k1
+c r 46 10 g1o16
+c r 48 10 g1o16
+c r 47 10 g1o16
+i r 49 k0
+i r 50 k1
+i r 51 k1
+c r 49 13 g2o13
+c r 50 10 g1o16
+c r 51 10 g1o16
+i w 52 k1 g0o19
+i r 53 k1
+i r 54 k0
+c r 53 10 g1o16
+c r 54 13 g2o13
+i r 55 k0
+c r 55 13 g2o13
+i w 56 k0 g2o18
+p 52 k1 11
+c w 52
+i w 57 k0 g0o20
+p 56 k0 14
+c w 56
+i w 58 k0 g2o19
+p 57 k0 15
+c w 57
+i r 59 k1
+p 58 k0 16
+c w 58
+i w 60 k1 g2o20
+c r 59 11 g0o19
+p 60 k1 12
+c w 60
+s 2
+i w 1 k0 g0o2
+i w 2 k0 g1o1
+i w 3 k1 g2o1
+p 1 k0 1
+c w 1
+i r 4 k1
+p 2 k0 2
+c w 2
+p 3 k1 1
+c w 3
+i w 5 k1 g1o2
+i r 6 k0
+c r 4 1 g2o1
+i w 7 k1 g0o4
+p 5 k1 2
+c w 5
+i w 8 k0 g1o3
+c r 6 2 g1o1
+i w 9 k0 g2o3
+p 7 k1 3
+c w 7
+i r 10 k1
+p 8 k0 3
+c w 8
+i w 11 k1 g1o4
+p 9 k0 4
+c w 9
+i r 12 k0
+c r 10 3 g0o4
+i w 13 k1 g0o6
+c r 12 4 g2o3
+i w 14 k0 g2o5
+p 11 k1 4
+c w 11
+i r 15 k1
+p 13 k1 5
+c w 13
+i w 16 k1 g0o7
+p 14 k0 5
+c w 14
+i w 17 k1 g2o6
+p 16 k1 6
+c w 16
+i w 18 k1 g0o8
+c r 15 6 g0o7
+i w 19 k1 g1o6
+p 17 k1 7
+c w 17
+p 18 k1 8
+c w 18
+i r 20 k0
+i r 21 k1
+p 19 k1 9
+c w 19
+i w 22 k0 g1o7
+c r 20 5 g2o5
+c r 21 9 g1o6
+i w 23 k0 g0o10
+i r 24 k0
+p 22 k0 6
+c w 22
+c r 24 6 g1o7
+i w 25 k1 g1o8
+i r 26 k0
+c r 26 6 g1o7
+i w 27 k1 g2o10
+p 23 k0 7
+c w 23
+i w 28 k1 g0o11
+p 25 k1 10
+c w 25
+i w 29 k1 g1o9
+p 27 k1 11
+c w 27
+i r 30 k0
+p 28 k1 12
+c w 28
+p 29 k1 13
+c w 29
+i w 31 k1 g0o12
+i w 32 k1 g1o10
+c r 30 7 g0o10
+i w 33 k1 g2o12
+p 31 k1 14
+c w 31
+i w 34 k0 g0o13
+p 32 k1 15
+c w 32
+i r 35 k0
+p 33 k1 16
+c w 33
+i w 36 k1 g2o13
+p 34 k0 8
+c w 34
+i w 37 k1 g0o14
+c r 35 8 g0o13
+i w 38 k0 g1o12
+p 36 k1 17
+c w 36
+p 37 k1 18
+c w 37
+i w 39 k1 g0o15
+i r 40 k0
+p 38 k0 9
+c w 38
+i w 41 k0 g1o13
+c r 40 9 g1o12
+i r 42 k0
+c r 42 9 g1o12
+i w 43 k1 g2o16
+p 39 k1 19
+c w 39
+i w 44 k1 g0o16
+p 41 k0 10
+c w 41
+i r 45 k0
+p 43 k1 20
+c w 43
+i r 46 k0
+p 44 k1 21
+c w 44
+c r 45 10 g1o13
+c r 46 10 g1o13
+i w 47 k0 g0o17
+i r 48 k0
+i w 49 k1 g2o18
+c r 48 10 g1o13
+i r 50 k0
+c r 50 10 g1o13
+i r 51 k0
+p 47 k0 11
+c w 47
+p 49 k1 22
+c w 49
+c r 51 11 g0o17
+i r 52 k1
+i r 53 k1
+i r 54 k0
+c r 52 22 g2o18
+c r 53 22 g2o18
+i w 55 k0 g0o19
+i r 56 k1
+c r 56 22 g2o18
+c r 54 11 g0o17
+i r 57 k1
+i w 58 k0 g2o20
+c r 57 22 g2o18
+p 55 k0 12
+c w 55
+i r 59 k0
+p 58 k0 13
+c w 58
+c r 59 13 g2o20
+i r 60 k1
+c r 60 22 g2o18
+s 3
+i r 1 k1
+i r 2 k1
+i r 3 k1
+c r 1 0 -
+c r 2 0 -
+c r 3 0 -
+i r 4 k1
+i w 5 k1 g1o2
+i w 6 k0 g2o2
+p 5 k1 1
+c w 5
+i w 7 k0 g1o3
+c r 4 1 g1o2
+i r 8 k1
+p 6 k0 1
+c w 6
+c r 8 1 g1o2
+i r 9 k0
+i w 10 k1 g2o3
+p 7 k0 2
+c w 7
+c r 9 2 g1o3
+i r 11 k0
+i w 12 k0 g1o4
+c r 11 2 g1o3
+i w 13 k0 g0o7
+p 10 k1 2
+c w 10
+i w 14 k0 g2o4
+p 12 k0 3
+c w 12
+i w 15 k1 g1o5
+p 13 k0 4
+c w 13
+i w 16 k0 g0o8
+p 14 k0 5
+c w 14
+p 15 k1 3
+c w 15
+i w 17 k1 g1o6
+i w 18 k1 g2o5
+p 16 k0 6
+c w 16
+i w 19 k1 g0o9
+p 17 k1 4
+c w 17
+p 18 k1 5
+c w 18
+p 19 k1 6
+c w 19
+i r 20 k1
+i w 21 k1 g1o7
+i w 22 k1 g2o6
+p 21 k1 7
+c w 21
+p 22 k1 8
+c w 22
+c r 20 8 g2o6
+i r 23 k0
+i r 24 k1
+i w 25 k1 g2o7
+c r 23 6 g0o8
+i r 26 k1
+c r 26 8 g2o6
+c r 24 8 g2o6
+i w 27 k0 g0o13
+i w 28 k1 g1o9
+p 25 k1 9
+c w 25
+i r 29 k1
+p 27 k0 7
+c w 27
+p 28 k1 10
+c w 28
+c r 29 10 g1o9
+i r 30 k1
+i r 31 k0
+i w 32 k1 g2o9
+c r 30 10 g1o9
+i w 33 k1 g0o15
+c r 31 7 g0o13
+i w 34 k0 g1o11
+p 32 k1 11
+c w 32
+i r 35 k1
+p 33 k1 12
+c w 33
+p 34 k0 8
+c w 34
+c r 35 12 g0o15
+i w 36 k1 g0o16
+i r 37 k1
+i r 38 k1
+c r 37 12 g0o15
+c r 38 12 g0o15
+i r 39 k0
+i w 40 k0 g2o12
+p 36 k1 13
+c w 36
+i w 41 k1 g0o17
+c r 39 8 g1o11
+i w 42 k1 g1o14
+p 40 k0 9
+c w 40
+i w 43 k0 g2o13
+p 41 k1 14
+c w 41
+i r 44 k1
+p 42 k1 15
+c w 42
+p 43 k0 10
+c w 43
+i w 45 k0 g1o15
+i r 46 k0
+c r 44 15 g1o14
+c r 46 10 g2o13
+i r 47 k0
+i w 48 k1 g2o15
+p 45 k0 11
+c w 45
+i w 49 k1 g1o16
+p 48 k1 16
+c w 48
+i r 50 k0
+c r 47 11 g1o15
+i w 51 k0 g0o20
+p 49 k1 17
+c w 49
+i w 52 k0 g1o17
+c r 50 11 g1o15
+i w 53 k0 g2o17
+p 51 k0 12
+c w 51
+p 52 k0 13
+c w 52
+i r 54 k0
+i r 55 k0
+p 53 k0 14
+c w 53
+c r 54 14 g2o17
+c r 55 14 g2o17
+i w 56 k0 g1o19
+i r 57 k1
+c r 57 17 g1o16
+i r 58 k0
+c r 58 14 g2o17
+i r 59 k0
+p 56 k0 15
+c w 56
+c r 59 15 g1o19
+i w 60 k1 g1o20
+p 60 k1 18
+c w 60
+s 4
+i r 1 k0
+i r 2 k1
+i w 3 k1 g2o1
+c r 1 0 -
+c r 2 0 -
+i r 4 k0
+i r 5 k1
+p 3 k1 1
+c w 3
+i r 6 k0
+c r 4 0 -
+c r 5 1 g2o1
+i w 7 k1 g0o4
+i r 8 k1
+c r 6 0 -
+i w 9 k1 g2o3
+c r 8 1 g2o1
+i w 10 k1 g1o4
+p 7 k1 2
+c w 7
+i w 11 k0 g0o5
+p 9 k1 3
+c w 9
+i w 12 k0 g2o4
+p 10 k1 4
+c w 10
+i w 13 k0 g1o5
+p 11 k0 1
+c w 11
+i w 14 k1 g0o6
+p 12 k0 2
+c w 12
+i r 15 k1
+p 13 k0 3
+c w 13
+i w 16 k0 g1o6
+p 14 k1 5
+c w 14
+i r 17 k0
+p 16 k0 4
+c w 16
+c r 15 5 g0o6
+i w 18 k0 g1o7
+i w 19 k1 g2o6
+c r 17 4 g1o6
+i w 20 k0 g0o8
+p 18 k0 5
+c w 18
+p 19 k1 6
+c w 19
+i r 21 k0
+i w 22 k1 g2o7
+p 20 k0 6
+c w 20
+p 22 k1 7
+c w 22
+c r 21 6 g0o8
+i w 23 k0 g0o9
+i r 24 k1
+i r 25 k0
+c r 24 7 g2o7
+i w 26 k0 g1o10
+p 23 k0 7
+c w 23
+i r 27 k1
+p 26 k0 8
+c w 26
+i w 28 k0 g1o11
+c r 25 8 g1o10
+i w 29 k0 g2o9
+c r 27 7 g2o7
+i r 30 k1
+p 28 k0 9
+c w 28
+p 29 k0 10
+c w 29
+i r 31 k1
+i r 32 k1
+c r 31 7 g2o7
+c r 32 7 g2o7
+i w 33 k0 g1o13
+i w 34 k0 g2o11
+p 33 k0 11
+c w 33
+i w 35 k0 g1o14
+p 34 k0 12
+c w 34
+i w 36 k1 g2o12
+p 35 k0 13
+c w 35
+p 36 k1 8
+c w 36
+i r 37 k0
+i w 38 k0 g2o13
+p 38 k0 14
+c w 38
+i r 39 k1
+c r 37 14 g2o13
+i r 40 k0
+c r 40 14 g2o13
+c r 39 8 g2o12
+i w 41 k0 g1o17
+i w 42 k1 g2o15
+p 41 k0 15
+c w 41
+p 42 k1 9
+c w 42
+i w 43 k0 g1o18
+i r 44 k0
+p 43 k0 16
+c w 43
+c r 44 16 g1o18
+i w 45 k0 g1o19
+i w 46 k0 g2o17
+c r 30 9 g2o15
+i w 47 k0 g0o12
+p 45 k0 17
+c w 45
+p 46 k0 18
+c w 46
+p 47 k0 19
+c w 47
+i r 48 k1
+i r 49 k1
+i w 50 k0 g2o18
+p 50 k0 20
+c w 50
+i w 51 k0 g2o19
+c r 48 9 g2o15
+c r 49 9 g2o15
+i r 52 k0
+c r 52 20 g2o18
+i w 53 k1 g0o15
+p 51 k0 21
+c w 51
+i r 54 k1
+p 53 k1 10
+c w 53
+i w 55 k1 g0o16
+c r 54 10 g0o15
+p 55 k1 11
+c w 55
+i r 56 k0
+c r 56 21 g2o19
+i w 57 k0 g0o18
+p 57 k0 22
+c w 57
+i w 58 k1 g0o19
+p 58 k1 12
+c w 58
+i r 59 k1
+c r 59 12 g0o19
+i w 60 k1 g0o21
+p 60 k1 13
+c w 60
+s 5
+i r 1 k0
+i w 2 k1 g1o1
+i w 3 k1 g2o1
+p 2 k1 1
+c w 2
+p 3 k1 2
+c w 3
+i w 4 k0 g1o2
+i r 5 k1
+c r 1 0 -
+i w 6 k1 g0o3
+c r 5 2 g2o1
+i w 7 k0 g2o3
+p 4 k0 1
+c w 4
+i w 8 k0 g1o3
+p 6 k1 3
+c w 6
+i r 9 k0
+p 7 k0 2
+c w 7
+i w 10 k1 g2o4
+p 8 k0 3
+c w 8
+c r 9 3 g1o3
+i r 11 k1
+i w 12 k0 g1o4
+p 10 k1 4
+c w 10
+c r 11 4 g2o4
+i r 13 k1
+i w 14 k0 g2o5
+p 12 k0 4
+c w 12
+c r 13 4 g2o4
+i r 15 k1
+i r 16 k0
+c r 15 4 g2o4
+i r 17 k0
+p 14 k0 5
+c w 14
+c r 17 5 g2o5
+c r 16 5 g2o5
+i r 18 k1
+i r 19 k1
+i w 20 k0 g2o6
+p 20 k0 6
+c w 20
+i r 21 k1
+c r 21 4 g2o4
+i w 22 k1 g2o8
+p 22 k1 5
+c w 22
+i r 23 k0
+c r 23 6 g2o6
+i w 24 k1 g2o10
+c r 18 5 g2o8
+c r 19 5 g2o8
+i r 25 k0
+i w 26 k0 g1o7
+p 24 k1 6
+c w 24
+i r 27 k1
+c r 25 6 g2o6
+i w 28 k1 g0o11
+p 26 k0 7
+c w 26
+c r 27 6 g2o10
+i w 29 k0 g1o8
+i w 30 k1 g2o12
+p 28 k1 7
+c w 28
+i r 31 k1
+c r 31 7 g0o11
+i w 32 k1 g0o13
+p 29 k0 8
+c w 29
+i r 33 k0
+p 30 k1 8
+c w 30
+i w 34 k0 g2o13
+c r 33 8 g1o8
+i w 35 k1 g1o10
+p 32 k1 9
+c w 32
+i r 36 k0
+p 34 k0 9
+c w 34
+i r 37 k0
+p 35 k1 10
+c w 35
+c r 36 9 g2o13
+i w 38 k0 g0o15
+i r 39 k1
+c r 37 9 g2o13
+i w 40 k0 g2o15
+c r 39 10 g1o10
+i r 41 k0
+c r 41 9 g2o13
+i r 42 k1
+p 38 k0 10
+c w 38
+i r 43 k1
+p 40 k0 11
+c w 40
+c r 42 10 g1o10
+i r 44 k1
+i r 45 k0
+c r 43 10 g1o10
+c r 44 10 g1o10
+i w 46 k0 g0o17
+i w 47 k1 g1o15
+c r 45 11 g2o15
+i w 48 k0 g2o17
+p 46 k0 12
+c w 46
+i r 49 k1
+p 47 k1 11
+c w 47
+i r 50 k0
+p 48 k0 13
+c w 48
+c r 49 11 g1o15
+c r 50 13 g2o17
+i r 51 k1
+i w 52 k0 g1o17
+i w 53 k0 g2o18
+c r 51 11 g1o15
+i w 54 k1 g0o20
+p 52 k0 14
+c w 52
+i w 55 k0 g1o18
+p 53 k0 15
+c w 53
+p 54 k1 12
+c w 54
+i w 56 k0 g0o21
+i r 57 k0
+p 55 k0 16
+c w 55
+p 56 k0 17
+c w 56
+i r 58 k1
+c r 57 17 g0o21
+i r 59 k1
+c r 58 12 g0o20
+c r 59 12 g0o20
+i r 60 k0
+c r 60 17 g0o21
+s 6
+i r 1 k0
+i w 2 k0 g1o1
+i r 3 k1
+p 2 k0 1
+c w 2
+i r 4 k1
+c r 1 1 g1o1
+c r 3 0 -
+i w 5 k0 g0o3
+i w 6 k0 g2o2
+c r 4 0 -
+i w 7 k0 g1o3
+p 5 k0 2
+c w 5
+p 6 k0 3
+c w 6
+i w 8 k1 g0o4
+i w 9 k0 g2o3
+p 7 k0 4
+c w 7
+i r 10 k1
+p 8 k1 1
+c w 8
+i r 11 k1
+p 9 k0 5
+c w 9
+i r 12 k0
+c r 10 1 g0o4
+i w 13 k1 g1o5
+c r 11 1 g0o4
+i r 14 k0
+c r 14 5 g2o3
+c r 12 5 g2o3
+i w 15 k0 g0o7
+i w 16 k0 g2o5
+p 13 k1 2
+c w 13
+i w 17 k1 g1o6
+p 15 k0 6
+c w 15
+i r 18 k0
+c r 18 6 g0o7
+i r 19 k1
+c r 19 2 g1o5
+i w 20 k1 g0o10
+p 16 k0 7
+c w 16
+p 17 k1 3
+c w 17
+i w 21 k1 g1o7
+i w 22 k0 g2o6
+p 20 k1 4
+c w 20
+i w 23 k1 g0o11
+p 21 k1 5
+c w 21
+i r 24 k1
+p 22 k0 8
+c w 22
+i w 25 k0 g2o7
+p 23 k1 6
+c w 23
+i w 26 k0 g0o12
+c r 24 6 g0o11
+i r 27 k0
+p 25 k0 9
+c w 25
+c r 27 9 g2o7
+i w 28 k1 g1o10
+i r 29 k1
+p 26 k0 10
+c w 26
+i w 30 k1 g0o13
+c r 29 6 g0o11
+i r 31 k0
+p 28 k1 7
+c w 28
+c r 31 10 g0o12
+i r 32 k0
+i w 33 k1 g2o10
+p 30 k1 8
+c w 30
+i w 34 k0 g0o14
+c r 32 10 g0o12
+i r 35 k1
+c r 35 8 g0o13
+i w 36 k1 g1o13
+p 33 k1 9
+c w 33
+i r 37 k0
+p 34 k0 11
+c w 34
+i r 38 k0
+p 36 k1 10
+c w 36
+i w 39 k0 g1o14
+c r 37 11 g0o14
+i r 40 k0
+c r 38 11 g0o14
+c r 40 11 g0o14
+i r 41 k0
+i w 42 k1 g2o13
+c r 41 11 g0o14
+i w 43 k1 g0o17
+p 39 k0 12
+c w 39
+i w 44 k0 g1o15
+p 42 k1 11
+c w 42
+i w 45 k0 g2o14
+p 43 k1 12
+c w 43
+i r 46 k0
+p 44 k0 13
+c w 44
+c r 46 13 g1o15
+i r 47 k1
+i w 48 k1 g1o16
+p 45 k0 14
+c w 45
+c r 47 12 g0o17
+i w 49 k1 g0o20
+i w 50 k0 g2o15
+p 48 k1 13
+c w 48
+i w 51 k1 g1o17
+p 49 k1 14
+c w 49
+i w 52 k1 g0o21
+p 50 k0 15
+c w 50
+i w 53 k1 g2o16
+p 51 k1 15
+c w 51
+i r 54 k1
+p 52 k1 16
+c w 52
+p 53 k1 17
+c w 53
+i r 55 k1
+c r 54 17 g2o16
+i w 56 k0 g1o19
+c r 55 17 g2o16
+i w 57 k0 g2o18
+p 56 k0 16
+c w 56
+i r 58 k1
+p 57 k0 17
+c w 57
+i w 59 k0 g2o19
+c r 58 17 g2o16
+p 59 k0 18
+c w 59
+i r 60 k1
+c r 60 17 g2o16
+s 7
+i r 1 k0
+i r 2 k0
+i w 3 k1 g2o1
+c r 1 0 -
+c r 2 0 -
+i w 4 k0 g0o3
+i r 5 k0
+p 3 k1 1
+c w 3
+i w 6 k1 g2o2
+c r 5 0 -
+i r 7 k1
+p 4 k0 1
+c w 4
+c r 7 1 g2o1
+i r 8 k0
+i w 9 k0 g1o4
+p 6 k1 2
+c w 6
+i r 10 k1
+p 9 k0 2
+c w 9
+i r 11 k1
+c r 8 2 g1o4
+c r 11 2 g2o2
+c r 10 2 g2o2
+i r 12 k1
+i w 13 k1 g1o6
+i r 14 k1
+c r 12 2 g2o2
+i r 15 k1
+c r 15 2 g2o2
+c r 14 2 g2o2
+i w 16 k0 g0o7
+i r 17 k1
+c r 17 2 g2o2
+i w 18 k0 g2o6
+p 13 k1 3
+c w 13
+i r 19 k1
+p 16 k0 3
+c w 16
+i w 20 k1 g0o8
+c r 19 3 g1o6
+i r 21 k1
+p 18 k0 4
+c w 18
+c r 21 3 g1o6
+i w 22 k0 g1o9
+i r 23 k1
+p 20 k1 4
+c w 20
+i w 24 k0 g0o9
+p 22 k0 5
+c w 22
+i w 25 k0 g1o10
+p 24 k0 6
+c w 24
+i r 26 k1
+c r 23 4 g0o8
+i w 27 k0 g2o8
+p 25 k0 7
+c w 25
+i w 28 k0 g1o11
+c r 26 4 g0o8
+i w 29 k1 g0o11
+p 27 k0 8
+c w 27
+p 28 k0 9
+c w 28
+i r 30 k0
+i r 31 k1
+p 29 k1 5
+c w 29
+c r 30 9 g1o11
+c r 31 5 g0o11
+i r 32 k1
+i r 33 k1
+i r 34 k1
+c r 32 5 g0o11
+c r 33 5 g0o11
+c r 34 5 g0o11
+i r 35 k1
+i w 36 k0 g1o14
+i r 37 k0
+c r 35 5 g0o11
+c r 37 9 g1o11
+i r 38 k1
+i w 39 k1 g2o12
+c r 38 5 g0o11
+i r 40 k1
+p 36 k0 10
+c w 36
+c r 40 5 g0o11
+i r 41 k1
+i r 42 k0
+c r 41 5 g0o11
+i w 43 k0 g0o17
+p 39 k1 6
+c w 39
+i w 44 k1 g2o13
+p 43 k0 11
+c w 43
+c r 42 11 g0o17
+i w 45 k1 g0o18
+i r 46 k0
+c r 46 11 g0o17
+i w 47 k1 g1o17
+p 44 k1 7
+c w 44
+i r 48 k1
+p 45 k1 8
+c w 45
+p 47 k1 9
+c w 47
+i r 49 k1
+i r 50 k0
+c r 49 9 g1o17
+c r 50 11 g0o17
+i r 51 k0
+i r 52 k0
+c r 51 11 g0o17
+c r 52 11 g0o17
+i w 53 k0 g0o21
+i r 54 k1
+c r 54 9 g1o17
+p 53 k0 12
+c w 53
+c r 48 9 g1o17
+i w 55 k1 g2o15
+p 55 k1 10
+c w 55
+i w 56 k1 g2o16
+p 56 k1 11
+c w 56
+i w 57 k0 g2o17
+p 57 k0 13
+c w 57
+i w 58 k0 g2o18
+p 58 k0 14
+c w 58
+i r 59 k0
+c r 59 14 g2o18
+i r 60 k1
+c r 60 11 g2o16
+s 8
+i w 1 k1 g0o2
+i r 2 k0
+i w 3 k1 g2o1
+p 1 k1 1
+c w 1
+c r 2 0 -
+i r 4 k0
+i w 5 k1 g1o2
+p 3 k1 2
+c w 3
+i r 6 k0
+p 5 k1 3
+c w 5
+i w 7 k1 g1o3
+c r 4 0 -
+i r 8 k1
+c r 6 0 -
+i r 9 k1
+c r 8 3 g1o2
+c r 9 3 g1o2
+i r 10 k0
+i r 11 k1
+p 7 k1 4
+c w 7
+i w 12 k0 g1o4
+c r 10 0 -
+c r 11 4 g1o3
+i r 13 k0
+i r 14 k1
+c r 13 0 -
+c r 14 4 g1o3
+i r 15 k0
+i w 16 k0 g2o6
+p 12 k0 1
+c w 12
+c r 15 1 g1o4
+i r 17 k1
+i r 18 k0
+p 16 k0 2
+c w 16
+c r 17 4 g1o3
+i w 19 k1 g0o9
+i w 20 k0 g2o7
+c r 18 2 g2o6
+i r 21 k0
+c r 21 2 g2o6
+i w 22 k1 g1o7
+p 19 k1 5
+c w 19
+p 20 k0 3
+c w 20
+i r 23 k1
+i w 24 k0 g2o8
+p 22 k1 6
+c w 22
+i w 25 k1 g1o8
+c r 23 6 g1o7
+i w 26 k0 g0o11
+p 24 k0 4
+c w 24
+i w 27 k0 g2o9
+p 25 k1 7
+c w 25
+i w 28 k1 g1o9
+p 26 k0 5
+c w 26
+i r 29 k1
+p 27 k0 6
+c w 27
+i w 30 k1 g2o10
+p 28 k1 8
+c w 28
+i w 31 k1 g1o10
+p 30 k1 9
+c w 30
+c r 29 9 g2o10
+i w 32 k0 g0o13
+i w 33 k1 g2o11
+p 31 k1 10
+c w 31
+i w 34 k0 g1o11
+p 32 k0 7
+c w 32
+i w 35 k1 g0o14
+p 33 k1 11
+c w 33
+i w 36 k1 g2o12
+p 34 k0 8
+c w 34
+i r 37 k1
+p 35 k1 12
+c w 35
+i r 38 k0
+p 36 k1 13
+c w 36
+i r 39 k1
+c r 37 13 g2o12
+i r 40 k1
+c r 38 8 g1o11
+c r 40 13 g2o12
+c r 39 13 g2o12
+i r 41 k1
+i w 42 k1 g1o14
+i r 43 k0
+p 42 k1 14
+c w 42
+c r 41 14 g1o14
+c r 43 8 g1o11
+i w 44 k1 g0o17
+i w 45 k1 g1o15
+i r 46 k1
+p 44 k1 15
+c w 44
+i w 47 k1 g0o18
+p 45 k1 16
+c w 45
+i r 48 k0
+c r 46 16 g1o15
+i w 49 k0 g2o16
+p 47 k1 17
+c w 47
+i r 50 k1
+c r 48 8 g1o11
+i w 51 k0 g1o17
+c r 50 17 g0o18
+i w 52 k1 g0o20
+p 49 k0 9
+c w 49
+p 51 k0 10
+c w 51
+i r 53 k0
+i w 54 k1 g2o17
+p 52 k1 18
+c w 52
+i w 55 k0 g0o21
+p 54 k1 19
+c w 54
+i w 56 k0 g2o18
+c r 53 10 g1o17
+i r 57 k0
+c r 57 10 g1o17
+i w 58 k0 g1o20
+p 55 k0 11
+c w 55
+p 56 k0 12
+c w 56
+i r 59 k1
+p 58 k0 13
+c w 58
+c r 59 19 g2o17
+i r 60 k0
+c r 60 13 g1o20
+s 9
+i w 1 k1 g0o2
+i r 2 k0
+i r 3 k0
+c r 2 0 -
+c r 3 0 -
+i r 4 k0
+i r 5 k1
+p 1 k1 1
+c w 1
+c r 4 0 -
+c r 5 1 g0o2
+i w 6 k1 g0o3
+i w 7 k0 g1o3
+i w 8 k0 g2o3
+p 6 k1 2
+c w 6
+i r 9 k1
+p 7 k0 1
+c w 7
+p 8 k0 2
+c w 8
+i r 10 k0
+i r 11 k0
+c r 9 2 g0o3
+i w 12 k1 g0o5
+c r 10 2 g2o3
+c r 11 2 g2o3
+i r 13 k0
+i r 14 k1
+c r 13 2 g2o3
+c r 14 2 g0o3
+i r 15 k1
+i w 16 k1 g2o6
+p 12 k1 3
+c w 12
+i w 17 k1 g0o6
+c r 15 3 g0o5
+i w 18 k0 g1o7
+p 16 k1 4
+c w 16
+i r 19 k1
+p 17 k1 5
+c w 17
+i w 20 k0 g0o7
+p 18 k0 3
+c w 18
+i w 21 k1 g1o8
+p 20 k0 4
+c w 20
+p 21 k1 6
+c w 21
+i w 22 k1 g0o8
+i r 23 k0
+c r 19 6 g1o8
+i r 24 k0
+p 22 k1 7
+c w 22
+i r 25 k1
+c r 23 4 g0o7
+c r 24 4 g0o7
+i w 26 k1 g1o10
+i w 27 k1 g2o9
+p 26 k1 8
+c w 26
+c r 25 8 g1o10
+i w 28 k0 g0o10
+i r 29 k0
+p 27 k1 9
+c w 27
+p 28 k0 5
+c w 28
+c r 29 5 g0o10
+i w 30 k1 g0o11
+i r 31 k1
+i r 32 k1
+c r 31 9 g2o9
+i r 33 k0
+p 30 k1 10
+c w 30
+c r 32 10 g0o11
+i w 34 k0 g0o12
+i w 35 k0 g2o11
+p 34 k0 6
+c w 34
+i r 36 k1
+c r 33 6 g0o12
+i w 37 k1 g1o14
+c r 36 10 g0o11
+i r 38 k1
+c r 38 10 g0o11
+i w 39 k0 g0o15
+p 35 k0 7
+c w 35
+p 37 k1 11
+c w 37
+i w 40 k1 g1o15
+i w 41 k1 g2o12
+p 39 k0 8
+c w 39
+p 40 k1 12
+c w 40
+p 41 k1 13
+c w 41
+i r 42 k1
+i r 43 k0
+i r 44 k0
+c r 42 13 g2o12
+c r 43 8 g0o15
+c r 44 8 g0o15
+i w 45 k1 g0o17
+i r 46 k1
+i r 47 k0
+c r 46 13 g2o12
+c r 47 8 g0o15
+i w 48 k0 g1o18
+i w 49 k1 g2o15
+p 45 k1 14
+c w 45
+i w 50 k1 g0o18
+p 48 k0 9
+c w 48
+i r 51 k0
+p 49 k1 15
+c w 49
+p 50 k1 16
+c w 50
+c r 51 9 g1o18
+i w 52 k1 g0o19
+i r 53 k0
+i w 54 k1 g2o16
+c r 53 9 g1o18
+p 52 k1 17
+c w 52
+i w 55 k0 g0o20
+p 54 k1 18
+c w 54
+i w 56 k0 g2o17
+p 55 k0 10
+c w 55
+i r 57 k0
+p 56 k0 11
+c w 56
+i w 58 k1 g2o18
+c r 57 11 g2o17
+p 58 k1 19
+c w 58
+i w 59 k1 g2o19
+p 59 k1 20
+c w 59
+i w 60 k1 g2o20
+p 60 k1 21
+c w 60
+s 10
+i r 1 k1
+i r 2 k1
+i w 3 k0 g2o1
+c r 1 0 -
+c r 2 0 -
+i w 4 k0 g0o3
+i w 5 k0 g1o2
+p 3 k0 1
+c w 3
+i r 6 k1
+p 4 k0 2
+c w 4
+i w 7 k0 g0o4
+p 5 k0 3
+c w 5
+c r 6 0 -
+i r 8 k0
+i r 9 k1
+c r 8 3 g1o2
+c r 9 0 -
+i r 10 k0
+i r 11 k0
+c r 10 3 g1o2
+c r 11 3 g1o2
+i w 12 k0 g1o5
+i r 13 k1
+p 7 k0 4
+c w 7
+c r 13 0 -
+i r 14 k0
+i r 15 k1
+c r 14 4 g0o4
+c r 15 0 -
+i w 16 k0 g0o6
+i w 17 k1 g2o7
+p 12 k0 5
+c w 12
+i r 18 k0
+p 16 k0 6
+c w 16
+i r 19 k1
+c r 18 6 g0o6
+i r 20 k0
+p 17 k1 1
+c w 17
+i w 21 k0 g2o8
+c r 19 1 g2o7
+c r 20 6 g0o6
+i r 22 k0
+i r 23 k1
+c r 22 6 g0o6
+c r 23 1 g2o7
+i w 24 k0 g0o9
+i w 25 k0 g1o9
+p 21 k0 7
+c w 21
+i w 26 k0 g2o9
+p 24 k0 8
+c w 24
+i r 27 k0
+p 25 k0 9
+c w 25
+i r 28 k0
+c r 27 9 g1o9
+c r 28 9 g1o9
+i r 29 k1
+i w 30 k1 g1o11
+p 26 k0 10
+c w 26
+i w 31 k0 g2o10
+c r 29 1 g2o7
+i w 32 k1 g0o12
+p 30 k1 2
+c w 30
+i w 33 k0 g1o12
+p 31 k0 11
+c w 31
+i w 34 k1 g2o11
+p 32 k1 3
+c w 32
+i w 35 k0 g0o13
+p 33 k0 12
+c w 33
+i w 36 k0 g1o13
+p 34 k1 4
+c w 34
+p 35 k0 13
+c w 35
+i r 37 k0
+i w 38 k0 g2o12
+p 36 k0 14
+c w 36
+c r 37 14 g1o13
+i w 39 k1 g0o15
+i r 40 k1
+p 38 k0 15
+c w 38
+i w 41 k0 g2o13
+p 39 k1 5
+c w 39
+i w 42 k1 g0o16
+c r 40 5 g0o15
+i w 43 k1 g1o15
+p 41 k0 16
+c w 41
+p 42 k1 6
+c w 42
+i r 44 k0
+i r 45 k0
+p 43 k1 7
+c w 43
+i r 46 k0
+c r 44 16 g2o13
+c r 46 16 g2o13
+c r 45 16 g2o13
+i w 47 k1 g0o18
+i r 48 k0
+i r 49 k1
+c r 48 16 g2o13
+c r 49 7 g1o15
+i r 50 k0
+i w 51 k1 g2o16
+c r 50 16 g2o13
+i r 52 k0
+p 47 k1 8
+c w 47
+c r 52 16 g2o13
+i w 53 k0 g0o19
+i w 54 k1 g1o20
+p 51 k1 9
+c w 51
+i r 55 k0
+p 53 k0 17
+c w 53
+i r 56 k1
+p 54 k1 10
+c w 54
+c r 55 17 g0o19
+i w 57 k0 g2o18
+c r 56 10 g1o20
+i w 58 k0 g0o21
+p 57 k0 18
+c w 57
+i w 59 k0 g2o19
+p 58 k0 19
+c w 58
+p 59 k0 20
+c w 59
+i w 60 k0 g2o20
+p 60 k0 21
+c w 60
+s 11
+i w 1 k1 g0o2
+i w 2 k1 g1o1
+i r 3 k0
+p 1 k1 1
+c w 1
+p 2 k1 2
+c w 2
+i w 4 k1 g0o3
+i r 5 k1
+c r 5 2 g1o1
+i r 6 k0
+p 4 k1 3
+c w 4
+i w 7 k0 g0o4
+c r 6 0 -
+i w 8 k1 g1o4
+c r 3 0 -
+i r 9 k0
+p 7 k0 1
+c w 7
+p 8 k1 4
+c w 8
+i w 10 k0 g0o5
+i r 11 k1
+c r 11 4 g1o4
+c r 9 1 g0o4
+i w 12 k0 g1o6
+i r 13 k0
+c r 13 1 g0o4
+i r 14 k1
+c r 14 4 g1o4
+i w 15 k0 g2o5
+p 10 k0 2
+c w 10
+i w 16 k1 g0o6
+p 12 k0 3
+c w 12
+i r 17 k0
+p 15 k0 4
+c w 15
+p 16 k1 5
+c w 16
+i r 18 k0
+i r 19 k0
+c r 17 4 g2o5
+i r 20 k0
+c r 18 4 g2o5
+c r 19 4 g2o5
+i w 21 k0 g0o8
+i r 22 k1
+c r 20 4 g2o5
+c r 22 5 g0o6
+i w 23 k1 g1o9
+i r 24 k1
+p 21 k0 5
+c w 21
+i r 25 k1
+p 23 k1 6
+c w 23
+i w 26 k1 g1o10
+c r 24 6 g1o9
+i r 27 k1
+c r 25 6 g1o9
+c r 27 6 g1o9
+i r 28 k0
+i r 29 k1
+c r 28 5 g0o8
+c r 29 6 g1o9
+i r 30 k1
+i r 31 k0
+c r 30 6 g1o9
+i w 32 k0 g0o12
+p 26 k1 7
+c w 26
+i r 33 k0
+c r 31 5 g0o8
+i w 34 k0 g2o12
+p 32 k0 6
+c w 32
+c r 33 6 g0o12
+i r 35 k0
+i r 36 k1
+p 34 k0 7
+c w 34
+c r 35 7 g2o12
+c r 36 7 g1o10
+i w 37 k1 g0o14
+i w 38 k0 g1o13
+i r 39 k1
+p 37 k1 8
+c w 37
+p 38 k0 8
+c w 38
+c r 39 8 g0o14
+i w 40 k1 g0o15
+i r 41 k1
+i w 42 k1 g2o14
+p 40 k1 9
+c w 40
+p 42 k1 10
+c w 42
+i w 43 k1 g0o16
+i w 44 k0 g2o15
+p 43 k1 11
+c w 43
+p 44 k0 9
+c w 44
+i r 45 k0
+i r 46 k0
+c r 45 9 g2o15
+c r 46 9 g2o15
+i w 47 k1 g0o18
+i r 48 k1
+c r 48 11 g0o16
+i w 49 k1 g2o18
+p 47 k1 12
+c w 47
+i r 50 k1
+p 49 k1 13
+c w 49
+i r 51 k0
+c r 50 13 g2o18
+i r 52 k1
+c r 52 13 g2o18
+c r 51 9 g2o15
+i r 53 k1
+i w 54 k0 g2o20
+p 54 k0 10
+c w 54
+c r 53 13 g2o18
+c r 41 13 g2o18
+i w 55 k1 g1o15
+p 55 k1 14
+c w 55
+i w 56 k1 g1o16
+p 56 k1 15
+c w 56
+i w 57 k0 g1o17
+p 57 k0 11
+c w 57
+i r 58 k1
+c r 58 15 g1o16
+i r 59 k0
+c r 59 11 g1o17
+i w 60 k1 g1o20
+p 60 k1 16
+c w 60
+s 12
+i w 1 k0 g0o2
+i r 2 k1
+i w 3 k0 g2o1
+c r 2 0 -
+i r 4 k0
+p 1 k0 1
+c w 1
+i r 5 k0
+c r 4 1 g0o2
+i r 6 k1
+p 3 k0 2
+c w 3
+c r 5 2 g2o1
+c r 6 0 -
+i r 7 k0
+i r 8 k1
+i w 9 k0 g2o2
+c r 7 2 g2o1
+c r 8 0 -
+i w 10 k0 g0o5
+i w 11 k0 g1o5
+p 9 k0 3
+c w 9
+p 10 k0 4
+c w 10
+p 11 k0 5
+c w 11
+i w 12 k1 g0o6
+i w 13 k0 g1o6
+i r 14 k0
+p 12 k1 1
+c w 12
+p 13 k0 6
+c w 13
+i w 15 k1 g0o7
+i r 16 k0
+c r 14 6 g1o6
+i r 17 k0
+c r 16 6 g1o6
+c r 17 6 g1o6
+i r 18 k0
+i w 19 k0 g2o5
+p 15 k1 2
+c w 15
+i w 20 k1 g0o8
+c r 18 6 g1o6
+i r 21 k1
+p 19 k0 7
+c w 19
+c r 21 2 g0o7
+i w 22 k1 g1o10
+i r 23 k0
+c r 23 7 g2o5
+i r 24 k0
+p 20 k1 3
+c w 20
+p 22 k1 4
+c w 22
+i r 25 k1
+i r 26 k1
+c r 24 7 g2o5
+i w 27 k0 g2o8
+c r 25 4 g1o10
+c r 26 4 g1o10
+i w 28 k1 g0o10
+i w 29 k1 g1o12
+p 27 k0 8
+c w 27
+i r 30 k1
+p 28 k1 5
+c w 28
+p 29 k1 6
+c w 29
+i r 31 k0
+i w 32 k0 g1o13
+c r 31 8 g2o8
+i r 33 k0
+p 32 k0 9
+c w 32
+i r 34 k1
+c r 33 9 g1o13
+i w 35 k0 g0o13
+c r 34 6 g1o12
+i w 36 k0 g1o15
+p 35 k0 10
+c w 35
+i r 37 k1
+c r 37 6 g1o12
+i r 38 k0
+p 36 k0 11
+c w 36
+i w 39 k1 g1o16
+c r 38 11 g1o15
+i r 40 k1
+c r 40 6 g1o12
+i r 41 k0
+c r 41 11 g1o15
+i r 42 k1
+p 39 k1 7
+c w 39
+i w 43 k0 g1o17
+c r 42 7 g1o16
+i r 44 k1
+c r 44 7 g1o16
+c r 30 7 g1o16
+i w 45 k0 g0o20
+i w 46 k1 g2o10
+p 43 k0 12
+c w 43
+i r 47 k0
+p 45 k0 13
+c w 45
+p 46 k1 8
+c w 46
+i r 48 k0
+i w 49 k1 g2o11
+c r 48 13 g0o20
+c r 47 13 g0o20
+i r 50 k0
+c r 50 13 g0o20
+i r 51 k0
+p 49 k1 9
+c w 49
+i r 52 k0
+c r 51 13 g0o20
+c r 52 13 g0o20
+i r 53 k1
+c r 53 9 g2o11
+i w 54 k0 g2o14
+p 54 k0 14
+c w 54
+i r 55 k0
+c r 55 14 g2o14
+i r 56 k0
+c r 56 14 g2o14
+i w 57 k1 g2o17
+p 57 k1 10
+c w 57
+i w 58 k1 g2o18
+p 58 k1 11
+c w 58
+i r 59 k1
+c r 59 11 g2o18
+i w 60 k0 g2o20
+p 60 k0 15
+c w 60
+s 13
+i w 1 k1 g0o2
+i w 2 k0 g1o1
+i r 3 k1
+c r 3 0 -
+i w 4 k1 g2o2
+p 1 k1 1
+c w 1
+i r 5 k0
+p 2 k0 1
+c w 2
+i r 6 k1
+p 4 k1 2
+c w 4
+c r 5 1 g1o1
+i r 7 k0
+i r 8 k0
+c r 7 1 g1o1
+c r 6 2 g2o2
+i r 9 k1
+i w 10 k1 g1o3
+c r 9 2 g2o2
+c r 8 1 g1o1
+i w 11 k0 g0o6
+i w 12 k1 g2o4
+p 10 k1 3
+c w 10
+i r 13 k1
+p 11 k0 2
+c w 11
+i w 14 k1 g0o7
+p 12 k1 4
+c w 12
+i w 15 k1 g2o5
+c r 13 4 g2o4
+i w 16 k0 g1o5
+p 14 k1 5
+c w 14
+p 15 k1 6
+c w 15
+i w 17 k0 g0o8
+i w 18 k0 g2o6
+p 16 k0 3
+c w 16
+p 17 k0 4
+c w 17
+p 18 k0 5
+c w 18
+i w 19 k1 g0o9
+i w 20 k1 g1o6
+i w 21 k0 g2o7
+p 19 k1 7
+c w 19
+i r 22 k0
+p 20 k1 8
+c w 20
+i r 23 k0
+p 21 k0 6
+c w 21
+i w 24 k0 g2o8
+c r 22 6 g2o7
+c r 23 6 g2o7
+i r 25 k1
+i r 26 k1
+c r 25 8 g1o6
+c r 26 8 g1o6
+i r 27 k0
+i w 28 k0 g1o9
+c r 27 6 g2o7
+i r 29 k1
+p 24 k0 7
+c w 24
+c r 29 8 g1o6
+i r 30 k1
+i r 31 k1
+p 28 k0 8
+c w 28
+i w 32 k1 g1o10
+c r 30 8 g1o6
+i w 33 k1 g0o15
+p 32 k1 9
+c w 32
+c r 31 9 g1o10
+i w 34 k1 g1o11
+i w 35 k1 g2o10
+p 33 k1 10
+c w 33
+p 34 k1 11
+c w 34
+p 35 k1 12
+c w 35
+i r 36 k0
+i r 37 k0
+i r 38 k0
+c r 36 8 g1o9
+c r 37 8 g1o9
+c r 38 8 g1o9
+i r 39 k0
+i w 40 k0 g1o13
+i r 41 k1
+c r 39 8 g1o9
+c r 41 12 g2o10
+i w 42 k1 g0o18
+i r 43 k1
+c r 43 12 g2o10
+i r 44 k1
+c r 44 12 g2o10
+i w 45 k1 g2o15
+p 40 k0 9
+c w 40
+p 42 k1 13
+c w 42
+i w 46 k0 g0o19
+i r 47 k1
+p 45 k1 14
+c w 45
+i w 48 k1 g2o16
+p 46 k0 10
+c w 46
+p 48 k1 15
+c w 48
+c r 47 15 g2o16
+i r 49 k0
+i r 50 k1
+i r 51 k1
+c r 49 10 g0o19
+c r 50 15 g2o16
+i r 52 k0
+i r 53 k0
+c r 52 10 g0o19
+c r 53 10 g0o19
+c r 51 15 g2o16
+i r 54 k0
+i r 55 k0
+c r 54 10 g0o19
+i w 56 k0 g1o18
+c r 55 10 g0o19
+i w 57 k0 g2o19
+p 56 k0 11
+c w 56
+i r 58 k0
+p 57 k0 12
+c w 57
+i r 59 k1
+c r 58 12 g2o19
+c r 59 15 g2o16
+i w 60 k1 g1o20
+p 60 k1 16
+c w 60
+s 14
+i r 1 k0
+i w 2 k1 g1o1
+i w 3 k0 g2o1
+c r 1 0 -
+i w 4 k0 g0o3
+p 2 k1 1
+c w 2
+p 3 k0 1
+c w 3
+i w 5 k1 g1o2
+i w 6 k0 g2o2
+p 4 k0 2
+c w 4
+p 5 k1 2
+c w 5
+p 6 k0 3
+c w 6
+i w 7 k1 g0o4
+i w 8 k0 g1o3
+i w 9 k1 g2o3
+p 7 k1 3
+c w 7
+p 8 k0 4
+c w 8
+p 9 k1 4
+c w 9
+i r 10 k1
+i w 11 k0 g1o4
+i w 12 k0 g2o4
+c r 10 4 g2o3
+i r 13 k1
+p 11 k0 5
+c w 11
+p 12 k0 6
+c w 12
+i r 14 k0
+i r 15 k1
+c r 13 4 g2o3
+i r 16 k1
+c r 16 4 g2o3
+c r 14 6 g2o4
+c r 15 4 g2o3
+i w 17 k0 g0o8
+i r 18 k0
+i r 19 k1
+p 17 k0 7
+c w 17
+c r 18 7 g0o8
+c r 19 4 g2o3
+i w 20 k1 g0o9
+i w 21 k0 g1o7
+i r 22 k0
+c r 22 7 g0o8
+i r 23 k0
+c r 23 7 g0o8
+i r 24 k1
+c r 24 4 g2o3
+i r 25 k1
+c r 25 4 g2o3
+i r 26 k1
+p 20 k1 5
+c w 20
+c r 26 5 g0o9
+i r 27 k0
+i w 28 k0 g2o12
+p 21 k0 8
+c w 21
+i r 29 k1
+p 28 k0 9
+c w 28
+c r 27 9 g2o12
+c r 29 5 g0o9
+i r 30 k0
+i w 31 k0 g1o9
+i r 32 k1
+c r 30 9 g2o12
+c r 32 5 g0o9
+i r 33 k0
+i w 34 k1 g2o14
+p 31 k0 10
+c w 31
+i r 35 k1
+c r 33 10 g1o9
+i w 36 k0 g0o13
+p 34 k1 6
+c w 34
+i w 37 k0 g2o15
+p 36 k0 11
+c w 36
+c r 35 6 g2o14
+i r 38 k0
+i w 39 k1 g1o11
+p 37 k0 12
+c w 37
+i r 40 k1
+p 39 k1 7
+c w 39
+i r 41 k0
+c r 38 12 g2o15
+i w 42 k1 g0o15
+c r 40 7 g1o11
+i r 43 k1
+c r 41 12 g2o15
+c r 43 7 g1o11
+i w 44 k0 g1o13
+i w 45 k0 g2o18
+p 42 k1 8
+c w 42
+i w 46 k0 g0o16
+p 44 k0 13
+c w 44
+i w 47 k0 g1o14
+p 45 k0 14
+c w 45
+i w 48 k0 g2o19
+p 46 k0 15
+c w 46
+i w 49 k1 g0o17
+p 47 k0 16
+c w 47
+i w 50 k0 g1o15
+p 48 k0 17
+c w 48
+i r 51 k1
+p 49 k1 9
+c w 49
+i r 52 k1
+p 50 k0 18
+c w 50
+i w 53 k0 g1o16
+c r 51 9 g0o17
+c r 52 9 g0o17
+i r 54 k1
+c r 54 9 g0o17
+i w 55 k1 g0o20
+p 53 k0 19
+c w 53
+i w 56 k0 g1o17
+p 55 k1 10
+c w 55
+i w 57 k1 g0o21
+p 56 k0 20
+c w 56
+i w 58 k1 g1o18
+p 57 k1 11
+c w 57
+p 58 k1 12
+c w 58
+i r 59 k0
+c r 59 20 g1o17
+i r 60 k1
+c r 60 12 g1o18
+s 15
+i w 1 k1 g0o2
+i r 2 k1
+i r 3 k1
+p 1 k1 1
+c w 1
+c r 2 1 g0o2
+c r 3 1 g0o2
+i w 4 k0 g0o3
+i r 5 k0
+i r 6 k0
+c r 5 0 -
+c r 6 0 -
+i r 7 k0
+i w 8 k0 g2o3
+p 4 k0 1
+c w 4
+i w 9 k0 g0o4
+c r 7 1 g0o3
+i r 10 k0
+p 8 k0 2
+c w 8
+p 9 k0 3
+c w 9
+c r 10 3 g0o4
+i r 11 k0
+i r 12 k0
+i w 13 k0 g2o4
+c r 11 3 g0o4
+c r 12 3 g0o4
+i w 14 k1 g0o6
+i r 15 k1
+c r 15 1 g0o2
+i r 16 k0
+c r 16 3 g0o4
+i w 17 k0 g1o8
+p 13 k0 4
+c w 13
+i w 18 k1 g2o5
+p 14 k1 2
+c w 14
+i w 19 k1 g0o7
+p 17 k0 5
+c w 17
+i r 20 k1
+c r 20 2 g0o6
+i r 21 k1
+c r 21 2 g0o6
+i w 22 k0 g1o11
+p 18 k1 3
+c w 18
+p 19 k1 4
+c w 19
+i w 23 k1 g0o8
+i w 24 k0 g2o6
+p 22 k0 6
+c w 22
+i w 25 k0 g1o12
+p 23 k1 5
+c w 23
+i r 26 k1
+p 24 k0 7
+c w 24
+i r 27 k0
+p 25 k0 8
+c w 25
+i r 28 k0
+c r 26 5 g0o8
+i r 29 k0
+c r 29 8 g1o12
+c r 28 8 g1o12
+c r 27 8 g1o12
+i w 30 k0 g0o11
+i w 31 k1 g1o14
+i r 32 k1
+c r 32 5 g0o8
+i r 33 k1
+p 30 k0 9
+c w 30
+c r 33 5 g0o8
+i w 34 k1 g0o12
+i r 35 k1
+p 31 k1 6
+c w 31
+i w 36 k0 g1o15
+p 34 k1 7
+c w 34
+i r 37 k0
+p 36 k0 10
+c w 36
+c r 35 7 g0o12
+i r 38 k1
+i r 39 k1
+c r 37 10 g1o15
+c r 38 7 g0o12
+c r 39 7 g0o12
+i r 40 k0
+i r 41 k0
+i w 42 k1 g2o12
+c r 40 10 g1o15
+c r 41 10 g1o15
+i w 43 k1 g0o15
+i r 44 k1
+c r 44 7 g0o12
+i w 45 k0 g1o19
+p 42 k1 8
+c w 42
+i r 46 k1
+p 43 k1 9
+c w 43
+i r 47 k1
+c r 46 9 g0o15
+i r 48 k0
+p 45 k0 11
+c w 45
+i w 49 k0 g1o20
+c r 47 9 g0o15
+c r 48 11 g1o19
+i r 50 k0
+i r 51 k1
+c r 50 11 g1o19
+i r 52 k1
+c r 52 9 g0o15
+c r 51 9 g0o15
+i w 53 k1 g0o19
+i w 54 k1 g2o16
+p 49 k0 12
+c w 49
+p 53 k1 10
+c w 53
+i w 55 k1 g0o20
+p 54 k1 11
+c w 54
+i w 56 k1 g2o17
+p 55 k1 12
+c w 55
+i w 57 k1 g0o21
+p 56 k1 13
+c w 56
+i r 58 k1
+p 57 k1 14
+c w 57
+c r 58 14 g0o21
+i r 59 k1
+c r 59 14 g0o21
+i r 60 k1
+c r 60 14 g0o21
+s 16
+i r 1 k1
+i w 2 k0 g1o1
+i r 3 k1
+c r 1 0 -
+c r 3 0 -
+i r 4 k0
+i w 5 k1 g2o2
+p 2 k0 1
+c w 2
+i r 6 k1
+c r 4 1 g1o1
+i r 7 k1
+p 5 k1 1
+c w 5
+i w 8 k1 g2o3
+c r 6 1 g2o2
+i w 9 k1 g1o3
+c r 7 1 g2o2
+i r 10 k1
+p 8 k1 2
+c w 8
+i r 11 k0
+p 9 k1 3
+c w 9
+c r 10 3 g1o3
+i w 12 k1 g0o6
+i r 13 k1
+p 12 k1 4
+c w 12
+i w 14 k1 g0o7
+c r 11 1 g1o1
+i r 15 k0
+c r 13 4 g0o6
+i w 16 k1 g1o5
+p 14 k1 5
+c w 14
+i w 17 k1 g0o8
+c r 15 1 g1o1
+i r 18 k0
+c r 18 1 g1o1
+i w 19 k1 g2o7
+p 16 k1 6
+c w 16
+i r 20 k1
+p 17 k1 7
+c w 17
+i w 21 k1 g0o9
+p 19 k1 8
+c w 19
+i r 22 k1
+p 21 k1 9
+c w 21
+i w 23 k0 g0o10
+c r 20 9 g0o9
+i w 24 k1 g1o7
+c r 22 9 g0o9
+i r 25 k1
+c r 25 9 g0o9
+i r 26 k1
+p 23 k0 2
+c w 23
+p 24 k1 10
+c w 24
+c r 26 10 g1o7
+i w 27 k1 g0o11
+i w 28 k1 g1o8
+i w 29 k0 g2o11
+p 27 k1 11
+c w 27
+p 28 k1 12
+c w 28
+p 29 k0 3
+c w 29
+i r 30 k1
+i w 31 k1 g1o9
+i w 32 k0 g2o12
+p 31 k1 13
+c w 31
+p 32 k0 4
+c w 32
+c r 30 13 g1o9
+i w 33 k0 g0o13
+i w 34 k1 g1o10
+i r 35 k0
+p 33 k0 5
+c w 33
+p 34 k1 14
+c w 34
+i r 36 k0
+i r 37 k0
+c r 35 5 g0o13
+i w 38 k1 g2o14
+c r 36 5 g0o13
+c r 37 5 g0o13
+i w 39 k1 g0o15
+i w 40 k1 g1o12
+p 38 k1 15
+c w 38
+i w 41 k1 g2o15
+p 39 k1 16
+c w 39
+p 40 k1 17
+c w 40
+p 41 k1 18
+c w 41
+i w 42 k0 g0o16
+i r 43 k1
+i r 44 k0
+c r 43 18 g2o15
+c r 44 5 g0o13
+i r 45 k0
+i w 46 k1 g2o17
+p 42 k0 6
+c w 42
+i w 47 k1 g0o17
+c r 45 6 g0o16
+i w 48 k0 g1o15
+p 46 k1 19
+c w 46
+i r 49 k1
+c r 49 19 g2o17
+i r 50 k1
+p 47 k1 20
+c w 47
+p 48 k0 7
+c w 48
+i r 51 k1
+i r 52 k0
+c r 50 20 g0o17
+i r 53 k0
+c r 51 20 g0o17
+c r 52 7 g1o15
+i w 54 k0 g0o19
+i r 55 k0
+c r 53 7 g1o15
+c r 55 7 g1o15
+i r 56 k0
+p 54 k0 8
+c w 54
+i w 57 k1 g0o20
+c r 56 8 g0o19
+i r 58 k1
+c r 58 20 g0o17
+i w 59 k0 g1o20
+p 59 k0 9
+c w 59
+p 57 k1 21
+c w 57
+i w 60 k0 g0o21
+p 60 k0 10
+c w 60
+s 17
+i w 1 k1 g0o2
+i w 2 k1 g1o1
+i r 3 k1
+c r 3 0 -
+i r 4 k0
+p 1 k1 1
+c w 1
+i r 5 k1
+p 2 k1 2
+c w 2
+c r 4 0 -
+i w 6 k1 g1o2
+i r 7 k0
+p 6 k1 3
+c w 6
+c r 5 3 g1o2
+c r 7 0 -
+i r 8 k1
+i r 9 k1
+i w 10 k0 g2o4
+p 10 k0 1
+c w 10
+c r 8 3 g1o2
+i w 11 k0 g0o5
+i r 12 k0
+c r 9 3 g1o2
+c r 12 1 g2o4
+i r 13 k0
+i w 14 k0 g2o6
+c r 13 1 g2o4
+i w 15 k0 g1o5
+p 11 k0 2
+c w 11
+i w 16 k0 g0o6
+p 14 k0 3
+c w 14
+p 15 k0 4
+c w 15
+i r 17 k1
+i w 18 k1 g2o7
+c r 17 3 g1o2
+i r 19 k0
+p 16 k0 5
+c w 16
+c r 19 5 g0o6
+i r 20 k0
+i r 21 k0
+p 18 k1 4
+c w 18
+i r 22 k0
+c r 20 5 g0o6
+c r 21 5 g0o6
+i r 23 k1
+i r 24 k0
+c r 23 4 g2o7
+c r 24 5 g0o6
+c r 22 5 g0o6
+i w 25 k1 g0o9
+i w 26 k1 g1o10
+i r 27 k0
+c r 27 5 g0o6
+i w 28 k0 g2o10
+p 25 k1 5
+c w 25
+i w 29 k1 g0o10
+p 26 k1 6
+c w 26
+p 28 k0 6
+c w 28
+i w 30 k1 g1o11
+i r 31 k0
+p 29 k1 7
+c w 29
+i r 32 k0
+p 30 k1 8
+c w 30
+i w 33 k0 g1o12
+c r 31 6 g2o10
+i r 34 k0
+c r 32 6 g2o10
+c r 34 6 g2o10
+i w 35 k0 g0o12
+i r 36 k0
+c r 36 6 g2o10
+i w 37 k0 g2o14
+p 33 k0 7
+c w 33
+i r 38 k1
+p 35 k0 8
+c w 35
+i w 39 k1 g0o13
+p 37 k0 9
+c w 37
+p 39 k1 9
+c w 39
+i r 40 k0
+i r 41 k1
+c r 40 9 g2o14
+c r 38 9 g0o13
+c r 41 9 g0o13
+i r 42 k1
+i w 43 k1 g1o14
+i w 44 k0 g2o16
+p 43 k1 10
+c w 43
+c r 42 10 g1o14
+i w 45 k1 g0o16
+i w 46 k0 g1o15
+p 44 k0 10
+c w 44
+i r 47 k1
+p 45 k1 11
+c w 45
+p 46 k0 11
+c w 46
+c r 47 11 g0o16
+i w 48 k1 g0o17
+i r 49 k0
+i r 50 k1
+c r 49 11 g1o15
+c r 50 11 g0o16
+i w 51 k1 g1o17
+i r 52 k1
+c r 52 11 g0o16
+i r 53 k0
+c r 53 11 g1o15
+p 48 k1 12
+c w 48
+i r 54 k1
+p 51 k1 13
+c w 51
+i w 55 k1 g1o18
+c r 54 13 g1o17
+i r 56 k0
+c r 56 11 g1o15
+i r 57 k0
+p 55 k1 14
+c w 55
+c r 57 11 g1o15
+i w 58 k0 g0o21
+i r 59 k0
+c r 59 11 g1o15
+i r 60 k0
+p 58 k0 12
+c w 58
+c r 60 12 g0o21
+s 18
+i r 1 k0
+i w 2 k0 g1o1
+i r 3 k0
+c r 1 0 -
+c r 3 0 -
+i w 4 k1 g0o3
+i r 5 k1
+p 2 k0 1
+c w 2
+i r 6 k0
+c r 5 0 -
+i r 7 k1
+c r 6 1 g1o1
+c r 7 0 -
+i r 8 k1
+i w 9 k1 g2o4
+p 4 k1 1
+c w 4
+i w 10 k0 g0o4
+p 9 k1 2
+c w 9
+i r 11 k0
+c r 8 2 g2o4
+i r 12 k1
+c r 11 1 g1o1
+i w 13 k1 g2o6
+p 10 k0 2
+c w 10
+c r 12 2 g2o4
+i w 14 k1 g0o5
+i r 15 k0
+c r 15 2 g0o4
+i r 16 k0
+c r 16 2 g0o4
+i r 17 k1
+p 13 k1 3
+c w 13
+c r 17 3 g2o6
+i r 18 k0
+i r 19 k0
+p 14 k1 4
+c w 14
+c r 18 2 g0o4
+i r 20 k1
+i w 21 k1 g1o9
+c r 19 2 g0o4
+i w 22 k0 g2o8
+c r 20 4 g0o5
+i w 23 k0 g0o7
+p 21 k1 5
+c w 21
+i w 24 k1 g1o10
+p 22 k0 3
+c w 22
+i r 25 k1
+p 23 k0 4
+c w 23
+i w 26 k1 g0o8
+p 24 k1 6
+c w 24
+i w 27 k1 g1o11
+c r 25 6 g1o10
+i r 28 k0
+c r 28 4 g0o7
+i r 29 k0
+p 26 k1 7
+c w 26
+c r 29 4 g0o7
+i w 30 k1 g0o9
+i r 31 k0
+c r 31 4 g0o7
+i w 32 k1 g2o13
+p 27 k1 8
+c w 27
+i r 33 k1
+p 30 k1 9
+c w 30
+i r 34 k1
+p 32 k1 10
+c w 32
+i w 35 k1 g2o14
+c r 34 10 g2o13
+c r 33 10 g2o13
+i r 36 k0
+i w 37 k0 g1o13
+c r 36 4 g0o7
+i w 38 k0 g0o12
+p 35 k1 11
+c w 35
+i w 39 k1 g2o15
+p 37 k0 5
+c w 37
+p 38 k0 6
+c w 38
+i r 40 k1
+i w 41 k0 g1o14
+c r 40 11 g2o14
+i w 42 k1 g0o14
+p 39 k1 12
+c w 39
+i r 43 k1
+p 41 k0 7
+c w 41
+i w 44 k0 g1o15
+p 42 k1 13
+c w 42
+c r 43 13 g0o14
+i r 45 k0
+i r 46 k0
+c r 45 7 g1o14
+c r 46 7 g1o14
+i w 47 k1 g0o16
+i r 48 k0
+p 44 k0 8
+c w 44
+i w 49 k1 g1o16
+c r 48 8 g1o15
+i r 50 k0
+c r 50 8 g1o15
+i r 51 k0
+p 47 k1 14
+c w 47
+c r 51 8 g1o15
+i w 52 k0 g0o17
+p 49 k1 15
+c w 49
+i w 53 k0 g1o17
+p 52 k0 9
+c w 52
+i w 54 k1 g0o18
+p 53 k0 10
+c w 53
+i w 55 k0 g1o18
+p 54 k1 16
+c w 54
+i w 56 k1 g0o19
+p 55 k0 11
+c w 55
+i r 57 k0
+p 56 k1 17
+c w 56
+i w 58 k1 g0o20
+c r 57 11 g1o18
+i w 59 k0 g1o20
+p 58 k1 18
+c w 58
+i w 60 k1 g0o21
+p 59 k0 12
+c w 59
+p 60 k1 19
+c w 60
+s 19
+i w 1 k1 g0o2
+i w 2 k1 g1o1
+i w 3 k1 g2o1
+p 1 k1 1
+c w 1
+i w 4 k1 g0o3
+p 2 k1 2
+c w 2
+p 3 k1 3
+c w 3
+i r 5 k1
+i r 6 k1
+p 4 k1 4
+c w 4
+i r 7 k1
+c r 5 4 g0o3
+c r 6 4 g0o3
+i r 8 k0
+i r 9 k0
+c r 7 4 g0o3
+c r 8 0 -
+c r 9 0 -
+i r 10 k1
+i r 11 k1
+i r 12 k0
+c r 10 4 g0o3
+c r 11 4 g0o3
+c r 12 0 -
+i w 13 k1 g0o6
+i r 14 k0
+i w 15 k1 g2o5
+p 13 k1 5
+c w 13
+i w 16 k1 g0o7
+p 15 k1 6
+c w 15
+c r 14 0 -
+i r 17 k1
+i w 18 k0 g2o6
+c r 17 6 g2o5
+i r 19 k1
+p 16 k1 7
+c w 16
+c r 19 7 g0o7
+i r 20 k0
+i r 21 k1
+c r 20 0 -
+c r 21 7 g0o7
+i w 22 k1 g0o9
+i w 23 k0 g1o9
+p 18 k0 1
+c w 18
+i w 24 k0 g2o7
+p 22 k1 8
+c w 22
+p 23 k0 2
+c w 23
+p 24 k0 3
+c w 24
+i w 25 k0 g0o10
+i w 26 k1 g1o10
+i r 27 k1
+p 25 k0 4
+c w 25
+p 26 k1 9
+c w 26
+c r 27 9 g1o10
+i r 28 k0
+i w 29 k1 g1o11
+i w 30 k0 g2o9
+p 29 k1 10
+c w 29
+p 30 k0 5
+c w 30
+i w 31 k0 g1o12
+i r 32 k1
+c r 28 5 g2o9
+c r 32 10 g1o11
+i r 33 k1
+i w 34 k0 g2o11
+c r 33 10 g1o11
+i r 35 k1
+c r 35 10 g1o11
+i r 36 k0
+p 31 k0 6
+c w 31
+c r 36 6 g1o12
+i w 37 k0 g0o15
+i r 38 k0
+p 34 k0 7
+c w 34
+i r 39 k1
+c r 38 7 g2o11
+i r 40 k1
+p 37 k0 8
+c w 37
+i w 41 k1 g0o16
+c r 40 10 g1o11
+c r 39 10 g1o11
+i r 42 k1
+i w 43 k1 g2o13
+c r 42 10 g1o11
+i r 44 k1
+c r 44 10 g1o11
+i w 45 k1 g1o17
+p 41 k1 11
+c w 41
+p 43 k1 12
+c w 43
+i w 46 k1 g0o17
+i w 47 k0 g2o14
+p 45 k1 13
+c w 45
+i r 48 k1
+p 46 k1 14
+c w 46
+p 47 k0 9
+c w 47
+i r 49 k1
+i w 50 k0 g2o15
+p 50 k0 10
+c w 50
+i w 51 k0 g2o16
+c r 48 14 g0o17
+i r 52 k0
+c r 49 14 g0o17
+i r 53 k0
+c r 53 10 g2o15
+c r 52 10 g2o15
+i r 54 k1
+i w 55 k1 g1o20
+c r 54 14 g0o17
+i w 56 k1 g0o21
+p 51 k0 11
+c w 51
+i r 57 k1
+c r 57 14 g0o17
+i r 58 k1
+p 55 k1 15
+c w 55
+c r 58 15 g1o20
+i w 59 k0 g2o19
+p 59 k0 12
+c w 59
+i w 60 k0 g2o20
+p 60 k0 13
+c w 60
+p 56 k1 16
+c w 56
+s 20
+i r 1 k0
+i r 2 k1
+i r 3 k0
+c r 1 0 -
+c r 2 0 -
+c r 3 0 -
+i w 4 k1 g0o3
+i w 5 k0 g1o2
+i w 6 k0 g2o2
+p 4 k1 1
+c w 4
+i w 7 k1 g0o4
+p 5 k0 1
+c w 5
+p 6 k0 2
+c w 6
+i w 8 k1 g1o3
+i r 9 k1
+p 7 k1 2
+c w 7
+p 8 k1 3
+c w 8
+i r 10 k0
+i w 11 k0 g1o4
+c r 9 3 g1o3
+i r 12 k1
+c r 10 2 g2o2
+c r 12 3 g1o3
+i w 13 k1 g0o6
+i r 14 k0
+p 11 k0 3
+c w 11
+i w 15 k0 g1o5
+c r 14 3 g1o4
+i r 16 k1
+c r 16 3 g1o3
+i w 17 k1 g2o7
+p 13 k1 4
+c w 13
+i r 18 k0
+p 15 k0 4
+c w 15
+i w 19 k1 g1o6
+c r 18 4 g1o5
+i r 20 k0
+p 17 k1 5
+c w 17
+i w 21 k1 g2o8
+p 19 k1 6
+c w 19
+i r 22 k1
+c r 20 4 g1o5
+i r 23 k0
+c r 23 4 g1o5
+c r 22 6 g1o6
+i r 24 k0
+i w 25 k0 g1o8
+c r 24 4 g1o5
+i w 26 k0 g0o11
+p 21 k1 7
+c w 21
+i w 27 k1 g2o9
+p 25 k0 5
+c w 25
+i r 28 k0
+p 26 k0 6
+c w 26
+c r 28 6 g0o11
+i w 29 k1 g0o12
+i w 30 k0 g1o10
+p 27 k1 8
+c w 27
+i r 31 k1
+p 29 k1 9
+c w 29
+i w 32 k0 g0o13
+p 30 k0 7
+c w 30
+i w 33 k1 g1o11
+c r 31 9 g0o12
+i r 34 k0
+p 32 k0 8
+c w 32
+i w 35 k0 g0o14
+c r 34 8 g0o13
+i w 36 k0 g2o12
+p 33 k1 10
+c w 33
+i w 37 k0 g1o12
+p 35 k0 9
+c w 35
+i w 38 k1 g0o15
+p 36 k0 10
+c w 36
+i r 39 k0
+p 37 k0 11
+c w 37
+i r 40 k1
+c r 39 11 g1o12
+i w 41 k1 g2o14
+p 38 k1 11
+c w 38
+c r 40 11 g0o15
+i w 42 k1 g0o16
+i r 43 k1
+c r 43 11 g0o15
+i w 44 k1 g1o15
+p 41 k1 12
+c w 41
+i r 45 k1
+p 42 k1 13
+c w 42
+i w 46 k0 g0o17
+p 44 k1 14
+c w 44
+i r 47 k1
+p 46 k0 12
+c w 46
+c r 45 14 g1o15
+i r 48 k0
+i r 49 k0
+c r 47 14 g1o15
+i w 50 k0 g1o17
+c r 48 12 g0o17
+c r 49 12 g0o17
+i r 51 k1
+i w 52 k0 g2o17
+p 50 k0 13
+c w 50
+p 52 k0 14
+c w 52
+i r 53 k1
+i w 54 k1 g2o18
+c r 51 14 g1o15
+i w 55 k0 g0o20
+c r 53 14 g1o15
+i r 56 k0
+c r 56 14 g2o17
+i r 57 k1
+p 54 k1 15
+c w 54
+i r 58 k0
+c r 57 15 g2o18
+p 55 k0 15
+c w 55
+c r 58 15 g0o20
+i w 59 k0 g0o21
+i w 60 k0 g2o20
+p 59 k0 16
+c w 59
+p 60 k0 17
+c w 60
+s 21
+i w 1 k0 g0o2
+i r 2 k0
+i w 3 k1 g2o1
+p 1 k0 1
+c w 1
+i r 4 k1
+c r 2 1 g0o2
+i w 5 k1 g1o2
+p 3 k1 1
+c w 3
+p 5 k1 2
+c w 5
+c r 4 2 g1o2
+i w 6 k1 g0o4
+i w 7 k0 g1o3
+i r 8 k1
+p 6 k1 3
+c w 6
+i r 9 k1
+p 7 k0 2
+c w 7
+i w 10 k0 g1o4
+c r 8 3 g0o4
+i w 11 k1 g2o3
+c r 9 3 g0o4
+i r 12 k0
+c r 12 2 g1o3
+i r 13 k1
+c r 13 3 g0o4
+i w 14 k1 g0o8
+p 10 k0 3
+c w 10
+i r 15 k1
+p 11 k1 4
+c w 11
+i w 16 k1 g2o4
+p 14 k1 5
+c w 14
+p 16 k1 6
+c w 16
+c r 15 6 g2o4
+i w 17 k0 g0o9
+i w 18 k0 g1o6
+i r 19 k0
+p 17 k0 4
+c w 17
+p 18 k0 5
+c w 18
+c r 19 5 g1o6
+i r 20 k1
+i r 21 k1
+i r 22 k0
+c r 20 6 g2o4
+c r 21 6 g2o4
+i r 23 k0
+i r 24 k0
+c r 22 5 g1o6
+i w 25 k1 g2o7
+p 25 k1 7
+c w 25
+i w 26 k1 g2o8
+p 26 k1 8
+c w 26
+i r 27 k0
+c r 27 5 g1o6
+i r 28 k1
+c r 28 8 g2o8
+i w 29 k0 g2o11
+p 29 k0 6
+c w 29
+i w 30 k0 g2o12
+p 30 k0 7
+c w 30
+i r 31 k1
+c r 23 7 g2o12
+c r 24 7 g2o12
+c r 31 8 g2o8
+i w 32 k1 g0o12
+i r 33 k1
+i r 34 k1
+c r 33 8 g2o8
+c r 34 8 g2o8
+i w 35 k0 g1o10
+i w 36 k1 g2o15
+p 32 k1 9
+c w 32
+p 35 k0 8
+c w 35
+p 36 k1 10
+c w 36
+i r 37 k0
+i r 38 k1
+i w 39 k0 g2o16
+p 39 k0 9
+c w 39
+i r 40 k1
+c r 37 9 g2o16
+c r 38 10 g2o15
+i w 41 k0 g0o14
+i r 42 k0
+c r 42 9 g2o16
+c r 40 10 g2o15
+i r 43 k0
+i w 44 k0 g2o18
+c r 43 9 g2o16
+i w 45 k0 g1o14
+p 41 k0 10
+c w 41
+i r 46 k1
+p 44 k0 11
+c w 44
+i r 47 k1
+c r 46 10 g2o15
+c r 47 10 g2o15
+i r 48 k0
+i w 49 k1 g2o20
+p 45 k0 12
+c w 45
+c r 48 12 g1o14
+i w 50 k1 g0o17
+i r 51 k1
+p 49 k1 11
+c w 49
+p 50 k1 12
+c w 50
+i w 52 k0 g0o18
+c r 51 12 g0o17
+i r 53 k1
+c r 53 12 g0o17
+i r 54 k1
+p 52 k0 13
+c w 52
+i r 55 k1
+c r 54 12 g0o17
+i w 56 k0 g1o18
+c r 55 12 g0o17
+i r 57 k1
+c r 57 12 g0o17
+i r 58 k0
+p 56 k0 14
+c w 56
+c r 58 14 g1o18
+i r 59 k1
+c r 59 12 g0o17
+i w 60 k0 g1o20
+p 60 k0 15
+c w 60
+s 22
+i r 1 k0
+i r 2 k1
+i r 3 k0
+c r 1 0 -
+c r 2 0 -
+c r 3 0 -
+i w 4 k1 g0o3
+i r 5 k1
+i w 6 k0 g2o2
+p 4 k1 1
+c w 4
+i r 7 k1
+p 6 k0 1
+c w 6
+i w 8 k1 g2o3
+c r 5 1 g0o3
+i w 9 k1 g1o3
+c r 7 1 g0o3
+i r 10 k0
+p 8 k1 2
+c w 8
+p 9 k1 3
+c w 9
+c r 10 1 g2o2
+i w 11 k1 g0o6
+i w 12 k0 g1o4
+i r 13 k0
+p 11 k1 4
+c w 11
+c r 13 1 g2o2
+i w 14 k0 g0o7
+i w 15 k1 g2o5
+p 12 k0 2
+c w 12
+i r 16 k0
+p 14 k0 3
+c w 14
+p 15 k1 5
+c w 15
+i w 17 k1 g0o8
+i r 18 k1
+c r 16 3 g0o7
+i w 19 k1 g1o6
+c r 18 5 g2o5
+i w 20 k1 g2o7
+p 17 k1 6
+c w 17
+i w 21 k0 g0o9
+p 19 k1 7
+c w 19
+i w 22 k1 g1o7
+p 20 k1 8
+c w 20
+p 21 k0 4
+c w 21
+i r 23 k1
+i r 24 k1
+p 22 k1 9
+c w 22
+i w 25 k0 g1o8
+p 25 k0 5
+c w 25
+i r 26 k1
+c r 23 9 g1o7
+c r 24 9 g1o7
+i w 27 k1 g0o11
+i r 28 k1
+c r 26 9 g1o7
+c r 28 9 g1o7
+i r 29 k1
+i w 30 k1 g2o10
+p 27 k1 10
+c w 27
+c r 29 10 g0o11
+i r 31 k1
+i w 32 k1 g1o11
+p 30 k1 11
+c w 30
+i r 33 k1
+p 32 k1 12
+c w 32
+c r 31 12 g1o11
+i r 34 k0
+i w 35 k1 g1o12
+c r 34 5 g1o8
+c r 33 12 g1o11
+i r 36 k1
+i r 37 k0
+c r 36 12 g1o11
+c r 37 5 g1o8
+i w 38 k0 g0o15
+i r 39 k0
+c r 39 5 g1o8
+i r 40 k0
+p 35 k1 13
+c w 35
+i r 41 k1
+c r 40 5 g1o8
+i w 42 k0 g2o15
+p 38 k0 6
+c w 38
+i r 43 k1
+c r 43 13 g1o12
+c r 41 13 g1o12
+i w 44 k1 g0o17
+i w 45 k0 g1o14
+p 42 k0 7
+c w 42
+i r 46 k1
+c r 46 13 g1o12
+i w 47 k0 g2o17
+p 44 k1 14
+c w 44
+i r 48 k0
+c r 48 7 g2o15
+i w 49 k1 g0o19
+p 45 k0 8
+c w 45
+i w 50 k0 g1o15
+p 47 k0 9
+c w 47
+i r 51 k1
+p 49 k1 15
+c w 49
+i w 52 k1 g0o20
+c r 51 15 g0o19
+i w 53 k1 g2o19
+p 50 k0 10
+c w 50
+i w 54 k1 g1o16
+p 52 k1 16
+c w 52
+i w 55 k0 g0o21
+p 53 k1 17
+c w 53
+i w 56 k1 g2o20
+p 54 k1 18
+c w 54
+i r 57 k0
+p 55 k0 11
+c w 55
+c r 57 11 g0o21
+i w 58 k0 g1o18
+p 56 k1 19
+c w 56
+p 58 k0 12
+c w 58
+i w 59 k0 g1o19
+p 59 k0 13
+c w 59
+i r 60 k1
+c r 60 19 g2o20
+s 23
+i w 1 k1 g0o2
+i w 2 k1 g1o1
+i w 3 k1 g2o1
+p 1 k1 1
+c w 1
+i r 4 k0
+p 2 k1 2
+c w 2
+p 3 k1 3
+c w 3
+i r 5 k1
+i r 6 k1
+c r 4 0 -
+i w 7 k0 g0o4
+c r 5 3 g2o1
+c r 6 3 g2o1
+i w 8 k1 g1o3
+i r 9 k0
+c r 9 0 -
+i r 10 k0
+c r 10 0 -
+i r 11 k1
+p 7 k0 1
+c w 7
+i w 12 k0 g0o5
+c r 11 3 g2o1
+i r 13 k0
+c r 13 1 g0o4
+i w 14 k1 g2o7
+p 8 k1 4
+c w 8
+i r 15 k1
+p 12 k0 2
+c w 12
+i w 16 k0 g0o6
+p 14 k1 5
+c w 14
+c r 15 5 g2o7
+i r 17 k1
+i w 18 k0 g2o8
+p 16 k0 3
+c w 16
+i r 19 k1
+c r 17 5 g2o7
+i w 20 k1 g1o6
+p 18 k0 4
+c w 18
+i w 21 k0 g2o9
+p 20 k1 6
+c w 20
+i w 22 k0 g1o7
+c r 19 6 g1o6
+i r 23 k1
+c r 23 6 g1o6
+i w 24 k0 g0o9
+p 21 k0 5
+c w 21
+p 22 k0 6
+c w 22
+i w 25 k1 g1o8
+i w 26 k0 g2o10
+p 24 k0 7
+c w 24
+p 25 k1 7
+c w 25
+i r 27 k0
+i r 28 k1
+p 26 k0 8
+c w 26
+i w 29 k0 g2o11
+c r 27 8 g2o10
+i w 30 k1 g0o11
+c r 28 7 g1o8
+i r 31 k0
+c r 31 8 g2o10
+i r 32 k1
+p 29 k0 9
+c w 29
+i r 33 k1
+c r 32 7 g1o8
+i r 34 k1
+p 30 k1 8
+c w 30
+i w 35 k0 g0o12
+c r 34 8 g0o11
+c r 33 8 g0o11
+i w 36 k1 g1o13
+i w 37 k0 g2o13
+p 35 k0 10
+c w 35
+i w 38 k1 g0o13
+p 36 k1 9
+c w 36
+p 37 k0 11
+c w 37
+i w 39 k1 g1o14
+i r 40 k0
+p 38 k1 10
+c w 38
+i w 41 k0 g0o14
+p 39 k1 11
+c w 39
+c r 40 11 g2o13
+i r 42 k1
+i r 43 k1
+p 41 k0 12
+c w 41
+c r 42 11 g1o14
+c r 43 11 g1o14
+i r 44 k1
+i r 45 k1
+i r 46 k0
+c r 44 11 g1o14
+c r 45 11 g1o14
+c r 46 12 g0o14
+i w 47 k1 g0o16
+i r 48 k0
+i w 49 k1 g2o17
+p 47 k1 12
+c w 47
+p 49 k1 13
+c w 49
+c r 48 12 g0o14
+i r 50 k1
+i r 51 k0
+i r 52 k1
+c r 50 13 g2o17
+c r 51 12 g0o14
+i r 53 k1
+i w 54 k0 g1o19
+p 54 k0 13
+c w 54
+i r 55 k1
+c r 53 13 g2o17
+c r 52 13 g2o17
+i r 56 k1
+i w 57 k0 g2o19
+c r 56 13 g2o17
+c r 55 13 g2o17
+i r 58 k0
+p 57 k0 14
+c w 57
+i w 59 k1 g2o20
+c r 58 14 g2o19
+i w 60 k1 g0o21
+p 59 k1 14
+c w 59
+p 60 k1 15
+c w 60
+s 24
+i r 1 k0
+i w 2 k1 g1o1
+i r 3 k0
+p 2 k1 1
+c w 2
+c r 1 0 -
+c r 3 0 -
+i r 4 k1
+i r 5 k1
+i r 6 k1
+c r 4 1 g1o1
+c r 5 1 g1o1
+c r 6 1 g1o1
+i r 7 k1
+i r 8 k1
+i r 9 k1
+c r 7 1 g1o1
+c r 8 1 g1o1
+c r 9 1 g1o1
+i w 10 k0 g0o5
+i r 11 k0
+i w 12 k0 g2o4
+p 10 k0 1
+c w 10
+i r 13 k0
+p 12 k0 2
+c w 12
+i w 14 k1 g2o5
+c r 11 2 g2o4
+i r 15 k1
+c r 13 2 g2o4
+c r 15 1 g1o1
+i w 16 k1 g0o7
+i r 17 k0
+c r 17 2 g2o4
+i w 18 k0 g1o7
+p 14 k1 2
+c w 14
+i w 19 k1 g2o6
+p 16 k1 3
+c w 16
+i w 20 k1 g0o8
+p 18 k0 3
+c w 18
+i r 21 k0
+p 19 k1 4
+c w 19
+i r 22 k1
+p 20 k1 5
+c w 20
+i w 23 k1 g0o9
+c r 21 3 g1o7
+c r 22 5 g0o8
+i w 24 k1 g1o9
+i r 25 k1
+c r 25 5 g0o8
+i w 26 k1 g2o9
+p 23 k1 6
+c w 23
+p 24 k1 7
+c w 24
+i r 27 k0
+i w 28 k0 g1o10
+p 26 k1 8
+c w 26
+i w 29 k0 g2o10
+c r 27 3 g1o7
+i w 30 k1 g0o11
+p 28 k0 4
+c w 28
+i w 31 k1 g1o11
+p 29 k0 5
+c w 29
+i r 32 k0
+p 30 k1 9
+c w 30
+i r 33 k0
+p 31 k1 10
+c w 31
+i w 34 k0 g1o12
+c r 32 5 g2o10
+i r 35 k1
+c r 33 5 g2o10
+c r 35 10 g1o11
+i w 36 k1 g0o13
+i r 37 k1
+p 34 k0 6
+c w 34
+i r 38 k1
+p 36 k1 11
+c w 36
+i w 39 k1 g0o14
+c r 37 11 g0o13
+i w 40 k0 g2o14
+p 39 k1 12
+c w 39
+i w 41 k0 g0o15
+c r 38 12 g0o14
+i r 42 k0
+c r 42 6 g1o12
+i r 43 k1
+p 40 k0 7
+c w 40
+c r 43 12 g0o14
+i w 44 k0 g1o16
+i r 45 k1
+p 41 k0 8
+c w 41
+i r 46 k0
+p 44 k0 9
+c w 44
+i w 47 k1 g1o17
+c r 45 12 g0o14
+i r 48 k1
+c r 46 9 g1o16
+i w 49 k0 g0o17
+c r 48 12 g0o14
+i r 50 k0
+p 47 k1 13
+c w 47
+i w 51 k1 g1o18
+p 49 k0 10
+c w 49
+i r 52 k1
+c r 52 13 g1o17
+c r 50 10 g0o17
+i r 53 k0
+i r 54 k1
+c r 53 10 g0o17
+c r 54 13 g1o17
+i w 55 k1 g0o20
+i w 56 k0 g2o19
+p 51 k1 14
+c w 51
+i w 57 k0 g1o19
+p 55 k1 15
+c w 55
+i r 58 k0
+p 56 k0 11
+c w 56
+p 57 k0 12
+c w 57
+i w 59 k0 g1o20
+i r 60 k1
+p 59 k0 13
+c w 59
+c r 58 13 g1o20
+c r 60 15 g0o20
+s 25
+i r 1 k1
+i w 2 k0 g1o1
+i r 3 k0
+p 2 k0 1
+c w 2
+i r 4 k1
+c r 1 0 -
+c r 3 1 g1o1
+i r 5 k0
+i w 6 k0 g2o2
+c r 4 0 -
+i r 7 k1
+c r 5 1 g1o1
+c r 7 0 -
+i w 8 k0 g0o4
+i r 9 k0
+c r 9 1 g1o1
+i r 10 k0
+p 6 k0 2
+c w 6
+i r 11 k0
+p 8 k0 3
+c w 8
+c r 10 3 g0o4
+i w 12 k1 g0o5
+i r 13 k0
+c r 13 3 g0o4
+c r 11 3 g0o4
+i w 14 k0 g1o7
+i w 15 k0 g2o4
+p 12 k1 1
+c w 12
+i w 16 k1 g0o6
+p 14 k0 4
+c w 14
+p 15 k0 5
+c w 15
+i r 17 k1
+i r 18 k1
+p 16 k1 2
+c w 16
+i w 19 k1 g0o7
+p 19 k1 3
+c w 19
+c r 17 3 g0o7
+c r 18 3 g0o7
+i r 20 k0
+i w 21 k1 g1o9
+i w 22 k0 g2o6
+c r 20 5 g2o4
+i w 23 k0 g0o9
+p 21 k1 4
+c w 21
+i r 24 k1
+p 22 k0 6
+c w 22
+i r 25 k1
+c r 24 4 g1o9
+c r 25 4 g1o9
+i w 26 k1 g1o11
+i w 27 k1 g2o8
+p 23 k0 7
+c w 23
+p 26 k1 5
+c w 26
+p 27 k1 6
+c w 27
+i r 28 k0
+i r 29 k0
+i w 30 k0 g2o9
+p 30 k0 8
+c w 30
+i r 31 k1
+c r 31 6 g2o8
+i r 32 k0
+c r 32 8 g2o9
+i w 33 k0 g2o12
+p 33 k0 9
+c w 33
+i w 34 k0 g2o13
+p 34 k0 10
+c w 34
+i r 35 k1
+c r 28 10 g2o13
+c r 29 10 g2o13
+c r 35 6 g2o8
+i r 36 k0
+i w 37 k1 g1o13
+i r 38 k1
+p 37 k1 7
+c w 37
+c r 36 10 g2o13
+c r 38 7 g1o13
+i w 39 k0 g0o12
+i r 40 k1
+i r 41 k0
+c r 40 7 g1o13
+c r 41 10 g2o13
+i r 42 k1
+i r 43 k1
+c r 42 7 g1o13
+c r 43 7 g1o13
+i w 44 k1 g1o16
+i w 45 k0 g2o18
+p 39 k0 11
+c w 39
+i w 46 k1 g0o13
+p 44 k1 8
+c w 44
+p 45 k0 12
+c w 45
+i w 47 k1 g1o17
+i w 48 k1 g2o19
+p 46 k1 9
+c w 46
+i r 49 k1
+p 47 k1 10
+c w 47
+i w 50 k0 g1o18
+c r 49 10 g1o17
+i w 51 k1 g0o15
+p 48 k1 11
+c w 48
+i r 52 k0
+p 50 k0 13
+c w 50
+i w 53 k0 g1o19
+p 51 k1 12
+c w 51
+p 53 k0 14
+c w 53
+i w 54 k1 g0o16
+i r 55 k1
+c r 52 14 g1o19
+p 54 k1 13
+c w 54
+i w 56 k0 g0o17
+c r 55 13 g0o16
+p 56 k0 15
+c w 56
+i r 57 k0
+c r 57 15 g0o17
+i r 58 k1
+c r 58 13 g0o16
+i r 59 k1
+c r 59 13 g0o16
+i w 60 k0 g0o21
+p 60 k0 16
+c w 60
+s 26
+i r 1 k0
+i r 2 k0
+i w 3 k0 g2o1
+c r 1 0 -
+c r 2 0 -
+i r 4 k1
+i w 5 k1 g1o2
+p 3 k0 1
+c w 3
+i r 6 k1
+c r 4 0 -
+c r 6 0 -
+i r 7 k0
+i r 8 k1
+p 5 k1 1
+c w 5
+i w 9 k1 g1o3
+c r 7 1 g2o1
+i w 10 k1 g0o5
+c r 8 1 g1o2
+i r 11 k1
+c r 11 1 g1o2
+i r 12 k0
+c r 12 1 g2o1
+i w 13 k1 g2o6
+p 9 k1 2
+c w 9
+p 10 k1 3
+c w 10
+i r 14 k0
+i w 15 k1 g1o4
+p 13 k1 4
+c w 13
+i r 16 k0
+p 15 k1 5
+c w 15
+i r 17 k0
+c r 14 1 g2o1
+i r 18 k0
+c r 16 1 g2o1
+i w 19 k1 g2o8
+c r 18 1 g2o1
+c r 17 1 g2o1
+i r 20 k0
+i w 21 k0 g1o6
+p 19 k1 6
+c w 19
+c r 20 1 g2o1
+i w 22 k1 g0o9
+i r 23 k0
+p 21 k0 2
+c w 21
+i r 24 k0
+p 22 k1 7
+c w 22
+i w 25 k1 g0o10
+c r 24 2 g1o6
+c r 23 2 g1o6
+i r 26 k1
+i r 27 k0
+c r 26 7 g0o9
+c r 27 2 g1o6
+i w 28 k0 g1o9
+i w 29 k1 g2o11
+p 25 k1 8
+c w 25
+i r 30 k1
+p 28 k0 3
+c w 28
+p 29 k1 9
+c w 29
+i w 31 k0 g1o10
+i r 32 k0
+c r 30 9 g2o11
+i r 33 k0
+c r 33 3 g1o9
+c r 32 3 g1o9
+i r 34 k0
+i r 35 k0
+p 31 k0 4
+c w 31
+i r 36 k1
+c r 34 4 g1o10
+i r 37 k0
+c r 35 4 g1o10
+i r 38 k1
+c r 37 4 g1o10
+c r 36 9 g2o11
+i r 39 k0
+i r 40 k1
+c r 38 9 g2o11
+i w 41 k1 g2o15
+c r 39 4 g1o10
+c r 40 9 g2o11
+i r 42 k0
+i r 43 k1
+c r 42 4 g1o10
+c r 43 9 g2o11
+i w 44 k0 g0o17
+i r 45 k1
+c r 45 9 g2o11
+i w 46 k0 g1o15
+p 41 k1 10
+c w 41
+i w 47 k0 g2o16
+p 44 k0 5
+c w 44
+i r 48 k1
+c r 48 10 g2o15
+i r 49 k0
+c r 49 5 g0o17
+i r 50 k1
+c r 50 10 g2o15
+i w 51 k0 g0o21
+p 46 k0 6
+c w 46
+p 47 k0 7
+c w 47
+i r 52 k0
+i r 53 k0
+p 51 k0 8
+c w 51
+c r 52 8 g0o21
+c r 53 8 g0o21
+i w 54 k0 g1o17
+i w 55 k1 g2o18
+p 54 k0 9
+c w 54
+i r 56 k0
+p 55 k1 11
+c w 55
+i r 57 k0
+c r 56 9 g1o17
+i r 58 k0
+c r 58 9 g1o17
+c r 57 9 g1o17
+i r 59 k1
+i r 60 k1
+c r 59 11 g2o18
+c r 60 11 g2o18
+s 27
+i r 1 k0
+i w 2 k1 g1o1
+i r 3 k1
+p 2 k1 1
+c w 2
+i r 4 k0
+c r 1 0 -
+c r 3 1 g1o1
+i w 5 k0 g0o3
+i w 6 k1 g2o2
+c r 4 0 -
+i w 7 k0 g1o3
+p 5 k0 1
+c w 5
+p 6 k1 2
+c w 6
+p 7 k0 2
+c w 7
+i w 8 k0 g0o4
+i w 9 k1 g1o4
+i w 10 k0 g2o3
+p 8 k0 3
+c w 8
+p 9 k1 3
+c w 9
+p 10 k0 4
+c w 10
+i r 11 k1
+i r 12 k0
+i r 13 k0
+c r 11 3 g1o4
+c r 12 4 g2o3
+c r 13 4 g2o3
+i w 14 k0 g0o6
+i w 15 k0 g1o6
+i r 16 k0
+c r 16 4 g2o3
+i w 17 k0 g2o6
+p 14 k0 5
+c w 14
+i r 18 k0
+p 15 k0 6
+c w 15
+p 17 k0 7
+c w 17
+i r 19 k1
+i w 20 k1 g2o7
+p 20 k1 4
+c w 20
+i w 21 k1 g2o8
+c r 18 7 g2o6
+i w 22 k0 g0o8
+c r 19 4 g2o7
+i r 23 k0
+p 21 k1 5
+c w 21
+i r 24 k0
+c r 23 7 g2o6
+i r 25 k1
+c r 25 5 g2o8
+c r 24 7 g2o6
+i w 26 k1 g1o10
+i r 27 k0
+p 22 k0 8
+c w 22
+i r 28 k0
+c r 27 8 g0o8
+i r 29 k0
+p 26 k1 6
+c w 26
+c r 28 8 g0o8
+c r 29 8 g0o8
+i w 30 k1 g0o10
+i r 31 k0
+i r 32 k0
+c r 31 8 g0o8
+c r 32 8 g0o8
+i w 33 k1 g1o12
+i r 34 k1
+c r 34 6 g1o10
+i w 35 k0 g2o14
+p 30 k1 7
+c w 30
+p 33 k1 8
+c w 33
+i w 36 k0 g0o11
+i w 37 k1 g1o13
+p 35 k0 9
+c w 35
+i r 38 k1
+p 36 k0 10
+c w 36
+i w 39 k0 g0o12
+p 37 k1 9
+c w 37
+i r 40 k0
+c r 38 9 g1o13
+i r 41 k0
+c r 40 10 g0o11
+c r 41 10 g0o11
+i w 42 k0 g1o15
+i r 43 k1
+p 39 k0 11
+c w 39
+c r 43 9 g1o13
+i r 44 k1
+i w 45 k1 g2o18
+p 42 k0 12
+c w 42
+i w 46 k0 g1o16
+p 45 k1 10
+c w 45
+p 46 k0 13
+c w 46
+c r 44 10 g2o18
+i r 47 k1
+i w 48 k1 g1o17
+i w 49 k0 g2o19
+c r 47 10 g2o18
+i w 50 k1 g0o15
+p 48 k1 11
+c w 48
+p 49 k0 14
+c w 49
+i r 51 k1
+i r 52 k0
+p 50 k1 12
+c w 50
+c r 51 12 g0o15
+c r 52 14 g2o19
+i r 53 k1
+i r 54 k0
+c r 53 12 g0o15
+c r 54 14 g2o19
+i w 55 k1 g0o17
+i r 56 k1
+c r 56 12 g0o15
+p 55 k1 13
+c w 55
+i w 57 k1 g0o18
+p 57 k1 14
+c w 57
+i w 58 k1 g0o19
+p 58 k1 15
+c w 58
+i r 59 k1
+c r 59 15 g0o19
+i r 60 k1
+c r 60 15 g0o19
+s 28
+i r 1 k0
+i w 2 k0 g1o1
+i w 3 k0 g2o1
+c r 1 0 -
+i r 4 k1
+p 2 k0 1
+c w 2
+i w 5 k1 g1o2
+p 3 k0 2
+c w 3
+c r 4 0 -
+i w 6 k0 g0o4
+i r 7 k1
+c r 7 0 -
+i r 8 k0
+p 5 k1 1
+c w 5
+p 6 k0 3
+c w 6
+c r 8 3 g0o4
+i r 9 k0
+i r 10 k1
+i w 11 k0 g2o4
+p 11 k0 4
+c w 11
+i w 12 k0 g2o5
+p 12 k0 5
+c w 12
+i w 13 k1 g2o6
+p 13 k1 2
+c w 13
+i r 14 k1
+c r 9 5 g2o5
+c r 10 2 g2o6
+c r 14 2 g2o6
+i r 15 k0
+i r 16 k1
+i w 17 k0 g2o8
+p 17 k0 6
+c w 17
+c r 15 6 g2o8
+c r 16 2 g2o6
+i r 18 k0
+i w 19 k0 g1o5
+i r 20 k1
+p 19 k0 7
+c w 19
+c r 18 7 g1o5
+c r 20 2 g2o6
+i w 21 k0 g0o8
+i r 22 k0
+i w 23 k0 g2o10
+c r 22 7 g1o5
+i w 24 k1 g1o7
+p 21 k0 8
+c w 21
+p 23 k0 9
+c w 23
+i w 25 k0 g0o9
+i r 26 k1
+p 24 k1 3
+c w 24
+i r 27 k1
+c r 27 3 g1o7
+c r 26 3 g1o7
+i r 28 k0
+i r 29 k0
+p 25 k0 10
+c w 25
+i w 30 k0 g0o10
+c r 28 10 g0o9
+c r 29 10 g0o9
+i w 31 k1 g1o10
+i r 32 k1
+c r 32 3 g1o7
+i w 33 k0 g2o14
+p 30 k0 11
+c w 30
+i r 34 k0
+p 31 k1 4
+c w 31
+p 33 k0 12
+c w 33
+i r 35 k0
+i r 36 k0
+c r 34 12 g2o14
+c r 35 12 g2o14
+c r 36 12 g2o14
+i r 37 k0
+i w 38 k0 g1o12
+i w 39 k0 g2o16
+c r 37 12 g2o14
+i w 40 k0 g0o13
+p 38 k0 13
+c w 38
+i w 41 k1 g1o13
+p 39 k0 14
+c w 39
+i r 42 k1
+p 40 k0 15
+c w 40
+p 41 k1 5
+c w 41
+i w 43 k0 g0o14
+i r 44 k1
+c r 42 5 g1o13
+i r 45 k1
+c r 44 5 g1o13
+c r 45 5 g1o13
+i r 46 k0
+i r 47 k1
+c r 46 15 g0o13
+c r 47 5 g1o13
+i r 48 k1
+i r 49 k1
+p 43 k0 16
+c w 43
+i r 50 k0
+c r 48 5 g1o13
+c r 49 5 g1o13
+i w 51 k0 g1o17
+c r 50 16 g0o14
+i r 52 k0
+p 51 k0 17
+c w 51
+c r 52 17 g1o17
+i w 53 k0 g0o17
+i w 54 k1 g1o18
+p 53 k0 18
+c w 53
+p 54 k1 6
+c w 54
+i w 55 k0 g0o18
+i r 56 k1
+p 55 k0 19
+c w 55
+i r 57 k1
+c r 57 6 g1o18
+c r 56 6 g1o18
+i w 58 k0 g0o20
+i r 59 k1
+c r 59 6 g1o18
+p 58 k0 20
+c w 58
+i w 60 k0 g0o21
+p 60 k0 21
+c w 60
+s 29
+i w 1 k0 g0o2
+i w 2 k0 g1o1
+i w 3 k1 g2o1
+p 1 k0 1
+c w 1
+p 2 k0 2
+c w 2
+p 3 k1 1
+c w 3
+i r 4 k0
+i w 5 k0 g1o2
+i w 6 k1 g2o2
+c r 4 2 g1o1
+i w 7 k0 g0o4
+p 5 k0 3
+c w 5
+p 6 k1 2
+c w 6
+i r 8 k1
+i w 9 k0 g2o3
+p 7 k0 4
+c w 7
+p 9 k0 5
+c w 9
+i r 10 k1
+i w 11 k1 g2o4
+c r 10 2 g2o2
+i w 12 k0 g0o6
+p 11 k1 3
+c w 11
+i r 13 k1
+p 12 k0 6
+c w 12
+i r 14 k1
+c r 14 3 g2o4
+c r 13 3 g2o4
+i w 15 k1 g0o8
+i w 16 k1 g2o6
+p 15 k1 4
+c w 15
+i r 17 k1
+p 16 k1 5
+c w 16
+i w 18 k1 g2o7
+c r 17 5 g2o6
+i r 19 k0
+c r 19 6 g0o6
+i w 20 k1 g0o11
+p 18 k1 6
+c w 18
+i r 21 k0
+p 20 k1 7
+c w 20
+i r 22 k0
+c r 22 6 g0o6
+c r 21 6 g0o6
+i w 23 k1 g0o13
+i w 24 k0 g2o9
+p 23 k1 8
+c w 23
+p 24 k0 7
+c w 24
+i r 25 k0
+i w 26 k0 g2o10
+p 26 k0 8
+c w 26
+c r 25 8 g2o10
+c r 8 8 g0o13
+i w 27 k0 g0o15
+i w 28 k1 g1o4
+i r 29 k1
+p 27 k0 9
+c w 27
+p 28 k1 9
+c w 28
+i w 30 k1 g0o16
+i w 31 k0 g1o5
+c r 29 9 g1o4
+i r 32 k0
+c r 32 9 g0o15
+i w 33 k0 g2o13
+p 30 k1 10
+c w 30
+i w 34 k1 g0o17
+p 31 k0 10
+c w 31
+i w 35 k1 g1o6
+p 33 k0 11
+c w 33
+p 34 k1 11
+c w 34
+i w 36 k1 g0o18
+i w 37 k0 g2o14
+p 35 k1 12
+c w 35
+i r 38 k1
+p 36 k1 13
+c w 36
+p 37 k0 12
+c w 37
+i r 39 k1
+i r 40 k0
+c r 38 13 g0o18
+i w 41 k0 g1o8
+p 41 k0 13
+c w 41
+c r 39 13 g0o18
+c r 40 13 g1o8
+i w 42 k1 g0o20
+i w 43 k1 g1o9
+i w 44 k1 g2o16
+p 42 k1 14
+c w 42
+i r 45 k0
+p 43 k1 15
+c w 43
+i w 46 k1 g1o10
+p 44 k1 16
+c w 44
+i r 47 k1
+p 46 k1 17
+c w 46
+i w 48 k1 g1o11
+c r 45 13 g1o8
+c r 47 17 g1o10
+i r 49 k1
+c r 49 17 g1o10
+i w 50 k0 g2o19
+p 48 k1 18
+c w 48
+i r 51 k1
+c r 51 18 g1o11
+i w 52 k1 g1o13
+p 50 k0 14
+c w 50
+i r 53 k0
+c r 53 14 g2o19
+p 52 k1 19
+c w 52
+i w 54 k0 g1o14
+p 54 k0 15
+c w 54
+i r 55 k1
+c r 55 19 g1o13
+i r 56 k0
+c r 56 15 g1o14
+i w 57 k1 g1o17
+p 57 k1 20
+c w 57
+i w 58 k1 g1o18
+p 58 k1 21
+c w 58
+i w 59 k1 g1o19
+p 59 k1 22
+c w 59
+i r 60 k1
+c r 60 22 g1o19
+s 30
+i w 1 k1 g0o2
+i r 2 k1
+i r 3 k0
+p 1 k1 1
+c w 1
+c r 2 1 g0o2
+c r 3 0 -
+i r 4 k1
+i w 5 k1 g1o2
+i r 6 k0
+c r 4 1 g0o2
+c r 6 0 -
+i r 7 k1
+i w 8 k1 g2o3
+p 5 k1 2
+c w 5
+i r 9 k0
+c r 7 2 g1o2
+i r 10 k1
+c r 10 2 g1o2
+c r 9 0 -
+i r 11 k0
+i w 12 k0 g1o4
+p 8 k1 3
+c w 8
+i w 13 k0 g2o4
+c r 11 0 -
+i w 14 k1 g0o7
+p 12 k0 1
+c w 12
+i r 15 k0
+p 13 k0 2
+c w 13
+i r 16 k1
+p 14 k1 4
+c w 14
+i w 17 k1 g0o8
+c r 15 2 g2o4
+c r 16 4 g0o7
+i w 18 k0 g1o6
+i r 19 k1
+c r 19 4 g0o7
+i w 20 k0 g2o7
+p 17 k1 5
+c w 17
+i r 21 k0
+p 18 k0 3
+c w 18
+i w 22 k1 g1o7
+p 20 k0 4
+c w 20
+i w 23 k1 g2o8
+c r 21 4 g2o7
+i r 24 k0
+p 22 k1 6
+c w 22
+p 23 k1 7
+c w 23
+i w 25 k0 g1o8
+i w 26 k1 g2o9
+c r 24 4 g2o7
+i r 27 k1
+c r 27 7 g2o8
+i w 28 k1 g0o12
+p 25 k0 5
+c w 25
+i w 29 k1 g1o9
+p 26 k1 8
+c w 26
+i w 30 k1 g2o10
+p 28 k1 9
+c w 28
+p 29 k1 10
+c w 29
+i r 31 k1
+i r 32 k1
+p 30 k1 11
+c w 30
+i r 33 k0
+c r 31 11 g2o10
+c r 32 11 g2o10
+i r 34 k1
+i r 35 k1
+c r 33 5 g1o8
+i r 36 k0
+c r 34 11 g2o10
+c r 35 11 g2o10
+c r 36 5 g1o8
+i w 37 k1 g0o15
+i w 38 k1 g1o12
+i w 39 k1 g2o13
+p 37 k1 12
+c w 37
+p 38 k1 13
+c w 38
+p 39 k1 14
+c w 39
+i r 40 k1
+i w 41 k1 g1o13
+i w 42 k0 g2o14
+c r 40 14 g2o13
+i r 43 k1
+p 41 k1 15
+c w 41
+i w 44 k0 g1o14
+p 42 k0 6
+c w 42
+c r 43 15 g1o13
+i w 45 k1 g0o18
+i w 46 k1 g2o15
+p 44 k0 7
+c w 44
+p 45 k1 16
+c w 45
+i w 47 k0 g0o19
+i r 48 k1
+p 46 k1 17
+c w 46
+i w 49 k0 g2o16
+c r 48 17 g2o15
+i w 50 k0 g1o16
+p 47 k0 8
+c w 47
+i w 51 k0 g0o20
+p 49 k0 9
+c w 49
+i r 52 k0
+p 50 k0 10
+c w 50
+p 51 k0 11
+c w 51
+i r 53 k1
+i r 54 k0
+c r 52 11 g0o20
+i r 55 k1
+c r 53 17 g2o15
+c r 54 11 g0o20
+c r 55 17 g2o15
+i r 56 k1
+i w 57 k0 g2o19
+c r 56 17 g2o15
+i r 58 k0
+c r 58 11 g0o20
+i r 59 k1
+c r 59 17 g2o15
+p 57 k0 12
+c w 57
+i w 60 k1 g2o20
+p 60 k1 18
+c w 60
+s 31
+i r 1 k1
+i w 2 k0 g1o1
+i r 3 k0
+p 2 k0 1
+c w 2
+i r 4 k1
+c r 1 0 -
+c r 3 1 g1o1
+i r 5 k1
+i w 6 k0 g2o2
+c r 5 0 -
+c r 4 0 -
+i r 7 k0
+i w 8 k1 g1o3
+p 6 k0 2
+c w 6
+c r 7 2 g2o2
+i w 9 k1 g0o5
+i w 10 k0 g2o3
+p 8 k1 1
+c w 8
+i w 11 k1 g1o4
+p 9 k1 2
+c w 9
+p 10 k0 3
+c w 10
+i w 12 k1 g0o6
+i w 13 k1 g2o4
+p 11 k1 3
+c w 11
+p 12 k1 4
+c w 12
+p 13 k1 5
+c w 13
+i r 14 k0
+i w 15 k1 g1o5
+i w 16 k0 g2o5
+c r 14 3 g2o3
+i w 17 k1 g0o8
+p 15 k1 6
+c w 15
+i r 18 k1
+p 16 k0 4
+c w 16
+p 17 k1 7
+c w 17
+i r 19 k0
+i r 20 k1
+c r 18 7 g0o8
+i r 21 k1
+c r 19 4 g2o5
+c r 21 7 g0o8
+c r 20 7 g0o8
+i r 22 k0
+i w 23 k0 g1o8
+i r 24 k0
+c r 22 4 g2o5
+c r 24 4 g2o5
+i w 25 k1 g0o11
+i r 26 k1
+c r 26 7 g0o8
+i w 27 k0 g2o9
+p 23 k0 5
+c w 23
+i r 28 k0
+c r 28 5 g1o8
+i w 29 k0 g1o10
+p 25 k1 8
+c w 25
+p 27 k0 6
+c w 27
+i w 30 k0 g0o12
+i w 31 k0 g2o10
+p 29 k0 7
+c w 29
+p 30 k0 8
+c w 30
+p 31 k0 9
+c w 31
+i w 32 k1 g0o13
+i w 33 k1 g1o11
+i w 34 k1 g2o11
+p 32 k1 9
+c w 32
+i w 35 k1 g0o14
+p 33 k1 10
+c w 33
+p 34 k1 11
+c w 34
+i r 36 k0
+i r 37 k0
+p 35 k1 12
+c w 35
+i r 38 k1
+c r 36 9 g2o10
+c r 37 9 g2o10
+i w 39 k0 g1o13
+i r 40 k1
+c r 38 12 g0o14
+c r 40 12 g0o14
+i r 41 k1
+i r 42 k1
+c r 41 12 g0o14
+c r 42 12 g0o14
+i w 43 k0 g0o17
+i r 44 k0
+c r 44 9 g2o10
+i r 45 k0
+p 39 k0 10
+c w 39
+c r 45 10 g1o13
+i r 46 k1
+i r 47 k0
+p 43 k0 11
+c w 43
+c r 46 12 g0o14
+c r 47 11 g0o17
+i r 48 k1
+i w 49 k0 g1o15
+i r 50 k0
+c r 48 12 g0o14
+c r 50 11 g0o17
+i r 51 k1
+i w 52 k0 g2o19
+p 49 k0 12
+c w 49
+i w 53 k1 g1o16
+p 52 k0 13
+c w 52
+i r 54 k1
+c r 51 12 g0o14
+i r 55 k1
+c r 55 12 g0o14
+c r 54 12 g0o14
+i w 56 k0 g0o21
+p 53 k1 13
+c w 53
+i r 57 k0
+p 56 k0 14
+c w 56
+c r 57 14 g0o21
+i w 58 k0 g1o18
+p 58 k0 15
+c w 58
+i r 59 k0
+c r 59 15 g1o18
+i r 60 k0
+c r 60 15 g1o18
+s 32
+i r 1 k1
+i r 2 k0
+i w 3 k1 g2o1
+p 3 k1 1
+c w 3
+i w 4 k0 g2o2
+c r 1 1 g2o1
+c r 2 0 -
+i w 5 k0 g0o3
+i w 6 k1 g1o2
+p 4 k0 1
+c w 4
+i r 7 k0
+p 5 k0 2
+c w 5
+i w 8 k0 g0o4
+p 6 k1 2
+c w 6
+i w 9 k1 g1o3
+p 8 k0 3
+c w 8
+c r 7 3 g0o4
+i r 10 k0
+i r 11 k0
+p 9 k1 3
+c w 9
+c r 10 3 g0o4
+c r 11 3 g0o4
+i w 12 k1 g0o6
+i w 13 k1 g1o4
+i w 14 k0 g2o5
+p 12 k1 4
+c w 12
+i r 15 k0
+p 13 k1 5
+c w 13
+p 14 k0 4
+c w 14
+i r 16 k0
+i r 17 k0
+c r 15 4 g2o5
+i w 18 k1 g0o8
+c r 16 4 g2o5
+c r 17 4 g2o5
+i w 19 k1 g1o6
+i w 20 k1 g2o7
+p 18 k1 6
+c w 18
+i w 21 k1 g0o9
+p 19 k1 7
+c w 19
+i w 22 k1 g1o7
+p 20 k1 8
+c w 20
+i w 23 k1 g2o8
+p 21 k1 9
+c w 21
+i w 24 k1 g0o10
+p 22 k1 10
+c w 22
+p 23 k1 11
+c w 23
+p 24 k1 12
+c w 24
+i r 25 k0
+i w 26 k0 g1o8
+i w 27 k0 g2o9
+p 26 k0 5
+c w 26
+p 27 k0 6
+c w 27
+i w 28 k1 g1o9
+i r 29 k1
+c r 25 6 g2o9
+i w 30 k0 g0o12
+c r 29 12 g0o10
+i r 31 k0
+p 28 k1 13
+c w 28
+i w 32 k1 g1o10
+c r 31 6 g2o9
+i r 33 k1
+p 30 k0 7
+c w 30
+i w 34 k1 g0o13
+c r 33 13 g1o9
+i r 35 k1
+c r 35 13 g1o9
+i w 36 k1 g2o14
+p 32 k1 14
+c w 32
+i r 37 k1
+p 34 k1 15
+c w 34
+p 36 k1 16
+c w 36
+i r 38 k1
+i w 39 k0 g2o15
+c r 37 16 g2o14
+i r 40 k1
+c r 38 16 g2o14
+i w 41 k0 g0o15
+p 39 k0 8
+c w 39
+i w 42 k1 g2o16
+c r 40 16 g2o14
+i r 43 k0
+c r 43 8 g2o15
+i r 44 k1
+c r 44 16 g2o14
+i w 45 k0 g1o15
+p 41 k0 9
+c w 41
+i r 46 k0
+p 42 k1 17
+c w 42
+i w 47 k0 g2o17
+p 45 k0 10
+c w 45
+c r 46 10 g1o15
+i r 48 k1
+i r 49 k1
+c r 48 17 g2o16
+i w 50 k1 g0o18
+p 47 k0 11
+c w 47
+i w 51 k0 g2o18
+c r 49 17 g2o16
+i r 52 k0
+p 50 k1 18
+c w 50
+i w 53 k0 g0o19
+c r 52 11 g2o17
+i r 54 k1
+c r 54 18 g0o18
+i w 55 k0 g1o19
+p 51 k0 12
+c w 51
+i r 56 k1
+p 53 k0 13
+c w 53
+p 55 k0 14
+c w 55
+c r 56 18 g0o18
+i w 57 k0 g0o20
+i w 58 k1 g1o20
+i w 59 k0 g2o20
+p 57 k0 15
+c w 57
+i w 60 k0 g0o21
+p 58 k1 19
+c w 58
+p 59 k0 16
+c w 59
+p 60 k0 17
+c w 60
+s 33
+i r 1 k0
+i r 2 k0
+i r 3 k0
+c r 1 0 -
+c r 2 0 -
+c r 3 0 -
+i r 4 k1
+i r 5 k1
+i w 6 k0 g2o2
+c r 4 0 -
+c r 5 0 -
+i w 7 k1 g0o4
+i r 8 k0
+c r 8 0 -
+i r 9 k0
+p 6 k0 1
+c w 6
+c r 9 1 g2o2
+i r 10 k0
+i w 11 k0 g2o3
+c r 10 1 g2o2
+i w 12 k1 g1o6
+p 7 k1 1
+c w 7
+p 11 k0 2
+c w 11
+i r 13 k1
+i r 14 k1
+p 12 k1 2
+c w 12
+i w 15 k0 g1o7
+c r 13 2 g1o6
+c r 14 2 g1o6
+i r 16 k1
+i r 17 k0
+c r 16 2 g1o6
+c r 17 2 g2o3
+i w 18 k0 g0o7
+i w 19 k0 g2o6
+p 15 k0 3
+c w 15
+p 18 k0 4
+c w 18
+i r 20 k0
+i w 21 k1 g1o8
+p 19 k0 5
+c w 19
+i r 22 k1
+c r 20 5 g2o6
+c r 22 2 g1o6
+i r 23 k0
+i w 24 k1 g2o8
+c r 23 5 g2o6
+i w 25 k1 g0o10
+p 21 k1 3
+c w 21
+i r 26 k0
+p 24 k1 4
+c w 24
+i r 27 k0
+p 25 k1 5
+c w 25
+i r 28 k0
+c r 26 5 g2o6
+i w 29 k1 g1o10
+c r 27 5 g2o6
+i r 30 k1
+p 29 k1 6
+c w 29
+i r 31 k0
+c r 28 5 g2o6
+c r 31 5 g2o6
+c r 30 6 g1o10
+i w 32 k0 g0o12
+i w 33 k1 g1o12
+i r 34 k0
+c r 34 5 g2o6
+i w 35 k0 g2o12
+p 32 k0 6
+c w 32
+i w 36 k1 g0o13
+p 33 k1 7
+c w 33
+i w 37 k0 g1o13
+p 35 k0 7
+c w 35
+i w 38 k0 g2o13
+p 36 k1 8
+c w 36
+p 37 k0 8
+c w 37
+i r 39 k1
+i r 40 k0
+p 38 k0 9
+c w 38
+i r 41 k1
+c r 39 8 g0o13
+c r 40 9 g2o13
+i w 42 k0 g0o15
+i w 43 k0 g1o15
+p 42 k0 10
+c w 42
+p 43 k0 11
+c w 43
+c r 41 8 g0o13
+i w 44 k0 g0o16
+i w 45 k1 g1o16
+i r 46 k1
+c r 46 8 g0o13
+i r 47 k1
+c r 47 8 g0o13
+i w 48 k1 g2o17
+p 44 k0 12
+c w 44
+i r 49 k1
+p 45 k1 9
+c w 45
+i r 50 k1
+p 48 k1 10
+c w 48
+i w 51 k1 g2o18
+c r 49 10 g2o17
+c r 50 10 g2o17
+i r 52 k0
+i r 53 k1
+p 51 k1 11
+c w 51
+c r 52 12 g0o16
+c r 53 11 g2o18
+i w 54 k1 g0o19
+i r 55 k1
+i r 56 k0
+c r 55 11 g2o18
+i r 57 k1
+c r 57 11 g2o18
+c r 56 12 g0o16
+i w 58 k1 g2o20
+p 54 k1 12
+c w 54
+i w 59 k0 g0o20
+p 58 k1 13
+c w 58
+p 59 k0 13
+c w 59
+i w 60 k1 g0o21
+p 60 k1 14
+c w 60
+s 34
+i r 1 k1
+i r 2 k1
+i w 3 k0 g2o1
+c r 1 0 -
+c r 2 0 -
+i r 4 k0
+i w 5 k1 g1o2
+p 3 k0 1
+c w 3
+i w 6 k1 g2o2
+p 5 k1 1
+c w 5
+c r 4 1 g2o1
+i r 7 k0
+i r 8 k0
+c r 7 1 g2o1
+i w 9 k1 g0o5
+p 6 k1 2
+c w 6
+i r 10 k0
+c r 8 1 g2o1
+i r 11 k0
+p 9 k1 3
+c w 9
+i w 12 k0 g0o6
+c r 11 1 g2o1
+c r 10 1 g2o1
+i w 13 k1 g1o5
+i w 14 k0 g2o4
+p 12 k0 2
+c w 12
+i w 15 k0 g0o7
+p 13 k1 4
+c w 13
+p 14 k0 3
+c w 14
+i r 16 k0
+i r 17 k0
+c r 16 3 g2o4
+i r 18 k1
+p 15 k0 4
+c w 15
+i w 19 k0 g0o8
+c r 17 4 g0o7
+i r 20 k1
+c r 18 4 g1o5
+i w 21 k0 g1o8
+c r 20 4 g1o5
+i w 22 k0 g2o7
+p 19 k0 5
+c w 19
+i w 23 k1 g0o9
+p 21 k0 6
+c w 21
+p 22 k0 7
+c w 22
+i r 24 k0
+i r 25 k1
+c r 24 7 g2o7
+c r 25 4 g1o5
+i r 26 k0
+i w 27 k0 g2o9
+p 23 k1 5
+c w 23
+i r 28 k1
+c r 26 7 g2o7
+i r 29 k1
+p 27 k0 8
+c w 27
+c r 28 5 g0o9
+i w 30 k0 g0o11
+i w 31 k1 g2o10
+p 30 k0 9
+c w 30
+c r 29 5 g0o9
+i r 32 k0
+i w 33 k1 g1o12
+c r 32 9 g0o11
+i r 34 k1
+p 31 k1 6
+c w 31
+p 33 k1 7
+c w 33
+i r 35 k0
+i w 36 k0 g2o11
+c r 34 7 g1o12
+i r 37 k1
+c r 35 9 g0o11
+i w 38 k1 g1o14
+c r 37 7 g1o12
+i r 39 k1
+c r 39 7 g1o12
+i w 40 k0 g0o16
+p 36 k0 10
+c w 36
+i r 41 k0
+p 38 k1 8
+c w 38
+i r 42 k0
+p 40 k0 11
+c w 40
+i w 43 k1 g0o17
+c r 42 11 g0o16
+c r 41 11 g0o16
+i r 44 k1
+i r 45 k1
+c r 44 8 g1o14
+c r 45 8 g1o14
+i w 46 k1 g1o17
+i w 47 k1 g2o14
+p 43 k1 9
+c w 43
+i r 48 k0
+p 46 k1 10
+c w 46
+i r 49 k0
+p 47 k1 11
+c w 47
+i r 50 k0
+c r 48 11 g0o16
+i r 51 k1
+c r 49 11 g0o16
+i w 52 k1 g1o19
+c r 50 11 g0o16
+i w 53 k0 g2o16
+c r 51 11 g2o14
+i r 54 k1
+p 52 k1 12
+c w 52
+c r 54 12 g1o19
+i w 55 k0 g0o21
+i r 56 k0
+p 53 k0 12
+c w 53
+i r 57 k0
+c r 56 12 g2o16
+p 55 k0 13
+c w 55
+c r 57 13 g0o21
+i r 58 k0
+c r 58 13 g0o21
+i w 59 k1 g2o19
+p 59 k1 13
+c w 59
+i w 60 k0 g2o20
+p 60 k0 14
+c w 60
+s 35
+i w 1 k1 g0o2
+i r 2 k1
+i w 3 k0 g2o1
+c r 2 0 -
+i w 4 k1 g1o2
+p 1 k1 1
+c w 1
+p 3 k0 1
+c w 3
+i w 5 k0 g0o3
+i w 6 k0 g2o2
+p 4 k1 2
+c w 4
+i w 7 k1 g1o3
+p 5 k0 2
+c w 5
+p 6 k0 3
+c w 6
+p 7 k1 3
+c w 7
+i r 8 k0
+i w 9 k1 g1o4
+i r 10 k0
+c r 8 3 g2o2
+c r 10 3 g2o2
+i w 11 k0 g0o5
+i r 12 k0
+p 9 k1 4
+c w 9
+c r 12 3 g2o2
+i r 13 k1
+i w 14 k1 g2o5
+p 11 k0 4
+c w 11
+i w 15 k1 g0o6
+p 14 k1 5
+c w 14
+c r 13 5 g2o5
+i r 16 k1
+i w 17 k0 g2o6
+p 15 k1 6
+c w 15
+p 17 k0 5
+c w 17
+c r 16 6 g0o6
+i w 18 k1 g0o7
+i w 19 k1 g1o7
+i w 20 k1 g2o7
+p 18 k1 7
+c w 18
+i r 21 k1
+p 19 k1 8
+c w 19
+p 20 k1 9
+c w 20
+i r 22 k1
+i r 23 k0
+c r 21 9 g2o7
+i w 24 k0 g0o9
+c r 22 9 g2o7
+c r 23 5 g2o6
+i w 25 k0 g1o9
+i w 26 k1 g2o9
+p 24 k0 6
+c w 24
+i w 27 k1 g0o10
+p 25 k0 7
+c w 25
+p 26 k1 10
+c w 26
+i w 28 k1 g1o10
+i r 29 k0
+p 27 k1 11
+c w 27
+c r 29 7 g1o9
+i w 30 k1 g0o11
+i w 31 k0 g2o11
+p 28 k1 12
+c w 28
+i w 32 k0 g1o11
+p 30 k1 13
+c w 30
+i w 33 k1 g0o12
+p 31 k0 8
+c w 31
+p 32 k0 9
+c w 32
+i w 34 k1 g1o12
+i r 35 k0
+c r 35 9 g1o11
+i r 36 k0
+c r 36 9 g1o11
+i w 37 k1 g2o14
+p 33 k1 14
+c w 33
+p 34 k1 15
+c w 34
+i w 38 k0 g0o13
+i w 39 k1 g1o13
+p 37 k1 16
+c w 37
+i w 40 k0 g2o15
+p 38 k0 10
+c w 38
+p 39 k1 17
+c w 39
+i w 41 k0 g0o14
+i w 42 k0 g1o14
+p 40 k0 11
+c w 40
+i w 43 k0 g2o16
+p 41 k0 12
+c w 41
+p 42 k0 13
+c w 42
+p 43 k0 14
+c w 43
+i r 44 k0
+i w 45 k1 g1o15
+i r 46 k0
+p 45 k1 18
+c w 45
+i r 47 k1
+c r 44 14 g2o16
+c r 46 14 g2o16
+i w 48 k1 g0o16
+i w 49 k1 g2o18
+p 48 k1 19
+c w 48
+i w 50 k1 g0o17
+p 49 k1 20
+c w 49
+i r 51 k0
+c r 47 20 g2o18
+c r 51 14 g2o16
+i r 52 k0
+i r 53 k0
+c r 52 14 g2o16
+i r 54 k1
+c r 54 20 g2o18
+c r 53 14 g2o16
+i w 55 k1 g1o19
+p 50 k1 21
+c w 50
+i r 56 k1
+p 55 k1 22
+c w 55
+i w 57 k1 g1o20
+c r 56 22 g1o19
+i r 58 k0
+c r 58 14 g2o16
+i r 59 k1
+c r 59 22 g1o19
+i w 60 k0 g0o21
+p 57 k1 23
+c w 57
+p 60 k0 15
+c w 60
+s 36
+i r 1 k0
+i w 2 k0 g1o1
+i w 3 k0 g2o1
+p 2 k0 1
+c w 2
+p 3 k0 2
+c w 3
+i r 4 k1
+i r 5 k1
+c r 1 2 g2o1
+i w 6 k1 g0o3
+p 6 k1 1
+c w 6
+i w 7 k0 g0o4
+c r 4 1 g0o3
+c r 5 1 g0o3
+i w 8 k1 g1o3
+i w 9 k1 g2o3
+p 7 k0 3
+c w 7
+p 8 k1 2
+c w 8
+i w 10 k1 g0o5
+i r 11 k0
+p 9 k1 3
+c w 9
+i r 12 k1
+c r 11 3 g0o4
+c r 12 3 g2o3
+i r 13 k0
+i w 14 k1 g2o5
+c r 13 3 g0o4
+i w 15 k1 g1o6
+p 10 k1 4
+c w 10
+i r 16 k0
+p 14 k1 5
+c w 14
+i r 17 k0
+c r 16 3 g0o4
+i w 18 k1 g0o7
+p 15 k1 6
+c w 15
+i r 19 k1
+p 18 k1 7
+c w 18
+c r 17 3 g0o4
+i r 20 k0
+i w 21 k0 g2o7
+c r 19 7 g0o7
+i w 22 k0 g1o8
+p 21 k0 4
+c w 21
+c r 20 4 g2o7
+i w 23 k0 g0o9
+i w 24 k1 g2o8
+p 22 k0 5
+c w 22
+i r 25 k0
+c r 25 5 g1o8
+i w 26 k0 g1o10
+p 23 k0 6
+c w 23
+i w 27 k0 g0o10
+p 24 k1 8
+c w 24
+i w 28 k1 g2o9
+p 26 k0 7
+c w 26
+i r 29 k1
+p 27 k0 8
+c w 27
+i w 30 k0 g0o11
+p 28 k1 9
+c w 28
+i w 31 k0 g2o10
+c r 29 9 g2o9
+i r 32 k0
+p 30 k0 9
+c w 30
+c r 32 9 g0o11
+i w 33 k0 g0o12
+i w 34 k1 g1o13
+p 31 k0 10
+c w 31
+i w 35 k1 g2o11
+p 33 k0 11
+c w 33
+p 34 k1 10
+c w 34
+p 35 k1 11
+c w 35
+i w 36 k0 g0o13
+i w 37 k0 g1o14
+i w 38 k1 g2o12
+p 36 k0 12
+c w 36
+p 37 k0 13
+c w 37
+p 38 k1 12
+c w 38
+i w 39 k1 g0o14
+i r 40 k1
+i r 41 k1
+c r 40 12 g2o12
+c r 41 12 g2o12
+i r 42 k0
+i r 43 k0
+p 39 k1 13
+c w 39
+i w 44 k0 g0o15
+c r 42 13 g1o14
+c r 43 13 g1o14
+i w 45 k0 g1o17
+i r 46 k0
+c r 46 13 g1o14
+i r 47 k0
+c r 47 13 g1o14
+i w 48 k0 g2o17
+p 44 k0 14
+c w 44
+i w 49 k1 g0o16
+p 45 k0 15
+c w 45
+p 48 k0 16
+c w 48
+i w 50 k1 g1o18
+i r 51 k1
+c r 51 13 g0o14
+i w 52 k0 g2o19
+p 49 k1 14
+c w 49
+i r 53 k0
+p 50 k1 15
+c w 50
+i w 54 k1 g1o19
+p 52 k0 17
+c w 52
+i r 55 k0
+c r 53 17 g2o19
+i r 56 k0
+p 54 k1 16
+c w 54
+c r 56 17 g2o19
+c r 55 17 g2o19
+i r 57 k1
+i w 58 k0 g1o20
+c r 57 16 g1o19
+i w 59 k1 g0o20
+p 58 k0 18
+c w 58
+p 59 k1 17
+c w 59
+i r 60 k0
+c r 60 18 g1o20
+s 37
+i r 1 k0
+i r 2 k0
+i r 3 k0
+c r 1 0 -
+c r 2 0 -
+c r 3 0 -
+i w 4 k0 g0o3
+i w 5 k0 g1o2
+i w 6 k1 g2o2
+p 4 k0 1
+c w 4
+p 5 k0 2
+c w 5
+i r 7 k0
+i w 8 k1 g1o3
+p 6 k1 1
+c w 6
+i w 9 k0 g2o3
+p 8 k1 2
+c w 8
+i w 10 k1 g1o4
+c r 7 2 g1o2
+i r 11 k0
+c r 11 2 g1o2
+i w 12 k1 g0o6
+p 9 k0 3
+c w 9
+i r 13 k1
+p 10 k1 3
+c w 10
+i w 14 k1 g1o5
+c r 13 3 g1o4
+i w 15 k1 g2o5
+p 12 k1 4
+c w 12
+p 14 k1 5
+c w 14
+i w 16 k0 g0o7
+i r 17 k1
+c r 17 5 g1o5
+i r 18 k0
+c r 18 3 g2o3
+i r 19 k1
+p 15 k1 6
+c w 15
+p 16 k0 4
+c w 16
+i r 20 k0
+i r 21 k1
+c r 20 4 g0o7
+c r 21 6 g2o5
+i w 22 k0 g0o9
+i w 23 k0 g2o7
+p 22 k0 5
+c w 22
+i r 24 k1
+p 23 k0 6
+c w 23
+i w 25 k1 g2o8
+c r 24 6 g2o5
+i w 26 k0 g0o11
+c r 19 6 g2o5
+i r 27 k0
+p 25 k1 7
+c w 25
+p 26 k0 7
+c w 26
+i w 28 k1 g0o12
+i w 29 k1 g2o9
+c r 27 7 g0o11
+i r 30 k0
+p 28 k1 8
+c w 28
+p 29 k1 9
+c w 29
+c r 30 7 g0o11
+i w 31 k0 g0o13
+i r 32 k0
+i r 33 k1
+c r 32 7 g0o11
+i w 34 k1 g1o12
+c r 33 9 g2o9
+i r 35 k0
+c r 35 7 g0o11
+i r 36 k1
+p 31 k0 8
+c w 31
+p 34 k1 10
+c w 34
+c r 36 10 g1o12
+i r 37 k0
+i w 38 k1 g1o13
+i r 39 k0
+c r 37 8 g0o13
+c r 39 8 g0o13
+i r 40 k1
+i w 41 k0 g2o14
+p 38 k1 11
+c w 38
+i r 42 k0
+c r 40 11 g1o13
+i r 43 k0
+p 41 k0 9
+c w 41
+i w 44 k0 g2o15
+c r 43 9 g2o14
+c r 42 9 g2o14
+i w 45 k0 g0o17
+i w 46 k1 g1o15
+p 44 k0 10
+c w 44
+p 45 k0 11
+c w 45
+p 46 k1 12
+c w 46
+i w 47 k1 g0o18
+i r 48 k0
+i r 49 k0
+c r 48 11 g0o17
+c r 49 11 g0o17
+i w 50 k0 g1o17
+i w 51 k0 g2o17
+p 47 k1 13
+c w 47
+i r 52 k0
+p 50 k0 12
+c w 50
+p 51 k0 13
+c w 51
+i r 53 k1
+i r 54 k0
+c r 52 13 g2o17
+c r 53 13 g0o18
+c r 54 13 g2o17
+i r 55 k0
+i r 56 k1
+i r 57 k1
+c r 55 13 g2o17
+c r 56 13 g0o18
+c r 57 13 g0o18
+i r 58 k0
+i r 59 k1
+i r 60 k1
+c r 58 13 g2o17
+c r 59 13 g0o18
+c r 60 13 g0o18
+s 38
+i w 1 k1 g0o2
+i r 2 k1
+i w 3 k0 g2o1
+p 1 k1 1
+c w 1
+i r 4 k0
+c r 2 1 g0o2
+i r 5 k1
+c r 4 0 -
+c r 5 1 g0o2
+i w 6 k1 g0o4
+i w 7 k1 g1o3
+p 3 k0 1
+c w 3
+i r 8 k1
+p 6 k1 2
+c w 6
+p 7 k1 3
+c w 7
+c r 8 3 g1o3
+i r 9 k0
+i w 10 k0 g1o4
+i r 11 k1
+c r 9 1 g2o1
+c r 11 3 g1o3
+i r 12 k0
+i r 13 k1
+c r 12 1 g2o1
+c r 13 3 g1o3
+i w 14 k0 g0o7
+i w 15 k0 g2o5
+p 10 k0 2
+c w 10
+i r 16 k0
+p 14 k0 3
+c w 14
+i w 17 k0 g0o8
+p 15 k0 4
+c w 15
+c r 16 4 g2o5
+i w 18 k0 g1o6
+i r 19 k0
+c r 19 4 g2o5
+i r 20 k0
+p 17 k0 5
+c w 17
+p 18 k0 6
+c w 18
+i w 21 k1 g0o9
+i r 22 k0
+c r 20 6 g1o6
+i w 23 k0 g2o8
+c r 22 6 g1o6
+i w 24 k0 g1o8
+p 21 k1 4
+c w 21
+i r 25 k1
+p 23 k0 7
+c w 23
+p 24 k0 8
+c w 24
+i w 26 k0 g1o9
+i r 27 k0
+c r 25 4 g0o9
+c r 27 8 g1o8
+i r 28 k0
+i w 29 k0 g2o10
+c r 28 8 g1o8
+i w 30 k1 g0o12
+p 26 k0 9
+c w 26
+i w 31 k1 g1o10
+p 29 k0 10
+c w 29
+i w 32 k1 g2o11
+p 30 k1 5
+c w 30
+p 31 k1 6
+c w 31
+i w 33 k1 g0o13
+i r 34 k0
+p 32 k1 7
+c w 32
+i w 35 k0 g2o12
+p 33 k1 8
+c w 33
+i w 36 k0 g0o14
+p 35 k0 11
+c w 35
+c r 34 11 g2o12
+i w 37 k1 g1o12
+i w 38 k1 g2o13
+p 36 k0 12
+c w 36
+p 37 k1 9
+c w 37
+i r 39 k0
+i r 40 k0
+p 38 k1 10
+c w 38
+c r 39 12 g0o14
+c r 40 12 g0o14
+i r 41 k1
+i w 42 k1 g1o14
+i w 43 k0 g2o14
+p 42 k1 11
+c w 42
+p 43 k0 13
+c w 43
+c r 41 11 g1o14
+i w 44 k1 g0o17
+i r 45 k1
+i w 46 k0 g2o15
+c r 45 11 g1o14
+i w 47 k1 g1o16
+p 44 k1 12
+c w 44
+i w 48 k1 g0o18
+p 46 k0 14
+c w 46
+i w 49 k0 g2o16
+p 47 k1 13
+c w 47
+i w 50 k0 g1o17
+p 48 k1 14
+c w 48
+i w 51 k0 g0o19
+p 49 k0 15
+c w 49
+i w 52 k0 g2o17
+p 50 k0 16
+c w 50
+i r 53 k0
+p 51 k0 17
+c w 51
+i r 54 k0
+p 52 k0 18
+c w 52
+i r 55 k1
+c r 53 18 g2o17
+i w 56 k1 g1o19
+c r 54 18 g2o17
+i r 57 k0
+c r 57 18 g2o17
+c r 55 14 g0o18
+i r 58 k0
+c r 58 18 g2o17
+i w 59 k1 g2o20
+p 56 k1 15
+c w 56
+i w 60 k0 g1o20
+p 59 k1 16
+c w 59
+p 60 k0 19
+c w 60
+s 39
+i r 1 k1
+i r 2 k0
+i w 3 k1 g2o1
+p 3 k1 1
+c w 3
+i w 4 k1 g2o2
+c r 1 1 g2o1
+c r 2 0 -
+i w 5 k1 g0o3
+i r 6 k1
+c r 6 1 g2o1
+i r 7 k0
+p 4 k1 2
+c w 4
+p 5 k1 3
+c w 5
+i w 8 k0 g0o4
+i w 9 k0 g2o3
+p 8 k0 1
+c w 8
+i r 10 k1
+p 9 k0 2
+c w 9
+i r 11 k1
+c r 10 3 g0o3
+i r 12 k0
+c r 12 2 g2o3
+c r 11 3 g0o3
+i r 13 k1
+i w 14 k0 g2o5
+c r 13 3 g0o3
+i w 15 k1 g0o8
+p 14 k0 3
+c w 14
+i w 16 k0 g2o6
+p 15 k1 4
+c w 15
+i r 17 k1
+c r 17 4 g0o8
+i r 18 k1
+p 16 k0 4
+c w 16
+c r 18 4 g0o8
+i r 19 k1
+i w 20 k0 g2o7
+c r 19 4 g0o8
+i r 21 k1
+c r 21 4 g0o8
+c r 7 4 g2o6
+i r 22 k1
+i w 23 k1 g1o4
+p 20 k0 5
+c w 20
+c r 22 4 g0o8
+i w 24 k1 g0o14
+i w 25 k1 g2o8
+p 23 k1 5
+c w 23
+i w 26 k1 g1o5
+p 24 k1 6
+c w 24
+i w 27 k1 g0o15
+p 25 k1 7
+c w 25
+i r 28 k0
+p 26 k1 8
+c w 26
+i r 29 k0
+p 27 k1 9
+c w 27
+c r 28 5 g2o7
+i w 30 k1 g0o16
+i w 31 k0 g2o10
+c r 29 5 g2o7
+i w 32 k1 g1o7
+p 30 k1 10
+c w 30
+p 31 k0 6
+c w 31
+i w 33 k1 g0o17
+i w 34 k0 g2o11
+p 32 k1 11
+c w 32
+p 33 k1 12
+c w 33
+p 34 k0 7
+c w 34
+i r 35 k1
+i w 36 k0 g1o8
+i r 37 k1
+p 36 k0 8
+c w 36
+i r 38 k0
+c r 35 12 g0o17
+c r 37 12 g0o17
+i r 39 k0
+i w 40 k1 g2o13
+c r 38 8 g1o8
+i r 41 k0
+p 40 k1 13
+c w 40
+c r 39 8 g1o8
+i w 42 k0 g0o20
+i r 43 k1
+c r 41 8 g1o8
+c r 43 13 g2o13
+i r 44 k0
+i r 45 k1
+p 42 k0 9
+c w 42
+i w 46 k1 g0o21
+p 46 k1 14
+c w 46
+c r 44 9 g0o20
+c r 45 14 g0o21
+i r 47 k1
+i w 48 k0 g2o16
+p 48 k0 10
+c w 48
+c r 47 14 g0o21
+i w 49 k1 g1o13
+i r 50 k0
+p 49 k1 15
+c w 49
+i r 51 k1
+c r 51 15 g1o13
+c r 50 10 g2o16
+i w 52 k0 g1o15
+i w 53 k1 g2o18
+p 52 k0 11
+c w 52
+i r 54 k1
+p 53 k1 16
+c w 53
+i w 55 k1 g2o19
+p 55 k1 17
+c w 55
+i w 56 k1 g2o20
+c r 54 17 g2o19
+i r 57 k1
+c r 57 17 g2o19
+i w 58 k1 g1o18
+p 56 k1 18
+c w 56
+p 58 k1 19
+c w 58
+i r 59 k1
+c r 59 19 g1o18
+i r 60 k0
+c r 60 11 g1o15
+s 40
+i r 1 k0
+i r 2 k1
+i r 3 k0
+c r 1 0 -
+c r 2 0 -
+c r 3 0 -
+i r 4 k0
+i w 5 k0 g1o2
+i w 6 k1 g2o2
+p 5 k0 1
+c w 5
+i w 7 k1 g1o3
+p 6 k1 1
+c w 6
+i w 8 k0 g2o3
+c r 4 1 g1o2
+i r 9 k0
+p 7 k1 2
+c w 7
+i r 10 k0
+c r 9 1 g1o2
+i w 11 k1 g0o5
+p 8 k0 2
+c w 8
+i r 12 k0
+p 11 k1 3
+c w 11
+i r 13 k0
+c r 13 2 g2o3
+c r 10 2 g2o3
+c r 12 2 g2o3
+i r 14 k1
+i w 15 k1 g1o5
+i r 16 k0
+c r 14 3 g0o5
+c r 16 2 g2o3
+i w 17 k1 g0o8
+i w 18 k1 g2o6
+p 15 k1 4
+c w 15
+i w 19 k0 g1o6
+p 17 k1 5
+c w 17
+i w 20 k1 g0o9
+p 18 k1 6
+c w 18
+i w 21 k1 g2o7
+p 19 k0 3
+c w 19
+i r 22 k1
+p 20 k1 7
+c w 20
+i r 23 k0
+c r 22 7 g0o9
+i w 24 k0 g1o8
+p 21 k1 8
+c w 21
+i r 25 k1
+p 24 k0 4
+c w 24
+c r 23 4 g1o8
+i w 26 k0 g0o11
+i w 27 k0 g1o9
+c r 25 8 g2o7
+i w 28 k1 g2o9
+p 26 k0 5
+c w 26
+i w 29 k1 g0o12
+p 27 k0 6
+c w 27
+i w 30 k0 g1o10
+p 28 k1 9
+c w 28
+i r 31 k1
+p 29 k1 10
+c w 29
+i w 32 k0 g0o13
+p 30 k0 7
+c w 30
+i r 33 k1
+c r 31 10 g0o12
+i w 34 k0 g2o11
+p 32 k0 8
+c w 32
+i r 35 k0
+c r 33 10 g0o12
+i r 36 k1
+c r 35 8 g0o13
+c r 36 10 g0o12
+i w 37 k1 g0o15
+i w 38 k1 g1o13
+p 34 k0 9
+c w 34
+i r 39 k1
+p 37 k1 11
+c w 37
+p 38 k1 12
+c w 38
+i r 40 k1
+i r 41 k0
+c r 40 12 g1o13
+c r 41 9 g2o11
+c r 39 12 g1o13
+i r 42 k1
+i r 43 k1
+i w 44 k1 g2o13
+c r 42 12 g1o13
+c r 43 12 g1o13
+i r 45 k0
+i w 46 k1 g1o16
+p 44 k1 13
+c w 44
+i w 47 k0 g2o14
+c r 45 9 g2o11
+i r 48 k0
+p 46 k1 14
+c w 46
+i w 49 k0 g1o17
+p 47 k0 10
+c w 47
+c r 48 10 g2o14
+i w 50 k1 g0o20
+i w 51 k0 g2o15
+p 49 k0 11
+c w 49
+i r 52 k1
+p 50 k1 15
+c w 50
+i r 53 k0
+c r 53 11 g1o17
+c r 52 15 g0o20
+i w 54 k0 g1o19
+p 51 k0 12
+c w 51
+i w 55 k1 g2o16
+p 54 k0 13
+c w 54
+p 55 k1 16
+c w 55
+i w 56 k1 g1o20
+i w 57 k0 g2o17
+p 56 k1 17
+c w 56
+p 57 k0 14
+c w 57
+i w 58 k0 g2o18
+p 58 k0 15
+c w 58
+i r 59 k0
+c r 59 15 g2o18
+i r 60 k0
+c r 60 15 g2o18
+s 41
+i w 1 k1 g0o2
+i w 2 k0 g1o1
+i r 3 k1
+p 1 k1 1
+c w 1
+i r 4 k1
+p 2 k0 1
+c w 2
+i r 5 k1
+c r 4 1 g0o2
+c r 3 1 g0o2
+i r 6 k0
+i w 7 k0 g2o2
+c r 5 1 g0o2
+i w 8 k1 g1o3
+c r 6 1 g1o1
+i w 9 k1 g0o5
+p 7 k0 2
+c w 7
+p 8 k1 2
+c w 8
+i r 10 k1
+i r 11 k0
+c r 10 2 g1o3
+i w 12 k1 g1o5
+p 9 k1 3
+c w 9
+i r 13 k0
+c r 13 2 g2o2
+c r 11 2 g2o2
+i r 14 k0
+i r 15 k1
+c r 14 2 g2o2
+c r 15 3 g0o5
+i w 16 k1 g0o8
+i r 17 k0
+p 12 k1 4
+c w 12
+c r 17 2 g2o2
+i w 18 k1 g1o6
+i w 19 k1 g2o6
+p 16 k1 5
+c w 16
+i r 20 k0
+c r 20 2 g2o2
+i r 21 k0
+p 18 k1 6
+c w 18
+i r 22 k1
+p 19 k1 7
+c w 19
+c r 21 2 g2o2
+c r 22 7 g2o6
+i r 23 k0
+i w 24 k1 g1o8
+i r 25 k0
+c r 23 2 g2o2
+i w 26 k1 g0o12
+p 24 k1 8
+c w 24
+i w 27 k1 g1o9
+p 26 k1 9
+c w 26
+c r 25 2 g2o2
+i r 28 k1
+i r 29 k0
+c r 28 9 g0o12
+c r 29 2 g2o2
+i w 30 k0 g0o14
+i w 31 k0 g2o9
+p 27 k1 10
+c w 27
+i r 32 k0
+p 30 k0 3
+c w 30
+p 31 k0 4
+c w 31
+c r 32 4 g2o9
+i w 33 k1 g0o15
+i r 34 k1
+i r 35 k1
+c r 34 10 g1o9
+c r 35 10 g1o9
+i w 36 k0 g1o12
+i w 37 k0 g2o11
+p 33 k1 11
+c w 33
+i w 38 k0 g0o16
+p 36 k0 5
+c w 36
+p 37 k0 6
+c w 37
+i r 39 k0
+i w 40 k0 g2o12
+c r 39 6 g2o11
+i w 41 k1 g1o14
+p 38 k0 7
+c w 38
+i r 42 k1
+p 40 k0 8
+c w 40
+p 41 k1 12
+c w 41
+i w 43 k1 g1o15
+i w 44 k0 g2o13
+c r 42 12 g1o14
+i r 45 k0
+c r 45 8 g2o12
+i r 46 k0
+p 43 k1 13
+c w 43
+c r 46 8 g2o12
+i r 47 k1
+i r 48 k0
+p 44 k0 9
+c w 44
+c r 47 13 g1o15
+i r 49 k1
+i w 50 k0 g2o14
+p 50 k0 10
+c w 50
+c r 49 13 g1o15
+c r 48 10 g2o14
+i r 51 k1
+i w 52 k0 g2o15
+p 52 k0 11
+c w 52
+i r 53 k1
+c r 53 13 g1o15
+i w 54 k1 g2o17
+c r 51 13 g1o15
+i w 55 k0 g1o18
+p 54 k1 14
+c w 54
+i r 56 k0
+p 55 k0 12
+c w 55
+i r 57 k0
+c r 56 12 g1o18
+i r 58 k1
+c r 57 12 g1o18
+c r 58 14 g2o17
+i w 59 k1 g1o20
+i w 60 k0 g2o20
+p 59 k1 15
+c w 59
+p 60 k0 13
+c w 60
+s 42
+i w 1 k1 g0o2
+i r 2 k1
+i r 3 k0
+p 1 k1 1
+c w 1
+c r 2 1 g0o2
+c r 3 0 -
+i r 4 k1
+i r 5 k0
+i w 6 k1 g2o2
+c r 4 1 g0o2
+c r 5 0 -
+i w 7 k0 g0o4
+i w 8 k1 g1o3
+p 6 k1 2
+c w 6
+i w 9 k1 g2o3
+p 7 k0 1
+c w 7
+i r 10 k0
+p 8 k1 3
+c w 8
+p 9 k1 4
+c w 9
+i w 11 k1 g1o4
+i r 12 k1
+c r 10 1 g0o4
+c r 12 4 g2o3
+i w 13 k1 g0o6
+i w 14 k0 g2o5
+p 11 k1 5
+c w 11
+i r 15 k1
+p 13 k1 6
+c w 13
+i r 16 k0
+p 14 k0 2
+c w 14
+i w 17 k0 g2o6
+c r 16 2 g2o5
+c r 15 6 g0o6
+i r 18 k0
+i r 19 k1
+c r 18 2 g2o5
+c r 19 6 g0o6
+i w 20 k1 g0o9
+i r 21 k0
+c r 21 2 g2o5
+i r 22 k1
+p 17 k0 3
+c w 17
+p 20 k1 7
+c w 20
+i r 23 k1
+i r 24 k0
+c r 22 7 g0o9
+i w 25 k0 g1o9
+p 25 k0 4
+c w 25
+c r 23 7 g0o9
+c r 24 4 g1o9
+i w 26 k0 g0o11
+i r 27 k0
+i r 28 k0
+c r 27 4 g1o9
+c r 28 4 g1o9
+i r 29 k0
+i r 30 k1
+c r 29 4 g1o9
+c r 30 7 g0o9
+i r 31 k1
+i w 32 k1 g2o10
+p 26 k0 5
+c w 26
+i w 33 k1 g0o12
+c r 31 7 g0o9
+i w 34 k0 g1o13
+p 32 k1 8
+c w 32
+p 33 k1 9
+c w 33
+p 34 k0 6
+c w 34
+i r 35 k0
+i r 36 k0
+i w 37 k0 g2o11
+p 37 k0 7
+c w 37
+c r 35 7 g2o11
+c r 36 7 g2o11
+i r 38 k0
+i r 39 k0
+i w 40 k0 g2o12
+c r 38 7 g2o11
+c r 39 7 g2o11
+i w 41 k0 g0o15
+i w 42 k0 g1o16
+p 40 k0 8
+c w 40
+i w 43 k0 g2o13
+p 41 k0 9
+c w 41
+i r 44 k0
+p 42 k0 10
+c w 42
+i w 45 k1 g1o17
+p 43 k0 11
+c w 43
+c r 44 11 g2o13
+i w 46 k0 g0o17
+i w 47 k1 g2o14
+p 45 k1 10
+c w 45
+i r 48 k1
+p 46 k0 12
+c w 46
+p 47 k1 11
+c w 47
+i r 49 k0
+i r 50 k1
+c r 49 12 g0o17
+c r 48 11 g2o14
+i w 51 k1 g0o19
+i w 52 k1 g1o19
+c r 50 11 g2o14
+i w 53 k1 g2o16
+p 51 k1 12
+c w 51
+p 52 k1 13
+c w 52
+i w 54 k0 g0o20
+i w 55 k0 g1o20
+p 53 k1 14
+c w 53
+p 54 k0 13
+c w 54
+i r 56 k0
+i w 57 k0 g2o17
+p 55 k0 14
+c w 55
+c r 56 14 g1o20
+p 57 k0 15
+c w 57
+i r 58 k1
+c r 58 14 g2o16
+i w 59 k0 g2o19
+p 59 k0 16
+c w 59
+i r 60 k0
+c r 60 16 g2o19
+s 43
+i r 1 k0
+i w 2 k0 g1o1
+i w 3 k1 g2o1
+c r 1 0 -
+i r 4 k0
+p 2 k0 1
+c w 2
+p 3 k1 1
+c w 3
+c r 4 1 g1o1
+i r 5 k0
+i w 6 k0 g1o2
+i r 7 k1
+c r 5 1 g1o1
+i w 8 k0 g0o5
+c r 7 1 g2o1
+i w 9 k0 g2o3
+p 6 k0 2
+c w 6
+i w 10 k1 g1o3
+p 8 k0 3
+c w 8
+i r 11 k0
+p 9 k0 4
+c w 9
+p 10 k1 2
+c w 10
+c r 11 4 g2o3
+i r 12 k1
+i r 13 k1
+i r 14 k1
+c r 12 2 g1o3
+i r 15 k1
+c r 15 2 g1o3
+c r 13 2 g1o3
+c r 14 2 g1o3
+i w 16 k1 g0o9
+i r 17 k1
+i w 18 k0 g2o5
+p 16 k1 3
+c w 16
+c r 17 3 g0o9
+i w 19 k0 g0o10
+i w 20 k0 g1o6
+p 18 k0 5
+c w 18
+i w 21 k0 g2o6
+p 19 k0 6
+c w 19
+i r 22 k1
+p 20 k0 7
+c w 20
+p 21 k0 8
+c w 21
+i r 23 k0
+i r 24 k1
+c r 22 3 g0o9
+c r 23 8 g2o6
+i w 25 k1 g0o12
+i w 26 k0 g1o8
+p 25 k1 4
+c w 25
+p 26 k0 9
+c w 26
+c r 24 4 g0o12
+i r 27 k1
+i w 28 k0 g1o9
+i w 29 k0 g2o8
+p 28 k0 10
+c w 28
+c r 27 4 g0o12
+i w 30 k1 g0o14
+i r 31 k1
+p 29 k0 11
+c w 29
+i w 32 k1 g2o9
+p 30 k1 5
+c w 30
+c r 31 5 g0o14
+i w 33 k1 g0o15
+i w 34 k0 g1o11
+p 32 k1 6
+c w 32
+p 33 k1 7
+c w 33
+i w 35 k0 g0o16
+i r 36 k0
+p 34 k0 12
+c w 34
+p 35 k0 13
+c w 35
+i r 37 k0
+i r 38 k1
+c r 36 13 g0o16
+i w 39 k1 g2o11
+p 39 k1 8
+c w 39
+i w 40 k0 g2o12
+p 40 k0 14
+c w 40
+i w 41 k1 g2o13
+p 41 k1 9
+c w 41
+i r 42 k0
+c r 42 14 g2o12
+i w 43 k1 g2o15
+p 43 k1 10
+c w 43
+i r 44 k0
+c r 44 14 g2o12
+i w 45 k0 g2o17
+p 45 k0 15
+c w 45
+i w 46 k1 g2o18
+p 46 k1 11
+c w 46
+i r 47 k0
+c r 47 15 g2o17
+i w 48 k1 g2o20
+p 48 k1 12
+c w 48
+c r 37 15 g2o17
+c r 38 12 g2o20
+i w 49 k0 g0o18
+i w 50 k0 g1o13
+p 49 k0 16
+c w 49
+p 50 k0 17
+c w 50
+i r 51 k0
+i r 52 k0
+c r 51 17 g1o13
+c r 52 17 g1o13
+i r 53 k1
+i w 54 k1 g1o15
+p 54 k1 13
+c w 54
+i r 55 k0
+c r 53 13 g1o15
+c r 55 17 g1o13
+i r 56 k1
+i w 57 k0 g1o17
+c r 56 13 g1o15
+p 57 k0 18
+c w 57
+i r 58 k1
+c r 58 13 g1o15
+i r 59 k1
+c r 59 13 g1o15
+i r 60 k1
+c r 60 13 g1o15
+s 44
+i w 1 k0 g0o2
+i r 2 k0
+i r 3 k1
+c r 2 0 -
+c r 3 0 -
+i r 4 k1
+i w 5 k0 g2o2
+p 1 k0 1
+c w 1
+i r 6 k1
+p 5 k0 2
+c w 5
+i w 7 k1 g2o3
+c r 6 0 -
+c r 4 0 -
+i w 8 k1 g0o4
+i w 9 k1 g1o3
+p 7 k1 1
+c w 7
+i w 10 k1 g2o4
+p 8 k1 2
+c w 8
+p 9 k1 3
+c w 9
+i w 11 k1 g0o5
+i r 12 k0
+p 10 k1 4
+c w 10
+i r 13 k0
+p 11 k1 5
+c w 11
+c r 12 2 g2o2
+i r 14 k1
+i r 15 k1
+c r 14 5 g0o5
+c r 15 5 g0o5
+c r 13 2 g2o2
+i w 16 k1 g0o7
+i r 17 k0
+i r 18 k0
+c r 17 2 g2o2
+i w 19 k0 g1o7
+c r 18 2 g2o2
+i r 20 k1
+c r 20 5 g0o5
+i r 21 k0
+p 16 k1 6
+c w 16
+c r 21 2 g2o2
+i r 22 k1
+i r 23 k1
+p 19 k0 3
+c w 19
+i r 24 k1
+c r 22 6 g0o7
+c r 23 6 g0o7
+i r 25 k1
+i r 26 k1
+c r 25 6 g0o7
+c r 24 6 g0o7
+c r 26 6 g0o7
+i w 27 k1 g0o10
+i r 28 k0
+i r 29 k0
+c r 28 3 g1o7
+c r 29 3 g1o7
+i w 30 k1 g1o10
+i w 31 k1 g2o12
+p 27 k1 7
+c w 27
+i w 32 k1 g0o11
+p 30 k1 8
+c w 30
+i w 33 k0 g1o11
+p 31 k1 9
+c w 31
+i w 34 k0 g2o13
+p 32 k1 10
+c w 32
+i r 35 k0
+p 33 k0 4
+c w 33
+i r 36 k1
+p 34 k0 5
+c w 34
+i r 37 k1
+c r 35 5 g2o13
+i r 38 k1
+c r 38 10 g0o11
+c r 36 10 g0o11
+c r 37 10 g0o11
+i w 39 k1 g0o14
+i w 40 k0 g1o13
+i w 41 k0 g2o15
+p 39 k1 11
+c w 39
+p 40 k0 6
+c w 40
+p 41 k0 7
+c w 41
+i w 42 k1 g0o15
+i w 43 k1 g1o14
+i w 44 k0 g2o16
+p 42 k1 12
+c w 42
+i r 45 k1
+p 43 k1 13
+c w 43
+p 44 k0 8
+c w 44
+i r 46 k1
+i r 47 k0
+c r 45 13 g1o14
+c r 46 13 g1o14
+c r 47 8 g2o16
+i r 48 k0
+i w 49 k1 g1o16
+i r 50 k1
+c r 48 8 g2o16
+i w 51 k1 g0o18
+c r 50 13 g1o14
+i w 52 k1 g2o19
+p 49 k1 14
+c w 49
+i w 53 k1 g1o17
+p 51 k1 15
+c w 51
+i r 54 k0
+p 52 k1 16
+c w 52
+i w 55 k0 g2o20
+p 53 k1 17
+c w 53
+i w 56 k1 g1o18
+p 55 k0 9
+c w 55
+c r 54 9 g2o20
+i r 57 k1
+c r 57 17 g1o17
+i w 58 k0 g0o21
+p 56 k1 18
+c w 56
+i r 59 k0
+p 58 k0 10
+c w 58
+c r 59 10 g0o21
+i r 60 k1
+c r 60 18 g1o18
+s 45
+i w 1 k1 g0o2
+i r 2 k1
+i r 3 k1
+c r 2 0 -
+c r 3 0 -
+i r 4 k1
+i r 5 k0
+p 1 k1 1
+c w 1
+i r 6 k0
+c r 4 1 g0o2
+c r 5 0 -
+i r 7 k1
+i r 8 k1
+c r 6 0 -
+c r 7 1 g0o2
+c r 8 1 g0o2
+i w 9 k1 g0o4
+i w 10 k1 g1o4
+i r 11 k0
+c r 11 0 -
+i r 12 k1
+c r 12 1 g0o2
+i r 13 k0
+c r 13 0 -
+i r 14 k1
+p 9 k1 2
+c w 9
+c r 14 2 g0o4
+i w 15 k1 g0o5
+i r 16 k1
+p 10 k1 3
+c w 10
+c r 16 3 g1o4
+i w 17 k1 g1o5
+i w 18 k0 g2o9
+p 15 k1 4
+c w 15
+i r 19 k1
+p 17 k1 5
+c w 17
+i w 20 k1 g1o6
+p 18 k0 1
+c w 18
+c r 19 5 g1o5
+i r 21 k1
+i w 22 k1 g2o10
+p 20 k1 6
+c w 20
+i r 23 k1
+c r 21 6 g1o6
+i r 24 k1
+c r 24 6 g1o6
+c r 23 6 g1o6
+i r 25 k1
+i r 26 k0
+c r 25 6 g1o6
+i r 27 k1
+c r 27 6 g1o6
+c r 26 1 g2o9
+i r 28 k1
+i r 29 k1
+p 22 k1 7
+c w 22
+i r 30 k1
+c r 28 7 g2o10
+c r 29 7 g2o10
+i w 31 k1 g0o12
+i r 32 k1
+c r 32 7 g2o10
+c r 30 7 g2o10
+i w 33 k0 g1o11
+i w 34 k0 g2o12
+p 31 k1 8
+c w 31
+i w 35 k0 g0o13
+p 33 k0 2
+c w 33
+p 34 k0 3
+c w 34
+p 35 k0 4
+c w 35
+i r 36 k0
+i w 37 k0 g1o12
+i w 38 k1 g2o13
+c r 36 4 g0o13
+i w 39 k1 g0o15
+p 37 k0 5
+c w 37
+p 38 k1 9
+c w 38
+i w 40 k1 g1o13
+i w 41 k0 g2o14
+p 39 k1 10
+c w 39
+p 40 k1 11
+c w 40
+p 41 k0 6
+c w 41
+i r 42 k0
+i w 43 k1 g1o14
+i w 44 k1 g2o15
+c r 42 6 g2o14
+i w 45 k0 g0o17
+p 43 k1 12
+c w 43
+i r 46 k1
+p 44 k1 13
+c w 44
+i w 47 k0 g2o16
+p 45 k0 7
+c w 45
+p 47 k0 8
+c w 47
+c r 46 13 g2o15
+i w 48 k0 g0o18
+i w 49 k1 g1o16
+i w 50 k0 g2o17
+p 48 k0 9
+c w 48
+i r 51 k0
+p 49 k1 14
+c w 49
+i r 52 k0
+c r 51 9 g0o18
+c r 52 9 g0o18
+i w 53 k0 g0o20
+i w 54 k0 g1o18
+p 50 k0 10
+c w 50
+i r 55 k1
+p 53 k0 11
+c w 53
+p 54 k0 12
+c w 54
+i w 56 k0 g0o21
+i w 57 k0 g1o19
+c r 55 14 g1o16
+i w 58 k1 g2o19
+p 56 k0 13
+c w 56
+p 57 k0 14
+c w 57
+i w 59 k1 g1o20
+p 58 k1 15
+c w 58
+i w 60 k1 g2o20
+p 59 k1 16
+c w 59
+p 60 k1 17
+c w 60
+s 46
+i w 1 k0 g0o2
+i r 2 k0
+i r 3 k0
+c r 2 0 -
+c r 3 0 -
+i r 4 k0
+i w 5 k1 g2o2
+p 1 k0 1
+c w 1
+i r 6 k1
+c r 4 1 g0o2
+i w 7 k0 g1o3
+p 5 k1 1
+c w 5
+c r 6 1 g2o2
+i w 8 k1 g0o4
+i r 9 k1
+p 7 k0 2
+c w 7
+i r 10 k0
+c r 9 1 g2o2
+i r 11 k0
+p 8 k1 2
+c w 8
+c r 10 2 g1o3
+c r 11 2 g1o3
+i w 12 k1 g0o5
+i w 13 k1 g1o5
+i w 14 k1 g2o5
+p 12 k1 3
+c w 12
+i r 15 k1
+p 13 k1 4
+c w 13
+p 14 k1 5
+c w 14
+i w 16 k1 g1o6
+i w 17 k1 g2o6
+p 16 k1 6
+c w 16
+c r 15 6 g1o6
+i w 18 k0 g0o7
+i w 19 k0 g1o7
+p 17 k1 7
+c w 17
+i r 20 k0
+p 18 k0 3
+c w 18
+i w 21 k0 g0o8
+p 19 k0 4
+c w 19
+i w 22 k0 g1o8
+c r 20 4 g1o7
+i r 23 k1
+p 21 k0 5
+c w 21
+c r 23 7 g2o6
+i r 24 k0
+i w 25 k1 g2o9
+p 22 k0 6
+c w 22
+i r 26 k0
+p 25 k1 8
+c w 25
+i r 27 k0
+c r 24 6 g1o8
+c r 26 6 g1o8
+c r 27 6 g1o8
+i r 28 k1
+i w 29 k0 g1o10
+i r 30 k1
+c r 28 8 g2o9
+c r 30 8 g2o9
+i r 31 k1
+i r 32 k0
+c r 31 8 g2o9
+c r 32 6 g1o8
+i w 33 k1 g0o12
+i w 34 k0 g2o13
+p 29 k0 7
+c w 29
+i r 35 k0
+p 33 k1 9
+c w 33
+i w 36 k0 g0o13
+p 34 k0 8
+c w 34
+c r 35 8 g2o13
+i w 37 k0 g1o12
+i w 38 k1 g2o14
+p 36 k0 9
+c w 36
+i r 39 k1
+p 37 k0 10
+c w 37
+p 38 k1 10
+c w 38
+i w 40 k0 g1o13
+i w 41 k0 g2o15
+c r 39 10 g2o14
+i w 42 k1 g0o15
+p 40 k0 11
+c w 40
+i w 43 k0 g1o14
+p 41 k0 12
+c w 41
+i w 44 k1 g2o16
+p 42 k1 11
+c w 42
+i r 45 k0
+p 43 k0 13
+c w 43
+p 44 k1 12
+c w 44
+i w 46 k1 g1o15
+i r 47 k0
+c r 45 13 g1o14
+i r 48 k1
+p 46 k1 13
+c w 46
+c r 48 13 g1o15
+c r 47 13 g1o14
+i r 49 k1
+i w 50 k0 g1o16
+i r 51 k1
+c r 49 13 g1o15
+i r 52 k1
+c r 51 13 g1o15
+i r 53 k0
+c r 52 13 g1o15
+c r 53 13 g1o14
+i w 54 k1 g0o20
+i w 55 k0 g2o20
+p 50 k0 14
+c w 50
+i w 56 k0 g1o17
+p 54 k1 14
+c w 54
+i w 57 k1 g0o21
+p 55 k0 15
+c w 55
+p 56 k0 16
+c w 56
+i r 58 k0
+p 57 k1 15
+c w 57
+c r 58 16 g1o17
+i w 59 k1 g1o19
+p 59 k1 16
+c w 59
+i r 60 k0
+c r 60 16 g1o17
+s 47
+i r 1 k1
+i w 2 k0 g1o1
+i w 3 k0 g2o1
+p 2 k0 1
+c w 2
+p 3 k0 2
+c w 3
+c r 1 0 -
+i w 4 k1 g0o3
+i w 5 k0 g1o2
+i w 6 k0 g2o2
+p 4 k1 1
+c w 4
+p 5 k0 3
+c w 5
+p 6 k0 4
+c w 6
+i r 7 k1
+i w 8 k1 g1o3
+i r 9 k0
+p 8 k1 2
+c w 8
+c r 7 2 g1o3
+c r 9 4 g2o2
+i w 10 k0 g0o5
+i w 11 k0 g1o4
+i r 12 k0
+c r 12 4 g2o2
+i r 13 k0
+c r 13 4 g2o2
+i r 14 k0
+p 10 k0 5
+c w 10
+p 11 k0 6
+c w 11
+c r 14 6 g1o4
+i r 15 k0
+i r 16 k1
+i r 17 k1
+c r 15 6 g1o4
+c r 16 2 g1o3
+c r 17 2 g1o3
+i r 18 k1
+i w 19 k1 g1o6
+i r 20 k0
+c r 18 2 g1o3
+c r 20 6 g1o4
+i r 21 k1
+i r 22 k1
+c r 21 2 g1o3
+c r 22 2 g1o3
+i r 23 k0
+i w 24 k0 g2o10
+p 19 k1 3
+c w 19
+c r 23 6 g1o4
+i w 25 k0 g0o10
+i w 26 k1 g1o7
+p 24 k0 7
+c w 24
+p 25 k0 8
+c w 25
+i r 27 k0
+i r 28 k0
+c r 27 8 g0o10
+c r 28 8 g0o10
+i r 29 k1
+i w 30 k0 g2o12
+c r 29 3 g1o6
+i w 31 k1 g0o13
+p 26 k1 4
+c w 26
+i w 32 k0 g1o8
+p 30 k0 9
+c w 30
+i w 33 k0 g2o13
+p 31 k1 5
+c w 31
+p 32 k0 10
+c w 32
+i r 34 k0
+i r 35 k0
+c r 34 10 g1o8
+i w 36 k1 g0o15
+p 33 k0 11
+c w 33
+i w 37 k1 g2o14
+c r 35 11 g2o13
+i r 38 k0
+c r 38 11 g2o13
+i r 39 k0
+p 36 k1 6
+c w 36
+c r 39 11 g2o13
+i w 40 k0 g0o16
+i w 41 k0 g1o12
+p 37 k1 7
+c w 37
+i w 42 k1 g2o15
+p 40 k0 12
+c w 40
+p 41 k0 13
+c w 41
+p 42 k1 8
+c w 42
+i r 43 k1
+i r 44 k1
+i w 45 k1 g2o16
+p 45 k1 9
+c w 45
+i w 46 k0 g2o17
+c r 43 9 g2o16
+c r 44 9 g2o16
+i w 47 k1 g0o18
+i r 48 k1
+c r 48 9 g2o16
+i w 49 k0 g1o15
+p 46 k0 14
+c w 46
+i r 50 k0
+p 47 k1 10
+c w 47
+i w 51 k1 g0o19
+p 49 k0 15
+c w 49
+i r 52 k0
+c r 50 15 g1o15
+i r 53 k1
+c r 53 10 g0o18
+i w 54 k1 g2o20
+p 51 k1 11
+c w 51
+i r 55 k0
+c r 52 15 g1o15
+i w 56 k0 g1o17
+p 54 k1 12
+c w 54
+p 56 k0 16
+c w 56
+c r 55 16 g1o17
+i r 57 k0
+i w 58 k0 g1o18
+c r 57 16 g1o17
+p 58 k0 17
+c w 58
+i w 59 k1 g1o19
+p 59 k1 13
+c w 59
+i r 60 k1
+c r 60 13 g1o19
+s 48
+i r 1 k0
+i r 2 k0
+i r 3 k0
+c r 1 0 -
+c r 2 0 -
+c r 3 0 -
+i r 4 k1
+i w 5 k1 g1o2
+i w 6 k1 g2o2
+p 5 k1 1
+c w 5
+p 6 k1 2
+c w 6
+c r 4 2 g2o2
+i w 7 k1 g0o4
+i r 8 k0
+i r 9 k1
+c r 8 0 -
+c r 9 2 g2o2
+i w 10 k1 g1o4
+i w 11 k1 g2o4
+p 7 k1 3
+c w 7
+p 10 k1 4
+c w 10
+i w 12 k1 g0o5
+i w 13 k1 g1o5
+p 11 k1 5
+c w 11
+i r 14 k0
+p 12 k1 6
+c w 12
+i r 15 k1
+p 13 k1 7
+c w 13
+i r 16 k1
+c r 14 0 -
+i w 17 k0 g2o6
+c r 15 7 g1o5
+c r 16 7 g1o5
+i w 18 k1 g0o7
+i w 19 k1 g1o7
+p 17 k0 1
+c w 17
+i w 20 k0 g2o7
+p 18 k1 8
+c w 18
+i w 21 k0 g0o8
+p 19 k1 9
+c w 19
+i w 22 k1 g1o8
+p 20 k0 2
+c w 20
+i r 23 k0
+p 21 k0 3
+c w 21
+i w 24 k0 g0o9
+p 22 k1 10
+c w 22
+i w 25 k0 g1o9
+c r 23 3 g0o8
+i w 26 k1 g2o9
+p 24 k0 4
+c w 24
+i r 27 k0
+p 25 k0 5
+c w 25
+i r 28 k1
+p 26 k1 11
+c w 26
+i r 29 k0
+c r 27 5 g1o9
+c r 28 11 g2o9
+c r 29 5 g1o9
+i r 30 k0
+i r 31 k0
+i w 32 k0 g2o11
+c r 30 5 g1o9
+i w 33 k0 g0o12
+c r 31 5 g1o9
+i w 34 k1 g1o12
+p 32 k0 6
+c w 32
+i r 35 k1
+p 33 k0 7
+c w 33
+i r 36 k1
+p 34 k1 12
+c w 34
+i r 37 k1
+c r 36 12 g1o12
+c r 37 12 g1o12
+c r 35 12 g1o12
+i w 38 k0 g0o14
+i w 39 k1 g1o14
+i r 40 k1
+c r 40 12 g1o12
+i r 41 k1
+c r 41 12 g1o12
+i r 42 k1
+p 38 k0 8
+c w 38
+i w 43 k1 g0o15
+c r 42 12 g1o12
+i w 44 k0 g2o16
+p 39 k1 13
+c w 39
+i r 45 k0
+p 43 k1 14
+c w 43
+i r 46 k0
+c r 45 8 g0o14
+i w 47 k1 g1o16
+p 44 k0 9
+c w 44
+i r 48 k0
+c r 46 9 g2o16
+i w 49 k0 g0o17
+p 47 k1 15
+c w 47
+i r 50 k1
+c r 48 9 g2o16
+i w 51 k1 g2o18
+c r 50 15 g1o16
+i w 52 k0 g1o18
+p 49 k0 10
+c w 49
+i w 53 k0 g0o18
+p 51 k1 16
+c w 51
+i r 54 k0
+p 52 k0 11
+c w 52
+i r 55 k1
+p 53 k0 12
+c w 53
+c r 54 12 g0o18
+i r 56 k1
+i r 57 k1
+c r 56 16 g2o18
+c r 55 16 g2o18
+c r 57 16 g2o18
+i r 58 k1
+i r 59 k1
+c r 58 16 g2o18
+c r 59 16 g2o18
+i r 60 k1
+c r 60 16 g2o18

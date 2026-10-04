@@ -43,6 +43,11 @@ jobs:
       # nightly the suite was run on (9 min 20 s on the owner's machine, 2026-10-02).
       - run: rustup toolchain install nightly-2026-09-05 --component miri --profile minimal
       - run: cargo +nightly-2026-09-05 miri test -p hyper-sim --locked
+      # hyper-check's oracles, liveness and witness tests (docs/sim.md §14.8): 8 s on the owner's
+      # machine at load 13-14 (2026-10-04), against hyper-sim's 9 min 20 s, so the timeout's rule
+      # leaves it as it is. Its search, agreement and mantle tests are left out: under Miri one test
+      # of the agreement's ran past 16 min and the mantle histories past 20 min unfinished.
+      - run: cargo +nightly-2026-09-05 miri test -p hyper-check --locked --test oracles --test liveness --test witness
   model:
     # The core's TLA+ model (docs/models/README.md): every configuration that passes, each at
     # exactly the states it states, and every one the checker must refuse. TLC runs here only

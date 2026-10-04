@@ -417,6 +417,24 @@ pub struct RawNode<S> {
     apply_paused: bool,
 }
 
+impl<S> RawNode<S> {
+    /// Plants `mutant` in this member, or takes the one planted out: a defect the tests show the
+    /// oracles catch (`crate::mutant`; the `mutants` feature, which no consumer enables).
+    #[cfg(feature = "mutants")]
+    pub fn plant(&mut self, mutant: Option<crate::Mutant>) {
+        self.raft.mutant = mutant;
+    }
+
+    /// Whether a `Ready` with `messages` leaves at once for the planted defect that sends a vote
+    /// before it is durable ([`crate::Mutant::VoteBeforeDurable`]).
+    fn vote_leaves_early(&self, messages: &[Message]) -> bool {
+        self.raft.planted(crate::Mutant::VoteBeforeDurable)
+            && messages
+                .iter()
+                .any(|message| message.msg_type == MessageType::MsgRequestVoteResponse)
+    }
+}
+
 impl<S: Storage> RawNode<S> {
     /// The member `config` names, opened on what `store` holds.
     pub fn new(config: &Config, store: S) -> Result<Self> {
@@ -965,6 +983,7 @@ impl<S: Storage> RawNode<S> {
         // vote it leads in are durable, which no write out or this one
         // changes.
         ready.after_persisting = self.raft.state() != StateRole::Leader || !self.vote_durable();
+        ready.after_persisting &= !self.vote_leaves_early(ready.light.messages());
         // What leaves with this write is sent once it is durable, when the
         // commit its hard state states is. What leaves at once is a leader's,
         // and holds no answer that states a commit (`state_durable_commit`).

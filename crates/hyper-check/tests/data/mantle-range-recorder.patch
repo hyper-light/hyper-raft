@@ -1,0 +1,131 @@
+--- a/crates/range/tests/sim.rs
++++ b/crates/range/tests/sim.rs
+@@ -528,6 +528,12 @@
+     /// Whether the bucket's gate has opened; the gateways but the first wait for it.
+     gate_open: bool,
+     history: Vec<Seen>,
++    /// RECORD: the history as events in program order, each gateway's current operation, each
++    /// key's publications' indexes.
++    record: Vec<String>,
++    current: Vec<u64>,
++    next_op: u64,
++    published: BTreeMap<String, Vec<u64>>,
+     /// Puts answered, by key: their values.
+     put: HashMap<String, Vec<String>>,
+     /// The identity the next new member takes; none is ever reused.
+@@ -570,6 +576,7 @@
+     damage: Damage,
+     steps: u64,
+     history: Vec<String>,
++    record: Vec<String>,
+ }
+ 
+ impl World {
+@@ -603,6 +610,10 @@
+             gateways,
+             gate_open: false,
+             history: Vec::new(),
++            record: Vec::new(),
++            current: vec![0; GATEWAYS as usize],
++            next_op: 0,
++            published: BTreeMap::new(),
+             put: HashMap::new(),
+             next_id: members + 1,
+             replacing: None,
+@@ -974,7 +985,7 @@
+                 }
+                 Some(_) => {}
+                 None => {
+-                    self.hear(&answers);
++                    self.hear(&answers, index);
+                     self.by_index.insert(index, answers);
+                 }
+             }
+@@ -1024,6 +1035,16 @@
+             let seen = name::current(r.engine(), "b", &key)
+                 .unwrap()
+                 .map(|(_, v)| v.etag);
++            let applied = r.applied();
++            let sequence = self
++                .published
++                .get(&key)
++                .map_or(0, |at| at.iter().filter(|i| **i <= applied).count());
++            self.record.push(format!(
++                "c r {} {sequence} {}",
++                self.current[g],
++                seen.clone().unwrap_or_else(|| "-".into())
++            ));
+             self.history.push(Seen {
+                 key,
+                 op: Operation {
+@@ -1038,7 +1059,7 @@
+     }
+ 
+     /// The gateways read the answers to what they sent.
+-    fn hear(&mut self, answers: &[(u64, u64, Answer)]) {
++    fn hear(&mut self, answers: &[(u64, u64, Answer)], index: u64) {
+         let now = self.step;
+         for (session, serial, answer) in answers {
+             for g in &mut self.gateways {
+@@ -1065,6 +1086,11 @@
+                         } else {
+                             match answer {
+                                 Answer::Name(name::Outcome::Put { .. }) => {
++                                    let op = self.current[g.id as usize];
++                                    let at = self.published.entry(key.clone()).or_default();
++                                    at.push(index);
++                                    self.record.push(format!("p {op} {key} {}", at.len()));
++                                    self.record.push(format!("c w {op}"));
+                                     self.history.push(Seen {
+                                         key: key.clone(),
+                                         op: Operation {
+@@ -1173,6 +1199,9 @@
+                     gw.next_serial += 1;
+                     let value = format!("g{}o{}", gw.id, gw.ops);
+                     entry = Some(write(gw.session, serial, &key, &value));
++                    self.next_op += 1;
++                    self.current[gw.id as usize] = self.next_op;
++                    self.record.push(format!("i w {} {key} {value}", self.next_op));
+                     gw.doing = Doing::Writing {
+                         serial,
+                         key,
+@@ -1181,6 +1210,9 @@
+                         sent: now,
+                     };
+                 } else {
++                    self.next_op += 1;
++                    self.current[gw.id as usize] = self.next_op;
++                    self.record.push(format!("i r {} {key}", self.next_op));
+                     gw.doing = Doing::Reading {
+                         key,
+                         call: now,
+@@ -1441,6 +1473,7 @@
+             .iter()
+             .map(|s| format!("{} {:?}", s.key, s.op))
+             .collect(),
++        record: w.record,
+     }
+ }
+ 
+@@ -2179,3 +2212,21 @@
+ fn a_replacements_joining_member_cut_anywhere_in_it_leaves_a_group_that_elects() {
+     every_replacement_cut(4);
+ }
++
++
++/// RECORD: every default seed's history with its witness, to the file `MANTLE_RECORD` names.
++#[test]
++#[ignore]
++fn record_histories() {
++    let mut out = String::new();
++    for seed in 1..=48u64 {
++        let members = if seed % 2 == 0 { 5 } else { 3 };
++        let ran = run(seed, members);
++        out.push_str(&format!("s {seed}\n"));
++        for line in ran.record {
++            out.push_str(&line);
++            out.push('\n');
++        }
++    }
++    std::fs::write(std::env::var("MANTLE_RECORD").unwrap(), out).unwrap();
++}

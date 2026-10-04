@@ -5923,3 +5923,51 @@ the runs were replayed under b18 and Copa's datagrams stayed ECN-capable to the 
 or 12 times in 30 s, once a sawtooth of the incumbent's at that rate, and each time a datagram of
 the incumbent's stood at the queue's head. A seed in which CoDel marked Copa twice was replayed
 beside them.
+
+## hyper-check's checkers (S-4, 2026-10-04)
+
+What judging a history costs (`docs/sim.md` §14.8, `docs/tails.md` §1a): CPU time, instructions and
+cycles from `proc_pid_rusage(RUSAGE_INFO_V6)` (`hyper_measure::usage`, its times converted from Mach
+absolute units by `mach_timebase_info` and checked against `getrusage` on this machine), allocations
+and the most bytes held at once from the counting allocator (`hyper_measure::cost`), the process's
+highest physical footprint beside. Apple M5 Max (Mac17,6), 18 cores, macOS, rustc 1.98.0, release,
+on `line` (`2e9fd39`, the schedules' rows on `a1210ab`) with S-4; the one-minute load average beside each, from the other sessions'
+builds and campaigns on the machine (none generated for the run).
+
+**Per history, both checkers on one history** (the agreement of `docs/sim.md` §14.4), p50 / p99 /
+max over the seeds by nearest rank (at 96 or fewer seeds the p99 is the most), one test at a time
+(`--test-threads 1`) so the process's counts are the history's:
+
+| Histories | Seeds | Load | Configurations | User µs | System µs | Instructions | Cycles | Allocations | Peak bytes |
+|---|---|---|---|---|---|---|---|---|---|
+| hyper-raft group | 96 | 82.3 | 65 / 188 / 188 | 54.0 / 106.0 / 106.0 | 6.1 / 10.8 / 10.8 | 476k / 1,165k / 1,165k | 257k / 488k / 488k | 222 / 408 / 408 | 29,056 / 64,040 / 64,040 |
+| hyper-raft group | 5,000 | 67.5 | 66 / 176 / 261 | 54.9 / 112.6 / 146.8 | 5.4 / 14.5 / 55.2 | 481k / 1,095k / 1,490k | 258k / 515k / 676k | 224 / 389 / 495 | 29,056 / 61,160 / 105,552 |
+| hyper-raft fast | 96 | 80.7 | 6 / 38 / 38 | 19.0 / 48.1 / 48.1 | 6.8 / 23.8 / 23.8 | 124k / 449k / 449k | 113k / 225k / 225k | 95 / 229 / 229 | 8,392 / 29,672 / 29,672 |
+| hyper-raft fast | 20,000 | 15.8 | 6 / 30 / 102 | 17.0 / 38.7 / 76.3 | 4.9 / 10.4 / 36.0 | 122k / 327k / 711k | 92k / 190k / 366k | 94 / 180 / 312 | 8,392 / 18,496 / 46,816 |
+| hyper-raft pipelined | 48 | 83.4 | 8 / 25 / 25 | 15.2 / 27.2 / 27.2 | 4.9 / 14.5 / 14.5 | 108k / 211k / 211k | 86k / 173k / 173k | 86 / 133 / 133 | 4,985 / 9,336 / 9,336 |
+| group, 25 in 100 lost and repeated | 96 | 83.4 | 41 / 190 / 190 | 39.3 / 94.5 / 94.5 | 6.3 / 10.7 / 10.7 | 323k / 1,095k / 1,095k | 197k / 425k / 425k | 176 / 382 / 382 | 16,632 / 60,664 / 60,664 |
+| group, 50 in 100 | 96 | 83.4 | 19 / 111 / 111 | 26.0 / 84.6 / 84.6 | 6.4 / 11.4 / 11.4 | 191k / 772k / 772k | 136k / 394k / 394k | 126 / 314 / 314 | 10,272 / 40,768 / 40,768 |
+| group, 75 in 100 | 96 | 83.4 | 6 / 29 / 29 | 16.1 / 27.0 / 27.0 | 5.8 / 9.9 / 9.9 | 104k / 223k / 223k | 92k / 148k / 148k | 84 / 135 / 135 | 5,928 / 12,440 / 12,440 |
+| mantle's range simulation | 48 | 47.9 | 58 / 58 / 58 | 44.8 / 75.7 / 75.7 | 0.8 / 49.8 / 49.8 | 667k / 899k / 899k | 201k / 541k / 541k | 671 / 700 / 700 | 19,440 / 22,035 / 22,035 |
+
+The most any history held, 105,552 bytes, is 2.5·10⁻⁵ of the search's 4 GiB ceiling (§7); every
+history is held to the ceiling by `agreed`. The process's highest footprint over a run was 4.5–6.5
+MB, the test binary's own. The 5,000- and 20,000-seed rows were campaigns (each its own process, two
+at once). Commands: `cargo test --release -p hyper-raft --test check -- --skip fast_track_without
+--nocapture --test-threads 1`; the campaigns with `HYPER_RAFT_SEEDS=5000` (group) and `20000`
+(fast) and `--exact` the test; `cargo test --release -p hyper-check --test mantle -- --nocapture
+--test-threads 1`.
+
+**Per configuration, the search alone** (`cargo bench -p hyper-check --bench search -- 3`, load
+48.7, three rounds, the range over them):
+
+| Workload | Units | Wall ns | CPU ns | Instructions | Cycles | Allocations | Bytes held at most |
+|---|---|---|---|---|---|---|---|
+| pass: an honest register history of 20,000 operations by three clients | 23,430 configurations | 103–133 | 103–132 | 1,610–1,658 | 394–569 | 0.014 | 3,284,301 |
+| refuse: six clients, eight writes and reads each, a last read of a value nobody wrote, fingerprints then whole keys | 46,656 configurations (23,328 confirming) | 316–324 | 316–324 | 4,896–4,934 | 1,137–1,259 | 0.141 | 2,768,870 |
+| witness: the honest history's 50,007 events | 50,007 events | 77–80 | 77–80 | 820–835 | 279–287 | 0.082 | 2,632,672 |
+
+A configuration on the honest history costs about 1,600 instructions and one allocation in seventy:
+the memo's table doubling and the order's growth. A refused history costs three times as much a
+configuration, for every configuration is reached and then searched again on whole keys, whose
+`BTreeSet` keys allocate.

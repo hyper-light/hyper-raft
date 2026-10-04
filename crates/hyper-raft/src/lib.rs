@@ -36,6 +36,7 @@ pub mod configuration;
 pub mod error;
 pub mod fast;
 pub mod log;
+pub mod mutant;
 pub mod node;
 pub mod progress;
 pub mod proto;
@@ -50,6 +51,7 @@ pub mod wire;
 pub use catchup::CatchUp;
 pub use configuration::{Change, Changed, Configuration, ConfigurationError};
 pub use error::{Error, Result, StorageError};
+pub use mutant::Mutant;
 pub use node::{Kept, LightReady, RawNode, Ready, SnapshotStatus, ToPersist};
 pub use quorum::{Quorum, Tally};
 pub use raft::{

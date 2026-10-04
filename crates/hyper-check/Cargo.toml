@@ -1,0 +1,25 @@
+[package]
+name = "hyper-check"
+description = "The judges of every simulation here (docs/sim.md §4, step S-4): the oracles held after every step over the whole history, the liveness phase's quiet period and monitors, the witness and search checkers of linearizability, and the non-vacuity floors"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+# std and the world's generator only (docs/sim.md §2: build, not pull).
+[dependencies]
+hyper-sim = { path = "../hyper-sim" }
+
+[dev-dependencies]
+# The search benchmark counts allocations and the bytes held at peak (docs/benchmarks.md, "hyper-check's
+# search checker").
+hyper-measure = { path = "../hyper-measure" }
+
+[[bench]]
+name = "search"
+harness = false
+
+[lints]
+workspace = true

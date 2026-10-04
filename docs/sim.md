@@ -5,8 +5,10 @@
 > records it as built and where it departs from this design), and its lints of §3.9 are in the
 > workspace (§12.6). **S-2 built** (§13): the network, with focal's path tests carried onto it,
 > hyper-transport's test network and hyper-liveness's simulation on it, and hyper-swim's first
-> simulation; its costs against the harnesses it replaced are still to measure. S-3 to S-8 are
-> designed, not built. Sources and
+> simulation; its costs against the harnesses it replaced are still to measure. **S-4 built** (§14):
+> `crates/hyper-check`'s oracles, liveness, floors and the two checkers of linearizability, judging
+> hyper-raft's schedules and mantle's range simulation, the planted mutants caught. S-3 and S-5 to
+> S-8 are designed, not built. Sources and
 > what each establishes are in `docs/research/sim.md`. The plan's starting point was mantle note 32
 > §3.10 and `docs/raft.md` §5; this design keeps their list of pieces and departs from it where §1
 > below shows a piece falls short.
@@ -930,3 +932,252 @@ new pieces' own, 26 tests.
   still to trace: the world's queue and the network's arena push only into reused vectors, so it
   is not their steps.
 
+
+## 14. S-4 as built (2026-10-04)
+
+`crates/hyper-check`: its oracles (`src/oracle/`), liveness (`src/liveness.rs`), the floors
+(`src/coverage.rs`), the two checkers of linearizability (`src/search/`, `src/witness.rs`) and their
+agreement (`src/agree.rs`), with `std` and `hyper-sim` its only dependencies and no `unsafe`. Its
+tests are in `crates/hyper-check/tests`; hyper-raft's schedules are judged by all of it in
+`crates/hyper-raft/tests/check.rs`. What §4.1–§4.4 and §4.6 assign S-4, and what was built:
+
+### 14.1 The oracles (§4.1)
+
+Each is a type fed observations after every step and returning a typed `Violation` that names its
+oracle; each holds a stated bound of what it keeps and refuses past it (`Violation::Full`). Each has
+a test of what it allows and of a planted case it refuses (`tests/oracles.rs`).
+
+| Oracle | Built as | Source of its statement |
+|---|---|---|
+| Election Safety | one leader per term, ever, over every term seen | Raft thesis Fig. 3.2 |
+| Log Matching | each (index, term) the first value seen there, across every member and over time; a term never falls along a log. `Terms::Ignored` where the fast track gives an entry its new leader's term (an entry restamped at an election is the same entry under a later term) | thesis Fig. 3.2; slates' explorer |
+| Leader Completeness | a leader, the first time it is seen leading its term, holds every entry committed in an earlier term at its index, read through a `LogView` | thesis §3.6; TLA+ `LeaderHolds` |
+| State Machine Safety | one entry per index, compared by what it states (`Terms::Ignored` in fast groups) | thesis Fig. 3.2; hyper-raft `chosen` |
+| Fast agreement | a ghost of every vote cast, counted from the moment it is cast. Its round is a term and its quorums the protocol's: a fast quorum of every set of voters the term's leader counted by (the one it was elected under and the one other a change named), none for a term elected under a joint configuration or naming a third set (`docs/raft.md` §3, the second rule). A vote is an acceptor's only where the index is open: above every index committed, and, while the term's leader leads, for the entry that leader holds there if it holds one | Lamport, Fast Paxos §3.3; slates' `votes_cast` |
+| Durability | over a `DurableView` (a member's term, vote, log terms and stated commit as its device holds them): I1 promises, I2 acknowledgements, I3 self-count, I4 apply, I5 restart, R-6 the commit fence, I7 order, I8 starts; every message released held to its sender's device | `docs/durable.md` §3 |
+| Read safety | a read is answered at or above the highest commit any member had heard of when it was asked | thesis §6.4 |
+| Exactly once | each acknowledged write applied once at one index on every member, and on every member of the settled configuration | mantle, focal `DuplicateCommit` |
+| Same history | each index applied reaches one digest on every member | mantle's rows, the E2E digests |
+
+**What the judging changed in the oracles.** Four statements were sharpened on evidence from the
+schedules, each a false alarm traced to its cause, not a looser check:
+- Fast agreement first counted the voters of the configuration in force when a leader was first
+  seen, and every vote. At seed 72 votes from members that were no voters of the term were counted;
+  at seed 17,961 of the fast schedules a member behind its group sent again, in later terms, what
+  it held beside its log at an index committed in term 3, and in configurations of one voter its
+  vote alone made a fast quorum. Neither is an acceptor's vote in the protocol: a leader counts no
+  vote at an index it holds otherwise, and every later leader holds what was committed.
+- Log Matching compared terms in fast groups, where an election restamps what it recovers (seed 500
+  of the fast schedules).
+- Leader Completeness held a leader to every entry committed, including what a later term committed
+  before that leader's own late election was seen (seed 34,639 of the fast schedules). It now holds
+  a leader to what was committed in an earlier term, the term an index was committed in being the
+  term of the member the group's commit first reached it at (the thesis's §3.6 statement).
+- The serving monitor held a read confirmed by a member that a change then removed, which is sent
+  nothing more (seed 2,976): its owner gives such a read up, as it does at a new term or a restart.
+
+### 14.2 Liveness and floors (§4.2, §4.4)
+
+- **Quiet period** (`Quiet`): on ticks, `2·(2·election_tick − 1 + patience) + 1`, twice the longest
+  timeout a member draws with its patience and a round; by suspicion, in the ordered discipline,
+  the detector's detection time, the span the members draw from, the vote rounds and a replication
+  round (`Quiet::ordered`), and in rounds of a tick (`Quiet::in_rounds`). hyper-raft's
+  `Cluster::settles` now takes its period from these, with the members' own settings; the numbers
+  are those it had (`the_quiet_period_comes_from_the_members_settings`).
+- **Progress** watches each member's term, commit, applied and last index, and says stuck once a
+  quiet period passes in which none moved.
+- **Monitor** (P# §2.5): obligations raised hot and met cold; a run that ends hot fails, naming the
+  first open obligation. The judge's serving monitor holds every read a member confirmed until it
+  is served or given up.
+- **Floors** (`Floor`, `hold`): a named counter per path, `Per::Seed` (more than one a seed) or
+  `Per::Campaign` (at least one), each stated with the count and seeds it was measured at; a floor
+  above its own measurement, or on a path no counter declares, fails as surely as one that fell.
+  hyper-raft's judged schedules hold 19 paths each, from the counts of their default seeds
+  (`group_floors`, `fast_floors`, `pipelined_floors`).
+
+### 14.3 The search checker (§4.3)
+
+Built as §4.3 states, with these readings of the papers (`docs/research/sim.md` §5):
+- **The search** is Horn and Kroening's Algorithm 1 over Wing and Gong's list of call and return
+  events (`search/list.rs`: `lift` unlinks a call then its return, `unlift` relinks them in the
+  other order). Candidates are tried in Lowe's just-in-time order: an operation that must go now (a
+  return reached with its call not linearized) first, then those whose call precedes the first
+  return left, operations that return before those that never do. WGL searches orders, not
+  linearization points, so Lemma 6 shrinks nothing it searches; it orders the trying, and gives a
+  configuration's compact form.
+- **The memo** holds a configuration as `⟨linearized set, state⟩`. Its set part is a Zobrist key, the
+  XOR of a 64-bit key drawn per operation from SplitMix64 (constant-time update, Horn and Kroening
+  §5.1), and the state's hash beside it; the two make a 128-bit fingerprint through SipHash-1-3 in
+  two lanes. The table is open addressing at a load of ¾ (Knuth's `½(1 + 1/(1−α)²)`, 8.5 probes for
+  a new key at its fullest), doubled within the budget, the old and new tables counted together
+  while it grows.
+- **A refusal from fingerprints is confirmed on whole keys**: the partition is searched again with
+  a memo of (first return left, the operations linearized ahead of it, the state), exactly; only a
+  confirmed refusal is reported. `a_refusal_from_fingerprints_is_confirmed_on_whole_keys` plants a
+  fingerprint that collides on purpose and sees the confirmation pass the history.
+- **Budget**: the memory ceiling of §7, 4 GiB (slates' `MEMORY_CEILING_BYTES`); a partition that
+  reaches it is `Unknown` with what it spent, never a pass or a refusal.
+- **Counterexample** (Lowe §3): the deepest linearized prefix reached, the operation that could not
+  follow it, the state there and the outputs that would have been legal.
+- **Indeterminate operations** return at +∞ and accept any output; a write that failed for good is
+  no operation (`Outcome::Failed`, Knossos's `:fail`).
+- **Partitions** by key (Herlihy and Wing Theorem 1), each searched alone, the orders put back on
+  the whole history's places.
+- **Lowe's bound holds for the memo's configurations**: a WGL configuration's linearized set is every
+  operation returned before the first return left and some of those pending there, which is Lowe's
+  configuration; `a_registers_configurations_are_within_lowes_bound` holds the searches of 2,000
+  seeded register histories, short and long, to `(N+1)·2^p·(p+1)`, `p` counting lost writes.
+
+**Evidence.** The search is checked against an exhaustive tree search on every history of up to
+three operations over every placement of their intervals (two writes each over 14 placements, ten
+in `0..=3` and four pending, and three reads over ten: `58 + 58² + 58³` = 198,534 histories), and on
+6,000 seeded histories of four to eight operations by one to four clients, honest and not;
+every order it exhibits passes `verify`, an independent statement of Herlihy and Wing's §2.2
+definition (each operation placed once, real-time order by a running maximum of calls, the model
+replayed). mantle's two `linear.rs` cases (`sequential_and_overlapping_histories_that_fit`,
+`histories_that_do_not_fit_are_refused`) pass under their own names in `tests/search.rs`.
+
+### 14.4 The witness checker and the agreement (§4.3)
+
+`witness::check` is focal's checker (`focal-sim/src/history.rs`) over a `Model` rather than its
+ledger: invocations, publications in a contiguous sequence per object, completions. Its errors are
+focal's (`Capacity`, `Identity`, `Prefix`, `DuplicateCommit`, `PrematureSuccess`,
+`ResponseMismatch`, `StaleRead`, `StateMismatch`) and five this design adds: a publication nobody
+asked under complete tracing (`Unasked`), one with no attempt of its key under way
+(`Unattributed`), a refused attempt that took effect (`RefusedButPublished`), a read that changed
+the state (`MutatingRead`) and a failed request that was published (`FailedButPublished`). focal's
+eleven `history.rs` cases pass on it with focal's ledger as the model (`tests/witness.rs`).
+
+`agree` runs both on one stream: the witness's publication order is turned into operations
+(`agree::operations`, which drops failed requests and reads never answered) and given to the
+search; each order either exhibits is verified with `verify`. A disagreement is typed
+(`SearchRefused`, `WitnessRefused`, `Unknown`, `Unverified`, `Search`). `tests/agree.rs` runs a
+simulated service with planted defects: a value nobody wrote and a stale read are refused by both;
+defects in the system's own order (a request published twice, a success answered before its
+publication) are the witness's to find, and the search, which does not trust that order, passes the operations' history.
+
+**Agreement counts.** Every history of every schedule judged here, both checkers passing and each
+order verified:
+
+| Histories | Seeds | Operations |
+|---|---|---|
+| mantle's range simulation (§14.7) | 48 | 2,880 |
+| hyper-raft's group schedules | 96 | 24,532 events |
+| hyper-raft's fast schedules | 96 | 6,615 events |
+| hyper-raft's pipelined schedules | 48 | 2,332 events |
+| hyper-raft's group schedules, lossy and repeating (§14.5) | 3 × 96 | 32,898 events |
+| campaigns: group 5,000 and fast 20,000 seeds | 25,000 | 2,619,966 events |
+
+### 14.5 hyper-raft's schedules, judged
+
+`crates/hyper-raft/tests/check.rs` runs `tests/group.rs`'s, `tests/fast.rs`'s and
+`tests/pipeline.rs`'s schedules with every oracle after every step (an `Observer` on `Cluster`) and
+records a client history of two registers, three clients each (§4.3's bound, mantle's three
+gateways): a write answered committed when applied, failed when another entry took its index or its
+term ended past the commit, unknown when its member restarted or changed term, with a retry
+answered when its index is decided; a read confirmed by a read index and served once its member
+applied through it. The harness's own checks are off (`Settings::judged`) so that the oracles alone
+judge. A mutant's catch is corroborated by the same seed without it keeping every oracle.
+
+**Hostile networks.** The group schedules again with the network losing and repeating 25, 50 and 75
+messages in a hundred, every oracle holding and both checkers agreeing on every history
+(`the_group_schedules_on_hostile_networks_keep_every_oracle_and_their_histories_are_linearizable`):
+17,723, 9,790 and 5,385 events over 96 seeds each. Reordering is the schedules' own (any message in
+flight is delivered next); partitions are their `windows`.
+
+**What the judging found in hyper-raft.** Two defects of the core, each fixed at its cause with a
+directed test that fails without the fix:
+- *A fast-track leader served reads below a commit made before they were asked* (read safety, seed
+  15,761 of the fast schedules). A leader serves reads once it commits in its term (thesis §6.4);
+  in a fast group what a new leader recovers bears its term and sits below its blank entry, and may
+  lie below an index a fast quorum committed earlier. Reads now wait for the blank entry the leader
+  began its term with (`Raft::commit_to_current_term`; `docs/raft.md` §3.3;
+  `a_fast_leaders_reads_wait_for_the_entry_it_began_its_term_with`).
+- *A leader never caught up a member that lost what it kept ahead of a hole* (liveness, seed 1,318 of
+  the group schedules, beyond the 96 the gate runs). R17's leader takes a refused append as kept and
+  sends again only the holes before it; a member that restarted had dropped what it kept, so the
+  hole before it was in no message the window would send, and every new append was refused for as
+  long as the group ran. A window holding what a member kept now waits on the hole before it as on a
+  resend: a beat with no answer for it has the member probed (`docs/raft.md` §3.3;
+  `a_member_that_lost_what_it_kept_ahead_is_probed`). A first fix, probing at the refusal when the
+  message holding the member's first missing index was taken as kept, failed R17's own measure on
+  reordering paths (`on_paths_that_reorder_what_arrives_ahead_is_not_sent_again`: a late refusal
+  probed what was arriving), and was replaced.
+
+### 14.6 The planted mutants (§4.6)
+
+Behind hyper-raft's `mutants` feature, which no consumer enables: `RawNode::plant(Some(Mutant))`.
+Each is caught by an oracle, and the same schedule without it keeps every oracle.
+
+| Mutant (§4.6) | Where it is planted | Caught by | Where | Clean without it |
+|---|---|---|---|---|
+| A commit counted from an older term's replicas | `maybe_commit` takes the entry's term for the leader's | Leader Completeness: the later leader lacks index 2 | the thesis's Figure 3.7, played by three members (`a_commit_counted_from_an_older_term_is_caught`); 2,096 random group seeds never reached it | the same play |
+| A read served before the term's first commit | `read_index` skips the wait | Read safety | seed 0 of the group schedules | the default seeds |
+| A vote sent before it is durable | `RawNode`'s ready lets a vote leave before persisting | Durability I1 | seed 0 of the group schedules on members whose writes lag, depth 2 | the default seeds |
+| The fast track without its first rule (seed 9843's) | the `beside` rule skipped in `fast_commit` | Leader Completeness | seed 47,818, the first of a campaign from 0 (`the_fast_track_without_its_first_rule_is_caught`) | the same seed |
+| The fast track without its second rule (seed 54104's) | the fast quorum counted of the configuration in force alone | Leader Completeness | seed 121,040, the first of a campaign from 0 | the same seed |
+
+Each fast-track mutant's original seed no longer reaches its defect on today's core. The campaigns
+(2026-10-04, release, two at once at load 64–104) ran 30 and 91 minutes. Earlier catches at lower
+seeds (82, 500, 4,846, 15,761, 17,961, 34,639) were each a false alarm of an oracle or the read
+defect of §14.5, found by running the same seed without the mutant; each was traced to its cause
+(§14.1, §14.5) before the campaign was run again.
+
+### 14.7 mantle's range simulation
+
+`tests/data/mantle-range-histories.txt` holds the clients' histories of mantle's range simulation
+(`crates/range/tests/sim.rs` at mantle `21ae613`), every default seed (1 to 48), with mantle's commit
+order as the witness: made by the recorder in `tests/data/mantle-range-recorder.patch`, which adds a
+record of each gateway's call, publication and reply and changes nothing else (mantle's own
+`a_group_under_faults_is_linearizable_and_applies_every_put_once` and
+`a_seed_runs_the_same_every_time` pass on the recorded copy). Each key is a register. Both checkers
+pass all 48 histories (2,880 operations); with a value nobody put planted in each history's first
+read, both refuse all 48 (`tests/mantle.rs`).
+
+### 14.8 Costs, and Miri
+
+Per history checked, both checkers on one history, p50 / p99 / max over the seeds (by nearest rank:
+at 96 or fewer seeds the p99 is the most), run one test at a time so the process's counts are the
+history's, release, Apple M5 Max, 18 cores, the load beside each (`docs/benchmarks.md`, "hyper-check's
+checkers"):
+
+| Histories | Seeds | Load | CPU µs (user + system) | Instructions | Allocations | Peak bytes |
+|---|---|---|---|---|---|---|
+| hyper-raft group | 5,000 | 67.5 | 60 / 127 / 202 | 481k / 1,095k / 1,490k | 224 / 389 / 495 | 29,056 / 61,160 / 105,552 |
+| hyper-raft fast | 20,000 | 15.8 | 22 / 49 / 112 | 122k / 327k / 711k | 94 / 180 / 312 | 8,392 / 18,496 / 46,816 |
+| hyper-raft pipelined | 48 | 83.4 | 20 / 42 / 42 | 108k / 211k / 211k | 86 / 133 / 133 | 4,985 / 9,336 / 9,336 |
+| group, 25 in 100 lost and repeated | 96 | 83.4 | 46 / 105 / 105 | 323k / 1,095k / 1,095k | 176 / 382 / 382 | 16,632 / 60,664 / 60,664 |
+| mantle's range simulation | 48 | 47.9 | 46 / 126 / 126 | 667k / 899k / 899k | 671 / 700 / 700 | 19,440 / 22,035 / 22,035 |
+
+(The CPU column sums each measure's own tails, so it bounds the sum's tail from above; each is
+stated apart in `docs/benchmarks.md`.)
+
+The search's peak memory, by the counting allocator, is held against the ceiling of §7 on every
+history (`agreed` asserts it below 4 GiB): the most any history held was 105,552 bytes.
+
+**Miri.** hyper-check holds no `unsafe` (the workspace denies it, and `scripts/check-contracts.py`
+lists no file of it). Under Miri (`nightly-2026-09-05`, the CI job's) its oracle, liveness and witness
+tests take 3 s, 1 s and 4 s on this machine at load 13–14, and join CI's `miri` job beside
+hyper-sim's 9 min 20 s, within the job's timeout. The search, agreement and mantle tests do not fit
+it: the agreement's first test ran 16 min and the mantle histories 20 min without finishing (load
+13–80). `hyper_measure::usage` reports nothing under Miri, which interprets no foreign call.
+
+### 14.9 The papers read
+
+Fetched 2026-10-04 from the URLs mantle note 06 A6 names; kept outside the repository, their
+SHA-256 here so a later reading can tell it read the same file:
+
+| Paper | SHA-256 |
+|---|---|
+| Herlihy, Wing, TOPLAS 1990 | `79e2ff81a15c55de870492231e81e36c50366389c118a7317b5877f603cfa2a0` |
+| Horn, Kroening, FORTE 2015 (arXiv:1504.00204v1) | `47766e24087f1b69de61c67f53d0245cd4ca0f95c3f5aadd6887f7202a52fad2` |
+| Lowe, CCPE 2017 (author's preprint) | `f7367bd6a8458daebfc68edf0f4f4da25ba651c8ea2a0b1273a694ec9c549bb9` |
+| Wing, Gong, JPDC 1993 (a scan) | `01209cf96366e9eaff39c56b40005555b2178d070b2ba3e4386dea5fafbd9b9d` |
+
+### 14.10 Open in S-4
+
+- **Competition parallel** (§4.3, §11 item 5): not built. On every history judged here the search
+  took at most 205 configurations (mantle's 58); there is nothing yet for a second search to win.
+- **Elle** for transactions stays out of scope (§4.3).
+- **The strategies' worth** against the mutants (§11 item 1) is S-5's: S-4 records the seeds a
+  random campaign from seed 0 needed.

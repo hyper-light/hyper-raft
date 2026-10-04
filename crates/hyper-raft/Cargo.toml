@@ -7,6 +7,11 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+# The planted defects of `src/mutant.rs`, for tests that show the oracles catch them
+# (docs/sim.md §4.6). No consumer enables it.
+mutants = []
+
 [dependencies]
 crc32c.workspace = true
 # The election law's draw (`election_delay`); a crate of this repository with no dependencies.
@@ -14,6 +19,11 @@ hyper-timing = { path = "../hyper-timing" }
 thiserror.workspace = true
 
 [dev-dependencies]
+# The oracles, the liveness rule and the linearizability checkers its schedules are judged by
+# (docs/sim.md §4, `tests/check.rs`), and this crate with its planted defects for the runs that show
+# the oracles catch them (`src/mutant.rs`).
+hyper-check = { path = "../hyper-check" }
+hyper-raft = { path = ".", features = ["mutants"] }
 # The core focal ran on before this one: the differential tests run both on
 # one schedule and compare what they say.
 raft.workspace = true

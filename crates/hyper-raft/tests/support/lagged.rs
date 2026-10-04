@@ -112,6 +112,9 @@ pub struct Lagged {
     /// entry after it.
     held: Vec<Entry>,
     apply_unpersisted: bool,
+    /// Whether hyper-check's oracles judge the member's outputs in place of the checks here
+    /// (`Settings::judged`).
+    judged: bool,
 }
 
 /// R-6: an answer says of its commit only what the disk states, so a
@@ -225,7 +228,7 @@ impl Lagged {
         };
         let id = raw.raft.id();
         let disk = &raw.store().0;
-        for message in ready.messages() {
+        for message in ready.messages().iter().filter(|_| !self.judged) {
             // I1: a leader's own messages leave at once only with its term
             // and vote durable.
             assert_eq!(
@@ -294,8 +297,10 @@ impl Lagged {
         for entry in &committed {
             let durable = holds(&raw.store().0, entry);
             assert!(
-                entry.index <= raft.log().committed()
-                    && (durable || (self.apply_unpersisted && leads && entry.term == raft.term())),
+                self.judged
+                    || entry.index <= raft.log().committed()
+                        && (durable
+                            || (self.apply_unpersisted && leads && entry.term == raft.term())),
                 "member {}: {} given to apply before it was committed and durable",
                 raft.id(),
                 entry.index
@@ -410,7 +415,7 @@ impl Lagged {
                 );
             }
         }
-        for message in &write.messages {
+        for message in write.messages.iter().filter(|_| !self.judged) {
             self.coverage.answers += u64::from(check_message(disk, message, id));
         }
         self.durable.push_back(write);
@@ -465,7 +470,7 @@ impl Lagged {
         if messages.is_empty() && !raw.raft.messages().is_empty() {
             self.coverage.held_back += 1;
         }
-        for message in &messages {
+        for message in messages.iter().filter(|_| !self.judged) {
             if leads {
                 self.coverage.answers += u64::from(check_commit(&raw.store().0, message, id));
                 // A pre-vote's answer names the term asked about, which no
@@ -512,6 +517,7 @@ impl Replica for Lagged {
             coverage: Coverage::default(),
             held: Vec::new(),
             apply_unpersisted: settings.apply_unpersisted,
+            judged: settings.judged,
         }
     }
     fn id(&self) -> u64 {
@@ -579,6 +585,9 @@ impl Replica for Lagged {
     }
     fn deadline(&self) -> Option<u64> {
         self.node.deadline()
+    }
+    fn plant(&mut self, mutant: Option<hyper_raft::Mutant>) {
+        self.node.raw.plant(mutant);
     }
     fn set_timeout(&mut self, ticks: usize) {
         self.node.set_timeout(ticks);

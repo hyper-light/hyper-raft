@@ -3143,6 +3143,77 @@ fn a_lost_append_costs_its_own_resend_and_what_was_kept_is_not_sent_again() {
     }
 }
 
+/// A member that kept appends ahead of a hole and lost them (a restart drops what it kept) refuses
+/// the next append ahead of the same hole: the leader's window still holds what it took as kept,
+/// and sending the holes before the refused append again would send nothing. A beat with no answer
+/// for that hole has the leader probe it, as for a resend a beat leaves unanswered (seed 1,318 of the group schedules in `tests/check.rs`, 2026-10-04: a leader sent new
+/// appends to such a member, each refused, for as long as the group ran).
+#[test]
+fn a_member_that_lost_what_it_kept_ahead_is_probed() {
+    let config_of = |id: u64| Config {
+        max_size_per_msg: 1,
+        max_inflight_msgs: 8,
+        ..config(id)
+    };
+    let (mut leader, mut follower, sent) = ahead_of(config_of, 4);
+    let hole = carried(&sent)[0];
+    // The first is lost, the other three kept and refused; the leader sends the hole again.
+    for append in sent.iter().skip(1) {
+        follower.step(append.clone()).unwrap();
+    }
+    let mut resent = Vec::new();
+    for refusal in drain(&mut follower) {
+        leader.step(refusal).unwrap();
+        resent.extend(
+            drain(&mut leader)
+                .into_iter()
+                .filter(|message| message.to == 2),
+        );
+    }
+    assert_eq!(carried(&resent), vec![hole]);
+    // The member restarts, losing what it kept, and then the hole arrives: it takes the hole
+    // alone, and its answer says so.
+    let mut follower = RawNode::new(&config_of(2), follower.store().clone()).unwrap();
+    for message in resent {
+        follower.step(message).unwrap();
+    }
+    for answer in drain(&mut follower) {
+        leader.step(answer).unwrap();
+    }
+    drain(&mut leader);
+    assert_eq!(leader.raft.tracker().get(2).unwrap().matched, hole);
+    // A new entry's append is refused ahead of the hole after the hole, and the hole is in no
+    // message out. Once a beat of the leader's ticks passes with no answer for it, the next
+    // heartbeat's answer has the member probed from past what it holds, and it takes all it lacks.
+    leader.propose(vec![], vec![9]).unwrap();
+    let mut out: Vec<Message> = drain(&mut leader)
+        .into_iter()
+        .filter(|message| message.to == 2)
+        .collect();
+    let beat = config_of(1).heartbeat_tick;
+    for _ in 0..4 * beat {
+        let mut answers = Vec::new();
+        for message in out.drain(..) {
+            follower.step(message).unwrap();
+            answers.extend(drain(&mut follower));
+        }
+        for answer in answers {
+            leader.step(answer).unwrap();
+        }
+        leader.tick().unwrap();
+        out.extend(
+            drain(&mut leader)
+                .into_iter()
+                .filter(|message| message.to == 2),
+        );
+    }
+    assert_eq!(
+        leader.raft.tracker().get(2).unwrap().matched,
+        hole + 4,
+        "the member holds every entry"
+    );
+}
+
 /// The leader's half: a member that keeps what arrives ahead of a hole refuses each append it
 /// keeps, and its leader sends the hole alone again, once: what it sent ahead is not sent again,
 /// and each append the member kept leaves the window, as a segment the receiver says it holds

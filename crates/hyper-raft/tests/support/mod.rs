@@ -619,6 +619,10 @@ pub struct Settings {
     /// schedule's clock by [`TICK_NS`] and wakes the member, and the
     /// schedule's detectors suspect and trust. `raft-rs` has only ticks.
     pub suspicion: bool,
+    /// Whether hyper-check's oracles judge the schedule in place of the checks the harness makes
+    /// as it goes (`Cluster::report`, `Cluster::check_durable`, `Lagged`'s): a run with a planted
+    /// defect is judged by the oracles alone, so that what catches the defect is theirs.
+    pub judged: bool,
 }
 
 /// A member's clock, in the schedule's nanoseconds, by suspicion: the span a
@@ -684,6 +688,7 @@ impl Settings {
             depth: 1,
             apply_unpersisted: false,
             suspicion: false,
+            judged: false,
         }
     }
     /// The same, electing by suspicion.
@@ -758,6 +763,8 @@ pub trait Replica: Sized {
         None
     }
     fn set_timeout(&mut self, ticks: usize);
+    /// Plants `mutant` in the member (`hyper_raft::Mutant`); raft-rs has none.
+    fn plant(&mut self, _mutant: Option<hyper_raft::Mutant>) {}
     fn drain(&mut self) -> Output;
     /// A persistence step ([`Step`]); true when it did something.
     fn persist(&mut self, _step: Step) -> bool {
@@ -1377,6 +1384,9 @@ impl Replica for New {
     }
     fn deadline(&self) -> Option<u64> {
         self.raw.deadline()
+    }
+    fn plant(&mut self, mutant: Option<hyper_raft::Mutant>) {
+        self.raw.plant(mutant);
     }
     fn set_timeout(&mut self, ticks: usize) {
         self.raw

@@ -488,10 +488,11 @@ impl<S: Storage> Raft<S> {
                     // log is older (module header).
                     let beside = || {
                         decided.binary_search(&member).is_ok()
-                            && self
-                                .log
-                                .term(progress.matched)
-                                .is_ok_and(|term| term == self.term)
+                            && (self.planted(crate::Mutant::FastBesideAnyTerm)
+                                || self
+                                    .log
+                                    .term(progress.matched)
+                                    .is_ok_and(|term| term == self.term))
                     };
                     if progress.matched >= index || beside() {
                         holding.push(member);
@@ -565,6 +566,9 @@ impl<S: Storage> Raft<S> {
                 holding.binary_search(&member).ok().map(|_| true)
             }) == quorum::Tally::Won
         };
+        if self.planted(crate::Mutant::FastAnyConfiguration) {
+            return self.tracker.has_fast_quorum(holding);
+        }
         self.term_known
             && self.tracker.has_fast_quorum(holding)
             && fast(&self.term_voters)

@@ -505,6 +505,9 @@ enum Campaign {
 /// One member: its term and vote, its role, its log and what it knows of
 /// the others.
 pub struct Raft<S> {
+    /// The defect planted in this member, if any (`crate::mutant`).
+    #[cfg(feature = "mutants")]
+    pub(crate) mutant: Option<crate::Mutant>,
     pub(crate) id: NodeId,
     pub(crate) term: u64,
     pub(crate) vote: NodeId,
@@ -600,6 +603,9 @@ pub struct Raft<S> {
     /// The last index when this member last became leader: entries at or
     /// below are no proposals of its own.
     leader_tail: u64,
+    /// The index of the blank entry this member appended on taking its term, after what it
+    /// recovered of the fast track; 0 when it does not lead.
+    term_start: u64,
     random: u64,
     /// What a member keeps that elects by suspicion ([`Elections::Suspicion`]);
     /// none on ticks, where it would be eight bytes and a branch.
@@ -1127,6 +1133,19 @@ fn counts_beyond_bound(message: &Message) -> bool {
             .any(|entry| entry.index == u64::MAX || entry.term == u64::MAX)
 }
 
+impl<S> Raft<S> {
+    /// Whether `mutant` is planted in this member.
+    #[cfg(feature = "mutants")]
+    pub(crate) fn planted(&self, mutant: crate::Mutant) -> bool {
+        self.mutant == Some(mutant)
+    }
+    /// Whether `mutant` is planted in this member: never, without the `mutants` feature.
+    #[cfg(not(feature = "mutants"))]
+    pub(crate) fn planted(&self, _mutant: crate::Mutant) -> bool {
+        false
+    }
+}
+
 impl<S: Storage> Raft<S> {
     /// The member `config` names, opened on what `store` holds.
     pub fn new(config: &Config, store: S) -> Result<Self> {
@@ -1180,6 +1199,8 @@ impl<S: Storage> Raft<S> {
             durable_commit: 0,
             lost: config.lost,
             told_to_campaign: false,
+            #[cfg(feature = "mutants")]
+            mutant: None,
             log,
             tracker,
             read_only: ReadOnly::new(config.limits.pending_reads, config.limits.members),
@@ -1188,6 +1209,7 @@ impl<S: Storage> Raft<S> {
             msgs: Outgoing::default(),
             uncommitted_bytes: 0,
             leader_tail: 0,
+            term_start: 0,
             random: config.seed,
             watch: match config.elections {
                 Elections::Ticks => None,
@@ -1442,12 +1464,14 @@ impl<S: Storage> Raft<S> {
     pub fn has_pending_conf(&self) -> bool {
         self.pending_conf_index > self.log.applied()
     }
-    /// Whether the committed entry is of this member's term: a leader
-    /// serves reads only once it is.
+    /// Whether this leader committed the blank entry it began its term with: it serves reads only
+    /// once it has, as then it knows every entry committed before its term (the thesis's §6.4: a
+    /// leader "commit[s] a blank no-op entry into the log at the start of its term"). An entry of
+    /// its term below that one is not enough: what it recovered of the fast track bears its term
+    /// and may lie below an index a fast quorum committed in an earlier term.
     pub fn commit_to_current_term(&self) -> bool {
-        self.log
-            .term(self.log.committed())
-            .is_ok_and(|term| term == self.term)
+        // Every entry from that one on is of its term: no term need be read from the log.
+        self.term_start != 0 && self.log.committed() >= self.term_start
     }
     /// The priority the owner gave.
     pub fn priority(&self) -> i64 {
@@ -1700,7 +1724,12 @@ impl<S: Storage> Raft<S> {
     /// Commits what the quorum holds, if it is of this term.
     pub fn maybe_commit(&mut self) -> Result<bool> {
         let index = self.tracker.quorum_index();
-        let classic = self.log.maybe_commit(index, self.term)?;
+        let term = if self.planted(crate::Mutant::OlderTermCommit) {
+            self.log.term(index).unwrap_or(self.term)
+        } else {
+            self.term
+        };
+        let classic = self.log.maybe_commit(index, term)?;
         // What the classic quorum committed may open the next index to the
         // fast one.
         let fast = self.fast_commit()?;
@@ -1765,6 +1794,7 @@ impl<S: Storage> Raft<S> {
             self.vote = 0;
         }
         self.leader_id = 0;
+        self.term_start = 0;
         self.reset_randomized_election_timeout();
         self.election_elapsed = 0;
         self.silence = 0;
@@ -2498,6 +2528,7 @@ impl<S: Storage> Raft<S> {
             return Err(Error::Invariant("a leader's first entry was refused"));
         }
         let last = self.log.last_index()?;
+        self.term_start = last;
         self.release_proposals(last)
     }
 
@@ -2946,7 +2977,7 @@ impl<S: Storage> Raft<S> {
         // A leader knows what is committed once it committed in its term: until then the read
         // waits for that commit (the thesis's §6.4 step 1), where it was dropped and its asker
         // left to its deadline.
-        if !self.commit_to_current_term() {
+        if !self.commit_to_current_term() && !self.planted(crate::Mutant::ReadBeforeFirstCommit) {
             if self.reads_held() >= self.config.limits.pending_reads {
                 return Err(Error::Capacity(
                     "reads that wait for the term's first commit",

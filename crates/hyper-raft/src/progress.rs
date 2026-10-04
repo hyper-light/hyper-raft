@@ -188,6 +188,12 @@ impl Inflights {
         self.settle();
         Some(last)
     }
+    /// Whether the window holds a message the member was taken to have kept
+    /// ahead of a hole ([`Inflights::delivered`]): until what it lacks before
+    /// it arrives, the member's answers wait on that hole.
+    pub fn holds_kept(&self) -> bool {
+        self.buffer.iter().any(|(_, held)| *held == 0)
+    }
     /// Whether the message out at `position` arrived and was kept
     /// ([`Inflights::delivered`]).
     pub fn delivered_at(&self, position: usize) -> bool {
@@ -431,7 +437,7 @@ impl Progress {
                 // A hole sent again and answered for nothing in a beat: the
                 // resend may be lost, and the member is probed.
                 if self.state == ProgressState::Replicate
-                    && self.repaired > self.matched
+                    && (self.repaired > self.matched || self.inflights.holds_kept())
                     && self.stalled >= beat
                 {
                     self.become_probe();
@@ -449,10 +455,15 @@ impl Progress {
                     // of it, the member is not being reached by it — what
                     // its owner was not told was lost — and it is asked
                     // where it is.
-                    // So too once a hole sent again went a beat with no
-                    // answer for it.
+                    // So too once a hole sent again, or one before what the
+                    // member kept, went a beat with no answer for it: a
+                    // member that restarted dropped what it kept, and the
+                    // hole before it is in no message out (seed 1,318 of
+                    // hyper-check's group campaign, `docs/sim.md` §14.5).
                     if !news
-                        && (self.inflights.full() || self.repaired > self.matched)
+                        && (self.inflights.full()
+                            || self.repaired > self.matched
+                            || self.inflights.holds_kept())
                         && self.stalled >= beat
                     {
                         self.become_probe();
@@ -474,11 +485,14 @@ impl Progress {
         }
     }
     /// A tick of the leader passed: counted for a member with a probe out,
-    /// a window that is full or a hole sent again, and for no other.
+    /// a window that is full, a hole sent again or one before what it kept,
+    /// and for no other.
     pub fn tick(&mut self) {
         let waits = match self.state {
             ProgressState::Probe => self.paused,
-            ProgressState::Replicate => self.inflights.full() || self.repaired > self.matched,
+            ProgressState::Replicate => {
+                self.inflights.full() || self.repaired > self.matched || self.inflights.holds_kept()
+            }
             ProgressState::Snapshot => false,
         };
         self.stalled = if waits {

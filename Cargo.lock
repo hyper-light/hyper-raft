@@ -660,6 +660,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "hyper-check"
+version = "0.1.0"
+dependencies = [
+ "hyper-measure",
+ "hyper-sim",
+]
+
+[[package]]
 name = "hyper-datagram"
 version = "0.1.0"
 dependencies = [
@@ -777,7 +785,9 @@ name = "hyper-raft"
 version = "0.1.0"
 dependencies = [
  "crc32c",
+ "hyper-check",
  "hyper-measure",
+ "hyper-raft",
  "hyper-timing",
  "raft",
  "raft-proto",

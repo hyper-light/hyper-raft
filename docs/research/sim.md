@@ -268,37 +268,79 @@ partially, completely, or not at all". hyper-block's simulated file models this 
 
 ## 5. Linearizability and histories
 
-**[PR] Herlihy, Wing, "Linearizability", TOPLAS 12(3), 1990.** §2.2: "A history H is linearizable if
-it can be extended (by appending zero or more response events) to some history H′" whose completion
-is equivalent to a legal sequential history respecting real-time order. §3.1, Theorem 1: "H is
-linearizable if and only if, for each object x, H|x is linearizable."
+Re-read for S-4 on 2026-10-04 (the PDFs fetched from the URLs mantle note 06 A6 names, SHA-256 in
+`docs/sim.md` §14.9; Wing and Gong's is a scan, read from page images). What each establishes for
+`hyper-check`:
 
-**[PR, via] Wing, Gong, "Testing and Verifying Concurrent Objects", JPDC 17, 1993**, as mantle note
-06 A6.2 records it (read there from page images): the search over orders preserving real-time order,
-with lift and unlift on a linked list (§4.1); NP-completeness for some types, and "testing many short
-histories rather than testing one long one" (§4.3).
+**[PR] Herlihy, Wing, "Linearizability", TOPLAS 12(3), 1990** (`cs.brown.edu/~mph/HerlihyW90/p463-herlihy.pdf`).
+§2.2: "A history H is linearizable if it can be extended (by appending zero or more response events)
+to some history H′ such that: L1: complete(H′) is equivalent to some legal sequential history S,
+and L2: <H ⊆ <S." "Extending H to H′ captures the notion that some pending invocations may have
+taken effect even though their responses have not yet been returned to the caller. Restricting
+attention to complete(H′) captures the notion that the remaining pending invocations have not yet
+had an effect." This is the definition `history::verify` applies to every order a checker
+exhibits, and the treatment of an operation that never returned (in the order or not). §3.1,
+Theorem 1: "H is linearizable if and only if, for each object x, H|x is linearizable": the
+partitions of `search_partitions` and the witness checker's per-object orders.
 
-**[PR] Lowe, "Testing for linearizability", CCPE 29(4), 2017** (author's preprint).
+**[PR] Wing, Gong, "Testing and Verifying Concurrent Objects", JPDC 17, 1993**
+(`cs.cmu.edu/~wing/publications/WingGong93.pdf`, pp. 170–173 read from page images, no longer
+[via]). §4: "we try every possible sequential order of H's concurrent operations while preserving
+its real-time order relation <H". §4.1: the history "is stored in a doubly linked list of events"
+with a `match` pointer from an invocation to its response and a sentinel at the end (Fig. 3);
+`search` keeps a stack of the operations linearized; `lift` "temporarily removes" an operation's
+events and `unlift` puts them back "if we later backtrack" (Figs. 4–6). §4.2 argues correctness;
+§4.3: "There exists simple data types and histories for which testing linearizability is
+NP-complete", "analyzing many short (100 operations) histories is tractable", and "a better chance
+of finding a nonlinearizable history by testing many short histories rather than testing one long
+one".
 
-- **§3.1.** Memoizing configurations, "the same operations have been linearized and the sequential
-  object is in the same state", needs an immutable specification.
-- **§4, just-in-time linearization.** Linearize as late as possible; a register then has at most
-  `(N+1)·2^p·(p+1)` configurations: "linear in the length of the history; it is exponential in the
-  number of threads". A queue is exponential in the worst case.
-- **§6, competition parallel.** A tree search and a graph search run together and "the first to
-  complete interrupted the other"; they "complement one another well".
-- **§1, §8.** Bugs are "normally ... discovered within 20 seconds, often less than a second". §7.1:
-  per-thread logs merged afterwards, with a call stamped strictly before any return that observes
-  it. §9: wall-clock stamps do not work across machines.
+**[PR] Lowe, "Testing for linearizability", CCPE 29(4), 2017** (author's preprint). Verified:
+- **§3**: the tree search (Figure 1), an operation "minimal in a given history if no return event of
+  another operation is before the call of op"; its debugging extension "prints the maximum
+  linearizable prefix, and the following event, necessarily a return event, and the alternative
+  values that could have been returned at this point" — `search::Counterexample`.
+- **§3.1**: the memo of configurations, "the same operations have been linearized and the sequential
+  object is in the same state", needing an immutable specification object.
+- **§4**: the specification automaton of configurations `(s, calls, rets)`; Lemma 4 (a lin event
+  commutes with a call or a return of another thread) and Lemma 6 ("If a recorded history has a
+  linearization, then it has a just-in-time linearization"); the bound `(N+1)·2^p·(p+1)` for a
+  register, "linear in the length of the history; it is exponential in the number of threads"; a
+  queue exponential in the worst case.
+- **§6**: on a map "the two [graph search] algorithms have similar behaviour ... with the JIT
+  Algorithm performing better on longer runs. We believe that this is because of the just-in-time
+  linearization reducing the number of configurations"; WG graph search is "particularly heavy on
+  memory for long runs, because it records the set of operations linearized in each stored
+  configuration"; competition parallel, tree searches "fast but erratic".
+- **§1, §8**: bugs are "normally ... discovered within 20 seconds, often less than a second".
+  **§7.1**: per-thread logs merged afterwards, with a call stamped strictly before any return that
+  observes it. **§9**: wall-clock stamps do not work across machines.
+
+What follows from these for the design, as inference (`docs/sim.md` §14.3): WGL's search is over
+orders, not over the placement of linearization points, so Lemma 6 shrinks no space WGL searches;
+it gives the order of trying (the operation whose return comes first, before the others) and the
+compact form of a configuration (a position and the operations linearized ahead of it, where WGL
+keeps a bit for every operation). A WGL configuration's linearized set is every operation returned
+before the first return left in the list and some of those pending there, so the memo's
+configurations are Lowe's and his register bound holds for them; a test holds it
+(`a_registers_configurations_are_within_lowes_bound`).
 
 **[PR] Horn, Kroening, "Faster Linearizability Checking via P-Compositionality", FORTE 2015,
-arXiv:1504.00204v1.** §3 Def. 6: a specification is P-compositional when a history is linearizable
-exactly when each part of a partition is; keys of a map are one (Ex. 7). §4 Algorithm 1 (WGL): a
-linked list of entries with lift and unlift, a stack of `(entry, state)`, a bitset of linearized
-operations and a cache of `⟨bitset, state⟩`. §5.1: the bitset's hash is updated in constant time
-because XOR over fixed-size bit vectors "forms an abelian group". §5.2: on Intel TBB's set, WGL
-101 s and 9,792 MiB, partitioned 6 s and 672 MiB; LRU eviction 11 s and 670 MiB with some runs
-then timing out.
+arXiv:1504.00204v1.** Verified: Definition 5 considers complete histories; Definition 6
+(P-compositionality) and Example 7 (a set or map by key); Algorithm 1 (WGL: at a call entry,
+`apply`, and if legal and ⟨linearized′, s′⟩ is new push, set the bit, lift and restart from the
+head; at a return entry with an empty stack, "return false"; else pop, clear, unlift and continue
+from the popped entry's next), Algorithm 2 (LIFT unlinks the call then its match; UNLIFT relinks
+the match then the call), Algorithm 3 and Theorem 1 (partitions checked separately); §5.1, the
+constant-time bitset hash as XOR "forms an abelian group", and LRU eviction as an option; Table 1
+(TBB: WGL 101 s, 9,792 MiB; WGL+P 6 s, 672 MiB; WGL+LRU 11 s, 670 MiB with 14 % and 9 % of the
+LSL and OPTIMIST runs timing out).
+
+**[PR] Knuth, The Art of Computer Programming, Vol. 3, 2nd ed., 1998, §6.4** [via the standard
+statement; the book was not re-read here]: linear probing at load α takes about `½(1 + 1/(1−α))`
+probes for a successful search and `½(1 + 1/(1−α)²)` for an unsuccessful one, which an insertion
+of a new fingerprint is; the memo's load of ¾ (8.5 probes at its fullest, against 32.5 at ⅞) rests
+on it (`docs/sim.md` §14.3).
 
 **[PR, via] Gibbons, Korach, "Testing Shared Memories", SIAM J. Comput. 1997:** NP-completeness in
 general, as Lowe §1, Horn and Kroening §1 and Kingsbury and Alvaro §1 report it; not accessed.

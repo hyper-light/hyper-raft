@@ -337,6 +337,13 @@ checked by its prefix model: acknowledgement out of order within one leader's te
 application in order; commitment out of order lost a committed entry in twelve steps and stays out
 (note 32 R18).
 
+The rule can change on a running member (`RawNode::set_ahead`). An owner whose peers cannot yet read
+a kept refusal runs raft-rs's rule (`Ahead::Refused`), as focal does until its upgrade fence opens
+the encoding that carries `Message::kept`, and then turns R17 on without restarting a group. Either
+change is safe at any point. What was kept is taken in when the hole fills whatever the rule, and
+the rule decides only whether a new append is kept and said so
+(`the_rule_for_what_arrives_ahead_changes_on_a_running_member`).
+
 What is kept is the leader of this term's own log: a leader never rewrites its log within its term,
 so the entry it sent for an index is its entry there whenever it is taken, and the append that fills
 the hole has checked the member's log against the leader's through its end. So this core keeps

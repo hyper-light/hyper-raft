@@ -34,6 +34,17 @@ impl Clock {
         Ok(Self { frequency })
     }
 
+    /// One count in nanoseconds, a second over the frequency rounded up: no two readings are closer
+    /// apart.
+    pub(crate) fn tick_ns(&self) -> u64 {
+        let frequency = u128::from(self.frequency);
+        let tick = NANOS_PER_SECOND
+            .saturating_add(frequency.saturating_sub(1))
+            .checked_div(frequency)
+            .unwrap_or(1);
+        u64::try_from(tick).unwrap_or(u64::MAX)
+    }
+
     /// Now, in nanoseconds.
     pub(crate) fn now_ns(&self) -> u64 {
         let mut counter: i64 = 0;

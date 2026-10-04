@@ -9,8 +9,8 @@ use std::time::Instant;
 use hyper_transport::{Budget, Classes, Directory, Endpoint, Event, Lateness};
 use tokio::time::Sleep;
 
-use crate::Error;
 use crate::socket::{Io, IoStats, Sent, Socket, registered};
+use crate::{Clock, Error};
 
 /// The turns one poll of [`Driver::event`] takes before it yields to the runtime: tokio's
 /// cooperative budget, 128 operations a task a poll (`tokio::task::coop`, `Budget::initial`).
@@ -58,6 +58,9 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Driver<C, B,
         io: Io,
     ) -> Result<Self, Error> {
         let socket = Socket::new(socket, io, false)?;
+        // The fold reads std's `Instant`, which is the clock `Clock` reads: `CLOCK_MONOTONIC`,
+        // `CLOCK_UPTIME_RAW` and `QueryPerformanceCounter` (std's `Instant` documentation).
+        let resolution = Clock::new()?.resolution();
         let sleep = registered(|| {
             Ok(Box::pin(tokio::time::sleep_until(
                 tokio::time::Instant::now(),
@@ -68,7 +71,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Driver<C, B,
             socket,
             sleep,
             armed: None,
-            late: Lateness::new(),
+            late: Lateness::new(resolution),
             epoch: Instant::now(),
         })
     }

@@ -307,6 +307,7 @@ impl Node {
             run,
             max_peers: settings.voters.len(),
             history: Exposure::new(),
+            resolution: stamped.clock().resolution(),
         })
         .map_err(NodeError::Liveness)?;
         Ok(Self {

@@ -63,6 +63,14 @@ impl Clock {
         self.ticks_ns(ticks)
     }
 
+    /// One tick in nanoseconds, `numer / denom` rounded up: no two readings are closer apart.
+    pub(crate) fn tick_ns(&self) -> u64 {
+        self.numer
+            .saturating_add(self.denom.saturating_sub(1))
+            .checked_div(self.denom)
+            .unwrap_or(1)
+    }
+
     /// `ticks` × `numer` / `denom`, in 128 bits so it cannot overflow before the division.
     pub(crate) fn ticks_ns(&self, ticks: u64) -> u64 {
         let ns = u128::from(ticks)

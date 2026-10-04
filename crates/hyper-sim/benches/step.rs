@@ -482,6 +482,7 @@ mod live {
 
     use std::cmp::Reverse;
     use std::collections::{BTreeMap, BinaryHeap};
+    use std::time::Duration;
 
     use hyper_liveness::{Change, Liveness, Output, PeerId, Settings, Write};
     use hyper_sim::{
@@ -551,6 +552,8 @@ mod live {
                     run: 1,
                     max_peers: NODES,
                     history: Exposure::new(),
+                    // The simulation's clocks read whole nanoseconds.
+                    resolution: Duration::from_nanos(1),
                 })
                 .unwrap();
                 for peer in 1..=NODES as u64 {

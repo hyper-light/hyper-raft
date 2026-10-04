@@ -808,7 +808,7 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
     /// (`Liveness::set_election`); none before a quorum's paths and the granularity are measured,
     /// when the core draws no delay and so does not campaign (§3, item 10).
     pub fn measure(&mut self, liveness: &Liveness) -> Result<Option<Span>, ReplicaError> {
-        let Some(granularity) = liveness.granularity().filter(|g| !g.is_zero()) else {
+        let Some(granularity) = liveness.granularity() else {
             return Ok(None);
         };
         let id = self.id();

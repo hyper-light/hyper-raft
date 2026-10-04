@@ -86,7 +86,8 @@ impl Wire {
             buffer: vec![0; 65_536],
             out: Vec::with_capacity(65_536),
             errors: 0,
-            late: Lateness::new(),
+            // std's `Instant` reads whole nanoseconds and states no coarser step.
+            late: Lateness::new(Duration::from_nanos(1)),
             epoch: Instant::now(),
         }
     }

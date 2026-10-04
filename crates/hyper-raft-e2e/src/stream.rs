@@ -145,7 +145,7 @@ impl Output for Asked {
 /// election `T_E` each pair is charged. None before a quorum's paths and the granularity are
 /// measured: the core then draws no delay and does not campaign (§3, item 10).
 pub fn timing(liveness: &Liveness, id: u64, voters: &[u64]) -> Option<(Timing, Span)> {
-    let granularity = liveness.granularity().filter(|g| !g.is_zero())?;
+    let granularity = liveness.granularity()?;
     let paths = voters
         .iter()
         .filter(|voter| **voter != id)

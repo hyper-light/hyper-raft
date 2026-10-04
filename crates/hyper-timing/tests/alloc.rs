@@ -54,7 +54,8 @@ fn a_heartbeat_a_poll_and_a_configuration_allocate_nothing() {
         seq += 1;
     }
     link.configure(&costs, granularity, granularity).unwrap();
-    let mut late = Lateness::new();
+    // The test's stamps are whole nanoseconds.
+    let mut late = Lateness::new(Duration::from_nanos(1));
     let mut flushes = Flushes::new();
     let mut fleet = Exposure::new();
     alloc::begin();

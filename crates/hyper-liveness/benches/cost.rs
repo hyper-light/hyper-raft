@@ -333,10 +333,12 @@ fn swim(nodes: usize) -> Rate {
     let peers = nodes - 1;
     let mut members: Vec<Detector> = (0..nodes as u64)
         .map(|id| {
+            // The simulation's stamps are whole nanoseconds.
             let mut detector = Detector::new(
                 HostId(id),
                 Exposure::new(),
                 NonZeroUsize::new(nodes).unwrap(),
+                Duration::from_nanos(1),
             );
             for peer in 0..nodes as u64 {
                 detector.join(HostId(peer)).unwrap();

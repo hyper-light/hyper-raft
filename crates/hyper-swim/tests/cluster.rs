@@ -125,7 +125,13 @@ fn member_process() {
     let mut plane = Plane::new(me, limits).unwrap();
     // The cluster is the placement: every member knows the others and no more.
     let members = NonZeroUsize::new(NODES as usize).unwrap();
-    let mut detector = Detector::new(HostId(me), Exposure::new(), members);
+    // std's `Instant` reads whole nanoseconds and states no coarser step.
+    let mut detector = Detector::new(
+        HostId(me),
+        Exposure::new(),
+        members,
+        Duration::from_nanos(1),
+    );
     for peer in (1..=NODES).filter(|peer| *peer != me) {
         let role = if me < peer {
             Role::Initiator

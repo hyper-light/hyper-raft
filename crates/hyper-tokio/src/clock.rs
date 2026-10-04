@@ -20,6 +20,8 @@
 //!   stamped when it is read: the portable path. Its cost is the read's delay counted as the
 //!   sender's, in the delays the detector measures and so in its margin.
 
+use std::time::Duration;
+
 use crate::Error;
 
 #[cfg(target_os = "linux")]
@@ -83,6 +85,28 @@ impl Clock {
         #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
         {
             u64::try_from(self.origin.elapsed().as_nanos()).unwrap_or(u64::MAX)
+        }
+    }
+
+    /// The least step the clock's readings take, which bounds how late a wait read exactly on time
+    /// was (`hyper_timing::Lateness`). On macOS a tick of `mach_absolute_time`, `numer / denom`
+    /// nanoseconds (125/3 on Apple silicon), rounded up; on Windows a count of
+    /// `QueryPerformanceCounter`, a second over `QueryPerformanceFrequency`, rounded up. Linux
+    /// states no step for `CLOCK_MONOTONIC`'s readings: `clock_getres(2)` reports its timers'
+    /// resolution, a jiffy where the kernel has no high-resolution timers, and a wait's lateness
+    /// does not stay above that (a deadline just before a tick is late by little). There, and
+    /// elsewhere, where std states none for `Instant`, it is the readings' unit, a nanosecond; a
+    /// counter that steps coarser (an arm64 timer at 24 or 25 MHz, Hyper-V's 100 ns reference
+    /// clock) is then understated, which matters only to an owner whose every wait reads within
+    /// that step of its deadline.
+    pub fn resolution(&self) -> Duration {
+        #[cfg(any(target_os = "macos", windows))]
+        {
+            Duration::from_nanos(self.os.tick_ns())
+        }
+        #[cfg(not(any(target_os = "macos", windows)))]
+        {
+            Duration::from_nanos(1)
         }
     }
 

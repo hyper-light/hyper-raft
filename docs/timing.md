@@ -212,7 +212,18 @@ now gives the base from the detector and the span from the ballot (`docs/benchma
   recorder's are (nothing else wakes it), the waits of an owner woken past its wakes by messages
   before its timer fired counted nothing: hyper-durable-e2e's members, asked for reports every few
   hundred microseconds on Linux's 1 ms ticks, went without `G` and refused every heartbeat as
-  unmeasured, a group that never formed or a stalled member a peer never suspected (§2.9). A stop
+  unmeasured, a group that never formed or a stalled member a peer never suspected (§2.9). `G` is
+  never stated below the resolution `r` of the clock the waits are read on, which the owner states:
+  a wait read exactly on time was late by less than `r`, and a mean below `r` is lateness the clock
+  cannot tell from none. As a plain mean, an owner whose every wait read on time (a simulation, a
+  busy-polling owner, a coarse counter) had `G` of zero, which floors nothing, and its detectors
+  configured nothing and suspected no one: slates' harness, which wakes its detectors when they
+  ask. hyper-tokio's `Clock::resolution` states `r` for the host's monotonic clock: a tick of
+  `mach_absolute_time` on macOS (`mach_timebase_info`, 125/3 ns on Apple silicon), a count of
+  `QueryPerformanceCounter` on Windows (a second over `QueryPerformanceFrequency`), and on Linux,
+  which states no step for its readings (`clock_getres(2)` reports its timers' resolution, a jiffy
+  without high-resolution timers, which a wait's lateness does not stay above), a nanosecond, the
+  readings' unit. A stop
   of the process or a
   frozen host inside a wait does count: the OS ran nothing then, and the queues the waits feed saw
   the delay; one such wait weighs `1/n` of `n`. Measured on
@@ -498,8 +509,12 @@ answer the member has from another member. Lifeguard found that "an episode of s
 processing at a given member is likely to impact multiple of its interactions" (§IV) and counted
 independent suspicions as evidence the local member processes messages in time; an answer from
 another member is that evidence, measured on the member's own round trips. A member whose own
-network has failed suspects everyone and condemns nobody. Gossiped suspicions are hints: only a
-member's own probes condemn. A suspicion re-adopted at a newer incarnation keeps the probes that
+network has failed suspects everyone and condemns nobody. So a member of a two-member view never
+condemns: the one other member is the suspect, there is no third to answer, and a lone survivor
+cannot tell its peer's death from its own network's failure, the case local health exists for; each
+side of a partition of two would otherwise condemn the other. An owner that must act on a death in
+a pair takes the evidence from outside the detector, a quorum or its supervisor's word that the
+process ended. Gossiped suspicions are hints: only a member's own probes condemn. A suspicion re-adopted at a newer incarnation keeps the probes that
 already told the peer and its pending condemnation: they carried a suspicion and went unanswered all
 the same, and resetting them had a crashed member told again from the start. Any answer from a peer,
 even one too late to be measured, is evidence of its life when it arrives. A member with nobody
@@ -573,7 +588,8 @@ probe was lost at once, and all four waited for one another for ever
 to judge with and nobody to probe usefully, and waits on the network.
 
 **The member's own lateness** (Lifeguard's local health) is measured, not multiplied:
-- every wake it asked for and got late is a sample of `G` ([`Lateness`]), which floors `α`;
+- every wake it asked for and got late is a sample of `G` ([`Lateness`]), which floors `α`, never
+  below the resolution of the clock its owner reads (`Detector::new`, §2.4);
 - its delay in reading acknowledgements is in the round trips it measures, so a slow member's own
   `V(D)` and `α` grow with it;
 - a probe is resolved when the member wakes, with every acknowledgement delivered by then, so a
@@ -1063,8 +1079,8 @@ lateness, the stall's delay (§2.2; `PairReport::skipped` counts them).
   running best replaces.
 
 **The API** the core's suspicion-started elections (L-2) and the shell consume (`src/lib.rs`):
-`Liveness::new(Settings { local, run, max_peers, history })`, `run` the node's durable count of
-its starts; `attach`/`detach` a group's peer; `on_durable(write, started, durable)`; `on_heartbeat(from, message,
+`Liveness::new(Settings { local, run, max_peers, history, resolution })`, `run` the node's durable
+count of its starts, `resolution` its clock's (§2.4); `attach`/`detach` a group's peer; `on_durable(write, started, durable)`; `on_heartbeat(from, message,
 arrival_ns, out)`; `on_wait(deadline, woke)`, a wait for `wake()` the owner began before it and that
 ended at or past it, whatever ended it (§2.4: what `G` is made of); `poll(now, out)` and `wake()`, with `Output::{heartbeat, flush, change}`;
 `Change::Suspected(Suspicion { peer, at_ns, noticed_ns, last: { seq, arrival_ns, due_ns, sent_ns },

@@ -32,6 +32,8 @@ use hyper_timing::{Ballot, Exposure, Trust, WINDOW_LIMIT};
 
 const MS: u64 = 1_000_000;
 const US: u64 = 1_000;
+/// The simulated clock's resolution: its readings are whole nanoseconds.
+const RESOLUTION: Duration = Duration::from_nanos(1);
 
 /// The seeds a test runs: its default count of them, or `HYPER_LIVENESS_SEEDS` where a soak sets
 /// it, from the `HYPER_LIVENESS_SEED`-th on where that is set (a seed a failure printed is its low
@@ -325,6 +327,7 @@ impl Sim {
                     run: 1,
                     max_peers: count,
                     history: Exposure::new(),
+                    resolution: RESOLUTION,
                 })
                 .unwrap();
                 for peer in 1..=count as u64 {
@@ -1216,6 +1219,7 @@ fn a_restarted_peer(seed: u64) {
         run: 2,
         max_peers: 3,
         history: Exposure::new(),
+        resolution: RESOLUTION,
     })
     .unwrap();
     liveness.attach(1).unwrap();
@@ -1277,6 +1281,7 @@ fn a_superseded_runs_heartbeat_is_stale_and_its_restart_counts_once() {
         run: 1,
         max_peers: 1,
         history: Exposure::new(),
+        resolution: RESOLUTION,
     })
     .unwrap();
     node.attach(2).unwrap();
@@ -1347,6 +1352,7 @@ fn heartbeats_without_their_proof_are_refused() {
         run: 1,
         max_peers: 1,
         history: Exposure::new(),
+        resolution: RESOLUTION,
     })
     .unwrap();
     node.attach(2).unwrap();
@@ -1670,6 +1676,7 @@ fn a_sender_that_skips_slots_is_late_not_lost() {
         run: 1,
         max_peers: 1,
         history: Exposure::new(),
+        resolution: RESOLUTION,
     })
     .unwrap();
     node.attach(2).unwrap();
@@ -1760,6 +1767,7 @@ fn an_owner_held_in_its_own_write_is_no_lateness_of_its_timer() {
         run: 1,
         max_peers: 1,
         history: Exposure::new(),
+        resolution: RESOLUTION,
     })
     .unwrap();
     node.attach(2).unwrap();
@@ -1822,6 +1830,7 @@ fn a_wait_a_message_ends_past_its_wake_measures_the_wake() {
             run: 1,
             max_peers: 1,
             history: Exposure::new(),
+            resolution: RESOLUTION,
         })
         .unwrap();
         node.attach(2).unwrap();

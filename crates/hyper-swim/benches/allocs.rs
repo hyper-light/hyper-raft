@@ -22,6 +22,7 @@
 )]
 
 use std::num::NonZeroUsize;
+use std::time::Duration;
 
 use hyper_datagram::{LENGTH_BYTES, OVERHEAD_BYTES};
 use hyper_measure::{alloc, faults};
@@ -115,6 +116,8 @@ fn cluster(members: usize) -> Vec<Member> {
                 HostId(id),
                 Exposure::new(),
                 NonZeroUsize::new(members).unwrap(),
+                // The simulation's stamps are whole nanoseconds.
+                Duration::from_nanos(1),
             );
             for peer in 0..members as u64 {
                 detector.join(HostId(peer)).unwrap();

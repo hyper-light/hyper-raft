@@ -590,6 +590,11 @@ pub struct Raft<S> {
     pub(crate) tracker: Tracker,
     pub(crate) read_only: ReadOnly,
     pub(crate) read_states: Vec<ReadState>,
+    /// Reads asked of this leader before it committed an entry of its term, in the order asked:
+    /// who asked, and the read's context. They wait for that commit, as the thesis's §6.4 step 1
+    /// has a leader wait and etcd's `pendingReadIndexMessages` hold them; they count against the
+    /// bound of reads with those that wait for their quorum or to be taken, and die with the term.
+    deferred_reads: Vec<(NodeId, Vec<u8>)>,
     pub(crate) msgs: Outgoing,
     uncommitted_bytes: usize,
     /// The last index when this member last became leader: entries at or
@@ -1179,6 +1184,7 @@ impl<S: Storage> Raft<S> {
             tracker,
             read_only: ReadOnly::new(config.limits.pending_reads, config.limits.members),
             read_states: Vec::new(),
+            deferred_reads: Vec::new(),
             msgs: Outgoing::default(),
             uncommitted_bytes: 0,
             leader_tail: 0,
@@ -1305,6 +1311,10 @@ impl<S: Storage> Raft<S> {
     /// How many reads wait to be taken.
     pub fn ready_read_count(&self) -> usize {
         self.read_states.len()
+    }
+    /// How many reads wait for this leader's first commit of its term.
+    pub fn deferred_read_count(&self) -> usize {
+        self.deferred_reads.len()
     }
     /// Ticks since this member last heard its leader, or last campaigned.
     pub fn election_elapsed(&self) -> usize {
@@ -1702,6 +1712,7 @@ impl<S: Storage> Raft<S> {
         if let Some(progress) = self.tracker.get_mut(self.id) {
             progress.update_committed(committed);
         }
+        self.release_deferred_reads()?;
         Ok(true)
     }
     /// The application applied through `applied`.
@@ -1779,6 +1790,7 @@ impl<S: Storage> Raft<S> {
         self.tracker.reset_votes();
         self.pending_conf_index = 0;
         self.read_only.clear();
+        self.deferred_reads.clear();
         self.pending_request_snapshot = 0;
         // Only a leader applies before its own write is durable.
         self.log.unpersisted_after = u64::MAX;
@@ -2927,17 +2939,55 @@ impl<S: Storage> Raft<S> {
         self.bcast_append()
     }
     fn read_index(&mut self, mut message: Message) -> Result<()> {
-        // A leader knows what is committed once it committed in its term.
-        if !self.commit_to_current_term() {
-            return Ok(());
-        }
         let Some(entry) = message.entries.first_mut() else {
-            return Ok(());
+            return Err(Error::Violation("a read without its context"));
         };
         let context = std::mem::take(&mut entry.data);
+        // A leader knows what is committed once it committed in its term: until then the read
+        // waits for that commit (the thesis's §6.4 step 1), where it was dropped and its asker
+        // left to its deadline.
+        if !self.commit_to_current_term() {
+            if self.reads_held() >= self.config.limits.pending_reads {
+                return Err(Error::Capacity(
+                    "reads that wait for the term's first commit",
+                ));
+            }
+            self.deferred_reads
+                .try_reserve(1)
+                .map_err(|_| Error::Memory)?;
+            self.deferred_reads.push((message.from, context));
+            return Ok(());
+        }
+        self.serve_read(message.from, context)
+    }
+    /// Every read this leader holds: waiting for its term's first commit, for its quorum, or to
+    /// be taken.
+    fn reads_held(&self) -> usize {
+        self.read_only
+            .len()
+            .saturating_add(self.read_states.len())
+            .saturating_add(self.deferred_reads.len())
+    }
+    /// The reads that waited for this leader's first commit of its term, in the order asked, once
+    /// that commit is made.
+    fn release_deferred_reads(&mut self) -> Result<()> {
+        if self.deferred_reads.is_empty() || !self.commit_to_current_term() {
+            return Ok(());
+        }
+        // Taken and put back, so the queue keeps its room for the next term.
+        let mut deferred = std::mem::take(&mut self.deferred_reads);
+        let served = deferred
+            .drain(..)
+            .try_for_each(|(from, context)| self.serve_read(from, context));
+        self.deferred_reads = deferred;
+        served
+    }
+    /// A read asked of a leader that committed in its term: answered at once by a member alone,
+    /// or confirmed by a round.
+    fn serve_read(&mut self, from: NodeId, context: Vec<u8>) -> Result<()> {
         let committed = self.log.committed();
         if self.tracker.is_singleton() {
-            return self.answer_read(message.from, committed, context);
+            return self.answer_read(from, committed, context);
         }
         if self.read_only.len().saturating_add(self.read_states.len())
             >= self.config.limits.pending_reads
@@ -2948,17 +2998,14 @@ impl<S: Storage> Raft<S> {
             // No round is sent for it here. One leaves when the member is
             // next asked what there is to do (`ask_reads`), carrying the
             // last read asked by then.
-            ReadRounds::Shared => self
-                .read_only
-                .add(committed, context, message.from, self.id),
+            ReadRounds::Shared => self.read_only.add(committed, context, from, self.id),
             ReadRounds::Each => {
                 let mut heartbeat = Vec::new();
                 heartbeat
                     .try_reserve_exact(context.len())
                     .map_err(|_| Error::Capacity("reads that wait for their quorum"))?;
                 heartbeat.extend_from_slice(&context);
-                self.read_only
-                    .add(committed, context, message.from, self.id)?;
+                self.read_only.add(committed, context, from, self.id)?;
                 self.bcast_heartbeat_with(Some(&heartbeat))?;
                 self.read_only.asked();
                 Ok(())
@@ -3243,9 +3290,19 @@ impl<S: Storage> Raft<S> {
         }
     }
 
+    /// A read with no leader to ask: refused when asked here, so its owner answers it now; one a
+    /// peer forwarded is dropped, and that peer's owner answers its own.
+    fn drop_read(message: &Message) -> Result<()> {
+        if message.from == 0 {
+            return Err(Error::ReadDropped);
+        }
+        Ok(())
+    }
+
     fn step_candidate(&mut self, kind: MessageType, message: Message) -> Result<()> {
         match kind {
             MessageType::MsgPropose => Err(Error::ProposalDropped),
+            MessageType::MsgReadIndex => Self::drop_read(&message),
             MessageType::MsgAppend => {
                 self.become_follower(message.term, message.from)?;
                 self.handle_append_entries(message)
@@ -3329,9 +3386,15 @@ impl<S: Storage> Raft<S> {
                 self.handle_snapshot(message)?;
                 self.heard_leader()
             }
-            MessageType::MsgTransferLeader | MessageType::MsgReadIndex => {
+            MessageType::MsgTransferLeader => {
                 if self.leader_id == 0 {
                     return Ok(());
+                }
+                self.forward(message)
+            }
+            MessageType::MsgReadIndex => {
+                if self.leader_id == 0 {
+                    return Self::drop_read(&message);
                 }
                 self.forward(message)
             }
@@ -3345,7 +3408,7 @@ impl<S: Storage> Raft<S> {
             }
             MessageType::MsgReadIndexResp => {
                 if message.entries.len() != 1 {
-                    return Ok(());
+                    return Err(Error::Violation("a read's answer without its one context"));
                 }
                 if self.read_states.len() >= self.config.limits.pending_reads {
                     return Err(Error::Capacity("reads that wait to be taken"));

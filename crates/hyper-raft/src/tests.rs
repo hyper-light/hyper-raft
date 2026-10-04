@@ -432,14 +432,19 @@ fn reads_that_wait_have_a_bound() {
         },
         ..config(1)
     });
-    // A leader answers reads once it committed in its term.
+    // A read asked before the leader committed in its term waits for that commit (it was
+    // dropped), and counts against the bound as it waits.
     node.read_index(b"early".to_vec()).unwrap();
+    assert_eq!(node.raft.deferred_read_count(), 1);
     assert_eq!(node.raft.pending_read_count(), 0);
     let mut append = answer(MessageType::MsgAppendResponse, 2, 1, 1);
     append.index = 1;
     node.step(append).unwrap();
+    // Released at the commit, it waits for its quorum.
+    assert_eq!(node.raft.deferred_read_count(), 0);
+    assert_eq!(node.raft.pending_read_count(), 1);
     drain(&mut node);
-    for read in 0..3u8 {
+    for read in 0..2u8 {
         node.read_index(vec![read]).unwrap();
     }
     assert!(matches!(node.read_index(vec![9]), Err(Error::Capacity(_))));
@@ -447,7 +452,7 @@ fn reads_that_wait_have_a_bound() {
     drain(&mut node);
     // One answer confirms every read asked before it.
     let mut heartbeat = answer(MessageType::MsgHeartbeatResponse, 2, 1, 1);
-    heartbeat.context = vec![1];
+    heartbeat.context = vec![0];
     node.step(heartbeat).unwrap();
     assert_eq!(node.raft.pending_read_count(), 1);
     assert_eq!(node.raft.ready_read_count(), 2);
@@ -460,10 +465,149 @@ fn reads_that_wait_have_a_bound() {
             .iter()
             .map(|read| (read.index, read.request_ctx.clone()))
             .collect::<Vec<_>>(),
-        vec![(1, vec![0]), (1, vec![1])]
+        vec![(1, b"early".to_vec()), (1, vec![0])]
     );
     node.advance(ready).unwrap();
     node.read_index(vec![7]).unwrap();
+}
+
+/// A read asked of a leader that has not committed an entry of its term waits for that commit
+/// (the thesis's §6.4 step 1; etcd's `pendingReadIndexMessages`), where it was dropped and its
+/// owner left to its deadline: once the term's first entry commits, the read leaves in a round
+/// and is answered as any other.
+#[test]
+fn a_new_leaders_read_waits_for_its_terms_first_commit() {
+    let mut node = leader();
+    node.read_index(b"early".to_vec()).unwrap();
+    assert_eq!(node.raft.deferred_read_count(), 1);
+    assert_eq!(node.raft.pending_read_count(), 0);
+    assert!(rounds(&drain(&mut node)).is_empty());
+    let mut append = answer(MessageType::MsgAppendResponse, 2, 1, 1);
+    append.index = 1;
+    node.step(append).unwrap();
+    assert_eq!(node.raft.deferred_read_count(), 0);
+    assert_eq!(
+        rounds(&drain(&mut node)),
+        vec![(2, b"early".to_vec()), (3, b"early".to_vec())]
+    );
+    let mut heartbeat = answer(MessageType::MsgHeartbeatResponse, 2, 1, 1);
+    heartbeat.context = b"early".to_vec();
+    node.step(heartbeat).unwrap();
+    assert_eq!(confirmed(&mut node), vec![b"early".to_vec()]);
+}
+
+/// A read a follower forwards to a leader that has not committed in its term waits as a local
+/// one does, and its asker is answered once the term's first entry commits.
+#[test]
+fn a_read_a_follower_forwards_waits_for_the_leaders_first_commit() {
+    let mut node = leader();
+    let mut asked = answer(MessageType::MsgReadIndex, 2, 1, 1);
+    asked.entries = vec![Entry {
+        data: b"forwarded".to_vec(),
+        ..Entry::default()
+    }];
+    node.step(asked).unwrap();
+    assert_eq!(node.raft.deferred_read_count(), 1);
+    let mut append = answer(MessageType::MsgAppendResponse, 2, 1, 1);
+    append.index = 1;
+    node.step(append).unwrap();
+    assert_eq!(
+        rounds(&drain(&mut node)),
+        vec![(2, b"forwarded".to_vec()), (3, b"forwarded".to_vec())]
+    );
+    let mut heartbeat = answer(MessageType::MsgHeartbeatResponse, 3, 1, 1);
+    heartbeat.context = b"forwarded".to_vec();
+    node.step(heartbeat).unwrap();
+    let answers: Vec<(u64, u64, Vec<u8>)> = drain(&mut node)
+        .into_iter()
+        .filter(|message| message.msg_type == MessageType::MsgReadIndexResp)
+        .map(|message| {
+            (
+                message.to,
+                message.index,
+                message
+                    .entries
+                    .first()
+                    .map(|entry| entry.data.clone())
+                    .unwrap_or_default(),
+            )
+        })
+        .collect();
+    assert_eq!(answers, vec![(2, 1, b"forwarded".to_vec())]);
+}
+
+/// Reads that wait for the term's first commit count against the bound of reads, and one past it
+/// is refused.
+#[test]
+fn reads_that_wait_for_the_first_commit_count_against_the_bound() {
+    let mut node = leader_with(Config {
+        limits: Limits {
+            pending_reads: 2,
+            ..limits()
+        },
+        ..config(1)
+    });
+    node.read_index(vec![0]).unwrap();
+    node.read_index(vec![1]).unwrap();
+    assert!(matches!(node.read_index(vec![2]), Err(Error::Capacity(_))));
+    assert_eq!(node.raft.deferred_read_count(), 2);
+}
+
+/// A leader deposed before its term's first commit lets the reads that waited for it go: they
+/// were its term's, and their owner sees the term change.
+#[test]
+fn a_leader_deposed_before_its_first_commit_lets_its_waiting_reads_go() {
+    let mut node = leader();
+    node.read_index(b"early".to_vec()).unwrap();
+    assert_eq!(node.raft.deferred_read_count(), 1);
+    node.step(answer(MessageType::MsgHeartbeat, 2, 1, 2))
+        .unwrap();
+    assert_eq!(node.raft.state(), StateRole::Follower);
+    assert_eq!(node.raft.deferred_read_count(), 0);
+    assert!(rounds(&drain(&mut node)).is_empty());
+}
+
+/// A read asked of a member with no leader to ask is refused, where an `Ok` left its owner to a
+/// deadline: a follower that heard no leader, and a candidate. One a peer forwarded is dropped,
+/// and that peer's owner answers its own.
+#[test]
+fn a_read_with_no_leader_to_ask_is_refused() {
+    let mut node = follower();
+    assert!(matches!(
+        node.read_index(b"nowhere".to_vec()),
+        Err(Error::ReadDropped)
+    ));
+    let mut forwarded = answer(MessageType::MsgReadIndex, 3, 2, 1);
+    forwarded.entries = vec![Entry {
+        data: b"forwarded".to_vec(),
+        ..Entry::default()
+    }];
+    node.step(forwarded).unwrap();
+    assert!(drain(&mut node).is_empty());
+    node.campaign().unwrap();
+    assert_ne!(node.raft.state(), StateRole::Follower);
+    assert!(matches!(
+        node.read_index(b"nowhere".to_vec()),
+        Err(Error::ReadDropped)
+    ));
+}
+
+/// A read, or a read's answer, without its one context contradicts what a read is, and is
+/// refused.
+#[test]
+fn a_read_without_its_context_is_refused() {
+    let mut node = reading_leader();
+    assert!(matches!(
+        node.step(answer(MessageType::MsgReadIndex, 2, 1, 1)),
+        Err(Error::Violation(_))
+    ));
+    assert_eq!(node.raft.pending_read_count(), 0);
+    let mut node = follower();
+    assert!(matches!(
+        node.step(answer(MessageType::MsgReadIndexResp, 1, 2, 1)),
+        Err(Error::Violation(_))
+    ));
+    assert_eq!(node.raft.ready_read_count(), 0);
 }
 
 /// A leader of three that committed in its term: it answers reads.

@@ -708,7 +708,9 @@ impl<S: Storage> RawNode<S> {
         self.tell(message)
     }
     /// Asks at which index a read may be served; the answer comes in a
-    /// `Ready` with the same `context`.
+    /// `Ready` with the same `context`. A leader that has not committed in
+    /// its term holds the read until it has; a member with no leader to ask
+    /// refuses it ([`Error::ReadDropped`]), so the owner answers it at once.
     pub fn read_index(&mut self, context: Vec<u8>) -> Result<()> {
         let mut message = proto::message(0, MessageType::MsgReadIndex);
         message
@@ -719,10 +721,9 @@ impl<S: Storage> RawNode<S> {
             data: context,
             ..Entry::default()
         });
-        match self.operate(|raft| raft.step(message)) {
-            Err(error) if error.is_fatal() || matches!(error, Error::Capacity(_)) => Err(error),
-            _ => Ok(()),
-        }
+        // Every refusal reaches the owner: an `Ok` for a read that went
+        // nowhere left its owner to wait out a deadline.
+        self.operate(|raft| raft.step(message))
     }
 
     /// What there is to apply, and, when `release`, the messages to send:

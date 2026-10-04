@@ -869,15 +869,16 @@ impl Node {
         if !self.leads(asker)? || !self.room(asker, self.reads.len())? {
             return Ok(());
         }
-        // A leader knows what is committed only once it has committed in its own term; until
-        // then the core drops the read (raft.rs `read_index`), so the asker is told to ask again.
-        if !self.raw.raft.commit_to_current_term() {
-            return self.respond(asker.address, asker.id, &Outcome::Busy);
-        }
+        // A leader that has not committed in its term holds the read until it has (raft.rs
+        // `read_index`); a refusal is answered at once.
         let sequence = self.sequence();
-        heard(self.raw.read_index(sequence.to_le_bytes().to_vec()))?;
-        self.reads.insert(sequence, (asker, key.to_vec()));
-        Ok(())
+        match heard(self.raw.read_index(sequence.to_le_bytes().to_vec()))? {
+            Some(()) => {
+                self.reads.insert(sequence, (asker, key.to_vec()));
+                Ok(())
+            }
+            None => self.respond(asker.address, asker.id, &Outcome::Busy),
+        }
     }
 
     fn hear_test(&mut self, body: &[u8], from: SocketAddr, at_ns: u64) -> Result<(), NodeError> {

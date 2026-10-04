@@ -822,9 +822,7 @@ impl Node {
         if !self.admits(asker, self.reads.len())? {
             return Ok(());
         }
-        if !self.replica.core().raft.commit_to_current_term() {
-            return self.respond(asker.address, asker.id, &Outcome::Busy);
-        }
+        // A leader that has not committed in its term holds the read until it has.
         let sequence = self.sequence();
         match heard(self.replica.read(sequence.to_le_bytes().to_vec()))? {
             Some(()) => {

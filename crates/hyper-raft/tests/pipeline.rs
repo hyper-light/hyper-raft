@@ -404,9 +404,13 @@ fn a_crash_at_every_persistence_step_with_faults_at_rest_loses_nothing_acknowled
 }
 
 fn crashes_at_every_persistence_step(faults_at_rest: bool) {
-    // Four: the fewest from seed zero at which every variant below, on ticks
-    // and by suspicion, holds a change behind the fence at some crash.
-    let seeds = count("HYPER_RAFT_CRASH_SEEDS", 4);
+    // Eleven: the fewest from seed zero at which every variant below, on ticks
+    // and by suspicion, holds a change behind the fence at some crash
+    // (measured 2026-10-04). It was four until a read asked of a new leader
+    // waited for its term's first commit: the rounds of the reads held until
+    // then moved the schedules, and the variant on ticks that applies only
+    // what is durable first held a change behind the fence at seed ten.
+    let seeds = count("HYPER_RAFT_CRASH_SEEDS", 11);
     let steps = count("HYPER_RAFT_CRASH_STEPS", 400);
     let corrupt = if faults_at_rest { 10_000 / steps } else { 0 };
     // The second has a leader apply its own entries before its write of them

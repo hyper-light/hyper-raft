@@ -2569,6 +2569,13 @@ minor faults per heartbeat, configurations included.
 At 21:32 the two rings measured 80.1 (78.4–82.7) and 125.5 (124.2–144.0) ns a heartbeat, 2,418 and
 715 ns a configuration, with no allocation, reallocation or fault: the estimator did not change.
 
+**Path samples stamped and aged** (2026-10-04 02:12 PDT, load 4.2 to 4.5, one build job, the
+before and after runs back to back): `PathRtt::on_sample` 16.4 (16.1–16.6) ns before, 17.0
+(16.4–17.3) with each sample stamped with its time and its endpoint's generation and the window's
+oldest checked against its span. The first ring, whose estimator did not change, moved from 45.0
+to 47.0 between the same two runs, so the difference is within what the load moves. Still no
+allocation, reallocation or fault (`tests/alloc.rs`).
+
 A heartbeat is a step on each Allan level it finishes (one on average, seventeen at most), a ring
 write, and the window read from the levels; the larger bound costs more because more levels
 qualify for `n_A`. `crates/hyper-timing/tests/alloc.rs` asserts the zero: 100,000 heartbeats with

@@ -125,7 +125,8 @@ mod hyper {
         let g = GRANULARITY.as_nanos() as u64;
         let paths = paths(
             || PathRtt::new(CORRELATION, heartbeat).unwrap(),
-            |path: &mut PathRtt, rtt| path.on_sample(rtt),
+            // One endpoint's answers, stamped at one instant: none ages past the span.
+            |path: &mut PathRtt, rtt| path.on_sample(rtt, 0, 0),
         );
         let anchors = RoundAnchors {
             heartbeat_ns: HEARTBEAT_NS,
@@ -152,7 +153,7 @@ mod hyper {
             "sample" => {
                 let mut path = PathRtt::new(CORRELATION, heartbeat).unwrap();
                 measure(iterations, |index| {
-                    path.on_sample(black_box(round_trip(index)));
+                    path.on_sample(black_box(round_trip(index)), 0, 0);
                     black_box(&path);
                 })
             }

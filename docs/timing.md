@@ -302,6 +302,19 @@ point is one half: Hampel 1971; Rousseeuw and Croux 1993), so three at `p ≥ T_
 macOS's 50 ms at a 10 ms probe. A path that moved is followed in `k + 1` probes, about one
 correlation time, as fast as any estimate one stall cannot move.
 
+Its samples are fresh and of one endpoint (focal's audit F44: an estimate with no age, kept across
+an endpoint's change under one id, and a sparsely probed path whose window is hours old). Each
+sample carries when it came and the generation of the peer's endpoint it measured. A sample of a
+new generation starts the window again, as QUIC resets its round-trip estimator on a path it has
+validated (RFC 9000 §9.4). A sample older than the window's span at its probe interval,
+`(2k + 1)·p`, about two correlation times, the time the window is derived to cover, is dropped as
+newer ones come or when the owner asks: it measures a path that may have moved further than the
+window can see, cached path state that "could also become invalid over time" (RFC 9040 §8.1). No
+constant enters: the span is the window's own. A path probed more sparsely than its interval holds
+fewer samples, and its readers see how many and the oldest's age. With fewer than `k + 1` held, one
+stall can move its median, so an owner asks a quorum path in that state for fresh probes first. A
+path whose samples have all aged out contributes nothing to the election law, as one never probed.
+
 **Item 6: the correlation time, and the rule it gives.** Theorem 7's `β` is a product over the
 heartbeats inside the margin, each factor a Cantelli bound: it takes them as independent. In the
 traces they are not: a stall delays every heartbeat it covers. The probability that two

@@ -84,8 +84,10 @@ pub trait PathEstimate {
 }
 
 impl PathEstimate for PathRtt {
+    /// The samples the window holds: of the peer's present endpoint and within the window's span.
+    /// A path whose samples have all aged out contributes nothing, as one never sampled.
     fn samples(&self) -> u64 {
-        PathRtt::samples(self)
+        u64::try_from(PathRtt::held(self)).unwrap_or(u64::MAX)
     }
     fn smoothed_ns(&self) -> u64 {
         PathRtt::smoothed_ns(self)
@@ -881,15 +883,19 @@ mod tests {
             "three late in a stall, seven to outvote them"
         );
         let mut smoothed = ExchangeRtt::new();
+        // A probe every 50 ms, each answer stamped when it came, of one endpoint.
+        let mut at = 0;
         for _ in 0..median.window() {
-            median.on_sample(5 * MS);
+            median.on_sample(5 * MS, at, 0);
             smoothed.on_sample(5 * MS);
+            at += nanos(probe);
         }
         let g = nanos(G);
         let before = quorum_priority([Some(&median), Some(&median)], 3, g);
         for late in [2_900, 1_400, 800] {
-            median.on_sample(late * MS);
+            median.on_sample(late * MS, at, 0);
             smoothed.on_sample(late * MS);
+            at += nanos(probe);
         }
         assert_eq!(
             quorum_priority([Some(&median), Some(&median)], 3, g),
@@ -897,6 +903,33 @@ mod tests {
         );
         let moved = quorum_priority([Some(&smoothed), Some(&smoothed)], 3, g);
         assert!(moved.quorum_ns > 500 * MS, "{moved:?}");
+    }
+
+    /// A path whose answers have all aged past its span contributes nothing, as one never
+    /// probed: a sparsely probed voter's old answers neither order it nor time the ballot.
+    #[test]
+    fn a_path_aged_out_contributes_nothing() {
+        let probe = ms(50);
+        let mut aged = PathRtt::new(ms(150), probe).unwrap();
+        let mut at = 0;
+        for _ in 0..aged.window() {
+            aged.on_sample(5 * MS, at, 0);
+            at += nanos(probe);
+        }
+        let g = nanos(G);
+        assert_ne!(
+            quorum_priority([Some(&aged), Some(&aged)], 3, g),
+            ElectionPriority::default()
+        );
+        assert!(Ballot::measure([&aged, &aged], 3, ms(4), G).is_some());
+        // Long after its last answer, nothing it holds is fresh.
+        assert!(aged.expire(at + 1_000 * nanos(probe)));
+        assert_eq!(PathEstimate::samples(&aged), 0);
+        assert_eq!(
+            quorum_priority([Some(&aged), Some(&aged)], 3, g),
+            ElectionPriority::default()
+        );
+        assert!(Ballot::measure([&aged, &aged], 3, ms(4), G).is_none());
     }
 
     fn ages_without_firing(

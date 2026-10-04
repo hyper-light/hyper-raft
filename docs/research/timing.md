@@ -308,6 +308,18 @@ estimates the spread of the body, not the variance. The MAD has the best possibl
 arbitrarily far before the estimate is; the median's is one half. `PathRtt`'s window is the
 shortest whose median the late probes of one stall cannot move: `2k + 1` for `k` late.
 
+**RFC 9000, §9.4 (read 2026-10-04).** Once an endpoint has validated a peer's new address it
+resets the congestion controller and the round-trip time estimator for the new path to their
+initial values, unless the only change in the peer's address is its port (with the reasons in §9.4
+and RFC 9002's appendices A.3 and B.3). Round trips measured on one path say nothing of another:
+`PathRtt` starts its window again at a new generation of the peer's endpoint.
+
+**RFC 9040, §8.1 (read 2026-10-04).** Of state cached across connections to one host: "In the case
+of temporal sharing, TCB information could also become invalid over time, i.e., indicating that
+although the path remains the same, path properties have changed." It defers to the mechanisms for
+idle connections (RFC 7661) and gives no timeout. `PathRtt` ages a sample out at its window's own
+span, the time the window is derived to cover, so it needs no constant either.
+
 **RFC 9002, §5.1 and §5.3 (read 2026-10-02).** "An endpoint generates an RTT sample on receiving an
 ACK frame that meets the following two conditions: the largest acknowledged packet number is newly
 acknowledged, and at least one of the newly acknowledged packets was ack-eliciting"; "on the first

@@ -36,7 +36,7 @@ use std::{
 
 use hyper_liveness::{Change, Liveness, PeerId, Settings as LiveSettings, Write as LiveWrite};
 use hyper_raft::{
-    Config, Elections, RawNode, StateRole,
+    Config, Elections, Limits, RawNode, StateRole, Stated,
     proto::{Entry, Message},
     wire::Record,
 };
@@ -274,15 +274,25 @@ impl Node {
         let datagram = wire::largest(&socket)?;
         let stamped =
             Stamped::new(&socket).map_err(|error| NodeError::Io(io::Error::other(error)))?;
-        let max_size_per_msg =
-            u64::try_from(datagram.saturating_sub(MESSAGE_ROOM)).unwrap_or(u64::MAX);
+        let room = datagram.saturating_sub(MESSAGE_ROOM);
+        let max_size_per_msg = u64::try_from(room).unwrap_or(u64::MAX);
+        // What the member states: a message is its fixed record and entries to its datagram's
+        // room; the group's voters are every member it has; its queues hold no more than the log
+        // its scenario writes, a datagram a write at the most.
+        let limits = Limits::derive(Stated {
+            message: room.saturating_add(hyper_raft::wire::MESSAGE_RECORD_FIXED_BYTES),
+            members: settings.voters.len(),
+            memory: settings.max_writes.saturating_mul(datagram),
+            depth: 1,
+        })
+        .map_err(NodeError::Raft)?;
         let config = Config {
             elections: Elections::Suspicion,
             max_size_per_msg,
             check_quorum: true,
             pre_vote: true,
             seed: settings.id,
-            ..Config::new(settings.id)
+            ..Config::new(settings.id, limits)
         };
         let raw = heard(RawNode::new(&config, wal))?.ok_or(NodeError::Raft(
             hyper_raft::Error::Settings("the member would not open"),
@@ -290,7 +300,7 @@ impl Node {
         let liveness = Liveness::new(LiveSettings {
             local: settings.id,
             run,
-            max_peers: hyper_raft::MAX_MEMBERS,
+            max_peers: settings.voters.len(),
             history: Exposure::new(),
         })
         .map_err(NodeError::Liveness)?;
@@ -924,7 +934,7 @@ impl Node {
             }
             return Ok(());
         }
-        let Some((id, control)) = wire::read_control(body, hyper_raft::MAX_MEMBERS) else {
+        let Some((id, control)) = wire::read_control(body, self.settings.voters.len()) else {
             return Ok(());
         };
         match control {

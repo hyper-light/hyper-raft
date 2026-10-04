@@ -10,6 +10,18 @@ use crate::{
     },
 };
 
+/// What these tests state of each member (`Limits::derive`): a message of twice the bytes their
+/// appends carry (`max_size_per_msg`, a MiB), groups of at most five members, as the largest here
+/// has, queues of four such messages each, and one write out at a time.
+fn limits() -> Limits {
+    Limits::derive(crate::Stated {
+        message: 2 << 20,
+        members: 5,
+        memory: 8 << 20,
+        depth: 1,
+    })
+    .unwrap()
+}
 fn config(id: u64) -> Config {
     Config {
         election_tick: 10,
@@ -17,7 +29,7 @@ fn config(id: u64) -> Config {
         check_quorum: true,
         pre_vote: true,
         max_size_per_msg: 1 << 20,
-        ..Config::new(id)
+        ..Config::new(id, limits())
     }
 }
 /// Persists and applies what there is, and gives the messages.
@@ -246,12 +258,146 @@ fn only_a_voter_campaigns() {
     }
 }
 
+/// Every bound is derived from what the member's owner states (`Limits::derive`, mantle note 32
+/// §3.8): a message of the stated bytes holds as many entries as the bound says and not one more;
+/// a member holds proposals that its vote carries in one such message; each queue holds what the
+/// memory holds of its least element; and the members and the writes out are as stated. A
+/// statement that admits nothing is refused, deriving or at open.
+#[test]
+fn every_bound_is_derived_from_what_the_owner_states() {
+    use crate::wire::{ENTRY_FIXED_BYTES, MESSAGE_RECORD_FIXED_BYTES, Record};
+    let stated = crate::Stated {
+        message: 64 << 10,
+        members: 5,
+        memory: 1 << 20,
+        depth: 3,
+    };
+    let limits = Limits::derive(stated).unwrap();
+    // A message of as many entries as the bound, each its fixed bytes alone, is no more than the
+    // stated bytes; one more entry passes them.
+    let mut append = proto::message(2, MessageType::MsgAppend);
+    append.entries = vec![Entry::default(); limits.entries_per_message];
+    assert!(append.encoded_len() <= stated.message);
+    append.entries.push(Entry::default());
+    assert!(append.encoded_len() > stated.message);
+    // What a member holds approved by itself, as much as it may, its vote carries in one message.
+    let mut held = crate::fast::Proposals::new(limits.proposals, limits.proposal_bytes);
+    let mut index = 0;
+    // Held until it holds no more: refused for room, never for a place taken.
+    while held
+        .hold(
+            Entry {
+                index: index + 1,
+                term: 1,
+                data: vec![1],
+                ..Entry::default()
+            },
+            true,
+            true,
+        )
+        .is_ok_and(|took| took)
+    {
+        index += 1;
+    }
+    assert!(index > 0 && held.len() <= limits.proposals);
+    let mut vote = proto::message(2, MessageType::MsgRequestVoteResponse);
+    crate::log::copy_entries_of(held.iter(), &mut vote.entries).unwrap();
+    assert!(vote.encoded_len() <= stated.message);
+    assert_eq!(limits.fast_window, limits.proposals as u64);
+    assert_eq!(limits.vote_bytes, stated.members * limits.proposal_bytes);
+    assert_eq!(
+        limits.proposal_bytes,
+        stated.message - MESSAGE_RECORD_FIXED_BYTES
+    );
+    // Each queue: the memory over its least element.
+    assert_eq!(
+        limits.unstable_entries,
+        stated.memory / std::mem::size_of::<Entry>()
+    );
+    assert_eq!(
+        limits.pending_messages,
+        stated.memory / proto::MESSAGE_ALLOWANCE
+    );
+    assert_eq!(
+        limits.pending_reads,
+        stated.memory / std::mem::size_of::<crate::read::PendingRead>()
+    );
+    assert_eq!((limits.readies_in_flight, limits.members), (3, 5));
+    // A message that carries no entry derives nothing.
+    let none = crate::Stated {
+        message: MESSAGE_RECORD_FIXED_BYTES + ENTRY_FIXED_BYTES - 1,
+        ..stated
+    };
+    assert!(matches!(Limits::derive(none), Err(Error::Settings(_))));
+    // Memory that holds fewer entries than a message carries, and a group of no member, are
+    // refused at open.
+    for refused in [
+        crate::Stated {
+            memory: 64 << 10,
+            ..stated
+        },
+        crate::Stated {
+            members: 0,
+            ..stated
+        },
+    ] {
+        let config = Config::new(1, Limits::derive(refused).unwrap());
+        assert!(matches!(
+            RawNode::new(&config, Memory::with_voters(&[1])),
+            Err(Error::Settings(_))
+        ));
+    }
+}
+
+/// A leader proposes no change past the members its group's configuration may name
+/// (`Limits::members`): the entry keeps its place and states nothing, as a second change does
+/// while one waits, and the group goes on as it was; within the bound the change is made.
+#[test]
+fn a_leader_proposes_no_change_past_the_members_a_configuration_names() {
+    use crate::wire::Record;
+    for (members, made) in [(3, false), (4, true)] {
+        let mut node = leader_with(Config {
+            limits: Limits {
+                members,
+                ..limits()
+            },
+            ..config(1)
+        });
+        node.propose_conf_change(
+            vec![],
+            &single(crate::proto::ConfChangeType::AddLearnerNode, 4),
+        )
+        .unwrap();
+        drain(&mut node);
+        let last = node.raft.log().last_index().unwrap();
+        let entry = node
+            .raft
+            .log()
+            .entries(last, u64::MAX, 1)
+            .unwrap()
+            .remove(0);
+        let changes = entry.entry_type != EntryType::EntryNormal;
+        assert_eq!(changes, made, "members {members}: {entry:?}");
+        // The voters commit it; the configuration is as it was, or holds the learner.
+        let mut append = answer(MessageType::MsgAppendResponse, 2, 1, 1);
+        append.index = last;
+        node.step(append).unwrap();
+        drain(&mut node);
+        assert_eq!(node.raft.log().committed(), last);
+        if made {
+            let change = ConfChangeV2::decode(&entry.data).unwrap();
+            node.apply_conf_change(&change).unwrap();
+        }
+        assert_eq!(node.raft.tracker().len(), 3 + usize::from(made));
+    }
+}
+
 #[test]
 fn what_waits_to_be_taken_has_a_bound() {
     let mut node = leader_with(Config {
         limits: Limits {
             pending_messages: 6,
-            ..Limits::default()
+            ..limits()
         },
         ..config(1)
     });
@@ -282,7 +428,7 @@ fn reads_that_wait_have_a_bound() {
     let mut node = leader_with(Config {
         limits: Limits {
             pending_reads: 3,
-            ..Limits::default()
+            ..limits()
         },
         ..config(1)
     });
@@ -759,7 +905,7 @@ fn what_is_not_durable_has_a_bound() {
             limits: Limits {
                 unstable_entries: 2,
                 entries_per_message: 2,
-                ..Limits::default()
+                ..limits()
             },
             ..config(2)
         },
@@ -803,7 +949,7 @@ fn a_message_carries_entries_to_a_bound_whatever_their_bytes() {
         limits: Limits {
             entries_per_message: 3,
             unstable_entries: 64,
-            ..Limits::default()
+            ..limits()
         },
         ..config(1)
     });
@@ -813,7 +959,7 @@ fn a_message_carries_entries_to_a_bound_whatever_their_bytes() {
                 limits: Limits {
                     entries_per_message: 65,
                     unstable_entries: 64,
-                    ..Limits::default()
+                    ..limits()
                 },
                 ..config(1)
             },

@@ -398,7 +398,8 @@ impl<S: Storage> Raft<S> {
             .log
             .slice(entry.index, entry.index.saturating_add(1), u64::MAX)?;
         if taken.first().is_some_and(|taken| same(taken, entry)) {
-            self.decided.holds(entry.index, holder)?;
+            self.decided
+                .holds(entry.index, holder, self.config.limits.members)?;
         }
         Ok(())
     }
@@ -618,7 +619,7 @@ impl<S: Storage> Raft<S> {
                         .config
                         .limits
                         .proposals
-                        .saturating_mul(crate::MAX_MEMBERS)
+                        .saturating_mul(self.config.limits.members)
             })
             .ok_or(Error::Capacity("indexes held above the log"))?;
         taken.try_reserve_exact(count).map_err(|_| Error::Memory)?;

@@ -505,6 +505,19 @@ pub mod mantle {
     }
 }
 
+/// What each member states (`hyper_raft::Limits::derive`): a message of its appends' 64 KiB and
+/// its fixed record, the group's members, queues of 16 MiB each, past anything the run holds, and
+/// one write out at a time.
+fn limits() -> hyper_raft::Limits {
+    hyper_raft::Limits::derive(hyper_raft::Stated {
+        message: (1 << 16) + hyper_raft::wire::MESSAGE_RECORD_FIXED_BYTES,
+        members: MEMBERS as usize,
+        memory: 16 << 20,
+        depth: 1,
+    })
+    .expect("the run's statement gives its bounds")
+}
+
 /// One member: its core and what it has applied.
 struct Member<S: Durable> {
     node: RawNode<S>,
@@ -524,7 +537,7 @@ impl<S: Durable> Member<S> {
             check_quorum: true,
             pre_vote: true,
             seed: id,
-            ..Config::new(id)
+            ..Config::new(id, limits())
         };
         Self {
             node: RawNode::new(&config, S::open(id)).unwrap(),

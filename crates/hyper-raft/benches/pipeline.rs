@@ -53,7 +53,7 @@ use std::{
 };
 
 use hyper_raft::{
-    Config, Limits, RawNode,
+    Config, RawNode,
     proto::{ConfState, Entry, HardState, Message},
 };
 use support::Store;
@@ -119,11 +119,7 @@ impl Group {
                 heartbeat_tick: 2,
                 max_size_per_msg: 4 * 1024 * 1024 + 1024,
                 max_inflight_msgs: 128,
-                limits: Limits {
-                    readies_in_flight: depth,
-                    ..Limits::default()
-                },
-                ..Config::new(id)
+                ..Config::new(id, support::limits(VOTERS as usize, depth))
             };
             members.push(Member {
                 raw: RawNode::new(&config, store).unwrap(),

@@ -336,7 +336,9 @@ macro_rules! focal_core {
             $self.raw.advance_apply_to($self.app.index).expect("applied");
         }
     };
-    ($module:ident, $krate:ident, $name:literal, $mode:ident) => {
+    // `$config` gives a member its settings from its identity and its group's voters: focal's
+    // cores take an identity, this core what its owner states besides (`Limits::derive`).
+    ($module:ident, $krate:ident, $name:literal, $mode:ident, $config:expr) => {
         pub mod $module {
             use hyper_measure::alloc;
             use super::{Disk, Message, apply, envelope};
@@ -376,7 +378,7 @@ macro_rules! focal_core {
                         pre_vote: true,
                         fast: settings.fast,
                         seed,
-                        ..$krate::Config::new(id)
+                        ..($config)(id, voters)
                     };
                     let raw = $krate::RawNode::new(&config, Disk::new(voters)).expect("opens");
                     Self {
@@ -476,12 +478,19 @@ pub mod pb {
     focal_storage!(focal_raft_control, any_entry);
     focal_storage!(focal_raft_mantle, no_any_entry);
 
-    focal_core!(control, focal_raft_control, "focal-raft a8e95f7", copies);
+    focal_core!(
+        control,
+        focal_raft_control,
+        "focal-raft a8e95f7",
+        copies,
+        |id, _: &[u64]| focal_raft_control::Config::new(id)
+    );
     focal_core!(
         mantle,
         focal_raft_mantle,
         "focal-raft 1395e22 (mantle)",
-        copies
+        copies,
+        |id, _: &[u64]| focal_raft_mantle::Config::new(id)
     );
 
     impl raft::Storage for Disk {
@@ -679,6 +688,26 @@ pub mod own {
 
     focal_storage!(hyper_raft, any_entry);
 
-    focal_core!(hyper, hyper_raft, "hyper-raft", in_place);
-    focal_core!(hyper_copy, hyper_raft, "hyper-raft, copying Ready", copies);
+    /// What each member states (`hyper_raft::Limits::derive`), as the core's own test harness
+    /// does: a message of 8 MiB, twice the largest append the shell's settings send; its group's
+    /// voters; queues of four such messages each; one write out at a time.
+    fn config(id: u64, voters: &[u64]) -> hyper_raft::Config {
+        let limits = hyper_raft::Limits::derive(hyper_raft::Stated {
+            message: 8 << 20,
+            members: voters.len(),
+            memory: 32 << 20,
+            depth: 1,
+        })
+        .expect("the comparison's statement gives its bounds");
+        hyper_raft::Config::new(id, limits)
+    }
+
+    focal_core!(hyper, hyper_raft, "hyper-raft", in_place, super::config);
+    focal_core!(
+        hyper_copy,
+        hyper_raft,
+        "hyper-raft, copying Ready",
+        copies,
+        super::config
+    );
 }

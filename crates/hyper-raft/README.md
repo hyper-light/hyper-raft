@@ -55,7 +55,9 @@ term's committed entries before its own write of them is durable.
 - Nothing unwinds. `Error` says whether an operation was refused and changed nothing,
   whether a peer's message contradicted what the member holds, or whether the member's
   state no longer adds up (`Error::is_fatal`), which alone stops the replica.
-- Everything that grows has a bound (`Limits`, `MAX_MEMBERS`).
+- Everything that grows has a bound, derived from what the owner states: its transport's largest
+  message, the members its group names, the bytes a queue may hold, its store's depth
+  (`Limits::derive`).
 - A run is its seed: election timeouts are drawn from `Config::seed`.
 
 ## Tests

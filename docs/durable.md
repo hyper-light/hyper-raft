@@ -590,12 +590,12 @@ Every hold has a bound derived from a quantity the system already has:
 | Hold | Bound | Derivation |
 |---|---|---|
 | Writes out per group | the log's depth: `PIPELINE_FRAMES` (3) | A group's write is useful in each of the log's three pipeline frames (confirming, writing, gathering); a fourth cannot be written before the third flush from now and adds only waiting (Little's law, hyper-log `lib.rs`, mantle research/11 §4). hyper-log's `GROUP_SUBMISSIONS` becomes `PIPELINE_FRAMES` plus one for a compaction. A store that completes synchronously (slates') has depth one. |
-| Unstable entries in the core | `Limits` (uncommitted bytes at a leader; at a follower the leader's inflight window to it, since nothing past it is sent before acknowledgement) | existing core bounds; R-3's `Limits::derive` |
+| Unstable entries in the core | `Limits` (uncommitted bytes at a leader; at a follower the leader's inflight window to it, since nothing past it is sent before acknowledgement) | derived from what the owner states (`Limits::derive`, `docs/raft.md` §3.2): its transport's largest message, its group's members, the bytes a queue may hold |
 | Persisted messages waiting on writes | the core's pending-message bound for each `Ready`, times the depth | core `Limits` × depth |
 | Committed entries behind the fence | one `Ready`'s committed page (`max_committed_size_per_ready`), and no more while it waits | R-6's apply pause |
 | Committed entries applied in one drive | one page (`max_committed_size_per_ready`), or one entry larger than it | §7's quantum: the rest waits for the next drive, the core's apply paused |
 | Committed entries waiting past a drive's page | the rest of the one range that crossed it, a page at most, and no more while they wait | R-6's apply pause: once they wait, no notice or `Ready` gives a range |
-| Snapshot reports while stalled or fenced | one per member of the configuration | at most `MAX_MEMBERS` |
+| Snapshot reports while stalled or fenced | one per member of the configuration | at most the members a configuration names (`Limits::members`, from what the owner states) |
 | Reads | the core's read bounds (rounds are the core's since F43; the shell keeps none) | core `Limits` |
 | Inputs while a write is out | none held: the core steps them | R-4 |
 | Inputs while stalled for room | none held: refused `Stalled`, as the network may drop them, and retried by Raft (thesis §3.3: messages may be lost) | — |

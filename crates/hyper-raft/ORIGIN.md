@@ -111,10 +111,10 @@ Every value is unchanged. These doc comments now state where each value comes fr
 
 Two kinds of value are literals, not derivations, and are marked so:
 
-- `Limits::default`: mantle note 32 §2.10. `Limits::derive` replaces it in R-3.
-- `MAX_MEMBERS`.
+- `Limits::default`: mantle note 32 §2.10. `Limits::derive` replaced it in R-3 (below, "R-3").
+- `MAX_MEMBERS`, replaced by `Limits::members` in R-3.
 
-They are open against the no-arbitrary-numbers rule until R-3.
+They were open against the no-arbitrary-numbers rule until R-3, which derived both.
 
 ### Removed
 
@@ -982,3 +982,26 @@ them. slates is read at `ec5e0df` (its `main`, 2026-10-03).
   unchanged: the shell reads the members' progress from the tracker.
 - **Measured**: slates' 2026-09-28 finding replayed on the shell, three images against none at the
   same three compactions (`docs/benchmarks.md`, "When a log is compacted (R22)").
+
+### Limits::derive: every bound from what the owner states
+
+- **What changed** (`docs/raft.md` §3.2): focal's `Limits::default` literals (65,536 messages and
+  unstable entries, 4,096 reads, 16,384 entries a message, 256 proposals and a window of 256,
+  `8 MiB − 64 KiB` of proposals, 64 MiB of votes; mantle note 32 §2.10, "no arbitrary constants")
+  and `MAX_MEMBERS` (1,024) are gone. `Limits::derive(Stated)` gives each from what the owner
+  states: its transport's largest message, the members a configuration of its group names, the
+  bytes one of its queues may hold, and its store's depth; `Config::new` takes the bounds.
+  `Limits::members` replaces the constant wherever the member counts something a member
+  (progress, a read's askers and confirmations, a fast entry's holders, the members suspected); a
+  leader proposes no change past it, and a member given a configuration past it stops.
+- **Each derivation's check** (`src/tests.rs`): a message of `entries_per_message` empty entries
+  fits the stated bytes, and one more does not; a member holding every proposal it may has a vote
+  that fits; each queue is the memory over its least element; a statement that admits nothing is
+  refused (`every_bound_is_derived_from_what_the_owner_states`). The members bound: a change past
+  it is proposed empty (`a_leader_proposes_no_change_past_the_members_a_configuration_names`) and
+  a configuration past it stops the member (`src/progress.rs`); each fails with its check taken
+  out.
+- **Every owner states its own**: the tests' harnesses (a message twice the largest append they
+  send, their groups' members, queues of several messages), the end-to-end members (a message of
+  their measured datagram, their voters, queues of their log's bound), the shell's tests, the
+  comparisons and the liveness bench.

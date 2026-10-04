@@ -104,6 +104,7 @@ impl Sim {
                     Store::new(boot.clone()),
                     &settings,
                     seed.wrapping_mul(1_000_003).wrapping_add(id),
+                    count as usize,
                 );
                 node.raw.set_timing(timing).unwrap();
                 Some(node)
@@ -353,7 +354,7 @@ fn the_delay_is_the_laws_draw() {
     for seed in first..first + count("HYPER_RAFT_SEEDS", 1_000) {
         let settings = Settings::focal().by_suspicion();
         let local = seed.wrapping_mul(0x2545_f491_4f6c_dd1d);
-        let mut node = New::open(2, Store::new(Sim::voters(&[1, 2, 3])), &settings, local);
+        let mut node = New::open(2, Store::new(Sim::voters(&[1, 2, 3])), &settings, local, 3);
         node.raw.set_timing(timing).unwrap();
         let opened = 7_000_000_000;
         node.wake(opened);
@@ -377,7 +378,7 @@ fn every_arming_draws_anew() {
     let settings = Settings::focal().by_suspicion();
     let local = 0x2545_f491_4f6c_dd1d;
     let draw = |index| hyper_timing::election_delay(timing.span, local, index).as_nanos() as u64;
-    let mut node = New::open(2, Store::new(Sim::voters(&[1, 2, 3])), &settings, local);
+    let mut node = New::open(2, Store::new(Sim::voters(&[1, 2, 3])), &settings, local, 3);
     node.raw.set_timing(timing).unwrap();
     let mut now = 7_000_000_000;
     node.wake(now);
@@ -668,7 +669,7 @@ fn a_restarted_leader_held_from_campaigning_hands_over() {
     let mut sim = Sim::new(3, &Sim::voters(&[1, 2, 3]), timing, 10);
     sim.found(1);
     let store = std::mem::take(sim.node(1).store_mut());
-    let mut node = New::open(1, store, &Settings::focal().by_suspicion(), 99);
+    let mut node = New::open(1, store, &Settings::focal().by_suspicion(), 99, 3);
     node.raw.set_timing(timing).unwrap();
     node.raw.hold_campaigns(true).unwrap();
     sim.nodes[0] = Some(node);
@@ -694,7 +695,7 @@ fn a_restarted_leader_hands_over_to_each_heir_in_turn() {
     sim.found(1);
     sim.cut.push(2);
     let store = std::mem::take(sim.node(1).store_mut());
-    let mut node = New::open(1, store, &Settings::focal().by_suspicion(), 99);
+    let mut node = New::open(1, store, &Settings::focal().by_suspicion(), 99, 3);
     node.raw.set_timing(timing).unwrap();
     node.raw.hold_campaigns(true).unwrap();
     sim.nodes[0] = Some(node);
@@ -824,7 +825,7 @@ fn a_leader_beats_while_work_is_in_flight_and_then_sleeps() {
 #[test]
 fn a_sole_voter_elects_itself_without_timing() {
     let settings = Settings::focal().by_suspicion();
-    let mut node = New::open(1, Store::new(Sim::voters(&[1])), &settings, 1);
+    let mut node = New::open(1, Store::new(Sim::voters(&[1])), &settings, 1, 1);
     node.wake(0);
     node.drain();
     assert_eq!(node.view().role, 2);
@@ -835,7 +836,7 @@ fn a_sole_voter_elects_itself_without_timing() {
 #[test]
 fn ticks_and_suspicion_do_not_mix() {
     let settings = Settings::focal().by_suspicion();
-    let mut node = New::open(1, Store::new(Sim::voters(&[1, 2, 3])), &settings, 1);
+    let mut node = New::open(1, Store::new(Sim::voters(&[1, 2, 3])), &settings, 1, 3);
     assert!(matches!(
         node.raw.tick(),
         Err(hyper_raft::Error::Settings(_))
@@ -845,6 +846,7 @@ fn ticks_and_suspicion_do_not_mix() {
         Store::new(Sim::voters(&[1, 2, 3])),
         &Settings::focal(),
         1,
+        3,
     );
     assert!(matches!(
         ticking.raw.suspect(2),
@@ -855,7 +857,7 @@ fn ticks_and_suspicion_do_not_mix() {
     // Without pre-vote and check-quorum, elections by suspicion are refused at open.
     let config = hyper_raft::Config {
         elections: hyper_raft::Elections::Suspicion,
-        ..hyper_raft::Config::new(1)
+        ..hyper_raft::Config::new(1, support::limits(1, 1))
     };
     assert!(matches!(
         config.validate(),

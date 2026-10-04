@@ -312,7 +312,7 @@ impl Cluster {
         let ask = self.next_id;
         control::put_order(&mut self.buffer, ask, &Order::Report);
         let body = self.exchange(id, ask)?;
-        let report = control::read_report(&body, hyper_raft::MAX_MEMBERS).map(|(_, r)| r)?;
+        let report = control::read_report(&body, self.members.len()).map(|(_, r)| r)?;
         // Every suspicion is the stream's: none told while a heartbeat the kernel stamped before
         // its point sat unread in the member's socket.
         assert_eq!(

@@ -502,9 +502,9 @@ impl Lagged {
 
 impl Replica for Lagged {
     const LAGGED: bool = true;
-    fn open(id: u64, store: Store, settings: &Settings, seed: u64) -> Self {
+    fn open(id: u64, store: Store, settings: &Settings, seed: u64, members: usize) -> Self {
         Self {
-            node: New::open(id, store, settings, seed),
+            node: New::open(id, store, settings, seed, members),
             depth: settings.depth,
             out: VecDeque::new(),
             durable: VecDeque::new(),

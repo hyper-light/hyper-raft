@@ -54,7 +54,7 @@ pub use node::{Kept, LightReady, RawNode, Ready, SnapshotStatus, ToPersist};
 pub use quorum::{Quorum, Tally};
 pub use raft::{
     Ahead, Config, Elections, FastStats, HeartbeatAnswers, Limits, Lost, Outgoing, Precedence,
-    Raft, ReadRounds, SoftState, StateRole,
+    Raft, ReadRounds, SoftState, StateRole, Stated,
 };
 pub use read::ReadState;
 pub use storage::{InitialState, Storage};
@@ -62,10 +62,6 @@ pub use watch::{TRANSFER_ROUNDS, Timing};
 
 /// A member's identity. Zero is no member.
 pub type NodeId = u64;
-/// The most members a configuration names, voters and learners together.
-/// focal's bound, carried unchanged; its derivation is owed with
-/// [`Limits`]'s (`docs/raft.md`, R-3).
-pub const MAX_MEMBERS: usize = 1024;
 
 #[cfg(test)]
 mod tests;

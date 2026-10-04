@@ -54,6 +54,18 @@ const HEARTBEAT_TICK: usize = 2;
 /// A group's voters.
 const VOTERS: u64 = 3;
 
+/// What each replica states (`hyper_raft::Limits::derive`): its group's voters, a message of a UDP
+/// datagram's 64 KiB, queues of 16 MiB each, past anything an idle group holds, and one write out.
+fn limits() -> hyper_raft::Limits {
+    hyper_raft::Limits::derive(hyper_raft::Stated {
+        message: 64 << 10,
+        members: VOTERS as usize,
+        memory: 16 << 20,
+        depth: 1,
+    })
+    .expect("the bench's statement gives its bounds")
+}
+
 /// A member's durable state in memory: what the core reads back.
 #[derive(Default)]
 struct Store {
@@ -155,7 +167,7 @@ impl Groups {
                     check_quorum: true,
                     pre_vote: true,
                     seed: (group * VOTERS as usize + slot) as u64 + 1,
-                    ..hyper_raft::Config::new(slot as u64 + 1)
+                    ..hyper_raft::Config::new(slot as u64 + 1, limits())
                 };
                 *at = replicas.len();
                 replicas.push(Replica {

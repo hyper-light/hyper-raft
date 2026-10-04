@@ -1119,6 +1119,29 @@ slates' configuration grew), and one that keeps one value (a register's: its ima
 - **The schedules**: `tests/sim.rs`'s five shapes reach the same counts at 128 seeds a shape with
   the rule's count checked after every step as without it; the check held at 1,000 seeds a shape.
 
+## Every bound from what the owner states (`Limits::derive`)
+
+Core step R-3's last commit (`crates/hyper-raft/ORIGIN.md`, "Limits::derive"; `docs/raft.md`
+§3.2). Measured on 2026-10-03 on the machine above, load 7.7–10.3; what follows is counted, and
+every run counts the same.
+
+**Allocations**: the comparison's members state a message of 8 MiB, their group's voters and queues
+of 32 MiB each; allocations, reallocations, bytes and peaks are R22's (the same core as R13's) on
+all 36 cells. A bound limits what may wait; none is reserved to it but the writes out, which are as
+before.
+
+**The schedules**: every line the suites print at their default seeds is R22's but one, the group
+of both cores, whose raft-rs members draw their timeouts from their thread (`tests/group.rs`): three
+runs of the one tree printed 452, 416 and 455 terms led by raft-rs. The harnesses state a message
+twice the largest append they send, their groups' members, and queues of four such messages; where
+a bound now stands elsewhere than focal's literal (a fast window of the proposals a vote carries,
+where it was 256), no schedule's outcome turned on it.
+
+**The derivations, checked exactly** (`every_bound_is_derived_from_what_the_owner_states`, at a
+message of 64 KiB, five members, queues of a MiB, three writes out): a message of
+`entries_per_message` (2,617) empty entries fits the stated bytes and one more does not; a member
+that holds every proposal it may has a vote that fits.
+
 ## Where hyper-raft does not win, and why
 
 hyper-raft in place allocates less than every other core in every row. It is faster than raft-rs
@@ -1448,6 +1471,10 @@ cargo test -p hyper-durable --test shell -- --nocapture --test-threads=1 \
   a_leader_that_waits_for_its_followers_sends_them_entries_not_images \
   a_sole_voter_that_compacts_when_due_holds_its_log_within_the_rule
 HYPER_DURABLE_SEEDS=1000 cargo test -p hyper-durable --test sim -- --nocapture random_schedules
+
+# Every bound from what the owner states (Limits::derive): the counting runs and the schedules as
+# above; the derivations are a unit test.
+cargo test -p hyper-raft --lib every_bound_is_derived_from_what_the_owner_states
 
 # The end-to-end scenarios, and every gate.
 cargo test -p hyper-raft-e2e --test cluster

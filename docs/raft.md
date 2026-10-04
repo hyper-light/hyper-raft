@@ -27,12 +27,14 @@
 > Timing step L-2 is done (2026-10-02): elections started by the owner's failure detectors, not by
 > ticks (`Config::elections`, `docs/timing.md` §2.9).
 >
-> Step R-3 is under way (2026-10-03, §3.2): slates' regression tests for R6, R7, R4, R5, R20 and
-> R21 pass; three defects at the end of what a member counts and a lease kept by a member's own
-> timer, which their siblings found, are fixed; the window a member is sent ahead of its answers is
-> one rule from focal's and slates' (R16); a member keeps what arrives ahead of a hole and
-> acknowledges it with the write that holds it (R17); a learner is caught up in rounds before it is
-> promoted (R13); a log is due for compaction by the thesis's rule, the shell's policy (R22).
+> Step R-3 is done (2026-10-03, §3.2): slates' regression tests for R6, R7, R4, R5, R20 and R21
+> pass; three defects at the end of what a member counts and a lease kept by a member's own timer,
+> which their siblings found, are fixed; the window a member is sent ahead of its answers is one
+> rule from focal's and slates' (R16); a member keeps what arrives ahead of a hole and acknowledges
+> it with the write that holds it (R17); a learner is caught up in rounds before it is promoted
+> (R13); a log is due for compaction by the thesis's rule, the shell's policy (R22); and every bound
+> is derived from what the member's owner states, the members a configuration names among them
+> (`Limits::derive`). mantle's and focal's suites run when each takes a snapshot of this crate.
 
 ## 1. What `hyper-raft` is
 
@@ -127,7 +129,7 @@ includes the consumers' suites. They run when each consumer takes a snapshot und
 |---|---|---|
 | **R-1** (done here) | focal-raft moved and conformed; no behaviour change. | focal-raft's own tests and the raft-rs differential, identical before and after (done, `ORIGIN.md`). Still to run: focal's full suite with focal on a snapshot of this crate, and mantle's `crates/range` suite including `sim.rs`. |
 | **R-2** | Own message types and **its own wire format** (the owner's decision, 2026-10-01: hyper-raft speaks its own protocol, not raft-rs's). The types are plain Rust structs with typed kinds; the encoding is §3.1's. No protobuf, no `prost`, no `raft-proto` in production. | Golden vectors of the new format pinned for every type. The differential unchanged in what it compares: raft-rs on its own types, this core on its own, compared field by field through the test adapter. Decoding refuses every truncation and corruption of every golden vector, never panics on arbitrary bytes. focal's WAL is translated by F-1's conversion. |
-| **R-3** | slates' enhancements, one commit each, in this order. First, regression tests for R6 and R7, which are expected to pass. Then tests for R4, R5, R20 and R21, with a patch only on failure. Then the R16 byte-bounded pipeline window, R17 out-of-order acknowledgement within a term, R13 learner catch-up rounds, and R22's compaction rule. `Limits::derive` replaces `Limits::default`. | For each: the slates test or bench that motivated it, run against this crate and showing slates' recorded improvement. The raft-rs differential; any intended divergence joins focal 27 §4.5's divergence table with its own test. mantle's and focal's suites. |
+| **R-3** (done, 2026-10-03) | slates' enhancements, one commit each, in this order. First, regression tests for R6 and R7, which are expected to pass. Then tests for R4, R5, R20 and R21, with a patch only on failure. Then the R16 byte-bounded pipeline window, R17 out-of-order acknowledgement within a term, R13 learner catch-up rounds, and R22's compaction rule. `Limits::derive` replaces `Limits::default`. | Run, for each (§3.2, `crates/hyper-raft/ORIGIN.md`, "R-3"; `docs/benchmarks.md`): slates' tests on this core, each failing with its rule taken out; slates' recorded improvements reproduced (pipelining at 2,000 proposals a second across five regions, 125 / 127 ms against one batch out falling behind; reordered paths at 4,000 a second; Figure 4.4(a), 45 rounds without a commit against one round trip; three images against none at three compactions); the raft-rs differential unchanged, R17's divergence in §3.3 with its own tests; every suite of this repository, the simulations at 1,000 seeds; allocation counts on all 36 cells. Still to run: mantle's and focal's suites, each when it takes a snapshot. |
 
 The R-numbers are note 32 §2.13's ledger.
 
@@ -424,6 +426,40 @@ its entries sending its third voter an image at every compaction; replayed on th
 images against none at the same three compactions (`docs/benchmarks.md`, "When a log is compacted
 (R22)").
 
+**Every bound from what the owner states (`Limits::derive`).** focal's bounds were literals carried
+unchanged (65,536 messages and unstable entries, 4,096 reads, 16,384 entries a message, 256
+proposals and a window of 256, `8 MiB − 64 KiB` of proposals, 64 MiB of votes; mantle note 32
+§2.10), and a configuration named at most `MAX_MEMBERS`, 1,024. Each is now derived from what the
+member's owner states (`Stated`): the largest message its transport carries, the members a
+configuration of its group names, the bytes one of its queues may hold, and its store's depth.
+- A message carries no more entries than its bytes past its fixed record hold at an entry's fixed
+  bytes each (`entries_per_message`; `wire::ENTRY_FIXED_BYTES`, `MESSAGE_RECORD_FIXED_BYTES`).
+- A member holds proposals of no more bytes than a message carries past its fixed record, so that
+  its vote carries every one (`proposal_bytes`). They are counted resident (`crate::fast`), each at
+  least an entry, so that no more are held than those bytes hold entries (`proposals`), and none is
+  proposed further above the commit than a vote could carry (`fast_window`).
+- A leader is told what each member holds, a message's bytes from each at the most (`vote_bytes`).
+- Each queue holds what the stated memory holds of its least element: an entry for the entries not
+  yet durable, a message's allowance for the messages not yet taken (`proto::MESSAGE_ALLOWANCE`), a
+  read for the reads that wait. What their buffers hold is bounded besides: the window to each
+  member, the bytes a leader holds uncommitted, the owner's budget.
+- The writes out (`readies_in_flight`) and the members (`members`) are as stated.
+
+A statement that admits nothing is refused: a message that carries no entry, memory that holds fewer
+entries than one message carries (a member could not take a leader's message whole), no member.
+The members bound is a configuration's, and every member of a group states the same, as each opens
+with the same fast track. A leader proposes no change past it: the entry keeps its place and states
+nothing, as a second change does while one waits. A member given a configuration past it, from its
+log, a snapshot or its storage at open, stops, an `Invariant`, for its group's other members hold
+the configuration and going on without it would leave this one in another. What a member counts
+for each member (its progress, a read's askers and confirmations, the holders of a fast entry, the
+members its detectors suspect) is held to the same bound. The tests check each derivation where
+it shows: a message of `entries_per_message` empty entries fits the stated bytes and one more does
+not, and a member that holds all the proposals it may has a vote that fits
+(`every_bound_is_derived_from_what_the_owner_states`); a change past the members is not proposed
+(`a_leader_proposes_no_change_past_the_members_a_configuration_names`); a configuration past them
+stops the member (`a_configuration_past_the_members_a_member_was_opened_for_stops_it`).
+
 ### 3.3 Where this core and raft-rs differ
 
 `tests/differential.rs` runs this core and raft-rs on one schedule and compares them field by field
@@ -443,7 +479,8 @@ table for focal-raft; it lives here since the core moved (R-1), with every decis
 | Priority judges the vote a transfer asks for; a member without a term, or one that left, may refuse for priority | Priority never judges a transfer, and is in force only for a member with a term that may campaign | `tests/group.rs`: `priority_orders_an_election_and_never_judges_a_transfer`, `a_member_that_has_no_term_refuses_no_one_for_priority`, `a_member_that_left_refuses_no_one_for_priority` |
 | One that is no voter may campaign, and unwinds when it wins | Refused, `NotPromotable` | `only_a_voter_campaigns` |
 | Election timeouts from the thread's generator | From a seed the owner gives (`Config::seed`): a run is its seed | `election_timeouts_are_drawn_from_the_seed` |
-| Queues without a bound of their own | `Limits`; a member takes of a message what it may hold, and answers with the last entry taken | `what_waits_to_be_taken_has_a_bound`, `what_is_not_durable_has_a_bound`, `reads_that_wait_have_a_bound` |
+| Queues without a bound of their own | `Limits`, derived from what the owner states (`Limits::derive`, §3.2); a member takes of a message what it may hold, and answers with the last entry taken | `what_waits_to_be_taken_has_a_bound`, `what_is_not_durable_has_a_bound`, `reads_that_wait_have_a_bound`, `every_bound_is_derived_from_what_the_owner_states` |
+| A leader proposes any change, and a configuration names any number of members | A leader proposes no change past the members a configuration of its group may name (`Limits::members`): the entry keeps its place and states nothing; a member given a configuration past them stops; the differential's groups stay within them | `a_leader_proposes_no_change_past_the_members_a_configuration_names`; `src/progress.rs`: `a_configuration_past_the_members_a_member_was_opened_for_stops_it` |
 | A round of heartbeats for each read as it is asked, and again as it is asked again | One round when the member is next asked what there is to do, for every read since (`ReadRounds::Shared`, focal F43); raft-rs's rule is kept as `ReadRounds::Each` | `reads_asked_together_leave_in_one_round_and_one_answer_confirms_them`; `tests/group.rs`: `a_round_confirms_no_read_asked_after_it_left` |
 | A window of messages alone | Of bytes, each append charged its record, what the owner says the path carries (`RawNode::set_inflight_bytes`, focal F41; R16's rule, §3.2), and of messages unless it counts none; a window that filled waits for room for a whole append or half of it; the differential runs with no byte bound | `a_member_is_sent_no_more_bytes_ahead_of_its_answers_than_its_path_carries`; `src/progress.rs`: `a_window_that_filled_waits_for_a_whole_append_or_half_of_it`; `tests/timed.rs` |
 | A follower refuses an append that begins past the end of its log and keeps nothing; at the refusal its leader probes from the member's match and sends what followed again | It keeps the entries, as many as its log may hold not yet durable, and takes them in when an append of the same term fills the hole, acknowledging them with it; its refusal says it kept the append (`Message::kept`), and its leader takes what the member kept out of its window and sends every hole before it again, once, and probes only a resend a beat leaves unanswered (`Ahead::Kept`, R17, §3.2); raft-rs's rule is kept as `Ahead::Refused`, which the differential runs | `a_lost_append_costs_its_own_resend_and_what_was_kept_is_not_sent_again`, `a_refusal_sends_the_hole_alone_and_what_was_kept_leaves_the_window`, `a_hole_sent_again_and_unanswered_for_a_beat_is_probed`, `a_refusal_older_than_the_members_progress_sends_what_it_lacks_and_no_more`, `every_hole_before_what_was_kept_goes_again_at_once`, `a_member_that_keeps_nothing_ahead_is_probed_and_caught_up`, `what_was_kept_is_acknowledged_only_with_the_write_that_holds_it`; `src/wire.rs`: the kept refusal's golden vector |
@@ -574,11 +611,6 @@ runs seed 54104's schedule; it fails without the second rule and passes with it.
 200,000 (`HYPER_RAFT_SEEDS=40000 HYPER_RAFT_SEED=<seed> cargo test -p hyper-raft --release --test
 fast a_group_with_the_fast_track`): every member commits the same entry at every index, every
 answered read saw what was committed when it was asked, and every group settles.
-
-**Open against the rules until R-3.** These values are carried unchanged and are literals, not
-derivations:
-- `Limits::default`: mantle note 32 §2.10;
-- `MAX_MEMBERS`.
 
 ## 4. The crates that follow
 

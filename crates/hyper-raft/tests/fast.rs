@@ -404,7 +404,8 @@ fn what_may_not_go_by_the_fast_track_is_refused() {
         assert!(group.peek(2).unwrap().held().is_empty());
     }
     // Below the log, and beyond the window above what is committed.
-    for index in [1, 2 + 256] {
+    let window = group.peek(2).unwrap().raw.raft.config().limits.fast_window;
+    for index in [1, 2 + window] {
         group.net.push(proposal(Entry {
             index,
             data: vec![1],

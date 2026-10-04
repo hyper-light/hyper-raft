@@ -189,9 +189,21 @@ pub struct Group<F: BlockFile + 'static> {
     writes: Vec<Duration>,
 }
 
-/// mantle's group test's settings, as the core takes them.
-fn settings(id: u64) -> Settings {
+/// mantle's group test's settings, as the core takes them, for a member of a group of `members`:
+/// what it states besides (`hyper_raft::Limits::derive`) is a message of its appends' bytes and its
+/// fixed record, its group's members, queues of 16 MiB each, past anything the run holds, and one
+/// write out, which the shell raises to the log's depth.
+fn settings(id: u64, members: u64) -> Settings {
     let s = crate::mantle::SETTINGS;
+    let limits = hyper_raft::Limits::derive(hyper_raft::Stated {
+        message: usize::try_from(s.max_size_per_msg)
+            .unwrap_or(usize::MAX)
+            .saturating_add(hyper_raft::wire::MESSAGE_RECORD_FIXED_BYTES),
+        members: usize::try_from(members).unwrap_or(usize::MAX),
+        memory: 16 << 20,
+        depth: 1,
+    })
+    .expect("the run's statement gives its bounds");
     Settings {
         core: Config {
             election_tick: s.election_tick,
@@ -203,7 +215,7 @@ fn settings(id: u64) -> Settings {
             check_quorum: true,
             pre_vote: true,
             seed: id,
-            ..Config::new(id)
+            ..Config::new(id, limits)
         },
         quiet: std::time::Duration::from_millis(10),
         elections: hyper_raft::Elections::Suspicion,
@@ -239,7 +251,7 @@ impl<F: BlockFile + 'static> Group<F> {
                 persisted: Point::default(),
             };
             let replica: Member<F> =
-                Replica::open(&settings(id), store, machine, Unbounded).unwrap();
+                Replica::open(&settings(id, members), store, machine, Unbounded).unwrap();
             handles.push(owner.insert(replica).map_err(|_| ()).unwrap());
             logs.push(log);
         }

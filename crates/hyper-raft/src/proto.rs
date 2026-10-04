@@ -394,15 +394,11 @@ pub struct Plan {
     pub context: Vec<u8>,
 }
 impl Plan {
-    /// The most changes one entry states.
-    pub const MAX_CHANGES: usize = crate::MAX_MEMBERS;
-
-    /// The change `change` states.
+    /// The change `change` states. Its changes are as many as its entry's
+    /// bytes hold; the configuration they make is held to the member's
+    /// bound where it takes effect ([`crate::Limits::members`]).
     pub fn of(change: &ConfChangeV2) -> Result<Self> {
         let transition = change.transition;
-        if change.changes.len() > Self::MAX_CHANGES {
-            return Err(Error::Capacity("changes in one entry"));
-        }
         let mut changes = Vec::new();
         changes
             .try_reserve_exact(change.changes.len())
@@ -470,11 +466,6 @@ impl Configuration {
     /// The configuration the log or a snapshot states.
     pub fn from_conf_state(state: &ConfState) -> Result<Self> {
         let copy = |members: &[NodeId]| -> Result<Vec<NodeId>> {
-            if members.len() > crate::MAX_MEMBERS {
-                return Err(Error::Configuration(
-                    crate::ConfigurationError::TooManyMembers,
-                ));
-            }
             let mut copied = Vec::new();
             copied
                 .try_reserve_exact(members.len())

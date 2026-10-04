@@ -634,6 +634,25 @@ pub const ROUND_NS: u64 = 5_000;
 /// A tick's advance of the clock ([`SPAN_NS`]).
 pub const TICK_NS: u64 = 500;
 
+/// The largest message the harness states its network carries: eight MiB, twice the largest
+/// append [`Settings::shell`] sends (four MiB and a KiB of entries).
+pub const MESSAGE: usize = 8 << 20;
+/// The bytes the harness states each of a member's queues may hold: four of its messages, room
+/// for the entries of one many times over, as `Limits::derive` asks.
+pub const MEMORY: usize = 4 * MESSAGE;
+
+/// What the harness states of a member of a group of `members` with `depth` writes out at once
+/// (`hyper_raft::Limits::derive`).
+pub fn limits(members: usize, depth: usize) -> hyper_raft::Limits {
+    hyper_raft::Limits::derive(hyper_raft::Stated {
+        message: MESSAGE,
+        members,
+        memory: MEMORY,
+        depth,
+    })
+    .expect("the harness's statement gives its bounds")
+}
+
 /// The timing the schedule gives each member that elects by suspicion.
 pub fn timing() -> hyper_raft::Timing {
     hyper_raft::Timing {
@@ -701,7 +720,8 @@ pub trait Replica: Sized {
     /// as the schedule's persistence steps say ([`Lagged`]); the others
     /// persist each `Ready` as they take it.
     const LAGGED: bool = false;
-    fn open(id: u64, store: Store, settings: &Settings, seed: u64) -> Self;
+    /// The member `id` of a group of `members`, opened on `store`.
+    fn open(id: u64, store: Store, settings: &Settings, seed: u64, members: usize) -> Self;
     fn id(&self) -> u64;
     fn store(&self) -> &Store;
     fn store_mut(&mut self) -> &mut Store;
@@ -863,7 +883,7 @@ impl Old {
     }
 }
 impl Replica for Old {
-    fn open(id: u64, mut store: Store, settings: &Settings, _seed: u64) -> Self {
+    fn open(id: u64, mut store: Store, settings: &Settings, _seed: u64, _members: usize) -> Self {
         store.0.reopen();
         let applied = store.0.snapshot_index();
         let app = if applied == 0 {
@@ -1230,7 +1250,7 @@ impl New {
     }
 }
 impl Replica for New {
-    fn open(id: u64, mut store: Store, settings: &Settings, seed: u64) -> Self {
+    fn open(id: u64, mut store: Store, settings: &Settings, seed: u64, members: usize) -> Self {
         store.0.reopen();
         let applied = store.0.snapshot_index();
         let app = if applied == 0 {
@@ -1277,12 +1297,8 @@ impl Replica for New {
                 hyper_raft::Elections::Ticks
             },
             seed,
-            limits: hyper_raft::Limits {
-                readies_in_flight: settings.depth,
-                ..hyper_raft::Limits::default()
-            },
             lost: store.0.mark(),
-            ..hyper_raft::Config::new(id)
+            ..hyper_raft::Config::new(id, limits(members, settings.depth))
         };
         let mut raw = hyper_raft::RawNode::new(&config, store).expect("hyper-raft opens");
         if settings.suspicion {
@@ -1541,16 +1557,16 @@ macro_rules! either {
     };
 }
 impl Replica for Either {
-    fn open(id: u64, store: Store, settings: &Settings, seed: u64) -> Self {
+    fn open(id: u64, store: Store, settings: &Settings, seed: u64, members: usize) -> Self {
         if id % 2 == 1 {
-            let mut old = Old::open(id, store, settings, seed);
+            let mut old = Old::open(id, store, settings, seed, members);
             // `raft-rs` draws its timeouts from the thread; a run is its
             // seed.
             let span = settings.election_tick as u64;
             old.set_timeout(settings.election_tick + Seeded(seed).below(span) as usize);
             Self::Old(Box::new(old))
         } else {
-            Self::New(Box::new(New::open(id, store, settings, seed)))
+            Self::New(Box::new(New::open(id, store, settings, seed, members)))
         }
     }
     fn id(&self) -> u64 {

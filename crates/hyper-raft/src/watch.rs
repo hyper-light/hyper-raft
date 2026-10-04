@@ -39,7 +39,7 @@
 //! timed at the next wake: the core never reads a clock.
 use std::time::Duration;
 
-use crate::{MAX_MEMBERS, NodeId};
+use crate::NodeId;
 
 /// A protocol fact, not a tunable: two, the vote rounds a leadership transfer takes at most from
 /// the leader's word to the new leader's first append reaching it: the order to campaign reaching
@@ -96,7 +96,8 @@ pub(crate) enum Arm {
 /// What a member that elects by suspicion keeps (the module's documentation).
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Watch {
-    /// The members the owner's detectors suspect, in order; at most [`MAX_MEMBERS`].
+    /// The members the owner's detectors suspect, in order; at most the members a configuration
+    /// names ([`crate::Limits::members`]).
     suspected: Vec<NodeId>,
     /// The span, the round tail and the expected election, nanoseconds, once the owner gave them.
     pub(crate) timing: Option<(u64, u64, u64)>,
@@ -141,12 +142,12 @@ impl Watch {
         self.suspected.binary_search(&member).is_ok()
     }
     /// The detectors suspect `member`. False when they already did. Refused past
-    /// [`MAX_MEMBERS`] members, the most a configuration names.
-    pub(crate) fn suspect(&mut self, member: NodeId) -> crate::Result<bool> {
+    /// `members`, the most a configuration names.
+    pub(crate) fn suspect(&mut self, member: NodeId, members: usize) -> crate::Result<bool> {
         match self.suspected.binary_search(&member) {
             Ok(_) => Ok(false),
             Err(position) => {
-                if self.suspected.len() >= MAX_MEMBERS {
+                if self.suspected.len() >= members {
                     return Err(crate::Error::Capacity("members suspected"));
                 }
                 self.suspected

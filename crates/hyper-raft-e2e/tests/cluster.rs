@@ -290,7 +290,7 @@ impl Cluster {
         let ask = self.next_id;
         stream::put_report_ask(&mut self.buffer, ask);
         let body = self.exchange(id, ask)?;
-        let (_, report) = stream::read_report(&body, hyper_raft::MAX_MEMBERS)?;
+        let (_, report) = stream::read_report(&body, self.members.len())?;
         // Every write a member keeps waiting is one an apply will answer.
         assert_eq!(
             report.stray, 0,
@@ -534,7 +534,7 @@ impl Cluster {
             stream::put_account_ask(&mut self.buffer, ask);
             let Some((_, account)) = self
                 .exchange(id, ask)
-                .and_then(|body| stream::read_account(&body, hyper_raft::MAX_MEMBERS))
+                .and_then(|body| stream::read_account(&body, self.members.len()))
             else {
                 out.push_str(&format!("\n  member {id}: no account"));
                 continue;

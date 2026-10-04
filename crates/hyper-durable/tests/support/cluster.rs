@@ -148,6 +148,23 @@ pub fn timing() -> hyper_raft::Timing {
     }
 }
 
+/// What the shell's tests state of a member of a group of `members` (`hyper_raft::Limits::derive`):
+/// a message of a UDP datagram's 64 KiB, as the end-to-end members send theirs, far past the
+/// appends of 256 bytes they send; queues of 16 MiB each, room no schedule here reaches; one
+/// write out, which the shell raises to the store's depth.
+pub fn limits(members: usize) -> hyper_raft::Limits {
+    hyper_raft::Limits::derive(hyper_raft::Stated {
+        message: 64 << 10,
+        members,
+        memory: 16 << 20,
+        depth: 1,
+    })
+    .expect("the tests' statement gives their bounds")
+}
+
+/// The most members a group of these tests names: the largest shape's five.
+pub const MEMBERS: usize = 5;
+
 pub fn settings(id: u64, seed: u64) -> Settings {
     Settings {
         core: Config {
@@ -157,7 +174,7 @@ pub fn settings(id: u64, seed: u64) -> Settings {
             check_quorum: true,
             pre_vote: true,
             seed: seed.wrapping_mul(31).wrapping_add(id),
-            ..Config::new(id)
+            ..Config::new(id, limits(MEMBERS))
         },
         quiet: Duration::from_millis(50),
         elections: hyper_raft::Elections::Suspicion,

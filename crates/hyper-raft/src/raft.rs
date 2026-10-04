@@ -26,9 +26,10 @@ use crate::{
         self, CAMPAIGN_TRANSFER, ConfState, Entry, EntryType, HardState, Message, MessageType,
         Plan, Snapshot,
     },
-    read::{ReadOnly, ReadState},
+    read::{PendingRead, ReadOnly, ReadState},
     storage::Storage,
     watch::{Arm, TRANSFER_ROUNDS, Timing, Watch, nanos},
+    wire::{ENTRY_FIXED_BYTES, MESSAGE_RECORD_FIXED_BYTES},
 };
 
 /// What grows only to a bound.
@@ -62,23 +63,81 @@ pub struct Limits {
     /// sets the store's depth: hyper-durable sets `LogStore::depth`, which
     /// for hyper-log is its pipeline frames (`docs/durable.md` §6).
     pub readies_in_flight: usize,
+    /// The most members a configuration names, voters and learners
+    /// together: what the member counts for each member (its progress, the
+    /// confirmations of a read, the holders of a fast entry, the members its
+    /// detectors suspect). A leader proposes no change past it, and a member
+    /// given a configuration past it stops.
+    pub members: usize,
 }
-/// focal's bounds, carried unchanged. They are literals, not derivations
-/// (mantle note 32 §2.10); `Limits::derive` replaces them in R-3
-/// (`docs/raft.md`).
-impl Default for Limits {
-    fn default() -> Self {
-        Self {
-            pending_messages: 65_536,
-            pending_reads: 4_096,
-            unstable_entries: 65_536,
-            entries_per_message: 16_384,
-            proposals: 256,
-            proposal_bytes: 8 * 1024 * 1024 - 64 * 1024,
-            fast_window: 256,
-            vote_bytes: 64 * 1024 * 1024,
-            readies_in_flight: 1,
-        }
+
+/// What an owner states of the member it opens, from which every bound of
+/// [`Limits`] is derived ([`Limits::derive`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Stated {
+    /// The bytes of the largest message the member's transport carries, its
+    /// record as the wire writes it ([`MESSAGE_RECORD_FIXED_BYTES`] and its
+    /// entries): a leader's append is no larger, nor a vote that carries a
+    /// member's proposals ([`crate::fast`]).
+    pub message: usize,
+    /// The most members a configuration of the group names, voters and
+    /// learners together. Every member of a group states the same, as it
+    /// opens with the same fast track: a change one refuses and another
+    /// applies would leave them in different configurations.
+    pub members: usize,
+    /// The bytes one of the member's queues may hold, each element counted
+    /// at the least it holds: the entries not yet durable, the messages not
+    /// yet taken, the reads that wait. What their buffers hold is bounded
+    /// besides: the window to each member, the bytes a leader holds
+    /// uncommitted, the owner's budget.
+    pub memory: usize,
+    /// The `Ready`s whose writes may be out at once: the store's depth.
+    pub depth: usize,
+}
+
+impl Limits {
+    /// The bounds `stated` gives, each derived from it:
+    /// - a message carries no more entries than its bytes past its fixed
+    ///   record hold at an entry's fixed bytes each ([`ENTRY_FIXED_BYTES`]);
+    /// - a member holds proposals of no more bytes than a message carries
+    ///   past its fixed record, so that a vote carries every one; they are
+    ///   counted resident ([`crate::fast`]), each at least an entry, so that
+    ///   no more of them are held than those bytes hold entries, and none is
+    ///   proposed further above the commit, where no vote could carry it;
+    /// - a leader is told what each member holds, a message's bytes from
+    ///   each at the most;
+    /// - each queue holds what `memory` holds of its least element: an
+    ///   entry, a message's allowance ([`proto::MESSAGE_ALLOWANCE`]), a read;
+    /// - the members and the readies in flight are as stated.
+    ///
+    /// Refused where a message carries no entry; [`Config::validate`] refuses
+    /// bounds that admit nothing or disagree.
+    pub fn derive(stated: Stated) -> Result<Self> {
+        let payload = stated
+            .message
+            .checked_sub(MESSAGE_RECORD_FIXED_BYTES)
+            .filter(|payload| *payload >= ENTRY_FIXED_BYTES)
+            .ok_or(Error::Settings("a message that carries no entry"))?;
+        let entries_per_message = payload.checked_div(ENTRY_FIXED_BYTES).unwrap_or(0);
+        let proposals = payload
+            .checked_div(std::mem::size_of::<Entry>())
+            .unwrap_or(0);
+        let vote_bytes = payload.checked_mul(stated.members).ok_or(Error::Settings(
+            "the bytes of a quorum's votes beyond what is counted",
+        ))?;
+        let within = |least: usize| stated.memory.checked_div(least).unwrap_or(0);
+        Ok(Self {
+            pending_messages: within(proto::MESSAGE_ALLOWANCE),
+            pending_reads: within(std::mem::size_of::<PendingRead>()),
+            unstable_entries: within(std::mem::size_of::<Entry>()),
+            entries_per_message,
+            proposals,
+            proposal_bytes: payload,
+            fast_window: u64::try_from(proposals).unwrap_or(u64::MAX),
+            vote_bytes,
+            readies_in_flight: stated.depth,
+            members: stated.members,
+        })
     }
 }
 
@@ -276,8 +335,9 @@ pub struct Config {
 impl Config {
     /// The member `id` with `raft-rs` 0.7's defaults (its `Config::default`:
     /// an election after twenty ticks, a heartbeat every two, a window of
-    /// 256 messages, no byte bounds) and the bounds of [`Limits::default`].
-    pub fn new(id: NodeId) -> Self {
+    /// 256 messages, no byte bounds) and the bounds its owner's statement
+    /// gives ([`Limits::derive`]).
+    pub fn new(id: NodeId, limits: Limits) -> Self {
         Self {
             id,
             election_tick: 20,
@@ -301,7 +361,7 @@ impl Config {
             elections: Elections::Ticks,
             lost: None,
             seed: id,
-            limits: Limits::default(),
+            limits,
         }
     }
     /// Whether the settings describe a member that can run: an identity, an
@@ -346,6 +406,7 @@ impl Config {
             || self.limits.fast_window == 0
             || self.limits.vote_bytes == 0
             || self.limits.readies_in_flight == 0
+            || self.limits.members == 0
         {
             return Err(Error::Settings("a bound that admits nothing"));
         }
@@ -1073,6 +1134,7 @@ impl<S: Storage> Raft<S> {
             log.last_index()?,
             config.max_inflight_msgs,
             config.max_inflight_bytes,
+            config.limits.members,
         )?;
         tracker.set_page(config.max_size_per_msg);
         let mut raft = Self {
@@ -1097,6 +1159,7 @@ impl<S: Storage> Raft<S> {
             votes: Votes::new(
                 usize::try_from(config.limits.fast_window).unwrap_or(usize::MAX),
                 config.limits.vote_bytes,
+                config.limits.members,
             ),
             decided: Decided::default(),
             displaced: Vec::new(),
@@ -1114,7 +1177,7 @@ impl<S: Storage> Raft<S> {
             told_to_campaign: false,
             log,
             tracker,
-            read_only: ReadOnly::new(config.limits.pending_reads),
+            read_only: ReadOnly::new(config.limits.pending_reads, config.limits.members),
             read_states: Vec::new(),
             msgs: Outgoing::default(),
             uncommitted_bytes: 0,
@@ -1934,8 +1997,9 @@ impl<S: Storage> Raft<S> {
     /// given up. A member never suspects itself.
     pub fn suspect(&mut self, member: NodeId) -> Result<()> {
         let (id, leader, state) = (self.id, self.leader_id, self.state);
+        let members = self.config.limits.members;
         let watch = self.watch_mut()?;
-        if member == id || !watch.suspect(member)? {
+        if member == id || !watch.suspect(member, members)? {
             return Ok(());
         }
         if state != StateRole::Leader {
@@ -2375,6 +2439,7 @@ impl<S: Storage> Raft<S> {
             Votes::new(
                 usize::try_from(self.config.limits.fast_window).unwrap_or(usize::MAX),
                 self.config.limits.vote_bytes,
+                self.config.limits.members,
             ),
         );
         self.reset(term)?;
@@ -2838,10 +2903,17 @@ impl<S: Storage> Raft<S> {
             };
             let joint = self.tracker.configuration().is_joint();
             let leaves = plan.stated == 0;
-            if pending > self.log.applied() || joint != leaves {
-                // One change at a time, and out of a joint configuration
-                // before into another: the entry keeps its place and
-                // states nothing.
+            // A change past the members a configuration of the group names
+            // would stop every member it reached.
+            let past = plan
+                .apply(self.tracker.configuration())
+                .is_ok_and(|changed| {
+                    changed.configuration.members().count() > self.config.limits.members
+                });
+            if pending > self.log.applied() || joint != leaves || past {
+                // One change at a time, out of a joint configuration before
+                // into another, and within the group's members: the entry
+                // keeps its place and states nothing.
                 *entry = Entry::default();
             } else {
                 pending = index;
@@ -3639,6 +3711,7 @@ impl<S: Storage> Raft<S> {
             last,
             self.config.max_inflight_msgs,
             self.config.max_inflight_bytes,
+            self.config.limits.members,
         )?;
         self.tracker.set_page(self.config.max_size_per_msg);
         self.post_conf_change()?;

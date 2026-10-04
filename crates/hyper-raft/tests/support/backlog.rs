@@ -27,7 +27,7 @@ impl Backlog {
             check_quorum: true,
             pre_vote: true,
             max_size_per_msg: 1 << 20,
-            ..Config::new(1)
+            ..Config::new(1, super::limits(voters as usize, 1))
         };
         let leader = RawNode::new(&config, Store::new(boot)).unwrap();
         let mut backlog = Self { leader };

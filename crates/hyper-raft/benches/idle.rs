@@ -55,7 +55,7 @@ fn voters() -> ConfState {
 
 impl Group {
     fn open(settings: &Settings, seed: u64) -> Self {
-        let open = |id: u64| New::open(id, Store::new(voters()), settings, seed * 3 + id);
+        let open = |id: u64| New::open(id, Store::new(voters()), settings, seed * 3 + id, 3);
         Self {
             members: [open(1), open(2), open(3)],
         }

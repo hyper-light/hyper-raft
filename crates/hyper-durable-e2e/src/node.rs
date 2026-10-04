@@ -52,7 +52,7 @@ use hyper_durable::{
 use hyper_log::{Config as LogConfig, Log, Waits};
 use hyper_raft::proto::{ConfChangeSingle, ConfChangeTransition, ConfChangeV2, ConfState, Message};
 use hyper_raft::wire::Record;
-use hyper_raft::{Config, StateRole};
+use hyper_raft::{Config, Limits, StateRole, Stated};
 use hyper_raft_e2e::run::RunError;
 use hyper_raft_e2e::stream;
 use hyper_raft_e2e::wire::{self, Command, Control, Kind, Op, Outcome, Status};
@@ -264,15 +264,25 @@ impl Node {
         let datagram = wire::largest(&socket)?;
         let stamped =
             Stamped::new(&socket).map_err(|error| NodeError::Io(io::Error::other(error)))?;
-        let max_size_per_msg =
-            u64::try_from(datagram.saturating_sub(MESSAGE_ROOM)).unwrap_or(u64::MAX);
+        let room = datagram.saturating_sub(MESSAGE_ROOM);
+        let max_size_per_msg = u64::try_from(room).unwrap_or(u64::MAX);
+        // What the member states: a message is its fixed record and entries to its datagram's
+        // room; the group's voters are every member it has; its queues hold no more than its
+        // group's log retains ([`log_config`]).
+        let limits = Limits::derive(Stated {
+            message: room.saturating_add(hyper_raft::wire::MESSAGE_RECORD_FIXED_BYTES),
+            members: settings.voters.len(),
+            memory: usize::try_from(log_config().group_bytes).unwrap_or(usize::MAX),
+            depth: 1,
+        })
+        .map_err(|e| NodeError::Open(hyper_durable::OpenError::Core(e)))?;
         let shell = Shell {
             core: Config {
                 max_size_per_msg,
                 check_quorum: true,
                 pre_vote: true,
                 seed: settings.id,
-                ..Config::new(settings.id)
+                ..Config::new(settings.id, limits)
             },
             // An owner woken by events has no period: the commit is written alone at the first
             // moment no write is out, the soonest a member that stops can reopen with what it
@@ -295,7 +305,7 @@ impl Node {
         let liveness = Liveness::new(LiveSettings {
             local: settings.id,
             run,
-            max_peers: hyper_raft::MAX_MEMBERS,
+            max_peers: settings.voters.len(),
             history: Exposure::new(),
         })
         .map_err(NodeError::Liveness)?;
@@ -860,7 +870,7 @@ impl Node {
             hyper_raft_e2e::parent::hold_until_released();
             return Ok(());
         }
-        let Some((id, control)) = wire::read_control(body, hyper_raft::MAX_MEMBERS) else {
+        let Some((id, control)) = wire::read_control(body, self.settings.voters.len()) else {
             return Ok(());
         };
         match control {

@@ -545,18 +545,22 @@ pub struct Tracker {
     /// The bytes a member's window admits until its owner says what the
     /// path to it carries.
     window_bytes: u64,
+    /// The most members a configuration in force names ([`crate::Limits::members`]).
+    members: usize,
     /// What a whole append costs ([`whole_append`]).
     page: u64,
     scratch: Vec<u64>,
 }
 impl Tracker {
     /// Every member of `configuration`, probed from `next_index` with a
-    /// window of `window` messages and `window_bytes` bytes; no votes.
+    /// window of `window` messages and `window_bytes` bytes, of at most
+    /// `members` members; no votes.
     pub fn new(
         configuration: Configuration,
         next_index: u64,
         window: usize,
         window_bytes: u64,
+        members: usize,
     ) -> Result<Self> {
         let mut tracker = Self {
             progress: Vec::new(),
@@ -564,6 +568,7 @@ impl Tracker {
             votes: Vec::new(),
             window,
             window_bytes,
+            members,
             page: u64::MAX,
             scratch: Vec::new(),
         };
@@ -737,13 +742,21 @@ impl Tracker {
     }
     /// Puts `configuration` in force: one that is a member now and was
     /// none, or is one of `renewed`, begins at `next_index`, and one that
-    /// is none any more is forgotten.
+    /// is none any more is forgotten. A configuration past the members the
+    /// member was opened for stops it: its group's other members, opened
+    /// alike, hold it, and going on without it would leave this one in
+    /// another configuration.
     pub fn apply(
         &mut self,
         configuration: Configuration,
         renewed: &[NodeId],
         next_index: u64,
     ) -> Result<()> {
+        if configuration.members().count() > self.members {
+            return Err(Error::Invariant(
+                "a configuration of more members than the member was opened for",
+            ));
+        }
         let mut progress = Vec::new();
         progress
             .try_reserve_exact(configuration.members().count())
@@ -1034,14 +1047,34 @@ mod tests {
         progress.become_probe();
         assert_eq!(progress.next_index, 13);
     }
+    /// The most members a configuration of these tests names.
+    const MEMBERS: usize = 6;
     fn tracker(voters: &[u64], learners: &[u64]) -> Tracker {
         Tracker::new(
             Configuration::new(voters.to_vec(), learners.to_vec()).unwrap(),
             1,
             8,
             u64::MAX,
+            MEMBERS,
         )
         .unwrap()
+    }
+    /// A configuration past the members the member was opened for stops it, opening as
+    /// changing (`Limits::members`): its group's other members hold it, and going on without
+    /// it would leave this one in another configuration.
+    #[test]
+    fn a_configuration_past_the_members_a_member_was_opened_for_stops_it() {
+        let three = || Configuration::new(vec![1, 2, 3], vec![]).unwrap();
+        assert!(matches!(
+            Tracker::new(three(), 1, 8, u64::MAX, 2),
+            Err(Error::Invariant(_))
+        ));
+        let mut members = Tracker::new(three(), 1, 8, u64::MAX, 3).unwrap();
+        let four = Configuration::new(vec![1, 2, 3], vec![4]).unwrap();
+        let refused = members.apply(four, &[], 1);
+        assert!(matches!(refused, Err(Error::Invariant(_))));
+        assert!(refused.unwrap_err().is_fatal());
+        assert_eq!(members.len(), 3, "nothing changed");
     }
     #[test]
     fn the_quorum_holds_what_a_majority_of_both_halves_holds() {

@@ -142,6 +142,9 @@ pub enum Member<R> {
 
 pub struct Cluster<R> {
     members: Vec<Member<R>>,
+    /// The members the group has, in and out of its configuration: what each states as the
+    /// most a configuration names.
+    size: usize,
     pub net: Vec<Message>,
     pub blocked: Vec<(u64, u64)>,
     pub settings: Settings,
@@ -198,6 +201,7 @@ impl<R: Replica> Cluster<R> {
         };
         let mut cluster = Self {
             members: Vec::new(),
+            size: count as usize,
             net: Vec::new(),
             blocked: Vec::new(),
             settings,
@@ -236,6 +240,7 @@ impl<R: Replica> Cluster<R> {
             self.seed
                 .wrapping_mul(1_000_003)
                 .wrapping_add(id * 7919 + self.opened),
+            self.size,
         )
     }
     pub fn node(&mut self, id: u64) -> Option<&mut R> {

@@ -309,6 +309,7 @@ pub fn run(scenario: &Scenario) -> Outcome {
                 Store::new(boot.clone()),
                 &scenario.settings,
                 scenario.seed.wrapping_mul(1_000_003).wrapping_add(id),
+                count,
             );
             node.raw.set_timing(timing).unwrap();
             node.raw.hold_campaigns(id != leader).unwrap();

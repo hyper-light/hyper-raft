@@ -5971,3 +5971,47 @@ A configuration on the honest history costs about 1,600 instructions and one all
 the memo's table doubling and the order's growth. A refused history costs three times as much a
 configuration, for every configuration is reached and then searched again on whole keys, whose
 `BTreeSet` keys allocate.
+
+# hyper-multilog
+
+`docs/multilog.md` §11 steps 4 and 5. The machine is the one in "The machine and the runs" above (Apple
+M5 Max, 18 cores, 128 GiB, macOS 26.4.1), shared with other sessions' builds and gates throughout.
+
+## The multilog explorer
+
+slates' explorer retargeted (`crates/hyper-multilog/tests/multilog.rs`, `docs/multilog.md` §11
+step 4) on hyper-sim's free discipline: any delivery order, messages dropped and duplicated, the
+network's capacity, partitions, crashes restarting from the last image, images and every log
+compacted at canonical cuts, snapshots installed by laggards. Raft's invariants per log and the
+merge's history across members and restarts are checked after every step; the first seed of each
+shape runs through `twice`. Three voters with three logs and five with two, 3,000 steps a seed.
+
+| Path | 3 × 3, 16 seeds | 5 × 2, 16 seeds | 3 × 3, 200 seeds | 5 × 2, 200 seeds | Floor |
+|---|---|---|---|---|---|
+| elections won | 531 | 255 | 6,665 | 3,167 | common |
+| keyed commands applied | 5,918 | 7,687 | 72,649 | 95,938 | common |
+| global commands applied | 824 | 1,046 | 8,751 | 14,892 | common |
+| barriers proposed | 439 | 272 | 5,449 | 3,658 | common |
+| members crashed and restarted | 751 | 735 | 9,343 | 9,177 | common |
+| restarted members' replays matched | 6,170 | 8,079 | 73,771 | 103,325 | common |
+| messages dropped | 4,175 | 5,096 | 55,400 | 62,515 | common |
+| messages duplicated | 527 | 612 | 6,633 | 7,801 | common |
+| proposals refused | 578 | 443 | 6,793 | 5,666 | common |
+| images taken and every log compacted | 240 | 391 | 3,088 | 4,514 | common |
+| images installed from a log's snapshot | 13 | 17 | 198 | 221 | rare |
+| messages past the network's capacity | 0 | 0 | 0 | 483 | not claimed |
+
+A floor is `docs/sim.md` §4.4's: a common path more than once a seed (above 16 and above 200), a
+rare one at least once a campaign. Every path but installs ran more than once a seed at both scales
+and both shapes; installs ran 0.8 to 1.1 times a seed, so they are held to the rare floor. The
+network's capacity was reached only at full scale with five voters, so it is counted and not
+claimed. A member that applies past a barrier without waiting is caught at seed 0, step 273
+(`a_member_that_does_not_wait_at_barriers_is_caught`).
+
+The full-scale run: release, 2026-10-04 10:29 PDT, 4.51 s, load average 2.25 at its start and 2.60
+at its end; the 16-seed run is the workspace's debug run, the same minute (load 2.55–2.83).
+
+```sh
+cargo test -p hyper-multilog --test multilog
+cargo test --release -p hyper-multilog --test multilog -- --ignored the_multi_log_merges_alike_at_full_scale --nocapture
+```

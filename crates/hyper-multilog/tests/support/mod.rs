@@ -386,6 +386,8 @@ pub struct Member {
     pub auto_barriers: bool,
     /// Whether its logs elect by suspicion rather than on ticks.
     pub suspicion: bool,
+    /// Whether [`Member::settle`] leaves the merge to the test.
+    pub hold_apply: bool,
 }
 
 impl Member {
@@ -429,6 +431,7 @@ impl Member {
             image_at_next_global: false,
             auto_barriers: true,
             suspicion,
+            hold_apply: false,
         }
     }
 
@@ -607,7 +610,9 @@ impl Member {
         for log in 0..self.logs {
             self.drive(log, out);
         }
-        self.apply();
+        if !self.hold_apply {
+            self.apply();
+        }
         if self.auto_barriers {
             self.barriers();
         }

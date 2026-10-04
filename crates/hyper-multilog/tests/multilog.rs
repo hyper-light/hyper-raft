@@ -452,8 +452,10 @@ const PROPOSALS_BOUND: u64 = 96;
 const KEYS: u64 = 12;
 /// Shape: one command in this many is global (slates').
 const GLOBAL_EVERY: u64 = 6;
-/// Shape: the actions one step chooses among (slates').
-const ACTIONS: u64 = 100;
+/// Shape: the actions one step chooses among: slates' hundred, and four more, in which a member
+/// drawn takes an image at the next global command it applies and compacts every log to it
+/// (`docs/multilog.md` §5), so that restarts start from images and laggards are sent snapshots.
+const ACTIONS: u64 = 104;
 /// Shape: the world steps one action may take: a network tick delivers a message for each member,
 /// a drop or a duplicate one.
 const WORLD_STEPS_PER_ACTION: u64 = 5;
@@ -486,6 +488,10 @@ pub struct Counters {
     pub overflowed: u64,
     /// Proposals refused: no log's member could take them (no leader known, a transfer, a bound).
     pub proposals_refused: u64,
+    /// Images taken at a canonical cut, every log compacted to them.
+    pub images_taken: u64,
+    /// Images installed from a log's snapshot, ahead of the member's state.
+    pub images_installed: u64,
 }
 
 impl Counters {
@@ -500,6 +506,8 @@ impl Counters {
         self.duplicated += other.duplicated;
         self.overflowed += other.overflowed;
         self.proposals_refused += other.proposals_refused;
+        self.images_taken += other.images_taken;
+        self.images_installed += other.images_installed;
     }
 }
 
@@ -522,6 +530,12 @@ struct Cluster {
     counters: Counters,
     /// Counts the members had folded in before their last restart.
     folded: Vec<support::Counts>,
+    /// For each member, how far into each key's history it has been checked since its restart:
+    /// what it applies again below the reference's length is a replay, matched.
+    checked: Vec<BTreeMap<Option<u64>, usize>>,
+    /// The planted defect, where a test plants it: member 1's application is a merge that passes
+    /// barriers as nothing, with what it applied.
+    mutant: Option<(Merge, support::App)>,
 }
 
 /// The world's streams the explorer draws from, one a source.
@@ -583,6 +597,8 @@ impl Cluster {
             proposals: 0,
             counters: Counters::default(),
             folded: vec![support::Counts::default(); voters as usize],
+            checked: vec![BTreeMap::new(); voters as usize],
+            mutant: None,
         }
     }
 
@@ -771,9 +787,22 @@ impl Cluster {
         folded.globals_applied += counts.globals_applied;
         folded.barriers_proposed += counts.barriers_proposed;
         folded.refused += counts.refused;
+        folded.images += counts.images;
+        folded.installed += counts.installed;
         member.restart();
         member.counts = support::Counts::default();
         self.counters.crashes += 1;
+        self.checked[at as usize - 1] = member
+            .app
+            .keys
+            .iter()
+            .map(|(key, history)| (*key, history.len()))
+            .collect();
+        if at == 1
+            && let Some(mutant) = self.mutant.as_mut()
+        {
+            *mutant = (Merge::new(member.logs).unwrap(), support::App::default());
+        }
         self.settle(at);
     }
 
@@ -853,6 +882,12 @@ impl Cluster {
                 };
                 self.isolate(at);
             }
+            100..=103 => {
+                let at = self.pick_member();
+                if self.mutant.is_none() {
+                    self.members[at as usize - 1].image_at_next_global = true;
+                }
+            }
             _ => {
                 let at = self.pick_member();
                 self.barriers(at);
@@ -911,22 +946,39 @@ impl Cluster {
             "{at}: member {id} refused an entry"
         );
         let restarted = self.counters.crashes > 0;
-        for (key, history) in &member.app.keys {
+        let keys = match (&mut self.mutant, id) {
+            (Some((merge, app)), 1) => {
+                merge
+                    .advance(&Unbarriered(member), u64::MAX, &mut |applied| {
+                        if let Applied::Command(command) = applied {
+                            app.apply(&command);
+                        }
+                        Flow::Continue
+                    })
+                    .unwrap();
+                app.keys.clone()
+            }
+            _ => member.app.keys.clone(),
+        };
+        let checked = &mut self.checked[id as usize - 1];
+        for (key, history) in &keys {
             let reference = self.reference.entry(*key).or_default();
-            for (position, applied) in history.iter().enumerate() {
+            let from = checked.get(key).copied().unwrap_or(0).min(history.len());
+            for (position, applied) in history.iter().enumerate().skip(from) {
                 match reference.get(position) {
                     Some(seen) => {
                         assert_eq!(
                             seen, applied,
                             "{at}: member {id} applied a different command or epoch for key {key:?} at its {position}th"
                         );
+                        if restarted {
+                            self.counters.replays_matched += 1;
+                        }
                     }
                     None => reference.push(applied.clone()),
                 }
             }
-            if restarted && history.len() < reference.len() {
-                self.counters.replays_matched += 1;
-            }
+            checked.insert(*key, history.len());
         }
     }
 
@@ -938,6 +990,8 @@ impl Cluster {
             counters.globals_applied += member.counts.globals_applied + folded.globals_applied;
             counters.barriers_proposed +=
                 member.counts.barriers_proposed + folded.barriers_proposed;
+            counters.images_taken += member.counts.images + folded.images;
+            counters.images_installed += member.counts.installed + folded.installed;
         }
         counters.overflowed = self.net.stats().dropped_capacity;
         counters
@@ -976,29 +1030,79 @@ fn explore(voters: u64, logs: usize, seeds: u64) -> Counters {
     total
 }
 
-/// Explores three voters with three logs and five with two, and holds every non-vacuity floor:
-/// each path reached more than once a seed, slates' floor.
+/// How often a run must reach a path (`docs/sim.md` §4.4): a common path more than once a seed,
+/// a rare one at least once a campaign. Which paths are common was read off the counts measured
+/// at both scales (`docs/benchmarks.md`, "The multilog explorer").
+#[derive(Clone, Copy, Debug)]
+enum Floor {
+    Common,
+    Rare,
+}
+
+/// Every named path the explorer claims, with its floor.
+fn coverage(counted: &Counters) -> [(&'static str, u64, Floor); 11] {
+    [
+        ("elections won", counted.elections_won, Floor::Common),
+        (
+            "keyed commands applied",
+            counted.keyed_applied,
+            Floor::Common,
+        ),
+        (
+            "global commands applied",
+            counted.globals_applied,
+            Floor::Common,
+        ),
+        (
+            "barriers proposed",
+            counted.barriers_proposed,
+            Floor::Common,
+        ),
+        (
+            "members crashed and restarted",
+            counted.crashes,
+            Floor::Common,
+        ),
+        (
+            "restarted members' replays matched",
+            counted.replays_matched,
+            Floor::Common,
+        ),
+        ("messages dropped", counted.dropped, Floor::Common),
+        ("messages duplicated", counted.duplicated, Floor::Common),
+        (
+            "proposals refused",
+            counted.proposals_refused,
+            Floor::Common,
+        ),
+        (
+            "images taken and every log compacted",
+            counted.images_taken,
+            Floor::Common,
+        ),
+        (
+            "images installed from a log's snapshot",
+            counted.images_installed,
+            Floor::Rare,
+        ),
+    ]
+}
+
+/// Explores three voters with three logs and five with two, and holds every floor.
 fn explore_and_check_coverage(seeds: u64) {
     for (voters, logs) in [(3, 3), (5, 2)] {
         let counted = explore(voters, logs, seeds);
         eprintln!(
             "explored {voters} voters x {logs} logs x {seeds} seeds x {STEPS} steps: {counted:?}"
         );
-        let floors = [
-            (counted.elections_won, "elections were won"),
-            (counted.keyed_applied, "keyed commands were applied"),
-            (counted.globals_applied, "global commands were applied"),
-            (counted.barriers_proposed, "barriers were proposed"),
-            (counted.crashes, "members crashed and restarted"),
-            (
-                counted.replays_matched,
-                "restarted members replayed their application",
-            ),
-        ];
-        for (count, path) in floors {
+        for (path, count, floor) in coverage(&counted) {
+            let least = match floor {
+                Floor::Common => seeds + 1,
+                Floor::Rare => 1,
+            };
             assert!(
-                count > seeds,
-                "{voters} voters, {logs} logs: {path} ({count} over {seeds} seeds)"
+                count >= least,
+                "{voters} voters, {logs} logs: {path}: {count} over {seeds} seeds, below its floor {least}"
             );
         }
     }
@@ -1018,4 +1122,62 @@ fn the_multi_log_merges_alike_under_an_adversarial_network() {
 #[ignore = "full scale: run in release"]
 fn the_multi_log_merges_alike_at_full_scale() {
     explore_and_check_coverage(SEEDS_FULL);
+}
+
+/// Member 1's logs as the planted defect reads them: every barrier passed as nothing, so its merge
+/// applies what follows a barrier without waiting for the global it names.
+struct Unbarriered<'a>(&'a Member);
+
+impl Logs for Unbarriered<'_> {
+    fn count(&self) -> usize {
+        self.0.logs
+    }
+    fn through(&self, log: usize) -> u64 {
+        self.0.multi.node(log).unwrap().given_to_apply()
+    }
+    fn walk(
+        &self,
+        log: usize,
+        from: u64,
+        through: u64,
+        visit: &mut dyn FnMut(&Entry) -> bool,
+    ) -> Result<(), StorageError> {
+        let store = self.0.multi.node(log).unwrap().store();
+        hyper_raft::Storage::any_entry(store, from, through + 1, &mut |entry| {
+            if matches!(entry::read(entry), entry::Stated::Barrier(_)) {
+                visit(&Entry {
+                    index: entry.index,
+                    term: entry.term,
+                    ..Entry::default()
+                })
+            } else {
+                visit(entry)
+            }
+        })
+        .map(|_| ())
+    }
+}
+
+/// The planted defect (`docs/sim.md` §4.6; slates' mutation): a member whose merge does not wait
+/// at barriers. The explorer's history check catches it within the workspace's seeds.
+#[test]
+fn a_member_that_does_not_wait_at_barriers_is_caught() {
+    let caught = std::panic::catch_unwind(|| {
+        for seed in 0..SEEDS_QUICK {
+            let mut cluster = Cluster::new(Source::Seed(seed), 3, 3);
+            cluster.mutant = Some((Merge::new(3).unwrap(), support::App::default()));
+            for step in 0..STEPS {
+                let calm = (step / STRETCH) % 2 == 1;
+                cluster.step(calm);
+                cluster.check(&format!("seed {seed} step {step}"));
+            }
+        }
+    });
+    let message = caught.expect_err("the planted defect went uncaught");
+    let said = message
+        .downcast_ref::<String>()
+        .cloned()
+        .unwrap_or_default();
+    eprintln!("caught: {said}");
+    assert!(said.contains("a different command or epoch"), "{said}");
 }

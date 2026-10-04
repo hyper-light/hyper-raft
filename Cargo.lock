@@ -752,6 +752,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "hyper-multilog"
+version = "0.1.0"
+dependencies = [
+ "crc32c",
+ "hyper-raft",
+ "proptest",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "hyper-quic"
 version = "0.1.0"
 dependencies = [

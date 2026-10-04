@@ -1,0 +1,21 @@
+[package]
+name = "hyper-multilog"
+description = "MLRaft over hyper-raft: one group's log as n Raft logs over the same voters, each electing its own leader, merged into one application order every member reaches alike (docs/multilog.md)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+# The Raft core each log is a member of.
+hyper-raft = { path = "../hyper-raft" }
+# The checksum of a point's encoding, CRC-32C as the core's records carry it (`docs/raft.md` §3.1).
+crc32c.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+
+[lints]
+workspace = true

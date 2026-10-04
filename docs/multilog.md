@@ -299,12 +299,14 @@ image. The image is the base every log's snapshot shares.
 
 ### 5.3 Installing an image
 
-A member a leader sends log `k`'s snapshot holds less of log `k` than the image, which is
-canonical, so by Lemma 4 the image holds the member's whole state: it is always ahead. The member
-persists it as its new base, replaces its state machine with it, and the merge moves to its cut
-(`MultiLog::install`). Its other logs keep their members as they are: each goes on taking its
-entries (and changes) from its leader, the merge reading only from its new position, or is sent a
-later image of its own, which is ahead again.
+A member's log installs a leader's snapshot only past its commit there (the core's rule), so the
+image's cut is past what the member's merge read of that log, unless an image the member installed
+through another log's snapshot already moved its merge there. The image is canonical, so by Lemma 4
+it is then either ahead of the member's whole state or held by it already (`MultiLog::install`
+says which, by log 0's position alone). Ahead, the member persists it as its new base, replaces its
+state machine with it, and the merge moves to its cut. Its other logs keep their members as they
+are: each goes on taking its entries (and changes) from its leader, the merge reading only from its
+new position, or is sent a snapshot of its own, of this image or a later one.
 
 ### 5.4 Configurations at a cut
 
@@ -352,7 +354,8 @@ preferred the voter ranked `k` for log `k`; focal spreads preferred leaders acro
 and returns leadership to them (focal 27 §5). Here:
 - `MultiLog::spread(ranked)`: the owner ranks the voters, best first (by its measured quorum round
   trips, `hyper_timing::quorum_priority`, or by placement); log `k`'s ranking is that list rotated
-  by `k`, and a member's priority in log `k` is how many members it outranks there, so each log
+  by `k`, and a member's priority in log `k` is how many ranked voters it is ahead of or level with
+  there (the preferred voter all `r` of them, the last one; a member not ranked none), so each log
   prefers a different voter and falls back through the same ranking. The core's elections then
   favour it (`Precedence::Log`: a voter of higher priority grants a lower one only a more current
   log).
@@ -460,7 +463,7 @@ Each step is one gated commit (`bash scripts/gates.sh` on its final tree).
 | `n` | the owner's | configuration; at most `u32::MAX` (§6) |
 | `Limits::unmerged` | the owner's | configuration: the retained log it allows between images (§6) |
 | The merge's budget | the owner's, a call | configuration, as the core's `max_committed_size_per_ready` |
-| Spread priorities | `0 ..= voters − 1` | how many members a member outranks in the log's ranking (§7) |
+| Spread priorities | `1 ..= r` for the `r` voters ranked, `0` for one not ranked | how many ranked voters a member is ahead of or level with in the log's rotation of the ranking (§7) |
 | A point's encoding | version 1, CRC-32C | the core's record format's conventions (`docs/raft.md` §3.1; RFC 3720 §B.4) |
 
 The tests' shapes (seeds, steps, stretches, bags, keys, rates, regions) are slates', each stated

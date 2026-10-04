@@ -35,6 +35,9 @@ UNSAFE_ALLOWED = {
         "std::task::RawWaker over a leaked slot (counting wakers; tests and benchmarks only)",
     "crates/hyper-block/src/node/macos.rs":
         "the disk ioctls of <sys/disk.h> (a device node's capacity and cache flush)",
+    "crates/hyper-raft-e2e/src/fault_windows.rs":
+        "AddVectoredExceptionHandler and the EXCEPTION_POINTERS it is called with (an E2E "
+        "member's account of a fatal fault; test harness only)",
     "crates/hyper-block/src/node/windows.rs":
         "IOCTL_DISK_GET_LENGTH_INFO (a device's capacity) and GetFileInformationByHandleEx's "
         "FileStorageInfo (the sector sizes of a file's volume)",

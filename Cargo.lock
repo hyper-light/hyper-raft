@@ -793,6 +793,7 @@ dependencies = [
  "hyper-raft",
  "hyper-timing",
  "hyper-tokio",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

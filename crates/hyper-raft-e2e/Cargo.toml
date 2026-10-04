@@ -21,6 +21,10 @@ hyper-tokio = { path = "../hyper-tokio" }
 hyper-timing = { path = "../hyper-timing" }
 # The codec of raft-rs's wire and log types, which hyper-raft speaks (prost).
 
+# The fault report's vectored exception handler (`fault`).
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true
+
 [[bin]]
 name = "hyper-raft-node"
 path = "src/main.rs"

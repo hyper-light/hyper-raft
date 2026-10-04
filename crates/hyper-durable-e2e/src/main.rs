@@ -116,6 +116,7 @@ fn serve(arguments: Arguments) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn main() -> ExitCode {
+    hyper_raft_e2e::fault::report_faults();
     let arguments: Vec<String> = std::env::args().collect();
     let outcome = parse(&arguments)
         .map_err(Box::<dyn std::error::Error>::from)

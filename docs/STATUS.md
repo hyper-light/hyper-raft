@@ -73,7 +73,12 @@ worked around.
   the cause is in `unsafe` code or what it calls. The suspects are the Windows interfaces on the
   members' path: the receive stamps (`WSARecvMsg` and its control messages, `dc42e0e`) and hyper-block's
   `threads` and `node` modules. The same scenario passed on the same target in run 37181616582 an
-  hour before. Open: which call, and the invariant it breaks.
+  hour before. A reading of the Windows code on the path found nothing unsound: the receive stamps
+  and the datagram socket, the performance counter, the toolhelp walk, the leaked-slot waker and the
+  aligned buffers; aws-lc's C remains. So each E2E member now writes the account of a fatal fault
+  before Windows ends it (hyper-raft-e2e's `fault`): the code, the faulting instruction, the access
+  and the address touched, then a backtrace, on the standard error the tests inherit. Open: which
+  call, and the invariant it breaks, from the next sighting's account.
 
 ## Consumers
 

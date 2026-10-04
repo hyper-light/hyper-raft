@@ -209,11 +209,16 @@ mod os {
         // SAFETY: the call returned 0, so it filled `info`; and a zeroed `rusage_info_v6` is a
         // valid one in any case, all its fields being integers.
         let info = unsafe { info.assume_init() };
+        // A process that has run in user mode has retired instructions and spent cycles, so a
+        // zero count beside user time is a counter the kernel does not keep: a virtual machine
+        // whose guest is given no performance counters (GitHub's macOS runners) reports zeros,
+        // not the work. Such a count is absent, not zero.
+        let counted = |count: u64| (count != 0 || info.ri_user_time == 0).then_some(count);
         Ok(Usage {
             user_ns: nanos(info.ri_user_time, &base)?,
             system_ns: nanos(info.ri_system_time, &base)?,
-            instructions: Some(info.ri_instructions),
-            cycles: Some(info.ri_cycles),
+            instructions: counted(info.ri_instructions),
+            cycles: counted(info.ri_cycles),
             footprint: Some(info.ri_phys_footprint),
             peak: Some(info.ri_lifetime_max_phys_footprint),
         })
@@ -360,8 +365,17 @@ mod tests {
         let spent = after.since(&before);
         assert!(spent.cpu_ns() > 0, "{spent:?}");
         if cfg!(target_vendor = "apple") {
-            assert!(spent.instructions.unwrap() >= 20_000_000, "{spent:?}");
-            assert!(spent.cycles.unwrap() > 0, "{spent:?}");
+            // Where the kernel keeps the counters it charges the work to them; where it keeps
+            // none (a virtual machine) both are absent, never zero.
+            assert_eq!(
+                after.instructions.is_some(),
+                after.cycles.is_some(),
+                "{after:?}"
+            );
+            if let (Some(instructions), Some(cycles)) = (spent.instructions, spent.cycles) {
+                assert!(instructions >= 20_000_000, "{spent:?}");
+                assert!(cycles > 0, "{spent:?}");
+            }
             assert!(after.peak.unwrap() >= after.footprint.unwrap(), "{after:?}");
         }
     }

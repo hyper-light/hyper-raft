@@ -753,6 +753,16 @@ among them) and the step benchmark (`benches/step.rs`). What §9 assigns S-1, an
   without a choice, which is most steps. A tie goes to the strategy, events in scheduling order and
   then timers in node order. **Free**: every pending event and every armed timer is a candidate, and
   the clock moves to `max(now, at)`, never backward.
+- **A tie costs its size at each of its steps.** The ordered discipline gathers a tie anew at every
+  step: it takes the `k` events at the earliest time from the heap, the strategy picks one, and the
+  other `k − 1` go back. A tie of `k` costs `O(k² log n)` to drain. Measured (2026-10-04),
+  `tests/net.rs`' order-keeping path ties its arrivals at a few instants. That took 0.26 s natively
+  and more than 35 minutes under Miri, past the job's budget; the test now runs a twentieth of its
+  messages there.
+
+  Owed with S-3: its write queue's completions tie at each flush's instant. So the tie is kept
+  between steps, and an event scheduled at the tie's time joins it, which drains a tie in
+  `O(k log n)` and asks the strategy the same questions.
 - A `Strategy` is asked only when two or more candidates are enabled, and it draws through `Draw`,
   from the world's `schedule` stream, into the trace. `Random` and `Fifo` are built. `Fifo` is
   earliest due, events first, then send order, with no draw: focal's network order, for directed

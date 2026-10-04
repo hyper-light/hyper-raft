@@ -179,3 +179,19 @@ etcd bounds what it hands out and has not seen applied by bytes (`maxApplyingEnt
 in one drive gave it 16 entries, 3,436 bytes, against a page of 512. Now every drive stays within
 the page, or applies one larger entry alone.
 
+## A write made again never starts the log past the state machine (2026-10-03)
+
+A write refused for room is made again as one write of everything the core holds not yet durable
+(`make_again`, `docs/durable.md` §2.4). The core may have taken a leader's snapshot while the
+refused write was out: the store's depth held its `Ready` back, so no `Ready` gave the snapshot
+and the state machine never installed it. Made again with it, the write moved the log's start to
+the snapshot's point with the state machine behind it, against I8 (the log never starts past what
+the state machine holds, mantle's rule), and a member stopped then would not open
+(`a_log_that_starts_past_the_state_machine_does_not_open`). The write made again now leaves out a
+snapshot no `Ready` gave (`Unstable::unissued_snapshot`) and the entries after it, and states no
+commit past what earlier writes hold; the snapshot's own `Ready` installs it and writes it, as
+every other install. Found by the simulation at 1,000 seeds a shape on R-3's core (seed 600 of five
+voters at depth one, `tests/sim.rs`), where the core's out-of-order acknowledgement (R17) changed
+the schedules; `main`'s shell has it, and its 1,000 seeds did not reach it. Test:
+`a_write_made_again_never_starts_the_log_past_the_state_machine` (`tests/shell.rs`), which fails
+before the change: the log started at 8 with the state machine at 0.

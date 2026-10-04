@@ -171,6 +171,10 @@ its owner's word (`Replica::resume`); made again before, the writes would only b
 refusal a drive. They are made again as one write of everything the core holds not yet durable,
 the fast track's proposals among it (`RawNode::issued_proposals`: the core keeps those of every
 write issued until its notice), whose notice is the last refused `Ready`'s: a member that cannot persist takes no part (mantle, audit S04). A
+snapshot the core took meanwhile, which no `Ready` gave, is not in it, nor the entries after it: the
+state machine has not installed it, and the log would start past the state machine (I8); its own
+`Ready` installs it and writes it, and the write made again states no commit past what earlier
+writes hold. A
 snapshot report that arrives meanwhile is kept, the latest per member, since replication to that
 member pauses until its fate is known (a mantle simulation seed found a lost report pausing it for
 good).
@@ -965,7 +969,12 @@ Tests (`crates/hyper-durable/tests`):
   within a drive, and what it released has left. Soaked at 1,000 seeds a shape; three shell
   defects were found and fixed so (a commit-only write naming entries not yet written; a
   compaction behind a snapshot's start still out; a refused write made again before room was
-  freed, a refusal a drive), and one in the harness's own model of hyper-log's refusals.
+  freed, a refusal a drive), and one in the harness's own model of hyper-log's refusals. At 1,000
+  seeds a shape on R-3's core, one more (seed 600 of five voters at depth one): a refused write
+  made again with a snapshot the core took while it was out, which no `Ready` had given, started
+  the log past the state machine (I8), so that a member stopped there would not open; fixed in
+  `make_again`, test `a_write_made_again_never_starts_the_log_past_the_state_machine`. It is in
+  `main`'s shell; R-3's out-of-order acknowledgement (R17) changed the schedules that reach it.
 - `directed.rs`: mantle's four cases and focal's two, on hyper-log over simulated devices with the
   power cut at each write and flush in turn, both ways of taking readies. The founder campaigns on
   its owner's word; the members are given their timing once it leads, as no span is chosen before

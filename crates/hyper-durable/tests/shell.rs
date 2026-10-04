@@ -26,7 +26,7 @@ use hyper_durable::{
 use hyper_raft::StorageError;
 use hyper_raft::proto::{
     ConfChangeSingle, ConfChangeTransition, ConfChangeType, ConfChangeV2, ConfState, Entry,
-    EntryType, HardState, Message, MessageType,
+    EntryType, HardState, Message, MessageType, Snapshot, SnapshotMetadata,
 };
 use support::cluster::settings;
 use support::{Kv, SimStore};
@@ -1477,4 +1477,87 @@ fn a_drive_applies_one_page_and_the_next_drive_the_next() {
         r.machine().now.entries.last().unwrap().2.len(),
         3 * page as usize
     );
+}
+
+/// A write refused for room is made again from what the core holds, but never with a snapshot no
+/// `Ready` gave: the state machine has not installed it, and the log would start past it (I8), so
+/// that a member stopped before that `Ready` would not open. A member whose append was out when
+/// its log refused it, and that took a leader's snapshot meanwhile, makes again only its hard
+/// state; the snapshot's own `Ready` installs it, then writes it. Found by the simulation at seed
+/// 600 of five voters at depth one, once R-3's out-of-order acknowledgement (R17) changed its
+/// schedules.
+#[test]
+fn a_write_made_again_never_starts_the_log_past_the_state_machine() {
+    let configuration = voters(&[1, 2, 3]);
+    let mut r: Sim = Replica::open(
+        &settings(2, 7),
+        SimStore::new(1),
+        Kv::new(configuration.clone(), false),
+        Unbounded,
+    )
+    .unwrap();
+    let entries = (1..=3)
+        .map(|index| Entry {
+            index,
+            term: 1,
+            data: vec![7; 8],
+            ..Entry::default()
+        })
+        .collect();
+    r.step(Message {
+        msg_type: MessageType::MsgAppend,
+        from: 1,
+        to: 2,
+        term: 1,
+        entries,
+        ..Message::default()
+    })
+    .unwrap();
+    let mut out = Output::default();
+    r.drive(now(), waker(), &mut out).unwrap();
+    assert_eq!(r.log_mut().pending(), 1, "the append's write is out");
+    // The log will refuse it; meanwhile the leader's image of eight entries arrives.
+    r.log_mut().refuse = Some(Fault::Room("the group's retained bound"));
+    let mut leader = Kv::new(configuration.clone(), false);
+    for index in 1..=8u64 {
+        leader.now.entries.push((index, 1, vec![index as u8; 8]));
+    }
+    leader.now.applied = Point { index: 8, term: 1 };
+    let mut data = Vec::new();
+    leader.image(&mut data).unwrap();
+    r.step(Message {
+        msg_type: MessageType::MsgSnapshot,
+        from: 1,
+        to: 2,
+        term: 1,
+        snapshot: Some(Box::new(Snapshot {
+            data,
+            metadata: Some(SnapshotMetadata {
+                conf_state: Some(configuration),
+                index: 8,
+                term: 1,
+            }),
+        })),
+        ..Message::default()
+    })
+    .unwrap();
+    assert!(r.log_mut().make_durable(), "refused");
+    out.clear();
+    r.drive(now(), waker(), &mut out).unwrap();
+    assert!(r.is_stalled());
+    r.resume();
+    for _ in 0..16 {
+        out.clear();
+        r.drive(now(), waker(), &mut out).unwrap();
+        while r.log_mut().make_durable() {
+            let start = r.log_mut().disk.start.index;
+            let machine = r.machine().durable.applied.index;
+            assert!(
+                start <= machine,
+                "the log starts at {start}, past the state machine's {machine} (I8)"
+            );
+        }
+    }
+    assert_eq!(r.log_mut().disk.start.index, 8, "the snapshot's own write");
+    assert_eq!(r.machine().durable.applied.index, 8);
 }

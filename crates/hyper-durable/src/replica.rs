@@ -1247,18 +1247,38 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
             // needed, and a compaction is the owner's to ask again.
             return Ok(());
         };
+        // A snapshot no `Ready` gave yet is not installed in the state machine: written here,
+        // the log would start past it (I8), and a member stopped before that `Ready` would not
+        // open. Its `Ready` installs it and writes it, and the entries after it, which follow
+        // it in the core; the commit stated meanwhile names only what earlier writes hold.
+        let unissued = self
+            .node
+            .raft
+            .log()
+            .unstable()
+            .unissued_snapshot()
+            .is_some();
+        let stated = self.stated_commit()?;
         let hard = HardState {
-            commit: self.stated_commit()?.max(self.issued.commit),
+            commit: if unissued {
+                self.issued.commit
+            } else {
+                stated.max(self.issued.commit)
+            },
             ..self.issued
         };
         // Copied: the core lends what it holds and the store's write takes the store mutably,
         // both inside the core. A refusal for room is rare, and this its one copy.
         let unstable = self.node.raft.log().unstable();
-        let start = unstable.snapshot().map(|s| Point {
+        let start = unstable.snapshot().filter(|_| !unissued).map(|s| Point {
             index: proto::snapshot_index(s),
             term: proto::snapshot_term(s),
         });
-        let held: Vec<Entry> = unstable.entries().to_vec();
+        let held: Vec<Entry> = if unissued {
+            Vec::new()
+        } else {
+            unstable.entries().to_vec()
+        };
         // The fast track's proposals the refused writes held: the core keeps those of every
         // write issued until its notice, and every write out has been answered, so those it
         // keeps are the refused ones'. Fenced here before, a full log cost a fast group its

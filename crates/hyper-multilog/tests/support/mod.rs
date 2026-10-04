@@ -619,6 +619,10 @@ impl Member {
         for log in 0..self.logs {
             self.drive(log, out);
         }
+        // Each message says whether its sender is cut from the leader of a log below its own.
+        for (log, message) in out.iter_mut() {
+            self.multi.stamp(*log, message);
+        }
     }
 
     pub fn leads(&self, log: usize) -> bool {

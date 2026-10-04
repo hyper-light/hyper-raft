@@ -68,6 +68,12 @@ pub struct MultiLog<S> {
     configurations: Vec<Configurations>,
     /// The voters, best first, as the owner last ranked them ([`MultiLog::spread`]).
     ranked: Vec<NodeId>,
+    /// For each log, whether each member of its configuration last stated, in a message there,
+    /// that it is cut from another log's leader ([`MultiLog::stamp`]).
+    stated: Vec<Vec<(NodeId, bool)>>,
+    /// For each log, the last leader this member's share of it named: a member that suspects its
+    /// leader campaigns and names none until one is elected, and is cut from it all the while.
+    known_leaders: Vec<NodeId>,
     limits: Limits,
 }
 
@@ -126,6 +132,21 @@ fn change_of(entry: &Entry) -> Result<ConfChangeV2> {
     decoded.map_err(|_| Error::Invariant("a committed change does not decode"))
 }
 
+/// The priority a message other than a vote carries from a member cut from another log's leader
+/// ([`MultiLog::stamp`]): a value no owner ranks a voter at.
+pub const CUT: i64 = i64::MIN;
+
+/// Whether a message is a vote or its answer, whose priority the core sets and reads.
+fn is_vote(kind: MessageType) -> bool {
+    matches!(
+        kind,
+        MessageType::MsgRequestVote
+            | MessageType::MsgRequestPreVote
+            | MessageType::MsgRequestVoteResponse
+            | MessageType::MsgRequestPreVoteResponse
+    )
+}
+
 impl<S: Storage> MultiLog<S> {
     /// Member `member.id` of `stores.len()` logs, each opened on its store, resuming at `point`:
     /// the image the owner restarts from, or the origin. Every log's member is `member`'s
@@ -164,6 +185,8 @@ impl<S: Storage> MultiLog<S> {
             latest_global: point.cut.epoch(),
             configurations,
             ranked: Vec::new(),
+            stated: vec![Vec::new(); count],
+            known_leaders: vec![0; count],
             limits,
         })
     }
@@ -229,7 +252,7 @@ impl<S: Storage> MultiLog<S> {
     /// Refused at a leader whose log holds [`Limits::unmerged`] entries past its merge.
     pub fn propose(&mut self, route: Route, command: Vec<u8>) -> Result<usize> {
         let log = self.route(route);
-        self.admit(log)?;
+        self.admit(log, 1)?;
         let data = match route {
             Route::Global => entry::global(command)?,
             Route::Key(key) => entry::keyed_command(command, key)?,
@@ -240,9 +263,42 @@ impl<S: Storage> MultiLog<S> {
         Ok(log)
     }
 
-    /// Refuses a client's command at a leader of `log` whose log holds [`Limits::unmerged`]
-    /// entries past what its merge consumed.
-    fn admit(&self, log: usize) -> Result<()> {
+    /// Proposes `commands`, every one routed to `log`, as one proposal of the core: one append
+    /// carries them all to each follower, as an owner batching its clients' commands asks
+    /// (`docs/multilog.md` §9). Taken whole or refused whole: refused for a command routed
+    /// elsewhere, and at a leader whose log would hold more than [`Limits::unmerged`] entries past
+    /// its merge with them.
+    pub fn propose_in(&mut self, log: usize, commands: Vec<(Route, Vec<u8>)>) -> Result<()> {
+        if commands.iter().any(|(route, _)| self.route(*route) != log) {
+            return Err(Error::Violation("a batch's command routed to another log"));
+        }
+        let count = u64::try_from(commands.len()).map_err(|_| Error::Capacity("a batch"))?;
+        self.admit(log, count)?;
+        let node = self.at(log)?;
+        let mut message = proto::message(0, MessageType::MsgPropose);
+        message.from = node.raft.id();
+        message
+            .entries
+            .try_reserve_exact(commands.len())
+            .map_err(|_| Error::Capacity("a batch"))?;
+        for (route, command) in commands {
+            let data = match route {
+                Route::Global => entry::global(command)?,
+                Route::Key(key) => entry::keyed_command(command, key)?,
+            };
+            message.entries.push(Entry {
+                data,
+                ..Entry::default()
+            });
+        }
+        self.at(log)?
+            .step(message)
+            .map_err(|error| Error::of(log, error))
+    }
+
+    /// Refuses `count` client commands at a leader of `log` whose log would hold more than
+    /// [`Limits::unmerged`] entries past what its merge consumed.
+    fn admit(&self, log: usize, count: u64) -> Result<()> {
         let node = self.nodes.get(log).ok_or(Error::NoLog(log))?;
         if node.raft.state() != StateRole::Leader {
             return Ok(());
@@ -254,7 +310,7 @@ impl<S: Storage> MultiLog<S> {
             .map_err(|error| Error::of(log, error))?;
         let merged = self.merged_through(log).ok_or(Error::NoLog(log))?;
         // A log that ends before its merge (moved there by an image) holds nothing past it.
-        if last.saturating_sub(merged) >= self.limits.unmerged {
+        if last.saturating_sub(merged).saturating_add(count) > self.limits.unmerged {
             return Err(Error::Capacity("unmerged"));
         }
         Ok(())
@@ -286,9 +342,24 @@ impl<S: Storage> MultiLog<S> {
     }
 
     fn step_member(&mut self, log: usize, message: Message) -> Result<()> {
+        if !is_vote(message.msg_type) {
+            self.note_stated(log, message.from, message.priority == CUT);
+        }
         self.at(log)?
             .step(message)
-            .map_err(|error| Error::of(log, error))
+            .map_err(|error| Error::of(log, error))?;
+        self.note_leader(log);
+        Ok(())
+    }
+
+    /// Notes the leader `log`'s share names, where it names one.
+    fn note_leader(&mut self, log: usize) {
+        let leader = self.nodes.get(log).map_or(0, |node| node.raft.leader_id());
+        if leader != 0
+            && let Some(known) = self.known_leaders.get_mut(log)
+        {
+            *known = leader;
+        }
     }
 
     /// A leader of `log` took a forwarded barrier naming `named`: it covers that global this term.
@@ -331,7 +402,10 @@ impl<S: Storage> MultiLog<S> {
             }
         }
         if commands {
-            self.admit(log)?;
+            self.admit(
+                log,
+                u64::try_from(message.entries.len()).map_err(|_| Error::Capacity("a batch"))?,
+            )?;
             return Ok(Screened::Pass);
         }
         Ok(if barriers_covered {
@@ -480,8 +554,12 @@ impl<S: Storage> MultiLog<S> {
         Ok(())
     }
 
-    /// This member's priority in `log` by the last ranking.
+    /// This member's priority in `log` by the last ranking; none while it is cut from the leader
+    /// of a log below it.
     fn priority_in(&self, log: usize) -> i64 {
+        if self.cut_below(log) {
+            return 0;
+        }
         let len = self.ranked.len();
         let Some(id) = self.nodes.first().map(|node| node.raft.id()) else {
             return 0;
@@ -504,21 +582,118 @@ impl<S: Storage> MultiLog<S> {
         self.ranked.get(at).copied()
     }
 
-    /// The voter this member, leading `log`, would hand it to: the log's preferred voter, where
-    /// that is another, its leader hears it, and it holds the leader's whole log. When to hand
-    /// over is the owner's policy (`docs/multilog.md` §7).
-    pub fn hand_off(&self, log: usize) -> Option<NodeId> {
+    /// Whether this member is cut from the leader of a log numbered below `log`: it suspects the
+    /// member its share of that log last named as leader, and has heard of no other since. Its merge cannot pass that log's next
+    /// barrier or global until it hears from it again, so a log it leads applies nothing at it
+    /// meanwhile; of two leaders cut from each other, the one leading the later log yields, so
+    /// one of them leads on and nothing is handed back and forth (`docs/multilog.md` §7.1). Log 0
+    /// and a single log are never cut.
+    pub fn cut_below(&self, log: usize) -> bool {
+        let Some(me) = self.nodes.first().map(|node| node.raft.id()) else {
+            return false;
+        };
+        self.nodes
+            .iter()
+            .zip(&self.known_leaders)
+            .take(log)
+            .any(|(node, known)| {
+                let named = node.raft.leader_id();
+                let leader = if named == 0 { *known } else { named };
+                leader != 0 && leader != me && node.raft.suspects(leader)
+            })
+    }
+
+    /// Stamps `message`, which this member's share of `log` sends, with whether this member is cut
+    /// from the leader of a log below it ([`MultiLog::cut_below`]), so that `log`'s leader does
+    /// not hand it `log` (`docs/multilog.md` §7.1). The core reads a message's priority only in a
+    /// vote, which it stamps itself and this leaves alone; in any other message the field carries
+    /// [`CUT`] or zero. An owner that does not stamp leaves its members' leaders believing it may
+    /// lead.
+    pub fn stamp(&self, log: usize, message: &mut Message) {
+        if !is_vote(message.msg_type) {
+            message.priority = if self.cut_below(log) { CUT } else { 0 };
+        }
+    }
+
+    /// Notes whether `from` stated, in a message of `log`, that it is cut from another log's
+    /// leader, where it is of the log's configuration: at most one entry for each of its members.
+    fn note_stated(&mut self, log: usize, from: NodeId, cut: bool) {
+        let Some(node) = self.nodes.get(log) else {
+            return;
+        };
+        if !node
+            .raft
+            .configuration()
+            .members()
+            .any(|member| member == from)
+        {
+            return;
+        }
+        let Some(stated) = self.stated.get_mut(log) else {
+            return;
+        };
+        match stated.iter_mut().find(|(member, _)| *member == from) {
+            Some(held) => held.1 = cut,
+            None => {
+                // Bounded by the configuration's members; refused growth leaves it unnoted.
+                if stated.try_reserve(1).is_ok() {
+                    stated.push((from, cut));
+                }
+            }
+        }
+    }
+
+    /// Whether `voter` may be handed `log`: its last message there did not state it cut below it.
+    fn may_lead(&self, log: usize, voter: NodeId) -> bool {
+        self.stated
+            .get(log)
+            .and_then(|stated| stated.iter().find(|(member, _)| *member == voter))
+            .is_none_or(|(_, cut)| !*cut)
+    }
+
+    /// The voter this member, leading `log`, would hand it to (`docs/multilog.md` §7), its
+    /// priorities first set from where it stands. A member cut from the leader of a log below
+    /// `log` ([`MultiLog::cut_below`]) stands for election in `log` at priority zero and yields it
+    /// to the first voter in the log's order of preference it does not suspect, that did not state
+    /// itself cut below `log` ([`MultiLog::stamp`]), that its leader hears and that holds the
+    /// leader's whole log (§7.1). Otherwise, the log's preferred voter, on those terms. When to
+    /// hand over is the owner's policy.
+    pub fn hand_off(&mut self, log: usize) -> Option<NodeId> {
+        for each in 0..self.nodes.len() {
+            self.note_leader(each);
+            let priority = self.priority_in(each);
+            if let Some(node) = self.nodes.get_mut(each) {
+                node.set_priority(priority);
+            }
+        }
         let node = self.nodes.get(log)?;
         if node.raft.state() != StateRole::Leader {
             return None;
         }
-        let preferred = self.preferred(log)?;
-        if preferred == node.raft.id() {
-            return None;
-        }
-        let progress = node.raft.tracker().get(preferred)?;
+        let me = node.raft.id();
         let last = node.raft.log().last_index().ok()?;
-        (progress.recent_active && progress.matched == last).then_some(preferred)
+        let ready = |voter: NodeId| {
+            voter != me
+                && !node.raft.suspects(voter)
+                && self.may_lead(log, voter)
+                && node
+                    .raft
+                    .tracker()
+                    .get(voter)
+                    .is_some_and(|progress| progress.recent_active && progress.matched == last)
+        };
+        if !self.cut_below(log) {
+            return self.preferred(log).filter(|preferred| ready(*preferred));
+        }
+        let len = self.ranked.len();
+        let shift = log.checked_rem(len)?;
+        (0..len)
+            .filter_map(|at| {
+                self.ranked
+                    .get(at.checked_add(shift)?.checked_rem(len)?)
+                    .copied()
+            })
+            .find(|voter| ready(*voter))
     }
 
     /// The point an image may be taken at now, if the merge's position is canonical

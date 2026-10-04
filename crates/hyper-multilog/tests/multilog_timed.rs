@@ -32,6 +32,7 @@
     clippy::disallowed_macros,
     clippy::cognitive_complexity,
     clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
     clippy::needless_range_loop,
     missing_docs,
     unreachable_pub
@@ -46,7 +47,7 @@ use hyper_multilog::{Limits, Route};
 use hyper_raft::Timing;
 use hyper_raft::proto::Message;
 use hyper_raft::wire::Record;
-use hyper_sim::net::{Net, NetLimits, Path, Ticket};
+use hyper_sim::net::{Loss, Net, NetLimits, Path, Ticket};
 use hyper_sim::{
     Clock, Discipline, NodeId, Random, Record as SimRecord, Source, Step, World, twice,
 };
@@ -97,19 +98,35 @@ const LIMITS: Limits = Limits {
 /// more has stopped converging.
 const STEPS: u64 = 4 * 89_020;
 
+/// The world steps a hostile run may take: four times the most any run of the hostile measurement
+/// took (90,164 steps, duplication at five logs over 20 seeds, measured 2026-10-04,
+/// `docs/benchmarks.md`, "Hostile networks"), so a run that takes many more has stopped
+/// converging.
+const HOSTILE_STEPS: u64 = 4 * 90_164;
+
+/// The step budget of `shape`'s run.
+fn steps_of(shape: &Shape) -> u64 {
+    if shape.hostile == Hostile::NONE {
+        STEPS
+    } else {
+        HOSTILE_STEPS
+    }
+}
+
 /// The one-way delay from region `from` to region `to`: half the published round trip from
 /// `from`, and the jitter's mean on top (slates draws `U[0, jitter)` on top; hyper-sim's path draws
-/// `one_way ± jitter`, so the path is centred on its half).
-fn path(from: usize, to: usize) -> Path {
+/// `one_way ± jitter`, so the path is centred on its half); `jitter_ns` slates' or a hostile
+/// condition's.
+fn path(from: usize, to: usize, jitter_ns: u64) -> Path {
     Path::reordering(
-        ROUND_TRIPS_MS[from][to] * MS / 2 + JITTER_NS / 2,
-        JITTER_NS / 2,
+        ROUND_TRIPS_MS[from][to] * MS / 2 + jitter_ns / 2,
+        jitter_ns / 2,
     )
 }
 
 /// The latest a message from `from` to `to` arrives after it is sent.
-fn latest_ns(from: usize, to: usize) -> u64 {
-    ROUND_TRIPS_MS[from][to] * MS / 2 + JITTER_NS
+fn latest_ns(from: usize, to: usize, jitter_ns: u64) -> u64 {
+    ROUND_TRIPS_MS[from][to] * MS / 2 + jitter_ns
 }
 
 /// Which member sits in each region under `seed`: a permutation of `1..=5` (slates' `placement`,
@@ -141,13 +158,13 @@ fn quorum_round_trip_ms(node: usize) -> u64 {
 
 /// The timing hyper-timing's law gives the member in region `region`: the split-vote span over the
 /// latest one-way delay of its paths and its quorum's round, for all but a lost leader's voters.
-fn timing_of(region: usize) -> Timing {
+fn timing_of(region: usize, jitter_ns: u64) -> Timing {
     let latency = (0..REGIONS)
         .filter(|o| *o != region)
-        .map(|o| latest_ns(region, o))
+        .map(|o| latest_ns(region, o, jitter_ns))
         .max()
         .unwrap();
-    let round = Duration::from_nanos(quorum_round_trip_ms(region) * MS + 2 * JITTER_NS);
+    let round = Duration::from_nanos(quorum_round_trip_ms(region) * MS + 2 * jitter_ns);
     let span = hyper_timing::election_span(
         REGIONS as u32,
         REGIONS as u32 - 1,
@@ -178,6 +195,41 @@ struct Shape {
     seed: u64,
     duration_ns: u64,
     crash: Option<Crash>,
+    hostile: Hostile,
+}
+
+/// Which pairs a partition cuts (Alquraan et al., OSDI 2018, §2.1), around the voter log 0 prefers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Cut {
+    /// It and every other voter, both ways.
+    Complete,
+    /// It and the next-ranked voter only, both ways: the others reach both.
+    Partial,
+    /// What the others send it is lost; what it sends arrives.
+    Simplex,
+}
+
+/// The network a run's members are on: slates' paths, and what a hostile condition does to them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Hostile {
+    /// Each one-way delay's jitter, uniform within it.
+    jitter_ns: u64,
+    /// Independent loss on every path, parts per million.
+    loss_ppm: u32,
+    /// Duplication of every message, parts per million.
+    duplicate_ppm: u32,
+    /// A partition over `[from_ns, until_ns)`.
+    partition: Option<(Cut, u64, u64)>,
+}
+
+impl Hostile {
+    /// slates' paths as they are.
+    const NONE: Self = Self {
+        jitter_ns: JITTER_NS,
+        loss_ppm: 0,
+        duplicate_ppm: 0,
+        partition: None,
+    };
 }
 
 /// What the network carries: a log's Raft message, or a node pair's heartbeat (its send time).
@@ -203,6 +255,9 @@ enum Ev {
     /// The crash window opens or closes.
     Crash,
     Restart,
+    /// The partition begins and heals.
+    Cut,
+    Heal,
 }
 
 /// A command proposed: when, by whom, into which log, keyed or not; and, once applied at its
@@ -227,7 +282,14 @@ struct Outcome {
     watched_keyed_gap_ns: u64,
     global_gap_ns: u64,
     messages: u64,
+    /// The bytes of the Raft messages on hyper-raft's wire, each with its log's number.
+    wire_bytes: u64,
     heartbeats: u64,
+    /// The commands proposed, and those never applied at their proposer by the run's end.
+    proposed: u64,
+    unapplied: u64,
+    /// The world's steps.
+    steps: u64,
     /// Every application: when, its log, keyed or not, its epoch, and when it was proposed.
     applications: Vec<(u64, usize, bool, u64, u64)>,
     /// When the crashed voter's log had a leader again, and whether the voter led it at the crash.
@@ -265,10 +327,11 @@ impl Sim {
             events: 1 << 16,
             nodes: REGIONS + 1,
             streams: 256,
-            steps: STEPS,
-            trace_words: STEPS as usize,
+            steps: steps_of(&shape),
+            trace_words: steps_of(&shape) as usize,
         };
         let mut world = World::new(source, Discipline::Ordered, limits).unwrap();
+        let hostile = shape.hostile;
         for _ in 0..=REGIONS {
             world.node(Clock::default()).unwrap();
         }
@@ -291,12 +354,18 @@ impl Sim {
         for from in 1..=REGIONS as u64 {
             for to in 1..=REGIONS as u64 {
                 if from != to {
-                    let p = path(region[from as usize - 1], region[to as usize - 1]);
+                    let p = path(
+                        region[from as usize - 1],
+                        region[to as usize - 1],
+                        hostile.jitter_ns,
+                    )
+                    .with_loss(Loss::random(hostile.loss_ppm));
                     net.set_pair_path(NodeId(from as u32), NodeId(to as u32), p)
                         .unwrap();
                 }
             }
         }
+        net.set_duplicate_ppm(hostile.duplicate_ppm);
         let ids: Vec<u64> = (1..=REGIONS as u64).collect();
         let members = ids
             .iter()
@@ -334,6 +403,10 @@ impl Sim {
         sim.world
             .schedule(STREAM_FROM_NS, NodeId(0), Ev::Global)
             .unwrap();
+        if let Some((_, from_ns, until_ns)) = hostile.partition {
+            sim.world.schedule(from_ns, NodeId(0), Ev::Cut).unwrap();
+            sim.world.schedule(until_ns, NodeId(0), Ev::Heal).unwrap();
+        }
         if let Some(crash) = shape.crash {
             sim.world
                 .schedule(crash.from_ns, NodeId(0), Ev::Crash)
@@ -347,7 +420,7 @@ impl Sim {
 
     /// A member's timing and priorities, as its owner sets them at opening.
     fn prepare(&mut self, id: u64) {
-        let timing = timing_of(self.region[id as usize - 1]);
+        let timing = timing_of(self.region[id as usize - 1], self.shape.hostile.jitter_ns);
         let member = &mut self.members[id as usize - 1];
         for log in 0..member.logs {
             member
@@ -384,6 +457,7 @@ impl Sim {
             let to = message.to;
             let bytes = message.encoded_len();
             self.outcome.messages += 1;
+            self.outcome.wire_bytes += bytes as u64 + 8;
             self.net
                 .send(
                     &mut self.world,
@@ -502,7 +576,11 @@ impl Sim {
         }
         let fresh = sent
             + PERIOD_NS
-            + latest_ns(self.region[peer as usize - 1], self.region[id as usize - 1]);
+            + latest_ns(
+                self.region[peer as usize - 1],
+                self.region[id as usize - 1],
+                self.shape.hostile.jitter_ns,
+            );
         self.world
             .schedule(
                 fresh.max(self.now()),
@@ -598,6 +676,33 @@ impl Sim {
         self.settle(victim);
     }
 
+    /// The partition the shape names, around the voter log 0 prefers.
+    fn partition(&mut self, blocked: bool) {
+        let Some((cut, _, _)) = self.shape.hostile.partition else {
+            return;
+        };
+        let watched = NodeId(self.ranked[0] as u32);
+        let next = NodeId(self.ranked[1] as u32);
+        for other in 1..=REGIONS as u32 {
+            let other = NodeId(other);
+            if other == watched {
+                continue;
+            }
+            match cut {
+                Cut::Complete => {
+                    self.net.partition(watched, other, blocked);
+                    self.net.partition(other, watched, blocked);
+                }
+                Cut::Partial if other == next => {
+                    self.net.partition(watched, other, blocked);
+                    self.net.partition(other, watched, blocked);
+                }
+                Cut::Partial => {}
+                Cut::Simplex => self.net.partition(other, watched, blocked),
+            }
+        }
+    }
+
     /// Notes when the crashed voter's log has a leader again.
     fn watch_leadership(&mut self) {
         let Some(crash) = self.shape.crash else {
@@ -664,6 +769,8 @@ impl Sim {
                         }
                         Ev::Crash => self.crash(self.shape.crash.unwrap()),
                         Ev::Restart => self.restart(self.shape.crash.unwrap()),
+                        Ev::Cut => self.partition(true),
+                        Ev::Heal => self.partition(false),
                     }
                 }
                 Step::Wake { node } => {
@@ -681,7 +788,15 @@ impl Sim {
             }
             self.watch_leadership();
         }
-        let outcome = std::mem::take(&mut self.outcome);
+        let mut outcome = std::mem::take(&mut self.outcome);
+        outcome.proposed = self.next_command;
+        outcome.unapplied = self
+            .commands
+            .values()
+            .filter(|c| c.applied_ns.is_none())
+            .count() as u64
+            + self.waiting.len() as u64;
+        outcome.steps = self.world.steps();
         (self.world.finish(), outcome)
     }
 }
@@ -750,6 +865,7 @@ fn measure(
             seed,
             duration_ns,
             crash,
+            hostile: Hostile::NONE,
         };
         let mut outcome = if seed == 0 {
             let mut first = None;
@@ -915,5 +1031,180 @@ fn multi_log_on_the_failure_path() {
             "  a keyed command's expectation as a region is lost: {} ms",
             expectation / REGIONS as u64
         );
+    }
+}
+
+/// The 1-based ranks of the order statistics bracketing the `q`-quantile of `n` samples with at
+/// least 95% coverage (David and Nagaraja, *Order Statistics*): the count below the quantile is
+/// Binomial(`n`, `q`). `None` above when the upper rank would pass the largest sample.
+fn ranks(n: usize, q: f64) -> (usize, Option<usize>) {
+    let tail = 0.025;
+    let (lq, lp) = (q.ln(), (1.0 - q).ln());
+    let mut ln_pmf = n as f64 * lp;
+    let mut cdf = Vec::with_capacity(n + 1);
+    let mut sum = 0.0;
+    for k in 0..=n {
+        sum += ln_pmf.exp();
+        cdf.push(f64::min(sum, 1.0));
+        if k < n {
+            ln_pmf += ((n - k) as f64).ln() - ((k + 1) as f64).ln() + lq - lp;
+        }
+    }
+    let below = |rank: usize| if rank == 0 { 0.0 } else { cdf[rank - 1] };
+    let mut lower = 1;
+    while lower < n && below(lower + 1) <= tail {
+        lower += 1;
+    }
+    (lower, (lower..=n).find(|rank| below(*rank) >= 1.0 - tail))
+}
+
+/// `q`'s estimate and interval among `sorted`, in milliseconds, as a table cell.
+fn cell(sorted: &[u64], q: f64) -> String {
+    let n = sorted.len();
+    if n == 0 {
+        return "none".into();
+    }
+    let at = ((n as f64 * q).ceil() as usize).clamp(1, n);
+    let (lower, upper) = ranks(n, q);
+    let ms = |ns: u64| ns as f64 / MS as f64;
+    match upper {
+        Some(upper) => format!(
+            "{:.0} [{:.0}–{:.0}]",
+            ms(sorted[at - 1]),
+            ms(sorted[lower - 1]),
+            ms(sorted[upper - 1])
+        ),
+        None => format!(
+            "{:.0} [{:.0}–unresolved]",
+            ms(sorted[at - 1]),
+            ms(sorted[lower - 1])
+        ),
+    }
+}
+
+/// A measurement tool (`docs/tails.md`): one, three and five logs across the five regions under
+/// each hostile condition, every command's latency from its scheduled time (the streams are open
+/// loop: a command is due at its time whatever the group does), pooled over the seeds, as quantiles
+/// with their 95% intervals; the messages and wire bytes a command; the commands never applied.
+/// Each condition's parameters and their source are in `docs/benchmarks.md`, "Hostile networks".
+/// `HYPER_MULTILOG_SEEDS=20 cargo test -p hyper-multilog --release --test multilog_timed --
+/// --ignored --exact multi_log_under_hostile_networks --nocapture`.
+#[test]
+#[ignore = "a measurement tool, run by hand with its environment set"]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a measurement tool takes its seed count from the environment"
+)]
+fn multi_log_under_hostile_networks() {
+    let Some(seeds) = std::env::var("HYPER_MULTILOG_SEEDS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+    else {
+        eprintln!("skipping: set HYPER_MULTILOG_SEEDS to measure");
+        return;
+    };
+    let window = Some((30_000 * MS, 50_000 * MS));
+    let partition = |cut: Cut| window.map(|(from, until)| (cut, from, until));
+    let conditions: [(&str, Hostile); 9] = [
+        ("slates' paths", Hostile::NONE),
+        (
+            "loss 0.1%",
+            Hostile {
+                loss_ppm: 1_000,
+                ..Hostile::NONE
+            },
+        ),
+        (
+            "loss 1%",
+            Hostile {
+                loss_ppm: 10_000,
+                ..Hostile::NONE
+            },
+        ),
+        (
+            "loss 10%",
+            Hostile {
+                loss_ppm: 100_000,
+                ..Hostile::NONE
+            },
+        ),
+        (
+            "jitter 50 ms",
+            Hostile {
+                jitter_ns: 50 * MS,
+                ..Hostile::NONE
+            },
+        ),
+        (
+            "duplication 1%",
+            Hostile {
+                duplicate_ppm: 10_000,
+                ..Hostile::NONE
+            },
+        ),
+        (
+            "complete partition",
+            Hostile {
+                partition: partition(Cut::Complete),
+                ..Hostile::NONE
+            },
+        ),
+        (
+            "partial partition",
+            Hostile {
+                partition: partition(Cut::Partial),
+                ..Hostile::NONE
+            },
+        ),
+        (
+            "simplex partition",
+            Hostile {
+                partition: partition(Cut::Simplex),
+                ..Hostile::NONE
+            },
+        ),
+    ];
+    eprintln!(
+        "| condition | logs | keyed p50 ms [95%] | keyed p99 | keyed p99.9 | keyed max | global p50 | global p99 | global p99.9 | global max | messages/command | wire bytes/command | unapplied/proposed | most steps |"
+    );
+    eprintln!("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|");
+    for (name, hostile) in conditions {
+        for logs in [1, 3, 5] {
+            let (mut keyed, mut global) = (Vec::new(), Vec::new());
+            let (mut messages, mut wire, mut proposed, mut unapplied, mut steps) = (0, 0, 0, 0, 0);
+            for seed in 0..seeds {
+                let shape = Shape {
+                    logs,
+                    seed,
+                    duration_ns: 70_000 * MS,
+                    crash: None,
+                    hostile,
+                };
+                let (_, outcome) = run_shape(Source::Seed(seed), shape);
+                keyed.extend(outcome.keyed_ns);
+                global.extend(outcome.global_ns);
+                messages += outcome.messages;
+                wire += outcome.wire_bytes;
+                proposed += outcome.proposed;
+                unapplied += outcome.unapplied;
+                steps = steps.max(outcome.steps);
+            }
+            keyed.sort_unstable();
+            global.sort_unstable();
+            let applied = (proposed - unapplied).max(1);
+            eprintln!(
+                "| {name} | {logs} | {} | {} | {} | {:.0} | {} | {} | {} | {:.0} | {:.1} | {:.0} | {unapplied}/{proposed} | {steps} |",
+                cell(&keyed, 0.5),
+                cell(&keyed, 0.99),
+                cell(&keyed, 0.999),
+                keyed.last().copied().unwrap_or(0) as f64 / MS as f64,
+                cell(&global, 0.5),
+                cell(&global, 0.99),
+                cell(&global, 0.999),
+                global.last().copied().unwrap_or(0) as f64 / MS as f64,
+                messages as f64 / applied as f64,
+                wire as f64 / applied as f64,
+            );
+        }
     }
 }

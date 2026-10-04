@@ -20,6 +20,8 @@ proptest.workspace = true
 hyper-sim = { path = "../hyper-sim" }
 # The election law the timed simulation derives each group's timing from.
 hyper-timing = { path = "../hyper-timing" }
+# The counting allocator: what the layer's own share of each hot path allocates (`tests/allocs.rs`).
+hyper-measure = { path = "../hyper-measure" }
 
 [lints]
 workspace = true

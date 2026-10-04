@@ -6015,3 +6015,235 @@ at its end; the 16-seed run is the workspace's debug run, the same minute (load 
 cargo test -p hyper-multilog --test multilog
 cargo test --release -p hyper-multilog --test multilog -- --ignored the_multi_log_merges_alike_at_full_scale --nocapture
 ```
+
+## Allocations on the hot paths
+
+`crates/hyper-multilog/tests/allocs.rs`, exact counts with `hyper_measure::alloc`, warm, at one
+leader: the merge applies a command with no allocation and no reallocation; a proposal through the
+layer allocates exactly what the core's proposal of the same bytes does (the layer reserves its
+nine-byte suffix in the owner's buffer, `entry::SUFFIX_BYTES`); a barrier allocates exactly what
+the core's proposal of its bytes does; handing committed entries over and screening a forwarded
+message allocate nothing of the layer's own. Each is an equality the test asserts, not a measured
+band.
+
+## Against slates' MLRaft
+
+`crates/hyper-raft-compare`, `multilog`: slates' layer at `5cce86a` and this one on slates'
+workload (three voters, 64 keys, one command in eleven global, slates' timed streams' ratio; 64 B
+commands), one log and three, a command a round and 64, each log led by a different voter. One
+round: the commands proposed at their logs' leaders (this layer: one proposal a log,
+`MultiLog::propose_in`), the group driven quiet in one thread, every member applying the round in
+the merged order. Closed loop and in one process, with no network and no device: what a round
+measures is the two layers' and their cores' own work. Five processes a layer and shape,
+interleaved, 2,000 rounds each, pooled for the quantiles; the intervals are 95%, distribution-free
+(`docs/tails.md` §3.3). CPU, instructions, cycles and energy are the process's own account over
+the timed rounds (`hyper_measure::usage`, `proc_pid_rusage(RUSAGE_INFO_V6)`); allocations and wire
+bytes from a separate counting process of the same seed, the wire bytes each layer's own encoding
+of every message (hyper-raft's record, slates' `RaftMessage::encode`) and the log's number.
+`slates-multilog+publication` copies slates' retained state out at every transition, as slates'
+server does before any reply (the core's comparison above, "slates with its retained-state
+publication"); it copies the whole log, so it runs a command a round only.
+
+2026-10-04, 11:19 PDT, on a machine shared with other sessions' builds and gates: load average
+95.7 at the first shape's start and 115.9 at the end (each row's start in its column). Round times
+in milliseconds.
+
+| workload | layer | load before | round p50 [95% interval] | p99 | p99.9 | max | CPU ns/command (user+sys) | instructions/command | cycles/command | energy nJ/command | wakeups/1k commands | allocs/command | reallocs/command | alloc bytes/command | messages/command | wire bytes/command | peak footprint MiB |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 1 logs b1 64B | hyper-multilog | 95.72 52.36 39.04 | 0.002 [0.002–0.002] | 0.004 [0.004–0.005] | 0.023 [0.018–0.035] | 0.144 | 1934 | 40707 | 7610 | 7330 | 0.00 | 25.00 | 0.000 | 4795 | 8.00 | 1027 | 3.1 |
+| 1 logs b1 64B | slates-multilog | 95.72 52.36 39.04 | 0.002 [0.002–0.002] | 0.004 [0.004–0.005] | 0.021 [0.018–0.032] | 0.067 | 1736 | 37817 | 7445 | 4675 | 0.00 | 55.00 | 1.923 | 4278 | 6.00 | 852 | 3.1 |
+| 1 logs b1 64B | slates-multilog+publication | 95.72 52.36 39.04 | 0.094 [0.093–0.096] | 8.918 [7.103–11.522] | 40.981 [34.857–67.482] | 77.382 | 102231 | 2347300 | 418822 | 467191 | 0.00 | 5077.50 | 1.923 | 768206 | 6.00 | 852 | 7.1 |
+| 3 logs b1 64B | hyper-multilog | 102.91 55.31 40.25 | 0.002 [0.002–0.002] | 0.010 [0.009–0.010] | 0.034 [0.029–0.054] | 0.269 | 2952 | 54305 | 11865 | 13829 | 0.00 | 30.07 | 0.000 | 5776 | 9.81 | 1239 | 3.6 |
+| 3 logs b1 64B | slates-multilog | 102.91 55.31 40.25 | 0.002 [0.002–0.002] | 0.006 [0.006–0.007] | 0.019 [0.016–0.026] | 0.275 | 2159 | 43384 | 8462 | 2165 | 0.00 | 61.24 | 2.127 | 4927 | 7.09 | 983 | 3.5 |
+| 3 logs b1 64B | slates-multilog+publication | 102.91 55.31 40.25 | 0.153 [0.149–0.156] | 20.909 [17.721–27.206] | 59.315 [51.262–76.836] | 132.631 | 181706 | 3221787 | 721785 | 629961 | 0.00 | 7097.05 | 2.127 | 1006727 | 7.09 | 983 | 9.4 |
+| 1 logs b64 64B | hyper-multilog | 113.29 60.75 42.55 | 0.016 [0.016–0.017] | 0.039 [0.037–0.043] | 0.225 [0.148–0.431] | 0.548 | 297 | 5551 | 1216 | 1052 | 0.00 | 9.25 | 0.000 | 1393 | 0.12 | 208 | 63.0 |
+| 1 logs b64 64B | slates-multilog | 113.29 60.75 42.55 | 0.021 [0.021–0.021] | 0.047 [0.043–0.051] | 0.538 [0.286–9.083] | 17.549 | 367 | 7653 | 1495 | 1320 | 0.00 | 13.66 | 2.097 | 1411 | 0.09 | 181 | 66.4 |
+| 3 logs b64 64B | hyper-multilog | 113.29 60.75 42.55 | 0.027 [0.027–0.027] | 0.096 [0.084–0.117] | 0.910 [0.550–23.228] | 50.698 | 476 | 7988 | 1886 | 1664 | 0.00 | 10.59 | 0.000 | 1670 | 0.69 | 270 | 80.8 |
+| 3 logs b64 64B | slates-multilog | 113.29 60.75 42.55 | 0.026 [0.026–0.026] | 0.093 [0.080–0.112] | 2.980 [0.584–8.858] | 18.846 | 465 | 8776 | 1871 | 1606 | 0.00 | 14.52 | 2.268 | 1679 | 0.47 | 225 | 79.1 |
+
+What it shows:
+- **A command a round**, one log: even. p50 and p99 are 2 and 4 µs for both; this layer spends
+  11% more CPU a command (1,934 ns against 1,736), 8% more instructions, and sends two more
+  messages a command (8 against 6, not yet traced to which), with less than half slates'
+  allocations (25 against 55, and no reallocation against 1.9).
+- **A command a round, three logs: this layer loses.** p99 10 µs against 6, p99.9 34 against 19,
+  37% more CPU a command (2,952 ns against 2,159), 25% more instructions, 9.81 messages against
+  7.09 and 26% more wire bytes. Going from one log to three adds 1.81 messages a command here and
+  1.09 in slates'. One difference in the barrier's path is a candidate: here every member proposes
+  the barrier it owes and a follower's is forwarded to the leader, which drops it if covered
+  (`docs/multilog.md` §3.1), where slates' leaders append their own and nothing else. It is not
+  yet traced; the loss is open.
+- **64 commands a round, one log: this layer wins.** p50 16 µs against 21, p99 39 against 47,
+  p99.9 225 against 538, max 0.55 ms against 17.5; 19% less CPU, 27% fewer instructions, 32%
+  fewer allocations and none reallocated. Before `propose_in` this layer proposed a command at a
+  time and lost this row three to one (8 messages a command against slates' 0.09); one proposal a
+  log is what slates' layer does, and what the owner contract now states (§9).
+- **64 commands a round, three logs: even**, p50 27 against 26 µs and p99 96 against 93, inside
+  each other's intervals; this layer's p99.9 interval reaches 23 ms, slates' 8.9 ms, on a machine
+  at load 113, so neither tail is resolved against the other. CPU even (476 against 465 ns),
+  instructions 9% fewer, allocations 27% fewer, but 0.69 messages a command against 0.47 and 20%
+  more wire bytes, the same open loss as at one command a round.
+- **slates as its server runs it** (its publication) is 50 to 60 times this layer's CPU a command
+  and its p99 a thousand to two thousand times higher (8.9 and 20.9 ms against 4 and 10 µs): the
+  copy of the whole retained log at every transition, which this layer's owner never makes (its
+  log's storage is the durable state).
+- Wakeups: none in either layer: one thread, no timer; an idle cost is the E2E's to measure.
+- Peak footprint: equal at each shape (3 to 81 MiB, the 64-command rounds' logs, which neither
+  compacts in this harness).
+
+## Hostile networks
+
+`tests/multilog_timed.rs`, `multi_log_under_hostile_networks`: slates' timed simulation (five Azure
+regions at Microsoft's published P50 round trips, a keyed stream of 20 a second over 64 keys and a
+global stream of two a second, elections by suspicion on per-pair heartbeat detectors, each log's
+preferred voter ranked by its quorum round trip) on hyper-sim's ordered world, 70 s a run, 20 seeds,
+under each condition on every path:
+- **slates' paths**: as slates ran them, jitter 5 ms;
+- **loss 0.1% and 1%**: ITU-T Y.1541's IP loss-ratio objective for its classes 0 to 4 is 1 × 10⁻³
+  (Table 1), the edge of a network that meets it, and ten times past it; **10%**, a hundred times
+  past it, where a link is failing;
+- **jitter 50 ms**: Y.1541's delay-variation objective for classes 0 and 1 (IPDV 50 ms), as
+  uniform jitter on each one-way delay, ten times slates';
+- **duplication 1%**, hyper-sim's duplication of every message;
+- **complete, partial and simplex partitions** of log 0's preferred voter for 20 s (30 s to 50 s),
+  the three kinds of Alquraan et al. (OSDI 2018, §2.1): complete from every other voter; partial
+  from the next-ranked voter only (the others reach both); simplex, what the others send it lost.
+
+Every command's latency runs from its scheduled time (the streams are open loop: a command is due
+whatever the group does) to its application at the member that proposed it. Quantiles pooled over
+the seeds, in milliseconds, with 95% intervals; "unresolved" where the samples do not bound the
+quantile from above (the global stream's 1,320 a seed). Messages and wire bytes are a command
+applied's. 2026-10-04, 11:13 PDT, release, load average 14.6 at the start and 14.6 at the end.
+
+| condition | logs | keyed p50 ms [95%] | keyed p99 | keyed p99.9 | keyed max | global p50 | global p99 | global p99.9 | global max | messages/command | wire bytes/command | unapplied/proposed | most steps |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| slates' paths | 1 | 123 [123–123] | 127 [127–127] | 127 [127–127] | 127 | 123 [123–123] | 127 [127–127] | 127 [127–unresolved] | 127 | 21.6 | 2423 | 40/26400 | 61840 |
+| slates' paths | 3 | 172 [171–172] | 456 [455–456] | 461 [460–463] | 465 | 456 [456–456] | 464 [463–464] | 466 [465–unresolved] | 467 | 32.0 | 3548 | 53/26400 | 76329 |
+| slates' paths | 5 | 176 [176–177] | 521 [520–522] | 530 [529–531] | 534 | 525 [524–525] | 532 [532–533] | 535 [534–unresolved] | 535 | 41.1 | 4548 | 135/26400 | 89020 |
+| loss 0.1% | 1 | 123 [123–123] | 127 [127–127] | 169 [168–169] | 171 | 123 [123–123] | 127 [127–127] | 169 [165–unresolved] | 170 | 21.6 | 2423 | 40/26400 | 61743 |
+| loss 0.1% | 3 | 172 [172–172] | 459 [458–460] | 840 [781–998] | 2040 | 456 [456–456] | 666 [588–802] | 1166 [890–unresolved] | 2090 | 32.0 | 3544 | 59/26400 | 76109 |
+| loss 0.1% | 5 | 177 [177–177] | 534 [529–553] | 806 [778–846] | 1139 | 525 [525–525] | 825 [784–874] | 1091 [985–unresolved] | 1189 | 41.1 | 4548 | 138/26400 | 89034 |
+| loss 1% | 1 | 123 [123–123] | 170 [170–170] | 228 [225–230] | 264 | 123 [123–123] | 170 [170–172] | 216 [189–unresolved] | 228 | 21.5 | 2429 | 43/26400 | 61172 |
+| loss 1% | 3 | 174 [174–174] | 700 [676–721] | 1002 [972–1060] | 1288 | 457 [457–457] | 1008 [920–1098] | 1199 [1172–unresolved] | 1288 | 31.9 | 3546 | 107/26400 | 75505 |
+| loss 1% | 5 | 196 [194–199] | 822 [812–836] | 1063 [1032–1107] | 1386 | 528 [527–528] | 1104 [1066–1148] | 1283 [1215–unresolved] | 1431 | 41.2 | 4570 | 156/26400 | 88320 |
+| loss 10% | 1 | 204 [201–206] | 1648 [1591–1718] | 2767 [2648–2858] | 3221 | 206 [196–216] | 1691 [1448–1945] | 2857 [2448–unresolved] | 3121 | 16.8 | 2037 | 118/26400 | 53413 |
+| loss 10% | 3 | 368 [362–375] | 2541 [2484–2619] | 3626 [3564–3898] | 4858 | 716 [699–740] | 2781 [2691–3164] | 4164 [3698–unresolved] | 5008 | 28.7 | 3294 | 279/26400 | 66579 |
+| loss 10% | 5 | 616 [609–623] | 3068 [3013–3131] | 3900 [3833–4066] | 5118 | 993 [976–1018] | 3554 [3241–3709] | 4557 [4092–unresolved] | 5168 | 39.1 | 4457 | 710/26400 | 78478 |
+| jitter 50 ms | 1 | 166 [166–167] | 205 [204–205] | 212 [211–212] | 216 | 170 [169–170] | 206 [205–208] | 212 [211–unresolved] | 215 | 20.0 | 2264 | 60/26400 | 59465 |
+| jitter 50 ms | 3 | 230 [229–230] | 592 [589–596] | 656 [648–684] | 2505 | 585 [583–586] | 685 [674–701] | 770 [737–unresolved] | 798 | 28.4 | 3186 | 141/26400 | 70921 |
+| jitter 50 ms | 5 | 240 [239–241] | 643 [637–649] | 705 [698–716] | 847 | 654 [652–656] | 752 [741–782] | 842 [832–unresolved] | 851 | 36.2 | 4043 | 136/26400 | 81585 |
+| duplication 1% | 1 | 123 [123–123] | 127 [127–127] | 127 [127–127] | 127 | 123 [123–123] | 127 [127–127] | 127 [127–unresolved] | 127 | 21.8 | 2441 | 40/26400 | 62521 |
+| duplication 1% | 3 | 172 [171–172] | 455 [455–456] | 461 [460–462] | 466 | 456 [455–456] | 464 [463–464] | 466 [465–unresolved] | 467 | 32.3 | 3578 | 53/26400 | 77393 |
+| duplication 1% | 5 | 176 [176–177] | 521 [519–522] | 529 [528–530] | 534 | 525 [525–525] | 532 [532–533] | 535 [534–unresolved] | 536 | 41.5 | 4584 | 134/26400 | 90164 |
+| complete partition | 1 | 173 [173–173] | 674 [587–742] | 20257 [20197–20301] | 20455 | 173 [173–174] | 424 [278–612] | 1425 [925–unresolved] | 1939 | 18.8 | 2127 | 122/26400 | 54655 |
+| complete partition | 3 | 192 [192–193] | 667 [666–670] | 1422 [1305–1598] | 20384 | 458 [458–459] | 1008 [765–1229] | 1769 [1322–unresolved] | 1822 | 29.4 | 3284 | 82/26400 | 69075 |
+| complete partition | 5 | 195 [194–199] | 771 [746–790] | 20704 [20512–20799] | 21228 | 527 [527–528] | 2876 [1596–20754] | 21206 [21141–unresolved] | 21239 | 38.0 | 4238 | 169/26400 | 80862 |
+| partial partition | 1 | 123 [123–123] | 127 [127–127] | 127 [127–127] | 127 | 123 [123–123] | 127 [127–127] | 127 [127–unresolved] | 127 | 20.1 | 2291 | 40/26400 | 58735 |
+| partial partition | 3 | 174 [174–174] | 524 [520–525] | 827 [781–922] | 20102 | 458 [458–458] | 824 [718–925] | 1000 [974–unresolved] | 1478 | 31.2 | 3468 | 53/26400 | 74217 |
+| partial partition | 5 | 177 [177–177] | 525 [524–526] | 744 [699–788] | 20203 | 525 [525–525] | 812 [696–857] | 974 [944–unresolved] | 1008 | 40.5 | 4486 | 138/26400 | 87070 |
+| simplex partition | 1 | 174 [174–174] | 424 [337–489] | 20380 [20355–20410] | 20516 | 174 [174–174] | 505 [272–20286] | 20380 [20310–unresolved] | 20416 | 18.8 | 2125 | 60/26400 | 56340 |
+| simplex partition | 3 | 191 [190–192] | 670 [667–673] | 1484 [979–20301] | 20495 | 458 [458–459] | 947 [779–20367] | 20421 [20403–unresolved] | 20458 | 29.5 | 3287 | 53/26400 | 70719 |
+| simplex partition | 5 | 195 [193–197] | 723 [716–725] | 20608 [20479–20661] | 20767 | 527 [527–528] | 20498 [20473–20711] | 20771 [20767–unresolved] | 20809 | 38.4 | 4276 | 138/26400 | 82527 |
+
+What it shows:
+- **Quiet paths, loss to 1%, duplication: the layer costs a tail.** With one log a keyed command's
+  p99 is one region's round (127 ms); with three and five logs it is the global it waits behind
+  (456 and 521 ms), the barrier wait slates measured. Loss and duplication add only their resends.
+- **Loss 10%**: every shape's p99 passes 1.6 s, and more logs are worse at every quantile (keyed
+  p99 1.65, 2.64 and 3.07 s at one, three and five logs): a keyed command outside log 0 waits for a
+  barrier whose append, and whose global's, may each be lost.
+- **Jitter 50 ms**: the same shape, each tail by the jitter.
+- **Complete and simplex partitions of a log's preferred leader**: until its detectors suspect it,
+  a cut leader's log takes commands it cannot commit; those wait the partition out (the 20 s
+  maxima, every shape including one log). This is the core's, not the layer's: one log shows it as
+  the others do.
+- **Partial partition: the layer's own failure, found here and fixed.** Before the rule of
+  `docs/multilog.md` §7.1, three and five logs had a keyed p99 of 18.8 and 18.2 s: the member cut
+  from log 0's leader led log 1, its merge stopped at log 0's next global, and log 1's commands
+  waited at it for the whole partition. With the rule (a member cut from a lower log's leader yields
+  what it leads and is not handed it back), keyed p99 is 524 and 525 ms, the quiet paths' 456 and
+  521 plus the hand-over; one log never had the failure (127 ms). A command proposed at the
+  yielding leader before it yielded still waits for that member (the 20.1 s maximum).
+- **Steps**: the most any run took, 90,164, sets `HOSTILE_STEPS` at four times it.
+
+```sh
+HYPER_MULTILOG_SEEDS=20 cargo test -p hyper-multilog --release --test multilog_timed -- --ignored --exact multi_log_under_hostile_networks --nocapture
+```
+
+## End to end
+
+`crates/hyper-multilog-e2e`: each member an OS process holding every log of the group, each log a
+`hyper_raft` member on its own fsynced file (`hyper_raft_e2e::wal`, the platform's full flush), Raft
+datagrams over UDP tagged with their log and stamped (§7.1), one node-pair liveness stream a pair
+shared by every log, elections by suspicion. The test is the core's harness
+(`hyper_raft_e2e::quiet`'s waits on facts), its client routing each key to its log and following
+each log's leader. Writes alternate keyed and global (`*` keys), so every keyed write outside log
+0 waits at a barrier and every global waits for every other log's barrier: the workload that takes
+the merge's whole path, not one that would show a gain. The client is closed loop (a write, then
+its read, then the next: `docs/tails.md` §3.1). The faults its harness injects are the core's: a
+member killed with `SIGKILL` and restarted on its logs, and a member cut off by a drop filter in
+its process; loss, delay, jitter and duplication on real sockets wait for the impairment relay
+(`docs/tails.md` §4.2, T-2) and are measured above on hyper-sim's network.
+
+Release, 2026-10-04: the four scenarios from 11:15 PDT (load average 17.7 at the start); the tails
+scenarios again from 11:25 (load 130.1 at the start, 67.0 at the end), after a fix to the accounts'
+sum. A phase is 136 writes on this datagram (9,216 bytes; 129 for the longer scenario names).
+Milliseconds, with 95% intervals.
+
+| Scenario | What a client saw | Writes p50 / p99 / p99.9 / max | Reads p50 / p99 / p99.9 / max | Merged alike |
+|---|---|---|---|---|
+| `commits-1` (1 log) | 136 writes (68 global) answered and read back | 18.4 / 35.0 / unresolved / 38.1 | 0.20 / 18.2 / unresolved / 26.7 | 137 |
+| `commits-3` (3 logs) | 136 writes (68 global) answered and read back | 50.3 / 94.9 / unresolved / 125.2 | 0.22 / 16.1 / unresolved / 21.6 | 276 |
+| `member-killed` (3 logs) | log 0's leader killed after 129 writes, member 2 elected in term 5, 129 more without it; restarted on its logs, its restart reported; 258 writes read back | 35.6 / 91.2 / unresolved / 1,091 | 0.12 / 11.9 / unresolved / 16.2 | 520 |
+| `partition` (3 logs) | log 0's leader cut off answered a read, a write and a later read each with `NotLeader(0)`; member 3 elected; 273 read back after the filter lifted | 40.8 / 98.1 / unresolved / 106.0 | 0.26 / 20.1 / unresolved / 55.3 | 553 |
+| `tails-1` (1 log), 3,688 writes | 1,844 global | 23.2 [23.0–23.5] / 143 [113–171] / 806 [307–2,654] / 2,654 | 4.37 [3.79–4.53] / 22.9 [21.2–24.4] / 87.6 [46.1–398] / 398 | 3,691 |
+| `tails-3` (3 logs), 3,688 writes | 1,844 global | 62.5 [56.8–65.4] / 409 [336–492] / 1,189 [828–1,860] / 1,860 | 0.57 [0.43–0.89] / 36.7 [25.4–82.5] / 279 [181–372] / 372 | 7,382 |
+
+3,688 writes is the least for which a p99.9's 95% interval closes above (`0.999ⁿ ≤ 0.025`); the
+smaller scenarios leave it unresolved. The members' accounts over the tails scenarios
+(`proc_pid_rusage(RUSAGE_INFO_V6)` of each member process, summed), and over 10 s idle after:
+
+| Per write, three members | 1 log | 3 logs |
+|---|---|---|
+| CPU (user + system) | 1,150 µs (223 + 926) | 2,780 µs (414 + 2,366) |
+| instructions | 4.12 M | 6.61 M |
+| cycles | 4.83 M | 11.66 M |
+| energy | 2.31 mJ | 4.86 mJ |
+| device bytes written per byte stored | 3,951 | 7,665 |
+| peak footprint, a member | 2.7 MiB | 3.4 MiB |
+| **Idle, per member** | | |
+| wakeups a second | 2.6 | 2.5 |
+| CPU a second | 0.369 ms | 0.415 ms |
+| energy a second | 0.628 mJ | 0.742 mJ |
+| footprint | 2.6 MiB | 3.2 MiB |
+
+What it shows, plainly:
+- **Three logs lose to one at every quantile of a write**: p50 62.5 against 23.2 ms, p99 409
+  against 143, p99.9 1,189 against 806. A global write waits for both other logs' barriers, each
+  its own fsynced append and round, and a keyed write outside log 0 waits for the global before it.
+  On this workload the layer adds a barrier per global per log and the waits on them.
+- **Reads are not slower at the median** (0.57 against 4.37 ms, not traced) but are at the tail
+  (p99 36.7 against 22.9, p99.9 279 against 88).
+- **Efficiency: three logs cost 2.4 times the CPU, 2.4 times the cycles, 2.1 times the energy and
+  1.9 times the device bytes of one log per write**, for no gain in latency: two more fsynced logs
+  a member and a barrier for every global in each. The device bytes per byte stored (3,951 and
+  7,665) are each write's records rounded to the device's pages and flushed once per write (a write
+  stores some 20 bytes of key and value), times three members.
+- **Idle**: a member wakes 2.5 times a second and spends 0.4 ms of CPU and 0.6 to 0.7 mJ a second
+  whatever its logs: its heartbeats are a node pair's, shared by every log (hyper-liveness), not a
+  log's. A log adds about 0.3 MiB of footprint.
+- **A defect the gate found under load** (load 79, `member-killed`): a member kept a write waiting
+  that no apply would answer (its report's `stray`). A client asked the write of a new leader that
+  already held the old leader's entry for it; the member waited for that entry but answered only
+  commands it had proposed itself. A waited write is now answered when its key's value is applied
+  in its log, whoever proposed it; the core's member never had the restriction. The scenarios above
+  ran before the fix: it changes which member answers, not what is applied.
+- No consumer should enable multilog on this evidence: it gains nothing here and costs about twice
+  the resources. Its case is a workload whose logs are each saturated alone, which none of these
+  is; slates measured the same for its own groups.
+
+```sh
+cargo test --release -p hyper-multilog-e2e --test cluster
+cargo test --release -p hyper-multilog-e2e --test cluster -- tails
+cd crates/hyper-raft-compare && cargo run --release -- multilog 5 2000
+```

@@ -131,13 +131,15 @@ fn place(entries: &mut Vec<Entry>, entry: Entry) -> Result<(), WalError> {
     Ok(())
 }
 
-/// The most entries a log of `max_writes` writes holds at `term`: one for each write, and one
-/// for each term's leader.
-fn bound(max_writes: usize, term: u64) -> usize {
-    max_writes.saturating_add(usize::try_from(term).unwrap_or(usize::MAX))
+/// The most entries a log of `max_writes` writes holds at `term`: one for each write, and
+/// `per_term` for each term (its leader's empty entry, and whatever more an owner's protocol
+/// appends once a term). Saturated: a bound past the address space is none.
+fn bound(max_writes: usize, per_term: usize, term: u64) -> usize {
+    let terms = usize::try_from(term).unwrap_or(usize::MAX);
+    max_writes.saturating_add(per_term.saturating_mul(terms))
 }
 
-fn replay(bytes: &[u8], max_writes: usize) -> Result<Replayed, WalError> {
+fn replay(bytes: &[u8], max_writes: usize, per_term: usize) -> Result<Replayed, WalError> {
     let mut replayed = Replayed {
         hard: HardState::default(),
         entries: Vec::new(),
@@ -158,7 +160,7 @@ fn replay(bytes: &[u8], max_writes: usize) -> Result<Replayed, WalError> {
         }
         replayed.valid = end;
     }
-    if replayed.entries.len() > bound(max_writes, replayed.hard.term) {
+    if replayed.entries.len() > bound(max_writes, per_term, replayed.hard.term) {
         return Err(WalError::Full);
     }
     Ok(replayed)
@@ -214,6 +216,8 @@ pub struct Wal {
     /// What one write encodes into, kept from one write to the next.
     buffer: Vec<u8>,
     max_writes: usize,
+    /// The entries a term adds besides the writes ([`bound`]).
+    per_term: usize,
     /// Entries handed over that could not be placed.
     damaged: Option<WalError>,
     /// Until when the device answers no flush, as the test asked ([`Wal::stall_flushes`]).
@@ -224,6 +228,17 @@ impl Wal {
     /// The log at `path` of a group of `voters` whose scenario makes at most `max_writes` writes;
     /// made empty if there is none.
     pub fn open(path: &Path, voters: Vec<u64>, max_writes: usize) -> Result<Self, WalError> {
+        Self::open_per_term(path, voters, max_writes, 1)
+    }
+    /// As [`Wal::open`], for a log whose terms each add `per_term` entries besides the writes:
+    /// the leader's empty entry, and what an owner's protocol appends once a term (a multilog's
+    /// barrier, `hyper-multilog-e2e`).
+    pub fn open_per_term(
+        path: &Path,
+        voters: Vec<u64>,
+        max_writes: usize,
+        per_term: usize,
+    ) -> Result<Self, WalError> {
         let created = !path.exists();
         let mut file = OpenOptions::new()
             .read(true)
@@ -237,7 +252,7 @@ impl Wal {
         }
         let mut bytes = Vec::new();
         file.read_to_end(&mut bytes)?;
-        let replayed = replay(&bytes, max_writes)?;
+        let replayed = replay(&bytes, max_writes, per_term)?;
         if replayed.valid < bytes.len() {
             cut(&file, replayed.valid)?;
         }
@@ -252,6 +267,7 @@ impl Wal {
             entries: replayed.entries,
             buffer: Vec::new(),
             max_writes,
+            per_term,
             damaged: None,
             stalled: None,
         })
@@ -278,7 +294,7 @@ impl Wal {
             usize::try_from(entry.index).unwrap_or(usize::MAX)
         });
         let term = hard.map_or(self.hard.term, |hard| hard.term.max(self.hard.term));
-        if end > bound(self.max_writes, term) {
+        if end > bound(self.max_writes, self.per_term, term) {
             return Err(WalError::Full);
         }
         self.buffer.clear();

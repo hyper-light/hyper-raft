@@ -147,3 +147,28 @@ fn a_log_past_its_bound_is_refused() {
     ));
     assert_eq!(held(&wal), vec![(1, 1), (2, 1)]);
 }
+
+/// A log whose terms each add more than their leader's entry (a multilog's barriers) holds that
+/// many a term besides its writes, and no more.
+#[test]
+fn a_log_holds_its_writes_and_its_entries_a_term() {
+    let path = fresh("per-term");
+    let mut wal = Wal::open_per_term(&path, vec![1], 2, 3).unwrap();
+    let hard = HardState {
+        term: 1,
+        ..HardState::default()
+    };
+    wal.persist((1..=5).map(|index| entry(index, 1)).collect(), Some(&hard))
+        .unwrap();
+    assert!(matches!(
+        wal.persist(vec![entry(6, 1)], None),
+        Err(WalError::Full)
+    ));
+    drop(wal);
+    let wal = Wal::open_per_term(&path, vec![1], 2, 3).unwrap();
+    assert_eq!(held(&wal).len(), 5);
+    assert!(matches!(
+        Wal::open_per_term(&path, vec![1], 2, 2),
+        Err(WalError::Full)
+    ));
+}

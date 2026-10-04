@@ -756,11 +756,25 @@ name = "hyper-multilog"
 version = "0.1.0"
 dependencies = [
  "crc32c",
+ "hyper-measure",
  "hyper-raft",
  "hyper-sim",
  "hyper-timing",
  "proptest",
  "thiserror 2.0.20",
+]
+
+[[package]]
+name = "hyper-multilog-e2e"
+version = "0.1.0"
+dependencies = [
+ "hyper-liveness",
+ "hyper-measure",
+ "hyper-multilog",
+ "hyper-raft",
+ "hyper-raft-e2e",
+ "hyper-timing",
+ "hyper-tokio",
 ]
 
 [[package]]

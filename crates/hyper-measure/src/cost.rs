@@ -22,11 +22,11 @@ pub struct Cost {
 /// `work`, with what it cost. The allocator's counts need [`alloc::Counting`] installed; without
 /// it they are zero.
 pub fn measure<T>(work: impl FnOnce() -> T) -> (T, Cost) {
-    let before = usage::read().ok();
+    let before = usage::this().ok();
     alloc::begin();
     let done = work();
     let counts = alloc::end();
-    let after = usage::read().ok();
+    let after = usage::this().ok();
     let usage = after
         .zip(before)
         .map(|(after, before)| after.since(&before));
@@ -95,7 +95,7 @@ impl Costs {
             self.system_ns.push(usage.system_ns);
             self.instructions.extend(usage.instructions);
             self.cycles.extend(usage.cycles);
-            self.footprint = self.footprint.max(usage.peak);
+            self.footprint = self.footprint.max(usage.peak_footprint);
         }
         self.allocations.push(cost.counts.calls());
         self.peak_bytes

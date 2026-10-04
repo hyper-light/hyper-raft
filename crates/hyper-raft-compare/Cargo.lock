@@ -381,6 +381,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "hyper-multilog"
+version = "0.1.0"
+dependencies = [
+ "crc32c",
+ "hyper-raft",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "hyper-raft"
 version = "0.1.0"
 dependencies = [
@@ -396,6 +405,7 @@ dependencies = [
  "focal-raft 0.1.0 (git+https://github.com/hyper-light/focal?rev=1395e223c065e85158ec1611fdc72073d28fd8a0)",
  "focal-raft 0.1.0 (git+https://github.com/hyper-light/focal?rev=a8e95f71496461ebc8984926a65666746e946473)",
  "hyper-measure",
+ "hyper-multilog",
  "hyper-raft",
  "raft",
  "raft-proto",

@@ -442,3 +442,149 @@ fn a_member_behind_a_compaction_installs_the_image_and_catches_up() {
     );
     same_everywhere(&mut group);
 }
+
+/// Three members of two logs whose elections run by suspicion, as an owner's detectors drive them.
+fn by_suspicion(seed: u64) -> Group {
+    let ids = [1, 2, 3];
+    Group {
+        members: ids
+            .iter()
+            .map(|id| support::Member::open(*id, &ids, 2, seed + id, ROOMY, true))
+            .collect(),
+        flight: Vec::new(),
+        blocked: std::collections::BTreeSet::new(),
+    }
+}
+
+/// `docs/multilog.md` §7.1: two logs' leaders cut from each other (a partial partition: the third
+/// member hears both). Log 1's leader is cut from log 0's, so its merge stops at log 0's next
+/// global: it stands at priority zero in log 1 and yields it to the member it does not suspect;
+/// log 0's leader, cut only from a later log's, keeps log 0. The new leader of log 1 does not hand
+/// it back while its preferred voter's messages state it cut; once the cut heals, it does.
+#[test]
+fn a_leader_cut_from_a_lower_logs_leader_yields_and_is_not_handed_back() {
+    let mut group = by_suspicion(23);
+    group.elect(0, 1);
+    group.elect(1, 2);
+    for member in &mut group.members {
+        member.multi.spread(&[1, 2, 3]).unwrap();
+    }
+    assert_eq!(
+        group.member(2).multi.hand_off(1),
+        None,
+        "2 is log 1's preferred voter"
+    );
+    group.cut(1, 2, true);
+    for (me, them) in [(1, 2), (2, 1)] {
+        for log in 0..2 {
+            group
+                .member(me)
+                .multi
+                .node_mut(log)
+                .unwrap()
+                .suspect(them)
+                .unwrap();
+        }
+    }
+    assert!(group.member(2).multi.cut_below(1));
+    assert!(
+        !group.member(1).multi.cut_below(1),
+        "1 leads log 0 and hears log 0"
+    );
+    assert!(!group.member(3).multi.cut_below(1));
+    // A command in each log, so each leader hears member 3 hold its whole log.
+    for (leader, log) in [(1, 0), (2, 1)] {
+        let key = (0..).find(|key| log_of(*key, 2) == log).unwrap();
+        assert!(group.member(leader).propose(Route::Key(key), b"k".to_vec()));
+        group.quiet();
+    }
+    assert_eq!(group.member(1).multi.hand_off(0), None, "1 keeps log 0");
+    assert_eq!(group.member(2).multi.hand_off(1), Some(3), "2 yields log 1");
+    group
+        .member(2)
+        .multi
+        .node_mut(1)
+        .unwrap()
+        .transfer_leader(3)
+        .unwrap();
+    group.quiet();
+    assert!(group.member(3).leads(1), "3 leads log 1");
+    // 2's messages state it cut below log 1: 3 hands it nothing back, though 2 is preferred.
+    assert_eq!(group.member(3).multi.hand_off(1), None);
+    assert!(group.member(1).propose(Route::Global, b"g".to_vec()));
+    group.quiet();
+    for id in [1, 3] {
+        assert_eq!(
+            group.member(id).counts.globals_applied,
+            1,
+            "member {id} hears both leaders, and applies"
+        );
+    }
+    group.cut(1, 2, false);
+    for (me, them) in [(1, 2), (2, 1)] {
+        for log in 0..2 {
+            group
+                .member(me)
+                .multi
+                .node_mut(log)
+                .unwrap()
+                .trust(them)
+                .unwrap();
+        }
+    }
+    assert!(!group.member(2).multi.cut_below(1));
+    let key = (0..).find(|key| log_of(*key, 2) == 1).unwrap();
+    assert!(group.member(3).propose(Route::Key(key), b"k".to_vec()));
+    group.quiet();
+    assert_eq!(
+        group.member(3).multi.hand_off(1),
+        Some(2),
+        "log 1 goes back to 2"
+    );
+}
+
+/// `docs/multilog.md` §9: a batch for one log is one proposal, carried to each follower by one
+/// append; a batch with a command routed elsewhere is refused whole, and the bound on what a log
+/// holds past its merge counts the batch's commands.
+#[test]
+fn a_batch_is_one_proposal_refused_whole() {
+    let mut group = Group::new(3, 2, 29, Limits { unmerged: 8 });
+    group.elect(0, 1);
+    group.elect(1, 1);
+    let keys: Vec<u64> = (0..).filter(|key| log_of(*key, 2) == 1).take(5).collect();
+    let batch: Vec<(Route, Vec<u8>)> = keys
+        .iter()
+        .map(|key| (Route::Key(*key), key.to_le_bytes().to_vec()))
+        .collect();
+    group.member(1).multi.propose_in(1, batch.clone()).unwrap();
+    let mut out = Vec::new();
+    group.member(1).settle(&mut out);
+    let appends: Vec<&Message> = out
+        .iter()
+        .filter(|(log, m)| *log == 1 && m.msg_type == MessageType::MsgAppend)
+        .map(|(_, m)| m)
+        .collect();
+    assert_eq!(appends.len(), 2, "one append to each follower");
+    assert!(appends.iter().all(|m| m.entries.len() == 5));
+    group
+        .flight
+        .extend(out.into_iter().map(|(log, m)| (1, log, m)));
+    group.quiet();
+    let mut misrouted = batch.clone();
+    misrouted.push((Route::Global, b"g".to_vec()));
+    assert_eq!(
+        group.member(1).multi.propose_in(1, misrouted),
+        Err(Error::Violation("a batch's command routed to another log"))
+    );
+    // Log 1 holds its leader's entry and five commands, all merged; nine more would pass eight.
+    let nine: Vec<(Route, Vec<u8>)> = (0..9)
+        .map(|i| (Route::Key(keys[i % 5]), vec![i as u8]))
+        .collect();
+    assert_eq!(
+        group.member(1).multi.propose_in(1, nine),
+        Err(Error::Capacity("unmerged"))
+    );
+    group.member(1).multi.propose_in(1, batch).unwrap();
+    group.quiet();
+    same_everywhere(&mut group);
+}

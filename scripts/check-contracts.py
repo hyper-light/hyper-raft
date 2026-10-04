@@ -32,11 +32,11 @@ UNSAFE_ALLOWED = {
         "here and read only when the kernel's count of written words matches it; Win32 "
         "K32GetProcessMemoryInfo through windows-sys (page-fault counts)",
     "crates/hyper-measure/src/usage.rs":
-        "proc_pid_rusage(RUSAGE_INFO_V6) through libc with rusage_info_v6 declared here from the "
-        "SDK's <sys/resource.h>, and mach_timebase_info declared here; getrusage(2) and getloadavg(3) "
-        "through libc; "
-        "Win32 GetProcessTimes, QueryProcessCycleTime and K32GetProcessMemoryInfo through "
-        "windows-sys (CPU time, instructions, cycles and footprint; measurement only)",
+        "proc_pid_rusage(RUSAGE_INFO_V6) through a declaration of <libproc.h>, with "
+        "rusage_info_v6 declared here from <sys/resource.h>, and mach_timebase_info through libc "
+        "(macOS); sysconf(_SC_CLK_TCK) (Linux), getrusage(2) (other Unix) and getloadavg(3) "
+        "through libc; Win32 OpenProcess, CloseHandle, GetProcessTimes, QueryProcessCycleTime and "
+        "K32GetProcessMemoryInfo through windows-sys: a process's account; measurement only",
     "crates/hyper-measure/src/wake.rs":
         "std::task::RawWaker over a leaked slot (counting wakers; tests and benchmarks only)",
     "crates/hyper-block/src/node/macos.rs":

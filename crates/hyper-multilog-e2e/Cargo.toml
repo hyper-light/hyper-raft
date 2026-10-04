@@ -1,0 +1,34 @@
+[package]
+name = "hyper-multilog-e2e"
+description = "hyper-multilog in real use: one OS process per member of an n-log group, on real UDP sockets and a real fsynced log for each log, driven by tests that write, read, kill, restart and cut members off."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+hyper-raft = { path = "../hyper-raft" }
+hyper-multilog = { path = "../hyper-multilog" }
+# The core's E2E harness pieces this member runs on as that crate's member does: its fsynced log
+# (`wal`), its datagrams (`wire`), the node-pair liveness stream as it carries it (`stream`), the
+# run record (`run`), the parent watch and the fault report.
+hyper-raft-e2e = { path = "../hyper-raft-e2e" }
+hyper-liveness = { path = "../hyper-liveness" }
+hyper-tokio = { path = "../hyper-tokio" }
+hyper-timing = { path = "../hyper-timing" }
+# The wait for a datagram every member and real-socket test makes.
+hyper-measure = { path = "../hyper-measure" }
+
+[[bin]]
+name = "hyper-multilog-node"
+path = "src/main.rs"
+
+[[test]]
+name = "cluster"
+# The scenarios run one after another in one thread: a group at a time.
+harness = false
+
+[lints]
+workspace = true

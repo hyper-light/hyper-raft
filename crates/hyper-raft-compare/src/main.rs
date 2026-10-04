@@ -25,6 +25,7 @@
 
 mod core;
 mod family;
+mod multilog;
 mod slates;
 mod workload;
 
@@ -432,6 +433,23 @@ fn main() {
                 // gains under 10 % per entry.
                 .unwrap_or(64);
             table(runs, &args[2..], batch, &cores);
+        }
+        Some("one-multilog") => {
+            let spec = multilog::Spec {
+                logs: args[2].parse().expect("logs"),
+                batch: args[3].parse().expect("a batch"),
+                bytes: args[4].parse().expect("bytes"),
+                rounds: args[5].parse().expect("rounds"),
+            };
+            let seed: u64 = args[6].parse().expect("a seed");
+            let counting = args.get(7).map(String::as_str) == Some("count");
+            let measured = multilog::run(&args[1], &spec, seed, counting);
+            println!("{}", multilog::print(&measured));
+        }
+        Some("multilog") => {
+            let runs: usize = args[1].parse().expect("runs");
+            let rounds: usize = args[2].parse().expect("rounds");
+            multilog::table(runs, rounds);
         }
         Some("sweep") => {
             let runs: usize = args[1].parse().expect("runs");

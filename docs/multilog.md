@@ -364,6 +364,37 @@ and returns leadership to them (focal 27 §5). Here:
   owner's leadership-return policy (note 32 R11, a shell policy: focal's fit, quiet and rest rules),
   and the core's transfer catches the voter up and asks it to campaign.
 
+### 7.1 A leader cut from a lower log's leader yields
+
+In one Raft group a follower cut from its leader by a partial partition is only stale: the leader
+still has a quorum through the others, and no client waits on the follower. In a multilog every
+member is a follower of every log it does not lead, and its merge cannot pass a log's next barrier
+or global without that log's entries, which only its leader sends. So a member cut from one log's
+leader applies nothing past that log's next barrier or global, and if it leads another log, the
+commands proposed there are never applied at it while the cut lasts. Measured (`docs/benchmarks.md`,
+"Hostile networks"): a partial partition cutting log 0's preferred voter from the next-ranked one
+for 20 s left one log untouched (keyed p99 127 ms, as with no cut) and three and five logs at a
+keyed p99 of 18.8 and 18.2 s: the partition's length. Partial partitions are 29% of the 136
+partition failures Alquraan et al. studied (OSDI 2018; `docs/research/tails.md`).
+
+The rule, exact and local to each member:
+- A member is *cut below* log `k` when it suspects the leader its share of some log `j < k` last
+  named, and has heard of no other since (a member suspecting its leader campaigns and names none
+  meanwhile, but is cut all the while). Log 0, and a single log, are never cut below.
+- A member cut below `k` stands for election in `k` at priority zero, and, leading `k`, yields it
+  (`MultiLog::hand_off`) to the first voter in `k`'s order of preference that it does not suspect,
+  that did not state itself cut below `k`, that its leader hears and that holds its whole log.
+- Every message a member's share of `k` sends other than a vote states whether it is cut below `k`
+  (`MultiLog::stamp`: the message's priority field, which the core reads only in a vote and sets
+  there itself, carries `CUT`); a leader hands `k` to no voter whose last message there stated it.
+  When the cut heals the voter's messages say so, and `k` goes back to its preferred voter.
+
+Of two leaders cut from each other, only the one leading the later log is cut below its log, so
+exactly one yields and nothing is handed back and forth; the member that yielded leads nothing its
+clients wait on while the cut lasts. With the rule, the same partial partition left three and five
+logs at a keyed p99 of 524 and 525 ms. What remains above it is a command proposed at the yielding
+leader before it yielded: its client waits for that member, cut, to apply it (the maximum, 20.1 s).
+
 ## 8. Reads
 
 A read of a key asks log `log_of(k)` (`RawNode::read_index`) and is served once the merge has
@@ -384,7 +415,12 @@ a single group (`node_mut`: `ready`, persist, send, `on_persist`), with these di
 - the state machine's commands come from `MultiLog::apply`, in the merged order;
 - `MultiLog::barriers` after every drive; `MultiLog::step` for every message, in place of the
   member's `step`;
-- proposals through `MultiLog::propose`;
+- proposals through `MultiLog::propose`, or, for a batch of commands routed to one log,
+  `MultiLog::propose_in`, which makes them one proposal of the core, carried to each follower by
+  one append (measured: one proposal a command sent 8 messages a command at a batch of 64, one a
+  batch 0.12, `docs/benchmarks.md`, "Against slates' MLRaft");
+- each message a log's member sends stamped by `MultiLog::stamp` (§7.1), and `MultiLog::hand_off`
+  asked by the owner's leadership policy for every log it leads;
 - images at canonical cuts only, and their installation through `MultiLog::install` (§5).
 
 Refused at open, with reasons: the fast track (`Config::fast`: its displaced proposals and held

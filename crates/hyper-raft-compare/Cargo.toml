@@ -13,6 +13,8 @@ publish = false
 
 [dependencies]
 hyper-raft = { path = "../hyper-raft" }
+# The MLRaft layer, against slates' (`src/multilog.rs`).
+hyper-multilog = { path = "../hyper-multilog" }
 hyper-measure = { path = "../hyper-measure" }
 # (b) the control: focal-raft at the revision hyper-raft came from, byte-identical source.
 focal-raft-control = { package = "focal-raft", git = "https://github.com/hyper-light/focal", rev = "a8e95f71496461ebc8984926a65666746e946473" }

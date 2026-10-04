@@ -36,6 +36,20 @@ where
     A: hyper_transport::Classes<Kind = Kind, Class = Class, Role = Role>,
     B: hyper_transport::Classes<Kind = Kind, Class = Class, Role = Role>,
 {
+    connected_on(pair, limits, budget, hyper_sim::Source::Seed(0))
+}
+
+/// Node 1 and node 2 connected on a network whose world draws from `source`.
+fn connected_on<A, B>(
+    pair: &Pair,
+    limits: Limits,
+    budget: u64,
+    source: hyper_sim::Source,
+) -> Net<Node<A>, Node<B>>
+where
+    A: hyper_transport::Classes<Kind = Kind, Class = Class, Role = Role>,
+    B: hyper_transport::Classes<Kind = Kind, Class = Class, Role = Role>,
+{
     let now = hyper_sim::Anchor::new().instant(0).unwrap();
     let a = pair.node::<A>(
         1,
@@ -53,7 +67,7 @@ where
         budget,
         now,
     );
-    let mut net = Net::new(now, a, b);
+    let mut net = Net::of(now, a, b, source);
     let address = net.b_address;
     net.a.connect(now, 2, address).unwrap();
     let (mut one, mut two) = (false, false);
@@ -90,6 +104,17 @@ fn run(net: &mut Net<Node<Mantle>, Node<Mantle>>, asker: &mut Asker, server: &mu
         asker.drive(&mut net.a);
         asker.finished()
     });
+}
+
+/// The run-twice check (docs/sim.md §3.9): two nodes connect on the zero path to one digest from
+/// a seed twice and from its trace, whatever keys and nonces the endpoints draw for themselves.
+#[test]
+fn a_connection_runs_the_same_twice_and_from_its_trace() {
+    let pair = Pair::new();
+    let record = twice_on(1, |source| {
+        connected_on::<Mantle, Mantle>(&pair, limits(), 256 << 20, source)
+    });
+    assert!(record.steps > 0);
 }
 
 #[test]

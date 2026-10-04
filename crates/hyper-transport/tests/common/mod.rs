@@ -19,7 +19,6 @@
     unreachable_pub
 )]
 
-use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
@@ -302,74 +301,161 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Drive for En
 /// A node of the in-memory network.
 pub type Node<C> = Endpoint<C, Fixed, Book>;
 
-/// Two endpoints, `a` and `b`, joined by an in-memory network on the caller's clock. Datagrams
-/// arrive the instant they are sent; time moves only to the next timer when nothing is in flight.
-/// A datagram's buffer is reused, so the network allocates nothing once warm.
+/// What the network schedules on the world: a datagram's arrival.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Arrival {
+    Datagram(hyper_sim::net::Ticket),
+}
+
+/// Two endpoints, `a` and `b`, joined by hyper-sim's network on its world (`docs/sim.md` §3.4):
+/// node 0 is `a`, node 1 is `b`, the zero path between them, so a datagram arrives the instant it
+/// is sent and in the order sent, and time moves only to the next timer when nothing is in flight.
+/// The world's virtual time is the caller's clock from the instant it gave. A datagram's buffer is
+/// reused, so the network allocates nothing once warm.
 pub struct Net<A: Drive, B: Drive> {
     pub now: Instant,
     pub a: A,
     pub b: B,
     pub a_address: SocketAddr,
     pub b_address: SocketAddr,
-    /// Datagrams in flight: towards `b` when the flag is set.
-    queue: VecDeque<(bool, Vec<u8>)>,
-    spare: Vec<Vec<u8>>,
-    out: Vec<u8>,
     /// Whether datagrams to `b` are lost: `b` is gone.
     pub b_dead: bool,
+    /// The caller's instant at the world's time zero.
+    start: Instant,
+    world: hyper_sim::World<Arrival>,
+    wire: hyper_sim::net::Net<Vec<u8>>,
+    spare: Vec<Vec<u8>>,
+    out: Vec<u8>,
 }
+
+/// `a` and `b` as nodes of the world.
+const A: hyper_sim::NodeId = hyper_sim::NodeId(0);
+const B: hyper_sim::NodeId = hyper_sim::NodeId(1);
 
 impl<A: Drive, B: Drive> Net<A, B> {
     pub fn new(now: Instant, a: A, b: B) -> Self {
+        Self::of(now, a, b, hyper_sim::Source::Seed(0))
+    }
+
+    /// The network with its world's decisions drawn from `source`: the zero path draws none, and
+    /// the run-twice check ([`twice_on`]) holds it to that.
+    pub fn of(now: Instant, a: A, b: B, source: hyper_sim::Source) -> Self {
+        let limits = hyper_sim::Limits {
+            events: 1 << 12,
+            nodes: 2,
+            streams: 8,
+            steps: u64::MAX,
+            trace_words: 0,
+        };
+        let mut world =
+            hyper_sim::World::new(source, hyper_sim::Discipline::Ordered, limits).unwrap();
+        world.node(hyper_sim::Clock::default()).unwrap();
+        world.node(hyper_sim::Clock::default()).unwrap();
+        let wire = hyper_sim::net::Net::new(hyper_sim::net::NetLimits {
+            flows: 2,
+            links: 0,
+            nats: 0,
+            link_messages: 0,
+            messages: 1 << 12,
+            bytes: 1 << 26,
+        });
         Self {
             now,
             a,
             b,
             a_address: "127.0.0.1:4433".parse().unwrap(),
             b_address: "127.0.0.1:4434".parse().unwrap(),
-            queue: VecDeque::with_capacity(64),
+            b_dead: false,
+            start: now,
+            world,
+            wire,
             spare: Vec::with_capacity(64),
             out: Vec::with_capacity(1500),
-            b_dead: false,
         }
+    }
+
+    /// Hands every datagram `side` has to the network; whether there was any.
+    fn send_all(&mut self, from_a: bool) -> bool {
+        let mut any = false;
+        loop {
+            let transmit = if from_a {
+                self.a.transmit(self.now, &mut self.out)
+            } else {
+                self.b.transmit(self.now, &mut self.out)
+            };
+            let Some(transmit) = transmit else {
+                return any;
+            };
+            let mut bytes = self.spare.pop().unwrap_or_default();
+            bytes.clear();
+            bytes.extend_from_slice(&self.out[..transmit.size]);
+            let pair = if from_a { (A, B) } else { (B, A) };
+            self.wire
+                .send(
+                    &mut self.world,
+                    pair,
+                    bytes,
+                    transmit.size,
+                    Arrival::Datagram,
+                )
+                .unwrap();
+            any = true;
+        }
+    }
+
+    /// Delivers every datagram due now, in the order sent; whether there was any.
+    fn deliver_due(&mut self) -> bool {
+        let mut any = false;
+        while self
+            .world
+            .earliest()
+            .is_some_and(|due| due <= self.world.now())
+        {
+            let hyper_sim::Step::Event {
+                node,
+                event: Arrival::Datagram(ticket),
+            } = self.world.next(&mut hyper_sim::Fifo).unwrap()
+            else {
+                panic!("only datagrams are scheduled");
+            };
+            let delivery = self
+                .wire
+                .deliver(&mut self.world, ticket, Arrival::Datagram)
+                .unwrap()
+                .unwrap();
+            if node == B {
+                if !self.b_dead {
+                    self.b.datagram(self.now, self.a_address, &delivery.payload);
+                }
+            } else {
+                self.a.datagram(self.now, self.b_address, &delivery.payload);
+            }
+            self.spare.push(delivery.payload);
+            any = true;
+        }
+        any
     }
 
     /// Moves every datagram until neither side has any; returns whether any moved.
     pub fn exchange(&mut self) -> bool {
         let mut moved = false;
         for _ in 0..1_000_000 {
-            let mut any = false;
-            while let Some(transmit) = self.a.transmit(self.now, &mut self.out) {
-                let mut bytes = self.spare.pop().unwrap_or_default();
-                bytes.clear();
-                bytes.extend_from_slice(&self.out[..transmit.size]);
-                self.queue.push_back((true, bytes));
-                any = true;
-            }
-            while let Some(transmit) = self.b.transmit(self.now, &mut self.out) {
-                let mut bytes = self.spare.pop().unwrap_or_default();
-                bytes.clear();
-                bytes.extend_from_slice(&self.out[..transmit.size]);
-                self.queue.push_back((false, bytes));
-                any = true;
-            }
-            while let Some((to_b, bytes)) = self.queue.pop_front() {
-                if to_b {
-                    if !self.b_dead {
-                        self.b.datagram(self.now, self.a_address, &bytes);
-                    }
-                } else {
-                    self.a.datagram(self.now, self.b_address, &bytes);
-                }
-                self.spare.push(bytes);
-                any = true;
-            }
-            if !any {
+            let sent_a = self.send_all(true);
+            let sent_b = self.send_all(false);
+            let delivered = self.deliver_due();
+            if !(sent_a || sent_b || delivered) {
                 return moved;
             }
             moved = true;
         }
         panic!("the network never went quiet");
+    }
+
+    /// Moves the world's clock to the caller's instant `to`, which nothing in flight precedes.
+    fn move_to(&mut self, to: Instant) {
+        let at = u64::try_from(to.saturating_duration_since(self.start).as_nanos()).unwrap();
+        self.world.advance(at.max(self.world.now())).unwrap();
+        self.now = self.now.max(to);
     }
 
     /// Fires the earliest timer of either side, moving the clock to it.
@@ -384,7 +470,7 @@ impl<A: Drive, B: Drive> Net<A, B> {
         let Some(next) = next else {
             return false;
         };
-        self.now = self.now.max(next);
+        self.move_to(next);
         self.a.fire(self.now);
         if !self.b_dead {
             self.b.fire(self.now);
@@ -403,11 +489,16 @@ impl<A: Drive, B: Drive> Net<A, B> {
         .flatten()
         .min()
         .map_or(self.now + most, |next| next.min(self.now + most));
-        self.now = self.now.max(next);
+        self.move_to(next);
         self.a.fire(self.now);
         if !self.b_dead {
             self.b.fire(self.now);
         }
+    }
+
+    /// The run's record: the digest of every arrival the world ordered, and its trace.
+    pub fn finish(self) -> hyper_sim::Record {
+        self.world.finish()
     }
 
     /// Runs the network until `done` holds, exchanging datagrams and firing timers; `done` is
@@ -428,6 +519,20 @@ impl<A: Drive, B: Drive> Net<A, B> {
         }
         panic!("the condition never held in {turns} turns");
     }
+}
+
+/// `scenario` through hyper-sim's run-twice check (docs/sim.md §3.9): twice from `seed` and once
+/// from the first run's trace, each on the network `scenario` builds from the source it is given,
+/// to one digest. The endpoints' keys and nonces are their own draws, outside the world, so this
+/// also holds that what the network orders does not depend on them.
+pub fn twice_on<A: Drive, B: Drive>(
+    seed: u64,
+    mut scenario: impl FnMut(hyper_sim::Source) -> Net<A, B>,
+) -> hyper_sim::Record {
+    hyper_sim::twice(seed, |source| {
+        Ok::<_, std::convert::Infallible>(scenario(source).finish())
+    })
+    .unwrap()
 }
 
 /// The parts of two nodes that know each other: node 1 a client of node 2, or both nodes.

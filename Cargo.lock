@@ -775,6 +775,7 @@ version = "0.1.0"
 dependencies = [
  "hyper-datagram",
  "hyper-measure",
+ "hyper-sim",
  "hyper-timing",
 ]
 

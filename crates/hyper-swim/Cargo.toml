@@ -16,6 +16,8 @@ hyper-timing = { path = "../hyper-timing" }
 [dev-dependencies]
 hyper-datagram = { path = "../hyper-datagram" }
 hyper-measure = { path = "../hyper-measure" }
+# The simulation's world and network (`tests/sim.rs`, `docs/sim.md` §9, S-2).
+hyper-sim = { path = "../hyper-sim" }
 
 [[bench]]
 name = "allocs"

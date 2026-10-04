@@ -64,6 +64,13 @@ name = "client_cert_verifier"
 path = "tests/runners/client_cert_verifier.rs"
 
 [[test]]
+name = "e2e"
+path = "tests/e2e.rs"
+# Real processes over TCP: the binary is the client and spawns itself as each scenario's server
+# (CLAUDE.md §1a), one server process at a time.
+harness = false
+
+[[test]]
 name = "ech"
 path = "tests/ech.rs"
 

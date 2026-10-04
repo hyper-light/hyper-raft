@@ -160,7 +160,9 @@ ticketer and key log (10), and the certificate-compression cache (6). Measured w
     counter, and a session records the identities it was made under.
 - **Oracle.** rustls's own suite from its repository at the crate's source commit `2976d90`:
   `tests/` and the `rustls-test` crate, which the published archive omits. It is kept passing
-  throughout. Interop runs against unmodified upstream rustls as a dev-only dependency.
+  throughout. Interop runs against unmodified upstream rustls as a dev-only dependency: the
+  allocation counts are held to it in one process, and the end-to-end test runs it in the other
+  process, as client and as server (crates/hyper-tls/VENDORED.md §5, §6).
 
 ## 4. Stages
 

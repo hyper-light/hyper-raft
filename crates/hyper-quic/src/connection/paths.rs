@@ -150,7 +150,25 @@ impl PathData {
         // Byte counts: the budget saturates at a total no path reaches, and the bytes to send
         // saturate upward, which blocks rather than over-sends
         !self.validated
-            && self.total_recvd.saturating_mul(3) < self.total_sent.saturating_add(bytes_to_send)
+            && self.total_recvd.saturating_mul(AMPLIFICATION_FACTOR)
+                < self.total_sent.saturating_add(bytes_to_send)
+    }
+
+    /// The bytes RFC 9000 §8.1 still lets a server send to the peer's address beyond the `created`
+    /// ones not yet counted in `total_sent`, or `None` once the address is validated and no limit
+    /// applies: "an endpoint MUST limit the amount of data it sends to the unvalidated address to
+    /// three times the amount of data received from that address"
+    pub(super) fn amplification_room(&self, created: u64) -> Option<u64> {
+        if self.validated {
+            return None;
+        }
+        // Byte counts: the allowance saturates at a total no path reaches, and what is spent
+        // saturates upward, which leaves less room rather than more
+        Some(
+            self.total_recvd
+                .saturating_mul(AMPLIFICATION_FACTOR)
+                .saturating_sub(self.total_sent.saturating_add(created)),
+        )
     }
 
     /// Returns the path's current MTU
@@ -474,6 +492,10 @@ fn quarter(d: Duration) -> Duration {
 fn eighth(d: Duration) -> Duration {
     d.checked_div(8).unwrap_or(Duration::ZERO)
 }
+
+/// RFC 9000 §8.1's anti-amplification factor: before validating the peer's address, an endpoint
+/// sends at most three times the bytes it has received from it
+const AMPLIFICATION_FACTOR: u64 = 3;
 
 #[cfg(test)]
 mod tests {

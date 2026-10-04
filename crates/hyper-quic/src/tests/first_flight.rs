@@ -179,3 +179,55 @@ fn the_first_flight_fills_but_never_exceeds_three_times_what_arrived() {
         "sent {sent} for {received} received: a whole datagram more would have fit"
     );
 }
+
+/// RFC 9002 §6.2.2 and Appendix A.11 (`OnPacketNumberSpaceDiscarded`: `pto_count = 0`): dropping
+/// keys is forward progress and resets the probe backoff. A client whose first flight was lost
+/// probed once; when it then discards its Initial keys, on sending its first Handshake packet, its
+/// backoff is reset, so a lost Finished is probed one PTO later, not two.
+#[test]
+fn discarding_initial_keys_resets_the_probe_backoff() {
+    let _guard = subscribe();
+    let mut pair = Pair::default();
+    let client_ch = pair.begin_connect(client_config());
+    pair.drive_client();
+    // The first flight is lost, and the client's PTO fires.
+    pair.server.inbound.clear();
+    pair.time = pair.client.next_wakeup().unwrap();
+    pair.drive_client();
+    assert_eq!(pair.client_conn_mut(client_ch).pto_state().0, 1);
+    // The probe reaches the server, whose flight reaches the client; the client answers with its
+    // first Handshake packet, discarding its Initial keys, before anything acknowledges it.
+    pair.drive_server();
+    pair.drive_client();
+    assert_eq!(pair.client_conn_mut(client_ch).pto_state().0, 0);
+}
+
+/// RFC 9000 §8.1 on a path the client migrates to: until the server validates the new address it
+/// sends at most three times what it has received there, its MTU probes included, which wait
+/// for the validation (upstream let a full datagram go for a single byte of allowance, and sent
+/// its probes past the limit).
+#[test]
+fn a_migrated_path_stays_within_the_amplification_limit() {
+    let _guard = subscribe();
+    let mut pair = Pair::default();
+    let (client_ch, server_ch) = pair.connect();
+    pair.drive();
+    // Any other address: the pair carries datagrams in memory
+    let moved = SocketAddr::new(Ipv4Addr::new(127, 0, 0, 2).into(), 4433);
+    pair.client.addr = moved;
+    pair.client_conn_mut(client_ch).ping();
+    let mut validated = false;
+    for _ in 0..1_000 {
+        let moving = pair.step();
+        let server = pair.server_conn_mut(server_ch);
+        let (sent, now_validated) = server.amplification_state();
+        if server.remote_address() == moved && !now_validated {
+            assert!(sent <= 3 * server.total_recvd(), "{sent} sent");
+        }
+        validated |= now_validated && server.remote_address() == moved;
+        if !moving {
+            break;
+        }
+    }
+    assert!(validated);
+}

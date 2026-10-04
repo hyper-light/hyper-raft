@@ -422,3 +422,40 @@ before these: a connection forgotten as it drained before its end was read (the 
 waited for an end already gone), a server that took its client's stream mark for the end of its
 connection, and two hooks that read a stream before the server's limits let it open (one run in
 four at load 58).
+
+## 9. The handshake at a geographic distance (2026-10-04)
+
+slates reported a two-datagram X25519MLKEM768 ClientHello that failed at 500 ms one way.
+`tests/geo.rs` runs the handshake on hyper-sim's network at that delay, then again with 5% loss and
+±100 ms of reordering over 32 seeds, each checked exactly (`docs/transport.md` §4e). Six departures
+from upstream came out of it, each a defect with a test that failed before its fix:
+
+1. **The attempt bound counted one attempt twice** (`Endpoint::admit_first_packet`). A ClientHello
+   whose first datagram is lost has its second held. The retransmitted flight's first datagram then
+   found the held entry counted against `max_incoming`, so with room for one attempt the attempt
+   was refused until the held entry expired, three PTOs later. A held entry for the same
+   destination CID is now this attempt's own.
+2. **The anti-amplification limit is exact** (RFC 9000 §8.1). Upstream let a full datagram go
+   whenever one byte of allowance was left (quinn-rs/quinn#1082), so its first flight was 7,248
+   bytes against a 7,200-byte limit. A datagram is now cut to the allowance. A datagram that could
+   not hold its packet is not begun: for an ack-eliciting Initial that is 1,200 bytes (§14.1),
+   otherwise the smallest packet. A padded PATH_CHALLENGE datagram is padded only as far as the
+   allowance permits (§8.2.1). MTU probes wait for the path's validation; upstream sent them past
+   the limit after a migration.
+3. **A PTO probes every handshake space with data** (RFC 9002 §6.2.4, "the peer might only have
+   receive keys for one of the two packet number spaces"). Upstream probed only the space whose
+   timer fired. A server whose ServerHello was lost held Handshake packets in flight that the client
+   could not decrypt. It probed those until the idle timeout while the lost Initial waited,
+   congestion-blocked, behind them. Three of 32 lossy seeds never connected.
+4. **One packet past the window on entering recovery** (RFC 9002 §7 and §7.3.2). The
+   retransmission of a lost packet goes without waiting for in-flight bytes the peer may be unable
+   to acknowledge.
+5. **Packets ahead of their keys are held, not dropped** (RFC 9001 §4.1.4: an endpoint "SHOULD
+   buffer received packets if they might be processed using keys that are not yet available").
+   Upstream dropped a Handshake packet that overtook the Initial carrying the ServerHello. The
+   server then resent it after loss detection, a round trip or more later: about 2.9 s where 2 s
+   suffices with reordering and no loss. Held bytes are bounded by `crypto_buffer_size`, and past
+   the bound a packet is dropped as before.
+6. **Discarding keys resets the PTO backoff** (RFC 9002 §6.2.2, Appendix A.11's `pto_count = 0`).
+   Upstream carried the count past the discard, so a client whose Initial PTO had fired probed a
+   lost Finished after twice the PTO.

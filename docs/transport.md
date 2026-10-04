@@ -508,6 +508,33 @@ Open:
 - **Still to come.** slates' bake-off on the harness, and slates' 1 ms pacing quantum and
   two-datagram floor.
 
+## 4e. The handshake at a geographic distance (2026-10-04)
+
+The owner's condition is 500 ms one way. slates reported that a two-datagram hybrid ClientHello
+(X25519MLKEM768, a 1,184-byte key share) failed there. `crates/hyper-quic/tests/geo.rs` runs real
+endpoints on hyper-sim's network and records every datagram with its time and its packets' types.
+It checks four guarantees exactly, on a clean path and over 32 seeds of 5% loss with ±100 ms of
+reordering:
+
+- **(a)** The client retransmits its first flight on RFC 9002's PTO from kInitialRtt, 333 ms
+  (§6.2.2): flights go at 0, 999 ms and then double. Exactly one retransmission precedes the first
+  reply at 1,000 ms, and no lossy seed has more than two.
+- **(b)** A retransmitted two-datagram flight is one PTO expiry, so the backoff doubles once a
+  flight. It is one attempt against `max_incoming`, even when its first datagram was lost and its
+  second held.
+- **(c)** Duplicate Initials are acknowledged at once and surface no second attempt. Their bytes
+  grow the server's allowance, and the server never sends past three times what it received
+  (RFC 9000 §8.1).
+- **(d)** The hybrid ClientHello with a server flight larger than three times it completes at two
+  round trips on the clean path, the floor the amplification limit sets. Every lossy seed
+  completes and answers its first request. A seed that lost nothing completes within two of the
+  slowest round trips.
+
+Six defects were fixed at their causes to meet these (`crates/hyper-quic/VENDORED.md` §9): the
+attempt bound counting one attempt twice, the amplification limit overshot by a datagram, a PTO
+probing only one space while the lost ServerHello waited, no packet on entering recovery, packets
+dropped when they overtook their keys, and the PTO backoff kept past a key discard.
+
 ## 5. Consumers
 
 slates, focal and mantle each vendor a snapshot of the conformed crates, recording the hyper-raft revision

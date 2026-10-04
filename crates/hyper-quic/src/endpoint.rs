@@ -774,7 +774,15 @@ impl Endpoint {
 
         // Saturation only happens under heavy load, where deriving initial keys per Initial just to
         // reply with CONNECTION_REFUSED would starve packet processing for existing connections.
-        let pending = self.incoming_buffers.len().saturating_add(self.held.len());
+        // Datagrams already held for this destination CID are this attempt's, not another's: a
+        // ClientHello whose first datagram was lost is held by its second and begun by the
+        // retransmission, and the one attempt counts once.
+        let own_held = usize::from(self.index.held(dst_cid).is_some());
+        let pending = self
+            .incoming_buffers
+            .len()
+            .saturating_add(self.held.len())
+            .saturating_sub(own_held);
         if self.cids_exhausted() || pending >= server_config.max_incoming {
             debug!(
                 "ignoring initial for connection {} due to saturation",

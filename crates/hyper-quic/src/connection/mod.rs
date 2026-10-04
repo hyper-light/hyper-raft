@@ -176,6 +176,14 @@ pub struct Connection {
     /// one was received
     retry_src_cid: Option<ConnectionId>,
     events: VecDeque<Event>,
+    /// Handshake and 1-RTT packets that arrived before their keys, as reordering delivers them
+    /// ahead of the packet whose CRYPTO data yields the keys; held for decryption once the keys
+    /// arrive (RFC 9001 §4.1.4: "an endpoint SHOULD buffer received packets if they might be
+    /// processed using keys that are not yet available"). Their bytes are bounded by
+    /// `crypto_buffer_size`, the bound on the handshake data held out of order, since they carry
+    /// that data; past it a packet is dropped as upstream dropped them all.
+    undecryptable: VecDeque<(SocketAddr, Option<EcnCodepoint>, PartialDecode)>,
+    undecryptable_bytes: usize,
     endpoint_events: VecDeque<EndpointEventInner>,
     /// Whether the spin bit is in use for this connection
     spin_enabled: bool,
@@ -229,6 +237,10 @@ pub struct Connection {
     //
     /// The number of times a PTO has been sent without receiving an ack.
     pto_count: u32,
+    /// Whether the congestion window was just reduced by a loss, so that one packet may go past
+    /// it (RFC 9002 §7.3.2): the retransmission of what was lost, sent without waiting for the
+    /// in-flight bytes to drain below the reduced window
+    recovery_packet: bool,
 
     //
     // Congestion Control
@@ -322,6 +334,8 @@ impl Connection {
             initial_dst_cid: init_cid,
             retry_src_cid: None,
             events: VecDeque::new(),
+            undecryptable: VecDeque::new(),
+            undecryptable_bytes: 0,
             endpoint_events: VecDeque::new(),
             spin_enabled: config.allow_spin && rng.random_ratio(7, 8),
             spin: false,
@@ -355,6 +369,7 @@ impl Connection {
             next_bundled_ack_time: None,
 
             pto_count: 0,
+            recovery_packet: false,
 
             app_limited: false,
             receiving_ecn: false,
@@ -678,7 +693,9 @@ impl Connection {
         // In-memory sizes: saturating can only over-state the room a packet needs
         let room_needed = MIN_PACKET_SPACE.saturating_add(tag_len);
         if !tx.coalesce || tx.buf_capacity.saturating_sub(buf_end) < room_needed {
-            if let Some(fill) = self.start_datagram(now, space_id, ack_eliciting, pn, buf, tx) {
+            if let Some(fill) =
+                self.start_datagram(now, space_id, ack_eliciting, pn, tag_len, buf, tx)
+            {
                 return fill;
             }
         } else if let Some(builder) = tx.builder.take() {
@@ -760,6 +777,7 @@ impl Connection {
         space_id: SpaceId,
         ack_eliciting: bool,
         pn: u64,
+        tag_len: usize,
         buf: &mut Vec<u8>,
         tx: &mut TransmitState,
     ) -> Option<Fill> {
@@ -769,20 +787,35 @@ impl Connection {
             return Some(Fill::Stop);
         }
 
-        // Anti-amplification is only based on `total_sent`, which gets
-        // updated at the end of this method. Therefore we pass the amount
-        // of bytes for datagrams that are already created, as well as 1 byte
-        // for starting another datagram. If there is any anti-amplification
-        // budget left, we always allow a full MTU to be sent
-        // (see https://github.com/quinn-rs/quinn/issues/1082)
-        // A byte count: saturating can only over-state it, which blocks rather than over-sends
-        let created = (tx.segment_size as u64)
-            .saturating_mul(tx.num_datagrams as u64)
-            .saturating_add(1);
-        if self.path.anti_amplification_blocked(created) {
-            trace!("blocked by anti-amplification");
-            return Some(Fill::Stop);
-        }
+        // RFC 9000 §8.1: before the peer's address is validated, the bytes sent stay within three
+        // times those received. `total_sent` counts this transmit's datagrams only once it ends,
+        // so the ones already begun here count at their full segment size, which over-states
+        // them and so never over-sends. Upstream let a full MTU go whenever a single byte of
+        // allowance was left (quinn-rs/quinn#1082), overshooting the limit by up to a datagram;
+        // here the datagram is cut to the allowance, and none is begun that could not hold its
+        // packet: an ack-eliciting Initial datagram, which RFC 9000 §14.1 requires a server to
+        // expand to 1,200 bytes, or the smallest packet worth coalescing.
+        let created = (tx.segment_size as u64).saturating_mul(tx.num_datagrams as u64);
+        let room = match self.path.amplification_room(created) {
+            None => tx.segment_size,
+            Some(room) => {
+                let needed = match space_id {
+                    SpaceId::Initial if ack_eliciting => usize::from(MIN_INITIAL_SIZE),
+                    // A short header, its tag, and the 4 bytes past the packet number's start
+                    // that header protection samples from (RFC 9001 §5.4.2)
+                    SpaceId::Data => self
+                        .predict_1rtt_overhead(Some(pn))
+                        .saturating_add(HP_SAMPLE_OFFSET),
+                    _ => MIN_PACKET_SPACE.saturating_add(tag_len),
+                };
+                let room = usize::try_from(room).unwrap_or(usize::MAX);
+                if room < needed {
+                    trace!("blocked by anti-amplification");
+                    return Some(Fill::Stop);
+                }
+                room
+            }
+        };
 
         // Congestion control and pacing checks
         // Tail loss probes must not be blocked by congestion, or a deadlock could arise
@@ -800,7 +833,7 @@ impl Connection {
             return Some(fill);
         }
 
-        self.allocate_datagram(space_id, buf, tx);
+        self.allocate_datagram(space_id, room, buf, tx);
         None
     }
 
@@ -814,8 +847,13 @@ impl Connection {
 
         // Byte counts: saturating can only over-state them, which blocks rather than over-sends
         let bytes_to_send = (tx.segment_size as u64).saturating_add(untracked_bytes);
-        if self.path.in_flight.bytes.saturating_add(bytes_to_send) >= self.path.congestion.window()
-        {
+        let window_blocked = self.path.in_flight.bytes.saturating_add(bytes_to_send)
+            >= self.path.congestion.window();
+        // RFC 9002 §7: a packet may exceed the window "when entering recovery", one packet
+        // (§7.3.2), which speeds loss recovery as RFC 6675 §5 does for TCP. Without it a lost
+        // Initial whose peer cannot acknowledge the in-flight Handshake packets (it has no keys
+        // for them until the lost data arrives) waits behind a window that never drains.
+        if window_blocked && !self.recovery_packet {
             tx.congestion_blocked = true;
             // We continue instead of breaking here in order to avoid
             // blocking loss probes queued for higher spaces.
@@ -840,6 +878,10 @@ impl Connection {
             trace!("blocked by pacing");
             return Some(Fill::Stop);
         }
+        if window_blocked {
+            trace!("one packet past the window on entering recovery");
+            self.recovery_packet = false;
+        }
         None
     }
 
@@ -855,7 +897,7 @@ impl Connection {
         tx: &mut TransmitState,
     ) -> Option<Fill> {
         if tx.pad_datagram {
-            builder.pad_to(MIN_INITIAL_SIZE);
+            builder.pad_to(tx.padded_size());
         }
 
         if tx.num_datagrams > 1 || tx.pad_datagram_to_mtu {
@@ -927,7 +969,14 @@ impl Connection {
     }
 
     /// Allocate space for another datagram
-    fn allocate_datagram(&mut self, space_id: SpaceId, buf: &mut Vec<u8>, tx: &mut TransmitState) {
+    /// Begins a datagram of at most `room` bytes, the anti-amplification allowance
+    fn allocate_datagram(
+        &mut self,
+        space_id: SpaceId,
+        room: usize,
+        buf: &mut Vec<u8>,
+        tx: &mut TransmitState,
+    ) {
         let space = self.spaces.get_mut(space_id);
         let next_datagram_size_limit = match space.loss_probes.checked_sub(1) {
             None => tx.segment_size,
@@ -939,6 +988,7 @@ impl Connection {
                 cmp::min(tx.segment_size, usize::from(INITIAL_MTU))
             }
         };
+        let next_datagram_size_limit = cmp::min(next_datagram_size_limit, room);
         // In-memory: at most `max_datagrams` segments
         tx.buf_capacity = tx.buf_capacity.saturating_add(next_datagram_size_limit);
         if buf.capacity() < tx.buf_capacity {
@@ -1080,7 +1130,7 @@ impl Connection {
             return;
         };
         if tx.pad_datagram {
-            builder.pad_to(MIN_INITIAL_SIZE);
+            builder.pad_to(tx.padded_size());
         }
 
         // If this datagram is a loss probe and `segment_size` is larger than `INITIAL_MTU`,
@@ -1107,6 +1157,12 @@ impl Connection {
 
     /// Writes an MTU probe into the empty `buf`, if one is due
     fn write_mtu_probe(&mut self, now: Instant, buf: &mut Vec<u8>) -> Option<()> {
+        // A probe is a datagram like any other to RFC 9000 §8.1's limit, and one of up to the
+        // MTU's size would spend an unvalidated path's whole allowance on padding (upstream sent
+        // them past the limit after a migration): probing waits for the path's validation.
+        if self.path.amplification_room(0).is_some() {
+            return None;
+        }
         let space_id = SpaceId::Data;
         let probe_size = self.path.mtud.poll_transmit(
             now,
@@ -1287,6 +1343,9 @@ impl Connection {
                     self.stats.udp_rx.bytes =
                         self.stats.udp_rx.bytes.saturating_add(data.len() as u64);
                     self.handle_coalesced(configs, now, remote, ecn, data);
+                }
+                if !self.undecryptable.is_empty() {
+                    self.replay_undecryptable(configs, now);
                 }
 
                 self.qlog.emit_recovery_metrics(
@@ -1895,8 +1954,29 @@ impl Connection {
             // Conventional loss probe
             _ => 2,
         };
+        // RFC 9002 §6.2.4: "the sender SHOULD send ack-eliciting packets from other packet number
+        // spaces with in-flight data", since "the peer might only have receive keys for one of the
+        // two packet number spaces". A space whose packets were declared lost has its data
+        // pending rather than in flight, and it is the one the peer most needs: a server whose
+        // ServerHello was lost holds Handshake packets in flight that the client cannot decrypt,
+        // and probing only the Handshake space repeats them until the idle timeout. So each
+        // other handshake space with keys and data in flight or pending gets one of the probes,
+        // the expired space keeping at least one; earlier spaces are written first, coalesced.
+        let mut probes: u32 = count;
+        for other in [SpaceId::Initial, SpaceId::Handshake] {
+            let candidate = self.spaces.get(other);
+            if other == space
+                || candidate.crypto.is_none()
+                || !(candidate.has_in_flight() || !candidate.pending.is_empty(&self.streams))
+            {
+                continue;
+            }
+            let probes_here = &mut self.spaces.get_mut(other).loss_probes;
+            *probes_here = probes_here.saturating_add(1);
+            probes = probes.saturating_sub(1).max(1);
+        }
         self.spaces.get_mut(space).loss_probes =
-            self.spaces.get(space).loss_probes.saturating_add(count);
+            self.spaces.get(space).loss_probes.saturating_add(probes);
         self.pto_count = self.pto_count.saturating_add(1);
         self.set_loss_detection_timer(now);
     }
@@ -2072,12 +2152,16 @@ impl Connection {
 
         if lost_ack_eliciting {
             self.stats.path.congestion_events = self.stats.path.congestion_events.saturating_add(1);
+            let window = self.path.congestion.window();
             self.path.congestion.on_congestion_event(
                 now,
                 largest_lost_sent,
                 lost.persistent_congestion,
                 lost.bytes,
             );
+            // Entering recovery reduces the window; a loss within a recovery period does not
+            // (RFC 9002 §7.3.2), and gets no extra packet
+            self.recovery_packet |= self.path.congestion.window() < window;
         }
     }
 
@@ -2530,6 +2614,12 @@ impl Connection {
         for packet in sent_packets.into_values() {
             self.remove_in_flight(&packet);
         }
+        // Discarding keys is forward progress: RFC 9002 §6.2.2 resets the PTO with the timers,
+        // and Appendix A.11's OnPacketNumberSpaceDiscarded sets pto_count = 0. Upstream kept the
+        // count, so a client whose Initial PTO fired once carried the doubled backoff into the
+        // handshake and the first request (at 500 ms one way, a probe 6.8 s after a lost Finished
+        // instead of 3.4 s).
+        self.pto_count = 0;
         self.set_loss_detection_timer(now)
     }
 
@@ -2570,6 +2660,13 @@ impl Connection {
         ecn: Option<EcnCodepoint>,
         partial_decode: PartialDecode,
     ) {
+        if self.hold_undecryptable(remote, &partial_decode) {
+            self.undecryptable_bytes = self
+                .undecryptable_bytes
+                .saturating_add(partial_decode.len());
+            self.undecryptable.push_back((remote, ecn, partial_decode));
+            return;
+        }
         if let Some(decoded) = packet_crypto::unprotect_header(
             partial_decode,
             &self.spaces,
@@ -2584,6 +2681,54 @@ impl Connection {
                 decoded.packet,
                 decoded.stateless_reset,
             );
+        }
+    }
+
+    /// Whether a packet of `space` is to be held until its keys arrive: a Handshake or 1-RTT
+    /// packet while handshaking, with no keys for its space yet and room in the bound. An Initial
+    /// packet with no keys is one whose keys were discarded, and 0-RTT keys are the server's to
+    /// have at the ClientHello, so neither is held.
+    fn hold_undecryptable(&self, remote: SocketAddr, partial_decode: &PartialDecode) -> bool {
+        let Some(space) = partial_decode.space() else {
+            return false;
+        };
+        self.is_handshaking()
+            && remote == self.path.remote
+            && !partial_decode.is_0rtt()
+            && space != SpaceId::Initial
+            && self.spaces.get(space).crypto.is_none()
+            && self
+                .undecryptable_bytes
+                .checked_add(partial_decode.len())
+                .is_some_and(|total| total <= self.config.crypto_buffer_size)
+    }
+
+    /// Decrypts the held packets whose keys have arrived, in the order they arrived; a packet
+    /// decrypted can bring keys for others, so passes repeat while one makes progress, at most
+    /// once a held packet. Once the handshake is over no keys are still to come, and what is held
+    /// is dropped.
+    fn replay_undecryptable(&mut self, configs: &mut Configs, now: Instant) {
+        for _ in 0..self.undecryptable.len() {
+            let held = mem::take(&mut self.undecryptable);
+            let before = held.len();
+            for (remote, ecn, partial_decode) in held {
+                let ready = partial_decode
+                    .space()
+                    .is_some_and(|space| self.spaces.get(space).crypto.is_some());
+                if ready || !self.is_handshaking() {
+                    self.undecryptable_bytes = self
+                        .undecryptable_bytes
+                        .saturating_sub(partial_decode.len());
+                }
+                if ready {
+                    self.handle_decode(configs, now, remote, ecn, partial_decode);
+                } else if self.is_handshaking() {
+                    self.undecryptable.push_back((remote, ecn, partial_decode));
+                }
+            }
+            if self.undecryptable.len() == before {
+                break;
+            }
         }
     }
 
@@ -4341,6 +4486,13 @@ impl Connection {
         self.path.total_recvd
     }
 
+    /// The current path's bytes sent and whether its peer's address is validated: with
+    /// `total_recvd`, what a test of RFC 9000 §8.1's limit reads
+    #[cfg(test)]
+    pub(crate) fn amplification_state(&self) -> (u64, bool) {
+        (self.path.total_sent, self.path.validated)
+    }
+
     #[cfg(test)]
     pub(crate) fn active_local_cid_seq(&self) -> (u64, u64) {
         self.local_cid_state.active_seq()
@@ -4837,6 +4989,18 @@ struct TransmitState {
     congestion_blocked: bool,
 }
 
+impl TransmitState {
+    /// The size a padded datagram is expanded to: RFC 9000 §14.1's 1,200 bytes, or less where the
+    /// anti-amplification allowance cut the datagram shorter, as §8.2.1 permits for a datagram
+    /// carrying PATH_CHALLENGE ("unless the anti-amplification limit for the path does not
+    /// permit sending a datagram of this size"). An ack-eliciting Initial datagram is begun only
+    /// with room for the full size (`start_datagram`), so it is never cut.
+    fn padded_size(&self) -> u16 {
+        let room = self.buf_capacity.saturating_sub(self.datagram_start);
+        u16::try_from(room).map_or(MIN_INITIAL_SIZE, |room| room.min(MIN_INITIAL_SIZE))
+    }
+}
+
 /// What `poll_transmit` does after one step of filling its buffer
 enum Fill {
     /// Look for more to send in the same space
@@ -4857,6 +5021,10 @@ enum Fill {
 /// The largest Handshake or 0-RTT header, from the fields listed above
 const MAX_HANDSHAKE_OR_0RTT_HEADER_SIZE: usize =
     1 + 4 + 1 + MAX_CID_SIZE + 1 + MAX_CID_SIZE + VarInt::from_u32(u16::MAX as u32).size() + 4;
+
+/// The bytes after a packet number's start that header protection skips before its sample: RFC
+/// 9001 §5.4.2 assumes a 4-byte packet number
+const HP_SAMPLE_OFFSET: usize = 4;
 
 /// Perform key updates this many packets before the AEAD confidentiality limit.
 ///

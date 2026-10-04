@@ -392,7 +392,7 @@ The scenarios follow the QUIC interop runner's cases (quic-interop-runner `testc
 | `lossy` | 2 MiB each way through a relay process that drops one full-size datagram in fifty in each direction (`transferloss`'s 2 %) and holds one in fifty until the next in its direction has passed; the relay reports its drops and holds, and both senders report packets lost and recovered |
 | `migration` | 2 MiB each way while the client moves to a new socket mid-transfer and tells its connection (RFC 9000 §9.5: a new connection ID on the new path); the server sends PATH_CHALLENGE on the new path and follows the client to it, the client answers and retires a connection ID (`connectionmigration`) |
 | `rebinding` | the same with the client's socket replaced unannounced, as a NAT rebinding does (RFC 9000 §9.3, `rebind-port`) |
-| `killed-server` | the server process is killed with SIGKILL mid-upload; the client's connection ends `TimedOut` no sooner than its idle timeout after the server's last datagram (RFC 9000 §10.1), and a new server process answers |
+| `killed-server` | the server process is killed with SIGKILL mid-upload; the client's connection ends `TimedOut` no sooner than its idle timeout after the server's last datagram (RFC 9000 §10.1); a new server process answers: the client resumes the killed server's session and opens its stream on 0-RTT keys, the new process, holding none of the killed one's sessions, rejects the early data, and the client opens the stream again on 1-RTT keys (RFC 9001 §4.6.2) |
 | `killed-client` | the client process is killed mid-upload; the server's connection ends the same way, and the server serves the next client |
 
 Every stream carries a pattern no lost, duplicated or misplaced byte can match, checked byte by

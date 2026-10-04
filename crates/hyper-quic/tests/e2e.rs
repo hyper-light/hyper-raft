@@ -673,6 +673,10 @@ const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 struct Streams<S> {
     open: BTreeMap<S, Flow>,
     to_open: Vec<usize>,
+    /// Whether streams in `open` were opened before the handshake ended, on 0-RTT keys.
+    early: bool,
+    /// The streams opened again after the server rejected the 0-RTT data they were opened with.
+    reopened: usize,
 }
 
 #[derive(Default)]
@@ -692,14 +696,31 @@ impl<S: Copy + Ord + Debug> Streams<S> {
         Self {
             open: BTreeMap::new(),
             to_open: Vec::new(),
+            early: false,
+            reopened: 0,
         }
     }
     /// Moves every stream as far as it goes now; whether any byte moved. `index` is the stream's
     /// pattern; a byte that differs fails the test.
     fn pump<Q: Quic<Stream = S>>(&mut self, quic: &mut Q) -> bool {
         let mut moved = false;
+        if self.early && !quic.is_handshaking() {
+            self.early = false;
+            if !quic.accepted_0rtt() {
+                // The server rejected the early data, as one that holds none of the sessions a
+                // ticket names does: the transport has discarded every stream opened on it, and
+                // the client resets its own state for them (RFC 9001 §4.6.2). They open again,
+                // in order, on 1-RTT keys, from their first byte.
+                let opened = std::mem::take(&mut self.open);
+                self.reopened += opened.len();
+                self.to_open
+                    .splice(0..0, opened.into_values().map(|flow| flow.to_send));
+                moved = true;
+            }
+        }
         while let Some(&size) = self.to_open.first() {
             let Some(stream) = quic.open() else { break };
+            self.early |= quic.is_handshaking();
             self.to_open.remove(0);
             self.open.insert(
                 stream,
@@ -1332,8 +1353,10 @@ fn migration<Q: Quic>(mut quic: Q, server: &mut Peer, active: bool) -> String {
 }
 
 /// The server process is killed with SIGKILL mid-upload; the client's connection ends by its
-/// idle timeout, no sooner than that after the server's last datagram, and a new server process
-/// answers after.
+/// idle timeout, no sooner than that after the server's last datagram. A new server process
+/// answers after: the client resumes the killed server's session and sends 0-RTT data on it, which
+/// the new process, holding none of the killed one's sessions, rejects; the client opens its
+/// stream again and the exchange completes.
 fn killed_server<Q: Quic>(mut quic: Q, server: &mut Peer, pki: &Pki, imp: Imp) -> String {
     let mut wire = Wire::bind();
     quic.connect(Instant::now(), server.address());
@@ -1363,10 +1386,40 @@ fn killed_server<Q: Quic>(mut quic: Q, server: &mut Peer, pki: &Pki, imp: Imp) -
     );
     drain(&mut wire, &mut quic);
     let mut next = Peer::spawn(pki, "HQ_SERVER", imp.name().into());
-    exchange(&mut quic, &mut wire, next.address(), &[MIB], |_, _, _| {}).unwrap();
-    assert_eq!(Served::parse(&next.line()).reason, CLOSED);
+    quic.connect(Instant::now(), next.address());
+    assert!(
+        quic.has_0rtt(),
+        "the killed server's ticket allows 0-RTT data"
+    );
+    let mut streams = streams_of(&[MIB]);
+    streams.pump(&mut quic);
+    let early = streams
+        .open
+        .values()
+        .next()
+        .expect("the remembered limits open the stream before the handshake")
+        .sent;
+    assert!(early > 0, "0-RTT data was written before the handshake");
+    drive(
+        &mut wire,
+        &mut quic,
+        &mut streams,
+        "after the kill",
+        |_, _, streams| echoed(streams),
+    )
+    .unwrap();
+    assert!(
+        !quic.accepted_0rtt(),
+        "a new server process accepted the killed one's 0-RTT data"
+    );
+    assert_eq!(streams.reopened, 1, "the rejected stream opened again");
+    quic.close(Instant::now());
+    drain(&mut wire, &mut quic);
+    let served = Served::parse(&next.line());
+    assert_eq!(served.reason, CLOSED);
+    assert!(!served.zero_rtt, "the new server took no 0-RTT data");
     format!(
-        "the server killed mid-upload; the client timed out {after_heard:?} after its last datagram; the next server process answered"
+        "the server killed mid-upload; the client timed out {after_heard:?} after its last datagram; the next server process rejected the {early} bytes of 0-RTT data the killed one's ticket allowed, and answered the stream opened again"
     )
 }
 

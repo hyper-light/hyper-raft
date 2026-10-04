@@ -25,7 +25,8 @@
 //! is answered or at its expected arrival from the latest round trip (NFD-E's estimate over a
 //! window of one), whichever is first; unanswered then, it is a loss to the estimators unless its
 //! answer comes later, and it judges nothing. Its wake measures the member's timer. Before any
-//! round trip, the first probe waits on its answer or on another member.
+//! round trip, the first probe waits as a retransmission timer does before its first measurement
+//! ([`INITIAL_WAIT_NS`]), or until another member is heard from.
 //!
 //! **Dead.** A suspected peer is told by the member's next probe to it (Lifeguard's buddy system);
 //! it is condemned when that probe also goes unanswered, and only once the member has since had an
@@ -225,6 +226,13 @@ pub struct PeerReport {
 /// it and is not kept for.
 const OUTSTANDING: usize = 3;
 
+/// How long a measurement period waits before any round trip was measured, nanoseconds: RFC 6298
+/// §2.1, a retransmission timer's value until a round trip has been measured ("the sender SHOULD
+/// set RTO <- 1 second"), backed off as any measurement period's wait is. Without it, a member
+/// whose first probe or its answer was lost waited on another member, and members whose first
+/// probes were all lost waited on one another for ever, none sending again.
+const INITIAL_WAIT_NS: u64 = 1_000_000_000;
+
 /// The longest a measurement period's wait backs off to, nanoseconds: RFC 6298 (2.5) lets a
 /// retransmission timer's doubling be capped, provided the cap is at least 60 seconds.
 const MEASUREMENT_WAIT_CAP_NS: u64 = 60_000_000_000;
@@ -376,10 +384,11 @@ struct Probe {
     verdict: Option<Verdict>,
     /// When the indirect probe's answers are due, once it was asked.
     indirect_until: Option<u64>,
-    /// A measurement probe's expected arrival from the latest round trip, backed off while
-    /// measurement periods go unanswered ([`Detector::measurement_wait`]): where its period ends,
-    /// answered or not, judging nothing; its wake measures the member's timer.
-    expected: Option<u64>,
+    /// A measurement probe's expected arrival from the latest round trip, or [`INITIAL_WAIT_NS`]
+    /// before one, backed off while measurement periods go unanswered
+    /// ([`Detector::measurement_wait`]): where its period ends, answered or not, judging nothing;
+    /// its wake measures the member's timer.
+    expected: u64,
 }
 
 impl Probe {
@@ -726,12 +735,12 @@ impl Detector {
     }
 
     /// When to [`poll`](Detector::poll) next, on the caller's clock: the probe's deadline, or the
-    /// indirect probe's once asked. `None` while a probe is measurement only (poll on the next
-    /// message), or before the first poll.
+    /// indirect probe's once asked, or a measurement probe's expected arrival. `None` once a
+    /// measurement probe is answered (poll on the next message), or before the first poll.
     pub fn wake(&self) -> Option<u64> {
         let probe = self.probe?;
         if probe.verdict.is_none() {
-            return probe.expected.filter(|_| !probe.answered);
+            return (!probe.answered).then_some(probe.expected);
         }
         if probe.answered {
             return probe.due_ns();
@@ -746,14 +755,14 @@ impl Detector {
         let due = probe.due_ns();
         match (probe.answered, due, probe.indirect_until) {
             // Measurement: over when answered or at its expected arrival; before any round trip,
-            // when another member is heard from.
+            // also when another member is heard from.
             (true, None, _) => Stage::Over,
-            (false, None, _) => match probe.expected {
-                Some(at) if now_ns < at => Stage::Wait,
-                Some(_) => Stage::Over,
-                None if self.heard_other => Stage::Over,
-                None => Stage::Wait,
-            },
+            (false, None, _)
+                if now_ns < probe.expected && !(self.last_rtt_ns.is_none() && self.heard_other) =>
+            {
+                Stage::Wait
+            }
+            (false, None, _) => Stage::Over,
             (true, Some(due), _) | (false, Some(due), None) if now_ns < due => Stage::Wait,
             (true, Some(_), _) => Stage::Over,
             (false, Some(_), None) => Stage::Indirect,
@@ -801,9 +810,8 @@ impl Detector {
             answered: false,
             verdict,
             indirect_until: None,
-            expected: self
-                .last_rtt_ns
-                .map(|rtt| now_ns.saturating_add(self.measurement_wait(rtt))),
+            expected: now_ns
+                .saturating_add(self.measurement_wait(self.last_rtt_ns.unwrap_or(INITIAL_WAIT_NS))),
         };
         self.probe = Some(probe);
         self.heard_other = false;
@@ -880,8 +888,8 @@ impl Detector {
     fn resolve(&mut self, probe: Probe, now_ns: u64) {
         if probe.verdict.is_none()
             && !probe.answered
-            && let Some(rtt) = self.last_rtt_ns
-            && self.measurement_wait(rtt) < MEASUREMENT_WAIT_CAP_NS
+            && self.measurement_wait(self.last_rtt_ns.unwrap_or(INITIAL_WAIT_NS))
+                < MEASUREMENT_WAIT_CAP_NS
         {
             self.measurement_misses = self.measurement_misses.saturating_add(1);
         }
@@ -1973,6 +1981,35 @@ mod tests {
             liveness(&detector, lost.to),
             Liveness::Alive,
             "and judged nothing"
+        );
+    }
+
+    /// A first probe, before any round trip, whose ping or answer was lost ends at the initial
+    /// wait, and the next unanswered one at twice it: waiting on another member instead, members
+    /// whose first probes were all lost waited on one another for ever (slates' daemons, the
+    /// datagrams queued at a re-key dropped).
+    #[test]
+    fn a_lost_first_probe_ends_at_the_initial_wait() {
+        let mut detector = detector(&[A, B]);
+        let mut requests = Vec::new();
+        let first = detector.poll(0, &mut requests).unwrap();
+        assert_eq!(
+            detector.wake(),
+            Some(INITIAL_WAIT_NS),
+            "a wake before any round trip"
+        );
+        assert_eq!(detector.poll(INITIAL_WAIT_NS - 1, &mut requests), None);
+        let second = detector.poll(INITIAL_WAIT_NS, &mut requests).unwrap();
+        assert_ne!(second.nonce, first.nonce, "probing again");
+        assert_eq!(
+            detector.wake(),
+            Some(3 * INITIAL_WAIT_NS),
+            "backed off: twice the initial wait"
+        );
+        assert_eq!(
+            liveness(&detector, first.to),
+            Liveness::Alive,
+            "judging nothing"
         );
     }
 

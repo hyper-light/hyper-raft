@@ -592,13 +592,19 @@ probe written over, none was measured, the latest round trip never lengthened, a
 on at the stale pace with nothing judged, slow to answer the others, who condemned it: a member
 43,557 periods into a cluster run, condemned 95 times
 (`measurement_periods_follow_round_trips_that_lengthen`, which reproduces it in the detector alone,
-taking no round trip in 2,000 periods without it). The very first probe,
-before any round trip, waits on an answer or another member. An earlier rule ended an unanswered
+taking no round trip in 2,000 periods without it). An earlier rule ended an unanswered
 measurement period only when another member was next heard from, assuming no time at all; in Linux
 at two CPUs with four busy loops, a throttled container dropped a burst of datagrams, every member's
 probe was lost at once, and all four waited for one another for ever
-(`a_lost_measurement_probe_ends_at_its_expected_arrival`). A member that hears nothing has nothing
-to judge with and nobody to probe usefully, and waits on the network.
+(`a_lost_measurement_probe_ends_at_its_expected_arrival`). The very first probe, before any round
+trip, has no round trip to expect its answer from: it waits as a retransmission timer does before
+its first measurement, 1 s (RFC 6298 §2.1, "Until a round-trip time (RTT) measurement has been made
+... the sender SHOULD set RTO <- 1 second"), backed off as above, and ends sooner when another member
+is heard from. It once waited on its answer or another member alone, and members whose first probes
+were all lost waited on one another for ever: slates' daemons, three in one process, dropped the
+datagrams queued while a peer's address was re-resolved at a re-key, sent five datagrams in all and
+then nothing, in 4 runs of 6 (`a_lost_first_probe_ends_at_the_initial_wait`, and in the simulated
+cluster `members_whose_first_probes_are_all_lost_probe_again`).
 
 **The member's own lateness** (Lifeguard's local health) is measured, not multiplied:
 - every wake it asked for and got late is a sample of `G` ([`Lateness`]), which floors `α`, never

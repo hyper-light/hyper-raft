@@ -110,6 +110,9 @@ struct Sim {
     world: World<Ev>,
     net: Net<Vec<u8>>,
     members: Vec<Member>,
+    /// Members whose next datagram the network loses: each member's first, in the run that loses
+    /// every first probe.
+    losing: Vec<bool>,
     /// Encoded messages to send, held so the members' borrows end first.
     outbox: Vec<(NodeId, NodeId, Vec<u8>)>,
 }
@@ -348,7 +351,7 @@ impl Member {
 }
 
 impl Sim {
-    fn new(source: Source) -> Self {
+    fn new(source: Source, lose_first: bool) -> Self {
         let mut world = World::new(source, Discipline::Ordered, LIMITS).unwrap();
         // Each member's clock: an offset, a rate within ±PHI and timers late by up to 60 µs, drawn
         // through the world from a stream of the member's own, so a run is its seed or its trace.
@@ -374,6 +377,7 @@ impl Sim {
             world,
             net,
             members,
+            losing: vec![lose_first; NODES as usize],
             outbox: Vec::new(),
         };
         for id in 0..NODES {
@@ -395,6 +399,9 @@ impl Sim {
 
     fn flush(&mut self) {
         for (from, to, bytes) in std::mem::take(&mut self.outbox) {
+            if std::mem::take(&mut self.losing[from.0 as usize]) {
+                continue;
+            }
             let length = bytes.len();
             self.net
                 .send(&mut self.world, (from, to), bytes, length, Ev::Arrive)
@@ -476,7 +483,7 @@ fn run(source: Source) -> Result<Record, SimError> {
         Source::Seed(seed) => format!("seed {seed}"),
         Source::Trace(_) => "the trace".to_owned(),
     };
-    let mut sim = Sim::new(source);
+    let mut sim = Sim::new(source, false);
     sim.run("every pair judged", Sim::every_pair_judged);
     for (me, member) in sim.live() {
         assert!(
@@ -525,4 +532,21 @@ fn a_killed_member_is_held_dead_by_every_survivor_within_its_bound_and_no_live_o
     for seed in 0..16 {
         twice(seed, run).unwrap_or_else(|refusal| panic!("seed {seed}: {refusal}"));
     }
+}
+
+/// Every member's first datagram, its first probe, is lost: each member probes again at its
+/// initial wait and every pair is judged. Waiting on its answer or another member instead, every
+/// member waited on the others for ever and the world went idle (slates' daemons at a re-key).
+#[test]
+fn members_whose_first_probes_are_all_lost_probe_again() {
+    for seed in 0..16 {
+        twice(seed, lost_first_probes).unwrap_or_else(|refusal| panic!("seed {seed}: {refusal}"));
+    }
+}
+
+/// One run from `source` with every member's first datagram lost, until every pair is judged.
+fn lost_first_probes(source: Source) -> Result<Record, SimError> {
+    let mut sim = Sim::new(source, true);
+    sim.run("every pair judged", Sim::every_pair_judged);
+    Ok(sim.world.finish())
 }

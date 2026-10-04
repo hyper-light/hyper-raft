@@ -422,16 +422,19 @@ groups, against per-group heartbeats that grow with the groups.
 ## 4d. Copa in the congestion enum (stage 4's first patch, 2026-10-04)
 
 Built: `crates/hyper-quic/src/congestion/copa.rs`, a fourth controller of the closed enum,
-`Congestion::Copa(CopaConfig)`. CUBIC stays the default until the harness below measures Copa on
-this stack. The source notes are in `docs/research/congestion.md`.
+`Congestion::Copa(CopaConfig)`. CUBIC stays the default: Copa meets neither focal's harm rule nor its
+own leave rule yet (below). The source notes are in `docs/research/congestion.md`.
 
-The law has three layers:
+The law has two layers:
 
 - **Copa (NSDI 2018).** The paper as slates fixed its details from the paper, genericCC and mvfst:
   - integer arithmetic throughout, with Nichols' filters for the four windows (constant space);
   - RFC 9002 §7.8 bounds only the window's growth, so a window the sender does not fill still
     shrinks. slates' guard once skipped every update, and a window slow start had overshot stayed
     at 1.5 MB on a 250 kB product.
+  - the mode's windows span four smoothed round trips, as genericCC's, slates' and focal's do;
+    competing, `1/δ` rises a packet a round trip and halves on a loss (§2.2), in whole
+    packets as focal's law holds it.
 - **focal's measured changes (focal's record F39):**
   - Slow start doubles once what was sent after the last doubling is heard of. Judged by what was
     sent before it, the window reached 3.07 MB where the path and queue hold 2.5 MB at 100 Mbit/s,
@@ -443,40 +446,67 @@ The law has three layers:
     nine tenths of their bar.
   - For ten seconds after a mark past slow start, the window grows a datagram a round trip.
     Competing, it raises `1/δ` only after a round trip in which the target held the window back.
-- **focal's derivations for the competing mode (b18):**
-  - A1: both mode windows span the five-round-trip cycle. The paper's §2.2 detector asks for a
-    nearly empty queue "in the last 5 RTTs", the period §3 gives Copa's oscillation; genericCC,
-    slates and focal took four.
-  - A2: past slow start, a delay sample is judged against the window its packet was sent under, as
-    §3's model `q(t) = w(t − RTTmin) − BDP` has it. A ring of 32 window samples, at least a
-    sixteenth of a smoothed round trip apart, reaches two round trips back. Without it, a queue
-    long beside the path locks the window to the target, and the competing mode never ends.
-  - B: competing, `1/δ` grows by `d_q/RTTstanding` a round trip, so Copa's rate grows `1/RTT` a
-    round trip as a classic sender's does. The paper's packet a round trip grows it `RTT/d_q`
-    times faster, which left NewReno a third at most.
 
-Each of A1, A2 and B is pinned by a unit test that fails with the change undone (checked 2026-10-04).
-The initial window is RFC 9002 §7.2's, ten datagrams limited to the larger of 14,720 bytes and two
-datagrams; slates and focal took ten datagrams, which is the same at 1,200 bytes.
+**Pacing.** A controller states its pacing rate (`Controller::pacing_rate`, bytes a second), and the
+path's pacer refills at it. `None` keeps the connection's rule, 5/4 of the window per smoothed round
+trip (RFC 9002 §7.7). Copa states `2·cwnd/RTTstanding` (§2.1); NewReno, CUBIC and BBR keep the
+connection's rule. Measured on the harness below, Copa alone emptied its queue at the same intervals
+paced either way on three of focal's five paths. It carried the same share at 10 Mbit/s and 20 ms
+beside NewReno and CUBIC. Its rate held within 1.6% of its median at 100 Mbit/s and 20 ms, so pacing
+on the standing round trip drives no oscillation.
 
-Not yet:
+**The harness.** `crates/hyper-quic/tests/congestion.rs` runs real hyper-quic endpoints over
+hyper-sim's network on focal's F39 grids. Each seed's run is exact and replays from its seed and its
+trace; focal's harness judged harm by deviations over seeds. The tests that run in the gate use one
+path, 10 Mbit/s and 20 ms for 10 s, and check that:
 
-- **Pacing.** A controller states its pacing rate (`Controller::pacing_rate`, bytes a second), and
-  the path's pacer refills at it; `None` keeps the connection's rule, 5/4 of the window per
-  smoothed round trip (RFC 9002 §7.7). Copa states `2·cwnd/RTTstanding` (§2.1); NewReno, CUBIC
-  and BBR keep the connection's rule. Measured on the harness below (2026-10-04): Copa alone
-  emptied its queue at the same intervals paced either way on three of focal's five paths, and
-  carried the same share at 10 Mbit/s and 20 ms beside NewReno and CUBIC. Its rate held within
-  1.6% of its median at 100 Mbit/s and 20 ms, so pacing on the standing round trip drives no
-  oscillation. slates' 1 ms quantum and two-datagram floor are still to come.
-- **The harness.** Every measured result is to be re-measured after the port: focal's F39 grids
-  (NewReno and CUBIC beside Copa on drop-tail, step and CoDel queues, the harm bar
-  `min(incumbent beside its own kind, incumbent beside CUBIC)`) and slates' bake-off. The runs are
-  real hyper-quic endpoints over hyper-sim's network, and each seed's check is exact: focal's rule
-  judged harm by deviations over seeds.
+- every law carries its transfer alone, with Copa's queue the shortest;
+- Copa shares a bottleneck with NewReno and CUBIC with no stall, ECN kept, CoDel marking it, and
+  each incumbent at nine tenths of its bar under CoDel at least.
+
+The grids run by hand (`--ignored`) and are recorded in `docs/benchmarks.md`, "Copa's competing mode
+over focal's grids".
+
+**focal's derivations for the competing mode, measured (2026-10-04).** focal's b18 proposed three
+derivations:
+
+- A1: the mode judged over five round trips, the cycle's period;
+- A2: a delay sample judged by the window its packet was sent under;
+- B: competing, `1/δ` raised by `d_q/RTTstanding` a round trip, so Copa's rate grows as a classic
+  sender's.
+
+Three further variants were measured beside them:
+
+- G: a queue of a datagram or less is nearly empty;
+- H: the mode ends only after the queue stays nearly empty longer than its window;
+- E: competing, the window is NewReno's.
+
+The rule (`docs/benchmarks.md`) was fixed before the full grid ran. None of the five laws met it. b18
+lowered Copa's share beside the incumbents from 41.7% to 25.0%, and every variant left Copa competing
+after its competitor left in 30 or more of 64 runs. So the law is focal's from before b18. The
+derivations' arithmetic and the harness's findings are in the research notes.
+
+Open:
+
+- **Finding 1.** Without a queue manager, Copa takes more than the bar. CUBIC carries 0.64 of its
+  bar at 1 Mbit/s and 100 ms, and a few seeds fall under 0.9 at 20 ms. Under CoDel at 1 Mbit/s and
+  100 ms NewReno carries 0.85.
+- **Finding 3.** The mode test takes one empty moment for a queue that empties: a classic sender's
+  halving leaves the queue empty once a sawtooth (§2.2 grants it). It also asks for an idle link at
+  high rates, where a tenth of the spread is less than a datagram's time. Copa competed after its
+  competitor left in 62 of 64 runs over the grid, and in 3 of 16 on the gate's path:
+  `copa_stops_competing_once_its_competitor_leaves` is ignored until this is fixed.
 - **Finding 4.** Under a single queue that CoDel manages, the manager empties the queue and hides
-  the competition from the mode test. It is open and not designed; the candidates are Copa+'s
-  passive identity and Nimbus's pulses (`docs/research/congestion.md`).
+  the competition from the mode test.
+
+  For findings 3 and 4 the candidates are a passive identity of the standing queue (Copa+'s
+  direction: the queue explained by Copa's own excess in flight) and Nimbus's pulses
+  (`docs/research/congestion.md`). Research first.
+- **CoDel's marks at 100 Mbit/s.** Under b18 and a variant, CoDel marked none of Copa's datagrams
+  in seven runs at 100 Mbit/s and 20 ms. Copa's ECN stayed on: CoDel acted 11 or 12 times in 30 s,
+  each time on the incumbent's datagram (`docs/benchmarks.md`).
+- **Still to come.** slates' bake-off on the harness, and slates' 1 ms pacing quantum and
+  two-datagram floor.
 
 ## 5. Consumers
 

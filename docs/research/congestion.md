@@ -43,9 +43,10 @@ pp. 329–342.** Checked against the paper's text, 2026-10-04.
   bandwidth-delay product in packets), where focal's derivation A2 finds the decision runs on the
   window now rather than the lagged one (below).
 
-**focal's derivations for the competing mode (focal b18, 2026-10-04).** Carried from focal's notes;
-the arithmetic checked here, and each change pinned by a unit test in `congestion/copa.rs` that fails
-with the change undone.
+**focal's derivations for the competing mode (focal b18, 2026-10-04).** Carried from focal's notes,
+with the arithmetic checked here. Measured on hyper-quic's harness over focal's grids by a rule fixed
+before the runs, they were not taken: b18 lowered Copa's share beside the incumbents from 41.7% to
+25.0% and left finding 3 open (`docs/benchmarks.md`, "Copa's competing mode over focal's grids").
 
 - A1: both mode windows cover the five-round-trip cycle §2.2 and §3 state. genericCC (`rtt-window.cc`),
   slates and focal took the least and the greatest over four smoothed round trips; a window shorter
@@ -71,6 +72,45 @@ with the change undone.
 - C (open, not designed): under a single CoDel-managed queue the manager empties the queue, so "nearly
   empty" says nothing about elastic traffic, and a mark is no proof of competition either. FQ-CoDel
   isolates flows, so this is single-queue CoDel only.
+
+**What the harness found in focal's derivations (2026-10-04).**
+
+Measured on hyper-quic's congestion harness (`crates/hyper-quic/tests/congestion.rs`): hyper-quic
+endpoints over hyper-sim's network, a dumbbell with one bottleneck each way and a queue of one
+bandwidth-delay product, ECN carried, each seed's run exact.
+
+**B holds the queueing delay fixed; the sawtooth moves it.** B matches the growth of Copa's rate
+`(1/δ)/d_q` to a classic sender's `W/RTT` at a fixed `d_q`: `1/δ` grows by `d_q/RTT` a round trip.
+Beside a classic sender the shared queue fills between losses, and Copa's target falls as
+`1/d_q`. `d_q` is small beside the round trip, so it moves far more in proportion than `RTT`, and
+a raise sized to a moment's `d_q` falls behind. Measured at 10 Mbit/s and 20 ms on drop-tail, seeds
+1–8: Copa 27.7%, NewReno 69.5%; focal's law before b18 50.4% / 46.8%. Copa competed in 72% of the
+run there, and in 96% with H, still carrying 30.3%. The mode is not the cause.
+
+**The paper's emptying is continuous; a link's is by packets.** §2.2's detector reads the queue as
+nearly empty within a tenth of the spread of the last round trips above `RTTmin`. Copa alone keeps a
+queue of about `2.5/δ` packets (§3), five at δ = 1/2, so a tenth of its spread is half a datagram's
+time on the link: the test asks for an idle link, and with whole packets the queue reaches none
+only now and then. Copa alone at 100 Mbit/s and 20 ms kept a 99th percentile of 0.54 ms (4.5
+datagrams) while a tenth of its spread was 0.06 ms against a datagram's 0.096 ms. It emptied once
+in 9.1 smoothed round trips at the median (11.6 at most) and judged itself competing in 33.4% of
+the run. At 1 Mbit/s and 20 ms: 23.8 at the median, 68.4% competing. At 10 Mbit/s and 20 ms, where
+the queue reached none once in 3.0 round trips (5.0 at most), it competed 0%; its one late
+"competing" sample came where an interval was 5.0 exactly, the old trough leaving the window 10 ms
+before the next arrived. This is focal's finding 2, without the pacing it was suspected of.
+
+**Pacing is not the cause.** Paced at `2·cwnd/RTTstanding` (§2.1) instead of the connection's five
+quarters of the window a smoothed round trip, Copa alone emptied its queue at the same intervals on
+three of the five paths (1M/20, 1M/100, 10M/20: the same counts and quantiles), and carried the same
+share beside NewReno and CUBIC at 10 Mbit/s and 20 ms. Its rate held steady: at 100 Mbit/s and
+20 ms, p1 198 and p99 204 Mbit/s, so pacing on the standing round trip, which the delay signal also
+reads, drives no oscillation (focal's question).
+
+**One empty moment is not a sender alone.** The paper grants it (§2.2: "The queue may be nearly
+empty even in the presence of a competing buffer-filling flow (e.g., because of a recent packet
+loss)"). With a queue of one product, a classic sender's halving leaves the queue empty once a
+sawtooth, and Copa left the competing mode each time: 61–74% competing beside NewReno at 10 Mbit/s
+and 20 ms. Copa alone empties its queue cycle after cycle (§3); a competitor's backoff does it once.
 
 **Arun, Balakrishnan, genericCC (the authors' implementation; `rtt-window.cc`, `markoviancc.cc`).**
 Carried from slates' and focal's notes: the mode window of four round trips for the least and the

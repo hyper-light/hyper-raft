@@ -1,6 +1,5 @@
 //! Copa (Arun and Balakrishnan, "Copa: Practical Delay-Based Congestion Control for the Internet",
-//! NSDI 2018), with the changes slates' and focal's measurements made to it and the three focal derived
-//! for its competing mode (docs/transport.md §4d).
+//! NSDI 2018), with the changes slates' and focal's measurements made to it (docs/transport.md §4d).
 //!
 //! Copa aims at the rate `1/(δ·d_q)` packets a second, where `d_q` is the queueing delay it measures:
 //! the least round trip of the last half smoothed round trip (`RTTstanding`) less the least of the last
@@ -8,8 +7,9 @@
 //! `v/(δ·cwnd)` packets for each packet acknowledged; the velocity `v` doubles once the window has moved
 //! one way for three round trips (§2.1). Alone, the queue cycles from empty to about `2.5/δ` packets and
 //! back every five round trips (§3). A loss is no signal by itself: it may be noise. When the queue has
-//! not nearly emptied in five round trips another sender is filling it, and Copa competes: `1/δ` grows
-//! each round trip without a loss and halves on a loss, until the queue empties again (§2.2).
+//! not nearly emptied in the last round trips ([`MODE_WINDOW_SRTTS`]) another sender is filling it,
+//! and Copa competes: `1/δ` grows each round trip without a loss and halves on a loss, until the queue
+//! empties again (§2.2).
 //!
 //! From slates' law, which fixed its details from the paper, the authors' implementation (genericCC)
 //! and mvfst: integer arithmetic throughout, Nichols' windowed filters, and RFC 9002 §7.8 bounding only
@@ -21,19 +21,22 @@
 //! - an explicit congestion mark (ECN-CE) is answered as a classic sender answers congestion, and for
 //!   ten seconds after a mark past slow start the window grows as a classic sender's does.
 //!
-//! From focal's analysis of the competing mode (focal b18, its derivations A1, A2 and B):
-//! - the mode is judged over five round trips, the period of Copa's own oscillation;
-//! - past slow start, a delay sample is compared with the window its packet was sent under;
-//! - competing, `1/δ` grows by `d_q/RTTstanding` a round trip, so Copa's rate grows as a classic
-//!   sender's does.
+//! focal's derivations for the competing mode (focal b18: the mode judged over five round trips, a
+//! delay sample judged by the window its packet was sent under, `1/δ` raised by `d_q/RTTstanding`)
+//! and three variants of the mode's exit and its competing growth were measured over focal's grids
+//! by a rule fixed before the runs; none met it, and the law is focal's from before b18
+//! (docs/transport.md §4d).
 //!
 //! The law states its pacing, `2·cwnd/RTTstanding` (§2.1), and the connection's pacer sends at it
 //! (`Controller::pacing_rate`): the paper's analysis of Copa's own cycle (§3) assumes it, and paced
 //! at the connection's own five quarters of the window a smoothed round trip, Copa alone emptied its
 //! queue every five round trips on one of focal's five paths.
 //!
-//! Open: under a single queue that CoDel manages, the manager empties the queue and hides the
-//! competition from the mode test (focal's finding 4).
+//! Open (docs/transport.md §4d, with the numbers): without a queue manager at long round trips Copa
+//! takes more than the incumbents' bar (focal's finding 1); the mode test, judging one empty moment
+//! as a queue that empties, leaves Copa competing after its competitor has gone (focal's finding 3);
+//! under a single queue that CoDel manages, the manager empties the queue and hides the competition
+//! from the mode test (focal's finding 4).
 
 use std::any::Any;
 
@@ -52,10 +55,9 @@ const MIN_RTT_WINDOW_NS: u64 = 10_000_000_000;
 /// Copa §2.2: the queue must have been nearly empty "in the last 5 RTTs", the period of Copa's own
 /// oscillation (§3: the queue oscillates "between having 0 and 2.5/δ̂ packets every five RTTs"). The
 /// paper measures `RTTmax`, which scales "nearly", over four, and genericCC (`rtt-window.cc`), slates
-/// and focal took four for both. A window shorter than the cycle can miss its trough and judge Copa
-/// alone competing (focal's measurement: 13.5% of samples alone at 100 Mbit/s and 20 ms), or miss its
-/// peak, which narrows "nearly": both windows cover the cycle here (focal's A1).
-const MODE_WINDOW_SRTTS: u64 = 5;
+/// and focal took four for both. focal's A1 took five, the cycle's period; measured with its other
+/// derivations over focal's grids, it was not taken (docs/transport.md §4d).
+const MODE_WINDOW_SRTTS: u64 = 4;
 /// Copa §2.2: the queue is nearly empty when the least round trip of the mode's window is within a
 /// tenth of that window's spread above `RTTmin`.
 const NEARLY_EMPTY_FRACTION: u64 = 10;
@@ -63,15 +65,6 @@ const NEARLY_EMPTY_FRACTION: u64 = 10;
 const VELOCITY_DIRECTION_THRESHOLD: u32 = 3;
 /// Copa §2.2: the default mode's δ = 0.5, held as `1/δ`.
 const DEFAULT_INV_DELTA: u64 = 2;
-/// `1/δ` is held in this many parts of a packet, 2^16: competing, it grows by the queueing delay's
-/// share of the standing round trip, a fraction of a packet.
-const INV_DELTA_UNIT: u64 = 65_536;
-/// How many samples of its window the law keeps...
-const WINDOW_SAMPLES: usize = 32;
-/// ...and how far apart at least, as a part of the smoothed round trip. Thirty-two samples a sixteenth
-/// of a round trip apart reach two round trips back, past the acknowledged packet's sending, and the
-/// sample in force then is within a sixteenth of a round trip's movement of the window then.
-const WINDOW_SAMPLE_SPACING: u64 = 16;
 /// A round trip moves the window by half of itself at most. The velocity of the paper and of slates is
 /// bounded by `cwnd·δ` packets, by which one round trip moves the window by all of itself; what the
 /// window's change does to the queue is heard of a round trip later, so a window that falls for the
@@ -211,74 +204,6 @@ fn most(filter: &mut Option<WindowedMax>, now: u64, window: u64, value: u64) -> 
     }
 }
 
-/// The window as it was: a sample whenever it changed, a sixteenth of a smoothed round trip apart at
-/// least (a change sooner is taken at the first event past the spacing), the last [`WINDOW_SAMPLES`]
-/// kept. A sample holds from its time to the next.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct WindowHistory {
-    samples: [Sample; WINDOW_SAMPLES],
-    /// Where the next sample goes.
-    next: usize,
-    /// How many are kept.
-    kept: usize,
-}
-
-impl WindowHistory {
-    fn newest(&self) -> Option<Sample> {
-        if self.kept == 0 {
-            return None;
-        }
-        let at = self
-            .next
-            .checked_sub(1)
-            .unwrap_or(WINDOW_SAMPLES.saturating_sub(1));
-        self.samples.get(at).copied()
-    }
-
-    /// Takes the window at `now`, unless it is the newest sample's or that sample is less than
-    /// `srtt/16` old (`srtt` zero takes every change).
-    fn record(&mut self, now: u64, srtt: u64, window: u64) {
-        if let Some(newest) = self.newest()
-            && (newest.value == window
-                || now.saturating_sub(newest.time)
-                    < srtt.checked_div(WINDOW_SAMPLE_SPACING).unwrap_or(0))
-        {
-            return;
-        }
-        if let Some(slot) = self.samples.get_mut(self.next) {
-            *slot = Sample {
-                time: now,
-                value: window,
-            };
-        }
-        self.next = self
-            .next
-            .saturating_add(1)
-            .checked_rem(WINDOW_SAMPLES)
-            .unwrap_or(0);
-        self.kept = self.kept.saturating_add(1).min(WINDOW_SAMPLES);
-    }
-
-    /// The window in force at `time`: the newest sample at or before it, or the oldest kept where
-    /// every sample is later.
-    fn at(&self, time: u64) -> Option<u64> {
-        let mut oldest = None;
-        for back in 1..=self.kept {
-            let at = self
-                .next
-                .checked_add(WINDOW_SAMPLES)
-                .and_then(|at| at.checked_sub(back))
-                .and_then(|at| at.checked_rem(WINDOW_SAMPLES))?;
-            let sample = self.samples.get(at)?;
-            if sample.time <= time {
-                return Some(sample.value);
-            }
-            oldest = Some(sample.value);
-        }
-        oldest
-    }
-}
-
 /// Which way the window moved over the last round trip (Copa §2.1's velocity rule).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Direction {
@@ -335,34 +260,16 @@ impl Delays {
     }
 }
 
-/// What a round trip competing raises `1/δ` by, in parts of a packet: the queueing delay's share of
-/// the standing round trip, so Copa's rate grows as a classic sender's does. Copa's rate is `1/δ`
-/// packets over the queueing delay `d_q`; a classic sender's is its window over the round trip, the
-/// window growing a packet a round trip and halving on a loss. `1/δ` halving on a loss halves Copa's
-/// rate as the window's halving does. Grown a packet a round trip (the paper's AIMD on `1/δ`, §2.2),
-/// Copa's rate grew `RTT/d_q` times faster than the window's: synchronised sawtooths leave `1/δ` about
-/// the window, and Copa `RTT/d_q` times the classic sender's rate. A buffer of a bandwidth-delay
-/// product at 1 Mbit/s and 100 ms, `d_q` up to the round trip's other half, leaves NewReno a third at
-/// most: focal measured 33.8% against a bar of 43.3%. Grown by `d_q/RTT` a round trip, Copa's rate
-/// grows `1/RTT` a round trip, as the window's does.
-fn competing_raise(queueing: u64, standing: u64) -> u64 {
-    u128::from(queueing)
-        .saturating_mul(u128::from(INV_DELTA_UNIT))
-        .checked_div(u128::from(standing))
-        .map_or(0, |parts| u64::try_from(parts).unwrap_or(u64::MAX))
-}
-
 /// The law, on a clock of nanoseconds the caller counts.
 #[derive(Clone, Debug)]
 struct Law {
     datagram: u64,
     initial: u64,
     window: u64,
-    /// `1/δ` as configured and as it is, in parts of a packet ([`INV_DELTA_UNIT`]).
+    /// `1/δ` as configured and as it is, in whole packets: focal's law, whose halving drops the
+    /// fraction.
     default_inv_delta: u64,
     inv_delta: u64,
-    /// The window as it was, for the rate a delay sample measured.
-    history: WindowHistory,
     /// What part of the window a round trip moves it by at most, as its inverse.
     stride: u64,
     competitive: bool,
@@ -397,16 +304,13 @@ impl Law {
     fn new(datagram: u64, config: &CopaConfig) -> Self {
         let datagram = datagram.max(1);
         let initial = initial_window(datagram);
-        let inv_delta = config.inv_delta.max(1).saturating_mul(INV_DELTA_UNIT);
-        let mut history = WindowHistory::default();
-        history.record(0, 0, initial);
+        let inv_delta = config.inv_delta.max(1);
         Self {
             datagram,
             initial,
             window: initial,
             default_inv_delta: inv_delta,
             inv_delta,
-            history,
             stride: config.stride.max(1),
             competitive: false,
             slow_start: true,
@@ -453,23 +357,12 @@ impl Law {
     }
 
     fn on_ack(&mut self, acked: Acked) {
-        self.ack(acked);
-        self.history
-            .record(acked.now, acked.srtt.max(1), self.window);
-    }
-
-    fn ack(&mut self, acked: Acked) {
         let srtt = acked.srtt.max(1);
         let delays = self.delays(acked.now, acked.rtt, srtt);
         let queueing = delays.queueing();
-        self.update_mode(
-            acked.now,
-            srtt,
-            &delays,
-            competing_raise(queueing, delays.standing),
-        );
+        self.update_mode(acked.now, srtt, &delays);
         let sent = acked.now.saturating_sub(acked.rtt);
-        let increase = self.below_target(sent, queueing, delays.standing);
+        let increase = self.below_target(queueing, delays.standing);
         if increase && !acked.window_limited {
             // RFC 9002 §7.8: a window that is not used does not grow. It still shrinks: slates' guard
             // once skipped every update, and a window slow start had overshot stayed frozen while
@@ -503,32 +396,13 @@ impl Law {
     /// `1/(δ·d_q)`; in bytes, `window·d_q ≤ (1/δ)·datagram·RTTstanding`. An empty queue is below any
     /// target. The products of three 64-bit values fit 192 bits and not 128: the target saturates
     /// where it would not fit.
-    ///
-    /// Past slow start the window is the one the packet sent at `sent` went under: the queue a sample
-    /// shows is what that window built (§3: `q(t) = w(t − RTTmin) − BDP`), and the window now differs
-    /// from it by a round trip's movement. Where the queue is short beside the path (`1/δ` well under
-    /// the bandwidth-delay product in packets, Copa's default) the two judge alike. Where it is not
-    /// (`1/δ` grown past the product while competing, or a path of a packet or two), the target barely
-    /// moves with the queue, and judged by the window now the window locked to it an acknowledgement
-    /// either side, the queue stood at `1/δ` and never emptied, and Copa competed on after the
-    /// competitor left: in focal's model of one queue served in order, `1/δ` rose to 125 in eight
-    /// seconds; on a path of 1 Mbit/s and 20 ms Copa alone competed 95% of the time, and judged by the
-    /// window sent, none of it. In slow start, the window now: it holds the doubling the sample has not
-    /// seen, and judged by the one before, slow start doubles once more than the path holds.
-    fn below_target(&self, sent: u64, queueing: u64, standing: u64) -> bool {
+    fn below_target(&self, queueing: u64, standing: u64) -> bool {
         if queueing == 0 {
             return true;
         }
-        let window = if self.slow_start {
-            self.window
-        } else {
-            self.history.at(sent).unwrap_or(self.window)
-        };
-        let held = u128::from(window).saturating_mul(u128::from(queueing));
+        let held = u128::from(self.window).saturating_mul(u128::from(queueing));
         let target = u128::from(self.inv_delta)
             .saturating_mul(u128::from(self.datagram))
-            .checked_div(u128::from(INV_DELTA_UNIT))
-            .unwrap_or(0)
             .saturating_mul(u128::from(standing));
         held <= target
     }
@@ -568,7 +442,7 @@ impl Law {
             self.direction_mark = Some((acked.now, self.window));
         }
         let gain = if increase && self.grows_as_a_classic_sender(acked.now) {
-            INV_DELTA_UNIT
+            1
         } else {
             self.velocity.saturating_mul(self.inv_delta)
         };
@@ -581,14 +455,12 @@ impl Law {
         }
     }
 
-    /// `bytes` acknowledged move the window by `bytes·datagram·gain/cwnd`, the gain in parts of a
-    /// packet; what is less than a byte is kept for the next step.
+    /// `bytes` acknowledged move the window by `bytes·datagram·gain/cwnd`, the gain in packets; what
+    /// is less than a byte is kept for the next step.
     fn step(&mut self, bytes: u64, gain: u64) -> u64 {
         let numerator = u128::from(bytes)
             .saturating_mul(u128::from(self.datagram))
             .saturating_mul(u128::from(gain))
-            .checked_div(u128::from(INV_DELTA_UNIT))
-            .unwrap_or(0)
             .saturating_add(u128::from(self.step_remainder));
         let denominator = u128::from(self.window.max(1));
         self.step_remainder = numerator
@@ -637,7 +509,6 @@ impl Law {
     /// the window by all of itself, divided by the stride.
     fn velocity_cap(&self) -> u64 {
         u128::from(self.window.checked_div(self.datagram).unwrap_or(0))
-            .saturating_mul(u128::from(INV_DELTA_UNIT))
             .checked_div(u128::from(self.inv_delta))
             .and_then(|packets| packets.checked_div(u128::from(self.stride)))
             .map_or(1, |cap| u64::try_from(cap).unwrap_or(u64::MAX))
@@ -645,8 +516,8 @@ impl Law {
     }
 
     /// Copa §2.2: a queue that nearly emptied in the mode's window is Copa's own, and `1/δ` is the
-    /// default; one that did not is another sender's, and competing, `1/δ` rises by `raise` each round
-    /// trip without a loss ([`competing_raise`]).
+    /// default; one that did not is another sender's, and competing, `1/δ` rises a packet each round
+    /// trip without a loss.
     ///
     /// While the window grows as a classic sender's, a datagram a round trip, the target rises only
     /// after a round trip it held the window back. Raised a packet a round trip beside it, the target
@@ -655,7 +526,7 @@ impl Law {
     /// competing (§2.2's test misjudges Copa's own queue now and then), raise `1/δ` to 58 and fill the
     /// queue to CoDel's target, a mark every three to six seconds. Held back, the window falls by Copa's
     /// own step, which empties the queue Copa alone keeps.
-    fn update_mode(&mut self, now: u64, srtt: u64, delays: &Delays, raise: u64) {
+    fn update_mode(&mut self, now: u64, srtt: u64, delays: &Delays) {
         if delays.nearly_empty() {
             self.competitive = false;
             self.inv_delta = self.default_inv_delta;
@@ -670,7 +541,7 @@ impl Law {
             && now.saturating_sub(self.last_loss_update) > srtt
             && (self.held_back || !self.grows_as_a_classic_sender(now))
         {
-            self.inv_delta = self.inv_delta.saturating_add(raise);
+            self.inv_delta = self.inv_delta.saturating_add(1);
             self.last_increase_update = now;
             self.held_back = false;
         }
@@ -702,7 +573,6 @@ impl Law {
         if persistent {
             self.window = self.minimum_window();
             self.slow_start = false;
-            self.history.record(now, 0, self.window);
         }
     }
 
@@ -747,7 +617,6 @@ impl Law {
         }
         self.back_off();
         self.direction_mark = Some((now, self.window));
-        self.history.record(now, 0, self.window);
     }
 
     /// The window multiplied by the mark backoff, never above what it was nor below the least window.
@@ -793,7 +662,7 @@ impl Copa {
 
     /// `1/δ`, in whole packets: about how many packets of queue the law aims to keep
     pub fn inv_delta(&self) -> u64 {
-        self.law.inv_delta.checked_div(INV_DELTA_UNIT).unwrap_or(0)
+        self.law.inv_delta
     }
 
     /// How many times its step a packet acknowledged moves the window by
@@ -940,8 +809,8 @@ mod tests {
 
     const DATAGRAM: u64 = 1_000;
     const MS: u64 = 1_000_000;
-    /// `1/δ` at the default, in parts.
-    const DEFAULT: u64 = DEFAULT_INV_DELTA * INV_DELTA_UNIT;
+    /// `1/δ` at the default.
+    const DEFAULT: u64 = DEFAULT_INV_DELTA;
 
     fn new_law() -> Law {
         Law::new(DATAGRAM, &CopaConfig::default())
@@ -1066,12 +935,9 @@ mod tests {
     }
 
     #[test]
-    fn competing_copa_raises_its_target_by_the_queueing_share_of_the_round_trip() {
-        // A queue of 50 ms over a least round trip of 100 ms that never empties: competing, each raise
-        // of `1/δ` is the queueing delay's share of the standing round trip, a third of a packet.
-        // Copa's rate, `1/δ` packets over 50 ms, grows a packet over the 150 ms round trip each round
-        // trip, as a classic sender's window grows its rate; grown a packet a round trip, it grew three
-        // times that.
+    fn competing_copa_raises_its_target_a_packet_a_round_trip() {
+        // A queue of 50 ms over a least round trip of 100 ms that never empties: competing, `1/δ`
+        // rises a packet each round trip without a loss (§2.2).
         let mut law = new_law();
         ack(&mut law, 0, 100 * MS, true);
         let mut raises = 0;
@@ -1080,7 +946,7 @@ mod tests {
             ack(&mut law, 500 * MS + step * 10 * MS, 150 * MS, true);
             if law.inv_delta != before {
                 assert!(law.competitive);
-                assert_eq!(law.inv_delta - before, competing_raise(50 * MS, 150 * MS));
+                assert_eq!(law.inv_delta - before, 1);
                 raises += 1;
                 before = law.inv_delta;
             }
@@ -1088,7 +954,6 @@ mod tests {
         // A raise at the first sample more than a smoothed round trip (100 ms) after the last, one in
         // eleven samples of 10 ms, from the mode's first judgement at 510 ms to 3,500 ms.
         assert_eq!(raises, 27);
-        assert_eq!(competing_raise(50 * MS, 150 * MS), INV_DELTA_UNIT / 3);
         // Halved on a loss.
         let raised = law.inv_delta;
         law.on_loss(4_000 * MS, 100 * MS, false);
@@ -1096,73 +961,17 @@ mod tests {
     }
 
     #[test]
-    fn the_mode_is_judged_over_five_round_trips_the_period_of_copas_own_oscillation() {
-        // The queue nearly empty at 0, standing since: within five smoothed round trips of it the
-        // default holds; past them Copa competes. Over four it would compete from 410 ms.
+    fn the_mode_is_judged_over_four_round_trips() {
+        // The queue nearly empty at 0, standing since: within four smoothed round trips of it the
+        // default holds; past them Copa competes.
         let mut law = new_law();
         ack(&mut law, 0, 100 * MS, true);
-        for step in 1..=50 {
+        for step in 1..=40 {
             ack(&mut law, step * 10 * MS, 150 * MS, true);
             assert!(!law.competitive, "{step}");
         }
-        ack(&mut law, 510 * MS, 150 * MS, true);
+        ack(&mut law, 410 * MS, 150 * MS, true);
         assert!(law.competitive);
-    }
-
-    #[test]
-    fn past_slow_start_the_window_a_packet_was_sent_under_judges_its_delay() {
-        // 10 ms of queue over a standing round trip of 110 ms: the target is two packets over 10 ms,
-        // 22 packets a round trip of 110 ms. The window was 20 packets when the acknowledged packet
-        // left and is 40 now: the queue the sample shows is what 20 packets built, under the target,
-        // and the window grows. Judged by the window now it would shrink.
-        let mut law = new_law();
-        ack(&mut law, 0, 100 * MS, true);
-        law.slow_start = false;
-        law.window = 20 * DATAGRAM;
-        law.history.record(100 * MS, 0, law.window);
-        law.window = 40 * DATAGRAM;
-        law.history.record(200 * MS, 0, law.window);
-        ack(&mut law, 250 * MS, 110 * MS, true);
-        // Up by Copa's step at velocity one: `2·datagram²/cwnd`.
-        assert_eq!(
-            law.window,
-            40 * DATAGRAM + 2 * DATAGRAM * DATAGRAM / (40 * DATAGRAM)
-        );
-        // A packet sent under the 40 is judged by them: over the target.
-        let mut law = new_law();
-        ack(&mut law, 0, 100 * MS, true);
-        law.slow_start = false;
-        law.window = 40 * DATAGRAM;
-        law.history.record(100 * MS, 0, law.window);
-        ack(&mut law, 250 * MS, 110 * MS, true);
-        assert_eq!(
-            law.window,
-            40 * DATAGRAM - 2 * DATAGRAM * DATAGRAM / (40 * DATAGRAM)
-        );
-    }
-
-    #[test]
-    fn the_history_keeps_the_window_a_sixteenth_of_a_round_trip_apart_and_the_last_thirty_two() {
-        let mut history = WindowHistory::default();
-        assert_eq!(history.at(5), None);
-        history.record(0, 160, 10);
-        // The same window again, or a change sooner than a sixteenth of the round trip (10), is not
-        // kept as it comes.
-        history.record(5, 160, 10);
-        history.record(9, 160, 11);
-        assert_eq!(history.kept, 1);
-        history.record(10, 160, 12);
-        assert_eq!(history.at(9), Some(10));
-        assert_eq!(history.at(10), Some(12));
-        assert_eq!(history.at(u64::MAX), Some(12));
-        // A time before every sample kept takes the oldest.
-        for at in 1..=40_u64 {
-            history.record(10 + at * 10, 160, 100 + at);
-        }
-        assert_eq!(history.kept, WINDOW_SAMPLES);
-        assert_eq!(history.at(0), Some(100 + 40 - 31));
-        assert_eq!(history.at(415), Some(140));
-        assert_eq!(history.at(405), Some(139));
     }
 
     #[test]
@@ -1416,9 +1225,8 @@ mod tests {
             ack(&mut law, step * 10 * MS, low(step), true);
         }
         assert!(law.competitive);
-        // Raised by the queueing delay's share of the round trip (a hundredth of a packet a round trip
-        // here); set where a longer competition would have taken it.
-        let raised = 9 * INV_DELTA_UNIT;
+        // Set where a longer competition would have raised it, a packet a round trip.
+        let raised = 9;
         law.inv_delta = raised;
         // A mark past slow start: `1/δ` halves, and for ten seconds the window grows as a classic
         // sender's.
@@ -1427,7 +1235,7 @@ mod tests {
         assert_eq!(halved, (raised / 2).max(DEFAULT));
         // Below its target the window grows round trip after round trip and the target stays: raised
         // beside a window that grows a datagram a round trip, it would never be reached, and the queue
-        // never empty. A queue nine to ten milliseconds over the least for the mode's five round trips
+        // never empty. A queue nine to ten milliseconds over the least for the mode's four round trips
         // keeps the mode competing as the samples rise: risen to 80 ms over, "nearly empty" is within
         // 8 ms of the least, and a sample of the low queue still in the window would end the mode.
         for step in 152..=300 {
@@ -1441,7 +1249,7 @@ mod tests {
             assert_eq!(law.inv_delta, halved, "{step}");
         }
         // The queue rises past what the target allows: a round trip goes down, and the round trip after
-        // it `1/δ` rises, by the queueing delay's share of the standing round trip (70 ms of 170).
+        // it `1/δ` rises, by a packet.
         let before = law.window;
         for step in 301..=360_u64 {
             let rtt = if step.is_multiple_of(2) {
@@ -1453,7 +1261,7 @@ mod tests {
             assert!(law.competitive, "{step}");
             if law.inv_delta > halved {
                 assert!(law.window < before, "{} {before}", law.window);
-                assert_eq!(law.inv_delta - halved, competing_raise(70 * MS, 170 * MS));
+                assert_eq!(law.inv_delta - halved, 1);
                 return;
             }
         }

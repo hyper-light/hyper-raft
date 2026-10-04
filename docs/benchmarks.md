@@ -5830,3 +5830,96 @@ cargo test --locked -p hyper-liveness --test processes -- --nocapture --test-thr
 hyper-timing-trace run <dir> <interval-us> 60 && hyper-timing-trace analyse <dir>
 cargo bench -p hyper-liveness --bench allocs   # on each tree, alternating
 ```
+
+## Copa's competing mode over focal's grids (2026-10-04)
+
+Measured on hyper-quic's congestion harness (`crates/hyper-quic/tests/congestion.rs`). Each flow is
+two hyper-quic endpoints over hyper-sim's network: a dumbbell with one bottleneck each way and a queue
+of one bandwidth-delay product, ECN carried. Every run is a deterministic simulation of its seed,
+checked against a second run from its seed and from its trace. So the machine's load during the sweep
+moves no number: 3.4 to 21.6, beside focal's gates and traced runs.
+
+**The grid.** focal's harm grid: 1 Mbit/s and 100 ms, 10 Mbit/s and 20 ms, 10 Mbit/s and 100 ms,
+100 Mbit/s and 20 ms. Each run is 30 s, seeds 1–8, under no queue manager, CoDel (5/100 ms) and a step
+of one datagram. Copa runs beside NewReno and beside CUBIC. In the leave runs the incumbent stops at
+the run's half. focal's alone grid runs each law alone: 1M/20, 1M/100, 10M/20, 10M/100, 100M/20,
+30 s, seed 1. The bar is `min(incumbent beside its own kind, incumbent beside CUBIC)` (Ware et al.,
+HotNets 2019).
+
+**The rule**, fixed before any run of this grid. A law is admissible when:
+
+1. with CoDel or without a manager, in every seed, neither flow carries under a tenth of the other;
+2. under either manager, Copa's datagrams stay ECN-capable;
+3. under CoDel, in every seed, CoDel marks Copa and each incumbent carries at least 9/10 of its bar;
+4. without a manager, in every seed, each incumbent carries at least 9/10 of its bar;
+5. alone, on every path, Copa carries at least 3/10 of the link and its queue's p99 is under
+   NewReno's;
+6. beside an incumbent that stops at the half, in every seed, Copa competed while the incumbent
+   sent, and no sample in the run's last quarter finds it competing.
+
+Of the admissible laws, the one chosen is the one under which Copa carries the most beside the
+incumbents. If none is admissible, the findings stay open and the law does not change to a law
+that failed.
+
+```
+cargo test -p hyper-quic --test congestion --locked every_law_alone_over_focals_grid -- --ignored --nocapture
+cargo test -p hyper-quic --test congestion --locked copa_shares_a_bottleneck_over_focals_grid -- --ignored --nocapture
+cargo test -p hyper-quic --test congestion --locked copa_stops_competing_over_focals_grid -- --ignored --nocapture
+```
+
+**The laws measured.** Each was run with Copa's pacing at `2·cwnd/RTTstanding` (§2.1).
+
+- **focal**: focal's law before b18. The mode is judged over four smoothed round trips, a delay
+  sample is judged by the window now, and competing raises `1/δ` a packet a round trip.
+- **b18**: focal's derivations. A1 judges the mode over five round trips. A2 judges a sample by the
+  window its packet was sent under. B raises `1/δ` by `d_q/RTTstanding` a round trip.
+- **G**: a queue of one datagram or less at Copa's own rate counts as nearly empty. A tenth of the
+  spread of a few datagrams' queue asks for an idle link.
+- **H**: the competing mode ends only once the queue has stayed nearly empty for longer than the
+  mode's window. That marks Copa alone's emptying, which recurs cycle after cycle (§3), not the one
+  empty moment a competitor's backoff leaves (§2.2).
+- **E**: competing, the window is NewReno's congestion avoidance from the window Copa entered the
+  mode with, halved on a loss once a round trip.
+
+| Law | Copa's share beside the incumbents (geomean, 128 runs) | Rule failures (runs) |
+|---|---|---|
+| focal, as shipped | **41.70%** | 3: 3 (bar); 4: 14; 5: 1; 6: 62 of 64 |
+| GH-E: b18, G, H and E | 39.42% | 5: 2; 6: 37 of 64 |
+| GH-paper: A1, A2, G and H, a packet a round trip | 36.31% | 4: 10; 6: 30 of 64 |
+| GH-B: b18, G and H | 25.84% | 3: 4 (CoDel marked nothing); 5: 1; 6: 35 of 64 |
+| b18 | 25.03% | 3: 3 (CoDel marked nothing); 6: 46 of 64 |
+
+No law is admissible. The law stays focal's from before b18, which also carries the most.
+
+**Where the shipped law fails.**
+
+- Rules 3 and 4, an incumbent under 9/10 of its bar:
+  - without a manager at 1 Mbit/s and 100 ms, CUBIC in all eight seeds (0.636 of its bar at least)
+    and NewReno in seeds 1, 2 and 6 (0.735);
+  - without a manager, CUBIC at 10 Mbit/s and 20 ms in seed 3 (0.884), and at 100 Mbit/s and 20 ms
+    in seeds 1 and 7 (0.84);
+  - under CoDel at 1 Mbit/s and 100 ms, NewReno in seeds 4–6 (0.849).
+
+  This is focal's finding 1.
+- Rule 5: at 1 Mbit/s and 20 ms Copa alone kept a queue p99 of 28.80 ms, equal to NewReno's and not
+  under it. Copa judged itself competing in 59.8% of the run.
+- Rule 6: Copa competed in the last quarter in 62 of 64 leave runs: every run but two seeds beside
+  NewReno at 10 Mbit/s and 20 ms. This is focal's finding 3. At 100 Mbit/s and 20 ms every law
+  failed all sixteen runs.
+
+The shipped law alone, focal's alone grid:
+
+| Path | Copa carried | Queue p50 / p99 ms (NewReno's) | Copa competing, alone |
+|---|---|---|---|
+| 1 Mbit/s, 20 ms | 89.6% | 18.10 / 28.80 (18.02 / 28.80) | 59.8% |
+| 1 Mbit/s, 100 ms | 96.6% | 24.51 / 53.31 (43.71 / 82.11) | 12.1% |
+| 10 Mbit/s, 20 ms | 96.7% | 2.05 / 16.45 (9.73 / 18.37) | 15.3% |
+| 10 Mbit/s, 100 ms | 97.2% | 3.65 / 11.33 (61.25 / 97.73) | 42.1% |
+| 100 Mbit/s, 20 ms | 97.2% | 0.35 / 0.83 (11.10 / 19.74) | 36.5% |
+
+**CoDel marked nothing in seven runs.** Under b18 and GH-B, at 100 Mbit/s and 20 ms, CoDel marked
+none of Copa's datagrams, where Copa carried 17–23%. That fails rule 3. It is no ECN fault. Three of
+the runs were replayed under b18 and Copa's datagrams stayed ECN-capable to the end. CoDel acted 11
+or 12 times in 30 s, once a sawtooth of the incumbent's at that rate, and each time a datagram of
+the incumbent's stood at the queue's head. A seed in which CoDel marked Copa twice was replayed
+beside them.

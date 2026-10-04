@@ -1,4 +1,4 @@
-use std::{any::Any, io, str};
+use std::{any::Any, io, str, sync::LazyLock};
 
 use aws_lc_rs::aead;
 use bytes::BytesMut;
@@ -66,6 +66,10 @@ impl crypto::Session for TlsSession {
                 .inner
                 .negotiated_key_exchange_group()
                 .map(|group| group.name()),
+            negotiated_cipher_suite: self
+                .inner
+                .negotiated_cipher_suite()
+                .map(|suite| suite.suite()),
         }))
     }
 
@@ -287,6 +291,8 @@ pub struct HandshakeData {
     pub server_name: Option<String>,
     /// The key exchange group negotiated with the peer, once the handshake has chosen one
     pub negotiated_key_exchange_group: Option<NamedGroup>,
+    /// The TLS 1.3 cipher suite negotiated with the peer, once the handshake has chosen one
+    pub negotiated_cipher_suite: Option<CipherSuite>,
 }
 
 /// A QUIC-compatible TLS client configuration
@@ -319,9 +325,9 @@ impl QuicClientConfig {
     pub(crate) fn new(verifier: Box<dyn ServerCertVerifier>) -> Result<Self, rustls::Error> {
         let inner = Self::inner(verifier)?;
         Ok(Self {
-            // The aws-lc-rs default provider contains TLS13_AES_128_GCM_SHA256; one without it
-            // is refused, where upstream panicked
-            initial: initial_suite_from_provider(inner.crypto_provider())
+            // aws-lc-rs's suite table holds TLS13_AES_128_GCM_SHA256 with its QUIC keys; were it
+            // gone the configuration is refused, where upstream panicked
+            initial: initial_suite()
                 .ok_or(rustls::Error::Internal("no initial cipher suite found"))?,
             inner,
         })
@@ -344,7 +350,7 @@ impl QuicClientConfig {
         verifier: Box<dyn ServerCertVerifier>,
     ) -> Result<rustls::ClientConfig, rustls::Error> {
         // The default providers support TLS 1.3; one that does not is refused
-        let mut config = rustls::ClientConfig::builder_with_provider(configured_provider())
+        let mut config = rustls::ClientConfig::builder_with_provider(node_provider())
             .with_protocol_versions(&[&rustls::version::TLS13])?
             .dangerous()
             .with_custom_certificate_verifier(verifier)
@@ -388,8 +394,7 @@ impl TryFrom<rustls::ClientConfig> for QuicClientConfig {
 
     fn try_from(inner: rustls::ClientConfig) -> Result<Self, Self::Error> {
         Ok(Self {
-            initial: initial_suite_from_provider(inner.crypto_provider())
-                .ok_or(NoInitialCipherSuite { specific: false })?,
+            initial: initial_suite().ok_or(NoInitialCipherSuite { specific: false })?,
             inner,
         })
     }
@@ -399,7 +404,8 @@ impl TryFrom<rustls::ClientConfig> for QuicClientConfig {
 ///
 /// When the cipher suite is supplied `with_initial()`, it must be
 /// [`CipherSuite::TLS13_AES_128_GCM_SHA256`]. When the cipher suite is derived from a config's
-/// [`CryptoProvider`][provider], that provider must reference a cipher suite with the same ID.
+/// [`CryptoProvider`][provider], it is aws-lc-rs's own AES-128-GCM suite whichever suites the
+/// provider offers (RFC 9001 §5.2).
 ///
 /// [provider]: rustls::crypto::CryptoProvider
 #[derive(Clone, Debug)]
@@ -443,9 +449,9 @@ impl QuicServerConfig {
     ) -> Result<Self, rustls::Error> {
         let inner = Self::inner(cert_chain, key)?;
         Ok(Self {
-            // The aws-lc-rs default provider contains TLS13_AES_128_GCM_SHA256; one without it
-            // is refused, where upstream panicked
-            initial: initial_suite_from_provider(inner.crypto_provider())
+            // aws-lc-rs's suite table holds TLS13_AES_128_GCM_SHA256 with its QUIC keys; were it
+            // gone the configuration is refused, where upstream panicked
+            initial: initial_suite()
                 .ok_or(rustls::Error::Internal("no initial cipher suite found"))?,
             inner,
         })
@@ -474,7 +480,7 @@ impl QuicServerConfig {
         key: PrivateKeyDer<'static>,
     ) -> Result<rustls::ServerConfig, rustls::Error> {
         // The default provider supports TLS 1.3; one that does not is refused
-        let mut inner = rustls::ServerConfig::builder_with_provider(configured_provider())
+        let mut inner = rustls::ServerConfig::builder_with_provider(node_provider())
             .with_protocol_versions(&[&rustls::version::TLS13])?
             .with_no_client_auth()
             .with_single_cert(cert_chain, key)?;
@@ -489,8 +495,7 @@ impl TryFrom<rustls::ServerConfig> for QuicServerConfig {
 
     fn try_from(inner: rustls::ServerConfig) -> Result<Self, Self::Error> {
         Ok(Self {
-            initial: initial_suite_from_provider(inner.crypto_provider())
-                .ok_or(NoInitialCipherSuite { specific: false })?,
+            initial: initial_suite().ok_or(NoInitialCipherSuite { specific: false })?,
             inner,
         })
     }
@@ -562,24 +567,47 @@ fn foreign_config() -> TransportError {
     TransportError::INTERNAL_ERROR("TLS session lent another implementation's configuration")
 }
 
-pub(crate) fn initial_suite_from_provider(
-    provider: &rustls::crypto::CryptoProvider,
-) -> Option<Suite> {
-    provider
-        .cipher_suites
-        .iter()
-        .find_map(|cs| match (cs.suite(), cs.tls13()) {
-            (rustls::CipherSuite::TLS13_AES_128_GCM_SHA256, Some(suite)) => {
-                Some(suite.quic_suite())
-            }
-            _ => None,
-        })
-        .flatten()
+/// The Initial packets' suite, AES-128-GCM with SHA-256, whatever the connection negotiates:
+/// "Initial packets use AEAD_AES_128_GCM with keys derived from the Destination Connection ID"
+/// (RFC 9001 §5.2). It is taken from the provider's own suite table, not from the suites a
+/// configuration offers, so a configuration that offers only 256-bit suites still protects its
+/// Initial packets as the RFC requires.
+pub(crate) fn initial_suite() -> Option<Suite> {
+    match rustls::crypto::aws_lc_rs::cipher_suite::TLS13_AES_128_GCM_SHA256 {
+        rustls::SupportedCipherSuite::Tls13(suite) => suite.quic_suite(),
+        rustls::SupportedCipherSuite::Tls12(_) => None,
+    }
 }
 
-/// aws-lc-rs's default provider: process-lifetime algorithm tables, borrowed by every configuration
-pub(crate) fn configured_provider() -> &'static rustls::crypto::CryptoProvider {
-    &rustls::crypto::aws_lc_rs::DEFAULT_PROVIDER
+/// The key exchange groups between nodes: the hybrid post-quantum groups only, X25519MLKEM768
+/// first (its share is the one a ClientHello carries), then SecP256r1MLKEM768
+/// (draft-ietf-tls-ecdhe-mlkem). A classical-only peer finds no group in common and is refused
+/// (the owner's decision, 2026-10-04).
+static NODE_KX_GROUPS: [&dyn rustls::crypto::SupportedKxGroup; 2] = [
+    rustls::crypto::aws_lc_rs::kx_group::X25519MLKEM768,
+    rustls::crypto::aws_lc_rs::kx_group::SECP256R1MLKEM768,
+];
+
+/// The TLS 1.3 suites between nodes: those with 256-bit keys only, AES-256-GCM first, then
+/// ChaCha20-Poly1305 (RFC 8446 §B.4). Initial packets keep AES-128-GCM ([`initial_suite`]).
+static NODE_CIPHER_SUITES: [rustls::SupportedCipherSuite; 2] = [
+    rustls::crypto::aws_lc_rs::cipher_suite::TLS13_AES_256_GCM_SHA384,
+    rustls::crypto::aws_lc_rs::cipher_suite::TLS13_CHACHA20_POLY1305_SHA256,
+];
+
+/// The provider between nodes: aws-lc-rs's, restricted to the hybrid post-quantum groups and the
+/// 256-bit suites, as process-lifetime data every configuration borrows
+static NODE_PROVIDER: LazyLock<rustls::crypto::CryptoProvider> =
+    LazyLock::new(|| rustls::crypto::CryptoProvider {
+        cipher_suites: NODE_CIPHER_SUITES.to_vec(),
+        kx_groups: NODE_KX_GROUPS.to_vec(),
+        ..rustls::crypto::aws_lc_rs::default_provider()
+    });
+
+/// The provider every configuration hyper-quic builds uses, and that the application layer's
+/// mutual TLS between nodes uses: hybrid post-quantum key exchange and 256-bit TLS 1.3 suites only
+pub fn node_provider() -> &'static rustls::crypto::CryptoProvider {
+    &NODE_PROVIDER
 }
 
 fn to_vec(params: &TransportParameters) -> Vec<u8> {

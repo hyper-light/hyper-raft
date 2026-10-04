@@ -535,6 +535,11 @@ attempt bound counting one attempt twice, the amplification limit overshot by a 
 probing only one space while the lost ServerHello waited, no packet on entering recovery, packets
 dropped when they overtook their keys, and the PTO backoff kept past a key discard.
 
+TLS between nodes is restricted to the hybrid post-quantum groups (X25519MLKEM768, then
+SecP256r1MLKEM768) and the 256-bit TLS 1.3 suites (AES-256-GCM, then ChaCha20-Poly1305). Initial
+packets keep AES-128-GCM (RFC 9001 §5.2), and a classical-only peer is refused
+(`crates/hyper-quic/VENDORED.md` §10).
+
 ## 5. Consumers
 
 slates, focal and mantle each vendor a snapshot of the conformed crates, recording the hyper-raft revision

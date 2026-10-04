@@ -20,7 +20,7 @@ use rustls::{
 };
 use tracing::{info_span, trace};
 
-use super::crypto::rustls::{QuicClientConfig, QuicServerConfig, configured_provider};
+use super::crypto::rustls::{QuicClientConfig, QuicServerConfig, node_provider};
 use super::*;
 use crate::{Duration, Instant};
 
@@ -595,6 +595,40 @@ impl Write for TestWriter {
     }
 }
 
+/// aws-lc-rs's provider with classical key exchange only: a client of it puts its ClientHello in
+/// one Initial datagram, the layout upstream's packet-counting tests were written against
+static CLASSICAL: std::sync::LazyLock<rustls::crypto::CryptoProvider> =
+    std::sync::LazyLock::new(|| rustls::crypto::CryptoProvider {
+        kx_groups: vec![
+            rustls::crypto::aws_lc_rs::kx_group::X25519,
+            rustls::crypto::aws_lc_rs::kx_group::SECP256R1,
+            rustls::crypto::aws_lc_rs::kx_group::SECP384R1,
+        ],
+        ..rustls::crypto::aws_lc_rs::default_provider()
+    });
+
+/// A server that accepts classical key exchange, for upstream's packet-counting tests: hyper-quic's
+/// own configurations refuse it (`node_provider`)
+pub(super) fn server_config_classical(
+    identity: Option<(CertificateDer<'static>, PrivateKeyDer<'static>)>,
+) -> ServerConfig {
+    let (cert, key) = identity.unwrap_or_else(|| {
+        (
+            CERTIFIED_KEY.cert.der().clone(),
+            PrivateKeyDer::Pkcs8(CERTIFIED_KEY.signing_key.serialize_der().into()),
+        )
+    });
+    let provider: &'static rustls::crypto::CryptoProvider = &CLASSICAL;
+    let mut inner = rustls::ServerConfig::builder_with_provider(provider)
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(vec![cert], key)
+        .unwrap();
+    inner.max_early_data_size = u32::MAX;
+    ServerConfig::with_crypto(Box::new(QuicServerConfig::try_from(inner).unwrap()))
+}
+
 pub(super) fn server_config() -> ServerConfig {
     ServerConfig::with_crypto(Box::new(server_crypto()))
 }
@@ -660,15 +694,6 @@ pub(super) fn client_config_with_certs(certs: Vec<CertificateDer<'static>>) -> C
 /// datagram: the layout upstream's packet-counting tests were written against. The default
 /// client prefers X25519MLKEM768, whose 1,184-byte key share spreads the ClientHello over two.
 pub(super) fn client_config_classical(certs: Option<Vec<CertificateDer<'static>>>) -> ClientConfig {
-    static CLASSICAL: std::sync::LazyLock<rustls::crypto::CryptoProvider> =
-        std::sync::LazyLock::new(|| rustls::crypto::CryptoProvider {
-            kx_groups: vec![
-                rustls::crypto::aws_lc_rs::kx_group::X25519,
-                rustls::crypto::aws_lc_rs::kx_group::SECP256R1,
-                rustls::crypto::aws_lc_rs::kx_group::SECP384R1,
-            ],
-            ..rustls::crypto::aws_lc_rs::default_provider()
-        });
     let provider: &'static rustls::crypto::CryptoProvider = &CLASSICAL;
     let mut roots = rustls::RootCertStore::empty();
     for cert in certs.unwrap_or_else(|| vec![CERTIFIED_KEY.cert.der().clone()]) {
@@ -706,7 +731,7 @@ fn client_crypto_inner(
     }
 
     let mut inner = QuicClientConfig::inner(
-        WebPkiServerVerifier::builder_with_provider(roots, configured_provider())
+        WebPkiServerVerifier::builder_with_provider(roots, node_provider())
             .build()
             .unwrap(),
     )

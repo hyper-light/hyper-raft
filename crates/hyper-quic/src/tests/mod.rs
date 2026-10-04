@@ -27,6 +27,7 @@ pub(crate) mod util;
 use util::*;
 
 mod first_flight;
+mod node_tls;
 mod token;
 
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
@@ -869,7 +870,7 @@ fn test_zero_rtt_incoming_limit<F: FnOnce(&mut ServerConfig)>(configure_server: 
     const EXPECTED_DROPPED: u64 = 4;
 
     let _guard = subscribe();
-    let mut server_config = server_config();
+    let mut server_config = server_config_classical(None);
     configure_server(&mut server_config);
     let mut pair = Pair::new(EndpointConfig::default(), server_config);
     let config = pair.add_client_config(client_config_classical(None));
@@ -2922,7 +2923,7 @@ fn server_can_send_3_inital_packets() {
     let _guard = subscribe();
 
     let (cert, key) = big_cert_and_key();
-    let server = server_config_with_cert(cert.clone(), key);
+    let server = server_config_classical(Some((cert.clone(), key)));
     let client = client_config_classical(Some(vec![cert]));
     let mut pair = Pair::new(Default::default(), server);
 

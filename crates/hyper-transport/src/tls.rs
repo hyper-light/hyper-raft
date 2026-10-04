@@ -31,7 +31,7 @@ pub struct Credentials {
 }
 
 fn provider() -> &'static rustls::crypto::CryptoProvider {
-    &rustls::crypto::aws_lc_rs::DEFAULT_PROVIDER
+    hyper_quic::crypto::rustls::node_provider()
 }
 
 fn roots(certificates: &[CertificateDer<'static>]) -> Result<RootCertStore, Refusal> {

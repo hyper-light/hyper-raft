@@ -459,3 +459,25 @@ from upstream came out of it, each a defect with a test that failed before its f
 6. **Discarding keys resets the PTO backoff** (RFC 9002 §6.2.2, Appendix A.11's `pto_count = 0`).
    Upstream carried the count past the discard, so a client whose Initial PTO had fired probed a
    lost Finished after twice the PTO.
+
+## 10. TLS between nodes: hybrid post-quantum groups and 256-bit suites only (2026-10-04)
+
+The owner approved restricting the TLS hyper-quic builds to post-quantum key exchange and 256-bit
+suites. `crypto::rustls::node_provider()` is aws-lc-rs's provider with two lists restricted. Every
+configuration hyper-quic builds uses it, and so does hyper-transport's mutual TLS:
+
+- **Key exchange.** X25519MLKEM768 first, whose share a ClientHello carries, then
+  SecP256r1MLKEM768 (draft-ietf-tls-ecdhe-mlkem). Upstream also offered X25519, P-256 and P-384.
+- **Cipher suites.** TLS13_AES_256_GCM_SHA384, then TLS13_CHACHA20_POLY1305_SHA256. Both have
+  256-bit keys. TLS13_AES_128_GCM_SHA256 is no longer offered.
+- **Initial packets.** These keep AEAD_AES_128_GCM, as RFC 9001 §5.2 requires. Their suite is
+  taken from aws-lc-rs's suite table (`initial_suite`), not from the suites a configuration offers.
+  Upstream refused a configuration whose provider lacked AES-128-GCM.
+- **What a peer sees.** A classical-only peer, or one offering only AES-128-GCM, shares nothing
+  with a node. It is refused with a TLS handshake_failure alert (CRYPTO_ERROR 0x128, RFC 9001
+  §4.8), in either role (`src/tests/node_tls.rs`).
+- **What is now exposed.** `HandshakeData::negotiated_cipher_suite` reports the suite.
+- **Upstream's tests.** The packet-counting tests need a one-datagram ClientHello, so they pair
+  their classical client with a test-only server that accepts classical groups.
+- **Interoperation.** Upstream quinn-proto, on rustls with `prefer-post-quantum`, offers
+  X25519MLKEM768 and AES-256-GCM. The end-to-end interoperation suite passes unchanged.

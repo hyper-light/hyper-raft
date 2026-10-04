@@ -9,7 +9,7 @@ use rustls::client::WebPkiServerVerifier;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use thiserror::Error;
 
-use crate::crypto::rustls::{QuicServerConfig, configured_provider};
+use crate::crypto::rustls::{QuicServerConfig, node_provider};
 use crate::{
     DEFAULT_SUPPORTED_VERSIONS, Duration, MAX_CID_SIZE, RandomConnectionIdGenerator, SystemTime,
     VarInt, VarIntBoundsExceeded,
@@ -596,7 +596,7 @@ impl ClientConfig {
     /// Create a client configuration that trusts specified trust anchors
     pub fn with_root_certificates(roots: rustls::RootCertStore) -> Result<Self, ClientConfigError> {
         Ok(Self::new(Box::new(crypto::rustls::QuicClientConfig::new(
-            WebPkiServerVerifier::builder_with_provider(roots, configured_provider()).build()?,
+            WebPkiServerVerifier::builder_with_provider(roots, node_provider()).build()?,
         )?)))
     }
 }

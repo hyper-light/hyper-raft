@@ -1047,14 +1047,12 @@ mod tests {
     #[test]
     fn header_encoding() {
         use crate::Side;
-        use crate::crypto::rustls::{initial_keys, initial_suite_from_provider};
-        use rustls::crypto::aws_lc_rs::default_provider;
+        use crate::crypto::rustls::{initial_keys, initial_suite};
         use rustls::quic::Version;
 
         let dcid = ConnectionId::new(&hex!("06b858ec6f80452b"));
-        let provider = default_provider();
 
-        let suite = initial_suite_from_provider(&provider).unwrap();
+        let suite = initial_suite().unwrap();
         let client = initial_keys(Version::V1, dcid, Side::Client, &suite);
         let mut buf = Vec::new();
         let header = Header::Initial(InitialHeader {

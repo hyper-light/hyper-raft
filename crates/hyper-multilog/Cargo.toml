@@ -16,6 +16,10 @@ thiserror.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
+# The world and network the explorer and the timed simulation run on (docs/sim.md, S-1 and S-2).
+hyper-sim = { path = "../hyper-sim" }
+# The election law the timed simulation derives each group's timing from.
+hyper-timing = { path = "../hyper-timing" }
 
 [lints]
 workspace = true

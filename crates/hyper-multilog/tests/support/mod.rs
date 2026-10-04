@@ -28,6 +28,15 @@ pub fn limits(members: usize) -> hyper_raft::Limits {
     .expect("the harness's statement gives its bounds")
 }
 
+/// A member's settings electing by suspicion (timing step L-2): its owner's detectors start its
+/// campaigns, and it takes no ticks.
+pub fn config_by_suspicion(id: u64, members: usize, seed: u64) -> Config {
+    Config {
+        elections: Elections::Suspicion,
+        ..config(id, members, seed)
+    }
+}
+
 /// A member's settings: pre-vote and check-quorum, elections on ticks (an election timeout of ten,
 /// a heartbeat every two, as focal's shell sets a group), and a window of bytes.
 pub fn config(id: u64, members: usize, seed: u64) -> Config {
@@ -372,19 +381,40 @@ pub struct Member {
     pub counts: Counts,
     /// Whether the member takes an image after the next global command it applies.
     pub image_at_next_global: bool,
+    /// Whether [`Member::settle`] proposes the barriers owed; an explorer that makes their
+    /// proposal an adversary's move turns it off.
+    pub auto_barriers: bool,
+    /// Whether its logs elect by suspicion rather than on ticks.
+    pub suspicion: bool,
 }
 
 impl Member {
     /// Member `id` of `voters`, holding `logs` logs, each a fresh log.
     pub fn new(id: u64, voters: &[u64], logs: usize, seed: u64, limits: Limits) -> Self {
+        Self::open(id, voters, logs, seed, limits, false)
+    }
+
+    /// As [`Member::new`], its logs electing by suspicion where `suspicion`.
+    pub fn open(
+        id: u64,
+        voters: &[u64],
+        logs: usize,
+        seed: u64,
+        limits: Limits,
+        suspicion: bool,
+    ) -> Self {
         let boot = ConfState {
             voters: voters.to_vec(),
             ..ConfState::default()
         };
         let stores = (0..logs).map(|_| Store(Disk::new(boot.clone()))).collect();
         let point = Point::origin(vec![boot.clone(); logs]).unwrap();
-        let multi = MultiLog::open(&config(id, voters.len(), seed), stores, &point, limits)
-            .expect("a member opens");
+        let settings = if suspicion {
+            config_by_suspicion(id, voters.len(), seed)
+        } else {
+            config(id, voters.len(), seed)
+        };
+        let multi = MultiLog::open(&settings, stores, &point, limits).expect("a member opens");
         Self {
             id,
             members: voters.len(),
@@ -397,6 +427,8 @@ impl Member {
             limits,
             counts: Counts::default(),
             image_at_next_global: false,
+            auto_barriers: true,
+            suspicion,
         }
     }
 
@@ -435,13 +467,13 @@ impl Member {
             disk.conf = at.configuration.clone();
             stores.push(Store(disk));
         }
-        self.multi = MultiLog::open(
-            &config(self.id, self.members, self.seed),
-            stores,
-            &point,
-            self.limits,
-        )
-        .expect("a member reopens on what it made durable");
+        let settings = if self.suspicion {
+            config_by_suspicion(self.id, self.members, self.seed)
+        } else {
+            config(self.id, self.members, self.seed)
+        };
+        self.multi = MultiLog::open(&settings, stores, &point, self.limits)
+            .expect("a member reopens on what it made durable");
         self.app = app;
     }
 
@@ -576,7 +608,9 @@ impl Member {
             self.drive(log, out);
         }
         self.apply();
-        self.barriers();
+        if self.auto_barriers {
+            self.barriers();
+        }
         for log in 0..self.logs {
             self.drive(log, out);
         }

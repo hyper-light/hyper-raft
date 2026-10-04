@@ -996,12 +996,25 @@ Tests (`crates/hyper-durable/tests`):
   founder's window is too narrow between processes to fail there (its write is on its way when it
   applies), which `directed.rs` covers deterministically.
 - Measured against mantle's shell (`crates/hyper-durable-compare`, `docs/benchmarks.md`, "The
-  durable shell against mantle's" and "The three losses ... traced"): faster with three and five
-  members and 18–36% fewer allocations. Of the losses:
-  - the reallocations are the core's unstable log and outgoing queue giving up their capacity when
-    readies are taken ahead; a core change is asked;
-  - the extra switches are involuntary, the price of the overlap;
-  - the one-member tail does not reproduce in nine rotated rounds.
+  durable shell against mantle's", "The three losses ... traced" and "mantle's range replica on the
+  shell (D-1)"): faster with three and five members and 18–36% fewer allocations. Of the losses:
+  - the reallocations were the core's unstable log and outgoing queue giving up their capacity
+    when readies are taken ahead, and the member keeping one spare queue while three writes out
+    each held one; the core keeps its capacity and a spare for each ready in flight, and the
+    driving thread reallocates as mantle's shell does once a group has warmed;
+  - the extra switches are involuntary, the price of the overlap, for the same CPU time; per
+    entry they are within a few percent of mantle's either way;
+  - the one-member tail is the device's: an entry's latency is its write's and the same few tens
+    of microseconds on both shells.
+- **mantle (D-1), switched** (mantle branch `shared-d1`, 2026-10-03): its range replica is this
+  shell with its engine and layer as `RangeMachine`, `durable` the engine's durable index with
+  the term the engine keeps beside it, its applied answers one record a command; elections on
+  ticks, no quiet write. Measured on its workload, it commits a group of three or five at a median
+  39–44% lower than mantle's shell on real files, with 30–43% fewer allocations and the same
+  reallocations, and one member evenly (`docs/benchmarks.md`, "mantle's range replica on the
+  shell (D-1)"). The move found two core faults, fixed: a campaign's vote requests left waiting
+  through many timeouts (`ORIGIN.md`, "A campaign supersedes the requests still waiting"), and
+  the one spare queue (`ORIGIN.md`, "A spare queue for each ready in flight").
 - `liveness.rs`: the shell on the node-pair liveness stream (L-3), three nodes on one simulated
   clock, 64 seeds by default: elected from nothing, silent while idle but after a detector's change,
   and the leader's node killed, suspected by every survivor within its stated bound and replaced

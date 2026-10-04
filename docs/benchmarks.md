@@ -3993,6 +3993,261 @@ for o in mantle hyper; do HYPER_DURABLE_ONLY=$o /usr/bin/time -l ./target/releas
   --devices file --members 3 --shapes register --rounds 3 --entries 300; done
 ```
 
+# mantle's range replica on the shell (D-1)
+
+mantle's D-1 moves its range replica onto this shell. `crates/hyper-durable-compare` now runs four
+sides in one process on mantle's workload, the order rotated each round:
+- **mantle 1c179e8**, **hyper-durable**: as in "The durable shell against mantle's" above;
+- **mantle 85b9c2d**: mantle's shell at its step 1, over this repository's `687244f` snapshots, so
+  it runs on the log the shell runs on;
+- **mantle D-1**: mantle's range replica on this shell (mantle `crates/range` on its branch
+  `shared-d1`, over the snapshots of `b3a1fd7`), driven as mantle's node is to drive a range
+  (mantle `docs/design/node.md` §2.2), with mantle's settings: elections on ticks, no quiet write.
+
+With `HYPER_DURABLE_DIAGNOSIS` each point also gives the leader's writes, submission to the answer
+taken. Same machine, 2026-10-03, other sessions building (a focal gate among them); the load
+average beside each point. Columns per committed entry as above, medians over the rounds; the
+driving thread's counts are the shell's, the core's, the state machine's and the store's calls.
+
+## On the device, 4 rounds of 300 entries after 50
+
+**1 member, register entries, device; load 6.69 7.41 7.53 → 4.79 6.75 7.28**
+
+| side | p50 µs | p99 µs | p99.9 µs | entries/s | flushes | allocs | reallocs | switches | driver's allocs | driver's reallocs | leader's write p50 µs | leader's write p99 µs |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| mantle 1c179e8 | 8655 | 14842 | 19076 | 113 | 1.00 | 38.4 | 9.08 | 15.9 | 38.3 | 9.03 | 8642 | 14824 |
+| mantle 85b9c2d | 8560 | 21166 | 126517 | 108 | 1.00 | 38.4 | 9.08 | 16.5 | 38.3 | 9.03 | 8542 | 21146 |
+| hyper-durable | 8596 | 17907 | 63222 | 110 | 1.00 | 30.4 | 9.08 | 16.5 | 30.3 | 9.03 | 8584 | 17896 |
+| mantle D-1 | 8583 | 13673 | 18059 | 110 | 1.00 | 30.4 | 9.08 | 15.7 | 30.3 | 9.03 | 8569 | 13628 |
+
+**3 members, register entries, device; load 4.79 6.75 7.28 → 11.03 7.70 7.44**
+
+| side | p50 µs | p99 µs | p99.9 µs | entries/s | flushes | allocs | reallocs | switches | driver's allocs | driver's reallocs | leader's write p50 µs | leader's write p99 µs |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| mantle 1c179e8 | 65358 | 112836 | 330276 | 20 | 6.00 | 135.1 | 21.19 | 140.7 | 135.0 | 21.06 | 13030 | 29733 |
+| mantle 85b9c2d | 65018 | 118407 | 353097 | 20 | 6.00 | 135.1 | 21.19 | 128.7 | 135.0 | 21.06 | 13816 | 29340 |
+| hyper-durable | 37683 | 63027 | 295355 | 27 | 5.72 | 93.9 | 21.19 | 125.8 | 93.7 | 21.06 | 30669 | 54159 |
+| mantle D-1 | 36989 | 68076 | 244814 | 27 | 5.78 | 93.9 | 21.19 | 137.3 | 93.7 | 21.06 | 30774 | 54707 |
+
+**5 members, register entries, device; load 11.03 7.70 7.44 → 8.53 11.54 9.88**
+
+| side | p50 µs | p99 µs | p99.9 µs | entries/s | flushes | allocs | reallocs | switches | driver's allocs | driver's reallocs | leader's write p50 µs | leader's write p99 µs |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| mantle 1c179e8 | 87928 | 129185 | 369212 | 12 | 10.00 | 225.8 | 33.29 | 266.8 | 225.7 | 33.08 | 18063 | 30529 |
+| mantle 85b9c2d | 87973 | 148602 | 367219 | 11 | 10.00 | 225.8 | 33.29 | 285.4 | 225.7 | 33.08 | 17997 | 31578 |
+| hyper-durable | 49905 | 75805 | 313985 | 19 | 9.80 | 157.0 | 33.29 | 277.8 | 156.5 | 33.08 | 41897 | 72522 |
+| mantle D-1 | 49676 | 77707 | 319761 | 20 | 9.81 | 157.0 | 33.29 | 276.7 | 156.5 | 33.08 | 41066 | 75894 |
+
+**1 member, 1 KiB put entries, device; load 8.53 11.54 9.88 → 4.36 9.02 9.09**
+
+| side | p50 µs | p99 µs | p99.9 µs | entries/s | flushes | allocs | reallocs | switches | driver's allocs | driver's reallocs | leader's write p50 µs | leader's write p99 µs |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| mantle 1c179e8 | 22150 | 33877 | 223216 | 44 | 1.00 | 26.0 | 10.07 | 29.4 | 26.0 | 10.02 | 22125 | 33852 |
+| mantle 85b9c2d | 21087 | 29924 | 240435 | 56 | 1.00 | 26.0 | 10.07 | 28.4 | 26.0 | 10.02 | 21058 | 29899 |
+| hyper-durable | 19998 | 28386 | 185015 | 52 | 1.00 | 18.0 | 10.07 | 28.0 | 18.0 | 10.02 | 19976 | 28364 |
+| mantle D-1 | 21200 | 28399 | 151172 | 49 | 1.00 | 18.0 | 10.07 | 28.2 | 18.0 | 10.02 | 21174 | 28359 |
+
+**3 members, 1 KiB put entries, device; load 4.36 9.02 9.09 → 3.67 6.19 7.77**
+
+| side | p50 µs | p99 µs | p99.9 µs | entries/s | flushes | allocs | reallocs | switches | driver's allocs | driver's reallocs | leader's write p50 µs | leader's write p99 µs |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| mantle 1c179e8 | 73622 | 134614 | 363142 | 15 | 6.00 | 96.1 | 12.16 | 162.6 | 96.0 | 12.03 | 16800 | 35881 |
+| mantle 85b9c2d | 70426 | 166069 | 358973 | 14 | 6.00 | 96.1 | 12.16 | 132.7 | 96.0 | 12.03 | 14992 | 38832 |
+| hyper-durable | 39046 | 69309 | 346192 | 26 | 5.77 | 54.9 | 12.16 | 138.4 | 54.8 | 12.03 | 33010 | 64949 |
+| mantle D-1 | 41298 | 109634 | 292041 | 24 | 5.75 | 55.0 | 12.16 | 139.9 | 54.8 | 12.03 | 35672 | 95434 |
+
+**5 members, 1 KiB put entries, device; load 3.67 6.19 7.77 → 20.54 14.97 11.25**
+
+| side | p50 µs | p99 µs | p99.9 µs | entries/s | flushes | allocs | reallocs | switches | driver's allocs | driver's reallocs | leader's write p50 µs | leader's write p99 µs |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| mantle 1c179e8 | 68990 | 126718 | 376839 | 14 | 10.00 | 160.2 | 14.24 | 247.8 | 160.0 | 14.03 | 10377 | 29337 |
+| mantle 85b9c2d | 74467 | 148087 | 423174 | 13 | 10.00 | 160.2 | 14.24 | 251.4 | 160.0 | 14.03 | 12901 | 32791 |
+| hyper-durable | 40159 | 129713 | 375414 | 25 | 9.81 | 91.3 | 14.24 | 241.2 | 90.8 | 14.03 | 33177 | 112756 |
+| mantle D-1 | 42310 | 67332 | 408772 | 23 | 9.80 | 91.4 | 14.24 | 247.1 | 90.8 | 14.03 | 34082 | 64292 |
+
+## On the simulated device, 4 rounds of 3,000 entries
+
+After 50 entries to warm:
+
+**1 member, register entries, simulated device; load 5.48 7.32 7.51 → 5.68 7.33 7.51**
+
+| side | p50 µs | p99 µs | p99.9 µs | entries/s | flushes | allocs | reallocs | switches | driver's allocs | driver's reallocs |
+|---|---|---|---|---|---|---|---|---|---|---|
+| mantle 1c179e8 | 11 | 31 | 121 | 87486 | 1.00 | 44.4 | 9.02 | 3.0 | 38.3 | 9.01 |
+| mantle 85b9c2d | 12 | 42 | 140 | 88860 | 1.00 | 44.4 | 9.02 | 3.0 | 38.3 | 9.01 |
+| hyper-durable | 11 | 40 | 145 | 85162 | 1.00 | 36.4 | 9.02 | 3.0 | 30.3 | 9.01 |
+| mantle D-1 | 12 | 48 | 188 | 85463 | 1.00 | 36.4 | 9.02 | 3.0 | 30.3 | 9.01 |
+
+**3 members, register entries, simulated device; load 5.68 7.33 7.51 → 5.68 7.33 7.51**
+
+| side | p50 µs | p99 µs | p99.9 µs | entries/s | flushes | allocs | reallocs | switches | driver's allocs | driver's reallocs |
+|---|---|---|---|---|---|---|---|---|---|---|
+| mantle 1c179e8 | 58 | 178 | 324 | 15155 | 6.00 | 179.0 | 21.29 | 17.0 | 135.0 | 21.01 |
+| mantle 85b9c2d | 59 | 231 | 462 | 14985 | 6.00 | 179.0 | 21.29 | 17.1 | 135.0 | 21.01 |
+| hyper-durable | 46 | 97 | 211 | 20355 | 5.53 | 130.0 | 21.28 | 15.8 | 93.5 | 21.02 |
+| mantle D-1 | 48 | 113 | 244 | 20403 | 5.52 | 130.0 | 21.28 | 15.3 | 93.5 | 21.02 |
+
+**5 members, register entries, simulated device; load 5.68 7.33 7.51 → 6.11 7.40 7.53**
+
+| side | p50 µs | p99 µs | p99.9 µs | entries/s | flushes | allocs | reallocs | switches | driver's allocs | driver's reallocs |
+|---|---|---|---|---|---|---|---|---|---|---|
+| mantle 1c179e8 | 96 | 261 | 492 | 9810 | 10.00 | 299.0 | 33.49 | 27.4 | 225.7 | 33.01 |
+| mantle 85b9c2d | 95 | 258 | 444 | 10064 | 10.00 | 299.0 | 33.49 | 27.4 | 225.7 | 33.01 |
+| hyper-durable | 65 | 130 | 214 | 14959 | 9.13 | 218.7 | 33.44 | 23.5 | 155.8 | 33.02 |
+| mantle D-1 | 67 | 139 | 240 | 14793 | 9.14 | 218.7 | 33.44 | 23.5 | 155.8 | 33.02 |
+
+**1 member, 1 KiB put entries, simulated device; load 6.11 7.40 7.53 → 6.11 7.40 7.53**
+
+| side | p50 µs | p99 µs | p99.9 µs | entries/s | flushes | allocs | reallocs | switches | driver's allocs | driver's reallocs |
+|---|---|---|---|---|---|---|---|---|---|---|
+| mantle 1c179e8 | 13 | 55 | 188 | 77236 | 1.00 | 32.0 | 10.02 | 3.0 | 26.0 | 10.00 |
+| mantle 85b9c2d | 13 | 36 | 169 | 81030 | 1.00 | 32.0 | 10.02 | 3.0 | 26.0 | 10.00 |
+| hyper-durable | 12 | 32 | 158 | 81718 | 1.00 | 24.0 | 10.02 | 3.0 | 18.0 | 10.00 |
+| mantle D-1 | 12 | 33 | 160 | 82443 | 1.00 | 24.0 | 10.02 | 3.0 | 18.0 | 10.00 |
+
+**3 members, 1 KiB put entries, simulated device; load 6.11 7.40 7.53 → 6.10 7.37 7.52**
+
+| side | p50 µs | p99 µs | p99.9 µs | entries/s | flushes | allocs | reallocs | switches | driver's allocs | driver's reallocs |
+|---|---|---|---|---|---|---|---|---|---|---|
+| mantle 1c179e8 | 60 | 212 | 354 | 15203 | 6.00 | 141.5 | 12.32 | 16.8 | 96.0 | 12.00 |
+| mantle 85b9c2d | 59 | 196 | 359 | 15192 | 6.00 | 141.5 | 12.32 | 16.8 | 96.0 | 12.00 |
+| hyper-durable | 47 | 116 | 255 | 20550 | 5.52 | 91.8 | 12.31 | 15.5 | 54.5 | 12.01 |
+| mantle D-1 | 47 | 110 | 199 | 20209 | 5.52 | 91.9 | 12.31 | 15.9 | 54.5 | 12.01 |
+
+**5 members, 1 KiB put entries, simulated device; load 6.10 7.37 7.52 → 6.57 7.45 7.55**
+
+| side | p50 µs | p99 µs | p99.9 µs | entries/s | flushes | allocs | reallocs | switches | driver's allocs | driver's reallocs |
+|---|---|---|---|---|---|---|---|---|---|---|
+| mantle 1c179e8 | 100 | 304 | 505 | 9604 | 10.00 | 235.8 | 14.54 | 27.4 | 160.0 | 14.00 |
+| mantle 85b9c2d | 95 | 280 | 461 | 9787 | 10.00 | 235.8 | 14.54 | 27.5 | 160.0 | 14.00 |
+| hyper-durable | 68 | 154 | 277 | 14716 | 9.17 | 155.0 | 14.50 | 23.6 | 90.1 | 14.02 |
+| mantle D-1 | 68 | 154 | 270 | 14402 | 9.16 | 154.3 | 14.50 | 23.8 | 90.1 | 14.02 |
+
+After 3,000:
+
+**3 members, register entries, simulated device; load 6.57 7.45 7.55 → 6.45 7.41 7.53**
+
+| side | p50 µs | p99 µs | p99.9 µs | entries/s | flushes | allocs | reallocs | switches | driver's allocs | driver's reallocs |
+|---|---|---|---|---|---|---|---|---|---|---|
+| mantle 1c179e8 | 55 | 188 | 263 | 15835 | 6.00 | 202.1 | 22.21 | 16.9 | 135.0 | 21.00 |
+| mantle 85b9c2d | 53 | 175 | 225 | 17417 | 6.00 | 202.1 | 22.21 | 16.8 | 135.0 | 21.00 |
+| hyper-durable | 44 | 99 | 154 | 21439 | 5.55 | 152.1 | 22.20 | 15.9 | 93.5 | 21.00 |
+| mantle D-1 | 45 | 105 | 145 | 21366 | 5.56 | 152.4 | 22.21 | 15.5 | 93.6 | 21.00 |
+
+**5 members, register entries, simulated device; load 6.45 7.41 7.53 → 6.25 7.35 7.51**
+
+| side | p50 µs | p99 µs | p99.9 µs | entries/s | flushes | allocs | reallocs | switches | driver's allocs | driver's reallocs |
+|---|---|---|---|---|---|---|---|---|---|---|
+| mantle 1c179e8 | 82 | 298 | 366 | 11061 | 10.00 | 337.4 | 35.01 | 27.4 | 225.7 | 33.00 |
+| mantle 85b9c2d | 80 | 286 | 340 | 11929 | 10.00 | 337.4 | 35.01 | 27.4 | 225.7 | 33.00 |
+| hyper-durable | 52 | 121 | 165 | 18128 | 9.16 | 256.0 | 34.95 | 23.4 | 155.8 | 33.00 |
+| mantle D-1 | 54 | 132 | 215 | 18959 | 9.16 | 256.1 | 34.95 | 23.4 | 155.8 | 33.00 |
+
+**3 members, 1 KiB put entries, simulated device; load 6.25 7.35 7.51 → 6.23 7.33 7.50**
+
+| side | p50 µs | p99 µs | p99.9 µs | entries/s | flushes | allocs | reallocs | switches | driver's allocs | driver's reallocs |
+|---|---|---|---|---|---|---|---|---|---|---|
+| mantle 1c179e8 | 54 | 208 | 270 | 16661 | 6.00 | 177.4 | 13.80 | 16.6 | 96.0 | 12.00 |
+| mantle 85b9c2d | 55 | 212 | 268 | 16008 | 6.00 | 177.4 | 13.80 | 16.6 | 96.0 | 12.00 |
+| hyper-durable | 34 | 112 | 146 | 27227 | 5.51 | 125.0 | 13.72 | 14.3 | 54.5 | 12.00 |
+| mantle D-1 | 34 | 112 | 149 | 27556 | 5.51 | 125.1 | 13.73 | 14.2 | 54.5 | 12.00 |
+
+**5 members, 1 KiB put entries, simulated device; load 6.23 7.33 7.50 → 6.69 7.41 7.53**
+
+| side | p50 µs | p99 µs | p99.9 µs | entries/s | flushes | allocs | reallocs | switches | driver's allocs | driver's reallocs |
+|---|---|---|---|---|---|---|---|---|---|---|
+| mantle 1c179e8 | 78 | 334 | 401 | 11588 | 10.00 | 295.7 | 16.99 | 26.8 | 160.0 | 14.00 |
+| mantle 85b9c2d | 76 | 321 | 372 | 11794 | 10.00 | 295.7 | 16.99 | 26.5 | 160.0 | 14.00 |
+| hyper-durable | 54 | 149 | 200 | 17098 | 9.16 | 210.8 | 16.82 | 23.8 | 90.1 | 14.01 |
+| mantle D-1 | 54 | 150 | 194 | 17134 | 9.17 | 210.6 | 16.83 | 24.0 | 90.1 | 14.01 |
+
+## One member, on the device, 8 rounds of 500 entries
+
+**1 member, register entries, device; load 20.54 14.97 11.25 → 4.02 11.30 10.81**
+
+| side | p50 µs | p99 µs | p99.9 µs | entries/s | flushes | allocs | reallocs | switches | driver's allocs | driver's reallocs | leader's write p50 µs | leader's write p99 µs |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| mantle 1c179e8 | 8725 | 48390 | 146935 | 90 | 1.00 | 38.4 | 9.06 | 16.5 | 38.3 | 9.02 | 8707 | 48362 |
+| mantle 85b9c2d | 8741 | 37375 | 108733 | 89 | 1.00 | 38.4 | 9.06 | 17.3 | 38.3 | 9.02 | 8717 | 37342 |
+| hyper-durable | 9440 | 57560 | 144584 | 84 | 1.00 | 30.4 | 9.06 | 18.1 | 30.3 | 9.02 | 9418 | 57526 |
+| mantle D-1 | 9407 | 44444 | 169264 | 82 | 1.00 | 30.4 | 9.06 | 17.8 | 30.3 | 9.02 | 9393 | 44420 |
+
+**1 member, 1 KiB put entries, device; load 4.02 11.30 10.81 → 3.89 8.06 9.55**
+
+| side | p50 µs | p99 µs | p99.9 µs | entries/s | flushes | allocs | reallocs | switches | driver's allocs | driver's reallocs | leader's write p50 µs | leader's write p99 µs |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| mantle 1c179e8 | 8614 | 23116 | 27544 | 108 | 1.00 | 26.0 | 10.05 | 17.4 | 26.0 | 10.01 | 8592 | 23075 |
+| mantle 85b9c2d | 8536 | 22556 | 146141 | 106 | 1.00 | 26.0 | 10.05 | 16.8 | 26.0 | 10.01 | 8514 | 22530 |
+| hyper-durable | 8659 | 25197 | 268937 | 92 | 1.00 | 18.0 | 10.05 | 17.6 | 18.0 | 10.01 | 8638 | 25175 |
+| mantle D-1 | 8561 | 24681 | 154813 | 102 | 1.00 | 18.0 | 10.05 | 17.1 | 18.0 | 10.01 | 8539 | 24661 |
+
+## The losses, closed
+
+- **Reallocations.** On the device, equal at every point, on the driving thread and in the
+  process. On the simulated device the process's are at or below mantle's at every point, and the
+  driving thread's mantle's once a group has run 3,000 entries (21.00, 33.00, 12.00 against the
+  same; 14.01 against 14.00), 0.01–0.02 above in a group's first 3,000. A tracing allocator (a
+  scratch build, its `unsafe` outside the contract script's list; every reallocation of an
+  8-aligned block on the driving thread recorded by size, then by stack for the sizes that
+  differ) found one cause: a follower's queue of messages growing from four slots to eight
+  (`Outgoing::push_counted`, from `handle_append_entries`), 176 times in 12,000 entries at three
+  members and 212 at five after 12,000 to warm, where mantle's shell grew none. The member kept one
+  spare queue and dropped every other the shell gave back, while three writes out each held one.
+  It now keeps a spare for each ready in flight (`crates/hyper-raft/ORIGIN.md`, "A spare queue for
+  each ready in flight"): the growths fall to 1 and 22, and the driving thread reallocates 21.00
+  and 33.00 an entry, as mantle's shell does. The 0.01–0.02 left in a group's first 3,000 entries
+  are each circulating queue growing to its high water once, about 18 growths a group of three
+  more than mantle's shell makes.
+- **Allocations.** mantle's range replica on the shell allocated one more an entry per member than
+  the stand-in (98.4 against 95.4 at three members), its answers built per entry; it now pushes
+  one record a command into the owner's buffer, and allocates as the stand-in does (93.5; 155.8).
+- **Context switches.** Per entry on the device, within 4% either way at three and five members
+  (137.3 against 140.7; 276.7 against 266.8; 247.1 against 247.8) and 14% fewer at three with 1
+  KiB entries (139.9 against 162.6). One side a process with `/usr/bin/time -l` (the device, three
+  members, two rounds, load 3.8–7.7): voluntary 62,454 and 68,763 against mantle's 61,157 and
+  60,248, involuntary 23,010 and 22,290 against 21,017 and 17,920, CPU even (1.08 and 1.01 s
+  against 1.07 and 1.10), wall time a third to a half less (23.0 and 23.7 s against 50.4 and
+  34.9). The overlap's, as traced above: more of the group's log threads runnable at once.
+- **The one-member tail.** An entry's commit latency is its leader's write and 14–37 µs more at
+  every percentile on every side, so the shell adds what mantle's adds and the tail is the write's:
+  the device's flush under the load of the moment. Across three runs on the device the shells'
+  one-member p50 and p99 trade places (register entries 8.58 against 8.66 ms and 9.41 against
+  8.73; 1 KiB entries 21.2 against 22.2 and 8.56 against 8.61; the stand-in at `687244f` 30.8
+  against 29.8 and 26.6 against 26.7). On the simulated device, where a flush costs nothing, the
+  D-1 side commits 2.3% fewer register entries a second (85,463 against 87,486) and 6.7% more 1 KiB
+  ones: its owner waits on a channel, mantle's harness in the log's own wait for its ticket. With
+  the D-1 side polling for its log's answer instead (`HYPER_DURABLE_SPIN`, six rounds of 3,000,
+  load 16–18), it commits 25,019 and 25,471 entries a second against mantle's 19,883 and 18,894,
+  26–35% more; blocking, in the same minute, 4.5–9.3% fewer, its write 5–6 µs longer at the median.
+  A node's shard is woken through its waker as this harness is (mantle `docs/design/node.md` §1.3).
+
+The shell replaces mantle's: at least as fast at every point with more than one member, even with
+one on the device, and allocating no more once a group has warmed. mantle's record of the same
+runs is its `docs/measurements/2026-10-03-range-on-the-shell.md`.
+
+```
+# From the repository root: the comparison is a workspace of its own and fetches mantle at the
+# revisions in crates/hyper-durable-compare/Cargo.toml.
+cd crates/hyper-durable-compare && CARGO_BUILD_JOBS=4 cargo build --release
+./target/release/hyper-durable-compare --devices sim --members 1,3,5 --shapes register,put \
+  --rounds 4 --entries 3000 --warm 50
+./target/release/hyper-durable-compare --devices sim --members 3,5 --shapes register,put \
+  --rounds 4 --entries 3000 --warm 3000
+HYPER_DURABLE_DIAGNOSIS=1 ./target/release/hyper-durable-compare --devices file \
+  --members 1,3,5 --shapes register,put --rounds 4 --entries 300 --warm 50
+HYPER_DURABLE_DIAGNOSIS=1 ./target/release/hyper-durable-compare --devices file --members 1 \
+  --shapes register,put --rounds 8 --entries 500 --warm 50
+HYPER_DURABLE_ONLY="mantle 1c,mantle 85,mantle D-1" ./target/release/hyper-durable-compare \
+  --devices sim --members 1 --shapes register,put --rounds 6 --entries 3000
+HYPER_DURABLE_SPIN=1 HYPER_DURABLE_ONLY="mantle 1c,mantle 85,mantle D-1" \
+  ./target/release/hyper-durable-compare --devices sim --members 1 --shapes register,put \
+  --rounds 6 --entries 3000
+for i in 1 2; do for o in "mantle 1c" "mantle 85" "hyper" "mantle D-1"; do
+  HYPER_DURABLE_ONLY="$o" /usr/bin/time -l ./target/release/hyper-durable-compare \
+    --devices file --members 3 --shapes register --rounds 2 --entries 300
+done; done
+```
+
 # hyper-liveness: node-pair heartbeats against per-group heartbeats and slates' detector
 
 `crates/hyper-liveness` (`docs/timing.md` §2.8), timing step L-3. Measured on 2026-10-02: an Apple

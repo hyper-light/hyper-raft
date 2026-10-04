@@ -1,18 +1,20 @@
-//! mantle's own shell: its range `Replica` at origin/dev `1c179e8`, over the hyper-log mantle
-//! vendors there, driven as mantle's node drives it: every member begins its ready (its leader's
-//! messages out before its own write, its update submitted), the messages are delivered, and every
-//! member waits for its write (`begin`, then `wait_persisted`: mantle `crates/range/src/replica.rs`,
-//! audit §5.1). One ready of a member is out at a time.
+//! mantle's own shell at its step 1 (`85b9c2d`): its range `Replica` as at `1c179e8`, over the
+//! hyper-raft, hyper-log and hyper-block snapshots of hyper-raft `687244f`, the log this
+//! repository's shell runs on, so beside the D-1 side the shells differ and the log does not.
+//! Driven as `mantle.rs` drives `1c179e8`'s: every member begins its ready, the messages are
+//! delivered, and every member waits for its write (`begin`, then `wait_persisted`). One ready of
+//! a member is out at a time.
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
-use mantle_hyper_block::block::BlockFile;
-use mantle_hyper_log::{Config as LogConfig, Log, Waits};
-use mantle_meta::engine::Model;
-use mantle_meta::wire::Entry;
-use mantle_range::{ConfState, Message, Range, Replica, ReplicaError, Settings};
-
-use crate::workload::{LAYER, RULES, first_range};
+use mantle_meta_s1::apply::Layer;
+use mantle_meta_s1::engine::{Engine, Model};
+use mantle_meta_s1::name;
+use mantle_meta_s1::session::Rules;
+use mantle_meta_s1::wire::Entry;
+use mantle_range_s1::{ConfState, Message, Range, Replica, ReplicaError, Settings};
+use mantle_s1_hyper_block::block::BlockFile;
+use mantle_s1_hyper_log::{Config as LogConfig, Log, Waits};
 
 /// The range's group, as mantle's group test names it.
 const GROUP: u128 = 0x0072_616e_6765;
@@ -31,8 +33,31 @@ pub fn log_config() -> LogConfig {
     }
 }
 
+/// The workload's session rules (`workload::RULES`), in this side's types.
+const RULES: Rules = Rules {
+    lifetime_ns: 3_600_000_000_000,
+    max_sessions: 1 << 20,
+    max_answers: 16,
+    max_answer_bytes: usize::MAX,
+    expiries_per_entry: 8,
+};
+
+/// The engine of a cell's first Name range (`workload::first_range`), in this side's types.
+fn first_range() -> Model {
+    let mut m = Model::default();
+    m.install(0, name::first(1).expect("the first range"))
+        .expect("installed");
+    m.persist().expect("persisted");
+    m
+}
+
+/// The workload's entry in this side's types: the same bytes, decoded.
+pub fn entry(of: &mantle_meta::wire::Entry) -> Entry {
+    Entry::decode(&of.encode().expect("encodes")).expect("decodes")
+}
+
 /// mantle's group test's settings.
-pub const SETTINGS: Settings = Settings {
+const SETTINGS: Settings = Settings {
     election_tick: 10,
     heartbeat_tick: 2,
     max_size_per_msg: 1 << 16,
@@ -59,7 +84,7 @@ impl<F: BlockFile + 'static> Group<F> {
     /// A group of `members` on the devices `device` makes, member 1 elected.
     pub fn open(members: u64, mut device: impl FnMut(u64) -> F) -> Self {
         let range = Range {
-            layer: LAYER,
+            layer: Layer::Name,
             rules: RULES,
             boot: ConfState {
                 voters: (1..=members).collect(),
@@ -86,7 +111,7 @@ impl<F: BlockFile + 'static> Group<F> {
                 return group;
             }
         }
-        panic!("mantle's group never elected member 1");
+        panic!("mantle step 1's group never elected member 1");
     }
 
     /// One round: every member begins, the messages arrive, every member waits for its write.
@@ -109,7 +134,7 @@ impl<F: BlockFile + 'static> Group<F> {
                     | ReplicaError::Stalled
                     | ReplicaError::MessagesHeld { .. },
                 ) => {}
-                Err(e) => panic!("mantle step: {e}"),
+                Err(e) => panic!("mantle step 1 step: {e}"),
             }
         }
         for node in &mut self.nodes {
@@ -126,7 +151,7 @@ impl<F: BlockFile + 'static> Group<F> {
             match self.nodes[0].replica.propose(entry) {
                 Ok(()) => break,
                 Err(ReplicaError::Stalled) => self.round(&mut |_| {}),
-                Err(e) => panic!("mantle propose: {e}"),
+                Err(e) => panic!("mantle step 1 propose: {e}"),
             }
         }
         for _ in 0..100_000 {
@@ -136,7 +161,7 @@ impl<F: BlockFile + 'static> Group<F> {
                 return;
             }
         }
-        panic!("mantle's group never applied an entry");
+        panic!("mantle step 1's group never applied an entry");
     }
 
     /// The leader's writes' times since the last call.

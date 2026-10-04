@@ -137,7 +137,10 @@ A campaign supersedes its own vote requests still waiting to be taken (2026-10-0
 D-1): a member whose writes stay out through many election timeouts, ticked meanwhile, sends at most
 one campaign's requests for each write it had out and its last campaign's, not one campaign's for
 every timeout (`crates/hyper-raft/ORIGIN.md`, "A campaign supersedes the requests still waiting").
-The raft-rs differential compares unchanged.
+The raft-rs differential compares unchanged. A member keeps a spare queue of messages for each
+`Ready` whose write may be out (`Limits::readies_in_flight`), so the queues an owner gives back
+once each write is durable are not dropped while others are out (2026-10-03, found by mantle's
+D-1; `ORIGIN.md`, "A spare queue for each ready in flight").
 
 **The fast track** stays focal's algorithm, with the safety fix below, until note 32 §3.8's tests
 decide, and no owner enables it until then. The tests:

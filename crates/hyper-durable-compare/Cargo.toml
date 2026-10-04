@@ -1,6 +1,6 @@
 [package]
 name = "hyper-durable-compare"
-description = "hyper-durable measured against the shells it replaces, on one workload: mantle's range replica (crates/range at origin/dev 1c179e8) first; focal's DurableNode and slates' publication are later steps."
+description = "hyper-durable measured against the shells it replaces, on one workload: mantle's range replica on its own shell (crates/range at origin/dev 1c179e8, and at its step 1 on the log this repository's shell runs on) and on this shell (mantle's D-1); focal's DurableNode and slates' publication are later steps."
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.98"
@@ -24,6 +24,19 @@ mantle-range = { git = "https://github.com/hyper-light/mantle", rev = "1c179e8a7
 mantle-meta = { git = "https://github.com/hyper-light/mantle", rev = "1c179e8a734d40640b82b6bddf8cad2030d0b55f" }
 mantle-hyper-block = { package = "hyper-block", git = "https://github.com/hyper-light/mantle", rev = "1c179e8a734d40640b82b6bddf8cad2030d0b55f", features = ["sim"] }
 mantle-hyper-log = { package = "hyper-log", git = "https://github.com/hyper-light/mantle", rev = "1c179e8a734d40640b82b6bddf8cad2030d0b55f" }
+# mantle's shell at its step 1 (`85b9c2d`): the shell of `1c179e8` over the snapshots of hyper-raft
+# `687244f`, the log this repository's shell runs on.
+mantle-range-s1 = { package = "mantle-range", git = "https://github.com/hyper-light/mantle", rev = "85b9c2dec8a3aeb78e5014961f6a748126cababb" }
+mantle-meta-s1 = { package = "mantle-meta", git = "https://github.com/hyper-light/mantle", rev = "85b9c2dec8a3aeb78e5014961f6a748126cababb" }
+mantle-s1-hyper-block = { package = "hyper-block", git = "https://github.com/hyper-light/mantle", rev = "85b9c2dec8a3aeb78e5014961f6a748126cababb", features = ["sim"] }
+mantle-s1-hyper-log = { package = "hyper-log", git = "https://github.com/hyper-light/mantle", rev = "85b9c2dec8a3aeb78e5014961f6a748126cababb" }
+# mantle's range replica on this shell (mantle's D-1), with the snapshots mantle vendors there.
+# Both revisions are on mantle's branch `shared-d1`, reachable from GitHub once mantle's `dev`
+# holds them; until then a clone's path may stand for the URL (`git = "file://<path>"`).
+mantle-range-d1 = { package = "mantle-range", git = "https://github.com/hyper-light/mantle", rev = "c28027e7259788c4233bae0374f0d5c1b093fde4" }
+mantle-meta-d1 = { package = "mantle-meta", git = "https://github.com/hyper-light/mantle", rev = "c28027e7259788c4233bae0374f0d5c1b093fde4" }
+mantle-d1-hyper-block = { package = "hyper-block", git = "https://github.com/hyper-light/mantle", rev = "c28027e7259788c4233bae0374f0d5c1b093fde4", features = ["sim"] }
+mantle-d1-hyper-log = { package = "hyper-log", git = "https://github.com/hyper-light/mantle", rev = "c28027e7259788c4233bae0374f0d5c1b093fde4" }
 
 [profile.release]
 lto = true

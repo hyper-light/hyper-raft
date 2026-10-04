@@ -87,6 +87,7 @@ dependencies = [
 name = "hyper-block"
 version = "0.1.0"
 dependencies = [
+ "crc32c",
  "getrandom",
  "rustix",
  "thiserror",
@@ -105,14 +106,51 @@ dependencies = [
 ]
 
 [[package]]
+name = "hyper-block"
+version = "0.1.0"
+source = "git+https://github.com/hyper-light/mantle?rev=85b9c2dec8a3aeb78e5014961f6a748126cababb#85b9c2dec8a3aeb78e5014961f6a748126cababb"
+dependencies = [
+ "crc32c",
+ "getrandom",
+ "rustix",
+ "thiserror",
+ "windows-sys",
+]
+
+[[package]]
+name = "hyper-block"
+version = "0.1.0"
+source = "git+https://github.com/hyper-light/mantle?rev=c28027e7259788c4233bae0374f0d5c1b093fde4#c28027e7259788c4233bae0374f0d5c1b093fde4"
+dependencies = [
+ "crc32c",
+ "getrandom",
+ "rustix",
+ "thiserror",
+ "windows-sys",
+]
+
+[[package]]
 name = "hyper-durable"
 version = "0.1.0"
 dependencies = [
  "hyper-block 0.1.0",
- "hyper-liveness",
+ "hyper-liveness 0.1.0",
  "hyper-log 0.1.0",
  "hyper-raft 0.1.0",
- "hyper-timing",
+ "hyper-timing 0.1.0",
+ "thiserror",
+]
+
+[[package]]
+name = "hyper-durable"
+version = "0.1.0"
+source = "git+https://github.com/hyper-light/mantle?rev=c28027e7259788c4233bae0374f0d5c1b093fde4#c28027e7259788c4233bae0374f0d5c1b093fde4"
+dependencies = [
+ "hyper-block 0.1.0 (git+https://github.com/hyper-light/mantle?rev=c28027e7259788c4233bae0374f0d5c1b093fde4)",
+ "hyper-liveness 0.1.0 (git+https://github.com/hyper-light/mantle?rev=c28027e7259788c4233bae0374f0d5c1b093fde4)",
+ "hyper-log 0.1.0 (git+https://github.com/hyper-light/mantle?rev=c28027e7259788c4233bae0374f0d5c1b093fde4)",
+ "hyper-raft 0.1.0 (git+https://github.com/hyper-light/mantle?rev=c28027e7259788c4233bae0374f0d5c1b093fde4)",
+ "hyper-timing 0.1.0 (git+https://github.com/hyper-light/mantle?rev=c28027e7259788c4233bae0374f0d5c1b093fde4)",
  "thiserror",
 ]
 
@@ -122,20 +160,36 @@ version = "0.1.0"
 dependencies = [
  "hyper-block 0.1.0",
  "hyper-block 0.1.0 (git+https://github.com/hyper-light/mantle?rev=1c179e8a734d40640b82b6bddf8cad2030d0b55f)",
- "hyper-durable",
+ "hyper-block 0.1.0 (git+https://github.com/hyper-light/mantle?rev=85b9c2dec8a3aeb78e5014961f6a748126cababb)",
+ "hyper-block 0.1.0 (git+https://github.com/hyper-light/mantle?rev=c28027e7259788c4233bae0374f0d5c1b093fde4)",
+ "hyper-durable 0.1.0",
  "hyper-log 0.1.0",
  "hyper-log 0.1.0 (git+https://github.com/hyper-light/mantle?rev=1c179e8a734d40640b82b6bddf8cad2030d0b55f)",
+ "hyper-log 0.1.0 (git+https://github.com/hyper-light/mantle?rev=85b9c2dec8a3aeb78e5014961f6a748126cababb)",
+ "hyper-log 0.1.0 (git+https://github.com/hyper-light/mantle?rev=c28027e7259788c4233bae0374f0d5c1b093fde4)",
  "hyper-measure",
  "hyper-raft 0.1.0",
- "mantle-meta",
- "mantle-range",
+ "mantle-meta 0.1.0 (git+https://github.com/hyper-light/mantle?rev=1c179e8a734d40640b82b6bddf8cad2030d0b55f)",
+ "mantle-meta 0.1.0 (git+https://github.com/hyper-light/mantle?rev=85b9c2dec8a3aeb78e5014961f6a748126cababb)",
+ "mantle-meta 0.1.0 (git+https://github.com/hyper-light/mantle?rev=c28027e7259788c4233bae0374f0d5c1b093fde4)",
+ "mantle-range 0.1.0 (git+https://github.com/hyper-light/mantle?rev=1c179e8a734d40640b82b6bddf8cad2030d0b55f)",
+ "mantle-range 0.1.0 (git+https://github.com/hyper-light/mantle?rev=85b9c2dec8a3aeb78e5014961f6a748126cababb)",
+ "mantle-range 0.1.0 (git+https://github.com/hyper-light/mantle?rev=c28027e7259788c4233bae0374f0d5c1b093fde4)",
 ]
 
 [[package]]
 name = "hyper-liveness"
 version = "0.1.0"
 dependencies = [
- "hyper-timing",
+ "hyper-timing 0.1.0",
+]
+
+[[package]]
+name = "hyper-liveness"
+version = "0.1.0"
+source = "git+https://github.com/hyper-light/mantle?rev=c28027e7259788c4233bae0374f0d5c1b093fde4#c28027e7259788c4233bae0374f0d5c1b093fde4"
+dependencies = [
+ "hyper-timing 0.1.0 (git+https://github.com/hyper-light/mantle?rev=c28027e7259788c4233bae0374f0d5c1b093fde4)",
 ]
 
 [[package]]
@@ -156,6 +210,28 @@ dependencies = [
  "crc32c",
  "getrandom",
  "hyper-block 0.1.0 (git+https://github.com/hyper-light/mantle?rev=1c179e8a734d40640b82b6bddf8cad2030d0b55f)",
+ "thiserror",
+]
+
+[[package]]
+name = "hyper-log"
+version = "0.1.0"
+source = "git+https://github.com/hyper-light/mantle?rev=85b9c2dec8a3aeb78e5014961f6a748126cababb#85b9c2dec8a3aeb78e5014961f6a748126cababb"
+dependencies = [
+ "crc32c",
+ "getrandom",
+ "hyper-block 0.1.0 (git+https://github.com/hyper-light/mantle?rev=85b9c2dec8a3aeb78e5014961f6a748126cababb)",
+ "thiserror",
+]
+
+[[package]]
+name = "hyper-log"
+version = "0.1.0"
+source = "git+https://github.com/hyper-light/mantle?rev=c28027e7259788c4233bae0374f0d5c1b093fde4#c28027e7259788c4233bae0374f0d5c1b093fde4"
+dependencies = [
+ "crc32c",
+ "getrandom",
+ "hyper-block 0.1.0 (git+https://github.com/hyper-light/mantle?rev=c28027e7259788c4233bae0374f0d5c1b093fde4)",
  "thiserror",
 ]
 
@@ -172,7 +248,7 @@ name = "hyper-raft"
 version = "0.1.0"
 dependencies = [
  "crc32c",
- "hyper-timing",
+ "hyper-timing 0.1.0",
  "thiserror",
 ]
 
@@ -186,8 +262,38 @@ dependencies = [
 ]
 
 [[package]]
+name = "hyper-raft"
+version = "0.1.0"
+source = "git+https://github.com/hyper-light/mantle?rev=85b9c2dec8a3aeb78e5014961f6a748126cababb#85b9c2dec8a3aeb78e5014961f6a748126cababb"
+dependencies = [
+ "crc32c",
+ "hyper-timing 0.1.0 (git+https://github.com/hyper-light/mantle?rev=85b9c2dec8a3aeb78e5014961f6a748126cababb)",
+ "thiserror",
+]
+
+[[package]]
+name = "hyper-raft"
+version = "0.1.0"
+source = "git+https://github.com/hyper-light/mantle?rev=c28027e7259788c4233bae0374f0d5c1b093fde4#c28027e7259788c4233bae0374f0d5c1b093fde4"
+dependencies = [
+ "crc32c",
+ "hyper-timing 0.1.0 (git+https://github.com/hyper-light/mantle?rev=c28027e7259788c4233bae0374f0d5c1b093fde4)",
+ "thiserror",
+]
+
+[[package]]
 name = "hyper-timing"
 version = "0.1.0"
+
+[[package]]
+name = "hyper-timing"
+version = "0.1.0"
+source = "git+https://github.com/hyper-light/mantle?rev=85b9c2dec8a3aeb78e5014961f6a748126cababb#85b9c2dec8a3aeb78e5014961f6a748126cababb"
+
+[[package]]
+name = "hyper-timing"
+version = "0.1.0"
+source = "git+https://github.com/hyper-light/mantle?rev=c28027e7259788c4233bae0374f0d5c1b093fde4#c28027e7259788c4233bae0374f0d5c1b093fde4"
 
 [[package]]
 name = "libc"
@@ -208,9 +314,35 @@ source = "git+https://github.com/hyper-light/mantle?rev=1c179e8a734d40640b82b6bd
 dependencies = [
  "getrandom",
  "hyper-block 0.1.0 (git+https://github.com/hyper-light/mantle?rev=1c179e8a734d40640b82b6bddf8cad2030d0b55f)",
- "mantle-codec",
- "mantle-crc",
- "mantle-disk",
+ "mantle-codec 0.1.0 (git+https://github.com/hyper-light/mantle?rev=1c179e8a734d40640b82b6bddf8cad2030d0b55f)",
+ "mantle-crc 0.1.0 (git+https://github.com/hyper-light/mantle?rev=1c179e8a734d40640b82b6bddf8cad2030d0b55f)",
+ "mantle-disk 0.1.0 (git+https://github.com/hyper-light/mantle?rev=1c179e8a734d40640b82b6bddf8cad2030d0b55f)",
+ "thiserror",
+]
+
+[[package]]
+name = "mantle-chunk"
+version = "0.1.0"
+source = "git+https://github.com/hyper-light/mantle?rev=85b9c2dec8a3aeb78e5014961f6a748126cababb#85b9c2dec8a3aeb78e5014961f6a748126cababb"
+dependencies = [
+ "getrandom",
+ "hyper-block 0.1.0 (git+https://github.com/hyper-light/mantle?rev=85b9c2dec8a3aeb78e5014961f6a748126cababb)",
+ "mantle-codec 0.1.0 (git+https://github.com/hyper-light/mantle?rev=85b9c2dec8a3aeb78e5014961f6a748126cababb)",
+ "mantle-crc 0.1.0 (git+https://github.com/hyper-light/mantle?rev=85b9c2dec8a3aeb78e5014961f6a748126cababb)",
+ "mantle-disk 0.1.0 (git+https://github.com/hyper-light/mantle?rev=85b9c2dec8a3aeb78e5014961f6a748126cababb)",
+ "thiserror",
+]
+
+[[package]]
+name = "mantle-chunk"
+version = "0.1.0"
+source = "git+https://github.com/hyper-light/mantle?rev=c28027e7259788c4233bae0374f0d5c1b093fde4#c28027e7259788c4233bae0374f0d5c1b093fde4"
+dependencies = [
+ "getrandom",
+ "hyper-block 0.1.0 (git+https://github.com/hyper-light/mantle?rev=c28027e7259788c4233bae0374f0d5c1b093fde4)",
+ "mantle-codec 0.1.0 (git+https://github.com/hyper-light/mantle?rev=c28027e7259788c4233bae0374f0d5c1b093fde4)",
+ "mantle-crc 0.1.0 (git+https://github.com/hyper-light/mantle?rev=c28027e7259788c4233bae0374f0d5c1b093fde4)",
+ "mantle-disk 0.1.0 (git+https://github.com/hyper-light/mantle?rev=c28027e7259788c4233bae0374f0d5c1b093fde4)",
  "thiserror",
 ]
 
@@ -220,9 +352,35 @@ version = "0.1.0"
 source = "git+https://github.com/hyper-light/mantle?rev=1c179e8a734d40640b82b6bddf8cad2030d0b55f#1c179e8a734d40640b82b6bddf8cad2030d0b55f"
 
 [[package]]
+name = "mantle-codec"
+version = "0.1.0"
+source = "git+https://github.com/hyper-light/mantle?rev=85b9c2dec8a3aeb78e5014961f6a748126cababb#85b9c2dec8a3aeb78e5014961f6a748126cababb"
+
+[[package]]
+name = "mantle-codec"
+version = "0.1.0"
+source = "git+https://github.com/hyper-light/mantle?rev=c28027e7259788c4233bae0374f0d5c1b093fde4#c28027e7259788c4233bae0374f0d5c1b093fde4"
+
+[[package]]
 name = "mantle-crc"
 version = "0.1.0"
 source = "git+https://github.com/hyper-light/mantle?rev=1c179e8a734d40640b82b6bddf8cad2030d0b55f#1c179e8a734d40640b82b6bddf8cad2030d0b55f"
+dependencies = [
+ "crc-fast",
+]
+
+[[package]]
+name = "mantle-crc"
+version = "0.1.0"
+source = "git+https://github.com/hyper-light/mantle?rev=85b9c2dec8a3aeb78e5014961f6a748126cababb#85b9c2dec8a3aeb78e5014961f6a748126cababb"
+dependencies = [
+ "crc-fast",
+]
+
+[[package]]
+name = "mantle-crc"
+version = "0.1.0"
+source = "git+https://github.com/hyper-light/mantle?rev=c28027e7259788c4233bae0374f0d5c1b093fde4#c28027e7259788c4233bae0374f0d5c1b093fde4"
 dependencies = [
  "crc-fast",
 ]
@@ -238,13 +396,55 @@ dependencies = [
 ]
 
 [[package]]
+name = "mantle-disk"
+version = "0.1.0"
+source = "git+https://github.com/hyper-light/mantle?rev=85b9c2dec8a3aeb78e5014961f6a748126cababb#85b9c2dec8a3aeb78e5014961f6a748126cababb"
+dependencies = [
+ "hyper-block 0.1.0 (git+https://github.com/hyper-light/mantle?rev=85b9c2dec8a3aeb78e5014961f6a748126cababb)",
+ "rustix",
+ "windows-sys",
+]
+
+[[package]]
+name = "mantle-disk"
+version = "0.1.0"
+source = "git+https://github.com/hyper-light/mantle?rev=c28027e7259788c4233bae0374f0d5c1b093fde4#c28027e7259788c4233bae0374f0d5c1b093fde4"
+dependencies = [
+ "hyper-block 0.1.0 (git+https://github.com/hyper-light/mantle?rev=c28027e7259788c4233bae0374f0d5c1b093fde4)",
+ "rustix",
+ "windows-sys",
+]
+
+[[package]]
 name = "mantle-meta"
 version = "0.1.0"
 source = "git+https://github.com/hyper-light/mantle?rev=1c179e8a734d40640b82b6bddf8cad2030d0b55f#1c179e8a734d40640b82b6bddf8cad2030d0b55f"
 dependencies = [
- "mantle-chunk",
- "mantle-codec",
- "mantle-crc",
+ "mantle-chunk 0.1.0 (git+https://github.com/hyper-light/mantle?rev=1c179e8a734d40640b82b6bddf8cad2030d0b55f)",
+ "mantle-codec 0.1.0 (git+https://github.com/hyper-light/mantle?rev=1c179e8a734d40640b82b6bddf8cad2030d0b55f)",
+ "mantle-crc 0.1.0 (git+https://github.com/hyper-light/mantle?rev=1c179e8a734d40640b82b6bddf8cad2030d0b55f)",
+ "thiserror",
+]
+
+[[package]]
+name = "mantle-meta"
+version = "0.1.0"
+source = "git+https://github.com/hyper-light/mantle?rev=85b9c2dec8a3aeb78e5014961f6a748126cababb#85b9c2dec8a3aeb78e5014961f6a748126cababb"
+dependencies = [
+ "mantle-chunk 0.1.0 (git+https://github.com/hyper-light/mantle?rev=85b9c2dec8a3aeb78e5014961f6a748126cababb)",
+ "mantle-codec 0.1.0 (git+https://github.com/hyper-light/mantle?rev=85b9c2dec8a3aeb78e5014961f6a748126cababb)",
+ "mantle-crc 0.1.0 (git+https://github.com/hyper-light/mantle?rev=85b9c2dec8a3aeb78e5014961f6a748126cababb)",
+ "thiserror",
+]
+
+[[package]]
+name = "mantle-meta"
+version = "0.1.0"
+source = "git+https://github.com/hyper-light/mantle?rev=c28027e7259788c4233bae0374f0d5c1b093fde4#c28027e7259788c4233bae0374f0d5c1b093fde4"
+dependencies = [
+ "mantle-chunk 0.1.0 (git+https://github.com/hyper-light/mantle?rev=c28027e7259788c4233bae0374f0d5c1b093fde4)",
+ "mantle-codec 0.1.0 (git+https://github.com/hyper-light/mantle?rev=c28027e7259788c4233bae0374f0d5c1b093fde4)",
+ "mantle-crc 0.1.0 (git+https://github.com/hyper-light/mantle?rev=c28027e7259788c4233bae0374f0d5c1b093fde4)",
  "thiserror",
 ]
 
@@ -256,9 +456,38 @@ dependencies = [
  "hyper-block 0.1.0 (git+https://github.com/hyper-light/mantle?rev=1c179e8a734d40640b82b6bddf8cad2030d0b55f)",
  "hyper-log 0.1.0 (git+https://github.com/hyper-light/mantle?rev=1c179e8a734d40640b82b6bddf8cad2030d0b55f)",
  "hyper-raft 0.1.0 (git+https://github.com/hyper-light/mantle?rev=1c179e8a734d40640b82b6bddf8cad2030d0b55f)",
- "mantle-codec",
- "mantle-crc",
- "mantle-meta",
+ "mantle-codec 0.1.0 (git+https://github.com/hyper-light/mantle?rev=1c179e8a734d40640b82b6bddf8cad2030d0b55f)",
+ "mantle-crc 0.1.0 (git+https://github.com/hyper-light/mantle?rev=1c179e8a734d40640b82b6bddf8cad2030d0b55f)",
+ "mantle-meta 0.1.0 (git+https://github.com/hyper-light/mantle?rev=1c179e8a734d40640b82b6bddf8cad2030d0b55f)",
+ "thiserror",
+]
+
+[[package]]
+name = "mantle-range"
+version = "0.1.0"
+source = "git+https://github.com/hyper-light/mantle?rev=85b9c2dec8a3aeb78e5014961f6a748126cababb#85b9c2dec8a3aeb78e5014961f6a748126cababb"
+dependencies = [
+ "hyper-block 0.1.0 (git+https://github.com/hyper-light/mantle?rev=85b9c2dec8a3aeb78e5014961f6a748126cababb)",
+ "hyper-log 0.1.0 (git+https://github.com/hyper-light/mantle?rev=85b9c2dec8a3aeb78e5014961f6a748126cababb)",
+ "hyper-raft 0.1.0 (git+https://github.com/hyper-light/mantle?rev=85b9c2dec8a3aeb78e5014961f6a748126cababb)",
+ "mantle-codec 0.1.0 (git+https://github.com/hyper-light/mantle?rev=85b9c2dec8a3aeb78e5014961f6a748126cababb)",
+ "mantle-crc 0.1.0 (git+https://github.com/hyper-light/mantle?rev=85b9c2dec8a3aeb78e5014961f6a748126cababb)",
+ "mantle-meta 0.1.0 (git+https://github.com/hyper-light/mantle?rev=85b9c2dec8a3aeb78e5014961f6a748126cababb)",
+ "thiserror",
+]
+
+[[package]]
+name = "mantle-range"
+version = "0.1.0"
+source = "git+https://github.com/hyper-light/mantle?rev=c28027e7259788c4233bae0374f0d5c1b093fde4#c28027e7259788c4233bae0374f0d5c1b093fde4"
+dependencies = [
+ "hyper-block 0.1.0 (git+https://github.com/hyper-light/mantle?rev=c28027e7259788c4233bae0374f0d5c1b093fde4)",
+ "hyper-durable 0.1.0 (git+https://github.com/hyper-light/mantle?rev=c28027e7259788c4233bae0374f0d5c1b093fde4)",
+ "hyper-log 0.1.0 (git+https://github.com/hyper-light/mantle?rev=c28027e7259788c4233bae0374f0d5c1b093fde4)",
+ "hyper-raft 0.1.0 (git+https://github.com/hyper-light/mantle?rev=c28027e7259788c4233bae0374f0d5c1b093fde4)",
+ "mantle-codec 0.1.0 (git+https://github.com/hyper-light/mantle?rev=c28027e7259788c4233bae0374f0d5c1b093fde4)",
+ "mantle-crc 0.1.0 (git+https://github.com/hyper-light/mantle?rev=c28027e7259788c4233bae0374f0d5c1b093fde4)",
+ "mantle-meta 0.1.0 (git+https://github.com/hyper-light/mantle?rev=c28027e7259788c4233bae0374f0d5c1b093fde4)",
  "thiserror",
 ]
 

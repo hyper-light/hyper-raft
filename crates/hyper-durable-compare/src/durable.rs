@@ -3,10 +3,10 @@
 //! `Owner` and driven by its turns, the log's answers waking it. Readies are taken ahead of their
 //! persistence to the log's depth.
 use std::collections::VecDeque;
+use std::sync::OnceLock;
 use std::sync::mpsc::{Receiver, sync_channel};
 use std::task::Waker;
-use std::sync::OnceLock;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use hyper_block::block::BlockFile;
 use hyper_durable::{
@@ -182,6 +182,8 @@ pub struct Group<F: BlockFile + 'static> {
     rounds: bool,
     /// The leader answered in a turn the wait took.
     answered: bool,
+    /// How long each of the leader's writes took, its submission to the drive that took its answer.
+    writes: Vec<Duration>,
 }
 
 /// mantle's group test's settings, as the core takes them.
@@ -248,6 +250,7 @@ impl<F: BlockFile + 'static> Group<F> {
             slots,
             rounds: std::env::var_os("HYPER_DURABLE_ROUNDS").is_some(),
             answered: false,
+            writes: Vec::new(),
         };
         let first = group.handles[0];
         group.owner.get_mut(first).unwrap().campaign().unwrap();
@@ -267,14 +270,17 @@ impl<F: BlockFile + 'static> Group<F> {
     fn turn(&mut self, answered: &mut dyn FnMut(bool)) {
         let leader = self.handles[0];
         let wire = &mut self.wire;
-        self.owner
-            .turn(now(), &mut self.out, |h, driven, out| {
-                driven.unwrap();
-                wire.extend(out.messages.drain(..));
-                if h == leader {
-                    answered(!out.answers.is_empty());
+        let writes = &mut self.writes;
+        self.owner.turn(now(), &mut self.out, |h, driven, out| {
+            let driven = driven.unwrap();
+            wire.extend(out.messages.drain(..));
+            if h == leader {
+                if let Some((submitted, taken)) = driven.flushed {
+                    writes.push(Duration::from_nanos(taken.saturating_sub(submitted)));
                 }
-            });
+                answered(!out.answers.is_empty());
+            }
+        });
         while let Some(m) = self.wire.pop_front() {
             let Some(&to) = self.handles.get(usize::try_from(m.to).unwrap() - 1) else {
                 continue;
@@ -338,6 +344,11 @@ impl<F: BlockFile + 'static> Group<F> {
             }
         }
         panic!("the group never applied an entry");
+    }
+
+    /// The leader's writes' times since the last call.
+    pub fn take_writes(&mut self) -> Vec<Duration> {
+        std::mem::take(&mut self.writes)
     }
 
     /// The writes every member made, by kind, and the wakes the logs' answers made.

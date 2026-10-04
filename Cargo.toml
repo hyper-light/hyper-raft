@@ -45,6 +45,7 @@ getrandom = "0.4"
 rustix = { version = "1.1", features = ["fs", "system", "param", "process", "time"] }
 windows-sys = { version = "0.61", features = [
   "Win32_Foundation",
+  "Win32_Networking_WinSock",
   "Win32_Security",
   "Win32_System_Diagnostics_Debug",
   "Win32_System_Diagnostics_ToolHelp",

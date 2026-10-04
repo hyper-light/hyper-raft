@@ -17,7 +17,26 @@ impl client::ClientSessionStore for NoClientSessionStorage {
 
     fn set_tls12_session(&mut self, _: ServerName<'static>, _: persist::Tls12ClientSessionValue) {}
 
-    fn tls12_session(&self, _: &ServerName<'_>) -> Option<persist::Tls12ClientSessionValue> {
+    fn tls12_session(
+        &mut self,
+        _: &ServerName<'static>,
+    ) -> Option<&persist::Tls12ClientSessionValue> {
+        None
+    }
+
+    fn lent_tls12_session(
+        &self,
+        _: &ServerName<'static>,
+        _: persist::SessionStamp,
+    ) -> Option<&persist::Tls12ClientSessionValue> {
+        None
+    }
+
+    fn current_tls12_session(
+        &mut self,
+        _: &ServerName<'static>,
+        _: persist::SessionStamp,
+    ) -> Option<&mut persist::Tls12ClientSessionValue> {
         None
     }
 
@@ -50,10 +69,16 @@ mod cache {
         kx_hint: Option<NamedGroup>,
 
         // Zero or one TLS1.2 sessions.
-        tls12: Option<persist::Tls12ClientSessionValue>,
+        tls12: Option<Tls12Held>,
 
         // Up to MAX_TLS13_TICKETS_PER_SERVER TLS1.3 tickets, oldest first.
         tls13: VecDeque<persist::Tls13ClientSessionValue>,
+    }
+
+    /// A server's TLS1.2 session, and whether the cache has lent it to a ClientHello.
+    struct Tls12Held {
+        value: persist::Tls12ClientSessionValue,
+        lent: bool,
     }
 
     impl Default for ServerData {
@@ -73,8 +98,17 @@ mod cache {
     ///
     /// It is owned by its [`ClientConfig`](crate::ClientConfig) and changed through `&mut`, so it
     /// needs no lock.
+    ///
+    /// A TLS1.2 session it has lent to a ClientHello and then displaces (another session saved
+    /// for its server, its removal, or its server's eviction) it keeps findable, so that a
+    /// connection still waiting for its server's answer finds the session it offered. It keeps
+    /// as many such sessions as its bound on servers, oldest pushed out first: its memory for
+    /// TLS1.2 sessions is at most twice its servers'.
     pub struct ClientSessionMemoryCache {
         servers: limited_cache::LimitedCache<ServerName<'static>, ServerData>,
+        /// Lent TLS1.2 sessions displaced since, oldest first; at most `max_servers`.
+        displaced: VecDeque<persist::Tls12ClientSessionValue>,
+        max_servers: usize,
     }
 
     impl ClientSessionMemoryCache {
@@ -85,14 +119,38 @@ mod cache {
                 / MAX_TLS13_TICKETS_PER_SERVER;
             Self {
                 servers: limited_cache::LimitedCache::new(max_servers),
+                displaced: VecDeque::with_capacity(max_servers),
+                max_servers,
             }
+        }
+
+        /// Keeps `held` findable if it was lent, pushing out the oldest kept session at the bound.
+        fn displace(&mut self, held: Option<Tls12Held>) {
+            let Some(Tls12Held { value, lent: true }) = held else {
+                return;
+            };
+            if self.max_servers == 0 {
+                return;
+            }
+            if self.displaced.len() >= self.max_servers {
+                self.displaced.pop_front();
+            }
+            self.displaced.push_back(value);
+        }
+
+        /// Edits `server_name`'s data, inserting it first if it is new; the TLS1.2 session of a
+        /// server the insertion evicted is displaced.
+        fn edit(&mut self, server_name: ServerName<'static>, edit: impl FnOnce(&mut ServerData)) {
+            let evicted = self
+                .servers
+                .get_or_insert_default_and_edit(server_name, edit);
+            self.displace(evicted.and_then(|data| data.tls12));
         }
     }
 
     impl super::client::ClientSessionStore for ClientSessionMemoryCache {
         fn set_kx_hint(&mut self, server_name: ServerName<'static>, group: NamedGroup) {
-            self.servers
-                .get_or_insert_default_and_edit(server_name, |data| data.kx_hint = Some(group));
+            self.edit(server_name, |data| data.kx_hint = Some(group));
         }
 
         fn kx_hint(&self, server_name: &ServerName<'_>) -> Option<NamedGroup> {
@@ -101,28 +159,58 @@ mod cache {
 
         fn set_tls12_session(
             &mut self,
-            _server_name: ServerName<'static>,
-            _value: persist::Tls12ClientSessionValue,
+            server_name: ServerName<'static>,
+            value: persist::Tls12ClientSessionValue,
         ) {
-            self.servers
-                .get_or_insert_default_and_edit(_server_name.clone(), |data| {
-                    data.tls12 = Some(_value)
-                });
+            let mut old = None;
+            // The name is moved in: upstream cloned it here, an allocation for every session saved.
+            self.edit(server_name, |data| {
+                old = data.tls12.replace(Tls12Held { value, lent: false })
+            });
+            self.displace(old);
         }
 
         fn tls12_session(
-            &self,
-            _server_name: &ServerName<'_>,
-        ) -> Option<persist::Tls12ClientSessionValue> {
-            self.servers
-                .get(_server_name)
-                .and_then(|sd| sd.tls12.as_ref().cloned())
+            &mut self,
+            server_name: &ServerName<'static>,
+        ) -> Option<&persist::Tls12ClientSessionValue> {
+            let held = self.servers.get_mut(server_name)?.tls12.as_mut()?;
+            held.lent = true;
+            Some(&held.value)
         }
 
-        fn remove_tls12_session(&mut self, _server_name: &ServerName<'static>) {
+        fn lent_tls12_session(
+            &self,
+            server_name: &ServerName<'static>,
+            stamp: persist::SessionStamp,
+        ) -> Option<&persist::Tls12ClientSessionValue> {
             self.servers
-                .get_mut(_server_name)
+                .get(server_name)
+                .and_then(|data| data.tls12.as_ref())
+                .map(|held| &held.value)
+                .filter(|value| value.stamp() == stamp)
+                .or_else(|| self.displaced.iter().find(|value| value.stamp() == stamp))
+        }
+
+        fn current_tls12_session(
+            &mut self,
+            server_name: &ServerName<'static>,
+            stamp: persist::SessionStamp,
+        ) -> Option<&mut persist::Tls12ClientSessionValue> {
+            self.servers
+                .get_mut(server_name)?
+                .tls12
+                .as_mut()
+                .map(|held| &mut held.value)
+                .filter(|value| value.stamp() == stamp)
+        }
+
+        fn remove_tls12_session(&mut self, server_name: &ServerName<'static>) {
+            let old = self
+                .servers
+                .get_mut(server_name)
                 .and_then(|data| data.tls12.take());
+            self.displace(old);
         }
 
         fn insert_tls13_ticket(
@@ -130,13 +218,13 @@ mod cache {
             server_name: ServerName<'static>,
             value: persist::Tls13ClientSessionValue,
         ) {
-            self.servers
-                .get_or_insert_default_and_edit(server_name.clone(), |data| {
-                    if data.tls13.len() == data.tls13.capacity() {
-                        data.tls13.pop_front();
-                    }
-                    data.tls13.push_back(value);
-                });
+            // The name is moved in: upstream cloned it here, an allocation for every ticket kept.
+            self.edit(server_name, |data| {
+                if data.tls13.len() == data.tls13.capacity() {
+                    data.tls13.pop_front();
+                }
+                data.tls13.push_back(value);
+            });
         }
 
         fn take_tls13_ticket(
@@ -219,7 +307,7 @@ mod tests {
     use pki_types::{ServerName, UnixTime};
 
     use super::provider::cipher_suite;
-    use super::NoClientSessionStorage;
+    use super::{ClientSessionMemoryCache, NoClientSessionStorage};
     use crate::client::ClientSessionStore;
     use crate::identity::Identity;
     use crate::msgs::base::PayloadU16;
@@ -228,6 +316,67 @@ mod tests {
     use crate::msgs::handshake::SessionId;
     use crate::msgs::persist::Tls13ClientSessionValue;
     use crate::suites::SupportedCipherSuite;
+
+    fn tls12_session() -> crate::msgs::persist::Tls12ClientSessionValue {
+        let SupportedCipherSuite::Tls12(suite) =
+            cipher_suite::TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384
+        else {
+            unreachable!()
+        };
+        crate::msgs::persist::Tls12ClientSessionValue::new(
+            suite,
+            SessionId::empty(),
+            PayloadU16::empty(),
+            &[],
+            CertificateChain::default(),
+            Identity::fresh(),
+            Identity::fresh(),
+            UnixTime::now(),
+            0,
+            true,
+        )
+    }
+
+    #[test]
+    fn test_lent_tls12_session_outlives_its_servers_eviction() {
+        // Sixteen sessions: a bound of two servers, of which the cache holds one.
+        let mut c = ClientSessionMemoryCache::new(16);
+        let a = ServerName::try_from("a.example").unwrap();
+        c.set_tls12_session(a.clone(), tls12_session());
+        let stamp = c.tls12_session(&a).unwrap().stamp();
+        for name in ["b.example", "c.example", "d.example"] {
+            c.set_kx_hint(ServerName::try_from(name).unwrap(), NamedGroup::X25519);
+        }
+        assert!(c.current_tls12_session(&a, stamp).is_none());
+        assert_eq!(
+            c.lent_tls12_session(&a, stamp).map(|v| v.stamp()),
+            Some(stamp)
+        );
+    }
+
+    #[test]
+    fn test_unlent_tls12_session_is_not_kept_once_displaced() {
+        let mut c = ClientSessionMemoryCache::new(16);
+        let a = ServerName::try_from("a.example").unwrap();
+        let first = tls12_session();
+        let stamp = first.stamp();
+        c.set_tls12_session(a.clone(), first);
+        c.set_tls12_session(a.clone(), tls12_session());
+        assert!(c.lent_tls12_session(&a, stamp).is_none());
+    }
+
+    #[test]
+    fn test_current_tls12_session_is_only_the_current_stamp() {
+        let mut c = ClientSessionMemoryCache::new(16);
+        let a = ServerName::try_from("a.example").unwrap();
+        c.set_tls12_session(a.clone(), tls12_session());
+        let first = c.tls12_session(&a).unwrap().stamp();
+        c.set_tls12_session(a.clone(), tls12_session());
+        let second = c.tls12_session(&a).unwrap().stamp();
+        assert!(c.current_tls12_session(&a, first).is_none());
+        assert!(c.lent_tls12_session(&a, first).is_some());
+        assert!(c.current_tls12_session(&a, second).is_some());
+    }
 
     #[test]
     fn test_noclientsessionstorage_does_nothing() {

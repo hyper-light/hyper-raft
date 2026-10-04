@@ -24,7 +24,7 @@ use crate::msgs::base::{Payload, PayloadU16, PayloadU8};
 use crate::msgs::ccs::ChangeCipherSpecPayload;
 use crate::msgs::handshake::{
     CertificateChain, ClientDhParams, ClientEcdhParams, ClientKeyExchangeParams,
-    HandshakeMessagePayload, HandshakePayload, NewSessionTicketPayload,
+    ClientSessionTicket, HandshakeMessagePayload, HandshakePayload, NewSessionTicketPayload,
     NewSessionTicketPayloadTls13, ServerKeyExchangeParams, SessionId,
 };
 use crate::msgs::message::{Message, MessagePayload};
@@ -88,15 +88,18 @@ mod server_hello {
                 });
             }
 
-            let ClientHelloInput { server_name, .. } = self.input;
+            let ClientHelloInput {
+                server_name,
+                resuming,
+                session_id: offered_session_id,
+                session_ticket,
+                ..
+            } = self.input;
 
-            let resuming_session = self
-                .input
-                .resuming
-                .and_then(|resuming| match resuming.value {
-                    ClientSessionValue::Tls12(inner) => Some(inner),
-                    ClientSessionValue::Tls13(_) => None,
-                });
+            let lent = resuming.and_then(|resuming| match resuming.value {
+                ClientSessionValue::Tls12(stamp) => Some(stamp),
+                ClientSessionValue::Tls13(_) => None,
+            });
 
             // Doing EMS?
             let using_ems = server_hello.extended_master_secret_ack.is_some();
@@ -125,9 +128,23 @@ mod server_hello {
             }
 
             // See if we're successfully resuming.
-            if let Some(resuming) = resuming_session {
-                if resuming.session_id == server_hello.session_id {
+            if let Some(stamp) = lent {
+                if offered_session_id == server_hello.session_id {
                     debug!("Server agreed to resume");
+
+                    // The session stayed in the store, which lent it to the ClientHello; find it
+                    // again.
+                    let Some(resuming) = cx
+                        .stores
+                        .resumption
+                        .store
+                        .lent_tls12_session(&server_name, stamp)
+                    else {
+                        return Err(cx.common.send_fatal_alert(
+                            AlertDescription::InternalError,
+                            Error::ResumedSessionLost,
+                        ));
+                    };
 
                     // Is the server telling lies about the ciphersuite?
                     if resuming.suite() != suite {
@@ -146,38 +163,44 @@ mod server_hello {
                         &secrets.randoms.client,
                         &secrets.master_secret,
                     );
-                    cx.common.start_encryption_tls12(&secrets, Side::Client)?;
-
                     // Since we're resuming, we verified the certificate and
                     // proof of possession in the prior session.
-                    cx.common.peer_certificates =
-                        Some(resuming.server_cert_chain().clone().into_owned());
+                    let peer_certificates = resuming.server_cert_chain().clone();
+                    cx.common.start_encryption_tls12(&secrets, Side::Client)?;
+                    cx.common.peer_certificates = Some(peer_certificates);
                     cx.common.handshake_kind = Some(HandshakeKind::Resumed);
                     let cert_verified = verify::ServerCertVerified::assertion();
                     let sig_verified = verify::HandshakeSignatureValid::assertion();
+                    let resumed = Some(Resumed {
+                        stamp,
+                        offered_ticket: match session_ticket {
+                            Some(ClientSessionTicket::Offer(ticket)) => {
+                                Some(PayloadU16::new(ticket.into_vec()))
+                            }
+                            _ => None,
+                        },
+                    });
 
                     return if must_issue_new_ticket {
                         Ok(Box::new(ExpectNewTicket {
                             secrets,
-                            resuming_session: Some(resuming),
+                            resumed,
                             session_id: server_hello.session_id,
                             server_name,
                             using_ems,
                             transcript: self.transcript,
-                            resuming: true,
                             cert_verified,
                             sig_verified,
                         }))
                     } else {
                         Ok(Box::new(ExpectCcs {
                             secrets,
-                            resuming_session: Some(resuming),
+                            resumed,
                             session_id: server_hello.session_id,
                             server_name,
                             using_ems,
                             transcript: self.transcript,
                             ticket: None,
-                            resuming: true,
                             cert_verified,
                             sig_verified,
                         }))
@@ -187,7 +210,6 @@ mod server_hello {
 
             cx.common.handshake_kind = Some(HandshakeKind::Full);
             Ok(Box::new(ExpectCertificate {
-                resuming_session: None,
                 session_id: server_hello.session_id,
                 server_name,
                 randoms: self.randoms,
@@ -202,7 +224,6 @@ mod server_hello {
 }
 
 struct ExpectCertificate {
-    resuming_session: Option<persist::Tls12ClientSessionValue>,
     session_id: SessionId,
     server_name: ServerName<'static>,
     randoms: ConnectionRandoms,
@@ -231,7 +252,6 @@ impl State<ClientConnectionData> for ExpectCertificate {
 
         if self.may_send_cert_status {
             Ok(Box::new(ExpectCertificateStatusOrServerKx {
-                resuming_session: self.resuming_session,
                 session_id: self.session_id,
                 server_name: self.server_name,
                 randoms: self.randoms,
@@ -245,7 +265,6 @@ impl State<ClientConnectionData> for ExpectCertificate {
             let server_cert = ServerCertDetails::new(server_cert_chain, vec![]);
 
             Ok(Box::new(ExpectServerKx {
-                resuming_session: self.resuming_session,
                 session_id: self.session_id,
                 server_name: self.server_name,
                 randoms: self.randoms,
@@ -264,7 +283,6 @@ impl State<ClientConnectionData> for ExpectCertificate {
 }
 
 struct ExpectCertificateStatusOrServerKx<'m> {
-    resuming_session: Option<persist::Tls12ClientSessionValue>,
     session_id: SessionId,
     server_name: ServerName<'static>,
     randoms: ConnectionRandoms,
@@ -289,7 +307,6 @@ impl State<ClientConnectionData> for ExpectCertificateStatusOrServerKx<'_> {
                 parsed: HandshakeMessagePayload(HandshakePayload::ServerKeyExchange(..)),
                 ..
             } => Box::new(ExpectServerKx {
-                resuming_session: self.resuming_session,
                 session_id: self.session_id,
                 server_name: self.server_name,
                 randoms: self.randoms,
@@ -304,7 +321,6 @@ impl State<ClientConnectionData> for ExpectCertificateStatusOrServerKx<'_> {
                 parsed: HandshakeMessagePayload(HandshakePayload::CertificateStatus(..)),
                 ..
             } => Box::new(ExpectCertificateStatus {
-                resuming_session: self.resuming_session,
                 session_id: self.session_id,
                 server_name: self.server_name,
                 randoms: self.randoms,
@@ -328,7 +344,6 @@ impl State<ClientConnectionData> for ExpectCertificateStatusOrServerKx<'_> {
 
     fn into_owned(self: Box<Self>) -> hs::NextState<'static> {
         Box::new(ExpectCertificateStatusOrServerKx {
-            resuming_session: self.resuming_session,
             session_id: self.session_id,
             server_name: self.server_name,
             randoms: self.randoms,
@@ -342,7 +357,6 @@ impl State<ClientConnectionData> for ExpectCertificateStatusOrServerKx<'_> {
 }
 
 struct ExpectCertificateStatus<'a> {
-    resuming_session: Option<persist::Tls12ClientSessionValue>,
     session_id: SessionId,
     server_name: ServerName<'static>,
     randoms: ConnectionRandoms,
@@ -378,7 +392,6 @@ impl State<ClientConnectionData> for ExpectCertificateStatus<'_> {
         let server_cert = ServerCertDetails::new(self.server_cert_chain, server_cert_ocsp_response);
 
         Ok(Box::new(ExpectServerKx {
-            resuming_session: self.resuming_session,
             session_id: self.session_id,
             server_name: self.server_name,
             randoms: self.randoms,
@@ -392,7 +405,6 @@ impl State<ClientConnectionData> for ExpectCertificateStatus<'_> {
 
     fn into_owned(self: Box<Self>) -> hs::NextState<'static> {
         Box::new(ExpectCertificateStatus {
-            resuming_session: self.resuming_session,
             session_id: self.session_id,
             server_name: self.server_name,
             randoms: self.randoms,
@@ -406,7 +418,6 @@ impl State<ClientConnectionData> for ExpectCertificateStatus<'_> {
 }
 
 struct ExpectServerKx<'a> {
-    resuming_session: Option<persist::Tls12ClientSessionValue>,
     session_id: SessionId,
     server_name: ServerName<'static>,
     randoms: ConnectionRandoms,
@@ -457,7 +468,6 @@ impl State<ClientConnectionData> for ExpectServerKx<'_> {
         }
 
         Ok(Box::new(ExpectServerDoneOrCertReq {
-            resuming_session: self.resuming_session,
             session_id: self.session_id,
             server_name: self.server_name,
             randoms: self.randoms,
@@ -472,7 +482,6 @@ impl State<ClientConnectionData> for ExpectServerKx<'_> {
 
     fn into_owned(self: Box<Self>) -> hs::NextState<'static> {
         Box::new(ExpectServerKx {
-            resuming_session: self.resuming_session,
             session_id: self.session_id,
             server_name: self.server_name,
             randoms: self.randoms,
@@ -603,7 +612,6 @@ impl ServerKxDetails {
 // Existence of the CertificateRequest tells us the server is asking for
 // client auth.  Otherwise we go straight to ServerHelloDone.
 struct ExpectServerDoneOrCertReq<'a> {
-    resuming_session: Option<persist::Tls12ClientSessionValue>,
     session_id: SessionId,
     server_name: ServerName<'static>,
     randoms: ConnectionRandoms,
@@ -632,7 +640,6 @@ impl State<ClientConnectionData> for ExpectServerDoneOrCertReq<'_> {
             }
         ) {
             Box::new(ExpectCertificateRequest {
-                resuming_session: self.resuming_session,
                 session_id: self.session_id,
                 server_name: self.server_name,
                 randoms: self.randoms,
@@ -648,7 +655,6 @@ impl State<ClientConnectionData> for ExpectServerDoneOrCertReq<'_> {
             self.transcript.abandon_client_auth();
 
             Box::new(ExpectServerDone {
-                resuming_session: self.resuming_session,
                 session_id: self.session_id,
                 server_name: self.server_name,
                 randoms: self.randoms,
@@ -666,7 +672,6 @@ impl State<ClientConnectionData> for ExpectServerDoneOrCertReq<'_> {
 
     fn into_owned(self: Box<Self>) -> hs::NextState<'static> {
         Box::new(ExpectServerDoneOrCertReq {
-            resuming_session: self.resuming_session,
             session_id: self.session_id,
             server_name: self.server_name,
             randoms: self.randoms,
@@ -681,7 +686,6 @@ impl State<ClientConnectionData> for ExpectServerDoneOrCertReq<'_> {
 }
 
 struct ExpectCertificateRequest<'a> {
-    resuming_session: Option<persist::Tls12ClientSessionValue>,
     session_id: SessionId,
     server_name: ServerName<'static>,
     randoms: ConnectionRandoms,
@@ -736,7 +740,6 @@ impl State<ClientConnectionData> for ExpectCertificateRequest<'_> {
         );
 
         Ok(Box::new(ExpectServerDone {
-            resuming_session: self.resuming_session,
             session_id: self.session_id,
             server_name: self.server_name,
             randoms: self.randoms,
@@ -752,7 +755,6 @@ impl State<ClientConnectionData> for ExpectCertificateRequest<'_> {
 
     fn into_owned(self: Box<Self>) -> hs::NextState<'static> {
         Box::new(ExpectCertificateRequest {
-            resuming_session: self.resuming_session,
             session_id: self.session_id,
             server_name: self.server_name,
             randoms: self.randoms,
@@ -767,7 +769,6 @@ impl State<ClientConnectionData> for ExpectCertificateRequest<'_> {
 }
 
 struct ExpectServerDone<'a> {
-    resuming_session: Option<persist::Tls12ClientSessionValue>,
     session_id: SessionId,
     server_name: ServerName<'static>,
     randoms: ConnectionRandoms,
@@ -972,25 +973,23 @@ impl State<ClientConnectionData> for ExpectServerDone<'_> {
         if st.must_issue_new_ticket {
             Ok(Box::new(ExpectNewTicket {
                 secrets,
-                resuming_session: st.resuming_session,
                 session_id: st.session_id,
                 server_name: st.server_name,
                 using_ems: st.using_ems,
                 transcript,
-                resuming: false,
+                resumed: None,
                 cert_verified,
                 sig_verified,
             }))
         } else {
             Ok(Box::new(ExpectCcs {
                 secrets,
-                resuming_session: st.resuming_session,
                 session_id: st.session_id,
                 server_name: st.server_name,
                 using_ems: st.using_ems,
                 transcript,
                 ticket: None,
-                resuming: false,
+                resumed: None,
                 cert_verified,
                 sig_verified,
             }))
@@ -999,7 +998,6 @@ impl State<ClientConnectionData> for ExpectServerDone<'_> {
 
     fn into_owned(self: Box<Self>) -> hs::NextState<'static> {
         Box::new(ExpectServerDone {
-            resuming_session: self.resuming_session,
             session_id: self.session_id,
             server_name: self.server_name,
             randoms: self.randoms,
@@ -1016,12 +1014,11 @@ impl State<ClientConnectionData> for ExpectServerDone<'_> {
 
 struct ExpectNewTicket {
     secrets: ConnectionSecrets,
-    resuming_session: Option<persist::Tls12ClientSessionValue>,
     session_id: SessionId,
     server_name: ServerName<'static>,
     using_ems: bool,
     transcript: HandshakeHash,
-    resuming: bool,
+    resumed: Option<Resumed>,
     cert_verified: verify::ServerCertVerified,
     sig_verified: verify::HandshakeSignatureValid,
 }
@@ -1045,13 +1042,12 @@ impl State<ClientConnectionData> for ExpectNewTicket {
 
         Ok(Box::new(ExpectCcs {
             secrets: self.secrets,
-            resuming_session: self.resuming_session,
             session_id: self.session_id,
             server_name: self.server_name,
             using_ems: self.using_ems,
             transcript: self.transcript,
             ticket: Some(nst),
-            resuming: self.resuming,
+            resumed: self.resumed,
             cert_verified: self.cert_verified,
             sig_verified: self.sig_verified,
         }))
@@ -1065,13 +1061,12 @@ impl State<ClientConnectionData> for ExpectNewTicket {
 // -- Waiting for their CCS --
 struct ExpectCcs {
     secrets: ConnectionSecrets,
-    resuming_session: Option<persist::Tls12ClientSessionValue>,
     session_id: SessionId,
     server_name: ServerName<'static>,
     using_ems: bool,
     transcript: HandshakeHash,
     ticket: Option<NewSessionTicketPayload>,
-    resuming: bool,
+    resumed: Option<Resumed>,
     cert_verified: verify::ServerCertVerified,
     sig_verified: verify::HandshakeSignatureValid,
 }
@@ -1103,13 +1098,12 @@ impl State<ClientConnectionData> for ExpectCcs {
 
         Ok(Box::new(ExpectFinished {
             secrets: self.secrets,
-            resuming_session: self.resuming_session,
             session_id: self.session_id,
             server_name: self.server_name,
             using_ems: self.using_ems,
             transcript: self.transcript,
             ticket: self.ticket,
-            resuming: self.resuming,
+            resumed: self.resumed,
             cert_verified: self.cert_verified,
             sig_verified: self.sig_verified,
         }))
@@ -1121,16 +1115,22 @@ impl State<ClientConnectionData> for ExpectCcs {
 }
 
 struct ExpectFinished {
-    resuming_session: Option<persist::Tls12ClientSessionValue>,
     session_id: SessionId,
     server_name: ServerName<'static>,
     using_ems: bool,
     transcript: HandshakeHash,
     ticket: Option<NewSessionTicketPayload>,
     secrets: ConnectionSecrets,
-    resuming: bool,
+    resumed: Option<Resumed>,
     cert_verified: verify::ServerCertVerified,
     sig_verified: verify::HandshakeSignatureValid,
+}
+
+/// What a resumed handshake keeps of the session its store lent: the stamp that finds it again,
+/// and the ticket its ClientHello offered.
+struct Resumed {
+    stamp: persist::SessionStamp,
+    offered_ticket: Option<PayloadU16>,
 }
 
 impl ExpectFinished {
@@ -1138,26 +1138,43 @@ impl ExpectFinished {
     fn save_session(&mut self, cx: &mut ClientContext<'_>) {
         // Save a ticket.  If we got a new ticket, save that.  Otherwise, save the
         // original ticket again.
-        let (mut ticket, lifetime) = match self.ticket.take() {
+        let (ticket, lifetime) = match self.ticket.take() {
             Some(nst) => (nst.ticket, nst.lifetime_hint),
             None => (PayloadU16::empty(), 0),
         };
-
-        if ticket.0.is_empty() {
-            if let Some(resuming_session) = &mut self.resuming_session {
-                ticket = resuming_session.take_ticket();
-            }
-        }
-
-        if self.session_id.is_empty() && ticket.0.is_empty() {
-            debug!("Session not saved: server didn't allocate id or ticket");
-            return;
-        }
+        let issued = match ticket.0.is_empty() {
+            true => None,
+            false => Some(ticket),
+        };
 
         let Ok(now) = cx.config.current_time() else {
             debug!("Could not get current time");
             return;
         };
+
+        let mut ticket = issued;
+        if let Some(resumed) = &mut self.resumed {
+            // A resumed session is renewed where its store keeps it, with what upstream's new
+            // value of it stated: nothing is copied.
+            if let Some(session) = cx
+                .stores
+                .resumption
+                .store
+                .current_tls12_session(&self.server_name, resumed.stamp)
+            {
+                session.renew(self.session_id, ticket, now, lifetime);
+                return;
+            }
+            // The store displaced it since it lent it: it is saved anew, as upstream saved it,
+            // with the ticket the ClientHello offered if the server issued none.
+            ticket = ticket.or_else(|| resumed.offered_ticket.take());
+        }
+        let ticket = ticket.unwrap_or_else(PayloadU16::empty);
+
+        if self.session_id.is_empty() && ticket.0.is_empty() {
+            debug!("Session not saved: server didn't allocate id or ticket");
+            return;
+        }
 
         let session_value = persist::Tls12ClientSessionValue::new(
             self.secrets.suite(),
@@ -1215,7 +1232,7 @@ impl State<ClientConnectionData> for ExpectFinished {
 
         st.save_session(cx);
 
-        if st.resuming {
+        if st.resumed.is_some() {
             emit_ccs(cx.common);
             cx.common.record_layer.start_encrypting();
             emit_finished(&st.secrets, &mut st.transcript, cx.common)?;
@@ -1234,7 +1251,7 @@ impl State<ClientConnectionData> for ExpectFinished {
     // this might mean that the ticket was invalid for some reason, so we remove it
     // from the store to restart a session from scratch
     fn handle_decrypt_error(&self, config: &mut ClientConfig) {
-        if self.resuming {
+        if self.resumed.is_some() {
             config
                 .resumption
                 .store

@@ -2,7 +2,6 @@ use alloc::borrow::ToOwned;
 use alloc::boxed::Box;
 use alloc::vec;
 use alloc::vec::Vec;
-use core::ops::Deref;
 
 use pki_types::ServerName;
 
@@ -22,7 +21,6 @@ use crate::enums::{
 };
 use crate::error::{Error, PeerIncompatible, PeerMisbehaved};
 use crate::hash_hs::HandshakeHashBuffer;
-use crate::identity::Identity;
 use crate::log::{debug, trace};
 use crate::msgs::base::Payload;
 use crate::msgs::enums::{Compression, ExtensionType};
@@ -65,6 +63,10 @@ struct ExpectServerHelloOrHelloRetryRequest {
 
 pub(super) struct ClientHelloInput {
     pub(super) resuming: Option<persist::Retrieved<ClientSessionValue>>,
+    /// The session ticket extension every ClientHello of this connection carries: offered from
+    /// a lent TLS 1.2 session, requested, or none. A second ClientHello repeats the first's
+    /// (RFC 8446 §4.1.2), so it is kept here between them.
+    pub(super) session_ticket: Option<ClientSessionTicket>,
     pub(super) random: Random,
     pub(super) sent_tls13_fake_ccs: bool,
     pub(super) hello: ClientHelloDetails,
@@ -80,28 +82,15 @@ impl ClientHelloInput {
         cx: &mut ClientContext<'_>,
     ) -> Result<Self, Error> {
         let config = cx.config;
-        let mut resuming = ClientSessionValue::retrieve(&server_name, cx);
-        let session_id = match &mut resuming {
-            Some(_resuming) => {
-                debug!("Resuming session");
-                match &mut _resuming.value {
-                    ClientSessionValue::Tls12(inner) => {
-                        // If we have a ticket, we use the sessionid as a signal that
-                        // we're  doing an abbreviated handshake.  See section 3.4 in
-                        // RFC5077.
-                        if !inner.ticket().is_empty() {
-                            inner.session_id = SessionId::random(config.provider.secure_random)?;
-                        }
-                        Some(inner.session_id)
-                    }
-                    _ => None,
-                }
-            }
-            _ => {
-                debug!("Not resuming any session");
-                None
-            }
-        };
+        let ResumptionOffer {
+            resuming,
+            session_id,
+            session_ticket,
+        } = ClientSessionValue::offer(&server_name, cx)?;
+        match resuming.is_some() {
+            true => debug!("Resuming session"),
+            false => debug!("Not resuming any session"),
+        }
 
         // https://tools.ietf.org/html/rfc8446#appendix-D.4
         // https://tools.ietf.org/html/draft-ietf-quic-tls-34#section-8.4
@@ -121,6 +110,7 @@ impl ClientHelloInput {
 
         Ok(Self {
             resuming,
+            session_ticket,
             random: Random::new(config.provider.secure_random)?,
             sent_tls13_fake_ccs: false,
             hello,
@@ -211,6 +201,7 @@ fn emit_client_hello_for_retry(
     }
 
     // Do we have a SessionID or ticket cached for this host?
+    exts.session_ticket = input.session_ticket.take();
     let tls13_session = prepare_resumption(&input.resuming, &mut exts, suite, cx)?;
 
     // Extensions MAY be randomized
@@ -260,7 +251,7 @@ fn emit_client_hello_for_retry(
         _ => None,
     };
 
-    let ch = Message {
+    let mut ch = Message {
         version: match retryreq {
             // <https://datatracker.ietf.org/doc/html/rfc8446#section-5.1>:
             // "This value MUST be set to 0x0303 for all records generated
@@ -285,6 +276,8 @@ fn emit_client_hello_for_retry(
     trace!("Sending ClientHello {ch:#?}");
 
     transcript_buffer.add_message(&ch);
+    // A second ClientHello repeats this one's session ticket extension (RFC 8446 §4.1.2).
+    input.session_ticket = take_session_ticket(&mut ch);
     cx.common.send_msg(ch, false);
 
     let early_data_key_schedule = tls13_early_data_key_schedule
@@ -317,6 +310,18 @@ fn emit_client_hello_for_retry(
     } else {
         Box::new(next)
     })
+}
+
+/// Moves the session ticket extension out of a ClientHello whose bytes are encoded already, to be
+/// offered again by the next.
+fn take_session_ticket(ch: &mut Message<'_>) -> Option<ClientSessionTicket> {
+    match &mut ch.payload {
+        MessagePayload::Handshake {
+            parsed: HandshakeMessagePayload(HandshakePayload::ClientHello(sent)),
+            ..
+        } => sent.extensions.session_ticket.take(),
+        _ => None,
+    }
 }
 
 /// The protocol versions this ClientHello offers. None usable is a configuration this connection
@@ -604,19 +609,13 @@ fn derive_early_secret(
     Ok(schedule)
 }
 
-/// Prepares `exts` and `cx` with TLS 1.2 or TLS 1.3 session
-/// resumption.
+/// Prepares `exts` and `cx` with TLS 1.3 session resumption: a request for early data if
+/// allowed, and the preshared key. The TLS 1.2 ticket, or the request for one, is the session
+/// ticket extension the ClientHello input carries ([`ClientSessionValue::offer`]).
 ///
 /// - `suite` is `None` if this is the initial ClientHello, or
 ///   `Some` if we're retrying in response to
 ///   a HelloRetryRequest.
-///
-/// This function will push onto `exts` to
-///
-/// (a) request a new ticket if we don't have one,
-/// (b) send our TLS 1.2 ticket after retrieving an 1.2 session,
-/// (c) send a request for 1.3 early data if allowed and
-/// (d) send a 1.3 preshared key if we have one.
 ///
 /// It returns the TLS 1.3 PSKs, if any, for further processing.
 fn prepare_resumption<'a>(
@@ -626,28 +625,13 @@ fn prepare_resumption<'a>(
     cx: &mut ClientContext<'_>,
 ) -> Result<Option<persist::Retrieved<&'a persist::Tls13ClientSessionValue>>, Error> {
     let config = cx.config;
-    // Check whether we're resuming with a non-empty ticket.
-    let resuming = match resuming {
-        Some(resuming) if !resuming.ticket().is_empty() => resuming,
-        _ => {
-            if config.supports_version(ProtocolVersion::TLSv1_2, cx.common.protocol)
-                && cx.stores.resumption.tls12_resumption == Tls12Resumption::SessionIdOrTickets
-            {
-                // If we don't have a ticket, request one.
-                exts.session_ticket = Some(ClientSessionTicket::Request);
-            }
-            return Ok(None);
-        }
-    };
-
-    let Some(tls13) = resuming.map(|csv| csv.tls13()) else {
-        // TLS 1.2; send the ticket if we have support this protocol version
-        if config.supports_version(ProtocolVersion::TLSv1_2, cx.common.protocol)
-            && cx.stores.resumption.tls12_resumption == Tls12Resumption::SessionIdOrTickets
-        {
-            exts.session_ticket = Some(ClientSessionTicket::Offer(Payload::new(resuming.ticket())));
-        }
-        return Ok(None); // TLS 1.2, so nothing to return here
+    // Only a TLS 1.3 session with a ticket resumes here.
+    let Some(tls13) = resuming
+        .as_ref()
+        .and_then(|resuming| resuming.map(|csv| csv.tls13()))
+        .filter(|tls13| !tls13.ticket().is_empty())
+    else {
+        return Ok(None);
     };
 
     if !config.supports_version(ProtocolVersion::TLSv1_3, cx.common.protocol) {
@@ -1174,65 +1158,101 @@ fn process_cert_type_extension(
     }
 }
 
+/// The session a ClientHello offers to resume.
 pub(super) enum ClientSessionValue {
+    /// A TLS 1.3 ticket, moved out of the store: each is offered at most once
+    /// (RFC 8446 Appendix C.4).
     Tls13(persist::Tls13ClientSessionValue),
-    Tls12(persist::Tls12ClientSessionValue),
+    /// A TLS 1.2 session the store lent to the first ClientHello and keeps; the server's answer
+    /// finds it again by its stamp.
+    Tls12(persist::SessionStamp),
+}
+
+/// What [`ClientSessionValue::offer`] found: the session to resume, the TLS 1.2 session ID that
+/// resumes it, and the session ticket extension.
+struct ResumptionOffer {
+    resuming: Option<persist::Retrieved<ClientSessionValue>>,
+    session_id: Option<SessionId>,
+    session_ticket: Option<ClientSessionTicket>,
 }
 
 impl ClientSessionValue {
-    fn retrieve(
+    /// Takes a TLS 1.3 ticket for `server_name` from the store, or is lent its TLS 1.2 session,
+    /// and makes what the ClientHello needs of it. A TLS 1.2 session stays in the store: the
+    /// ClientHello's ticket is the only copy made of it, as upstream made.
+    fn offer(
         server_name: &ServerName<'static>,
         cx: &mut ClientContext<'_>,
-    ) -> Option<persist::Retrieved<Self>> {
+    ) -> Result<ResumptionOffer, Error> {
         let config = cx.config;
-        let store = &mut cx.stores.resumption.store;
-        let found = store
-            .take_tls13_ticket(server_name)
-            .map(ClientSessionValue::Tls13)
-            .or_else(|| {
-                {
-                    store
-                        .tls12_session(server_name)
-                        .map(ClientSessionValue::Tls12)
-                }
-            })
-            .and_then(|resuming| {
-                resuming.compatible_config(
-                    config.verifier_identity,
-                    config.client_auth_cert_resolver_identity,
-                )
-            })
-            .and_then(|resuming| {
-                let now = config
-                    .current_time()
-                    .map_err(|_err| debug!("Could not get current time: {_err}"))
-                    .ok()?;
-
-                let retrieved = persist::Retrieved::new(resuming, now);
-                match retrieved.has_expired() {
-                    false => Some(retrieved),
-                    true => None,
-                }
-            })
-            .or_else(|| {
-                debug!("No cached session for {server_name:?}");
-                None
-            });
-
-        if let Some(resuming) = &found {
-            if cx.common.is_quic() {
-                cx.common.quic.params = resuming.tls13().map(|v| v.quic_params());
+        let tls12_tickets = config.supports_version(ProtocolVersion::TLSv1_2, cx.common.protocol)
+            && cx.stores.resumption.tls12_resumption == Tls12Resumption::SessionIdOrTickets;
+        let usable = |common: &persist::ClientSessionCommon| -> Option<pki_types::UnixTime> {
+            if !common.compatible_config(
+                config.verifier_identity,
+                config.client_auth_cert_resolver_identity,
+            ) {
+                return None;
             }
+            let now = config
+                .current_time()
+                .map_err(|_err| debug!("Could not get current time: {_err}"))
+                .ok()?;
+            (!common.has_expired(now)).then_some(now)
+        };
+        let store = &mut cx.stores.resumption.store;
+
+        if let Some(ticket) = store.take_tls13_ticket(server_name) {
+            let resuming =
+                usable(&ticket.common).map(|now| persist::Retrieved::new(Self::Tls13(ticket), now));
+            let session_ticket = match &resuming {
+                Some(resuming) if resuming.tls13().is_some_and(|v| !v.ticket().is_empty()) => None,
+                _ => tls12_tickets.then_some(ClientSessionTicket::Request),
+            };
+            if let Some(resuming) = &resuming {
+                if cx.common.is_quic() {
+                    cx.common.quic.params = resuming.tls13().map(|v| v.quic_params());
+                }
+            } else {
+                debug!("No cached session for {server_name:?}");
+            }
+            return Ok(ResumptionOffer {
+                resuming,
+                session_id: None,
+                session_ticket,
+            });
         }
 
-        found
-    }
-
-    fn common(&self) -> &persist::ClientSessionCommon {
-        match self {
-            Self::Tls13(inner) => &inner.common,
-            Self::Tls12(inner) => &inner.common,
-        }
+        let Some((session, now)) = store
+            .tls12_session(server_name)
+            .and_then(|session| Some((session, usable(&session.common)?)))
+        else {
+            debug!("No cached session for {server_name:?}");
+            return Ok(ResumptionOffer {
+                resuming: None,
+                session_id: None,
+                session_ticket: tls12_tickets.then_some(ClientSessionTicket::Request),
+            });
+        };
+        let ticket = session.ticket();
+        let (session_id, session_ticket) = match ticket.is_empty() {
+            true => (
+                session.session_id,
+                tls12_tickets.then_some(ClientSessionTicket::Request),
+            ),
+            // If we have a ticket, we use the sessionid as a signal that
+            // we're  doing an abbreviated handshake.  See section 3.4 in
+            // RFC5077.
+            false => (
+                SessionId::random(config.provider.secure_random)?,
+                tls12_tickets.then(|| ClientSessionTicket::Offer(Payload::new(ticket))),
+            ),
+        };
+        Ok(ResumptionOffer {
+            resuming: Some(persist::Retrieved::new(Self::Tls12(session.stamp()), now)),
+            session_id: Some(session_id),
+            session_ticket,
+        })
     }
 
     fn tls13(&self) -> Option<&persist::Tls13ClientSessionValue> {
@@ -1240,28 +1260,5 @@ impl ClientSessionValue {
             Self::Tls13(v) => Some(v),
             Self::Tls12(_) => None,
         }
-    }
-
-    fn compatible_config(
-        self,
-        server_cert_verifier: Identity,
-        client_creds: Identity,
-    ) -> Option<Self> {
-        match &self {
-            Self::Tls13(v) => v
-                .compatible_config(server_cert_verifier, client_creds)
-                .then_some(self),
-            Self::Tls12(v) => v
-                .compatible_config(server_cert_verifier, client_creds)
-                .then_some(self),
-        }
-    }
-}
-
-impl Deref for ClientSessionValue {
-    type Target = persist::ClientSessionCommon;
-
-    fn deref(&self) -> &Self::Target {
-        self.common()
     }
 }

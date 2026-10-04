@@ -83,6 +83,12 @@ pub enum Error {
     /// something a peer caused; upstream rustls panicked at each such site (`VENDORED.md` §3).
     Internal(&'static str),
 
+    /// The server resumed the TLS 1.2 session this client offered, and the client's session
+    /// store no longer holds it: the store displaced it after lending it to the ClientHello and
+    /// had pushed it out of what it keeps by the time the server answered
+    /// ([`ClientSessionStore::tls12_session`](crate::client::ClientSessionStore::tls12_session)).
+    ResumedSessionLost,
+
     /// We failed to figure out what time it currently is.
     FailedToGetCurrentTime,
 
@@ -1104,6 +1110,10 @@ impl fmt::Display for Error {
             }
             Self::General(err) => write!(f, "unexpected error: {err}"),
             Self::Internal(what) => write!(f, "internal error: {what}"),
+            Self::ResumedSessionLost => write!(
+                f,
+                "the server resumed a TLS 1.2 session the session store no longer holds"
+            ),
             Self::Other(err) => write!(f, "other error: {err}"),
         }
     }
@@ -1462,6 +1472,7 @@ mod tests {
             super::CertificateError::InvalidOcspResponse.into(),
             Error::General("undocumented error".to_string()),
             Error::Internal("an invariant"),
+            Error::ResumedSessionLost,
             Error::FailedToGetCurrentTime,
             Error::FailedToGetRandomBytes,
             Error::HandshakeNotComplete,

@@ -1,5 +1,5 @@
 use alloc::vec::Vec;
-use core::{cmp, mem};
+use core::cmp;
 
 use pki_types::{DnsName, UnixTime};
 use zeroize::Zeroizing;
@@ -46,15 +46,6 @@ impl Retrieved<&Tls13ClientSessionValue> {
             .unwrap_or(u32::MAX)
             .saturating_mul(1000);
         age_millis.wrapping_add(self.value.age_add)
-    }
-}
-
-impl<T: core::ops::Deref<Target = ClientSessionCommon>> Retrieved<T> {
-    pub(crate) fn has_expired(&self) -> bool {
-        let common = &*self.value;
-        common.lifetime_secs != 0
-            && common.epoch.saturating_add(u64::from(common.lifetime_secs))
-                < self.retrieved_at.as_secs()
     }
 }
 
@@ -148,12 +139,24 @@ impl core::ops::Deref for Tls13ClientSessionValue {
     }
 }
 
-/// What a client keeps of a TLS 1.2 session to resume it
-#[derive(Debug, Clone)]
+/// Which TLS 1.2 session a client's store holds, drawn fresh for each session.
+///
+/// A store lends its session to the ClientHello that offers it, and the connection keeps only
+/// this stamp: when the server answers, it finds the session again by its stamp, however the
+/// store changed between the two calls (`ClientSessionStore::lent_tls12_session`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SessionStamp(Identity);
+
+/// What a client keeps of a TLS 1.2 session to resume it.
+///
+/// The session stays in its store: a connection is lent it, and copies nothing out of it but what
+/// the handshake sends (VENDORED.md §5).
+#[derive(Debug)]
 pub struct Tls12ClientSessionValue {
     suite: &'static Tls12CipherSuite,
     pub(crate) session_id: SessionId,
     extended_ms: bool,
+    stamp: SessionStamp,
     #[doc(hidden)]
     pub(crate) common: ClientSessionCommon,
 }
@@ -175,6 +178,7 @@ impl Tls12ClientSessionValue {
             suite,
             session_id,
             extended_ms,
+            stamp: SessionStamp(Identity::fresh()),
             common: ClientSessionCommon::new(
                 ticket,
                 master_secret,
@@ -187,9 +191,28 @@ impl Tls12ClientSessionValue {
         }
     }
 
-    /// Move the ticket out, for the session value that replaces this one.
-    pub(crate) fn take_ticket(&mut self) -> PayloadU16 {
-        mem::replace(&mut self.common.ticket, PayloadU16::empty())
+    /// Which session this is.
+    pub fn stamp(&self) -> SessionStamp {
+        self.stamp
+    }
+
+    /// Renews this session after a connection resumed it, where its store keeps it: the session
+    /// ID the server echoed, the ticket the server issued if it issued one, and the lifetime the
+    /// server gave from `time_now`. Upstream rustls stored a new value made of the same session's
+    /// master secret, certificate chain and suite instead, copying the chain.
+    pub(crate) fn renew(
+        &mut self,
+        session_id: SessionId,
+        ticket: Option<PayloadU16>,
+        time_now: UnixTime,
+        lifetime_secs: u32,
+    ) {
+        self.session_id = session_id;
+        if let Some(ticket) = ticket {
+            self.common.ticket = ticket;
+        }
+        self.common.epoch = time_now.as_secs();
+        self.common.lifetime_secs = cmp::min(lifetime_secs, MAX_TICKET_LIFETIME);
     }
 
     pub(crate) fn extended_ms(&self) -> bool {
@@ -216,7 +239,8 @@ impl core::ops::Deref for Tls12ClientSessionValue {
     }
 }
 
-#[derive(Debug, Clone)]
+/// What every client session keeps, whichever the protocol version
+#[derive(Debug)]
 pub struct ClientSessionCommon {
     ticket: PayloadU16,
     secret: Zeroizing<PayloadU8>,
@@ -250,6 +274,12 @@ impl ClientSessionCommon {
         }
     }
 
+    /// Whether the session's lifetime has run out at `now`; a lifetime of zero never does.
+    pub(crate) fn has_expired(&self, now: UnixTime) -> bool {
+        self.lifetime_secs != 0
+            && self.epoch.saturating_add(u64::from(self.lifetime_secs)) < now.as_secs()
+    }
+
     pub(crate) fn compatible_config(
         &self,
         server_cert_verifier: Identity,
@@ -275,6 +305,11 @@ impl ClientSessionCommon {
 
     pub(crate) fn server_cert_chain(&self) -> &CertificateChain<'static> {
         &self.server_cert_chain
+    }
+
+    /// Moves the server's certificate chain out, for a connection that spends this session.
+    pub(crate) fn take_server_cert_chain(&mut self) -> CertificateChain<'static> {
+        core::mem::take(&mut self.server_cert_chain)
     }
 
     pub(crate) fn secret(&self) -> &[u8] {

@@ -24,7 +24,13 @@ where
     K: Eq + Hash + Clone + core::fmt::Debug,
     V: Default,
 {
-    pub(crate) fn get_or_insert_default_and_edit(&mut self, k: K, edit: impl FnOnce(&mut V)) {
+    /// Edits `k`'s value, inserting the default first if `k` is new; returns the value of the
+    /// oldest key if the insertion evicted it.
+    pub(crate) fn get_or_insert_default_and_edit(
+        &mut self,
+        k: K,
+        edit: impl FnOnce(&mut V),
+    ) -> Option<V> {
         let inserted_new_item = match self.map.entry(k) {
             Entry::Occupied(value) => {
                 edit(value.into_mut());
@@ -40,9 +46,10 @@ where
         // ensure next insertion does not require a realloc
         if inserted_new_item && self.oldest.capacity() == self.oldest.len() {
             if let Some(oldest_key) = self.oldest.pop_front() {
-                self.map.remove(&oldest_key);
+                return self.map.remove(&oldest_key);
             }
         }
+        None
     }
 
     pub(crate) fn get_mut<Q: Hash + Eq + ?Sized>(&mut self, k: &Q) -> Option<&mut V>

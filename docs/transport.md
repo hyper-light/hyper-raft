@@ -143,10 +143,16 @@ ticketer and key log (10), and the certificate-compression cache (6). Measured w
     calls never overlap.
   - The config is split into read-only settings and these stores, so one call can hold a
     borrowed certificate key and a mutable store together.
-  - A TLS 1.2 session stays in the cache for reuse, so resuming copies its ticket and
-    certificate chain out, where `Arc` shared them: +2 allocations per resumed TLS 1.2
-    handshake, measured (crates/hyper-tls/VENDORED.md §2.10). Every other handshake allocates
-    less than before.
+  - A TLS 1.2 session stays in the cache for reuse, so the cache lends it: the call that sends
+    the ClientHello reads its session ID and ticket where it is, and the connection keeps only
+    the session's stamp. The call that takes the server's answer finds it again by the stamp
+    and copies the chain into `peer_certificates`, as upstream did; a resumed session is renewed
+    in place. A ClientHello sent after a HelloRetryRequest repeats the first's ticket, kept
+    from the first (RFC 8446 §4.1.2). The cache keeps a session it displaced while lent, up to
+    its bound on servers, and a resumption whose session it pushed out fails typed. Every
+    handshake shape allocates no more than upstream's, held exactly by a test against upstream
+    rustls in the same process (crates/hyper-tls/VENDORED.md §5); before, a resumed TLS 1.2
+    handshake copied the session out and made 2 allocations more (§2.10).
 - **Verifiers, resolvers and root stores are owned by their config**, as `Box<dyn …>` or by
   value. Configs are not `Clone`: each endpoint builds its own.
   - Upstream refused to resume a session under another verifier or client resolver by comparing

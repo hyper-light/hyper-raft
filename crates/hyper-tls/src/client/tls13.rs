@@ -540,7 +540,7 @@ impl State<ClientConnectionData> for ExpectEncryptedExtensions {
         }
 
         match self.resuming_session {
-            Some(resuming_session) => {
+            Some(mut resuming_session) => {
                 let was_early_traffic = cx.common.early_traffic;
                 if was_early_traffic {
                     match exts.early_data_ack {
@@ -557,7 +557,10 @@ impl State<ClientConnectionData> for ExpectEncryptedExtensions {
                     self.key_schedule.set_handshake_encrypter(cx.common)?;
                 }
 
-                cx.common.peer_certificates = Some(resuming_session.server_cert_chain().clone());
+                // The ticket was moved out of its store and is spent here: its chain moves with
+                // it, where upstream copied it out of the shared session.
+                cx.common.peer_certificates =
+                    Some(resuming_session.common.take_server_cert_chain());
                 cx.common.handshake_kind = Some(HandshakeKind::Resumed);
 
                 // We *don't* reverify the certificate chain here: resumption is a

@@ -4409,12 +4409,24 @@ enum ClientStorageOp {
 }
 
 /// A client session store the test can inspect while its configuration owns it: clones share
-/// the cache and the operation log.
-#[derive(Clone)]
+/// the operation log, the key exchange hints and the TLS 1.3 tickets. TLS 1.2 sessions, which a
+/// store lends to its connections, are each instance's own.
 struct ClientStorage {
     storage: Arc<Mutex<hyper_tls::client::ClientSessionMemoryCache>>,
+    tls12: hyper_tls::client::ClientSessionMemoryCache,
     ops: Arc<Mutex<Vec<ClientStorageOp>>>,
     alter_max_early_data_size: Option<(u32, u32)>,
+}
+
+impl Clone for ClientStorage {
+    fn clone(&self) -> Self {
+        Self {
+            storage: self.storage.clone(),
+            tls12: hyper_tls::client::ClientSessionMemoryCache::new(1024),
+            ops: self.ops.clone(),
+            alter_max_early_data_size: self.alter_max_early_data_size,
+        }
+    }
 }
 
 impl ClientStorage {
@@ -4423,6 +4435,7 @@ impl ClientStorage {
             storage: Arc::new(Mutex::new(
                 hyper_tls::client::ClientSessionMemoryCache::new(1024),
             )),
+            tls12: hyper_tls::client::ClientSessionMemoryCache::new(1024),
             ops: Arc::new(Mutex::new(Vec::new())),
             alter_max_early_data_size: None,
         }
@@ -4474,17 +4487,14 @@ impl hyper_tls::client::ClientSessionStore for ClientStorage {
             .lock()
             .unwrap()
             .push(ClientStorageOp::SetTls12Session(server_name.clone()));
-        self.storage
-            .lock()
-            .unwrap()
-            .set_tls12_session(server_name, value)
+        self.tls12.set_tls12_session(server_name, value)
     }
 
     fn tls12_session(
-        &self,
-        server_name: &ServerName<'_>,
-    ) -> Option<hyper_tls::client::Tls12ClientSessionValue> {
-        let rc = self.storage.lock().unwrap().tls12_session(server_name);
+        &mut self,
+        server_name: &ServerName<'static>,
+    ) -> Option<&hyper_tls::client::Tls12ClientSessionValue> {
+        let rc = self.tls12.tls12_session(server_name);
         self.ops
             .lock()
             .unwrap()
@@ -4495,15 +4505,28 @@ impl hyper_tls::client::ClientSessionStore for ClientStorage {
         rc
     }
 
+    fn lent_tls12_session(
+        &self,
+        server_name: &ServerName<'static>,
+        stamp: hyper_tls::client::SessionStamp,
+    ) -> Option<&hyper_tls::client::Tls12ClientSessionValue> {
+        self.tls12.lent_tls12_session(server_name, stamp)
+    }
+
+    fn current_tls12_session(
+        &mut self,
+        server_name: &ServerName<'static>,
+        stamp: hyper_tls::client::SessionStamp,
+    ) -> Option<&mut hyper_tls::client::Tls12ClientSessionValue> {
+        self.tls12.current_tls12_session(server_name, stamp)
+    }
+
     fn remove_tls12_session(&mut self, server_name: &ServerName<'static>) {
         self.ops
             .lock()
             .unwrap()
             .push(ClientStorageOp::RemoveTls12Session(server_name.clone()));
-        self.storage
-            .lock()
-            .unwrap()
-            .remove_tls12_session(server_name);
+        self.tls12.remove_tls12_session(server_name);
     }
 
     fn insert_tls13_ticket(
@@ -6934,6 +6957,223 @@ fn test_client_removes_tls12_session_if_server_sends_undecryptable_first_message
         storage.ops()[0],
         ClientStorageOp::RemoveTls12Session(_)
     ));
+}
+
+/// The session ticket extension of a ClientHello, given as its handshake message's encoding, if
+/// it carries one.
+fn session_ticket_extension(handshake: &[u8]) -> Option<Vec<u8>> {
+    if handshake.first() != Some(&u8::from(HandshakeType::ClientHello)) {
+        return None;
+    }
+    let body = &handshake[4..];
+    let u16_at = |at: usize| usize::from(u16::from_be_bytes([body[at], body[at + 1]]));
+    // legacy_version and random, then session_id<0..32>, cipher_suites<2..2^16-2> and
+    // compression_methods<1..2^8-1> (RFC 8446 §4.1.2).
+    let mut at = 2 + 32;
+    at += 1 + usize::from(body[at]);
+    at += 2 + u16_at(at);
+    at += 1 + usize::from(body[at]);
+    let end = at + 2 + u16_at(at);
+    at += 2;
+    while at < end {
+        let (kind, length) = (u16_at(at), u16_at(at + 2));
+        if kind == usize::from(u16::from(ExtensionType::SessionTicket)) {
+            return Some(body[at + 4..at + 4 + length].to_vec());
+        }
+        at += 4 + length;
+    }
+    None
+}
+
+/// Moves what `client` has to send to `server`, and returns the session ticket extension of the
+/// ClientHello among it.
+fn send_client_hello(client: &mut TestClient, server: &mut TestServer) -> Option<Vec<u8>> {
+    let seen = std::cell::RefCell::new(None);
+    transfer_altered(
+        client,
+        |message| {
+            if let MessagePayload::Handshake { encoded, .. } = &message.payload {
+                if let Some(ticket) = session_ticket_extension(encoded.bytes()) {
+                    *seen.borrow_mut() = Some(ticket);
+                }
+            }
+            Altered::InPlace
+        },
+        server,
+    );
+    seen.into_inner()
+}
+
+/// A server of `version` alone that takes only `group`.
+fn server_of(
+    kt: KeyType,
+    version: &'static SupportedProtocolVersion,
+    group: &'static dyn SupportedKxGroup,
+    provider: &CryptoProvider,
+) -> ServerConfig {
+    finish_server_config(
+        kt,
+        ServerConfig::builder_with_provider(static_provider(CryptoProvider {
+            kx_groups: vec![group],
+            ..provider.clone()
+        }))
+        .with_protocol_versions(&[version])
+        .unwrap(),
+    )
+}
+
+/// A TLS 1.2 server that issues tickets under a key of its own, taking only secp384r1.
+fn tls12_ticket_server(kt: KeyType, provider: &CryptoProvider) -> Shared<ServerConfig> {
+    let mut config = server_of(
+        kt,
+        &hyper_tls::version::TLS12,
+        provider::kx_group::SECP384R1,
+        provider,
+    );
+    config.ticketer = provider::Ticketer::new().unwrap();
+    Shared::new(config)
+}
+
+/// RFC 8446 §4.1.2: a ClientHello sent again after a HelloRetryRequest repeats the first's
+/// session ticket extension. The store lent the TLS 1.2 ticket to the first ClientHello, and here
+/// replaces that session before the retry: the retry still offers the first ticket.
+#[test]
+fn tls12_ticket_is_offered_again_after_a_retry_though_its_store_replaced_it() {
+    let provider = provider::default_provider();
+    let kt = KeyType::EcdsaP256;
+    // Both versions, a secp384r1 key share first.
+    let client_config = Shared::new(make_client_config_with_kx_groups(
+        kt,
+        vec![provider::kx_group::SECP384R1, provider::kx_group::X25519],
+        &provider,
+    ));
+
+    // A TLS 1.2 session with a ticket.
+    let (mut client, mut server) =
+        make_pair_for_configs(client_config.clone(), tls12_ticket_server(kt, &provider));
+    do_handshake(&mut client, &mut server);
+
+    // A server now on TLS 1.3 alone, taking only X25519: the first ClientHello offers the ticket.
+    let tls13_server = Shared::new(server_of(
+        kt,
+        &hyper_tls::version::TLS13,
+        provider::kx_group::X25519,
+        &provider,
+    ));
+    let mut retrying = TestClient::new(client_config.clone(), server_name("localhost")).unwrap();
+    let mut server = TestServer::new(tls13_server).unwrap();
+    let first = send_client_hello(&mut retrying, &mut server).unwrap();
+    assert!(!first.is_empty(), "the first ClientHello offers the ticket");
+
+    // Meanwhile another connection meets a TLS 1.2 server with another ticket key, which declines
+    // the ticket: the full handshake's session replaces the one lent.
+    let (mut other, mut other_server) =
+        make_pair_for_configs(client_config.clone(), tls12_ticket_server(kt, &provider));
+    do_handshake(&mut other, &mut other_server);
+    assert_eq!(other.handshake_kind(), Some(HandshakeKind::Full));
+    let mut fresh = TestClient::new(client_config.clone(), server_name("localhost")).unwrap();
+    let replaced = send_client_hello(
+        &mut fresh,
+        &mut TestServer::new(tls12_ticket_server(kt, &provider)).unwrap(),
+    )
+    .unwrap();
+    assert_ne!(first, replaced, "the store holds another session now");
+
+    // The TLS 1.3 server asks for a retry; the second ClientHello offers the first's ticket.
+    server.process_new_packets().unwrap();
+    transfer(&mut server, &mut retrying);
+    retrying.process_new_packets().unwrap();
+    let second = send_client_hello(&mut retrying, &mut server).unwrap();
+    assert_eq!(first, second);
+    do_handshake(&mut retrying, &mut server);
+    assert_eq!(
+        retrying.handshake_kind(),
+        Some(HandshakeKind::FullWithHelloRetryRequest)
+    );
+}
+
+/// A TLS 1.2 session its store lent to a ClientHello, then displaced before the server answered,
+/// still resumes: the store keeps a displaced session it lent, and the connection finds it there.
+#[test]
+fn a_tls12_session_displaced_after_it_was_lent_still_resumes() {
+    let provider = provider::default_provider();
+    let kt = KeyType::EcdsaP256;
+    let client_config = Shared::new(make_client_config_with_versions(
+        kt,
+        &[&hyper_tls::version::TLS12],
+        &provider,
+    ));
+    let server_config = Shared::new(make_server_config(kt, &provider));
+    let (mut client, mut server) =
+        make_pair_for_configs(client_config.clone(), server_config.clone());
+    do_handshake(&mut client, &mut server);
+
+    // The server takes the offer of the session, and resumes it.
+    let (mut resuming, mut server) =
+        make_pair_for_configs(client_config.clone(), server_config.clone());
+    transfer(&mut resuming, &mut server);
+    server.process_new_packets().unwrap();
+
+    // Meanwhile another connection meets a server that lost the session; its full handshake's
+    // session displaces the one lent.
+    let (mut other, mut other_server) =
+        make_pair_for_configs(client_config.clone(), make_server_config(kt, &provider));
+    do_handshake(&mut other, &mut other_server);
+    assert_eq!(other.handshake_kind(), Some(HandshakeKind::Full));
+
+    do_handshake(&mut resuming, &mut server);
+    assert_eq!(resuming.handshake_kind(), Some(HandshakeKind::Resumed));
+    assert_eq!(resuming.peer_certificates(), Some(&kt.get_chain()[..]));
+
+    // The resumed session is saved again, as upstream saved it, and resumes again.
+    let (mut again, mut server) =
+        make_pair_for_configs(client_config.clone(), server_config.clone());
+    do_handshake(&mut again, &mut server);
+    assert_eq!(again.handshake_kind(), Some(HandshakeKind::Resumed));
+}
+
+/// A store keeps as many displaced sessions it lent as it holds servers. A session pushed out of
+/// them before its server's answer fails the resumption, typed, with an internal_error alert.
+#[test]
+fn a_tls12_session_pushed_out_of_its_store_fails_the_resumption_typed() {
+    let provider = provider::default_provider();
+    let kt = KeyType::EcdsaP256;
+    let mut client_config =
+        make_client_config_with_versions(kt, &[&hyper_tls::version::TLS12], &provider);
+    // Sixteen sessions: a bound of two servers, so two displaced sessions kept.
+    client_config.resumption = Resumption::store(Box::new(
+        hyper_tls::client::ClientSessionMemoryCache::new(16),
+    ));
+    let client_config = Shared::new(client_config);
+    let server_config = Shared::new(make_server_config(kt, &provider));
+    let (mut client, mut server) =
+        make_pair_for_configs(client_config.clone(), server_config.clone());
+    do_handshake(&mut client, &mut server);
+
+    let (mut resuming, mut server) =
+        make_pair_for_configs(client_config.clone(), server_config.clone());
+    transfer(&mut resuming, &mut server);
+    server.process_new_packets().unwrap();
+
+    // Three full handshakes with servers that lost the session: each displaces the session before
+    // it, the third pushing the first displaced out.
+    for _ in 0..3 {
+        let (mut other, mut other_server) =
+            make_pair_for_configs(client_config.clone(), make_server_config(kt, &provider));
+        do_handshake(&mut other, &mut other_server);
+        assert_eq!(other.handshake_kind(), Some(HandshakeKind::Full));
+    }
+
+    transfer(&mut server, &mut resuming);
+    assert_eq!(
+        resuming.process_new_packets().err(),
+        Some(Error::ResumedSessionLost)
+    );
+    transfer(&mut resuming, &mut server);
+    assert_eq!(
+        server.process_new_packets().err(),
+        Some(Error::AlertReceived(AlertDescription::InternalError))
+    );
 }
 
 #[test]

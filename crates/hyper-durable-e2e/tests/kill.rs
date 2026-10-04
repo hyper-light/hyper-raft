@@ -364,7 +364,8 @@ impl Cluster {
                 "\n  member {id}, {:?} ago: term {} leads {} commit {} applied {} last {}; \
                  suspected {:?} heard {:?} unjudged {} at up to {:?} taken {} restarts {}; \
                  detection {:?} span {:?} round {:?}; a write out {:?} all told, its oldest out \
-                 {:?}, the longest write {:?}, the longest between two reads {:?}",
+                 {:?}, the longest write {:?}, the longest between two reads {:?}; stalled {} \
+                 marked {} deadline {}",
                 at.elapsed(),
                 s.term,
                 s.leads,
@@ -384,6 +385,13 @@ impl Cluster {
                 Duration::from_nanos(r.writing_ns),
                 Duration::from_nanos(r.flush_most_ns),
                 Duration::from_nanos(r.turn_most_ns),
+                r.stalled,
+                r.marked,
+                if r.deadline_ns == u64::MAX {
+                    "none".to_string()
+                } else {
+                    format!("in {:?}", Duration::from_nanos(r.deadline_ns))
+                },
             ));
         }
         out

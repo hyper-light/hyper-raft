@@ -179,6 +179,15 @@ pub struct Report {
     /// suspicion's freshness point, was still unread in its socket (hyper-raft-e2e's
     /// `Report::unread`). Zero always.
     pub unread: u64,
+    /// Whether a write of its replica waits for room: its campaigns are held meanwhile
+    /// (`docs/durable.md` §8).
+    pub stalled: bool,
+    /// Whether its replica holds a mark, what its log may lack (`docs/durable.md` §5).
+    pub marked: bool,
+    /// How long from the report until its replica's deadline, nanoseconds: zero when due,
+    /// `u64::MAX` when nothing is timed. A follower's deadline is its campaign's, which a stall
+    /// holds.
+    pub deadline_ns: u64,
     /// The peers its detectors suspect.
     pub suspected: Vec<u64>,
     /// The peers its stream has taken a heartbeat from.
@@ -217,6 +226,9 @@ pub fn put_report(buffer: &mut Vec<u8>, id: u64, report: &Report) {
         report.flush_most_ns,
         report.turn_most_ns,
         report.unread,
+        u64::from(report.stalled),
+        u64::from(report.marked),
+        report.deadline_ns,
         u64::try_from(report.voters.len()).unwrap_or(u64::MAX),
     ] {
         wire::put_u64(buffer, word);
@@ -254,7 +266,7 @@ pub fn read_report(body: &[u8], max_voters: usize) -> Option<(u64, Report)> {
         return None;
     }
     let status = read_status(&mut reader)?;
-    let mut words = [0u64; 14];
+    let mut words = [0u64; 17];
     for word in &mut words {
         *word = reader.u64()?;
     }
@@ -273,6 +285,9 @@ pub fn read_report(body: &[u8], max_voters: usize) -> Option<(u64, Report)> {
         flush_most_ns,
         turn_most_ns,
         unread,
+        stalled,
+        marked,
+        deadline_ns,
     ] = words;
     let list = |reader: &mut Reader<'_>| {
         let count = usize::try_from(reader.u64()?).ok()?;
@@ -305,6 +320,9 @@ pub fn read_report(body: &[u8], max_voters: usize) -> Option<(u64, Report)> {
             flush_most_ns,
             turn_most_ns,
             unread,
+            stalled: stalled != 0,
+            marked: marked != 0,
+            deadline_ns,
             suspected,
             heard,
         },

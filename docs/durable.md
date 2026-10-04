@@ -148,6 +148,17 @@ something into a replica or when a write completion woke it. Each call does, in 
 
 Nothing is held between calls but the writes out, each with what waits for it.
 
+An owner that takes requests in batches drives each replica a request reached, whether or not its
+step left the core anything ready. A step that gives no `Ready` still owes its frame an answer:
+- an older-term message the core passes over;
+- a heartbeat's answer at a follower;
+- a refusal the core returns.
+
+The poll that answers the frame is the drive. focal's owner learned this (focal `de6840c`). It
+batched requests and drained at the batch's end only the replicas with `has_ready()`. A peer frame
+whose step left nothing ready waited for its 750 ms deadline, and a test that pumped one frame at a
+time stalled behind it with no leader. Every request a batch takes now owes the batch its drive.
+
 ### 2.3 What one write holds, and in what order
 
 One write is one log update: the snapshot's point, the entries, the fast-track proposals, then the

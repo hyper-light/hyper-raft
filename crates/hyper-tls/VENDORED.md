@@ -418,3 +418,35 @@ tickets are stored under an owned name, and its resumed ticket's chain moves.
 Unit 250 (247 and the cache's three), api 232 (229 and the three above), api_ffdhe 5,
 client_cert_verifier 4, ech 2, key_log_file_env 2, process_provider 1, server_cert_verifier 6,
 unbuffered 27, alloc_per_handshake 1, doctests 15 (3 ignored): all pass.
+
+## 6. End to end, against upstream (2026-10-03)
+
+`tests/e2e.rs` (`harness = false`): real processes over real TCP sockets on loopback (CLAUDE.md
+§1a). The test binary is the client and spawns itself as each scenario's server, a process that
+shares nothing with it but the kernel's sockets; the server serves the scenario's connections in
+turn and reports each on its standard output. Every scenario runs three ways: hyper-tls on both
+sides, a hyper-tls client against an upstream rustls 0.23.45 server (the `upstream-rustls`
+dev-dependency), and an upstream client against a hyper-tls server.
+
+| Scenario | Connections |
+|---|---|
+| `tls13`, `tls12`, `tls12-tickets` | a full handshake, then a resumed one: by ticket under TLS 1.3, by the server's session cache or by ticket under TLS 1.2 |
+| `mutual13`, `mutual12` | the same with a client certificate the server requires; the server reports the certificate it verified, in the resumed handshake too |
+| `untrusted-server13`, `untrusted-server12` | the server's chain from an authority the client does not trust: `UnknownIssuer` at the client, `AlertReceived(UnknownCA)` at the server |
+| `untrusted-client13`, `untrusted-client12` | the client's chain from an authority the server does not trust: `UnknownIssuer` at the server, `AlertReceived(UnknownCA)` at the client |
+| `missing-client13` | no client certificate where one is required: `NoCertificatesPresented` at the server, `AlertReceived(CertificateRequired)` at the client |
+| `wrong-name13` | the server's certificate does not name the server asked for: `NotValidForName` at the client, `AlertReceived(BadCertificate)` at the server |
+
+A connection that completes moves a mebibyte each way, every byte checked on both sides, and both
+sides agree on its kind (`Full` or `Resumed`) and version. A refused one is refused on both sides
+with each implementation's typed error, the alert the refusing side sent being the error the other
+reports. Neither side closes its socket with bytes unread, which would reset the other's stream and
+could lose the alert in it: each ends its writing and reads to the end of the other's.
+
+Every wait is for a fact: bytes from the peer, the end of its stream, or its process ending. The
+one wall-clock bound is a failure guard on each socket read (120 s), far past what a handshake on
+loopback needs, so that a wedged peer fails the test instead of hanging it.
+
+All 33 runs pass, in 2.8 s for the binary (debug profile, this machine), and 20 repetitions at load
+23–24 passed every one: a full TLS 1.3 handshake with a mebibyte each way in 36–74 ms, a resumed
+one in 1.7–2.8 ms.

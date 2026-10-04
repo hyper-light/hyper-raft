@@ -2,70 +2,39 @@ name: ci
 
 on:
   push:
-  pull_request:
 
 jobs:
-  gates:
-    # The six targets every consumer ships on (CLAUDE.md §1, Portable).
+  stall-loop:
+    # Diagnostic only, never merged. windows-11-arm's access violation (runs 37184084685 and
+    # 37204898614: a member of hyper-durable-e2e's kill test, in a stall case, writes to 0x10e from
+    # Node::drain) caught with the fault report's registers and code bytes. The two stall cases
+    # run until one fails or the deadline passes; windows-2025 runs the same loop beside it, so a
+    # run says whether the fault is aarch64's alone.
     strategy:
       fail-fast: false
       matrix:
         runner:
-          - ubuntu-24.04
-          - ubuntu-24.04-arm
-          - macos-15
-          - macos-15-intel
           - windows-2025
-          - windows-11-arm
     runs-on: ${{ matrix.runner }}
-    # A wait that never ends fails here, not at GitHub's six-hour default: twice the slowest gates
-    # job measured on main, the model job's rule (windows-2025, 31.9 min, the slowest of the last
-    # 12 green runs, 2026-10-02; one hung for 110 min on ubuntu-24.04-arm, run 37087273821, in
-    # hyper-liveness's processes test).
+    # The gates job's limit.
     timeout-minutes: 64
     steps:
       - uses: actions/checkout@v5
-      # The toolchain comes from rust-toolchain.toml, pinned exactly.
       - run: rustup show active-toolchain || rustup toolchain install
-      - run: bash scripts/gates.sh
+      - run: cargo test -p hyper-durable-e2e --test kill --locked --no-run
         shell: bash
-  miri:
-    # hyper-sim under Miri (docs/sim.md §9, S-1's gate): the crate has no `unsafe` and no platform
-    # code, so one OS suffices; Miri checks it keeps Rust's rules, and its isolation refuses the
-    # file, environment and entropy calls a simulation must not make inside a run.
-    runs-on: ubuntu-24.04
-    # Twice the job measured on main, the model job's rule (17.7 min, the slowest of the last 8
-    # green runs, 2026-10-02).
-    timeout-minutes: 36
-    steps:
-      - uses: actions/checkout@v5
-      # Miri is nightly-only, so it is installed here and not in rust-toolchain.toml; this is the
-      # nightly the suite was run on (9 min 20 s on the owner's machine, 2026-10-02).
-      - run: rustup toolchain install nightly-2026-09-05 --component miri --profile minimal
-      - run: cargo +nightly-2026-09-05 miri test -p hyper-sim --locked
-  model:
-    # The core's TLA+ model (docs/models/README.md): every configuration that passes, each at
-    # exactly the states it states, and every one the checker must refuse. TLC runs here only
-    # (CLAUDE.md §1, "Model checking"); one OS suffices, for the model is not the code.
-    runs-on: ubuntu-24.04
-    # The state bound is what bounds the work; this catches a checker that stopped making
-    # progress: twice the suite's measured time at one worker (docs/models/README.md).
-    timeout-minutes: 131
-    env:
-      TLA_TOOLS: ${{ github.workspace }}/target/tla
-      # The runner's four vCPUs (GitHub's standard Linux runner, public repository); a refused
-      # configuration runs with one whatever this says.
-      TLC_WORKERS: 4
-    steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-java@v6.0.1
-        with:
-          distribution: temurin
-          java-version: '21'
-      # tla2tools.jar v1.7.4; scripts/check-model.sh checks its SHA-256 whether it came from
-      # the cache or the release.
-      - uses: actions/cache@v6.1.0
-        with:
-          path: target/tla/tla2tools.jar
-          key: tla2tools-v1.7.4-936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88
-      - run: bash scripts/check-model.sh
+      # The deadline: the limit less the test build (3 min 3 s on windows-11-arm in run
+      # 37204898614), the checkout and toolchain, and a stall pair's longest run with room.
+      - run: |
+          deadline=$((SECONDS + 55 * 60))
+          i=0
+          while [ "$SECONDS" -lt "$deadline" ]; do
+            i=$((i + 1))
+            echo "== iteration $i at ${SECONDS}s"
+            if ! cargo test -p hyper-durable-e2e --test kill --locked -- stall-; then
+              echo "failed at iteration $i"
+              exit 1
+            fi
+          done
+          echo "no failure in $i iterations"
+        shell: bash

@@ -1853,6 +1853,13 @@ impl Connection {
         }
     }
 
+    /// The probe timeouts fired since the last acknowledgement, and the ack-eliciting packets in
+    /// flight on the current path: what a test of the loss-detection timer observes.
+    #[cfg(test)]
+    pub(crate) fn pto_state(&self) -> (u32, u64) {
+        (self.pto_count, self.path.in_flight.ack_eliciting)
+    }
+
     fn on_loss_detection_timeout(&mut self, now: Instant) {
         if let Some((_, pn_space)) = self.loss_time_and_space() {
             // Time threshold loss Detection
@@ -1875,6 +1882,12 @@ impl Connection {
             "PTO fired"
         );
 
+        // Nothing ack-eliciting in flight on this path and the peer's address validated: there is
+        // nothing to probe for and no deadlock to break (RFC 9002 §6.2.2.1), so no PTO is due.
+        if self.path.in_flight.ack_eliciting == 0 && self.peer_completed_address_validation() {
+            self.set_loss_detection_timer(now);
+            return;
+        }
         let count = match self.path.in_flight.ack_eliciting {
             // A PTO when we're not expecting any ACKs must be due to handshake anti-amplification
             // deadlock preventions
@@ -3599,6 +3612,12 @@ impl Connection {
         {
             self.timers.set(Timer::PathValidation, deadline);
         }
+        // The loss-detection timer was armed for the old path's in-flight packets; the new path
+        // starts with none counted, so arm it again for what this path has in flight. Left as it
+        // was, it fired against an empty count: a probe timeout counted (backing off the next) and
+        // an Initial-space probe asked for after the handshake. Upstream quinn-proto 0.11.18
+        // asserts there, and its server crashed on a rebinding in hyper-quic's e2e (macOS, Intel).
+        self.set_loss_detection_timer(now);
     }
 
     /// Handle a change in the local address, i.e. an active migration

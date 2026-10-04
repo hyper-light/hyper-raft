@@ -1795,6 +1795,64 @@ fn migration() {
     );
 }
 
+/// A NAT rebinding while the server has data in flight that the client never received: the
+/// server moves to the client's new address, and the loss-detection timer it had armed for the
+/// old path must not fire against the new path's empty in-flight count. Stock quinn-proto 0.11.18
+/// asserts there (`!peer_completed_address_validation()`); a server always has, so a stale timer
+/// counted a PTO and asked for an Initial-space probe after the handshake. RFC 9002 §6.2.2.1: with
+/// nothing ack-eliciting in flight and the peer's address validated, no PTO is armed.
+#[test]
+fn a_rebinding_leaves_no_stale_probe_timeout() {
+    let _guard = subscribe();
+    let mut pair = Pair::default();
+    let (client_ch, server_ch) = pair.connect();
+    pair.drive();
+    // Data from the server the client never receives: ack-eliciting in flight on the first path,
+    // and the server's loss-detection timer armed for it.
+    let s = pair.server_streams(server_ch).open(Dir::Uni).unwrap();
+    pair.server_send(server_ch, s).write(&[7u8; 4000]).unwrap();
+    pair.drive_server();
+    pair.client.inbound.clear();
+    let (ptos, in_flight) = pair.server_conn_mut(server_ch).pto_state();
+    assert_eq!(ptos, 0);
+    assert!(in_flight > 0, "the server's data is in flight");
+    // The client moves without saying so and pings from its new address, arriving once the
+    // server's loss-detection deadline has passed.
+    let deadline = pair.server.next_wakeup().unwrap();
+    pair.client.addr = SocketAddr::new(
+        Ipv4Addr::new(127, 0, 0, 1).into(),
+        CLIENT_PORTS.lock().unwrap().next().unwrap(),
+    );
+    pair.client_conn_mut(client_ch).ping();
+    pair.drive_client();
+    pair.time = pair.time.max(deadline) + pair.latency;
+    // The server reads the ping, and migrates, before its timer: the timer must have been
+    // re-armed for the new path, which has nothing ack-eliciting in flight.
+    pair.server.drive_incoming(pair.time, pair.client.addr);
+    pair.server.events_then_timeout(server_ch, pair.time);
+    assert_eq!(
+        pair.server_conn_mut(server_ch).remote_address(),
+        pair.client.addr,
+        "the server moved to the client's new address"
+    );
+    let (ptos, in_flight) = pair.server_conn_mut(server_ch).pto_state();
+    assert_eq!(in_flight, 0, "nothing was sent on the new path yet");
+    assert_eq!(
+        ptos, 0,
+        "no probe timeout fired against the new path's empty in-flight count"
+    );
+    // And the connection carries on: the data still reaches the client.
+    pair.drive();
+    let mut recv = pair.client_recv(client_ch, s);
+    let mut chunks = recv.read(true).unwrap();
+    let mut got = 0;
+    while let Ok(Some(chunk)) = chunks.next(usize::MAX) {
+        got += chunk.bytes.len();
+    }
+    let _ = chunks.finalize();
+    assert_eq!(got, 4000);
+}
+
 fn test_flow_control(config: TransportConfig, window_size: usize) {
     let _guard = subscribe();
     let mut pair = Pair::new(

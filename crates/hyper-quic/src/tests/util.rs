@@ -427,6 +427,17 @@ impl TestEndpoint {
         }
     }
 
+    /// Applies the events queued for connection `ch`, then its timeout at `now`: the order a
+    /// driver that reads its socket before its timers takes, which `drive_outgoing` reverses.
+    pub(super) fn events_then_timeout(&mut self, ch: ConnectionHandle, now: Instant) {
+        let events = self.conn_events.remove(&ch).unwrap_or_default();
+        let conn = self.connections.get_mut(&ch).unwrap();
+        for event in events {
+            conn.handle_event(event, self.endpoint.configs_mut());
+        }
+        conn.handle_timeout(now);
+    }
+
     pub(super) fn drive_outgoing(&mut self, now: Instant) {
         let buffer_size = self.endpoint.config().get_max_udp_payload_size() as usize;
         let mut buf = Vec::with_capacity(buffer_size);

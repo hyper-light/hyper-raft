@@ -9,6 +9,7 @@
 //!
 //! One thread per process, and one process per member: the harness never multiplies either.
 
+pub mod device;
 pub mod fault;
 pub mod node;
 pub mod parent;

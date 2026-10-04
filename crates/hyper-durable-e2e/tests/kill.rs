@@ -65,6 +65,7 @@ use std::time::{Duration, Instant};
 
 use hyper_durable_e2e::control::{self, Order, Point, Report};
 use hyper_raft::proto::ConfChangeType;
+use hyper_raft_e2e::device::{self, Probe};
 use hyper_raft_e2e::quiet::{self, Heard, Progress, Quiet, RTO, Stuck, Watch};
 use hyper_raft_e2e::wire::{self, Control, Kind, Op, Outcome};
 use hyper_raft_e2e::{run, stream};
@@ -104,6 +105,10 @@ struct Cluster {
     quiet: Quiet,
     /// Why the latest wait that gave up did.
     stuck: Option<Stuck>,
+    /// The test's own file on the members' device, flushed before a member is judged stuck.
+    probe: Probe,
+    /// When the device was last measured.
+    measured: Option<Instant>,
     /// Each member's latest report and when it came: what a failed wait prints.
     last: BTreeMap<u64, (Instant, Report)>,
     test: UdpSocket,
@@ -197,6 +202,10 @@ impl Cluster {
             voters: ids,
             quiet: Quiet::new(),
             stuck: None,
+            probe: Probe::new(
+                PathBuf::from(TMP).join(format!("durable-{}-{name}.probe", std::process::id())),
+            ),
+            measured: None,
             last: BTreeMap::new(),
             test,
             datagram,
@@ -485,8 +494,19 @@ impl Cluster {
         {
             Ok(()) => true,
             Err(stuck) => {
-                self.stuck = Some(stuck);
-                false
+                match device::reconsider(
+                    stuck,
+                    &self.probe,
+                    &mut self.measured,
+                    &mut self.quiet,
+                    Instant::now(),
+                ) {
+                    None => true,
+                    Some(stuck) => {
+                        self.stuck = Some(stuck);
+                        false
+                    }
+                }
             }
         }
     }

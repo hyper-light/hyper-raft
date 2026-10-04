@@ -21,6 +21,11 @@
 //!   the write is durable, a write that never ends would otherwise extend the watch for good, and
 //!   the timeout keeps the write judged as a member's thread held in it would be, by a look whose
 //!   ask waits that long for its answer.
+//! - **The device.** Before a member is judged held, the harness flushes its own file on the
+//!   members' device ([`crate::device::Probe`]) and states the flush's time ([`Quiet::device`]),
+//!   which joins what excuses a write: a write slower than any before it is a member's only if the
+//!   device answers the test's flush faster. A device that answers no flush within the kernel's
+//!   own bound has failed ([`Stuck::Device`]).
 //!
 //! The harnesses feed it what their looks saw ([`Quiet::look`]) and the asks they made
 //! ([`Quiet::asked`]); it reads no clock of its own.
@@ -142,6 +147,12 @@ pub enum Stuck {
         /// What the members' own measures excused.
         excuse: Duration,
     },
+    /// The members' device answered no flush of the test's own for `waited`, the kernel's own
+    /// bound on a flush ([`crate::device::FLUSH_BOUND`]): the device failed, not a member.
+    Device {
+        /// How long the test's flush was waited for.
+        waited: Duration,
+    },
 }
 
 impl std::fmt::Display for Stuck {
@@ -163,6 +174,10 @@ impl std::fmt::Display for Stuck {
             } => write!(
                 f,
                 "member {member} had a write out for {writing:?}, past a retransmission timeout and the {excuse:?} the members' longest write and the quiet period excuse"
+            ),
+            Self::Device { waited } => write!(
+                f,
+                "the members' device answered no flush of the test's for {waited:?}, the kernel's own bound on a flush"
             ),
         }
     }
@@ -200,6 +215,8 @@ pub struct Quiet {
     /// The longest one write any member has reported, nanoseconds.
     write_most: u64,
     stall: Duration,
+    /// The latest flush of the test's own on the members' device took this long ([`Quiet::device`]).
+    device: Duration,
     seen: Seen,
 }
 
@@ -240,6 +257,12 @@ impl Quiet {
     pub fn gone(&mut self, id: u64) {
         self.law.remove(&id);
         self.unanswered.remove(&id);
+    }
+
+    /// The test's own flush on the members' device took `took` ([`crate::device::Probe`]): a write
+    /// that long is the device's, not a member's.
+    pub fn device(&mut self, took: Duration) {
+        self.device = took;
     }
 
     /// The test ordered every member's device to answer no flush for `stall`: a silence that long
@@ -311,7 +334,7 @@ impl Quiet {
         }
         watch.unheard.extend(unheard.iter().copied());
         let period = self.period();
-        let excuse = period.saturating_add(self.write_most().max(self.stall));
+        let excuse = period.saturating_add(self.write_most().max(self.stall).max(self.device));
         let silent = self.silence(unheard, excuse);
         // Judged as a member's thread held in the write would be: its silence is counted less the
         // timeout a look's ask waits for its answer.
@@ -367,5 +390,85 @@ impl Quiet {
             }
         }
         silent
+    }
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::arithmetic_side_effects,
+    clippy::disallowed_methods,
+    clippy::disallowed_macros
+)]
+mod tests {
+    use super::*;
+
+    fn heard(id: u64, writing: Duration) -> Heard {
+        Heard {
+            id,
+            progress: Progress {
+                term: 1,
+                commit: 1,
+                applied: 1,
+                last_index: 1,
+                restarts: 0,
+                unjudged: 0,
+                judging: 0,
+            },
+            blocked_ns: 0,
+            writing_ns: u64::try_from(writing.as_nanos()).unwrap(),
+        }
+    }
+
+    /// A write out past the quiet period and the members' longest write is held; the same write
+    /// is excused once the test's own flush on the device took as long, and held again past that.
+    #[test]
+    fn the_devices_measured_flush_excuses_a_write_as_slow() {
+        let start = Instant::now();
+        let mut quiet = Quiet::new();
+        // One member, its law one second, its longest write 100 ms: the excuse is 1.1 s.
+        quiet.reported(1, Duration::from_secs(1), 100_000_000);
+        let mut watch = quiet.watch(start);
+        // A first look sets the member's progress; nothing is out yet.
+        assert!(
+            quiet
+                .look(&mut watch, start, start, &[heard(1, Duration::ZERO)], &[])
+                .is_ok()
+        );
+        // Its write out 2.2 s: past the 1.1 s excuse and the retransmission timeout.
+        let later = start + Duration::from_millis(10);
+        let held = quiet.look(
+            &mut watch,
+            later,
+            later,
+            &[heard(1, Duration::from_millis(2_200))],
+            &[],
+        );
+        assert!(
+            matches!(held, Err(Stuck::Held { member: 1, .. })),
+            "{held:?}"
+        );
+        // The device answered the test's flush in 2 s: the write is the device's.
+        quiet.device(Duration::from_secs(2));
+        let excused = quiet.look(
+            &mut watch,
+            later,
+            later,
+            &[heard(1, Duration::from_millis(2_200))],
+            &[],
+        );
+        assert!(excused.is_ok(), "{excused:?}");
+        // A write out past the device's time, the quiet period and the timeout is held again.
+        let held = quiet.look(
+            &mut watch,
+            later,
+            later,
+            &[heard(1, Duration::from_millis(4_100))],
+            &[],
+        );
+        assert!(
+            matches!(held, Err(Stuck::Held { member: 1, .. })),
+            "{held:?}"
+        );
     }
 }

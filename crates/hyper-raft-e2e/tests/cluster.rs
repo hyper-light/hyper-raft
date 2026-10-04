@@ -58,6 +58,7 @@ use std::{
 
 use hyper_raft::proto::{self, Entry};
 use hyper_raft_e2e::{
+    device::{self, Probe},
     node,
     quiet::{self, Heard, Progress, Quiet, RTO, Stuck, Watch},
     run,
@@ -126,6 +127,10 @@ struct Cluster {
     quiet: Quiet,
     /// Why the latest wait that gave up did.
     stuck: Option<Stuck>,
+    /// The test's own file on the members' device, flushed before a member is judged stuck.
+    probe: Probe,
+    /// When the device was last measured.
+    measured: Option<Instant>,
     test: UdpSocket,
     /// The most bytes the test's socket sends in one datagram ([`wire::largest`]).
     datagram: usize,
@@ -202,6 +207,10 @@ impl Cluster {
             room,
             quiet: Quiet::new(),
             stuck: None,
+            probe: Probe::new(
+                PathBuf::from(TMP).join(format!("e2e-{}-{name}.probe", std::process::id())),
+            ),
+            measured: None,
             test,
             datagram,
             next_id: 0,
@@ -418,6 +427,15 @@ impl Cluster {
             .quiet
             .look(watch, looked, Instant::now(), &heard, &unheard)
         else {
+            return true;
+        };
+        let Some(stuck) = device::reconsider(
+            stuck,
+            &self.probe,
+            &mut self.measured,
+            &mut self.quiet,
+            Instant::now(),
+        ) else {
             return true;
         };
         // What the group was when it was judged stuck, and what it says a look later, for the

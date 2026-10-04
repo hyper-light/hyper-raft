@@ -1516,7 +1516,19 @@ hyper-raft-e2e's had, each failing on CI once in a way a re-run passed:
   the quiet period ends the wait, named (`Stuck::Held`), as a silent one does, its write's time
   counted less the timeout a look waits for an answer, as a silent member's silence is: on CI's
   windows-2025 every member of a fresh group had its first writes out 1.0–1.3 s while the longest
-  any had finished took 154 ms, which the bound without the timeout called held. A fact no longer
+  any had finished took 154 ms, which the bound without the timeout called held. The members' longest
+  write is learned only from writes that finished, so the first write a busy device slows past
+  every one before it was still called held: at load averages of 50 to 100, other processes' builds
+  on the same disk, `stalled-devices` failed once in twenty with all three members' writes out
+  2.1 s together against a 97 ms longest write (2026-10-04, before any hold), and once with a
+  follower's write out 9.0 s past its 7 s hold. A slow device and a stuck member look alike to that
+  rule and not to the device: before a member is judged silent or held, the test flushes a file of
+  its own on the members' device with their flush (`hyper_raft_e2e::device::Probe`) and its time
+  joins the excuse, so a write is the member's only if the device answers the test faster. The
+  test's stalls are made inside a member's process (`FaultFile`), so an injected stall still fails
+  named; a device that answers no flush of the test's within the kernel's own bound on a flush, 60 s
+  (Linux's SCSI disk driver: `SD_TIMEOUT` 30 s × `SD_FLUSH_TIMEOUT_MULTIPLIER` 2; its NVMe driver's
+  `nvme_io_timeout`, 30 s), has failed, and the wait says so (`Stuck::Device`). A fact no longer
   holds of a member that did not answer: the stalled member's suspicion and a restart's report were
   true of a look that heard no one. `stalled-devices` (the leader's disk stalled, the survivors'
   devices held the quiet period and two looks' timeouts, 7 s, as they elect, once every pair is

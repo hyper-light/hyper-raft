@@ -66,6 +66,14 @@ worked around.
   Member 1 was stopped. Member 2, at term 5, suspected it, with a longest write of 597 ms. The two
   members up took no write within the 2.88 s the test excuses. Member 3's report is not in the
   failure's output.
+- **hyper-durable-e2e `kill` `stall-leader`, windows-11-arm CI (`01aaeb7` on `diag-quic-tls`, run
+  37184084685; the branch changes hyper-quic and hyper-tls only).** Member 1's process ended with
+  exit code `0xc0000005`, Windows' access violation, a second after its last report. It was a
+  follower at term 1, commit 5, with a write out 1.3 s all told. Safe Rust does not end this way:
+  the cause is in `unsafe` code or what it calls. The suspects are the Windows interfaces on the
+  members' path: the receive stamps (`WSARecvMsg` and its control messages, `dc42e0e`) and hyper-block's
+  `threads` and `node` modules. The same scenario passed on the same target in run 37181616582 an
+  hour before. Open: which call, and the invariant it breaks.
 
 ## Consumers
 

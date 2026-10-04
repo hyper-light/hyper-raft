@@ -95,6 +95,9 @@ impl StateMachine for RangeMachine {
     fn image(&mut self, _: &mut Vec<u8>) -> Result<(Point, ConfState), Fatal> {
         Err(Fatal("the run compacts nothing"))
     }
+    fn image_bytes(&self) -> Option<u64> {
+        None
+    }
     fn install(&mut self, _: &[u8], _: Point, _: &ConfState) -> Result<(), Fatal> {
         Err(Fatal("the run compacts nothing"))
     }

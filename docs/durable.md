@@ -599,10 +599,50 @@ Every hold has a bound derived from a quantity the system already has:
 | Reads | the core's read bounds (rounds are the core's since F43; the shell keeps none) | core `Limits` |
 | Inputs while a write is out | none held: the core steps them | R-4 |
 | Inputs while stalled for room | none held: refused `Stalled`, as the network may drop them, and retried by Raft (thesis §3.3: messages may be lost) | — |
+| Applied entries the log holds, for an owner that compacts when due | the image it was last compacted to times the owner's expansion, twice that while a leader waits for a member that lacks them, and the entry that crossed it | Ongaro's thesis §5.1.2 and slates' wait (§6.1, R22) |
 
 Memory is reserved before a transition from the owner's budget (focal's R28): an operation whose
 reservation is refused changes nothing. The budget is a trait; mantle's and slates' owners pass one
 that admits all, and the reservation then costs nothing on their paths (measured in §12).
+
+### 6.1 When to compact (R22)
+
+The owner compacts a group's log (`Replica::compact`), and the shell says when it is due
+(`Replica::compaction_due`): by the rule of Ongaro's thesis (§5.1.2, "When to snapshot", pp.
+54–55), once the applied entries it holds exceed the image it was last compacted to times an
+expansion factor the owner states (`Compaction`). The thesis weighs the previous image because the
+next one's size is unknown until it is written. The factor trades the disk's bandwidth for its
+room: at `e`, an image is written for every `e` times its bytes of log, a share of `1/(1+e)` of what
+the group writes, and the disk holds about `2 + e` images' worth at the most (the image in force,
+the log `e` times it, and the image being written; the thesis's example is 4, a fifth of the
+bandwidth and six times the state). slates states one. The owner knows what its disk and its
+machine's images cost; zero makes a log due whenever it holds anything applied.
+
+What is counted is the applied entries past the log's start, in the bytes the core counts an entry
+(`EntryRef::encoded_bytes`, the wire's: what sending them to a member costs, against sending the
+image). The count is kept as entries apply, and walked again from the log at open and once a
+compaction's start is durable (`Replica::compactable_bytes`); an install starts it at the image's
+point as it is written. A compaction's start the log refuses changes nothing, and the log stays due
+for the owner to ask again (§2.4). The image is the one the shell made at its last compaction (the
+snapshot it serves members behind the start), the one it installed, or at open, the image of what
+the member opened with: the one it prepares when the log was compacted before, else the machine's
+word (`StateMachine::image_bytes`), so that a group formed holding state, as a range split from
+another is, is weighed against that state and not against nothing. A machine that keeps no image is
+never due.
+
+A leader waits while a member lacks what it applied, as long as the log holds no more than twice the
+threshold. slates measured a leader that compacted the moment a majority held its entries: it sent
+the third voter of three a whole image in place of the round it lacked, at every compaction, so
+that the third never compacted itself (slates `fold.rs`, 2026-09-28; `docs/benchmarks.md`, "When a
+log is compacted (R22)", reproduces it here). Past twice the threshold the log is due: a member that
+far behind, or gone, takes the image and cannot pin the log, which holds at most `2e` images' worth
+of applied entries beside what is not yet applied. While a start is out (a compaction or an install
+under way) the log is not due, as `compact` waits for it.
+
+A state machine whose state is on disk makes a new image as it applies (thesis §5.2), and its log
+could go as soon as what it applied is durable. Here each compaction prepares the image a member
+behind the start is sent, and the rule bounds what those cost. The rule is the owner's to follow:
+one that compacts for room (§2.4), or on its own schedule, may.
 
 ## 7. Threading and ownership
 
@@ -721,6 +761,8 @@ pub trait StateMachine {
     fn acts_at_start(&self, entry: &Entry) -> bool;
     fn image(&mut self, at: Point) -> Result<ImageSource, Fatal>;
     fn install(&mut self, image: ImageSink, at: Point) -> Result<(), Fatal>;
+    /// The bytes `image` would write now, or none for a machine that keeps no image (§6.1).
+    fn image_bytes(&self) -> Option<u64>;
 }
 
 pub struct Replica<L: LogStore, M: StateMachine, B: Budget = Unbounded> { /* core, writes out, C_d */ }
@@ -746,6 +788,8 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
     pub fn drive(&mut self, now_ns: u64, waker: &Waker, out: &mut Output<M::Answer>)
         -> Result<Driven, ReplicaError>;
     pub fn compact(&mut self, keep: u64) -> Result<(), ReplicaError>;
+    /// Whether the log is due to be compacted by the owner's rule (§6.1).
+    pub fn compaction_due(&self, rule: Compaction) -> bool;
 }
 ```
 
@@ -914,12 +958,14 @@ and allocates no more on that project's workload.
 - **`StateMachine`** (`src/machine.rs`) applies an `EntryRef`, borrowed, with no copy, and each
   change with the change its entry stated (its context among it); its `durable` point carries its
   term (§4.3); `image` (with the configuration held at its point, §2.3), `install` (durable
-  before it returns) and `persist` are its snapshot and compaction.
+  before it returns) and `persist` are its snapshot and compaction, and `image_bytes` what its
+  image would take, against which a log never compacted is weighed (§6.1).
 - **`Replica`** (`src/replica.rs`): `open`, `step`, `suspect`, `trust`, `restarted`,
   `set_timing`, `set_carriage` (the window a leader keeps in flight to a member, `docs/raft.md`
   §3.2, R16), `deadline`, `campaign`, `propose`, `propose_fast`, `change`, `catch_up` (where
   catching up a learner stands, for its owner to promote it, R13), `read`, `transfer`,
-  `report_unreachable`, `report_snapshot`, `drive`, `compact`, `resume`, `held`, `release`;
+  `report_unreachable`, `report_snapshot`, `drive`, `compact`, `compaction_due` and
+  `compactable_bytes` (the thesis's compaction rule, §6.1, R22), `resume`, `held`, `release`;
   the owner's policy, `set_priority` and `set_inflight_bytes` (the core's, as focal's owners set
   them from placement and from what a path carries, a window stated outright where `set_carriage`
   derives it); what the owner reads to admit and account, `reads_held` (reads confirmed that wait
@@ -960,7 +1006,8 @@ Tests (`crates/hyper-durable/tests`):
 - `sim.rs`: five shapes (three voters at depth three with a durable state machine; at depth two
   with a replayed one; a control group, every entry acted on at start; a leader applying before its
   write is durable, its disk the slowest; five voters at depth one), 128 seeds of 5,000 steps each
-  by default, with refusals, failed writes, crashes, compactions and changes; and a crash after
+  by default, with refusals, failed writes, crashes, compactions and changes, and after every step
+  the compaction rule's count of each live member against a walk of its log (§6.1); and a crash after
   every step of a schedule that did something, in turn (`a_crash_after_every_durability_event_loses_nothing_durable`).
   Members elect by suspicion: a tenth of the steps are a detector's word about a peer (right nine
   in ten of a member that is down, wrong one in ten of one that is up), the clock moves a
@@ -980,6 +1027,8 @@ Tests (`crates/hyper-durable/tests`):
   the log past the state machine (I8), so that a member stopped there would not open; fixed in
   `make_again`, test `a_write_made_again_never_starts_the_log_past_the_state_machine`. It is in
   `main`'s shell; R-3's out-of-order acknowledgement (R17) changed the schedules that reach it.
+  With the compaction rule's count checked at every step (R22), soaked again at 1,000 seeds a
+  shape and the crash after every event at 64 seeds.
 - `directed.rs`: mantle's four cases and focal's two, on hyper-log over simulated devices with the
   power cut at each write and flush in turn, both ways of taking readies. The founder campaigns on
   its owner's word; the members are given their timing once it leads, as no span is chosen before

@@ -32,7 +32,7 @@
 > timer, which their siblings found, are fixed; the window a member is sent ahead of its answers is
 > one rule from focal's and slates' (R16); a member keeps what arrives ahead of a hole and
 > acknowledges it with the write that holds it (R17); a learner is caught up in rounds before it is
-> promoted (R13).
+> promoted (R13); a log is due for compaction by the thesis's rule, the shell's policy (R22).
 
 ## 1. What `hyper-raft` is
 
@@ -414,6 +414,15 @@ voters 1, 2 and 3 hold forty entries, member 4 joins empty and voter 3 fails, tw
 and one out at a time as slates' drive sent them. Added directly, the group cannot commit for 45
 rounds while 4 catches up (a round here carries messages one way; slates counted 21 round trips);
 staged first, it commits in the first round trip after the loss, as slates measured.
+
+**When a log is compacted (R22).** The shell's policy, not the core's (`docs/durable.md` §6.1): a
+log is due once the applied entries it holds exceed the image it was last compacted to times the
+owner's expansion factor (Ongaro's thesis §5.1.2), and a leader waits for a member that lacks what
+it applied while the log holds no more than twice the threshold, reading the member's progress from
+the tracker (slates `fold.rs`). slates measured a leader that compacted the moment a majority held
+its entries sending its third voter an image at every compaction; replayed on the shell, three
+images against none at the same three compactions (`docs/benchmarks.md`, "When a log is compacted
+(R22)").
 
 ### 3.3 Where this core and raft-rs differ
 

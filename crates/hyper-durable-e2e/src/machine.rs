@@ -134,6 +134,10 @@ impl StateMachine for Kv {
         Err(Fatal("this store keeps no snapshots"))
     }
 
+    fn image_bytes(&self) -> Option<u64> {
+        None
+    }
+
     fn install(&mut self, _: &[u8], _: Point, _: &ConfState) -> Result<(), Fatal> {
         Err(Fatal("this store keeps no snapshots"))
     }

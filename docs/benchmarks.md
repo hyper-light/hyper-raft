@@ -1070,6 +1070,55 @@ two to a round trip, where slates' round took its reply at once.
 | added directly as a voter | 45 (22½ round trips) | 21 round trips |
 | caught up as a learner first (`RawNode::catch_up`), then promoted | 2 (one round trip) | 1 |
 
+## When a log is compacted (R22)
+
+Core step R-3's sixth commit (`crates/hyper-durable/ORIGIN.md`, "R22"; `docs/durable.md` §6.1), in
+the shell: the core is unchanged, and so are its counting runs and schedules. Measured on
+2026-10-03 on the machine above, load 6.9–7.2; what follows is counted, not timed, and every run
+counts the same.
+
+**slates' finding** (`a_leader_that_waits_for_its_followers_sends_them_entries_not_images`,
+`tests/shell.rs`): a leader of three whose third voter takes each round a round behind the
+majority, its window (eight appends) less than a round of sixteen entries of eight bytes, through
+twelve rounds; expansion one, on a state that keeps every entry, so that the image grows with what
+was applied. slates measured the same on its council (`fold.rs`, 2026-09-28).
+
+| Compaction | Rounds compacted | Images sent to the third voter | slates |
+|---|---|---|---|
+| by the rule, which waits for the third while the log holds less than twice the threshold | 2, 5 and 11 | 0 | none |
+| at the same rounds, the moment the majority holds them | 2, 5 and 11 | 3 | one at every compaction, and the third never compacted itself |
+
+**A long history** (`a_sole_voter_that_compacts_when_due_holds_its_log_within_the_rule`, slates'
+`measure_a_long_council_history`): a sole voter proposes one entry of eight bytes at a time and
+compacts whenever the rule says it is due; checked after every proposal, its log never holds more
+than the expansion times its image and the entry that crossed it. Without compaction it holds every
+entry, 33 bytes each. Two states: one that keeps every entry (its image grows with the log, as
+slates' configuration grew), and one that keeps one value (a register's: its image stays 40 bytes).
+
+| State | Expansion | Proposals | Entries held at the end | Bytes held | Image | Compactions | Image bytes written | Entry bytes written |
+|---|---|---|---|---|---|---|---|---|
+| every entry | 1 | 250 | 0 | 0 | 8,032 | 8 | 16,128 | 8,283 |
+| every entry | 1 | 1,000 | 25 | 825 | 31,232 | 10 | 63,200 | 33,033 |
+| every entry | 1 | 4,000 | 213 | 7,029 | 121,216 | 12 | 245,952 | 132,033 |
+| every entry | 4 | 250 | 11 | 363 | 7,680 | 4 | 9,632 | 8,283 |
+| every entry | 4 | 1,000 | 761 | 25,113 | 7,680 | 4 | 9,632 | 33,033 |
+| every entry | 4 | 4,000 | 2,830 | 93,390 | 37,472 | 5 | 47,104 | 132,033 |
+| one value | 1 | 250 | 1 | 33 | 40 | 125 | 5,000 | 8,283 |
+| one value | 1 | 1,000 | 1 | 33 | 40 | 500 | 20,000 | 33,033 |
+| one value | 1 | 4,000 | 1 | 33 | 40 | 2,000 | 80,000 | 132,033 |
+| one value | 4 | 250 | 4 | 132 | 40 | 50 | 2,000 | 8,283 |
+| one value | 4 | 1,000 | 4 | 132 | 40 | 200 | 8,000 | 33,033 |
+| one value | 4 | 4,000 | 4 | 132 | 40 | 800 | 32,000 | 132,033 |
+
+- **One value**: the log is bounded whatever the history, and the images are the thesis's share of
+  what is written: at four, 32,000 of 164,033 bytes, 19.5 % (the thesis: about 20 %); at one,
+  37.7 %, against a half, for a compaction waits for the entry that crosses the threshold.
+- **Every entry**: each image holds the whole history, so the compactions come as it doubles at
+  one (twelve by 4,000), and the images written are about twice the entries; at four they are a
+  third of them. This is the thesis's trade where the state grows as fast as the log.
+- **The schedules**: `tests/sim.rs`'s five shapes reach the same counts at 128 seeds a shape with
+  the rule's count checked after every step as without it; the check held at 1,000 seeds a shape.
+
 ## Where hyper-raft does not win, and why
 
 hyper-raft in place allocates less than every other core in every row. It is faster than raft-rs
@@ -1392,6 +1441,13 @@ HYPER_RAFT_TIMED_AHEAD=refused HYPER_RAFT_TIMED_SEEDS=1 HYPER_RAFT_TIMED_STREAM_
 # A learner caught up in rounds (R13): the counting runs and the schedules as above; the replay of
 # Figure 4.4(a) is a unit test.
 cargo test -p hyper-raft --lib a_staged_newcomer_leaves_no_availability_gap_where_a_direct_one_does
+
+# When a log is compacted (R22): slates' finding and the long history, from the shell's tests; the
+# simulation with the rule's count checked after every step, at 1,000 seeds a shape.
+cargo test -p hyper-durable --test shell -- --nocapture --test-threads=1 \
+  a_leader_that_waits_for_its_followers_sends_them_entries_not_images \
+  a_sole_voter_that_compacts_when_due_holds_its_log_within_the_rule
+HYPER_DURABLE_SEEDS=1000 cargo test -p hyper-durable --test sim -- --nocapture random_schedules
 
 # The end-to-end scenarios, and every gate.
 cargo test -p hyper-raft-e2e --test cluster

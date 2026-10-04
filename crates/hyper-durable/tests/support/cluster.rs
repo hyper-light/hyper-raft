@@ -31,7 +31,9 @@ use std::collections::{BTreeMap, VecDeque};
 use std::task::Waker;
 use std::time::Duration;
 
-use hyper_durable::{Cause, Fault, Output, Point, Replica, ReplicaError, Settings, Unbounded};
+use hyper_durable::{
+    Cause, EntryRef, Fault, Output, Point, Replica, ReplicaError, Settings, Unbounded,
+};
 use hyper_raft::proto::{
     ConfChangeSingle, ConfChangeTransition, ConfChangeType, ConfChangeV2, ConfState, Message,
     MessageType,
@@ -337,6 +339,7 @@ impl Cluster {
             }
         };
         self.check_start();
+        self.check_compactable();
         did
     }
 
@@ -728,6 +731,45 @@ impl Cluster {
                     self.reached.committed += 1;
                 }
             }
+        }
+    }
+
+    /// The compaction rule's count for every live member with no start out (R22,
+    /// `docs/durable.md` §6.1): what it kept as it applied, compacted and installed is what a walk
+    /// of its log counts, the applied entries past the start, where the store holds them and,
+    /// past them, where the core does. A start out, or an install the core holds not yet
+    /// durable (one refused waits to be made again), moves the start the count is from.
+    fn check_compactable(&self) {
+        for node in &self.nodes {
+            let Some(r) = &node.replica else {
+                continue;
+            };
+            let store = r.core().store().log();
+            if store.start_out() || r.core().raft.log().unstable().snapshot().is_some() {
+                continue;
+            }
+            let log = store.answered();
+            let applied = r.applied().index;
+            let unstable = r.core().raft.log().unstable().entries();
+            let tail = unstable.first().map_or(u64::MAX, |e| e.index);
+            let bytes = |e: &hyper_raft::proto::Entry| EntryRef::of(e).encoded_bytes();
+            let held: u64 = log
+                .entries
+                .iter()
+                .filter(|e| e.index > log.start.index && e.index <= applied && e.index < tail)
+                .map(bytes)
+                .sum::<u64>()
+                + unstable
+                    .iter()
+                    .filter(|e| e.index > log.start.index && e.index <= applied)
+                    .map(bytes)
+                    .sum::<u64>();
+            assert_eq!(
+                r.compactable_bytes(),
+                held,
+                "member {}: what the rule counts against a walk of the log, applied {applied}",
+                node.id
+            );
         }
     }
 

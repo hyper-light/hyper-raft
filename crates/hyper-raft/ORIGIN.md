@@ -972,3 +972,13 @@ them. slates is read at `ec5e0df` (its `main`, 2026-10-03).
 - **Measured** (`docs/benchmarks.md`, "A learner caught up in rounds (R13)"): Figure 4.4(a)
   replayed, 45 rounds without a commit after the loss with the newcomer added directly against one
   round trip staged (slates: 21 round trips against one).
+
+### R22: when a log is compacted, the shell's policy
+
+- **The rule** is the shell's (`crates/hyper-durable/ORIGIN.md`, "R22"; `docs/durable.md` §6.1):
+  Ongaro's thesis §5.1.2, a log due once its applied entries exceed the image it was last compacted
+  to times the owner's expansion factor, with slates' wait for a member that lacks what its leader
+  applied while the log holds no more than twice the threshold (slates `fold.rs`). The core is
+  unchanged: the shell reads the members' progress from the tracker.
+- **Measured**: slates' 2026-09-28 finding replayed on the shell, three images against none at the
+  same three compactions (`docs/benchmarks.md`, "When a log is compacted (R22)").

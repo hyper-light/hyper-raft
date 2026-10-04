@@ -49,6 +49,7 @@ use hyper_raft::{
 use hyper_timing::{Ballot, Flushes, Span, Trust, inflight_window};
 
 use crate::budget::{Budget, Unbounded};
+use crate::compaction::Compaction;
 use crate::held::Held;
 use crate::machine::{Fatal, StateMachine};
 use crate::store::{Entries, EntryRef, Fault, Health, LogStore, Point, Write};
@@ -230,8 +231,9 @@ enum Kind {
     Ready(u64),
     /// The commit alone.
     Commit,
-    /// A compaction's start.
-    Start,
+    /// A compaction's start, and the bytes of the image it was made with: what the compaction
+    /// rule weighs the log against once the start is durable ([`Compaction`]).
+    Start(u64),
 }
 
 /// Where a write is.
@@ -292,6 +294,14 @@ pub struct Replica<L: LogStore, M: StateMachine, B: Budget = Unbounded> {
     logged_commit: u64,
     /// The last entry applied.
     applied: Point,
+    /// The bytes of the applied entries the log holds past its start, as the core counts an
+    /// entry's ([`EntryRef::encoded_bytes`]): what a compaction frees, and what the compaction
+    /// rule weighs ([`Compaction`]).
+    compactable: u64,
+    /// The bytes of the image the log was last compacted to: the one this member made or
+    /// installed, or at open, the image of what it opened with; none from a machine that keeps
+    /// no image.
+    imaged: Option<u64>,
     /// What the core was last told was applied.
     told_applied: u64,
     /// The index of the entry that made the configuration.
@@ -400,6 +410,8 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
             issued: view.hard_state,
             logged_commit: view.hard_state.commit,
             applied: durable,
+            compactable: 0,
+            imaged: None,
             told_applied: durable.index,
             conf_index: durable.index,
             fence: None,
@@ -415,13 +427,21 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
             writes_made: Writes::default(),
             flushed: None,
         };
-        // A log compacted before the restart serves a lagging member only by snapshot.
-        if view.start.index > 0 {
-            replica.prepare().map_err(|e| match e {
+        // A log compacted before the restart serves a lagging member only by snapshot, and its
+        // image is what the compaction rule weighs the log against; a log never compacted is
+        // weighed against the image of what the member opened with, as its machine states it.
+        replica.imaged = if view.start.index > 0 {
+            let prepared = replica.prepare().map_err(|e| match e {
                 ReplicaError::Fenced(Cause::Machine(fatal)) => OpenError::Machine(fatal),
                 _ => OpenError::Core(hyper_raft::Error::Invariant("a snapshot at open")),
             })?;
-        }
+            Some(prepared)
+        } else {
+            replica.machine.image_bytes()
+        };
+        replica.compactable = replica
+            .compactable_after(view.start.index)
+            .map_err(|e| OpenError::Core(hyper_raft::Error::Storage(e)))?;
         replica.settle();
         Ok(replica)
     }
@@ -1198,10 +1218,17 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
             self.logged_commit = self.logged_commit.max(commit);
         }
         let Kind::Ready(number) = write.kind else {
-            if write.kind == Kind::Start
-                && let Some(stall) = self.stall.as_mut()
-            {
-                stall.freed = true;
+            if let Kind::Start(imaged) = write.kind {
+                // The log starts past what it compacted only now: a start refused changed
+                // nothing, and is the owner's to ask again (`Replica::make_again`).
+                self.imaged = Some(imaged);
+                let start = self.node.store().log.bounds().map(|(start, _)| start.index);
+                let held = start.and_then(|start| self.compactable_after(start));
+                self.compactable =
+                    held.map_err(|e| self.fence(Cause::Core(hyper_raft::Error::Storage(e))))?;
+                if let Some(stall) = self.stall.as_mut() {
+                    stall.freed = true;
+                }
             }
             return self.tell_durable_commit();
         };
@@ -1553,6 +1580,14 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
     fn installed(&mut self, point: Point) {
         self.applied = point;
         self.conf_index = point.index;
+        // The log starts at the image's point, holding nothing applied past it.
+        self.compactable = 0;
+        self.imaged = self
+            .node
+            .store()
+            .snapshot
+            .as_ref()
+            .map(|s| bytes(s.data.len()));
         if self.fence.take().is_some() {
             self.paged = false;
             self.node.resume_apply();
@@ -1695,6 +1730,7 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
             node,
             machine,
             applied,
+            compactable,
             page,
             drive_applied,
             ..
@@ -1717,6 +1753,8 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
                 return true;
             }
             *drive_applied = drive_applied.saturating_add(bytes);
+            // Applied from here, or failed, which fences the replica: it counts afresh at open.
+            *compactable = compactable.saturating_add(bytes);
             if entry.changes_configuration() {
                 stop = match change_of(&entry) {
                     Ok(change) => Stop::Change(point_of(&entry), change),
@@ -1837,8 +1875,8 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
     /// Prepares the snapshot the core serves to members behind the log's start: the state
     /// machine's image, with the configuration the group held at its point. Not the
     /// configuration applied since: a member installing it applies the changes after the
-    /// image's point from the log, each once.
-    fn prepare(&mut self) -> Result<(), ReplicaError> {
+    /// image's point from the log, each once. Its bytes.
+    fn prepare(&mut self) -> Result<u64, ReplicaError> {
         let mut data = Vec::new();
         let imaged = self.machine.image(&mut data);
         let (point, configuration) = self.machine_did(imaged)?;
@@ -1850,8 +1888,9 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
                 term: point.term,
             }),
         };
+        let imaged = bytes(snapshot.data.len());
         self.node.store_mut().snapshot = Some(snapshot);
-        Ok(())
+        Ok(imaged)
     }
 
     /// Makes the state machine's applied state durable and lets the log free what is before it,
@@ -1876,6 +1915,8 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
             }
             let term = r.node.store().log.term(index);
             let term = term.map_err(|e| r.fence(Cause::Core(hyper_raft::Error::Storage(e))))?;
+            // The image a member behind the new start is sent, ready before the start moves.
+            let imaged = r.prepare()?;
             // The log is compacted only through what it states committed, stated with it.
             let hard = (index > r.issued.commit).then_some(HardState {
                 commit: index,
@@ -1893,7 +1934,7 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
             }
             r.writes_made.starts = r.writes_made.starts.saturating_add(1);
             r.writes.push_back(Out {
-                kind: Kind::Start,
+                kind: Kind::Start(imaged),
                 state,
                 messages: Vec::new(),
                 commit: hard.map(|h| h.commit),
@@ -1901,9 +1942,71 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
                 start: true,
                 submitted: now,
             });
-            r.prepare()?;
             Ok(true)
         })
+    }
+
+    /// Whether the log is due to be compacted by `rule` ([`Compaction`], Ongaro's thesis §5.1.2),
+    /// for the owner to compact with [`Replica::compact`], keeping nothing: the applied entries it
+    /// holds weighed against the image it was last compacted to, and while this member leads, a
+    /// member that lacks what it applied waited for as long as the log holds no more than twice
+    /// the threshold. A machine that keeps no image is never due.
+    pub fn compaction_due(&self, rule: Compaction) -> bool {
+        let Some(image) = self.imaged else {
+            return false;
+        };
+        // A start out is a compaction or an install under way, and [`Replica::compact`] waits
+        // for it.
+        if self.writes.iter().any(|w| w.start) {
+            return false;
+        }
+        let raft = &self.node.raft;
+        let id = raft.id();
+        let applied = self.applied.index;
+        let lagging = raft.state() == StateRole::Leader
+            && raft
+                .tracker()
+                .iter()
+                .any(|(member, progress)| member != id && progress.matched < applied);
+        rule.due(self.compactable, image, lagging)
+    }
+
+    /// The bytes of the applied entries the log holds past its start, as the core counts an
+    /// entry's: what [`Replica::compaction_due`] weighs. A compaction counts once its start is
+    /// durable; an install, as it is written.
+    pub fn compactable_bytes(&self) -> u64 {
+        self.compactable
+    }
+
+    /// The bytes of the applied entries the log holds past `after`, as the core counts them:
+    /// those the store holds, and a leader's own past them, applied before its write is durable
+    /// (`Config::apply_unpersisted`), where the core holds them. An install not yet durable
+    /// starts the log at its point, and what the store holds before it is not counted.
+    fn compactable_after(&self, after: u64) -> Result<u64, StorageError> {
+        let end = self.applied.index.saturating_add(1);
+        let unstable = self.node.raft.log().unstable();
+        let after = unstable
+            .snapshot()
+            .map_or(after, |s| after.max(proto::snapshot_index(s)));
+        let first = after.saturating_add(1);
+        let held = self.node.store();
+        let unstable = unstable.entries();
+        let tail = unstable.first().map_or(u64::MAX, |e| e.index);
+        let mut bytes = 0u64;
+        if first < end.min(tail) {
+            held.log
+                .visit(first, end.min(tail), held.page, &mut |entry| {
+                    bytes = bytes.saturating_add(entry.encoded_bytes());
+                    false
+                })?;
+        }
+        for entry in unstable
+            .iter()
+            .filter(|e| e.index >= first && e.index < end)
+        {
+            bytes = bytes.saturating_add(EntryRef::of(entry).encoded_bytes());
+        }
+        Ok(bytes)
     }
 }
 

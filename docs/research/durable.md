@@ -275,3 +275,34 @@ shared memory before any reply (`retention.rs`). Cost linear in the record, abou
 70 µs at 1,000 entries, 3.1 ms at 50,000 (`docs/wip/BENCHMARKS.md`, 2026-10-01); bounded by the
 thesis's compaction rule; delta publication measured and rejected at its sizes. Durable across a
 daemon crash, not a power loss.
+
+## 7. When to compact
+
+**Ongaro, dissertation, §5.1.2, "When to snapshot" (pp. 54–55)**, as mantle's
+`docs/research/06-consensus-and-metadata.md` §A1.6 read it and slates' `fold.rs` quotes it:
+"Servers take a snapshot once the size of the log exceeds the size of the previous snapshot times
+a configurable expansion factor." The previous snapshot stands in for the next, whose size is
+unknown until it is taken. The factor trades disk bandwidth for room: at 4, about 20 % of the
+disk's bandwidth goes to snapshots and about six times the state's size is on disk (the old
+snapshot, a log four times it, the new one being written). **§5.2 (pp. 57–58)**, disk-based state
+machines: "Applying each entry from the Raft log mutates the on-disk state and effectively arrives
+at a new snapshot. Thus, once an entry is applied, it can be discarded from the Raft log", once its
+writes reach disk; a snapshot is then needed only to send the state to slow or new followers.
+
+**slates `crates/cluster/src/fold.rs` (`ec5e0df`).** The rule with a factor of one (slates is held
+in RAM, and its factor trades only against the publication re-encoded before every reply), applied
+on every member after each apply. A leader waits for its followers: past the threshold it compacts
+only once every follower holds what it applied (`replicated_through`: the least match among its
+replication targets while it leads), while the log stays within twice the threshold
+(`HELD_FOR_FOLLOWERS`, "the rule's one, plus one for the follower still taking them"). Measured
+2026-09-28 (`docs/wip/BENCHMARKS.md`, "Consensus log compaction and bounded replication"):
+compacting the moment a majority committed sent the follower one round behind the whole snapshot
+in place of the entry it lacked, at every compaction, and the third voter of three never compacted
+itself; a sole voter's retained bytes fell from 5,708 to 3,182 at 250 changes, 22,583 to 9,601 at
+1,000 and 90,083 to 45,607 at 4,000 (log entries 251 to 67, 1,001 to 100, 4,001 to 928), the
+configuration itself still growing.
+
+Left open by both: the thesis states the rule for one server's own snapshot and says nothing of a
+leader's followers, whose wait slates measured and states; "the size of the log" is the disk's,
+where hyper-durable counts the wire's bytes an entry (`ENTRY_FIXED_BYTES` and its context and
+data), within a constant an entry of a store's own record.

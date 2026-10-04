@@ -1,12 +1,15 @@
 # Simulation and checking: `hyper-sim` and `hyper-check`
 
-> Status (2026-10-02): **S-1 built** (`crates/hyper-sim`: the generator and named streams, time and
+> Status (2026-10-04): **S-1 built** (`crates/hyper-sim`: the generator and named streams, time and
 > node clocks, the world under both disciplines, the trace, the digest and the run-twice check; §12
 > records it as built and where it departs from this design), and its lints of §3.9 are in the
-> workspace (§12.6). S-2 to S-8 are designed, not built. Sources and what each
-> establishes are in `docs/research/sim.md`. The plan's starting point was mantle note 32 §3.10 and
-> `docs/raft.md` §5; this design keeps their list of pieces and departs from it where §1 below shows
-> a piece falls short. No existing test has moved onto the world yet.
+> workspace (§12.6). **S-2 built** (§13): the network, with focal's path tests carried onto it,
+> hyper-transport's test network and hyper-liveness's simulation on it, and hyper-swim's first
+> simulation; its costs against the harnesses it replaced are still to measure. S-3 to S-8 are
+> designed, not built. Sources and
+> what each establishes are in `docs/research/sim.md`. The plan's starting point was mantle note 32
+> §3.10 and `docs/raft.md` §5; this design keeps their list of pieces and departs from it where §1
+> below shows a piece falls short.
 
 The two crates are the test infrastructure every other crate here and every consumer runs its
 deterministic simulations and checks on. **`hyper-sim`** is the world under the test's control: time,
@@ -825,3 +828,95 @@ The world allocates nothing a step in any workload. At three timed nodes it cost
 than hyper-liveness's harness: about 3 ns recording the trace and 2.4 ns the exact draws (measured
 by taking each out), neither of which that harness has. This is to be closed or justified when
 hyper-liveness's simulation moves at S-2.
+
+## 13. S-2 as built (2026-10-04)
+
+`crates/hyper-sim/src/net.rs`, its tests in `crates/hyper-sim/tests/net.rs`. What §3.4 assigns S-2,
+and what was built:
+
+- **One model, two payloads.** `Net<P>` carries any payload with a stated size: typed messages and
+  datagrams alike, so byte bounds and serialization time apply to both. Per directed pair a `Path`
+  (focal's: one-way delay with uniform jitter, in order or reordering, Gilbert–Elliott loss per flow,
+  a bottleneck `Link` with drop-tail, step or CoDel marking, an MTU, a `Nat` whose mapping expires),
+  with focal's named profiles (`LAN`, `REGIONAL`, `GEOGRAPHIC`).
+- **Every draw from its flow's stream.** A flow names its streams (`net.delay`, `net.loss`,
+  `net.duplicate`, each with `[from, to]`) at its first draw, so adding a flow, or a flow's draws,
+  leaves every other flow's draws unchanged (`a_flows_draws_do_not_depend_on_other_flows`). A
+  lossless path, and a path without jitter, draws nothing.
+- **Arrivals are the world's events.** A send that departs puts its message in the network's arena
+  and gives the world `arrival(ticket)` at the arrival time; the harness hands the ticket back to
+  `Net::deliver`, so the world's strategy orders arrivals with every other event, under either
+  discipline.
+- **Capacity.** The arena holds at most `NetLimits::messages` messages and `NetLimits::bytes` bytes,
+  the `C` of §7. Past it the oldest message in flight (the least send number) is lost and counted
+  in `dropped_capacity`, and the arrival that would have carried it finds its ticket empty. A
+  message larger than the network holds in all is refused and loses nothing else. Evicting scans
+  the arena, which is `C` slots: eviction happens only at the bound.
+- **Duplication** is a delivery that keeps its message: it stays in its slot and arrives again after
+  a fresh propagation delay (hyper-raft's `keep`), so a duplicate holds no more room.
+- **Partitions** cut at the send and at the arrival. The test's own cuts (`partition`, `heal`) and
+  a drawn partition are held apart, so healing one leaves the other. Drawn partitions take
+  TigerBeetle's packet simulator's shapes (`Split::UniformSize`, `UniformPartition`,
+  `IsolateSingle`; symmetric or asymmetric), and a `churn` the harness calls starts or heals one with
+  its stated chance once the present state has lasted its stability.
+- **The plane's adversary** (`Adversary`) keeps the latest datagrams the network carried, within a
+  stated count and size, and sends a replay from the datagram's sender or a truncated or one-byte
+  forged copy from a third address, so every seed of a run on the sealed plane tries them.
+
+**Exact tests, not statistical ones.** focal's tests of loss and jitter asserted rates inside
+bands (5% of 100,000 within 4,600 to 5,400). Carried here, each instead replays the draws of the
+stream the network names, in a world of its own on the same seed (a stream's draws depend on the
+seed and the name alone), and requires the network's fate for each message to be the model's by its
+definition: the Gilbert–Elliott process for loss, `one_way − jitter + U[0, 2·jitter]` held behind the
+flow's previous arrival for delay. The rest of focal's tests (the bottleneck, CoDel, ECN marking,
+the NAT, partitions, bounds, accounting) were exact already and are carried as they were. With the
+new pieces' own, 26 tests.
+
+**The gate's other items.**
+- hyper-transport's test network (`tests/common`, `Net<A, B>`) runs on the world and the network:
+  node 0 and node 1 on the zero path, the world's time the caller's from its instant. Its interface
+  is unchanged, and so are the outcomes of the 26 tests that use it (`tests/exchange.rs`).
+- hyper-swim's first simulation (`crates/hyper-swim/tests/sim.rs`): the cluster test's five
+  members on the world and the network's LAN path, each clock with its own offset, a rate within
+  RFC 5905's 15 ppm and timers late by a drawn amount; once every pair is judged a member is
+  killed, and every survivor holds it dead within the bound its detector stated, while none holds a
+  live one dead. Sixteen seeds, each through the run-twice check, its members' clocks drawn through
+  the world so the trace replays them.
+- **Every one of them runs a seed through the run-twice check** (§3.9, `scripts/check-contracts.py`):
+  the network's replay scenario, hyper-swim's sixteen seeds, hyper-liveness's live peers to their
+  doubling, and hyper-transport's connection, whose endpoints draw their keys and nonces outside the
+  world: what the network orders does not depend on them.
+
+- **Measured delays.** A `Path` may propagate as a host measured (`Path::measured`): its quantiles
+  at probabilities in parts per million, drawn from by the inverse transform, linear between the
+  grid's points, the draw one integer below a million and the interpolation exact in integers
+  (hyper-timing-trace's grid, whose finest point, 0.99999, is a whole part per million). A table
+  that is no distribution is refused, typed (`SimError::NotADistribution`).
+
+- hyper-liveness's simulation (`crates/hyper-liveness/tests/sim.rs`) runs on the world and the
+  network. Its heartbeats travel a measured path, its host's one-way delay table on every pair;
+  its disks' flushes and its owners' timer lateness are drawn by the owner from streams of the world
+  through the same inverse transform (`Measured::at`), the timers set to the instant they fire
+  with no lateness of the world's own, since a host's measured sweep, a table for each asked wait,
+  is not a floor and a spread; and its freezes, its writes and every arrival are events the world
+  orders, events before timers and each in the order made (`Fifo`), as its own queue ordered them.
+  Every one of its 15 tests passes with its assertions unchanged, at the default seeds and at 80
+  seeds a test (3,840 runs).
+- **The trace's reservation**, which the world makes when a run begins (§12.2), is each harness's
+  bound stated from the runs it makes: four times the most any run took, measured and named where
+  the bound is stated. hyper-liveness's runs took at most 38,725 steps, 39,383 decisions and 13
+  events pending over 80 seeds a test; hyper-swim's at most 1,240 steps and 1,574 decisions over its sixteen. A soak
+  that passes one has stopped converging or found a longer tail, and the bound is measured again.
+
+**Open in S-2.**
+- hyper-liveness's harness against the world, in cost (`benches/step.rs` holds both, §12.7, where
+  the world cost 7 ns a step more at three nodes).
+- hyper-transport's allocation bench counts the endpoints' allocations, assuming the network makes
+  none once warm. On the moved network every row with a body, and the lane frame, is identical to
+  the run on the old one at the same commit's parent (2026-10-04, one build job, load from the
+  other sessions' builds; counts are exact whatever the load). The two rows without a body are
+  0.01 allocation an exchange above it: 8.36 against 8.35, and the bare stream 8.09 against 8.08,
+  with one byte more. That is twenty allocations in 2,000 exchanges that are the network's own,
+  still to trace: the world's queue and the network's arena push only into reused vectors, so it
+  is not their steps.
+

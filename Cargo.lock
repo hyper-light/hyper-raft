@@ -721,6 +721,7 @@ dependencies = [
  "getrandom 0.4.3",
  "hyper-block",
  "hyper-measure",
+ "hyper-timing",
  "proptest",
  "tempfile",
  "thiserror 2.0.20",

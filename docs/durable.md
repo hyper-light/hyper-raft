@@ -917,6 +917,40 @@ allocations, reallocations and minor and major faults per committed entry (`hype
 switches, and the threads alive. The shell replaces a project's only where it is at least as fast
 and allocates no more on that project's workload.
 
+### 13.1 The log's own statistics, for an owner's metrics
+
+`Log::stats` answers what a log measured from its opening (`LogStats`, `crates/hyper-log/src/stats.rs`):
+
+| Field | What it counts |
+|---|---|
+| `frames`, `updates` | Frames written and flushed, and the updates they carried. |
+| `bytes` | Bytes written: frames, persist records and confirmations, each padded to the file's alignment. |
+| `flushes` | Flushes made: each frame's, and each confirmation's written on its own. |
+| `flush` | A histogram of each flush's `sync_data`, the platform's full flush (`fdatasync`, `F_FULLFSYNC`, `FlushFileBuffers`). |
+| `write` | A histogram of each frame's writes, the frame and its persist record. |
+| `commit_wait` | A histogram of each update's wait, from its submission to the end of the flush that let it be answered: the next frame's, whose record confirms its frame, or its frame's own confirmation's. |
+| `flushing_since` | When the frame or confirmation the device holds went to it, while one does. |
+| `at` | When the owner answered. |
+
+The thread that does a job's I/O times its writes and its flush apart and carries the times back
+in the job's completion. The owner hears every completion and counts it in one allocation made at
+open, and it timestamps each update at submission on the caller's thread. A reader asks the owner
+through its inbox, as any query does. The owner never waits on I/O: it hands each job with the
+device to another thread and goes on answering. So a flush that stalls delays no answer. It shows
+as `at − flushing_since` before it ends, though the histograms hear of it only once it has. The
+reader hands back the box an earlier answer gave, which is filled again, so a reader that keeps it
+allocates once. A log that nobody asks pays only the counting.
+
+**Why eight buckets a doubling.** This follows focal F26's derivation. The histogram is
+`hyper_timing::Histogram` (`docs/timing.md` §2.10). A bucket's width is at most an eighth of its
+least value, so a value is placed within 12.5%. The measured claims these numbers feed compare runs
+that differ by 10–30%. The smallest regression worth paging on is a quarter of p99. At 12.5% a
+change of 25% always lands a bucket apart, where at a factor of two (`log2` buckets) it can sit in
+one. A histogram is 3,968 bytes of counts, and a log keeps three.
+
+**No directory fence is measured.** The log writes inside one preallocated file and flushes its
+directory once, at create.
+
 ## 14. Open, to be measured
 
 1. **Depth.** The flushes a committed entry costs, and the latency, at depths 1–3 on hyper-log,

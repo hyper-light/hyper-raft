@@ -11,6 +11,8 @@ repository.workspace = true
 crc32c.workspace = true
 getrandom.workspace = true
 hyper-block = { path = "../hyper-block" }
+# The histograms the log's statistics keep (`LogStats`, docs/durable.md §13.1).
+hyper-timing = { path = "../hyper-timing" }
 thiserror.workspace = true
 
 [dev-dependencies]

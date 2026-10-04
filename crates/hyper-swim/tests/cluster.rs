@@ -53,7 +53,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
-use std::io::{BufRead, BufReader, ErrorKind, Write};
+use std::io::{BufRead, BufReader, Write};
 use std::net::UdpSocket;
 use std::num::NonZeroUsize;
 use std::process::{Child, Command, Stdio};
@@ -410,10 +410,6 @@ impl Member {
     /// Waits for one datagram until the detector's wake (or for one datagram, when it asks no
     /// wake), and handles it. Only a timeout or a datagram ends the wait: any other error
     /// (Windows reports a reset on the next receive after a send to a closed port) skips it.
-    #[allow(
-        clippy::disallowed_methods,
-        reason = "the socket waits by a peek with the timeout, never a timed receive"
-    )]
     fn receive(&mut self) {
         let timeout = match self.detector.wake() {
             Some(at) => match at.checked_sub(self.now()).filter(|left| *left > 0) {
@@ -422,15 +418,10 @@ impl Member {
             },
             None => None,
         };
-        self.socket.set_read_timeout(timeout).unwrap();
-        // Waited for by a peek and taken once there: on Windows a receive that times out can lose
-        // the datagram that arrives as it times out (`setsockopt`, `SO_RCVTIMEO`; `docs/raft.md`,
-        // "The harness's receive"), which this detector would count as a heartbeat lost.
-        // A peek leaves a reset in place, so whatever it found is taken by a receive that does not
-        // wait, which clears it.
-        if let Err(error) = self.socket.peek_from(&mut self.buffer)
-            && matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut)
-        {
+        // Waited for without taking it, and taken once there (`hyper_measure::wait::arrives`): a
+        // datagram lost to a timed receive this detector would count as a heartbeat lost. A reset
+        // the wait found is taken by a receive that does not wait, which clears it.
+        if !hyper_measure::wait::arrives(&self.socket, timeout, &mut self.buffer).unwrap_or(true) {
             return;
         }
         self.socket.set_nonblocking(true).unwrap();

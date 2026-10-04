@@ -135,7 +135,7 @@ impl Wire {
     /// arrived (also when the timer is already due), fires the timers due, and sends again.
     #[allow(
         clippy::disallowed_methods,
-        reason = "real processes on the host's clock, threads and environment (CLAUDE.md §1a, end to end); the socket waits by a peek with the timeout, never a timed receive"
+        reason = "real processes on the host's clock, threads and environment (CLAUDE.md §1a, end to end)"
     )]
     fn turn<E: Drive>(&mut self, endpoint: &mut E) {
         self.flush(endpoint);
@@ -147,20 +147,11 @@ impl Wire {
         let mut most = DRAIN;
         if !wait.is_zero() {
             self.socket.set_nonblocking(false).unwrap();
-            self.socket.set_read_timeout(Some(wait)).unwrap();
-            // The wait is a peek and the datagram is taken with the rest: on Windows a receive
-            // that times out can lose the datagram that arrives as it times out (`setsockopt`,
-            // `SO_RCVTIMEO`; hyper-raft's `docs/raft.md`, "The harness's receive").
-            let arrived = match self.socket.peek_from(&mut self.buffer) {
-                Ok(_) => true,
-                Err(error)
-                    if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) =>
-                {
-                    false
-                }
-                // A reset and the like: what else arrived is still to be taken.
-                Err(_) => true,
-            };
+            // The wait takes nothing, and the datagram is taken with the rest
+            // (`hyper_measure::wait::arrives`). A reset and the like count as arrived: what else
+            // arrived is still to be taken.
+            let arrived = hyper_measure::wait::arrives(&self.socket, Some(wait), &mut self.buffer)
+                .unwrap_or(true);
             if arrived {
                 most = DRAIN.saturating_add(1);
             } else {

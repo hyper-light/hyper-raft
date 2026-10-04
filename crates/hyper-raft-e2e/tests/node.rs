@@ -36,7 +36,7 @@ fn remove(path: &std::path::Path) {
 #[test]
 #[allow(
     clippy::disallowed_methods,
-    reason = "real processes on the host's clock, threads and environment (CLAUDE.md §1a, end to end); the member's socket is waited on by a peek, never a timed receive"
+    reason = "real processes on the host's clock, threads and environment (CLAUDE.md §1a, end to end)"
 )]
 fn a_member_behind_its_deadline_still_reads_what_arrived() {
     let path = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
@@ -63,15 +63,14 @@ fn a_member_behind_its_deadline_still_reads_what_arrived() {
     client.send_to(&request, address).unwrap();
     // The fact the turn below needs: the request is in the member's socket.
     let mut peeked = vec![0u8; wire::MAX_DATAGRAM];
-    arrived.set_read_timeout(Some(LOOPBACK_BOUND)).unwrap();
-    arrived.peek_from(&mut peeked).unwrap();
+    assert!(hyper_measure::wait::arrives(&arrived, Some(LOOPBACK_BOUND), &mut peeked).unwrap());
 
     // The member's deadline was due before it turned to its socket.
     node.receive_until(Some(0)).unwrap();
 
     let mut answer = vec![0u8; wire::MAX_DATAGRAM];
     assert!(
-        wire::arrives(&client, Some(LOOPBACK_BOUND), &mut answer).unwrap(),
+        hyper_measure::wait::arrives(&client, Some(LOOPBACK_BOUND), &mut answer).unwrap(),
         "the member read the request and answered it"
     );
     let (length, _) = wire::take(&client, &mut answer).unwrap();

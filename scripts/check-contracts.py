@@ -39,6 +39,9 @@ UNSAFE_ALLOWED = {
         "AddVectoredExceptionHandler and the EXCEPTION_POINTERS it is called with, the CONTEXT "
         "union's registers, VirtualQuery before code bytes are read, GetCurrentThreadStackLimits "
         "(an E2E member's account of a fatal fault; test harness only)",
+    "crates/hyper-measure/src/wait_windows.rs":
+        "WSAPoll (the wait for a datagram every real-socket test and E2E member makes, on Windows, "
+        "with no operation in flight past its return; tests and harnesses only)",
     "crates/hyper-block/src/node/windows.rs":
         "IOCTL_DISK_GET_LENGTH_INFO (a device's capacity) and GetFileInformationByHandleEx's "
         "FileStorageInfo (the sector sizes of a file's volume)",

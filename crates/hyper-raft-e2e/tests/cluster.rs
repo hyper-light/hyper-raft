@@ -257,10 +257,10 @@ impl Cluster {
             if left.is_zero() {
                 return None;
             }
-            // Waited for by a peek, taken without waiting (`wire::arrives`). A refusal from a
+            // Waited for by a peek, taken without waiting (`hyper_measure::wait::arrives`). A refusal from a
             // member that is down reads as an error on some platforms: no answer yet, and the
             // wait goes on to its timeout.
-            if !wire::arrives(&self.test, Some(left), &mut received).unwrap() {
+            if !hyper_measure::wait::arrives(&self.test, Some(left), &mut received).unwrap() {
                 return None;
             }
             let Ok((length, _)) = wire::take(&self.test, &mut received) else {

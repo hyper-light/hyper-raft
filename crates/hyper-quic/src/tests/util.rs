@@ -340,16 +340,13 @@ pub(super) fn validate_incoming(incoming: &Incoming) -> IncomingConnectionBehavi
 }
 
 impl TestEndpoint {
-    #[allow(
-        clippy::disallowed_methods,
-        reason = "a capture socket, made only with SSLKEYLOGFILE and drained of whatever arrives: nothing it receives is read, so a timed receive has nothing to lose"
-    )]
     fn new(endpoint: Endpoint, addr: SocketAddr) -> Self {
+        // A capture socket, made only with SSLKEYLOGFILE and drained of whatever arrives without
+        // waiting: a receive with a timeout on Windows can complete after it returned, into the
+        // drain's buffer on the stack (`hyper_measure::wait`).
         let socket = if env::var_os("SSLKEYLOGFILE").is_some() {
             let socket = UdpSocket::bind(addr).expect("failed to bind UDP socket");
-            socket
-                .set_read_timeout(Some(Duration::from_millis(10)))
-                .unwrap();
+            socket.set_nonblocking(true).unwrap();
             Some(socket)
         } else {
             None

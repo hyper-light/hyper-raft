@@ -1,9 +1,9 @@
-//! The harness's wait for a datagram (`wire::arrives`, `wire::take`): a peek with the timeout, then a
-//! receive that does not wait. A receive that times out on Windows can be cancelled as it
-//! completes and lose the datagram (Microsoft's `setsockopt` reference, `SO_RCVTIMEO`); a peek
-//! removes nothing, so one cancelled loses nothing. That no wait in the workspace is a timed
-//! receive is the lint's to hold, not a count of datagrams: `clippy.toml` disallows
-//! `UdpSocket::set_read_timeout` but where a site states why its wait cannot lose one.
+//! The harness's wait for a datagram (`hyper_measure::wait::arrives`, `wire::take`): a wait that
+//! takes nothing (a peek with the timeout on Linux and macOS, a poll on Windows), then a receive
+//! that does not wait. A receive that times out on Windows can be cancelled as it completes and
+//! lose the datagram (Microsoft's `setsockopt` reference, `SO_RCVTIMEO`). That no wait in the
+//! workspace is a timed receive is the lint's to hold, not a count of datagrams: `clippy.toml`
+//! disallows `UdpSocket::set_read_timeout` but in the wait itself.
 #![allow(
     clippy::unwrap_used,
     clippy::indexing_slicing,
@@ -32,7 +32,7 @@ fn a_reset_is_taken_and_the_datagram_behind_it_after() {
     // The reset, if one is reported, and the datagram: two takes at most.
     let mut taken = None;
     for _ in 0..2 {
-        assert!(wire::arrives(&socket, None, &mut buffer).unwrap());
+        assert!(hyper_measure::wait::arrives(&socket, None, &mut buffer).unwrap());
         match wire::take(&socket, &mut buffer) {
             Ok((length, _)) => {
                 taken = Some(buffer[..length].to_vec());

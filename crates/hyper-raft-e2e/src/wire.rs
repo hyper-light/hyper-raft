@@ -4,9 +4,8 @@
 //! verified before anything is read, so a datagram that arrived damaged is dropped whole. A
 //! body is read by [`Reader`], which refuses a length past what is there instead of reading it.
 use std::{
-    io::{self, ErrorKind},
+    io,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket},
-    time::Duration,
 };
 
 /// The most bytes one UDP datagram carries over IPv4: 65,535 for the whole IP packet (RFC 791)
@@ -111,39 +110,9 @@ pub fn largest(socket: &UdpSocket) -> io::Result<usize> {
     Ok(low)
 }
 
-/// Waits on the blocking `socket` for a datagram, for `wait` (never zero) or, with `None`, for as
-/// long as it takes; whether there is something to take: a datagram, or an error the socket
-/// reports, such as the reset Windows reports after a send to a closed port. The caller takes it
-/// with [`take`], a receive that does not wait.
-///
-/// The wait is a peek, never a receive: a receive that times out can lose the datagram that
-/// arrives as it times out. Microsoft's `setsockopt` reference says of `SO_RCVTIMEO`: "If a
-/// blocking receive call times out, the socket is left in an indeterminate state, and should not
-/// be used; TCP sockets in this state have a potential for data loss, since the operation could be
-/// canceled at the same moment the operation was to be completed." UDP loses the datagram so
-/// taken. Measured on GitHub's windows-11-arm runner (`docs/raft.md`, "The harness's receive"), a
-/// receiver waiting a millisecond at a time lost 65 of 40,000 datagrams that way, and a peek lost
-/// none of 40,000; the members of hyper-durable-e2e lost the test's asks to it, a second's wait
-/// each. A peek takes nothing, so one cancelled with it loses nothing. A peek takes no error
-/// either: a reset it reports is reported again until a receive takes it, so the receive follows
-/// whatever the peek found.
-#[allow(
-    clippy::disallowed_methods,
-    reason = "the wait the lint points to: a peek with the timeout, never a timed receive"
-)]
-pub fn arrives(socket: &UdpSocket, wait: Option<Duration>, buffer: &mut [u8]) -> io::Result<bool> {
-    socket.set_read_timeout(wait)?;
-    match socket.peek_from(buffer) {
-        Err(error) if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
-            Ok(false)
-        }
-        Ok(_) | Err(_) => Ok(true),
-    }
-}
-
-/// Takes what [`arrives`] found on the blocking `socket`, without waiting: the datagram, or the
-/// error the socket reports, which the receive clears; `WouldBlock` when there was nothing after
-/// all. The socket is blocking again after.
+/// Takes what `hyper_measure::wait::arrives` found on the blocking `socket`, without waiting: the
+/// datagram, or the error the socket reports, which the receive clears; `WouldBlock` when there was
+/// nothing after all. The socket is blocking again after.
 pub fn take(socket: &UdpSocket, buffer: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
     socket.set_nonblocking(true)?;
     let taken = socket.recv_from(buffer);

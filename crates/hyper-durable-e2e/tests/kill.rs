@@ -254,9 +254,9 @@ impl Cluster {
             if left.is_zero() {
                 return None;
             }
-            // Waited for by a peek, taken without waiting (`wire::arrives`). A reset is an
+            // Waited for by a peek, taken without waiting (`hyper_measure::wait::arrives`). A reset is an
             // earlier send's, to a member gone (Windows reports it on the next receive).
-            if !wire::arrives(&self.test, Some(left), &mut received).unwrap() {
+            if !hyper_measure::wait::arrives(&self.test, Some(left), &mut received).unwrap() {
                 return None;
             }
             let length = match wire::take(&self.test, &mut received) {

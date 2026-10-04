@@ -619,10 +619,9 @@ impl Wire {
             let _ = self.socket.send_to(&self.out, destination);
         }
     }
-    /// Sends what is due, waits for a datagram until the next timer (a peek, never a timed
-    /// receive: on Windows one that times out can lose the datagram it is cancelled with, as
-    /// hyper-raft-e2e's `wire::arrives` says), takes everything that has arrived, fires the timers
-    /// due, and sends again.
+    /// Sends what is due, waits for a datagram until the next timer without taking it
+    /// (`hyper_measure::wait::arrives`), takes everything that has arrived, fires the timers due,
+    /// and sends again.
     fn turn(&mut self, quic: &mut impl Quic) {
         self.flush(quic);
         let began = Instant::now();
@@ -632,9 +631,8 @@ impl Wire {
             .min(IDLE_TURN);
         if !wait.is_zero() {
             self.socket.set_nonblocking(false).unwrap();
-            self.socket.set_read_timeout(Some(wait)).unwrap();
             let listening = Instant::now();
-            let _ = self.socket.peek_from(&mut self.buffer);
+            let _ = hyper_measure::wait::arrives(&self.socket, Some(wait), &mut self.buffer);
             self.listened += listening.elapsed();
         }
         self.socket.set_nonblocking(true).unwrap();

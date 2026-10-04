@@ -536,7 +536,7 @@ impl Node {
         if wait.is_none_or(|wait| !wait.is_zero()) {
             most = turn.saturating_add(1);
             self.turn_most = self.turn_most.max(began.saturating_sub(self.read_ns));
-            let came = wire::arrives(&self.socket, wait, &mut self.received)?;
+            let came = hyper_measure::wait::arrives(&self.socket, wait, &mut self.received)?;
             // A wait begun before the stream's wake and ended at or past it, by its deadline or
             // by a datagram that came after it, is what the stream's `G` is made of
             // (`Liveness::on_wait`), reported before anything it brought is fed: how late past
@@ -554,7 +554,7 @@ impl Node {
             }
         }
         // The datagram waited for is taken with the rest, none of them waited on: a receive that
-        // waits can lose what arrives as it times out (`wire::arrives`). A wait that ran out is
+        // waits can lose what arrives as it times out (`hyper_measure::wait::arrives`). A wait that ran out is
         // drained too, for the clock the stream is polled at.
         self.drain(most)
     }

@@ -74,7 +74,7 @@ disallowed-methods = [
   # Windows a receive that times out can be cancelled as it completes and lose the datagram
   # (Microsoft's setsockopt reference, SO_RCVTIMEO; docs/raft.md, "The harness's receive"); a peek
   # removes nothing, so one cancelled loses nothing.
-  { path = "std::net::UdpSocket::set_read_timeout", reason = "a datagram socket waits by a peek, never a timed receive, which on Windows loses the datagram it is cancelled with: hyper-raft-e2e's wire::arrives and wire::take" },
+  { path = "std::net::UdpSocket::set_read_timeout", reason = "a datagram socket waits without taking, never by a timed receive, which on Windows loses the datagram it is cancelled with and can complete after it returned: hyper_measure::wait::arrives, then a receive that does not wait" },
   # The accessors generated for the enumerations of raft-proto's wire and log types unwind on a value
   # they do not know, and a peer chooses the value; hyper_raft::proto reads them as options (focal's
   # clippy.toml, carried with the core).

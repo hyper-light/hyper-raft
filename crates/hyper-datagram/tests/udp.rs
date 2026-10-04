@@ -50,17 +50,14 @@ fn bound() -> UdpSocket {
     UdpSocket::bind("127.0.0.1:0").unwrap()
 }
 
-/// The next datagram, waited for by a peek and taken by a receive that does not wait: on Windows a
-/// receive that times out can lose the datagram that arrives as it is cancelled (hyper-raft's
-/// `docs/raft.md`, "The harness's receive").
-#[allow(
-    clippy::disallowed_methods,
-    reason = "the socket waits by a peek with the timeout, never a timed receive"
-)]
+/// The next datagram, waited for without taking it (`hyper_measure::wait::arrives`) and taken by a
+/// receive that does not wait.
 fn receive(socket: &UdpSocket) -> Vec<u8> {
     let mut buffer = vec![0u8; 65_536];
-    socket.set_read_timeout(Some(RECEIVE_TIMEOUT)).unwrap();
-    socket.peek_from(&mut buffer).expect("a datagram arrives");
+    assert!(
+        hyper_measure::wait::arrives(socket, Some(RECEIVE_TIMEOUT), &mut buffer).unwrap(),
+        "a datagram arrives"
+    );
     socket.set_nonblocking(true).unwrap();
     let taken = socket.recv_from(&mut buffer);
     socket.set_nonblocking(false).unwrap();

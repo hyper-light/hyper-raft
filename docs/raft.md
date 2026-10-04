@@ -635,9 +635,10 @@ rewritten without its lock and with its `unsafe` listed in the contract script; 
 `hyper-raft-compare` measures this crate against each core it replaces, and `hyper-raft-e2e` runs it
 as real processes (`docs/benchmarks.md`).
 
-**The harness's receive.** A member of `hyper-raft-e2e` or `hyper-durable-e2e`, and each test that
-asks one, waits for a datagram by peeking with a timeout (`wire::arrives`) and takes what the peek
-found without waiting; it never waits in a receive. On Windows a receive that times out can lose the
+**The harness's receive.** A member of `hyper-raft-e2e` or `hyper-durable-e2e`, each test that
+asks one, and every real-socket test of the workspace waits for a datagram without taking it
+(`hyper_measure::wait::arrives`: a peek with a timeout on Linux and macOS, a poll on Windows, below)
+and takes what the wait found without waiting; it never waits in a receive. On Windows a receive that times out can lose the
 datagram that arrives as it times out. Microsoft's `setsockopt` reference says of `SO_RCVTIMEO`: "If
 a blocking receive call times out, the socket is left in an indeterminate state, and should not be
 used; TCP sockets in this state have a potential for data loss, since the operation could be
@@ -657,12 +658,30 @@ datagram or an error, is taken by a receive that does not wait (`wire::take`), n
 again (a first form of this change peeked again, and spun on the reset to the end of each wait: on
 both Windows runners the E2E did not finish within fifteen minutes once a member had exited).
 That no wait in the workspace is a timed receive the lint holds: `clippy.toml` disallows
-`UdpSocket::set_read_timeout`, and each site that sets one states why its wait cannot lose a
-datagram (a peek: `wire::arrives`, the real-socket tests of `hyper-transport`, `hyper-swim` and
-`hyper-datagram`; or a socket whose receives drop what arrives). A test that sent 4,251 datagrams
+`UdpSocket::set_read_timeout`, and the one site that sets one is the wait's peek on Linux and
+macOS (`hyper_measure::wait`). A test that sent 4,251 datagrams
 to catch a loss with a picked probability is gone: a peek removes nothing, so none is lost to a
 cancelled one, and the count measured nothing the lint does not hold. `tests/arrives.rs` holds the
 taking of a reset and the datagram behind it.
+
+**The wait on Windows (2026-10-04).** A timed peek is no safe wait on Windows either. On
+windows-11-arm the kill test's stall cases ended a member with an access violation: twice in CI
+(runs 37184084685 and 37204898614), then at iterations 19 and 42 of loops of those cases
+(37208590794, 37209556561). The fault report gives the registers, the faulting frame's words and
+the code (`hyper_raft_e2e::fault`):
+- the faulting instruction in `Node::drain` is `str q0, [x9, #0x100]`;
+- x9 is 14, loaded from drain's own frame at `[sp+0x38]`, where a pointer had been stored;
+- the word before it, `[sp+0x30]`, is zero, and the pair reads as an I/O status block,
+  STATUS_SUCCESS and 14 bytes, over drain's slot;
+- the frame below still holds std's `io::Error` for WSAETIMEDOUT (10060).
+
+drain runs right after `wire::arrives` returns, in the stack the peek's calls had just used. So the
+peek timed out, and the cancelled operation completed afterwards, writing its status into the
+frames the member had reused. Every capture shows 14, the length of the test's asks of its members (`stream::put_report_ask`: the
+header, an id and a tag), which it sends all through its waits. On Windows the wait is
+now `WSAPoll` for readability (`poll_windows.rs`), which has no operation in flight past its
+return. The same stall cases then looped 361 times on windows-11-arm with the poll (run 37209665315, the
+loop's whole 55 minutes) and never faulted.
 
 The simulation and the checks are two crates, designed in `docs/sim.md` (sources in
 `docs/research/sim.md`), not yet built:

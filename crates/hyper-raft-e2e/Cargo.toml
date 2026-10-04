@@ -19,6 +19,8 @@ hyper-liveness = { path = "../hyper-liveness" }
 hyper-tokio = { path = "../hyper-tokio" }
 # The election law's types: the ballot and span the members' timing is derived by.
 hyper-timing = { path = "../hyper-timing" }
+# The wait for a datagram every member and the tests make (`hyper_measure::wait::arrives`).
+hyper-measure = { path = "../hyper-measure" }
 # The codec of raft-rs's wire and log types, which hyper-raft speaks (prost).
 
 # The fault report's vectored exception handler (`fault`).

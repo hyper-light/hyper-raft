@@ -9,14 +9,17 @@
 //! counting on around what it measures.
 //!
 //! A test or a benchmark that hands a call a `Waker` takes a counting one from
-//! [`wake`].
+//! [`wake`]. A real-socket test or an E2E member waits for a datagram with
+//! [`wait::arrives`].
 //!
-//! The `unsafe` this crate needs is in three files that
+//! The `unsafe` this crate needs is in four files that
 //! `scripts/check-contracts.py` lists: `src/alloc.rs` (the allocator forwards
-//! to the system's), `src/faults.rs` (the OS calls that read the faults) and
-//! `src/wake.rs` (a waker built over a leaked slot).
+//! to the system's), `src/faults.rs` (the OS calls that read the faults),
+//! `src/wake.rs` (a waker built over a leaked slot) and `src/wait_windows.rs`
+//! (the poll a wait is on Windows).
 
 pub mod alloc;
 pub mod faults;
 pub mod stats;
+pub mod wait;
 pub mod wake;

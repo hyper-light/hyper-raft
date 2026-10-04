@@ -600,7 +600,10 @@ probe was lost at once, and all four waited for one another for ever
 trip, has no round trip to expect its answer from: it waits as a retransmission timer does before
 its first measurement, 1 s (RFC 6298 §2.1, "Until a round-trip time (RTT) measurement has been made
 ... the sender SHOULD set RTO <- 1 second"), backed off as above, and ends sooner when another member
-is heard from. It once waited on its answer or another member alone, and members whose first probes
+is heard from. An owner that measured a round trip to the peer outside the detector, the handshake
+that keyed its session, gives it at the join (`Detector::join_measured`), and the first probe waits
+on that instead: 1 s is some 10^4 times a LAN's round trip. It only times the first waits; a
+handshake is not a probe, so no estimator takes it and it judges nothing. It once waited on its answer or another member alone, and members whose first probes
 were all lost waited on one another for ever: slates' daemons, three in one process, dropped the
 datagrams queued while a peer's address was re-resolved at a re-key, sent five datagrams in all and
 then nothing, in 4 runs of 6 (`a_lost_first_probe_ends_at_the_initial_wait`, and in the simulated

@@ -25,8 +25,9 @@
 //! is answered or at its expected arrival from the latest round trip (NFD-E's estimate over a
 //! window of one), whichever is first; unanswered then, it is a loss to the estimators unless its
 //! answer comes later, and it judges nothing. Its wake measures the member's timer. Before any
-//! round trip, the first probe waits as a retransmission timer does before its first measurement
-//! ([`INITIAL_WAIT_NS`]), or until another member is heard from.
+//! round trip, the first probe waits on the round trip its owner measured to the peer, where it
+//! gave one ([`Detector::join_measured`]), or as a retransmission timer does before its first
+//! measurement ([`INITIAL_WAIT_NS`]), or until another member is heard from.
 //!
 //! **Dead.** A suspected peer is told by the member's next probe to it (Lifeguard's buddy system);
 //! it is condemned when that probe also goes unanswered, and only once the member has since had an
@@ -327,6 +328,10 @@ struct Peer {
     last_mistake: Option<f64>,
     last_answer_ns: Option<u64>,
     report: PeerReport,
+    /// A round trip to the peer its owner measured outside the detector, the handshake that keyed
+    /// the peer's session ([`Detector::join_measured`]): the first wait for its probes before this
+    /// member measured any round trip.
+    handshake_rtt_ns: Option<u64>,
 }
 
 impl Peer {
@@ -341,6 +346,7 @@ impl Peer {
             last_mistake: None,
             last_answer_ns: None,
             report: PeerReport::default(),
+            handshake_rtt_ns: None,
         }
     }
 
@@ -384,8 +390,8 @@ struct Probe {
     verdict: Option<Verdict>,
     /// When the indirect probe's answers are due, once it was asked.
     indirect_until: Option<u64>,
-    /// A measurement probe's expected arrival from the latest round trip, or [`INITIAL_WAIT_NS`]
-    /// before one, backed off while measurement periods go unanswered
+    /// A measurement probe's expected arrival from the latest round trip, or before one from the
+    /// owner's ([`Detector::wait_base`]), backed off while measurement periods go unanswered
     /// ([`Detector::measurement_wait`]): where its period ends, answered or not, judging nothing;
     /// its wake measures the member's timer.
     expected: u64,
@@ -810,8 +816,7 @@ impl Detector {
             answered: false,
             verdict,
             indirect_until: None,
-            expected: now_ns
-                .saturating_add(self.measurement_wait(self.last_rtt_ns.unwrap_or(INITIAL_WAIT_NS))),
+            expected: now_ns.saturating_add(self.measurement_wait(self.wait_base(target))),
         };
         self.probe = Some(probe);
         self.heard_other = false;
@@ -888,8 +893,7 @@ impl Detector {
     fn resolve(&mut self, probe: Probe, now_ns: u64) {
         if probe.verdict.is_none()
             && !probe.answered
-            && self.measurement_wait(self.last_rtt_ns.unwrap_or(INITIAL_WAIT_NS))
-                < MEASUREMENT_WAIT_CAP_NS
+            && self.measurement_wait(self.wait_base(probe.target)) < MEASUREMENT_WAIT_CAP_NS
         {
             self.measurement_misses = self.measurement_misses.saturating_add(1);
         }
@@ -1070,6 +1074,19 @@ impl Detector {
             .checked_shl(self.measurement_misses)
             .unwrap_or(u64::MAX);
         rtt_ns.saturating_mul(factor).min(MEASUREMENT_WAIT_CAP_NS)
+    }
+
+    /// The round trip a measurement probe of `target` waits from before backing off: the latest
+    /// this member measured, to anyone; before any, the one its owner measured to `target`; and
+    /// without one, [`INITIAL_WAIT_NS`].
+    fn wait_base(&self, target: HostId) -> u64 {
+        self.last_rtt_ns
+            .or_else(|| {
+                self.peers
+                    .get(&target)
+                    .and_then(|peer| peer.handshake_rtt_ns)
+            })
+            .unwrap_or(INITIAL_WAIT_NS)
     }
 
     /// Whether every probe this member makes is judged by a configured verdict: the pool holds
@@ -1706,6 +1723,22 @@ impl Detector {
         Ok(())
     }
 
+    /// Learns a peer as [`join`](Self::join) does, with a round trip to it that the owner measured
+    /// outside the detector, the handshake that keyed the peer's session: until this member
+    /// measures a round trip, its probes of the peer wait on that one instead of
+    /// [`INITIAL_WAIT_NS`], 1 s where a LAN's is about 100 µs. It judges nothing and feeds no
+    /// estimator: a handshake is not a probe. A zero round trip measures nothing and is not taken.
+    pub fn join_measured(&mut self, peer: HostId, round_trip: Duration) -> Result<(), Full> {
+        self.join(peer)?;
+        let rtt = u64::try_from(round_trip.as_nanos()).unwrap_or(u64::MAX);
+        if let Some(held) = self.peers.get_mut(&peer)
+            && rtt > 0
+        {
+            held.handshake_rtt_ns = Some(rtt);
+        }
+        Ok(())
+    }
+
     /// Applies a gossiped membership update, returning the change and enqueuing it for onward
     /// gossip; refused, and counted, when it is about one member more than the view holds.
     pub fn apply(&mut self, subject: HostId, update: MemberState) -> Result<Option<Change>, Full> {
@@ -2011,6 +2044,29 @@ mod tests {
             Liveness::Alive,
             "judging nothing"
         );
+    }
+
+    /// A peer joined with its handshake's round trip is first probed on that round trip's wait, not
+    /// the initial one; a peer joined without one waits the initial wait, backed off.
+    #[test]
+    fn a_handshake_round_trip_sets_the_first_wait() {
+        let mut detector = Detector::new(LOCAL, Exposure::new(), room(), RESOLUTION);
+        let handshake = Duration::from_micros(100);
+        detector.join_measured(A, handshake).unwrap();
+        detector.join(B).unwrap();
+        let mut requests = Vec::new();
+        // Each period's target and its wait, the first unanswered one doubling the second's.
+        let first = detector.poll(0, &mut requests).unwrap();
+        let first_wait = detector.wake().unwrap();
+        let second = detector.poll(first_wait, &mut requests).unwrap();
+        let second_wait = detector.wake().unwrap() - first_wait;
+        let base = u64::try_from(handshake.as_nanos()).unwrap();
+        let expected = if first.to == A {
+            [(A, base), (B, 2 * INITIAL_WAIT_NS)]
+        } else {
+            [(B, INITIAL_WAIT_NS), (A, 2 * base)]
+        };
+        assert_eq!([(first.to, first_wait), (second.to, second_wait)], expected);
     }
 
     /// Measurement periods follow round trips that lengthen. A measurement period ends at its

@@ -5,9 +5,10 @@
 //! to handle itself is written too; the account that explains an ending is the last one written.
 //!
 //! The account names the fault, the image the instruction is in and its offset there, the thread's
-//! registers and stack at the fault, and the code bytes around the instruction, then a backtrace.
-//! A backtrace names the function; the registers and the instruction name the register that held
-//! the address touched, and the value it held.
+//! registers and stack at the fault, the faulting frame's words, and the code bytes around the
+//! instruction, then a backtrace. A backtrace names the function; the registers and the instruction
+//! name the register that held the address touched, and the value it held; the frame's words show
+//! where that value came from and what lies beside it.
 #![allow(unsafe_code)]
 
 use std::ffi::c_void;
@@ -46,8 +47,10 @@ const FATAL: [NTSTATUS; 6] = [
 /// The bytes a line of the account takes at most. The first is the longest, 111: its fixed words,
 /// 37 bytes with the line's end; the code, `0x` and eight hex digits; three addresses of `0x` and up
 /// to sixteen; and a count of up to ten decimal digits. A line of registers takes 107 at most (four
-/// of a name of up to six letters, a space and eighteen characters, two spaces between), the
-/// image's 65, a line of code 73 (`code `, an address, a colon, sixteen bytes) and the stack's 45.
+/// of a name of up to six letters, a space and eighteen characters, two spaces between), a line of
+/// the frame's words 102 (`words `, an address, a colon, four words of eighteen characters after a
+/// space), the image's 65, a line of code 73 (`code `, an address, a colon, sixteen bytes) and the
+/// stack's 45.
 const LINE: usize = 111;
 
 /// The registers written a line.
@@ -65,6 +68,16 @@ const CODE_FROM: usize = 16;
 
 /// Code bytes written a line.
 const CODE_A_LINE: usize = 16;
+
+/// Bytes of the stack written from the faulting frame's stack pointer up. `Node::drain`'s frame
+/// measured 0x270 bytes from its stack pointer to its frame pointer on windows-11-arm (run
+/// 37208590794): a KiB holds it whole, with its frame record and the bottom of its caller's. Below
+/// the stack pointer the system has already laid the exception's records, so nothing there is the
+/// faulting thread's own.
+const FRAME_BYTES: usize = 1024;
+
+/// Stack words written a line.
+const WORDS_A_LINE: usize = 4;
 
 /// The page protections a read is allowed under (memoryapi.h's memory protection constants).
 const READABLE: u32 = PAGE_READONLY
@@ -139,6 +152,7 @@ fn account(stderr: &mut Stderr, record: &EXCEPTION_RECORD, context: Option<&CONT
     }
     if let Some(context) = context {
         write_registers(stderr, context);
+        write_frame(stderr, stack_pointer(context));
     }
     let (mut low, mut high) = (0usize, 0usize);
     // SAFETY: both are writable `usize`s for the call, which writes each once with the bounds of
@@ -161,6 +175,36 @@ fn write_registers(stderr: &mut Stderr, context: &CONTEXT) {
             }
             writeln!(out)
         });
+    }
+}
+
+/// The faulting frame's words from the stack pointer `sp` up, [`WORDS_A_LINE`] a line after the
+/// address of the first, as many of [`FRAME_BYTES`] as lie in the stack's readable region.
+fn write_frame(stderr: &mut Stderr, sp: usize) {
+    let first = std::ptr::with_exposed_provenance::<u64>(sp);
+    let Some(region) = readable(first.cast()) else {
+        return;
+    };
+    let word = size_of::<u64>();
+    let end = sp.saturating_add(FRAME_BYTES).min(region.end);
+    let words = end.saturating_sub(sp).checked_div(word).unwrap_or(0);
+    let mut at = 0;
+    while at < words {
+        let start = sp.saturating_add(at.saturating_mul(word));
+        line(stderr, |out| {
+            write!(out, "words {start:#x}:")?;
+            for index in at..words.min(at.saturating_add(WORDS_A_LINE)) {
+                // SAFETY: the word lies in `[sp, end)`, inside the committed, readable region that
+                // holds the stack pointer, and is aligned, the stack pointer being so (a word on
+                // x86_64, sixteen bytes on aarch64). The faulting thread is stopped in this handler,
+                // which runs below the stack pointer, so nothing writes these words while they are
+                // read, by address and as plain integers.
+                let value = unsafe { first.wrapping_add(index).read_volatile() };
+                write!(out, " {value:#018x}")?;
+            }
+            writeln!(out)
+        });
+        at = at.saturating_add(WORDS_A_LINE);
     }
 }
 
@@ -273,6 +317,24 @@ fn registers(context: &CONTEXT) -> impl Iterator<Item = (&'static str, u64)> {
         ("eflags", u64::from(context.EFlags)),
     ]
     .into_iter()
+}
+
+/// The faulting thread's stack pointer.
+#[cfg(target_arch = "aarch64")]
+fn stack_pointer(context: &CONTEXT) -> usize {
+    usize::try_from(context.Sp).unwrap_or(0)
+}
+
+/// The faulting thread's stack pointer.
+#[cfg(target_arch = "x86_64")]
+fn stack_pointer(context: &CONTEXT) -> usize {
+    usize::try_from(context.Rsp).unwrap_or(0)
+}
+
+/// No stack pointer is read from another architecture's context.
+#[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+fn stack_pointer(_context: &CONTEXT) -> usize {
+    0
 }
 
 /// No registers are named for another architecture's context.

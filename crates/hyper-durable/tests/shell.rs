@@ -839,6 +839,73 @@ fn a_leader_applies_its_own_term_before_its_write_is_durable() {
     }
 }
 
+/// The owner's policy reaches the core through the replica: the member's election priority, in
+/// force once it has a term, and a member's window, refused for a member the configuration does
+/// not name; and the owner reads its budget there, holding what the replica charged.
+#[test]
+fn the_owners_priority_and_windows_reach_the_core_and_its_budget_reads_what_is_charged() {
+    let mut r = led(2, false);
+    r.set_priority(7);
+    assert_eq!(r.core().raft.priority_in_force(), 7);
+    assert!(r.set_inflight_bytes(2, 4096));
+    let progress = r.core().raft.tracker().get(2).unwrap();
+    assert_eq!(progress.inflights.byte_cap(), 4096);
+    assert!(
+        !r.set_inflight_bytes(9, 4096),
+        "a member the configuration does not name"
+    );
+    let mut b = sole(1, Bytes::new(1 << 20), |_| {});
+    let used = b.budget_mut().used();
+    assert_eq!(used, b.charged());
+}
+
+/// A read a quorum confirmed at an index the member has not applied waits in the replica, counted
+/// by `reads_held`, and is given out by the drive that applies through its index: a leader whose
+/// followers hold its entry before its own disk does confirms the read at the commit its own write
+/// has not reached (`Config::apply_unpersisted` off).
+#[test]
+fn a_read_confirmed_ahead_of_the_apply_is_held_until_the_apply_reaches_it() {
+    let mut r = led(3, false);
+    r.propose(Vec::new(), b"x".to_vec()).unwrap();
+    let mut out = Output::default();
+    r.drive(now(), waker(), &mut out).unwrap();
+    acknowledge(&mut r, 2);
+    acknowledge(&mut r, 3);
+    let commit = r.core().raft.log().committed();
+    assert!(
+        commit > r.applied().index,
+        "the leader's own write is not durable"
+    );
+    r.read(b"r".to_vec()).unwrap();
+    out.clear();
+    r.drive(now(), waker(), &mut out).unwrap();
+    let rounds: Vec<Message> = out
+        .messages
+        .iter()
+        .filter(|m| m.msg_type == MessageType::MsgHeartbeat)
+        .cloned()
+        .collect();
+    assert!(!rounds.is_empty(), "the read's round of heartbeats left");
+    for m in rounds {
+        r.step(Message {
+            msg_type: MessageType::MsgHeartbeatResponse,
+            from: m.to,
+            to: 1,
+            term: m.term,
+            context: m.context.clone(),
+            ..Message::default()
+        })
+        .unwrap();
+    }
+    out.clear();
+    r.drive(now(), waker(), &mut out).unwrap();
+    assert!(out.reads.is_empty());
+    assert_eq!(r.reads_held(), 1);
+    let out = pump(&mut r);
+    assert_eq!(out.reads, vec![(b"r".to_vec(), commit)]);
+    assert_eq!(r.reads_held(), 0);
+}
+
 /// The owner's clock in nanoseconds, simulated: each reading a nanosecond after the one before, so
 /// time only moves forward, as an owner's monotonic clock does, and every run reads the same times.
 /// No test here waits on elapsed time; those that judge time state it outright.

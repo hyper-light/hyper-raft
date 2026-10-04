@@ -897,8 +897,10 @@ and allocates no more on that project's workload.
   adds `bounds`, `visit` (entries where the store holds them, borrowed: the state machine applies
   from the log's own buffers), `room` and `write_now` (the writes of §4.3, before the core opens).
   `GroupStore` (`src/hyperlog.rs`) is hyper-log's group handle, each write one update cut into
-  frame-sized parts and answered once every part is; `RamStore` (`src/memory.rs`) completes each
-  write as it is submitted, depth one, slates' case and the simplest test store.
+  frame-sized parts and answered once every part is; an owner with nothing else to do for the
+  group waits on it for the oldest write's answer (`GroupStore::wait`, the log's own wait for each
+  part) and drives after, as focal's `wait_persisted` does. `RamStore` (`src/memory.rs`)
+  completes each write as it is submitted, depth one, slates' case and the simplest test store.
 - **A store's hold** (`src/store.rs`): `LogStore::Hold`, `held` and `release`, and
   `Fault::Held` (§2.4). hyper-log's handle, the RAM store and the tests' stores hold nothing
   (`Infallible`). `tests/shell.rs` holds a write whose entry needs a precondition until its
@@ -909,8 +911,12 @@ and allocates no more on that project's workload.
   before it returns) and `persist` are its snapshot and compaction.
 - **`Replica`** (`src/replica.rs`): `open`, `step`, `suspect`, `trust`, `restarted`,
   `set_timing`, `deadline`, `campaign`, `propose`, `propose_fast`, `change`, `read`, `transfer`,
-  `report_unreachable`, `report_snapshot`, `drive`, `compact`, `resume`, `held`, `release`; and
-  on ticks (§8), `tick`, `beat`, `set_randomized_election_timeout`, `set_patience`.
+  `report_unreachable`, `report_snapshot`, `drive`, `compact`, `resume`, `held`, `release`;
+  the owner's policy, `set_priority` and `set_inflight_bytes` (the core's, as focal's owners set
+  them from placement and from what a path carries); what the owner reads to admit and account,
+  `reads_held` (reads confirmed that wait for their apply, which an owner bounding reads counts
+  beside the core's) and `budget_mut` (an owner whose budget charges by lane says which before a
+  call); and on ticks (§8), `tick`, `beat`, `set_randomized_election_timeout`, `set_patience`.
   `Settings::elections` is stated by every owner, with no default. Every call runs inside the unwind boundary. A drive takes the log's answers first and
   only then, applies what the fence allows, one page at most (§2.2), takes at most one `Ready`
   (§7's quantum), and writes the

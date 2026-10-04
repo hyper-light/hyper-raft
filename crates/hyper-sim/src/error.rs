@@ -50,6 +50,9 @@ pub enum SimError {
         /// Where it ended.
         at: usize,
     },
+    /// A measured table that is no distribution: its grid not from zero to a million rising, its
+    /// values falling, or the two of different lengths (`net::Measured`).
+    NotADistribution,
     /// A strategy picked a candidate that is not there.
     Pick {
         /// What the strategy picked.
@@ -81,6 +84,7 @@ impl fmt::Display for SimError {
                 write!(f, "the run diverged from its trace at word {at}")
             }
             Self::TraceEnded { at } => write!(f, "the trace ended at word {at}"),
+            Self::NotADistribution => f.write_str("a measured table that is no distribution"),
             Self::Pick { picked, candidates } => {
                 write!(f, "a strategy picked candidate {picked} of {candidates}")
             }

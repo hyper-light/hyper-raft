@@ -72,7 +72,7 @@ handshake state. Two replacements were weighed and rejected:
 Chosen design, by kind of state:
 - **Plain data is copied into its owner.** A connection takes its own `TransportConfig` value,
   a few hundred bytes. Congestion control is a closed enum of controllers carried by value
-  (`Cubic`, `NewReno`, `Bbr`, and Copa when it lands). That replaces the shared
+  (`Cubic`, `NewReno`, `Bbr`, `Copa`; §4d). That replaces the shared
   `ControllerFactory`, and it makes the controller set one reviewed list, not a plug-in point.
 - **Shared objects live in the endpoint's `Configs` slab.** A slot holds a server or a client
   configuration, and with it the TLS config, the handshake-token key, the time source and the
@@ -418,6 +418,60 @@ not wait behind bulk. The receiver judges it by the kernel's receive stamp (§4b
 Measured (`docs/benchmarks.md`, "hyper-liveness"): no allocation a heartbeat once configured, about
 0.7 to 1.0 µs of the crate's work a heartbeat; per node, two plane messages a pair an interval whatever the
 groups, against per-group heartbeats that grow with the groups.
+
+## 4d. Copa in the congestion enum (stage 4's first patch, 2026-10-04)
+
+Built: `crates/hyper-quic/src/congestion/copa.rs`, a fourth controller of the closed enum,
+`Congestion::Copa(CopaConfig)`. CUBIC stays the default until the harness below measures Copa on
+this stack. The source notes are in `docs/research/congestion.md`.
+
+The law has three layers:
+
+- **Copa (NSDI 2018).** The paper as slates fixed its details from the paper, genericCC and mvfst:
+  - integer arithmetic throughout, with Nichols' filters for the four windows (constant space);
+  - RFC 9002 §7.8 bounds only the window's growth, so a window the sender does not fill still
+    shrinks. slates' guard once skipped every update, and a window slow start had overshot stayed
+    at 1.5 MB on a 250 kB product.
+- **focal's measured changes (focal's record F39):**
+  - Slow start doubles once what was sent after the last doubling is heard of. Judged by what was
+    sent before it, the window reached 3.07 MB where the path and queue hold 2.5 MB at 100 Mbit/s,
+    100 ms.
+  - A round trip moves the window by half of itself at most (`CopaConfig::stride`, default 2):
+    95% of the path at 100 Mbit/s, 100 ms, where the paper's whole-window bound carried 67%.
+  - A mark (ECN-CE) is answered as a classic sender answers congestion, halving the window
+    (`CopaConfig::mark_backoff`). The gentler RFC backoffs left NewReno and CUBIC under CoDel below
+    nine tenths of their bar.
+  - For ten seconds after a mark past slow start, the window grows a datagram a round trip.
+    Competing, it raises `1/δ` only after a round trip in which the target held the window back.
+- **focal's derivations for the competing mode (b18):**
+  - A1: both mode windows span the five-round-trip cycle. The paper's §2.2 detector asks for a
+    nearly empty queue "in the last 5 RTTs", the period §3 gives Copa's oscillation; genericCC,
+    slates and focal took four.
+  - A2: past slow start, a delay sample is judged against the window its packet was sent under, as
+    §3's model `q(t) = w(t − RTTmin) − BDP` has it. A ring of 32 window samples, at least a
+    sixteenth of a smoothed round trip apart, reaches two round trips back. Without it, a queue
+    long beside the path locks the window to the target, and the competing mode never ends.
+  - B: competing, `1/δ` grows by `d_q/RTTstanding` a round trip, so Copa's rate grows `1/RTT` a
+    round trip as a classic sender's does. The paper's packet a round trip grows it `RTT/d_q`
+    times faster, which left NewReno a third at most.
+
+Each of A1, A2 and B is pinned by a unit test that fails with the change undone (checked 2026-10-04).
+The initial window is RFC 9002 §7.2's, ten datagrams limited to the larger of 14,720 bytes and two
+datagrams; slates and focal took ten datagrams, which is the same at 1,200 bytes.
+
+Not yet:
+
+- **Pacing.** The connection paces at its own rule, 5/4 of the window per smoothed round trip
+  (RFC 9002 §7.7), not at Copa's `2·cwnd/RTTstanding` (§2.1). The pacing seam is stage 4's next
+  patch, with slates' 1 ms quantum and two-datagram floor.
+- **The harness.** Every measured result is to be re-measured after the port: focal's F39 grids
+  (NewReno and CUBIC beside Copa on drop-tail, step and CoDel queues, the harm bar
+  `min(incumbent beside its own kind, incumbent beside CUBIC)`) and slates' bake-off. The runs are
+  real hyper-quic endpoints over hyper-sim's network, and each seed's check is exact: focal's rule
+  judged harm by deviations over seeds.
+- **Finding 4.** Under a single queue that CoDel manages, the manager empties the queue and hides
+  the competition from the mode test. It is open and not designed; the candidates are Copa+'s
+  passive identity and Nimbus's pulses (`docs/research/congestion.md`).
 
 ## 5. Consumers
 

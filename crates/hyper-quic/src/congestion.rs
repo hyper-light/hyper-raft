@@ -5,10 +5,12 @@ use crate::connection::RttEstimator;
 use std::any::Any;
 
 mod bbr;
+mod copa;
 mod cubic;
 mod new_reno;
 
 pub use bbr::{Bbr, BbrConfig};
+pub use copa::{Copa, CopaConfig};
 pub use cubic::{Cubic, CubicConfig};
 pub use new_reno::{NewReno, NewRenoConfig};
 
@@ -107,6 +109,8 @@ pub enum Congestion {
     NewReno(NewRenoConfig),
     /// BBR (version 1)
     Bbr(BbrConfig),
+    /// Copa (Arun and Balakrishnan, NSDI 2018), with slates' and focal's measured changes
+    Copa(CopaConfig),
 }
 
 impl Default for Congestion {
@@ -122,6 +126,7 @@ impl Congestion {
             Self::Cubic(config) => Box::new(Cubic::new(config.clone(), now, current_mtu)),
             Self::NewReno(config) => Box::new(NewReno::new(config.clone(), now, current_mtu)),
             Self::Bbr(config) => Box::new(Bbr::new(config.clone(), current_mtu)),
+            Self::Copa(config) => Box::new(Copa::new(config.clone(), now, current_mtu)),
         }
     }
 }

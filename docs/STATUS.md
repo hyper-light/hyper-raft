@@ -66,6 +66,14 @@ worked around.
   Member 1 was stopped. Member 2, at term 5, suspected it, with a longest write of 597 ms. The two
   members up took no write within the 2.88 s the test excuses. Member 3's report is not in the
   failure's output.
+- **hyper-liveness `processes` `a_stalled_disk_and_a_killed_node_are_suspected_and_no_live_one_is`,
+  ubuntu-24.04-arm CI (`d7f6d48` on `diag-shell-calls`, run 37172761220; the commit changes only
+  hyper-durable).** Member 4 suspected the stalled disk 18,223,323 ns after its last heartbeat was
+  due, against its stated bound of 18,171,760 ns: 51.6 µs, 0.28 %, past it. The bound is across
+  the two clocks (`bound.rs`): the best echo's bound on their offset, and the drift allowance
+  `PHI_PER_MILLION` over the span. Open: which term fails on that runner, or whether the times the
+  test compares are not the ones the bound is of. The member reports its waits before it polls
+  (`Liveness::on_wait`), so the suspicion's own wake is already in its `G`.
 
 ## Consumers
 

@@ -932,6 +932,12 @@ impl Node {
                     flush_most_ns: self.flush_most,
                     turn_most_ns: self.turn_most,
                     unread: self.unread,
+                    stalled: self.replica.is_stalled(),
+                    marked: self.replica.mark().is_some(),
+                    deadline_ns: self
+                        .replica
+                        .deadline()
+                        .map_or(u64::MAX, |at| at.saturating_sub(self.now())),
                     suspected: self
                         .attached
                         .iter()

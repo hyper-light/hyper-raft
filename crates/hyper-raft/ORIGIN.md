@@ -684,3 +684,35 @@ on mantle's range group of three over hyper-log with one member's store answers 
   drains every `Ready` after each operation and compares unchanged, as does every suite of this
   crate. The cost is one walk of the queue a campaign, over what the member queued since its last
   `Ready`; nothing is allocated.
+
+## A spare queue for each ready in flight
+
+Not a port: found tracing mantle's range replica on the durable shell (mantle's D-1, 2026-10-03)
+against mantle's own shell, whose driving thread it out-reallocated by 0.02 an entry once a group
+had run 12,000 entries. Every reallocation of an 8-aligned block on that thread was recorded with
+its sizes, and the excess was one: a follower's queue of messages growing from four slots to eight
+(`Outgoing::push_counted`, from `handle_append_entries`), 176 times in 12,000 entries at three
+members and 212 at five, where mantle's shell grew none. Each `Ready` hands the member's queue to
+the owner (`Outgoing::take`) and leaves the spare the owner gave back in its place; the shell gives
+each write's queue back only once the write is durable (`RawNode::recycle_messages`), and with three
+writes out it takes three `Ready`s before the first comes back. The member kept one spare and
+dropped every other queue given back, so the second and third `take` started a queue from nothing,
+and a follower that queued more than four answers while its writes were out grew it again.
+
+- **The rule** (`src/raft.rs`: `Outgoing::recycle`, `Outgoing::take`): the member keeps up to one
+  spare for each `Ready` whose write may be out (`Limits::readies_in_flight`, which the shell sets to
+  its store's depth), ordered by room; a `take` leaves the one with the most, and past the bound a
+  queue with more room replaces the one with the least. The bound on any one queue
+  (`Limits::pending_messages`) stands, and `Outgoing::resident_bytes` counts every spare. An owner
+  that keeps one write out (`readies_in_flight` one) keeps one spare, as before.
+- **The tests.** `raft::outgoing::a_member_keeps_a_spare_queue_for_each_ready_in_flight`: three
+  queues of eight given back while the member queues, then three takes, each starting with room
+  for eight when three are kept, and only the first when one is;
+  `raft::outgoing::spares_past_the_bound_keep_the_most_room`.
+- **Measured** with `crates/hyper-durable-compare` on the simulated device, 4 rounds of 3,000
+  entries after 12,000 (`docs/benchmarks.md`, "mantle's range replica on the shell (D-1)"): the
+  shell's driving thread reallocates 21.00 times an entry at three members and 33.00 at five, as
+  mantle's shell does, against 21.02 and 33.02 before; the growths from four slots fall to 1 and 22.
+  After only 50 entries the first 3,000 still grow each circulating queue to its high water once,
+  about 18 growths a group of three more than mantle's shell makes, 0.01–0.02 an entry over those
+  3,000; they are done by 3,000 entries, after which the counts are mantle's.

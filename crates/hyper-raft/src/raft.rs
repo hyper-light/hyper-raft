@@ -3303,6 +3303,16 @@ impl<S: Storage> Raft<S> {
         match kind {
             MessageType::MsgPropose => Err(Error::ProposalDropped),
             MessageType::MsgReadIndex => Self::drop_read(&message),
+            MessageType::MsgAppend | MessageType::MsgHeartbeat | MessageType::MsgSnapshot
+                if self.state == StateRole::PreCandidate && self.suspects(message.from) =>
+            {
+                // A pre-candidate keeps its leader's term, so what that leader sends would make it
+                // a follower again and end the asking its detectors began: a leader that is up
+                // answers a pre-vote with a heartbeat, which can reach the asker before any grant.
+                // While it asks it does not hear a leader it suspects; the message is dropped, as
+                // a lost one.
+                Ok(())
+            }
             MessageType::MsgAppend => {
                 self.become_follower(message.term, message.from)?;
                 self.handle_append_entries(message)

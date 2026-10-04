@@ -30,6 +30,10 @@
 //!   it is trusted). A leader asked for a vote by a member of its group tells it who leads, by a
 //!   heartbeat: such a member knows no leader, as one that restarted while its group was idle
 //!   does, and nothing else would tell it.
+//! - **A pre-candidate does not hear a leader it suspects**: it keeps the leader's term while it
+//!   asks, so the leader's appends, heartbeats and snapshots would make it a follower again and
+//!   end its asking; a leader that is up answers a pre-vote with a heartbeat, which can come
+//!   before every grant, ask after ask. They are dropped while it asks, as lost messages are.
 //! - **A leader that trusts a member again** sends it a heartbeat, so a member that was cut off
 //!   while the group was idle catches up (CockroachDB wakes a quiesced range when a node becomes
 //!   live again).

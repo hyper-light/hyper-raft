@@ -364,3 +364,11 @@ and allowed at the site with its reason; no behaviour changes:
   which an owner replaces through `ServerConfig`.
 - `config/transport.rs`, `QlogConfig::default`: qlog's start time, taken when a qlog configuration
   is made (the `qlog` feature).
+
+## 7. Allocations after hyper-tls lends its TLS 1.2 sessions (2026-10-03)
+
+No change here. hyper-tls's session store now moves a server name in where it cloned it, and a
+spent TLS 1.3 ticket's certificate chain moves into the connection where it was copied
+(`crates/hyper-tls/VENDORED.md` §5). `tests/handshake.rs`, debug profile, this machine: 492
+allocations a full handshake (494 before), 497 a resumed one (501 before), against 526c2cc's 505 and
+511.

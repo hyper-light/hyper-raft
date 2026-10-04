@@ -291,7 +291,7 @@ development machine, debug profile, three runs (reallocations vary by ±1, bytes
 | TLS 1.2 resumed | 101 allocs | 101 allocs, 17 reallocs, 21,766 B |
 
 No hot path gained an allocation. The TLS 1.2 resumed +2 against 526c2cc (§2 item 8) is still
-owed. Its cause: `ClientSessionStore::tls12_session` hands out an owned
+owed (closed in §5). Its cause: `ClientSessionStore::tls12_session` hands out an owned
 `Tls12ClientSessionValue`, so the ticket and the server's certificate chain are copied out of a
 store that keeps them for the next connection, where upstream bumped two reference counts. The
 ticket copy could go if every ClientHello borrowed it from the store in the call that sends it,
@@ -306,3 +306,115 @@ The workspace denies `Instant::now`, `SystemTime::now`, thread spawns and enviro
 (`clippy.toml`, `docs/sim.md` §3.9). Upstream reads `SSLKEYLOGFILE` in `key_log_file.rs`, only when
 an owner installs `KeyLogFile`; it is kept and allowed at the site with its reason. No behaviour
 changes.
+
+## 5. TLS 1.2 sessions lent by their store (2026-10-03)
+
+§3's owed count, closed at its cause. `ClientSessionStore::tls12_session` handed out an owned
+`Tls12ClientSessionValue`, so every TLS 1.2 resumption copied the session out of the store: its
+ticket, its master secret, and the server's certificate chain (the vector and each certificate),
+where upstream bumped two reference counts. A resumed handshake then stored a new value made of
+the same chain, copied again from `peer_certificates`.
+
+1. **The store lends.** `tls12_session(&mut self, &ServerName<'static>) ->
+   Option<&Tls12ClientSessionValue>`. In the call that sends the ClientHello
+   (`ClientConnection::new`), the client reads the session where it is: its session ID, or a random
+   one when it offers the ticket (RFC 5077 §3.4), and the ticket, copied into the ClientHello's
+   extension as upstream copied it. The connection keeps only the session's `SessionStamp`, an
+   `Identity` drawn for each session.
+2. **A retry repeats the first ClientHello's ticket.** RFC 8446 §4.1.2 lets a ClientHello sent
+   after a HelloRetryRequest change only its key shares, cookie, early data, PSK and padding. The
+   first ClientHello's session ticket extension is moved out of the message once its bytes are
+   encoded and kept in the connection's `ClientHelloInput`, and the retry offers it again, whatever
+   the store did meanwhile, without a copy.
+3. **The server's answer finds the session by its stamp** (`lent_tls12_session`), in the call that
+   takes the ServerHello, and copies the chain into `peer_certificates`: the one copy upstream made
+   too.
+4. **The store keeps a session it displaced after lending it.** Between the ClientHello and the
+   ServerHello the owner may drive other connections with the same configuration, which save
+   another session for the server, remove it (a resumption that failed to decrypt), or evict the
+   server from the cache. `ClientSessionMemoryCache` marks a session lent when it lends it, and
+   moves a lent session it displaces into a queue it searches by stamp: at most as many sessions as
+   its bound on servers (`size` / 8, rounded up), the oldest pushed out first, the queue's memory
+   reserved when the cache is made. An insertion into `LimitedCache` now returns the entry it
+   evicted, so an eviction displaces like a replacement or a removal. A resumption whose session was
+   pushed out before its server answered fails with the new `Error::ResumedSessionLost`, sending an
+   `internal_error` alert (RFC 5246 §7.2.2): a stated bound, typed at its edge, where a store of
+   values shared by reference counts had no bound to state. A store of another implementation that
+   keeps nothing it displaced gives that error whenever its session is displaced before the answer.
+5. **A resumed session is renewed where the store keeps it** (`current_tls12_session`,
+   `Tls12ClientSessionValue::renew`): the session ID the server echoed, the ticket it issued if it
+   issued one, and the lifetime it gave, from now. Its chain, master secret, suite, and the verifier
+   and resolver identities it was made under stay as they were. Upstream stored a new value,
+   copying the chain from `peer_certificates` and stamping the identities the configuration had at
+   that moment. A session the store displaced meanwhile is saved anew as upstream saved it, with the
+   ticket the ClientHello offered if the server issued none; it then displaces the newer one, as
+   upstream's last save did.
+6. **Only the states a resumption reaches carry the session**, as a `Resumed { stamp,
+   offered_ticket }`. Every state of a full handshake carried an empty
+   `Option<Tls12ClientSessionValue>` before, about 150 bytes in each boxed state.
+7. **Two copies the cache made of server names, gone**: `set_tls12_session` and
+   `insert_tls13_ticket` cloned the name they were given before inserting it, an allocation for
+   every session or ticket kept under an owned name; it is moved in. A TLS 1.3 ticket, which moves
+   out of its store and is spent by the handshake that offers it, gives its chain to
+   `peer_certificates` by move, where upstream copied it out of the shared session.
+
+API changes: `ClientSessionStore::tls12_session` lends, through `&mut self` (to mark the lend) and
+a `'static` name, as `take_tls13_ticket` and `remove_tls12_session` already take; the trait gains
+`lent_tls12_session` and `current_tls12_session`; `Tls12ClientSessionValue` is no longer `Clone`
+and has `stamp()`; `SessionStamp` and `Error::ResumedSessionLost` are new. A store behind a lock
+cannot lend a reference, so `tests/api.rs`'s `ClientStorage` keeps TLS 1.2 sessions per instance and
+shares only its operation log, key exchange hints and TLS 1.3 tickets between clones; no assertion
+changed.
+
+### The test
+
+`tests/alloc_per_handshake.rs` now runs upstream rustls 0.23.45, unmodified (the dev-dependency
+`upstream-rustls`, whose checksum in `Cargo.lock` is the archive's SHA-256 that
+`vendor/rustls/VENDORED.md` records, built with this crate's one build path: `aws_lc_rs`,
+`brotli`, `logging`, `prefer-post-quantum`, `std`, `tls12`, `zlib`), beside hyper-tls in one
+process, with one counter,
+over eleven handshake shapes with ECDSA P-256 and with Ed25519 credentials. Both providers draw
+their random bytes from one SplitMix64 stream reseeded for each run. A shape's allocations are the
+same on every run, so they are held to upstream's exactly: no shape may allocate more than
+upstream's does. With Ed25519 every size in a handshake is fixed, so reallocations and bytes are
+the same on every run too (five runs, identical), and they are held to upstream's as well. With
+ECDSA they vary with the signatures' DER lengths and are recorded below. Before this change the
+test failed: TLS 1.2 resumed 101 allocations against 99, TLS 1.2 resumed by ticket 117 against 115,
+declined 144 against 143, and bytes over upstream's in six Ed25519 shapes, from 8 B (TLS 1.2 full,
+the states' empty sessions) to 1,298 B (TLS 1.2 resumed by ticket). It passes now.
+
+New tests besides: `tls12_ticket_is_offered_again_after_a_retry_though_its_store_replaced_it`,
+`a_tls12_session_displaced_after_it_was_lent_still_resumes` (which fails with the queue taken out),
+`a_tls12_session_pushed_out_of_its_store_fails_the_resumption_typed`, and the cache's
+`test_lent_tls12_session_outlives_its_servers_eviction`,
+`test_unlent_tls12_session_is_not_kept_once_displaced` and
+`test_current_tls12_session_is_only_the_current_stamp`.
+
+### Allocations per handshake
+
+Client and server together, debug profile, macOS aarch64 development machine; allocations the same
+in every run of either credential, reallocations and bytes for Ed25519, whose runs are identical:
+
+| Shape | Upstream 0.23.45 | Before | Now | Now, reallocations and bytes (upstream's) |
+|---|---|---|---|---|
+| TLS 1.3 full | 296 | 286 | 286 | 44, 34,578,758 B (44, 34,579,070 B) |
+| TLS 1.3 resumed | 219 | 213 | 209 | 43, 54,194 B (43, 55,636 B) |
+| TLS 1.3 with a HelloRetryRequest | 325 | 315 | 315 | 60, 34,561,398 B (60, 34,561,718 B) |
+| TLS 1.3, both sides authenticated | 423 | 411 | 411 | 72, 69,126,558 B (72, 69,127,038 B) |
+| TLS 1.2 full | 144 | 140 | 140 | 31, 30,215 B (31, 31,415 B) |
+| TLS 1.2 resumed by session ID | 99 | 101 | 91 | 17, 18,332 B (17, 19,942 B) |
+| TLS 1.2 full, the server issuing tickets | 156 | 151 | 151 | 38, 31,864 B (38, 33,224 B) |
+| TLS 1.2 resumed by ticket | 115 | 117 | 106 | 25, 21,295 B (25, 23,065 B) |
+| TLS 1.2 resumption declined | 143 | 144 | 139 | 31, 29,159 B (31, 30,471 B) |
+| TLS 1.2, both sides authenticated | 184 | 180 | 180 | 52, 47,991 B (52, 49,495 B) |
+| A TLS 1.2 ticket offered, then a TLS 1.3 retry | 328 | 324 | 317 | 61, 34,562,062 B (61, 34,562,654 B) |
+
+The full handshakes' bytes are the brotli compressor's tables. hyper-quic's handshakes, on this
+crate, went from 494 to 492 allocations (full) and from 501 to 497 (resumed): its client's
+tickets are stored under an owned name, and its resumed ticket's chain moves.
+
+### Oracle
+
+Unit 250 (247 and the cache's three), api 232 (229 and the three above), api_ffdhe 5,
+client_cert_verifier 4, ech 2, key_log_file_env 2, process_provider 1, server_cert_verifier 6,
+unbuffered 27, alloc_per_handshake 1, doctests 15 (3 ignored): all pass.

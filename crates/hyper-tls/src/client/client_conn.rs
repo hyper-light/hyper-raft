@@ -51,20 +51,44 @@ pub trait ClientSessionStore: fmt::Debug + Send + Sync {
     /// to the server.
     fn kx_hint(&self, server_name: &ServerName<'_>) -> Option<NamedGroup>;
 
-    /// Remember a TLS1.2 session.
+    /// Remember a TLS1.2 session, displacing the current one for `server_name`.
     ///
-    /// At most one of these can be remembered at a time, per `server_name`.
+    /// At most one of these is current at a time, per `server_name`.
     fn set_tls12_session(
         &mut self,
         server_name: ServerName<'static>,
         value: persist::Tls12ClientSessionValue,
     );
 
-    /// Get the most recently saved TLS1.2 session for `server_name` provided to `set_tls12_session`.
+    /// Lend the most recently saved TLS1.2 session for `server_name` to the ClientHello that
+    /// offers it.
+    ///
+    /// The connection copies out of it only what its ClientHello sends, and keeps the session's
+    /// [`SessionStamp`](persist::SessionStamp). When the server answers, a later call finds the
+    /// session again through [`lent_tls12_session`](Self::lent_tls12_session). A store should
+    /// keep a session it displaces after lending it findable there for a stated bound; a
+    /// connection whose server resumes a session its store no longer holds fails with
+    /// [`Error::ResumedSessionLost`](crate::Error::ResumedSessionLost).
     fn tls12_session(
+        &mut self,
+        server_name: &ServerName<'static>,
+    ) -> Option<&persist::Tls12ClientSessionValue>;
+
+    /// The TLS1.2 session `stamp` this store lent for `server_name`, if it still holds it: the
+    /// current session, or one displaced since it was lent and kept.
+    fn lent_tls12_session(
         &self,
-        server_name: &ServerName<'_>,
-    ) -> Option<persist::Tls12ClientSessionValue>;
+        server_name: &ServerName<'static>,
+        stamp: persist::SessionStamp,
+    ) -> Option<&persist::Tls12ClientSessionValue>;
+
+    /// The current TLS1.2 session for `server_name` if it is `stamp`: a connection that resumed
+    /// it renews it in place.
+    fn current_tls12_session(
+        &mut self,
+        server_name: &ServerName<'static>,
+        stamp: persist::SessionStamp,
+    ) -> Option<&mut persist::Tls12ClientSessionValue>;
 
     /// Remove and forget any saved TLS1.2 session for `server_name`.
     fn remove_tls12_session(&mut self, server_name: &ServerName<'static>);

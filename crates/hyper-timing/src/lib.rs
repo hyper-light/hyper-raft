@@ -54,6 +54,8 @@ pub use qos::{
 };
 mod folds;
 pub use folds::{Exposure, Flushes, FoldFull, Lateness, Wakes};
+mod histogram;
+pub use histogram::Histogram;
 mod link;
 pub use link::{
     Configuration, EstimateError, Estimates, Event, LinkEstimator, MILLION, PHI_PER_MILLION,

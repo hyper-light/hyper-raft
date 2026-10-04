@@ -1691,6 +1691,24 @@ settings, the fast track and the crash at every persistence step, its detectors 
 ten about a member that is down or cut off and wrong one time in ten about one that is not
 (`crates/hyper-raft/ORIGIN.md`, "L-2", has the counts).
 
+### 2.10 Histograms for an owner's metrics
+
+`Histogram` (`src/histogram.rs`) is what an owner's metrics keep of a latency in fixed room: a log's
+flushes and group-commit waits (hyper-log's `LogStats`, `docs/durable.md` §13.1), and an owner's
+queue, quorum and apply delays (focal's metrics view, F26). A value below eight nanoseconds has a
+bucket of its own; from eight, each doubling `[2^e, 2^(e+1))` is cut into eight equal buckets:
+bucket `8 + 8·(e − 3) + ((v >> (e − 3)) & 7)`, 496 buckets covering `u64`, 3,968 bytes. A bucket is
+at most an eighth of its least value wide, so a value is placed within 12.5%. The precision is
+focal's, from what the numbers are used for: its measured claims compare runs that differ by 10–30%,
+and the smallest regression worth paging on is a quarter of p99, which at an eighth always lands a
+bucket apart, where in `log2` buckets (a factor of two) it can sit in one.
+
+A histogram counts, sums (saturating) and merges bucket by bucket, so an owner gathers several logs'
+or owners' histograms without a second copy of the bucket arithmetic. A quantile is read by the
+nearest rank as the largest value its bucket holds: the quantile is at most that, and less by an
+eighth at most. A metrics page renders count, sum and fixed quantiles (p50, p90, p99, p99.9 and the
+most), which keeps its cardinality fixed; tools read the raw buckets.
+
 ## 3. Open, to be measured before it is fixed
 
 Items 2, 6 and 7 and part of 3 are settled by the traces (§2.6) and implemented in L-1's estimator

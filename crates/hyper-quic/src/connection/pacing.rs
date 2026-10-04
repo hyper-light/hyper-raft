@@ -16,6 +16,8 @@ pub(super) struct Pacer {
     capacity: u64,
     last_window: u64,
     last_mtu: u16,
+    /// The rate the capacity was last derived from, when the controller stated one.
+    last_rate: Option<u64>,
     tokens: u64,
     prev: Instant,
 }
@@ -28,6 +30,7 @@ impl Pacer {
             capacity,
             last_window: window,
             last_mtu: mtu,
+            last_rate: None,
             tokens: capacity,
             prev: now,
         }
@@ -44,24 +47,29 @@ impl Pacer {
     /// where `d` is the time before this function should be called again.
     ///
     /// The 5/4 ratio used here comes from the suggestion that N = 1.25 in the draft IETF RFC for
-    /// QUIC.
+    /// QUIC. A `rate` the controller states, bytes a second, replaces that rule ([`Self::delay_at`]).
     pub(super) fn delay(
         &mut self,
         smoothed_rtt: Duration,
+        rate: Option<u64>,
         bytes_to_send: u64,
         mtu: u16,
         window: u64,
         now: Instant,
     ) -> Option<Instant> {
+        if let Some(rate) = rate {
+            return self.delay_at(rate, bytes_to_send, mtu, now);
+        }
         // A congestion window is never zero (upstream asserted that in debug builds); a zero one
         // paces nothing, below.
-        if window != self.last_window || mtu != self.last_mtu {
+        if window != self.last_window || mtu != self.last_mtu || self.last_rate.is_some() {
             self.capacity = optimal_capacity(smoothed_rtt, window, mtu);
 
             // Clamp the tokens
             self.tokens = self.capacity.min(self.tokens);
             self.last_window = window;
             self.last_mtu = mtu;
+            self.last_rate = None;
         }
 
         // if we can already send a packet, there is no need for delay
@@ -118,7 +126,67 @@ impl Pacer {
             .unwrap_or(Duration::MAX);
         self.prev.checked_add(delay)
     }
+
+    /// `delay` at a rate the controller states, bytes a second: the bucket holds what the rate
+    /// sends in a burst interval, clamped as the window's is, and refills at the rate; a datagram
+    /// it cannot cover waits until the bucket holds a burst again. A zero rate paces nothing, as a
+    /// zero window does.
+    fn delay_at(
+        &mut self,
+        rate: u64,
+        bytes_to_send: u64,
+        mtu: u16,
+        now: Instant,
+    ) -> Option<Instant> {
+        if self.last_rate != Some(rate) || mtu != self.last_mtu {
+            self.capacity = rate_capacity(rate, mtu);
+            self.tokens = self.capacity.min(self.tokens);
+            self.last_rate = Some(rate);
+            self.last_mtu = mtu;
+        }
+        if self.tokens >= bytes_to_send || rate == 0 {
+            return None;
+        }
+        let elapsed = now.checked_duration_since(self.prev).unwrap_or_else(|| {
+            warn!("received a timestamp early than a previous recorded time, ignoring");
+            Default::default()
+        });
+        // A u64 rate times a u64 nanosecond count fits a u128; the quotient saturates into a u64.
+        let new_tokens = u128::from(rate)
+            .saturating_mul(elapsed.as_nanos())
+            .checked_div(NANOS_PER_SECOND)
+            .map_or(u64::MAX, |tokens| u64::try_from(tokens).unwrap_or(u64::MAX));
+        self.tokens = self.tokens.saturating_add(new_tokens).min(self.capacity);
+        self.prev = now;
+        if self.tokens >= bytes_to_send {
+            return None;
+        }
+        let deficit = bytes_to_send.max(self.capacity).saturating_sub(self.tokens);
+        let wait = u128::from(deficit)
+            .saturating_mul(NANOS_PER_SECOND)
+            .checked_div(u128::from(rate))
+            .map_or(u64::MAX, |nanos| u64::try_from(nanos).unwrap_or(u64::MAX));
+        // A time past what `Instant` represents does not pace, as the window's rule.
+        self.prev.checked_add(Duration::from_nanos(wait))
+    }
 }
+
+/// The bucket for a stated `rate`: what it sends in a burst interval, clamped as the window's is.
+fn rate_capacity(rate: u64, mtu: u16) -> u64 {
+    let capacity = u128::from(rate)
+        .saturating_mul(BURST_INTERVAL_NANOS)
+        .checked_div(NANOS_PER_SECOND)
+        .map_or(u64::MAX, |capacity| {
+            u64::try_from(capacity).unwrap_or(u64::MAX)
+        });
+    capacity.clamp(
+        MIN_BURST_SIZE.saturating_mul(u64::from(mtu)),
+        MAX_BURST_SIZE.saturating_mul(u64::from(mtu)),
+    )
+}
+
+/// Nanoseconds in a second: the unit rates are stated per.
+const NANOS_PER_SECOND: u128 = 1_000_000_000;
 
 /// Calculates a pacer capacity for a certain window and RTT
 ///
@@ -179,19 +247,78 @@ mod tests {
 
         assert!(
             Pacer::new(rtt, 30000, 1500, new_instant)
-                .delay(Duration::from_micros(0), 0, 1500, 1, old_instant)
+                .delay(Duration::from_micros(0), None, 0, 1500, 1, old_instant)
                 .is_none()
         );
         assert!(
             Pacer::new(rtt, 30000, 1500, new_instant)
-                .delay(Duration::from_micros(0), 1600, 1500, 1, old_instant)
+                .delay(Duration::from_micros(0), None, 1600, 1500, 1, old_instant)
                 .is_none()
         );
         assert!(
             Pacer::new(rtt, 30000, 1500, new_instant)
-                .delay(Duration::from_micros(0), 1500, 1500, 3000, old_instant)
+                .delay(
+                    Duration::from_micros(0),
+                    None,
+                    1500,
+                    1500,
+                    3000,
+                    old_instant
+                )
                 .is_none()
         );
+    }
+
+    #[test]
+    fn a_stated_rate_paces_at_that_rate() {
+        let rtt = Duration::from_millis(50);
+        let mtu = 1_000;
+        let start = Instant::now();
+        let mut pacer = Pacer::new(rtt, 2_000_000, mtu, start);
+        // A megabyte a second sends 2,000 bytes in a burst interval: below ten datagrams, so the
+        // bucket holds ten.
+        let rate = Some(1_000_000);
+        assert_eq!(pacer.delay(rtt, rate, 1_000, mtu, 2_000_000, start), None);
+        assert_eq!(pacer.capacity, 10_000);
+        for _ in 0..10 {
+            assert_eq!(pacer.delay(rtt, rate, 1_000, mtu, 2_000_000, start), None);
+            pacer.on_transmit(mtu);
+        }
+        // Empty: it waits until the rate refills a burst, 10,000 bytes at a megabyte a second.
+        assert_eq!(
+            pacer.delay(rtt, rate, 1_000, mtu, 2_000_000, start),
+            Some(start + Duration::from_millis(10))
+        );
+        // Half that later it holds half a burst, and sends.
+        assert_eq!(
+            pacer.delay(
+                rtt,
+                rate,
+                1_000,
+                mtu,
+                2_000_000,
+                start + Duration::from_millis(5)
+            ),
+            None
+        );
+        assert_eq!(pacer.tokens, 5_000);
+        // The window's rule again: the capacity is the window's.
+        pacer.delay(
+            rtt,
+            None,
+            1_000,
+            mtu,
+            2_000_000,
+            start + Duration::from_millis(5),
+        );
+        assert_eq!(
+            pacer.capacity,
+            (2_000_000u128 * BURST_INTERVAL_NANOS / rtt.as_nanos()) as u64
+        );
+        // A zero rate paces nothing.
+        let mut idle = Pacer::new(rtt, 2_000_000, mtu, start);
+        idle.tokens = 0;
+        assert_eq!(idle.delay(rtt, Some(0), 1_000, mtu, 2_000_000, start), None);
     }
 
     #[test]
@@ -232,27 +359,27 @@ mod tests {
         assert_eq!(pacer.tokens, pacer.capacity);
         let initial_tokens = pacer.tokens;
 
-        pacer.delay(rtt, mtu as u64, mtu, window * 2, now);
+        pacer.delay(rtt, None, mtu as u64, mtu, window * 2, now);
         assert_eq!(
             pacer.capacity,
             (2 * window as u128 * BURST_INTERVAL_NANOS / rtt.as_nanos()) as u64
         );
         assert_eq!(pacer.tokens, initial_tokens);
 
-        pacer.delay(rtt, mtu as u64, mtu, window / 2, now);
+        pacer.delay(rtt, None, mtu as u64, mtu, window / 2, now);
         assert_eq!(
             pacer.capacity,
             (window as u128 / 2 * BURST_INTERVAL_NANOS / rtt.as_nanos()) as u64
         );
         assert_eq!(pacer.tokens, initial_tokens / 2);
 
-        pacer.delay(rtt, mtu as u64, mtu * 2, window, now);
+        pacer.delay(rtt, None, mtu as u64, mtu * 2, window, now);
         assert_eq!(
             pacer.capacity,
             (window as u128 * BURST_INTERVAL_NANOS / rtt.as_nanos()) as u64
         );
 
-        pacer.delay(rtt, mtu as u64, 20_000, window, now);
+        pacer.delay(rtt, None, mtu as u64, 20_000, window, now);
         assert_eq!(pacer.capacity, 20_000_u64 * MIN_BURST_SIZE);
     }
 
@@ -268,7 +395,7 @@ mod tests {
 
         for _ in 0..packet_capacity {
             assert_eq!(
-                pacer.delay(rtt, mtu as u64, mtu, window, old_instant),
+                pacer.delay(rtt, None, mtu as u64, mtu, window, old_instant),
                 None,
                 "When capacity is available packets should be sent immediately"
             );
@@ -280,7 +407,7 @@ mod tests {
 
         assert_eq!(
             pacer
-                .delay(rtt, mtu as u64, mtu, window, old_instant)
+                .delay(rtt, None, mtu as u64, mtu, window, old_instant)
                 .expect("Send must be delayed")
                 .duration_since(old_instant),
             pace_duration
@@ -290,6 +417,7 @@ mod tests {
         assert_eq!(
             pacer.delay(
                 rtt,
+                None,
                 mtu as u64,
                 mtu,
                 window,
@@ -301,7 +429,7 @@ mod tests {
 
         for _ in 0..packet_capacity / 2 {
             assert_eq!(
-                pacer.delay(rtt, mtu as u64, mtu, window, old_instant),
+                pacer.delay(rtt, None, mtu as u64, mtu, window, old_instant),
                 None,
                 "When capacity is available packets should be sent immediately"
             );
@@ -313,6 +441,7 @@ mod tests {
         assert_eq!(
             pacer.delay(
                 rtt,
+                None,
                 mtu as u64,
                 mtu,
                 window,

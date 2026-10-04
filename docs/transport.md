@@ -461,9 +461,14 @@ datagrams; slates and focal took ten datagrams, which is the same at 1,200 bytes
 
 Not yet:
 
-- **Pacing.** The connection paces at its own rule, 5/4 of the window per smoothed round trip
-  (RFC 9002 §7.7), not at Copa's `2·cwnd/RTTstanding` (§2.1). The pacing seam is stage 4's next
-  patch, with slates' 1 ms quantum and two-datagram floor.
+- **Pacing.** A controller states its pacing rate (`Controller::pacing_rate`, bytes a second), and
+  the path's pacer refills at it; `None` keeps the connection's rule, 5/4 of the window per
+  smoothed round trip (RFC 9002 §7.7). Copa states `2·cwnd/RTTstanding` (§2.1); NewReno, CUBIC
+  and BBR keep the connection's rule. Measured on the harness below (2026-10-04): Copa alone
+  emptied its queue at the same intervals paced either way on three of focal's five paths, and
+  carried the same share at 10 Mbit/s and 20 ms beside NewReno and CUBIC. Its rate held within
+  1.6% of its median at 100 Mbit/s and 20 ms, so pacing on the standing round trip drives no
+  oscillation. slates' 1 ms quantum and two-datagram floor are still to come.
 - **The harness.** Every measured result is to be re-measured after the port: focal's F39 grids
   (NewReno and CUBIC beside Copa on drop-tail, step and CoDel queues, the harm bar
   `min(incumbent beside its own kind, incumbent beside CUBIC)`) and slates' bake-off. The runs are

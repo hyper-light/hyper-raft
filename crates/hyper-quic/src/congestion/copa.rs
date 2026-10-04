@@ -27,9 +27,13 @@
 //! - competing, `1/δ` grows by `d_q/RTTstanding` a round trip, so Copa's rate grows as a classic
 //!   sender's does.
 //!
+//! The law states its pacing, `2·cwnd/RTTstanding` (§2.1), and the connection's pacer sends at it
+//! (`Controller::pacing_rate`): the paper's analysis of Copa's own cycle (§3) assumes it, and paced
+//! at the connection's own five quarters of the window a smoothed round trip, Copa alone emptied its
+//! queue every five round trips on one of focal's five paths.
+//!
 //! Open: under a single queue that CoDel manages, the manager empties the queue and hides the
-//! competition from the mode test (focal's finding 4). The connection paces at its own rule, not at
-//! Copa's `2·cwnd/RTTstanding` (§2.1); the pacing seam is docs/transport.md §3's stage 4.
+//! competition from the mode test (focal's finding 4).
 
 use std::any::Any;
 
@@ -85,6 +89,12 @@ const DEFAULT_MARK_BACKOFF: MarkBackoff = MarkBackoff {
     numerator: 1,
     denominator: 2,
 };
+
+/// Copa §2.1: "the sender paces packets at a rate of 2·cwnd/RTTstanding packets per second", double
+/// the window's rate "to accommodate imperfections in pacing".
+const PACING_MULTIPLE: u128 = 2;
+/// Nanoseconds in a second: the unit rates are stated per.
+const NANOS_PER_SECOND: u128 = 1_000_000_000;
 
 /// RFC 9002 §7.2's initial window for datagrams of `datagram` bytes.
 fn initial_window(datagram: u64) -> u64 {
@@ -421,6 +431,18 @@ impl Law {
 
     fn minimum_window(&self) -> u64 {
         MINIMUM_WINDOW_DATAGRAMS.saturating_mul(self.datagram)
+    }
+
+    /// `2·cwnd/RTTstanding` in bytes a second (§2.1), once a standing round trip is measured; the
+    /// connection's own rule until then.
+    fn pacing_rate(&self) -> Option<u64> {
+        let standing = self.standing_rtt?.get().max(1);
+        let rate = u128::from(self.window)
+            .saturating_mul(PACING_MULTIPLE)
+            .saturating_mul(NANOS_PER_SECOND)
+            .checked_div(u128::from(standing))
+            .map_or(u64::MAX, |rate| u64::try_from(rate).unwrap_or(u64::MAX));
+        Some(rate)
     }
 
     /// The path takes datagrams of another size (RFC 9002 §7.2): the window stays in bytes, and is the
@@ -835,11 +857,16 @@ impl Controller for Copa {
         self.law.window
     }
 
+    fn pacing_rate(&self) -> Option<u64> {
+        self.law.pacing_rate()
+    }
+
     fn metrics(&self) -> ControllerMetrics {
         ControllerMetrics {
             congestion_window: self.law.window,
             ssthresh: None,
-            pacing_rate: None,
+            // qlog states it in bits a second.
+            pacing_rate: self.law.pacing_rate().map(|bytes| bytes.saturating_mul(8)),
         }
     }
 
@@ -950,6 +977,20 @@ mod tests {
         let copa = Copa::new(CopaConfig::default(), Instant::now(), 1_200);
         assert_eq!(copa.initial_window(), 12_000);
         assert_eq!(copa.window(), 12_000);
+    }
+
+    #[test]
+    fn copa_paces_at_twice_its_window_over_the_standing_round_trip() {
+        let mut law = new_law();
+        // No standing round trip yet: the connection's own rule.
+        assert_eq!(law.pacing_rate(), None);
+        ack(&mut law, 0, 100 * MS, true);
+        // 10,000 bytes over a standing 100 ms, doubled: 200,000 bytes a second.
+        assert_eq!(law.window, 10 * DATAGRAM);
+        assert_eq!(law.pacing_rate(), Some(200_000));
+        let copa = Copa::new(CopaConfig::default(), Instant::now(), 1_200);
+        assert_eq!(copa.pacing_rate(), None);
+        assert_eq!(copa.metrics().pacing_rate, None);
     }
 
     #[test]

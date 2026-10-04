@@ -491,7 +491,14 @@ mod tests {
         for _ in 0..1000 {
             if path
                 .pacing
-                .delay(path.rtt.get(), mtu.into(), mtu, window, now)
+                .delay(
+                    path.rtt.get(),
+                    path.congestion.pacing_rate(),
+                    mtu.into(),
+                    mtu,
+                    window,
+                    now,
+                )
                 .is_some()
             {
                 break;
@@ -500,7 +507,14 @@ mod tests {
         }
         assert!(
             path.pacing
-                .delay(path.rtt.get(), mtu.into(), mtu, window, now)
+                .delay(
+                    path.rtt.get(),
+                    path.congestion.pacing_rate(),
+                    mtu.into(),
+                    mtu,
+                    window,
+                    now
+                )
                 .is_some()
         );
 
@@ -509,6 +523,7 @@ mod tests {
         assert_eq!(
             path.pacing.delay(
                 path.rtt.get(),
+                path.congestion.pacing_rate(),
                 path.current_mtu().into(),
                 path.current_mtu(),
                 path.congestion.window(),

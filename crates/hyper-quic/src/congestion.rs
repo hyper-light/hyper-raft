@@ -66,6 +66,14 @@ pub trait Controller: Send + Sync {
     /// Number of ack-eliciting bytes that may be in flight
     fn window(&self) -> u64;
 
+    /// The rate the path's pacer sends at, in bytes a second
+    ///
+    /// `None` keeps the connection's own rule, five quarters of the window a smoothed round trip
+    /// (RFC 9002 §7.7). A law that states its pacing (Copa §2.1) states it here.
+    fn pacing_rate(&self) -> Option<u64> {
+        None
+    }
+
     /// Retrieve implementation-specific metrics used to populate `qlog` traces when they are enabled
     fn metrics(&self) -> ControllerMetrics {
         ControllerMetrics {

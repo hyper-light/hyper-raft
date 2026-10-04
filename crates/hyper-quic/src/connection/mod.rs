@@ -827,6 +827,7 @@ impl Connection {
         let smoothed_rtt = self.path.rtt.get();
         if let Some(delay) = self.path.pacing.delay(
             smoothed_rtt,
+            self.path.congestion.pacing_rate(),
             bytes_to_send,
             self.path.current_mtu(),
             self.path.congestion.window(),

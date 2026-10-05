@@ -357,8 +357,8 @@ and returns leadership to them (focal 27 §5). Here:
   by `k`, and a member's priority in log `k` is how many ranked voters it is ahead of or level with
   there (the preferred voter all `r` of them, the last one; a member not ranked none), so each log
   prefers a different voter and falls back through the same ranking. The core's elections then
-  favour it (`Precedence::Log`: a voter of higher priority grants a lower one only a more current
-  log).
+  favour it (a voter of higher priority grants a lower one only a more current log, `docs/raft.md`
+  §3.3).
 - `MultiLog::hand_off(k)`: a leader of log `k` that is not its preferred voter names it, once its
   tracker shows that voter active and holding the leader's whole log. When to hand over is the
   owner's leadership-return policy (note 32 R11, a shell policy: focal's fit, quiet and rest rules),

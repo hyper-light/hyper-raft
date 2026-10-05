@@ -171,13 +171,22 @@ impl Configuration {
     fn swarm(harness: Harness, seed: u64) -> Self {
         let mut swarm = Swarm::of(seed);
         let base = harness.settings();
+        let pre_vote = swarm.feature();
+        let check_quorum = swarm.feature();
+        let refuse_ahead = swarm.feature();
+        let round_each = swarm.feature();
+        let bare_answers = swarm.feature();
+        // raft-rs's precedence is the differential tests' alone, no consumer's: a campaign runs
+        // what a consumer can (`docs/raft.md` §3.3, swarm group seed 9,657). Its feature is still
+        // drawn, so every draw after it, and every seed's schedule, is as it was.
+        let _raft_rs_precedence = swarm.feature();
         let mut settings = Settings {
-            pre_vote: swarm.feature(),
-            check_quorum: swarm.feature(),
-            refuse_ahead: swarm.feature(),
-            round_each: swarm.feature(),
-            bare_answers: swarm.feature(),
-            by_length: swarm.feature(),
+            pre_vote,
+            check_quorum,
+            refuse_ahead,
+            round_each,
+            bare_answers,
+            by_length: false,
             max_inflight_bytes: swarm.one(&[256, 4096, u64::MAX]).unwrap(),
             max_size_per_msg: swarm.one(&[1, 64, base.max_size_per_msg]).unwrap(),
             ..base
@@ -594,6 +603,38 @@ fn every_step_of_the_default_schedules_is_a_step_of_the_model() {
     }
 }
 
+/// Swarm group seed 9,657 drew raft-rs's precedence of length. Its schedule ends with member 1
+/// holding the longest log, of an older last term (18), and the highest priority; member 3 a
+/// shorter log of term 27 whose last change enters the joint configuration {1,3} / {1,2,3}, by
+/// which it counts (`docs/raft.md` §3.4); member 2 the shortest. Member 1 refuses both
+/// candidates for priority, though it can never be elected itself, member 3 refuses member 2 for
+/// its log, and with every member up the group elected no one within the liveness bound, terms
+/// climbing (`docs/raft.md` §3.3). By the log's precedence, the only rule a consumer can set, the
+/// same schedule elects.
+#[test]
+fn swarm_group_seed_9657_elects_by_the_logs_precedence() {
+    const SEED: u64 = 9_657;
+    let harness = Harness::Group;
+    let configuration = Configuration::swarm(harness, SEED);
+    assert!(!configuration.settings.by_length);
+    let judged = run(harness, &configuration, SEED, None, &mut Seed(Seeded(SEED)));
+    assert_eq!(judged.violation, None);
+    assert!(judged.settled, "by the log's precedence the group elects");
+    // The same schedule by raft-rs's rule: the cause, replayed.
+    let by_length = Configuration {
+        settings: Settings {
+            by_length: true,
+            ..configuration.settings
+        },
+        ..configuration
+    };
+    let judged = run(harness, &by_length, SEED, None, &mut Seed(Seeded(SEED)));
+    assert!(
+        !judged.settled,
+        "by raft-rs's precedence the group elects no one"
+    );
+}
+
 // ---------------------------------------------------------------------------------------------
 // The campaigns: for each defect and strategy, the runs to its first catch.
 
@@ -901,7 +942,7 @@ const CATCHES: &[(Strategy, usize, u64)] = &[
     (Strategy::Swarm, 0, 171),
     (Strategy::Swarm, 1, 17),
     (Strategy::Swarm, 2, 0),
-    (Strategy::Swarm, 3, 3_312),
+    (Strategy::Swarm, 3, 2_692),
     (Strategy::Pct(1), 1, 7),
     (Strategy::Pct(1), 2, 0),
     (Strategy::Pct(1), 3, 22_065),
@@ -1370,6 +1411,14 @@ fn strategy_costs() {
 // ---------------------------------------------------------------------------------------------
 // The swarm and the model over the core with no defect planted.
 
+/// The seeds the swarm runs each harness with no defect planted: enough to see, with probability
+/// 0.95, a defect that one seed in 2,693 reaches, ⌈ln 0.05 / ln(1 − 1/2,693)⌉: the rarest a planted
+/// defect the swarm catches was for it, the first fast-track rule's catch at run 2,693 (`CATCHES`).
+/// Run 2026-10-05 at 9,924 seeds (the count for the catch at 3,313 before raft-rs's precedence left
+/// the swarm): no failure on any harness, at most 9,039, 8,472 and 3,396 operations a liveness
+/// phase (group, fast, pipelined).
+const NO_DEFECT_SEEDS: u64 = 8_067;
+
 /// The swarm's configurations of each harness with no defect planted, every step held to the
 /// model: every oracle keeps, every step is a model step, every group settles and every read it
 /// confirmed is served. A failure here is a defect of the core, or of a judge, to trace to its
@@ -1380,7 +1429,7 @@ fn the_swarm_with_no_defect_keeps_every_oracle_and_the_model() {
     for harness in [Harness::Group, Harness::Fast, Harness::Pipelined] {
         let mut failures = Vec::new();
         let mut most = 0;
-        let seeds = 5_000;
+        let seeds = NO_DEFECT_SEEDS;
         for seed in 0..seeds {
             let configuration = Configuration::swarm(harness, seed);
             let mut driver = Conformed::new(Seed(Seeded(seed)), None);
@@ -1404,6 +1453,7 @@ fn the_swarm_with_no_defect_keeps_every_oracle_and_the_model() {
             "{harness:?}: {seeds} swarm seeds, at most {most} operations a liveness phase, {} failed: {failures:#?}",
             failures.len()
         );
+        assert!(failures.is_empty(), "{harness:?}: {failures:#?}");
     }
 }
 

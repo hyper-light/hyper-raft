@@ -141,29 +141,6 @@ impl Limits {
     }
 }
 
-/// What a candidate of lower priority must hold to be voted for all the
-/// same.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum Precedence {
-    /// A log more current than the voter's: a later last term, or the same
-    /// and more entries. A voter that refuses for priority could then have
-    /// been elected itself, so the refusal never leaves a group that can
-    /// elect without a leader.
-    #[default]
-    Log,
-    /// More entries than the voter, whatever their terms: the rule of
-    /// `raft-rs`. Two voters whose logs are equally long and end in
-    /// different terms refuse each other, the one for priority and the
-    /// other for the log, and with the third away the group elects no one.
-    /// With a marked member (core step R-7) no member need be away: the
-    /// voter of the longest log, of an older term, refuses the candidate of
-    /// the later term for priority while the marked voter refuses it for its
-    /// mark, and neither of them can be elected. A marked member's election
-    /// is argued by [`Precedence::Log`] (`docs/durable.md` §5.2). Kept to
-    /// compare the two cores under one rule.
-    Length,
-}
-
 /// When a leader asks its quorum for the reads that wait (Ongaro's thesis
 /// §6.4: a round of heartbeats sent after a read was asked, and answered by
 /// a quorum, confirms it and every read asked before it).
@@ -291,11 +268,19 @@ pub struct Config {
     /// An election is asked about before a term is spent on it.
     pub pre_vote: bool,
     /// This member's rank in elections: a voter of higher priority votes
-    /// for a candidate of lower only when the candidate's log is ahead of
-    /// its own by [`Config::precedence`]. It never judges a transfer.
+    /// for a candidate of lower only when the candidate's log is more
+    /// current than its own, a later last term or the same and more
+    /// entries. A voter that refuses for priority could then have been
+    /// elected itself, so the refusal never leaves a group that can elect
+    /// without a leader. It never judges a transfer.
     pub priority: i64,
-    /// What a candidate of lower priority must hold to be voted for.
-    pub precedence: Precedence,
+    /// raft-rs's rule in place of the above, for the differential tests
+    /// alone (`docs/raft.md` §3.3): a candidate of lower priority must hold
+    /// more entries than the voter, whatever their terms. It can leave a
+    /// group that could elect without a leader, so no build but the tests'
+    /// has it.
+    #[cfg(feature = "raft-rs-precedence")]
+    pub raft_rs_precedence: bool,
     /// When a leader sends the round of heartbeats that confirms the reads
     /// that wait.
     pub read_rounds: ReadRounds,
@@ -351,7 +336,8 @@ impl Config {
             check_quorum: false,
             pre_vote: false,
             priority: 0,
-            precedence: Precedence::Log,
+            #[cfg(feature = "raft-rs-precedence")]
+            raft_rs_precedence: false,
             read_rounds: ReadRounds::Shared,
             heartbeat_answers: HeartbeatAnswers::Position,
             ahead: Ahead::Kept,
@@ -2858,16 +2844,17 @@ impl<S: Storage> Raft<S> {
             kind == MessageType::MsgRequestVote && message.context.as_slice() == CAMPAIGN_TRANSFER;
         // Judged against what this member answers for: its log, or what it marks lost.
         let (last_index, last_term) = self.claim()?;
-        let ahead = match self.config.precedence {
-            Precedence::Log => {
-                message.log_term > last_term
-                    || (message.log_term == last_term && message.index > last_index)
-            }
-            Precedence::Length => message.index > last_index,
+        let ahead = message.log_term > last_term
+            || (message.log_term == last_term && message.index > last_index);
+        #[cfg(feature = "raft-rs-precedence")]
+        let ahead = if self.config.raft_rs_precedence {
+            message.index > last_index
+        } else {
+            ahead
         };
         // A member whose log may lack what it acknowledged refuses no one
         // for priority: a voter that refuses for priority must be one the
-        // group could elect instead (`Precedence::Log`), and a marked member
+        // group could elect instead (the log's precedence), and a marked member
         // may not be (a schedule, seed 560, found one of the highest
         // priority refusing every candidate it was not behind). Judged
         // here, where votes are, and not settled on every operation.

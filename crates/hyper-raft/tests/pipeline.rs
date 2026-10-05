@@ -154,7 +154,7 @@ fn settled(mut group: Cluster<Lagged>, seed: u64, crash: Option<u64>) -> Cluster
         // The rule's argument is by the log's precedence. By raft-rs's
         // precedence of length a voter of higher priority refuses a candidate
         // whose log is shorter however much more current, and may be one the
-        // group could not elect instead (`Precedence::Length`): with marks, a
+        // group could not elect instead (`Config::raft_rs_precedence`): with marks, a
         // group with every member up may then wait with a member the rule
         // admits. Seed 740 of 960: the voter of the longest log, of an older
         // term, refused the candidate of the later term for priority, the

@@ -1288,7 +1288,8 @@ took 14.7 min on the owner's machine at load 69, 2.48 GB resident at most.
 it never moves the schedule's draws): each feature on with even odds (Groce et al. §2), each rate
 uniform over its range. hyper-raft's `Configuration::swarm` states the ranges, each the schedule
 tests' own: the rules (pre-vote, check-quorum, refusing what arrives ahead of a hole, a round a read,
-bare answers, precedence by length, and for pipelined members applying before durability), the
+bare answers, and for pipelined members applying before durability; precedence by length is drawn
+and not run, as no consumer can set it, `docs/raft.md` §3.3), the
 windows and message sizes the tests use, every kind of step on or off (changes, a leader leaving,
 restarts, compaction, partitions, priorities, windows, bursts of reads), losses and repeats up to
 three in four (`tests/check.rs`' hostile networks), the fast track's share up to all, persistence
@@ -1418,7 +1419,7 @@ sessions' work, load 9–72 (`docs/benchmarks.md`, "hyper-check's strategies and
 | a commit counted from an older term's replicas | not in 2,096 | **172** | not in 2,096 | not in 2,096 | not in 2,096 | **33,621** (four rounds) |
 | a read served before the term's first commit | 4 | 18 | 8 | 8 | 20 | outside its scenarios (no reads) |
 | a vote sent before it is durable | 1 | 1 | 1 | 1 | 1 | outside its scope (no lagging writes) |
-| the fast track without its first rule | 102,775 | **3,313** | 22,066 | 38,861 | not in 102,775 | outside its scope (no fast track) |
+| the fast track without its first rule | 102,775 | **2,693** | 22,066 | 38,861 | not in 102,775 | outside its scope (no fast track) |
 | the fast track without its second rule | **8,868** | not in 8,868 | not in 8,868 | not in 8,868 | not in 8,868 | outside its scope |
 
 The counts are those on the core that counts by the newest configuration in its log (§15.12) and
@@ -1428,14 +1429,17 @@ from their first seeds, and each catch is its defect's (`each_catch_by_seed_is_i
 13, 13 and 8 runs of PCT and coverage. On the core before the release (§15.12 alone) the two fast-track
 rows were 67,843, 2,881, 26,306, 28,115, 6,655 and 1,484, 571, not in 2,096, not in 2,096, 1,496;
 before that, the second rule's swarm campaign met the core's open defect first (§15.9), and the first
-rule's counts were 47,819 (random walk), 706, 25,324, 21,181 and 4,787.
+rule's counts were 47,819 (random walk), 706, 25,324, 21,181 and 4,787. The swarm's column is that of
+the swarm that no longer runs raft-rs's precedence of length (`docs/raft.md` §3.3, 2026-10-05): its
+draws are as they were, and the first rule's catch moved from 3,313 to 2,693; every other row's
+swarm count is as it was.
 
 The guarantees the PCT campaigns' run counts carry, by Theorem 9 at their `k`, five members: for a
 defect of depth one, 1 − (4/5)^R, above 0.9999 at every count here but the first runs; for depth two,
 0.925 at 26,306 runs and 0.937 at 28,115 (the first rule, on the core of §15.12), 0.194 at 2,096
 (the group's) and 0.185 (the second rule's); for depth three, at most 1.4·10⁻³ (the campaigns' own
 report, 2026-10-05). **What the counts say.** On the first fast-track rule the swarm beats the
-random walk by 31 times and PCT by 2.7 to 4.7, and coverage guidance does not catch it within the
+random walk by 38 times and PCT by 8.2 (depth 1) and 14 (depth 2), and coverage guidance does not catch it within the
 random walk's count; on the second, under the
 release (§15.13), only the random walk catches it within its count: a member holds a vote now
 until a classic commit covers it, so fewer schedules leave a fast quorum counted across a change. The swarm alone catches the older-term

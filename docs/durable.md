@@ -456,7 +456,7 @@ In `crates/hyper-raft` (`src/raft.rs`, `src/progress.rs`, `src/node.rs`, `src/pr
   holds an entry of a later term from a leader, whose log holds every entry committed in the
   mark's terms before that one (Leader Completeness; terms never fall along a log). mantle's rules
   for a marked member (§5) move from the shell into the core: it judges a vote request against
-  its claim, the mark (`Raft::claim`, in `step_vote`, for the vote and for `Precedence`), refuses
+  its claim, the mark (`Raft::claim`, in `step_vote`, for the vote and for priority's precedence), refuses
   to campaign (`Error::Lost`, and its deadline is none), forgets the leader whose silence asked it
   to (so it holds no lease on one that is gone), and refuses no one for priority (a voter that
   refuses for priority must be one the group could elect instead; a schedule of seed 560 found a
@@ -575,9 +575,9 @@ group waits for good, as PAR's does ("the system will remain unavailable", §3.4
 count both (`docs/raft.md` §3's R-7 row).
 
 **By the log's precedence.** That a group with a member the rule admits elects rests on
-`Precedence::Log`, under which a voter refuses a candidate for priority only where it could be
-elected instead. Under raft-rs's precedence of length, which the core keeps only to compare itself
-with raft-rs, a voter of higher priority refuses a candidate whose log is shorter however much more
+the log's precedence, under which a voter refuses a candidate for priority only where it could be
+elected instead, the only rule a consumer can set. Under raft-rs's precedence of length, which the
+tests' build alone keeps to compare the core with raft-rs (`docs/raft.md` §3.3), a voter of higher priority refuses a candidate whose log is shorter however much more
 current, and with a mark no member need be away for the group to elect no one: at 960 seeds of the
 faults at rest (seed 740), the voter of the longest log, of an older term, refused the candidate of
 the later term for priority, the marked voter refused it for its mark, and neither could be elected.

@@ -11,6 +11,10 @@ repository.workspace = true
 # The planted defects of `src/mutant.rs`, for tests that show the oracles catch them
 # (docs/sim.md §4.6). No consumer enables it.
 mutants = []
+# raft-rs's precedence of length in elections (`Config::raft_rs_precedence`), for the differential
+# tests that compare this core with raft-rs under one rule (docs/raft.md §3.3). It can leave a group
+# that could elect without a leader; no consumer enables it.
+raft-rs-precedence = []
 
 [dependencies]
 crc32c.workspace = true
@@ -23,7 +27,7 @@ thiserror.workspace = true
 # (docs/sim.md §4, `tests/check.rs`), and this crate with its planted defects for the runs that show
 # the oracles catch them (`src/mutant.rs`).
 hyper-check = { path = "../hyper-check" }
-hyper-raft = { path = ".", features = ["mutants"] }
+hyper-raft = { path = ".", features = ["mutants", "raft-rs-precedence"] }
 # The core focal ran on before this one: the differential tests run both on
 # one schedule and compare what they say.
 raft.workspace = true

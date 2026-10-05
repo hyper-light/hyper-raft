@@ -253,7 +253,7 @@ that is ahead in one log and behind in another.
 - `Storage::any_entry`: a walk of `[low, high)` in order "without copying any" (`storage.rs`).
 - A follower forwards a proposal to its leader (`raft.rs`, `step_follower`, `MsgPropose`), and a
   candidate drops it (`ProposalDropped`).
-- Priority with `Precedence::Log`, `transfer_leader`, `read_index`, `apply_conf_change`
+- Priority by the log's precedence, `transfer_leader`, `read_index`, `apply_conf_change`
   (`docs/raft.md` §1, §3.3).
 - A campaign waits for a committed change of configuration to be applied (`docs/raft.md` §3.3,
   "One told to campaign before it applied a change"; R4 in §3.2), which is why the layer applies

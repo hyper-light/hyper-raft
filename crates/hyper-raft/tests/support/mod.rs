@@ -623,7 +623,8 @@ pub struct Settings {
     pub max_committed_size_per_ready: u64,
     pub check_quorum: bool,
     pub pre_vote: bool,
-    /// Whether priority yields to a longer log alone, as in `raft-rs`.
+    /// Whether priority yields to a longer log alone, as in `raft-rs`
+    /// (`Config::raft_rs_precedence`, the tests' build alone).
     pub by_length: bool,
     /// Whether a leader sends a round of heartbeats for each read as it is
     /// asked, as in `raft-rs`.
@@ -1307,11 +1308,7 @@ impl Replica for New {
             max_committed_size_per_ready: settings.max_committed_size_per_ready,
             check_quorum: settings.check_quorum,
             pre_vote: settings.pre_vote,
-            precedence: if settings.by_length {
-                hyper_raft::Precedence::Length
-            } else {
-                hyper_raft::Precedence::Log
-            },
+            raft_rs_precedence: settings.by_length,
             read_rounds: if settings.round_each {
                 hyper_raft::ReadRounds::Each
             } else {

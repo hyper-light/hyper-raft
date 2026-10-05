@@ -306,6 +306,7 @@ pub(crate) fn create<F: BlockFile>(file: &F, config: &Config, id: u128) -> Resul
         incarnation: 1,
         nonce,
         segment_bytes: config.segment_bytes,
+        key: None,
     };
     let frame = FrameHeader::frame(id, 1, nonce, 0, 1, 0, &[]).ok_or(LogError::Config("frame"))?;
     let total = block
@@ -1194,6 +1195,8 @@ fn replay_records(
                 let last = g.last.max(start.index);
                 g.reach(last);
             }
+            // A sealed log's session key: what opens the records after it, not a group's piece.
+            Owned::Key { .. } => {}
             Owned::Proposal { group, proposal } => {
                 groups.entry(group).or_default().proposals.insert(
                     proposal.index,

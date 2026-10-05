@@ -181,6 +181,11 @@ spliced with another file's segments fails to open (STREAM's nonce-based OAE sec
   adds 16 bytes: 0.024% at 64 KiB, 0.39% at 4 KiB. The bound is GCM's 2^39 − 256 bits a seal (SP
   800-38D §5.2.1.1), so `S` is refused above 64 GiB; it is also refused below 512 bytes, where the
   tag is more than 3% of the bytes.
+- **A consumer with versions that never repeat** (slates: a chunk version whose ID never repeats
+  across restart and restore) may seal every version of an object under one lineage key with
+  `nonce = version (64 bits) ‖ segment index (32 bits)`, so a 4 KiB overwrite reseals one segment and
+  makes no key. That consumer states and tests the argument that a version ID never repeats under its
+  key, through crash, restart and restore; without that argument the rule is a key per file.
 - **Sizes follow from plaintext.** A segment of `n` bytes is `n + 16` stored bytes, so a byte's stored
   offset follows from its plaintext offset, and a read opens only the segments its range covers.
 - **The file's header** carries the wrapped data key record (§3.3), the file ID, `S`, a version, and
@@ -338,12 +343,17 @@ to a hibernation image: macOS writes them to its image (encrypted under FileVaul
   one, the consumer drops every key it holds, each wiped as it drops, and checks with `keys_held`
   that none is left before it lets the suspend go on; it unwraps them again from the key source on
   resume. The region does not wipe keys under their owners: a key zeroed while still held would seal
-  under zeros without an error. Keys share one locked region for the whole process, made once by `lock_keys(count)` with the
+  under zeros without an error.
+
+Keys share one locked region for the whole process, made once by `lock_keys(count)` with the
 consumer's stated count of keys held at once and rounded up to whole pages, so a process locks a
 bounded number of pages, not a page a key, and stays inside its locked-memory limit
 (`RLIMIT_MEMLOCK`, or the minimum working set on Windows). A key is a 32-byte slot claimed through
 an atomic bitmap; past the count a key is refused (`Capacity`), and a region the OS will not lock
-is refused (`Lock`), never used unlocked.
+is refused (`Lock`), never used unlocked. The region is a hard bound; a consumer that holds many
+keys (slates: a key per open chunk) keeps its own bounded cache of unwrapped keys under it and
+evicts by its stated rule (least recently used) before it claims another, re-unwrapping on a miss,
+so the bound is never a refused read.
 
 A consumer that holds plaintext in RAM between writes (slates' "at rest is idle RAM") seals it with
 §4's construction under a volume key in a `Secret32`, and keeps only the sealed bytes; its plaintext
@@ -354,7 +364,10 @@ buffers are the consumer's to wipe.
 `hyper-seal` builds against `aws-lc-sys` by default and `aws-lc-fips-sys` under the `fips` feature
 (aws-lc-rs's FIPS module: AWS-LC FIPS 3.0, FIPS 140-3 certificate #5314, the first validated
 module to include ML-KEM, ML-KEM-1024 among it; R §9). Every primitive here is in the module's approved
-set: AES-256-GCM, AES-KW, HKDF with SHA-384, HMAC-SHA-256, ML-KEM-1024, its DRBG. A consumer selects
+set: AES-256-GCM, AES-KW, HKDF with SHA-384, HMAC-SHA-256, ML-KEM-1024, its DRBG. Keys come from
+the OS through `getrandom` in every build; what the FIPS module's own DRBG seeds from at start (and
+whether a build with jitter entropy off, as slates runs, changes it) is to be read from AWS-LC's FIPS
+security policy and stated here before a FIPS release (slates' review). A consumer selects
 FIPS at build time; `hyper_seal::fips()` reports which module it runs, so a node can refuse to start
 when its configuration demands FIPS and the binary is not. Every call into AWS-LC runs behind the
 unwind boundary (CLAUDE.md §1); none is expected to unwind, but a panic there is a typed error, not a
@@ -362,8 +375,11 @@ process abort.
 
 ## 10. Between our own nodes
 
-`hyper-quic` between our own nodes admits only the hybrid groups `X25519MLKEM768` and
-`SecP256r1MLKEM768` and TLS 1.3's 256-bit suites (`TLS_AES_256_GCM_SHA384`,
+`hyper-quic` between our own nodes admits only hybrid post-quantum groups, and prefers
+`SecP384r1MLKEM1024` (ML-KEM-1024, CNSA 2.0's key establishment, with P-384; defined by the IETF's
+hybrid ECDHE-MLKEM draft and shipped by AWS-LC) when both ends are ours; `X25519MLKEM768` and
+`SecP256r1MLKEM768` stay admitted only if a measured handshake cost argues for them (slates'
+review). The suites are TLS 1.3's 256-bit ones (`TLS_AES_256_GCM_SHA384`,
 `TLS_CHACHA20_POLY1305_SHA256`). Initial packets stay AES-128-GCM, which RFC 9001 §5.2 fixes, since
 their keys come from the connection ID and protect nothing secret. This is node-to-node
 configuration in `hyper-quic` and `hyper-tls`, not in `hyper-seal`; clients reaching an S3 or NFS
@@ -379,6 +395,11 @@ endpoint keep the standard sets.
 - **Open of one record**: a 4 KiB and a 300 B record, p50 and p99 under load (slates: ≤ ~1 µs p99 at
   4 KiB).
 - **Key make and wrap**: p50 and p99 (slates: single-digit µs).
+- **A 4 KiB open, cold and warm** (slates): cold includes the data key's AES-KW unwrap from the
+  header; warm takes the key from the consumer's cache in the locked region.
+- **A 4 KiB random overwrite** inside a 64 KiB and a 256 KiB chunk: a key per file (the whole
+  chunk resealed and a key made) against the version-keyed rule of §4.
+- **Group commit at 100 B records** (slates' op log): the tag's 16% growth on file.
 - **Throughput**: seal and open GB/s a core at each segment size of §4.
 - **Energy per byte**: hyper-measure's energy readings (RAPL on Linux x86, IOKit on macOS) sealed
   against unsealed, on Apple silicon and an x86 laptop.

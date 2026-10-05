@@ -278,17 +278,26 @@ pub(crate) struct Params {
     pub(crate) frame_room: usize,
     /// Charged bytes the queue holds at most (`PIPELINE_FRAMES`).
     pub(crate) queue_bytes: u64,
+    /// Bytes of the tag after each entry's and proposal's bytes: [`format::TAG_LEN`] in a sealed
+    /// log, 0 in an unsealed one.
+    pub(crate) tag: usize,
 }
 
 /// `update` for `group` in parts that each fit a frame of `room` payload bytes
 /// (`Log::parts`, `GroupLog::parts`).
-pub(crate) fn parts(room: usize, group: u128, update: Update) -> Result<Vec<Update>, LogError> {
-    let len_of = |u: &Update| writer::update_len(group, u).ok_or(LogError::TooLarge(usize::MAX));
+pub(crate) fn parts(
+    room: usize,
+    group: u128,
+    update: Update,
+    tag: usize,
+) -> Result<Vec<Update>, LogError> {
+    let len_of =
+        |u: &Update| writer::update_len(group, u, tag).ok_or(LogError::TooLarge(usize::MAX));
     if update.remove || len_of(&update)? <= room {
         return Ok(vec![update]);
     }
     let record =
-        |r: &format::Record<'_>| format::encoded_len(r).ok_or(LogError::TooLarge(usize::MAX));
+        |r: &format::Record<'_>| format::encoded_len(r, tag).ok_or(LogError::TooLarge(usize::MAX));
     let Update {
         start,
         entries,
@@ -524,6 +533,7 @@ impl<F: BlockFile + 'static> Log<F> {
             align,
             frame_room: room_bytes,
             queue_bytes,
+            tag: 0,
         };
         let waiters = config
             .max_groups
@@ -545,7 +555,7 @@ impl<F: BlockFile + 'static> Log<F> {
                 uncertain: r.uncertain,
                 damaged: r.damaged,
             };
-            let bytes = writer::submission_len(r.group, &r.update, marks)
+            let bytes = writer::submission_len(r.group, &r.update, marks, p.tag)
                 .and_then(writer::charge)
                 .ok_or(LogError::TooLarge(usize::MAX))?;
             room.hold(r.group, bytes)?;
@@ -743,7 +753,7 @@ impl<F: BlockFile + 'static> Log<F> {
     ) -> Result<Pending, LogError> {
         // Refused before it holds any room: no frame could take it, and every admitted
         // submission fits the byte bound alone, so none waits for a queue that cannot hold it.
-        let len = writer::submission_len(group, &update, Marks::default())
+        let len = writer::submission_len(group, &update, Marks::default(), self.p.tag)
             .ok_or(LogError::TooLarge(usize::MAX))?;
         if len > self.p.frame_room {
             return Err(LogError::TooLarge(len));
@@ -812,11 +822,14 @@ impl<F: BlockFile + 'static> Log<F> {
 
     /// The most bytes one entry may hold and still fit a frame alone.
     pub fn entry_room(&self) -> Result<usize, LogError> {
-        let one = format::encoded_len(&format::Record::Entries {
-            group: 0,
-            first: 0,
-            entries: &[(0, &[])],
-        })
+        let one = format::encoded_len(
+            &format::Record::Entries {
+                group: 0,
+                first: 0,
+                entries: &[(0, &[])],
+            },
+            self.p.tag,
+        )
         .ok_or(LogError::Config("an entry's record"))?;
         self.frame_room()?
             .checked_sub(one)
@@ -831,7 +844,7 @@ impl<F: BlockFile + 'static> Log<F> {
     /// never done, so never acknowledged. `TooLarge` when one entry or proposal alone is
     /// more than a frame holds.
     pub fn parts(&self, group: u128, update: Update) -> Result<Vec<Update>, LogError> {
-        parts(self.p.frame_room, group, update)
+        parts(self.p.frame_room, group, update, self.p.tag)
     }
 
     /// Submits `update` and waits until it is durable; refused at once when the queue is

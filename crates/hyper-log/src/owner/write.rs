@@ -467,9 +467,14 @@ impl<F: BlockFile + 'static> Owner<F> {
             self.schedule.held.push_back(s);
             return Ok(Some(false));
         }
-        let Some(placement) =
-            writer::encode(payload, &mut laid.records, s.group, &s.update, s.marks)
-        else {
+        let Some(placement) = writer::encode(
+            payload,
+            &mut laid.records,
+            s.group,
+            &s.update,
+            s.marks,
+            self.p.tag,
+        ) else {
             batch.push_front(s);
             return Err(LogError::TooLarge(len));
         };
@@ -482,7 +487,7 @@ impl<F: BlockFile + 'static> Owner<F> {
     /// group, and the payload bytes its records take.
     fn fits(&self, s: &Submission, new_groups: usize) -> Result<(bool, usize), LogError> {
         let new = writer::validate(&self.state, &self.p.config, s, new_groups)?;
-        match writer::submission_len(s.group, &s.update, s.marks) {
+        match writer::submission_len(s.group, &s.update, s.marks, self.p.tag) {
             Some(len) if len <= self.p.frame_room => Ok((new, len)),
             Some(len) => Err(LogError::TooLarge(len)),
             None => Err(LogError::TooLarge(usize::MAX)),
@@ -653,6 +658,7 @@ impl<F: BlockFile + 'static> Owner<F> {
             sequence,
             tail,
             records,
+            sealed: p.tag != 0,
         };
         let header = frame
             .header(payload)
@@ -672,6 +678,7 @@ impl<F: BlockFile + 'static> Owner<F> {
                 incarnation: target.incarnation,
                 nonce: target.nonce,
                 segment_bytes: p.config.segment_bytes,
+                key: None,
             };
             buf.extend_from_slice(&header.encode()).map_err(disk)?;
             buf.extend_zeros(block.saturating_sub(buf.len()))

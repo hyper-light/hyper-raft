@@ -1816,11 +1816,14 @@ fn the_queue_bounds_every_submission_not_yet_answered() {
 
 /// An update of one entry whose records take `len` payload bytes.
 fn sized(first: u64, len: usize) -> Update {
-    let header = hyper_log::format::encoded_len(&hyper_log::format::Record::Entries {
-        group: 0,
-        first,
-        entries: &[(1, &[])],
-    })
+    let header = hyper_log::format::encoded_len(
+        &hyper_log::format::Record::Entries {
+            group: 0,
+            first,
+            entries: &[(1, &[])],
+        },
+        0,
+    )
     .unwrap();
     Update {
         entries: Some(Entries {
@@ -1896,11 +1899,14 @@ fn empty_entries_are_charged_their_records() {
         }),
         ..Update::default()
     };
-    let len = hyper_log::format::encoded_len(&hyper_log::format::Record::Entries {
-        group: 0,
-        first: 1,
-        entries: &[(1, &[])],
-    })
+    let len = hyper_log::format::encoded_len(
+        &hyper_log::format::Record::Entries {
+            group: 0,
+            first: 1,
+            entries: &[(1, &[])],
+        },
+        0,
+    )
     .unwrap();
     let cost = charged(len);
     let nothing = charged(0);

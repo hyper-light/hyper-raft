@@ -156,6 +156,9 @@ impl<F: BlockFile + 'static> LogStore for Depth<F> {
     fn proposals(&self, into: &mut Vec<hyper_raft::proto::Entry>) -> Result<(), StorageError> {
         self.0.proposals(into)
     }
+    fn released(&self) -> Result<u64, StorageError> {
+        self.0.released()
+    }
     fn room(&self) -> bool {
         self.0.room()
     }

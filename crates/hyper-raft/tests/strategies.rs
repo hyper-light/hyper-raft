@@ -267,12 +267,12 @@ const CASES: [Case; 5] = [
     Case {
         mutant: Mutant::FastBesideAnyTerm,
         harness: Harness::FastFirstRule,
-        random: Some(67_843),
+        random: Some(102_775),
     },
     Case {
         mutant: Mutant::FastAnyConfiguration,
         harness: Harness::Fast,
-        random: Some(1_484),
+        random: Some(8_868),
     },
 ];
 
@@ -498,6 +498,7 @@ fn abstraction<R: Core>(group: &Cluster<R>) -> Abstract {
                     log: disk.entries.iter().map(|e| (e.term, stated(e))).collect(),
                     held: disk.proposals.iter().map(|e| e.index).collect(),
                     commit: disk.hard_state.commit,
+                    classic: disk.released,
                 }
             })
             .collect(),
@@ -891,23 +892,24 @@ fn check_catches(guided: bool) {
 }
 
 /// The catches the campaigns reported (2026-10-05, on the core that counts by the newest
-/// configuration in its log): strategy, case, and the seed (for a coverage campaign, the run).
+/// configuration in its log and holds what it holds until a classic commit): strategy, case, and
+/// the seed (for a coverage campaign, the run). `FastAnyConfiguration` is caught by the random
+/// walk alone (`CASES`): swarm, PCT at either depth and the coverage-guided campaign each ran its
+/// 8,868 runs without a catch; and the coverage-guided campaign ran `FastBesideAnyTerm`'s 102,775
+/// without one.
 const CATCHES: &[(Strategy, usize, u64)] = &[
     (Strategy::Swarm, 0, 171),
     (Strategy::Swarm, 1, 17),
     (Strategy::Swarm, 2, 0),
-    (Strategy::Swarm, 3, 2_880),
-    (Strategy::Swarm, 4, 570),
-    (Strategy::Pct(1), 1, 12),
+    (Strategy::Swarm, 3, 3_312),
+    (Strategy::Pct(1), 1, 7),
     (Strategy::Pct(1), 2, 0),
-    (Strategy::Pct(1), 3, 26_305),
-    (Strategy::Pct(2), 1, 12),
+    (Strategy::Pct(1), 3, 22_065),
+    (Strategy::Pct(2), 1, 7),
     (Strategy::Pct(2), 2, 0),
-    (Strategy::Pct(2), 3, 28_114),
-    (Strategy::Guided, 1, 8),
+    (Strategy::Pct(2), 3, 38_860),
+    (Strategy::Guided, 1, 20),
     (Strategy::Guided, 2, 1),
-    (Strategy::Guided, 3, 6_655),
-    (Strategy::Guided, 4, 1_496),
 ];
 
 // ---------------------------------------------------------------------------------------------
@@ -960,44 +962,47 @@ fn recorded(case: Case, seed: u64) -> (Judged, Tape) {
     (judged, taped.player.finish())
 }
 
-/// The random walk's catch of a read before the term's first commit (seed 3 of the group
-/// schedules), recorded through a tape and shrunk while it fails with a stale read: the tape
-/// replays the seed's run exactly, and the shrunk tape is 1-minimal and still fails.
+/// The random walk's first catch of a read before the term's first commit among the group
+/// schedules' 96 default seeds (`tests/check.rs`, `a_read_before_the_terms_first_commit_is_caught`),
+/// recorded through a tape and shrunk while it fails with a stale read: the tape replays the
+/// seed's run exactly, and the shrunk tape is 1-minimal and still fails.
 #[test]
 fn a_failing_run_shrinks_to_a_minimal_tape_that_fails_the_same_way() {
-    // The random walk's first catch (`CASES`): runs, less one.
-    const SEED: u64 = 3;
     let case = CASES[1];
-    let (judged, tape) = recorded(case, SEED);
-    let violation = judged
-        .violation
-        .expect("seed 3 catches the read before the first commit");
+    let (seed, judged, tape) = (0..96)
+        .map(|seed| {
+            let (judged, tape) = recorded(case, seed);
+            (seed, judged, tape)
+        })
+        .find(|(_, judged, _)| judged.violation.is_some())
+        .expect("a default seed catches the read before the first commit");
+    let violation = judged.violation.expect("found by its violation");
     assert!(
         matches!(violation, Violation::StaleRead { .. }),
-        "{violation}"
+        "seed {seed}: {violation}"
     );
     // The tape is the seed's run: the same steps and the same violation.
     let plain = run(
         case.harness,
         &Configuration::of(case.harness),
-        SEED,
+        seed,
         Some(case.mutant),
-        &mut Seed(Seeded(SEED)),
+        &mut Seed(Seeded(seed)),
     );
     assert_eq!(plain.violation, Some(violation.clone()));
-    assert!(fails_as(case, SEED, &tape, &violation));
+    assert!(fails_as(case, seed, &tape, &violation));
     let shrunk = shrink(tape.clone(), 20_000, |candidate| {
-        fails_as(case, SEED, candidate, &violation)
+        fails_as(case, seed, candidate, &violation)
     });
     println!(
-        "a read before the first commit: {} steps shrunk to {} in {} runs, minimal {}",
+        "a read before the first commit, seed {seed}: {} steps shrunk to {} in {} runs, minimal {}",
         tape.len(),
         shrunk.tape.len(),
         shrunk.runs,
         shrunk.minimal
     );
     assert!(shrunk.minimal && shrunk.tape.len() < tape.len());
-    assert!(fails_as(case, SEED, &shrunk.tape, &violation));
+    assert!(fails_as(case, seed, &shrunk.tape, &violation));
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1494,20 +1499,17 @@ fn the_swarm_seeds_whose_groups_never_converged_settle() {
     }
 }
 
-/// An open defect of the fast track, found by the swarm's campaign against its second rule at fast
-/// seed 41,345 with no defect planted (`docs/sim.md` §15.9): four voters, index 10 committed by the
-/// fast quorum in term 13, member 4's vote for it among the three; member 4 later led term 18 and
-/// took the entry into its log, which released what it held beside its log there (a member holds a
-/// proposal only above its log, `Raft::release_proposals`); term 23's leader cut member 4's log
-/// below index 10 (its entries bore term 18, the leader's term 13), member 4 then held another
-/// proposal at 10, and the election of term 34 by members 1, 3 and 4 recovered the most held of
-/// their reports, the other value. slates' search refuses the same rule (`Variant::DropCovered`,
-/// `tests/models/prefix.rs`: a slot dropped once its log covers the index loses a committed entry);
-/// `FastTrack.tla`'s `Release` keeps it, and its scopes do not reach the run. Ignored until the
-/// fast track keeps a vote's record until a commit no later leader can lack covers it, which
-/// changes the core, its storage's contract and the model together.
+/// The swarm's campaign against the fast track's second rule found, at fast seed 41,345 with no
+/// defect planted (`docs/sim.md` §15.9), an entry committed by the fast quorum lost: four voters,
+/// index 10 committed in term 13 with member 4's vote among the three; member 4 led term 18, took
+/// the entry into its log and let its holding go (it held a proposal only above its log); term 23's
+/// leader cut member 4's log below index 10, member 4 held another proposal there, and the election
+/// of term 34 by members 1, 3 and 4 recovered the other value: members 1 and 3 had the entry in
+/// their logs alone, from term 13's leader, which the fast quorum had counted and no election
+/// reads. A member now holds what it holds by itself until it knows the index committed by a
+/// classic quorum, and a fast quorum counts only such holdings (`docs/raft.md` §3.5). The seed's
+/// run keeps every oracle.
 #[test]
-#[ignore = "an open defect of the fast track (docs/sim.md §15.9): fails until it is fixed"]
 fn a_fast_committed_entry_outlives_a_vote_its_log_covered_and_then_lost() {
     let seed = 41_345;
     let configuration = Configuration::swarm(Harness::Fast, seed);

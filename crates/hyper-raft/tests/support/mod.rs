@@ -106,6 +106,8 @@ pub struct Disk {
     pub lost: Option<hyper_raft::Lost>,
     /// What the member approved by itself.
     pub proposals: Vec<Entry>,
+    /// The greatest index a `Ready` released what the member approved by itself through.
+    pub released: u64,
 }
 
 /// An entry's checksum: FNV-1a over everything it states.
@@ -176,8 +178,6 @@ impl Disk {
             self.entries.push(entry.clone());
             self.sums.push(sum(entry));
         }
-        let last = self.last_index();
-        self.proposals.retain(|held| held.index > last);
     }
     /// Keeps the entries a member gave up once durable, as they are: what
     /// they replace is cut first, as `append` cuts it.
@@ -194,12 +194,20 @@ impl Disk {
         self.sums.truncate(at);
         self.sums.extend(entries.iter().map(sum));
         self.entries.extend(entries);
-        self.trim_proposals();
     }
-    /// What the log reached is approved by itself no more.
-    pub fn trim_proposals(&mut self) {
-        let last = self.last_index();
-        self.proposals.retain(|held| held.index > last);
+    /// Takes what a `Ready` gave of what the member approved by itself: what
+    /// it released goes first ([`hyper_raft::Ready::released`]), then each
+    /// proposal given replaces the one held at its index. Nothing else drops
+    /// one: not the log reaching it, not a snapshot.
+    pub fn hold(&mut self, given: &[Entry], released: Option<u64>) {
+        if let Some(released) = released {
+            self.proposals.retain(|held| held.index > released);
+            self.released = self.released.max(released);
+        }
+        for entry in given {
+            self.proposals.retain(|held| held.index != entry.index);
+            self.proposals.push(entry.clone());
+        }
     }
     pub fn install(&mut self, snapshot: &Snapshot) {
         self.install_owned(snapshot.clone());
@@ -212,7 +220,6 @@ impl Disk {
         self.entries.clear();
         self.sums.clear();
         self.snapshot = snapshot;
-        self.proposals.retain(|held| held.index > metadata.index);
     }
     /// Everything through `index` becomes the snapshot.
     pub fn compact(&mut self, index: u64, data: Vec<u8>) {
@@ -417,6 +424,7 @@ impl hyper_raft::Storage for Store {
             hard_state: disk.hard_state,
             configuration: disk.conf.clone(),
             proposals: disk.proposals.clone(),
+            released: disk.released,
         })
     }
     fn entries(
@@ -1448,13 +1456,12 @@ impl Replica for New {
                 }
                 output.persisted.extend(persist.entries.iter().map(said));
                 let disk = &mut persist.store.0;
-                disk.proposals.extend(ready.proposals().iter().cloned());
-                disk.trim_proposals();
+                disk.hold(ready.proposals(), ready.released());
             } else {
                 output.persisted.extend(ready.entries().iter().map(said));
                 let disk = &mut self.raw.store_mut().0;
-                disk.proposals.extend(ready.proposals().iter().cloned());
                 disk.append(ready.entries());
+                disk.hold(ready.proposals(), ready.released());
             }
             output.displaced.extend(ready.displaced().iter().map(said));
             if let Some(hard) = ready.hard_state() {

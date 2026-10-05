@@ -23,6 +23,8 @@ pub struct Measured {
     pub total: alloc::Counts,
     pub aside: alloc::Counts,
     pub faults: faults::Faults,
+    /// The indexes the members committed by a fast quorum while measured (the fast workload).
+    pub fast_committed: u64,
 }
 
 /// Whether this process counts allocations (`one ... count`) or times (`one ... time`).
@@ -476,6 +478,7 @@ fn fast<C: Core>(group: &mut Group<C>, spec: &Spec) -> Option<Measured> {
         round(group)?;
     }
     group.compact();
+    let before: u64 = group.nodes.iter().map(Core::fast_committed).sum();
     let mut meter = Meter::new();
     meter.start();
     for at in 0..spec.rounds {
@@ -486,5 +489,8 @@ fn fast<C: Core>(group: &mut Group<C>, spec: &Spec) -> Option<Measured> {
     }
     meter.stop();
     assert!(group.agreed(1), "{}: the members differ", C::NAME);
-    Some(meter.finish((spec.rounds * spec.batch) as u64))
+    let mut measured = meter.finish((spec.rounds * spec.batch) as u64);
+    let after: u64 = group.nodes.iter().map(Core::fast_committed).sum();
+    measured.fast_committed = after.saturating_sub(before);
+    Some(measured)
 }

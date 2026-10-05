@@ -1416,23 +1416,29 @@ sessions' work, load 9–72 (`docs/benchmarks.md`, "hyper-check's strategies and
 | Defect (§4.6) | Random walk (§14.6) | Swarm | PCT, depth 1 | PCT, depth 2 | Coverage-guided | Exhaustive rounds (rounds played) |
 |---|---|---|---|---|---|---|
 | a commit counted from an older term's replicas | not in 2,096 | **172** | not in 2,096 | not in 2,096 | not in 2,096 | **33,621** (four rounds) |
-| a read served before the term's first commit | 4 | 18 | 13 | 13 | 8 | outside its scenarios (no reads) |
+| a read served before the term's first commit | 4 | 18 | 8 | 8 | 20 | outside its scenarios (no reads) |
 | a vote sent before it is durable | 1 | 1 | 1 | 1 | 1 | outside its scope (no lagging writes) |
-| the fast track without its first rule | 67,843 | **2,881** | 26,306 | 28,115 | **6,655** | outside its scope (no fast track) |
-| the fast track without its second rule | 1,484 | **571** | not in 2,096 | not in 2,096 | 1,496 | outside its scope |
+| the fast track without its first rule | 102,775 | **3,313** | 22,066 | 38,861 | not in 102,775 | outside its scope (no fast track) |
+| the fast track without its second rule | **8,868** | not in 8,868 | not in 8,868 | not in 8,868 | not in 8,868 | outside its scope |
 
-The counts are those on the core that counts by the newest configuration in its log (§15.12,
-2026-10-05); the campaigns were run again on it from their first seeds, and each catch is its
-defect's (`each_catch_by_seed_is_its_defects`, `each_catch_by_coverage_is_its_defects`). On the
-core before, the second rule's swarm campaign met the core's open defect first (§15.9), and the
-first rule's counts were 47,819 (random walk), 706, 25,324, 21,181 and 4,787.
+The counts are those on the core that counts by the newest configuration in its log (§15.12) and
+holds what it holds until a classic commit (§15.13), 2026-10-05; the campaigns were run again on it
+from their first seeds, and each catch is its defect's (`each_catch_by_seed_is_its_defects`,
+`each_catch_by_coverage_is_its_defects`). On the core of §15.12 the read before the first commit took
+13, 13 and 8 runs of PCT and coverage. On the core before the release (§15.12 alone) the two fast-track
+rows were 67,843, 2,881, 26,306, 28,115, 6,655 and 1,484, 571, not in 2,096, not in 2,096, 1,496;
+before that, the second rule's swarm campaign met the core's open defect first (§15.9), and the first
+rule's counts were 47,819 (random walk), 706, 25,324, 21,181 and 4,787.
 
 The guarantees the PCT campaigns' run counts carry, by Theorem 9 at their `k`, five members: for a
 defect of depth one, 1 − (4/5)^R, above 0.9999 at every count here but the first runs; for depth two,
-0.925 at 26,306 runs and 0.937 at 28,115 (the first rule), 0.194 at 2,096 (the group's) and 0.185
-(the second rule's); for depth three, at most 1.4·10⁻³ (the campaigns' own report, 2026-10-05). **What the counts say.** On the first fast-track rule the swarm beats
-the random walk by 23 times, coverage guidance by 10 and PCT by about 2.5; on the second the swarm
-by 2.6 times, and coverage guidance and PCT not at all. The swarm alone catches the older-term
+0.925 at 26,306 runs and 0.937 at 28,115 (the first rule, on the core of §15.12), 0.194 at 2,096
+(the group's) and 0.185 (the second rule's); for depth three, at most 1.4·10⁻³ (the campaigns' own
+report, 2026-10-05). **What the counts say.** On the first fast-track rule the swarm beats the
+random walk by 31 times and PCT by 2.7 to 4.7, and coverage guidance does not catch it within the
+random walk's count; on the second, under the
+release (§15.13), only the random walk catches it within its count: a member holds a vote now
+until a classic commit covers it, so fewer schedules leave a fast quorum counted across a change. The swarm alone catches the older-term
 commit, which needs an order of elections and partitions rather than of deliveries. The exhaustive round
 search is the only strategy that guarantees its result within its scope: it plays every four-round
 scenario, and the older-term commit is among them.
@@ -1462,7 +1468,7 @@ answers whatever the settings (thesis Figure 3.1, "reply false if term < current
 `the_swarm_seeds_whose_groups_never_converged_settle`). The differential with raft-rs loses such a
 message for both cores, a third decided difference, and holds that its runs reach it.
 
-**Open in the core: a fast-committed entry lost with the record of a vote** (swarm campaign against
+**Fixed in the core: a fast-committed entry lost with the record of a vote** (swarm campaign against
 the second rule, fast seed 41,345, no defect planted: four voters, check-quorum on, pre-vote off, no
 changes, restarts or partitions). Index 10 was committed by the fast quorum in term 13, member 4's
 vote among the three. Member 4 led term 18, recovered the entry into its log and so released its
@@ -1477,8 +1483,9 @@ fast commits (`Variant::PruneAtFastCommit`); its design releases a vote only und
 `FastTrack.tla` keeps hyper-raft's release, and its `Replicate` always sends through the leader's
 end, so it never cuts a log short of an index and cannot reach the run. The fix changes the core's
 release rule, what a follower learns of the classic commit, the storage's contract for what it holds
-and the model together, and is its own series; until it lands the seed's test is ignored
-(`a_fast_committed_entry_outlives_a_vote_its_log_covered_and_then_lost`, which fails today).
+and the model together, and is its own series (`docs/raft.md` §3.5, §15.13 here); the seed's test
+(`a_fast_committed_entry_outlives_a_vote_its_log_covered_and_then_lost`) failed before it and passes
+with it.
 
 **In the harness:**
 - *A snapshot lost at the network's bound was never reported to its sender* (fast seed 2,396). The
@@ -1543,14 +1550,8 @@ searches 14.7 min, 2.48 GB resident at most.
 
 ### 15.11 Open in S-5
 
-- **The fast track's lost entry** (§15.9, swarm fast seed 41,345): fixed in its own series from
-  `line`. A vote counts toward a fast quorum only while it is held, and a member keeps what it holds
-  until its own classic commit, learned through an in-order append, covers it (slates' design,
-  `Variant::DropCovered` and `PruneAtFastCommit` refused). That series changes the model and the
-  wire, and re-runs the swarm and PCT campaigns against the second rule with no defect planted.
-- **`FastTrack.tla` as a Rust `Model`** (§4.5's last paragraph): not built. The model-level search
-  runs slates' two models; the core's own model is checked by TLC in CI and, on the implementation's
-  schedules, by the conformance check's projections of its `Next` (§15.4).
+- **The fast track's lost entry** (§15.9, swarm fast seed 41,345): fixed (§15.13).
+- **`FastTrack.tla` as a Rust `Model`** (§4.5's last paragraph): built (§15.13).
 - **The conformance check is by projection** (§15.4): a step is held to every relation the model's
   actions keep, not shown to be a sequence of model actions.
 - **The round search's scope** leaves out reads, lagging writes and the fast track (§15.8), and
@@ -1561,9 +1562,8 @@ searches 14.7 min, 2.48 GB resident at most.
   moving `tests/group.rs`, `fast.rs` and `pipeline.rs` onto them, and hyper-durable's crash
   enumeration onto forks, is S-6's (§8).
 - **slates' prefix model's representative** (§15.9) is slates' to correct; reported, not edited.
-- **`FastTrack.tla`'s `LogMatching`** compares whole entries, and the fast track's committed prefixes
-  may differ in their stamps (§15.9), which its present scopes do not reach. TLC runs in CI only;
-  the invariant's change, and a scope that reaches such a state, are owed to the model.
+- **`FastTrack.tla`'s `LogMatching`** compares terms only where neither member has committed, and a
+  scope reaches a restamped prefix (§15.13).
 
 ### 15.12 The configuration a member counts by (2026-10-05)
 
@@ -1596,3 +1596,48 @@ one index in one term, where the leader's wrong count led; the run without the d
 oracle), and the second at seed 1,483. The floors of `tests/check.rs` are the counts on this core
 (§15.2); a write displaced by another entry is reached about once a pipelined seed, and is held to
 being reached.
+
+### 15.13 Holdings kept until a classic commit (2026-10-05)
+
+The fix of §15.9's lost entry (`docs/raft.md` §3.5) changes what a member holds and for how long, so
+every campaign was run again on it from its first seed (release, beside other sessions' work):
+
+- **No defect planted.** The swarm, 5,000 seeds a harness: group, fast and pipelined keep every
+  oracle and the model, and settle within 9,039, 8,016 and 3,396 operations of a liveness phase
+  (`LIVENESS` is four times the most, unchanged).
+- **The planted defects.** The first fast-track rule's random walk first catches at seed 102,774
+  (Leader Completeness); the second rule's at seed 8,867. The table of §15.8 gives the rest. Each
+  catch's run without its defect keeps every oracle.
+- **Its store, end to end.** `hyper-durable-e2e`'s `fast-kill-*` scenarios run the kill points of
+  the classic scenarios on a group whose members each take writes and propose them by the fast
+  track, on hyper-log over real fully flushed files: every answered write reads back and every
+  member applies the same history. They found two faults, each fixed with a directed test that fails
+  without it: hyper-log refused a write whose entries reached a proposal it carried and fenced the
+  member (`docs/raft.md` §3.5, "Storage"; `tests/hyperlog.rs`,
+  `a_holding_the_same_write_reaches_by_an_append_is_kept`; the scenarios fence a member without the
+  fix), and the shell dropped `Ready::displaced`, so a member never learned that another entry took
+  its proposal's index and its client waited on an entry no member applies (`Output::displaced`;
+  `tests/shell.rs`, `a_fast_proposal_another_entry_took_the_index_of_is_given_back`). On this
+  machine's disks no index of those runs was committed by a fast quorum: with three voters the fast
+  quorum is all three, and the last holder's write lands behind the commit write it had out, after
+  the leader's append round. The scenarios report the counts and assert none, for which path wins
+  is a race; the swarm's fast harnesses decide the fast commit exactly.
+- **`FastTrack.tla` as a Rust `Model`.** `tests/models/fasttrack.rs` is the specification's `Next`
+  under `hyper_check::explore`, every constant a field of its `Scope`, and searches each
+  configuration of `docs/models/` (`tests/fasttrack.rs`). It reaches TLC's count at every
+  configuration it shares with CI's model job: with the rules before the fix, the eight of one
+  value at the counts TLC published before (`the_model_counts_what_tlc_counted`); with the fix,
+  `one` 573,160, `round` 3,974,278, `four` 3,602,968, `change` 4,067,274, `grow` 9,551,710, `classic`
+  841,050, `joint` 2,626,941, `marked` 303,762, `markedchange` 431,168 and `markedjoint` 1,182,158
+  (CI run 37336523719), and the scenario from the end of its term 1 at 3,870,308. Its scripts replay
+  the swarm's run in the scenario (`the_entry_the_swarm_lost_is_lost_by_each_rule_before_the_fix`,
+  `with_the_fix_the_same_run_keeps_the_entry`). CI's explore job runs its whole scopes.
+- **`LogMatching` on restamped prefixes.** A member keeps the stamp of an entry it committed that a
+  later leader's election took again under its own term, and takes that leader's entries after it,
+  so two logs can hold an entry of one term at one index above entries of different terms; the
+  invariant compares terms only where neither member has committed. No configuration reached such
+  a pair (each searched with the claim `NoRestamp`, the scenario from its term 1 too); the restamp
+  scope does, three voters at two terms and three indexes, the entry held at index 2
+  (`FastTrackRestampReached.cfg`, refused; the Rust search finds the pair after 1,195,591 classes),
+  and keeps every invariant at 3,808,625 states (`FastTrackRestamp.cfg`,
+  `the_restamp_scope_reaches_a_restamped_prefix_and_keeps_log_matching`).

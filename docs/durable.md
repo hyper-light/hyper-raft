@@ -794,6 +794,8 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
     /// When to drive though nothing arrives; none for a group with nothing in flight.
     pub fn deadline(&self) -> Option<u64>;
     pub fn propose(&mut self, entry: &[u8]) -> Result<(), ReplicaError>;
+    /// The index proposed for. One another entry takes comes back in `Output::displaced`: no
+    /// member applies it, and its proposer proposes it again or says it was not taken.
     pub fn propose_fast(&mut self, entry: &[u8]) -> Result<u64, ReplicaError>;
     pub fn read(&mut self, context: &[u8]) -> Result<(), ReplicaError>;
     pub fn change(&mut self, change: &ConfChangeV2) -> Result<(), ReplicaError>;
@@ -1042,7 +1044,8 @@ What waits on core steps not built:
   others can be a quorum; the shell holds only a stalled member's campaigns.
 - **Asked of the core besides:** `RawNode::into_store`, so a closed replica gives back its store;
   and the fast track's proposals not yet durable, so a refused write that held them is made again
-  instead of fencing the replica (no owner enables the fast track yet).
+  instead of fencing the replica. No owner of the three projects enables the fast track yet;
+  `hyper-durable-e2e` runs it (`--fast`, the `fast-kill-*` scenarios, `docs/sim.md` §15.13).
 
 hyper-log changed with it (`crates/hyper-durable/ORIGIN.md`): writes sent behind a refused one are
 refused (`LogError::Behind`), and `GroupLog::depth` and `has_room`. `GROUP_SUBMISSIONS` is still two,

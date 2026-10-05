@@ -127,6 +127,7 @@ pub mod hyper {
                 hard_state: self.hard,
                 configuration: self.conf.clone(),
                 proposals: Vec::new(),
+                released: 0,
             })
         }
         fn entries(&self, low: u64, high: u64, _max: u64, into: &mut Vec<Entry>) -> Result<(), StorageError> {

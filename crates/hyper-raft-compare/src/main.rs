@@ -90,6 +90,7 @@ struct Row {
     minor: f64,
     major: f64,
     task: f64,
+    fast: f64,
 }
 
 impl Row {
@@ -111,11 +112,12 @@ impl Row {
                 .faults
                 .task
                 .map_or(f64::NAN, |task| task.faults as f64),
+            fast: measured.fast_committed as f64,
         }
     }
     fn print(&self) -> String {
         format!(
-            "ops={} ns={} allocs={} reallocs={} bytes={} total_allocs={} total_reallocs={} total_bytes={} peak={} minor={} major={} task={}",
+            "ops={} ns={} allocs={} reallocs={} bytes={} total_allocs={} total_reallocs={} total_bytes={} peak={} minor={} major={} task={} fast={}",
             self.ops,
             self.ns,
             self.allocs,
@@ -127,7 +129,8 @@ impl Row {
             self.peak,
             self.minor,
             self.major,
-            self.task
+            self.task,
+            self.fast
         )
     }
     fn parse(line: &str) -> Option<Self> {
@@ -148,6 +151,7 @@ impl Row {
                 "minor" => row.minor = value,
                 "major" => row.major = value,
                 "task" => row.task = value,
+                "fast" => row.fast = value,
                 _ => return None,
             }
         }

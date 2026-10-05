@@ -17,6 +17,9 @@
 //! - a member stopped mid-scenario fails the wait for what it cannot do, named, and once let go
 //!   applies the same history;
 //! - a member started again is reported restarted to every other member's core;
+//! - a group whose members each take writes and propose them by the fast track keeps all of this
+//!   through the same kill points, a write another entry took the index of answered as not taken
+//!   and asked again (`fast-kill-*`);
 //! - every suspicion is the member's stream's: none was told while a heartbeat the kernel stamped
 //!   before its point sat unread in the member's socket (each report's `unread`).
 //!
@@ -122,6 +125,11 @@ struct Cluster {
     /// Members ordered to fail a flush: each fences and exits, which ends its process as the test
     /// expects.
     fencing: Vec<u64>,
+    /// Whether the group runs the fast track: each write goes to the members in turn, and each
+    /// that knows a leader proposes it to every voter itself.
+    fast: bool,
+    /// The turn the next write by the fast track goes to.
+    proposer: usize,
 }
 
 impl Drop for Cluster {
@@ -142,7 +150,7 @@ impl Drop for Cluster {
     clippy::disallowed_methods,
     reason = "real processes on the host's clock, threads and environment (CLAUDE.md §1a, end to end)"
 )]
-fn spawn(id: u64, voters: &[u64], log: &Path) -> (Child, u16, Receiver<String>) {
+fn spawn(id: u64, voters: &[u64], log: &Path, fast: bool) -> (Child, u16, Receiver<String>) {
     let list: Vec<String> = voters.iter().map(u64::to_string).collect();
     let mut child = Command::new(NODE)
         .args(["--id", &id.to_string()])
@@ -151,6 +159,7 @@ fn spawn(id: u64, voters: &[u64], log: &Path) -> (Child, u16, Receiver<String>) 
         .args(["--log", log.to_str().unwrap()])
         .args(["--max-keys", &MAX_KEYS.to_string()])
         .args(["--max-pending", &MAX_PENDING.to_string()])
+        .args(fast.then_some("--fast"))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
@@ -178,6 +187,11 @@ fn spawn(id: u64, voters: &[u64], log: &Path) -> (Child, u16, Receiver<String>) 
 
 impl Cluster {
     fn start(name: &str, voters: u64) -> Self {
+        Self::open(name, voters, false)
+    }
+
+    /// A group of `voters` founded under `name`, by the fast track when `fast`.
+    fn open(name: &str, voters: u64, fast: bool) -> Self {
         let ids: Vec<u64> = (1..=voters).collect();
         let mut members = Vec::new();
         for &id in &ids {
@@ -185,7 +199,7 @@ impl Cluster {
                 PathBuf::from(TMP).join(format!("durable-{}-{name}-{id}.log", std::process::id()));
             remove(&log);
             remove(&run::path(&log));
-            let (child, port, lines) = spawn(id, &ids, &log);
+            let (child, port, lines) = spawn(id, &ids, &log, fast);
             members.push(Member {
                 id,
                 child: Some(child),
@@ -214,6 +228,8 @@ impl Cluster {
             acked: BTreeMap::new(),
             stopped: Vec::new(),
             fencing: Vec::new(),
+            fast,
+            proposer: 0,
         };
         cluster.tell_peers();
         cluster
@@ -605,13 +621,24 @@ impl Cluster {
         }
     }
 
-    /// Writes `key` = `value` through the leader until a member answers it, while the group
-    /// moves; the index it was applied at. The group is looked at only when no answer came.
+    /// Writes `key` = `value` through the leader, or by the fast track through the members up in
+    /// turn, until a member answers it, while the group moves; the index it was applied at. The
+    /// group is looked at only when no answer came.
     fn put(&mut self, key: &[u8], value: &[u8]) -> Option<u64> {
         let mut watch = self.watch();
         loop {
-            let leader = self.leader()?;
-            if let Some(Outcome::Put(index)) = self.ask(leader, &Op::Put { key, value }) {
+            let to = if self.fast {
+                let up: Vec<u64> = self
+                    .up()
+                    .into_iter()
+                    .filter(|id| !self.stopped.contains(id))
+                    .collect();
+                self.proposer = self.proposer.wrapping_add(1);
+                *up.get(self.proposer % up.len().max(1))?
+            } else {
+                self.leader()?
+            };
+            if let Some(Outcome::Put(index)) = self.ask(to, &Op::Put { key, value }) {
                 self.acked.insert(key.to_vec(), value.to_vec());
                 return Some(index);
             }
@@ -810,9 +837,10 @@ impl Cluster {
             .filter(|(_, r)| r.heard.contains(&id))
             .map(|(other, r)| (other, r.restarts))
             .collect();
+        let fast = self.fast;
         let member = self.member(id);
         assert!(member.child.is_none());
-        let (child, port, lines) = spawn(id, &voters, &member.log.clone());
+        let (child, port, lines) = spawn(id, &voters, &member.log.clone(), fast);
         member.child = Some(child);
         member.lines = Some(lines);
         member.address = SocketAddr::from(([127, 0, 0, 1], port));
@@ -842,6 +870,28 @@ impl Cluster {
 
     /// Every write a member answered reads back as it was answered, and every member up applies
     /// the same history once a last write has reached them all.
+    /// What the group did by the fast track since each member up last started, as each reports
+    /// it. Whether an index is committed by a fast quorum or a classic one is a race between the
+    /// last holder's write and the leader's append round, so it is reported and never asserted;
+    /// the swarm's fast harnesses decide it exactly (`docs/sim.md`).
+    fn fast_track(&mut self) -> String {
+        let reports: Vec<Report> = self
+            .up()
+            .into_iter()
+            .filter_map(|id| self.report(id))
+            .collect();
+        let sum = |field: fn(&Report) -> u64| reports.iter().map(field).sum::<u64>();
+        format!(
+            "fast track: {} proposed, {} held, {} displaced, {} committed by a fast quorum, {} \
+             recovered at elections",
+            sum(|r| r.fast.proposed),
+            sum(|r| r.fast.held),
+            sum(|r| r.fast.displaced),
+            sum(|r| r.fast.committed),
+            sum(|r| r.fast.recovered)
+        )
+    }
+
     fn verify(&mut self) {
         let acked = self.acked.clone();
         for (key, value) in &acked {
@@ -906,8 +956,8 @@ fn turn(voters: usize) -> usize {
 /// Kills `target` (the leader or a follower) at `point`, the `count`-th time it passes it, while
 /// the group takes writes; restarts it on its log; every answered write reads back and every
 /// member applies the same history.
-fn kill_at(point: Point, leader: bool, count: u64, name: &str) -> String {
-    let mut cluster = Cluster::start(name, 3);
+fn kill_at(point: Point, leader: bool, count: u64, name: &str, fast: bool) -> String {
+    let mut cluster = Cluster::open(name, 3, fast);
     cluster.write_some("before", WRITES);
     let lead = cluster.leader().expect("a leader");
     let target = if leader {
@@ -944,7 +994,12 @@ fn kill_at(point: Point, leader: bool, count: u64, name: &str) -> String {
     cluster.restart(target, true);
     cluster.write_some("after", WRITES);
     cluster.verify();
-    cluster.looks()
+    let fast_track = if fast {
+        format!("; {}", cluster.fast_track())
+    } else {
+        String::new()
+    };
+    format!("{}{fast_track}", cluster.looks())
 }
 
 /// A member's disk stops completing flushes: its heartbeats stop with it (each needs a flush made
@@ -1290,7 +1345,7 @@ fn random_kills(rounds: u64) {
         let point = points[next(3) as usize];
         let leader = next(2) == 0;
         let count = 1 + next(8);
-        kill_at(point, leader, count, &format!("random-{round}"));
+        kill_at(point, leader, count, &format!("random-{round}"), false);
     }
 }
 
@@ -1311,11 +1366,15 @@ fn main() -> ExitCode {
         (Point::Durable, "durable"),
         (Point::Released, "released"),
     ] {
-        for leader in [true, false] {
-            let name = format!("kill-{name}-{}", if leader { "leader" } else { "follower" });
+        for (leader, fast) in [(true, false), (false, false), (true, true), (false, true)] {
+            let name = format!(
+                "{}kill-{name}-{}",
+                if fast { "fast-" } else { "" },
+                if leader { "leader" } else { "follower" }
+            );
             if runs(&name) {
                 let at = Instant::now();
-                let looks = kill_at(point, leader, 1, &name);
+                let looks = kill_at(point, leader, 1, &name, fast);
                 println!("{name}: ok in {:?}; {looks}", at.elapsed());
             }
         }

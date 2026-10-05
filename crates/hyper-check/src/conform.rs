@@ -1,6 +1,6 @@
 //! The TLA+ abstraction (`docs/sim.md` §4.5, "Coverage, defined"): a group's members read as the
-//! variables of `docs/models/FastTrack.tla` — each member's `term`, `vote`, `role`, `log`, `held`
-//! and `commit` — so that every step of a simulated run can be held to the model, and the
+//! variables of `docs/models/FastTrack.tla` — each member's `term`, `vote`, `role`, `log`, `held`,
+//! `commit` and `classic` — so that every step of a simulated run can be held to the model, and the
 //! abstract states a campaign reaches are its coverage.
 //!
 //! **The conformance check** ([`conforms`]). Every action of the model's `Next` keeps a set of
@@ -16,13 +16,20 @@
 //!   `Max(p, commit[m]) + 1`; only `Lose`, a fault at rest, cuts it, which the harness names);
 //! - no entry of its log bears a term above its own (`Take` and `Elect` write the member's term;
 //!   `Replicate` sets the member's term to the leader's);
-//! - what it holds beside its log is above its log (`TypeOK`, `Release`);
+//! - what it knows committed by a classic quorum never falls (`ClassicCommit` and `Replicate`
+//!   raise it to what the leader knows; only `Lose` cuts it). The model's `classic <= commit` is
+//!   of a member's own state, and is not checked here: the abstraction reads the durable commit,
+//!   which lags the member's own (a commit the member gives its owner outside a hard state need
+//!   not be durable, `LightReady::commit_index`), and what it released may reach storage first;
+//! - what it holds by itself is above what it knows committed by a classic quorum, and it lets a
+//!   holding go only once it knows its index so committed (`Release`, `ReleaseBy`);
 //! - a member that becomes leader voted for itself in its term (`Elect`);
 //! - a leader that stays leader in its term keeps its log and only adds to it, with entries of its
 //!   term (`Take`; no action rewrites a leader's log in its term).
 //!
 //! A member that crashed and restarted has lost only what was not durable: the abstraction reads
-//! durable state (its device's term, vote, log and commit), so a restart changes only its role.
+//! durable state (its device's term, vote, log, commit, holdings and what it released), so a
+//! restart changes only its role.
 //! Entries below a member's snapshot are a committed prefix and are not compared.
 //!
 //! **Coverage** ([`Abstract::point`]). The abstract state's shape, bounded so that a campaign's
@@ -56,10 +63,13 @@ pub struct Member {
     pub start: u64,
     /// `log` above `start`: each entry's term and a digest of what it states.
     pub log: Vec<(u64, u64)>,
-    /// `held`: the indexes it holds proposals at beside its log.
+    /// `held`: the indexes it holds proposals at by itself.
     pub held: Vec<u64>,
     /// `commit`.
     pub commit: u64,
+    /// `classic`: the index through which it knows its log committed by a classic quorum, as it
+    /// released what it held through it.
+    pub classic: u64,
 }
 
 impl Member {
@@ -130,8 +140,24 @@ pub enum Nonconformance {
         /// The index.
         index: u64,
     },
-    /// A member holds a proposal at an index its log holds.
-    HeldInLog {
+    /// What a member knows committed by a classic quorum fell.
+    ClassicFell {
+        /// The member's place.
+        member: usize,
+        /// Before.
+        from: u64,
+        /// After.
+        to: u64,
+    },
+    /// A member holds a proposal at an index it knows committed by a classic quorum.
+    HeldBelowClassic {
+        /// The member's place.
+        member: usize,
+        /// The index.
+        index: u64,
+    },
+    /// A member let a holding go at an index it did not know committed by a classic quorum.
+    ReleasedEarly {
         /// The member's place.
         member: usize,
         /// The index.
@@ -204,8 +230,26 @@ pub fn conforms(before: &Abstract, after: &Abstract, lost: &[usize]) -> Result<(
                 return Err(Nonconformance::EntryAboveTerm { member, index });
             }
         }
-        if let Some(index) = new.held.iter().find(|index| **index <= new.last()) {
-            return Err(Nonconformance::HeldInLog {
+        if !faulted && new.classic < old.classic {
+            return Err(Nonconformance::ClassicFell {
+                member,
+                from: old.classic,
+                to: new.classic,
+            });
+        }
+        if let Some(index) = new.held.iter().find(|index| **index <= new.classic) {
+            return Err(Nonconformance::HeldBelowClassic {
+                member,
+                index: *index,
+            });
+        }
+        if !faulted
+            && let Some(index) = old
+                .held
+                .iter()
+                .find(|index| **index > new.classic && !new.held.contains(index))
+        {
+            return Err(Nonconformance::ReleasedEarly {
                 member,
                 index: *index,
             });
@@ -244,6 +288,7 @@ struct Shape {
     last: u64,
     last_term: u64,
     commit: u64,
+    classic: u64,
     held: usize,
 }
 
@@ -277,6 +322,7 @@ impl Abstract {
                     last: below(last, m.last()),
                     last_term: below(last_term, m.last_term()),
                     commit: below(commit, m.commit),
+                    classic: below(m.commit, m.classic),
                     held: m.held.len().min(HELD),
                 }
             })
@@ -299,6 +345,7 @@ mod tests {
             log: log.to_vec(),
             held: Vec::new(),
             commit,
+            classic: 0,
         }
     }
 
@@ -346,11 +393,45 @@ mod tests {
             conforms(&before, &after, &[]),
             Err(Nonconformance::EntryAboveTerm { .. })
         ));
+        // A holding at an index the log holds conforms; at one known committed by a classic
+        // quorum it does not, nor letting a holding go before.
         let mut after = before.clone();
         after.members[0].held.push(2);
+        assert_eq!(conforms(&before, &after, &[]), Ok(()));
+        after.members[0].classic = 2;
         assert!(matches!(
             conforms(&before, &after, &[]),
-            Err(Nonconformance::HeldInLog { .. })
+            Err(Nonconformance::HeldBelowClassic { index: 2, .. })
+        ));
+        let mut known = before.clone();
+        known.members[0].classic = 1;
+        assert!(matches!(
+            conforms(&known, &before, &[]),
+            Err(Nonconformance::ClassicFell { from: 1, to: 0, .. })
+        ));
+        assert_eq!(conforms(&known, &before, &[0]), Ok(()));
+        let mut held = before.clone();
+        held.members[0].held.push(2);
+        let mut after = held.clone();
+        after.members[0].held.clear();
+        assert!(matches!(
+            conforms(&held, &after, &[]),
+            Err(Nonconformance::ReleasedEarly { index: 2, .. })
+        ));
+        after.members[0].classic = 1;
+        assert!(matches!(
+            conforms(&held, &after, &[]),
+            Err(Nonconformance::ReleasedEarly { index: 2, .. })
+        ));
+        let mut after = held.clone();
+        after.members[0].held.clear();
+        after.members[0].commit = 2;
+        after.members[0].classic = 2;
+        assert_eq!(conforms(&held, &after, &[]), Ok(()));
+        after.members[0].classic = 0;
+        assert!(matches!(
+            conforms(&held, &after, &[]),
+            Err(Nonconformance::ReleasedEarly { index: 2, .. })
         ));
         let mut after = before.clone();
         after.members[0].leader = true;

@@ -381,6 +381,41 @@ per op, median [min–max]):
 
 Every range overlaps its pair's; no difference is claimed.
 
+## The fast track's release (design A)
+
+`docs/raft.md` §3.5: a fast quorum counts holdings only, and a member holds what it holds until it
+knows the index committed by a classic quorum. Measured 2026-10-05 on macOS 26.4.1, Apple M5 Max,
+beside other sessions' work and two of this series' seed searches (load 5.7–6.1), against the core
+before it (`dropped`, `b5e372d`), each built from its own tree with the comparison's fast count
+(`fast=`, the indexes the members committed by a fast quorum while measured):
+
+```text
+cd crates/hyper-raft-compare && cargo build --release --locked
+hyper-raft-compare one hyper fast <3|5> 1 64 10000 1 count      # once each
+hyper-raft-compare one hyper fast <3|5> 1 64 10000 <1..15> time # 15 runs each, interleaved
+```
+
+| Voters | Core | Committed by a fast quorum | Allocations a proposal | Reallocations | Bytes asked a proposal | Time a proposal, p50 [min–max] |
+|---|---|---|---|---|---|---|
+| 3 | before | 10,000 of 10,000 | 45 | 0 | 9,072 | 2,144 ns [1,995–2,510] |
+| 3 | release | 10,000 of 10,000 | 45 | 0 | 9,440 | 2,240 ns [2,093–2,464] |
+| 5 | before | 10,000 of 10,000 | 73 | 0 | 14,808 | 3,782 ns [3,534–4,120] |
+| 5 | release | 10,000 of 10,000 | 71 | 0 | 14,952 | 3,925 ns [3,801–4,457] |
+
+The leader now holds what it hears and gives it to storage as each voter does: two allocations a
+proposal, measured by a build without it (five voters, 78 against 80). The series first cost more,
+and each cost was found by the count and taken out: an append round of its own to tell the members
+the classic commit (50 and 80 allocations a proposal with it; the next append or heartbeat carries
+it now), a copy of the leader's holding when it took the entry, and a copy of a log entry to compare
+a holding with (both read in place now, `Log::any_entry`). At the first count, with all three, the
+time a proposal was 24–25% above the core before.
+
+On real disks the fast quorum seldom wins: `hyper-durable-e2e`'s `fast-kill-*` scenarios (three
+members, each write proposed by a member in turn, one write of each member's log out at a time)
+committed no index by a fast quorum, for the fast quorum of three is all three and the last holder's
+write lands behind the write it already had out, after the leader's append round (`docs/sim.md`
+§15.13). The rate on a device is a race between those two writes and is reported, never asserted.
+
 ## Readies in flight (R-4)
 
 Core step R-4 (`docs/durable.md` §2.1) lets a member take `Ready`s while earlier writes are out.

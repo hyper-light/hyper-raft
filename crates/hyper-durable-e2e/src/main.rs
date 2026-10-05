@@ -2,7 +2,7 @@
 //!
 //! ```text
 //! hyper-durable-node --id N --voters 1,2,3 --listen 127.0.0.1:0 --log PATH --max-keys K
-//!                    --max-pending P
+//!                    --max-pending P [--fast]
 //! ```
 //!
 //! It prints `listening <port>` once its socket is bound, then serves until its standard input
@@ -52,6 +52,7 @@ fn parse(arguments: &[String]) -> Result<Arguments, String> {
             voters,
             max_keys: value(arguments, "--max-keys")?,
             max_pending: value(arguments, "--max-pending")?,
+            fast: arguments.iter().any(|argument| argument == "--fast"),
         },
         listen: value(arguments, "--listen")?,
         log: PathBuf::from(value::<String>(arguments, "--log")?),

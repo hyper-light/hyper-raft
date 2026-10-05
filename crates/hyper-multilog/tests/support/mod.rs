@@ -159,6 +159,7 @@ impl Storage for Store {
             hard_state: self.0.hard_state,
             configuration: self.0.conf.clone(),
             proposals: Vec::new(),
+            released: 0,
         })
     }
     fn entries(

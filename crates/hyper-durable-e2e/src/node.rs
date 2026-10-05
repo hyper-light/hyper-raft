@@ -143,6 +143,9 @@ pub struct Settings {
     pub max_keys: usize,
     /// The most writes and reads one member waits to answer.
     pub max_pending: usize,
+    /// Whether the group runs the fast track (`hyper_raft::fast`): a member that knows a leader
+    /// takes a write and proposes it to every voter itself.
+    pub fast: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -282,6 +285,7 @@ impl Node {
                 check_quorum: true,
                 pre_vote: true,
                 seed: settings.id,
+                fast: settings.fast,
                 ..Config::new(settings.id, limits)
             },
             // An owner woken by events has no period: the commit is written alone at the first
@@ -776,9 +780,11 @@ impl Node {
         }
     }
 
-    fn admits(&mut self, asker: Asker, waiting: usize) -> Result<bool, NodeError> {
-        if !self.replica.is_leader() {
-            let leader = self.replica.leader();
+    /// Whether the member takes an ask: the leader does, and with `any` so does a member that
+    /// knows a leader (a write by the fast track), while it waits on fewer than its bound.
+    fn admits(&mut self, asker: Asker, waiting: usize, any: bool) -> Result<bool, NodeError> {
+        let leader = self.replica.leader();
+        if !self.replica.is_leader() && !(any && leader != 0) {
             self.respond(asker.address, asker.id, &Outcome::NotLeader(leader))?;
             return Ok(false);
         }
@@ -795,7 +801,7 @@ impl Node {
     }
 
     fn write(&mut self, asker: Asker, key: &[u8], value: &[u8]) -> Result<(), NodeError> {
-        if !self.admits(asker, self.writes.len())? {
+        if !self.admits(asker, self.writes.len(), self.settings.fast)? {
             return Ok(());
         }
         let sequence = self.sequence();
@@ -809,7 +815,12 @@ impl Node {
             },
         );
         let data = self.command.clone();
-        match heard(self.replica.propose(Vec::new(), data))? {
+        let proposed = if self.settings.fast {
+            self.replica.propose_fast(Vec::new(), data).map(drop)
+        } else {
+            self.replica.propose(Vec::new(), data)
+        };
+        match heard(proposed)? {
             Some(()) => {
                 self.writes.insert(sequence, asker);
                 Ok(())
@@ -819,7 +830,7 @@ impl Node {
     }
 
     fn read(&mut self, asker: Asker, key: &[u8]) -> Result<(), NodeError> {
-        if !self.admits(asker, self.reads.len())? {
+        if !self.admits(asker, self.reads.len(), false)? {
             return Ok(());
         }
         // A leader that has not committed in its term holds the read until it has.
@@ -927,6 +938,7 @@ impl Node {
                         .max()
                         .unwrap_or(0),
                     restarts: self.restarts,
+                    fast: self.replica.core().raft.fast_stats(),
                     blocked_ns: self.blocked_now(),
                     writing_ns: self.writing_now(),
                     flush_most_ns: self.flush_most,
@@ -1073,8 +1085,8 @@ impl Node {
         Ok(())
     }
 
-    /// Answers the writes this member proposed that were applied, and the reads now applied
-    /// through their index.
+    /// Answers the writes this member proposed that were applied or that another entry took the
+    /// index of, and the reads now applied through their index.
     fn answer(&mut self) -> Result<(), NodeError> {
         let answers = std::mem::take(&mut self.out.answers);
         for applied in &answers {
@@ -1091,6 +1103,20 @@ impl Node {
             }
         }
         self.out.answers = answers;
+        // A write another entry took the index of is applied by no member: its asker asks again.
+        let displaced = std::mem::take(&mut self.out.displaced);
+        for entry in &displaced {
+            let Some(command) = wire::read_command(&entry.data) else {
+                continue;
+            };
+            if command.origin != self.settings.id {
+                continue;
+            }
+            if let Some(asker) = self.writes.remove(&command.sequence) {
+                self.respond(asker.address, asker.id, &Outcome::Busy)?;
+            }
+        }
+        self.out.displaced = displaced;
         let reads = std::mem::take(&mut self.out.reads);
         for (context, _) in &reads {
             let Ok(sequence) = <[u8; 8]>::try_from(context.as_slice()).map(u64::from_le_bytes)

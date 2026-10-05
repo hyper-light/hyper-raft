@@ -93,6 +93,29 @@
 (* Losers = {} no step of these is enabled and every configuration has the *)
 (* states it had.                                                          *)
 (*                                                                         *)
+(* What a member holds by itself it holds until it knows the index        *)
+(* committed by a classic quorum (Releases = "classic"): only then is the *)
+(* entry in every later leader's log (Raft's election rule), and a fast   *)
+(* commit puts it in no majority's logs.  A member learns the classic     *)
+(* commit with what follows from a leader (classic), a leader by its own  *)
+(* count.  Releases = "log", what the core did before, lets a member drop *)
+(* what it holds once its log reaches the index, and a later leader's     *)
+(* append can cut that log back: refused (FastTrackCovered.cfg).  A fast  *)
+(* quorum counts what members hold by themselves only (Votes = "held"),   *)
+(* the leader's own held entry among them; Votes = "logs" counts what     *)
+(* they hold from the leader too, which no election reads: refused        *)
+(* (FastTrackLogs.cfg).  slates' search refuses both (its prefix model's  *)
+(* DropCovered and PruneAtFastCommit; hyper-check's tests/exhaustive.rs). *)
+(*                                                                         *)
+(* A leader sends what follows a point through any index of its log, not *)
+(* only through its end: the core's appends carry at most what its        *)
+(* message bound admits.  An append that conflicts below where it stops   *)
+(* cuts the member's log short.                                            *)
+(*                                                                         *)
+(* A scenario may name the member elected in each term (Leads) and the    *)
+(* values proposed in each (Proposed): a run of it is a run of the model, *)
+(* so what it refuses the model refuses (FastTrackScenario.tla).          *)
+(*                                                                         *)
 (* Nothing here grows without a bound.  A configuration states how many    *)
 (* distinct states it has (StateBudget), the checker stops at one more     *)
 (* (WithinBudget), and scripts/check-model.sh gives the checker the memory *)
@@ -134,6 +157,8 @@ CONSTANTS Servers,   \* every member, voter or not
           MaxLen,    \* how long a log grows
           HeldAt,    \* the indexes at which proposals are held
           Losers,    \* the members whose log may lose its tail at rest
+          Leads,     \* [1..MaxTerm -> SUBSET Servers]: who may be elected in a term
+          Proposed,  \* [0..MaxTerm -> SUBSET Values]: what is proposed in a term
           StateBudget \* the distinct states the checker may find
 
 Stated  == Values \cup {Noop}
@@ -169,9 +194,16 @@ VARIABLES
   chosen,   \* [Indexes -> [value, term]]: what was first committed, and by a leader of which term
   mark,     \* [Servers -> [index, term]]: what a member's log may lack of
             \* what it acknowledged; NoMark for none (Raft::lost)
-  markedLed \* whether a member was elected while marked (NoMarkedLeader)
+  markedLed, \* whether a member was elected while marked (NoMarkedLeader)
+  classic   \* [Servers -> 0..MaxLen]: the index a member knows committed by a
+            \* classic quorum, and everything below it
 
-vars == <<term, vote, role, log, held, commit, says, acks, under, chosen, mark, markedLed>>
+vars == <<term, vote, role, log, held, commit, says, acks, under, chosen, mark, markedLed,
+          classic>>
+
+\* Any member may be elected in any term, and any value proposed.
+AnyLeads == [t \in 1..MaxTerm |-> Servers]
+AnyProposals == [t \in 0..MaxTerm |-> Values]
 
 NotChosen == [value |-> Nothing, term |-> 0]
 NoMark == [index |-> 0, term |-> 0]
@@ -202,8 +234,14 @@ NewestChangeAt(s) ==
 \* A change written and not committed (Raft::has_pending_conf).
 Pending(s) == \E i \in (commit[s] + 1)..Len(log[s]) : log[s][i].value \in Changes
 
-\* What a member holds by itself is above its log.
-Release(h, length) == [i \in Indexes |-> IF i <= length THEN Nothing ELSE h[i]]
+\* What a member holds by itself at or below `upto` it holds no more.
+Release(h, upto) == [i \in Indexes |-> IF i <= upto THEN Nothing ELSE h[i]]
+
+CONSTANT Releases \* "classic" | "log"
+\* What member s holds once its log is `length` long and it knows `known`
+\* committed by a classic quorum.  "classic" is what the core does.
+ReleaseBy(s, length, known) ==
+  IF Releases = "log" THEN Release(held[s], length) ELSE Release(held[s], known)
 
 TypeOK ==
   /\ term \in [Servers -> 0..MaxTerm]
@@ -213,7 +251,9 @@ TypeOK ==
                         /\ \A i \in 1..Len(log[s]) : log[s][i] \in Entries
                         /\ commit[s] <= Len(log[s])
   /\ held \in [Servers -> [Indexes -> Values \cup {Nothing}]]
-  /\ \A s \in Servers : \A i \in Indexes : i <= Len(log[s]) => held[s][i] = Nothing
+  /\ Releases = "log" =>
+       \A s \in Servers : \A i \in Indexes : i <= Len(log[s]) => held[s][i] = Nothing
+  /\ \A s \in Servers : classic[s] <= commit[s]
   /\ \A s \in Servers : role[s] = "follower" => under[s] = NoConfiguration
   /\ mark \in [Servers -> [index : 0..MaxLen, term : 0..MaxTerm]]
   /\ markedLed \in BOOLEAN
@@ -231,6 +271,7 @@ Init ==
   /\ chosen = [i \in Indexes |-> NotChosen]
   /\ mark   = [s \in Servers |-> NoMark]
   /\ markedLed = FALSE
+  /\ classic = [s \in Servers |-> 0]
 
 ----------------------------------------------------------------------------
 \* A proposal reaches a voter, which holds it if it holds nothing there,
@@ -239,29 +280,32 @@ Init ==
 \* no leader has acted on.
 Hold(m, i, v) ==
   /\ m \in Voters(ConfigurationOf(m))
+  /\ v \in Proposed[term[m]]
   /\ i > Len(log[m])
   /\ held[m][i] = Nothing
   /\ held' = [held EXCEPT ![m][i] = v]
   /\ says' = [says EXCEPT ![m][i] = [value |-> v, term |-> term[m]]]
-  /\ UNCHANGED <<term, vote, role, log, commit, acks, under, chosen, mark, markedLed>>
+  /\ UNCHANGED <<term, vote, role, log, commit, acks, under, chosen, mark, markedLed, classic>>
 
 \* A member says again what it holds, as of a term it has come to since.
 Say(m, i) ==
   /\ held[m][i] # Nothing
   /\ says[m][i].term # term[m]
   /\ says' = [says EXCEPT ![m][i] = [value |-> held[m][i], term |-> term[m]]]
-  /\ UNCHANGED <<term, vote, role, log, held, commit, acks, under, chosen, mark, markedLed>>
+  /\ UNCHANGED <<term, vote, role, log, held, commit, acks, under, chosen, mark, markedLed,
+                 classic>>
 
 Write(l, v) ==
   /\ log' = [log EXCEPT ![l] = Append(@, [term |-> term[l], value |-> v])]
-  /\ held' = [held EXCEPT ![l] = Release(@, Len(log[l]) + 1)]
+  /\ held' = [held EXCEPT ![l] = ReleaseBy(l, Len(log[l]) + 1, classic[l])]
 
 \* A leader takes an entry for the next index of its log.
 Take(l, v) ==
   /\ role[l] = "leader"
+  /\ v \in {Noop} \cup Proposed[term[l]]
   /\ Len(log[l]) < MaxLen
   /\ Write(l, v)
-  /\ UNCHANGED <<term, vote, role, commit, says, acks, under, chosen, mark, markedLed>>
+  /\ UNCHANGED <<term, vote, role, commit, says, acks, under, chosen, mark, markedLed, classic>>
 
 \* A leader writes the change, or the entry that leaves the joint
 \* configuration once the one that entered it is committed.  It writes none
@@ -282,7 +326,7 @@ Reconfigure(l) ==
   /\ ~Pending(l)
   /\ \A i \in older : i <= commit[l]
   /\ Write(l, v)
-  /\ UNCHANGED <<term, vote, role, commit, says, acks, under, chosen, mark, markedLed>>
+  /\ UNCHANGED <<term, vote, role, commit, says, acks, under, chosen, mark, markedLed, classic>>
 
 CONSTANT Counts   \* "round" | "any"
 \* A member's log is of the leader's round: it said it holds the leader's
@@ -291,13 +335,19 @@ OfTheRound(l, m) ==
   LET a == acks[m][term[l]]
   IN a >= 1 /\ a <= Len(log[l]) /\ log[l][a].term = term[l]
 \* Who holds the entry a leader has at an index, as the leader was told.
-\* "round" is what the core does.
+\* "round" is what the core does; a leader's own log is of its round.
 HoldsByItself(l, m, i) ==
-  /\ Counts = "any" \/ OfTheRound(l, m)
+  /\ Counts = "any" \/ m = l \/ OfTheRound(l, m)
   /\ says[m][i] = [value |-> log[l][i].value, term |-> term[l]]
 HoldsFromLeader(l, m, i) ==
   \/ m = l
   \/ acks[m][term[l]] >= i
+
+CONSTANT Votes  \* "held" | "logs"
+\* What a fast quorum counts.  "held" is what the core does.
+Holds(l, m, i) ==
+  \/ HoldsByItself(l, m, i)
+  \/ Votes = "logs" /\ HoldsFromLeader(l, m, i)
 
 Choose(i, l) ==
   [chosen EXCEPT ![i] = IF @ = NotChosen
@@ -321,34 +371,40 @@ FastCommit(l) ==
   /\ log[l][i].term = term[l]
   /\ ~Pending(l)
   /\ c.out = {}
-  /\ FastOfTheTerm(l, {m \in c.in : HoldsByItself(l, m, i) \/ HoldsFromLeader(l, m, i)})
+  /\ FastOfTheTerm(l, {m \in c.in : Holds(l, m, i)})
   /\ commit' = [commit EXCEPT ![l] = i]
   /\ chosen' = Choose(i, l)
-  /\ UNCHANGED <<term, vote, role, log, held, says, acks, under, mark, markedLed>>
+  /\ UNCHANGED <<term, vote, role, log, held, says, acks, under, mark, markedLed, classic>>
 
+\* A classic quorum holds the leader's entry of its term at i: the leader
+\* knows i committed by it, and commits it if it had not (a fast quorum may
+\* have committed it first).
 ClassicCommit(l, i) ==
   LET c == ConfigurationOf(l) IN
   /\ role[l] = "leader"
-  /\ i > commit[l]
+  /\ i > classic[l]
   /\ i <= Len(log[l])
   /\ log[l][i].term = term[l]
   /\ ClassicOf(c, {m \in Voters(c) : HoldsFromLeader(l, m, i)})
-  /\ commit' = [commit EXCEPT ![l] = i]
+  /\ commit' = [commit EXCEPT ![l] = Max(@, i)]
   /\ chosen' = [j \in Indexes |->
                  IF j > commit[l] /\ j <= i /\ chosen[j] = NotChosen
                  THEN [value |-> log[l][j].value, term |-> term[l]]
                  ELSE chosen[j]]
-  /\ UNCHANGED <<term, vote, role, log, held, says, acks, under, mark, markedLed>>
+  /\ classic' = [classic EXCEPT ![l] = i]
+  /\ held' = [held EXCEPT ![l] = IF Releases = "classic" THEN Release(@, i) ELSE @]
+  /\ UNCHANGED <<term, vote, role, log, says, acks, under, mark, markedLed>>
 
 \* A member of the leader's configuration takes from it what follows the
-\* point p, through k.
-Replicate(l, m, p) ==
-  LET k == Len(log[l]) IN
+\* point p, through k: the leader's append carries at most what its bound
+\* admits, so k is any index of the leader's log from p on.
+Replicate(l, m, p, k) ==
   /\ l # m
   /\ role[l] = "leader"
   /\ m \in Voters(ConfigurationOf(l))
   /\ term[m] <= term[l]
   /\ p <= k
+  /\ k <= Len(log[l])
   /\ \/ p = 0
      \/ p <= commit[m]
      \/ p >= 1 /\ p <= Len(log[m]) /\ log[m][p].term = log[l][p].term
@@ -358,8 +414,10 @@ Replicate(l, m, p) ==
                      THEN log[m]
                      ELSE LET c == CHOOSE i \in differs : \A j \in differs : i <= j
                           IN SubSeq(log[m], 1, c - 1) \o SubSeq(log[l], c, k)
+         known    == Max(classic[m], Min(classic[l], k))
      IN /\ log' = [log EXCEPT ![m] = taken]
-        /\ held' = [held EXCEPT ![m] = Release(@, Len(taken))]
+        /\ classic' = [classic EXCEPT ![m] = known]
+        /\ held' = [held EXCEPT ![m] = ReleaseBy(m, Len(taken), known)]
         /\ commit' = [commit EXCEPT ![m] = Max(@, Min(commit[l], k))]
         /\ mark' = [mark EXCEPT ![m] = Settled(m, taken)]
   /\ term' = [term EXCEPT ![m] = term[l]]
@@ -385,6 +443,7 @@ Lose(m, k) ==
   /\ k < Len(log[m])
   /\ log' = [log EXCEPT ![m] = SubSeq(@, 1, k)]
   /\ commit' = [commit EXCEPT ![m] = Min(@, k)]
+  /\ classic' = [classic EXCEPT ![m] = Min(@, k)]
   /\ mark' = [mark EXCEPT ![m] = merged]
   /\ role' = [role EXCEPT ![m] = "follower"]
   /\ under' = [under EXCEPT ![m] = NoConfiguration]
@@ -402,9 +461,20 @@ Current(c, m) ==
   \/ LastTerm(log[c]) > Claim(m).term
   \/ LastTerm(log[c]) = Claim(m).term /\ Len(log[c]) >= Claim(m).index
 
-\* How many of the voters V hold v at i by themselves, as their votes say.
+CONSTANT Reports  \* "held" | "acknowledged"
+\* What voter m says it holds at i with its vote.  "held" is what the core
+\* does: what it holds by itself.  "acknowledged" is design B (docs/raft.md
+\* §3.5): every entry it acknowledged above what it knows committed by a
+\* classic quorum, its log's where its log reaches i (slates' ReportLogsToo,
+\* here over the most-held rule).
+Report(m, i) ==
+  IF Reports = "acknowledged" /\ i <= Len(log[m]) /\ i > classic[m]
+  THEN log[m][i].value
+  ELSE held[m][i]
+
+\* How many of the voters V report v at i.
 Count(V, i, v) ==
-  Cardinality({m \in V : held[m][i] = v})
+  Cardinality({m \in V : Report(m, i) = v})
 \* MostHeld is what the core does.  LeastHeld is what it does not, kept to
 \* show that the properties fail without the rule.
 MostHeld(V, i, v) ==
@@ -414,11 +484,26 @@ LeastHeld(V, i, v) ==
   /\ Count(V, i, v) > 0
   /\ \A w \in Values : Count(V, i, w) > 0 => Count(V, i, v) <= Count(V, i, w)
 
-CONSTANT Rule   \* "most" | "least"
-Recovered(V, i, v) ==
+\* slates' ballot rule (its slot model, after Fast Paxos): of the reports
+\* said in the latest term, the value at least |Q| + |F| - n of them hold,
+\* with F the fast quorum of the n voters counted by; else the index is free.
+FastSize(n) == CHOOSE f \in 0..n : 4 * f >= 3 * n /\ \A g \in 0..(f - 1) : 4 * g < 3 * n
+Ballot(V, i, v, C) ==
+  LET reports == {m \in V : held[m][i] # Nothing}
+      top     == CHOOSE t \in {says[m][i].term : m \in reports} :
+                   \A m \in reports : says[m][i].term <= t
+      latest  == {m \in reports : says[m][i].term = top}
+      enough  == Cardinality(V \cap C) + FastSize(Cardinality(C)) - Cardinality(C)
+      forced  == {w \in Values : Cardinality({m \in latest : held[m][i] = w}) >= enough}
+  IN IF forced = {} THEN v = Noop ELSE v \in forced
+
+CONSTANT Rule   \* "most" | "least" | "ballot"
+Recovered(V, i, v, C) ==
   IF \A w \in Values : Count(V, i, w) = 0
   THEN v = Noop
-  ELSE IF Rule = "most" THEN MostHeld(V, i, v) ELSE LeastHeld(V, i, v)
+  ELSE CASE Rule = "most"  -> MostHeld(V, i, v)
+         [] Rule = "least" -> LeastHeld(V, i, v)
+         [] Rule = "ballot" -> Ballot(V, i, v, C)
 
 \* A voter of its own configuration campaigns in the next term, whatever
 \* it was: one that led has heard of a later term, or lost its members, and
@@ -441,7 +526,10 @@ Stands(c) ==
   \/ c \in Voters(ConfigurationOf(c))
   \/ /\ commit[c] < NewestChangeAt(c)
      /\ c \in Voters(ConfigurationThrough(log[c], NewestChangeAt(c) - 1))
-Campaigns(c) == term[c] < MaxTerm /\ Stands(c)
+Campaigns(c) ==
+  /\ term[c] < MaxTerm
+  /\ Stands(c)
+  /\ c \in Leads[term[c] + 1]
 Asked(c, Q) ==
   /\ c \notin Q
   /\ \A m \in Q : /\ term[m] < term[c] + 1 \/ (term[m] = term[c] + 1 /\ vote[m] = Nobody)
@@ -472,18 +560,18 @@ Elect(c, Q, V) ==
   /\ IF V = {}
      THEN /\ role'  = [m \in Servers |-> IF m \in voted THEN "follower" ELSE role[m]]
           /\ under' = [m \in Servers |-> IF m \in voted THEN NoConfiguration ELSE under[m]]
-          /\ UNCHANGED <<log, held, mark, markedLed>>
+          /\ UNCHANGED <<log, held, mark, markedLed, classic>>
      ELSE LET length == Len(log[c])
               reported == {i \in Indexes : /\ i > length
                                            /\ \E v \in Values : Count(V, i, v) > 0}
               top == IF reported = {} THEN length
                      ELSE CHOOSE i \in reported : \A j \in reported : j <= i
           IN /\ \E taken \in [(length + 1)..top -> Stated] :
-                  /\ \A i \in (length + 1)..top : Recovered(V, i, taken[i])
+                  /\ \A i \in (length + 1)..top : Recovered(V, i, taken[i], counted.in)
                   /\ log' = [log EXCEPT ![c] =
                                @ \o [i \in 1..(top - length) |->
                                       [term |-> t, value |-> taken[length + i]]]]
-             /\ held' = [held EXCEPT ![c] = Release(@, top)]
+             /\ held' = [held EXCEPT ![c] = ReleaseBy(c, top, classic[c])]
              /\ role' = [m \in Servers |-> IF m = c THEN "leader"
                                            ELSE IF m \in voted THEN "follower"
                                            ELSE role[m]]
@@ -494,7 +582,7 @@ Elect(c, Q, V) ==
              \* (Raft::become_leader).
              /\ mark' = [mark EXCEPT ![c] = NoMark]
              /\ markedLed' = (markedLed \/ Marked(c))
-  /\ UNCHANGED <<commit, acks, chosen>>
+  /\ UNCHANGED <<commit, acks, chosen, classic>>
 
 \* Each step's guards that do not depend on its later arguments come
 \* first, so that the checker does not try every argument of a step that
@@ -509,7 +597,8 @@ Next ==
                           \/ \E i \in Indexes : ClassicCommit(l, i)
                           \/ \E m \in Voters(ConfigurationOf(l)) \ {l} :
                                /\ term[m] <= term[l]
-                               /\ \E p \in 0..Len(log[l]) : Replicate(l, m, p)
+                               /\ \E p \in 0..Len(log[l]), k \in 0..Len(log[l]) :
+                                    Replicate(l, m, p, k)
   \/ \E c \in Servers : /\ Campaigns(c)
                        /\ \E Q \in SUBSET (Servers \ {c}) :
                             /\ Asked(c, Q)
@@ -538,10 +627,16 @@ OneLeader ==
   \A l, m \in Servers :
     (role[l] = "leader" /\ role[m] = "leader" /\ term[l] = term[m]) => l = m
 
+\* Two logs that hold an entry of one term at one index hold the same
+\* values through it, and the same terms wherever neither member has
+\* committed: an entry a fast quorum committed keeps, at a member that
+\* committed it, the term of the leader that took it, and a later leader
+\* that took it again at its election holds it under its own.
 LogMatching ==
   \A m, n \in Servers : \A i \in 1..Min(Len(log[m]), Len(log[n])) :
     log[m][i].term = log[n][i].term =>
-      \A j \in 1..i : log[m][j] = log[n][j]
+      \A j \in 1..i : /\ log[m][j].value = log[n][j].value
+                     /\ (j > commit[m] /\ j > commit[n]) => log[m][j].term = log[n][j].term
 
 \* A leader committed an index of its term that no classic quorum holds
 \* from it: it counted what members hold by themselves.  A configuration
@@ -577,6 +672,20 @@ NoFastByHeldAfterChange == ~FastByHeldAfterChange
 \* reach it (MarkedReached.cfg, which the checker must refuse), or it checks
 \* nothing of a marked member's election.
 NoMarkedLeader == ~markedLed
+
+\* Two logs hold an entry of one term at one index and, below it, entries
+\* under different terms: a member kept the stamp of a committed entry that
+\* a later leader's election took again under its own term, and took that
+\* leader's entries after it.  LogMatching compares terms only where
+\* neither member has committed; a configuration that checks it must reach
+\* such a pair (FastTrackRestampReached.cfg, refused), or the weaker
+\* comparison is never put to work.
+Restamped ==
+  \E m, n \in Servers : \E i \in 1..Min(Len(log[m]), Len(log[n])) :
+    /\ log[m][i].term = log[n][i].term
+    /\ \E j \in 1..(i - 1) : log[m][j].term # log[n][j].term
+
+NoRestamp == ~Restamped
 
 \* For the checker: it has found no more states than the configuration
 \* states it has.

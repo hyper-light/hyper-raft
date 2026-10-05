@@ -131,20 +131,20 @@ fn the_group_schedules_keep_every_oracle_and_their_histories_are_linearizable() 
 /// one a campaign where it was rarer.
 fn group_floors() -> Vec<Floor> {
     vec![
-        seed_floor("terms led", 936, 96),
-        seed_floor("entries committed", 91742, 96),
-        seed_floor("log entries held", 59552, 96),
-        seed_floor("leaderships held to the committed entries", 936, 96),
-        seed_floor("messages held to their senders' devices", 161848, 96),
-        seed_floor("reads asked", 23666, 96),
-        seed_floor("reads recorded", 4956, 96),
-        seed_floor("read indexes answered", 9698, 96),
-        seed_floor("reads served", 3241, 96),
-        seed_floor("writes published", 4937, 96),
-        seed_floor("writes answered committed", 4937, 96),
-        seed_floor("writes failed, another entry at their index", 142, 96),
-        campaign_floor("writes failed, their term ended past the commit", 10, 96),
-        seed_floor("operations left unknown by a restart", 2977, 96),
+        seed_floor("terms led", 911, 96),
+        seed_floor("entries committed", 91775, 96),
+        seed_floor("log entries held", 63578, 96),
+        seed_floor("leaderships held to the committed entries", 911, 96),
+        seed_floor("messages held to their senders' devices", 170297, 96),
+        seed_floor("reads asked", 23507, 96),
+        seed_floor("reads recorded", 4664, 96),
+        seed_floor("read indexes answered", 9643, 96),
+        seed_floor("reads served", 3069, 96),
+        seed_floor("writes published", 4350, 96),
+        seed_floor("writes answered committed", 4350, 96),
+        seed_floor("writes failed, another entry at their index", 188, 96),
+        campaign_floor("writes failed, their term ended past the commit", 20, 96),
+        seed_floor("operations left unknown by a restart", 2826, 96),
     ]
 }
 
@@ -238,21 +238,21 @@ fn the_fast_schedules_keep_every_oracle_and_their_histories_are_linearizable() {
 /// (2026-10-05, this test at its commit).
 fn fast_floors() -> Vec<Floor> {
     vec![
-        seed_floor("terms led", 480, 96),
-        seed_floor("entries committed", 34850, 96),
-        seed_floor("log entries held", 31405, 96),
-        seed_floor("leaderships held to the committed entries", 480, 96),
-        seed_floor("messages held to their senders' devices", 230058, 96),
-        seed_floor("reads asked", 7734, 96),
-        seed_floor("reads recorded", 700, 96),
-        seed_floor("read indexes answered", 1172, 96),
-        seed_floor("reads served", 320, 96),
-        seed_floor("writes published", 805, 96),
-        seed_floor("writes answered committed", 805, 96),
-        seed_floor("writes failed, another entry at their index", 799, 96),
-        seed_floor("operations left unknown by a restart", 1377, 96),
-        seed_floor("fast votes cast", 67535, 96),
-        seed_floor("indexes a fast quorum chose", 537, 96),
+        seed_floor("terms led", 446, 96),
+        seed_floor("entries committed", 31804, 96),
+        seed_floor("log entries held", 30450, 96),
+        seed_floor("leaderships held to the committed entries", 446, 96),
+        seed_floor("messages held to their senders' devices", 238721, 96),
+        seed_floor("reads asked", 7718, 96),
+        seed_floor("reads recorded", 638, 96),
+        seed_floor("read indexes answered", 1083, 96),
+        seed_floor("reads served", 281, 96),
+        seed_floor("writes published", 686, 96),
+        seed_floor("writes answered committed", 686, 96),
+        seed_floor("writes failed, another entry at their index", 763, 96),
+        seed_floor("operations left unknown by a restart", 1282, 96),
+        seed_floor("fast votes cast", 79004, 96),
+        seed_floor("indexes a fast quorum chose", 681, 96),
     ]
 }
 
@@ -315,22 +315,22 @@ fn the_pipelined_schedules_keep_every_oracle_and_their_histories_are_linearizabl
 /// average, so it is held to being reached, not to its rate.
 fn pipelined_floors() -> Vec<Floor> {
     vec![
-        seed_floor("terms led", 143, 48),
-        seed_floor("entries committed", 4812, 48),
-        seed_floor("log entries held", 4650, 48),
-        seed_floor("leaderships held to the committed entries", 143, 48),
-        seed_floor("messages held to their senders' devices", 15200, 48),
-        seed_floor("leaders' commits held to their voters' devices", 331, 48),
-        seed_floor("entries applied held to their members' devices", 4812, 48),
-        seed_floor("reads asked", 3854, 48),
-        seed_floor("reads recorded", 400, 48),
-        seed_floor("read indexes answered", 673, 48),
-        seed_floor("reads served", 167, 48),
-        seed_floor("writes published", 309, 48),
-        seed_floor("writes answered committed", 309, 48),
-        campaign_floor("writes failed, another entry at their index", 48, 48),
-        campaign_floor("writes failed, their term ended past the commit", 30, 48),
-        seed_floor("operations left unknown by a restart", 413, 48),
+        seed_floor("terms led", 142, 48),
+        seed_floor("entries committed", 4581, 48),
+        seed_floor("log entries held", 4433, 48),
+        seed_floor("leaderships held to the committed entries", 142, 48),
+        seed_floor("messages held to their senders' devices", 15113, 48),
+        seed_floor("leaders' commits held to their voters' devices", 333, 48),
+        seed_floor("entries applied held to their members' devices", 4581, 48),
+        seed_floor("reads asked", 3844, 48),
+        seed_floor("reads recorded", 392, 48),
+        seed_floor("read indexes answered", 693, 48),
+        seed_floor("reads served", 170, 48),
+        seed_floor("writes published", 291, 48),
+        seed_floor("writes answered committed", 291, 48),
+        campaign_floor("writes failed, another entry at their index", 53, 48),
+        campaign_floor("writes failed, their term ended past the commit", 27, 48),
+        seed_floor("operations left unknown by a restart", 403, 48),
     ]
 }
 
@@ -487,8 +487,10 @@ fn a_vote_sent_before_it_is_durable_is_caught() {
 /// campaign from seed 0 found seed 47,818 first (2026-10-04), and on the core that counts by the
 /// newest configuration in its log (`docs/raft.md` §3.4) seed 67,842 (2026-10-05, 400,000 seeds
 /// asked): a member voted two values at one index in one term, the fast agreement oracle's catch of
-/// what the leader's wrong count led to. The same seed without the defect keeps every oracle, so the
-/// catch is the defect's.
+/// what the leader's wrong count led to; and on the core whose fast quorum counts holdings alone,
+/// kept until a classic commit (`docs/raft.md` §3.5), seed 102,774 (2026-10-05, 400,000 seeds asked):
+/// a later leader lacks an entry the fast track committed. The same seed without the defect keeps
+/// every oracle, so the catch is the defect's.
 #[test]
 fn the_fast_track_without_its_first_rule_is_caught() {
     let mix = Mix {
@@ -506,14 +508,14 @@ fn the_fast_track_without_its_first_rule_is_caught() {
     };
     let make = |seed| Cluster::<New>::new(5, &[1, 2, 3, 4, 5], judged_settings(settings), seed);
     assert_eq!(
-        judged(make(67_842), 67_842, 4_000, &mix, None).violation,
+        judged(make(102_774), 102_774, 4_000, &mix, None).violation,
         None
     );
-    let (seed, violation) = caught(make, 67_842, 1, 4_000, &mix, Mutant::FastBesideAnyTerm)
-        .expect("seed 67,842 did not catch the fast track without its first rule");
+    let (seed, violation) = caught(make, 102_774, 1, 4_000, &mix, Mutant::FastBesideAnyTerm)
+        .expect("seed 102,774 did not catch the fast track without its first rule");
     println!("fast track without its first rule: seed {seed}: {violation}");
     assert!(
-        matches!(violation, Violation::VoteChanged { .. }),
+        matches!(violation, Violation::LeaderLacks { .. }),
         "{violation}"
     );
 }
@@ -524,7 +526,8 @@ fn the_fast_track_without_its_first_rule_is_caught() {
 /// oracles): a later leader lacks an entry the fast track committed. The same seed without the
 /// defect keeps every oracle, so the catch is the defect's. On the core that counts by the newest
 /// configuration in its log (`docs/raft.md` §3.4) the campaign from seed 0 finds seed 1,483 first
-/// (2026-10-05), the same violation.
+/// (2026-10-05), the same violation, and on the core whose fast quorum counts holdings alone
+/// (`docs/raft.md` §3.5) seed 8,867.
 #[test]
 fn the_fast_track_without_its_second_rule_is_caught() {
     let mix = Mix {
@@ -535,11 +538,11 @@ fn the_fast_track_without_its_second_rule_is_caught() {
     let settings = Settings::fast();
     let make = |seed| Cluster::<New>::new(5, &[1, 2, 3, 4, 5], judged_settings(settings), seed);
     assert_eq!(
-        judged(make(1_483), 1_483, 4_000, &mix, None).violation,
+        judged(make(8_867), 8_867, 4_000, &mix, None).violation,
         None
     );
-    let (seed, violation) = caught(make, 1_483, 1, 4_000, &mix, Mutant::FastAnyConfiguration)
-        .expect("seed 1,483 did not catch the fast track without its second rule");
+    let (seed, violation) = caught(make, 8_867, 1, 4_000, &mix, Mutant::FastAnyConfiguration)
+        .expect("seed 8,867 did not catch the fast track without its second rule");
     println!("fast track without its second rule: seed {seed}: {violation}");
     assert!(
         matches!(violation, Violation::LeaderLacks { .. }),

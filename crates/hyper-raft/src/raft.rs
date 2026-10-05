@@ -549,8 +549,16 @@ pub struct Raft<S> {
     /// Entries this member took into its log from what it kept ahead of a
     /// hole.
     taken_ahead: u64,
-    /// What this member approved by itself.
+    /// What this member approved by itself, held until it knows the index committed by a
+    /// classic quorum (`docs/raft.md` §3.5).
     pub(crate) held: Proposals,
+    /// The index through which this member knows its log committed by a classic quorum: a
+    /// leader by its own count (`Raft::maybe_commit`), another member from what a leader of its
+    /// term says with what its log then matches (`Message::classic`). Every later leader's log
+    /// holds the entries through it; a fast quorum's commit puts an entry in no majority's logs,
+    /// so it never moves this. Not kept across a restart: a member that opens knows nothing
+    /// committed so, and releases nothing until a leader says.
+    pub(crate) classic: u64,
     /// What the voters hold above this member's log, as it was told.
     pub(crate) votes: Votes,
     /// Who holds what this leader took from the fast track.
@@ -799,6 +807,8 @@ struct Outbox<'a, S> {
     priority: i64,
     max_bytes: u64,
     max_entries: usize,
+    /// What the leader knows committed by a classic quorum, which its appends say.
+    classic: u64,
 }
 
 fn push(msgs: &mut Outgoing, id: NodeId, term: u64, priority: i64, message: Message) -> Result<()> {
@@ -914,6 +924,7 @@ impl<S: Storage> Outbox<'_, S> {
         }
         message.msg_type = MessageType::MsgSnapshot;
         message.snapshot = Some(Box::new(snapshot));
+        message.classic = Some(self.classic);
         progress.become_snapshot(index);
         Ok(true)
     }
@@ -966,6 +977,7 @@ impl<S: Storage> Outbox<'_, S> {
                     message.index = progress.next_index.saturating_sub(1);
                     message.log_term = term;
                     message.commit = self.log.committed();
+                    message.classic = Some(self.classic);
                     if let Some(last) = page.entries.last() {
                         // Charged by the rule the page was cut by, counted
                         // as it was chosen.
@@ -1074,6 +1086,7 @@ impl<S: Storage> Outbox<'_, S> {
             index: after,
             log_term: term,
             commit: self.log.committed(),
+            classic: Some(self.classic),
             entries: page.entries,
             ..Message::default()
         };
@@ -1093,8 +1106,9 @@ impl<S: Storage> Outbox<'_, S> {
     }
     fn heartbeat(&mut self, to: NodeId, progress: &Progress, context: Option<&[u8]>) -> Result<()> {
         let mut message = proto::message(to, MessageType::MsgHeartbeat);
-        // Never a commit the member may not hold.
+        // Never a commit the member may not hold, nor a classic one.
         message.commit = progress.matched.min(self.log.committed());
+        message.classic = Some(progress.matched.min(self.classic));
         if let Some(context) = context {
             message
                 .context
@@ -1191,6 +1205,7 @@ impl<S: Storage> Raft<S> {
             ticks: 0,
             taken_ahead: 0,
             held: Proposals::new(config.limits.proposals, config.limits.proposal_bytes),
+            classic: 0,
             votes: Votes::new(
                 usize::try_from(config.limits.fast_window).unwrap_or(usize::MAX),
                 config.limits.vote_bytes,
@@ -1252,9 +1267,11 @@ impl<S: Storage> Raft<S> {
         raft.conf_before_at = applied;
         raft.conf_newest_at = applied;
         raft.refresh_configuration(applied.saturating_add(1))?;
-        let last = raft.log.last_index()?;
+        // What storage released the member knew committed by a classic quorum; the rest it
+        // holds until it knows that of their indexes.
+        raft.classic = initial.released.min(raft.log.committed());
         for held in initial.proposals {
-            if held.index > last {
+            if held.index > raft.classic {
                 raft.held.hold(held, true, false)?;
             }
         }
@@ -1691,6 +1708,7 @@ impl<S: Storage> Raft<S> {
                 priority: self.priority_in_force,
                 max_bytes: self.config.max_size_per_msg,
                 max_entries: self.config.limits.entries_per_message,
+                classic: self.classic,
             },
             &mut self.tracker,
         )
@@ -1783,6 +1801,16 @@ impl<S: Storage> Raft<S> {
             self.term
         };
         let classic = self.log.maybe_commit(index, term)?;
+        // The quorum holds this leader's entry at `index`, so every later leader's log holds it
+        // and every entry before it: what this member holds by itself through it is held no more.
+        // A fast quorum may have committed it first. The members learn it with the next append or
+        // heartbeat (`Message::classic`), never by a round of its own: a release frees room, and
+        // one that comes later is still right (`docs/raft.md` §3.5, "The cost").
+        let known =
+            index > self.classic && self.log.term(index).is_ok_and(|held| held == self.term);
+        if known {
+            self.learn_classic(index)?;
+        }
         // What the classic quorum committed may open the next index to the
         // fast one.
         let fast = self.fast_commit()?;
@@ -2565,7 +2593,7 @@ impl<S: Storage> Raft<S> {
         }
         let last = self.log.last_index()?;
         self.term_start = last;
-        self.release_proposals(last)
+        Ok(())
     }
 
     fn campaign(&mut self, campaign: Campaign) -> Result<()> {
@@ -3557,8 +3585,10 @@ impl<S: Storage> Raft<S> {
                 }
                 let last = self.take_ahead(last, message.commit)?;
                 answer.index = last;
-                let held = self.log.last_index()?;
-                self.release_proposals(held)?;
+                // The log matches the leader's through `last`.
+                if let Some(classic) = message.classic {
+                    self.learn_classic(classic.min(last))?;
+                }
             }
             None if self.lost.is_some() && message.index > self.log.last_index()? => {
                 // What it refuses follows entries it may have acknowledged
@@ -3770,6 +3800,11 @@ impl<S: Storage> Raft<S> {
             return self.send_lost(message.from, lost.index);
         }
         self.log.commit_to(message.commit)?;
+        // The leader says no more than the log it knows this member holds.
+        if let Some(classic) = message.classic {
+            let last = self.log.last_index()?;
+            self.learn_classic(classic.min(last))?;
+        }
         if self.pending_request_snapshot != 0 {
             return self.send_request_snapshot();
         }
@@ -3790,12 +3825,18 @@ impl<S: Storage> Raft<S> {
             .take()
             .map(|snapshot| *snapshot)
             .unwrap_or_default();
+        let index = proto::snapshot_index(&snapshot);
         let mut answer = proto::message(message.from, MessageType::MsgAppendResponse);
         answer.index = if self.restore(snapshot)? {
             self.log.last_index()?
         } else {
             self.log.committed()
         };
+        // What the snapshot holds the log holds now, if it was not behind it.
+        if let Some(classic) = message.classic {
+            let held = index.min(self.log.committed());
+            self.learn_classic(classic.min(held))?;
+        }
         self.send(answer)
     }
     /// Begins again from `snapshot`. False when the member keeps its log.
@@ -3833,7 +3874,6 @@ impl<S: Storage> Raft<S> {
         // held.
         self.early.clear();
         let last = self.log.last_index()?;
-        self.release_proposals(last)?;
         self.tracker = Tracker::new(
             configuration,
             last,

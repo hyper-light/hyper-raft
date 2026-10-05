@@ -94,6 +94,11 @@ pub trait Core: Sized {
     fn open_fast(&mut self) -> bool {
         true
     }
+    /// The indexes this member committed by a fast quorum while it led: zero for a core that
+    /// does not say.
+    fn fast_committed(&self) -> u64 {
+        0
+    }
     /// Hands the lead to `to`.
     fn transfer(&mut self, to: u64, out: &mut Vec<Envelope<Self::Message>>) -> bool;
     /// A message from the network. What it asks to send is given here or at

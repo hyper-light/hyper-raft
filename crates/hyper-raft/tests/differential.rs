@@ -40,7 +40,7 @@ mod support;
 use std::collections::VecDeque;
 
 use hyper_raft::StateRole;
-use hyper_raft::proto::MessageType;
+use hyper_raft::proto::{Message, MessageType};
 use support::{Cluster, Mix, New, Old, Op, Replica, Report, Seeded, Settings};
 
 #[allow(
@@ -356,6 +356,19 @@ fn timeless(reports: &mut [Report]) {
     }
 }
 
+/// This core's messages as raft-rs's say them: raft-rs states no classic commit
+/// (`Message::classic`), which only the fast track reads, and none of these schedules runs it.
+fn classless(reports: &mut [Report], net: &mut [Message]) {
+    for report in reports {
+        for message in &mut report.output.messages {
+            message.classic = None;
+        }
+    }
+    for message in net {
+        message.classic = None;
+    }
+}
+
 fn run(seed: u64, steps: u64, settings: Settings, mix: Mix, reached: &mut Reached) -> End {
     let voters = [1, 2, 3];
     let mut old: Cluster<Old> = Cluster::new(5, &voters, settings, seed);
@@ -428,6 +441,7 @@ fn run(seed: u64, steps: u64, settings: Settings, mix: Mix, reached: &mut Reache
         let mut said_new = new.act(&op);
         timeless(&mut said_old);
         timeless(&mut said_new);
+        classless(&mut said_new, &mut new.net);
         let changes = |reports: &[Report]| {
             reports.iter().any(|report| {
                 report

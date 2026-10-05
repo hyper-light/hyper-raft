@@ -3,6 +3,7 @@
 //! of configuration, a flush to fail or a disk to stall, and what the member is, at length. The
 //! node-pair liveness heartbeats members send one another are framed as hyper-raft-e2e's members
 //! frame theirs (`hyper_raft_e2e::stream`), at the tag past these orders'.
+use hyper_raft::FastStats;
 use hyper_raft::proto::ConfChangeType;
 use hyper_raft_e2e::wire::{self, Kind, Reader, Status};
 
@@ -164,6 +165,8 @@ pub struct Report {
     pub unjudged_interval_ns: u64,
     /// The restarts of its peers its stream has seen.
     pub restarts: u64,
+    /// What its core did by the fast track since it started (`hyper_raft::FastStats`).
+    pub fast: FastStats,
     /// The time it has had a write of its log out, all told, nanoseconds: time its group's
     /// progress through it waited on its device (`hyper_raft_e2e::quiet`).
     pub blocked_ns: u64,
@@ -221,6 +224,12 @@ pub fn put_report(buffer: &mut Vec<u8>, id: u64, report: &Report) {
         report.unjudged,
         report.unjudged_interval_ns,
         report.restarts,
+        report.fast.proposed,
+        report.fast.displaced,
+        report.fast.held,
+        report.fast.taken,
+        report.fast.committed,
+        report.fast.recovered,
         report.blocked_ns,
         report.writing_ns,
         report.flush_most_ns,
@@ -266,7 +275,7 @@ pub fn read_report(body: &[u8], max_voters: usize) -> Option<(u64, Report)> {
         return None;
     }
     let status = read_status(&mut reader)?;
-    let mut words = [0u64; 17];
+    let mut words = [0u64; 23];
     for word in &mut words {
         *word = reader.u64()?;
     }
@@ -280,6 +289,12 @@ pub fn read_report(body: &[u8], max_voters: usize) -> Option<(u64, Report)> {
         unjudged,
         unjudged_interval_ns,
         restarts,
+        proposed,
+        displaced,
+        held,
+        fast_taken,
+        committed,
+        recovered,
         blocked_ns,
         writing_ns,
         flush_most_ns,
@@ -315,6 +330,14 @@ pub fn read_report(body: &[u8], max_voters: usize) -> Option<(u64, Report)> {
             unjudged,
             unjudged_interval_ns,
             restarts,
+            fast: FastStats {
+                proposed,
+                displaced,
+                held,
+                taken: fast_taken,
+                committed,
+                recovered,
+            },
             blocked_ns,
             writing_ns,
             flush_most_ns,

@@ -408,6 +408,7 @@ impl hyper_raft::Storage for Wal {
             hard_state: self.hard,
             configuration: self.configuration.clone(),
             proposals: Vec::new(),
+            released: 0,
         })
     }
     fn entries(

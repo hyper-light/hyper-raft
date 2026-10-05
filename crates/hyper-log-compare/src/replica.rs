@@ -234,6 +234,7 @@ pub mod hyper {
                 hard_state,
                 configuration: conf(),
                 proposals: Vec::new(),
+                released: 0,
             })
         }
 
@@ -406,6 +407,7 @@ pub mod mantle {
                 hard_state,
                 configuration: conf(),
                 proposals: Vec::new(),
+                released: 0,
             })
         }
 

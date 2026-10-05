@@ -202,10 +202,17 @@ checksum.
 
 - **Message body**: kind (1), flags (1: bit 0 reject, bit 1 snapshot present, bit 2 a refused
   append's answer from a member whose log lost what it acknowledged, core step R-5, bit 3 a refused
-  append's answer from a member that kept the append ahead of a hole, R-3's R17; any other bit set
-  is refused), then nine `u64` (to, from, term, log term, index, commit, commit term, request snapshot,
-  reject hint) and an `i64` priority, then the entry count (`u32`) and context length (`u32`), the
-  context bytes, the entries, and the snapshot body when its flag is set.
+  append's answer from a member that kept the append ahead of a hole, R-3's R17, bit 4 a classic
+  commit follows; any other bit set is refused), then nine `u64` (to, from, term, log term, index,
+  commit, commit term, request snapshot, reject hint) and an `i64` priority, then the entry count
+  (`u32`) and context length (`u32`), the context bytes, the entries, the snapshot body when its
+  flag is set, and the classic commit (`u64`) when its flag is set: the index through which the
+  sender, a leader, knows its log committed by a classic quorum (§3.5, "Releasing what a member
+  holds"). A message without the flag states none, which a member takes as nothing known. The flag
+  is a profile of the format as bits 2 and 3 are: a decoder that does not know it refuses the
+  record, so an owner whose members are not all upgraded strips it (`Message::classic` to `None`)
+  until they are, and its members then release nothing they hold by themselves until it does,
+  which costs the fast track room and never safety.
 - **Entry body**: kind (1), term and index (`u64`), data and context lengths (`u32`), the data, the
   context.
 - **Hard state**: term, vote, commit (`u64`).
@@ -705,6 +712,144 @@ runs seed 54104's schedule; it fails without the second rule and passes with it.
 200,000 (`HYPER_RAFT_SEEDS=40000 HYPER_RAFT_SEED=<seed> cargo test -p hyper-raft --release --test
 fast a_group_with_the_fast_track`): every member commits the same entry at every index, every
 answered read saw what was committed when it was asked, and every group settles.
+
+### 3.5 Releasing what a member holds (the fast track's lost entry)
+
+**The defect.** hyper-check's swarm, run against the fast track's second rule with no defect planted,
+found a later leader lacking an entry the fast quorum had committed (fast seed 41,345, 2026-10-04,
+`docs/sim.md` §15.9): four voters, index 10 committed in term 13 by a fast quorum of the leader,
+member 4 holding the entry by itself, and a member holding it in its log from the leader. Member 4
+led term 18, took the entry into its log at its election under term 18, and let its holding go,
+for a member held a proposal only above its log (`Raft::release_proposals`). Term 23's leader cut
+member 4's log back below index 10 with an append that stopped short of it (its own log bore an
+older term there), member 4 then held another proposal at 10, and in term 34 members 1 and 3 elected
+it: their logs held the entry under term 13, older than member 4's last term 23, and neither held
+anything at 10 by itself. Recovery took member 4's own proposal.
+
+**The cause.** The argument for the fast quorum (`track.rs`, after Fast Paxos's condition O4) reads:
+a later leader whose log reaches the index holds the entry, for a member that holds it from the
+leader votes for no one whose log lacks it; one whose log ends below it takes the most held, and
+more members of the fast quorum hold it than are outside it. The first half fails once an election
+takes entries again under its own term below the index: a candidate whose log ends short of the
+index can then have a later last term than a member whose log holds the entry under the term that
+committed it, and that member votes for it and reports nothing, for an election reads what members
+hold by themselves and not their logs. The second half fails once a member lets its holding go:
+its log reaching the index is no record an election can count on, since a later leader's append can
+cut that log back. slates' prefix search refuses both rules (`Variant::DropCovered`, a holding
+dropped once the log covers it, 16 steps; `Variant::PruneAtFastCommit`, dropped under a commit that
+counts fast commits, 12 steps), and its bug record of 2026-09-29 is the same shape (explorer seed
+266). `FastTrack.tla` had the same release, and a `Replicate` that always sent through the leader's
+end, so it never cut a log short of an index and could not reach the run.
+
+**The rule.** Two changes, slates' design as its search checked it:
+- *A fast quorum counts holdings only* (`Raft::fast_commit`): a member that holds the leader's entry
+  by itself and said so in the leader's term, its log holding an entry of that term (the first
+  rule). A member's log copy of the entry no longer counts, and the leader counts once its own
+  holding of what it took is durable: a leader holds what it hears of first as any voter does
+  (`Raft::hear_proposal`, `Raft::holds_what_it_took`).
+- *A member holds what it holds until it knows the index committed by a classic quorum*
+  (`Raft::learn_classic`): the leader by its own count (the quorum index, an entry of its term,
+  `Raft::maybe_commit`), another member from what a leader says with an append, a heartbeat or a
+  snapshot (`Message::classic`, §3.1) and what its log then matches. Nothing else releases a
+  holding: not the log reaching the index, not its own election, not a snapshot, not a fast commit.
+
+**Why it is safe.** Let index `i` be committed in term `t` by a fast quorum `F` of the term's
+configuration, each member of `F` holding entry `e` at `i` durably and having said so in `t`, its
+log holding an entry of term `t`. Claim: every leader of a term after `t` takes or holds `e` at `i`.
+By induction on the term. The leader `L` of term `t' > t` was elected by a classic quorum `V`. If
+`L`'s log reaches `i`, its entry there was written by the leader of the term of its last entry at
+or after `i`, which holds `e` at `i` (the induction, or `t`'s leader itself), and `L`'s log matches
+that leader's through its last entry in what entries state (a member's committed prefix may keep an
+older stamp, `docs/models/README.md`). If `L`'s log ends below `i`, `L` takes the most held at `i`
+among `V`'s reports. A member of `V ∩ F` still holds `e` at `i`: it holds one entry an index and
+replaces none it holds, and it released `e` only on knowing a classic commit at or above `i`, which
+puts `i` in every later leader's log (Raft's election rule over a classic quorum's logs, Ongaro's
+thesis §3.6.3), and `L`'s log does not reach `i`. So at least `|V ∩ F| ≥ |V| + |F| − n` reports say
+`e`, and at most `n − |F|` say anything else, and `2|F| + |Q| > 2n` (`quorum.rs`) makes `e` the most
+held, strictly. The first rule keeps the members of `F` from electing a candidate whose log holds an
+older entry at `i` (the section above).
+
+**The model.** `FastTrack.tla` now has a member's `classic`, a release by `Releases` ("classic", the
+core; "log", before), what a fast quorum counts by `Votes` ("held"; "logs", before), recovery's rule
+by `Rule` ("most", the core; "least"; "ballot", slates' highest ballot with `|Q| + |F| − n`), what a
+voter reports by `Reports` ("held"; "acknowledged", design B below), and a leader's append that stops
+at any index of its log. The run needs four members, three terms, three indexes and two values
+(`FastTrackScenario.tla` says why each), past any whole search: hyper-check's search of the model
+(`tests/fasttrack.rs`, which reaches TLC's published count at every configuration of one value
+before the change) passed 402 million classes held to the run's order of leaders without ending. So
+the scenario is searched whole from the end of its term 1, a state a run of the model reaches:
+with the rules before the fix, and with either alone, the checker finds `LeaderHolds` violated
+(`FastTrackScenarioBefore.cfg`, `…Covered.cfg`, `…Logs.cfg`); with the fix every run from there keeps
+every invariant (`FastTrackScenario.cfg`, 3,870,308 states). Every other configuration passes or is
+refused as before, with appends that stop short. The ballot rule is refused in the scenario
+(`FastTrackScenarioBallot.cfg`): a member here says what it holds again when it votes in a later term,
+so the latest report need not be of the committing round; the most-held rule holds.
+
+**Design B, considered.** Keep the count of log copies, and have a voter report every entry it
+acknowledged above what it knows committed by a classic quorum, its log's where its log reaches the
+index (slates' `ReportLogsToo`, over the most-held rule). The model passes it at every scope above
+and in the scenario (`FastTrackScenarioB.cfg`, 3,066,656 states; with the release on log coverage,
+`FastTrackScenarioBLog.cfg`, 1,097,636). It is not taken: its safety needs its own proof (a log's
+entry at the index can be replaced by a later leader's, so a report is no fixed vote, and
+slates' argument for it is over the highest ballot, not the most held), and design A's measured
+cost does not ask for it (below).
+
+**The cost.** Measured against the core before the fix, whose count of log copies B keeps and to
+which B adds its reports, so that the core before is a floor under B's cost (`docs/benchmarks.md`,
+"The fast track's release (design A)"). On the fast workload every index is committed by a fast
+quorum before and after (10,000 of 10,000, three and five voters), with the same allocations a
+proposal at three voters (45) and two fewer at five (73 to 71), no reallocations, 368 and 144 more
+bytes asked, and p50 time 2,144 to 2,240 ns and 3,782 to 3,925 ns, within the runs' spread (load
+5.7–6.1). The leader's holding costs two allocations a proposal (a build without it, five voters):
+it copies what it hears and gives it to storage as each voter does, and that holding is what makes
+its vote a record an election reads. Three costs the series first had are gone, each measured:
+the leader told its members the classic commit by an append round of its own (5 allocations a
+proposal at three voters, 9 at five; now the next append or heartbeat carries it, and a later
+release costs room, never safety), and it copied its own holding when it took the entry, and a
+log entry to compare a holding with (both now read where they are, `Log::any_entry`).
+
+**The bound.** A member now holds proposals below its log until it learns the classic commit; they
+stay within what it may hold (`Limits::proposals`, `proposal_bytes`), which its vote carries in one
+message (§3.2's derivation is unchanged). A member at its bound holds no more and votes for nothing
+more, and the leader commits by the classic quorum: room, never safety.
+
+**Storage.** A store keeps every proposal a `Ready` gave until a `Ready` releases it
+(`Ready::released`): it drops those at or below the index before it takes the `Ready`'s proposals, a
+proposal given again at an index replaces the one there, and nothing else drops one, not the log
+reaching it, not a start that moves past it. It keeps the greatest release it wrote durably and gives
+it back when the member opens (`InitialState::released`), with the proposals it still holds.
+A proposal at an index the same write's entries reach is taken with them: a voter holds what it
+heard above its log, and the leader's append may cover that index before the write goes out. The
+holding is still its vote. hyper-durable's stores do all of this (`RamStore`, `GroupStore` over
+hyper-log's `Released` record; `tests/hyperlog.rs`:
+`a_holding_the_same_write_reaches_by_an_append_is_kept`, which fails while hyper-log refused such a
+write and fenced the member).
+
+Mantle's range store on `dev` (`crates/range/src/store.rs` over `mantle-log`) does not hold to this.
+A range that turns the fast track on needs four things from its store:
+
+1. Proposals outlive the log reaching them. `mantle-log` ends them when it reaches them, both on
+   replay (`state::Replayed::reach`) and as it writes (`writer.rs`, "What the log has reached").
+2. A proposal in an update whose entries reach it is taken. `mantle-log` refuses it ("a proposal
+   the log has reached"), and the range's member is fenced.
+3. `Ready::released` is written durably in the same update as the proposals. It ends those at or
+   below it before the update's own proposals are taken. The greatest release is kept across
+   compaction (hyper-log's `Released` record, key 10).
+4. `initial_state` gives back `released` with the proposals the store still holds.
+
+Mantle's branch `shared-d1` moves its ranges onto hyper-durable's `GroupStore` (D-1,
+`docs/durable.md` §15), which meets all four with this series' hyper-log. `mantle-log` is not
+changed to meet them. Until a range runs on that store at this series, it runs with
+`Config::fast` off, as every range does now.
+
+**Evidence.** `tests/fast.rs`: `an_entry_the_fast_track_committed_outlives_a_log_cut_short_of_it`
+(the run scripted at five members, where the core's tie-break for the first voted needs a fifth; it
+fails before the fix, member 4 committing another entry at 3, and passes with it),
+`a_holding_outlives_its_log_reaching_it_until_a_classic_commit_is_known`,
+`a_fast_quorum_counts_holdings_and_not_logs`; `tests/strategies.rs`:
+`a_fast_committed_entry_outlives_a_vote_its_log_covered_and_then_lost` (seed 41,345); hyper-check's
+`tests/fasttrack.rs`: `the_entry_the_swarm_lost_is_lost_by_each_rule_before_the_fix`,
+`with_the_fix_the_same_run_keeps_the_entry`.
 
 ## 4. The crates that follow
 

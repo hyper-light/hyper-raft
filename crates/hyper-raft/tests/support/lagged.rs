@@ -88,6 +88,7 @@ struct Write {
     snapshot: Option<Snapshot>,
     entries: Vec<Entry>,
     proposals: Vec<Entry>,
+    released: Option<u64>,
     hard_state: Option<HardState>,
     /// What waits for this write to be durable.
     messages: Vec<Message>,
@@ -253,6 +254,7 @@ impl Lagged {
             snapshot,
             entries,
             proposals: ready.proposals().to_vec(),
+            released: ready.released(),
             hard_state: ready.hard_state().copied(),
             messages: ready.take_persisted_messages(),
             from,
@@ -382,8 +384,7 @@ impl Lagged {
             disk.install(snapshot);
         }
         disk.append(&write.entries);
-        disk.proposals.extend(write.proposals.iter().cloned());
-        disk.trim_proposals();
+        disk.hold(&write.proposals, write.released);
         if let Some(hard) = write.hard_state {
             // The commit a store records never goes back: a compaction since
             // the `Ready` was taken recorded a later one (`Disk::compact`).

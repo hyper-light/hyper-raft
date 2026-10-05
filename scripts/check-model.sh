@@ -4,6 +4,9 @@
 #
 #   scripts/check-model.sh             every configuration below
 #   scripts/check-model.sh NAME...     the ones named
+#   scripts/check-model.sh --part P    the ones of part P
+#   scripts/check-model.sh --parts     the parts, one a line, and nothing run (CI holds its
+#                                      matrix to them)
 #
 # A configuration passes or is refused. One that passes holds every invariant it names and has
 # exactly the distinct states it states. One that is refused is the model with a rule of the core
@@ -33,37 +36,64 @@ digest=936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88
 memory="${TLC_MEMORY_MB:-256}"
 workers="${TLC_WORKERS:-1}"
 
-# NAME CONFIGURATION REFUSED [MODULE]: the invariant the checker must find violated, or - for one
-# that passes; the module checked, FastTrack unless named (Reconfig: the configuration a member
-# counts by across two changes, docs/research/reconfiguration.md §5).
+# NAME CONFIGURATION REFUSED PART [MODULE]: the invariant the checker must find violated, or - for
+# one that passes; the part of CI's model job it runs in (.github/workflows/ci.yml, where the parts
+# run side by side); the module checked, FastTrack unless named (a scenario, FastTrackScenario, is
+# FastTrack held to an order of leaders and proposals; Reconfig, the configuration a member counts
+# by across two changes, docs/research/reconfiguration.md §5).
 configurations="
-one          FastTrack.cfg                  -
-round        FastTrackRound.cfg             -
-four         FastTrackFour.cfg              -
-change       FastTrackChange.cfg            -
-grow         FastTrackGrow.cfg              -
-classic      Classic.cfg                    -
-joint        ClassicJoint.cfg               -
-reached      FastTrackReached.cfg           NoFastByHeld
-anyround     FastTrackAnyRound.cfg          LeaderHolds
-least        FastTrackWrong.cfg             LeaderHolds
-growreached  FastTrackGrowReached.cfg       NoFastByHeldAfterChange
-marked       Marked.cfg                     -
-markedchange MarkedChange.cfg               -
-markedjoint  MarkedJoint.cfg                -
-markedself   MarkedSelf.cfg                 LeaderHolds
-markedwhole  MarkedWhole.cfg                LeaderHolds
-markedreach  MarkedReached.cfg              NoMarkedLeader
-changereach  MarkedChangeReached.cfg        NoMarkedLeader
-jointreach   MarkedJointReached.cfg         NoMarkedLeader
-rjoint       ReconfigJoint.cfg              -                  Reconfig
-rpromote     ReconfigPromote.cfg            -                  Reconfig
-rsingle      ReconfigSingle.cfg             -                  Reconfig
-rsinglejoint ReconfigSingleJoint.cfg        -                  Reconfig
-rapplied     ReconfigApplied.cfg            OneLeader          Reconfig
-rpending     ReconfigPending.cfg            NoElectedOnPending Reconfig
-rstood       ReconfigStood.cfg              NoElectedUnnamed   Reconfig
+one          FastTrack.cfg                -                       fast
+round        FastTrackRound.cfg           -                       fast
+four         FastTrackFour.cfg            -                       fast
+change       FastTrackChange.cfg          -                       fast
+grow         FastTrackGrow.cfg            -                       change
+classic      Classic.cfg                  -                       change
+joint        ClassicJoint.cfg             -                       change
+reached      FastTrackReached.cfg         NoFastByHeld            small
+anyround     FastTrackAnyRound.cfg        LeaderHolds             small
+least        FastTrackWrong.cfg           LeaderHolds             small
+growreached  FastTrackGrowReached.cfg     NoFastByHeldAfterChange small
+restamp      FastTrackRestamp.cfg         -                       small
+restampreach FastTrackRestampReached.cfg  NoRestamp               small
+marked       Marked.cfg                   -                       small
+markedchange MarkedChange.cfg             -                       small
+markedjoint  MarkedJoint.cfg              -                       small
+markedself   MarkedSelf.cfg               LeaderHolds             small
+markedwhole  MarkedWhole.cfg              LeaderHolds             small
+markedreach  MarkedReached.cfg            NoMarkedLeader          small
+changereach  MarkedChangeReached.cfg      NoMarkedLeader          small
+jointreach   MarkedJointReached.cfg       NoMarkedLeader          small
+rjoint       ReconfigJoint.cfg            -                       reconfig Reconfig
+rpromote     ReconfigPromote.cfg          -                       reconfig Reconfig
+rsingle      ReconfigSingle.cfg           -                       reconfig Reconfig
+rsinglejoint ReconfigSingleJoint.cfg      -                       reconfig Reconfig
+rapplied     ReconfigApplied.cfg          OneLeader               reconfig Reconfig
+rpending     ReconfigPending.cfg          NoElectedOnPending      reconfig Reconfig
+rstood       ReconfigStood.cfg            NoElectedUnnamed        reconfig Reconfig
+scenario     FastTrackScenario.cfg        -                       scenario FastTrackScenario
+before       FastTrackScenarioBefore.cfg  LeaderHolds             scenario FastTrackScenario
+covered      FastTrackScenarioCovered.cfg LeaderHolds             scenario FastTrackScenario
+logs         FastTrackScenarioLogs.cfg    LeaderHolds             scenario FastTrackScenario
+ballot       FastTrackScenarioBallot.cfg  LeaderHolds             scenario FastTrackScenario
+designb      FastTrackScenarioB.cfg       -                       scenario FastTrackScenario
+designblog   FastTrackScenarioBLog.cfg    -                       scenario FastTrackScenario
+roundballot  FastTrackRoundBallot.cfg     -                       fast
+oneb         FastTrackB.cfg               -                       fast
 "
+
+if [ "${1:-}" = "--parts" ]; then
+  echo "$configurations" | awk 'NF { print $4 }' | sort -u
+  exit 0
+fi
+if [ "${1:-}" = "--part" ]; then
+  part="${2:?a part}"
+  # shellcheck disable=SC2046
+  set -- $(echo "$configurations" | awk -v part="$part" '$4 == part { print $1 }')
+  if [ "$#" -eq 0 ]; then
+    echo "no configuration is in part $part" >&2
+    exit 2
+  fi
+fi
 
 if ! command -v java >/dev/null 2>&1; then
   echo "TLC needs Java on PATH" >&2
@@ -93,8 +123,8 @@ trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-check() { # NAME CONFIGURATION REFUSED [MODULE]
-  local name="$1" config="$2" refused="$3" module="${4:-FastTrack}"
+check() { # NAME CONFIGURATION REFUSED PART [MODULE]
+  local name="$1" config="$2" refused="$3" module="${5:-FastTrack}"
   local budget threads status=0 found
   budget="$(sed -n 's/^ *StateBudget *= *\([0-9][0-9]*\) *$/\1/p' "$root/docs/models/$config")"
   if [ -z "$budget" ]; then

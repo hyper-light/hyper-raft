@@ -203,11 +203,12 @@ macro_rules! focal_storage {
     ($krate:ident, base) => {};
     (@methods $krate:ident) => {
         fn initial_state(&self) -> Result<$krate::InitialState, $krate::StorageError> {
-            Ok($krate::InitialState {
-                hard_state: self.hard.clone(),
-                configuration: self.conf.clone(),
-                proposals: Vec::new(),
-            })
+            // Field by field: the cores' states differ in what they hold beside these, and
+            // this storage holds nothing of the fast track.
+            let mut state = $krate::InitialState::default();
+            state.hard_state = self.hard.clone();
+            state.configuration = self.conf.clone();
+            Ok(state)
         }
         fn entries(
             &self,
@@ -402,6 +403,9 @@ macro_rules! focal_core {
                 }
                 fn digest(&self) -> u64 {
                     self.app.digest
+                }
+                fn fast_committed(&self) -> u64 {
+                    self.raw.raft.fast_stats().committed
                 }
                 fn campaign(&mut self, out: &mut Vec<Envelope<Message>>) {
                     heard(self.raw.campaign());

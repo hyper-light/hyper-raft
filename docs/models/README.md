@@ -222,6 +222,55 @@ elections alone, is refused for `LeaderHolds` only at three terms, past what TLC
 worker in the job's time; the mirror refutes it there with the reductions, in eleven steps
 (`elections_by_the_newest_and_commits_by_the_applied_lose_a_committed_entry`).
 
+**Holdings kept until a classic commit (2026-10-05).** `docs/raft.md` §3.5: a fast quorum counts
+what members hold by themselves, and a member holds what it holds until it knows the index
+committed by a classic quorum (`Releases = "classic"`, `Votes = "held"`, `Reports = "held"` in every
+configuration below that does not name another). Every configuration took new counts, counted by
+CI's model job (runs 37336523719, 37358361974 and 37365272958) and, for those that pass, equal to hyper-check's
+Rust model where it searches them (`tests/fasttrack.rs`, `the_model_counts_what_tlc_counts`):
+
+| Name | Distinct states | Result |
+|---|---|---|
+| `one` | 573,160 | passes |
+| `round` | 3,974,278 | passes |
+| `four` | 3,602,968 | passes |
+| `change` | 4,067,274 | passes |
+| `grow` | 9,551,710 | passes |
+| `classic` | 841,050 (two indexes now; three were 5,013,585) | passes |
+| `joint` | 2,626,941 | passes |
+| `reached` | 285,888 | refused: `NoFastByHeld` |
+| `anyround` | 315,519 | refused: `LeaderHolds` |
+| `least` | 264,569 | refused: `LeaderHolds` |
+| `growreached` | 1,571,732 | refused: `NoFastByHeldAfterChange` |
+| `marked` | 303,762 | passes |
+| `markedchange` | 431,168 | passes |
+| `markedjoint` | 1,182,158 | passes |
+| `markedself` | 1,005 | refused: `LeaderHolds` |
+| `markedwhole` | 1,247 | refused: `LeaderHolds` |
+| `markedreach` | 250 | refused: `NoMarkedLeader` |
+| `changereach` | 1,165 | refused: `NoMarkedLeader` |
+| `jointreach` | 586 | refused: `NoMarkedLeader` |
+| `roundballot` | 3,974,278 | passes |
+| `oneb` | 854,746 | passes |
+
+New with it:
+- `restamp` (`FastTrackRestamp.cfg`): three voters, two terms, three indexes, the entry held at
+  index 2, 3,808,625 states, passes. A member keeps the stamp of an entry it committed that a later
+  leader's election took again under its own term, so `LogMatching` compares terms only where
+  neither member has committed; `restampreach` (`FastTrackRestampReached.cfg`, 1,230,055 states,
+  refused: `NoRestamp`) shows the scope reaches such a pair, which no other configuration does.
+- The scenario of swarm fast seed 41,345 (`FastTrackScenario.tla`, searched whole from the end of
+  its term 1): `scenario` 3,870,308, passes; `before` (both rules the core had) 2,549, `logs`
+  (holdings counted from logs) 2,553 and `covered` (the release on log coverage) 2,549, each refused: `LeaderHolds` (`covered` starts
+  where `before` does: under the release on log coverage the leader let go of its holding once it
+  took the entry, CI run 37365272958); `ballot` (slates' highest
+  ballot) 495, refused: `LeaderHolds`; design B `designb` 3,066,656 and `designblog` 1,097,636,
+  pass.
+
+The suite no longer fits one job's timeout at four workers (run 37336523719 passed 131 minutes), so
+CI runs it in five parts side by side, each configuration naming its part in
+`scripts/check-model.sh`; in run 37358361974 the longest part took 55 minutes.
+
 **To change the model.** A change that makes a configuration larger or smaller fails the check
 until its states are counted again and stated; a new configuration is first run with a
 `StateBudget` it cannot exceed without being stopped, and its count recorded here with the run.

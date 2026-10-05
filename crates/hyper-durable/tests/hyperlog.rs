@@ -260,3 +260,76 @@ fn two_groups_driven_in_turn_both_have_their_write_out_before_either_waits() {
         frames_after - frames
     );
 }
+
+/// A voter holds a fast proposal above its log, and the leader's append reaches that index
+/// before the write goes out: the one write carries the entry and the holding at its index. The
+/// holding is the voter's vote, kept until a release (`docs/raft.md` §3.5), so the log takes it
+/// with the entry that reached it rather than refusing the write.
+#[test]
+fn a_holding_the_same_write_reaches_by_an_append_is_kept() {
+    use hyper_raft::proto::{Entry, Message, MessageType};
+    let log = Log::create(sim_file(23), config(16, 1 << 12), 1).unwrap();
+    let store = GroupStore::claim(&log, 1).unwrap();
+    let kv = Kv::new(
+        ConfState {
+            voters: vec![1, 2, 3],
+            ..ConfState::default()
+        },
+        false,
+    );
+    let mut s = settings(1, 3);
+    s.core.fast = true;
+    let mut r: Member = Replica::open(&s, store, kv, Unbounded).unwrap();
+    let (tell, woken) = sync_channel(1024);
+    let (waker, _) = hyper_measure::wake::waker(0, tell);
+    r.step(Message {
+        msg_type: MessageType::MsgHeartbeat,
+        from: 2,
+        to: 1,
+        term: 1,
+        ..Message::default()
+    })
+    .unwrap();
+    settle(&mut r, &waker, &woken);
+    let last = r.core().raft.log().last_index().unwrap();
+    let at = last + 1;
+    r.step(Message {
+        msg_type: hyper_raft::fast::FAST_PROPOSE,
+        from: 3,
+        to: 1,
+        term: 1,
+        entries: vec![Entry {
+            index: at,
+            term: 1,
+            data: b"held".to_vec(),
+            ..Entry::default()
+        }],
+        ..Message::default()
+    })
+    .unwrap();
+    let log_term = r.core().raft.log().term(last).unwrap();
+    r.step(Message {
+        msg_type: MessageType::MsgAppend,
+        from: 2,
+        to: 1,
+        term: 1,
+        index: last,
+        log_term,
+        entries: vec![Entry {
+            index: at,
+            term: 1,
+            data: b"appended".to_vec(),
+            ..Entry::default()
+        }],
+        ..Message::default()
+    })
+    .unwrap();
+    settle(&mut r, &waker, &woken);
+    let view = r.core().store().log().view().unwrap();
+    assert_eq!(view.last, at);
+    let initial = hyper_raft::Storage::initial_state(r.core().store()).unwrap();
+    assert!(
+        initial.proposals.iter().any(|p| p.index == at),
+        "the holding is kept beside the entry that reached it"
+    );
+}

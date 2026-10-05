@@ -51,10 +51,19 @@ jobs:
   model:
     # The core's TLA+ model (docs/models/README.md): every configuration that passes, each at
     # exactly the states it states, and every one the checker must refuse. TLC runs here only
-    # (CLAUDE.md §1, "Model checking"); one OS suffices, for the model is not the code.
+    # (CLAUDE.md §1, "Model checking"); one OS suffices, for the model is not the code. The
+    # configurations run in parts, side by side: the whole took past the job's timeout in one
+    # (2026-10-05, run 37336523719). Each configuration names its part in the script, and the
+    # `parts` job holds the script's parts to this matrix.
+    name: model (${{ matrix.part }})
+    strategy:
+      fail-fast: false
+      matrix:
+        part: [fast, change, small, reconfig, scenario]
     runs-on: ubuntu-24.04
     # The state bound is what bounds the work; this catches a checker that stopped making
-    # progress: twice the suite's measured time at one worker (docs/models/README.md).
+    # progress: twice the whole suite's measured time at one worker (docs/models/README.md),
+    # which every part is within.
     timeout-minutes: 131
     env:
       TLA_TOOLS: ${{ github.workspace }}/target/tla
@@ -73,7 +82,14 @@ jobs:
         with:
           path: target/tla/tla2tools.jar
           key: tla2tools-v1.7.4-936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88
-      - run: bash scripts/check-model.sh
+      - run: bash scripts/check-model.sh --part ${{ matrix.part }}
+  parts:
+    # Every configuration of scripts/check-model.sh is in a part the model job runs.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v5
+      - run: diff <(bash scripts/check-model.sh --parts) <(printf '%s\n' change fast reconfig scenario small)
   explore:
     # hyper-check's exhaustive searches at full scope (docs/sim.md §15.1): slates' models at the
     # class counts slates recorded, every rejected variant refused by its shortest history, and
@@ -83,10 +99,12 @@ jobs:
     # Twice the suite's time on a runner core half as fast as one here, the model job's rule: 14.7
     # min on the owner's machine at load 69 (2026-10-04), so 4 × 14.7; the first CI run took 12.2
     # min with its build (docs/benchmarks.md, "hyper-check's strategies and searches (S-5)"). The
-    # Reconfig model's full scopes add 1.8 min here at load 6 (2026-10-05): 4 × 16.5 is 66.
-    timeout-minutes: 66
+    # Reconfig model's full scopes add 1.8 min here at load 6 (2026-10-05), and FastTrack.tla's
+    # Rust model 0.6 min at load 13 (2026-10-05): 4 × 17.1 is 68.4.
+    timeout-minutes: 69
     steps:
       - uses: actions/checkout@v5
       - run: rustup show active-toolchain || rustup toolchain install
       - run: cargo test --release -p hyper-check --locked --test exhaustive -- --ignored --test-threads 1
       - run: cargo test --release -p hyper-check --locked --test reconfig -- --ignored --test-threads 1
+      - run: cargo test --release -p hyper-check --locked --test fasttrack -- --ignored --test-threads 1

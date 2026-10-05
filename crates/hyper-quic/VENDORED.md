@@ -564,3 +564,15 @@ Tests: the phases on NewReno (`connection::resume::tests`), a resumed mebibyte a
 sooner (`a_resumed_connection_starts_from_half_what_the_last_delivered`), and a jump onto the lossy
 condition over its 32 seeds, where 7 seeds jump and all 7 retreat and every transfer completes
 (`a_jump_onto_a_lossy_path_retreats_and_every_transfer_completes`).
+
+### The upstream peer's driver order in `tests/e2e.rs` (2026-10-04)
+
+The end-to-end loop took every datagram, fired the timers due, then sent. Upstream quinn-proto
+0.11.18's `migrate` keeps the loss-detection timer armed for the old path, and fired before anything
+is sent on the new path it reaches `debug_assert!(!self.peer_completed_address_validation())` in
+`pto_time_and_space`: its server panicked there after a migration on the macOS Intel runner (CI run
+37257976598). quinn's main at d45b513 still does not re-arm the timer in `migrate`. quinn's own
+`ConnectionDriver::poll` transmits before it drives its timer, and its first send re-arms the
+timer, so the upstream side now runs in that order (`Quic::TRANSMIT_BEFORE_TIMERS`), its asserts on.
+hyper-quic re-arms the timer in `migrate` (17c9964, `a_rebinding_leaves_no_stale_probe_timeout`), and
+its side keeps the harder order.

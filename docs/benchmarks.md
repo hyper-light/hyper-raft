@@ -6358,3 +6358,152 @@ target/release/examples/geo_open_loop --rate 100 --requests 20000 --dials 5
 target/release/examples/geo_open_loop --rate 50 --requests 1500 --dials 1
 target/release/examples/geo_open_loop --rate 100 --requests 3000 --dials 1 --one-way-ms 0
 ```
+
+## hyper-quic at 500 ms one way: probe timeouts, tickets and Careful Resume (2026-10-04)
+
+The second round toward the owner's tenfold cut in what the stack adds above the physical floor of
+round trips at 500 ms one way (the round before: the section above). Before is 14aaea1; after is
+f530fe7 (the timing runs) and its follow-up, which removes one allocation and changes no time.
+Research: `docs/research/quic-overhead.md`. Changes: `crates/hyper-quic/VENDORED.md` §11 and §12,
+`crates/hyper-tls/VENDORED.md` §7, `docs/transport.md` §4f.
+
+Machine: Apple M5 Max, 18 cores, 128 GiB, macOS 26.4.1. Other sessions built and tested throughout
+(workspace test runs, a release hyper-raft strategy search); the load average is beside each run.
+
+### On the simulated network (exact, virtual time)
+
+`crates/hyper-quic/tests/geo.rs`, the round before's harness and schedule: 500 ms each way, then 5%
+loss each way with ±100 ms of reordering over the 32 seeds 1 to 32, the large certificate, a fresh
+dial and then a resumed dial with its request in 0-RTT data.
+
+Clean path: every case is at its floor before and after, as in the table above (fresh 1,000 /
+2,000 ms, resumed with 0-RTT 1,000 / 1,000 ms, large certificate 1,999 / 2,999 ms, kept requests
+1,000 ms each).
+
+Lossy, overhead above the floor. With 32 samples the p99 and p99.9 are the maximum and unresolved
+(`docs/tails.md` §3.3); the median, p90 and maximum are given.
+
+| | before (14aaea1) | after (f530fe7) |
+|---|---|---|
+| fresh handshake, median / p90 / max | 134 / 1,890 / 2,722 ms | 134 / 1,783 / 2,190 ms |
+| fresh first reply, median / p90 / max | 875 / 4,650 / 6,073 ms | 975 / 1,899 / 2,319 ms |
+| resumed handshake, median / p90 / max | 65 / 2,040 / 2,911 ms | 54 / 1,177 / 1,913 ms |
+| resumed first reply, median / p90 / max | 65 / 3,899 / 4,790 ms | 54 / 1,177 / 3,890 ms |
+| dials that never completed | 0 of 64 | 0 of 64 |
+| datagrams / bytes sent, all 32 seeds | 1,384 / 969,439 | 1,400 / 974,961 |
+
+- **The fresh first reply's p90 fell 2.4x (4,650 to 1,899 ms) and its maximum 2.6x; the resumed
+  first reply's p90 fell 3.3x (3,899 to 1,177 ms).** Two changes carry it: a probe now carries the
+  lost reply or request itself rather than only control frames, saving the round trip in which the
+  probe's acknowledgement used to reveal the loss; and the probe waits two smoothed RTTs at the first
+  sample rather than three. A third, a Handshake probe that also carries the Data space once an RTT
+  sample exists, resends a lost Finished and the request coalesced with it together.
+- **The fresh first reply's median moved from 875 to 975 ms, and it is not a regression of the
+  median's kind.** Sorted, the 32 values after are 0 (seven seeds), 31, 76, 114, 118, 305, 312, 354,
+  875, 975, 1,024, … 2,319: fourteen seeds lose nothing on the reply's path and eighteen lose at
+  least one packet there, and the median falls in the gap between the groups. A loss on the critical
+  path costs at least a round trip at any stack: a lost packet is known lost only when a later one
+  is acknowledged, a round trip after it was sent, and its copy then takes the one-way delay. Values
+  from 875 to about 1,300 ms fit one such recovery with up to 200 ms of jitter a round trip; those
+  near 2,000 ms fit two.
+- **Cost:** 16 more datagrams and 0.6% more bytes over the 32 seeds, the probes' copies.
+- **Ablations** (on the tree before the 0-RTT ACK fix, item 5 of VENDORED.md §11): without the
+  Data-space probe the fresh first reply's maximum was 3,090 ms against 2,242 ms with it; probing
+  the Data space before any RTT sample gave a resumed p90 of 961 ms against 1,177 ms, but on real
+  sockets it raised the open loop's worst from 291–294 ms to 343–354 ms in single 1,500-request
+  runs (the server's 999 ms first PTO fires against the 1 s round trip and repeats 0.5-RTT data
+  that is not lost), so the Data space waits for a sample.
+
+Careful Resume on the clean path (`print_the_resume_table`): a fresh dial asks for a reply of the
+given size, then a resumed dial with its request in 0-RTT asks for the same. The simulated path has no
+capacity limit, so the floor is one round trip and the rest is slow start:
+
+| reply | resumed first reply, without | with Careful Resume | saved |
+|---|---|---|---|
+| 512 KiB | 6,631 ms | 5,886 ms | 745 ms |
+| 1 MiB | 7,672 ms | 5,922 ms | 1,750 ms |
+| 2 MiB | 8,722 ms | 6,038 ms | 2,684 ms |
+
+The fresh dials are the same with it and without it (7,627, 8,685 and 9,741 ms). Under the lossy
+condition, a first dial of a mebibyte on the clean path and a resumed one on the lossy path: 7 of
+the 32 seeds jump and all 7 retreat at their first loss (RFC 9959 §3.5); every transfer completes.
+
+### On real sockets: the open loop
+
+`crates/hyper-quic/examples/geo_open_loop.rs`, the round before's bench: client, server and the
+relay's two directions as threads on loopback, 500 ms each way, five dials (the first fresh, the
+rest resumed with a 0-RTT request), then 20,000 requests open loop at 100 a second on the kept
+connection, latencies from each request's scheduled time less 1,000 ms; quantile intervals 95%
+distribution-free. The relay's own lateness is beside each run. Runs interleaved, 2026-10-04
+20:20–20:48 PDT; before is 14aaea1's binary, after is f530fe7's.
+
+The round before's condition (no warm-up):
+
+| run | load (before → after the run) | dials falling back to 1-RTT | p50 / p99 / p99.9 / max, overhead | relay lateness p99.9 up / down |
+|---|---|---|---|---|
+| before 1 | 16.5 → 10.3 | dial 4 | 1.216 / 4.425 / 191.1 [151.1, 231.5] / 291.0 ms | 3.47 / 3.17 ms |
+| after 1 | 10.3 → 6.3 | none | 1.174 / 2.376 / 152.3 [132.6, 181.9] / 241.1 ms | 2.69 / 1.04 ms |
+| before 2 | 6.3 → 10.9 | dial 4 | 1.213 / 11.00 / 192.1 [152.0, 232.4] / 292.0 ms | 7.06 / 7.24 ms |
+| after 2 | 10.9 → 7.2 | none | 1.202 / 3.223 / 152.6 [133.2, 181.5] / 241.1 ms | 1.79 / 1.97 ms |
+
+- **0-RTT on every resumed dial.** Dials 2 to 5 all had their 0-RTT data accepted, 0.5 to 1.9 ms
+  over their one-round-trip floor; before, dial 4 fell back to 1-RTT in every run (its first reply
+  2,001.5 to 2,001.7 ms against a floor of 1,000) because dials 2 and 3 closed before their tickets
+  arrived. The tickets now come with the server's Finished (`crates/hyper-tls/VENDORED.md` §7).
+- **The start of the burst stalls 241 ms where it stalled 291 ms**, every run: p99.9 152 ms against
+  191 ms. The 50 ms is the 0-RTT ACK fix (VENDORED.md §11 item 5): the server's first flight now
+  acknowledges the client's 0-RTT request, so it leaves the client's flight a round trip sooner.
+  What is left is the initial window: this kept connection has never measured its path (each dial
+  before it carried one request), so it starts at 12,000 bytes (RFC 9002 §7.2) and the requests
+  past 15 kB a round trip wait for the first acknowledgements. Every later tenth of each run is
+  under 11 ms.
+
+A path an earlier connection measured: the first dial first carries 4,000 requests at 400 a second
+(about 60 kB a round trip, past RFC 9959 §3.1's four initial windows), then the four resumed dials,
+then the open loop at 100 a second on dial 5. The same binary with Careful Resume off and on:
+
+| run | load | p50 / p99 / p99.9 / max, overhead | worst in the first tenth | relay lateness p99.9 up / down |
+|---|---|---|---|---|
+| off 1 | 7.2 → 7.4 | 1.198 / 3.554 / 151.8 [132.0, 181.5] / 241.1 ms | 241.1 ms | 2.28 / 2.48 ms |
+| on 1 | 7.4 → 7.3 | 1.235 / 2.159 / **8.93** [7.43, 11.1] / **20.5** ms | 12.8 ms | 2.02 / 1.75 ms |
+| off 2 | 7.3 → 22.5 | 1.239 / 2.729 / 152.6 [133.0, 182.1] / 241.7 ms | 241.7 ms | 1.08 / 1.12 ms |
+| on 2 | 22.5 → 17.4 | 1.244 / 3.106 / **24.7** [21.7, 31.7] / **64.1** ms | 1.8 ms | 4.62 / 5.10 ms |
+
+- **With Careful Resume the burst's start no longer stalls: the first tenth's worst is 12.8 and
+  1.8 ms against 241 ms, and p99.9 falls from 152 ms to 8.9 and 24.7 ms (6x to 17x).** Once dial 5's
+  initial data is acknowledged its window jumps to half the 400-a-second measurement, about 30 kB,
+  past the 15 kB a round trip the open loop asks. The run's worst moves to mid-run (64 ms in its
+  seventh tenth in "on 2", the load average then 17 to 22), the host's, as the 1 to 2 ms p50 is.
+- The warm-up itself, slow start from 12,000 bytes to 60 kB a round trip, is the same either way
+  (p99 1,473 ms over the round trip): a fresh connection to an unmeasured path is not changed.
+
+### Overhead above the floor, before and after
+
+| condition | before | after | cut |
+|---|---|---|---|
+| simulated, lossy, fresh first reply, p90 / max | 4,650 / 6,073 ms | 1,899 / 2,319 ms | 2.4x / 2.6x |
+| simulated, lossy, resumed first reply, p90 / max | 3,899 / 4,790 ms | 1,177 / 3,890 ms | 3.3x / 1.2x |
+| simulated, lossy, resumed first reply, median | 65 ms | 54 ms | 1.2x |
+| simulated, lossy, fresh first reply, median | 875 ms | 975 ms | (in the gap between seeds that lose and those that do not) |
+| real sockets, fourth dial (resumed) first reply | 1,001.5–1,001.7 ms (fell back to 1-RTT) | 1.0–1.1 ms | ~1,000x |
+| real sockets, kept connection's burst, p99.9 / worst (path never measured) | 191–192 / 291–292 ms | 152–153 / 241 ms | 1.25x / 1.2x |
+| real sockets, resumed connection's burst after a measured connection, p99.9 / worst | 152–153 / 241–242 ms (Careful Resume off) | 8.9–24.7 / 20.5–64.1 ms | 6–17x / 4–12x |
+| simulated, clean, 1 MiB resumed transfer | 7,672 ms | 5,922 ms | 1.3x (1,750 ms) |
+
+```sh
+# Simulated (deterministic): the overhead, lossy and Careful Resume tables
+cargo test -p hyper-quic --test geo -- --ignored --nocapture --exact print_the_overhead_table
+cargo test -p hyper-quic --test geo -- --ignored --nocapture --exact print_the_lossy_overhead_table
+cargo test -p hyper-quic --test geo -- --ignored --nocapture --exact print_the_resume_table
+# Real sockets, each run between two `uptime`s, before (14aaea1) and after interleaved
+cargo build --release -p hyper-quic --example geo_open_loop
+target/release/examples/geo_open_loop --rate 100 --requests 20000 --dials 5
+target/release/examples/geo_open_loop --rate 100 --requests 20000 --dials 5 --warm-rate 400 --warm-requests 4000 [--no-careful-resume]
+```
+
+What is left of the 10x: the lossy medians sit at the cost of one recovered loss, a round trip,
+which no stack avoids; the lossy maxima are two or three losses on the critical path, each still a
+probe timeout of two smoothed RTTs early in a connection where the variation is still that of the
+first sample. A connection to a path with no earlier measurement starts at the initial window,
+RFC 9002's safety rule, so a kept connection whose earlier traffic never filled 15 kB a round trip
+still waits about 240 ms at the start of such a burst. The steady state's 1 to 2 ms is the host's.

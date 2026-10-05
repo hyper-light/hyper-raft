@@ -37,6 +37,32 @@ impl Seeded {
     }
 }
 
+/// Where a schedule's draws come from: a seed's SplitMix64 ([`Seeded`]), or a run's decision tape
+/// played back, mutated or shrunk (`hyper_check::strategy::tape`). Every draw is a word reduced to
+/// its bound by the high half of their product, so a tape's word is read as the seed's would be.
+pub trait Draws {
+    fn next(&mut self) -> u64;
+    fn below(&mut self, bound: u64) -> u64 {
+        ((u128::from(self.next()) * u128::from(bound)) >> 64) as u64
+    }
+    fn chance(&mut self, percent: u64) -> bool {
+        self.below(100) < percent
+    }
+    fn pick<T: Copy>(&mut self, from: &[T]) -> Option<T> {
+        if from.is_empty() {
+            None
+        } else {
+            Some(from[self.below(from.len() as u64) as usize])
+        }
+    }
+}
+
+impl Draws for Seeded {
+    fn next(&mut self) -> u64 {
+        Seeded::next(self)
+    }
+}
+
 pub fn sorted(mut state: ConfState) -> ConfState {
     state.voters.sort_unstable();
     state.learners.sort_unstable();
@@ -1150,6 +1176,7 @@ impl Old {
 // ---------------------------------------------------------------------
 // hyper-raft.
 
+#[derive(Clone)]
 pub struct New {
     pub raw: hyper_raft::RawNode<Store>,
     app: App,
@@ -1643,6 +1670,7 @@ impl Replica for Either {
 
 pub mod backlog;
 pub mod cluster;
+pub mod judge;
 pub mod lagged;
 pub mod timed;
 #[allow(unused_imports)]

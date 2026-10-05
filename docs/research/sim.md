@@ -421,3 +421,34 @@ about `2L / 2⁶⁴` (inference from the construction, not a statement of the so
 - **mantle `docs/research/06-consensus-and-metadata.md` B6 [via]**: madsim's `power_fail` and
   `sync_all` are no-ops; turmoil's durable-versus-pending file model is behind an unstable feature;
   stateright's linearizability tester has no memo. No outside crate gives what §4 above asks.
+- **slates `crates/cluster/tests/prefix_model.rs`, measured again here (S-5, 2026-10-04)**: its
+  representative of a class is not one key an orbit. An append that cuts a log leaves the cut
+  entries in the array past the log's length, and the signature that sorts members reads every
+  place of the array; a state with such a stale tail can sort its members apart from the same
+  state without one, and its orbit then takes a second key. Built again in hyper-check with the
+  tail cleared, the design reaches 21,771,580 classes at (3, 3, 1, 3) against slates' 21,776,022,
+  12,551,719 at (4, 2, 2, 3) against 12,559,351, and 3,400,472 at (3, 2, 2, 4) against 3,401,082;
+  with the tail kept as slates keeps it, every count is slates' exactly, and so is every path's
+  count where both run (the 49,654 recoveries from a log of the rejected variant that reports logs
+  too). The transitions are the same; only the keys differ. No verdict changes: the extra keys
+  re-visit states already visited. At (3, 3, 1, 2) no stale tail splits a class (1,951,672 both
+  ways). The slot model has no such field and reaches slates' counts exactly (463,715 and the rest).
+
+## 8. Sources S-5 adds
+
+Cited for the algorithms as their authors state them; not re-read for S-5.
+
+- **[PR] Zeller, Hildebrandt, "Simplifying and Isolating Failure-Inducing Input", IEEE TSE 28(2),
+  2002** (delta debugging, `ddmin`): a failing input reduced by removing subsets of a granularity
+  that is refined while no removal fails, ending in a 1-minimal input (no single element can be
+  removed with the test still failing). `hyper_check::strategy::tape::shrink` removes chunks of
+  steps, halving them, then single steps to a fixed point: the complement steps of `ddmin`.
+- **[PR] Knuth, *The Art of Computer Programming* Vol. 2, §3.4.2, Algorithm P** (the shuffle of
+  Fisher and Yates, as Durstenfeld gave it): each of the `n!` orders with equal probability from
+  `n − 1` uniform draws. `hyper_check::strategy::pct` draws PCT's first priorities by it.
+- **[PR] Lemire, "Fast Random Integer Generation in an Interval", ACM TOMACS 29(1), 2019**: the
+  high half of the product of a 64-bit word and a bound `b` maps a uniform word to `[0, b)` with
+  a bias below `b/2⁶⁴` without the rejection step. hyper-raft's schedule harness has always drawn
+  so (`support::Seeded::below`), and the decision tape reads its words the same way, so a tape
+  recorded from a seed replays the seed's run.
+

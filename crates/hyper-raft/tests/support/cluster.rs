@@ -12,9 +12,28 @@ use hyper_raft::proto::{
 };
 
 use super::{
-    Coverage, Disk, Fault, Output, ROUND_NS, Replica, SPAN_NS, Said, Seeded, Settings, Step, Store,
+    Coverage, Disk, Draws, Fault, Output, ROUND_NS, Replica, SPAN_NS, Said, Settings, Step, Store,
     TICK_NS, View, members, votes,
 };
+
+/// [`Draws`] as an object, for the closures `choose` and `change` share draws through.
+trait DrawsDyn {
+    fn pick_u64(&mut self, from: &[u64]) -> Option<u64>;
+    fn chance_dyn(&mut self, percent: u64) -> bool;
+    fn below_dyn(&mut self, bound: u64) -> u64;
+}
+
+impl<D: Draws> DrawsDyn for D {
+    fn pick_u64(&mut self, from: &[u64]) -> Option<u64> {
+        self.pick(from)
+    }
+    fn chance_dyn(&mut self, percent: u64) -> bool {
+        self.chance(percent)
+    }
+    fn below_dyn(&mut self, bound: u64) -> u64 {
+        self.below(bound)
+    }
+}
 
 /// The most messages the network holds; the oldest is lost for a new one.
 const NETWORK: usize = 2048;
@@ -148,11 +167,13 @@ impl<R> Observer<R> for () {}
 
 /// A member: running, and owning its disk, or stopped, and the cluster
 /// holds the disk until it opens again.
+#[derive(Clone)]
 pub enum Member<R> {
     Up(R),
     Down(Box<Store>),
 }
 
+#[derive(Clone)]
 pub struct Cluster<R> {
     members: Vec<Member<R>>,
     /// The members the group has, in and out of its configuration: what each states as the
@@ -656,7 +677,7 @@ impl<R: Replica> Cluster<R> {
         }
     }
 
-    fn change(&self, rng: &mut Seeded, leader: u64, mix: &Mix) -> ConfChangeV2 {
+    fn change(&self, rng: &mut impl Draws, leader: u64, mix: &Mix) -> ConfChangeV2 {
         let conf = self.disk(leader).conf.clone();
         let joint = !conf.voters_outgoing.is_empty();
         if joint && rng.chance(70) {
@@ -687,14 +708,14 @@ impl<R: Replica> Cluster<R> {
             .collect();
         let voters: Vec<u64> = conf.voters.iter().copied().filter(spared).collect();
         let inside: Vec<u64> = held.iter().copied().filter(spared).collect();
-        let one = |rng: &mut Seeded| -> Option<ConfChangeSingle> {
-            let (kind, member) = match rng.below(6) {
-                0 => (ConfChangeType::AddLearnerNode, rng.pick(&outside)?),
-                1 => (ConfChangeType::AddNode, rng.pick(&outside)?),
-                2 => (ConfChangeType::AddNode, rng.pick(&conf.learners)?),
-                3 => (ConfChangeType::RemoveNode, rng.pick(&inside)?),
-                4 => (ConfChangeType::AddLearnerNode, rng.pick(&voters)?),
-                _ => (ConfChangeType::RemoveNode, rng.pick(&conf.learners)?),
+        let one = |rng: &mut dyn DrawsDyn| -> Option<ConfChangeSingle> {
+            let (kind, member) = match rng.below_dyn(6) {
+                0 => (ConfChangeType::AddLearnerNode, rng.pick_u64(&outside)?),
+                1 => (ConfChangeType::AddNode, rng.pick_u64(&outside)?),
+                2 => (ConfChangeType::AddNode, rng.pick_u64(&conf.learners)?),
+                3 => (ConfChangeType::RemoveNode, rng.pick_u64(&inside)?),
+                4 => (ConfChangeType::AddLearnerNode, rng.pick_u64(&voters)?),
+                _ => (ConfChangeType::RemoveNode, rng.pick_u64(&conf.learners)?),
             };
             Some(ConfChangeSingle {
                 change_type: kind,
@@ -724,16 +745,16 @@ impl<R: Replica> Cluster<R> {
     }
 
     /// The next step of the schedule.
-    pub fn choose(&mut self, rng: &mut Seeded, mix: &Mix) -> Op {
+    pub fn choose(&mut self, rng: &mut impl Draws, mix: &Mix) -> Op {
         let up = self.up();
         let all = self.ids();
         let leaders = self.leaders_now();
-        let any = |rng: &mut Seeded| rng.pick(&up).unwrap_or(1);
+        let any = |rng: &mut dyn DrawsDyn| rng.pick_u64(&up).unwrap_or(1);
         // Where a leader is wanted and none is known, any member is asked:
         // what one that does not lead does with it is compared as well.
-        let leader = |rng: &mut Seeded| {
-            if rng.chance(90) {
-                rng.pick(&leaders).unwrap_or_else(|| any(rng))
+        let leader = |rng: &mut dyn DrawsDyn| {
+            if rng.chance_dyn(90) {
+                rng.pick_u64(&leaders).unwrap_or_else(|| any(rng))
             } else {
                 any(rng)
             }

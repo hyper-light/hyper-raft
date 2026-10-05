@@ -504,6 +504,7 @@ enum Campaign {
 
 /// One member: its term and vote, its role, its log and what it knows of
 /// the others.
+#[derive(Clone)]
 pub struct Raft<S> {
     /// The defect planted in this member, if any (`crate::mutant`).
     #[cfg(feature = "mutants")]
@@ -621,7 +622,7 @@ pub struct Raft<S> {
 /// messages may grow it by is known before they are sent
 /// ([`Outgoing::growth_of`]), and does not depend on what a library keeps
 /// as its own.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct Outgoing {
     msgs: Vec<Message>,
     payload: usize,

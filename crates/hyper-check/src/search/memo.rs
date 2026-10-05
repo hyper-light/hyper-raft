@@ -24,6 +24,7 @@ use std::collections::BTreeSet;
 use std::hash::{DefaultHasher, Hash, Hasher};
 
 use crate::model::Model;
+use crate::table::{LOAD_DENOMINATOR, LOAD_NUMERATOR, Probe, Slots, grow_by, low};
 
 /// The bytes the memory a search may hold, by default: GitHub's smallest runner (the macOS image,
 /// 7 GB) holds a search of 4 GiB beside the test binary and the runner's own processes, the
@@ -100,135 +101,6 @@ pub(crate) trait Memo<S> {
     fn fresh(&mut self, zobrist: u128, first: u32, state: &S) -> Result<bool, Spent>;
     /// Configurations held.
     fn held(&self) -> u64;
-}
-
-/// The bytes of `slots` slots of `width` bytes, or `None` past `usize`.
-fn bytes_of(slots: usize, width: usize) -> Option<usize> {
-    slots.checked_mul(width)
-}
-
-/// A table of slots, empty or full, over a capacity that is a power of two, growing by doubling
-/// within a budget of bytes that counts the old table and the new one together while it grows.
-struct Slots<T: Copy + PartialEq> {
-    slots: Vec<T>,
-    len: usize,
-    empty: T,
-    memory: usize,
-}
-
-/// The fill at which a table doubles, as a fraction: `LOAD_NUMERATOR / LOAD_DENOMINATOR`. Cited:
-/// linear probing at load α takes about `½(1 + 1/(1−α)²)` probes for an unsuccessful search
-/// (Knuth, TAOCP Vol. 3, §6.4), which every new configuration's insertion is: 8.5 at ¾, against
-/// 32.5 at ⅞ and 2.5 at ½. At ¾ a table is between ⅜ and ¾ full, so a configuration's 16 bytes cost
-/// 21⅓ to 42⅔ of table (`docs/sim.md` §14.3).
-const LOAD_NUMERATOR: usize = 3;
-/// See [`LOAD_NUMERATOR`].
-const LOAD_DENOMINATOR: usize = 4;
-
-impl<T: Copy + PartialEq> Slots<T> {
-    fn new(capacity: usize, empty: T, memory: usize) -> Result<Self, Spent> {
-        let capacity = capacity
-            .max(1)
-            .checked_next_power_of_two()
-            .ok_or(Spent::Memory)?;
-        let fits = bytes_of(capacity, size_of::<T>()).is_some_and(|bytes| bytes <= memory);
-        if !fits {
-            return Err(Spent::Budget { configurations: 0 });
-        }
-        let mut slots = Vec::new();
-        slots
-            .try_reserve_exact(capacity)
-            .map_err(|_| Spent::Memory)?;
-        slots.resize(capacity, empty);
-        Ok(Self {
-            slots,
-            len: 0,
-            empty,
-            memory,
-        })
-    }
-
-    fn mask(&self) -> usize {
-        self.slots.len().saturating_sub(1)
-    }
-
-    /// The slot `hash` probes to first, then each after it in turn, wrapping.
-    fn find(&self, hash: u64, mut same: impl FnMut(T) -> bool) -> Probe {
-        let mask = self.mask();
-        let mut at = usize::try_from(hash).unwrap_or(usize::MAX) & mask;
-        // A table is never full (it doubles at its load), so the probe meets an empty slot within
-        // its length.
-        for _ in 0..self.slots.len() {
-            match self.slots.get(at) {
-                Some(slot) if *slot == self.empty => return Probe::Empty(at),
-                Some(slot) if same(*slot) => return Probe::Found,
-                _ => at = at.wrapping_add(1) & mask,
-            }
-        }
-        Probe::Full
-    }
-
-    /// Whether one more fits before the table doubles.
-    fn has_room(&self) -> bool {
-        let after = self.len.saturating_add(1);
-        after.saturating_mul(LOAD_DENOMINATOR) <= self.slots.len().saturating_mul(LOAD_NUMERATOR)
-    }
-
-    /// The table doubled, its slots placed again by `hash`; refused when the old and the new
-    /// table would not fit the budget together.
-    fn double(&mut self, hash: impl Fn(T) -> u64) -> Result<(), Spent> {
-        let held = u64::try_from(self.len).unwrap_or(u64::MAX);
-        let spent = Spent::Budget {
-            configurations: held,
-        };
-        let capacity = self.slots.len().checked_mul(2).ok_or(spent)?;
-        let peak = capacity
-            .checked_add(self.slots.len())
-            .and_then(|slots| bytes_of(slots, size_of::<T>()))
-            .ok_or(spent)?;
-        if peak > self.memory {
-            return Err(spent);
-        }
-        let mut grown = Vec::new();
-        grown
-            .try_reserve_exact(capacity)
-            .map_err(|_| Spent::Memory)?;
-        grown.resize(capacity, self.empty);
-        let old = std::mem::replace(&mut self.slots, grown);
-        let mask = self.mask();
-        for slot in old.into_iter().filter(|slot| *slot != self.empty) {
-            let mut at = usize::try_from(hash(slot)).unwrap_or(usize::MAX) & mask;
-            while self.slots.get(at).is_some_and(|held| *held != self.empty) {
-                at = at.wrapping_add(1) & mask;
-            }
-            if let Some(free) = self.slots.get_mut(at) {
-                *free = slot;
-            }
-        }
-        Ok(())
-    }
-
-    fn put(&mut self, at: usize, value: T) {
-        if let Some(slot) = self.slots.get_mut(at) {
-            *slot = value;
-            self.len = self.len.saturating_add(1);
-        }
-    }
-
-    fn bytes(&self) -> usize {
-        bytes_of(self.slots.len(), size_of::<T>()).unwrap_or(usize::MAX)
-    }
-}
-
-enum Probe {
-    Empty(usize),
-    Found,
-    Full,
-}
-
-/// The low 64 bits of a fingerprint, which place it in a table: a fingerprint's bits are uniform.
-fn low(print: u128) -> u64 {
-    u64::try_from(print & u128::from(u64::MAX)).unwrap_or(0)
 }
 
 /// The fingerprint memo: a table of 128-bit fingerprints. Zero marks an empty slot, so a
@@ -384,33 +256,6 @@ impl<'m, M: Model> Whole<'m, M> {
             && held == Some(self.scratch.as_slice())
             && entry.state == *state
     }
-}
-
-/// `vec` given room for `more` elements of `width` bytes, doubling when it must, with `bytes` the
-/// bytes held before; the bytes held after, refused with `spent` when the old and new buffers
-/// would not fit `memory` together.
-fn grow_by<T>(
-    vec: &mut Vec<T>,
-    more: usize,
-    width: usize,
-    bytes: usize,
-    memory: usize,
-    spent: Spent,
-) -> Result<usize, Spent> {
-    let needed = vec.len().checked_add(more).ok_or(spent)?;
-    if needed <= vec.capacity() {
-        return Ok(bytes);
-    }
-    let capacity = needed.max(vec.capacity().saturating_mul(2)).max(4);
-    let old = bytes_of(vec.capacity(), width).ok_or(spent)?;
-    let new = bytes_of(capacity, width).ok_or(spent)?;
-    let peak = bytes.checked_add(new).ok_or(spent)?;
-    if peak > memory {
-        return Err(spent);
-    }
-    vec.try_reserve_exact(capacity.saturating_sub(vec.len()))
-        .map_err(|_| Spent::Memory)?;
-    Ok(bytes.saturating_sub(old).saturating_add(new))
 }
 
 impl<M: Model> Memo<M::State> for Whole<'_, M> {

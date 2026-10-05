@@ -82,6 +82,7 @@ impl Coverage {
 }
 
 /// One write a member issued.
+#[derive(Clone)]
 struct Write {
     number: u64,
     snapshot: Option<Snapshot>,
@@ -98,6 +99,7 @@ struct Write {
     vote: (u64, u64),
 }
 
+#[derive(Clone)]
 pub struct Lagged {
     pub node: New,
     depth: usize,

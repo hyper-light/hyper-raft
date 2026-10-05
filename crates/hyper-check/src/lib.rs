@@ -30,12 +30,16 @@
 )]
 
 pub mod agree;
+pub mod conform;
 pub mod coverage;
+pub mod explore;
 pub mod history;
 pub mod liveness;
 pub mod model;
 pub mod oracle;
 pub mod search;
+pub mod strategy;
+mod table;
 pub mod witness;
 
 pub use agree::{Agreed, Agreement, Disagreement, agree};

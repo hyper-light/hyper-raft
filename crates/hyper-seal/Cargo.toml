@@ -1,0 +1,23 @@
+[package]
+name = "hyper-seal"
+description = "Sealing at rest for mantle, focal and slates: a hierarchy of random keys wrapped with AES-256-KW, files sealed by STREAM, the shared log sealed record by record under a key per writer session, keys to another machine by ML-KEM-1024, names keyed per tenant"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[features]
+# AWS-LC's FIPS 140-3 module in place of the default build (docs/seal.md §9).
+fips = ["aws-lc-rs/fips"]
+
+[dependencies]
+aws-lc-rs = { version = "1.18", default-features = false, features = ["aws-lc-sys", "prebuilt-nasm"] }
+getrandom.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

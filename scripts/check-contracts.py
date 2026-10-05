@@ -39,6 +39,8 @@ UNSAFE_ALLOWED = {
         "K32GetProcessMemoryInfo through windows-sys: a process's account; measurement only",
     "crates/hyper-measure/src/wake.rs":
         "std::task::RawWaker over a leaked slot (counting wakers; tests and benchmarks only)",
+    "crates/hyper-seal/src/memory.rs":
+        "std::ptr::write_volatile over a key's own bytes (the wipe a dropped key gets, never elided)",
     "crates/hyper-block/src/node/macos.rs":
         "the disk ioctls of <sys/disk.h> (a device node's capacity and cache flush)",
     "crates/hyper-raft-e2e/src/fault_windows.rs":

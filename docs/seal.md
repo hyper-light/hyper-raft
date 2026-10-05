@@ -183,8 +183,10 @@ spliced with another file's segments fails to open (STREAM's nonce-based OAE sec
   offset follows from its plaintext offset, and a read opens only the segments its range covers.
 - **The file's header** carries the wrapped data key record (§3.3), the file ID, `S`, a version, and
   the key's commitment (§2).
-  It is authenticated: its bytes are the additional data of segment 0 alongside the file ID, so a
-  header altered to point at another key fails to open the first segment.
+  It is authenticated: every field but the key record is the additional data of segment 0 alongside
+  the file ID, and the key record's key is pinned by the commitment, so a header re-pointed at
+  another key fails its commitment and one with any other field changed fails segment 0. The key
+  record stays out of segment 0's additional data because a rotation rewrites it (§3.1).
 
 ## 5. Sealing an appended log
 
@@ -250,11 +252,20 @@ number of messages without a nonce, and a persist record is rewritten in its slo
 The tags and MACs bind every record to its place, not to its time. An adversary who can write the
 device can put back an older, validly sealed segment or persist record: a member then forgets a vote
 or an acknowledgement, which can lose an entry a quorum counted on. Detecting it needs state the
-adversary cannot roll back: a trusted monotonic counter, bound into the MAC of each persist record
-and advanced past it before the record's frame is acknowledged. `hyper-seal` binds one where the
-key source has one (`KeySource::monotonic`: a TPM NV counter, the Secure Enclave); without one,
-rollback at rest is a stated non-goal (§13). A rolled-back minority member is caught only partly by
-its peers (a later term it should have seen), never with certainty.
+adversary cannot roll back: a trusted monotonic counter (`KeySource::monotonic`: a TPM NV counter,
+the Secure Enclave). Such counters are slow (a TPM 2.0 NV increment takes milliseconds) and wear
+out at a vendor-specified endurance, which is why Memoir (Parno et al., IEEE S&P 2011) and ROTE
+(Matetic et al., USENIX Security 2017) exist; one advance per group commit would put milliseconds on
+every acknowledgement and exhaust the counter in days. So the counter is bound where a rollback
+breaks safety and changes are rare: **the hard state**. Before a term change or a cast vote is
+persisted and the vote answered, the counter is advanced and its value bound into that hard state's
+MAC; recovery refuses a hard state whose counter is behind the source's. That keeps Election Safety
+(no second vote in a term after a rollback) at a few advances an election. The bound is stated and
+checked at open: the measured election rate's advances an hour against the counter's specified
+endurance over the node's service life, refused at configuration when it does not fit. A rollback of
+entries (a member losing acknowledged entries) is caught only through the quorum, whose other
+members hold them, and is stated so; Memoir's approach can tighten it later. Without a counter,
+rollback at rest is a stated non-goal (§13).
 
 ## 6. A key to another machine
 

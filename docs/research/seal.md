@@ -107,3 +107,12 @@ server-side encryption; `31`, integrity).
 - **Chan, Rogaway**, "On Committing Authenticated-Encryption", ESORICS 2022: the CTX transform,
   committing to the key with a hash beside the ciphertext. `docs/seal.md` §2 commits with
   HMAC-SHA-256 under the data key, inside the FIPS boundary.
+
+## 11. Rollback and monotonic counters
+
+- **Parno, Lorch, Douceur, Mickens, McCune**, "Memoir: Practical State Continuity for Protected
+  Modules", IEEE S&P 2011: TPM NV counters are too slow and wear-limited to advance on every update.
+- **Matetic, Ahmed, Kostiainen, Dhar, Sommer, Gervais, Juels, Capkun**, "ROTE: Rollback Protection
+  for Trusted Execution", USENIX Security 2017: distributed rollback protection for the same reason.
+- TPM 2.0 NV counter increment latency and endurance: vendor-specified; measured or read from the
+  part's datasheet by the consumer that binds one (`docs/seal.md` §5.2).

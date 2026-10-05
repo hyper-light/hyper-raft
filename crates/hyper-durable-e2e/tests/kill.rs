@@ -374,7 +374,7 @@ impl Cluster {
                  suspected {:?} heard {:?} unjudged {} at up to {:?} taken {} restarts {}; \
                  detection {:?} span {:?} round {:?}; a write out {:?} all told, its oldest out \
                  {:?}, the longest write {:?}, the longest between two reads {:?}; stalled {} \
-                 marked {} deadline {}",
+                 marked {} deadline {}; its core suspects {:?}, campaign {}",
                 at.elapsed(),
                 s.term,
                 s.leads,
@@ -401,6 +401,8 @@ impl Cluster {
                 } else {
                     format!("in {:?}", Duration::from_nanos(r.deadline_ns))
                 },
+                r.core_suspected,
+                campaign(r.campaign, r.clock_ns),
             ));
         }
         out
@@ -1349,4 +1351,28 @@ fn main() -> ExitCode {
     }
     println!("all ok in {:?}", started.elapsed());
     ExitCode::SUCCESS
+}
+
+/// A member's campaign as its report states it (`hyper_raft::CampaignState`): when it is due from
+/// the report's clock, and what holds it.
+fn campaign(state: Option<hyper_raft::CampaignState>, clock_ns: u64) -> String {
+    let Some(state) = state else {
+        return "none".to_string();
+    };
+    let due = match state.due {
+        Some(at) if at >= clock_ns => format!("due in {:?}", Duration::from_nanos(at - clock_ns)),
+        Some(at) => format!("due {:?} ago", Duration::from_nanos(clock_ns - at)),
+        None => "untimed".to_string(),
+    };
+    format!(
+        "armed {} {due}, led {}, held {}, trusted quorum {}, may campaign {}, may lead {}, \
+         promotable {}",
+        state.armed,
+        state.led,
+        state.held,
+        state.trusted_quorum,
+        state.may_campaign,
+        state.may_lead,
+        state.promotable,
+    )
 }

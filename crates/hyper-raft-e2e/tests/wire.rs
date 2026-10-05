@@ -125,3 +125,52 @@ fn the_largest_datagram_is_what_the_socket_sends() {
         assert!(socket.send_to(&datagram[..largest + 1], to).is_err());
     }
 }
+
+/// A member's report reads back as written, its core's suspicions and campaign among it: what a
+/// failure's dump states of each member's elections.
+#[test]
+fn a_report_reads_back_with_its_core_state() {
+    use hyper_raft::CampaignState;
+    use hyper_raft_e2e::stream::{self, Report};
+    let mut buffer = Vec::new();
+    for campaign in [
+        None,
+        Some(CampaignState::default()),
+        Some(CampaignState {
+            due: Some(17),
+            armed: true,
+            led: true,
+            held: false,
+            trusted_quorum: true,
+            may_campaign: true,
+            may_lead: false,
+            promotable: true,
+        }),
+    ] {
+        let report = Report {
+            status: Status {
+                id: 2,
+                term: 3,
+                leads: false,
+                leader: 1,
+                commit: 9,
+                applied: 9,
+                last_index: 10,
+                digest: 11,
+            },
+            span_ns: 1,
+            round_ns: 2,
+            suspected: vec![1],
+            heard: vec![1, 3],
+            core_suspected: vec![1, 3],
+            clock_ns: 99,
+            campaign,
+            ..Report::default()
+        };
+        stream::put_report(&mut buffer, 5, &report);
+        assert!(wire::seal(&mut buffer, wire::MAX_DATAGRAM));
+        let (kind, body) = wire::open(&buffer).unwrap();
+        assert_eq!(kind, Kind::Response);
+        assert_eq!(stream::read_report(body, 3), Some((5, report)));
+    }
+}

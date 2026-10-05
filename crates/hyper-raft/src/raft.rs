@@ -445,6 +445,28 @@ pub struct FastStats {
     pub recovered: u64,
 }
 
+/// What decides a member's next campaign when it elects by suspicion ([`Raft::campaign_state`]),
+/// for its owner to report: a campaign that does not come is one of these.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CampaignState {
+    /// When the campaign is due on the owner's clock, nanoseconds, once timed.
+    pub due: Option<u64>,
+    /// Whether a campaign is armed at all, timed or not.
+    pub armed: bool,
+    /// Whether it led its current term and leads no more: it campaigns or hands over.
+    pub led: bool,
+    /// Whether the owner holds its campaigns.
+    pub held: bool,
+    /// Whether it and the members its core trusts are a quorum of each half of its configuration.
+    pub trusted_quorum: bool,
+    /// Whether its log lets it campaign (`may_campaign`) and lead (`may_lead`).
+    pub may_campaign: bool,
+    /// Whether it could lead a term it campaigned for.
+    pub may_lead: bool,
+    /// Whether it may campaign by its configuration (`Raft::promotable`).
+    pub promotable: bool,
+}
+
 /// What a member's log may lack: entries it acknowledged and lost at rest, through `index`, of
 /// terms up to `term` (`docs/durable.md` §5). It is what its store found when it opened:
 /// hyper-log's uncertainty mark, a lost last frame whose persist record survived (Protocol-Aware
@@ -2080,6 +2102,20 @@ impl<S: Storage> Raft<S> {
     /// The members the owner's detectors suspect, in order; none on ticks.
     pub fn suspected(&self) -> &[NodeId] {
         self.watch.as_ref().map_or(&[], |watch| watch.suspected())
+    }
+    /// What decides this member's next campaign by suspicion; none on ticks.
+    pub fn campaign_state(&self) -> Option<CampaignState> {
+        let watch = self.watch.as_ref()?;
+        Some(CampaignState {
+            due: Watch::due(watch.campaign),
+            armed: watch.campaign != Arm::Off,
+            led: watch.led == self.term && self.term != 0,
+            held: watch.held,
+            trusted_quorum: self.trusted_quorum(),
+            may_campaign: self.may_campaign(),
+            may_lead: self.may_lead(),
+            promotable: self.promotable(),
+        })
     }
     fn watch_mut(&mut self) -> Result<&mut Watch> {
         self.watch

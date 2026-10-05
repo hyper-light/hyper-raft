@@ -9,7 +9,7 @@
 use std::time::Duration;
 
 use hyper_liveness::{Change, Liveness, Output, PeerId};
-use hyper_raft::Timing;
+use hyper_raft::{CampaignState, Timing};
 use hyper_timing::{Ballot, Span};
 
 use crate::wire::{self, Kind, Reader, Status};
@@ -208,6 +208,48 @@ pub struct Report {
     pub suspected: Vec<u64>,
     /// The peers its stream has taken a heartbeat from.
     pub heard: Vec<u64>,
+    /// The peers its core suspects: what the stream told it, which the core acts on.
+    pub core_suspected: Vec<u64>,
+    /// Its clock when it reported, nanoseconds: what `campaign.due` is on.
+    pub clock_ns: u64,
+    /// What decides its next campaign by suspicion (`hyper_raft::Raft::campaign_state`).
+    pub campaign: Option<CampaignState>,
+}
+
+/// A campaign's state as two words: when it is due (`u64::MAX` for none) and its flags.
+pub fn campaign_words(campaign: Option<CampaignState>) -> [u64; 2] {
+    let Some(state) = campaign else {
+        return [u64::MAX, 0];
+    };
+    let flags = [
+        true,
+        state.armed,
+        state.led,
+        state.held,
+        state.trusted_quorum,
+        state.may_campaign,
+        state.may_lead,
+        state.promotable,
+    ]
+    .iter()
+    .enumerate()
+    .fold(0_u64, |flags, (bit, set)| flags | (u64::from(*set) << bit));
+    [state.due.unwrap_or(u64::MAX), flags]
+}
+
+/// The campaign state two words state ([`campaign_words`]).
+pub fn campaign_of([due, flags]: [u64; 2]) -> Option<CampaignState> {
+    let bit = |at: u32| flags.checked_shr(at).is_some_and(|word| word & 1 == 1);
+    bit(0).then(|| CampaignState {
+        due: (due != u64::MAX).then_some(due),
+        armed: bit(1),
+        led: bit(2),
+        held: bit(3),
+        trusted_quorum: bit(4),
+        may_campaign: bit(5),
+        may_lead: bit(6),
+        promotable: bit(7),
+    })
 }
 
 /// Puts a report as a response to `id`.
@@ -239,10 +281,14 @@ pub fn put_report(buffer: &mut Vec<u8>, id: u64, report: &Report) {
         report.waiting,
         report.stray,
         report.unread,
-    ] {
+        report.clock_ns,
+    ]
+    .into_iter()
+    .chain(campaign_words(report.campaign))
+    {
         wire::put_u64(buffer, word);
     }
-    for list in [&report.suspected, &report.heard] {
+    for list in [&report.suspected, &report.heard, &report.core_suspected] {
         wire::put_u64(buffer, u64::try_from(list.len()).unwrap_or(u64::MAX));
         for peer in list {
             wire::put_u64(buffer, *peer);
@@ -267,7 +313,7 @@ pub fn read_report(body: &[u8], max_peers: usize) -> Option<(u64, Report)> {
         last_index: reader.u64()?,
         digest: reader.u64()?,
     };
-    let mut words = [0u64; 14];
+    let mut words = [0u64; 17];
     for word in &mut words {
         *word = reader.u64()?;
     }
@@ -286,6 +332,9 @@ pub fn read_report(body: &[u8], max_peers: usize) -> Option<(u64, Report)> {
         waiting,
         stray,
         unread,
+        clock_ns,
+        due,
+        flags,
     ] = words;
     let mut list = || {
         let count = usize::try_from(reader.u64()?).ok()?;
@@ -298,6 +347,7 @@ pub fn read_report(body: &[u8], max_peers: usize) -> Option<(u64, Report)> {
     };
     let suspected = list()?;
     let heard = list()?;
+    let core_suspected = list()?;
     Some((
         id,
         Report {
@@ -318,6 +368,9 @@ pub fn read_report(body: &[u8], max_peers: usize) -> Option<(u64, Report)> {
             unread,
             suspected,
             heard,
+            core_suspected,
+            clock_ns,
+            campaign: campaign_of([due, flags]),
         },
     ))
 }

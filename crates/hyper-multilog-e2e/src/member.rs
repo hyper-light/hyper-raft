@@ -745,6 +745,16 @@ impl Member {
                     .report(peer)
                     .is_some_and(|pair| pair.taken > 0)
             }),
+            // The first log's core, whose timing the report states too
+            core_suspected: self
+                .multi
+                .node(0)
+                .map_or_else(Vec::new, |node| node.raft.suspected().to_vec()),
+            clock_ns: self.now(),
+            campaign: self
+                .multi
+                .node(0)
+                .and_then(|node| node.raft.campaign_state()),
         }
     }
 

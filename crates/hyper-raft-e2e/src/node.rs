@@ -736,6 +736,9 @@ impl Node {
                     .report(peer)
                     .is_some_and(|pair| pair.taken > 0)
             }),
+            core_suspected: self.raw.raft.suspected().to_vec(),
+            clock_ns: self.now(),
+            campaign: self.raw.raft.campaign_state(),
         }
     }
 

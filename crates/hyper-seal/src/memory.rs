@@ -21,8 +21,10 @@ use crate::SealError;
 /// Bytes of a key slot.
 const SLOT: usize = 32;
 
-/// The process's locked region, once [`lock_keys`] made it.
-static REGION: OnceLock<Region> = OnceLock::new();
+/// The process's locked region: made once, by the first [`lock_keys`], or the reason it could not
+/// be. Every other caller waits for that first one to finish, so no key is asked of a region still
+/// being made.
+static REGION: OnceLock<Result<Region, SealError>> = OnceLock::new();
 
 struct Region {
     /// The first byte, page-aligned; `len` bytes from here are locked and ours.
@@ -51,6 +53,20 @@ fn page_size() -> usize {
 /// OS will not lock (the process's locked-memory limit: `RLIMIT_MEMLOCK` on Unix, the minimum
 /// working set on Windows).
 pub fn lock_keys(count: usize) -> Result<(), SealError> {
+    let mut made = false;
+    let region = REGION.get_or_init(|| {
+        made = true;
+        make_region(count)
+    });
+    match (made, region) {
+        (true, Ok(_)) => Ok(()),
+        (true, Err(e)) => Err(*e),
+        (false, _) => Err(SealError::Capacity),
+    }
+}
+
+/// The region of `count` keys: allocated, locked and out of core dumps, or why not.
+fn make_region(count: usize) -> Result<Region, SealError> {
     if count == 0 {
         return Err(SealError::Capacity);
     }
@@ -64,21 +80,23 @@ pub fn lock_keys(count: usize) -> Result<(), SealError> {
     let region = allocate(len, page)?;
     let words = slots.div_ceil(64);
     let claimed: Box<[AtomicU64]> = (0..words).map(|_| AtomicU64::new(0)).collect();
-    let made = Region {
+    Ok(Region {
         base: region,
         slots,
         claimed,
         held: AtomicUsize::new(0),
-    };
-    REGION.set(made).map_err(|_| SealError::Capacity)
+    })
+}
+
+/// The region, once made.
+fn region() -> Option<&'static Region> {
+    REGION.get().and_then(|r| r.as_ref().ok())
 }
 
 /// The slots the region has, and how many keys hold one now: what a consumer checks after dropping
 /// every key on a suspend notification (§8), and what it sizes against.
 pub fn keys_held() -> Option<(usize, usize)> {
-    REGION
-        .get()
-        .map(|r| (r.slots, r.held.load(Ordering::Acquire)))
+    region().map(|r| (r.slots, r.held.load(Ordering::Acquire)))
 }
 
 /// Allocates `len` bytes aligned to `page`, zeroed, locked, and out of core dumps where the OS
@@ -129,7 +147,7 @@ impl Secret32 {
     pub(crate) fn zeroed() -> Result<Self, SealError> {
         #[cfg(test)]
         test_region();
-        let region = REGION.get().ok_or(SealError::Capacity)?;
+        let region = region().ok_or(SealError::Capacity)?;
         for (word_index, word) in region.claimed.iter().enumerate() {
             let mut bits = word.load(Ordering::Acquire);
             while bits != u64::MAX {
@@ -183,14 +201,14 @@ impl Secret32 {
     }
 
     fn ptr(&self) -> *mut u8 {
-        let base = REGION.get().map_or(0, |r| r.base);
+        let base = region().map_or(0, |r| r.base);
         base.wrapping_add(self.slot.wrapping_mul(SLOT)) as *mut u8
     }
 }
 
 impl Drop for Secret32 {
     fn drop(&mut self) {
-        if let Some(region) = REGION.get() {
+        if let Some(region) = region() {
             wipe_slot(region, self.slot);
             let word = self.slot / 64;
             let bit = 1u64 << (self.slot % 64);

@@ -7085,3 +7085,28 @@ test against a map (moved, cleared and early-ended deadlines), which catches a m
 unkeyed, a mutation the integration oracle did not see. A new test holds that an owner refused a
 write finishes on `Writable` alone; nothing tested `Writable` before, and a visit set that skipped
 such owners passed every other test.
+
+## hyper-quic at 500 ms one way: the copies' spacing learned per path (2026-10-05)
+
+`crates/hyper-quic/VENDORED.md` §15; research and the full table in
+`docs/research/burst-loss.md` §8. `print_the_burst_table`, 128 seeds, virtual time, exact.
+Load 7.5 to 9.7 while it ran (`uptime` before and after), machine as above. With two dials of
+256 KiB each way before the measured ones and Careful Resume off, first reply over its floor,
+p90 of the fresh dial / p90 of the resumed dial, ms:
+
+| condition | copies back to back | spaced 35 ms | spaced as learned |
+|---|---|---|---|
+| independent 5% | 734 / 150 | 986 / 266 | 1,032 / **122** |
+| bursts τ 35 ms | 1,917 / 165 | 3,200 / 235 | 3,200 / 235 |
+| bursts τ 78.7 ms | 2,891 / 2,628 | 1,089 / 272 | 1,089 / 272 |
+
+- Over 128 seeds with no dial before, the independent condition's p90s are 221 / 130 back to back
+  and 998 / 228 spaced. The 32 seeds of the earlier sections gave 136 / 108 and 317 / 235; the
+  fresh dial's distribution has a cliff at one probe timeout, and its p90 falls on either side of
+  it by the seeds drawn.
+- What learning did not reach: the fresh dial's p90 on independent loss. Its cliff after the
+  learning dials is common to every spacing.
+
+```sh
+cargo test --release -p hyper-quic --test geo -- --ignored --nocapture --exact print_the_burst_table
+```

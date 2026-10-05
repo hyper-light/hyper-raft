@@ -48,6 +48,9 @@ use cid_state::CidState;
 mod copies;
 use copies::copy_spacing;
 
+mod losses;
+pub(crate) use losses::{Ledger, LossFit, LossMemory};
+
 mod datagrams;
 use datagrams::DatagramState;
 pub use datagrams::{Datagrams, SendDatagramError};
@@ -195,6 +198,9 @@ pub struct Connection {
     resume: CarefulResume,
     /// When the last ack-eliciting 1-RTT packet arrived: the warm-up waits a round trip past it
     received_eliciting: Option<Instant>,
+    /// What the path's losses say of their bursts: the endpoint's memory of the remote when the
+    /// connection began, and what the connection counted since (`losses.rs`)
+    ledger: Ledger,
     /// Whether the spin bit is in use for this connection
     spin_enabled: bool,
     /// Outgoing spin bit state
@@ -302,6 +308,7 @@ impl Connection {
         rng_seed: [u8; 32],
         side_args: SideArgs,
         resume: CarefulResume,
+        losses: LossFit,
     ) -> Self {
         let pref_addr_cid = side_args.pref_addr_cid();
         let path_validated = side_args.path_validated();
@@ -357,6 +364,7 @@ impl Connection {
             endpoint_events: VecDeque::new(),
             resume,
             received_eliciting: None,
+            ledger: Ledger::new(losses),
             spin_enabled: config.allow_spin && rng.random_ratio(7, 8),
             spin: false,
             spaces: Spaces::new(initial_space, PacketSpace::new(now), PacketSpace::new(now)),
@@ -612,7 +620,11 @@ impl Connection {
         // before backoff. One spacing for every space, so the copies of a datagram's coalesced
         // packets go together as their originals did (the Data space's max_ack_delay would part
         // them)
-        let spacing = copy_spacing(self.config.handshake_copy_burst, self.path.rtt.probe_base());
+        let burst = self
+            .ledger
+            .tau()
+            .unwrap_or(self.config.handshake_copy_burst);
+        let spacing = copy_spacing(burst, self.path.rtt.probe_base());
         let mut waiting: Option<Instant> = None;
         for space in SpaceId::iter() {
             let keys = match space {
@@ -1945,6 +1957,9 @@ impl Connection {
         let mut newly_acked = ArrayRangeSet::new();
         for range in ack.iter() {
             self.packet_number_filter.check_ack(space, range.clone())?;
+            // A packet declared lost that the peer acknowledges was reordered, not lost
+            self.ledger
+                .acknowledged(space, *range.start(), *range.end());
             for (&pn, _) in self.spaces.get(space).sent_packets.range(range) {
                 newly_acked.insert_one(pn);
             }
@@ -1965,6 +1980,11 @@ impl Connection {
 
         if new_largest && ack_eliciting_acked {
             self.update_rtt(now, space, ack.delay);
+        }
+        if new_largest {
+            let delivered_sent = self.spaces.get(space).largest_acked_packet_sent;
+            self.ledger
+                .settle(space, delivered_sent, self.path.rtt.variation_bound());
         }
 
         // Must be called before crypto/pto_count are clobbered
@@ -2060,6 +2080,8 @@ impl Connection {
 
                 // Notify ack frequency that a packet was acked, because it might contain an ACK_FREQUENCY frame
                 self.ack_frequency.on_acked(packet);
+                self.ledger
+                    .delivered(space, packet, info.ack_eliciting && !info.handshake_flight);
 
                 self.on_packet_acked(now, info);
             }
@@ -2279,6 +2301,30 @@ impl Connection {
         self.set_loss_detection_timer(now);
     }
 
+    /// Hands a lost packet to the loss ledger, with its neighbour: the next ack-eliciting packet
+    /// its space sent, still in flight or acknowledged already. Only packets sent after the
+    /// handshake's flights count: those may go unacknowledged though they arrived (0-RTT refused,
+    /// keys a peer has not yet or no longer, RFC 9001 §4.9 and §4.6.2), which is no loss of the path.
+    fn count_lost(&mut self, pn_space: SpaceId, packet: u64, info: &SentPacket) {
+        if !info.ack_eliciting || info.handshake_flight {
+            return;
+        }
+        let next = info.next.map(|(next, sent)| {
+            let gap = sent.saturating_duration_since(info.time_sent);
+            let in_flight = self.spaces.get(pn_space).sent_packets.contains_key(&next);
+            (next, gap, in_flight)
+        });
+        self.ledger.lost(pn_space, packet, info.time_sent, next);
+    }
+
+    /// Tells the endpoint what the connection counted of its path's bursts since it last did
+    fn tell_losses(&mut self, now: Instant) {
+        if let Some(untold) = self.ledger.untold() {
+            self.endpoint_events
+                .push_back(EndpointEventInner::Losses(now, untold));
+        }
+    }
+
     fn detect_lost_packets(&mut self, now: Instant, pn_space: SpaceId, due_to_ack: bool) {
         // Loss is detected only against an acknowledged packet; with none there is none to find
         let Some(largest_acked_packet) = self.spaces.get(pn_space).largest_acked_packet else {
@@ -2307,6 +2353,7 @@ impl Connection {
             self.stats.path.lost_plpmtud_probes =
                 self.stats.path.lost_plpmtud_probes.saturating_add(1);
         }
+        self.tell_losses(now);
     }
 
     /// Finds the packets of `pn_space` now deemed lost, and arms its loss time for the rest
@@ -2428,6 +2475,7 @@ impl Connection {
             };
             self.qlog
                 .emit_packet_lost(packet, &info, loss_delay, pn_space, now, self.orig_rem_cid);
+            self.count_lost(pn_space, packet, &info);
             self.remove_in_flight(&info);
             for frame in info.stream_frames {
                 self.streams.retransmit(frame);

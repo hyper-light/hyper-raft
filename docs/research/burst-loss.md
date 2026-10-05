@@ -187,3 +187,95 @@ first flight, ten datagrams the window and the anti-amplification limit had let 
 copies then wait for the window, and the flight is recovered by probes of two datagrams with backoff.
 No copy can be sent past the window or the limit (RFC 9002 §7, RFC 9000 §8.1). The resumed maximum,
 3.2 s, is a seed whose 0-RTT request and its copy both met bursts.
+
+## 7. τ per path, learned from the connection's own losses (2026-10-05)
+
+The default τ of 35 ms costs a path whose losses are independent (§6). This section decides how a
+sender learns its path's τ, from what evidence, and how few losses suffice.
+
+**What a sender sees.** RFC 9002 declares each lost packet with its send time. For each lost
+ack-eliciting packet, take its *neighbour*: the next ack-eliciting packet its space sent, `gap`
+later. The neighbour's fate, lost or acknowledged, is one Bernoulli sample at `gap`. Under the
+chain of §2 it is lost with probability `r + (1 − r)·e^(−gap/τ)`; under independent loss, with
+`r`.
+
+**Three pitfalls, each measured on the geo harness before it was handled:**
+- *Spurious loss.* RFC 9002 declares a packet lost on reordering as well as on loss (§6.1). At
+  ±100 ms of jitter, most early declarations in the bursty runs were reordered packets whose
+  neighbours had arrived, and the first estimator took bursty paths for independent ones. The fix:
+  a packet declared lost counts only once a packet of the same space, sent more than the delay's
+  variation after it, is acknowledged while it is not. That is RACK's "a later send was delivered"
+  (RFC 8985 §6.2), with the window set to four mean deviations (RFC 6298 §2's `K`). One
+  acknowledged after its declaration counts as delivered.
+- *Unacknowledged but delivered.* Packets of the handshake's flights can arrive and never be
+  acknowledged: 0-RTT refused, keys not yet held or already discarded (RFC 9001 §4.6.2, §4.9).
+  More generally, "QUIC does not guarantee receipt of an acknowledgment for every packet that the
+  receiver processes" (RFC 9000 §13.2.3). Only packets sent after the handshake's flights count, and
+  only acknowledgements of the same space settle a loss.
+- *A model that is too sure.* The chain takes the neighbour's loss probability to 1 as the gap
+  closes, so one delivered neighbour beside a counted loss refutes bursts outright: one such
+  anomaly in 16 seeds flipped a bursty path to "independent". No trace measured 1. The highest
+  conditional loss measured at the shortest spacing is Bolot's 0.60 at 8 ms (Table 3), and the
+  model's probability is capped there.
+
+**The decision: Wald's sequential probability ratio test** (Wald, "Sequential Tests of
+Statistical Hypotheses", Ann. Math. Statist. 16(2), 1945). Three hypotheses are weighed:
+independent loss, τ = 35.0 ms and τ = 78.7 ms. Each neighbour adds its log-likelihood under each,
+with `r` taken by Laplace's rule of succession, `(lost + 1)/(fates + 2)`. A hypothesis replaces the
+configured 35 ms once it is `(1 − β)/α = 19` times as likely, with α = β = 0.05. Until then the
+configuration stands.
+
+**How few losses.**
+- At 5% loss, a neighbour sent with its lost packet (gap ≈ 0) and delivered weighs
+  `log2((1 − r)/(1 − 0.6)) ≈ 1.25` bits toward independence. Wald's ratio of 19 is 4.25 bits, so
+  four such pairs decide (`four_neighbours_sent_with_lost_packets_and_delivered_are_independent_loss`).
+- At a 100 ms gap the burst model's probability is `0.05 + 0.95·e^(−100/35) ≈ 0.10`, a pair weighs
+  `log2(0.95/0.90) ≈ 0.08` bits, and some fifty pairs are needed.
+- Neighbours lost together favour bursts, which the default already assumes.
+
+**Bolot's spacing dependence.** τ fitted at one spacing grows with the spacing (§3: 10.9 ms at
+8 ms, 78.7 ms at 200 ms). Evidence gathered at short gaps therefore says little about correlation
+at the copy's 117 ms, and it is never used to *shorten* the spacing below the default's bursts:
+the only hypotheses are independence, the default and the longest correlation measured. Short-gap
+evidence decides independence well. Telling 35 ms from 78.7 ms needs evidence at the long gaps,
+which a connection rarely has; in every run measured it left the default standing.
+
+**Memory.** An endpoint keeps the evidence per remote IP address (`LossMemory`), separately from
+Careful Resume's `CongestionMemory`, with the same bound and lifetime (256 addresses, one hour;
+`EndpointConfig::loss_memory`). Every connection to an address starts from the memory and adds to
+it, so evidence accumulates across connections. Each endpoint learns its own sending direction,
+which is the direction its copies travel.
+
+**The liveness stream.** hyper-liveness's per-pair heartbeats come at a fixed interval, Bolot's own
+probe design, but they do not fit the boundary yet. A receiver sees gaps in the heartbeats'
+sequence numbers, and a gap is either a loss or a slot the sender skipped while it was behind
+(`PairReport::skipped`, known only at the sender). A heartbeat would have to carry its sender's
+skipped count before the receiver could count losses. Even then, hyper-quic would take the
+resulting fit as a value its owner passes in, never a dependency. Not built: the change is to
+hyper-liveness's wire format, outside this step, and §8 shows the QUIC evidence alone suffices
+once a path has carried traffic.
+
+## 8. Measured (2026-10-05)
+
+`print_the_burst_table` over 128 seeds (32 left the p90 of a cliff-shaped distribution to chance).
+The "two dials before" rows run two dials of 256 KiB each way first, with Careful Resume off so
+only the copies' spacing differs between rows. First reply over its floor, p90 of the fresh dial /
+p90 of the resumed dial, ms:
+
+| condition | back to back | spaced 35 ms | spaced as learned |
+|---|---|---|---|
+| independent, no dial before: fresh / resumed | 221 / 130 | 998 / 228 | 998 / 228 (nothing to learn from) |
+| independent, two dials before: fresh / resumed | 734 / 150 | 986 / 266 | 1,032 / **122** |
+| bursts 35 ms, two dials before: fresh / resumed | 1,917 / 165 | 3,200 / 235 | 3,200 / 235 |
+| bursts 78.7 ms, two dials before: fresh / resumed | 2,891 / 2,628 | 1,089 / 272 | 1,089 / 272 |
+
+- **Independent loss, resumed dial:** learning takes the p90 from 266 to 122 ms, back to the
+  back-to-back copies' 150 ms. Both endpoints' evidence settled on independence in 12 of the 16
+  seeds examined, and one of the two in the other four.
+- **Independent loss, fresh dial:** no gain at p90. After the learning dials, every variant's fresh
+  dial (734 to 1,032 ms) sits at the one-probe-timeout cliff in a tenth of the seeds, so the cliff
+  sets the p90, not the spacing.
+- **Bursts:** the learned rows equal the 35 ms rows exactly. The evidence never left the default,
+  so learning costs nothing where losses come in bursts.
+- **Without a dial before**, nothing is learned, since handshake packets are not counted, and the
+  rows equal the 35 ms ones.

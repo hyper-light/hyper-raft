@@ -700,3 +700,27 @@ is upstream's threshold, inherited and uncited; only the "peer short of credit" 
 (RFC 9000 §4.6), and it reuses that line rather than adding one. Deriving the eighth is owed. Test:
 `freed_stream_credit_is_announced_when_the_peer_is_short_of_it` (its second half fails on
 upstream's rule; its first half holds the saving).
+
+## 17. The copies' spacing learned per path (2026-10-05)
+
+`docs/research/burst-loss.md` §7–§8. A connection weighs what its own losses say of the path's
+bursts (`connection/losses.rs`), and its endpoint keeps the evidence per remote IP address
+(`LossMemory`, `EndpointConfig::loss_memory`: 256 addresses for an hour, as Careful Resume's
+memory, and a structure of its own). Only once the evidence makes one hypothesis 19 times as likely
+as the configured 35 ms (Wald's ratio at errors of 5%) does it replace
+`TransportConfig::handshake_copy_burst`; independent loss sends the copies at once.
+
+- **The evidence.** Each lost ack-eliciting packet sent after the handshake's flights, with its
+  space's next ack-eliciting packet (`SentPacket::next`). It is counted once a packet of the same
+  space, sent more than four mean deviations of the delay later, is acknowledged while it is not;
+  one acknowledged after it was declared lost counts as delivered. At most ten wait to be counted
+  (the initial window's packets); past that the oldest is dropped uncounted.
+- **The bound on certainty.** A neighbour's loss is never taken as likelier than Bolot's 0.60 at
+  8 ms.
+
+Tests: `four_neighbours_sent_with_lost_packets_and_delivered_are_independent_loss`,
+`a_packet_acknowledged_after_its_loss_was_declared_is_delivered`,
+`a_loss_counts_once_a_later_send_arrives_and_its_neighbour_is_known`, and on the geo harness
+`a_path_learned_independent_sends_its_copies_at_once_and_one_bursty_spaces_them`. Over 128 seeds,
+two dials before, independent loss: the resumed first reply's p90 fell from 266 to 122 ms. Under
+bursts nothing changed.

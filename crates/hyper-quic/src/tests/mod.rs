@@ -691,6 +691,95 @@ fn zero_rtt_long_header_packets_fit_their_length_field() {
     assert_eq!(received, msg);
 }
 
+/// RFC 9001 §4.1.4 and §5.7: a server holds 0-RTT packets that arrive before the whole
+/// ClientHello and decrypts them once its keys come. The post-quantum ClientHello spans two Initial
+/// datagrams; with the first, the connection is made and the hello is not whole, and a datagram of
+/// 0-RTT data arriving then was dropped, its data going again a round trip later in 1-RTT.
+#[test]
+fn a_0rtt_packet_before_the_whole_client_hello_is_held_until_its_keys() {
+    let _guard = subscribe();
+    let mut pair = Pair::default();
+    pair.server.handle_incoming = Box::new(validate_incoming);
+    let config = pair.add_client_config(single_flights(client_config()));
+    let client_ch = pair.begin_connect_shared(config);
+    pair.drive();
+    pair.server.assert_accept();
+    pair.client
+        .connections
+        .get_mut(&client_ch)
+        .unwrap()
+        .close(pair.time, VarInt(0), [][..].into());
+    pair.drive();
+
+    pair.client.addr = pair.fresh_client_addr();
+    let client_ch = pair.begin_connect_shared(config);
+    assert!(pair.client_conn_mut(client_ch).has_0rtt());
+    let s = pair.client_streams(client_ch).open(Dir::Uni).unwrap();
+    // Enough 0-RTT data that a third datagram holds 0-RTT alone
+    let msg = vec![0x5a; 2_000];
+    pair.client_send(client_ch, s).write(&msg).unwrap();
+    pair.drive_client();
+    // The hello's first datagram, then the datagrams of 0-RTT alone, then the hello's rest
+    let zero_rtt = |datagram: &[u8]| {
+        datagram
+            .first()
+            .is_some_and(|b| b & 0x80 != 0 && (b >> 4) & 0x03 == 1)
+    };
+    let inbound: Vec<_> = pair.server.inbound.drain(..).collect();
+    assert!(!zero_rtt(&inbound[0].2) && !zero_rtt(&inbound[1].2));
+    assert!(
+        inbound[2..].iter().all(|d| zero_rtt(&d.2)),
+        "{}",
+        inbound.len()
+    );
+    pair.server.inbound.push_back(inbound[0].clone());
+    pair.server.inbound.extend(inbound[2..].iter().cloned());
+    pair.server.inbound.push_back(inbound[1].clone());
+    pair.drive();
+
+    assert!(pair.client_conn_mut(client_ch).accepted_0rtt());
+    let server_ch = pair.server.assert_accept();
+    let mut recv = pair.server_recv(server_ch, s);
+    let mut chunks = recv.read(true).unwrap();
+    let mut got = Vec::new();
+    while let Ok(Some(chunk)) = chunks.next(usize::MAX) {
+        got.extend_from_slice(&chunk.bytes);
+    }
+    let _ = chunks.finalize();
+    assert_eq!(got, msg);
+    assert_eq!(pair.client_conn_mut(client_ch).stats().path.lost_packets, 0);
+}
+
+/// RFC 9002 §7.8 grows only a window that is used. Messages offered faster than the initial
+/// window carries fill it for part of the first round trip; the acknowledgements of that round
+/// trip then come one at a time while the sender, its backlog gone, waits for its next message.
+/// The window counts as used through them, as Linux keeps it (`tcp_cwnd_validate`), so slow start
+/// grows it by all they acknowledge (RFC 9002 §7.3.1): upstream judged each acknowledgement by the
+/// last transmission, idle, and the window grew by a third as much.
+#[test]
+fn a_window_used_up_grows_by_all_the_round_trip_after_acknowledges() {
+    let _guard = subscribe();
+    let mut pair = Pair::default();
+    pair.latency = Duration::from_millis(50);
+    let (client_ch, _) = pair.connect();
+    pair.drive();
+    let initial = pair.client_conn_mut(client_ch).stats().path.cwnd;
+    let s = pair.client_streams(client_ch).open(Dir::Uni).unwrap();
+    // 150 bytes a millisecond: about 18 kB a round trip of 100 ms, past the initial window
+    for _ in 0..200 {
+        pair.client_send(client_ch, s).write(&[0x7a; 150]).unwrap();
+        pair.drive_client();
+        pair.drive_server();
+        pair.time += Duration::from_millis(1);
+    }
+    // The run is exact: from the 14,520-byte initial window (1,452-byte datagrams), the round trip
+    // after the window filled acknowledges 13,102 bytes; judged by the last transmission, the window
+    // grew by 4,002 of them, to 18,522.
+    let cwnd = pair.client_conn_mut(client_ch).stats().path.cwnd;
+    assert_eq!(initial, 14_520);
+    assert_eq!(cwnd, 27_622);
+}
+
 #[test]
 fn zero_rtt_happypath() {
     let _guard = subscribe();
@@ -908,7 +997,7 @@ fn test_zero_rtt_incoming_limit<F: FnOnce(&mut ServerConfig)>(configure_server: 
     let mut server_config = server_config_classical(None);
     configure_server(&mut server_config);
     let mut pair = Pair::new(EndpointConfig::default(), server_config);
-    let config = pair.add_client_config(client_config_classical(None));
+    let config = pair.add_client_config(single_flights(client_config_classical(None)));
 
     // Establish normal connection
     let client_ch = pair.begin_connect_shared(config);
@@ -2951,8 +3040,11 @@ fn server_can_send_3_inital_packets() {
     let _guard = subscribe();
 
     let (cert, key) = big_cert_and_key();
-    let server = server_config_classical(Some((cert.clone(), key)));
-    let client = client_config_classical(Some(vec![cert]));
+    let mut server = server_config_classical(Some((cert.clone(), key)));
+    let mut transport = TransportConfig::default();
+    transport.handshake_copies(false);
+    server.transport_config(transport);
+    let client = single_flights(client_config_classical(Some(vec![cert])));
     let mut pair = Pair::new(Default::default(), server);
 
     let client_ch = pair.begin_connect(client);
@@ -3882,7 +3974,7 @@ fn validate_then_reject_manually() {
     });
 
     // The server should now retry and reject incoming connections.
-    let client_ch = pair.begin_connect(client_config());
+    let client_ch = pair.begin_connect(single_flights(client_config()));
     pair.drive();
     pair.server.assert_no_accept();
     let client = pair.client.connections.get_mut(&client_ch).unwrap();

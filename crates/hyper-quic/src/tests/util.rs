@@ -671,6 +671,16 @@ pub(super) fn client_config_with_deterministic_pns() -> ClientConfig {
     cfg
 }
 
+/// `config` sending each packet of the handshake's flights once
+/// (`TransportConfig::handshake_copies` off): for tests of what one flight does on the wire, or of
+/// how many attempts a server sees
+pub(super) fn single_flights(mut config: ClientConfig) -> ClientConfig {
+    let mut transport = TransportConfig::default();
+    transport.handshake_copies(false);
+    config.transport = transport;
+    config
+}
+
 pub(super) fn client_config_with_certs(certs: Vec<CertificateDer<'static>>) -> ClientConfig {
     ClientConfig::new(Box::new(client_crypto_inner(Some(certs), None)))
 }

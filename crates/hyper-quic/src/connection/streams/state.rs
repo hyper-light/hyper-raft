@@ -812,11 +812,11 @@ impl StreamsState {
         if stream.is_reset() {
             return;
         }
-        if !stream.is_pending() {
-            self.pending.push_pending(frame.id, stream.priority);
+        let (id, was_pending) = (frame.id, stream.is_pending());
+        stream.retransmit(frame);
+        if !was_pending && stream.is_pending() {
+            self.pending.push_pending(id, stream.priority);
         }
-        stream.fin_pending |= frame.fin;
-        stream.pending.retransmit(frame.offsets);
     }
 
     pub(crate) fn retransmit_all_for_0rtt(&mut self) {

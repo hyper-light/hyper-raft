@@ -38,9 +38,14 @@ fn post_quantum_key_exchange_is_negotiated() {
 fn the_default_client_hello_spans_two_initial_datagrams() {
     let _guard = subscribe();
     let mut pair = Pair::default();
-    pair.begin_connect(client_config());
+    pair.begin_connect(single_flights(client_config()));
     pair.drive_client();
     assert_eq!(pair.server.inbound.len(), 2);
+    // By default each goes twice (`TransportConfig::handshake_copies`)
+    let mut pair = Pair::default();
+    pair.begin_connect(client_config());
+    pair.drive_client();
+    assert_eq!(pair.server.inbound.len(), 4);
 }
 
 /// Upstream surfaced the first flight's second datagram, arriving after the server answered the
@@ -63,7 +68,7 @@ fn a_retried_attempt_surfaces_once() {
             }
         }
     });
-    let client_ch = pair.begin_connect(client_config());
+    let client_ch = pair.begin_connect(single_flights(client_config()));
     pair.drive();
     let server_ch = pair.server.assert_accept();
     assert_matches!(
@@ -95,7 +100,7 @@ fn a_retried_attempt_surfaces_once() {
 fn a_client_hello_out_of_order_surfaces_once_without_a_probe() {
     let _guard = subscribe();
     let mut pair = Pair::default();
-    let client_ch = pair.begin_connect(client_config());
+    let client_ch = pair.begin_connect(single_flights(client_config()));
     pair.drive_client();
     assert_eq!(pair.server.inbound.len(), 2);
     pair.server.inbound.swap(0, 1);
@@ -165,7 +170,7 @@ fn the_first_flight_fills_but_never_exceeds_three_times_what_arrived() {
     let _guard = subscribe();
     let (cert, key) = incompressible_cert_and_key();
     let server = server_config_with_cert(cert.clone(), key);
-    let client = client_config_with_certs(vec![cert]);
+    let client = single_flights(client_config_with_certs(vec![cert]));
     let mut pair = Pair::new(Default::default(), server);
 
     pair.begin_connect(client);

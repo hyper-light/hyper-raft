@@ -163,7 +163,7 @@ pub struct Connection {
     state: State,
     side: ConnectionSide,
     /// Whether or not 0-RTT was enabled during the handshake. Does not imply acceptance.
-    zero_rtt_enabled: bool,
+    pub(super) zero_rtt_enabled: bool,
     /// Set if 0-RTT is supported, then cleared when no longer needed.
     zero_rtt_crypto: Option<ZeroRttCrypto>,
     key_phase: bool,
@@ -257,6 +257,13 @@ pub struct Connection {
     /// Whether the last `poll_transmit` call yielded no data because there was
     /// no outgoing application data.
     app_limited: bool,
+    /// Whether the datagram being written holds an Initial or Handshake packet
+    pub(super) handshake_datagram: bool,
+
+    /// When the congestion window or the pacer last held a datagram back, the Data space's next
+    /// packet number then: the window counts as used until a packet sent after that is
+    /// acknowledged ([`Connection::window_limited`])
+    limited_through: Option<u64>,
 
     streams: StreamsState,
     /// Surplus remote CIDs for future use on new paths
@@ -379,6 +386,9 @@ impl Connection {
             recovery_packet: false,
 
             app_limited: false,
+            limited_through: None,
+            handshake_datagram: false,
+
             receiving_ecn: false,
             total_authed_packets: 0,
 
@@ -526,6 +536,7 @@ impl Connection {
                 .get_mut(space)
                 .maybe_queue_probe(request_immediate_ack, &mut self.streams);
         }
+        self.queue_copies();
 
         let close = self.close_pending()?;
         self.queue_ack_frequency();
@@ -547,8 +558,7 @@ impl Connection {
             return early;
         }
         self.finish_last_packet(now, buf, &mut tx);
-
-        self.app_limited = buf.is_empty() && !tx.congestion_blocked;
+        self.after_fill(buf.is_empty(), tx.congestion_blocked);
 
         // Send MTU probe if necessary
         if buf.is_empty() && self.state.is_established() {
@@ -585,6 +595,42 @@ impl Connection {
             },
             src_ip: self.local_ip,
         })
+    }
+
+    /// Queues copies of the handshake's flights ([`PacketSpace::queue_copies`]) in each space
+    /// with keys to send them, when the configuration asks for them
+    /// ([`TransportConfig::handshake_copies`])
+    fn queue_copies(&mut self) {
+        if !self.config.handshake_copies {
+            return;
+        }
+        for space in SpaceId::iter() {
+            let keys = match space {
+                SpaceId::Data => {
+                    self.zero_rtt_crypto.is_some() || self.spaces.get(space).crypto.is_some()
+                }
+                _ => self.spaces.get(space).crypto.is_some(),
+            };
+            if keys {
+                self.spaces.get_mut(space).queue_copies(&mut self.streams);
+            }
+        }
+    }
+
+    /// What a transmission leaves: a space whose copies are all sent sends originals again, and
+    /// whether the sender was limited by the application or by the window or the pacer
+    /// ([`Connection::window_limited`])
+    fn after_fill(&mut self, nothing_sent: bool, congestion_blocked: bool) {
+        for space in SpaceId::iter() {
+            let space = self.spaces.get_mut(space);
+            if space.pending.is_empty(&self.streams) {
+                space.sending_copies = false;
+            }
+        }
+        self.app_limited = nothing_sent && !congestion_blocked;
+        if congestion_blocked {
+            self.limited_through = Some(self.spaces.get(SpaceId::Data).next_packet_number);
+        }
     }
 
     /// Whether a close message is to be sent; `None` when nothing at all is to be sent
@@ -741,6 +787,7 @@ impl Connection {
             return Fill::Return(None);
         };
         tx.coalesce = tx.coalesce && !builder.short_header;
+        self.handshake_datagram |= space_id != SpaceId::Data;
         let (max_size, exact_number) = (builder.max_size, builder.exact_number);
         tx.builder = Some(builder);
 
@@ -1019,6 +1066,7 @@ impl Connection {
             }
         };
         let next_datagram_size_limit = cmp::min(next_datagram_size_limit, room);
+        self.handshake_datagram = false;
         // In-memory: at most `max_datagrams` segments
         tx.buf_capacity = tx.buf_capacity.saturating_add(next_datagram_size_limit);
         if buf.capacity() < tx.buf_capacity {
@@ -1751,7 +1799,7 @@ impl Connection {
         self.path.congestion.on_end_acks(
             now,
             self.path.in_flight.bytes,
-            self.app_limited,
+            !self.window_limited(),
             self.spaces.get(space).largest_acked_packet,
         );
 
@@ -1938,7 +1986,7 @@ impl Connection {
                 now,
                 info.time_sent,
                 info.size.into(),
-                self.app_limited,
+                !self.window_limited(),
                 &self.path.rtt,
             );
         }
@@ -2298,6 +2346,30 @@ impl Connection {
             }
         }
         result
+    }
+
+    /// Whether the congestion window counts as used for the acknowledgements being taken: the
+    /// sender had more to send at its last transmission, or the window or the pacer held a
+    /// datagram back within the last round trip, until a packet sent after that is acknowledged
+    ///
+    /// RFC 9002 §7.8 lets the window grow only while it is used ("When bytes in flight is smaller
+    /// than the congestion window and sending is not pacing limited, the congestion window is
+    /// underutilized"). Upstream judged by the last transmission alone: a sender whose window
+    /// filled, then sent what it held as acknowledgements freed room and went idle until its next
+    /// message, counted every later acknowledgement as of an unused window. A connection at the
+    /// initial window carrying 100 requests a second over a 1 s round trip filled it for 170 ms,
+    /// and its window grew 1.8 kB in the round trip after, where slow start grows it by what is
+    /// acknowledged: the stall came again each round trip. Linux keeps a window limited for the
+    /// data in flight when the limit was met (`tcp_cwnd_validate` sets `is_cwnd_limited` until
+    /// `snd_una` passes `max_packets_seq`, net/ipv4/tcp_output.c), which this follows.
+    fn window_limited(&self) -> bool {
+        !self.app_limited
+            || self.limited_through.is_some_and(|through| {
+                self.spaces
+                    .get(SpaceId::Data)
+                    .largest_acked_packet
+                    .is_none_or(|acked| acked < through)
+            })
     }
 
     fn peer_completed_address_validation(&self) -> bool {
@@ -2767,45 +2839,73 @@ impl Connection {
         }
     }
 
-    /// Whether a packet of `space` is to be held until its keys arrive: a Handshake or 1-RTT
-    /// packet while handshaking, with no keys for its space yet and room in the bound. An Initial
-    /// packet with no keys is one whose keys were discarded, and 0-RTT keys are the server's to
-    /// have at the ClientHello, so neither is held.
+    /// Whether a packet of `space` is to be held until its keys arrive: while handshaking, with
+    /// room in the bound, a Handshake or 1-RTT packet with no keys for its space yet, or at a
+    /// server a 0-RTT packet that came before the ClientHello was whole (RFC 9001 §4.1.4: an
+    /// endpoint "SHOULD buffer received packets if they might be processed using keys that are not
+    /// yet available"; §5.7: a server "MAY retain these packets for later decryption in anticipation
+    /// of receiving a ClientHello"). A ClientHello in two datagrams whose second, with the 0-RTT
+    /// packet coalesced, arrives first makes the connection from what of the hello has come; the
+    /// 0-RTT keys come only with the rest, and the request in the 0-RTT packet was dropped and
+    /// went again a round trip later. An Initial packet with no keys is one whose keys were
+    /// discarded, so it is not held.
     fn hold_undecryptable(&self, remote: SocketAddr, partial_decode: &PartialDecode) -> bool {
         let Some(space) = partial_decode.space() else {
             return false;
         };
+        let awaits_keys = if partial_decode.is_0rtt() {
+            self.awaits_0rtt_keys()
+        } else {
+            space != SpaceId::Initial && self.spaces.get(space).crypto.is_none()
+        };
         self.is_handshaking()
             && remote == self.path.remote
-            && !partial_decode.is_0rtt()
-            && space != SpaceId::Initial
-            && self.spaces.get(space).crypto.is_none()
+            && awaits_keys
             && self
                 .undecryptable_bytes
                 .checked_add(partial_decode.len())
                 .is_some_and(|total| total <= self.config.crypto_buffer_size)
     }
 
+    /// Whether 0-RTT keys may still come: at a server that has no 0-RTT keys and has not yet read
+    /// the whole ClientHello, which brings the Handshake keys and the decision on 0-RTT
+    fn awaits_0rtt_keys(&self) -> bool {
+        self.side.is_server()
+            && self.zero_rtt_crypto.is_none()
+            && self.spaces.get(SpaceId::Handshake).crypto.is_none()
+    }
+
+    /// Whether a held packet's keys have arrived
+    fn keys_ready(&self, partial_decode: &PartialDecode) -> bool {
+        if partial_decode.is_0rtt() {
+            return self.zero_rtt_crypto.is_some();
+        }
+        partial_decode
+            .space()
+            .is_some_and(|space| self.spaces.get(space).crypto.is_some())
+    }
+
     /// Decrypts the held packets whose keys have arrived, in the order they arrived; a packet
     /// decrypted can bring keys for others, so passes repeat while one makes progress, at most
     /// once a held packet. Once the handshake is over no keys are still to come, and what is held
-    /// is dropped.
+    /// is dropped; so are 0-RTT packets once the ClientHello is read without 0-RTT keys (0-RTT
+    /// refused).
     fn replay_undecryptable(&mut self, configs: &mut Configs, now: Instant) {
         for _ in 0..self.undecryptable.len() {
             let held = mem::take(&mut self.undecryptable);
             let before = held.len();
             for (remote, ecn, partial_decode) in held {
-                let ready = partial_decode
-                    .space()
-                    .is_some_and(|space| self.spaces.get(space).crypto.is_some());
-                if ready || !self.is_handshaking() {
+                let ready = self.keys_ready(&partial_decode);
+                let still =
+                    self.is_handshaking() && (!partial_decode.is_0rtt() || self.awaits_0rtt_keys());
+                if ready || !still {
                     self.undecryptable_bytes = self
                         .undecryptable_bytes
                         .saturating_sub(partial_decode.len());
                 }
                 if ready {
                     self.handle_decode(configs, now, remote, ecn, partial_decode);
-                } else if self.is_handshaking() {
+                } else if still {
                     self.undecryptable.push_back((remote, ecn, partial_decode));
                 }
             }

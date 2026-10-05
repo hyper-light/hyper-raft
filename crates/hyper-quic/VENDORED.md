@@ -576,3 +576,45 @@ is sent on the new path it reaches `debug_assert!(!self.peer_completed_address_v
 timer, so the upstream side now runs in that order (`Quic::TRANSMIT_BEFORE_TIMERS`), its asserts on.
 hyper-quic re-arms the timer in `migrate` (17c9964, `a_rebinding_leaves_no_stale_probe_timeout`), and
 its side keeps the harder order.
+
+## 13. The handshake's flights twice, and three defects at 500 ms one way (2026-10-05)
+
+Measured at 500 ms one way (`docs/benchmarks.md`, "hyper-quic at 500 ms one way: the handshake's
+flights twice"; sources in `docs/research/quic-overhead.md` §4). Each change has a test that failed
+before it.
+
+1. **The handshake's flights go twice** (`TransportConfig::handshake_copies`, on by default;
+   `PacketSpace::queue_copies`). Every Initial and Handshake packet, the 0-RTT and 0.5-RTT data sent
+   while the handshake runs, and on a connection without 0-RTT the data beside the client's Finished
+   are copied once, in packets of their own numbers, when their space has nothing new to send, under
+   the congestion window, pacing and the anti-amplification limit. A lost original is still declared
+   lost and answered (RFC 9265). On the lossy condition the first reply's p90 fell from 1,899 to
+   180 ms fresh and from 1,177 to 124 ms resumed, for 73% more bytes there
+   (`a_lost_first_datagram_costs_no_probe_timeout_with_its_copy`; the probe-schedule tests run with
+   single flights through `Scenario::copies`, and the unit tests of one flight's wire layout or of
+   Retry's attempts through `single_flights`).
+2. **Acknowledged stream data is never sent again** (`SendBuffer::retransmit`, `Send::retransmit`).
+   A range acknowledged through one packet that carried it is not queued for another's loss, and a
+   queued retransmission whose range is then acknowledged is dropped; a FIN acknowledged is not sent
+   again (`acknowledged_data_is_never_sent_again`). Upstream re-sent such ranges whenever a probe's
+   copy and the original were both in flight.
+3. **0-RTT packets that arrive before the whole ClientHello are held** (`hold_undecryptable`,
+   `awaits_0rtt_keys`): RFC 9001 §4.1.4 ("SHOULD buffer received packets if they might be processed
+   using keys that are not yet available") and §5.7. Upstream dropped them, and the request went
+   again a round trip later in 1-RTT
+   (`a_0rtt_packet_before_the_whole_client_hello_is_held_until_its_keys`).
+4. **The window counts as used for the round trip after it blocked** (`Connection::window_limited`).
+   RFC 9002 §7.8 grows only a used window; upstream judged each acknowledgement by its last
+   transmission alone, so a sender that filled its window, emptied its backlog and went idle took the
+   rest of that round trip's acknowledgements for an unused window, and the stall came again each
+   round trip. As Linux's `tcp_cwnd_validate`, the window counts as used until a packet sent after
+   the block is acknowledged (`a_window_used_up_grows_by_all_the_round_trip_after_acknowledges`).
+5. **The initial window follows the datagram size** (`congestion::initial_window`; NewReno and
+   CUBIC). RFC 9002 §7.2: "If the maximum datagram size changes during the connection, the initial
+   congestion window SHOULD be recalculated with the new size." A window still at the initial one
+   with no congestion met becomes the new initial window; a configured initial window stays fixed
+   (`the_initial_window_follows_the_datagram_size_until_the_window_moves`).
+
+The geo harness's certificate is the same every run (an Ed25519 key from a fixed seed, a fixed
+serial): rustls compresses certificates (RFC 8879), and a random key and serial moved the server's
+flight by bytes run to run, and with it every later datagram's draw from the network.

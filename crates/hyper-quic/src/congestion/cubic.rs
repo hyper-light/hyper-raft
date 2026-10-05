@@ -1,7 +1,7 @@
 use std::any::Any;
 use std::cmp;
 
-use super::{BASE_DATAGRAM_SIZE, Controller};
+use super::{Controller, initial_window};
 use crate::connection::RttEstimator;
 use crate::{Duration, Instant, float};
 
@@ -76,7 +76,9 @@ impl Cubic {
     /// Construct a state using the given `config` and current time `now`
     pub fn new(config: CubicConfig, _now: Instant, current_mtu: u16) -> Self {
         Self {
-            window: config.initial_window,
+            window: config
+                .initial_window
+                .unwrap_or_else(|| initial_window(current_mtu.into())),
             ssthresh: u64::MAX,
             recovery_start_time: None,
             config,
@@ -225,8 +227,16 @@ impl Controller for Cubic {
         }
     }
 
+    /// RFC 9002 §7.2: "If the maximum datagram size changes during the connection, the initial
+    /// congestion window SHOULD be recalculated with the new size." A window still at the initial
+    /// one, with no congestion met (the slow-start threshold unset), becomes the new initial window;
+    /// one slow start or a congestion response has moved is the controller's own.
     fn on_mtu_update(&mut self, new_mtu: u16) {
+        let before = self.initial_window();
         self.current_mtu = new_mtu as u64;
+        if self.window == before && self.ssthresh == u64::MAX {
+            self.window = self.initial_window();
+        }
         self.window = self.window.max(self.minimum_window());
     }
 
@@ -256,7 +266,9 @@ impl Controller for Cubic {
     }
 
     fn initial_window(&self) -> u64 {
-        self.config.initial_window
+        self.config
+            .initial_window
+            .unwrap_or_else(|| initial_window(self.current_mtu))
     }
 
     fn into_any(self: Box<Self>) -> Box<dyn Any> {
@@ -265,32 +277,42 @@ impl Controller for Cubic {
 }
 
 /// Configuration for the `Cubic` congestion controller
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct CubicConfig {
-    initial_window: u64,
+    /// `None`: RFC 9002 §7.2's, by the path's datagram size
+    initial_window: Option<u64>,
 }
 
 impl CubicConfig {
-    /// Default limit on the amount of outstanding data in bytes.
+    /// Limit on the amount of outstanding data in bytes before any is acknowledged
     ///
-    /// Recommended value: `min(10 * max_datagram_size, max(2 * max_datagram_size, 14720))`
+    /// By default RFC 9002 §7.2's, `min(10 * max_datagram_size, max(2 * max_datagram_size, 14720))`,
+    /// recalculated as the path's datagram size changes; a value set here is fixed.
     pub fn initial_window(&mut self, value: u64) -> &mut Self {
-        self.initial_window = value;
+        self.initial_window = Some(value);
         self
-    }
-}
-
-impl Default for CubicConfig {
-    fn default() -> Self {
-        Self {
-            initial_window: 14720.clamp(2 * BASE_DATAGRAM_SIZE, 10 * BASE_DATAGRAM_SIZE),
-        }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::super::BASE_DATAGRAM_SIZE;
     use super::*;
+
+    #[test]
+    fn the_initial_window_follows_the_datagram_size_until_the_window_moves() {
+        let now = Instant::now();
+        let mut cubic = Cubic::new(CubicConfig::default(), now, BASE_DATAGRAM_SIZE as u16);
+        assert_eq!(cubic.window(), 12_000);
+        cubic.on_mtu_update(1_452);
+        assert_eq!(cubic.window(), 14_520);
+        // After congestion the window is the controller's own
+        let later = now + std::time::Duration::from_millis(10);
+        cubic.on_congestion_event(later, later, false, 1_452);
+        let after = cubic.window();
+        cubic.on_mtu_update(9_000);
+        assert_eq!(cubic.window(), after.max(2 * 9_000));
+    }
 
     #[test]
     fn fast_convergence_reduces_w_max_without_double_reducing_window() {

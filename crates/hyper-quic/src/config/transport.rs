@@ -34,6 +34,7 @@ pub struct TransportConfig {
     pub(crate) min_mtu: u16,
     pub(crate) mtu_discovery_config: Option<MtuDiscoveryConfig>,
     pub(crate) pad_to_mtu: bool,
+    pub(crate) handshake_copies: bool,
     pub(crate) ack_frequency_config: Option<AckFrequencyConfig>,
 
     pub(crate) persistent_congestion_threshold: u32,
@@ -228,6 +229,21 @@ impl TransportConfig {
         self
     }
 
+    /// Send each packet of the handshake's flights twice, the second in a packet of its own
+    ///
+    /// Enabled by default. The flights are every Initial and Handshake packet, the 0-RTT and
+    /// 0.5-RTT data sent while the handshake runs, and on a connection without 0-RTT the data
+    /// beside the client's Finished; each is copied once its space has nothing new to send, under
+    /// the congestion window, pacing and the anti-amplification limit. A lost original is still
+    /// declared lost and answered as congestion (RFC 9265). Before any RTT sample a lost first
+    /// flight waits out a probe timeout from RFC 9002's kInitialRtt, about a second on any path,
+    /// and later a lost handshake packet a probe timeout of two smoothed RTTs or more; the copy
+    /// takes its place at the cost of the handshake's bytes once more (`docs/benchmarks.md`).
+    pub fn handshake_copies(&mut self, value: bool) -> &mut Self {
+        self.handshake_copies = value;
+        self
+    }
+
     /// Specifies the ACK frequency config (see [`AckFrequencyConfig`] for details)
     ///
     /// The provided configuration will be ignored if the peer does not support the acknowledgement
@@ -367,6 +383,7 @@ impl Default for TransportConfig {
             min_mtu: INITIAL_MTU,
             mtu_discovery_config: Some(MtuDiscoveryConfig::default()),
             pad_to_mtu: false,
+            handshake_copies: true,
             ack_frequency_config: None,
 
             persistent_congestion_threshold: 3,
@@ -402,6 +419,7 @@ impl fmt::Debug for TransportConfig {
             min_mtu,
             mtu_discovery_config,
             pad_to_mtu,
+            handshake_copies,
             ack_frequency_config,
             persistent_congestion_threshold,
             keep_alive_interval,
@@ -430,6 +448,7 @@ impl fmt::Debug for TransportConfig {
             .field("min_mtu", min_mtu)
             .field("mtu_discovery_config", mtu_discovery_config)
             .field("pad_to_mtu", pad_to_mtu)
+            .field("handshake_copies", handshake_copies)
             .field("ack_frequency_config", ack_frequency_config)
             .field(
                 "persistent_congestion_threshold",

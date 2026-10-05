@@ -134,7 +134,7 @@ fn retry_then_use_token() {
 fn use_token_then_retry() {
     let _guard = subscribe();
     let mut pair = Pair::default();
-    let client_config = pair.add_client_config(client_config());
+    let client_config = pair.add_client_config(single_flights(client_config()));
     let (client_ch, _server_ch) = pair.connect_with_shared(client_config);
     pair.client
         .connections

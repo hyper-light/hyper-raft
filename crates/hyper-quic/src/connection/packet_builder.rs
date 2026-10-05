@@ -216,6 +216,13 @@ impl PacketBuilder {
             false => 0,
         };
 
+        // Of the handshake's flights: an Initial or Handshake packet, one sent while this endpoint
+        // handshakes (0-RTT and 0.5-RTT data), or, on a connection without 0-RTT, one beside the
+        // client's Finished: the application's first data, which could go no sooner. With 0-RTT
+        // that data went in it, and what goes beside the Finished is the traffic after.
+        let handshake_flight = space_id != SpaceId::Data
+            || conn.state.is_handshake()
+            || (conn.handshake_datagram && !conn.zero_rtt_enabled);
         let packet = SentPacket {
             path_generation: conn.path.generation(),
             largest_acked: sent.largest_acked,
@@ -224,6 +231,8 @@ impl PacketBuilder {
             ack_eliciting,
             retransmits: sent.retransmits,
             stream_frames: sent.stream_frames,
+            copied: conn.spaces.get(space_id).sending_copies,
+            handshake_flight,
         };
 
         conn.path

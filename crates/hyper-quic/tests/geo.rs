@@ -33,7 +33,7 @@ use hyper_quic::rustls::RootCertStore;
 use hyper_quic::rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use hyper_quic::{
     ClientConfig, ClientConfigHandle, Connection, ConnectionHandle, DatagramEvent, Dir, Endpoint,
-    EndpointConfig, Event, ServerConfig, StreamEvent, StreamId, TimeSource,
+    EndpointConfig, Event, ServerConfig, StreamEvent, StreamId, TimeSource, TransportConfig,
 };
 use hyper_sim::net::{Loss, Net, NetLimits, NetStats, Path, Ticket};
 use hyper_sim::{Clock, Discipline, Fifo, Limits, NodeId, Record, Source, Step, World, twice};
@@ -99,11 +99,20 @@ impl Pki {
             z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
             format!("{:016x}.geo.example", z ^ (z >> 31))
         }));
-        let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap();
-        let cert = rcgen::CertificateParams::new(subject)
-            .unwrap()
-            .self_signed(&key)
-            .unwrap();
+        // The certificate is the same every run, so the server's flight is: rustls compresses
+        // certificates (RFC 8879), and a random key and serial changed the compressed flight's
+        // length by bytes run to run, and with it how the flight fell into datagrams and each
+        // datagram's draw from the network. The key is an Ed25519 key from a fixed seed (the PKCS#8
+        // form of RFC 8410 §7), whose signatures are deterministic (RFC 8032 §5.1.6).
+        let mut pkcs8 = vec![
+            0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x04, 0x22,
+            0x04, 0x20,
+        ];
+        pkcs8.extend_from_slice(&[0x5a; 32]);
+        let key = rcgen::KeyPair::try_from(&PrivatePkcs8KeyDer::from(pkcs8)).unwrap();
+        let mut params = rcgen::CertificateParams::new(subject).unwrap();
+        params.serial_number = Some(rcgen::SerialNumber::from(0x0123_4567_89ab_cdef_u64));
+        let cert = params.self_signed(&key).unwrap();
         Self {
             certificate: cert.der().clone(),
             key: PrivatePkcs8KeyDer::from(key.serialize_der()).into(),
@@ -225,6 +234,8 @@ struct Dialed {
     surfaced: u32,
     /// Each later request's latency on the kept connection, sent as the last reply arrived.
     kept: Vec<u64>,
+    /// The packets the client had declared lost when the first reply arrived.
+    lost_packets: u64,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -251,6 +262,9 @@ struct Scenario {
     careful_resume: bool,
     /// Whether the first dial runs on a clean path and the later ones on `path`.
     clean_first: bool,
+    /// Whether the endpoints send the handshake's flights twice (`TransportConfig::handshake_copies`,
+    /// their default); off for the checks of RFC 9002's probe schedule, flight by flight.
+    copies: bool,
     /// The virtual time past which the run stops.
     horizon: u64,
 }
@@ -270,6 +284,7 @@ impl Scenario {
             reply_bytes: REPLY.len(),
             careful_resume: true,
             clean_first: false,
+            copies: true,
             horizon: HORIZON,
         }
     }
@@ -426,11 +441,16 @@ impl Run {
             endpoint_config.careful_resume(None);
         }
         let mut client = Endpoint::new(endpoint_config.clone(), None, false, rng(CLIENT)).unwrap();
-        let client_config = client.insert_client_config(pki.client_config()).unwrap();
+        let mut transport = TransportConfig::default();
+        transport.handshake_copies(scenario.copies);
+        let mut client_config = pki.client_config();
+        client_config.transport_config(transport.clone());
+        let client_config = client.insert_client_config(client_config).unwrap();
         if scenario.silent {
             net.partition(CLIENT, SERVER, true);
         }
         let mut server_config = pki.server_config();
+        server_config.transport_config(transport);
         if let Some(max) = scenario.max_incoming {
             server_config.max_incoming(max);
         }
@@ -560,7 +580,10 @@ impl Run {
                 read_to_end(connection, id, &mut self.reply);
                 if self.reply.len() == self.scenario.reply_bytes {
                     match dialed.replied {
-                        None => dialed.replied = Some(now),
+                        None => {
+                            dialed.replied = Some(now);
+                            dialed.lost_packets = connection.stats().path.lost_packets;
+                        }
                         Some(_) => dialed.kept.push(now - self.asked_at),
                     }
                     // The next request on the kept connection, at once
@@ -864,7 +887,14 @@ fn print_the_lossy_summary() {
 /// retransmission, at 999 ms, precedes it, within the guarantee's two.
 fn the_client_retransmits_its_first_flight_on_the_pto_from_333_ms(names: usize) {
     let pki = Pki::new(names);
-    let out = Run::new(Scenario::clean(), &pki).run();
+    let out = Run::new(
+        Scenario {
+            copies: false,
+            ..Scenario::clean()
+        },
+        &pki,
+    )
+    .run();
     let reply = out.first_reply().unwrap();
     assert_eq!(reply, RTT, "{}", out.timeline());
     assert_eq!(
@@ -890,6 +920,7 @@ fn an_unanswered_client_backs_off_by_doubling_one_flight_at_a_time() {
     let out = Run::new(
         Scenario {
             silent: true,
+            copies: false,
             ..Scenario::clean()
         },
         &pki,
@@ -914,7 +945,14 @@ fn an_unanswered_client_backs_off_by_doubling_one_flight_at_a_time() {
 fn under_loss_and_reordering_the_first_flight_follows_the_pto_schedule() {
     let pki = Pki::new(MANY_NAMES);
     for seed in SEEDS {
-        let out = Run::new(Scenario::lossy(seed), &pki).run();
+        let out = Run::new(
+            Scenario {
+                copies: false,
+                ..Scenario::lossy(seed)
+            },
+            &pki,
+        )
+        .run();
         let reply = out.first_reply().unwrap();
         let flights = out.client_flights_before(reply);
         let mut pto = FIRST_PTO;
@@ -942,6 +980,7 @@ fn a_retransmitted_two_datagram_flight_counts_once_against_the_attempt_bound() {
         Scenario {
             drop_client: &[0],
             max_incoming: Some(1),
+            copies: false,
             ..Scenario::clean()
         },
         &pki,
@@ -959,6 +998,36 @@ fn a_retransmitted_two_datagram_flight_counts_once_against_the_attempt_bound() {
         "{}",
         out.timeline()
     );
+}
+
+/// The handshake's flights go twice (`TransportConfig::handshake_copies`): the first datagram of the
+/// ClientHello lost, its copy begins the attempt, and the handshake ends at its clean floor, where a
+/// single flight waits out the first probe timeout (999 ms from kInitialRtt) and a round trip more
+/// (`a_retransmitted_two_datagram_flight_counts_once_against_the_attempt_bound`). The lost
+/// original is still declared lost, a congestion signal the copy does not hide (RFC 9265).
+#[test]
+fn a_lost_first_datagram_costs_no_probe_timeout_with_its_copy() {
+    let pki = Pki::new(MANY_NAMES);
+    let clean = Run::new(Scenario::clean(), &pki).run();
+    let out = Run::new(
+        Scenario {
+            drop_client: &[0],
+            ..Scenario::clean()
+        },
+        &pki,
+    )
+    .run();
+    let first = out.first();
+    assert_eq!(first.surfaced, 1, "{}", out.timeline());
+    assert_eq!(
+        first.connected,
+        clean.first().connected,
+        "{}",
+        out.timeline()
+    );
+    assert_eq!(first.replied, clean.first().replied, "{}", out.timeline());
+    assert_eq!(first.lost_packets, 1, "{}", out.timeline());
+    assert_eq!(clean.first().lost_packets, 0);
 }
 
 /// Guarantee c: the server acknowledges every duplicate Initial datagram at once (RFC 9000
@@ -1013,7 +1082,14 @@ fn duplicate_initials_are_acknowledged_once_and_grow_the_allowance() {
 #[test]
 fn a_post_quantum_hello_and_a_large_server_flight_complete_in_two_round_trips() {
     let pki = Pki::new(MANY_NAMES);
-    let out = Run::new(Scenario::clean(), &pki).run();
+    let out = Run::new(
+        Scenario {
+            copies: false,
+            ..Scenario::clean()
+        },
+        &pki,
+    )
+    .run();
     let first_flight: u64 = out
         .client_initials_before(1)
         .iter()

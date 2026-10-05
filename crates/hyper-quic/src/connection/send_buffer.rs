@@ -54,6 +54,8 @@ impl SendBuffer {
         range.start = base_offset.max(range.start);
         range.end = base_offset.max(range.end);
 
+        // A range acknowledged through one copy of a packet is not sent again for another's loss
+        self.retransmits.remove(range.clone());
         self.acks.insert(range);
 
         while self.acks.min() == Some(self.base_offset()) {
@@ -190,8 +192,19 @@ impl SendBuffer {
 
     /// Queue a range of sent but unacknowledged data to be retransmitted
     /// Only sent data can be lost (upstream asserted that in debug builds).
-    pub(super) fn retransmit(&mut self, range: Range<u64>) {
+    ///
+    /// Only what is still unacknowledged goes again: a packet's frames may travel in two packets
+    /// (a probe's or a copy's), and the loss of one after the other's acknowledgement leaves
+    /// nothing to send.
+    pub(super) fn retransmit(&mut self, mut range: Range<u64>) {
+        let base_offset = self.base_offset();
+        range.start = base_offset.max(range.start);
+        range.end = base_offset.max(range.end);
+        if range.is_empty() {
+            return;
+        }
         self.retransmits.insert(range);
+        self.retransmits.subtract(&self.acks);
     }
 
     /// Called before any data is acknowledged, while everything written is held (upstream
@@ -397,6 +410,30 @@ mod tests {
         // Lose the second frame
         buf.retransmit(16..23);
         assert_eq!(buf.poll_transmit(16), (16..23, true));
+    }
+
+    #[test]
+    fn acknowledged_data_is_never_sent_again() {
+        let mut buf = SendBuffer::new();
+        const MSG: &[u8] = b"Hello, world with extra data!";
+        buf.write(MSG.into());
+        assert_eq!(buf.poll_transmit(16), (0..16, false));
+        assert_eq!(buf.poll_transmit(16), (16..23, true));
+        // A copy of the first frame's packet is acknowledged, then the original is lost: nothing
+        // of it goes again.
+        buf.ack(0..16);
+        buf.retransmit(0..16);
+        assert!(buf.retransmits.is_empty());
+        // Part of the second acknowledged out of order, then the whole declared lost: only the
+        // rest goes again.
+        buf.ack(16..20);
+        buf.retransmit(16..23);
+        assert_eq!(buf.poll_transmit(16), (20..23, true));
+        // A retransmission queued and then acknowledged through the other copy is not sent.
+        buf.retransmit(20..23);
+        buf.ack(20..23);
+        assert!(buf.retransmits.is_empty());
+        assert_eq!(buf.poll_transmit(16), (23..MSG.len() as u64, true));
     }
 
     #[test]

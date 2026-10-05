@@ -154,5 +154,14 @@ impl Congestion {
     }
 }
 
+/// RFC 9002 §7.2's initial window for datagrams of `max_datagram_size` bytes: "ten times the
+/// maximum datagram size ... while limiting the window to the larger of 14,720 bytes or twice the
+/// maximum datagram size"
+pub(crate) fn initial_window(max_datagram_size: u64) -> u64 {
+    max_datagram_size
+        .saturating_mul(10)
+        .min(max_datagram_size.saturating_mul(2).max(14_720))
+}
+
 /// The smallest maximum datagram size QUIC allows, 1200 bytes (RFC 9000 §14)
 const BASE_DATAGRAM_SIZE: u64 = 1200;

@@ -1,6 +1,6 @@
 use std::any::Any;
 
-use super::{BASE_DATAGRAM_SIZE, Controller};
+use super::{Controller, initial_window};
 use crate::connection::RttEstimator;
 use crate::{Instant, float};
 
@@ -25,7 +25,9 @@ impl NewReno {
     /// Construct a state using the given `config` and current time `now`
     pub fn new(config: NewRenoConfig, now: Instant, current_mtu: u16) -> Self {
         Self {
-            window: config.initial_window,
+            window: config
+                .initial_window
+                .unwrap_or_else(|| initial_window(current_mtu.into())),
             ssthresh: u64::MAX,
             recovery_start_time: now,
             current_mtu: current_mtu as u64,
@@ -105,8 +107,16 @@ impl Controller for NewReno {
         }
     }
 
+    /// RFC 9002 §7.2: "If the maximum datagram size changes during the connection, the initial
+    /// congestion window SHOULD be recalculated with the new size." A window still at the initial
+    /// one, with no congestion met (the slow-start threshold unset), becomes the new initial window;
+    /// one slow start or a congestion response has moved is the controller's own.
     fn on_mtu_update(&mut self, new_mtu: u16) {
+        let before = self.initial_window();
         self.current_mtu = new_mtu as u64;
+        if self.window == before && self.ssthresh == u64::MAX {
+            self.window = self.initial_window();
+        }
         self.window = self.window.max(self.minimum_window());
     }
 
@@ -136,7 +146,9 @@ impl Controller for NewReno {
     }
 
     fn initial_window(&self) -> u64 {
-        self.config.initial_window
+        self.config
+            .initial_window
+            .unwrap_or_else(|| initial_window(self.current_mtu))
     }
 
     fn into_any(self: Box<Self>) -> Box<dyn Any> {
@@ -147,16 +159,18 @@ impl Controller for NewReno {
 /// Configuration for the `NewReno` congestion controller
 #[derive(Debug, Clone)]
 pub struct NewRenoConfig {
-    initial_window: u64,
+    /// `None`: RFC 9002 §7.2's, by the path's datagram size
+    initial_window: Option<u64>,
     loss_reduction_factor: f32,
 }
 
 impl NewRenoConfig {
-    /// Default limit on the amount of outstanding data in bytes.
+    /// Limit on the amount of outstanding data in bytes before any is acknowledged
     ///
-    /// Recommended value: `min(10 * max_datagram_size, max(2 * max_datagram_size, 14720))`
+    /// By default RFC 9002 §7.2's, `min(10 * max_datagram_size, max(2 * max_datagram_size, 14720))`,
+    /// recalculated as the path's datagram size changes; a value set here is fixed.
     pub fn initial_window(&mut self, value: u64) -> &mut Self {
-        self.initial_window = value;
+        self.initial_window = Some(value);
         self
     }
 
@@ -170,8 +184,50 @@ impl NewRenoConfig {
 impl Default for NewRenoConfig {
     fn default() -> Self {
         Self {
-            initial_window: 14720.clamp(2 * BASE_DATAGRAM_SIZE, 10 * BASE_DATAGRAM_SIZE),
+            initial_window: None,
             loss_reduction_factor: 0.5,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::super::BASE_DATAGRAM_SIZE;
+    use super::*;
+
+    #[test]
+    fn the_initial_window_follows_the_datagram_size_until_the_window_moves() {
+        let now = Instant::now();
+        let mut reno = NewReno::new(NewRenoConfig::default(), now, BASE_DATAGRAM_SIZE as u16);
+        // RFC 9002 §7.2 at 1,200 bytes: ten datagrams
+        assert_eq!(reno.window(), 12_000);
+        // Path discovery finds 1,452 bytes: ten of those, 14,520
+        reno.on_mtu_update(1_452);
+        assert_eq!(reno.window(), 14_520);
+        assert_eq!(reno.initial_window(), 14_520);
+        // Jumbo datagrams: limited to the larger of 14,720 and two datagrams
+        reno.on_mtu_update(9_000);
+        assert_eq!(reno.window(), 18_000);
+        // Once slow start moves it, the window is the controller's own
+        let rtt = RttEstimator::new(Duration::from_millis(100));
+        let later = now + Duration::from_millis(10);
+        reno.on_ack(later, later, 1_000, false, &rtt);
+        assert_eq!(reno.window(), 19_000);
+        reno.on_mtu_update(1_452);
+        assert_eq!(reno.window(), 19_000);
+        // So after congestion, even at the initial window's size
+        let mut reno = NewReno::new(NewRenoConfig::default(), now, BASE_DATAGRAM_SIZE as u16);
+        reno.on_congestion_event(later, later, false, 1_200);
+        reno.window = 12_000;
+        reno.on_mtu_update(1_452);
+        assert_eq!(reno.window(), 12_000);
+        // A window set in the configuration is fixed
+        let mut config = NewRenoConfig::default();
+        config.initial_window(20_000);
+        let mut reno = NewReno::new(config, now, BASE_DATAGRAM_SIZE as u16);
+        reno.on_mtu_update(1_452);
+        assert_eq!(reno.window(), 20_000);
     }
 }

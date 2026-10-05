@@ -211,3 +211,145 @@ resumed handshake, since a PSK handshake carries no CertificateRequest, and a fu
 server asks for no certificate) puts them in the same flight as the reply, so each such dial
 replaces the ticket it spent. A handshake that requests a client certificate keeps sending them
 after the client's Finished, as the RFC's condition requires.
+
+## 4. Round three: what is left, and what closes it (2026-10-05)
+
+Round two left the tenfold cut unmet in two places (`docs/benchmarks.md`, "probe timeouts, tickets
+and Careful Resume"): the lossy path's first reply, 2.4x at p90 fresh (4,650 to 1,899 ms) and 3.3x
+resumed (3,899 to 1,177 ms); and the burst on a path no connection has measured, 1.2x (291 to
+241 ms). The sources below were read on 2026-10-04 and 2026-10-05: RFC text from rfc-editor.org
+(RFC 9000 from its plain-text form, quoted as written), papers from their publishers' pages.
+
+### 4.1 The lossy path's first reply
+
+**Where the time goes.** Per seed (the harness's 32 seeds, 5% loss each way, ±100 ms reordering,
+a fresh dial with a large certificate, then a resumed dial with its request in 0-RTT), every seed
+above 300 ms of overhead lost a packet of the handshake's flights: the client's first Initial (a
+probe timeout of 999 ms from kInitialRtt, RFC 9002 §6.2.2, since no RTT sample exists yet), the
+server's second flight, the client's Finished and the request beside it, the server's reply, or the
+resumed dial's ClientHello datagram with its 0-RTT request. A lost packet is known lost a round trip
+after it was sent at the soonest, and its copy then takes the one-way delay: at 500 ms one way,
+each such loss costs a second or more whatever the timer.
+
+**RACK-TLP (RFC 8985).** §7.2's probe timeout is 2·SRTT, already round two's at the first sample
+(the variation weighed by 2, Chromium's constant). §6.2's reordering window starts at min_RTT/4 and
+grows on DSACK, bounded by SRTT; RFC 9002 §6.1.2 keeps a time threshold of 9/8 and notes that
+"Algorithms that increase the reordering threshold after spuriously detecting losses, such as RACK,
+have proven useful in TCP". Adapting the window acts on spurious loss declarations; in every slow
+seed the delay came from a real loss on the critical path, so it would not move them, and it was
+not built.
+
+**Seeding the variation from a previous connection.** RFC 9002 §6.2.2 lets a resumed connection
+take "the previous connection's final smoothed RTT value as the resumed connection's initial RTT";
+round one tried the smoothed RTT and variation together and measured it worse (the first probe
+waits about 1.3 s instead of 999 ms). Measured again here, both ways, on the resumed dial:
+
+- the variation alone, taken at the first sample in place of half the sample (§5.3): p90 of the
+  first reply 2,100 ms against 1,177 ms;
+- smoothed RTT and variation before any sample: p90 1,201 ms, maximum 3,093 ms against 3,890 ms;
+- with the handshake's flights sent twice (below), either way moved the median (11 or 5 ms against
+  32 ms) and not the tail (p90 110 and 105 ms against 103 ms, maximum 159 and 150 against 120).
+
+The data does not support it, and it was not kept.
+
+**Forward erasure correction.** RFC 9265 (IRTF, Informational, July 2022; read from its plain text)
+states the condition a coding scheme must meet: "FEC coding mechanisms should not hide congestion
+signals" (abstract). Its §4, FEC within the transport, is the design taken here: "The repair
+symbols are sent within what the congestion window or calculated rate allows", and "For small
+files, sending repair symbols when there is no more data to transmit could help to reduce the
+transfer time. Sending repair symbols can avoid the silence period between the transmission of the
+last packet in the send buffer and 1) firing a retransmission of lost packets or 2) the
+transmission of new packets." Michel, De Coninck and Bonaventure ("QUIC-FEC: Bringing the
+benefits of Forward Erasure Correction to QUIC", IFIP Networking 2019) measured FEC in QUIC to cost
+completion time on long transfers or at low loss and delay, and to cut it "drastically" with "high
+packet loss rates and long delays or smaller files", "by avoiding costly retransmission timeouts";
+they kept the congestion signal by "distinguishing the packets that have been received from the
+packets that have been recovered". Google's QUIC removed its XOR FEC (IETF 99 MAPRG, "The QUIC Transport Protocol: Design and
+Internet-Scale Deployment", slide 18: "Conclusion: Benefits not worth the pain", "Multiple packet
+losses within RTT common", "Gains really at tail, where aggressive TLP wins"). At a 1 s round trip an aggressive probe still costs two
+seconds, and the handshake's flights are each a packet or a few: for a flight that fits a packet,
+the code that recovers any single loss is a repetition.
+
+Emulated on the harness first, each datagram duplicated on the wire with an independent loss draw,
+the resumed dial's p90 fell from 1,177 to 84 ms (the emulation's copies are free of the window and
+the anti-amplification limit, so it overstates the fresh dial). Built as copies of frames, in
+packets of their own numbers:
+
+- **What is copied: the handshake's flights.** Every Initial and Handshake packet; the 0-RTT and
+  0.5-RTT data sent while the handshake runs; and on a connection without 0-RTT, the data beside the
+  client's Finished, the application's first data, which could go no sooner. On real sockets the
+  forms measured cost the burst that starts with a resumed dial's reply (worst latency, 242 ms with
+  no copies): copying every packet until the handshake's confirmation, 680 ms (the client confirms a
+  round trip into the burst, and its copies took the initial window); copying the data beside the
+  Finished on a resumed connection too, 273 ms (the burst's first requests ride with it); the form
+  kept, 252 ms, the copy of the Finished itself.
+- **When.** Once a space has nothing new to send, so a copy never goes before new data, and under
+  the congestion window, pacing and the anti-amplification limit like any packet: every lossy seed
+  keeps the limit (`duplicate_initials_are_acknowledged_once_and_grow_the_allowance`).
+- **The congestion signal.** A lost original is still declared lost and answered (RFC 9265); the
+  copy's own number is acknowledged. Stream data acknowledged through one copy is never sent again
+  for the other's loss: the send buffer drops acknowledged ranges from what it retransmits.
+- **What the simulation does not show.** Its losses are independent; a copy goes right behind its
+  original, and a burst that loses both, which Google's measurement found common, costs what it cost
+  before.
+- **Measured alternatives.** Copying every later flight once the connection has declared a loss
+  (loss-adaptive, as Michel et al. recommend adapting to the path) took the fresh p90 to 107 ms
+  where the handshake's flights alone give 180 ms, both within the tenfold cut; it doubles every
+  small message on a lossy connection for the rest of its life, and was not taken.
+
+**A defect the copies uncovered.** A server dropped a 0-RTT packet that arrived when the connection
+existed but the ClientHello was not yet whole ("dropping unexpected 0-RTT packet"): a ClientHello in
+two datagrams whose first arrived, then a datagram of 0-RTT data. RFC 9001 §4.1.4: an endpoint
+"SHOULD buffer received packets if they might be processed using keys that are not yet available";
+§5.7: a server "MAY retain these packets for later decryption in anticipation of receiving a
+ClientHello". The server now holds them with its other undecryptable packets, within the same
+bound, and decrypts them when the 0-RTT keys come (or drops them once the ClientHello is read
+without 0-RTT).
+
+### 4.2 The burst on a path no connection has measured
+
+**What binds.** RFC 9002 §7.2: "Endpoints SHOULD use an initial congestion window of ten times the
+maximum datagram size", at most 14,720 bytes, 12,000 at QUIC's 1,200-byte minimum; §7.7: "Senders
+SHOULD limit bursts to the initial congestion window". The open loop offers 100 requests a second of
+131-byte packets over a 1 s round trip, 13.1 kB a round trip: the last 1.1 kB of the first round
+trip wait for its acknowledgements, about 240 ms at worst.
+
+- **Pacing the initial window over the first round trip** spreads what the window allows; it adds
+  nothing to it, and the open loop's requests are already spread by the application.
+- **Careful Resume** (RFC 9959 §3.1) needs a measurement of the path; the kept connection's earlier
+  dials each carried one request, below the four initial windows §3.1 asks for.
+- **A larger initial window.** RFC 6928 (Experimental) set TCP's at ten segments; the only proposal
+  to go past it on an unmeasured path, Allman's "Removing TCP's Initial Congestion Window"
+  (draft-allman-tcpm-no-initwin-00, an individual draft, expired, with no IETF standing), would let a
+  sender choose any window it paces evenly over the first round trip. No standards-track document
+  permits more than the initial window on a path without a measurement.
+- **A larger datagram.** The initial window is ten datagrams: RFC 9002 §7.2, "If the maximum
+  datagram size changes during the connection, the initial congestion window SHOULD be recalculated
+  with the new size"; at 1,452 bytes it is 14,520, past the open loop's 13.1 kB. RFC 9000 §14.2:
+  "QUIC implementations that implement any kind of PMTU discovery therefore SHOULD maintain a maximum
+  datagram size for each combination of local and remote IP addresses"; §14.3.1, a sender "can
+  therefore enter the DPLPMTUD BASE state ... when the QUIC connection handshake has been completed";
+  RFC 8899 §3 (item 9), the PMTU "MAY also be stored with the corresponding entry associated with the
+  destination ... and used by other PL instances". hyper-quic's controllers did not recalculate; they
+  now do, while the window is still the initial one and no congestion has been met. Measured with
+  path MTU discovery on the bench (the deployed `hyper-transport` endpoint enables it; the bench did
+  not) and the discovered size kept per remote address: the dials close before the binary search
+  passes 1,326 bytes, the probes take window during the burst, and the worst rose to 352 ms. That
+  part was not kept.
+
+**A defect behind a second stall.** RFC 9002 §7.8 lets the window grow only while it is used:
+"When bytes in flight is smaller than the congestion window and sending is not pacing limited, the
+congestion window is underutilized". hyper-quic (as upstream quinn) judged each acknowledgement by
+its last transmission alone: a sender whose window filled, then sent what it held as
+acknowledgements freed room and went idle until its next request, took every later acknowledgement
+of that round trip for one of an unused window. The window grew 1.8 kB in the round trip after the
+stall where slow start grows it by what is acknowledged, and the stall came again a round trip later,
+and again. Linux keeps a window limited for the data in flight when the limit was met
+(`tcp_cwnd_validate` in `net/ipv4/tcp_output.c` sets `is_cwnd_limited` until `snd_una` passes
+`max_packets_seq`); hyper-quic now counts the window used from a block until a packet sent after it
+is acknowledged.
+
+**What is left, and why.** The first round trip of a burst on a connection with no measurement of
+its path: about 240 ms at worst for an offered 13.1 kB against 12,000 bytes. Closing it tenfold asks
+for about 13 kB in that round trip, which RFC 9002 §7.2 and §7.7 do not allow without a measurement
+or a larger datagram size, and no standards-track mechanism provides either before the burst.

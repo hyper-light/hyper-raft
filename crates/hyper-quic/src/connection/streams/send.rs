@@ -128,6 +128,13 @@ impl Send {
         }
     }
 
+    /// Queues the frame's data and FIN to go again, as much of them as is still unacknowledged
+    pub(super) fn retransmit(&mut self, frame: frame::StreamMeta) {
+        let fin_acked = matches!(self.state, SendState::DataSent { finish_acked: true });
+        self.fin_pending |= frame.fin && !fin_acked;
+        self.pending.retransmit(frame.offsets);
+    }
+
     /// Handle increase to stream-level flow control limit
     ///
     /// Returns whether the stream was unblocked

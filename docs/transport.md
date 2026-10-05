@@ -579,6 +579,16 @@ the numbers are `docs/benchmarks.md`, "Probe timeouts, tickets and Careful Resum
   delivered a round trip, and retreats on the first congestion (`crates/hyper-quic/VENDORED.md`
   §12). A connection with no earlier measurement of its path still starts at the initial window
   (RFC 9002 §7.2): that start is the network's safety rule, not overhead.
+- **The handshake's flights twice** (2026-10-05). Each packet of the handshake's flights is copied
+  once, in a packet of its own number, under the window, pacing and the anti-amplification limit,
+  so a lost one costs no probe timeout; a lost original is still answered as congestion (RFC 9265).
+  With it, three defects closed: acknowledged stream data no longer goes again, a server holds 0-RTT
+  packets that come before the whole ClientHello (RFC 9001 §4.1.4), and the window counts as used
+  for the round trip after it blocked (RFC 9002 §7.8), so a burst past the initial window stalls
+  once, not each round trip. The initial window follows the datagram size (RFC 9002 §7.2)
+  (`crates/hyper-quic/VENDORED.md` §13). What is left: a burst's first round trip on a path no
+  connection has measured waits on the initial window, which no standards-track mechanism lets a
+  sender exceed (`docs/research/quic-overhead.md` §4.2).
 
 ## 5. Consumers
 

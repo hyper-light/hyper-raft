@@ -62,6 +62,9 @@ pub(super) struct PacketSpace {
     pub(super) loss_time: Option<Instant>,
     /// Number of tail loss probes to send
     pub(super) loss_probes: u32,
+    /// Whether the packets sent now carry copies ([`PacketSpace::queue_copies`]), which are not
+    /// copied again
+    pub(super) sending_copies: bool,
     pub(super) ping_pending: bool,
     pub(super) immediate_ack_pending: bool,
     /// Number of packets sent in the current key phase
@@ -93,6 +96,7 @@ impl PacketSpace {
             time_of_last_ack_eliciting_packet: None,
             loss_time: None,
             loss_probes: 0,
+            sending_copies: false,
             ping_pending: false,
             immediate_ack_pending: false,
             sent_with_keys: 0,
@@ -158,6 +162,42 @@ impl PacketSpace {
         if !self.immediate_ack_pending {
             self.ping_pending = true;
         }
+    }
+
+    /// Queues a copy of the frames of each packet of the handshake's flights in flight and not yet
+    /// copied ([`SentPacket::handshake_flight`]), once this space has nothing new to send and no
+    /// probe is due
+    ///
+    /// RFC 9265 §4's FEC within the transport, a repetition for flights of a packet or a few:
+    /// "repair symbols are sent within what the congestion window or calculated rate allows", "when
+    /// there is no more data to transmit". The copy goes in packets of its own numbers, under the
+    /// congestion window, pacing and the anti-amplification limit like any other, so a lost original
+    /// is still declared lost and answered: FEC "should not hide congestion signals" (RFC 9265). The
+    /// originals keep their frames: whichever packet is acknowledged first delivers them, and data
+    /// acknowledged through one is not sent again for the other's loss (`SendBuffer::retransmit`).
+    pub(super) fn queue_copies(&mut self, streams: &mut StreamsState) {
+        if self.loss_probes != 0 || !self.pending.is_empty(streams) {
+            return;
+        }
+        let mut queued = false;
+        for packet in self.sent_packets.values_mut() {
+            if packet.copied
+                || !packet.handshake_flight
+                || !packet.ack_eliciting
+                || (packet.retransmits.is_empty(streams) && packet.stream_frames.is_empty())
+            {
+                continue;
+            }
+            packet.copied = true;
+            if let Some(retransmits) = packet.retransmits.get() {
+                self.pending |= retransmits.clone();
+            }
+            for frame in packet.stream_frames.iter() {
+                streams.retransmit(frame.clone());
+            }
+            queued = true;
+        }
+        self.sending_copies |= queued;
     }
 
     /// Get the next outgoing packet number in this space
@@ -342,6 +382,13 @@ pub(super) struct SentPacket {
     ///
     /// The actual application data is stored with the stream state.
     pub(super) stream_frames: frame::StreamMetaVec,
+    /// Whether this packet's frames went, or are queued to go, in a second packet
+    /// ([`PacketSpace::queue_copies`]), or it is that second packet
+    pub(super) copied: bool,
+    /// Whether the packet is of the handshake's flights: an Initial or Handshake packet, one sent
+    /// before this endpoint's handshake completed (0-RTT and 0.5-RTT data), or one in a datagram
+    /// with a Handshake packet (the client's first 1-RTT data, beside its Finished)
+    pub(super) handshake_flight: bool,
 }
 
 /// Retransmittable data queue

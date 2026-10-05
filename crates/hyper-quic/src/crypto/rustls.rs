@@ -579,11 +579,14 @@ pub(crate) fn initial_suite() -> Option<Suite> {
     }
 }
 
-/// The key exchange groups between nodes: the hybrid post-quantum groups only, X25519MLKEM768
-/// first (its share is the one a ClientHello carries), then SecP256r1MLKEM768
-/// (draft-ietf-tls-ecdhe-mlkem). A classical-only peer finds no group in common and is refused
-/// (the owner's decision, 2026-10-04).
-static NODE_KX_GROUPS: [&dyn rustls::crypto::SupportedKxGroup; 2] = [
+/// The key exchange groups between nodes: the hybrid post-quantum groups only
+/// (draft-ietf-tls-ecdhe-mlkem). SecP384r1MLKEM1024 first, whose share a ClientHello carries:
+/// ML-KEM-1024 is CNSA 2.0's key establishment, and both ends are ours (hyper-raft docs/seal.md §10,
+/// slates' review). X25519MLKEM768 and SecP256r1MLKEM768 stay admitted for a peer that offers only
+/// them, until a measured handshake cost decides whether they stay. A classical-only peer finds no
+/// group in common and is refused (the owner's decision, 2026-10-04).
+static NODE_KX_GROUPS: [&dyn rustls::crypto::SupportedKxGroup; 3] = [
+    rustls::crypto::aws_lc_rs::kx_group::SECP384R1MLKEM1024,
     rustls::crypto::aws_lc_rs::kx_group::X25519MLKEM768,
     rustls::crypto::aws_lc_rs::kx_group::SECP256R1MLKEM768,
 ];

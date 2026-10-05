@@ -21,7 +21,6 @@ thiserror.workspace = true
 hyper-block = { path = "../hyper-block", features = ["sim"] }
 hyper-measure = { path = "../hyper-measure" }
 proptest.workspace = true
-hyper-seal = { path = "../hyper-seal" }
 tempfile.workspace = true
 
 [[bench]]

@@ -62,8 +62,10 @@ pub(crate) fn guarded<T, E>(
     }
 }
 
-/// Whether this build runs AWS-LC's FIPS 140-3 module (the `fips` feature) in its approved mode, so
-/// a node whose configuration demands FIPS can refuse to start on a build that is not (§9).
+/// Whether this build runs AWS-LC's FIPS 140-3 module in its approved mode, so a node whose
+/// configuration demands FIPS can refuse to start on a build that is not (§9). The consumer selects
+/// the module by enabling aws-lc-rs's `fips` feature in its own build; features unify, so every
+/// crate here then runs on it.
 pub fn fips() -> bool {
     aws_lc_rs::try_fips_mode().is_ok()
 }

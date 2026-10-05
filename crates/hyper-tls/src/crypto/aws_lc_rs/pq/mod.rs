@@ -38,6 +38,22 @@ pub static SECP256R1MLKEM768: &dyn SupportedKxGroup = &hybrid::Hybrid {
     },
 };
 
+/// This is the [SECP384R1MLKEM1024] key exchange: ML-KEM-1024, CNSA 2.0's key establishment, with
+/// ECDH over P-384, the classical share and secret first, as in SecP256r1MLKEM768.
+///
+/// [SECP384R1MLKEM1024]: <https://datatracker.ietf.org/doc/draft-ietf-tls-ecdhe-mlkem/>
+pub static SECP384R1MLKEM1024: &dyn SupportedKxGroup = &hybrid::Hybrid {
+    classical: kx_group::SECP384R1,
+    post_quantum: MLKEM1024,
+    name: NamedGroup::secp384r1MLKEM1024,
+    layout: hybrid::Layout {
+        classical_share_len: SECP384R1_LEN,
+        post_quantum_client_share_len: MLKEM1024_ENCAP_LEN,
+        post_quantum_server_share_len: MLKEM1024_CIPHERTEXT_LEN,
+        post_quantum_first: false,
+    },
+};
+
 /// This is the [MLKEM] key encapsulation mechanism in NIST with security category 3.
 ///
 /// [MLKEM]: https://datatracker.ietf.org/doc/draft-ietf-tls-mlkem
@@ -65,3 +81,9 @@ const SECP256R1_LEN: usize = 65;
 const MLKEM768_CIPHERTEXT_LEN: usize = 1088;
 /// An ML-KEM-768 encapsulation key (FIPS 203 Table 3).
 const MLKEM768_ENCAP_LEN: usize = 1184;
+/// An uncompressed secp384r1 point (RFC 8446 §4.2.8.2, SEC 1 §2.3.3).
+const SECP384R1_LEN: usize = 97;
+/// An ML-KEM-1024 ciphertext (FIPS 203 Table 3).
+const MLKEM1024_CIPHERTEXT_LEN: usize = 1568;
+/// An ML-KEM-1024 encapsulation key (FIPS 203 Table 3).
+const MLKEM1024_ENCAP_LEN: usize = 1568;

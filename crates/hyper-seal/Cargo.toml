@@ -7,10 +7,6 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
-[features]
-# AWS-LC's FIPS 140-3 module in place of the default build (docs/seal.md §9).
-fips = ["aws-lc-rs/fips"]
-
 [dependencies]
 aws-lc-rs = { version = "1.18", default-features = false, features = ["aws-lc-sys", "prebuilt-nasm"] }
 getrandom.workspace = true

@@ -34,8 +34,8 @@ here.
 
 ## 2. The construction, and why
 
-**AES-256-GCM** seals every byte, through aws-lc-rs (`aws-lc-sys`, or `aws-lc-fips-sys` under the
-`fips` feature, §9). AES-256 meets CNSA 2.0's symmetric requirement (R §6) and keeps 128-bit
+**AES-256-GCM** seals every byte, through aws-lc-rs (`aws-lc-sys`, or `aws-lc-fips-sys` when the
+consumer enables aws-lc-rs's `fips` feature, §9). AES-256 meets CNSA 2.0's symmetric requirement (R §6) and keeps 128-bit
 security against Grover's search (R §6). GCM is a NIST mode (SP 800-38D), streams in one pass, and
 runs at memory bandwidth on AES-NI and ARMv8 cryptography extensions (mantle measured 8 GB/s a core
 sealing, 8.4 GB/s opening; R §8). Every tag is the full 128 bits (SP 800-38D §5.2.1.2).
@@ -155,8 +155,8 @@ memory and returns the record to keep.
 ### 3.4 Generation
 
 Keys are read from the operating system's generator through `getrandom`, which returns a typed
-error where AWS-LC's own generator aborts the process. Under `fips`, keys come from AWS-LC's
-approved DRBG through its fallible interface, behind the unwind boundary (§9).
+error where AWS-LC's own generator aborts the process, in every build, the FIPS module's included
+(§9).
 
 ## 4. Sealing a file written once
 
@@ -388,7 +388,7 @@ buffers are the consumer's to wipe.
 
 ## 9. FIPS mode
 
-`hyper-seal` builds against `aws-lc-sys` by default and `aws-lc-fips-sys` under the `fips` feature
+`hyper-seal` builds against `aws-lc-sys`, and against `aws-lc-fips-sys` when the consumer enables aws-lc-rs's `fips` feature in its own build (features unify, so every crate here then runs on the FIPS module; hyper-seal carries no feature of its own, so the workspace's `--all-features` gate does not need the FIPS module's CMake and Go toolchain)
 (aws-lc-rs's FIPS module: AWS-LC FIPS 3.0, FIPS 140-3 certificate #5314, the first validated
 module to include ML-KEM, ML-KEM-1024 among it; R §9). Every primitive here is in the module's approved
 set: AES-256-GCM, AES-KW, HKDF with SHA-384, HMAC-SHA-256, ML-KEM-1024, its DRBG. Keys come from

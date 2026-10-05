@@ -5,6 +5,11 @@ use qlog::streamer::QlogStreamer;
 use crate::QlogStream;
 use crate::{Duration, INITIAL_MTU, MAX_UDP_PAYLOAD, VarInt, VarIntBoundsExceeded, congestion};
 
+/// The default correlation time of a path's loss bursts ([`TransportConfig::handshake_copy_burst`]):
+/// 35.0 ms, from Jiang and Schulzrinne's trace 4 (NOSSDAV 2000, Table 1; 30 ms spacing, loss 2.82%,
+/// conditional loss 44.1%) by `τ = δ/ln((1 − ulp)/(clp − ulp))` (`docs/research/burst-loss.md` §2).
+const HANDSHAKE_COPY_BURST: Duration = Duration::from_millis(35);
+
 /// Parameters governing the core QUIC state machine
 ///
 /// Default values should be suitable for most internet applications. Applications protocols which
@@ -35,6 +40,7 @@ pub struct TransportConfig {
     pub(crate) mtu_discovery_config: Option<MtuDiscoveryConfig>,
     pub(crate) pad_to_mtu: bool,
     pub(crate) handshake_copies: bool,
+    pub(crate) handshake_copy_burst: Duration,
     pub(crate) ack_frequency_config: Option<AckFrequencyConfig>,
 
     pub(crate) persistent_congestion_threshold: u32,
@@ -233,7 +239,8 @@ impl TransportConfig {
     ///
     /// Enabled by default. The flights are every Initial and Handshake packet, the 0-RTT and
     /// 0.5-RTT data sent while the handshake runs, and on a connection without 0-RTT the data
-    /// beside the client's Finished; each is copied once its space has nothing new to send, under
+    /// beside the client's Finished; each is copied once its space has nothing new to send and the
+    /// copy's spacing behind its original has passed ([`handshake_copy_burst`](Self::handshake_copy_burst)), under
     /// the congestion window, pacing and the anti-amplification limit. A lost original is still
     /// declared lost and answered as congestion (RFC 9265). Before any RTT sample a lost first
     /// flight waits out a probe timeout from RFC 9002's kInitialRtt, about a second on any path,
@@ -241,6 +248,20 @@ impl TransportConfig {
     /// takes its place at the cost of the handshake's bytes once more (`docs/benchmarks.md`).
     pub fn handshake_copies(&mut self, value: bool) -> &mut Self {
         self.handshake_copies = value;
+        self
+    }
+
+    /// The correlation time of the path's loss bursts, which a copy of the handshake's flights
+    /// waits past ([`handshake_copies`](Self::handshake_copies))
+    ///
+    /// A copy goes `τ·ln(PTO/τ)` behind its original, the spacing that minimises the flight's
+    /// expected delay under bursts of correlation time `τ` when losing both costs a probe timeout
+    /// (`docs/research/burst-loss.md` §5); with a probe timeout no longer than `τ`, or `τ` zero,
+    /// at once. The default, 35 ms, is the longest correlation measured at the spacing nearest a
+    /// handshake's packets: Jiang and Schulzrinne's trace 4 (NOSSDAV 2000, Table 1: UCSC to UMass,
+    /// 30 ms spacing, loss 2.82%, conditional loss 44.1%).
+    pub fn handshake_copy_burst(&mut self, value: Duration) -> &mut Self {
+        self.handshake_copy_burst = value;
         self
     }
 
@@ -384,6 +405,7 @@ impl Default for TransportConfig {
             mtu_discovery_config: Some(MtuDiscoveryConfig::default()),
             pad_to_mtu: false,
             handshake_copies: true,
+            handshake_copy_burst: HANDSHAKE_COPY_BURST,
             ack_frequency_config: None,
 
             persistent_congestion_threshold: 3,
@@ -420,6 +442,7 @@ impl fmt::Debug for TransportConfig {
             mtu_discovery_config,
             pad_to_mtu,
             handshake_copies,
+            handshake_copy_burst,
             ack_frequency_config,
             persistent_congestion_threshold,
             keep_alive_interval,
@@ -449,6 +472,7 @@ impl fmt::Debug for TransportConfig {
             .field("mtu_discovery_config", mtu_discovery_config)
             .field("pad_to_mtu", pad_to_mtu)
             .field("handshake_copies", handshake_copies)
+            .field("handshake_copy_burst", handshake_copy_burst)
             .field("ack_frequency_config", ack_frequency_config)
             .field(
                 "persistent_congestion_threshold",

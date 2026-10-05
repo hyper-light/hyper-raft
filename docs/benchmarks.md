@@ -6811,3 +6811,74 @@ cost of encrypting the bytes; before the frame MAC left sealed bytes to their ta
 between 8.5 and 16 ms in both modes alike, the flush's steps under other I/O; they are not a
 difference between the modes.
 
+## hyper-quic at 500 ms one way under bursts: copies spaced past the burst (2026-10-05)
+
+Before is `line` at 1a385a2 (copies of the handshake's flights sent right behind their originals);
+after is that tree with `crates/hyper-quic/VENDORED.md` §14 (a copy waits `τ·ln(PTO/τ)`, 117 ms at
+the first probe timeout; 1-RTT packets held until the handshake completes). Research and the burst
+conditions: `docs/research/burst-loss.md`. hyper-sim's loss in time (`Loss::bursty_in_time`) is in
+both trees for the simulated rows.
+
+Machine: Apple M5 Max, 18 cores, 128 GiB, macOS 26.4.1, other sessions building and testing
+throughout; load average 4.99 → 4.22 over the before table's run, 3.38 → 3.21 over the after
+table's.
+
+### On the simulated network (exact, virtual time)
+
+`crates/hyper-quic/tests/geo.rs`, `print_the_burst_table`: 500 ms one way with ±100 ms reordering,
+seeds 1 to 32, the large certificate, a fresh dial then a resumed dial with its request in 0-RTT; the
+first reply above its floor, median / p90 / maximum, ms. Three conditions at the same 5% mean:
+independent; bursts of correlation time 35.0 ms (mean burst 36.8 ms every 700 ms, Jiang and
+Schulzrinne's trace 4); bursts of 78.7 ms (mean burst 82.8 ms every 1,574 ms, Bolot's 200 ms column).
+
+| condition | no copies | before: copies back to back | after: copies spaced |
+|---|---|---|---|
+| independent, fresh | 180 / 1,947 / 2,319 | 0 / 136 / 818 | 58 / 317 / 1,168 |
+| independent, resumed | 169 / 2,445 / 3,126 | 13 / 108 / 146 | 107 / 235 / 265 |
+| bursts 35 ms, fresh | 118 / 2,182 / 3,229 | 0 / **2,749** / 5,776 | 0 / **394** / 10,258 |
+| bursts 35 ms, resumed | 135 / 3,924 / 5,035 | 38 / 141 / 2,972 | 95 / 155 / 3,164 |
+| bursts 78.7 ms, fresh | 99 / 2,005 / 9,737 | 0 / **2,004** / 5,023 | 0 / **676** / 10,258 |
+| bursts 78.7 ms, resumed | 102 / 3,548 / 5,035 | 18 / 88 / 141 | 74 / 270 / 3,139 |
+| bytes sent, all 32 seeds: independent / 35 ms / 78.7 ms | 1,002,927 / 998,909 / 990,242 | 1,678,139 / 1,742,656 / 1,703,399 | 1,487,099 / 1,523,386 / 1,538,742 |
+
+- **Under bursts, copies right behind their originals died with them**: the fresh p90 with copies,
+  2,749 ms, was worse than with none, 2,182 ms. **Spaced, it is 394 ms (7.0x), and 676 ms on the
+  longer bursts (3.0x).** Fresh dials a probe timeout or more past their floor on the 35 ms
+  condition: eight of 32 back to back, two spaced
+  (`under_bursts_a_spaced_copy_clears_the_burst_its_original_met`).
+- **Cost under independent loss**: the spacing is paid on each recovered loss, fresh p90 136 → 317 ms
+  and resumed 108 → 235 ms. No measured trace shows independent loss at the handshake's spacings
+  (`docs/research/burst-loss.md` §3).
+- **Bytes: spaced copies send 11% fewer than back-to-back ones** (+48% over no copies under
+  independent loss against +67%): a copy whose original is acknowledged or declared lost before it is
+  due is never sent.
+- **The fresh maximum, 10.3 s**, is one seed (14) where a burst took the server's whole first flight,
+  ten datagrams the window and the anti-amplification limit had let go at once. Its copies wait on
+  the window, and probes of two datagrams with backoff recover the flight; neither limit may be
+  passed (RFC 9002 §7, RFC 9000 §8.1).
+- Measured and not taken: τ = 78.7 ms as the default (fresh p90 358 / 429 ms on the two burst
+  conditions, but resumed 290 ms on the 35 ms one and fresh 933 ms under independent loss).
+
+### On real sockets: the open loop, unchanged
+
+`crates/hyper-quic/examples/geo_open_loop.rs`, as the section above: no loss on the relay, five
+dials then 20,000 requests at 100 a second on the kept connection; before and after binaries
+interleaved, 2026-10-05 05:39–05:52 PDT.
+
+| run | load (before → after the run) | p50 / p99 / p99.9 / max, overhead | worst in the first tenth |
+|---|---|---|---|
+| before 1 | 4.43 → 3.26 | 2.198 / 3.391 / 103.4 [42.3, 173.4] / 262.1 ms | 262.1 ms |
+| after 1 | 3.26 → 3.20 | 2.162 / 3.273 / 106.5 [52.6, 176.5] / 264.8 ms | 264.8 ms |
+| before 2 | 3.20 → 4.41 | 2.172 / 3.414 / 102.0 [42.4, 172.0] / 261.8 ms | 261.8 ms |
+| after 2 | 4.41 → 2.95 | 2.178 / 3.335 / 102.9 [52.3, 172.9] / 262.7 ms | 262.7 ms |
+
+Every quantile's interval overlaps its before's. The dials' first replies stay 1.7 to 9.0 ms over
+their floors, 0-RTT on every resumed dial.
+
+```sh
+# Simulated (deterministic)
+cargo test --release -p hyper-quic --test geo -- --ignored --nocapture --exact print_the_burst_table
+# Real sockets, before (1a385a2) and after interleaved, each between two load readings
+cargo build --release -p hyper-quic --example geo_open_loop
+target/release/examples/geo_open_loop --rate 100 --requests 20000 --dials 5
+```

@@ -750,6 +750,44 @@ fn a_0rtt_packet_before_the_whole_client_hello_is_held_until_its_keys() {
     assert_eq!(pair.client_conn_mut(client_ch).stats().path.lost_packets, 0);
 }
 
+/// A 1-RTT packet that reaches the server before the client's Finished, as reordering delivers a
+/// request ahead of the Finished it went with, is held and used once the handshake completes
+/// (RFC 9001 §5.7: such packets "MAY be stored and later decrypted and used once the handshake is
+/// complete"). Upstream discarded it, and the client sent it again once it was declared lost.
+#[test]
+fn a_1rtt_packet_before_the_finished_is_held_until_the_handshake_completes() {
+    let _guard = subscribe();
+    let mut pair = Pair::default();
+    let client_ch = pair.begin_connect(single_flights(client_config()));
+    pair.drive_client();
+    pair.drive_server();
+    // The client reads the server's flight and sends its Finished
+    pair.drive_client();
+    let s = pair.client_streams(client_ch).open(Dir::Uni).unwrap();
+    let msg = vec![0x5a; 4_000];
+    pair.client_send(client_ch, s).write(&msg).unwrap();
+    pair.drive_client();
+    let short = |datagram: &[u8]| datagram.first().is_some_and(|b| b & 0x80 == 0);
+    let inbound: Vec<_> = pair.server.inbound.drain(..).collect();
+    let (alone, rest): (Vec<_>, Vec<_>) = inbound.into_iter().partition(|d| short(&d.2));
+    assert!(!alone.is_empty() && !rest.is_empty());
+    // The datagrams of 1-RTT data alone first, then the Finished's
+    pair.server.inbound.extend(alone);
+    pair.server.inbound.extend(rest);
+    pair.drive();
+
+    let server_ch = pair.server.assert_accept();
+    let mut recv = pair.server_recv(server_ch, s);
+    let mut chunks = recv.read(true).unwrap();
+    let mut got = Vec::new();
+    while let Ok(Some(chunk)) = chunks.next(usize::MAX) {
+        got.extend_from_slice(&chunk.bytes);
+    }
+    let _ = chunks.finalize();
+    assert_eq!(got, msg);
+    assert_eq!(pair.client_conn_mut(client_ch).stats().path.lost_packets, 0);
+}
+
 /// RFC 9002 §7.8 grows only a window that is used. Messages offered faster than the initial
 /// window carries fill it for part of the first round trip; the acknowledgements of that round
 /// trip then come one at a time while the sender, its backlog gone, waits for its next message.
@@ -2375,7 +2413,9 @@ fn handshake_1rtt_handling() {
 
     pair.drive();
 
-    assert!(pair.client_conn_mut(client_ch).stats().path.lost_packets != 0);
+    // The server holds the 1-RTT data until the handshake completes (RFC 9001 §5.7), where
+    // upstream discarded it and the client sent it again
+    assert_eq!(pair.client_conn_mut(client_ch).stats().path.lost_packets, 0);
     let mut recv = pair.server_recv(server_ch, s);
     let mut chunks = recv.read(false).unwrap();
     assert_matches!(

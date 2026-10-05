@@ -45,6 +45,9 @@ pub use assembler::{Chunk, MAX_CHUNKS as MAX_STREAM_CHUNKS};
 mod cid_state;
 use cid_state::CidState;
 
+mod copies;
+use copies::copy_spacing;
+
 mod datagrams;
 use datagrams::DatagramState;
 pub use datagrams::{Datagrams, SendDatagramError};
@@ -536,7 +539,7 @@ impl Connection {
                 .get_mut(space)
                 .maybe_queue_probe(request_immediate_ack, &mut self.streams);
         }
-        self.queue_copies();
+        self.queue_copies(now);
 
         let close = self.close_pending()?;
         self.queue_ack_frequency();
@@ -599,11 +602,19 @@ impl Connection {
 
     /// Queues copies of the handshake's flights ([`PacketSpace::queue_copies`]) in each space
     /// with keys to send them, when the configuration asks for them
-    /// ([`TransportConfig::handshake_copies`])
-    fn queue_copies(&mut self) {
+    /// ([`TransportConfig::handshake_copies`]), each once it is [`copy_spacing`] behind its
+    /// original; the copy timer wakes the connection for the earliest still waiting
+    fn queue_copies(&mut self, now: Instant) {
+        self.timers.stop(Timer::Copies);
         if !self.config.handshake_copies {
             return;
         }
+        // What losing both costs: the probe timer's interval, as `pto_time_and_space` arms it
+        // before backoff. One spacing for every space, so the copies of a datagram's coalesced
+        // packets go together as their originals did (the Data space's max_ack_delay would part
+        // them)
+        let spacing = copy_spacing(self.config.handshake_copy_burst, self.path.rtt.probe_base());
+        let mut waiting: Option<Instant> = None;
         for space in SpaceId::iter() {
             let keys = match space {
                 SpaceId::Data => {
@@ -615,9 +626,16 @@ impl Connection {
             // stream's first packet queued while the rest of the stream waits would go first, and
             // the rest beside it in its last packet
             let sending = space == SpaceId::Data && self.streams.can_send_stream_data();
-            if keys && !sending {
-                self.spaces.get_mut(space).queue_copies(&mut self.streams);
+            if !keys {
+                continue;
             }
+            let space = self.spaces.get_mut(space);
+            if let Some(due) = space.queue_copies(&mut self.streams, now, spacing, sending) {
+                waiting = Some(waiting.map_or(due, |earliest| earliest.min(due)));
+            }
+        }
+        if let Some(due) = waiting.filter(|due| *due > now) {
+            self.timers.set(Timer::Copies, due);
         }
     }
 
@@ -1526,6 +1544,7 @@ impl Connection {
                 self.path.challenge_pending = false;
             }
             Timer::Pacing => trace!("pacing timer expired"),
+            Timer::Copies => trace!("a copy of the handshake's flights is due"),
             Timer::PushNewCid => {
                 // Update `retire_prior_to` field in NEW_CONNECTION_ID frame
                 let num_new_cid = self.local_cid_state.on_cid_timeout().into();
@@ -2844,8 +2863,9 @@ impl Connection {
     }
 
     /// Whether a packet of `space` is to be held until its keys arrive: while handshaking, with
-    /// room in the bound, a Handshake or 1-RTT packet with no keys for its space yet, or at a
-    /// server a 0-RTT packet that came before the ClientHello was whole (RFC 9001 §4.1.4: an
+    /// room in the bound, a Handshake packet with no keys for its space yet, any 1-RTT packet
+    /// (one that arrives before the peer's Finished, as reordering delivers a request ahead of the
+    /// Finished it went with, is used once the handshake completes), or at a server a 0-RTT packet that came before the ClientHello was whole (RFC 9001 §4.1.4: an
     /// endpoint "SHOULD buffer received packets if they might be processed using keys that are not
     /// yet available"; §5.7: a server "MAY retain these packets for later decryption in anticipation
     /// of receiving a ClientHello"). A ClientHello in two datagrams whose second, with the 0-RTT
@@ -2859,6 +2879,11 @@ impl Connection {
         };
         let awaits_keys = if partial_decode.is_0rtt() {
             self.awaits_0rtt_keys()
+        } else if space == SpaceId::Data {
+            // A 1-RTT packet may not be processed before the handshake completes even with its
+            // keys (RFC 9001 §5.7: "Received packets protected with 1-RTT keys MAY be stored and
+            // later decrypted and used once the handshake is complete")
+            true
         } else {
             space != SpaceId::Initial && self.spaces.get(space).crypto.is_none()
         };
@@ -2879,14 +2904,16 @@ impl Connection {
             && self.spaces.get(SpaceId::Handshake).crypto.is_none()
     }
 
-    /// Whether a held packet's keys have arrived
+    /// Whether a held packet's keys have arrived, and for a 1-RTT packet the handshake has
+    /// completed
     fn keys_ready(&self, partial_decode: &PartialDecode) -> bool {
         if partial_decode.is_0rtt() {
             return self.zero_rtt_crypto.is_some();
         }
-        partial_decode
-            .space()
-            .is_some_and(|space| self.spaces.get(space).crypto.is_some())
+        partial_decode.space().is_some_and(|space| {
+            self.spaces.get(space).crypto.is_some()
+                && (space != SpaceId::Data || !self.is_handshaking())
+        })
     }
 
     /// Decrypts the held packets whose keys have arrived, in the order they arrived; a packet
@@ -3050,7 +3077,7 @@ impl Connection {
             debug!("discarding possible duplicate packet");
             return true;
         } else if self.state.is_handshake() && packet.header.is_short() {
-            // TODO: SHOULD buffer these to improve reordering tolerance.
+            // Held until the handshake completes (`hold_undecryptable`) unless the bound is full
             trace!("dropping short packet during handshake");
             return true;
         }

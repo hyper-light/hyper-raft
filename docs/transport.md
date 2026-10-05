@@ -589,6 +589,13 @@ the numbers are `docs/benchmarks.md`, "Probe timeouts, tickets and Careful Resum
   (`crates/hyper-quic/VENDORED.md` §13). What is left: a burst's first round trip on a path no
   connection has measured waits on the initial window, which no standards-track mechanism lets a
   sender exceed (`docs/research/quic-overhead.md` §4.2).
+- **Copies spaced past a burst** (2026-10-05). Losses come in bursts on every measured path, and a
+  copy sent with its original died with it in hyper-sim's burst model; a copy now waits
+  `τ·ln(PTO/τ)` behind its original (117 ms at the first probe timeout, none where the probe
+  timeout is shorter than a burst), and a server holds 1-RTT packets that come before the client's
+  Finished (RFC 9001 §5.7). Under bursts the fresh first reply's p90 fell from 2,749 to 394 ms; under
+  independent loss it rose from 136 to 317 ms (`crates/hyper-quic/VENDORED.md` §14,
+  `docs/research/burst-loss.md`).
 
 ## 5. Consumers
 

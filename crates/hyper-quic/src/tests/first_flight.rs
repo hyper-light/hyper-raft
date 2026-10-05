@@ -1,7 +1,8 @@
 //! A client's first flight when its ClientHello spans more than one Initial datagram, as a
-//! post-quantum key share makes it: the default client prefers X25519MLKEM768, whose 1,184-byte
-//! key share (draft-ietf-tls-ecdhe-mlkem) does not fit beside the rest of a ClientHello in one
-//! 1,200-byte Initial.
+//! post-quantum key share makes it: the default client prefers SecP384r1MLKEM1024, whose 1,665-byte
+//! key share (a 97-byte P-384 point and a 1,568-byte ML-KEM-1024 encapsulation key,
+//! draft-ietf-tls-ecdhe-mlkem) does not fit beside the rest of a ClientHello in one 1,200-byte
+//! Initial.
 
 use std::cmp;
 
@@ -30,7 +31,7 @@ fn post_quantum_key_exchange_is_negotiated() {
         .unwrap();
     assert_eq!(
         data.negotiated_key_exchange_group,
-        Some(rustls::NamedGroup::X25519MLKEM768)
+        Some(rustls::NamedGroup::secp384r1MLKEM1024)
     );
 }
 

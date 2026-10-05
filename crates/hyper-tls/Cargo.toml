@@ -71,6 +71,10 @@ path = "tests/e2e.rs"
 harness = false
 
 [[test]]
+name = "openssl_interop"
+path = "tests/openssl_interop.rs"
+
+[[test]]
 name = "ech"
 path = "tests/ech.rs"
 

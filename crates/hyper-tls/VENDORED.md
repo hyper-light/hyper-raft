@@ -477,3 +477,14 @@ derived from; the predicted Finished is hashed in place. hyper-quic's
 full handshake and 495 to 496 for a resumed one, reallocations 55–57 before and 54–55 after. Upstream's suite passes unchanged;
 `crates/hyper-quic/tests/geo.rs`'s `every_resumed_dial_closed_at_its_reply_leaves_a_ticket_for_the_next`
 failed before it.
+
+## 8. SecP384r1MLKEM1024, checked against OpenSSL (2026-10-05)
+
+`kx_group::SECP384R1MLKEM1024` (codepoint 0x11ed, draft-ietf-tls-ecdhe-mlkem): ML-KEM-1024 with
+ECDH over P-384, the classical share and secret first, as SecP256r1MLKEM768. hyper-quic prefers it
+between nodes (hyper-raft docs/seal.md §10). `tests/openssl_interop.rs` checks it against OpenSSL
+3.6.4 (Homebrew, macOS, aarch64), each side offering that group alone, over TCP, both ways: a hyper-tls
+client against `openssl s_server`, and `openssl s_client` against a hyper-tls server, each asserting
+the group negotiated and the chain verified. Both pass. CI's runners carry OpenSSL 3.0, which has no
+ML-KEM, so the tests are `#[ignore]` and run by hand: `cargo test -p hyper-tls --test
+openssl_interop -- --ignored`. slates ships the same group, checked against OpenSSL 3.5.7 both ways.

@@ -35,14 +35,14 @@ use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
 use bytes::BytesMut;
-use hyper_quic::congestion::{Congestion, Copa, CopaConfig, CubicConfig, NewRenoConfig};
+use hyper_quic::congestion::{BbrConfig, Congestion, Copa, CopaConfig, CubicConfig, NewRenoConfig};
 use hyper_quic::rustls::RootCertStore;
 use hyper_quic::rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use hyper_quic::{
     ClientConfig, Connection, ConnectionHandle, DatagramEvent, Dir, EcnCodepoint, Endpoint,
     EndpointConfig, Event, ServerConfig, StreamEvent, StreamId, TransportConfig, VarInt,
 };
-use hyper_sim::net::{Fate, Link, Marking, Net, NetLimits, Path, Ticket};
+use hyper_sim::net::{Fate, Link, Loss, Marking, Net, NetLimits, Path, Ticket};
 use hyper_sim::{
     Clock, Discipline, Fifo, Limits, NodeId, Record, SimError, Source, Step, World, twice,
 };
@@ -76,16 +76,21 @@ const STEP: Marking = Marking::Step {
 enum Law {
     NewReno,
     Cubic,
+    Bbr,
     Copa,
 }
 
 impl Law {
+    /// The laws focal's grids judge: the loss-based incumbents and Copa.
     const ALL: [Self; 3] = [Self::NewReno, Self::Cubic, Self::Copa];
+    /// Every law hyper-quic ships, slates' bake-off's field.
+    const BAKEOFF: [Self; 4] = [Self::NewReno, Self::Cubic, Self::Bbr, Self::Copa];
 
     fn congestion(self) -> Congestion {
         match self {
             Self::NewReno => Congestion::NewReno(NewRenoConfig::default()),
             Self::Cubic => Congestion::Cubic(CubicConfig::default()),
+            Self::Bbr => Congestion::Bbr(BbrConfig::default()),
             Self::Copa => Congestion::Copa(CopaConfig::default()),
         }
     }
@@ -98,6 +103,16 @@ struct Scenario {
     seconds: u64,
     seed: u64,
     marking: Marking,
+    /// The bottleneck's queue in thousandths of a bandwidth-delay product.
+    buffer_permille: u64,
+    /// What each direction's path loses.
+    loss: Loss,
+    /// Each datagram's propagation varies by up to this either way, and may overtake an earlier one.
+    jitter_ns: u64,
+    /// At this time the bottleneck's rate becomes the second value, both ways.
+    step: Option<(u64, u64)>,
+    /// Where measurement starts, if not a quarter of the run.
+    warm_ns: Option<u64>,
 }
 
 impl Scenario {
@@ -106,29 +121,49 @@ impl Scenario {
         u64::try_from(bits / 8).unwrap()
     }
 
-    /// One bandwidth-delay product, and four datagrams at least.
+    /// The configured share of a bandwidth-delay product (one by default), and four datagrams at
+    /// least.
     fn queue_bytes(&self) -> u64 {
-        self.bdp_bytes().max(4 * DATAGRAM)
+        (self.bdp_bytes() * self.buffer_permille / 1_000).max(4 * DATAGRAM)
     }
 
-    /// The most bytes one direction holds: its propagation and its full queue.
+    /// The bottleneck's largest rate over the run.
+    fn peak_rate(&self) -> u64 {
+        self.step.map_or(self.rate_bits_per_second, |(_, rate)| {
+            rate.max(self.rate_bits_per_second)
+        })
+    }
+
+    /// The most bytes one direction holds: its propagation at the peak rate and its full queue.
     fn bytes_one_way(&self) -> u64 {
-        self.bdp_bytes() / 2 + self.queue_bytes()
+        let bits = u128::from(self.peak_rate()) * u128::from(self.rtt_ns + 2 * self.jitter_ns)
+            / 1_000_000_000;
+        u64::try_from(bits / 16).unwrap() + self.queue_bytes()
     }
 
-    /// Measured from a quarter of the run: slow start and the first oscillations are over.
+    /// Measured from a quarter of the run unless stated: slow start and the first oscillations
+    /// are over.
     fn warm(&self) -> u64 {
-        self.seconds * SECOND / 4
+        self.warm_ns.unwrap_or(self.seconds * SECOND / 4)
     }
 
     fn end(&self) -> u64 {
         self.seconds * SECOND
     }
 
-    /// The bytes the link carries between the warm-up and the end.
+    /// The bytes the link carries between the warm-up and the end, the step's rate after it.
     fn could_carry(&self) -> u64 {
-        let bits = u128::from(self.rate_bits_per_second) * u128::from(self.end() - self.warm())
-            / 1_000_000_000;
+        let (warm, end) = (self.warm(), self.end());
+        let span = |from: u64, to: u64, rate: u64| {
+            u128::from(rate) * u128::from(to.saturating_sub(from)) / 1_000_000_000
+        };
+        let bits = match self.step {
+            Some((at, rate)) => {
+                let at = at.clamp(warm, end);
+                span(warm, at, self.rate_bits_per_second) + span(at, end, rate)
+            }
+            None => span(warm, end, self.rate_bits_per_second),
+        };
         u64::try_from(bits / 8).unwrap()
     }
 
@@ -159,6 +194,11 @@ fn scenario(rate_bits_per_second: u64, rtt_ms: u64, seconds: u64) -> Scenario {
         seconds,
         seed: 1,
         marking: Marking::Off,
+        buffer_permille: 1_000,
+        loss: Loss::NONE,
+        jitter_ns: 0,
+        step: None,
+        warm_ns: None,
     }
 }
 
@@ -220,8 +260,35 @@ enum Ev {
     Arrive(Ticket),
     Warm,
     Sample,
+    /// The bottleneck's rate changes (`Scenario::step`).
+    Step,
     End,
 }
+
+/// One connection of a run: its law, when its client stops handing its transfer more, whether it
+/// is a ping flow (a request of [`PING_BYTES`] every gap, each answered by as many) rather than a
+/// bulk transfer, and its round trip where it differs from the scenario's.
+#[derive(Clone, Copy, Debug)]
+struct FlowSpec {
+    law: Law,
+    stop_at: Option<u64>,
+    ping_gap_ns: Option<u64>,
+    rtt_ns: Option<u64>,
+}
+
+impl FlowSpec {
+    const fn bulk(law: Law) -> Self {
+        Self {
+            law,
+            stop_at: None,
+            ping_gap_ns: None,
+            rtt_ns: None,
+        }
+    }
+}
+
+/// A ping's request and its reply, a small metadata operation's (slates' bake-off).
+const PING_BYTES: usize = 64;
 
 struct Side {
     node: NodeId,
@@ -253,6 +320,17 @@ struct State {
     samples_late: u64,
     /// When the client stops handing its transfer more: what it handed already still goes.
     stop_at: Option<u64>,
+    /// A ping flow's gap between requests, and when the next is due.
+    ping_gap: Option<u64>,
+    next_ping: u64,
+    /// The client's pings awaiting their replies: each stream, when it was due, the bytes back.
+    pings: Vec<(StreamId, u64, usize)>,
+    /// Each ping's latency, due to answered, for those due after the warm-up.
+    ping_latencies: Vec<u64>,
+    /// The server's requests being read: each stream and the bytes read.
+    requests: Vec<(StreamId, usize)>,
+    /// When the run starts measuring, for the pings.
+    warm: u64,
 }
 
 /// One connection: flow `f` is nodes `2f` (the client) and `2f + 1` (the server).
@@ -302,11 +380,72 @@ impl Flow {
     }
 }
 
-/// The client's application: the transfer, written until the stream refuses more.
+/// A ping client's application: a request each gap on a stream of its own, each reply's latency
+/// from when its request was due.
+fn ping_client(connection: &mut Connection, state: &mut State, now: u64, gap: u64) {
+    while state.next_ping <= now {
+        let Some(id) = connection.streams().open(Dir::Bi) else {
+            // The stream limit holds it back: it goes when credit returns, its latency from when
+            // it was due
+            break;
+        };
+        let mut send = connection.send_stream(id);
+        assert_eq!(send.write(&[0x50; PING_BYTES]).unwrap(), PING_BYTES);
+        send.finish().unwrap();
+        state.pings.push((id, state.next_ping, 0));
+        state.next_ping += gap;
+    }
+    let warm = state.warm;
+    let latencies = &mut state.ping_latencies;
+    state.pings.retain_mut(|(id, due, got)| {
+        let mut stream = connection.recv_stream(*id);
+        if let Ok(mut chunks) = stream.read(true) {
+            while let Ok(Some(chunk)) = chunks.next(usize::MAX) {
+                *got += chunk.bytes.len();
+            }
+            let _ = chunks.finalize();
+        }
+        if *got < PING_BYTES {
+            return true;
+        }
+        if *due >= warm {
+            latencies.push(now - *due);
+        }
+        false
+    });
+}
+
+/// A ping server's application: each request answered as it is read whole.
+fn ping_server(connection: &mut Connection, state: &mut State) {
+    while let Some(id) = connection.streams().accept(Dir::Bi) {
+        state.requests.push((id, 0));
+    }
+    state.requests.retain_mut(|(id, got)| {
+        let mut stream = connection.recv_stream(*id);
+        if let Ok(mut chunks) = stream.read(true) {
+            while let Ok(Some(chunk)) = chunks.next(usize::MAX) {
+                *got += chunk.bytes.len();
+            }
+            let _ = chunks.finalize();
+        }
+        if *got < PING_BYTES {
+            return true;
+        }
+        let mut send = connection.send_stream(*id);
+        assert_eq!(send.write(&[0x51; PING_BYTES]).unwrap(), PING_BYTES);
+        send.finish().unwrap();
+        false
+    });
+}
+
+/// The client's application: the transfer, written until the stream refuses more, or the pings.
 fn client_events(connection: &mut Connection, state: &mut State, now: u64) {
     while let Some(event) = connection.poll() {
         match event {
-            Event::Connected => state.connected = true,
+            Event::Connected => {
+                state.connected = true;
+                state.next_ping = now;
+            }
             Event::ConnectionLost { reason } => {
                 state
                     .closed
@@ -316,6 +455,10 @@ fn client_events(connection: &mut Connection, state: &mut State, now: u64) {
         }
     }
     if !state.connected || state.stop_at.is_some_and(|stop| now >= stop) {
+        return;
+    }
+    if let Some(gap) = state.ping_gap {
+        ping_client(connection, state, now, gap);
         return;
     }
     let id = *state
@@ -341,6 +484,10 @@ fn server_events(connection: &mut Connection, state: &mut State, now: u64) {
             _ => {}
         }
     }
+    if state.ping_gap.is_some() {
+        ping_server(connection, state);
+        return;
+    }
     let Some(id) = state.inbound else {
         return;
     };
@@ -357,6 +504,9 @@ fn server_events(connection: &mut Connection, state: &mut State, now: u64) {
 /// What one flow carried and kept.
 #[derive(Clone, Debug, Default)]
 struct Measured {
+    /// A ping flow's answered pings due after the warm-up, and their latency's 99th percentile.
+    pings: usize,
+    ping_p99_ns: u64,
     /// What the transfer delivered after the warm-up, of what the link could carry then, in parts
     /// per million.
     carried_ppm: u64,
@@ -382,24 +532,27 @@ struct Run {
     world: World<Ev>,
     net: Net<Datagram>,
     flows: Vec<Flow>,
+    /// The bottleneck each way.
+    links: (hyper_sim::net::LinkId, hyper_sim::net::LinkId),
     scratch: Vec<u8>,
 }
 
 impl Run {
-    /// One flow for each law, all through the one bottleneck in each direction.
+    /// One connection for each flow, all through the one bottleneck in each direction.
     fn new(
         scenario: Scenario,
-        laws: &[(Law, Option<u64>)],
+        specs: &[FlowSpec],
         pki: &Pki,
         source: Source,
     ) -> Result<Self, SimError> {
-        let nodes = 2 * laws.len();
+        let nodes = 2 * specs.len();
         // Every message either direction holds, at the smallest datagram's size.
         let messages = usize::try_from(2 * scenario.bytes_one_way() / SMALLEST_DATAGRAM).unwrap();
         let limits = Limits {
             events: messages + 3,
             nodes,
-            streams: nodes + 1,
+            // The run's own, and each direction of each flow its loss and its delay draws
+            streams: 3 * nodes + 1,
             steps: u64::MAX,
             trace_words: 0,
         };
@@ -422,17 +575,24 @@ impl Run {
         };
         let up = net.add_link(link)?;
         let down = net.add_link(link)?;
-        let path = Path::in_order(scenario.rtt_ns / 2, 0);
-        let flows: Vec<Flow> = laws
+        let flows: Vec<Flow> = specs
             .iter()
             .enumerate()
-            .map(|(index, (law, stop_at))| {
-                let mut flow = Flow::new(u32::try_from(index).unwrap(), *law, &scenario, pki);
-                flow.state.stop_at = *stop_at;
+            .map(|(index, spec)| {
+                let mut flow = Flow::new(u32::try_from(index).unwrap(), spec.law, &scenario, pki);
+                flow.state.stop_at = spec.stop_at;
+                flow.state.ping_gap = spec.ping_gap_ns;
+                flow.state.warm = scenario.warm();
                 flow
             })
             .collect();
-        for flow in &flows {
+        for (flow, spec) in flows.iter().zip(specs) {
+            let one_way = spec.rtt_ns.unwrap_or(scenario.rtt_ns) / 2;
+            let path = match scenario.jitter_ns {
+                0 => Path::in_order(one_way, 0),
+                jitter => Path::reordering(one_way, jitter),
+            }
+            .with_loss(scenario.loss);
             net.set_pair_path(flow.client.node, flow.server.node, path.through(up))?;
             net.set_pair_path(flow.server.node, flow.client.node, path.through(down))?;
         }
@@ -442,6 +602,7 @@ impl Run {
             world,
             net,
             flows,
+            links: (up, down),
             scratch: Vec::with_capacity(2 * DATAGRAM as usize),
         })
     }
@@ -484,6 +645,7 @@ impl Run {
             net,
             flows,
             scratch,
+            ..
         } = self;
         let is_client = node.0.is_multiple_of(2);
         let flow = &mut flows[usize::try_from(node.0 / 2).unwrap()];
@@ -558,9 +720,16 @@ impl Run {
                 );
             }
         }
-        let deadline = connection
+        let timer = connection
             .poll_timeout()
             .map(|due| u64::try_from(due.saturating_duration_since(*epoch).as_nanos()).unwrap());
+        // A ping client wakes for its next request too
+        let ping = (is_client && state.connected && state.ping_gap.is_some())
+            .then_some(state.next_ping.max(now));
+        let deadline = match (timer, ping) {
+            (Some(t), Some(p)) => Some(t.min(p)),
+            (t, p) => t.or(p),
+        };
         world.wake(node, deadline)
     }
 
@@ -667,6 +836,9 @@ impl Run {
         self.world.schedule(warm, NodeId(0), Ev::Warm)?;
         self.world.schedule(end, NodeId(0), Ev::End)?;
         self.world.schedule(sample_every, NodeId(0), Ev::Sample)?;
+        if let Some((at, _)) = self.scenario.step {
+            self.world.schedule(at, NodeId(0), Ev::Step)?;
+        }
         self.connect(pki)?;
         loop {
             match self.world.next(&mut Fifo)? {
@@ -686,6 +858,18 @@ impl Run {
                 } => {
                     self.sample();
                     self.world.after(sample_every, NodeId(0), Ev::Sample)?;
+                }
+                Step::Event {
+                    event: Ev::Step, ..
+                } => {
+                    if let Some((_, rate)) = self.scenario.step {
+                        let link = Link {
+                            marking: self.scenario.marking,
+                            ..Link::drop_tail(rate, self.scenario.queue_bytes())
+                        };
+                        self.net.set_link(self.links.0, link);
+                        self.net.set_link(self.links.1, link);
+                    }
                 }
                 Step::Event { event: Ev::End, .. } | Step::Idle => break,
                 Step::Wake { node } => self.fire(node)?,
@@ -712,7 +896,22 @@ impl Run {
                 state.queued[(count * per_cent).div_ceil(100).clamp(1, count) - 1]
             };
             let carried = state.received - state.received_at_warm;
+            // A ping still unanswered at the end counts at what it has waited, so a stall shows
+            for (_, due, _) in &state.pings {
+                if *due >= state.warm {
+                    state.ping_latencies.push(end - due);
+                }
+            }
+            state.ping_latencies.sort_unstable();
+            let pings = state.ping_latencies.len();
+            let ping_p99_ns = if pings > 0 {
+                state.ping_latencies[(pings * 99).div_ceil(100).clamp(1, pings) - 1]
+            } else {
+                0
+            };
             let m = Measured {
+                pings,
+                ping_p99_ns,
                 carried_ppm: carried * 1_000_000 / could.max(1),
                 queue_p50_ns: at(50),
                 queue_p99_ns: at(99),
@@ -740,7 +939,24 @@ fn run(
     pki: &Pki,
     source: Source,
 ) -> Result<(Vec<Measured>, Record), SimError> {
-    Run::new(scenario, laws, pki, source)?.run(pki)
+    let specs: Vec<FlowSpec> = laws
+        .iter()
+        .map(|(law, stop_at)| FlowSpec {
+            stop_at: *stop_at,
+            ..FlowSpec::bulk(*law)
+        })
+        .collect();
+    run_flows(scenario, &specs, pki, source)
+}
+
+/// These flows at once through the scenario's bottleneck, the world's decisions from `source`.
+fn run_flows(
+    scenario: Scenario,
+    specs: &[FlowSpec],
+    pki: &Pki,
+    source: Source,
+) -> Result<(Vec<Measured>, Record), SimError> {
+    Run::new(scenario, specs, pki, source)?.run(pki)
 }
 
 fn compete(scenario: Scenario, laws: &[Law], pki: &Pki) -> Vec<Measured> {
@@ -1044,4 +1260,261 @@ fn copa_stops_competing_once_its_competitor_leaves() {
 #[ignore = "focal's grid, thirty seconds a run: a measurement, run by hand"]
 fn copa_stops_competing_over_focals_grid() {
     leaves(&HARM_GRID, 30);
+}
+
+/// A ping's request on the wire at most: [`PING_BYTES`] in a STREAM frame (a type byte, an 8-byte
+/// stream id, a 2-byte length; RFC 9000 §19.8) in a short-header packet (a flags byte, a 20-byte
+/// connection id at most, a 4-byte packet number; §17.3.1) sealed with a 16-byte tag (RFC 9001
+/// §5.3). The ping flow's load is held under its share of the link by it.
+const PING_WIRE_BYTES: u64 = PING_BYTES as u64 + 1 + 8 + 2 + 1 + 20 + 4 + 16;
+/// slates' bake-off's shape: the pings a run collects after its warm-up, so the p99 is the tenth
+/// worst; the ping flow's share of the link, per mille, light enough to measure the bulk flow's
+/// queue rather than add its own; the warm-up, twenty round trips and five seconds at least.
+const PINGS: u64 = 1_000;
+const PING_LOAD_PERMILLE: u64 = 10;
+const WARMUP_RTTS: u64 = 20;
+const MIN_WARMUP_NS: u64 = 5 * SECOND;
+/// A bulk flow that carried less than this share of the link, in parts per million, stalled
+/// (slates' bake-off: under 1% of the link's capacity).
+const STALL_PPM: u64 = 10_000;
+/// slates' fairness floor: Jain's index of two flows of one law.
+const FAIRNESS_FLOOR: f64 = 0.9;
+
+/// One scenario of the bake-off: its path, and the second bulk flow beside the first if any (its
+/// round trip, and its law where it is not the law under test).
+#[derive(Clone, Copy)]
+struct Trial {
+    name: &'static str,
+    path: Scenario,
+    second: Option<(u64, Option<Law>)>,
+}
+
+/// slates' bake-off's grid (`slates` `docs/wip/BENCHMARKS.md`, 2026-09-28): rate × round trip ×
+/// random loss, then the extras at 10 Mbit/s and 100 ms.
+fn bakeoff_trials() -> Vec<Trial> {
+    let mut trials = Vec::new();
+    for rate in [64_000, 1_000_000, 10_000_000, 100_000_000] {
+        for rtt in [20, 100, 300] {
+            for loss_ppm in [0, 1_000, 10_000, 50_000] {
+                trials.push(Trial {
+                    name: "grid",
+                    path: Scenario {
+                        loss: Loss::random(loss_ppm),
+                        ..scenario(rate, rtt, 0)
+                    },
+                    second: None,
+                });
+            }
+        }
+    }
+    let base = scenario(10_000_000, 100, 0);
+    // A Gilbert chain at a mean of 1%: bursts of four datagrams on average (leaving the bad state
+    // at 1/4 a datagram), entered at 0.01/0.99 of that, every datagram lost in it.
+    let bursty = Loss::bursty(2_525, 250_000, 1_000_000);
+    for (name, path, second) in [
+        (
+            "buffer 1/4 BDP",
+            Scenario {
+                buffer_permille: 250,
+                ..base
+            },
+            None,
+        ),
+        (
+            "buffer 4 BDP",
+            Scenario {
+                buffer_permille: 4_000,
+                ..base
+            },
+            None,
+        ),
+        (
+            "reordering ±10 ms",
+            Scenario {
+                jitter_ns: 10 * MS,
+                ..base
+            },
+            None,
+        ),
+        (
+            "burst loss 1%",
+            Scenario {
+                loss: bursty,
+                ..base
+            },
+            None,
+        ),
+        (
+            "step to 2M",
+            Scenario {
+                step: Some((0, 2_000_000)),
+                ..base
+            },
+            None,
+        ),
+        ("same-RTT fairness", base, Some((100 * MS, None))),
+        ("RTT fairness 20/100 ms", base, Some((20 * MS, None))),
+        ("beside CUBIC", base, Some((100 * MS, Some(Law::Cubic)))),
+    ] {
+        trials.push(Trial { name, path, second });
+    }
+    trials
+}
+
+/// One law's run of a trial at a seed: the bulk flow, the ping flow, and the second bulk flow.
+struct Cell {
+    ping_p99_ns: u64,
+    carried_ppm: u64,
+    stalled: bool,
+    jain: Option<f64>,
+}
+
+fn bakeoff_cell(trial: &Trial, law: Law, seed: u64, pki: &Pki) -> Cell {
+    let path = trial.path;
+    let warm = (WARMUP_RTTS * path.rtt_ns).max(MIN_WARMUP_NS);
+    let gap =
+        PING_WIRE_BYTES * 8 * SECOND * 1_000 / (path.rate_bits_per_second * PING_LOAD_PERMILLE);
+    let end = warm + PINGS * gap + 2 * path.rtt_ns;
+    let path = Scenario {
+        seed,
+        seconds: end.div_ceil(SECOND),
+        warm_ns: Some(warm),
+        // The step comes halfway through the measured span
+        step: path.step.map(|(_, rate)| (warm + PINGS * gap / 2, rate)),
+        ..path
+    };
+    let mut specs = vec![
+        FlowSpec::bulk(law),
+        FlowSpec {
+            ping_gap_ns: Some(gap),
+            ..FlowSpec::bulk(law)
+        },
+    ];
+    if let Some((rtt, other)) = trial.second {
+        specs.push(FlowSpec {
+            rtt_ns: Some(rtt),
+            ..FlowSpec::bulk(other.unwrap_or(law))
+        });
+    }
+    let measured = run_flows(path, &specs, pki, Source::Seed(seed)).unwrap().0;
+    let (bulk, ping) = (&measured[0], &measured[1]);
+    let stalled = measured.iter().any(|m| m.closed.is_some())
+        || bulk.carried_ppm < STALL_PPM
+        || ping.pings == 0;
+    let jain = match trial.second {
+        Some((_, None)) => {
+            let (a, b) = (bulk.carried_ppm as f64, measured[2].carried_ppm as f64);
+            Some((a + b).powi(2) / (2.0 * (a * a + b * b)).max(f64::MIN_POSITIVE))
+        }
+        _ => None,
+    };
+    Cell {
+        ping_p99_ns: ping.ping_p99_ns,
+        carried_ppm: bulk.carried_ppm,
+        stalled,
+        jain,
+    }
+}
+
+fn geomean(ratios: &[f64]) -> f64 {
+    (ratios.iter().map(|r| r.ln()).sum::<f64>() / ratios.len().max(1) as f64).exp()
+}
+
+/// slates' congestion bake-off on hyper-quic. **The rule, fixed before any run (slates'):**
+/// 1. a law is disqualified if any run stalls (its bulk flow under 1% of the link, a connection
+///    lost, or no ping answered), or two flows of the law score Jain's index below 0.9;
+/// 2. primary: the ping p99 under load, as the geometric mean over every trial and seed of the law's
+///    p99 over the best law's there, its worst reported beside it;
+/// 3. secondary: the bulk goodput, as the geometric mean of the best law's over the law's.
+///
+/// Each line is a CSV row (trial, path, seed, law, ping p99 ms, carried %, stalled, Jain); the
+/// ranking follows. `SEEDS` is 3, slates' count.
+#[test]
+#[ignore = "slates' bake-off, 56 trials of four laws at three seeds: a measurement, run by hand"]
+fn the_congestion_bakeoff_over_slates_grid() {
+    let pki = Pki::new();
+    let trials = bakeoff_trials();
+    // Per law: its p99 and goodput ratios to the best, its worst p99 ratio and where, its reasons
+    // for disqualification
+    let mut p99_ratios: BTreeMap<Law, Vec<f64>> = BTreeMap::new();
+    let mut goodput_ratios: BTreeMap<Law, Vec<f64>> = BTreeMap::new();
+    let mut worst: BTreeMap<Law, (f64, String)> = BTreeMap::new();
+    let mut out: BTreeMap<Law, Vec<String>> = BTreeMap::new();
+    println!("trial,path,seed,law,ping_p99_ms,carried_pct,stalled,jain");
+    for trial in &trials {
+        for seed in 1..=3 {
+            let cells: Vec<(Law, Cell)> = Law::BAKEOFF
+                .iter()
+                .map(|law| (*law, bakeoff_cell(trial, *law, seed, &pki)))
+                .collect();
+            for (law, cell) in &cells {
+                println!(
+                    "{},{},{seed},{law:?},{:.3},{:.2},{},{}",
+                    trial.name,
+                    trial.path.name(),
+                    millis(cell.ping_p99_ns),
+                    percent(cell.carried_ppm),
+                    cell.stalled,
+                    cell.jain.map_or(String::new(), |j| format!("{j:.3}"))
+                );
+                if cell.stalled {
+                    out.entry(*law).or_default().push(format!(
+                        "stalled: {} {} seed {seed}",
+                        trial.name,
+                        trial.path.name()
+                    ));
+                }
+                if let Some(jain) = cell.jain
+                    && jain < FAIRNESS_FLOOR
+                {
+                    out.entry(*law)
+                        .or_default()
+                        .push(format!("Jain {jain:.3}: {} seed {seed}", trial.name));
+                }
+            }
+            let best_p99 = cells
+                .iter()
+                .map(|(_, c)| c.ping_p99_ns.max(1))
+                .min()
+                .unwrap();
+            let best_goodput = cells
+                .iter()
+                .map(|(_, c)| c.carried_ppm.max(1))
+                .max()
+                .unwrap();
+            for (law, cell) in &cells {
+                let p99 = cell.ping_p99_ns.max(1) as f64 / best_p99 as f64;
+                p99_ratios.entry(*law).or_default().push(p99);
+                goodput_ratios
+                    .entry(*law)
+                    .or_default()
+                    .push(best_goodput as f64 / cell.carried_ppm.max(1) as f64);
+                let w = worst.entry(*law).or_insert((0.0, String::new()));
+                if p99 > w.0 {
+                    *w = (
+                        p99,
+                        format!("{} {} seed {seed}", trial.name, trial.path.name()),
+                    );
+                }
+            }
+        }
+    }
+    println!();
+    println!(
+        "| law | ping p99 vs best (geomean) | worst p99 vs best | goodput shortfall (geomean) | disqualified by |"
+    );
+    println!("|---|---|---|---|---|");
+    for law in Law::BAKEOFF {
+        let reasons = out.get(&law).map_or_else(
+            || "—".to_owned(),
+            |r| format!("{} ({} runs)", r[0], r.len()),
+        );
+        println!(
+            "| {law:?} | {:.3} | {:.2} ({}) | {:.3} | {reasons} |",
+            geomean(&p99_ratios[&law]),
+            worst[&law].0,
+            worst[&law].1,
+            geomean(&goodput_ratios[&law]),
+        );
+    }
 }

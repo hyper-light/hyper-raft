@@ -239,6 +239,73 @@ impl FileOpener {
     }
 }
 
+/// One key over every version of an object (docs/seal.md §4), for a consumer whose versions never
+/// repeat under it, through crash, restart and restore, which the consumer states and tests: each
+/// segment of version `v` is sealed at nonce `v (64 bits) ‖ index (31 bits) | LAST·[last]`, so a 4
+/// KiB overwrite reseals one segment and makes no key. The object's ID is every segment's
+/// additional data.
+pub struct VersionKey {
+    key: LessSafeKey,
+    object: [u8; 16],
+}
+
+/// The top bit of a versioned nonce's segment field, set on a version's last segment.
+const VERSION_LAST: u32 = 1 << 31;
+
+impl VersionKey {
+    /// The key of object `object`, from its lineage key `secret`.
+    pub fn new(secret: &Secret32, object: [u8; 16]) -> Result<Self, SealError> {
+        let key = guarded(SealError::Seal, || {
+            UnboundKey::new(&AES_256_GCM, secret.bytes()).map(LessSafeKey::new)
+        })?;
+        Ok(Self { key, object })
+    }
+
+    fn nonce(version: u64, index: u32, last: bool) -> Result<aws_lc_rs::aead::Nonce, SealError> {
+        if index >= VERSION_LAST {
+            return Err(SealError::Size);
+        }
+        let field = if last { index | VERSION_LAST } else { index };
+        let mut nonce = [0u8; 12];
+        fill(&mut nonce, &[&version.to_be_bytes(), &field.to_be_bytes()]);
+        Ok(aws_lc_rs::aead::Nonce::assume_unique_for_key(nonce))
+    }
+
+    /// Seals segment `index` of version `version` in place and returns its tag.
+    pub fn seal(
+        &self,
+        version: u64,
+        index: u32,
+        last: bool,
+        segment: &mut [u8],
+    ) -> Result<[u8; TAG], SealError> {
+        let nonce = Self::nonce(version, index, last)?;
+        let tag = guarded(SealError::Seal, || {
+            self.key
+                .seal_in_place_separate_tag(nonce, Aad::from(&self.object), segment)
+        })?;
+        tag.as_ref().try_into().map_err(|_| SealError::Seal)
+    }
+
+    /// Opens segment `index` of version `version` in place. Another version's, index's or
+    /// object's segment, or a change, is [`SealError::Open`].
+    pub fn open(
+        &self,
+        version: u64,
+        index: u32,
+        last: bool,
+        segment: &mut [u8],
+        tag: &[u8; TAG],
+    ) -> Result<(), SealError> {
+        let nonce = Self::nonce(version, index, last)?;
+        guarded(SealError::Open, || {
+            self.key
+                .open_in_place_separate_tag(nonce, Aad::from(&self.object), tag, segment)
+                .map(|_| ())
+        })
+    }
+}
+
 /// `header` with its data key rewrapped from `old` to `new`: the rotation that changes the header's
 /// key record and nothing else (§3.1). The commitment is unchanged, since the key is.
 pub fn rewrap(header: &Header, old: &WrappingKey, new: &WrappingKey) -> Result<Header, SealError> {
@@ -443,6 +510,31 @@ mod tests {
         assert_eq!(
             FileOpener::new(&old, &rewrapped).err(),
             Some(SealError::Unwrap)
+        );
+    }
+
+    #[test]
+    fn a_versioned_segment_opens_only_as_its_version_index_and_object() {
+        let secret = random_secret().unwrap();
+        let key = VersionKey::new(&secret, [3; 16]).unwrap();
+        let mut seg = vec![7u8; 4096];
+        let tag = key.seal(9, 2, false, &mut seg).unwrap();
+        let mut got = seg.clone();
+        key.open(9, 2, false, &mut got, &tag).unwrap();
+        assert_eq!(got, vec![7u8; 4096]);
+        for (v, i, last) in [(8, 2, false), (9, 1, false), (9, 2, true)] {
+            let mut got = seg.clone();
+            assert_eq!(key.open(v, i, last, &mut got, &tag), Err(SealError::Open));
+        }
+        let other = VersionKey::new(&secret, [4; 16]).unwrap();
+        let mut got = seg.clone();
+        assert_eq!(
+            other.open(9, 2, false, &mut got, &tag),
+            Err(SealError::Open)
+        );
+        assert_eq!(
+            key.seal(1, 1 << 31, false, &mut [0; 1]),
+            Err(SealError::Size)
         );
     }
 

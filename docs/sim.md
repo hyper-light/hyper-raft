@@ -7,8 +7,12 @@
 > hyper-transport's test network and hyper-liveness's simulation on it, and hyper-swim's first
 > simulation; its costs against the harnesses it replaced are still to measure. **S-4 built** (§14):
 > `crates/hyper-check`'s oracles, liveness, floors and the two checkers of linearizability, judging
-> hyper-raft's schedules and mantle's range simulation, the planted mutants caught. S-3 and S-5 to
-> S-8 are designed, not built. Sources and
+> hyper-raft's schedules and mantle's range simulation, the planted mutants caught. **S-5 built**
+> (§15): the exhaustive model search with slates' models at slates' class counts (463,715 and the
+> rest) and every rejected variant refused; the swarm, PCT, coverage over the TLA+ abstraction with
+> its conformance check, the round search of the real core, crash enumeration by fork and
+> shrinking, with each strategy's runs to catch each planted defect. S-3 and S-6 to S-8 are
+> designed, not built. Sources and
 > what each establishes are in `docs/research/sim.md`. The plan's starting point was mantle note 32
 > §3.10 and `docs/raft.md` §5; this design keeps their list of pieces and departs from it where §1
 > below shows a piece falls short.
@@ -674,20 +678,23 @@ allocations in release are measured at S-6 with the same schedules. The table an
 
 ## 11. Open, to be measured
 
-1. **Which strategies earn their place.** For each planted defect of §4.6 and slates' two rejected slot
-   rules: the runs random walk, swarm, PCT and coverage guidance each need to find it. A strategy that
-   never beats random walk on any is dropped.
-2. **Forks.** The size of a world with the core's and the shell's members, the cost of a clone against
-   the steps it saves, and whether `RawNode` and `Replica` can be `Clone` without cost to production.
-3. **The abstraction's cost** per step for coverage and conformance, against the step itself.
+1. **Which strategies earn their place** (measured at S-5, §15.8). For each planted defect of §4.6
+   and slates' two rejected slot rules: the runs random walk, swarm, PCT and coverage guidance each
+   need to find it. A strategy that never beats random walk on any is dropped.
+2. **Forks** (answered at S-5, §15.6: the core derives `Clone`, at no cost to production). The size
+   of a world with the core's and the shell's members, the cost of a clone against the steps it
+   saves, and whether `RawNode` and `Replica` can be `Clone` without cost to production.
+3. **The abstraction's cost** (measured at S-5, §15.10) per step for coverage and conformance,
+   against the step itself.
 4. **Swarm ranges and stretch lengths.** Distinct abstract states per CPU-second under each setting,
    the measure FDB's "carefully tuned" rates leave unstated.
 5. **Competition parallel** in the search checker, on mantle's and the E2E histories.
-6. **hyper-log under the world.** Whether its owner can be driven as a step function with its device as
-   world completions without a second code path in production, or whether its simulation keeps a
+6. **hyper-log under the world.** Whether its owner can be driven as a step function with its device
+   as world completions without a second code path in production, or whether its simulation keeps a
    thread and a deterministic hand-off.
-7. **PCT for message passing.** Reading Ozkan et al.'s construction (only the abstract was reachable)
-   and choosing between per-member priorities and chain partitioning by measurement.
+7. **PCT for message passing** (per-member priorities built at S-5, §15.3; chains still unread).
+   Reading Ozkan et al.'s construction (only the abstract was reachable) and choosing between
+   per-member priorities and chain partitioning by measurement.
 8. **The time type.** Whether the sans-io crates should take time as nanoseconds rather than
    `std::time::Instant`, which removes the anchor of §3.2; it touches every crate's API and is the
    timing work's to decide.
@@ -1181,3 +1188,373 @@ SHA-256 here so a later reading can tell it read the same file:
 - **Elle** for transactions stays out of scope (§4.3).
 - **The strategies' worth** against the mutants (§11 item 1) is S-5's: S-4 records the seeds a
   random campaign from seed 0 needed.
+
+## 15. S-5 as built (2026-10-04)
+
+The strategies of §4.5, built in `crates/hyper-check` beside S-4's judges and run on hyper-raft's
+core:
+- `src/explore/`: the exhaustive search of a model (`mod.rs`: the `Model` trait, the serial
+  breadth-first search with shortest histories, the parallel level-synchronous search; `pack.rs`,
+  `symmetry.rs`), and the round search of an implementation (`rounds.rs`);
+- `src/strategy/`: the swarm's draws (`swarm.rs`), PCT and its confidence (`pct.rs`), the decision
+  tape with its feasible mutations and shrinking (`tape.rs`), coverage guidance (`guided.rs`), and
+  crash enumeration by fork (`fork.rs`);
+- `src/conform.rs`: the TLA+ abstraction, its conformance check and its coverage points;
+- `src/table.rs`: the budgeted open-addressing table, moved out of the search checker's memo so the
+  visited sets and the coverage set use it too;
+- `tests/exhaustive.rs` with `tests/models/`: slates' slot and prefix models, built again;
+- in hyper-raft, `tests/strategies.rs` (the swarm, PCT, coverage with conformance, the round
+  search, shrinking and the campaigns), `tests/pipeline.rs` (crash enumeration by fork, held to the
+  replay), and `tests/support/judge.rs` (S-4's judge, moved out of `tests/check.rs` so both
+  files judge with it, and its runs driven by any `Driver`).
+
+### 15.1 Exhaustive search, model level (§4.5)
+
+slates' design, built again under the production lints: a `Model` names its states, actions,
+faults and a packed representative of a state's class; `shortest` is breadth first on one thread
+with each class's key and parent in one table (the ids are breadth-first order, so the queue is a
+cursor over it) and replays the chain of representatives into a concrete shortest history;
+`explore` is breadth first level by level on a stated number of scoped workers over 128-bit
+fingerprints, one shard a worker, nothing shared mutably, the workers joined before each phase
+ends. The models' packer (`Packer`) and the representative's tie orders (`least_over_ties`) are
+in the crate, each refusing what does not fit with a typed error.
+
+**Memory, counted exactly.** slates held its counted bytes to the ceiling over a measured factor
+of two between resident and counted memory (`RESIDENT_PER_ACCOUNTED`), for the growth it did not
+count. Here every table and vector is counted at its capacity, a growth with its old and new buffer
+together, before it is made; a search that would pass its `Budget` stops with `Outcome::Unknown`
+and what it reached, never a pass. The counted peak bounds the resident one: 2.85 GB counted
+against 2.19 GB resident at the largest scope (slot model, five members, four terms), and the
+serial search's peak by the counting allocator stays within a 1 MiB budget that refuses
+463,715 classes (`a_search_past_its_budget_says_unknown_and_holds_no_more`). The budget is §7's
+4 GiB.
+
+**Workers.** Four, GitHub's standard Linux runner's vCPUs, where CI's `explore` job runs the full
+scopes. The classes counted do not depend on them: 56,971 at (4, 1, 2, 3) with 1, 2, 3 and 7
+workers and serially (`the_workers_change_no_count`).
+
+**The slot model** (`tests/models/slot.rs`) reaches every count slates recorded, exactly:
+
+| Rule | Scope (members, indexes, values, terms) | Classes | slates |
+|---|---|---|---|
+| ballots | 4, 1, 2, 4 | **463,715** | 463,715 |
+| ballots | 5, 1, 2, 3 | 1,586,398 | 1,586,398 |
+| ballots | 4, 1, 3, 4 | 642,654 | 642,654 |
+| ballots | 5, 1, 2, 4 | 23,552,907 | 23,552,907 |
+| ballots | 3, 2, 2, 2 | 639,871 (every path, a commit above an uncommitted index among them) | not recorded |
+| published, as written | 4, 1, 2, 4 | disagreement in 15 steps, at 1,049,232 classes | 1,049,232 |
+| published, once a term | 4, 1, 2, 4 | disagreement in 18 steps, at 1,199,113 classes | 1,199,113 |
+| published, keeping leader-approved entries | 4, 1, 2, 4 | 999,583, no disagreement; stalls after one crash | 999,583 |
+
+The serial counts to a fault match too, so the search meets each fault where slates' did: its order
+of actions is slates'. slates' two scripted histories (five members losing a fast-committed entry;
+the stall) are tests here as there.
+
+**The prefix model** (`tests/models/prefix.rs`). Built as slates' was, it reaches slates' counts
+only when a cut log keeps its stale tail past its length as slates' array does: slates' signature
+reads every place of the array, so one orbit may take two keys (`docs/research/sim.md` §7). The
+model states which (`Tail`), and is held to both:
+
+| Variant | Scope | Classes, tail cleared (one key an orbit) | Classes, tail stale | slates |
+|---|---|---|---|---|
+| design | 3, 3, 1, 2 | 1,951,672 | 1,951,672 | 1,951,672 |
+| design | 3, 3, 1, 3 | 21,771,580 | 21,776,022 | 21,776,022 |
+| design | 4, 2, 2, 3 | 12,551,719 | 12,559,351 | 12,559,351 |
+| design | 3, 2, 2, 4 | 3,400,472 | 3,401,082 | 3,401,082 |
+| reporting logs too | 3, 3, 1, 3 | 21,785,636, 49,654 recoveries from a log | 21,789,824, the same 49,654 | 21,789,824, 49,654 |
+
+**Every `Variant` refused**, each by its shortest history at slates' length, and at slates' serial
+count with the stale tail:
+
+| Variant | Scope | Fault | Steps | Classes reached (cleared / stale) | slates |
+|---|---|---|---|---|---|
+| commits counted from windows | 3, 3, 1, 3 | a new leader lacks index 2 | 12 | 382,705 / 382,952 | 12 steps, 382,952 |
+| slots dropped once covered | 3, 3, 1, 3 | a new leader lacks index 2 | 16 | 2,014,571 / 2,015,576 | 16, 2,015,576 |
+| slots pruned at a commit counting fast ones | 3, 3, 1, 3 | logs diverge at index 2 | 12 | 860,670 / 860,982 | 12, 860,982 |
+| slots dropped at a sync | 3, 3, 1, 4 | a new leader lacks index 2 | 18 | 15,374,180 / 15,379,817 | 18, 15,379,817 |
+| voters report their logs too | 3, 3, 1, 3 | no property breaks; refused for recovering a deposed leader's entry from a log (49,654 times), which the design never does | — | — | the same |
+
+The default suite runs the 463,715 scope, the workers' check, the scripted histories and the
+budget's refusal (14 s in debug); everything else runs in release in CI's new `explore` job and
+took 14.7 min on the owner's machine at load 69, 2.48 GB resident at most.
+
+### 15.2 Random walk under swarm configurations (§3.8)
+
+`strategy::Swarm` draws each seed's configuration from a stream of its own (named for the seed, so
+it never moves the schedule's draws): each feature on with even odds (Groce et al. §2), each rate
+uniform over its range. hyper-raft's `Configuration::swarm` states the ranges, each the schedule
+tests' own: the rules (pre-vote, check-quorum, refusing what arrives ahead of a hole, a round a read,
+bare answers, precedence by length, and for pipelined members applying before durability), the
+windows and message sizes the tests use, every kind of step on or off (changes, a leader leaving,
+restarts, compaction, partitions, priorities, windows, bursts of reads), losses and repeats up to
+three in four (`tests/check.rs`' hostile networks), the fast track's share up to all, persistence
+steps up to three in four, and three or five members. The group's kind (fast, pipelined) is the
+harness's: the fast track's defects need the fast track.
+
+### 15.3 PCT over members (§4.5, §11 item 7)
+
+`strategy::Pct` is the paper's algorithm with members for threads (priorities `d … d + n − 1` by
+Fisher and Yates's shuffle, `d − 1` change points uniform in `[1, k]`, the member that would run
+lowered at each). Its steps are the deliveries at which messages for two or more members race; a
+delivery with one member's messages only is no step. hyper-raft's `Prioritized` driver lets
+`Cluster::choose` draw everything as before and replaces only which message a delivery takes: the
+oldest message to the enabled member of highest priority. **Departure from §4.5's open choice
+(§11 item 7):** per-member priorities, not chain partitioning (Ozkan et al.'s construction, whose
+paper was not reachable): a member's messages are its chain, taken oldest first.
+
+`k`, measured: the most racing deliveries any of the 96 default seeds' runs took — 1,939 (group),
+377 (pipelined), 2,051 (fast), 2,035 (the first rule's harness) (`racing_deliveries_are_counted`).
+`confidence` gives `1 − (1 − 1/(n·k^(d−1)))^R`; at these `k` a depth-two bug is found with
+probability at least 1.0·10⁻⁴ a run at five members, so the campaigns' run counts reach, for
+depths one, two and three, the confidences tabled in §15.8.
+
+### 15.4 Coverage over the TLA+ abstraction, and the conformance check (§4.5, §11 item 3)
+
+`conform::Abstract` reads a group as `FastTrack.tla`'s variables, from what each member holds
+durably (its device's term, vote, log and commit, what it holds beside its log) with whether it
+runs and leads. **The conformance check** holds every step to the relations every action of the
+model's `Next` keeps (`src/conform.rs` names each with its actions): a term never falls; a vote cast
+stays within its term; a commit never falls and a committed entry never changes, but by a fault at
+rest (`Lose`); no entry bears a term above its member's; what a member holds beside its log is
+above it; a member that becomes leader voted for itself; a leader keeps its log in its term and adds
+only entries of its term. **Departure from §4.5:** these are the projections of `Next` on each
+member's variables, not a search for a sequence of model actions from one abstract state to the
+next; the model's messages are not abstracted (it keeps a member's last word, `says`, which the
+implementation's messages in flight do not map onto one to one).
+
+Every step of the default schedules is a model step: 244,088 steps over 24 group seeds, 24 fast and
+12 pipelined, the liveness phases included (`every_step_of_the_default_schedules_is_a_step_of_the_model`),
+and every step of every coverage campaign below.
+
+**Coverage** is the abstract state's shape, bounded: per member whether it runs, its role, its
+vote's kind, its term, log length, last log term and commit each as an offset below the group's
+greatest capped at three (FastTrack.tla's largest `MaxTerm` and `MaxLen`), and its entries beside
+its log capped at two (`HeldAt`'s most). **The campaign** (`guided_campaign`, Gulcan et al.'s
+Algorithm 1): fresh tapes while no corpus entry has energy, then mutations of the entry with the
+most; a run that reaches `m` new points joins the corpus with energy `m`, one run a unit; the corpus
+holds 64 tapes, the weakest giving way. A tape's first step is the group's seed, so a mutation may
+draw another group's member randomness as it draws another schedule.
+
+**The tape** (`strategy::tape`). Every word a schedule draws, grouped by step, each step tagged as
+a delivery, a crash or other. A word is read as the harness reads any draw (the high half of its
+product with the bound), so any tape is feasible, and a tape recorded from a seed is that seed's run
+(SplitMix64 read the same way). Mutations are Gulcan et al.'s three over steps: a step's words
+redrawn (which link or member it chose), two steps of a kind exchanged, a step dropped or repeated
+(one delivery fewer or more). The tape's bound is four times the most words any default seed drew
+(25,358) and a step for the seed.
+
+### 15.5 Implementation-level exhaustive search at a tiny scope (§4.5)
+
+`explore::rounds` searches every sequence of a few rounds of a real system depth first, the
+systems alive at once one per round of the path (§7's bound for forks), each round's resulting key
+held in a fingerprint set within the budget, a prefix not followed when its key was explored with as
+many rounds left. hyper-raft's `Tiny` is three members, all voters, on focal's rules with one
+entry an append, no pre-vote, no check of quorum, and refusing what arrives ahead of a hole. A
+round is one of 144 scenarios (Twins §4.2): a leader (3), its election's partition (3), its
+replication's partition (4), whether its replication carries entries of its new term (2), and
+whether it then takes a proposal it sends to no one (2). Every member restarts at a round's start,
+so a round's state is the members' disks and the judge's oracles, which the key holds: the
+reduction's claim (two prefixes with one key have the same futures) holds by construction.
+**Departure from §4.5:** no symmetry reduction; members are renamed by nothing, since the key
+holds the oracles' ghosts, which name members.
+
+| Rounds | Rounds played | Distinct states | Prefixes pruned | Result |
+|---|---|---|---|---|
+| 2 | 12,240 | 85 | 60 | every oracle keeps (default suite) |
+| 3 | 249,840 | 1,735 | 10,506 | every oracle keeps, with the older-term commit planted too |
+| 4 | 4,481,280 | 31,120 | 218,721 | every oracle keeps |
+| 4, the older-term commit planted | 33,621 to the catch | — | — | caught: Leader Completeness |
+
+The search found the commit counted from an older term's replicas in four rounds — a shorter
+history than the thesis's Figure 3.7, at index 1: member 1 leads by {1, 2} and replicates its
+first entry to no one; member 2 leads by {2, 3}, likewise; member 1 leads again by {1, 3} and gives
+member 3 its old entry and nothing of its term, so the defect commits it; member 2 leads by {2, 3}
+without it. The figure's own path is a directed test (`figure_three_seven_is_a_path_of_four_rounds`).
+2,096 random group schedules never reached either (§14.6).
+
+### 15.6 Crash enumeration by fork (§3.7, §11 item 2)
+
+**The core made `Clone`.** `RawNode`, `Raft`, `Log`, `Unstable`, `Page`, `Early`, `Outgoing` and
+`Given` derive `Clone` (every other type a member holds already did): a derive adds code only where
+a clone is asked for, so production pays nothing. The harness's `New`, `Lagged`, `Cluster` and
+`Member` derive it too.
+
+`strategy::fork::each_point` runs a schedule once and, after each step that returns a point, clones
+the world, runs the clone's branch to its end, and drops it before the trunk's next step: one child
+alive at a time. hyper-raft's `pipeline.rs` now enumerates its crashes by it (`forked`): at each
+persistence step that did something, the group and its draws are cloned, the member crashed in the
+clone, and the clone run through the rest of the schedule and its liveness phase. **The gate**
+(`a_crash_point_forked_ends_as_its_replay_ends`): every crash point of every schedule the
+enumerations take — 1,964 without faults at rest and 2,016 with, over 4 settings × 11 seeds × 400
+steps — ends forked exactly as the replay with the crash there ends: every member's disk and view,
+what was committed, the persistence steps' coverage, faults, waits, repairs and incarnations. The
+trunks took 17,600 steps where the replays' prefixes took 785,600 and 806,400.
+
+### 15.7 Shrinking (§4.5)
+
+`strategy::tape::shrink` removes chunks of steps, halving them, then single steps until a whole
+pass removes none (Zeller and Hildebrandt's `ddmin`, complement steps): the result is 1-minimal, or
+the run budget ended first and it says so. The random walk's catch of a read before the term's first
+commit (seed 0 of the group schedules), recorded through a tape — which replays the seed's run
+exactly, the same steps and the same violation — shrinks from 944 steps to 30 in 471 runs, 1-minimal,
+and still fails with a stale read
+(`a_failing_run_shrinks_to_a_minimal_tape_that_fails_the_same_way`).
+
+### 15.8 The runs each strategy needed (§4.6, §11 item 1)
+
+Each campaign runs its strategy from its first seed until a run catches the defect, within the
+random walk's own count (§14.6), so that a strategy not catching within it has not beaten the
+random walk on that defect, and at least the 2,096 runs the random walk was given for the defect it
+never caught. Each harness and its mix is `tests/check.rs`'s; each catch's run without the defect
+keeps every oracle (§15.9). Release, the campaigns' processes four to six at once beside other
+sessions' work, load 9–72 (`docs/benchmarks.md`, "hyper-check's strategies and searches (S-5)").
+
+| Defect (§4.6) | Random walk (§14.6) | Swarm | PCT, depth 1 | PCT, depth 2 | Coverage-guided | Exhaustive rounds (rounds played) |
+|---|---|---|---|---|---|---|
+| a commit counted from an older term's replicas | not in 2,096 | **172** | not in 2,096 | not in 2,096 | not in 2,096 | **33,621** (four rounds) |
+| a read served before the term's first commit | 1 | 16 | 3 | 3 | 99 | outside its scenarios (no reads) |
+| a vote sent before it is durable | 1 | 1 | 1 | 1 | 1 | outside its scope (no lagging writes) |
+| the fast track without its first rule | 47,819 | **706** | 25,324 | 21,181 | **4,787** | outside its scope (no fast track) |
+| the fast track without its second rule | 121,041 | not its defect: run 41,346 found the core's open one (§15.9) | 103,278 | 103,278 | not in 121,041 (5,385,415 abstract states covered) | outside its scope |
+
+The guarantees the PCT campaigns' run counts carry, by Theorem 9 at their `k`, five members: for a
+defect of depth one, 1 − (4/5)^R, above 0.9999 at every count here but the first runs; for depth two,
+0.875 at 21,181 runs (the first rule's `k` of 2,035), 0.194 at 2,096 (the group's 1,939); for depth
+three, at most 1.2·10⁻³. **What the counts say.** The swarm beats the random walk by 68 times on the
+first fast-track rule and catches the older-term commit, which the random walk never caught; on the
+second rule it found the core's open defect (§15.9) before the planted one, so its count there says
+nothing of the strategy. Coverage guidance beats the random walk by 10 times on the first rule and
+does not catch the second within 121,041 runs, covering 5.4 million abstract states; PCT beats it
+by about 2 times on the first rule and by 1.2 times on the second, and not at all on
+the older-term commit, where the defect needs an order of elections and partitions rather than of
+deliveries. The exhaustive round
+search is the only strategy that guarantees its result within its scope: it plays every four-round
+scenario, and the older-term commit is among them.
+
+### 15.9 What the strategies found
+
+The swarm with no defect planted, every step held to the model and every group required to settle
+(`the_swarm_with_no_defect_keeps_every_oracle_and_the_model`, 5,000 seeds of each of the group,
+fast and pipelined harnesses), and the swarm's campaigns, found two defects of the core, two of the
+harness and three of the judges. Each was traced to its cause; all but the core's second are
+corrected, each with a directed test that fails without its correction, and the second is open (below). With them corrected the hunt ends with no failure over its 15,000 seeds, and every catch of
+§15.8 is its defect's: the same run without it keeps every oracle (`each_catch_by_seed_is_its_defects`,
+`each_catch_by_coverage_is_its_defects`). The round search to four rounds and the conformance check
+over the default schedules found nothing.
+
+**In the core: a leader of an older term never told of the newer one** (fast seed 3,112: four
+members, neither check-quorum nor pre-vote, changes on). A change made member 1 a learner in its
+group's later configuration while member 1, not yet having applied it, led term 24 by an older one;
+member 3, in the later configuration's joint form, campaigned without end (its log too short for the
+others), reaching term 3,898; member 1 sent its heartbeats of term 24 to member 3, which dropped them.
+A member answered an append or heartbeat of an older term only under check-quorum or pre-vote, as
+raft-rs does, leaving the rest to its vote requests, and a member's vote requests go only to the voters
+its configuration names: member 1 led its old term for ever and the group never converged. It now
+answers whatever the settings (thesis Figure 3.1, "reply false if term < currentTerm"; `Raft::step_older_term`,
+`docs/raft.md` §3.3), and the leader steps down
+(`a_member_of_a_later_term_answers_a_leader_of_an_earlier_one`, which fails without it; the seed,
+`the_swarm_seeds_whose_groups_never_converged_settle`). The differential with raft-rs loses such a
+message for both cores, a third decided difference, and holds that its runs reach it.
+
+**Open in the core: a fast-committed entry lost with the record of a vote** (swarm campaign against
+the second rule, fast seed 41,345, no defect planted: four voters, check-quorum on, pre-vote off, no
+changes, restarts or partitions). Index 10 was committed by the fast quorum in term 13, member 4's
+vote among the three. Member 4 led term 18, recovered the entry into its log and so released its
+vote (`Raft::release_proposals`: a member holds only above its log); term 23's leader cut member 4's
+log at index 6 with an append that carried entries short of index 10, member 4 then held another
+proposal there, and member 4 was elected in term 34 by members 1 and 3, neither of which held anything at index 10 by
+itself: the most held of the reports was the other value. The recovery argument (`track.rs`, after Fast Paxos's
+condition O4) takes a member that holds the entry from a leader to vote for no candidate lacking it,
+which fails once a later leader's recovery stamps its term on entries below the index. slates'
+search refuses the same rule (`Variant::DropCovered`, §15.1) and releasing at a commit that counts
+fast commits (`Variant::PruneAtFastCommit`); its design releases a vote only under a classic commit.
+`FastTrack.tla` keeps hyper-raft's release, and its `Replicate` always sends through the leader's
+end, so it never cuts a log short of an index and cannot reach the run. The fix changes the core's
+release rule, what a follower learns of the classic commit, the storage's contract for what it holds
+and the model together, and is its own series; until it lands the seed's test is ignored
+(`a_fast_committed_entry_outlives_a_vote_its_log_covered_and_then_lost`, which fails today).
+
+**In the harness:**
+- *A snapshot lost at the network's bound was never reported to its sender* (fast seed 2,396). The
+  network drops its oldest message to take a new one; a dropped snapshot left its leader waiting on
+  it for ever, the member it was for caught up but never again sent to. An owner whose transport
+  drops a transfer reports it failed; `Cluster` now does (`Cluster::report`; the seed's test fails
+  without it).
+- *The liveness phase had no bound* (§4.2: a group that keeps moving without converging is ended by
+  the run's budget, never passed). Seed 3,112's phase ran for hours, its terms moving and its group
+  never converging, so the quiet period never passed. The strategies' groups now state their bound,
+  four times the most operations any of the swarm's 15,000 seeds took in its phase (11,292; the
+  default seeds took at most 1,556), and a run past it is reported unconverged
+  (`Cluster::liveness_bound`). The schedule tests that do not state one keep none: S-6's, when they
+  move onto the world (§8).
+
+**In the judges** (pipelined seeds of the first hunt of 2,000 seeds, eight failures, and a fast
+seed of the swarm's campaign against the second fast-track rule, whose catch was no catch: the run
+failed the same way with the defect taken out; held by
+`the_swarm_seeds_that_found_the_judges_wanting_keep_every_oracle_and_the_model`):
+- *The durability oracle's I1 refused a request the core may send* (seeds 123, 522, 967). A member
+  campaigned with a log of an older term (seed 123: twenty entries of term 1); before its write's
+  notice, term 3's leader cut its log to two entries, and that write was durable too, writes being
+  durable in order and their notices later (I7). The request, released at its notice, named index
+  20 of term 1, which the device no longer held. `docs/durable.md` §3 said a request "names only a
+  last entry `D` holds", which the core never promised against later writes of the term. A request
+  is judged by the last entry it names (thesis §3.6.1), and the device's log, (term 3, index 2), is
+  more up to date than (term 1, index 20): every entry a voter granting the request could require is
+  held. The oracle and §3 now state that (`a_request_from_a_log_its_terms_leader_cut_is_judged_by_its_claim`,
+  which refuses a claim more current than the device as before).
+- *The abstraction read a leader whose term was not yet durable as the model's leader* (seeds 299,
+  585, 1,159, 1,580, 1,633, each a member that applies before durability, alone a voter after a
+  change, elected at once). Such a member sends nothing until its term and vote are durable (I1), and
+  leads in the model once that write is (`docs/models/README.md`, "Readies ahead of their
+  persistence"); the abstraction now counts a member as leading only in a term its device holds.
+- *Log Matching refused a term falling after a member's committed prefix* (fast seed 34,957). Index
+  40 was committed under term 33 at member 3 (term 33's leader took it again at its election and
+  stamped it, as the fast track does); member 1, leading term 37, held it under term 32 and sent its
+  entry of term 32 at index 41 after it. A member keeps its committed prefix as it holds it and takes
+  its leader's entries after it, whatever the two stamped the committed entries with
+  (`Log::append_after`; `FastTrack.tla`'s `Replicate`, from `Max(p, commit[m]) + 1`), so member 3's
+  log held term 32 after term 33. The election restriction is not weakened: an entry is committed
+  only by holders whose last entry bears the committing leader's term (classically its own entry
+  after it; by the fast quorum, the first rule), and a log's last term bounds what it may lack only
+  above its commit. The oracle now lets a term fall in a fast group only where the entry before is
+  committed at the member (`LogMatching::holds_at`, `a_term_falls_only_after_a_fast_members_committed_prefix`).
+  `FastTrack.tla`'s own `LogMatching` compares whole entries, terms included, and would refuse that
+  state; its scopes (at most two indexes or three terms) do not reach it. Whether the invariant
+  should compare what entries state below a member's commit is the model's to decide in CI (§15.11).
+
+**slates' prefix model's representative** is not one key an orbit (§15.1, `docs/research/sim.md`
+§7): its counts are 0.02 % to 0.06 % above the classes'. No verdict of slates' changes. slates is
+not edited here; the finding is reported to its owner.
+
+### 15.10 Costs
+
+`docs/benchmarks.md`, "hyper-check's strategies and searches (S-5)". In brief, CPU a run, p50 /
+p99, load 17–20: the random walk 14.2 / 32.5 ms (group), the swarm 8.9 / 114.8, PCT 15.1 / 35.0,
+the walk with every step held to the model 20.1 / 51.1 (the abstraction's cost, §11 item 3: 1.4
+times the walk), the coverage campaign 50.9 / 63.6; a round of the round search 37 µs; crash
+enumeration by fork 7.1 / 14.8 ms a schedule against the replay's 12.4 / 22.3; the full-scope model
+searches 14.7 min, 2.48 GB resident at most.
+
+### 15.11 Open in S-5
+
+- **The fast track's lost entry** (§15.9, swarm fast seed 41,345): fixed in its own series from
+  `line`. A vote counts toward a fast quorum only while it is held, and a member keeps what it holds
+  until its own classic commit, learned through an in-order append, covers it (slates' design,
+  `Variant::DropCovered` and `PruneAtFastCommit` refused). That series changes the model and the
+  wire, and re-runs the swarm and PCT campaigns against the second rule with no defect planted.
+- **`FastTrack.tla` as a Rust `Model`** (§4.5's last paragraph): not built. The model-level search
+  runs slates' two models; the core's own model is checked by TLC in CI and, on the implementation's
+  schedules, by the conformance check's projections of its `Next` (§15.4).
+- **The conformance check is by projection** (§15.4): a step is held to every relation the model's
+  actions keep, not shown to be a sequence of model actions.
+- **The round search's scope** leaves out reads, lagging writes and the fast track (§15.8), and
+  applies no symmetry (§15.5); three of the five planted defects lie outside it.
+- **PCT's chains** (§11 item 7): per-member priorities were built; Ozkan et al.'s construction is
+  still unread.
+- **The strategies in the schedule tests**: the swarm, PCT and coverage run as campaigns here;
+  moving `tests/group.rs`, `fast.rs` and `pipeline.rs` onto them, and hyper-durable's crash
+  enumeration onto forks, is S-6's (§8).
+- **slates' prefix model's representative** (§15.9) is slates' to correct; reported, not edited.
+- **`FastTrack.tla`'s `LogMatching`** compares whole entries, and the fast track's committed prefixes
+  may differ in their stamps (§15.9), which its present scopes do not reach. TLC runs in CI only;
+  the invariant's change, and a scope that reaches such a state, are owed to the model.

@@ -1491,3 +1491,30 @@ fn the_swarm_seeds_whose_groups_never_converged_settle() {
         assert!(judged.settled, "seed {seed}: the group did not converge");
     }
 }
+
+/// An open defect of the fast track, found by the swarm's campaign against its second rule at fast
+/// seed 41,345 with no defect planted (`docs/sim.md` §15.9): four voters, index 10 committed by the
+/// fast quorum in term 13, member 4's vote for it among the three; member 4 later led term 18 and
+/// took the entry into its log, which released what it held beside its log there (a member holds a
+/// proposal only above its log, `Raft::release_proposals`); term 23's leader cut member 4's log
+/// below index 10 (its entries bore term 18, the leader's term 13), member 4 then held another
+/// proposal at 10, and the election of term 34 by members 1, 3 and 4 recovered the most held of
+/// their reports, the other value. slates' search refuses the same rule (`Variant::DropCovered`,
+/// `tests/models/prefix.rs`: a slot dropped once its log covers the index loses a committed entry);
+/// `FastTrack.tla`'s `Release` keeps it, and its scopes do not reach the run. Ignored until the
+/// fast track keeps a vote's record until a commit no later leader can lack covers it, which
+/// changes the core, its storage's contract and the model together.
+#[test]
+#[ignore = "an open defect of the fast track (docs/sim.md §15.9): fails until it is fixed"]
+fn a_fast_committed_entry_outlives_a_vote_its_log_covered_and_then_lost() {
+    let seed = 41_345;
+    let configuration = Configuration::swarm(Harness::Fast, seed);
+    let judged = run(
+        Harness::Fast,
+        &configuration,
+        seed,
+        None,
+        &mut Seed(Seeded(seed)),
+    );
+    assert_eq!(judged.violation, None);
+}

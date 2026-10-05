@@ -5972,6 +5972,84 @@ the memo's table doubling and the order's growth. A refused history costs three 
 configuration, for every configuration is reached and then searched again on whole keys, whose
 `BTreeSet` keys allocate.
 
+## hyper-check's strategies and searches (S-5, 2026-10-04)
+
+What a run of each strategy of `docs/sim.md` §15 costs (`docs/tails.md` §1a): CPU time from
+`proc_pid_rusage(RUSAGE_INFO_V6)`, instructions and cycles, allocations and the most bytes held at
+once from the counting allocator, by `hyper_measure::cost` around each run, p50 / p99 / max by
+nearest rank (at 96 runs the p99 is the most). Apple M5 Max (Mac17,6), 18 cores, 128 GiB, macOS
+26.4.1, rustc 1.98.0, release, branch `check-s5`; the one-minute load average beside each, from
+other sessions' builds and campaigns and this work's own campaigns (four to six single-threaded
+campaign processes ran beside every measurement here; none was waited out).
+
+**A run of each strategy**, 96 runs of the harness's 4,000-step schedules and liveness phase, no
+defect planted, one test at a time (`cargo test --release -p hyper-raft --all-features --test
+strategies -- --ignored --exact strategy_costs --nocapture --test-threads 1`, on the tree with
+§15.9's corrections), load 17.5–20.3:
+
+| Harness | Strategy | User ms | Instructions (M) | Allocations (k) | Peak bytes (k) |
+|---|---|---|---|---|---|
+| group | random walk | 14.2 / 32.5 / 32.5 | 328 / 714 / 714 | 403 / 790 / 790 | 245 / 404 / 404 |
+| group | swarm | 8.9 / 114.8 / 114.8 | 213 / 2,525 / 2,525 | 257 / 3,029 / 3,029 | 150 / 686 / 686 |
+| group | PCT, depth 2 | 15.1 / 35.0 / 35.0 | 358 / 815 / 815 | 423 / 819 / 819 | 255 / 406 / 406 |
+| group | random walk, every step held to the model | 20.1 / 51.1 / 51.1 | 462 / 1,094 / 1,094 | 452 / 845 / 845 | 247 / 415 / 415 |
+| group | coverage-guided (conformance, coverage, tape) | 50.9 / 63.6 / 63.6 | 809 / 1,009 / 1,009 | 510 / 623 / 623 | 774 / 895 / 895 |
+| fast | random walk | 15.3 / 26.3 / 26.3 | 339 / 519 / 519 | 401 / 646 / 646 | 292 / 461 / 461 |
+| fast | swarm | 9.9 / 125.4 / 125.4 | 227 / 2,610 / 2,610 | 271 / 3,134 / 3,134 | 191 / 1,229 / 1,229 |
+| fast | PCT, depth 2 | 14.7 / 30.6 / 30.6 | 338 / 719 / 719 | 380 / 741 / 741 | 289 / 608 / 608 |
+| fast | random walk, every step held to the model | 21.5 / 33.6 / 33.6 | 466 / 705 / 705 | 473 / 731 / 731 | 296 / 467 / 467 |
+| fast | coverage-guided | 49.5 / 73.2 / 73.2 | 717 / 944 / 944 | 431 / 615 / 615 | 812 / 946 / 946 |
+
+System time was under 1.6 ms a run in every row. The conformance check costs a run 1.4 times the
+random walk's CPU at the median (20.1 against 14.2 ms): the abstraction copies every member's log a
+step (`docs/sim.md` §11 item 3). The coverage campaign's run costs 3.6 times the random walk's: the
+abstraction, the coverage set's insert and the tape's record of every word. The swarm's median run is
+cheaper than the random walk's (its configurations often turn off kinds of steps), its tail dearer
+(losses and repeats to three in four lengthen the liveness phase). PCT costs what the walk does. The
+same measurement before the corrections, at load 52–55, gave the same allocation counts but the
+swarm's (its configurations' runs changed with the core's correction) and CPU times 4–20 % higher.
+
+**The round search and shrinking** (same command and run): one exhaustive search of two rounds of
+three members, 12,240 rounds played, 450 ms user (p50 of 3 searches), 8.38·10⁹ instructions, 8.71
+million allocations, 92 KB held at most — 37 µs and 712 allocations a round played; shrinking seed
+0's read before the first commit from 944 steps to 30, 471 runs, 173 ms user, 3.71 million
+allocations, 370 KB held at most.
+
+**The round search at four rounds** (`... --exact four_rounds_of_three_members_catch_the_older_term_commit
+--nocapture --test-threads 1`, load 58–69): three rounds twice (249,840 rounds played each), four
+rounds clean (4,481,280) and four with the older-term commit planted to its catch (33,621) in
+512 s wall, 163 s user, 7.5 MB resident at most.
+
+**Crash enumeration, by fork and by replay**, per schedule enumerated (one of 44: four settings ×
+11 seeds of 400 steps, 1,964 crash points; `cargo test --release -p hyper-raft --all-features
+--test pipeline -- --ignored --exact crash_enumeration_costs --nocapture --test-threads 1`, load
+56.4):
+
+| | User ms | Instructions (M) | Allocations (k) | Peak bytes (k) |
+|---|---|---|---|---|
+| by fork | 7.1 / 14.8 / 14.8 | 163 / 350 / 350 | 214 / 471 / 471 | 94 / 111 / 111 |
+| by replay | 12.4 / 22.3 / 22.3 | 278 / 500 / 500 | 368 / 663 / 663 | 63 / 81 / 81 |
+
+The fork takes 57 % of the replay's CPU and 58 % of its allocations at the median, and holds 47 %
+more at its peak (the clone beside the trunk). The saving is the prefixes' 400-step schedules
+(17,600 steps of trunk against 785,600 of prefix and rest); each branch's liveness phase, which the
+fork does not save, is most of the rest. A clone of the group costs what its members hold (§11
+item 2: a member's log, its progress and its queues; no measured cost to production, a derive adds
+no code where nothing clones).
+
+**The exhaustive model searches** (`cargo test --release -p hyper-check --test exhaustive --
+--ignored --test-threads 1 --nocapture`, four workers, load 62–71):
+
+| Search | Classes | Wall | User | Peak |
+|---|---|---|---|---|
+| slot model, ballots, 4, 1, 2, 4 (the default suite's) | 463,715 | 0.71 s with its suite | — | 45.6 MB counted |
+| slot model, ballots, full scope: 5, 1, 2, 3; 4, 1, 3, 4; 5, 1, 2, 4; 3, 2, 2, 2 | 26,421,830 in all | 102.9 s | 167.7 s | 2.19 GB resident (2.85 GB counted) |
+| prefix model, design, 3, 3, 1, 3, tail cleared | 21,771,580 | 52.7 s | 88.2 s | 2.30 GB resident (1.92 GB counted) |
+| every ignored search (§15.1's tables) | — | 884.6 s | 800.8 s | 2.48 GB resident |
+
+CI's `explore` job ran the ignored searches in 12.2 min with its build (run 37248774674, ubuntu-24.04,
+four vCPUs). The 4 GiB ceiling of `docs/sim.md` §7 held every search.
+
 # hyper-multilog
 
 `docs/multilog.md` §11 steps 4 and 5. The machine is the one in "The machine and the runs" above (Apple

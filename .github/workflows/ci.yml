@@ -29,6 +29,16 @@ jobs:
       - run: rustup show active-toolchain || rustup toolchain install
       - run: bash scripts/gates.sh
         shell: bash
+      # The progress record (scripts/gate-progress.py), kept whether the gates passed or not: it
+      # names the last test of every failure and timeout. A runner that loses its connection
+      # mid-step runs no later step, so this artifact is not uploaded then, and whether GitHub keeps
+      # that step's summary is unverified.
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: gate-progress-${{ matrix.runner }}
+          path: target/gate-progress.log
+          if-no-files-found: ignore
   miri:
     # hyper-sim under Miri (docs/sim.md §9, S-1's gate): the crate has no `unsafe` and no platform
     # code, so one OS suffices; Miri checks it keeps Rust's rules, and its isolation refuses the

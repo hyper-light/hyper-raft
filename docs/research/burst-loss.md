@@ -278,20 +278,26 @@ with 32 seeds in brackets:
 
 | condition | back to back | spaced 35 ms | spaced as learned |
 |---|---|---|---|
-| independent, no dial before | 112 / 122 (97 / 135) | 331 / 293 (236 / 332) | the same as spaced: nothing to learn from |
-| independent, two dials before | 96 / 80 (2 / 76) | 297 / 290 (1,038 / 257) | **143 / 136** (84 / 149) |
-| bursts 35 ms, no dial before | 1,911 / 127 (1,967 / 80) | 283 / 187 (237 / 137) | the same as spaced |
-| bursts 35 ms, two dials before | 2,599 / 2,778 (3,356 / 132) | 131 / 246 (112 / 155) | 131 / 246 (112 / 155) |
-| bursts 78.7 ms, no dial before | 1,910 / 164 (1,945 / 127) | 300 / 227 (237 / 189) | the same as spaced |
-| bursts 78.7 ms, two dials before | 1,550 / 1,819 (828 / 3,060) | 87 / 260 (126 / 236) | 87 / 260 (126 / 236) |
+| independent, no dial before | 112 / 90 (97 / 144) | 331 / 235 (236 / 235) | as spaced: nothing to learn from |
+| independent, two dials before | 69 / 106 (31 / 80) | 658 / 296 (792 / 259) | **207 / 105** (91 / 95) |
+| bursts 35 ms, no dial before | 1,911 / 122 (1,967 / 103) | 283 / 223 (237 / 140) | as spaced |
+| bursts 35 ms, two dials before | 2,068 / 2,912 (3,279 / 136) | 312 / 190 (174 / 183) | 312 / 190 (174 / 183) |
+| bursts 78.7 ms, no dial before | 1,910 / 158 (1,945 / 3,671) | 300 / 229 (237 / 211) | as spaced |
+| bursts 78.7 ms, two dials before | 1,831 / 123 (1,831 / 93) | 1,964 / 282 (2,786 / 244) | 1,964 / 282 (2,786 / 244) |
 
-- **Independent loss, two dials before:** learning takes the fresh p90 from 297 to 143 ms and the
-  resumed from 290 to 136 ms, within 50 ms of back to back (96 / 80). Both endpoints' evidence
-  settled on independence in 12 of the 16 seeds examined, and one of the two endpoints' in the
-  other four.
+- **Independent loss, two dials before:** learning takes the fresh p90 from 658 to 207 ms and the
+  resumed from 296 to 105 ms. The resumed dial reaches back to back (106); the fresh dial is 140 ms
+  above back to back's 69. Both endpoints' evidence settled on independence in 12 of the 16 seeds
+  examined, and one of the two endpoints' in the other four.
 - **Bursts:** the learned rows equal the 35 ms rows exactly. The evidence never left the default,
-  so learning costs nothing where losses come in bursts. Back to back is worse there, by up to 2.6 s
+  so learning costs nothing where losses come in bursts. Back to back is worse there, by up to 2.8 s
   at p90.
+- **τ = 78.7 ms after two dials:** spaced and learned alike have a fresh p90 of 1,964 ms. The 35 ms
+  default spaces copies 117 ms, inside these bursts' correlation; in seed 23, traced, the first
+  flight's copies met a burst and the dial waited the client's probe timeout. Evidence at the gaps a
+  connection sees never tells 78.7 ms from 35 ms (§7), so learning keeps the default. Before the
+  rebase onto `diag-quic-land` (Careful Resume's warm-up), the same row measured 87 ms: the row is
+  sensitive to where the measured dial's start falls in the bursts.
 - **Without a dial before**, nothing is learned (handshake packets are not counted) and the rows
   equal the 35 ms ones.
 - **The shift between 32 and 128 seeds** is the cliff of §9 before its fix, and sampling after it.
@@ -315,10 +321,13 @@ and above p90 (back to back, independent loss), packet by packet:
 - **The first reply was never copied (seeds 77, 106, 67, 26, 90).** The server's reply goes as its
   handshake completes, in the Data space. It was not of the handshake's flights. Lost, it waited
   the server's probe timeout: the dial's last round trip.
-  **Fix:** what a space sends from the handshake's completion until the peer acknowledges a packet
-  of it, the application's first round trip, is copied as the handshake's flights are
-  (`application_from`; test `a_lost_first_reply_comes_by_its_copy`). The copies stay under the
-  window, the pacer and the amplification limit, and a lost original is declared and answered.
+  **Fix:** a packet that finishes a stream, sent from the handshake's completion until the peer
+  acknowledges a packet of its space (the application's first round trip), is copied as the
+  handshake's flights are (`application_from`; test `a_lost_first_reply_comes_by_its_copy`).
+  Copying all of that round trip's packets copied a bulk transfer's first window too; that moved one
+  seed of the Copa bake-off below its bar (`copa_shares_a_bottleneck_with_newreno_and_cubic`), so
+  only a message's end is copied. The copies stay under the window, the pacer and the amplification
+  limit, and a lost original is declared and answered.
 - **What remains after both fixes.** Back-to-back, independent loss, 128 seeds: 7 of 128 fresh dials
   still wait a probe timeout.
   - *An original and its copy both lost* (seed 125). Each pair is lost together with probability

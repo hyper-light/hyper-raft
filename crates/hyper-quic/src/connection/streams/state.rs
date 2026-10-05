@@ -423,6 +423,22 @@ impl StreamsState {
         })
     }
 
+    /// Whether any stream holds data or a FIN not yet sent, flow control holding it back or not
+    pub(crate) fn has_unsent_data(&self) -> bool {
+        self.send
+            .values()
+            .any(|s| s.as_ref().is_some_and(|s| !s.is_reset() && s.is_pending()))
+    }
+
+    /// The bytes written to every stream and never sent
+    pub(crate) fn unsent_bytes(&self) -> u64 {
+        self.send
+            .values()
+            .filter_map(|s| s.as_ref())
+            .filter(|s| !s.is_reset())
+            .fold(0u64, |sum, s| sum.saturating_add(s.unsent_bytes()))
+    }
+
     /// Whether MAX_STREAM_DATA frames could be sent for stream `id`
     pub(crate) fn can_send_flow_control(&self, id: StreamId) -> bool {
         self.recv

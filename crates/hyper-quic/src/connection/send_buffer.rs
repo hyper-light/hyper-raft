@@ -231,6 +231,11 @@ impl SendBuffer {
         self.unsent != self.offset || !self.retransmits.is_empty()
     }
 
+    /// Bytes written by the application and never sent
+    pub(super) fn unsent_bytes(&self) -> u64 {
+        self.offset.saturating_sub(self.unsent)
+    }
+
     /// Bytes still retained from application writes, including acknowledged data
     pub(super) fn buffered(&self) -> u64 {
         len_u64(self.unacked_len.saturating_add(self.front_trimmed))

@@ -15,6 +15,10 @@
 //! - **Warm-up.** With `--warm-rate`, the first connection first carries `--warm-requests` at that
 //!   rate, so both endpoints measure the path for Careful Resume (RFC 9959); the last connection's
 //!   open loop then starts from half that measurement. `--no-careful-resume` turns it off on both.
+//! - **Idle.** With `--idle-ms`, the kept connection is driven that long with nothing to send before
+//!   its open loop, as a node's connection to a peer is up before load comes: an idle connection to
+//!   a path with no measurement warms the path up (`CarefulResumeConfig::warm_up`).
+//!   `--no-warm-up` turns that off on both endpoints.
 //!
 //! Overhead is a latency less the round trip the relay imposes. The relay's own lateness, how long
 //! after its due time it sent each datagram, is reported beside it, so the relay's cost is not
@@ -50,8 +54,8 @@ use bytes::BytesMut;
 use hyper_quic::rustls::RootCertStore;
 use hyper_quic::rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use hyper_quic::{
-    ClientConfig, Connection, ConnectionHandle, DatagramEvent, Dir, Endpoint, EndpointConfig,
-    Event, ServerConfig, StreamEvent, StreamId, TransportConfig, VarInt,
+    CarefulResumeConfig, ClientConfig, Connection, ConnectionHandle, DatagramEvent, Dir, Endpoint,
+    EndpointConfig, Event, ServerConfig, StreamEvent, StreamId, TransportConfig, VarInt,
 };
 
 const REQUEST: [u8; 100] = [0x51; 100];
@@ -72,6 +76,8 @@ struct Args {
     warm_rate: u64,
     warm_requests: usize,
     careful_resume: bool,
+    warm_up: bool,
+    idle: Duration,
 }
 
 fn args() -> Args {
@@ -83,11 +89,17 @@ fn args() -> Args {
         warm_rate: 0,
         warm_requests: 0,
         careful_resume: true,
+        warm_up: true,
+        idle: Duration::ZERO,
     };
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
         if flag == "--no-careful-resume" {
             parsed.careful_resume = false;
+            continue;
+        }
+        if flag == "--no-warm-up" {
+            parsed.warm_up = false;
             continue;
         }
         let value = it.next().unwrap_or_else(|| panic!("{flag} takes a value"));
@@ -98,6 +110,7 @@ fn args() -> Args {
             "--dials" => parsed.dials = value.parse().unwrap(),
             "--warm-rate" => parsed.warm_rate = value.parse().unwrap(),
             "--warm-requests" => parsed.warm_requests = value.parse().unwrap(),
+            "--idle-ms" => parsed.idle = Duration::from_millis(value.parse().unwrap()),
             _ => panic!("unknown flag {flag}"),
         }
     }
@@ -224,9 +237,9 @@ type Served = (ConnectionHandle, Connection, Vec<(StreamId, usize)>);
 /// The endpoints' configuration: Careful Resume on unless `--no-careful-resume`
 fn endpoint_config(args: &Args) -> EndpointConfig {
     let mut config = EndpointConfig::default();
-    if !args.careful_resume {
-        config.careful_resume(None);
-    }
+    let mut resume = CarefulResumeConfig::default();
+    resume.warm_up(args.warm_up);
+    config.careful_resume(args.careful_resume.then_some(resume));
     config
 }
 
@@ -316,6 +329,8 @@ struct Client {
     latencies: Vec<u64>,
     /// The warm-up's latencies, likewise.
     warm: Vec<u64>,
+    /// The kept connection's warm-up packets and window when its open loop began.
+    idle: (u64, u64),
 }
 
 struct Pending {
@@ -339,6 +354,7 @@ fn client(
         dials: Vec::new(),
         latencies: Vec::new(),
         warm: Vec::new(),
+        idle: (0, 0),
     };
     let mut kept: Option<(ConnectionHandle, Connection)> = None;
     for dial in 0..args.dials {
@@ -420,8 +436,18 @@ fn client(
         kept = Some((ch, conn));
     }
 
-    // The open loop on the kept connection
+    // The open loop on the kept connection, after it has idled `--idle-ms`
     let (ch, mut conn) = kept.take().unwrap();
+    idle(
+        &mut endpoint,
+        ch,
+        &mut conn,
+        (socket, relay),
+        args.idle,
+        (&mut buf, &mut out),
+    );
+    let stats = conn.stats();
+    measured.idle = (stats.path.sent_warm_up_packets, stats.path.cwnd);
     measured.latencies = open_loop(
         &mut endpoint,
         ch,
@@ -435,6 +461,53 @@ fn client(
     flush(&mut conn, &endpoint, socket, relay, &mut out);
     stop.store(true, Ordering::Relaxed);
     measured
+}
+
+/// Drives `conn` for `span` with nothing of its own to send
+fn idle(
+    endpoint: &mut Endpoint,
+    ch: ConnectionHandle,
+    conn: &mut Connection,
+    (socket, relay): (&UdpSocket, SocketAddr),
+    span: Duration,
+    (buf, out): (&mut Vec<u8>, &mut Vec<u8>),
+) {
+    let end = Instant::now() + span;
+    loop {
+        let now = Instant::now();
+        if now >= end {
+            return;
+        }
+        if conn.poll_timeout().is_some_and(|t| t <= now) {
+            conn.handle_timeout(now);
+        }
+        while let Some(event) = conn.poll_endpoint_events() {
+            if let Some(event) = endpoint.handle_event(ch, event) {
+                conn.handle_event(event, endpoint.configs_mut());
+            }
+        }
+        while let Some(event) = conn.poll() {
+            if let Event::ConnectionLost { reason } = event {
+                panic!("the kept connection: {reason}");
+            }
+        }
+        flush(conn, endpoint, socket, relay, out);
+        let deadline = conn.poll_timeout().map_or(end, |t| t.min(end));
+        if let Some(n) = recv_until(socket, Some(deadline), buf) {
+            out.clear();
+            if let Some(DatagramEvent::ConnectionEvent(h, event)) = endpoint.handle(
+                Instant::now(),
+                relay,
+                None,
+                None,
+                BytesMut::from(&buf[..n]),
+                out,
+            ) && h == ch
+            {
+                conn.handle_event(event, endpoint.configs_mut());
+            }
+        }
+    }
 }
 
 /// `requests` requests scheduled ahead at `rate` a second on `conn`; each latency from its
@@ -708,6 +781,12 @@ fn main() {
     println!(
         "worst over one RTT by tenth of the run (ms): {}",
         worst.join(" ")
+    );
+    println!(
+        "kept connection after {} ms idle: {} warm-up packets, window {} bytes",
+        args.idle.as_millis(),
+        measured.idle.0,
+        measured.idle.1
     );
     report("open loop, over one RTT (ms)", &mut latencies, rtt);
     report("relay lateness up (ms)", &mut lateness_up, 0);

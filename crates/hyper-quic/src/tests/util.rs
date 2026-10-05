@@ -28,6 +28,17 @@ const SERVER_PORT: u16 = 4433;
 /// The client's first port in every pair, upstream's first
 const FIRST_CLIENT_PORT: u16 = 44433;
 
+/// An endpoint configuration whose connections do not warm their paths up
+/// ([`CarefulResumeConfig::warm_up`]): for tests that pin another mechanism's exact traffic, which
+/// the warm-up's packets would join
+pub(super) fn endpoint_config_without_warm_up() -> EndpointConfig {
+    let mut resume = CarefulResumeConfig::default();
+    resume.warm_up(false);
+    let mut config = EndpointConfig::default();
+    config.careful_resume(Some(resume));
+    config
+}
+
 pub(super) struct Pair {
     pub(super) server: TestEndpoint,
     pub(super) client: TestEndpoint,
@@ -50,11 +61,17 @@ pub(super) struct Pair {
 
 impl Pair {
     pub(super) fn default_with_deterministic_pns() -> Self {
+        Self::deterministic_pns(Default::default())
+    }
+
+    /// A pair whose server numbers its packets deterministically, its endpoints configured by
+    /// `endpoint_config`
+    pub(super) fn deterministic_pns(endpoint_config: EndpointConfig) -> Self {
         let mut cfg = server_config();
         let mut transport = TransportConfig::default();
         transport.deterministic_packet_numbers(true);
         cfg.transport = transport;
-        Self::new(Default::default(), cfg)
+        Self::new(endpoint_config, cfg)
     }
 
     pub(super) fn new(endpoint_config: EndpointConfig, server_config: ServerConfig) -> Self {

@@ -180,6 +180,7 @@ pub struct CarefulResumeConfig {
     pub(crate) remembered: usize,
     pub(crate) lifetime: Duration,
     pub(crate) max_jump: u64,
+    pub(crate) warm_up: bool,
 }
 
 impl CarefulResumeConfig {
@@ -211,6 +212,20 @@ impl CarefulResumeConfig {
         self.max_jump = value;
         self
     }
+
+    /// Whether a connection to a remote with no measurement measures its path while idle: PING and
+    /// PADDING packets of the path's MTU, under the window and the pacer and only when nothing else
+    /// is to be sent, until four initial windows are acknowledged in one round trip (RFC 9959
+    /// §3.1's floor for keeping a measurement), congestion is met, or sixteen initial windows are
+    /// spent; one connection to a remote at a time
+    ///
+    /// On by default: a connection that only carries exchanges smaller than the window never
+    /// delivers four initial windows a round trip, so its path would never be measured and every
+    /// burst on it would wait on the initial window (`docs/research/quic-overhead.md` §5).
+    pub fn warm_up(&mut self, value: bool) -> &mut Self {
+        self.warm_up = value;
+        self
+    }
 }
 
 impl Default for CarefulResumeConfig {
@@ -219,6 +234,7 @@ impl Default for CarefulResumeConfig {
             remembered: 256,
             lifetime: Duration::from_secs(60 * 60),
             max_jump: u64::MAX,
+            warm_up: true,
         }
     }
 }

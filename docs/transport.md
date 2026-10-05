@@ -589,6 +589,11 @@ the numbers are `docs/benchmarks.md`, "Probe timeouts, tickets and Careful Resum
   (`crates/hyper-quic/VENDORED.md` §13). What is left: a burst's first round trip on a path no
   connection has measured waits on the initial window, which no standards-track mechanism lets a
   sender exceed (`docs/research/quic-overhead.md` §4.2).
+- **The path measured before its first burst** (2026-10-05). An idle connection to a remote with
+  no measurement warms its path up, PING and PADDING under the window and the pacer, until four
+  initial windows are acknowledged in a round trip (RFC 9959 §3.1's floor), so a later burst starts
+  from Careful Resume's jump rather than the initial window; the jump is taken only where it beats
+  slow start (`crates/hyper-quic/VENDORED.md` §15, `docs/research/quic-overhead.md` §5).
 
 ## 5. Consumers
 

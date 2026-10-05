@@ -66,7 +66,7 @@ pub(crate) mod qlog;
 use qlog::QlogSink;
 
 mod resume;
-pub(crate) use resume::{CarefulResume, CongestionMemory, Saved};
+pub(crate) use resume::{CarefulResume, CongestionMemory, Grant, Leaves};
 
 mod send_buffer;
 
@@ -190,6 +190,8 @@ pub struct Connection {
     endpoint_events: VecDeque<EndpointEventInner>,
     /// Careful Resume over the current path's congestion controller (RFC 9959)
     resume: CarefulResume,
+    /// When the last ack-eliciting 1-RTT packet arrived: the warm-up waits a round trip past it
+    received_eliciting: Option<Instant>,
     /// Whether the spin bit is in use for this connection
     spin_enabled: bool,
     /// Outgoing spin bit state
@@ -351,6 +353,7 @@ impl Connection {
             undecryptable_bytes: 0,
             endpoint_events: VecDeque::new(),
             resume,
+            received_eliciting: None,
             spin_enabled: config.allow_spin && rng.random_ratio(7, 8),
             spin: false,
             spaces: Spaces::new(initial_space, PacketSpace::new(now), PacketSpace::new(now)),
@@ -560,11 +563,7 @@ impl Connection {
         self.finish_last_packet(now, buf, &mut tx);
         self.after_fill(buf.is_empty(), tx.congestion_blocked);
 
-        // Send MTU probe if necessary
-        if buf.is_empty() && self.state.is_established() {
-            self.write_mtu_probe(now, buf)?;
-            tx.num_datagrams = 1;
-        }
+        self.send_when_idle(now, buf, &mut tx);
 
         if buf.is_empty() {
             return None;
@@ -919,6 +918,7 @@ impl Connection {
                 now,
                 self.spaces.get(SpaceId::Data).next_packet_number,
                 self.path.in_flight.bytes,
+                self.streams.unsent_bytes(),
                 &self.path.rtt,
                 &mut *self.path.congestion,
             )
@@ -938,24 +938,9 @@ impl Connection {
             return Some(Fill::NextSpace);
         }
 
-        // Check whether the next datagram is blocked by pacing
-        let smoothed_rtt = self.path.rtt.get();
-        let pacing_rate = self.path.congestion.pacing_rate().or_else(|| {
-            self.resume
-                .pacing_rate(self.path.congestion.window(), smoothed_rtt)
-        });
-        if let Some(delay) = self.path.pacing.delay(
-            smoothed_rtt,
-            pacing_rate,
-            bytes_to_send,
-            self.path.current_mtu(),
-            self.path.congestion.window(),
-            now,
-        ) {
-            self.timers.set(Timer::Pacing, delay);
+        // Loss probes should be subject to pacing, even though they are not congestion controlled
+        if self.paced(now, bytes_to_send) {
             tx.congestion_blocked = true;
-            // Loss probes should be subject to pacing, even though
-            // they are not congestion controlled.
             trace!("blocked by pacing");
             return Some(Fill::Stop);
         }
@@ -964,6 +949,29 @@ impl Connection {
             self.recovery_packet = false;
         }
         None
+    }
+
+    /// Whether the pacer holds back a datagram of `bytes`, its timer then set for when it may go
+    fn paced(&mut self, now: Instant, bytes: u64) -> bool {
+        let smoothed_rtt = self.path.rtt.get();
+        let pacing_rate = self.path.congestion.pacing_rate().or_else(|| {
+            self.resume
+                .pacing_rate(self.path.congestion.window(), smoothed_rtt)
+        });
+        match self.path.pacing.delay(
+            smoothed_rtt,
+            pacing_rate,
+            bytes,
+            self.path.current_mtu(),
+            self.path.congestion.window(),
+            now,
+        ) {
+            Some(delay) => {
+                self.timers.set(Timer::Pacing, delay);
+                true
+            }
+            None => false,
+        }
     }
 
     /// Finishes the current packet so another datagram can follow it; `Some` when the GSO
@@ -1294,6 +1302,113 @@ impl Connection {
 
         trace!(?probe_size, "writing MTUD probe");
         Some(())
+    }
+
+    /// An MTU probe, or else a packet of the path's warm-up, when nothing else was sent
+    fn send_when_idle(&mut self, now: Instant, buf: &mut Vec<u8>, tx: &mut TransmitState) {
+        if !buf.is_empty() || !self.state.is_established() {
+            return;
+        }
+        if self.write_mtu_probe(now, buf).is_some() {
+            tx.num_datagrams = 1;
+        } else if !tx.congestion_blocked {
+            self.warm_up(now, buf, tx);
+        }
+    }
+
+    /// Sends a packet of the path's warm-up, if one is wanted. The warm-up uses the window as data
+    /// would (RFC 9002 §7.8): a packet sent leaves the sender not limited by the application, and
+    /// one held back by the window or the pacer leaves the window used, so slow start grows it.
+    fn warm_up(&mut self, now: Instant, buf: &mut Vec<u8>, tx: &mut TransmitState) {
+        let size = self.path.current_mtu();
+        let bytes = u64::from(size);
+        // Only an idle connection warms up, in both directions. One with stream data waiting, if
+        // only on flow control, carries a transfer that measures the path itself, and the warm-up's
+        // packets would take the window from it the moment its credit came. One that received an
+        // ack-eliciting packet within the last smoothed round trip is receiving a flight: the
+        // warm-up's packets would queue ahead of its acknowledgements on the path back and slow
+        // the peer's transfer (measured: a mebibyte reply at 500 ms one way came 2.8 ms later).
+        if !self
+            .resume
+            .warm_up_wants(self.path.congestion.initial_window(), bytes)
+            || self.streams.has_unsent_data()
+        {
+            return;
+        }
+        if let Some(quiet) = self
+            .received_eliciting
+            .and_then(|at| at.checked_add(self.path.rtt.get()))
+            .filter(|quiet| *quiet > now)
+        {
+            // Woken when the round trip has passed, the pacer's timer being the one that only
+            // asks for a transmission; an earlier deadline of its own is kept
+            let due = self
+                .timers
+                .get(Timer::Pacing)
+                .map_or(quiet, |d| d.min(quiet));
+            self.timers.set(Timer::Pacing, due);
+            return;
+        }
+        match self.write_warm_up(now, buf, size) {
+            Some(true) => {
+                tx.num_datagrams = 1;
+                self.app_limited = false;
+            }
+            Some(false) => {
+                self.app_limited = false;
+                self.limited_through = Some(self.spaces.get(SpaceId::Data).next_packet_number);
+            }
+            None => {}
+        }
+    }
+
+    /// A packet of the path's warm-up (RFC 9959 §3.1, [`CarefulResume::warm_up_wants`]): a PING
+    /// padded to `size`, the path's MTU, ack-eliciting and in flight, under the congestion window
+    /// and the pacer like any packet. `Some(true)` when it was written, `Some(false)` when the
+    /// window or the pacer holds it back, `None` when the connection cannot send one yet.
+    fn write_warm_up(&mut self, now: Instant, buf: &mut Vec<u8>, size: u16) -> Option<bool> {
+        // It waits for the handshake's confirmation (RFC 9001 §4.1.2: the server's at its
+        // completion, the client's at HANDSHAKE_DONE, each discarding its Handshake keys): before
+        // it the server may drop 1-RTT packets (§5.7), and the window is the handshake's
+        if self.spaces.get(SpaceId::Handshake).crypto.is_some() {
+            return None;
+        }
+        // Like an MTU probe, it waits for the path's validation (RFC 9000 §8.1)
+        if self.path.amplification_room(0).is_some() {
+            return None;
+        }
+        let bytes = u64::from(size);
+        if self.path.in_flight.bytes.saturating_add(bytes) >= self.path.congestion.window()
+            || self.paced(now, bytes)
+        {
+            return Some(false);
+        }
+        let buf_capacity = usize::from(size);
+        buf.reserve(buf_capacity);
+        let mut builder = PacketBuilder::new(
+            now,
+            SpaceId::Data,
+            self.rem_cids.active(),
+            buf,
+            buf_capacity,
+            0,
+            true,
+            self,
+        )?;
+        buf.write(frame::FrameType::PING);
+        self.stats.frame_tx.ping = self.stats.frame_tx.ping.saturating_add(1);
+        builder.pad_to(size);
+        // Nothing in it is sent again: a lost one is congestion, and ends the warm-up
+        let sent_frames = SentFrames {
+            non_retransmits: true,
+            ..Default::default()
+        };
+        builder.finish_and_track(now, self, Some(sent_frames), buf);
+        self.resume.on_warm_up_sent(bytes);
+        self.stats.path.sent_warm_up_packets =
+            self.stats.path.sent_warm_up_packets.saturating_add(1);
+        trace!(size, "writing a warm-up packet");
+        Some(true)
     }
 
     /// Send PATH_CHALLENGE for a previous path if necessary
@@ -1827,6 +1942,14 @@ impl Connection {
             &self.path.rtt,
             &mut *self.path.congestion,
         );
+        // The warm-up's measurement goes to the endpoint as soon as it is made
+        if let Some(saved) = self
+            .resume
+            .measured(self.path.congestion.initial_window(), self.path.rtt.min())
+        {
+            self.endpoint_events
+                .push_back(EndpointEventInner::Resume(Leaves::Keep(saved)));
+        }
 
         if self.peer_completed_address_validation() {
             self.pto_count = 0;
@@ -3869,6 +3992,9 @@ impl Connection {
         is_probing_packet: bool,
         close: Option<Close>,
     ) {
+        if ack_eliciting {
+            self.received_eliciting = Some(now);
+        }
         let space = self.spaces.get_mut(SpaceId::Data);
         if space
             .pending_acks
@@ -4458,12 +4584,12 @@ impl Connection {
         }
         // What this connection measured goes to the endpoint as it closes, not three PTOs later
         // when it drains, so a connection to the same remote made at once can resume from it
-        if let Some(saved) = self
+        let leaves = self
             .resume
-            .observed(self.path.congestion.initial_window(), self.path.rtt.min())
-        {
+            .observed(self.path.congestion.initial_window(), self.path.rtt.min());
+        if leaves != Leaves::Nothing {
             self.endpoint_events
-                .push_back(EndpointEventInner::Observed(saved));
+                .push_back(EndpointEventInner::Resume(leaves));
         }
     }
 

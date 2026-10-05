@@ -759,7 +759,8 @@ fn a_0rtt_packet_before_the_whole_client_hello_is_held_until_its_keys() {
 #[test]
 fn a_window_used_up_grows_by_all_the_round_trip_after_acknowledges() {
     let _guard = subscribe();
-    let mut pair = Pair::default();
+    // A path no connection has measured: the warm-up would have grown the window before the burst
+    let mut pair = Pair::new(endpoint_config_without_warm_up(), server_config());
     pair.latency = Duration::from_millis(50);
     let (client_ch, _) = pair.connect();
     pair.drive();
@@ -3322,8 +3323,8 @@ fn mtud_probes_include_immediate_ack() {
     let stats = pair.client_conn_mut(client_ch).stats();
     assert_eq!(stats.path.sent_plpmtud_probes, 4);
 
-    // Each probe contains a ping and an immediate ack
-    assert_eq!(stats.frame_tx.ping, 4);
+    // Each probe contains a ping and an immediate ack; the warm-up's packets a ping alone
+    assert_eq!(stats.frame_tx.ping, 4 + stats.path.sent_warm_up_packets);
     assert_eq!(stats.frame_tx.immediate_ack, 4);
 }
 
@@ -3561,7 +3562,8 @@ fn setup_ack_frequency_test(max_ack_delay: Duration) -> (Pair, ConnectionHandle,
         .ack_frequency_config(Some(ack_freq_config))
         .mtu_discovery_config(None); // To keep traffic cleaner
 
-    let mut pair = Pair::default_with_deterministic_pns();
+    // Nor the warm-up's PINGs, which these tests count
+    let mut pair = Pair::deterministic_pns(endpoint_config_without_warm_up());
     pair.latency = Duration::from_millis(10); // Need latency to avoid an RTT = 0
     let (client_ch, server_ch) = pair.connect_with(client_config);
     pair.drive();

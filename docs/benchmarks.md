@@ -6811,3 +6811,66 @@ cost of encrypting the bytes; before the frame MAC left sealed bytes to their ta
 between 8.5 and 16 ms in both modes alike, the flush's steps under other I/O; they are not a
 difference between the modes.
 
+
+## hyper-quic at 500 ms one way: measuring the path before its first burst (2026-10-05)
+
+The fourth round toward the owner's tenfold cut in what the stack adds above the physical floor of
+round trips at 500 ms one way. Round three left the burst on a path no connection has measured at
+85 ms p99.9 and 252 ms worst, the initial window's stall. Research: `docs/research/quic-overhead.md`
+§5; the change: `crates/hyper-quic/VENDORED.md` §15. Before and after are the same binary, the
+warm-up off (`--no-warm-up`) and on.
+
+Machine: Apple M5 Max, 18 cores, 128 GiB, macOS 26.4.1. Other sessions built and tested throughout;
+the load average is beside each run.
+
+### On real sockets: the open loop after the kept connection idles
+
+`crates/hyper-quic/examples/geo_open_loop.rs`: client, server and the relay's two directions as
+threads on loopback, 500 ms each way, five dials (the first fresh, the rest resumed with a 0-RTT
+request), then the kept connection idles 8 s (`--idle-ms 8000`), as a node's connection to a peer
+is up before load comes, then 20,000 requests open loop at 100 a second; latencies from each
+request's scheduled time less 1,000 ms; quantile intervals 95% distribution-free. Runs interleaved,
+2026-10-05 10:04–10:22 PDT.
+
+| run | load (before → after) | p50 / p99 / p99.9 / max, overhead | warm-up packets, window at the burst |
+|---|---|---|---|
+| off 1 | 5.1 → 4.6 | 2.137 / 4.254 / 73.1 [24.7, 126.4] / 216.4 ms | 0, 12,000 B |
+| **on 1** | 4.6 → 6.1 | 2.133 / 3.297 / **7.2** [6.2, 8.6] / **14.8** ms | 99, 69,659 B |
+| off 2 | 6.1 → 5.8 | 2.143 / 6.154 / 75.9 [34.4, 125.9] / 215.9 ms | 0, 12,000 B |
+| **on 2** | 5.8 → 6.8 | 2.138 / 2.991 / **6.2** [6.1, 6.2] / **15.9** ms | 139, 93,659 B |
+| no idle (`--idle-ms 0`) | 6.8 → 6.5 | 2.140 / 4.077 / 85.1 [42.1, 152.2] / 262.2 ms | 0, 12,000 B |
+
+- **The burst's p99.9 fell from 73–76 to 6.2–7.2 ms (about 11x), and its worst from 216 to 15–16 ms
+  (about 14x).** From round three's starting point (155 ms p99.9, 243 ms worst; round two's 192 /
+  292 ms): 21–25x at p99.9, 15–16x worst.
+- **The no-idle run is round three's**: a burst at the first contact, before any idle round trip,
+  waits on the initial window as before (85 ms p99.9, 262 ms worst), which no standard lets a sender
+  exceed without a measurement (RFC 9002 §7.2).
+- **Cost**: 99 and 139 warm-up packets of the path's MTU a side, about 130–184 kB, once a path a
+  lifetime (one hour by default), within the budget of sixteen initial windows (232 kB at a
+  1,452-byte datagram). The dials are unchanged: resumed first replies 0.8–3.5 ms over their floor
+  in every run.
+
+### On the simulated network (exact, virtual time)
+
+`an_idle_connection_warms_its_path_up_and_a_later_burst_needs_no_second_round_trip`
+(`crates/hyper-quic/tests/geo.rs`): a 24 kB reply on a kept connection after an idle first
+connection, 2,000 ms without the warm-up and 1,259 ms with, the floor 1,000 ms: the jump carries
+the reply within its round trip, paced over it as RFC 9959 §3.3 requires. A mebibyte reply on a
+fresh resumed connection is unchanged (7,643 ms either way): the jump is declined where slow start
+would beat it (`crates/hyper-quic/VENDORED.md` §15 item 3).
+
+### Overhead above the floor, round four
+
+| condition | before | after | cut | cut from round two's start |
+|---|---|---|---|---|
+| real sockets, kept connection's burst after idling, p99.9 | 73–76 ms | 6.2–7.2 ms | ~11x | 27–31x (from 192 ms) |
+| real sockets, kept connection's burst after idling, worst | 216 ms | 15–16 ms | ~14x | 18–19x (from 292 ms) |
+| real sockets, burst at first contact, p99.9 / worst | 85 / 252 ms | 85 / 262 ms | unchanged | the initial window |
+
+```sh
+cargo build --release -p hyper-quic --example geo_open_loop
+target/release/examples/geo_open_loop --rate 100 --requests 20000 --dials 5 --idle-ms 8000 --no-warm-up
+target/release/examples/geo_open_loop --rate 100 --requests 20000 --dials 5 --idle-ms 8000
+target/release/examples/geo_open_loop --rate 100 --requests 20000 --dials 5 --idle-ms 0
+```

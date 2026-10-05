@@ -6247,3 +6247,114 @@ cargo test --release -p hyper-multilog-e2e --test cluster
 cargo test --release -p hyper-multilog-e2e --test cluster -- tails
 cd crates/hyper-raft-compare && cargo run --release -- multilog 5 2000
 ```
+
+## hyper-quic at 500 ms one way: what the stack adds above the round trips (2026-10-04)
+
+The owner's goal is to cut what hyper-quic adds above the physical floor at 500 ms one way by 10x,
+giving up no correctness. Overhead here is a time less the floor of round trips the protocol
+needs. A fresh dial's handshake needs 1 round trip; its first reply needs 2, because the request
+goes with the client's Finished. A large certificate meets the amplification limit (RFC 9000 §8.1),
+which adds 1 round trip to each. A resumed dial with its request in 0-RTT data needs 1 for both.
+A request on a kept connection needs 1.
+
+Machine: Apple M5 Max, 18 cores, 128 GiB, macOS 26.4.1. Other sessions were building and testing
+throughout. The load average is recorded beside each run.
+
+### On the simulated network (exact, virtual time)
+
+`crates/hyper-quic/tests/geo.rs`: real endpoints and TLS 1.3 with X25519MLKEM768, 500 ms each way.
+The large certificate has 1,000 incompressible names, so the server's flight exceeds 3x the
+two-datagram ClientHello.
+
+Clean path. The numbers are the same before (df54729) and after (5425611):
+
+| case | handshake | first reply | kept requests |
+|---|---|---|---|
+| fresh, small certificate | 1,000 ms | 2,000 ms | 1,000 ms each |
+| resumed, 0-RTT request | 1,000 ms | 1,000 ms | 1,000 ms each |
+| fresh, large certificate | 1,999 ms | 2,999 ms | 1,000 ms each |
+| resumed, large certificate, 0-RTT request (address token) | 1,000 ms | 1,000 ms | 1,000 ms each |
+
+Every case is at its floor. The resumed dial skips the amplification round trip because the
+server's NEW_TOKEN validates the client's address (RFC 9000 §8.1.3). With 0-RTT its first reply
+comes at the physical floor of one round trip.
+
+5% loss each way with ±100 ms reordering: 32 seeds, large certificate, a fresh dial and then a
+resumed dial with its request in 0-RTT data. Each cell is the overhead above the floor:
+
+| | before (df54729) | after (5425611) |
+|---|---|---|
+| fresh handshake, median / p90 / max | 1,059 / 2,094 / 3,026 ms | **134** / 1,890 / 2,722 ms |
+| fresh first reply, median / p90 / max | 1,011 / 2,960 / 7,490 ms | 875 / 4,650 / 6,073 ms |
+| fresh dials that never completed | **3 of 32** (idle timeout) | **0** |
+| resumed handshake, median / p90 / max | 120 / 2,858 / 6,720 ms | 65 / 2,040 / 2,911 ms |
+| resumed first reply, median / p90 / max | 120 / 7,087 / 8,706 ms | 65 / 3,899 / 4,790 ms |
+
+- **The fresh handshake's median overhead fell from 1,059 to 134 ms (7.9x), and no dial now
+  stalls to its idle timeout.** The 134 ms left is within the path's own jitter, up to 200 ms a
+  round trip over two round trips. With reordering and no loss the handshake completes within two
+  of the slowest round trips (`reordering_alone_costs_no_round_trip`), where it took about 2.9 s
+  before.
+- **The fresh first reply's p90 rose (2,960 to 4,650 ms) because the three dials that never
+  completed before are now counted**, and these are the slowest that do complete. Its remaining
+  overhead is tail-loss recovery: a lost request or reply waits for a probe timeout,
+  srtt + 4·rttvar + max_ack_delay (RFC 9002 §6.2.1), about 2 to 3.4 s this early in a connection,
+  since rttvar starts at half the first sample (§5.3).
+- **Tried and not kept:** seeding a re-dial's RTT estimator with the previous connection's final
+  smoothed RTT and variation (RFC 9002 §6.2.2; RFC 9040 §5's temporal sharing). The resumed first
+  reply's p90 went from 3,899 to 4,146 ms. A first-flight probe then waits about 1.3 s instead of
+  999 ms, and that offsets the shorter later probes, so the measurement did not justify it.
+
+### On real sockets: the open loop
+
+`crates/hyper-quic/examples/geo_open_loop.rs`. The client and server are threads on loopback, and
+a relay holds each datagram 500 ms each way. There are five dials, the first fresh and the later
+ones resumed with a 0-RTT request. Then 20,000 requests go open loop at 100 a second on the kept
+connection. Each latency runs from the request's scheduled time, and its overhead is the latency
+less 1,000 ms. The relay's lateness past each datagram's due time is reported beside it. Quantile
+intervals are 95% distribution-free (`docs/tails.md` §3.3). The before (df54729) and after
+(5425611 and d05c195, the tree measured) runs were interleaved:
+
+| run | load (before → after) | open loop overhead p50 / p99 / p99.9 / max | relay lateness p99 up / down |
+|---|---|---|---|
+| before 1 | 68.9 → 62.3 | 2.067 / 4.564 / 195.2 [165.2, 242.6] / 292.6 ms | 1.95 / 1.82 ms |
+| after 1 | 62.3 → 58.4 | 2.070 / 4.544 / 191.8 [151.7, 232.7] / 291.7 ms | 1.95 / 1.81 ms |
+| before 2 | 58.4 → 64.1 | 1.151 / 4.111 / 194.3 [165.7, 234.3] / 293.2 ms | 1.09 / 0.99 ms |
+| after 2 | 64.1 → 58.6 | 1.124 / 2.145 / 190.9 [150.9, 231.1] / 290.8 ms | 0.96 / 0.83 ms |
+
+Dials (overhead above floor): fresh 2.6 to 6.2 ms; resumed with 0-RTT accepted 0.6 to 4.4 ms. The
+fourth dial in every run fell back to 1-RTT, 0.9 to 3.6 ms over its 2-round-trip floor.
+
+- **The steady state costs 1 to 2 ms above the round trip at p50**, at load 58 to 69. The same
+  bench with no delay (`--one-way-ms 0`) gives a p50 of 2.07 ms at load 83, so this cost does not
+  depend on distance. It is the host's: four threads woken in turn on a machine with about four
+  runnable threads a core, two of them the relay's.
+- **The p99.9 and the maximum, about 190 and 290 ms, are the open loop's first second, the same
+  before and after.** The worst latency in the run's first tenth is 291 to 293 ms, and 2.5 to 26 ms
+  in every later tenth. At 100 requests a second the client offers about 15 kB a round trip, above
+  QUIC's initial window of 12,000 bytes (RFC 9002 §7.2, 10 × 1,200). The requests past the window
+  wait for the first acknowledgements, a round trip later. At 50 a second (7.5 kB a round trip) the
+  worst is 6.4 ms. This is congestion control's start, a rule of the network's safety and not a
+  defect. It is the largest overhead left and it is open: an RTT-and-window carry-over for kept and
+  resumed connections, such as draft-ietf-tsvwg-careful-resume, needs a research note first.
+- **Why the fourth dial lost 0-RTT:** dials 2 and 3 close at their first reply, one round trip in,
+  before their new session tickets arrive, half a round trip after the client's Finished
+  (RFC 8446 §4.6.1). The client then used up the two tickets dial 1 left. This comes from the
+  harness's dial pattern, not the stack, and it is recorded.
+
+So, under the owner's condition with loss and reordering, the stack's handshake overhead fell by
+7.9x at the median and its stalls are gone. On a clean path every protocol case was already at its
+floor of round trips. What is left above the floor is the host's 1 to 2 ms, tail-loss probe
+timeouts under loss, and congestion control's initial window.
+
+```sh
+# The simulated tables (the large certificate takes a few seconds per seed).
+cargo test -p hyper-quic --test geo -- --ignored --nocapture print_the_overhead_table
+cargo test -p hyper-quic --test geo -- --ignored --nocapture print_the_lossy_overhead_table
+# Before: the same tests with the source fixes of 5425611 reverse-applied.
+# Real sockets, each run preceded and followed by `uptime`, before and after interleaved.
+cargo build --release -p hyper-quic --example geo_open_loop
+target/release/examples/geo_open_loop --rate 100 --requests 20000 --dials 5
+target/release/examples/geo_open_loop --rate 50 --requests 1500 --dials 1
+target/release/examples/geo_open_loop --rate 100 --requests 3000 --dials 1 --one-way-ms 0
+```

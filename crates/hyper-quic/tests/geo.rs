@@ -221,6 +221,8 @@ struct Dialed {
     accepted_0rtt: bool,
     /// Attempts the server's endpoint surfaced for this dial.
     surfaced: u32,
+    /// Each later request's latency on the kept connection, sent as the last reply arrived.
+    kept: Vec<u64>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -231,6 +233,8 @@ struct Scenario {
     dials: u32,
     /// Whether the client sends its request before the handshake ends (0-RTT where it can).
     early: bool,
+    /// Requests sent one after another on the connection after the first is answered.
+    kept_requests: u32,
     /// The client's datagrams, by their order of sending from zero, the network loses.
     drop_client: &'static [usize],
     /// Whether the server never hears the client.
@@ -246,6 +250,7 @@ impl Scenario {
             seed: 1,
             dials: 1,
             early: false,
+            kept_requests: 0,
             drop_client: &[],
             silent: false,
             max_incoming: None,
@@ -348,6 +353,7 @@ struct Run {
     dialed: Vec<Dialed>,
     request: Option<StreamId>,
     reply: Vec<u8>,
+    asked_at: u64,
     inbound: Option<StreamId>,
     asked: Vec<u8>,
     answered: bool,
@@ -428,6 +434,7 @@ impl Run {
             dialed: Vec::new(),
             request: None,
             reply: Vec::new(),
+            asked_at: 0,
             inbound: None,
             asked: Vec::new(),
             answered: false,
@@ -502,6 +509,8 @@ impl Run {
                 (false, Event::Stream(StreamEvent::Opened { dir: Dir::Bi })) => {
                     if let Some(id) = connection.streams().accept(Dir::Bi) {
                         self.inbound = Some(id);
+                        self.asked.clear();
+                        self.answered = false;
                     }
                 }
                 _ => {}
@@ -518,8 +527,21 @@ impl Run {
             }
             if let Some(id) = self.request {
                 read_to_end(connection, id, &mut self.reply);
-                if self.reply.len() == REPLY.len() && dialed.replied.is_none() {
-                    dialed.replied = Some(now);
+                if self.reply.len() == REPLY.len() {
+                    match dialed.replied {
+                        None => dialed.replied = Some(now),
+                        Some(_) => dialed.kept.push(now - self.asked_at),
+                    }
+                    // The next request on the kept connection, at once
+                    if (dialed.kept.len() as u32) < self.scenario.kept_requests {
+                        let id = connection.streams().open(Dir::Bi).unwrap();
+                        let mut stream = connection.send_stream(id);
+                        assert_eq!(stream.write(REQUEST).unwrap(), REQUEST.len());
+                        stream.finish().unwrap();
+                        self.request = Some(id);
+                        self.asked_at = now;
+                    }
+                    self.reply.clear();
                 }
             }
         } else if let Some(id) = self.inbound {
@@ -617,6 +639,8 @@ impl Run {
     /// Runs every dial to its reply, or to the horizon.
     fn run(mut self) -> Outcome {
         self.world.schedule(0, CLIENT, Ev::Dial).unwrap();
+        // Whether the next dial is scheduled, so the last one's end schedules it once
+        let mut redialing = true;
         loop {
             let step = self.world.next(&mut Fifo).unwrap();
             if self.world.now() > HORIZON {
@@ -629,18 +653,22 @@ impl Run {
                 } => self.arrive(node, ticket),
                 Step::Event {
                     event: Ev::Dial, ..
-                } => self.dial(),
+                } => {
+                    redialing = false;
+                    self.dial();
+                }
                 Step::Wake { node } => self.fire(node),
                 Step::Idle | Step::Spent => break,
             }
-            let done = self
-                .dialed
-                .last()
-                .is_some_and(|d| d.replied.is_some() || d.lost.is_some());
-            if done {
+            let done = self.dialed.last().is_some_and(|d| {
+                (d.replied.is_some() && d.kept.len() as u32 >= self.scenario.kept_requests)
+                    || d.lost.is_some()
+            });
+            if done && !redialing {
                 if self.dialed.len() as u32 >= self.scenario.dials {
                     break;
                 }
+                redialing = true;
                 // The next dial once the last has its reply: the kept state (session ticket,
                 // address validation token) is what a re-dial uses.
                 let now = self.world.now();
@@ -1022,4 +1050,100 @@ fn a_lossy_run_replays_from_its_seed_and_from_its_trace() {
         Ok::<_, std::convert::Infallible>(Run::from_source(scenario, &pki, source).run().record)
     })
     .unwrap();
+}
+
+/// The overhead table of `docs/benchmarks.md` ("At 500 ms one way"): for each case, each dial's
+/// handshake and first reply from its start, and the kept connection's later requests.
+#[test]
+#[ignore = "prints the overhead table; run by hand"]
+fn print_the_overhead_table() {
+    for (label, names, early) in [
+        ("small certificate", 0, false),
+        ("small certificate, early request", 0, true),
+        ("large certificate", MANY_NAMES, false),
+        ("large certificate, early request", MANY_NAMES, true),
+    ] {
+        let pki = Pki::new(names);
+        let out = Run::new(
+            Scenario {
+                dials: 2,
+                early,
+                kept_requests: 3,
+                ..Scenario::clean()
+            },
+            &pki,
+        )
+        .run();
+        for (i, d) in out.dialed.iter().enumerate() {
+            println!(
+                "{label}, dial {}: connected {:?} ms, first reply {:?} ms, 0-RTT {}, kept {:?} ms",
+                i + 1,
+                d.connected.map(|t| (t - d.started) as f64 / MS as f64),
+                d.replied.map(|t| (t - d.started) as f64 / MS as f64),
+                d.accepted_0rtt,
+                d.kept
+                    .iter()
+                    .map(|&t| t as f64 / MS as f64)
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+}
+
+/// The lossy overhead table of `docs/benchmarks.md`: over the 32 seeds, each dial's handshake and
+/// first reply above its floor of round trips (handshake 2 and reply 3 for a fresh dial, whose
+/// large certificate meets the amplification limit; 1 and 1 for the resumed dial with its request
+/// in 0-RTT data), as median, 90th percentile and maximum, and the dials that never completed.
+#[test]
+#[ignore = "prints the lossy overhead table; run by hand"]
+fn print_the_lossy_overhead_table() {
+    let pki = Pki::new(MANY_NAMES);
+    let mut rows: [[Vec<u64>; 2]; 2] = Default::default();
+    let mut stuck = [0u32; 2];
+    for seed in SEEDS {
+        let out = Run::new(
+            Scenario {
+                dials: 2,
+                early: true,
+                ..Scenario::lossy(seed)
+            },
+            &pki,
+        )
+        .run();
+        for (i, floors) in [(0usize, (2, 3)), (1, (1, 1))] {
+            match out.dialed.get(i) {
+                Some(Dialed {
+                    started,
+                    connected: Some(c),
+                    replied: Some(r),
+                    ..
+                }) => {
+                    rows[i][0].push((c - started).saturating_sub(floors.0 * RTT));
+                    rows[i][1].push((r - started).saturating_sub(floors.1 * RTT));
+                }
+                _ => stuck[i] += 1,
+            }
+        }
+    }
+    for (i, label) in ["fresh dial", "resumed dial, 0-RTT request"]
+        .iter()
+        .enumerate()
+    {
+        for (j, what) in ["handshake", "first reply"].iter().enumerate() {
+            let v = &mut rows[i][j];
+            v.sort_unstable();
+            let at = |q: usize| {
+                v.get((v.len() * q).div_ceil(100).max(1) - 1)
+                    .map(|&x| x / MS)
+            };
+            println!(
+                "{label}, {what} over floor: median {:?} ms, p90 {:?} ms, max {:?} ms, completed {}, stuck {}",
+                at(50),
+                at(90),
+                v.last().map(|&x| x / MS),
+                v.len(),
+                stuck[i]
+            );
+        }
+    }
 }

@@ -900,10 +900,16 @@ impl Connection {
         };
 
         // Congestion control and pacing checks
-        // Tail loss probes must not be blocked by congestion, or a deadlock could arise
+        // Tail loss probes must not be blocked by congestion, or a deadlock could arise. A packet
+        // carrying a PATH_RESPONSE is not paced: RFC 9000 §8.2.2, "An endpoint MUST NOT delay
+        // transmission of a packet containing a PATH_RESPONSE frame unless constrained by
+        // congestion control", which the window still is. Paced, a migrating client's response
+        // waited behind its upload while the peer's validation of the new path ran out.
+        let responding =
+            space_id == SpaceId::Data && self.path_responses.has_on_path(self.path.remote);
         if ack_eliciting
             && self.spaces.get(space_id).loss_probes == 0
-            && let Some(fill) = self.congestion_blocks(now, tx)
+            && let Some(fill) = self.congestion_blocks(now, tx, responding)
         {
             return Some(fill);
         }
@@ -919,8 +925,14 @@ impl Connection {
         None
     }
 
-    /// `Some` when congestion control or pacing holds back the next datagram
-    fn congestion_blocks(&mut self, now: Instant, tx: &mut TransmitState) -> Option<Fill> {
+    /// `Some` when congestion control or pacing holds back the next datagram; `unpaced` exempts it
+    /// from the pacer
+    fn congestion_blocks(
+        &mut self,
+        now: Instant,
+        tx: &mut TransmitState,
+        unpaced: bool,
+    ) -> Option<Fill> {
         // Assume the current packet will get padded to fill the segment
         let untracked_bytes = match &tx.builder {
             Some(builder) => tx.buf_capacity.saturating_sub(builder.partial_encode.start),
@@ -957,7 +969,7 @@ impl Connection {
         }
 
         // Loss probes should be subject to pacing, even though they are not congestion controlled
-        if self.paced(now, bytes_to_send) {
+        if !unpaced && self.paced(now, bytes_to_send) {
             tx.congestion_blocked = true;
             trace!("blocked by pacing");
             return Some(Fill::Stop);
@@ -970,7 +982,17 @@ impl Connection {
     }
 
     /// Whether the pacer holds back a datagram of `bytes`, its timer then set for when it may go
+    ///
+    /// Nothing is paced until the handshake is confirmed (RFC 9001 §4.1.2; the Handshake keys
+    /// discarded): its flights are bounded by the initial window and the anti-amplification limit,
+    /// all RFC 9002 §7.7 asks ("Senders SHOULD limit bursts to the initial congestion window"),
+    /// and a rate before then rests on one RTT sample at most, or on the initial RTT's guess. Paced
+    /// then, the handshake's flights went two datagrams at a time, and a client's Finished waited
+    /// behind a copy while its first 1-RTT packets reached a server that dropped them.
     fn paced(&mut self, now: Instant, bytes: u64) -> bool {
+        if self.spaces.get(SpaceId::Handshake).crypto.is_some() || !self.state.is_established() {
+            return false;
+        }
         let smoothed_rtt = self.path.rtt.get();
         let pacing_rate = self.path.congestion.pacing_rate().or_else(|| {
             self.resume

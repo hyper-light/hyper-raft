@@ -449,6 +449,12 @@ impl PathResponses {
     pub(crate) fn is_empty(&self) -> bool {
         self.pending.is_empty()
     }
+
+    /// Whether the next response to send is for `remote`, the current path's: the packet it goes
+    /// in is not held by the pacer (RFC 9000 §8.2.2)
+    pub(crate) fn has_on_path(&self, remote: SocketAddr) -> bool {
+        self.pending.last().is_some_and(|r| r.remote == remote)
+    }
 }
 
 #[derive(Copy, Clone)]

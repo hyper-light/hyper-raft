@@ -163,6 +163,8 @@ trait Quic {
     fn has_0rtt(&self) -> bool;
     fn accepted_0rtt(&self) -> bool;
     fn is_handshaking(&self) -> bool;
+    /// Whether a client has confirmed the handshake: it received HANDSHAKE_DONE (RFC 9001 §4.1.2)
+    fn confirmed(&self) -> bool;
     fn close(&mut self, now: Instant);
     /// Whether the endpoint still holds a connection that has not drained.
     fn live(&self) -> bool;
@@ -360,6 +362,11 @@ mod hyper {
         }
         fn has_0rtt(&self) -> bool {
             self.conn.as_ref().unwrap().1.has_0rtt()
+        }
+        fn confirmed(&self) -> bool {
+            self.conn
+                .as_ref()
+                .is_some_and(|(_, conn)| conn.stats().frame_rx.handshake_done > 0)
         }
         fn accepted_0rtt(&self) -> bool {
             self.conn.as_ref().unwrap().1.accepted_0rtt()
@@ -578,6 +585,11 @@ mod upstream {
         fn has_0rtt(&self) -> bool {
             self.conn.as_ref().unwrap().1.has_0rtt()
         }
+        fn confirmed(&self) -> bool {
+            self.conn
+                .as_ref()
+                .is_some_and(|(_, conn)| conn.stats().frame_rx.handshake_done > 0)
+        }
         fn accepted_0rtt(&self) -> bool {
             self.conn.as_ref().unwrap().1.accepted_0rtt()
         }
@@ -690,6 +702,8 @@ struct Streams<S> {
     early: bool,
     /// The streams opened again after the server rejected the 0-RTT data they were opened with.
     reopened: usize,
+    /// The most bytes of each stream written so far, where a scenario holds the rest back.
+    hold: Option<usize>,
 }
 
 #[derive(Default)]
@@ -711,6 +725,7 @@ impl<S: Copy + Ord + Debug> Streams<S> {
             to_open: Vec::new(),
             early: false,
             reopened: 0,
+            hold: None,
         }
     }
     /// Moves every stream as far as it goes now; whether any byte moved. `index` is the stream's
@@ -759,8 +774,11 @@ impl<S: Copy + Ord + Debug> Streams<S> {
                 flow.received = received;
                 flow.ended = ended;
             }
-            while flow.sent < flow.to_send {
-                let end = flow.to_send.min(flow.sent + 65_536);
+            let to_send = self
+                .hold
+                .map_or(flow.to_send, |hold| hold.min(flow.to_send));
+            while flow.sent < to_send {
+                let end = to_send.min(flow.sent + 65_536);
                 let chunk: Vec<u8> = (flow.sent..end).map(|at| pattern(index, at)).collect();
                 let written = quic.write(stream, &chunk);
                 if written == 0 {
@@ -788,7 +806,7 @@ fn drive<Q: Quic>(
     quic: &mut Q,
     streams: &mut Streams<Q::Stream>,
     what: &str,
-    mut done: impl FnMut(&mut Q, &mut Wire, &Streams<Q::Stream>) -> bool,
+    mut done: impl FnMut(&mut Q, &mut Wire, &mut Streams<Q::Stream>) -> bool,
 ) -> Result<(), String> {
     let mut moved_at = wire.listened;
     loop {
@@ -801,7 +819,7 @@ fn drive<Q: Quic>(
         if streams.pump(quic) {
             moved_at = wire.listened;
         }
-        if done(quic, wire, streams) {
+        if done(quic, wire, &mut *streams) {
             return Ok(());
         }
         let quiet = wire.listened - moved_at;
@@ -1180,7 +1198,7 @@ fn exchange<Q: Quic>(
     wire: &mut Wire,
     server: SocketAddr,
     sizes: &[usize],
-    mut step: impl FnMut(&mut Q, &mut Wire, &Streams<Q::Stream>),
+    mut step: impl FnMut(&mut Q, &mut Wire, &mut Streams<Q::Stream>),
 ) -> Result<Stats, String> {
     quic.connect(Instant::now(), server);
     let mut streams = streams_of(sizes);
@@ -1300,8 +1318,9 @@ fn lossy<Q: Quic>(mut quic: Q, server: &mut Peer, pki: &Pki) -> String {
     )
 }
 
-/// The client moves mid-transfer: once it has written half its upload, it takes a new socket,
-/// telling its connection when `active` (RFC 9000 §9.5: a new connection ID on the new path).
+/// The client moves mid-transfer: once it has written half its upload and confirmed the handshake
+/// (RFC 9000 §9), it takes a new socket, telling its connection when `active` (RFC 9000 §9.5: a new
+/// connection ID on the new path), and writes the other half from there.
 fn migration<Q: Quic>(mut quic: Q, server: &mut Peer, active: bool) -> String {
     let mut wire = Wire::bind();
     let before = wire.address();
@@ -1312,17 +1331,27 @@ fn migration<Q: Quic>(mut quic: Q, server: &mut Peer, active: bool) -> String {
         server.address(),
         &[2 * MIB],
         |quic, wire, streams| {
+            // The upload's second half waits for the move, so the client has data to send from
+            // its new address: unannounced, its next datagram is how the server learns of it.
+            if moved.is_none() {
+                streams.hold = Some(MIB);
+            }
             // The stream opens once the server's transport parameters allow it.
             let Some(flow) = streams.open.values().next() else {
                 return;
             };
-            if moved.is_none() && flow.sent >= MIB {
+            // Mid-transfer, once the client has confirmed the handshake (RFC 9000 §9: no migration
+            // before it): before then the server may still lack the client's Finished, and
+            // discards a new address's packets as a handshake's strays. A mebibyte written can
+            // come first, the stream taking it at once.
+            if moved.is_none() && flow.sent >= MIB && quic.confirmed() {
                 assert!(!flow.finished, "the move falls mid-transfer");
                 wire.rebind();
                 if active {
                     quic.local_address_changed();
                 }
                 moved = Some(wire.address());
+                streams.hold = None;
             }
         },
     )

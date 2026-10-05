@@ -966,6 +966,9 @@ impl Node {
                                 .is_some_and(|pair| pair.taken > 0)
                         })
                         .collect(),
+                    core_suspected: self.replica.core().raft.suspected().to_vec(),
+                    clock_ns: self.now(),
+                    campaign: self.replica.core().raft.campaign_state(),
                 };
                 control::put_report(&mut self.sending, id, &report);
                 if wire::seal(&mut self.sending, self.datagram) {

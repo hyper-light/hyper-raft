@@ -44,42 +44,70 @@ them on Linux.
 
 ## Open defects
 
-Found under load, each once, not yet reproduced. They are being traced to their causes; none is
-worked around.
+Found under load, each once. They are traced to their causes; none is worked around. Every
+member's report in both E2E harnesses now carries its core's own suspicions and what decides its
+next campaign (`hyper_raft::CampaignState`: when it is due, whether it led its term, held, a trusted
+quorum, may campaign and lead), beside the stream's suspicions, so a sighting names which of them
+held an election back.
 
-- **hyper-raft-e2e `stalled-devices`.** Seen on macOS, under the load of other builds. After the
-  7 s stall the old leader had stepped down in its term (leader 0), its followers still trusted
-  it, every detector trusted every member, and no member campaigned through the members' quiet
-  period (2.6 s). The core's step-down and re-campaign alone elect in every order of suspicion
-  and trust a simulation tried, so the trace looks for what the real processes add.
-- **hyper-durable-e2e `kill-durable-leader`.** Seen in Linux Docker at 2 CPUs with load 6.8. Both
-  survivors had a write of their log out for 2 s, against 58 ms for the longest write before it,
-  so their flush-proven heartbeats stopped and each came to suspect the other. The wait judged the
-  member stuck, because its rule excuses a write only up to the longest write seen. Open: whether
-  the write was with the device (a slow disk under the host's I/O) or waited elsewhere.
-- **hyper-raft-e2e `member-stopped`, windows-11-arm CI (`1967cd9`, run 37152466424).** Live
-  members 2 and 3 each sat 5.1 s in a single flush. Member 3 lost its leadership (leader 0, term
-  1). Member 2 still named 3 its leader and suspected it, and no term moved in the next 3 s.
-  Windows stamps a datagram as it is read, not as it arrived (timing §3 item 5), so heartbeats
-  drained after the flush are late by it. Open: why member 2, suspecting its leader, did not
-  campaign; that is the core's elections.
+- **hyper-raft-e2e `stalled-devices`.** Seen once on macOS under the load of other builds
+  (2026-10-03, the tree of 9893679). After the 7 s stall the old leader had stepped down in its
+  term (leader 0), its followers still trusted it, the stream trusted every member, and no member
+  campaigned through the quiet period (2.6 s). What the evidence adds (`gates-exact-coverage`'s
+  last look and the look after): no member took a heartbeat in that time, every count (324, 212,
+  217) the same in both looks, while every member answered the test. The core elects in every
+  order of suspicion and trust a simulation tried (1,200 orders, and 200 seeds × 16 orders with an
+  entry in flight), so the cause is outside its rules. The fixes that landed hours after it change
+  exactly that path: the stream's `G` is no longer inflated by an owner's own stall (f498c63, which
+  measured stalled-devices taking `G` to seconds) and a wait ended by an arrival counts (9588f45:
+  with no `G` the stream refuses every heartbeat as unmeasured, so nothing is taken or judged).
+  Not seen again on 2026-10-05: 120 runs on `line` (40 at the machine's load 5 to 27, 40 under 24
+  CPU burners at load 48 to 53, 40 beside a parallel workspace build at load 6 to 23), 40 runs of
+  9893679's own tree with its diagnostics, and 30 in Docker's Linux at 2 CPUs; CI since 2ef0ab3:
+  no failure of it on any target. Open until a sighting's report states the core's side, which it
+  now does.
 - **hyper-durable-e2e `kill` `member-stopped`, ubuntu-24.04 CI (`36e01cd`, run 37152765895).**
-  Member 1 was stopped. Member 2, at term 5, suspected it, with a longest write of 597 ms. The two
-  members up took no write within the 2.88 s the test excuses. Member 3's report is not in the
-  failure's output.
-- **hyper-durable-e2e `kill` `stall-leader`, windows-11-arm CI (`01aaeb7` on `diag-quic-tls`, run
-  37184084685; the branch changes hyper-quic and hyper-tls only).** Member 1's process ended with
-  exit code `0xc0000005`, Windows' access violation, a second after its last report. It was a
-  follower at term 1, commit 5, with a write out 1.3 s all told. Safe Rust does not end this way:
-  the cause is in `unsafe` code or what it calls. The suspects are the Windows interfaces on the
-  members' path: the receive stamps (`WSARecvMsg` and its control messages, `dc42e0e`) and hyper-block's
-  `threads` and `node` modules. The same scenario passed on the same target in run 37181616582 an
-  hour before. A reading of the Windows code on the path found nothing unsound: the receive stamps
-  and the datagram socket, the performance counter, the toolhelp walk, the leaked-slot waker and the
-  aligned buffers; aws-lc's C remains. So each E2E member now writes the account of a fatal fault
-  before Windows ends it (hyper-raft-e2e's `fault`): the code, the faulting instruction, the access
-  and the address touched, then a backtrace, on the standard error the tests inherit. Open: which
-  call, and the invariant it breaks, from the next sighting's account.
+  Member 1 was stopped at term 2. Members 2 and 3 went through three elections to term 5 (3 leading,
+  commit 7) with writes of 597 and 741 ms against detections of 54 and 107 ms: each write held its
+  member's flush-proven heartbeats past its peer's detection, so the pair suspected each other in
+  turn. The test's put waits while the stopped member's silence stays within the longest write and
+  the quiet period (2.88 s), and the elections outlasted it (3.08 s). Member 3's report is in the
+  failure's output (term 5, leading). Not seen again: 30 runs in Docker's Linux at 2 CPUs and load
+  6.3 to 7.0, 10 runs with both members' flushes held 741 and 597 ms after the stop (each commits
+  in 1.4 s, no election), and 47 ubuntu-24.04 gates since 2ef0ab3. Open: whether a device whose
+  every write is that slow makes a pair re-elect past the law (each new leader's first write
+  suspected in turn); the reports now state each member's core suspicions and campaign.
+
+### Closed (2026-10-05)
+
+- **hyper-durable-e2e `kill-durable-leader`** (Linux Docker, 2 CPUs, load 6.8): the survivors'
+  writes out 2 s against a longest finished write of 58 ms, and the wait judged a member stuck past
+  that write and the quiet period. The cause was the wait's rule, not the group: one flush does not
+  bound another on a contended device. 8594bf0 (09067dd on its branch) judges a member with a write
+  in progress only past the kernel's own bound on a flush (`device::FLUSH_BOUND`, 60 s), its unit
+  test pinning both sides. Since: 30 runs in Docker's Linux at 2 CPUs and load 6.4 to 7.4, 30 runs
+  on macOS under 28 CPU burners at load up to 43, every gate on every target.
+- **hyper-raft-e2e `member-stopped`, windows-11-arm (`1967cd9`, run 37152466424).** Member 2 did
+  not campaign because its detectors suspected both other members: member 1, stopped, and member 3, its
+  leader, held 5.1 s inside one flush. A member campaigns only while it and those it trusts are a
+  quorum (`watch.rs`), and member 3, inside its flush, could vote for no one, so no election could
+  run until the flush returned; the core did what its rule says, and this depends on neither the
+  configuration-safety change. The test failed because member 3's silence inside that flush
+  (3.0 s) passed its excuse (1.04 s, the longest write reported and the quiet period). On `line`
+  the wait judges a silent member only once the device answers the test's own flush faster
+  (2ef0ab3), and a member in its write by the kernel's bound (8594bf0). Since 2ef0ab3: 40
+  windows-11-arm gates passed, none failing in an E2E scenario.
+- **The access violation `0xc0000005` of an E2E member on windows-11-arm.** Three accounts from the
+  fault handler, all on 2026-10-04 before c3406db (runs 37204898614, 37208590794, 37209556561),
+  fault in `hyper_durable_e2e::node::Node::drain` writing `0x10e` through a stack slot that held 14:
+  an I/O status block (STATUS_SUCCESS, 14 bytes, the length of a report ask) written into drain's
+  reused frame by a timed peek (`SO_RCVTIMEO`) that Windows cancelled as the call returned and that
+  completed after it. The invariant broken: an operation the kernel may still complete must not
+  have its buffers on a frame the call has left. c3406db waits by `WSAPoll`, which writes nothing
+  past its return (`hyper_measure::wait::arrives`); its loop ran 361 iterations on windows-11-arm
+  without a fault. Searched since: every failed or cancelled run from 2026-10-04 08:00 UTC to
+  2026-10-05 (38 runs, `gh run view --log-failed`), and 40 windows-11-arm gates passed since
+  2ef0ab3: no other account.
 
 ## Consumers
 

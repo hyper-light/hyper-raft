@@ -5,6 +5,7 @@
 //! frame theirs (`hyper_raft_e2e::stream`), at the tag past these orders'.
 use hyper_raft::FastStats;
 use hyper_raft::proto::ConfChangeType;
+use hyper_raft_e2e::stream;
 use hyper_raft_e2e::wire::{self, Kind, Reader, Status};
 
 /// A named durability point: where a member stops, printing `stopped <name>`, for the test to kill
@@ -195,6 +196,12 @@ pub struct Report {
     pub suspected: Vec<u64>,
     /// The peers its stream has taken a heartbeat from.
     pub heard: Vec<u64>,
+    /// The peers its core suspects: what the stream told it, which the core acts on.
+    pub core_suspected: Vec<u64>,
+    /// Its clock when it reported, nanoseconds: what `campaign.due` is on.
+    pub clock_ns: u64,
+    /// What decides its next campaign by suspicion (`hyper_raft::Raft::campaign_state`).
+    pub campaign: Option<hyper_raft::CampaignState>,
 }
 
 /// The response tag a report takes: past those of `wire::Outcome`.
@@ -238,14 +245,18 @@ pub fn put_report(buffer: &mut Vec<u8>, id: u64, report: &Report) {
         u64::from(report.stalled),
         u64::from(report.marked),
         report.deadline_ns,
-        u64::try_from(report.voters.len()).unwrap_or(u64::MAX),
-    ] {
+        report.clock_ns,
+    ]
+    .into_iter()
+    .chain(stream::campaign_words(report.campaign))
+    .chain([u64::try_from(report.voters.len()).unwrap_or(u64::MAX)])
+    {
         wire::put_u64(buffer, word);
     }
     for voter in &report.voters {
         wire::put_u64(buffer, *voter);
     }
-    for list in [&report.suspected, &report.heard] {
+    for list in [&report.suspected, &report.heard, &report.core_suspected] {
         wire::put_u64(buffer, u64::try_from(list.len()).unwrap_or(u64::MAX));
         for peer in list {
             wire::put_u64(buffer, *peer);
@@ -275,7 +286,7 @@ pub fn read_report(body: &[u8], max_voters: usize) -> Option<(u64, Report)> {
         return None;
     }
     let status = read_status(&mut reader)?;
-    let mut words = [0u64; 23];
+    let mut words = [0u64; 26];
     for word in &mut words {
         *word = reader.u64()?;
     }
@@ -303,6 +314,9 @@ pub fn read_report(body: &[u8], max_voters: usize) -> Option<(u64, Report)> {
         stalled,
         marked,
         deadline_ns,
+        clock_ns,
+        due,
+        flags,
     ] = words;
     let list = |reader: &mut Reader<'_>| {
         let count = usize::try_from(reader.u64()?).ok()?;
@@ -316,6 +330,7 @@ pub fn read_report(body: &[u8], max_voters: usize) -> Option<(u64, Report)> {
     let voters = list(&mut reader)?;
     let suspected = list(&mut reader)?;
     let heard = list(&mut reader)?;
+    let core_suspected = list(&mut reader)?;
     Some((
         id,
         Report {
@@ -348,6 +363,50 @@ pub fn read_report(body: &[u8], max_voters: usize) -> Option<(u64, Report)> {
             deadline_ns,
             suspected,
             heard,
+            core_suspected,
+            clock_ns,
+            campaign: stream::campaign_of([due, flags]),
         },
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A member's report reads back as written, its core's suspicions and campaign among it: what a
+    /// failure's account states of each member's elections.
+    #[test]
+    fn a_report_reads_back_with_its_core_state() {
+        let mut buffer = Vec::new();
+        for campaign in [
+            None,
+            Some(hyper_raft::CampaignState {
+                due: Some(17),
+                armed: true,
+                led: false,
+                held: true,
+                trusted_quorum: false,
+                may_campaign: true,
+                may_lead: true,
+                promotable: true,
+            }),
+        ] {
+            let report = Report {
+                voters: vec![1, 2, 3],
+                suspected: vec![1],
+                heard: vec![1, 3],
+                core_suspected: vec![1, 3],
+                clock_ns: 99,
+                deadline_ns: 5,
+                campaign,
+                ..Report::default()
+            };
+            put_report(&mut buffer, 5, &report);
+            assert!(wire::seal(&mut buffer, wire::MAX_DATAGRAM));
+            let (kind, body) = wire::open(&buffer).unwrap();
+            assert_eq!(kind, Kind::Response);
+            assert_eq!(read_report(body, 3), Some((5, report)));
+        }
+    }
 }

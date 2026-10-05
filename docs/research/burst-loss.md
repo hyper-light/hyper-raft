@@ -285,6 +285,17 @@ with 32 seeds in brackets:
 | bursts 78.7 ms, no dial before | 1,910 / 158 (1,945 / 3,671) | 300 / 229 (237 / 211) | as spaced |
 | bursts 78.7 ms, two dials before | 1,831 / 123 (1,831 / 93) | 1,964 / 282 (2,786 / 244) | 1,964 / 282 (2,786 / 244) |
 
+At 512 seeds (same tree, load 7.9 to 16.3; first reply p90, fresh / resumed):
+
+| condition | back to back | spaced 35 ms | spaced as learned |
+|---|---|---|---|
+| independent, no dial before | 132 / 99 | 361 / 235 | as spaced |
+| independent, two dials before | 79 / 106 | 292 / 262 | **150 / 124** |
+| bursts 35 ms, no dial before | 1,880 / 139 | 271 / 226 | as spaced |
+| bursts 35 ms, two dials before | 1,864 / 158 | 197 / 226 | 197 / 226 |
+| bursts 78.7 ms, no dial before | 1,906 / 2,005 | 308 / 249 | as spaced |
+| bursts 78.7 ms, two dials before | 1,642 / 2,816 | 381 / 232 | 381 / 232 |
+
 - **Independent loss, two dials before:** learning takes the fresh p90 from 658 to 207 ms and the
   resumed from 296 to 105 ms. The resumed dial reaches back to back (106); the fresh dial is 140 ms
   above back to back's 69. Both endpoints' evidence settled on independence in 12 of the 16 seeds
@@ -292,12 +303,38 @@ with 32 seeds in brackets:
 - **Bursts:** the learned rows equal the 35 ms rows exactly. The evidence never left the default,
   so learning costs nothing where losses come in bursts. Back to back is worse there, by up to 2.8 s
   at p90.
-- **τ = 78.7 ms after two dials:** spaced and learned alike have a fresh p90 of 1,964 ms. The 35 ms
-  default spaces copies 117 ms, inside these bursts' correlation; in seed 23, traced, the first
-  flight's copies met a burst and the dial waited the client's probe timeout. Evidence at the gaps a
-  connection sees never tells 78.7 ms from 35 ms (§7), so learning keeps the default. Before the
-  rebase onto `diag-quic-land` (Careful Resume's warm-up), the same row measured 87 ms: the row is
-  sensitive to where the measured dial's start falls in the bursts.
+- **τ = 78.7 ms after two dials, fresh: 1,964 ms at 128 seeds is sampling, not a regression.**
+  Before the rebase onto `diag-quic-land` the row measured 87 ms. Bisected at 512 seeds, the same
+  scenario (`scratch` runs, not committed), first reply p90 over the floor:
+
+  | tree | p90, seeds 1–128 | p90 per 128-seed block (1–128, 129–256, 257–384, 385–512) | p90, 512 seeds | over 2.5 s |
+  |---|---|---|---|---|
+  | c3e30a2 + path-tau (before the rebase) | 87 | 87, 984, 753, 335 | 335 | 29 |
+  | + this branch's stream-end rule | 587 | 587, 1,143, 946, 205 | 332 | 32 |
+  | 34d53af (warm-up) + path-tau | 87 | identical to c3e30a2 | 335 | 29 |
+  | b0d4231 (no pacing before confirmation) + path-tau | 198 | 198, 426, 328, 143 | 227 | 24 |
+  | + the stream-end rule (this branch's head) | 1,964 | 1,964, 253, 224, 140 | 381 | 25 |
+  | dda0330 + path-tau | as b0d4231 | | | |
+
+  The 128-seed p90 of one tree spans 87 to 984 ms across disjoint blocks: p90 is the 116th of 128
+  values, and about 5% of fresh dials (21 to 32 of 512 on every tree) wait two or more probe
+  timeouts, so whether the 116th lands among them is the block's draw. On 512 seeds, p90 sits
+  between 227 and 381 ms on every tree; the rank band of a 512-seed p90 at 95% (ranks 447–474)
+  is 143–1,376 ms before the rebase and 144–655 ms after b0d4231, overlapping throughout. No
+  commit moved the tail; b0d4231 shrank it (29 to 24 of 512). The warm-up changes nothing here:
+  these rows run with Careful Resume off.
+- **What that tail is.** In all 12 tail seeds of 1–128 traced (6, 9, 23, 27, 30, 33, 35, 41, 79,
+  90, 119, 125), the server's handshake flight (nine datagrams of 1,200 bytes and one of 1,193:
+  a 9,280-byte certificate chain) leaves at one instant, one 78.7 ms burst takes all of it, and
+  each copy due 117 ms later is "blocked by congestion control": the flight fills the 12,000-byte
+  initial window (RFC 9002 §7.2, `min(10 * max_datagram_size, max(2 * max_datagram_size, 14720))`),
+  and "an endpoint MUST NOT send a packet if it would cause bytes_in_flight ... to be larger than
+  the congestion window" (§7). Nothing acknowledges the lost flight, so each probe timeout sends
+  one probe (§6.2.4) and the window stays full: three to six probe timeouts. The clause binds.
+  The remedy that keeps it is a flight half the window: TLS certificate compression (RFC 8879)
+  shrinks the chain the flight carries, so a flight and its copies fit the initial window. That is
+  a proposal of its own (a compressor of our own, measured on the chain), not built here.
+
 - **Without a dial before**, nothing is learned (handshake packets are not counted) and the rows
   equal the 35 ms ones.
 - **The shift between 32 and 128 seeds** is the cliff of §9 before its fix, and sampling after it.

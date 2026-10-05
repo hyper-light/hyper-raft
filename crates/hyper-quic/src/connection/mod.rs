@@ -65,6 +65,9 @@ use paths::{PathData, PathResponses};
 pub(crate) mod qlog;
 use qlog::QlogSink;
 
+mod resume;
+pub(crate) use resume::{CarefulResume, CongestionMemory, Saved};
+
 mod send_buffer;
 
 mod spaces;
@@ -185,6 +188,8 @@ pub struct Connection {
     undecryptable: VecDeque<(SocketAddr, Option<EcnCodepoint>, PartialDecode)>,
     undecryptable_bytes: usize,
     endpoint_events: VecDeque<EndpointEventInner>,
+    /// Careful Resume over the current path's congestion controller (RFC 9959)
+    resume: CarefulResume,
     /// Whether the spin bit is in use for this connection
     spin_enabled: bool,
     /// Outgoing spin bit state
@@ -284,6 +289,7 @@ impl Connection {
         allow_mtud: bool,
         rng_seed: [u8; 32],
         side_args: SideArgs,
+        resume: CarefulResume,
     ) -> Self {
         let pref_addr_cid = side_args.pref_addr_cid();
         let path_validated = side_args.path_validated();
@@ -337,6 +343,7 @@ impl Connection {
             undecryptable: VecDeque::new(),
             undecryptable_bytes: 0,
             endpoint_events: VecDeque::new(),
+            resume,
             spin_enabled: config.allow_spin && rng.random_ratio(7, 8),
             spin: false,
             spaces: Spaces::new(initial_space, PacketSpace::new(now), PacketSpace::new(now)),
@@ -517,7 +524,7 @@ impl Connection {
                 space == SpaceId::Data && self.peer_supports_ack_frequency();
             self.spaces
                 .get_mut(space)
-                .maybe_queue_probe(request_immediate_ack, &self.streams);
+                .maybe_queue_probe(request_immediate_ack, &mut self.streams);
         }
 
         let close = self.close_pending()?;
@@ -758,8 +765,15 @@ impl Connection {
 
         if sent.largest_acked.is_some() {
             self.spaces.get_mut(space_id).pending_acks.acks_sent();
-            self.timers.stop(Timer::MaxAckDelay);
-            self.next_bundled_ack_time = now.checked_add(self.next_bundled_ack_delay());
+            // The max_ack_delay timer and the bundling deadline are the Data space's (Initial and
+            // Handshake packets are acknowledged at once, RFC 9000 §13.2.1). Upstream reset them on
+            // an ACK in any space, so the Initial ACK a server's first flight carries stopped the
+            // timer for the client's 0-RTT packet and put off its bundled ACK a round trip: the
+            // 0-RTT packet was acknowledged only after the handshake, past max_ack_delay.
+            if space_id == SpaceId::Data {
+                self.timers.stop(Timer::MaxAckDelay);
+                self.next_bundled_ack_time = now.checked_add(self.next_bundled_ack_delay());
+            }
         }
 
         // Keep information about the packet around until it gets finalized
@@ -847,8 +861,20 @@ impl Connection {
 
         // Byte counts: saturating can only over-state them, which blocks rather than over-sends
         let bytes_to_send = (tx.segment_size as u64).saturating_add(untracked_bytes);
-        let window_blocked = self.path.in_flight.bytes.saturating_add(bytes_to_send)
+        let mut window_blocked = self.path.in_flight.bytes.saturating_add(bytes_to_send)
             >= self.path.congestion.window();
+        if window_blocked
+            && self.resume.on_window_blocked(
+                now,
+                self.spaces.get(SpaceId::Data).next_packet_number,
+                self.path.in_flight.bytes,
+                &self.path.rtt,
+                &mut *self.path.congestion,
+            )
+        {
+            window_blocked = self.path.in_flight.bytes.saturating_add(bytes_to_send)
+                >= self.path.congestion.window();
+        }
         // RFC 9002 §7: a packet may exceed the window "when entering recovery", one packet
         // (§7.3.2), which speeds loss recovery as RFC 6675 §5 does for TCP. Without it a lost
         // Initial whose peer cannot acknowledge the in-flight Handshake packets (it has no keys
@@ -863,9 +889,13 @@ impl Connection {
 
         // Check whether the next datagram is blocked by pacing
         let smoothed_rtt = self.path.rtt.get();
+        let pacing_rate = self.path.congestion.pacing_rate().or_else(|| {
+            self.resume
+                .pacing_rate(self.path.congestion.window(), smoothed_rtt)
+        });
         if let Some(delay) = self.path.pacing.delay(
             smoothed_rtt,
-            self.path.congestion.pacing_rate(),
+            pacing_rate,
             bytes_to_send,
             self.path.current_mtu(),
             self.path.congestion.window(),
@@ -1146,10 +1176,18 @@ impl Connection {
         }
 
         let last_packet_number = builder.exact_number;
+        let space = builder.space;
         builder.finish_and_track(now, self, tx.sent_frames.take(), buf);
         self.path
             .congestion
             .on_sent(now, buf.len() as u64, last_packet_number);
+        if space == SpaceId::Data {
+            self.resume.on_data_sent(
+                last_packet_number,
+                self.path.in_flight.bytes,
+                &mut *self.path.congestion,
+            );
+        }
 
         self.qlog
             .emit_recovery_metrics(self.pto_count, &mut self.path, now, self.orig_rem_cid);
@@ -1708,7 +1746,7 @@ impl Connection {
             return Ok(());
         }
 
-        let ack_eliciting_acked = self.on_packets_acked(now, space, &newly_acked);
+        let (ack_eliciting_acked, acked_bytes) = self.on_packets_acked(now, space, &newly_acked);
 
         self.path.congestion.on_end_acks(
             now,
@@ -1723,6 +1761,20 @@ impl Connection {
 
         // Must be called before crypto/pto_count are clobbered
         self.detect_lost_packets(now, space, true);
+
+        let data = self.spaces.get(SpaceId::Data);
+        let data_sent = data
+            .time_of_last_ack_eliciting_packet
+            .map(|_| data.largest_ack_eliciting_sent);
+        self.resume.on_ack(
+            now,
+            acked_bytes,
+            data.largest_acked_packet,
+            data_sent,
+            self.path.in_flight.bytes,
+            &self.path.rtt,
+            &mut *self.path.congestion,
+        );
 
         if self.peer_completed_address_validation() {
             self.pto_count = 0;
@@ -1755,14 +1807,15 @@ impl Connection {
     }
 
     /// Takes each newly acknowledged packet out of flight; returns whether any was
-    /// ACK-eliciting
+    /// ACK-eliciting, and the bytes of those that were
     fn on_packets_acked(
         &mut self,
         now: Instant,
         space: SpaceId,
         newly_acked: &ArrayRangeSet,
-    ) -> bool {
+    ) -> (bool, u64) {
         let mut ack_eliciting_acked = false;
+        let mut acked_bytes = 0u64;
         for packet in newly_acked.elts() {
             if let Some(info) = self.spaces.get_mut(space).take(packet) {
                 if let Some(acked) = info.largest_acked {
@@ -1777,6 +1830,9 @@ impl Connection {
                         .subtract_below(acked);
                 }
                 ack_eliciting_acked |= info.ack_eliciting;
+                if info.ack_eliciting {
+                    acked_bytes = acked_bytes.saturating_add(u64::from(info.size));
+                }
 
                 // Notify MTU discovery that a packet was acked, because it might be an MTU probe
                 let mtu_updated = self.path.mtud.on_acked(space, packet, info.size);
@@ -1792,7 +1848,7 @@ impl Connection {
                 self.on_packet_acked(now, info);
             }
         }
-        ack_eliciting_acked
+        (ack_eliciting_acked, acked_bytes)
     }
 
     /// Takes an RTT sample from an ACK of a new largest, ACK-eliciting packet
@@ -1864,6 +1920,7 @@ impl Connection {
                 self.path
                     .congestion
                     .on_congestion_event(now, largest_sent_time, false, 0);
+                self.resume.on_congestion(&mut *self.path.congestion);
             }
         }
     }
@@ -1872,7 +1929,9 @@ impl Connection {
     // high-latency handshakes
     fn on_packet_acked(&mut self, now: Instant, info: SentPacket) {
         self.remove_in_flight(&info);
-        if info.ack_eliciting && self.path.challenge.is_none() {
+        // Careful Resume holds the window in its Unvalidated Phase and Safe Retreat (RFC 9959
+        // §3.3, §3.5)
+        if info.ack_eliciting && self.path.challenge.is_none() && !self.resume.holds_window() {
             // Only pass ACKs to the congestion controller if we are not validating the current
             // path, so as to ignore any ACKs from older paths still coming in.
             self.path.congestion.on_ack(
@@ -1914,6 +1973,12 @@ impl Connection {
 
     /// The probe timeouts fired since the last acknowledgement, and the ack-eliciting packets in
     /// flight on the current path: what a test of the loss-detection timer observes.
+    /// The largest of this endpoint's packets the peer acknowledged in `space`
+    #[cfg(test)]
+    pub(crate) fn largest_acked(&self, space: SpaceId) -> Option<u64> {
+        self.spaces.get(space).largest_acked_packet
+    }
+
     #[cfg(test)]
     pub(crate) fn pto_state(&self) -> (u32, u64) {
         (self.pto_count, self.path.in_flight.ack_eliciting)
@@ -1960,12 +2025,22 @@ impl Connection {
         // pending rather than in flight, and it is the one the peer most needs: a server whose
         // ServerHello was lost holds Handshake packets in flight that the client cannot decrypt,
         // and probing only the Handshake space repeats them until the idle timeout. So each
-        // other handshake space with keys and data in flight or pending gets one of the probes,
-        // the expired space keeping at least one; earlier spaces are written first, coalesced.
+        // other space with keys and data in flight or pending gets one of the probes, the expired
+        // space keeping at least one; earlier spaces are written first, coalesced. The Data space
+        // is among them once the path has an RTT sample: a client whose Finished and first request
+        // went in one lost datagram probes the Finished on its Handshake timer, and the request
+        // rides in the same datagram rather than waiting for its own loss to be detected after the
+        // handshake. Before any sample the timer runs from kInitialRtt (§6.2.2), a guess that
+        // expires before any acknowledgement can return on a path longer than a second: a server's
+        // first PTO at 999 ms against a 1 s round trip. Its Data probe would then repeat 0.5-RTT
+        // data that is not lost, a packet held in flight through the client's first burst
+        // (measured in `docs/benchmarks.md`, "Probe timeouts").
         let mut probes: u32 = count;
-        for other in [SpaceId::Initial, SpaceId::Handshake] {
+        let sampled = self.path.first_packet_after_rtt_sample.is_some();
+        for other in [SpaceId::Initial, SpaceId::Handshake, SpaceId::Data] {
             let candidate = self.spaces.get(other);
             if other == space
+                || (other == SpaceId::Data && !sampled)
                 || candidate.crypto.is_none()
                 || !(candidate.has_in_flight() || !candidate.pending.is_empty(&self.streams))
             {
@@ -2159,6 +2234,7 @@ impl Connection {
                 lost.persistent_congestion,
                 lost.bytes,
             );
+            self.resume.on_congestion(&mut *self.path.congestion);
             // Entering recovery reduces the window; a loss within a recovery period does not
             // (RFC 9002 §7.3.2), and gets no extra packet
             self.recovery_packet |= self.path.congestion.window() < window;
@@ -2175,7 +2251,7 @@ impl Connection {
         let backoff = 2u32.saturating_pow(self.pto_count.min(MAX_BACKOFF_EXPONENT));
         // Delays: saturating can only lengthen them; a deadline past the clock's range is never
         // reached, so it is no deadline
-        let mut duration = self.path.rtt.pto_base().saturating_mul(backoff);
+        let mut duration = self.path.rtt.probe_base().saturating_mul(backoff);
 
         if self.path.in_flight.ack_eliciting == 0 {
             let space = match self.highest_space {
@@ -3153,6 +3229,13 @@ impl Connection {
         self.events.push_back(Event::Connected);
         self.state = State::Established;
         trace!("established");
+        // The probe timer skips the Data space while the connection is handshaking, and the
+        // server armed it above while discarding its Handshake keys, still handshaking. Its
+        // handshake is confirmed now (RFC 9001 §4.1.2), so the Data space's in-flight packets get
+        // their PTO (RFC 9002 §6.2.1). Upstream left the timer unarmed: a server whose window was
+        // full of 0.5-RTT data, with the client's acknowledgements of it dropped before the
+        // handshake completed (RFC 9001 §5.7), sent nothing more and idled out.
+        self.set_loss_detection_timer(now);
         Ok(())
     }
 
@@ -3716,6 +3799,8 @@ impl Connection {
 
     fn migrate(&mut self, now: Instant, remote: SocketAddr) {
         trace!(%remote, "migration initiated");
+        // RFC 9959 §3.2: a different path stops Careful Resume
+        self.resume.on_path_change();
         self.path_counter = self.path_counter.wrapping_add(1);
         // Reset rtt/congestion state for new path unless it looks like a NAT rebinding.
         // Note that the congestion window will not grow until validation terminates. Helps mitigate
@@ -4259,6 +4344,15 @@ impl Connection {
         trace!("connection closed");
         for &timer in &Timer::VALUES {
             self.timers.stop(timer);
+        }
+        // What this connection measured goes to the endpoint as it closes, not three PTOs later
+        // when it drains, so a connection to the same remote made at once can resume from it
+        if let Some(saved) = self
+            .resume
+            .observed(self.path.congestion.initial_window(), self.path.rtt.min())
+        {
+            self.endpoint_events
+                .push_back(EndpointEventInner::Observed(saved));
         }
     }
 

@@ -66,6 +66,21 @@ pub trait Controller: Send + Sync {
     /// Number of ack-eliciting bytes that may be in flight
     fn window(&self) -> u64;
 
+    /// Sets the window to `window` bytes, not below the controller's minimum, for Careful Resume
+    /// (RFC 9959 §3.3 to §3.5); returns whether the controller supports it
+    ///
+    /// A controller whose window is not a byte count it may be told (BBR's and Copa's are derived
+    /// from their models) returns `false`, and its connections start at the initial window.
+    #[allow(unused_variables)]
+    fn set_window(&mut self, window: u64) -> bool {
+        false
+    }
+
+    /// Sets the slow-start threshold on leaving Careful Resume's Safe Retreat (RFC 9959 §3.5),
+    /// not below the controller's minimum window
+    #[allow(unused_variables)]
+    fn set_ssthresh(&mut self, ssthresh: u64) {}
+
     /// The rate the path's pacer sends at, in bytes a second
     ///
     /// `None` keeps the connection's own rule, five quarters of the window a smoothed round trip

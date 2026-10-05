@@ -27,7 +27,6 @@ fn stateless_retry() {
 fn retry_token_expired() {
     let _guard = subscribe();
 
-    let fake_time = FakeTimeSource::new();
     let retry_token_lifetime = Duration::from_secs(1);
 
     let mut pair = Pair::default();
@@ -35,7 +34,7 @@ fn retry_token_expired() {
 
     let mut config = server_config();
     config
-        .time_source(Box::new(fake_time.clone()))
+        .time_source(Box::new(FixedTime(START)))
         .retry_token_lifetime(retry_token_lifetime);
     pair.server.set_server_config(Some(config)).unwrap();
 
@@ -45,7 +44,7 @@ fn retry_token_expired() {
     pair.drive_client();
 
     // to expire retry token
-    fake_time.advance(retry_token_lifetime + Duration::from_millis(1));
+    advance_server_clock(&mut pair, retry_token_lifetime + Duration::from_millis(1));
 
     pair.drive();
     assert_matches!(
@@ -256,11 +255,10 @@ fn use_same_token_twice() {
 #[test]
 fn use_token_expired() {
     let _guard = subscribe();
-    let fake_time = FakeTimeSource::new();
     let lifetime = Duration::from_secs(10000);
     let mut server_config = server_config();
     server_config
-        .time_source(Box::new(fake_time.clone()))
+        .time_source(Box::new(FixedTime(START)))
         .validation_token
         .lifetime(lifetime);
     let mut pair = Pair::new(Default::default(), server_config);
@@ -294,7 +292,7 @@ fn use_token_expired() {
     assert_eq!(pair.server.known_connections(), 0);
     assert_eq!(pair.server.known_cids(), 0);
 
-    fake_time.advance(lifetime + Duration::from_secs(1));
+    advance_server_clock(&mut pair, lifetime + Duration::from_secs(1));
 
     pair.server.handle_incoming = Box::new(|incoming| {
         assert!(!incoming.remote_address_validated());
@@ -314,23 +312,23 @@ fn use_token_expired() {
     assert_eq!(pair.server.known_cids(), 0);
 }
 
-/// A clock the test advances; clones share it, so the test keeps one while the server
-/// configuration owns another
-#[derive(Clone)]
-pub(super) struct FakeTimeSource(Arc<Mutex<SystemTime>>);
+/// The wall-clock time the token tests start from: fixed, so no test reads the host's clock.
+const START: SystemTime = SystemTime::UNIX_EPOCH;
 
-impl FakeTimeSource {
-    pub(super) fn new() -> Self {
-        Self(Arc::new(Mutex::new(SystemTime::now())))
-    }
+/// A wall clock stopped at one time. The server's configuration owns it; a test moves the
+/// server's time on by replacing it there (`advance_server_clock`), where upstream shared one clock
+/// between the test and the configuration behind a lock.
+pub(super) struct FixedTime(pub(super) SystemTime);
 
-    pub(super) fn advance(&self, dur: Duration) {
-        *self.0.lock().unwrap() += dur;
+impl TimeSource for FixedTime {
+    fn now(&self) -> SystemTime {
+        self.0
     }
 }
 
-impl TimeSource for FakeTimeSource {
-    fn now(&self) -> SystemTime {
-        *self.0.lock().unwrap()
-    }
+/// Moves the clock of the server's current configuration `by` on, keeping its keys.
+fn advance_server_clock(pair: &mut Pair, by: Duration) {
+    let config = pair.server.endpoint.server_config_mut().unwrap();
+    let now = config.time_source.now();
+    config.time_source(Box::new(FixedTime(now + by)));
 }

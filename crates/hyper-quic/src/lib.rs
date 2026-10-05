@@ -78,9 +78,10 @@ pub use rustls;
 
 mod config;
 pub use config::{
-    AckFrequencyConfig, ClientConfig, ClientConfigError, ClientConfigHandle, ConfigError, Configs,
-    ConfigsFull, EndpointConfig, IdleTimeout, MtuDiscoveryConfig, ServerConfig, ServerConfigHandle,
-    StdSystemTime, TimeSource, TransportConfig, ValidationTokenConfig,
+    AckFrequencyConfig, CarefulResumeConfig, ClientConfig, ClientConfigError, ClientConfigHandle,
+    ConfigError, Configs, ConfigsFull, EndpointConfig, IdleTimeout, MtuDiscoveryConfig,
+    ServerConfig, ServerConfigHandle, StdSystemTime, TimeSource, TransportConfig,
+    ValidationTokenConfig,
 };
 pub use config::{QlogConfig, QlogError};
 

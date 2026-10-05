@@ -450,3 +450,24 @@ loopback needs, so that a wedged peer fails the test instead of hanging it.
 All 33 runs pass, in 2.8 s for the binary (debug profile, this machine), and 20 repetitions at load
 23–24 passed every one: a full TLS 1.3 handshake with a mebibyte each way in 36–74 ms, a resumed
 one in 1.7–2.8 ms.
+
+## 7. Tickets with the server's Finished over QUIC (2026-10-04)
+
+RFC 8446 §4.6.1: "a server which does not request client authentication MAY compute the remainder
+of the transcript independently and then send a NewSessionTicket immediately upon sending its
+Finished rather than waiting for the client Finished." Over QUIC a client sends no EndOfEarlyData
+(RFC 9001 §8.3), so on a handshake that does not request a client certificate its second flight is
+its Finished alone. `server::tls13` now computes that Finished (`client_finish_ahead`) and the
+resumption secret it gives (`resumption_ahead`), and writes the tickets after its own Finished, to
+go under the 1-RTT keys (`Quic::one_rtt_flight`, released by `write_hs` once those keys are passed
+on, since RFC 9001 §4 puts NewSessionTicket in 1-RTT packets). The transcript the client's Finished
+is checked against is left as it was, and a client whose Finished differs is refused as before.
+
+The reason is measured (`docs/benchmarks.md`): a resumed dial that closed at its first reply, one
+round trip in, closed half a round trip before tickets sent after the client's Finished arrived, so
+with the two tickets of the first dial spent the fourth dial fell back to 1-RTT. More tickets per
+full handshake only defer that, since each such dial spends one and gets none; tickets in the first
+flight replace the one each dial spends. A handshake that requests a client certificate, and TLS
+over TCP, send them after the client's Finished as upstream does. Upstream's suite passes unchanged;
+`crates/hyper-quic/tests/geo.rs`'s `every_resumed_dial_closed_at_its_reply_leaves_a_ticket_for_the_next`
+failed before it.

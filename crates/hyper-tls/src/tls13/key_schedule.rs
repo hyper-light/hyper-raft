@@ -475,6 +475,31 @@ impl KeyScheduleTrafficWithClientFinishedPending {
             .set_decrypter(&self.handshake_client_traffic_secret, common)
     }
 
+    /// The client's Finished verify_data for the transcript `hs_hash`, which ends with the server's
+    /// Finished: what the client will send when it authenticates with no certificate, computed
+    /// ahead of it (RFC 8446 §4.6.1).
+    pub(crate) fn client_finish_ahead(&self, hs_hash: &hash::Output) -> Result<hmac::Tag, Error> {
+        self.before_finished
+            .ks
+            .sign_finish(&self.handshake_client_traffic_secret, hs_hash)
+    }
+
+    /// The resumption secret of the transcript `hs_hash`, which ends with the client's Finished
+    /// (RFC 8446 §7.1, `res_master`), derived ahead of that Finished.
+    pub(crate) fn resumption_ahead(
+        &self,
+        hs_hash: &hash::Output,
+    ) -> Result<KeyScheduleResumption, Error> {
+        let resumption_master_secret = self
+            .before_finished
+            .ks
+            .derive(SecretKind::ResumptionMasterSecret, hs_hash.as_ref())?;
+        Ok(KeyScheduleResumption {
+            ks: self.before_finished.ks.inner,
+            resumption_master_secret,
+        })
+    }
+
     pub(crate) fn sign_client_finish(
         self,
         hs_hash: &hash::Output,

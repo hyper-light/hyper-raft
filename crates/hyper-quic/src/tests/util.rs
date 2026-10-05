@@ -1,20 +1,18 @@
 use std::{
     cmp,
     collections::{HashMap, VecDeque},
-    env,
     io::{self, Write},
     mem,
-    net::{Ipv6Addr, SocketAddr, UdpSocket},
+    net::{Ipv6Addr, SocketAddr},
     ops::RangeFrom,
     str,
-    sync::Mutex,
 };
+
+use lazy_static::lazy_static;
 
 use assert_matches::assert_matches;
 use bytes::BytesMut;
-use lazy_static::lazy_static;
 use rustls::{
-    KeyLogFile,
     client::WebPkiServerVerifier,
     pki_types::{CertificateDer, PrivateKeyDer},
 };
@@ -25,6 +23,10 @@ use super::*;
 use crate::{Duration, Instant};
 
 pub(super) const DEFAULT_MTU: usize = 1452;
+/// The server's port in every pair, upstream's first
+const SERVER_PORT: u16 = 4433;
+/// The client's first port in every pair, upstream's first
+const FIRST_CLIENT_PORT: u16 = 44433;
 
 pub(super) struct Pair {
     pub(super) server: TestEndpoint,
@@ -42,6 +44,8 @@ pub(super) struct Pair {
     /// Number of spin bit flips
     pub(super) spins: u64,
     last_spin: bool,
+    /// The client ports not yet used, in order
+    client_ports: RangeFrom<u16>,
 }
 
 impl Pair {
@@ -62,14 +66,12 @@ impl Pair {
     }
 
     pub(super) fn new_from_endpoint(client: Endpoint, server: Endpoint) -> Self {
-        let server_addr = SocketAddr::new(
-            Ipv6Addr::LOCALHOST.into(),
-            SERVER_PORTS.lock().unwrap().next().unwrap(),
-        );
-        let client_addr = SocketAddr::new(
-            Ipv6Addr::LOCALHOST.into(),
-            CLIENT_PORTS.lock().unwrap().next().unwrap(),
-        );
+        // The pair's network is its own, in memory, so its addresses need be distinct only from
+        // one another: each pair numbers its client's ports itself, where upstream drew every
+        // pair's ports from process-wide counters behind locks.
+        let mut client_ports = FIRST_CLIENT_PORT..;
+        let server_addr = SocketAddr::new(Ipv6Addr::LOCALHOST.into(), SERVER_PORT);
+        let client_addr = SocketAddr::new(Ipv6Addr::LOCALHOST.into(), client_ports.next().unwrap());
         let now = Instant::now();
         Self {
             server: TestEndpoint::new(server, server_addr),
@@ -81,7 +83,16 @@ impl Pair {
             spins: 0,
             last_spin: false,
             congestion_experienced: false,
+            client_ports,
         }
+    }
+
+    /// A client address the pair has not used, for a test that moves the client
+    pub(super) fn fresh_client_addr(&mut self) -> SocketAddr {
+        SocketAddr::new(
+            Ipv6Addr::LOCALHOST.into(),
+            self.client_ports.next().unwrap(),
+        )
     }
 
     /// Returns whether the connection is not idle
@@ -148,9 +159,6 @@ impl Pair {
                 self.spins += (spin == self.last_spin) as u64;
                 self.last_spin = spin;
             }
-            if let Some(ref socket) = self.client.socket {
-                socket.send_to(&buffer, packet.destination).unwrap();
-            }
             if self.server.addr == packet.destination {
                 let ecn = set_congestion_experienced(packet.ecn, self.congestion_experienced);
                 self.server.inbound.push_back((
@@ -171,9 +179,6 @@ impl Pair {
             if packet_size > self.mtu {
                 info!(packet_size, "dropping packet (max size exceeded)");
                 continue;
-            }
-            if let Some(ref socket) = self.server.socket {
-                socket.send_to(&buffer, packet.destination).unwrap();
             }
             if self.client.addr == packet.destination {
                 let ecn = set_congestion_experienced(packet.ecn, self.congestion_experienced);
@@ -309,7 +314,6 @@ impl Default for Pair {
 pub(super) struct TestEndpoint {
     pub(super) endpoint: Endpoint,
     pub(super) addr: SocketAddr,
-    socket: Option<UdpSocket>,
     timeout: Option<Instant>,
     pub(super) outbound: VecDeque<(Transmit, Bytes)>,
     delayed: VecDeque<(Transmit, Bytes)>,
@@ -341,20 +345,9 @@ pub(super) fn validate_incoming(incoming: &Incoming) -> IncomingConnectionBehavi
 
 impl TestEndpoint {
     fn new(endpoint: Endpoint, addr: SocketAddr) -> Self {
-        // A capture socket, made only with SSLKEYLOGFILE and drained of whatever arrives without
-        // waiting: a receive with a timeout on Windows can complete after it returned, into the
-        // drain's buffer on the stack (`hyper_measure::wait`).
-        let socket = if env::var_os("SSLKEYLOGFILE").is_some() {
-            let socket = UdpSocket::bind(addr).expect("failed to bind UDP socket");
-            socket.set_nonblocking(true).unwrap();
-            Some(socket)
-        } else {
-            None
-        };
         Self {
             endpoint,
             addr,
-            socket,
             timeout: None,
             outbound: VecDeque::new(),
             delayed: VecDeque::new(),
@@ -375,14 +368,6 @@ impl TestEndpoint {
     }
 
     pub(super) fn drive_incoming(&mut self, now: Instant, remote: SocketAddr) {
-        if let Some(ref socket) = self.socket {
-            loop {
-                let mut buf = [0; 8192];
-                if socket.recv_from(&mut buf).is_err() {
-                    break;
-                }
-            }
-        }
         let buffer_size = self.endpoint.config().get_max_udp_payload_size() as usize;
         let mut buf = Vec::with_capacity(buffer_size);
 
@@ -709,7 +694,6 @@ pub(super) fn client_config_classical(certs: Option<Vec<CertificateDer<'static>>
         .with_custom_certificate_verifier(verifier)
         .with_no_client_auth();
     inner.enable_early_data = true;
-    inner.key_log = Box::new(KeyLogFile::new());
     ClientConfig::new(Box::new(QuicClientConfig::try_from(inner).unwrap()))
 }
 
@@ -736,7 +720,6 @@ fn client_crypto_inner(
             .unwrap(),
     )
     .unwrap();
-    inner.key_log = Box::new(KeyLogFile::new());
     if let Some(alpn) = alpn {
         inner.alpn_protocols = alpn;
     }
@@ -802,8 +785,6 @@ fn set_congestion_experienced(
 }
 
 lazy_static! {
-    pub static ref SERVER_PORTS: Mutex<RangeFrom<u16>> = Mutex::new(4433..);
-    pub static ref CLIENT_PORTS: Mutex<RangeFrom<u16>> = Mutex::new(44433..);
     pub(crate) static ref CERTIFIED_KEY: rcgen::CertifiedKey<rcgen::KeyPair> =
         rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
 }

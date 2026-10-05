@@ -60,6 +60,8 @@ const SEEDS: std::ops::Range<u64> = 1..33;
 /// What a request and its reply carry.
 const REQUEST: &[u8] = &[0x51; 100];
 const REPLY: &[u8] = &[0x52; 100];
+/// RFC 9000 §18.2's default max_ack_delay, which hyper-quic's endpoints advertise.
+const MAX_ACK_DELAY: u64 = 25 * MS;
 /// The longest a run goes on in virtual time: the default idle timeout (RFC 9308 §3.2's 30 s,
 /// hyper-quic's `max_idle_timeout`) twice, past which a connection that has not finished is
 /// stuck, not slow.
@@ -237,10 +239,20 @@ struct Scenario {
     kept_requests: u32,
     /// The client's datagrams, by their order of sending from zero, the network loses.
     drop_client: &'static [usize],
+    /// The server's datagrams, likewise.
+    drop_server: &'static [usize],
     /// Whether the server never hears the client.
     silent: bool,
     /// The server's bound on attempts pending at once (`ServerConfig::max_incoming`).
     max_incoming: Option<usize>,
+    /// The bytes of each reply.
+    reply_bytes: usize,
+    /// Whether the endpoints run Careful Resume (RFC 9959), their default.
+    careful_resume: bool,
+    /// Whether the first dial runs on a clean path and the later ones on `path`.
+    clean_first: bool,
+    /// The virtual time past which the run stops.
+    horizon: u64,
 }
 
 impl Scenario {
@@ -252,8 +264,13 @@ impl Scenario {
             early: false,
             kept_requests: 0,
             drop_client: &[],
+            drop_server: &[],
             silent: false,
             max_incoming: None,
+            reply_bytes: REPLY.len(),
+            careful_resume: true,
+            clean_first: false,
+            horizon: HORIZON,
         }
     }
 
@@ -280,7 +297,9 @@ struct Amplification {
 #[derive(Default)]
 struct Wire {
     drop_client: &'static [usize],
+    drop_server: &'static [usize],
     client_sent: usize,
+    server_sent: usize,
     sent: Vec<Sent>,
     server: Amplification,
     violations: Vec<(u64, usize, u64, u64)>,
@@ -309,10 +328,13 @@ impl Wire {
         if !from_client {
             self.server.sent += size as u64;
         }
-        let dropped = from_client && self.drop_client.contains(&self.client_sent);
-        if from_client {
+        let dropped = if from_client {
             self.client_sent += 1;
-        }
+            self.drop_client.contains(&(self.client_sent - 1))
+        } else {
+            self.server_sent += 1;
+            self.drop_server.contains(&(self.server_sent - 1))
+        };
         let fate = if dropped {
             hyper_sim::net::Fate::Dropped(hyper_sim::net::Dropped::Loss)
         } else {
@@ -356,7 +378,8 @@ struct Run {
     asked_at: u64,
     inbound: Option<StreamId>,
     asked: Vec<u8>,
-    answered: bool,
+    /// The bytes of the current reply the server has written
+    answered: usize,
     scratch: Vec<u8>,
 }
 
@@ -386,16 +409,23 @@ impl Run {
             messages: 4_096,
             bytes: 4_096 * 1_500,
         });
-        net.set_pair_path(CLIENT, SERVER, scenario.path).unwrap();
-        net.set_pair_path(SERVER, CLIENT, scenario.path).unwrap();
+        let first_path = match scenario.clean_first {
+            true => Path::in_order(ONE_WAY, 0),
+            false => scenario.path,
+        };
+        net.set_pair_path(CLIENT, SERVER, first_path).unwrap();
+        net.set_pair_path(SERVER, CLIENT, first_path).unwrap();
         let rng = |node: NodeId| {
             let mut bytes = [0u8; 32];
             bytes[..8].copy_from_slice(&scenario.seed.to_le_bytes());
             bytes[8..12].copy_from_slice(&node.0.to_le_bytes());
             Some(bytes)
         };
-        let mut client =
-            Endpoint::new(EndpointConfig::default(), None, false, rng(CLIENT)).unwrap();
+        let mut endpoint_config = EndpointConfig::default();
+        if !scenario.careful_resume {
+            endpoint_config.careful_resume(None);
+        }
+        let mut client = Endpoint::new(endpoint_config.clone(), None, false, rng(CLIENT)).unwrap();
         let client_config = client.insert_client_config(pki.client_config()).unwrap();
         if scenario.silent {
             net.partition(CLIENT, SERVER, true);
@@ -404,13 +434,8 @@ impl Run {
         if let Some(max) = scenario.max_incoming {
             server_config.max_incoming(max);
         }
-        let server = Endpoint::new(
-            EndpointConfig::default(),
-            Some(server_config),
-            false,
-            rng(SERVER),
-        )
-        .unwrap();
+        let server =
+            Endpoint::new(endpoint_config, Some(server_config), false, rng(SERVER)).unwrap();
         Self {
             scenario,
             epoch,
@@ -429,6 +454,7 @@ impl Run {
             client_config,
             wire: Wire {
                 drop_client: scenario.drop_client,
+                drop_server: scenario.drop_server,
                 ..Wire::default()
             },
             dialed: Vec::new(),
@@ -437,7 +463,7 @@ impl Run {
             asked_at: 0,
             inbound: None,
             asked: Vec::new(),
-            answered: false,
+            answered: 0,
             scratch: Vec::with_capacity(1_500),
         }
     }
@@ -448,6 +474,11 @@ impl Run {
 
     fn dial(&mut self) {
         let now = self.world.now();
+        if self.scenario.clean_first && self.dialed.len() == 1 {
+            let path = self.scenario.path;
+            self.net.set_pair_path(CLIENT, SERVER, path).unwrap();
+            self.net.set_pair_path(SERVER, CLIENT, path).unwrap();
+        }
         let at = self.at(now);
         let connection = self
             .client
@@ -466,7 +497,7 @@ impl Run {
         self.reply.clear();
         self.inbound = None;
         self.asked.clear();
-        self.answered = false;
+        self.answered = 0;
         self.wire.server = Amplification::default();
         self.dialed.push(Dialed {
             started: now,
@@ -510,7 +541,7 @@ impl Run {
                     if let Some(id) = connection.streams().accept(Dir::Bi) {
                         self.inbound = Some(id);
                         self.asked.clear();
-                        self.answered = false;
+                        self.answered = 0;
                     }
                 }
                 _ => {}
@@ -527,7 +558,7 @@ impl Run {
             }
             if let Some(id) = self.request {
                 read_to_end(connection, id, &mut self.reply);
-                if self.reply.len() == REPLY.len() {
+                if self.reply.len() == self.scenario.reply_bytes {
                     match dialed.replied {
                         None => dialed.replied = Some(now),
                         Some(_) => dialed.kept.push(now - self.asked_at),
@@ -546,11 +577,20 @@ impl Run {
             }
         } else if let Some(id) = self.inbound {
             read_to_end(connection, id, &mut self.asked);
-            if self.asked.len() == REQUEST.len() && !self.answered {
+            let total = self.scenario.reply_bytes;
+            if self.asked.len() == REQUEST.len() && self.answered < total {
+                // Written as the stream's buffer takes it, a large reply over several turns
                 let mut stream = connection.send_stream(id);
-                assert_eq!(stream.write(REPLY).unwrap(), REPLY.len());
-                stream.finish().unwrap();
-                self.answered = true;
+                while self.answered < total {
+                    let chunk = &[0x52; 1_200][..(total - self.answered).min(1_200)];
+                    match stream.write(chunk) {
+                        Ok(n) if n > 0 => self.answered += n,
+                        _ => break,
+                    }
+                }
+                if self.answered == total {
+                    stream.finish().unwrap();
+                }
             }
         }
         loop {
@@ -643,7 +683,7 @@ impl Run {
         let mut redialing = true;
         loop {
             let step = self.world.next(&mut Fifo).unwrap();
-            if self.world.now() > HORIZON {
+            if self.world.now() > self.scenario.horizon {
                 break;
             }
             match step {
@@ -1100,6 +1140,8 @@ fn print_the_lossy_overhead_table() {
     let pki = Pki::new(MANY_NAMES);
     let mut rows: [[Vec<u64>; 2]; 2] = Default::default();
     let mut stuck = [0u32; 2];
+    // What the network carried over every seed: the cost of the probes beside their latency
+    let (mut datagrams, mut bytes) = (0usize, 0usize);
     for seed in SEEDS {
         let out = Run::new(
             Scenario {
@@ -1110,6 +1152,8 @@ fn print_the_lossy_overhead_table() {
             &pki,
         )
         .run();
+        datagrams += out.sent.len();
+        bytes += out.sent.iter().map(|s| s.size).sum::<usize>();
         for (i, floors) in [(0usize, (2, 3)), (1, (1, 1))] {
             match out.dialed.get(i) {
                 Some(Dialed {
@@ -1143,6 +1187,258 @@ fn print_the_lossy_overhead_table() {
                 v.last().map(|&x| x / MS),
                 v.len(),
                 stuck[i]
+            );
+        }
+    }
+    println!(
+        "sent over {} seeds: {datagrams} datagrams, {bytes} bytes",
+        SEEDS.end - SEEDS.start
+    );
+}
+
+/// The datagrams a scenario drops, chosen from a clean run's record: the harness's scenarios hold
+/// `'static` slices, and a test lives as long as the process.
+fn chosen(indices: Vec<usize>) -> &'static [usize] {
+    Box::leak(indices.into_boxed_slice())
+}
+
+/// The position among one side's datagrams of the first that `pick` selects.
+fn position(out: &Outcome, from_client: bool, pick: impl Fn(&Sent) -> bool) -> (usize, u64) {
+    out.sent
+        .iter()
+        .filter(|s| s.from_client == from_client)
+        .enumerate()
+        .find(|(_, s)| pick(s))
+        .map(|(i, s)| (i, s.at))
+        .unwrap()
+}
+
+/// A reply lost on the wire goes again in the server's first probe, which waits twice the
+/// smoothed RTT and the peer's ACK delay at most (`PROBE_VARIANCE_MULTIPLIER`, RFC 8985 §7.2).
+/// Upstream's probe carried no STREAM frames, so the reply went only once the probe's
+/// acknowledgement declared it lost, a round trip after a probe RFC 9002's variation weight of 4
+/// put at three smoothed RTTs: about 4 s where 2 s suffice.
+#[test]
+fn a_lost_reply_goes_again_in_the_first_probe_within_two_round_trips() {
+    let pki = Pki::new(0);
+    let clean = Run::new(Scenario::clean(), &pki).run();
+    let replied = clean.first().replied.unwrap();
+    let (reply, lost_at) = position(&clean, false, |s| s.arrives == Some(replied));
+    let out = Run::new(
+        Scenario {
+            drop_server: chosen(vec![reply]),
+            ..Scenario::clean()
+        },
+        &pki,
+    )
+    .run();
+    let replied = out.first().replied.unwrap();
+    let resent = out
+        .sent
+        .iter()
+        .find(|s| !s.from_client && s.arrives == Some(replied))
+        .unwrap();
+    assert!(
+        resent.at - lost_at <= 2 * RTT + MAX_ACK_DELAY,
+        "{}",
+        out.timeline()
+    );
+}
+
+/// The client's Finished and its first request share a datagram; when it is lost, the client's
+/// Handshake probe carries both (RFC 9002 §6.2.4: probe "other packet number spaces with
+/// in-flight data"), two smoothed RTTs after it, and the reply comes one round trip later.
+/// Upstream probed the Handshake space alone, and the request waited for its own loss to be
+/// found once the handshake ended.
+#[test]
+fn a_lost_finished_and_request_go_again_in_one_probe() {
+    let pki = Pki::new(0);
+    let clean = Run::new(Scenario::clean(), &pki).run();
+    let (request, lost_at) = position(&clean, true, |s| {
+        s.kinds.contains(&Kind::Handshake) && s.kinds.contains(&Kind::Short)
+    });
+    let out = Run::new(
+        Scenario {
+            drop_client: chosen(vec![request]),
+            ..Scenario::clean()
+        },
+        &pki,
+    )
+    .run();
+    let asked = out.first().replied.unwrap() - RTT;
+    assert!(
+        out.sent.iter().any(|s| s.from_client
+            && s.at == asked
+            && s.kinds.contains(&Kind::Handshake)
+            && s.kinds.contains(&Kind::Short)),
+        "{}",
+        out.timeline()
+    );
+    assert!(asked - lost_at <= 2 * RTT, "{}", out.timeline());
+}
+
+/// Every resumed dial that closes at its first reply, one round trip in, still leaves the client a
+/// ticket for the next: the server sends its tickets with its Finished on a handshake that does not
+/// authenticate the client (RFC 8446 §4.6.1), so they arrive with the reply. Upstream sent them
+/// once the client's Finished arrived, half a round trip after the reply, so dials closed at their
+/// reply received none, and with the two tickets of the first dial spent the fourth dial fell back
+/// to 1-RTT (`docs/benchmarks.md`, "Why the fourth dial lost 0-RTT").
+#[test]
+fn every_resumed_dial_closed_at_its_reply_leaves_a_ticket_for_the_next() {
+    let pki = Pki::new(0);
+    let out = Run::new(
+        Scenario {
+            dials: 6,
+            early: true,
+            ..Scenario::clean()
+        },
+        &pki,
+    )
+    .run();
+    assert_eq!(out.dialed.len(), 6);
+    for (i, d) in out.dialed.iter().enumerate().skip(1) {
+        assert!(d.accepted_0rtt, "dial {}: {d:?}", i + 1);
+        assert_eq!(d.replied.unwrap() - d.started, RTT, "dial {}", i + 1);
+    }
+}
+
+/// A reply large enough that the server's slow start meets the round trip many times: a mebibyte
+/// takes the first connection's window from 12,000 bytes past 400 kB, and its server measures more
+/// than four initial windows a round trip (RFC 9959 §3.1).
+const BULK: usize = 1 << 20;
+
+/// Careful Resume (RFC 9959): the server measured the first connection's delivery a round trip,
+/// and the resumed connection, once its initial data is acknowledged, jumps to half of it where
+/// slow start would still be doubling from the initial window. The fresh dial is the same with it
+/// or without it, and the resumed dial's reply comes at least a round trip sooner with it.
+#[test]
+fn a_resumed_connection_starts_from_half_what_the_last_delivered() {
+    let pki = Pki::new(0);
+    let run = |careful_resume| {
+        Run::new(
+            Scenario {
+                dials: 2,
+                early: true,
+                reply_bytes: BULK,
+                careful_resume,
+                ..Scenario::clean()
+            },
+            &pki,
+        )
+        .run()
+    };
+    let (with, without) = (run(true), run(false));
+    let reply = |out: &Outcome, i: usize| {
+        let d = &out.dialed[i];
+        d.replied.unwrap() - d.started
+    };
+    assert_eq!(reply(&with, 0), reply(&without, 0));
+    assert!(with.dialed[1].accepted_0rtt);
+    assert!(
+        reply(&with, 1) + RTT <= reply(&without, 1),
+        "with {} ms, without {} ms",
+        reply(&with, 1) / MS,
+        reply(&without, 1) / MS
+    );
+}
+
+/// Careful Resume meeting the lossy condition, each seed exactly: the first dial measures a clean
+/// path, the resumed dial jumps on the lossy one and retreats at its first loss (RFC 9959 §3.5),
+/// and every transfer of both dials completes, neither connection lost but by the client's close. A mebibyte at 5%
+/// loss and a 1 s round trip takes minutes (loss-based congestion control's rate falls as the
+/// square root of the loss rate, Mathis et al., CCR 1997), so the run's horizon is ten minutes.
+#[test]
+fn a_jump_onto_a_lossy_path_retreats_and_every_transfer_completes() {
+    let pki = Pki::new(0);
+    for seed in SEEDS {
+        let out = Run::new(
+            Scenario {
+                dials: 2,
+                early: true,
+                reply_bytes: BULK,
+                clean_first: true,
+                horizon: 600_000 * MS,
+                ..Scenario::lossy(seed)
+            },
+            &pki,
+        )
+        .run();
+        assert_eq!(out.dialed.len(), 2, "seed {seed}: {:?}", out.dialed);
+        for d in &out.dialed {
+            // The client closes each dial at its reply, which the server sees as closed by peer
+            let closed_by_client = d
+                .server_lost
+                .as_ref()
+                .is_none_or(|(_, reason)| reason == "closed by peer: 0");
+            assert!(
+                d.replied.is_some() && d.lost.is_none() && closed_by_client,
+                "seed {seed}: {d:?}"
+            );
+        }
+    }
+}
+
+/// A server whose window is full of 0.5-RTT data when the client's Finished is lost: the client's
+/// acknowledgements of that data come in 1-RTT packets the server may not process before its
+/// handshake completes (RFC 9001 §5.7), so it drops them, and when the retransmitted Finished
+/// completes the handshake it must arm its probe timer for the Data space (RFC 9002 §6.2.1: the
+/// server's handshake is confirmed when it completes). Upstream armed the timer while discarding
+/// the Handshake keys, a step before the connection counted as established, so the Data space was
+/// still skipped; with the window full nothing was sent again and both sides idled out.
+#[test]
+fn a_server_whose_handshake_completes_late_probes_its_full_window() {
+    let pki = Pki::new(0);
+    let scenario = Scenario {
+        dials: 2,
+        early: true,
+        reply_bytes: BULK,
+        ..Scenario::clean()
+    };
+    let clean = Run::new(scenario, &pki).run();
+    let resumed = clean.dialed[1].started;
+    let (finished, _) = position(&clean, true, |s| {
+        s.at >= resumed && s.kinds.contains(&Kind::Handshake)
+    });
+    let out = Run::new(
+        Scenario {
+            drop_client: chosen(vec![finished]),
+            ..scenario
+        },
+        &pki,
+    )
+    .run();
+    assert_eq!(out.dialed.len(), 2);
+    let d = &out.dialed[1];
+    assert!(d.replied.is_some() && d.lost.is_none(), "{d:?}");
+}
+
+/// The Careful Resume table of `docs/benchmarks.md`: a fresh dial and a resumed one, each asking
+/// for a reply of each size, on the clean path, with Careful Resume and without; each dial's first
+/// reply from its start, against its floor of round trips (2 fresh, 1 resumed with 0-RTT).
+#[test]
+#[ignore = "prints the Careful Resume table; run by hand"]
+fn print_the_resume_table() {
+    let pki = Pki::new(0);
+    for bytes in [BULK / 2, BULK, 2 * BULK] {
+        for careful_resume in [false, true] {
+            let out = Run::new(
+                Scenario {
+                    dials: 2,
+                    early: true,
+                    reply_bytes: bytes,
+                    careful_resume,
+                    ..Scenario::clean()
+                },
+                &pki,
+            )
+            .run();
+            let replies: Vec<String> = out
+                .dialed
+                .iter()
+                .map(|d| format!("{} ms", (d.replied.unwrap() - d.started) / MS))
+                .collect();
+            println!(
+                "{bytes} bytes, careful resume {careful_resume}: fresh then resumed first reply {replies:?}"
             );
         }
     }

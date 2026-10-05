@@ -12,6 +12,9 @@
 //! - **Open loop.** On the last connection, kept, `--requests` requests are scheduled ahead at
 //!   `--rate` a second. Each latency runs from its scheduled time to its reply's end (Tene's
 //!   coordinated omission; `docs/tails.md` §3.1), each a 100-byte request answered by 100 bytes.
+//! - **Warm-up.** With `--warm-rate`, the first connection first carries `--warm-requests` at that
+//!   rate, so both endpoints measure the path for Careful Resume (RFC 9959); the last connection's
+//!   open loop then starts from half that measurement. `--no-careful-resume` turns it off on both.
 //!
 //! Overhead is a latency less the round trip the relay imposes. The relay's own lateness, how long
 //! after its due time it sent each datagram, is reported beside it, so the relay's cost is not
@@ -66,6 +69,9 @@ struct Args {
     rate: u64,
     requests: usize,
     dials: usize,
+    warm_rate: u64,
+    warm_requests: usize,
+    careful_resume: bool,
 }
 
 fn args() -> Args {
@@ -74,15 +80,24 @@ fn args() -> Args {
         rate: 200,
         requests: 20_000,
         dials: 5,
+        warm_rate: 0,
+        warm_requests: 0,
+        careful_resume: true,
     };
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
+        if flag == "--no-careful-resume" {
+            parsed.careful_resume = false;
+            continue;
+        }
         let value = it.next().unwrap_or_else(|| panic!("{flag} takes a value"));
         match flag.as_str() {
             "--one-way-ms" => parsed.one_way = Duration::from_millis(value.parse().unwrap()),
             "--rate" => parsed.rate = value.parse().unwrap(),
             "--requests" => parsed.requests = value.parse().unwrap(),
             "--dials" => parsed.dials = value.parse().unwrap(),
+            "--warm-rate" => parsed.warm_rate = value.parse().unwrap(),
+            "--warm-requests" => parsed.warm_requests = value.parse().unwrap(),
             _ => panic!("unknown flag {flag}"),
         }
     }
@@ -91,11 +106,14 @@ fn args() -> Args {
 
 /// Streams open at once: four times what the open loop keeps in flight, its rate times the round
 /// trip. A stream's credit returns only once the server has seen it closed and its MAX_STREAMS has
-/// crossed back, half a round trip more, so the limit never paces the offered load.
+/// crossed back, half a round trip more, so the limit never paces the offered load. The warm-up
+/// starts at the initial window, where its requests wait round trips of slow start, so its whole
+/// count may be open at once.
 fn transport(args: &Args) -> TransportConfig {
     let in_flight = args.rate * 2 * args.one_way.as_millis() as u64 / 1_000;
+    let streams = (4 * in_flight.max(100)).max(args.warm_requests as u64);
     let mut transport = TransportConfig::default();
-    transport.max_concurrent_bidi_streams(VarInt::from_u64(4 * in_flight.max(100)).unwrap());
+    transport.max_concurrent_bidi_streams(VarInt::from_u64(streams).unwrap());
     transport
 }
 
@@ -203,8 +221,23 @@ fn read_all(connection: &mut Connection, id: StreamId) -> (usize, bool) {
 type Served = (ConnectionHandle, Connection, Vec<(StreamId, usize)>);
 
 /// The server: answers every request on every connection it accepts, until stopped.
-fn server(socket: &UdpSocket, config: ServerConfig, relay: SocketAddr, stop: &AtomicBool) {
-    let mut endpoint = Endpoint::new(EndpointConfig::default(), Some(config), false, None).unwrap();
+/// The endpoints' configuration: Careful Resume on unless `--no-careful-resume`
+fn endpoint_config(args: &Args) -> EndpointConfig {
+    let mut config = EndpointConfig::default();
+    if !args.careful_resume {
+        config.careful_resume(None);
+    }
+    config
+}
+
+fn server(
+    socket: &UdpSocket,
+    config: ServerConfig,
+    relay: SocketAddr,
+    args: &Args,
+    stop: &AtomicBool,
+) {
+    let mut endpoint = Endpoint::new(endpoint_config(args), Some(config), false, None).unwrap();
     let mut connections: Vec<Served> = Vec::new();
     let mut buf = vec![0u8; MAX_DATAGRAM];
     let mut out = Vec::with_capacity(MAX_DATAGRAM);
@@ -281,6 +314,8 @@ struct Client {
     dials: Vec<(Duration, Duration, bool)>,
     /// Each open-loop request's latency from its scheduled time, in nanoseconds.
     latencies: Vec<u64>,
+    /// The warm-up's latencies, likewise.
+    warm: Vec<u64>,
 }
 
 struct Pending {
@@ -296,19 +331,24 @@ fn client(
     args: &Args,
     stop: &AtomicBool,
 ) -> Client {
-    let mut endpoint = Endpoint::new(EndpointConfig::default(), None, false, None).unwrap();
+    let mut endpoint = Endpoint::new(endpoint_config(args), None, false, None).unwrap();
     let handle = endpoint.insert_client_config(config).unwrap();
     let mut buf = vec![0u8; MAX_DATAGRAM];
     let mut out = Vec::with_capacity(MAX_DATAGRAM);
     let mut measured = Client {
         dials: Vec::new(),
-        latencies: Vec::with_capacity(args.requests),
+        latencies: Vec::new(),
+        warm: Vec::new(),
     };
     let mut kept: Option<(ConnectionHandle, Connection)> = None;
     for dial in 0..args.dials {
-        if let Some((_, mut old)) = kept.take() {
+        if let Some((old_ch, mut old)) = kept.take() {
             old.close(Instant::now(), 0u32.into(), bytes::Bytes::new());
             flush(&mut old, &endpoint, socket, relay, &mut out);
+            // What it measured of the path reaches the endpoint as it closes (Careful Resume)
+            while let Some(event) = old.poll_endpoint_events() {
+                endpoint.handle_event(old_ch, event);
+            }
         }
         let start = Instant::now();
         let (ch, mut conn) = endpoint
@@ -366,18 +406,56 @@ fn client(
         measured
             .dials
             .push((connected.unwrap(), replied, conn.accepted_0rtt()));
+        if dial == 0 && args.warm_rate > 0 {
+            measured.warm = open_loop(
+                &mut endpoint,
+                ch,
+                &mut conn,
+                (socket, relay),
+                args.warm_rate,
+                args.warm_requests,
+                (&mut buf, &mut out),
+            );
+        }
         kept = Some((ch, conn));
     }
 
     // The open loop on the kept connection
     let (ch, mut conn) = kept.take().unwrap();
-    let interval = Duration::from_nanos(1_000_000_000 / args.rate);
+    measured.latencies = open_loop(
+        &mut endpoint,
+        ch,
+        &mut conn,
+        (socket, relay),
+        args.rate,
+        args.requests,
+        (&mut buf, &mut out),
+    );
+    conn.close(Instant::now(), 0u32.into(), bytes::Bytes::new());
+    flush(&mut conn, &endpoint, socket, relay, &mut out);
+    stop.store(true, Ordering::Relaxed);
+    measured
+}
+
+/// `requests` requests scheduled ahead at `rate` a second on `conn`; each latency from its
+/// scheduled time to its reply's end, in nanoseconds
+fn open_loop(
+    endpoint: &mut Endpoint,
+    ch: ConnectionHandle,
+    conn: &mut Connection,
+    (socket, relay): (&UdpSocket, SocketAddr),
+    rate: u64,
+    requests: usize,
+    (buf, out): (&mut Vec<u8>, &mut Vec<u8>),
+) -> Vec<u64> {
+    let mut latencies = Vec::with_capacity(requests);
+    let interval = Duration::from_nanos(1_000_000_000 / rate);
     let start = Instant::now();
     let mut issued = 0usize;
     let mut pending: Vec<Pending> = Vec::new();
-    while measured.latencies.len() < args.requests {
+    while latencies.len() < requests {
         let now = Instant::now();
-        while issued < args.requests && start + interval * issued as u32 <= now {
+        while issued < requests && start + interval * issued as u32 <= now {
             let id = conn
                 .streams()
                 .open(Dir::Bi)
@@ -407,22 +485,20 @@ fn client(
         }
         let done = Instant::now();
         pending.retain_mut(|p| {
-            p.got += read_all(&mut conn, p.id).0;
+            p.got += read_all(conn, p.id).0;
             if p.got == REPLY.len() {
-                measured
-                    .latencies
-                    .push(done.saturating_duration_since(p.scheduled).as_nanos() as u64);
+                latencies.push(done.saturating_duration_since(p.scheduled).as_nanos() as u64);
                 return false;
             }
             true
         });
-        flush(&mut conn, &endpoint, socket, relay, &mut out);
-        let next_issue = (issued < args.requests).then(|| start + interval * issued as u32);
+        flush(conn, endpoint, socket, relay, out);
+        let next_issue = (issued < requests).then(|| start + interval * issued as u32);
         let deadline = [conn.poll_timeout(), next_issue]
             .into_iter()
             .flatten()
             .min();
-        if let Some(n) = recv_until(socket, deadline, &mut buf) {
+        if let Some(n) = recv_until(socket, deadline, buf) {
             out.clear();
             if let Some(DatagramEvent::ConnectionEvent(h, event)) = endpoint.handle(
                 Instant::now(),
@@ -430,17 +506,14 @@ fn client(
                 None,
                 None,
                 BytesMut::from(&buf[..n]),
-                &mut out,
+                out,
             ) && h == ch
             {
                 conn.handle_event(event, endpoint.configs_mut());
             }
         }
     }
-    conn.close(Instant::now(), 0u32.into(), bytes::Bytes::new());
-    flush(&mut conn, &endpoint, socket, relay, &mut out);
-    stop.store(true, Ordering::Relaxed);
-    measured
+    latencies
 }
 
 /// `ln C(n, k)`, by the log-gamma of Stirling's series (Abramowitz and Stegun 6.1.41)
@@ -568,7 +641,15 @@ fn main() {
                 &stop,
             )
         });
-        s.spawn(|| server(&server_socket, server_config, relay_for_server, &stop));
+        s.spawn(|| {
+            server(
+                &server_socket,
+                server_config,
+                relay_for_server,
+                &args,
+                &stop,
+            )
+        });
         let _stop = StopOnDrop(&stop);
         let measured = client(
             &client_socket,
@@ -601,6 +682,21 @@ fn main() {
             zero_rtt
         );
     }
+    if !measured.warm.is_empty() {
+        let mut warm = measured.warm;
+        report(
+            &format!(
+                "warm-up at {}/s on dial 1, over one RTT (ms)",
+                args.warm_rate
+            ),
+            &mut warm,
+            rtt,
+        );
+    }
+    println!(
+        "careful resume {}",
+        if args.careful_resume { "on" } else { "off" }
+    );
     let mut latencies = measured.latencies;
     // The worst latency over one RTT in each tenth of the run, in completion order: where in the
     // run the tail sits

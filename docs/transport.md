@@ -540,6 +540,30 @@ SecP256r1MLKEM768) and the 256-bit TLS 1.3 suites (AES-256-GCM, then ChaCha20-Po
 packets keep AES-128-GCM (RFC 9001 §5.2), and a classical-only peer is refused
 (`crates/hyper-quic/VENDORED.md` §10).
 
+## 4f. What the stack adds above the round trips at 500 ms one way (2026-10-04)
+
+The owner's goal is a tenfold cut in what the stack adds above the physical floor of round trips at
+500 ms one way, with no correctness given up. The research is `docs/research/quic-overhead.md`;
+the numbers are `docs/benchmarks.md`, "Probe timeouts, tickets and Careful Resume".
+
+- **Loss recovery.** A probe carries the oldest in-flight packet's STREAM frames, as Chromium,
+  msquic and quiche do; the probe timer weighs the RTT variation by 2 (Chromium's constant;
+  RACK-TLP's 2·SRTT at the first sample), while the periods RFC 9002 and RFC 9000 define from the
+  PTO keep RFC 9002's 4; a PTO probes the Data space too once an RTT sample exists
+  (`crates/hyper-quic/VENDORED.md` §11, items 1 to 3).
+- **Two defects that cost a round trip or the connection.** A server armed its probe timer while
+  still handshaking and never again, so a full window with dropped acknowledgements idled out; and
+  an ACK in the Initial space reset the Data space's max_ack_delay timer and bundling deadline, so
+  0-RTT packets were acknowledged a round trip late (§11, items 4 and 5).
+- **Tickets.** The server sends its session tickets with its Finished on a handshake that does not
+  authenticate the client (RFC 8446 §4.6.1), so a resumed dial that closes at its first reply still
+  receives one (`crates/hyper-tls/VENDORED.md` §7).
+- **Careful Resume** (RFC 9959). A connection to a remote IP address that an earlier connection
+  measured jumps, once its first round trip confirms the path, to half of what that connection
+  delivered a round trip, and retreats on the first congestion (`crates/hyper-quic/VENDORED.md`
+  §12). A connection with no earlier measurement of its path still starts at the initial window
+  (RFC 9002 §7.2): that start is the network's safety rule, not overhead.
+
 ## 5. Consumers
 
 slates, focal and mantle each vendor a snapshot of the conformed crates, recording the hyper-raft revision

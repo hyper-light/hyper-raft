@@ -1,8 +1,7 @@
 use std::{
     convert::TryInto,
     iter, mem,
-    net::{Ipv4Addr, Ipv6Addr, SocketAddr},
-    sync::{Arc, Mutex},
+    net::{Ipv4Addr, SocketAddr},
 };
 
 use assert_matches::assert_matches;
@@ -670,10 +669,7 @@ fn zero_rtt_long_header_packets_fit_their_length_field() {
         .close(pair.time, VarInt(0), [][..].into());
     pair.drive();
 
-    pair.client.addr = SocketAddr::new(
-        Ipv6Addr::LOCALHOST.into(),
-        CLIENT_PORTS.lock().unwrap().next().unwrap(),
-    );
+    pair.client.addr = pair.fresh_client_addr();
     let client_ch = pair.begin_connect_shared(config);
     assert!(pair.client_conn_mut(client_ch).has_0rtt());
     let s = pair.client_streams(client_ch).open(Dir::Uni).unwrap();
@@ -713,10 +709,7 @@ fn zero_rtt_happypath() {
         .close(pair.time, VarInt(0), [][..].into());
     pair.drive();
 
-    pair.client.addr = SocketAddr::new(
-        Ipv6Addr::LOCALHOST.into(),
-        CLIENT_PORTS.lock().unwrap().next().unwrap(),
-    );
+    pair.client.addr = pair.fresh_client_addr();
     info!("resuming session");
     let client_ch = pair.begin_connect_shared(config);
     assert!(pair.client_conn_mut(client_ch).has_0rtt());
@@ -759,6 +752,42 @@ fn zero_rtt_happypath() {
     );
     let _ = chunks.finalize();
     assert_eq!(pair.client_conn_mut(client_ch).stats().path.lost_packets, 0);
+}
+
+/// RFC 9000 §13.2.1: 0-RTT packets are acknowledged within max_ack_delay. The server's first
+/// flight acknowledges the client's 0-RTT packet: its Data packets have room for the ACK frame,
+/// and a bundled or delayed ACK in the Data space is not held back by the ACK the same flight
+/// carries in the Initial space. Upstream kept one bundling deadline and one max_ack_delay timer
+/// for the connection, and the Initial ACK pushed the deadline a round trip out and stopped the
+/// timer, so the 0-RTT packet was acknowledged only after the handshake, a round trip later.
+#[test]
+fn the_first_flight_acknowledges_0rtt() {
+    let _guard = subscribe();
+    let mut pair = Pair::default();
+    let config = pair.add_client_config(client_config());
+    let client_ch = pair.begin_connect_shared(config);
+    pair.drive();
+    pair.server.assert_accept();
+    pair.client
+        .connections
+        .get_mut(&client_ch)
+        .unwrap()
+        .close(pair.time, VarInt(0), [][..].into());
+    pair.drive();
+
+    pair.client.addr = pair.fresh_client_addr();
+    let client_ch = pair.begin_connect_shared(config);
+    let s = pair.client_streams(client_ch).open(Dir::Uni).unwrap();
+    pair.client_send(client_ch, s).write(b"0-RTT").unwrap();
+    // The client's first flight, the server's answer, and the client reading it
+    pair.drive_client();
+    pair.drive_server();
+    pair.drive_client();
+    assert_eq!(
+        pair.client_conn_mut(client_ch)
+            .largest_acked(crate::packet::SpaceId::Data),
+        Some(0)
+    );
 }
 
 #[test]
@@ -886,10 +915,7 @@ fn test_zero_rtt_incoming_limit<F: FnOnce(&mut ServerConfig)>(configure_server: 
         .close(pair.time, VarInt(0), [][..].into());
     pair.drive();
 
-    pair.client.addr = SocketAddr::new(
-        Ipv6Addr::LOCALHOST.into(),
-        CLIENT_PORTS.lock().unwrap().next().unwrap(),
-    );
+    pair.client.addr = pair.fresh_client_addr();
     info!("resuming session");
     pair.server.handle_incoming = Box::new(|_| IncomingConnectionBehavior::Wait);
     let client_ch = pair.begin_connect_shared(config);
@@ -1763,10 +1789,8 @@ fn migration() {
 
     let client_stats_after_connect = pair.client_conn_mut(client_ch).stats();
 
-    pair.client.addr = SocketAddr::new(
-        Ipv4Addr::new(127, 0, 0, 1).into(),
-        CLIENT_PORTS.lock().unwrap().next().unwrap(),
-    );
+    let port = pair.fresh_client_addr().port();
+    pair.client.addr = SocketAddr::new(Ipv4Addr::new(127, 0, 0, 1).into(), port);
     pair.client_conn_mut(client_ch).ping();
 
     // Assert that just receiving the ping message is accounted into the servers
@@ -1820,10 +1844,8 @@ fn a_rebinding_leaves_no_stale_probe_timeout() {
     // The client moves without saying so and pings from its new address, arriving once the
     // server's loss-detection deadline has passed.
     let deadline = pair.server.next_wakeup().unwrap();
-    pair.client.addr = SocketAddr::new(
-        Ipv4Addr::new(127, 0, 0, 1).into(),
-        CLIENT_PORTS.lock().unwrap().next().unwrap(),
-    );
+    let port = pair.fresh_client_addr().port();
+    pair.client.addr = SocketAddr::new(Ipv4Addr::new(127, 0, 0, 1).into(), port);
     pair.client_conn_mut(client_ch).ping();
     pair.drive_client();
     pair.time = pair.time.max(deadline) + pair.latency;
@@ -3086,10 +3108,8 @@ fn migrate_detects_new_mtu_and_respects_original_peer_max_udp_payload_size() {
 
     // Migrate client to a different port (and simulate a higher path MTU)
     pair.mtu = 1500;
-    pair.client.addr = SocketAddr::new(
-        Ipv4Addr::new(127, 0, 0, 1).into(),
-        CLIENT_PORTS.lock().unwrap().next().unwrap(),
-    );
+    let port = pair.fresh_client_addr().port();
+    pair.client.addr = SocketAddr::new(Ipv4Addr::new(127, 0, 0, 1).into(), port);
     pair.client_conn_mut(client_ch).ping();
     pair.drive();
 
@@ -3167,27 +3187,30 @@ fn blackhole_after_mtu_change_repairs_itself() {
     // Back to the base MTU
     pair.mtu = 1200;
 
-    // The payload will be sent in a single packet, because the detected MTU was 1444, but it will
-    // be dropped because the link no longer supports that packet size!
+    // Each payload goes in a single packet, because the detected MTU was 1452, and is dropped
+    // because the link no longer supports that size. A probe is clamped to the base MTU and
+    // carries the oldest in-flight packet's STREAM frames (VENDORED.md §11), so each payload
+    // arrives at its first probe; each such loss is one suspicious burst, and one burst past
+    // `BLACK_HOLE_THRESHOLD` (3) the black hole is declared. Upstream's probes carried no STREAM
+    // data, so its one payload was lost in full-size retransmissions until the declaration.
     let payload = vec![42; 1300];
-    let s = pair.client_streams(client_ch).open(Dir::Uni).unwrap();
-    pair.client_send(client_ch, s).write(&payload).unwrap();
-    let out_of_bounds = pair.drive_bounded();
-
-    if out_of_bounds {
-        panic!("Connections never reached an idle state");
+    for sent in 1..=4 {
+        let s = pair.client_streams(client_ch).open(Dir::Uni).unwrap();
+        pair.client_send(client_ch, s).write(&payload).unwrap();
+        let out_of_bounds = pair.drive_bounded();
+        if out_of_bounds {
+            panic!("Connections never reached an idle state");
+        }
+        let recv = pair.server_recv(server_ch, s);
+        let buf = stream_chunks(recv);
+        // The whole packet arrived in the end
+        assert_eq!(buf.len(), 1300, "payload {sent}");
     }
 
-    let recv = pair.server_recv(server_ch, s);
-    let buf = stream_chunks(recv);
-
-    // The whole packet arrived in the end
-    assert_eq!(buf.len(), 1300);
-
-    // Sanity checks (black hole detected after 3 lost packets)
+    // Sanity checks (black hole detected after 4 suspicious loss bursts)
     let client_stats = pair.client_conn_mut(client_ch).stats();
-    assert!(client_stats.path.lost_packets >= 3);
-    assert!(client_stats.path.congestion_events >= 3);
+    assert!(client_stats.path.lost_packets >= 4);
+    assert!(client_stats.path.congestion_events >= 1);
     assert_eq!(client_stats.path.black_holes_detected, 1);
 }
 
@@ -4117,9 +4140,7 @@ fn path_changes_unblock_oversized_datagrams() {
 
         pair.mtu = 1200;
         if migrate {
-            pair.client
-                .addr
-                .set_port(CLIENT_PORTS.lock().unwrap().next().unwrap());
+            pair.client.addr = pair.fresh_client_addr();
             pair.client_conn_mut(client_ch).ping();
             pair.drive_client();
             // Process migration without transmitting, so sends cannot free the buffer first.

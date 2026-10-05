@@ -236,9 +236,32 @@ mod client_hello {
                 cx.common.start_outgoing_traffic(&mut cx.sendable_plaintext);
             }
 
+            // RFC 8446 §4.6.1: "a server which does not request client authentication MAY
+            // compute the remainder of the transcript independently and then send a
+            // NewSessionTicket immediately upon sending its Finished rather than waiting for the
+            // client Finished." Over QUIC the tickets then reach the client with the server's
+            // first flight, so a connection that closes at its first reply, one round trip in,
+            // still leaves its client a ticket; sent after the client's Finished they arrive half
+            // a round trip after that reply. A client whose Finished differs is refused as before,
+            // with tickets it can use only to resume a session it already holds the PSK of.
+            let send_tickets =
+                match self.send_tickets > 0 && !doing_client_auth && cx.common.is_quic() {
+                    true => {
+                        Self::emit_tickets_ahead(
+                            &self.transcript,
+                            self.suite,
+                            self.send_tickets,
+                            &key_schedule_traffic,
+                            cx,
+                        )?;
+                        0
+                    }
+                    false => self.send_tickets,
+                };
+
             Ok(Self::next_state(
                 cx,
-                (self.transcript, self.suite, self.send_tickets),
+                (self.transcript, self.suite, send_tickets),
                 key_schedule_traffic,
                 doing_client_auth,
                 doing_early_data,
@@ -471,6 +494,31 @@ mod client_hello {
                     .clone_from(&resume.client_cert_chain);
             }
             (chosen_psk_index, resumedata)
+        }
+
+        /// Writes `count` tickets from the transcript the client's Finished will complete, to go
+        /// under the 1-RTT keys after the server's Finished. `transcript` ends with that Finished
+        /// and is left unchanged, since the client's Finished is still checked against it.
+        fn emit_tickets_ahead(
+            transcript: &HandshakeHash,
+            suite: &'static Tls13CipherSuite,
+            count: usize,
+            key_schedule: &KeyScheduleTrafficWithClientFinishedPending,
+            cx: &mut ServerContext<'_>,
+        ) -> Result<(), Error> {
+            let verify_data = key_schedule.client_finish_ahead(&transcript.current_hash())?;
+            let mut ahead = transcript.clone();
+            HandshakeFlightTls13::new(&mut ahead).add(HandshakeMessagePayload(
+                HandshakePayload::Finished(Payload::new(verify_data.as_ref())),
+            ));
+            let resumption = key_schedule.resumption_ahead(&ahead.current_hash())?;
+            // NewSessionTicket is not part of the transcript (RFC 8446 §4.4.1)
+            let mut flight = HandshakeFlightTls13::new(&mut ahead);
+            for _ in 0..count {
+                ExpectFinished::emit_ticket(&mut flight, suite, cx, &resumption)?;
+            }
+            flight.finish_under_one_rtt_keys(cx.common);
+            Ok(())
         }
 
         /// The state after the server's first flight.

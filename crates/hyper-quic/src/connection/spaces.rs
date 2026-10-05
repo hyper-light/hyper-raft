@@ -111,10 +111,16 @@ impl PacketSpace {
     /// waiting to be sent, then we retransmit in-flight data to reduce odds of loss. If there's no
     /// in-flight data either, we're probably a client guarding against a handshake
     /// anti-amplification deadlock and we just make something up.
+    ///
+    /// The in-flight data retransmitted is the oldest packet's, its STREAM frames included, as
+    /// Chromium's probe retransmits the oldest outstanding data (`MaybeSendProbePacket`) and
+    /// RFC 9002 §6.2.4 permits ("the sender MAY retransmit unacknowledged data"). Upstream took
+    /// only the control frames, so a lost reply was resent only once the probe's acknowledgement
+    /// declared it lost, a round trip after the probe.
     pub(super) fn maybe_queue_probe(
         &mut self,
         request_immediate_ack: bool,
-        streams: &StreamsState,
+        streams: &mut StreamsState,
     ) {
         if self.loss_probes == 0 {
             return;
@@ -133,10 +139,15 @@ impl PacketSpace {
 
         // Retransmit the data of the oldest in-flight packet
         for packet in self.sent_packets.values_mut() {
-            if !packet.retransmits.is_empty(streams) {
+            if !packet.retransmits.is_empty(streams) || !packet.stream_frames.is_empty() {
                 // Remove retransmitted data from the old packet so we don't end up retransmitting
-                // it *again* even if the copy we're sending now gets acknowledged.
+                // it *again* even if the copy we're sending now gets acknowledged. Its STREAM
+                // frames move likewise, so one sent copy of each range is tracked, as after a
+                // loss: the probe's acknowledgement or loss settles them.
                 self.pending |= mem::take(&mut packet.retransmits);
+                for frame in mem::take(&mut packet.stream_frames) {
+                    streams.retransmit(frame);
+                }
                 return;
             }
         }

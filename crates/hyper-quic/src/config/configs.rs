@@ -145,6 +145,18 @@ impl Configs {
         }
     }
 
+    /// The server configuration `handle` refers to, mutably, if it is still held
+    #[cfg(test)]
+    pub(crate) fn server_config_mut(
+        &mut self,
+        handle: ServerConfigHandle,
+    ) -> Option<&mut ServerConfig> {
+        match &mut self.occupant_mut(handle.0)?.config {
+            Shared::Server(config) => Some(config),
+            Shared::Client(_) => None,
+        }
+    }
+
     pub(crate) fn insert_server(
         &mut self,
         config: ServerConfig,

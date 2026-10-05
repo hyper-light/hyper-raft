@@ -481,3 +481,86 @@ configuration hyper-quic builds uses it, and so does hyper-transport's mutual TL
   their classical client with a test-only server that accepts classical groups.
 - **Interoperation.** Upstream quinn-proto, on rustls with `prefer-post-quantum`, offers
   X25519MLKEM768 and AES-256-GCM. The end-to-end interoperation suite passes unchanged.
+
+## 11. Recovery at a geographic distance (2026-10-04)
+
+Measured at 500 ms one way (`docs/benchmarks.md`, "Probe timeouts, tickets and Careful Resume";
+sources in `docs/research/quic-overhead.md` §2). Each departure has a test that failed before it.
+
+1. **What a probe carries** (`PacketSpace::maybe_queue_probe`). A probe with no new data to send
+   retransmits the oldest in-flight packet's frames, its STREAM frames included, as Chromium,
+   msquic and Cloudflare quiche do (RFC 9002 §6.2.4: "the sender MAY retransmit unacknowledged
+   data"). Upstream took only the control frames, so a lost reply went again only after the probe's
+   own acknowledgement declared it lost, a round trip later. The STREAM frames move off the old
+   packet as its control frames do, so one sent copy of each range is tracked
+   (`a_lost_reply_goes_again_in_the_first_probe_within_two_round_trips`). The black-hole test
+   now sends four payloads: each arrives in its first probe, clamped to the base MTU, and each such
+   loss is one suspicious burst, where upstream's one payload was lost in full-size
+   retransmissions until the black hole was declared.
+2. **The probe timer's variation weight is 2** (`RttEstimator::probe_base`), Chromium's
+   `kPtoRttvarMultiplier`, where RFC 9002 §6.2.1 has 4. A PTO expiry declares nothing lost and
+   leaves the window alone (§6.2), so an early probe costs one or two packets; at the first sample
+   (rttvar = sample / 2, §5.3) it waits two smoothed RTTs, RACK-TLP's PTO (RFC 8985 §7.2), where 4
+   waits three. Before any sample the timer is RFC 9002's from kInitialRtt. Persistent congestion,
+   key discard and draining keep the weight of 4, so no congestion response or lifetime changes.
+3. **A PTO also probes the Data space** (`on_loss_detection_timeout`), once the path has an RTT
+   sample, as RFC 9002 §6.2.4 asks ("other packet number spaces with in-flight data"). A client's
+   lost Finished and the request coalesced with it go again in one datagram
+   (`a_lost_finished_and_request_go_again_in_one_probe`). Before a sample the timer from
+   kInitialRtt fires at 999 ms against a 1 s round trip, so the server's Data probe would repeat
+   0.5-RTT data that is not lost; measured on real sockets, it held a packet in flight through the
+   client's first burst and raised the open loop's worst latency from 291–294 ms to 343–354 ms.
+4. **A server arms its probe timer when its handshake completes**. It armed it while discarding its
+   Handshake keys, still handshaking, when the Data space is skipped (RFC 9002 §6.2.1: "An endpoint
+   MUST NOT set its PTO timer for the Application Data packet number space until the handshake is
+   confirmed", which for a server is the handshake's completion, RFC 9001 §4.1.2). A server whose
+   window was full of 0.5-RTT data, with the client's acknowledgements of it dropped before the
+   handshake completed (RFC 9001 §5.7), sent nothing more and both sides idled out
+   (`a_server_whose_handshake_completes_late_probes_its_full_window`).
+5. **The max_ack_delay timer and the ACK bundling deadline are the Data space's**. Upstream reset
+   both on an ACK sent in any space, so the Initial ACK in a server's first flight stopped the timer
+   for the client's 0-RTT packet and pushed its bundled ACK a round trip out: the 0-RTT packet was
+   acknowledged after the handshake, a round trip past max_ack_delay (RFC 9000 §13.2.1). On real
+   sockets this alone cut the open loop's initial-window stall from 291 to 242 ms
+   (`the_first_flight_acknowledges_0rtt`).
+6. **Tests hold no locks.** The unit tests' address counters (`SERVER_PORTS`, `CLIENT_PORTS`, each a
+   `Mutex` shared by every test) became each `Pair`'s own: its network is in memory, so its addresses
+   need be distinct only from one another (`Pair::fresh_client_addr`). The token tests' clock, an
+   `Arc<Mutex<SystemTime>>` shared between the test and the server's configuration, became a
+   stopped clock the configuration owns and the test replaces (`advance_server_clock`, through a
+   test-only `Endpoint::server_config_mut`). The capture sockets and key log the tests opened when
+   `SSLKEYLOGFILE` was set went with them: they read the environment and bound real ports, the
+   reason the counters were process-wide.
+
+## 12. Careful Resume (RFC 9959, 2026-10-04)
+
+`connection/resume.rs`; the decision and its sources are `docs/research/quic-overhead.md` §1.
+Each endpoint keeps, per remote IP address, what its closed connections delivered a round trip
+and their minimum RTT (`CongestionMemory`, at most `CarefulResumeConfig::remembered` addresses,
+the oldest replaced; a measurement below four initial windows is not kept, §3.1). A connection
+reports its measurement as it closes (`EndpointEventInner::Observed`), not when it drains three
+PTOs later, so a connection made at once can use it. The next connection to that address takes it,
+so no second connection starts from it at once (§3.2), and returns it unused at its close unless it
+retreated. On that connection:
+
+- **Reconnaissance**: the initial window under normal congestion control until every ack-eliciting
+  Data packet sent before the first acknowledgement is acknowledged without congestion;
+- **the jump**, deferred to the first time the window blocks a datagram (§3.2): the window becomes
+  half the measurement (and at most `max_jump`), if that is more than it is and the minimum RTT is
+  above half the saved RTT and the smoothed RTT within ten times it (§4.2.1);
+- **Unvalidated**: the window held, paced at one window a smoothed RTT (§3.3), until the flight
+  fills it, an acknowledgement covers its first packet, or a round trip passes; then the window
+  becomes the PipeSize and Careful Resume ends, or the flight size and Validating follows;
+- **Validating**: normal congestion control until the last Unvalidated packet is acknowledged;
+- **Safe Retreat** on congestion after the jump: the measurement deleted, the window at most half
+  the PipeSize and not grown, and on leaving ssthresh half the PipeSize (§3.5).
+
+`Controller::set_window` and `set_ssthresh` carry the window changes; CUBIC and NewReno implement
+them, and BBR and Copa, whose windows come from their models, keep the initial window. On by
+default (`EndpointConfig::careful_resume`): lifetime one hour, Chromium's bound on the bandwidth
+estimate it resumes from; 256 addresses, the server names `TokenMemoryCache` keeps tokens for.
+
+Tests: the phases on NewReno (`connection::resume::tests`), a resumed mebibyte at least a round trip
+sooner (`a_resumed_connection_starts_from_half_what_the_last_delivered`), and a jump onto the lossy
+condition over its 32 seeds, where 7 seeds jump and all 7 retreat and every transfer completes
+(`a_jump_onto_a_lossy_path_retreats_and_every_transfer_completes`).

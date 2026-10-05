@@ -26,7 +26,7 @@ use crate::{
         ClientConfig, ClientConfigHandle, ConfigKey, Configs, ConfigsFull, EndpointConfig,
         ServerConfig, ServerConfigHandle,
     },
-    connection::{Connection, ConnectionError, SideArgs},
+    connection::{CarefulResume, CongestionMemory, Connection, ConnectionError, Saved, SideArgs},
     crypto::{self, Keys, UnsupportedVersion},
     frame,
     packet::{
@@ -73,6 +73,8 @@ pub struct Endpoint {
     token_log: Box<dyn TokenLog>,
     /// Address validation tokens servers gave this client, for its later connections to them
     token_store: Box<dyn TokenStore>,
+    /// What closed connections measured of their paths, for Careful Resume (RFC 9959)
+    congestion_memory: CongestionMemory,
 }
 
 impl Endpoint {
@@ -102,6 +104,8 @@ impl Endpoint {
         let mut configs = Configs::new(config.config_slots);
         // The slab is empty and has at least one slot, so the insertion cannot be refused
         let server_config = server_config.and_then(|c| configs.insert_server(c).ok());
+        let congestion_memory =
+            CongestionMemory::new(config.careful_resume.map_or(0, |c| c.remembered));
         Ok(Self {
             rng,
             index: ConnectionIndex::default(),
@@ -118,6 +122,7 @@ impl Endpoint {
             all_incoming_buffers_total_bytes: 0,
             token_log: Box::new(BloomTokenLog::default()),
             token_store: Box::new(TokenMemoryCache::default()),
+            congestion_memory,
         })
     }
 
@@ -194,6 +199,12 @@ impl Endpoint {
         }
     }
 
+    /// The current server configuration, mutably: a test changes it in place, keeping its keys
+    #[cfg(test)]
+    pub(crate) fn server_config_mut(&mut self) -> Option<&mut ServerConfig> {
+        self.configs.server_config_mut(self.server_config?)
+    }
+
     /// The configurations this endpoint and its connections share
     pub fn configs(&self) -> &Configs {
         &self.configs
@@ -245,6 +256,7 @@ impl Endpoint {
             NewToken { server_name, token } => {
                 self.token_store.insert(&server_name, token);
             }
+            Observed(saved) => self.remember(ch, saved),
             Drained => {
                 if let Some(conn) = self.connections.try_remove(ch.0) {
                     self.index.remove(&conn);
@@ -258,6 +270,15 @@ impl Endpoint {
             }
         }
         None
+    }
+
+    /// Keeps what connection `ch` measured of its path for the next connection to its remote
+    /// (Careful Resume, RFC 9959 §3.1)
+    fn remember(&mut self, ch: ConnectionHandle, saved: Saved) {
+        if let Some(meta) = self.connections.get(ch.0) {
+            self.congestion_memory
+                .put(meta.addresses.remote.ip(), saved);
+        }
     }
 
     /// Process an incoming UDP datagram
@@ -1387,6 +1408,14 @@ impl Endpoint {
         self.rng.fill_bytes(&mut rng_seed);
         let side = side_args.side();
         let pref_addr_cid = side_args.pref_addr_cid();
+        let resume = match self.config.careful_resume {
+            Some(config) => CarefulResume::new(
+                self.congestion_memory
+                    .take(addresses.remote.ip(), now, config.lifetime),
+                config.max_jump,
+            ),
+            None => CarefulResume::new(None, 0),
+        };
         let conn = Connection::new(
             self.config.grease_quic_bit,
             transport_config,
@@ -1404,6 +1433,7 @@ impl Endpoint {
             self.allow_mtud,
             rng_seed,
             side_args,
+            resume,
         );
 
         // The handshake CID is sequence 0, a preferred address's sequence 1

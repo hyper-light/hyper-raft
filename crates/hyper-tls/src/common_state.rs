@@ -1054,6 +1054,14 @@ impl<'a, const TLS13: bool> HandshakeFlight<'a, TLS13> {
     }
 }
 
+impl HandshakeFlight<'_, true> {
+    /// Queues the flight to go under the 1-RTT keys once they are passed to QUIC, after
+    /// everything queued before it (`Quic::one_rtt_flight`).
+    pub(crate) fn finish_under_one_rtt_keys(self, common: &mut CommonState) {
+        common.quic.one_rtt_flight = Some(self.body);
+    }
+}
+
 pub(crate) type HandshakeFlightTls12<'a> = HandshakeFlight<'a, false>;
 pub(crate) type HandshakeFlightTls13<'a> = HandshakeFlight<'a, true>;
 

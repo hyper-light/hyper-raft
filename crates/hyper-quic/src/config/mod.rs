@@ -41,6 +41,8 @@ pub struct EndpointConfig {
     pub(crate) rng_seed: Option<[u8; 32]>,
     /// Bound on the configurations the endpoint holds at once (see [`Configs`])
     pub(crate) config_slots: NonZeroUsize,
+    /// Careful Resume (RFC 9959), or `None` to start every connection at the initial window
+    pub(crate) careful_resume: Option<CarefulResumeConfig>,
 }
 
 impl EndpointConfig {
@@ -55,6 +57,7 @@ impl EndpointConfig {
             min_reset_interval: Duration::from_millis(20),
             rng_seed: None,
             config_slots: configs::DEFAULT_CONFIG_SLOTS,
+            careful_resume: Some(CarefulResumeConfig::default()),
         }
     }
 
@@ -158,6 +161,66 @@ impl EndpointConfig {
         self.config_slots = slots;
         self
     }
+
+    /// Careful Resume (RFC 9959): a connection to a remote IP address an earlier connection
+    /// measured starts, once its first round trip confirms the path, from half of what that
+    /// connection delivered a round trip, and retreats on the first congestion
+    ///
+    /// On by default with [`CarefulResumeConfig::default`]; `None` starts every connection at the
+    /// initial window (RFC 9002 §7.2).
+    pub fn careful_resume(&mut self, config: Option<CarefulResumeConfig>) -> &mut Self {
+        self.careful_resume = config;
+        self
+    }
+}
+
+/// Careful Resume's parameters (RFC 9959 §2.4)
+#[derive(Debug, Clone, Copy)]
+pub struct CarefulResumeConfig {
+    pub(crate) remembered: usize,
+    pub(crate) lifetime: Duration,
+    pub(crate) max_jump: u64,
+}
+
+impl CarefulResumeConfig {
+    /// The remote IP addresses whose measurements an endpoint keeps at once, the oldest replaced
+    /// first
+    ///
+    /// Defaults to 256, the server names [`TokenMemoryCache`](crate::TokenMemoryCache) keeps
+    /// address validation tokens for: a client resumes the servers it holds tokens for, and a
+    /// server remembers as many clients.
+    pub fn remembered(&mut self, value: usize) -> &mut Self {
+        self.remembered = value;
+        self
+    }
+
+    /// How long a measurement may be used after it was taken (RFC 9959 §2.4's Lifetime)
+    ///
+    /// Defaults to one hour, Chromium's bound on the age of a bandwidth estimate it resumes from
+    /// (`kNumSecondsPerHour` in `quic_server_session_base.cc`). RFC 9959 §4.3.1 leaves it to
+    /// configuration, minutes on paths known to change and hours on stable ones.
+    pub fn lifetime(&mut self, value: Duration) -> &mut Self {
+        self.lifetime = value;
+        self
+    }
+
+    /// The largest window a jump sets, in bytes (RFC 9959 §2.4's `max_jump`)
+    ///
+    /// Defaults to no bound beyond RFC 9959 §3.3's half of the measurement.
+    pub fn max_jump(&mut self, value: u64) -> &mut Self {
+        self.max_jump = value;
+        self
+    }
+}
+
+impl Default for CarefulResumeConfig {
+    fn default() -> Self {
+        Self {
+            remembered: 256,
+            lifetime: Duration::from_secs(60 * 60),
+            max_jump: u64::MAX,
+        }
+    }
 }
 
 impl Clone for EndpointConfig {
@@ -171,6 +234,7 @@ impl Clone for EndpointConfig {
             min_reset_interval: self.min_reset_interval,
             rng_seed: self.rng_seed,
             config_slots: self.config_slots,
+            careful_resume: self.careful_resume,
         }
     }
 }
@@ -185,6 +249,7 @@ impl fmt::Debug for EndpointConfig {
             .field("grease_quic_bit", &self.grease_quic_bit)
             .field("rng_seed", &self.rng_seed)
             .field("config_slots", &self.config_slots)
+            .field("careful_resume", &self.careful_resume)
             .finish_non_exhaustive()
     }
 }

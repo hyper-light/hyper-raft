@@ -114,6 +114,15 @@ impl Controller for NewReno {
         self.window
     }
 
+    fn set_window(&mut self, window: u64) -> bool {
+        self.window = window.max(self.minimum_window());
+        true
+    }
+
+    fn set_ssthresh(&mut self, ssthresh: u64) {
+        self.ssthresh = ssthresh.max(self.minimum_window());
+    }
+
     fn metrics(&self) -> super::ControllerMetrics {
         super::ControllerMetrics {
             congestion_window: self.window(),

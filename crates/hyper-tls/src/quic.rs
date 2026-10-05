@@ -474,11 +474,20 @@ pub(crate) struct Quic {
     pub(crate) traffic_secrets: Option<Secrets>,
     /// Whether keys derived from traffic_secrets have been passed to the QUIC implementation
     pub(crate) returned_traffic_keys: bool,
+    /// A flight written before the 1-RTT keys were passed on that must go under them: the
+    /// server's tickets sent with its Finished (RFC 8446 §4.6.1), which RFC 9001 §4 puts in 1-RTT
+    /// packets. One flight at most: the server writes it once, in its first flight.
+    pub(crate) one_rtt_flight: Option<Vec<u8>>,
     pub(crate) version: Version,
 }
 
 impl Quic {
     pub(crate) fn write_hs(&mut self, buf: &mut Vec<u8>) -> Option<KeyChange> {
+        if self.returned_traffic_keys {
+            if let Some(flight) = self.one_rtt_flight.take() {
+                buf.extend_from_slice(&flight);
+            }
+        }
         while let Some((_, msg)) = self.hs_queue.pop_front() {
             buf.extend_from_slice(&msg);
             if let Some(&(true, _)) = self.hs_queue.front() {

@@ -11,6 +11,17 @@ use crate::{Duration, Instant, TIMER_GRANULARITY, TransportConfig, congestion, p
 
 use qlog::events::quic::MetricsUpdated;
 
+/// The RTT variation's weight in the probe timer: 2, Chromium's `kPtoRttvarMultiplier`
+/// (quiche/quic/core/quic_constants.h), where RFC 9002 §6.2.1 has 4.
+///
+/// RFC 9002's 4 is RFC 6298's RTO, whose expiry collapses the window; a PTO expiry declares nothing
+/// lost and leaves the window alone (§6.2), so a probe sent early costs one or two packets. With
+/// the first sample's variation at half the sample (§5.3), 2 makes the first probe wait twice the
+/// smoothed RTT, RACK-TLP's probe timeout (RFC 8985 §7.2, "under normal circumstances … an ACK
+/// typically arrives in one SRTT"), where 4 makes it wait three times. Measured at 500 ms one
+/// way in `docs/benchmarks.md` ("Probe timeouts").
+const PROBE_VARIANCE_MULTIPLIER: u32 = 2;
+
 /// Description of a particular network path
 pub(super) struct PathData {
     pub(super) remote: SocketAddr,
@@ -336,6 +347,24 @@ impl RttEstimator {
         // Durations: saturating can only lengthen them
         self.get()
             .saturating_add(cmp::max(self.var.saturating_mul(4), TIMER_GRANULARITY))
+    }
+
+    /// The loss-detection timer's interval before backoff and the peer's ACK delay: the smoothed
+    /// RTT plus [`PROBE_VARIANCE_MULTIPLIER`] times its variation once a sample exists, and
+    /// RFC 9002 §6.2.1's PTO before one (§6.2.2, from kInitialRtt).
+    ///
+    /// Only the probe timer runs on it. The periods RFC 9002 and RFC 9000 state as multiples of
+    /// the PTO (persistent congestion, §7.6.1; key discard and draining, RFC 9000 §10.2) keep
+    /// [`pto_base`](Self::pto_base), so no congestion response and no state's lifetime changes.
+    pub(crate) fn probe_base(&self) -> Duration {
+        if self.smoothed.is_none() {
+            return self.pto_base();
+        }
+        // Durations: saturating can only lengthen them
+        self.get().saturating_add(cmp::max(
+            self.var.saturating_mul(PROBE_VARIANCE_MULTIPLIER),
+            TIMER_GRANULARITY,
+        ))
     }
 
     pub(crate) fn update(&mut self, ack_delay: Duration, rtt: Duration) {

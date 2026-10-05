@@ -710,14 +710,15 @@ budget. The MTU discovery test keeps it on and counts its PINGs apart.
    them anew: the ClientHello's copies went as `[1141, 1928)` with `[0, 349)`, then `[349, 1141)`,
    so one lost copy left both halves without theirs
    (`each_copy_carries_its_originals_frames_alone`).
-3. **The application's first round trip is copied**: what a space sends from the handshake's
-   completion (`application_from`) until the peer acknowledges a packet of it. The server's first
-   reply goes then; lost and uncopied, it waited a probe timeout, the most frequent wait at the
-   fresh dial's p90 (`a_lost_first_reply_comes_by_its_copy`).
+3. **A message's end in the application's first round trip is copied**: a packet that finishes a
+   stream, sent from the handshake's completion (`application_from`) until the peer acknowledges a
+   packet of its space. The server's first reply goes then; lost and uncopied, it waited a probe
+   timeout, the most frequent wait at the fresh dial's p90 (`a_lost_first_reply_comes_by_its_copy`).
+   A bulk transfer's first window ends no stream and is not copied.
    `a_lost_first_datagram_costs_no_probe_timeout_with_its_copy` now finds the lost original
    undeclared: the client's Initial keys go before an acknowledgement meets a threshold for it
    (RFC 9002 §6.4).
 
-Over 128 seeds, independent loss, two dials before: the first reply's p90 went from 297 / 290 ms
-(fresh / resumed) at 35 ms to 143 / 136 ms learned. Under bursts the learned rows equal the 35 ms
+Over 128 seeds, independent loss, two dials before: the first reply's p90 went from 658 / 296 ms
+(fresh / resumed) at 35 ms to 207 / 105 ms learned. Under bursts the learned rows equal the 35 ms
 rows.

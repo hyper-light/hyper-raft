@@ -6949,18 +6949,18 @@ target/release/examples/geo_open_loop --rate 100 --requests 20000 --dials 5 --id
 ## hyper-quic at 500 ms one way: the copies' spacing learned per path (2026-10-05)
 
 `crates/hyper-quic/VENDORED.md` §16; research, the full table and the fresh dial's cliff traced in
-`docs/research/burst-loss.md` §8–§9. `print_the_burst_table`, virtual time, exact. Load 15 to 18
+`docs/research/burst-loss.md` §8–§9. `print_the_burst_table`, virtual time, exact. Load 7.5 to 8.0
 while it ran (`uptime` before and after); machine as above. First reply over its floor, p90 of the
 fresh dial / p90 of the resumed dial, ms, at 128 seeds (32 seeds in brackets):
 
 | condition | back to back | spaced 35 ms | spaced as learned |
 |---|---|---|---|
-| independent 5%, no dial before | 112 / 122 (97 / 135) | 331 / 293 (236 / 332) | as spaced |
-| independent 5%, two dials before | 96 / 80 (2 / 76) | 297 / 290 (1,038 / 257) | **143 / 136** (84 / 149) |
-| bursts τ 35 ms, no dial before | 1,911 / 127 (1,967 / 80) | 283 / 187 (237 / 137) | as spaced |
-| bursts τ 35 ms, two dials before | 2,599 / 2,778 (3,356 / 132) | 131 / 246 (112 / 155) | 131 / 246 |
-| bursts τ 78.7 ms, no dial before | 1,910 / 164 (1,945 / 127) | 300 / 227 (237 / 189) | as spaced |
-| bursts τ 78.7 ms, two dials before | 1,550 / 1,819 (828 / 3,060) | 87 / 260 (126 / 236) | 87 / 260 |
+| independent 5%, no dial before | 112 / 90 (97 / 144) | 331 / 235 (236 / 235) | as spaced |
+| independent 5%, two dials before | 69 / 106 (31 / 80) | 658 / 296 (792 / 259) | **207 / 105** (91 / 95) |
+| bursts τ 35 ms, no dial before | 1,911 / 122 (1,967 / 103) | 283 / 223 (237 / 140) | as spaced |
+| bursts τ 35 ms, two dials before | 2,068 / 2,912 (3,279 / 136) | 312 / 190 (174 / 183) | 312 / 190 |
+| bursts τ 78.7 ms, no dial before | 1,910 / 158 (1,945 / 3,671) | 300 / 229 (237 / 211) | as spaced |
+| bursts τ 78.7 ms, two dials before | 1,831 / 123 (1,831 / 93) | 1,964 / 282 (2,786 / 244) | 1,964 / 282 |
 
 - **The fresh dial's cliff is gone.** Before §15's copy alignment and first-reply copies, every
   variant's fresh p90 at 128 seeds sat a probe timeout up (independent: 221 ms back to back, 998 ms

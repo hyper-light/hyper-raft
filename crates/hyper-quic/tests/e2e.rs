@@ -132,6 +132,9 @@ struct Stats {
 /// A QUIC endpoint with at most one connection at a time, either implementation.
 trait Quic {
     type Stream: Copy + Ord + Debug;
+    /// Whether the implementation's own driver sends what the datagrams it took produced before
+    /// it fires the timers due, the order a turn then takes (`Wire::turn`).
+    const TRANSMIT_BEFORE_TIMERS: bool;
     fn index(stream: Self::Stream) -> u64;
     fn connect(&mut self, now: Instant, server: SocketAddr);
     /// Takes one datagram; a response the endpoint sends at once, into `out`, and its destination.
@@ -208,6 +211,9 @@ mod hyper {
 
     impl Quic for Side {
         type Stream = StreamId;
+        // hyper-quic's consumers drive it either way, and a timer fired after the datagrams but
+        // before their answer is the harder order (`a_rebinding_leaves_no_stale_probe_timeout`).
+        const TRANSMIT_BEFORE_TIMERS: bool = false;
         fn index(stream: StreamId) -> u64 {
             stream.index()
         }
@@ -418,6 +424,12 @@ mod upstream {
 
     impl Quic for Side {
         type Stream = StreamId;
+        // quinn's `ConnectionDriver::poll` (quinn/src/connection.rs) processes the connection's
+        // events, then transmits, then drives its timer. quinn-proto 0.11.18, and quinn's main
+        // at d45b513, keep the loss-detection timer armed for the old path across `migrate`, and
+        // it asserts if that timer fires before anything is sent on the new path: an order its own
+        // driver never takes, since the first send re-arms the timer.
+        const TRANSMIT_BEFORE_TIMERS: bool = true;
         fn index(stream: StreamId) -> u64 {
             stream.index()
         }
@@ -621,8 +633,8 @@ impl Wire {
     }
     /// Sends what is due, waits for a datagram until the next timer without taking it
     /// (`hyper_measure::wait::arrives`), takes everything that has arrived, fires the timers due,
-    /// and sends again.
-    fn turn(&mut self, quic: &mut impl Quic) {
+    /// and sends again; an implementation whose driver sends before its timers sends in between.
+    fn turn<Q: Quic>(&mut self, quic: &mut Q) {
         self.flush(quic);
         let began = Instant::now();
         let wait = quic
@@ -651,6 +663,9 @@ impl Wire {
                 // still good, and what else arrived is still to be read.
                 Err(_) => {}
             }
+        }
+        if Q::TRANSMIT_BEFORE_TIMERS {
+            self.flush(quic);
         }
         let now = Instant::now();
         if quic.timeout().is_some_and(|due| due <= now) {

@@ -186,6 +186,17 @@ spliced with another file's segments fails to open (STREAM's nonce-based OAE sec
   `nonce = version (64 bits) ‖ segment index (32 bits)`, so a 4 KiB overwrite reseals one segment and
   makes no key. That consumer states and tests the argument that a version ID never repeats under its
   key, through crash, restart and restore; without that argument the rule is a key per file.
+- **A file keyed by its content** (`FileSealer::content_keyed`; slates' sealed replication, which
+  seals the same chunk again at every snapshot for holders that keep only ciphertext): its data
+  key and ID are derived by HKDF-SHA-384 from the parent key and the content's 256-bit hash, so the
+  same plaintext under the same parent seals to the same bytes and a holder sees an unchanged chunk
+  as unchanged. This is keyed message-locked encryption (Bellare, Keelveedhi and Ristenpart,
+  EUROCRYPT 2013; DupLESS, USENIX Security 2013, R §5) within one parent: two different plaintexts
+  share a key, and so nonces, only if their 256-bit hashes collide; what the stored bytes tell is
+  that two files are equal, which their keyed names tell already (§7); and the key is the parent's,
+  so it erases with it. The caller's contract is that the hash is of exactly the plaintext sealed.
+  A stored header resumed for resealing was considered and refused: it would rest nonce uniqueness
+  on the caller keeping header and plaintext paired, where a derived key rests it on the hash.
 - **Sizes follow from plaintext.** A segment of `n` bytes is `n + 16` stored bytes, so a byte's stored
   offset follows from its plaintext offset, and a read opens only the segments its range covers.
 - **The file's header** carries the wrapped data key record (§3.3), the file ID, `S`, a version, and

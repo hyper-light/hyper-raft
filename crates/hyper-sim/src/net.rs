@@ -37,14 +37,28 @@ const BITS_PER_BYTE: u128 = 8;
 const MILLISECOND: u64 = 1_000_000;
 
 /// The two-state Gilbert–Elliott channel (Gilbert, BSTJ 1960; Elliott, BSTJ 1963): independent loss
-/// with one state, bursty loss with a bad state entered and left per message. Its state is kept per
-/// directed flow.
+/// with one state, bursty loss with a bad state entered and left per message or in time
+/// (`docs/research/burst-loss.md`). Its state is kept per directed flow.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Loss {
-    good_to_bad_ppm: u32,
-    bad_to_good_ppm: u32,
+    chain: Chain,
     good_loss_ppm: u32,
     bad_loss_ppm: u32,
+}
+
+/// How the channel moves between its states.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Chain {
+    /// One step a message: the bad state entered with `good_to_bad_ppm` and left with
+    /// `bad_to_good_ppm`, whatever the time between messages.
+    PerMessage {
+        good_to_bad_ppm: u32,
+        bad_to_good_ppm: u32,
+    },
+    /// In time: a stay in the good state lasts `mean_good_ns` on average, in the bad state
+    /// `mean_bad_ns`, one step a nanosecond, so whether a message finds a burst depends on the time
+    /// since the flow's last message.
+    InTime { mean_good_ns: u64, mean_bad_ns: u64 },
 }
 
 impl Default for Loss {
@@ -53,20 +67,24 @@ impl Default for Loss {
     }
 }
 
+/// One in fixed point with 64 fractional bits, the probabilities of the chain in time.
+const Q64_ONE: u128 = 1 << 64;
+/// The bits of the draw that decides the state in time: a probability in 32 fractional bits, finer
+/// than the parts per million of the other draws, so a copy microseconds behind its original is
+/// told from one sent with it.
+const STATE_BITS: u32 = 32;
+
 impl Loss {
     /// No loss.
-    pub const NONE: Self = Self {
-        good_to_bad_ppm: 0,
-        bad_to_good_ppm: PPM,
-        good_loss_ppm: 0,
-        bad_loss_ppm: 0,
-    };
+    pub const NONE: Self = Self::random(0);
 
     /// Independent (Bernoulli) loss of `loss_ppm` a message.
     pub const fn random(loss_ppm: u32) -> Self {
         Self {
-            good_to_bad_ppm: 0,
-            bad_to_good_ppm: PPM,
+            chain: Chain::PerMessage {
+                good_to_bad_ppm: 0,
+                bad_to_good_ppm: PPM,
+            },
             good_loss_ppm: loss_ppm,
             bad_loss_ppm: loss_ppm,
         }
@@ -77,17 +95,104 @@ impl Loss {
     /// and nothing outside.
     pub const fn bursty(enter_ppm: u32, leave_ppm: u32, burst_loss_ppm: u32) -> Self {
         Self {
-            good_to_bad_ppm: enter_ppm,
-            bad_to_good_ppm: leave_ppm,
+            chain: Chain::PerMessage {
+                good_to_bad_ppm: enter_ppm,
+                bad_to_good_ppm: leave_ppm,
+            },
             good_loss_ppm: 0,
             bad_loss_ppm: burst_loss_ppm,
         }
+    }
+
+    /// Bursts in time: a burst lasts `mean_burst_ns` on average and the gap between bursts
+    /// `mean_gap_ns`, and a burst loses `burst_loss_ppm` of what is sent inside it and nothing
+    /// outside. A flow's first message finds a burst with the chain's stationary probability,
+    /// `burst / (burst + gap)`; a later one, `δ` after the flow's previous message, with
+    /// `π_b + (s − π_b)·(1 − 1/gap − 1/burst)^δ` where `s` is 1 in a burst and 0 outside
+    /// (`docs/research/burst-loss.md` §2). Either mean zero is no process, refused.
+    pub fn bursty_in_time(
+        mean_burst_ns: u64,
+        mean_gap_ns: u64,
+        burst_loss_ppm: u32,
+    ) -> Result<Self, SimError> {
+        if mean_burst_ns == 0 || mean_gap_ns == 0 {
+            return Err(SimError::NotALossProcess);
+        }
+        Ok(Self {
+            chain: Chain::InTime {
+                mean_good_ns: mean_gap_ns,
+                mean_bad_ns: mean_burst_ns,
+            },
+            good_loss_ppm: 0,
+            bad_loss_ppm: burst_loss_ppm,
+        })
     }
 
     /// A lossless path draws nothing.
     const fn is_lossless(&self) -> bool {
         self.good_loss_ppm == 0 && self.bad_loss_ppm == 0
     }
+}
+
+/// The chance, in [`STATE_BITS`] fractional bits, that the chain in time is in its bad state
+/// `elapsed` nanoseconds after it was in `was_bad` (or at its stationary probability with no
+/// previous message): `π_b + (s − π_b)·λ^δ`, with `λ = 1 − 1/G − 1/B` a nanosecond, in 64
+/// fractional bits, raised by squaring. Every step is integer arithmetic, so a run replays on every
+/// host.
+fn bad_in_time(mean_good_ns: u64, mean_bad_ns: u64, previous: Option<(bool, u64)>) -> u64 {
+    let good = u128::from(mean_good_ns.max(1));
+    let bad = u128::from(mean_bad_ns.max(1));
+    // π_b = B / (G + B), in 64 fractional bits.
+    let stationary = bad
+        .checked_shl(64)
+        .and_then(|scaled| scaled.checked_div(good.saturating_add(bad)))
+        .unwrap_or(0);
+    let chance = match previous {
+        None => stationary,
+        Some((was_bad, elapsed)) => {
+            let rate = Q64_ONE
+                .checked_div(good)
+                .unwrap_or(0)
+                .saturating_add(Q64_ONE.checked_div(bad).unwrap_or(0));
+            let decay = power(Q64_ONE.saturating_sub(rate), elapsed);
+            if was_bad {
+                // π_b + (1 − π_b)·λ^δ
+                let rest = Q64_ONE.saturating_sub(stationary);
+                stationary.saturating_add(multiply(rest, decay))
+            } else {
+                // π_b·(1 − λ^δ)
+                multiply(stationary, Q64_ONE.saturating_sub(decay))
+            }
+        }
+    };
+    chance
+        .checked_shr(64_u32.saturating_sub(STATE_BITS))
+        .and_then(|bits| u64::try_from(bits).ok())
+        .unwrap_or(1 << STATE_BITS)
+}
+
+/// The product of two numbers in 64 fractional bits, at most one each, truncated.
+fn multiply(a: u128, b: u128) -> u128 {
+    // Below 2^64 · 2^64 unless both are one, whose product is one.
+    a.checked_mul(b)
+        .and_then(|product| product.checked_shr(64))
+        .unwrap_or(Q64_ONE)
+}
+
+/// `base^exponent` in 64 fractional bits, `base` at most one: by squaring, one step a bit of the
+/// exponent, at most 64.
+fn power(mut base: u128, mut exponent: u64) -> u128 {
+    let mut result = Q64_ONE;
+    while exponent != 0 {
+        if exponent & 1 == 1 {
+            result = multiply(result, base);
+        }
+        exponent = exponent.checked_shr(1).unwrap_or(0);
+        if exponent != 0 {
+            base = multiply(base, base);
+        }
+    }
+    result
 }
 
 /// What a link's queue manager does with a message that finds the queue long, below the capacity
@@ -598,6 +703,8 @@ pub struct Delivery<P> {
 struct Flow {
     /// Whether the loss channel is in its bad state.
     bad: bool,
+    /// When the loss channel in time last drew its state.
+    last_loss_draw: Option<u64>,
     last_arrival: Option<u64>,
     delay: Option<StreamId>,
     loss: Option<StreamId>,
@@ -993,10 +1100,29 @@ impl<P: Clone> Net<P> {
             return Ok(false);
         }
         let stream = Self::stream(world, &mut flow.loss, "net.loss", pair)?;
-        flow.bad = if flow.bad {
-            !world.chance(stream, loss.bad_to_good_ppm)?
-        } else {
-            world.chance(stream, loss.good_to_bad_ppm)?
+        flow.bad = match loss.chain {
+            Chain::PerMessage {
+                good_to_bad_ppm,
+                bad_to_good_ppm,
+            } => {
+                if flow.bad {
+                    !world.chance(stream, bad_to_good_ppm)?
+                } else {
+                    world.chance(stream, good_to_bad_ppm)?
+                }
+            }
+            Chain::InTime {
+                mean_good_ns,
+                mean_bad_ns,
+            } => {
+                let now = world.now();
+                let previous = flow
+                    .last_loss_draw
+                    .map(|at| (flow.bad, now.saturating_sub(at)));
+                flow.last_loss_draw = Some(now);
+                let chance = bad_in_time(mean_good_ns, mean_bad_ns, previous);
+                world.below(stream, 1 << STATE_BITS)? < chance
+            }
         };
         let ppm = if flow.bad {
             loss.bad_loss_ppm
@@ -1468,5 +1594,64 @@ impl Adversary {
             }
         }
         Ok(adversary)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Q64_ONE, STATE_BITS, bad_in_time, power};
+
+    const MILLISECOND: u64 = 1_000_000;
+    /// The measured condition of `docs/research/burst-loss.md` §4.
+    const BURST: u64 = 36_800_000;
+    const GAP: u64 = 700 * MILLISECOND;
+    const CERTAIN: u64 = 1 << STATE_BITS;
+
+    #[test]
+    fn a_power_is_exact_where_its_terms_are() {
+        assert_eq!(power(Q64_ONE / 2, 0), Q64_ONE);
+        assert_eq!(power(Q64_ONE / 2, 1), Q64_ONE / 2);
+        assert_eq!(power(Q64_ONE / 2, 3), Q64_ONE / 8);
+        assert_eq!(power(Q64_ONE / 2, 64), 1);
+        assert_eq!(power(Q64_ONE / 2, 65), 0);
+        assert_eq!(power(Q64_ONE, u64::MAX), Q64_ONE);
+    }
+
+    #[test]
+    fn no_time_leaves_the_state_where_it_was() {
+        assert_eq!(bad_in_time(GAP, BURST, Some((true, 0))), CERTAIN);
+        assert_eq!(bad_in_time(GAP, BURST, Some((false, 0))), 0);
+    }
+
+    #[test]
+    fn a_flow_starts_and_ends_at_the_stationary_chance() {
+        // ⌊2³²·B/(G+B)⌋: the stationary chance of a burst, 5% of the time here.
+        let stationary =
+            u64::try_from(u128::from(CERTAIN) * u128::from(BURST) / u128::from(GAP + BURST))
+                .unwrap();
+        assert_eq!(bad_in_time(GAP, BURST, None), stationary);
+        // Long enough after that λ^δ is below 2⁻⁶⁴, the state is forgotten.
+        let forgotten = 1_000 * GAP;
+        assert_eq!(bad_in_time(GAP, BURST, Some((true, forgotten))), stationary);
+        assert_eq!(
+            bad_in_time(GAP, BURST, Some((false, forgotten))),
+            stationary
+        );
+    }
+
+    #[test]
+    fn a_burst_fades_with_time_and_a_gap_fills() {
+        let mut was_bad = CERTAIN;
+        let mut was_good = 0;
+        for elapsed in [1, 1_000, MILLISECOND, 10 * MILLISECOND, 100 * MILLISECOND] {
+            let bad = bad_in_time(GAP, BURST, Some((true, elapsed)));
+            let good = bad_in_time(GAP, BURST, Some((false, elapsed)));
+            assert!(bad <= was_bad && good >= was_good, "at {elapsed} ns");
+            assert!(
+                good < bad,
+                "a burst is likelier just after one, at {elapsed} ns"
+            );
+            (was_bad, was_good) = (bad, good);
+        }
     }
 }

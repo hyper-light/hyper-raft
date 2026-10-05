@@ -25,8 +25,10 @@ every one marked to verify before a value of the grid is derived from it.
 
 - **Gilbert, "Capacity of a burst-noise channel"**, Bell System Technical Journal 39, 1960, and
   **Elliott, "Estimates of error rates for codes on burst-noise channels"**, BSTJ 42, 1963. Taken:
-  the two-state burst-loss model hyper-sim's `Loss::bursty` implements. To verify against
-  hyper-sim's parameters (enter, leave, loss in the burst state).
+  the two-state burst-loss model hyper-sim's `Loss::bursty` and `Loss::bursty_in_time` implement.
+  Its form as fitted to Internet traces, and the measured traces its parameters come from (Bolot,
+  SIGCOMM 1993; Jiang and Schulzrinne, NOSSDAV 2000), are read and quoted in
+  `docs/research/burst-loss.md`.
 - **RFC 8289, Controlled Delay Active Queue Management** (Nichols, Jacobson, McGregor, Iyengar,
   2018). Already used by the Copa harness (`docs/research/congestion.md`).
 - **Alquraan, Takruri, Alfatafta and Al-Kiswany, "An Analysis of Network-Partitioning Failures in

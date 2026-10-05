@@ -285,6 +285,137 @@ fn bursty_loss_is_its_process_and_comes_in_runs() {
     assert!(runs > 0, "this seed's draws enter bursts");
 }
 
+/// The measured burst condition of `docs/research/burst-loss.md` §4: bursts of 36.8 ms on average
+/// every 700 ms, everything inside them lost, 5% of the time in all.
+fn measured_bursts() -> Loss {
+    Loss::bursty_in_time(36_800_000, 700 * MILLISECOND, PPM).unwrap()
+}
+
+#[test]
+fn a_loss_process_in_time_needs_a_burst_and_a_gap() {
+    assert_eq!(
+        Loss::bursty_in_time(0, MILLISECOND, PPM),
+        Err(SimError::NotALossProcess)
+    );
+    assert_eq!(
+        Loss::bursty_in_time(MILLISECOND, 0, PPM),
+        Err(SimError::NotALossProcess)
+    );
+}
+
+/// A message sent with a lost one shares its burst: with no time between them the chain in time
+/// has not moved, so a copy sent with its original is lost with it, where independent loss draws
+/// each afresh.
+#[test]
+fn a_message_sent_with_a_lost_one_is_lost_with_it_in_a_burst() {
+    let seed = 7;
+    let pairs = |loss: Loss| -> Vec<(bool, bool)> {
+        let mut world = world(seed);
+        let mut net = Net::new(NET);
+        net.set_path(Path::NONE.with_loss(loss));
+        (0..sized(2_000))
+            .map(|pair| {
+                world.advance(pair * SECOND).unwrap();
+                let first = send(&mut world, &mut net, 1, 2, 2 * pair, 100);
+                let second = send(&mut world, &mut net, 1, 2, 2 * pair + 1, 100);
+                drain(&mut world, &mut net);
+                let lost = |fate| fate == Fate::Dropped(Dropped::Loss);
+                (lost(first), lost(second))
+            })
+            .collect()
+    };
+    let bursty = pairs(measured_bursts());
+    assert!(
+        bursty.iter().any(|(first, _)| *first),
+        "this seed's draws find bursts"
+    );
+    assert!(bursty.iter().all(|(first, second)| first == second));
+    let independent = pairs(Loss::random(50_000));
+    assert!(
+        independent.iter().any(|(first, second)| first != second),
+        "independent loss parts this seed's pairs"
+    );
+}
+
+/// The chain in time by its definition (`docs/research/burst-loss.md` §2), on a reference stream:
+/// each message's chance of a burst from the time since the flow's previous one, then its loss in
+/// the state drawn.
+fn in_time(seed: u64, (burst, gap): (u64, u64), sends: &[u64]) -> Vec<bool> {
+    let one: u128 = 1 << 64;
+    let (mut world, stream) = reference(seed, "net.loss", 1, 2);
+    let stationary = (u128::from(burst) << 64) / u128::from(gap + burst);
+    let lambda = one - (one / u128::from(gap) + one / u128::from(burst));
+    let times = |a: u128, b: u128| a.checked_mul(b).map_or(one, |p| p >> 64);
+    let mut previous: Option<(bool, u64)> = None;
+    sends
+        .iter()
+        .map(|&at| {
+            let chance = match previous {
+                None => stationary,
+                Some((bad, then)) => {
+                    let mut decay = one;
+                    let mut square = lambda;
+                    let mut exponent = at - then;
+                    while exponent > 0 {
+                        if exponent & 1 == 1 {
+                            decay = times(decay, square);
+                        }
+                        exponent >>= 1;
+                        if exponent > 0 {
+                            square = times(square, square);
+                        }
+                    }
+                    if bad {
+                        stationary + times(one - stationary, decay)
+                    } else {
+                        times(stationary, one - decay)
+                    }
+                }
+            };
+            let bad = world.below(stream, 1 << 32).unwrap() < (chance >> 32) as u64;
+            previous = Some((bad, at));
+            world.chance(stream, if bad { PPM } else { 0 }).unwrap()
+        })
+        .collect()
+}
+
+#[test]
+fn bursty_loss_in_time_is_its_process() {
+    let seed = 7;
+    let mut world = world(seed);
+    let mut net = Net::new(NET);
+    net.set_path(Path::NONE.with_loss(measured_bursts()));
+    // Spacings from back to back to past the mean gap, cycled.
+    let spacings = [
+        0,
+        1_000,
+        MILLISECOND,
+        10 * MILLISECOND,
+        50 * MILLISECOND,
+        SECOND,
+    ];
+    let mut at = 0;
+    let mut sends = Vec::new();
+    let fates: Vec<bool> = (0..sized(10_000))
+        .map(|message| {
+            at += spacings[message as usize % spacings.len()];
+            world.advance(at).unwrap();
+            sends.push(at);
+            let fate = send(&mut world, &mut net, 1, 2, message, 100);
+            drain(&mut world, &mut net);
+            fate == Fate::Dropped(Dropped::Loss)
+        })
+        .collect();
+    assert_eq!(
+        fates,
+        in_time(seed, (36_800_000, 700 * MILLISECOND), &sends)
+    );
+    assert!(
+        fates.iter().any(|lost| *lost),
+        "this seed's draws find bursts"
+    );
+}
+
 #[test]
 fn loss_state_is_per_flow() {
     let mut world = world(7);
@@ -482,6 +613,44 @@ fn scenario(source: Source) -> Result<Record, SimError> {
         world.observe(count);
     }
     Ok(world.finish())
+}
+
+/// A run of three nodes whose messages are spaced in time on a path that loses in bursts in time.
+fn scenario_in_time(source: Source) -> Result<Record, SimError> {
+    let mut world = world_of(source);
+    let mut net = Net::new(NET);
+    net.set_path(
+        Path::reordering(80 * MILLISECOND, 20 * MILLISECOND).with_loss(Loss::bursty_in_time(
+            36_800_000,
+            700 * MILLISECOND,
+            PPM,
+        )?),
+    );
+    let mut delivered = Vec::new();
+    for message in 0..sized(2_000) {
+        until(&mut world, &mut net, message * MILLISECOND, &mut delivered);
+        let from = 1 + (message % 3) as u32;
+        let to = 1 + ((message + 1) % 3) as u32;
+        send(&mut world, &mut net, from, to, message, 100);
+    }
+    delivered.extend(drain(&mut world, &mut net));
+    for (at, message) in delivered {
+        world.observe(at ^ message.rotate_left(32));
+    }
+    let stats = net.stats();
+    for count in [stats.delivered, stats.dropped_loss] {
+        world.observe(count);
+    }
+    Ok(world.finish())
+}
+
+/// The run-twice check holds for loss in time: its chances are integer arithmetic on the world's
+/// clock, so a run gives one digest from its seed twice and from its trace.
+#[test]
+fn a_run_with_bursts_in_time_replays_from_its_seed_and_from_its_trace() {
+    let record = twice(11, scenario_in_time).unwrap();
+    assert!(!record.trace.is_empty());
+    assert_ne!(twice(12, scenario_in_time).unwrap().digest, record.digest);
 }
 
 /// The run-twice check (docs/sim.md §3.9): a run of three nodes on a reordering, bursty path gives

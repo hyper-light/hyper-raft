@@ -89,8 +89,9 @@ Each property has a model shared by the simulation and the real-socket relay (§
 condition is one specification in both:
 - **Delay and jitter**: hyper-sim's `Path` (one-way delay, jitter), LAN, regional and geographic
   points, and measured distributions (`Measured`) from published or recorded traces.
-- **Loss**: independent (`Loss::random`) and bursty (`Loss::bursty`, the Gilbert–Elliott model,
-  Gilbert 1960, Elliott 1963), its parameters fitted to published measurements.
+- **Loss**: independent (`Loss::random`) and bursty (`Loss::bursty` per message and
+  `Loss::bursty_in_time`, the Gilbert–Elliott model, Gilbert 1960, Elliott 1963), its parameters
+  fitted to published measurements (`docs/research/burst-loss.md` §3–§4).
 - **Reordering and duplication**: `Path::reordering` and the network's duplication.
 - **Capacity and queues**: drop-tail links with deep buffers (bufferbloat) and CoDel (RFC 8289),
   as the Copa harness already runs; competing flows (NewReno, CUBIC) where the crate shares a link.

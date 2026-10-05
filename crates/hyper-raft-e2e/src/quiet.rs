@@ -136,9 +136,9 @@ pub enum Stuck {
         /// What the members' own measures excused.
         excuse: Duration,
     },
-    /// A member answered with a write out for `writing`, which less a retransmission timeout is
-    /// past the `excuse` the members' longest write (or the stall the test ordered) and the quiet
-    /// period make.
+    /// A member answered with a write out for `writing`, past the kernel's own bound on a flush
+    /// ([`crate::device::FLUSH_BOUND`]): a write in progress is the kernel's until then, however
+    /// long the members' other writes or the test's own flush took.
     Held {
         /// The member.
         member: u64,
@@ -336,9 +336,13 @@ impl Quiet {
         let period = self.period();
         let excuse = period.saturating_add(self.write_most().max(self.stall).max(self.device));
         let silent = self.silence(unheard, excuse);
-        // Judged as a member's thread held in the write would be: its silence is counted less the
-        // timeout a look's ask waits for its answer.
-        let held = held.filter(|(_, writing)| writing.saturating_sub(RTO) > excuse);
+        // A member inside its write waits on the kernel: on a busy machine one write on a
+        // contended device, its thread competing for the CPU, stays out for seconds while another
+        // flush, the members' or the test's own, returns at once (hyper-durable-e2e's kill
+        // scenarios at load 60 to 78, 2026-10-04: single writes out 1.3 to 3.5 s, the longest
+        // completed 83 ms, the test's flush faster still). No measure of another flush bounds it;
+        // the kernel's bound does.
+        let held = held.filter(|(_, writing)| *writing > crate::device::FLUSH_BOUND);
         if !unheard.is_empty() {
             self.seen.unheard_looks = self.seen.unheard_looks.saturating_add(1);
         }
@@ -420,10 +424,11 @@ mod tests {
         }
     }
 
-    /// A write out past the quiet period and the members' longest write is held; the same write
-    /// is excused once the test's own flush on the device took as long, and held again past that.
+    /// A write in progress is excused however far past the quiet period, the members' longest
+    /// write and the test's own flush it runs, until the kernel's bound on a flush; past that the
+    /// member is held.
     #[test]
-    fn the_devices_measured_flush_excuses_a_write_as_slow() {
+    fn a_write_in_progress_is_the_kernels_until_its_bound_on_a_flush() {
         let start = Instant::now();
         let mut quiet = Quiet::new();
         // One member, its law one second, its longest write 100 ms: the excuse is 1.1 s.
@@ -435,35 +440,35 @@ mod tests {
                 .look(&mut watch, start, start, &[heard(1, Duration::ZERO)], &[])
                 .is_ok()
         );
-        // Its write out 2.2 s: past the 1.1 s excuse and the retransmission timeout.
+        // Its write out 2.2 s, past the 1.1 s excuse: still the kernel's.
         let later = start + Duration::from_millis(10);
-        let held = quiet.look(
+        let out = quiet.look(
             &mut watch,
             later,
             later,
             &[heard(1, Duration::from_millis(2_200))],
             &[],
         );
-        assert!(
-            matches!(held, Err(Stuck::Held { member: 1, .. })),
-            "{held:?}"
-        );
-        // The device answered the test's flush in 2 s: the write is the device's.
-        quiet.device(Duration::from_secs(2));
-        let excused = quiet.look(
+        assert!(out.is_ok(), "{out:?}");
+        // Excused whatever the test's own flush took.
+        quiet.device(Duration::from_millis(5));
+        let out = quiet.look(
             &mut watch,
             later,
             later,
-            &[heard(1, Duration::from_millis(2_200))],
+            &[heard(1, crate::device::FLUSH_BOUND)],
             &[],
         );
-        assert!(excused.is_ok(), "{excused:?}");
-        // A write out past the device's time, the quiet period and the timeout is held again.
+        assert!(out.is_ok(), "{out:?}");
+        // Past the kernel's bound on a flush: held.
         let held = quiet.look(
             &mut watch,
             later,
             later,
-            &[heard(1, Duration::from_millis(4_100))],
+            &[heard(
+                1,
+                crate::device::FLUSH_BOUND + Duration::from_millis(1),
+            )],
             &[],
         );
         assert!(

@@ -90,8 +90,8 @@ pub fn reconsider(
 ) -> Option<Stuck> {
     let began = match &stuck {
         Stuck::Silent { silence, .. } => now.checked_sub(*silence),
-        Stuck::Held { writing, .. } => now.checked_sub(*writing),
-        Stuck::Quiet(_) | Stuck::Device { .. } => return Some(stuck),
+        // Held only past the kernel's bound on a flush, which no flush of the test's excuses.
+        Stuck::Held { .. } | Stuck::Quiet(_) | Stuck::Device { .. } => return Some(stuck),
     };
     // Measured since it began: the member is slower than its device, and stuck.
     if measured.zip(began).is_some_and(|(at, began)| at >= began) {

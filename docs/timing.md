@@ -1522,9 +1522,15 @@ hyper-raft-e2e's had, each failing on CI once in a way a re-run passed:
   on the same disk, `stalled-devices` failed once in twenty with all three members' writes out
   2.1 s together against a 97 ms longest write (2026-10-04, before any hold), and once with a
   follower's write out 9.0 s past its 7 s hold. A slow device and a stuck member look alike to that
-  rule and not to the device: before a member is judged silent or held, the test flushes a file of
-  its own on the members' device with their flush (`hyper_raft_e2e::device::Probe`) and its time
-  joins the excuse, so a write is the member's only if the device answers the test faster. The
+  rule and not to the device: before a member is judged silent, the test flushes a file of its own
+  on the members' device with their flush (`hyper_raft_e2e::device::Probe`) and its time joins the
+  excuse. A member with a write in progress is not judged by any other flush: one write on a
+  contended device, its thread competing for the CPU, stays out for seconds while another returns at
+  once. `kill-durable-leader` at load 60 to 78 (2026-10-04) held single writes out 1.3 to 3.5 s while
+  the longest any member had finished took 83 ms and the test's own flush was faster still, which
+  the rule that judged a write by the test's flush called held. Twelve runs at load 60 to 65 passed
+  only because no write outran it. A write in progress is the kernel's until the kernel's own bound
+  on a flush passes, and past that it is held. The
   test's stalls are made inside a member's process (`FaultFile`), so an injected stall still fails
   named; a device that answers no flush of the test's within the kernel's own bound on a flush, 60 s
   (Linux's SCSI disk driver: `SD_TIMEOUT` 30 s × `SD_FLUSH_TIMEOUT_MULTIPLIER` 2; its NVMe driver's

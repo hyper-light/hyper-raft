@@ -438,12 +438,33 @@ impl<S: Storage> Raft<S> {
         if entry.index <= self.log.committed() || !self.decided.knows(entry.index) {
             return Ok(());
         }
-        let taken = self
+        let index = entry.index;
+        if self
             .log
-            .slice(entry.index, entry.index.saturating_add(1), u64::MAX)?;
-        if taken.first().is_some_and(|taken| same(taken, entry)) {
+            .any_entry(index, index.saturating_add(1), |taken| same(taken, entry))?
+        {
             self.decided
-                .holds(entry.index, holder, self.config.limits.members)?;
+                .holds(index, holder, self.config.limits.members)?;
+        }
+        Ok(())
+    }
+    /// The last index this leader may take from the fast track at, or none for no cap: its log
+    /// grows by the fast track no further than the owner lets it (hyper-multilog's bound on what
+    /// a log holds past its merge). Votes past the cap are kept, within their bound, and what they
+    /// decide is taken once the cap rises; what a leader takes later is still right, and the
+    /// classic track goes on.
+    pub fn cap_takes(&mut self, through: Option<u64>) -> Result<()> {
+        let rose = match (self.takes_through, through) {
+            (Some(_), None) => true,
+            (Some(was), Some(now)) => now > was,
+            (None, _) => false,
+        };
+        self.takes_through = through;
+        if rose {
+            self.decide()?;
+            if self.maybe_commit()? {
+                self.bcast_append()?;
+            }
         }
         Ok(())
     }
@@ -456,6 +477,9 @@ impl<S: Storage> Raft<S> {
         // Every index taken is one of the window.
         for _ in 0..self.config.limits.fast_window {
             let index = self.log.last_index()?.saturating_add(1);
+            if self.takes_through.is_some_and(|through| index > through) {
+                break;
+            }
             let Some((entry, holders)) = self.votes.most(index) else {
                 break;
             };

@@ -305,3 +305,38 @@ layer may make (a barrier) or that is out of place; a leader counts the barriers
 before it appends another; changes of configuration are applied as given, not as merged;
 compaction is possible at the cuts §6 asks for; and what a log may hold beyond its merge is
 bounded, with a typed refusal at its leader.
+
+## 9. Changing the streams a merge reads, while it runs
+
+**Benz and Pedone, "Elastic Paxos: A Dynamic Atomic Multicast Protocol", *Proceedings of the 37th
+IEEE International Conference on Distributed Computing Systems* (ICDCS 2017).** Samuel Benz and
+Fernando Pedone, Università della Svizzera italiana. Read in full as the authors' PDF,
+`www.inf.usi.ch/faculty/pedone/Paper/2017/2017ICDCSb.pdf`, on 2026-10-05.
+
+- **The setting is this layer's.** Each atomic multicast stream is a Multi-Paxos sequence; a replica
+  subscribed to several merges them with a deterministic round-robin merge (`dMerge`, §III-B), and
+  a partitioned key/value store has one stream per partition and one shared stream for
+  multi-partition operations (§I, §III-C): the keyed logs and log 0 here.
+- **What changes is the set of streams merged, not the members** (§I, §IV-A): "Dynamic
+  subscriptions in Elastic Paxos should not be confused with dynamic reconfiguration … Elastic
+  Paxos seeks to allow replicas to dynamically change the multicast groups they subscribe to,
+  while the membership of the system may remain constant."
+- **Adding a stream** (§V-A, Algorithm 1): a replica "must atomically broadcast request
+  subscribe_msg(G, S_N) to (a) the new stream S_N; and (b) a stream S that R currently subscribes
+  to". The merge, on meeting the request in S, scans S_N for the same request and takes "the
+  maximum between the instances in which the subscribe request was delivered in each stream" as
+  the merge point, skipping what precedes it in S_N; "this works because the merge point is
+  'aligned' at all subscribed streams" (Figure 2). Each replica computes it from the streams'
+  decided contents alone, so every replica merges alike.
+- **Removing a stream** is "simpler … because there is already a total order among messages in all
+  subscribed streams. Therefore, it is enough to broadcast a single unsubscribe_msg(group,stream)
+  request to any of the subscribed streams. As soon as the request is delivered, the dMerge task
+  removes the requested stream" (§V-A).
+- **Repartitioning** (§VII-D): after a split, "Commands from clients which are received by the wrong
+  partition after the split are discarded. The clients will resend them after a timeout to the
+  correct partition." A command's place is judged against the partitioning in force where the
+  merge delivers it, and a misplaced one is refused, not moved.
+- **Leaves open.** The paper measures throughput through a split and a reconfiguration (Figures
+  3–5); it gives no proof beyond Figure 2's argument, no bound on what a replica queues while a new
+  stream is recovered (it reads the stream's whole decided history, §V-B, shortened by a `prepare`
+  hint, §V-C), and it delegates partition metadata to ZooKeeper (§VI).

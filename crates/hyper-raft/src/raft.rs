@@ -551,6 +551,9 @@ pub struct Raft<S> {
     pub(crate) decided: Decided,
     /// What was proposed here and another entry took the index of.
     pub(crate) displaced: Vec<Entry>,
+    /// The last index the owner lets this leader take from the fast track at, if it caps it
+    /// ([`Raft::cap_takes`]): votes past it are kept, and taken once the cap rises.
+    pub(crate) takes_through: Option<u64>,
     /// The leader, and its term, that was told what this member holds.
     pub(crate) voted_to: (u64, NodeId),
     /// What the fast track did here since the member opened.
@@ -1199,6 +1202,7 @@ impl<S: Storage> Raft<S> {
             ),
             decided: Decided::default(),
             displaced: Vec::new(),
+            takes_through: None,
             voted_to: (0, 0),
             fast_stats: FastStats::default(),
             holders: Vec::new(),

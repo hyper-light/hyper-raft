@@ -65,6 +65,10 @@ pub struct Disk {
     pub conf: ConfState,
     pub snapshot: Snapshot,
     pub entries: Vec<Entry>,
+    /// The fast track's proposals the member approved by itself, kept until a `Ready` releases
+    /// them (`docs/raft.md` §3.5, "Storage"), and the greatest release written.
+    pub proposals: Vec<Entry>,
+    pub released: u64,
 }
 
 impl Disk {
@@ -158,8 +162,8 @@ impl Storage for Store {
         Ok(hyper_raft::InitialState {
             hard_state: self.0.hard_state,
             configuration: self.0.conf.clone(),
-            proposals: Vec::new(),
-            released: 0,
+            proposals: self.0.proposals.clone(),
+            released: self.0.released,
         })
     }
     fn entries(
@@ -389,6 +393,11 @@ pub struct Member {
     pub suspicion: bool,
     /// Whether [`Member::settle`] leaves the merge to the test.
     pub hold_apply: bool,
+    /// Whether its logs run the fast track.
+    pub fast: bool,
+    /// What it proposed by the fast track and another entry took the index of, as its logs'
+    /// `Ready`s gave them, until the owner takes them.
+    pub displaced: Vec<(usize, Entry)>,
 }
 
 impl Member {
@@ -406,17 +415,39 @@ impl Member {
         limits: Limits,
         suspicion: bool,
     ) -> Self {
+        Self::build(id, voters, logs, seed, limits, suspicion, false)
+    }
+
+    /// As [`Member::new`], its logs running the fast track.
+    pub fn new_fast(id: u64, voters: &[u64], logs: usize, seed: u64, limits: Limits) -> Self {
+        Self::build(id, voters, logs, seed, limits, false, true)
+    }
+
+    fn settings_of(id: u64, members: usize, seed: u64, suspicion: bool, fast: bool) -> Config {
+        let settings = if suspicion {
+            config_by_suspicion(id, members, seed)
+        } else {
+            config(id, members, seed)
+        };
+        Config { fast, ..settings }
+    }
+
+    fn build(
+        id: u64,
+        voters: &[u64],
+        logs: usize,
+        seed: u64,
+        limits: Limits,
+        suspicion: bool,
+        fast: bool,
+    ) -> Self {
         let boot = ConfState {
             voters: voters.to_vec(),
             ..ConfState::default()
         };
         let stores = (0..logs).map(|_| Store(Disk::new(boot.clone()))).collect();
         let point = Point::origin(vec![boot.clone(); logs]).unwrap();
-        let settings = if suspicion {
-            config_by_suspicion(id, voters.len(), seed)
-        } else {
-            config(id, voters.len(), seed)
-        };
+        let settings = Self::settings_of(id, voters.len(), seed, suspicion, fast);
         let multi = MultiLog::open(&settings, stores, &point, limits).expect("a member opens");
         Self {
             id,
@@ -433,6 +464,8 @@ impl Member {
             auto_barriers: true,
             suspicion,
             hold_apply: false,
+            fast,
+            displaced: Vec::new(),
         }
     }
 
@@ -471,11 +504,8 @@ impl Member {
             disk.conf = at.configuration.clone();
             stores.push(Store(disk));
         }
-        let settings = if self.suspicion {
-            config_by_suspicion(self.id, self.members, self.seed)
-        } else {
-            config(self.id, self.members, self.seed)
-        };
+        let settings =
+            Self::settings_of(self.id, self.members, self.seed, self.suspicion, self.fast);
         self.multi = MultiLog::open(&settings, stores, &point, self.limits)
             .expect("a member reopens on what it made durable");
         self.app = app;
@@ -491,10 +521,22 @@ impl Member {
                 node.store_mut().0.install(snapshot);
                 snapshot.data.clone()
             });
-            node.store_mut().0.append(ready.entries());
+            let disk = &mut node.store_mut().0;
+            disk.append(ready.entries());
             if let Some(hard) = ready.hard_state() {
-                node.store_mut().0.hard_state = *hard;
+                disk.hard_state = *hard;
             }
+            // The release before the proposals it is written with, as a store applies them.
+            if let Some(through) = ready.released() {
+                disk.proposals.retain(|held| held.index > through);
+                disk.released = disk.released.max(through);
+            }
+            for given in ready.proposals() {
+                disk.proposals.retain(|held| held.index != given.index);
+                disk.proposals.push(given.clone());
+            }
+            self.displaced
+                .extend(ready.take_displaced().into_iter().map(|entry| (log, entry)));
             out.extend(ready.take_messages().into_iter().map(|m| (log, m)));
             out.extend(
                 ready
@@ -633,6 +675,10 @@ impl Member {
     pub fn propose(&mut self, route: Route, command: Vec<u8>) -> bool {
         self.multi.propose(route, command).is_ok()
     }
+
+    pub fn propose_fast(&mut self, route: Route, command: Vec<u8>) -> bool {
+        self.multi.propose_fast(route, command).is_ok()
+    }
 }
 
 /// A group of members on a network that delivers every message, in the order sent, unless a test
@@ -646,17 +692,21 @@ pub struct Group {
 
 impl Group {
     pub fn new(voters: u64, logs: usize, seed: u64, limits: Limits) -> Self {
+        Self::open(voters, logs, seed, limits, false)
+    }
+
+    /// As [`Group::new`], its members' logs running the fast track where `fast`.
+    pub fn open(voters: u64, logs: usize, seed: u64, limits: Limits, fast: bool) -> Self {
         let ids: Vec<u64> = (1..=voters).collect();
         let members = ids
             .iter()
             .map(|id| {
-                Member::new(
-                    *id,
-                    &ids,
-                    logs,
-                    seed.wrapping_mul(1_000_003).wrapping_add(*id),
-                    limits,
-                )
+                let seed = seed.wrapping_mul(1_000_003).wrapping_add(*id);
+                if fast {
+                    Member::new_fast(*id, &ids, logs, seed, limits)
+                } else {
+                    Member::new(*id, &ids, logs, seed, limits)
+                }
             })
             .collect();
         Self {

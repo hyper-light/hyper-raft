@@ -588,3 +588,130 @@ fn a_batch_is_one_proposal_refused_whole() {
     group.quiet();
     same_everywhere(&mut group);
 }
+
+/// The fast track's proposal of a command, made by a member that does not lead its log, held by
+/// every voter and taken by the leader, and committed by the fast quorum: every member applies it
+/// in the merged order (`docs/multilog.md` §9.1).
+#[test]
+fn a_command_proposed_by_the_fast_track_is_applied_alike_everywhere() {
+    let mut group = Group::open(3, 2, 37, ROOMY, true);
+    group.elect(0, 1);
+    group.elect(1, 1);
+    let key = (0..).find(|key| log_of(*key, 2) == 1).unwrap();
+    assert!(group.member(2).propose_fast(Route::Key(key), b"k".to_vec()));
+    assert!(group.member(3).propose_fast(Route::Global, b"g".to_vec()));
+    group.quiet();
+    for member in &group.members {
+        assert_eq!(member.counts.keyed_applied, 1, "member {}", member.id);
+        assert_eq!(member.counts.globals_applied, 1, "member {}", member.id);
+        assert!(member.displaced.is_empty());
+    }
+    let committed: u64 = (0..2)
+        .map(|log| {
+            group.members[0]
+                .multi
+                .node(log)
+                .unwrap()
+                .raft
+                .fast_stats()
+                .committed
+        })
+        .sum();
+    assert_eq!(committed, 2, "each by the fast quorum");
+    same_everywhere(&mut group);
+}
+
+/// No member holds what the fast track may not carry (`docs/multilog.md` §9.1): a command in
+/// another log, and a barrier, are refused before the core sees them, and nothing changes.
+#[test]
+fn a_fast_proposal_out_of_place_is_refused_and_no_member_holds_it() {
+    let mut group = Group::open(3, 2, 41, ROOMY, true);
+    group.elect(0, 1);
+    group.elect(1, 1);
+    let elsewhere = (0..).find(|key| log_of(*key, 2) == 0).unwrap();
+    for data in [
+        entry::keyed_command(b"k".to_vec(), elsewhere).unwrap(),
+        entry::barrier_naming(1).unwrap(),
+        entry::global(b"g".to_vec()).unwrap(),
+    ] {
+        let message = Message {
+            msg_type: hyper_raft::fast::FAST_PROPOSE,
+            from: 2,
+            to: 3,
+            entries: vec![Entry {
+                index: 2,
+                term: 1,
+                data,
+                ..Entry::default()
+            }],
+            ..Message::default()
+        };
+        assert!(matches!(
+            group.member(3).multi.step(1, message),
+            Err(Error::Violation(_))
+        ));
+        assert_eq!(
+            group
+                .member(3)
+                .multi
+                .node(1)
+                .unwrap()
+                .raft
+                .fast_stats()
+                .held,
+            0,
+            "nothing is held"
+        );
+    }
+}
+
+/// `docs/multilog.md` §6 by the fast track: a leader whose log holds `unmerged` entries past its
+/// merge takes nothing more from the fast track, however much the other members propose, until
+/// the merge moves; then it takes what their votes decided, and a proposal made after.
+#[test]
+fn a_leader_at_its_unmerged_bound_takes_nothing_by_the_fast_track() {
+    let unmerged = 6;
+    let mut group = Group::open(3, 2, 43, Limits { unmerged }, true);
+    group.elect(0, 1);
+    assert!(group.member(1).propose(Route::Global, b"g".to_vec()));
+    group.quiet();
+    let key = (0..).find(|key| log_of(*key, 2) == 0).unwrap();
+    for i in 0..20u64 {
+        group
+            .member(2)
+            .propose_fast(Route::Key(key), i.to_le_bytes().to_vec());
+        group.quiet();
+    }
+    let leader = group.member(1);
+    let last = leader
+        .multi
+        .node(0)
+        .unwrap()
+        .raft
+        .log()
+        .last_index()
+        .unwrap();
+    let merged = leader.multi.merged_through(0).unwrap();
+    assert!(
+        last - merged <= unmerged,
+        "the leader holds {} past its merge",
+        last - merged
+    );
+    assert_eq!(
+        leader.counts.globals_applied, 0,
+        "the global waits for log 1"
+    );
+    group.elect(1, 2);
+    for member in &group.members {
+        assert_eq!(member.counts.globals_applied, 1, "member {}", member.id);
+    }
+    let before = group.member(2).counts.keyed_applied;
+    assert!(
+        group
+            .member(2)
+            .propose_fast(Route::Key(key), b"after".to_vec())
+    );
+    group.quiet();
+    assert_eq!(group.member(2).counts.keyed_applied, before + 1);
+    same_everywhere(&mut group);
+}

@@ -136,6 +136,41 @@ fn a_proposal_through_the_layer_allocates_what_the_core_does() {
     }
 }
 
+/// A fast proposal through the layer at a follower allocates what the core's own does at another
+/// follower in the same state: the layer builds the entry in the owner's room and adds nothing.
+#[test]
+fn a_fast_proposal_through_the_layer_allocates_what_the_core_does() {
+    let mut group = Group::open(3, 1, 13, ROOMY, true);
+    group.elect(0, 1);
+    let key = (0..).find(|k| log_of(*k, 1) == 0).unwrap();
+    for (bytes, i) in [(8usize, 0u64), (64, 1), (4096, 2)] {
+        let layer_data = command(i, bytes);
+        alloc::begin();
+        group
+            .member(2)
+            .multi
+            .propose_fast(Route::Key(key), layer_data)
+            .unwrap();
+        let layer = alloc::end();
+        let bare_data = entry::keyed_command(command(i, bytes), key).unwrap();
+        alloc::begin();
+        group
+            .member(3)
+            .multi
+            .node_mut(0)
+            .unwrap()
+            .propose_fast(Vec::new(), bare_data)
+            .unwrap();
+        let core = alloc::end();
+        assert_eq!(
+            (layer.allocations, layer.reallocations, layer.bytes),
+            (core.allocations, core.reallocations, core.bytes),
+            "a fast proposal of {bytes} bytes"
+        );
+        group.quiet();
+    }
+}
+
 /// Rounds each comparison repeats, the first ones warming the member's queues for both sides.
 const ROUNDS: u64 = 64;
 

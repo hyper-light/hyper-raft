@@ -629,6 +629,11 @@ impl<S: Storage> RawNode<S> {
     pub fn set_timing(&mut self, timing: crate::Timing) -> Result<()> {
         self.raft.set_timing(timing)
     }
+    /// The last index this member, leading, may take from the fast track
+    /// at ([`Raft::cap_takes`]).
+    pub fn cap_takes(&mut self, through: Option<u64>) -> Result<()> {
+        self.operate(|raft| raft.cap_takes(through))
+    }
     /// The owner holds this member's campaigns, or lets them go
     /// ([`Raft::hold_campaigns`]).
     pub fn hold_campaigns(&mut self, held: bool) -> Result<()> {

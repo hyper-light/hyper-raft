@@ -3,7 +3,8 @@
 //!
 //! The owner drives each log's member as it drives a single group ([`MultiLog::node_mut`]: `ready`,
 //! persist, send, `on_persist`), and in four places goes through the layer instead: proposals
-//! ([`MultiLog::propose`]), messages ([`MultiLog::step`]), the committed entries a `Ready` gives
+//! ([`MultiLog::propose`], [`MultiLog::propose_fast`]), messages ([`MultiLog::step`]), the
+//! committed entries a `Ready` gives
 //! ([`MultiLog::hand_over`]), and the state machine's commands ([`MultiLog::apply`], in the merged
 //! order). After every drive it asks for the barriers it owes ([`MultiLog::barriers`]).
 
@@ -13,7 +14,7 @@ use hyper_raft::proto::{
     ConfChange, ConfChangeV2, ConfState, Entry, EntryType, Message, MessageType,
 };
 use hyper_raft::wire::Record;
-use hyper_raft::{Config, NodeId, RawNode, StateRole, Storage, StorageError, proto};
+use hyper_raft::{Config, NodeId, RawNode, StateRole, Storage, StorageError, fast, proto};
 
 use crate::entry::{self, Stated};
 use crate::error::{Error, Result};
@@ -152,8 +153,7 @@ impl<S: Storage> MultiLog<S> {
     /// the image the owner restarts from, or the origin. Every log's member is `member`'s
     /// settings, with an election seed of its own and the cut's position as what is applied.
     /// Refused for no log, more logs than a `u32` numbers, a point of another count, storage that
-    /// does not hold the cut, the fast track or entries applied before they are durable
-    /// (`docs/multilog.md` §9).
+    /// does not hold the cut, or entries applied before they are durable (`docs/multilog.md` §9).
     pub fn open(member: &Config, stores: Vec<S>, point: &Point, limits: Limits) -> Result<Self> {
         let count = stores.len();
         Self::check(member, count, point, limits)?;
@@ -198,9 +198,6 @@ impl<S: Storage> MultiLog<S> {
         u32::try_from(count).map_err(|_| Error::Settings("more logs than a u32 numbers"))?;
         if point.cut.logs() != count || point.logs.len() != count {
             return Err(Error::Settings("a point of another count of logs"));
-        }
-        if member.fast {
-            return Err(Error::Settings("the fast track in a multilog"));
         }
         if member.apply_unpersisted {
             return Err(Error::Settings(
@@ -263,6 +260,25 @@ impl<S: Storage> MultiLog<S> {
         Ok(log)
     }
 
+    /// Proposes `command` by the fast track where `route` sends it (`docs/multilog.md` §9.1): to
+    /// every voter of that log, which hold it beside their logs until its leader takes it or
+    /// another entry. The log's number and the index proposed for; one another entry takes comes
+    /// back in that log's `Ready` (`hyper_raft::Ready::displaced`), and its owner proposes it
+    /// again. Refused as [`MultiLog::propose`] refuses, and for a group with no fast track.
+    pub fn propose_fast(&mut self, route: Route, command: Vec<u8>) -> Result<(usize, u64)> {
+        let log = self.route(route);
+        self.admit(log, 1)?;
+        let data = match route {
+            Route::Global => entry::global(command)?,
+            Route::Key(key) => entry::keyed_command(command, key)?,
+        };
+        let index = self
+            .at(log)?
+            .propose_fast(Vec::new(), data)
+            .map_err(|error| Error::of(log, error))?;
+        Ok((log, index))
+    }
+
     /// Proposes `commands`, every one routed to `log`, as one proposal of the core: one append
     /// carries them all to each follower, as an owner batching its clients' commands asks
     /// (`docs/multilog.md` §9). Taken whole or refused whole: refused for a command routed
@@ -320,6 +336,11 @@ impl<S: Storage> MultiLog<S> {
     /// place is refused, and one of barriers a leader's barrier covers is dropped
     /// (`docs/multilog.md` §3.1, §3.2).
     pub fn step(&mut self, log: usize, message: Message) -> Result<()> {
+        if message.msg_type == fast::FAST_PROPOSE || message.msg_type == fast::FAST_VOTE {
+            self.screen_fast(log, &message)?;
+            self.steer(log)?;
+            return self.step_member(log, message);
+        }
         if message.msg_type == MessageType::MsgPropose {
             if let Screened::Drop = self.screen(log, &message)? {
                 return Ok(());
@@ -415,6 +436,38 @@ impl<S: Storage> MultiLog<S> {
         })
     }
 
+    /// Refuses a fast-track proposal for `log` that is not a command in place
+    /// (`docs/multilog.md` §9.1): no member may hold it, and a barrier never goes by the fast
+    /// track (§3.1's one barrier a global is the leader's to keep).
+    fn screen_fast(&self, log: usize, message: &Message) -> Result<()> {
+        if message.msg_type != fast::FAST_PROPOSE {
+            return Ok(());
+        }
+        for entry in &message.entries {
+            match entry::read(entry) {
+                Stated::Global(_) if log == 0 => {}
+                Stated::Keyed { key, .. } if log_of(key, self.nodes.len()) == log => {}
+                _ => {
+                    return Err(Error::Violation(
+                        "a fast proposal that is no command in place",
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Caps what `log`'s member takes from the fast track at [`Limits::unmerged`] entries past
+    /// its merge, as [`MultiLog::admit`] bounds a client's proposals (`docs/multilog.md` §6): votes
+    /// past the cap are kept, and the leader takes what they decide as the merge moves.
+    fn steer(&mut self, log: usize) -> Result<()> {
+        let merged = self.merged_through(log).ok_or(Error::NoLog(log))?;
+        let through = merged.saturating_add(self.limits.unmerged);
+        self.at(log)?
+            .cap_takes(Some(through))
+            .map_err(|error| Error::of(log, error))
+    }
+
     /// Whether this member leads `log` and a barrier it appended this term, or one its merge read
     /// there, names `named` or later.
     fn leads_covering(&self, log: usize, named: u64) -> Result<bool> {
@@ -495,6 +548,10 @@ impl<S: Storage> MultiLog<S> {
             .merge
             .advance(&Stores { nodes: &self.nodes }, budget, apply)?;
         self.settle_configurations();
+        // The merge moved: a leader held for its bound may take from the fast track again.
+        for log in 0..self.nodes.len() {
+            self.steer(log)?;
+        }
         Ok(advance)
     }
 

@@ -492,6 +492,10 @@ pub struct Counters {
     pub images_taken: u64,
     /// Images installed from a log's snapshot, ahead of the member's state.
     pub images_installed: u64,
+    /// Indexes the leaders committed by a fast quorum (a group on the fast track).
+    pub fast_committed: u64,
+    /// Fast proposals another entry took the index of, each proposed again by its member.
+    pub displaced: u64,
 }
 
 impl Counters {
@@ -508,6 +512,8 @@ impl Counters {
         self.proposals_refused += other.proposals_refused;
         self.images_taken += other.images_taken;
         self.images_installed += other.images_installed;
+        self.fast_committed += other.fast_committed;
+        self.displaced += other.displaced;
     }
 }
 
@@ -536,6 +542,10 @@ struct Cluster {
     /// The planted defect, where a test plants it: member 1's application is a merge that passes
     /// barriers as nothing, with what it applied.
     mutant: Option<(Merge, support::App)>,
+    /// Whether the group runs the fast track: each command is proposed by it.
+    fast: bool,
+    /// Fast commits counted by members before their last restart.
+    fast_folded: u64,
 }
 
 /// The world's streams the explorer draws from, one a source.
@@ -547,7 +557,7 @@ struct Streams {
 }
 
 impl Cluster {
-    fn new(source: Source, voters: u64, logs: usize) -> Self {
+    fn new(source: Source, voters: u64, logs: usize, fast: bool) -> Self {
         let world_steps = STEPS as u64 * WORLD_STEPS_PER_ACTION;
         let limits = hyper_sim::Limits {
             events: 2 * IN_FLIGHT_BOUND,
@@ -579,7 +589,11 @@ impl Cluster {
         let members = ids
             .iter()
             .map(|id| {
-                let mut member = Member::new(*id, &ids, logs, *id, ROOMY);
+                let mut member = if fast {
+                    Member::new_fast(*id, &ids, logs, *id, ROOMY)
+                } else {
+                    Member::new(*id, &ids, logs, *id, ROOMY)
+                };
                 member.auto_barriers = false;
                 member
             })
@@ -599,6 +613,8 @@ impl Cluster {
             folded: vec![support::Counts::default(); voters as usize],
             checked: vec![BTreeMap::new(); voters as usize],
             mutant: None,
+            fast,
+            fast_folded: 0,
         }
     }
 
@@ -614,6 +630,7 @@ impl Cluster {
     fn settle(&mut self, id: u64) {
         let mut out = Vec::new();
         self.members[id as usize - 1].settle(&mut out);
+        self.propose_displaced(id);
         for (log, message) in out {
             let to = message.to;
             let bytes = message.encoded_len();
@@ -729,10 +746,33 @@ impl Cluster {
         let at = self.pick_member();
         self.proposals += 1;
         let command = self.proposals.to_le_bytes().to_vec();
-        if !self.members[at as usize - 1].propose(route, command) {
+        let member = &mut self.members[at as usize - 1];
+        let proposed = if self.fast {
+            member.propose_fast(route, command)
+        } else {
+            member.propose(route, command)
+        };
+        if !proposed {
             self.counters.proposals_refused += 1;
         }
         self.settle(at);
+    }
+
+    /// What member `id` proposed by the fast track and another entry took the index of, it
+    /// proposes again, as an owner does; a proposal refused again is counted refused.
+    fn propose_displaced(&mut self, id: u64) {
+        let member = &mut self.members[id as usize - 1];
+        for (_, entry) in std::mem::take(&mut member.displaced) {
+            self.counters.displaced += 1;
+            let (route, command) = match entry::read(&entry) {
+                entry::Stated::Keyed { key, command } => (Route::Key(key), command.to_vec()),
+                entry::Stated::Global(command) => (Route::Global, command.to_vec()),
+                other => panic!("member {id} proposed {other:?} by the fast track"),
+            };
+            if !member.propose_fast(route, command) {
+                self.counters.proposals_refused += 1;
+            }
+        }
     }
 
     /// Member `at` proposes the barriers it owes.
@@ -789,6 +829,9 @@ impl Cluster {
         folded.refused += counts.refused;
         folded.images += counts.images;
         folded.installed += counts.installed;
+        self.fast_folded += fast_committed(member);
+        // What it waited on to propose again is lost with it.
+        member.displaced.clear();
         member.restart();
         member.counts = support::Counts::default();
         self.counters.crashes += 1;
@@ -994,13 +1037,29 @@ impl Cluster {
             counters.images_installed += member.counts.installed + folded.installed;
         }
         counters.overflowed = self.net.stats().dropped_capacity;
+        counters.fast_committed =
+            self.fast_folded + self.members.iter().map(fast_committed).sum::<u64>();
         counters
     }
 }
 
-/// One seeded history of `voters` voters holding `logs` logs each; its record and its counters.
-fn explore_one(source: Source, voters: u64, logs: usize, seed: u64) -> (SimRecord, Counters) {
-    let mut cluster = Cluster::new(source, voters, logs);
+/// What a member's leaders committed by a fast quorum, all its logs told.
+fn fast_committed(member: &Member) -> u64 {
+    (0..member.logs)
+        .map(|log| member.multi.node(log).unwrap().raft.fast_stats().committed)
+        .sum()
+}
+
+/// One seeded history of `voters` voters holding `logs` logs each, on the fast track where
+/// `fast`; its record and its counters.
+fn explore_one(
+    source: Source,
+    voters: u64,
+    logs: usize,
+    fast: bool,
+    seed: u64,
+) -> (SimRecord, Counters) {
+    let mut cluster = Cluster::new(source, voters, logs, fast);
     for step in 0..STEPS {
         let calm = (step / STRETCH) % 2 == 1;
         cluster.step(calm);
@@ -1012,19 +1071,19 @@ fn explore_one(source: Source, voters: u64, logs: usize, seed: u64) -> (SimRecor
 
 /// Explores `seeds` histories of `voters` voters holding `logs` logs each, the first through the
 /// run-twice check (`docs/sim.md` §3.9); what they counted.
-fn explore(voters: u64, logs: usize, seeds: u64) -> Counters {
+fn explore(voters: u64, logs: usize, fast: bool, seeds: u64) -> Counters {
     let mut total = Counters::default();
-    let base = (voters << 32) ^ ((logs as u64) << 40);
+    let base = (voters << 32) ^ ((logs as u64) << 40) ^ (u64::from(fast) << 48);
     let mut first = None;
     twice(base, |source| {
-        let (record, counters) = explore_one(source, voters, logs, 0);
+        let (record, counters) = explore_one(source, voters, logs, fast, 0);
         first = Some(counters);
         Ok::<_, String>(record)
     })
     .unwrap_or_else(|refusal| panic!("{voters} voters, {logs} logs: {refusal}"));
     total.add(&first.unwrap());
     for seed in 1..seeds {
-        let (_, counters) = explore_one(Source::Seed(base ^ seed), voters, logs, seed);
+        let (_, counters) = explore_one(Source::Seed(base ^ seed), voters, logs, fast, seed);
         total.add(&counters);
     }
     total
@@ -1039,9 +1098,9 @@ enum Floor {
     Rare,
 }
 
-/// Every named path the explorer claims, with its floor.
-fn coverage(counted: &Counters) -> [(&'static str, u64, Floor); 11] {
-    [
+/// Every named path the explorer claims, with its floor; on the fast track, its own two besides.
+fn coverage(counted: &Counters, fast: bool) -> Vec<(&'static str, u64, Floor)> {
+    let mut paths = vec![
         ("elections won", counted.elections_won, Floor::Common),
         (
             "keyed commands applied",
@@ -1085,24 +1144,37 @@ fn coverage(counted: &Counters) -> [(&'static str, u64, Floor); 11] {
             counted.images_installed,
             Floor::Rare,
         ),
-    ]
+    ];
+    if fast {
+        paths.push((
+            "indexes committed by a fast quorum",
+            counted.fast_committed,
+            Floor::Rare,
+        ));
+        paths.push((
+            "fast proposals displaced and proposed again",
+            counted.displaced,
+            Floor::Common,
+        ));
+    }
+    paths
 }
 
 /// Explores three voters with three logs and five with two, and holds every floor.
 fn explore_and_check_coverage(seeds: u64) {
-    for (voters, logs) in [(3, 3), (5, 2)] {
-        let counted = explore(voters, logs, seeds);
+    for (voters, logs, fast) in [(3, 3, false), (5, 2, false), (3, 3, true), (5, 2, true)] {
+        let counted = explore(voters, logs, fast, seeds);
         eprintln!(
-            "explored {voters} voters x {logs} logs x {seeds} seeds x {STEPS} steps: {counted:?}"
+            "explored {voters} voters x {logs} logs x {seeds} seeds x {STEPS} steps, fast {fast}: {counted:?}"
         );
-        for (path, count, floor) in coverage(&counted) {
+        for (path, count, floor) in coverage(&counted, fast) {
             let least = match floor {
                 Floor::Common => seeds + 1,
                 Floor::Rare => 1,
             };
             assert!(
                 count >= least,
-                "{voters} voters, {logs} logs: {path}: {count} over {seeds} seeds, below its floor {least}"
+                "{voters} voters, {logs} logs, fast {fast}: {path}: {count} over {seeds} seeds, below its floor {least}"
             );
         }
     }
@@ -1164,7 +1236,7 @@ impl Logs for Unbarriered<'_> {
 fn a_member_that_does_not_wait_at_barriers_is_caught() {
     let caught = std::panic::catch_unwind(|| {
         for seed in 0..SEEDS_QUICK {
-            let mut cluster = Cluster::new(Source::Seed(seed), 3, 3);
+            let mut cluster = Cluster::new(Source::Seed(seed), 3, 3, false);
             cluster.mutant = Some((Merge::new(3).unwrap(), support::App::default()));
             for step in 0..STEPS {
                 let calm = (step / STRETCH) % 2 == 1;

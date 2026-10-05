@@ -332,7 +332,7 @@ storage that does not hold the cut (`first ≤ next[k] ≤ last + 1`).
 |---|---|---|
 | Logs | stated by the owner: `n ≥ 1`, at most `u32::MAX` (a log's number travels as a `u32`) | refused at open |
 | A log's member | its `hyper_raft::Limits`, derived from what the owner states of it (`docs/raft.md` §3.2) | the core's refusals |
-| What a log holds beyond its merge | `Limits::unmerged`, entries, stated by the owner: the retained log's bound between images | a leader refuses a client's proposal there (`Error::Capacity("unmerged")`); barriers are always taken, being what lets the merge move |
+| What a log holds beyond its merge | `Limits::unmerged`, entries, stated by the owner: the retained log's bound between images | a leader refuses a client's proposal there (`Error::Capacity("unmerged")`) and takes nothing from the fast track past it (`RawNode::cap_takes`, §9.1); barriers are always taken, being what lets the merge move |
 | The merge's work a call | the owner's budget in bytes, one command at least | the call stops; `Advance::more` says so |
 | The configurations kept (§5.4) | one for each change between the merge and what the log gave, so within `unmerged` and the log's own retained entries | grows with them only |
 | Barrier proposals | one a log for each pair of a term and a `latest` | nothing more is proposed |
@@ -423,10 +423,45 @@ a single group (`node_mut`: `ready`, persist, send, `on_persist`), with these di
   asked by the owner's leadership policy for every log it leads;
 - images at canonical cuts only, and their installation through `MultiLog::install` (§5).
 
-Refused at open, with reasons: the fast track (`Config::fast`: its displaced proposals and held
-entries are a second way into a log that barriers and the merge's reading were not designed
-against, and no owner runs it, `docs/raft.md` §3); `Config::apply_unpersisted` (a leader's entries
-given before they are durable are not in storage, where the merge reads).
+Refused at open, with its reason: `Config::apply_unpersisted` (a leader's entries given before they
+are durable are not in storage, where the merge reads).
+
+### 9.1 The fast track
+
+Each log may run the fast track (`Config::fast`, `docs/raft.md` §3.5): a member proposes a command
+by `MultiLog::propose_fast` to every voter of the command's log, each holds it beside its log, and
+the leader takes it into the log. The merge is unchanged: it reads what the logs committed, and an
+entry taken from the fast track is a log entry like any other once taken. Three rules keep the
+layer's other ways into a log what they were:
+- **Commands only, in place.** A fast proposal is a global command in log 0 or a keyed command in
+  its key's log. Anything else is refused at every member before the core sees it
+  (`Error::Violation`), so no member holds it: a barrier goes by the leader alone, whose one
+  barrier a global (§3.1) the fast track would bypass, and a misplaced command no member may
+  vote for.
+- **The bound holds.** A leader takes from the fast track only as far as `Limits::unmerged` past
+  its merge (`RawNode::cap_takes`, set at each fast-track message and after each merge call):
+  votes past the cap are kept within the core's bound on them and taken as the merge moves, so a
+  stalled merge stops the fast track's growth of a log as it stops a client's proposals there.
+  A leader that dropped such votes instead lost them for its term (a member says what it holds
+  once a term), and the log's fast track stalled until another entry took those indexes.
+- **The owner proposes again what was displaced.** A proposal another entry took the index of
+  comes back in its log's `Ready` (`Ready::displaced`); no member applies it, and the owner
+  proposes it again or answers that it was not taken, as for a single group.
+
+Each log's storage keeps the core's contract for what a member holds (`docs/raft.md` §3.5,
+"Storage").
+
+**Evidence.** `tests/layer.rs`: `a_command_proposed_by_the_fast_track_is_applied_alike_everywhere`
+(a keyed command and a global, each committed by the fast quorum, applied alike on every member),
+`a_fast_proposal_out_of_place_is_refused_and_no_member_holds_it`, and
+`a_leader_at_its_unmerged_bound_takes_nothing_by_the_fast_track` (the leader holds 6 entries past
+its merge at a bound of 6, and 21 without the cap; once the merge moves it takes what was voted).
+The explorer runs both shapes on the fast track beside the classic ones, every command proposed by
+it and each displaced one proposed again, under loss, duplication, partitions and crash-restarts:
+at the workspace's 16 seeds, 5 and 17 indexes committed by a fast quorum and 196 and 250 proposals
+displaced (three voters with three logs, five with two), every member's history alike
+(`tests/multilog.rs`). `tests/allocs.rs`: a fast proposal through the layer allocates what the
+core's own does.
 
 ## 10. What comes from where
 
@@ -510,4 +545,3 @@ where it is used with slates' reason, and the coverage floors are set from measu
 - Whether any owner gains: slates measured one log better for its groups (research §8); the
   measurements of §11 step 5 say what this core and layer show.
 - Changing `n` for a living group (a global command could move keys at an epoch); not designed.
-- The fast track over a multilog (§9).

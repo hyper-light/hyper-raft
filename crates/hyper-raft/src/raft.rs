@@ -18,7 +18,7 @@ use crate::{
     Configuration, NodeId, Tally,
     ahead::Early,
     catchup::{CatchUp, Staging, Stagings},
-    error::{Error, Result, StorageError},
+    error::{Dropped, Error, Result, StorageError},
     fast::{self, Decided, Proposals, Votes},
     log::Log,
     progress::{Progress, ProgressState, Tracker},
@@ -2945,10 +2945,13 @@ impl<S: Storage> Raft<S> {
     }
     fn propose(&mut self, message: &mut Message) -> Result<()> {
         if message.entries.is_empty() {
-            return Err(Error::ProposalDropped);
+            return Err(Error::ProposalDropped(Dropped::Empty));
         }
-        if self.tracker.get(self.id).is_none() || self.lead_transferee.is_some() {
-            return Err(Error::ProposalDropped);
+        if self.tracker.get(self.id).is_none() {
+            return Err(Error::ProposalDropped(Dropped::NotMember));
+        }
+        if self.lead_transferee.is_some() {
+            return Err(Error::ProposalDropped(Dropped::Transferring));
         }
         let last = self.log.last_index()?;
         let mut pending = self.pending_conf_index;
@@ -2958,7 +2961,7 @@ impl<S: Storage> Raft<S> {
             let plan = match Plan::of_entry(entry) {
                 Ok(None) => continue,
                 Ok(Some(plan)) => plan,
-                Err(_) => return Err(Error::ProposalDropped),
+                Err(_) => return Err(Error::ProposalDropped(Dropped::Malformed)),
             };
             let joint = self.tracker.configuration().is_joint();
             let leaves = plan.stated == 0;
@@ -2980,7 +2983,7 @@ impl<S: Storage> Raft<S> {
         }
         let entries = std::mem::take(&mut message.entries);
         if !self.append_entry(entries)? {
-            return Err(Error::ProposalDropped);
+            return Err(Error::ProposalDropped(Dropped::Uncommitted));
         }
         self.pending_conf_index = pending;
         self.bcast_append()
@@ -3352,7 +3355,7 @@ impl<S: Storage> Raft<S> {
 
     fn step_candidate(&mut self, kind: MessageType, message: Message) -> Result<()> {
         match kind {
-            MessageType::MsgPropose => Err(Error::ProposalDropped),
+            MessageType::MsgPropose => Err(Error::ProposalDropped(Dropped::NoLeader)),
             MessageType::MsgReadIndex => Self::drop_read(&message),
             MessageType::MsgAppend | MessageType::MsgHeartbeat | MessageType::MsgSnapshot
                 if self.state == StateRole::PreCandidate && self.suspects(message.from) =>
@@ -3416,7 +3419,7 @@ impl<S: Storage> Raft<S> {
         match kind {
             MessageType::MsgPropose => {
                 if self.leader_id == 0 {
-                    return Err(Error::ProposalDropped);
+                    return Err(Error::ProposalDropped(Dropped::NoLeader));
                 }
                 self.forward(message)
             }

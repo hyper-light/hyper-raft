@@ -66,7 +66,7 @@
 //! commits by the classic quorum until the next term.
 use crate::{
     NodeId,
-    error::{Error, Result},
+    error::{Dropped, Error, Result},
     fast::{self, Votes, same},
     log::{copy_entries_of, copy_entry},
     proto::{self, Entry, EntryType, Message},
@@ -129,7 +129,7 @@ impl<S: Storage> Raft<S> {
             return Err(Error::Settings("the group has no fast track"));
         }
         if data.is_empty() {
-            return Err(Error::ProposalDropped);
+            return Err(Error::ProposalDropped(Dropped::Empty));
         }
         if self.msgs.len() >= self.config.limits.pending_messages {
             return Err(Error::Capacity("messages that wait to be taken"));
@@ -153,7 +153,7 @@ impl<S: Storage> Raft<S> {
         }
         // One that knows no leader proposes to no one who could decide.
         if self.leader_id == 0 {
-            return Err(Error::ProposalDropped);
+            return Err(Error::ProposalDropped(Dropped::NoLeader));
         }
         if self.displaced.len() >= self.config.limits.proposals {
             return Err(Error::Capacity("proposals whose end was not taken"));

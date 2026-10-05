@@ -1188,7 +1188,7 @@ fn a_leader_holds_uncommitted_what_it_may_and_one_proposal_at_least() {
     assert_eq!(node.raft.uncommitted_bytes(), 200);
     assert_eq!(
         node.propose(vec![], vec![2; 1]),
-        Err(Error::ProposalDropped)
+        Err(Error::ProposalDropped(crate::Dropped::Uncommitted))
     );
     drain(&mut node);
     let mut append = answer(MessageType::MsgAppendResponse, 2, 1, 1);
@@ -1200,7 +1200,7 @@ fn a_leader_holds_uncommitted_what_it_may_and_one_proposal_at_least() {
     node.propose(vec![], vec![3; 24]).unwrap();
     assert_eq!(
         node.propose(vec![], vec![4; 1]),
-        Err(Error::ProposalDropped)
+        Err(Error::ProposalDropped(crate::Dropped::Uncommitted))
     );
 }
 
@@ -1694,7 +1694,10 @@ fn a_change_that_cannot_be_read_is_not_proposed() {
         ..Message::default()
     };
     proposal.entries = vec![garbled];
-    assert_eq!(node.step(proposal), Err(Error::ProposalDropped));
+    assert_eq!(
+        node.step(proposal),
+        Err(Error::ProposalDropped(crate::Dropped::Malformed))
+    );
     assert_eq!(node.raft.log().last_index().unwrap(), 1);
 }
 
@@ -4274,4 +4277,83 @@ fn a_commit_counted_by_the_configuration_applied_is_not_made() {
         nodes[0].raft.log().committed() < first,
         "A's first entry committed by A and C, a majority of the voters before the change alone"
     );
+}
+
+/// A proposal dropped says why (`Dropped`): one with no entry, or whose change does not decode, is
+/// the caller's bug; one a member cannot take now is to retry or redirect: a follower that knows no
+/// leader, a candidate, a leader handing over, a leader the configuration it leads names no member,
+/// a leader at its bound of what it holds uncommitted (`a_leader_holds_uncommitted_what_it_may_and_one_proposal_at_least`,
+/// `a_change_that_cannot_be_read_is_not_proposed`).
+#[test]
+fn a_dropped_proposal_says_why() {
+    use crate::Dropped;
+    use crate::proto::ConfChangeType;
+    // No entry.
+    let mut node = leader();
+    let empty = Message {
+        msg_type: MessageType::MsgPropose,
+        from: 1,
+        to: 1,
+        ..Message::default()
+    };
+    assert_eq!(
+        node.step(empty),
+        Err(Error::ProposalDropped(Dropped::Empty))
+    );
+    assert!(Dropped::Empty.is_callers_bug() && Dropped::Malformed.is_callers_bug());
+    // A follower that knows no leader.
+    let mut alone = RawNode::new(&config(2), Memory::with_voters(&[1, 2, 3])).unwrap();
+    assert_eq!(
+        alone.propose(vec![], b"x".to_vec()),
+        Err(Error::ProposalDropped(Dropped::NoLeader))
+    );
+    // A candidate.
+    let mut candidate = RawNode::new(&config(1), Memory::with_voters(&[1, 2, 3])).unwrap();
+    candidate.campaign().unwrap();
+    assert_eq!(candidate.raft.state(), StateRole::PreCandidate);
+    assert_eq!(
+        candidate.propose(vec![], b"x".to_vec()),
+        Err(Error::ProposalDropped(Dropped::NoLeader))
+    );
+    // A leader handing over.
+    let mut handing = reading_leader();
+    handing
+        .step(answer(MessageType::MsgTransferLeader, 3, 1, 1))
+        .unwrap();
+    assert_eq!(
+        handing.propose(vec![], b"x".to_vec()),
+        Err(Error::ProposalDropped(Dropped::Transferring))
+    );
+    // A leader that wrote its own removal leads until it is committed, and takes no proposal.
+    let mut leaving = reading_leader();
+    leaving
+        .propose_conf_change(vec![], &single(ConfChangeType::RemoveNode, 1))
+        .unwrap();
+    assert!(!leaving.raft.configuration().contains(1));
+    assert_eq!(
+        leaving.propose(vec![], b"x".to_vec()),
+        Err(Error::ProposalDropped(Dropped::NotMember))
+    );
+    // The fast track's: no data, and a member that knows no leader to propose by.
+    let fast = Config {
+        fast: true,
+        ..config(2)
+    };
+    let mut proposer = RawNode::new(&fast, Memory::with_voters(&[1, 2, 3])).unwrap();
+    assert_eq!(
+        proposer.propose_fast(vec![], vec![]),
+        Err(Error::ProposalDropped(Dropped::Empty))
+    );
+    assert_eq!(
+        proposer.propose_fast(vec![], b"x".to_vec()),
+        Err(Error::ProposalDropped(Dropped::NoLeader))
+    );
+    for reason in [
+        Dropped::NoLeader,
+        Dropped::Transferring,
+        Dropped::NotMember,
+        Dropped::Uncommitted,
+    ] {
+        assert!(!reason.is_callers_bug(), "{reason:?}");
+    }
 }

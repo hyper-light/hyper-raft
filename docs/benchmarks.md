@@ -6169,40 +6169,66 @@ M5 Max, 18 cores, 128 GiB, macOS 26.4.1), shared with other sessions' builds and
 ## The multilog explorer
 
 slates' explorer retargeted (`crates/hyper-multilog/tests/multilog.rs`, `docs/multilog.md` §11
-step 4) on hyper-sim's free discipline: any delivery order, messages dropped and duplicated, the
-network's capacity, partitions, crashes restarting from the last image, images and every log
-compacted at canonical cuts, snapshots installed by laggards. Raft's invariants per log and the
-merge's history across members and restarts are checked after every step; the first seed of each
-shape runs through `twice`. Three voters with three logs and five with two, 3,000 steps a seed.
+step 4) on hyper-sim's free discipline: any delivery order, messages dropped and duplicated,
+partitions, crashes restarting from the last image, images and every log compacted at canonical
+cuts, snapshots installed by laggards, and, in their shapes, the fast track and resizes. Raft's
+invariants per log and the merge's history across members and restarts are checked after every
+step; the first seed of each shape runs through `twice`.
 
-| Path | 3 × 3, 16 seeds | 5 × 2, 16 seeds | 3 × 3, 200 seeds | 5 × 2, 200 seeds | Floor |
-|---|---|---|---|---|---|
-| elections won | 531 | 255 | 6,665 | 3,167 | common |
-| keyed commands applied | 5,918 | 7,687 | 72,649 | 95,938 | common |
-| global commands applied | 824 | 1,046 | 8,751 | 14,892 | common |
-| barriers proposed | 439 | 272 | 5,449 | 3,658 | common |
-| members crashed and restarted | 751 | 735 | 9,343 | 9,177 | common |
-| restarted members' replays matched | 6,170 | 8,079 | 73,771 | 103,325 | common |
-| messages dropped | 4,175 | 5,096 | 55,400 | 62,515 | common |
-| messages duplicated | 527 | 612 | 6,633 | 7,801 | common |
-| proposals refused | 578 | 443 | 6,793 | 5,666 | common |
-| images taken and every log compacted | 240 | 391 | 3,088 | 4,514 | common |
-| images installed from a log's snapshot | 13 | 17 | 198 | 221 | rare |
-| messages past the network's capacity | 0 | 0 | 0 | 483 | not claimed |
+**Its scale, measured** (`measure_the_scale`, release, 2026-10-05). slates' numbers were a
+neighbour's (3,000 steps, stretches of 200, 96 proposals, 12 keys, one global in 6, its hundred
+actions); each was swept down, in the order of the table below, to the least at which, with every
+number before it at its own least, every claimed path holds its floor over 59 seeds of each of the
+six shapes and the planted defect (a merge that passes barriers) is caught. Seeds: 59, the least
+count with 1 − 0.95ⁿ ≥ 0.95 (Wilks's one-sided 95/95): a campaign of 59 histories that all pass says
+at least 95% of histories at this scale pass, with 95% confidence. The planted defect is caught at
+all 59, so its per-seed catch rate asks for no more. The network's bound is the most messages any
+history held in flight with no bound (142), so none is lost to it.
 
-A floor is `docs/sim.md` §4.4's: a common path more than once a seed (above 16 and above 200), a
-rare one at least once a campaign. Every path but installs ran more than once a seed at both scales
-and both shapes; installs ran 0.8 to 1.1 times a seed, so they are held to the rare floor. The
-network's capacity was reached only at full scale with five voters, so it is counted and not
-claimed. A member that applies past a barrier without waiting is caught at seed 0, step 273
-(`a_member_that_does_not_wait_at_barriers_is_caught`).
+| Number | slates' | Least that holds | Fails at |
+|---|---|---|---|
+| steps | 3,000 | 431 | 430 |
+| stretch | 200 | 75 | 74 |
+| proposals | 96 | 18 | 17 |
+| keys | 12 | 10 | 9 |
+| one global in | 6 | 6 | 5 |
+| deliver | 40 | 40 | 39 |
+| heartbeat | 8 | 1 | — |
+| propose | 8 | 6 | 5 |
+| barriers | 9 | 6 | 5 |
+| drop, duplicate | 3, 3 | 1, 1 | — |
+| time out | 14 | 3 | 2 |
+| tick | 10 | 7 | 6 |
+| crash, isolate, image, resize | 3, 2, 4, 1 | 1 each | — |
 
-The full-scale run: release, 2026-10-04 10:29 PDT, 4.51 s, load average 2.25 at its start and 2.60
-at its end; the 16-seed run is the workspace's debug run, the same minute (load 2.55–2.83).
+The sweep also found a check of the explorer's that was wrong: it held every member's committed
+entries to one term at an index, and the fast track commits an entry that a later leader's election
+takes again under its own term, so two members hold it under two terms (`docs/models/README.md`,
+`LogMatching`). It now compares what entries state. The paths at that scale:
+
+| Path | 3 × 3 | 3 × 3 fast | 3 × 3 resize | 5 × 2 | 5 × 2 fast | 5 × 2 resize | Floor |
+|---|---|---|---|---|---|---|---|
+| elections won | 260 | 295 | 345 | 176 | 167 | 211 | common |
+| keyed commands applied | 1,783 | 1,856 | 1,562 | 3,387 | 3,715 | 2,760 | common |
+| global commands applied | 259 | 281 | 272 | 747 | 646 | 491 | common |
+| barriers proposed | 229 | 268 | 694 | 177 | 210 | 415 | common |
+| commands applied from the least used log | 210 | 182 | 98 | 940 | 1,000 | 551 | common |
+| members crashed and restarted | 166 | 198 | 202 | 203 | 179 | 191 | common |
+| messages dropped | 1,012 | 1,194 | 1,105 | 1,202 | 1,344 | 1,049 | common |
+| messages duplicated | 84 | 91 | 97 | 114 | 113 | 104 | common |
+| images taken | 102 | 113 | 91 | 128 | 143 | 102 | common |
+| images installed | 2 | 6 | 2 | 3 | 5 | 4 | rare |
+| committed by a fast quorum | — | 22 | — | — | 76 | — | rare |
+| fast proposals displaced | — | 65 | — | — | 164 | — | common |
+| resizes applied | — | — | 466 | — | — | 951 | common |
+| refused as a resize moved their key | — | — | 151 | — | — | 90 | common |
+
+A floor is `docs/sim.md` §4.4's: a common path more than once a seed (above 59), a rare one at least
+once. Load 20–25 beside other sessions' work.
 
 ```sh
 cargo test -p hyper-multilog --test multilog
-cargo test --release -p hyper-multilog --test multilog -- --ignored the_multi_log_merges_alike_at_full_scale --nocapture
+cargo test --release -p hyper-multilog --test multilog -- --ignored measure_the_scale --nocapture
 ```
 
 ## Allocations on the hot paths

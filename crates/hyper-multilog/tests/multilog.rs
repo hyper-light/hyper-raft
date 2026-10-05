@@ -35,7 +35,7 @@ mod support;
 use std::collections::{BTreeMap, BTreeSet};
 
 use hyper_multilog::{Applied, Command, Flow, Limits, Logs, Merge, Route, entry, log_of};
-use hyper_raft::proto::{Entry, Message};
+use hyper_raft::proto::{Entry, EntryType, Message};
 use hyper_raft::wire::Record;
 use hyper_raft::{StateRole, StorageError};
 use hyper_sim::net::{Net, NetLimits, Path, Ticket};
@@ -174,7 +174,9 @@ fn advance(
                 }) => {
                     out.push((log, key, data.to_vec(), epoch));
                 }
-                Applied::Refused { .. } => panic!("refused {applied:?}"),
+                Applied::Refused { .. } | Applied::Resized { .. } => {
+                    panic!("refused or resized: {applied:?}")
+                }
             }
             Flow::Continue
         })
@@ -433,29 +435,105 @@ fn each_log_hands_off_to_its_preferred_voter() {
 
 // --- slates' explorer (`crates/cluster/tests/multilog.rs`) on hyper-sim ---
 
-/// Shape: the seeds each shape is explored under at full scale, and in the workspace's debug run
-/// (slates' own).
-const SEEDS_FULL: u64 = 200;
-const SEEDS_QUICK: u64 = 16;
-/// Shape: the steps one seeded history runs (slates').
-const STEPS: usize = 3_000;
-/// Shape: a history alternates adversarial and calm stretches of this many steps, as slates'
-/// explorers do, so elections settle and commands commit between the faults (slates measured five
-/// voters committing 108 entries over 400 seeds without them).
-const STRETCH: usize = 200;
-/// Shape: what the network holds in flight, the oldest lost past it and counted (slates').
-const IN_FLIGHT_BOUND: usize = 512;
-/// Shape: the commands a history proposes at most, keyed and global (slates').
-const PROPOSALS_BOUND: u64 = 96;
-/// Shape: the keys the commands write: few, so every key collects a history across several epochs
-/// (slates').
-const KEYS: u64 = 12;
-/// Shape: one command in this many is global (slates').
-const GLOBAL_EVERY: u64 = 6;
-/// Shape: the actions one step chooses among: slates' hundred, and four more, in which a member
-/// drawn takes an image at the next global command it applies and compacts every log to it
-/// (`docs/multilog.md` §5), so that restarts start from images and laggards are sent snapshots.
-const ACTIONS: u64 = 104;
+/// What one step's actions weigh: a step draws one in proportion to its weight.
+#[derive(Clone, Copy, Debug)]
+struct Weights {
+    deliver: u64,
+    heartbeat: u64,
+    propose: u64,
+    barriers: u64,
+    drop: u64,
+    duplicate: u64,
+    time_out: u64,
+    tick: u64,
+    crash: u64,
+    isolate: u64,
+    image: u64,
+    resize: u64,
+}
+
+impl Weights {
+    fn total(&self) -> u64 {
+        self.deliver
+            + self.heartbeat
+            + self.propose
+            + self.barriers
+            + self.drop
+            + self.duplicate
+            + self.time_out
+            + self.tick
+            + self.crash
+            + self.isolate
+            + self.image
+            + self.resize
+    }
+}
+
+/// What a step does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Act {
+    Deliver,
+    Heartbeat,
+    Propose,
+    Barriers,
+    Drop,
+    Duplicate,
+    TimeOut,
+    Tick,
+    Crash,
+    Isolate,
+    Image,
+    Resize,
+}
+
+/// The explorer's scale: each number stated where [`SCALE`] gives it.
+#[derive(Clone, Copy, Debug)]
+struct Scale {
+    /// The steps one seeded history runs.
+    steps: usize,
+    /// A history alternates adversarial and calm stretches of this many steps.
+    stretch: usize,
+    /// The commands a history proposes at most, keyed and global.
+    proposals: u64,
+    /// The keys the commands write.
+    keys: u64,
+    /// One command in this many is global.
+    global_every: u64,
+    /// What the network holds in flight, the oldest lost past it and counted.
+    in_flight: usize,
+    weights: Weights,
+}
+
+/// The scale the explorer runs at, measured by [`measure_the_scale`] (2026-10-05): from slates'
+/// shape (3,000 steps, stretches of 200, 96 proposals, 12 keys, one global in 6, its hundred
+/// actions, four image actions and one resize), each number in the order listed went down to the
+/// least at which, with every number before it at its own least, every path [`coverage`] claims
+/// holds its floor over [`WILKS_SEEDS`] seeds of every shape and the planted defect is caught. The
+/// network's bound is the most messages any of those histories held in flight at once, with no
+/// bound: no message is lost to it, only to the explorer's own drops.
+const SCALE: Scale = Scale {
+    steps: 431,
+    stretch: 75,
+    proposals: 18,
+    keys: 10,
+    global_every: 6,
+    in_flight: 142,
+    weights: Weights {
+        deliver: 40,
+        heartbeat: 1,
+        propose: 6,
+        barriers: 6,
+        drop: 1,
+        duplicate: 1,
+        time_out: 3,
+        tick: 7,
+        crash: 1,
+        isolate: 1,
+        image: 1,
+        resize: 1,
+    },
+};
+
 /// Shape: the world steps one action may take: a network tick delivers a message for each member,
 /// a drop or a duplicate one.
 const WORLD_STEPS_PER_ACTION: u64 = 5;
@@ -496,6 +574,15 @@ pub struct Counters {
     pub fast_committed: u64,
     /// Fast proposals another entry took the index of, each proposed again by its member.
     pub displaced: u64,
+    /// Resizes applied, by every member, all told.
+    pub resizes: u64,
+    /// Keyed commands refused for their log after a resize routed their key elsewhere.
+    pub misrouted: u64,
+    /// The most messages the network held in flight at once, over every history.
+    pub most_in_flight: u64,
+    /// The fewest commands any log the group began with gave the members to apply, over a
+    /// history's members: the explorer exercises every log, or this says which it left idle.
+    pub least_log_applied: u64,
 }
 
 impl Counters {
@@ -514,6 +601,10 @@ impl Counters {
         self.images_installed += other.images_installed;
         self.fast_committed += other.fast_committed;
         self.displaced += other.displaced;
+        self.resizes += other.resizes;
+        self.misrouted += other.misrouted;
+        self.most_in_flight = self.most_in_flight.max(other.most_in_flight);
+        self.least_log_applied += other.least_log_applied;
     }
 }
 
@@ -524,12 +615,12 @@ struct Cluster {
     members: Vec<Member>,
     streams: Streams,
     isolated: Option<u64>,
-    /// Per (log, term), the leader seen.
-    leaders: BTreeMap<(usize, u64), u64>,
-    /// Per member and log, whether it led after the last step.
-    leading: BTreeSet<(u64, usize)>,
-    /// Per (log, index), the entry first seen committed there.
-    committed: BTreeMap<(usize, u64), (u64, Vec<u8>)>,
+    /// Per (log, generation, term), the leader seen.
+    leaders: BTreeMap<(usize, u32, u64), u64>,
+    /// Per member, log and generation, whether it led after the last step.
+    leading: BTreeSet<(u64, usize, u32)>,
+    /// Per (log, generation, index), the entry first seen committed there.
+    committed: BTreeMap<(usize, u32, u64), (EntryType, Vec<u8>)>,
     /// The history every member's application must be a prefix of: per key, the longest seen.
     reference: History,
     proposals: u64,
@@ -544,8 +635,14 @@ struct Cluster {
     mutant: Option<(Merge, support::App)>,
     /// Whether the group runs the fast track: each command is proposed by it.
     fast: bool,
+    /// Whether members propose to change the count of logs, to between one and one more than the
+    /// group began with.
+    resize: bool,
+    /// The count of logs the group began with.
+    logs: usize,
     /// Fast commits counted by members before their last restart.
     fast_folded: u64,
+    scale: Scale,
 }
 
 /// The world's streams the explorer draws from, one a source.
@@ -557,14 +654,33 @@ struct Streams {
 }
 
 impl Cluster {
-    fn new(source: Source, voters: u64, logs: usize, fast: bool) -> Self {
-        let world_steps = STEPS as u64 * WORLD_STEPS_PER_ACTION;
+    fn new(
+        source: Source,
+        voters: u64,
+        logs: usize,
+        fast: bool,
+        resize: bool,
+        scale: Scale,
+    ) -> Self {
+        let scale = if resize {
+            scale
+        } else {
+            Scale {
+                weights: Weights {
+                    resize: 0,
+                    ..scale.weights
+                },
+                ..scale
+            }
+        };
+        let world_steps = scale.steps as u64 * WORLD_STEPS_PER_ACTION;
         let limits = hyper_sim::Limits {
-            events: 2 * IN_FLIGHT_BOUND,
+            // A message in flight is one arrival, and a duplicate of it one more.
+            events: 2 * scale.in_flight,
             nodes: voters as usize,
             streams: 16 + (voters * voters) as usize * 3,
             steps: world_steps,
-            trace_words: (STEPS as u64 * WORDS_PER_ACTION) as usize,
+            trace_words: (scale.steps as u64 * WORDS_PER_ACTION) as usize,
         };
         let mut world = World::new(source, Discipline::Free, limits).unwrap();
         for _ in 0..voters {
@@ -581,8 +697,8 @@ impl Cluster {
             links: 0,
             nats: 0,
             link_messages: 0,
-            messages: IN_FLIGHT_BOUND,
-            bytes: IN_FLIGHT_BOUND * support::MESSAGE,
+            messages: scale.in_flight,
+            bytes: scale.in_flight * support::MESSAGE,
         });
         net.set_path(Path::NONE);
         let ids: Vec<u64> = (1..=voters).collect();
@@ -614,7 +730,10 @@ impl Cluster {
             checked: vec![BTreeMap::new(); voters as usize],
             mutant: None,
             fast,
+            resize,
+            logs,
             fast_folded: 0,
+            scale,
         }
     }
 
@@ -727,21 +846,35 @@ impl Cluster {
         self.draw(self.streams.member, voters) + 1
     }
 
+    /// A log some member holds now: members whose merges are at another count hold others.
     fn pick_log(&mut self) -> usize {
-        let logs = self.members[0].logs as u64;
+        let logs = self.members.iter().map(|member| member.logs).max().unwrap() as u64;
         self.draw(self.streams.log, logs) as usize
+    }
+
+    /// Member `at` proposes to change the count of logs (`docs/multilog.md` §3.5).
+    fn propose_resize(&mut self, at: u64) {
+        let logs = self.draw(self.streams.log, self.logs as u64 + 1) as usize + 1;
+        if self.members[at as usize - 1]
+            .multi
+            .propose_resize(logs)
+            .is_err()
+        {
+            self.counters.proposals_refused += 1;
+        }
+        self.settle(at);
     }
 
     /// A command, keyed to one of [`KEYS`] or, one in [`GLOBAL_EVERY`], global, proposed at a
     /// member drawn: appended where it leads the log the command routes to, forwarded otherwise.
     fn propose(&mut self) {
-        if self.proposals >= PROPOSALS_BOUND {
+        if self.proposals >= self.scale.proposals {
             return;
         }
-        let route = if self.draw(self.streams.command, GLOBAL_EVERY) == 0 {
+        let route = if self.draw(self.streams.command, self.scale.global_every) == 0 {
             Route::Global
         } else {
-            Route::Key(self.draw(self.streams.command, KEYS))
+            Route::Key(self.draw(self.streams.command, self.scale.keys))
         };
         let at = self.pick_member();
         self.proposals += 1;
@@ -783,11 +916,9 @@ impl Cluster {
 
     /// Member `at` times out in `log`: it campaigns, by pre-vote.
     fn time_out(&mut self, at: u64, log: usize) {
-        let _ = self.members[at as usize - 1]
-            .multi
-            .node_mut(log)
-            .unwrap()
-            .campaign();
+        if let Some(node) = self.members[at as usize - 1].multi.node_mut(log) {
+            let _ = node.campaign();
+        }
         self.settle(at);
     }
 
@@ -829,6 +960,8 @@ impl Cluster {
         folded.refused += counts.refused;
         folded.images += counts.images;
         folded.installed += counts.installed;
+        folded.resizes += counts.resizes;
+        folded.misrouted += counts.misrouted;
         self.fast_folded += fast_committed(member);
         // What it waited on to propose again is lost with it.
         member.displaced.clear();
@@ -862,16 +995,47 @@ impl Cluster {
         }
     }
 
+    /// The action a step draws, in proportion to [`Scale::weights`].
+    fn act(&mut self) -> Act {
+        let w = self.scale.weights;
+        let mut roll = self.draw(self.streams.action, w.total());
+        for (act, weight) in [
+            (Act::Deliver, w.deliver),
+            (Act::Heartbeat, w.heartbeat),
+            (Act::Propose, w.propose),
+            (Act::Barriers, w.barriers),
+            (Act::Drop, w.drop),
+            (Act::Duplicate, w.duplicate),
+            (Act::TimeOut, w.time_out),
+            (Act::Tick, w.tick),
+            (Act::Crash, w.crash),
+            (Act::Isolate, w.isolate),
+            (Act::Image, w.image),
+            (Act::Resize, w.resize),
+        ] {
+            if roll < weight {
+                return act;
+            }
+            roll -= weight;
+        }
+        Act::Deliver
+    }
+
     fn step(&mut self, calm: bool) {
+        self.counters.most_in_flight = self
+            .counters
+            .most_in_flight
+            .max(self.world.pending() as u64);
         if calm && self.isolated.is_some() {
             self.isolate(None);
         }
-        let roll = self.draw(self.streams.action, ACTIONS);
-        if calm && matches!(roll, 60..=65 | 90..=94) {
+        let act = self.act();
+        // A calm stretch loses, duplicates and crashes nothing, and partitions no one.
+        if calm && matches!(act, Act::Drop | Act::Duplicate | Act::Crash | Act::Isolate) {
             return;
         }
-        match roll {
-            0..=39 => {
+        match act {
+            Act::Deliver => {
                 for _ in 0..self.members.len() {
                     if self.world.pending() == 0 {
                         break;
@@ -879,45 +1043,42 @@ impl Cluster {
                     self.deliver_one();
                 }
             }
-            40..=47 => {
+            Act::Heartbeat => {
                 let log = self.pick_log();
                 self.heartbeat(log);
             }
-            48..=55 => self.propose(),
-            56..=59 => {
+            Act::Propose => self.propose(),
+            Act::Barriers => {
                 let at = self.pick_member();
                 self.barriers(at);
             }
-            60..=62 => {
+            Act::Drop => {
                 if self.world.pending() > 0 {
                     self.drop_one();
                 }
             }
-            63..=65 => {
+            Act::Duplicate => {
                 if self.world.pending() > 0 {
                     self.duplicate_one();
                 }
             }
-            66..=79 => {
+            Act::TimeOut => {
                 let (at, log) = (self.pick_member(), self.pick_log());
                 let leader_known = self.members[at as usize - 1]
                     .multi
                     .node(log)
-                    .unwrap()
-                    .raft
-                    .leader_id()
-                    != 0;
+                    .is_some_and(|node| node.raft.leader_id() != 0);
                 if calm && leader_known {
                     return;
                 }
                 self.time_out(at, log);
             }
-            80..=89 => self.tick_all(),
-            90..=92 => {
+            Act::Tick => self.tick_all(),
+            Act::Crash => {
                 let at = self.pick_member();
                 self.crash(at);
             }
-            93..=94 => {
+            Act::Isolate => {
                 let at = if self.isolated.is_none() {
                     Some(self.pick_member())
                 } else {
@@ -925,15 +1086,17 @@ impl Cluster {
                 };
                 self.isolate(at);
             }
-            100..=103 => {
+            Act::Image => {
                 let at = self.pick_member();
                 if self.mutant.is_none() {
                     self.members[at as usize - 1].image_at_next_global = true;
                 }
             }
-            _ => {
-                let at = self.pick_member();
-                self.barriers(at);
+            Act::Resize => {
+                if self.resize {
+                    let at = self.pick_member();
+                    self.propose_resize(at);
+                }
             }
         }
     }
@@ -951,30 +1114,38 @@ impl Cluster {
         let member = &self.members[id as usize - 1];
         for log in 0..member.logs {
             let raft = &member.multi.node(log).unwrap().raft;
+            let generation = member.multi.generation(log).unwrap();
             if raft.state() == StateRole::Leader {
-                let previous = *self.leaders.entry((log, raft.term())).or_insert(id);
+                let previous = *self
+                    .leaders
+                    .entry((log, generation, raft.term()))
+                    .or_insert(id);
                 assert_eq!(
                     previous,
                     id,
                     "{at}: two leaders of term {} in log {log}",
                     raft.term()
                 );
-                if self.leading.insert((id, log)) {
+                if self.leading.insert((id, log, generation)) {
                     self.counters.elections_won += 1;
                 }
             } else {
-                self.leading.remove(&(id, log));
+                self.leading.remove(&(id, log, generation));
             }
             let disk = &member.multi.node(log).unwrap().store().0;
             let commit = raft.log().committed().min(disk.last_index());
+            // What a committed entry states is one at each index (state machine safety). Its term
+            // may differ between members: a later leader's election takes an entry the fast track
+            // committed again under its own term, and a member that committed it keeps the stamp
+            // it had (`docs/models/README.md`, `LogMatching`; `docs/raft.md` §3.5).
             for entry in disk.entries.iter().filter(|entry| entry.index <= commit) {
                 let first = self
                     .committed
-                    .entry((log, entry.index))
-                    .or_insert_with(|| (entry.term, entry.data.clone()));
+                    .entry((log, generation, entry.index))
+                    .or_insert_with(|| (entry.entry_type, entry.data.clone()));
                 assert_eq!(
                     first,
-                    &(entry.term, entry.data.clone()),
+                    &(entry.entry_type, entry.data.clone()),
                     "{at}: log {log} committed two entries at {}",
                     entry.index
                 );
@@ -1035,8 +1206,19 @@ impl Cluster {
                 member.counts.barriers_proposed + folded.barriers_proposed;
             counters.images_taken += member.counts.images + folded.images;
             counters.images_installed += member.counts.installed + folded.installed;
+            counters.resizes += member.counts.resizes + folded.resizes;
+            counters.misrouted += member.counts.misrouted + folded.misrouted;
         }
         counters.overflowed = self.net.stats().dropped_capacity;
+        counters.least_log_applied = (0..self.logs)
+            .map(|log| {
+                self.members
+                    .iter()
+                    .map(|member| member.app.logs.get(&(log as u64)).map_or(0, Vec::len) as u64)
+                    .sum::<u64>()
+            })
+            .min()
+            .unwrap_or(0);
         counters.fast_committed =
             self.fast_folded + self.members.iter().map(fast_committed).sum::<u64>();
         counters
@@ -1056,12 +1238,12 @@ fn explore_one(
     source: Source,
     voters: u64,
     logs: usize,
-    fast: bool,
+    shape: Shape,
     seed: u64,
 ) -> (SimRecord, Counters) {
-    let mut cluster = Cluster::new(source, voters, logs, fast);
-    for step in 0..STEPS {
-        let calm = (step / STRETCH) % 2 == 1;
+    let mut cluster = Cluster::new(source, voters, logs, shape.fast, shape.resize, shape.scale);
+    for step in 0..shape.scale.steps {
+        let calm = (step / shape.scale.stretch) % 2 == 1;
         cluster.step(calm);
         cluster.check(&format!("seed {seed} step {step}"));
     }
@@ -1071,19 +1253,30 @@ fn explore_one(
 
 /// Explores `seeds` histories of `voters` voters holding `logs` logs each, the first through the
 /// run-twice check (`docs/sim.md` §3.9); what they counted.
-fn explore(voters: u64, logs: usize, fast: bool, seeds: u64) -> Counters {
+/// What a campaign's groups do beside the classic track: the fast track, resizes.
+#[derive(Clone, Copy, Debug)]
+struct Shape {
+    fast: bool,
+    resize: bool,
+    scale: Scale,
+}
+
+fn explore(voters: u64, logs: usize, shape: Shape, seeds: u64) -> Counters {
     let mut total = Counters::default();
-    let base = (voters << 32) ^ ((logs as u64) << 40) ^ (u64::from(fast) << 48);
+    let base = (voters << 32)
+        ^ ((logs as u64) << 40)
+        ^ (u64::from(shape.fast) << 48)
+        ^ (u64::from(shape.resize) << 49);
     let mut first = None;
     twice(base, |source| {
-        let (record, counters) = explore_one(source, voters, logs, fast, 0);
+        let (record, counters) = explore_one(source, voters, logs, shape, 0);
         first = Some(counters);
         Ok::<_, String>(record)
     })
     .unwrap_or_else(|refusal| panic!("{voters} voters, {logs} logs: {refusal}"));
     total.add(&first.unwrap());
     for seed in 1..seeds {
-        let (_, counters) = explore_one(Source::Seed(base ^ seed), voters, logs, fast, seed);
+        let (_, counters) = explore_one(Source::Seed(base ^ seed), voters, logs, shape, seed);
         total.add(&counters);
     }
     total
@@ -1099,7 +1292,7 @@ enum Floor {
 }
 
 /// Every named path the explorer claims, with its floor; on the fast track, its own two besides.
-fn coverage(counted: &Counters, fast: bool) -> Vec<(&'static str, u64, Floor)> {
+fn coverage(counted: &Counters, shape: Shape) -> Vec<(&'static str, u64, Floor)> {
     let mut paths = vec![
         ("elections won", counted.elections_won, Floor::Common),
         (
@@ -1127,6 +1320,11 @@ fn coverage(counted: &Counters, fast: bool) -> Vec<(&'static str, u64, Floor)> {
             counted.replays_matched,
             Floor::Common,
         ),
+        (
+            "commands applied from the least used log",
+            counted.least_log_applied,
+            Floor::Common,
+        ),
         ("messages dropped", counted.dropped, Floor::Common),
         ("messages duplicated", counted.duplicated, Floor::Common),
         (
@@ -1145,7 +1343,15 @@ fn coverage(counted: &Counters, fast: bool) -> Vec<(&'static str, u64, Floor)> {
             Floor::Rare,
         ),
     ];
-    if fast {
+    if shape.resize {
+        paths.push(("resizes applied", counted.resizes, Floor::Common));
+        paths.push((
+            "keyed commands refused as a resize moved their key",
+            counted.misrouted,
+            Floor::Common,
+        ));
+    }
+    if shape.fast {
         paths.push((
             "indexes committed by a fast quorum",
             counted.fast_committed,
@@ -1162,38 +1368,78 @@ fn coverage(counted: &Counters, fast: bool) -> Vec<(&'static str, u64, Floor)> {
 
 /// Explores three voters with three logs and five with two, and holds every floor.
 fn explore_and_check_coverage(seeds: u64) {
-    for (voters, logs, fast) in [(3, 3, false), (5, 2, false), (3, 3, true), (5, 2, true)] {
-        let counted = explore(voters, logs, fast, seeds);
-        eprintln!(
-            "explored {voters} voters x {logs} logs x {seeds} seeds x {STEPS} steps, fast {fast}: {counted:?}"
-        );
-        for (path, count, floor) in coverage(&counted, fast) {
+    if let Err(fault) = coverage_holds(SCALE, seeds, true) {
+        panic!("{fault}");
+    }
+}
+
+/// Explores every shape at `scale` over `seeds` and holds every path to its floor: the floor
+/// missed, if one is.
+fn coverage_holds(scale: Scale, seeds: u64, print: bool) -> Result<(), String> {
+    let classic = Shape {
+        fast: false,
+        resize: false,
+        scale,
+    };
+    for (voters, logs, shape) in [(3, 3), (5, 2)].into_iter().flat_map(|(voters, logs)| {
+        [
+            classic,
+            Shape {
+                fast: true,
+                ..classic
+            },
+            Shape {
+                resize: true,
+                ..classic
+            },
+        ]
+        .map(move |shape| (voters, logs, shape))
+    }) {
+        let counted = explore(voters, logs, shape, seeds);
+        if print {
+            eprintln!(
+                "explored {voters} voters x {logs} logs x {seeds} seeds, {shape:?}: {counted:?}"
+            );
+        }
+        for (path, count, floor) in coverage(&counted, shape) {
             let least = match floor {
                 Floor::Common => seeds + 1,
                 Floor::Rare => 1,
             };
-            assert!(
-                count >= least,
-                "{voters} voters, {logs} logs, fast {fast}: {path}: {count} over {seeds} seeds, below its floor {least}"
-            );
+            if count < least {
+                return Err(format!(
+                    "{voters} voters, {logs} logs, fast {}, resize {}: {path}: {count} over {seeds} seeds, below its floor {least}",
+                    shape.fast, shape.resize
+                ));
+            }
         }
     }
+    Ok(())
+}
+
+/// Whether the planted defect is caught at `seed` and `scale`: member 1's merge passes barriers.
+fn mutant_caught(scale: Scale, seed: u64) -> bool {
+    std::panic::catch_unwind(|| {
+        let mut cluster = Cluster::new(Source::Seed(seed), 3, 3, false, false, scale);
+        cluster.mutant = Some((Merge::new(3).unwrap(), support::App::default()));
+        for step in 0..scale.steps {
+            let calm = (step / scale.stretch) % 2 == 1;
+            cluster.step(calm);
+            cluster.check(&format!("seed {seed} step {step}"));
+        }
+    })
+    .is_err()
 }
 
 /// slates (§3.6, T-8.13's counterpart for MLRaft): "the merge applies every key's commands in one
 /// order and each in one epoch, and the global commands in one order, on every node and across
 /// every restart, under loss, duplication, reordering, partitions and crash-restarts; each log keeps
-/// Raft's own safety." The workspace's scale ([`SEEDS_QUICK`]).
+/// Raft's own safety." Over [`WILKS_SEEDS`] seeds of every shape: no history of them fails, so at
+/// least 95% of histories at this scale keep it, with 95% confidence. The planted defect is caught
+/// at every one of the same seeds (`measure_the_scale`), so its per-seed catch rate needs no more.
 #[test]
 fn the_multi_log_merges_alike_under_an_adversarial_network() {
-    explore_and_check_coverage(SEEDS_QUICK);
-}
-
-/// The same at full scale ([`SEEDS_FULL`]), run in release with `--ignored`.
-#[test]
-#[ignore = "full scale: run in release"]
-fn the_multi_log_merges_alike_at_full_scale() {
-    explore_and_check_coverage(SEEDS_FULL);
+    explore_and_check_coverage(WILKS_SEEDS);
 }
 
 /// Member 1's logs as the planted defect reads them: every barrier passed as nothing, so its merge
@@ -1235,11 +1481,11 @@ impl Logs for Unbarriered<'_> {
 #[test]
 fn a_member_that_does_not_wait_at_barriers_is_caught() {
     let caught = std::panic::catch_unwind(|| {
-        for seed in 0..SEEDS_QUICK {
-            let mut cluster = Cluster::new(Source::Seed(seed), 3, 3, false);
+        for seed in 0..WILKS_SEEDS {
+            let mut cluster = Cluster::new(Source::Seed(seed), 3, 3, false, false, SCALE);
             cluster.mutant = Some((Merge::new(3).unwrap(), support::App::default()));
-            for step in 0..STEPS {
-                let calm = (step / STRETCH) % 2 == 1;
+            for step in 0..SCALE.steps {
+                let calm = (step / SCALE.stretch) % 2 == 1;
                 cluster.step(calm);
                 cluster.check(&format!("seed {seed} step {step}"));
             }
@@ -1253,3 +1499,130 @@ fn a_member_that_does_not_wait_at_barriers_is_caught() {
     eprintln!("caught: {said}");
     assert!(said.contains("a different command or epoch"), "{said}");
 }
+
+/// Each scale's number measured (`docs/multilog.md` §11): the planted defect's catch rate, the most
+/// messages in flight, and each number swept down to the least at which every path holds its floor
+/// and the planted defect is caught, the others held. Run in release with `--ignored --nocapture`.
+#[test]
+#[ignore = "a measurement, in release"]
+fn measure_the_scale() {
+    std::panic::set_hook(Box::new(|_| {}));
+    let seeds = WILKS_SEEDS;
+    let caught = (0..WILKS_SEEDS)
+        .filter(|seed| mutant_caught(SCALE, *seed))
+        .count();
+    println!("the planted defect: caught at {caught} of {WILKS_SEEDS} seeds");
+
+    let holds = |scale: Scale| {
+        // A history whose check fails at a scale is no pass, and is said: a scale that finds a
+        // defect is no smaller scale, it is a finding.
+        match std::panic::catch_unwind(|| coverage_holds(scale, seeds, false)) {
+            Ok(Ok(())) => (0..seeds).any(|seed| mutant_caught(scale, seed)),
+            Ok(Err(floor)) => {
+                println!("  {floor}");
+                false
+            }
+            Err(panic) => {
+                let said = panic
+                    .downcast_ref::<String>()
+                    .cloned()
+                    .or_else(|| panic.downcast_ref::<&str>().map(|s| (*s).to_owned()))
+                    .unwrap_or_default();
+                println!("  a history failed at {scale:?}: {said}");
+                false
+            }
+        }
+    };
+    assert!(holds(SCALE), "the scale itself holds");
+    type Set = fn(&mut Scale, u64);
+    let numbers: [(&str, u64, Set); 17] = [
+        ("steps", SCALE.steps as u64, |s, v| s.steps = v as usize),
+        ("stretch", SCALE.stretch as u64, |s, v| {
+            s.stretch = v as usize
+        }),
+        ("proposals", SCALE.proposals, |s, v| s.proposals = v),
+        ("keys", SCALE.keys, |s, v| s.keys = v),
+        ("global_every", SCALE.global_every, |s, v| {
+            s.global_every = v
+        }),
+        ("deliver", SCALE.weights.deliver, |s, v| {
+            s.weights.deliver = v
+        }),
+        ("heartbeat", SCALE.weights.heartbeat, |s, v| {
+            s.weights.heartbeat = v
+        }),
+        ("propose", SCALE.weights.propose, |s, v| {
+            s.weights.propose = v
+        }),
+        ("barriers", SCALE.weights.barriers, |s, v| {
+            s.weights.barriers = v
+        }),
+        ("drop", SCALE.weights.drop, |s, v| s.weights.drop = v),
+        ("duplicate", SCALE.weights.duplicate, |s, v| {
+            s.weights.duplicate = v
+        }),
+        ("time_out", SCALE.weights.time_out, |s, v| {
+            s.weights.time_out = v
+        }),
+        ("tick", SCALE.weights.tick, |s, v| s.weights.tick = v),
+        ("crash", SCALE.weights.crash, |s, v| s.weights.crash = v),
+        ("isolate", SCALE.weights.isolate, |s, v| {
+            s.weights.isolate = v
+        }),
+        ("image", SCALE.weights.image, |s, v| s.weights.image = v),
+        ("resize", SCALE.weights.resize, |s, v| s.weights.resize = v),
+    ];
+    // In the order listed, each number goes down to the least at which the criterion holds with
+    // every number before it already at its own least: the scale found holds by construction.
+    let mut found = SCALE;
+    for (name, at, set) in numbers {
+        // By bisection between a failing low and a passing high: the criterion is taken to hold
+        // from its boundary up, which the run confirms at the boundary.
+        let mut one = found;
+        set(&mut one, 1);
+        if holds(one) {
+            found = one;
+            println!("{name}: holds down to 1 (from {at})");
+            continue;
+        }
+        let (mut low, mut high) = (1u64, at);
+        while high - low > 1 {
+            let middle = low + (high - low) / 2;
+            let mut scale = found;
+            set(&mut scale, middle);
+            if holds(scale) {
+                high = middle;
+            } else {
+                low = middle;
+            }
+        }
+        set(&mut found, high);
+        println!("{name}: boundary {high} (fails at {low}; from {at})");
+    }
+    println!("the scale found: {found:?}");
+    let roomy = Scale {
+        in_flight: 1 << 16,
+        ..found
+    };
+    let mut most = 0;
+    for (fast, resize) in [(false, false), (true, false), (false, true)] {
+        for (voters, logs) in [(3, 3), (5, 2)] {
+            let counted = explore(
+                voters,
+                logs,
+                Shape {
+                    fast,
+                    resize,
+                    scale: roomy,
+                },
+                seeds,
+            );
+            most = most.max(counted.most_in_flight);
+        }
+    }
+    println!("most in flight at the scale found: {most}");
+}
+
+/// The seeds a measurement of the scale runs: Wilks's 59, the least n with 1 - 0.95^n >= 0.95
+/// (one-sided 95/95).
+const WILKS_SEEDS: u64 = 59;

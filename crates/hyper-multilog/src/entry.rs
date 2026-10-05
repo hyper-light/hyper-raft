@@ -14,6 +14,9 @@ pub const GLOBAL: u8 = 0x01;
 pub const KEYED: u8 = 0x02;
 /// Format: a barrier's tag; the log-0 index it names, [`WORD_BYTES`] long, comes before it.
 pub const BARRIER: u8 = 0x03;
+/// Format: a resize's tag, log 0 only; the count of logs it makes, [`WORD_BYTES`] long, comes
+/// before it (`docs/multilog.md` §3.5).
+pub const RESIZE: u8 = 0x04;
 /// Format: the width of a key and of an index, a `u64` written little-endian.
 pub const WORD_BYTES: usize = 8;
 /// Format: the most the layer appends to a command: a key and the tag. An owner that reserves this
@@ -37,6 +40,9 @@ pub enum Stated<'a> {
     },
     /// A barrier (logs other than log 0): the log-0 index it names.
     Barrier(u64),
+    /// A change of the count of logs (log 0 only), ordered as a global command is: the count it
+    /// makes, at least one and at most what a `u32` numbers.
+    Resize(usize),
     /// Bytes the layer never writes: refused alike on every member.
     Malformed,
 }
@@ -53,6 +59,7 @@ pub fn read(entry: &Entry) -> Stated<'_> {
         GLOBAL => Stated::Global(rest),
         KEYED => keyed(rest),
         BARRIER => barrier(rest),
+        RESIZE => resize_to(rest),
         _ => Stated::Malformed,
     }
 }
@@ -70,6 +77,13 @@ fn keyed(rest: &[u8]) -> Stated<'_> {
 
 fn barrier(rest: &[u8]) -> Stated<'_> {
     word(rest).map_or(Stated::Malformed, Stated::Barrier)
+}
+
+fn resize_to(rest: &[u8]) -> Stated<'_> {
+    word(rest)
+        .filter(|logs| *logs >= 1 && *logs <= u64::from(u32::MAX))
+        .and_then(|logs| usize::try_from(logs).ok())
+        .map_or(Stated::Malformed, Stated::Resize)
 }
 
 /// A `u64` from exactly [`WORD_BYTES`] little-endian bytes.
@@ -98,6 +112,19 @@ pub fn keyed_command(mut command: Vec<u8>, key: u64) -> Result<Vec<u8>> {
     command.extend_from_slice(&key.to_le_bytes());
     command.push(KEYED);
     Ok(command)
+}
+
+/// A resize's data, making `logs` logs: refused for none, or more than a `u32` numbers.
+pub fn resize(logs: usize) -> Result<Vec<u8>> {
+    let count = u32::try_from(logs).map_err(|_| Error::Settings("more logs than a u32 numbers"))?;
+    if count == 0 {
+        return Err(Error::Settings("no log"));
+    }
+    let mut data = Vec::new();
+    room(&mut data, SUFFIX_BYTES)?;
+    data.extend_from_slice(&u64::from(count).to_le_bytes());
+    data.push(RESIZE);
+    Ok(data)
 }
 
 /// A barrier's data, naming log 0's `index`.
@@ -146,6 +173,9 @@ mod tests {
         );
         let entry = normal(barrier_naming(42).unwrap());
         assert_eq!(read(&entry), Stated::Barrier(42));
+        let entry = normal(resize(3).unwrap());
+        assert_eq!(read(&entry), Stated::Resize(3));
+        assert!(resize(0).is_err());
         assert_eq!(read(&normal(Vec::new())), Stated::Own);
         let change = Entry {
             entry_type: EntryType::EntryConfChangeV2,
@@ -160,7 +190,9 @@ mod tests {
             vec![0, 0, 0, 0, 0, 0, 0, 0, 1, BARRIER],
             vec![0xff],
             vec![0],
-            vec![1, 2, 0x04],
+            vec![1, 2, RESIZE],
+            vec![0, 0, 0, 0, 0, 0, 0, 0, RESIZE],
+            vec![0, 0, 0, 0, 1, 0, 0, 0, RESIZE],
         ] {
             assert_eq!(
                 read(&normal(hostile.clone())),

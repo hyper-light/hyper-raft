@@ -39,7 +39,7 @@ pub mod point;
 pub mod route;
 
 pub use error::{Error, Result};
-pub use merge::{Advance, Applied, Command, Cut, Flow, Logs, Merge, Refusal};
-pub use multilog::{CUT, Installed, Limits, MultiLog};
+pub use merge::{Advance, Applied, Command, Cut, Flow, Logs, MAX_RESIZES, Merge, Refusal};
+pub use multilog::{CUT, Ended, Installed, Limits, MultiLog};
 pub use point::{At, Point, PointError};
 pub use route::{Route, log_of};

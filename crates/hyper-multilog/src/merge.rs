@@ -61,6 +61,8 @@ pub enum Refusal {
     GlobalOutsideLogZero,
     /// A barrier in log 0.
     BarrierInLogZero,
+    /// A resize in a log other than log 0.
+    ResizeOutsideLogZero,
     /// A keyed command in a log its key does not route to.
     Misrouted {
         /// The key.
@@ -73,6 +75,18 @@ pub enum Refusal {
 pub enum Applied<'a> {
     /// A command to apply.
     Command(Command<'a>),
+    /// The count of logs changed at log 0's `index`, ordered as a global command is
+    /// (`docs/multilog.md` §3.5): the logs past `logs` end there, the ones it adds begin there,
+    /// and every keyed command consumed after it is routed by the new count. The merge stops right
+    /// after it; where it added logs, the owner opens them before the merge reads on.
+    Resized {
+        /// Log 0's index of the resize.
+        index: u64,
+        /// The count of logs from it on.
+        logs: usize,
+        /// The count before it.
+        was: usize,
+    },
     /// An entry refused, consumed as nothing.
     Refused {
         /// Its log.
@@ -108,7 +122,16 @@ pub struct Advance {
 pub struct Cut {
     next: Vec<u64>,
     epoch: u64,
+    /// Each log's generation: the count of resizes applied when the log began
+    /// (`docs/multilog.md` §3.5), zero for the logs the group began with.
+    generations: Vec<u32>,
+    /// The count of resizes applied.
+    resizes: u32,
 }
+
+/// The most resizes a group applies: a log's generation travels in the upper half of a message's
+/// priority (`MultiLog::stamp`), a non-negative `i64`.
+pub const MAX_RESIZES: u32 = i32::MAX as u32;
 
 impl Cut {
     /// The position before anything, over `logs` logs: every log at its first index, no global
@@ -121,7 +144,12 @@ impl Cut {
         next.try_reserve_exact(logs)
             .map_err(|_| Error::Capacity("logs"))?;
         next.resize(logs, 1);
-        Ok(Self { next, epoch: 0 })
+        Ok(Self {
+            generations: vec![0; next.len()],
+            next,
+            epoch: 0,
+            resizes: 0,
+        })
     }
     /// The position `next` and `epoch` state, refused unless it can be one: a log at least,
     /// every index from one on, and the epoch below log 0's next index.
@@ -135,7 +163,42 @@ impl Cut {
         if epoch >= zero {
             return Err(Error::Settings("an epoch log 0 has not reached"));
         }
-        Ok(Self { next, epoch })
+        Ok(Self {
+            generations: vec![0; next.len()],
+            next,
+            epoch,
+            resizes: 0,
+        })
+    }
+    /// As [`Cut::new`], with each log's generation and the count of resizes applied: refused
+    /// unless there is a generation for each log, none past the count, and the count within
+    /// [`MAX_RESIZES`].
+    pub fn with_generations(
+        next: Vec<u64>,
+        epoch: u64,
+        generations: Vec<u32>,
+        resizes: u32,
+    ) -> Result<Self> {
+        let cut = Self::new(next, epoch)?;
+        if generations.len() != cut.next.len()
+            || generations.iter().any(|generation| *generation > resizes)
+            || resizes > MAX_RESIZES
+        {
+            return Err(Error::Settings("generations that do not fit the cut"));
+        }
+        Ok(Self {
+            generations,
+            resizes,
+            ..cut
+        })
+    }
+    /// Each log's generation.
+    pub fn generations(&self) -> &[u32] {
+        &self.generations
+    }
+    /// The count of resizes applied.
+    pub fn resizes(&self) -> u32 {
+        self.resizes
     }
     /// Each log's next index to consume.
     pub fn next(&self) -> &[u64] {
@@ -167,6 +230,10 @@ pub struct Merge {
     /// Whether the last entry consumed was a global command applied: the position is that
     /// command's canonical cut until anything else is consumed.
     after_global: bool,
+    /// Each log's generation (`Cut::generations`).
+    generations: Vec<u32>,
+    /// The count of resizes applied.
+    resizes: u32,
 }
 
 /// One call's account: what it may spend, and what it did.
@@ -210,6 +277,8 @@ impl Merge {
             epoch: cut.epoch,
             head: vec![None; cut.next.len()],
             after_global: false,
+            generations: cut.generations.clone(),
+            resizes: cut.resizes,
         }
     }
     /// How many logs.
@@ -233,7 +302,13 @@ impl Merge {
         Cut {
             next: self.next.clone(),
             epoch: self.epoch,
+            generations: self.generations.clone(),
+            resizes: self.resizes,
         }
+    }
+    /// `log`'s generation: the count of resizes applied when it began.
+    pub fn generation(&self, log: usize) -> Option<u32> {
+        self.generations.get(log).copied()
     }
     /// Whether the position is canonical (`docs/multilog.md` §5.1): comparable with every position
     /// any member reaches, so that an image taken here can be installed by any. With one log,
@@ -351,15 +426,54 @@ impl Merge {
         let Take::Consume(handed) = take else {
             return Ok(false);
         };
-        let global = matches!(handed, Some(Applied::Command(Command { key: None, .. })));
+        let global = matches!(
+            handed,
+            Some(Applied::Command(Command { key: None, .. }) | Applied::Resized { .. })
+        );
+        let resized = match handed {
+            Some(Applied::Resized { logs, .. }) => Some(logs),
+            _ => None,
+        };
         let flow = handed.map_or(Flow::Continue, &mut *apply);
         self.moved_past(log, next)?;
         self.after_global = global;
         run.took(entry.data.len(), flow);
+        if let Some(logs) = resized {
+            self.resize(logs)?;
+            // The owner opens what the resize added before the merge reads past it.
+            run.halted = true;
+        }
         Ok(true)
     }
 
     /// `log` consumed its entry at `index`: it stands at the next, read afresh.
+    /// The merge reads `logs` logs from here on: the ones it adds start at their first index, as
+    /// logs that held nothing before this point; the ones it ends are read no more.
+    fn resize(&mut self, logs: usize) -> Result<()> {
+        let resizes = self
+            .resizes
+            .checked_add(1)
+            .filter(|resizes| *resizes <= MAX_RESIZES)
+            .ok_or(Error::Capacity("resizes"))?;
+        if logs > self.next.len() {
+            let more = logs.saturating_sub(self.next.len());
+            self.next
+                .try_reserve_exact(more)
+                .map_err(|_| Error::Capacity("logs"))?;
+            self.head
+                .try_reserve_exact(more)
+                .map_err(|_| Error::Capacity("logs"))?;
+            self.generations
+                .try_reserve_exact(more)
+                .map_err(|_| Error::Capacity("logs"))?;
+        }
+        self.next.resize(logs, 1);
+        self.head.resize(logs, None);
+        self.generations.resize(logs, resizes);
+        self.resizes = resizes;
+        Ok(())
+    }
+
     fn moved_past(&mut self, log: usize, index: u64) -> Result<()> {
         let after = index
             .checked_add(1)
@@ -377,6 +491,7 @@ impl Merge {
         let index = entry.index;
         match entry::read(entry) {
             Stated::Global(data) => self.take_global(index, data),
+            Stated::Resize(logs) => self.take_resize(index, logs),
             Stated::Keyed { key, command } => self.take_keyed(0, index, key, command),
             Stated::Barrier(_) => refuse(0, index, Refusal::BarrierInLogZero),
             Stated::Malformed => refuse(0, index, Refusal::Malformed),
@@ -391,6 +506,7 @@ impl Merge {
             Stated::Barrier(named) => self.take_barrier(log, named),
             Stated::Keyed { key, command } => self.take_keyed(log, index, key, command),
             Stated::Global(_) => refuse(log, index, Refusal::GlobalOutsideLogZero),
+            Stated::Resize(_) => refuse(log, index, Refusal::ResizeOutsideLogZero),
             Stated::Malformed => refuse(log, index, Refusal::Malformed),
             Stated::Own => Take::Consume(None),
         }
@@ -399,12 +515,7 @@ impl Merge {
     /// A global command at log-0 `index`: applied once every other log stands at a barrier naming
     /// it or later.
     fn take_global<'e>(&mut self, index: u64, data: &'e [u8]) -> Take<'e> {
-        let reached = self
-            .head
-            .iter()
-            .skip(1)
-            .all(|head| head.is_some_and(|named| named >= index));
-        if !reached {
+        if !self.every_barrier_reaches(index) {
             return Take::Hold;
         }
         let epoch = self.epoch;
@@ -416,6 +527,28 @@ impl Merge {
             data,
             epoch,
         })))
+    }
+
+    /// Whether every log but log 0 stands at a barrier naming `index` or later.
+    fn every_barrier_reaches(&self, index: u64) -> bool {
+        self.head
+            .iter()
+            .skip(1)
+            .all(|head| head.is_some_and(|named| named >= index))
+    }
+
+    /// A resize at log 0's `index`: taken as a global command is, once every log stands at a
+    /// barrier naming it, and an epoch of its own.
+    fn take_resize<'e>(&mut self, index: u64, logs: usize) -> Take<'e> {
+        if !self.every_barrier_reaches(index) {
+            return Take::Hold;
+        }
+        self.epoch = index;
+        Take::Consume(Some(Applied::Resized {
+            index,
+            logs,
+            was: self.next.len(),
+        }))
     }
 
     /// A keyed command in `log`: applied in the current epoch where its key routes there.

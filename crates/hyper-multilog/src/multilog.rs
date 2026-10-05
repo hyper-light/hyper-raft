@@ -75,7 +75,28 @@ pub struct MultiLog<S> {
     /// For each log, the last leader this member's share of it named: a member that suspects its
     /// leader campaigns and names none until one is elected, and is cut from it all the while.
     known_leaders: Vec<NodeId>,
+    /// For each log, log 0's index of the resize that added it, zero for a log the group began
+    /// with: it is owed barriers only for globals after it.
+    born: Vec<u64>,
+    /// The settings every log's member is opened with, for the logs a resize adds.
+    member: Config,
+    /// The members of logs a resize ended, until the owner takes them ([`MultiLog::take_ended`]).
+    ended: Vec<Ended<S>>,
+    /// Each log's generation, as this member runs it: what its messages carry and what a message
+    /// to it must carry ([`MultiLog::stamp`]).
+    generations: Vec<u32>,
     limits: Limits,
+}
+
+/// A log a resize ended (`docs/multilog.md` §3.5): its number and generation, and this member's
+/// member of it.
+pub struct Ended<S> {
+    /// The log's number.
+    pub log: usize,
+    /// Its generation: what its last messages carry ([`MultiLog::stamp_ended`]).
+    pub generation: u32,
+    /// This member's member of it.
+    pub node: RawNode<S>,
 }
 
 /// The logs' storage as the merge reads it.
@@ -133,9 +154,13 @@ fn change_of(entry: &Entry) -> Result<ConfChangeV2> {
     decoded.map_err(|_| Error::Invariant("a committed change does not decode"))
 }
 
-/// The priority a message other than a vote carries from a member cut from another log's leader
-/// ([`MultiLog::stamp`]): a value no owner ranks a voter at.
-pub const CUT: i64 = i64::MIN;
+/// The low half of the priority a message other than a vote carries from a member cut from another
+/// log's leader ([`MultiLog::stamp`]).
+pub const CUT: i64 = 1;
+/// The low half of a stamped priority: the core's own in a vote, [`CUT`] or zero in any other.
+const LOW_HALF: i64 = 0xFFFF_FFFF;
+/// Where a log's generation sits in a stamped priority: its upper half.
+const GENERATION_SHIFT: u32 = 32;
 
 /// Whether a message is a vote or its answer, whose priority the core sets and reads.
 fn is_vote(kind: MessageType) -> bool {
@@ -187,6 +212,10 @@ impl<S: Storage> MultiLog<S> {
             ranked: Vec::new(),
             stated: vec![Vec::new(); count],
             known_leaders: vec![0; count],
+            born: vec![0; count],
+            member: member.clone(),
+            ended: Vec::new(),
+            generations: point.cut.generations().to_vec(),
             limits,
         })
     }
@@ -226,9 +255,9 @@ impl<S: Storage> MultiLog<S> {
     pub fn merge(&self) -> &Merge {
         &self.merge
     }
-    /// The log `route` names.
+    /// The log `route` names, by the count of logs the merge is at.
     pub fn route(&self, route: Route) -> usize {
-        route.log(self.nodes.len())
+        route.log(self.merge.logs())
     }
     /// The last index of `log` the merge has consumed: a read of `log` asked at an index at or
     /// below it may be served (`docs/multilog.md` §8).
@@ -277,6 +306,119 @@ impl<S: Storage> MultiLog<S> {
             .propose_fast(Vec::new(), data)
             .map_err(|error| Error::of(log, error))?;
         Ok((log, index))
+    }
+
+    /// Proposes to change the count of logs to `logs` (`docs/multilog.md` §3.5): an entry of log
+    /// 0 ordered as a global command is. Every member's merge applies it at one point, where the
+    /// logs past `logs` end and the ones it adds begin, and routes every keyed command after it by
+    /// the new count. Refused as [`MultiLog::propose`] refuses a global, and for no log or more
+    /// than a `u32` numbers.
+    pub fn propose_resize(&mut self, logs: usize) -> Result<()> {
+        self.admit(0, 1)?;
+        let data = entry::resize(logs)?;
+        self.at(0)?
+            .propose(Vec::new(), data)
+            .map_err(|error| Error::of(0, error))
+    }
+
+    /// Opens the logs a resize the merge applied added, one store each, in order
+    /// (`docs/multilog.md` §3.5): a store begins empty, under the configuration
+    /// [`MultiLog::configuration_for_new_logs`] gives, or is the one the member held for that log
+    /// before it reopened from an image older than the resize. Until they are open the merge reads
+    /// no further. Refused for another count of stores than the resize added.
+    pub fn open_logs(&mut self, stores: Vec<S>) -> Result<()> {
+        let adding = self.merge.logs().checked_sub(self.nodes.len());
+        if adding != Some(stores.len()) || stores.is_empty() {
+            return Err(Error::Settings(
+                "stores for another count of logs than a resize added",
+            ));
+        }
+        let more = stores.len();
+        self.nodes
+            .try_reserve_exact(more)
+            .map_err(|_| Error::Capacity("logs"))?;
+        self.proposed
+            .try_reserve_exact(more)
+            .map_err(|_| Error::Capacity("logs"))?;
+        let born = self.merge.epoch();
+        let configuration = self.configuration_for_new_logs();
+        for store in stores {
+            let log = self.nodes.len();
+            let mut config = self.member.clone();
+            config.seed = seed_of(self.member.seed, log);
+            config.applied = 0;
+            let node = RawNode::new(&config, store).map_err(|error| Error::of(log, error))?;
+            self.nodes.push(node);
+            self.proposed.push((0, 0));
+            self.configurations.push(Configurations {
+                at_merge: configuration.clone(),
+                since: VecDeque::new(),
+            });
+            self.stated.push(Vec::new());
+            self.known_leaders.push(0);
+            self.born.push(born);
+            self.generations
+                .push(self.merge.generation(log).unwrap_or(0));
+        }
+        Ok(())
+    }
+
+    /// The configuration a log a resize adds begins under: log 0's as of the merge, the group's
+    /// voters where the resize was applied.
+    pub fn configuration_for_new_logs(&self) -> ConfState {
+        self.configurations
+            .first()
+            .map(|held| held.at_merge.clone())
+            .unwrap_or_default()
+    }
+
+    /// `log`'s generation as this member runs it.
+    pub fn generation(&self, log: usize) -> Option<u32> {
+        self.generations.get(log).copied()
+    }
+
+    /// Whether this member runs the logs `point` states, each of the generation it states: an
+    /// image of other logs is reached only by reopening from it (`docs/multilog.md` §3.5).
+    pub fn runs_generations_of(&self, point: &Point) -> bool {
+        point.logs.len() == self.nodes.len()
+            && point.cut.generations() == self.generations.as_slice()
+    }
+
+    /// The members of the logs resizes ended since the last call, in the order of their logs. The
+    /// owner drives each once more and sends what it sends: where this member led the log, its
+    /// last heartbeats, which tell the others the commit that holds the log's barrier for the
+    /// resize, so that their merges reach the resize too. It keeps their storage until an image
+    /// past the resize is durable, for a member that reopens from an older image reads them again
+    /// (§5.5). A member that misses those heartbeats reaches the resize by an image past it (§5.3).
+    pub fn take_ended(&mut self) -> Vec<Ended<S>> {
+        std::mem::take(&mut self.ended)
+    }
+
+    /// Ends the logs a resize the merge applied took away: nothing of them is read again, and
+    /// their members wait for the owner ([`MultiLog::take_ended`]).
+    fn end_logs(&mut self) {
+        let logs = self.merge.logs();
+        if logs >= self.nodes.len() {
+            return;
+        }
+        let ended = self.nodes.split_off(logs);
+        let generations = self.generations.split_off(logs);
+        for (at, (mut node, generation)) in ended.into_iter().zip(generations).enumerate() {
+            if node.raft.state() == StateRole::Leader {
+                // Its last word: the followers learn the commit from it.
+                let _ = node.ping();
+            }
+            self.ended.push(Ended {
+                log: logs.saturating_add(at),
+                generation,
+                node,
+            });
+        }
+        self.proposed.truncate(logs);
+        self.configurations.truncate(logs);
+        self.stated.truncate(logs);
+        self.known_leaders.truncate(logs);
+        self.born.truncate(logs);
     }
 
     /// Proposes `commands`, every one routed to `log`, as one proposal of the core: one append
@@ -335,7 +477,15 @@ impl<S: Storage> MultiLog<S> {
     /// A message for `log` from the network. A forwarded proposal is screened first: one out of
     /// place is refused, and one of barriers a leader's barrier covers is dropped
     /// (`docs/multilog.md` §3.1, §3.2).
-    pub fn step(&mut self, log: usize, message: Message) -> Result<()> {
+    pub fn step(&mut self, log: usize, mut message: Message) -> Result<()> {
+        // A message of another generation of the log (`docs/multilog.md` §3.5) is no message of
+        // this one: one sent before a resize ended and began the log again, or after it by a
+        // member whose merge is ahead. Dropped, as the network may drop it.
+        let generation = message.priority >> GENERATION_SHIFT;
+        if Some(generation) != self.generations.get(log).copied().map(i64::from) {
+            return Ok(());
+        }
+        message.priority &= LOW_HALF;
         if message.msg_type == fast::FAST_PROPOSE || message.msg_type == fast::FAST_VOTE {
             self.screen_fast(log, &message)?;
             self.steer(log)?;
@@ -405,11 +555,14 @@ impl<S: Storage> MultiLog<S> {
         for entry in &message.entries {
             match entry::read(entry) {
                 Stated::Own => barriers_covered = false,
-                Stated::Global(_) if log == 0 => commands = true,
+                Stated::Global(_) | Stated::Resize(_) if log == 0 => commands = true,
+                Stated::Resize(_) => {
+                    return Err(Error::Violation("a resize outside log 0"));
+                }
                 Stated::Global(_) => {
                     return Err(Error::Violation("a global command outside log 0"));
                 }
-                Stated::Keyed { key, .. } if log_of(key, self.nodes.len()) == log => {
+                Stated::Keyed { key, .. } if log_of(key, self.merge.logs()) == log => {
                     commands = true
                 }
                 Stated::Keyed { .. } => {
@@ -446,7 +599,7 @@ impl<S: Storage> MultiLog<S> {
         for entry in &message.entries {
             match entry::read(entry) {
                 Stated::Global(_) if log == 0 => {}
-                Stated::Keyed { key, .. } if log_of(key, self.nodes.len()) == log => {}
+                Stated::Keyed { key, .. } if log_of(key, self.merge.logs()) == log => {}
                 _ => {
                     return Err(Error::Violation(
                         "a fast proposal that is no command in place",
@@ -511,7 +664,7 @@ impl<S: Storage> MultiLog<S> {
 
     /// Notes a global command log 0 gave to apply: the barriers owed name it.
     fn note_global(&mut self, log: usize, entry: &Entry) {
-        if log == 0 && matches!(entry::read(entry), Stated::Global(_)) {
+        if log == 0 && matches!(entry::read(entry), Stated::Global(_) | Stated::Resize(_)) {
             self.latest_global = self.latest_global.max(entry.index);
         }
     }
@@ -544,13 +697,27 @@ impl<S: Storage> MultiLog<S> {
         budget: u64,
         apply: &mut dyn FnMut(Applied<'_>) -> Flow,
     ) -> Result<Advance> {
+        if self.merge.logs() != self.nodes.len() {
+            return Err(Error::Settings("the logs a resize added are not open"));
+        }
+        if !self.ended.is_empty() {
+            return Err(Error::Settings("the logs a resize ended are not taken"));
+        }
         let advance = self
             .merge
             .advance(&Stores { nodes: &self.nodes }, budget, apply)?;
         self.settle_configurations();
+        self.end_logs();
         // The merge moved: a leader held for its bound may take from the fast track again.
         for log in 0..self.nodes.len() {
             self.steer(log)?;
+        }
+        if self.merge.logs() != self.nodes.len() {
+            // A resize added logs: the owner opens them, and the merge reads on.
+            return Ok(Advance {
+                more: true,
+                ..advance
+            });
         }
         Ok(advance)
     }
@@ -573,7 +740,8 @@ impl<S: Storage> MultiLog<S> {
         let mut proposed = 0usize;
         for log in 1..self.nodes.len() {
             let latest = self.latest_global;
-            if latest <= self.covered(log)? {
+            let born = self.born.get(log).copied().unwrap_or(0);
+            if latest <= self.covered(log)? || latest <= born {
                 continue;
             }
             let data = entry::barrier_naming(latest)?;
@@ -666,10 +834,39 @@ impl<S: Storage> MultiLog<S> {
     /// vote, which it stamps itself and this leaves alone; in any other message the field carries
     /// [`CUT`] or zero. An owner that does not stamp leaves its members' leaders believing it may
     /// lead.
+    ///
+    /// The upper half of the priority carries the log's generation (`docs/multilog.md` §3.5), so
+    /// that a member drops what another generation of the log sent; a vote's priority, which the
+    /// core sets from the ranks [`MultiLog::spread`] gives, keeps the lower half.
     pub fn stamp(&self, log: usize, message: &mut Message) {
-        if !is_vote(message.msg_type) {
-            message.priority = if self.cut_below(log) { CUT } else { 0 };
-        }
+        let low = if is_vote(message.msg_type) {
+            if (0..=LOW_HALF).contains(&message.priority) {
+                message.priority
+            } else {
+                0
+            }
+        } else if self.cut_below(log) {
+            CUT
+        } else {
+            0
+        };
+        let generation = self.generations.get(log).copied().unwrap_or(0);
+        Self::stamp_generation(generation, low, message);
+    }
+
+    /// Stamps a message an ended log's member sends last (`MultiLog::take_ended`) with that log's
+    /// generation: the member is cut from no one there any more.
+    pub fn stamp_ended(generation: u32, message: &mut Message) {
+        let low = if is_vote(message.msg_type) && (0..=LOW_HALF).contains(&message.priority) {
+            message.priority
+        } else {
+            0
+        };
+        Self::stamp_generation(generation, low, message);
+    }
+
+    fn stamp_generation(generation: u32, low: i64, message: &mut Message) {
+        message.priority = (i64::from(generation) << GENERATION_SHIFT) | low;
     }
 
     /// Notes whether `from` stated, in a message of `log`, that it is cut from another log's
@@ -789,8 +986,11 @@ impl<S: Storage> MultiLog<S> {
     /// if it is ahead of the member's state, the merge resumes at its cut and each log's
     /// configuration as of the merge is the point's.
     pub fn install(&mut self, point: &Point) -> Result<Installed> {
-        if point.cut.logs() != self.nodes.len() || point.logs.len() != self.nodes.len() {
-            return Err(Error::Invariant("an image of another count of logs"));
+        if !self.runs_generations_of(point) {
+            // A resize lies between this member and the image: it reopens from it (§5.5).
+            return Err(Error::Settings(
+                "an image of another count of logs: reopen from it",
+            ));
         }
         if self.merge.cut().holds(&point.cut) {
             return Ok(Installed::Held);

@@ -48,8 +48,9 @@ nothing else (§11, "n = 1 against the bare core").
 `0xbf58476d1ce4e5b9` and `0x94d049bb133111eb`, the shifts 30, 27 and 31). The finalizer is a
 bijection on 64-bit words with full avalanche, so consecutive keys spread over the logs, and the
 remainder's bias toward the low logs is under `n / 2^64`. A key's log is a function of the key and
-`n` alone: it is part of the format, the same on every member and every version, and `n` is fixed
-for a group's life (a group with another `n` is another group).
+`n` alone: it is part of the format, the same on every member and every version. `n` changes only
+by a resize (§3.5), at one point of the merged order, and a key's log is a function of the key and
+the `n` in force where the merge consumes the command.
 
 The owner's keys are 64-bit words. An owner whose keys are byte strings hashes them first, with a
 hash of its own that every member computes alike; two keys that hash alike share a log, which costs
@@ -66,6 +67,7 @@ allocates nothing more for a proposal than its command.
 |---|---|
 | `command ‖ 0x01` | a global command |
 | `command ‖ key (u64, little-endian) ‖ 0x02` | a keyed command |
+| `n (u64, little-endian) ‖ 0x04` | a resize to `n` logs, `1 ≤ n ≤ u32::MAX` (log 0 only) |
 | `index (u64, little-endian) ‖ 0x03` | a barrier naming log 0's `index` |
 | empty | the core's own entry (a new leader's first) |
 | any other | malformed |
@@ -136,6 +138,53 @@ a group can then lose every log's progress: log 0's members that committed past 
 campaign while their changes wait behind it, the member that leads log `k` cannot learn the global
 committed without a log-0 leader, and the global waits for log `k`'s barrier. Applied as given, a
 log's elections never wait on the merge. The merge consumes a change as nothing.
+
+### 3.5 Changing `n`
+
+A group changes its count of logs while it runs by a **resize**: an entry of log 0 naming the new
+count (`MultiLog::propose_resize`), ordered as a global command is. It is Elastic Paxos's dynamic
+subscription (research §9) with the place of the change fixed by the merge rather than computed
+from two streams: every log stands at a barrier naming the resize before the merge takes it
+(§3.1, §4.1), so the resize is a cut every member reaches alike, and at it:
+- the logs past the new count **end**. What they hold before their barrier for the resize was
+  consumed before it; nothing after it is read. Elastic Paxos removes a stream on one ordered
+  request the same way (research §9).
+- the logs it adds **begin**, each read from its first entry, under log 0's configuration as of
+  the merge. The merge stops right after the resize, and each member opens the new logs on stores
+  of its own (`MultiLog::open_logs`) before it reads on. A log that begins holds nothing ordered
+  before the resize, so its entries need no barrier for it.
+- every keyed command the merge consumes after it is routed by the new count. One proposed under
+  the old count and committed after the resize, in a log its key no longer routes to, is refused
+  as out of place (§2.2), alike on every member, and its owner proposes it again, as Elastic Paxos's
+  clients resend a command a split sent to the wrong partition (research §9).
+
+**Generations.** A log number can end and begin again (three logs to one, then to three), and the
+new log must take nothing the old one sent. Each log has a generation, the count of resizes applied
+when it began, kept in the cut and the image (`Cut::generations`, point version 2). Every message a
+log's member sends carries its generation in the upper half of its priority (`MultiLog::stamp`),
+and a member drops a message of another generation (`MultiLog::step`), as the network may drop it.
+A resize is refused past `MAX_RESIZES` (`i32::MAX`), which keeps the stamp a non-negative priority.
+
+**An ended log's last word.** The leader of an ended log drives it once more: its last heartbeats
+tell the others the commit that holds the log's barrier for the resize, so their merges reach the
+resize too (`MultiLog::take_ended`, which hands the owner the ended members to drive and stamp,
+`MultiLog::stamp_ended`). A member that misses them reaches the resize through an image past it,
+which log 0's leader sends with a snapshot once it compacts past the member (§5.3); the owner keeps
+an ended log's storage until an image past the resize is durable, for a member that reopens from an
+older image reads the log again.
+
+**An image across a resize.** An image of other logs, or of other generations, is not installed in
+place: the member reopens from it (`MultiLog::runs_generations_of`, §5.5).
+
+**Evidence.** `tests/merge.rs`: `a_resize_that_adds_a_log_routes_what_follows_it_by_the_new_count`,
+`a_resize_that_ends_logs_reads_nothing_past_their_barrier`, `a_resize_outside_log_0_is_refused`;
+`tests/layer.rs`: `a_group_grows_and_shrinks_its_logs_and_every_member_applies_alike` (two logs to
+three to one under writes, and a member reopened from an image two resizes back reaching the same
+history), `a_message_of_another_generation_of_a_log_is_dropped`. The explorer runs both shapes with
+members proposing resizes among one log and one more than the group began with, beside crashes,
+loss, duplication and partitions: over its 59 seeds, 466 and 951 resizes applied and 151 and 90
+keyed commands refused as a resize moved their key, every member's history alike
+(`tests/multilog.rs`).
 
 ## 4. The merge
 
@@ -454,13 +503,13 @@ Each log's storage keeps the core's contract for what a member holds (`docs/raft
 **Evidence.** `tests/layer.rs`: `a_command_proposed_by_the_fast_track_is_applied_alike_everywhere`
 (a keyed command and a global, each committed by the fast quorum, applied alike on every member),
 `a_fast_proposal_out_of_place_is_refused_and_no_member_holds_it`, and
-`a_leader_at_its_unmerged_bound_takes_nothing_by_the_fast_track` (the leader holds 6 entries past
-its merge at a bound of 6, and 21 without the cap; once the merge moves it takes what was voted).
+`a_leader_at_its_unmerged_bound_takes_nothing_by_the_fast_track` (the leader holds 2 entries past
+its merge at a bound of 2, and 3 without the cap; once the merge moves it takes what was voted).
 The explorer runs both shapes on the fast track beside the classic ones, every command proposed by
 it and each displaced one proposed again, under loss, duplication, partitions and crash-restarts:
-at the workspace's 16 seeds, 5 and 17 indexes committed by a fast quorum and 196 and 250 proposals
-displaced (three voters with three logs, five with two), every member's history alike
-(`tests/multilog.rs`). `tests/allocs.rs`: a fast proposal through the layer allocates what the
+over its 59 seeds, 22 and 76 indexes committed by a fast quorum and 65 and 164 proposals displaced
+(three voters with three logs, five with two), every member's history alike (`tests/multilog.rs`,
+`docs/benchmarks.md`, "The multilog explorer"). `tests/allocs.rs`: a fast proposal through the layer allocates what the
 core's own does.
 
 ## 10. What comes from where
@@ -508,8 +557,9 @@ Each step is one gated commit (`bash scripts/gates.sh` on its final tree).
    check is restated exactly (the mechanism the margin stood for, held for every command of the
    run), and the measured numbers are recorded beside slates' (the owner's rule: exact checks
    only).
-4. **The explorer on hyper-sim** (`docs/sim.md`, S-1 and S-2): slates' 200 seeds × 3,000 steps at
-   full scale, every member's real logs on the world and its network (free discipline: any
+4. **The explorer on hyper-sim** (`docs/sim.md`, S-1 and S-2): 59 seeds (Wilks's one-sided 95/95)
+   at a scale measured down from slates' (`docs/benchmarks.md`, "The multilog explorer"), every
+   member's real logs on the world and its network (free discipline: any
    delivery order; loss, duplication, partitions; crashes restarting from the last image; images
    and compaction at canonical cuts and snapshots sent to laggards), Raft's invariants per log and
    the merge's history across members and restarts after every step; the first seed through
@@ -530,12 +580,14 @@ Each step is one gated commit (`bash scripts/gates.sh` on its final tree).
 | Tags | `0x01`, `0x02`, `0x03` | the format's (§2.2); a later version adds tags, never reuses one |
 | `SUFFIX_BYTES` | 9 | a key's 8 bytes (`u64`) and the tag |
 | A barrier's data | 9 bytes | an index's 8 and the tag |
+| A resize's data | 9 bytes | a count's 8 and the tag |
+| `MAX_RESIZES` | `i32::MAX` | a generation fills the upper half of a non-negative `i64` priority |
 | Routing constants | §2.1 | SplitMix64 (Steele, Lea and Flood, OOPSLA 2014) |
 | `n` | the owner's | configuration; at most `u32::MAX` (§6) |
 | `Limits::unmerged` | the owner's | configuration: the retained log it allows between images (§6) |
 | The merge's budget | the owner's, a call | configuration, as the core's `max_committed_size_per_ready` |
 | Spread priorities | `1 ..= r` for the `r` voters ranked, `0` for one not ranked | how many ranked voters a member is ahead of or level with in the log's rotation of the ranking (§7) |
-| A point's encoding | version 1, CRC-32C | the core's record format's conventions (`docs/raft.md` §3.1; RFC 3720 §B.4) |
+| A point's encoding | version 2 (the generations, §3.5), CRC-32C | the core's record format's conventions (`docs/raft.md` §3.1; RFC 3720 §B.4) |
 
 The tests' shapes (seeds, steps, stretches, bags, keys, rates, regions) are slates', each stated
 where it is used with slates' reason, and the coverage floors are set from measured counts.
@@ -544,4 +596,3 @@ where it is used with slates' reason, and the coverage floors are set from measu
 
 - Whether any owner gains: slates measured one log better for its groups (research §8); the
   measurements of §11 step 5 say what this core and layer show.
-- Changing `n` for a living group (a global command could move keys at an epoch); not designed.

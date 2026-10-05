@@ -13,17 +13,19 @@ use hyper_raft::wire::Record;
 use crate::error::{Error, Result};
 use crate::merge::Cut;
 
-/// Format: the point encoding's version, its first byte.
-pub const VERSION: u8 = 1;
+/// Format: the point encoding's version, its first byte. Version 2 states the count of resizes
+/// applied and each log's generation (`docs/multilog.md` §3.5); no owner kept a point of version 1,
+/// which is refused.
+pub const VERSION: u8 = 2;
 /// Format: the bytes of a `u32` and a `u64` field.
 const U32_BYTES: usize = 4;
 /// Format: as [`U32_BYTES`].
 const U64_BYTES: usize = 8;
 /// Format: the bytes of the checksum, a CRC-32C, last.
 const CHECKSUM_BYTES: usize = 4;
-/// Format: the bytes of one log's fixed fields: its next index, its term, its configuration's
-/// length.
-const LOG_FIXED_BYTES: usize = U64_BYTES + U64_BYTES + U32_BYTES;
+/// Format: the bytes of one log's fixed fields: its next index, its term, its generation, its
+/// configuration's length.
+const LOG_FIXED_BYTES: usize = U64_BYTES + U64_BYTES + U32_BYTES + U32_BYTES;
 
 /// One log at a point.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -88,9 +90,17 @@ impl Point {
         out.push(VERSION);
         out.extend_from_slice(&count.to_le_bytes());
         out.extend_from_slice(&self.cut.epoch().to_le_bytes());
-        for (next, at) in self.cut.next().iter().zip(&self.logs) {
+        out.extend_from_slice(&self.cut.resizes().to_le_bytes());
+        for ((next, generation), at) in self
+            .cut
+            .next()
+            .iter()
+            .zip(self.cut.generations())
+            .zip(&self.logs)
+        {
             out.extend_from_slice(&next.to_le_bytes());
             out.extend_from_slice(&at.term.to_le_bytes());
+            out.extend_from_slice(&generation.to_le_bytes());
             let length = u32::try_from(at.configuration.encoded_len())
                 .map_err(|_| Error::Capacity("a configuration"))?;
             out.extend_from_slice(&length.to_le_bytes());
@@ -116,17 +126,22 @@ impl Point {
         }
         let count = reader.count()?;
         let epoch = reader.u64()?;
-        let (next, logs) = reader.logs(count)?;
+        let resizes = reader.word()?;
+        let (next, generations, logs) = reader.logs(count)?;
         if !reader.0.is_empty() {
             return Err(PointError::Trailing);
         }
-        let cut = Cut::new(next, epoch).map_err(|_| PointError::Cut)?;
+        let cut = Cut::with_generations(next, epoch, generations, resizes)
+            .map_err(|_| PointError::Cut)?;
         Ok(Self { cut, logs })
     }
 }
 
 /// The bytes of a point left to read.
 struct Reader<'a>(&'a [u8]);
+
+/// What a point states of its logs: each one's next index, generation, and term and configuration.
+type ParsedLogs = (Vec<u64>, Vec<u32>, Vec<At>);
 
 impl<'a> Reader<'a> {
     fn take(&mut self, length: usize) -> std::result::Result<&'a [u8], PointError> {
@@ -150,6 +165,14 @@ impl<'a> Reader<'a> {
         self.0 = rest;
         Ok(u64::from_le_bytes(*word))
     }
+    fn word(&mut self) -> std::result::Result<u32, PointError> {
+        let (word, rest) = self
+            .0
+            .split_first_chunk::<U32_BYTES>()
+            .ok_or(PointError::Truncated)?;
+        self.0 = rest;
+        Ok(u32::from_le_bytes(*word))
+    }
     fn u32(&mut self) -> std::result::Result<usize, PointError> {
         let (word, rest) = self
             .0
@@ -169,12 +192,14 @@ impl<'a> Reader<'a> {
         }
         Ok(count)
     }
-    fn logs(&mut self, count: usize) -> std::result::Result<(Vec<u64>, Vec<At>), PointError> {
+    fn logs(&mut self, count: usize) -> std::result::Result<ParsedLogs, PointError> {
         let mut next = Vec::with_capacity(count);
+        let mut generations = Vec::with_capacity(count);
         let mut logs = Vec::with_capacity(count);
         for _ in 0..count {
             next.push(self.u64()?);
             let term = self.u64()?;
+            generations.push(self.word()?);
             let length = self.u32()?;
             let configuration =
                 ConfState::decode(self.take(length)?).map_err(|_| PointError::Configuration)?;
@@ -183,7 +208,7 @@ impl<'a> Reader<'a> {
                 configuration,
             });
         }
-        Ok((next, logs))
+        Ok((next, generations, logs))
     }
 }
 
@@ -197,7 +222,7 @@ mod tests {
             ..ConfState::default()
         };
         Point {
-            cut: Cut::new(vec![8, 3, 5], 7).unwrap(),
+            cut: Cut::with_generations(vec![8, 3, 5], 7, vec![0, 2, 1], 2).unwrap(),
             logs: vec![
                 At {
                     term: 2,

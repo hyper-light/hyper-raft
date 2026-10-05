@@ -670,13 +670,17 @@ fn a_fast_proposal_out_of_place_is_refused_and_no_member_holds_it() {
 /// the merge moves; then it takes what their votes decided, and a proposal made after.
 #[test]
 fn a_leader_at_its_unmerged_bound_takes_nothing_by_the_fast_track() {
-    let unmerged = 6;
+    // The global waiting past the merge takes one entry of the bound; the test needs room for one
+    // command the fast track takes and none for another, so the least bound is two, and one
+    // proposal past the room shows the cap.
+    let unmerged = 2;
+    let proposed = unmerged;
     let mut group = Group::open(3, 2, 43, Limits { unmerged }, true);
     group.elect(0, 1);
     assert!(group.member(1).propose(Route::Global, b"g".to_vec()));
     group.quiet();
     let key = (0..).find(|key| log_of(*key, 2) == 0).unwrap();
-    for i in 0..20u64 {
+    for i in 0..proposed {
         group
             .member(2)
             .propose_fast(Route::Key(key), i.to_le_bytes().to_vec());
@@ -714,4 +718,75 @@ fn a_leader_at_its_unmerged_bound_takes_nothing_by_the_fast_track() {
     group.quiet();
     assert_eq!(group.member(2).counts.keyed_applied, before + 1);
     same_everywhere(&mut group);
+}
+
+/// `docs/multilog.md` §3.5: a group of two logs grows to three and shrinks to one while it takes
+/// commands; every member applies the resize at one point, opens and ends the same logs, and
+/// applies the same history, a member restarted from an image taken before the resizes included.
+#[test]
+fn a_group_grows_and_shrinks_its_logs_and_every_member_applies_alike() {
+    let mut group = Group::new(3, 2, 47, ROOMY);
+    group.elect(0, 1);
+    group.elect(1, 1);
+    let write = |group: &mut Group, round: u8| {
+        for key in 0..8u64 {
+            let route = Route::Key(key);
+            assert!(group.member(1).propose(route, vec![round, key as u8]));
+            group.quiet();
+        }
+    };
+    write(&mut group, 0);
+    group.member(3).image_at_next_global = true;
+    assert!(group.member(1).propose(Route::Global, b"g".to_vec()));
+    group.quiet();
+    assert!(group.member(3).image.is_some(), "member 3 took an image");
+    group.member(1).multi.propose_resize(3).unwrap();
+    group.quiet();
+    for member in &group.members {
+        assert_eq!(member.multi.count(), 3, "member {}", member.id);
+        assert_eq!(member.counts.resizes, 1, "member {}", member.id);
+    }
+    group.elect(2, 1);
+    write(&mut group, 1);
+    same_everywhere(&mut group);
+    group.member(1).multi.propose_resize(1).unwrap();
+    group.quiet();
+    for member in &group.members {
+        assert_eq!(member.multi.count(), 1, "member {}", member.id);
+        assert_eq!(member.counts.resizes, 2, "member {}", member.id);
+    }
+    write(&mut group, 2);
+    same_everywhere(&mut group);
+    let applied = group.member(1).counts.keyed_applied;
+    assert_eq!(applied, 24, "every write applied");
+    // Member 3 reopens from its image, two resizes back, and reaches the same history.
+    group.member(3).restart();
+    group.quiet();
+    assert_eq!(group.member(3).multi.count(), 1);
+    same_everywhere(&mut group);
+}
+
+/// A message of another generation of a log (`docs/multilog.md` §3.5) is dropped: one an earlier
+/// generation's leader sent, with a term past this generation's, moves nothing here.
+#[test]
+fn a_message_of_another_generation_of_a_log_is_dropped() {
+    let mut group = Group::new(3, 2, 53, ROOMY);
+    group.elect(1, 1);
+    let term = group.member(2).multi.node(1).unwrap().raft.term();
+    let stale = |generation: i64| Message {
+        msg_type: MessageType::MsgHeartbeat,
+        from: 3,
+        to: 2,
+        term: term + 5,
+        priority: generation << 32,
+        ..Message::default()
+    };
+    group.member(2).multi.step(1, stale(1)).unwrap();
+    assert_eq!(group.member(2).multi.node(1).unwrap().raft.term(), term);
+    group.member(2).multi.step(1, stale(0)).unwrap();
+    assert_eq!(
+        group.member(2).multi.node(1).unwrap().raft.term(),
+        term + 5,
+        "the same generation's message is taken"
+    );
 }

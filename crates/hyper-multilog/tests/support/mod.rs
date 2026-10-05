@@ -7,7 +7,7 @@
 
 use std::collections::BTreeMap;
 
-use hyper_multilog::{Applied, Command, Flow, Installed, Limits, MultiLog, Point, Route};
+use hyper_multilog::{Applied, Command, Flow, Installed, Limits, MultiLog, Point, Refusal, Route};
 use hyper_raft::proto::{ConfState, Entry, HardState, Message, Snapshot, SnapshotMetadata};
 use hyper_raft::{Config, Elections, StateRole, Storage, StorageError};
 
@@ -368,6 +368,9 @@ pub struct Counts {
     pub barriers_proposed: u64,
     pub images: u64,
     pub installed: u64,
+    pub resizes: u64,
+    /// Keyed commands refused for their log after a resize routed their key elsewhere.
+    pub misrouted: u64,
 }
 
 /// One member of a multilog group, with its durable state: each log's disk (inside its member)
@@ -398,6 +401,14 @@ pub struct Member {
     /// What it proposed by the fast track and another entry took the index of, as its logs'
     /// `Ready`s gave them, until the owner takes them.
     pub displaced: Vec<(usize, Entry)>,
+    /// The disks of logs it holds no member of now, by log: ended by a resize, or past the count
+    /// of an image it reopened from. A resize that opens the log again takes its disk back.
+    pub parked: BTreeMap<(usize, u32), Disk>,
+    /// What the members of ended logs sent last, stamped with their generation, until the member
+    /// next settles and sends it.
+    pub last_words: Vec<(usize, Message)>,
+    /// The count of logs the group began with: a member that reopens with no image starts there.
+    pub origin_logs: usize,
 }
 
 impl Member {
@@ -466,6 +477,9 @@ impl Member {
             hold_apply: false,
             fast,
             displaced: Vec::new(),
+            parked: BTreeMap::new(),
+            last_words: Vec::new(),
+            origin_logs: logs,
         }
     }
 
@@ -476,17 +490,32 @@ impl Member {
             .image
             .as_ref()
             .map(|(point, _)| point.clone())
-            .unwrap_or_else(|| Point::origin(vec![self.boot.clone(); self.logs]).unwrap());
+            .unwrap_or_else(|| Point::origin(vec![self.boot.clone(); self.origin_logs]).unwrap());
         let app = self
             .image
             .as_ref()
             .map(|(_, app)| app.clone())
             .unwrap_or_default();
         let mut stores = Vec::new();
-        for log in 0..self.logs {
-            let mut disk = self.multi.node(log).unwrap().store().0.clone();
-            let next = point.cut.next()[log];
+        let held = self.multi.count();
+        for log in 0..held {
+            let generation = self.multi.generation(log).unwrap();
+            if point.cut.generations().get(log) != Some(&generation) {
+                let disk = self.multi.node(log).unwrap().store().0.clone();
+                self.parked.insert((log, generation), disk);
+            }
+        }
+        for log in 0..point.cut.logs() {
             let at = &point.logs[log];
+            let generation = point.cut.generations()[log];
+            let mut disk = if log < held && self.multi.generation(log) == Some(generation) {
+                self.multi.node(log).unwrap().store().0.clone()
+            } else {
+                self.parked
+                    .remove(&(log, generation))
+                    .unwrap_or_else(|| Disk::new(at.configuration.clone()))
+            };
+            let next = point.cut.next()[log];
             if disk.last_index() + 1 < next {
                 // The log ends before the image's cut: it starts again at the image's snapshot.
                 let image = encode_image(&point, &app);
@@ -504,6 +533,7 @@ impl Member {
             disk.conf = at.configuration.clone();
             stores.push(Store(disk));
         }
+        self.logs = point.cut.logs();
         let settings =
             Self::settings_of(self.id, self.members, self.seed, self.suspicion, self.fast);
         self.multi = MultiLog::open(&settings, stores, &point, self.limits)
@@ -514,7 +544,8 @@ impl Member {
     /// Drives `log`'s member until it has nothing to do: each `Ready` persisted, its committed
     /// entries handed to the layer, and what it sends returned with the log's number.
     pub fn drive(&mut self, log: usize, out: &mut Vec<(usize, Message)>) {
-        while self.multi.node(log).unwrap().has_ready() {
+        // A member that reopened from an image of fewer logs holds this one no more.
+        while self.multi.node(log).is_some_and(|node| node.has_ready()) {
             let node = self.multi.node_mut(log).unwrap();
             let mut ready = node.ready().expect("a ready");
             let installed = ready.snapshot().map(|snapshot| {
@@ -568,6 +599,13 @@ impl Member {
         // read of that log, unless an image installed through another log's snapshot moved the
         // merge there already: by its canonical cut it is ahead of the member's whole state, or
         // held (`docs/multilog.md` §5.3).
+        if !self.multi.runs_generations_of(&point) {
+            // A resize lies between the member and the image: it reopens from it.
+            self.image = Some((point, app));
+            self.restart();
+            self.counts.installed += 1;
+            return;
+        }
         match self.multi.install(&point).expect("an image installs") {
             Installed::Ahead => {
                 self.app = app.clone();
@@ -588,8 +626,11 @@ impl Member {
     /// Applies what the logs allow, taking an image at a global command when asked.
     pub fn apply(&mut self) {
         loop {
+            self.fit();
             let mut stopped_at_global = false;
             let want_image = self.image_at_next_global;
+            // A merge resizes only at the end of a call: a call after one routes by its count.
+            let resized = self.multi.merge().cut().resizes() > 0;
             let app = &mut self.app;
             let counts = &mut self.counts;
             let advance = self
@@ -608,8 +649,19 @@ impl Member {
                         }
                         Flow::Continue
                     }
+                    Applied::Refused {
+                        why: Refusal::Misrouted { .. },
+                        ..
+                    } if resized => {
+                        counts.misrouted += 1;
+                        Flow::Continue
+                    }
                     Applied::Refused { .. } => {
                         counts.refused += 1;
+                        Flow::Continue
+                    }
+                    Applied::Resized { .. } => {
+                        counts.resizes += 1;
                         Flow::Continue
                     }
                 })
@@ -622,6 +674,52 @@ impl Member {
                 break;
             }
         }
+    }
+
+    /// The member's logs fitted to a resize its merge applied: the disks of the logs it ended are
+    /// parked, and the logs it added are opened, each on its parked disk or a fresh one.
+    fn fit(&mut self) {
+        let kept = self.multi.count();
+        for ended in self.multi.take_ended() {
+            let (log, generation, mut node) = (ended.log, ended.generation, ended.node);
+            // What it sends last goes out with the member's next messages.
+            let mut said = Vec::new();
+            while node.has_ready() {
+                let mut ready = node.ready().expect("a ready");
+                node.store_mut().0.append(ready.entries());
+                if let Some(hard) = ready.hard_state() {
+                    node.store_mut().0.hard_state = *hard;
+                }
+                said.extend(ready.take_messages());
+                said.extend(ready.take_persisted_messages());
+                let mut light = node.advance_append(ready).expect("advanced");
+                said.extend(light.take_messages());
+            }
+            for mut message in said {
+                MultiLog::<Store>::stamp_ended(generation, &mut message);
+                self.last_words.push((log, message));
+            }
+            self.parked
+                .insert((log, generation), node.store().0.clone());
+        }
+        let logs = self.multi.merge().logs();
+        if logs > kept {
+            let configuration = self.multi.configuration_for_new_logs();
+            let stores = (kept..logs)
+                .map(|log| {
+                    let generation = self.multi.merge().generation(log).unwrap();
+                    Store(
+                        self.parked
+                            .remove(&(log, generation))
+                            .unwrap_or_else(|| Disk::new(configuration.clone())),
+                    )
+                })
+                .collect();
+            self.multi
+                .open_logs(stores)
+                .expect("the logs a resize added open");
+        }
+        self.logs = self.multi.count();
     }
 
     /// An image at the merge's canonical cut, made durable, and every log compacted to it.
@@ -654,7 +752,18 @@ impl Member {
             self.drive(log, out);
         }
         if !self.hold_apply {
-            self.apply();
+            // A resize the merge applied may open logs, whose members give what they hold to
+            // apply once driven: until none opens, drive them and apply again.
+            loop {
+                let logs = self.logs;
+                self.apply();
+                if self.logs <= logs {
+                    break;
+                }
+                for log in logs..self.logs {
+                    self.drive(log, out);
+                }
+            }
         }
         if self.auto_barriers {
             self.barriers();
@@ -666,10 +775,13 @@ impl Member {
         for (log, message) in out.iter_mut() {
             self.multi.stamp(*log, message);
         }
+        out.append(&mut self.last_words);
     }
 
     pub fn leads(&self, log: usize) -> bool {
-        self.multi.node(log).unwrap().raft.state() == StateRole::Leader
+        self.multi
+            .node(log)
+            .is_some_and(|node| node.raft.state() == StateRole::Leader)
     }
 
     pub fn propose(&mut self, route: Route, command: Vec<u8>) -> bool {

@@ -156,6 +156,7 @@ impl Out {
                 }
             }
             Applied::Refused { log, index, why } => Self::Refused { log, index, why },
+            Applied::Resized { .. } => panic!("these histories hold no resize"),
         }
     }
 }
@@ -928,4 +929,131 @@ proptest! {
         oracle.check(&history, &out, &merge, &format!("{history:?} by {order:?}, stopping"));
         prop_assert_eq!(history_of(&out), history_of(&whole));
     }
+}
+
+/// An entry of `data` at `index`.
+fn at(index: u64, data: Vec<u8>) -> Entry {
+    Entry {
+        entry_type: EntryType::EntryNormal,
+        term: 1,
+        index,
+        data,
+        context: Vec::new(),
+    }
+}
+
+/// What a run over `logs`, each held whole, handed the owner.
+fn run_whole(merge: &mut Merge, logs: &[Vec<Entry>]) -> (Vec<String>, Advance) {
+    let held = Held {
+        logs,
+        through: logs.iter().map(|log| log.len() as u64).collect(),
+    };
+    let mut out = Vec::new();
+    let advance = merge
+        .advance(&held, u64::MAX, &mut |applied| {
+            out.push(match applied {
+                Applied::Command(command) => format!(
+                    "{}@{} key {:?} epoch {}",
+                    command.log, command.index, command.key, command.epoch
+                ),
+                Applied::Refused { log, index, why } => format!("{log}@{index} refused {why:?}"),
+                Applied::Resized { index, logs, was } => {
+                    format!("0@{index} resized {was} to {logs}")
+                }
+            });
+            Flow::Continue
+        })
+        .unwrap();
+    (out, advance)
+}
+
+/// `docs/multilog.md` §3.5, growing: the resize is taken as a global is, once every log stands at
+/// a barrier naming it, and the merge stops after it; the log it adds is read from its first
+/// entry, and every keyed command consumed after it is routed by the new count, so one routed by
+/// the old count and committed after the resize is refused, alike on every member.
+#[test]
+fn a_resize_that_adds_a_log_routes_what_follows_it_by_the_new_count() {
+    let moved = (0..)
+        .find(|key| log_of(*key, 2) == 1 && log_of(*key, 3) != 1)
+        .unwrap();
+    let stays = (0..)
+        .find(|key| log_of(*key, 2) == 1 && log_of(*key, 3) == 1)
+        .unwrap();
+    let added = key_in(2, 3);
+    let logs = vec![
+        vec![
+            at(1, entry::resize(3).unwrap()),
+            at(2, entry::keyed_command(vec![2], added).unwrap()),
+        ],
+        vec![
+            at(1, entry::keyed_command(vec![1], stays).unwrap()),
+            at(2, entry::barrier_naming(1).unwrap()),
+            at(3, entry::keyed_command(vec![3], moved).unwrap()),
+            at(4, entry::keyed_command(vec![4], stays).unwrap()),
+        ],
+        vec![at(1, entry::keyed_command(vec![5], added).unwrap())],
+    ];
+    let mut merge = Merge::new(2).unwrap();
+    let (before, advance) = run_whole(&mut merge, &logs[..2]);
+    assert_eq!(
+        before,
+        [
+            format!("1@1 key {:?} epoch 0", Some(stays)),
+            "0@1 resized 2 to 3".to_owned(),
+        ]
+    );
+    assert!(advance.more, "the merge stops at the resize");
+    assert_eq!(merge.logs(), 3);
+    assert_eq!(merge.next(2), Some(1));
+    let (after, _) = run_whole(&mut merge, &logs);
+    assert_eq!(
+        after,
+        [
+            format!("1@3 refused {:?}", Refusal::Misrouted { key: moved }),
+            format!("1@4 key {:?} epoch 1", Some(stays)),
+            format!("2@1 key {:?} epoch 1", Some(added)),
+            format!("0@2 refused {:?}", Refusal::Misrouted { key: added }),
+        ]
+    );
+}
+
+/// `docs/multilog.md` §3.5, shrinking: the logs past the new count end at their barrier for the
+/// resize, and nothing after it there is read; every key routes among the logs that are left.
+#[test]
+fn a_resize_that_ends_logs_reads_nothing_past_their_barrier() {
+    let elsewhere = key_in(2, 3);
+    let logs = vec![
+        vec![
+            at(1, entry::resize(1).unwrap()),
+            at(2, entry::keyed_command(vec![1], elsewhere).unwrap()),
+        ],
+        vec![
+            at(1, entry::barrier_naming(1).unwrap()),
+            at(2, entry::keyed_command(vec![2], key_in(1, 3)).unwrap()),
+        ],
+        vec![
+            at(1, entry::barrier_naming(1).unwrap()),
+            at(2, entry::resize(5).unwrap()),
+        ],
+    ];
+    let mut merge = Merge::new(3).unwrap();
+    let (before, _) = run_whole(&mut merge, &logs);
+    assert_eq!(before, ["0@1 resized 3 to 1".to_owned()]);
+    assert_eq!(merge.logs(), 1);
+    let (after, advance) = run_whole(&mut merge, &logs[..1]);
+    assert_eq!(after, [format!("0@2 key {:?} epoch 1", Some(elsewhere))]);
+    assert!(!advance.more);
+}
+
+/// A resize anywhere but log 0 is refused alike on every member, and changes nothing.
+#[test]
+fn a_resize_outside_log_0_is_refused() {
+    let logs = vec![vec![], vec![at(1, entry::resize(4).unwrap())]];
+    let mut merge = Merge::new(2).unwrap();
+    let (out, _) = run_whole(&mut merge, &logs);
+    assert_eq!(
+        out,
+        [format!("1@1 refused {:?}", Refusal::ResizeOutsideLogZero)]
+    );
+    assert_eq!(merge.logs(), 2);
 }

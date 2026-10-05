@@ -22,7 +22,7 @@ use std::num::NonZeroUsize;
 
 use hyper_check::explore::{Outcome, explore};
 use hyper_check::search::{Budget, MEMORY_CEILING};
-use reconfig::{Elections, Reconfig, Scenario, Scope, Stand};
+use reconfig::{Elections, Precedence, Reconfig, Scenario, Scope, Stand};
 
 fn scope(
     scenario: Scenario,
@@ -34,6 +34,7 @@ fn scope(
 ) -> Scope {
     let servers = match scenario {
         Scenario::Single | Scenario::SingleJoint => 2,
+        Scenario::Remove => 3,
         Scenario::Promote | Scenario::Joint => 4,
     };
     Scope {
@@ -45,6 +46,9 @@ fn scope(
         commits,
         stand,
         scenario,
+        priority: [0; reconfig::MAX_SERVERS],
+        precedence: Precedence::Log,
+        elects: false,
         reached: false,
         stood: false,
         reduce: false,
@@ -76,6 +80,14 @@ fn ends(scope: Scope) -> End {
     }
 }
 
+/// The scope with `Elects` checked.
+fn electing(scope: Scope) -> Scope {
+    Scope {
+        elects: true,
+        ..scope
+    }
+}
+
 fn reduced(scope: Scope) -> Scope {
     Scope {
         reduce: true,
@@ -98,9 +110,16 @@ fn the_applied_rule_elects_two_leaders_of_a_term() {
 /// rule: every invariant, at the states TLC counts (`ReconfigSingle.cfg`, `ReconfigSingleJoint.cfg`).
 #[test]
 fn the_core_rule_holds_where_a_sole_voter_adds_a_second() {
-    let single = scope(Scenario::Single, 3, 3, Newest, Newest, Stand::Needed);
+    let single = electing(scope(Scenario::Single, 3, 3, Newest, Newest, Stand::Needed));
     assert_eq!(ends(single), End::Exhausted(31_203));
-    let joint = scope(Scenario::SingleJoint, 3, 3, Newest, Newest, Stand::Needed);
+    let joint = electing(scope(
+        Scenario::SingleJoint,
+        3,
+        3,
+        Newest,
+        Newest,
+        Stand::Needed,
+    ));
     assert_eq!(ends(joint), End::Exhausted(24_460));
 }
 
@@ -110,19 +129,26 @@ fn the_core_rule_holds_where_a_sole_voter_adds_a_second() {
 #[test]
 #[ignore = "the full scopes, in release; CI's explore job runs them"]
 fn the_core_rule_holds_through_two_changes() {
-    let joint = scope(Scenario::Joint, 2, 2, Newest, Newest, Stand::Needed);
+    let joint = electing(scope(Scenario::Joint, 2, 2, Newest, Newest, Stand::Needed));
     assert_eq!(ends(joint), End::Exhausted(4_945_526));
-    let promote = scope(Scenario::Promote, 2, 2, Newest, Newest, Stand::Needed);
+    let promote = electing(scope(
+        Scenario::Promote,
+        2,
+        2,
+        Newest,
+        Newest,
+        Stand::Needed,
+    ));
     assert_eq!(ends(promote), End::Exhausted(6_496_567));
     for (scenario, terms, length, classes) in REDUCED {
-        let scope = reduced(scope(
+        let scope = reduced(electing(scope(
             *scenario,
             *terms,
             *length,
             Newest,
             Newest,
             Stand::Needed,
-        ));
+        )));
         assert_eq!(
             ends(scope),
             End::Exhausted(*classes),
@@ -167,4 +193,25 @@ fn the_scopes_reach_what_they_are_for() {
     let mut stood = reduced(scope(Scenario::Joint, 2, 2, Newest, Newest, Stand::Needed));
     stood.stood = true;
     assert_eq!(ends(stood), End::Fault(reconfig::Fault::NoElectedUnnamed));
+}
+
+/// Swarm group seed 9,657's shape: A, of the highest priority, holds the longest log, of an older
+/// term; C, which counts by the joint configuration that removes B, needs A's vote. By raft-rs's
+/// precedence of length A refuses both candidates of the later term and can never be elected itself,
+/// and with every member up the group elects no one; by the log's precedence, the core's, some
+/// member can always be elected (`docs/raft.md` §3.3, `ReconfigRemove.cfg`,
+/// `ReconfigRemoveLength.cfg`).
+#[test]
+fn by_the_logs_precedence_a_group_with_every_member_up_can_always_elect() {
+    let ranked = |precedence| Scope {
+        priority: [2, 0, 1, 0],
+        precedence,
+        elects: true,
+        ..scope(Scenario::Remove, 2, 3, Newest, Newest, Stand::Needed)
+    };
+    assert_eq!(ends(ranked(Precedence::Log)), End::Exhausted(667_123));
+    assert_eq!(
+        ends(ranked(Precedence::Length)),
+        End::Fault(reconfig::Fault::Elects)
+    );
 }

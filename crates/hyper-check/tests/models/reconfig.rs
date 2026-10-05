@@ -43,6 +43,16 @@ pub enum Stand {
     Needed,
 }
 
+/// `Precedence`: what a candidate of lower priority must hold to be voted for all the same.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Precedence {
+    /// A log more current than the voter's: a later last term, or the same and more entries (the
+    /// core's).
+    Log,
+    /// More entries than the voter, whatever their terms (raft-rs's, the core's tests' alone).
+    Length,
+}
+
 /// `Scenario`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Scenario {
@@ -50,6 +60,9 @@ pub enum Scenario {
     Joint,
     Single,
     SingleJoint,
+    /// B removed from A, B, C through a joint configuration, left by itself (swarm group seed
+    /// 9,657's change).
+    Remove,
 }
 
 /// A configuration: voters, the voters it leaves, learners; a bit a member.
@@ -85,6 +98,11 @@ const JOINT: [Conf; 3] = [
 ];
 const SINGLE: [Conf; 2] = [conf(A, 0, B), conf(A | B, 0, 0)];
 const SINGLE_JOINT: [Conf; 3] = [conf(A, 0, 0), conf(A | B, A, 0), conf(A | B, 0, 0)];
+const REMOVE: [Conf; 3] = [
+    conf(A | B | C, 0, 0),
+    conf(A | C, A | B | C, 0),
+    conf(A | C, 0, 0),
+];
 
 impl Scenario {
     pub fn chain(self) -> &'static [Conf] {
@@ -93,6 +111,7 @@ impl Scenario {
             Self::Joint => &JOINT,
             Self::Single => &SINGLE,
             Self::SingleJoint => &SINGLE_JOINT,
+            Self::Remove => &REMOVE,
         }
     }
 }
@@ -109,6 +128,14 @@ pub struct Scope {
     /// `Stand`.
     pub stand: Stand,
     pub scenario: Scenario,
+    /// `Priority`: each member's rank in elections, in force once it has a term and while it may
+    /// campaign (`Raft::settle_priority`).
+    pub priority: [u8; MAX_SERVERS],
+    /// `Precedence`.
+    pub precedence: Precedence,
+    /// Whether `Elects` is checked: in every state some member could be elected, at a term past
+    /// every member's, with every member up.
+    pub elects: bool,
     /// Whether `NoElectedOnPending` is checked (the scope must reach it).
     pub reached: bool,
     /// Whether `NoElectedUnnamed` is checked (the scope must reach it).
@@ -178,6 +205,7 @@ pub enum Fault {
     LogMatching,
     NoElectedOnPending,
     NoElectedUnnamed,
+    Elects,
 }
 
 pub type Key = [u64; WORDS];
@@ -450,13 +478,54 @@ impl Reconfig {
     fn campaigns(&self, state: &State, c: usize) -> bool {
         state.term[c] < self.scope.max_term && self.stands(state, c)
     }
+    /// `InForce(m)`: a member's priority judges nothing before it has a term or while it may not
+    /// campaign.
+    fn in_force(&self, state: &State, m: usize) -> u8 {
+        if state.term[m] == 0 || !self.stands(state, m) {
+            0
+        } else {
+            self.scope.priority[m]
+        }
+    }
+    /// `Ranked(c, p, m)`: `m` may vote for `c`, asking with priority `p`, by priority: `c` ranks
+    /// at least as high, or holds what the precedence asks of a candidate of lower priority.
+    fn ranked(&self, state: &State, c: usize, p: u8, m: usize) -> bool {
+        let ahead = match self.scope.precedence {
+            Precedence::Log => {
+                let (lc, lm) = (Self::last_term(state, c), Self::last_term(state, m));
+                lc > lm || (lc == lm && state.len[c] > state.len[m])
+            }
+            Precedence::Length => state.len[c] > state.len[m],
+        };
+        self.in_force(state, m) <= p || ahead
+    }
+    /// `Grants(c, p, m)`.
+    fn grants(&self, state: &State, c: usize, p: u8, m: usize) -> bool {
+        Self::current(state, c, m) && self.ranked(state, c, p, m)
+    }
     fn asked(&self, state: &State, c: usize, q: u8) -> bool {
         !has(q, c)
             && (0..self.scope.servers).filter(|m| has(q, *m)).all(|m| {
                 (state.term[m] < state.term[c] + 1
                     || (state.term[m] == state.term[c] + 1 && state.vote[m] == NOBODY))
-                    && Self::current(state, c, m)
+                    && self.grants(state, c, self.in_force(state, c), m)
             })
+    }
+    /// `Elects`: some member that may campaign is granted, at a term past every member's, the
+    /// votes of a quorum of the configuration it counts by. It asks with its priority, in force
+    /// from its first term on (the campaign out of term 0 asks with none, as the core's does).
+    fn elects(&self, state: &State) -> bool {
+        (0..self.scope.servers).any(|c| {
+            if !self.stands(state, c) {
+                return false;
+            }
+            let counted = self.election_conf(state, c);
+            let granted = (0..self.scope.servers)
+                .filter(|m| has(Self::voters(counted), *m))
+                .filter(|m| *m == c || self.grants(state, c, self.scope.priority[c], *m))
+                .fold(0u8, |mask, m| mask | bit(m));
+            Self::quorum_of(counted, granted)
+        })
     }
     fn quorums(&self, state: &State, c: usize, q: u8) -> Vec<u8> {
         let counted = self.election_conf(state, c);
@@ -569,6 +638,9 @@ impl Reconfig {
             |l: usize| state.leader[l] && !has(Self::voters(self.election_conf(state, l)), l);
         if self.scope.stood && (0..n).any(unnamed) {
             return Some(Fault::NoElectedUnnamed);
+        }
+        if self.scope.elects && !self.elects(state) {
+            return Some(Fault::Elects);
         }
         None
     }
@@ -760,7 +832,9 @@ impl Model for Reconfig {
             *state
         };
         let mut key = self.pack(&reduced);
-        if self.scope.symmetry && matches!(self.scope.scenario, Scenario::Joint | Scenario::Promote)
+        if self.scope.symmetry
+            && matches!(self.scope.scenario, Scenario::Joint | Scenario::Promote)
+            && self.scope.priority[1] == self.scope.priority[2]
         {
             key = key.min(self.pack(&Self::swapped(&reduced)));
         }

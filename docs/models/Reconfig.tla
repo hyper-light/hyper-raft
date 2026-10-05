@@ -26,6 +26,18 @@
 (*              is past its commit, a voter of the configuration before   *)
 (*              it, for the group may still need it (thesis §4.2.2, the   *)
 (*              core's); its own vote counts only where it is a voter.     *)
+(* A voter of higher priority votes for a candidate of lower only where   *)
+(* the candidate holds what Precedence asks of it:                         *)
+(*   "log"      a log more current than the voter's, a later last term or *)
+(*              the same and more entries (the core's);                   *)
+(*   "length"   more entries, whatever their terms (raft-rs's, which the  *)
+(*              core keeps for its differential tests alone).             *)
+(* A member's priority (Ranking) is in force once it has a term and while *)
+(* it may campaign (Raft::settle_priority).  Elects is the liveness the   *)
+(* rule is for, as a state predicate: with every member up, some member   *)
+(* could be elected at a term past every member's (docs/raft.md §3.3,     *)
+(* hyper-check's swarm, group seed 9,657).                                 *)
+(*                                                                         *)
 (* A configuration entry a later leader overwrites is gone from the log,  *)
 (* and the newest configuration falls back to the one before (thesis      *)
 (* §4.1): the definitions read the log as it is.                           *)
@@ -42,7 +54,9 @@ EXTENDS Naturals, FiniteSets, Sequences, TLC
 
 CONSTANTS Servers, Values, Noop, Nobody, MaxTerm, MaxLen, Elections, Commits, Stand,
           A, B, C, D,  \* the four members the scenarios name
-          Scenario,    \* "promote" | "joint"
+          Scenario,    \* "promote" | "joint" | "single" | "singlejoint" | "remove"
+          Ranking,     \* "none": no member ranks above another; "ac": A, then C
+          Precedence,  \* "log" | "length"
           StateBudget
 
 \* A configuration: voters, the voters it leaves (joint), learners.
@@ -53,6 +67,8 @@ Conf(v, o, l) == [voters |-> v, outgoing |-> o, learners |-> l]
 \* it applied, A commits by {A} until the entry is committed, while B
 \* counts its elections by {A, B}.
 \* "singlejoint": the same through a joint configuration.
+\* "remove": B removed from A, B, C through a joint configuration (swarm
+\* group seed 9,657's change).
 Chain ==
   CASE Scenario = "promote" ->
          << Conf({A, B, C}, {}, {D}), Conf({A, B, C, D}, {}, {}), Conf({B, C, D}, {}, {A}) >>
@@ -62,6 +78,8 @@ Chain ==
          << Conf({A}, {}, {B}), Conf({A, B}, {}, {}) >>
     [] Scenario = "singlejoint" ->
          << Conf({A}, {}, {}), Conf({A, B}, {A}, {}), Conf({A, B}, {}, {}) >>
+    [] Scenario = "remove" ->
+         << Conf({A, B, C}, {}, {}), Conf({A, C}, {A, B, C}, {}), Conf({A, C}, {}, {}) >>
 
 Indexes == 1..MaxLen
 Configs == 2..Len(Chain)
@@ -185,10 +203,23 @@ Stands(c) ==
      /\ commit[c] < NewestAt(log[c])
      /\ c \in Voters(ConfThrough(log[c], NewestAt(log[c]) - 1))
 Campaigns(c) == term[c] < MaxTerm /\ Stands(c)
+Priority(s) ==
+  CASE Ranking = "none" -> 0
+    [] Ranking = "ac" -> IF s = A THEN 2 ELSE IF s = C THEN 1 ELSE 0
+InForce(s) == IF term[s] = 0 \/ ~Stands(s) THEN 0 ELSE Priority(s)
+Ahead(c, m) ==
+  IF Precedence = "log"
+  THEN \/ LastTerm(log[c]) > LastTerm(log[m])
+       \/ LastTerm(log[c]) = LastTerm(log[m]) /\ Len(log[c]) > Len(log[m])
+  ELSE Len(log[c]) > Len(log[m])
+\* m votes for c, which asks with priority p.
+Grants(c, p, m) == Current(c, m) /\ (InForce(m) <= p \/ Ahead(c, m))
+\* A campaign asks with the priority in force before it: out of term 0,
+\* with none (as the core's does).
 Asked(c, Q) ==
   /\ c \notin Q
   /\ \A m \in Q : /\ term[m] < term[c] + 1 \/ (term[m] = term[c] + 1 /\ vote[m] = Nobody)
-                  /\ Current(c, m)
+                  /\ Grants(c, InForce(c), m)
 Quorums(c, Q) ==
   LET counted == ElectionConf(c) IN
   {{}} \cup {V \in SUBSET ((Q \cup {c}) \cap Voters(counted)) :
@@ -259,6 +290,15 @@ NoElectedOnPending == ~ElectedOnPending
 ElectedUnnamed ==
   \E l \in Servers : role[l] = "leader" /\ l \notin Voters(ElectionConf(l))
 NoElectedUnnamed == ~ElectedUnnamed
+
+\* With every member up, some member that may campaign is granted, at a
+\* term past every member's and asking with its priority, the votes of a
+\* quorum of the configuration it counts by.
+Elects ==
+  \E c \in Servers :
+    /\ Stands(c)
+    /\ LET counted == ElectionConf(c)
+       IN QuorumOf(counted, {m \in Voters(counted) : m = c \/ Grants(c, Priority(c), m)})
 
 WithinBudget == TLCGet("distinct") <= StateBudget
 =============================================================================

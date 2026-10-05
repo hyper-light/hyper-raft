@@ -216,6 +216,8 @@ the reductions that note argues sound.
 | `rapplied` | `ReconfigApplied.cfg` | `rjoint` by the configuration applied (raft-rs's rule) | 1,171,121 | refused: `OneLeader` |
 | `rpending` | `ReconfigPending.cfg` | `rjoint` and the claim `NoElectedOnPending` | 603 | refused: `NoElectedOnPending` |
 | `rstood` | `ReconfigStood.cfg` | `rjoint` and the claim `NoElectedUnnamed` | 27,962 | refused: `NoElectedUnnamed` |
+| `rremove` | `ReconfigRemove.cfg` | the core's rule with priority (A, then C) by the log's precedence, B removed through a joint configuration, 2 terms, 3 indexes | 667,123 | passes |
+| `rlength` | `ReconfigRemoveLength.cfg` | `rremove` by raft-rs's precedence of length | 848 | refused: `Elects` |
 
 Elections by the newest configuration and commitment by the one applied, the thesis's rule for
 elections alone, is refused for `LeaderHolds` only at three terms, past what TLC runs here at one
@@ -270,6 +272,22 @@ New with it:
 The suite no longer fits one job's timeout at four workers (run 37336523719 passed 131 minutes), so
 CI runs it in five parts side by side, each configuration naming its part in
 `scripts/check-model.sh`; in run 37358361974 the longest part took 55 minutes.
+
+**Priority and the liveness it is for (2026-10-05).** A voter of higher priority votes for a
+candidate of lower only where the candidate holds what `Precedence` asks: by `"log"`, the core's,
+a more current log; by `"length"`, raft-rs's, more entries (`Grants`). A member's priority is in
+force once it has a term and while it may campaign, as `Raft::settle_priority` has it. `Elects`
+states the liveness the precedence is for as a state predicate: with every member up, some member
+that may campaign is granted, at a term past every member's, the votes of a quorum of the
+configuration it counts by. The core's configurations check it (`rjoint`, `rpromote`, `rsingle`,
+`rsinglejoint`, with no member ranked above another, and `rremove`, ranked). `rlength` is
+`rremove` by raft-rs's rule, and the checker must refuse it: A, of the highest priority, holds the
+longest log, of an older term, refuses both candidates of the later term, one of which counts by
+the joint configuration that needs A's vote, and can never be elected itself, the shape of
+hyper-check's swarm, group seed 9,657, which no model checked before, as none had priority or a
+liveness property (`docs/raft.md` §3.3). CI's TLC counted both (run 37387647725: `rremove` at the
+mirror's 667,123, `rlength` refused at 848). The mirror finds the same
+(`by_the_logs_precedence_a_group_with_every_member_up_can_always_elect`).
 
 **To change the model.** A change that makes a configuration larger or smaller fails the check
 until its states are counted again and stated; a new configuration is first run with a

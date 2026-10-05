@@ -70,6 +70,8 @@ rsinglejoint ReconfigSingleJoint.cfg      -                       reconfig Recon
 rapplied     ReconfigApplied.cfg          OneLeader               reconfig Reconfig
 rpending     ReconfigPending.cfg          NoElectedOnPending      reconfig Reconfig
 rstood       ReconfigStood.cfg            NoElectedUnnamed        reconfig Reconfig
+rremove      ReconfigRemove.cfg           -                       reconfig Reconfig
+rlength      ReconfigRemoveLength.cfg     Elects                  reconfig Reconfig
 scenario     FastTrackScenario.cfg        -                       scenario FastTrackScenario
 before       FastTrackScenarioBefore.cfg  LeaderHolds             scenario FastTrackScenario
 covered      FastTrackScenarioCovered.cfg LeaderHolds             scenario FastTrackScenario

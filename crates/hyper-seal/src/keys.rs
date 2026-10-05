@@ -149,7 +149,7 @@ impl WrappingKey {
         if wrapped.parent != self.id || wrapped.generation != self.generation {
             return Err(SealError::Unwrap);
         }
-        let mut child = Secret32::zeroed();
+        let mut child = Secret32::zeroed()?;
         let written = guarded(SealError::Unwrap, || {
             let kek = AesKek::new(&AES_256, self.secret.bytes())?;
             kek.unwrap(&wrapped.key, child.bytes_mut()).map(|w| w.len())
@@ -250,7 +250,7 @@ mod tests {
     use super::*;
 
     fn key(bytes: [u8; 32]) -> WrappingKey {
-        WrappingKey::new(KeyId([1; 16]), 0, Secret32::from_bytes(&bytes))
+        WrappingKey::new(KeyId([1; 16]), 0, Secret32::from_bytes(&bytes).unwrap())
     }
 
     /// RFC 3394 §4.6: 256 bits of key data with a 256-bit KEK.
@@ -268,7 +268,7 @@ mod tests {
             0x1A, 0x99, 0xF4, 0x3B, 0xFB, 0x98, 0x8B, 0x9B, 0x7A, 0x02, 0xDD, 0x21,
         ];
         let parent = key(kek);
-        let wrapped = parent.wrap(&Secret32::from_bytes(&data)).unwrap();
+        let wrapped = parent.wrap(&Secret32::from_bytes(&data).unwrap()).unwrap();
         assert_eq!(wrapped.key, expected);
         assert_eq!(parent.unwrap(&wrapped).unwrap().bytes(), &data);
     }

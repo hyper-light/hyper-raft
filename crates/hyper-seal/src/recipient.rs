@@ -113,7 +113,7 @@ impl KeyType for Kek {
 
 /// The key-encryption key from the shared secrets and everything public about the record.
 fn derive_kek(ikm: &[&[u8]], info: &[&[u8]]) -> Result<Secret32, SealError> {
-    let mut kek = Secret32::zeroed();
+    let mut kek = Secret32::zeroed()?;
     let mut joined = Vec::new();
     for part in ikm {
         joined.extend_from_slice(part);
@@ -215,7 +215,7 @@ impl Recipient {
         let wrapped = record
             .get(record.len().saturating_sub(WRAPPED_KEY)..)
             .ok_or(SealError::Malformed)?;
-        let mut out = Secret32::zeroed();
+        let mut out = Secret32::zeroed()?;
         let written = guarded(SealError::Unwrap, || {
             let kw = AesKek::new(&AES_256, kek.bytes())?;
             kw.unwrap(wrapped, out.bytes_mut()).map(|w| w.len())

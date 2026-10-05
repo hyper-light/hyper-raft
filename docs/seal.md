@@ -127,7 +127,9 @@ The root key is never on a data device. `hyper-seal` gives two sources and the t
 
 - **`FileSource`**: 32 bytes in a file the configuration names, created owner-only (0600 on Unix, an
   ACL of the owner alone on Windows), refused at open if any other principal can read it, read-only
-  where the operator says so (slates).
+  where the operator says so (slates). The crates here are sans-io, so the consumer's device module
+  creates and reads the file; `hyper-seal` checks its permissions from its metadata and takes its
+  bytes.
 - **`MemorySource`**: a key held only in locked memory (§8), for tests and for a key a consumer was
   handed (a successor's unwrapped volume key, §6).
 - **Hardware and services** implement the trait in the consumer or its platform module: the macOS
@@ -332,11 +334,16 @@ to a hibernation image: macOS writes them to its image (encrypted under FileVaul
 
 - **Servers** turn hibernation off at install, and say so.
 - **Laptops** (focal, days of use): the hibernation image is protected by full-disk encryption at
-  rest, which the consumer's install requires, and every key in the arena is wiped on the OS's
-  suspend notification where it gives one (`Arena::wipe_all`), the keys unwrapped again from the
-  key source on resume. Keys share locked pages from one arena,
-so a process locks a bounded number of pages (a stated count, refused past it), not a page a key.
-The arena's size is the consumer's stated count of keys held at once.
+  rest, which the consumer's install requires, and on the OS's suspend notification, where it gives
+  one, the consumer drops every key it holds, each wiped as it drops, and checks with `keys_held`
+  that none is left before it lets the suspend go on; it unwraps them again from the key source on
+  resume. The region does not wipe keys under their owners: a key zeroed while still held would seal
+  under zeros without an error. Keys share one locked region for the whole process, made once by `lock_keys(count)` with the
+consumer's stated count of keys held at once and rounded up to whole pages, so a process locks a
+bounded number of pages, not a page a key, and stays inside its locked-memory limit
+(`RLIMIT_MEMLOCK`, or the minimum working set on Windows). A key is a 32-byte slot claimed through
+an atomic bitmap; past the count a key is refused (`Capacity`), and a region the OS will not lock
+is refused (`Lock`), never used unlocked.
 
 A consumer that holds plaintext in RAM between writes (slates' "at rest is idle RAM") seals it with
 §4's construction under a volume key in a `Secret32`, and keeps only the sealed bytes; its plaintext

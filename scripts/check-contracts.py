@@ -40,7 +40,10 @@ UNSAFE_ALLOWED = {
     "crates/hyper-measure/src/wake.rs":
         "std::task::RawWaker over a leaked slot (counting wakers; tests and benchmarks only)",
     "crates/hyper-seal/src/memory.rs":
-        "std::ptr::write_volatile over a key's own bytes (the wipe a dropped key gets, never elided)",
+        "std::alloc::alloc_zeroed for the process's key region, mlock(2) and madvise(2) "
+        "MADV_DONTDUMP through rustix (Unix), VirtualLock through windows-sys (Windows), the "
+        "region's key slots read and written by their one claimer, and std::ptr::write_volatile "
+        "for the wipe a dropped key gets",
     "crates/hyper-block/src/node/macos.rs":
         "the disk ioctls of <sys/disk.h> (a device node's capacity and cache flush)",
     "crates/hyper-raft-e2e/src/fault_windows.rs":

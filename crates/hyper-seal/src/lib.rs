@@ -38,7 +38,7 @@ pub mod recipient;
 pub mod stream;
 
 pub use error::SealError;
-pub use memory::Secret32;
+pub use memory::{Secret32, keys_held, lock_keys};
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
@@ -67,7 +67,7 @@ pub fn fips() -> bool {
 /// 32 bytes from the operating system's random source, straight into a [`Secret32`]: `getrandom`
 /// fails with an error where AWS-LC's own generator aborts (§3.4).
 pub(crate) fn random_secret() -> Result<Secret32, SealError> {
-    let mut secret = Secret32::zeroed();
+    let mut secret = Secret32::zeroed()?;
     getrandom::fill(secret.bytes_mut()).map_err(|_| SealError::Random)?;
     Ok(secret)
 }

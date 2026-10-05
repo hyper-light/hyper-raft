@@ -31,6 +31,13 @@ pub enum SealError {
     /// A key source refused, with its own reason.
     #[error("the key source refused: {0}")]
     Source(&'static str),
+    /// No slot for a key: the locked region was not made ([`crate::lock_keys`]), or every slot of
+    /// its stated count is held.
+    #[error("no slot for a key in the locked region")]
+    Capacity,
+    /// The OS would not lock the region: the process's locked-memory limit.
+    #[error("the OS would not lock the key region")]
+    Lock,
     /// AWS-LC unwound; caught at the boundary.
     #[error("the cryptographic library unwound")]
     Unwound,

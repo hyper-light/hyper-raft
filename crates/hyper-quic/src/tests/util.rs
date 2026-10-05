@@ -795,6 +795,22 @@ fn set_congestion_experienced(
 }
 
 lazy_static! {
-    pub(crate) static ref CERTIFIED_KEY: rcgen::CertifiedKey<rcgen::KeyPair> =
-        rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+    /// The same identity every run, so a handshake's flights are the same length every run and the
+    /// tests that count bytes, windows and datagrams are exact: rcgen's default is a random ECDSA
+    /// P-256 key, whose signatures take a random nonce and are 70 to 72 bytes in DER, so the server's
+    /// CertificateVerify changed length handshake to handshake. An Ed25519 key from a fixed seed (RFC
+    /// 8410 §7's PKCS#8 form) signs deterministically (RFC 8032 §5.1.6), with a fixed serial.
+    pub(crate) static ref CERTIFIED_KEY: rcgen::CertifiedKey<rcgen::KeyPair> = {
+        let mut pkcs8 = vec![
+            0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x04, 0x22, 0x04,
+            0x20,
+        ];
+        pkcs8.extend_from_slice(&[0x5a; 32]);
+        let signing_key =
+            rcgen::KeyPair::try_from(&rustls::pki_types::PrivatePkcs8KeyDer::from(pkcs8)).unwrap();
+        let mut params = rcgen::CertificateParams::new(vec!["localhost".into()]).unwrap();
+        params.serial_number = Some(rcgen::SerialNumber::from(0x0123_4567_89ab_cdef_u64));
+        let cert = params.self_signed(&signing_key).unwrap();
+        rcgen::CertifiedKey { cert, signing_key }
+    };
 }

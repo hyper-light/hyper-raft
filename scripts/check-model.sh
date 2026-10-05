@@ -33,8 +33,9 @@ digest=936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88
 memory="${TLC_MEMORY_MB:-256}"
 workers="${TLC_WORKERS:-1}"
 
-# NAME CONFIGURATION REFUSED: the invariant the checker must find violated, or - for one that
-# passes.
+# NAME CONFIGURATION REFUSED [MODULE]: the invariant the checker must find violated, or - for one
+# that passes; the module checked, FastTrack unless named (a scenario, FastTrackScenario, is
+# FastTrack held to an order of leaders and proposals).
 configurations="
 one          FastTrack.cfg                  -
 round        FastTrackRound.cfg             -
@@ -56,6 +57,15 @@ markedwhole  MarkedWhole.cfg                LeaderHolds
 markedreach  MarkedReached.cfg              NoMarkedLeader
 changereach  MarkedChangeReached.cfg        NoMarkedLeader
 jointreach   MarkedJointReached.cfg         NoMarkedLeader
+scenario     FastTrackScenario.cfg          -              FastTrackScenario
+before       FastTrackScenarioBefore.cfg    LeaderHolds    FastTrackScenario
+covered      FastTrackScenarioCovered.cfg   LeaderHolds    FastTrackScenario
+logs         FastTrackScenarioLogs.cfg      LeaderHolds    FastTrackScenario
+ballot       FastTrackScenarioBallot.cfg    LeaderHolds    FastTrackScenario
+designb      FastTrackScenarioB.cfg         -              FastTrackScenario
+designblog   FastTrackScenarioBLog.cfg      -              FastTrackScenario
+roundballot  FastTrackRoundBallot.cfg       -
+oneb         FastTrackB.cfg                 -
 "
 
 if ! command -v java >/dev/null 2>&1; then
@@ -86,8 +96,8 @@ trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-check() { # NAME CONFIGURATION REFUSED
-  local name="$1" config="$2" refused="$3"
+check() { # NAME CONFIGURATION REFUSED [MODULE]
+  local name="$1" config="$2" refused="$3" module="${4:-FastTrack}"
   local budget threads status=0 found
   budget="$(sed -n 's/^ *StateBudget *= *\([0-9][0-9]*\) *$/\1/p' "$root/docs/models/$config")"
   if [ -z "$budget" ]; then
@@ -99,11 +109,11 @@ check() { # NAME CONFIGURATION REFUSED
     threads=1
   fi
   work="$(mktemp -d "$tools/run-$name.XXXXXX")"
-  cp "$root/docs/models/FastTrack.tla" "$root/docs/models/$config" "$work/"
-  echo "== $name ($config)"
+  cp "$root"/docs/models/*.tla "$root/docs/models/$config" "$work/"
+  echo "== $name ($config, $module)"
   (cd "$work" && java "-Xmx${memory}m" "-XX:MaxDirectMemorySize=${memory}m" -XX:+UseParallelGC \
     -cp "$jar" tlc2.TLC -workers "$threads" -deadlock -metadir "$work/states" \
-    -config "$config" FastTrack.tla >out.log 2>&1) || status=$?
+    -config "$config" "$module.tla" >out.log 2>&1) || status=$?
   grep -E "states generated|Invariant .* is violated|^Error|Finished in" "$work/out.log" | tail -5 \
     || true
   found="$(sed -n 's/^[0-9]* states generated, \([0-9]*\) distinct states found.*/\1/p' \

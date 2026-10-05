@@ -41,9 +41,20 @@ fn the_default_client_hello_spans_two_initial_datagrams() {
     pair.begin_connect(single_flights(client_config()));
     pair.drive_client();
     assert_eq!(pair.server.inbound.len(), 2);
-    // By default each goes twice (`TransportConfig::handshake_copies`)
+    // By default each goes twice (`TransportConfig::handshake_copies`), the copies τ·ln(PTO/τ)
+    // behind: 35 ms·ln(999 ms/35 ms) = 117.3 ms at the first probe timeout, from kInitialRtt
     let mut pair = Pair::default();
     pair.begin_connect(client_config());
+    pair.drive_client();
+    assert_eq!(pair.server.inbound.len(), 2);
+    let sent = pair.time;
+    let due = pair.client.next_wakeup().unwrap();
+    let spacing = due - sent;
+    assert!(
+        (Duration::from_micros(117_200)..Duration::from_micros(117_400)).contains(&spacing),
+        "{spacing:?}"
+    );
+    pair.time = due;
     pair.drive_client();
     assert_eq!(pair.server.inbound.len(), 4);
 }
@@ -193,7 +204,7 @@ fn the_first_flight_fills_but_never_exceeds_three_times_what_arrived() {
 fn discarding_initial_keys_resets_the_probe_backoff() {
     let _guard = subscribe();
     let mut pair = Pair::default();
-    let client_ch = pair.begin_connect(client_config());
+    let client_ch = pair.begin_connect(single_flights(client_config()));
     pair.drive_client();
     // The first flight is lost, and the client's PTO fires.
     pair.server.inbound.clear();

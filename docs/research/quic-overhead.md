@@ -290,9 +290,11 @@ packets of their own numbers:
 - **The congestion signal.** A lost original is still declared lost and answered (RFC 9265); the
   copy's own number is acknowledged. Stream data acknowledged through one copy is never sent again
   for the other's loss: the send buffer drops acknowledged ranges from what it retransmits.
-- **What the simulation does not show.** Its losses are independent; a copy goes right behind its
-  original, and a burst that loses both, which Google's measurement found common, costs what it cost
-  before.
+- **Under bursts** (`docs/research/burst-loss.md`, 2026-10-05). hyper-sim now loses in bursts in
+  time, fitted to measured traces. A copy right behind its original died with it: on the burst
+  condition at the same 5% mean the fresh first reply's p90 with copies was 2,749 ms, against 136 ms
+  under independent loss. A copy now waits `τ·ln(PTO/τ)` behind its original (117 ms at the first
+  probe timeout), and that p90 is 394 ms (`crates/hyper-quic/VENDORED.md` §14).
 - **Measured alternatives.** Copying every later flight once the connection has declared a loss
   (loss-adaptive, as Michel et al. recommend adapting to the path) took the fresh p90 to 107 ms
   where the handshake's flights alone give 180 ms, both within the tenfold cut; it doubles every

@@ -175,17 +175,42 @@ impl PacketSpace {
     /// is still declared lost and answered: FEC "should not hide congestion signals" (RFC 9265). The
     /// originals keep their frames: whichever packet is acknowledged first delivers them, and data
     /// acknowledged through one is not sent again for the other's loss (`SendBuffer::retransmit`).
-    pub(super) fn queue_copies(&mut self, streams: &mut StreamsState) {
-        if self.loss_probes != 0 || !self.pending.is_empty(streams) {
-            return;
-        }
+    ///
+    /// A copy waits `spacing` behind its original ([`copy_spacing`](super::copy_spacing)): losses
+    /// come in bursts, and a copy sent with its original is lost with it in one
+    /// (`docs/research/burst-loss.md`). Nothing is copied while the space is `sending` new data
+    /// its pending frames do not show (the Data space's streams). Returns when the earliest copy
+    /// still waiting is due.
+    pub(super) fn queue_copies(
+        &mut self,
+        streams: &mut StreamsState,
+        now: Instant,
+        spacing: Duration,
+        sending: bool,
+    ) -> Option<Instant> {
+        let ready = !sending && self.loss_probes == 0 && self.pending.is_empty(streams);
         let mut queued = false;
+        let mut waiting: Option<Instant> = None;
         for packet in self.sent_packets.values_mut() {
             if packet.copied
                 || !packet.handshake_flight
                 || !packet.ack_eliciting
                 || (packet.retransmits.is_empty(streams) && packet.stream_frames.is_empty())
             {
+                continue;
+            }
+            // A deadline past the clock's range is never reached: the copy waits for nothing
+            let due = packet
+                .time_sent
+                .checked_add(spacing)
+                .unwrap_or(packet.time_sent);
+            if due > now {
+                waiting = Some(waiting.map_or(due, |earliest| earliest.min(due)));
+                continue;
+            }
+            // Due, and held until the space has nothing new to send: the transmission that sends
+            // the new data polls again
+            if !ready {
                 continue;
             }
             packet.copied = true;
@@ -198,6 +223,7 @@ impl PacketSpace {
             queued = true;
         }
         self.sending_copies |= queued;
+        waiting
     }
 
     /// Get the next outgoing packet number in this space

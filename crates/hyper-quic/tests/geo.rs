@@ -48,6 +48,11 @@ const K_INITIAL_RTT: u64 = 333 * MS;
 /// (RFC 9002 §5.3), so PTO = kInitialRtt + max(4 × rttvar, kGranularity) (§6.2.1), with no
 /// max_ack_delay in the Initial space.
 const FIRST_PTO: u64 = K_INITIAL_RTT + 4 * (K_INITIAL_RTT / 2);
+/// How long a copy of the handshake's flights waits behind its original before any RTT sample
+/// (`TransportConfig::handshake_copy_burst`, `docs/research/burst-loss.md` §5): τ·ln(C/τ) with τ
+/// the default 35 ms and C the first probe timeout, 999 ms, is 117.30 ms; hyper-quic's fixed-point
+/// logarithm gives this many nanoseconds.
+const SPACING: u64 = 117_298_493;
 /// RFC 9000 §8.1's anti-amplification factor.
 const AMPLIFICATION: u64 = 3;
 /// 5% loss each way, independent: the second condition's loss.
@@ -269,6 +274,9 @@ struct Scenario {
     /// Whether the endpoints send the handshake's flights twice (`TransportConfig::handshake_copies`,
     /// their default); off for the checks of RFC 9002's probe schedule, flight by flight.
     copies: bool,
+    /// The correlation time a copy waits past (`TransportConfig::handshake_copy_burst`), or the
+    /// endpoints' default.
+    copy_burst: Option<Duration>,
     /// The virtual time past which the run stops.
     horizon: u64,
 }
@@ -290,6 +298,7 @@ impl Scenario {
             careful_resume: true,
             clean_first: false,
             copies: true,
+            copy_burst: None,
             horizon: HORIZON,
         }
     }
@@ -448,6 +457,9 @@ impl Run {
         let mut client = Endpoint::new(endpoint_config.clone(), None, false, rng(CLIENT)).unwrap();
         let mut transport = TransportConfig::default();
         transport.handshake_copies(scenario.copies);
+        if let Some(burst) = scenario.copy_burst {
+            transport.handshake_copy_burst(burst);
+        }
         let mut client_config = pki.client_config();
         client_config.transport_config(transport.clone());
         let client_config = client.insert_client_config(client_config).unwrap();
@@ -1008,8 +1020,9 @@ fn a_retransmitted_two_datagram_flight_counts_once_against_the_attempt_bound() {
 }
 
 /// The handshake's flights go twice (`TransportConfig::handshake_copies`): the first datagram of the
-/// ClientHello lost, its copy begins the attempt, and the handshake ends at its clean floor, where a
-/// single flight waits out the first probe timeout (999 ms from kInitialRtt) and a round trip more
+/// ClientHello lost, its copy, [`SPACING`] behind it, begins the attempt, and the handshake ends
+/// that much past its clean floor, where a single flight waits out the first probe timeout (999 ms
+/// from kInitialRtt) and a round trip more
 /// (`a_retransmitted_two_datagram_flight_counts_once_against_the_attempt_bound`). The lost
 /// original is still declared lost, a congestion signal the copy does not hide (RFC 9265).
 #[test]
@@ -1026,13 +1039,20 @@ fn a_lost_first_datagram_costs_no_probe_timeout_with_its_copy() {
     .run();
     let first = out.first();
     assert_eq!(first.surfaced, 1, "{}", out.timeline());
+    // The copy's answer comes a round trip after it, a millisecond past its first probe timeout
+    // (999 ms from kInitialRtt), so the probe's hello, answered at once, completes the handshake
     assert_eq!(
         first.connected,
-        clean.first().connected,
+        Some(SPACING + FIRST_PTO + RTT),
         "{}",
         out.timeline()
     );
-    assert_eq!(first.replied, clean.first().replied, "{}", out.timeline());
+    assert_eq!(
+        first.replied,
+        Some(SPACING + FIRST_PTO + 2 * RTT),
+        "{}",
+        out.timeline()
+    );
     assert_eq!(first.lost_packets, 1, "{}", out.timeline());
     assert_eq!(clean.first().lost_packets, 0);
 }
@@ -1040,7 +1060,8 @@ fn a_lost_first_datagram_costs_no_probe_timeout_with_its_copy() {
 /// A request that spans two 0-RTT packets goes whole before any copy of it: the Data space waits for
 /// its streams as well as its frames before it copies. The copy of the request's first packet was
 /// queued while the rest waited, and the rest, its FIN with it, went behind the copy in the first
-/// flight's last packet, whose loss held the request until a probe.
+/// flight's last packet, whose loss held the request until a probe. With the last packet lost, the
+/// reply comes [`SPACING`] past the round trip, by its copy.
 #[test]
 fn a_request_goes_whole_before_its_copies() {
     let pki = Pki::new(0);
@@ -1075,10 +1096,47 @@ fn a_request_goes_whole_before_its_copies() {
     let resumed = &out.dialed[1];
     assert_eq!(
         resumed.replied.unwrap() - resumed.started,
-        RTT,
+        RTT + SPACING,
         "{}",
         out.timeline()
     );
+}
+
+/// Losses come in bursts (`docs/research/burst-loss.md`): under the measured condition (bursts of
+/// 36.8 ms every 700 ms, 5% of the time), a copy sent with its original dies with it, and a fresh
+/// dial whose flight met a burst waits out a probe timeout. A copy [`SPACING`] behind clears the
+/// burst: over the 32 seeds, back-to-back copies leave eight fresh dials a probe timeout or more
+/// past their floor and spaced copies two (seeds 14 and 18: a burst that took a whole flight the
+/// window had sent, and copies the window then held).
+#[test]
+fn under_bursts_a_spaced_copy_clears_the_burst_its_original_met() {
+    let pki = Pki::new(MANY_NAMES);
+    let waited = |burst: Option<Duration>| -> Vec<u64> {
+        SEEDS
+            .filter(|&seed| {
+                let out = Run::new(
+                    Scenario {
+                        dials: 2,
+                        early: true,
+                        copy_burst: burst,
+                        path: Path::reordering(ONE_WAY, JITTER).with_loss(bursts(35 * MS)),
+                        ..Scenario::lossy(seed)
+                    },
+                    &pki,
+                )
+                .run();
+                let first = out.first();
+                let over = (first.replied.unwrap() - first.started).saturating_sub(3 * RTT);
+                over >= FIRST_PTO
+            })
+            .collect()
+    };
+    assert_eq!(
+        waited(Some(Duration::ZERO)),
+        [6, 12, 14, 20, 23, 28, 29, 32],
+        "back to back"
+    );
+    assert_eq!(waited(None), [14, 18], "spaced");
 }
 
 /// Guarantee c: the server acknowledges every duplicate Initial datagram at once (RFC 9000
@@ -1097,9 +1155,9 @@ fn duplicate_initials_are_acknowledged_once_and_grow_the_allowance() {
         out.violations,
         out.timeline()
     );
-    // The duplicate flight (sent at 999 ms) arrives at 1,499 ms; each of its datagrams is answered
-    // by an Initial datagram at that instant.
-    let duplicates_at = FIRST_PTO + ONE_WAY;
+    // The duplicate flight (sent [`SPACING`] behind the first) arrives that long after it; each of
+    // its datagrams is answered by an Initial datagram at that instant.
+    let duplicates_at = SPACING + ONE_WAY;
     let answers = out
         .sent
         .iter()
@@ -1264,6 +1322,43 @@ fn print_the_overhead_table() {
 #[test]
 #[ignore = "prints the lossy overhead table; run by hand"]
 fn print_the_lossy_overhead_table() {
+    overhead_table(Loss::random(LOSS_PPM), true, None);
+}
+
+/// The conditions of `docs/research/burst-loss.md` §4, at the lossy condition's 5% mean: bursts in
+/// time of `τ/(1 − 0.05)` on average every `τ/0.05`, everything inside them lost; τ = 35.0 ms
+/// (Jiang and Schulzrinne's trace 4) and 78.7 ms (Bolot's 200 ms column).
+fn bursts(tau_ns: u64) -> Loss {
+    Loss::bursty_in_time(tau_ns * 100 / 95, tau_ns * 20, 1_000_000).unwrap()
+}
+
+/// The burst table of `docs/benchmarks.md`: the lossy overhead table under independent loss and
+/// under the two burst conditions at the same mean, with the handshake's copies on and off.
+#[test]
+#[ignore = "prints the burst table; run by hand"]
+fn print_the_burst_table() {
+    for (label, loss) in [
+        ("independent 5%", Loss::random(LOSS_PPM)),
+        ("bursts, tau 35.0 ms", bursts(35 * MS)),
+        ("bursts, tau 78.7 ms", bursts(78_700_000)),
+    ] {
+        for (copies, burst, what) in [
+            (false, None, "no copies"),
+            (true, Some(Duration::ZERO), "copies back to back"),
+            (true, None, "copies spaced, the default 35 ms"),
+            (
+                true,
+                Some(Duration::from_micros(78_700)),
+                "copies spaced, 78.7 ms",
+            ),
+        ] {
+            println!("== {label}, {what}");
+            overhead_table(loss, copies, burst);
+        }
+    }
+}
+
+fn overhead_table(loss: Loss, copies: bool, copy_burst: Option<Duration>) {
     let pki = Pki::new(MANY_NAMES);
     let mut rows: [[Vec<u64>; 2]; 2] = Default::default();
     let mut stuck = [0u32; 2];
@@ -1274,6 +1369,9 @@ fn print_the_lossy_overhead_table() {
             Scenario {
                 dials: 2,
                 early: true,
+                copies,
+                copy_burst,
+                path: Path::reordering(ONE_WAY, JITTER).with_loss(loss),
                 ..Scenario::lossy(seed)
             },
             &pki,

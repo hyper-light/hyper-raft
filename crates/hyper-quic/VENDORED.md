@@ -620,3 +620,28 @@ before it.
 The geo harness's certificate is the same every run (an Ed25519 key from a fixed seed, a fixed
 serial): rustls compresses certificates (RFC 8879), and a random key and serial moved the server's
 flight by bytes run to run, and with it every later datagram's draw from the network.
+
+## 14. Copies spaced past a burst, and 1-RTT packets held until the handshake completes (2026-10-05)
+
+Measured on hyper-sim's burst-loss model in time (`docs/research/burst-loss.md`; `docs/benchmarks.md`,
+"hyper-quic at 500 ms one way under bursts"). Each change has a test that failed before it.
+
+1. **A copy of the handshake's flights waits `τ·ln(C/τ)` behind its original**
+   (`connection::copies::copy_spacing`, `PacketSpace::queue_copies`, `Timer::Copies`;
+   `TransportConfig::handshake_copy_burst`, 35 ms by default). `C` is the probe timer's interval
+   before backoff; the spacing minimises the flight's expected delay under bursts of correlation time
+   `τ` (§5 of the note), 117.3 ms at the first probe timeout and zero where the probe timeout is no
+   longer than `τ`. One spacing serves every space, so a datagram's coalesced packets are copied
+   together. A copy whose original is acknowledged or declared lost before it is due is never sent.
+   Under the measured burst condition the fresh first reply's p90 fell from 2,749 to 394 ms
+   (`under_bursts_a_spaced_copy_clears_the_burst_its_original_met`,
+   `the_default_client_hello_spans_two_initial_datagrams`); under independent loss it rose from 136
+   to 317 ms. The logarithm is in fixed point (Turner, IEEE SPM 2010), so a schedule is the same on
+   every host.
+2. **1-RTT packets that arrive while the handshake runs are held** (`hold_undecryptable`,
+   `keys_ready`) and used once it completes, within the bound of the other held packets: RFC 9001
+   §5.7, "Received packets protected with 1-RTT keys MAY be stored and later decrypted and used once
+   the handshake is complete". Upstream discarded them (its TODO: "SHOULD buffer these to improve
+   reordering tolerance"), and a request that overtook the client's Finished went again after a
+   probe timeout (`a_1rtt_packet_before_the_finished_is_held_until_the_handshake_completes`;
+   upstream's `handshake_1rtt_handling` now finds nothing lost).

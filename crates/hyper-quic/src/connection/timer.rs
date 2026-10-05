@@ -20,11 +20,13 @@ pub(crate) enum Timer {
     PushNewCid = 7,
     /// When to send an immediate ACK if there are unacked ack-eliciting packets of the peer
     MaxAckDelay = 8,
+    /// When a copy of the handshake's flights is due behind its original
+    Copies = 9,
 }
 
 impl Timer {
     /// Every timer
-    pub(crate) const VALUES: [Self; 9] = [
+    pub(crate) const VALUES: [Self; 10] = [
         Self::LossDetection,
         Self::Idle,
         Self::Close,
@@ -34,13 +36,14 @@ impl Timer {
         Self::Pacing,
         Self::PushNewCid,
         Self::MaxAckDelay,
+        Self::Copies,
     ];
 }
 
 /// A table of data associated with each distinct kind of `Timer`
 #[derive(Debug, Copy, Clone, Default)]
 pub(crate) struct TimerTable {
-    data: [Option<Instant>; 9],
+    data: [Option<Instant>; 10],
 }
 
 impl TimerTable {
@@ -49,7 +52,7 @@ impl TimerTable {
     }
 
     pub(super) fn get(&self, timer: Timer) -> Option<Instant> {
-        let [a, b, c, d, e, f, g, h, i] = &self.data;
+        let [a, b, c, d, e, f, g, h, i, j] = &self.data;
         *match timer {
             Timer::LossDetection => a,
             Timer::Idle => b,
@@ -60,6 +63,7 @@ impl TimerTable {
             Timer::Pacing => g,
             Timer::PushNewCid => h,
             Timer::MaxAckDelay => i,
+            Timer::Copies => j,
         }
     }
 
@@ -69,7 +73,7 @@ impl TimerTable {
 
     /// Each timer's slot, found by destructuring so that no lookup can miss
     fn slot_mut(&mut self, timer: Timer) -> &mut Option<Instant> {
-        let [a, b, c, d, e, f, g, h, i] = &mut self.data;
+        let [a, b, c, d, e, f, g, h, i, j] = &mut self.data;
         match timer {
             Timer::LossDetection => a,
             Timer::Idle => b,
@@ -80,6 +84,7 @@ impl TimerTable {
             Timer::Pacing => g,
             Timer::PushNewCid => h,
             Timer::MaxAckDelay => i,
+            Timer::Copies => j,
         }
     }
 

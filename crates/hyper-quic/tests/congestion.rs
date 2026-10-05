@@ -1021,7 +1021,6 @@ fn copa_shares_a_bottleneck_over_focals_grid() {
 }
 
 #[test]
-#[ignore = "focal's finding 3 is open (docs/transport.md §4d): seed 2 beside NewReno competes to the end"]
 fn copa_stops_competing_once_its_competitor_leaves() {
     leaves(&[(10_000_000, 20)], 10);
 }

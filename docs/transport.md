@@ -422,19 +422,19 @@ groups, against per-group heartbeats that grow with the groups.
 ## 4d. Copa in the congestion enum (stage 4's first patch, 2026-10-04)
 
 Built: `crates/hyper-quic/src/congestion/copa.rs`, a fourth controller of the closed enum,
-`Congestion::Copa(CopaConfig)`. CUBIC stays the default: Copa meets neither focal's harm rule nor its
-own leave rule yet (below). The source notes are in `docs/research/congestion.md`.
+`Congestion::Copa(CopaConfig)`. Since the cut (below) Copa meets focal's harm rule and its own leave
+rule over focal's grids; CUBIC stays the default, which is a choice of its own. The source notes are
+in `docs/research/congestion.md`.
 
-The law has two layers:
+The law has three layers:
 
 - **Copa (NSDI 2018).** The paper as slates fixed its details from the paper, genericCC and mvfst:
   - integer arithmetic throughout, with Nichols' filters for the four windows (constant space);
   - RFC 9002 §7.8 bounds only the window's growth, so a window the sender does not fill still
     shrinks. slates' guard once skipped every update, and a window slow start had overshot stayed
     at 1.5 MB on a 250 kB product.
-  - the mode's windows span four smoothed round trips, as genericCC's, slates' and focal's do;
-    competing, `1/δ` rises a packet a round trip and halves on a loss (§2.2), in whole
-    packets as focal's law holds it.
+  - the mode's windows span the five smoothed round trips of Copa's cycle (§2.2, §3; focal's A1),
+    where genericCC, slates and focal took four.
 - **focal's measured changes (focal's record F39):**
   - Slow start doubles once what was sent after the last doubling is heard of. Judged by what was
     sent before it, the window reached 3.07 MB where the path and queue hold 2.5 MB at 100 Mbit/s,
@@ -445,7 +445,7 @@ The law has two layers:
     (`CopaConfig::mark_backoff`). The gentler RFC backoffs left NewReno and CUBIC under CoDel below
     nine tenths of their bar.
   - For ten seconds after a mark past slow start, the window grows a datagram a round trip.
-    Competing, it raises `1/δ` only after a round trip in which the target held the window back.
+- **The cut and the competing law (below)**, which replaced the paper's AIMD on `1/δ`.
 
 **Pacing.** A controller states its pacing rate (`Controller::pacing_rate`, bytes a second), and the
 path's pacer refills at it. `None` keeps the connection's rule, 5/4 of the window per smoothed round
@@ -481,30 +481,46 @@ Three further variants were measured beside them:
 - H: the mode ends only after the queue stays nearly empty longer than its window;
 - E: competing, the window is NewReno's.
 
-The rule (`docs/benchmarks.md`) was fixed before the full grid ran. None of the five laws met it. b18
-lowered Copa's share beside the incumbents from 41.7% to 25.0%, and every variant left Copa competing
-after its competitor left in 30 or more of 64 runs. So the law is focal's from before b18. The
-derivations' arithmetic and the harness's findings are in the research notes.
+The rule (`docs/benchmarks.md`) was fixed before the full grid ran. None of those five laws met it.
+b18 lowered Copa's share beside the incumbents from 41.7% to 25.0%, and every variant left Copa
+competing after its competitor left in 30 or more of 64 runs.
+
+**The cut: whose queue is it (2026-10-04).** Every failure of rules 5 and 6 was Copa alone judged
+competing; GH-E's competing law met rules 1 to 4 in every run. A passive identity cannot tell alone
+from sharing: by Little's law Copa's bytes in the queue are `r·d_q` with or without a competitor, so
+the excess in flight always explains Copa's own part, and what separates the two is the bottleneck's
+capacity, which the sender's own rate does not show while it shares. So Copa acts on the identity:
+
+- where the paper would switch to competing, Copa cuts its window to `r·RTTmin` less two datagrams,
+  never under three, withdrawing its own bytes in the queue;
+- the packets sent under the cut over half a smoothed round trip judge it: within two datagrams' time
+  on the link of `RTTmin` (plus what the floor holds beyond Copa's share), the queue was Copa's, and
+  Copa keeps the default mode with its excess dropped; above it, another sender's bytes stood, and
+  Copa competes;
+- competing, the window grows as NewReno's and halves on a loss or a mark once a recovery period
+  (RFC 9002 §7.3.2, §B.5), and Copa cuts again every 40 smoothed round trips (`CUT_INTERVAL_SRTTS`,
+  measured: 10 failed rule 3, 80 failed rule 6, 40 carried more than 20); the mode ends only on a
+  cut that finds the queue empty, never on one empty moment;
+- with A1 (the mode over five round trips), A2 (a sample judged by the window its packet was sent
+  under) and G (a queue of a datagram is nearly empty).
+
+The floor and the allowance were set by what the alone grid showed before any shared run: cut to two
+datagrams, one packet was in flight and every sample waited out the peer's 25 ms `max_ack_delay`
+(RFC 9000 §13.2.2), and an allowance at Copa's own rate rather than the path's let NewReno's backlog
+pass for empty at 1 Mbit/s and 100 ms. Measured over focal's grids, the law meets all six rules
+(`docs/benchmarks.md`, "The cut"): Copa alone never competes, its queue is the shortest on every
+path, every incumbent carries 1.04 of its bar or more with a manager or without, and Copa never
+competes after its competitor leaves. Its share beside the incumbents is 35.5% (geomean of 128 runs),
+against 41.7% for focal's law, which took it from the incumbents.
+
+Closed: **finding 1** (without a manager the incumbents now carry 1.16 of their bar or more) and
+**finding 3** (`copa_stops_competing_once_its_competitor_leaves` runs in the gate again).
 
 Open:
 
-- **Finding 1.** Without a queue manager, Copa takes more than the bar. CUBIC carries 0.64 of its
-  bar at 1 Mbit/s and 100 ms, and a few seeds fall under 0.9 at 20 ms. Under CoDel at 1 Mbit/s and
-  100 ms NewReno carries 0.85.
-- **Finding 3.** The mode test takes one empty moment for a queue that empties: a classic sender's
-  halving leaves the queue empty once a sawtooth (§2.2 grants it). It also asks for an idle link at
-  high rates, where a tenth of the spread is less than a datagram's time. Copa competed after its
-  competitor left in 62 of 64 runs over the grid, and in 3 of 16 on the gate's path:
-  `copa_stops_competing_once_its_competitor_leaves` is ignored until this is fixed.
-- **Finding 4.** Under a single queue that CoDel manages, the manager empties the queue and hides
-  the competition from the mode test.
-
-  For findings 3 and 4 the candidates are a passive identity of the standing queue (Copa+'s
-  direction: the queue explained by Copa's own excess in flight) and Nimbus's pulses
-  (`docs/research/congestion.md`). Research first.
-- **CoDel's marks at 100 Mbit/s.** Under b18 and a variant, CoDel marked none of Copa's datagrams
-  in seven runs at 100 Mbit/s and 20 ms. Copa's ECN stayed on: CoDel acted 11 or 12 times in 30 s,
-  each time on the incumbent's datagram (`docs/benchmarks.md`).
+- **Finding 4, as a behaviour.** Under CoDel at 100 ms the cut finds no backlog beyond its allowance
+  and Copa does not compete; the incumbents still carry 1.04 of their bar or more, the marks answered
+  as a classic sender answers them.
 - **Still to come.** slates' bake-off on the harness, and slates' 1 ms pacing quantum and
   two-datagram floor.
 

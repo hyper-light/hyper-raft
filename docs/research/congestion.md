@@ -136,6 +136,113 @@ elasticity detected by asymmetric sinusoidal pulses and an FFT over 5 s; Copa ma
 in the elastic period against NimbusCC's 1. Its constants (200 ms pulses) do not scale to datacenter
 round trips, and it needs a pulser/watcher election among a bottleneck's flows: a candidate for C.
 
+## Whose queue is it: Copa withdraws its own excess and looks (2026-10-04)
+
+Findings 3 and 4 and rule 5's failures share one cause: the mode test misreads who fills the queue.
+Alone at 100 Mbit/s and 20 ms every variant judged itself competing in a third to a half of the run
+(b18 33.4%, GH-B 52.6%, GH-E 90.6%). Rule 6 asks for none of it in the last quarter. GH-E met rules
+1 to 4 in all 128 judged runs and failed only rules 5 and 6. Both failures are Copa alone judged
+competing, so the competing law is not what fails; the mode test is.
+
+**A passive identity cannot tell.** Little's law (Little, "A Proof for the Queuing Formula
+L = λW", Operations Research 9(3):383–387, 1961) at the bottleneck puts Copa's bytes in the queue at
+`r·d_q`, its delivery rate times the queueing delay, with or without a competitor. Over the whole
+path it gives `W = r·(RTTmin + d_q)`, the window over the round trip, for any flow, alone or not.
+So "the standing queue is explained by Copa's own excess in flight" holds identically: the excess
+`W − r·RTTmin` always equals `r·d_q`. Vegas' `diff` (Brakmo, Peterson, "TCP Vegas: End to End
+Congestion Avoidance on a Global Internet", IEEE JSAC 13(8), 1995) is the same estimate of the
+sender's own backlog, and says nothing of anyone else's. What separates "alone" from "sharing" is
+whether `r` is the bottleneck's capacity `C`: the whole queue is `C·d_q`, Copa's share of it
+`r/C`. The capacity is not observable from the sender's own rate while it shares the link. BBR's
+windowed maximum of the delivery rate (Cardwell, Cheng, Gunn, Yeganeh, Jacobson, "BBR:
+Congestion-Based Congestion Control", ACM Queue 14(5), 2016) is Copa's own share after the window
+passes. Packet-pair dispersion measures `C` independent of the share but needs many pairs and
+back-to-back sending, which pacing removes (Dovrolis, Ramanathan, Moore, IEEE/ACM ToN 12(6), 2004).
+Copa's own oscillation is the only motion a passive test could correlate with, and alone at δ = 1/2
+it moves the window by about five packets, 2.4% of the window at 100 Mbit/s and 20 ms: within the
+noise of a round trip's delivery rate.
+
+**Active: withdraw the excess.** The identity becomes a test once Copa acts on it. Copa cuts its
+window to `r·RTTmin` less a margin, which withdraws `r·d_q` and a little more: exactly its own bytes
+in the queue (Little). Alone, the queue was all Copa's, and the packets sent under the cut find it
+empty: their least round trip is `RTTmin`. Sharing, the other senders' `(C − r)·d_q` stays, and the
+least round trip of the cut's packets stands above `RTTmin` by their backlog. This is Copa's own
+premise (§2.2: "the queue is empty at least once every 5·RTT when only Copa flows ... share the
+bottleneck"), made to hold by construction instead of waited for, and it reads the same evidence
+§2.2 reads, the least round trip against `RTTmin`.
+
+- Copa+ (Jiang et al., IEEE/ACM ToN 32(1):127–142, 2024, DOI 10.1109/TNET.2023.3278677; checked
+  against the abstract, 2026-10-04) finds the root cause of Copa's failures in that it "fails to
+  achieve its expected behaviors, i.e., clear the bottleneck buffer occupancy periodically", and
+  adapts Copa's parameters so it "can adaptively clear the bottleneck buffer occupancy". The cut
+  clears Copa's share of it on purpose.
+- BBR's ProbeRTT is the deployed precedent of draining on purpose to read the path
+  (draft-ietf-ccwg-bbr-06, July 2026; checked 2026-10-04): in-flight data held to half the estimated
+  bandwidth-delay product (`ProbeRTTCwndGain` 0.5) for at least 200 ms and a round trip, at most
+  every 5 s (`ProbeRTTInterval`), so `min_rtt` stays right "if there are legacy loss-based Reno or
+  CUBIC flows sharing the bottleneck". ProbeRTT reads only the least round trip; the cut reads who
+  held the queue, from the same sample.
+- Nimbus (Goyal et al., SIGCOMM 2022) is the active alternative: pulses, and an FFT of the cross
+  traffic's answer. It decides elastic against inelastic cross traffic, which the rules do not ask,
+  at the cost of continuous pulsing and a pulser election.
+
+**The cut, made exact for a link of packets.** The first form of each detail below was measured
+alone on focal's alone grid before any shared run, and two were changed by what it found.
+
+- The rate `r`: bytes acknowledged over the last interval of at least a smoothed round trip, the
+  delivery-rate estimate of draft-cheng-iccrg-delivery-rate-estimation (Cheng, Cardwell, Yeganeh,
+  Jacobson) taken over a round trip so the acknowledgements' bunching averages out.
+- The margin: two datagrams. A rate counted in whole packets over an interval is off by up to one
+  datagram at its end; the cut, that rate times `RTTmin` (at most the interval), by up to one
+  datagram; and a queue of one datagram is the packet in service, the quantum G found the paper's
+  continuous "nearly empty" ignores.
+- The floor: three datagrams. A receiver acknowledges the second of two ack-eliciting packets at once
+  and holds a lone one up to its `max_ack_delay` (RFC 9000 §13.2.2; 25 ms by default, §18.2), and
+  the path sends only while its bytes in flight and the next datagram stay under the window. Cut to
+  RFC 9002's least window of two datagrams, one packet was in flight, every sample under the cut
+  waited out the peer's 25 ms, and Copa alone at 1 Mbit/s and 20 ms read its empty queue as standing
+  (the least under the cut 54.9 ms against `RTTmin` 22.9 ms) and competed 87% of the run. Three keep
+  two in flight.
+- The evidence: the packets sent under the cut over half a smoothed round trip from the first,
+  the paper's own window for the standing round trip (§2.1, τ = srtt/2). Alone, their least stands
+  above `RTTmin` by at most two datagrams' time on the link: `RTTmin` may be a smaller packet's,
+  sooner by up to a datagram's transmission (at 1 Mbit/s and 20 ms the least was 22.9 ms and a full
+  datagram's 30.0 ms), and of two packets in flight the second waits out the first. Allowed at Copa's
+  own rate, two datagrams' time was 34 to 78 ms beside NewReno at 1 Mbit/s and 100 ms, where Copa
+  carried a third of the link: wider than NewReno's backlog, so Copa never competed in 10 of 16 leave
+  runs there. The link's rate is the most the path delivered over Copa's window for `RTTmin` (ten
+  seconds, §2.1), as BBR's bottleneck-bandwidth filter takes it: the allowance is two datagrams at
+  that rate (at most at Copa's own), plus, at the floor, what the floor holds beyond Copa's share.
+- How long it costs: from the cut to the verdict about two round trips, of which the link loses at
+  most the margin when Copa is alone, and when sharing Copa's own queue share for that time.
+
+**When Copa cuts.** In the default mode, where the paper switches to competing: the queue did not
+nearly empty over the mode's window. A cut that finds the queue empty keeps the default mode, and
+the window stays at the cut, Copa's own excess dropped. One that finds it standing begins competing.
+Competing, Copa cuts once every `CUT_INTERVAL_SRTTS` smoothed round trips, measured over focal's
+grids (below), and leaves the mode only on a cut that finds the queue empty: never on one empty
+moment, which a competitor's backoff leaves (§2.2 grants it), and which ended competing for every
+law the rule judged.
+
+**What Copa does while competing.** E's law, which met rules 1 to 4 in every judged run: the window
+grows as NewReno's in congestion avoidance (RFC 9002 §B.5, a datagram a window acknowledged) from
+where Copa began competing, and a loss or a mark halves it once a recovery period (RFC 9002
+§7.3.2, `kLossReductionFactor` 0.5, §B.1). §2.2 leaves the competing law open ("whatever
+buffer-filling algorithm one wishes to emulate (e.g., NewReno, Cubic, etc.)"); emulating it on the
+window instead of on `1/δ` is what B's derivation and its measurement showed `1/δ` cannot do beside
+a sawtooth that moves `d_q`.
+
+**Measured (2026-10-04, `docs/benchmarks.md`, "Copa's competing mode over focal's grids").** The
+prediction held. Alone, Copa judged itself competing in none of any path's samples (the shipped law:
+12.1% to 59.8%). Beside NewReno or CUBIC on drop-tail that stop at the run's half, it competed in 22.5% to 59.4%
+of the run and never in the last quarter after the competitor left, in all 64 leave runs. The law met all six rules at
+cut intervals of 20 and 40 round trips, and 40 carried more (35.5% against 31.8%). At 10, CoDel
+marked none of Copa's datagrams in one run at 100 Mbit/s and 20 ms. At 80, Copa competed in the last
+quarter in four runs at 100 ms, the next cut coming after the quarter had begun. Under CoDel at 100 ms
+the cut found no backlog of the incumbent's above the allowance and Copa did not compete (finding 4's
+hiding), yet each incumbent carried 1.04 of its bar or more: the marks, answered as a classic sender
+answers them, did what the mode did not.
+
 ## Harm and fairness
 
 **Ware, Mukerjee, Seshan, Sherry, "Beyond Jain's Fairness Index: Setting the Bar for the Deployment of

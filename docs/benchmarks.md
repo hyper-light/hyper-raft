@@ -5883,15 +5883,16 @@ cargo test -p hyper-quic --test congestion --locked copa_stops_competing_over_fo
 
 | Law | Copa's share beside the incumbents (geomean, 128 runs) | Rule failures (runs) |
 |---|---|---|
-| focal, as shipped | **41.70%** | 3: 3 (bar); 4: 14; 5: 1; 6: 62 of 64 |
+| focal, as shipped before the cut | **41.70%** | 3: 3 (bar); 4: 14; 5: 1; 6: 62 of 64 |
 | GH-E: b18, G, H and E | 39.42% | 5: 2; 6: 37 of 64 |
 | GH-paper: A1, A2, G and H, a packet a round trip | 36.31% | 4: 10; 6: 30 of 64 |
 | GH-B: b18, G and H | 25.84% | 3: 4 (CoDel marked nothing); 5: 1; 6: 35 of 64 |
 | b18 | 25.03% | 3: 3 (CoDel marked nothing); 6: 46 of 64 |
 
-No law is admissible. The law stays focal's from before b18, which also carries the most.
+No law is admissible. The law stayed focal's from before b18, which also carries the most, until the
+cut below.
 
-**Where the shipped law fails.**
+**Where focal's law, shipped before the cut, fails.**
 
 - Rules 3 and 4, an incumbent under 9/10 of its bar:
   - without a manager at 1 Mbit/s and 100 ms, CUBIC in all eight seeds (0.636 of its bar at least)
@@ -5907,7 +5908,7 @@ No law is admissible. The law stays focal's from before b18, which also carries 
   NewReno at 10 Mbit/s and 20 ms. This is focal's finding 3. At 100 Mbit/s and 20 ms every law
   failed all sixteen runs.
 
-The shipped law alone, focal's alone grid:
+focal's law alone, focal's alone grid:
 
 | Path | Copa carried | Queue p50 / p99 ms (NewReno's) | Copa competing, alone |
 |---|---|---|---|
@@ -5923,6 +5924,77 @@ the runs were replayed under b18 and Copa's datagrams stayed ECN-capable to the 
 or 12 times in 30 s, once a sawtooth of the incumbent's at that rate, and each time a datagram of
 the incumbent's stood at the queue's head. A seed in which CoDel marked Copa twice was replayed
 beside them.
+
+### The cut: Copa withdraws its own bytes and looks (2026-10-04, admissible)
+
+The design and its sources are in `docs/research/congestion.md`, "Whose queue is it". Where the
+paper switches to competing (the queue not nearly empty over five round trips), Copa cuts its window
+to `r·RTTmin` less two datagrams (never under three), which withdraws its own bytes in the queue.
+Alone, the packets sent under the cut find the queue empty; beside another sender its backlog stays.
+Competing, the window is NewReno's (E), and Copa cuts again every `CUT_INTERVAL_SRTTS` round trips,
+leaving the mode only on a cut that finds the queue empty. With it, A1, A2 and G. Same harness, grid,
+seeds 1–8 and rule as above, judged by the rule's script over the rows (`judge.py`). Every run is
+exact for its seed, so the load moves no number: 3.5 to 20.6 over the sweeps (23:10–23:47 PDT), from
+other sessions' builds and gates.
+
+| Law | Copa's share beside the incumbents (geomean, 128 runs) | Rule failures (runs) |
+|---|---|---|
+| **cut, every 40 round trips competing (shipped)** | **35.48%** | none |
+| cut, every 20 | 31.83% | none |
+| cut, every 80 | 37.81% | 6: 4 of 64 (1 Mbit/s and 10 Mbit/s at 100 ms: the next cut came after the last quarter began) |
+| cut, every 10 | 27.18% | 3: 1 (CoDel marked none of Copa's datagrams at 100 Mbit/s, 20 ms, seed 3, beside CUBIC) |
+
+The law is the cut at 40: of the admissible, the one under which Copa carries the most.
+
+Alone (focal's alone grid, 30 s, seed 1), against the shipped law before it:
+
+| Path | Copa carried | Queue p50 / p99 ms (NewReno's) | Copa competing, alone (before) |
+|---|---|---|---|
+| 1 Mbit/s, 20 ms | 83.2% | 18.02 / 27.71 (18.02 / 28.80) | 0.0% (59.8%) |
+| 1 Mbit/s, 100 ms | 96.3% | 24.51 / 53.31 (43.71 / 82.11) | 0.0% (12.1%) |
+| 10 Mbit/s, 20 ms | 95.8% | 1.92 / 3.97 (9.73 / 18.37) | 0.0% (15.3%) |
+| 10 Mbit/s, 100 ms | 97.2% | 2.69 / 4.61 (61.25 / 97.73) | 0.0% (42.1%) |
+| 100 Mbit/s, 20 ms | 97.0% | 0.25 / 0.54 (11.10 / 19.74) | 0.0% (36.5%) |
+
+Beside the incumbents, 30 s, seeds 1–8, Copa's carried share and the least of the incumbent's share
+of its bar over the seeds (the step reported, not judged):
+
+| Path | Manager | Incumbent | Copa carried | Incumbent's bar share, least | Copa competing |
+|---|---|---|---|---|---|
+| 1M 100ms | none | NewReno | 38.0–43.2% | 1.178 | 44.2–80.8% |
+| 1M 100ms | none | CUBIC | 31.2–39.0% | 1.243 | 44.3–76.8% |
+| 1M 100ms | CoDel | NewReno | 37.2–40.6% | 1.038 | 0% |
+| 1M 100ms | CoDel | CUBIC | 38.5–41.8% | 1.063 | 0% |
+| 10M 20ms | none | NewReno | 35.5–39.1% | 1.423 | 77.7–83.2% |
+| 10M 20ms | none | CUBIC | 32.6–37.0% | 1.247 | 82.2–87.5% |
+| 10M 20ms | CoDel | NewReno | 35.9–40.8% | 1.222 | 64.5–75.7% |
+| 10M 20ms | CoDel | CUBIC | 35.2–39.8% | 1.187 | 60.5–72.0% |
+| 10M 100ms | none | NewReno | 21.9–38.2% | 2.021 | 62.4–85.5% |
+| 10M 100ms | none | CUBIC | 19.7–28.8% | 1.479 | 87.1–93.6% |
+| 10M 100ms | CoDel | NewReno | 33.0–42.1% | 1.139 | 0% |
+| 10M 100ms | CoDel | CUBIC | 30.4–41.8% | 1.173 | 0% |
+| 100M 20ms | none | NewReno | 34.3–44.4% | 1.186 | 90.1–96.8% |
+| 100M 20ms | none | CUBIC | 26.0–41.2% | 1.162 | 92.3–98.7% |
+| 100M 20ms | CoDel | NewReno | 31.1–43.4% | 1.209 | 56.0–74.6% |
+| 100M 20ms | CoDel | CUBIC | 26.9–45.2% | 1.138 | 47.6–61.5% |
+| any | step | either | 1.2–26.3% | 0.870 | 0% |
+
+- **Finding 1 is closed.** Without a manager every incumbent carries 1.16 of its bar or more in
+  every seed, where the shipped law left CUBIC 0.636 at 1 Mbit/s and 100 ms.
+- **Finding 3 is closed.** In all 64 leave runs Copa competed while the incumbent sent (22.5% to
+  59.4% of the run) and in none of the last quarter's samples; the shipped law competed there in 62.
+  `copa_stops_competing_once_its_competitor_leaves` runs in the gate again.
+- **Finding 4 stands as a behaviour and no longer as a harm.** Under CoDel at 100 ms the cut finds no
+  backlog of the incumbent's beyond the allowance and Copa does not compete; the incumbents still
+  carry 1.04 of their bar or more, the marks answered as a classic sender answers them.
+- CoDel marked Copa in all 64 CoDel runs and Copa's datagrams stayed ECN-capable in every managed
+  run (the shares test's own checks).
+
+```
+cargo test -p hyper-quic --test congestion --locked every_law_alone_over_focals_grid -- --ignored --nocapture
+cargo test -p hyper-quic --test congestion --locked copa_stops_competing_over_focals_grid -- --ignored --nocapture
+cargo test -p hyper-quic --test congestion --locked copa_shares_a_bottleneck_over_focals_grid -- --ignored --nocapture
+```
 
 ## hyper-check's checkers (S-4, 2026-10-04)
 

@@ -21,8 +21,8 @@ static AES_128_ONLY: LazyLock<CryptoProvider> = LazyLock::new(|| CryptoProvider 
     ..default_provider()
 });
 
-static X25519_HYBRID: LazyLock<CryptoProvider> = LazyLock::new(|| CryptoProvider {
-    kx_groups: vec![kx_group::X25519MLKEM768],
+static P384_HYBRID: LazyLock<CryptoProvider> = LazyLock::new(|| CryptoProvider {
+    kx_groups: vec![kx_group::SECP384R1MLKEM1024],
     cipher_suites: vec![cipher_suite::TLS13_AES_256_GCM_SHA384],
     ..default_provider()
 });
@@ -59,16 +59,15 @@ fn client_offering(provider: &'static CryptoProvider) -> ClientConfig {
     ClientConfig::new(Box::new(QuicClientConfig::try_from(inner).unwrap()))
 }
 
-/// Both ends ours: ML-KEM-1024 with P-384, CNSA 2.0's key establishment (hyper-raft docs/seal.md §10).
 #[test]
-fn nodes_negotiate_secp384r1mlkem1024_and_aes_256_gcm() {
+fn nodes_negotiate_x25519mlkem768_and_aes_256_gcm() {
     let _guard = subscribe();
     let mut pair = Pair::default();
     let (client_ch, _) = pair.connect();
     let data = handshake_data(&mut pair, client_ch);
     assert_eq!(
         data.negotiated_key_exchange_group,
-        Some(rustls::NamedGroup::secp384r1MLKEM1024)
+        Some(rustls::NamedGroup::X25519MLKEM768)
     );
     assert_eq!(
         data.negotiated_cipher_suite,
@@ -76,18 +75,18 @@ fn nodes_negotiate_secp384r1mlkem1024_and_aes_256_gcm() {
     );
 }
 
-/// X25519MLKEM768 is accepted when it is the only group a peer offers.
+/// SecP384r1MLKEM1024 (ML-KEM-1024, CNSA 2.0) is served to a peer that offers only it.
 #[test]
-fn a_peer_offering_only_x25519mlkem768_is_served() {
+fn a_peer_offering_only_secp384r1mlkem1024_is_served() {
     let _guard = subscribe();
     let mut pair = Pair::default();
-    let client_ch = pair.begin_connect(client_offering(&X25519_HYBRID));
+    let client_ch = pair.begin_connect(client_offering(&P384_HYBRID));
     pair.drive();
     pair.server.assert_accept();
     let data = handshake_data(&mut pair, client_ch);
     assert_eq!(
         data.negotiated_key_exchange_group,
-        Some(rustls::NamedGroup::X25519MLKEM768)
+        Some(rustls::NamedGroup::secp384r1MLKEM1024)
     );
 }
 

@@ -402,11 +402,14 @@ process abort.
 
 ## 10. Between our own nodes
 
-`hyper-quic` between our own nodes admits only hybrid post-quantum groups, and prefers
+`hyper-quic` between our own nodes admits only hybrid post-quantum groups. It is to prefer
 `SecP384r1MLKEM1024` (ML-KEM-1024, CNSA 2.0's key establishment, with P-384; defined by the IETF's
-hybrid ECDHE-MLKEM draft and shipped by AWS-LC) when both ends are ours; `X25519MLKEM768` and
-`SecP256r1MLKEM768` stay admitted only if a measured handshake cost argues for them (slates'
-review). The suites are TLS 1.3's 256-bit ones (`TLS_AES_256_GCM_SHA384`,
+hybrid ECDHE-MLKEM draft and implemented in hyper-tls) when both ends are ours, with
+`X25519MLKEM768` and `SecP256r1MLKEM768` admitted only if a measured handshake cost argues for them
+(slates' review). As built it admits `SecP384r1MLKEM1024` and serves it to a peer that offers it,
+and keeps `X25519MLKEM768` first: with the P-384 group first, the congestion harness's run-twice
+check (`crates/hyper-quic/tests/congestion.rs`) gives two digests from one seed, which is being
+traced to its cause before the order changes. The suites are TLS 1.3's 256-bit ones (`TLS_AES_256_GCM_SHA384`,
 `TLS_CHACHA20_POLY1305_SHA256`). Initial packets stay AES-128-GCM, which RFC 9001 §5.2 fixes, since
 their keys come from the connection ID and protect nothing secret. This is node-to-node
 configuration in `hyper-quic` and `hyper-tls`, not in `hyper-seal`; clients reaching an S3 or NFS

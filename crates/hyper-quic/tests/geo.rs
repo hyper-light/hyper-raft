@@ -1121,7 +1121,9 @@ fn a_retransmitted_two_datagram_flight_counts_once_against_the_attempt_bound() {
 /// that much past its clean floor, where a single flight waits out the first probe timeout (999 ms
 /// from kInitialRtt) and a round trip more
 /// (`a_retransmitted_two_datagram_flight_counts_once_against_the_attempt_bound`). The lost
-/// original is still declared lost, a congestion signal the copy does not hide (RFC 9265).
+/// original is not declared lost: no acknowledgement the client takes before it discards its
+/// Initial keys meets the packet or time threshold for it, and the discard takes it out of flight
+/// without a loss (RFC 9002 §6.4).
 #[test]
 fn a_lost_first_datagram_costs_no_probe_timeout_with_its_copy() {
     let pki = Pki::new(MANY_NAMES);
@@ -1150,8 +1152,64 @@ fn a_lost_first_datagram_costs_no_probe_timeout_with_its_copy() {
         "{}",
         out.timeline()
     );
-    assert_eq!(first.lost_packets, 1, "{}", out.timeline());
+    assert_eq!(first.lost_packets, 0, "{}", out.timeline());
     assert_eq!(clean.first().lost_packets, 0);
+}
+
+/// A copy is a packet of its original's frames alone. The ClientHello's second datagram and the
+/// copy of its first lost, the first datagram and the copy of the second carry it whole, and the
+/// handshake ends at its clean floor plus [`SPACING`]. Copies queued together were packed anew,
+/// the second half's frames before the first's start, so this loss left both halves short of
+/// theirs until a probe timeout.
+#[test]
+fn each_copy_carries_its_originals_frames_alone() {
+    let pki = Pki::new(MANY_NAMES);
+    let clean = Run::new(Scenario::clean(), &pki).run();
+    let out = Run::new(
+        Scenario {
+            drop_client: &[1, 2],
+            ..Scenario::clean()
+        },
+        &pki,
+    )
+    .run();
+    assert_eq!(
+        out.first().connected,
+        clean.first().connected.map(|at| at + SPACING),
+        "{}",
+        out.timeline()
+    );
+}
+
+/// The application's first round trip is copied as the handshake's flights are: the server's
+/// reply lost, its copy brings it less than a probe timeout late. It was the last round trip of a
+/// fresh dial and the most frequent wait at the fresh dial's 90th percentile
+/// (`docs/research/burst-loss.md` §9).
+#[test]
+fn a_lost_first_reply_comes_by_its_copy() {
+    let pki = Pki::new(MANY_NAMES);
+    let clean = Run::new(Scenario::clean(), &pki).run();
+    let first = clean.first();
+    let reply = clean
+        .sent
+        .iter()
+        .filter(|s| !s.from_client)
+        .enumerate()
+        .filter(|(_, s)| s.kinds == [Kind::Short] && s.arrives == first.replied)
+        // The reply's datagram is the largest that arrives as it is read, beside acknowledgements
+        .max_by_key(|(_, s)| s.size)
+        .map(|(i, _)| i)
+        .unwrap();
+    let out = Run::new(
+        Scenario {
+            drop_server: chosen(vec![reply]),
+            ..Scenario::clean()
+        },
+        &pki,
+    )
+    .run();
+    let late = out.first().replied.unwrap() - first.replied.unwrap();
+    assert!(late > 0 && late < FIRST_PTO, "{late}\n{}", out.timeline());
 }
 
 /// A request that spans two 0-RTT packets goes whole before any copy of it: the Data space waits for
@@ -1202,9 +1260,9 @@ fn a_request_goes_whole_before_its_copies() {
 /// Losses come in bursts (`docs/research/burst-loss.md`): under the measured condition (bursts of
 /// 36.8 ms every 700 ms, 5% of the time), a copy sent with its original dies with it, and a fresh
 /// dial whose flight met a burst waits out a probe timeout. A copy [`SPACING`] behind clears the
-/// burst: over the 32 seeds, back-to-back copies leave eight fresh dials a probe timeout or more
-/// past their floor and spaced copies two (seeds 14 and 18: a burst that took a whole flight the
-/// window had sent, and copies the window then held).
+/// burst: over the 32 seeds, back-to-back copies leave nine fresh dials a probe timeout or more
+/// past their floor and spaced copies one (seed 14: a burst that took a whole flight the window had
+/// sent, and copies the window then held).
 #[test]
 fn under_bursts_a_spaced_copy_clears_the_burst_its_original_met() {
     let pki = Pki::new(MANY_NAMES);
@@ -1230,10 +1288,10 @@ fn under_bursts_a_spaced_copy_clears_the_burst_its_original_met() {
     };
     assert_eq!(
         waited(Some(Duration::ZERO)),
-        [6, 12, 14, 20, 23, 28, 29, 32],
+        [4, 6, 13, 14, 23, 24, 28, 29, 32],
         "back to back"
     );
-    assert_eq!(waited(None), [14, 18], "spaced");
+    assert_eq!(waited(None), [14], "spaced");
 }
 
 /// A path learned (`EndpointConfig::loss_memory`, `docs/research/burst-loss.md` §7): after two
@@ -1515,8 +1573,10 @@ fn print_the_burst_table() {
                 "copies spaced as learned over two dials before",
             ),
         ] {
-            println!("== {label}, {what}");
-            overhead_table(loss, copies, burst, learning, memory, BURST_SEEDS);
+            for seeds in [SEEDS, BURST_SEEDS] {
+                println!("== {label}, {what}, {} seeds", seeds.end - seeds.start);
+                overhead_table(loss, copies, burst, learning, memory, seeds);
+            }
         }
     }
 }

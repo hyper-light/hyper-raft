@@ -684,26 +684,40 @@ unused window) run with the warm-up off (`endpoint_config_without_warm_up`): the
 clock moves only to the next timer, so its pacer never refills and a warm-up there spends its
 budget. The MTU discovery test keeps it on and counts its PINGs apart.
 
-## 16. The copies' spacing learned per path (2026-10-05)
+## 16. The copies' spacing learned per path, copies aligned, the first reply copied (2026-10-05)
 
-`docs/research/burst-loss.md` §7–§8. A connection weighs what its own losses say of the path's
-bursts (`connection/losses.rs`), and its endpoint keeps the evidence per remote IP address
-(`LossMemory`, `EndpointConfig::loss_memory`: 256 addresses for an hour, as Careful Resume's
-memory, and a structure of its own). Only once the evidence makes one hypothesis 19 times as likely
-as the configured 35 ms (Wald's ratio at errors of 5%) does it replace
-`TransportConfig::handshake_copy_burst`; independent loss sends the copies at once.
+`docs/research/burst-loss.md` §7–§9. Each change has a test that failed before it.
 
-- **The evidence.** Each lost ack-eliciting packet sent after the handshake's flights, with its
-  space's next ack-eliciting packet (`SentPacket::next`). It is counted once a packet of the same
-  space, sent more than four mean deviations of the delay later, is acknowledged while it is not;
-  one acknowledged after it was declared lost counts as delivered. At most ten wait to be counted
-  (the initial window's packets); past that the oldest is dropped uncounted.
-- **The bound on certainty.** A neighbour's loss is never taken as likelier than Bolot's 0.60 at
-  8 ms.
+1. **The spacing learned per path.** A connection weighs what its own losses say of the path's
+   bursts (`connection/losses.rs`), and its endpoint keeps the evidence per remote IP address
+   (`LossMemory`, `EndpointConfig::loss_memory`: 256 addresses for an hour, as Careful Resume's
+   memory, in a structure of its own). Once one hypothesis is 19 times as likely as the configured
+   35 ms (Wald's ratio at errors of 5%), it replaces `TransportConfig::handshake_copy_burst`;
+   independent loss sends the copies at once.
+   - *Evidence.* Each lost ack-eliciting packet sent after the handshake's flights, paired with
+     its space's next ack-eliciting packet (`SentPacket::next`).
+   - *When a loss counts.* Once a packet of the same space, sent more than four mean deviations of
+     the delay later, is acknowledged while the lost one is not. One acknowledged after its loss was
+     declared counts as delivered.
+   - *Bounds.* At most ten losses wait to be counted (the initial window's packets). A neighbour's
+     loss is never taken as likelier than Bolot's 0.60 at 8 ms.
+   - Tests: `four_neighbours_sent_with_lost_packets_and_delivered_are_independent_loss`,
+     `a_packet_acknowledged_after_its_loss_was_declared_is_delivered`,
+     `a_loss_counts_once_a_later_send_arrives_and_its_neighbour_is_known`,
+     `a_path_learned_independent_sends_its_copies_at_once_and_one_bursty_spaces_them`.
+2. **A copy is a packet of its original's frames alone** (`PacketSpace::queue_copies` copies one
+   original at a time). Queued together, the retransmission queue merged their frames and packed
+   them anew: the ClientHello's copies went as `[1141, 1928)` with `[0, 349)`, then `[349, 1141)`,
+   so one lost copy left both halves without theirs
+   (`each_copy_carries_its_originals_frames_alone`).
+3. **The application's first round trip is copied**: what a space sends from the handshake's
+   completion (`application_from`) until the peer acknowledges a packet of it. The server's first
+   reply goes then; lost and uncopied, it waited a probe timeout, the most frequent wait at the
+   fresh dial's p90 (`a_lost_first_reply_comes_by_its_copy`).
+   `a_lost_first_datagram_costs_no_probe_timeout_with_its_copy` now finds the lost original
+   undeclared: the client's Initial keys go before an acknowledgement meets a threshold for it
+   (RFC 9002 §6.4).
 
-Tests: `four_neighbours_sent_with_lost_packets_and_delivered_are_independent_loss`,
-`a_packet_acknowledged_after_its_loss_was_declared_is_delivered`,
-`a_loss_counts_once_a_later_send_arrives_and_its_neighbour_is_known`, and on the geo harness
-`a_path_learned_independent_sends_its_copies_at_once_and_one_bursty_spaces_them`. Over 128 seeds,
-two dials before, independent loss: the resumed first reply's p90 fell from 266 to 122 ms. Under
-bursts nothing changed.
+Over 128 seeds, independent loss, two dials before: the first reply's p90 went from 297 / 290 ms
+(fresh / resumed) at 35 ms to 143 / 136 ms learned. Under bursts the learned rows equal the 35 ms
+rows.

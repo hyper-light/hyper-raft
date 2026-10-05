@@ -270,6 +270,10 @@ pub struct Connection {
     app_limited: bool,
     /// Whether the datagram being written holds an Initial or Handshake packet
     pub(super) handshake_datagram: bool,
+    /// The Data space's first packet number once the handshake completed here: the application's
+    /// first round trip runs until a packet from it on is acknowledged, and its packets are copied
+    /// as the handshake's flights are
+    pub(super) application_from: Option<u64>,
 
     /// When the congestion window or the pacer last held a datagram back, the Data space's next
     /// packet number then: the window counts as used until a packet sent after that is
@@ -402,6 +406,7 @@ impl Connection {
             app_limited: false,
             limited_through: None,
             handshake_datagram: false,
+            application_from: None,
 
             receiving_ecn: false,
             total_authed_packets: 0,
@@ -3558,6 +3563,7 @@ impl Connection {
         }
 
         self.events.push_back(Event::Connected);
+        self.application_from = Some(self.spaces.get(SpaceId::Data).next_packet_number);
         self.state = State::Established;
         trace!("established");
         // The probe timer skips the Data space while the connection is handshaking, and the

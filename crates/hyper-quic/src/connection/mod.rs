@@ -1971,14 +1971,21 @@ impl Connection {
         }
     }
 
-    /// The probe timeouts fired since the last acknowledgement, and the ack-eliciting packets in
-    /// flight on the current path: what a test of the loss-detection timer observes.
     /// The largest of this endpoint's packets the peer acknowledged in `space`
     #[cfg(test)]
     pub(crate) fn largest_acked(&self, space: SpaceId) -> Option<u64> {
         self.spaces.get(space).largest_acked_packet
     }
 
+    /// The largest packet number this endpoint has sent in `space`; a skipped number counts as
+    /// sent, as the number after it is the one the packet took
+    #[cfg(test)]
+    pub(crate) fn largest_sent(&self, space: SpaceId) -> Option<u64> {
+        self.spaces.get(space).next_packet_number.checked_sub(1)
+    }
+
+    /// The probe timeouts fired since the last acknowledgement, and the ack-eliciting packets in
+    /// flight on the current path: what a test of the loss-detection timer observes.
     #[cfg(test)]
     pub(crate) fn pto_state(&self) -> (u32, u64) {
         (self.pto_count, self.path.in_flight.ack_eliciting)

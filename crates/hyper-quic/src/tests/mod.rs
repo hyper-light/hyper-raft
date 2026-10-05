@@ -779,14 +779,20 @@ fn the_first_flight_acknowledges_0rtt() {
     let client_ch = pair.begin_connect_shared(config);
     let s = pair.client_streams(client_ch).open(Dir::Uni).unwrap();
     pair.client_send(client_ch, s).write(b"0-RTT").unwrap();
-    // The client's first flight, the server's answer, and the client reading it
+    // The client's first flight, the server's answer, and the client reading it. The 0-RTT
+    // packet's number is read rather than assumed: the client may skip a number to catch an
+    // optimistic acknowledgement, and then the packet takes the next.
     pair.drive_client();
+    let zero_rtt = pair
+        .client_conn_mut(client_ch)
+        .largest_sent(crate::packet::SpaceId::Data);
+    assert!(zero_rtt.is_some());
     pair.drive_server();
     pair.drive_client();
     assert_eq!(
         pair.client_conn_mut(client_ch)
             .largest_acked(crate::packet::SpaceId::Data),
-        Some(0)
+        zero_rtt
     );
 }
 

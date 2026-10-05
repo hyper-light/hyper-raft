@@ -823,8 +823,12 @@ impl Judge {
                 }
             }
             fed.retain(|index, _| *index <= disk.last_index());
+            let commit = disk.hard_state.commit.max(disk.snapshot_index());
             for (index, term, held, before) in fresh {
-                let outcome = self.matching.holds(id, index, term, &held, before);
+                let before_committed = index.saturating_sub(1) <= commit;
+                let outcome =
+                    self.matching
+                        .holds_at(id, index, term, &held, before, before_committed);
                 note(&mut self.violation, outcome);
                 self.counters.hit("log entries held");
             }

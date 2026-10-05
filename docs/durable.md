@@ -214,7 +214,11 @@ Stated over a member's durable state `D` (what a restart would read) at the mome
 
 - **I1 (promises).** A message that carries or depends on a term or vote leaves only once `D` holds
   that term and vote (thesis §3.8). A candidate's requests and every vote leave after their hard
-  state is durable, and a candidate's request names only a last entry `D` holds.
+  state is durable, and a candidate's request names only a last entry `D` holds, or one `D`'s log
+  has passed: a request's write is followed by later ones before its notice (I7), and an append of
+  the term's leader among them may cut the log the request was made from. Voters judge a request
+  by the last entry it names (§3.6.1), so a `D` at least as up to date as the one named holds every
+  entry a voter granting it could require (`docs/sim.md` §15.9).
 - **I2 (acknowledgements).** A follower's acknowledgement of index `i` leaves only once `D` holds
   every entry through `i` with the terms the acknowledgement names. The fast track's "held" answer
   for a proposal leaves only once `D` holds the proposal (focal 27 §4.4).

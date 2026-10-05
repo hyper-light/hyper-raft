@@ -80,8 +80,9 @@ jobs:
     # the published recovery's disagreements. Rust code, so it runs beside the gates and not in
     # them only for its time; one OS suffices, for the models are not the code.
     runs-on: ubuntu-24.04
-    # Twice the suite's time on a runner core half as fast as one here, the model job's rule:
-    # 14.7 min on the owner's machine at load 69 (2026-10-04), so 4 × 14.7 (docs/benchmarks.md, "hyper-check's searches (S-5)").
+    # Twice the suite's time on a runner core half as fast as one here, the model job's rule: 14.7
+    # min on the owner's machine at load 69 (2026-10-04), so 4 × 14.7; the first CI run took 12.2
+    # min with its build (docs/benchmarks.md, "hyper-check's strategies and searches (S-5)").
     timeout-minutes: 59
     steps:
       - uses: actions/checkout@v5

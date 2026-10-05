@@ -229,6 +229,13 @@ pub struct Cluster<R> {
     marked_since: BTreeMap<u64, u64>,
     /// Operations acted on.
     steps: u64,
+    /// Snapshots the network lost at its bound, by sender and recipient, whose senders are yet
+    /// to be told.
+    evicted: Vec<(u64, u64)>,
+    /// The most operations the liveness phase may act before the run is reported unconverged
+    /// (`docs/sim.md` §4.2: a group that keeps moving without converging is ended by the run's
+    /// budget, never passed); `None` for none, where a harness has not stated one.
+    pub liveness_bound: Option<u64>,
 }
 
 impl<R: Replica> Cluster<R> {
@@ -264,6 +271,8 @@ impl<R: Replica> Cluster<R> {
             marked_steps: 0,
             marked_since: BTreeMap::new(),
             steps: 0,
+            evicted: Vec::new(),
+            liveness_bound: None,
         };
         for id in 1..=count {
             let node = cluster.open(id, Store::new(boot.clone()));
@@ -423,7 +432,13 @@ impl<R: Replica> Cluster<R> {
         }
         for message in &output.messages {
             if self.net.len() >= NETWORK {
-                self.net.remove(0);
+                let lost = self.net.remove(0);
+                if lost.msg_type == MessageType::MsgSnapshot {
+                    // Its sender is told the transfer failed, as an owner whose transport
+                    // dropped it is: without the word, the leader waits on the snapshot for
+                    // ever (the swarm's fast seed 2,396, `docs/sim.md` §15.9).
+                    self.evicted.push((lost.from, lost.to));
+                }
             }
             self.net.push(message.clone());
         }
@@ -601,6 +616,17 @@ impl<R: Replica> Cluster<R> {
                 }
                 self.faults += 1;
                 reports.extend(self.act(&Op::Restart(*id)));
+            }
+        }
+        // Each snapshot the network lost at its bound is reported failed to its sender, as a
+        // delivery that loses one is; a report may lose more, at most the network's bound of them.
+        for _ in 0..NETWORK {
+            let Some((from, to)) = self.evicted.pop() else {
+                break;
+            };
+            if let Some(node) = self.node(from) {
+                node.snapshot_status(to, false);
+                reports.push(self.report(from, None));
             }
         }
         if R::LAGGED && !self.settings.judged {
@@ -963,7 +989,17 @@ impl<R: Replica> Cluster<R> {
         }
         .expect("a quiet period within u64");
         let mut progress = Progress::new(quiet, 0);
+        let began = self.steps;
+        let spent = |cluster: &Self| {
+            cluster
+                .liveness_bound
+                .is_some_and(|bound| cluster.steps - began > bound)
+        };
         for round in 0u64.. {
+            if spent(self) {
+                println!("the liveness phase passed its bound at round {round}: unconverged");
+                break;
+            }
             for id in self.up() {
                 let view = self.peek(id).map(|node| node.view()).expect("up");
                 let at = Position {
@@ -986,7 +1022,7 @@ impl<R: Replica> Cluster<R> {
                 }
             }
 
-            while !self.net.is_empty() {
+            while !self.net.is_empty() && !spent(self) {
                 self.act_observed(
                     observer,
                     &Op::Deliver {

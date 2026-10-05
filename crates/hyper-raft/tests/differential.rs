@@ -5,14 +5,16 @@
 //! member knows of the others; all of it is equal, or the run fails naming
 //! its seed and its step.
 //!
-//! The two differ by decision in two places a schedule reaches. A leader
+//! The two differ by decision in three places a schedule reaches. A leader
 //! that applies a change which leaves it no voter steps down here and
 //! leads on there: a run that comes to it ends there, and what this core
 //! does from there on is tested by itself (`group.rs`). A member told by
 //! its leader to campaign while it asks whether it could be elected
 //! campaigns here and ignores it there, where the leader then waits an
 //! election timeout for nothing: the schedule loses that message for both,
-//! and the run goes on.
+//! and the run goes on. Without check-quorum and pre-vote, a member answers
+//! an append or a heartbeat of an older term here and drops it there: the
+//! schedule loses that message for both too.
 #![allow(
     clippy::panic,
     clippy::unwrap_used,
@@ -51,6 +53,9 @@ fn count(name: &str, default: u64) -> u64 {
 struct Reached {
     /// Members told to campaign while they asked whether they could.
     told_while_asking: u64,
+    /// Appends and heartbeats of an older term than their recipients', without check-quorum or
+    /// pre-vote: this core answers them, raft-rs does not, and the comparison loses them for both.
+    stale_leaders: u64,
     /// Reads that would have reached a leader before its term's first commit, lost for both.
     held_reads: u64,
     terms: u64,
@@ -125,6 +130,31 @@ fn tells_one_that_asks(group: &Cluster<New>, op: &Op) -> bool {
             let view = member.view();
             view.role == 3 && view.term == message.term
         })
+}
+
+/// Whether `op` delivers an append or a heartbeat of an older term than its recipient's to a group
+/// without check-quorum or pre-vote: this core answers it, so that the leader of the older term
+/// learns the newer one (thesis Figure 3.1), and raft-rs leaves that to vote requests, which never
+/// reach a leader the newer term's configuration names no voter (`docs/sim.md` §15.9).
+fn stale_leader(group: &Cluster<New>, op: &Op) -> bool {
+    let Op::Deliver {
+        at, lose: false, ..
+    } = op
+    else {
+        return false;
+    };
+    let Some(message) = group.net.get(*at) else {
+        return false;
+    };
+    !group.settings.check_quorum
+        && !group.settings.pre_vote
+        && matches!(
+            message.msg_type,
+            MessageType::MsgAppend | MessageType::MsgHeartbeat
+        )
+        && group
+            .peek(message.to)
+            .is_some_and(|member| member.view().term > message.term)
 }
 
 /// Whether `op` asks a read of a leader that has not committed an entry of its term, or delivers
@@ -297,6 +327,14 @@ fn run(seed: u64, steps: u64, settings: Settings, mix: Mix, reached: &mut Reache
         let op = match op {
             Op::Deliver { at, keep, .. } if tells_one_that_asks(&new, &op) => {
                 reached.told_while_asking += 1;
+                Op::Deliver {
+                    at,
+                    keep,
+                    lose: true,
+                }
+            }
+            Op::Deliver { at, keep, .. } if stale_leader(&new, &op) => {
+                reached.stale_leaders += 1;
                 Op::Deliver {
                     at,
                     keep,
@@ -553,6 +591,8 @@ fn the_cores_agree_without_pre_vote_and_check_quorum() {
     };
     let reached = campaign("plain", settings, Mix::everything());
     assert!(reached.committed > 0);
+    // The third decided difference is reached, or the comparison says nothing of it.
+    assert!(reached.stale_leaders > 0, "{reached:?}");
 }
 
 #[test]

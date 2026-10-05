@@ -10,8 +10,9 @@
 //!   decrease along it (slates' explorer). In a group with the fast track a successor takes an entry
 //!   its predecessor committed again under its own term (below), so two logs can hold one value at
 //!   an index under two terms, and an entry can follow either: there the oracle holds each index and
-//!   term to one value, and terms to never decrease, and leaves the prefix's agreement, by what its
-//!   entries state, to State Machine Safety.
+//!   term to one value, and terms to never decrease but after a member's committed prefix, which it
+//!   keeps as it holds it ([`LogMatching::holds_at`]), and leaves the prefix's agreement, by what
+//!   its entries state, to State Machine Safety.
 //! - **Leader Completeness**: "if a log entry is committed in a given term, then that entry will be
 //!   present in the logs of the leaders for all higher-numbered terms" (the TLA+ model's
 //!   `LeaderHolds`): held once a leadership, when it is first seen, against every entry committed
@@ -73,7 +74,27 @@ impl<V: Clone + Eq> LogMatching<V> {
         value: &V,
         before: u64,
     ) -> Result<(), Violation> {
-        if before > term {
+        self.holds_at(member, index, term, value, before, false)
+    }
+
+    /// As [`LogMatching::holds`], where `before_committed` says the entry before is committed at
+    /// `member`. With [`Terms::Ignored`] a term may fall there and nowhere else: a member keeps its
+    /// committed prefix as it holds it and takes its leader's entries after it, whatever terms the
+    /// two stamped the committed entries with (hyper-raft's `Log::append_after`;
+    /// `docs/models/FastTrack.tla`, `Replicate`, which takes from `Max(p, commit[m]) + 1`), so an
+    /// entry its leader holds under an older term may follow a committed one a later leader
+    /// stamped (the swarm's fast seed 34,957, `docs/sim.md` §15.9).
+    pub fn holds_at(
+        &mut self,
+        member: u64,
+        index: u64,
+        term: u64,
+        value: &V,
+        before: u64,
+        before_committed: bool,
+    ) -> Result<(), Violation> {
+        let restamped = self.terms == Terms::Ignored && before_committed;
+        if before > term && !restamped {
             return Err(Violation::TermsDecrease {
                 member,
                 index,

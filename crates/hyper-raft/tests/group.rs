@@ -526,3 +526,70 @@ fn a_member_that_has_no_term_refuses_no_one_for_priority() {
     elect(&mut group, 1);
     assert_eq!(group.peek(3).unwrap().view().leader, 1);
 }
+
+/// A member that moved its term past its leader's answers that leader's append or heartbeat with
+/// its term, so the leader steps down (thesis Figure 3.1, "reply false if term < currentTerm"),
+/// with check-quorum and pre-vote off too. raft-rs answers only under one of them and leaves the
+/// rest to vote requests, which never reach a leader the member's configuration names no voter:
+/// the swarm's fast seed 3,112 (`docs/sim.md` §15.9) found such a leader leading its old term for
+/// ever, its group never converging. Here member 3 moves to term 3 while every message it sends is
+/// lost; member 1's heartbeat of term 1 then reaches it.
+#[test]
+fn a_member_of_a_later_term_answers_a_leader_of_an_earlier_one() {
+    let settings = Settings {
+        check_quorum: false,
+        pre_vote: false,
+        ..Settings::focal()
+    };
+    let mut group: Cluster<New> = Cluster::new(3, &[1, 2, 3], settings, 0);
+    let deliver_all = |group: &mut Cluster<New>,
+                       lose: &dyn Fn(&hyper_raft::proto::Message) -> bool| {
+        for _ in 0..1_000 {
+            let Some(message) = group.net.first() else {
+                return;
+            };
+            let lose = lose(message);
+            group.act(&Op::Deliver {
+                at: 0,
+                keep: false,
+                lose,
+            });
+        }
+        panic!("the network does not fall quiet");
+    };
+    group.act(&Op::Campaign(1));
+    deliver_all(&mut group, &|_| false);
+    assert_eq!(group.leaders_now(), vec![1]);
+    for _ in 0..2 {
+        group.act(&Op::Campaign(3));
+        deliver_all(&mut group, &|message| message.from == 3);
+    }
+    assert_eq!(group.peek(3).unwrap().view().term, 3);
+    for _ in 0..group.settings.heartbeat_tick {
+        group.act(&Op::Tick(1));
+    }
+    let at = group
+        .net
+        .iter()
+        .position(|m| m.from == 1 && m.to == 3)
+        .expect("member 1's heartbeat to member 3");
+    let reports = group.act(&Op::Deliver {
+        at,
+        keep: false,
+        lose: false,
+    });
+    let answered = reports.iter().any(|report| {
+        report.member == 3
+            && report.output.messages.iter().any(|m| {
+                m.to == 1
+                    && m.term == 3
+                    && m.msg_type == hyper_raft::proto::MessageType::MsgAppendResponse
+            })
+    });
+    assert!(answered, "member 3 answered nothing: {reports:?}");
+    deliver_all(&mut group, &|_| false);
+    assert!(
+        !group.leaders_now().contains(&1),
+        "member 1 still leads term 1"
+    );
+}

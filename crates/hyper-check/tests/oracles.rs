@@ -653,3 +653,54 @@ fn every_violation_names_its_oracle() {
         assert!(violation.to_string().starts_with(oracle));
     }
 }
+
+/// A candidate's request made from a log its term's leader then cut, released once the cut is
+/// durable (a lagged member's notice comes after later writes are durable, `docs/durable.md` §3,
+/// I7): it names entries the device no longer holds, but the device's log is more up to date than
+/// the one named, and a request is judged by its claim (thesis §3.6.1). The swarm's pipelined
+/// configurations found it at seeds 123, 522 and 967 (`docs/sim.md` §15.9): a member that campaigned
+/// with twenty entries of term 1, cut to two by term 3's leader before the request's notice.
+#[test]
+fn a_request_from_a_log_its_terms_leader_cut_is_judged_by_its_claim() {
+    let mut oracle = Durability::default();
+    let cut = device(3, 5, 1, &[(1, 10), (3, 11)]);
+    let request = Says::VoteRequest {
+        last_index: 20,
+        last_term: 1,
+    };
+    assert_eq!(
+        rule(oracle.released(&cut, &message(5, 1, Some(3), request))),
+        None
+    );
+    // A claim more current than the device holds is still refused: of the term, or longer.
+    for (last_index, last_term) in [(2, 4), (3, 3)] {
+        let request = Says::VoteRequest {
+            last_index,
+            last_term,
+        };
+        assert_eq!(
+            rule(oracle.released(&cut, &message(5, 1, Some(3), request))),
+            Some(Rule::I1),
+            "{last_index}, {last_term}"
+        );
+    }
+}
+
+/// A group with the fast track: a member keeps its committed prefix as it holds it and takes its
+/// leader's entries after it, so a term may fall after a committed entry a later leader stamped
+/// (the swarm's fast seed 34,957: index 40 committed under term 33, index 41 its leader's of term
+/// 32), and nowhere else; a classic group holds terms to rise everywhere.
+#[test]
+fn a_term_falls_only_after_a_fast_members_committed_prefix() {
+    let mut fast = LogMatching::<u8>::new(Terms::Ignored, 64);
+    fast.holds_at(3, 41, 32, &7, 33, true).unwrap();
+    assert!(matches!(
+        fast.holds_at(3, 42, 31, &8, 32, false),
+        Err(Violation::TermsDecrease { index: 42, .. })
+    ));
+    let mut classic = LogMatching::<u8>::new(Terms::Compared, 64);
+    assert!(matches!(
+        classic.holds_at(3, 41, 32, &7, 33, true),
+        Err(Violation::TermsDecrease { index: 41, .. })
+    ));
+}

@@ -2776,13 +2776,17 @@ impl<S: Storage> Raft<S> {
         // leading hands over until its term moves (`Raft::wake`), and this
         // answer is how it learns that it has.
         let handed = kind == MessageType::MsgTimeoutNow && self.watch.is_some();
-        if (self.config.check_quorum || self.config.pre_vote)
-            && (matches!(kind, MessageType::MsgHeartbeat | MessageType::MsgAppend) || handed)
-        {
+        if matches!(kind, MessageType::MsgHeartbeat | MessageType::MsgAppend) || handed {
             // A leader of an older term: this member moved its term
-            // while it was cut off. Its answer tells that leader, which
-            // no vote request of this member would, refused as they
-            // are while the leader is heard.
+            // while it was cut off, or holds a configuration that names
+            // that leader no voter. Its answer tells that leader (thesis
+            // Figure 3.1: "reply false if term < currentTerm"), which no
+            // vote request of this member would: refused while the leader
+            // is heard, and never sent to a member its configuration does
+            // not name a voter. raft-rs answers only under check-quorum or
+            // pre-vote and leaves the rest to vote requests; without either,
+            // a leader whose group's later configuration made it a learner
+            // led its old term for ever (`docs/sim.md` §15.9).
             self.send(proto::message(message.from, MessageType::MsgAppendResponse))?;
         } else if kind == MessageType::MsgRequestPreVote {
             // Answered and not dropped: a candidate of an older term

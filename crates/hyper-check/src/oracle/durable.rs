@@ -5,8 +5,8 @@
 //!
 //! - **I1 (promises).** A message that carries a term leaves only once `D` holds that term (a
 //!   pre-vote asks of a term no member takes). In `D`'s term, a vote request only with `D`'s vote
-//!   its own and naming a last entry `D` holds, and a vote given only with `D`'s vote the candidate's
-//!   (thesis §3.8).
+//!   its own and naming a last entry `D` holds or `D`'s log at least as up to date as the one it
+//!   names, and a vote given only with `D`'s vote the candidate's (thesis §3.8, §3.6.1).
 //! - **I2 (acknowledgements).** An acknowledgement of index `i` in `D`'s term leaves only once `D`
 //!   holds an entry at `i` of no later term (what that term's leader sent) or a snapshot past it; the
 //!   fast track's word of what a member holds only once `D` holds it, beside its log or in it, or
@@ -285,8 +285,15 @@ fn said<V, D: DurableView<V>>(view: &D, message: &Released<'_, V>) -> Result<(),
             if view.vote() != from {
                 return Err(broke(from, Rule::I1, view.term(), view.vote()));
             }
+            // The request names a last entry the device holds, or the device's log has since
+            // become at least as up to date as the one named (a later write of the term, the
+            // term's leader's append, cut the log the request was made from): what voters judge
+            // a request by is that claim (thesis §3.6.1), and a device at least as current holds
+            // every entry a voter granting it could require.
             let named = last_index == 0 || view.term_at(last_index) == Some(last_term);
-            if !named {
+            let last = view.last();
+            let current = (view.term_at(last).unwrap_or(0), last) >= (last_term, last_index);
+            if !named && !current {
                 return Err(broke(from, Rule::I1, last_index, view.last()));
             }
             Ok(())

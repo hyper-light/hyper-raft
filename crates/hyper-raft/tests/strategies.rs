@@ -227,9 +227,17 @@ impl Configuration {
     fn group<R: Core>(&self, seed: u64) -> Cluster<R> {
         let mut group = Cluster::new(self.count, &self.voters, self.settings, seed);
         group.stop_who_left = !self.settings.fast;
+        group.liveness_bound = Some(LIVENESS);
         group
     }
 }
+
+/// The most operations a run's liveness phase may act: four times the most any of the swarm's
+/// 15,000 seeds with no defect took (11,292, a group harness's,
+/// `the_swarm_with_no_defect_keeps_every_oracle_and_the_model`, measured 2026-10-04; the default
+/// seeds took at most 1,556), the rule the trace's reservation is stated by (`docs/sim.md` §13).
+/// Past it the run is reported unconverged (§4.2).
+const LIVENESS: u64 = 4 * 11_292;
 
 /// A planted defect, the harness its catch is sought in, and what a random walk from seed 0 needed
 /// to catch it there (`docs/sim.md` §14.6): its runs, or `None` where 2,096 runs never did.
@@ -388,13 +396,16 @@ fn racing_deliveries_are_counted() {
             most = most.max(driver.races);
         }
         let mut words = 0;
+        let mut liveness = 0;
         for seed in 0..96 {
             let mut taped = Taped {
                 player: Player::record(seed, TAPE),
             };
-            run(harness, &configuration, seed, None, &mut taped);
+            let judged = run(harness, &configuration, seed, None, &mut taped);
             words = words.max(taped.player.finish().words());
+            liveness = liveness.max(judged.steps.saturating_sub(harness.steps()));
         }
+        println!("{harness:?}: at most {liveness} operations a liveness phase");
         println!(
             "{harness:?}: at most {most} racing deliveries a run, stated {}; at most {words} words of tape a run",
             racing(harness)
@@ -464,7 +475,7 @@ fn stated(entry: &Entry) -> u64 {
 
 /// The group read as `FastTrack.tla`'s variables: each member's durable term, vote, log and
 /// commit (what a restart opens on, as the model's members hold only what is durable), what it
-/// holds beside its log, whether it runs and whether it leads.
+/// holds beside its log, whether it runs, and whether it leads in a term its device holds.
 fn abstraction<R: Core>(group: &Cluster<R>) -> Abstract {
     Abstract {
         members: group
@@ -477,7 +488,12 @@ fn abstraction<R: Core>(group: &Cluster<R>) -> Abstract {
                     up: node.is_some(),
                     term: disk.hard_state.term,
                     vote: disk.hard_state.vote,
-                    leader: node.is_some_and(|node| node.view().role == 2),
+                    // A leader whose term is not yet durable sends nothing (I1) and leads in the
+                    // model once the write that carries its election is durable
+                    // (`docs/models/README.md`, "Readies ahead of their persistence").
+                    leader: node.is_some_and(|node| {
+                        node.view().role == 2 && node.view().term == disk.hard_state.term
+                    }),
                     start: disk.snapshot_index(),
                     log: disk.entries.iter().map(|e| (e.term, stated(e))).collect(),
                     held: disk.proposals.iter().map(|e| e.index).collect(),
@@ -586,6 +602,8 @@ struct Catch {
     runs: u64,
     seed: u64,
     violation: Violation,
+    /// The catching run's tape, where the strategy runs by tapes.
+    tape: Option<Tape>,
 }
 
 /// A campaign's result, or the runs it took without a catch.
@@ -610,6 +628,7 @@ fn swarm_campaign(case: Case, budget: u64) -> Campaign {
                 runs: seed + 1,
                 seed,
                 violation,
+                tape: None,
             });
         }
     }
@@ -633,6 +652,7 @@ fn pct_campaign(case: Case, depth: u32, budget: u64) -> Campaign {
                 runs: seed + 1,
                 seed,
                 violation,
+                tape: None,
             });
         }
     }
@@ -677,11 +697,13 @@ fn guided_campaign(case: Case, budget: u64) -> (Campaign, u64, Option<String>) {
             return (Err(runs), guided.points(), Some(departure));
         }
         if let Some(violation) = catch(&judged) {
+            let tape = Some(taped.player.finish());
             return (
                 Ok(Catch {
                     runs,
                     seed,
                     violation,
+                    tape,
                 }),
                 guided.points(),
                 None,
@@ -790,37 +812,74 @@ campaigns! {
 }
 
 /// Each catch a campaign reports, held to be the defect's: the same run with the defect taken out
-/// keeps every oracle.
+/// keeps every oracle. A coverage campaign's catch is found again by running the campaign to it,
+/// and its tape played without the defect.
 #[test]
-#[ignore = "the campaigns' catches checked clean without their defects, in release"]
-fn each_catch_is_its_defects() {
-    for (strategy, case, seed) in CATCHES {
+fn each_catch_by_seed_is_its_defects() {
+    check_catches(false);
+}
+
+/// The coverage campaigns' catches, each found again by running its campaign to it.
+#[test]
+#[ignore = "the coverage campaigns run to their catches, in release"]
+fn each_catch_by_coverage_is_its_defects() {
+    check_catches(true);
+}
+
+fn check_catches(guided: bool) {
+    for (strategy, case, seed) in CATCHES
+        .iter()
+        .filter(|(strategy, ..)| matches!(strategy, Strategy::Guided) == guided)
+    {
         let case = CASES[*case];
         let configuration = match strategy {
             Strategy::Swarm => Configuration::swarm(case.harness, *seed),
             _ => Configuration::of(case.harness),
         };
-        let judge = |mutant| match strategy {
-            Strategy::Swarm => run(
-                case.harness,
-                &configuration,
-                *seed,
-                mutant,
-                &mut Seed(Seeded(*seed)),
+        let (caught, clean) = match strategy {
+            Strategy::Swarm => (
+                run(
+                    case.harness,
+                    &configuration,
+                    *seed,
+                    Some(case.mutant),
+                    &mut Seed(Seeded(*seed)),
+                ),
+                run(
+                    case.harness,
+                    &configuration,
+                    *seed,
+                    None,
+                    &mut Seed(Seeded(*seed)),
+                ),
             ),
             Strategy::Pct(depth) => {
                 let members = configuration.count as usize;
-                let mut driver = Prioritized::new(*seed, members, *depth, racing(case.harness));
-                run(case.harness, &configuration, *seed, mutant, &mut driver)
+                let prioritized = |mutant| {
+                    let mut driver = Prioritized::new(*seed, members, *depth, racing(case.harness));
+                    run(case.harness, &configuration, *seed, mutant, &mut driver)
+                };
+                (prioritized(Some(case.mutant)), prioritized(None))
             }
             Strategy::Guided => {
-                unreachable!("guided catches are checked by their campaign's replay")
+                let (campaign, ..) = guided_campaign(case, *seed);
+                let catch = campaign.expect("the coverage campaign catches the defect again");
+                assert_eq!(catch.runs, *seed, "the coverage campaign's catch moved");
+                let tape = catch
+                    .tape
+                    .expect("a coverage campaign's catch has its tape");
+                let replay = |mutant| {
+                    let mut player = Player::replay(&tape, 0, TAPE);
+                    let seed = player.word().unwrap();
+                    player.end_step(3).unwrap();
+                    let mut taped = Taped { player };
+                    run(case.harness, &configuration, seed, mutant, &mut taped)
+                };
+                (replay(Some(case.mutant)), replay(None))
             }
         };
-        let caught = judge(Some(case.mutant));
-        let clean = judge(None);
         println!(
-            "{strategy:?}, {:?}, seed {seed}: {:?}; without it: {:?}, settled {}",
+            "{strategy:?}, {:?}, {seed}: {:?}; without it: {:?}, settled {}",
             case.mutant,
             caught.violation.as_ref().map(ToString::to_string),
             clean.violation.as_ref().map(ToString::to_string),
@@ -831,15 +890,24 @@ fn each_catch_is_its_defects() {
     }
 }
 
-/// The catches the campaigns reported (2026-10-04): strategy, case, seed.
+/// The catches the campaigns reported (2026-10-04): strategy, case, and the seed (for a coverage
+/// campaign, the run).
 const CATCHES: &[(Strategy, usize, u64)] = &[
-    (Strategy::Swarm, 0, 45),
+    (Strategy::Swarm, 0, 171),
     (Strategy::Swarm, 2, 0),
     (Strategy::Swarm, 3, 705),
     (Strategy::Pct(1), 2, 0),
     (Strategy::Pct(2), 2, 0),
     (Strategy::Pct(1), 3, 25_323),
     (Strategy::Pct(2), 3, 21_180),
+    (Strategy::Swarm, 1, 15),
+    (Strategy::Pct(1), 1, 2),
+    (Strategy::Pct(2), 1, 2),
+    (Strategy::Guided, 1, 99),
+    (Strategy::Guided, 2, 1),
+    (Strategy::Guided, 3, 4_787),
+    (Strategy::Pct(1), 4, 103_277),
+    (Strategy::Pct(2), 4, 103_277),
 ];
 
 // ---------------------------------------------------------------------------------------------
@@ -1304,11 +1372,13 @@ fn strategy_costs() {
 fn the_swarm_with_no_defect_keeps_every_oracle_and_the_model() {
     for harness in [Harness::Group, Harness::Fast, Harness::Pipelined] {
         let mut failures = Vec::new();
-        let seeds = 2_000;
+        let mut most = 0;
+        let seeds = 5_000;
         for seed in 0..seeds {
             let configuration = Configuration::swarm(harness, seed);
             let mut driver = Conformed::new(Seed(Seeded(seed)), None);
             let judged = run(harness, &configuration, seed, None, &mut driver);
+            most = most.max(judged.steps.saturating_sub(harness.steps()));
             if judged.violation.is_some()
                 || judged.departure.is_some()
                 || !judged.settled
@@ -1324,7 +1394,7 @@ fn the_swarm_with_no_defect_keeps_every_oracle_and_the_model() {
             }
         }
         println!(
-            "{harness:?}: {seeds} swarm seeds, {} failed: {failures:#?}",
+            "{harness:?}: {seeds} swarm seeds, at most {most} operations a liveness phase, {} failed: {failures:#?}",
             failures.len()
         );
     }
@@ -1379,5 +1449,45 @@ fn figure_three_seven_is_a_path_of_four_rounds() {
                 assert!(fault.starts_with("Leader Completeness"), "{fault}");
             }
         }
+    }
+}
+
+/// The swarm's seeds that found the judges wanting (`docs/sim.md` §15.9): at pipelined seeds 123,
+/// 522 and 967 the durability oracle refused a candidate's request whose log its term's leader had
+/// cut before the request's notice; at pipelined seeds 299, 585, 1,159, 1,580 and 1,633 the
+/// abstraction read a member that led a term its device did not yet hold as the model's leader; at
+/// fast seed 34,957 Log Matching refused a term falling after a member's committed prefix, which the
+/// fast track keeps as the member holds it. Each now keeps every oracle and every step is a model
+/// step.
+#[test]
+fn the_swarm_seeds_that_found_the_judges_wanting_keep_every_oracle_and_the_model() {
+    let seeds = [123, 522, 967, 299, 585, 1_159, 1_580, 1_633]
+        .map(|seed| (Harness::Pipelined, seed))
+        .into_iter()
+        .chain([(Harness::Fast, 34_957)]);
+    for (harness, seed) in seeds {
+        let configuration = Configuration::swarm(harness, seed);
+        let mut driver = Conformed::new(Seed(Seeded(seed)), None);
+        let judged = run(harness, &configuration, seed, None, &mut driver);
+        assert_eq!(judged.violation, None, "{harness:?}, seed {seed}");
+        assert_eq!(judged.departure, None, "{harness:?}, seed {seed}");
+        assert!(judged.settled, "{harness:?}, seed {seed}");
+    }
+}
+
+/// The swarm's fast seeds whose groups never converged (`docs/sim.md` §15.9): at 3,112 a leader
+/// whose group's later configuration made it a learner led its old term for ever, no member
+/// answering its appends without check-quorum or pre-vote (`Raft::step_older_term`); at 2,396 the
+/// harness's network lost a snapshot at its bound without telling its sender, which waited on it
+/// for ever (`Cluster::report`). Each now settles, and keeps every oracle and the model.
+#[test]
+fn the_swarm_seeds_whose_groups_never_converged_settle() {
+    for seed in [2_396, 3_112] {
+        let configuration = Configuration::swarm(Harness::Fast, seed);
+        let mut driver = Conformed::new(Seed(Seeded(seed)), None);
+        let judged = run(Harness::Fast, &configuration, seed, None, &mut driver);
+        assert_eq!(judged.violation, None, "seed {seed}");
+        assert_eq!(judged.departure, None, "seed {seed}");
+        assert!(judged.settled, "seed {seed}: the group did not converge");
     }
 }

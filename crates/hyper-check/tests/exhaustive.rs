@@ -7,7 +7,7 @@
 //!
 //! The scopes that fit the default suite run in it; the full scopes run in release in CI's
 //! `explore` job (`--ignored`), and every one of them on the owner's machine with its time and
-//! peak in `docs/benchmarks.md`, "hyper-check's searches (S-5)".
+//! peak in `docs/benchmarks.md`, "hyper-check's strategies and searches (S-5)".
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,

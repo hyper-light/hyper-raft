@@ -6962,6 +6962,10 @@ fresh dial / p90 of the resumed dial, ms, at 128 seeds (32 seeds in brackets):
 | bursts τ 78.7 ms, no dial before | 1,910 / 158 (1,945 / 3,671) | 300 / 229 (237 / 211) | as spaced |
 | bursts τ 78.7 ms, two dials before | 1,831 / 123 (1,831 / 93) | 1,964 / 282 (2,786 / 244) | 1,964 / 282 |
 
+At 512 seeds the τ 78.7 ms two-dial row is 381 / 232 ms; its 1,964 ms at 128 seeds is that block's
+draw of a 5% tail whose copies the initial window holds (RFC 9002 §7), the same on every commit
+bisected (`docs/research/burst-loss.md` §8, with the 512-seed table).
+
 - **The fresh dial's cliff is gone.** Before §15's copy alignment and first-reply copies, every
   variant's fresh p90 at 128 seeds sat a probe timeout up (independent: 221 ms back to back, 998 ms
   spaced, against 136 and 317 ms at 32 seeds).

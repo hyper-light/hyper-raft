@@ -62,11 +62,21 @@ plaintext key should not be encrypted twice under the same key-wrapping key" (NI
 holds.
 
 **CRC-32C stays** on every stored record, over the bytes as stored (ciphertext). It is the
-storage layer's check that the device returned what was written, which feeds repair (CLAUDE.md §6);
-the tag is the end-to-end check that the plaintext is the one sealed, under the key and at the
-position claimed. A record whose CRC holds and whose tag fails was sealed under another key, at
-another place, or altered by someone who could recompute a CRC; it is a typed `Open` error, which
-the consumer reports as corruption.
+storage layer's check that the device returned what was written, which feeds repair (CLAUDE.md §6).
+A CRC is not authentication: anyone who can write the device can change bytes and recompute it.
+Only bytes under a GCM tag or a MAC (§5.1) are authenticated, and only those are trusted against an
+adversary. A record whose CRC holds and whose tag or MAC fails was sealed under another key, at
+another place, or altered by someone who recomputed the CRC; it is a typed `Open` or `Tampered`
+error, which the consumer reports as corruption and never as a torn tail.
+
+**Every key commits.** AES-GCM is not key-committing: one ciphertext can be made to open validly
+under two chosen keys (Dodis, Grubbs, Ristenpart and Woodage, "invisible salamanders", CRYPTO 2018;
+Len, Grubbs and Ristenpart, partitioning oracles, USENIX Security 2021; R §10). Keys here are
+random, but clones share chunks under wrapped lineage keys and a tenant controls what it wraps, so
+every file header (§4) and key frame (§5) carries a 32-byte commitment,
+`HMAC-SHA-256(data key, "hyper-seal commit" ‖ file or session ID)`, checked before the first open
+under that key. A key that does not match its commitment opens nothing (the idea of Chan and
+Rogaway's CTX, ESORICS 2022, made with an approved MAC).
 
 ## 3. Keys
 
@@ -107,6 +117,9 @@ pub trait KeySource {
     fn id(&self) -> SourceId;
     fn wrap(&mut self, key: &Secret32) -> Result<Wrapped, SealError>;
     fn unwrap(&mut self, wrapped: &Wrapped) -> Result<Secret32, SealError>;
+    /// A trusted monotonic counter the source keeps (a TPM NV counter, the Secure Enclave), where
+    /// it has one: read, and advanced past a value. `None` where the source has none (§5.2).
+    fn monotonic(&mut self) -> Option<&mut dyn Monotonic> { None }
 }
 ```
 
@@ -168,7 +181,8 @@ spliced with another file's segments fails to open (STREAM's nonce-based OAE sec
   tag is more than 3% of the bytes.
 - **Sizes follow from plaintext.** A segment of `n` bytes is `n + 16` stored bytes, so a byte's stored
   offset follows from its plaintext offset, and a read opens only the segments its range covers.
-- **The file's header** carries the wrapped data key record (§3.3), the file ID, `S`, and a version.
+- **The file's header** carries the wrapped data key record (§3.3), the file ID, `S`, a version, and
+  the key's commitment (§2).
   It is authenticated: its bytes are the additional data of segment 0 alongside the file ID, so a
   header altered to point at another key fails to open the first segment.
 
@@ -204,18 +218,43 @@ and slates need, and costs one GCM call; a frame of many records costs one call 
   key frame is written in the same write as the first frame it keys, and recovery treats a frame
   whose key record it has not read as damage past the torn tail, which it already does for any
   frame after the last valid one.
-- **Framing stays clear.** Frame headers, persist records, group IDs, indices, terms and hard states
-  are positions, not data; recovery reads them before it holds any key. They stay authenticated by
-  their CRCs, and every one that names a record is bound into that record's tag by its additional
-  data. What they reveal is the log's shape: how many groups, how many entries, their sizes. A
-  consumer for whom the shape is sensitive pads its own payloads.
+- **Framing stays readable, under a MAC** (§5.1). Frame headers, persist records, group IDs,
+  indices, terms and hard states are positions, not data, and recovery reads them first; but a
+  term, a vote or a frame boundary an adversary rewrote would let a member vote twice in a term,
+  which breaks Election Safety. So they are not left to their CRCs. What they reveal is the log's
+  shape: how many groups, how many entries, their sizes. A consumer for whom the shape is sensitive
+  pads its own payloads.
 - **Cost.** A record grows by 16 bytes, and a session costs one key made and wrapped (single-digit
   µs) at a segment's opening, which happens once per segment's worth of writes. §11 measures group
   commit sealed against unsealed, open loop under load, before this is committed as the log's
   default.
-- **Format.** A sealed log is format 4. Its segment header gains the wrapped key record and a sealing
-  flag; a format-3 log (mantle's files, unsealed) still opens and is sealed from its next segment
-  on, never rewritten in place.
+- **Format.** A sealed log is format 4. Its segment header gains the wrapped key record, the key's
+  commitment and a sealing flag, and every frame header and persist record a 32-byte MAC; a
+  format-3 log (mantle's files, unsealed) still opens and is sealed from its next segment on, never
+  rewritten in place.
+
+### 5.1 The log's authentication key
+
+Each log has an authentication key, a child of the tenant key (or of the root, for a node's own
+log), wrapped in a record the log keeps beside its segments and unwrapped at open with the rest. Every
+frame header, every persist record and every segment header carries
+`HMAC-SHA-256(auth key, "hyper-seal frame" ‖ log ID ‖ bytes)` over its bytes, CRC included,
+truncated to nothing: the full 32 bytes. Recovery checks the CRC first (the device's check, which
+tells a torn write from a good one) and then the MAC, before it trusts a term, a vote, an index or a
+frame boundary. A frame whose CRC holds and whose MAC fails is `Tampered`, a typed error the log
+reports and never reads as its torn tail. HMAC rather than GMAC because its key may be used for any
+number of messages without a nonce, and a persist record is rewritten in its slot.
+
+### 5.2 Rollback
+
+The tags and MACs bind every record to its place, not to its time. An adversary who can write the
+device can put back an older, validly sealed segment or persist record: a member then forgets a vote
+or an acknowledgement, which can lose an entry a quorum counted on. Detecting it needs state the
+adversary cannot roll back: a trusted monotonic counter, bound into the MAC of each persist record
+and advanced past it before the record's frame is acknowledged. `hyper-seal` binds one where the
+key source has one (`KeySource::monotonic`: a TPM NV counter, the Secure Enclave); without one,
+rollback at rest is a stated non-goal (§13). A rolled-back minority member is caught only partly by
+its peers (a later term it should have seen), never with certainty.
 
 ## 6. A key to another machine
 
@@ -228,10 +267,21 @@ kek      = HKDF-SHA-384(salt = context, ikm = ss, info = "hyper-seal recipient" 
 record   = ct ‖ AES-256-KW(kek, key)
 ```
 
-ML-KEM-1024 is CNSA 2.0's key-establishment algorithm (R §6) and NIST's category 5. The KDF is
+Two modes, recorded in the record's first byte:
+
+- **CNSA** (the only mode under `fips`): ML-KEM-1024 alone, as above. ML-KEM-1024 is CNSA 2.0's
+  key-establishment algorithm and NIST's category 5 (R §6).
+- **Hybrid** (the default otherwise): ML-KEM-1024 and ECDH over P-384, their shared secrets
+  concatenated as SP 800-56C Rev. 2 §2 allows (`ikm = ss_kem ‖ ss_ecdh`, with both ciphertexts and
+  both public keys in `info`), so the key stays safe while either problem stays hard. Backups and
+  archives live for decades, and ANSSI's and BSI's guidance asks for hybrid key establishment through
+  the transition (R §6). P-384 rather than X25519 because it is FIPS-approved, so the hybrid's
+  classical half is inside the module too.
+ The KDF is
 SP 800-56C's two-step (extract, expand) with SHA-384, CNSA 2.0's hash. Binding the recipient's ID
 and the key's ID into `info` keeps a record from being replayed as another key's or another
-recipient's (R §4). The record is 1,568 + 40 bytes. The recipient's decapsulation key is a key like
+recipient's (R §4). A CNSA record is 1 + 1,568 + 40 bytes; a hybrid record adds P-384's 97-byte
+ephemeral public key. The recipient's decapsulation key is a key like
 any other: held by a key source, wrapped at rest.
 
 Replication between our own nodes is not this: holders keep ciphertext and never a key (slates), or
@@ -265,10 +315,15 @@ a consumer that names by BLAKE3 hashes the plaintext with BLAKE3 and keys the na
 
 A key in memory is in `Secret32`: 32 bytes in a page that is locked against swap (`mlock` on Linux
 and macOS, `VirtualLock` on Windows), kept out of core dumps where the OS offers it (`MADV_DONTDUMP`
-on Linux), and wiped on drop (volatile writes and a compiler fence, through `zeroize`). What each OS
-does with locked pages at hibernation and in its crash dumps is in R §7, with the man pages and
-vendor references; where an OS gives no guarantee, the consumer's install turns the leak off
-(hibernation, crash dumps) and says so. Keys share locked pages from one arena,
+on Linux), and wiped on drop (volatile writes and a compiler fence). Locked pages are still written
+to a hibernation image: macOS writes them to its image (encrypted under FileVault), Windows to
+`hiberfil.sys`, Linux to its swap (R §7). So:
+
+- **Servers** turn hibernation off at install, and say so.
+- **Laptops** (focal, days of use): the hibernation image is protected by full-disk encryption at
+  rest, which the consumer's install requires, and every key in the arena is wiped on the OS's
+  suspend notification where it gives one (`Arena::wipe_all`), the keys unwrapped again from the
+  key source on resume. Keys share locked pages from one arena,
 so a process locks a bounded number of pages (a stated count, refused past it), not a page a key.
 The arena's size is the consumer's stated count of keys held at once.
 
@@ -279,7 +334,8 @@ buffers are the consumer's to wipe.
 ## 9. FIPS mode
 
 `hyper-seal` builds against `aws-lc-sys` by default and `aws-lc-fips-sys` under the `fips` feature
-(aws-lc-rs's FIPS 140-3 validated module, R §9). Every primitive here is in the module's approved
+(aws-lc-rs's FIPS module: AWS-LC FIPS 3.0, FIPS 140-3 certificate #5314, the first validated
+module to include ML-KEM, ML-KEM-1024 among it; R §9). Every primitive here is in the module's approved
 set: AES-256-GCM, AES-KW, HKDF with SHA-384, HMAC-SHA-256, ML-KEM-1024, its DRBG. A consumer selects
 FIPS at build time; `hyper_seal::fips()` reports which module it runs, so a node can refuse to start
 when its configuration demands FIPS and the binary is not. Every call into AWS-LC runs behind the
@@ -298,9 +354,10 @@ endpoint keep the standard sets.
 ## 11. Measurement, before the log seals by default
 
 - **Group commit, sealed against unsealed**: hyper-log's open-loop bench at the frame sizes of
-  focal (a few hundred bytes), slates (100 B to KiB) and mantle, p50, p99 and p999 of the
-  acknowledgement, under the machine's own load, recorded; sealing is the default only if its added
-  latency is noise beside the flush (a stated margin from the measured flush distribution).
+  focal (frames of a few hundred bytes, group commit at its single-digit-ms flush), slates (100 B to
+  KiB) and mantle, p50, p99 and p999 of the acknowledgement, under the machine's own load, recorded;
+  sealing is the default only if its added latency is within a margin stated from the measured flush
+  distribution.
 - **Open of one record**: a 4 KiB and a 300 B record, p50 and p99 under load (slates: ≤ ~1 µs p99 at
   4 KiB).
 - **Key make and wrap**: p50 and p99 (slates: single-digit µs).
@@ -320,6 +377,12 @@ endpoint keep the standard sets.
   continuation: every acknowledged record opens, no key ever seals two payloads at one offset (the
   test records every (key, offset) sealed and checks it), a torn frame's records never open under
   the new session's key.
+- Commitment: a file or session whose key does not match its commitment opens nothing; a header
+  re-pointed at another key fails before any open.
+- Tamper: a frame header, persist record or segment header rewritten with a recomputed CRC fails
+  its MAC as `Tampered`, never as a torn tail; every hard-state field changed alone is caught.
+- Recipient: both modes round-trip; a record replayed under another recipient or key ID fails; the
+  hybrid fails if either half's shared secret is replaced.
 - Erase: a tenant key destroyed leaves every file under it unopenable, and its records report it.
 - Rotation: a rewrap opens every file and changes only key records.
 - Keys in memory: the arena refuses past its count; a dropped key's bytes are zero (read through the
@@ -333,3 +396,4 @@ endpoint keep the standard sets.
 - It does not protect a running process's memory from its own host's root; that is the consumer's
   isolation.
 - It does not choose a consumer's key source; the consumer binds the hardware it runs on.
+- It does not detect rollback at rest without a trusted monotonic counter (§5.2).

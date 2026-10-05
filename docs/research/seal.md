@@ -65,6 +65,9 @@ server-side encryption; `31`, integrity).
 - **NSA, CNSA 2.0** (Commercial National Security Algorithm Suite 2.0, September 2022, and its FAQ):
   AES-256, ML-KEM-1024, ML-DSA-87, SHA-384 or SHA-512; hybrid key establishment accepted in the
   transition.
+- **ANSSI**, "ANSSI views on the Post-Quantum Cryptography transition" (2022, follow-up 2023), and
+  **BSI** TR-02102-1 (2024): hybrid key establishment, a classical and a post-quantum scheme
+  combined, through the transition.
 - Grover's search against AES-256 leaves about 128 bits of security; NIST's PQC call for proposals
   (2016) uses AES-256's key search as category 5.
 
@@ -72,11 +75,13 @@ server-side encryption; `31`, integrity).
 
 - **mlock(2)** (Linux man-pages; macOS `mlock(2)`): locked pages stay resident and are not paged to
   swap. Linux `madvise(2)` `MADV_DONTDUMP` (since 3.4): excluded from core dumps.
-- **Linux hibernation** (`Documentation/power/swsusp.rst`): the image holds all of memory; locked
-  pages are not exempt. So a node that must not leak keys disables hibernation or encrypts its swap
-  and image. To check for the review: macOS's treatment of wired pages in its hibernation image and
-  in panic dumps, and Windows' `VirtualLock` and hibernation, from Apple's and Microsoft's own
-  references; `docs/seal.md` §8 states no guarantee for either until these are read.
+- **Hibernation writes locked pages.** Linux (`Documentation/power/swsusp.rst`): the image holds all
+  of memory, locked pages included, in swap. macOS writes wired pages to its hibernation image,
+  which FileVault encrypts (Apple Platform Security guide, "FileVault" and hibernation). Windows
+  writes them to `hiberfil.sys` (Microsoft's `VirtualLock` documentation gives no exemption from
+  hibernation). So servers turn hibernation off, and laptops rely on full-disk encryption of the
+  image and wipe keys on the suspend notification (`docs/seal.md` §8). From focal's review of
+  2026-10-05; Apple's and Microsoft's pages to be quoted here at the next revision.
 - **zeroize** crate: volatile writes and a compiler fence, so a wipe is not elided.
 
 ## 8. Cost
@@ -87,7 +92,18 @@ server-side encryption; `31`, integrity).
 
 ## 9. FIPS
 
-- **aws-lc-rs**, `fips` feature: builds against `aws-lc-fips-sys`, the AWS-LC FIPS module, which
-  holds FIPS 140-3 validation for its approved services (AES-GCM, AES-KW, HKDF, HMAC, SHA-2, its
-  DRBG; ML-KEM in the module versions that list it). To check for the review: the certificate
-  numbers and which module version first lists ML-KEM-1024 as approved, from NIST CMVP's records.
+- **aws-lc-rs**, `fips` feature: builds against `aws-lc-fips-sys`, the AWS-LC FIPS module.
+- **AWS Security Blog**, "AWS-LC FIPS 3.0: first cryptographic library to include ML-KEM in FIPS
+  140-3 validation": ML-KEM-512, -768 and -1024 inside the module, ML-KEM-1024 named for CNSA 2.0.
+- **sec-certs**, "AWS-LC 3 Cryptographic Module (static)": FIPS 140-3 Level 1, certificate #5314,
+  validated 2026-06-05, sunset 2031-06-04. To confirm against NIST CMVP's own record (focal also
+  saw a related #5298) before a release names the certificate.
+
+## 10. Key commitment
+
+- **Dodis, Grubbs, Ristenpart, Woodage**, "Fast Message Franking: From Invisible Salamanders to
+  Encryptment", CRYPTO 2018: AES-GCM ciphertexts that open validly under two keys.
+- **Len, Grubbs, Ristenpart**, "Partitioning Oracle Attacks", USENIX Security 2021.
+- **Chan, Rogaway**, "On Committing Authenticated-Encryption", ESORICS 2022: the CTX transform,
+  committing to the key with a hash beside the ciphertext. `docs/seal.md` §2 commits with
+  HMAC-SHA-256 under the data key, inside the FIPS boundary.

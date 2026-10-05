@@ -468,6 +468,12 @@ round trip in, closed half a round trip before tickets sent after the client's F
 with the two tickets of the first dial spent the fourth dial fell back to 1-RTT. More tickets per
 full handshake only defer that, since each such dial spends one and gets none; tickets in the first
 flight replace the one each dial spends. A handshake that requests a client certificate, and TLS
-over TCP, send them after the client's Finished as upstream does. Upstream's suite passes unchanged;
+over TCP, send them after the client's Finished as upstream does; `ExpectFinished` writes no flight
+when none are left to send.
+
+The cost is one allocation a handshake, the fork of the transcript's hash the resumption secret is
+derived from; the predicted Finished is hashed in place. hyper-quic's
+`allocations_per_handshake` (client and server together, two runs each): 490 to 491 allocations for a
+full handshake and 495 to 496 for a resumed one, reallocations 55–57 before and 54–55 after. Upstream's suite passes unchanged;
 `crates/hyper-quic/tests/geo.rs`'s `every_resumed_dial_closed_at_its_reply_leaves_a_ticket_for_the_next`
 failed before it.

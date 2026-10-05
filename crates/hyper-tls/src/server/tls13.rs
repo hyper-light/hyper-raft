@@ -507,10 +507,14 @@ mod client_hello {
             cx: &mut ServerContext<'_>,
         ) -> Result<(), Error> {
             let verify_data = key_schedule.client_finish_ahead(&transcript.current_hash())?;
+            // The client's Finished as the transcript takes it (RFC 8446 §4: msg_type, a 24-bit
+            // length, the verify_data), hashed in place rather than encoded into a buffer
+            let length = u8::try_from(verify_data.as_ref().len())
+                .map_err(|_| Error::General("verify_data longer than a hash".into()))?;
             let mut ahead = transcript.clone();
-            HandshakeFlightTls13::new(&mut ahead).add(HandshakeMessagePayload(
-                HandshakePayload::Finished(Payload::new(verify_data.as_ref())),
-            ));
+            let [kind] = HandshakeType::Finished.to_array();
+            ahead.add(&[kind, 0, 0, length]);
+            ahead.add(verify_data.as_ref());
             let resumption = key_schedule.resumption_ahead(&ahead.current_hash())?;
             // NewSessionTicket is not part of the transcript (RFC 8446 §4.4.1)
             let mut flight = HandshakeFlightTls13::new(&mut ahead);
@@ -1454,11 +1458,14 @@ impl State<ServerConnectionData> for ExpectFinished {
         let (key_schedule_traffic, resumption) =
             key_schedule_before_finished.into_traffic(self.transcript.current_hash())?;
 
-        let mut flight = HandshakeFlightTls13::new(&mut self.transcript);
-        for _ in 0..self.send_tickets {
-            Self::emit_ticket(&mut flight, self.suite, cx, &resumption)?;
+        // None left to send when they went with the server's Finished (`emit_tickets_ahead`)
+        if self.send_tickets > 0 {
+            let mut flight = HandshakeFlightTls13::new(&mut self.transcript);
+            for _ in 0..self.send_tickets {
+                Self::emit_ticket(&mut flight, self.suite, cx, &resumption)?;
+            }
+            flight.finish(cx.common);
         }
-        flight.finish(cx.common);
 
         // Application data may now flow, even if we have client auth enabled.
         cx.common.start_traffic(&mut cx.sendable_plaintext);

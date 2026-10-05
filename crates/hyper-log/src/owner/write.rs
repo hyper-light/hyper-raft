@@ -820,7 +820,7 @@ impl<F: BlockFile + 'static> Owner<F> {
                 .as_slice()
                 .get(frame_at..body_end)
                 .ok_or(LogError::Damaged("a frame"))?;
-            let mac = seal.mac(covered)?;
+            let mac = seal.mac_frame(covered, records)?;
             buf.extend_from_slice(&mac).map_err(disk)?;
         }
         Ok(buf)

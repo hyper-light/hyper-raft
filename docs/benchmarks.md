@@ -6779,3 +6779,35 @@ burst's first round trip on a connection with no measurement of its path waits o
 window, which RFC 9002 §7.2 and §7.7 set and no standards-track mechanism lets a sender exceed
 (`docs/research/quic-overhead.md` §4.2).
 
+## Sealing at rest (hyper-seal, sealed hyper-log)
+
+docs/seal.md §11. M5 Max, 18 cores, APFS, 2026-10-05, the machine's own load recorded with each run.
+
+**hyper-seal** (`cargo bench -p hyper-seal --bench seal -- 10000`, 10:44Z, load 5.2), p50 / p99 / p99.9:
+
+| | |
+|---|---|
+| a key made and wrapped | 1.38 / 1.50 / 1.88 µs |
+| a key unwrapped | 375 / 416 / 459 ns |
+| a 4 KiB segment opened, warm | 500 / 542 / 625 ns |
+| a 4 KiB segment opened, cold (unwrap + commitment) | 1.21 / 1.33 / 4.00 µs |
+| 4 KiB overwrite in a 64 KiB chunk: key per file / versioned | 9.88 / 10.88 / 13.71 µs vs 500 / 583 / 709 ns |
+| 4 KiB overwrite in a 256 KiB chunk: key per file / versioned | 31.0 / 32.6 / 37.0 µs vs 500 / 583 / 750 ns |
+| throughput a core, seal / open, 4 / 16 / 64 / 256 KiB segments | 9.25 / 10.12 / 10.45 / 10.49 GB/s; 8.42 / 9.15 / 8.98 / 9.24 GB/s |
+
+**Group commit, plain against sealed** (`cargo bench -p hyper-log --bench log -- DIR 5 1024,16384 64
+plain,sealed`, each point plain then sealed, three repetitions, 64 closed-loop replicas, load 3.9–5.3).
+With the frame MAC over framing only:
+
+| entry | appends/s plain / sealed | p50 plain / sealed | energy an append plain / sealed |
+|---|---|---|---|
+| 1 KiB | 6,932–7,781 / 7,099–7,748 | 8.46–8.49 / 8.43–8.49 ms | 30.2–34.2 / 32.1–37.2 µJ |
+| 16 KiB | 6,894–7,536 / 6,894–7,395 | 8.49–8.54 / 8.52–8.60 ms | 47.4–48.1 / 60.1–62.0 µJ |
+
+Latency and rate are within the flush's own spread (one F_FULLFSYNC, ~8.5 ms here): sealing adds
+microseconds to a frame that waits milliseconds. Energy grows 5–9% at 1 KiB and ~27% at 16 KiB, the
+cost of encrypting the bytes; before the frame MAC left sealed bytes to their tags it was ~13% and
+~80% (three repetitions at 5 s, load 3.1–4.7). Single 2-second points earlier the same day moved p50
+between 8.5 and 16 ms in both modes alike, the flush's steps under other I/O; they are not a
+difference between the modes.
+

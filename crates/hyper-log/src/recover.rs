@@ -272,9 +272,8 @@ fn check_frame_mac(mac: &FrameMac, header: &FrameHeader, bytes: &[u8]) -> Result
     let (Some(covered), Some(tag)) = (bytes.get(..at), bytes.get(at..end)) else {
         return Err(LogError::Tampered("a frame cut short of its MAC"));
     };
-    let tag: &[u8; MAC_LEN] = tag.try_into().map_err(|_| LogError::Tampered("a MAC"))?;
-    mac.verify(covered, tag)
-        .map_err(|_| LogError::Tampered("a frame fails its MAC"))
+    let expected = crate::seal::frame_mac(mac, covered, header.records)?;
+    crate::seal::same_mac(&expected, tag)
 }
 
 fn block_of(align: Alignment) -> Result<u64, LogError> {
@@ -426,7 +425,7 @@ pub(crate) fn create<F: BlockFile>(
     if let Some(sealer) = sealer.as_deref() {
         let mac = sealer.mac(&header)?;
         header.extend_from_slice(&mac);
-        let mac = sealer.mac(&frame)?;
+        let mac = sealer.mac_frame(&frame, 0)?;
         frame.extend_from_slice(&mac);
     }
     if header.len() > block {

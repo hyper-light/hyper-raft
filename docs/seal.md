@@ -246,9 +246,15 @@ and slates need, and costs one GCM call; a frame of many records costs one call 
 
 Each log has an authentication key, a child of the tenant key (or of the root, for a node's own
 log), wrapped in a record the log keeps beside its segments and unwrapped at open with the rest. Every
-frame header, every persist record and every segment header carries
-`HMAC-SHA-256(auth key, "hyper-seal frame" ‖ log ID ‖ bytes)` over its bytes, CRC included,
-truncated to nothing: the full 32 bytes. Recovery checks the CRC first (the device's check, which
+frame, every persist record and every segment header carries
+`HMAC-SHA-256(auth key, "hyper-seal frame" ‖ log ID ‖ bytes)`, the full 32 bytes. A segment header's
+and a persist record's bytes are all of them, CRC included. A frame's are its header and every byte
+of its payload but the sealed records' stored bytes: those are authenticated by their own tags, each
+bound to its offset under its session's key and to its log, segment, group, index and term, while
+their lengths and CRC fields, and every record that is not sealed, stay under the MAC. So a change to
+a sealed record that keeps its CRC true changes what the MAC covers, and one that does not fails the
+CRC. Hashing the sealed bytes again cost about 80% more energy an append at 16 KiB entries for
+nothing (§11). Recovery checks the CRC first (the device's check, which
 tells a torn write from a good one) and then the MAC, before it trusts a term, a vote, an index or a
 frame boundary. A frame whose CRC holds and whose MAC fails is `Tampered`, a typed error the log
 reports and never reads as its torn tail. HMAC rather than GMAC because its key may be used for any

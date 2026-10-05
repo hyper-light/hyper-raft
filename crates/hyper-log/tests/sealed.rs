@@ -412,3 +412,68 @@ fn sweeps_reseal_what_they_copy() {
     check(&log);
     log.close().unwrap();
 }
+
+/// A sealed entry's bytes changed, its CRC and its frame's CRC recomputed: the frame's MAC leaves
+/// sealed bytes to their own tags but covers each one's CRC field, so a change that keeps the CRC
+/// true changes what the MAC covers, and the open reports tampering. (One that leaves the CRC as it
+/// was fails the CRC, and the bytes' tag besides.)
+#[test]
+fn a_sealed_entry_changed_with_its_crcs_recomputed_is_tampering() {
+    let log = Log::create_sealed(sim(7), config(16, 8), ID, keys(1, 2)).unwrap();
+    log.write(
+        1,
+        Update {
+            entries: Some(entries(1, &[1, 1])),
+            hard_state: Some(HardState {
+                term: 1,
+                vote: 1,
+                commit: 2,
+            }),
+            ..Update::default()
+        },
+    )
+    .unwrap();
+    let file = log.close().unwrap();
+    let bytes = bytes_of(&file);
+    let first = AREA as usize + BLOCK;
+    let empty = FrameHeader::decode(&bytes[first..]).unwrap();
+    let at = first
+        + Alignment::new(BLOCK)
+            .unwrap()
+            .up(empty.frame_len().unwrap())
+            .unwrap();
+    let header = FrameHeader::decode(&bytes[at..]).unwrap();
+    let payload = at + FRAME_HEADER_LEN;
+    let end = payload + header.payload_len as usize;
+    let mut frame = bytes[at..end].to_vec();
+    let mut first_entry = None;
+    hyper_log::format::sealables(&frame[FRAME_HEADER_LEN..], header.records, |s| {
+        first_entry.get_or_insert(s);
+        Some(())
+    })
+    .unwrap();
+    let s = first_entry.unwrap();
+    let base = FRAME_HEADER_LEN;
+    frame[base + s.bytes_at] ^= 0x01;
+    let stored = &frame[base + s.bytes_at..base + s.bytes_at + s.stored];
+    let crc = hyper_log::format::entry_crc(s.group, s.index, s.term, stored);
+    frame[base + s.crc_at..base + s.crc_at + 4].copy_from_slice(&crc.to_le_bytes());
+    let mut fcrc = hyper_log::codec::Crc32c::new();
+    fcrc.update(&frame[..FRAME_HEADER_LEN - 4]);
+    fcrc.update(&frame[FRAME_HEADER_LEN..]);
+    frame[FRAME_HEADER_LEN - 4..FRAME_HEADER_LEN].copy_from_slice(&fcrc.finish().to_le_bytes());
+    let span = Alignment::new(BLOCK).unwrap().up(frame.len()).unwrap();
+    let mut write = AlignedBuf::zeroed(span, file.alignment()).unwrap();
+    write.set_len(span).unwrap();
+    write.as_mut_slice().copy_from_slice(&bytes[at..at + span]);
+    write.as_mut_slice()[..frame.len()].copy_from_slice(&frame);
+    file.write_all_at(write.as_slice(), at as u64).unwrap();
+    let refused = Log::try_open_sealed(file, config(16, 8), ID, keys(1, 2))
+        .err()
+        .unwrap();
+    assert!(
+        matches!(refused.error, LogError::Tampered(_)),
+        "{:?}",
+        refused.error
+    );
+}

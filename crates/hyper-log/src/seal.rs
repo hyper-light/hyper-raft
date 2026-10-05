@@ -58,6 +58,59 @@ pub(crate) fn put_at(dst: Option<&mut [u8]>, src: &[u8]) -> Result<(), LogError>
     Ok(())
 }
 
+/// The MAC of a sealed frame (hyper-raft docs/seal.md §5.1): its header and every byte of its payload
+/// but the sealed records' stored bytes. Those are authenticated by their own tags, each bound to its
+/// file offset under its session's key and to its log, segment, group, index and term, so hashing
+/// them again buys nothing; their lengths and CRC fields, and every record that is not sealed, are
+/// covered. A payload that does not walk is tampering, its CRC having held.
+pub(crate) fn frame_mac(
+    mac: &FrameMac,
+    frame: &[u8],
+    records: u32,
+) -> Result<[u8; MAC_LEN], LogError> {
+    let (header, payload) = frame
+        .split_at_checked(format::FRAME_HEADER_LEN)
+        .ok_or(LogError::Tampered("a frame shorter than its header"))?;
+    let mut sealed_spans = Vec::new();
+    format::sealables(payload, records, |s| {
+        sealed_spans.push((s.bytes_at, s.bytes_at.checked_add(s.stored)?));
+        Some(())
+    })
+    .ok_or(LogError::Tampered("a frame's payload does not walk"))?;
+    let mut spans = Vec::with_capacity(sealed_spans.len().saturating_mul(2).saturating_add(2));
+    spans.push(header);
+    let mut at = 0usize;
+    for (from, to) in sealed_spans {
+        spans.push(
+            payload
+                .get(at..from)
+                .ok_or(LogError::Tampered("a sealed record out of order"))?,
+        );
+        at = to;
+    }
+    spans.push(
+        payload
+            .get(at..)
+            .ok_or(LogError::Tampered("a sealed record past its frame"))?,
+    );
+    mac.mac_spans(spans).map_err(sealed)
+}
+
+/// Whether `mac` is `expected`, compared in constant time; a mismatch is tampering.
+pub(crate) fn same_mac(expected: &[u8; MAC_LEN], mac: &[u8]) -> Result<(), LogError> {
+    let equal = expected.len() == mac.len()
+        && expected
+            .iter()
+            .zip(mac)
+            .fold(0u8, |diff, (a, b)| diff | (a ^ b))
+            == 0;
+    if equal {
+        Ok(())
+    } else {
+        Err(LogError::Tampered("a frame fails its MAC"))
+    }
+}
+
 fn sealed(e: SealError) -> LogError {
     match e {
         SealError::Tampered => LogError::Tampered("framing fails its MAC"),
@@ -233,6 +286,11 @@ impl Sealer {
         let mut plain = bytes.to_vec();
         opener.open(offset, &id, &mut plain, tag).map_err(sealed)?;
         Ok(plain)
+    }
+
+    /// The MAC of a sealed frame, `frame` its header and payload of `records` records (§5.1).
+    pub(crate) fn mac_frame(&self, frame: &[u8], records: u32) -> Result<[u8; MAC_LEN], LogError> {
+        frame_mac(&self.mac, frame, records)
     }
 
     /// The framing MAC, for a reader of the log's frames: recovery's, and the device's.

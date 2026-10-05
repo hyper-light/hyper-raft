@@ -30,6 +30,9 @@
 )]
 
 mod error;
+mod file;
+#[cfg(windows)]
+mod file_windows;
 pub mod keys;
 pub mod log;
 mod memory;
@@ -38,6 +41,7 @@ pub mod recipient;
 pub mod stream;
 
 pub use error::SealError;
+pub use file::FileSource;
 pub use memory::{Secret32, keys_held, lock_keys};
 
 use std::panic::{AssertUnwindSafe, catch_unwind};

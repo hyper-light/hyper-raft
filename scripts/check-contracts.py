@@ -44,6 +44,9 @@ UNSAFE_ALLOWED = {
         "MADV_DONTDUMP through rustix (Unix), VirtualLock through windows-sys (Windows), the "
         "region's key slots read and written by their one claimer, and std::ptr::write_volatile "
         "for the wipe a dropped key gets",
+    "crates/hyper-seal/src/file_windows.rs":
+        "GetSecurityInfo, GetAclInformation, GetAce, EqualSid, IsWellKnownSid and LocalFree through "
+        "windows-sys (a key file's DACL, checked owner-only)",
     "crates/hyper-block/src/node/macos.rs":
         "the disk ioctls of <sys/disk.h> (a device node's capacity and cache flush)",
     "crates/hyper-raft-e2e/src/fault_windows.rs":

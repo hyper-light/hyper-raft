@@ -21,8 +21,8 @@ thiserror.workspace = true
 rustix = { workspace = true, features = ["mm", "param"] }
 
 [target.'cfg(windows)'.dependencies]
-# VirtualLock for the key region.
-windows-sys = { workspace = true }
+# VirtualLock for the key region; GetSecurityInfo and the ACL walk for a key file's owner-only check.
+windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_System_Memory"] }
 
 [dev-dependencies]
 tempfile.workspace = true

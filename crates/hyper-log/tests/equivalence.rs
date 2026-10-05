@@ -208,6 +208,8 @@ fn answer(r: Result<(), LogError>) -> &'static str {
         Err(LogError::Claimed(_)) => "claimed",
         Err(LogError::Behind(_)) => "behind",
         Err(LogError::Disk(_)) => "disk",
+        Err(LogError::Tampered(_)) => "tampered",
+        Err(LogError::Seal(_)) => "seal",
     }
 }
 

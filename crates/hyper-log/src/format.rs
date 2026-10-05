@@ -38,6 +38,8 @@ pub const TAG_LEN: usize = hyper_seal::TAG;
 pub const KEY_FRAME_LEN: usize = hyper_seal::log::KEY_FRAME;
 /// Bytes of a sealed segment's header before its MAC: the header, then the key frame.
 pub const SEALED_SEGMENT_HEADER_LEN: usize = SEGMENT_HEADER_LEN + KEY_FRAME_LEN;
+/// Bytes of a key record: its kind and group, then the key frame.
+pub const KEY_RECORD_LEN: usize = RECORD_HEADER_LEN + KEY_FRAME_LEN;
 
 /// Bytes of a segment header before its padding.
 pub const SEGMENT_HEADER_LEN: usize = 52;

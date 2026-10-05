@@ -274,6 +274,33 @@ entries (a member losing acknowledged entries) is caught only through the quorum
 members hold them, and is stated so; Memoir's approach can tighten it later. Without a counter,
 rollback at rest is a stated non-goal (§13).
 
+### 5.3 As built in hyper-log
+
+- **Format 4, fixed at creation.** `Log::create_sealed` and `Log::open_sealed` take a `Sealing` (the
+  parent key and the authentication key). A sealed log refuses a frame, segment header or persist
+  record of format 3 as `Tampered`, so no unsealed frame can be spliced in; an unsealed log reads a
+  sealed one as foreign. An existing unsealed log is not converted in place.
+- **Where the MACs are.** A segment header's MAC follows its key frame in its first block. A frame's
+  MAC follows its payload, so the header keeps its layout and every offset the log computes from
+  it; the frame's length counts it. A persist record's MAC follows its CRC; a sealed log's persist
+  slots are sized with it, and an unsealed log's are unchanged.
+- **Nonces.** A record's nonce is the file offset of its sealed bytes, and its additional data its
+  log, segment incarnation, group, index and term.
+- **Sessions.** A segment's opening session's key frame is in its header; the first frame a writer
+  writes into a segment it continues after an open begins with a key record (kind 9). If that frame
+  ends up opening a new segment instead, the key goes in the new header and no record is laid. A
+  segment's sessions are bounded by its frames.
+- **Who holds the keys.** The log's owner holds the sealer: it seals each frame's payload in place
+  once the frame's place is known, then computes the frame's CRC and MAC over the sealed bytes, and
+  opens entries read back and records a sweep copies. The device holds a copy of the framing MAC
+  key and checks every frame it reads, so a sweep never copies a hard state it has not
+  authenticated.
+- **Tests** (`crates/hyper-log/tests/sealed.rs`): read back across reopening with nothing cached; no
+  plaintext in the file; a wrong parent key, a wrong authentication key, no keys, and the reverse
+  all refused; a hard state changed with the frame's CRC recomputed is `Tampered`; five opens, each
+  continuing the head segment with its own session; sweeps reclaiming segments, every live record
+  read back after reopening.
+
 ## 6. A key to another machine
 
 A backup, an archive, a hand-off to a successor or a restore on a fresh machine needs a key there

@@ -203,7 +203,9 @@ impl SessionOpener {
 }
 
 /// The MAC every frame header, persist record and segment header of one log carries (§5.1): the
-/// log's authentication key, its ID, and the bytes, CRC included.
+/// log's authentication key, its ID, and the bytes, CRC included. A log's owner and its device each
+/// hold one, the device to check the frames it reads.
+#[derive(Clone)]
 pub struct FrameMac {
     key: hmac::Key,
     log: [u8; 16],

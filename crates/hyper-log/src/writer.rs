@@ -144,6 +144,9 @@ pub(crate) struct Placement {
     proposals: Option<usize>,
     uncertain: Option<usize>,
     damaged: Option<usize>,
+    /// The tag after each entry's and proposal's bytes in a sealed log: what an entry's or
+    /// proposal's stride counts beside its header and bytes.
+    tag: usize,
 }
 
 /// A live piece of the tail copied into the payload.
@@ -178,6 +181,9 @@ pub(crate) struct Target {
     pub(crate) frame_len: u64,
     /// Whether the frame opens its segment, whose header it writes first.
     pub(crate) opens: bool,
+    /// Bytes laid before the payload: a sealed log's key record, when the frame begins a writer
+    /// session in a segment it continues ([`format::KEY_RECORD_LEN`]), or none.
+    pub(crate) prefix: u64,
 }
 
 pub(crate) fn block(p: &Params) -> Result<u64, LogError> {
@@ -423,11 +429,7 @@ pub(crate) fn target(
     makes_room: bool,
 ) -> Result<Option<Target>, LogError> {
     let block = block(p)?;
-    let frame_len = format::FRAME_HEADER_LEN
-        .checked_add(payload_len)
-        .and_then(|len| u64::try_from(len).ok())
-        .and_then(|len| p.align.up_u64(len))
-        .ok_or(LogError::TooLarge(payload_len))?;
+    let frame_len = frame_len(p, payload_len)?;
     let head = state.head;
     let head_end = slot_start(&p.config, head.slot)?
         .checked_add(p.config.segment_bytes)
@@ -446,6 +448,7 @@ pub(crate) fn target(
             offset: head.offset,
             frame_len,
             opens: false,
+            prefix: 0,
         }));
     }
     if usable == 0 || (usable == 1 && !makes_room) {
@@ -472,7 +475,18 @@ pub(crate) fn target(
         offset,
         frame_len,
         opens: true,
+        prefix: 0,
     }))
+}
+
+/// Bytes of a frame whose header is followed by `payload_len` bytes (a sealed log's MAC
+/// counted among them), padded to the block.
+pub(crate) fn frame_len(p: &Params, payload_len: usize) -> Result<u64, LogError> {
+    format::FRAME_HEADER_LEN
+        .checked_add(payload_len)
+        .and_then(|len| u64::try_from(len).ok())
+        .and_then(|len| p.align.up_u64(len))
+        .ok_or(LogError::TooLarge(payload_len))
 }
 
 /// A run of live entries being gathered: its first index and its entries' terms and bytes.
@@ -928,6 +942,7 @@ pub(crate) fn encode(
         let damaged = lay.put(&Record::Damaged { group })?;
         return Some(Placement {
             damaged: Some(damaged),
+            tag,
             ..Placement::default()
         });
     }
@@ -959,6 +974,7 @@ pub(crate) fn encode(
         proposals,
         uncertain,
         damaged: None,
+        tag,
     })
 }
 
@@ -1018,6 +1034,7 @@ pub(crate) fn publish(
     let base = target
         .offset
         .checked_add(format::FRAME_HEADER_BYTES)
+        .and_then(|base| base.checked_add(target.prefix))
         .ok_or(LogError::Damaged("an offset past u64"))?;
     let place = |at: usize| -> Result<Place, LogError> {
         Ok(Place {
@@ -1218,7 +1235,8 @@ fn apply_entries(
         let here = at.ok_or(LogError::Damaged("an offset past usize"))?;
         at = here
             .checked_add(format::ENTRY_HEADER_LEN)
-            .and_then(|a| a.checked_add(usize::try_from(len).ok()?));
+            .and_then(|a| a.checked_add(usize::try_from(len).ok()?))
+            .and_then(|a| a.checked_add(placement.tag));
         let slot = Slot {
             term,
             place: place(here)?,
@@ -1306,7 +1324,8 @@ fn apply_proposals(
         record = start
             .checked_add(format::RECORD_HEADER_LEN)
             .and_then(|a| a.checked_add(format::PROPOSAL_FIELDS_LEN))
-            .and_then(|a| a.checked_add(p.bytes.len()));
+            .and_then(|a| a.checked_add(p.bytes.len()))
+            .and_then(|a| a.checked_add(placement.tag));
         let at = start
             .checked_add(format::RECORD_HEADER_LEN)
             .ok_or(LogError::Damaged("an offset past usize"))?;

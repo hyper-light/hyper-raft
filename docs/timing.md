@@ -1257,9 +1257,9 @@ spend a term and depose a leader that never left.
 **The rules**, each with its source and, where the schedules found it, the run that did:
 - **A follower campaigns when it trusts no leader**, after the law's draw, `election_delay(W, seed,
   index)` uniform on `[0, W)` (`ElectionTiming::delay` is the same draw). It trusts a leader while
-  it knows one, its detector does not suspect it, and the configuration it applied names it a voter
-  (a leader that is none steps down once it applies that, and a member that applied it knows it was
-  committed). A suspicion withdrawn before the delay ends cancels the campaign.
+  it knows one, its detector does not suspect it, and the configuration it counts by, the newest its
+  log states, names it a voter (a leader that is none leads only until that configuration is
+  committed, and hands over once it applies it; `docs/raft.md` §3.4). A suspicion withdrawn before the delay ends cancels the campaign.
 - **Every arming draws anew** (`Watch::draws`, the next draw's index): a member's delays are
   independent across elections, as Raft's randomized timeout is drawn anew at every reset (§5.2,
   §9.3) and as the law's split probability takes them. A draw kept until it fired, as the campaign

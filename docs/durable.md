@@ -271,8 +271,8 @@ Where the shell keeps each, as built (D-1, `crates/hyper-durable`; the oracle an
 ### 4.1 Apply only on a commit the log holds, where a restart acts on it
 
 A member's commit is volatile (thesis §3.8) and is re-learned from its group after a restart. In a
-core whose configuration takes effect when applied (hyper-raft's, as etcd's), the configuration
-reverts with it, and a member that restarted without the commit counts the members the change
+core whose configuration takes effect when applied (etcd's, and hyper-raft's before
+`docs/raft.md` §3.4), the configuration reverts with it, and a member that restarted without the commit counts the members the change
 removed: two voters of which one was removed and stopped leave one that cannot elect itself
 (focal's `cli_network`; etcd's doc states the same hole for two-member removal, research §3). And a
 member that acts on applied state at its next start, before its group tells it anything, acts on

@@ -517,7 +517,7 @@ models.
 ### 4.6 Testing the tests
 
 Each oracle and each strategy has planted defects it must catch: the TLA+ configurations that must be
-refused (`FastTrackAnyRound`, `FastTrackAnyConfig`), slates' `Variant`s, and for the implementation,
+refused (`FastTrackAnyRound`), slates' `Variant`s, and for the implementation,
 mutants behind a test-only setting — committing by counting an older term's replicas, a ReadIndex
 without the leader's first entry, a vote not made durable before it is sent, the fast track without each
 of its two rules (seeds 9843 and 54104). Twins validates its generator the same way (Bano et al. §6.1).
@@ -1412,22 +1412,24 @@ sessions' work, load 9–72 (`docs/benchmarks.md`, "hyper-check's strategies and
 | Defect (§4.6) | Random walk (§14.6) | Swarm | PCT, depth 1 | PCT, depth 2 | Coverage-guided | Exhaustive rounds (rounds played) |
 |---|---|---|---|---|---|---|
 | a commit counted from an older term's replicas | not in 2,096 | **172** | not in 2,096 | not in 2,096 | not in 2,096 | **33,621** (four rounds) |
-| a read served before the term's first commit | 1 | 16 | 3 | 3 | 99 | outside its scenarios (no reads) |
+| a read served before the term's first commit | 4 | 18 | 13 | 13 | 8 | outside its scenarios (no reads) |
 | a vote sent before it is durable | 1 | 1 | 1 | 1 | 1 | outside its scope (no lagging writes) |
-| the fast track without its first rule | 47,819 | **706** | 25,324 | 21,181 | **4,787** | outside its scope (no fast track) |
-| the fast track without its second rule | 121,041 | not its defect: run 41,346 found the core's open one (§15.9) | 103,278 | 103,278 | not in 121,041 (5,385,415 abstract states covered) | outside its scope |
+| the fast track without its first rule | 67,843 | **2,881** | 26,306 | 28,115 | **6,655** | outside its scope (no fast track) |
+| the fast track without its second rule | 1,484 | **571** | not in 2,096 | not in 2,096 | 1,496 | outside its scope |
+
+The counts are those on the core that counts by the newest configuration in its log (§15.12,
+2026-10-05); the campaigns were run again on it from their first seeds, and each catch is its
+defect's (`each_catch_by_seed_is_its_defects`, `each_catch_by_coverage_is_its_defects`). On the
+core before, the second rule's swarm campaign met the core's open defect first (§15.9), and the
+first rule's counts were 47,819 (random walk), 706, 25,324, 21,181 and 4,787.
 
 The guarantees the PCT campaigns' run counts carry, by Theorem 9 at their `k`, five members: for a
 defect of depth one, 1 − (4/5)^R, above 0.9999 at every count here but the first runs; for depth two,
-0.875 at 21,181 runs (the first rule's `k` of 2,035), 0.194 at 2,096 (the group's 1,939); for depth
-three, at most 1.2·10⁻³. **What the counts say.** The swarm beats the random walk by 68 times on the
-first fast-track rule and catches the older-term commit, which the random walk never caught; on the
-second rule it found the core's open defect (§15.9) before the planted one, so its count there says
-nothing of the strategy. Coverage guidance beats the random walk by 10 times on the first rule and
-does not catch the second within 121,041 runs, covering 5.4 million abstract states; PCT beats it
-by about 2 times on the first rule and by 1.2 times on the second, and not at all on
-the older-term commit, where the defect needs an order of elections and partitions rather than of
-deliveries. The exhaustive round
+0.925 at 26,306 runs and 0.937 at 28,115 (the first rule), 0.194 at 2,096 (the group's) and 0.185
+(the second rule's); for depth three, at most 1.4·10⁻³ (the campaigns' own report, 2026-10-05). **What the counts say.** On the first fast-track rule the swarm beats
+the random walk by 23 times, coverage guidance by 10 and PCT by about 2.5; on the second the swarm
+by 2.6 times, and coverage guidance and PCT not at all. The swarm alone catches the older-term
+commit, which needs an order of elections and partitions rather than of deliveries. The exhaustive round
 search is the only strategy that guarantees its result within its scope: it plays every four-round
 scenario, and the older-term commit is among them.
 
@@ -1558,3 +1560,35 @@ searches 14.7 min, 2.48 GB resident at most.
 - **`FastTrack.tla`'s `LogMatching`** compares whole entries, and the fast track's committed prefixes
   may differ in their stamps (§15.9), which its present scopes do not reach. TLC runs in CI only;
   the invariant's change, and a scope that reaches such a state, are owed to the model.
+
+### 15.12 The configuration a member counts by (2026-10-05)
+
+The random walk, re-run on the fast schedules, elected two leaders of a term (fast seed 135,923): a
+member whose log held a change past its commit counted elections by the configuration it had applied
+(`docs/raft.md` §3.4). The core now counts elections and commitment by the newest configuration in
+its log. The schedules then found three more of the rule's consequences, each corrected at its cause
+with a directed test (§3.4's list): a newcomer refused the snapshot that would seed it (group seed
+0), a leader the newest configuration left out answered a read alone (hostile seed 47), and the
+members holding the entry that leaves a joint configuration had no one they could elect (group seed
+11). The harness held three things to the configuration applied that now count by the newest: the
+durability oracle's configuration a commit was decided by, the members the stop rule and the
+electability check read, and hyper-durable's I3; each now reads what the core counts by. A member that
+restarts on a snapshot its disk holds is credited with it by the exactly-once oracle (pipelined seed
+21, where the snapshot was durable and the member stopped before it heard so).
+
+The swarm with no defect planted, re-run on this core, found a defect that is not the rule's and
+that the core had before it (the directed test fails on the core before either): a stale read (group
+seed 4,521). An asker asked a read again under the context an earlier read round had carried, so the
+read waited at the queue's tail behind reads asked since; a late, repeated answer to that earlier
+round named the context, and confirmed the read and every one before it, all asked after the round
+left. A deposed leader answered at its commit of 48 a read asked when 220 was committed. A round now
+carries its number after the context, and an answer confirms a read only if its round was sent while
+the read waited (`ReadOnly::ack_round`; `docs/raft.md` §3.3,
+`a_late_answer_to_a_round_confirms_no_read_asked_after_it_under_the_same_context`).
+
+What the counts moved. The read before the first commit is first caught at group seed 3 (it was 0),
+the first fast-track rule at seed 67,842, by the fast agreement oracle (a member voted two values at
+one index in one term, where the leader's wrong count led; the run without the defect keeps every
+oracle), and the second at seed 1,483. The floors of `tests/check.rs` are the counts on this core
+(§15.2); a write displaced by another entry is reached about once a pipelined seed, and is held to
+being reached.

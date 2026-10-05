@@ -417,6 +417,13 @@ fn replay<M: Model>(
     Ok(history)
 }
 
+/// Adds one expansion's path counts to the report's.
+fn tally_all(counts: &mut [u64], more: &[u64]) {
+    for (count, more) in counts.iter_mut().zip(more) {
+        *count = count.saturating_add(*more);
+    }
+}
+
 /// What one worker made of its slice of a frontier.
 struct Expansion<M: Model> {
     /// Its successors not yet visited, bucketed by the shard that owns their fingerprints.
@@ -447,12 +454,22 @@ fn expand<M: Model>(
         fault: None,
         full: false,
     };
-    let mut bucketed = 0usize;
+    // Places the buckets hold by capacity, against the allowance.
+    let mut held = 0usize;
     let mut actions = Vec::new();
+    // The classes one state's steps reached, so that two of its steps to one class (a model's
+    // actions often reach one state by several arguments) take one bucket's place: as many as
+    // its actions, and cleared for the next state.
+    let mut reached: Vec<u128> = Vec::new();
     for key in slice {
         let state = model.unpack(key);
         actions.clear();
+        reached.clear();
         model.actions(&state, &mut actions);
+        if reached.try_reserve(actions.len()).is_err() {
+            expansion.full = true;
+            return expansion;
+        }
         for action in actions.iter().copied() {
             let Some(next) = model.apply(&state, action) else {
                 continue;
@@ -465,22 +482,28 @@ fn expand<M: Model>(
             let representative = model.canonical(&next.state);
             let print = fingerprint(&representative);
             let shard = shard_of(print, shards.len());
-            if shards.get(shard).is_some_and(|set| set.contains(print)) {
+            if reached.contains(&print) || shards.get(shard).is_some_and(|set| set.contains(print))
+            {
                 continue;
             }
-            bucketed = bucketed.saturating_add(1);
-            if bucketed > allowance {
+            reached.push(print);
+            // A bucket grows by doubling, within the bytes the allowance leaves: what it holds by
+            // capacity is what the search counts.
+            let Some(bucket) = expansion.buckets.get_mut(shard) else {
                 expansion.full = true;
                 return expansion;
+            };
+            if bucket.len() == bucket.capacity() {
+                let grown = bucket.capacity().saturating_mul(2).max(16);
+                let more = grown.saturating_sub(bucket.capacity());
+                if held.saturating_add(more) > allowance || bucket.try_reserve_exact(more).is_err()
+                {
+                    expansion.full = true;
+                    return expansion;
+                }
+                held = held.saturating_add(more);
             }
-            if let Some(bucket) = expansion.buckets.get_mut(shard)
-                && bucket.try_reserve(1).is_ok()
-            {
-                bucket.push((print, representative));
-            } else {
-                expansion.full = true;
-                return expansion;
-            }
+            bucket.push((print, representative));
         }
     }
     expansion
@@ -501,59 +524,76 @@ fn settle<K: Copy>(shard: &mut PrintSet, buckets: &[&Vec<(u128, K)>]) -> Result<
     Ok(fresh)
 }
 
-/// Breadth-first search, level by level on `workers` scoped threads, over fingerprints of the
-/// representatives, from the model's initial state: every reachable class visited once. It stops
-/// at the first level with a fault, giving the step that met it ([`shortest`] gives the whole
-/// history where its budget affords it). Holds at most `budget`'s bytes.
-pub fn explore<M: Model>(
-    model: &M,
-    workers: NonZeroUsize,
-    budget: Budget,
-) -> Result<Found<M>, ExploreError> {
-    let memory = budget.memory;
-    let workers = workers.get();
-    let mut report = Report::new(model.paths().len());
-    let shard_memory = memory;
-    let mut shards = Vec::new();
-    for _ in 0..workers {
-        match PrintSet::new(shard_memory, 1024) {
-            Ok(set) => shards.push(set),
-            Err(spent) => return Ok(Outcome::Unknown { report, spent }),
-        }
+/// The classes the tables hold.
+fn classes(shards: &[PrintSet]) -> u64 {
+    shards.iter().map(PrintSet::len).sum::<u64>()
+}
+
+/// The bytes the tables hold.
+fn tables(shards: &[PrintSet]) -> usize {
+    shards
+        .iter()
+        .map(PrintSet::bytes)
+        .fold(0usize, usize::saturating_add)
+}
+
+/// What became of one part of a level.
+enum Part<M: Model> {
+    /// Its fresh classes joined the next level.
+    Joined,
+    /// Its successors did not fit beside the tables: it is expanded again in halves.
+    Halve,
+    /// The search ends here.
+    End(Found<M>),
+}
+
+/// The search's shared state across one level: its tables, the level being expanded (by its
+/// capacity) and the next one.
+struct Level<'a, M: Model> {
+    model: &'a M,
+    shards: &'a mut [PrintSet],
+    frontier_capacity: usize,
+    next: &'a mut Vec<M::Key>,
+    report: &'a mut Report,
+    memory: usize,
+    workers: usize,
+}
+
+impl<M: Model> Level<'_, M> {
+    fn unknown(&mut self, spent: Spent) -> Part<M> {
+        self.report.classes = classes(self.shards);
+        Part::End(Outcome::Unknown {
+            report: std::mem::replace(self.report, Report::new(0)),
+            spent,
+        })
     }
-    let initial = model.canonical(&model.initial());
-    let print = fingerprint(&initial);
-    if let Some(shard) = shards.get_mut(shard_of(print, workers)) {
-        let _ = shard.insert(print);
+    fn over_budget(&mut self) -> Part<M> {
+        let configurations = classes(self.shards);
+        self.unknown(Spent::Budget { configurations })
     }
-    let mut frontier = vec![initial];
-    report.classes = 1;
-    let key_bytes = size_of::<M::Key>();
-    let bucket_bytes = size_of::<(u128, M::Key)>();
-    let classes = |shards: &[PrintSet]| shards.iter().map(PrintSet::len).sum::<u64>();
-    let tables = |shards: &[PrintSet]| {
-        shards
-            .iter()
-            .map(PrintSet::bytes)
-            .fold(0usize, usize::saturating_add)
-    };
-    while !frontier.is_empty() {
-        report.levels = report.levels.saturating_add(1);
-        let held = tables(&shards).saturating_add(vec_bytes::<M::Key>(frontier.capacity()));
-        report.peak = report.peak.max(held);
-        let free = memory.saturating_sub(held);
-        let allowance = free
+
+    /// Expands `slice` on the workers and settles what it reached into the tables; `halvable`
+    /// when the part may be halved still.
+    fn part(&mut self, slice: &[M::Key], halvable: bool) -> Result<Part<M>, ExploreError> {
+        let workers = self.workers;
+        let model = self.model;
+        let held = tables(self.shards)
+            .saturating_add(vec_bytes::<M::Key>(self.frontier_capacity))
+            .saturating_add(vec_bytes::<M::Key>(self.next.capacity()));
+        self.report.peak = self.report.peak.max(held);
+        let bucket_bytes = size_of::<(u128, M::Key)>();
+        let allowance = self
+            .memory
+            .saturating_sub(held)
             .checked_div(bucket_bytes.max(1))
             .and_then(|successors| successors.checked_div(workers))
             .unwrap_or(0);
-        let part = frontier.len().div_ceil(workers).max(1);
+        let share = slice.len().div_ceil(workers).max(1);
+        let shards: &[PrintSet] = self.shards;
         let joined: Vec<std::thread::Result<Expansion<M>>> = std::thread::scope(|scope| {
-            let running: Vec<_> = frontier
-                .chunks(part)
-                .map(|slice| {
-                    let shards = &shards;
-                    scope.spawn(move || expand(model, slice, shards, allowance))
-                })
+            let running: Vec<_> = slice
+                .chunks(share)
+                .map(|slice| scope.spawn(move || expand(model, slice, shards, allowance)))
                 .collect();
             running.into_iter().map(|worker| worker.join()).collect()
         });
@@ -561,63 +601,42 @@ pub fn explore<M: Model>(
         for expansion in joined {
             expansions.push(expansion.map_err(|_| ExploreError::Worker)?);
         }
-        for expansion in &expansions {
-            for (count, more) in report.paths.iter_mut().zip(&expansion.paths) {
-                *count = count.saturating_add(*more);
-            }
-        }
         let bucketed = expansions
             .iter()
             .flat_map(|expansion| expansion.buckets.iter().map(Vec::capacity))
             .fold(0usize, usize::saturating_add);
         let buckets_held = bytes_of(bucketed, bucket_bytes).unwrap_or(usize::MAX);
-        report.peak = report.peak.max(held.saturating_add(buckets_held));
+        self.report.peak = self.report.peak.max(held.saturating_add(buckets_held));
         if let Some((from, action, fault)) = expansions.iter().find_map(|expansion| expansion.fault)
         {
-            report.classes = classes(&shards);
-            return Ok(Outcome::Fault {
-                report,
+            for expansion in &expansions {
+                tally_all(&mut self.report.paths, &expansion.paths);
+            }
+            self.report.classes = classes(self.shards);
+            return Ok(Part::End(Outcome::Fault {
+                report: std::mem::replace(self.report, Report::new(0)),
                 history: Vec::new(),
                 from,
                 action,
                 fault,
+            }));
+        }
+        let settling = self.settling(&expansions, buckets_held);
+        if expansions.iter().any(|expansion| expansion.full) || settling > self.memory {
+            return Ok(if halvable {
+                Part::Halve
+            } else {
+                self.over_budget()
             });
         }
-        if expansions.iter().any(|expansion| expansion.full) {
-            report.classes = classes(&shards);
-            let configurations = report.classes;
-            return Ok(Outcome::Unknown {
-                report,
-                spent: Spent::Budget { configurations },
-            });
+        for expansion in &expansions {
+            tally_all(&mut self.report.paths, &expansion.paths);
         }
-        // The expanded level is done with; it is freed before the next is gathered, and the
-        // tables' growth and the next frontier must fit beside the buckets.
-        frontier = Vec::new();
-        let mut settling = buckets_held;
-        for (index, shard) in shards.iter().enumerate() {
-            let incoming = expansions
-                .iter()
-                .filter_map(|expansion| expansion.buckets.get(index))
-                .map(Vec::len)
-                .fold(0usize, usize::saturating_add);
-            let peak = shard.peak_for(incoming).unwrap_or(usize::MAX);
-            settling = settling
-                .saturating_add(peak)
-                .saturating_add(bytes_of(incoming, key_bytes).unwrap_or(usize::MAX));
-        }
-        if settling > memory {
-            report.classes = classes(&shards);
-            let configurations = report.classes;
-            return Ok(Outcome::Unknown {
-                report,
-                spent: Spent::Budget { configurations },
-            });
-        }
-        report.peak = report.peak.max(settling);
+        self.report.peak = self.report.peak.max(settling);
         let settled: Vec<std::thread::Result<Result<Vec<M::Key>, Spent>>> =
             std::thread::scope(|scope| {
-                let running: Vec<_> = shards
+                let running: Vec<_> = self
+                    .shards
                     .iter_mut()
                     .enumerate()
                     .map(|(index, shard)| {
@@ -635,27 +654,127 @@ pub fn explore<M: Model>(
         for part in settled {
             match part.map_err(|_| ExploreError::Worker)? {
                 Ok(keys) => fresh.push(keys),
-                Err(spent) => {
-                    report.classes = classes(&shards);
-                    return Ok(Outcome::Unknown { report, spent });
-                }
+                Err(spent) => return Ok(self.unknown(spent)),
             }
         }
+        Ok(self.join(fresh))
+    }
+
+    /// The bytes the tables, the levels and the buckets hold while the buckets settle.
+    fn settling(&self, expansions: &[Expansion<M>], buckets_held: usize) -> usize {
+        let key_bytes = size_of::<M::Key>();
+        let mut settling = buckets_held;
+        for (index, shard) in self.shards.iter().enumerate() {
+            let incoming = expansions
+                .iter()
+                .filter_map(|expansion| expansion.buckets.get(index))
+                .map(Vec::len)
+                .fold(0usize, usize::saturating_add);
+            let peak = shard.peak_for(incoming).unwrap_or(usize::MAX);
+            settling = settling
+                .saturating_add(peak)
+                .saturating_add(bytes_of(incoming, key_bytes).unwrap_or(usize::MAX));
+        }
+        settling
+            .saturating_add(vec_bytes::<M::Key>(self.frontier_capacity))
+            .saturating_add(vec_bytes::<M::Key>(self.next.capacity()))
+    }
+
+    /// The fresh classes join the next level, which grows to hold them exactly, beside them, the
+    /// tables and this level.
+    fn join(&mut self, fresh: Vec<Vec<M::Key>>) -> Part<M> {
         let width = fresh
             .iter()
             .map(Vec::len)
             .fold(0usize, usize::saturating_add);
-        if frontier.try_reserve_exact(width).is_err() {
-            report.classes = classes(&shards);
-            return Ok(Outcome::Unknown {
-                report,
-                spent: Spent::Memory,
-            });
+        let grown = self
+            .next
+            .len()
+            .saturating_add(width)
+            .max(self.next.capacity());
+        let fresh_bytes = fresh
+            .iter()
+            .map(|part| vec_bytes::<M::Key>(part.capacity()))
+            .fold(0usize, usize::saturating_add);
+        let extending = tables(self.shards)
+            .saturating_add(vec_bytes::<M::Key>(self.frontier_capacity))
+            .saturating_add(vec_bytes::<M::Key>(grown))
+            .saturating_add(fresh_bytes);
+        if extending > self.memory {
+            return self.over_budget();
         }
+        if self
+            .next
+            .try_reserve_exact(grown.saturating_sub(self.next.len()))
+            .is_err()
+        {
+            return self.unknown(Spent::Memory);
+        }
+        self.report.peak = self.report.peak.max(extending);
         for part in fresh {
-            frontier.extend(part);
+            self.next.extend(part);
         }
-        report.classes = classes(&shards);
+        self.report.classes = classes(self.shards);
+        Part::Joined
+    }
+}
+
+/// Breadth-first search, level by level on `workers` scoped threads, over fingerprints of the
+/// representatives, from the model's initial state: every reachable class visited once. It stops
+/// at the first level with a fault, giving the step that met it ([`shortest`] gives the whole
+/// history where its budget affords it). Holds at most `budget`'s bytes.
+///
+/// A level is expanded a part at a time: the successors one part buckets must fit beside the
+/// tables, this level and the next, and a part whose successors do not is halved and expanded
+/// again (expanding changes nothing, so a part given up costs only its time). The classes are
+/// those of a level expanded whole: each part settles into the same tables before the next, and
+/// every fresh class joins the next level.
+pub fn explore<M: Model>(
+    model: &M,
+    workers: NonZeroUsize,
+    budget: Budget,
+) -> Result<Found<M>, ExploreError> {
+    let memory = budget.memory;
+    let workers = workers.get();
+    let mut report = Report::new(model.paths().len());
+    let mut shards = Vec::new();
+    for _ in 0..workers {
+        match PrintSet::new(memory, 1024) {
+            Ok(set) => shards.push(set),
+            Err(spent) => return Ok(Outcome::Unknown { report, spent }),
+        }
+    }
+    let initial = model.canonical(&model.initial());
+    let print = fingerprint(&initial);
+    if let Some(shard) = shards.get_mut(shard_of(print, workers)) {
+        let _ = shard.insert(print);
+    }
+    let mut frontier = vec![initial];
+    report.classes = 1;
+    while !frontier.is_empty() {
+        report.levels = report.levels.saturating_add(1);
+        let mut next: Vec<M::Key> = Vec::new();
+        let mut level = Level {
+            model,
+            shards: &mut shards,
+            frontier_capacity: frontier.capacity(),
+            next: &mut next,
+            report: &mut report,
+            memory,
+            workers,
+        };
+        let mut done = 0usize;
+        let mut part_len = frontier.len();
+        while done < frontier.len() {
+            let end = done.saturating_add(part_len).min(frontier.len());
+            let slice = frontier.get(done..end).unwrap_or(&[]);
+            match level.part(slice, part_len > workers)? {
+                Part::Joined => done = end,
+                Part::Halve => part_len = part_len.div_ceil(2),
+                Part::End(outcome) => return Ok(outcome),
+            }
+        }
+        frontier = next;
     }
     Ok(Outcome::Exhausted(report))
 }

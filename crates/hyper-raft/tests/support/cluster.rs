@@ -442,10 +442,10 @@ impl<R: Replica> Cluster<R> {
             }
             self.net.push(message.clone());
         }
-        let conf = self.disk(member).conf.clone();
-        if self.stop_who_left && view.role == 2 && !votes(&conf, member) {
-            // It leads a group it is no voter of, and unwinds when it next
-            // commits. Its owner stops it, and it opens as what it is.
+        if self.stop_who_left && view.role == 2 && !view.promotable && view.applied >= view.commit {
+            // It leads a group that no longer needs it, and applied all it committed: the
+            // configuration it counts by names it no voter (hyper-raft's newest in its log, once
+            // committed; raft-rs's applied). Its owner stops it, and it opens as what it is.
             self.deposed += 1;
             self.restart(member);
         }
@@ -670,7 +670,7 @@ impl<R: Replica> Cluster<R> {
             let Some(committed) = &led.committed else {
                 continue;
             };
-            let conf = self.disk(id).conf.clone();
+            let conf = led.counted_by.clone();
             let before = self.counted_by.insert(id, conf.clone());
             let last = self.checked.insert(id, (led.term, committed.index));
             // What it knew committed when it was elected it did not decide,
@@ -1013,9 +1013,10 @@ impl<R: Replica> Cluster<R> {
             if progress.stuck(round) {
                 break;
             }
-            // A member that joined after the leader's snapshot was taken is
-            // not named by it and discards it: it is seeded by a snapshot
-            // taken since, which is the owner's to take.
+            // A member of raft-rs that joined after the leader's snapshot was
+            // taken is not named by it and discards it (this core takes it,
+            // `docs/raft.md` §3.4): it is seeded by a snapshot taken since,
+            // which is the owner's to take.
             if round % 16 == 15 {
                 for leader in self.leaders_now() {
                     self.act_observed(observer, &Op::Compact(leader));
@@ -1121,9 +1122,12 @@ impl<R: Replica> Cluster<R> {
             .into_iter()
             .filter(|candidate| {
                 let disk = self.disk(*candidate);
-                let conf = &disk.conf;
+                let node = self.peek(*candidate);
+                let counted = node.and_then(Replica::counts_by);
+                let conf = counted.as_ref().unwrap_or(&disk.conf);
+                let stands = node.map_or(votes(conf, *candidate), |node| node.view().promotable);
                 let marked = disk.mark().is_some();
-                if !votes(conf, *candidate) || (marked && self.settings.fast) {
+                if !stands || (marked && self.settings.fast) {
                     return false;
                 }
                 let last = disk.last_index();

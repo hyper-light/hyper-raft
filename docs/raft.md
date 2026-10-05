@@ -472,19 +472,22 @@ stops the member (`a_configuration_past_the_members_a_member_was_opened_for_stop
 `tests/differential.rs` runs this core and raft-rs on one schedule and compares them field by field
 (§1). Where the two decide differently it is by decision, and each decision is held by a test of its
 own; where a schedule can reach one, the differential runs raft-rs's rule, which this core keeps for
-that purpose, or loses for both cores the message that would reach it. focal 27 §4.5 began this
+that purpose, loses for both cores the message that would reach it, or, for a change of the
+configuration, ends the run where the change's entry enters a log (§3.4). focal 27 §4.5 began this
 table for focal-raft; it lives here since the core moved (R-1), with every decision since.
 
 | raft-rs 0.7 | This core | Test |
 |---|---|---|
 | Asserts; the shell contains the unwind and stops the replica | An error of one of three kinds: a refusal that changed nothing, a peer's message that contradicts the member, or a state that no longer adds up, which alone stops the replica (`Error`) | `src/tests.rs`: `what_a_peer_may_not_say_is_refused_and_changes_nothing`, `storage_that_fails_stops_no_one_and_is_said` |
 | Its generated accessors unwind on an enumeration value they do not know, which a peer chooses | Its own types and wire format (R-2, §3.1): an unknown kind, flag or version is refused | `src/wire.rs`: `unknown_kinds_flags_and_versions_are_refused`, `arbitrary_bodies_never_panic` |
+| A configuration takes effect when its owner applies it, for elections and for commitment; a member refuses to campaign while a change it committed is not applied | From the moment a log holds its entry, falling back when the entry is replaced; a voter of the configuration before an uncommitted change that leaves it out may campaign, its own vote counting nowhere (§3.4). The differential ends a run where a change enters a log | `a_sole_voter_does_not_commit_past_a_voter_it_adds_alone`, `an_append_that_replaces_a_change_takes_the_configuration_back`, `one_told_to_campaign_counts_by_the_change_its_log_holds_applied_or_not`, `a_voter_the_uncommitted_change_leaves_out_campaigns_and_is_elected_by_the_voters_it_names`; `tests/group.rs`: `a_member_that_holds_a_change_it_has_not_committed_leads_no_term_another_leads`; `tests/differential.rs`: `the_cores_agree_until_a_change_enters_a_log` |
+| A joint configuration that leaves by itself is left once the leader applies the entry that entered it | Once that entry is committed | `a_joint_configuration_that_leaves_by_itself_is_left_once_its_entry_commits` |
+| A snapshot that does not name the member is refused | Taken: a member a change adds may be seeded by a snapshot older than the change | `a_member_a_change_adds_takes_a_snapshot_older_than_the_change` |
 | A leader that applies a change which leaves it no voter leads on, and unwinds when it next commits | It tells the voter that holds the whole log to campaign, and follows | `tests/group.rs`: `a_leader_a_change_leaves_no_voter_hands_the_group_over_and_follows` |
-| One told to campaign while a change it committed is not applied forgets it was told | It campaigns once the change is applied, unless it heard of a leader since | `one_told_to_campaign_before_it_applied_a_change_campaigns_once_it_has` |
 | One told to campaign while it asks whether it could be elected ignores it, and the leader waits an election timeout | It campaigns; the differential loses that message for both cores | `one_told_to_campaign_while_it_asks_whether_it_could_does` |
 | A voter refuses a candidate of lower priority unless the candidate has more entries | Unless the candidate's log is more current, by its last term and then its length (`Precedence::Log`); raft-rs's rule is kept as `Precedence::Length` | `tests/group.rs`: `priority_yields_to_a_log_that_is_more_current` |
 | Priority judges the vote a transfer asks for; a member without a term, or one that left, may refuse for priority | Priority never judges a transfer, and is in force only for a member with a term that may campaign | `tests/group.rs`: `priority_orders_an_election_and_never_judges_a_transfer`, `a_member_that_has_no_term_refuses_no_one_for_priority`, `a_member_that_left_refuses_no_one_for_priority` |
-| One that is no voter may campaign, and unwinds when it wins | Refused, `NotPromotable` | `only_a_voter_campaigns` |
+| One that is no voter may campaign, and unwinds when it wins | Refused, `NotPromotable`, from `RawNode::campaign` and from a leader's `MsgTimeoutNow`; its timer arms no campaign (§3.4 has who may) | `only_a_voter_campaigns` |
 | Election timeouts from the thread's generator | From a seed the owner gives (`Config::seed`): a run is its seed | `election_timeouts_are_drawn_from_the_seed` |
 | Queues without a bound of their own | `Limits`, derived from what the owner states (`Limits::derive`, §3.2); a member takes of a message what it may hold, and answers with the last entry taken | `what_waits_to_be_taken_has_a_bound`, `what_is_not_durable_has_a_bound`, `reads_that_wait_have_a_bound`, `every_bound_is_derived_from_what_the_owner_states` |
 | A leader proposes any change, and a configuration names any number of members | A leader proposes no change past the members a configuration of its group may name (`Limits::members`): the entry keeps its place and states nothing; a member given a configuration past them stops; the differential's groups stay within them | `a_leader_proposes_no_change_past_the_members_a_configuration_names`; `src/progress.rs`: `a_configuration_past_the_members_a_member_was_opened_for_stops_it` |
@@ -492,14 +495,92 @@ table for focal-raft; it lives here since the core moved (R-1), with every decis
 | A window of messages alone | Of bytes, each append charged its record, what the owner says the path carries (`RawNode::set_inflight_bytes`, focal F41; R16's rule, §3.2), and of messages unless it counts none; a window that filled waits for room for a whole append or half of it; the differential runs with no byte bound | `a_member_is_sent_no_more_bytes_ahead_of_its_answers_than_its_path_carries`; `src/progress.rs`: `a_window_that_filled_waits_for_a_whole_append_or_half_of_it`; `tests/timed.rs` |
 | A follower refuses an append that begins past the end of its log and keeps nothing; at the refusal its leader probes from the member's match and sends what followed again | It keeps the entries, as many as its log may hold not yet durable, and takes them in when an append of the same term fills the hole, acknowledging them with it; its refusal says it kept the append (`Message::kept`), and its leader takes what the member kept out of its window and sends every hole before it again, once, and probes only a resend a beat leaves unanswered, or a hole before what the member kept that a beat leaves unanswered (a member that restarted dropped what it kept, and the hole before it was in no message the window would send again: hyper-check's group campaign, seed 1,318, 2026-10-04, where a leader sent such a member new appends for as long as the group ran) (`Ahead::Kept`, R17, §3.2); raft-rs's rule is kept as `Ahead::Refused`, which the differential runs | `a_lost_append_costs_its_own_resend_and_what_was_kept_is_not_sent_again`, `a_refusal_sends_the_hole_alone_and_what_was_kept_leaves_the_window`, `a_hole_sent_again_and_unanswered_for_a_beat_is_probed`, `a_member_that_lost_what_it_kept_ahead_is_probed`, `a_refusal_older_than_the_members_progress_sends_what_it_lacks_and_no_more`, `every_hole_before_what_was_kept_goes_again_at_once`, `a_member_that_keeps_nothing_ahead_is_probed_and_caught_up`, `what_was_kept_is_acknowledged_only_with_the_write_that_holds_it`; `src/wire.rs`: the kept refusal's golden vector |
 | A read asked of a leader that has not committed an entry of its term is dropped, `Ok` to its asker, whether asked there or forwarded; a member with no leader drops a read it is asked, `Ok` | The leader holds it until that commit and then serves it, as the thesis's §6.4 step 1 has a leader that has not committed in its term wait "until it has done so" and etcd's `pendingReadIndexMessages` hold it. The commit waited for is that of the blank entry the leader appended on taking its term (§6.4: "a blank no-op entry into the log at the start of its term"), not any entry of its term: in a fast group what a new leader recovers of the fast track bears its term and sits below that entry, and may lie below an index a fast quorum committed in an earlier term, so a read served once one of those committed was answered below a commit made before it was asked (hyper-check's read safety oracle, seed 15,761 of the fast schedules, 2026-10-04); held reads count against `Limits::pending_reads` with those that wait for their quorum or to be taken, and are cleared with the term. A read asked of a member with no leader is refused (`ReadDropped`), so its owner answers it at once; a read, or a read's answer, without its one context is a peer's contradiction (focal's finding, 2026-10-04: its owners answered such reads only at a deadline) | `a_new_leaders_read_waits_for_its_terms_first_commit`, `a_read_a_follower_forwards_waits_for_the_leaders_first_commit`, `reads_that_wait_for_the_first_commit_count_against_the_bound`, `a_leader_deposed_before_its_first_commit_lets_its_waiting_reads_go`, `a_fast_leaders_reads_wait_for_the_entry_it_began_its_term_with` (`tests/check.rs`), `a_read_with_no_leader_to_ask_is_refused`, `a_read_without_its_context_is_refused` |
+| A heartbeat round carries the last read's context, and an answer confirms the read it names and every read before it | The round also carries its number after the context (`ReadOnly::round_context`), and an answer confirms the read only if the round was sent while the read waited: an asker may ask a read again under a context an earlier round carried, and a late or repeated answer to that round confirmed reads asked after it was sent (hyper-check's swarm, group seed 4,521, 2026-10-05: a deposed leader answered a read 172 entries below the commit when it was asked); the differential loses such an answer for both cores | `a_late_answer_to_a_round_confirms_no_read_asked_after_it_under_the_same_context` |
 | A heartbeat's answer says nothing of the log, and a full window frees its first message at every answer | The answer says how far the log goes and is taken as an append's answer (`HeartbeatAnswers::Position`, focal F42); raft-rs's rule is kept as `HeartbeatAnswers::Bare` | `a_heartbeats_answer_gives_back_what_the_member_holds_and_nothing_more` |
-| A follower's lease reads its one election counter, which its own campaign restarts: one whose campaign waits for a committed change to apply keeps its lease another election timeout, and refuses the voter that campaigns | The lease reads the ticks since the member heard its leader (`Raft::silence`), apart from its own timer (R4, §3.2); the differential's owner applies every change at once and never reaches it | `a_member_whose_campaign_waits_for_a_change_holds_no_lease` |
+| A follower's lease reads its one election counter, which its own campaign restarts | The lease reads the ticks since the member heard its leader (`Raft::silence`), apart from its own timer (R4, §3.2); a member whose owner holds a committed change no longer waits for it to campaign (§3.4) | `a_member_whose_owner_holds_a_change_campaigns_by_it` |
 | A term or an index may be counted to `u64::MAX` | The last of each is `u64::MAX − 1`; a campaign, an append or a proposal past it is refused before anything changes, by suspicion no campaign is armed that would be, and the fast track holds nothing at the last index (R6, §3.2) | `a_term_with_no_successor_cannot_campaign_and_keeps_one_leader`, `a_member_with_no_index_for_a_leaders_first_entry_does_not_campaign`, `by_suspicion_a_member_with_no_successor_is_due_for_no_campaign`, `the_fast_track_proposes_and_holds_nothing_at_the_last_index` |
 | A member of a later term answers an append or a heartbeat of an earlier one only under check-quorum or pre-vote; without either it leaves the earlier term's leader to learn the later term from its vote requests | It answers whatever the settings (thesis Figure 3.1: "reply false if term < currentTerm"): a member's vote requests never reach a leader its configuration names no voter, and without the answer a leader whose group's later configuration made it a learner led its old term for ever (hyper-check's swarm, fast seed 3,112, 2026-10-04, `docs/sim.md` §15.9); the differential loses such a message for both cores | `tests/group.rs`: `a_member_of_a_later_term_answers_a_leader_of_an_earlier_one`; `tests/strategies.rs`: `the_swarm_seeds_whose_groups_never_converged_settle` |
 
 Kept although it could be otherwise, as focal kept it: a member that a change removes and adds
 again is known anew, and a member added by a change is first probed one entry before the log's
 end. Both are raft-rs's, harmless, and keep the comparison free of an exception for them.
+
+### 3.4 The configuration a member counts by
+
+**The defect.** hyper-check's random walk elected two leaders of one term (fast seed 135,923 of
+`tests/check.rs`'s schedules, 2026-10-05), and the core as it was does the same in a scripted run,
+where it goes on to commit a second entry at an index
+(`tests/group.rs`: `a_member_that_holds_a_change_it_has_not_committed_leads_no_term_another_leads`).
+Five voters go to `{2, 3, 5}` through a joint configuration and then to `{2, 3}`. Member 1 holds both
+changes' entries with a commit of 1. A configuration took effect when its owner applied it, raft-rs's
+and etcd's rule, so member 1 counted by the five voters and was elected by members 4 and 5, while
+member 3 led the same term by `{2, 3}`. No restart and no fault is needed, and no owner can be relied
+on to stop a process its core does not know was removed. `docs/research/reconfiguration.md` has the
+trace and the sources.
+
+**The rule.** Elections and commitment count by the newest configuration a member's log states,
+committed or not, and both halves of a joint one (Ongaro's thesis §4.1: "each server always uses the
+latest configuration found in its log"). An entry that replaces the newest change takes the
+configuration back to the one before it (§4.1: "a server must be prepared to fall back"). A member
+campaigns if that configuration names it a voter, or if its entry is past the member's commit and the
+configuration before it names the member a voter: the group may still need it until the entry is
+committed (§4.2.2: a server "not part of its own latest configuration should still start new
+elections, as it might still be needed until the Cnew entry is committed"); its own vote counts only
+where it is a voter. A leader the configuration leaves out leads until the configuration is committed
+and applied, counting itself nowhere, and then tells the voter that holds its whole log to campaign
+(§4.2.2 has it step down once the entry is committed; the core does at the owner's next apply, where
+it acts outside a step). A joint configuration that leaves by itself is left once the entry that
+entered it is committed. A leader proposes a change only once it applied every change its log holds
+(`pending_conf_index`) and committed an entry of its term (the raft-dev fix of 2015, Figure 3.7's
+rule), so of a log's changes only the newest can be uncommitted: the core keeps that configuration and
+the one before it (`Raft::refresh_configuration`), and an append that would replace an older one is a
+log no protocol made, an `Error::Invariant`.
+
+**What follows from it, each found by the schedules once the rule was in and each with its test:**
+- A snapshot that does not name the member is taken (§4.1: servers process requests "without
+  consulting their current configurations"). A member a change adds counts from the change's entry,
+  and the snapshot that seeds it may be older than the entry; refused, a group whose log was compacted
+  past what the newcomer holds waited for ever (seed 0 of `tests/check.rs`'s group schedules).
+  `a_member_a_change_adds_takes_a_snapshot_older_than_the_change`.
+- A leader answers a read alone only when it is the one voter. A leader the newest configuration
+  leaves out still leads, and that configuration's one voter may have been elected and committed since
+  (seed 47 of the hostile schedules answered a read below a commit made there).
+  `a_leader_the_newest_configuration_leaves_out_answers_no_read_alone`.
+- A voter of the configuration before an uncommitted change that leaves it out campaigns (the rule's
+  last clause). Without it, seed 11 of the group schedules stopped: the leader of a joint configuration
+  wrote the entry that leaves it and was lost, the members holding that entry were voters of no
+  configuration they counted by, and the one voter they named lacked the entry, needed their votes,
+  and was refused them for its shorter log (the thesis's Figure 4.6).
+  `a_voter_the_uncommitted_change_leaves_out_campaigns_and_is_elected_by_the_voters_it_names`.
+
+**The model.** `docs/models/Reconfig.tla` and its Rust mirror (hyper-check's `tests/reconfig.rs`)
+search four servers through two changes, by one voter (D a learner promoted, then A demoted) and
+through a joint configuration (A replaced by D), and a sole voter adding a second by one entry and
+through a joint configuration. Appends carry the leader's commit or not, so a member can hold a change
+past its commit. Today's rule, both counted by the applied configuration, is refused for `OneLeader`
+at every scope; elections by the newest and commitment by the applied (the thesis's rule for
+elections alone) is refused for `LeaderHolds`, and its shortest history, eleven steps, is played on
+the core (`a_commit_counted_by_the_configuration_applied_is_not_made`, failing on the core before);
+elections and commitment by the newest, with the campaign rule above, pass. The states each
+searched are in `docs/models/README.md`.
+
+**What the owner sees, and what counts.** The owner is told the configuration it applies, change by
+change, as before: what `RawNode::apply_conf_change` returns, and `Raft::applied_configuration`. Every
+other surface is the newest in the log:
+
+| Surface | Counts by |
+|---|---|
+| `RawNode::apply_conf_change`'s `ConfState`, `Raft::applied_configuration` | The configuration applied, change by change |
+| `Raft::configuration`, `Raft::tracker`: the votes an election counts, the quorum a commit, a read's round and a fast quorum count, `Raft::promotable` | The newest the log states |
+| Who a leader sends appends and heartbeats to, probes and catches up | The newest the log states |
+| Leaving a joint configuration that leaves by itself | The joint entry committed |
+| A removed leader's hand-over | The configuration that leaves it out committed and applied |
+| Whether a leader may propose a change | Every change in its log applied |
+
+The fast track's second rule (below) reasons from the configuration a member counts by: a member that
+took an entry of the leader's term holds the leader's log through it, so it counts by the
+configuration the leader was elected under or by one the leader wrote since, which the leader notes
+as it writes it (`Raft::note_term_change`).
 
 ### The fast track's election defect, and its fix
 
@@ -562,18 +643,18 @@ applied.** With the rule above in, 40,000 schedules from seed 43,000 and from se
 failed once (seeds 54104 and 203544: "member 2 committed another entry at 11", "member 1 committed
 another entry at 12"). Traced: the leader had applied a change that demoted a voter to a learner and
 committed an index by three of its four voters, a fast quorum of four. One of those three had not
-heard the change committed, so it counted by the five voters before it (a member campaigns by the
-configuration it has applied, as raft-rs does); it was elected by itself and two members of the five
+heard the change committed, so it counted by the five voters before it (a member then campaigned by
+the configuration it had applied, as raft-rs does); it was elected by itself and two members of the five
 that held another entry, which was the most held among them. Raft's classic argument holds across a
 change because majorities of two configurations one change apart meet; a fast quorum of the new
 configuration need not be a fast quorum of the old one, and the guard the fast track had (no change
 committed and not applied, no joint configuration, both at the leader) says nothing of the members.
 
-The fix: a member that took an entry of the leader's term took the leader's commit with it (an
-append commits to the lesser of the leader's commit and its own last entry), and that commit covers
-the configuration the leader was elected under; a member campaigns only once it has applied every
-change it has committed. So it counts by the configuration the leader was elected under or by one
-the leader applied since. A member that took no entry of the term has an older last term than every
+The fix: a member that took an entry of the leader's term holds the leader's log through it, and
+counts by the newest configuration its log states (§3.4). So it counts by the configuration the
+leader was elected under or by one the leader wrote since. (Before §3.4 the same held by another
+road: the member took the leader's commit with the entry, which covers the configuration the leader
+was elected under, and campaigned only once it had applied every change it had committed.) A member that took no entry of the term has an older last term than every
 member of the fast quorum, which refuse it, and no majority of a configuration one change away
 avoids three quarters of this one. The leader notes the voters it was elected under and the one
 other set of voters a change since named (a joint configuration's two halves are the two sets), and
@@ -607,10 +688,13 @@ the model came here with both (`docs/models/FastTrack.tla`), with the configurat
 by (the one its committed log states), a change by one entry or through a joint configuration, and
 the second rule. TLC finds each defect with its rule taken out and passes the same bounds with it in:
 `FastTrackAnyRound.cfg` (four voters, three terms) is refused for `LeaderHolds` and
-`FastTrackFour.cfg` passes, 3,207,204 states; `FastTrackAnyConfig.cfg` (three voters, of which a
-change removes one; seed 54104's run with three voters for five) is refused for `LeaderHolds` and
-`FastTrackChange.cfg` passes, 3,304,320 states. `docs/models/README.md` has every configuration,
-its states and the run that counted them.
+`FastTrackFour.cfg` passes, 3,207,204 states. Since a member counts by the newest configuration
+in its log (§3.4) the second rule's defect needs five voters over many terms (fast seed 1,483 of
+`tests/check.rs`, which catches the rule taken out), past what the model is searched at: with the
+rule out, three voters losing one passes (TLC and the Rust mirror alike), as do four voters at three
+terms and five at two (the mirror with the scenario's reductions, 2026-10-05); `FastTrackChange.cfg` passes with the
+rule in. `docs/models/README.md` has every configuration, its states and the run that counted
+them.
 
 **Evidence.** The directed test `an_election_never_commits_a_second_entry_at_a_committed_index` runs
 seed 9843's schedule with the rules it was found under (a round of reads for each read, no byte

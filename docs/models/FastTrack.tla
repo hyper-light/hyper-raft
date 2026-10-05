@@ -32,16 +32,19 @@
 (* the rule without it (FastTrackAnyRound.cfg, refused).                   *)
 (*                                                                         *)
 (* The second rule is for a member that counts by a configuration older    *)
-(* than the leader's: one that has not committed the change.  A fast       *)
-(* quorum of the new voters need not be one of the old, and such a member  *)
-(* is elected by old voters most of whom held another entry.  Configs =    *)
-(* "current" is the rule without it (FastTrackAnyConfig.cfg, refused).     *)
+(* than the leader's: one whose log lacks the change.  A fast quorum of    *)
+(* the new voters need not be one of the old, and such a member is elected *)
+(* by old voters most of whom held another entry.  Configs = "current" is  *)
+(* the rule without it (refused by the core's schedules, docs/raft.md).    *)
 (*                                                                         *)
-(* A member counts by the configuration its committed log states: the     *)
-(* core applies a change once it is committed, campaigns only once it has *)
-(* applied what it committed (Raft::hup), and a leader that has a change   *)
-(* committed and not applied commits nothing by the fast quorum            *)
-(* (Raft::has_pending_conf).  A change is one entry from Initial to Target *)
+(* A member counts elections and commitment by the newest configuration   *)
+(* its log states, committed or not (docs/raft.md §3.4,                    *)
+(* Raft::refresh_configuration).  It campaigns if that configuration names *)
+(* it a voter, or if the change is past its commit and the configuration  *)
+(* before it does (Raft::promotable); its own vote counts only where it is *)
+(* a voter.  A leader with a change past its commit commits nothing by    *)
+(* the fast quorum (Raft::has_pending_conf).  A change is one entry from   *)
+(* Initial to Target *)
 (* (Joint = FALSE), or an entry that enters the joint configuration of     *)
 (* both and one that leaves it for Target (Joint = TRUE, ConfChangeV2 with *)
 (* auto-leave).  One change is made at most.                               *)
@@ -183,12 +186,19 @@ Marked(s) == mark[s] # NoMark
 \* The mark a member keeps once its log is l.
 Settled(s, l) == IF Marked(s) /\ Resolves(mark[s], l) THEN NoMark ELSE mark[s]
 
-\* The configuration a member counts by: the one its committed log states.
-States(s, x) == \E i \in 1..commit[s] : log[s][i].value = x
-ConfigurationOf(s) ==
-  IF States(s, Change) \/ States(s, Leave) THEN Configuration(Target, {})
-  ELSE IF States(s, Enter) THEN Configuration(Target, Initial)
+\* The configuration the log l states through index upto.
+StatesThrough(l, upto, x) == \E i \in 1..upto : l[i].value = x
+ConfigurationThrough(l, upto) ==
+  IF StatesThrough(l, upto, Change) \/ StatesThrough(l, upto, Leave)
+  THEN Configuration(Target, {})
+  ELSE IF StatesThrough(l, upto, Enter) THEN Configuration(Target, Initial)
   ELSE Configuration(Initial, {})
+\* The configuration a member counts by: the newest its log states.
+ConfigurationOf(s) == ConfigurationThrough(log[s], Len(log[s]))
+\* The index of the newest change in a member's log, 0 for none.
+NewestChangeAt(s) ==
+  LET at == {i \in 1..Len(log[s]) : log[s][i].value \in Changes}
+  IN IF at = {} THEN 0 ELSE CHOOSE i \in at : \A j \in at : j <= i
 \* A change written and not committed (Raft::has_pending_conf).
 Pending(s) == \E i \in (commit[s] + 1)..Len(log[s]) : log[s][i].value \in Changes
 
@@ -424,7 +434,14 @@ Recovered(V, i, v) ==
 \* not hear of with the vote and hears of when the voter says it, and a
 \* step of a member that has not yet voted is the same step taken before
 \* the campaign.
-Campaigns(c) == term[c] < MaxTerm /\ c \in Voters(ConfigurationOf(c))
+\* It votes in the configuration it counts by, or the group may still need
+\* it: the newest change is past its commit and the configuration before it
+\* names it a voter (Ongaro's thesis §4.2.2).
+Stands(c) ==
+  \/ c \in Voters(ConfigurationOf(c))
+  \/ /\ commit[c] < NewestChangeAt(c)
+     /\ c \in Voters(ConfigurationThrough(log[c], NewestChangeAt(c) - 1))
+Campaigns(c) == term[c] < MaxTerm /\ Stands(c)
 Asked(c, Q) ==
   /\ c \notin Q
   /\ \A m \in Q : /\ term[m] < term[c] + 1 \/ (term[m] = term[c] + 1 /\ vote[m] = Nobody)
@@ -436,7 +453,7 @@ Own(c) == IF Marked(c) /\ Marks # "self" THEN {} ELSE {c}
 Quorums(c, Q) ==
   LET counted == ConfigurationOf(c) IN
   {{}} \cup {V \in SUBSET ((Q \cup Own(c)) \cap Voters(counted)) :
-               Own(c) \subseteq V /\ ClassicOf(counted, V)}
+               (Own(c) \cap Voters(counted)) \subseteq V /\ ClassicOf(counted, V)}
 
 Elect(c, Q, V) ==
   LET t == term[c] + 1

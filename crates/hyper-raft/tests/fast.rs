@@ -524,7 +524,10 @@ fn an_election_never_commits_a_second_entry_at_a_committed_index() {
 /// was elected by members 3 and 4, which held another entry at 11, and took
 /// theirs. A fast quorum now counts only where it is a fast quorum of every
 /// configuration a member that holds an entry of the term may count by
-/// (`docs/raft.md`).
+/// (`docs/raft.md`). A member now counts by the newest configuration its log
+/// holds (`docs/raft.md` §3.4), so one that counts by the five holds no entry
+/// of the change; the schedule is kept as it ran, and the rule's catch is
+/// `tests/check.rs`'s.
 #[test]
 fn a_member_that_counts_by_the_configuration_before_commits_no_second_entry() {
     let mix = Mix {

@@ -489,6 +489,8 @@ pub struct Led {
     pub term: u64,
     pub committed: Option<Entry>,
     pub own: Option<Entry>,
+    /// The configuration the leader counts commitment by: the newest its log states.
+    pub counted_by: ConfState,
 }
 
 /// A member's persistence, one step at a time ([`Lagged`]).
@@ -572,9 +574,6 @@ pub struct Output {
     pub displaced: Vec<Said>,
     /// A change that could not be applied, by the index of its entry.
     pub refused: Vec<u64>,
-    /// A leader applied a change that leaves it no voter. The two cores
-    /// differ from here by decision: this one steps down.
-    pub leader_left: bool,
 }
 
 pub type Member = (u64, u64, u64, u8, bool, u64, u64, bool, usize, u64);
@@ -810,6 +809,11 @@ pub trait Replica: Sized {
     fn led(&self) -> Option<Led> {
         None
     }
+    /// The configuration the member counts elections and commitment by, where it is not the one
+    /// its disk states applied: hyper-raft's, the newest its log holds (`docs/raft.md` §3.4).
+    fn counts_by(&self) -> Option<ConfState> {
+        None
+    }
     fn view(&self) -> View;
     fn app(&self) -> App;
     /// Everything applied becomes the snapshot. False when there is
@@ -896,7 +900,6 @@ impl Old {
             let Some(change) = change_of(&entry) else {
                 continue;
             };
-            let led = self.raw.raft.state == raft::StateRole::Leader;
             let applied = match change {
                 Ok(change) => self.raw.apply_conf_change(&convert::change_to(&change)),
                 Err(change) => self.raw.apply_conf_change(&convert::single_to(&change)),
@@ -904,9 +907,6 @@ impl Old {
             match applied {
                 Ok(conf) => {
                     let conf = sorted(convert::conf_from(conf));
-                    if led && !votes(&conf, self.raw.raft.id) {
-                        output.leader_left = true;
-                    }
                     self.raw.mut_store().0.conf = conf.clone();
                     output.confs.push(conf);
                 }
@@ -1201,16 +1201,12 @@ fn apply_to(
         let Some(change) = change_of(&entry) else {
             continue;
         };
-        let led = raw.raft.state() == hyper_raft::StateRole::Leader;
         let applied = match change {
             Ok(change) => raw.apply_conf_change(&change),
             Err(change) => raw.apply_conf_change_v1(&change),
         };
         match applied {
             Ok(conf) => {
-                if led && !votes(&conf, raw.raft.id()) {
-                    output.leader_left = true;
-                }
                 raw.store_mut().0.conf = conf.clone();
                 output.confs.push(conf);
             }
@@ -1516,6 +1512,9 @@ impl Replica for New {
         output.messages = canonical(messages);
         output
     }
+    fn counts_by(&self) -> Option<ConfState> {
+        self.raw.raft.configuration().to_conf_state().ok()
+    }
     fn view(&self) -> View {
         view_of(&self.raw, self.app)
     }
@@ -1659,6 +1658,9 @@ impl Replica for Either {
     }
     fn drain(&mut self) -> Output {
         either!(self, node => node.drain())
+    }
+    fn counts_by(&self) -> Option<ConfState> {
+        either!(self, node => node.counts_by())
     }
     fn view(&self) -> View {
         either!(self, node => node.view())

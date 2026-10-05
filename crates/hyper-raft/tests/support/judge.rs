@@ -284,7 +284,8 @@ pub struct Judge {
     /// Each recorded read not yet confirmed: its context, and the member asked, its incarnation
     /// and its term then (its owner gives the read up with the term).
     pub asking: BTreeMap<u64, (Vec<u8>, u64, u64, u64)>,
-    /// Before the operation acting: its proposer's last index, and each member's configuration.
+    /// Before the operation acting: its proposer's last index, and the configuration each leader
+    /// counted commitment by.
     pub last: u64,
     pub conf: BTreeMap<u64, ConfState>,
 }
@@ -859,7 +860,7 @@ impl Judge {
                 continue;
             }
             let halves = |conf: &ConfState| vec![conf.voters.clone(), conf.voters_outgoing.clone()];
-            let after = halves(&disk.conf);
+            let after = halves(&led.counted_by);
             let earlier = before.get(&id).map(halves).unwrap_or_else(|| after.clone());
             let after: Vec<&[u64]> = after.iter().map(Vec::as_slice).collect();
             let earlier: Vec<&[u64]> = earlier.iter().map(Vec::as_slice).collect();
@@ -1005,6 +1006,14 @@ impl Judge {
             note(&mut self.violation, outcome);
         }
         self.restarted(group);
+        // A member opens on the snapshot its disk holds, one it took and was stopped before it
+        // heard it was durable among them: what it applied is what that snapshot holds.
+        if let Op::Restart(member) | Op::Corrupt(member, _) = op {
+            let index = group.disk(*member).snapshot_index();
+            if index > 0 {
+                self.installed(*member, index);
+            }
+        }
         self.serve(group);
         self.logs(group);
         if self.lagged {
@@ -1139,10 +1148,16 @@ impl<R: Core> Observer<R> for Judge {
             }
             _ => 0,
         };
+        // What each leader counts commitment by: the newest configuration its log states.
         self.conf = group
             .ids()
             .into_iter()
-            .map(|id| (id, group.disk(id).conf.clone()))
+            .filter_map(|id| {
+                group
+                    .peek(id)
+                    .and_then(Replica::led)
+                    .map(|led| (id, led.counted_by))
+            })
             .collect();
     }
 

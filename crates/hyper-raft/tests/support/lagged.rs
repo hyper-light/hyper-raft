@@ -660,6 +660,7 @@ impl Replica for Lagged {
                 .tracker()
                 .get(raft.id())
                 .and_then(|own| entry_at(own.matched)),
+            counted_by: raft.configuration().to_conf_state().ok()?,
         })
     }
     /// Everything applied becomes the snapshot, once the disk states a
@@ -679,6 +680,9 @@ impl Replica for Lagged {
         let data = self.node.app().encode();
         self.node.store_mut().0.compact(index, data);
         true
+    }
+    fn counts_by(&self) -> Option<hyper_raft::proto::ConfState> {
+        self.node.counts_by()
     }
     fn view(&self) -> View {
         self.node.view()

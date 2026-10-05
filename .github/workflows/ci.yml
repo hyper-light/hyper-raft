@@ -82,9 +82,11 @@ jobs:
     runs-on: ubuntu-24.04
     # Twice the suite's time on a runner core half as fast as one here, the model job's rule: 14.7
     # min on the owner's machine at load 69 (2026-10-04), so 4 × 14.7; the first CI run took 12.2
-    # min with its build (docs/benchmarks.md, "hyper-check's strategies and searches (S-5)").
-    timeout-minutes: 59
+    # min with its build (docs/benchmarks.md, "hyper-check's strategies and searches (S-5)"). The
+    # Reconfig model's full scopes add 1.8 min here at load 6 (2026-10-05): 4 × 16.5 is 66.
+    timeout-minutes: 66
     steps:
       - uses: actions/checkout@v5
       - run: rustup show active-toolchain || rustup toolchain install
       - run: cargo test --release -p hyper-check --locked --test exhaustive -- --ignored --test-threads 1
+      - run: cargo test --release -p hyper-check --locked --test reconfig -- --ignored --test-threads 1

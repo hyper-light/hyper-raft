@@ -233,11 +233,11 @@ impl Configuration {
 }
 
 /// The most operations a run's liveness phase may act: four times the most any of the swarm's
-/// 15,000 seeds with no defect took (11,292, a group harness's,
-/// `the_swarm_with_no_defect_keeps_every_oracle_and_the_model`, measured 2026-10-04; the default
-/// seeds took at most 1,556), the rule the trace's reservation is stated by (`docs/sim.md` §13).
+/// 15,000 seeds with no defect took (9,039, a group harness's,
+/// `the_swarm_with_no_defect_keeps_every_oracle_and_the_model`, measured 2026-10-05), the rule
+/// the trace's reservation is stated by (`docs/sim.md` §13).
 /// Past it the run is reported unconverged (§4.2).
-const LIVENESS: u64 = 4 * 11_292;
+const LIVENESS: u64 = 4 * 9_039;
 
 /// A planted defect, the harness its catch is sought in, and what a random walk from seed 0 needed
 /// to catch it there (`docs/sim.md` §14.6): its runs, or `None` where 2,096 runs never did.
@@ -257,7 +257,7 @@ const CASES: [Case; 5] = [
     Case {
         mutant: Mutant::ReadBeforeFirstCommit,
         harness: Harness::Group,
-        random: Some(1),
+        random: Some(4),
     },
     Case {
         mutant: Mutant::VoteBeforeDurable,
@@ -267,12 +267,12 @@ const CASES: [Case; 5] = [
     Case {
         mutant: Mutant::FastBesideAnyTerm,
         harness: Harness::FastFirstRule,
-        random: Some(47_819),
+        random: Some(67_843),
     },
     Case {
         mutant: Mutant::FastAnyConfiguration,
         harness: Harness::Fast,
-        random: Some(121_041),
+        random: Some(1_484),
     },
 ];
 
@@ -890,24 +890,24 @@ fn check_catches(guided: bool) {
     }
 }
 
-/// The catches the campaigns reported (2026-10-04): strategy, case, and the seed (for a coverage
-/// campaign, the run).
+/// The catches the campaigns reported (2026-10-05, on the core that counts by the newest
+/// configuration in its log): strategy, case, and the seed (for a coverage campaign, the run).
 const CATCHES: &[(Strategy, usize, u64)] = &[
     (Strategy::Swarm, 0, 171),
+    (Strategy::Swarm, 1, 17),
     (Strategy::Swarm, 2, 0),
-    (Strategy::Swarm, 3, 705),
+    (Strategy::Swarm, 3, 2_880),
+    (Strategy::Swarm, 4, 570),
+    (Strategy::Pct(1), 1, 12),
     (Strategy::Pct(1), 2, 0),
+    (Strategy::Pct(1), 3, 26_305),
+    (Strategy::Pct(2), 1, 12),
     (Strategy::Pct(2), 2, 0),
-    (Strategy::Pct(1), 3, 25_323),
-    (Strategy::Pct(2), 3, 21_180),
-    (Strategy::Swarm, 1, 15),
-    (Strategy::Pct(1), 1, 2),
-    (Strategy::Pct(2), 1, 2),
-    (Strategy::Guided, 1, 99),
+    (Strategy::Pct(2), 3, 28_114),
+    (Strategy::Guided, 1, 8),
     (Strategy::Guided, 2, 1),
-    (Strategy::Guided, 3, 4_787),
-    (Strategy::Pct(1), 4, 103_277),
-    (Strategy::Pct(2), 4, 103_277),
+    (Strategy::Guided, 3, 6_655),
+    (Strategy::Guided, 4, 1_496),
 ];
 
 // ---------------------------------------------------------------------------------------------
@@ -960,16 +960,18 @@ fn recorded(case: Case, seed: u64) -> (Judged, Tape) {
     (judged, taped.player.finish())
 }
 
-/// The random walk's catch of a read before the term's first commit (seed 0 of the group
+/// The random walk's catch of a read before the term's first commit (seed 3 of the group
 /// schedules), recorded through a tape and shrunk while it fails with a stale read: the tape
 /// replays the seed's run exactly, and the shrunk tape is 1-minimal and still fails.
 #[test]
 fn a_failing_run_shrinks_to_a_minimal_tape_that_fails_the_same_way() {
+    // The random walk's first catch (`CASES`): runs, less one.
+    const SEED: u64 = 3;
     let case = CASES[1];
-    let (judged, tape) = recorded(case, 0);
+    let (judged, tape) = recorded(case, SEED);
     let violation = judged
         .violation
-        .expect("seed 0 catches the read before the first commit");
+        .expect("seed 3 catches the read before the first commit");
     assert!(
         matches!(violation, Violation::StaleRead { .. }),
         "{violation}"
@@ -978,14 +980,14 @@ fn a_failing_run_shrinks_to_a_minimal_tape_that_fails_the_same_way() {
     let plain = run(
         case.harness,
         &Configuration::of(case.harness),
-        0,
+        SEED,
         Some(case.mutant),
-        &mut Seed(Seeded(0)),
+        &mut Seed(Seeded(SEED)),
     );
     assert_eq!(plain.violation, Some(violation.clone()));
-    assert!(fails_as(case, 0, &tape, &violation));
+    assert!(fails_as(case, SEED, &tape, &violation));
     let shrunk = shrink(tape.clone(), 20_000, |candidate| {
-        fails_as(case, 0, candidate, &violation)
+        fails_as(case, SEED, candidate, &violation)
     });
     println!(
         "a read before the first commit: {} steps shrunk to {} in {} runs, minimal {}",
@@ -995,7 +997,7 @@ fn a_failing_run_shrinks_to_a_minimal_tape_that_fails_the_same_way() {
         shrunk.minimal
     );
     assert!(shrunk.minimal && shrunk.tape.len() < tape.len());
-    assert!(fails_as(case, 0, &shrunk.tape, &violation));
+    assert!(fails_as(case, SEED, &shrunk.tape, &violation));
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1347,13 +1349,13 @@ fn strategy_costs() {
     );
     println!("  {played} rounds played a search");
     let case = CASES[1];
-    let (judged, tape) = recorded(case, 0);
+    let (judged, tape) = recorded(case, 3);
     let violation = judged.violation.unwrap();
     costs_of(
-        "shrinking seed 0's read before the first commit (one shrinking)",
+        "shrinking seed 3's read before the first commit (one shrinking)",
         |_| {
             shrink(tape.clone(), 20_000, |candidate| {
-                fails_as(case, 0, candidate, &violation)
+                fails_as(case, 3, candidate, &violation)
             });
         },
         3,

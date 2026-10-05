@@ -39,11 +39,11 @@ their terms.
 | `Say(m, i)` | A held entry said again to a leader of a later term: `Raft::heard_leader`. |
 | `Take(l, v)` | The leader takes an entry for the next index: `Raft::leader_hears` → `Raft::decide` → `Raft::take`; its own proposals; its first entry, `Raft::become_leader`. |
 | `Reconfigure(l)` | A change accepted by `Raft::propose`: one at a time (`pending_conf_index`, set to the end of the log at `Raft::become_leader`), and out of a joint configuration before into another; the entry that leaves a joint configuration by itself, `Raft::commit_apply` (auto-leave). |
-| `ConfigurationOf(s)` | The configuration a member counts by: `Raft::apply_conf_change` applies a committed change, and `Raft::hup` campaigns only once every committed change is applied. |
+| `ConfigurationOf(s)`, `Stands(c)` | The configuration a member counts by, the newest its log states (`Raft::refresh_configuration`, `docs/raft.md` §3.4), and who may campaign (`Raft::promotable`). |
 | `FastCommit(l)` | `Raft::fast_commit` (`track.rs`). `OfTheRound` is the first rule, `self.log.term(progress.matched) == self.term`; `FastOfTheTerm` is the second, `Raft::fast_quorum_of_the_term` over the voters in force (`Tracker::has_fast_quorum`) and those `Raft::note_term_configuration` and `Raft::note_term_change` noted; `~Pending(l)` and `c.out = {}` are `Raft::has_pending_conf` and `Configuration::is_joint`. |
 | `ClassicCommit(l, i)` | `Raft::maybe_commit`: the tracker's quorum index (`Tracker::quorum_index`, both halves of a joint configuration) and `Log::maybe_commit`, which commits only an entry of the leader's term. |
 | `Replicate(l, m, p)` | `Raft::bcast_append` to the members of the leader's configuration; `Raft::handle_append_entries` → `Log::maybe_append` and `Raft::release_proposals` at the member; the answer, `Raft::handle_append_response` (`Progress::matched`, the model's `acks`). |
-| `Elect(c, Q, V)` | `Raft::hup` (a voter of its own applied configuration), `Raft::campaign`, `Raft::step_vote` (the log comparison, `Log::is_up_to_date`, and the held entries sent with the vote), `Raft::poll`, `Raft::hear_report`, then `Raft::become_leader` → `Raft::note_term_configuration` and `Raft::recover` (the entry most held among the voters, at every index above the log). |
+| `Elect(c, Q, V)` | `Raft::hup` (`Raft::promotable`), `Raft::campaign`, `Raft::step_vote` (the log comparison, `Log::is_up_to_date`, and the held entries sent with the vote), `Raft::poll`, `Raft::hear_report`, then `Raft::become_leader` → `Raft::note_term_configuration` and `Raft::recover` (the entry most held among the voters, at every index above the log). |
 | `Lose(m, k)` | A member of `Losers` whose log lost its tail after `k` at rest and reopened: hyper-log's uncertainty mark (`Health::Marked`), passed to the core as `Config::lost` (`Lost`). It keeps its term and vote, marks through its last entry, the greater index and term where a mark had not yet ended (hyper-log's merge), and its commit falls to what it holds. The mark ends as `Lost::resolved_by` says, in `Replicate` (`Raft::settle_lost` at every notice) and at its election (`Raft::become_leader`). |
 | `Claim(m)`, `Current(c, m)` | `Raft::claim` in `Raft::step_vote`: a voter grants only a log at least as current as its mark while marked. `Marks = "whole"` judges by the log alone (refused). |
 | `Own(c)`, `Quorums(c, Q)` | `Raft::campaign` polling a marked candidate's own vote as a refusal (R-7): its quorum is of the others. `Marks = "self"` counts it (refused). `Raft::may_campaign`'s further limits (the others can be a quorum; not in a fast group) only refuse campaigns the model may take and win nothing by. |
@@ -71,10 +71,8 @@ What the model leaves out, and why it is sound to:
 - **The durable commit, the apply pause and applying before durability** (core step R-6,
   `docs/durable.md` §4.4). An answer's commit is what a leader learns of a member's commit; no
   action of the model reads it, nor any decision of the core, so holding it to the durable commit
-  changes no run. The apply pause only defers applying, and a member campaigns only once every
-  change it committed is applied (`Raft::hup`), as before; `ConfigurationOf(s)` is the
-  configuration of what `s` committed and applied, and a deferred apply is a later step of the
-  model. A leader that applies its own committed entries before its write is durable applies
+  changes no run. The apply pause only defers applying, which no configuration a member counts
+  by waits for (`docs/raft.md` §3.4). A leader that applies its own committed entries before its write is durable applies
   what a quorum holds durably, which `ClassicCommit` and `FastCommit` already require; the model has no
   state machine but the configuration, and a change waits for the durable commit (I5), which
   cannot cover an entry not durable at the member (I7). No action changes.
@@ -116,23 +114,22 @@ one worker, `TLC_MEMORY_MB=256`, beside other work (load average about 30 on 18 
 | `one` | `FastTrack.cfg` | 3 voters, 3 terms, 1 index, 2 values | 560,563 (focal: 560,563) | passes | 1 min 20 s |
 | `round` | `FastTrackRound.cfg` | 3 voters, 2 terms, 2 indexes, 1 value | 2,462,010 (focal: 2,462,010) | passes | 6 min 33 s |
 | `four` | `FastTrackFour.cfg` | 4 voters, 3 terms, 1 index, 1 value | 3,207,204 (focal: 3,207,204) | passes | 16 min 25 s |
-| `change` | `FastTrackChange.cfg` | 3 voters, a change removes s3, 2 terms, 2 indexes (held at 2), 2 values | 3,304,320 | passes | 12 min 56 s |
-| `grow` | `FastTrackGrow.cfg` | 3 voters, a change adds s4, 2 terms, 2 indexes (held at 2), 1 value | 3,084,745 | passes | 14 min 14 s |
-| `classic` | `Classic.cfg` | classic core, 2 voters, a change adds s3, 3 terms, 3 indexes | 1,661,802 | passes | 7 min 2 s |
-| `joint` | `ClassicJoint.cfg` | classic core, s1 replaced by s3 through a joint configuration, 3 terms, 3 indexes | 575,442 | passes | 1 min 4 s |
+| `change` | `FastTrackChange.cfg` | 3 voters, a change removes s3, 2 terms, 2 indexes (held at 2), 2 values | 2,841,943 | passes | 12 min 56 s |
+| `grow` | `FastTrackGrow.cfg` | 3 voters, a change adds s4, 2 terms, 2 indexes (held at 2), 1 value | 5,228,729 | passes | 14 min 14 s |
+| `classic` | `Classic.cfg` | classic core, 2 voters, a change adds s3, 3 terms, 3 indexes | 5,013,585 | passes | 7 min 2 s |
+| `joint` | `ClassicJoint.cfg` | classic core, s1 replaced by s3 through a joint configuration, 3 terms, 3 indexes | 798,339 | passes | 1 min 4 s |
 | `reached` | `FastTrackReached.cfg` | `round` and the claim `NoFastByHeld` | 367,248 (focal: 367,248) | refused: `NoFastByHeld` | 46 s |
 | `anyround` | `FastTrackAnyRound.cfg` | `four` without the first rule | 190,662 (focal: 190,662) | refused: `LeaderHolds` | 37 s |
 | `least` | `FastTrackWrong.cfg` | 5 voters, 2 terms, 1 index, the least-held entry recovered, no first rule | 89,337 (focal: 89,337) | refused: `LeaderHolds` | 2 min 58 s |
-| `anyconfig` | `FastTrackAnyConfig.cfg` | `change` without the second rule | 755,201 | refused: `LeaderHolds` | 1 min 22 s |
-| `growreached` | `FastTrackGrowReached.cfg` | `grow` and the claim `NoFastByHeldAfterChange` | 12,451 | refused: `NoFastByHeldAfterChange` | 2 s |
+| `growreached` | `FastTrackGrowReached.cfg` | `grow` and the claim `NoFastByHeldAfterChange` | 239,653 | refused: `NoFastByHeldAfterChange` | 2 s |
 | `marked` | `Marked.cfg` | classic core, 3 voters, any losing its log's tail at rest, 2 terms, 2 indexes | 196,484 | passes | 14 s (CI, 4 workers) |
-| `markedchange` | `MarkedChange.cfg` | classic core, 2 voters and s3 added by one entry, any losing its tail, 2 terms, 2 indexes | 76,173 | passes | 5 s (CI, 4 workers) |
-| `markedjoint` | `MarkedJoint.cfg` | classic core, s3 removed through a joint configuration, any losing its tail, 2 terms, 2 indexes | 909,876 | passes | 51 s (CI, 4 workers) |
+| `markedchange` | `MarkedChange.cfg` | classic core, 2 voters and s3 added by one entry, any losing its tail, 2 terms, 2 indexes | 224,402 | passes | 5 s (CI, 4 workers) |
+| `markedjoint` | `MarkedJoint.cfg` | classic core, s3 removed through a joint configuration, any losing its tail, 2 terms, 2 indexes | 784,034 | passes | 51 s (CI, 4 workers) |
 | `markedself` | `MarkedSelf.cfg` | `marked` at 2 terms and 1 index, a marked candidate's own vote counted | 979 | refused: `LeaderHolds` | 1 s (CI) |
 | `markedwhole` | `MarkedWhole.cfg` | `marked` at 2 terms and 1 index, voters judging by their logs | 1,187 | refused: `LeaderHolds` | 1 s (CI) |
 | `markedreach` | `MarkedReached.cfg` | `marked` and the claim `NoMarkedLeader` | 241 | refused: `NoMarkedLeader` | 1 s (CI) |
-| `changereach` | `MarkedChangeReached.cfg` | `markedchange` and the claim `NoMarkedLeader` | 6,297 | refused: `NoMarkedLeader` | 2 s (CI) |
-| `jointreach` | `MarkedJointReached.cfg` | `markedjoint` and the claim `NoMarkedLeader` | 579 | refused: `NoMarkedLeader` | 1 s (CI) |
+| `changereach` | `MarkedChangeReached.cfg` | `markedchange` and the claim `NoMarkedLeader` | 1,023 | refused: `NoMarkedLeader` | 2 s (CI) |
+| `jointreach` | `MarkedJointReached.cfg` | `markedjoint` and the claim `NoMarkedLeader` | 575 | refused: `NoMarkedLeader` | 1 s (CI) |
 
 What each shows:
 - `one`, `round`, `four`: focal's three, unchanged. `reached` shows that `round` commits an index
@@ -141,11 +138,11 @@ What each shows:
 - `anyround` is seed 9843's defect (`an_election_never_commits_a_second_entry_at_a_committed_index`):
   a member that holds the entry beside a log of an older term votes for a candidate that keeps
   its own entry at the index. `four` is the same four voters with the first rule.
-- `anyconfig` is seed 54104's defect (`a_member_that_counts_by_the_configuration_before_commits_no_second_entry`)
-  with three voters for five: the leader commits the change by s2, which does not hear that it is
-  committed and counts by all three; the leader commits the next index by the fast quorum of the
-  two voters left, s2 holding the entry beside its log; s3 holds another entry there, and s2 is
-  elected by s3 and takes it. `change` is the same with the second rule. After a change that
+- `anyconfig`, seed 54104's defect with three voters for five, was refused while a member counted
+  by the configuration its committed log stated; since it counts by the newest its log states
+  (`docs/raft.md` §3.4) that configuration passes with the rule out, and was retired
+  (2026-10-05): the rule's catch is the core's (`tests/check.rs`, fast seed 1,483). `change` is
+  the configuration with the second rule. After a change that
   removes a voter of three no fast quorum of the two is one of the three, so under the rule the
   leader commits by the classic quorum until its term ends.
 - `grow` checks the second rule where it leaves the fast track open: after a change that adds a
@@ -168,8 +165,7 @@ refused ones with one. The first CI run's time is the measurement to replace thi
 at 3 terms and 2 indexes, 4 voters at 2 terms and 2 indexes, 5 voters at 2 terms and 1 index; the
 model before an election became one step took 208 million states and 26 GB of disk at 3 voters,
 3 terms and 2 indexes without ending. A change of five voters to four, as seed 54104 had, is
-five voters at two indexes: past that bound too, so `anyconfig` and `change` show the same defect
-and rule at three.
+five voters at two indexes: past that bound too, so `change` checks the rule at three.
 
 **The marked members (R-7, 2026-10-02).** The model gained `Lose`, `Claim`, `Own`, the variables
 `mark` and `markedLed` and the constants `Losers` and `Marks`. With `Losers = {}` no step of them is
@@ -195,6 +191,36 @@ two). Each is at the smallest scope that still does what it is for:
 
 `scripts/check-model.sh` now runs every configuration named and fails at the end if any did not end
 as it states, so one run reports every count.
+
+**The newest configuration in the log (2026-10-05).** `ConfigurationOf(s)` now reads a member's
+whole log, and `Stands(c)` lets a voter of the configuration before an uncommitted change campaign
+(`docs/raft.md` §3.4). The configurations with a change took new counts, counted by CI's model job
+(runs 37296371662 and 37305116263) and, for those of one value, equal to the Rust mirror's
+(hyper-check `tests/fasttrack.rs` on the release series); those without a change kept theirs.
+The Reconfig rows' passing counts are the Rust search's, which TLC matched in those runs.
+
+**The configuration a member counts by (`Reconfig.tla`, 2026-10-05).** A second module, of the
+classic core alone across two changes of four servers (and a sole voter adding a second), with the
+configuration elections and commitment count by as constants (`docs/research/reconfiguration.md`
+§5, `docs/raft.md` §3.4). Its Rust mirror, hyper-check's `tests/models/reconfig.rs`, searches the
+same specification with no symmetry and no reduction, so its class counts are the distinct states
+the configurations state; CI's explore job holds the mirror to them and searches past them with
+the reductions that note argues sound.
+
+| Name | Configuration | Bounds | Distinct states | Result |
+|---|---|---|---|---|
+| `rjoint` | `ReconfigJoint.cfg` | the core's rule, A replaced by D through a joint configuration, 2 terms, 2 indexes | 4,945,526 | passes |
+| `rpromote` | `ReconfigPromote.cfg` | the core's rule, D promoted then A demoted, 2 terms, 2 indexes | 6,496,567 | passes |
+| `rsingle` | `ReconfigSingle.cfg` | the core's rule, a sole voter adds a second by one entry, 3 terms, 3 indexes | 31,203 | passes |
+| `rsinglejoint` | `ReconfigSingleJoint.cfg` | the same through a joint configuration | 24,460 | passes |
+| `rapplied` | `ReconfigApplied.cfg` | `rjoint` by the configuration applied (raft-rs's rule) | 1,171,121 | refused: `OneLeader` |
+| `rpending` | `ReconfigPending.cfg` | `rjoint` and the claim `NoElectedOnPending` | 603 | refused: `NoElectedOnPending` |
+| `rstood` | `ReconfigStood.cfg` | `rjoint` and the claim `NoElectedUnnamed` | 27,962 | refused: `NoElectedUnnamed` |
+
+Elections by the newest configuration and commitment by the one applied, the thesis's rule for
+elections alone, is refused for `LeaderHolds` only at three terms, past what TLC runs here at one
+worker in the job's time; the mirror refutes it there with the reductions, in eleven steps
+(`elections_by_the_newest_and_commits_by_the_applied_lose_a_committed_entry`).
 
 **To change the model.** A change that makes a configuration larger or smaller fails the check
 until its states are counted again and stated; a new configuration is first run with a

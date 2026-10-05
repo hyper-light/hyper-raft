@@ -63,11 +63,17 @@ const LOSS_PPM: u32 = 50_000;
 const JITTER: u64 = 100 * MS;
 /// The seeds the lossy condition is checked over, each exactly.
 const SEEDS: std::ops::Range<u64> = 1..33;
+/// The seeds the burst table is measured over: 128, so a p90 is the 116th of them, not the 29th
+/// of 32, and a run's draws moved by a dial before it move the quantiles less.
+const BURST_SEEDS: std::ops::Range<u64> = 1..129;
 /// What a request and its reply carry.
 const REQUEST: &[u8] = &[0x51; 100];
-/// The most a scenario's request may hold: a request past one 0-RTT packet.
-static LARGE_REQUEST: [u8; 4_096] = [0x51; 4_096];
+/// The most a scenario's request may hold: a learning dial's upload (`LEARNING_BYTES`).
+static LARGE_REQUEST: [u8; LEARNING_BYTES] = [0x51; LEARNING_BYTES];
 const REPLY: &[u8] = &[0x52; 100];
+/// A learning dial's request and reply: 256 KiB each way, some 220 packets, at the conditions' 5%
+/// some eleven losses a dial for each endpoint's evidence of its own direction.
+const LEARNING_BYTES: usize = 256 << 10;
 /// RFC 9000 §18.2's default max_ack_delay, which hyper-quic's endpoints advertise.
 const MAX_ACK_DELAY: u64 = 25 * MS;
 /// The longest a run goes on in virtual time: the default idle timeout (RFC 9308 §3.2's 30 s,
@@ -291,6 +297,14 @@ struct Scenario {
     /// The correlation time a copy waits past (`TransportConfig::handshake_copy_burst`), or the
     /// endpoints' default.
     copy_burst: Option<Duration>,
+    /// Dials made first to learn the path, each with a client configuration of its own, so the
+    /// dials after them start fresh (no session ticket) on endpoints that remember the path.
+    learning: u32,
+    /// What a learning dial's request and reply carry: enough packets for losses to be seen.
+    learning_bytes: (usize, usize),
+    /// Whether the endpoints remember what connections learned of the path's loss bursts
+    /// (`EndpointConfig::loss_memory`, their default).
+    loss_memory: bool,
     /// The virtual time past which the run stops.
     horizon: u64,
 }
@@ -299,6 +313,10 @@ impl Scenario {
     /// The bytes of the reply on the `dials`th dial, counted from one, to its first request or to
     /// a `kept` one after it
     fn reply_len(&self, dials: usize, kept: bool) -> usize {
+        // A learning dial's ([`Scenario::learning`]) whatever else is asked
+        if dials > 0 && dials <= self.learning as usize {
+            return self.learning_bytes.1;
+        }
         match (kept, self.kept_reply_bytes, dials, self.first_reply_bytes) {
             (true, Some(kept), _, _) => kept,
             (_, _, 1, Some(first)) => first,
@@ -327,6 +345,9 @@ impl Scenario {
             clean_first: false,
             copies: true,
             copy_burst: None,
+            learning: 0,
+            learning_bytes: (LEARNING_BYTES, LEARNING_BYTES),
+            loss_memory: true,
             horizon: HORIZON,
         }
     }
@@ -427,6 +448,8 @@ struct Run {
     net: Net<Vec<u8>>,
     client: Side,
     server: Side,
+    /// The learning dials' client configuration ([`Scenario::learning`]).
+    learning_config: ClientConfigHandle,
     client_config: ClientConfigHandle,
     wire: Wire,
     dialed: Vec<Dialed>,
@@ -484,6 +507,9 @@ impl Run {
         let mut resume = CarefulResumeConfig::default();
         resume.warm_up(scenario.warm_up);
         endpoint_config.careful_resume(scenario.careful_resume.then_some(resume));
+        if !scenario.loss_memory {
+            endpoint_config.loss_memory(0, Duration::ZERO);
+        }
         let mut client = Endpoint::new(endpoint_config.clone(), None, false, rng(CLIENT)).unwrap();
         let mut transport = TransportConfig::default();
         transport.handshake_copies(scenario.copies);
@@ -493,6 +519,9 @@ impl Run {
         let mut client_config = pki.client_config();
         client_config.transport_config(transport.clone());
         let client_config = client.insert_client_config(client_config).unwrap();
+        let mut learning_config = pki.client_config();
+        learning_config.transport_config(transport.clone());
+        let learning_config = client.insert_client_config(learning_config).unwrap();
         if scenario.silent {
             net.partition(CLIENT, SERVER, true);
         }
@@ -518,6 +547,7 @@ impl Run {
                 endpoint: server,
                 connection: None,
             },
+            learning_config,
             client_config,
             wire: Wire {
                 drop_client: scenario.drop_client,
@@ -536,6 +566,20 @@ impl Run {
         }
     }
 
+    /// Whether the dial under way is one of the learning dials ([`Scenario::learning`]).
+    fn learning(&self) -> bool {
+        // The dial under way is the last one pushed
+        !self.dialed.is_empty() && self.dialed.len() as u32 <= self.scenario.learning
+    }
+
+    fn request_bytes(&self) -> usize {
+        if self.learning() {
+            self.scenario.learning_bytes.0
+        } else {
+            self.scenario.request_bytes
+        }
+    }
+
     fn at(&self, now: u64) -> Instant {
         self.epoch + Duration::from_nanos(now)
     }
@@ -548,16 +592,15 @@ impl Run {
             self.net.set_pair_path(SERVER, CLIENT, path).unwrap();
         }
         let at = self.at(now);
+        let config = if (self.dialed.len() as u32) < self.scenario.learning {
+            self.learning_config
+        } else {
+            self.client_config
+        };
         let connection = self
             .client
             .endpoint
-            .connect(
-                at,
-                self.client_config,
-                self.server.address,
-                "localhost",
-                None,
-            )
+            .connect(at, config, self.server.address, "localhost", None)
             .unwrap();
         self.client.connection = Some(connection);
         self.server.connection = None;
@@ -586,6 +629,7 @@ impl Run {
     }
 
     fn serve(&mut self, node: NodeId) {
+        let request_bytes = self.request_bytes();
         let now = self.world.now();
         let at = self.at(now);
         let is_client = node == CLIENT;
@@ -634,7 +678,7 @@ impl Run {
             if ready && self.request.is_none() && dialed.lost.is_none() {
                 let id = connection.streams().open(Dir::Bi).unwrap();
                 let mut stream = connection.send_stream(id);
-                let request = &LARGE_REQUEST[..self.scenario.request_bytes];
+                let request = &LARGE_REQUEST[..request_bytes];
                 assert_eq!(stream.write(request).unwrap(), request.len());
                 stream.finish().unwrap();
                 self.request = Some(id);
@@ -653,7 +697,7 @@ impl Run {
                     if (dialed.kept.len() as u32) < self.scenario.kept_requests {
                         let id = connection.streams().open(Dir::Bi).unwrap();
                         let mut stream = connection.send_stream(id);
-                        let request = &LARGE_REQUEST[..self.scenario.request_bytes];
+                        let request = &LARGE_REQUEST[..request_bytes];
                         assert_eq!(stream.write(request).unwrap(), request.len());
                         stream.finish().unwrap();
                         self.request = Some(id);
@@ -665,7 +709,7 @@ impl Run {
         } else if let Some(id) = self.inbound {
             read_to_end(connection, id, &mut self.asked);
             let total = self.scenario.reply_len(self.dialed.len(), self.served > 1);
-            if self.asked.len() == self.scenario.request_bytes && self.answered < total {
+            if self.asked.len() == request_bytes && self.answered < total {
                 // Written as the stream's buffer takes it, a large reply over several turns
                 let mut stream = connection.send_stream(id);
                 while self.answered < total {
@@ -1192,6 +1236,40 @@ fn under_bursts_a_spaced_copy_clears_the_burst_its_original_met() {
     assert_eq!(waited(None), [14, 18], "spaced");
 }
 
+/// A path learned (`EndpointConfig::loss_memory`, `docs/research/burst-loss.md` §7): after two
+/// dials that each carry 256 KiB both ways, the next fresh dial's client sends its first flight's
+/// copies at once on a path whose losses are independent, as the client's evidence there says,
+/// and [`SPACING`] behind on one that loses in bursts, where the evidence leaves the configured
+/// 35 ms. Seed 1 of each condition.
+#[test]
+fn a_path_learned_independent_sends_its_copies_at_once_and_one_bursty_spaces_them() {
+    let pki = Pki::new(MANY_NAMES);
+    let copies_after = |loss: Loss| -> Vec<u64> {
+        let out = Run::new(
+            Scenario {
+                dials: 4,
+                early: true,
+                learning: 2,
+                careful_resume: false,
+                horizon: HORIZON * 4,
+                path: Path::reordering(ONE_WAY, JITTER).with_loss(loss),
+                ..Scenario::lossy(1)
+            },
+            &pki,
+        )
+        .run();
+        let started = out.dialed[2].started;
+        out.sent
+            .iter()
+            .filter(|s| s.from_client && s.at >= started && s.kinds[0] == Kind::Initial)
+            .take(4)
+            .map(|s| s.at - started)
+            .collect()
+    };
+    assert_eq!(copies_after(Loss::random(LOSS_PPM)), [0, 0, 0, 0]);
+    assert_eq!(copies_after(bursts(35 * MS)), [0, 0, SPACING, SPACING]);
+}
+
 /// Guarantee c: the server acknowledges every duplicate Initial datagram at once (RFC 9000
 /// §13.2.1: Initial packets are acknowledged immediately), surfaces no second attempt and feeds no
 /// ClientHello twice (a second one would fail the handshake), and its allowance grows with the
@@ -1384,7 +1462,7 @@ fn print_the_overhead_table() {
 #[test]
 #[ignore = "prints the lossy overhead table; run by hand"]
 fn print_the_lossy_overhead_table() {
-    overhead_table(Loss::random(LOSS_PPM), true, None);
+    overhead_table(Loss::random(LOSS_PPM), true, None, 0, true, SEEDS);
 }
 
 /// The conditions of `docs/research/burst-loss.md` §4, at the lossy condition's 5% mean: bursts in
@@ -1404,35 +1482,73 @@ fn print_the_burst_table() {
         ("bursts, tau 35.0 ms", bursts(35 * MS)),
         ("bursts, tau 78.7 ms", bursts(78_700_000)),
     ] {
-        for (copies, burst, what) in [
-            (false, None, "no copies"),
-            (true, Some(Duration::ZERO), "copies back to back"),
-            (true, None, "copies spaced, the default 35 ms"),
+        for (copies, burst, learning, memory, what) in [
+            (false, None, 0, false, "no copies"),
+            (true, Some(Duration::ZERO), 0, false, "copies back to back"),
+            (true, None, 0, false, "copies spaced 35 ms, nothing learned"),
             (
                 true,
-                Some(Duration::from_micros(78_700)),
-                "copies spaced, 78.7 ms",
+                None,
+                0,
+                true,
+                "copies spaced as learned, no dial before",
+            ),
+            (
+                true,
+                Some(Duration::ZERO),
+                2,
+                false,
+                "copies back to back, two dials before",
+            ),
+            (
+                true,
+                None,
+                2,
+                false,
+                "copies spaced 35 ms, two dials before",
+            ),
+            (
+                true,
+                None,
+                2,
+                true,
+                "copies spaced as learned over two dials before",
             ),
         ] {
             println!("== {label}, {what}");
-            overhead_table(loss, copies, burst);
+            overhead_table(loss, copies, burst, learning, memory, BURST_SEEDS);
         }
     }
 }
 
-fn overhead_table(loss: Loss, copies: bool, copy_burst: Option<Duration>) {
+fn overhead_table(
+    loss: Loss,
+    copies: bool,
+    copy_burst: Option<Duration>,
+    learning: u32,
+    loss_memory: bool,
+    seeds: std::ops::Range<u64>,
+) {
     let pki = Pki::new(MANY_NAMES);
     let mut rows: [[Vec<u64>; 2]; 2] = Default::default();
     let mut stuck = [0u32; 2];
     // What the network carried over every seed: the cost of the probes beside their latency
     let (mut datagrams, mut bytes) = (0usize, 0usize);
-    for seed in SEEDS {
+    let count = seeds.end - seeds.start;
+    for seed in seeds {
         let out = Run::new(
             Scenario {
-                dials: 2,
+                dials: learning + 2,
                 early: true,
                 copies,
                 copy_burst,
+                learning,
+                loss_memory,
+                // Careful Resume would start the measured dials from what the learning dials
+                // delivered, a change of its own beside the copies' spacing
+                careful_resume: learning == 0,
+                // The default horizon for each dial
+                horizon: HORIZON * u64::from(learning + 2),
                 path: Path::reordering(ONE_WAY, JITTER).with_loss(loss),
                 ..Scenario::lossy(seed)
             },
@@ -1442,7 +1558,7 @@ fn overhead_table(loss: Loss, copies: bool, copy_burst: Option<Duration>) {
         datagrams += out.sent.len();
         bytes += out.sent.iter().map(|s| s.size).sum::<usize>();
         for (i, floors) in [(0usize, (2, 3)), (1, (1, 1))] {
-            match out.dialed.get(i) {
+            match out.dialed.get(i + learning as usize) {
                 Some(Dialed {
                     started,
                     connected: Some(c),
@@ -1477,10 +1593,7 @@ fn overhead_table(loss: Loss, copies: bool, copy_burst: Option<Duration>) {
             );
         }
     }
-    println!(
-        "sent over {} seeds: {datagrams} datagrams, {bytes} bytes",
-        SEEDS.end - SEEDS.start
-    );
+    println!("sent over {count} seeds: {datagrams} datagrams, {bytes} bytes");
 }
 
 /// The datagrams a scenario drops, chosen from a clean run's record: the harness's scenarios hold
@@ -1715,6 +1828,7 @@ fn a_jump_onto_a_lossy_path_retreats_and_every_transfer_completes() {
         )
         .run();
         assert_eq!(out.dialed.len(), 2, "seed {seed}: {:?}", out.dialed);
+
         for d in &out.dialed {
             // The client closes each dial at its reply, which the server sees as closed by peer
             let closed_by_client = d

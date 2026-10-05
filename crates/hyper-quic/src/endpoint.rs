@@ -27,7 +27,8 @@ use crate::{
         ServerConfig, ServerConfigHandle,
     },
     connection::{
-        CarefulResume, CongestionMemory, Connection, ConnectionError, Grant, Leaves, SideArgs,
+        CarefulResume, CongestionMemory, Connection, ConnectionError, Grant, Leaves, LossFit,
+        LossMemory, SideArgs,
     },
     crypto::{self, Keys, UnsupportedVersion},
     frame,
@@ -77,6 +78,8 @@ pub struct Endpoint {
     token_store: Box<dyn TokenStore>,
     /// What closed connections measured of their paths, for Careful Resume (RFC 9959)
     congestion_memory: CongestionMemory,
+    /// What connections learned of each remote's loss bursts
+    loss_memory: LossMemory,
 }
 
 impl Endpoint {
@@ -108,6 +111,7 @@ impl Endpoint {
         let server_config = server_config.and_then(|c| configs.insert_server(c).ok());
         let congestion_memory =
             CongestionMemory::new(config.careful_resume.map_or(0, |c| c.remembered));
+        let loss_memory = LossMemory::new(config.loss_memory.0);
         Ok(Self {
             rng,
             index: ConnectionIndex::default(),
@@ -125,6 +129,7 @@ impl Endpoint {
             token_log: Box::new(BloomTokenLog::default()),
             token_store: Box::new(TokenMemoryCache::default()),
             congestion_memory,
+            loss_memory,
         })
     }
 
@@ -259,6 +264,7 @@ impl Endpoint {
                 self.token_store.insert(&server_name, token);
             }
             Resume(leaves) => self.remember(ch, leaves),
+            Losses(now, fit) => self.learn_losses(ch, now, &fit),
             Drained => {
                 if let Some(conn) = self.connections.try_remove(ch.0) {
                     self.index.remove(&conn);
@@ -272,6 +278,16 @@ impl Endpoint {
             }
         }
         None
+    }
+
+    /// Adds what connection `ch` counted of its path's loss bursts to the endpoint's memory of its
+    /// remote, for the next connection to it
+    fn learn_losses(&mut self, ch: ConnectionHandle, now: Instant, fit: &LossFit) {
+        if let Some(meta) = self.connections.get(ch.0) {
+            let remote = meta.addresses.remote.ip();
+            self.loss_memory
+                .add(remote, fit, now, self.config.loss_memory.1);
+        }
     }
 
     /// Keeps what connection `ch` measured of its path for the next connection to its remote
@@ -1427,6 +1443,9 @@ impl Endpoint {
             ),
             None => CarefulResume::new(Grant::Neither, 0, false, now),
         };
+        let losses = self
+            .loss_memory
+            .get(addresses.remote.ip(), now, self.config.loss_memory.1);
         let conn = Connection::new(
             self.config.grease_quic_bit,
             transport_config,
@@ -1445,6 +1464,7 @@ impl Endpoint {
             rng_seed,
             side_args,
             resume,
+            losses,
         );
 
         // The handshake CID is sequence 0, a preferred address's sequence 1

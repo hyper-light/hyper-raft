@@ -342,6 +342,12 @@ impl RttEstimator {
         self.min
     }
 
+    /// How far the path's delay varies: four mean deviations (RFC 6298 §2's `K`), and at least the
+    /// timer's granularity, the term RFC 9002 §6.2.1 adds to the PTO
+    pub(crate) fn variation_bound(&self) -> Duration {
+        cmp::max(self.var.saturating_mul(4), TIMER_GRANULARITY)
+    }
+
     // PTO computed as described in RFC9002#6.2.1
     pub(crate) fn pto_base(&self) -> Duration {
         // Durations: saturating can only lengthen them

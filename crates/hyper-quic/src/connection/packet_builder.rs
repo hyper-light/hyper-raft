@@ -233,6 +233,7 @@ impl PacketBuilder {
             stream_frames: sent.stream_frames,
             copied: conn.spaces.get(space_id).sending_copies,
             handshake_flight,
+            next: None,
         };
 
         conn.path

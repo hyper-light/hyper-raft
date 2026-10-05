@@ -64,6 +64,9 @@ pub(crate) enum EndpointEventInner {
     /// §3.1): a measurement, as its warm-up makes one or as it closes, or at its close what becomes
     /// of the remote's mark it held
     Resume(crate::connection::Leaves),
+    /// What the connection counted of its path's loss bursts since it last said
+    /// (`connection::LossFit`)
+    Losses(Instant, crate::connection::LossFit),
 }
 
 /// Protocol-level identifier for a connection.

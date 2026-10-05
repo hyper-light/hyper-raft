@@ -43,7 +43,15 @@ pub struct EndpointConfig {
     pub(crate) config_slots: NonZeroUsize,
     /// Careful Resume (RFC 9959), or `None` to start every connection at the initial window
     pub(crate) careful_resume: Option<CarefulResumeConfig>,
+    /// The remote IP addresses whose loss bursts the endpoint remembers, and for how long
+    pub(crate) loss_memory: (usize, Duration),
 }
+
+/// The loss memory's default bound and lifetime: Careful Resume's
+/// ([`CarefulResumeConfig::default`]), 256 remote addresses, the server names
+/// `TokenMemoryCache` keeps tokens for, and an hour, Chromium's bound on the age of a path estimate
+/// it resumes from.
+const LOSS_MEMORY: (usize, Duration) = (256, Duration::from_secs(60 * 60));
 
 impl EndpointConfig {
     /// Create a default config with a particular `reset_key`
@@ -58,6 +66,7 @@ impl EndpointConfig {
             rng_seed: None,
             config_slots: configs::DEFAULT_CONFIG_SLOTS,
             careful_resume: Some(CarefulResumeConfig::default()),
+            loss_memory: LOSS_MEMORY,
         }
     }
 
@@ -172,6 +181,20 @@ impl EndpointConfig {
         self.careful_resume = config;
         self
     }
+
+    /// The remote IP addresses whose loss bursts the endpoint remembers at once, the oldest
+    /// replaced first, and how long what it learned of one stands without another connection
+    /// adding to it
+    ///
+    /// A connection learns from its own loss record whether its path loses in bursts, and the next
+    /// connection to the same address spaces its handshake's copies by what was learned
+    /// (`TransportConfig::handshake_copy_burst`, `docs/research/burst-loss.md` §7). Defaults to
+    /// Careful Resume's bound and lifetime, 256 addresses and an hour; zero addresses learns
+    /// nothing across connections.
+    pub fn loss_memory(&mut self, remembered: usize, lifetime: Duration) -> &mut Self {
+        self.loss_memory = (remembered, lifetime);
+        self
+    }
 }
 
 /// Careful Resume's parameters (RFC 9959 §2.4)
@@ -251,6 +274,7 @@ impl Clone for EndpointConfig {
             rng_seed: self.rng_seed,
             config_slots: self.config_slots,
             careful_resume: self.careful_resume,
+            loss_memory: self.loss_memory,
         }
     }
 }
@@ -266,6 +290,7 @@ impl fmt::Debug for EndpointConfig {
             .field("rng_seed", &self.rng_seed)
             .field("config_slots", &self.config_slots)
             .field("careful_resume", &self.careful_resume)
+            .field("loss_memory", &self.loss_memory)
             .finish_non_exhaustive()
     }
 }

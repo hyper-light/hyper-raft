@@ -52,7 +52,7 @@ pub(super) fn copy_spacing(burst: Duration, pto: Duration) -> Duration {
 
 /// `log2(x)` in [`FRACTION_BITS`] fractional bits, for `x ≥ 1`, by Turner's iterative squaring: one
 /// fractional bit an iteration.
-fn log2_fixed(x: u64) -> u64 {
+pub(super) fn log2_fixed(x: u64) -> u64 {
     if x <= 1 {
         return 0;
     }

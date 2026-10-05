@@ -315,6 +315,13 @@ impl PacketSpace {
 
         let mut forgotten = None;
         if packet.ack_eliciting {
+            // This packet is the neighbour of the last ack-eliciting one still held
+            if let Some(previous) = self.sent_packets.get_mut(&self.largest_ack_eliciting_sent)
+                && previous.ack_eliciting
+                && self.largest_ack_eliciting_sent < number
+            {
+                previous.next = Some((number, packet.time_sent));
+            }
             self.unacked_non_ack_eliciting_tail = 0;
             self.largest_ack_eliciting_sent = number;
         } else if self.unacked_non_ack_eliciting_tail > MAX_UNACKED_NON_ACK_ELICTING_TAIL {
@@ -415,6 +422,10 @@ pub(super) struct SentPacket {
     /// before this endpoint's handshake completed (0-RTT and 0.5-RTT data), or one in a datagram
     /// with a Handshake packet (the client's first 1-RTT data, beside its Finished)
     pub(super) handshake_flight: bool,
+    /// The next ack-eliciting packet this space sent after this one, if this one is ack-eliciting:
+    /// its number and when it went, the neighbour whose fate says whether a loss of this one came
+    /// in a burst (`losses.rs`)
+    pub(super) next: Option<(u64, Instant)>,
 }
 
 /// Retransmittable data queue

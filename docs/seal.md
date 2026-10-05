@@ -406,10 +406,34 @@ process abort.
 `SecP384r1MLKEM1024` (ML-KEM-1024, CNSA 2.0's key establishment, with P-384; defined by the IETF's
 hybrid ECDHE-MLKEM draft and implemented in hyper-tls) when both ends are ours, with
 `X25519MLKEM768` and `SecP256r1MLKEM768` admitted only if a measured handshake cost argues for them
-(slates' review). As built it admits `SecP384r1MLKEM1024` and serves it to a peer that offers it,
-and keeps `X25519MLKEM768` first: with the P-384 group first, the congestion harness's run-twice
-check (`crates/hyper-quic/tests/congestion.rs`) gives two digests from one seed, which is being
-traced to its cause before the order changes. The suites are TLS 1.3's 256-bit ones (`TLS_AES_256_GCM_SHA384`,
+(slates' review). As built it offers `SecP384r1MLKEM1024` first and serves `X25519MLKEM768` and
+`SecP256r1MLKEM768` to a peer that offers only them.
+
+- **The run-twice check.** With the P-384 group first, the congestion harness's run-twice check
+  (`crates/hyper-quic/tests/congestion.rs`) gave two digests from one seed in 10 of 10 tries. The
+  cause was the harness's identity, not the group: rcgen's default identity is a random ECDSA P-256
+  key, and an ECDSA signature takes a random nonce, its DER encoding 70 to 72 bytes as the nonce
+  falls, so the server's CertificateVerify, and with it the flight, changed length by a byte or two
+  from handshake to handshake. With the larger P-384 share, that byte moved a datagram's boundary
+  and the run's timing; with X25519MLKEM768 the slack absorbed it. The harness now signs with an
+  Ed25519 key from a fixed seed (deterministic signatures, RFC 8032 §5.1.6), as the geo harness
+  does, and the check holds in 10 of 10 tries with the P-384 group first.
+- **The handshake's cost, hyper to hyper, 500 ms one way** (`crates/hyper-quic/tests/geo.rs`,
+  exact, with hyper-quic's handshake copies, `crates/hyper-quic/VENDORED.md` §13). The clean path
+  is at its floor either way, every case the same to the millisecond (fresh 1,000 / 2,000 ms,
+  resumed with 0-RTT 1,000 / 1,000 ms, large certificate 1,999 / 2,999 ms). Under 5% loss each way
+  with ±100 ms of reordering, 32 seeds, overhead above the floor, P-384 first against X25519 first:
+  fresh first reply, median / p90 / max, 0 / 136 / 818 ms against 0 / 180 / 2,117 ms; resumed
+  first reply 13 / 108 / 146 ms against 37 / 124 / 142 ms; 2,402 datagrams and 1,678,139 bytes
+  against 2,453 and 1,683,483. The differences are the seeds' different draws over a different
+  layout, not a cost: the ClientHello spans two Initial datagrams either way (1,665 bytes of share
+  against 1,184). Before hyper-quic's two fixes of §13 (0-RTT packets held until the whole
+  ClientHello, a request sent whole before its copies), the P-384 group first cost the resumed dial
+  a round trip at the median (979 ms against 54), its larger share pushing the 0-RTT request into a
+  datagram of its own that could come before the hello was whole.
+- **CPU.** One in-memory handshake, both ends, release build, 400 a run, runs interleaved at a load
+  of 3 to 4: p50 1.22 and 1.39 ms with the P-384 group first, 1.01 and 1.08 ms with X25519MLKEM768
+  first, about a quarter of a millisecond more. The suites are TLS 1.3's 256-bit ones (`TLS_AES_256_GCM_SHA384`,
 `TLS_CHACHA20_POLY1305_SHA256`). Initial packets stay AES-128-GCM, which RFC 9001 §5.2 fixes, since
 their keys come from the connection ID and protect nothing secret. This is node-to-node
 configuration in `hyper-quic` and `hyper-tls`, not in `hyper-seal`; clients reaching an S3 or NFS

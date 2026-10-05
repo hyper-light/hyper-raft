@@ -687,7 +687,7 @@ pub(super) fn client_config_with_certs(certs: Vec<CertificateDer<'static>>) -> C
 
 /// A client offering only classical key exchange, so its ClientHello fits in one Initial
 /// datagram: the layout upstream's packet-counting tests were written against. The default
-/// client prefers X25519MLKEM768, whose 1,184-byte key share spreads the ClientHello over two.
+/// client prefers SecP384r1MLKEM1024, whose 1,665-byte key share spreads the ClientHello over two.
 pub(super) fn client_config_classical(certs: Option<Vec<CertificateDer<'static>>>) -> ClientConfig {
     let provider: &'static rustls::crypto::CryptoProvider = &CLASSICAL;
     let mut roots = rustls::RootCertStore::empty();

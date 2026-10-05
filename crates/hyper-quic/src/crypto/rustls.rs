@@ -580,16 +580,16 @@ pub(crate) fn initial_suite() -> Option<Suite> {
 }
 
 /// The key exchange groups between nodes: the hybrid post-quantum groups only
-/// (draft-ietf-tls-ecdhe-mlkem). X25519MLKEM768 first, whose share a ClientHello carries, then
-/// SecP256r1MLKEM768, then SecP384r1MLKEM1024 (ML-KEM-1024, CNSA 2.0's key establishment), served
-/// to a peer that offers it. SecP384r1MLKEM1024 goes first once its handshake cost is measured and
-/// the congestion harness's run-twice check holds with it first, which it does not yet (hyper-raft
-/// docs/seal.md §10). A classical-only peer finds no group in common and is refused (the owner's
-/// decision, 2026-10-04).
+/// (draft-ietf-tls-ecdhe-mlkem). SecP384r1MLKEM1024 first (ML-KEM-1024, CNSA 2.0's key
+/// establishment), whose share a ClientHello carries; then X25519MLKEM768 and SecP256r1MLKEM768,
+/// served to a peer that offers them. Measured at 500 ms one way it costs no round trip and no
+/// latency against X25519MLKEM768 first, and a quarter of a millisecond of CPU a handshake
+/// (hyper-raft docs/seal.md §10). A classical-only peer finds no group in common and is refused
+/// (the owner's decision, 2026-10-04).
 static NODE_KX_GROUPS: [&dyn rustls::crypto::SupportedKxGroup; 3] = [
+    rustls::crypto::aws_lc_rs::kx_group::SECP384R1MLKEM1024,
     rustls::crypto::aws_lc_rs::kx_group::X25519MLKEM768,
     rustls::crypto::aws_lc_rs::kx_group::SECP256R1MLKEM768,
-    rustls::crypto::aws_lc_rs::kx_group::SECP384R1MLKEM1024,
 ];
 
 /// The TLS 1.3 suites between nodes: those with 256-bit keys only, AES-256-GCM first, then

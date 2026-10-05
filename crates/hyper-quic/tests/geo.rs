@@ -2,7 +2,7 @@
 //! `Path::GEOGRAPHIC` mean), on hyper-sim's network in virtual time.
 //!
 //! A client and a server endpoint, real TLS 1.3 with the hybrid post-quantum key exchange the
-//! client offers first (X25519MLKEM768, a 1,184-byte key share that puts the ClientHello in two
+//! client offers first (SecP384r1MLKEM1024, a 1,665-byte key share that puts the ClientHello in two
 //! Initial datagrams), exchange over one path each way. Every datagram either side sends is
 //! recorded with its time and its first packet's type, so a test reads the handshake's schedule
 //! off the record and checks it exactly against the RFCs' arithmetic.
@@ -1127,7 +1127,7 @@ fn duplicate_initials_are_acknowledged_once_and_grow_the_allowance() {
     }
 }
 
-/// Guarantee d: the X25519MLKEM768 ClientHello in two datagrams, and a server flight larger than
+/// Guarantee d: the SecP384r1MLKEM1024 ClientHello in two datagrams, and a server flight larger than
 /// three times them, so the server must wait for the client's next bytes (RFC 9000 §8.1): the
 /// handshake completes at two round trips, the floor that limit sets.
 #[test]

@@ -168,12 +168,27 @@ struct Pki {
 }
 
 impl Pki {
+    /// The same identity every run, so a run is its seed's. rcgen's default identity is a random
+    /// ECDSA P-256 key and serial: an ECDSA signature takes a random nonce and its DER encoding is
+    /// 70 to 72 bytes as the nonce falls (RFC 8446 §4.2.3, RFC 3279 §2.2.3), and rustls compresses
+    /// the certificate (RFC 8879), so the server's flight changed length by bytes run to run. With
+    /// SecP384r1MLKEM1024's larger share first, a byte more moved a datagram's boundary and the run's
+    /// timing, and the run-twice check failed. An Ed25519 key from a fixed seed (RFC 8410 §7's
+    /// PKCS#8 form) signs deterministically (RFC 8032 §5.1.6).
     fn new() -> Self {
-        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
-        let key = PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der());
+        let mut pkcs8 = vec![
+            0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x04, 0x22,
+            0x04, 0x20,
+        ];
+        pkcs8.extend_from_slice(&[0x5a; 32]);
+        let signing_key =
+            rcgen::KeyPair::try_from(&PrivatePkcs8KeyDer::from(pkcs8.clone())).unwrap();
+        let mut params = rcgen::CertificateParams::new(vec!["localhost".into()]).unwrap();
+        params.serial_number = Some(rcgen::SerialNumber::from(0x0123_4567_89ab_cdef_u64));
+        let cert = params.self_signed(&signing_key).unwrap();
         Self {
-            certificate: cert.cert.into(),
-            key: key.into(),
+            certificate: cert.der().clone(),
+            key: PrivatePkcs8KeyDer::from(pkcs8).into(),
         }
     }
 }

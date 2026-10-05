@@ -5989,6 +5989,10 @@ of its bar over the seeds (the step reported, not judged):
   carry 1.04 of their bar or more, the marks answered as a classic sender answers them.
 - CoDel marked Copa in all 64 CoDel runs and Copa's datagrams stayed ECN-capable in every managed
   run (the shares test's own checks).
+- **With SecP384r1MLKEM1024 first between nodes and hyper-quic's handshake copies**
+  (`docs/seal.md` §10, `crates/hyper-quic/VENDORED.md` §13), the harness's identity now fixed: the
+  three grids again, 2026-10-05 03:08–03:23 PDT. Admissible, every rule met in every run; Copa's
+  share beside the incumbents 36.23% (geomean, 128 runs).
 
 ```
 cargo test -p hyper-quic --test congestion --locked every_law_alone_over_focals_grid -- --ignored --nocapture

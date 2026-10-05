@@ -127,6 +127,17 @@ impl Scenario {
         (self.bdp_bytes() * self.buffer_permille / 1_000).max(4 * DATAGRAM)
     }
 
+    /// The decisions a run records: a draw for loss and one for delay at most per datagram, on a
+    /// path that draws them, and the datagrams each way no more than the bottleneck carries over
+    /// the run at its peak rate, each of the smallest size, beside what it holds at the start.
+    fn trace_words(&self) -> usize {
+        let draws = u64::from(self.loss != Loss::NONE) + u64::from(self.jitter_ns != 0);
+        let carried = u128::from(self.peak_rate()) * u128::from(self.end()) / 8_000_000_000;
+        let datagrams =
+            (u64::try_from(carried).unwrap() + self.bytes_one_way()) / SMALLEST_DATAGRAM;
+        usize::try_from(2 * draws * datagrams).unwrap()
+    }
+
     /// The bottleneck's largest rate over the run.
     fn peak_rate(&self) -> u64 {
         self.step.map_or(self.rate_bits_per_second, |(_, rate)| {
@@ -554,7 +565,7 @@ impl Run {
             // The run's own, and each direction of each flow its loss and its delay draws
             streams: 3 * nodes + 1,
             steps: u64::MAX,
-            trace_words: 0,
+            trace_words: scenario.trace_words(),
         };
         let mut world = World::new(source, Discipline::Ordered, limits)?;
         for _ in 0..nodes {

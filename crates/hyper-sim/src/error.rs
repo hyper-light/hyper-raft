@@ -53,6 +53,8 @@ pub enum SimError {
     /// A measured table that is no distribution: its grid not from zero to a million rising, its
     /// values falling, or the two of different lengths (`net::Measured`).
     NotADistribution,
+    /// A loss process in time whose mean burst or mean gap is zero (`net::Loss::bursty_in_time`).
+    NotALossProcess,
     /// A strategy picked a candidate that is not there.
     Pick {
         /// What the strategy picked.
@@ -85,6 +87,9 @@ impl fmt::Display for SimError {
             }
             Self::TraceEnded { at } => write!(f, "the trace ended at word {at}"),
             Self::NotADistribution => f.write_str("a measured table that is no distribution"),
+            Self::NotALossProcess => {
+                f.write_str("a loss process in time with a zero mean burst or gap")
+            }
             Self::Pick { picked, candidates } => {
                 write!(f, "a strategy picked candidate {picked} of {candidates}")
             }

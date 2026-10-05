@@ -235,7 +235,10 @@ hyper-quic, hyper-datagram, hyper-swim and hyper-liveness). A payload states its
 and serialization times apply to both.
 
 Per directed link, the path of focal's `path.rs` (itself slates' `SimPath`): one-way delay with jitter,
-in order or reordering; Gilbert–Elliott loss in parts per million per flow; a bottleneck link with a
+in order or reordering; Gilbert–Elliott loss in parts per million per flow, its chain stepped per
+message or in time (`Loss::bursty_in_time`, whose state after `δ` is the two-state chain's transition
+function in fixed point, so a copy sent with a lost original shares its burst;
+`docs/research/burst-loss.md`); a bottleneck link with a
 drop-tail queue shared by the flows through it; an MTU black hole; a NAT mapping that expires. Added
 from the inventory and the literature:
 - **Duplication** as a re-delivery of a message still held, not a copy (hyper-raft's `keep`), so it adds
@@ -886,7 +889,8 @@ and what was built:
 bands (5% of 100,000 within 4,600 to 5,400). Carried here, each instead replays the draws of the
 stream the network names, in a world of its own on the same seed (a stream's draws depend on the
 seed and the name alone), and requires the network's fate for each message to be the model's by its
-definition: the Gilbert–Elliott process for loss, `one_way − jitter + U[0, 2·jitter]` held behind the
+definition: the Gilbert–Elliott process for loss (per message, and in time from the time since the
+flow's previous message), `one_way − jitter + U[0, 2·jitter]` held behind the
 flow's previous arrival for delay. The rest of focal's tests (the bottleneck, CoDel, ECN marking,
 the NAT, partitions, bounds, accounting) were exact already and are carried as they were. With the
 new pieces' own, 26 tests.

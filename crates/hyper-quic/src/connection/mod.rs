@@ -611,7 +611,11 @@ impl Connection {
                 }
                 _ => self.spaces.get(space).crypto.is_some(),
             };
-            if keys {
+            // The Data space's new data is its streams' as well as its frames': a copy of a
+            // stream's first packet queued while the rest of the stream waits would go first, and
+            // the rest beside it in its last packet
+            let sending = space == SpaceId::Data && self.streams.can_send_stream_data();
+            if keys && !sending {
                 self.spaces.get_mut(space).queue_copies(&mut self.streams);
             }
         }

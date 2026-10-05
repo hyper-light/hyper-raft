@@ -59,6 +59,8 @@ const JITTER: u64 = 100 * MS;
 const SEEDS: std::ops::Range<u64> = 1..33;
 /// What a request and its reply carry.
 const REQUEST: &[u8] = &[0x51; 100];
+/// The most a scenario's request may hold: a request past one 0-RTT packet.
+static LARGE_REQUEST: [u8; 4_096] = [0x51; 4_096];
 const REPLY: &[u8] = &[0x52; 100];
 /// RFC 9000 §18.2's default max_ack_delay, which hyper-quic's endpoints advertise.
 const MAX_ACK_DELAY: u64 = 25 * MS;
@@ -258,6 +260,8 @@ struct Scenario {
     max_incoming: Option<usize>,
     /// The bytes of each reply.
     reply_bytes: usize,
+    /// The bytes of each request, at most [`LARGE_REQUEST`]'s.
+    request_bytes: usize,
     /// Whether the endpoints run Careful Resume (RFC 9959), their default.
     careful_resume: bool,
     /// Whether the first dial runs on a clean path and the later ones on `path`.
@@ -282,6 +286,7 @@ impl Scenario {
             silent: false,
             max_incoming: None,
             reply_bytes: REPLY.len(),
+            request_bytes: REQUEST.len(),
             careful_resume: true,
             clean_first: false,
             copies: true,
@@ -572,7 +577,8 @@ impl Run {
             if ready && self.request.is_none() && dialed.lost.is_none() {
                 let id = connection.streams().open(Dir::Bi).unwrap();
                 let mut stream = connection.send_stream(id);
-                assert_eq!(stream.write(REQUEST).unwrap(), REQUEST.len());
+                let request = &LARGE_REQUEST[..self.scenario.request_bytes];
+                assert_eq!(stream.write(request).unwrap(), request.len());
                 stream.finish().unwrap();
                 self.request = Some(id);
             }
@@ -590,7 +596,8 @@ impl Run {
                     if (dialed.kept.len() as u32) < self.scenario.kept_requests {
                         let id = connection.streams().open(Dir::Bi).unwrap();
                         let mut stream = connection.send_stream(id);
-                        assert_eq!(stream.write(REQUEST).unwrap(), REQUEST.len());
+                        let request = &LARGE_REQUEST[..self.scenario.request_bytes];
+                        assert_eq!(stream.write(request).unwrap(), request.len());
                         stream.finish().unwrap();
                         self.request = Some(id);
                         self.asked_at = now;
@@ -601,7 +608,7 @@ impl Run {
         } else if let Some(id) = self.inbound {
             read_to_end(connection, id, &mut self.asked);
             let total = self.scenario.reply_bytes;
-            if self.asked.len() == REQUEST.len() && self.answered < total {
+            if self.asked.len() == self.scenario.request_bytes && self.answered < total {
                 // Written as the stream's buffer takes it, a large reply over several turns
                 let mut stream = connection.send_stream(id);
                 while self.answered < total {
@@ -1028,6 +1035,50 @@ fn a_lost_first_datagram_costs_no_probe_timeout_with_its_copy() {
     assert_eq!(first.replied, clean.first().replied, "{}", out.timeline());
     assert_eq!(first.lost_packets, 1, "{}", out.timeline());
     assert_eq!(clean.first().lost_packets, 0);
+}
+
+/// A request that spans two 0-RTT packets goes whole before any copy of it: the Data space waits for
+/// its streams as well as its frames before it copies. The copy of the request's first packet was
+/// queued while the rest waited, and the rest, its FIN with it, went behind the copy in the first
+/// flight's last packet, whose loss held the request until a probe.
+#[test]
+fn a_request_goes_whole_before_its_copies() {
+    let pki = Pki::new(0);
+    let scenario = Scenario {
+        dials: 2,
+        early: true,
+        // Past the room the 0-RTT packet beside the ClientHello's second part leaves
+        request_bytes: 650,
+        ..Scenario::clean()
+    };
+    let clean = Run::new(scenario, &pki).run();
+    let resumed = &clean.dialed[1];
+    assert!(resumed.accepted_0rtt);
+    assert_eq!(resumed.replied.unwrap() - resumed.started, RTT);
+    let last = clean
+        .sent
+        .iter()
+        .filter(|s| s.from_client)
+        .enumerate()
+        .filter(|(_, s)| s.at == resumed.started)
+        .map(|(i, _)| i)
+        .last()
+        .unwrap();
+    let out = Run::new(
+        Scenario {
+            drop_client: chosen(vec![last]),
+            ..scenario
+        },
+        &pki,
+    )
+    .run();
+    let resumed = &out.dialed[1];
+    assert_eq!(
+        resumed.replied.unwrap() - resumed.started,
+        RTT,
+        "{}",
+        out.timeline()
+    );
 }
 
 /// Guarantee c: the server acknowledges every duplicate Initial datagram at once (RFC 9000

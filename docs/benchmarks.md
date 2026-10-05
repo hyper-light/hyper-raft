@@ -6704,9 +6704,9 @@ Careful Resume on the clean path (`print_the_resume_table`), the resumed first r
 
 | reply | without, before → after | with Careful Resume, before → after |
 |---|---|---|
-| 512 KiB | 6,631 → 6,498 ms | 5,886 → 5,819 ms |
-| 1 MiB | 7,672 → 7,514 ms | 5,922 → 5,859 ms |
-| 2 MiB | 8,722 → 8,563 ms | 6,038 → 5,956 ms |
+| 512 KiB | 6,631 → 6,558 ms | 5,886 → 5,784 ms |
+| 1 MiB | 7,672 → 7,599 ms | 5,922 → 5,832 ms |
+| 2 MiB | 8,722 → 8,648 ms | 6,038 → 5,945 ms |
 
 The fresh dials fell likewise (7,627 → 7,506, 8,685 → 8,542, 9,741 → 9,607 ms): slow start now
 grows by every acknowledgement of a round trip in which its window was used (§13 item 4).
@@ -6717,7 +6717,8 @@ grows by every acknowledgement of a round trip in which its window was used (§1
 relay's two directions as threads on loopback, 500 ms each way, five dials (the first fresh, the
 rest resumed with a 0-RTT request), then 20,000 requests open loop at 100 a second on the kept
 connection, latencies from each request's scheduled time less 1,000 ms; quantile intervals 95%
-distribution-free. Before and after binaries interleaved, 2026-10-05 01:36–01:57 PDT.
+distribution-free. Before and after binaries interleaved, 2026-10-05 01:36–01:57 PDT; the third pair
+02:32–02:39, after the Data space's copies were made to wait for its streams.
 
 | run | load (before → after the run) | p50 / p99 / p99.9 / max, overhead | worst in the first tenth |
 |---|---|---|---|
@@ -6725,6 +6726,8 @@ distribution-free. Before and after binaries interleaved, 2026-10-05 01:36–01:
 | after 1 | 6.3 → 6.9 | 2.181 / 4.261 / **85.0** [35.0, 151.8] / 251.5 ms | 251.5 ms |
 | before 2 | 6.9 → 7.0 | 2.177 / 4.030 / 155.4 [137.7, 183.8] / 243.4 ms | 243.4 ms |
 | after 2 | 7.0 → 6.6 | 2.183 / 5.296 / **84.6** [42.2, 153.4] / 252.7 ms | 252.7 ms |
+| before 3 | 3.3 → 2.5 | 2.143 / 4.137 / 153.4 [133.7, 182.6] / 242.1 ms | 242.1 ms |
+| after 3 (the final tree) | 2.5 → 3.4 | 2.126 / 3.157 / **85.6** [42.5, 155.6] / 252.2 ms | 252.2 ms |
 
 After a measured warm-up (4,000 requests at 400 a second on dial 1, Careful Resume on):
 

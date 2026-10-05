@@ -586,7 +586,9 @@ before it.
 1. **The handshake's flights go twice** (`TransportConfig::handshake_copies`, on by default;
    `PacketSpace::queue_copies`). Every Initial and Handshake packet, the 0-RTT and 0.5-RTT data sent
    while the handshake runs, and on a connection without 0-RTT the data beside the client's Finished
-   are copied once, in packets of their own numbers, when their space has nothing new to send, under
+   are copied once, in packets of their own numbers, when their space has nothing new to send (the
+   Data space's streams included, so a request is sent whole before any copy of it,
+   `a_request_goes_whole_before_its_copies`), under
    the congestion window, pacing and the anti-amplification limit. A lost original is still declared
    lost and answered (RFC 9265). On the lossy condition the first reply's p90 fell from 1,899 to
    180 ms fresh and from 1,177 to 124 ms resumed, for 73% more bytes there

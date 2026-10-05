@@ -283,7 +283,8 @@ packets of their own numbers:
   round trip into the burst, and its copies took the initial window); copying the data beside the
   Finished on a resumed connection too, 273 ms (the burst's first requests ride with it); the form
   kept, 252 ms, the copy of the Finished itself.
-- **When.** Once a space has nothing new to send, so a copy never goes before new data, and under
+- **When.** Once a space has nothing new to send, its streams' data included in the Data space, so
+  a copy never goes before new data, and under
   the congestion window, pacing and the anti-amplification limit like any packet: every lossy seed
   keeps the limit (`duplicate_initials_are_acknowledged_once_and_grow_the_allowance`).
 - **The congestion signal.** A lost original is still declared lost and answered (RFC 9265); the

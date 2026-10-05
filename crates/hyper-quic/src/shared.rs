@@ -60,9 +60,10 @@ pub(crate) enum EndpointEventInner {
     RetireConnectionId(Instant, u64, bool),
     /// The server sent an address validation token (NEW_TOKEN) for later connections to it
     NewToken { server_name: String, token: Bytes },
-    /// The connection closed with what it measured of its path, for a later connection to the
-    /// same remote to resume from (RFC 9959 §3.1)
-    Observed(crate::connection::Saved),
+    /// What the connection leaves its endpoint's Careful Resume memory for its remote (RFC 9959
+    /// §3.1): a measurement, as its warm-up makes one or as it closes, or at its close what becomes
+    /// of the remote's mark it held
+    Resume(crate::connection::Leaves),
 }
 
 /// Protocol-level identifier for a connection.

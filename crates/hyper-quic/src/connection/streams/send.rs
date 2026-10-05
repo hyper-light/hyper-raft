@@ -151,6 +151,11 @@ impl Send {
         self.pending.offset()
     }
 
+    /// Bytes written and never sent
+    pub(super) fn unsent_bytes(&self) -> u64 {
+        self.pending.unsent_bytes()
+    }
+
     pub(super) fn is_pending(&self) -> bool {
         self.pending.has_unsent_data() || self.fin_pending
     }

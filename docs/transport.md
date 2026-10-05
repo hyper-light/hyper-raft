@@ -596,6 +596,11 @@ the numbers are `docs/benchmarks.md`, "Probe timeouts, tickets and Careful Resum
   Finished (RFC 9001 §5.7). Under bursts the fresh first reply's p90 fell from 2,749 to 394 ms; under
   independent loss it rose from 136 to 317 ms (`crates/hyper-quic/VENDORED.md` §14,
   `docs/research/burst-loss.md`).
+- **The path measured before its first burst** (2026-10-05). An idle connection to a remote with
+  no measurement warms its path up, PING and PADDING under the window and the pacer, until four
+  initial windows are acknowledged in a round trip (RFC 9959 §3.1's floor), so a later burst starts
+  from Careful Resume's jump rather than the initial window; the jump is taken only where it beats
+  slow start (`crates/hyper-quic/VENDORED.md` §15, `docs/research/quic-overhead.md` §5).
 
 ## 5. Consumers
 

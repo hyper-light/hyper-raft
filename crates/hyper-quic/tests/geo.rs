@@ -32,8 +32,9 @@ use bytes::BytesMut;
 use hyper_quic::rustls::RootCertStore;
 use hyper_quic::rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use hyper_quic::{
-    ClientConfig, ClientConfigHandle, Connection, ConnectionHandle, DatagramEvent, Dir, Endpoint,
-    EndpointConfig, Event, ServerConfig, StreamEvent, StreamId, TimeSource, TransportConfig,
+    CarefulResumeConfig, ClientConfig, ClientConfigHandle, Connection, ConnectionHandle,
+    DatagramEvent, Dir, Endpoint, EndpointConfig, Event, ServerConfig, StreamEvent, StreamId,
+    TimeSource, TransportConfig,
 };
 use hyper_sim::net::{Loss, Net, NetLimits, NetStats, Path, Ticket};
 use hyper_sim::{Clock, Discipline, Fifo, Limits, NodeId, Record, Source, Step, World, twice};
@@ -215,6 +216,8 @@ enum Ev {
     Arrive(Ticket),
     /// The client dials (again).
     Dial,
+    /// The client closes the connection that lingered past its reply.
+    Close,
 }
 
 const CLIENT: NodeId = NodeId(0);
@@ -265,10 +268,21 @@ struct Scenario {
     max_incoming: Option<usize>,
     /// The bytes of each reply.
     reply_bytes: usize,
+    /// The bytes of the first dial's reply, where it differs from the others'.
+    first_reply_bytes: Option<usize>,
+    /// The bytes of each reply to a kept connection's later requests, where they differ.
+    kept_reply_bytes: Option<usize>,
+    /// How long a dial's connection stays open, idle, after its last reply before the client
+    /// closes it; zero closes it at once.
+    linger: u64,
     /// The bytes of each request, at most [`LARGE_REQUEST`]'s.
     request_bytes: usize,
     /// Whether the endpoints run Careful Resume (RFC 9959), their default.
     careful_resume: bool,
+    /// Whether a connection with no measurement of its path warms it up while idle
+    /// (`CarefulResumeConfig::warm_up`, the default); off where a check counts the network's
+    /// datagrams of the handshake alone.
+    warm_up: bool,
     /// Whether the first dial runs on a clean path and the later ones on `path`.
     clean_first: bool,
     /// Whether the endpoints send the handshake's flights twice (`TransportConfig::handshake_copies`,
@@ -282,6 +296,16 @@ struct Scenario {
 }
 
 impl Scenario {
+    /// The bytes of the reply on the `dials`th dial, counted from one, to its first request or to
+    /// a `kept` one after it
+    fn reply_len(&self, dials: usize, kept: bool) -> usize {
+        match (kept, self.kept_reply_bytes, dials, self.first_reply_bytes) {
+            (true, Some(kept), _, _) => kept,
+            (_, _, 1, Some(first)) => first,
+            _ => self.reply_bytes,
+        }
+    }
+
     fn clean() -> Self {
         Self {
             path: Path::in_order(ONE_WAY, 0),
@@ -294,8 +318,12 @@ impl Scenario {
             silent: false,
             max_incoming: None,
             reply_bytes: REPLY.len(),
+            first_reply_bytes: None,
+            kept_reply_bytes: None,
+            linger: 0,
             request_bytes: REQUEST.len(),
             careful_resume: true,
+            warm_up: true,
             clean_first: false,
             copies: true,
             copy_burst: None,
@@ -409,6 +437,8 @@ struct Run {
     asked: Vec<u8>,
     /// The bytes of the current reply the server has written
     answered: usize,
+    /// The requests the server has accepted on the current connection
+    served: u32,
     scratch: Vec<u8>,
 }
 
@@ -451,9 +481,9 @@ impl Run {
             Some(bytes)
         };
         let mut endpoint_config = EndpointConfig::default();
-        if !scenario.careful_resume {
-            endpoint_config.careful_resume(None);
-        }
+        let mut resume = CarefulResumeConfig::default();
+        resume.warm_up(scenario.warm_up);
+        endpoint_config.careful_resume(scenario.careful_resume.then_some(resume));
         let mut client = Endpoint::new(endpoint_config.clone(), None, false, rng(CLIENT)).unwrap();
         let mut transport = TransportConfig::default();
         transport.handshake_copies(scenario.copies);
@@ -501,6 +531,7 @@ impl Run {
             inbound: None,
             asked: Vec::new(),
             answered: 0,
+            served: 0,
             scratch: Vec::with_capacity(1_500),
         }
     }
@@ -535,11 +566,22 @@ impl Run {
         self.inbound = None;
         self.asked.clear();
         self.answered = 0;
+        self.served = 0;
         self.wire.server = Amplification::default();
         self.dialed.push(Dialed {
             started: now,
             ..Dialed::default()
         });
+        self.serve(CLIENT);
+    }
+
+    /// The client closes its connection and sends what the close asks
+    fn close_client(&mut self) {
+        let now = self.world.now();
+        if let Some((_, connection)) = &mut self.client.connection {
+            let at = self.epoch + Duration::from_nanos(now);
+            connection.close(at, 0u32.into(), bytes::Bytes::new());
+        }
         self.serve(CLIENT);
     }
 
@@ -561,6 +603,8 @@ impl Run {
                 connection.handle_event(event, side.endpoint.configs_mut());
             }
         }
+        let kept = self.dialed.last().is_some_and(|d| d.replied.is_some());
+        let reply_len = self.scenario.reply_len(self.dialed.len(), kept);
         let dialed = self.dialed.last_mut().unwrap();
         while let Some(event) = connection.poll() {
             match (is_client, event) {
@@ -579,6 +623,7 @@ impl Run {
                         self.inbound = Some(id);
                         self.asked.clear();
                         self.answered = 0;
+                        self.served += 1;
                     }
                 }
                 _ => {}
@@ -596,7 +641,7 @@ impl Run {
             }
             if let Some(id) = self.request {
                 read_to_end(connection, id, &mut self.reply);
-                if self.reply.len() == self.scenario.reply_bytes {
+                if self.reply.len() == reply_len {
                     match dialed.replied {
                         None => {
                             dialed.replied = Some(now);
@@ -619,7 +664,7 @@ impl Run {
             }
         } else if let Some(id) = self.inbound {
             read_to_end(connection, id, &mut self.asked);
-            let total = self.scenario.reply_bytes;
+            let total = self.scenario.reply_len(self.dialed.len(), self.served > 1);
             if self.asked.len() == self.scenario.request_bytes && self.answered < total {
                 // Written as the stream's buffer takes it, a large reply over several turns
                 let mut stream = connection.send_stream(id);
@@ -739,6 +784,9 @@ impl Run {
                     redialing = false;
                     self.dial();
                 }
+                Step::Event {
+                    event: Ev::Close, ..
+                } => self.close_client(),
                 Step::Wake { node } => self.fire(node),
                 Step::Idle | Step::Spent => break,
             }
@@ -751,15 +799,20 @@ impl Run {
                     break;
                 }
                 redialing = true;
-                // The next dial once the last has its reply: the kept state (session ticket,
-                // address validation token) is what a re-dial uses.
+                // The next dial once the last has its reply, and has lingered: the kept state
+                // (session ticket, address validation token) is what a re-dial uses.
                 let now = self.world.now();
-                if let Some((_, connection)) = &mut self.client.connection {
-                    let at = self.epoch + Duration::from_nanos(now);
-                    connection.close(at, 0u32.into(), bytes::Bytes::new());
+                let linger = self.scenario.linger;
+                if linger == 0 {
+                    self.close_client();
+                } else {
+                    self.world
+                        .schedule(now + linger, CLIENT, Ev::Close)
+                        .unwrap();
                 }
-                self.serve(CLIENT);
-                self.world.schedule(now + RTT, CLIENT, Ev::Dial).unwrap();
+                self.world
+                    .schedule(now + linger + RTT, CLIENT, Ev::Dial)
+                    .unwrap();
             }
         }
         // The digest covers every datagram's time, sender and size (`docs/sim.md` §3.9)
@@ -1250,7 +1303,16 @@ fn reordering_alone_costs_no_round_trip() {
     let slowest_round_trip = 2 * (ONE_WAY + JITTER);
     let mut lossless = 0;
     for seed in SEEDS {
-        let out = Run::new(Scenario::lossy(seed), &pki).run();
+        // The seeds whose network lost nothing of the handshake: the warm-up after it would add
+        // datagrams for the loss to fall on
+        let out = Run::new(
+            Scenario {
+                warm_up: false,
+                ..Scenario::lossy(seed)
+            },
+            &pki,
+        )
+        .run();
         if out.stats.dropped_loss != 0 {
             continue;
         }
@@ -1565,6 +1627,70 @@ fn a_resumed_connection_starts_from_half_what_the_last_delivered() {
         reply(&with, 1) / MS,
         reply(&without, 1) / MS
     );
+}
+
+/// An idle connection warms its path up (`CarefulResumeConfig::warm_up`, `docs/research/
+/// quic-overhead.md` §5), each run exact. The first dial carries one small exchange, which never
+/// delivers four initial windows a round trip, and lingers idle; with the warm-up its endpoints
+/// measure the path meanwhile. On the second dial, after a small first exchange, the server answers
+/// a kept request with 24 kB, past its initial window: without a measurement the reply waits a
+/// second round trip on slow start, and with one Careful Resume's jump carries it within the first
+/// (measured: 2,000 ms against 1,259 ms, the floor 1,000 ms). Neither first
+/// reply is moved, and each side's warm-up stays within its budget, four times four initial windows
+/// of the largest datagram (RFC 9000 §14's 1,452-byte ceiling on this path).
+#[test]
+fn an_idle_connection_warms_its_path_up_and_a_later_burst_needs_no_second_round_trip() {
+    let pki = Pki::new(0);
+    let run = |warm_up| {
+        Run::new(
+            Scenario {
+                dials: 2,
+                early: true,
+                kept_requests: 1,
+                kept_reply_bytes: Some(24_000),
+                linger: 20 * RTT,
+                warm_up,
+                ..Scenario::clean()
+            },
+            &pki,
+        )
+        .run()
+    };
+    let (with, without) = (run(true), run(false));
+    let reply = |out: &Outcome, i: usize| {
+        let d = &out.dialed[i];
+        d.replied.unwrap() - d.started
+    };
+    for i in 0..2 {
+        assert_eq!(reply(&with, i), reply(&without, i), "dial {i}");
+    }
+    assert!(with.dialed[1].accepted_0rtt);
+    // Without a measurement the reply's last bytes wait for the first acknowledgements, a second
+    // round trip; with one they go within the first, paced over it as the jump must be (RFC 9959
+    // §3.3), so what is left above the round trip is that pacing
+    let (burst_with, burst_without) = (with.dialed[1].kept[0], without.dialed[1].kept[0]);
+    assert!(
+        burst_without >= 2 * RTT && burst_with < 2 * RTT,
+        "with {} ms, without {} ms",
+        burst_with / MS,
+        burst_without / MS
+    );
+    // Each side's warm-up within its budget: its full-sized datagrams while the first connection
+    // lingered
+    let lingered = with.dialed[0].kept[0]..with.dialed[1].started;
+    let budget = 16 * 10 * 1_452;
+    for from_client in [true, false] {
+        let bytes: usize = with
+            .sent
+            .iter()
+            .filter(|d| d.from_client == from_client && lingered.contains(&d.at) && d.size >= 1_200)
+            .map(|d| d.size)
+            .sum();
+        assert!(
+            bytes > 0 && bytes <= budget,
+            "client {from_client}: {bytes} bytes"
+        );
+    }
 }
 
 /// Careful Resume meeting the lossy condition, each seed exactly: the first dial measures a clean

@@ -356,3 +356,79 @@ is acknowledged.
 its path: about 240 ms at worst for an offered 13.1 kB against 12,000 bytes. Closing it tenfold asks
 for about 13 kB in that round trip, which RFC 9002 §7.2 and §7.7 do not allow without a measurement
 or a larger datagram size, and no standards-track mechanism provides either before the burst.
+
+## 5. Round four: measuring the path before its first burst (2026-10-05)
+
+Round three left the burst on a path no connection has measured at 252 ms worst (§4.2). Every
+standards-track way past the initial window carries a measurement of the path (§1), and a node's
+connections to its peers rarely make one: their exchanges are small, and RFC 9959 §3.1 keeps no
+measurement below four initial windows delivered in a round trip. The sources below were read on
+2026-10-05: RFC 9959 at https://www.rfc-editor.org/rfc/rfc9959.txt, draft-ietf-ccwg-bbr-06 at the
+IETF datatracker.
+
+### 5.1 What RFC 9959 asks of a measurement
+
+- **§3.1**: "If the measured CWND is less than four times the IW, the sender can choose to not save
+  the CC parameters."
+- **§4.1**: "It is inappropriate to use an overshoot in the CWND as a basis for estimating the
+  capacity", and "When the sender is rate limited or in the RTT following a burst of transmission, a
+  sender typically transmits less data than allowed by the CWND. Such observations could be
+  discounted when estimating the saved_cwnd".
+- Nothing in it limits what traffic the measurement is taken from. A measurement is what the path
+  delivered in a round trip while the sender filled its window, which is what slow start from the
+  initial window does with any ack-eliciting packets.
+
+**The packets.** RFC 9000 §14.4 already sends packets for no data of the application's own: PMTU
+probes, "PING and PADDING frames" (§19.1, §19.2), ack-eliciting and counted in flight (RFC 9002
+§2: a packet is in flight when "ack-eliciting or contain[ing] a PADDING frame"). The warm-up's
+packets are the same, a PING padded to the path's MTU, sent under the congestion window and the
+pacer like any packet; one lost is congestion, answered as any loss is, and ends the warm-up.
+
+### 5.2 The design
+
+- **When.** A connection whose endpoint holds no measurement for its remote IP address, and that no
+  other connection to the remote is measuring, warms its path up once the handshake is confirmed
+  (RFC 9001 §4.1.2; before it a server may drop 1-RTT packets, §5.7), and only while idle in both
+  directions: nothing waiting in its streams (one with data waiting carries a transfer that measures
+  the path itself), and no ack-eliciting packet received in the last smoothed round trip (an
+  incoming flight's acknowledgements share the path the warm-up would load; measured, a mebibyte
+  reply at 500 ms one way came 2.8 ms later when the receiver warmed up beside it).
+- **How far.** Until four initial windows are acknowledged in one round trip, §3.1's floor: the
+  least measurement Careful Resume keeps. The measurement goes to the endpoint at once, so a
+  connection made while this one is open resumes from it.
+- **Its bound.** Four times the target, sixteen initial windows: slow start doubles the window a
+  round trip and a round trip's count may straddle two of the sender's rounds, so the target is met
+  for certain once a window of twice it has been sent, and the rounds before carried less than that
+  again (a geometric sum). A warm-up that meets congestion or spends its budget is recorded, and no
+  connection to the remote warms up again until Careful Resume's lifetime has passed: a path the
+  warm-up cannot measure costs one budget a lifetime, not one a connection. A connection closed
+  before or during its warm-up releases the remote for the next.
+- **Round trips by packet number.** The measurement counts what is acknowledged in a round trip, and
+  a round trip is a packet-timed one, as BBR counts them (draft-ietf-ccwg-bbr-06 §5.5.1): it begins
+  at an acknowledgement and ends at the first acknowledgement of a packet sent after it. Counted on
+  the clock by the smoothed RTT, as hyper-quic did before, a round trip shorter than the gap between
+  acknowledgements closed a count at every acknowledgement, and a warm-up on such a path spent its
+  whole budget without a measurement.
+- **The window it uses counts as used.** A warm-up packet sent leaves the sender not limited by the
+  application, and one held back by the window or the pacer leaves the window used (RFC 9002
+  §7.8), so slow start grows the window as it would for data.
+
+### 5.3 The jump, taken only where it gains
+
+The warm-up's measurement is four initial windows, so its jump (§3.3: "no more than half of the
+saved_cwnd") is two. The Unvalidated Phase holds the jumped window for a round trip and paces it
+(§3.3), where slow start would double the window over that round trip. Measured on the geo harness:
+a mebibyte reply resumed from a measurement of 70.8 kB jumped from slow start's 29.8 kB window to
+35.4 kB and came 185 ms later than slow start alone. RFC 9959 §3.2 makes the jump a MAY; it is now
+taken only where it gains: in congestion avoidance whenever it exceeds the window, and in slow start
+when it is at least twice the window (slow start's own window a round trip on), or when everything
+in flight and waiting in the streams fits in it, so the burst ends within the round trip.
+
+### 5.4 Measured
+
+The numbers are `docs/benchmarks.md`, "Measuring the path before its first burst". What is left,
+and why: a burst that starts as the first connection to a new peer completes, before any idle
+round trip, still meets the initial window (RFC 9002 §7.2), which no standard lets a sender exceed
+without a measurement; and a jumped window is paced over its round trip (RFC 9959 §3.3), the MUST
+that leaves a burst larger than the application's own pacing a share of a round trip above the
+floor.

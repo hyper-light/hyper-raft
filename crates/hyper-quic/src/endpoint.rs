@@ -26,7 +26,9 @@ use crate::{
         ClientConfig, ClientConfigHandle, ConfigKey, Configs, ConfigsFull, EndpointConfig,
         ServerConfig, ServerConfigHandle,
     },
-    connection::{CarefulResume, CongestionMemory, Connection, ConnectionError, Saved, SideArgs},
+    connection::{
+        CarefulResume, CongestionMemory, Connection, ConnectionError, Grant, Leaves, SideArgs,
+    },
     crypto::{self, Keys, UnsupportedVersion},
     frame,
     packet::{
@@ -256,7 +258,7 @@ impl Endpoint {
             NewToken { server_name, token } => {
                 self.token_store.insert(&server_name, token);
             }
-            Observed(saved) => self.remember(ch, saved),
+            Resume(leaves) => self.remember(ch, leaves),
             Drained => {
                 if let Some(conn) = self.connections.try_remove(ch.0) {
                     self.index.remove(&conn);
@@ -274,10 +276,17 @@ impl Endpoint {
 
     /// Keeps what connection `ch` measured of its path for the next connection to its remote
     /// (Careful Resume, RFC 9959 §3.1)
-    fn remember(&mut self, ch: ConnectionHandle, saved: Saved) {
-        if let Some(meta) = self.connections.get(ch.0) {
-            self.congestion_memory
-                .put(meta.addresses.remote.ip(), saved);
+    /// What connection `ch` leaves the Careful Resume memory for its remote
+    fn remember(&mut self, ch: ConnectionHandle, leaves: Leaves) {
+        let Some(meta) = self.connections.get(ch.0) else {
+            return;
+        };
+        let remote = meta.addresses.remote.ip();
+        match leaves {
+            Leaves::Keep(saved) => self.congestion_memory.put(remote, saved),
+            Leaves::Tried(since) => self.congestion_memory.tried(remote, since),
+            Leaves::Release => self.congestion_memory.release(remote),
+            Leaves::Nothing => {}
         }
     }
 
@@ -1413,8 +1422,10 @@ impl Endpoint {
                 self.congestion_memory
                     .take(addresses.remote.ip(), now, config.lifetime),
                 config.max_jump,
+                config.warm_up,
+                now,
             ),
-            None => CarefulResume::new(None, 0),
+            None => CarefulResume::new(Grant::Neither, 0, false, now),
         };
         let conn = Connection::new(
             self.config.grease_quic_bit,

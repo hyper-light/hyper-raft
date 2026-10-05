@@ -645,3 +645,41 @@ Measured on hyper-sim's burst-loss model in time (`docs/research/burst-loss.md`;
    reordering tolerance"), and a request that overtook the client's Finished went again after a
    probe timeout (`a_1rtt_packet_before_the_finished_is_held_until_the_handshake_completes`;
    upstream's `handshake_1rtt_handling` now finds nothing lost).
+
+## 15. The path's warm-up for Careful Resume (2026-10-05)
+
+`connection/resume.rs`, `Connection::warm_up`; the decision and its sources are
+`docs/research/quic-overhead.md` §5.
+
+1. **An idle connection measures its path** (`CarefulResumeConfig::warm_up`, on by default). The
+   endpoint's memory now gives a new connection a `Grant`: a measurement to resume from, the right
+   to measure the path (no measurement held and no other connection measuring it), or neither. A
+   connection given the right sends, once its handshake is confirmed and while idle in both
+   directions (nothing waiting in its streams, no ack-eliciting packet received in the last
+   smoothed round trip), PING frames padded to the path's MTU under the window and the pacer, until
+   four initial windows are acknowledged in one round trip, congestion is met, or sixteen initial
+   windows are spent. Its measurement goes to the endpoint as it is made
+   (`EndpointEventInner::Resume`). A warm-up that fails holds its remote for the lifetime; a
+   connection that closes before or during its warm-up releases it. Tests:
+   `an_idle_connection_warms_its_path_up_and_a_later_burst_needs_no_second_round_trip` (geo, exact:
+   a 24 kB reply on a kept connection 2,000 ms without, 1,259 ms with, the floor 1,000 ms; each
+   side's warm-up within its budget), and the memory's and the warm-up's rules in
+   `connection::resume::tests`.
+2. **A round trip's delivery is counted by packet number** (`Observer`): from an acknowledgement to
+   the first acknowledgement of a packet sent after it, as BBR counts its rounds
+   (draft-ietf-ccwg-bbr-06 §5.5.1). Counted on the clock by the smoothed RTT, a path whose round
+   trip was below the gap between acknowledgements never saw a window's worth delivered
+   (`a_round_trip_is_counted_by_packet_numbers_whatever_the_clock`).
+3. **The jump is taken only where it gains** (`CarefulResume::on_window_blocked`): in slow start
+   only if it is at least twice the window or the bytes in flight and waiting in the streams fit
+   in it. A jump between the two held the window a round trip where slow start doubled it, and a
+   resumed mebibyte came 185 ms later
+   (`a_jump_below_twice_the_window_is_taken_only_for_a_burst_that_fits_it`).
+4. **The warm-up waits for the handshake's confirmation.** Sent from the client's 1-RTT keys, its
+   packets went beside the client's Finished, where a server not yet holding the Finished may drop
+   them (RFC 9001 §5.7); `handshake_1rtt_handling` caught it.
+
+The unit tests that pin another mechanism's exact traffic (ACK frequency, window growth after an
+unused window) run with the warm-up off (`endpoint_config_without_warm_up`): the in-memory pair's
+clock moves only to the next timer, so its pacer never refills and a warm-up there spends its
+budget. The MTU discovery test keeps it on and counts its PINGs apart.

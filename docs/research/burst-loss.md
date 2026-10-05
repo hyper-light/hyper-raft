@@ -249,33 +249,89 @@ which is the direction its copies travel.
 **The liveness stream.** hyper-liveness's per-pair heartbeats come at a fixed interval, Bolot's own
 probe design, but they do not fit the boundary yet. A receiver sees gaps in the heartbeats'
 sequence numbers, and a gap is either a loss or a slot the sender skipped while it was behind
-(`PairReport::skipped`, known only at the sender). A heartbeat would have to carry its sender's
-skipped count before the receiver could count losses. Even then, hyper-quic would take the
-resulting fit as a value its owner passes in, never a dependency. Not built: the change is to
-hyper-liveness's wire format, outside this step, and §8 shows the QUIC evidence alone suffices
-once a path has carried traffic.
+(`PairReport::skipped`, known only at the sender). Not built in this round. The proposal:
+- **Field.** `skipped` (8 bytes, little-endian, after `flush_age`): the slots the sender has
+  skipped in this run, all told. A receiver that takes heartbeats `a` then `b` of one run knows
+  that `b.seq − a.seq − 1 − (b.skipped − a.skipped)` heartbeats between them were sent and lost,
+  and `b.sent − a.sent` is the gap. Each lost heartbeat followed by a delivered one is one
+  neighbour pair, its gap the interval. A run of losses yields the lost-after-lost pairs at the same
+  spacing.
+- **Size.** The head grows from 75 to 83 bytes (`HEAD_BYTES` = 2 + 10·8 + 1), and `MAX_BYTES` from
+  99 to 107.
+- **Version.** `codec::VERSION` 2 → 3. A version 2 heartbeat is refused as `BadVersion`, never
+  misread, as version 1 is now; nodes upgrade together, which the pair's restart order already
+  allows.
+- **The fit.** hyper-liveness would count the pairs per peer at its stream's interval: `(gap,
+  lost-after-lost, delivered-after-lost, lost, delivered)`. Its owner would pass the counts to
+  hyper-quic through a call that takes them for a remote address, which adds them to the
+  `LossMemory` evidence as a connection's would. hyper-quic takes a value; it never depends on
+  hyper-liveness.
 
 ## 8. Measured (2026-10-05)
 
-`print_the_burst_table` over 128 seeds (32 left the p90 of a cliff-shaped distribution to chance).
-The "two dials before" rows run two dials of 256 KiB each way first, with Careful Resume off so
-only the copies' spacing differs between rows. First reply over its floor, p90 of the fresh dial /
-p90 of the resumed dial, ms:
+`print_the_burst_table`, each condition over the 32 seeds of the earlier sections and over 128
+(32 left the p90 of a cliff-shaped distribution to chance). The "two dials before" rows run two
+dials of 256 KiB each way first, with Careful Resume off so only the copies' spacing differs between
+rows. The table is the final tree's: copies aligned to their originals and the first reply copied
+(§9). First reply over its floor, p90 of the fresh dial / p90 of the resumed dial, ms, at 128 seeds,
+with 32 seeds in brackets:
 
 | condition | back to back | spaced 35 ms | spaced as learned |
 |---|---|---|---|
-| independent, no dial before: fresh / resumed | 221 / 130 | 998 / 228 | 998 / 228 (nothing to learn from) |
-| independent, two dials before: fresh / resumed | 734 / 150 | 986 / 266 | 1,032 / **122** |
-| bursts 35 ms, two dials before: fresh / resumed | 1,917 / 165 | 3,200 / 235 | 3,200 / 235 |
-| bursts 78.7 ms, two dials before: fresh / resumed | 2,891 / 2,628 | 1,089 / 272 | 1,089 / 272 |
+| independent, no dial before | 112 / 122 (97 / 135) | 331 / 293 (236 / 332) | the same as spaced: nothing to learn from |
+| independent, two dials before | 96 / 80 (2 / 76) | 297 / 290 (1,038 / 257) | **143 / 136** (84 / 149) |
+| bursts 35 ms, no dial before | 1,911 / 127 (1,967 / 80) | 283 / 187 (237 / 137) | the same as spaced |
+| bursts 35 ms, two dials before | 2,599 / 2,778 (3,356 / 132) | 131 / 246 (112 / 155) | 131 / 246 (112 / 155) |
+| bursts 78.7 ms, no dial before | 1,910 / 164 (1,945 / 127) | 300 / 227 (237 / 189) | the same as spaced |
+| bursts 78.7 ms, two dials before | 1,550 / 1,819 (828 / 3,060) | 87 / 260 (126 / 236) | 87 / 260 (126 / 236) |
 
-- **Independent loss, resumed dial:** learning takes the p90 from 266 to 122 ms, back to the
-  back-to-back copies' 150 ms. Both endpoints' evidence settled on independence in 12 of the 16
-  seeds examined, and one of the two in the other four.
-- **Independent loss, fresh dial:** no gain at p90. After the learning dials, every variant's fresh
-  dial (734 to 1,032 ms) sits at the one-probe-timeout cliff in a tenth of the seeds, so the cliff
-  sets the p90, not the spacing.
+- **Independent loss, two dials before:** learning takes the fresh p90 from 297 to 143 ms and the
+  resumed from 290 to 136 ms, within 50 ms of back to back (96 / 80). Both endpoints' evidence
+  settled on independence in 12 of the 16 seeds examined, and one of the two endpoints' in the
+  other four.
 - **Bursts:** the learned rows equal the 35 ms rows exactly. The evidence never left the default,
-  so learning costs nothing where losses come in bursts.
-- **Without a dial before**, nothing is learned, since handshake packets are not counted, and the
-  rows equal the 35 ms ones.
+  so learning costs nothing where losses come in bursts. Back to back is worse there, by up to 2.6 s
+  at p90.
+- **Without a dial before**, nothing is learned (handshake packets are not counted) and the rows
+  equal the 35 ms ones.
+- **The shift between 32 and 128 seeds** is the cliff of §9 before its fix, and sampling after it.
+  With 32 seeds the fresh dial's p90 is the 29th value; at 128 it is the 116th. Before the fixes of
+  §9, the independent back-to-back fresh p90 was 136 ms at 32 seeds and 221 ms at 128.
+
+## 9. The fresh dial's cliff, traced (2026-10-05)
+
+Before §9's fixes, at 128 seeds every variant's fresh p90 sat about one probe timeout up: 221 ms
+back to back on independent loss, 998 ms spaced, against 136 and 317 ms at 32 seeds. The seeds at
+and above p90 (back to back, independent loss), packet by packet:
+
+- **Copies packed across their originals (seeds 47 and others).** The ClientHello went as Initial 0
+  `CRYPTO [0, 1141)` and Initial 1 `[1141, 1928)`. Its copies, queued together, went as Initial 2
+  `[1141, 1928)` with `[0, 349)`, then Initial 3 `[349, 1141)`: the retransmission queue merged both
+  originals' frames and packed them anew. With Initial 1 and Initial 2 lost, the server held
+  `[0, 1141)` and `[349, 1141)`: part two had no copy left, and the dial waited the client's probe
+  timeout. One lost copy removed coverage from both halves.
+  **Fix:** a space copies one original at a time, so each copy is a packet of that original's frames
+  alone (`PacketSpace::queue_copies`; test `each_copy_carries_its_originals_frames_alone`).
+- **The first reply was never copied (seeds 77, 106, 67, 26, 90).** The server's reply goes as its
+  handshake completes, in the Data space. It was not of the handshake's flights. Lost, it waited
+  the server's probe timeout: the dial's last round trip.
+  **Fix:** what a space sends from the handshake's completion until the peer acknowledges a packet
+  of it, the application's first round trip, is copied as the handshake's flights are
+  (`application_from`; test `a_lost_first_reply_comes_by_its_copy`). The copies stay under the
+  window, the pacer and the amplification limit, and a lost original is declared and answered.
+- **What remains after both fixes.** Back-to-back, independent loss, 128 seeds: 7 of 128 fresh dials
+  still wait a probe timeout.
+  - *An original and its copy both lost* (seed 125). Each pair is lost together with probability
+    0.25%. A fresh dial with the large certificate has about twenty pairs, so this happens in about
+    5% of dials, which a repetition code cannot help.
+  - *A copy held by the congestion window* (seeds 68, 59, 85, 7). The large certificate's flight
+    (about 20 KB) is past the initial window, so the copies of its later datagrams wait for
+    acknowledgements to free the window, which come a round trip later, no sooner than the probe.
+    RFC 9002 §7: "An endpoint MUST NOT send a packet if it would cause bytes_in_flight ... to be
+    larger than the congestion window"; §7.2's initial window of ten datagrams binds.
+  - *A copy held by the anti-amplification limit* (seeds 106, 90). A lost datagram of the server's
+    first flight, sent to the limit before the client's address is validated, can have no copy until
+    the client's next bytes arrive. RFC 9000 §8: "an endpoint MUST limit the amount of data it
+    sends to the unvalidated address to three times the amount of data received from that address".
+  - The kInitialRtt-based probe of the Initial space fired early in some of them (999 ms against a
+    1 s round trip), but it carried no loss elsewhere and delayed nothing.

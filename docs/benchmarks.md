@@ -7088,24 +7088,26 @@ such owners passed every other test.
 
 ## hyper-quic at 500 ms one way: the copies' spacing learned per path (2026-10-05)
 
-`crates/hyper-quic/VENDORED.md` §15; research and the full table in
-`docs/research/burst-loss.md` §8. `print_the_burst_table`, 128 seeds, virtual time, exact.
-Load 7.5 to 9.7 while it ran (`uptime` before and after), machine as above. With two dials of
-256 KiB each way before the measured ones and Careful Resume off, first reply over its floor,
-p90 of the fresh dial / p90 of the resumed dial, ms:
+`crates/hyper-quic/VENDORED.md` §16; research, the full table and the fresh dial's cliff traced in
+`docs/research/burst-loss.md` §8–§9. `print_the_burst_table`, virtual time, exact. Load 15 to 18
+while it ran (`uptime` before and after); machine as above. First reply over its floor, p90 of the
+fresh dial / p90 of the resumed dial, ms, at 128 seeds (32 seeds in brackets):
 
-| condition | copies back to back | spaced 35 ms | spaced as learned |
+| condition | back to back | spaced 35 ms | spaced as learned |
 |---|---|---|---|
-| independent 5% | 734 / 150 | 986 / 266 | 1,032 / **122** |
-| bursts τ 35 ms | 1,917 / 165 | 3,200 / 235 | 3,200 / 235 |
-| bursts τ 78.7 ms | 2,891 / 2,628 | 1,089 / 272 | 1,089 / 272 |
+| independent 5%, no dial before | 112 / 122 (97 / 135) | 331 / 293 (236 / 332) | as spaced |
+| independent 5%, two dials before | 96 / 80 (2 / 76) | 297 / 290 (1,038 / 257) | **143 / 136** (84 / 149) |
+| bursts τ 35 ms, no dial before | 1,911 / 127 (1,967 / 80) | 283 / 187 (237 / 137) | as spaced |
+| bursts τ 35 ms, two dials before | 2,599 / 2,778 (3,356 / 132) | 131 / 246 (112 / 155) | 131 / 246 |
+| bursts τ 78.7 ms, no dial before | 1,910 / 164 (1,945 / 127) | 300 / 227 (237 / 189) | as spaced |
+| bursts τ 78.7 ms, two dials before | 1,550 / 1,819 (828 / 3,060) | 87 / 260 (126 / 236) | 87 / 260 |
 
-- Over 128 seeds with no dial before, the independent condition's p90s are 221 / 130 back to back
-  and 998 / 228 spaced. The 32 seeds of the earlier sections gave 136 / 108 and 317 / 235; the
-  fresh dial's distribution has a cliff at one probe timeout, and its p90 falls on either side of
-  it by the seeds drawn.
-- What learning did not reach: the fresh dial's p90 on independent loss. Its cliff after the
-  learning dials is common to every spacing.
+- **The fresh dial's cliff is gone.** Before §15's copy alignment and first-reply copies, every
+  variant's fresh p90 at 128 seeds sat a probe timeout up (independent: 221 ms back to back, 998 ms
+  spaced, against 136 and 317 ms at 32 seeds).
+- **What still waits a probe timeout**, 7 of 128 back-to-back fresh dials on independent loss: an
+  original and its copy both lost; or a copy held by the congestion window (RFC 9002 §7) or the
+  anti-amplification limit (RFC 9000 §8), under the large certificate's flight.
 
 ```sh
 cargo test --release -p hyper-quic --test geo -- --ignored --nocapture --exact print_the_burst_table

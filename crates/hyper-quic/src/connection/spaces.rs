@@ -188,7 +188,7 @@ impl PacketSpace {
         spacing: Duration,
         sending: bool,
     ) -> Option<Instant> {
-        let ready = !sending && self.loss_probes == 0 && self.pending.is_empty(streams);
+        let mut ready = !sending && self.loss_probes == 0 && self.pending.is_empty(streams);
         let mut queued = false;
         let mut waiting: Option<Instant> = None;
         for packet in self.sent_packets.values_mut() {
@@ -221,6 +221,12 @@ impl PacketSpace {
                 streams.retransmit(frame.clone());
             }
             queued = true;
+            // One original at a time, so its copy is a packet of its own frames alone. Queued
+            // together, the retransmission queue merges their frames and packs them anew: a
+            // ClientHello in two packets went as [1141, 1928) with [0, 349), then [349, 1141), so
+            // one lost copy left both halves without theirs. The next original is copied once this
+            // copy is sent, at the next transmission.
+            ready = false;
         }
         self.sending_copies |= queued;
         waiting

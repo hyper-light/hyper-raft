@@ -219,10 +219,20 @@ impl PacketBuilder {
         // Of the handshake's flights: an Initial or Handshake packet, one sent while this endpoint
         // handshakes (0-RTT and 0.5-RTT data), or, on a connection without 0-RTT, one beside the
         // client's Finished: the application's first data, which could go no sooner. With 0-RTT
-        // that data went in it, and what goes beside the Finished is the traffic after.
+        // that data went in it, and what goes beside the Finished is the traffic after. And the
+        // application's first round trip: what this space sends from the handshake's completion
+        // until the peer acknowledges a packet of it. A server's first reply goes then, the dial's
+        // last round trip; lost, it waited a probe timeout (`docs/research/burst-loss.md` §9).
+        let first_round = conn.application_from.is_some_and(|from| {
+            conn.spaces
+                .get(space_id)
+                .largest_acked_packet
+                .is_none_or(|acked| acked < from)
+        });
         let handshake_flight = space_id != SpaceId::Data
             || conn.state.is_handshake()
-            || (conn.handshake_datagram && !conn.zero_rtt_enabled);
+            || (conn.handshake_datagram && !conn.zero_rtt_enabled)
+            || first_round;
         let packet = SentPacket {
             path_generation: conn.path.generation(),
             largest_acked: sent.largest_acked,

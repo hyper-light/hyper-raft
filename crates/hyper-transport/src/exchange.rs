@@ -264,6 +264,8 @@ pub(crate) struct Exchange<K> {
     pub(crate) active: bool,
     /// Its index in its connection's list of exchanges.
     pub(crate) at: usize,
+    /// The due time its connection's deadline heap holds for it, if any (`tally::Table`).
+    pub(crate) deadline: Option<Instant>,
     pub(crate) began: Instant,
     /// Whether the peer's message has begun (a reply's prefix and head arrived).
     pub(crate) answered: bool,

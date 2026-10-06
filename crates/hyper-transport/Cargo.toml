@@ -25,6 +25,8 @@ oracle = []
 # The tests run with the oracle compiled in (src/tally.rs).
 hyper-transport = { path = ".", features = ["oracle"] }
 hyper-measure = { path = "../hyper-measure" }
+# The deadline heap's model test (src/deadlines.rs).
+proptest.workspace = true
 # Tests that need an Instant epoch take it from simulated time's one anchor, not the host clock
 # (docs/sim.md §3.2, §12.6).
 hyper-sim = { path = "../hyper-sim" }

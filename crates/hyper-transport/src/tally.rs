@@ -25,8 +25,11 @@
 //! the folds it replaced and counts any difference (`Endpoint::oracle_mismatches`); the
 //! test harness switches every endpoint it builds to it.
 
+use std::time::Instant;
+
 use crate::Refusal;
 use crate::arena::Arena;
+use crate::deadlines;
 use crate::exchange::{Exchange, Out};
 
 /// One exchange's share of its connection's sums, as it was last counted.
@@ -145,6 +148,14 @@ pub(crate) struct Table<K> {
     actives: Vec<Vec<(u64, u64)>>,
     /// The order the next exchange made takes.
     next_order: u64,
+    /// Indexed by the connection's key: a binary min-heap of (due, id), one entry for each
+    /// exchange whose wait has a due time (src/deadlines.rs).
+    deadlines: Vec<Vec<(Instant, u64)>>,
+    /// Each exchange's index in its connection's heap, by arena slot: sized to the bound once.
+    positions: Vec<Option<usize>>,
+    /// The frontier of a walk of a deadline heap: at most the heap's entries, so at most the
+    /// exchange bound, reserved once.
+    walk: Vec<usize>,
     /// Settles that found the sums by recounting (the non-vacuity counter for the oracle).
     #[cfg(feature = "oracle")]
     settled: u64,
@@ -160,6 +171,9 @@ impl<K> Table<K> {
             ranks,
             actives: Vec::new(),
             next_order: 0,
+            deadlines: Vec::new(),
+            positions: vec![None; capacity],
+            walk: Vec::with_capacity(capacity),
             #[cfg(feature = "oracle")]
             settled: 0,
         }
@@ -189,6 +203,9 @@ impl<K> Table<K> {
         if let Some(tally) = self.tallies.get_mut(exchange.connection) {
             tally.sub(exchange.counted);
         }
+        if let Some(heap) = self.deadlines.get_mut(exchange.connection) {
+            deadlines::remove(heap, &mut self.positions, id);
+        }
         if exchange.active
             && let Some(active) = self.actives.get_mut(exchange.connection)
             && let Ok(at) = active.binary_search(&(exchange.order, id))
@@ -203,6 +220,24 @@ impl<K> Table<K> {
     pub(crate) fn place(&mut self, id: u64, at: usize) {
         if let Some(exchange) = self.arena.get_mut(id) {
             exchange.at = at;
+        }
+    }
+
+    /// The exchanges of connection `key` whose wait is due at `now`, settled, in the order they
+    /// were made, appended to `into`. The heap walk stops below any entry not yet due, so it costs
+    /// the due entries and the entries bordering them, not the connection's exchanges.
+    pub(crate) fn due(&mut self, key: usize, now: Instant, into: &mut Vec<u64>) {
+        self.settle();
+        let start = into.len();
+        let Some(heap) = self.deadlines.get(key) else {
+            return;
+        };
+        deadlines::due(heap, now, &mut self.walk, into);
+        let arena = &self.arena;
+        if let Some(found) = into.get_mut(start..) {
+            found.sort_unstable_by_key(|id| {
+                arena.get(*id).map_or(u64::MAX, |exchange| exchange.order)
+            });
         }
     }
 
@@ -266,7 +301,6 @@ impl<K> Table<K> {
     /// Recounts every touched exchange, moving its old share out of its connection's sums and its
     /// new one in.
     pub(crate) fn settle(&mut self) {
-        let ranks = self.ranks;
         let mut touched = std::mem::take(&mut self.touched);
         for id in touched.drain(..) {
             let Some(exchange) = self.arena.get_mut(id) else {
@@ -275,40 +309,71 @@ impl<K> Table<K> {
             exchange.touched = false;
             let key = exchange.connection;
             let visited = visits(exchange);
-            if visited != exchange.active {
-                exchange.active = visited;
-                if self.actives.len() <= key {
-                    self.actives.resize_with(key.saturating_add(1), Vec::new);
-                }
-                if let Some(active) = self.actives.get_mut(key) {
-                    let entry = (exchange.order, id);
-                    match (visited, active.binary_search(&entry)) {
-                        (true, Err(at)) => active.insert(at, entry),
-                        (false, Ok(at)) => {
-                            active.remove(at);
-                        }
-                        _ => {}
-                    }
-                }
-            }
+            let revisit = (visited != exchange.active).then_some(exchange.order);
+            exchange.active = visited;
+            let due = exchange.carry.due();
+            let deadline = due != exchange.deadline;
+            exchange.deadline = due;
             let share = Counted::of(exchange);
-            if share == exchange.counted {
-                continue;
+            if let Some(order) = revisit {
+                self.revisit(key, (order, id), visited);
             }
-            let before = std::mem::replace(&mut exchange.counted, share);
-            if self.tallies.len() <= key {
-                self.tallies
-                    .resize_with(key.saturating_add(1), || Tally::new(ranks));
+            if deadline {
+                self.redeadline(key, id, due);
             }
-            if let Some(tally) = self.tallies.get_mut(key) {
-                tally.sub(before);
-                tally.add(share);
-            }
+            self.recount(key, id, share);
         }
         self.touched = touched;
         #[cfg(feature = "oracle")]
         {
             self.settled = self.settled.saturating_add(1);
+        }
+    }
+
+    /// Puts `entry` (order, id) into connection `key`'s visit set, or takes it out.
+    fn revisit(&mut self, key: usize, entry: (u64, u64), visited: bool) {
+        if self.actives.len() <= key {
+            self.actives.resize_with(key.saturating_add(1), Vec::new);
+        }
+        let Some(active) = self.actives.get_mut(key) else {
+            return;
+        };
+        match (visited, active.binary_search(&entry)) {
+            (true, Err(at)) => active.insert(at, entry),
+            (false, Ok(at)) => {
+                active.remove(at);
+            }
+            _ => {}
+        }
+    }
+
+    /// Moves exchange `id`'s entry in connection `key`'s deadline heap to `due`.
+    fn redeadline(&mut self, key: usize, id: u64, due: Option<Instant>) {
+        if self.deadlines.len() <= key {
+            self.deadlines.resize_with(key.saturating_add(1), Vec::new);
+        }
+        if let Some(heap) = self.deadlines.get_mut(key) {
+            deadlines::set(heap, &mut self.positions, id, due);
+        }
+    }
+
+    /// Moves exchange `id`'s counted share in connection `key`'s sums to `share`.
+    fn recount(&mut self, key: usize, id: u64, share: Counted) {
+        let Some(exchange) = self.arena.get_mut(id) else {
+            return;
+        };
+        if share == exchange.counted {
+            return;
+        }
+        let before = std::mem::replace(&mut exchange.counted, share);
+        let ranks = self.ranks;
+        if self.tallies.len() <= key {
+            self.tallies
+                .resize_with(key.saturating_add(1), || Tally::new(ranks));
+        }
+        if let Some(tally) = self.tallies.get_mut(key) {
+            tally.sub(before);
+            tally.add(share);
         }
     }
 

@@ -1456,6 +1456,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
             order: 0,
             active: false,
             at: 0,
+            deadline: None,
             connection: key,
             peer,
             stream: Some(stream),
@@ -1823,6 +1824,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
             order: 0,
             active: false,
             at: 0,
+            deadline: None,
             connection: key,
             peer,
             stream: None,
@@ -1936,6 +1938,26 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
             .collect();
         expected.sort_unstable();
         if !expected.iter().map(|(_, id)| id).eq(visited.iter()) {
+            self.mismatches = self.mismatches.saturating_add(1);
+        }
+    }
+
+    /// With the oracle on, counts a due set differing from the exchanges of `conn` whose wait is
+    /// due at `now`, in the order they were made.
+    #[cfg(feature = "oracle")]
+    fn check_due(&mut self, conn: &Conn<C::Role>, now: Instant, due: &[u64]) {
+        if !self.oracle {
+            return;
+        }
+        let mut expected: Vec<(u64, u64)> = conn
+            .exchanges
+            .iter()
+            .filter_map(|id| self.exchanges.get(*id).map(|exchange| (exchange, *id)))
+            .filter(|(exchange, _)| exchange.carry.due().is_some_and(|at| at <= now))
+            .map(|(exchange, id)| (exchange.order, id))
+            .collect();
+        expected.sort_unstable();
+        if !expected.iter().map(|(_, id)| id).eq(due.iter()) {
             self.mismatches = self.mismatches.saturating_add(1);
         }
     }
@@ -2303,7 +2325,11 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
             self.wake(conn, *id);
         }
         ids.clear();
-        ids.extend_from_slice(&conn.exchanges);
+        // Only the exchanges whose wait is due, from the connection's deadline heap, in the order
+        // they were made: `judge` does nothing for any other.
+        self.exchanges.due(conn.key, now, &mut ids);
+        #[cfg(feature = "oracle")]
+        self.check_due(conn, now, &ids);
         for id in &ids {
             self.judge(now, conn, *id);
         }

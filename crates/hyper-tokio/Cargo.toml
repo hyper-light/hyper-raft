@@ -7,6 +7,11 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+# hyper-transport's scheduling-core oracle (its src/tally.rs). The transport's test harness, which
+# these tests share, checks it where this feature is on; it is off here unless asked for.
+oracle = ["hyper-transport/oracle"]
+
 [dependencies]
 hyper-transport = { path = "../hyper-transport" }
 hyper-datagram = { path = "../hyper-datagram" }

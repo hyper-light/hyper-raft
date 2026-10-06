@@ -278,6 +278,12 @@ pub trait Drive {
     fn fire(&mut self, now: Instant);
     /// The driver measured its timer granularity: what has a use for it takes it.
     fn granularity(&mut self, _granularity: Duration) {}
+    /// What the scheduling core read that differed from its fold, with the oracle on
+    /// (hyper-transport src/tally.rs); a driver without one has none.
+    #[cfg(feature = "oracle")]
+    fn mismatches(&self) -> u64 {
+        0
+    }
 }
 
 impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Drive for Endpoint<C, B, D> {
@@ -292,6 +298,10 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Drive for En
     }
     fn fire(&mut self, now: Instant) {
         self.handle_timeout(now);
+    }
+    #[cfg(feature = "oracle")]
+    fn mismatches(&self) -> u64 {
+        self.oracle_mismatches()
     }
     fn granularity(&mut self, granularity: Duration) {
         self.set_granularity(granularity);
@@ -451,6 +461,18 @@ impl<A: Drive, B: Drive> Net<A, B> {
         panic!("the network never went quiet");
     }
 
+    /// Neither node's scheduling core read anything that differed from the fold it replaced
+    /// (hyper-transport src/tally.rs): checked whenever a run's condition holds.
+    fn oracle_holds(&self) {
+        #[cfg(feature = "oracle")]
+        for (side, mismatches) in [("a", self.a.mismatches()), ("b", self.b.mismatches())] {
+            assert_eq!(
+                mismatches, 0,
+                "node {side}: the core read something that differed from its fold"
+            );
+        }
+    }
+
     /// Moves the world's clock to the caller's instant `to`, which nothing in flight precedes.
     fn move_to(&mut self, to: Instant) {
         let at = u64::try_from(to.saturating_duration_since(self.start).as_nanos()).unwrap();
@@ -508,10 +530,12 @@ impl<A: Drive, B: Drive> Net<A, B> {
         for _ in 0..turns {
             self.exchange();
             if done(self) {
+                self.oracle_holds();
                 return;
             }
             if !self.exchange() && !self.advance() {
                 if done(self) {
+                    self.oracle_holds();
                     return;
                 }
                 panic!("nothing is left to happen");

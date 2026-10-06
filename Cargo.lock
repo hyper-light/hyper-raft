@@ -942,6 +942,7 @@ dependencies = [
  "hyper-sim",
  "hyper-timing",
  "hyper-transport",
+ "proptest",
  "rcgen",
  "thiserror 2.0.20",
 ]

@@ -36,6 +36,7 @@ mod admission;
 mod arena;
 mod budget;
 mod credit;
+mod deadlines;
 mod endpoint;
 mod error;
 mod exchange;

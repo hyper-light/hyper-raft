@@ -52,6 +52,7 @@
 mod attribution;
 pub mod blocking;
 mod cells;
+pub mod combine;
 pub mod control;
 pub mod dns;
 pub mod driver;

@@ -44,6 +44,7 @@ mod lane;
 mod progress;
 mod receive;
 mod round;
+mod tally;
 mod timing;
 pub mod tls;
 

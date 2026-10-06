@@ -941,6 +941,7 @@ dependencies = [
  "hyper-quic",
  "hyper-sim",
  "hyper-timing",
+ "hyper-transport",
  "rcgen",
  "thiserror 2.0.20",
 ]

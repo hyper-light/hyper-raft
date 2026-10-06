@@ -253,6 +253,10 @@ pub(crate) struct Exchange<K> {
     /// For an exchange queued for a stream, the connection's last credit-queue advance its wait was last judged on
     /// (policy C): a further advance restarts its wait; none for a whole period refuses it as stalled.
     pub(crate) credit_seen: Option<Instant>,
+    /// Its share of its connection's sums as last counted (`tally::Table::settle`).
+    pub(crate) counted: crate::tally::Counted,
+    /// It changed since its share was last counted: it is in the table's touched list.
+    pub(crate) touched: bool,
     pub(crate) began: Instant,
     /// Whether the peer's message has begun (a reply's prefix and head arrived).
     pub(crate) answered: bool,

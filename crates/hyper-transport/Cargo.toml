@@ -16,7 +16,14 @@ bytes = "1"
 crc32c.workspace = true
 thiserror.workspace = true
 
+[features]
+# Compares the scheduling core's running sums with the folds they replaced, on an endpoint switched
+# to it (`Endpoint::set_oracle`); the tests switch every endpoint they build, the benches none.
+oracle = []
+
 [dev-dependencies]
+# The tests run with the oracle compiled in (src/tally.rs).
+hyper-transport = { path = ".", features = ["oracle"] }
 hyper-measure = { path = "../hyper-measure" }
 # Tests that need an Instant epoch take it from simulated time's one anchor, not the host clock
 # (docs/sim.md §3.2, §12.6).

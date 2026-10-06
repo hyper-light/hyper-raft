@@ -67,6 +67,11 @@ where
         budget,
         now,
     );
+    // Every running sum the scheduling core reads is checked against the fold it replaced
+    // (src/tally.rs); `run` asserts none differed.
+    let (mut a, mut b) = (a, b);
+    a.set_oracle(true);
+    b.set_oracle(true);
     let mut net = Net::of(now, a, b, source);
     let address = net.b_address;
     net.a.connect(now, 2, address).unwrap();
@@ -104,6 +109,23 @@ fn run(net: &mut Net<Node<Mantle>, Node<Mantle>>, asker: &mut Asker, server: &mu
         asker.drive(&mut net.a);
         asker.finished()
     });
+    sums_agree_with_their_folds(net);
+}
+
+/// The scheduling core's running sums (src/tally.rs) equal, at every read, the folds over the
+/// connection's exchanges they replaced; the settle counter moving is the non-vacuity check.
+fn sums_agree_with_their_folds(net: &Net<Node<Mantle>, Node<Mantle>>) {
+    for (side, node) in [("asker", &net.a), ("server", &net.b)] {
+        assert_eq!(
+            node.oracle_mismatches(),
+            0,
+            "{side}: a running sum differed from its fold"
+        );
+        assert!(
+            node.oracle_settles() > 0,
+            "{side}: the sums were never read"
+        );
+    }
 }
 
 /// The run-twice check (docs/sim.md §3.9): two nodes connect on the zero path to one digest from

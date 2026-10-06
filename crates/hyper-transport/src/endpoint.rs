@@ -37,7 +37,6 @@ use hyper_quic::{
 };
 
 use crate::admission::{Admission, AdmissionLimits, AdmissionStats};
-use crate::arena::Arena;
 use crate::budget::{Budget, Lane, Reservation};
 use crate::credit::{
     K_GRANULARITY, MIN_DATAGRAM, Window, class_reserve, initial_window, stream_window_ceiling,
@@ -47,6 +46,7 @@ use crate::frame::{PREFIX_BYTES, Prefix};
 use crate::lane::{LaneIn, LaneOut, OPENER_BYTES, Reading, opened};
 use crate::progress::{Carry, Delivered, Moved, Progress};
 use crate::receive::Receive;
+use crate::tally::{Table, Tally};
 use crate::timing::PeerTiming;
 use crate::tls::{self, Credentials};
 use crate::{Classes, Directory, Epoch, Event, ExchangeId, PeerId, Refusal};
@@ -361,7 +361,13 @@ struct Core<C: Classes, B, D> {
     /// The deadline an exchange a peer opened is judged by.
     serve: Progress,
     admission: Admission,
-    exchanges: Arena<Exchange<C::Class>>,
+    exchanges: Table<C::Class>,
+    /// Whether every settled sum is compared with the fold it replaced (`oracle` feature).
+    #[cfg(feature = "oracle")]
+    oracle: bool,
+    /// Settled sums that differed from their fold.
+    #[cfg(feature = "oracle")]
+    mismatches: u64,
     /// The events the owner has not polled, at most [`Limits::event_bound`].
     events: VecDeque<Waiting<C>>,
     peers: Vec<PeerEntry<C::Role>>,
@@ -429,7 +435,11 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
                 limits,
                 serve: Progress::new(limits.serve_period)?,
                 admission: Admission::new(limits.admission)?,
-                exchanges: Arena::new(limits.exchanges),
+                exchanges: Table::new(limits.exchanges, C::RANKS),
+                #[cfg(feature = "oracle")]
+                oracle: false,
+                #[cfg(feature = "oracle")]
+                mismatches: 0,
                 events: VecDeque::new(),
                 peers: Vec::with_capacity(peers),
                 now,
@@ -839,6 +849,26 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
     pub fn connection_stats(&self, peer: PeerId) -> Option<hyper_quic::ConnectionStats> {
         let key = self.core.connection_of(peer)?;
         Some(self.conns.get(key)?.as_ref()?.quic.stats())
+    }
+
+    /// Compares every running sum the scheduling core reads with the fold over the connection's
+    /// exchanges it replaced (src/tally.rs), counting differences in [`Self::oracle_mismatches`].
+    /// A test switch: the fold is what the sums exist to avoid.
+    #[cfg(feature = "oracle")]
+    pub fn set_oracle(&mut self, on: bool) {
+        self.core.oracle = on;
+    }
+
+    /// Running sums that differed from their fold while the oracle was on.
+    #[cfg(feature = "oracle")]
+    pub fn oracle_mismatches(&self) -> u64 {
+        self.core.mismatches
+    }
+
+    /// How many times the running sums were settled: the oracle's non-vacuity counter.
+    #[cfg(feature = "oracle")]
+    pub fn oracle_settles(&self) -> u64 {
+        self.core.exchanges.settled()
     }
 
     /// What the endpoint holds and what it refused.
@@ -1419,6 +1449,8 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
         carry.answering(now, moved(conn, 0), length(PREFIX_BYTES), backlog);
         let exchange = Exchange {
             credit_seen: None,
+            counted: crate::tally::Counted::default(),
+            touched: false,
             connection: key,
             peer,
             stream: Some(stream),
@@ -1780,6 +1812,8 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
         out.has_body = body.is_some();
         let exchange = Exchange {
             credit_seen: None,
+            counted: crate::tally::Counted::default(),
+            touched: false,
             connection: key,
             peer,
             stream: None,
@@ -1842,25 +1876,46 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
     }
 
     /// What the exchanges on `conn` have to send.
-    fn held(&self, conn: &Conn<C::Role>) -> u64 {
-        conn.exchanges
-            .iter()
-            .filter_map(|id| self.exchanges.get(*id))
-            .fold(0u64, |held, exchange| {
-                held.saturating_add(exchange.out.pending())
-            })
+    fn held(&mut self, conn: &Conn<C::Role>) -> u64 {
+        let held = self.exchanges.tally(conn.key).map_or(0, Tally::held);
+        #[cfg(feature = "oracle")]
+        self.check(held, |core| {
+            conn.exchanges
+                .iter()
+                .filter_map(|id| core.exchanges.get(*id))
+                .fold(0u64, |held, exchange| {
+                    held.saturating_add(exchange.out.pending())
+                })
+        });
+        held
     }
 
     /// What the peer has declared on `conn` and not yet delivered, of the classes of `rank` and
     /// the less urgent ones: what the answering wait of a class of `rank` may come after.
-    fn backlog(&self, conn: &Conn<C::Role>, rank: u8) -> u64 {
-        conn.exchanges
-            .iter()
-            .filter_map(|id| self.exchanges.get(*id))
-            .filter(|exchange| exchange.rank >= rank)
-            .fold(0u64, |owed, exchange| {
-                owed.saturating_add(exchange.incoming.owed())
-            })
+    fn backlog(&mut self, conn: &Conn<C::Role>, rank: u8) -> u64 {
+        let owed = self
+            .exchanges
+            .tally(conn.key)
+            .map_or(0, |tally| tally.owed_from(rank));
+        #[cfg(feature = "oracle")]
+        self.check(owed, |core| {
+            conn.exchanges
+                .iter()
+                .filter_map(|id| core.exchanges.get(*id))
+                .filter(|exchange| exchange.rank >= rank)
+                .fold(0u64, |owed, exchange| {
+                    owed.saturating_add(exchange.incoming.owed())
+                })
+        });
+        owed
+    }
+
+    /// With the oracle on, counts `tallied` differing from what `fold` finds over every exchange.
+    #[cfg(feature = "oracle")]
+    fn check(&mut self, tallied: u64, fold: impl FnOnce(&Self) -> u64) {
+        if self.oracle && fold(self) != tallied {
+            self.mismatches = self.mismatches.saturating_add(1);
+        }
     }
 
     /// Give exchange `id` a stream if it has none and one is free, then write what it can.
@@ -1895,15 +1950,21 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
     /// earlier rule counted a more urgent exchange as waiting only once its owner had been refused
     /// a write, so an owner that wrote its bulk body first took the credit its requests were about
     /// to need (`requests_behind_a_bulk_body_take_credit_first_from_a_slow_owner`).
-    fn demand_above(&self, conn: &Conn<C::Role>, rank: u8) -> u64 {
-        let exchanges = conn
+    fn demand_above(&mut self, conn: &Conn<C::Role>, rank: u8) -> u64 {
+        let exchanges = self
             .exchanges
-            .iter()
-            .filter_map(|id| self.exchanges.get(*id))
-            .filter(|exchange| exchange.rank < rank && exchange.stream.is_some())
-            .fold(0u64, |sum, exchange| {
-                sum.saturating_add(exchange.out.pending())
-            });
+            .tally(conn.key)
+            .map_or(0, |tally| tally.streamed_above(rank));
+        #[cfg(feature = "oracle")]
+        self.check(exchanges, |core| {
+            conn.exchanges
+                .iter()
+                .filter_map(|id| core.exchanges.get(*id))
+                .filter(|exchange| exchange.rank < rank && exchange.stream.is_some())
+                .fold(0u64, |sum, exchange| {
+                    sum.saturating_add(exchange.out.pending())
+                })
+        });
         conn.lanes_out
             .iter()
             .flat_map(|lane| {
@@ -1925,7 +1986,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
 
     /// The credit a class of `rank` may take on `conn` now: what QUIC would take, less the reserve
     /// for the classes above and less what those classes still have to send.
-    fn allowed(&self, conn: &mut Conn<C::Role>, rank: u8) -> u64 {
+    fn allowed(&mut self, conn: &mut Conn<C::Role>, rank: u8) -> u64 {
         let demand = self.demand_above(conn, rank);
         credit(&mut conn.quic, rank).saturating_sub(demand)
     }

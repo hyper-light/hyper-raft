@@ -328,10 +328,15 @@ On all three OSes, IPv4 and IPv6: `TcpListener::bind(addr, backlog)`, `accept`, 
 - **Reads into the caller's buffer.** `read(&mut [u8])` and `read_vectored(&mut [IoSliceMut])` read
   straight into slices the caller owns, with no allocation in the runtime, so a request body streams into
   hyper-block's aligned buffers (mantle's S3 listener). Nothing on the read path copies.
-- **Accepting on every shard.** On Linux and macOS each shard binds its own listener with
-  `SO_REUSEPORT` and the kernel spreads connections among them. Windows has no equivalent, so one acceptor
-  shard accepts and hands each accepted socket to the least-loaded shard (the one with the fewest live
-  connections) by message, the socket moving as its owned handle. The connection budget is process-wide:
+- **Accepting on every shard** (`tcp::serve`). On Linux each shard binds its own listener with
+  `SO_REUSEPORT` and the kernel spreads connections among them by a hash of their addresses. macOS has
+  `SO_REUSEPORT` with BSD's meaning, which does not balance (measured: 32 of 32 connections on the last of
+  four listeners bound; XNU has no `SO_REUSEPORT_LB`), and Windows has none, so on both one acceptor shard
+  accepts and hands each accepted socket to the least-loaded shard (the fewest open connections, counted
+  per shard on process-wide cells) by spawn request, the socket moving as its owned handle and the handler's
+  future made on the target, so it need not be `Send`. Handlers run detached. An accept loop that runs out
+  of descriptors waits for one of its own connections to close; with none open it stops and records the
+  error (`Serving::ended`), a descriptor limit below the process's need being configuration, not a wait. The connection budget is process-wide:
   one atomic count every shard's accept checks and takes from before serving.
 - **TLS composes on top.** hyper-tls is sans-I/O; a TLS session over a `TcpStream` is the session's bytes
   read into and written from the stream's buffers. An end-to-end test runs a TLS 1.3 HTTP/1.1 exchange
@@ -360,8 +365,8 @@ On all three OSes, IPv4 and IPv6: `TcpListener::bind(addr, backlog)`, `accept`, 
   vectored reads and writes, the options above read back, `ConnectionBudget` on a process-wide cell
   (wait-free take; a slot travels with its stream through `into_parts`), `bind_shared` (`SO_REUSEPORT`).
   `tests/tcp.rs` and `tests/tcp_streams.rs` pass on macOS and Linux 6.12; Windows is clippy-checked, its
-  run owed to the Windows lanes. **Owed**: the per-shard accept (a listener per shard on Unix, the Windows
-  acceptor handoff to the least-loaded shard) and the TLS composition test.
+  run owed to the Windows lanes. `tcp::serve` done the same day (`tests/tcp_serve.rs`, macOS
+  and Linux). **Owed**: the TLS composition test.
 
 ### 5.3 Local stream sockets and the peer's identity
 

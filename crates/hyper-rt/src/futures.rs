@@ -59,6 +59,13 @@ pub fn spawn<F: Future<Output = ()> + 'static>(future: F) -> Result<TaskId, RtEr
         .ok_or(RtError::NotOnShardThread)?
 }
 
+/// Spawns a detached task on the current shard: nobody joins it, and its slot is freed when it ends (a
+/// server's per-connection task).
+pub fn spawn_detached<F: Future<Output = ()> + 'static>(future: F) -> Result<TaskId, RtError> {
+    registry::with_current(|ctx| ctx.spawn_detached(boxed(future)))
+        .ok_or(RtError::NotOnShardThread)?
+}
+
 /// Spawns a joinable child of the current task; a parent's completion cancels and joins it.
 pub fn spawn_child<F: Future<Output = ()> + 'static>(future: F) -> Result<TaskId, RtError> {
     registry::with_current(|ctx| {

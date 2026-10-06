@@ -24,7 +24,14 @@
 //! client sees as a reset). The budget is process-wide: every shard's listener may share one, and a slot
 //! returns when its stream drops, wherever that is.
 //!
+//! **Accepting on every shard** is [`serve`]: a listener per shard with `SO_REUSEPORT` on Linux and macOS,
+//! and on Windows, which has no equivalent, one acceptor handing each connection to the least-loaded shard.
+//!
 //! TCP is host-local here: it has no simulated fabric and runs on a real runtime.
+
+mod serve;
+
+pub use serve::{Serving, serve};
 
 use std::io::{IoSlice, IoSliceMut};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -55,10 +62,12 @@ pub struct ConnectionBudget {
     max: u64,
 }
 
-/// One connection's place in a [`ConnectionBudget`], given back when dropped.
+/// One connection's place in a [`ConnectionBudget`], and in its shard's count when [`serve`] accepted it;
+/// both given back when dropped, wherever the stream went.
 #[derive(Debug)]
 pub struct ConnectionSlot {
-    cell: CellRef,
+    global: Option<CellRef>,
+    local: Option<CellRef>,
 }
 
 impl ConnectionBudget {
@@ -78,7 +87,10 @@ impl ConnectionBudget {
             return None;
         }
         self.cell.retain();
-        Some(ConnectionSlot { cell: self.cell })
+        Some(ConnectionSlot {
+            global: Some(self.cell),
+            local: None,
+        })
     }
 
     /// Connections open now.
@@ -112,10 +124,15 @@ impl Drop for ConnectionBudget {
 
 impl Drop for ConnectionSlot {
     fn drop(&mut self) {
-        if let Some(cell) = self.cell.cell() {
-            cell.state.fetch_sub(1, Ordering::AcqRel);
+        if let Some(global) = self.global {
+            if let Some(cell) = global.cell() {
+                cell.state.fetch_sub(1, Ordering::AcqRel);
+            }
+            global.release();
         }
-        self.cell.release();
+        if let Some(local) = self.local {
+            serve::returned(local);
+        }
     }
 }
 
@@ -271,6 +288,20 @@ impl TcpStream {
     /// accepted one.
     pub fn from_owned(owned: OwnedStream) -> Result<TcpStream, RtError> {
         Self::from_parts(owned, None)
+    }
+
+    /// Counts the stream in its shard's `local` cell ([`serve`]), given back with its slot.
+    pub(crate) fn count_in(&mut self, local: CellRef) {
+        serve::counted(local);
+        match &mut self.slot {
+            Some(slot) => slot.local = Some(local),
+            None => {
+                self.slot = Some(ConnectionSlot {
+                    global: None,
+                    local: Some(local),
+                });
+            }
+        }
     }
 
     /// Adopts a socket and the budget slot it moved with.

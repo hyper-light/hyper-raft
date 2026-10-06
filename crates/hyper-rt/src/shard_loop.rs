@@ -316,7 +316,16 @@ impl Shard {
         c
     }
 
-    /// Live tasks.
+    /// Tasks not yet terminal (a finished one waiting for its joiner is not counted).
+    pub fn running_tasks(&self) -> usize {
+        self.desk
+            .tasks
+            .iter()
+            .filter(|cell| cell.phase.get() == Phase::Live)
+            .count()
+    }
+
+    /// Occupied task slots: running tasks and finished ones waiting for a joiner.
     pub fn live_tasks(&self) -> usize {
         self.desk
             .tasks
@@ -698,7 +707,9 @@ impl Shard {
             self.poll_slot(slot);
             self.apply();
         }
-        let exit = self.core.shutting_down && self.live_tasks() == 0;
+        // Running tasks, not occupied slots: a finished task that waits for a joiner holds its slot, and after
+        // shutdown nobody joins it, so waiting on it would never end (found by `tcp::serve`'s handlers).
+        let exit = self.core.shutting_down && self.running_tasks() == 0;
         if exit {
             self.core.exited = true;
             registry::note_arena_generation(self.desk.id, self.core.generation_high);

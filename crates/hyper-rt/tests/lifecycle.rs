@@ -102,6 +102,40 @@ fn a_runtime_dropped_without_shutdown_stops_and_joins_its_workers() {
     again.shutdown().unwrap();
 }
 
+/// Found by `tcp::serve`: a task that spawned a joinable task and ended left that task finished and never
+/// joined, holding its slot, and shutdown waited for every slot to be free, so it never returned. Do: on
+/// every shard, a task spawns a joinable task that ends at once, and neither is joined; then shut down on
+/// another thread. Expect: the shutdown returns within the bound.
+#[test]
+fn a_finished_task_nobody_joins_does_not_hold_shutdown() {
+    let _serial = serial();
+    let runtime = Runtime::start(&config()).unwrap();
+    let (spawned, told) = channel();
+    for id in runtime.shard_ids() {
+        let spawned = spawned.clone();
+        runtime
+            .spawn_on(*id, async move {
+                let _ = spawned.send(hyper_rt::futures::spawn(async {}).is_ok());
+            })
+            .unwrap();
+    }
+    for _ in runtime.shard_ids() {
+        assert!(
+            told.recv_timeout(STOP_WAIT).unwrap(),
+            "the joinable task spawned"
+        );
+    }
+    let (stopped, stop) = channel();
+    let stopper = std::thread::spawn(move || {
+        let _ = stopped.send(runtime.shutdown().is_ok());
+    });
+    assert!(
+        stop.recv_timeout(STOP_WAIT).expect("shutdown returned"),
+        "shutdown succeeded"
+    );
+    stopper.join().unwrap();
+}
+
 /// The slots a runtime of this configuration gets when nothing else holds any: the baseline a failed start
 /// must leave intact.
 fn baseline_slots() -> Vec<hyper_rt::shard::ShardId> {

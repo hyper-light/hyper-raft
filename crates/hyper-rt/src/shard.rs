@@ -430,6 +430,15 @@ impl ShardContext {
         })
     }
 
+    /// Spawns a detached task on this shard: nobody joins it, and its slot is freed when it ends.
+    pub fn spawn_detached(&self, future: BoxedFuture) -> Result<TaskId, RtError> {
+        self.claim(Incoming {
+            future,
+            parent: None,
+            joinable: false,
+        })
+    }
+
     /// Claims a free slot for `incoming` and asks the loop to install it.
     pub(crate) fn claim(&self, incoming: Incoming) -> Result<TaskId, RtError> {
         let capacity = self.tasks.len();

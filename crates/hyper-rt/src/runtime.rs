@@ -348,14 +348,11 @@ fn run_worker(
 /// and every slot still given back).
 fn stop(workers: Vec<Worker>) -> Result<Vec<Counters>, RtError> {
     for worker in &workers {
-        // A full control channel refuses the message; the shard drains its channel as it runs, so the send is
-        // retried until it lands or the shard is gone. Before 2026-09-17 the refusal was dropped, and the join
-        // then waited for a shutdown the shard never received (`tests/admission.rs`).
-        while let Err(RtError::ControlFull { .. }) =
-            registry::send_control(worker.id, Control::Shutdown)
-        {
-            std::thread::yield_now();
-        }
+        // The stop takes no slot of the bounded control channel, so a full channel cannot hold it back and
+        // nothing here waits (§15 item 9: the send used to be retried with `yield_now`, unbounded). Before
+        // 2026-09-17 a refused Shutdown was dropped and the join waited for good (`tests/admission.rs`).
+        // `ShardGone`: the shard's slot is already free, and the join below reports how its thread ended.
+        let _ = registry::request_stop(worker.id);
     }
     let ids: Vec<u16> = workers.iter().map(|worker| worker.id).collect();
     let mut counters = Vec::with_capacity(workers.len());

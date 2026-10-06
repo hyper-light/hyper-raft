@@ -241,14 +241,32 @@ fn a_submission_pinned_to_a_holder_is_refused_once_its_slot_is_reused() {
     second.shutdown().unwrap();
 }
 
-/// A shutdown whose message first meets a full control channel still lands and completes: the send
-/// is retried as the shard drains. Before 2026-09-17 the refusal was dropped and the join never
-/// returned.
+/// docs/runtime.md §15 item 9 (mantle's review): stopping never waits for room in the control channel.
+/// Do: hold the shard inside one poll until it sees its stop requested, fill its control channel
+/// behind the hold, and shut the runtime down. Expect: the stop is requested while the channel is still
+/// full (the held shard drains nothing), the hold ends on it, and the shutdown completes. A stop that
+/// needed a channel slot never got one here: the hold waits for the stop, the slot for the hold.
+/// Before 2026-09-17 a refused Shutdown was dropped and the join never returned; until 2026-10-06 the
+/// send was retried with `yield_now`, unbounded.
 #[test]
 fn a_shutdown_lands_against_a_full_control_channel() {
     let rt = Runtime::start(&config(ARENA)).unwrap();
     let shard = rt.shard_ids()[0];
-    hold(&rt, shard);
+    let receipt = rt
+        .spawn_on_with_receipt(shard, async move {
+            let stopping = || {
+                registry::with_entry(shard.0, |entry| entry.stop.load(Ordering::Acquire))
+                    .unwrap_or(true)
+            };
+            while !stopping() {
+                std::hint::spin_loop();
+            }
+        })
+        .unwrap();
+    assert!(
+        matches!(receipt.wait(WAIT), Some(Admission::Admitted(_))),
+        "the hold is admitted"
+    );
     let mut queued = 0;
     loop {
         match rt.spawn_on(shard, async {}) {
@@ -258,12 +276,6 @@ fn a_shutdown_lands_against_a_full_control_channel() {
         }
     }
     assert!(queued >= 1, "the channel filled behind the hold");
-    let (done_tx, done_rx) = channel();
-    std::thread::spawn(move || {
-        rt.shutdown().unwrap();
-        let _ = done_tx.send(());
-    });
-    done_rx
-        .recv_timeout(WAIT)
-        .expect("the shutdown completed although its message first met a full control channel");
+    rt.shutdown()
+        .expect("the shutdown completed although the control channel was full when it was asked");
 }

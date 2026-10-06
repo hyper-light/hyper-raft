@@ -959,6 +959,12 @@ impl Shard {
             // docs/bugs/2026-09-17-control-drain-forgets-a-burst-past-one-batch.md).
             entry.control_pending.rearm();
         }
+        // The runtime's stop, after this batch's messages: a Shutdown at the back of the batch that took no
+        // channel slot (`registry::request_stop`). Messages drained later are refused as at any shutdown.
+        if entry.stop.load(std::sync::atomic::Ordering::Acquire) && !self.core.shutting_down {
+            self.handle_control(Control::Shutdown);
+            return true;
+        }
         drained > 0
     }
 

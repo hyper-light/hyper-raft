@@ -59,6 +59,11 @@ pub struct Entry {
     /// Set by a sender, cleared by the shard once the channel is drained: the shard polls the
     /// channel only when this says something was sent, one atomic load per step otherwise.
     pub control_pending: crate::parking::ControlFlag,
+    /// Set by the runtime's stop ([`request_stop`]), read by the shard's next control drain: a shutdown
+    /// that takes no slot of the bounded control channel, so stopping never waits for the channel to have
+    /// room (docs/runtime.md §15 item 9, closed 2026-10-06; it used to retry a full channel with
+    /// `yield_now` and no bound).
+    pub stop: AtomicBool,
     /// The generational kick that wakes this registration's driver.
     pub kick: Kick,
     /// The kick descriptor, closed after the owning contexts and foreign borrows end (Unix).
@@ -379,6 +384,7 @@ pub(crate) fn register_slot(
             control,
             generation_base: slot.arena_generation.load(Ordering::Acquire),
             control_pending: crate::parking::ControlFlag::new(),
+            stop: AtomicBool::new(false),
             kick: Kick::None,
             #[cfg(unix)]
             kick_fd: None,
@@ -653,6 +659,19 @@ pub(crate) fn count_stale(target: u16) {
 pub fn send_control(target: u16, message: Control) -> Result<(), RtError> {
     with_entry(target, |entry| send_control_to(entry, target, message))
         .ok_or(RtError::ShardGone { shard: target })?
+}
+
+/// Asks shard `target` to shut down without a control-channel slot: sets its stop flag, then publishes
+/// the control mark and kicks it as a message would, so a parked shard wakes and its next drain applies
+/// the stop after the messages it drains in that batch. Never waits. `ShardGone` for a free slot.
+pub(crate) fn request_stop(target: u16) -> Result<(), RtError> {
+    with_entry(target, |entry| {
+        // The flag before the mark: the drain that takes the mark (AcqRel) then sees the flag.
+        entry.stop.store(true, Ordering::Release);
+        entry.control_pending.publish();
+        entry.parking.kick_if_parked(|| entry.kick.kick());
+    })
+    .ok_or(RtError::ShardGone { shard: target })
 }
 
 /// The send itself, on a counted entry (see [`send_control`]).

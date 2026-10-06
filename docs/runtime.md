@@ -696,8 +696,11 @@ thread. §12's row runs both drivers the same way.
    (spin hits, CPU, p99 under load).
    And why a shard that makes no system call while spinning sees 10–13 µs scheduling gaps that a kick's
    syscall seems to close (slates, inferred): the mechanism, measured, before kick-if-parked is kept.
-9. `Runtime`'s `stop` retries a full control channel with `yield_now` and no counted bound (slates'
-   shape): the shard drains as it runs, but the loop's end rests on that, not on a count.
+9. Closed 2026-10-06 (mantle's review): `Runtime`'s `stop` retried a full control channel with
+   `yield_now` and no counted bound (slates' shape). The stop is now a flag on the shard's registry entry
+   (`registry::request_stop`), published and kicked like a message but taking no channel slot; the shard's
+   next drain applies it after that batch. `tests/admission.rs` holds the shard until it sees the stop,
+   with the channel full: the old send never found room and hung.
 10. The calibration record's key and its age bound for focal's short commands (§10.2): what a stale record
    costs (a mis-sized spin) against what a fresh one costs (the probes' budget per command).
 

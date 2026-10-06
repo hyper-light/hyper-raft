@@ -24,7 +24,7 @@
 //! refuses a datagram, whose acknowledgements every connection's loss detection needs (RFC 9002
 //! §6).
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::marker::PhantomData;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
@@ -226,6 +226,12 @@ struct Conn<R> {
     epoch: Epoch,
     /// Its exchanges, oldest first.
     exchanges: Vec<u64>,
+    /// Its exchanges with a stream, by that stream: what a stream event is matched to in one lookup. It was a scan of
+    /// `exchanges` with an arena lookup each, per event, so a connection with hundreds of exchanges open paid hundreds
+    /// of lookups per readable stream (slates measured the same shape in its fetch worker, 2026-10-05: a 64 MiB pull
+    /// of 1,024 chunks did not finish in 9 minutes of CPU until each turn visited only the exchanges that moved).
+    /// Bounded by `exchanges`.
+    by_stream: BTreeMap<StreamId, u64>,
     lanes_out: Vec<LaneOut>,
     lanes_in: Vec<LaneIn>,
     window: Window,
@@ -929,6 +935,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
             exchanges: Vec::with_capacity(
                 usize::try_from(limits.streams_per_connection).unwrap_or(0),
             ),
+            by_stream: BTreeMap::new(),
             lanes_out: Vec::new(),
             lanes_in: Vec::new(),
             window: Window::new(initial, limits.window_ceiling),
@@ -1371,7 +1378,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
     }
 
     fn exchange_on(&self, conn: &Conn<C::Role>, stream: StreamId) -> Option<u64> {
-        conn.exchanges.iter().copied().find(|id| {
+        conn.by_stream.get(&stream).copied().filter(|id| {
             self.exchanges
                 .get(*id)
                 .is_some_and(|exchange| exchange.stream == Some(stream))
@@ -1422,6 +1429,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
         match self.exchanges.insert(exchange) {
             Ok(id) => {
                 conn.exchanges.push(id);
+                conn.by_stream.insert(stream, id);
                 self.read_exchange(now, conn, id);
             }
             Err(refusal) => {
@@ -1851,6 +1859,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
                 return;
             };
             exchange.stream = Some(stream);
+            conn.by_stream.insert(stream, id);
             let _ = conn
                 .quic
                 .send_stream(stream)
@@ -2094,6 +2103,9 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
             return;
         };
         conn.exchanges.retain(|held| *held != id);
+        if let Some(stream) = exchange.stream {
+            conn.by_stream.remove(&stream);
+        }
         let code = failure
             .map_or(Refusal::Closed, |(refusal, _)| refusal)
             .code();

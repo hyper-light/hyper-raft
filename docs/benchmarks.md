@@ -7021,3 +7021,41 @@ Getting to the limit found three things, fixed before this baseline:
 - The bench left the ended exchange's last events unpolled. A removed exchange holds its seat
   until they are polled, so at the limit the next `open` was refused `Exchanges`. The bench now
   drains both sides.
+
+### After: per-exchange work independent of the open exchanges
+
+Three changes, each measured on its own (same bench and host; load 70-87, shared machine, one
+run each; the shape, not the last microsecond, is the result):
+
+1. **Running sums** (`src/tally.rs`): what each connection's exchanges hold, send and are owed,
+   by rank, settled from the exchanges touched since the last read. 1,023 open: 55.5 ms → 1.07 ms.
+2. **Visit sets**: a pass visits only the exchanges that `start` or `wake` can move, and an
+   exchange leaves its connection's list in constant time. 1,023: 1.07 ms → 136 µs.
+3. **Deadline heap** (`src/deadlines.rs`): a pass judges only the exchanges whose wait is due.
+   1,023: 136 µs → 21 µs.
+
+| Open beside it | Allocations | Bytes | Baseline | (1) sums | (1)+(2) visits | (1)+(2)+(3) heap |
+|---|---|---|---|---|---|---|
+| 1 | 12.86 | 2396 | 5.0 µs | 5.5 µs | 4.6 µs | 3.9 µs |
+| 16 | 12.84 | 2393 | 10.1 µs | 10.0 µs | 4.7 µs | 3.9 µs |
+| 64 | 12.80 | 2385 | 91.6 µs | 45.2 µs | 5.3 µs | 4.6 µs |
+| 128 | 12.74 | 2374 | 390.6 µs | 81.8 µs | 13.5 µs | 3.9 µs |
+| 256 | 12.60 | 2350 | 1428.8 µs | 148.9 µs | 17.6 µs | 5.1 µs |
+| 512 | 12.35 | 2390 | 6011.9 µs | 293.5 µs | 32.1 µs | 4.0 µs |
+| 1023 | 13.44 | 2562 | 55477.2 µs | 1074.8 µs | 136.2 µs | 21.1 µs |
+
+From 1 to 512 open an exchange costs 3.9-6.1 µs with every change in, flat within the load's
+noise. Allocations and bytes are the baseline's at every row: none of the three allocates per
+exchange (the touched list, the visit sets and the heap's walk are reserved; a connection's visit
+set and heap grow only to their high-water mark). At 1,023 the connection's 1,024 streams are all
+in use, so every stream an exchange frees is announced at once (hyper-quic VENDORED.md §16): one
+more frame, one more allocation and 170 more bytes an exchange, which the baseline row shows too.
+
+Correctness: with the `oracle` feature (on in the tests only, switched per endpoint), every sum,
+visit set and due set the core reads is compared with the fold over the connection's exchanges it
+replaced, and `Net::until` asserts no difference wherever a run's condition holds. Mutations that
+drop a touch mark or leave an ended exchange in the heap fail it. The heap also has its own model
+test against a map (moved, cleared and early-ended deadlines), which catches a moved deadline left
+unkeyed, a mutation the integration oracle did not see. A new test holds that an owner refused a
+write finishes on `Writable` alone; nothing tested `Writable` before, and a visit set that skipped
+such owners passed every other test.

@@ -23,18 +23,13 @@
     clippy::missing_panics_doc
 )]
 // Test harness code: an unwrap here is a failed test, which is what it should be.
-// Async TCP is the NFS loopback mount server's alone (macOS/Linux); Windows mounts through WinFsp, so
-// the `tcp` module and this test are gated off it (the fleet transport is QUIC over UDP — see udp.rs).
-#![cfg(not(windows))]
 
 use std::sync::mpsc::channel;
 use std::time::Duration;
 
-// The address types come through `rustix::net` (the standard types re-exported) to honour the
-// host-path wall's `std::net` guard.
+// The address types come through the runtime's re-export (`core::net`'s), so the test builds on every OS.
 use hyper_rt::runtime::{Runtime, RuntimeConfig};
-use hyper_rt::tcp::{TcpListener, TcpStream};
-use rustix::net::{Ipv4Addr, SocketAddrV4};
+use hyper_rt::tcp::{Ipv4Addr, SocketAddrV4, TcpListener, TcpStream};
 
 fn config() -> RuntimeConfig {
     RuntimeConfig {
@@ -55,7 +50,7 @@ fn config() -> RuntimeConfig {
 }
 
 /// Shape: the test makes exactly one connection, so one queued pending connection suffices.
-const BACKLOG: i32 = 1;
+const BACKLOG: u32 = 1;
 
 /// The bytes the client sends and the marker the server frames its echo with, so the reply proves the
 /// whole accept -> read -> write -> read round trip travelled the socket.
@@ -140,7 +135,7 @@ fn a_listener_handed_over_by_descriptor_serves_on_the_same_port() {
     let bound = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0), BACKLOG).unwrap();
     let port = bound.local_addr().unwrap().port();
     assert_ne!(port, 0, "the OS assigned a port");
-    let listener = TcpListener::from_fd(bound.into_fd()).unwrap();
+    let listener = TcpListener::from_owned(bound.into_owned(), BACKLOG).unwrap();
     assert_eq!(
         listener.local_addr().unwrap().port(),
         port,

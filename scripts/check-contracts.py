@@ -46,6 +46,8 @@ UNSAFE_ALLOWED = {
         "the wake probe's thread parking and placement calls",
     "crates/hyper-rt/src/netsys.rs":
         "Winsock 2: WSAStartup, socket, bind, sendto, recvfrom, setsockopt, ioctlsocket (the datagram socket on Windows, IPv4 and IPv6); IP_DONTFRAG and IPV6_DONTFRAG (macOS)",
+    "crates/hyper-rt/src/tcpsys.rs":
+        "Winsock 2 stream calls (socket, accept, connect, recv, send, WSARecv, WSASend over IoSlice's WSABUF layout, shutdown) and the TCP options rustix lacks (TCP_NOTSENT_LOWAT, TCP_RXT_CONNDROPTIME, SO_NOSIGPIPE)",
     "crates/hyper-rt/src/udp/linux.rs":
         "sendmmsg, recvmmsg, UDP_SEGMENT, UDP_GRO and SCM_TIMESTAMPNS control messages, which rustix 1.1 lacks (batched UDP, docs/runtime.md §5.1)",
     "crates/hyper-rt/src/udp/macos.rs":

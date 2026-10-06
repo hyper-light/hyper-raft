@@ -25,8 +25,7 @@
 //! Modules: [`error`], [`control`], [`waker`], [`registry`], [`parking`] (the kick-if-parked
 //! protocol and its loom model), [`task`], [`queue`], [`timer`], [`driver`], [`sim`], [`shard`],
 //! [`runtime`], [`futures`], `attribution` (who held a long poll: the task or the host), the async
-//! sockets ([`udp`] everywhere and `tcp` on Unix — the NFS mount server's, over one shared readiness
-//! future), and the OS drivers.
+//! sockets ([`udp`] and [`tcp`] on every OS, over one shared readiness future), and the OS drivers.
 
 // Test code opts out of the no-panic wall at the crate root (CLAUDE.md §1); shipped code does not.
 #![cfg_attr(
@@ -71,10 +70,8 @@ pub mod sync;
 pub mod task;
 mod thread_clock;
 pub use thread_clock::CpuReading;
-// Async TCP is the NFS loopback mount server's alone (macOS/Linux; Windows mounts through WinFsp), so
-// it stays a `rustix` module gated off Windows — the fleet transport is QUIC over UDP, not TCP.
-#[cfg(not(windows))]
 pub mod tcp;
+mod tcpsys;
 pub mod timer;
 pub mod udp;
 pub mod waker;

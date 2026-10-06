@@ -91,7 +91,6 @@ pub async fn readable(raw: i32) -> Result<(), RtError> {
 }
 
 /// Awaits `raw`'s writability once (a real socket whose send buffer filled, or a connect in progress).
-#[cfg(unix)]
 pub(crate) async fn writable(raw: i32) -> Result<(), RtError> {
     ready(Target::Os(raw), true).await
 }

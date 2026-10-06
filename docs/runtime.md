@@ -352,6 +352,16 @@ On all three OSes, IPv4 and IPv6: `TcpListener::bind(addr, backlog)`, `accept`, 
   mantle's listener decides whether to answer 503 first by reserving one slot for that).
 - **Windows** through AFD: `AFD_POLL_ACCEPT` for listeners, `AFD_POLL_SEND` for writes,
   `AFD_POLL_CONNECT_FAIL` for connects.
+- **The retransmission deadline on all three**: Linux `TCP_USER_TIMEOUT`, macOS `TCP_RXT_CONNDROPTIME`
+  (whole seconds, rounded up), Windows `TCP_MAXRTMS`. `TCP_NOTSENT_LOWAT` on Linux and macOS; Windows has
+  no writability threshold (`SIO_IDEAL_SEND_BACKLOG_QUERY` is a query), so it is reported not offered.
+- **No `SIGPIPE`**: `MSG_NOSIGNAL` on Linux, `SO_NOSIGPIPE` on macOS; Windows raises none.
+- **Done** (2026-10-06): `TcpListener`/`TcpStream` on all three OSes through `tcpsys.rs`, IPv4 and IPv6,
+  vectored reads and writes, the options above read back, `ConnectionBudget` on a process-wide cell
+  (wait-free take; a slot travels with its stream through `into_parts`), `bind_shared` (`SO_REUSEPORT`).
+  `tests/tcp.rs` and `tests/tcp_streams.rs` pass on macOS and Linux 6.12; Windows is clippy-checked, its
+  run owed to the Windows lanes. **Owed**: the per-shard accept (a listener per shard on Unix, the Windows
+  acceptor handoff to the least-loaded shard) and the TLS composition test.
 
 ### 5.3 Local stream sockets and the peer's identity
 

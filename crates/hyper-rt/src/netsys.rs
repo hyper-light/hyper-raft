@@ -293,7 +293,7 @@ mod imp {
 // ============================================================================== Windows (Winsock 2)
 
 #[cfg(windows)]
-mod imp {
+pub(crate) mod imp {
     use std::os::windows::io::IntoRawSocket;
     use std::sync::OnceLock;
 
@@ -330,7 +330,7 @@ mod imp {
     /// Winsock must be initialized once per process before any socket call; `WSAStartup(2.2)` and no
     /// matching cleanup (process-lifetime) means one success suffices. A `OnceLock` makes it
     /// exactly-once with no lock on the data path.
-    fn ensure_started() -> Result<(), RtError> {
+    pub(crate) fn ensure_started() -> Result<(), RtError> {
         /// Format: the Winsock version to request in `WSAStartup` — 2.2, low byte major, high byte minor
         /// (`MAKEWORD(2, 2)` = `0x0202`), the version every current Windows provides.
         const WINSOCK_VERSION_2_2: u16 = 0x0202;
@@ -350,7 +350,7 @@ mod imp {
 
     /// The last Winsock error as an `RtError`, carrying the `WSAGetLastError` code (the shape
     /// `RtError::os` gives on Unix).
-    fn last(call: &'static str) -> RtError {
+    pub(crate) fn last(call: &'static str) -> RtError {
         RtError::DriverRefused {
             call,
             // SAFETY: a pure query of thread-local last-error state.
@@ -405,12 +405,13 @@ mod imp {
             socket: raw,
             family,
         };
-        set_nonblocking(&socket)?;
+        set_nonblocking(socket.socket)?;
         if family == Family::V6 {
             set_int(
-                &socket,
+                socket.socket,
                 IPPROTO_IPV6,
                 IPV6_V6ONLY,
+                1,
                 "setsockopt(IPV6_V6ONLY)",
             )?;
         }
@@ -418,35 +419,28 @@ mod imp {
         Ok(socket)
     }
 
-    /// Puts `socket` in non-blocking mode (`FIONBIO`), as every socket this seam drives must be.
-    fn set_nonblocking(socket: &Socket) -> Result<(), RtError> {
+    /// Puts `socket` in non-blocking mode (`FIONBIO`), as every socket hyper-rt drives must be.
+    pub(crate) fn set_nonblocking(socket: SOCKET) -> Result<(), RtError> {
         let mut nonblocking: u32 = 1;
         // SAFETY: FIONBIO takes one u32 by pointer; a live local suffices.
-        if unsafe { ioctlsocket(socket.socket, FIONBIO, &mut nonblocking) } == SOCKET_ERROR {
+        if unsafe { ioctlsocket(socket, FIONBIO, &mut nonblocking) } == SOCKET_ERROR {
             return Err(last("ioctlsocket(FIONBIO)"));
         }
         Ok(())
     }
 
-    /// Sets one `int`-valued option of `socket` to 1; `call` names it in a refusal.
-    fn set_int(
-        socket: &Socket,
+    /// Sets one `int`-valued option of `socket` to `value`; `call` names it in a refusal.
+    pub(crate) fn set_int(
+        socket: SOCKET,
         level: i32,
         option: i32,
+        value: i32,
         call: &'static str,
     ) -> Result<(), RtError> {
-        let on: i32 = 1;
         let len = i32::try_from(std::mem::size_of::<i32>()).unwrap_or(i32::MAX);
         // SAFETY: the option takes a DWORD-sized `int`; the pointer and length name one live local.
-        let outcome = unsafe {
-            setsockopt(
-                socket.socket,
-                level,
-                option,
-                (&raw const on).cast::<u8>(),
-                len,
-            )
-        };
+        let outcome =
+            unsafe { setsockopt(socket, level, option, (&raw const value).cast::<u8>(), len) };
         if outcome == SOCKET_ERROR {
             return Err(last(call));
         }
@@ -459,31 +453,38 @@ mod imp {
     fn set_dont_fragment(socket: &Socket) -> Result<(), RtError> {
         match socket.family {
             Family::V4 => set_int(
-                socket,
+                socket.socket,
                 IPPROTO_IP,
                 IP_DONTFRAGMENT,
+                1,
                 "setsockopt(IP_DONTFRAGMENT)",
             ),
             Family::V6 => set_int(
-                socket,
+                socket.socket,
                 IPPROTO_IPV6,
                 IPV6_DONTFRAG,
+                1,
                 "setsockopt(IPV6_DONTFRAG)",
             ),
         }
     }
 
-    /// One `int`-valued `SOL_SOCKET` option of `socket` (`SO_RCVBUF`, `SO_TYPE`); `call` names the query in a
+    /// One `int`-valued option of `socket` (`SO_RCVBUF`, `SO_TYPE`, `SO_ERROR`); `call` names the query in a
     /// refusal.
-    fn int_option(socket: &Socket, option: i32, call: &'static str) -> Result<i32, RtError> {
+    pub(crate) fn int_option(
+        socket: SOCKET,
+        level: i32,
+        option: i32,
+        call: &'static str,
+    ) -> Result<i32, RtError> {
         let mut value: i32 = 0;
         // The option is an `int`: its length is that type's size, which always fits an `i32`.
         let mut len: i32 = i32::try_from(std::mem::size_of::<i32>()).unwrap_or(i32::MAX);
         // SAFETY: the option is an `int`; the out pointer and its length name one live local `i32`.
         let outcome = unsafe {
             getsockopt(
-                socket.socket,
-                SOL_SOCKET,
+                socket,
+                level,
                 option,
                 (&raw mut value).cast::<u8>(),
                 &raw mut len,
@@ -497,18 +498,23 @@ mod imp {
 
     /// The socket's kernel receive buffer (`SO_RCVBUF`) in bytes.
     pub(crate) fn recv_buffer_bytes(socket: &Socket) -> Result<usize, RtError> {
-        let bytes = int_option(socket, SO_RCVBUF, "getsockopt(SO_RCVBUF)")?;
+        let bytes = int_option(
+            socket.socket,
+            SOL_SOCKET,
+            SO_RCVBUF,
+            "getsockopt(SO_RCVBUF)",
+        )?;
         usize::try_from(bytes).map_err(|_| last("getsockopt(SO_RCVBUF)"))
     }
 
     /// The length of a socket address structure, as Winsock takes it.
-    fn length<T>() -> i32 {
+    pub(crate) fn length<T>() -> i32 {
         i32::try_from(size_of::<T>()).unwrap_or(0)
     }
 
     /// `addr` written into a `SOCKADDR_STORAGE` (network byte order for the port and address, as the wire
     /// wants), and its length.
-    fn sockaddr(addr: SocketAddr) -> (SOCKADDR_STORAGE, i32) {
+    pub(crate) fn sockaddr(addr: SocketAddr) -> (SOCKADDR_STORAGE, i32) {
         // SAFETY: `SOCKADDR_STORAGE` is plain integers; all zeroes is a valid value.
         let mut storage: SOCKADDR_STORAGE = unsafe { std::mem::zeroed() };
         match addr {
@@ -559,7 +565,7 @@ mod imp {
 
     /// The address a filled `SOCKADDR_STORAGE` names, if it is an internet address (the inverse of
     /// [`sockaddr`]).
-    fn from_sockaddr(storage: &SOCKADDR_STORAGE) -> Option<SocketAddr> {
+    pub(crate) fn from_sockaddr(storage: &SOCKADDR_STORAGE) -> Option<SocketAddr> {
         match storage.ss_family {
             AF_INET => {
                 // SAFETY: the family says Winsock wrote a `SOCKADDR_IN`, which the storage holds.
@@ -607,7 +613,7 @@ mod imp {
             socket: raw,
             family: Family::V4,
         };
-        let kind = int_option(&socket, SO_TYPE, "getsockopt(SO_TYPE)")?;
+        let kind = int_option(socket.socket, SOL_SOCKET, SO_TYPE, "getsockopt(SO_TYPE)")?;
         if kind != SOCK_DGRAM {
             return Err(RtError::DriverRefused {
                 call: "adopt(SO_TYPE)",
@@ -615,7 +621,7 @@ mod imp {
             });
         }
         socket.family = Family::of(local_addr(&socket)?);
-        set_nonblocking(&socket)?;
+        set_nonblocking(socket.socket)?;
         set_dont_fragment(&socket)?;
         Ok(socket)
     }
@@ -728,6 +734,9 @@ mod imp {
     }
 }
 
+/// The Winsock helpers the stream seam (`crate::tcpsys`) shares.
+#[cfg(windows)]
+pub(crate) use imp as winsock;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(crate) use imp::dont_fragment;
 pub(crate) use imp::{OwnedDatagram, Socket};

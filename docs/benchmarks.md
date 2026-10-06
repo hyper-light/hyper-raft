@@ -6980,3 +6980,44 @@ target/release/examples/geo_open_loop --rate 100 --requests 20000 --dials 5 --id
 target/release/examples/geo_open_loop --rate 100 --requests 20000 --dials 5 --idle-ms 8000
 target/release/examples/geo_open_loop --rate 100 --requests 20000 --dials 5 --idle-ms 0
 ```
+
+## Exchange lookup by stream: one exchange beside n open (2026-10-05)
+
+`cargo bench -p hyper-transport --bench lookup`: one exchange, a request and its reply of 600
+bytes each way (half the least QUIC datagram, so one datagram each way), timed over 2,000 rounds
+after 200 warm-up rounds while `n` other exchanges stay open and idle on the same connection. `n`
+doubles from 1 to the limit itself, 1,023 (the exchange limit of 1,024 less the timed exchange; the
+stream limit is set equal, so credit never binds). Simulated network, real CPU time.
+
+Apple M5 Max, macOS 26.4, commit `532c435` plus the bench, one run; load average 48 before and
+after (the machine is shared; other sessions were building). A baseline, before the scheduling
+core's per-operation work is made independent of `n`:
+
+| Open beside it | Allocations | Bytes | Time per exchange |
+|---|---|---|---|
+| 1 | 12.86 | 2396 | 5.0 µs |
+| 2 | 12.86 | 2396 | 5.3 µs |
+| 4 | 12.86 | 2396 | 5.9 µs |
+| 8 | 12.86 | 2395 | 6.1 µs |
+| 16 | 12.84 | 2393 | 10.1 µs |
+| 32 | 12.83 | 2391 | 22.5 µs |
+| 64 | 12.79 | 2385 | 91.6 µs |
+| 128 | 12.73 | 2373 | 390.6 µs |
+| 256 | 12.60 | 2350 | 1428.8 µs |
+| 512 | 12.35 | 2390 | 6011.9 µs |
+| 1023 | 13.43 | 2561 | 55477.2 µs |
+
+Above 16 open, each doubling of `n` costs about four times as much: quadratic. Every operation's
+progress pass visits each exchange on the connection, and each visit folds what every exchange has
+to send (`Core::progress` → `wake` → `allowed` → `demand_above`). Allocations do not grow with
+`n`. Two earlier runs at load 54 measured 3.5–7.9 ms at 512; the shape is the same.
+
+Getting to the limit found three things, fixed before this baseline:
+
+- The 1,001st exchange beside 1,000 held was refused `Stalled` by its own age while waiting for a
+  stream. It is now judged on whether the connection's credit queue moves (policy C, `907dcb7`).
+- The peer never announced freed stream credit when it held most of its window, so the client
+  starved below the limit (hyper-quic VENDORED.md §16, `532c435`).
+- The bench left the ended exchange's last events unpolled. A removed exchange holds its seat
+  until they are polled, so at the limit the next `open` was refused `Exchanges`. The bench now
+  drains both sides.

@@ -695,7 +695,8 @@ asks the maximum to rise as streams close "to keep the number of streams availab
 roughly consistent".
 
 The announcement is now also made when anything is unannounced and the peer has an eighth of the
-window or less left to open (what it was last told, less the streams it has opened). The saving
-stays where the peer has plenty; no new constant. Test:
+window or less left to open (what it was last told, less the streams it has opened). The eighth
+is upstream's threshold, inherited and uncited; only the "peer short of credit" trigger is new
+(RFC 9000 §4.6), and it reuses that line rather than adding one. Deriving the eighth is owed. Test:
 `freed_stream_credit_is_announced_when_the_peer_is_short_of_it` (its second half fails on
 upstream's rule; its first half holds the saving).

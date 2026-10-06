@@ -23,7 +23,7 @@ mod common;
 use std::time::{Duration, Instant};
 
 use common::*;
-use hyper_transport::{Event, Limits, Refusal};
+use hyper_transport::{Event, ExchangeId, LEAST_PROGRESS, Limits, Refusal};
 
 const PERIOD: Duration = Duration::from_secs(2);
 const TURNS: usize = 10_000;
@@ -1690,4 +1690,225 @@ fn a_peer_table_held_by_unpolled_events_refuses_a_new_peer() {
             .iter()
             .any(|event| matches!(event, Event::Connected { peer: 3, .. }))
     });
+}
+
+/// Exchanges queued behind the peer's stream credit (rule 2's bound, policy C): a queued exchange is judged on whether
+/// the connection's credit queue moves, not on its own age. Do: one stream a connection, eight exchanges asked at once,
+/// and a server that answers one every half period, so the last waits about four periods for its stream. Expect: all
+/// eight answered whole, none refused, though the last waited several of its own progress periods.
+#[test]
+fn exchanges_queued_behind_steady_credit_all_complete_past_several_periods() {
+    let pair = Pair::new();
+    let mut one = limits();
+    one.streams_per_connection = 1;
+    one.exchanges = 8;
+    let mut net = connected::<Mantle, Mantle>(&pair, one, 256 << 20);
+    let (mut asker, mut server) = (Asker::new(), Server::new());
+    for seed in 0..8 {
+        asker
+            .ask(
+                &mut net.a,
+                net.now,
+                2,
+                (Kind::Get, Class::Request),
+                seed,
+                Some(1_000),
+                PERIOD,
+            )
+            .unwrap();
+    }
+    let started = net.now;
+    let pace = PERIOD / 2;
+    let mut next_serve = net.now;
+    // The clock moves no faster than a tenth of the pace, so the server answers on time rather than when a transport
+    // timer next fires.
+    let step = pace / 10;
+    for _ in 0..TURNS {
+        asker.drive(&mut net.a);
+        // Every request is taken as it arrives; the answers are paced, one every half period.
+        while let Some(event) = net.b.poll_event() {
+            server.on_event(&mut net.b, event);
+        }
+        if net.now >= next_serve {
+            let before = server.answered;
+            server.advance_all(&mut net.b);
+            if server.answered > before {
+                next_serve = net.now + pace;
+            }
+        }
+        asker.drive(&mut net.a);
+        if asker.finished() {
+            break;
+        }
+        if !net.exchange() {
+            net.advance_within(step);
+        }
+    }
+    assert!(
+        asker
+            .asked
+            .iter()
+            .all(|asked| asked.refused.is_none() && asked.read == 1_000),
+        "every queued exchange completed: {:?}",
+        asker
+            .asked
+            .iter()
+            .map(|asked| (asked.refused, asked.read))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        net.now.duration_since(started) > PERIOD * 3,
+        "the last exchange waited past several of its own periods ({:?})",
+        net.now.duration_since(started)
+    );
+}
+
+/// Policy C's other half: a peer that stops granting credit stops the queue, and every exchange queued behind it is
+/// refused, typed, within one progress period of the queue's last advance. Do: one stream a connection, four exchanges;
+/// the server answers the first and trickles its reply (twice the least progress every half period, so the first is
+/// never itself stalled and never frees its stream). Expect: the three queued refused `Stalled` within two periods of
+/// the first being given its stream (one period, and the judgement that finds it), while the first is still alive.
+#[test]
+fn exchanges_queued_behind_withheld_credit_are_refused_within_a_period_of_the_last_advance() {
+    let pair = Pair::new();
+    let mut one = limits();
+    one.streams_per_connection = 1;
+    one.exchanges = 4;
+    let mut net = connected::<Mantle, Mantle>(&pair, one, 256 << 20);
+    let mut asker = Asker::new();
+    for seed in 0..4 {
+        asker
+            .ask(
+                &mut net.a,
+                net.now,
+                2,
+                (Kind::Get, Class::Request),
+                seed,
+                Some(1_000),
+                PERIOD,
+            )
+            .unwrap();
+    }
+    // The first exchange is given the connection's only stream as it opens: the queue's last advance.
+    let last_advance = net.now;
+    let pace = PERIOD / 2;
+    // Shape: twice the least a period must move, every half period.
+    let trickle = usize::try_from(LEAST_PROGRESS * 2).unwrap();
+    // Shape: far more than the test runs long enough to trickle, so the first exchange never completes.
+    let total = LEAST_PROGRESS * 2 * 1_000;
+    let step = pace / 10;
+    let mut first: Option<(ExchangeId, u64, u64, bool, u64)> = None;
+    let mut next_trickle = net.now;
+    let mut refused_at: Vec<Option<Instant>> = vec![None; 4];
+    let mut piece = vec![0u8; trickle];
+    for _ in 0..TURNS {
+        asker.drive(&mut net.a);
+        while let Some(event) = net.b.poll_event() {
+            if let Event::Request { exchange, .. } = event {
+                let seed = u64::from(
+                    net.b
+                        .head(exchange)
+                        .and_then(|head| head.first().copied())
+                        .unwrap(),
+                );
+                first = Some((exchange, seed, 0, false, 0));
+            }
+        }
+        if let Some((exchange, seed, read, replied, written)) = &mut first {
+            while *read < 1_000 {
+                let mut into = net.b.reserve(Class::Request, 1_000).unwrap();
+                let got = net.b.read_body(*exchange, &mut into).unwrap();
+                net.b.release(into);
+                if got == 0 {
+                    break;
+                }
+                *read += got as u64;
+            }
+            if *read == 1_000 && !*replied {
+                let mut head = b"ok:".to_vec();
+                head.extend_from_slice(net.b.head(*exchange).unwrap());
+                net.b.reply(*exchange, &head, Some(total)).unwrap();
+                *replied = true;
+            }
+            if *replied && net.now >= next_trickle {
+                fill(*seed, *written, &mut piece);
+                *written += net.b.write_body(*exchange, &piece).unwrap() as u64;
+                next_trickle = net.now + pace;
+            }
+        }
+        asker.drive(&mut net.a);
+        for (at, asked) in asker.asked.iter().enumerate() {
+            if asked.refused.is_some() && refused_at[at].is_none() {
+                refused_at[at] = Some(net.now);
+            }
+        }
+        if refused_at.iter().skip(1).all(Option::is_some) {
+            break;
+        }
+        if !net.exchange() {
+            net.advance_within(step);
+        }
+    }
+    assert_eq!(
+        asker.asked[0].refused, None,
+        "the stream holder is still alive"
+    );
+    assert!(asker.asked[0].read > 0, "and its reply is moving");
+    for (at, asked) in asker.asked.iter().enumerate().skip(1) {
+        assert_eq!(
+            asked.refused.map(|(refusal, _)| refusal),
+            Some(Refusal::Stalled),
+            "exchange {at}"
+        );
+        let after = refused_at[at].unwrap().duration_since(last_advance);
+        assert!(
+            after <= PERIOD * 2,
+            "exchange {at} refused {after:?} after the last advance"
+        );
+    }
+}
+
+/// The table's bound, exactly: at the limit every exchange is taken, and one more is refused at `open`, typed, never
+/// lost. Do: an exchange limit of six, six asked, then a seventh. Expect: six taken and answered, the seventh refused
+/// `Exchanges` when asked.
+#[test]
+fn exchanges_at_the_limit_are_taken_and_one_past_it_is_refused_at_open() {
+    let pair = Pair::new();
+    let mut tight = limits();
+    tight.exchanges = 6;
+    let mut net = connected::<Mantle, Mantle>(&pair, tight, 256 << 20);
+    let (mut asker, mut server) = (Asker::new(), Server::new());
+    for seed in 0..6 {
+        asker
+            .ask(
+                &mut net.a,
+                net.now,
+                2,
+                (Kind::Get, Class::Request),
+                seed,
+                Some(1_000),
+                PERIOD,
+            )
+            .unwrap();
+    }
+    assert_eq!(
+        asker.ask(
+            &mut net.a,
+            net.now,
+            2,
+            (Kind::Get, Class::Request),
+            6,
+            Some(1_000),
+            PERIOD
+        ),
+        Err(Refusal::Exchanges)
+    );
+    run(&mut net, &mut asker, &mut server);
+    assert!(
+        asker
+            .asked
+            .iter()
+            .all(|asked| asked.refused.is_none() && asked.read == 1_000)
+    );
+    assert_eq!(server.answered, 6);
 }

@@ -233,6 +233,9 @@ struct Conn<R> {
     /// turn visited only the exchanges that moved). Bounded by `limits.streams_per_connection`, as `exchanges` is, and
     /// reserved to it when the connection is made, so no insert allocates.
     by_stream: Vec<(StreamId, u64)>,
+    /// When this connection's credit queue last advanced (policy C): an exchange was given a stream or finished, or
+    /// the peer raised the streams it lets this side open. An exchange waiting for a stream is judged on this.
+    credit_moved: Option<Instant>,
     lanes_out: Vec<LaneOut>,
     lanes_in: Vec<LaneIn>,
     window: Window,
@@ -939,6 +942,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
             by_stream: Vec::with_capacity(
                 usize::try_from(limits.streams_per_connection).unwrap_or(0),
             ),
+            credit_moved: None,
             lanes_out: Vec::new(),
             lanes_in: Vec::new(),
             window: Window::new(initial, limits.window_ceiling),
@@ -1239,6 +1243,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
                     exchange.stream_blocked = false;
                 }
             }
+            StreamEvent::Available { dir: Dir::Bi } => conn.credit_moved = Some(now),
             StreamEvent::Finished { .. } | StreamEvent::Available { .. } => {}
         }
     }
@@ -1413,6 +1418,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
         let backlog = self.backlog(conn, 0);
         carry.answering(now, moved(conn, 0), length(PREFIX_BYTES), backlog);
         let exchange = Exchange {
+            credit_seen: None,
             connection: key,
             peer,
             stream: Some(stream),
@@ -1773,6 +1779,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
         out.left = body.unwrap_or(0);
         out.has_body = body.is_some();
         let exchange = Exchange {
+            credit_seen: None,
             connection: key,
             peer,
             stream: None,
@@ -1867,6 +1874,10 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
             };
             exchange.stream = Some(stream);
             bind_stream(&mut conn.by_stream, stream, id);
+            conn.credit_moved = Some(self.now);
+            // Its stream is the queue's advance for it too: the wait runs from the grant, as one given a stream at once.
+            exchange.credit_seen = None;
+            exchange.carry.hold(self.now, moved(conn, exchange.rank), 0);
             let _ = conn
                 .quic
                 .send_stream(stream)
@@ -2110,6 +2121,10 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
             return;
         };
         conn.exchanges.retain(|held| *held != id);
+        // Only an exchange that held a stream frees credit; one refused while queued moves no queue.
+        if exchange.stream.is_some() {
+            conn.credit_moved = Some(self.now);
+        }
         if let Some(stream) = exchange.stream
             && let Ok(at) = conn
                 .by_stream
@@ -2213,7 +2228,20 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
         // What the peer's credit would take of this exchange's class now, before this side's own
         // classes are served: none means the peer is not taking what the exchange has to send.
         let peer_takes = credit(&mut conn.quic, rank);
+        let credit_moved = conn.credit_moved;
         let judged = self.exchanges.get_mut(id).map_or(Ok(()), |exchange| {
+            if exchange.stream.is_none() {
+                // Queued for a stream (policy C): judged on whether the connection's credit queue moves, not on its
+                // own age. A further advance restarts the wait from it; none for a whole period refuses it.
+                return match credit_moved {
+                    Some(advanced) if exchange.credit_seen != Some(advanced) => {
+                        exchange.credit_seen = Some(advanced);
+                        exchange.carry.hold_from(advanced, at, backlog);
+                        Ok(())
+                    }
+                    _ => Err(Refusal::Stalled),
+                };
+            }
             if Self::ours_to_move(exchange, peer_takes) {
                 exchange.carry.hold(now, at, backlog);
                 return Ok(());

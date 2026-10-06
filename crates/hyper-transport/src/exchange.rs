@@ -250,6 +250,9 @@ pub(crate) struct Exchange<K> {
     pub(crate) out: Outgoing,
     pub(crate) incoming: Incoming,
     pub(crate) carry: Carry,
+    /// For an exchange queued for a stream, the connection's last credit-queue advance its wait was last judged on
+    /// (policy C): a further advance restarts its wait; none for a whole period refuses it as stalled.
+    pub(crate) credit_seen: Option<Instant>,
     pub(crate) began: Instant,
     /// Whether the peer's message has begun (a reply's prefix and head arrived).
     pub(crate) answered: bool,

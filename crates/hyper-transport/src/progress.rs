@@ -39,6 +39,16 @@
 //!   behind fifteen others at none read while its period brought 464 KB. A wall-clock bound
 //!   measures the machine, not the peer (`hyper_timing::progress`); what a slow body holds here is
 //!   bounded in bytes by the receive window the budget funds, not by time.
+//! - **Queued**: the exchange is open and waits for a stream, the peer's concurrent-stream credit
+//!   being taken. It is judged on whether the connection's credit queue moves, not on its own age:
+//!   an exchange given a stream or one holding a stream finishing, or the peer raising the streams
+//!   it lets this side open, is an advance, and each restarts the wait from it; a period with none
+//!   refuses it `Stalled`. A healthy peer behind a full window keeps the queue moving, so nothing
+//!   queued is refused; one that withholds credit stops it, and every queued exchange is refused,
+//!   typed, within a period of the last advance. The stream's grant starts the asking phase afresh.
+//!   Judged on its own age, the 1,001st exchange beside 1,000 held ones was refused while its peer
+//!   was healthy (hyper-transport `benches/lookup.rs`, 2026-10-05); an exchange refused while
+//!   queued freed no stream, so it is no advance.
 
 use std::time::{Duration, Instant};
 
@@ -213,6 +223,12 @@ impl Carry {
             *had = false;
         }
     }
+    /// The wait of an exchange queued for a stream restarts from `since`, when its connection's credit queue last
+    /// advanced (policy C: a queued exchange is judged on whether its queue moves, not on its own age).
+    pub(crate) fn hold_from(&mut self, since: Instant, moved: Moved, backlog: u64) {
+        self.hold(since, moved, backlog);
+    }
+
     fn restart(&mut self, now: Instant, moved: Moved) {
         self.before = moved;
         self.next = now.checked_add(self.period).unwrap_or(now);

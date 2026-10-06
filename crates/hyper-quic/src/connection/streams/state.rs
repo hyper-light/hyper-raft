@@ -971,8 +971,17 @@ impl StreamsState {
                 .get(dir)
                 .saturating_sub(*self.sent_max_remote.get(dir));
             // To reduce traffic, only announce updates if at least 1/8 of the flow control window
-            // has been consumed.
-            if diff > *self.max_concurrent_remote_count.get(dir) / 8 {
+            // has been consumed, or once the peer has an eighth of the window or less left to open
+            // (what it was last told, less what it has opened): a peer holding most of its streams
+            // never frees an eighth, and credit held back from it then starves it below the limit
+            // (RFC 9000 §4.6: increase the maximum as streams close "to keep the number of streams
+            // available to peers roughly consistent").
+            let eighth = *self.max_concurrent_remote_count.get(dir) / 8;
+            let peer_left = self
+                .sent_max_remote
+                .get(dir)
+                .saturating_sub(*self.next_remote.get(dir));
+            if diff > eighth || (diff > 0 && peer_left <= eighth) {
                 *pending.max_stream_id.get_mut(dir) = true;
                 queued = true;
             }
@@ -2071,6 +2080,51 @@ mod tests {
                 0
             ),
             Ok(ShouldTransmit(false))
+        );
+    }
+
+    /// A peer that holds most of its streams open must still be told of every stream it frees once
+    /// it is short of credit: freed credit held back until an eighth of the window is freed starved
+    /// a client at 1,001 concurrent streams below a 1,024 limit (hyper-transport `benches/lookup.rs`,
+    /// 2026-10-05). Do: a window of 128; the peer opens one stream and it is freed, then the peer
+    /// opens all 128 and one is freed. Expect: no MAX_STREAMS while the peer has plenty of credit
+    /// (the traffic saving kept), one as soon as one stream is freed with the peer's credit spent.
+    #[test]
+    fn freed_stream_credit_is_announced_when_the_peer_is_short_of_it() {
+        let mut client = make(Side::Client);
+        let open = |client: &mut StreamsState, index: u64| {
+            client.received(
+                frame::Stream {
+                    id: StreamId::new(Side::Server, Dir::Uni, index).unwrap(),
+                    offset: 0,
+                    fin: true,
+                    data: Bytes::from_static(&[]),
+                },
+                0,
+            )
+        };
+        let free = |client: &mut StreamsState, index: u64| {
+            let mut pending = Retransmits::default();
+            RecvStream {
+                id: StreamId::new(Side::Server, Dir::Uni, index).unwrap(),
+                state: client,
+                pending: &mut pending,
+            }
+            .stop(0u32.into())
+            .unwrap();
+            // What the connection does on its next poll (`Connection::poll_transmit`).
+            client.queue_max_stream_id(&mut pending);
+            *pending.max_stream_id.get(Dir::Uni)
+        };
+        assert_eq!(open(&mut client, 0), Ok(ShouldTransmit(false)));
+        assert!(
+            !free(&mut client, 0),
+            "the peer has 127 streams of credit left: no announcement"
+        );
+        assert_eq!(open(&mut client, 127), Ok(ShouldTransmit(false)));
+        assert!(
+            free(&mut client, 127),
+            "the peer's credit is spent: the freed stream is announced"
         );
     }
 

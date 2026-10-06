@@ -683,3 +683,19 @@ The unit tests that pin another mechanism's exact traffic (ACK frequency, window
 unused window) run with the warm-up off (`endpoint_config_without_warm_up`): the in-memory pair's
 clock moves only to the next timer, so its pacer never refills and a warm-up there spends its
 budget. The MTU discovery test keeps it on and counts its PINGs apart.
+
+## 16. Freed stream credit announced when the peer is short of it (2026-10-05)
+
+Upstream announces a raised MAX_STREAMS only once more than an eighth of the concurrency window
+has been freed since the last announcement (`queue_max_stream_id`), to save frames. A peer that
+holds most of its streams open never frees an eighth: with 1,000 of a 1,024 window held, the 24
+others were used once each and freed, never announced, and the peer could open no 1,025th stream
+although it had 1,001 open, below the limit (hyper-transport `benches/lookup.rs`). RFC 9000 §4.6
+asks the maximum to rise as streams close "to keep the number of streams available to peers
+roughly consistent".
+
+The announcement is now also made when anything is unannounced and the peer has an eighth of the
+window or less left to open (what it was last told, less the streams it has opened). The saving
+stays where the peer has plenty; no new constant. Test:
+`freed_stream_credit_is_announced_when_the_peer_is_short_of_it` (its second half fails on
+upstream's rule; its first half holds the saving).

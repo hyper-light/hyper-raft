@@ -175,6 +175,13 @@ impl IocpDriver {
     /// Issues a poll for `events` on `raw`'s base socket, recorded as outstanding. `Capacity` past the
     /// handles bound (unreachable: the shard's wait table holds no more handles than that).
     fn issue(&mut self, raw: i32, events: u32, tag: u64) -> Result<(), RtError> {
+        #[cfg(test)]
+        if tests::FAIL_NEXT_ISSUE.with(|fail| fail.replace(false)) {
+            return Err(RtError::DriverRefused {
+                call: "IOCTL_AFD_POLL (forced by a test)",
+                code: None,
+            });
+        }
         if self.outstanding.len() >= self.handles_bound {
             return Err(RtError::Capacity {
                 what: "AFD polls",
@@ -423,5 +430,79 @@ impl Driver for IocpDriver {
             events |= WRITABLE_EVENTS;
         }
         self.arm_events(raw, events, tag)
+    }
+}
+
+#[cfg(test)]
+#[cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::disallowed_methods,
+        clippy::disallowed_macros
+    )
+)]
+mod tests {
+    use std::cell::Cell;
+
+    use crate::combine::{Either, join2, race2};
+    use crate::futures::{sleep, yield_now};
+    use crate::runtime::{LocalRuntime, RuntimeConfig};
+    use crate::udp::{Ipv4Addr, SocketAddr, UdpSocket};
+
+    thread_local! {
+        /// Set by a test to refuse the next poll this thread's driver issues (the thread is its shard's).
+        pub(super) static FAIL_NEXT_ISSUE: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// Shape: how long a wait that should have woken is given before the test fails rather than hangs.
+    const PATIENCE_NS: u64 = 10_000_000_000;
+
+    fn config() -> RuntimeConfig {
+        RuntimeConfig {
+            shards: 1,
+            tasks_per_shard: 16,
+            timers_per_shard: 16,
+            interests_per_shard: 16,
+            ring_entries: 64,
+            step_budget_ns: 1_000_000_000,
+            timer_tick_ns: 100_000,
+            batch: 64,
+            pin: false,
+            cores: Vec::new(),
+            page_bytes: 4096,
+            spin_ns: 0,
+            wake_tracking: None,
+        }
+    }
+
+    /// Mantle's final review, second pass, finding 1. Do: a reader waits on a socket (its AFD poll in flight);
+    /// a writer's wait on the same socket needs a wider poll, whose issue is refused; then a datagram arrives.
+    /// Expect: the writer's wait is refused, and the reader still wakes. The old poll used to be cancelled
+    /// before the wider one was issued, so the refusal left the reader with no poll and it slept for good.
+    #[test]
+    fn a_refused_wider_poll_leaves_the_waiters_already_on_the_socket() {
+        let mut rt = LocalRuntime::new(&config()).unwrap();
+        rt.block_on(async {
+            let ours = UdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).unwrap();
+            let peer = UdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).unwrap();
+            let to = ours.local_addr().unwrap();
+            let joined = join2(ours.readable(), async {
+                // One yield: the loop arms the reader's poll before the writer asks for the wider one.
+                yield_now().await;
+                FAIL_NEXT_ISSUE.with(|fail| fail.set(true));
+                assert!(ours.writable().await.is_err(), "the wider poll was refused");
+                peer.send_to(b"x", to).unwrap();
+            });
+            match race2(joined, sleep(PATIENCE_NS)).await {
+                Either::First((read, ())) => read.unwrap(),
+                Either::Second(_) => {
+                    panic!("the reader's wait was stranded by the refused replacement")
+                }
+            }
+        })
+        .unwrap();
     }
 }

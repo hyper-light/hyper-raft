@@ -48,6 +48,8 @@ UNSAFE_ALLOWED = {
         "Winsock 2: WSAStartup, socket, bind, sendto, recvfrom, setsockopt, ioctlsocket (the datagram socket on Windows, IPv4 and IPv6); IP_DONTFRAG and IPV6_DONTFRAG (macOS)",
     "crates/hyper-rt/src/localsys.rs":
         "AF_UNIX stream sockets and the peer's identity: getpeereid and LOCAL_PEERPID (macOS); Winsock AF_UNIX, SIO_AF_UNIX_GETPEERPID, OpenProcessToken and GetTokenInformation(TokenUser) (Windows)",
+    "crates/hyper-rt/src/signal.rs":
+        "sigaction and the async-signal-safe self-pipe write (Unix); SetConsoleCtrlHandler (Windows)",
     "crates/hyper-rt/src/tcpsys.rs":
         "Winsock 2 stream calls (socket, accept, connect, recv, send, WSARecv, WSASend over IoSlice's WSABUF layout, shutdown) and the TCP options rustix lacks (TCP_NOTSENT_LOWAT, TCP_RXT_CONNDROPTIME, SO_NOSIGPIPE)",
     "crates/hyper-rt/src/udp/linux.rs":

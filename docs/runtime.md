@@ -450,6 +450,11 @@ Ctrl-Break, close, logoff and shutdown (Windows).
 - **Bound:** one handler per kind, subscribers bounded by the shard count (DERIVED: at most one
   subscription per kind per shard is needed, since a shard's tasks share it).
 
+**Done** (2026-10-06), with one change: on Unix the subscribers are woken by **one signal thread** that
+reads the self-pipe, not by each shard awaiting the pipe, so one pipe serves any number of subscribers
+without one draining it for the rest; Windows' handler, on the OS's thread, wakes them directly. A kind
+with a subscriber is handled on Windows (the default end does not run). `tests/signals.rs` (Unix).
+
 ### 6.2 Stdio
 
 Reading standard input and writing standard output without blocking a shard. Readiness works on Unix for a
@@ -458,7 +463,10 @@ console or an anonymous pipe cannot be polled at all. One mechanism therefore se
 kind of handle: **one reader thread and one writer thread for the process**, each moving bytes between
 the handle and a bounded queue of fixed-size chunks (the chunk is one page, the queue's depth the
 consumer's), handing them to tasks through §8's channel. Bounded: two threads, `depth × page` bytes each
-way (DERIVED).
+way (DERIVED). **Done** (2026-10-06): the buffers are allocated once and recycled between task and thread
+(full ones one way, empty ones back), and stdout is locked per chunk, not for the thread's life, so other
+writers interleave. `tests/stdio.rs` streams a mebibyte through four 4 KiB buffers each way in a child
+process.
 
 ## 7. The completion seam for device issuers
 

@@ -20,7 +20,7 @@ use crate::registry;
 use crate::waker::polling_task;
 
 /// Which readiness edge a caller awaits.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum Interest {
     /// The socket has data to read, or a listener has a connection to accept.
     Readable,
@@ -33,7 +33,8 @@ enum Interest {
 /// Awaits one readiness edge on `raw` through the shard's driver: it registers one-shot interest on
 /// the first poll and yields; the driver's completion re-queues the task, and the next poll is ready
 /// so the caller retries the non-blocking syscall (a spurious wake just retries).
-pub(crate) struct Ready {
+#[derive(Debug)]
+pub struct Ready {
     target: Target,
     interest: Interest,
     armed: bool,
@@ -41,7 +42,7 @@ pub(crate) struct Ready {
 
 /// What a readiness wait watches: an OS handle through the shard's driver, or a simulated socket through
 /// its desk (docs/runtime.md §11).
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub(crate) enum Target {
     /// A descriptor or socket the driver watches.
     Os(i32),

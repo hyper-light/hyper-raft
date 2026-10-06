@@ -862,6 +862,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "hyper-rt-transport"
+version = "0.1.0"
+dependencies = [
+ "hyper-datagram",
+ "hyper-measure",
+ "hyper-rt",
+ "hyper-sim",
+ "hyper-transport",
+ "rcgen",
+]
+
+[[package]]
 name = "hyper-seal"
 version = "0.1.0"
 dependencies = [

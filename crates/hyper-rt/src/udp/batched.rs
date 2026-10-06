@@ -338,12 +338,12 @@ impl Batched {
     }
 
     /// Awaits the socket's read readiness through the driver (or a spurious wake).
-    pub fn readable(&self) -> impl Future<Output = Result<(), RtError>> + use<> {
+    pub fn readable(&self) -> crate::readiness::Ready {
         self.udp.readable()
     }
 
     /// Awaits the socket's write readiness through the driver (or a spurious wake).
-    pub fn writable(&self) -> impl Future<Output = Result<(), RtError>> + use<> {
+    pub fn writable(&self) -> crate::readiness::Ready {
         self.udp.writable()
     }
 

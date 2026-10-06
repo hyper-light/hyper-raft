@@ -364,12 +364,12 @@ impl TcpStream {
     }
 
     /// Awaits read readiness once (or a spurious wake).
-    pub fn readable(&self) -> impl Future<Output = Result<(), RtError>> + use<> {
+    pub fn readable(&self) -> crate::readiness::Ready {
         crate::readiness::ready(crate::readiness::Target::Os(self.stream.raw_id()), false)
     }
 
     /// Awaits write readiness once (or a spurious wake).
-    pub fn writable(&self) -> impl Future<Output = Result<(), RtError>> + use<> {
+    pub fn writable(&self) -> crate::readiness::Ready {
         crate::readiness::ready(crate::readiness::Target::Os(self.stream.raw_id()), true)
     }
 

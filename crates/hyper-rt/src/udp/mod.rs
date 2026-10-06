@@ -260,7 +260,7 @@ impl UdpSocket {
 
     /// Awaits the socket's write readiness through the driver (send-buffer space), or a spurious wake — so a
     /// caller follows it with [`UdpSocket::try_send_to`] and loops on `None`.
-    pub fn writable(&self) -> impl Future<Output = Result<(), RtError>> + use<> {
+    pub fn writable(&self) -> crate::readiness::Ready {
         ready(self.target(), true)
     }
 
@@ -290,7 +290,7 @@ impl UdpSocket {
     /// spuriously — so a caller follows it with [`UdpSocket::try_recv_from`] and loops on `None`. The future
     /// names the socket by its descriptor (or fabric port), not by a borrow, so a task that reaches the socket
     /// through a handle (a kept demultiplexer, AUD-29-08) can await it outside the handle's borrow.
-    pub fn readable(&self) -> impl Future<Output = Result<(), RtError>> + use<> {
+    pub fn readable(&self) -> crate::readiness::Ready {
         ready(self.target(), false)
     }
 

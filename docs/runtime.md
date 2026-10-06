@@ -640,6 +640,22 @@ on a shard, with the API of hyper-tokio's `Driver` (`bind`, `new`, `endpoint`, `
 `flush`, `local_addr`, `stats`) so a consumer moves from one to the other by type. The UDP layer is §5.1's,
 shared with hyper-tokio once hyper-tokio takes it from here (one `sys` layer, two drivers).
 
+**Done** (2026-10-06) as the crate `hyper-rt-transport` rather than a module: hyper-transport builds aws-lc
+(C), and hyper-rt stays pure Rust so it checks for every target from any host. The endpoint's `Instant`s
+are derived from the shard's clock (one anchor), so on the simulation runtime the endpoint runs on
+simulated time. `tests/exchanges.rs` runs hyper-tokio's exchange scenario — 19 exchanges in every class,
+9 MiB each way, every byte checked, the driver's future dropped mid-wait by a 1 ms race — with both
+endpoints on one shard:
+
+| release, 3 runs | handshake | 19 exchanges | datagrams a call (send / receive) |
+|---|---|---|---|
+| macOS, hyper-rt-transport, one shard | 5.1–6.2 ms | 103–106 ms | 1 / 1 |
+| macOS, hyper-tokio e2e, two processes | 26.2–26.6 ms | 111–128 ms | 1 / 1 |
+| Linux 6.12 (Docker), hyper-rt-transport | 3.2–30.9 ms | 47–65 ms | 8.6 / 43 |
+
+Not yet a like-for-like comparison: hyper-tokio's scenario runs its ends in two processes, this one on one
+thread. §12's row runs both drivers the same way.
+
 ## 15. Open items, to settle before the part that rests on them
 
 1. Whether `IOCTL_AFD_POLL` reports readiness on Windows `AF_UNIX` sockets (§5.3). Measured on the Windows

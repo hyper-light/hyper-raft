@@ -24,7 +24,7 @@
 //! refuses a datagram, whose acknowledgements every connection's loss detection needs (RFC 9002
 //! §6).
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::VecDeque;
 use std::marker::PhantomData;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
@@ -226,12 +226,13 @@ struct Conn<R> {
     epoch: Epoch,
     /// Its exchanges, oldest first.
     exchanges: Vec<u64>,
-    /// Its exchanges with a stream, by that stream: what a stream event is matched to in one lookup. It was a scan of
-    /// `exchanges` with an arena lookup each, per event, so a connection with hundreds of exchanges open paid hundreds
-    /// of lookups per readable stream (slates measured the same shape in its fetch worker, 2026-10-05: a 64 MiB pull
-    /// of 1,024 chunks did not finish in 9 minutes of CPU until each turn visited only the exchanges that moved).
-    /// Bounded by `exchanges`.
-    by_stream: BTreeMap<StreamId, u64>,
+    /// Its exchanges with a stream, as `(stream, exchange)` sorted by stream: what a stream event is matched to by a
+    /// binary search. It was a scan of `exchanges` with an arena lookup each, per event, so a connection with hundreds of
+    /// exchanges open paid hundreds of lookups per Readable, Stopped or Writable event (slates measured the same shape
+    /// in its own fetch worker, 2026-10-05: a 64 MiB pull of 1,024 chunks did not finish in 9 minutes of CPU until each
+    /// turn visited only the exchanges that moved). Bounded by `limits.streams_per_connection`, as `exchanges` is, and
+    /// reserved to it when the connection is made, so no insert allocates.
+    by_stream: Vec<(StreamId, u64)>,
     lanes_out: Vec<LaneOut>,
     lanes_in: Vec<LaneIn>,
     window: Window,
@@ -935,7 +936,9 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
             exchanges: Vec::with_capacity(
                 usize::try_from(limits.streams_per_connection).unwrap_or(0),
             ),
-            by_stream: BTreeMap::new(),
+            by_stream: Vec::with_capacity(
+                usize::try_from(limits.streams_per_connection).unwrap_or(0),
+            ),
             lanes_out: Vec::new(),
             lanes_in: Vec::new(),
             window: Window::new(initial, limits.window_ceiling),
@@ -1378,7 +1381,11 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
     }
 
     fn exchange_on(&self, conn: &Conn<C::Role>, stream: StreamId) -> Option<u64> {
-        conn.by_stream.get(&stream).copied().filter(|id| {
+        let at = conn
+            .by_stream
+            .binary_search_by_key(&stream, |(held, _)| *held)
+            .ok()?;
+        conn.by_stream.get(at).map(|(_, id)| *id).filter(|id| {
             self.exchanges
                 .get(*id)
                 .is_some_and(|exchange| exchange.stream == Some(stream))
@@ -1429,7 +1436,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
         match self.exchanges.insert(exchange) {
             Ok(id) => {
                 conn.exchanges.push(id);
-                conn.by_stream.insert(stream, id);
+                bind_stream(&mut conn.by_stream, stream, id);
                 self.read_exchange(now, conn, id);
             }
             Err(refusal) => {
@@ -1859,7 +1866,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
                 return;
             };
             exchange.stream = Some(stream);
-            conn.by_stream.insert(stream, id);
+            bind_stream(&mut conn.by_stream, stream, id);
             let _ = conn
                 .quic
                 .send_stream(stream)
@@ -2103,8 +2110,12 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
             return;
         };
         conn.exchanges.retain(|held| *held != id);
-        if let Some(stream) = exchange.stream {
-            conn.by_stream.remove(&stream);
+        if let Some(stream) = exchange.stream
+            && let Ok(at) = conn
+                .by_stream
+                .binary_search_by_key(&stream, |(held, _)| *held)
+        {
+            conn.by_stream.remove(at);
         }
         let code = failure
             .map_or(Refusal::Closed, |(refusal, _)| refusal)
@@ -2659,4 +2670,11 @@ fn priority<C: Classes>(rank: u8) -> i32 {
     i32::from(C::RANKS)
         .saturating_sub(1)
         .saturating_sub(i32::from(rank))
+}
+
+/// Records that exchange `id` holds `stream`, keeping `by_stream` sorted by stream (a stream is bound once).
+fn bind_stream(by_stream: &mut Vec<(StreamId, u64)>, stream: StreamId, id: u64) {
+    if let Err(at) = by_stream.binary_search_by_key(&stream, |(held, _)| *held) {
+        by_stream.insert(at, (stream, id));
+    }
 }

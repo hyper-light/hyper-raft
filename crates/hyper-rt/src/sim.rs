@@ -1024,17 +1024,15 @@ impl Driver for SimDriver {
         Ok(())
     }
 
-    fn register_readable(&mut self, _raw: i32, _user_data: u64) -> Result<(), RtError> {
+    fn arm(
+        &mut self,
+        _raw: i32,
+        _want: crate::interests::Readiness,
+        _tag: u64,
+    ) -> Result<(), RtError> {
         // Simulated sockets register their interest on the desk (`sim_register`); no OS handle exists here.
         Err(RtError::DriverRefused {
-            call: "register_readable on the simulation driver",
-            code: None,
-        })
-    }
-
-    fn register_writable(&mut self, _raw: i32, _user_data: u64) -> Result<(), RtError> {
-        Err(RtError::DriverRefused {
-            call: "register_writable on the simulation driver",
+            call: "arm on the simulation driver",
             code: None,
         })
     }

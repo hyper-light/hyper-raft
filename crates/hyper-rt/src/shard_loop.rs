@@ -23,6 +23,7 @@ use crate::attribution::{self, Attribution, Tracker};
 use crate::control::Control;
 use crate::driver::{Completion, Driver, DriverKind, DriverSeed, Kick};
 use crate::error::RtError;
+use crate::interests::{self, Interests, Readiness};
 use crate::machine::wake::WakeEstimate;
 use crate::mem::Encoded;
 use crate::parking::{Parked, Woken};
@@ -183,6 +184,8 @@ struct Core {
     exited: bool,
     fired: Vec<(u32, u64)>,
     completions: Vec<Completion>,
+    /// Who waits on which handle, in which direction (`crate::interests`).
+    waiting: Interests,
     pollers: Vec<Poller>,
     /// One past the highest task generation issued: what the registry slot's next holder starts from.
     generation_high: u32,
@@ -259,6 +262,7 @@ impl Shard {
             control: seed.control,
             fired: Vec::with_capacity(config.timers_per_shard),
             completions: Vec::with_capacity(config.ring_entries),
+            waiting: Interests::new(config.interests_per_shard)?,
             pollers: Vec::new(),
             counters: Counters::default(),
             shutting_down: false,
@@ -430,23 +434,7 @@ impl Shard {
             self.apply_timer(slot);
         }
         while let Some(interest) = self.desk.interests.pop() {
-            let registered = if interest.writable {
-                self.core
-                    .driver
-                    .register_writable(interest.raw, interest.word.word())
-            } else {
-                self.core
-                    .driver
-                    .register_readable(interest.raw, interest.word.word())
-            };
-            if let Err(refusal) = registered {
-                self.core.counters.interests_refused =
-                    self.core.counters.interests_refused.saturating_add(1);
-                if let Some(cell) = self.desk.task(interest.word.slot()) {
-                    cell.interest_refused.set(Some(refusal));
-                }
-                self.desk.wake_local(interest.word.slot());
-            }
+            self.apply_interest(interest);
         }
     }
 
@@ -596,17 +584,82 @@ impl Shard {
         }
     }
 
+    /// Adds a task's readiness wait to the table and arms the handle for every direction now waited for, or
+    /// withdraws a wait its future dropped. A refusal (the table's bound, the driver's) is handed to the task.
+    fn apply_interest(&mut self, interest: crate::shard::Interest) {
+        let word = interest.word.word();
+        if interest.withdraw {
+            // The handle stays armed for what is left; a direction no one waits for fires once, to no one.
+            let _ = self
+                .core
+                .waiting
+                .remove(interest.raw, interest.writable, word);
+            return;
+        }
+        let armed = self
+            .core
+            .waiting
+            .add(interest.raw, interest.writable, word)
+            .and_then(|wanted| {
+                self.core
+                    .driver
+                    .arm(interest.raw, wanted, interests::tag_of(interest.raw))
+                    .inspect_err(|_| {
+                        let _ = self
+                            .core
+                            .waiting
+                            .remove(interest.raw, interest.writable, word);
+                    })
+            });
+        if let Err(refusal) = armed {
+            self.core.counters.interests_refused =
+                self.core.counters.interests_refused.saturating_add(1);
+            if let Some(cell) = self.desk.task(interest.word.slot()) {
+                cell.interest_refused.set(Some(refusal));
+            }
+            self.desk.wake_local(interest.word.slot());
+        }
+    }
+
+    /// Queues the tasks the driver's completions name: a task's own word (a no-op's), or a handle whose
+    /// readiness wakes its waiters in the directions that fired, the handle armed again for those left.
+    fn deliver(&mut self, completions: &mut Vec<Completion>) {
+        for completion in completions.drain(..) {
+            self.core.counters.completions = self.core.counters.completions.saturating_add(1);
+            let Some(raw) = interests::handle_of(completion.user_data) else {
+                self.desk
+                    .wake_local(Encoded::from_word(completion.user_data).slot());
+                continue;
+            };
+            let desk = &self.desk;
+            let fired = Readiness::from_bits(completion.result);
+            let left = self.core.waiting.fire(raw, fired, |word| {
+                desk.wake_local(Encoded::from_word(word).slot());
+            });
+            if !left.is_empty()
+                && self
+                    .core
+                    .driver
+                    .arm(raw, left, interests::tag_of(raw))
+                    .is_err()
+            {
+                // Not armed again: wake the rest, whose calls then see what the driver refused.
+                self.core.counters.interests_refused =
+                    self.core.counters.interests_refused.saturating_add(1);
+                self.core.waiting.fire(raw, left, |word| {
+                    desk.wake_local(Encoded::from_word(word).slot());
+                });
+            }
+        }
+    }
+
     /// Harvests the driver's ready completions without blocking and queues their tasks; true when a
     /// completion was queued.
     fn harvest_io(&mut self) -> bool {
         let mut completions = std::mem::take(&mut self.core.completions);
         let result = self.core.driver.wait(Some(0), &mut completions);
         let harvested = !completions.is_empty();
-        for completion in completions.drain(..) {
-            self.core.counters.completions = self.core.counters.completions.saturating_add(1);
-            self.desk
-                .wake_local(Encoded::from_word(completion.user_data).slot());
-        }
+        self.deliver(&mut completions);
         self.core.completions = completions;
         if matches!(result, Err(RtError::DriverLost)) {
             self.core.counters.driver_lost = self.core.counters.driver_lost.saturating_add(1);
@@ -844,11 +897,7 @@ impl Shard {
         let timeout = deadline_ns.map(|d| d.saturating_sub(self.core.driver.now_ns()));
         let mut completions = std::mem::take(&mut self.core.completions);
         let result = self.core.driver.wait(timeout, &mut completions);
-        for completion in completions.drain(..) {
-            self.core.counters.completions = self.core.counters.completions.saturating_add(1);
-            self.desk
-                .wake_local(Encoded::from_word(completion.user_data).slot());
-        }
+        self.deliver(&mut completions);
         self.core.completions = completions;
         match result {
             Ok(()) => false,

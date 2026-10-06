@@ -37,7 +37,8 @@ enum Interest {
 pub struct Ready {
     target: Target,
     interest: Interest,
-    armed: bool,
+    /// The task word registered, while the wait is armed.
+    armed: Option<crate::mem::Encoded>,
 }
 
 /// What a readiness wait watches: an OS handle through the shard's driver, or a simulated socket through
@@ -55,13 +56,16 @@ impl Future for Ready {
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), RtError>> {
         let Some(word) = polling_task(cx.waker()) else {
-            // A foreign waker cannot be registered with the driver; degrade to a retry (the caller's loop copes).
-            return Poll::Ready(Ok(()));
+            // A waker that is not this shard's task (a combinator's, another runtime's, a poll off the shard)
+            // cannot be registered, and answering "ready" would make the caller's retry loop spin on the shard
+            // (mantle's review, finding 1): refused, as the synchronization primitives refuse it.
+            return Poll::Ready(Err(RtError::NotOnShardThread));
         };
-        if self.armed {
-            // Woken: by the driver, or by the loop handing back a registration the driver refused.
+        if let Some(armed) = self.armed {
+            // Woken: by the driver, or by the loop handing back a registration it refused.
+            self.armed = None;
             return Poll::Ready(
-                match registry::with_current(|ctx| ctx.take_interest_refusal(word)).flatten() {
+                match registry::with_current(|ctx| ctx.take_interest_refusal(armed)).flatten() {
                     Some(refusal) => Err(refusal),
                     None => Ok(()),
                 },
@@ -76,12 +80,24 @@ impl Future for Ready {
         };
         match registered {
             Some(Ok(())) => {
-                self.armed = true;
+                self.armed = Some(word);
                 Poll::Pending
             }
             Some(Err(e)) => Poll::Ready(Err(e)),
             None => Poll::Ready(Err(RtError::NotOnShardThread)),
         }
+    }
+}
+
+impl Drop for Ready {
+    /// A wait dropped while armed (a race lost, a task cancelled) leaves the shard's table, so abandoned waits
+    /// never accumulate there (mantle's review, finding 8's Unix half).
+    fn drop(&mut self) {
+        let (Some(word), Target::Os(raw)) = (self.armed, self.target) else {
+            return;
+        };
+        let writable = matches!(self.interest, Interest::Writable);
+        let _ = registry::with_current(|ctx| ctx.withdraw_interest(raw, writable, word));
     }
 }
 
@@ -92,7 +108,7 @@ pub async fn readable(raw: i32) -> Result<(), RtError> {
 }
 
 /// Awaits `raw`'s writability once (a real socket whose send buffer filled, or a connect in progress).
-pub(crate) async fn writable(raw: i32) -> Result<(), RtError> {
+pub async fn writable(raw: i32) -> Result<(), RtError> {
     ready(Target::Os(raw), true).await
 }
 
@@ -105,6 +121,6 @@ pub(crate) fn ready(target: Target, writable: bool) -> Ready {
         } else {
             Interest::Readable
         },
-        armed: false,
+        armed: None,
     }
 }

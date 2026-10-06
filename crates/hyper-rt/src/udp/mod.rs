@@ -264,6 +264,15 @@ impl UdpSocket {
         ready(self.target(), true)
     }
 
+    /// The handle [`crate::readiness::readable`] and [`crate::readiness::writable`] wait on; `-1` for a
+    /// simulated socket, whose waits go through [`UdpSocket::readable`].
+    pub fn readiness_handle(&self) -> i32 {
+        match self.target() {
+            Target::Os(raw) => raw,
+            Target::Sim(_) => -1,
+        }
+    }
+
     /// What a readiness wait on this socket watches.
     fn target(&self) -> Target {
         match &self.inner {

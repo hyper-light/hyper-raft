@@ -124,8 +124,23 @@ struct AfdPollInfo {
 pub(crate) struct Block {
     overlapped: OVERLAPPED,
     poll_info: AfdPollInfo,
-    /// The waker word the driver reports as the completion's `user_data`.
+    /// The handle's tag the driver reports as the completion's `user_data`.
     user_data: u64,
+    /// The events asked for, kept apart from `poll_info`, which the kernel overwrites with those that fired.
+    requested: u32,
+    /// Set when the driver cancelled the poll to replace it: its completion carries nothing to deliver.
+    cancelled: bool,
+}
+
+/// What a poll's completion carried.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Reclaimed {
+    /// The handle's tag.
+    pub(crate) user_data: u64,
+    /// The events that fired (none for a cancelled or failed poll).
+    pub(crate) fired: u32,
+    /// Whether the driver cancelled the poll.
+    pub(crate) cancelled: bool,
 }
 
 impl Block {
@@ -146,6 +161,8 @@ impl Block {
                 }],
             },
             user_data,
+            requested: events,
+            cancelled: false,
         };
         Box::into_raw(Box::new(block))
     }
@@ -155,10 +172,30 @@ impl Block {
     ///
     /// # Safety
     /// `ptr` must be a live `Block` leaked by [`Block::leak`] and delivered by the port, taken once.
-    pub(crate) unsafe fn reclaim(ptr: *mut Block) -> u64 {
+    pub(crate) unsafe fn reclaim(ptr: *mut Block) -> Reclaimed {
         // SAFETY: the contract above — a leaked block delivered once; `from_raw` takes ownership back.
         let block = unsafe { Box::from_raw(ptr) };
-        block.user_data
+        // The status the IOCTL left in the overlapped's head (`Internal`, the IO_STATUS_BLOCK's status).
+        let succeeded = block.overlapped.Internal == 0;
+        let fired = match block.poll_info.handles.first() {
+            Some(handle) if succeeded && !block.cancelled => handle.events,
+            _ => 0,
+        };
+        Reclaimed {
+            user_data: block.user_data,
+            fired,
+            cancelled: block.cancelled,
+        }
+    }
+
+    /// The events a poll still in flight asked for.
+    ///
+    /// # Safety
+    /// `ptr` must be a live `Block` leaked by [`Block::leak`] whose completion has not been reclaimed. The
+    /// kernel writes only the block's `overlapped` and `poll_info`; this reads neither.
+    pub(crate) unsafe fn requested(ptr: *mut Block) -> u32 {
+        // SAFETY: the contract above; `requested` is the driver's own field, which the kernel never touches.
+        unsafe { (*ptr).requested }
     }
 }
 
@@ -192,6 +229,11 @@ unsafe extern "system" {
     ) -> NTSTATUS;
 
     fn RtlNtStatusToDosError(status: NTSTATUS) -> u32;
+    fn NtCancelIoFileEx(
+        file_handle: HANDLE,
+        io_request_to_cancel: *mut IoStatusBlock,
+        io_status_block: *mut IoStatusBlock,
+    ) -> NTSTATUS;
 
     fn CloseHandle(handle: HANDLE) -> i32;
 }
@@ -309,6 +351,30 @@ impl Afd {
             // SAFETY: `block` was just leaked and no completion will be delivered for a failed arm.
             let _ = unsafe { Box::from_raw(block) };
             Err(nt_error("NtDeviceIoControlFile(IOCTL_AFD_POLL)", status))
+        }
+    }
+}
+
+impl Afd {
+    /// Cancels a poll still in flight, to replace it: its completion still arrives on the port (cancelled),
+    /// marked so the driver delivers nothing for it and only reclaims its block.
+    ///
+    /// # Safety
+    /// `ptr` must be a live `Block` this device's [`Afd::poll`] returned, whose completion has not been
+    /// reclaimed.
+    pub(crate) unsafe fn cancel(&self, ptr: *mut Block) {
+        let mut status = IoStatusBlock {
+            status: 0,
+            information: 0,
+        };
+        // SAFETY: the contract above. The `cancelled` flag is the driver's field, untouched by the kernel; the
+        // request's IO_STATUS_BLOCK is the block's `overlapped` head (the address the IOCTL was given), and
+        // `status` is a live local for the call's own result. A poll that completed meanwhile is not found
+        // (STATUS_NOT_FOUND) and its completion, already queued, is delivered as fired.
+        unsafe {
+            (*ptr).cancelled = true;
+            let request = std::ptr::addr_of_mut!((*ptr).overlapped).cast::<IoStatusBlock>();
+            NtCancelIoFileEx(self.handle, request, &raw mut status);
         }
     }
 }

@@ -10,6 +10,7 @@ use rustix::event::epoll::{self, CreateFlags, EventData, EventFlags};
 
 use crate::driver::{Completion, Driver, DriverKind, Kick, nanos_since, refused};
 use crate::error::RtError;
+use crate::interests::Readiness;
 
 /// Creates the kick eventfd both Linux drivers wake on; the registry owns it until every shard driver has
 /// retired.
@@ -114,9 +115,19 @@ impl Driver for EpollDriver {
             if data.u64() == KICK_TAG {
                 kicked = true;
             } else {
+                // An error or a hang-up is both directions' news: the waiter's call reports it.
+                let broken = flags.intersects(EventFlags::ERR | EventFlags::HUP);
+                let mut fired = Readiness::NONE;
+                if broken || flags.intersects(EventFlags::IN | EventFlags::PRI | EventFlags::RDHUP)
+                {
+                    fired = fired.union(Readiness::READ);
+                }
+                if broken || flags.contains(EventFlags::OUT) {
+                    fired = fired.union(Readiness::WRITE);
+                }
                 out.push(Completion {
                     user_data: data.u64(),
-                    result: i32::try_from(flags.bits()).unwrap_or(0),
+                    result: fired.bits(),
                 });
             }
         }
@@ -131,27 +142,15 @@ impl Driver for EpollDriver {
         Ok(())
     }
 
-    fn register_readable(&mut self, raw: i32, user_data: u64) -> Result<(), RtError> {
-        // One-shot readable interest whose u64 data carries the waker word; the `wait` loop above turns
-        // the ready event into a completion keyed by that word.
-        self.arm(
-            raw,
-            user_data,
-            EventFlags::IN | EventFlags::ONESHOT,
-            ("epoll_ctl(ADD readable)", "epoll_ctl(MOD readable)"),
-        )
-    }
-
-    fn register_writable(&mut self, raw: i32, user_data: u64) -> Result<(), RtError> {
-        // One-shot writable interest whose u64 data carries the waker word; the `wait` loop turns the
-        // ready event into a completion keyed by that word (§4.6, TCP send backpressure to a stalled
-        // client).
-        self.arm(
-            raw,
-            user_data,
-            EventFlags::OUT | EventFlags::ONESHOT,
-            ("epoll_ctl(ADD writable)", "epoll_ctl(MOD writable)"),
-        )
+    fn arm(&mut self, raw: i32, want: Readiness, tag: u64) -> Result<(), RtError> {
+        let mut flags = EventFlags::ONESHOT;
+        if want.contains(Readiness::READ) {
+            flags |= EventFlags::IN;
+        }
+        if want.contains(Readiness::WRITE) {
+            flags |= EventFlags::OUT;
+        }
+        self.arm_flags(raw, tag, flags)
     }
 
     fn has_pending(&self) -> bool {
@@ -167,24 +166,19 @@ impl EpollDriver {
     /// epoll_ctl with EPOLL_CTL_MOD to rearm"). Every await re-arms, so a receive loop's second await
     /// — the fleet's serve sockets after their first datagram — is the `MOD`
     /// (docs/bugs/2026-09-14-epoll-readiness-re-add-eexist.md).
-    fn arm(
-        &self,
-        raw: i32,
-        user_data: u64,
-        flags: EventFlags,
-        calls: (&'static str, &'static str),
-    ) -> Result<(), RtError> {
-        let (add_call, modify_call) = calls;
+    /// One registration of `raw` with `flags`, replacing any earlier one: `MOD` when it is registered, `ADD`
+    /// when it is not (a fresh descriptor, or one closed and reused since).
+    fn arm_flags(&self, raw: i32, user_data: u64, flags: EventFlags) -> Result<(), RtError> {
         // SAFETY: `raw` is a live socket the caller (a UdpSocket or TcpStream) owns for the registration;
         // the borrow is used only for these epoll_ctl calls and not retained.
         let fd = unsafe { std::os::fd::BorrowedFd::borrow_raw(raw) };
         let data = EventData::new_u64(user_data);
-        match epoll::add(&self.epfd, fd, data, flags) {
+        match epoll::modify(&self.epfd, fd, data, flags) {
             Ok(()) => Ok(()),
-            Err(rustix::io::Errno::EXIST) => {
-                epoll::modify(&self.epfd, fd, data, flags).map_err(|e| refused(modify_call, e))
+            Err(rustix::io::Errno::NOENT) => {
+                epoll::add(&self.epfd, fd, data, flags).map_err(|e| refused("epoll_ctl(ADD)", e))
             }
-            Err(e) => Err(refused(add_call, e)),
+            Err(e) => Err(refused("epoll_ctl(MOD)", e)),
         }
     }
 }

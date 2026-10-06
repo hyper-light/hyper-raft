@@ -21,6 +21,7 @@ use rustix::event::kqueue::{
 
 use crate::driver::{Completion, Driver, DriverKind, Kick, nanos_since, refused};
 use crate::error::RtError;
+use crate::interests::Readiness;
 
 /// Format: the identifier of the kick event on the queue.
 const KICK_IDENT: isize = 0;
@@ -143,12 +144,15 @@ impl Driver for KqueueDriver {
         }
         // Kick events carry nothing; other filters (later phases) become completions keyed by udata.
         for ev in &self.events {
-            if !matches!(ev.filter(), EventFilter::User { .. }) {
-                out.push(Completion {
-                    user_data: u64::try_from(ev.udata().addr()).unwrap_or(0),
-                    result: 0,
-                });
-            }
+            let fired = match ev.filter() {
+                EventFilter::User { .. } => continue,
+                EventFilter::Write(_) => Readiness::WRITE,
+                _ => Readiness::READ,
+            };
+            out.push(Completion {
+                user_data: u64::try_from(ev.udata().addr()).unwrap_or(0),
+                result: fired.bits(),
+            });
         }
         Ok(())
     }
@@ -158,42 +162,34 @@ impl Driver for KqueueDriver {
         Ok(())
     }
 
-    fn register_readable(&mut self, raw: i32, user_data: u64) -> Result<(), RtError> {
-        // A one-shot read filter whose udata carries the waker word; the `wait` loop above turns the
-        // ready event into a completion keyed by that word (the same path the kick's siblings take).
-        let event = Event::new(
-            EventFilter::Read(raw),
-            EventFlags::ADD | EventFlags::ONESHOT,
-            core::ptr::without_provenance_mut(usize::try_from(user_data).unwrap_or(usize::MAX)),
-        );
+    fn arm(&mut self, raw: i32, want: Readiness, tag: u64) -> Result<(), RtError> {
+        // One filter per direction, each its own registration (ident and filter), so arming one never
+        // touches the other; a filter armed earlier and no longer wanted fires once, to no waiter.
+        let udata = core::ptr::without_provenance_mut(usize::try_from(tag).unwrap_or(usize::MAX));
+        let read = want.contains(Readiness::READ).then(|| {
+            Event::new(
+                EventFilter::Read(raw),
+                EventFlags::ADD | EventFlags::ONESHOT,
+                udata,
+            )
+        });
+        let write = want.contains(Readiness::WRITE).then(|| {
+            Event::new(
+                EventFilter::Write(raw),
+                EventFlags::ADD | EventFlags::ONESHOT,
+                udata,
+            )
+        });
         let mut none: Vec<Event> = Vec::new();
-        self.kq
-            .with(|kq| {
-                // SAFETY: one valid change record on the open queue; the output buffer receives nothing.
-                unsafe { kevent(kq, &[event], &mut none, None) }
-            })
-            .ok_or(RtError::DriverLost)?
-            .map_err(|e| refused("kevent(EVFILT_READ)", e))?;
-        Ok(())
-    }
-
-    fn register_writable(&mut self, raw: i32, user_data: u64) -> Result<(), RtError> {
-        // A one-shot write filter whose udata carries the waker word; the `wait` loop turns the ready
-        // event into a completion keyed by that word, exactly as the read filter does. The socket becomes
-        // writable when its send buffer has space again (§4.6, TCP send backpressure to a stalled client).
-        let event = Event::new(
-            EventFilter::Write(raw),
-            EventFlags::ADD | EventFlags::ONESHOT,
-            core::ptr::without_provenance_mut(usize::try_from(user_data).unwrap_or(usize::MAX)),
-        );
-        let mut none: Vec<Event> = Vec::new();
-        self.kq
-            .with(|kq| {
-                // SAFETY: one valid change record on the open queue; the output buffer receives nothing.
-                unsafe { kevent(kq, &[event], &mut none, None) }
-            })
-            .ok_or(RtError::DriverLost)?
-            .map_err(|e| refused("kevent(EVFILT_WRITE)", e))?;
+        for change in [read, write].into_iter().flatten() {
+            self.kq
+                .with(|kq| {
+                    // SAFETY: one valid change record on the open queue; the output buffer receives nothing.
+                    unsafe { kevent(kq, &[change], &mut none, None) }
+                })
+                .ok_or(RtError::DriverLost)?
+                .map_err(|e| refused("kevent(EV_ADD)", e))?;
+        }
         Ok(())
     }
 

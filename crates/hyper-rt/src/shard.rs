@@ -130,6 +130,8 @@ pub(crate) struct Interest {
     pub(crate) raw: i32,
     pub(crate) writable: bool,
     pub(crate) word: Encoded,
+    /// A wait whose future dropped before it fired, leaving the table.
+    pub(crate) withdraw: bool,
 }
 
 /// The values a shard keeps for its life, filled before its first step and immutable afterwards (slates'
@@ -601,11 +603,23 @@ impl ShardContext {
                 raw,
                 writable,
                 word,
+                withdraw: false,
             })
             .map_err(|_| RtError::Capacity {
                 what: "readiness registrations",
                 bound: self.interests.capacity(),
             })
+    }
+
+    /// Withdraws a readiness wait whose future dropped before it fired. Best effort: with the intent ring full
+    /// the wait stays in the table until its handle fires, waking the task once, spuriously.
+    pub fn withdraw_interest(&self, raw: i32, writable: bool, word: Encoded) {
+        let _ = self.interests.push(Interest {
+            raw,
+            writable,
+            word,
+            withdraw: true,
+        });
     }
 
     /// The refusal the driver gave the polling task's last readiness registration, if any (taken).

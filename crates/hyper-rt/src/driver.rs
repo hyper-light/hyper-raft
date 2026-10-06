@@ -175,19 +175,15 @@ pub trait Driver {
     /// self-test; every real operation follows the same path).
     fn submit_nop(&mut self, user_data: u64) -> Result<(), RtError>;
 
-    /// Registers one-shot interest in `raw`'s readability (a UDP socket for the fleet transport,
-    /// §4.10a; a TCP listener or stream for the loopback bridge, §4.6): when it next becomes readable, a
-    /// completion carrying `user_data` arrives on a following `wait` (re-registered after each read).
-    /// `raw` is the OS handle (a `RawFd` on Unix, a `SOCKET` on Windows): kqueue `EVFILT_READ`, epoll
-    /// `EPOLLIN`, IOCP an AFD poll (`crate::afd`).
-    fn register_readable(&mut self, raw: i32, user_data: u64) -> Result<(), RtError>;
-
-    /// Registers one-shot interest in `raw`'s writability (a TCP stream whose send buffer filled while
-    /// the loopback bridge wrote a reply, §4.6): when it next has send-buffer space, a completion
-    /// carrying `user_data` arrives on a following `wait` (re-registered after each blocked write), so a
-    /// write to a stalled peer yields the shard instead of blocking it. `raw` is the OS handle: kqueue
-    /// `EVFILT_WRITE`, epoll `EPOLLOUT`, IOCP an AFD send poll.
-    fn register_writable(&mut self, raw: i32, user_data: u64) -> Result<(), RtError>;
+    /// Arms one-shot interest in `raw`'s readiness in the directions `want` (readable: data, a connection to
+    /// accept, end of stream, an error; writable: send-buffer space, a connect's result), replacing any
+    /// earlier arming of `raw`: when one of them next holds, a completion carrying `tag` and the directions
+    /// that fired (`result`, as [`crate::interests::Readiness`] bits) arrives on a following `wait`. The loop
+    /// keeps the waiters per handle and arms the union (`crate::interests`). `raw` is the OS handle (a `RawFd`
+    /// on Unix, a `SOCKET` on Windows): epoll `EPOLLIN`/`EPOLLOUT`, kqueue `EVFILT_READ`/`EVFILT_WRITE`, IOCP
+    /// one AFD poll per socket.
+    fn arm(&mut self, raw: i32, want: crate::interests::Readiness, tag: u64)
+    -> Result<(), RtError>;
 
     /// Whether a `wait` would return a completion or a kick without blocking, as far as the driver
     /// can tell without a syscall (an idle loop skips the wait when this is false).
@@ -435,7 +431,11 @@ mod tests {
         let mut driver = (prepared.seed)(kick).unwrap();
         let (reader, writer) = rustix::pipe::pipe().unwrap();
         driver
-            .register_readable(std::os::fd::AsRawFd::as_raw_fd(&reader), PIPE_TAG)
+            .arm(
+                std::os::fd::AsRawFd::as_raw_fd(&reader),
+                crate::interests::Readiness::READ,
+                PIPE_TAG,
+            )
             .unwrap();
         rustix::io::write(&writer, &[1]).unwrap();
         let mut out = Vec::new();

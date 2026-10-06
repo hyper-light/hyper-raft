@@ -297,6 +297,12 @@ impl TcpStream {
         Ok(TcpStream { stream, slot: None })
     }
 
+    /// The handle [`crate::readiness::readable`] and [`crate::readiness::writable`] wait on (an fd on Unix,
+    /// a socket's low 32 bits on Windows): for a wait kept apart from the stream's own calls.
+    pub fn readiness_handle(&self) -> i32 {
+        self.stream.raw_id()
+    }
+
     /// The stream's seam handle.
     pub(crate) fn seam(&self) -> &Stream {
         &self.stream

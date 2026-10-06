@@ -217,8 +217,8 @@ fn poll_value<T>(tried: &mut Result<Option<T>, SyncError<()>>) -> Option<Result<
 #[derive(Debug)]
 pub struct Sender<T> {
     value: SyncSender<T>,
-    /// Where a sender that found the channel full queues its word to be woken when room appears.
-    room: SyncSender<u64>,
+    /// Where a sender that found the channel full queues its waiter cell to be woken when room appears.
+    room: SyncSender<CellRef>,
     cell: CellRef,
 }
 
@@ -226,23 +226,37 @@ pub struct Sender<T> {
 #[derive(Debug)]
 pub struct ChannelReceiver<T> {
     value: Receiver<T>,
-    room: Receiver<u64>,
+    room: Receiver<CellRef>,
     cell: CellRef,
 }
+
+/// Format: the channel cell's state bit set when a sender that was handed room dropped its send unused: the
+/// receiver passes that room to the next waiting sender (mantle's review of hyper-rt, finding 3).
+const OWED: u64 = 1 << 4;
 
 /// A bounded channel of `capacity` values from any number of senders to one receiver. A sender waiting for
 /// room queues its word, at most `capacity` of them (a sender past that is told `Full`), and the receiver
 /// wakes one waiting sender for each value it takes, oldest first. Refused `Capacity` at the cell bound and
 /// `BadConfig` for a zero capacity.
 pub fn channel<T>(capacity: usize) -> Result<(Sender<T>, ChannelReceiver<T>), RtError> {
-    if capacity == 0 {
+    channel_with(capacity, capacity)
+}
+
+/// A bounded channel of `capacity` values, with room for `waiters` senders waiting at once (past it a send
+/// is told `Full`): for many concurrent senders on a small channel. Refused `BadConfig` for a zero capacity or
+/// no waiters.
+pub fn channel_with<T>(
+    capacity: usize,
+    waiters: usize,
+) -> Result<(Sender<T>, ChannelReceiver<T>), RtError> {
+    if capacity == 0 || waiters == 0 {
         return Err(RtError::BadConfig {
-            what: "a channel of no capacity",
+            what: "a channel of no capacity, or no room for a waiting sender",
         });
     }
     let cell = claim(2)?;
     let (value, receiver) = sync_channel(capacity);
-    let (room, waiting) = sync_channel(capacity);
+    let (room, waiting) = sync_channel(waiters);
     Ok((
         Sender { value, room, cell },
         ChannelReceiver {
@@ -300,20 +314,72 @@ impl<T> Sender<T> {
         Send {
             sender: self,
             value: Some(value),
-            queued: false,
+            waiter: None,
         }
     }
 }
 
 /// The wait of [`Sender::send`].
+///
+/// A sender that finds the channel full queues a waiter cell of its own (state 0, waiting) behind the senders
+/// already waiting. The receiver, taking a value, grants the room to the oldest live waiter (0 → `GRANTED`)
+/// and wakes it, skipping waiters that left (`ABANDONED`). A woken sender whose room a racing sender took
+/// queues again; one dropped while waiting leaves its cell `ABANDONED`; one dropped after its grant, unused,
+/// marks the channel `OWED` and wakes the receiver, which hands the room on (mantle's review, finding 3: a
+/// woken sender used to wait for good, and a cancelled one's word used to spend a later wake).
 #[derive(Debug)]
 pub struct Send<'a, T> {
     sender: &'a Sender<T>,
     value: Option<T>,
-    queued: bool,
+    /// The waiter cell queued for room, while one is.
+    waiter: Option<CellRef>,
 }
 
 impl<T> Unpin for Send<'_, T> {}
+
+impl<T> Send<'_, T> {
+    /// Leaves the queue: the waiter's cell marked abandoned, unless the room was granted to it and not `used`,
+    /// which then passes on through the receiver.
+    fn leave(&mut self, used: bool) {
+        let Some(waiter) = self.waiter.take() else {
+            return;
+        };
+        if let Some(words) = waiter.cell() {
+            let previous =
+                words
+                    .state
+                    .compare_exchange(0, ABANDONED, Ordering::AcqRel, Ordering::Acquire);
+            if previous == Err(GRANTED) && !used {
+                if let Some(channel) = self.sender.cell.cell() {
+                    channel.state.fetch_or(OWED, Ordering::AcqRel);
+                }
+                self.sender.cell.wake();
+            }
+        }
+        waiter.release();
+    }
+
+    /// Queues a waiter cell holding `word`; `false` when the queue of waiting senders is full or no cell is free.
+    fn queue(&mut self, word: crate::mem::Encoded) -> bool {
+        let Ok(waiter) = claim(2) else {
+            return false;
+        };
+        waiter.register(word);
+        if self.sender.room.try_send(waiter).is_err() {
+            waiter.release();
+            waiter.release();
+            return false;
+        }
+        self.waiter = Some(waiter);
+        true
+    }
+}
+
+impl<T> Drop for Send<'_, T> {
+    fn drop(&mut self) {
+        self.leave(false);
+    }
+}
 
 impl<T> Future for Send<'_, T> {
     type Output = Result<(), SyncError<T>>;
@@ -323,28 +389,52 @@ impl<T> Future for Send<'_, T> {
             return Poll::Ready(Ok(()));
         };
         let value = match self.sender.try_send(value) {
-            Ok(()) => return Poll::Ready(Ok(())),
+            Ok(()) => {
+                self.leave(true);
+                return Poll::Ready(Ok(()));
+            }
             Err(SyncError::Full(value)) => value,
-            Err(refused) => return Poll::Ready(Err(refused)),
+            Err(refused) => {
+                self.leave(true);
+                return Poll::Ready(Err(refused));
+            }
         };
         let Some(word) = polling_task(cx.waker()) else {
+            self.leave(false);
             return Poll::Ready(Err(SyncError::NotOnShardThread(value)));
         };
-        // Queue for room once per wait; a queue already full of waiting senders is `Full` for this one.
-        if !self.queued {
-            if self.sender.room.try_send(word.word()).is_err() {
+        // Still waiting with a cell not yet granted: keep the place, with the latest word registered.
+        let waiting = self
+            .waiter
+            .and_then(CellRef::cell)
+            .is_some_and(|words| words.state.load(Ordering::Acquire) == 0);
+        if waiting {
+            if let Some(waiter) = self.waiter {
+                waiter.register(word);
+            }
+        } else {
+            // No place yet, or the room granted was taken by a racing sender: queue again, at the back.
+            if let Some(granted) = self.waiter.take() {
+                granted.release();
+            }
+            if !self.queue(word) {
                 return Poll::Ready(Err(SyncError::Full(value)));
             }
-            self.queued = true;
         }
         // Room may have appeared between the try and the queueing: try again before waiting.
         match self.sender.try_send(value) {
-            Ok(()) => Poll::Ready(Ok(())),
+            Ok(()) => {
+                self.leave(true);
+                Poll::Ready(Ok(()))
+            }
             Err(SyncError::Full(value)) => {
                 self.value = Some(value);
                 Poll::Pending
             }
-            Err(refused) => Poll::Ready(Err(refused)),
+            Err(refused) => {
+                self.leave(true);
+                Poll::Ready(Err(refused))
+            }
         }
     }
 }
@@ -352,6 +442,7 @@ impl<T> Future for Send<'_, T> {
 impl<T> ChannelReceiver<T> {
     /// Takes a value without waiting: `None` when the channel is empty, `Closed` when every sender is gone.
     pub fn try_recv(&mut self) -> Result<Option<T>, SyncError<()>> {
+        self.settle_owed();
         match self.value.try_recv() {
             Ok(value) => {
                 self.wake_one_sender();
@@ -374,10 +465,34 @@ impl<T> ChannelReceiver<T> {
         Recv { receiver: self }
     }
 
-    /// The room one value made goes to the sender that waited longest.
+    /// The room one value made goes to the live sender that waited longest; waiters that left are skipped,
+    /// at most the queue's length of them.
     fn wake_one_sender(&self) {
-        if let Ok(word) = self.room.try_recv() {
-            crate::registry::wake(crate::mem::Encoded::from_word(word));
+        while let Ok(waiter) = self.room.try_recv() {
+            let granted = waiter.cell().is_some_and(|words| {
+                words
+                    .state
+                    .compare_exchange(0, GRANTED, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+            });
+            if granted {
+                waiter.wake();
+            }
+            waiter.release();
+            if granted {
+                return;
+            }
+        }
+    }
+
+    /// Hands on room a sender was granted and dropped unused (`OWED`).
+    fn settle_owed(&self) {
+        if self
+            .cell
+            .cell()
+            .is_some_and(|cell| cell.state.fetch_and(!OWED, Ordering::AcqRel) & OWED != 0)
+        {
+            self.wake_one_sender();
         }
     }
 }
@@ -385,8 +500,9 @@ impl<T> ChannelReceiver<T> {
 impl<T> Drop for ChannelReceiver<T> {
     fn drop(&mut self) {
         // Senders waiting for room learn the receiver is gone when they try again.
-        while let Ok(word) = self.room.try_recv() {
-            crate::registry::wake(crate::mem::Encoded::from_word(word));
+        while let Ok(waiter) = self.room.try_recv() {
+            waiter.wake();
+            waiter.release();
         }
         self.cell.release();
     }
@@ -428,6 +544,10 @@ pub struct WatchSender {
     joiner: SyncSender<CellRef>,
     /// The receivers' cells this sender wakes at each send, at most the bound.
     receivers: Vec<CellRef>,
+    /// The live receivers' count (`state`), shared with them: a clone takes a place under the bound, a dropped
+    /// receiver gives it back (mantle's review, finding 4: a clone checked only the joining queue's room, so
+    /// past the bound one succeeded that the sender never took in, and it never woke).
+    census: CellRef,
 }
 
 /// A receiving half of a watched word: reads the latest value and waits for the next change. Clone it for
@@ -442,6 +562,20 @@ pub struct WatchReceiver {
     seen: u64,
     /// The most receivers the word may have.
     bound: usize,
+    /// The live receivers' count, shared with the sender.
+    census: CellRef,
+}
+
+/// Takes a receiver's place in `census` under `bound`; `false` at the bound.
+fn take_place(census: CellRef, bound: usize) -> bool {
+    let bound = u64::try_from(bound).unwrap_or(u64::MAX);
+    census.cell().is_some_and(|cell| {
+        cell.state
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |live| {
+                (live < bound).then(|| live.saturating_add(1))
+            })
+            .is_ok()
+    })
 }
 
 /// A watched word starting at `initial`, read by at most `receivers` receivers at once (past it, a clone is
@@ -457,6 +591,14 @@ pub fn watch(initial: u64, receivers: usize) -> Result<(WatchSender, WatchReceiv
         cell.state.store(initial, Ordering::Release);
     }
     let own = claim(1).inspect_err(|_| shared.release())?;
+    let census = claim(2).inspect_err(|_| {
+        shared.release();
+        shared.release();
+        own.release();
+    })?;
+    if let Some(cell) = census.cell() {
+        cell.state.store(1, Ordering::Release);
+    }
     let (joiner, joining) = sync_channel(receivers);
     let mut list = Vec::new();
     list.try_reserve_exact(receivers)
@@ -471,6 +613,7 @@ pub fn watch(initial: u64, receivers: usize) -> Result<(WatchSender, WatchReceiv
             joining,
             joiner: joiner.clone(),
             receivers: list,
+            census,
         },
         WatchReceiver {
             shared,
@@ -478,6 +621,7 @@ pub fn watch(initial: u64, receivers: usize) -> Result<(WatchSender, WatchReceiv
             joiner,
             seen: 0,
             bound: receivers,
+            census,
         },
     ))
 }
@@ -501,16 +645,25 @@ impl WatchSender {
 
     /// A receiver of this word (refused `Capacity` at the bound).
     pub fn subscribe(&mut self) -> Result<WatchReceiver, RtError> {
-        let own = claim(1)?;
-        self.take_joining();
-        if self.receivers.len() >= self.receivers.capacity() {
-            own.release();
+        let bound = self.receivers.capacity();
+        if !take_place(self.census, bound) {
             return Err(RtError::Capacity {
                 what: "watch receivers",
-                bound: self.receivers.capacity(),
+                bound,
+            });
+        }
+        let own = claim(1).inspect_err(|_| give_place(self.census))?;
+        self.take_joining();
+        if self.receivers.len() >= bound {
+            own.release();
+            give_place(self.census);
+            return Err(RtError::Capacity {
+                what: "watch receivers",
+                bound,
             });
         }
         self.cell.retain();
+        self.census.retain();
         self.receivers.push(own);
         Ok(WatchReceiver {
             shared: self.cell,
@@ -521,6 +674,7 @@ impl WatchSender {
                 .cell()
                 .map_or(0, |cell| cell.aux.load(Ordering::Acquire)),
             bound: self.receivers.capacity(),
+            census: self.census,
         })
     }
 
@@ -551,6 +705,18 @@ impl Drop for WatchSender {
         }
         self.wake_receivers();
         self.cell.release();
+        self.census.release();
+    }
+}
+
+/// Gives a receiver's place in `census` back.
+fn give_place(census: CellRef) {
+    if let Some(cell) = census.cell() {
+        let _ = cell
+            .state
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |live| {
+                live.checked_sub(1)
+            });
     }
 }
 
@@ -597,29 +763,40 @@ impl WatchReceiver {
     /// Another receiver of the same word, seeing what this one has seen. Refused `Capacity` at the cell bound
     /// or at the sender's bound on receivers (the sender takes it in at its next send).
     pub fn try_clone(&self) -> Result<Self, RtError> {
-        let own = claim(1)?;
+        if !take_place(self.census, self.bound) {
+            return Err(RtError::Capacity {
+                what: "watch receivers",
+                bound: self.bound,
+            });
+        }
+        let own = claim(1).inspect_err(|_| give_place(self.census))?;
         if self.joiner.try_send(own).is_err() {
             own.release();
+            give_place(self.census);
             return Err(RtError::Capacity {
                 what: "watch receivers",
                 bound: self.bound,
             });
         }
         self.shared.retain();
+        self.census.retain();
         Ok(Self {
             shared: self.shared,
             own,
             joiner: self.joiner.clone(),
             seen: self.seen,
             bound: self.bound,
+            census: self.census,
         })
     }
 }
 
 impl Drop for WatchReceiver {
     fn drop(&mut self) {
+        give_place(self.census);
         self.own.release();
         self.shared.release();
+        self.census.release();
     }
 }
 

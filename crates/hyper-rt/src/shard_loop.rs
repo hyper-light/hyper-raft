@@ -117,6 +117,9 @@ pub struct Counters {
     pub pin_refused: u64,
     /// Readiness registrations the driver refused (each handed to its task's next poll).
     pub interests_refused: u64,
+    /// Marks of waits dropped away from this shard that its sweeps visited: one per marked slot, never a
+    /// pass over every slot.
+    pub abandons_swept: u64,
 }
 
 /// Shape: the exponential-forgetting shift of the measured scheduler overrun — an overrun not renewed
@@ -982,7 +985,9 @@ impl Shard {
             .abandons_marked
             .swap(false, std::sync::atomic::Ordering::AcqRel)
         {
-            self.desk.sweep_abandoned();
+            let visited = self.desk.sweep_abandoned();
+            self.core.counters.abandons_swept =
+                self.core.counters.abandons_swept.saturating_add(visited);
             drained = drained.saturating_add(1);
         }
         // The runtime's stop, after this batch's messages: a Shutdown at the back of the batch that took no
@@ -1051,7 +1056,6 @@ impl Shard {
             Control::Cancel(word) => {
                 let _ = self.desk.cancel(TaskId(word));
             }
-
             Control::Shutdown => {
                 self.core.shutting_down = true;
                 self.cancel_all();

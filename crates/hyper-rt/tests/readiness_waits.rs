@@ -275,3 +275,68 @@ fn a_wait_dropped_elsewhere_ends_on_its_shard_with_its_control_channel_full() {
         "no end of a wait was lost"
     );
 }
+
+/// Mantle's final review, fourth pass, E. Do: on a shard with thousands of wait slots, arm one wait,
+/// drop it on another shard, and let the owner sweep. Expect: the owner's sweeps visited exactly one mark
+/// (its summary bitmap names the marked slot), and the slot came back. The sweep used to swap every
+/// slot's mark for one drop.
+#[test]
+fn a_sweep_visits_only_the_marked_slots() {
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::mpsc::channel;
+    use std::task::Poll;
+
+    use hyper_rt::runtime::Runtime;
+    use hyper_rt::sync::oneshot;
+
+    /// Shape: wait slots a shard holds, so a pass over all of them would be unmistakable.
+    const MANY: usize = 4096;
+    /// Shape: yields the owner gives its loop to sweep and withdraw before it reports.
+    const SETTLE_YIELDS: usize = 64;
+
+    let rt = Runtime::start(&RuntimeConfig {
+        shards: 2,
+        interests_per_shard: MANY,
+        ..config()
+    })
+    .unwrap();
+    let (a, b) = (rt.shard_ids()[0], rt.shard_ids()[1]);
+    let (moved, arrives) = oneshot().unwrap();
+    let (finished, done) = oneshot::<()>().unwrap();
+    let (report, reports) = channel();
+    rt.spawn_on(a, async move {
+        let ours = UdpSocket::bind(loopback()).unwrap();
+        let mut armed = ours.readable();
+        std::future::poll_fn(|cx| {
+            let _ = Pin::new(&mut armed).poll(cx);
+            Poll::Ready(())
+        })
+        .await;
+        let _ = moved.send(armed);
+        let _ = done.await;
+        let mut left = waits_held();
+        for _ in 0..SETTLE_YIELDS {
+            if left == 0 {
+                break;
+            }
+            yield_now().await;
+            left = waits_held();
+        }
+        let _ = report.send(left);
+        drop(ours);
+    })
+    .unwrap();
+    rt.spawn_on(b, async move {
+        drop(arrives.await.unwrap());
+        let _ = finished.send(());
+    })
+    .unwrap();
+    let left = reports.recv().unwrap();
+    let counters = rt.shutdown().unwrap();
+    assert_eq!(left, 0, "the dropped wait's slot came back");
+    assert_eq!(
+        counters[0].abandons_swept, 1,
+        "one drop, one mark visited, of {MANY} slots"
+    );
+}

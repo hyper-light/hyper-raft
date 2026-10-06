@@ -341,7 +341,9 @@ against it on those rows of §12 before the choice is fixed (slates-dc's review)
   it. A wait dropped on another shard, or off any, is marked on its shard's registry entry: one atomic word
   per wait slot, holding the dropped wait's generation. A slot's generation is dropped at most once, so a
   mark is never refused for room. The control channel was not used for this, because a full one leaked the
-  slot. The shard's next control drain sweeps the marks.
+  slot. The shard's next control drain sweeps the marks. A summary bitmap with one bit per slot lets the
+  sweep visit only the marked slots, O(slots / 64 + marked), never a pass over tens of thousands of slots
+  for one drop (`Counters::abandons_swept` counts the visits).
 
 The tests are `tests/readiness_waits.rs`, `tests/duplex.rs` and the table's model test.
 

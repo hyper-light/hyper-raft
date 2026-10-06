@@ -726,38 +726,60 @@ impl ShardContext {
     }
 
     /// Ends the waits of this shard dropped on another shard or off any, from their marks on the registry
-    /// entry ([`crate::registry::Entry::mark_abandoned`]): each as if dropped here. A mark of an ended
-    /// generation names nothing. Bounded by the wait slots.
-    pub(crate) fn sweep_abandoned(&self) {
-        let Some(entry) = self.entry else {
-            return;
+    /// entry ([`crate::registry::Entry::mark_abandoned`]): each as if dropped here. Only the slots whose
+    /// summary bit is set are visited, O(slots / 64 + marked). A mark of an ended generation names nothing.
+    /// Returns the marks visited.
+    pub(crate) fn sweep_abandoned(&self) -> u64 {
+        let (Some(entry), Some(owner)) = (self.entry, self.incarnation) else {
+            return 0;
         };
-        let Some(owner) = self.incarnation else {
-            return;
-        };
-        for (slot, mark) in entry.abandoned.iter().enumerate() {
-            let marked = mark.swap(0, std::sync::atomic::Ordering::AcqRel);
-            let (Some(generation), Ok(slot)) = (
-                marked
-                    .checked_sub(1)
-                    .and_then(|generation| u32::try_from(generation).ok()),
-                u32::try_from(slot),
-            ) else {
-                continue;
-            };
-            let ticket = Ticket {
-                owner,
-                slot,
-                generation,
-            };
-            let Some(cell) = self.wait_of(ticket) else {
-                continue;
-            };
-            let Some(word) = cell.word.get() else {
-                continue;
-            };
-            self.abandon_interest(cell.raw.get(), cell.writable.get(), word, ticket);
+        let mut visited = 0u64;
+        for (index, summary) in entry.abandoned_summary.iter().enumerate() {
+            let mut bits = summary.swap(0, std::sync::atomic::Ordering::AcqRel);
+            while bits != 0 {
+                let bit = bits.trailing_zeros();
+                bits &= bits.wrapping_sub(1);
+                let Some(slot) = u32::try_from(index)
+                    .ok()
+                    .and_then(|index| index.checked_mul(u64::BITS))
+                    .and_then(|base| base.checked_add(bit))
+                else {
+                    continue;
+                };
+                visited = visited.saturating_add(1);
+                self.sweep_slot(entry, owner, slot);
+            }
         }
+        visited
+    }
+
+    /// Ends the wait in `slot` if its mark names its live generation.
+    fn sweep_slot(&self, entry: &Entry, owner: crate::registry::SlotHolder, slot: u32) {
+        let Some(mark) = usize::try_from(slot)
+            .ok()
+            .and_then(|slot| entry.abandoned.get(slot))
+        else {
+            return;
+        };
+        let marked = mark.swap(0, std::sync::atomic::Ordering::AcqRel);
+        let Some(generation) = marked
+            .checked_sub(1)
+            .and_then(|generation| u32::try_from(generation).ok())
+        else {
+            return;
+        };
+        let ticket = Ticket {
+            owner,
+            slot,
+            generation,
+        };
+        let Some(cell) = self.wait_of(ticket) else {
+            return;
+        };
+        let Some(word) = cell.word.get() else {
+            return;
+        };
+        self.abandon_interest(cell.raw.get(), cell.writable.get(), word, ticket);
     }
 
     /// Gives a wait's slot back: its generation moves on, so the ended wait's ticket names nothing.

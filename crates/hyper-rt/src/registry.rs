@@ -93,6 +93,10 @@ pub struct Entry {
     /// third pass, A). A slot's generation is abandoned at most once, so a mark never overwrites one still
     /// owed, and the marks need no room the control channel could lack: a dropped wait is never refused.
     pub(crate) abandoned: Box<[AtomicU64]>,
+    /// One bit per wait slot, set with its mark: the sweep visits only the marked slots, O(slots / 64 +
+    /// marked), not every mark (mantle's final review, fourth pass, E: tens of thousands of slots a shard at
+    /// agentic scale made one foreign drop a pass over as many cache lines on the owner's loop).
+    pub(crate) abandoned_summary: Box<[AtomicU64]>,
     /// Set with a mark; the shard sweeps the marks when it takes this.
     pub(crate) abandons_marked: AtomicBool,
 }
@@ -109,6 +113,15 @@ impl Entry {
             return false;
         };
         mark.store(u64::from(generation).saturating_add(1), Ordering::Release);
+        // The slot's summary bit after its mark: a sweep that takes the bit then finds the mark.
+        let (word, bit) = (slot / u64::BITS, slot % u64::BITS);
+        let Some(summary) = usize::try_from(word)
+            .ok()
+            .and_then(|word| self.abandoned_summary.get(word))
+        else {
+            return false;
+        };
+        summary.fetch_or(1u64 << bit, Ordering::AcqRel);
         self.abandons_marked.store(true, Ordering::Release);
         self.control_pending.publish();
         self.parking.kick_if_parked(|| self.kick.kick());
@@ -424,6 +437,7 @@ pub(crate) fn register_slot(
             pulse: Pulse::default(),
             exited: AtomicBool::new(false),
             abandoned: (0..waits).map(|_| AtomicU64::new(0)).collect(),
+            abandoned_summary: (0..waits.div_ceil(64)).map(|_| AtomicU64::new(0)).collect(),
             abandons_marked: AtomicBool::new(false),
         });
         entry.kick = match kick {

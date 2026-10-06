@@ -446,7 +446,7 @@ impl Runtime {
             let ready = ready.clone();
             #[allow(
                 clippy::disallowed_methods,
-                reason = "the runtime owns one thread per shard (docs/runtime.md §3): the one place a thread is started"
+                reason = "the runtime owns one thread per shard (docs/runtime.md §3)"
             )]
             let spawned = std::thread::Builder::new()
                 .name(format!("hyper-rt-shard-{id}"))

@@ -50,8 +50,10 @@
 )]
 
 mod attribution;
+pub mod blocking;
 mod cells;
 pub mod control;
+pub mod dns;
 pub mod driver;
 pub mod error;
 pub mod futures;

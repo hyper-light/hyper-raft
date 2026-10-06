@@ -132,8 +132,15 @@ its own "a message to a spinning shard costs no syscall" (NOTE08 §3.1).
 hyper-rt keeps the local push and replaces both rings with a **wake bitmap** per shard: one bit per task
 slot, in 64-bit words with a summary word above every 64 (a two-level scalable bitmap, the structure
 blk-mq uses for its tags [SBITMAP]). A wake from another thread is one `fetch_or` on the slot's bit, one
-on its summary bit, and a kick only if the shard is parked (the loom-checked protocol, §3.5). The shard
-drains by reading the summary words and swapping each marked word to zero.
+on its summary bit **only when the word went from empty to non-empty** (as sbitmap does: most wakes then
+touch one cache line, not the summary word all wakers of 4,096 slots share), and a kick only if the shard
+is parked (the loom-checked protocol, §3.5). The shard drains by swapping each marked summary word to zero
+and then each marked word: **summary before word**, so a wake landing between them is either in the word
+the drain takes or marks the summary again for the next drain. A drain **starts where the last one
+stopped** and wraps, so under a step's batch bound high slots do not always queue behind low ones (a p99
+tail on a loaded shard otherwise). The three changes follow slates-dc's review (2026-10-06); the two
+wakers-of-one-word-against-a-drain interleavings are a loom model in `wakes.rs` (47 interleavings), which
+fails when the drain clears the summary after the word.
 
 - **Bounded by construction.** The bitmap is `tasks_per_shard` bits plus `tasks_per_shard / 64` summary
   bits, allocated once at the shard's build; it cannot fill, so no sender ever waits (DERIVED).
@@ -142,10 +149,22 @@ drains by reading the summary words and swapping each marked word to zero.
   occupant once, spuriously; every future tolerates a spurious wake [WAKER, "spurious wake-ups"]. The
   cost is one poll, bounded by the number of wakes that raced a slot's reuse. The generation stays in
   the word, so a wake for a slot of a *different shard incarnation* (a registry slot reused by a later
-  runtime) is still refused at the registry by the slot's generation, as slates does.
-- **INFERENCE to measure:** the `fetch_or` contends only between wakers of tasks in the same 64-slot
-  word; the benchmark rows of §12 (cross-shard round trip, foreign wake) decide it against slates' rings
-  before slates' rings are removed.
+  runtime) is still refused at the registry by the slot's generation, as slates does. A drained wake whose
+  slot holds no task is counted (`Counters::wakes_to_free_slots`) and not queued: the visible half of that
+  race, and the non-vacuity counter for its bound (`tests/foreign_wake.rs`).
+- **INFERENCE to measure:** with the summary marked only on empty words, a wake contends with wakers of
+  the same 64-slot word. Packed words put 512 slots on one 64-byte line, so unrelated wakers may still
+  bounce it; the §12 foreign-wake row measures packed words against one word per cache line (memory
+  `tasks_per_shard / 64 × 128` bytes) and the cross-shard row the bitmap against slates' rings, with a p99
+  for wakes to high slots under load, before slates' rings are removed.
+- **Measured against, in slates (2026-10-06):** kicking only a parked shard on slates' pair rings was
+  correct (loom 3/3, Miri clean, 200/200 wakes to a busy shard with every kick saved) and *slower* for a
+  spinning shard: the cross-shard round trip went 1,958–2,000 → 2,291–2,416 ns on Linux 6.12 and
+  4,750–5,250 → 12,292–13,292 ns (p99 26–40 µs) on macOS under load, while a parking shard got faster on
+  Linux and stayed even on macOS. No wake was lost; the sender reached its next event later without its own
+  kick, a scheduling effect not yet identified (slates `docs/wip/BENCHMARKS.md`, "Measured and rejected").
+  hyper-rt routes every cross-thread wake through kick-if-parked, so §12 carries the **spinning** round
+  trip on both OSes under load, beside the parking one, and the choice stands only if it holds there.
 
 ### 3.3 The run queue
 
@@ -171,7 +190,9 @@ window spins rather than parks, so the client's next request costs no kernel wak
 serve path did not, and an uncached lookup's median went from 23 µs to about 60 µs on Linux 6.12 under
 load once the window lapsed between requests (slates-dc, 2026-10-05). hyper-rt makes it structural
 rather than a call each server must remember: the transport driver (§14), the TCP and local-socket
-reads (§5) and the channel receive (§8) mark activity on the shard when they hand a request to a task.
+reads (§5), the device reads (slates' `/dev/fuse` and vhost-user queues, awaited through
+`readiness::readable`) and the channel receive (§8) mark activity on the shard when they hand a request
+to a task.
 
 **Change: exclusive access is structural; nothing nests.** slates keeps the shard's mutable state in a
 `RefCell<ShardInner>` and refuses a nested borrow with `try_borrow_mut`, counting it (`shard.rs`): a task's
@@ -269,7 +290,15 @@ read, write or fsync; NOTE08 §3.4), so it does what epoll does at the cost of a
 zero-timeout harvest needed a raw `enter` to stop sleeping 0.3–1.0 ms (slates bug 2026-09-26). One path
 per mechanism (NOTE32 §3.1): epoll on Linux. Mantle's disk path is Linux native AIO by the owner's
 decision, not io_uring (§7). If a measurement shows io_uring's completion mode winning for sockets, it
-returns as the one Linux path, not beside epoll.
+returns as the one Linux path, not beside epoll. The `Driver` seam therefore stays open to completion
+mode: slates' FUSE requests cost two kernel handoffs each (19,222 across one `pip install`, slates
+BENCHMARKS 2026-10-06), and FUSE over io_uring (Linux 6.14, **UNVERIFIED**) is the lever that would bring
+it back under that rule.
+
+**To measure: one-shot against edge-triggered.** `EPOLLONESHOT` costs an `epoll_ctl(MOD)` per readiness
+event per descriptor, a syscall per wake on a hot descriptor (a fleet UDP socket, a long-lived TCP
+connection, `/dev/fuse`). Persistent `EPOLLET` with drain-to-`EAGAIN` (kqueue `EV_CLEAR`) is measured
+against it on those rows of §12 before the choice is fixed (slates-dc's review).
 
 **Change: Windows readiness for writes and for TCP.** slates' AFD reactor serves reads and UDP sends;
 hyper-rt registers `AFD_POLL_SEND` for writability and `AFD_POLL_ACCEPT`/`AFD_POLL_CONNECT_FAIL` for
@@ -598,7 +627,11 @@ shared with hyper-tokio once hyper-tokio takes it from here (one `sys` layer, tw
 6. A plain `Release` store of the wake bitmap's pending flag failed loom 0.7.2's parking model: the sender's
    own later load read the flag's earlier value, which coherence forbids. The flag is published with a swap
    (the model passes); the execution is to be reduced to a loom report or to an error of this model's.
-7. The calibration record's key and its age bound for focal's short commands (§10.2): what a stale record
+7. One-shot against edge-triggered registration (§3.7), and packed wake words against one per cache line
+   (§3.2), measured on §12's rows.
+8. `Runtime`'s `stop` retries a full control channel with `yield_now` and no counted bound (slates'
+   shape): the shard drains as it runs, but the loop's end rests on that, not on a count.
+9. The calibration record's key and its age bound for focal's short commands (§10.2): what a stale record
    costs (a mis-sized spin) against what a fresh one costs (the probes' budget per command).
 
 ## 16. Order of work

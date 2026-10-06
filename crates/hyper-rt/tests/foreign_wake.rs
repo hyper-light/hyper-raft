@@ -127,3 +127,37 @@ fn a_waker_fired_from_another_thread_wakes_the_task_it_was_made_for() {
     let counters = runtime.shutdown().unwrap();
     assert_eq!(counters[1].completed, 2);
 }
+
+/// slates-dc's review item 4: a wake that arrives after its task ended is counted, not queued. Do: a task
+/// hands out its waker and ends when woken; fire a clone of that waker again from another thread after the
+/// task finished. Expect: the shard counts one wake to a free slot.
+#[test]
+#[cfg_attr(miri, ignore)] // the OS driver opens a kqueue or an eventfd, which Miri does not model
+fn a_wake_for_a_finished_task_is_counted_not_queued() {
+    let runtime = Runtime::start(&config()).unwrap();
+    let shard = runtime.shard_ids()[0];
+    let (wakers_tx, wakers) = channel();
+    let (finished_tx, finished) = channel();
+    runtime
+        .spawn_on(
+            shard,
+            Parked {
+                name: "once",
+                wakers: wakers_tx,
+                finished: finished_tx,
+                handed_out: false,
+            },
+        )
+        .unwrap();
+    let (_, waker) = wakers.recv_timeout(REPORT_WAIT).unwrap();
+    let late = waker.clone();
+    std::thread::spawn(move || waker.wake()).join().unwrap();
+    assert_eq!(finished.recv_timeout(REPORT_WAIT), Ok("once"));
+    std::thread::spawn(move || late.wake()).join().unwrap();
+    let counters = runtime.shutdown().unwrap();
+    assert_eq!(
+        counters[0].wakes_to_free_slots, 1,
+        "the late wake found its slot free: {:?}",
+        counters[0]
+    );
+}

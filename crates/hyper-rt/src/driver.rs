@@ -393,10 +393,37 @@ mod tests {
     /// expiry): 0.3–1.0 ms per harvest on a loaded Linux VM, a millisecond on every NFS request
     /// (`docs/bugs/2026-09-26-io-uring-zero-timeout-harvest-sleeps.md`). The sleep is observed as the
     /// thread's voluntary context switches, where the OS counts them per thread (Linux).
+    ///
+    /// The count is the thread's, but what blocks it can be the process's: beside the other tests' threads,
+    /// a page fault in the wait path waits for the address-space lock while another thread unmaps, and
+    /// counts as a voluntary switch (one in ten parallel runs on Linux 6.12, 2026-10-06). So the measurement
+    /// runs in a child process of this test binary that runs only this test, where no other thread
+    /// allocates.
     #[test]
     #[cfg(unix)]
     #[cfg_attr(miri, ignore)]
     fn a_zero_timeout_wait_delivers_what_is_ready_and_never_sleeps() {
+        /// Format: the variable that tells the child it is the isolated run.
+        const ISOLATED: &str = "HYPER_RT_ZERO_TIMEOUT_ISOLATED";
+        if std::env::var_os(ISOLATED).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "driver::tests::a_zero_timeout_wait_delivers_what_is_ready_and_never_sleeps",
+                    "--test-threads=1",
+                    "--nocapture",
+                ])
+                .env(ISOLATED, "1")
+                .output()
+                .unwrap();
+            let text = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success() && text.contains("1 passed"),
+                "the isolated run failed: {text}{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
         let prepared = os_driver(64).unwrap();
         // The registration outlives its driver and retires even when an assertion unwinds (its drop):
         // otherwise the parallel registry stress test can fill its abandoned ring and wait forever.

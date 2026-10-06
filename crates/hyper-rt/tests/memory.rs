@@ -71,12 +71,14 @@ fn resident_kib() -> u64 {
 }
 
 /// Do: measure what one live two-shard runtime occupies (its footprint: resident size with it up, less
-/// resident size before it), shut it down, then start and shut down `CYCLES` more in turn. Expect: the
-/// resident size grows over those cycles by less than one footprint — the contexts were given back and
-/// their memory reused, where a leak grows by one footprint per cycle — and the reclamation counter moved
+/// resident size before it), shut it down, then run `CYCLES` start-and-shutdown cycles twice, reading the
+/// resident size after each batch. Expect: the second batch grows the process by less than one footprint —
+/// a leak grows by one footprint per cycle, `CYCLES` footprints per batch — and the reclamation counter moved
 /// by every context started (non-vacuity: the footprint is positive, and every context was reclaimed).
 /// Before the fix (2026-09-14) every start leaked its contexts: 32 cycles grew the process by ~32
-/// footprints.
+/// footprints. The first batch is not judged: the allocator keeps what it freed for reuse, and how much it
+/// keeps varied from 0.4 to 3.6 MiB over 15 runs of one batch on macOS (2026-10-06) against a 2.6 MiB
+/// footprint, so judging the first batch's growth judged the allocator, not the runtime.
 #[cfg(unix)]
 #[test]
 fn a_shut_down_runtimes_context_heap_is_given_back() {
@@ -86,16 +88,19 @@ fn a_shut_down_runtimes_context_heap_is_given_back() {
     let live = resident_kib();
     warm.shutdown().unwrap();
     let footprint = live.saturating_sub(before);
-    let after_warm = resident_kib();
+    for _ in 0..CYCLES {
+        Runtime::start(&config()).unwrap().shutdown().unwrap();
+    }
+    let settled = resident_kib();
     for _ in 0..CYCLES {
         Runtime::start(&config()).unwrap().shutdown().unwrap();
     }
     let after = resident_kib();
-    let growth = after.saturating_sub(after_warm);
+    let growth = after.saturating_sub(settled);
     let reclaimed = contexts_reclaimed() - reclaimed_before;
     eprintln!(
-        "resident KiB: before {before}, one runtime live {live} (footprint {footprint}), after warm-up \
-     {after_warm}, after {CYCLES} more cycles {after} (growth {growth}); contexts reclaimed {reclaimed}"
+        "resident KiB: before {before}, one runtime live {live} (footprint {footprint}), after {CYCLES} \
+     cycles {settled}, after {CYCLES} more {after} (growth {growth}); contexts reclaimed {reclaimed}"
     );
     assert!(
         footprint > 0,
@@ -103,12 +108,12 @@ fn a_shut_down_runtimes_context_heap_is_given_back() {
     );
     assert_eq!(
         reclaimed,
-        (CYCLES + 1) * u64::from(config().shards),
+        (2 * CYCLES + 1) * u64::from(config().shards),
         "every context started was reclaimed"
     );
     assert!(
         growth < footprint,
-        "the contexts of {CYCLES} shut-down runtimes were given back: the process grew {growth} KiB, \
+        "the contexts of {CYCLES} more shut-down runtimes were given back: the process grew {growth} KiB, \
      against a per-runtime footprint of {footprint} KiB (a leak grows by one footprint per cycle)"
     );
 }

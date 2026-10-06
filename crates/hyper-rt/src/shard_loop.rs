@@ -79,6 +79,11 @@ pub struct Counters {
     pub cancelled: u64,
     /// Wakes that arrived from other threads (the wake bitmap).
     pub wakes_foreign: u64,
+    /// Of those, wakes for a slot with no task when drained: the task ended after the wake was sent. Not
+    /// queued. A wake that raced its task's end *and* the slot's reuse wakes the new occupant once,
+    /// spuriously, and cannot be told apart (a bit carries no generation); this counter bounds the
+    /// visible half of that race (slates-dc's review item 4).
+    pub wakes_to_free_slots: u64,
     /// Control messages received.
     pub controls: u64,
     /// Timers fired.
@@ -908,7 +913,19 @@ impl Shard {
             return false;
         };
         let desk = &self.desk;
-        let woken = entry.wakes.drain(|slot| desk.wake_local(slot));
+        let mut free: u64 = 0;
+        let woken = entry.wakes.drain(|slot| {
+            if desk
+                .task(slot)
+                .is_none_or(|cell| cell.phase.get() == Phase::Free)
+            {
+                free = free.saturating_add(1);
+            } else {
+                desk.wake_local(slot);
+            }
+        });
+        self.core.counters.wakes_to_free_slots =
+            self.core.counters.wakes_to_free_slots.saturating_add(free);
         self.core.counters.wakes_foreign = self
             .core
             .counters

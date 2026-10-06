@@ -238,7 +238,9 @@ def mib(value):
 
 
 def main():
-    root = os.getppid()
+    # The gate's shell (`GATE_ROOT`, from gates.sh): on Windows this script's parent is a pipeline's
+    # own bash, not the one cargo descends from
+    root = int(os.environ.get("GATE_ROOT") or os.getppid())
     path = os.environ.get("GATE_PROGRESS") or os.path.join("target", "gate-progress.log")
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     summary = os.environ.get("GITHUB_STEP_SUMMARY")

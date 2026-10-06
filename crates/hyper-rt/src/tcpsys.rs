@@ -129,7 +129,22 @@ mod imp {
                 prepare(&fd)?;
                 Ok(Io::Ready(Stream { fd }))
             }
-            Err(Errno::CONNABORTED) => Ok(Io::Interrupted),
+            // A connection that died in the queue, and the errors accept(2) on Linux says to treat as
+            // EAGAIN (a pending network error of the new socket, or a firewall's refusal): one client's
+            // trouble, not the listener's, so it is read past (mantle's review, finding 5).
+            Err(
+                Errno::CONNABORTED
+                | Errno::NETDOWN
+                | Errno::PROTO
+                | Errno::NOPROTOOPT
+                | Errno::HOSTDOWN
+                | Errno::HOSTUNREACH
+                | Errno::OPNOTSUPP
+                | Errno::NETUNREACH
+                | Errno::PERM,
+            ) => Ok(Io::Interrupted),
+            #[cfg(target_os = "linux")]
+            Err(Errno::NONET) => Ok(Io::Interrupted),
             Err(e) => classify("accept", e),
         }
     }
@@ -442,7 +457,7 @@ mod imp {
     use windows_sys::Win32::Networking::WinSock::{
         AF_INET, AF_INET6, INVALID_SOCKET, IPPROTO_IPV6, IPPROTO_TCP, IPV6_V6ONLY, SD_BOTH,
         SD_RECEIVE, SD_SEND, SO_ERROR, SO_TYPE, SOCK_STREAM, SOCKADDR, SOCKADDR_STORAGE, SOCKET,
-        SOCKET_ERROR, SOL_SOCKET, TCP_MAXRTMS, TCP_NODELAY, WSABUF, WSAECONNABORTED,
+        SOCKET_ERROR, SOL_SOCKET, TCP_MAXRTMS, TCP_NODELAY, WSABUF, WSAECONNABORTED, WSAECONNRESET,
         WSAEINPROGRESS, WSAEINTR, WSAENOTCONN, WSAEWOULDBLOCK, WSAGetLastError, WSARecv, WSASend,
         accept as ws_accept, bind as ws_bind, closesocket, connect as ws_connect, getpeername,
         getsockname, listen as ws_listen, recv, send, shutdown as ws_shutdown, socket as ws_socket,
@@ -594,8 +609,10 @@ mod imp {
         // SAFETY: null address pointers ask for no peer address.
         let raw = unsafe { ws_accept(stream.socket, std::ptr::null_mut(), std::ptr::null_mut()) };
         if raw == INVALID_SOCKET {
+            // A connection that died in the queue is one client's trouble, read past (finding 5).
             // SAFETY: a pure query of thread-local last-error state.
-            if unsafe { WSAGetLastError() } == WSAECONNABORTED {
+            let code = unsafe { WSAGetLastError() };
+            if matches!(code, WSAECONNABORTED | WSAECONNRESET) {
                 return Ok(Io::Interrupted);
             }
             return classify("accept");

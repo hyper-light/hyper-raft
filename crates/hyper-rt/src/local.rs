@@ -50,9 +50,10 @@ impl LocalListener {
             for _ in 0..self.backlog {
                 match tcpsys::accept(&self.stream)? {
                     Io::Ready(accepted) => {
-                        return Ok(LocalStream {
-                            inner: TcpStream::local(accepted)?,
-                        });
+                        // A peer gone already is dropped; the listener goes on (finding 5).
+                        if let Ok(inner) = TcpStream::local(accepted) {
+                            return Ok(LocalStream { inner });
+                        }
                     }
                     Io::WouldBlock => break,
                     Io::Interrupted | Io::Astray => {}

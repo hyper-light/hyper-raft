@@ -302,9 +302,10 @@ pub(crate) mod imp {
         IP_DONTFRAGMENT, IPPROTO_IP, IPPROTO_IPV6, IPPROTO_UDP, IPV6_DONTFRAG, IPV6_V6ONLY,
         SO_RCVBUF, SO_TYPE, SOCK_DGRAM, SOCKADDR, SOCKADDR_IN, SOCKADDR_IN6, SOCKADDR_IN6_0,
         SOCKADDR_STORAGE, SOCKET, SOCKET_ERROR, SOL_SOCKET, WSADATA, WSAECONNREFUSED,
-        WSAECONNRESET, WSAEHOSTUNREACH, WSAEINTR, WSAENETRESET, WSAENETUNREACH, WSAEWOULDBLOCK,
-        WSAGetLastError, WSAStartup, bind as ws_bind, closesocket, getsockname, getsockopt,
-        ioctlsocket, recvfrom as ws_recvfrom, sendto as ws_sendto, setsockopt, socket as ws_socket,
+        WSAECONNRESET, WSAEHOSTUNREACH, WSAEINTR, WSAEMSGSIZE, WSAENETRESET, WSAENETUNREACH,
+        WSAEWOULDBLOCK, WSAGetLastError, WSAStartup, bind as ws_bind, closesocket, getsockname,
+        getsockopt, ioctlsocket, recvfrom as ws_recvfrom, sendto as ws_sendto, setsockopt,
+        socket as ws_socket,
     };
 
     use core::net::{Ipv6Addr, SocketAddrV6};
@@ -700,6 +701,17 @@ pub(crate) mod imp {
             )
         };
         if rc == SOCKET_ERROR {
+            // A datagram longer than `buf`: Winsock fills the buffer and reports WSAEMSGSIZE, where Unix
+            // truncates silently; it is the same truncation, as the socket's documentation states (mantle's
+            // review, finding 9).
+            // SAFETY: a pure query of thread-local last-error state.
+            if unsafe { WSAGetLastError() } == WSAEMSGSIZE {
+                let unspecified = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0));
+                return Ok(Io::Ready((
+                    buf.len(),
+                    from_sockaddr(&from).unwrap_or(unspecified),
+                )));
+            }
             return classify("recvfrom");
         }
         let unspecified = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0));

@@ -250,6 +250,11 @@ mod os {
 
     /// The handler: async-signal-safe only — atomics and `write(2)` (POSIX.1-2017 §2.4.3).
     extern "C" fn on_signal(signal: libc::c_int) {
+        // `write(2)` to a full pipe sets errno, which the interrupted thread may be about to read for its own
+        // failed call: saved and restored (mantle's review, finding 6).
+        let errno = errno_location();
+        // SAFETY: the calling thread's errno, a live thread-local int.
+        let saved = unsafe { *errno };
         let bit = super::Signal::ALL
             .iter()
             .find(|kind| number(**kind) == Some(signal))
@@ -262,6 +267,22 @@ mod os {
             // A full pipe fails `EAGAIN`, ignored: the bit already records the signal.
             let _ = unsafe { libc::write(fd, (&raw const byte).cast(), 1) };
         }
+        // SAFETY: as above.
+        unsafe { *errno = saved };
+    }
+
+    /// The calling thread's errno.
+    #[cfg(target_os = "linux")]
+    fn errno_location() -> *mut libc::c_int {
+        // SAFETY: a pure accessor of the thread's errno, async-signal-safe.
+        unsafe { libc::__errno_location() }
+    }
+
+    /// The calling thread's errno.
+    #[cfg(not(target_os = "linux"))]
+    fn errno_location() -> *mut libc::c_int {
+        // SAFETY: a pure accessor of the thread's errno, async-signal-safe.
+        unsafe { libc::__error() }
     }
 
     /// Makes the pipe and starts the signal thread, once.
@@ -298,10 +319,36 @@ mod os {
                 Ok(_) | Err(rustix::io::Errno::INTR) => {
                     let arrived = RAW.swap(0, Ordering::AcqRel);
                     if arrived != 0 {
-                        deliver(arrived);
+                        let wanted = deliver(arrived);
+                        default_action(arrived & !wanted);
                     }
                 }
                 Err(_) => return,
+            }
+        }
+    }
+
+    /// The kinds in `unwanted` arrived with no subscriber left: each gets its default action back and is raised
+    /// again, so a SIGINT or SIGTERM with nobody listening ends the process as it would have (mantle's review,
+    /// finding 7). A later subscription installs the handler again.
+    fn default_action(unwanted: u32) {
+        for kind in Signal::ALL {
+            let bit = kind.bit();
+            if unwanted & bit == 0 {
+                continue;
+            }
+            let Some(signal) = number(kind) else {
+                continue;
+            };
+            INSTALLED.fetch_and(!bit, Ordering::AcqRel);
+            // SAFETY: an all-zero `sigaction` is a valid value; SIG_DFL restores the default action.
+            let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+            action.sa_sigaction = libc::SIG_DFL;
+            // SAFETY: a valid action for a valid signal number; no previous action is read. `raise` sends the
+            // signal to this thread, whose default action now runs.
+            unsafe {
+                libc::sigaction(signal, &raw const action, std::ptr::null_mut());
+                libc::raise(signal);
             }
         }
     }

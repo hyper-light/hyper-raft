@@ -519,8 +519,11 @@ impl Batched {
         };
         let now_ns = shard_now()?;
         let mut delivered = 0usize;
-        for (taken, buffer) in linux.received.iter().zip(buffers.iter_mut()) {
-            let Some(bytes) = buffer.get_mut(..taken.length) else {
+        for taken in &linux.received {
+            let Some(bytes) = buffers
+                .get_mut(taken.index)
+                .and_then(|buffer| buffer.get_mut(..taken.length))
+            else {
                 continue;
             };
             let stamp = taken

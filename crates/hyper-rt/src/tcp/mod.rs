@@ -232,7 +232,11 @@ impl TcpListener {
                         }
                     },
                 };
-                tcpsys::set_options(&accepted)?;
+                // A peer that reset the connection already can refuse its options (macOS, BSD): that
+                // connection is dropped, and the listener goes on (mantle's review, finding 5).
+                if tcpsys::set_options(&accepted).is_err() {
+                    continue;
+                }
                 return Ok(TcpStream {
                     stream: accepted,
                     slot,

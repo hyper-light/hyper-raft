@@ -373,6 +373,9 @@ fn socklen_u32(bytes: usize) -> u32 {
 /// One message `recvmmsg` delivered.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Received {
+    /// The buffer the message is in: messages skipped (truncated, not internet) leave gaps, so a message is
+    /// paired with its buffer by index, not by position (mantle's review, finding 10).
+    pub(crate) index: usize,
     pub(crate) from: SocketAddr,
     pub(crate) length: usize,
     /// The size of each coalesced datagram, when the kernel coalesced them.
@@ -440,7 +443,12 @@ pub(crate) fn receive(
     let Ok(received) = usize::try_from(received) else {
         return Err(io::Error::last_os_error());
     };
-    for (message, name) in messages.iter_mut().zip(names.iter()).take(received) {
+    for (index, (message, name)) in messages
+        .iter_mut()
+        .zip(names.iter())
+        .take(received)
+        .enumerate()
+    {
         if message.msg_hdr.msg_flags & libc::MSG_TRUNC != 0 {
             continue;
         }
@@ -452,6 +460,7 @@ pub(crate) fn receive(
         };
         let (segment, stamp) = controls_of(&message.msg_hdr);
         out.push(Received {
+            index,
             from,
             length,
             segment,

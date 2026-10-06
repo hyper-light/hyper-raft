@@ -413,6 +413,12 @@ token's user SID [AFUNIX]. Access is first kept by the directory: the socket liv
 owner may enter (focal's `PrivateDir`, the owner-only DACL on Windows), so a peer of another user cannot
 connect at all, and the identity check is the second wall.
 
+**Done** (2026-10-06): `local::{LocalListener, LocalStream, current_user}` over `localsys.rs`, the stream
+calls shared with TCP. `tests/local.rs` passes on macOS and Linux 6.12: each end sees the other as this
+process and this user, and a bind over an existing path is refused. A Linux connect to a full accept queue
+fails `EAGAIN` (unix(7)), which writability would never end, so it is a typed refusal the caller retries.
+Windows is clippy-checked; its run (and AFD's readiness on `AF_UNIX`) is owed to the Windows lanes.
+
 focal today uses a named pipe on Windows; moving it to `AF_UNIX` is focal's decision, recorded in its own
 documents. If AFD does not poll `AF_UNIX`, hyper-rt adds named pipes through overlapped I/O on the
 completion port, as the one Windows mechanism, and records why.

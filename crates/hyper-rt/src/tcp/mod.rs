@@ -290,6 +290,18 @@ impl TcpStream {
         Self::from_parts(owned, None)
     }
 
+    /// A connected local (`AF_UNIX`) stream: [`crate::local`] reads and writes through this type, with no
+    /// `TCP_NODELAY` (a local socket has no Nagle) and no `SIGPIPE`.
+    pub(crate) fn local(stream: Stream) -> Result<TcpStream, RtError> {
+        tcpsys::set_no_sigpipe(&stream)?;
+        Ok(TcpStream { stream, slot: None })
+    }
+
+    /// The stream's seam handle.
+    pub(crate) fn seam(&self) -> &Stream {
+        &self.stream
+    }
+
     /// Counts the stream in its shard's `local` cell ([`serve`]), given back with its slot.
     pub(crate) fn count_in(&mut self, local: CellRef) {
         serve::counted(local);

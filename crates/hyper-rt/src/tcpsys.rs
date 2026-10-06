@@ -52,6 +52,11 @@ mod imp {
         pub(crate) fn raw_id(&self) -> i32 {
             self.fd.as_raw_fd()
         }
+
+        /// The OS handle, for a query the seam does not make (`crate::localsys`'s peer identity).
+        pub(crate) fn raw_handle(&self) -> i32 {
+            self.fd.as_raw_fd()
+        }
     }
 
     /// The `Io` a failed non-blocking call maps to, or the refusal it is.
@@ -210,11 +215,17 @@ mod imp {
         }
     }
 
-    /// The options every connected stream carries: `TCP_NODELAY` (`crate::tcp`), and on macOS
-    /// `SO_NOSIGPIPE` (see [`write`]).
+    /// The options every connected TCP stream carries: `TCP_NODELAY` (`crate::tcp`), and
+    /// [`set_no_sigpipe`].
     pub(crate) fn set_options(stream: &Stream) -> Result<(), RtError> {
         rustix::net::sockopt::set_tcp_nodelay(&stream.fd, true)
             .map_err(|e| refused("setsockopt(TCP_NODELAY)", e))?;
+        set_no_sigpipe(stream)
+    }
+
+    /// A write to a closed peer is `EPIPE`, never a `SIGPIPE`: macOS's `SO_NOSIGPIPE` on the socket (Linux
+    /// passes `MSG_NOSIGNAL` per write, [`write`]). Every stream, TCP or local, carries it.
+    pub(crate) fn set_no_sigpipe(stream: &Stream) -> Result<(), RtError> {
         #[cfg(target_os = "macos")]
         set_int(
             stream,
@@ -223,6 +234,7 @@ mod imp {
             1,
             "setsockopt(SO_NOSIGPIPE)",
         )?;
+        let _ = stream;
         Ok(())
     }
 
@@ -464,6 +476,11 @@ mod imp {
         pub(crate) fn raw_id(&self) -> i32 {
             let low = u32::try_from(self.socket).unwrap_or(u32::MAX);
             i32::from_ne_bytes(low.to_ne_bytes())
+        }
+
+        /// The OS handle, for a query the seam does not make (`crate::localsys`'s peer identity).
+        pub(crate) fn raw_handle(&self) -> SOCKET {
+            self.socket
         }
     }
 
@@ -708,6 +725,11 @@ mod imp {
         )
     }
 
+    /// Windows raises no `SIGPIPE`.
+    pub(crate) fn set_no_sigpipe(_stream: &Stream) -> Result<(), RtError> {
+        Ok(())
+    }
+
     pub(crate) fn nodelay(stream: &Stream) -> Result<bool, RtError> {
         int_option(
             stream.socket,
@@ -785,7 +807,7 @@ mod imp {
 pub(crate) use imp::set_reuseport;
 pub(crate) use imp::{
     OwnedStream, Stream, accept, adopt, bind, connect, into_owned, listen, local_addr, nodelay,
-    notsent_lowat, peer_addr, read, read_vectored, set_notsent_lowat, set_options,
+    notsent_lowat, peer_addr, read, read_vectored, set_no_sigpipe, set_notsent_lowat, set_options,
     set_user_timeout, shutdown, stream_socket, take_error, user_timeout_ms, write, write_vectored,
 };
 

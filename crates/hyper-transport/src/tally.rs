@@ -27,7 +27,7 @@
 
 use crate::Refusal;
 use crate::arena::Arena;
-use crate::exchange::Exchange;
+use crate::exchange::{Exchange, Out};
 
 /// One exchange's share of its connection's sums, as it was last counted.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -119,6 +119,18 @@ fn clamp(sum: u128) -> u64 {
     u64::try_from(sum).unwrap_or(u64::MAX)
 }
 
+/// Whether a progress pass can move `exchange`: `start` gives a stream to one queued for it and
+/// writes a head or trailer it holds; `wake` tells an owner refused a write that it can write
+/// again. For any other exchange both do nothing, so the pass skips it.
+pub(crate) fn visits<K>(exchange: &Exchange<K>) -> bool {
+    exchange.stream.is_none()
+        || matches!(exchange.out.state, Out::Head | Out::Trailer)
+        || (exchange.out.state == Out::Body
+            && exchange.wants_write
+            && !exchange.writable_sent
+            && !exchange.stream_blocked)
+}
+
 /// The endpoint's exchanges, each connection's sums over them, and the exchanges touched since
 /// the sums were last settled.
 #[derive(Debug)]
@@ -128,6 +140,11 @@ pub(crate) struct Table<K> {
     /// Indexed by the connection's key; a key's tally is made when an exchange first counts on it.
     tallies: Vec<Tally>,
     ranks: u8,
+    /// Indexed by the connection's key: the exchanges a progress pass visits, as (order, id),
+    /// sorted by order.
+    actives: Vec<Vec<(u64, u64)>>,
+    /// The order the next exchange made takes.
+    next_order: u64,
     /// Settles that found the sums by recounting (the non-vacuity counter for the oracle).
     #[cfg(feature = "oracle")]
     settled: u64,
@@ -141,13 +158,17 @@ impl<K> Table<K> {
             touched: Vec::with_capacity(capacity),
             tallies: Vec::new(),
             ranks,
+            actives: Vec::new(),
+            next_order: 0,
             #[cfg(feature = "oracle")]
             settled: 0,
         }
     }
 
-    pub(crate) fn insert(&mut self, value: Exchange<K>) -> Result<u64, Refusal> {
+    pub(crate) fn insert(&mut self, mut value: Exchange<K>) -> Result<u64, Refusal> {
+        value.order = self.next_order;
         let id = self.arena.insert(value)?;
+        self.next_order = self.next_order.saturating_add(1);
         self.mark(id);
         Ok(id)
     }
@@ -168,7 +189,30 @@ impl<K> Table<K> {
         if let Some(tally) = self.tallies.get_mut(exchange.connection) {
             tally.sub(exchange.counted);
         }
+        if exchange.active
+            && let Some(active) = self.actives.get_mut(exchange.connection)
+            && let Ok(at) = active.binary_search(&(exchange.order, id))
+        {
+            active.remove(at);
+        }
         Some(exchange)
+    }
+
+    /// Records that exchange `id` is at index `at` of its connection's list: bookkeeping that
+    /// neither its share nor its visits depend on, so it is not a touch.
+    pub(crate) fn place(&mut self, id: u64, at: usize) {
+        if let Some(exchange) = self.arena.get_mut(id) {
+            exchange.at = at;
+        }
+    }
+
+    /// The exchanges of connection `key` a progress pass visits, settled, in the order they were
+    /// made, appended to `into`.
+    pub(crate) fn active(&mut self, key: usize, into: &mut Vec<u64>) {
+        self.settle();
+        if let Some(active) = self.actives.get(key) {
+            into.extend(active.iter().map(|(_, id)| *id));
+        }
     }
 
     pub(crate) fn hold(&mut self, id: u64) -> bool {
@@ -229,12 +273,29 @@ impl<K> Table<K> {
                 continue;
             };
             exchange.touched = false;
+            let key = exchange.connection;
+            let visited = visits(exchange);
+            if visited != exchange.active {
+                exchange.active = visited;
+                if self.actives.len() <= key {
+                    self.actives.resize_with(key.saturating_add(1), Vec::new);
+                }
+                if let Some(active) = self.actives.get_mut(key) {
+                    let entry = (exchange.order, id);
+                    match (visited, active.binary_search(&entry)) {
+                        (true, Err(at)) => active.insert(at, entry),
+                        (false, Ok(at)) => {
+                            active.remove(at);
+                        }
+                        _ => {}
+                    }
+                }
+            }
             let share = Counted::of(exchange);
             if share == exchange.counted {
                 continue;
             }
             let before = std::mem::replace(&mut exchange.counted, share);
-            let key = exchange.connection;
             if self.tallies.len() <= key {
                 self.tallies
                     .resize_with(key.saturating_add(1), || Tally::new(ranks));

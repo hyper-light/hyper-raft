@@ -23,7 +23,7 @@ mod common;
 use std::time::{Duration, Instant};
 
 use common::*;
-use hyper_transport::{Event, ExchangeId, LEAST_PROGRESS, Limits, Refusal};
+use hyper_transport::{Event, ExchangeId, LEAST_PROGRESS, Limits, Progress, Refusal};
 
 const PERIOD: Duration = Duration::from_secs(2);
 const TURNS: usize = 10_000;
@@ -1933,4 +1933,86 @@ fn exchanges_at_the_limit_are_taken_and_one_past_it_is_refused_at_open() {
             .all(|asked| asked.refused.is_none() && asked.read == 1_000)
     );
     assert_eq!(server.answered, 6);
+}
+
+/// An owner refused part of a write is told when it can write more, and needs no other cue: the
+/// progress pass's `wake` is the only source of `Writable`, and the harness's asker retries every
+/// drive, so nothing else tests it. Do: a 16 MiB body (past the connection's first receive window,
+/// so writes are refused), written only at the start and after each `Writable`. Expect: every
+/// byte read by the server, each refused write answered by one `Writable`, and at least one
+/// refused (else the test is vacuous).
+#[test]
+fn an_owner_refused_a_write_finishes_writing_on_writable_alone() {
+    let pair = Pair::new();
+    let mut net = connected::<Mantle, Mantle>(&pair, limits(), 256 << 20);
+    // Shape: far past the first receive window, so the owner is refused writes many times.
+    let total: u64 = 16 << 20;
+    let progress = Progress::new(PERIOD).unwrap();
+    let id = net
+        .a
+        .open(net.now, 2, Kind::Put, &[0, 1, 2, 3], Some(total), progress)
+        .unwrap();
+    let piece = vec![0u8; PIECE];
+    let (mut written, mut refused_writes, mut writable, mut may_write) = (0u64, 0u64, 0u64, true);
+    let mut served: Option<(ExchangeId, u64)> = None;
+    for _ in 0..TURNS {
+        if may_write {
+            while written < total {
+                let take = usize::try_from(total - written).unwrap().min(PIECE);
+                let took = net.a.write_body(id, &piece[..take]).unwrap();
+                written += took as u64;
+                if took < take {
+                    may_write = false;
+                    refused_writes += 1;
+                    break;
+                }
+            }
+        }
+        net.exchange();
+        while let Some(event) = net.a.poll_event() {
+            match event {
+                Event::Writable { exchange } if exchange == id => {
+                    writable += 1;
+                    may_write = true;
+                }
+                Event::Refused { exchange, .. } if exchange == id => panic!("refused: {event:?}"),
+                _ => {}
+            }
+        }
+        while let Some(event) = net.b.poll_event() {
+            if let Event::Request { exchange, .. } = event {
+                served = Some((exchange, 0));
+            }
+        }
+        if let Some((exchange, read)) = &mut served {
+            loop {
+                let mut into = net.b.reserve(Class::Request, PIECE as u64).unwrap();
+                let got = net.b.read_body(*exchange, &mut into).unwrap();
+                net.b.release(into);
+                if got == 0 {
+                    break;
+                }
+                *read += got as u64;
+            }
+            if *read == total {
+                break;
+            }
+        }
+        if !net.exchange() {
+            net.advance();
+        }
+    }
+    assert_eq!(
+        served.map(|(_, read)| read),
+        Some(total),
+        "the whole body arrived"
+    );
+    assert!(
+        refused_writes > 0,
+        "no write was refused: the test proves nothing"
+    );
+    assert_eq!(
+        writable, refused_writes,
+        "each refused write was answered by one Writable"
+    );
 }

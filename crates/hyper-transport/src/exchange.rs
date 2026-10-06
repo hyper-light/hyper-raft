@@ -257,6 +257,13 @@ pub(crate) struct Exchange<K> {
     pub(crate) counted: crate::tally::Counted,
     /// It changed since its share was last counted: it is in the table's touched list.
     pub(crate) touched: bool,
+    /// Its place in the order exchanges were made, the endpoint's whole life: the order its
+    /// connection's exchanges are visited in.
+    pub(crate) order: u64,
+    /// It is in its connection's set of exchanges a progress pass visits (`tally::visits`).
+    pub(crate) active: bool,
+    /// Its index in its connection's list of exchanges.
+    pub(crate) at: usize,
     pub(crate) began: Instant,
     /// Whether the peer's message has begun (a reply's prefix and head arrived).
     pub(crate) answered: bool,

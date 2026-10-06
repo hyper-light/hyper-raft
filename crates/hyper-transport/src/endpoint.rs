@@ -1367,6 +1367,8 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
         self.ids.clear();
         let mut ids = std::mem::take(&mut self.ids);
         ids.extend_from_slice(&conn.exchanges);
+        // Refused in the order they were made, as the list kept them before removal reordered it.
+        ids.sort_unstable_by_key(|id| self.exchanges.get(*id).map_or(0, |exchange| exchange.order));
         for id in &ids {
             self.finish_exchange(conn, *id, Some((Refusal::Closed, false)));
         }
@@ -1451,6 +1453,9 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
             credit_seen: None,
             counted: crate::tally::Counted::default(),
             touched: false,
+            order: 0,
+            active: false,
+            at: 0,
             connection: key,
             peer,
             stream: Some(stream),
@@ -1473,6 +1478,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
         };
         match self.exchanges.insert(exchange) {
             Ok(id) => {
+                self.exchanges.place(id, conn.exchanges.len());
                 conn.exchanges.push(id);
                 bind_stream(&mut conn.by_stream, stream, id);
                 self.read_exchange(now, conn, id);
@@ -1814,6 +1820,9 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
             credit_seen: None,
             counted: crate::tally::Counted::default(),
             touched: false,
+            order: 0,
+            active: false,
+            at: 0,
             connection: key,
             peer,
             stream: None,
@@ -1835,6 +1844,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
             ended: false,
         };
         let id = self.exchanges.insert(exchange)?;
+        self.exchanges.place(id, conn.exchanges.len());
         conn.exchanges.push(id);
         let held = self.held(conn);
         let at = moved(conn, C::rank(class));
@@ -1910,11 +1920,43 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
         owed
     }
 
+    /// With the oracle on, counts a visit set differing from the exchanges of `conn` that
+    /// `visits` picks, in the order they were made.
+    #[cfg(feature = "oracle")]
+    fn check_visits(&mut self, conn: &Conn<C::Role>, visited: &[u64]) {
+        if !self.oracle {
+            return;
+        }
+        let mut expected: Vec<(u64, u64)> = conn
+            .exchanges
+            .iter()
+            .filter_map(|id| self.exchanges.get(*id).map(|exchange| (exchange, *id)))
+            .filter(|(exchange, _)| crate::tally::visits(exchange))
+            .map(|(exchange, id)| (exchange.order, id))
+            .collect();
+        expected.sort_unstable();
+        if !expected.iter().map(|(_, id)| id).eq(visited.iter()) {
+            self.mismatches = self.mismatches.saturating_add(1);
+        }
+    }
+
     /// With the oracle on, counts `tallied` differing from what `fold` finds over every exchange.
     #[cfg(feature = "oracle")]
     fn check(&mut self, tallied: u64, fold: impl FnOnce(&Self) -> u64) {
         if self.oracle && fold(self) != tallied {
             self.mismatches = self.mismatches.saturating_add(1);
+        }
+    }
+
+    /// Takes exchange `id`, at index `at`, out of `conn`'s list in constant time: the last takes
+    /// its place (visits keep the order exchanges were made by their own record of it).
+    fn unlist(&mut self, conn: &mut Conn<C::Role>, id: u64, at: usize) {
+        if conn.exchanges.get(at) != Some(&id) {
+            return;
+        }
+        conn.exchanges.swap_remove(at);
+        if let Some(moved) = conn.exchanges.get(at) {
+            self.exchanges.place(*moved, at);
         }
     }
 
@@ -2181,7 +2223,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
         let Some(exchange) = self.exchanges.remove(id) else {
             return;
         };
-        conn.exchanges.retain(|held| *held != id);
+        self.unlist(conn, id, exchange.at);
         // Only an exchange that held a stream frees credit; one refused while queued moves no queue.
         if exchange.stream.is_some() {
             conn.credit_moved = Some(self.now);
@@ -2238,10 +2280,31 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
         }
         let mut ids = std::mem::take(&mut self.ids);
         ids.clear();
+        // Only the exchanges `start` or `wake` can move (src/tally.rs `visits`), in the order they
+        // were made: for every other, both do nothing.
+        self.exchanges.active(conn.key, &mut ids);
+        #[cfg(feature = "oracle")]
+        self.check_visits(conn, &ids);
+        // Streams are given in that order: once one is refused, every later one would be.
+        let mut streams_left = true;
+        for id in &ids {
+            let queued = |core: &Self| {
+                core.exchanges
+                    .get(*id)
+                    .is_some_and(|exchange| exchange.stream.is_none())
+            };
+            if !streams_left && queued(self) {
+                continue;
+            }
+            self.start(conn, *id);
+            if queued(self) {
+                streams_left = false;
+            }
+            self.wake(conn, *id);
+        }
+        ids.clear();
         ids.extend_from_slice(&conn.exchanges);
         for id in &ids {
-            self.start(conn, *id);
-            self.wake(conn, *id);
             self.judge(now, conn, *id);
         }
         self.ids = ids;

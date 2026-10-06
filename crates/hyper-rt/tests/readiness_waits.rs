@@ -182,3 +182,96 @@ fn a_wait_dropped_on_another_shard_ends_on_its_own() {
     assert_eq!(seen.get("A's slots held"), Some(&0), "A's slot came back");
     assert_eq!(hyper_rt::readiness::abandons_lost(), 0);
 }
+
+/// Mantle's final review, third pass, A. Do: shard A arms a wait, moves the armed `Ready` to shard B and
+/// holds itself inside one poll; A's control channel is filled behind the hold; B drops the moved `Ready`
+/// while the channel is full; A is let go. Expect: A's slot comes back and no end of a wait was lost.
+/// The drop used to travel as a control message: refused by the full channel, it left the slot held for
+/// the shard's life.
+#[test]
+fn a_wait_dropped_elsewhere_ends_on_its_shard_with_its_control_channel_full() {
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc::channel;
+    use std::task::Poll;
+
+    use hyper_rt::RtError;
+    use hyper_rt::runtime::Runtime;
+    use hyper_rt::sync::oneshot;
+
+    /// Whether shard A may leave its hold.
+    static RELEASE: AtomicBool = AtomicBool::new(false);
+    /// Shape: yields the held task gives its shard to sweep and withdraw before it reports.
+    const SETTLE_YIELDS: usize = 64;
+
+    let lost_before = hyper_rt::readiness::abandons_lost();
+    let rt = Runtime::start(&RuntimeConfig {
+        shards: 2,
+        ..config()
+    })
+    .unwrap();
+    let (a, b) = (rt.shard_ids()[0], rt.shard_ids()[1]);
+    let (moved, arrives) = oneshot().unwrap();
+    let (go, dropping) = oneshot::<()>().unwrap();
+    let (report, reports) = channel();
+    let (holding, held) = channel();
+    let (dropped, after_drop) = channel();
+    rt.spawn_on(a, async move {
+        let ours = UdpSocket::bind(loopback()).unwrap();
+        let mut armed = ours.readable();
+        std::future::poll_fn(|cx| {
+            let _ = Pin::new(&mut armed).poll(cx);
+            Poll::Ready(())
+        })
+        .await;
+        let _ = moved.send(armed);
+        let _ = holding.send(());
+        // The hold: this poll does not return until released, so A drains nothing meanwhile.
+        while !RELEASE.load(Ordering::Acquire) {
+            std::hint::spin_loop();
+        }
+        let mut left = waits_held();
+        for _ in 0..SETTLE_YIELDS {
+            if left == 0 {
+                break;
+            }
+            yield_now().await;
+            left = waits_held();
+        }
+        let _ = report.send(left);
+        drop(ours);
+    })
+    .unwrap();
+    rt.spawn_on(b, async move {
+        let foreign = arrives.await.unwrap();
+        let _ = dropping.await;
+        drop(foreign);
+        let _ = dropped.send(());
+    })
+    .unwrap();
+    held.recv().unwrap();
+    let mut queued = 0;
+    loop {
+        match rt.spawn_on(a, async {}) {
+            Ok(()) => queued += 1,
+            Err(RtError::ControlFull { .. }) => break,
+            Err(e) => panic!("{e}"),
+        }
+    }
+    assert!(queued >= 1, "A's control channel filled behind the hold");
+    let _ = go.send(());
+    after_drop.recv().unwrap();
+    RELEASE.store(true, Ordering::Release);
+    let left = reports.recv().unwrap();
+    rt.shutdown().unwrap();
+    assert_eq!(
+        left, 0,
+        "A's slot came back although its control channel was full"
+    );
+    assert_eq!(
+        hyper_rt::readiness::abandons_lost(),
+        lost_before,
+        "no end of a wait was lost"
+    );
+}

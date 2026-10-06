@@ -88,6 +88,32 @@ pub struct Entry {
     /// a sender that finds one full stops spinning and counts the wake stale instead of waiting for a
     /// consumer that is gone (the livelock the registry stress test found on 2026-09-14).
     pub exited: AtomicBool,
+    /// Readiness waits of this shard dropped on another shard or off any: per wait slot, the dropped wait's
+    /// generation plus one (zero: none), swept by the shard's next control drain (mantle's final review,
+    /// third pass, A). A slot's generation is abandoned at most once, so a mark never overwrites one still
+    /// owed, and the marks need no room the control channel could lack: a dropped wait is never refused.
+    pub(crate) abandoned: Box<[AtomicU64]>,
+    /// Set with a mark; the shard sweeps the marks when it takes this.
+    pub(crate) abandons_marked: AtomicBool,
+}
+
+impl Entry {
+    /// Marks the wait in `slot` at `generation` abandoned and asks the shard to sweep, as a control message
+    /// would: the mark, then the flag, then the control mark and a kick. False only for a slot past the
+    /// marks, which no ticket of this shard names.
+    pub(crate) fn mark_abandoned(&self, slot: u32, generation: u32) -> bool {
+        let Some(mark) = usize::try_from(slot)
+            .ok()
+            .and_then(|slot| self.abandoned.get(slot))
+        else {
+            return false;
+        };
+        mark.store(u64::from(generation).saturating_add(1), Ordering::Release);
+        self.abandons_marked.store(true, Ordering::Release);
+        self.control_pending.publish();
+        self.parking.kick_if_parked(|| self.kick.kick());
+        true
+    }
 }
 
 /// A shard's forward-progress pulse, readable from any thread with no shard round-trip (§4.14; the same
@@ -336,7 +362,8 @@ pub fn register(
     control_bound: usize,
     kick: RegisterKick,
 ) -> Result<(Registration, Receiver<Control>), RtError> {
-    let (holder, control) = register_slot(wake_slots, control_bound, kick)?;
+    // A holder outside the runtime runs no desk, so no readiness waits.
+    let (holder, control) = register_slot(wake_slots, control_bound, 0, kick)?;
     Ok((Registration { holder }, control))
 }
 
@@ -346,6 +373,7 @@ pub fn register(
 pub(crate) fn register_slot(
     wake_slots: usize,
     control_bound: usize,
+    waits: usize,
     kick: RegisterKick,
 ) -> Result<(SlotHolder, Receiver<Control>), RtError> {
     let max = u16::try_from(MAX_SHARDS).unwrap_or(u16::MAX);
@@ -395,6 +423,8 @@ pub(crate) fn register_slot(
             parking: Parking::new(),
             pulse: Pulse::default(),
             exited: AtomicBool::new(false),
+            abandoned: (0..waits).map(|_| AtomicU64::new(0)).collect(),
+            abandons_marked: AtomicBool::new(false),
         });
         entry.kick = match kick {
             RegisterKick::Kick(kick) => kick,
@@ -704,6 +734,17 @@ pub struct SlotHolder {
     generation: u32,
 }
 
+#[cfg(test)]
+impl SlotHolder {
+    /// A holder for a table test that has no registration.
+    pub(crate) fn for_test() -> SlotHolder {
+        SlotHolder {
+            shard: u16::MAX,
+            generation: 0,
+        }
+    }
+}
+
 impl Entry {
     /// The registration that owns this entry.
     pub(crate) fn holder(&self) -> SlotHolder {
@@ -754,7 +795,7 @@ mod tests {
         #[cfg(any(target_os = "macos", target_os = "freebsd"))]
         let form = Kick::Kqueue;
         let (shard_holder, _control) =
-            register_slot(2, 1, RegisterKick::Descriptor(descriptor, form)).unwrap();
+            register_slot(2, 1, 0, RegisterKick::Descriptor(descriptor, form)).unwrap();
         let shard = shard_holder.shard();
         let kick = with_entry(shard, |entry| entry.kick).unwrap();
         let descriptor = match kick {
@@ -794,7 +835,7 @@ mod tests {
         });
         assert_eq!(descriptor.with(|_| ()), None);
         let (replacement_holder, _control) =
-            register_slot(2, 1, RegisterKick::Kick(Kick::None)).unwrap();
+            register_slot(2, 1, 0, RegisterKick::Kick(Kick::None)).unwrap();
         assert_eq!(
             descriptor.with(|_| ()),
             None,
@@ -812,7 +853,7 @@ mod tests {
         use std::sync::mpsc::sync_channel;
 
         let (shard_holder, _control) =
-            register_slot(2, 1, RegisterKick::Kick(Kick::none())).unwrap();
+            register_slot(2, 1, 0, RegisterKick::Kick(Kick::none())).unwrap();
         let shard = shard_holder.shard();
         let slot = SLOTS.get(usize::from(shard)).unwrap();
         let live = slot.generation.load(Ordering::Acquire);
@@ -849,7 +890,7 @@ mod tests {
     /// entry stays, and its own retirement then frees the slot.
     #[test]
     fn a_stale_holder_retires_nothing() {
-        let (live, _control) = register_slot(2, 1, RegisterKick::Kick(Kick::none())).unwrap();
+        let (live, _control) = register_slot(2, 1, 0, RegisterKick::Kick(Kick::none())).unwrap();
         let stale = SlotHolder {
             shard: live.shard,
             generation: live.generation.wrapping_sub(2),
@@ -868,7 +909,8 @@ mod tests {
     /// to a shard that will not drain it.
     #[test]
     fn a_wake_to_an_exited_holder_is_counted_stale() {
-        let (id_holder, _receiver) = register_slot(4, 2, RegisterKick::Kick(Kick::none())).unwrap();
+        let (id_holder, _receiver) =
+            register_slot(4, 2, 0, RegisterKick::Kick(Kick::none())).unwrap();
         let id = id_holder.shard();
         let stale_before = stale_wakes(id);
         note_exited(id);
@@ -883,9 +925,9 @@ mod tests {
 
     #[test]
     fn registration_hands_out_distinct_ids_and_entries() {
-        let (a_holder, _ra) = register_slot(8, 4, RegisterKick::Kick(Kick::none())).unwrap();
+        let (a_holder, _ra) = register_slot(8, 4, 0, RegisterKick::Kick(Kick::none())).unwrap();
         let a = a_holder.shard();
-        let (b_holder, _rb) = register_slot(8, 4, RegisterKick::Kick(Kick::none())).unwrap();
+        let (b_holder, _rb) = register_slot(8, 4, 0, RegisterKick::Kick(Kick::none())).unwrap();
         let b = b_holder.shard();
         assert_ne!(a, b);
         assert!(entry(a).is_some());
@@ -896,7 +938,8 @@ mod tests {
 
     #[test]
     fn a_wake_from_a_foreign_thread_lands_in_the_target_bitmap() {
-        let (id_holder, _receiver) = register_slot(8, 4, RegisterKick::Kick(Kick::none())).unwrap();
+        let (id_holder, _receiver) =
+            register_slot(8, 4, 0, RegisterKick::Kick(Kick::none())).unwrap();
         let id = id_holder.shard();
         let word = Encoded::pack(id, 5, 1).unwrap();
         std::thread::scope(|scope| {
@@ -913,7 +956,8 @@ mod tests {
     /// counted stale, not delivered.
     #[test]
     fn a_wake_past_the_bitmap_is_counted_stale() {
-        let (id_holder, _receiver) = register_slot(4, 4, RegisterKick::Kick(Kick::none())).unwrap();
+        let (id_holder, _receiver) =
+            register_slot(4, 4, 0, RegisterKick::Kick(Kick::none())).unwrap();
         let id = id_holder.shard();
         let before = stale_wakes(id);
         wake(Encoded::pack(id, 1_000, 1).unwrap());
@@ -923,7 +967,8 @@ mod tests {
 
     #[test]
     fn control_is_refused_when_the_channel_is_full_or_the_shard_is_gone() {
-        let (id_holder, receiver) = register_slot(2, 1, RegisterKick::Kick(Kick::none())).unwrap();
+        let (id_holder, receiver) =
+            register_slot(2, 1, 0, RegisterKick::Kick(Kick::none())).unwrap();
         let id = id_holder.shard();
         send_control(id, Control::Shutdown).unwrap();
         assert!(matches!(
@@ -946,7 +991,8 @@ mod tests {
     /// a later registration holds it — never delivered to the new holder.
     #[test]
     fn a_holder_pinned_send_is_refused_once_the_slot_changes_hands() {
-        let (id_holder, _receiver) = register_slot(2, 2, RegisterKick::Kick(Kick::none())).unwrap();
+        let (id_holder, _receiver) =
+            register_slot(2, 2, 0, RegisterKick::Kick(Kick::none())).unwrap();
         let id = id_holder.shard();
         let holder = holder_of(id).unwrap();
         assert_eq!(holder.shard(), id);
@@ -958,7 +1004,7 @@ mod tests {
             Err(RtError::ShardGone { .. })
         ));
         let (again_holder, _receiver) =
-            register_slot(2, 2, RegisterKick::Kick(Kick::none())).unwrap();
+            register_slot(2, 2, 0, RegisterKick::Kick(Kick::none())).unwrap();
         let again = again_holder.shard();
         if again == id {
             assert!(matches!(

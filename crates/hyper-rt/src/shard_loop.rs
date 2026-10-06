@@ -154,8 +154,12 @@ impl ShardSeed {
         driver: DriverSeed,
         kick: registry::RegisterKick,
     ) -> Result<ShardSeed, RtError> {
-        let (holder, control) =
-            registry::register_slot(config.tasks_per_shard, config.ring_entries, kick)?;
+        let (holder, control) = registry::register_slot(
+            config.tasks_per_shard,
+            config.ring_entries,
+            config.interests_per_shard,
+            kick,
+        )?;
         let id = holder.shard();
         let kick = registry::with_entry(id, |entry| entry.kick).unwrap_or(Kick::None);
         Ok(ShardSeed {
@@ -973,6 +977,14 @@ impl Shard {
             // docs/bugs/2026-09-17-control-drain-forgets-a-burst-past-one-batch.md).
             entry.control_pending.rearm();
         }
+        // Waits of this shard dropped elsewhere: their marks, set before the control mark this drain took.
+        if entry
+            .abandons_marked
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
+        {
+            self.desk.sweep_abandoned();
+            drained = drained.saturating_add(1);
+        }
         // The runtime's stop, after this batch's messages: a Shutdown at the back of the batch that took no
         // channel slot (`registry::request_stop`). Messages drained later are refused as at any shutdown.
         if entry.stop.load(std::sync::atomic::Ordering::Acquire) && !self.core.shutting_down {
@@ -1039,14 +1051,7 @@ impl Shard {
             Control::Cancel(word) => {
                 let _ = self.desk.cancel(TaskId(word));
             }
-            Control::Abandon(abandoned) => {
-                self.desk.abandon_interest(
-                    abandoned.raw,
-                    abandoned.writable,
-                    abandoned.word,
-                    abandoned.ticket,
-                );
-            }
+
             Control::Shutdown => {
                 self.core.shutting_down = true;
                 self.cancel_all();

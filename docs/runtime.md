@@ -337,9 +337,11 @@ against it on those rows of §12 before the choice is fixed (slates-dc's review)
   wait for a cancel to finish) until the last arrives, or at most the I/O manager's own timeout for a
   cancelled IRP, five minutes (Microsoft, *Canceling IRPs*). It counts a block still owed then, which is
   left to the kernel rather than freed.
-- **A ticket names its desk.** A ticket carries its shard's registration. A wait dropped on another shard,
-  or off any, is carried to its own shard through that shard's control channel, pinned to the registration.
-  Another desk honours none of it.
+- **A ticket names its desk.** A ticket carries its shard's registration, and another desk honours none of
+  it. A wait dropped on another shard, or off any, is marked on its shard's registry entry: one atomic word
+  per wait slot, holding the dropped wait's generation. A slot's generation is dropped at most once, so a
+  mark is never refused for room. The control channel was not used for this, because a full one leaked the
+  slot. The shard's next control drain sweeps the marks.
 
 The tests are `tests/readiness_waits.rs`, `tests/duplex.rs` and the table's model test.
 

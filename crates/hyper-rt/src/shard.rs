@@ -142,15 +142,27 @@ pub struct Ticket {
     /// The registration of the shard whose desk holds the wait: a `Ready` may be dropped, or polled again,
     /// on another shard or off any, and a ticket is honoured only by its own desk (mantle's final review,
     /// second pass, finding 4: by slot and generation alone, another shard's live wait was taken for it).
-    owner: Option<crate::registry::SlotHolder>,
+    /// Every runtime shard's desk is registered, so a ticket always names one (the third pass, D: an
+    /// optional owner let two unregistered desks accept each other's tickets).
+    owner: crate::registry::SlotHolder,
     slot: u32,
     generation: u32,
 }
 
 impl Ticket {
     /// The registration of the shard whose desk holds the wait.
-    pub(crate) fn owner(self) -> Option<crate::registry::SlotHolder> {
+    pub(crate) fn owner(self) -> crate::registry::SlotHolder {
         self.owner
+    }
+
+    /// The wait's slot.
+    pub(crate) fn slot(self) -> u32 {
+        self.slot
+    }
+
+    /// The slot's generation when the wait took it.
+    pub(crate) fn generation(self) -> u32 {
+        self.generation
     }
 }
 
@@ -159,21 +171,11 @@ impl Ticket {
     /// A ticket for a table test that has no desk.
     pub(crate) fn for_test(slot: u32) -> Ticket {
         Ticket {
-            owner: None,
+            owner: crate::registry::SlotHolder::for_test(),
             slot,
             generation: 0,
         }
     }
-}
-
-/// The end of a readiness wait dropped away from its shard, carried to that shard's loop
-/// ([`Control::Abandon`](crate::control::Control::Abandon)).
-#[derive(Clone, Copy, Debug)]
-pub struct Abandoned {
-    pub(crate) raw: Option<i32>,
-    pub(crate) writable: bool,
-    pub(crate) word: Encoded,
-    pub(crate) ticket: Ticket,
 }
 
 /// Where a readiness wait stands. Only a fire makes a wait ready: a task woken for another reason (a timer
@@ -196,6 +198,11 @@ struct WaitCell {
     generation: Cell<u32>,
     phase: Cell<WaitPhase>,
     refusal: Cell<Option<RtError>>,
+    /// What the wait waits on (`None`: a simulated socket) and for whom, so the shard can end a wait
+    /// dropped elsewhere from its slot alone.
+    raw: Cell<Option<i32>>,
+    writable: Cell<bool>,
+    word: Cell<Option<Encoded>>,
 }
 
 /// The values a shard keeps for its life, filled before its first step and immutable afterwards (slates'
@@ -394,6 +401,9 @@ impl ShardContext {
                     generation: Cell::new(0),
                     phase: Cell::new(WaitPhase::Free),
                     refusal: Cell::new(None),
+                    raw: Cell::new(None),
+                    writable: Cell::new(false),
+                    word: Cell::new(None),
                 })
                 .collect(),
             free_waits: CellStack::full_of(wait_ids.into_iter()),
@@ -671,7 +681,13 @@ impl ShardContext {
 
     /// Takes a wait slot for a readiness wait: its ticket, or `Capacity` when `interests_per_shard` waits
     /// are outstanding.
-    pub(crate) fn take_wait(&self) -> Result<Ticket, RtError> {
+    pub(crate) fn take_wait(
+        &self,
+        raw: Option<i32>,
+        writable: bool,
+        word: Encoded,
+    ) -> Result<Ticket, RtError> {
+        let owner = self.incarnation.ok_or(RtError::NotOnShardThread)?;
         let slot = self.free_waits.pop().ok_or(RtError::Capacity {
             what: "readiness waits",
             bound: self.waits.len(),
@@ -681,8 +697,11 @@ impl ShardContext {
             bound: self.waits.len(),
         })?;
         cell.phase.set(WaitPhase::Armed);
+        cell.raw.set(raw);
+        cell.writable.set(writable);
+        cell.word.set(Some(word));
         Ok(Ticket {
-            owner: self.incarnation,
+            owner,
             slot,
             generation: cell.generation.get(),
         })
@@ -694,7 +713,7 @@ impl ShardContext {
 
     /// The cell `ticket` names, while that wait holds it: a ticket of another desk names nothing here.
     fn wait_of(&self, ticket: Ticket) -> Option<&WaitCell> {
-        if ticket.owner != self.incarnation {
+        if Some(ticket.owner) != self.incarnation {
             return None;
         }
         self.wait_cell(ticket.slot)
@@ -703,7 +722,42 @@ impl ShardContext {
 
     /// Whether `ticket` is this desk's.
     pub(crate) fn owns(&self, ticket: Ticket) -> bool {
-        ticket.owner == self.incarnation
+        Some(ticket.owner) == self.incarnation
+    }
+
+    /// Ends the waits of this shard dropped on another shard or off any, from their marks on the registry
+    /// entry ([`crate::registry::Entry::mark_abandoned`]): each as if dropped here. A mark of an ended
+    /// generation names nothing. Bounded by the wait slots.
+    pub(crate) fn sweep_abandoned(&self) {
+        let Some(entry) = self.entry else {
+            return;
+        };
+        let Some(owner) = self.incarnation else {
+            return;
+        };
+        for (slot, mark) in entry.abandoned.iter().enumerate() {
+            let marked = mark.swap(0, std::sync::atomic::Ordering::AcqRel);
+            let (Some(generation), Ok(slot)) = (
+                marked
+                    .checked_sub(1)
+                    .and_then(|generation| u32::try_from(generation).ok()),
+                u32::try_from(slot),
+            ) else {
+                continue;
+            };
+            let ticket = Ticket {
+                owner,
+                slot,
+                generation,
+            };
+            let Some(cell) = self.wait_of(ticket) else {
+                continue;
+            };
+            let Some(word) = cell.word.get() else {
+                continue;
+            };
+            self.abandon_interest(cell.raw.get(), cell.writable.get(), word, ticket);
+        }
     }
 
     /// Gives a wait's slot back: its generation moves on, so the ended wait's ticket names nothing.
@@ -726,7 +780,7 @@ impl ShardContext {
         writable: bool,
         word: Encoded,
     ) -> Result<Ticket, RtError> {
-        let ticket = self.take_wait()?;
+        let ticket = self.take_wait(Some(raw), writable, word)?;
         let pushed = self.interests.push(Interest {
             raw,
             writable,

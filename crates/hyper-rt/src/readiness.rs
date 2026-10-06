@@ -84,7 +84,7 @@ impl Future for Ready {
         let writable = matches!(self.interest, Interest::Writable);
         let registered = registry::with_current(|ctx| match self.target {
             Target::Os(raw) => ctx.register_interest(raw, writable, word),
-            Target::Sim(index) => ctx.take_wait().and_then(|ticket| {
+            Target::Sim(index) => ctx.take_wait(None, writable, word).and_then(|ticket| {
                 crate::sim::sim_register(index, writable, word, ticket)
                     .map(|()| ticket)
                     .inspect_err(|_| {
@@ -103,20 +103,22 @@ impl Future for Ready {
     }
 }
 
-/// Waits dropped away from their shard whose end could not be carried to it (its control channel full, or
-/// the shard gone): their slots stay held against the owner's bound until it exits. A tripwire, expected
-/// zero.
+/// Waits dropped away from their shard whose end could not be marked on it while it lived: a slot held
+/// against the owner's bound until it exits. A tripwire, expected zero: a mark is refused only for a slot
+/// past the owner's marks, which no ticket names. A send refused because the owner is gone leaks nothing
+/// (its desk went with its slots) and is not counted (the third pass, B).
 static ABANDONS_LOST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// Waits whose end could not be carried to their shard since the process started ([`ABANDONS_LOST`]).
+/// Waits whose end could not be marked on their live shard since the process started ([`ABANDONS_LOST`]).
 pub fn abandons_lost() -> u64 {
     ABANDONS_LOST.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 impl Ready {
     /// Ends the armed wait, if any: its own shard withdraws it from its table and gives its slot back. On
-    /// another shard, or off any, the end is carried to the owner through its control channel, pinned to
-    /// its registration (mantle's final review, second pass, finding 4).
+    /// another shard, or off any, the wait is marked abandoned on its shard's registry entry, which its
+    /// next control drain sweeps: a mark per slot, never refused for room (mantle's final review, second
+    /// pass, finding 4, and third pass, A: a control message could meet a full channel and leak the slot).
     fn abandon(&mut self) {
         let Some((ticket, word)) = self.armed.take() else {
             return;
@@ -135,19 +137,11 @@ impl Ready {
         if here {
             return;
         }
-        let carried = ticket.owner().is_some_and(|owner| {
-            registry::send_control_to_holder(
-                owner,
-                crate::control::Control::Abandon(crate::shard::Abandoned {
-                    raw,
-                    writable,
-                    word,
-                    ticket,
-                }),
-            )
-            .is_ok()
+        let marked = registry::with_holder(ticket.owner(), |entry| {
+            entry.mark_abandoned(ticket.slot(), ticket.generation())
         });
-        if !carried {
+        // `None`: the owner is gone, and its slots with it.
+        if marked == Some(false) {
             ABANDONS_LOST.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
     }

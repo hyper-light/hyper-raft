@@ -332,9 +332,14 @@ against it on those rows of §12 before the choice is fixed (slates-dc's review)
   reallocates. A handle whose last waiter leaves is disarmed (IOCP cancels its AFD poll).
 - **An AFD poll delivers by the status its IRP completed with.** `STATUS_CANCELLED` delivers nothing, a poll
   that completed before its cancel delivers its events, and a failed one wakes both directions, as wepoll
-  maps it to `EPOLLERR`. A dropped driver awaits its cancelled polls' completions for at most the shard's step budget
-  (`CancelIoEx` does not wait for a cancel to finish), and counts any block still owed at that deadline,
-  which is left to the kernel rather than freed.
+  maps it to `EPOLLERR`. A replacement poll is issued before the old one is cancelled, so a refused issue leaves the
+  waiters already served. A dropped driver awaits its cancelled polls' completions (`CancelIoEx` does not
+  wait for a cancel to finish) until the last arrives, or at most the I/O manager's own timeout for a
+  cancelled IRP, five minutes (Microsoft, *Canceling IRPs*). It counts a block still owed then, which is
+  left to the kernel rather than freed.
+- **A ticket names its desk.** A ticket carries its shard's registration. A wait dropped on another shard,
+  or off any, is carried to its own shard through that shard's control channel, pinned to the registration.
+  Another desk honours none of it.
 
 The tests are `tests/readiness_waits.rs`, `tests/duplex.rs` and the table's model test.
 
@@ -501,7 +506,11 @@ The order that keeps a live subscriber's handler is `signal_protocol.rs`:
   the kind;
 - the kernel serializes `sigaction`, which carries the rest.
 
-It is loom-checked, from both starting states, and a restore that never rechecks fails the model.
+A subscription claims its slot with a sentinel bit no kind uses, resets the slot's pending kinds,
+and only then publishes its mask, so a restore that hands it a signal is never undone by the reset.
+
+Both orders are loom-checked (the first from both starting states). A restore that never rechecks fails
+the first model, and a claim that publishes before resetting fails the second.
 
 ### 6.2 Stdio
 
@@ -561,6 +570,11 @@ blocking `recv` and never touches the cell.
 | `watch` of a larger value | the publisher keeps it; readers are notified through the cell and ask the owner for it (a request through a `channel`) | the owner's |
 | `Semaphore(n)` | an atomic count + a bounded FIFO of waiting words; a release wakes exactly the waiters it admits, in arrival order | `n` permits; waiters bounded by the configured queue, past it `Capacity` |
 | `Notify` | the cell alone: `notify_one` wakes the registered waiter; a notification with no waiter is kept as one pending permit | one |
+
+A waiter registers its task word with a swap, not a store: registration and the publisher's take are
+both read-modify-writes of one word, so a waiter that registers and then checks never sleeps through a
+publisher that changes the state and then wakes (`handoff.rs`, loom-checked; a plain store fails the model,
+the store-buffer pattern).
 
 No broadcast primitive is offered: a broadcast to N waiters is the O(N) hazard of NOTE26 §5.1. An event that
 concerns every waiter (a shutdown) completes each waiter's cell once (NOTE26 §5.3 rule 2).

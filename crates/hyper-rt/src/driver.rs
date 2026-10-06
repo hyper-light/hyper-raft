@@ -190,11 +190,9 @@ pub trait Driver {
     /// per-handle state is bounded by the handles waited on.
     fn disarm(&mut self, _raw: i32) {}
 
-    /// Shapes the driver from the shard's configuration, once before the first registration: its per-handle
-    /// state reserved for `handles` handles (`interests_per_shard`), and `drain_ns` (`step_budget_ns`), the
-    /// longest a dropped driver waits for completions the kernel still owes it. `Capacity` when the
-    /// reservation fails.
-    fn shape(&mut self, _handles: usize, _drain_ns: u64) -> Result<(), RtError> {
+    /// Reserves the driver's per-handle state for `handles` handles (`interests_per_shard`), once before the
+    /// first registration. `Capacity` when the reservation fails.
+    fn reserve_handles(&mut self, _handles: usize) -> Result<(), RtError> {
         Ok(())
     }
 

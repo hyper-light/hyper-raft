@@ -242,14 +242,17 @@ impl CellRef {
     /// Forgets the waiting task, if any (its handle leaves the cell to a next user).
     pub(crate) fn clear_waiter(self) {
         if let Some(cell) = self.cell() {
-            cell.waiter.store(NO_WAITER, Ordering::Release);
+            crate::handoff::clear_waiter(&cell.waiter);
         }
     }
 
-    /// Records `word` as the task to wake (replacing any earlier one: one waiter at a time).
+    /// Records `word` as the task to wake (replacing any earlier one: one waiter at a time). A
+    /// read-modify-write, so a waiter that registers and then checks the state never misses a publisher
+    /// that changes the state and then wakes (`crate::handoff`; mantle's final review, second pass,
+    /// finding 2: a plain store let both sides read stale values).
     pub(crate) fn register(self, word: Encoded) {
         if let Some(cell) = self.cell() {
-            cell.waiter.store(word.word(), Ordering::Release);
+            crate::handoff::register_waiter(&cell.waiter, word.word());
         }
     }
 
@@ -258,8 +261,7 @@ impl CellRef {
         let Some(cell) = self.cell() else {
             return;
         };
-        let word = cell.waiter.swap(NO_WAITER, Ordering::AcqRel);
-        if word != NO_WAITER {
+        if let Some(word) = crate::handoff::take_waiter(&cell.waiter) {
             crate::registry::wake(Encoded::from_word(word));
         }
     }

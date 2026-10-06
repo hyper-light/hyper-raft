@@ -271,6 +271,7 @@ pub(crate) fn register_kick(_fd: Option<()>) -> registry::RegisterKick {
 /// could not run.
 struct Worker {
     id: u16,
+    holder: registry::SlotHolder,
     thread: JoinHandle<Result<Counters, RtError>>,
 }
 
@@ -354,7 +355,7 @@ fn stop(workers: Vec<Worker>) -> Result<Vec<Counters>, RtError> {
         // `ShardGone`: the shard's slot is already free, and the join below reports how its thread ended.
         let _ = registry::request_stop(worker.id);
     }
-    let ids: Vec<u16> = workers.iter().map(|worker| worker.id).collect();
+    let holders: Vec<registry::SlotHolder> = workers.iter().map(|worker| worker.holder).collect();
     let mut counters = Vec::with_capacity(workers.len());
     let mut failure = None;
     for worker in workers {
@@ -369,8 +370,8 @@ fn stop(workers: Vec<Worker>) -> Result<Vec<Counters>, RtError> {
             }
         }
     }
-    for id in ids {
-        registry::unregister(id);
+    for holder in holders {
+        registry::unregister(holder);
     }
     match failure {
         Some(error) => Err(error),
@@ -380,10 +381,10 @@ fn stop(workers: Vec<Worker>) -> Result<Vec<Counters>, RtError> {
 
 /// Gives back the slots of seeds that never became workers.
 fn release_seeds(seeds: Vec<ShardSeed>) {
-    let ids: Vec<u16> = seeds.iter().map(|seed| seed.id).collect();
+    let holders: Vec<registry::SlotHolder> = seeds.iter().map(|seed| seed.holder).collect();
     drop(seeds);
-    for id in ids {
-        registry::unregister(id);
+    for holder in holders {
+        registry::unregister(holder);
     }
 }
 
@@ -440,6 +441,7 @@ impl Runtime {
                 None
             };
             let id = seed.id;
+            let holder = seed.holder;
             let ready = ready.clone();
             #[allow(
                 clippy::disallowed_methods,
@@ -449,10 +451,10 @@ impl Runtime {
                 .name(format!("hyper-rt-shard-{id}"))
                 .spawn(move || run_worker(seed, core, ready));
             match spawned {
-                Ok(thread) => workers.push(Worker { id, thread }),
+                Ok(thread) => workers.push(Worker { id, holder, thread }),
                 Err(error) => {
                     // The seed moved into the refused closure and is dropped with it; its slot, and the rest, go back.
-                    registry::unregister(id);
+                    registry::unregister(holder);
                     release_seeds(seeds.map(|(_, seed)| seed).collect());
                     let refusal = RtError::DriverRefused {
                         call: "thread spawn",
@@ -575,12 +577,12 @@ pub struct LocalRuntime {
 
 /// Gives a registry slot back when dropped: after the shard that held it, by field order.
 #[derive(Debug)]
-pub(crate) struct SlotGuard(u16);
+pub(crate) struct SlotGuard(registry::SlotHolder);
 
 impl SlotGuard {
-    /// Guards shard `id`'s slot.
-    pub(crate) fn new(id: u16) -> Self {
-        Self(id)
+    /// Guards the slot `holder` holds.
+    pub(crate) fn new(holder: registry::SlotHolder) -> Self {
+        Self(holder)
     }
 }
 
@@ -604,12 +606,12 @@ impl LocalRuntime {
     pub fn new(config: &RuntimeConfig) -> Result<LocalRuntime, RtError> {
         let prepared = os_driver(u32::try_from(config.ring_entries).unwrap_or(u32::MAX))?;
         let seed = ShardSeed::register(config, prepared.seed, register_kick(prepared.kick_fd))?;
-        let id = seed.id;
-        let shard = Shard::build(seed).inspect_err(|_| registry::unregister(id))?;
+        let holder = seed.holder;
+        let shard = Shard::build(seed).inspect_err(|_| registry::unregister(holder))?;
         Ok(LocalRuntime {
             shard,
             notes: prepared.notes,
-            slot: SlotGuard(id),
+            slot: SlotGuard(holder),
         })
     }
 
@@ -620,18 +622,18 @@ impl LocalRuntime {
         kick: Kick,
     ) -> Result<LocalRuntime, RtError> {
         let seed = ShardSeed::register(config, driver, registry::RegisterKick::Kick(kick))?;
-        let id = seed.id;
-        let shard = Shard::build(seed).inspect_err(|_| registry::unregister(id))?;
+        let holder = seed.holder;
+        let shard = Shard::build(seed).inspect_err(|_| registry::unregister(holder))?;
         Ok(LocalRuntime {
             shard,
             notes: Vec::new(),
-            slot: SlotGuard(id),
+            slot: SlotGuard(holder),
         })
     }
 
     /// The shard.
     pub fn shard_id(&self) -> ShardId {
-        ShardId(self.slot.0)
+        ShardId(self.slot.0.shard())
     }
 
     /// The driver notes.
@@ -681,7 +683,9 @@ impl LocalRuntime {
             }
             let outcome = self.shard.step();
             if outcome.exit {
-                return Err(RtError::ShardGone { shard: self.slot.0 });
+                return Err(RtError::ShardGone {
+                    shard: self.slot.0.shard(),
+                });
             }
             if !outcome.did_work {
                 self.shard.park(outcome.next_deadline_ns);

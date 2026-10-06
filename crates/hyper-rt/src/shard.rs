@@ -139,8 +139,19 @@ pub(crate) struct Interest {
 /// (mantle's final review, findings 1 and 2).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Ticket {
+    /// The registration of the shard whose desk holds the wait: a `Ready` may be dropped, or polled again,
+    /// on another shard or off any, and a ticket is honoured only by its own desk (mantle's final review,
+    /// second pass, finding 4: by slot and generation alone, another shard's live wait was taken for it).
+    owner: Option<crate::registry::SlotHolder>,
     slot: u32,
     generation: u32,
+}
+
+impl Ticket {
+    /// The registration of the shard whose desk holds the wait.
+    pub(crate) fn owner(self) -> Option<crate::registry::SlotHolder> {
+        self.owner
+    }
 }
 
 #[cfg(test)]
@@ -148,10 +159,21 @@ impl Ticket {
     /// A ticket for a table test that has no desk.
     pub(crate) fn for_test(slot: u32) -> Ticket {
         Ticket {
+            owner: None,
             slot,
             generation: 0,
         }
     }
+}
+
+/// The end of a readiness wait dropped away from its shard, carried to that shard's loop
+/// ([`Control::Abandon`](crate::control::Control::Abandon)).
+#[derive(Clone, Copy, Debug)]
+pub struct Abandoned {
+    pub(crate) raw: Option<i32>,
+    pub(crate) writable: bool,
+    pub(crate) word: Encoded,
+    pub(crate) ticket: Ticket,
 }
 
 /// Where a readiness wait stands. Only a fire makes a wait ready: a task woken for another reason (a timer
@@ -660,6 +682,7 @@ impl ShardContext {
         })?;
         cell.phase.set(WaitPhase::Armed);
         Ok(Ticket {
+            owner: self.incarnation,
             slot,
             generation: cell.generation.get(),
         })
@@ -669,10 +692,18 @@ impl ShardContext {
         self.waits.get(usize::try_from(slot).ok()?)
     }
 
-    /// The cell `ticket` names, while that wait holds it.
+    /// The cell `ticket` names, while that wait holds it: a ticket of another desk names nothing here.
     fn wait_of(&self, ticket: Ticket) -> Option<&WaitCell> {
+        if ticket.owner != self.incarnation {
+            return None;
+        }
         self.wait_cell(ticket.slot)
             .filter(|cell| cell.generation.get() == ticket.generation)
+    }
+
+    /// Whether `ticket` is this desk's.
+    pub(crate) fn owns(&self, ticket: Ticket) -> bool {
+        ticket.owner == self.incarnation
     }
 
     /// Gives a wait's slot back: its generation moves on, so the ended wait's ticket names nothing.

@@ -103,8 +103,20 @@ impl Future for Ready {
     }
 }
 
+/// Waits dropped away from their shard whose end could not be carried to it (its control channel full, or
+/// the shard gone): their slots stay held against the owner's bound until it exits. A tripwire, expected
+/// zero.
+static ABANDONS_LOST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Waits whose end could not be carried to their shard since the process started ([`ABANDONS_LOST`]).
+pub fn abandons_lost() -> u64 {
+    ABANDONS_LOST.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 impl Ready {
-    /// Ends the armed wait, if any: the shard withdraws it from its table and gives its slot back.
+    /// Ends the armed wait, if any: its own shard withdraws it from its table and gives its slot back. On
+    /// another shard, or off any, the end is carried to the owner through its control channel, pinned to
+    /// its registration (mantle's final review, second pass, finding 4).
     fn abandon(&mut self) {
         let Some((ticket, word)) = self.armed.take() else {
             return;
@@ -114,7 +126,30 @@ impl Ready {
             Target::Os(raw) => Some(raw),
             Target::Sim(_) => None,
         };
-        let _ = registry::with_current(|ctx| ctx.abandon_interest(raw, writable, word, ticket));
+        let here = registry::with_current(|ctx| {
+            ctx.owns(ticket)
+                .then(|| ctx.abandon_interest(raw, writable, word, ticket))
+                .is_some()
+        })
+        .unwrap_or(false);
+        if here {
+            return;
+        }
+        let carried = ticket.owner().is_some_and(|owner| {
+            registry::send_control_to_holder(
+                owner,
+                crate::control::Control::Abandon(crate::shard::Abandoned {
+                    raw,
+                    writable,
+                    word,
+                    ticket,
+                }),
+            )
+            .is_ok()
+        });
+        if !carried {
+            ABANDONS_LOST.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 }
 

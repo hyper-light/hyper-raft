@@ -129,6 +129,8 @@ const OVERRUN_FORGET_SHIFT: u32 = 3;
 pub struct ShardSeed {
     /// The registered id.
     pub id: u16,
+    /// The registration that holds the slot, for retiring exactly it.
+    pub(crate) holder: registry::SlotHolder,
     /// Builds the driver on the shard's thread.
     pub driver: DriverSeed,
     /// The kick the driver answers to.
@@ -152,11 +154,13 @@ impl ShardSeed {
         driver: DriverSeed,
         kick: registry::RegisterKick,
     ) -> Result<ShardSeed, RtError> {
-        let (id, control) =
+        let (holder, control) =
             registry::register_slot(config.tasks_per_shard, config.ring_entries, kick)?;
+        let id = holder.shard();
         let kick = registry::with_entry(id, |entry| entry.kick).unwrap_or(Kick::None);
         Ok(ShardSeed {
             id,
+            holder,
             driver,
             kick,
             control,
@@ -233,7 +237,7 @@ impl Shard {
     pub fn build(seed: ShardSeed) -> Result<Shard, RtError> {
         let config = seed.config;
         let mut driver = (seed.driver)(seed.kick)?;
-        driver.shape(config.interests_per_shard, config.step_budget_ns)?;
+        driver.reserve_handles(config.interests_per_shard)?;
         let is_sim = driver.kind() == DriverKind::Simulation;
         let generation_base = registry::entry(seed.id).map_or(0, |entry| entry.generation_base);
         let desk = Box::new(ShardContext::new(
@@ -1034,6 +1038,14 @@ impl Shard {
             }
             Control::Cancel(word) => {
                 let _ = self.desk.cancel(TaskId(word));
+            }
+            Control::Abandon(abandoned) => {
+                self.desk.abandon_interest(
+                    abandoned.raw,
+                    abandoned.writable,
+                    abandoned.word,
+                    abandoned.ticket,
+                );
             }
             Control::Shutdown => {
                 self.core.shutting_down = true;

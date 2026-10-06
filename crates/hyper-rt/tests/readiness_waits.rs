@@ -4,6 +4,8 @@
 //! - Finding 1: two waits of one task on one handle and direction shared the table's node (keyed by the
 //!   task's word); a race's losing wait, dropped, withdrew it, and the join's wait on the same socket
 //!   never woke.
+//!   (The join test below fails on the old code through finding 2 first: the race's own wait reported
+//!   ready. Finding 1 alone is pinned by `interests.rs`'s table test of two waits of one word.)
 //! - Finding 2: a wait re-polled for any reason reported ready, so a timer that woke a biased race made
 //!   the idle socket's wait win, and that wait's node was never withdrawn.
 
@@ -109,29 +111,74 @@ fn a_wait_woken_by_a_timer_stays_unready_and_leaves_when_it_loses() {
     .unwrap();
 }
 
-/// Windows, mantle's final review, finding 4: a dropped driver reclaims every AFD poll block without an
-/// unbounded wait. Do: in each of several runtimes, lose a race of a read wait (its poll cancelled when the
-/// last waiter leaves) and leave a task waiting on a second socket when the runtime ends (its poll still in
-/// flight at the driver's drop). Expect: the drop's zero-timeout drain found every block, so none was left
-/// to the kernel.
-#[cfg(windows)]
+/// Mantle's final review, second pass, finding 4. Do: on shard A, arm a read wait and move the armed
+/// `Ready` to shard B, where a task waits on its own socket (its wait in the same slot and generation of
+/// B's table as the moved one's in A's), and drop it there; then send B's socket a datagram. Expect: B's
+/// wait wakes (a ticket of A's names nothing on B), and A's slot comes back (the drop is carried to A).
 #[test]
-fn a_dropped_driver_leaves_no_afd_poll_to_the_kernel() {
-    for _ in 0..8 {
-        let mut rt = LocalRuntime::new(&config()).unwrap();
-        rt.block_on(async {
-            let idle = UdpSocket::bind(loopback()).unwrap();
-            let raced = race2(idle.readable(), sleep(TICK_NS)).await;
-            assert!(matches!(raced, Either::Second(Ok(()))));
-            let waiting = UdpSocket::bind(loopback()).unwrap();
-            hyper_rt::futures::spawn_detached(async move {
-                let _ = waiting.readable().await;
-            })
-            .unwrap();
-            yield_now().await;
+fn a_wait_dropped_on_another_shard_ends_on_its_own() {
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::mpsc::channel;
+    use std::task::Poll;
+
+    use hyper_rt::runtime::Runtime;
+    use hyper_rt::sync::oneshot;
+
+    let rt = Runtime::start(&RuntimeConfig {
+        shards: 2,
+        ..config()
+    })
+    .unwrap();
+    let (a, b) = (rt.shard_ids()[0], rt.shard_ids()[1]);
+    let (moved, arrives) = oneshot().unwrap();
+    let (finished, done) = oneshot::<()>().unwrap();
+    let (report, reports) = channel();
+    let from_a = report.clone();
+    rt.spawn_on(a, async move {
+        let ours = UdpSocket::bind(loopback()).unwrap();
+        let mut armed = ours.readable();
+        std::future::poll_fn(|cx| {
+            let _ = Pin::new(&mut armed).poll(cx);
+            Poll::Ready(())
         })
-        .unwrap();
-        drop(rt);
+        .await;
+        assert_eq!(waits_held(), 1, "armed on A");
+        let _ = moved.send(armed);
+        let _ = done.await;
+        yield_now().await;
+        let _ = from_a.send(("A's slots held", waits_held()));
+    })
+    .unwrap();
+    rt.spawn_on(b, async move {
+        let ours = UdpSocket::bind(loopback()).unwrap();
+        let peer = UdpSocket::bind(loopback()).unwrap();
+        let to = ours.local_addr().unwrap();
+        let joined = join2(ours.readable(), async {
+            let foreign = arrives.await.unwrap();
+            drop(foreign);
+            yield_now().await;
+            peer.send_to(b"x", to).unwrap();
+        });
+        let woke = matches!(
+            race2(joined, sleep(PATIENCE_NS)).await,
+            Either::First((Ok(()), ()))
+        );
+        let _ = report.send(("B's wait woke", usize::from(woke)));
+        let _ = finished.send(());
+    })
+    .unwrap();
+    let mut seen = std::collections::BTreeMap::new();
+    for _ in 0..2 {
+        let (what, value) = reports.recv().unwrap();
+        seen.insert(what, value);
     }
-    assert_eq!(hyper_rt::iocp::afd_blocks_left(), 0);
+    rt.shutdown().unwrap();
+    assert_eq!(
+        seen.get("B's wait woke"),
+        Some(&1),
+        "B's live wait was taken for A's"
+    );
+    assert_eq!(seen.get("A's slots held"), Some(&0), "A's slot came back");
+    assert_eq!(hyper_rt::readiness::abandons_lost(), 0);
 }

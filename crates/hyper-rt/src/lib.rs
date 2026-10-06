@@ -58,6 +58,7 @@ pub mod dns;
 pub mod driver;
 pub mod error;
 pub mod futures;
+mod handoff;
 pub mod interests;
 pub mod local;
 mod localsys;

@@ -308,36 +308,36 @@ thread_local! {
 /// entry its context holds (AUD-29-08).
 #[derive(Debug)]
 pub struct Registration {
-    shard: u16,
+    holder: SlotHolder,
 }
 
 impl Registration {
     /// The registered shard id.
     pub fn shard(&self) -> u16 {
-        self.shard
+        self.holder.shard
     }
 }
 
 impl Drop for Registration {
     fn drop(&mut self) {
-        unregister(self.shard);
+        unregister(self.holder);
     }
 }
 
 /// Claims a slot as [`register_slot`] does, for a holder outside the runtime: the slot is retired when the
-/// returned [`Registration`] drops. Retiring a slot by its number — a running shard's included — is not
-/// reachable from outside the runtime:
+/// returned [`Registration`] drops. Retiring a slot — a running shard's included — is not reachable from
+/// outside the runtime:
 ///
 /// ```compile_fail,E0603
-/// hyper_rt::registry::unregister(0);
+/// hyper_rt::registry::unregister(hyper_rt::registry::holder_of(0).unwrap());
 /// ```
 pub fn register(
     wake_slots: usize,
     control_bound: usize,
     kick: RegisterKick,
 ) -> Result<(Registration, Receiver<Control>), RtError> {
-    let (shard, control) = register_slot(wake_slots, control_bound, kick)?;
-    Ok((Registration { shard }, control))
+    let (holder, control) = register_slot(wake_slots, control_bound, kick)?;
+    Ok((Registration { holder }, control))
 }
 
 /// Registers a new shard with a wake bitmap for `wake_slots` task slots, a control channel bounded at
@@ -347,7 +347,7 @@ pub(crate) fn register_slot(
     wake_slots: usize,
     control_bound: usize,
     kick: RegisterKick,
-) -> Result<(u16, Receiver<Control>), RtError> {
+) -> Result<(SlotHolder, Receiver<Control>), RtError> {
     let max = u16::try_from(MAX_SHARDS).unwrap_or(u16::MAX);
     for (index, slot) in SLOTS.iter().enumerate() {
         let free = slot.generation.load(Ordering::Acquire);
@@ -415,7 +415,7 @@ pub(crate) fn register_slot(
         };
         // Retirement takes the pointer and frees it through its last reader before publishing a free slot.
         slot.entry.publish(entry);
-        return Ok((id, receiver));
+        return Ok((holder, receiver));
     }
     Err(RtError::TooManyShards { max })
 }
@@ -473,19 +473,22 @@ pub fn contexts_reclaimed() -> u64 {
     CONTEXTS_RECLAIMED.load(Ordering::Relaxed)
 }
 
-/// Retires a shard after all of its runtime's contexts have ended: removes the entry from lookup, and
-/// its resources are dropped and the free generation published by whichever ends last — this call, when
-/// no foreign reader holds the entry, or the last reader's unpin (`crate::retire`). It never waits: a
-/// descheduled reader delays only the free, and a retirement from inside a reader's own call ends
-/// (mantle's review, finding 10b). A new registration cannot claim the slot before the free (§4.3).
-pub(crate) fn unregister(shard: u16) {
-    let Some(slot) = SLOTS.get(usize::from(shard)) else {
+/// Retires the registration `holder` names after all of its runtime's contexts have ended: removes the
+/// entry from lookup, and its resources are dropped and the free generation published by whichever ends
+/// last — this call, when no foreign reader holds the entry, or the last reader's unpin (`crate::retire`).
+/// It never waits: a descheduled reader delays only the free, and a retirement from inside a reader's own
+/// call ends (mantle's review, finding 10b). A new registration cannot claim the slot before the free
+/// (§4.3). A holder whose slot has moved on — retired already, or held by a later registration — retires
+/// nothing (mantle's final review: by shard number alone, a second call after the slot's reuse would have
+/// retired its new holder).
+pub(crate) fn unregister(holder: SlotHolder) {
+    let Some(slot) = SLOTS.get(usize::from(holder.shard)) else {
         return;
     };
-    if slot.generation.load(Ordering::Acquire) & 1 == 1 {
+    if slot.generation.load(Ordering::Acquire) != holder.generation {
         return;
     }
-    note_exited(shard);
+    note_exited(holder.shard);
     slot.entry.retire(|entry| slot.free(entry));
 }
 
@@ -750,8 +753,9 @@ mod tests {
         let form = Kick::Eventfd;
         #[cfg(any(target_os = "macos", target_os = "freebsd"))]
         let form = Kick::Kqueue;
-        let (shard, _control) =
+        let (shard_holder, _control) =
             register_slot(2, 1, RegisterKick::Descriptor(descriptor, form)).unwrap();
+        let shard = shard_holder.shard();
         let kick = with_entry(shard, |entry| entry.kick).unwrap();
         let descriptor = match kick {
             #[cfg(target_os = "linux")]
@@ -776,7 +780,7 @@ mod tests {
             });
             borrowing.recv().unwrap();
             // The borrow is held until `release`: a retirement that waited for it would never return.
-            unregister(shard);
+            unregister(shard_holder);
             assert!(
                 with_entry(shard, |_| ()).is_none(),
                 "the retired entry is out of lookup"
@@ -789,13 +793,14 @@ mod tests {
             );
         });
         assert_eq!(descriptor.with(|_| ()), None);
-        let (replacement, _control) = register_slot(2, 1, RegisterKick::Kick(Kick::None)).unwrap();
+        let (replacement_holder, _control) =
+            register_slot(2, 1, RegisterKick::Kick(Kick::None)).unwrap();
         assert_eq!(
             descriptor.with(|_| ()),
             None,
             "a stale kick cannot borrow a replacement"
         );
-        unregister(replacement);
+        unregister(replacement_holder);
     }
 
     /// Mantle's final review, finding 5. Do: retire a slot twice while a foreign reader holds its entry,
@@ -806,7 +811,9 @@ mod tests {
     fn a_second_retirement_under_a_reader_does_nothing() {
         use std::sync::mpsc::sync_channel;
 
-        let (shard, _control) = register_slot(2, 1, RegisterKick::Kick(Kick::none())).unwrap();
+        let (shard_holder, _control) =
+            register_slot(2, 1, RegisterKick::Kick(Kick::none())).unwrap();
+        let shard = shard_holder.shard();
         let slot = SLOTS.get(usize::from(shard)).unwrap();
         let live = slot.generation.load(Ordering::Acquire);
         let (entered, inside) = sync_channel(0);
@@ -819,8 +826,8 @@ mod tests {
                 })
             });
             inside.recv().unwrap();
-            unregister(shard);
-            unregister(shard);
+            unregister(shard_holder);
+            unregister(shard_holder);
             let under_the_reader = slot.generation.load(Ordering::Acquire);
             // The reader is let go before anything is judged, so a failure ends the test, not the scope.
             release.send(()).unwrap();
@@ -837,18 +844,38 @@ mod tests {
         );
     }
 
+    /// Mantle's final review: a retirement names its registration, not only its slot. Do: retire a live
+    /// slot with the holder of an earlier registration of it. Expect: nothing is retired; the live holder's
+    /// entry stays, and its own retirement then frees the slot.
+    #[test]
+    fn a_stale_holder_retires_nothing() {
+        let (live, _control) = register_slot(2, 1, RegisterKick::Kick(Kick::none())).unwrap();
+        let stale = SlotHolder {
+            shard: live.shard,
+            generation: live.generation.wrapping_sub(2),
+        };
+        unregister(stale);
+        assert!(
+            with_holder(live, |_| ()).is_some(),
+            "the live registration was not retired by a stale holder"
+        );
+        unregister(live);
+        assert!(with_entry(live.shard, |_| ()).is_none());
+    }
+
     /// Do: register a slot, mark its holder exited (what the shard does at its loop's exit) and wake a
     /// task of it from a foreign thread's path. Expect: the wake is counted stale at once, never delivered
     /// to a shard that will not drain it.
     #[test]
     fn a_wake_to_an_exited_holder_is_counted_stale() {
-        let (id, _receiver) = register_slot(4, 2, RegisterKick::Kick(Kick::none())).unwrap();
+        let (id_holder, _receiver) = register_slot(4, 2, RegisterKick::Kick(Kick::none())).unwrap();
+        let id = id_holder.shard();
         let stale_before = stale_wakes(id);
         note_exited(id);
         wake(Encoded::pack(id, 1, 0).unwrap());
         assert_eq!(stale_wakes(id) - stale_before, 1);
         assert!(!entry(id).unwrap().wakes.is_pending());
-        unregister(id);
+        unregister(id_holder);
     }
 
     // Every registration below is given back at the test's end, so no test leaves a live holder behind for
@@ -856,18 +883,21 @@ mod tests {
 
     #[test]
     fn registration_hands_out_distinct_ids_and_entries() {
-        let (a, _ra) = register_slot(8, 4, RegisterKick::Kick(Kick::none())).unwrap();
-        let (b, _rb) = register_slot(8, 4, RegisterKick::Kick(Kick::none())).unwrap();
+        let (a_holder, _ra) = register_slot(8, 4, RegisterKick::Kick(Kick::none())).unwrap();
+        let a = a_holder.shard();
+        let (b_holder, _rb) = register_slot(8, 4, RegisterKick::Kick(Kick::none())).unwrap();
+        let b = b_holder.shard();
         assert_ne!(a, b);
         assert!(entry(a).is_some());
         assert!(entry(b).is_some());
-        unregister(a);
-        unregister(b);
+        unregister(a_holder);
+        unregister(b_holder);
     }
 
     #[test]
     fn a_wake_from_a_foreign_thread_lands_in_the_target_bitmap() {
-        let (id, _receiver) = register_slot(8, 4, RegisterKick::Kick(Kick::none())).unwrap();
+        let (id_holder, _receiver) = register_slot(8, 4, RegisterKick::Kick(Kick::none())).unwrap();
+        let id = id_holder.shard();
         let word = Encoded::pack(id, 5, 1).unwrap();
         std::thread::scope(|scope| {
             scope.spawn(|| wake(word));
@@ -876,23 +906,25 @@ mod tests {
         entry(id).unwrap().wakes.drain(|slot| woken.push(slot));
         assert_eq!(woken, vec![5]);
         assert_eq!(current_shard(), None);
-        unregister(id);
+        unregister(id_holder);
     }
 
     /// A wake past the target's slots (a stale word from a larger runtime that held the registry slot) is
     /// counted stale, not delivered.
     #[test]
     fn a_wake_past_the_bitmap_is_counted_stale() {
-        let (id, _receiver) = register_slot(4, 4, RegisterKick::Kick(Kick::none())).unwrap();
+        let (id_holder, _receiver) = register_slot(4, 4, RegisterKick::Kick(Kick::none())).unwrap();
+        let id = id_holder.shard();
         let before = stale_wakes(id);
         wake(Encoded::pack(id, 1_000, 1).unwrap());
         assert_eq!(stale_wakes(id) - before, 1);
-        unregister(id);
+        unregister(id_holder);
     }
 
     #[test]
     fn control_is_refused_when_the_channel_is_full_or_the_shard_is_gone() {
-        let (id, receiver) = register_slot(2, 1, RegisterKick::Kick(Kick::none())).unwrap();
+        let (id_holder, receiver) = register_slot(2, 1, RegisterKick::Kick(Kick::none())).unwrap();
+        let id = id_holder.shard();
         send_control(id, Control::Shutdown).unwrap();
         assert!(matches!(
             send_control(id, Control::Shutdown),
@@ -907,24 +939,27 @@ mod tests {
             send_control(u16::MAX, Control::Shutdown),
             Err(RtError::ShardGone { .. })
         ));
-        unregister(id);
+        unregister(id_holder);
     }
 
     /// A submission pinned to a slot's registration is refused as gone once the slot is free, and once
     /// a later registration holds it — never delivered to the new holder.
     #[test]
     fn a_holder_pinned_send_is_refused_once_the_slot_changes_hands() {
-        let (id, _receiver) = register_slot(2, 2, RegisterKick::Kick(Kick::none())).unwrap();
+        let (id_holder, _receiver) = register_slot(2, 2, RegisterKick::Kick(Kick::none())).unwrap();
+        let id = id_holder.shard();
         let holder = holder_of(id).unwrap();
         assert_eq!(holder.shard(), id);
         send_control_to_holder(holder, Control::Shutdown).unwrap();
-        unregister(id);
+        unregister(id_holder);
         assert_ne!(holder_of(id), Some(holder), "the old registration ended");
         assert!(matches!(
             send_control_to_holder(holder, Control::Shutdown),
             Err(RtError::ShardGone { .. })
         ));
-        let (again, _receiver) = register_slot(2, 2, RegisterKick::Kick(Kick::none())).unwrap();
+        let (again_holder, _receiver) =
+            register_slot(2, 2, RegisterKick::Kick(Kick::none())).unwrap();
+        let again = again_holder.shard();
         if again == id {
             assert!(matches!(
                 send_control_to_holder(holder, Control::Shutdown),
@@ -932,6 +967,6 @@ mod tests {
             ));
             assert_ne!(holder_of(again), Some(holder));
         }
-        unregister(again);
+        unregister(again_holder);
     }
 }

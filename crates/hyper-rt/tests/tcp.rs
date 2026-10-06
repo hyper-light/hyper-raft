@@ -189,9 +189,14 @@ fn a_listener_handed_over_by_descriptor_serves_on_the_same_port() {
     rt.shutdown().unwrap();
 }
 
-/// Shape: an idle spin window far longer than any round trip, so a reply that waited for the window to
-/// end is unmistakable (§4.3's 2-competitive spin runs for the idle window before a park).
-const LONG_SPIN_NS: u64 = 10_000_000_000;
+/// Shape: an idle spin window that never ends, so the shard has no reason to park during the test and a
+/// park can only be the fault (mantle's final review, second pass: a finite window rested the test's
+/// premise on the exchange finishing inside it, a clock assumption).
+const LONG_SPIN_NS: u64 = u64::MAX;
+/// Shape: how long the exchange is given before the test fails rather than hangs. It bounds only the
+/// failure: under the fault the shard spins for good and never answers. A correct shard passes on its
+/// state alone.
+const PATIENCE: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// §4.3: a shard spinning in its idle window sees its driver's readiness, not only its rings: a request
 /// arriving on a socket while the shard spins is answered at once, not after the window ends and the
@@ -243,13 +248,11 @@ fn a_spinning_shard_answers_a_socket_request_without_waiting_out_its_window() {
     })
     .unwrap();
     let (before, after) = rx
-        .recv()
-        .expect("the exchange completed")
+        .recv_timeout(PATIENCE)
+        .expect("the exchange completed: a spinning shard must see socket readiness")
         .expect("the exchange succeeded");
-    // The fault waits the window out: the reply leaves only after the spin ends and the shard parks in its
-    // driver, which counts a wait. The window, opened at the start, outlasts the test, so a shard that saw
-    // the readiness while spinning entered no wait (mantle's final review: judged by the shard's state, not
-    // by a clock).
+    // A shard that sees the readiness while spinning enters no driver wait: the window never ends, so any
+    // wait counted here is the fault's (judged by the shard's state, not by a clock).
     assert_eq!(
         after, before,
         "the shard parked in its driver during the exchange: a spinning shard must see socket readiness"

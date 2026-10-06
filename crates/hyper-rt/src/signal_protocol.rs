@@ -180,4 +180,45 @@ mod loom_tests {
             });
         }
     }
+
+    /// The second pass's finding 5. Do: a signal of `KIND` arrived with no subscriber, and the signal thread
+    /// restores it (keeping it and delivering it to a subscriber it then sees) against a subscription
+    /// claiming a slot for `KIND`, every interleaving. Expect: the signal is raised, or it ends up pending on
+    /// the subscription, never neither.
+    #[test]
+    fn a_signal_kept_for_a_new_subscription_is_never_erased() {
+        use crate::signal::{CLAIMING, SlotWord, claim_slot, deliver_to};
+        loom::model(|| {
+            let kernel = Arc::new(Kernel {
+                ours: AtomicU32::new(0),
+                raised: AtomicU32::new(0),
+            });
+            let installed = Arc::new(AtomicU32::new(0));
+            let mask = Arc::new(AtomicU32::new(0));
+            let pending = Arc::new(AtomicU32::new(0));
+            let subscriber = {
+                let (kernel, installed, mask, pending) = (
+                    Arc::clone(&kernel),
+                    Arc::clone(&installed),
+                    Arc::clone(&mask),
+                    Arc::clone(&pending),
+                );
+                loom::thread::spawn(move || {
+                    assert!(claim_slot(&*mask, &*pending, KIND, || {}));
+                    install(&installed, KIND, &*kernel).unwrap();
+                })
+            };
+            let kept = restore(&installed, KIND, || mask.get() & !CLAIMING, &*kernel);
+            if kept != 0 {
+                deliver_to(&*mask, &*pending, kept);
+            }
+            subscriber.join().unwrap();
+            let raised = kernel.raised.load(Ordering::Acquire) & KIND != 0;
+            let delivered = pending.load(Ordering::Acquire) & KIND != 0;
+            assert!(
+                raised || delivered,
+                "the signal was neither raised nor delivered"
+            );
+        });
+    }
 }

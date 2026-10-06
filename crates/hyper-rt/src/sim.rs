@@ -1134,7 +1134,7 @@ impl SimRuntime {
                 crate::registry::RegisterKick::Sim(Box::new(SimShared::new())),
             )?;
             let id = seed.id;
-            let slot = crate::runtime::SlotGuard::new(id);
+            let slot = crate::runtime::SlotGuard::new(seed.holder);
             let shared = crate::registry::entry(id)
                 .and_then(|entry| entry.sim_shared.as_deref())
                 .ok_or(RtError::ShardGone { shard: id })?;

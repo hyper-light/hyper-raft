@@ -69,14 +69,19 @@ pub struct IocpDriver {
     outstanding: HashMap<i32, *mut Block>,
     /// The handles `outstanding` may hold (`interests_per_shard`).
     handles_bound: usize,
-    /// The longest the drop waits for completions still owed (`step_budget_ns`).
-    drain_ns: u64,
     /// Polls issued and not yet reclaimed, cancelled ones included: what the drop drains.
     in_flight: usize,
 }
 
-/// AFD poll blocks a dropped driver could not reclaim within its drain deadline: left to the kernel, never
-/// freed while it may write them (a test's tripwire, expected zero).
+/// Cited: how long a dropped driver waits for completions the kernel still owes it — the I/O manager's own
+/// bound on a cancelled IRP: "If a canceled IRP is not completed within 5 minutes, the I/O manager considers
+/// the IRP timed out" (Microsoft, *Canceling IRPs*, Windows driver documentation). The wait ends as soon as
+/// the last completion arrives; it reaches the bound only when a driver breaks its cancel contract, when
+/// Windows itself gives up on the IRP.
+const DRAIN_NS: u64 = 300_000_000_000;
+
+/// AFD poll blocks a dropped driver could not reclaim by [`DRAIN_NS`]: left to the kernel, never freed while
+/// it may write them (a test's tripwire, expected zero).
 static BLOCKS_LEFT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// AFD poll blocks dropped drivers left to the kernel since the process started ([`BLOCKS_LEFT`]).
@@ -125,7 +130,6 @@ impl IocpDriver {
             afd: None,
             outstanding: HashMap::new(),
             handles_bound: 0,
-            drain_ns: 0,
             in_flight: 0,
         })
     }
@@ -153,32 +157,42 @@ impl IocpDriver {
     /// the readiness seam carries it as the same `i32` a Unix fd uses; it is reconstructed here as the
     /// low 32 bits, unsigned. The leaked poll block is owned by the kernel until `wait` reclaims it.
     /// One outstanding AFD poll per socket (mantle's review, finding 8): a poll that already watches every
-    /// event wanted stays; otherwise it is cancelled and replaced by one for the union. The cancelled poll's
-    /// completion reclaims its block and delivers nothing.
+    /// event wanted stays; otherwise one for the union is issued first and only then the old one cancelled,
+    /// so a refused issue leaves the old poll, and the waiters it serves, in place (mantle's final review,
+    /// second pass, finding 1: cancelling first stranded them when the issue failed).
     fn arm_events(&mut self, raw: i32, events: u32, tag: u64) -> Result<(), RtError> {
-        if let Some(&block) = self.outstanding.get(&raw) {
-            // SAFETY: an outstanding block is live until its completion is reclaimed, which removes it here.
-            let requested = unsafe { Block::requested(block) };
-            if requested & events == events {
-                return Ok(());
+        let Some(&old) = self.outstanding.get(&raw) else {
+            if self.outstanding.len() >= self.handles_bound {
+                return Err(RtError::Capacity {
+                    what: "AFD polls",
+                    bound: self.handles_bound,
+                });
             }
-            self.outstanding.remove(&raw);
-            if let Some(afd) = self.afd.as_ref() {
-                // SAFETY: the block is in flight (above); its completion, now cancelled, still arrives.
-                unsafe { afd.cancel(block) };
-            }
-            return self.issue(raw, requested | events, tag);
+            let block = self.issue(raw, events, tag)?;
+            self.outstanding.insert(raw, block);
+            return Ok(());
+        };
+        // SAFETY: an outstanding block is live until its completion is reclaimed, which removes it here.
+        let requested = unsafe { Block::requested(old) };
+        if requested & events == events {
+            return Ok(());
         }
-        self.issue(raw, events, tag)
+        let block = self.issue(raw, requested | events, tag)?;
+        self.outstanding.insert(raw, block);
+        if let Some(afd) = self.afd.as_ref() {
+            // SAFETY: the old block was in flight until just now (above); its completion still arrives.
+            unsafe { afd.cancel(old) };
+        }
+        Ok(())
     }
 
-    /// Issues a poll for `events` on `raw`'s base socket, recorded as outstanding. `Capacity` past the
-    /// handles bound (unreachable: the shard's wait table holds no more handles than that).
-    fn issue(&mut self, raw: i32, events: u32, tag: u64) -> Result<(), RtError> {
-        if self.outstanding.len() >= self.handles_bound {
-            return Err(RtError::Capacity {
-                what: "AFD polls",
-                bound: self.handles_bound,
+    /// Issues a poll for `events` on `raw`'s base socket: its block, in flight.
+    fn issue(&mut self, raw: i32, events: u32, tag: u64) -> Result<*mut Block, RtError> {
+        #[cfg(test)]
+        if tests::FAIL_NEXT_ISSUE.with(|fail| fail.replace(false)) {
+            return Err(RtError::DriverRefused {
+                call: "IOCTL_AFD_POLL (forced by a test)",
+                code: None,
             });
         }
         // The inverse of `netsys::Socket::raw_id`: the `i32`'s 32 bits, widened to the pointer-width `SOCKET`.
@@ -189,8 +203,7 @@ impl IocpDriver {
         // completion is delivered here and the block is reclaimed exactly once (`wait`, or the drop's drain).
         let block = unsafe { afd.poll(base, events, tag)? };
         self.in_flight = self.in_flight.saturating_add(1);
-        self.outstanding.insert(raw, block);
-        Ok(())
+        Ok(block)
     }
 
     /// Takes a poll's completion: reclaims its block and, unless it was cancelled, the readiness it carried.
@@ -199,13 +212,17 @@ impl IocpDriver {
         let reclaimed = unsafe { Block::reclaim(block) };
         self.in_flight = self.in_flight.saturating_sub(1);
         let raw = crate::interests::handle_of(reclaimed.user_data)?;
-        if self.outstanding.get(&raw) == Some(&block) {
+        let current = self.outstanding.get(&raw) == Some(&block);
+        if current {
             self.outstanding.remove(&raw);
         }
         let fired = match reclaimed.outcome {
-            // A cancelled poll was replaced or disarmed: nothing happened to deliver.
-            Outcome::Cancelled => return None,
-            Outcome::Failed => Readiness::READ.union(Readiness::WRITE),
+            // A cancelled poll the driver replaced or disarmed: nothing happened to deliver.
+            Outcome::Cancelled if !current => return None,
+            // Cancelled while still the handle's poll — not by this driver (a thread's exit, another caller's
+            // cancel): its waiters would wait on nothing, so they are woken to retry (the second pass's
+            // hardening of finding 1).
+            Outcome::Cancelled | Outcome::Failed => Readiness::READ.union(Readiness::WRITE),
             Outcome::Fired(events) => {
                 let mut fired = Readiness::NONE;
                 if events & READABLE_EVENTS != 0 {
@@ -229,8 +246,9 @@ impl Drop for IocpDriver {
     /// handle closes with the driver: the kernel holds each block until its completion is delivered, and a
     /// block never delivered is never freed (mantle's review, finding 8). A cancel is not synchronous
     /// (`CancelIoEx`: "does not wait for all canceled operations to complete"; mio's selector likewise
-    /// awaits a cancelled poll's completion on the port), so the drain waits — at most `drain_ns`, the
-    /// shard's step budget, in total. A block still owed
+    /// awaits a cancelled poll's completion on the port), so the drain waits — at most [`DRAIN_NS`], the I/O
+    /// manager's own timeout for a cancelled IRP, in total (mantle's final review, second pass, finding 3:
+    /// it was the step budget, a wake latency, about a millisecond). A block still owed
     /// at the deadline is left to the kernel and counted ([`afd_blocks_left`]), never freed while the kernel
     /// may write it (mantle's final review, finding 4: the drain waited `INFINITE`). The deadline alone bounds
     /// it: a counted number of rounds would let kick packets end it before the polls' completions came.
@@ -241,7 +259,7 @@ impl Drop for IocpDriver {
                 unsafe { afd.cancel(block) };
             }
         }
-        let deadline = crate::machine::clock::monotonic_ns().saturating_add(self.drain_ns);
+        let deadline = crate::machine::clock::monotonic_ns().saturating_add(DRAIN_NS);
         // Bounded by the deadline: each round returns entries or times out at it.
         while self.in_flight > 0 {
             // The time left, in whole milliseconds rounded up, so a round never returns early with time left.
@@ -402,7 +420,7 @@ impl Driver for IocpDriver {
         }
     }
 
-    fn shape(&mut self, handles: usize, drain_ns: u64) -> Result<(), RtError> {
+    fn reserve_handles(&mut self, handles: usize) -> Result<(), RtError> {
         let refused = RtError::Capacity {
             what: "AFD polls",
             bound: handles,
@@ -410,7 +428,6 @@ impl Driver for IocpDriver {
         let room = handles.checked_mul(2).ok_or(refused.clone())?;
         self.outstanding.try_reserve(room).map_err(|_| refused)?;
         self.handles_bound = handles;
-        self.drain_ns = drain_ns;
         Ok(())
     }
 
@@ -423,5 +440,79 @@ impl Driver for IocpDriver {
             events |= WRITABLE_EVENTS;
         }
         self.arm_events(raw, events, tag)
+    }
+}
+
+#[cfg(test)]
+#[cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::disallowed_methods,
+        clippy::disallowed_macros
+    )
+)]
+mod tests {
+    use std::cell::Cell;
+
+    use crate::combine::{Either, join2, race2};
+    use crate::futures::{sleep, yield_now};
+    use crate::runtime::{LocalRuntime, RuntimeConfig};
+    use crate::udp::{Ipv4Addr, SocketAddr, UdpSocket};
+
+    thread_local! {
+        /// Set by a test to refuse the next poll this thread's driver issues (the thread is its shard's).
+        pub(super) static FAIL_NEXT_ISSUE: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// Shape: how long a wait that should have woken is given before the test fails rather than hangs.
+    const PATIENCE_NS: u64 = 10_000_000_000;
+
+    fn config() -> RuntimeConfig {
+        RuntimeConfig {
+            shards: 1,
+            tasks_per_shard: 16,
+            timers_per_shard: 16,
+            interests_per_shard: 16,
+            ring_entries: 64,
+            step_budget_ns: 1_000_000_000,
+            timer_tick_ns: 100_000,
+            batch: 64,
+            pin: false,
+            cores: Vec::new(),
+            page_bytes: 4096,
+            spin_ns: 0,
+            wake_tracking: None,
+        }
+    }
+
+    /// Mantle's final review, second pass, finding 1. Do: a reader waits on a socket (its AFD poll in flight);
+    /// a writer's wait on the same socket needs a wider poll, whose issue is refused; then a datagram arrives.
+    /// Expect: the writer's wait is refused, and the reader still wakes. The old poll used to be cancelled
+    /// before the wider one was issued, so the refusal left the reader with no poll and it slept for good.
+    #[test]
+    fn a_refused_wider_poll_leaves_the_waiters_already_on_the_socket() {
+        let mut rt = LocalRuntime::new(&config()).unwrap();
+        rt.block_on(async {
+            let ours = UdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).unwrap();
+            let peer = UdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).unwrap();
+            let to = ours.local_addr().unwrap();
+            let joined = join2(ours.readable(), async {
+                // One yield: the loop arms the reader's poll before the writer asks for the wider one.
+                yield_now().await;
+                FAIL_NEXT_ISSUE.with(|fail| fail.set(true));
+                assert!(ours.writable().await.is_err(), "the wider poll was refused");
+                peer.send_to(b"x", to).unwrap();
+            });
+            match race2(joined, sleep(PATIENCE_NS)).await {
+                Either::First((read, ())) => read.unwrap(),
+                Either::Second(_) => {
+                    panic!("the reader's wait was stranded by the refused replacement")
+                }
+            }
+        })
+        .unwrap();
     }
 }

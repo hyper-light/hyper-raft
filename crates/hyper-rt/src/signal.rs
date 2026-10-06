@@ -107,16 +107,85 @@ static SLOTS: [Slot; MAX_SHARDS] = [const {
     }
 }; MAX_SHARDS];
 
+/// A subscription's words (its mask and its pending kinds): std's in the table, loom's in the model of
+/// `signal_protocol`.
+pub(crate) trait SlotWord {
+    /// A compare-and-swap.
+    fn cas(&self, current: u32, new: u32) -> bool;
+    /// A load.
+    fn get(&self) -> u32;
+    /// A store.
+    fn put(&self, value: u32);
+    /// A fetch-or.
+    fn or(&self, bits: u32);
+}
+
+macro_rules! slot_word {
+    ($atomic:ty) => {
+        impl SlotWord for $atomic {
+            fn cas(&self, current: u32, new: u32) -> bool {
+                self.compare_exchange(current, new, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+            }
+            fn get(&self) -> u32 {
+                self.load(Ordering::Acquire)
+            }
+            fn put(&self, value: u32) {
+                self.store(value, Ordering::Release);
+            }
+            fn or(&self, bits: u32) {
+                self.fetch_or(bits, Ordering::AcqRel);
+            }
+        }
+    };
+}
+
+slot_word!(AtomicU32);
+#[cfg(loom)]
+slot_word!(loom::sync::atomic::AtomicU32);
+
+/// Format: a slot claimed and not yet published: a bit no kind of signal uses, so a delivery or a restore
+/// reading the mask meanwhile sees no subscriber.
+pub(crate) const CLAIMING: u32 = 1 << 31;
+
+/// Claims a free slot for a subscription to `kinds`: false when it is taken. The slot is claimed with
+/// [`CLAIMING`], its pending kinds and waiter reset (`reset`), and only then its mask published (mantle's
+/// final review, second pass, finding 5: the mask used to be published first and pending reset after, so a
+/// restore that saw the new mask in between handed the signal to the slot and the reset erased it, neither
+/// raised nor delivered).
+pub(crate) fn claim_slot(
+    mask: &impl SlotWord,
+    pending: &impl SlotWord,
+    kinds: u32,
+    reset: impl FnOnce(),
+) -> bool {
+    if !mask.cas(0, CLAIMING) {
+        return false;
+    }
+    pending.put(0);
+    reset();
+    mask.put(kinds);
+    true
+}
+
+/// Marks the kinds of `arrived` a slot subscribes to as pending: the kinds it took.
+pub(crate) fn deliver_to(mask: &impl SlotWord, pending: &impl SlotWord, arrived: u32) -> u32 {
+    let hit = mask.get() & arrived & !CLAIMING;
+    if hit != 0 {
+        pending.or(hit);
+    }
+    hit
+}
+
 /// Marks `arrived` on every subscriber of those kinds and wakes it; the kinds some subscriber wanted.
 fn deliver(arrived: u32) -> u32 {
     let mut wanted = 0;
     for slot in &SLOTS {
-        let hit = slot.mask.load(Ordering::Acquire) & arrived;
+        let hit = deliver_to(&slot.mask, &slot.pending, arrived);
         if hit == 0 {
             continue;
         }
         wanted |= hit;
-        slot.pending.fetch_or(hit, Ordering::AcqRel);
         let waiter = slot.waiter.swap(NO_WAITER, Ordering::AcqRel);
         if waiter != NO_WAITER {
             registry::wake(Encoded::from_word(waiter));
@@ -145,13 +214,9 @@ pub fn subscribe(kinds: &[Signal]) -> Result<SignalStream, RtError> {
     // default action reads the masks after it, and keeps the handler for a subscriber it sees
     // (`signal_protocol`; mantle's final review, finding 3).
     for (index, slot) in SLOTS.iter().enumerate() {
-        if slot
-            .mask
-            .compare_exchange(0, mask, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-        {
-            slot.pending.store(0, Ordering::Release);
+        if claim_slot(&slot.mask, &slot.pending, mask, || {
             slot.waiter.store(NO_WAITER, Ordering::Release);
+        }) {
             if let Err(refused) = os::install(mask) {
                 slot.mask.store(0, Ordering::Release);
                 return Err(refused);
@@ -168,9 +233,9 @@ pub fn subscribe(kinds: &[Signal]) -> Result<SignalStream, RtError> {
 /// The kinds some subscription wants now.
 #[cfg(unix)]
 fn subscribed() -> u32 {
-    SLOTS
-        .iter()
-        .fold(0, |union, slot| union | slot.mask.load(Ordering::Acquire))
+    SLOTS.iter().fold(0, |union, slot| {
+        union | (slot.mask.load(Ordering::Acquire) & !CLAIMING)
+    })
 }
 
 impl SignalStream {

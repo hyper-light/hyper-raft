@@ -18,4 +18,7 @@ pub enum Control {
     Cancel(Encoded),
     /// Finish every task and exit the loop.
     Shutdown,
+    /// A readiness wait of this shard's, dropped on another shard or off any: its slot and table node
+    /// are given back here, by its owner (mantle's final review, second pass, finding 4).
+    Abandon(crate::shard::Abandoned),
 }

@@ -30,3 +30,7 @@ tempfile.workspace = true
 
 [lints]
 workspace = true
+
+[[bench]]
+name = "pipeline"
+harness = false

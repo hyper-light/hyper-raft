@@ -162,6 +162,33 @@ batches gain more.
   `K` is the knee of the measured curve, not a picked number. Whether a consumer drive's FUA
   writes run in parallel or as internal flushes is unknown until measured.
 
+- **Measured: macOS, APFS, Apple SSD AP8192Z (M5 Max, macOS 26.4.1), 2026-10-06.** This is
+  `cargo bench -p hyper-block --bench pipeline`: `K` writers and one flusher running
+  `F_FULLFSYNC` back to back, under the issue rule of §1, on a preallocated, zero-written file
+  with `F_NOCACHE`. Latency runs from submission to durable.
+
+  | `K` | Frame | Frames | Frames/s | Flushes | p50 µs | p99 µs |
+  |---|---|---|---|---|---|---|
+  | 1 | 4 KiB | 400 | 242 | 400 | 4,247 | 6,293 |
+  | 2 | 4 KiB | 400 | 249 | 395 | 8,425 | 12,411 |
+  | 4 | 4 KiB | 400 | 499 | 196 | 8,443 | 10,558 |
+  | 16 | 4 KiB | 400 | 1,967 | 50 | 8,377 | 12,509 |
+  | 64 | 4 KiB | 1,600 | 7,940 | 49 | 8,282 | 10,478 |
+  | 128 | 4 KiB | 1,600 | 15,910 | 23 | 8,218 | 9,478 |
+  | 1 | 64 KiB | 800 | 258 | 800 | 4,235 | 6,283 |
+  | 64 | 64 KiB | 800 | 7,051 | 25 | 8,472 | 11,824 |
+
+  An `F_FULLFSYNC` costs about 4 ms on this device whatever it covers, from one 4 KiB frame to
+  sixty-four 64 KiB ones. A `K = 1` cycle (4.1 ms) is the flush alone, so a direct 4 KiB write is
+  negligible beside it. Frames a second therefore grow with frames per flush, with no knee up to
+  128. That is batching, which hyper-log's group commit already does: every update waiting
+  during a flush goes into the next frame. What `K > 1` adds on macOS is the write overlapping
+  the flush, under 1% of the cycle here, and it costs latency: p50 rises from one flush to
+  nearly two, because a frame written during a flush waits for the next one. On this device class,
+  hyper-log keeps `K = 1` and lets the frame grow. This confirms §3's expectation by measurement.
+  The gain §2 describes needs a device where writes complete durably in parallel (FUA, or
+  power-loss protection). That curve is measured on Linux and Windows hardware, not on this Mac.
+
 ## 6. Detection and the risks
 
 - **What a device says** (Linux, NVMe, macOS, Windows), cross-checked by measurement as CLAUDE.md

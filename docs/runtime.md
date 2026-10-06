@@ -555,8 +555,11 @@ rate; it takes on the order of the probes' wall budget. A long-running node meas
 command must not: `Calibration` encodes to a fixed, versioned, checksummed record the consumer stores
 (focal in its data directory), keyed by the machine's identity (CPU model, OS build, core count,
 page size, power source), and a stored record is reused while its key matches and its age is under the
-consumer's bound; otherwise it is measured again. A power-source change re-measures the cheap subset, as
-slates does.
+consumer's bound; otherwise it is measured again. A power-source change is part of the key, so it
+re-measures (all of it: the record holds only the two probes that cost the budget, the wake and the null
+system call; the facts are queried afresh each time). **Done** (2026-10-06): `machine::record`
+(`Calibration::{encode, decode, load_or_measure}`), CRC-32C over a fixed little-endian layout, the key
+bounded at 1 KiB, wall time an input; every one-byte corruption and every truncation is refused.
 
 ### 10.3 What is derived
 

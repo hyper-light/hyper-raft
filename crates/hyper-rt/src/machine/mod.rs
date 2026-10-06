@@ -10,6 +10,7 @@ pub mod error;
 pub mod facts;
 pub mod placement;
 pub mod probes;
+pub mod record;
 pub mod stats;
 pub mod wake;
 

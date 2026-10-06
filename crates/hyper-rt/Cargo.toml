@@ -8,6 +8,8 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+# The calibration record's checksum (docs/runtime.md §10.2), the workspace's CRC-32C.
+crc32c.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 # sysctl, mach and the per-thread CPU clocks that rustix does not cover (the OS-interface files of

@@ -71,7 +71,10 @@ before the part that rests on them is built.
 hyper-raft's CLAUDE.md, the union of the three projects' rules, plus what this crate's owner role adds:
 
 - **No shared ownership, no locks, no `RefCell`.** `Arc`, `Rc`, `Mutex`, `RwLock` and `Condvar` are denied
-  by `clippy.toml`; `RefCell` is not used either (mantle's rule, carried here). A shard's state is owned
+  by `clippy.toml`. `RefCell` is not used (the owner's rule, "avoid Arc and RefCell, even in tests", given to
+mantle): `scripts/check-contracts.py` refuses it in this crate, and the rule moves to `clippy.toml` once
+the crates that still hold one (hyper-log's device and ticket tables, hyper-block's simulation,
+hyper-durable's held scratch, and test support) have moved off it. A shard's state is owned
   by its thread; everything that crosses threads is a `Copy` word, an atomic, or a value moved through a
   bounded queue.
 - **No panics in shipped code**, no unchecked arithmetic, no indexing: the workspace wall.
@@ -147,8 +150,12 @@ drains by reading the summary words and swapping each marked word to zero.
 ### 3.3 The run queue
 
 Slot indices in a pre-sized ring with one pending flag per slot (slates' `queue.rs`), at most `batch`
-polls per step. `batch` is the latency budget over the measured per-item cost (slates'
-`calibrate_batch`), kept.
+polls per step. `batch` is a latency budget over the measured cost of one loop item (slates'
+`calibrate_batch`). **The budget, derived:** a task woken while a batch runs waits at most that batch
+before the loop next reads its wakes, and a waker on another shard would otherwise have paid a park's
+wake to reach it, so the batch may delay it by at most the expected wake: budget = the mean wake, the
+same quantum as §3.4's step (DERIVED from §3.4's spin-then-park rule). A consumer with a stricter latency
+objective states it, and the smaller of the two applies.
 
 ### 3.4 The loop
 
@@ -166,11 +173,51 @@ load once the window lapsed between requests (slates-dc, 2026-10-05). hyper-rt m
 rather than a call each server must remember: the transport driver (§14), the TCP and local-socket
 reads (§5) and the channel receive (§8) mark activity on the shard when they hand a request to a task.
 
-**Change: no `RefCell`.** slates keeps the shard's mutable state in a `RefCell<ShardInner>` and refuses
-a nested borrow with `try_borrow_mut` (`shard.rs`). hyper-rt keeps the same semantics without the type:
-the state is a `Cell<Option<Box<ShardInner>>>`, a borrow is a `take` that leaves `None`, and the state is
-put back when the borrow ends; a nested borrow finds `None` and is refused and counted, exactly as before.
-No `unsafe`, no panic path (DERIVED).
+**Change: exclusive access is structural; nothing nests.** slates keeps the shard's mutable state in a
+`RefCell<ShardInner>` and refuses a nested borrow with `try_borrow_mut`, counting it (`shard.rs`): a task's
+poll that spawns, arms a timer or registers interest borrows the state the loop is running. A
+take-and-put `Cell<Option<Box<_>>>` would be the same runtime-checked borrow under another name (mantle's
+review). The owner's rule is no `Arc` and no `RefCell`, even in tests (§2).
+
+hyper-rt splits the shard in two, so that a poll can never reach the loop's state:
+
+- **The loop's state** (`Loop`: the task futures, the timing wheel, the driver, the control receiver, the
+  counters) is owned by value by the loop's frame and lent `&mut` down the step. No task ever holds a
+  reference to it.
+- **The desk** (`Desk`): what a polled task may ask of its shard, as **intents** in queues that are
+  pre-sized at the shard's build and owned per shard, plus what the loop publishes for tasks to read. A
+  task reaches the desk through the thread's current-shard pointer, valid for the span of the step
+  (`registry.rs`, an OS-interface file in the sense of §13, as slates' is). Between polls the loop drains
+  every intent queue into its state.
+
+| A task asks | Intent | Answered synchronously by |
+|---|---|---|
+| spawn (child or sibling) | the boxed future and its parent, in the spawn queue | a task slot popped from the desk's **free-slot stack**, so the `TaskId` exists at once; an empty stack is `TooManyTasks` |
+| arm a timer | `(deadline, task word, timer slot)` in the timer queue | a timer slot popped from the desk's free-timer stack (the `TimerId`); empty: the sleep waits for a timer to free (§3.6) |
+| disarm a timer | the timer slot | — |
+| register readable or writable interest | `(handle, interest, task word)` | — |
+| wake a task of this shard | the slot onto the run queue | — |
+| cancel, detach | the task id | — |
+| join | — | the slot's published outcome and a waiter word, both in the desk |
+| the clock | — | the step's time, published by the loop |
+
+Each queue is a ring of `Cell` slots (a `Copy` intent in a `Cell<T>`; the spawn queue's boxed futures in
+`Cell<Option<_>>`, written once by the task and taken once by the loop: a move, not a borrow) with
+`Cell` head and tail. Every queue's bound follows from what feeds it (DERIVED): spawns cannot outnumber
+free slots, timer arms cannot outnumber free timers, disarms cannot outnumber armed timers; interest
+registrations are bounded by the shard's configured handle count, past which a registration is refused
+`Capacity`. Intents take effect before the next poll and before the shard parks, so a spawned child runs
+in the next step, and an armed deadline or a registered interest is in the wheel or the driver before
+any wait that could miss it.
+
+**The two narrow paths that are not intents, and why.** The free-slot and free-timer stacks are popped by
+tasks and pushed by the loop: an identifier must exist when `spawn` or `sleep` returns, so its allocation
+cannot wait for the loop. Each stack is one field, `Cell` words and a `Cell` length, with no borrow and no
+refusal path but "empty". Kept values (slates' per-shard singletons, `Kept`) are filled before the shard's
+first step and immutable afterwards, so tasks reach them by shared reference only. Nothing else in a
+task's reach is mutable.
+
+With nothing nesting, slates' nested-borrow counter has nothing to count, and goes.
 
 ### 3.5 Parking and the kick
 
@@ -187,9 +234,15 @@ The kick per OS: an eventfd on Linux (epoll), `EVFILT_USER` on macOS and FreeBSD
 
 A hierarchical timing wheel [WHEELS §VI.B], entries in a slab reserved once, doubly linked slot lists:
 arming, cancelling and firing never allocate (slates' `timer.rs`, `tests/timer_allocations.rs`). The
-tick is `max(mean wake, 100 × clock-read cost)` (slates' derivation: a timer cannot fire more precisely
-than a parked shard can wake, and the clock's own cost stays under one percent of a tick); the wheel
-spans `levels × log2(slots)` bits of ticks, sized so the longest configured wait fits (§10).
+wheel spans `levels × log2(slots)` bits of ticks, sized so the longest configured wait fits (§10).
+
+**The tick, derived.** slates sets it to `max(mean wake, 100 × clock-read cost)`; the 100 is a pick
+(mantle's review). What a tick costs is lateness: a timer fires up to one tick after its deadline, and a
+parked shard adds its wake, so a timer's lateness is bounded by `tick + wake p99` (DERIVED). A tick finer
+than the mean wake buys nothing, since a parked shard cannot run sooner than it wakes; so the tick is the
+mean wake. The clock-read term goes: the loop reads the clock once a step whatever the tick, so the tick
+does not change what the clock costs (DERIVED). A consumer states its timers' lateness tolerance; a
+configuration whose `tick + wake p99` exceeds it is refused at build, naming both, rather than run late.
 
 **Change: the next deadline in O(levels), not O(armed timers).** slates rescans every armed entry after a
 fire or the earliest cancel, every step (NOTE08 §3.2). hyper-rt keeps an occupancy bitmap per level (64
@@ -256,7 +309,19 @@ the platform calls behind one seam per kind (`netsys`), Unix through `rustix`, W
 ### 5.2 TCP
 
 On all three OSes, IPv4 and IPv6: `TcpListener::bind(addr, backlog)`, `accept`, `TcpStream::connect`,
-`read`, `write`, `write_all`, `shutdown`, vectored writes.
+`read`, `write`, `write_all`, `shutdown`, vectored reads and writes.
+
+- **Reads into the caller's buffer.** `read(&mut [u8])` and `read_vectored(&mut [IoSliceMut])` read
+  straight into slices the caller owns, with no allocation in the runtime, so a request body streams into
+  hyper-block's aligned buffers (mantle's S3 listener). Nothing on the read path copies.
+- **Accepting on every shard.** On Linux and macOS each shard binds its own listener with
+  `SO_REUSEPORT` and the kernel spreads connections among them. Windows has no equivalent, so one acceptor
+  shard accepts and hands each accepted socket to the least-loaded shard (the one with the fewest live
+  connections) by message, the socket moving as its owned handle. The connection budget is process-wide:
+  one atomic count every shard's accept checks and takes from before serving.
+- **TLS composes on top.** hyper-tls is sans-I/O; a TLS session over a `TcpStream` is the session's bytes
+  read into and written from the stream's buffers. An end-to-end test runs a TLS 1.3 HTTP/1.1 exchange
+  over hyper-rt's `TcpStream` (mantle's listener runs plain HTTP on loopback and TLS elsewhere).
 
 - **Backpressure.** A write that finds the send buffer full awaits writability; the task yields, the shard
   does not block.
@@ -268,9 +333,9 @@ On all three OSes, IPv4 and IPv6: `TcpListener::bind(addr, backlog)`, `accept`, 
   DERIVED from the rule that the next write should find room).
 - **`TCP_USER_TIMEOUT`** where offered (Linux) [RFC5482]: the consumer states how long unacknowledged
   data may wait before the connection is declared dead.
-- **A connection budget.** `TcpListener` takes the maximum it will hold open; an accept past it is closed at
-  once and counted (refusal by close, which an HTTP client sees as a reset; mantle's listener decides
-  whether to answer 503 first by reserving one slot for that).
+- **A connection budget.** The listener takes the maximum it will hold open, process-wide (above); an
+  accept past it is closed at once and counted (refusal by close, which an HTTP client sees as a reset;
+  mantle's listener decides whether to answer 503 first by reserving one slot for that).
 - **Windows** through AFD: `AFD_POLL_ACCEPT` for listeners, `AFD_POLL_SEND` for writes,
   `AFD_POLL_CONNECT_FAIL` for connects.
 
@@ -415,10 +480,17 @@ slates does.
 | Constant | Formula (slates' derivations, kept) |
 |---|---|
 | spin before parking, step quantum | the mean wake [KARLIN] |
-| timer tick | `max(mean wake, 100 × clock read)` |
-| wake-ring and control-queue depth | `wake p99 / system call` rounded up to a power of two (Little's law at the overflow target) |
-| loop batch | latency budget / measured per-item cost |
-| shards | the fastest class of cores the process may run on that its CPU budget runs at once, less one for control and the OS, at least one (slates' placement rule); pinned only where the process owns its cores |
+| timer tick | the mean wake, refused if `tick + wake p99` exceeds the consumer's stated lateness tolerance (§3.6) |
+| control-queue depth | `wake p99 / system call` rounded up to a power of two (Little's law at the overflow target: a producer sending one message per system call for as long as the consumer's wake takes at its p99) |
+| loop batch | min(mean wake, the consumer's latency objective) / measured per-item cost (§3.3) |
+| shards | the fastest class of cores the process may run on that its CPU budget runs at once, less the consumer's **reserved cores**, at least one; pinned only where the process owns its cores |
+
+**Reserved cores** replace slates' fixed "less one for control and the OS" (a pick). A consumer states
+the cores its non-shard threads need (its device issuers, the blocking pool's busy workers, stdio), as
+configuration: from the CPU those threads are measured to take, rounded up to whole cores, where it has
+measured them, and otherwise the count of its own threads that run continuously. The default is zero
+reserved cores with a note in the runtime's start report, since a process with no such threads loses a
+shard to nothing.
 
 A test or a short command passes a stated configuration instead (one shard, the defaults named with their
 reason), so `block_on` costs no calibration.
@@ -438,9 +510,11 @@ Gilbert–Elliott loss, path and interface MTU, NAT expiry). hyper-rt keeps it a
 
 ## 12. Measurement and tests
 
-Benchmarks (`docs/benchmarks.md`, hardware, date and command each), each row against tokio 1.53
-(multi-thread and current-thread) and slates-rt at `6b9ce5c` on the same machine, with allocations,
-reallocations and page faults counted per operation (hyper-measure):
+Benchmarks (`docs/benchmarks.md`, hardware, date and command each), each row against what each consumer
+runs today, on the same machine, with allocations, reallocations and page faults counted per operation
+(hyper-measure): tokio 1.53 (multi-thread and current-thread) for focal; slates-rt at `6b9ce5c` for
+slates; and for mantle, which has no async runtime, its current drivers: `bench chunk`'s clients as
+records and the device issuer's pool. Rows:
 
 - spawn and run a trivial task; a local wake; a cross-shard round trip, both parked and both spinning; a
   foreign-thread wake; a timer of 100 µs (lateness at p50, p99, max);
@@ -502,8 +576,8 @@ shared with hyper-tokio once hyper-tokio takes it from here (one `sys` layer, tw
    stats, the stopping rule) at `6b9ce5c` or later, conformed to this repository's wall, its tests
    passing: the port, with `ORIGIN.md`. slates' locked arenas (`ChunkArena`, per-block locking since
    `6b9ce5c`) are storage, not runtime, and are not carried; the runtime locks and pre-faults nothing.
-3. The departures of §3 (bitmap wakes, no `RefCell`, O(levels) deadline, no io_uring), each against its
-   benchmark row.
+3. The departures of §3 (bitmap wakes, the loop and the desk, O(levels) deadline, no io_uring), each against
+   its benchmark row.
 4. `block_on` and the test harness (§4); calibration records (§10).
 5. Sockets (§5), signals and stdio (§6), synchronization (§8), the blocking pool (§9).
 6. The transport driver (§14) and the shared UDP `sys` layer.

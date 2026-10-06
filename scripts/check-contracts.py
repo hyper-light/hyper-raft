@@ -13,6 +13,7 @@
 - The simulation crates (`hyper-sim`, and `hyper-check` when it lands) hold no `HashMap`,
   `HashSet` or `RandomState`: their iteration order is seeded by the OS, which would make a run's
   decisions depend on more than its seed (docs/sim.md §3.9).
+- No `RefCell` in the crates `NO_REFCELL` lists (the owner's rule; docs/runtime.md §2).
 - Every test file that makes a `hyper_sim` world runs its first seed through `twice`, the
   run-twice check (docs/sim.md §3.9): determinism is checked by every simulation, not trusted.
 """
@@ -203,6 +204,23 @@ def check_simulation(rel, lines):
     return failures
 
 
+# The owner's rule, no RefCell even in tests (docs/runtime.md §2), held for the crates that already meet
+# it. A crate joins once its last RefCell is gone; when every crate has, the rule moves to clippy.toml's
+# disallowed types and this list goes.
+NO_REFCELL = ("crates/hyper-rt/",)
+REFCELL = re.compile(r"\bRefCell\b")
+
+
+def check_refcell(rel, lines):
+    if not rel.startswith(NO_REFCELL):
+        return []
+    return [
+        f"{rel}:{n + 1}: RefCell (the owner's rule: exclusive access is structural, docs/runtime.md §3.4)"
+        for n, line in enumerate(lines)
+        if REFCELL.search(code_of(line))
+    ]
+
+
 def main():
     failures = []
     all_sources = list(sources())
@@ -211,6 +229,7 @@ def main():
         failures.extend(check_unsafe(rel, lines))
         failures.extend(check_constants(rel, lines, test_files))
         failures.extend(check_simulation(rel, lines))
+        failures.extend(check_refcell(rel, lines))
     for rel in UNSAFE_ALLOWED:
         if not (ROOT / rel).exists():
             failures.append(f"{rel}: listed in UNSAFE_ALLOWED but missing")

@@ -160,6 +160,10 @@ impl Driver for IocpDriver {
     nanos_since(self.epoch)
   }
 
+  fn clock(&self) -> crate::driver::Clock {
+    crate::driver::Clock::Since(self.epoch)
+  }
+
   fn wait(&mut self, timeout_ns: Option<u64>, out: &mut Vec<Completion>) -> Result<(), RtError> {
     /// Format: nanoseconds per millisecond.
     const NANOS_PER_MILLI: u64 = 1_000_000;

@@ -29,6 +29,7 @@ fn config(shards: u16) -> RuntimeConfig {
     shards,
     tasks_per_shard: 16,
     timers_per_shard: 16,
+    interests_per_shard: 64,
     ring_entries: 16,
     step_budget_ns: 1_000_000,
     timer_tick_ns: 100_000,
@@ -329,11 +330,7 @@ fn a_shard_slot_whose_wake_generations_are_spent_retires_and_is_not_reissued() {
   assert_eq!(
     hyper_rt::registry::stale_wakes(id.0),
     before,
-    "the wake reached the live slot, so the arena refused it"
-  );
-  assert!(
-    counters[0].stale_wakes >= 1,
-    "the arena counted the refused wake"
+    "the wake reached the live shard, whose retired slot holds no task to poll"
   );
 
   let third = Runtime::start(&config(1)).unwrap();

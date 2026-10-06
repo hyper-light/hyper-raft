@@ -1,5 +1,6 @@
-//! Task slots: the pinned future, its state, its parent and child links, the joiner's waker, and
-//! the counters the watchdog keeps (§4.3, `TaskSlot`).
+//! Task slots: the pinned future, its state, its parent and child links, and the counters the watchdog
+//! keeps (slates §4.3, `TaskSlot`). The slot's identity (its generation), its outcome and its joiner live on
+//! the shard's desk (docs/runtime.md §3.4), where tasks read them; this side is the loop's alone.
 //!
 //! Children are linked through their parent's slot (first child, siblings) so that a parent's
 //! completion cancels them in O(children) and a child's completion unlinks in O(1); no task is
@@ -9,7 +10,6 @@
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel};
-use std::task::Waker;
 use std::time::Duration;
 
 use crate::mem::Encoded;
@@ -208,8 +208,6 @@ pub struct TaskSlot {
   pub next_sibling: u32,
   /// The previous sibling's slot, or `NO_LINK`.
   pub prev_sibling: u32,
-  /// The waker of whoever awaits this task's terminal state.
-  pub join_waker: Option<Waker>,
   /// The outcome once terminal.
   pub outcome: Option<Outcome>,
   /// Set when cancellation was requested; honoured at the next poll boundary.
@@ -236,10 +234,28 @@ impl TaskSlot {
       first_child: NO_LINK,
       next_sibling: NO_LINK,
       prev_sibling: NO_LINK,
-      join_waker: None,
       outcome: None,
       cancel_requested: false,
       joinable,
+      polls: 0,
+      long_steps: 0,
+      longest_step_ns: 0,
+    }
+  }
+
+  /// An empty slot: no task.
+  pub fn empty() -> Self {
+    Self {
+      state: State::Done,
+      future: None,
+      parent: None,
+      children: 0,
+      first_child: NO_LINK,
+      next_sibling: NO_LINK,
+      prev_sibling: NO_LINK,
+      outcome: None,
+      cancel_requested: false,
+      joinable: false,
       polls: 0,
       long_steps: 0,
       longest_step_ns: 0,

@@ -16,6 +16,7 @@ fn config(shards: u16) -> RuntimeConfig {
     shards,
     tasks_per_shard: 64,
     timers_per_shard: 64,
+    interests_per_shard: 64,
     ring_entries: 64,
     step_budget_ns: 1_000_000_000,
     timer_tick_ns: 100_000,
@@ -101,14 +102,7 @@ fn a_task_on_one_shard_is_woken_by_a_task_on_another() {
   );
   let counters = rt.shutdown().unwrap();
   assert_eq!(counters.len(), 2);
-  assert!(
-    counters.iter().all(|c| c.nested_borrows == 0),
-    "{counters:?}"
-  );
-  assert!(
-    counters[0].wakes_pair + counters[0].wakes_foreign >= 1,
-    "{counters:?}"
-  );
+  assert!(counters[0].wakes_foreign >= 1, "{counters:?}");
 }
 
 #[test]

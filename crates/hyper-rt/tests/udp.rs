@@ -69,6 +69,7 @@ fn config() -> RuntimeConfig {
     shards: 1,
     tasks_per_shard: 64,
     timers_per_shard: 64,
+    interests_per_shard: 64,
     ring_entries: 64,
     step_budget_ns: 1_000_000_000,
     timer_tick_ns: 100_000,
@@ -362,10 +363,10 @@ const FLOW_LENGTH: usize = 32;
 /// Sends `FLOW_LENGTH` datagrams `SEND_GAP_NS` apart, each stamped with its virtual send time, and returns
 /// each datagram's (arrival, stamp) pair as the receiver saw them, in arrival order.
 fn run_stamped_flow(seed: u64, delay: hyper_rt::sim::SimPath) -> Vec<(u64, u64)> {
-  use hyper_rt::sim::{SimRuntime, sim_udp_set_path};
+  use hyper_rt::sim::SimRuntime;
 
   let mut sim = SimRuntime::new(&config(), seed).unwrap();
-  sim_udp_set_path(delay);
+  sim.set_path(delay);
   let id = sim.shard_ids()[0];
   let (port_tx, port_rx) = channel();
   let (result_tx, result_rx) = channel();
@@ -507,6 +508,9 @@ fn a_send_under_local_pressure_waits_for_writability_and_sends_once() {
       let sent = sender.send_to_writable(b"pressure", to).await;
       let at = hyper_rt::futures::now_ns();
       let _ = sent_tx.send((plain, tried, sent, at));
+      // The fabric carries what a step sent once the step ends: the receiver waits for it to arrive, then
+      // takes everything that came.
+      receiver.readable().await.unwrap();
       let mut buf = [0u8; 64];
       let mut received = Vec::new();
       while let Ok(Some((n, _))) = receiver.try_recv_from(&mut buf) {

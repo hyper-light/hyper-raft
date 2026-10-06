@@ -23,6 +23,7 @@ fn config() -> RuntimeConfig {
     shards: 2,
     tasks_per_shard: 4096,
     timers_per_shard: 4096,
+    interests_per_shard: 64,
     ring_entries: 64,
     step_budget_ns: 1_000_000,
     timer_tick_ns: 100_000,
@@ -62,9 +63,12 @@ fn one_simulation() {
 }
 
 /// Do: measure what one live two-shard simulation occupies, drop it, then build and drop `CYCLES` more in
-/// turn. Expect: the resident size grows over those cycles by less than one footprint, and the
+/// turn, twice. Expect: the second batch grows the resident size by less than one footprint, and the
 /// reclamation counter moved by every context built (non-vacuity: the footprint is positive). Before the
-/// fix, 32 simulations grew the process by 32 footprints.
+/// fix, 32 simulations grew the process by 32 footprints. The first batch is not judged: the allocator
+/// keeps the pages the first simulations freed (measured 2026-10-06: about one and a half footprints after
+/// 32 cycles and the same after 128), which says nothing about a leak; growth that continues into the
+/// second batch does.
 #[cfg(unix)]
 #[test]
 fn a_dropped_simulation_gives_back_its_contexts_clock_and_flags() {
@@ -78,12 +82,17 @@ fn a_dropped_simulation_gives_back_its_contexts_clock_and_flags() {
   for _ in 0..CYCLES {
     one_simulation();
   }
+  let settled = resident_kib();
+  for _ in 0..CYCLES {
+    one_simulation();
+  }
   let after = resident_kib();
-  let growth = after.saturating_sub(after_warm);
+  let growth = after.saturating_sub(settled);
   let reclaimed = contexts_reclaimed() - reclaimed_before;
   eprintln!(
     "resident KiB: before {before}, one simulation live {live} (footprint {footprint}), after warm-up \
-     {after_warm}, after {CYCLES} more cycles {after} (growth {growth}); contexts reclaimed {reclaimed}"
+     {after_warm}, after {CYCLES} cycles {settled}, after {CYCLES} more {after} (growth {growth}); \
+     contexts reclaimed {reclaimed}"
   );
   assert!(
     footprint > 0,
@@ -91,7 +100,7 @@ fn a_dropped_simulation_gives_back_its_contexts_clock_and_flags() {
   );
   assert_eq!(
     reclaimed,
-    (CYCLES + 1) * u64::from(config().shards),
+    (2 * CYCLES + 1) * u64::from(config().shards),
     "every context built was reclaimed"
   );
   assert!(

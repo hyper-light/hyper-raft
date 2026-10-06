@@ -33,29 +33,44 @@ enum Interest {
 /// Awaits one readiness edge on `raw` through the shard's driver: it registers one-shot interest on
 /// the first poll and yields; the driver's completion re-queues the task, and the next poll is ready
 /// so the caller retries the non-blocking syscall (a spurious wake just retries).
-struct Ready {
-  raw: i32,
+pub(crate) struct Ready {
+  target: Target,
   interest: Interest,
   armed: bool,
+}
+
+/// What a readiness wait watches: an OS handle through the shard's driver, or a simulated socket through
+/// its desk (docs/runtime.md §11).
+#[derive(Clone, Copy)]
+pub(crate) enum Target {
+  /// A descriptor or socket the driver watches.
+  Os(i32),
+  /// A simulated socket's index on the shard's desk.
+  Sim(u16),
 }
 
 impl Future for Ready {
   type Output = Result<(), RtError>;
 
   fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), RtError>> {
-    if self.armed {
-      // The driver woke us; let the caller retry the syscall.
-      return Poll::Ready(Ok(()));
-    }
     let Some(word) = polling_task(cx.waker()) else {
-      // A foreign waker cannot be armed on the driver; degrade to a retry (the caller's loop copes).
+      // A foreign waker cannot be registered with the driver; degrade to a retry (the caller's loop copes).
       return Poll::Ready(Ok(()));
     };
-    let (raw, interest) = (self.raw, self.interest);
-    let registered = registry::with_current(|ctx| match interest {
-      Interest::Readable => ctx.register_readable(raw, word.word()),
-      Interest::Writable => ctx.register_writable(raw, word.word()),
-    });
+    if self.armed {
+      // Woken: by the driver, or by the loop handing back a registration the driver refused.
+      return Poll::Ready(
+        match registry::with_current(|ctx| ctx.take_interest_refusal(word)).flatten() {
+          Some(refusal) => Err(refusal),
+          None => Ok(()),
+        },
+      );
+    }
+    let writable = matches!(self.interest, Interest::Writable);
+    let registered = match self.target {
+      Target::Os(raw) => registry::with_current(|ctx| ctx.register_interest(raw, writable, word)),
+      Target::Sim(index) => Some(crate::sim::sim_register(index, writable, word)),
+    };
     match registered {
       Some(Ok(())) => {
         self.armed = true;
@@ -70,20 +85,23 @@ impl Future for Ready {
 /// Awaits `raw`'s readability once (a real socket fd, a simulated fabric port, or a bridge
 /// queue's doorbell descriptor).
 pub async fn readable(raw: i32) -> Result<(), RtError> {
-  Ready {
-    raw,
-    interest: Interest::Readable,
-    armed: false,
-  }
-  .await
+  ready(Target::Os(raw), false).await
 }
 
 /// Awaits `raw`'s writability once (a real socket whose send buffer filled, or a connect in progress).
 pub(crate) async fn writable(raw: i32) -> Result<(), RtError> {
+  ready(Target::Os(raw), true).await
+}
+
+/// One readiness edge of `target`.
+pub(crate) fn ready(target: Target, writable: bool) -> Ready {
   Ready {
-    raw,
-    interest: Interest::Writable,
+    target,
+    interest: if writable {
+      Interest::Writable
+    } else {
+      Interest::Readable
+    },
     armed: false,
   }
-  .await
 }

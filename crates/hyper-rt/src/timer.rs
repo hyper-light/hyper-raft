@@ -1,72 +1,83 @@
-//! A hierarchical timing wheel [A: Varghese & Lauck, "Hashed and hierarchical timing wheels",
-//! SOSP'87]: insertion, cancellation and expiry in O(1) amortized, with entries cascading to a
-//! finer level as their deadline approaches.
+//! A hierarchical timing wheel [A: Varghese & Lauck, "Hashed and hierarchical timing wheels", SOSP'87;
+//! IEEE/ACM ToN 5(6) 1997 §VI.B]: arming, disarming and expiry in O(1), entries cascading to a finer level
+//! as their deadline approaches (slates' `timer.rs`, ORIGIN.md).
 //!
-//! The tick is derived from the profile (`timer_tick_ns`: no shorter than a wake, no shorter than
-//! the timer floor). Each level has 64 slots and there are six levels, so the wheel spans 2^36
-//! ticks; a deadline beyond that is clamped to the horizon and re-armed when it cascades (tokio's
-//! and Kafka's rule). Entries live in a slab and are linked through it, so arming a timer
-//! allocates nothing once the slab's segments exist.
-
-use crate::mem::{Handle, Slab};
+//! Each level has 64 slots and there are six levels, so the wheel spans 2^36 ticks; a deadline beyond
+//! that is clamped to the horizon and re-armed when it cascades (tokio's and Kafka's rule). The tick is
+//! the measured mean wake (docs/runtime.md §3.6).
+//!
+//! **Identifiers come from outside.** A timer is named by a slot index the caller allocates (the shard's
+//! desk hands them to tasks, §3.4), and the wheel keeps one entry per index, allocated once: arming,
+//! disarming, cascading and firing never allocate.
+//!
+//! **The next event in O(levels).** Each level keeps a 64-bit occupancy word, one bit per slot, so the
+//! next tick at which some level has work is found with a rotate and a `trailing_zeros` per level. slates
+//! rescanned every armed entry after a fire or a cancel of the earliest (docs/runtime.md §3.6).
 
 use crate::error::RtError;
 
-/// Format: slots per level and levels: 64^6 = 2^36 ticks of range.
+/// Format: slots per level, one bit each in a level's occupancy word.
 pub const SLOTS_PER_LEVEL: usize = 64;
-/// Format: levels.
+/// Format: levels: 64^6 = 2^36 ticks of range.
 pub const LEVELS: usize = 6;
 /// Format: log2 of the slots per level.
 const SLOT_BITS: u32 = 6;
-
+/// Format: the mask of a slot index within a level.
+const SLOT_MASK: u64 = 63;
+/// Format: "no entry" in a slot list's links.
 const NONE: u32 = u32::MAX;
 
 /// A timer entry.
-#[derive(Debug)]
-pub struct Entry {
+#[derive(Clone, Copy, Debug)]
+struct Entry {
   /// The deadline in ticks.
-  pub deadline: u64,
-  /// The packed waker word to wake when the deadline passes.
-  pub word: u64,
+  deadline: u64,
+  /// The word to report when the deadline passes.
+  word: u64,
   next: u32,
   prev: u32,
   level: u8,
-  slot: u16,
+  slot: u8,
+  armed: bool,
 }
 
-/// A handle to an armed timer.
-pub type TimerId = Handle<Entry>;
+impl Entry {
+  /// Format: an unarmed entry.
+  const IDLE: Entry = Entry {
+    deadline: 0,
+    word: 0,
+    next: NONE,
+    prev: NONE,
+    level: 0,
+    slot: 0,
+    armed: false,
+  };
+}
 
 /// The wheel.
 #[derive(Debug)]
 pub struct Wheel {
   tick_ns: u64,
   now_tick: u64,
-  entries: Slab<Entry>,
-  heads: Vec<u32>,
+  entries: Box<[Entry]>,
+  heads: Box<[u32]>,
+  occupied: [u64; LEVELS],
   armed: usize,
-  earliest: Option<u64>,
-  earliest_exact: bool,
   /// Ticks the wheel has examined (`expire_tick` calls) — the cost witness of `advance`.
   visits: u64,
 }
 
 impl Wheel {
-  /// A wheel with `tick_ns` per tick, room for `max_timers` timers, starting at `now_ns`.
-  pub fn new(tick_ns: u64, max_timers: usize, now_ns: u64) -> Self {
+  /// A wheel with `tick_ns` per tick, room for timers `0..capacity`, starting at `now_ns`.
+  pub fn new(tick_ns: u64, capacity: usize, now_ns: u64) -> Self {
     let tick_ns = tick_ns.max(1);
-    // The wheel's bucket count is unrelated to its storage geometry. Reserve the bounded
-    // slab once; one allocation per bucket-sized segment made empty partitions expensive
-    // to start (25,271 allocations at CI's 1,617,130-timer bound, 2026-09-19).
-    let entries = Slab::preallocated(max_timers);
     Self {
       tick_ns,
-      now_tick: now_ns / tick_ns,
-      entries,
-      heads: vec![NONE; SLOTS_PER_LEVEL * LEVELS],
+      now_tick: now_ns.checked_div(tick_ns).unwrap_or(0),
+      entries: vec![Entry::IDLE; capacity].into_boxed_slice(),
+      heads: vec![NONE; SLOTS_PER_LEVEL.saturating_mul(LEVELS)].into_boxed_slice(),
+      occupied: [0; LEVELS],
       armed: 0,
-      earliest: None,
-      earliest_exact: true,
       visits: 0,
     }
   }
@@ -86,207 +97,229 @@ impl Wheel {
     self.armed
   }
 
-  /// Arms a timer to wake `word` at `deadline_ns`.
-  pub fn insert(&mut self, deadline_ns: u64, word: u64) -> Result<TimerId, RtError> {
-    let deadline = (deadline_ns.div_ceil(self.tick_ns)).max(self.now_tick + 1);
-    let id = self.entries.insert(Entry {
-      deadline,
-      word,
-      next: NONE,
-      prev: NONE,
-      level: 0,
-      slot: 0,
-    })?;
-    self.link(id.index(), deadline);
-    self.armed += 1;
-    self.earliest = Some(self.earliest.map_or(deadline, |e| e.min(deadline)));
-    Ok(id)
+  /// The timers it has room for.
+  pub fn capacity(&self) -> usize {
+    self.entries.len()
   }
 
-  /// Disarms a timer; a stale id is refused. The arena removal comes **first** so the id's generation is
-  /// validated before any list is touched: a stale id (its slot already fired and was reused by a *later*
-  /// timer) is refused here and never reaches the unlink — unlinking by bare index would otherwise splice
-  /// out whichever timer now occupies the slot, orphaning a live timer so it never fires (the SWIM probe's
-  /// deadline stranded exactly this way, hanging a survivor's death detection under a fleet's own load).
-  /// The removed entry carries its own recorded position, so the unlink needs no second read of it.
-  pub fn cancel(&mut self, id: TimerId) -> Result<(), RtError> {
-    let removed = self.entries.remove(id)?;
-    let head = usize::from(removed.level) * SLOTS_PER_LEVEL + usize::from(removed.slot);
-    self.unlink_at(removed.next, removed.prev, head);
-    self.armed -= 1;
-    if self.earliest == Some(removed.deadline) {
-      // The earliest may have been this one; the next query rescans.
-      self.earliest_exact = false;
+  /// Arms timer `id` to report `word` at `deadline_ns` (no earlier than the next tick). Refused for an id
+  /// past the capacity or one already armed.
+  pub fn arm(&mut self, id: u32, deadline_ns: u64, word: u64) -> Result<(), RtError> {
+    let deadline = deadline_ns
+      .div_ceil(self.tick_ns)
+      .max(self.now_tick.saturating_add(1));
+    let entry = self.entry_mut(id)?;
+    if entry.armed {
+      return Err(RtError::TimerState { id, armed: true });
     }
+    *entry = Entry {
+      deadline,
+      word,
+      armed: true,
+      ..Entry::IDLE
+    };
+    self.link(id, deadline);
+    self.armed = self.armed.saturating_add(1);
     Ok(())
   }
 
-  /// The next deadline in nanoseconds, if any timer is armed. Exact after an insert; a cancel of
-  /// the earliest entry or a firing tick marks it for one rescan.
-  pub fn next_deadline_ns(&mut self) -> Option<u64> {
-    if self.armed == 0 {
-      self.earliest = None;
-      self.earliest_exact = true;
-      return None;
+  /// Disarms timer `id`; refused for an id that is not armed (fired, or never armed).
+  pub fn disarm(&mut self, id: u32) -> Result<(), RtError> {
+    let entry = *self.entry(id)?;
+    if !entry.armed {
+      return Err(RtError::TimerState { id, armed: false });
     }
-    if !self.earliest_exact {
-      let mut best: Option<u64> = None;
-      for (_, entry) in self.entries.iter() {
-        best = Some(best.map_or(entry.deadline, |b| b.min(entry.deadline)));
-      }
-      self.earliest = best;
-      self.earliest_exact = true;
+    self.unlink(id, entry);
+    if let Ok(entry) = self.entry_mut(id) {
+      *entry = Entry::IDLE;
     }
-    self
-      .earliest
-      .map(|ticks| ticks.saturating_mul(self.tick_ns))
+    self.armed = self.armed.saturating_sub(1);
+    Ok(())
   }
 
-  /// Advances to `now_ns`, collecting the words of every expired timer into `fired` in deadline
-  /// order within a tick. Each step jumps straight to the next tick that has work — a level-0 slot to
-  /// fire, or a higher level's slot to cascade at its boundary ([`Wheel::next_event_tick`]) — so the cost
-  /// is per timer event, never per idle tick: a shard idle for 66,600 ticks between two timers examined
-  /// 66,595 of them before (every tick once any timer had fired), which made a simulated 64 kbit/s run
-  /// take minutes of CPU (2026-09-27).
-  pub fn advance(&mut self, now_ns: u64, fired: &mut Vec<u64>) {
-    let target = now_ns / self.tick_ns;
-    let before = fired.len();
+  /// The next tick's time in nanoseconds at which the wheel has work (a timer to fire, or a level to
+  /// cascade toward one), if any timer is armed: never later than the earliest deadline, and exactly it for
+  /// a deadline within the finest level's rotation.
+  pub fn next_deadline_ns(&self) -> Option<u64> {
+    if self.armed == 0 {
+      return None;
+    }
+    let tick = self.next_event_tick(u64::MAX);
+    (tick != u64::MAX).then(|| tick.saturating_mul(self.tick_ns))
+  }
+
+  /// Advances to `now_ns`, collecting `(id, word)` of every expired timer into `fired` in deadline order
+  /// within a tick; a fired timer is disarmed. Each step jumps straight to the next tick that has work
+  /// ([`Wheel::next_event_tick`]), so the cost is per timer event, never per idle tick (slates measured a
+  /// shard idle for 66,600 ticks examining 66,595 of them before, 2026-09-27).
+  pub fn advance(&mut self, now_ns: u64, fired: &mut Vec<(u32, u64)>) {
+    let target = now_ns.checked_div(self.tick_ns).unwrap_or(0);
     while self.now_tick < target {
       self.now_tick = self.next_event_tick(target);
       self.expire_tick(fired);
     }
-    if fired.len() > before {
-      self.earliest_exact = false;
-    }
   }
 
   /// The next tick after `now_tick`, at most `target`, at which some level has an occupied slot to process:
-  /// for each level, the boundaries of its slots after `now_tick` (every tick at level 0, every `64^L`
-  /// ticks at level `L`) are scanned for a non-empty slot, at most one rotation (64 slots) per level. An
-  /// entry at level `L` lies less than one rotation of that level ahead (`level_and_slot`), and its slot's
-  /// boundary is after `now_tick` (its distance is at least `64^L`), so the scan always meets it.
+  /// for level `L`, the boundaries of its slots after `now_tick` fall every `64^L` ticks, and the first
+  /// occupied one is the occupancy word rotated to start just past the current slot, its trailing zeros
+  /// counting the boundaries skipped. An entry at level `L` lies less than one rotation of that level ahead
+  /// (`level_and_slot`), so one rotation always meets it.
   fn next_event_tick(&self, target: u64) -> u64 {
     let mut best = target;
-    for level in 0..LEVELS {
-      let shift = SLOT_BITS * u32::try_from(level).unwrap_or(0);
-      let span = 1u64 << shift;
-      let mut boundary = ((self.now_tick >> shift) + 1) << shift;
-      for _ in 0..SLOTS_PER_LEVEL {
-        if boundary >= best {
-          break;
-        }
-        let slot = usize::try_from((boundary >> shift) & (SLOTS_PER_LEVEL as u64 - 1)).unwrap_or(0);
-        if self.heads[level * SLOTS_PER_LEVEL + slot] != NONE {
-          best = boundary;
-          break;
-        }
-        boundary = boundary.saturating_add(span);
+    for (level, occupied) in self.occupied.iter().enumerate() {
+      if *occupied == 0 {
+        continue;
       }
+      let shift = level_shift(level);
+      let base = self.now_tick >> shift;
+      let start = u32::try_from(base.wrapping_add(1) & SLOT_MASK).unwrap_or(0);
+      let skipped = u64::from(occupied.rotate_right(start).trailing_zeros());
+      let boundary = base
+        .saturating_add(1)
+        .saturating_add(skipped)
+        .checked_shl(shift)
+        .unwrap_or(u64::MAX);
+      best = best.min(boundary);
     }
     best
   }
 
-  fn expire_tick(&mut self, fired: &mut Vec<u64>) {
-    self.visits += 1;
+  fn expire_tick(&mut self, fired: &mut Vec<(u32, u64)>) {
+    self.visits = self.visits.saturating_add(1);
     let tick = self.now_tick;
-    // Level 0 slot for this tick fires; a higher level's slot that this tick enters cascades.
+    // The level-0 slot for this tick fires; a higher level's slot that this tick enters cascades.
     for level in 0..LEVELS {
-      let shift = SLOT_BITS * u32::try_from(level).unwrap_or(0);
-      if level > 0 && tick & ((1u64 << shift) - 1) != 0 {
+      let shift = level_shift(level);
+      let below = 1u64.checked_shl(shift).map_or(0, |span| span.saturating_sub(1));
+      if level > 0 && tick & below != 0 {
         break;
       }
-      let slot = usize::try_from((tick >> shift) & (SLOTS_PER_LEVEL as u64 - 1)).unwrap_or(0);
-      let head = level * SLOTS_PER_LEVEL + slot;
-      let mut index = self.heads[head];
-      self.heads[head] = NONE;
-      while index != NONE {
-        let (next, deadline, word) = {
-          let Ok(entry) = self
-            .entries
-            .get(Handle::from_raw(index, self.generation_of(index)))
-          else {
-            break;
-          };
-          (entry.next, entry.deadline, entry.word)
+      let slot = slot_index(tick >> shift);
+      let head = head_index(level, slot);
+      let Some(first) = self.heads.get_mut(head).map(|h| std::mem::replace(h, NONE)) else {
+        continue;
+      };
+      self.clear_occupied(level, slot);
+      let mut id = first;
+      while id != NONE {
+        let Ok(entry) = self.entry(id).copied() else {
+          break;
         };
-        if deadline <= tick || level == 0 {
-          fired.push(word);
-          let _ = self
-            .entries
-            .remove(Handle::from_raw(index, self.generation_of(index)));
-          self.armed -= 1;
+        if entry.deadline <= tick || level == 0 {
+          fired.push((id, entry.word));
+          if let Ok(entry) = self.entry_mut(id) {
+            *entry = Entry::IDLE;
+          }
+          self.armed = self.armed.saturating_sub(1);
         } else {
-          self.link(index, deadline);
+          self.link(id, entry.deadline);
         }
-        index = next;
+        id = entry.next;
       }
     }
-  }
-
-  fn generation_of(&self, index: u32) -> u32 {
-    self.entries.generation_at(index).unwrap_or(0)
   }
 
   fn level_and_slot(&self, deadline: u64) -> (usize, usize) {
     let delta = deadline.saturating_sub(self.now_tick).max(1);
-    let level = (usize::try_from((u64::BITS - 1 - delta.leading_zeros()) / SLOT_BITS).unwrap_or(0))
-      .min(LEVELS - 1);
-    let shift = SLOT_BITS * u32::try_from(level).unwrap_or(0);
-    let slot = usize::try_from((deadline >> shift) & (SLOTS_PER_LEVEL as u64 - 1)).unwrap_or(0);
-    (level, slot)
+    let magnitude = (u64::BITS - 1).saturating_sub(delta.leading_zeros());
+    let level = usize::try_from(magnitude / SLOT_BITS)
+      .unwrap_or(0)
+      .min(LEVELS.saturating_sub(1));
+    (level, slot_index(deadline >> level_shift(level)))
   }
 
-  fn link(&mut self, index: u32, deadline: u64) {
+  fn link(&mut self, id: u32, deadline: u64) {
     let (level, slot) = self.level_and_slot(deadline);
-    let head = level * SLOTS_PER_LEVEL + slot;
-    let old = self.heads[head];
-    if let Ok(entry) = self
-      .entries
-      .get_mut(Handle::from_raw(index, self.generation_of(index)))
-    {
+    let head = head_index(level, slot);
+    let old = self.heads.get(head).copied().unwrap_or(NONE);
+    if let Ok(entry) = self.entry_mut(id) {
       entry.next = old;
       entry.prev = NONE;
       entry.level = u8::try_from(level).unwrap_or(0);
-      entry.slot = u16::try_from(slot).unwrap_or(0);
+      entry.slot = u8::try_from(slot).unwrap_or(0);
     }
     if old != NONE
-      && let Ok(next) = self
-        .entries
-        .get_mut(Handle::from_raw(old, self.generation_of(old)))
+      && let Ok(next) = self.entry_mut(old)
     {
-      next.prev = index;
+      next.prev = id;
     }
-    self.heads[head] = index;
+    if let Some(h) = self.heads.get_mut(head) {
+      *h = id;
+    }
+    if let Some(word) = self.occupied.get_mut(level) {
+      *word |= 1u64 << slot;
+    }
   }
 
-  /// Splices an entry out of its doubly-linked slot list given the position it recorded — its `next`,
-  /// `prev`, and the `head` of its `(level, slot)`. The entry itself is already gone from the arena (the
-  /// caller removed it after validating its generation), so this only mends its former neighbours and the
-  /// head pointer. Its neighbours are the entry's own list-mates, so they are live at their current
-  /// generation.
-  fn unlink_at(&mut self, next: u32, prev: u32, head: usize) {
-    if prev == NONE {
-      self.heads[head] = next;
-    } else if let Ok(p) = self
-      .entries
-      .get_mut(Handle::from_raw(prev, self.generation_of(prev)))
-    {
-      p.next = next;
+  /// Splices `entry` (timer `id`, still linked) out of its slot list.
+  fn unlink(&mut self, id: u32, entry: Entry) {
+    let level = usize::from(entry.level);
+    let slot = usize::from(entry.slot);
+    let head = head_index(level, slot);
+    if entry.prev == NONE {
+      if let Some(h) = self.heads.get_mut(head)
+        && *h == id
+      {
+        *h = entry.next;
+      }
+    } else if let Ok(p) = self.entry_mut(entry.prev) {
+      p.next = entry.next;
     }
-    if next != NONE
-      && let Ok(n) = self
-        .entries
-        .get_mut(Handle::from_raw(next, self.generation_of(next)))
+    if entry.next != NONE
+      && let Ok(n) = self.entry_mut(entry.next)
     {
-      n.prev = prev;
+      n.prev = entry.prev;
+    }
+    if self.heads.get(head).copied() == Some(NONE) {
+      self.clear_occupied(level, slot);
     }
   }
+
+  fn clear_occupied(&mut self, level: usize, slot: usize) {
+    if let Some(word) = self.occupied.get_mut(level) {
+      *word &= !(1u64 << slot);
+    }
+  }
+
+  fn entry(&self, id: u32) -> Result<&Entry, RtError> {
+    usize::try_from(id)
+      .ok()
+      .and_then(|index| self.entries.get(index))
+      .ok_or(RtError::TimerState { id, armed: false })
+  }
+
+  fn entry_mut(&mut self, id: u32) -> Result<&mut Entry, RtError> {
+    usize::try_from(id)
+      .ok()
+      .and_then(|index| self.entries.get_mut(index))
+      .ok_or(RtError::TimerState { id, armed: false })
+  }
+}
+
+/// The bit shift of a level's slot boundaries: `64^level` ticks.
+fn level_shift(level: usize) -> u32 {
+  SLOT_BITS.saturating_mul(u32::try_from(level).unwrap_or(0))
+}
+
+/// A slot index within a level, from a tick shifted to the level.
+fn slot_index(shifted: u64) -> usize {
+  usize::try_from(shifted & SLOT_MASK).unwrap_or(0)
+}
+
+/// A slot's list head in the flat table of every level's slots.
+fn head_index(level: usize, slot: usize) -> usize {
+  level.saturating_mul(SLOTS_PER_LEVEL).saturating_add(slot)
 }
 
 #[cfg(test)]
 mod tests {
   use super::*;
   use crate::machine::stats::Xorshift;
+
+  fn words(fired: &[(u32, u64)]) -> Vec<u64> {
+    fired.iter().map(|(_, word)| *word).collect()
+  }
 
   #[test]
   fn timers_fire_in_deadline_order_within_one_tick_of_accuracy() {
@@ -296,7 +329,9 @@ mod tests {
     let mut expected: Vec<(u64, u64)> = Vec::new();
     for word in 0..10_000u64 {
       let deadline_ns = u64::try_from(rng.below(5_000_000)).unwrap() + 1;
-      wheel.insert(deadline_ns, word).unwrap();
+      wheel
+        .arm(u32::try_from(word).unwrap(), deadline_ns, word)
+        .unwrap();
       expected.push((deadline_ns.div_ceil(tick), word));
     }
     assert_eq!(wheel.armed(), 10_000);
@@ -307,7 +342,7 @@ mod tests {
       now += tick;
       let before = fired.len();
       wheel.advance(now, &mut fired);
-      for word in &fired[before..] {
+      for (_, word) in &fired[before..] {
         let (deadline_tick, _) = expected[usize::try_from(*word).unwrap()];
         assert!(deadline_tick <= now / tick, "timer {word} fired early");
         assert!(
@@ -325,54 +360,43 @@ mod tests {
   }
 
   #[test]
-  fn cancel_disarms_and_refuses_a_stale_id() {
+  fn disarm_removes_a_timer_and_refuses_one_that_is_not_armed() {
     let mut wheel = Wheel::new(10, 8, 0);
-    let a = wheel.insert(50, 1).unwrap();
-    let b = wheel.insert(50, 2).unwrap();
-    wheel.cancel(a).unwrap();
-    assert!(matches!(wheel.cancel(a), Err(RtError::Mem(_))));
+    wheel.arm(0, 50, 1).unwrap();
+    wheel.arm(1, 50, 2).unwrap();
+    assert!(matches!(
+      wheel.arm(1, 70, 9),
+      Err(RtError::TimerState { armed: true, .. })
+    ));
+    wheel.disarm(0).unwrap();
+    assert!(wheel.disarm(0).is_err());
     assert_eq!(wheel.next_deadline_ns(), Some(50));
     let mut fired = Vec::new();
     wheel.advance(60, &mut fired);
-    assert_eq!(fired, vec![2]);
-    assert!(wheel.cancel(b).is_err());
+    assert_eq!(fired, vec![(1, 2)]);
+    assert!(wheel.disarm(1).is_err(), "a fired timer is no longer armed");
     assert_eq!(wheel.next_deadline_ns(), None);
+    assert!(wheel.arm(8, 50, 1).is_err(), "past the capacity");
   }
 
-  /// A stale `cancel` — one whose slot has already fired and been reused by a *later* timer — must be
-  /// refused without disturbing the reused slot's live timer. Regression: `cancel` unlinked by bare index
-  /// (at the slot's current generation) *before* validating the id's generation, so a stale cancel spliced
-  /// the timer that had reused the slot out of its list — orphaning it in the arena, in no slot list, so
-  /// it never fired. That is the runtime hazard that hung a fleet survivor's SWIM probe of a dead node
-  /// (the probe's deadline timer, orphaned when a healthy probe's fired-timer slot was reused and its id
-  /// then cancelled late). Here A fires and frees its slot, B reuses it, the stale cancel of A is refused,
-  /// and B must still fire.
+  /// slates' regression (a stale cancel orphaned the timer that reused its slot, hanging a SWIM probe's
+  /// deadline): here a timer fires, its id is armed again by another timer, and a late disarm of that id
+  /// removes the new timer only when its owner asks — the wheel refuses a disarm of a fired id, so a
+  /// stale disarm arriving between the fire and the reuse cannot orphan anything. Generations that tell a
+  /// stale holder from the new one are the desk's (docs/runtime.md §3.4).
   #[test]
-  fn a_stale_cancel_does_not_orphan_the_timer_that_reused_the_slot() {
+  fn a_disarm_after_a_fire_is_refused_and_the_reuse_still_fires() {
     let mut wheel = Wheel::new(10, 4, 0);
-    let a = wheel.insert(50, 1).unwrap();
+    wheel.arm(0, 50, 1).unwrap();
     let mut fired = Vec::new();
-    // Fire A, freeing its slot for reuse.
     wheel.advance(60, &mut fired);
-    assert_eq!(fired, vec![1], "A fired, freeing its slot");
+    assert_eq!(words(&fired), vec![1]);
+    assert!(wheel.disarm(0).is_err(), "the stale disarm is refused");
     fired.clear();
-    // B reuses A's freed slot (same index, a new generation) — the reuse the bug needs.
-    let b = wheel.insert(100, 2).unwrap();
-    assert_eq!(a.index(), b.index(), "B reused A's slot");
-    // The now-stale cancel of A is refused and must NOT unlink B.
-    assert!(
-      wheel.cancel(a).is_err(),
-      "a stale cancel (fired-and-reused slot) is refused"
-    );
-    // B was not orphaned: it is still the earliest, and it still fires.
+    wheel.arm(0, 100, 2).unwrap();
     assert_eq!(wheel.next_deadline_ns(), Some(100));
     wheel.advance(110, &mut fired);
-    assert_eq!(
-      fired,
-      vec![2],
-      "B still fires — the stale cancel did not orphan it"
-    );
-    let _ = b;
+    assert_eq!(words(&fired), vec![2]);
   }
 
   #[test]
@@ -380,17 +404,20 @@ mod tests {
     let mut wheel = Wheel::new(1, 64, 0);
     let deadlines = [63, 64, 65, 127, 128, 4095, 4096, 4097, 262_144, 262_145];
     for (i, d) in deadlines.iter().enumerate() {
-      wheel.insert(*d, u64::try_from(i).unwrap()).unwrap();
+      wheel
+        .arm(u32::try_from(i).unwrap(), *d, u64::try_from(i).unwrap())
+        .unwrap();
     }
     let mut fired = Vec::new();
     let mut now = 0;
     let mut order = Vec::new();
     while wheel.armed() > 0 {
       let next = wheel.next_deadline_ns().unwrap();
-      now = now.max(next);
+      assert!(next > now, "the next event is ahead of the clock");
+      now = next;
       let before = fired.len();
       wheel.advance(now, &mut fired);
-      for w in &fired[before..] {
+      for (_, w) in &fired[before..] {
         let d = deadlines[usize::try_from(*w).unwrap()];
         assert_eq!(d, now, "timer {w} fired at {now}, deadline {d}");
         order.push(d);
@@ -403,34 +430,48 @@ mod tests {
   fn a_far_deadline_cascades_down_the_levels_and_fires_on_time() {
     let mut wheel = Wheel::new(1, 8, 0);
     let far = 64 * 64 * 3 + 7;
-    wheel.insert(far, 42).unwrap();
+    wheel.arm(0, far, 42).unwrap();
     let mut fired = Vec::new();
     wheel.advance(far - 1, &mut fired);
     assert!(fired.is_empty());
     wheel.advance(far, &mut fired);
-    assert_eq!(fired, vec![42]);
+    assert_eq!(words(&fired), vec![42]);
   }
 
-  /// §4.3 (a shard's wake cost must not grow with its idle time): after a timer has fired, advancing across
-  /// a long idle stretch to the next timer examines a number of ticks bounded by the wheel's levels and the
-  /// timers it passes — not one per tick, nor one per 64-tick boundary. A 10 µs tick and a 666 ms idle wait
-  /// (a session's idle re-drive) is 66,600 ticks; the wheel walked most of them after any firing.
+  /// §4.3 (a shard's wake cost must not grow with its idle time): advancing across a long idle stretch to
+  /// the next timer examines a number of ticks bounded by the wheel's levels, not one per tick.
   #[test]
   fn advancing_across_an_idle_stretch_costs_per_event_not_per_tick() {
     let mut wheel = Wheel::new(1, 16, 0);
     let mut fired = Vec::new();
-    wheel.insert(5, 1).unwrap();
+    wheel.arm(0, 5, 1).unwrap();
     wheel.advance(5, &mut fired);
-    assert_eq!(fired, vec![1], "the first timer fired");
+    assert_eq!(words(&fired), vec![1], "the first timer fired");
     let far = 66_600;
-    wheel.insert(far, 2).unwrap();
+    wheel.arm(1, far, 2).unwrap();
     let before = wheel.visits();
     wheel.advance(far, &mut fired);
-    assert_eq!(fired, vec![1, 2], "the far timer fired on time");
+    assert_eq!(words(&fired), vec![1, 2], "the far timer fired on time");
     let visited = wheel.visits() - before;
     assert!(
       visited <= 2 * LEVELS as u64,
       "{visited} ticks examined to reach one timer {far} ticks away"
     );
+  }
+
+  /// The next event is found from the occupancy words, never by visiting entries: with every timer armed at
+  /// the far end of the wheel and one near, the next deadline is the near one, and disarming it moves the
+  /// next deadline to the far timers' cascade.
+  #[test]
+  fn the_next_deadline_follows_arms_and_disarms_without_a_rescan() {
+    let mut wheel = Wheel::new(1, 1_000, 0);
+    for id in 1..1_000u32 {
+      wheel.arm(id, 1_000_000, u64::from(id)).unwrap();
+    }
+    wheel.arm(0, 10, 0).unwrap();
+    assert_eq!(wheel.next_deadline_ns(), Some(10));
+    wheel.disarm(0).unwrap();
+    let next = wheel.next_deadline_ns().unwrap();
+    assert!(next > 10 && next <= 1_000_000, "{next}");
   }
 }

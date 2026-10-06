@@ -1,13 +1,12 @@
 //! The simulation driver and runtime: virtual time, a seeded generator, kicks as flags, and fault
 //! injection, so a whole set of shards runs deterministically on one thread (§4.3, D-20).
 //!
-//! Every simulated shard shares one clock. `SimRuntime::run_until_idle` steps each shard in
-//! turn; when all are idle it advances the clock to the earliest deadline any shard asked for,
-//! and stops when no shard has a deadline or a message. Fault injection: `kill_driver` makes a
-//! shard's next wait fail with `DriverLost`, which the shard answers by cancelling every task
-//! with a terminal completion and exiting (T-0.7). The registry owns each shard's flags.
-//! Kicks carry a registration generation and pin the flags for their borrow; the owning
-//! driver borrows them until its context ends. The runtime owns the shared clock.
+//! Every simulated shard reads one clock, which the runtime sets on each shard's flags.
+//! `SimRuntime::run_until_idle` steps each shard in turn; when all are idle it advances the clock to the
+//! earliest deadline any shard asked for or the earliest datagram in flight, and stops when nothing is
+//! pending. Fault injection: `kill_driver` makes a shard's next wait fail with `DriverLost`, which the
+//! shard answers by cancelling every task with a terminal completion and exiting (T-0.7). The registry
+//! owns each shard's flags; the runtime owns its shards, by value, and the fabric between them.
 //!
 //! The simulated UDP fabric below carries the fleet plane at N=1 and models the network under test
 //! ([`SimPath`]): a one-way delay with seeded jitter (since 2026-09-14, so the consensus timing rules of
@@ -16,22 +15,22 @@
 //! loss ([`SimLoss`]), a path MTU, a bounded receive buffer, and a NAT whose mapping expires and rebinds
 //! ([`SimNat`]) — every condition the session plane's constrained-link design is proven against
 //! (`docs/wip/research/nfs-transport-constrained-links.md` §5, §9), deterministic from the seed.
-#![allow(unsafe_code)]
 
+use std::cell::Cell;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use crate::machine::stats::Xorshift;
-
+use crate::cells::CellStack;
 use crate::driver::{Completion, Driver, DriverKind, DriverSeed, Kick};
 use crate::error::RtError;
+use crate::machine::stats::Xorshift;
 use crate::runtime::RuntimeConfig;
-use crate::shard::{ShardContext, ShardId, ShardSeed, StepOutcome, TaskId};
+use crate::shard::{Kept, ShardContext, ShardId, TaskId};
+use crate::shard_loop::{Counters, Shard, ShardSeed, StepOutcome};
 use crate::task::SpawnRequest;
 
 /// Format: the "no deadline requested" sentinel.
 const NO_DEADLINE: u64 = u64::MAX;
 
-use std::cell::RefCell;
 use std::collections::{BTreeMap, VecDeque};
 
 use crate::mem::Encoded;
@@ -120,7 +119,7 @@ pub struct SimLink {
   pub queue_bytes: u64,
 }
 
-/// A link added to this thread's fabric ([`sim_udp_add_link`]).
+/// A link on the fabric ([`sim_udp_add_link`], [`SimRuntime::add_link`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct SimLinkId(u32);
 
@@ -303,14 +302,6 @@ pub struct SimFabricStats {
   pub peak_queue_bytes: u64,
 }
 
-/// A bound port's receive queue: the datagrams (bytes, source port) and the bytes they hold, bounded by
-/// [`SIM_RECV_BUFFER_BYTES`].
-#[derive(Debug, Default)]
-struct Mailbox {
-  queue: VecDeque<(Vec<u8>, u16)>,
-  held: usize,
-}
-
 /// A datagram the fabric holds until its arrival time.
 #[derive(Debug)]
 struct InFlight {
@@ -319,58 +310,45 @@ struct InFlight {
   from: u16,
 }
 
-/// The simulated UDP fabric (§4.10a): a deterministic, in-memory datagram network so the fleet plane
-/// is testable at N=1 without the OS network — the "sim arm first" the design's phasing calls for.
-/// It is a thread-local because the simulation runs on one thread (so no `Send`/`Sync`, no lock), and
-/// wakes a waiting receiver through the registry, the same path a real driver completion takes.
+/// A datagram the fabric hands to a port: its bytes, and the source port it carries.
+#[derive(Debug)]
+struct Arrival {
+  port: u16,
+  bytes: Vec<u8>,
+  from: u16,
+}
+
+/// The simulated UDP fabric (slates §4.10a): a deterministic, in-memory datagram network, owned by its
+/// [`SimRuntime`] (slates kept it in a thread-local `RefCell`). It routes and times datagrams; the sockets'
+/// mailboxes are on their shards' desks ([`SimSockets`]), which the runtime fills from what the fabric hands
+/// over.
 ///
-/// Every send is timed against the simulation clock the runtime installs ([`sim_fabric_reset`]) and the
-/// directed pair's [`SimPath`] (else the fabric-wide one): a datagram is dropped past the path MTU, is
-/// serialized through its bottleneck link (dropped if the link's queue is full), is lost by the path's
-/// loss process, then propagates. A datagram whose arrival is now goes straight to its mailbox; a later
-/// one waits in flight, ordered by arrival, and the simulation loop hands it over — and wakes its receiver
-/// — once the clock reaches it ([`SimRuntime::run_until_idle`] also treats the earliest arrival as a
-/// deadline the clock may advance to). A receiver's mailbox holds at most [`SIM_RECV_BUFFER_BYTES`], the
-/// bound a kernel socket buffer has, and drops past it. With no clock installed "now" is zero.
+/// Every send is timed against the simulation clock and the directed pair's [`SimPath`] (else the
+/// fabric-wide one): a datagram is dropped past the path MTU, is serialized through its bottleneck link
+/// (dropped if the link's queue is full), is lost by the path's loss process, then propagates. A datagram
+/// whose arrival is now is handed over at once; a later one waits in flight, ordered by arrival, and is
+/// handed over once the clock reaches it ([`SimRuntime::run_until_idle`] treats the earliest arrival as a
+/// deadline the clock may advance to).
 #[derive(Debug)]
 pub struct SimFabric {
-  next_port: u16,
-  /// Each bound port's queued datagrams.
-  mailboxes: BTreeMap<u16, Mailbox>,
-  interests: BTreeMap<u16, u64>,
+  /// The next external port a NAT may allocate: above every shard's socket ports.
+  next_external: u16,
   /// The seeded generator the jitter and loss are drawn from — the fabric's own stream, so a profile's
-  /// draws never perturb the shards' generators and a run replays exactly from its seed.
+  /// draws never perturb the shards' and a run replays exactly from its seed.
   rng: Xorshift,
-  /// The path of every directed pair without an override.
   default_path: SimPath,
-  /// Directed overrides, keyed `(from, dest)` by the sockets' own ports.
   pair_paths: BTreeMap<(u16, u16), SimPath>,
-  /// The sending host's interface MTU, when one is modelled: a datagram larger than it is refused at the
-  /// send, as a real host with don't-fragment set refuses it (`EMSGSIZE`) — before any path sees it. `None`:
-  /// no interface limit (every send reaches its path).
-  interface_mtu: Option<usize>,
-  /// The bottleneck links, by id.
-  links: Vec<LinkState>,
-  /// Each directed flow's Gilbert–Elliott state: `true` while in the bad (burst) state.
+  links: BTreeMap<SimLinkId, LinkState>,
   loss_state: BTreeMap<(u16, u16), bool>,
-  /// NATs by inside port, and the current external→inside mappings.
   nats: BTreeMap<u16, NatState>,
   external: BTreeMap<u16, u16>,
   /// Every external port a NAT has allocated, live or expired, so a datagram to an expired mapping is
-  /// counted as the NAT's drop rather than a closed port's. Bounded by the 16-bit port space.
+  /// counted as the NAT's drop. Bounded by the 16-bit port space.
   nat_ports: std::collections::BTreeSet<u16>,
-  /// Datagrams not yet arrived, keyed by arrival time then send sequence (so two arrivals at one instant
-  /// keep send order and never collide).
   in_flight: BTreeMap<(u64, u64), InFlight>,
   next_sequence: u64,
-  /// The latest arrival scheduled on each directed flow, the floor an in-order path clamps the next to.
   last_arrival: BTreeMap<(u16, u16), u64>,
   stats: SimFabricStats,
-  /// Ports whose sends the scenario has blocked (`sim_udp_block_sends`): local send pressure, as a kernel
-  /// with a full send buffer reports it — the send would block (AUD-29-61).
-  send_blocked: std::collections::BTreeSet<u16>,
-  /// One-shot write interest on a blocked port, woken when the scenario releases it.
-  send_interests: BTreeMap<u16, u64>,
 }
 
 /// Format: the salt that separates the fabric's generator stream from the shards' (both are seeded from
@@ -378,17 +356,13 @@ pub struct SimFabric {
 const FABRIC_SEED_SALT: u64 = 0xD1B5_4A32_D192_ED03;
 
 impl SimFabric {
-  fn new(seed: u64) -> SimFabric {
+  fn new(seed: u64, first_external: u16) -> SimFabric {
     SimFabric {
-      // Ports start at 1 so 0 stays the "unspecified" address, as in the OS.
-      next_port: 1,
-      mailboxes: BTreeMap::new(),
-      interests: BTreeMap::new(),
+      next_external: first_external,
       rng: Xorshift::new(seed ^ FABRIC_SEED_SALT),
       default_path: SimPath::NONE,
       pair_paths: BTreeMap::new(),
-      interface_mtu: None,
-      links: Vec::new(),
+      links: BTreeMap::new(),
       loss_state: BTreeMap::new(),
       nats: BTreeMap::new(),
       external: BTreeMap::new(),
@@ -397,21 +371,7 @@ impl SimFabric {
       next_sequence: 0,
       last_arrival: BTreeMap::new(),
       stats: SimFabricStats::default(),
-      send_blocked: std::collections::BTreeSet::new(),
-      send_interests: BTreeMap::new(),
     }
-  }
-
-  fn bind(&mut self) -> u16 {
-    let port = self.next_port;
-    self.next_port = self.next_port.saturating_add(1);
-    self.mailboxes.entry(port).or_default();
-    port
-  }
-
-  /// Virtual now: the clock of the shard sending on this fabric, or zero off a shard.
-  fn now_ns(&self) -> u64 {
-    crate::futures::now_ns()
   }
 
   /// The source port a datagram from `from` carries on the wire: `from` itself, or its NAT's current
@@ -434,8 +394,8 @@ impl SimFabric {
         if let Some((old, _)) = mapping {
           self.external.remove(&old);
         }
-        let fresh = self.bind();
-        self.mailboxes.remove(&fresh);
+        let fresh = self.next_external;
+        self.next_external = self.next_external.saturating_add(1);
         self.external.insert(fresh, from);
         self.nat_ports.insert(fresh);
         fresh
@@ -447,11 +407,10 @@ impl SimFabric {
     port
   }
 
-  /// The inside port a datagram addressed to `dest` reaches at `now`: `dest` itself when no NAT owns
-  /// it, the inside port behind a live mapping, or `None` when it names an expired or unknown mapping.
+  /// The inside port a datagram addressed to `dest` reaches at `now`: `dest` itself when no NAT owns it,
+  /// the inside port behind a live mapping, or `None` when it names an expired or unknown mapping.
   fn translate_inbound(&self, dest: u16, now: u64) -> Option<u16> {
     let Some(&inside) = self.external.get(&dest) else {
-      // An inside port is reachable only through its NAT, and an expired external port reaches nothing.
       return (!self.nats.contains_key(&dest) && !self.nat_ports.contains(&dest)).then_some(dest);
     };
     let state = self.nats.get(&inside)?;
@@ -459,7 +418,6 @@ impl SimFabric {
     (port == dest && now.saturating_sub(last) <= state.nat.idle_timeout_ns).then_some(inside)
   }
 
-  /// The path a datagram from `from` to `dest` takes (both the sockets' own ports).
   fn path(&self, from: u16, dest: u16) -> SimPath {
     self
       .pair_paths
@@ -490,13 +448,10 @@ impl SimFabric {
     )
   }
 
-  /// Sends a datagram from socket `from` to address port `dest`: returns the waker word of a receiver to
-  /// wake when it is delivered at once, or schedules (or drops) it per the path.
-  fn send(&mut self, dest: u16, bytes: &[u8], from: u16) -> Option<u64> {
-    let now = self.now_ns();
+  /// Sends a datagram from socket `from` to address port `dest` at `now`: hands it over at once when it
+  /// arrives now, or schedules (or drops) it per the path.
+  fn send(&mut self, now: u64, dest: u16, bytes: Vec<u8>, from: u16) -> Option<Arrival> {
     let wire_from = self.translate_outbound(from, now);
-    // The path is chosen by the two sockets, so a scenario configures it by the ports it bound; a
-    // datagram to a NAT's external port follows the path to the inside port behind it.
     let path_dest = self.external.get(&dest).copied().unwrap_or(dest);
     let path = self.path(from, path_dest);
     if path.mtu.is_some_and(|mtu| bytes.len() > mtu) {
@@ -504,13 +459,12 @@ impl SimFabric {
       return None;
     }
     let mut departure = now;
-    if let Some(SimLinkId(index)) = path.link
-      && let Some(link) = self
-        .links
-        .get_mut(usize::try_from(index).unwrap_or(usize::MAX))
+    if let Some(id) = path.link
+      && let Some(link) = self.links.get_mut(&id)
     {
       let backlog = link.backlog_bytes(now);
-      if backlog.saturating_add(bytes.len() as u64) > link.link.queue_bytes {
+      let size = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+      if backlog.saturating_add(size) > link.link.queue_bytes {
         self.stats.dropped_queue = self.stats.dropped_queue.saturating_add(1);
         return None;
       }
@@ -533,7 +487,7 @@ impl SimFabric {
     }
     self.last_arrival.insert((from, path_dest), arrival);
     if arrival <= now {
-      return self.arrive(dest, bytes.to_vec(), wire_from, now);
+      return self.arrive(dest, bytes, wire_from, now);
     }
     let sequence = self.next_sequence;
     self.next_sequence = self.next_sequence.saturating_add(1);
@@ -541,50 +495,38 @@ impl SimFabric {
       (arrival, sequence),
       InFlight {
         dest,
-        bytes: bytes.to_vec(),
+        bytes,
         from: wire_from,
       },
     );
     None
   }
 
-  /// A datagram reaching address port `dest` at `now`: through a NAT's live mapping to its inside port,
-  /// into the receiver's mailbox within its buffer bound; returns the waker word of a waiting receiver.
-  fn arrive(&mut self, dest: u16, bytes: Vec<u8>, from: u16, now: u64) -> Option<u64> {
+  /// A datagram reaching address port `dest` at `now`: through a NAT's live mapping to its inside port.
+  fn arrive(&mut self, dest: u16, bytes: Vec<u8>, from: u16, now: u64) -> Option<Arrival> {
     let Some(inside) = self.translate_inbound(dest, now) else {
       self.stats.dropped_nat = self.stats.dropped_nat.saturating_add(1);
       return None;
     };
-    let Some(Mailbox { queue, held }) = self.mailboxes.get_mut(&inside) else {
-      // No socket is bound there: the datagram is dropped, as the OS drops one to a closed port.
-      self.stats.dropped_unbound = self.stats.dropped_unbound.saturating_add(1);
-      return None;
-    };
-    if held.saturating_add(bytes.len()) > SIM_RECV_BUFFER_BYTES {
-      self.stats.dropped_receive_buffer = self.stats.dropped_receive_buffer.saturating_add(1);
-      return None;
-    }
-    *held = held.saturating_add(bytes.len());
-    queue.push_back((bytes, from));
-    self.stats.delivered = self.stats.delivered.saturating_add(1);
-    self.interests.remove(&inside)
+    Some(Arrival {
+      port: inside,
+      bytes,
+      from,
+    })
   }
 
-  /// Hands over every in-flight datagram whose arrival is at or before `now`, in arrival order, and
-  /// returns the waker words of the receivers waiting on them.
-  fn deliver_due(&mut self, now: u64) -> Vec<u64> {
-    let mut wakes = Vec::new();
+  /// Hands over every in-flight datagram whose arrival is at or before `now`, in arrival order.
+  fn deliver_due(&mut self, now: u64, out: &mut Vec<Arrival>) {
     while let Some(entry) = self.in_flight.first_entry() {
       if entry.key().0 > now {
         break;
       }
       let arrival = entry.key().0;
       let InFlight { dest, bytes, from } = entry.remove();
-      if let Some(word) = self.arrive(dest, bytes, from, arrival) {
-        wakes.push(word);
+      if let Some(handed) = self.arrive(dest, bytes, from, arrival) {
+        out.push(handed);
       }
     }
-    wakes
   }
 
   /// The earliest arrival still in flight, if any — a deadline the simulation clock may advance to.
@@ -592,134 +534,53 @@ impl SimFabric {
     self.in_flight.keys().next().map(|(arrival, _)| *arrival)
   }
 
-  fn recv(&mut self, port: u16) -> Option<(Vec<u8>, u16)> {
-    let mailbox = self.mailboxes.get_mut(&port)?;
-    let (bytes, from) = mailbox.queue.pop_front()?;
-    mailbox.held = mailbox.held.saturating_sub(bytes.len());
-    Some((bytes, from))
+  fn add_link(&mut self, id: SimLinkId, link: SimLink) {
+    self.links.insert(
+      id,
+      LinkState {
+        link,
+        busy_until_ns: 0,
+      },
+    );
   }
 
-  /// Records one-shot read interest; returns a waker word to wake now if a datagram already waits.
-  fn register(&mut self, port: u16, word: u64) -> Option<u64> {
-    if self
-      .mailboxes
-      .get(&port)
-      .is_some_and(|mailbox| !mailbox.queue.is_empty())
-    {
-      return Some(word);
+  fn apply(&mut self, change: Scenario) {
+    match change {
+      Scenario::Path(path) => self.default_path = path,
+      Scenario::PairPath { from, dest, path } => {
+        self.pair_paths.insert((from, dest), path);
+      }
+      Scenario::AddLink { id, link } => self.add_link(id, link),
+      Scenario::SetLink { id, link } => {
+        if let Some(state) = self.links.get_mut(&id) {
+          state.link = link;
+        }
+      }
+      Scenario::Nat { inside, nat } => {
+        self.nats.insert(inside, NatState { nat, mapping: None });
+      }
+      Scenario::Rebind(inside) => {
+        let old = self
+          .nats
+          .get_mut(&inside)
+          .and_then(|state| state.mapping.take());
+        if let Some((port, _)) = old {
+          self.external.remove(&port);
+        }
+      }
     }
-    self.interests.insert(port, word);
-    None
-  }
-}
-
-thread_local! {
-  static SIM_FABRIC: RefCell<SimFabric> = RefCell::new(SimFabric::new(0));
-}
-
-/// Resets the thread's simulated UDP fabric for a fresh simulation: an empty network on the zero path,
-/// drawing its jitter and loss from `seed`.
-pub(crate) fn sim_fabric_reset(seed: u64) {
-  SIM_FABRIC.with(|f| *f.borrow_mut() = SimFabric::new(seed));
-}
-
-/// Sets the path of every directed pair on this thread's fabric that has no override — the whole
-/// modelled network at one profile. Takes effect for datagrams sent from now on; call it after
-/// `SimRuntime::new` (which resets the fabric) and before the tasks that send.
-pub fn sim_udp_set_path(path: SimPath) {
-  SIM_FABRIC.with(|f| f.borrow_mut().default_path = path);
-}
-
-/// Models every sending host's interface MTU from now on (`None` removes it): a datagram larger than `mtu` is
-/// refused at the send with the OS's too-large code (`RtError::is_message_too_large`), as a real host with
-/// don't-fragment set refuses it — the refusal path MTU discovery reads as "too large here" at no network
-/// cost (RFC 8899 §4.4). An Ethernet host is 1,500.
-pub fn sim_udp_set_interface_mtu(mtu: Option<usize>) {
-  SIM_FABRIC.with(|f| f.borrow_mut().interface_mtu = mtu);
-}
-
-/// Whether a datagram of `bytes` exceeds the modelled interface MTU (the send is then refused).
-pub(crate) fn sim_udp_exceeds_interface(bytes: usize) -> bool {
-  SIM_FABRIC.with(|f| f.borrow().interface_mtu.is_some_and(|mtu| bytes > mtu))
-}
-
-/// Sets the path from socket port `from` to socket port `dest`, overriding the fabric's default for that
-/// directed pair only — a near pair inside a far fleet, an asymmetric route, or one flow's bottleneck.
-pub fn sim_udp_set_pair_path(from: u16, dest: u16, path: SimPath) {
-  SIM_FABRIC.with(|f| {
-    f.borrow_mut().pair_paths.insert((from, dest), path);
-  });
-}
-
-/// Adds a bottleneck link to this thread's fabric; paths name it with [`SimPath::through`].
-pub fn sim_udp_add_link(link: SimLink) -> SimLinkId {
-  SIM_FABRIC.with(|f| {
-    let mut fabric = f.borrow_mut();
-    let id = SimLinkId(u32::try_from(fabric.links.len()).unwrap_or(u32::MAX));
-    fabric.links.push(LinkState {
-      link,
-      busy_until_ns: 0,
-    });
-    id
-  })
-}
-
-/// Changes a link's rate and queue from now on (a path whose capacity drops or recovers mid-run — the
-/// variable-bandwidth case a controller must follow); the backlog already queued drains at the old
-/// timing.
-pub fn sim_udp_set_link(id: SimLinkId, link: SimLink) {
-  SIM_FABRIC.with(|f| {
-    if let Some(state) = f
-      .borrow_mut()
-      .links
-      .get_mut(usize::try_from(id.0).unwrap_or(usize::MAX))
-    {
-      state.link = link;
-    }
-  });
-}
-
-/// Puts a NAT in front of socket port `inside`: its datagrams leave from an external port that expires
-/// after `nat.idle_timeout_ns` without outbound traffic.
-pub fn sim_udp_set_nat(inside: u16, nat: SimNat) {
-  SIM_FABRIC.with(|f| {
-    f.borrow_mut()
-      .nats
-      .insert(inside, NatState { nat, mapping: None });
-  });
-}
-
-/// Expires the NAT mapping in front of `inside` now, so its next datagram leaves from a fresh external
-/// port — an address change at a moment the scenario chooses (a Wi-Fi to cellular move, a NAT reboot).
-pub fn sim_udp_rebind(inside: u16) {
-  SIM_FABRIC.with(|f| {
-    let mut fabric = f.borrow_mut();
-    let old = fabric
-      .nats
-      .get_mut(&inside)
-      .and_then(|state| state.mapping.take());
-    if let Some((port, _)) = old {
-      fabric.external.remove(&port);
-    }
-  });
-}
-
-/// What the fabric has done so far (delivered and dropped datagrams by cause, the peak queue).
-pub fn sim_udp_stats() -> SimFabricStats {
-  SIM_FABRIC.with(|f| f.borrow().stats)
-}
-
-/// Hands over every in-flight datagram due by `now` and wakes the receivers waiting on them.
-fn sim_fabric_deliver_due(now: u64) {
-  let wakes = SIM_FABRIC.with(|f| f.borrow_mut().deliver_due(now));
-  for word in wakes {
-    crate::registry::wake(Encoded::from_word(word));
   }
 }
 
-/// The earliest arrival still in flight on this thread's fabric.
-fn sim_fabric_earliest_arrival() -> Option<u64> {
-  SIM_FABRIC.with(|f| f.borrow().earliest_arrival())
+/// A change to the modelled network a task asks for (applied by the runtime between steps, in order).
+#[derive(Clone, Copy, Debug)]
+enum Scenario {
+  Path(SimPath),
+  PairPath { from: u16, dest: u16, path: SimPath },
+  AddLink { id: SimLinkId, link: SimLink },
+  SetLink { id: SimLinkId, link: SimLink },
+  Nat { inside: u16, nat: SimNat },
+  Rebind(u16),
 }
 
 /// Shape: the receive buffer of a simulated datagram socket — what its mailbox holds before dropping, and
@@ -728,93 +589,342 @@ fn sim_fabric_earliest_arrival() -> Option<u64> {
 /// be on the stricter host.
 pub const SIM_RECV_BUFFER_BYTES: usize = 208 * 1024;
 
-/// Binds a simulated UDP port on this thread's fabric.
-pub fn sim_udp_bind() -> u16 {
-  SIM_FABRIC.with(|f| f.borrow_mut().bind())
+/// How a simulation's sockets are sized (configuration; docs/runtime.md §11).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SimConfig {
+  /// Sockets each shard may have bound at once; past it a bind is refused `Capacity`.
+  pub sockets_per_shard: u16,
 }
 
-/// Sends a simulated datagram along its path: delivered at once on the zero path (a waiting receiver is
-/// woken through the registry), scheduled for its arrival on a delayed one, or dropped as the path says.
-pub fn sim_udp_send(dest: u16, bytes: &[u8], from: u16) {
-  let wake = SIM_FABRIC.with(|f| f.borrow_mut().send(dest, bytes, from));
-  if let Some(word) = wake {
-    crate::registry::wake(Encoded::from_word(word));
+impl Default for SimConfig {
+  /// One socket per simulated host role a test builds (a node's transport, its datagram plane, a client) is
+  /// a handful; sixty-four leaves room for a shard that plays many endpoints. An unbound socket costs a few
+  /// words: its queues hold nothing until it receives or sends.
+  fn default() -> Self {
+    Self {
+      sockets_per_shard: 64,
+    }
   }
 }
 
-/// Receives one simulated datagram, or `None` when the mailbox is empty.
-pub fn sim_udp_recv(port: u16) -> Option<(Vec<u8>, u16)> {
-  SIM_FABRIC.with(|f| f.borrow_mut().recv(port))
+/// One simulated socket's desk side.
+pub(crate) struct SimSocketCell {
+  bound: Cell<bool>,
+  /// The datagrams waiting, moved out and back in whole by each leaf operation (no reference into it
+  /// escapes a call), bounded by `held` against [`SIM_RECV_BUFFER_BYTES`].
+  mailbox: Cell<VecDeque<(Vec<u8>, u16)>>,
+  held: Cell<usize>,
+  read_interest: Cell<Option<Encoded>>,
+  write_interest: Cell<Option<Encoded>>,
+  send_blocked: Cell<bool>,
 }
 
-/// Blocks socket port `port`'s sends from now on: each would block, as on a host whose send buffer is full
-/// (AUD-29-61), until [`sim_udp_release_sends`].
-pub fn sim_udp_block_sends(port: u16) {
-  SIM_FABRIC.with(|f| {
-    f.borrow_mut().send_blocked.insert(port);
-  });
+/// A datagram a simulated socket sent, waiting for the runtime to put it on the fabric.
+pub(crate) struct SimSend {
+  from: u16,
+  dest: u16,
+  bytes: Vec<u8>,
 }
 
-/// Releases socket port `port`'s sends and wakes a sender waiting for its writability.
-pub fn sim_udp_release_sends(port: u16) {
-  let wake = SIM_FABRIC.with(|f| {
-    let mut fabric = f.borrow_mut();
-    fabric.send_blocked.remove(&port);
-    fabric.send_interests.remove(&port)
-  });
-  if let Some(word) = wake {
-    crate::registry::wake(Encoded::from_word(word));
+/// A simulated shard's sockets, on its desk: what its tasks' sockets read and write without reaching the
+/// fabric, which the runtime owns.
+pub(crate) struct SimSockets {
+  port_base: u16,
+  sockets: Box<[SimSocketCell]>,
+  free: CellStack<u16>,
+  /// What the shard's sockets sent since the runtime last drained, and the bytes it holds: bounded by
+  /// every socket's receive buffer at once (DERIVED: no step can usefully send more than the receivers
+  /// could hold), past which a send would block.
+  outbound: Cell<Vec<SimSend>>,
+  outbound_bytes: Cell<usize>,
+  /// The network changes the shard's tasks asked for since the runtime last drained: at most one per
+  /// directed pair of its sockets (DERIVED), past which a change is dropped and counted.
+  scenario: Cell<Vec<Scenario>>,
+  /// The sending host's interface MTU, when one is modelled: a larger send is refused `EMSGSIZE` at once.
+  interface_mtu: Cell<Option<usize>>,
+  /// Links this shard's tasks added, counted so each gets the id the fabric will give it.
+  links_added: Cell<u32>,
+}
+
+impl SimSockets {
+  fn new(port_base: u16, config: SimConfig) -> Self {
+    let count = usize::from(config.sockets_per_shard);
+    Self {
+      port_base,
+      sockets: (0..count)
+        .map(|_| SimSocketCell {
+          bound: Cell::new(false),
+          mailbox: Cell::new(VecDeque::new()),
+          held: Cell::new(0),
+          read_interest: Cell::new(None),
+          write_interest: Cell::new(None),
+          send_blocked: Cell::new(false),
+        })
+        .collect(),
+      free: CellStack::full_of((0..config.sockets_per_shard).rev()),
+      outbound: Cell::new(Vec::new()),
+      outbound_bytes: Cell::new(0),
+      scenario: Cell::new(Vec::new()),
+      interface_mtu: Cell::new(None),
+      links_added: Cell::new(0),
+    }
+  }
+
+  fn socket(&self, index: u16) -> Option<&SimSocketCell> {
+    self.sockets.get(usize::from(index))
+  }
+
+  /// The socket a port names on this shard.
+  fn index_of(&self, port: u16) -> Option<u16> {
+    let index = port.checked_sub(self.port_base)?;
+    (usize::from(index) < self.sockets.len()).then_some(index)
+  }
+
+  /// The port of socket `index`.
+  fn port_of(&self, index: u16) -> u16 {
+    self.port_base.saturating_add(index)
+  }
+
+  /// The bytes every socket's receive buffer holds at once: the send queue's bound.
+  fn outbound_bound(&self) -> usize {
+    self.sockets.len().saturating_mul(SIM_RECV_BUFFER_BYTES)
+  }
+
+  /// One change per directed pair of this shard's sockets: the scenario queue's bound.
+  fn scenario_bound(&self) -> usize {
+    self.sockets.len().saturating_mul(self.sockets.len()).max(1)
+  }
+
+  fn push_scenario(&self, change: Scenario) {
+    let mut queue = self.scenario.take();
+    if queue.len() < self.scenario_bound() {
+      queue.push(change);
+    }
+    self.scenario.set(queue);
   }
 }
 
-/// Whether socket port `port`'s sends are blocked now.
-pub(crate) fn sim_udp_sends_blocked(port: u16) -> bool {
-  SIM_FABRIC.with(|f| f.borrow().send_blocked.contains(&port))
+impl SimSocketCell {
+  fn push(&self, datagram: (Vec<u8>, u16)) {
+    let mut mailbox = self.mailbox.take();
+    mailbox.push_back(datagram);
+    self.mailbox.set(mailbox);
+  }
+
+  fn pop(&self) -> Option<(Vec<u8>, u16)> {
+    let mut mailbox = self.mailbox.take();
+    let datagram = mailbox.pop_front();
+    self.mailbox.set(mailbox);
+    datagram
+  }
+
+  fn is_empty(&self) -> bool {
+    let mailbox = self.mailbox.take();
+    let empty = mailbox.is_empty();
+    self.mailbox.set(mailbox);
+    empty
+  }
 }
 
-/// Registers one-shot write interest, waking now (through the registry) when the port's sends are not
-/// blocked.
-fn sim_udp_register_writable(port: u16, word: u64) {
-  let wake = SIM_FABRIC.with(|f| {
-    let mut fabric = f.borrow_mut();
-    if fabric.send_blocked.contains(&port) {
-      fabric.send_interests.insert(port, word);
-      None
+/// The simulated sockets of the shard running on this thread.
+fn with_sockets<R>(f: impl FnOnce(&ShardContext, &SimSockets) -> R) -> Option<R> {
+  crate::registry::with_current(|desk| desk.sim.as_ref().map(|sockets| f(desk, sockets))).flatten()
+}
+
+/// Binds a simulated socket on the current shard: its index and port.
+pub(crate) fn sim_bind() -> Result<(u16, u16), RtError> {
+  with_sockets(|_, sockets| {
+    let index = sockets.free.pop().ok_or(RtError::Capacity {
+      what: "simulated sockets",
+      bound: sockets.sockets.len(),
+    })?;
+    if let Some(socket) = sockets.socket(index) {
+      socket.bound.set(true);
+      socket.held.set(0);
+      socket.send_blocked.set(false);
+    }
+    Ok((index, sockets.port_of(index)))
+  })
+  .unwrap_or(Err(RtError::NotOnShardThread))
+}
+
+/// Closes a simulated socket: its mailbox emptied and its index given back.
+pub(crate) fn sim_close(index: u16) {
+  let _ = with_sockets(|_, sockets| {
+    let Some(socket) = sockets.socket(index) else {
+      return;
+    };
+    if !socket.bound.replace(false) {
+      return;
+    }
+    drop(socket.mailbox.take());
+    socket.held.set(0);
+    socket.read_interest.set(None);
+    socket.write_interest.set(None);
+    let _ = sockets.free.push(index);
+  });
+}
+
+/// Sends a datagram from simulated socket `index` to port `dest`: the bytes accepted, or `None` when the
+/// scenario blocked the socket's sends (local pressure) or this step's send queue is full.
+pub(crate) fn sim_send(index: u16, dest: u16, bytes: &[u8]) -> Result<Option<usize>, RtError> {
+  with_sockets(|_, sockets| {
+    if sockets.interface_mtu.get().is_some_and(|mtu| bytes.len() > mtu) {
+      return Err(RtError::message_too_large("sendto"));
+    }
+    if sockets.socket(index).is_some_and(|socket| socket.send_blocked.get()) {
+      return Ok(None);
+    }
+    let queued = sockets.outbound_bytes.get();
+    if queued.saturating_add(bytes.len()) > sockets.outbound_bound() {
+      return Ok(None);
+    }
+    let mut outbound = sockets.outbound.take();
+    outbound.push(SimSend {
+      from: sockets.port_of(index),
+      dest,
+      bytes: bytes.to_vec(),
+    });
+    sockets.outbound.set(outbound);
+    sockets.outbound_bytes.set(queued.saturating_add(bytes.len()));
+    Ok(Some(bytes.len()))
+  })
+  .unwrap_or(Err(RtError::NotOnShardThread))
+}
+
+/// Takes one waiting datagram for simulated socket `index` into `buf` (truncated to it): its length and
+/// source port.
+pub(crate) fn sim_recv(index: u16, buf: &mut [u8]) -> Option<(usize, u16)> {
+  with_sockets(|_, sockets| {
+    let socket = sockets.socket(index)?;
+    let (bytes, from) = socket.pop()?;
+    socket.held.set(socket.held.get().saturating_sub(bytes.len()));
+    let n = bytes.len().min(buf.len());
+    if let (Some(into), Some(from_bytes)) = (buf.get_mut(..n), bytes.get(..n)) {
+      into.copy_from_slice(from_bytes);
+    }
+    Some((n, from))
+  })
+  .flatten()
+}
+
+/// Registers one-shot interest in simulated socket `index`: readable when a datagram waits, writable when
+/// its sends are not blocked. Ready now wakes the task at once.
+pub(crate) fn sim_register(index: u16, writable: bool, word: Encoded) -> Result<(), RtError> {
+  with_sockets(|desk, sockets| {
+    let socket = sockets.socket(index).ok_or(RtError::Capacity {
+      what: "simulated sockets",
+      bound: sockets.sockets.len(),
+    })?;
+    let ready = if writable {
+      !socket.send_blocked.get()
     } else {
-      Some(word)
+      !socket.is_empty()
+    };
+    if ready {
+      desk.wake_local(word.slot());
+    } else if writable {
+      socket.write_interest.set(Some(word));
+    } else {
+      socket.read_interest.set(Some(word));
+    }
+    Ok(())
+  })
+  .unwrap_or(Err(RtError::NotOnShardThread))
+}
+
+/// Queues a scenario change on the current shard; the runtime applies it before the next step.
+fn scenario(change: Scenario) {
+  let _ = with_sockets(|_, sockets| sockets.push_scenario(change));
+}
+
+/// Sets the path of every directed pair that has no override, from now on.
+pub fn sim_udp_set_path(path: SimPath) {
+  scenario(Scenario::Path(path));
+}
+
+/// Models every sending host's interface MTU from now on (`None` removes it): a datagram larger than `mtu`
+/// is refused at the send with the OS's too-large code (`RtError::is_message_too_large`), as a real host
+/// with don't-fragment set refuses it (RFC 8899 §4.4). An Ethernet host is 1,500.
+pub fn sim_udp_set_interface_mtu(mtu: Option<usize>) {
+  let _ = with_sockets(|_, sockets| sockets.interface_mtu.set(mtu));
+}
+
+/// Sets the path from socket port `from` to socket port `dest`, overriding the default for that directed
+/// pair only.
+pub fn sim_udp_set_pair_path(from: u16, dest: u16, path: SimPath) {
+  scenario(Scenario::PairPath { from, dest, path });
+}
+
+/// Adds a bottleneck link; paths name it with [`SimPath::through`]. Its id is the adding shard's (its first
+/// port, in the high half) and its count of links so far, so links added on different shards never share
+/// one.
+pub fn sim_udp_add_link(link: SimLink) -> SimLinkId {
+  with_sockets(|_, sockets| {
+    let count = sockets.links_added.get();
+    sockets.links_added.set(count.saturating_add(1));
+    let id = SimLinkId((u32::from(sockets.port_base) << 16) | (count & 0xFFFF));
+    sockets.push_scenario(Scenario::AddLink { id, link });
+    id
+  })
+  .unwrap_or(SimLinkId(u32::MAX))
+}
+
+/// Changes a link's rate and queue from now on.
+pub fn sim_udp_set_link(id: SimLinkId, link: SimLink) {
+  scenario(Scenario::SetLink { id, link });
+}
+
+/// Puts a NAT in front of socket port `inside`.
+pub fn sim_udp_set_nat(inside: u16, nat: SimNat) {
+  scenario(Scenario::Nat { inside, nat });
+}
+
+/// Expires the NAT mapping in front of `inside` now, so its next datagram leaves from a fresh external port.
+pub fn sim_udp_rebind(inside: u16) {
+  scenario(Scenario::Rebind(inside));
+}
+
+/// Blocks socket port `port`'s sends from now on (local send pressure, AUD-29-61), until
+/// [`sim_udp_release_sends`]. The port must be one of the current shard's.
+pub fn sim_udp_block_sends(port: u16) {
+  let _ = with_sockets(|_, sockets| {
+    if let Some(socket) = sockets.index_of(port).and_then(|index| sockets.socket(index)) {
+      socket.send_blocked.set(true);
     }
   });
-  if let Some(word) = wake {
-    crate::registry::wake(Encoded::from_word(word));
-  }
 }
 
-/// Registers one-shot read interest, waking now (through the registry) if a datagram already waits.
-pub fn sim_udp_register(port: u16, word: u64) {
-  let wake = SIM_FABRIC.with(|f| f.borrow_mut().register(port, word));
-  if let Some(word) = wake {
-    crate::registry::wake(Encoded::from_word(word));
-  }
+/// Releases socket port `port`'s sends and wakes a sender waiting for its writability. The port must be
+/// one of the current shard's.
+pub fn sim_udp_release_sends(port: u16) {
+  let _ = with_sockets(|desk, sockets| {
+    if let Some(socket) = sockets.index_of(port).and_then(|index| sockets.socket(index)) {
+      socket.send_blocked.set(false);
+      if let Some(word) = socket.write_interest.take() {
+        desk.wake_local(word.slot());
+      }
+    }
+  });
 }
 
-/// The state a simulated driver shares with its kick and the simulation clock.
+/// The state a simulated driver shares with its kick and the simulation clock: the shard's own, owned by
+/// its registry slot.
 #[derive(Debug)]
 pub struct SimShared {
   now_ns: AtomicU64,
   kicked: AtomicBool,
   requested_deadline: AtomicU64,
-  rng_state: AtomicU64,
   kill_at_wait: AtomicU64,
   waits: AtomicU64,
 }
 
 impl SimShared {
-  fn new(seed: u64) -> Self {
+  fn new() -> Self {
     Self {
       now_ns: AtomicU64::new(0),
       kicked: AtomicBool::new(false),
       requested_deadline: AtomicU64::new(NO_DEADLINE),
-      rng_state: AtomicU64::new(Xorshift::new(seed).next_u64()),
       kill_at_wait: AtomicU64::new(NO_DEADLINE),
       waits: AtomicU64::new(0),
     }
@@ -830,14 +940,6 @@ impl SimShared {
     self.now_ns.load(Ordering::Acquire)
   }
 
-  /// The next pseudo-random word from the simulation's seeded generator.
-  pub fn next_random(&self) -> u64 {
-    let mut rng = Xorshift::new(self.rng_state.load(Ordering::Acquire));
-    let value = rng.next_u64();
-    self.rng_state.store(value, Ordering::Release);
-    value
-  }
-
   fn requested_deadline(&self) -> Option<u64> {
     match self.requested_deadline.load(Ordering::Acquire) {
       NO_DEADLINE => None,
@@ -846,12 +948,11 @@ impl SimShared {
   }
 }
 
-/// The simulation driver of one shard.
+/// The simulation driver of one shard: virtual time and kicks as flags, never blocking.
 #[derive(Debug)]
 pub struct SimDriver {
   kick: Kick,
   shared: &'static SimShared,
-  clock: &'static SimShared,
   nops: Vec<u64>,
 }
 
@@ -865,11 +966,19 @@ impl Driver for SimDriver {
   }
 
   fn now_ns(&self) -> u64 {
-    self.clock.now_ns()
+    self.shared.now_ns()
+  }
+
+  fn clock(&self) -> crate::driver::Clock {
+    crate::driver::Clock::Sim(self.shared)
   }
 
   fn wait(&mut self, timeout_ns: Option<u64>, out: &mut Vec<Completion>) -> Result<(), RtError> {
-    let waits = self.shared.waits.fetch_add(1, Ordering::AcqRel) + 1;
+    let waits = self
+      .shared
+      .waits
+      .fetch_add(1, Ordering::AcqRel)
+      .saturating_add(1);
     if waits >= self.shared.kill_at_wait.load(Ordering::Acquire) {
       return Err(RtError::DriverLost);
     }
@@ -884,8 +993,8 @@ impl Driver for SimDriver {
         .store(NO_DEADLINE, Ordering::Release);
       return Ok(());
     }
-    // Nothing to deliver: record the deadline for the simulation clock and return without
-    // blocking; the runtime advances time when every shard is idle.
+    // Nothing to deliver: record the deadline for the simulation clock and return without blocking; the
+    // runtime advances time when every shard is idle.
     let deadline = timeout_ns.map_or(NO_DEADLINE, |t| self.now_ns().saturating_add(t));
     self
       .shared
@@ -899,26 +1008,19 @@ impl Driver for SimDriver {
     Ok(())
   }
 
-  fn register_readable(&mut self, raw: i32, user_data: u64) -> Result<(), RtError> {
-    // The simulated UDP fabric (§4.10a): the raw handle is a sim port; interest is recorded there and
-    // woken through the registry when a datagram arrives — the same wake path a real completion takes.
-    let port = u16::try_from(raw).map_err(|_| RtError::DriverRefused {
-      call: "register_readable",
+  fn register_readable(&mut self, _raw: i32, _user_data: u64) -> Result<(), RtError> {
+    // Simulated sockets register their interest on the desk (`sim_register`); no OS handle exists here.
+    Err(RtError::DriverRefused {
+      call: "register_readable on the simulation driver",
       code: None,
-    })?;
-    sim_udp_register(port, user_data);
-    Ok(())
+    })
   }
 
-  fn register_writable(&mut self, raw: i32, user_data: u64) -> Result<(), RtError> {
-    // The simulated fabric's sends block only where a scenario blocked them (local send pressure,
-    // AUD-29-61); write interest then waits for the scenario's release, and is ready at once otherwise.
-    let port = u16::try_from(raw).map_err(|_| RtError::DriverRefused {
-      call: "register_writable",
+  fn register_writable(&mut self, _raw: i32, _user_data: u64) -> Result<(), RtError> {
+    Err(RtError::DriverRefused {
+      call: "register_writable on the simulation driver",
       code: None,
-    })?;
-    sim_udp_register_writable(port, user_data);
-    Ok(())
+    })
   }
 
   fn has_pending(&self) -> bool {
@@ -930,20 +1032,22 @@ impl Driver for SimDriver {
   }
 }
 
-/// A set of simulated shards on the calling thread.
+/// One simulated shard: the shard, its flags, and the guard that gives its registry slot back after it.
+struct SimShard {
+  /// Declared before `slot`: dropped while the slot (and the flags the driver borrows) still exists.
+  shard: Shard,
+  shared: &'static SimShared,
+  /// Gives the slot back when dropped, after `shard`.
+  _slot: crate::runtime::SlotGuard,
+}
+
+/// A set of simulated shards on the calling thread, with the network between them.
 pub struct SimRuntime {
-  shards: Vec<&'static ShardContext>,
-  /// The simulation clock's allocation — read here ([`SimRuntime::clock`]) and borrowed by the drivers for
-  /// the life of their contexts — owned here as a raw pointer and freed in `Drop` after every context is
-  /// reclaimed. A raw pointer, not a `Box`: moving a `Box` (into this struct, or this struct out of
-  /// `new`) is a unique retag of its allocation under Stacked Borrows, which invalidated the shared
-  /// borrows the drivers already held — Miri caught the drivers' next `now_ns` reading through a tag
-  /// no longer on the borrow stack (2026-09-16; `-p slates-rt --test differential`). And no reference to it
-  /// is a field: a runtime passed by value (`drop(sim)`) has its reference fields protected for the call, and
-  /// freeing their target inside it is undefined behaviour — Miri caught the old `clock: &'static` field so
-  /// (2026-09-30; `-p slates-rt --test ownership`).
-  clock_allocation: std::ptr::NonNull<SimShared>,
-  shared: Vec<&'static SimShared>,
+  shards: Vec<SimShard>,
+  fabric: SimFabric,
+  now_ns: u64,
+  arrivals: Vec<Arrival>,
+  links_added: u32,
 }
 
 impl std::fmt::Debug for SimRuntime {
@@ -954,59 +1058,29 @@ impl std::fmt::Debug for SimRuntime {
   }
 }
 
-impl Drop for SimRuntime {
-  /// The simulation's shards were built and stepped on this thread; every `run_until_*` returned
-  /// before this drop. Each context is freed (`reclaim_context`, which also clears the thread's
-  /// current-context cell a bare step left pointing at it) and its slot given back — before this, a
-  /// simulation reclaimed nothing (its slots were never unregistered, so a test binary spent one of
-  /// the registry's slots per simulation for good). The per-shard flags are the slots' own (a retired
-  /// entry is reclaimed after the last counted kick borrow), and the clock is this runtime's
-  /// allocation, dropped after the contexts.
-  fn drop(&mut self) {
-    let ids: Vec<_> = self.shards.iter().map(|context| context.id).collect();
-    for ctx in &self.shards {
-      crate::registry::note_arena_generation(ctx.id, ctx.arena_generation_high());
-      crate::registry::reclaim_context(ctx.id);
-    }
-    // Cancellation can wake another shard. Keep every pair ring until all contexts ended.
-    for id in ids {
-      crate::registry::unregister(id);
-    }
-    // SAFETY: the allocation was made by `Box::new` in `new` and is freed exactly once, here, after
-    // every context — and so every driver holding a `&'static` into it — was reclaimed above; no field
-    // holds a reference into it, and nothing reads the clock after this.
-    unsafe { drop(Box::from_raw(self.clock_allocation.as_ptr())) };
-  }
-}
-
 impl SimRuntime {
-  /// The simulation clock, lent for this runtime's borrow.
-  fn clock(&self) -> &SimShared {
-    // SAFETY: the allocation lives from `new` until this runtime's `Drop` frees it, and the returned borrow
-    // is bounded by `&self`, so it ends before the drop; the allocation is never moved through a `Box`.
-    unsafe { self.clock_allocation.as_ref() }
+  /// Builds `config.shards` simulated shards sharing one clock and one fabric seeded by `seed`, each with
+  /// the default socket table ([`SimConfig`]).
+  pub fn new(config: &RuntimeConfig, seed: u64) -> Result<SimRuntime, RtError> {
+    Self::with(config, seed, SimConfig::default())
   }
 
-  /// Builds `config.shards` simulated shards sharing one clock seeded by `seed`.
-  pub fn new(config: &RuntimeConfig, seed: u64) -> Result<SimRuntime, RtError> {
-    let clock_allocation = std::ptr::NonNull::from(Box::leak(Box::new(SimShared::new(seed))));
-    // SAFETY: the allocation lives until this runtime's `Drop` frees it, after every context (and so
-    // every driver borrowing it) was reclaimed, so no driver outlives the clock; and it is never moved
-    // through a `Box` again — the pointer is what the struct holds — so no unique retag invalidates
-    // these shared borrows while they are live. Before 2026-09-14 the clock was leaked per simulation;
-    // from then until 2026-09-16 it was a `Box` field, whose move invalidated the borrows (Miri).
-    let clock: &'static SimShared = unsafe { clock_allocation.as_ref() };
-    // A fresh simulation starts with an empty UDP fabric on this thread.
-    sim_fabric_reset(seed);
-    let mut seeds = Vec::new();
-    let mut shared = Vec::new();
-    for _ in 0..config.shards {
-      // The driver takes its flags from the kick the slot minted over them (the flags are the slot's,
-      // so a stale waker may still kick them after this simulation ends; see `registry::Entry`).
+  /// Builds the simulation with `sim` sizing its sockets.
+  pub fn with(config: &RuntimeConfig, seed: u64, sim: SimConfig) -> Result<SimRuntime, RtError> {
+    let per_shard = sim.sockets_per_shard;
+    let mut shards = Vec::new();
+    for index in 0..config.shards {
+      // Ports start at 1 so 0 stays the "unspecified" address; each shard's sockets take the next range.
+      let port_base = u16::try_from(
+        usize::from(index)
+          .saturating_mul(usize::from(per_shard))
+          .saturating_add(1),
+      )
+      .map_err(|_| RtError::BadConfig {
+        what: "simulated ports past the 16-bit port space",
+      })?;
       let driver: DriverSeed = Box::new(move |kick| match kick {
         Kick::Sim(holder) => {
-          // The owning thread borrows the entry until its context is reclaimed. Foreign
-          // kicks carry only the holder and borrow under the registry's reader pin.
           let flags = crate::registry::entry(holder.shard())
             .and_then(|entry| entry.sim_shared.as_deref())
             .ok_or(RtError::ShardGone {
@@ -1015,7 +1089,6 @@ impl SimRuntime {
           Ok(Box::new(SimDriver {
             kick,
             shared: flags,
-            clock,
             nops: Vec::new(),
           }) as Box<dyn Driver>)
         }
@@ -1024,39 +1097,47 @@ impl SimRuntime {
           code: None,
         }),
       });
-      let registered = ShardSeed::register(
+      let seed = ShardSeed::register(
         config,
         driver,
-        crate::registry::RegisterKick::Sim(Box::new(SimShared::new(seed))),
+        crate::registry::RegisterKick::Sim(Box::new(SimShared::new())),
       )?;
-      let flags = crate::registry::entry(registered.id)
+      let id = seed.id;
+      let slot = crate::runtime::SlotGuard::new(id);
+      let shared = crate::registry::entry(id)
         .and_then(|entry| entry.sim_shared.as_deref())
-        .ok_or(RtError::ShardGone {
-          shard: registered.id,
-        })?;
-      shared.push(flags);
-      seeds.push(registered);
+        .ok_or(RtError::ShardGone { shard: id })?;
+      let mut shard = Shard::build(seed)?;
+      shard.attach_sim(SimSockets::new(port_base, sim));
+      shards.push(SimShard {
+        shard,
+        shared,
+        _slot: slot,
+      });
     }
-    crate::runtime::connect_pairs(&mut seeds)?;
-    let shards = seeds
-      .into_iter()
-      .map(ShardContext::build)
-      .collect::<Result<Vec<_>, _>>()?;
+    let first_external = u16::try_from(
+      usize::from(config.shards)
+        .saturating_mul(usize::from(per_shard))
+        .saturating_add(1),
+    )
+    .unwrap_or(u16::MAX);
     Ok(SimRuntime {
       shards,
-      clock_allocation,
-      shared,
+      fabric: SimFabric::new(seed, first_external),
+      now_ns: 0,
+      arrivals: Vec::new(),
+      links_added: 0,
     })
   }
 
   /// The shard ids, in order.
   pub fn shard_ids(&self) -> Vec<ShardId> {
-    self.shards.iter().map(|s| ShardId(s.id)).collect()
+    self.shards.iter().map(|s| s.shard.id()).collect()
   }
 
   /// Virtual now.
   pub fn now_ns(&self) -> u64 {
-    self.clock().now_ns()
+    self.now_ns
   }
 
   /// Spawns a detached task on a shard.
@@ -1065,93 +1146,221 @@ impl SimRuntime {
     shard: ShardId,
     future: impl std::future::Future<Output = ()> + Send + 'static,
   ) -> Result<TaskId, RtError> {
-    let ctx = self.context(shard)?;
-    ctx.spawn_request(SpawnRequest::new(Box::pin(future), None))
+    self
+      .shard_mut(shard)?
+      .shard
+      .spawn_request(SpawnRequest::new(Box::pin(future), None))
+  }
+
+  /// Keeps `value` for a shard's life and hands back its handle.
+  pub fn keep<T: 'static>(&mut self, shard: ShardId, value: T) -> Result<Kept<T>, RtError> {
+    self.shard_mut(shard)?.shard.keep(value)
   }
 
   /// Makes a shard's driver fail at its `nth` wait from now (1 = the very next one).
   pub fn kill_driver(&mut self, shard: ShardId, nth: u64) -> Result<(), RtError> {
-    let index = self.index_of(shard)?;
-    let shared = self.shared[index];
+    let shared = self.shard_mut(shard)?.shared;
     shared.kill_at_wait.store(
-      shared.waits.load(Ordering::Acquire) + nth,
+      shared.waits.load(Ordering::Acquire).saturating_add(nth),
       Ordering::Release,
     );
     Ok(())
   }
 
-  /// Steps every shard until none has work, advancing virtual time to the earliest deadline —
-  /// a shard's timer or a datagram's arrival on the fabric — whenever all are idle. Datagrams due by
-  /// the current time are handed over (and their receivers woken) before each pass, so a delayed
-  /// datagram is received exactly at its arrival time. Returns the number of steps taken.
+  /// Steps every shard until none has work, advancing virtual time to the earliest deadline — a shard's
+  /// timer or a datagram's arrival — whenever all are idle. What the shards sent is put on the fabric after
+  /// each shard's step, and datagrams due by the current time are handed over (and their receivers woken)
+  /// before each pass. Returns the number of steps taken.
   pub fn run_until_idle(&mut self) -> u64 {
     let mut steps = 0u64;
     loop {
-      sim_fabric_deliver_due(self.clock().now_ns());
+      self.pump();
       let mut any_work = false;
       let mut earliest: Option<u64> = None;
       for index in 0..self.shards.len() {
-        let ctx = self.shards[index];
-        if ctx.exited() {
+        let Some(sim_shard) = self.shards.get_mut(index) else {
+          continue;
+        };
+        if sim_shard.shard.exited() {
           continue;
         }
-        let outcome: StepOutcome = ctx.step();
-        steps += 1;
+        let outcome: StepOutcome = sim_shard.shard.step();
+        steps = steps.saturating_add(1);
         if outcome.did_work {
           any_work = true;
-          continue;
+        } else {
+          sim_shard.shard.park(outcome.next_deadline_ns);
+          if let Some(deadline) = sim_shard.shared.requested_deadline() {
+            earliest = Some(earliest.map_or(deadline, |e| e.min(deadline)));
+          }
+          if sim_shard.shared.kicked.load(Ordering::Acquire) {
+            any_work = true;
+          }
         }
-        ctx.park(outcome.next_deadline_ns);
-        let shared = self.shared[index];
-        if let Some(deadline) = shared.requested_deadline() {
-          earliest = Some(earliest.map_or(deadline, |e| e.min(deadline)));
-        }
-        if shared.kicked.load(Ordering::Acquire) {
+        if self.pump() {
           any_work = true;
         }
       }
       if any_work {
         continue;
       }
-      // A datagram in flight is a pending event too: the clock may advance to its arrival.
-      if let Some(arrival) = sim_fabric_earliest_arrival() {
+      if let Some(arrival) = self.fabric.earliest_arrival() {
         earliest = Some(earliest.map_or(arrival, |e| e.min(arrival)));
       }
       match earliest {
-        Some(deadline) => {
-          if deadline > self.clock().now_ns() {
-            self.clock().now_ns.store(deadline, Ordering::Release);
-          }
-        }
+        Some(deadline) if deadline > self.now_ns => self.set_clock(deadline),
+        Some(_) => {}
         None => break,
       }
     }
     steps
   }
 
+  /// Moves what the shards asked of the network onto the fabric and hands over what is due; true when a
+  /// receiver was woken.
+  fn pump(&mut self) -> bool {
+    let now = self.now_ns;
+    let mut arrivals = std::mem::take(&mut self.arrivals);
+    for sim_shard in &self.shards {
+      let Some(sockets) = sim_shard.shard.context().sim.as_ref() else {
+        continue;
+      };
+      let mut changes = sockets.scenario.take();
+      for change in changes.drain(..) {
+        self.fabric.apply(change);
+      }
+      sockets.scenario.set(changes);
+      let mut sends = sockets.outbound.take();
+      sockets.outbound_bytes.set(0);
+      for send in sends.drain(..) {
+        if let Some(arrival) = self.fabric.send(now, send.dest, send.bytes, send.from) {
+          arrivals.push(arrival);
+        }
+      }
+      sockets.outbound.set(sends);
+    }
+    self.fabric.deliver_due(now, &mut arrivals);
+    let mut woke = false;
+    for arrival in arrivals.drain(..) {
+      woke |= self.deliver(arrival);
+    }
+    self.arrivals = arrivals;
+    woke
+  }
+
+  /// Puts an arrival in its socket's mailbox within its bounds and wakes a waiting receiver.
+  fn deliver(&mut self, arrival: Arrival) -> bool {
+    let Arrival { port, bytes, from } = arrival;
+    let target = self.shards.iter().find_map(|sim_shard| {
+      let desk = sim_shard.shard.context();
+      let sockets = desk.sim.as_ref()?;
+      let socket = sockets.socket(sockets.index_of(port)?)?;
+      Some((desk, socket))
+    });
+    let Some((desk, socket)) = target.filter(|(_, socket)| socket.bound.get()) else {
+      self.fabric.stats.dropped_unbound = self.fabric.stats.dropped_unbound.saturating_add(1);
+      return false;
+    };
+    let held = socket.held.get();
+    if held.saturating_add(bytes.len()) > SIM_RECV_BUFFER_BYTES {
+      self.fabric.stats.dropped_receive_buffer = self.fabric.stats.dropped_receive_buffer.saturating_add(1);
+      return false;
+    }
+    socket.held.set(held.saturating_add(bytes.len()));
+    socket.push((bytes, from));
+    self.fabric.stats.delivered = self.fabric.stats.delivered.saturating_add(1);
+    match socket.read_interest.take() {
+      Some(word) => {
+        desk.wake_local(word.slot());
+        true
+      }
+      None => false,
+    }
+  }
+
+  fn set_clock(&mut self, now_ns: u64) {
+    self.now_ns = now_ns;
+    for sim_shard in &self.shards {
+      sim_shard.shared.now_ns.store(now_ns, Ordering::Release);
+    }
+  }
+
   /// Advances the clock by `ns` without running anything (a pause in the story).
   pub fn advance(&mut self, ns: u64) {
-    let clock = self.clock();
-    clock
-      .now_ns
-      .store(clock.now_ns().saturating_add(ns), Ordering::Release);
+    self.set_clock(self.now_ns.saturating_add(ns));
   }
 
-  /// A shard's context, for counters and joins in tests.
+  /// A shard's desk, for reads in tests.
   pub fn context(&self, shard: ShardId) -> Result<&ShardContext, RtError> {
-    let index = self.index_of(shard)?;
-    self
-      .shards
-      .get(index)
-      .copied()
-      .ok_or(RtError::NotOnShardThread)
+    Ok(self.shard_ref(shard)?.shard.context())
   }
 
-  fn index_of(&self, shard: ShardId) -> Result<usize, RtError> {
+  /// A shard's counters.
+  pub fn counters(&self, shard: ShardId) -> Result<Counters, RtError> {
+    Ok(self.shard_ref(shard)?.shard.counters())
+  }
+
+  /// One step of a shard without blocking.
+  pub fn step(&mut self, shard: ShardId) -> Result<StepOutcome, RtError> {
+    Ok(self.shard_mut(shard)?.shard.step())
+  }
+
+  /// Whether a shard left its loop.
+  pub fn exited(&self, shard: ShardId) -> Result<bool, RtError> {
+    Ok(self.shard_ref(shard)?.shard.exited())
+  }
+
+  /// Live tasks on a shard.
+  pub fn live_tasks(&self, shard: ShardId) -> Result<usize, RtError> {
+    Ok(self.shard_ref(shard)?.shard.live_tasks())
+  }
+
+  /// What the fabric has done so far.
+  pub fn stats(&self) -> SimFabricStats {
+    self.fabric.stats
+  }
+
+  /// Sets the path of every directed pair that has no override, from now on.
+  pub fn set_path(&mut self, path: SimPath) {
+    self.fabric.apply(Scenario::Path(path));
+  }
+
+  /// Sets one directed pair's path.
+  pub fn set_pair_path(&mut self, from: u16, dest: u16, path: SimPath) {
+    self.fabric.apply(Scenario::PairPath { from, dest, path });
+  }
+
+  /// Adds a bottleneck link from the test's thread: ids above every shard's (port 0 is no shard's, so its
+  /// high half is free), counted from zero.
+  pub fn add_link(&mut self, link: SimLink) -> SimLinkId {
+    let id = SimLinkId(self.links_added);
+    self.links_added = self.links_added.saturating_add(1);
+    self.fabric.add_link(id, link);
+    id
+  }
+
+  /// Models every shard's interface MTU from now on.
+  pub fn set_interface_mtu(&mut self, mtu: Option<usize>) {
+    for sim_shard in &self.shards {
+      if let Some(sockets) = sim_shard.shard.context().sim.as_ref() {
+        sockets.interface_mtu.set(mtu);
+      }
+    }
+  }
+
+  fn shard_ref(&self, shard: ShardId) -> Result<&SimShard, RtError> {
     self
       .shards
       .iter()
-      .position(|c| c.id == shard.0)
+      .find(|s| s.shard.id() == shard)
+      .ok_or(RtError::NotOnShardThread)
+  }
+
+  fn shard_mut(&mut self, shard: ShardId) -> Result<&mut SimShard, RtError> {
+    self
+      .shards
+      .iter_mut()
+      .find(|s| s.shard.id() == shard)
       .ok_or(RtError::NotOnShardThread)
   }
 }

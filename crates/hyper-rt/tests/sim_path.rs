@@ -15,7 +15,7 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use hyper_rt::runtime::RuntimeConfig;
 use hyper_rt::sim::{
   PPM, SimFabricStats, SimLink, SimLoss, SimNat, SimPath, SimRuntime, sim_udp_add_link,
-  sim_udp_set_nat, sim_udp_set_pair_path, sim_udp_stats,
+  sim_udp_set_nat, sim_udp_set_pair_path,
 };
 use hyper_rt::udp::{Ipv4Addr, SocketAddrV4, UdpSocket};
 
@@ -24,6 +24,7 @@ fn config() -> RuntimeConfig {
     shards: 1,
     tasks_per_shard: 64,
     timers_per_shard: 64,
+    interests_per_shard: 64,
     ring_entries: 64,
     step_budget_ns: 1_000_000_000,
     timer_tick_ns: 1_000,
@@ -123,7 +124,7 @@ fn spawn_sender(
 /// Runs the simulation to rest and collects what the receiver saw, with the fabric's counters.
 fn finish(sim: &mut SimRuntime, arrivals: &Receiver<Arrival>) -> (Vec<Arrival>, SimFabricStats) {
   sim.run_until_idle();
-  (arrivals.try_iter().collect(), sim_udp_stats())
+  (arrivals.try_iter().collect(), sim.stats())
 }
 
 /// A receiver's port once its task has run far enough to bind.
@@ -417,7 +418,7 @@ fn a_nat_mapping_expires_and_the_next_datagram_rebinds() {
     .expect("the inside socket was answered");
   assert_eq!(answered, 11, "only the answer to the live mapping arrived");
   assert_eq!(
-    sim_udp_stats().dropped_nat,
+    sim.stats().dropped_nat,
     1,
     "the stale mapping's answer was dropped"
   );

@@ -16,6 +16,7 @@ fn config() -> RuntimeConfig {
     shards: 1,
     tasks_per_shard: 64,
     timers_per_shard: 64,
+    interests_per_shard: 64,
     ring_entries: 64,
     step_budget_ns: 1_000_000_000,
     timer_tick_ns: 100_000,
@@ -74,16 +75,15 @@ async fn program(log: Sender<String>) {
 
 fn run_on_os() -> Vec<String> {
   let (tx, rx) = channel();
-  let rt = LocalRuntime::new(&config()).unwrap();
+  let mut rt = LocalRuntime::new(&config()).unwrap();
   let root = rt.spawn(program(tx)).unwrap();
   rt.run_until_idle();
-  let counters = rt.context().counters();
+  let counters = rt.counters();
   assert_eq!(
     counters.completed, 4,
     "root, c1, c2 and c3 complete; {counters:?}"
   );
   assert_eq!(counters.cancelled, 1, "{counters:?}");
-  assert_eq!(counters.nested_borrows, 0, "{counters:?}");
   rt.context().detach(root).unwrap();
   rx.try_iter().collect()
 }
@@ -94,7 +94,7 @@ fn run_on_sim() -> Vec<String> {
   let shard = sim.shard_ids()[0];
   sim.spawn_on(shard, program(tx)).unwrap();
   sim.run_until_idle();
-  let counters = sim.context(shard).unwrap().counters();
+  let counters = sim.counters(shard).unwrap();
   assert_eq!(
     counters.completed, 4,
     "root, c1, c2 and c3 complete; {counters:?}"
@@ -144,13 +144,12 @@ fn a_lost_driver_cancels_every_task_with_a_terminal_completion() {
   }
   sim.kill_driver(shard, 1).unwrap();
   sim.run_until_idle();
-  let ctx = sim.context(shard).unwrap();
-  assert!(ctx.exited());
-  let c = ctx.counters();
+  assert!(sim.exited(shard).unwrap());
+  let c = sim.counters(shard).unwrap();
   assert_eq!(c.driver_lost, 1, "{c:?}");
   assert_eq!(c.cancelled, 5, "{c:?}");
   assert_eq!(c.completed, 0, "{c:?}");
-  assert_eq!(ctx.live_tasks(), 0);
+  assert_eq!(sim.live_tasks(shard).unwrap(), 0);
   assert_eq!(rx.try_iter().count(), 0, "no task ran to completion");
 }
 
@@ -173,11 +172,10 @@ fn a_parent_finishing_cancels_and_joins_its_children() {
     })
     .unwrap();
   sim.run_until_idle();
-  let ctx = sim.context(shard).unwrap();
-  let c = ctx.counters();
+  let c = sim.counters(shard).unwrap();
   assert_eq!(c.completed, 1, "{c:?}");
   assert_eq!(c.cancelled, 3, "{c:?}");
-  assert_eq!(ctx.live_tasks(), 0, "every slot reaped");
+  assert_eq!(sim.live_tasks(shard).unwrap(), 0, "every slot reaped");
   assert_eq!(rx.try_iter().collect::<Vec<_>>(), vec!["parent done"]);
 }
 
@@ -186,7 +184,7 @@ fn a_parent_finishing_cancels_and_joins_its_children() {
 fn admission_is_refused_at_the_arena_bound_never_silently() {
   let mut cfg = config();
   cfg.tasks_per_shard = 2;
-  let rt = LocalRuntime::new(&cfg).unwrap();
+  let mut rt = LocalRuntime::new(&cfg).unwrap();
   rt.spawn(async {}).unwrap();
   rt.spawn(async {}).unwrap();
   assert!(matches!(
@@ -194,5 +192,5 @@ fn admission_is_refused_at_the_arena_bound_never_silently() {
     Err(hyper_rt::RtError::TooManyTasks { capacity: 2 })
   ));
   rt.run_until_idle();
-  assert_eq!(rt.context().counters().admission_refused, 1);
+  assert_eq!(rt.counters().admission_refused, 1);
 }

@@ -1,41 +1,28 @@
-//! The process-wide shard registry: how a wake finds its target (§4.3, "wake from another shard
-//! enqueues (slot, generation) on the target's ring and kicks the driver").
+//! The process-wide shard registry: how a wake finds its target (slates §4.3; docs/runtime.md §3.2).
 //!
-//! Each shard registers into one of [`MAX_SHARDS`] **slots** and gives it back when its runtime
-//! shuts down: a slot holds the shard's multi-producer wake ring (for foreign threads), the sending
-//! end of its control channel, its kick, its parking word and its pulse, plus a `generation` word
-//! that is **even while live and odd while free**. The slot's memory is process-static and is never
-//! freed, so a waker that outlives its shard reads a live-or-free word, never freed memory; what a
-//! stale waker finds is either a free slot (its wake is dropped and counted) or a *new* shard that
-//! reused the slot (its wake is delivered and refused by that shard's task arena, whose generations
-//! continue from where the old shard's ended — [`Slot::generation_base`] — so a stale word can
-//! never name a live task). The kick descriptor is owned by the slot and closed at unregistration,
-//! so a process that starts runtimes repeatedly holds exactly the descriptors of its live shards.
-//! Before 2026-09-14 every registration leaked its entry, its descriptor and its context for the
-//! process lifetime ("one runtime in production"), which filled the table at the 895th shard of a
-//! test process and leaked two descriptors per shard
-//! (`docs/bugs/2026-09-14-shard-registry-leaks-every-slot-for-the-process-lifetime.md`). The
-//! context — the task arena, run queue and timer wheel sized to the shard's task budget — is owned
-//! by the slot from its build and freed by its own thread when its loop ends ([`reclaim_context`]);
-//! it needs no retirement because nothing foreign ever dereferences it.
+//! Each shard registers into one of [`MAX_SHARDS`] **slots** and gives it back when its runtime shuts
+//! down: a slot holds the shard's wake bitmap (for wakes from other threads), the sending end of its
+//! control channel, its kick, its parking word and its pulse, plus a `generation` word that is **even
+//! while live and odd while free**. The slot's memory is process-static and never freed, so a waker that
+//! outlives its shard reads a live-or-free word, never freed memory: a wake to a free slot is dropped and
+//! counted, and one to a slot a later shard reused wakes a task of that shard spuriously at most, which
+//! every future tolerates. The kick descriptor is owned by the slot and closed at unregistration.
 //!
 //! Registration takes the lowest free slot under one atomic exchange on the slot's generation
 //! (free → claimed), so concurrent runtimes never share a slot; lookup is one `Acquire` load of the
-//! generation and a parity check. Shard-to-shard wakes take the single-producer ring of the
-//! (source, target) pair, which the current shard's thread-local context holds, and never a
-//! compare-and-swap.
+//! generation and a parity check.
 //!
-//! Routing: on the owning shard's thread the wake goes straight to the local queue; on another
-//! shard's thread it goes to that pair's ring and kicks; on a foreign thread it goes to the
-//! target's multi-producer ring and kicks. A full ring spins until the consumer drains it, and
-//! counts the event: a wake to a live shard is never dropped.
+//! Routing: on the owning shard's thread, inside a step, a wake goes straight to the desk's run queue;
+//! from anywhere else it sets the task's bit in the target's wake bitmap and kicks the target only if it
+//! is parked. No wake ever waits: the bitmap holds every slot (slates' rings made a sender spin while a
+//! ring was full).
 #![allow(unsafe_code)]
 
 use std::cell::Cell;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering, fence};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
 
-use crate::mem::{Encoded, MpscRing};
+use crate::mem::Encoded;
 
 use crate::control::Control;
 use crate::driver::Kick;
@@ -44,6 +31,7 @@ use crate::driver::KickFd;
 use crate::error::RtError;
 use crate::parking::Parking;
 use crate::shard::ShardContext;
+use crate::wakes::WakeBitmap;
 
 /// Shape: the bound on shard ids per process: more than any host's core count, few enough that
 /// the registry is a small static table and a packed word's top bits stay free.
@@ -59,8 +47,8 @@ pub const MAX_SHARDS: usize = crate::waker::MAX_SHARDS_32;
 pub struct Entry {
   /// The registration that owns this entry; checked under the reader pin.
   holder: SlotHolder,
-  /// The wake ring foreign threads push to.
-  pub inbound: MpscRing,
+  /// The wakes other threads send this shard (docs/runtime.md §3.2).
+  pub wakes: WakeBitmap,
   /// The control channel's sending end.
   pub control: SyncSender<Control>,
   /// The task-arena generation the shard that holds this slot starts its handles from: one past the
@@ -81,12 +69,6 @@ pub struct Entry {
   /// A simulated shard's flags, owned until its contexts and foreign kick borrows end.
   /// A copied kick carries the registration, never a reference to these flags.
   pub sim_shared: Option<Box<crate::sim::SimShared>>,
-  /// The single-producer rings this shard sends on, one per other shard of its runtime, owned here
-  /// and lent as `&'static` to those shards' contexts; retired with the entry (every shard of a
-  /// runtime unregisters after every thread of it joined, so no borrower outlives them).
-  pub pair_rings: Vec<Box<crate::mem::SpscRing>>,
-  /// How many times a producer found the ring full and had to spin (a tripwire, GAPS §7).
-  pub ring_full_events: AtomicU64,
   /// The shard thread's CPU-clock handle, recorded as it starts (zero until then, and where the platform has none):
   /// what an observer reads to count its budget in the shard's own time ([`shard_cpu`]).
   pub cpu_clock: AtomicU64,
@@ -244,12 +226,6 @@ struct Slot {
   /// zero before freeing the entry, including when a borrower was descheduled.
   readers: AtomicU32,
   entry: std::sync::atomic::AtomicPtr<Entry>,
-  /// The shard's context, owned here from its build until its owning thread reclaims it at the
-  /// loop's end ([`reclaim_context`]): the raw pointer `Box::into_raw` produced, kept whole so the
-  /// box is freed with the provenance it was made with. Null while no context is attached. Only the
-  /// owning thread stores or takes it — a context is that thread's (`!Send`), and nothing foreign
-  /// dereferences one: a wake routes by id through the entry, never through the context.
-  context: std::sync::atomic::AtomicPtr<ShardContext>,
   /// The highest task-arena generation a holder of this slot has issued, carried to the next
   /// holder as its base (see [`Entry::generation_base`]).
   arena_generation: AtomicU32,
@@ -263,16 +239,11 @@ impl Slot {
       generation: AtomicU32::new(1),
       readers: AtomicU32::new(0),
       entry: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
-      context: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
       arena_generation: AtomicU32::new(0),
       stale_wakes: AtomicU64::new(0),
     }
   }
 }
-
-/// Contexts reclaimed by their owning threads since the process started (see [`reclaim_context`]);
-/// a test's non-vacuity counter that a shut-down runtime's context heap was given back.
-static CONTEXTS_RECLAIMED: AtomicU64 = AtomicU64::new(0);
 
 static SLOTS: [Slot; MAX_SHARDS] = [const { Slot::new() }; MAX_SHARDS];
 
@@ -313,19 +284,19 @@ impl Drop for Registration {
 /// hyper_rt::registry::unregister(0);
 /// ```
 pub fn register(
-  ring_entries: usize,
+  wake_slots: usize,
   control_bound: usize,
   kick: RegisterKick,
 ) -> Result<(Registration, Receiver<Control>), RtError> {
-  let (shard, control) = register_slot(ring_entries, control_bound, kick)?;
+  let (shard, control) = register_slot(wake_slots, control_bound, kick)?;
   Ok((Registration { shard }, control))
 }
 
-/// Registers a new shard with a wake ring of `ring_entries` words, a control channel bounded at
+/// Registers a new shard with a wake bitmap for `wake_slots` task slots, a control channel bounded at
 /// `control_bound`, and its kick; returns the id and the control channel's receiving end. Takes the
 /// lowest free slot; refuses `TooManyShards` when every slot holds a live shard.
 pub(crate) fn register_slot(
-  ring_entries: usize,
+  wake_slots: usize,
   control_bound: usize,
   kick: RegisterKick,
 ) -> Result<(u16, Receiver<Control>), RtError> {
@@ -354,23 +325,14 @@ pub(crate) fn register_slot(
     }
     let id = u16::try_from(index).unwrap_or(u16::MAX);
     let (control, receiver) = sync_channel(control_bound.max(1));
-    let inbound = match MpscRing::new(ring_entries) {
-      Ok(ring) => ring,
-      Err(e) => {
-        // Give the slot back before refusing.
-        slot
-          .generation
-          .store(live.wrapping_add(1), Ordering::Release);
-        return Err(e.into());
-      }
-    };
+    let wakes = WakeBitmap::new(wake_slots);
     let holder = SlotHolder {
       shard: id,
       generation: live,
     };
     let mut entry = Box::new(Entry {
       holder,
-      inbound,
+      wakes,
       control,
       generation_base: slot.arena_generation.load(Ordering::Acquire),
       control_pending: crate::parking::ControlFlag::new(),
@@ -380,8 +342,6 @@ pub(crate) fn register_slot(
       #[cfg(windows)]
       kick_port: None,
       sim_shared: None,
-      pair_rings: Vec::new(),
-      ring_full_events: AtomicU64::new(0),
       cpu_clock: AtomicU64::new(0),
       parking: Parking::new(),
       pulse: Pulse::default(),
@@ -436,54 +396,16 @@ pub fn note_arena_generation(shard: u16, high: u32) {
   }
 }
 
-/// Hands `shard`'s slot the context its owning thread just built (`ShardContext::build`), as the raw
-/// pointer `Box::into_raw` produced, so the same thread can free it at the loop's end with the
-/// provenance it was made with ([`reclaim_context`]). Called once per build, on the owning thread.
-pub(crate) fn attach_context(shard: u16, context: *mut ShardContext) {
-  if let Some(slot) = SLOTS.get(usize::from(shard)) {
-    slot.context.store(context, Ordering::Release);
-  }
-}
+/// Shards dropped by their owners since the process started (a shut-down runtime's per-shard state given
+/// back): a test's non-vacuity counter.
+static CONTEXTS_RECLAIMED: AtomicU64 = AtomicU64::new(0);
 
-/// Frees `shard`'s context: **only its owning thread calls this, after its loop has returned** (the
-/// multi-thread runtime's worker after `run`, `LocalRuntime` and `SimRuntime` in their `Drop`). At that
-/// point the context has no other holder: the loop cleared the thread's current-context cell, its task
-/// arena is empty (the loop exits only once every task, including the cancelled ones, is dropped), and
-/// nothing foreign ever dereferences a context — a waker carries a packed word and routes by shard id
-/// through the entry, and cross-shard rings are owned by entries, not contexts. The entry itself is
-/// untouched here (retirement waits for foreign readers in [`unregister`]). Idempotent: a slot with no attached context is a no-op. Before
-/// 2026-09-14 every build leaked its context for the process lifetime — a task arena, run queue and
-/// timer wheel each sized to the shard's task budget, per shard, per runtime start.
-pub(crate) fn reclaim_context(shard: u16) {
-  let Some(slot) = SLOTS.get(usize::from(shard)) else {
-    return;
-  };
-  let context = slot.context.swap(std::ptr::null_mut(), Ordering::AcqRel);
-  if context.is_null() {
-    return;
-  }
-  // Nothing will drain this shard's rings again: a sender spinning on a full one must stop.
-  note_exited(shard);
-  // A step leaves this thread's current-context cell pointing at the context it stepped (`run` and
-  // `run_until_idle` clear it at their exit, a bare `step` does not), so a same-thread runtime — a
-  // `LocalRuntime`, a simulation — could be dropped with the cell still naming the context freed
-  // here, and the thread's next wake would dereference freed memory. Cleared here, once, for every
-  // owner: the cell is this thread's, and the context is this thread's to free.
-  let _ = CURRENT.try_with(|current| {
-    if std::ptr::eq(current.get(), context.cast_const()) {
-      current.set(std::ptr::null());
-    }
-  });
-  // SAFETY: `context` is the pointer `Box::into_raw` produced in `ShardContext::build`, stored by
-  // `attach_context` and taken back exactly once here (the swap leaves null). The caller is the
-  // context's owning thread after its loop returned, so no reference to the context is live (see the
-  // doc above), and this thread may drop the `!Send` value it built.
-  drop(unsafe { Box::from_raw(context) });
+/// Counts one shard dropped by its owner.
+pub(crate) fn note_reclaimed() {
   CONTEXTS_RECLAIMED.fetch_add(1, Ordering::Relaxed);
 }
 
-/// Contexts freed by their owning threads since the process started (a shut-down runtime's per-shard
-/// context heap given back): a test's non-vacuity counter.
+/// Shards dropped by their owners since the process started: a test's non-vacuity counter.
 pub fn contexts_reclaimed() -> u64 {
   CONTEXTS_RECLAIMED.load(Ordering::Relaxed)
 }
@@ -610,32 +532,6 @@ pub(crate) fn entry(shard: u16) -> Option<&'static Entry> {
   Some(unsafe { &*entry })
 }
 
-/// Stores a pair ring in `shard`'s entry and lends it for the entry's life (see
-/// `Entry::pair_rings`); `None` for a free slot.
-pub(crate) fn lend_pair_ring(
-  shard: u16,
-  ring: crate::mem::SpscRing,
-) -> Option<&'static crate::mem::SpscRing> {
-  let slot = SLOTS.get(usize::from(shard))?;
-  if slot.generation.load(Ordering::Acquire) & 1 == 1 {
-    return None;
-  }
-  let entry = slot.entry.load(Ordering::SeqCst);
-  if entry.is_null() {
-    return None;
-  }
-  // SAFETY: the entry is valid (see `entry`); the rings are pushed only here, by the registering
-  // thread before any shard thread of the runtime starts (`connect_pairs` runs before the spawns),
-  // so no other reference to `pair_rings` exists yet, and the boxed ring's address is stable for the
-  // entry's life.
-  let entry = unsafe { &mut *entry };
-  entry.pair_rings.push(Box::new(ring));
-  let lent: &crate::mem::SpscRing = entry.pair_rings.last()?;
-  // SAFETY: lifetime extension by the same argument as the kick: the box is never moved or freed
-  // while a borrower can exist.
-  Some(unsafe { &*(lent as *const crate::mem::SpscRing) })
-}
-
 /// The wakes that found their target's slot free (a waker outlived its shard); a tripwire, never a
 /// fault: the word it carried had no task to reach.
 pub fn stale_wakes(shard: u16) -> u64 {
@@ -697,97 +593,31 @@ pub fn current_shard() -> Option<u16> {
   with_current(|ctx| ctx.id)
 }
 
-/// Wakes the task named by `word` from wherever the caller is.
+/// Wakes the task named by `word` from wherever the caller is: inside a step of its own shard, onto the
+/// desk's run queue; from anywhere else, its bit in the shard's wake bitmap, and a kick only if the shard
+/// is parked. Never waits. A wake to a shard that exited or a free slot is counted stale and dropped.
 pub fn wake(word: Encoded) {
   let target = word.shard();
-  let handled = with_current(|ctx| {
-    if ctx.id == target {
-      ctx.local.push(word.slot());
-      return true;
+  let local = with_current(|ctx| {
+    let own = ctx.id == target;
+    if own {
+      ctx.wake_local(word.slot());
     }
-    match ctx.send_to(target, word.word()) {
-      PairSend::Sent | PairSend::Gone => true,
-      // No pair ring to that shard (another runtime's): the multi-producer path, but as a shard
-      // must take it — draining its own rings while the target's is full, never blocking as a
-      // plain foreign thread may.
-      PairSend::NoRing => {
-        ctx.send_foreign_draining(target, word.word());
-        true
-      }
-    }
+    own
   });
-  if handled != Some(true) {
-    send_foreign(target, word.word());
+  if local == Some(true) {
+    return;
   }
-}
-
-/// The outcome of a shard's send over a pair ring (`ShardContext::send_to`).
-#[derive(Debug, PartialEq, Eq)]
-pub enum PairSend {
-  /// The word landed on the pair ring and the target was kicked.
-  Sent,
-  /// This shard keeps no pair ring to `target` (a shard of another runtime): use the foreign path.
-  NoRing,
-  /// The target left its loop or its slot is free: the wake was counted stale.
-  Gone,
-}
-
-/// Sends a wake word to a shard from a foreign thread (or from a shard without a pair ring).
-pub fn send_foreign(target: u16, word: u64) {
-  let mut pending = word;
-  loop {
-    match try_send_foreign(target, pending) {
-      TrySend::Landed | TrySend::Gone => return,
-      TrySend::Full(back) => {
-        pending = back;
-        std::thread::yield_now();
-      }
+  let landed = with_entry(target, |entry| {
+    if entry.exited.load(Ordering::Acquire) || !entry.wakes.set(word.slot()) {
+      return false;
     }
-  }
-}
-
-/// One turn of a foreign send: the word landed in the target's ring (and the target was kicked if it
-/// was parked); the ring was full (the word is handed back, for the caller to retry after doing its own
-/// work — a shard drains its inbound rings meanwhile, so two shards saturating each other's rings never
-/// wait on each other for good); or the target is gone — its holder exited, or its slot is free — and
-/// the wake was counted stale. Each turn re-reads the target under the reader count, so a spin ends the
-/// moment the wake became stale (the livelock the stress test found on 2026-09-14: a holder that left
-/// never drains, and a ring only its holder empties).
-pub fn try_send_foreign(target: u16, word: u64) -> TrySend {
-  let outcome = with_entry(target, |entry| {
-    if entry.exited.load(Ordering::Acquire) {
-      return TrySend::Gone;
-    }
-    match entry.inbound.push(word) {
-      Ok(()) => {
-        entry.parking.kick_if_parked(|| entry.kick.kick());
-        TrySend::Landed
-      }
-      Err(back) => {
-        entry.ring_full_events.fetch_add(1, Ordering::Relaxed);
-        entry.kick.kick();
-        TrySend::Full(back)
-      }
-    }
+    entry.parking.kick_if_parked(|| entry.kick.kick());
+    true
   });
-  match outcome {
-    Some(TrySend::Gone) | None => {
-      count_stale(target);
-      TrySend::Gone
-    }
-    Some(turn) => turn,
+  if landed != Some(true) {
+    count_stale(target);
   }
-}
-
-/// The outcome of one foreign send turn ([`try_send_foreign`]).
-#[derive(Debug, PartialEq, Eq)]
-pub enum TrySend {
-  /// The word landed in the target's ring.
-  Landed,
-  /// The ring was full; the word is handed back to retry.
-  Full(u64),
-  /// The target's holder exited or its slot is free: the wake was counted stale.
-  Gone,
 }
 
 /// Counts a wake that found no live consumer (a stale waker, or a holder that exited): a tripwire,
@@ -932,32 +762,22 @@ mod tests {
     unregister(replacement);
   }
 
-  /// Do: register a slot whose ring holds four words, fill it, mark its holder exited (what the shard
-  /// does at its loop's exit) and send a fifth wake from a foreign thread's path. Expect: the send
-  /// returns at once, counted stale — where before it spun for a consumer that would never come.
-  /// Non-vacuous: the four fills landed (the ring was full), and the stale count moved by one.
+  /// Do: register a slot, mark its holder exited (what the shard does at its loop's exit) and wake a
+  /// task of it from a foreign thread's path. Expect: the wake is counted stale at once, never delivered
+  /// to a shard that will not drain it.
   #[test]
-  fn a_wake_to_an_exited_holders_full_ring_is_counted_stale_not_spun_on() {
+  fn a_wake_to_an_exited_holder_is_counted_stale() {
     let (id, _receiver) = register_slot(4, 2, RegisterKick::Kick(Kick::none())).unwrap();
-    for word in 0..4u64 {
-      send_foreign(id, word);
-    }
     let stale_before = stale_wakes(id);
     note_exited(id);
-    send_foreign(id, 4);
-    assert_eq!(
-      stale_wakes(id) - stale_before,
-      1,
-      "the fifth wake found an exited holder's full ring and was counted stale"
-    );
+    wake(Encoded::pack(id, 1, 0).unwrap());
+    assert_eq!(stale_wakes(id) - stale_before, 1);
+    assert!(!entry(id).unwrap().wakes.is_pending());
     unregister(id);
   }
 
-  // Every registration below is given back at the test's end. A slot left registered with a ring
-  // nobody drains is a live holder to every other test in this binary: the interleaving stress test's
-  // neighbour wake to it fills the ring and then spins, as the protocol says it must for a live
-  // holder, for good — the binary hung 10 minutes that way on 2026-09-17 (the stress test's last
-  // thread in `send_as_shard`, the neighbour a leaked two-word ring).
+  // Every registration below is given back at the test's end, so no test leaves a live holder behind for
+  // another to wake.
 
   #[test]
   fn registration_hands_out_distinct_ids_and_entries() {
@@ -966,41 +786,32 @@ mod tests {
     assert_ne!(a, b);
     assert!(entry(a).is_some());
     assert!(entry(b).is_some());
-    assert_eq!(entry(a).unwrap().inbound.capacity(), 8);
     unregister(a);
     unregister(b);
   }
 
   #[test]
-  fn a_wake_from_a_foreign_thread_lands_in_the_target_ring() {
-    let (id, _receiver) = register_slot(4, 4, RegisterKick::Kick(Kick::none())).unwrap();
+  fn a_wake_from_a_foreign_thread_lands_in_the_target_bitmap() {
+    let (id, _receiver) = register_slot(8, 4, RegisterKick::Kick(Kick::none())).unwrap();
     let word = Encoded::pack(id, 5, 1).unwrap();
-    wake(word);
-    let consumer = entry(id).unwrap().inbound.consumer().unwrap();
-    assert_eq!(consumer.pop(), Some(word.word()));
+    std::thread::scope(|scope| {
+      scope.spawn(|| wake(word));
+    });
+    let mut woken = Vec::new();
+    entry(id).unwrap().wakes.drain(|slot| woken.push(slot));
+    assert_eq!(woken, vec![5]);
     assert_eq!(current_shard(), None);
-    drop(consumer);
     unregister(id);
   }
 
+  /// A wake past the target's slots (a stale word from a larger runtime that held the registry slot) is
+  /// counted stale, not delivered.
   #[test]
-  fn a_full_foreign_ring_spins_and_counts_without_losing_the_word() {
-    let (id, _receiver) = register_slot(2, 4, RegisterKick::Kick(Kick::none())).unwrap();
-    let entry = entry(id).unwrap();
-    send_foreign(id, 1);
-    send_foreign(id, 2);
-    let filler = std::thread::spawn(move || send_foreign(id, 3));
-    while entry.ring_full_events.load(Ordering::Relaxed) == 0 {
-      std::thread::yield_now();
-    }
-    let c = entry.inbound.consumer().unwrap();
-    assert_eq!(c.pop(), Some(1));
-    filler.join().unwrap();
-    assert_eq!(c.pop(), Some(2));
-    assert_eq!(c.pop(), Some(3));
-    // The claim is released into the ring before retirement frees it (Miri: a consumer dropped after
-    // `unregister` wrote into the freed ring).
-    drop(c);
+  fn a_wake_past_the_bitmap_is_counted_stale() {
+    let (id, _receiver) = register_slot(4, 4, RegisterKick::Kick(Kick::none())).unwrap();
+    let before = stale_wakes(id);
+    wake(Encoded::pack(id, 1_000, 1).unwrap());
+    assert_eq!(stale_wakes(id) - before, 1);
     unregister(id);
   }
 

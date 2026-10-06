@@ -45,6 +45,7 @@ fn config(step_budget_ns: u64, wake_tracking: Option<WakeTracking>) -> RuntimeCo
     shards: 1,
     tasks_per_shard: 64,
     timers_per_shard: 64,
+    interests_per_shard: 64,
     ring_entries: 64,
     step_budget_ns,
     timer_tick_ns: 100_000,
@@ -77,15 +78,15 @@ impl Future for PendOnce {
 }
 
 /// Steps the shard until it has nothing to do.
-fn step_until_idle(ctx: &hyper_rt::shard::ShardContext) {
-  while ctx.step().did_work {}
+fn step_until_idle(rt: &mut LocalRuntime) {
+  while rt.step().did_work {}
 }
 
 /// Parks the shard and wakes it from another thread a millisecond after it announced the park: a real
 /// kick of a sleeping shard, the event the online estimate learns from.
-fn park_and_kick(ctx: &hyper_rt::shard::ShardContext, wakers: &Receiver<Waker>) {
+fn park_and_kick(rt: &mut LocalRuntime, wakers: &Receiver<Waker>) {
   let waker = wakers.try_recv().expect("the task handed over its waker");
-  let shard = ctx.id;
+  let shard = rt.shard_id().0;
   std::thread::scope(|scope| {
     scope.spawn(move || {
       let began = Instant::now();
@@ -104,7 +105,7 @@ fn park_and_kick(ctx: &hyper_rt::shard::ShardContext, wakers: &Receiver<Waker>) 
       }
       waker.wake();
     });
-    ctx.park(None);
+    rt.park(None);
   });
 }
 
@@ -121,8 +122,7 @@ fn a_tracking_shard_learns_its_wake_from_the_parks_its_kicks_ended() {
     shift: SHIFT,
     idle_ratio: 1,
   };
-  let rt = LocalRuntime::new(&config(PRIOR_NS, Some(tracking))).unwrap();
-  let ctx = rt.context();
+  let mut rt = LocalRuntime::new(&config(PRIOR_NS, Some(tracking))).unwrap();
   let (tx, rx) = channel::<Waker>();
   rt.spawn(async move {
     for _ in 0..KICKS {
@@ -135,11 +135,11 @@ fn a_tracking_shard_learns_its_wake_from_the_parks_its_kicks_ended() {
   })
   .unwrap();
   for _ in 0..KICKS {
-    step_until_idle(ctx);
-    park_and_kick(ctx, &rx);
+    step_until_idle(&mut rt);
+    park_and_kick(&mut rt, &rx);
   }
-  step_until_idle(ctx);
-  let counters = ctx.counters();
+  step_until_idle(&mut rt);
+  let counters = rt.counters();
   assert_eq!(
     counters.wake_samples + counters.wake_unslept,
     KICKS,
@@ -153,12 +153,11 @@ fn a_tracking_shard_learns_its_wake_from_the_parks_its_kicks_ended() {
     counters.wake_cost_ns < PRIOR_NS / 2,
     "the estimate moved off its one-second prior toward the measured wakes: {counters:?}"
   );
-  assert_eq!(ctx.quantum_ns(), counters.wake_cost_ns);
-  let mirrored = registry::with_entry(ctx.id, |entry| entry.pulse.wake_cost_ns()).unwrap();
+  assert_eq!(rt.context().quantum_ns(), counters.wake_cost_ns);
+  let mirrored = registry::with_entry(rt.shard_id().0, |entry| entry.pulse.wake_cost_ns()).unwrap();
   assert_eq!(mirrored, counters.wake_cost_ns);
 
-  let fixed = LocalRuntime::new(&config(QUANTUM_NS, None)).unwrap();
-  let fixed_ctx = fixed.context();
+  let mut fixed = LocalRuntime::new(&config(QUANTUM_NS, None)).unwrap();
   let (tx, rx) = channel::<Waker>();
   fixed
     .spawn(async move {
@@ -169,11 +168,11 @@ fn a_tracking_shard_learns_its_wake_from_the_parks_its_kicks_ended() {
       .await;
     })
     .unwrap();
-  step_until_idle(fixed_ctx);
-  park_and_kick(fixed_ctx, &rx);
-  step_until_idle(fixed_ctx);
-  assert_eq!(fixed_ctx.counters().wake_samples, 0);
-  assert_eq!(fixed_ctx.quantum_ns(), QUANTUM_NS);
+  step_until_idle(&mut fixed);
+  park_and_kick(&mut fixed, &rx);
+  step_until_idle(&mut fixed);
+  assert_eq!(fixed.counters().wake_samples, 0);
+  assert_eq!(fixed.context().quantum_ns(), QUANTUM_NS);
 }
 
 /// How a held poll spends its hold.
@@ -266,17 +265,16 @@ impl Future for HoldEachPoll {
 }
 
 /// Runs one busy period of [`LONG_POLLS`] held polls and returns the shard's counters.
-fn one_busy_period(hold: Hold) -> hyper_rt::shard::Counters {
+fn one_busy_period(hold: Hold) -> hyper_rt::shard_loop::Counters {
   CPU_PAST_QUANTUM.with(|count| count.set(0));
-  let rt = LocalRuntime::new(&config(QUANTUM_NS, None)).unwrap();
+  let mut rt = LocalRuntime::new(&config(QUANTUM_NS, None)).unwrap();
   rt.spawn(HoldEachPoll {
     polls_left: LONG_POLLS,
     hold,
   })
   .unwrap();
-  let ctx = rt.context();
-  step_until_idle(ctx);
-  let counters = ctx.counters();
+  step_until_idle(&mut rt);
+  let counters = rt.counters();
   let hold_ns = u64::try_from(HOLD.as_nanos()).unwrap();
   assert!(
     counters.longest_step_ns >= hold_ns,
@@ -286,7 +284,7 @@ fn one_busy_period(hold: Hold) -> hyper_rt::shard::Counters {
 }
 
 /// A shard's long polls as (the task's, of those blocked, the host's, unattributed).
-fn attributed(counters: &hyper_rt::shard::Counters) -> (u64, u64, u64, u64) {
+fn attributed(counters: &hyper_rt::shard_loop::Counters) -> (u64, u64, u64, u64) {
   (
     counters.long_steps,
     counters.blocked_steps,

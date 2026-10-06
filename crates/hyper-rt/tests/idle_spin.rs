@@ -18,7 +18,8 @@ use std::time::{Duration, Instant};
 use hyper_rt::futures::sleep;
 use hyper_rt::registry;
 use hyper_rt::runtime::{Runtime, RuntimeConfig};
-use hyper_rt::shard::{Counters, ShardId};
+use hyper_rt::shard::ShardId;
+use hyper_rt::shard_loop::Counters;
 
 /// Shape: the idle window — long against the timer period, so the window holds dozens of idle moments,
 /// and short enough that the test spans a few of them in well under a second.
@@ -36,6 +37,7 @@ fn config() -> RuntimeConfig {
     shards: 1,
     tasks_per_shard: 64,
     timers_per_shard: 64,
+    interests_per_shard: 64,
     ring_entries: 64,
     step_budget_ns: 1_000_000_000,
     timer_tick_ns: 100_000,

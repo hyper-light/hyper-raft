@@ -37,6 +37,7 @@ fn config() -> RuntimeConfig {
     shards: 1,
     tasks_per_shard: 64,
     timers_per_shard: 64,
+    interests_per_shard: 64,
     ring_entries: 64,
     step_budget_ns: 1_000_000_000,
     timer_tick_ns: 100_000,
@@ -80,28 +81,27 @@ fn nanos(window: Duration) -> u64 {
 #[test]
 #[cfg_attr(miri, ignore)] // the OS driver opens a kqueue or an eventfd, which Miri does not model
 fn a_wait_stepped_past_its_deadline_reports_the_lateness() {
-  let rt = LocalRuntime::new(&config()).unwrap();
-  let ctx = rt.context();
+  let mut rt = LocalRuntime::new(&config()).unwrap();
   rt.spawn(async {
     futures::sleep(SLEEP_NS).await.unwrap();
   })
   .unwrap();
   // The task arms its timer; the shard then has nothing to do until it fires.
-  let mut outcome = ctx.step();
+  let mut outcome = rt.step();
   while outcome.did_work {
-    outcome = ctx.step();
+    outcome = rt.step();
   }
   let deadline = outcome
     .next_deadline_ns
     .expect("the sleep armed a timer the shard waits for");
-  ctx.park(Some(deadline));
+  rt.park(Some(deadline));
   // Woken at the deadline — and then not run.
   hold_for(HELD_OFF);
-  ctx.step();
-  let stepped_by = ctx.now_ns();
-  let overrun = ctx.scheduler_overrun_ns();
+  rt.step();
+  let stepped_by = rt.context().now_ns();
+  let overrun = rt.context().scheduler_overrun_ns();
   rt.run_until_idle();
-  let counters = ctx.counters();
+  let counters = rt.counters();
   assert!(
     counters.waits >= 1,
     "the shard parked for the deadline (waits {}) — the test's premise",
@@ -137,7 +137,7 @@ static SLEEPER_OVERRUN_NS: AtomicU64 = AtomicU64::new(u64::MAX);
 #[test]
 #[cfg_attr(miri, ignore)] // the OS driver opens a kqueue or an eventfd, which Miri does not model
 fn a_busy_shards_late_timer_is_not_a_scheduler_overrun() {
-  let rt = LocalRuntime::new(&config()).unwrap();
+  let mut rt = LocalRuntime::new(&config()).unwrap();
   rt.spawn(async {
     let due = futures::now_ns().saturating_add(SLEEP_NS);
     futures::sleep(SLEEP_NS).await.unwrap();
@@ -150,7 +150,7 @@ fn a_busy_shards_late_timer_is_not_a_scheduler_overrun() {
   })
   .unwrap();
   rt.run_until_idle();
-  let counters = rt.context().counters();
+  let counters = rt.counters();
   let late = SLEEPER_LATE_NS.load(Ordering::Acquire);
   assert!(
     late >= nanos(HELD_OFF).saturating_sub(SLEEP_NS),

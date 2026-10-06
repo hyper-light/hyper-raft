@@ -199,11 +199,28 @@ pub trait Driver {
   /// can tell without a syscall (an idle loop skips the wait when this is false).
   fn has_pending(&self) -> bool;
 
+  /// The clock the shard's tasks read: the one [`Driver::now_ns`] reads, live.
+  fn clock(&self) -> Clock {
+    Clock::Published
+  }
+
   /// Whether this is the simulation driver, so a `UdpSocket` uses the deterministic in-memory fabric
   /// instead of a real socket (§4.10a). Only the simulation driver overrides this.
   fn is_sim(&self) -> bool {
     false
   }
+}
+
+/// The clock a shard's tasks read ([`crate::shard::ShardContext::now_ns`]): the driver's own, read live,
+/// so a task that measures time inside one poll sees it pass.
+#[derive(Clone, Copy, Debug)]
+pub enum Clock {
+  /// Monotonic nanoseconds since the driver's epoch (the OS drivers).
+  Since(std::time::Instant),
+  /// The simulation's virtual clock.
+  Sim(&'static crate::sim::SimShared),
+  /// No live clock: the time the loop last published (a test double's driver).
+  Published,
 }
 
 /// What builds a driver on the shard's thread: a closure the runtime prepared with the OS

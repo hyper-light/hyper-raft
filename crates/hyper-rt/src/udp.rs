@@ -14,7 +14,7 @@
 
 use crate::error::RtError;
 use crate::netsys::{self, Io, Socket};
-use crate::readiness::readable;
+use crate::readiness::{Target, ready};
 use crate::registry;
 
 // The address types are `core::net`'s (the same ones the seam and `rustix::net` use), re-exported so
@@ -38,7 +38,18 @@ pub struct UdpSocket {
 #[derive(Debug)]
 enum Inner {
   Real { socket: Socket },
-  Sim { port: u16 },
+  Sim { index: u16, port: u16 },
+  /// Handed over ([`UdpSocket::into_owned`]): nothing left to close.
+  Moved,
+}
+
+impl Drop for UdpSocket {
+  /// A simulated socket gives its desk slot back (an OS socket closes with its descriptor).
+  fn drop(&mut self) {
+    if let Inner::Sim { index, .. } = self.inner {
+      crate::sim::sim_close(index);
+    }
+  }
 }
 
 /// Whether the current shard runs the simulation driver (so a socket uses the in-memory fabric).
@@ -52,10 +63,9 @@ impl UdpSocket {
   /// fabric port is assigned.
   pub fn bind(addr: SocketAddrV4) -> Result<UdpSocket, RtError> {
     if on_sim() {
+      let (index, port) = crate::sim::sim_bind()?;
       return Ok(UdpSocket {
-        inner: Inner::Sim {
-          port: crate::sim::sim_udp_bind(),
-        },
+        inner: Inner::Sim { index, port },
       });
     }
     let socket = netsys::dgram_socket()?;
@@ -96,12 +106,15 @@ impl UdpSocket {
   /// across daemon restarts as its NFS listener is, §4.6). Refused on the simulation driver, whose sockets
   /// are fabric ports. Unix: the supervisor that uses it is (Windows daemons are not anchor-spawned).
   #[cfg(unix)]
-  pub fn into_owned(self) -> Result<OwnedDatagram, RtError> {
-    match self.inner {
+  pub fn into_owned(mut self) -> Result<OwnedDatagram, RtError> {
+    match std::mem::replace(&mut self.inner, Inner::Moved) {
       Inner::Real { socket } => Ok(netsys::into_owned(socket)),
-      Inner::Sim { .. } => Err(RtError::BadConfig {
-        what: "a simulated socket has no OS descriptor to hand over",
-      }),
+      inner => {
+        self.inner = inner;
+        Err(RtError::BadConfig {
+          what: "a simulated socket has no OS descriptor to hand over",
+        })
+      }
     }
   }
 
@@ -110,7 +123,8 @@ impl UdpSocket {
   pub fn local_addr(&self) -> Result<SocketAddrV4, RtError> {
     match &self.inner {
       Inner::Real { socket } => netsys::local_addr(socket),
-      Inner::Sim { port } => Ok(SocketAddrV4::new(Ipv4Addr::LOCALHOST, *port)),
+      Inner::Sim { port, .. } => Ok(SocketAddrV4::new(Ipv4Addr::LOCALHOST, *port)),
+      Inner::Moved => Err(moved()),
     }
   }
 
@@ -121,6 +135,7 @@ impl UdpSocket {
     match &self.inner {
       Inner::Real { socket } => netsys::dont_fragment(socket),
       Inner::Sim { .. } => Ok(true),
+      Inner::Moved => Err(moved()),
     }
   }
 
@@ -131,6 +146,7 @@ impl UdpSocket {
     match &self.inner {
       Inner::Real { socket } => netsys::recv_buffer_bytes(socket),
       Inner::Sim { .. } => Ok(crate::sim::SIM_RECV_BUFFER_BYTES),
+      Inner::Moved => Err(moved()),
     }
   }
 
@@ -156,16 +172,8 @@ impl UdpSocket {
           Io::Interrupted => {}
         }
       },
-      Inner::Sim { port } => {
-        if crate::sim::sim_udp_exceeds_interface(buf.len()) {
-          return Err(RtError::message_too_large("sendto"));
-        }
-        if crate::sim::sim_udp_sends_blocked(*port) {
-          return Ok(None);
-        }
-        crate::sim::sim_udp_send(addr.port(), buf, *port);
-        Ok(Some(buf.len()))
-      }
+      Inner::Sim { index, .. } => crate::sim::sim_send(*index, addr.port(), buf),
+      Inner::Moved => Err(moved()),
     }
   }
 
@@ -183,10 +191,16 @@ impl UdpSocket {
   /// Awaits the socket's write readiness through the driver (send-buffer space), or a spurious wake — so a
   /// caller follows it with [`UdpSocket::try_send_to`] and loops on `None`.
   pub fn writable(&self) -> impl Future<Output = Result<(), RtError>> + use<> {
-    crate::readiness::writable(match &self.inner {
-      Inner::Real { socket } => socket.raw_id(),
-      Inner::Sim { port } => i32::from(*port),
-    })
+    ready(self.target(), true)
+  }
+
+  /// What a readiness wait on this socket watches.
+  fn target(&self) -> Target {
+    match &self.inner {
+      Inner::Real { socket } => Target::Os(socket.raw_id()),
+      Inner::Sim { index, .. } => Target::Sim(*index),
+      Inner::Moved => Target::Os(-1),
+    }
   }
 
   /// Receives one datagram, awaiting readability through the driver when none is ready. Returns the
@@ -207,10 +221,7 @@ impl UdpSocket {
   /// names the socket by its descriptor (or fabric port), not by a borrow, so a task that reaches the socket
   /// through a handle (a kept demultiplexer, AUD-29-08) can await it outside the handle's borrow.
   pub fn readable(&self) -> impl Future<Output = Result<(), RtError>> + use<> {
-    readable(match &self.inner {
-      Inner::Real { socket } => socket.raw_id(),
-      Inner::Sim { port } => i32::from(*port),
-    })
+    ready(self.target(), false)
   }
 
   /// Takes one waiting datagram into `buf` without blocking: the byte count and the sender, or `None`
@@ -225,13 +236,18 @@ impl UdpSocket {
           Io::Interrupted => {}
         }
       },
-      Inner::Sim { port } => Ok(crate::sim::sim_udp_recv(*port).map(|(bytes, from)| {
-        let n = bytes.len().min(buf.len());
-        if let (Some(into), Some(from_bytes)) = (buf.get_mut(..n), bytes.get(..n)) {
-          into.copy_from_slice(from_bytes);
-        }
-        (n, SocketAddrV4::new(Ipv4Addr::LOCALHOST, from))
-      })),
+      Inner::Sim { index, .. } => Ok(
+        crate::sim::sim_recv(*index, buf)
+          .map(|(n, from)| (n, SocketAddrV4::new(Ipv4Addr::LOCALHOST, from))),
+      ),
+      Inner::Moved => Err(moved()),
     }
+  }
+}
+
+/// The refusal for a socket whose OS handle was handed over.
+fn moved() -> RtError {
+  RtError::BadConfig {
+    what: "a socket whose descriptor was handed over",
   }
 }

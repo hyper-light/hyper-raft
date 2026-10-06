@@ -1,49 +1,30 @@
 //! AC-0.7, §4.3: race registration, foreign wakes and retirement through the public registry.
-//! This fixture owns its process: its neighbour sends intentionally address any live slot,
-//! so sharing a binary with tests that do not drain those rings can corrupt their observations
-//! or deadlock them. All sixteen concurrent workers and their history budget remain unchanged.
+//! This fixture owns its process: its neighbour wakes intentionally address any live slot, so
+//! sharing a binary with other tests would wake their tasks spuriously. All sixteen concurrent workers and their history budget remain unchanged.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use hyper_rt::driver::Kick;
-use hyper_rt::registry::{
-  MAX_SHARDS, RegisterKick, TrySend, holder_of, register, try_send_foreign, with_entry,
-};
+use hyper_rt::mem::Encoded;
+use hyper_rt::registry::{MAX_SHARDS, RegisterKick, holder_of, register, wake, with_entry};
 
-/// Sends `word` to `target` as a shard does: one turn at a time, draining this thread's own ring
-/// (`own`) while the target's is full, so a producer that is also a consumer keeps consuming.
-fn send_as_shard(own: u16, target: u16, word: u64, landed: &AtomicU64) -> bool {
-  let mut pending = word;
-  let mut own_seen = false;
-  loop {
-    match try_send_foreign(target, pending) {
-      TrySend::Landed | TrySend::Gone => return own_seen,
-      TrySend::Full(back) => {
-        pending = back;
-        own_seen |= drain_own(own, landed);
-        std::thread::yield_now();
-      }
-    }
-  }
-}
+/// Format: the task slot the "shard" (this thread) wakes in itself; a wake bitmap of four slots holds it.
+const OWN_SLOT: u32 = 1;
 
-/// Drains the calling thread's own ring (it is the "shard" of `id`), counting the wake it sent
-/// itself and reporting whether it was seen; a neighbour's wake that landed here is drained too but
-/// not counted, since the assertion below is about the wakes to live slots this thread sent itself.
+/// Drains the calling thread's own bitmap (it is the "shard" of `id`), counting its own wake; reports
+/// whether it was seen. A neighbour's wake that landed here is drained too but not counted.
 fn drain_own(id: u16, landed: &AtomicU64) -> bool {
   with_entry(id, |entry| {
     let mut seen = false;
-    let ring = entry
-      .inbound
-      .consumer()
-      .expect("this thread is its slot's only consumer");
-    while let Some(word) = ring.pop() {
-      if word == 7 {
-        landed.fetch_add(1, Ordering::Relaxed);
+    entry.wakes.drain(|slot| {
+      if slot == OWN_SLOT {
         seen = true;
       }
+    });
+    if seen {
+      landed.fetch_add(1, Ordering::Relaxed);
     }
     seen
   })
@@ -77,25 +58,14 @@ fn registrations_wakes_and_unregistrations_interleave_without_a_fault() {
           let (registration, receiver) = register(4, 2, RegisterKick::Kick(Kick::none())).unwrap();
           let id = registration.shard();
           let held = holder_of(id).unwrap();
-          // A foreign wake to our own slot lands in its ring, drained by the "shard" (this thread).
-          // Both wakes are sent as a shard sends: one turn at a time, draining this thread's own ring
-          // between turns — a consumer that blocks in a producer loop without consuming is the
-          // deadlock this test found on 2026-09-14: a holder descheduled after registering came back
-          // to a ring its fast-cycling predecessor had filled with neighbour wakes, looped on `Full`
-          // in its own wake without draining, and every thread behind it stopped too.
-          let mut own_seen = send_as_shard(id, id, 7, landed);
-          // Drain until the own wake is seen: it landed, but a neighbour mid-push into the slot
-          // ahead of it holds the consumer back until that producer finishes (a ring pops in
-          // order) — a shard keeps stepping, so this thread keeps draining.
-          while !own_seen {
-            own_seen = drain_own(id, landed);
-            if !own_seen {
-              std::thread::yield_now();
-            }
-          }
+          // A foreign wake to our own slot lands in its bitmap at once, drained by the "shard" (this
+          // thread): a bit set never waits for a consumer (slates' rings deadlocked here on 2026-09-14,
+          // a holder looping on a full ring of neighbour wakes without draining its own).
+          wake(Encoded::pack(id, OWN_SLOT, 0).unwrap());
+          assert!(drain_own(id, landed), "slot {id}'s own wake landed");
           // A wake to a slot another thread may have freed meanwhile is counted, never a fault.
           let neighbour = id.wrapping_add(1) % u16::try_from(MAX_SHARDS).unwrap_or(u16::MAX);
-          let _ = send_as_shard(id, neighbour, 9, landed);
+          wake(Encoded::pack(neighbour, OWN_SLOT, 0).unwrap());
           let _ = receiver.try_recv();
           drop(registration);
           // The slot was given back: its generation moved past the even value this thread held

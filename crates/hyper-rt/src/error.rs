@@ -71,6 +71,22 @@ pub enum RtError {
     /// The shard.
     shard: u16,
   },
+  /// A timer id that is not in the state the call needs: armed when it was to be armed, or not armed when
+  /// it was to be disarmed (fired, never armed, or past the wheel's capacity).
+  TimerState {
+    /// The timer.
+    id: u32,
+    /// Whether it was armed.
+    armed: bool,
+  },
+  /// A bounded table or queue of the shard's is at its bound (docs/runtime.md §2): the request is
+  /// refused, never queued without a bound.
+  Capacity {
+    /// What is full.
+    what: &'static str,
+    /// Its bound.
+    bound: usize,
+  },
   /// The OS had no room for a non-blocking call now (`EAGAIN`, `WSAEWOULDBLOCK`): local pressure, not a
   /// failure of the socket. Nothing was sent; the call is retried once the socket is writable (AUD-29-61).
   WouldBlock {
@@ -100,6 +116,8 @@ impl fmt::Display for RtError {
         "a ring half shard {shard} must own was already handed out"
       ),
       Self::WorkerFailed { shard } => write!(f, "shard {shard}'s worker ended without a result"),
+      Self::TimerState { id, armed } => write!(f, "timer {id} is {}", if *armed { "already armed" } else { "not armed" }),
+      Self::Capacity { what, bound } => write!(f, "{what} is full at its bound of {bound}"),
       Self::WouldBlock { call } => write!(f, "{call} would block: the OS has no room for it now"),
     }
   }

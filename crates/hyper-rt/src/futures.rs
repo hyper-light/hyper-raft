@@ -6,13 +6,10 @@ use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use crate::mem::MemError;
-
 use crate::error::RtError;
 use crate::registry;
-use crate::shard::{ShardContext, ShardId, TaskId, boxed};
+use crate::shard::{ShardId, TaskId, TimerId, boxed};
 use crate::task::Outcome;
-use crate::timer::TimerId;
 use crate::waker::polling_task;
 
 /// The current shard's id, if this thread runs one.
@@ -97,7 +94,8 @@ impl Future for Join {
 
   fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
     let id = self.id;
-    registry::with_current(|ctx| ctx.poll_join(id, cx.waker()))
+    let joiner = polling_task(cx.waker());
+    registry::with_current(|ctx| ctx.poll_join(id, joiner))
       .unwrap_or(Poll::Ready(Err(RtError::NotOnShardThread)))
   }
 }
@@ -160,13 +158,10 @@ pub fn sleep(ns: u64) -> Sleep {
 }
 
 /// The sleep future: completes, `Ok`, no earlier than its deadline — the shard's clock at the first poll
-/// plus the span. A wheel with no free timer does not end it early: the task waits for a timer to free
-/// (counted, `Counters::timer_waits`) and arms then, or completes if its deadline passed meanwhile. It is
-/// refused only where no wait can succeed: polled off a shard, or with a waker that is not a task's
-/// (`NotOnShardThread`). A caller racing it against other work must tell `Ready(Err)` from the deadline —
-/// `Poll::is_ready` does not. Until 2026-09-30 every
-/// arming failure, a full wheel included, completed the sleep at once, so an overloaded periodic loop spun
-/// exactly when the runtime was under pressure (AUD-29-39).
+/// plus the span. When every timer of the shard is taken it does not end early: the task waits for a timer
+/// to free (counted) and arms then, or completes if its deadline passed meanwhile. It is refused only where
+/// no wait can succeed: polled off a shard, or with a waker that is not a task's (`NotOnShardThread`).
+/// The timer it takes is let go when it drops (slates' AUD-29-39 behaviour, through the desk's intents).
 #[derive(Debug)]
 pub struct Sleep {
   ns: u64,
@@ -181,36 +176,35 @@ impl Future for Sleep {
     let Some(word) = polling_task(cx.waker()) else {
       return Poll::Ready(Err(RtError::NotOnShardThread));
     };
-    let Some(now) = registry::with_current(ShardContext::now_ns) else {
+    let span = self.ns;
+    let held = self.timer;
+    let polled = registry::with_current(|ctx| {
+      let now = ctx.now_ns();
+      // A deadline past the clock's range saturates: the sleep then never completes, which is exactly "no
+      // earlier than its deadline".
+      let deadline = now.saturating_add(span);
+      (now, deadline, held.is_some_and(|id| ctx.timer_pending(id)))
+    });
+    let Some((now, first_deadline, armed)) = polled else {
       return Poll::Ready(Err(RtError::NotOnShardThread));
     };
-    // A deadline past the clock's range saturates: the sleep then never completes, which is exactly "no
-    // earlier than its deadline" (the range is some 584 years of nanoseconds), and its timer is the future's
-    // own, disarmed when it drops.
-    let span = self.ns;
-    let deadline = *self.deadline.get_or_insert(now.saturating_add(span));
+    let deadline = *self.deadline.get_or_insert(first_deadline);
     if now >= deadline {
-      // A timer still armed (the clock passed the deadline before the wheel fired it) is given back.
       if let Some(id) = self.timer.take() {
         let _ = registry::with_current(|ctx| ctx.disarm_timer(id));
       }
       return Poll::Ready(Ok(()));
     }
-    if self.timer.is_some() {
+    if armed {
       return Poll::Pending;
     }
-    match registry::with_current(|ctx| {
-      ctx
-        .arm_timer(deadline, word.word())
-        .map(Some)
-        .or_else(|refusal| match refusal {
-          // The wheel is full: wait for a timer to free, and arm on the poll that wakes.
-          RtError::Mem(MemError::SlabFull { .. }) => ctx.wait_for_timer(word.word()).map(|()| None),
-          refusal => Err(refusal),
-        })
-    }) {
-      Some(Ok(armed)) => {
-        self.timer = armed;
+    let taken = registry::with_current(|ctx| match ctx.arm_timer(deadline, word.word()) {
+      Some(id) => Ok(Some(id)),
+      None => ctx.wait_for_timer(word).map(|()| None),
+    });
+    match taken {
+      Some(Ok(id)) => {
+        self.timer = id;
         Poll::Pending
       }
       Some(Err(refusal)) => Poll::Ready(Err(refusal)),

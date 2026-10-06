@@ -36,18 +36,20 @@ fn reservation_cost_is_independent_of_capacity_and_renewals_allocate_nothing() {
 
   let capacity = 129;
   let mut wheel = Wheel::new(1, capacity, 0);
-  let mut handles = Vec::with_capacity(capacity);
   let mut fired = Vec::with_capacity(capacity);
+  let ids = || (0..capacity).map(|id| u32::try_from(id).unwrap());
   alloc::begin();
-  for word in 0..capacity {
-    handles.push(wheel.insert(10, u64::try_from(word).unwrap()).unwrap());
+  for id in ids() {
+    wheel.arm(id, 10, u64::from(id)).unwrap();
   }
-  assert!(wheel.insert(10, u64::MAX).is_err());
-  for (word, handle) in handles.iter_mut().enumerate() {
-    let old = *handle;
-    wheel.cancel(old).unwrap();
-    *handle = wheel.insert(20, u64::try_from(word).unwrap()).unwrap();
-    assert!(wheel.cancel(old).is_err());
+  assert!(
+    wheel.arm(u32::try_from(capacity).unwrap(), 10, u64::MAX).is_err(),
+    "past the capacity"
+  );
+  for id in ids() {
+    wheel.disarm(id).unwrap();
+    wheel.arm(id, 20, u64::from(id)).unwrap();
+    assert!(wheel.arm(id, 20, 0).is_err(), "an armed timer is not armed twice");
   }
   wheel.advance(10, &mut fired);
   assert!(fired.is_empty());
@@ -57,9 +59,10 @@ fn reservation_cost_is_independent_of_capacity_and_renewals_allocate_nothing() {
     calls, 0,
     "insertion, renewal and expiry stay in reserved storage"
   );
-  fired.sort_unstable();
+  let mut words: Vec<u64> = fired.iter().map(|(_, word)| *word).collect();
+  words.sort_unstable();
   assert_eq!(
-    fired,
+    words,
     (0..u64::try_from(capacity).unwrap()).collect::<Vec<_>>()
   );
 }

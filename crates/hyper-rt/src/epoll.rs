@@ -83,6 +83,10 @@ impl Driver for EpollDriver {
     nanos_since(self.epoch)
   }
 
+  fn clock(&self) -> crate::driver::Clock {
+    crate::driver::Clock::Since(self.epoch)
+  }
+
   fn wait(&mut self, timeout_ns: Option<u64>, out: &mut Vec<Completion>) -> Result<(), RtError> {
     let mut timeout = timeout_ns.map(timespec);
     if !self.nops.is_empty() {

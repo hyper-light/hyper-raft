@@ -1,7 +1,6 @@
-//! The runtime: the configuration derived from the profile, the OS runtime that owns one thread
-//! per shard, the local runtime that runs one shard on the calling thread, and the shard-pair
-//! ring wiring both share with the simulation (§4.3).
-#![allow(unsafe_code)]
+//! The runtime: the configuration derived from the machine's calibration (docs/runtime.md §10), the OS
+//! runtime that owns one thread per shard, and the local runtime that runs one shard on the calling thread
+//! and can run a future to completion there ([`LocalRuntime::block_on`], §4).
 
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -11,13 +10,12 @@ use crate::derived;
 use crate::machine::Derived;
 use crate::machine::calibration::{Calibration, Constants};
 use crate::machine::probes::Pinning;
-use crate::mem::SpscRing;
-
 use crate::control::Control;
 use crate::driver::{DriverSeed, Kick, Prepared, os_driver};
 use crate::error::RtError;
 use crate::registry;
-use crate::shard::{Counters, ShardContext, ShardId, ShardSeed, TaskId};
+use crate::shard::{Kept, ShardContext, ShardId, TaskId};
+use crate::shard_loop::{Counters, Shard, ShardSeed, StepOutcome};
 use crate::task::{AdmissionReceipt, SpawnRequest};
 
 /// Submits a detached task to the shard `holder` names, from any thread and without a runtime handle
@@ -50,6 +48,10 @@ pub struct RuntimeConfig {
   pub tasks_per_shard: usize,
   /// Timers a shard may hold at once.
   pub timers_per_shard: usize,
+  /// Readiness registrations a shard's tasks may queue between two of its loop's drains: the most socket
+  /// waits its tasks start in one poll each (docs/runtime.md §3.4); past it a registration is refused
+  /// `Capacity`.
+  pub interests_per_shard: usize,
   /// Entries in each inbound ring.
   pub ring_entries: usize,
   /// The step budget the watchdog counts against, in nanoseconds.
@@ -90,6 +92,13 @@ pub struct WakeTracking {
   pub idle_ratio: u64,
 }
 
+/// The readiness registrations a shard of `tasks` tasks may queue between drains: each task waits on at
+/// most one read and one write per poll in the common case, so twice its tasks (a task that waits on more
+/// handles at once in one poll is the consumer's to configure).
+pub fn interests_for(tasks: usize) -> usize {
+  tasks.saturating_mul(2)
+}
+
 /// A shard's wake-ring size from the profile's derived `ring_entries` (Little's law at the overflow target), at
 /// least the ring's smallest admitted capacity ([`crate::mem::mpsc::MIN_CAPACITY`]): on a machine whose wake p99
 /// is no longer than a syscall's median the law asks for one slot, a geometry the ring refuses (AUD-29-33), and
@@ -123,6 +132,7 @@ impl RuntimeConfig {
       shards: constants.placement.shards.get(),
       tasks_per_shard,
       timers_per_shard,
+      interests_per_shard: interests_for(tasks_per_shard),
       ring_entries,
       step_budget_ns: constants.spin_ns.get(),
       timer_tick_ns: constants.tick_ns.get(),
@@ -221,32 +231,6 @@ pub fn admission_limit(requests_per_second: u64, p99_service_ns: u64) -> Derived
   )
 }
 
-/// Wires the single-producer rings between every ordered pair of seeds; rings are leaked for
-/// the process (bounded by shards²).
-pub(crate) fn connect_pairs(seeds: &mut [ShardSeed]) -> Result<(), RtError> {
-  let entries = seeds.first().map_or(1, |s| s.config.ring_entries);
-  let ids: Vec<u16> = seeds.iter().map(|s| s.id).collect();
-  for a in 0..seeds.len() {
-    for b in 0..seeds.len() {
-      if a == b {
-        continue;
-      }
-      // The ring is owned by the source shard's registry entry and lent to both contexts as
-      // `&'static`: the entry outlives every borrower (its slot is given back only after every
-      // thread of the runtime joined, and the entry itself is dropped only by the slot's next
-      // registration), so the lifetime is the slot protocol's promise, not a leak.
-      let ring: &'static SpscRing = registry::lend_pair_ring(ids[a], SpscRing::new(entries)?)
-        .ok_or(RtError::ShardGone { shard: ids[a] })?;
-      // Split once, here: the source shard holds the only producer and the target the only consumer for
-      // their contexts' lives (AUD-29-33).
-      let (producer, consumer) = ring.split().ok_or(RtError::RingClaimed { shard: ids[a] })?;
-      seeds[a].set_outbound(ids[b], producer);
-      seeds[b].set_inbound(consumer);
-    }
-  }
-  Ok(())
-}
-
 /// The slot's kick for an OS driver: its descriptor (Unix) or its completion port (Windows), owned by
 /// the slot and closed when the slot retires the registration.
 #[cfg(any(target_os = "macos", target_os = "freebsd"))]
@@ -320,10 +304,10 @@ impl Drop for Runtime {
   }
 }
 
-/// A shard's worker body: builds the context on this thread (pinned first, so the arena and rings are
-/// first touched on the shard's own core), acknowledges the build — or its refusal — on `ready`, then runs
-/// the loop and frees the context. The acknowledgement's sender is dropped with it, so a worker that ends
-/// before acknowledging is seen as gone rather than awaited.
+/// A shard's worker body: builds the shard on this thread (pinned first, so its tables are first touched
+/// on the shard's own core), acknowledges the build — or its refusal — on `ready`, then runs the loop.
+/// The acknowledgement's sender is dropped with it, so a worker that ends before acknowledging is seen as
+/// gone rather than awaited.
 fn run_worker(
   seed: ShardSeed,
   core: Option<u32>,
@@ -331,27 +315,25 @@ fn run_worker(
 ) -> Result<Counters, RtError> {
   let id = seed.id;
   let pinned = core.map(|core| (core, crate::machine::probes::pin_current_thread(core)));
-  let ctx = match ShardContext::build(seed) {
-    Ok(ctx) => ctx,
+  let mut shard = match Shard::build(seed) {
+    Ok(shard) => shard,
     Err(error) => {
       let _ = ready.send((id, Err(error.clone())));
       return Err(error);
     }
   };
-  // The shard's CPU clock, for observers that count their budget in its own time (§4.14).
-  crate::registry::record_cpu_clock(id);
+  // The shard's CPU clock, for observers that count their budget in its own time.
+  registry::record_cpu_clock(id);
   let _ = ready.send((id, Ok(())));
   drop(ready);
   if let Some((core, Pinning::Refused)) = pinned {
-    ctx.note_pin_refused();
-    log_pin_refused(ctx.id, core);
+    shard.note_pin_refused();
+    log_pin_refused(id, core);
   }
-  ctx.run();
-  let counters = ctx.counters();
-  // The loop has returned on this thread: the current-context cell is cleared, the arena is
-  // empty, and nothing foreign dereferences a context — so this thread, which built it,
-  // frees it. The slot's entry stays (retired by `stop`'s `unregister` after the join).
-  registry::reclaim_context(id);
+  shard.run();
+  let counters = shard.counters();
+  drop(shard);
+  registry::note_reclaimed();
   Ok(counters)
 }
 
@@ -423,10 +405,6 @@ fn register_seeds(
         return Err(error);
       }
     }
-  }
-  if let Err(error) = connect_pairs(&mut seeds) {
-    release_seeds(seeds);
-    return Err(error);
   }
   Ok(seeds)
 }
@@ -580,71 +558,74 @@ fn await_readiness(
   Ok(())
 }
 
-/// One shard on the calling thread with the OS driver (tests, benches, the CLI's own work).
+/// One shard on the calling thread with the OS driver (tests, benchmarks, a command's own work).
 pub struct LocalRuntime {
-  /// The shard's context, freed by this runtime's `Drop`: held as a pointer and lent through
-  /// [`LocalRuntime::context`], never as a reference field — a runtime passed by value (`drop(rt)`) has its
-  /// reference fields protected for the call, and freeing their target inside it is undefined behaviour
-  /// (the simulation's clock had exactly this shape, found by Miri on 2026-09-30).
-  ctx: std::ptr::NonNull<ShardContext>,
+  /// Declared before `slot`, so it drops first: its futures are dropped while the registry slot (and the
+  /// kick it owns) still exists.
+  shard: Shard,
   notes: Vec<String>,
+  slot: SlotGuard,
+}
+
+/// Gives a registry slot back when dropped: after the shard that held it, by field order.
+#[derive(Debug)]
+pub(crate) struct SlotGuard(u16);
+
+impl SlotGuard {
+  /// Guards shard `id`'s slot.
+  pub(crate) fn new(id: u16) -> Self {
+    Self(id)
+  }
+}
+
+impl Drop for SlotGuard {
+  fn drop(&mut self) {
+    registry::unregister(self.0);
+    registry::note_reclaimed();
+  }
 }
 
 impl std::fmt::Debug for LocalRuntime {
   fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
     f.debug_struct("LocalRuntime")
-      .field("shard", &self.context().id)
+      .field("shard", &self.shard.id())
       .finish()
   }
 }
 
-impl Drop for LocalRuntime {
-  /// The shard ran on this thread and its loop has returned by the time the value drops (every
-  /// `run_until_*` returns before), so its context is freed and its slot given back here: the kick
-  /// descriptor closes and the slot is reusable by the next runtime.
-  fn drop(&mut self) {
-    let id = self.context().id;
-    registry::note_arena_generation(id, self.context().arena_generation_high());
-    // The context was built and run on this thread (the handle is `!Send`), and every `run_until_*`
-    // returned before this drop: free it here, then give the slot back.
-    registry::reclaim_context(id);
-    registry::unregister(id);
-  }
-}
-
 impl LocalRuntime {
-  /// Builds the shard.
+  /// Builds the shard on the OS driver.
   pub fn new(config: &RuntimeConfig) -> Result<LocalRuntime, RtError> {
     let prepared = os_driver(u32::try_from(config.ring_entries).unwrap_or(u32::MAX))?;
+    let seed = ShardSeed::register(config, prepared.seed, register_kick(prepared.kick_fd))?;
+    let id = seed.id;
+    let shard = Shard::build(seed).inspect_err(|_| registry::unregister(id))?;
     Ok(LocalRuntime {
-      ctx: std::ptr::NonNull::from(ShardContext::build(ShardSeed::register(
-        config,
-        prepared.seed,
-        register_kick(prepared.kick_fd),
-      )?)?),
+      shard,
       notes: prepared.notes,
+      slot: SlotGuard(id),
     })
   }
 
-  /// Builds the shard over a given driver (the simulation, or a test double).
+  /// Builds the shard over a given driver (a test double).
   pub fn with_driver(
     config: &RuntimeConfig,
     driver: DriverSeed,
     kick: Kick,
   ) -> Result<LocalRuntime, RtError> {
+    let seed = ShardSeed::register(config, driver, registry::RegisterKick::Kick(kick))?;
+    let id = seed.id;
+    let shard = Shard::build(seed).inspect_err(|_| registry::unregister(id))?;
     Ok(LocalRuntime {
-      ctx: std::ptr::NonNull::from(ShardContext::build(ShardSeed::register(
-        config,
-        driver,
-        registry::RegisterKick::Kick(kick),
-      )?)?),
+      shard,
       notes: Vec::new(),
+      slot: SlotGuard(id),
     })
   }
 
   /// The shard.
   pub fn shard_id(&self) -> ShardId {
-    ShardId(self.context().id)
+    ShardId(self.slot.0)
   }
 
   /// The driver notes.
@@ -653,20 +634,78 @@ impl LocalRuntime {
   }
 
   /// Spawns a joinable task.
-  pub fn spawn<F: Future<Output = ()> + 'static>(&self, future: F) -> Result<TaskId, RtError> {
-    self
-      .context()
-      .spawn_local(crate::shard::boxed(future), None)
+  pub fn spawn<F: Future<Output = ()> + 'static>(&mut self, future: F) -> Result<TaskId, RtError> {
+    self.shard.spawn_local(crate::shard::boxed(future))
+  }
+
+  /// Keeps `value` for the shard's life and hands back its handle.
+  pub fn keep<T: 'static>(&mut self, value: T) -> Result<Kept<T>, RtError> {
+    self.shard.keep(value)
   }
 
   /// Runs until no task, timer or message is pending.
-  pub fn run_until_idle(&self) {
-    self.context().run_until_idle();
+  pub fn run_until_idle(&mut self) {
+    self.shard.run_until_idle();
   }
 
-  /// The shard's context, for counters and joins: lent for this runtime's borrow, since dropping the
-  /// runtime frees it (AUD-29-08; until 2026-09-30 it was a `&'static` that outlived the drop). The lend
-  /// cannot outlive the runtime:
+  /// Runs `future` to completion on this thread as the shard's root task and returns its output. Whatever
+  /// the root spawned and left running is cancelled and joined before this returns: nothing outlives the
+  /// call. Refused when the root cannot be admitted, and `ShardGone` when the shard's driver is lost
+  /// before the root finishes.
+  pub fn block_on<T: 'static>(&mut self, future: impl Future<Output = T> + 'static) -> Result<T, RtError> {
+    self.shard.spawn_local(crate::shard::boxed(async move {
+      let output = future.await;
+      let _ = registry::with_current(|desk| desk.put_root_output(Box::new(output)));
+    }))?;
+    loop {
+      if let Some(output) = self.shard.context().take_root_output() {
+        self.shard.cancel_everything();
+        self.shard.run_until_idle();
+        return output
+          .downcast::<T>()
+          .map(|output| *output)
+          .map_err(|_| RtError::BadConfig {
+            what: "a root output of another type",
+          });
+      }
+      let outcome = self.shard.step();
+      if outcome.exit {
+        return Err(RtError::ShardGone {
+          shard: self.slot.0,
+        });
+      }
+      if !outcome.did_work {
+        self.shard.park(outcome.next_deadline_ns);
+      }
+    }
+  }
+
+  /// One loop iteration without blocking.
+  pub fn step(&mut self) -> StepOutcome {
+    self.shard.step()
+  }
+
+  /// Parks in the driver until a kick, a completion or `deadline_ns`.
+  pub fn park(&mut self, deadline_ns: Option<u64>) {
+    self.shard.park(deadline_ns);
+  }
+
+  /// The shard's counters.
+  pub fn counters(&self) -> Counters {
+    self.shard.counters()
+  }
+
+  /// Live tasks.
+  pub fn live_tasks(&self) -> usize {
+    self.shard.live_tasks()
+  }
+
+  /// Whether the shard left its loop.
+  pub fn exited(&self) -> bool {
+    self.shard.exited()
+  }
+
+  /// The shard's desk, for reads in tests and between runs; lent for this runtime's borrow:
   ///
   /// ```compile_fail,E0515
   /// use hyper_rt::runtime::{LocalRuntime, RuntimeConfig};
@@ -677,10 +716,7 @@ impl LocalRuntime {
   /// }
   /// ```
   pub fn context(&self) -> &ShardContext {
-    // SAFETY: the pointer came from the `&'static` `ShardContext::build` returned, whose context is freed only
-    // by this runtime's `Drop` (`reclaim_context`); the borrow returned is bounded by `&self`, so it ends
-    // before that drop.
-    unsafe { self.ctx.as_ref() }
+    self.shard.context()
   }
 }
 

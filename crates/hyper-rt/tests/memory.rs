@@ -23,6 +23,7 @@ fn config() -> RuntimeConfig {
     shards: 2,
     tasks_per_shard: 4096,
     timers_per_shard: 4096,
+    interests_per_shard: 64,
     ring_entries: 64,
     step_budget_ns: 1_000_000,
     timer_tick_ns: 100_000,

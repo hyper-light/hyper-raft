@@ -11,7 +11,6 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::channel;
 
-use hyper_rt::error::RtError;
 use hyper_rt::registry::with_current;
 use hyper_rt::runtime::RuntimeConfig;
 use hyper_rt::shard::Kept;
@@ -22,6 +21,7 @@ fn config() -> RuntimeConfig {
     shards: 1,
     tasks_per_shard: 16,
     timers_per_shard: 16,
+    interests_per_shard: 64,
     ring_entries: 16,
     step_budget_ns: 1_000_000_000,
     timer_tick_ns: 100_000,
@@ -46,19 +46,14 @@ impl Drop for Counted {
   }
 }
 
-/// Keeps a [`Counted`] from a task of a fresh simulated runtime and returns the runtime and the handle.
+/// Keeps a [`Counted`] on the shard of a fresh simulated runtime (its owner keeps it, between runs) and
+/// returns the runtime and the handle.
 fn runtime_keeping(word: u64, drops: &'static AtomicU64) -> (SimRuntime, Kept<Counted>) {
   let mut sim = SimRuntime::new(&config(), 1).unwrap();
   let shard = sim.shard_ids()[0];
-  let (tx, rx) = channel();
-  sim
-    .spawn_on(shard, async move {
-      let kept = with_current(|context| context.keep(Counted { word, drops })).unwrap();
-      let _ = tx.send(kept);
-    })
-    .unwrap();
+  let kept = sim.keep(shard, Counted { word, drops }).unwrap();
   sim.run_until_idle();
-  (sim, rx.recv().unwrap().unwrap())
+  (sim, kept)
 }
 
 /// Resolves `kept` from a task of `sim`'s shard: what the value's word reads there.
@@ -133,8 +128,7 @@ fn the_current_shard_is_published_only_while_its_owner_steps() {
     .unwrap();
   sim.run_until_idle();
   assert_eq!(rx.recv().unwrap(), Some(shard.0), "inside a step");
-  let context = sim.context(shard).unwrap();
-  let _ = context.step();
+  let _ = sim.step(shard).unwrap();
   assert_eq!(
     with_current(|context| context.id),
     None,
@@ -142,47 +136,38 @@ fn the_current_shard_is_published_only_while_its_owner_steps() {
   );
 }
 
-/// AUD-29-08: do: inside a borrow of a kept value, keep another value on the same shard, and keep a value
-/// whose builder keeps a second; expect both refused `KeptInUse`, the built value of the second dropped,
-/// and the first value still reachable.
+/// docs/runtime.md §3.4: kept values are kept by the shard's owner between runs and immutable while it runs,
+/// so a task reaches every one of them by shared lend, one inside another, with nothing to refuse; and each
+/// is dropped exactly once, with its shard.
 #[test]
-fn a_keep_inside_a_kept_borrow_is_refused_typed() {
+fn kept_values_are_lent_together_and_dropped_once_with_their_shard() {
   static DROPS: AtomicU64 = AtomicU64::new(0);
   let mut sim = SimRuntime::new(&config(), 9).unwrap();
   let shard = sim.shard_ids()[0];
+  let outer = sim.keep(shard, 1_u64).unwrap();
+  let counted = sim
+    .keep(
+      shard,
+      Counted {
+        word: 4,
+        drops: &DROPS,
+      },
+    )
+    .unwrap();
   let (tx, rx) = channel();
   sim
     .spawn_on(shard, async move {
-      let outer = with_current(|context| context.keep(1_u64))
-        .unwrap()
-        .unwrap();
       let nested = outer
-        .with(|_| with_current(|context| context.keep(2_u64).map(|_| ())))
-        .flatten()
-        .unwrap();
-      let building = with_current(|context| {
-        context.keep_with(|_: Kept<Counted>| {
-          let _ = context.keep(3_u64);
-          Counted {
-            word: 4,
-            drops: &DROPS,
-          }
-        })
-      })
-      .unwrap();
-      let _ = tx.send((nested, building.map(|_| ()), outer.with(|value| *value)));
+        .with(|first| counted.with(|second| (*first, second.word)))
+        .flatten();
+      let _ = tx.send(nested);
     })
     .unwrap();
   sim.run_until_idle();
-  let (nested, building, outer) = rx.recv().unwrap();
-  assert_eq!(nested, Err(RtError::KeptInUse { shard: shard.0 }));
-  assert_eq!(building, Err(RtError::KeptInUse { shard: shard.0 }));
-  assert_eq!(
-    DROPS.load(Ordering::SeqCst),
-    1,
-    "the refused build was dropped"
-  );
-  assert_eq!(outer, Some(1));
+  assert_eq!(rx.recv().unwrap(), Some((1, 4)));
+  assert_eq!(DROPS.load(Ordering::SeqCst), 0, "kept while the shard lives");
+  drop(sim);
+  assert_eq!(DROPS.load(Ordering::SeqCst), 1, "dropped once, with its shard");
 }
 
 /// AUD-29-08: do: inside a task of one runtime, build and run another to idle on the same thread; expect

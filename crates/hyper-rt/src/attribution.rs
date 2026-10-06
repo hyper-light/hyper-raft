@@ -12,14 +12,15 @@
 //! The shard reads the calling thread's account ([`ThreadAccount`]) at the start of a window and at the
 //! end of a long poll: its CPU time (`CLOCK_THREAD_CPUTIME_ID` on Linux and macOS) and, on Linux, its
 //! voluntary context switches (`getrusage(RUSAGE_THREAD)`'s `ru_nvcsw`: the thread blocked in a call;
-//! Linux counts a preemption and a `sched_yield` as involuntary). The runtime reports its own yields
-//! inside a poll (a send to a full ring) to the window. Measured in a Linux container on this Mac (Docker,
+//! Linux counts a preemption and a `sched_yield` as involuntary). hyper-rt's runtime never yields the
+//! thread inside a poll (no wake waits for a full ring: docs/runtime.md §3.2), so slates' report of its own
+//! yields to the window is gone. Measured in a Linux container on this Mac (Docker,
 //! four CPUs, 2026-09-25, best of five rounds of 200,000 calls): the CPU clock 155–161 ns and `getrusage`
 //! 130–134 ns; on Apple silicon the CPU clock 107–129 ns (2026-09-22). That is too dear for every poll,
 //! so the shard reads only at the end of a poll that already ran long, and — while a long poll went
 //! unattributed for want of a window — at each step's start and each wait's end ([`Tracker`]); a busy
 //! period that runs no long poll stops the readings. macOS counts no per-thread voluntary switches, so a
-//! poll off the CPU there is unattributed unless the runtime itself yielded in it. A virtual machine's
+//! poll off the CPU there is unattributed. A virtual machine's
 //! guest may count time its virtual CPU was stolen while the thread ran as the thread's CPU; such a poll
 //! then reads as a long run and is the task's by this rule (the macOS CI runner, run 36289513559,
 //! 2026-09-27: a poll that slept 3 ms took 23 ms and read past a 1 ms quantum on the thread clock). Windows keeps
@@ -114,7 +115,7 @@ pub(crate) enum Attribution {
   /// The task: the poll ran past the quantum on the CPU.
   Long,
   /// The task: the poll's CPU stayed within the quantum and the thread waited inside a call during the
-  /// window — blocked in the kernel, or yielded by the runtime to a full peer ring.
+  /// window — blocked in the kernel.
   Blocked,
   /// The host: the poll's CPU stayed within the quantum and the thread never waited inside a call during
   /// the window, so it was runnable and off the CPU.
@@ -182,8 +183,6 @@ pub(crate) fn attribute(window: &Window, quantum_ns: u64) -> Attribution {
 pub(crate) struct Tracker {
   /// The open window's start: the thread's account and the shard clock then.
   window_start: Option<(ThreadAccount, u64)>,
-  /// Whether the runtime yielded the thread inside a poll since the window opened.
-  yielded: bool,
   /// Whether step starts and wait ends open windows.
   armed: bool,
   /// Whether the busy period since the last wait did work.
@@ -204,7 +203,6 @@ impl Tracker {
   pub(crate) fn step_began(&mut self, read: impl FnOnce() -> Option<(ThreadAccount, u64)>) {
     if self.armed {
       self.window_start = read();
-      self.yielded = false;
     }
   }
 
@@ -216,7 +214,6 @@ impl Tracker {
   /// A wait (a spin or a park) begins: the window closes, and a busy period that ran no long poll disarms.
   pub(crate) fn wait_began(&mut self) {
     self.window_start = None;
-    self.yielded = false;
     if self.period_worked {
       if !self.period_long {
         self.armed = false;
@@ -230,13 +227,7 @@ impl Tracker {
   pub(crate) fn wait_ended(&mut self, read: impl FnOnce() -> Option<(ThreadAccount, u64)>) {
     if self.armed {
       self.window_start = read();
-      self.yielded = false;
     }
-  }
-
-  /// The runtime yielded the thread inside a poll (a send to a full ring waiting for its peer).
-  pub(crate) fn yielded_in_poll(&mut self) {
-    self.yielded = true;
   }
 
   /// A poll that began at `poll_started_ns` ran past `quantum_ns` by the wall clock and ended at `now_ns`
@@ -269,12 +260,8 @@ impl Tracker {
     attribution
   }
 
-  /// Whether the thread waited inside a call between two readings: the runtime's own yield says so on
-  /// any platform; otherwise the voluntary switches, where counted.
+  /// Whether the thread waited inside a call between two readings: the voluntary switches, where counted.
   fn waited_in_call(&self, start: ThreadAccount, end: ThreadAccount) -> Option<bool> {
-    if self.yielded {
-      return Some(true);
-    }
     match (start.voluntary_switches, end.voluntary_switches) {
       (Some(before), Some(after)) => Some(after > before),
       _ => None,
@@ -283,7 +270,6 @@ impl Tracker {
 
   fn open(&mut self, now_ns: u64, reading: Option<ThreadAccount>) {
     self.window_start = reading.map(|account| (account, now_ns));
-    self.yielded = false;
   }
 }
 
@@ -380,11 +366,10 @@ mod tests {
     tracker.step_began(|| panic!("a disarmed shard reads nothing"));
   }
 
-  /// §4.3, A-31: a wait closes the window, so the park's own block is never charged to the poll after it;
-  /// a window opened by an armed step start judges the next long poll; and the runtime's own yield inside
-  /// a poll marks the window as waiting in a call where the platform counts no switches.
+  /// §4.3, A-31: a wait closes the window, so the park's own block is never charged to the poll after it,
+  /// and a window opened by an armed step start judges the next long poll.
   #[test]
-  fn a_wait_closes_the_window_and_the_runtimes_yield_marks_it_blocked() {
+  fn a_wait_closes_the_window_and_a_fresh_window_judges_the_next_long_poll() {
     let mut tracker = Tracker::default();
     assert_eq!(
       tracker.long_poll(0, QUANTUM_NS * 2, account(0, None), QUANTUM_NS),
@@ -404,18 +389,17 @@ mod tests {
       Attribution::Preempted,
       "the park's switch is outside the window"
     );
-    tracker.step_began(|| at(QUANTUM_NS * 104, account(30, None)));
-    tracker.yielded_in_poll();
+    tracker.step_began(|| at(QUANTUM_NS * 104, account(30, Some(5))));
     assert_eq!(
       tracker.long_poll(
         QUANTUM_NS * 104,
         QUANTUM_NS * 107,
-        account(40, None),
+        account(40, Some(6)),
         QUANTUM_NS
       ),
       Attribution::Blocked
     );
-    // With no switch count and no yield, off the CPU is all this platform can say.
+    // With no switch count, off the CPU is all this platform can say.
     assert_eq!(
       tracker.long_poll(
         QUANTUM_NS * 107,

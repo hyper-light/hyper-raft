@@ -31,6 +31,7 @@
 mod attribution;
 pub mod machine;
 pub mod mem;
+mod cells;
 pub mod control;
 pub mod driver;
 pub mod error;
@@ -42,6 +43,7 @@ pub mod readiness;
 pub mod registry;
 pub mod runtime;
 pub mod shard;
+pub mod shard_loop;
 pub mod sim;
 pub mod task;
 mod thread_clock;
@@ -53,6 +55,7 @@ pub mod tcp;
 pub mod timer;
 pub mod udp;
 pub mod waker;
+pub mod wakes;
 
 #[cfg(target_os = "windows")]
 mod afd;

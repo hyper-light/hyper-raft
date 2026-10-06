@@ -27,6 +27,7 @@ fn one_timer() -> RuntimeConfig {
     shards: 1,
     tasks_per_shard: 16,
     timers_per_shard: 1,
+    interests_per_shard: 64,
     ring_entries: 16,
     step_budget_ns: 1_000_000_000,
     timer_tick_ns: 1_000,
@@ -63,7 +64,7 @@ fn a_sleep_facing_a_full_wheel_waits_rather_than_completing_early() {
     assert_eq!(slept, Ok(()));
     assert!(elapsed >= SPAN_NS, "slept {elapsed} ns of {SPAN_NS}");
   }
-  let counters = sim.context(shard).unwrap().counters();
+  let counters = sim.counters(shard).unwrap();
   assert!(
     counters.timer_waits >= 1,
     "the second sleep waited for a timer: {counters:?}"
@@ -148,7 +149,7 @@ fn a_deadline_past_the_clock_never_fires_and_its_timer_returns_on_drop() {
   assert_eq!(forever, Ok(None), "the saturated sleep did not complete");
   assert_eq!(slept, Ok(Some((Ok(()), Ok(())))));
   assert!(elapsed >= SPAN_NS);
-  assert_eq!(sim.context(shard).unwrap().counters().timer_waits, 0);
+  assert_eq!(sim.counters(shard).unwrap().timer_waits, 0);
 }
 
 /// AUD-29-39: do: in a one-timer shard, one task holds the timer for a second and another waits for it; drop
@@ -166,9 +167,9 @@ fn shutdown_ends_a_sleep_waiting_for_a_timer() {
       .unwrap();
   }
   for _ in 0..4 {
-    let _ = sim.context(shard).unwrap().step();
+    let _ = sim.step(shard).unwrap();
   }
-  let counters = sim.context(shard).unwrap().counters();
+  let counters = sim.counters(shard).unwrap();
   assert_eq!(counters.timer_waits, 1, "one sleep waits: {counters:?}");
   drop(sim);
 }

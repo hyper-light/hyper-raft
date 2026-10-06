@@ -67,6 +67,7 @@ pub mod runtime;
 pub mod shard;
 pub mod shard_loop;
 pub mod sim;
+pub mod sync;
 pub mod task;
 mod thread_clock;
 pub use thread_clock::CpuReading;

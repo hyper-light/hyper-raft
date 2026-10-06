@@ -924,6 +924,7 @@ dependencies = [
  "env_logger",
  "hex",
  "hyper-measure",
+ "hyper-rt",
  "log",
  "macro_rules_attribute",
  "num-bigint",

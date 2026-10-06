@@ -27,6 +27,8 @@ zeroize = "1.8"
 zlib-rs = "0.6"
 
 [dev-dependencies]
+# The session composed over hyper-rt's TcpStream (tests/over_hyper_rt.rs; hyper-rt docs/runtime.md §5.2).
+hyper-rt = { path = "../hyper-rt" }
 base64 = "0.22"
 env_logger = "0.11"
 hex = "0.4"

@@ -395,7 +395,11 @@ On all three OSes, IPv4 and IPv6: `TcpListener::bind(addr, backlog)`, `accept`, 
   (wait-free take; a slot travels with its stream through `into_parts`), `bind_shared` (`SO_REUSEPORT`).
   `tests/tcp.rs` and `tests/tcp_streams.rs` pass on macOS and Linux 6.12; Windows is clippy-checked, its
   run owed to the Windows lanes. `tcp::serve` done the same day (`tests/tcp_serve.rs`, macOS
-  and Linux). **Owed**: the TLS composition test.
+  and Linux). TLS composition: `hyper-tls/tests/over_hyper_rt.rs` runs an HTTP/1.1 exchange over TLS 1.3
+  with a mebibyte response on hyper-rt's `TcpStream` (macOS and Linux); the test lives in hyper-tls so
+  hyper-rt's own tests build no C for a cross target. The pump keeps ciphertext the session has not taken
+  pending until the plaintext before it is read: feeding a whole read at once overflowed hyper-tls's
+  plaintext buffer, the backpressure a consumer's pump must keep too.
 
 ### 5.3 Local stream sockets and the peer's identity
 

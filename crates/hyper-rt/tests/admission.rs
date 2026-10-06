@@ -37,9 +37,6 @@ const ARENA: usize = 4;
 /// Shape: how long a receipt or a reply is waited for before the test calls it lost: far past a
 /// shard's step and a held shard's spin, so a slow box does not fail a correct runtime.
 const WAIT: Duration = Duration::from_secs(10);
-/// Shape: a wait that must *not* be satisfied is watched this long — long enough that a task which
-/// was going to run has run.
-const QUIET: Duration = Duration::from_millis(200);
 /// Shape: how long a held shard spins, nanoseconds: long enough for the submissions made meanwhile
 /// to queue behind it, short enough for the test.
 const HOLD_NS: u64 = 300_000_000;
@@ -153,8 +150,8 @@ fn a_full_arena_refuses_on_the_receipt_and_admits_once_a_task_ends() {
         "submitted (the channel is receptive), refused at admission (the arena is full)"
     );
     assert!(
-        ran.recv_timeout(QUIET).is_err(),
-        "a refused task never runs"
+        ran.recv().is_err(),
+        "a refused task never runs: its future, and the sender in it, is dropped unrun"
     );
     RELEASE.store(true, Ordering::Release);
     let began = Instant::now();
@@ -187,8 +184,8 @@ fn a_request_drained_during_shutdown_is_terminated_on_its_receipt() {
     let counters = rt.shutdown().unwrap();
     assert_eq!(receipt.wait(WAIT), Some(Admission::Terminated));
     assert!(
-        ran.recv_timeout(QUIET).is_err(),
-        "a terminated task never runs"
+        ran.recv().is_err(),
+        "a terminated task never runs: its future, and the sender in it, is dropped unrun"
     );
     assert_eq!(
         counters[0].refused_at_shutdown, 1,

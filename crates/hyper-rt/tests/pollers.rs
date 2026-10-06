@@ -38,10 +38,6 @@ const SPIN_NS: u64 = 2_000_000_000;
 /// Shape: how long the ring gets to wake the poller before the test fails — far past a step, far
 /// below the client's one-second claim wait the lost ring would otherwise be paid in.
 const WAKE_DEADLINE: Duration = Duration::from_secs(2);
-/// Shape: how long the shard gets to finish the step that polled the task and settle into its idle
-/// spin before the ring is sent (a step is microseconds; a generous margin on a loaded machine), far
-/// inside the spin window — so the ring lands in the spin, not in the step before it.
-const SETTLE: Duration = Duration::from_millis(50);
 
 fn config() -> RuntimeConfig {
     RuntimeConfig {
@@ -112,9 +108,15 @@ fn a_ring_during_the_idle_spin_wakes_a_consuming_poller() {
         wait_until(WAKE_DEADLINE, || SERVED.load(Ordering::Acquire) >= 1),
         "the doorbell task ran once and went idle"
     );
-    // Let the step that polled the task end and the shard, inside its window with nothing to do, settle
-    // into its spin; then ring.
-    let _ = wait_until(SETTLE, || false);
+    // Ring once the shard is in its idle spin: the spin after the step that polled the task (the step's
+    // count of the task happens before the spin's mark), not a guessed settle time (finding 10c).
+    assert!(
+        wait_until(WAKE_DEADLINE, || registry::with_entry(shard.0, |entry| {
+            entry.pulse.spinning()
+        })
+        .unwrap_or(false)),
+        "the shard entered its idle spin"
+    );
     RUNG.store(true, Ordering::Release);
     let _ = registry::with_entry(shard.0, |entry| entry.kick.kick());
     let woken = wait_until(WAKE_DEADLINE, || SERVED.load(Ordering::Acquire) >= 2);

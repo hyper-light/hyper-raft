@@ -678,7 +678,13 @@ impl Shard {
             return false;
         }
         self.core.attribution.wait_began();
+        if let Some(entry) = self.desk.entry {
+            entry.pulse.record_spinning(true);
+        }
         let found = self.spin_for_work(window_end, deadline_ns);
+        if let Some(entry) = self.desk.entry {
+            entry.pulse.record_spinning(false);
+        }
         if found {
             self.wait_ended();
         }

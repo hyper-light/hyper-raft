@@ -119,9 +119,25 @@ pub struct Pulse {
     /// The shard's online wake estimate (`ShardContext::wake_cost_ns`), mirrored at each wake it folds
     /// in, for a reader on another thread (the daemon's status, a stall diagnosis).
     wake_cost_ns: AtomicU64,
+    /// Whether the shard is in its idle spin now, mirrored as it enters and leaves one: an observer tells
+    /// a spinning shard from a running or parked one (a stall diagnosis; a test that must ring during the
+    /// spin waits on this, not on a guessed settle time — mantle's review, finding 10c).
+    spinning: AtomicBool,
 }
 
 impl Pulse {
+    /// The owning shard marks entering (`true`) and leaving (`false`) its idle spin. Release: an observer
+    /// that acquires `true` after a fact the shard published before the spin sees this spin, not an
+    /// earlier one.
+    pub fn record_spinning(&self, spinning: bool) {
+        self.spinning.store(spinning, Ordering::Release);
+    }
+
+    /// Whether the shard is in its idle spin now (see [`Pulse::record_spinning`]).
+    pub fn spinning(&self) -> bool {
+        self.spinning.load(Ordering::Acquire)
+    }
+
     /// The owning shard mirrors its measured scheduler overrun after folding a wait into it.
     pub fn record_scheduler_overrun(&self, overrun_ns: u64) {
         self.scheduler_overrun_ns

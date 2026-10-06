@@ -103,7 +103,8 @@ fn a_tcp_request_and_reply_travel_through_the_driver() {
     })
     .unwrap();
 
-    match rx.recv_timeout(Duration::from_secs(5)) {
+    // The reply is the fact waited on; a hang is the harness's to report (finding 10c).
+    match rx.recv() {
         Ok(Ok(bytes)) => {
             let mut expected = REPLY_PREFIX.to_vec();
             expected.extend_from_slice(REQUEST);
@@ -113,10 +114,7 @@ fn a_tcp_request_and_reply_travel_through_the_driver() {
             );
         }
         Ok(Err(e)) => panic!("the round trip failed: {e:?}"),
-        Err(e) => {
-            let counters = rt.shutdown().unwrap();
-            panic!("timed out ({e}); counters {counters:#?}");
-        }
+        Err(e) => panic!("the client task ended without a reply: {e}"),
     }
     rt.shutdown().unwrap();
 }
@@ -176,7 +174,8 @@ fn a_listener_handed_over_by_descriptor_serves_on_the_same_port() {
     })
     .unwrap();
 
-    match rx.recv_timeout(Duration::from_secs(5)) {
+    // The reply is the fact waited on; a hang is the harness's to report (finding 10c).
+    match rx.recv() {
         Ok(Ok(bytes)) => {
             let mut expected = REPLY_PREFIX.to_vec();
             expected.extend_from_slice(REQUEST);
@@ -186,10 +185,7 @@ fn a_listener_handed_over_by_descriptor_serves_on_the_same_port() {
             );
         }
         Ok(Err(e)) => panic!("the round trip failed: {e:?}"),
-        Err(e) => {
-            let counters = rt.shutdown().unwrap();
-            panic!("timed out ({e}); counters {counters:#?}");
-        }
+        Err(e) => panic!("the client task ended without a reply: {e}"),
     }
     rt.shutdown().unwrap();
 }
@@ -197,9 +193,6 @@ fn a_listener_handed_over_by_descriptor_serves_on_the_same_port() {
 /// Shape: an idle spin window far longer than any round trip, so a reply that waited for the window to
 /// end is unmistakable (§4.3's 2-competitive spin runs for the idle window before a park).
 const LONG_SPIN_NS: u64 = 10_000_000_000;
-/// Shape: the reply's bound: a tenth of the spin window, so it cannot have waited the window out yet
-/// is thousands of loopback round trips on any host.
-const REPLY_WITHIN: Duration = Duration::from_millis(1_000);
 
 /// §4.3: a shard spinning in its idle window sees its driver's readiness, not only its rings: a request
 /// arriving on a socket while the shard spins is answered at once, not after the window ends and the
@@ -249,39 +242,40 @@ fn a_spinning_shard_answers_a_socket_request_without_waiting_out_its_window() {
     })
     .unwrap();
     let waited = rx
-        .recv_timeout(Duration::from_nanos(LONG_SPIN_NS * 3))
+        .recv()
         .expect("the exchange completed")
         .expect("the exchange succeeded");
+    // The fault waits the window out: the reply leaves only after the spin ends and the shard parks and
+    // reads its driver. The window itself is the bound (finding 10c), not a guessed fraction of it.
     assert!(
-        waited < REPLY_WITHIN,
-        "the reply waited {waited:?}: a spinning shard must see socket readiness"
+        waited < Duration::from_nanos(LONG_SPIN_NS),
+        "the reply waited {waited:?}, the whole spin window: a spinning shard must see socket readiness"
     );
     rt.shutdown().unwrap();
 }
 
-/// Shape: request/reply rounds timed after the connection settles; the median of them is judged, so a
-/// scheduling hiccup on a loaded host moves one sample, not the verdict.
+/// Shape: request/reply rounds, each answered in two writes.
 const ROUNDS: usize = 32;
-/// Shape: a quarter of the smallest delayed-acknowledgement timer the supported kernels run (Linux
-/// `TCP_DELACK_MIN` = HZ/25 = 40 ms, include/net/tcp.h; macOS `net.inet.tcp.delayed_ack` 100 ms), so a
-/// round that waited for the peer's delayed ACK cannot pass, yet the bound is thousands of loopback
-/// round trips.
-const ROUND_WITHIN: Duration = Duration::from_millis(10);
 
 /// §4.6 (the NFS loopback server's sockets): a server that answers one request in two writes — as it
 /// does when two replies leave in separate batches — must not hold the second write until the client
 /// acknowledges the first. With Nagle's algorithm on, the second small write waits for that ACK, and a
 /// client with nothing to send delays its ACK (40 ms on Linux), so each round costs a delayed-ACK timer:
-/// the 40 ms tails the hot-directory storm measured through a native Linux mount. Do run request/reply
-/// rounds whose reply leaves in two writes; expect the median round far under the delayed-ACK timer.
+/// the 40 ms tails the hot-directory storm measured through a native Linux mount. The cause is Nagle's
+/// algorithm, so the test judges it, read back from the OS on both ends, not a median round against a
+/// guessed bound (mantle's review, finding 10c). Do: run request/reply rounds whose reply leaves in two
+/// writes. Expect: every round answered whole, and `TCP_NODELAY` set on the accepted and the connected
+/// stream.
 #[test]
 fn a_reply_in_two_writes_does_not_wait_for_the_peers_delayed_acknowledgement() {
     let rt = Runtime::start(&config()).unwrap();
     let id = rt.shard_ids()[0];
     let listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0), BACKLOG).unwrap();
     let addr = listener.local_addr().unwrap();
+    let (accepted_tx, accepted_rx) = channel();
     rt.spawn_on(id, async move {
         if let Ok(stream) = listener.accept().await {
+            let _ = accepted_tx.send(stream.nodelay());
             let mut buf = [0u8; 64];
             while let Ok(n) = stream.read(&mut buf).await {
                 if n == 0
@@ -296,12 +290,12 @@ fn a_reply_in_two_writes_does_not_wait_for_the_peers_delayed_acknowledgement() {
     .unwrap();
     let (tx, rx) = channel();
     rt.spawn_on(id, async move {
-        let outcome: Result<Vec<Duration>, hyper_rt::RtError> = async {
+        let outcome: Result<(bool, usize), hyper_rt::RtError> = async {
             let stream = TcpStream::connect(addr).await?;
+            let nodelay = stream.nodelay()?;
             let want = REPLY_PREFIX.len() + REQUEST.len();
-            let mut rounds = Vec::with_capacity(ROUNDS);
+            let mut answered = 0;
             for _ in 0..ROUNDS {
-                let started = std::time::Instant::now();
                 stream.write_all(REQUEST).await?;
                 let mut got = 0;
                 let mut buf = [0u8; 64];
@@ -312,23 +306,28 @@ fn a_reply_in_two_writes_does_not_wait_for_the_peers_delayed_acknowledgement() {
                     }
                     got += n;
                 }
-                rounds.push(started.elapsed());
+                if got == want {
+                    answered += 1;
+                }
             }
-            Ok(rounds)
+            Ok((nodelay, answered))
         }
         .await;
         let _ = tx.send(outcome);
     })
     .unwrap();
-    let mut rounds = rx
-        .recv_timeout(Duration::from_secs(30))
+    let (connected_nodelay, answered) = rx
+        .recv()
         .expect("the rounds completed")
         .expect("the rounds succeeded");
-    rounds.sort();
-    let median = rounds[rounds.len() / 2];
+    assert_eq!(answered, ROUNDS, "every round was answered whole");
+    assert!(connected_nodelay, "the connected stream is TCP_NODELAY");
     assert!(
-        median < ROUND_WITHIN,
-        "the median round took {median:?} (all: {rounds:?}): the second write waited for a delayed ACK"
+        accepted_rx
+            .recv()
+            .expect("the server accepted")
+            .expect("the option reads back"),
+        "the accepted stream is TCP_NODELAY"
     );
     rt.shutdown().unwrap();
 }

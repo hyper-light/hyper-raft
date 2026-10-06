@@ -56,6 +56,8 @@ UNSAFE_ALLOWED = {
         "sendmmsg, recvmmsg, UDP_SEGMENT, UDP_GRO and SCM_TIMESTAMPNS control messages, which rustix 1.1 lacks (batched UDP, docs/runtime.md §5.1)",
     "crates/hyper-rt/src/udp/macos.rs":
         "recvmsg with SCM_TIMESTAMP_MONOTONIC and mach_absolute_time, which rustix drops (kernel receive stamps, docs/runtime.md §5.1)",
+    "crates/hyper-rt/src/retire.rs":
+        "the counted-pin protocol's raw entry pointer: published from a Box, read under a pin, freed by the last reader of its retirement (docs/runtime.md §4.3)",
     "crates/hyper-rt/src/registry.rs":
         "the static shard table's entry and context pointers under counted readers, and the thread's current-shard pointer (docs/runtime.md §3.4, §13)",
     "crates/hyper-rt/src/thread_clock.rs":

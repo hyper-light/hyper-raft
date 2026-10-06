@@ -99,8 +99,9 @@ performance off the OS's load balancing [LOZI; NOTE26 §4.5]. Work moves between
 (§8), never as shared mutable state.
 
 **Kept from slates-rt:** the task arena with generational slots, the `Copy` waker word, the process-static
-shard registry with odd/even generations and counted foreign readers, the park-and-kick protocol and
-its loom model, the hierarchical timing wheel, structured cancellation (a parent's end cancels and joins
+shard registry with odd/even generations and counted foreign readers (retirement now never waits for
+them: the last reader frees the entry, `src/retire.rs`, loom-modelled; mantle's review, finding 10b),
+the park-and-kick protocol and its loom model, the hierarchical timing wheel, structured cancellation (a parent's end cancels and joins
 its children), admission receipts, long-poll attribution, the simulation driver. Each is described below
 with what changes.
 
@@ -640,6 +641,7 @@ The files to be listed in `scripts/check-contracts.py`, each with the interface 
 |---|---|
 | `src/waker.rs` | `RawWakerVTable` over the `Copy` word |
 | `src/registry.rs` | the static slot table's entry pointer under counted readers (slates' protocol; NOTE08 §3.8 flags one `&mut Entry` formed while foreign readers hold `&Entry`, to be closed in the port) |
+| `src/retire.rs` | the counted-pin protocol's raw entry pointer: published from a `Box`, read under a pin, freed by the last reader of its retirement (loom: one and two readers against a retirement, and a retirement inside a read) |
 | `src/sys/kqueue.rs` | `kevent` (rustix's is safe; the `EVFILT_USER` trigger is not covered) |
 | `src/sys/epoll.rs` | none expected (rustix) |
 | `src/sys/windows/{iocp,afd,net}.rs` | completion ports, `NtDeviceIoControlFile` for AFD, Winsock |

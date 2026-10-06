@@ -19,7 +19,7 @@
 #![allow(unsafe_code)]
 
 use std::cell::Cell;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering, fence};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
 
 use crate::mem::Encoded;
@@ -30,6 +30,7 @@ use crate::driver::Kick;
 use crate::driver::KickFd;
 use crate::error::RtError;
 use crate::parking::Parking;
+use crate::retire::Pinned;
 use crate::shard::ShardContext;
 use crate::wakes::WakeBitmap;
 
@@ -219,10 +220,9 @@ impl Pulse {
 #[repr(align(128))]
 struct Slot {
     generation: AtomicU32,
-    /// Foreign readers inside [`with_entry`]. Retirement clears the pointer, then waits for
-    /// zero before freeing the entry, including when a borrower was descheduled.
-    readers: AtomicU32,
-    entry: std::sync::atomic::AtomicPtr<Entry>,
+    /// The entry, read by foreign readers inside [`with_entry`] under counted pins and freed by the last
+    /// of them after its retirement, or by the retirement itself when none reads (`crate::retire`).
+    entry: Pinned<Entry>,
     /// The highest task-arena generation a holder of this slot has issued, carried to the next
     /// holder as its base (see [`Entry::generation_base`]).
     arena_generation: AtomicU32,
@@ -231,18 +231,48 @@ struct Slot {
 }
 
 impl Slot {
+    #[cfg(not(loom))]
     const fn new() -> Slot {
         Slot {
             generation: AtomicU32::new(1),
-            readers: AtomicU32::new(0),
-            entry: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
+            entry: Pinned::new(),
             arena_generation: AtomicU32::new(0),
             stale_wakes: AtomicU64::new(0),
         }
     }
 }
 
+#[cfg(not(loom))]
 static SLOTS: [Slot; MAX_SHARDS] = [const { Slot::new() }; MAX_SHARDS];
+
+/// Under loom the entry's atomics are loom's, which are not `const`: the table is built on first use.
+/// loom's models drive `crate::retire` itself and never touch the table; this only keeps the crate
+/// building under `--cfg loom`.
+#[cfg(loom)]
+static SLOTS: std::sync::LazyLock<[Slot; MAX_SHARDS]> =
+    std::sync::LazyLock::new(|| std::array::from_fn(|_| Slot::new()));
+
+impl Slot {
+    #[cfg(loom)]
+    fn new() -> Slot {
+        Slot {
+            generation: AtomicU32::new(1),
+            entry: Pinned::new(),
+            arena_generation: AtomicU32::new(0),
+            stale_wakes: AtomicU64::new(0),
+        }
+    }
+
+    /// Frees a retired entry (`None`: the slot published none) and publishes the slot free: the
+    /// retirement's finish, run by the retirement or by the entry's last reader. The generation is still
+    /// the holder's (even) value — nothing claims a slot before this store.
+    fn free(&self, entry: Option<Box<Entry>>) {
+        let live = self.generation.load(Ordering::Acquire);
+        drop(entry);
+        self.generation
+            .store(live.wrapping_add(1), Ordering::Release);
+    }
+}
 
 thread_local! {
   /// The context of the shard running on this thread, or null: set only for the span of an [`Entered`]
@@ -361,9 +391,8 @@ pub(crate) fn register_slot(
                 Kick::Sim(holder)
             }
         };
-        // Unregistration clears the pointer and waits out readers before publishing a free slot.
-        // Store only the raw pointer: moving the Box after lending fields would invalidate borrows.
-        slot.entry.store(Box::into_raw(entry), Ordering::Release);
+        // Retirement takes the pointer and frees it through its last reader before publishing a free slot.
+        slot.entry.publish(entry);
         return Ok((id, receiver));
     }
     Err(RtError::TooManyShards { max })
@@ -422,46 +451,35 @@ pub fn contexts_reclaimed() -> u64 {
     CONTEXTS_RECLAIMED.load(Ordering::Relaxed)
 }
 
-/// Retires a shard after all of its runtime's contexts have ended. Remove the entry from
-/// lookup, wait for foreign borrowers, then drop its resources and publish the free generation.
-/// A new registration cannot claim the slot before retirement has finished (§4.3).
+/// Retires a shard after all of its runtime's contexts have ended: removes the entry from lookup, and
+/// its resources are dropped and the free generation published by whichever ends last — this call, when
+/// no foreign reader holds the entry, or the last reader's unpin (`crate::retire`). It never waits: a
+/// descheduled reader delays only the free, and a retirement from inside a reader's own call ends
+/// (mantle's review, finding 10b). A new registration cannot claim the slot before the free (§4.3).
 pub(crate) fn unregister(shard: u16) {
     let Some(slot) = SLOTS.get(usize::from(shard)) else {
         return;
     };
-    let live = slot.generation.load(Ordering::Acquire);
-    if live & 1 == 1 {
+    if slot.generation.load(Ordering::Acquire) & 1 == 1 {
         return;
     }
     note_exited(shard);
-    let retired = slot.entry.swap(std::ptr::null_mut(), Ordering::SeqCst);
-    fence(Ordering::SeqCst);
-    if !retired.is_null() {
-        while slot.readers.load(Ordering::SeqCst) != 0 {
-            std::thread::yield_now();
-        }
-        // SAFETY: this pointer came from Box::into_raw in register. All owning contexts ended,
-        // and the swap/fence/readers protocol excludes every foreign borrow of the retired entry.
-        // New readers see null. The generation remains claimed until the resources are dropped.
-        drop(unsafe { Box::from_raw(retired) });
-    }
-    slot.generation
-        .store(live.wrapping_add(1), Ordering::Release);
+    slot.entry.retire(|entry| slot.free(entry));
 }
 
 /// Runs `f` on the live entry of `shard` — the form every **foreign** reader uses (a wake or a control
-/// message from another thread, an observer reading the pulse or copying the kick): the slot counts the
-/// reader for the call's span. Unregistration frees an entry only after its pointer was removed
-/// and no reader is counted, so `f` never sees freed memory however long its thread is
-/// descheduled. `None` for a free slot (a wake to it is stale). The shard's own context holds an
+/// message from another thread, an observer reading the pulse or copying the kick): the slot pins the
+/// entry for the call's span. A retired entry is freed only once its pointer was removed and no pin is
+/// counted — by this reader, when it is the last — so `f` never sees freed memory however long its
+/// thread is descheduled. `None` for a free slot (a wake to it is stale). The shard's own context holds an
 /// unguarded reference to its entry instead ([`entry`]): its slot cannot be re-registered while it
 /// lives, since unregistration follows its thread's join.
 pub fn with_entry<R>(shard: u16, f: impl FnOnce(&Entry) -> R) -> Option<R> {
     let slot = SLOTS.get(usize::from(shard))?;
-    slot.readers.fetch_add(1, Ordering::SeqCst);
-    fence(Ordering::SeqCst);
-    let _reader = Reader(&slot.readers);
-    read_counted(slot, f)
+    if slot.generation.load(Ordering::Acquire) & 1 == 1 {
+        return None;
+    }
+    slot.entry.read(f, |entry| slot.free(Some(entry)))
 }
 
 /// Records the calling thread's CPU clock on shard `shard`'s entry (the shard's own thread, as it starts).
@@ -485,37 +503,12 @@ pub fn shard_cpu(holder: SlotHolder) -> Option<crate::thread_clock::CpuReading> 
     .and_then(crate::thread_clock::read)
 }
 
-/// Release the reader pin even when a test callback unwinds.
-struct Reader<'a>(&'a AtomicU32);
-impl Drop for Reader<'_> {
-    fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::SeqCst);
-    }
-}
-
 /// A pinned read of one particular registration, never a replacement in the same slot.
 pub(crate) fn with_holder<R>(holder: SlotHolder, f: impl FnOnce(&Entry) -> R) -> Option<R> {
     with_entry(holder.shard, |entry| {
         (entry.holder == holder).then(|| f(entry))
     })
     .flatten()
-}
-
-/// The counted read itself: the generation check, the pointer load and the call, between the reader
-/// count's increment and decrement in [`with_entry`].
-fn read_counted<R>(slot: &Slot, f: impl FnOnce(&Entry) -> R) -> Option<R> {
-    if slot.generation.load(Ordering::Acquire) & 1 == 1 {
-        return None;
-    }
-    let entry = slot.entry.load(Ordering::SeqCst);
-    if entry.is_null() {
-        return None;
-    }
-    // SAFETY: a non-null entry pointer was produced by `Box::into_raw` in `register` and is freed only
-    // by `unregister`, which waits until the slot's reader count is zero after clearing
-    // the pointer; this reader was counted before the pointer load, under the fence protocol
-    // described at that wait, so the entry it loaded is valid for the span of `f`.
-    Some(f(unsafe { &*entry }))
 }
 
 /// Marks `shard`'s entry exited (the shard's own thread, at its loop's exit): a sender that finds its
@@ -533,7 +526,7 @@ pub(crate) fn entry(shard: u16) -> Option<&'static Entry> {
     if slot.generation.load(Ordering::Acquire) & 1 == 1 {
         return None;
     }
-    let entry = slot.entry.load(Ordering::SeqCst);
+    let entry = slot.entry.unguarded();
     if entry.is_null() {
         return None;
     }
@@ -708,13 +701,14 @@ pub fn send_control_to_holder(holder: SlotHolder, message: Control) -> Result<()
 mod tests {
     use super::*;
 
-    /// AC-0.7: pause a foreign descriptor borrow, then retire its shard. Retirement must
-    /// wait for that borrow, and a copied kick must refuse access after retirement and reuse.
+    /// AC-0.7, finding 10b: pause a foreign descriptor borrow, then retire its shard. Expect: the
+    /// retirement returns with the borrow still held (it never waits), the descriptor stays open
+    /// for the borrow's span, the borrow's end frees it, and a copied kick refuses access after
+    /// retirement and reuse.
     #[cfg(unix)]
     #[test]
-    fn retirement_waits_for_a_foreign_kick_borrow() {
+    fn retirement_returns_and_a_borrowed_kick_stays_open_until_the_borrow_ends() {
         use std::sync::mpsc::sync_channel;
-        use std::time::Duration;
 
         let (descriptor, _write) = rustix::pipe::pipe().unwrap();
         #[cfg(target_os = "linux")]
@@ -733,36 +727,32 @@ mod tests {
         };
         let (entered, borrowing) = sync_channel(0);
         let (release, released) = sync_channel(0);
-        let (retiring, retirement_started) = sync_channel(0);
-        let (retired, retirement_done) = sync_channel(1);
-        let closed_during_borrow = std::thread::scope(|scope| {
+        std::thread::scope(|scope| {
             let borrower = scope.spawn(move || {
-                descriptor.with(|_| {
+                descriptor.with(|fd| {
+                    // The number, read while the borrow is fresh; checked below by number alone, so a
+                    // free under the borrow shows as a closed descriptor, never as a read of freed memory.
+                    let raw = std::os::fd::AsRawFd::as_raw_fd(fd);
                     entered.send(()).unwrap();
                     released.recv().unwrap();
+                    // SAFETY: F_GETFD reads the descriptor table only, no memory of this process.
+                    unsafe { libc::fcntl(raw, libc::F_GETFD) != -1 }
                 })
             });
             borrowing.recv().unwrap();
-            let owner = scope.spawn(move || {
-                retiring.send(()).unwrap();
-                unregister(shard);
-                retired.send(()).unwrap();
-            });
-            retirement_started.recv().unwrap();
-            // Shape: a scheduler observation window only; channels force the borrow to span
-            // retirement. This does not tune the runtime or delay a production operation.
-            let closed = retirement_done
-                .recv_timeout(Duration::from_millis(50))
-                .is_ok();
+            // The borrow is held until `release`: a retirement that waited for it would never return.
+            unregister(shard);
+            assert!(
+                with_entry(shard, |_| ()).is_none(),
+                "the retired entry is out of lookup"
+            );
             release.send(()).unwrap();
-            assert_eq!(borrower.join().unwrap(), Some(()));
-            owner.join().unwrap();
-            closed
+            assert_eq!(
+                borrower.join().unwrap(),
+                Some(true),
+                "the descriptor stayed open for its borrow"
+            );
         });
-        assert!(
-            !closed_during_borrow,
-            "unregistration closed a borrowed descriptor"
-        );
         assert_eq!(descriptor.with(|_| ()), None);
         let (replacement, _control) = register_slot(2, 1, RegisterKick::Kick(Kick::None)).unwrap();
         assert_eq!(

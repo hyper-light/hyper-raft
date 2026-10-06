@@ -10,4 +10,8 @@ cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 # Each test's end and each test binary's start, with the machine's memory, go to a file and to the
 # job's summary as they happen (scripts/gate-progress.py): a runner lost mid-run leaves a record of
 # what ran last.
+# The tree is this shell's: on Windows its own process id, which MSYS's bash gives in /proc.
+GATE_ROOT=$$
+if [ -r "/proc/$$/winpid" ]; then GATE_ROOT=$(cat "/proc/$$/winpid"); fi
+export GATE_ROOT
 cargo test --workspace --all-features --locked 2>&1 | python3 scripts/gate-progress.py

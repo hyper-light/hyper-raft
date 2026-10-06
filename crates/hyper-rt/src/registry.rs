@@ -892,10 +892,14 @@ mod tests {
                 "the slot stays claimed while its reader holds the entry"
             );
         });
-        assert_eq!(
-            slot.generation.load(Ordering::Acquire),
-            live.wrapping_add(1),
-            "freed once, by the reader"
+        // Freed by the reader. Another test running beside this one may claim the free slot at once, so the
+        // state is judged, not the count: an odd generation is free; an even one is a registration with its
+        // entry. The bug's state is neither: even, and no entry (a second free under the reader).
+        let after = slot.generation.load(Ordering::Acquire);
+        assert_ne!(after, live, "freed by the reader");
+        assert!(
+            after & 1 == 1 || !slot.entry.unguarded().is_null(),
+            "a claimed slot holds its entry (generation {after})"
         );
     }
 

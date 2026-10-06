@@ -3,7 +3,9 @@
 //! through the registry slot. Before 2026-09-14 every `SimRuntime::new` leaked its contexts, its clock
 //! and one flag block per shard for the process lifetime — the simulation-driven suites (transport,
 //! cluster, db, vfs) build thousands of runtimes per process. One test per binary, so no other test's
-//! allocations move the resident-size numbers.
+//! allocations move the counts. Judged by the heap's live bytes, exactly: the process's resident size
+//! moves with the allocator's retention of freed regions (0 to 1.6 MiB over 32 dropped simulations in
+//! five identical runs, 2026-10-06), which says nothing about a leak.
 
 // Test harness code: a panic here is a failed test (CLAUDE.md §1).
 #![allow(
@@ -23,15 +25,15 @@
     clippy::panic_in_result_fn,
     clippy::missing_panics_doc
 )]
-// The whole file measures resident size through `ps` (Unix), so it is a Unix-only test and the crate is
-// empty on Windows. Without this, `--all-targets` clippy on Windows flags the imports, `config`, `CYCLES`
-// and `one_simulation` as unused there — the only test that uses them is `#[cfg(unix)]`.
-#![cfg(unix)]
 // Test harness code: an unwrap here is a failed test, which is what it should be.
 
+use hyper_measure::alloc::{self, Counting};
 use hyper_rt::registry::contexts_reclaimed;
 use hyper_rt::runtime::RuntimeConfig;
 use hyper_rt::sim::SimRuntime;
+
+#[global_allocator]
+static ALLOCATOR: Counting = Counting;
 
 /// Shape: a daemon-sized task budget per shard, so one simulation is megabytes — far above the page
 /// granularity of the resident-size accounting.
@@ -57,19 +59,6 @@ fn config() -> RuntimeConfig {
 /// footprint is many times the footprint, so the bound below cannot be met by noise.
 const CYCLES: u64 = 32;
 
-/// The process's resident size in KiB, as the kernel accounts it (`ps`, Unix).
-#[cfg(unix)]
-fn resident_kib() -> u64 {
-    let output = std::process::Command::new("ps")
-        .args(["-o", "rss=", "-p", &std::process::id().to_string()])
-        .output()
-        .expect("ps runs");
-    String::from_utf8_lossy(&output.stdout)
-        .trim()
-        .parse()
-        .expect("ps prints the resident size in KiB")
-}
-
 /// Runs one simulation to idle with a task on each shard, and drops it.
 fn one_simulation() {
     let mut sim = SimRuntime::new(&config(), 7).unwrap();
@@ -79,50 +68,39 @@ fn one_simulation() {
     sim.run_until_idle();
 }
 
-/// Do: measure what one live two-shard simulation occupies, drop it, then build and drop `CYCLES` more in
-/// turn, twice. Expect: the second batch grows the resident size by less than one footprint, and the
-/// reclamation counter moved by every context built (non-vacuity: the footprint is positive). Before the
-/// fix, 32 simulations grew the process by 32 footprints. The first batch is not judged: the allocator
-/// keeps the pages the first simulations freed (measured 2026-10-06: about one and a half footprints after
-/// 32 cycles and the same after 128), which says nothing about a leak; growth that continues into the
-/// second batch does.
-#[cfg(unix)]
+/// Do: measure the live heap of one two-shard simulation, then build and drop `CYCLES` simulations in turn
+/// (a warm-up that pays the process's one-time allocations), then `CYCLES` more under a process-wide count.
+/// Expect: the second batch leaves the live heap exactly where it found it, and the reclamation counter moved
+/// by every context built (non-vacuity: a live simulation holds heap). Before the fix, every simulation
+/// leaked its contexts, clock and flags.
 #[test]
 fn a_dropped_simulation_gives_back_its_contexts_clock_and_flags() {
     let reclaimed_before = contexts_reclaimed();
-    let before = resident_kib();
+    alloc::begin_process();
     let warm = SimRuntime::new(&config(), 7).unwrap();
-    let live = resident_kib();
+    let footprint = alloc::read_process().live;
     drop(warm);
-    let footprint = live.saturating_sub(before);
-    let after_warm = resident_kib();
     for _ in 0..CYCLES {
         one_simulation();
     }
-    let settled = resident_kib();
+    alloc::begin_process();
     for _ in 0..CYCLES {
         one_simulation();
     }
-    let after = resident_kib();
-    let growth = after.saturating_sub(settled);
+    let growth = alloc::read_process().live;
     let reclaimed = contexts_reclaimed() - reclaimed_before;
     eprintln!(
-        "resident KiB: before {before}, one simulation live {live} (footprint {footprint}), after warm-up \
-     {after_warm}, after {CYCLES} cycles {settled}, after {CYCLES} more {after} (growth {growth}); \
-     contexts reclaimed {reclaimed}"
+        "live heap: one simulation {footprint} B; after {CYCLES} more dropped, {growth} B; contexts reclaimed \
+     {reclaimed}"
     );
-    assert!(
-        footprint > 0,
-        "a live simulation occupies memory (non-vacuity)"
-    );
+    assert!(footprint > 0, "a live simulation holds heap (non-vacuity)");
     assert_eq!(
         reclaimed,
         (2 * CYCLES + 1) * u64::from(config().shards),
         "every context built was reclaimed"
     );
-    assert!(
-        growth < footprint,
-        "the contexts, clocks and flags of {CYCLES} dropped simulations were given back: the process grew \
-     {growth} KiB against a per-simulation footprint of {footprint} KiB"
+    assert_eq!(
+        growth, 0,
+        "{CYCLES} dropped simulations gave back every byte they allocated"
     );
 }

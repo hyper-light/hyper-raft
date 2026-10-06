@@ -111,7 +111,12 @@ fn a_wait_stepped_past_its_deadline_reports_the_lateness() {
     let deadline = outcome
         .next_deadline_ns
         .expect("the sleep armed a timer the shard waits for");
+    // Parked until the shard's clock reaches the deadline: a wait may return before it (Windows waits expire
+    // on the timer tick, and the loop parks again on such a wake), so one park is not the premise.
     rt.park(Some(deadline));
+    while rt.context().now_ns() < deadline {
+        rt.park(Some(deadline));
+    }
     // Woken at the deadline — and then not run.
     hold_for(HELD_OFF);
     rt.step();

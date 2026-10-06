@@ -1,19 +1,12 @@
-//! The memory structures the runtime is built on, from slates' `mem` (ORIGIN.md): generational
-//! handles and the packed task word, the task slab, segmented storage, and the single- and
-//! multi-producer rings.
+//! The memory structures the runtime is built on, from slates' `mem` (ORIGIN.md): the packed task word
+//! and generational handles, and the bounds every loom model explores under. slates' slab, segmented
+//! storage and rings went with the redesign (docs/runtime.md §3.2, §3.4): the desk's `Cell` structures and
+//! the wake bitmap replaced them.
 
 pub mod error;
 pub mod handle;
 #[cfg(loom)]
 pub mod loom_bounds;
-pub mod mpsc;
-pub mod ring;
-pub mod segmented;
-pub mod slab;
 
 pub use error::MemError;
 pub use handle::{Encoded, Handle};
-pub use mpsc::MpscRing;
-pub use ring::SpscRing;
-pub use segmented::Segmented;
-pub use slab::Slab;

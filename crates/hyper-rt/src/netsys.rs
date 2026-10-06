@@ -21,504 +21,512 @@ pub(crate) use core::net::{Ipv4Addr, SocketAddrV4};
 
 /// The outcome of a non-blocking receive: bytes and a sender, or a signal to await readiness and retry.
 pub(crate) enum Io<T> {
-  /// The operation completed with this value.
-  Ready(T),
-  /// The socket is not ready (`EAGAIN`/`WSAEWOULDBLOCK`); await the read edge through the driver.
-  WouldBlock,
-  /// The call was interrupted before doing anything (`EINTR`); retry at once.
-  Interrupted,
+    /// The operation completed with this value.
+    Ready(T),
+    /// The socket is not ready (`EAGAIN`/`WSAEWOULDBLOCK`); await the read edge through the driver.
+    WouldBlock,
+    /// The call was interrupted before doing anything (`EINTR`); retry at once.
+    Interrupted,
 }
 
 // ============================================================================== Unix (rustix)
 
 #[cfg(unix)]
 mod imp {
-  use std::os::fd::{AsRawFd, OwnedFd};
+    use std::os::fd::{AsRawFd, OwnedFd};
 
-  use rustix::net::{
-    AddressFamily, RecvFlags, SendFlags, SocketAddr, SocketFlags, SocketType, bind as rx_bind,
-    getsockname, recvfrom, sendto as rx_sendto, socket_with,
-  };
-
-  use super::{Io, Ipv4Addr, SocketAddrV4};
-  use crate::driver::refused;
-  use crate::error::RtError;
-
-  /// A non-blocking OS UDP socket owned here (closed on drop, by `OwnedFd`).
-  #[derive(Debug)]
-  pub(crate) struct Socket {
-    fd: OwnedFd,
-  }
-
-  impl Socket {
-    /// The readiness handle a `crate::readiness` future registers (the raw fd).
-    pub(crate) fn raw_id(&self) -> i32 {
-      self.fd.as_raw_fd()
-    }
-  }
-
-  /// The socket's kernel receive buffer (`SO_RCVBUF`) in bytes.
-  pub(crate) fn recv_buffer_bytes(socket: &Socket) -> Result<usize, RtError> {
-    rustix::net::sockopt::socket_recv_buffer_size(&socket.fd).map_err(|e| refused("getsockopt", e))
-  }
-
-  pub(crate) fn dgram_socket() -> Result<Socket, RtError> {
-    // `SocketFlags` on `socket()` is Linux-only, so non-blocking/cloexec are set after creation.
-    let fd = socket_with(
-      AddressFamily::INET,
-      SocketType::DGRAM,
-      SocketFlags::empty(),
-      None,
-    )
-    .map_err(|e| refused("socket(DGRAM)", e))?;
-    rustix::io::fcntl_setfd(&fd, rustix::io::FdFlags::CLOEXEC)
-      .map_err(|e| refused("fcntl(CLOEXEC)", e))?;
-    rustix::io::ioctl_fionbio(&fd, true).map_err(|e| refused("ioctl(FIONBIO)", e))?;
-    set_dont_fragment(&fd)?;
-    Ok(Socket { fd })
-  }
-
-  /// Sets the don't-fragment bit on every datagram the socket sends, and has the kernel leave the
-  /// sizing to the transport (RFC 8899 §3: a packetization layer that probes the path needs its probes
-  /// dropped, not fragmented, when too large; §4.4: a datagram larger than the local interface then
-  /// fails its send with `EMSGSIZE`). Linux: `IP_PMTUDISC_PROBE` sets DF and ignores the kernel's own
-  /// path-MTU cache, so the transport's probes decide.
-  #[cfg(target_os = "linux")]
-  fn set_dont_fragment(fd: &OwnedFd) -> Result<(), RtError> {
-    rustix::net::sockopt::set_ip_mtu_discover(fd, rustix::net::sockopt::Ipv4PathMtuDiscovery::PROBE)
-      .map_err(|e| refused("setsockopt(IP_MTU_DISCOVER)", e))
-  }
-
-  /// macOS: `IP_DONTFRAG` sets DF on each datagram (see the Linux arm).
-  #[cfg(target_os = "macos")]
-  fn set_dont_fragment(fd: &OwnedFd) -> Result<(), RtError> {
-    let on: libc::c_int = 1;
-    let len = libc::socklen_t::try_from(size_of::<libc::c_int>()).unwrap_or(libc::socklen_t::MAX);
-    // SAFETY: `IP_DONTFRAG` takes an `int`; the pointer and length name one live local `c_int`, and the
-    // descriptor is this socket's, open for the call.
-    let outcome = unsafe {
-      libc::setsockopt(
-        fd.as_raw_fd(),
-        libc::IPPROTO_IP,
-        libc::IP_DONTFRAG,
-        (&raw const on).cast::<libc::c_void>(),
-        len,
-      )
+    use rustix::net::{
+        AddressFamily, RecvFlags, SendFlags, SocketAddr, SocketFlags, SocketType, bind as rx_bind,
+        getsockname, recvfrom, sendto as rx_sendto, socket_with,
     };
-    if outcome == 0 {
-      Ok(())
-    } else {
-      Err(RtError::os("setsockopt(IP_DONTFRAG)"))
+
+    use super::{Io, Ipv4Addr, SocketAddrV4};
+    use crate::driver::refused;
+    use crate::error::RtError;
+
+    /// A non-blocking OS UDP socket owned here (closed on drop, by `OwnedFd`).
+    #[derive(Debug)]
+    pub(crate) struct Socket {
+        fd: OwnedFd,
     }
-  }
 
-  /// Whether the socket sends with the don't-fragment bit as [`set_dont_fragment`] set it: Linux reads
-  /// `IP_MTU_DISCOVER` back as `IP_PMTUDISC_PROBE`.
-  #[cfg(target_os = "linux")]
-  pub(crate) fn dont_fragment(socket: &Socket) -> Result<bool, RtError> {
-    rustix::net::sockopt::ip_mtu_discover(&socket.fd)
-      .map(|mode| mode == rustix::net::sockopt::Ipv4PathMtuDiscovery::PROBE)
-      .map_err(|e| refused("getsockopt(IP_MTU_DISCOVER)", e))
-  }
-
-  /// macOS: `IP_DONTFRAG` read back.
-  #[cfg(target_os = "macos")]
-  pub(crate) fn dont_fragment(socket: &Socket) -> Result<bool, RtError> {
-    let mut set: libc::c_int = 0;
-    let mut len =
-      libc::socklen_t::try_from(size_of::<libc::c_int>()).unwrap_or(libc::socklen_t::MAX);
-    // SAFETY: `IP_DONTFRAG` is an `int`; the out pointer and its length name one live local `c_int`, and
-    // the descriptor is this socket's, open for the call.
-    let outcome = unsafe {
-      libc::getsockopt(
-        socket.fd.as_raw_fd(),
-        libc::IPPROTO_IP,
-        libc::IP_DONTFRAG,
-        (&raw mut set).cast::<libc::c_void>(),
-        &raw mut len,
-      )
-    };
-    if outcome == 0 {
-      Ok(set != 0)
-    } else {
-      Err(RtError::os("getsockopt(IP_DONTFRAG)"))
+    impl Socket {
+        /// The readiness handle a `crate::readiness` future registers (the raw fd).
+        pub(crate) fn raw_id(&self) -> i32 {
+            self.fd.as_raw_fd()
+        }
     }
-  }
 
-  pub(crate) fn bind(socket: &Socket, addr: SocketAddrV4) -> Result<(), RtError> {
-    rx_bind(&socket.fd, &addr).map_err(|e| refused("bind", e))
-  }
-
-  /// An already-bound OS socket the caller hands over (the socket-activation shape): the port was never
-  /// released between the caller's bind and this adoption, so nothing can take it in between. Refused
-  /// unless it is a datagram socket; made close-on-exec and non-blocking like one this seam created.
-  pub(crate) fn adopt(fd: OwnedDatagram) -> Result<Socket, RtError> {
-    let kind =
-      rustix::net::sockopt::socket_type(&fd).map_err(|e| refused("getsockopt(SO_TYPE)", e))?;
-    if kind != SocketType::DGRAM {
-      return Err(refused("adopt(SO_TYPE)", rustix::io::Errno::PROTOTYPE));
+    /// The socket's kernel receive buffer (`SO_RCVBUF`) in bytes.
+    pub(crate) fn recv_buffer_bytes(socket: &Socket) -> Result<usize, RtError> {
+        rustix::net::sockopt::socket_recv_buffer_size(&socket.fd)
+            .map_err(|e| refused("getsockopt", e))
     }
-    rustix::io::fcntl_setfd(&fd, rustix::io::FdFlags::CLOEXEC)
-      .map_err(|e| refused("fcntl(CLOEXEC)", e))?;
-    rustix::io::ioctl_fionbio(&fd, true).map_err(|e| refused("ioctl(FIONBIO)", e))?;
-    set_dont_fragment(&fd)?;
-    Ok(Socket { fd })
-  }
 
-  /// The owned OS handle [`adopt`] takes: a file descriptor.
-  pub(crate) type OwnedDatagram = OwnedFd;
-
-  /// Gives up the socket's descriptor — the counterpart to [`adopt`], for a supervisor that binds a
-  /// socket and hands it to the process it spawns.
-  pub(crate) fn into_owned(socket: Socket) -> OwnedDatagram {
-    socket.fd
-  }
-
-  pub(crate) fn local_addr(socket: &Socket) -> Result<SocketAddrV4, RtError> {
-    match SocketAddr::try_from(getsockname(&socket.fd).map_err(|e| refused("getsockname", e))?) {
-      Ok(SocketAddr::V4(v4)) => Ok(v4),
-      _ => Err(refused("getsockname", rustix::io::Errno::AFNOSUPPORT)),
+    pub(crate) fn dgram_socket() -> Result<Socket, RtError> {
+        // `SocketFlags` on `socket()` is Linux-only, so non-blocking/cloexec are set after creation.
+        let fd = socket_with(
+            AddressFamily::INET,
+            SocketType::DGRAM,
+            SocketFlags::empty(),
+            None,
+        )
+        .map_err(|e| refused("socket(DGRAM)", e))?;
+        rustix::io::fcntl_setfd(&fd, rustix::io::FdFlags::CLOEXEC)
+            .map_err(|e| refused("fcntl(CLOEXEC)", e))?;
+        rustix::io::ioctl_fionbio(&fd, true).map_err(|e| refused("ioctl(FIONBIO)", e))?;
+        set_dont_fragment(&fd)?;
+        Ok(Socket { fd })
     }
-  }
 
-  pub(crate) fn recv_from(
-    socket: &Socket,
-    buf: &mut [u8],
-  ) -> Result<Io<(usize, SocketAddrV4)>, RtError> {
-    match recvfrom(&socket.fd, buf, RecvFlags::empty()) {
-      Ok((n, _flags, Some(from))) => match SocketAddr::try_from(from) {
-        Ok(SocketAddr::V4(v4)) => Ok(Io::Ready((n, v4))),
-        _ => Err(refused("recvfrom", rustix::io::Errno::AFNOSUPPORT)),
-      },
-      Ok((n, _flags, None)) => Ok(Io::Ready((n, SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)))),
-      Err(rustix::io::Errno::AGAIN) => Ok(Io::WouldBlock),
-      Err(rustix::io::Errno::INTR) => Ok(Io::Interrupted),
-      Err(e) => Err(refused("recvfrom", e)),
+    /// Sets the don't-fragment bit on every datagram the socket sends, and has the kernel leave the
+    /// sizing to the transport (RFC 8899 §3: a packetization layer that probes the path needs its probes
+    /// dropped, not fragmented, when too large; §4.4: a datagram larger than the local interface then
+    /// fails its send with `EMSGSIZE`). Linux: `IP_PMTUDISC_PROBE` sets DF and ignores the kernel's own
+    /// path-MTU cache, so the transport's probes decide.
+    #[cfg(target_os = "linux")]
+    fn set_dont_fragment(fd: &OwnedFd) -> Result<(), RtError> {
+        rustix::net::sockopt::set_ip_mtu_discover(
+            fd,
+            rustix::net::sockopt::Ipv4PathMtuDiscovery::PROBE,
+        )
+        .map_err(|e| refused("setsockopt(IP_MTU_DISCOVER)", e))
     }
-  }
 
-  pub(crate) fn send_to(
-    socket: &Socket,
-    buf: &[u8],
-    addr: SocketAddrV4,
-  ) -> Result<Io<usize>, RtError> {
-    match rx_sendto(&socket.fd, buf, SendFlags::empty(), &addr) {
-      Ok(n) => Ok(Io::Ready(n)),
-      Err(rustix::io::Errno::AGAIN) => Ok(Io::WouldBlock),
-      Err(rustix::io::Errno::INTR) => Ok(Io::Interrupted),
-      Err(e) => Err(refused("sendto", e)),
+    /// macOS: `IP_DONTFRAG` sets DF on each datagram (see the Linux arm).
+    #[cfg(target_os = "macos")]
+    fn set_dont_fragment(fd: &OwnedFd) -> Result<(), RtError> {
+        let on: libc::c_int = 1;
+        let len =
+            libc::socklen_t::try_from(size_of::<libc::c_int>()).unwrap_or(libc::socklen_t::MAX);
+        // SAFETY: `IP_DONTFRAG` takes an `int`; the pointer and length name one live local `c_int`, and the
+        // descriptor is this socket's, open for the call.
+        let outcome = unsafe {
+            libc::setsockopt(
+                fd.as_raw_fd(),
+                libc::IPPROTO_IP,
+                libc::IP_DONTFRAG,
+                (&raw const on).cast::<libc::c_void>(),
+                len,
+            )
+        };
+        if outcome == 0 {
+            Ok(())
+        } else {
+            Err(RtError::os("setsockopt(IP_DONTFRAG)"))
+        }
     }
-  }
+
+    /// Whether the socket sends with the don't-fragment bit as [`set_dont_fragment`] set it: Linux reads
+    /// `IP_MTU_DISCOVER` back as `IP_PMTUDISC_PROBE`.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn dont_fragment(socket: &Socket) -> Result<bool, RtError> {
+        rustix::net::sockopt::ip_mtu_discover(&socket.fd)
+            .map(|mode| mode == rustix::net::sockopt::Ipv4PathMtuDiscovery::PROBE)
+            .map_err(|e| refused("getsockopt(IP_MTU_DISCOVER)", e))
+    }
+
+    /// macOS: `IP_DONTFRAG` read back.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn dont_fragment(socket: &Socket) -> Result<bool, RtError> {
+        let mut set: libc::c_int = 0;
+        let mut len =
+            libc::socklen_t::try_from(size_of::<libc::c_int>()).unwrap_or(libc::socklen_t::MAX);
+        // SAFETY: `IP_DONTFRAG` is an `int`; the out pointer and its length name one live local `c_int`, and
+        // the descriptor is this socket's, open for the call.
+        let outcome = unsafe {
+            libc::getsockopt(
+                socket.fd.as_raw_fd(),
+                libc::IPPROTO_IP,
+                libc::IP_DONTFRAG,
+                (&raw mut set).cast::<libc::c_void>(),
+                &raw mut len,
+            )
+        };
+        if outcome == 0 {
+            Ok(set != 0)
+        } else {
+            Err(RtError::os("getsockopt(IP_DONTFRAG)"))
+        }
+    }
+
+    pub(crate) fn bind(socket: &Socket, addr: SocketAddrV4) -> Result<(), RtError> {
+        rx_bind(&socket.fd, &addr).map_err(|e| refused("bind", e))
+    }
+
+    /// An already-bound OS socket the caller hands over (the socket-activation shape): the port was never
+    /// released between the caller's bind and this adoption, so nothing can take it in between. Refused
+    /// unless it is a datagram socket; made close-on-exec and non-blocking like one this seam created.
+    pub(crate) fn adopt(fd: OwnedDatagram) -> Result<Socket, RtError> {
+        let kind = rustix::net::sockopt::socket_type(&fd)
+            .map_err(|e| refused("getsockopt(SO_TYPE)", e))?;
+        if kind != SocketType::DGRAM {
+            return Err(refused("adopt(SO_TYPE)", rustix::io::Errno::PROTOTYPE));
+        }
+        rustix::io::fcntl_setfd(&fd, rustix::io::FdFlags::CLOEXEC)
+            .map_err(|e| refused("fcntl(CLOEXEC)", e))?;
+        rustix::io::ioctl_fionbio(&fd, true).map_err(|e| refused("ioctl(FIONBIO)", e))?;
+        set_dont_fragment(&fd)?;
+        Ok(Socket { fd })
+    }
+
+    /// The owned OS handle [`adopt`] takes: a file descriptor.
+    pub(crate) type OwnedDatagram = OwnedFd;
+
+    /// Gives up the socket's descriptor — the counterpart to [`adopt`], for a supervisor that binds a
+    /// socket and hands it to the process it spawns.
+    pub(crate) fn into_owned(socket: Socket) -> OwnedDatagram {
+        socket.fd
+    }
+
+    pub(crate) fn local_addr(socket: &Socket) -> Result<SocketAddrV4, RtError> {
+        match SocketAddr::try_from(getsockname(&socket.fd).map_err(|e| refused("getsockname", e))?)
+        {
+            Ok(SocketAddr::V4(v4)) => Ok(v4),
+            _ => Err(refused("getsockname", rustix::io::Errno::AFNOSUPPORT)),
+        }
+    }
+
+    pub(crate) fn recv_from(
+        socket: &Socket,
+        buf: &mut [u8],
+    ) -> Result<Io<(usize, SocketAddrV4)>, RtError> {
+        match recvfrom(&socket.fd, buf, RecvFlags::empty()) {
+            Ok((n, _flags, Some(from))) => match SocketAddr::try_from(from) {
+                Ok(SocketAddr::V4(v4)) => Ok(Io::Ready((n, v4))),
+                _ => Err(refused("recvfrom", rustix::io::Errno::AFNOSUPPORT)),
+            },
+            Ok((n, _flags, None)) => {
+                Ok(Io::Ready((n, SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0))))
+            }
+            Err(rustix::io::Errno::AGAIN) => Ok(Io::WouldBlock),
+            Err(rustix::io::Errno::INTR) => Ok(Io::Interrupted),
+            Err(e) => Err(refused("recvfrom", e)),
+        }
+    }
+
+    pub(crate) fn send_to(
+        socket: &Socket,
+        buf: &[u8],
+        addr: SocketAddrV4,
+    ) -> Result<Io<usize>, RtError> {
+        match rx_sendto(&socket.fd, buf, SendFlags::empty(), &addr) {
+            Ok(n) => Ok(Io::Ready(n)),
+            Err(rustix::io::Errno::AGAIN) => Ok(Io::WouldBlock),
+            Err(rustix::io::Errno::INTR) => Ok(Io::Interrupted),
+            Err(e) => Err(refused("sendto", e)),
+        }
+    }
 }
 
 // ============================================================================== Windows (Winsock 2)
 
 #[cfg(windows)]
 mod imp {
-  use std::os::windows::io::IntoRawSocket;
-  use std::sync::OnceLock;
+    use std::os::windows::io::IntoRawSocket;
+    use std::sync::OnceLock;
 
-  use windows_sys::Win32::Networking::WinSock::{
-    AF_INET, FIONBIO, IN_ADDR, IN_ADDR_0, INVALID_SOCKET, IP_DONTFRAGMENT, IPPROTO_IP, IPPROTO_UDP,
-    SO_RCVBUF, SO_TYPE, SOCK_DGRAM, SOCKADDR, SOCKADDR_IN, SOCKET, SOCKET_ERROR, SOL_SOCKET,
-    WSADATA, WSAEINTR, WSAEWOULDBLOCK, WSAGetLastError, WSAStartup, bind as ws_bind, closesocket,
-    getsockname, getsockopt, ioctlsocket, recvfrom as ws_recvfrom, sendto as ws_sendto, setsockopt,
-    socket as ws_socket,
-  };
-
-  use super::{Io, Ipv4Addr, SocketAddrV4};
-  use crate::error::RtError;
-
-  /// A non-blocking Winsock UDP socket owned here (closed on drop). Held as the raw `SOCKET`; the drop
-  /// closes it once. Not `Copy`, so ownership is single.
-  #[derive(Debug)]
-  pub(crate) struct Socket {
-    socket: SOCKET,
-  }
-
-  impl Drop for Socket {
-    fn drop(&mut self) {
-      // SAFETY: our socket, created by `socket()`; closed exactly once here.
-      unsafe { closesocket(self.socket) };
-    }
-  }
-
-  /// Winsock must be initialized once per process before any socket call; `WSAStartup(2.2)` and no
-  /// matching cleanup (process-lifetime) means one success suffices. A `OnceLock` makes it
-  /// exactly-once with no lock on the data path.
-  fn ensure_started() -> Result<(), RtError> {
-    /// Format: the Winsock version to request in `WSAStartup` — 2.2, low byte major, high byte minor
-    /// (`MAKEWORD(2, 2)` = `0x0202`), the version every current Windows provides.
-    const WINSOCK_VERSION_2_2: u16 = 0x0202;
-    static STARTED: OnceLock<bool> = OnceLock::new();
-    let ok = *STARTED.get_or_init(|| {
-      // SAFETY: an all-zero WSADATA is a valid, uninitialized out-param.
-      let mut data: WSADATA = unsafe { std::mem::zeroed() };
-      // SAFETY: `data` is a live, writable WSADATA; `WSAStartup` fills it and returns 0 on success.
-      unsafe { WSAStartup(WINSOCK_VERSION_2_2, &mut data) == 0 }
-    });
-    if ok {
-      Ok(())
-    } else {
-      Err(RtError::os("WSAStartup"))
-    }
-  }
-
-  /// The last Winsock error as an `RtError`, carrying the `WSAGetLastError` code (the shape
-  /// `RtError::os` gives on Unix).
-  fn last(call: &'static str) -> RtError {
-    RtError::DriverRefused {
-      call,
-      // SAFETY: a pure query of thread-local last-error state.
-      code: Some(unsafe { WSAGetLastError() }),
-    }
-  }
-
-  /// `WSAGetLastError` for the current thread (to classify would-block/interrupted before mapping).
-  fn last_code() -> i32 {
-    // SAFETY: a pure query of thread-local last-error state.
-    unsafe { WSAGetLastError() }
-  }
-
-  impl Socket {
-    /// The readiness handle a `crate::readiness` future registers. A Winsock `SOCKET` is pointer-width
-    /// but a kernel handle-table value that fits in a positive `i32` in practice; the readiness seam
-    /// (and the AFD reactor that reconstructs it) carry it as that `i32`, the width a Unix fd uses.
-    pub(crate) fn raw_id(&self) -> i32 {
-      // The low 32 bits of the socket, reinterpreted as `i32` bit-for-bit — a checked narrowing (the
-      // socket fits) then a bit-preserving reinterpret, so the AFD reactor's `raw as u32 as SOCKET`
-      // reconstructs the same handle. No lossy `as` cast.
-      let low = u32::try_from(self.socket).unwrap_or(u32::MAX);
-      i32::from_ne_bytes(low.to_ne_bytes())
-    }
-  }
-
-  pub(crate) fn dgram_socket() -> Result<Socket, RtError> {
-    ensure_started()?;
-    // SAFETY: a plain socket creation; the result is checked against INVALID_SOCKET.
-    let raw = unsafe { ws_socket(AF_INET as i32, SOCK_DGRAM, IPPROTO_UDP) };
-    if raw == INVALID_SOCKET {
-      return Err(last("socket(DGRAM)"));
-    }
-    let socket = Socket { socket: raw };
-    set_nonblocking(&socket)?;
-    set_dont_fragment(&socket)?;
-    Ok(socket)
-  }
-
-  /// Puts `socket` in non-blocking mode (`FIONBIO`), as every socket this seam drives must be.
-  fn set_nonblocking(socket: &Socket) -> Result<(), RtError> {
-    let mut nonblocking: u32 = 1;
-    // SAFETY: FIONBIO takes one u32 by pointer; a live local suffices.
-    if unsafe { ioctlsocket(socket.socket, FIONBIO, &mut nonblocking) } == SOCKET_ERROR {
-      return Err(last("ioctlsocket(FIONBIO)"));
-    }
-    Ok(())
-  }
-
-  /// Sets the don't-fragment bit on every datagram the socket sends (`IP_DONTFRAGMENT`; RFC 8899 §3 — see
-  /// the Unix arms), so a path-MTU probe that is too large is dropped rather than fragmented.
-  fn set_dont_fragment(socket: &Socket) -> Result<(), RtError> {
-    let on: i32 = 1;
-    let len = i32::try_from(std::mem::size_of::<i32>()).unwrap_or(i32::MAX);
-    // SAFETY: `IP_DONTFRAGMENT` takes a DWORD-sized `int`; the pointer and length name one live local.
-    let outcome = unsafe {
-      setsockopt(
-        socket.socket,
-        IPPROTO_IP,
-        IP_DONTFRAGMENT,
-        (&raw const on).cast::<u8>(),
-        len,
-      )
+    use windows_sys::Win32::Networking::WinSock::{
+        AF_INET, FIONBIO, IN_ADDR, IN_ADDR_0, INVALID_SOCKET, IP_DONTFRAGMENT, IPPROTO_IP,
+        IPPROTO_UDP, SO_RCVBUF, SO_TYPE, SOCK_DGRAM, SOCKADDR, SOCKADDR_IN, SOCKET, SOCKET_ERROR,
+        SOL_SOCKET, WSADATA, WSAEINTR, WSAEWOULDBLOCK, WSAGetLastError, WSAStartup,
+        bind as ws_bind, closesocket, getsockname, getsockopt, ioctlsocket,
+        recvfrom as ws_recvfrom, sendto as ws_sendto, setsockopt, socket as ws_socket,
     };
-    if outcome == SOCKET_ERROR {
-      return Err(last("setsockopt(IP_DONTFRAGMENT)"));
+
+    use super::{Io, Ipv4Addr, SocketAddrV4};
+    use crate::error::RtError;
+
+    /// A non-blocking Winsock UDP socket owned here (closed on drop). Held as the raw `SOCKET`; the drop
+    /// closes it once. Not `Copy`, so ownership is single.
+    #[derive(Debug)]
+    pub(crate) struct Socket {
+        socket: SOCKET,
     }
-    Ok(())
-  }
 
-  /// One `int`-valued `SOL_SOCKET` option of `socket` (`SO_RCVBUF`, `SO_TYPE`); `call` names the query in a
-  /// refusal.
-  fn int_option(socket: &Socket, option: i32, call: &'static str) -> Result<i32, RtError> {
-    let mut value: i32 = 0;
-    // The option is an `int`: its length is that type's size, which always fits an `i32`.
-    let mut len: i32 = i32::try_from(std::mem::size_of::<i32>()).unwrap_or(i32::MAX);
-    // SAFETY: the option is an `int`; the out pointer and its length name one live local `i32`.
-    let outcome = unsafe {
-      getsockopt(
-        socket.socket,
-        SOL_SOCKET,
-        option,
-        (&raw mut value).cast::<u8>(),
-        &raw mut len,
-      )
-    };
-    if outcome == SOCKET_ERROR {
-      return Err(last(call));
+    impl Drop for Socket {
+        fn drop(&mut self) {
+            // SAFETY: our socket, created by `socket()`; closed exactly once here.
+            unsafe { closesocket(self.socket) };
+        }
     }
-    Ok(value)
-  }
 
-  /// The socket's kernel receive buffer (`SO_RCVBUF`) in bytes.
-  pub(crate) fn recv_buffer_bytes(socket: &Socket) -> Result<usize, RtError> {
-    let bytes = int_option(socket, SO_RCVBUF, "getsockopt(SO_RCVBUF)")?;
-    usize::try_from(bytes).map_err(|_| last("getsockopt(SO_RCVBUF)"))
-  }
-
-  /// A `SOCKADDR_IN` for `addr` (network byte order for the port and address, as the wire wants).
-  fn sockaddr(addr: SocketAddrV4) -> SOCKADDR_IN {
-    SOCKADDR_IN {
-      sin_family: AF_INET,
-      sin_port: addr.port().to_be(),
-      sin_addr: IN_ADDR {
-        S_un: IN_ADDR_0 {
-          // The octets in memory order [a, b, c, d] are already network order.
-          S_addr: u32::from_ne_bytes(addr.ip().octets()),
-        },
-      },
-      sin_zero: [0; 8],
+    /// Winsock must be initialized once per process before any socket call; `WSAStartup(2.2)` and no
+    /// matching cleanup (process-lifetime) means one success suffices. A `OnceLock` makes it
+    /// exactly-once with no lock on the data path.
+    fn ensure_started() -> Result<(), RtError> {
+        /// Format: the Winsock version to request in `WSAStartup` — 2.2, low byte major, high byte minor
+        /// (`MAKEWORD(2, 2)` = `0x0202`), the version every current Windows provides.
+        const WINSOCK_VERSION_2_2: u16 = 0x0202;
+        static STARTED: OnceLock<bool> = OnceLock::new();
+        let ok = *STARTED.get_or_init(|| {
+            // SAFETY: an all-zero WSADATA is a valid, uninitialized out-param.
+            let mut data: WSADATA = unsafe { std::mem::zeroed() };
+            // SAFETY: `data` is a live, writable WSADATA; `WSAStartup` fills it and returns 0 on success.
+            unsafe { WSAStartup(WINSOCK_VERSION_2_2, &mut data) == 0 }
+        });
+        if ok {
+            Ok(())
+        } else {
+            Err(RtError::os("WSAStartup"))
+        }
     }
-  }
 
-  /// The `SocketAddrV4` a filled `SOCKADDR_IN` names (the inverse of [`sockaddr`]).
-  fn from_sockaddr(raw: &SOCKADDR_IN) -> SocketAddrV4 {
-    // SAFETY: reading the `S_addr` arm of the address union — a plain `u32`, always initialized.
-    let addr_bytes = unsafe { raw.sin_addr.S_un.S_addr }.to_ne_bytes();
-    SocketAddrV4::new(
-      Ipv4Addr::new(addr_bytes[0], addr_bytes[1], addr_bytes[2], addr_bytes[3]),
-      u16::from_be(raw.sin_port),
-    )
-  }
-
-  /// An already-bound OS socket the caller hands over (the socket-activation shape): the port was never
-  /// released between the caller's bind and this adoption, so nothing can take it in between. Refused
-  /// unless it is a datagram socket; made non-blocking like one this seam created.
-  pub(crate) fn adopt(owned: OwnedDatagram) -> Result<Socket, RtError> {
-    ensure_started()?;
-    let Ok(raw) = SOCKET::try_from(owned.into_raw_socket()) else {
-      return Err(RtError::DriverRefused {
-        call: "adopt(SOCKET)",
-        code: None,
-      });
-    };
-    // Owned from here: the drop closes it once, on every refusal below too.
-    let socket = Socket { socket: raw };
-    let kind = int_option(&socket, SO_TYPE, "getsockopt(SO_TYPE)")?;
-    if kind != SOCK_DGRAM {
-      return Err(RtError::DriverRefused {
-        call: "adopt(SO_TYPE)",
-        code: Some(kind),
-      });
+    /// The last Winsock error as an `RtError`, carrying the `WSAGetLastError` code (the shape
+    /// `RtError::os` gives on Unix).
+    fn last(call: &'static str) -> RtError {
+        RtError::DriverRefused {
+            call,
+            // SAFETY: a pure query of thread-local last-error state.
+            code: Some(unsafe { WSAGetLastError() }),
+        }
     }
-    set_nonblocking(&socket)?;
-    set_dont_fragment(&socket)?;
-    Ok(socket)
-  }
 
-  /// The owned OS handle [`adopt`] takes: a Winsock socket.
-  pub(crate) type OwnedDatagram = std::os::windows::io::OwnedSocket;
-
-  pub(crate) fn bind(socket: &Socket, addr: SocketAddrV4) -> Result<(), RtError> {
-    let sa = sockaddr(addr);
-    // SAFETY: `sa` is a live SOCKADDR_IN of the given length, passed as the generic SOCKADDR.
-    let rc = unsafe {
-      ws_bind(
-        socket.socket,
-        std::ptr::addr_of!(sa).cast::<SOCKADDR>(),
-        i32::try_from(size_of::<SOCKADDR_IN>()).unwrap_or(0),
-      )
-    };
-    if rc == SOCKET_ERROR {
-      Err(last("bind"))
-    } else {
-      Ok(())
+    /// `WSAGetLastError` for the current thread (to classify would-block/interrupted before mapping).
+    fn last_code() -> i32 {
+        // SAFETY: a pure query of thread-local last-error state.
+        unsafe { WSAGetLastError() }
     }
-  }
 
-  pub(crate) fn local_addr(socket: &Socket) -> Result<SocketAddrV4, RtError> {
-    // SAFETY: an all-zero SOCKADDR_IN is a valid empty address getsockname fills.
-    let mut sa: SOCKADDR_IN = unsafe { std::mem::zeroed() };
-    let mut len = i32::try_from(size_of::<SOCKADDR_IN>()).unwrap_or(0);
-    // SAFETY: getsockname writes up to `len` bytes into `sa` and the actual length back into `len`.
-    let rc = unsafe {
-      getsockname(
-        socket.socket,
-        std::ptr::addr_of_mut!(sa).cast::<SOCKADDR>(),
-        &mut len,
-      )
-    };
-    if rc == SOCKET_ERROR {
-      return Err(last("getsockname"));
+    impl Socket {
+        /// The readiness handle a `crate::readiness` future registers. A Winsock `SOCKET` is pointer-width
+        /// but a kernel handle-table value that fits in a positive `i32` in practice; the readiness seam
+        /// (and the AFD reactor that reconstructs it) carry it as that `i32`, the width a Unix fd uses.
+        pub(crate) fn raw_id(&self) -> i32 {
+            // The low 32 bits of the socket, reinterpreted as `i32` bit-for-bit — a checked narrowing (the
+            // socket fits) then a bit-preserving reinterpret, so the AFD reactor's `raw as u32 as SOCKET`
+            // reconstructs the same handle. No lossy `as` cast.
+            let low = u32::try_from(self.socket).unwrap_or(u32::MAX);
+            i32::from_ne_bytes(low.to_ne_bytes())
+        }
     }
-    Ok(from_sockaddr(&sa))
-  }
 
-  pub(crate) fn recv_from(
-    socket: &Socket,
-    buf: &mut [u8],
-  ) -> Result<Io<(usize, SocketAddrV4)>, RtError> {
-    let len = i32::try_from(buf.len()).unwrap_or(i32::MAX);
-    // SAFETY: an all-zero SOCKADDR_IN is a valid empty address recvfrom fills.
-    let mut from: SOCKADDR_IN = unsafe { std::mem::zeroed() };
-    let mut from_len = i32::try_from(size_of::<SOCKADDR_IN>()).unwrap_or(0);
-    // SAFETY: recvfrom writes up to `len` bytes into `buf` and the sender into `from`/`from_len`.
-    let rc = unsafe {
-      ws_recvfrom(
-        socket.socket,
-        buf.as_mut_ptr(),
-        len,
-        0,
-        std::ptr::addr_of_mut!(from).cast::<SOCKADDR>(),
-        &mut from_len,
-      )
-    };
-    if rc == SOCKET_ERROR {
-      return Ok(match last_code() {
-        WSAEWOULDBLOCK => Io::WouldBlock,
-        WSAEINTR => Io::Interrupted,
-        _ => return Err(last("recvfrom")),
-      });
+    pub(crate) fn dgram_socket() -> Result<Socket, RtError> {
+        ensure_started()?;
+        // SAFETY: a plain socket creation; the result is checked against INVALID_SOCKET.
+        let raw = unsafe { ws_socket(AF_INET as i32, SOCK_DGRAM, IPPROTO_UDP) };
+        if raw == INVALID_SOCKET {
+            return Err(last("socket(DGRAM)"));
+        }
+        let socket = Socket { socket: raw };
+        set_nonblocking(&socket)?;
+        set_dont_fragment(&socket)?;
+        Ok(socket)
     }
-    Ok(Io::Ready((
-      usize::try_from(rc).unwrap_or(0),
-      from_sockaddr(&from),
-    )))
-  }
 
-  pub(crate) fn send_to(
-    socket: &Socket,
-    buf: &[u8],
-    addr: SocketAddrV4,
-  ) -> Result<Io<usize>, RtError> {
-    let sa = sockaddr(addr);
-    let len = i32::try_from(buf.len()).unwrap_or(i32::MAX);
-    // SAFETY: sendto reads `len` bytes from `buf` and the destination from `sa`.
-    let rc = unsafe {
-      ws_sendto(
-        socket.socket,
-        buf.as_ptr(),
-        len,
-        0,
-        std::ptr::addr_of!(sa).cast::<SOCKADDR>(),
-        i32::try_from(size_of::<SOCKADDR_IN>()).unwrap_or(0),
-      )
-    };
-    if rc == SOCKET_ERROR {
-      return Ok(match last_code() {
-        WSAEWOULDBLOCK => Io::WouldBlock,
-        WSAEINTR => Io::Interrupted,
-        _ => return Err(last("sendto")),
-      });
+    /// Puts `socket` in non-blocking mode (`FIONBIO`), as every socket this seam drives must be.
+    fn set_nonblocking(socket: &Socket) -> Result<(), RtError> {
+        let mut nonblocking: u32 = 1;
+        // SAFETY: FIONBIO takes one u32 by pointer; a live local suffices.
+        if unsafe { ioctlsocket(socket.socket, FIONBIO, &mut nonblocking) } == SOCKET_ERROR {
+            return Err(last("ioctlsocket(FIONBIO)"));
+        }
+        Ok(())
     }
-    Ok(Io::Ready(usize::try_from(rc).unwrap_or(0)))
-  }
+
+    /// Sets the don't-fragment bit on every datagram the socket sends (`IP_DONTFRAGMENT`; RFC 8899 §3 — see
+    /// the Unix arms), so a path-MTU probe that is too large is dropped rather than fragmented.
+    fn set_dont_fragment(socket: &Socket) -> Result<(), RtError> {
+        let on: i32 = 1;
+        let len = i32::try_from(std::mem::size_of::<i32>()).unwrap_or(i32::MAX);
+        // SAFETY: `IP_DONTFRAGMENT` takes a DWORD-sized `int`; the pointer and length name one live local.
+        let outcome = unsafe {
+            setsockopt(
+                socket.socket,
+                IPPROTO_IP,
+                IP_DONTFRAGMENT,
+                (&raw const on).cast::<u8>(),
+                len,
+            )
+        };
+        if outcome == SOCKET_ERROR {
+            return Err(last("setsockopt(IP_DONTFRAGMENT)"));
+        }
+        Ok(())
+    }
+
+    /// One `int`-valued `SOL_SOCKET` option of `socket` (`SO_RCVBUF`, `SO_TYPE`); `call` names the query in a
+    /// refusal.
+    fn int_option(socket: &Socket, option: i32, call: &'static str) -> Result<i32, RtError> {
+        let mut value: i32 = 0;
+        // The option is an `int`: its length is that type's size, which always fits an `i32`.
+        let mut len: i32 = i32::try_from(std::mem::size_of::<i32>()).unwrap_or(i32::MAX);
+        // SAFETY: the option is an `int`; the out pointer and its length name one live local `i32`.
+        let outcome = unsafe {
+            getsockopt(
+                socket.socket,
+                SOL_SOCKET,
+                option,
+                (&raw mut value).cast::<u8>(),
+                &raw mut len,
+            )
+        };
+        if outcome == SOCKET_ERROR {
+            return Err(last(call));
+        }
+        Ok(value)
+    }
+
+    /// The socket's kernel receive buffer (`SO_RCVBUF`) in bytes.
+    pub(crate) fn recv_buffer_bytes(socket: &Socket) -> Result<usize, RtError> {
+        let bytes = int_option(socket, SO_RCVBUF, "getsockopt(SO_RCVBUF)")?;
+        usize::try_from(bytes).map_err(|_| last("getsockopt(SO_RCVBUF)"))
+    }
+
+    /// A `SOCKADDR_IN` for `addr` (network byte order for the port and address, as the wire wants).
+    fn sockaddr(addr: SocketAddrV4) -> SOCKADDR_IN {
+        SOCKADDR_IN {
+            sin_family: AF_INET,
+            sin_port: addr.port().to_be(),
+            sin_addr: IN_ADDR {
+                S_un: IN_ADDR_0 {
+                    // The octets in memory order [a, b, c, d] are already network order.
+                    S_addr: u32::from_ne_bytes(addr.ip().octets()),
+                },
+            },
+            sin_zero: [0; 8],
+        }
+    }
+
+    /// The `SocketAddrV4` a filled `SOCKADDR_IN` names (the inverse of [`sockaddr`]).
+    fn from_sockaddr(raw: &SOCKADDR_IN) -> SocketAddrV4 {
+        // SAFETY: reading the `S_addr` arm of the address union — a plain `u32`, always initialized.
+        let addr_bytes = unsafe { raw.sin_addr.S_un.S_addr }.to_ne_bytes();
+        SocketAddrV4::new(
+            Ipv4Addr::new(addr_bytes[0], addr_bytes[1], addr_bytes[2], addr_bytes[3]),
+            u16::from_be(raw.sin_port),
+        )
+    }
+
+    /// An already-bound OS socket the caller hands over (the socket-activation shape): the port was never
+    /// released between the caller's bind and this adoption, so nothing can take it in between. Refused
+    /// unless it is a datagram socket; made non-blocking like one this seam created.
+    pub(crate) fn adopt(owned: OwnedDatagram) -> Result<Socket, RtError> {
+        ensure_started()?;
+        let Ok(raw) = SOCKET::try_from(owned.into_raw_socket()) else {
+            return Err(RtError::DriverRefused {
+                call: "adopt(SOCKET)",
+                code: None,
+            });
+        };
+        // Owned from here: the drop closes it once, on every refusal below too.
+        let socket = Socket { socket: raw };
+        let kind = int_option(&socket, SO_TYPE, "getsockopt(SO_TYPE)")?;
+        if kind != SOCK_DGRAM {
+            return Err(RtError::DriverRefused {
+                call: "adopt(SO_TYPE)",
+                code: Some(kind),
+            });
+        }
+        set_nonblocking(&socket)?;
+        set_dont_fragment(&socket)?;
+        Ok(socket)
+    }
+
+    /// The owned OS handle [`adopt`] takes: a Winsock socket.
+    pub(crate) type OwnedDatagram = std::os::windows::io::OwnedSocket;
+
+    pub(crate) fn bind(socket: &Socket, addr: SocketAddrV4) -> Result<(), RtError> {
+        let sa = sockaddr(addr);
+        // SAFETY: `sa` is a live SOCKADDR_IN of the given length, passed as the generic SOCKADDR.
+        let rc = unsafe {
+            ws_bind(
+                socket.socket,
+                std::ptr::addr_of!(sa).cast::<SOCKADDR>(),
+                i32::try_from(size_of::<SOCKADDR_IN>()).unwrap_or(0),
+            )
+        };
+        if rc == SOCKET_ERROR {
+            Err(last("bind"))
+        } else {
+            Ok(())
+        }
+    }
+
+    pub(crate) fn local_addr(socket: &Socket) -> Result<SocketAddrV4, RtError> {
+        // SAFETY: an all-zero SOCKADDR_IN is a valid empty address getsockname fills.
+        let mut sa: SOCKADDR_IN = unsafe { std::mem::zeroed() };
+        let mut len = i32::try_from(size_of::<SOCKADDR_IN>()).unwrap_or(0);
+        // SAFETY: getsockname writes up to `len` bytes into `sa` and the actual length back into `len`.
+        let rc = unsafe {
+            getsockname(
+                socket.socket,
+                std::ptr::addr_of_mut!(sa).cast::<SOCKADDR>(),
+                &mut len,
+            )
+        };
+        if rc == SOCKET_ERROR {
+            return Err(last("getsockname"));
+        }
+        Ok(from_sockaddr(&sa))
+    }
+
+    pub(crate) fn recv_from(
+        socket: &Socket,
+        buf: &mut [u8],
+    ) -> Result<Io<(usize, SocketAddrV4)>, RtError> {
+        let len = i32::try_from(buf.len()).unwrap_or(i32::MAX);
+        // SAFETY: an all-zero SOCKADDR_IN is a valid empty address recvfrom fills.
+        let mut from: SOCKADDR_IN = unsafe { std::mem::zeroed() };
+        let mut from_len = i32::try_from(size_of::<SOCKADDR_IN>()).unwrap_or(0);
+        // SAFETY: recvfrom writes up to `len` bytes into `buf` and the sender into `from`/`from_len`.
+        let rc = unsafe {
+            ws_recvfrom(
+                socket.socket,
+                buf.as_mut_ptr(),
+                len,
+                0,
+                std::ptr::addr_of_mut!(from).cast::<SOCKADDR>(),
+                &mut from_len,
+            )
+        };
+        if rc == SOCKET_ERROR {
+            return Ok(match last_code() {
+                WSAEWOULDBLOCK => Io::WouldBlock,
+                WSAEINTR => Io::Interrupted,
+                _ => return Err(last("recvfrom")),
+            });
+        }
+        Ok(Io::Ready((
+            usize::try_from(rc).unwrap_or(0),
+            from_sockaddr(&from),
+        )))
+    }
+
+    pub(crate) fn send_to(
+        socket: &Socket,
+        buf: &[u8],
+        addr: SocketAddrV4,
+    ) -> Result<Io<usize>, RtError> {
+        let sa = sockaddr(addr);
+        let len = i32::try_from(buf.len()).unwrap_or(i32::MAX);
+        // SAFETY: sendto reads `len` bytes from `buf` and the destination from `sa`.
+        let rc = unsafe {
+            ws_sendto(
+                socket.socket,
+                buf.as_ptr(),
+                len,
+                0,
+                std::ptr::addr_of!(sa).cast::<SOCKADDR>(),
+                i32::try_from(size_of::<SOCKADDR_IN>()).unwrap_or(0),
+            )
+        };
+        if rc == SOCKET_ERROR {
+            return Ok(match last_code() {
+                WSAEWOULDBLOCK => Io::WouldBlock,
+                WSAEINTR => Io::Interrupted,
+                _ => return Err(last("sendto")),
+            });
+        }
+        Ok(Io::Ready(usize::try_from(rc).unwrap_or(0)))
+    }
 }
 
-#[cfg(unix)]
-pub(crate) use imp::into_owned;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(crate) use imp::dont_fragment;
+#[cfg(unix)]
+pub(crate) use imp::into_owned;
 pub(crate) use imp::{OwnedDatagram, Socket};
 pub(crate) use imp::{
-  adopt, bind, dgram_socket, local_addr, recv_buffer_bytes, recv_from, send_to,
+    adopt, bind, dgram_socket, local_addr, recv_buffer_bytes, recv_from, send_to,
 };

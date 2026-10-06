@@ -7,34 +7,33 @@
 //! The `derived!` macro is the one form the literal check (`cargo xtask literals`) accepts for a
 //! numeric literal in shipped code.
 
-
 /// A value together with the formula and anchors that produced it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Derived<T> {
-  /// The derived value.
-  pub value: T,
-  /// The formula, in plain English or arithmetic, exactly as the design states it.
-  pub formula: &'static str,
-  /// The measured quantities the formula consumed, by their profile field names.
-  pub anchors: &'static [&'static str],
+    /// The derived value.
+    pub value: T,
+    /// The formula, in plain English or arithmetic, exactly as the design states it.
+    pub formula: &'static str,
+    /// The measured quantities the formula consumed, by their profile field names.
+    pub anchors: &'static [&'static str],
 }
 
 impl<T> Derived<T> {
-  /// Builds a derived value; prefer the `derived!` macro at call sites.
-  pub const fn new(value: T, formula: &'static str, anchors: &'static [&'static str]) -> Self {
-    Self {
-      value,
-      formula,
-      anchors,
+    /// Builds a derived value; prefer the `derived!` macro at call sites.
+    pub const fn new(value: T, formula: &'static str, anchors: &'static [&'static str]) -> Self {
+        Self {
+            value,
+            formula,
+            anchors,
+        }
     }
-  }
 }
 
 impl<T: Copy> Derived<T> {
-  /// The value alone, for arithmetic.
-  pub const fn get(&self) -> T {
-    self.value
-  }
+    /// The value alone, for arithmetic.
+    pub const fn get(&self) -> T {
+        self.value
+    }
 }
 
 /// Marks a value as derived: `derived!(expr, "formula", ["anchor", ...])`.
@@ -52,13 +51,13 @@ macro_rules! derived {
 
 #[cfg(test)]
 mod tests {
-  use super::*;
+    use super::*;
 
-  #[test]
-  fn a_derived_value_carries_its_formula_and_anchors() {
-    let d: Derived<u64> = derived!(4096 * 4, "page size × 4", ["page.base"]);
-    assert_eq!(d.get(), 16384);
-    assert_eq!(d.formula, "page size × 4");
-    assert_eq!(d.anchors, &["page.base"]);
-  }
+    #[test]
+    fn a_derived_value_carries_its_formula_and_anchors() {
+        let d: Derived<u64> = derived!(4096 * 4, "page size × 4", ["page.base"]);
+        assert_eq!(d.get(), 16384);
+        assert_eq!(d.formula, "page size × 4");
+        assert_eq!(d.anchors, &["page.base"]);
+    }
 }

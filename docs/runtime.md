@@ -566,7 +566,10 @@ shared with hyper-tokio once hyper-tokio takes it from here (one `sys` layer, tw
    go.
 4. std's `sync_channel` against tokio's `mpsc` and a ring of hyper-rt's own (§8).
 5. `SBITMAP` and `AFUNIX` read at a named revision.
-6. The calibration record's key and its age bound for focal's short commands (§10.2): what a stale record
+6. A plain `Release` store of the wake bitmap's pending flag failed loom 0.7.2's parking model: the sender's
+   own later load read the flag's earlier value, which coherence forbids. The flag is published with a swap
+   (the model passes); the execution is to be reduced to a loom report or to an error of this model's.
+7. The calibration record's key and its age bound for focal's short commands (§10.2): what a stale record
    costs (a mis-sized spin) against what a fresh one costs (the probes' budget per command).
 
 ## 16. Order of work

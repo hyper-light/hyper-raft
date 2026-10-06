@@ -6,12 +6,29 @@
 //! the process's own resident size through `ps` (a read of the kernel's accounting, never a write).
 //! One test per binary, so no other test's allocations move the numbers.
 
+// Test harness code: a panic here is a failed test (CLAUDE.md §1).
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects,
+    clippy::disallowed_macros,
+    clippy::disallowed_methods,
+    clippy::cognitive_complexity,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_wrap,
+    clippy::string_slice,
+    clippy::unwrap_in_result,
+    clippy::panic_in_result_fn,
+    clippy::missing_panics_doc
+)]
 // The whole file measures resident size through `ps` (Unix), so it is a Unix-only test and the crate is
 // empty on Windows. Without this, `--all-targets` clippy on Windows flags the imports, `config` and
 // `CYCLES` as unused there — the only test that uses them is `#[cfg(unix)]`.
 #![cfg(unix)]
 // Test harness code: an unwrap here is a failed test, which is what it should be.
-#![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use hyper_rt::registry::contexts_reclaimed;
 use hyper_rt::runtime::{Runtime, RuntimeConfig};
@@ -19,21 +36,21 @@ use hyper_rt::runtime::{Runtime, RuntimeConfig};
 /// Shape: a daemon-sized task budget, so one context is megabytes — far above the page granularity of
 /// the resident-size accounting — while the runtime itself stays a test's runtime (two shards, unpinned).
 fn config() -> RuntimeConfig {
-  RuntimeConfig {
-    shards: 2,
-    tasks_per_shard: 4096,
-    timers_per_shard: 4096,
-    interests_per_shard: 64,
-    ring_entries: 64,
-    step_budget_ns: 1_000_000,
-    timer_tick_ns: 100_000,
-    batch: 64,
-    pin: false,
-    cores: Vec::new(),
-    page_bytes: 4096,
-    spin_ns: 0,
-    wake_tracking: None,
-  }
+    RuntimeConfig {
+        shards: 2,
+        tasks_per_shard: 4096,
+        timers_per_shard: 4096,
+        interests_per_shard: 64,
+        ring_entries: 64,
+        step_budget_ns: 1_000_000,
+        timer_tick_ns: 100_000,
+        batch: 64,
+        pin: false,
+        cores: Vec::new(),
+        page_bytes: 4096,
+        spin_ns: 0,
+        wake_tracking: None,
+    }
 }
 
 /// Shape: how many runtimes are started in turn after the warm-up — enough that a per-start leak of one
@@ -43,14 +60,14 @@ const CYCLES: u64 = 32;
 /// The process's resident size in KiB, as the kernel accounts it (`ps`, Unix).
 #[cfg(unix)]
 fn resident_kib() -> u64 {
-  let output = std::process::Command::new("ps")
-    .args(["-o", "rss=", "-p", &std::process::id().to_string()])
-    .output()
-    .expect("ps runs");
-  String::from_utf8_lossy(&output.stdout)
-    .trim()
-    .parse()
-    .expect("ps prints the resident size in KiB")
+    let output = std::process::Command::new("ps")
+        .args(["-o", "rss=", "-p", &std::process::id().to_string()])
+        .output()
+        .expect("ps runs");
+    String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse()
+        .expect("ps prints the resident size in KiB")
 }
 
 /// Do: measure what one live two-shard runtime occupies (its footprint: resident size with it up, less
@@ -63,35 +80,35 @@ fn resident_kib() -> u64 {
 #[cfg(unix)]
 #[test]
 fn a_shut_down_runtimes_context_heap_is_given_back() {
-  let reclaimed_before = contexts_reclaimed();
-  let before = resident_kib();
-  let warm = Runtime::start(&config()).unwrap();
-  let live = resident_kib();
-  warm.shutdown().unwrap();
-  let footprint = live.saturating_sub(before);
-  let after_warm = resident_kib();
-  for _ in 0..CYCLES {
-    Runtime::start(&config()).unwrap().shutdown().unwrap();
-  }
-  let after = resident_kib();
-  let growth = after.saturating_sub(after_warm);
-  let reclaimed = contexts_reclaimed() - reclaimed_before;
-  eprintln!(
-    "resident KiB: before {before}, one runtime live {live} (footprint {footprint}), after warm-up \
+    let reclaimed_before = contexts_reclaimed();
+    let before = resident_kib();
+    let warm = Runtime::start(&config()).unwrap();
+    let live = resident_kib();
+    warm.shutdown().unwrap();
+    let footprint = live.saturating_sub(before);
+    let after_warm = resident_kib();
+    for _ in 0..CYCLES {
+        Runtime::start(&config()).unwrap().shutdown().unwrap();
+    }
+    let after = resident_kib();
+    let growth = after.saturating_sub(after_warm);
+    let reclaimed = contexts_reclaimed() - reclaimed_before;
+    eprintln!(
+        "resident KiB: before {before}, one runtime live {live} (footprint {footprint}), after warm-up \
      {after_warm}, after {CYCLES} more cycles {after} (growth {growth}); contexts reclaimed {reclaimed}"
-  );
-  assert!(
-    footprint > 0,
-    "a live runtime occupies memory (non-vacuity)"
-  );
-  assert_eq!(
-    reclaimed,
-    (CYCLES + 1) * u64::from(config().shards),
-    "every context started was reclaimed"
-  );
-  assert!(
-    growth < footprint,
-    "the contexts of {CYCLES} shut-down runtimes were given back: the process grew {growth} KiB, \
+    );
+    assert!(
+        footprint > 0,
+        "a live runtime occupies memory (non-vacuity)"
+    );
+    assert_eq!(
+        reclaimed,
+        (CYCLES + 1) * u64::from(config().shards),
+        "every context started was reclaimed"
+    );
+    assert!(
+        growth < footprint,
+        "the contexts of {CYCLES} shut-down runtimes were given back: the process grew {growth} KiB, \
      against a per-runtime footprint of {footprint} KiB (a leak grows by one footprint per cycle)"
-  );
+    );
 }

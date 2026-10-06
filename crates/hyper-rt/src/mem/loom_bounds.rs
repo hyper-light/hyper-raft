@@ -45,12 +45,12 @@ pub const BRANCH_CAP: usize = 2 * 112;
 /// where the environment says nothing, so a documented loom variable still steers an
 /// investigation.
 pub fn builder() -> loom::model::Builder {
-  let mut builder = loom::model::Builder::new();
-  builder.preemption_bound.get_or_insert(PREEMPTION_BOUND);
-  if std::env::var_os("LOOM_MAX_BRANCHES").is_none() {
-    builder.max_branches = BRANCH_CAP;
-  }
-  builder
+    let mut builder = loom::model::Builder::new();
+    builder.preemption_bound.get_or_insert(PREEMPTION_BOUND);
+    if std::env::var_os("LOOM_MAX_BRANCHES").is_none() {
+        builder.max_branches = BRANCH_CAP;
+    }
+    builder
 }
 
 /// Checks `model` under the bounds and returns how many executions loom explored, printing the
@@ -65,19 +65,21 @@ pub fn builder() -> loom::model::Builder {
 /// loom itself does, when an interleaving violates the model's assertions, deadlocks, or runs
 /// past the branch cap.
 pub fn explore(name: &str, model: impl Fn() + Send + Sync + 'static) -> u64 {
-  let explored: &'static AtomicU64 = Box::leak(Box::new(AtomicU64::new(0)));
-  let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-    builder().check(move || {
-      explored.fetch_add(1, Ordering::Relaxed);
-      model();
-    });
-  }));
-  let count = explored.load(Ordering::Relaxed);
-  if let Err(failure) = outcome {
-    eprintln!("loom: {name}: failed at interleaving {count} (preemption bound {PREEMPTION_BOUND})");
-    std::panic::resume_unwind(failure);
-  }
-  eprintln!("loom: {name}: explored {count} interleavings (preemption bound {PREEMPTION_BOUND})");
-  assert!(count > 0, "loom: {name}: explored no interleaving");
-  count
+    let explored: &'static AtomicU64 = Box::leak(Box::new(AtomicU64::new(0)));
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        builder().check(move || {
+            explored.fetch_add(1, Ordering::Relaxed);
+            model();
+        });
+    }));
+    let count = explored.load(Ordering::Relaxed);
+    if let Err(failure) = outcome {
+        eprintln!(
+            "loom: {name}: failed at interleaving {count} (preemption bound {PREEMPTION_BOUND})"
+        );
+        std::panic::resume_unwind(failure);
+    }
+    eprintln!("loom: {name}: explored {count} interleavings (preemption bound {PREEMPTION_BOUND})");
+    assert!(count > 0, "loom: {name}: explored no interleaving");
+    count
 }

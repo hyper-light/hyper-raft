@@ -9,8 +9,25 @@
 //! past the quantum on the CPU or blocked in a call, the host's when it was runnable and held off the
 //! CPU, unattributed where the platform cannot tell (the first long poll opens the first window).
 
+// Test harness code: a panic here is a failed test (CLAUDE.md §1).
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects,
+    clippy::disallowed_macros,
+    clippy::disallowed_methods,
+    clippy::cognitive_complexity,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_wrap,
+    clippy::string_slice,
+    clippy::unwrap_in_result,
+    clippy::panic_in_result_fn,
+    clippy::missing_panics_doc
+)]
 // Test harness code: an unwrap here is a failed test, which is what it should be.
-#![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::future::Future;
 use std::pin::Pin;
@@ -41,72 +58,72 @@ const PARK_WAIT: Duration = Duration::from_secs(10);
 const ASLEEP_AFTER: Duration = Duration::from_millis(1);
 
 fn config(step_budget_ns: u64, wake_tracking: Option<WakeTracking>) -> RuntimeConfig {
-  RuntimeConfig {
-    shards: 1,
-    tasks_per_shard: 64,
-    timers_per_shard: 64,
-    interests_per_shard: 64,
-    ring_entries: 64,
-    step_budget_ns,
-    timer_tick_ns: 100_000,
-    batch: 64,
-    pin: false,
-    cores: Vec::new(),
-    page_bytes: 4096,
-    // No idle spin: every wait below is a park.
-    spin_ns: 0,
-    wake_tracking,
-  }
+    RuntimeConfig {
+        shards: 1,
+        tasks_per_shard: 64,
+        timers_per_shard: 64,
+        interests_per_shard: 64,
+        ring_entries: 64,
+        step_budget_ns,
+        timer_tick_ns: 100_000,
+        batch: 64,
+        pin: false,
+        cores: Vec::new(),
+        page_bytes: 4096,
+        // No idle spin: every wait below is a park.
+        spin_ns: 0,
+        wake_tracking,
+    }
 }
 
 /// A future that is pending once — handing its waker to the test — and ready when polled again.
 struct PendOnce {
-  wakers: Sender<Waker>,
-  polled: bool,
+    wakers: Sender<Waker>,
+    polled: bool,
 }
 
 impl Future for PendOnce {
-  type Output = ();
-  fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
-    if self.polled {
-      return Poll::Ready(());
+    type Output = ();
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        if self.polled {
+            return Poll::Ready(());
+        }
+        self.polled = true;
+        let _ = self.wakers.send(cx.waker().clone());
+        Poll::Pending
     }
-    self.polled = true;
-    let _ = self.wakers.send(cx.waker().clone());
-    Poll::Pending
-  }
 }
 
 /// Steps the shard until it has nothing to do.
 fn step_until_idle(rt: &mut LocalRuntime) {
-  while rt.step().did_work {}
+    while rt.step().did_work {}
 }
 
 /// Parks the shard and wakes it from another thread a millisecond after it announced the park: a real
 /// kick of a sleeping shard, the event the online estimate learns from.
 fn park_and_kick(rt: &mut LocalRuntime, wakers: &Receiver<Waker>) {
-  let waker = wakers.try_recv().expect("the task handed over its waker");
-  let shard = rt.shard_id().0;
-  std::thread::scope(|scope| {
-    scope.spawn(move || {
-      let began = Instant::now();
-      while !registry::with_entry(shard, |entry| entry.parking.parked())
-        .expect("a local shard is registered")
-      {
-        assert!(
-          began.elapsed() < PARK_WAIT,
-          "the shard never announced its park"
-        );
-        std::thread::yield_now();
-      }
-      let announced = Instant::now();
-      while announced.elapsed() < ASLEEP_AFTER {
-        std::thread::yield_now();
-      }
-      waker.wake();
+    let waker = wakers.try_recv().expect("the task handed over its waker");
+    let shard = rt.shard_id().0;
+    std::thread::scope(|scope| {
+        scope.spawn(move || {
+            let began = Instant::now();
+            while !registry::with_entry(shard, |entry| entry.parking.parked())
+                .expect("a local shard is registered")
+            {
+                assert!(
+                    began.elapsed() < PARK_WAIT,
+                    "the shard never announced its park"
+                );
+                std::thread::yield_now();
+            }
+            let announced = Instant::now();
+            while announced.elapsed() < ASLEEP_AFTER {
+                std::thread::yield_now();
+            }
+            waker.wake();
+        });
+        rt.park(None);
     });
-    rt.park(None);
-  });
 }
 
 /// §4.3, A-31: a tracking shard kicked while asleep learns the kick's wake — each such park is one sample
@@ -117,93 +134,94 @@ fn park_and_kick(rt: &mut LocalRuntime, wakers: &Receiver<Waker>) {
 #[test]
 #[cfg_attr(miri, ignore)] // the OS driver opens a kqueue or an eventfd, which Miri does not model
 fn a_tracking_shard_learns_its_wake_from_the_parks_its_kicks_ended() {
-  let tracking = WakeTracking {
-    prior_ns: PRIOR_NS,
-    shift: SHIFT,
-    idle_ratio: 1,
-  };
-  let mut rt = LocalRuntime::new(&config(PRIOR_NS, Some(tracking))).unwrap();
-  let (tx, rx) = channel::<Waker>();
-  rt.spawn(async move {
-    for _ in 0..KICKS {
-      PendOnce {
-        wakers: tx.clone(),
-        polled: false,
-      }
-      .await;
-    }
-  })
-  .unwrap();
-  for _ in 0..KICKS {
-    step_until_idle(&mut rt);
-    park_and_kick(&mut rt, &rx);
-  }
-  step_until_idle(&mut rt);
-  let counters = rt.counters();
-  assert_eq!(
-    counters.wake_samples + counters.wake_unslept,
-    KICKS,
-    "every kicked park was measured or counted unslept: {counters:?}"
-  );
-  assert!(
-    counters.wake_samples >= KICKS / 2,
-    "kicks that landed on a sleeping shard fed the estimate: {counters:?}"
-  );
-  assert!(
-    counters.wake_cost_ns < PRIOR_NS / 2,
-    "the estimate moved off its one-second prior toward the measured wakes: {counters:?}"
-  );
-  assert_eq!(rt.context().quantum_ns(), counters.wake_cost_ns);
-  let mirrored = registry::with_entry(rt.shard_id().0, |entry| entry.pulse.wake_cost_ns()).unwrap();
-  assert_eq!(mirrored, counters.wake_cost_ns);
-
-  let mut fixed = LocalRuntime::new(&config(QUANTUM_NS, None)).unwrap();
-  let (tx, rx) = channel::<Waker>();
-  fixed
-    .spawn(async move {
-      PendOnce {
-        wakers: tx,
-        polled: false,
-      }
-      .await;
+    let tracking = WakeTracking {
+        prior_ns: PRIOR_NS,
+        shift: SHIFT,
+        idle_ratio: 1,
+    };
+    let mut rt = LocalRuntime::new(&config(PRIOR_NS, Some(tracking))).unwrap();
+    let (tx, rx) = channel::<Waker>();
+    rt.spawn(async move {
+        for _ in 0..KICKS {
+            PendOnce {
+                wakers: tx.clone(),
+                polled: false,
+            }
+            .await;
+        }
     })
     .unwrap();
-  step_until_idle(&mut fixed);
-  park_and_kick(&mut fixed, &rx);
-  step_until_idle(&mut fixed);
-  assert_eq!(fixed.counters().wake_samples, 0);
-  assert_eq!(fixed.context().quantum_ns(), QUANTUM_NS);
+    for _ in 0..KICKS {
+        step_until_idle(&mut rt);
+        park_and_kick(&mut rt, &rx);
+    }
+    step_until_idle(&mut rt);
+    let counters = rt.counters();
+    assert_eq!(
+        counters.wake_samples + counters.wake_unslept,
+        KICKS,
+        "every kicked park was measured or counted unslept: {counters:?}"
+    );
+    assert!(
+        counters.wake_samples >= KICKS / 2,
+        "kicks that landed on a sleeping shard fed the estimate: {counters:?}"
+    );
+    assert!(
+        counters.wake_cost_ns < PRIOR_NS / 2,
+        "the estimate moved off its one-second prior toward the measured wakes: {counters:?}"
+    );
+    assert_eq!(rt.context().quantum_ns(), counters.wake_cost_ns);
+    let mirrored =
+        registry::with_entry(rt.shard_id().0, |entry| entry.pulse.wake_cost_ns()).unwrap();
+    assert_eq!(mirrored, counters.wake_cost_ns);
+
+    let mut fixed = LocalRuntime::new(&config(QUANTUM_NS, None)).unwrap();
+    let (tx, rx) = channel::<Waker>();
+    fixed
+        .spawn(async move {
+            PendOnce {
+                wakers: tx,
+                polled: false,
+            }
+            .await;
+        })
+        .unwrap();
+    step_until_idle(&mut fixed);
+    park_and_kick(&mut fixed, &rx);
+    step_until_idle(&mut fixed);
+    assert_eq!(fixed.counters().wake_samples, 0);
+    assert_eq!(fixed.context().quantum_ns(), QUANTUM_NS);
 }
 
 /// How a held poll spends its hold.
 #[derive(Clone, Copy, Debug)]
 enum Hold {
-  /// Busy on the CPU until the thread has run [`HOLD`] of CPU time: a task's own long step.
-  OnCpu,
-  /// Asleep in the kernel for [`HOLD`]: a task blocked in a call.
-  InCall,
-  /// Yielding the CPU to a runnable competitor until [`HOLD`] has passed: a runnable thread the host
-  /// keeps off its CPU, as a preemption does.
-  #[cfg(target_os = "linux")]
-  Runnable,
+    /// Busy on the CPU until the thread has run [`HOLD`] of CPU time: a task's own long step.
+    OnCpu,
+    /// Asleep in the kernel for [`HOLD`]: a task blocked in a call.
+    InCall,
+    /// Yielding the CPU to a runnable competitor until [`HOLD`] has passed: a runnable thread the host
+    /// keeps off its CPU, as a preemption does.
+    #[cfg(target_os = "linux")]
+    Runnable,
 }
 
 /// The calling thread's CPU time where the platform keeps a fine one, else the wall clock since `since`
 /// (a platform with no per-thread clock attributes nothing, so the hold's exact nature does not matter).
 fn thread_time(since: Instant) -> Duration {
-  #[cfg(any(target_os = "linux", target_os = "macos"))]
-  {
-    let _ = since;
-    let reading = rustix::time::clock_gettime(rustix::time::ClockId::ThreadCPUTime);
-    Duration::new(
-      u64::try_from(reading.tv_sec).unwrap(),
-      u32::try_from(reading.tv_nsec).unwrap(),
-    )
-  }
-  #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-  {
-    since.elapsed()
-  }
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        let _ = since;
+        let reading = rustix::time::clock_gettime(rustix::time::ClockId::ThreadCPUTime);
+        Duration::new(
+            u64::try_from(reading.tv_sec).unwrap(),
+            u32::try_from(reading.tv_nsec).unwrap(),
+        )
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        since.elapsed()
+    }
 }
 
 thread_local! {
@@ -218,79 +236,79 @@ thread_local! {
 /// Notes in [`CPU_PAST_QUANTUM`] a poll whose thread CPU, from its first to its last instruction
 /// (`cpu_began` to now), ran past the quantum.
 fn note_cpu(began: Instant, cpu_began: Duration) {
-  if thread_time(began).saturating_sub(cpu_began) > Duration::from_nanos(QUANTUM_NS) {
-    CPU_PAST_QUANTUM.with(|count| count.set(count.get() + 1));
-  }
+    if thread_time(began).saturating_sub(cpu_began) > Duration::from_nanos(QUANTUM_NS) {
+        CPU_PAST_QUANTUM.with(|count| count.set(count.get() + 1));
+    }
 }
 
 /// A future whose every poll holds the thread for [`HOLD`] as `hold` says, then wakes itself, so its
 /// polls run back to back — one per step — in one busy period with no wait between them.
 struct HoldEachPoll {
-  polls_left: u64,
-  hold: Hold,
+    polls_left: u64,
+    hold: Hold,
 }
 
 impl Future for HoldEachPoll {
-  type Output = ();
-  fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
-    if self.polls_left == 0 {
-      return Poll::Ready(());
-    }
-    self.polls_left -= 1;
-    let began = Instant::now();
-    let poll_cpu_began = thread_time(began);
-    match self.hold {
-      Hold::OnCpu => {
-        let cpu_began = thread_time(began);
-        while thread_time(began).saturating_sub(cpu_began) < HOLD {
-          std::hint::spin_loop();
+    type Output = ();
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        if self.polls_left == 0 {
+            return Poll::Ready(());
         }
-      }
-      // A test may sleep (the lint's stated exception): a sleep is a call the thread blocks in.
-      #[allow(clippy::disallowed_methods)]
-      Hold::InCall => std::thread::sleep(HOLD),
-      #[cfg(target_os = "linux")]
-      Hold::Runnable => {
-        while began.elapsed() < HOLD {
-          std::thread::yield_now();
+        self.polls_left -= 1;
+        let began = Instant::now();
+        let poll_cpu_began = thread_time(began);
+        match self.hold {
+            Hold::OnCpu => {
+                let cpu_began = thread_time(began);
+                while thread_time(began).saturating_sub(cpu_began) < HOLD {
+                    std::hint::spin_loop();
+                }
+            }
+            // A test may sleep (the lint's stated exception): a sleep is a call the thread blocks in.
+            #[allow(clippy::disallowed_methods)]
+            Hold::InCall => std::thread::sleep(HOLD),
+            #[cfg(target_os = "linux")]
+            Hold::Runnable => {
+                while began.elapsed() < HOLD {
+                    std::thread::yield_now();
+                }
+            }
         }
-      }
+        cx.waker().wake_by_ref();
+        // The whole poll's CPU, measured as late as the poll can: the shard's window closes on a reading
+        // taken just after it returns.
+        note_cpu(began, poll_cpu_began);
+        Poll::Pending
     }
-    cx.waker().wake_by_ref();
-    // The whole poll's CPU, measured as late as the poll can: the shard's window closes on a reading
-    // taken just after it returns.
-    note_cpu(began, poll_cpu_began);
-    Poll::Pending
-  }
 }
 
 /// Runs one busy period of [`LONG_POLLS`] held polls and returns the shard's counters.
 fn one_busy_period(hold: Hold) -> hyper_rt::shard_loop::Counters {
-  CPU_PAST_QUANTUM.with(|count| count.set(0));
-  let mut rt = LocalRuntime::new(&config(QUANTUM_NS, None)).unwrap();
-  rt.spawn(HoldEachPoll {
-    polls_left: LONG_POLLS,
-    hold,
-  })
-  .unwrap();
-  step_until_idle(&mut rt);
-  let counters = rt.counters();
-  let hold_ns = u64::try_from(HOLD.as_nanos()).unwrap();
-  assert!(
-    counters.longest_step_ns >= hold_ns,
-    "the wall clock saw each held poll: {counters:?}"
-  );
-  counters
+    CPU_PAST_QUANTUM.with(|count| count.set(0));
+    let mut rt = LocalRuntime::new(&config(QUANTUM_NS, None)).unwrap();
+    rt.spawn(HoldEachPoll {
+        polls_left: LONG_POLLS,
+        hold,
+    })
+    .unwrap();
+    step_until_idle(&mut rt);
+    let counters = rt.counters();
+    let hold_ns = u64::try_from(HOLD.as_nanos()).unwrap();
+    assert!(
+        counters.longest_step_ns >= hold_ns,
+        "the wall clock saw each held poll: {counters:?}"
+    );
+    counters
 }
 
 /// A shard's long polls as (the task's, of those blocked, the host's, unattributed).
 fn attributed(counters: &hyper_rt::shard_loop::Counters) -> (u64, u64, u64, u64) {
-  (
-    counters.long_steps,
-    counters.blocked_steps,
-    counters.preempted_steps,
-    counters.unattributed_steps,
-  )
+    (
+        counters.long_steps,
+        counters.blocked_steps,
+        counters.preempted_steps,
+        counters.unattributed_steps,
+    )
 }
 
 /// Whether this platform keeps a fine per-thread CPU clock the shard attributes by.
@@ -302,13 +320,13 @@ const HAS_THREAD_CLOCK: bool = cfg!(any(target_os = "linux", target_os = "macos"
 #[test]
 #[cfg_attr(miri, ignore)] // the OS driver opens a kqueue or an eventfd, which Miri does not model
 fn a_poll_busy_on_the_cpu_past_the_quantum_is_its_tasks() {
-  let counters = one_busy_period(Hold::OnCpu);
-  let expected = if HAS_THREAD_CLOCK {
-    (LONG_POLLS - 1, 0, 0, 1)
-  } else {
-    (0, 0, 0, LONG_POLLS)
-  };
-  assert_eq!(attributed(&counters), expected, "{counters:?}");
+    let counters = one_busy_period(Hold::OnCpu);
+    let expected = if HAS_THREAD_CLOCK {
+        (LONG_POLLS - 1, 0, 0, 1)
+    } else {
+        (0, 0, 0, LONG_POLLS)
+    };
+    assert_eq!(attributed(&counters), expected, "{counters:?}");
 }
 
 /// §4.3, A-31: a poll that blocked in a call past the quantum is its task's — the shard stalled on it just
@@ -321,34 +339,34 @@ fn a_poll_busy_on_the_cpu_past_the_quantum_is_its_tasks() {
 #[test]
 #[cfg_attr(miri, ignore)] // the OS driver opens a kqueue or an eventfd, which Miri does not model
 fn a_poll_blocked_in_a_call_past_the_quantum_is_its_tasks_where_blocks_are_counted() {
-  let counters = one_busy_period(Hold::InCall);
-  let clocked_long = CPU_PAST_QUANTUM.with(std::cell::Cell::get);
-  let (long, blocked, preempted, unattributed) = attributed(&counters);
-  assert_eq!(
-    long + unattributed,
-    LONG_POLLS,
-    "each long poll attributed once: {counters:?}"
-  );
-  assert_eq!(preempted, 0, "a block is never the host's: {counters:?}");
-  if cfg!(target_os = "linux") {
-    // The first long poll opens the first window; every later one is the task's, blocked unless its
-    // own clock ran past the quantum.
-    assert_eq!((long, unattributed), (LONG_POLLS - 1, 1), "{counters:?}");
-    assert!(
-      blocked + clocked_long >= LONG_POLLS - 1,
-      "a later poll is blocked unless its clock ran long ({clocked_long}): {counters:?}"
-    );
-  } else {
+    let counters = one_busy_period(Hold::InCall);
+    let clocked_long = CPU_PAST_QUANTUM.with(std::cell::Cell::get);
+    let (long, blocked, preempted, unattributed) = attributed(&counters);
     assert_eq!(
-      blocked, 0,
-      "no platform but Linux counts blocks: {counters:?}"
+        long + unattributed,
+        LONG_POLLS,
+        "each long poll attributed once: {counters:?}"
     );
-    assert!(
-      long <= clocked_long,
-      "a blocked poll is the task's only where its own clock ran past the quantum \
+    assert_eq!(preempted, 0, "a block is never the host's: {counters:?}");
+    if cfg!(target_os = "linux") {
+        // The first long poll opens the first window; every later one is the task's, blocked unless its
+        // own clock ran past the quantum.
+        assert_eq!((long, unattributed), (LONG_POLLS - 1, 1), "{counters:?}");
+        assert!(
+            blocked + clocked_long >= LONG_POLLS - 1,
+            "a later poll is blocked unless its clock ran long ({clocked_long}): {counters:?}"
+        );
+    } else {
+        assert_eq!(
+            blocked, 0,
+            "no platform but Linux counts blocks: {counters:?}"
+        );
+        assert!(
+            long <= clocked_long,
+            "a blocked poll is the task's only where its own clock ran past the quantum \
        ({clocked_long}): {counters:?}"
-    );
-  }
+        );
+    }
 }
 
 /// Restores the calling thread's CPU affinity on drop, so a failed assertion leaves the test thread as
@@ -358,9 +376,9 @@ struct RestoreAffinity(rustix::thread::CpuSet);
 
 #[cfg(target_os = "linux")]
 impl Drop for RestoreAffinity {
-  fn drop(&mut self) {
-    let _ = rustix::thread::sched_setaffinity(None, &self.0);
-  }
+    fn drop(&mut self) {
+        let _ = rustix::thread::sched_setaffinity(None, &self.0);
+    }
 }
 
 /// §4.3, A-31: a runnable poll the host keeps off its CPU past the quantum is not its task's. The shard
@@ -371,38 +389,38 @@ impl Drop for RestoreAffinity {
 #[test]
 #[cfg_attr(miri, ignore)] // the OS driver opens a kqueue or an eventfd, which Miri does not model
 fn a_poll_the_host_kept_off_its_cpu_is_not_its_tasks() {
-  use std::sync::atomic::{AtomicBool, Ordering};
-  let saved = rustix::thread::sched_getaffinity(None).unwrap();
-  let cpu = rustix::thread::sched_getcpu();
-  let mut one = rustix::thread::CpuSet::new();
-  one.set(cpu);
-  if let Err(refusal) = rustix::thread::sched_setaffinity(None, &one) {
-    eprintln!(
-      "SKIP a_poll_the_host_kept_off_its_cpu_is_not_its_tasks: pinning refused ({refusal})"
-    );
-    return;
-  }
-  let _restore = RestoreAffinity(saved);
-  let running = AtomicBool::new(false);
-  let stop = AtomicBool::new(false);
-  let counters = std::thread::scope(|scope| {
-    scope.spawn(|| {
-      rustix::thread::sched_setaffinity(None, &one).unwrap();
-      running.store(true, Ordering::Release);
-      while !stop.load(Ordering::Acquire) {
-        std::hint::spin_loop();
-      }
-    });
-    while !running.load(Ordering::Acquire) {
-      std::thread::yield_now();
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let saved = rustix::thread::sched_getaffinity(None).unwrap();
+    let cpu = rustix::thread::sched_getcpu();
+    let mut one = rustix::thread::CpuSet::new();
+    one.set(cpu);
+    if let Err(refusal) = rustix::thread::sched_setaffinity(None, &one) {
+        eprintln!(
+            "SKIP a_poll_the_host_kept_off_its_cpu_is_not_its_tasks: pinning refused ({refusal})"
+        );
+        return;
     }
-    let counters = one_busy_period(Hold::Runnable);
-    stop.store(true, Ordering::Release);
-    counters
-  });
-  assert_eq!(
-    attributed(&counters),
-    (0, 0, LONG_POLLS - 1, 1),
-    "{counters:?}"
-  );
+    let _restore = RestoreAffinity(saved);
+    let running = AtomicBool::new(false);
+    let stop = AtomicBool::new(false);
+    let counters = std::thread::scope(|scope| {
+        scope.spawn(|| {
+            rustix::thread::sched_setaffinity(None, &one).unwrap();
+            running.store(true, Ordering::Release);
+            while !stop.load(Ordering::Acquire) {
+                std::hint::spin_loop();
+            }
+        });
+        while !running.load(Ordering::Acquire) {
+            std::thread::yield_now();
+        }
+        let counters = one_busy_period(Hold::Runnable);
+        stop.store(true, Ordering::Release);
+        counters
+    });
+    assert_eq!(
+        attributed(&counters),
+        (0, 0, LONG_POLLS - 1, 1),
+        "{counters:?}"
+    );
 }

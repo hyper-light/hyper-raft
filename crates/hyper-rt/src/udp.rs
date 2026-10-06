@@ -30,224 +30,226 @@ pub type OwnedDatagram = netsys::OwnedDatagram;
 /// the methods below, never by matching a backend.
 #[derive(Debug)]
 pub struct UdpSocket {
-  inner: Inner,
+    inner: Inner,
 }
 
 /// The socket's backend: a real OS datagram socket (through the platform seam), or a simulation
 /// fabric port. Private — the distinction is internal (`on_sim`), so a consumer sees one type.
 #[derive(Debug)]
 enum Inner {
-  Real { socket: Socket },
-  Sim { index: u16, port: u16 },
-  /// Handed over ([`UdpSocket::into_owned`]): nothing left to close.
-  Moved,
+    Real {
+        socket: Socket,
+    },
+    Sim {
+        index: u16,
+        port: u16,
+    },
+    /// Handed over ([`UdpSocket::into_owned`]): nothing left to close.
+    Moved,
 }
 
 impl Drop for UdpSocket {
-  /// A simulated socket gives its desk slot back (an OS socket closes with its descriptor).
-  fn drop(&mut self) {
-    if let Inner::Sim { index, .. } = self.inner {
-      crate::sim::sim_close(index);
+    /// A simulated socket gives its desk slot back (an OS socket closes with its descriptor).
+    fn drop(&mut self) {
+        if let Inner::Sim { index, .. } = self.inner {
+            crate::sim::sim_close(index);
+        }
     }
-  }
 }
 
 /// Whether the current shard runs the simulation driver (so a socket uses the in-memory fabric).
 fn on_sim() -> bool {
-  registry::with_current(|ctx| ctx.driver_is_sim()).unwrap_or(false)
+    registry::with_current(|ctx| ctx.driver_is_sim()).unwrap_or(false)
 }
 
 impl UdpSocket {
-  /// Binds a non-blocking UDP socket to `addr` (use port 0 for an OS-assigned port, then
-  /// [`UdpSocket::local_addr`]). On the simulation runtime the requested address is ignored and a
-  /// fabric port is assigned.
-  pub fn bind(addr: SocketAddrV4) -> Result<UdpSocket, RtError> {
-    if on_sim() {
-      let (index, port) = crate::sim::sim_bind()?;
-      return Ok(UdpSocket {
-        inner: Inner::Sim { index, port },
-      });
-    }
-    let socket = netsys::dgram_socket()?;
-    netsys::bind(&socket, addr)?;
-    Ok(UdpSocket {
-      inner: Inner::Real { socket },
-    })
-  }
-
-  /// Adopts an already-bound OS datagram socket (a `std::net::UdpSocket` converts into
-  /// [`OwnedDatagram`]): the socket-activation shape, for a caller that must hold a port from the moment
-  /// it learns it until the runtime serves on it. Binding by number instead gives the port up between the
-  /// check and the use, and another socket can take it in between (the fleet fixtures' port race,
-  /// `docs/bugs/2026-09-28-a-released-test-port-was-taken-before-the-daemon-bound-it.md`). Refused when
-  /// the socket is not a datagram socket, is not bound to an IPv4 address and port, or when the current
-  /// shard runs the simulation driver (whose sockets are fabric ports, not OS handles).
-  pub fn adopt(socket: OwnedDatagram) -> Result<UdpSocket, RtError> {
-    if on_sim() {
-      return Err(RtError::BadConfig {
-        what: "an adopted OS socket on the simulation driver",
-      });
-    }
-    let socket = netsys::adopt(socket)?;
-    let bound = netsys::local_addr(&socket)?;
-    if bound.port() == 0 {
-      return Err(RtError::DriverRefused {
-        call: "adopt(unbound)",
-        code: None,
-      });
-    }
-    Ok(UdpSocket {
-      inner: Inner::Real { socket },
-    })
-  }
-
-  /// Gives up the OS socket's descriptor — the counterpart to [`UdpSocket::adopt`], for a supervisor that
-  /// binds a socket and hands it to each process it spawns (the anchor's fleet serve sockets, §4.8, held
-  /// across daemon restarts as its NFS listener is, §4.6). Refused on the simulation driver, whose sockets
-  /// are fabric ports. Unix: the supervisor that uses it is (Windows daemons are not anchor-spawned).
-  #[cfg(unix)]
-  pub fn into_owned(mut self) -> Result<OwnedDatagram, RtError> {
-    match std::mem::replace(&mut self.inner, Inner::Moved) {
-      Inner::Real { socket } => Ok(netsys::into_owned(socket)),
-      inner => {
-        self.inner = inner;
-        Err(RtError::BadConfig {
-          what: "a simulated socket has no OS descriptor to hand over",
+    /// Binds a non-blocking UDP socket to `addr` (use port 0 for an OS-assigned port, then
+    /// [`UdpSocket::local_addr`]). On the simulation runtime the requested address is ignored and a
+    /// fabric port is assigned.
+    pub fn bind(addr: SocketAddrV4) -> Result<UdpSocket, RtError> {
+        if on_sim() {
+            let (index, port) = crate::sim::sim_bind()?;
+            return Ok(UdpSocket {
+                inner: Inner::Sim { index, port },
+            });
+        }
+        let socket = netsys::dgram_socket()?;
+        netsys::bind(&socket, addr)?;
+        Ok(UdpSocket {
+            inner: Inner::Real { socket },
         })
-      }
     }
-  }
 
-  /// The local address the socket is bound to (the OS-assigned port on a real socket; the fabric
-  /// port, on loopback, in simulation).
-  pub fn local_addr(&self) -> Result<SocketAddrV4, RtError> {
-    match &self.inner {
-      Inner::Real { socket } => netsys::local_addr(socket),
-      Inner::Sim { port, .. } => Ok(SocketAddrV4::new(Ipv4Addr::LOCALHOST, *port)),
-      Inner::Moved => Err(moved()),
-    }
-  }
-
-  /// Whether every datagram the socket sends carries the don't-fragment bit (RFC 8899 §3), read back from
-  /// the OS; on the simulation fabric, which has no fragmentation, `true`.
-  #[cfg(any(target_os = "linux", target_os = "macos"))]
-  pub fn dont_fragment(&self) -> Result<bool, RtError> {
-    match &self.inner {
-      Inner::Real { socket } => netsys::dont_fragment(socket),
-      Inner::Sim { .. } => Ok(true),
-      Inner::Moved => Err(moved()),
-    }
-  }
-
-  /// The socket's receive buffer in bytes — what the kernel queues for it before dropping datagrams
-  /// (`SO_RCVBUF`); a consumer that redistributes the socket among several sessions sizes each session's
-  /// queue from it. On the simulation fabric, a stated stand-in (the fabric's mailbox is unbounded).
-  pub fn recv_buffer_bytes(&self) -> Result<usize, RtError> {
-    match &self.inner {
-      Inner::Real { socket } => netsys::recv_buffer_bytes(socket),
-      Inner::Sim { .. } => Ok(crate::sim::SIM_RECV_BUFFER_BYTES),
-      Inner::Moved => Err(moved()),
-    }
-  }
-
-  /// Sends a datagram to `addr` without blocking: the bytes accepted, or `RtError::WouldBlock` when the
-  /// OS has no room for it now — local pressure, typed apart from a failure of the socket, so a caller
-  /// retries it once [`UdpSocket::writable`] (or sends with [`UdpSocket::send_to_writable`]) rather than
-  /// treating it as a lost path (AUD-29-61). In simulation the datagram is delivered to `addr`'s port on the
-  /// fabric and any waiting receiver is woken.
-  pub fn send_to(&self, buf: &[u8], addr: SocketAddrV4) -> Result<usize, RtError> {
-    self
-      .try_send_to(buf, addr)?
-      .ok_or(RtError::WouldBlock { call: "sendto" })
-  }
-
-  /// Sends a datagram to `addr` without blocking: the bytes accepted, or `None` when the OS has no room for
-  /// it now (nothing was sent).
-  pub fn try_send_to(&self, buf: &[u8], addr: SocketAddrV4) -> Result<Option<usize>, RtError> {
-    match &self.inner {
-      Inner::Real { socket } => loop {
-        match netsys::send_to(socket, buf, addr)? {
-          Io::Ready(sent) => return Ok(Some(sent)),
-          Io::WouldBlock => return Ok(None),
-          Io::Interrupted => {}
+    /// Adopts an already-bound OS datagram socket (a `std::net::UdpSocket` converts into
+    /// [`OwnedDatagram`]): the socket-activation shape, for a caller that must hold a port from the moment
+    /// it learns it until the runtime serves on it. Binding by number instead gives the port up between the
+    /// check and the use, and another socket can take it in between (the fleet fixtures' port race,
+    /// `docs/bugs/2026-09-28-a-released-test-port-was-taken-before-the-daemon-bound-it.md`). Refused when
+    /// the socket is not a datagram socket, is not bound to an IPv4 address and port, or when the current
+    /// shard runs the simulation driver (whose sockets are fabric ports, not OS handles).
+    pub fn adopt(socket: OwnedDatagram) -> Result<UdpSocket, RtError> {
+        if on_sim() {
+            return Err(RtError::BadConfig {
+                what: "an adopted OS socket on the simulation driver",
+            });
         }
-      },
-      Inner::Sim { index, .. } => crate::sim::sim_send(*index, addr.port(), buf),
-      Inner::Moved => Err(moved()),
-    }
-  }
-
-  /// Sends a datagram to `addr`, awaiting the socket's writability through the driver while the OS has no
-  /// room for it (AUD-29-61): local send pressure delays the datagram, never fails it.
-  pub async fn send_to_writable(&self, buf: &[u8], addr: SocketAddrV4) -> Result<usize, RtError> {
-    loop {
-      if let Some(sent) = self.try_send_to(buf, addr)? {
-        return Ok(sent);
-      }
-      self.writable().await?;
-    }
-  }
-
-  /// Awaits the socket's write readiness through the driver (send-buffer space), or a spurious wake — so a
-  /// caller follows it with [`UdpSocket::try_send_to`] and loops on `None`.
-  pub fn writable(&self) -> impl Future<Output = Result<(), RtError>> + use<> {
-    ready(self.target(), true)
-  }
-
-  /// What a readiness wait on this socket watches.
-  fn target(&self) -> Target {
-    match &self.inner {
-      Inner::Real { socket } => Target::Os(socket.raw_id()),
-      Inner::Sim { index, .. } => Target::Sim(*index),
-      Inner::Moved => Target::Os(-1),
-    }
-  }
-
-  /// Receives one datagram, awaiting readability through the driver when none is ready. Returns the
-  /// byte count and the sender's address. The loop of [`UdpSocket::readable`] and
-  /// [`UdpSocket::try_recv_from`] — a caller whose buffer must not be held across the await (one buffer
-  /// shared by a shard's readers) drives those two itself.
-  pub async fn recv_from(&self, buf: &mut [u8]) -> Result<(usize, SocketAddrV4), RtError> {
-    loop {
-      if let Some(received) = self.try_recv_from(buf)? {
-        return Ok(received);
-      }
-      self.readable().await?;
-    }
-  }
-
-  /// Awaits the socket's read readiness through the driver: a datagram is waiting, or the wait ended
-  /// spuriously — so a caller follows it with [`UdpSocket::try_recv_from`] and loops on `None`. The future
-  /// names the socket by its descriptor (or fabric port), not by a borrow, so a task that reaches the socket
-  /// through a handle (a kept demultiplexer, AUD-29-08) can await it outside the handle's borrow.
-  pub fn readable(&self) -> impl Future<Output = Result<(), RtError>> + use<> {
-    ready(self.target(), false)
-  }
-
-  /// Takes one waiting datagram into `buf` without blocking: the byte count and the sender, or `None`
-  /// when nothing is waiting. A datagram longer than `buf` is truncated to it (size `buf` to the largest
-  /// datagram the caller reads).
-  pub fn try_recv_from(&self, buf: &mut [u8]) -> Result<Option<(usize, SocketAddrV4)>, RtError> {
-    match &self.inner {
-      Inner::Real { socket } => loop {
-        match netsys::recv_from(socket, buf)? {
-          Io::Ready(out) => return Ok(Some(out)),
-          Io::WouldBlock => return Ok(None),
-          Io::Interrupted => {}
+        let socket = netsys::adopt(socket)?;
+        let bound = netsys::local_addr(&socket)?;
+        if bound.port() == 0 {
+            return Err(RtError::DriverRefused {
+                call: "adopt(unbound)",
+                code: None,
+            });
         }
-      },
-      Inner::Sim { index, .. } => Ok(
-        crate::sim::sim_recv(*index, buf)
-          .map(|(n, from)| (n, SocketAddrV4::new(Ipv4Addr::LOCALHOST, from))),
-      ),
-      Inner::Moved => Err(moved()),
+        Ok(UdpSocket {
+            inner: Inner::Real { socket },
+        })
     }
-  }
+
+    /// Gives up the OS socket's descriptor — the counterpart to [`UdpSocket::adopt`], for a supervisor that
+    /// binds a socket and hands it to each process it spawns (the anchor's fleet serve sockets, §4.8, held
+    /// across daemon restarts as its NFS listener is, §4.6). Refused on the simulation driver, whose sockets
+    /// are fabric ports. Unix: the supervisor that uses it is (Windows daemons are not anchor-spawned).
+    #[cfg(unix)]
+    pub fn into_owned(mut self) -> Result<OwnedDatagram, RtError> {
+        match std::mem::replace(&mut self.inner, Inner::Moved) {
+            Inner::Real { socket } => Ok(netsys::into_owned(socket)),
+            inner => {
+                self.inner = inner;
+                Err(RtError::BadConfig {
+                    what: "a simulated socket has no OS descriptor to hand over",
+                })
+            }
+        }
+    }
+
+    /// The local address the socket is bound to (the OS-assigned port on a real socket; the fabric
+    /// port, on loopback, in simulation).
+    pub fn local_addr(&self) -> Result<SocketAddrV4, RtError> {
+        match &self.inner {
+            Inner::Real { socket } => netsys::local_addr(socket),
+            Inner::Sim { port, .. } => Ok(SocketAddrV4::new(Ipv4Addr::LOCALHOST, *port)),
+            Inner::Moved => Err(moved()),
+        }
+    }
+
+    /// Whether every datagram the socket sends carries the don't-fragment bit (RFC 8899 §3), read back from
+    /// the OS; on the simulation fabric, which has no fragmentation, `true`.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub fn dont_fragment(&self) -> Result<bool, RtError> {
+        match &self.inner {
+            Inner::Real { socket } => netsys::dont_fragment(socket),
+            Inner::Sim { .. } => Ok(true),
+            Inner::Moved => Err(moved()),
+        }
+    }
+
+    /// The socket's receive buffer in bytes — what the kernel queues for it before dropping datagrams
+    /// (`SO_RCVBUF`); a consumer that redistributes the socket among several sessions sizes each session's
+    /// queue from it. On the simulation fabric, a stated stand-in (the fabric's mailbox is unbounded).
+    pub fn recv_buffer_bytes(&self) -> Result<usize, RtError> {
+        match &self.inner {
+            Inner::Real { socket } => netsys::recv_buffer_bytes(socket),
+            Inner::Sim { .. } => Ok(crate::sim::SIM_RECV_BUFFER_BYTES),
+            Inner::Moved => Err(moved()),
+        }
+    }
+
+    /// Sends a datagram to `addr` without blocking: the bytes accepted, or `RtError::WouldBlock` when the
+    /// OS has no room for it now — local pressure, typed apart from a failure of the socket, so a caller
+    /// retries it once [`UdpSocket::writable`] (or sends with [`UdpSocket::send_to_writable`]) rather than
+    /// treating it as a lost path (AUD-29-61). In simulation the datagram is delivered to `addr`'s port on the
+    /// fabric and any waiting receiver is woken.
+    pub fn send_to(&self, buf: &[u8], addr: SocketAddrV4) -> Result<usize, RtError> {
+        self.try_send_to(buf, addr)?
+            .ok_or(RtError::WouldBlock { call: "sendto" })
+    }
+
+    /// Sends a datagram to `addr` without blocking: the bytes accepted, or `None` when the OS has no room for
+    /// it now (nothing was sent).
+    pub fn try_send_to(&self, buf: &[u8], addr: SocketAddrV4) -> Result<Option<usize>, RtError> {
+        match &self.inner {
+            Inner::Real { socket } => loop {
+                match netsys::send_to(socket, buf, addr)? {
+                    Io::Ready(sent) => return Ok(Some(sent)),
+                    Io::WouldBlock => return Ok(None),
+                    Io::Interrupted => {}
+                }
+            },
+            Inner::Sim { index, .. } => crate::sim::sim_send(*index, addr.port(), buf),
+            Inner::Moved => Err(moved()),
+        }
+    }
+
+    /// Sends a datagram to `addr`, awaiting the socket's writability through the driver while the OS has no
+    /// room for it (AUD-29-61): local send pressure delays the datagram, never fails it.
+    pub async fn send_to_writable(&self, buf: &[u8], addr: SocketAddrV4) -> Result<usize, RtError> {
+        loop {
+            if let Some(sent) = self.try_send_to(buf, addr)? {
+                return Ok(sent);
+            }
+            self.writable().await?;
+        }
+    }
+
+    /// Awaits the socket's write readiness through the driver (send-buffer space), or a spurious wake — so a
+    /// caller follows it with [`UdpSocket::try_send_to`] and loops on `None`.
+    pub fn writable(&self) -> impl Future<Output = Result<(), RtError>> + use<> {
+        ready(self.target(), true)
+    }
+
+    /// What a readiness wait on this socket watches.
+    fn target(&self) -> Target {
+        match &self.inner {
+            Inner::Real { socket } => Target::Os(socket.raw_id()),
+            Inner::Sim { index, .. } => Target::Sim(*index),
+            Inner::Moved => Target::Os(-1),
+        }
+    }
+
+    /// Receives one datagram, awaiting readability through the driver when none is ready. Returns the
+    /// byte count and the sender's address. The loop of [`UdpSocket::readable`] and
+    /// [`UdpSocket::try_recv_from`] — a caller whose buffer must not be held across the await (one buffer
+    /// shared by a shard's readers) drives those two itself.
+    pub async fn recv_from(&self, buf: &mut [u8]) -> Result<(usize, SocketAddrV4), RtError> {
+        loop {
+            if let Some(received) = self.try_recv_from(buf)? {
+                return Ok(received);
+            }
+            self.readable().await?;
+        }
+    }
+
+    /// Awaits the socket's read readiness through the driver: a datagram is waiting, or the wait ended
+    /// spuriously — so a caller follows it with [`UdpSocket::try_recv_from`] and loops on `None`. The future
+    /// names the socket by its descriptor (or fabric port), not by a borrow, so a task that reaches the socket
+    /// through a handle (a kept demultiplexer, AUD-29-08) can await it outside the handle's borrow.
+    pub fn readable(&self) -> impl Future<Output = Result<(), RtError>> + use<> {
+        ready(self.target(), false)
+    }
+
+    /// Takes one waiting datagram into `buf` without blocking: the byte count and the sender, or `None`
+    /// when nothing is waiting. A datagram longer than `buf` is truncated to it (size `buf` to the largest
+    /// datagram the caller reads).
+    pub fn try_recv_from(&self, buf: &mut [u8]) -> Result<Option<(usize, SocketAddrV4)>, RtError> {
+        match &self.inner {
+            Inner::Real { socket } => loop {
+                match netsys::recv_from(socket, buf)? {
+                    Io::Ready(out) => return Ok(Some(out)),
+                    Io::WouldBlock => return Ok(None),
+                    Io::Interrupted => {}
+                }
+            },
+            Inner::Sim { index, .. } => Ok(crate::sim::sim_recv(*index, buf)
+                .map(|(n, from)| (n, SocketAddrV4::new(Ipv4Addr::LOCALHOST, from)))),
+            Inner::Moved => Err(moved()),
+        }
+    }
 }
 
 /// The refusal for a socket whose OS handle was handed over.
 fn moved() -> RtError {
-  RtError::BadConfig {
-    what: "a socket whose descriptor was handed over",
-  }
+    RtError::BadConfig {
+        what: "a socket whose descriptor was handed over",
+    }
 }

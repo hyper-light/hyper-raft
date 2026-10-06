@@ -28,14 +28,36 @@
 //! sockets ([`udp`] everywhere and `tcp` on Unix — the NFS mount server's, over one shared readiness
 //! future), and the OS drivers.
 
+// Test code opts out of the no-panic wall at the crate root (CLAUDE.md §1); shipped code does not.
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing,
+        clippy::arithmetic_side_effects,
+        clippy::disallowed_macros,
+        clippy::disallowed_methods,
+        clippy::cognitive_complexity,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_possible_wrap,
+        clippy::string_slice,
+        clippy::unwrap_in_result,
+        clippy::panic_in_result_fn,
+        clippy::missing_panics_doc
+    )
+)]
+
 mod attribution;
-pub mod machine;
-pub mod mem;
 mod cells;
 pub mod control;
 pub mod driver;
 pub mod error;
 pub mod futures;
+pub mod machine;
+pub mod mem;
 mod netsys;
 pub mod parking;
 pub mod queue;

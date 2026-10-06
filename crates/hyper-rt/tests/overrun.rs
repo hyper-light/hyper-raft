@@ -8,8 +8,25 @@
 //! `docs/bugs/2026-09-16-fleet-detection-windows-use-a-fixed-scheduler-quantum.md`); and on an idle
 //! shard the measurement never exceeds the lateness the shard's own clock actually shows.
 
+// Test harness code: a panic here is a failed test (CLAUDE.md §1).
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects,
+    clippy::disallowed_macros,
+    clippy::disallowed_methods,
+    clippy::cognitive_complexity,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_wrap,
+    clippy::string_slice,
+    clippy::unwrap_in_result,
+    clippy::panic_in_result_fn,
+    clippy::missing_panics_doc
+)]
 // Test harness code: an unwrap here is a failed test, which is what it should be.
-#![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -33,46 +50,46 @@ const HELD_OFF: Duration = Duration::from_millis(50);
 const DONE_DEADLINE: Duration = Duration::from_secs(10);
 
 fn config() -> RuntimeConfig {
-  RuntimeConfig {
-    shards: 1,
-    tasks_per_shard: 64,
-    timers_per_shard: 64,
-    interests_per_shard: 64,
-    ring_entries: 64,
-    step_budget_ns: 1_000_000_000,
-    timer_tick_ns: 100_000,
-    batch: 64,
-    pin: false,
-    cores: Vec::new(),
-    page_bytes: 4096,
-    // No idle spin: every wait below is a park, measured against a real driver wake.
-    spin_ns: 0,
-    wake_tracking: None,
-  }
+    RuntimeConfig {
+        shards: 1,
+        tasks_per_shard: 64,
+        timers_per_shard: 64,
+        interests_per_shard: 64,
+        ring_entries: 64,
+        step_budget_ns: 1_000_000_000,
+        timer_tick_ns: 100_000,
+        batch: 64,
+        pin: false,
+        cores: Vec::new(),
+        page_bytes: 4096,
+        // No idle spin: every wait below is a park, measured against a real driver wake.
+        spin_ns: 0,
+        wake_tracking: None,
+    }
 }
 
 /// Holds the calling thread for `window` without a blocking sleep (D-9): the thread yields, so it is
 /// not stepping its shard — which, for the shard, is the operating system not running it.
 fn hold_for(window: Duration) {
-  let began = Instant::now();
-  while began.elapsed() < window {
-    std::thread::yield_now();
-  }
+    let began = Instant::now();
+    while began.elapsed() < window {
+        std::thread::yield_now();
+    }
 }
 
 fn wait_until(deadline: Duration, done: impl Fn() -> bool) -> bool {
-  let began = Instant::now();
-  while began.elapsed() < deadline {
-    if done() {
-      return true;
+    let began = Instant::now();
+    while began.elapsed() < deadline {
+        if done() {
+            return true;
+        }
+        std::thread::yield_now();
     }
-    std::thread::yield_now();
-  }
-  done()
+    done()
 }
 
 fn nanos(window: Duration) -> u64 {
-  u64::try_from(window.as_nanos()).unwrap()
+    u64::try_from(window.as_nanos()).unwrap()
 }
 
 /// A shard that waited for a deadline and first stepped `HELD_OFF` past it reports at least that much,
@@ -81,47 +98,47 @@ fn nanos(window: Duration) -> u64 {
 #[test]
 #[cfg_attr(miri, ignore)] // the OS driver opens a kqueue or an eventfd, which Miri does not model
 fn a_wait_stepped_past_its_deadline_reports_the_lateness() {
-  let mut rt = LocalRuntime::new(&config()).unwrap();
-  rt.spawn(async {
-    futures::sleep(SLEEP_NS).await.unwrap();
-  })
-  .unwrap();
-  // The task arms its timer; the shard then has nothing to do until it fires.
-  let mut outcome = rt.step();
-  while outcome.did_work {
-    outcome = rt.step();
-  }
-  let deadline = outcome
-    .next_deadline_ns
-    .expect("the sleep armed a timer the shard waits for");
-  rt.park(Some(deadline));
-  // Woken at the deadline — and then not run.
-  hold_for(HELD_OFF);
-  rt.step();
-  let stepped_by = rt.context().now_ns();
-  let overrun = rt.context().scheduler_overrun_ns();
-  rt.run_until_idle();
-  let counters = rt.counters();
-  assert!(
-    counters.waits >= 1,
-    "the shard parked for the deadline (waits {}) — the test's premise",
-    counters.waits
-  );
-  assert!(
-    overrun >= nanos(HELD_OFF),
-    "the step {} ns past its wait's deadline reports at least the {} ns it was held off",
-    overrun,
-    nanos(HELD_OFF)
-  );
-  assert!(
-    overrun <= stepped_by.saturating_sub(deadline),
-    "the overrun ({overrun} ns) never exceeds the lateness the shard clock shows ({} ns)",
-    stepped_by.saturating_sub(deadline)
-  );
-  assert_eq!(
-    counters.scheduler_overrun_ns, overrun,
-    "the counters carry the same measurement"
-  );
+    let mut rt = LocalRuntime::new(&config()).unwrap();
+    rt.spawn(async {
+        futures::sleep(SLEEP_NS).await.unwrap();
+    })
+    .unwrap();
+    // The task arms its timer; the shard then has nothing to do until it fires.
+    let mut outcome = rt.step();
+    while outcome.did_work {
+        outcome = rt.step();
+    }
+    let deadline = outcome
+        .next_deadline_ns
+        .expect("the sleep armed a timer the shard waits for");
+    rt.park(Some(deadline));
+    // Woken at the deadline — and then not run.
+    hold_for(HELD_OFF);
+    rt.step();
+    let stepped_by = rt.context().now_ns();
+    let overrun = rt.context().scheduler_overrun_ns();
+    rt.run_until_idle();
+    let counters = rt.counters();
+    assert!(
+        counters.waits >= 1,
+        "the shard parked for the deadline (waits {}) — the test's premise",
+        counters.waits
+    );
+    assert!(
+        overrun >= nanos(HELD_OFF),
+        "the step {} ns past its wait's deadline reports at least the {} ns it was held off",
+        overrun,
+        nanos(HELD_OFF)
+    );
+    assert!(
+        overrun <= stepped_by.saturating_sub(deadline),
+        "the overrun ({overrun} ns) never exceeds the lateness the shard clock shows ({} ns)",
+        stepped_by.saturating_sub(deadline)
+    );
+    assert_eq!(
+        counters.scheduler_overrun_ns, overrun,
+        "the counters carry the same measurement"
+    );
 }
 
 /// How late the sleeper saw its own timer fire, on the shard clock.
@@ -137,39 +154,39 @@ static SLEEPER_OVERRUN_NS: AtomicU64 = AtomicU64::new(u64::MAX);
 #[test]
 #[cfg_attr(miri, ignore)] // the OS driver opens a kqueue or an eventfd, which Miri does not model
 fn a_busy_shards_late_timer_is_not_a_scheduler_overrun() {
-  let mut rt = LocalRuntime::new(&config()).unwrap();
-  rt.spawn(async {
-    let due = futures::now_ns().saturating_add(SLEEP_NS);
-    futures::sleep(SLEEP_NS).await.unwrap();
-    SLEEPER_LATE_NS.store(futures::now_ns().saturating_sub(due), Ordering::Release);
-    SLEEPER_OVERRUN_NS.store(futures::scheduler_overrun_ns(), Ordering::Release);
-  })
-  .unwrap();
-  rt.spawn(async {
-    hold_for(HELD_OFF);
-  })
-  .unwrap();
-  rt.run_until_idle();
-  let counters = rt.counters();
-  let late = SLEEPER_LATE_NS.load(Ordering::Acquire);
-  assert!(
-    late >= nanos(HELD_OFF).saturating_sub(SLEEP_NS),
-    "the blocker held the shard past the sleeper's deadline: the timer fired {late} ns late (the \
+    let mut rt = LocalRuntime::new(&config()).unwrap();
+    rt.spawn(async {
+        let due = futures::now_ns().saturating_add(SLEEP_NS);
+        futures::sleep(SLEEP_NS).await.unwrap();
+        SLEEPER_LATE_NS.store(futures::now_ns().saturating_sub(due), Ordering::Release);
+        SLEEPER_OVERRUN_NS.store(futures::scheduler_overrun_ns(), Ordering::Release);
+    })
+    .unwrap();
+    rt.spawn(async {
+        hold_for(HELD_OFF);
+    })
+    .unwrap();
+    rt.run_until_idle();
+    let counters = rt.counters();
+    let late = SLEEPER_LATE_NS.load(Ordering::Acquire);
+    assert!(
+        late >= nanos(HELD_OFF).saturating_sub(SLEEP_NS),
+        "the blocker held the shard past the sleeper's deadline: the timer fired {late} ns late (the \
      test's premise — the sleeper polls before the blocker)"
-  );
-  assert_eq!(
-    counters.timers_fired, 1,
-    "the sleeper's timer fired from a step's expiry, {counters:?}"
-  );
-  assert_eq!(
-    counters.waits, 0,
-    "the shard never waited: it was busy the whole time, {counters:?}"
-  );
-  assert_eq!(
-    SLEEPER_OVERRUN_NS.load(Ordering::Acquire),
-    0,
-    "a busy shard's late timer is task latency, not a scheduler overrun"
-  );
+    );
+    assert_eq!(
+        counters.timers_fired, 1,
+        "the sleeper's timer fired from a step's expiry, {counters:?}"
+    );
+    assert_eq!(
+        counters.waits, 0,
+        "the shard never waited: it was busy the whole time, {counters:?}"
+    );
+    assert_eq!(
+        SLEEPER_OVERRUN_NS.load(Ordering::Acquire),
+        0,
+        "a busy shard's late timer is task latency, not a scheduler overrun"
+    );
 }
 
 /// The span the sleeps took on the shard clock, from before the first to after the last.
@@ -178,12 +195,12 @@ static SLEEPS_SPAN_NS: AtomicU64 = AtomicU64::new(0);
 static IDLE_OVERRUN_NS: AtomicU64 = AtomicU64::new(u64::MAX);
 
 async fn sleep_repeatedly() {
-  let began = futures::now_ns();
-  for _ in 0..SLEEPS {
-    futures::sleep(SLEEP_NS).await.unwrap();
-  }
-  SLEEPS_SPAN_NS.store(futures::now_ns().saturating_sub(began), Ordering::Release);
-  IDLE_OVERRUN_NS.store(futures::scheduler_overrun_ns(), Ordering::Release);
+    let began = futures::now_ns();
+    for _ in 0..SLEEPS {
+        futures::sleep(SLEEP_NS).await.unwrap();
+    }
+    SLEEPS_SPAN_NS.store(futures::now_ns().saturating_sub(began), Ordering::Release);
+    IDLE_OVERRUN_NS.store(futures::scheduler_overrun_ns(), Ordering::Release);
 }
 
 /// On a shard thread of its own, idle between sleeps, the measurement is bounded by the lateness the
@@ -195,33 +212,33 @@ async fn sleep_repeatedly() {
 #[test]
 #[cfg_attr(miri, ignore)] // the OS driver opens a kqueue or an eventfd, which Miri does not model
 fn an_idle_shards_measured_overrun_never_exceeds_the_lateness_it_observed() {
-  let rt = Runtime::start(&config()).unwrap();
-  let shard = rt.shard_ids()[0];
-  rt.spawn_on(shard, sleep_repeatedly()).unwrap();
-  assert!(
-    wait_until(DONE_DEADLINE, || IDLE_OVERRUN_NS.load(Ordering::Acquire)
-      != u64::MAX),
-    "the sleeps finished inside the deadline"
-  );
-  let mirrored = registry::with_entry(shard.0, |entry| entry.pulse.scheduler_overrun_ns());
-  let counters = rt.shutdown().unwrap();
-  let overrun = IDLE_OVERRUN_NS.load(Ordering::Acquire);
-  let lateness = SLEEPS_SPAN_NS
-    .load(Ordering::Acquire)
-    .saturating_sub(SLEEPS.saturating_mul(SLEEP_NS));
-  assert!(
-    counters[0].waits >= SLEEPS,
-    "the shard parked for each sleep (waits {}) — the test's premise",
-    counters[0].waits
-  );
-  assert!(
-    overrun <= lateness,
-    "the measured overrun ({overrun} ns) is bounded by the lateness the {SLEEPS} sleeps of \
+    let rt = Runtime::start(&config()).unwrap();
+    let shard = rt.shard_ids()[0];
+    rt.spawn_on(shard, sleep_repeatedly()).unwrap();
+    assert!(
+        wait_until(DONE_DEADLINE, || IDLE_OVERRUN_NS.load(Ordering::Acquire)
+            != u64::MAX),
+        "the sleeps finished inside the deadline"
+    );
+    let mirrored = registry::with_entry(shard.0, |entry| entry.pulse.scheduler_overrun_ns());
+    let counters = rt.shutdown().unwrap();
+    let overrun = IDLE_OVERRUN_NS.load(Ordering::Acquire);
+    let lateness = SLEEPS_SPAN_NS
+        .load(Ordering::Acquire)
+        .saturating_sub(SLEEPS.saturating_mul(SLEEP_NS));
+    assert!(
+        counters[0].waits >= SLEEPS,
+        "the shard parked for each sleep (waits {}) — the test's premise",
+        counters[0].waits
+    );
+    assert!(
+        overrun <= lateness,
+        "the measured overrun ({overrun} ns) is bounded by the lateness the {SLEEPS} sleeps of \
      {SLEEP_NS} ns accrued ({lateness} ns)"
-  );
-  assert_eq!(
-    mirrored,
-    Some(overrun),
-    "the registry pulse mirrors the shard's measurement for another thread"
-  );
+    );
+    assert_eq!(
+        mirrored,
+        Some(overrun),
+        "the registry pulse mirrors the shard's measurement for another thread"
+    );
 }

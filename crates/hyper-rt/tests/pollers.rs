@@ -4,8 +4,25 @@
 //! so whoever asks must wake the task — a spin that asks and drops the answer loses the ring, and a
 //! client's claim then waits until another client rings or its own claim wait runs out.
 
+// Test harness code: a panic here is a failed test (CLAUDE.md §1).
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects,
+    clippy::disallowed_macros,
+    clippy::disallowed_methods,
+    clippy::cognitive_complexity,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_wrap,
+    clippy::string_slice,
+    clippy::unwrap_in_result,
+    clippy::panic_in_result_fn,
+    clippy::missing_panics_doc
+)]
 // Test harness code: an unwrap here is a failed test, which is what it should be.
-#![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -27,21 +44,21 @@ const WAKE_DEADLINE: Duration = Duration::from_secs(2);
 const SETTLE: Duration = Duration::from_millis(50);
 
 fn config() -> RuntimeConfig {
-  RuntimeConfig {
-    shards: 1,
-    tasks_per_shard: 64,
-    timers_per_shard: 64,
-    interests_per_shard: 64,
-    ring_entries: 64,
-    step_budget_ns: 1_000_000_000,
-    timer_tick_ns: 100_000,
-    batch: 64,
-    pin: false,
-    cores: Vec::new(),
-    page_bytes: 4096,
-    spin_ns: SPIN_NS,
-    wake_tracking: None,
-  }
+    RuntimeConfig {
+        shards: 1,
+        tasks_per_shard: 64,
+        timers_per_shard: 64,
+        interests_per_shard: 64,
+        ring_entries: 64,
+        step_budget_ns: 1_000_000_000,
+        timer_tick_ns: 100_000,
+        batch: 64,
+        pin: false,
+        cores: Vec::new(),
+        page_bytes: 4096,
+        spin_ns: SPIN_NS,
+        wake_tracking: None,
+    }
 }
 
 /// The doorbell: rung by a client (set), consumed by the poller's question (swapped to false).
@@ -52,28 +69,28 @@ static SERVED: AtomicU64 = AtomicU64::new(0);
 /// The daemon's control loop in miniature: register as a poller with a consuming question, then
 /// idle until woken, counting each wake.
 async fn doorbell_loop() {
-  if let Some(task) = futures::current_task() {
-    registry::with_current(|ctx| {
-      ctx.register_poller(task, Box::new(|| RUNG.swap(false, Ordering::AcqRel)))
-    })
-    .unwrap()
-    .unwrap();
-  }
-  loop {
-    SERVED.fetch_add(1, Ordering::AcqRel);
-    futures::idle().await;
-  }
+    if let Some(task) = futures::current_task() {
+        registry::with_current(|ctx| {
+            ctx.register_poller(task, Box::new(|| RUNG.swap(false, Ordering::AcqRel)))
+        })
+        .unwrap()
+        .unwrap();
+    }
+    loop {
+        SERVED.fetch_add(1, Ordering::AcqRel);
+        futures::idle().await;
+    }
 }
 
 fn wait_until(deadline: Duration, done: impl Fn() -> bool) -> bool {
-  let started = Instant::now();
-  while started.elapsed() < deadline {
-    if done() {
-      return true;
+    let started = Instant::now();
+    while started.elapsed() < deadline {
+        if done() {
+            return true;
+        }
+        std::thread::yield_now();
     }
-    std::thread::yield_now();
-  }
-  done()
+    done()
 }
 
 /// A ring that lands while the shard is idle-spinning wakes the consuming poller: the spin saw it
@@ -83,39 +100,39 @@ fn wait_until(deadline: Duration, done: impl Fn() -> bool) -> bool {
 /// kick; a parked one does).
 #[test]
 fn a_ring_during_the_idle_spin_wakes_a_consuming_poller() {
-  let rt = Runtime::start(&config()).unwrap();
-  let shard = rt.shard_ids()[0];
-  // A client's earlier request opened the shard's idle window, as the server notes one it served.
-  rt.spawn_on(shard, async {
-    registry::with_current(|ctx| ctx.note_activity());
-  })
-  .unwrap();
-  rt.spawn_on(shard, doorbell_loop()).unwrap();
-  assert!(
-    wait_until(WAKE_DEADLINE, || SERVED.load(Ordering::Acquire) >= 1),
-    "the doorbell task ran once and went idle"
-  );
-  // Let the step that polled the task end and the shard, inside its window with nothing to do, settle
-  // into its spin; then ring.
-  let _ = wait_until(SETTLE, || false);
-  RUNG.store(true, Ordering::Release);
-  let _ = registry::with_entry(shard.0, |entry| entry.kick.kick());
-  let woken = wait_until(WAKE_DEADLINE, || SERVED.load(Ordering::Acquire) >= 2);
-  let counters = rt.shutdown().unwrap();
-  let shard_counters = &counters[0];
-  assert!(
-    shard_counters.spin_hits >= 1,
-    "the ring landed inside the idle spin (spin hits {}); the test's timing premise",
-    shard_counters.spin_hits
-  );
-  assert!(
-    woken,
-    "the ring during the spin woke the poller: served {} times, poller wakes {}",
-    SERVED.load(Ordering::Acquire),
-    shard_counters.poller_wakes
-  );
-  assert!(
-    shard_counters.poller_wakes >= 1,
-    "non-vacuity: the loop woke the poller, not a foreign wake"
-  );
+    let rt = Runtime::start(&config()).unwrap();
+    let shard = rt.shard_ids()[0];
+    // A client's earlier request opened the shard's idle window, as the server notes one it served.
+    rt.spawn_on(shard, async {
+        registry::with_current(|ctx| ctx.note_activity());
+    })
+    .unwrap();
+    rt.spawn_on(shard, doorbell_loop()).unwrap();
+    assert!(
+        wait_until(WAKE_DEADLINE, || SERVED.load(Ordering::Acquire) >= 1),
+        "the doorbell task ran once and went idle"
+    );
+    // Let the step that polled the task end and the shard, inside its window with nothing to do, settle
+    // into its spin; then ring.
+    let _ = wait_until(SETTLE, || false);
+    RUNG.store(true, Ordering::Release);
+    let _ = registry::with_entry(shard.0, |entry| entry.kick.kick());
+    let woken = wait_until(WAKE_DEADLINE, || SERVED.load(Ordering::Acquire) >= 2);
+    let counters = rt.shutdown().unwrap();
+    let shard_counters = &counters[0];
+    assert!(
+        shard_counters.spin_hits >= 1,
+        "the ring landed inside the idle spin (spin hits {}); the test's timing premise",
+        shard_counters.spin_hits
+    );
+    assert!(
+        woken,
+        "the ring during the spin woke the poller: served {} times, poller wakes {}",
+        SERVED.load(Ordering::Acquire),
+        shard_counters.poller_wakes
+    );
+    assert!(
+        shard_counters.poller_wakes >= 1,
+        "non-vacuity: the loop woke the poller, not a foreign wake"
+    );
 }

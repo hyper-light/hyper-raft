@@ -5,8 +5,25 @@
 //! the 1024-slot table and leaked a descriptor per shard — the accumulated suite state that made
 //! late tests fail under oversubscription (`docs/wip/fleet-under-load.md`).
 
+// Test harness code: a panic here is a failed test (CLAUDE.md §1).
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects,
+    clippy::disallowed_macros,
+    clippy::disallowed_methods,
+    clippy::cognitive_complexity,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_wrap,
+    clippy::string_slice,
+    clippy::unwrap_in_result,
+    clippy::panic_in_result_fn,
+    clippy::missing_panics_doc
+)]
 // Test harness code: an unwrap here is a failed test, which is what it should be.
-#![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use hyper_rt::registry::MAX_SHARDS;
 use hyper_rt::runtime::{Runtime, RuntimeConfig};
@@ -19,73 +36,73 @@ use hyper_rt::runtime::{Runtime, RuntimeConfig};
 static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn serial() -> std::sync::MutexGuard<'static, ()> {
-  SERIAL
-    .lock()
-    .unwrap_or_else(std::sync::PoisonError::into_inner)
+    SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 fn config(shards: u16) -> RuntimeConfig {
-  RuntimeConfig {
-    shards,
-    tasks_per_shard: 16,
-    timers_per_shard: 16,
-    interests_per_shard: 64,
-    ring_entries: 16,
-    step_budget_ns: 1_000_000,
-    timer_tick_ns: 100_000,
-    batch: 16,
-    pin: false,
-    cores: Vec::new(),
-    page_bytes: 4096,
-    spin_ns: 0,
-    wake_tracking: None,
-  }
+    RuntimeConfig {
+        shards,
+        tasks_per_shard: 16,
+        timers_per_shard: 16,
+        interests_per_shard: 64,
+        ring_entries: 16,
+        step_budget_ns: 1_000_000,
+        timer_tick_ns: 100_000,
+        batch: 16,
+        pin: false,
+        cores: Vec::new(),
+        page_bytes: 4096,
+        spin_ns: 0,
+        wake_tracking: None,
+    }
 }
 
 /// The process's open descriptor count (Unix), through the descriptor table's own listing — a
 /// read of `/dev/fd` (macOS, Linux via the symlink), never a write.
 #[cfg(unix)]
 fn open_descriptors() -> usize {
-  std::fs::read_dir("/dev/fd").map_or(0, |dir| dir.count())
+    std::fs::read_dir("/dev/fd").map_or(0, |dir| dir.count())
 }
 
 /// A local or CI run can require the backend it intends to cover. Docker's default policy
 /// selects epoll, which cannot establish that io_uring releases its pending file references.
 #[cfg(target_os = "linux")]
 fn verify_linux_driver(notes: &[String]) {
-  let selection = notes
-    .iter()
-    .find(|note| note.starts_with("io_uring = "))
-    .expect("the runtime reports its Linux driver probe");
-  let driver = if selection.ends_with("using epoll") {
-    "epoll"
-  } else {
-    "io_uring"
-  };
-  eprintln!("listener retirement driver: {driver}; {notes:?}");
-  if let Some(expected) = std::env::var_os("SLATES_TEST_DRIVER") {
-    assert_eq!(
-      expected, driver,
-      "the requested Linux backend must be exercised"
-    );
-  }
+    let selection = notes
+        .iter()
+        .find(|note| note.starts_with("io_uring = "))
+        .expect("the runtime reports its Linux driver probe");
+    let driver = if selection.ends_with("using epoll") {
+        "epoll"
+    } else {
+        "io_uring"
+    };
+    eprintln!("listener retirement driver: {driver}; {notes:?}");
+    if let Some(expected) = std::env::var_os("SLATES_TEST_DRIVER") {
+        assert_eq!(
+            expected, driver,
+            "the requested Linux backend must be exercised"
+        );
+    }
 }
 
 #[cfg(target_os = "linux")]
 fn bind_abstract_listener(address: &rustix::net::SocketAddrUnix) -> std::os::fd::OwnedFd {
-  use rustix::net::{AddressFamily, SocketFlags, SocketType};
+    use rustix::net::{AddressFamily, SocketFlags, SocketType};
 
-  let socket = rustix::net::socket_with(
-    AddressFamily::UNIX,
-    SocketType::STREAM,
-    SocketFlags::CLOEXEC | SocketFlags::NONBLOCK,
-    None,
-  )
-  .unwrap();
-  rustix::net::bind(&socket, address).unwrap();
-  // The fixture admits no connections; a one-connection backlog suffices for listening.
-  rustix::net::listen(&socket, 1).unwrap();
-  socket
+    let socket = rustix::net::socket_with(
+        AddressFamily::UNIX,
+        SocketType::STREAM,
+        SocketFlags::CLOEXEC | SocketFlags::NONBLOCK,
+        None,
+    )
+    .unwrap();
+    rustix::net::bind(&socket, address).unwrap();
+    // The fixture admits no connections; a one-connection backlog suffices for listening.
+    rustix::net::listen(&socket, 1).unwrap();
+    socket
 }
 
 /// Do: start and shut down one more runtime than the registry has slots, one shard each. Expect:
@@ -93,14 +110,14 @@ fn bind_abstract_listener(address: &rustix::net::SocketAddrUnix) -> std::os::fd:
 /// shards, not on shards ever created. Before the fix the 1025th start refused `TooManyShards`.
 #[test]
 fn a_shut_down_runtimes_slot_is_reclaimed_so_more_runtimes_than_slots_may_run_in_turn() {
-  let _serial = serial();
-  for round in 0..=MAX_SHARDS {
-    let runtime = Runtime::start(&config(1)).unwrap_or_else(|e| {
-      panic!("runtime {round} refused after {round} shut-down runtimes: {e:?}")
-    });
-    assert_eq!(runtime.shard_ids().len(), 1);
-    runtime.shutdown().unwrap();
-  }
+    let _serial = serial();
+    for round in 0..=MAX_SHARDS {
+        let runtime = Runtime::start(&config(1)).unwrap_or_else(|e| {
+            panic!("runtime {round} refused after {round} shut-down runtimes: {e:?}")
+        });
+        assert_eq!(runtime.shard_ids().len(), 1);
+        runtime.shutdown().unwrap();
+    }
 }
 
 /// Do: measure the open descriptors, run 64 start/shutdown cycles of a two-shard runtime, measure
@@ -109,19 +126,19 @@ fn a_shut_down_runtimes_slot_is_reclaimed_so_more_runtimes_than_slots_may_run_in
 #[cfg(unix)]
 #[test]
 fn a_shut_down_runtime_closes_every_descriptor_it_opened() {
-  let _serial = serial();
-  // One warm-up cycle so lazily-opened process-wide descriptors (the thread-local storage of the
-  // first shard thread, the allocator's) are in the baseline.
-  Runtime::start(&config(2)).unwrap().shutdown().unwrap();
-  let baseline = open_descriptors();
-  for _ in 0..64 {
+    let _serial = serial();
+    // One warm-up cycle so lazily-opened process-wide descriptors (the thread-local storage of the
+    // first shard thread, the allocator's) are in the baseline.
     Runtime::start(&config(2)).unwrap().shutdown().unwrap();
-  }
-  let after = open_descriptors();
-  assert!(
-    after <= baseline,
-    "descriptors leaked across 64 two-shard cycles: {baseline} before, {after} after"
-  );
+    let baseline = open_descriptors();
+    for _ in 0..64 {
+        Runtime::start(&config(2)).unwrap().shutdown().unwrap();
+    }
+    let after = open_descriptors();
+    assert!(
+        after <= baseline,
+        "descriptors leaked across 64 two-shard cycles: {baseline} before, {after} after"
+    );
 }
 
 /// AC-0.6 / T-2.14, §4.3: shut down with a listener awaiting readiness, then bind its
@@ -130,42 +147,42 @@ fn a_shut_down_runtime_closes_every_descriptor_it_opened() {
 #[cfg(target_os = "linux")]
 #[test]
 fn shutdown_releases_a_listener_with_an_armed_readiness_wait() {
-  use std::future::{Future, poll_fn};
-  use std::os::fd::AsRawFd;
-  use std::task::Poll;
+    use std::future::{Future, poll_fn};
+    use std::os::fd::AsRawFd;
+    use std::task::Poll;
 
-  use rustix::net::SocketAddrUnix;
+    use rustix::net::SocketAddrUnix;
 
-  let _serial = serial();
-  let name = format!("slates-shutdown-readiness-{}", std::process::id());
-  let address = SocketAddrUnix::new_abstract_name(name.as_bytes()).unwrap();
-  let listener = bind_abstract_listener(&address);
-  let runtime = Runtime::start(&config(1)).unwrap();
-  verify_linux_driver(runtime.notes());
-  let (armed, received) = std::sync::mpsc::sync_channel(1);
-  runtime
-    .spawn_on(runtime.shard_ids()[0], async move {
-      let mut readiness = std::pin::pin!(hyper_rt::readiness::readable(listener.as_raw_fd()));
-      let mut armed = Some(armed);
-      poll_fn(|context| {
-        let result = readiness.as_mut().poll(context);
-        if result.is_pending()
-          && let Some(armed) = armed.take()
-        {
-          armed.send(()).unwrap();
-        }
-        assert!(matches!(result, Poll::Pending), "no client connects");
-        result
-      })
-      .await
-      .unwrap();
-    })
-    .unwrap();
-  let observed = received.recv_timeout(std::time::Duration::from_secs(5));
-  let counters = runtime.shutdown().unwrap();
-  observed.expect("the listener's readiness wait was armed before shutdown");
-  assert_eq!(counters[0].cancelled, 1, "shutdown cancelled the listener");
-  drop(bind_abstract_listener(&address));
+    let _serial = serial();
+    let name = format!("slates-shutdown-readiness-{}", std::process::id());
+    let address = SocketAddrUnix::new_abstract_name(name.as_bytes()).unwrap();
+    let listener = bind_abstract_listener(&address);
+    let runtime = Runtime::start(&config(1)).unwrap();
+    verify_linux_driver(runtime.notes());
+    let (armed, received) = std::sync::mpsc::sync_channel(1);
+    runtime
+        .spawn_on(runtime.shard_ids()[0], async move {
+            let mut readiness = std::pin::pin!(hyper_rt::readiness::readable(listener.as_raw_fd()));
+            let mut armed = Some(armed);
+            poll_fn(|context| {
+                let result = readiness.as_mut().poll(context);
+                if result.is_pending()
+                    && let Some(armed) = armed.take()
+                {
+                    armed.send(()).unwrap();
+                }
+                assert!(matches!(result, Poll::Pending), "no client connects");
+                result
+            })
+            .await
+            .unwrap();
+        })
+        .unwrap();
+    let observed = received.recv_timeout(std::time::Duration::from_secs(5));
+    let counters = runtime.shutdown().unwrap();
+    observed.expect("the listener's readiness wait was armed before shutdown");
+    assert_eq!(counters[0].cancelled, 1, "shutdown cancelled the listener");
+    drop(bind_abstract_listener(&address));
 }
 
 /// AC-0.6 / T-2.14, §4.3: retire a local runtime with more pending listener polls
@@ -174,33 +191,33 @@ fn shutdown_releases_a_listener_with_an_armed_readiness_wait() {
 #[cfg(target_os = "linux")]
 #[test]
 fn dropping_a_local_runtime_releases_a_polled_listener_before_returning() {
-  use rustix::net::SocketAddrUnix;
-  use std::os::fd::AsRawFd;
+    use rustix::net::SocketAddrUnix;
+    use std::os::fd::AsRawFd;
 
-  let _serial = serial();
-  let config = config(1);
-  // io_uring's default CQ holds twice its SQ entries. One more listener, plus the kick
-  // and drain, forces retirement to consume completions across the CQ overflow boundary.
-  let addresses: Vec<_> = (0..config.ring_entries * 2 + 1)
-    .map(|listener| {
-      let name = format!("slates-local-readiness-{}-{listener}", std::process::id());
-      SocketAddrUnix::new_abstract_name(name.as_bytes()).unwrap()
-    })
-    .collect();
-  let listeners: Vec<_> = addresses.iter().map(bind_abstract_listener).collect();
-  let runtime = hyper_rt::runtime::LocalRuntime::new(&config).unwrap();
-  verify_linux_driver(runtime.notes());
-  for listener in &listeners {
-    runtime
-      .context()
-      .register_readable(listener.as_raw_fd(), 0xABCD)
-      .unwrap();
-  }
-  drop(listeners);
-  drop(runtime);
-  for address in addresses {
-    drop(bind_abstract_listener(&address));
-  }
+    let _serial = serial();
+    let config = config(1);
+    // io_uring's default CQ holds twice its SQ entries. One more listener, plus the kick
+    // and drain, forces retirement to consume completions across the CQ overflow boundary.
+    let addresses: Vec<_> = (0..config.ring_entries * 2 + 1)
+        .map(|listener| {
+            let name = format!("slates-local-readiness-{}-{listener}", std::process::id());
+            SocketAddrUnix::new_abstract_name(name.as_bytes()).unwrap()
+        })
+        .collect();
+    let listeners: Vec<_> = addresses.iter().map(bind_abstract_listener).collect();
+    let runtime = hyper_rt::runtime::LocalRuntime::new(&config).unwrap();
+    verify_linux_driver(runtime.notes());
+    for listener in &listeners {
+        runtime
+            .context()
+            .register_readable(listener.as_raw_fd(), 0xABCD)
+            .unwrap();
+    }
+    drop(listeners);
+    drop(runtime);
+    for address in addresses {
+        drop(bind_abstract_listener(&address));
+    }
 }
 
 /// Do: spawn a task on a runtime and keep its wake word; shut the runtime down; start a new runtime
@@ -212,61 +229,61 @@ fn dropping_a_local_runtime_releases_a_polled_listener_before_returning() {
 /// not move: the slot was live), so the arena's generation check is what refused it.
 #[test]
 fn a_wake_minted_for_a_dead_shard_is_refused_by_the_slots_new_holder() {
-  let _serial = serial();
-  use std::sync::atomic::{AtomicU64, Ordering};
-  use std::task::{Context, Poll};
-  static POLLS: AtomicU64 = AtomicU64::new(0);
+    let _serial = serial();
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::task::{Context, Poll};
+    static POLLS: AtomicU64 = AtomicU64::new(0);
 
-  // A future that records every poll and captures its waker on the first.
-  struct Capture(std::sync::mpsc::Sender<std::task::Waker>);
-  impl std::future::Future for Capture {
-    type Output = ();
-    fn poll(self: std::pin::Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
-      let _ = self.0.send(cx.waker().clone());
-      Poll::Ready(())
+    // A future that records every poll and captures its waker on the first.
+    struct Capture(std::sync::mpsc::Sender<std::task::Waker>);
+    impl std::future::Future for Capture {
+        type Output = ();
+        fn poll(self: std::pin::Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+            let _ = self.0.send(cx.waker().clone());
+            Poll::Ready(())
+        }
     }
-  }
 
-  let (tx, rx) = std::sync::mpsc::channel();
-  let first = Runtime::start(&config(1)).unwrap();
-  let id = first.shard_ids()[0];
-  first.spawn_on(id, Capture(tx)).unwrap();
-  let waker = rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
-  first.shutdown().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let first = Runtime::start(&config(1)).unwrap();
+    let id = first.shard_ids()[0];
+    first.spawn_on(id, Capture(tx)).unwrap();
+    let waker = rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+    first.shutdown().unwrap();
 
-  let second = Runtime::start(&config(1)).unwrap();
-  assert_eq!(
-    second.shard_ids()[0],
-    id,
-    "the second runtime reused the freed slot"
-  );
-  // A live task on the new holder, polled once by its own spawn.
-  struct Counted(std::sync::mpsc::Sender<()>);
-  impl std::future::Future for Counted {
-    type Output = ();
-    fn poll(self: std::pin::Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
-      POLLS.fetch_add(1, Ordering::Relaxed);
-      let _ = self.0.send(());
-      Poll::Ready(())
+    let second = Runtime::start(&config(1)).unwrap();
+    assert_eq!(
+        second.shard_ids()[0],
+        id,
+        "the second runtime reused the freed slot"
+    );
+    // A live task on the new holder, polled once by its own spawn.
+    struct Counted(std::sync::mpsc::Sender<()>);
+    impl std::future::Future for Counted {
+        type Output = ();
+        fn poll(self: std::pin::Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
+            POLLS.fetch_add(1, Ordering::Relaxed);
+            let _ = self.0.send(());
+            Poll::Ready(())
+        }
     }
-  }
-  let (done_tx, done_rx) = std::sync::mpsc::channel();
-  second.spawn_on(id, Counted(done_tx)).unwrap();
-  done_rx
-    .recv_timeout(std::time::Duration::from_secs(5))
-    .expect("the new holder polled its own task");
-  let before = hyper_rt::registry::stale_wakes(id.0);
-  waker.wake_by_ref();
-  let counters = second.shutdown().unwrap();
-  let after = hyper_rt::registry::stale_wakes(id.0);
-  assert_eq!(
-    after, before,
-    "the stale wake reached a live slot (it was the arena that refused it)"
-  );
-  assert_eq!(
-    counters[0].completed, 1,
-    "the new holder ran exactly its own task; the stale wake polled nothing extra"
-  );
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    second.spawn_on(id, Counted(done_tx)).unwrap();
+    done_rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("the new holder polled its own task");
+    let before = hyper_rt::registry::stale_wakes(id.0);
+    waker.wake_by_ref();
+    let counters = second.shutdown().unwrap();
+    let after = hyper_rt::registry::stale_wakes(id.0);
+    assert_eq!(
+        after, before,
+        "the stale wake reached a live slot (it was the arena that refused it)"
+    );
+    assert_eq!(
+        counters[0].completed, 1,
+        "the new holder ran exactly its own task; the stale wake polled nothing extra"
+    );
 }
 
 /// AUD-29-11 at the wake word's boundary, without 2^24 iterations. Do: free a runtime's shard slot and
@@ -278,66 +295,66 @@ fn a_wake_minted_for_a_dead_shard_is_refused_by_the_slots_new_holder() {
 /// handed to the third runtime — where a 24-bit mask would have let the next holder alias it.
 #[test]
 fn a_shard_slot_whose_wake_generations_are_spent_retires_and_is_not_reissued() {
-  let _serial = serial();
-  use std::task::{Context, Poll};
-  struct Capture(std::sync::mpsc::Sender<std::task::Waker>);
-  impl std::future::Future for Capture {
-    type Output = ();
-    fn poll(self: std::pin::Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
-      let _ = self.0.send(cx.waker().clone());
-      Poll::Ready(())
+    let _serial = serial();
+    use std::task::{Context, Poll};
+    struct Capture(std::sync::mpsc::Sender<std::task::Waker>);
+    impl std::future::Future for Capture {
+        type Output = ();
+        fn poll(self: std::pin::Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+            let _ = self.0.send(cx.waker().clone());
+            Poll::Ready(())
+        }
     }
-  }
 
-  let first = Runtime::start(&config(1)).unwrap();
-  let id = first.shard_ids()[0];
-  first.shutdown().unwrap();
-  hyper_rt::registry::note_arena_generation(id.0, hyper_rt::mem::Encoded::TASK_GENERATION_LIMIT);
+    let first = Runtime::start(&config(1)).unwrap();
+    let id = first.shard_ids()[0];
+    first.shutdown().unwrap();
+    hyper_rt::registry::note_arena_generation(id.0, hyper_rt::mem::Encoded::TASK_GENERATION_LIMIT);
 
-  let second = Runtime::start(&config(1)).unwrap();
-  assert_eq!(second.shard_ids()[0], id, "the primed slot was reused");
-  let wait = std::time::Duration::from_secs(5);
-  let admitted = |receipt: hyper_rt::task::AdmissionReceipt| match receipt.wait(wait) {
-    Some(hyper_rt::task::Admission::Admitted(task)) => task,
-    other => panic!("the task was not admitted: {other:?}"),
-  };
-  let (tx, rx) = std::sync::mpsc::channel();
-  let last = admitted(
-    second
-      .spawn_on_with_receipt(id, Capture(tx.clone()))
-      .unwrap(),
-  );
-  let stale = rx.recv_timeout(wait).unwrap();
-  assert_eq!(
-    last.0.generation(),
-    hyper_rt::mem::Encoded::TASK_GENERATION_LIMIT,
-    "the first task was issued the word's last generation"
-  );
-  let next = admitted(second.spawn_on_with_receipt(id, Capture(tx)).unwrap());
-  let _live = rx.recv_timeout(wait).unwrap();
-  assert_ne!(
-    next.0.slot(),
-    last.0.slot(),
-    "the slot that issued the last generation retired and was not reissued"
-  );
-  let before = hyper_rt::registry::stale_wakes(id.0);
-  stale.wake_by_ref();
-  let counters = second.shutdown().unwrap();
-  assert_eq!(
-    counters[0].completed, 2,
-    "the stale wake polled nothing extra"
-  );
-  assert_eq!(
-    hyper_rt::registry::stale_wakes(id.0),
-    before,
-    "the wake reached the live shard, whose retired slot holds no task to poll"
-  );
+    let second = Runtime::start(&config(1)).unwrap();
+    assert_eq!(second.shard_ids()[0], id, "the primed slot was reused");
+    let wait = std::time::Duration::from_secs(5);
+    let admitted = |receipt: hyper_rt::task::AdmissionReceipt| match receipt.wait(wait) {
+        Some(hyper_rt::task::Admission::Admitted(task)) => task,
+        other => panic!("the task was not admitted: {other:?}"),
+    };
+    let (tx, rx) = std::sync::mpsc::channel();
+    let last = admitted(
+        second
+            .spawn_on_with_receipt(id, Capture(tx.clone()))
+            .unwrap(),
+    );
+    let stale = rx.recv_timeout(wait).unwrap();
+    assert_eq!(
+        last.0.generation(),
+        hyper_rt::mem::Encoded::TASK_GENERATION_LIMIT,
+        "the first task was issued the word's last generation"
+    );
+    let next = admitted(second.spawn_on_with_receipt(id, Capture(tx)).unwrap());
+    let _live = rx.recv_timeout(wait).unwrap();
+    assert_ne!(
+        next.0.slot(),
+        last.0.slot(),
+        "the slot that issued the last generation retired and was not reissued"
+    );
+    let before = hyper_rt::registry::stale_wakes(id.0);
+    stale.wake_by_ref();
+    let counters = second.shutdown().unwrap();
+    assert_eq!(
+        counters[0].completed, 2,
+        "the stale wake polled nothing extra"
+    );
+    assert_eq!(
+        hyper_rt::registry::stale_wakes(id.0),
+        before,
+        "the wake reached the live shard, whose retired slot holds no task to poll"
+    );
 
-  let third = Runtime::start(&config(1)).unwrap();
-  assert_ne!(
-    third.shard_ids()[0],
-    id,
-    "a slot whose wake generations are spent is never reissued"
-  );
-  third.shutdown().unwrap();
+    let third = Runtime::start(&config(1)).unwrap();
+    assert_ne!(
+        third.shard_ids()[0],
+        id,
+        "a slot whose wake generations are spent is never reissued"
+    );
+    third.shutdown().unwrap();
 }

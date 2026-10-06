@@ -48,12 +48,6 @@ UNSAFE_ALLOWED = {
         "Winsock 2: WSAStartup, socket, bind, sendto, recvfrom, setsockopt, ioctlsocket (the datagram socket on Windows)",
     "crates/hyper-rt/src/registry.rs":
         "the static shard table's entry and context pointers under counted readers, and the thread's current-shard pointer (docs/runtime.md §3.4, §13)",
-    "crates/hyper-rt/src/runtime.rs":
-        "LocalRuntime's context pointer, removed when the loop owns its state (docs/runtime.md §13, step 3)",
-    "crates/hyper-rt/src/shard.rs":
-        "the context's Box::into_raw at build, removed when the loop owns its state (docs/runtime.md §3.4, step 3)",
-    "crates/hyper-rt/src/sim.rs":
-        "the simulated shards' context pointers, removed when the loop owns its state (docs/runtime.md §3.4, step 3)",
     "crates/hyper-rt/src/thread_clock.rs":
         "pthread_getcpuclockid and clock_gettime; thread_info (macOS); QueryThreadCycleTime and GetThreadTimes (Windows): per-thread CPU clocks",
     "crates/hyper-rt/src/waker.rs":

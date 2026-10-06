@@ -12,10 +12,10 @@ use crate::task::SpawnRequest;
 /// A control message.
 #[derive(Debug)]
 pub enum Control {
-  /// Take ownership of a spawn request (a boxed future and its placement).
-  Spawn(Box<SpawnRequest>),
-  /// Cancel the task named by the packed word.
-  Cancel(Encoded),
-  /// Finish every task and exit the loop.
-  Shutdown,
+    /// Take ownership of a spawn request (a boxed future and its placement).
+    Spawn(Box<SpawnRequest>),
+    /// Cancel the task named by the packed word.
+    Cancel(Encoded),
+    /// Finish every task and exit the loop.
+    Shutdown,
 }

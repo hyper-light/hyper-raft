@@ -1,0 +1,210 @@
+//! Async TCP on the runtime (§4.6): the NFS loopback bridge's production server accepts connections
+//! and serves each over the executor's own driver — no foreign runtime (R6, D-9). `accept` and `read`
+//! await read-readiness through the shard's driver; `write_all` awaits write-readiness so a write to a
+//! stalled peer (a soft-mounted NFS client that stopped reading, filling the send buffer) yields the
+//! shard instead of blocking it; `connect` awaits write-readiness for the handshake to complete. The
+//! socket is a `rustix` TCP socket (not `std::net`, which the lint wall reserves; the address types
+//! come through `rustix::net`, the standard types re-exported). Only the readiness-native drivers
+//! (kqueue, epoll) back it; TCP is host-local, so unlike the UDP fleet plane (§4.10a) it has no
+//! simulated fabric — it runs on a real runtime.
+
+use std::os::fd::{AsRawFd, OwnedFd};
+
+use rustix::net::{
+  AddressFamily, SocketAddr, SocketFlags, SocketType, accept, bind, connect, getsockname, listen,
+  socket_with,
+};
+
+// The socket address types are `rustix::net`'s (the standard `core::net` types, re-exported); re-export
+// them here so a consumer of this API can name a bind address without depending on `rustix` directly.
+pub use rustix::net::{Ipv4Addr, SocketAddrV4};
+
+use crate::driver::refused;
+use crate::error::RtError;
+use crate::readiness::{readable, writable};
+
+/// A listening TCP socket on the runtime: a non-blocking `rustix` socket whose `accept` awaits the
+/// shard's driver for the next connection.
+#[derive(Debug)]
+pub struct TcpListener {
+  fd: OwnedFd,
+}
+
+/// A connected TCP stream on the runtime: a non-blocking `rustix` socket whose `read` and `write_all`
+/// await the shard's driver.
+#[derive(Debug)]
+pub struct TcpStream {
+  fd: OwnedFd,
+}
+
+/// Creates a non-blocking, close-on-exec INET stream socket. `SocketFlags` on `socket()` is
+/// Linux-only, so CLOEXEC and non-blocking are set after creation (as the UDP socket does): the
+/// driver provides the waiting, and the descriptor is not inherited across an exec.
+fn stream_socket() -> Result<OwnedFd, RtError> {
+  let fd = socket_with(
+    AddressFamily::INET,
+    SocketType::STREAM,
+    SocketFlags::empty(),
+    None,
+  )
+  .map_err(|e| refused("socket(STREAM)", e))?;
+  set_nonblocking_cloexec(&fd)?;
+  Ok(fd)
+}
+
+/// Marks `fd` close-on-exec and non-blocking (applied to a fresh socket and to each accepted one,
+/// which does not inherit non-blocking on macOS/BSD).
+fn set_nonblocking_cloexec(fd: &OwnedFd) -> Result<(), RtError> {
+  rustix::io::fcntl_setfd(fd, rustix::io::FdFlags::CLOEXEC)
+    .map_err(|e| refused("fcntl(CLOEXEC)", e))?;
+  rustix::io::ioctl_fionbio(fd, true).map_err(|e| refused("ioctl(FIONBIO)", e))?;
+  Ok(())
+}
+
+/// Prepares a connected stream (accepted, connected or adopted): non-blocking and close-on-exec, and
+/// `TCP_NODELAY`, so a small write leaves at once instead of waiting for the peer to acknowledge the
+/// previous one (Nagle, RFC 896). Every stream here carries request/reply traffic that the server already
+/// coalesces into one write per batch, so Nagle has nothing left to merge; left on, a reply written while
+/// an earlier one is unacknowledged waits for the client's delayed ACK — 40 ms on Linux (`TCP_DELACK_MIN`),
+/// measured as the median round of `a_reply_in_two_writes_does_not_wait_for_the_peers_delayed_acknowledgement`
+/// on Linux (42 ms before; docs/bugs/2026-10-05-nagle-delayed-ack.md).
+fn prepare_stream(fd: &OwnedFd) -> Result<(), RtError> {
+  set_nonblocking_cloexec(fd)?;
+  rustix::net::sockopt::set_tcp_nodelay(fd, true).map_err(|e| refused("setsockopt(TCP_NODELAY)", e))
+}
+
+/// The bound address of `fd` as an IPv4 socket address.
+fn local_v4(fd: &OwnedFd) -> Result<SocketAddrV4, RtError> {
+  match SocketAddr::try_from(getsockname(fd).map_err(|e| refused("getsockname", e))?) {
+    Ok(SocketAddr::V4(v4)) => Ok(v4),
+    _ => Err(refused("getsockname", rustix::io::Errno::AFNOSUPPORT)),
+  }
+}
+
+impl TcpListener {
+  /// Binds a non-blocking listening socket to `addr` (use port 0 for an OS-assigned port, then
+  /// [`TcpListener::local_addr`]) with a `backlog` of pending connections the kernel queues before
+  /// the accept loop takes them — the caller derives it from its connection fan-in, and the OS clamps
+  /// it to the system maximum.
+  pub fn bind(addr: SocketAddrV4, backlog: i32) -> Result<TcpListener, RtError> {
+    let fd = stream_socket()?;
+    bind(&fd, &addr).map_err(|e| refused("bind", e))?;
+    listen(&fd, backlog).map_err(|e| refused("listen", e))?;
+    Ok(TcpListener { fd })
+  }
+
+  /// Adopts an already-bound, listening socket from an existing descriptor — a listener a supervisor
+  /// bound and handed over across an exec so its port survives a daemon restart (§4.6, "One TCP
+  /// loopback listener held by the anchor"). The descriptor must name a bound, listening INET stream
+  /// socket; it is made non-blocking (the driver waits on it) and close-on-exec (the adopting process
+  /// does not re-inherit it), then owned here. `fd` is an `OwnedFd`, so the caller has already taken
+  /// ownership of the raw descriptor (its own `unsafe` at the inheritance boundary).
+  pub fn from_fd(fd: OwnedFd) -> Result<TcpListener, RtError> {
+    set_nonblocking_cloexec(&fd)?;
+    Ok(TcpListener { fd })
+  }
+
+  /// Gives up ownership of the underlying descriptor — the counterpart to [`TcpListener::from_fd`],
+  /// for a supervisor that binds the listener, then hands its descriptor to the daemon it spawns so
+  /// the port survives a restart (§4.6). The caller owns the returned descriptor and its lifetime.
+  pub fn into_fd(self) -> OwnedFd {
+    self.fd
+  }
+
+  /// The local address the listener is bound to (the OS-assigned port on an ephemeral bind).
+  pub fn local_addr(&self) -> Result<SocketAddrV4, RtError> {
+    local_v4(&self.fd)
+  }
+
+  /// Accepts the next connection, awaiting readability through the driver when none is pending. The
+  /// accepted socket is made non-blocking and close-on-exec, like the listener, and `TCP_NODELAY`.
+  pub async fn accept(&self) -> Result<TcpStream, RtError> {
+    loop {
+      match accept(&self.fd) {
+        Ok(fd) => {
+          prepare_stream(&fd)?;
+          return Ok(TcpStream { fd });
+        }
+        Err(rustix::io::Errno::AGAIN) => readable(self.fd.as_raw_fd()).await?,
+        Err(rustix::io::Errno::INTR) => continue,
+        Err(e) => return Err(refused("accept", e)),
+      }
+    }
+  }
+}
+
+impl TcpStream {
+  /// Connects to `addr`, awaiting the driver until the handshake completes. A non-blocking `connect`
+  /// returns immediately with `EINPROGRESS`; the socket becomes writable when the handshake finishes,
+  /// and a pending socket error (a refused connection) surfaces then, as a typed refusal.
+  pub async fn connect(addr: SocketAddrV4) -> Result<TcpStream, RtError> {
+    let fd = stream_socket()?;
+    match connect(&fd, &addr) {
+      Ok(()) => {}
+      Err(rustix::io::Errno::INPROGRESS) => {
+        writable(fd.as_raw_fd()).await?;
+        if let Err(err) =
+          rustix::net::sockopt::socket_error(&fd).map_err(|e| refused("getsockopt(SO_ERROR)", e))?
+        {
+          return Err(refused("connect", err));
+        }
+      }
+      Err(e) => return Err(refused("connect", e)),
+    }
+    rustix::net::sockopt::set_tcp_nodelay(&fd, true)
+      .map_err(|e| refused("setsockopt(TCP_NODELAY)", e))?;
+    Ok(TcpStream { fd })
+  }
+
+  /// Gives up the stream's descriptor, to move the connection to another shard (§4.6: a mount's connection is
+  /// served on the shard that owns its volume). No readiness is armed between awaits — every registration is
+  /// one-shot, re-armed by the next await — so nothing on this shard's driver waits on it once the serving
+  /// task stops awaiting it; on epoll a fired one-shot entry stays in this shard's interest list disabled,
+  /// never reported, until the descriptor closes.
+  pub fn into_fd(self) -> OwnedFd {
+    self.fd
+  }
+
+  /// Adopts a connected stream's descriptor on the current shard: the counterpart to
+  /// [`TcpStream::into_fd`]. It is made non-blocking and close-on-exec, as an accepted stream is.
+  pub fn from_fd(fd: OwnedFd) -> Result<TcpStream, RtError> {
+    prepare_stream(&fd)?;
+    Ok(TcpStream { fd })
+  }
+
+  /// The local address this stream is bound to.
+  pub fn local_addr(&self) -> Result<SocketAddrV4, RtError> {
+    local_v4(&self.fd)
+  }
+
+  /// Reads into `buf`, awaiting readability through the driver when nothing is ready; returns the
+  /// byte count, or zero at end of stream (the peer closed its write half).
+  pub async fn read(&self, buf: &mut [u8]) -> Result<usize, RtError> {
+    loop {
+      match rustix::io::read(&self.fd, &mut *buf) {
+        Ok(n) => return Ok(n),
+        Err(rustix::io::Errno::AGAIN) => readable(self.fd.as_raw_fd()).await?,
+        Err(rustix::io::Errno::INTR) => continue,
+        Err(e) => return Err(refused("read", e)),
+      }
+    }
+  }
+
+  /// Writes all of `buf`, awaiting writability through the driver whenever the send buffer is full,
+  /// so a stalled peer yields the shard rather than blocking it. Returns when every byte is accepted.
+  pub async fn write_all(&self, buf: &[u8]) -> Result<(), RtError> {
+    let mut sent = 0;
+    while sent < buf.len() {
+      match rustix::io::write(&self.fd, &buf[sent..]) {
+        // A non-blocking write of a non-empty slice returns bytes written, `EAGAIN`, or an error; a
+        // zero here would mean the kernel accepted nothing without blocking, which is a broken pipe.
+        Ok(0) => return Err(refused("write", rustix::io::Errno::PIPE)),
+        Ok(n) => sent += n,
+        Err(rustix::io::Errno::AGAIN) => writable(self.fd.as_raw_fd()).await?,
+        Err(rustix::io::Errno::INTR) => continue,
+        Err(e) => return Err(refused("write", e)),
+      }
+    }
+    Ok(())
+  }
+}

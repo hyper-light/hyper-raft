@@ -26,6 +26,38 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 
 # Each entry: the file, and the interface its `unsafe` binds.
 UNSAFE_ALLOWED = {
+    "crates/hyper-rt/src/afd.rs":
+        "IOCTL_AFD_POLL through NtDeviceIoControlFile on \\Device\\Afd, its OVERLAPPED blocks and SIO_BASE_HANDLE (socket readiness on Windows; the wepoll and mio technique)",
+    "crates/hyper-rt/src/attribution.rs":
+        "getrusage(RUSAGE_THREAD) through libc (a long poll's voluntary context switches)",
+    "crates/hyper-rt/src/epoll.rs":
+        "epoll and eventfd where rustix's wrappers are unsafe by signature",
+    "crates/hyper-rt/src/iocp.rs":
+        "I/O completion ports: CreateIoCompletionPort, GetQueuedCompletionStatusEx, PostQueuedCompletionStatus",
+    "crates/hyper-rt/src/kqueue.rs":
+        "kevent through rustix (unsafe by signature: the udata word) and the EVFILT_USER trigger",
+    "crates/hyper-rt/src/machine/clock.rs":
+        "clock_gettime and mach_absolute_time through libc; QueryPerformanceCounter (the monotonic clock)",
+    "crates/hyper-rt/src/machine/facts.rs":
+        "sysctlbyname, host_statistics and the IOKit power-source query (macOS); GetSystemInfo, GlobalMemoryStatusEx, GetLogicalProcessorInformation, GetSystemPowerStatus (Windows)",
+    "crates/hyper-rt/src/machine/probes.rs":
+        "thread_policy_set (macOS affinity tag); SetThreadAffinityMask, CreateEventW and SetEvent (Windows)",
+    "crates/hyper-rt/src/machine/wake.rs":
+        "the wake probe's thread parking and placement calls",
+    "crates/hyper-rt/src/netsys.rs":
+        "Winsock 2: WSAStartup, socket, bind, sendto, recvfrom, setsockopt, ioctlsocket (the datagram socket on Windows)",
+    "crates/hyper-rt/src/registry.rs":
+        "the static shard table's entry and context pointers under counted readers, and the thread's current-shard pointer (docs/runtime.md §3.4, §13)",
+    "crates/hyper-rt/src/runtime.rs":
+        "LocalRuntime's context pointer, removed when the loop owns its state (docs/runtime.md §13, step 3)",
+    "crates/hyper-rt/src/shard.rs":
+        "the context's Box::into_raw at build, removed when the loop owns its state (docs/runtime.md §3.4, step 3)",
+    "crates/hyper-rt/src/sim.rs":
+        "the simulated shards' context pointers, removed when the loop owns its state (docs/runtime.md §3.4, step 3)",
+    "crates/hyper-rt/src/thread_clock.rs":
+        "pthread_getcpuclockid and clock_gettime; thread_info (macOS); QueryThreadCycleTime and GetThreadTimes (Windows): per-thread CPU clocks",
+    "crates/hyper-rt/src/waker.rs":
+        "RawWakerVTable over the Copy task word (docs/runtime.md §3.2)",
     "crates/hyper-measure/src/alloc.rs":
         "std::alloc::GlobalAlloc over System (the counting allocator; measurement only)",
     "crates/hyper-measure/src/faults.rs":

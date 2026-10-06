@@ -301,10 +301,24 @@ the platform calls behind one seam per kind (`netsys`), Unix through `rustix`, W
   (`recvmsg` when stamped); Windows one call a datagram, `UDP_SEND_MSG_SIZE` and
   `UDP_RECV_MAX_COALESCED_SIZE` owed (docs/transport.md §4b).
 - **Kernel receive stamps**: `SO_TIMESTAMPNS` on Linux, `SO_TIMESTAMP_MONOTONIC` on macOS, the read's time
-  on Windows, as hyper-tokio does.
+  on Windows and in simulation, as hyper-tokio does, handed over on the **shard's clock**, the one its
+  timers run on. The kernel stamps on a clock of its own (`CLOCK_REALTIME`; `mach_absolute_time`, which
+  stops while the host sleeps where the shard's `CLOCK_MONOTONIC` does not), so a stamp is carried over by
+  its age: the stamps' clock read after the receive and the shard's after it, so a preemption between the
+  two makes a stamp late, never early; held within the read's time and no earlier than the arrival before
+  it (`udp/batched.rs`).
+- **Astray reports.** A UDP socket reports an earlier datagram's ICMP refusal or unreachable (and, on
+  Windows, a send to a closed port as `WSAECONNRESET`) on a later call that moves no data. The seam returns
+  it as its own outcome, counted and read past, never an error of the socket; a batched receive reads past
+  at most a batch of them per call.
 - **Don't-fragment** set per OS, as slates does; a send the OS has no room for is `WouldBlock`, awaited on
   writability, never a lost path (slates' AUD-29-61).
-- **Socket activation** (`adopt`, `into_owned`) kept from slates.
+- **Socket activation** (`adopt`, `into_owned`) kept from slates, on Windows too.
+- **Done** (2026-10-06): `UdpSocket` and `Batched` on IPv4 and IPv6; the batched calls and stamps moved from
+  hyper-tokio's `sys` layer into `udp/linux.rs` and `udp/macos.rs`. Measured by `tests/udp_batched.rs` on
+  macOS and on Linux 6.12 (Docker): a 32-datagram batch crosses loopback in fewer calls than datagrams
+  both ways on Linux, every arrival between its send and its read; Windows is clippy-checked, its run owed
+  to the Windows CI lanes.
 
 ### 5.2 TCP
 

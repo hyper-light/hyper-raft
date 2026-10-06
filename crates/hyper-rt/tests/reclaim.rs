@@ -66,28 +66,6 @@ fn open_descriptors() -> usize {
     std::fs::read_dir("/dev/fd").map_or(0, |dir| dir.count())
 }
 
-/// A local or CI run can require the backend it intends to cover. Docker's default policy
-/// selects epoll, which cannot establish that io_uring releases its pending file references.
-#[cfg(target_os = "linux")]
-fn verify_linux_driver(notes: &[String]) {
-    let selection = notes
-        .iter()
-        .find(|note| note.starts_with("io_uring = "))
-        .expect("the runtime reports its Linux driver probe");
-    let driver = if selection.ends_with("using epoll") {
-        "epoll"
-    } else {
-        "io_uring"
-    };
-    eprintln!("listener retirement driver: {driver}; {notes:?}");
-    if let Some(expected) = std::env::var_os("SLATES_TEST_DRIVER") {
-        assert_eq!(
-            expected, driver,
-            "the requested Linux backend must be exercised"
-        );
-    }
-}
-
 #[cfg(target_os = "linux")]
 fn bind_abstract_listener(address: &rustix::net::SocketAddrUnix) -> std::os::fd::OwnedFd {
     use rustix::net::{AddressFamily, SocketFlags, SocketType};
@@ -158,7 +136,6 @@ fn shutdown_releases_a_listener_with_an_armed_readiness_wait() {
     let address = SocketAddrUnix::new_abstract_name(name.as_bytes()).unwrap();
     let listener = bind_abstract_listener(&address);
     let runtime = Runtime::start(&config(1)).unwrap();
-    verify_linux_driver(runtime.notes());
     let (armed, received) = std::sync::mpsc::sync_channel(1);
     runtime
         .spawn_on(runtime.shard_ids()[0], async move {
@@ -185,9 +162,9 @@ fn shutdown_releases_a_listener_with_an_armed_readiness_wait() {
     drop(bind_abstract_listener(&address));
 }
 
-/// AC-0.6 / T-2.14, §4.3: retire a local runtime with more pending listener polls
-/// than fit in one completion batch. No shard-thread exit may hide asynchronous
-/// cleanup: every address must rebind on this thread without a delay or retry.
+/// AC-0.6 / T-2.14, §4.3: retire a local runtime with more armed listener waits than one `epoll_wait`
+/// batch returns. No shard-thread exit may hide asynchronous cleanup: every address must rebind on this
+/// thread without a delay or retry.
 #[cfg(target_os = "linux")]
 #[test]
 fn dropping_a_local_runtime_releases_a_polled_listener_before_returning() {
@@ -195,24 +172,30 @@ fn dropping_a_local_runtime_releases_a_polled_listener_before_returning() {
     use std::os::fd::AsRawFd;
 
     let _serial = serial();
-    let config = config(1);
-    // io_uring's default CQ holds twice its SQ entries. One more listener, plus the kick
-    // and drain, forces retirement to consume completions across the CQ overflow boundary.
-    let addresses: Vec<_> = (0..config.ring_entries * 2 + 1)
+    let config = RuntimeConfig {
+        tasks_per_shard: 64,
+        ..config(1)
+    };
+    let addresses: Vec<_> = (0..config.batch * 2 + 1)
         .map(|listener| {
             let name = format!("slates-local-readiness-{}-{listener}", std::process::id());
             SocketAddrUnix::new_abstract_name(name.as_bytes()).unwrap()
         })
         .collect();
     let listeners: Vec<_> = addresses.iter().map(bind_abstract_listener).collect();
-    let runtime = hyper_rt::runtime::LocalRuntime::new(&config).unwrap();
-    verify_linux_driver(runtime.notes());
+    let mut runtime = hyper_rt::runtime::LocalRuntime::new(&config).unwrap();
     for listener in &listeners {
+        let raw = listener.as_raw_fd();
         runtime
-            .context()
-            .register_readable(listener.as_raw_fd(), 0xABCD)
+            .spawn(async move {
+                let _ = hyper_rt::readiness::readable(raw).await;
+            })
             .unwrap();
     }
+    // One step polls every task, each arms its listener's readability, and the loop applies the
+    // registrations to the driver before the step ends.
+    runtime.step();
+    assert_eq!(runtime.live_tasks(), listeners.len(), "every wait is armed");
     drop(listeners);
     drop(runtime);
     for address in addresses {

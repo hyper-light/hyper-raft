@@ -209,7 +209,11 @@ impl Afd {
     pub(crate) fn open() -> Result<Afd, RtError> {
         // "\Device\Afd\Slates" as UTF-16, no nul (a counted UNICODE_STRING).
         let name: Vec<u16> = "\\Device\\Afd\\Slates".encode_utf16().collect();
-        let byte_len = u16::try_from(name.len() * size_of::<u16>()).unwrap_or(u16::MAX);
+        let byte_len = name
+            .len()
+            .checked_mul(size_of::<u16>())
+            .and_then(|bytes| u16::try_from(bytes).ok())
+            .unwrap_or(u16::MAX);
         let unicode = UnicodeString {
             length: byte_len,
             maximum_length: byte_len,

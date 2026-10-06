@@ -42,18 +42,16 @@ mod linux {
     use std::sync::mpsc::channel;
     use std::time::Duration;
 
-    use hyper_rt::machine::profile::{MachineProfile, ProfileOptions};
+    use hyper_rt::machine::calibration::{Calibration, Policy};
     use hyper_rt::runtime::{Runtime, RuntimeConfig};
 
-    /// Shape: the per-probe wall budget of the profile the runtime derives from (the test fixtures' quick
-    /// profile; the placement depends on the facts, not on the probes' precision).
+    /// Shape: the per-probe wall budget of the calibration the runtime derives from (the placement depends on
+    /// the facts, not on the probes' precision).
     const PROBE_MS: u64 = 50;
     /// Shape: how long every shard gets to say which CPUs it may run on (a step is microseconds).
     const ANSWER: Duration = Duration::from_secs(10);
     /// Shape: the admission and timer limits of the runtime; the test spawns one task per shard.
     const TASKS: usize = 64;
-    /// Shape: the latency budget the batch is calibrated against — a millisecond, the daemon's order.
-    const LATENCY_BUDGET_NS: u64 = 1_000_000;
 
     /// Parses a kernel CPU list such as `0-3,8,10-11`.
     fn cpu_list(text: &str) -> Vec<u32> {
@@ -97,16 +95,18 @@ mod linux {
         })
     }
 
-    /// Starts a runtime from a measured profile, as the daemon does, and returns what every shard thread
-    /// may run on, in shard order.
+    /// Starts a runtime from a measured calibration, as a consumer does, with no cores reserved, and returns
+    /// what every shard thread may run on, in shard order.
     fn shard_masks() -> Vec<Vec<u32>> {
-        let profile = MachineProfile::measure(ProfileOptions {
-            budget_per_probe: Duration::from_millis(PROBE_MS),
-            codecs: false,
-            core_matrix: false,
-        })
-        .expect("the machine profile measures");
-        let config = RuntimeConfig::from_profile(&profile, TASKS, TASKS, LATENCY_BUDGET_NS);
+        let calibration = Calibration::measure(Duration::from_millis(PROBE_MS), 0)
+            .expect("the machine calibrates");
+        let policy = Policy {
+            reserved_cores: 0,
+            lateness_tolerance_ns: None,
+            latency_objective_ns: None,
+        };
+        let constants = calibration.constants(&policy).unwrap();
+        let config = RuntimeConfig::from_calibration(&calibration, &constants, TASKS, TASKS);
         let rt = Runtime::start(&config).unwrap();
         let (answers, masks) = channel();
         for (index, shard) in rt.shard_ids().iter().enumerate() {
@@ -128,7 +128,7 @@ mod linux {
     /// A process granted a share of a larger pool's time owns none of the pool's cores (a Kubernetes pod
     /// under the default CPU manager, `docker run --cpus`), so the operating system places its shards: fixed
     /// to one core, every such daemon on the machine picks the same one and waits for it while the rest of
-    /// the pool idles. Do: start a runtime from the machine's profile under a CPU quota below the process's
+    /// the pool idles. Do: start a runtime from the machine's calibration under a CPU quota below the process's
     /// cpuset. Expect: every shard may run on every CPU the process may.
     #[test]
     fn under_a_quota_below_the_cpuset_the_scheduler_places_every_shard() {

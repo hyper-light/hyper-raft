@@ -1114,7 +1114,7 @@ mod platform {
         if len == 0 || entry == 0 {
             return Vec::new();
         }
-        let count = usize::try_from(len / entry).unwrap_or(0);
+        let count = usize::try_from(len.checked_div(entry).unwrap_or(0)).unwrap_or(0);
         let mut out: Vec<SYSTEM_LOGICAL_PROCESSOR_INFORMATION> = Vec::with_capacity(count);
         // SAFETY: the buffer holds `count` entries of `len` bytes total; on success the call filled
         // `len` bytes, so `count` entries are initialized.
@@ -1123,7 +1123,13 @@ mod platform {
             return Vec::new();
         }
         // SAFETY: see above; `len / entry` entries were written.
-        unsafe { out.set_len(usize::try_from(len / entry).unwrap_or(0)) };
+        unsafe {
+            out.set_len(
+                usize::try_from(len.checked_div(entry).unwrap_or(0))
+                    .unwrap_or(0)
+                    .min(count),
+            )
+        };
         out
     }
 

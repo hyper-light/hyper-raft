@@ -19,3 +19,5 @@ slates' runtime, taken at slates `6b9ce5c` (2026-10-05) and designed onward for 
 `cargo test -p hyper-rt` on macOS arm64, Rust 1.98.0, before any of docs/runtime.md's departures:
 91 unit tests, 70 integration tests in 22 files, 6 doctests, all passing. The departures are made
 against this suite.
+
+| `src/udp/linux.rs`, `src/udp/macos.rs`, `src/udp/batched.rs` | hyper-tokio `src/sys/{linux,macos}.rs`, `src/socket.rs`, `src/clock.rs` | The batched calls and kernel stamps, moved so hyper-tokio and hyper-rt share one layer (docs/runtime.md §5.1, §14). `Batched` awaits hyper-rt's readiness instead of tokio's reactor, so a receive always asks the kernel (no `Through::Reactor`). Stamps land on the shard's clock by their age; macOS reads the age on `mach_absolute_time` (`Clock::now_ticks`). Astray reports are a seam outcome; EIO from a segmented send resends unsegmented instead of dropping. |

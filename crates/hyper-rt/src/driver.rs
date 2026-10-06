@@ -22,8 +22,6 @@ pub struct Completion {
 /// Which driver a shard runs on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DriverKind {
-    /// Linux io_uring.
-    IoUring,
     /// Linux epoll with an eventfd kick.
     Epoll,
     /// macOS / BSD kqueue with an `EVFILT_USER` kick.
@@ -38,7 +36,6 @@ impl DriverKind {
     /// The name as the profile and the counters print it.
     pub const fn name(self) -> &'static str {
         match self {
-            Self::IoUring => "io_uring",
             Self::Epoll => "epoll",
             Self::Kqueue => "kqueue",
             Self::Iocp => "iocp",
@@ -52,7 +49,7 @@ impl DriverKind {
 /// borrows, and a copied kick cannot address a later registration in the same slot.
 #[derive(Clone, Copy, Debug)]
 pub enum Kick {
-    /// Write eight bytes to an eventfd (Linux; io_uring and epoll).
+    /// Write eight bytes to an eventfd (Linux epoll).
     #[cfg(target_os = "linux")]
     Eventfd(KickFd),
     /// Trigger the `EVFILT_USER` event on a kqueue (macOS / BSD).
@@ -181,18 +178,15 @@ pub trait Driver {
     /// Registers one-shot interest in `raw`'s readability (a UDP socket for the fleet transport,
     /// §4.10a; a TCP listener or stream for the loopback bridge, §4.6): when it next becomes readable, a
     /// completion carrying `user_data` arrives on a following `wait` (re-registered after each read).
-    /// `raw` is the OS handle (a `RawFd` on Unix). The readiness-native drivers (kqueue, epoll) register
-    /// it; the completion-native drivers (io_uring, IOCP) do not carry it yet and refuse with a typed
-    /// [`RtError`] (owed).
+    /// `raw` is the OS handle (a `RawFd` on Unix, a `SOCKET` on Windows): kqueue `EVFILT_READ`, epoll
+    /// `EPOLLIN`, IOCP an AFD poll (`crate::afd`).
     fn register_readable(&mut self, raw: i32, user_data: u64) -> Result<(), RtError>;
 
     /// Registers one-shot interest in `raw`'s writability (a TCP stream whose send buffer filled while
     /// the loopback bridge wrote a reply, §4.6): when it next has send-buffer space, a completion
     /// carrying `user_data` arrives on a following `wait` (re-registered after each blocked write), so a
-    /// write to a stalled peer yields the shard instead of blocking it. `raw` is the OS handle. The
-    /// readiness-native drivers (kqueue, epoll) register it; the completion-native drivers (io_uring,
-    /// IOCP) do not carry it yet, and the simulation's fabric sends never block, so those refuse with a
-    /// typed [`RtError`] (owed).
+    /// write to a stalled peer yields the shard instead of blocking it. `raw` is the OS handle: kqueue
+    /// `EVFILT_WRITE`, epoll `EPOLLOUT`, IOCP an AFD send poll.
     fn register_writable(&mut self, raw: i32, user_data: u64) -> Result<(), RtError>;
 
     /// Whether a `wait` would return a completion or a kick without blocking, as far as the driver
@@ -255,50 +249,14 @@ impl std::fmt::Debug for Prepared {
     }
 }
 
-/// Whether the io_uring driver is available: probed on 64-bit Linux, where its binding exists.
-#[cfg(all(target_os = "linux", target_pointer_width = "64"))]
-fn uring_available(ring_entries: u32, notes: &mut Vec<String>) -> bool {
-    crate::uring::probe(ring_entries, notes)
-}
-
-/// On 32-bit Linux the io_uring binding has no kernel layout, so the epoll driver serves (AUD-29-32).
-#[cfg(all(target_os = "linux", not(target_pointer_width = "64")))]
-fn uring_available(_ring_entries: u32, notes: &mut Vec<String>) -> bool {
-    notes.push("io_uring = not built for a 32-bit target; using epoll".to_owned());
-    false
-}
-
-/// The io_uring driver over the kick eventfd.
-#[cfg(all(target_os = "linux", target_pointer_width = "64"))]
-fn uring_driver(efd: KickFd, ring_entries: u32) -> Result<Box<dyn Driver>, RtError> {
-    Ok(Box::new(crate::uring::UringDriver::with_eventfd(efd, ring_entries)?) as Box<dyn Driver>)
-}
-
-/// Never selected on 32-bit Linux (`uring_available` is false there); refused typed if it were.
-#[cfg(all(target_os = "linux", not(target_pointer_width = "64")))]
-fn uring_driver(_efd: KickFd, _ring_entries: u32) -> Result<Box<dyn Driver>, RtError> {
-    Err(RtError::DriverRefused {
-        call: "io_uring on a 32-bit target",
-        code: None,
-    })
-}
-
-/// Prepares the OS driver for this platform, probing and falling back as D-9 says.
+/// Prepares the OS driver for this platform: epoll over the kick eventfd (io_uring is not carried,
+/// docs/runtime.md §3.7).
 #[cfg(target_os = "linux")]
-pub fn os_driver(ring_entries: u32) -> Result<Prepared, RtError> {
+pub fn os_driver(_ring_entries: u32) -> Result<Prepared, RtError> {
     let efd = crate::epoll::prepare_eventfd()?;
-    let mut notes = Vec::new();
-    let uring = uring_available(ring_entries, &mut notes);
-    let seed: DriverSeed = if uring {
-        Box::new(move |kick| match kick {
-            Kick::Eventfd(efd) => uring_driver(efd, ring_entries),
-            _ => Err(RtError::DriverRefused {
-                call: "io_uring driver without its eventfd",
-                code: None,
-            }),
-        })
-    } else {
-        Box::new(|kick| match kick {
+    Ok(Prepared {
+        kick_fd: Some(efd),
+        seed: Box::new(|kick| match kick {
             Kick::Eventfd(efd) => {
                 Ok(Box::new(crate::epoll::EpollDriver::with_eventfd(efd)?) as Box<dyn Driver>)
             }
@@ -306,12 +264,8 @@ pub fn os_driver(ring_entries: u32) -> Result<Prepared, RtError> {
                 call: "epoll driver without its eventfd",
                 code: None,
             }),
-        })
-    };
-    Ok(Prepared {
-        kick_fd: Some(efd),
-        seed,
-        notes,
+        }),
+        notes: Vec::new(),
     })
 }
 

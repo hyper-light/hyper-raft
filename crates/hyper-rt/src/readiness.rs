@@ -26,7 +26,7 @@ enum Interest {
     Readable,
     /// The socket has send-buffer space for a write (or connect) that returned `EAGAIN`/`EINPROGRESS`: a TCP
     /// write, or a UDP send the kernel had no room for (every platform's driver arms it: kqueue
-    /// `EVFILT_WRITE`, epoll `EPOLLOUT`, io_uring `POLLOUT`, IOCP's AFD send poll).
+    /// `EVFILT_WRITE`, epoll `EPOLLOUT`, IOCP's AFD send poll).
     Writable,
 }
 
@@ -91,6 +91,7 @@ pub async fn readable(raw: i32) -> Result<(), RtError> {
 }
 
 /// Awaits `raw`'s writability once (a real socket whose send buffer filled, or a connect in progress).
+#[cfg(unix)]
 pub(crate) async fn writable(raw: i32) -> Result<(), RtError> {
     ready(Target::Os(raw), true).await
 }

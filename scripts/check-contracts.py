@@ -45,7 +45,11 @@ UNSAFE_ALLOWED = {
     "crates/hyper-rt/src/machine/wake.rs":
         "the wake probe's thread parking and placement calls",
     "crates/hyper-rt/src/netsys.rs":
-        "Winsock 2: WSAStartup, socket, bind, sendto, recvfrom, setsockopt, ioctlsocket (the datagram socket on Windows)",
+        "Winsock 2: WSAStartup, socket, bind, sendto, recvfrom, setsockopt, ioctlsocket (the datagram socket on Windows, IPv4 and IPv6); IP_DONTFRAG and IPV6_DONTFRAG (macOS)",
+    "crates/hyper-rt/src/udp/linux.rs":
+        "sendmmsg, recvmmsg, UDP_SEGMENT, UDP_GRO and SCM_TIMESTAMPNS control messages, which rustix 1.1 lacks (batched UDP, docs/runtime.md §5.1)",
+    "crates/hyper-rt/src/udp/macos.rs":
+        "recvmsg with SCM_TIMESTAMP_MONOTONIC and mach_absolute_time, which rustix drops (kernel receive stamps, docs/runtime.md §5.1)",
     "crates/hyper-rt/src/registry.rs":
         "the static shard table's entry and context pointers under counted readers, and the thread's current-shard pointer (docs/runtime.md §3.4, §13)",
     "crates/hyper-rt/src/thread_clock.rs":

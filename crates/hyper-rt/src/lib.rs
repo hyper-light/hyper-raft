@@ -14,7 +14,7 @@
 //! SOSP'87] whose tick is derived from the measured wake cost. Every operation is cancel-safe by
 //! construction: resources live in arenas keyed by handle, so dropping a future releases nothing
 //! it did not own; a parent's completion cancels and joins its children (hecate's task-lifecycle
-//! law). The drivers (io_uring or epoll, kqueue, IOCP) share one seam: block until a kick, a
+//! law). The drivers (epoll, kqueue, IOCP) share one seam: block until a kick, a
 //! completion or a deadline; the simulation driver replaces time and the kick with seeded,
 //! single-threaded stand-ins so a whole cluster runs deterministically in one process (D-20).
 //!

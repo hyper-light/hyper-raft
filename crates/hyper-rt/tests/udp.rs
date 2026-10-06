@@ -135,7 +135,7 @@ fn a_udp_datagram_is_received_through_the_driver() {
     match rx.recv_timeout(Duration::from_secs(5)) {
         Ok(Ok((bytes, from))) => {
             assert_eq!(bytes, b"ping", "the datagram's bytes arrived");
-            assert_eq!(from.ip(), &Ipv4Addr::LOCALHOST, "from a loopback sender");
+            assert_eq!(from.ip(), Ipv4Addr::LOCALHOST, "from a loopback sender");
         }
         Ok(Err(e)) => panic!("recv_from failed: {e:?}"),
         Err(e) => {

@@ -185,6 +185,19 @@ pub trait Driver {
     fn arm(&mut self, raw: i32, want: crate::interests::Readiness, tag: u64)
     -> Result<(), RtError>;
 
+    /// Takes back `raw`'s registration: no wait is left on it. A one-shot registration that fires to no
+    /// one costs nothing (epoll, kqueue: the default does nothing); IOCP cancels the handle's AFD poll so its
+    /// per-handle state is bounded by the handles waited on.
+    fn disarm(&mut self, _raw: i32) {}
+
+    /// Shapes the driver from the shard's configuration, once before the first registration: its per-handle
+    /// state reserved for `handles` handles (`interests_per_shard`), and `drain_ns` (`step_budget_ns`), the
+    /// longest a dropped driver waits for completions the kernel still owes it. `Capacity` when the
+    /// reservation fails.
+    fn shape(&mut self, _handles: usize, _drain_ns: u64) -> Result<(), RtError> {
+        Ok(())
+    }
+
     /// Whether a `wait` would return a completion or a kick without blocking, as far as the driver
     /// can tell without a syscall (an idle loop skips the wait when this is false).
     fn has_pending(&self) -> bool;

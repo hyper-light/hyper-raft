@@ -232,7 +232,8 @@ impl Shard {
     /// Builds the shard from its seed on the calling thread (which builds the driver too).
     pub fn build(seed: ShardSeed) -> Result<Shard, RtError> {
         let config = seed.config;
-        let driver = (seed.driver)(seed.kick)?;
+        let mut driver = (seed.driver)(seed.kick)?;
+        driver.shape(config.interests_per_shard, config.step_budget_ns)?;
         let is_sim = driver.kind() == DriverKind::Simulation;
         let generation_base = registry::entry(seed.id).map_or(0, |entry| entry.generation_base);
         let desk = Box::new(ShardContext::new(
@@ -590,39 +591,48 @@ impl Shard {
         let word = interest.word.word();
         if interest.withdraw {
             // The handle stays armed for what is left; a direction no one waits for fires once, to no one.
-            let _ = self
+            let left = self
                 .core
                 .waiting
-                .remove(interest.raw, interest.writable, word);
+                .remove(interest.raw, interest.writable, interest.ticket);
+            if left.is_empty() {
+                self.core.driver.disarm(interest.raw);
+            }
+            self.desk.withdrawn(interest.ticket);
+            return;
+        }
+        if self.desk.wait_abandoned(interest.ticket) {
+            // Dropped before it was registered: nothing to arm; its withdrawal, queued behind, finds it gone.
+            self.desk.withdrawn(interest.ticket);
             return;
         }
         let armed = self
             .core
             .waiting
-            .add(interest.raw, interest.writable, word)
+            .add(interest.raw, interest.writable, word, interest.ticket)
             .and_then(|wanted| {
                 self.core
                     .driver
                     .arm(interest.raw, wanted, interests::tag_of(interest.raw))
                     .inspect_err(|_| {
-                        let _ = self
-                            .core
-                            .waiting
-                            .remove(interest.raw, interest.writable, word);
+                        let _ = self.core.waiting.remove(
+                            interest.raw,
+                            interest.writable,
+                            interest.ticket,
+                        );
                     })
             });
         if let Err(refusal) = armed {
             self.core.counters.interests_refused =
                 self.core.counters.interests_refused.saturating_add(1);
-            if let Some(cell) = self.desk.task(interest.word.slot()) {
-                cell.interest_refused.set(Some(refusal));
-            }
-            self.desk.wake_local(interest.word.slot());
+            self.desk
+                .refuse_wait(interest.ticket, interest.word, refusal);
         }
     }
 
     /// Queues the tasks the driver's completions name: a task's own word (a no-op's), or a handle whose
-    /// readiness wakes its waiters in the directions that fired, the handle armed again for those left.
+    /// readiness fires its waits in the directions that fired — each marked fired on the desk, so only a
+    /// fire makes a wait ready — the handle armed again for those left.
     fn deliver(&mut self, completions: &mut Vec<Completion>) {
         for completion in completions.drain(..) {
             self.core.counters.completions = self.core.counters.completions.saturating_add(1);
@@ -633,8 +643,8 @@ impl Shard {
             };
             let desk = &self.desk;
             let fired = Readiness::from_bits(completion.result);
-            let left = self.core.waiting.fire(raw, fired, |word| {
-                desk.wake_local(Encoded::from_word(word).slot());
+            let left = self.core.waiting.fire(raw, fired, |word, ticket| {
+                desk.fire_wait(ticket, Encoded::from_word(word));
             });
             if !left.is_empty()
                 && self
@@ -643,11 +653,11 @@ impl Shard {
                     .arm(raw, left, interests::tag_of(raw))
                     .is_err()
             {
-                // Not armed again: wake the rest, whose calls then see what the driver refused.
+                // Not armed again: fire the rest, whose calls then see what the driver refused.
                 self.core.counters.interests_refused =
                     self.core.counters.interests_refused.saturating_add(1);
-                self.core.waiting.fire(raw, left, |word| {
-                    desk.wake_local(Encoded::from_word(word).slot());
+                self.core.waiting.fire(raw, left, |word, ticket| {
+                    desk.fire_wait(ticket, Encoded::from_word(word));
                 });
             }
         }

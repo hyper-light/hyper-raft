@@ -117,6 +117,11 @@ impl<T: Copy> CellStack<T> {
         }
     }
 
+    /// Values held now.
+    pub(crate) fn len(&self) -> usize {
+        self.len.get()
+    }
+
     /// Takes the most recently pushed value.
     pub(crate) fn pop(&self) -> Option<T> {
         let len = self.len.get().checked_sub(1)?;

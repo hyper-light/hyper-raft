@@ -317,6 +317,27 @@ event per descriptor, a syscall per wake on a hot descriptor (a fleet UDP socket
 connection, `/dev/fuse`). Persistent `EPOLLET` with drain-to-`EAGAIN` (kqueue `EV_CLEAR`) is measured
 against it on those rows of §12 before the choice is fixed (slates-dc's review).
 
+**Readiness waits** (mantle's reviews, 2026-10-06):
+- **One registration per handle.** The loop keeps the waiters per handle and direction (`interests.rs`) and
+  arms the driver once per handle with the union.
+- **Each wait is its own.** A wait takes a slot of the desk's wait table (bounded by `interests_per_shard`)
+  and is named by that slot and its generation, a *ticket*. Two waits of one task on one handle, such as a
+  `join` of a read with a `race` of another read and a timer, are two nodes, so the race's loser withdraws
+  only its own.
+- **Only a fire makes a wait ready.** The loop marks a wait fired when its handle fires; a task woken for
+  another reason finds it still armed. Any re-poll used to report ready, so a timer's wake made an idle
+  socket win a biased race, and that wait was never withdrawn.
+- **A dropped wait is withdrawn losslessly.** The intent ring holds two entries per wait slot, which one
+  poll can never exceed. The handle table is open-addressed with backward-shift deletion and never
+  reallocates. A handle whose last waiter leaves is disarmed (IOCP cancels its AFD poll).
+- **An AFD poll delivers by the status its IRP completed with.** `STATUS_CANCELLED` delivers nothing, a poll
+  that completed before its cancel delivers its events, and a failed one wakes both directions, as wepoll
+  maps it to `EPOLLERR`. A dropped driver awaits its cancelled polls' completions for at most the shard's step budget
+  (`CancelIoEx` does not wait for a cancel to finish), and counts any block still owed at that deadline,
+  which is left to the kernel rather than freed.
+
+The tests are `tests/readiness_waits.rs`, `tests/duplex.rs` and the table's model test.
+
 **Change: Windows readiness for writes and for TCP.** slates' AFD reactor serves reads and UDP sends;
 hyper-rt registers `AFD_POLL_SEND` for writability and `AFD_POLL_ACCEPT`/`AFD_POLL_CONNECT_FAIL` for
 listeners and connects, which TCP on Windows needs (§5.2).
@@ -472,6 +493,16 @@ reads the self-pipe, not by each shard awaiting the pipe, so one pipe serves any
 without one draining it for the rest; Windows' handler, on the OS's thread, wakes them directly. A kind
 with a subscriber is handled on Windows (the default end does not run). `tests/signals.rs` (Unix).
 
+**A kind that arrives with no subscriber** keeps its default action on Unix: the signal thread restores
+`SIG_DFL` and raises it (mantle's review, finding 7). That restore races a new subscription's installation.
+The order that keeps a live subscriber's handler is `signal_protocol.rs`:
+- a subscription publishes its mask before installing;
+- the restore reads the masks after its `SIG_DFL`, and reinstalls (handing the signal over) when one wants
+  the kind;
+- the kernel serializes `sigaction`, which carries the rest.
+
+It is loom-checked, from both starting states, and a restore that never rechecks fails the model.
+
 ### 6.2 Stdio
 
 Reading standard input and writing standard output without blocking a shard. Readiness works on Unix for a
@@ -526,7 +557,7 @@ blocking `recv` and never touches the cell.
 |---|---|---|
 | `channel::<T>(n)` (many senders, one receiver) | `sync_channel(n)` + a cell | `n` messages; a full channel is `Full` to `try_send`, and `send().await` waits for room, its waiters queued one to one (NOTE26 §5.3) |
 | `oneshot::<T>()` | `sync_channel(1)` + a cell | one value |
-| `watch` of a `Copy` value that fits a word (`u64`) | the value and its version packed in the cell's atomic words | one value; readers see the latest and its version |
+| `watch` of a `Copy` value that fits a word (`u64`) | the value and its version packed in the cell's atomic words; the `n` receiver slots claimed when it is made, chained through their cells, each taken by one compare-and-swap and given back at drop, the sender waking the taken ones | one value; readers see the latest and its version; `n` receivers, refused exactly at `n` (mantle's final review, finding 6) |
 | `watch` of a larger value | the publisher keeps it; readers are notified through the cell and ask the owner for it (a request through a `channel`) | the owner's |
 | `Semaphore(n)` | an atomic count + a bounded FIFO of waiting words; a release wakes exactly the waiters it admits, in arrival order | `n` permits; waiters bounded by the configured queue, past it `Capacity` |
 | `Notify` | the cell alone: `notify_one` wakes the registered waiter; a notification with no waiter is kept as one pending permit | one |

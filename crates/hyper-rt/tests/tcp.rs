@@ -25,7 +25,6 @@
 // Test harness code: an unwrap here is a failed test, which is what it should be.
 
 use std::sync::mpsc::channel;
-use std::time::Duration;
 
 // The address types come through the runtime's re-export (`core::net`'s), so the test builds on every OS.
 use hyper_rt::runtime::{Runtime, RuntimeConfig};
@@ -226,30 +225,34 @@ fn a_spinning_shard_answers_a_socket_request_without_waiting_out_its_window() {
     .unwrap();
     let (tx, rx) = channel();
     rt.spawn_on(id, async move {
-        let outcome: Result<Duration, hyper_rt::RtError> = async {
+        let outcome: Result<(u64, u64), hyper_rt::RtError> = async {
             let stream = TcpStream::connect(addr).await?;
-            // The first exchange settles the connection; the timed one finds the server shard spinning.
+            // The first exchange settles the connection; the watched one finds the server shard spinning.
             let mut buf = [0u8; 64];
             stream.write_all(REQUEST).await?;
             stream.read(&mut buf).await?;
-            let started = std::time::Instant::now();
+            let waits =
+                || hyper_rt::registry::with_entry(id.0, |entry| entry.pulse.waits()).unwrap_or(0);
+            let before = waits();
             stream.write_all(REQUEST).await?;
             stream.read(&mut buf).await?;
-            Ok(started.elapsed())
+            Ok((before, waits()))
         }
         .await;
         let _ = tx.send(outcome);
     })
     .unwrap();
-    let waited = rx
+    let (before, after) = rx
         .recv()
         .expect("the exchange completed")
         .expect("the exchange succeeded");
-    // The fault waits the window out: the reply leaves only after the spin ends and the shard parks and
-    // reads its driver. The window itself is the bound (finding 10c), not a guessed fraction of it.
-    assert!(
-        waited < Duration::from_nanos(LONG_SPIN_NS),
-        "the reply waited {waited:?}, the whole spin window: a spinning shard must see socket readiness"
+    // The fault waits the window out: the reply leaves only after the spin ends and the shard parks in its
+    // driver, which counts a wait. The window, opened at the start, outlasts the test, so a shard that saw
+    // the readiness while spinning entered no wait (mantle's final review: judged by the shard's state, not
+    // by a clock).
+    assert_eq!(
+        after, before,
+        "the shard parked in its driver during the exchange: a spinning shard must see socket readiness"
     );
     rt.shutdown().unwrap();
 }

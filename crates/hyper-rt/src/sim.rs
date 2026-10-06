@@ -614,8 +614,8 @@ pub(crate) struct SimSocketCell {
     /// escapes a call), bounded by `held` against [`SIM_RECV_BUFFER_BYTES`].
     mailbox: Cell<VecDeque<(Vec<u8>, u16)>>,
     held: Cell<usize>,
-    read_interest: Cell<Option<Encoded>>,
-    write_interest: Cell<Option<Encoded>>,
+    read_interest: Cell<Option<(Encoded, crate::shard::Ticket)>>,
+    write_interest: Cell<Option<(Encoded, crate::shard::Ticket)>>,
     send_blocked: Cell<bool>,
 }
 
@@ -751,7 +751,7 @@ pub(crate) fn sim_bind() -> Result<(u16, u16), RtError> {
 
 /// Closes a simulated socket: its mailbox emptied and its index given back.
 pub(crate) fn sim_close(index: u16) {
-    let _ = with_sockets(|_, sockets| {
+    let _ = with_sockets(|desk, sockets| {
         let Some(socket) = sockets.socket(index) else {
             return;
         };
@@ -760,8 +760,13 @@ pub(crate) fn sim_close(index: u16) {
         }
         drop(socket.mailbox.take());
         socket.held.set(0);
-        socket.read_interest.set(None);
-        socket.write_interest.set(None);
+        // A wait on a closed socket ends: fired, its call then sees the socket gone.
+        for interest in [socket.read_interest.take(), socket.write_interest.take()]
+            .into_iter()
+            .flatten()
+        {
+            desk.fire_wait(interest.1, interest.0);
+        }
         let _ = sockets.free.push(index);
     });
 }
@@ -822,7 +827,12 @@ pub(crate) fn sim_recv(index: u16, buf: &mut [u8]) -> Option<(usize, u16)> {
 
 /// Registers one-shot interest in simulated socket `index`: readable when a datagram waits, writable when
 /// its sends are not blocked. Ready now wakes the task at once.
-pub(crate) fn sim_register(index: u16, writable: bool, word: Encoded) -> Result<(), RtError> {
+pub(crate) fn sim_register(
+    index: u16,
+    writable: bool,
+    word: Encoded,
+    ticket: crate::shard::Ticket,
+) -> Result<(), RtError> {
     with_sockets(|desk, sockets| {
         let socket = sockets.socket(index).ok_or(RtError::Capacity {
             what: "simulated sockets",
@@ -834,11 +844,18 @@ pub(crate) fn sim_register(index: u16, writable: bool, word: Encoded) -> Result<
             !socket.is_empty()
         };
         if ready {
-            desk.wake_local(word.slot());
-        } else if writable {
-            socket.write_interest.set(Some(word));
+            desk.fire_wait(ticket, word);
+            return Ok(());
+        }
+        let cell = if writable {
+            &socket.write_interest
         } else {
-            socket.read_interest.set(Some(word));
+            &socket.read_interest
+        };
+        // One waiter per direction in the model: a second one fires the first, whose call retries and
+        // finds the socket as it is (a simulated socket has one reader and one writer in every scenario).
+        if let Some((earlier, earlier_ticket)) = cell.replace(Some((word, ticket))) {
+            desk.fire_wait(earlier_ticket, earlier);
         }
         Ok(())
     })
@@ -919,8 +936,8 @@ pub fn sim_udp_release_sends(port: u16) {
             .and_then(|index| sockets.socket(index))
         {
             socket.send_blocked.set(false);
-            if let Some(word) = socket.write_interest.take() {
-                desk.wake_local(word.slot());
+            if let Some((word, ticket)) = socket.write_interest.take() {
+                desk.fire_wait(ticket, word);
             }
         }
     });
@@ -1290,10 +1307,7 @@ impl SimRuntime {
         socket.push((bytes, from));
         self.fabric.stats.delivered = self.fabric.stats.delivered.saturating_add(1);
         match socket.read_interest.take() {
-            Some(word) => {
-                desk.wake_local(word.slot());
-                true
-            }
+            Some((word, ticket)) => desk.fire_wait(ticket, word),
             None => false,
         }
     }

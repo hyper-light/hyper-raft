@@ -284,10 +284,10 @@ impl Slot {
         }
     }
 
-    /// Frees a retired entry (`None`: the slot published none) and publishes the slot free: the
-    /// retirement's finish, run by the retirement or by the entry's last reader. The generation is still
-    /// the holder's (even) value — nothing claims a slot before this store.
-    fn free(&self, entry: Option<Box<Entry>>) {
+    /// Frees a retired entry and publishes the slot free: the retirement's finish, run once, by the
+    /// retirement or by the entry's last reader. The generation is still the holder's (even) value —
+    /// nothing claims a slot before this store.
+    fn free(&self, entry: Box<Entry>) {
         let live = self.generation.load(Ordering::Acquire);
         drop(entry);
         self.generation
@@ -501,7 +501,7 @@ pub fn with_entry<R>(shard: u16, f: impl FnOnce(&Entry) -> R) -> Option<R> {
     if slot.generation.load(Ordering::Acquire) & 1 == 1 {
         return None;
     }
-    slot.entry.read(f, |entry| slot.free(Some(entry)))
+    slot.entry.read(f, |entry| slot.free(entry))
 }
 
 /// Records the calling thread's CPU clock on shard `shard`'s entry (the shard's own thread, as it starts).
@@ -796,6 +796,45 @@ mod tests {
             "a stale kick cannot borrow a replacement"
         );
         unregister(replacement);
+    }
+
+    /// Mantle's final review, finding 5. Do: retire a slot twice while a foreign reader holds its entry,
+    /// then let the reader go. Expect: the slot stays claimed through both retirements, and the reader's end
+    /// frees it once (one generation step, to the free value). The second retirement used to publish the slot
+    /// free under the reader, and the reader's free then made it look live with no entry.
+    #[test]
+    fn a_second_retirement_under_a_reader_does_nothing() {
+        use std::sync::mpsc::sync_channel;
+
+        let (shard, _control) = register_slot(2, 1, RegisterKick::Kick(Kick::none())).unwrap();
+        let slot = SLOTS.get(usize::from(shard)).unwrap();
+        let live = slot.generation.load(Ordering::Acquire);
+        let (entered, inside) = sync_channel(0);
+        let (release, released) = sync_channel::<()>(0);
+        std::thread::scope(|scope| {
+            let reader = scope.spawn(move || {
+                with_entry(shard, |_| {
+                    entered.send(()).unwrap();
+                    released.recv().unwrap();
+                })
+            });
+            inside.recv().unwrap();
+            unregister(shard);
+            unregister(shard);
+            let under_the_reader = slot.generation.load(Ordering::Acquire);
+            // The reader is let go before anything is judged, so a failure ends the test, not the scope.
+            release.send(()).unwrap();
+            assert_eq!(reader.join().unwrap(), Some(()));
+            assert_eq!(
+                under_the_reader, live,
+                "the slot stays claimed while its reader holds the entry"
+            );
+        });
+        assert_eq!(
+            slot.generation.load(Ordering::Acquire),
+            live.wrapping_add(1),
+            "freed once, by the reader"
+        );
     }
 
     /// Do: register a slot, mark its holder exited (what the shard does at its loop's exit) and wake a

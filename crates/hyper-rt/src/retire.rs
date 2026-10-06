@@ -96,18 +96,19 @@ impl<T> Pinned<T> {
     }
 
     /// Retires the published entry: `finish` receives it now when no reader holds it, or from the last
-    /// reader's unpin; with nothing published, `finish` receives `None` now. The caller holds the right to
-    /// retire (the registry's claimed generation) and retires once per publication.
-    pub(crate) fn retire(&self, finish: impl FnOnce(Option<Box<T>>)) {
+    /// reader's unpin. With nothing published — a retirement of this publication already under way or done —
+    /// it does nothing: the swap that takes the pointer is the one claim on the retirement, so a second
+    /// `retire` never finishes a second time (mantle's final review, finding 5: it used to finish with
+    /// nothing, and the registry published the slot free while a reader still held the entry).
+    pub(crate) fn retire(&self, finish: impl FnOnce(Box<T>)) {
         let entry = self.entry.swap(std::ptr::null_mut(), Ordering::SeqCst);
         if entry.is_null() {
-            finish(None);
             return;
         }
         self.retired.store(entry, Ordering::SeqCst);
         self.pins.fetch_or(RETIRED, Ordering::SeqCst);
         if let Some(entry) = self.claim() {
-            finish(Some(entry));
+            finish(entry);
         }
     }
 
@@ -231,7 +232,13 @@ mod loom_tests {
         loom::model(|| {
             let frees = Arc::new(AtomicUsize::new(0));
             let pinned = published(&frees);
-            pinned.read(|_| pinned.retire(drop), drop);
+            pinned.read(
+                |_| {
+                    pinned.retire(drop);
+                    pinned.retire(|_| panic!("a second retirement finished"));
+                },
+                drop,
+            );
             assert_eq!(frees.load(Ordering::SeqCst), 1, "freed once, by the reader");
         });
     }

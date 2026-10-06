@@ -536,18 +536,20 @@ impl<T> Future for Recv<'_, T> {
 
 /// The publishing half of a watched word: one value that fits a `u64` (a flag, a level, an epoch) and its
 /// version, read by any number of receivers up to the bound it was made with.
+///
+/// **Receivers' places** (mantle's final review, finding 6): the word claims its `bound` receiver slots when
+/// it is made — cells chained through their `aux` words, the chain's head in the census cell — and a receiver
+/// (the first, a `subscribe`, a `try_clone`) takes a free slot with one compare-and-swap and gives it back
+/// when it drops. The sender wakes each taken slot. A receiver dropped before any send leaves nothing behind,
+/// so a refusal is exactly the bound reached: clones used to travel to the sender through a channel only the
+/// sender drained, and a dropped clone's entry held a place in it until the next send.
 #[derive(Debug)]
 pub struct WatchSender {
     cell: CellRef,
-    /// New receivers' cells, handed over by [`WatchReceiver::clone`] and taken in at each send.
-    joining: Receiver<CellRef>,
-    joiner: SyncSender<CellRef>,
-    /// The receivers' cells this sender wakes at each send, at most the bound.
-    receivers: Vec<CellRef>,
-    /// The live receivers' count (`state`), shared with them: a clone takes a place under the bound, a dropped
-    /// receiver gives it back (mantle's review, finding 4: a clone checked only the joining queue's room, so
-    /// past the bound one succeeded that the sender never took in, and it never woke).
+    /// The chain's owner: one handle per end, the last releases the chain (`release_census`).
     census: CellRef,
+    /// The most receivers.
+    bound: usize,
 }
 
 /// A receiving half of a watched word: reads the latest value and waits for the next change. Clone it for
@@ -556,30 +558,91 @@ pub struct WatchSender {
 pub struct WatchReceiver {
     /// The shared value (`state`) and version (`aux`), and the closed bit.
     shared: CellRef,
-    /// This receiver's own cell, where its waiting task's word is registered.
+    /// This receiver's slot, where its waiting task's word is registered.
     own: CellRef,
-    joiner: SyncSender<CellRef>,
     seen: u64,
     /// The most receivers the word may have.
     bound: usize,
-    /// The live receivers' count, shared with the sender.
+    /// The chain's owner, shared with the sender.
     census: CellRef,
 }
 
-/// Takes a receiver's place in `census` under `bound`; `false` at the bound.
-fn take_place(census: CellRef, bound: usize) -> bool {
-    let bound = u64::try_from(bound).unwrap_or(u64::MAX);
-    census.cell().is_some_and(|cell| {
-        cell.state
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |live| {
-                (live < bound).then(|| live.saturating_add(1))
-            })
-            .is_ok()
+/// Format: a slot's `state` while a receiver holds it.
+const TAKEN: u64 = 1;
+/// Format: the end of the slot chain.
+const CHAIN_END: u64 = u64::MAX;
+
+/// The slots of the chain headed in `census`, in order, at most `bound` (the chain's length).
+fn slots(census: CellRef, bound: usize) -> impl Iterator<Item = CellRef> {
+    let mut next = census
+        .cell()
+        .map_or(CHAIN_END, |cell| cell.aux.load(Ordering::Acquire));
+    std::iter::from_fn(move || {
+        if next == CHAIN_END {
+            return None;
+        }
+        let slot = CellRef::from_word(next);
+        next = slot
+            .cell()
+            .map_or(CHAIN_END, |cell| cell.aux.load(Ordering::Acquire));
+        Some(slot)
+    })
+    .take(bound)
+}
+
+/// Takes a free slot of the chain: a receiver's place, or `Capacity` at the bound.
+fn take_slot(census: CellRef, bound: usize) -> Result<CellRef, RtError> {
+    for slot in slots(census, bound) {
+        let taken = slot.cell().is_some_and(|cell| {
+            cell.state
+                .compare_exchange(0, TAKEN, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        });
+        if taken {
+            slot.clear_waiter();
+            return Ok(slot);
+        }
+    }
+    Err(RtError::Capacity {
+        what: "watch receivers",
+        bound,
     })
 }
 
+/// Gives a receiver's slot back.
+fn give_slot(slot: CellRef) {
+    slot.clear_waiter();
+    if let Some(cell) = slot.cell() {
+        cell.state.store(0, Ordering::Release);
+    }
+}
+
+/// Drops an end's handle on the census; the last releases every slot of the chain, read before each
+/// release, then frees the census itself.
+fn release_census(census: CellRef, bound: usize) {
+    let head = census
+        .cell()
+        .map_or(CHAIN_END, |cell| cell.aux.load(Ordering::Acquire));
+    if !census.release_last() {
+        return;
+    }
+    // This was the last end: no one else walks the chain now, and its cells are still claimed.
+    let mut next = head;
+    for _ in 0..bound {
+        if next == CHAIN_END {
+            break;
+        }
+        let slot = CellRef::from_word(next);
+        next = slot
+            .cell()
+            .map_or(CHAIN_END, |cell| cell.aux.load(Ordering::Acquire));
+        slot.release();
+    }
+}
+
 /// A watched word starting at `initial`, read by at most `receivers` receivers at once (past it, a clone is
-/// refused `Capacity`). Refused `Capacity` at the cell bound and `BadConfig` for no receivers.
+/// refused `Capacity`). Its `receivers` slots are claimed now: refused `Capacity` at the cell bound, and
+/// `BadConfig` for no receivers.
 pub fn watch(initial: u64, receivers: usize) -> Result<(WatchSender, WatchReceiver), RtError> {
     if receivers == 0 {
         return Err(RtError::BadConfig {
@@ -590,35 +653,43 @@ pub fn watch(initial: u64, receivers: usize) -> Result<(WatchSender, WatchReceiv
     if let Some(cell) = shared.cell() {
         cell.state.store(initial, Ordering::Release);
     }
-    let own = claim(1).inspect_err(|_| shared.release())?;
     let census = claim(2).inspect_err(|_| {
         shared.release();
         shared.release();
-        own.release();
     })?;
     if let Some(cell) = census.cell() {
-        cell.state.store(1, Ordering::Release);
+        cell.aux.store(CHAIN_END, Ordering::Release);
     }
-    let (joiner, joining) = sync_channel(receivers);
-    let mut list = Vec::new();
-    list.try_reserve_exact(receivers)
-        .map_err(|_| RtError::Capacity {
-            what: "watch receivers",
-            bound: receivers,
+    // The chain, built from its tail: each slot's `aux` names the next; the census heads it.
+    for _ in 0..receivers {
+        let slot = claim(1).inspect_err(|_| {
+            shared.release();
+            shared.release();
+            release_census(census, receivers);
+            release_census(census, receivers);
         })?;
-    list.push(own);
+        if let (Some(slot_cell), Some(census_cell)) = (slot.cell(), census.cell()) {
+            slot_cell
+                .aux
+                .store(census_cell.aux.load(Ordering::Acquire), Ordering::Release);
+            census_cell.aux.store(slot.to_word(), Ordering::Release);
+        }
+    }
+    let own = take_slot(census, receivers).inspect_err(|_| {
+        shared.release();
+        shared.release();
+        release_census(census, receivers);
+        release_census(census, receivers);
+    })?;
     Ok((
         WatchSender {
             cell: shared,
-            joining,
-            joiner: joiner.clone(),
-            receivers: list,
             census,
+            bound: receivers,
         },
         WatchReceiver {
             shared,
             own,
-            joiner,
             seen: 0,
             bound: receivers,
             census,
@@ -645,55 +716,30 @@ impl WatchSender {
 
     /// A receiver of this word (refused `Capacity` at the bound).
     pub fn subscribe(&mut self) -> Result<WatchReceiver, RtError> {
-        let bound = self.receivers.capacity();
-        if !take_place(self.census, bound) {
-            return Err(RtError::Capacity {
-                what: "watch receivers",
-                bound,
-            });
-        }
-        let own = claim(1).inspect_err(|_| give_place(self.census))?;
-        self.take_joining();
-        if self.receivers.len() >= bound {
-            own.release();
-            give_place(self.census);
-            return Err(RtError::Capacity {
-                what: "watch receivers",
-                bound,
-            });
-        }
+        let own = take_slot(self.census, self.bound)?;
         self.cell.retain();
         self.census.retain();
-        self.receivers.push(own);
         Ok(WatchReceiver {
             shared: self.cell,
             own,
-            joiner: self.joiner.clone(),
             seen: self
                 .cell
                 .cell()
-                .map_or(0, |cell| cell.aux.load(Ordering::Acquire)),
-            bound: self.receivers.capacity(),
+                .map_or(0, |cell| cell.aux.load(Ordering::Acquire) & VERSION_MASK),
+            bound: self.bound,
             census: self.census,
         })
     }
 
-    /// Takes in receivers cloned since the last send, and drops those whose receivers are gone.
-    fn take_joining(&mut self) {
-        self.receivers.retain(|own| own.cell().is_some());
-        while self.receivers.len() < self.receivers.capacity() {
-            let Ok(own) = self.joining.try_recv() else {
-                break;
-            };
-            self.receivers.push(own);
-        }
-    }
-
-    /// Wakes each receiver once (one wake per receiver, never a broadcast to one shared waiter).
-    fn wake_receivers(&mut self) {
-        self.take_joining();
-        for own in &self.receivers {
-            own.wake();
+    /// Wakes each taken slot's waiter once (one wake per receiver, never a broadcast to one shared waiter).
+    fn wake_receivers(&self) {
+        for slot in slots(self.census, self.bound) {
+            if slot
+                .cell()
+                .is_some_and(|cell| cell.state.load(Ordering::Acquire) == TAKEN)
+            {
+                slot.wake();
+            }
         }
     }
 }
@@ -705,18 +751,7 @@ impl Drop for WatchSender {
         }
         self.wake_receivers();
         self.cell.release();
-        self.census.release();
-    }
-}
-
-/// Gives a receiver's place in `census` back.
-fn give_place(census: CellRef) {
-    if let Some(cell) = census.cell() {
-        let _ = cell
-            .state
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |live| {
-                live.checked_sub(1)
-            });
+        release_census(self.census, self.bound);
     }
 }
 
@@ -757,33 +792,16 @@ impl WatchReceiver {
         }
         (version & !VERSION_MASK != 0).then_some(Err(SyncError::Closed(())))
     }
-}
 
-impl WatchReceiver {
     /// Another receiver of the same word, seeing what this one has seen. Refused `Capacity` at the cell bound
-    /// or at the sender's bound on receivers (the sender takes it in at its next send).
+    /// or when every one of the word's receiver slots is held.
     pub fn try_clone(&self) -> Result<Self, RtError> {
-        if !take_place(self.census, self.bound) {
-            return Err(RtError::Capacity {
-                what: "watch receivers",
-                bound: self.bound,
-            });
-        }
-        let own = claim(1).inspect_err(|_| give_place(self.census))?;
-        if self.joiner.try_send(own).is_err() {
-            own.release();
-            give_place(self.census);
-            return Err(RtError::Capacity {
-                what: "watch receivers",
-                bound: self.bound,
-            });
-        }
+        let own = take_slot(self.census, self.bound)?;
         self.shared.retain();
         self.census.retain();
         Ok(Self {
             shared: self.shared,
             own,
-            joiner: self.joiner.clone(),
             seen: self.seen,
             bound: self.bound,
             census: self.census,
@@ -793,10 +811,9 @@ impl WatchReceiver {
 
 impl Drop for WatchReceiver {
     fn drop(&mut self) {
-        give_place(self.census);
-        self.own.release();
+        give_slot(self.own);
         self.shared.release();
-        self.census.release();
+        release_census(self.census, self.bound);
     }
 }
 

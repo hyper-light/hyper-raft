@@ -100,8 +100,6 @@ pub(crate) struct TaskCell {
     pub(crate) poller: Cell<Option<PollerReady>>,
     /// Whether the slot waits on the timer-waiter ring.
     pub(crate) waits_for_timer: Cell<bool>,
-    /// A readiness registration the driver refused for this task, handed to its next poll.
-    pub(crate) interest_refused: Cell<Option<RtError>>,
 }
 
 /// Where a timer slot is in its life.
@@ -124,14 +122,58 @@ pub(crate) struct TimerCell {
     pub(crate) dirty: Cell<bool>,
 }
 
-/// A readiness registration a task asked for.
+/// A readiness registration a task asked for, or the withdrawal of one whose wait dropped.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Interest {
     pub(crate) raw: i32,
     pub(crate) writable: bool,
     pub(crate) word: Encoded,
+    /// The wait's own slot: two waits of one task on one handle and direction are two waits.
+    pub(crate) ticket: Ticket,
     /// A wait whose future dropped before it fired, leaving the table.
     pub(crate) withdraw: bool,
+}
+
+/// One readiness wait's name: its slot in the desk's wait table and that slot's generation when the wait
+/// took it, so a fire, a refusal or a withdrawal meant for an ended wait never reaches the slot's next one
+/// (mantle's final review, findings 1 and 2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Ticket {
+    slot: u32,
+    generation: u32,
+}
+
+#[cfg(test)]
+impl Ticket {
+    /// A ticket for a table test that has no desk.
+    pub(crate) fn for_test(slot: u32) -> Ticket {
+        Ticket {
+            slot,
+            generation: 0,
+        }
+    }
+}
+
+/// Where a readiness wait stands. Only a fire makes a wait ready: a task woken for another reason (a timer
+/// that a race also waits on, a sibling of a join) finds its wait still `Armed` and keeps waiting.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WaitPhase {
+    Free,
+    /// Registered, not yet fired.
+    Armed,
+    /// The handle fired in the wait's direction (or a simulated socket became ready).
+    Fired,
+    /// The loop could not register it; the refusal is in the cell.
+    Refused,
+    /// Its future dropped while armed: the loop withdraws it from the table and frees the slot.
+    Abandoned,
+}
+
+/// One slot of the desk's wait table.
+struct WaitCell {
+    generation: Cell<u32>,
+    phase: Cell<WaitPhase>,
+    refusal: Cell<Option<RtError>>,
 }
 
 /// The values a shard keeps for its life, filled before its first step and immutable afterwards (slates'
@@ -223,7 +265,14 @@ pub struct ShardContext {
     pub(crate) free_timers: CellStack<u32>,
     pub(crate) dirty_timers: CellRing<u32>,
     pub(crate) timer_waiters: CellRing<u32>,
+    /// Registrations and withdrawals for the loop, drained after every poll. Twice the wait slots: one
+    /// poll pushes at most two intents per slot — a slot a fired wait frees on the desk is taken once more,
+    /// registered and abandoned, and is then held `Abandoned` until the loop has drained — so a push is
+    /// never refused and a withdrawal never lost (mantle's final review, finding 2).
     pub(crate) interests: CellRing<Interest>,
+    /// The readiness waits, one slot each, bounded by `interests_per_shard`.
+    waits: Box<[WaitCell]>,
+    free_waits: CellStack<u32>,
     /// The task being polled.
     pub(crate) current_task: Cell<Option<u32>>,
     /// The shard's clock at the start of the current poll (or step), published by the loop.
@@ -286,6 +335,7 @@ impl ShardContext {
         };
         let task_ids = slot_ids(shape.tasks);
         let timer_ids = slot_ids(shape.timers);
+        let wait_ids = slot_ids(shape.interests);
         Self {
             id,
             local: LocalQueue::new(shape.tasks),
@@ -300,7 +350,6 @@ impl ShardContext {
                     incoming: Cell::new(None),
                     poller: Cell::new(None),
                     waits_for_timer: Cell::new(false),
-                    interest_refused: Cell::new(None),
                 })
                 .collect(),
             free_tasks: CellStack::full_of(task_ids.into_iter()),
@@ -317,7 +366,15 @@ impl ShardContext {
             free_timers: CellStack::full_of(timer_ids.into_iter()),
             dirty_timers: CellRing::new(shape.timers),
             timer_waiters: CellRing::new(shape.tasks),
-            interests: CellRing::new(shape.interests),
+            interests: CellRing::new(shape.interests.saturating_mul(2)),
+            waits: (0..shape.interests)
+                .map(|_| WaitCell {
+                    generation: Cell::new(0),
+                    phase: Cell::new(WaitPhase::Free),
+                    refusal: Cell::new(None),
+                })
+                .collect(),
+            free_waits: CellStack::full_of(wait_ids.into_iter()),
             current_task: Cell::new(None),
             now_ns: Cell::new(0),
             activity_ns: Cell::new(None),
@@ -590,41 +647,178 @@ impl ShardContext {
         Ok(())
     }
 
-    /// Registers one-shot interest in `raw`'s readability (or writability): when it next is, the driver
-    /// wakes the task `word` names. Refused `Capacity` when the shard's interest queue is full.
+    /// Takes a wait slot for a readiness wait: its ticket, or `Capacity` when `interests_per_shard` waits
+    /// are outstanding.
+    pub(crate) fn take_wait(&self) -> Result<Ticket, RtError> {
+        let slot = self.free_waits.pop().ok_or(RtError::Capacity {
+            what: "readiness waits",
+            bound: self.waits.len(),
+        })?;
+        let cell = self.wait_cell(slot).ok_or(RtError::Capacity {
+            what: "readiness waits",
+            bound: self.waits.len(),
+        })?;
+        cell.phase.set(WaitPhase::Armed);
+        Ok(Ticket {
+            slot,
+            generation: cell.generation.get(),
+        })
+    }
+
+    fn wait_cell(&self, slot: u32) -> Option<&WaitCell> {
+        self.waits.get(usize::try_from(slot).ok()?)
+    }
+
+    /// The cell `ticket` names, while that wait holds it.
+    fn wait_of(&self, ticket: Ticket) -> Option<&WaitCell> {
+        self.wait_cell(ticket.slot)
+            .filter(|cell| cell.generation.get() == ticket.generation)
+    }
+
+    /// Gives a wait's slot back: its generation moves on, so the ended wait's ticket names nothing.
+    fn free_wait(&self, ticket: Ticket) {
+        if let Some(cell) = self.wait_of(ticket) {
+            cell.generation.set(cell.generation.get().wrapping_add(1));
+            cell.phase.set(WaitPhase::Free);
+            cell.refusal.set(None);
+            // The slot came off this stack, which holds every slot: room for it.
+            let _ = self.free_waits.push(ticket.slot);
+        }
+    }
+
+    /// Registers one-shot interest in `raw`'s readability (or writability) for the task `word` names: the
+    /// wait's ticket. When the handle fires in that direction the loop marks the wait fired and wakes the
+    /// task. Refused `Capacity` when every wait slot is taken.
     pub fn register_interest(
         &self,
         raw: i32,
         writable: bool,
         word: Encoded,
-    ) -> Result<(), RtError> {
-        self.interests
-            .push(Interest {
-                raw,
-                writable,
-                word,
-                withdraw: false,
-            })
-            .map_err(|_| RtError::Capacity {
-                what: "readiness registrations",
-                bound: self.interests.capacity(),
-            })
-    }
-
-    /// Withdraws a readiness wait whose future dropped before it fired. Best effort: with the intent ring full
-    /// the wait stays in the table until its handle fires, waking the task once, spuriously.
-    pub fn withdraw_interest(&self, raw: i32, writable: bool, word: Encoded) {
-        let _ = self.interests.push(Interest {
+    ) -> Result<Ticket, RtError> {
+        let ticket = self.take_wait()?;
+        let pushed = self.interests.push(Interest {
             raw,
             writable,
             word,
-            withdraw: true,
+            ticket,
+            withdraw: false,
         });
+        if pushed.is_err() {
+            // Unreachable by the ring's sizing (see `interests`); refused rather than lost.
+            self.free_wait(ticket);
+            return Err(RtError::Capacity {
+                what: "readiness registrations",
+                bound: self.interests.capacity(),
+            });
+        }
+        Ok(ticket)
     }
 
-    /// The refusal the driver gave the polling task's last readiness registration, if any (taken).
-    pub fn take_interest_refusal(&self, word: Encoded) -> Option<RtError> {
-        self.task(word.slot())?.interest_refused.take()
+    /// What became of the wait `ticket` names: `None` while it waits; `Some(Ok)` once it fired, or
+    /// `Some(Err)` when it was refused — both end the wait and give its slot back. A ticket that names
+    /// nothing reads as fired: the caller retries its call, which says what holds.
+    pub fn interest_outcome(&self, ticket: Ticket) -> Option<Result<(), RtError>> {
+        let Some(cell) = self.wait_of(ticket) else {
+            return Some(Ok(()));
+        };
+        let outcome = match cell.phase.get() {
+            WaitPhase::Armed => return None,
+            WaitPhase::Refused => Err(cell.refusal.take().unwrap_or(RtError::Capacity {
+                what: "readiness registrations",
+                bound: self.waits.len(),
+            })),
+            WaitPhase::Fired | WaitPhase::Free | WaitPhase::Abandoned => Ok(()),
+        };
+        self.free_wait(ticket);
+        Some(outcome)
+    }
+
+    /// Ends a wait whose future dropped. An armed OS wait is marked abandoned and its withdrawal queued; the
+    /// loop takes it out of the table and frees the slot. A fired or refused wait, or a simulated one (whose
+    /// socket fires through `fire_wait`, which a stale ticket misses), gives its slot back now.
+    pub fn abandon_interest(
+        &self,
+        raw: Option<i32>,
+        writable: bool,
+        word: Encoded,
+        ticket: Ticket,
+    ) {
+        let Some(cell) = self.wait_of(ticket) else {
+            return;
+        };
+        match (cell.phase.get(), raw) {
+            (WaitPhase::Armed, Some(raw)) => {
+                cell.phase.set(WaitPhase::Abandoned);
+                let pushed = self.interests.push(Interest {
+                    raw,
+                    writable,
+                    word,
+                    ticket,
+                    withdraw: true,
+                });
+                // Unreachable by the ring's sizing (see `interests`). Were it refused, the slot would stay
+                // abandoned, held against the bound, until the handle fires and `fire_wait` frees it.
+                let _ = pushed;
+            }
+            (WaitPhase::Abandoned, _) => {}
+            _ => self.free_wait(ticket),
+        }
+    }
+
+    /// The loop (or a simulated socket) reports the wait `ticket` names ready: an armed wait is marked
+    /// fired and its task woken; an abandoned one is freed. True when a task was woken.
+    pub(crate) fn fire_wait(&self, ticket: Ticket, word: Encoded) -> bool {
+        let Some(cell) = self.wait_of(ticket) else {
+            return false;
+        };
+        match cell.phase.get() {
+            WaitPhase::Armed => {
+                cell.phase.set(WaitPhase::Fired);
+                self.wake_local(word.slot());
+                true
+            }
+            WaitPhase::Abandoned => {
+                self.free_wait(ticket);
+                false
+            }
+            _ => false,
+        }
+    }
+
+    /// The loop refused to register the wait `ticket` names: an armed wait carries the refusal to its task,
+    /// woken; an abandoned one is freed.
+    pub(crate) fn refuse_wait(&self, ticket: Ticket, word: Encoded, refusal: RtError) {
+        let Some(cell) = self.wait_of(ticket) else {
+            return;
+        };
+        match cell.phase.get() {
+            WaitPhase::Armed => {
+                cell.phase.set(WaitPhase::Refused);
+                cell.refusal.set(Some(refusal));
+                self.wake_local(word.slot());
+            }
+            WaitPhase::Abandoned => self.free_wait(ticket),
+            _ => {}
+        }
+    }
+
+    /// Whether the wait `ticket` names was abandoned before the loop registered it (the loop then frees it
+    /// instead of arming the handle for no one).
+    pub(crate) fn wait_abandoned(&self, ticket: Ticket) -> bool {
+        self.wait_of(ticket)
+            .is_some_and(|cell| cell.phase.get() == WaitPhase::Abandoned)
+    }
+
+    /// The loop withdrew an abandoned wait from its table: the slot is given back.
+    pub(crate) fn withdrawn(&self, ticket: Ticket) {
+        if self.wait_abandoned(ticket) {
+            self.free_wait(ticket);
+        }
+    }
+
+    /// Wait slots held now (a test's view of the table's bound).
+    pub fn waits_held(&self) -> usize {
+        self.waits.len().saturating_sub(self.free_waits.len())
     }
 
     /// Registers `task` as a poller: the loop wakes it whenever `ready` says so (slates' client rings).

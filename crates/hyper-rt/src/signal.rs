@@ -141,7 +141,9 @@ pub fn subscribe(kinds: &[Signal]) -> Result<SignalStream, RtError> {
             what: "a signal kind this OS does not deliver",
         });
     }
-    os::install(mask)?;
+    // The mask is published before the handlers are installed: the signal thread's restore of a kind's
+    // default action reads the masks after it, and keeps the handler for a subscriber it sees
+    // (`signal_protocol`; mantle's final review, finding 3).
     for (index, slot) in SLOTS.iter().enumerate() {
         if slot
             .mask
@@ -150,6 +152,10 @@ pub fn subscribe(kinds: &[Signal]) -> Result<SignalStream, RtError> {
         {
             slot.pending.store(0, Ordering::Release);
             slot.waiter.store(NO_WAITER, Ordering::Release);
+            if let Err(refused) = os::install(mask) {
+                slot.mask.store(0, Ordering::Release);
+                return Err(refused);
+            }
             return Ok(SignalStream { index });
         }
     }
@@ -157,6 +163,14 @@ pub fn subscribe(kinds: &[Signal]) -> Result<SignalStream, RtError> {
         what: "signal subscriptions",
         bound: MAX_SHARDS,
     })
+}
+
+/// The kinds some subscription wants now.
+#[cfg(unix)]
+fn subscribed() -> u32 {
+    SLOTS
+        .iter()
+        .fold(0, |union, slot| union | slot.mask.load(Ordering::Acquire))
 }
 
 impl SignalStream {
@@ -220,22 +234,31 @@ mod os {
 
     use std::os::fd::{AsRawFd, OwnedFd};
     use std::sync::OnceLock;
-    use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
+    #[cfg(not(loom))]
+    use std::sync::atomic::AtomicU32;
+    use std::sync::atomic::{AtomicI32, Ordering};
 
-    use super::{Signal, deliver};
+    use super::{Signal, deliver, subscribed};
     use crate::driver::refused;
     use crate::error::RtError;
+    use crate::signal_protocol::{self, Dispositions};
 
     /// The kinds Unix delivers.
     pub(super) const DELIVERED: u32 =
         Signal::Interrupt.bit() | Signal::Terminate.bit() | Signal::Hangup.bit();
 
     /// The kinds that arrived since the signal thread last looked (the handler's half).
-    static RAW: AtomicU32 = AtomicU32::new(0);
+    static RAW: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     /// The pipe's write end, for the handler; -1 before the first installation.
     static WRITE: AtomicI32 = AtomicI32::new(-1);
-    /// The kinds whose handler is installed.
+    /// The kinds whose handler is installed (`signal_protocol`'s word).
+    #[cfg(not(loom))]
     static INSTALLED: AtomicU32 = AtomicU32::new(0);
+    /// Under loom the protocol's atomics are loom's, which are not `const`; its models drive
+    /// `signal_protocol` itself and never this word, which only keeps the crate building.
+    #[cfg(loom)]
+    static INSTALLED: std::sync::LazyLock<loom::sync::atomic::AtomicU32> =
+        std::sync::LazyLock::new(|| loom::sync::atomic::AtomicU32::new(0));
     /// The pipe, made once with the signal thread.
     static PIPE: OnceLock<Result<OwnedFd, RtError>> = OnceLock::new();
 
@@ -320,7 +343,18 @@ mod os {
                     let arrived = RAW.swap(0, Ordering::AcqRel);
                     if arrived != 0 {
                         let wanted = deliver(arrived);
-                        default_action(arrived & !wanted);
+                        let unwanted = arrived & !wanted;
+                        if unwanted != 0 {
+                            // A kind with no subscriber gets its default action back and is raised, unless a
+                            // subscription came meanwhile: then the signal is its (finding 7, and the final
+                            // review's finding 3).
+                            let kept = signal_protocol::restore(
+                                &INSTALLED, unwanted, subscribed, &Sigaction,
+                            );
+                            if kept != 0 {
+                                deliver(kept);
+                            }
+                        }
                     }
                 }
                 Err(_) => return,
@@ -328,41 +362,21 @@ mod os {
         }
     }
 
-    /// The kinds in `unwanted` arrived with no subscriber left: each gets its default action back and is raised
-    /// again, so a SIGINT or SIGTERM with nobody listening ends the process as it would have (mantle's review,
-    /// finding 7). A later subscription installs the handler again.
-    fn default_action(unwanted: u32) {
-        for kind in Signal::ALL {
-            let bit = kind.bit();
-            if unwanted & bit == 0 {
-                continue;
-            }
-            let Some(signal) = number(kind) else {
-                continue;
-            };
-            INSTALLED.fetch_and(!bit, Ordering::AcqRel);
-            // SAFETY: an all-zero `sigaction` is a valid value; SIG_DFL restores the default action.
-            let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
-            action.sa_sigaction = libc::SIG_DFL;
-            // SAFETY: a valid action for a valid signal number; no previous action is read. `raise` sends the
-            // signal to this thread, whose default action now runs.
-            unsafe {
-                libc::sigaction(signal, &raw const action, std::ptr::null_mut());
-                libc::raise(signal);
-            }
-        }
+    /// The kernel's dispositions through `sigaction(2)`.
+    struct Sigaction;
+
+    /// The signal number of the kind `bit` names.
+    fn number_of(bit: u32) -> Option<libc::c_int> {
+        Signal::ALL
+            .into_iter()
+            .find(|kind| kind.bit() == bit)
+            .and_then(number)
     }
 
-    /// Installs the handlers of the kinds in `mask` not yet installed.
-    pub(super) fn install(mask: u32) -> Result<(), RtError> {
-        pipe()?;
-        for kind in Signal::ALL {
-            let bit = kind.bit();
-            if mask & bit == 0 || INSTALLED.fetch_or(bit, Ordering::AcqRel) & bit != 0 {
-                continue;
-            }
-            let Some(signal) = number(kind) else {
-                continue;
+    impl Dispositions for Sigaction {
+        fn ours(&self, bit: u32) -> Result<(), RtError> {
+            let Some(signal) = number_of(bit) else {
+                return Ok(());
             };
             // SAFETY: an all-zero `sigaction` is a valid value of the C struct; the handler is set below.
             let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
@@ -371,11 +385,39 @@ mod os {
             // SAFETY: `action` names a handler that is async-signal-safe (above), with an empty mask and
             // `SA_RESTART`, so interrupted system calls of other threads resume; no previous action is read.
             if unsafe { libc::sigaction(signal, &raw const action, std::ptr::null_mut()) } != 0 {
-                INSTALLED.fetch_and(!bit, Ordering::AcqRel);
                 return Err(RtError::os("sigaction"));
             }
+            Ok(())
         }
-        Ok(())
+
+        fn restore_default(&self, bit: u32) {
+            let Some(signal) = number_of(bit) else {
+                return;
+            };
+            // SAFETY: an all-zero `sigaction` is a valid value; SIG_DFL restores the default action.
+            let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+            action.sa_sigaction = libc::SIG_DFL;
+            // SAFETY: a valid action for a valid signal number; no previous action is read.
+            unsafe {
+                libc::sigaction(signal, &raw const action, std::ptr::null_mut());
+            }
+        }
+
+        fn raise(&self, bit: u32) {
+            if let Some(signal) = number_of(bit) {
+                // SAFETY: sends a valid signal to this thread, whose default action now runs.
+                unsafe {
+                    libc::raise(signal);
+                }
+            }
+        }
+    }
+
+    /// Installs the handlers of the kinds in `mask` not yet installed, for a subscription whose mask is
+    /// published.
+    pub(super) fn install(mask: u32) -> Result<(), RtError> {
+        pipe()?;
+        signal_protocol::install(&INSTALLED, mask, &Sigaction)
     }
 }
 

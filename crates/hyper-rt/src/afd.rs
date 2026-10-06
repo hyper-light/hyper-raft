@@ -31,6 +31,8 @@ const IOCTL_AFD_POLL: u32 = 0x0001_2024;
 const STATUS_PENDING: NTSTATUS = 0x0000_0103;
 /// Format: `STATUS_SUCCESS`.
 const STATUS_SUCCESS: NTSTATUS = 0x0000_0000;
+/// Format: `STATUS_CANCELLED` (ntstatus.h), the status a cancelled IRP completes with.
+const STATUS_CANCELLED: u32 = 0xC000_0120;
 /// Format: `FILE_OPEN` — open the existing device, do not create (`NtCreateFile` disposition).
 const FILE_OPEN: u32 = 0x0000_0001;
 /// Format: `SYNCHRONIZE` — the only access the AFD helper handle needs.
@@ -128,8 +130,20 @@ pub(crate) struct Block {
     user_data: u64,
     /// The events asked for, kept apart from `poll_info`, which the kernel overwrites with those that fired.
     requested: u32,
-    /// Set when the driver cancelled the poll to replace it: its completion carries nothing to deliver.
-    cancelled: bool,
+}
+
+/// What a poll's completion carried, by the status the IRP completed with — not by whether the driver asked
+/// to cancel it: a poll that completed before its cancel reached it carries its events, which are delivered
+/// (mantle's final review, finding 4).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Outcome {
+    /// The poll completed with these events.
+    Fired(u32),
+    /// The poll was cancelled before it completed: nothing to deliver.
+    Cancelled,
+    /// The poll failed: its waiters are woken in every direction, so their calls see the error (wepoll
+    /// maps a failed poll to `EPOLLERR` the same way, `sock_feed_event`).
+    Failed,
 }
 
 /// What a poll's completion carried.
@@ -137,10 +151,8 @@ pub(crate) struct Block {
 pub(crate) struct Reclaimed {
     /// The handle's tag.
     pub(crate) user_data: u64,
-    /// The events that fired (none for a cancelled or failed poll).
-    pub(crate) fired: u32,
-    /// Whether the driver cancelled the poll.
-    pub(crate) cancelled: bool,
+    /// How the poll ended.
+    pub(crate) outcome: Outcome,
 }
 
 impl Block {
@@ -162,7 +174,6 @@ impl Block {
             },
             user_data,
             requested: events,
-            cancelled: false,
         };
         Box::into_raw(Box::new(block))
     }
@@ -175,16 +186,23 @@ impl Block {
     pub(crate) unsafe fn reclaim(ptr: *mut Block) -> Reclaimed {
         // SAFETY: the contract above — a leaked block delivered once; `from_raw` takes ownership back.
         let block = unsafe { Box::from_raw(ptr) };
-        // The status the IOCTL left in the overlapped's head (`Internal`, the IO_STATUS_BLOCK's status).
-        let succeeded = block.overlapped.Internal == 0;
-        let fired = match block.poll_info.handles.first() {
-            Some(handle) if succeeded && !block.cancelled => handle.events,
-            _ => 0,
+        // The status the IOCTL left in the overlapped's head (`Internal`, the IO_STATUS_BLOCK's status), as
+        // the NTSTATUS's 32 bits.
+        let status = u32::try_from(block.overlapped.Internal & 0xFFFF_FFFF).unwrap_or(u32::MAX);
+        let outcome = match status {
+            0 => Outcome::Fired(
+                block
+                    .poll_info
+                    .handles
+                    .first()
+                    .map_or(0, |handle| handle.events),
+            ),
+            STATUS_CANCELLED => Outcome::Cancelled,
+            _ => Outcome::Failed,
         };
         Reclaimed {
             user_data: block.user_data,
-            fired,
-            cancelled: block.cancelled,
+            outcome,
         }
     }
 
@@ -356,8 +374,11 @@ impl Afd {
 }
 
 impl Afd {
-    /// Cancels a poll still in flight, to replace it: its completion still arrives on the port (cancelled),
-    /// marked so the driver delivers nothing for it and only reclaims its block.
+    /// Cancels a poll still in flight: its completion still arrives on the port, and its block is reclaimed
+    /// there. What it delivers follows the status it completed with ([`Outcome`]): a cancelled poll delivers
+    /// nothing, and one that completed before the cancel reached it (`STATUS_NOT_FOUND` here) delivers its
+    /// events. The cancel may finish after this returns (`CancelIoEx` does not wait), so the completion is
+    /// awaited on the port, as every completion is.
     ///
     /// # Safety
     /// `ptr` must be a live `Block` this device's [`Afd::poll`] returned, whose completion has not been
@@ -367,12 +388,10 @@ impl Afd {
             status: 0,
             information: 0,
         };
-        // SAFETY: the contract above. The `cancelled` flag is the driver's field, untouched by the kernel; the
-        // request's IO_STATUS_BLOCK is the block's `overlapped` head (the address the IOCTL was given), and
-        // `status` is a live local for the call's own result. A poll that completed meanwhile is not found
-        // (STATUS_NOT_FOUND) and its completion, already queued, is delivered as fired.
+        // SAFETY: the contract above. The request's IO_STATUS_BLOCK is the block's `overlapped` head (the
+        // address the IOCTL was given), only named here, not read; `status` is a live local for the call's own
+        // result. Its result is not needed: the completion's own status says what happened.
         unsafe {
-            (*ptr).cancelled = true;
             let request = std::ptr::addr_of_mut!((*ptr).overlapped).cast::<IoStatusBlock>();
             NtCancelIoFileEx(self.handle, request, &raw mut status);
         }

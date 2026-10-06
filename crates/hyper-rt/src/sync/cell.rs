@@ -199,13 +199,31 @@ impl CellRef {
         }
     }
 
+    /// The handle as one word, for a cell's `aux` to name another cell (a chain).
+    pub(crate) fn to_word(self) -> u64 {
+        u64::from(self.index) | (u64::from(self.generation) << 32)
+    }
+
+    /// The handle a word from [`CellRef::to_word`] names.
+    pub(crate) fn from_word(word: u64) -> CellRef {
+        CellRef {
+            index: u32::try_from(word & u64::from(u32::MAX)).unwrap_or(u32::MAX),
+            generation: u32::try_from(word >> 32).unwrap_or(u32::MAX),
+        }
+    }
+
     /// Drops a handle; the last frees the cell.
     pub(crate) fn release(self) {
+        let _ = self.release_last();
+    }
+
+    /// Drops a handle, and says whether it was the last, which freed the cell.
+    pub(crate) fn release_last(self) -> bool {
         let Some(cell) = self.cell() else {
-            return;
+            return false;
         };
         if cell.handles.fetch_sub(1, Ordering::AcqRel) != 1 {
-            return;
+            return false;
         }
         cell.generation.fetch_add(1, Ordering::AcqRel);
         cell.waiter.store(NO_WAITER, Ordering::Release);
@@ -218,6 +236,14 @@ impl CellRef {
             summary.fetch_or(1u64 << (segment_index % SEGMENT), Ordering::AcqRel);
         }
         LIVE.fetch_sub(1, Ordering::AcqRel);
+        true
+    }
+
+    /// Forgets the waiting task, if any (its handle leaves the cell to a next user).
+    pub(crate) fn clear_waiter(self) {
+        if let Some(cell) = self.cell() {
+            cell.waiter.store(NO_WAITER, Ordering::Release);
+        }
     }
 
     /// Records `word` as the task to wake (replacing any earlier one: one waiter at a time).

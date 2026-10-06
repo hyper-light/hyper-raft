@@ -16,7 +16,9 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use crate::error::RtError;
+use crate::mem::Encoded;
 use crate::registry;
+use crate::shard::Ticket;
 use crate::waker::polling_task;
 
 /// Which readiness edge a caller awaits.
@@ -30,15 +32,18 @@ enum Interest {
     Writable,
 }
 
-/// Awaits one readiness edge on `raw` through the shard's driver: it registers one-shot interest on
-/// the first poll and yields; the driver's completion re-queues the task, and the next poll is ready
-/// so the caller retries the non-blocking syscall (a spurious wake just retries).
+/// Awaits one readiness edge on `raw` through the shard's driver: it takes a wait slot and registers
+/// one-shot interest on the first poll and yields; the loop marks the wait fired when the handle fires,
+/// and only then is a poll ready, so the caller retries its non-blocking syscall. A task woken for another
+/// reason — a timer a `race` also waits on, a sibling of a `join` — finds its wait still armed and keeps
+/// waiting (mantle's final review, finding 2: any re-poll used to report ready, and a wait that had not
+/// fired was never withdrawn). Dropped while armed, it withdraws its own wait and no other.
 #[derive(Debug)]
 pub struct Ready {
     target: Target,
     interest: Interest,
-    /// The task word registered, while the wait is armed.
-    armed: Option<crate::mem::Encoded>,
+    /// The wait's ticket and the task word it was registered for, while the wait is armed.
+    armed: Option<(Ticket, Encoded)>,
 }
 
 /// What a readiness wait watches: an OS handle through the shard's driver, or a simulated socket through
@@ -61,26 +66,35 @@ impl Future for Ready {
             // (mantle's review, finding 1): refused, as the synchronization primitives refuse it.
             return Poll::Ready(Err(RtError::NotOnShardThread));
         };
-        if let Some(armed) = self.armed {
-            // Woken: by the driver, or by the loop handing back a registration it refused.
-            self.armed = None;
-            return Poll::Ready(
-                match registry::with_current(|ctx| ctx.take_interest_refusal(armed)).flatten() {
-                    Some(refusal) => Err(refusal),
-                    None => Ok(()),
-                },
-            );
+        if let Some((ticket, armed_for)) = self.armed {
+            if armed_for == word {
+                let outcome = registry::with_current(|ctx| ctx.interest_outcome(ticket)).flatten();
+                return match outcome {
+                    // Not fired: whatever woke the task, this wait goes on.
+                    None => Poll::Pending,
+                    Some(outcome) => {
+                        self.armed = None;
+                        Poll::Ready(outcome)
+                    }
+                };
+            }
+            // Polled by another task than the one it registered for: the old wait ends, a new one begins.
+            self.abandon();
         }
         let writable = matches!(self.interest, Interest::Writable);
-        let registered = match self.target {
-            Target::Os(raw) => {
-                registry::with_current(|ctx| ctx.register_interest(raw, writable, word))
-            }
-            Target::Sim(index) => Some(crate::sim::sim_register(index, writable, word)),
-        };
+        let registered = registry::with_current(|ctx| match self.target {
+            Target::Os(raw) => ctx.register_interest(raw, writable, word),
+            Target::Sim(index) => ctx.take_wait().and_then(|ticket| {
+                crate::sim::sim_register(index, writable, word, ticket)
+                    .map(|()| ticket)
+                    .inspect_err(|_| {
+                        ctx.abandon_interest(None, writable, word, ticket);
+                    })
+            }),
+        });
         match registered {
-            Some(Ok(())) => {
-                self.armed = Some(word);
+            Some(Ok(ticket)) => {
+                self.armed = Some((ticket, word));
                 Poll::Pending
             }
             Some(Err(e)) => Poll::Ready(Err(e)),
@@ -89,15 +103,26 @@ impl Future for Ready {
     }
 }
 
-impl Drop for Ready {
-    /// A wait dropped while armed (a race lost, a task cancelled) leaves the shard's table, so abandoned waits
-    /// never accumulate there (mantle's review, finding 8's Unix half).
-    fn drop(&mut self) {
-        let (Some(word), Target::Os(raw)) = (self.armed, self.target) else {
+impl Ready {
+    /// Ends the armed wait, if any: the shard withdraws it from its table and gives its slot back.
+    fn abandon(&mut self) {
+        let Some((ticket, word)) = self.armed.take() else {
             return;
         };
         let writable = matches!(self.interest, Interest::Writable);
-        let _ = registry::with_current(|ctx| ctx.withdraw_interest(raw, writable, word));
+        let raw = match self.target {
+            Target::Os(raw) => Some(raw),
+            Target::Sim(_) => None,
+        };
+        let _ = registry::with_current(|ctx| ctx.abandon_interest(raw, writable, word, ticket));
+    }
+}
+
+impl Drop for Ready {
+    /// A wait dropped while armed (a race lost, a task cancelled) leaves the shard's table — its own node,
+    /// by its ticket — so abandoned waits never accumulate there (mantle's review, findings 8 and 1).
+    fn drop(&mut self) {
+        self.abandon();
     }
 }
 

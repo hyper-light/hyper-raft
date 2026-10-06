@@ -7088,7 +7088,7 @@ such owners passed every other test.
 
 ## hyper-quic at 500 ms one way: the copies' spacing learned per path (2026-10-05)
 
-`crates/hyper-quic/VENDORED.md` §16; research, the full table and the fresh dial's cliff traced in
+`crates/hyper-quic/VENDORED.md` §17; research, the full table and the fresh dial's cliff traced in
 `docs/research/burst-loss.md` §8–§9. `print_the_burst_table`, virtual time, exact. Load 7.5 to 8.0
 while it ran (`uptime` before and after); machine as above. First reply over its floor, p90 of the
 fresh dial / p90 of the resumed dial, ms, at 128 seeds (32 seeds in brackets):

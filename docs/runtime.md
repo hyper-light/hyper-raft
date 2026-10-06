@@ -165,6 +165,22 @@ fails when the drain clears the summary after the word.
   kick, a scheduling effect not yet identified (slates `docs/wip/BENCHMARKS.md`, "Measured and rejected").
   hyper-rt routes every cross-thread wake through kick-if-parked, so §12 carries the **spinning** round
   trip on both OSes under load, beside the parking one, and the choice stands only if it holds there.
+  **slates' nanosecond timeline (2026-10-06):** the result is a phase effect, not a fixed cost — probing
+  each event reversed the A/B (always-kick 2,458 ns, kick-if-parked 1,917 ns). ~2,250 of 8,000 kicks hit a
+  target mid-step and left a pending eventfd/kevent, so its next park returned at once: an accidental extra
+  inbox poll. And in every run, both builds and both OSes, **the idle spin never hit** (one miss per round
+  trip): its window was the startup probe's mean wake (1.7 µs on macOS), far below what a wake costs under
+  load. hyper-rt derives `spin_ns` the same way (§10.3), so §12's spinning row runs **with the online wake
+  estimate on** (`WakeTracking`), under load, and counts spin hits and misses; a spin window that never hits
+  under load is a defect of the derivation, to fix at its cause, not a tuning.
+  **Then, in slates' daemon configuration** (spin window ×100, online estimate on, macOS at load 14–40,
+  three alternating rounds): always-kick 4,875–5,917 ns, kick-if-parked 12,167–12,791 ns, with only 1–2
+  real driver waits per 2,000 round trips — so the spin window is **not** what costs the extra ~7 µs, and
+  no kernel wake sits in it. What is left are 10–13 µs gaps in which a shard thread that makes no system
+  call logs nothing: the OS scheduling two spinning threads, the kick's syscall apparently keeping the peer
+  promptly scheduled (inferred, not measured). So the kick question is decided on §12's spinning row under
+  load as stated above, and the spin window's derivation (startup mean against an online p50/p90) is
+  measured separately, on its own merits: spin hits, CPU, p99 under load.
 
 ### 3.3 The run queue
 
@@ -673,9 +689,14 @@ thread. §12's row runs both drivers the same way.
    (the model passes); the execution is to be reduced to a loom report or to an error of this model's.
 7. One-shot against edge-triggered registration (§3.7), and packed wake words against one per cache line
    (§3.2), measured on §12's rows.
-8. `Runtime`'s `stop` retries a full control channel with `yield_now` and no counted bound (slates'
+8. The spin window from the startup wake probe rarely hit in slates' bench configuration (§3.2), though it
+   is not the kick result's cause: measure the startup mean against an online p50/p90 on its own merits
+   (spin hits, CPU, p99 under load).
+   And why a shard that makes no system call while spinning sees 10–13 µs scheduling gaps that a kick's
+   syscall seems to close (slates, inferred): the mechanism, measured, before kick-if-parked is kept.
+9. `Runtime`'s `stop` retries a full control channel with `yield_now` and no counted bound (slates'
    shape): the shard drains as it runs, but the loop's end rests on that, not on a count.
-9. The calibration record's key and its age bound for focal's short commands (§10.2): what a stale record
+10. The calibration record's key and its age bound for focal's short commands (§10.2): what a stale record
    costs (a mis-sized spin) against what a fresh one costs (the probes' budget per command).
 
 ## 16. Order of work

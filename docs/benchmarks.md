@@ -7180,3 +7180,29 @@ channel hand-offs, each a kernel wake under load. So a consumer batches only rea
 device to serve (a page its own cache lacks, on a file opened for direct I/O), and reads cached pages
 in place. The three allocations per operation are the batch's vector, the issuer's buffer slots and
 the answer's vector.
+
+## hyper-log: the flushes an append costs (2026-10-07)
+
+`benches/log.rs` reports the device flushes an append costs (`flush/app`, from
+`LogStats::flushes`), beside the updates each frame carries (`per flush`). A frame is answered only
+once a later durable record confirms its flush: the next frame's persist record, or, when no frame
+follows, a confirmation written for it alone. In the bench's closed loop every replica waits for
+its answer before it appends again, so no frame follows another and every frame costs two flushes,
+its own and its confirmation's. A node at rest, one write at a time, pays it on every entry.
+
+macOS arm64 (load average 7 to 9), plain, one second a point:
+
+| replicas | size | appends/s | p50 | p99 | updates/frame | flushes/append | energy/append |
+|---|---|---|---|---|---|---|---|
+| 1 | 128 B | 117 | 8.59 ms | 12.31 ms | 1.0 | 2.00 | 841 µJ |
+| 4 | 128 B | 366 | 8.50 ms | 67.28 ms | 4.0 | 0.50 | 234 µJ |
+| 16 | 128 B | 1,861 | 8.50 ms | 13.54 ms | 15.9 | 0.13 | 62 µJ |
+| 1 | 1 KiB | 118 | 8.50 ms | 9.61 ms | 1.0 | 2.00 | 774 µJ |
+| 4 | 1 KiB | 468 | 8.49 ms | 10.74 ms | 4.0 | 0.50 | 220 µJ |
+| 16 | 1 KiB | 1,873 | 8.50 ms | 9.55 ms | 15.9 | 0.13 | 75 µJ |
+
+Two flushes a frame at every load, so a frame's confirmation doubles what a write at rest costs the
+device in power and, on flash, in wear. focal's commits bench, an entry at a time, measures the
+same: 2.00 flushes a commit on the shell against 1.00 on focal-log, at equal medians. Whether a
+frame nothing follows can be confirmed without a flush of its own is open (hyper-log's recovery,
+mantle's raft-log.md §3 and §6); this column is the number that answers it.

@@ -266,7 +266,7 @@ fn point(
     let appends = latencies.len() as f64;
     let (frames, updates) = log.flushed();
     // Device flushes an append, confirmations among them: an entry nothing follows (one replica,
-    // a node at rest) is confirmed by a flush of its own (docs/benchmarks.md, "Flushes").
+    // a node at rest) is confirmed by a flush of its own (docs/benchmarks.md, "hyper-log: the flushes an append costs").
     let flushes = log.stats(None).unwrap().flushes;
     let flushes_per_append = flushes as f64 / appends.max(1.0);
     let per_flush = if frames == 0 {

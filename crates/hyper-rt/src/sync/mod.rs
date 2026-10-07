@@ -113,7 +113,8 @@ impl Future for Notified<'_> {
 #[derive(Debug)]
 pub struct OneshotSender<T> {
     value: SyncSender<T>,
-    cell: CellRef,
+    /// After `value`: its wake runs once the channel has disconnected ([`WakeOnDrop`]).
+    cell: WakeOnDrop,
 }
 
 /// The receiving half of a one-shot: a future of the value, or `Closed` when the sender went without
@@ -129,7 +130,10 @@ pub fn oneshot<T>() -> Result<(OneshotSender<T>, OneshotReceiver<T>), RtError> {
     let cell = claim(2)?;
     let (value, receiver) = sync_channel(1);
     Ok((
-        OneshotSender { value, cell },
+        OneshotSender {
+            value,
+            cell: WakeOnDrop(cell),
+        },
         OneshotReceiver {
             value: receiver,
             cell,
@@ -146,19 +150,63 @@ impl<T> OneshotSender<T> {
                 Err(SyncError::Closed(value))
             }
         };
-        self.cell.wake();
+        self.cell.0.wake();
         sent
     }
 }
 
 impl<T> Drop for OneshotSender<T> {
     fn drop(&mut self) {
-        // The receiver learns the sender went (its channel disconnects); wake it to see so.
-        if let Some(cell) = self.cell.cell() {
+        // The receiver learns the sender went (its channel disconnects); `cell` wakes it to see so once
+        // `value` has dropped.
+        if let Some(cell) = self.cell.0.cell() {
             cell.state.fetch_or(CLOSED, Ordering::AcqRel);
         }
-        self.cell.wake();
-        self.cell.release();
+    }
+}
+
+/// A cell handle that wakes the cell's waiter, then gives the handle back, when it drops. A sending half
+/// declares it after its std channel half: fields drop in declaration order after `Drop::drop`, so the
+/// channel has disconnected before the wake, and the woken receiver's retry sees the disconnect. Waking in
+/// `Drop::drop` itself ran before the disconnect: the receiver could retry, find the channel empty and still
+/// connected, and wait for good (CI run 37543499272, `a_thread_and_a_task_exchange_values_both_ways`).
+#[derive(Debug)]
+struct WakeOnDrop(CellRef);
+
+impl Drop for WakeOnDrop {
+    fn drop(&mut self) {
+        self.0.wake();
+        self.0.release();
+    }
+}
+
+/// A sender's waiter cell in a channel's queue of senders waiting for room. Dropping it, whether the receiver
+/// took it or the queue went with the receiver, grants the room to a sender still waiting (0 → `GRANTED`),
+/// wakes it, and gives the queue's handle back: a sender queued as the receiver goes is woken to find the
+/// channel closed, and its cell is not left behind in the dropped queue.
+#[derive(Debug)]
+struct Queued(CellRef);
+
+impl Queued {
+    /// Grants the room to the waiter if it still waits, and wakes it; `false` for one that left.
+    fn grant(&self) -> bool {
+        let granted = self.0.cell().is_some_and(|words| {
+            words
+                .state
+                .compare_exchange(0, GRANTED, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        });
+        if granted {
+            self.0.wake();
+        }
+        granted
+    }
+}
+
+impl Drop for Queued {
+    fn drop(&mut self) {
+        self.grant();
+        self.0.release();
     }
 }
 
@@ -218,15 +266,19 @@ fn poll_value<T>(tried: &mut Result<Option<T>, SyncError<()>>) -> Option<Result<
 pub struct Sender<T> {
     value: SyncSender<T>,
     /// Where a sender that found the channel full queues its waiter cell to be woken when room appears.
-    room: SyncSender<CellRef>,
-    cell: CellRef,
+    room: SyncSender<Queued>,
+    /// After `value`: its wake runs once the last sender's drop has disconnected the channel ([`WakeOnDrop`]).
+    cell: WakeOnDrop,
 }
 
 /// The receiving half of a bounded channel.
 #[derive(Debug)]
 pub struct ChannelReceiver<T> {
+    /// Dropped first: senders that retry see the channel closed.
     value: Receiver<T>,
-    room: Receiver<CellRef>,
+    /// Dropped after `value`: each sender still queued is granted, woken to find the channel closed, and its
+    /// cell given back ([`Queued`]).
+    room: Receiver<Queued>,
     cell: CellRef,
 }
 
@@ -258,7 +310,11 @@ pub fn channel_with<T>(
     let (value, receiver) = sync_channel(capacity);
     let (room, waiting) = sync_channel(waiters);
     Ok((
-        Sender { value, room, cell },
+        Sender {
+            value,
+            room,
+            cell: WakeOnDrop(cell),
+        },
         ChannelReceiver {
             value: receiver,
             room: waiting,
@@ -269,19 +325,12 @@ pub fn channel_with<T>(
 
 impl<T> Clone for Sender<T> {
     fn clone(&self) -> Self {
-        self.cell.retain();
+        self.cell.0.retain();
         Self {
             value: self.value.clone(),
             room: self.room.clone(),
-            cell: self.cell,
+            cell: WakeOnDrop(self.cell.0),
         }
-    }
-}
-
-impl<T> Drop for Sender<T> {
-    fn drop(&mut self) {
-        self.cell.wake();
-        self.cell.release();
     }
 }
 
@@ -290,7 +339,7 @@ impl<T> Sender<T> {
     pub fn try_send(&self, value: T) -> Result<(), SyncError<T>> {
         match self.value.try_send(value) {
             Ok(()) => {
-                self.cell.wake();
+                self.cell.0.wake();
                 Ok(())
             }
             Err(TrySendError::Full(value)) => Err(SyncError::Full(value)),
@@ -302,7 +351,7 @@ impl<T> Sender<T> {
     pub fn blocking_send(&self, value: T) -> Result<(), SyncError<T>> {
         match self.value.send(value) {
             Ok(()) => {
-                self.cell.wake();
+                self.cell.0.wake();
                 Ok(())
             }
             Err(std::sync::mpsc::SendError(value)) => Err(SyncError::Closed(value)),
@@ -350,10 +399,10 @@ impl<T> Send<'_, T> {
                     .state
                     .compare_exchange(0, ABANDONED, Ordering::AcqRel, Ordering::Acquire);
             if previous == Err(GRANTED) && !used {
-                if let Some(channel) = self.sender.cell.cell() {
+                if let Some(channel) = self.sender.cell.0.cell() {
                     channel.state.fetch_or(OWED, Ordering::AcqRel);
                 }
-                self.sender.cell.wake();
+                self.sender.cell.0.wake();
             }
         }
         waiter.release();
@@ -365,8 +414,8 @@ impl<T> Send<'_, T> {
             return false;
         };
         waiter.register(word);
-        if self.sender.room.try_send(waiter).is_err() {
-            waiter.release();
+        if self.sender.room.try_send(Queued(waiter)).is_err() {
+            // The refused `Queued` gave the queue's handle back as it dropped; this gives back the wait's.
             waiter.release();
             return false;
         }
@@ -418,7 +467,8 @@ impl<T> Future for Send<'_, T> {
                 granted.release();
             }
             if !self.queue(word) {
-                return Poll::Ready(Err(SyncError::Full(value)));
+                // The queue is full, or went with the receiver: the channel itself says which.
+                return Poll::Ready(self.sender.try_send(value));
             }
         }
         // Room may have appeared between the try and the queueing: try again before waiting.
@@ -469,17 +519,8 @@ impl<T> ChannelReceiver<T> {
     /// at most the queue's length of them.
     fn wake_one_sender(&self) {
         while let Ok(waiter) = self.room.try_recv() {
-            let granted = waiter.cell().is_some_and(|words| {
-                words
-                    .state
-                    .compare_exchange(0, GRANTED, Ordering::AcqRel, Ordering::Acquire)
-                    .is_ok()
-            });
-            if granted {
-                waiter.wake();
-            }
-            waiter.release();
-            if granted {
+            // Dropping `waiter` gives the queue's handle back.
+            if waiter.grant() {
                 return;
             }
         }
@@ -499,11 +540,7 @@ impl<T> ChannelReceiver<T> {
 
 impl<T> Drop for ChannelReceiver<T> {
     fn drop(&mut self) {
-        // Senders waiting for room learn the receiver is gone when they try again.
-        while let Ok(waiter) = self.room.try_recv() {
-            waiter.wake();
-            waiter.release();
-        }
+        // Then `value` disconnects and `room` wakes every sender still queued to see so ([`Queued`]).
         self.cell.release();
     }
 }

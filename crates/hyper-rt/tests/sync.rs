@@ -94,6 +94,64 @@ fn a_thread_and_a_task_exchange_values_both_ways() {
     rt.shutdown().unwrap();
 }
 
+/// Shape: rounds of a drop race. The race these tests meet was lost about once in 300 runs of the exchange
+/// above (CI run 37543499272, and locally on macOS); 3,000 rounds miss it with probability about e^-10.
+const DROP_RACE_ROUNDS: u32 = 3_000;
+
+/// The last sender dropped on a thread just after a task answered it and went back to wait: the task must see
+/// the channel close. The drop used to wake the task before the channel disconnected, and a task retrying in
+/// between found it empty and still open, and waited for good.
+#[test]
+fn a_task_waiting_to_receive_sees_the_last_senders_drop() {
+    let rt = Runtime::start(&config(1)).unwrap();
+    let shard = rt.shard_ids()[0];
+    let (ended, closed) = std_channel();
+    for round in 0..DROP_RACE_ROUNDS {
+        let (to_task, mut task_rx) = sync::channel::<u32>(1).unwrap();
+        let (from_task, mut thread_rx) = sync::channel::<u32>(1).unwrap();
+        let ended = ended.clone();
+        rt.spawn_on(shard, async move {
+            while let Ok(value) = task_rx.recv().await {
+                if from_task.send(value).await.is_err() {
+                    return;
+                }
+            }
+            let _ = ended.send(());
+        })
+        .unwrap();
+        to_task.blocking_send(round).unwrap();
+        assert_eq!(thread_rx.blocking_recv(), Ok(round));
+        // The task is going back to wait: drop the only sender as it does.
+        drop(to_task);
+        assert_eq!(closed.recv_timeout(WAIT), Ok(()), "round {round}");
+    }
+    rt.shutdown().unwrap();
+}
+
+/// The receiver dropped on a thread while a task waits for room to send: the task must see the channel close.
+/// The drop used to wake queued senders before the channel disconnected (one retrying in between found it
+/// full and queued again behind the drop), and a sender queued after the drop's drain was never woken; now
+/// the queue's own drop, after the disconnect, wakes each sender still in it.
+#[test]
+fn a_task_waiting_for_room_sees_the_receivers_drop() {
+    let rt = Runtime::start(&config(1)).unwrap();
+    let shard = rt.shard_ids()[0];
+    let (done, finished) = std_channel();
+    for round in 0..DROP_RACE_ROUNDS {
+        let (tx, rx) = sync::channel::<u32>(1).unwrap();
+        tx.try_send(0).unwrap();
+        let done = done.clone();
+        rt.spawn_on(shard, async move {
+            let refused = tx.send(1).await;
+            let _ = done.send(matches!(refused, Err(SyncError::Closed(1))));
+        })
+        .unwrap();
+        drop(rx);
+        assert_eq!(finished.recv_timeout(WAIT), Ok(true), "round {round}");
+    }
+    rt.shutdown().unwrap();
+}
+
 #[test]
 fn tasks_on_two_shards_exchange_values() {
     let rt = Runtime::start(&config(2)).unwrap();

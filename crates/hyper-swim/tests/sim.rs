@@ -9,6 +9,12 @@
 //! the wait it measured for evidence of its own health added where its condemnation was pending on
 //! it, and no member holds a live one dead. Every seed's run replays from its seed, so each check
 //! is exact for the seeds named; the run-twice check refuses a run whose digests differ.
+//!
+//! The far-link runs (`docs/timing.md` §2.7, "A pair the pool does not fit") put some members 100 ms one way from the rest
+//! ([`Shape`]), each pair joined with its handshake's round trip as slates' daemons join: a pair the
+//! pooled verdict does not fit is never judged by it, is judged provisionally until its own
+//! estimator configures, and a member that dies before any far pair configured is still condemned
+//! by every survivor within the bound its detector stated.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -33,13 +39,13 @@ use hyper_sim::{
 };
 use hyper_swim::HostId;
 use hyper_swim::codec::{Coordinate, GossipBatch, SwimMessage, gossip_capacity};
-use hyper_swim::detector::{Detector, PingReq};
+use hyper_swim::detector::{Detector, PingReq, Verdict};
 use hyper_swim::membership::{Liveness, MemberState};
 use hyper_timing::Exposure;
 
-/// Members in the cluster.
+/// Members in the LAN cluster.
 const NODES: u32 = 5;
-/// The member killed.
+/// The member killed in the LAN cluster.
 const VICTIM: u32 = NODES - 1;
 /// The path's datagram size: QUIC's minimum, which every path carries (RFC 9000 §14.1).
 const DATAGRAM: usize = 1_200;
@@ -49,30 +55,103 @@ const PHI_PPM: u64 = 15;
 /// The steps a run may take: four times the most any seed took, 1,240 of seeds 0 to 15 (measured
 /// 2026-10-04), so a run that takes many more has stopped converging.
 const STEPS: u64 = 4 * 1_240;
-/// The decisions a step makes at most: the strategy's pick of a tie, a timer's lateness, and a
-/// delay for each message a poll sends, a probe and a ping-request to each other member.
-const DECISIONS_PER_STEP: u64 = 2 + NODES as u64;
 
-const LIMITS: Limits = Limits {
-    events: 1_024,
-    nodes: NODES as usize,
-    streams: 64,
+/// The far side's one-way delay: slates' repro, two Docker networks 100 ms apart (slates
+/// `docs/bugs/2026-10-07-a-far-member-condemns-the-near-side-by-its-pooled-deadline.md`).
+const FAR_ONE_WAY_NS: u64 = 100_000_000;
+/// The far path's jitter: slates' repro's 100 µs, so the far path is lossless and nearly fixed
+/// and any condemnation of a live member is the detector's, not the path's.
+const FAR_JITTER_NS: u64 = 100_000;
+/// How long the far-link runs watch the live cluster: slates' repro's 30 s.
+const WATCHED_NS: u64 = 30_000_000_000;
+
+/// A cluster's topology: its members, which of them sit across the far path from the rest, and the
+/// steps its run may take.
+#[derive(Clone, Copy, Debug)]
+struct Shape {
+    nodes: u32,
+    far: &'static [u32],
+    steps: u64,
+}
+
+/// The LAN cluster every member of which is one switch from the others.
+const LAN_CLUSTER: Shape = Shape {
+    nodes: NODES,
+    far: &[],
     steps: STEPS,
-    trace_words: (STEPS * DECISIONS_PER_STEP) as usize,
 };
 
-const NET: NetLimits = NetLimits {
-    flows: (NODES * NODES) as usize,
-    links: 0,
-    nats: 0,
-    link_messages: 0,
-    messages: 1_024,
-    bytes: 1_024 * DATAGRAM,
+/// slates' far-link repro: two near members, four 100 ms one way from them. Its steps: four times the
+/// most any named seed took ([`FAR_STEPS_TAKEN`]).
+const FAR_LINK: Shape = Shape {
+    nodes: 6,
+    far: &[2, 3, 4, 5],
+    steps: 4 * FAR_STEPS_TAKEN,
 };
+
+/// The most steps a named seed's far-link or all-far run took: 32,188, seed 12's far-link run until
+/// every far pair configured (`record_far_link`, measured 2026-10-07).
+const FAR_STEPS_TAKEN: u64 = 32_188;
+
+/// Two near members and one far one: every survivor of the far one's death is far from it.
+const ALL_FAR: Shape = Shape {
+    nodes: 3,
+    far: &[2],
+    steps: 4 * FAR_STEPS_TAKEN,
+};
+
+impl Shape {
+    /// Whether the pair `(a, b)` crosses the far path.
+    fn crosses(&self, a: u32, b: u32) -> bool {
+        self.far.contains(&a) != self.far.contains(&b)
+    }
+
+    /// The pair's one-way delay before jitter: the LAN's, plus the far path's where it crosses it.
+    fn one_way_ns(&self, a: u32, b: u32) -> u64 {
+        if self.crosses(a, b) {
+            FAR_ONE_WAY_NS
+        } else {
+            Path::LAN.one_way_ns()
+        }
+    }
+
+    /// The decisions a step makes at most: the strategy's pick of a tie, a timer's lateness, and a
+    /// delay for each message a poll sends, a probe and a ping-request to each other member.
+    fn decisions_per_step(&self) -> u64 {
+        2 + u64::from(self.nodes)
+    }
+
+    fn limits(&self) -> Limits {
+        Limits {
+            events: 1_024,
+            nodes: self.nodes as usize,
+            streams: 64,
+            steps: self.steps,
+            trace_words: (self.steps * self.decisions_per_step()) as usize,
+        }
+    }
+
+    fn net(&self) -> NetLimits {
+        NetLimits {
+            flows: (self.nodes * self.nodes) as usize,
+            links: 0,
+            nats: 0,
+            link_messages: 0,
+            messages: 1_024,
+            bytes: 1_024 * DATAGRAM,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Ev {
     Arrive(Ticket),
+}
+
+/// Whether `verdict` is a misfit pair's provisional one: it promises no bound (`mistake` 1, the
+/// detector's `misfit_verdict`).
+fn is_provisional(verdict: &Verdict) -> bool {
+    verdict.mistake >= 1.0
 }
 
 fn host(node: NodeId) -> HostId {
@@ -89,6 +168,8 @@ fn node_of(host: HostId) -> NodeId {
 struct Noted {
     after: Duration,
     within: Option<Duration>,
+    /// When the member came to hold it dead, on its own clock.
+    at_ns: u64,
 }
 
 /// One member's driver, as the cluster test's: its detector and the probes it relays.
@@ -103,10 +184,17 @@ struct Member {
     relaying: BTreeMap<u64, (u64, HostId, u64)>,
     /// Each peer's death as this member came to hold it.
     deaths: BTreeMap<u64, Noted>,
+    /// The peers this member has judged by a provisional verdict (`mistake` 1, before the pair's own
+    /// estimator configured), as polled.
+    provisional: std::collections::BTreeSet<u64>,
+    nodes: u32,
     alive: bool,
 }
 
 struct Sim {
+    shape: Shape,
+    /// Member 0's clock when the run began: [`Sim::now`] counts from it.
+    origin: u64,
     world: World<Ev>,
     net: Net<Vec<u8>>,
     members: Vec<Member>,
@@ -118,13 +206,21 @@ struct Sim {
 }
 
 impl Member {
-    fn new(me: NodeId) -> Self {
-        let members = NonZeroUsize::new(NODES as usize).unwrap();
+    fn new(me: NodeId, shape: Shape) -> Self {
+        let members = NonZeroUsize::new(shape.nodes as usize).unwrap();
         // The world's clocks read whole nanoseconds.
         let mut detector =
             Detector::new(host(me), Exposure::new(), members, Duration::from_nanos(1));
-        for peer in (0..NODES).map(NodeId).filter(|peer| *peer != me) {
-            detector.join(host(peer)).unwrap();
+        for peer in (0..shape.nodes).map(NodeId).filter(|peer| *peer != me) {
+            if shape.far.is_empty() {
+                detector.join(host(peer)).unwrap();
+            } else {
+                // As slates' daemons join: with the round trip the keying handshake measured.
+                let round_trip = 2 * shape.one_way_ns(me.0, peer.0);
+                detector
+                    .join_measured(host(peer), Duration::from_nanos(round_trip))
+                    .unwrap();
+            }
         }
         let mut member = Self {
             detector,
@@ -135,6 +231,8 @@ impl Member {
             encoded: Vec::new(),
             relaying: BTreeMap::new(),
             deaths: BTreeMap::new(),
+            provisional: std::collections::BTreeSet::new(),
+            nodes: shape.nodes,
             alive: true,
         };
         member.gossip = member.room(me, true);
@@ -318,7 +416,14 @@ impl Member {
 
     /// Notes each death this member comes to hold, as the cluster test does.
     fn note_deaths(&mut self, me: NodeId, now: u64) {
-        for peer in (0..NODES).map(NodeId).filter(|peer| *peer != me) {
+        for peer in (0..self.nodes).map(NodeId).filter(|peer| *peer != me) {
+            if self
+                .detector
+                .verdict(host(peer))
+                .is_some_and(|verdict| is_provisional(&verdict))
+            {
+                self.provisional.insert(host(peer).0);
+            }
             let held = self
                 .detector
                 .membership()
@@ -338,6 +443,7 @@ impl Member {
                         Noted {
                             after: since(report.last_answer_ns),
                             within: bound.map(|bound| bound.saturating_add(waited)),
+                            at_ns: now,
                         },
                     );
                 }
@@ -351,11 +457,11 @@ impl Member {
 }
 
 impl Sim {
-    fn new(source: Source, lose_first: bool) -> Self {
-        let mut world = World::new(source, Discipline::Ordered, LIMITS).unwrap();
+    fn new(source: Source, lose_first: bool, shape: Shape) -> Self {
+        let mut world = World::new(source, Discipline::Ordered, shape.limits()).unwrap();
         // Each member's clock: an offset, a rate within ±PHI and timers late by up to 60 µs, drawn
         // through the world from a stream of the member's own, so a run is its seed or its trace.
-        for id in 0..NODES {
+        for id in 0..shape.nodes {
             let clocks = world.stream("clock", &[u64::from(id)]).unwrap();
             let rate = i32::try_from(world.below(clocks, 2 * PHI_PPM + 1).unwrap()).unwrap()
                 - PHI_PPM as i32;
@@ -370,20 +476,40 @@ impl Sim {
             };
             assert_eq!(world.node(clock).unwrap(), NodeId(id));
         }
-        let mut net = Net::new(NET);
+        let origin = world.monotonic(NodeId(0)).unwrap();
+        let mut net = Net::new(shape.net());
         net.set_path(Path::LAN);
-        let members = (0..NODES).map(|id| Member::new(NodeId(id))).collect();
+        for a in 0..shape.nodes {
+            for b in (0..shape.nodes).filter(|b| shape.crosses(a, *b)) {
+                net.set_pair_path(
+                    NodeId(a),
+                    NodeId(b),
+                    Path::in_order(FAR_ONE_WAY_NS, FAR_JITTER_NS),
+                )
+                .unwrap();
+            }
+        }
+        let members = (0..shape.nodes)
+            .map(|id| Member::new(NodeId(id), shape))
+            .collect();
         let mut sim = Self {
+            shape,
+            origin,
             world,
             net,
             members,
-            losing: vec![lose_first; NODES as usize],
+            losing: vec![lose_first; shape.nodes as usize],
             outbox: Vec::new(),
         };
-        for id in 0..NODES {
+        for id in 0..shape.nodes {
             sim.step(NodeId(id));
         }
         sim
+    }
+
+    /// Nanoseconds since the run began, on member 0's clock.
+    fn now(&self) -> u64 {
+        self.world.monotonic(NodeId(0)).unwrap() - self.origin
     }
 
     /// Polls member `node`, sends what it queued and arms its timer at its detector's wake.
@@ -411,9 +537,21 @@ impl Sim {
 
     /// Runs until `done`, within the world's step budget.
     fn run(&mut self, what: &str, done: impl Fn(&Self) -> bool) {
+        if let Err(stopped) = self.run_until(done) {
+            panic!("{what}: {stopped}");
+        }
+    }
+
+    /// Runs until `done`; `Err` naming why the world stopped first (nothing pending, or the step
+    /// budget spent), for the record runs that must report a detector that never gets there.
+    fn run_until(&mut self, done: impl Fn(&Self) -> bool) -> Result<(), String> {
         let mut strategy = Random;
         while !done(self) {
-            match self.world.next(&mut strategy).unwrap() {
+            match self
+                .world
+                .next(&mut strategy)
+                .map_err(|refusal| refusal.to_string())?
+            {
                 Step::Wake { node } => {
                     if self.members[node.0 as usize].alive {
                         self.step(node);
@@ -426,11 +564,14 @@ impl Sim {
                     let delivered = self
                         .net
                         .deliver(&mut self.world, ticket, Ev::Arrive)
-                        .unwrap();
+                        .map_err(|refusal| refusal.to_string())?;
                     if let Some(delivery) = delivered
                         && self.members[node.0 as usize].alive
                     {
-                        let stamp = self.world.monotonic(node).unwrap();
+                        let stamp = self
+                            .world
+                            .monotonic(node)
+                            .map_err(|refusal| refusal.to_string())?;
                         let member = &mut self.members[node.0 as usize];
                         if let Ok(message) = SwimMessage::decode(&delivery.payload) {
                             member.handle(node, message, stamp, &mut self.outbox);
@@ -438,10 +579,11 @@ impl Sim {
                         self.step(node);
                     }
                 }
-                Step::Idle => panic!("{what}: nothing pending"),
-                Step::Spent => panic!("{what}: the step budget is spent"),
+                Step::Idle => return Err("nothing pending".to_owned()),
+                Step::Spent => return Err("the step budget is spent".to_owned()),
             }
         }
+        Ok(())
     }
 
     /// Whether every live member judges every live peer by a verdict, the pair's own or the
@@ -460,6 +602,21 @@ impl Sim {
             .enumerate()
             .filter(|(_, member)| member.alive)
             .map(|(id, member)| (NodeId(id as u32), member))
+    }
+
+    /// Whether every live member's pair with every live member across the far path has its own
+    /// estimator's verdict.
+    fn every_far_pair_configured(&self) -> bool {
+        self.live().all(|(me, member)| {
+            self.live()
+                .filter(|(peer, _)| self.shape.crosses(me.0, peer.0))
+                .all(|(peer, _)| {
+                    member
+                        .detector
+                        .report(host(peer))
+                        .is_some_and(|report| report.configured)
+                })
+        })
     }
 
     fn kill(&mut self, victim: NodeId) {
@@ -483,7 +640,7 @@ fn run(source: Source) -> Result<Record, SimError> {
         Source::Seed(seed) => format!("seed {seed}"),
         Source::Trace(_) => "the trace".to_owned(),
     };
-    let mut sim = Sim::new(source, false);
+    let mut sim = Sim::new(source, false, LAN_CLUSTER);
     sim.run("every pair judged", Sim::every_pair_judged);
     for (me, member) in sim.live() {
         assert!(
@@ -546,7 +703,222 @@ fn members_whose_first_probes_are_all_lost_probe_again() {
 
 /// One run from `source` with every member's first datagram lost, until every pair is judged.
 fn lost_first_probes(source: Source) -> Result<Record, SimError> {
-    let mut sim = Sim::new(source, true);
+    let mut sim = Sim::new(source, true, LAN_CLUSTER);
     sim.run("every pair judged", Sim::every_pair_judged);
     Ok(sim.world.finish())
+}
+
+/// The far-link runs' seeds: 0 to 15, as the LAN runs', and [`STALE_POOL_SEEDS`].
+const FAR_SEEDS: std::ops::Range<u64> = 0..16;
+
+/// Seeds whose far-link run condemned a live member for the stale-pool cause: with the handshake
+/// compared against the pool's verdict as held before `start` configured it, the probe that first
+/// configured the pool judged a far pair by it. Found 2026-10-07 on this harness with that order
+/// restored: seeds 1, 6, 25, 33, 36, 37, 43 and 52 of 0 to 63 each condemned a live near member once
+/// in 30 s; 1 and 6 are in [`FAR_SEEDS`] already.
+const STALE_POOL_SEEDS: &[u64] = &[25, 33, 36, 37, 43, 52];
+
+/// Every own-probe condemnation of a live member: `(member, condemned, count)`.
+fn condemned_live(sim: &Sim) -> Vec<(u32, u32, u64)> {
+    let mut found = Vec::new();
+    for (me, member) in sim.live() {
+        for (peer, _) in sim.live().filter(|(peer, _)| *peer != me) {
+            let count = member
+                .detector
+                .report(host(peer))
+                .map_or(0, |report| report.condemnations);
+            if count > 0 {
+                found.push((me.0, peer.0, count));
+            }
+        }
+    }
+    found
+}
+
+/// slates' far-link repro on the simulated network: two near members, four 100 ms one way from
+/// them, the path lossless with 100 µs of jitter, watched 30 s. No member condemns a live one, and
+/// every far pair has left provisional judgement for its own estimator's verdict by the end.
+fn far_link(source: Source) -> Result<Record, SimError> {
+    let mut sim = Sim::new(source, false, FAR_LINK);
+    sim.run("30 s watched", |sim| sim.now() >= WATCHED_NS);
+    no_live_member_condemned(&sim, "in 30 s");
+    // Then on until every far pair's own estimator has configured: from then each is judged by its
+    // own verdict, not the provisional one.
+    sim.run("every far pair configured", Sim::every_far_pair_configured);
+    no_live_member_condemned(&sim, "once every far pair configured");
+    for (me, member) in sim.live() {
+        for (peer, _) in sim
+            .live()
+            .filter(|(peer, _)| sim.shape.crosses(me.0, peer.0))
+        {
+            let verdict = member.detector.verdict(host(peer));
+            assert!(
+                member.provisional.contains(&host(peer).0),
+                "member {me:?} judged far peer {peer:?} provisionally before its own estimator configured"
+            );
+            assert!(
+                verdict.is_some_and(|verdict| !is_provisional(&verdict)),
+                "member {me:?} judges configured far peer {peer:?} by its own verdict: {verdict:?}"
+            );
+        }
+    }
+    Ok(sim.world.finish())
+}
+
+/// No member has condemned a live one by its own probes, and none holds a live one dead.
+fn no_live_member_condemned(sim: &Sim, when: &str) {
+    let condemned = condemned_live(sim);
+    assert!(
+        condemned.is_empty(),
+        "{when}: live members condemned (member, condemned, count): {condemned:?}"
+    );
+    for (me, member) in sim.live() {
+        assert!(
+            member.deaths.is_empty(),
+            "{when}: member {me:?} holds a live member dead"
+        );
+    }
+}
+
+/// slates' repro (`no_live_member_is_condemned_across_a_lossless_far_link`), deterministic: every
+/// named seed condemns no live member, and every far pair moves from provisional judgement to its
+/// own verdict. Each seed through the run-twice check.
+#[test]
+fn no_live_member_is_condemned_across_a_lossless_far_link() {
+    for seed in FAR_SEEDS.chain(STALE_POOL_SEEDS.iter().copied()) {
+        twice(seed, far_link).unwrap_or_else(|refusal| panic!("seed {seed}: {refusal}"));
+    }
+}
+
+/// Two near members and one far one, the far one killed from the start: neither survivor ever
+/// measures it, so neither pair has its own verdict, and each is judged provisionally. Every
+/// survivor holds it dead, by its own probes, within the bound its detector stated, counted from
+/// the kill: a member that never answered has no last answer to count from.
+fn all_far_kill(source: Source) -> Result<Record, SimError> {
+    let mut sim = Sim::new(source, false, ALL_FAR);
+    let victim = NodeId(2);
+    let killed_at: Vec<(NodeId, u64)> = sim
+        .live()
+        .filter(|(me, _)| *me != victim)
+        .map(|(me, _)| (me, sim.world.monotonic(me).unwrap()))
+        .collect();
+    sim.kill(victim);
+    sim.run("the far member held dead by every survivor", |sim| {
+        sim.held_dead(victim)
+    });
+    for (me, killed) in killed_at {
+        let member = &sim.members[me.0 as usize];
+        let death = member.deaths[&host(victim).0];
+        let within = death
+            .within
+            .unwrap_or_else(|| panic!("member {me:?} stated no bound"));
+        let after = Duration::from_nanos(death.at_ns - killed);
+        assert!(
+            after <= within,
+            "member {me:?} held the far member dead {after:?} after the kill, past its stated bound {within:?}"
+        );
+        assert!(
+            member.provisional.contains(&host(victim).0),
+            "member {me:?} judged the never-measured far member provisionally"
+        );
+        assert!(
+            member
+                .detector
+                .report(host(victim))
+                .is_some_and(|report| report.condemnations > 0)
+                || sim.live().any(|(other, held)| other != me
+                    && held
+                        .detector
+                        .report(host(victim))
+                        .is_some_and(|report| report.condemnations > 0)),
+            "a survivor's own probes condemned the far member"
+        );
+    }
+    let condemned = condemned_live(&sim);
+    assert!(
+        condemned.is_empty(),
+        "live members condemned: {condemned:?}"
+    );
+    Ok(sim.world.finish())
+}
+
+/// The hyper-raft review's liveness case for `swim-pair-deadline`: a member that dies before any far
+/// pair configures, with every survivor far from it, is still condemned within its stated bound.
+/// Before the provisional verdict, a misfit pair's probes judged nothing and it was never held dead.
+#[test]
+fn a_far_member_killed_before_any_far_pair_configures_is_held_dead_by_every_survivor() {
+    for seed in FAR_SEEDS {
+        twice(seed, all_far_kill).unwrap_or_else(|refusal| panic!("seed {seed}: {refusal}"));
+    }
+}
+
+/// One far-link record run: false condemnations in [`WATCHED_NS`], then a far member killed and how
+/// long until every survivor held it dead (`None` if it never was within the step budget), then the
+/// steps the run took. Asserts nothing, so the same run measures a detector without the fix.
+fn far_link_record(seed: u64) -> (u64, Option<Duration>, u64) {
+    let mut sim = Sim::new(Source::Seed(seed), false, FAR_LINK);
+    let watched = sim.run_until(|sim| sim.now() >= WATCHED_NS);
+    let false_condemnations = condemned_live(&sim)
+        .iter()
+        .map(|(_, _, count)| *count)
+        .sum::<u64>();
+    let victim = NodeId(FAR_LINK.nodes - 1);
+    let killed = sim.now();
+    sim.kill(victim);
+    let detected = watched
+        .and_then(|()| sim.run_until(|sim| sim.held_dead(victim)))
+        .ok()
+        .map(|()| Duration::from_nanos(sim.now() - killed));
+    (false_condemnations, detected, sim.world.steps())
+}
+
+/// One all-far record run: the far member killed from the start, and how long until both survivors
+/// held it dead (`None` if never within the step budget), with the steps taken.
+fn all_far_record(seed: u64) -> (Option<Duration>, u64) {
+    let mut sim = Sim::new(Source::Seed(seed), false, ALL_FAR);
+    let victim = NodeId(2);
+    sim.kill(victim);
+    let detected = sim
+        .run_until(|sim| sim.held_dead(victim))
+        .ok()
+        .map(|()| Duration::from_nanos(sim.now()));
+    (detected, sim.world.steps())
+}
+
+/// One far-link run until every far pair's own estimator configured: when, or `None` within the
+/// step budget, and the steps taken.
+fn configured_record(seed: u64) -> (Option<Duration>, u64) {
+    let mut sim = Sim::new(Source::Seed(seed), false, FAR_LINK);
+    let configured = sim
+        .run_until(|sim| sim.now() >= WATCHED_NS && sim.every_far_pair_configured())
+        .ok()
+        .map(|()| Duration::from_nanos(sim.now()));
+    (configured, sim.world.steps())
+}
+
+/// Prints the far-link and all-far records `docs/benchmarks.md` cites, per seed: false
+/// condemnations a minute in the watched 30 s, a killed far member's detection time, the all-far
+/// detection time, and the steps each run took (`FAR_STEPS_TAKEN`). Run on demand:
+/// `cargo test -p hyper-swim --test sim --release -- --ignored --nocapture record_far_link`.
+#[test]
+#[ignore = "a record run for docs/benchmarks.md, printed, not checked"]
+fn record_far_link() {
+    let minutes = WATCHED_NS as f64 / 60e9;
+    println!(
+        "| seed | false condemnations / min | far kill detected | all-far detected | far pairs configured | steps |"
+    );
+    println!("|---|---|---|---|---|---|");
+    for seed in FAR_SEEDS.chain(STALE_POOL_SEEDS.iter().copied()) {
+        let (condemned, detected, steps) = far_link_record(seed);
+        let (all_far, all_far_steps) = all_far_record(seed);
+        let (configured, configured_steps) = configured_record(seed);
+        println!(
+            "| {seed} | {:.1} | {} | {} | {} | {} |",
+            condemned as f64 / minutes,
+            detected.map_or("never".to_owned(), |at| format!("{at:.2?}")),
+            all_far.map_or("never".to_owned(), |at| format!("{at:.2?}")),
+            configured.map_or("never".to_owned(), |at| format!("{at:.2?}")),
+            steps.max(all_far_steps).max(configured_steps)
+        );
+    }
 }

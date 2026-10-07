@@ -901,11 +901,13 @@ impl<F: BlockFile + 'static> Log<F> {
             &self.inbox,
             &self.p,
             group,
-            class,
             update,
-            wait,
-            waker,
-            hears,
+            Sending {
+                class,
+                wait,
+                waker,
+                hears,
+            },
         )
     }
 
@@ -1142,17 +1144,28 @@ impl<F: BlockFile + 'static> Drop for Log<F> {
 }
 
 /// Submits `update` for `group` to the log's owner (`Log::send`).
-#[allow(clippy::too_many_arguments)]
+/// How a submission is sent: its class, whether the sender waits for room in the queue, the waker
+/// its answer wakes, and what the sender hears.
+struct Sending {
+    class: Class,
+    wait: bool,
+    waker: Option<Waker>,
+    hears: Hears,
+}
+
 fn send<F: BlockFile + 'static>(
     inbox: &SyncSender<Message<F>>,
     p: &Params,
     group: u128,
-    class: Class,
     update: Update,
-    wait: bool,
-    waker: Option<Waker>,
-    hears: Hears,
+    how: Sending,
 ) -> Result<Pending, LogError> {
+    let Sending {
+        class,
+        wait,
+        waker,
+        hears,
+    } = how;
     // Refused before it holds any room: no frame could take it, and every admitted
     // submission fits the byte bound alone, so none waits for a queue that cannot hold it.
     let len = writer::submission_len(group, &update, Marks::default(), p.tag)
@@ -1298,11 +1311,13 @@ impl<F: BlockFile + 'static> LogOpener<F> {
             &self.inbox,
             &self.p,
             group,
-            Class::Normal,
             update,
-            true,
-            None,
-            Hears::Waits,
+            Sending {
+                class: Class::Normal,
+                wait: true,
+                waker: None,
+                hears: Hears::Waits,
+            },
         )?
         .wait()
     }

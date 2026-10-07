@@ -193,6 +193,55 @@ impl Verdict {
     }
 }
 
+/// Whether the pool's verdict, whose span is `pooled_span`, does not fit `peer`: an answer of its
+/// came back past that span or after its probe's record was reused (`Peer::pool_misfit`), or the
+/// handshake that keyed it measured a round trip longer than the span. One rule for the probe's
+/// verdict and its wait.
+fn misfits_pool(peer: &Peer, pooled_span: Option<u64>) -> bool {
+    peer.pool_misfit
+        || peer
+            .handshake_rtt_ns
+            .zip(pooled_span)
+            .is_some_and(|(rtt, span)| rtt > span)
+}
+
+/// The verdict that judges a probe of `peer`, given the pool's: the pair's own once its estimator
+/// configures; before that, for a pair the pool does not fit ([`misfits_pool`]), the provisional
+/// [`misfit_verdict`] from its measured round trip (none, measurement only, before any is
+/// measured); otherwise the pool's. With it, whether the verdict is the provisional one. The one
+/// rule [`Detector::verdict`] reports and a probe is judged by.
+fn judging(peer: &Peer, pooled: Option<Verdict>) -> (Option<Verdict>, bool) {
+    if let Some(own) = peer.stream.verdict {
+        return (Some(own), false);
+    }
+    if misfits_pool(peer, pooled.map(|verdict| verdict.span_ns())) {
+        let provisional = pooled
+            .zip(peer.path_rtt_ns)
+            .map(|(pooled, rtt)| misfit_verdict(pooled, rtt));
+        return (provisional, true);
+    }
+    (pooled, false)
+}
+
+/// The verdict a pair the pool does not fit is judged by until its own estimator configures: its
+/// own latest round trip `R` as the expected arrival, and the margin RFC 6298 §2.2 gives a path
+/// with one measured round trip — `RTTVAR = R/2`, `RTO = SRTT + 4·RTTVAR = 3R`, so `α = 2R` —
+/// or the pool's margin where that is wider. The pool's measured loss sizes the relays as before.
+/// It promises no bound (`mistake` 1): Theorem 7's bound needs the pair's own variance, which
+/// it has not measured. Without a judged deadline, a pair whose peer died before answering once
+/// was measured for ever and never condemned it (hyper-raft review of `swim-pair-deadline`,
+/// 2026-10-07: a far member killed with every survivor far from it was never held dead).
+fn misfit_verdict(pooled: Verdict, path_rtt_ns: u64) -> Verdict {
+    let round_trip = Duration::from_nanos(path_rtt_ns);
+    Verdict {
+        round_trip,
+        margin: round_trip.saturating_mul(2).max(pooled.margin),
+        interval: pooled.interval,
+        loss: pooled.loss,
+        mistake: 1.0,
+    }
+}
+
 /// What a member has done and promised about one peer, for its owner and its tests.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct PeerReport {
@@ -346,6 +395,10 @@ struct Peer {
     /// the peer's session ([`Detector::join_measured`]): the first wait for its probes before this
     /// member measured any round trip.
     handshake_rtt_ns: Option<u64>,
+    /// The pair's latest measured round trip: its latest answered probe's, however late, else its
+    /// handshake's. What a misfit pair is judged by until its own estimator configures
+    /// ([`misfit_verdict`]).
+    path_rtt_ns: Option<u64>,
 }
 
 impl Peer {
@@ -363,6 +416,7 @@ impl Peer {
             misfit_misses: 0,
             report: PeerReport::default(),
             handshake_rtt_ns: None,
+            path_rtt_ns: None,
         }
     }
 
@@ -411,6 +465,12 @@ struct Probe {
     /// ([`Detector::measurement_wait`]): where its period ends, answered or not, judging nothing;
     /// its wake measures the member's timer.
     expected: u64,
+    /// Whether the verdict is a misfit pair's provisional one ([`misfit_verdict`]): judged if it goes
+    /// unanswered, but its period ends at its answer as a measurement probe's does. Waiting out the
+    /// provisional deadline on an answered probe stretched the member's periods past the interval its
+    /// pairs' estimators were built at, and pairs near and far stopped configuring (33 of 40 seeds,
+    /// 2026-10-07).
+    provisional: bool,
 }
 
 impl Probe {
@@ -765,7 +825,7 @@ impl Detector {
             return (!probe.answered).then_some(probe.expected);
         }
         if probe.answered {
-            return probe.due_ns();
+            return (!probe.provisional).then(|| probe.due_ns()).flatten();
         }
         probe.indirect_until.or_else(|| probe.due_ns())
     }
@@ -785,6 +845,8 @@ impl Detector {
                 Stage::Wait
             }
             (false, None, _) => Stage::Over,
+            // A provisional verdict's answered probe ends its period at the answer, as a measurement's.
+            (true, Some(_), _) if probe.provisional => Stage::Over,
             (true, Some(due), _) | (false, Some(due), None) if now_ns < due => Stage::Wait,
             (true, Some(_), _) => Stage::Over,
             (false, Some(_), None) => Stage::Indirect,
@@ -817,22 +879,13 @@ impl Detector {
         // long the pair's handshake had measured its path (a near member condemned by a far one in 5
         // of 40 seeds, 2026-10-07).
         let pooled = self.pooled();
-        let pooled_span = pooled.map(|verdict| verdict.span_ns());
         // The handshake that keyed the pair already measured its path: a round trip longer than the
-        // pool's deadline is the same evidence a late answer gives, known before the first probe.
-        let (own, misfit) = self.peers.get(&target).map_or((None, false), |peer| {
-            let handshake_misfit = peer
-                .handshake_rtt_ns
-                .zip(pooled_span)
-                .is_some_and(|(rtt, span)| rtt > span);
-            (peer.stream.verdict, peer.pool_misfit || handshake_misfit)
-        });
-        let verdict = match own {
-            Some(own) => Some(own),
-            // A pair the pool's verdict does not fit is measured, not judged, until it has its own.
-            None if misfit => None,
-            None => pooled,
-        };
+        // pool's deadline is the same evidence a late answer gives, known before the first probe
+        // ([`misfits_pool`]).
+        let (verdict, provisional) = self
+            .peers
+            .get(&target)
+            .map_or((pooled, false), |peer| judging(peer, pooled));
         let peer = self.peers.entry(target).or_insert_with(Peer::new);
         let seq = peer.sent;
         peer.sent = peer.sent.saturating_add(1);
@@ -850,6 +903,7 @@ impl Detector {
             verdict,
             indirect_until: None,
             expected: now_ns.saturating_add(self.probe_wait(target)),
+            provisional,
         };
         self.probe = Some(probe);
         self.heard_other = false;
@@ -1099,25 +1153,14 @@ impl Detector {
         Some(Duration::from_nanos(period.saturating_mul(periods)))
     }
 
-    /// How long a measurement period waits past its probe: the latest round trip, doubled for each
-    /// measurement period since that ended unanswered, as a retransmission timer backs off (RFC 6298
-    /// §5.5), up to [`MEASUREMENT_WAIT_CAP_NS`]. An answer is measured only while its probe is
-    /// outstanding, the latest three of its peer's; when round trips lengthen past that, periods at
-    /// the latest round trip's pace see every answer come for a probe written over, measure none,
-    /// and never lengthen. A measured round trip ends the backing off.
     /// How long a measurement probe of `target` waits for its answer: the member's backed-off wait,
-    /// or, for a pair the pool does not fit, that pair's own backoff from the same base.
+    /// or, for a pair the pool does not fit ([`misfits_pool`]), that pair's own backoff from the same
+    /// base.
     fn probe_wait(&self, target: HostId) -> u64 {
         let base = self.wait_base(target);
         let pooled_span = self.pool.verdict.map(|verdict| verdict.span_ns());
         match self.peers.get(&target) {
-            Some(peer)
-                if peer.pool_misfit
-                    || peer
-                        .handshake_rtt_ns
-                        .zip(pooled_span)
-                        .is_some_and(|(rtt, span)| rtt > span) =>
-            {
+            Some(peer) if misfits_pool(peer, pooled_span) => {
                 let factor = 1u64.checked_shl(peer.misfit_misses).unwrap_or(u64::MAX);
                 base.saturating_mul(factor).min(MEASUREMENT_WAIT_CAP_NS)
             }
@@ -1125,6 +1168,12 @@ impl Detector {
         }
     }
 
+    /// How long a measurement period waits past its probe: the latest round trip, doubled for each
+    /// measurement period since that ended unanswered, as a retransmission timer backs off (RFC 6298
+    /// §5.5), up to [`MEASUREMENT_WAIT_CAP_NS`]. An answer is measured only while its probe is
+    /// outstanding, the latest three of its peer's; when round trips lengthen past that, periods at
+    /// the latest round trip's pace see every answer come for a probe written over, measure none,
+    /// and never lengthen. A measured round trip ends the backing off.
     fn measurement_wait(&self, rtt_ns: u64) -> u64 {
         let factor = 1u64
             .checked_shl(self.measurement_misses)
@@ -1265,6 +1314,7 @@ impl Detector {
             return;
         };
         let rtt = at_ns.saturating_sub(sent.at_ns);
+        peer.path_rtt_ns = Some(rtt);
         if peer.stream.verdict.is_none() && pooled_span.is_some_and(|span| rtt > span) {
             peer.pool_misfit = true;
         }
@@ -1389,12 +1439,14 @@ impl Detector {
         self.peers.get(&peer).map(|held| held.stream.samples)
     }
 
-    /// The verdict that times this member's probes of `peer` now: the pair's, else the pool's.
+    /// The verdict that times this member's probes of `peer` now: the pair's own; before it has one,
+    /// a pair the pool does not fit is judged provisionally ([`misfit_verdict`], `mistake` 1), else
+    /// by the pool's.
     pub fn verdict(&self, peer: HostId) -> Option<Verdict> {
-        self.peers
-            .get(&peer)
-            .and_then(|held| held.stream.verdict)
-            .or(self.pool.verdict)
+        match self.peers.get(&peer) {
+            Some(held) => judging(held, self.pool.verdict).0,
+            None => self.pool.verdict,
+        }
     }
 
     /// The mean of this member's periods, once one has ended.
@@ -1801,6 +1853,7 @@ impl Detector {
             && rtt > 0
         {
             held.handshake_rtt_ns = Some(rtt);
+            held.path_rtt_ns = held.path_rtt_ns.or(Some(rtt));
         }
         Ok(())
     }

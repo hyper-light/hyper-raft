@@ -265,6 +265,10 @@ fn point(
     latencies.sort_unstable();
     let appends = latencies.len() as f64;
     let (frames, updates) = log.flushed();
+    // Device flushes an append, confirmations among them: an entry nothing follows (one replica,
+    // a node at rest) is confirmed by a flush of its own (docs/benchmarks.md, "Flushes").
+    let flushes = log.stats(None).unwrap().flushes;
+    let flushes_per_append = flushes as f64 / appends.max(1.0);
     let per_flush = if frames == 0 {
         0.0
     } else {
@@ -289,7 +293,7 @@ fn point(
         |nj| format!("{:.2} µJ", nj as f64 / 1e3 / appends.max(1.0)),
     );
     println!(
-        "  {:<19} {:>9} {:>8} {:>9} {:>11.0} {:>9.1} MiB/s {:>10} {:>10} {:>10} {:>11.1} {:>12} {:>10} {:>8} in {}",
+        "  {:<19} {:>9} {:>8} {:>9} {:>11.0} {:>9.1} MiB/s {:>10} {:>10} {:>10} {:>11.1} {:>11.2} {:>12} {:>10} {:>8} in {}",
         format!("{} {size}", if sealed { "sealed" } else { "plain" }),
         count,
         peak.load(Ordering::Relaxed),
@@ -300,6 +304,7 @@ fn point(
         nanos(percentile(&latencies, 0.99)),
         nanos(percentile(&latencies, 0.999)),
         per_flush,
+        flushes_per_append,
         per_append,
         nanos(reopen.as_nanos() as u64),
         read,
@@ -334,7 +339,7 @@ fn main() {
     println!("{}", dir.display());
     println!("hyper-log in a scratch file (removed afterwards), one entry an append");
     println!(
-        "  {:<19} {:>9} {:>8} {:>9} {:>11} {:>15} {:>10} {:>10} {:>10} {:>11} {:>12} {:>10} {:>20}",
+        "  {:<19} {:>9} {:>8} {:>9} {:>11} {:>15} {:>10} {:>10} {:>10} {:>11} {:>11} {:>12} {:>10} {:>20}",
         "",
         "replicas",
         "threads",
@@ -345,6 +350,7 @@ fn main() {
         "p99",
         "p99.9",
         "per flush",
+        "flush/app",
         "energy",
         "reopen",
         "read back"

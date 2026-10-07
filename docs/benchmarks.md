@@ -7150,3 +7150,33 @@ registered, and the spin polls it once a quantum (docs/runtime.md §3.4). The sp
 calibrated window (4.55 µs) was shorter than the host's scheduling noise at that load. The parked round
 trip is two kernel wakes, 4.4–4.5 µs. The spinning row's p99 depends on the load: 0.79 µs in one run and
 29.29 µs in the other.
+
+## hyper-block: a batch of reads through the issuer (2026-10-07)
+
+`cargo bench -p hyper-block --bench reads` (`crates/hyper-block/benches/reads.rs`). Each operation reads
+four 4 KiB pages at pseudo-random offsets of a 256 MiB file. Four is the fan-out of a mantle engine
+seek, measured at about 4.5 pages per seek at 10M keys. **sequential** reads the pages one
+`read_exact_at` after another on the calling thread. **batched** hands them to an issuer of four
+workers as one batch (`Attached::submit_reads`) and waits for its answer. The **direct** rows open
+the file for direct I/O (`F_NOCACHE` here), so each read reaches the device. The **cached** rows read
+the whole file once first, so each read hits the page cache. Each row is 2,995 operations after as
+many unmeasured: Wilks' least sample for a one-sided 95 % bound on the p99.9 [WILKS]. Allocator calls
+are counted across the process and page faults from the OS.
+
+Apple M5 Max, macOS 26.4.1, internal SSD, release build. One-minute load 8.2–8.5.
+
+| Row | p50 µs | p99 µs | max (p99.9 bound) µs | allocations / op | faults / op |
+|---|---|---|---|---|---|
+| direct, sequential | 298.17 | 381.58 | 7,102.33 | 0 | 0 |
+| direct, batched | 148.38 | 216.33 | 587.75 | 3 | 0 |
+| cached, sequential | 2.71 | 4.50 | 18.21 | 0 | 0 |
+| cached, batched | 43.21 | 99.50 | 133.71 | 3 | 0 |
+
+A batch halves a seek's device reads, because the device serves four at once where one after another
+waits for each. It costs sixteen times as much when the pages are cached. A cached read is a memory
+copy of about 0.7 µs, while the batch crosses threads: the submitter wakes the issuer's thread, that
+thread wakes four workers, each worker wakes it back, and it wakes the submitter. These are blocking
+channel hand-offs, each a kernel wake under load. So a consumer batches only reads it expects the
+device to serve (a page its own cache lacks, on a file opened for direct I/O), and reads cached pages
+in place. The three allocations per operation are the batch's vector, the issuer's buffer slots and
+the answer's vector.

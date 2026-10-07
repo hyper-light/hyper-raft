@@ -27,6 +27,12 @@ windows-sys.workspace = true
 [dev-dependencies]
 proptest.workspace = true
 tempfile.workspace = true
+# The reads bench counts allocator calls and page faults (benches/reads.rs).
+hyper-measure = { path = "../hyper-measure" }
 
 [lints]
 workspace = true
+
+[[bench]]
+name = "reads"
+harness = false

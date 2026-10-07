@@ -619,7 +619,7 @@ The rule:
   - the handshake that keyed its session measured a round trip longer than that span (`join_measured`).
 - The pool is configured, if due, **before** the handshake is compared with it. Comparing first read no verdict on the probe that configured the pool, and that probe was judged by the pool; on slates' harness a near member was condemned in 5 of 40 runs.
 - A misfit pair is never judged by the pool. Until its own estimator configures it is judged **provisionally** (`misfit_verdict`):
-  - **Expected arrival `μ = R`**, the pair's own latest measured round trip: its latest answer however late, else its handshake's.
+  - **Expected arrival `μ = R`**, the pair's own latest measured round trip: its latest answer however late, else its handshake's. An answer that finds its probe's record reused gives one too. Each peer keeps the latest record a later probe wrote over while it was unanswered (`Peer::reused`): an answer to it is timed exactly, and an answer to an earlier probe, sent before it since nonces only increase, has at least that record's age, a lower bound. Without it, a pair made misfit by such an answer, with no handshake round trip, had no `R`, stayed measurement only, and a member that then died was never condemned by it (`a_far_peer_that_answers_only_after_its_records_are_reused_and_dies_is_condemned`, failing first: alive after 600 s simulated).
   - **Margin `α = max(2R, α_pool)`.** RFC 6298 §2.2's rule for a path with one measured round trip `R` sets `SRTT = R` and `RTTVAR = R/2`, so `RTO = SRTT + 4·RTTVAR = 3R`, and the margin is `3R − R = 2R`. The pool's margin is kept where it is wider: the host's own stalls (§2.6) are in every pair's round trip, near or far.
   - **Interval `η` and loss `p`** are the pool's. The pair is probed at the member's rounds like any other, and the loss sizes the relays an unanswered probe asks.
 - Before any round trip of the pair is measured, which needs a handshake that measured none and no answer yet, its probes are measurement only, as before.
@@ -656,7 +656,11 @@ The per-seed rows are in `docs/benchmarks.md`. On `756bfaa` the all-far kill is 
 because the far pair is judged by the near pool's 2 ms deadline: the same deadline condemns live far
 members, and the detection overran the bound the detector stated.
 
-Open: until a far pair configures, the far member's own detection of it runs at the provisional
+Open: a far peer joined with no handshake round trip has no evidence of its distance until its first
+answer returns. If the pool configures first, the pool judges it, and a live far member can be
+suspected (40 ms answers before the pool's 100 ms: judged provisionally; 200 ms answers after it:
+suspected at 132 ms in the same unit-test driver). Joining with the handshake's round trip, as slates
+does, closes it. Also: until a far pair configures, the far member's own detection of it runs at the provisional
 `3R` deadline, so a far member's death is held a few hundred milliseconds to seconds later than a
 configured pair would hold it; and configuration itself is paced by the far pairs' one sample a
 round, minutes on this topology.

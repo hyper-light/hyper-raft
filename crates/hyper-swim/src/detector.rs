@@ -399,6 +399,10 @@ struct Peer {
     /// handshake's. What a misfit pair is judged by until its own estimator configures
     /// ([`misfit_verdict`]).
     path_rtt_ns: Option<u64>,
+    /// The latest probe whose record a later probe wrote over while it was still unanswered: an
+    /// answer that finds no record is for it or for one sent before it, so its round trip is known
+    /// exactly or bounded below ([`Peer::reused_round_trip`]).
+    reused: Option<Sent>,
 }
 
 impl Peer {
@@ -417,6 +421,7 @@ impl Peer {
             report: PeerReport::default(),
             handshake_rtt_ns: None,
             path_rtt_ns: None,
+            reused: None,
         }
     }
 
@@ -428,13 +433,43 @@ impl Peer {
             .and_then(Option::take)
     }
 
-    /// Records a probe sent, over the oldest still outstanding.
+    /// Records a probe sent, over the oldest still outstanding; that one, if still unanswered, is
+    /// kept as the latest reused record.
     fn send(&mut self, sent: Sent) {
         let slots = u64::try_from(OUTSTANDING).unwrap_or(1);
         let at = usize::try_from(sent.seq.checked_rem(slots).unwrap_or(0)).unwrap_or(0);
-        if let Some(slot) = self.outstanding.get_mut(at) {
-            *slot = Some(sent);
+        if let Some(slot) = self.outstanding.get_mut(at)
+            && let Some(written_over) = slot.replace(sent)
+        {
+            self.reused = Some(written_over);
         }
+    }
+
+    /// An answer to `nonce` at `at_ns` whose probe's record later probes already reused: it came back
+    /// long after the pool would have judged it, so the pool does not fit this pair. Its round trip,
+    /// exact or a lower bound ([`Peer::reused_round_trip`]), is the pair's path until one is
+    /// measured, so a misfit pair with no handshake round trip is still judged provisionally
+    /// ([`misfit_verdict`]); without it, such a pair whose member then died was measured for ever and
+    /// never condemned.
+    fn answered_unrecorded(&mut self, nonce: u64, at_ns: u64) {
+        if self.stream.verdict.is_some() {
+            return;
+        }
+        self.pool_misfit = true;
+        if let Some(round_trip) = self.reused_round_trip(nonce, at_ns) {
+            self.path_rtt_ns = Some(
+                self.path_rtt_ns
+                    .map_or(round_trip, |path| path.max(round_trip)),
+            );
+        }
+    }
+
+    /// The round trip of an answer to `nonce` at `at_ns` that found no record: exact when it answers
+    /// the latest reused record; a lower bound when it answers an earlier one, which was sent before
+    /// that record (nonces only increase); `None` for a nonce after it, which no reuse explains.
+    fn reused_round_trip(&self, nonce: u64, at_ns: u64) -> Option<u64> {
+        let reused = self.reused?;
+        (nonce <= reused.nonce).then(|| at_ns.saturating_sub(reused.at_ns))
     }
 
     fn clear_pending(&mut self) {
@@ -1306,11 +1341,7 @@ impl Detector {
         peer.last_answer_ns = Some(peer.last_answer_ns.map_or(at_ns, |last| last.max(at_ns)));
         let pooled_span = self.pool.verdict.map(|verdict| verdict.span_ns());
         let Some(sent) = peer.take(nonce) else {
-            // An answer whose probe's record later probes already reused came back long after the
-            // pool would have judged it: the pool does not fit this pair.
-            if peer.stream.verdict.is_none() {
-                peer.pool_misfit = true;
-            }
+            peer.answered_unrecorded(nonce, at_ns);
             return;
         };
         let rtt = at_ns.saturating_sub(sent.at_ns);
@@ -2604,6 +2635,96 @@ mod tests {
         for peer in [B, C] {
             assert_eq!(liveness(&detector, peer), Liveness::Alive);
         }
+    }
+
+    /// A far peer, joined with no handshake round trip, whose first answers all come after their
+    /// probes' records were reused (the member's near peers answer in 1 ms, so it probes the far one
+    /// three more times before a 40 ms answer comes back), and which dies before any answer of its is
+    /// measured. Do: measure the near peers, join the far one, drive the member until such a reused
+    /// answer has marked the pair misfit with no
+    /// measured answer of the far peer's, then kill the far peer. Expect: it is held dead. Before the
+    /// reused record's age was taken as the path's round trip, the pair had none, so it was never
+    /// judged provisionally and the dead member was measured for ever (the hyper-raft owner's review
+    /// of `swim-pair-deadline`, 2026-10-07).
+    #[test]
+    fn a_far_peer_that_answers_only_after_its_records_are_reused_and_dies_is_condemned() {
+        const F: HostId = HostId(5);
+        // Far enough that three more probes of it go out before its answer returns (the near peers
+        // answer in 1 ms), near enough that the answer returns before the pool configures: so its
+        // first answers find their records reused while nothing yet judges the pair.
+        const FAR_RTT: u64 = 40 * MS;
+        const HORIZON: u64 = 600_000 * MS;
+        // The near peers are measured first, as in a running cluster the far member then joins.
+        let mut detector = detector(&[A, B, C]);
+        let mut world = World::new();
+        let mut warm = 0x2545_F491_4F6C_DD1D;
+        world.run(&mut detector, 12, |_| Some(jitter(&mut warm)));
+        detector.join(F).unwrap();
+        let mut requests = Vec::new();
+        let mut pending: Vec<(HostId, u64, u64)> = Vec::new();
+        let mut state = 0x9E37_79B9_7F4A_7C15;
+        let mut now = world.now;
+        let (mut far_alive, mut far_measured, mut killed) = (true, false, false);
+        while now < HORIZON && !(killed && liveness(&detector, F) == Liveness::Dead) {
+            if let Some(ping) = detector.poll(now, &mut requests) {
+                let rtt = if ping.to == F {
+                    far_alive.then_some(FAR_RTT)
+                } else {
+                    Some(jitter(&mut state))
+                };
+                if let Some(rtt) = rtt {
+                    pending.push((ping.to, ping.nonce, now + rtt));
+                }
+            }
+            let ack = pending.iter().map(|(_, _, at)| *at).min();
+            now = match (detector.wake().map(|wake| wake + MS / 10), ack) {
+                (Some(wake), Some(at)) => wake.min(at).max(now),
+                (Some(wake), None) => wake.max(now),
+                (None, Some(at)) => at.max(now),
+                (None, None) => {
+                    detector.on_ping(A);
+                    now + MS
+                }
+            };
+            pending.sort_by_key(|(_, _, at)| *at);
+            let due: Vec<(HostId, u64, u64)> = pending
+                .iter()
+                .copied()
+                .filter(|(_, _, at)| *at <= now)
+                .collect();
+            pending.retain(|(_, _, at)| *at > now);
+            for (from, nonce, at) in due {
+                if from != F {
+                    detector.on_ack(from, nonce, at);
+                    continue;
+                }
+                if !far_alive {
+                    continue;
+                }
+                let outstanding = detector.peers.get(&F).is_some_and(|peer| {
+                    peer.outstanding
+                        .iter()
+                        .flatten()
+                        .any(|sent| sent.nonce == nonce)
+                });
+                far_measured |= outstanding;
+                detector.on_ack(from, nonce, at);
+                let misfit = detector.peers.get(&F).is_some_and(|peer| peer.pool_misfit);
+                if !outstanding && !far_measured && misfit {
+                    killed = true;
+                    far_alive = false;
+                }
+            }
+        }
+        assert!(
+            killed,
+            "the far pair was made misfit by a reused record's answer before any was measured"
+        );
+        assert_eq!(
+            liveness(&detector, F),
+            Liveness::Dead,
+            "the far peer, dead, is held dead"
+        );
     }
 
     #[test]

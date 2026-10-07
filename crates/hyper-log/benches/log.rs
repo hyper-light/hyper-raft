@@ -272,6 +272,7 @@ fn point(
     let stats = log.stats(None).unwrap();
     let flushes_per_append = stats.flushes as f64 / appends.max(1.0);
     let durable_per_append = stats.durable_writes as f64 / appends.max(1.0);
+    let fallback_per_append = stats.durable_fallbacks as f64 / appends.max(1.0);
     // The flushes the device itself completed, the log's and anything else on it, an append.
     let device = match (device_before, device_flushes(scratch.path())) {
         (Some((before, _)), Some((after, fua))) => format!(
@@ -305,7 +306,7 @@ fn point(
         |nj| format!("{:.2} µJ", nj as f64 / 1e3 / appends.max(1.0)),
     );
     println!(
-        "  {:<19} {:>9} {:>8} {:>9} {:>11.0} {:>9.1} MiB/s {:>10} {:>10} {:>10} {:>11.1} {:>11.2} {:>11.2} {:>12} {:>12} {:>10} {:>8} in {}",
+        "  {:<19} {:>9} {:>8} {:>9} {:>11.0} {:>9.1} MiB/s {:>10} {:>10} {:>10} {:>11.1} {:>11.2} {:>11.2} {:>11.2} {:>12} {:>12} {:>10} {:>8} in {}",
         format!("{} {size}", if sealed { "sealed" } else { "plain" }),
         count,
         peak.load(Ordering::Relaxed),
@@ -318,6 +319,7 @@ fn point(
         per_flush,
         flushes_per_append,
         durable_per_append,
+        fallback_per_append,
         device,
         per_append,
         nanos(reopen.as_nanos() as u64),
@@ -388,7 +390,7 @@ fn main() {
     println!("{}", dir.display());
     println!("hyper-log in a scratch file (removed afterwards), one entry an append");
     println!(
-        "  {:<19} {:>9} {:>8} {:>9} {:>11} {:>15} {:>10} {:>10} {:>10} {:>11} {:>11} {:>11} {:>12} {:>12} {:>10} {:>20}",
+        "  {:<19} {:>9} {:>8} {:>9} {:>11} {:>15} {:>10} {:>10} {:>10} {:>11} {:>11} {:>11} {:>11} {:>12} {:>12} {:>10} {:>20}",
         "",
         "replicas",
         "threads",
@@ -401,6 +403,7 @@ fn main() {
         "per flush",
         "flush/app",
         "durable/app",
+        "fallbk/app",
         "dev flush/app",
         "energy",
         "reopen",

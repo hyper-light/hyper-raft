@@ -551,6 +551,7 @@ impl<F: BlockFile> Device<F> {
             bytes,
             flushed_at: None,
             durable_write: false,
+            durable_fallback: false,
         };
         if wrote.is_err() {
             return (wrote, timing);
@@ -577,6 +578,7 @@ impl<F: BlockFile> Device<F> {
             bytes: 0,
             flushed_at: None,
             durable_write: false,
+            durable_fallback: false,
         };
         let written = guarded(|| {
             let bytes = buf.padded().map_err(|e| LogError::Disk(e.into()))?;
@@ -595,6 +597,7 @@ impl<F: BlockFile> Device<F> {
             }
             Ok(hyper_block::block::Durable::Flushed) => {
                 timing.flush_ns = Some(timing.took_ns);
+                timing.durable_fallback = true;
                 Ok(())
             }
             Err(e) => Err(e),

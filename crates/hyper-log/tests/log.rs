@@ -624,6 +624,7 @@ fn the_statistics_count_each_frame_flush_byte_and_wait() {
     // on its own: one flush and one durable write a frame, no second flush.
     assert_eq!(after.flushes - before.flushes, n);
     assert_eq!(after.durable_writes - before.durable_writes, n);
+    assert_eq!(after.durable_fallbacks - before.durable_fallbacks, 0);
     assert_eq!(
         after.bytes - before.bytes,
         (writes_after - writes) * BLOCK as u64

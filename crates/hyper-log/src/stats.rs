@@ -42,6 +42,11 @@ pub struct LogStats {
     /// confirmation, written with `RWF_DSYNC` on a direct file on Linux (a FUA write where the
     /// device has FUA). Where the write falls back to a write and a flush, it counts in `flushes`.
     pub durable_writes: u64,
+    /// Durable writes the file made with a write and a flush of its cache instead: on a file that
+    /// is not direct, off Linux, or on a kernel that takes no `RWF_DSYNC`. Each also counts in
+    /// `flushes`. (Where the device has no FUA, the kernel's own fallback is invisible here: such a
+    /// write counts in `durable_writes`, and only the device's counters show its flush.)
+    pub durable_fallbacks: u64,
     /// Times the owner refused the file a slot past its end (`crate::Growth`), each read as the
     /// file's bound reached: the frame that needed it answered `Full`.
     pub growth_refused: u64,
@@ -58,6 +63,7 @@ impl LogStats {
             bytes: 0,
             flushes: 0,
             durable_writes: 0,
+            durable_fallbacks: 0,
             flush: Histogram::new(),
             write: Histogram::new(),
             commit_wait: Histogram::new(),
@@ -92,6 +98,8 @@ pub(crate) struct Timing {
     /// The job's durability came from one write made durable on its own (a FUA write,
     /// `BlockFile::write_durable_at`), not from a flush of the device's cache.
     pub(crate) durable_write: bool,
+    /// The job asked for a durable write and the file made it with a write and a flush instead.
+    pub(crate) durable_fallback: bool,
 }
 
 /// The nanoseconds from `from` to `to`, saturating.
@@ -106,6 +114,8 @@ pub(crate) struct Tally {
     pub(crate) flushes: u64,
     /// Writes made durable on their own, no flush with them (`Timing::durable_write`).
     pub(crate) durable_writes: u64,
+    /// Durable writes made with a write and a flush instead (`Timing::durable_fallback`).
+    pub(crate) durable_fallbacks: u64,
     pub(crate) flush: Histogram,
     pub(crate) write: Histogram,
     pub(crate) commit_wait: Histogram,
@@ -117,6 +127,7 @@ impl Tally {
             bytes: 0,
             flushes: 0,
             durable_writes: 0,
+            durable_fallbacks: 0,
             flush: Histogram::new(),
             write: Histogram::new(),
             commit_wait: Histogram::new(),
@@ -136,6 +147,9 @@ impl Tally {
         }
         if timing.durable_write {
             self.durable_writes = self.durable_writes.saturating_add(1);
+        }
+        if timing.durable_fallback {
+            self.durable_fallbacks = self.durable_fallbacks.saturating_add(1);
         }
     }
 

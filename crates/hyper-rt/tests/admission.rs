@@ -37,9 +37,8 @@ const ARENA: usize = 4;
 /// Shape: how long a receipt or a reply is waited for before the test calls it lost: far past a
 /// shard's step and a held shard's spin, so a slow box does not fail a correct runtime.
 const WAIT: Duration = Duration::from_secs(10);
-/// Shape: how long a held shard spins, nanoseconds: long enough for the submissions made meanwhile
-/// to queue behind it, short enough for the test.
-const HOLD_NS: u64 = 300_000_000;
+/// Raised by the test once what it queues behind a held shard is queued ([`hold`]).
+static RELEASED: AtomicBool = AtomicBool::new(false);
 /// Shape: a parked filler's hop between checks of its release flag, nanoseconds.
 const HOP_NS: u64 = 1_000_000;
 
@@ -61,13 +60,20 @@ fn config(tasks_per_shard: usize) -> RuntimeConfig {
     }
 }
 
-/// Holds `shard` inside one poll for [`HOLD_NS`] — a task that spins on the shard clock — and
-/// returns once the shard has admitted it, so everything submitted after this queues behind the hold.
+/// Holds `shard` inside one poll until the test calls [`release`] — a task that spins on the
+/// flag — and returns once the shard has admitted it, so everything submitted before the release
+/// queues behind the hold whatever the machine's load. It held for a fixed 300 ms before, and a
+/// test thread preempted past that queued its request after the shard had drained the shutdown and
+/// exited: the request was dropped unprocessed, its receipt `Terminated` by its drop and counted by
+/// no shard (ubuntu-24.04, hyper-raft run 37569511180). The spin ends at [`WAIT`] at most, so a
+/// test that never releases fails rather than hangs.
 fn hold(rt: &Runtime, shard: ShardId) {
+    RELEASED.store(false, Ordering::Release);
     let receipt = rt
         .spawn_on_with_receipt(shard, async {
-            let end = now_ns().saturating_add(HOLD_NS);
-            while now_ns() < end {
+            let bound = u64::try_from(WAIT.as_nanos()).unwrap_or(u64::MAX);
+            let end = now_ns().saturating_add(bound);
+            while !RELEASED.load(Ordering::Acquire) && now_ns() < end {
                 std::hint::spin_loop();
             }
         })
@@ -76,6 +82,11 @@ fn hold(rt: &Runtime, shard: ShardId) {
         matches!(receipt.wait(WAIT), Some(Admission::Admitted(_))),
         "the hold is admitted"
     );
+}
+
+/// Lets the held shard go on, once what the test queues behind it is queued.
+fn release() {
+    RELEASED.store(true, Ordering::Release);
 }
 
 /// Submits a task that reports on a channel when it runs; the receipt and the report's receiver.
@@ -181,6 +192,7 @@ fn a_request_drained_during_shutdown_is_terminated_on_its_receipt() {
     // Queued behind the hold, in this order: the shutdown, then the request.
     registry::send_control(shard.0, Control::Shutdown).unwrap();
     let (receipt, ran) = submit_reporter(&rt, shard);
+    release();
     let counters = rt.shutdown().unwrap();
     assert_eq!(receipt.wait(WAIT), Some(Admission::Terminated));
     assert!(

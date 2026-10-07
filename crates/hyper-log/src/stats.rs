@@ -47,8 +47,10 @@ pub struct LogStats {
     /// `flushes`. (Where the device has no FUA, the kernel's own fallback is invisible here: such a
     /// write counts in `durable_writes`, and only the device's counters show its flush.)
     pub durable_fallbacks: u64,
-    /// Times the owner refused the file a slot past its end (`crate::Growth`), each read as the
-    /// file's bound reached: the frame that needed it answered `Full`.
+    /// Asks for a slot past the file's end the owner refused (`crate::Growth`), each read as the
+    /// file's bound reached: the frame that needed it answered `Full`. It counts asks, not
+    /// episodes: the log asks again whenever it looks for room, so one bound reached counts as
+    /// often as the log looked while it held.
     pub growth_refused: u64,
 }
 

@@ -728,6 +728,13 @@ the flushes an append costs"). Three ways out were weighed (2026-10-07):
   kernel flushes in its place. macOS has no such write (`F_BARRIERFSYNC` orders and does not
   persist), so a confirmation there stays a full flush. This is what hyper-log does.
 
+A frame not confirmed is the torn tail when it does not read, and an unacknowledged suffix when it
+does; neither is restored or marked. A frame whose flush failed, but every sector of which reached the
+medium, is the second: no one heard it was durable, as after a crash between a write and its answer.
+An unconfirmed last frame keeps its term and vote; its commit is not kept; its entries are a suffix no
+one acknowledged, which a leader may overwrite (Raft, §5.3). Whether the file's end falls inside such
+a frame changes nothing (§6.3).
+
 ### 6.3 A slot is written whole before its frames
 
 On Linux's ext4 and XFS, a write past a file's size, or into an extent allocated and not yet
@@ -760,9 +767,17 @@ of the device's cache alone. A slot reused is written already and is not filled 
 - **Where it pays.** Measured on Linux: the device's flushes an append fall from three to two, and
   appends a second rise by about 70% (`docs/benchmarks.md`, "a slot written whole before its frames").
   On macOS the zeros showed no gain and a growing frame's 16 MiB of zeros cost a 100 to 200 ms answer,
-  so it stays off there, and on Windows, unmeasured. The zeros are written on the frame that grows
-  the file; writing them ahead, while a slot admitted early waits, would take that cost off the
-  frame's answer, and is open.
+  so it stays off there, and on Windows, unmeasured.
+- **Not written ahead (measured, ruled 2026-10-07).** Writing a slot's zeros while the writer is
+  idle, ahead of the frame that opens it, was built and measured (`log-zero-ahead`, 3d2b22d), and
+  dropped. The fill is one write and flush of a whole segment, about 5 ms on Linux in Docker's VM at
+  16 MiB, and a frame arriving during it waits for all of it: appends that grew the file averaged
+  6.5 to 7.1 ms with it against 4.8 to 5.6 ms inline with 1 ms between appends, and no better closed
+  loop. A reopen then also searches the filled slot block by block for a frame of a lost header
+  (`recover::lost_headers`), about 1.5 ms more. In steady state the replicas reuse freed slots, so
+  growth is off the hot path (`docs/benchmarks.md`, "zeros written ahead"). If a workload measures
+  growth latency, the place to start is a fill written in pieces of the device's largest single
+  transfer, one a moment the writer is idle, flushed once after the last.
 
 ## 7. Threading and ownership
 

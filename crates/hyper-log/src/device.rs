@@ -362,6 +362,9 @@ pub(crate) struct Device<F> {
     pub(crate) file: F,
     /// Buffers for reading entries back, kept between reads.
     pool: Pool,
+    /// A segment of zeros, written over each slot the file grows by (`Device::zero_fill`): made at
+    /// the first and kept.
+    zeros: Option<AlignedBuf>,
     segment_bytes: u64,
     /// The owner's word that another frame follows the one with this sequence.
     more: Receiver<u64>,
@@ -398,6 +401,7 @@ impl<F: BlockFile> Device<F> {
         Self {
             file,
             pool,
+            zeros: None,
             segment_bytes,
             more,
             flushed,
@@ -625,24 +629,24 @@ impl<F: BlockFile> Device<F> {
         (result, timing)
     }
 
-    /// Writes zeros over `[at, at + len)`, a slot the file grows by (`Frame::zero`), in one write
-    /// from a buffer of the pool, which holds a segment: the bytes written.
+    /// Writes zeros over `[at, at + len)`, a slot the file grows by (`Frame::zero`), in one write:
+    /// a segment, the log's largest write, from a zeroed buffer of a segment the device makes at the
+    /// first slot it fills and keeps for the log's life, so a slot costs no allocation and no page
+    /// fault after the first. The bytes written.
     fn zero_fill(&mut self, at: u64, len: u64) -> Result<u64, LogError> {
         let size = usize::try_from(len).map_err(|_| LogError::Damaged("a slot past usize"))?;
-        let mut buf = self.pool.take(size).map_err(|e| LogError::Disk(e.into()))?;
-        let filled = buf
-            .as_mut_capacity()
-            .get_mut(..size)
-            .map(|bytes| bytes.fill(0))
-            .ok_or(LogError::Damaged("a slot past its buffer"))
-            .and_then(|()| buf.set_len(size).map_err(|e| LogError::Disk(e.into())));
-        let written = filled.and_then(|()| {
-            self.file
-                .write_all_at(buf.as_slice(), at)
-                .map_err(LogError::from)
-        });
-        self.pool.give(buf);
-        written.map(|()| len)
+        if self.zeros.as_ref().is_none_or(|zeros| zeros.len() != size) {
+            let mut zeros = AlignedBuf::zeroed(size, self.file.layout_block())
+                .map_err(|e| LogError::Disk(e.into()))?;
+            zeros.set_len(size).map_err(|e| LogError::Disk(e.into()))?;
+            self.zeros = Some(zeros);
+        }
+        let zeros = self
+            .zeros
+            .as_ref()
+            .ok_or(LogError::Damaged("no zeros to fill a slot with"))?;
+        self.file.write_all_at(zeros.as_slice(), at)?;
+        Ok(len)
     }
 
     /// Writes `buf`, padded with zeros to the file's alignment, at `at`: the bytes written.

@@ -7265,3 +7265,26 @@ with FUA the confirmation's would be a lone FUA write and one flush would remain
 energy an append within the spread of the two rounds, and two points whose p99 rose to 108 and 207 ms:
 the frame that grew the file wrote 16 MiB of zeros before its answer. No gain to set against it, so
 the zeros stay off on macOS (`DeviceFile::fills_new_space`).
+
+## hyper-log: zeros written ahead, measured and dropped (2026-10-07)
+
+An idle writer writing the next slot's zeros ahead of the frame that opens it (`log-zero-ahead`,
+3d2b22d, `docs/durable.md` §6.3), against zeros written under the growing frame's flush
+(`863deb6`), on Linux 6.12 in Docker Desktop's VM, ext4, 16 MiB slots, two rounds each.
+
+The log bench (plain, 128 B and 1 KiB, 1, 4 and 16 replicas, one second a point): appends a second,
+p50, p99 and p99.9 within the spread of the rounds on both sides, for its replicas compact and
+reuse freed slots, so the file stops growing; reopen 2.6 to 3.3 ms before, 4.2 to 6.5 ms after.
+
+Growth alone (one group, 64 KiB entries, no compaction, 10,000 appends, 41 slots opened; a scratch
+program, not kept), the mean of the appends during which the file grew:
+
+| between appends | inline | written ahead |
+|---|---|---|
+| none (closed loop) | 2.95 to 3.55 ms | 1.86 to 4.69 ms |
+| 1 ms | 4.78 to 5.63 ms | 6.50 to 7.12 ms |
+
+p99.9 and the maximum were no better. The fill is one write and flush of a segment, about 5 ms,
+and a frame that arrives during it waits for all of it: the cost moves to the next frame. Dropped;
+a fill in pieces of the device's largest transfer is where to start if a workload measures growth
+latency.

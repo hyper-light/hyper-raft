@@ -418,7 +418,7 @@ impl<F: BlockFile> Device<F> {
                 record_at,
                 mut these,
             } => {
-                let (result, timing) = self.write_then_flush((&mut record, record_at), None);
+                let (result, timing) = self.write_durable(&mut record, record_at);
                 if result.is_ok() {
                     answers.append(&mut these);
                 }
@@ -502,7 +502,7 @@ impl<F: BlockFile> Device<F> {
                 answering.durable();
             }
         }
-        let (result, timing) = self.write_then_flush((&mut f.confirm, f.record_at), None);
+        let (result, timing) = self.write_durable(&mut f.confirm, f.record_at);
         if result.is_ok() {
             answers.append(&mut f.these);
         }
@@ -550,6 +550,7 @@ impl<F: BlockFile> Device<F> {
             flush_ns: None,
             bytes,
             flushed_at: None,
+            durable_write: false,
         };
         if wrote.is_err() {
             return (wrote, timing);
@@ -560,6 +561,46 @@ impl<F: BlockFile> Device<F> {
         timing.flush_ns = Some(stats::nanos(written, ended));
         timing.flushed_at = flushed.is_ok().then_some(ended);
         (flushed, timing)
+    }
+
+    /// Writes a confirmation, `buf` at `at`, durable before it returns: on its own where the file
+    /// can (`BlockFile::write_durable_at`, a FUA write on Linux), so the device's cache is not
+    /// flushed for one record; otherwise a write and a flush. The confirmation is written only after
+    /// its frame's flush returned, so the frame needs nothing of this write but to be durable (mantle
+    /// docs/design/raft-log.md §6, step 5).
+    fn write_durable(&self, buf: &mut AlignedBuf, at: u64) -> (Result<(), LogError>, Timing) {
+        let started = stats::now();
+        let mut timing = Timing {
+            took_ns: 0,
+            write_ns: 0,
+            flush_ns: None,
+            bytes: 0,
+            flushed_at: None,
+            durable_write: false,
+        };
+        let written = guarded(|| {
+            let bytes = buf.padded().map_err(|e| LogError::Disk(e.into()))?;
+            timing.bytes = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+            self.file
+                .write_durable_at(bytes, at)
+                .map_err(LogError::from)
+        });
+        let ended = stats::now();
+        timing.took_ns = stats::nanos(started, ended);
+        timing.write_ns = timing.took_ns;
+        let result = match written {
+            Ok(hyper_block::block::Durable::Written) => {
+                timing.durable_write = true;
+                Ok(())
+            }
+            Ok(hyper_block::block::Durable::Flushed) => {
+                timing.flush_ns = Some(timing.took_ns);
+                Ok(())
+            }
+            Err(e) => Err(e),
+        };
+        timing.flushed_at = result.is_ok().then_some(ended);
+        (result, timing)
     }
 
     /// Writes `buf`, padded with zeros to the file's alignment, at `at`: the bytes written.

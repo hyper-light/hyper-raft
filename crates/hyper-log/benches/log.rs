@@ -230,6 +230,7 @@ fn point(
 ) {
     let scratch = Scratch::create(dir, ".hyper-bench-log").unwrap();
     let before = hyper_measure::usage::this().ok();
+    let device_before = device_flushes(scratch.path());
     let log = if sealed {
         Log::create_sealed(open(scratch.path()), config(most), id, keys()).unwrap()
     } else {
@@ -268,8 +269,18 @@ fn point(
     // Device flushes an append, confirmations among them: an entry nothing follows (one replica,
     // a node at rest) is confirmed by a flush of its own (docs/benchmarks.md, "hyper-log: the
     // flushes an append costs").
-    let flushes = log.stats(None).unwrap().flushes;
-    let flushes_per_append = flushes as f64 / appends.max(1.0);
+    let stats = log.stats(None).unwrap();
+    let flushes_per_append = stats.flushes as f64 / appends.max(1.0);
+    let durable_per_append = stats.durable_writes as f64 / appends.max(1.0);
+    // The flushes the device itself completed, the log's and anything else on it, an append.
+    let device = match (device_before, device_flushes(scratch.path())) {
+        (Some((before, _)), Some((after, fua))) => format!(
+            "{:.2}{}",
+            after.saturating_sub(before) as f64 / appends.max(1.0),
+            if fua { " fua" } else { "" }
+        ),
+        _ => "-".to_string(),
+    };
     let per_flush = if frames == 0 {
         0.0
     } else {
@@ -294,7 +305,7 @@ fn point(
         |nj| format!("{:.2} µJ", nj as f64 / 1e3 / appends.max(1.0)),
     );
     println!(
-        "  {:<19} {:>9} {:>8} {:>9} {:>11.0} {:>9.1} MiB/s {:>10} {:>10} {:>10} {:>11.1} {:>11.2} {:>12} {:>10} {:>8} in {}",
+        "  {:<19} {:>9} {:>8} {:>9} {:>11.0} {:>9.1} MiB/s {:>10} {:>10} {:>10} {:>11.1} {:>11.2} {:>11.2} {:>12} {:>12} {:>10} {:>8} in {}",
         format!("{} {size}", if sealed { "sealed" } else { "plain" }),
         count,
         peak.load(Ordering::Relaxed),
@@ -306,11 +317,48 @@ fn point(
         nanos(percentile(&latencies, 0.999)),
         per_flush,
         flushes_per_append,
+        durable_per_append,
+        device,
         per_append,
         nanos(reopen.as_nanos() as u64),
         read,
         nanos(read_time.as_nanos() as u64),
     );
+}
+
+/// The block device a file lives on, as Linux names it under `/sys/dev/block`: the whole disk's
+/// directory where the file is on a partition, whose counters are the disk's.
+#[cfg(target_os = "linux")]
+fn device_dir(path: &Path) -> Option<PathBuf> {
+    use std::os::unix::fs::MetadataExt;
+    let dev = std::fs::metadata(path).ok()?.dev();
+    // glibc's encoding of a dev_t's major and minor (makedev(3)).
+    let major = ((dev >> 8) & 0xfff) | ((dev >> 32) & !0xfff);
+    let minor = (dev & 0xff) | ((dev >> 12) & !0xff);
+    let dir = std::fs::canonicalize(format!("/sys/dev/block/{major}:{minor}")).ok()?;
+    if dir.join("partition").exists() {
+        dir.parent().map(Path::to_path_buf)
+    } else {
+        Some(dir)
+    }
+}
+
+/// What the device the file lives on did: the flush requests it completed, from its counters
+/// (`/sys/block/<dev>/stat`, field 16, Linux 5.5 on), and whether its queue advertises FUA.
+#[cfg(target_os = "linux")]
+fn device_flushes(path: &Path) -> Option<(u64, bool)> {
+    let dir = device_dir(path)?;
+    let stat = std::fs::read_to_string(dir.join("stat")).ok()?;
+    let flushes = stat.split_whitespace().nth(15)?.parse().ok()?;
+    let fua = std::fs::read_to_string(dir.join("queue/fua"))
+        .ok()
+        .is_some_and(|v| v.trim() == "1");
+    Some((flushes, fua))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn device_flushes(_path: &Path) -> Option<(u64, bool)> {
+    None
 }
 
 fn list(arg: Option<&String>, default: &[usize]) -> Vec<usize> {
@@ -340,7 +388,7 @@ fn main() {
     println!("{}", dir.display());
     println!("hyper-log in a scratch file (removed afterwards), one entry an append");
     println!(
-        "  {:<19} {:>9} {:>8} {:>9} {:>11} {:>15} {:>10} {:>10} {:>10} {:>11} {:>11} {:>12} {:>10} {:>20}",
+        "  {:<19} {:>9} {:>8} {:>9} {:>11} {:>15} {:>10} {:>10} {:>10} {:>11} {:>11} {:>11} {:>12} {:>12} {:>10} {:>20}",
         "",
         "replicas",
         "threads",
@@ -352,6 +400,8 @@ fn main() {
         "p99.9",
         "per flush",
         "flush/app",
+        "durable/app",
+        "dev flush/app",
         "energy",
         "reopen",
         "read back"

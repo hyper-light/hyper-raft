@@ -77,6 +77,7 @@ impl<F: BlockFile + 'static> Owner<F> {
         out.updates = self.schedule.updates;
         out.bytes = tally.bytes;
         out.flushes = tally.flushes;
+        out.durable_writes = tally.durable_writes;
         out.flush.clone_from(&tally.flush);
         out.write.clone_from(&tally.write);
         out.commit_wait.clone_from(&tally.commit_wait);

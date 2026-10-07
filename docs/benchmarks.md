@@ -7206,3 +7206,35 @@ device in power and, on flash, in wear. focal's commits bench, an entry at a tim
 same: 2.00 flushes a commit on the shell against 1.00 on focal-log, at equal medians. Whether a
 frame nothing follows can be confirmed without a flush of its own is open (hyper-log's recovery,
 mantle's raft-log.md §3 and §6); this column is the number that answers it.
+
+## hyper-log: a frame's confirmation as one durable write (2026-10-07)
+
+A frame nothing follows is confirmed by one write made durable on its own (`docs/durable.md` §6.2):
+on Linux a direct file's confirmation goes with `RWF_DSYNC`, which the block layer issues as a FUA
+write where the device advertises FUA, and otherwise emulates with a flush. The log bench reports
+the flushes it asked for (`flush/app`), its durable writes (`durable/app`), and on Linux the flushes
+the device itself completed (`dev flush/app`, `/sys/block/<dev>/stat` field 16) with `fua` where the
+queue advertises it.
+
+**macOS arm64** (APFS, internal SSD): unchanged, as it must be: no durable write of its own there,
+so 2.00 flushes an append at one replica, 0.50 at four, 0.13 at sixteen, and no durable writes.
+
+**Linux** (6.12, Docker Desktop's VM on the same machine, ext4 on `vda`: write-back cache, no FUA),
+the bench before this change and after it, alternated, two rounds each, one second a point:
+
+| replicas | size | before: flush/app | before: device flush/app | after: flush/app, durable/app | after: device flush/app |
+|---|---|---|---|---|---|
+| 1 | 128 B | 2.00 | 3.00 | 1.00, 1.00 | 3.00 |
+| 4 | 128 B | 0.50 | 0.75 | 0.25, 0.25 | 0.75 |
+| 16 | 128 B | 0.13 | 0.19 | 0.06, 0.06 | 0.19 |
+| 1 | 1 KiB | 2.00 | 3.00 | 1.00, 1.00 | 3.00 |
+| 4 | 1 KiB | 0.50 | 0.75 | 0.25, 0.25 | 0.75 |
+| 16 | 1 KiB | 0.13 | 0.19 | 0.06, 0.06 | 0.17 to 0.18 |
+
+Appends per second and their p50 and p99 are within the two rounds' spread before and after
+(1,588 to 1,927 an append a second at one replica, p50 0.49 to 0.59 ms). On a device without FUA the
+kernel flushes in the durable write's place, and the device does the same work: no saving and no
+cost. The third device flush at one replica, on both, is ext4's journal committing the file's size as
+frames grow it. What a FUA device saves is not measured here: neither this VM's disk nor the macOS
+host advertises one, and the measurement is owed on one that does (a Linux machine whose NVMe or SAS
+drive reports `queue/fua` 1).

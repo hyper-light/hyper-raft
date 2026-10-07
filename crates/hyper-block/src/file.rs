@@ -142,6 +142,35 @@ impl DeviceFile {
         self.layout
     }
 
+    /// Writes all of `buf` at `offset` and makes that write durable before it returns. On Linux a
+    /// direct file's write goes with `RWF_DSYNC` (pwritev2(2)): the block layer issues it as a FUA
+    /// write where the device advertises FUA (`/sys/block/<dev>/queue/fua`) and the write is an
+    /// overwrite the file system need not log, and otherwise writes and flushes, so the device's
+    /// whole cache is not flushed for one write. Elsewhere, and where the kernel does not take the
+    /// flag, a write and [`DeviceFile::sync_data`] (macOS has no durable write of its own:
+    /// `F_BARRIERFSYNC` orders and does not persist).
+    pub fn write_durable_at(
+        &self,
+        buf: &[u8],
+        offset: u64,
+    ) -> Result<crate::block::Durable, DiskError> {
+        #[cfg(target_os = "linux")]
+        if self.caching == Caching::Direct {
+            self.check_alignment(offset, buf.len())?;
+            self.check_address(buf.as_ptr().addr(), offset, buf.len())?;
+            match sys::write_durable_at(&self.file, buf, offset) {
+                Ok(()) => return Ok(crate::block::Durable::Written),
+                // A kernel before 4.7 takes no flag: nothing was written.
+                Err(e) if e.raw_os_error() == Some(rustix::io::Errno::OPNOTSUPP.raw_os_error()) => {
+                }
+                Err(e) => return Err(self.io_error("write durable", e)),
+            }
+        }
+        self.write_all_at(buf, offset)?;
+        self.sync_data()?;
+        Ok(crate::block::Durable::Flushed)
+    }
+
     /// Writes all of `buf` at `offset`.
     pub fn write_all_at(&self, buf: &[u8], offset: u64) -> Result<(), DiskError> {
         self.check_alignment(offset, buf.len())?;
@@ -443,6 +472,26 @@ mod sys {
 
     pub(super) fn write_at(file: &File, buf: &[u8], offset: u64) -> io::Result<usize> {
         file.write_at(buf, offset)
+    }
+
+    /// All of `buf` at `offset` with `RWF_DSYNC`: each part durable before the call returns.
+    #[cfg(target_os = "linux")]
+    pub(super) fn write_durable_at(file: &File, buf: &[u8], offset: u64) -> io::Result<()> {
+        use rustix::io::{ReadWriteFlags, pwritev2};
+        let mut done = 0usize;
+        while let Some(rest) = buf.get(done..).filter(|r| !r.is_empty()) {
+            let at = u64::try_from(done)
+                .ok()
+                .and_then(|done| offset.checked_add(done))
+                .ok_or(io::ErrorKind::InvalidInput)?;
+            let wrote = pwritev2(file, &[io::IoSlice::new(rest)], at, ReadWriteFlags::DSYNC)
+                .map_err(io::Error::from)?;
+            if wrote == 0 {
+                return Err(io::ErrorKind::WriteZero.into());
+            }
+            done = done.saturating_add(wrote);
+        }
+        Ok(())
     }
 
     pub(super) fn read_at(file: &File, buf: &mut [u8], offset: u64) -> io::Result<usize> {

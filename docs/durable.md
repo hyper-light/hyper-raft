@@ -698,6 +698,36 @@ could go as soon as what it applied is durable. Here each compaction prepares th
 behind the start is sent, and the rule bounds what those cost. The rule is the owner's to follow:
 one that compacts for room (§2.4), or on its own schedule, may.
 
+### 6.2 A frame's confirmation is a second durable write
+
+hyper-log answers a frame only once a later durable record confirms that its flush completed: the
+next frame's persist record, or, when no frame follows, a confirmation written over the frame's own
+record (mantle `docs/design/raft-log.md` §6, step 5). In a closed loop, which is how replicas write
+(each waits for its answer before it writes again), no frame ever follows another, so every frame is
+confirmed on its own: two durable writes a frame at every load (`docs/benchmarks.md`, "hyper-log:
+the flushes an append costs"). Three ways out were weighed (2026-10-07):
+
+- **One ordered flush for the frame and its record** cannot be exact. Cut the power during that
+  flush, and recovery may find a record that verifies beside a frame that does not, and the bytes are
+  the same whether (i) the flush never completed, the frame never answered (a torn tail, cut
+  silently), or (ii) it completed, the frame was answered, and the frame was damaged at rest (to be
+  restored and marked uncertain). That is AGL+18 §3.3.3's ambiguity of the last entry, which the
+  confirmation exists to close. Both ways out of it were tried: answering at the frame's own flush and
+  taking (ii) for a torn tail lost an acknowledged entry without a mark (the audit's S01, round
+  three); marking every such frame uncertain left groups that could elect no one after a power loss
+  tore a leader's and a follower's frames alike (raft-log.md §6). A checksum in the record names
+  which frame it is about, not whether that frame's flush returned.
+- **A confirmation that waits for the next frame** keeps the rule, but in the closed loop the next
+  frame comes only after the answer it waits for: it would wait on a timer, adding latency, and save
+  no write.
+- **The confirmation as one durable write** keeps the rule (it is still written after the frame's
+  flush returned) and costs less: on Linux, a direct file's confirmation goes with `RWF_DSYNC`
+  (`BlockFile::write_durable_at`), which the block layer issues as a FUA write where the device
+  advertises FUA and the write is an overwrite, so the device's whole cache is not flushed for one
+  record. `LogStats::durable_writes` counts them, `flushes` the rest; where the device has no FUA the
+  kernel flushes in its place. macOS has no such write (`F_BARRIERFSYNC` orders and does not
+  persist), so a confirmation there stays a full flush. This is what hyper-log does.
+
 ## 7. Threading and ownership
 
 No thread per group, no `Arc`, no lock (`CLAUDE.md` §1). A node runs a fixed set of owner threads

@@ -38,6 +38,10 @@ pub struct LogStats {
     /// Each update's wait, from its submission to the end of the flush that let it be answered:
     /// the next frame's, whose record confirms its frame, or its frame's confirmation's.
     pub commit_wait: Histogram,
+    /// Writes the device made durable on their own, each without a flush of its cache: a frame's
+    /// confirmation, written with `RWF_DSYNC` on a direct file on Linux (a FUA write where the
+    /// device has FUA). Where the write falls back to a write and a flush, it counts in `flushes`.
+    pub durable_writes: u64,
     /// Times the owner refused the file a slot past its end (`crate::Growth`), each read as the
     /// file's bound reached: the frame that needed it answered `Full`.
     pub growth_refused: u64,
@@ -53,6 +57,7 @@ impl LogStats {
             updates: 0,
             bytes: 0,
             flushes: 0,
+            durable_writes: 0,
             flush: Histogram::new(),
             write: Histogram::new(),
             commit_wait: Histogram::new(),
@@ -84,6 +89,9 @@ pub(crate) struct Timing {
     pub(crate) bytes: u64,
     /// When the flush ended, if it held: the moment the updates it lets be answered waited until.
     pub(crate) flushed_at: Option<Instant>,
+    /// The job's durability came from one write made durable on its own (a FUA write,
+    /// `BlockFile::write_durable_at`), not from a flush of the device's cache.
+    pub(crate) durable_write: bool,
 }
 
 /// The nanoseconds from `from` to `to`, saturating.
@@ -96,6 +104,8 @@ pub(crate) fn nanos(from: Instant, to: Instant) -> u64 {
 pub(crate) struct Tally {
     pub(crate) bytes: u64,
     pub(crate) flushes: u64,
+    /// Writes made durable on their own, no flush with them (`Timing::durable_write`).
+    pub(crate) durable_writes: u64,
     pub(crate) flush: Histogram,
     pub(crate) write: Histogram,
     pub(crate) commit_wait: Histogram,
@@ -106,6 +116,7 @@ impl Tally {
         Box::new(Self {
             bytes: 0,
             flushes: 0,
+            durable_writes: 0,
             flush: Histogram::new(),
             write: Histogram::new(),
             commit_wait: Histogram::new(),
@@ -122,6 +133,9 @@ impl Tally {
         if let Some(ns) = timing.flush_ns {
             self.flushes = self.flushes.saturating_add(1);
             self.flush.record(ns);
+        }
+        if timing.durable_write {
+            self.durable_writes = self.durable_writes.saturating_add(1);
         }
     }
 

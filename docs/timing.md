@@ -656,11 +656,25 @@ The per-seed rows are in `docs/benchmarks.md`. On `756bfaa` the all-far kill is 
 because the far pair is judged by the near pool's 2 ms deadline: the same deadline condemns live far
 members, and the detection overran the bound the detector stated.
 
-Open: a far peer joined with no handshake round trip has no evidence of its distance until its first
-answer returns. If the pool configures first, the pool judges it, and a live far member can be
-suspected (40 ms answers before the pool's 100 ms: judged provisionally; 200 ms answers after it:
-suspected at 132 ms in the same unit-test driver). Joining with the handshake's round trip, as slates
-does, closes it. Also: until a far pair configures, the far member's own detection of it runs at the provisional
+**A peer with no evidence of its path** (no handshake round trip, never answered: one learned by gossip
+before it was spoken to, or re-learned after it was forgotten) is judged provisionally at RFC 6298
+§2.1's initial RTO: "until a round-trip time (RTT) measurement has been made for a segment sent
+between the sender and receiver, the sender SHOULD set RTO <- 1 second". It takes the provisional
+verdict with `R = 1/3 s`, so its deadline `3R` is that second (`FIRST_CONTACT_RTT_NS`). Its first
+answer, measured or bounded by a reused record, replaces it with the path's provisional verdict, or
+with the pool's once the pair is shown to fit; a first answer slower than a second backs off per pair
+(§5.5, above). Judged by the pool instead, a live far peer was suspected, condemned and forgotten
+before its first 200 ms answer could return (`a_peer_joined_without_a_round_trip_is_not_suspected_before_its_first_answer`,
+failing first). Requiring a measured round trip at `join` instead would refuse every member a node
+learns by gossip before it has spoken to it. The cost falls on a peer that never answers: each
+unanswered judged probe waits out its direct deadline and then its relays', which includes the
+target's own span, two initial RTOs a probe, and a condemnation takes two probes, so its first
+detection moves by at most four initial RTOs: 4,076 ms against 108 ms with a 1 ms handshake
+(`a_near_peer_joined_without_a_round_trip_is_condemned_at_most_four_initial_rtos_later`). In the
+far-link record one seed of 22 moved: seed 10's far kill held dead in 5.51 s rather than 3.54 s, a
+survivor that had forgotten the victim having re-learned it by gossip with no evidence of its path.
+
+Open: until a far pair configures, the far member's own detection of it runs at the provisional
 `3R` deadline, so a far member's death is held a few hundred milliseconds to seconds later than a
 configured pair would hold it; and configuration itself is paced by the far pairs' one sample a
 round, minutes on this topology.

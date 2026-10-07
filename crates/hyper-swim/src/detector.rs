@@ -220,8 +220,21 @@ fn judging(peer: &Peer, pooled: Option<Verdict>) -> (Option<Verdict>, bool) {
             .map(|(pooled, rtt)| misfit_verdict(pooled, rtt));
         return (provisional, true);
     }
+    if peer.path_rtt_ns.is_none() && peer.last_answer_ns.is_none() {
+        // No evidence of the pair's path yet: no handshake round trip, no answer. RFC 6298 §2.1:
+        // "until a round-trip time (RTT) measurement has been made ... the sender SHOULD set RTO <- 1
+        // second" — the provisional verdict whose deadline, 3R, is that second. Judged by the pool
+        // instead, a peer joined by gossip before it was ever spoken to was suspected, alive, before
+        // its first answer could return from 200 ms away.
+        let provisional = pooled.map(|pooled| misfit_verdict(pooled, FIRST_CONTACT_RTT_NS));
+        return (provisional, true);
+    }
     (pooled, false)
 }
+
+/// The round trip a pair with no evidence of its path is judged provisionally by: a third of RFC 6298
+/// §2.1's initial RTO ([`INITIAL_WAIT_NS`], 1 s), so its provisional deadline `3R` is that RTO.
+const FIRST_CONTACT_RTT_NS: u64 = INITIAL_WAIT_NS / 3;
 
 /// The verdict a pair the pool does not fit is judged by until its own estimator configures: its
 /// own latest round trip `R` as the expected arrival, and the margin RFC 6298 §2.2 gives a path
@@ -2635,6 +2648,156 @@ mod tests {
         for peer in [B, C] {
             assert_eq!(liveness(&detector, peer), Liveness::Alive);
         }
+    }
+
+    /// Drives `detector` from `now` with any number of answers in flight: `answer` gives each probe's
+    /// round trip (none for silence); `heard` is called with each answer's sender, nonce and arrival as
+    /// it is delivered, before the detector sees it, and stops the run by returning true; the run also
+    /// stops at `horizon` or when `done` holds. Returns the time it stopped.
+    fn drive_many(
+        detector: &mut Detector,
+        mut now: u64,
+        horizon: u64,
+        mut answer: impl FnMut(HostId) -> Option<u64>,
+        mut heard: impl FnMut(&Detector, HostId, u64, u64) -> bool,
+        done: impl Fn(&Detector) -> bool,
+    ) -> u64 {
+        let mut requests = Vec::new();
+        let mut pending: Vec<(HostId, u64, u64)> = Vec::new();
+        while now < horizon && !done(detector) {
+            if let Some(ping) = detector.poll(now, &mut requests)
+                && let Some(rtt) = answer(ping.to)
+            {
+                pending.push((ping.to, ping.nonce, now + rtt));
+            }
+            let ack = pending.iter().map(|(_, _, at)| *at).min();
+            now = match (detector.wake().map(|wake| wake + MS / 10), ack) {
+                (Some(wake), Some(at)) => wake.min(at).max(now),
+                (Some(wake), None) => wake.max(now),
+                (None, Some(at)) => at.max(now),
+                (None, None) => {
+                    detector.on_ping(A);
+                    now + MS
+                }
+            };
+            pending.sort_by_key(|(_, _, at)| *at);
+            let due: Vec<(HostId, u64, u64)> = pending
+                .iter()
+                .copied()
+                .filter(|(_, _, at)| *at <= now)
+                .collect();
+            pending.retain(|(_, _, at)| *at > now);
+            for (from, nonce, at) in due {
+                if heard(detector, from, nonce, at) {
+                    return now;
+                }
+                detector.on_ack(from, nonce, at);
+            }
+        }
+        now
+    }
+
+    /// A configured member over near peers A, B and C, and the time its warm-up ended: the member a
+    /// far or late peer then joins.
+    fn warmed() -> (Detector, u64) {
+        let mut detector = detector(&[A, B, C]);
+        let mut world = World::new();
+        configured(&mut detector, &mut world, &[A, B, C]);
+        (detector, world.now)
+    }
+
+    /// RFC 6298 §2.1 for a peer joined with no handshake round trip that has not answered yet: it is
+    /// judged provisionally at the initial RTO, not by the pool. Do: on a configured member, join a far
+    /// peer with no handshake round trip that answers in 200 ms, and run until its first answer
+    /// arrives, then on for 30 s. Expect: it was not suspected before that answer, and never condemned.
+    /// Before: the pool judged it at a few milliseconds, and the live peer was suspected before its
+    /// first answer came back (132 ms in, on the driver of the test below).
+    #[test]
+    fn a_peer_joined_without_a_round_trip_is_not_suspected_before_its_first_answer() {
+        const F: HostId = HostId(5);
+        let (mut detector, now) = warmed();
+        detector.join(F).unwrap();
+        let mut state = 0x9E37_79B9_7F4A_7C15;
+        let mut suspected_before_first_answer = None;
+        drive_many(
+            &mut detector,
+            now,
+            now + 30_000 * MS,
+            |peer| {
+                Some(if peer == F {
+                    200 * MS
+                } else {
+                    jitter(&mut state)
+                })
+            },
+            |detector, from, _, _| {
+                if from == F && suspected_before_first_answer.is_none() {
+                    // Held, alive, with its report: a member condemned and forgotten has neither.
+                    suspected_before_first_answer = Some((
+                        detector.membership().state(F).map(|state| state.liveness),
+                        detector.report(F).map(|report| report.suspicions),
+                    ));
+                }
+                false
+            },
+            |_| false,
+        );
+        assert_eq!(
+            suspected_before_first_answer,
+            Some((Some(Liveness::Alive), Some(0))),
+            "held alive and never suspected when its first answer arrived"
+        );
+        let report = detector.report(F).unwrap_or_default();
+        assert_eq!(report.condemnations, 0, "never condemned while alive");
+        assert_eq!(
+            detector.membership().state(F).map(|state| state.liveness),
+            Some(Liveness::Alive),
+            "held alive"
+        );
+    }
+
+    /// The cost of RFC 6298 §2.1's initial RTO for a near peer joined with no handshake round trip:
+    /// until its first answer it is judged at 1 s, not by the pool. A condemnation takes two judged
+    /// probes (the one that suspects and the one that tells), and each unanswered one waits out its
+    /// direct deadline and then the relays', which includes the target's own span: two initial RTOs a
+    /// probe, so the first detection of a peer that never answers moves by at most four. Do: on a
+    /// configured member, join a near peer that never answers, once with no handshake round trip and
+    /// once with a 1 ms one, and time each from the join to holding it dead. Expect: both held dead,
+    /// the first no more than four initial RTOs after the second (measured: 4,076 ms against 108 ms).
+    #[test]
+    fn a_near_peer_joined_without_a_round_trip_is_condemned_at_most_four_initial_rtos_later() {
+        const D: HostId = HostId(5);
+        let held_dead_after = |handshake: Option<u64>| {
+            let (mut detector, now) = warmed();
+            match handshake {
+                Some(rtt) => detector
+                    .join_measured(D, Duration::from_nanos(rtt))
+                    .unwrap(),
+                None => detector.join(D).unwrap(),
+            }
+            let mut state = 0x9E37_79B9_7F4A_7C15;
+            let end = drive_many(
+                &mut detector,
+                now,
+                now + 600_000 * MS,
+                |peer| (peer != D).then(|| jitter(&mut state)),
+                |_, _, _, _| false,
+                |detector| liveness(detector, D) == Liveness::Dead,
+            );
+            assert_eq!(liveness(&detector, D), Liveness::Dead, "held dead");
+            end - now
+        };
+        let unmeasured = held_dead_after(None);
+        let measured = held_dead_after(Some(MS));
+        eprintln!(
+            "near peer held dead: {:.1} ms with no handshake round trip, {:.1} ms with one",
+            unmeasured as f64 / MS as f64,
+            measured as f64 / MS as f64
+        );
+        assert!(
+            unmeasured <= measured + 4 * INITIAL_WAIT_NS,
+            "at most four initial RTOs later: {unmeasured} ns against {measured} ns"
+        );
     }
 
     /// A far peer, joined with no handshake round trip, whose first answers all come after their

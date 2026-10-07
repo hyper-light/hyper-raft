@@ -645,6 +645,20 @@ its threshold; the queue admits `GROUP_SUBMISSIONS` writes for every group the n
 never refuses a handle's write for count. Facts that give no configuration are refused, typed
 (`LogError::Unfit`), never clamped, and no caller copies the log's constants.
 
+`max_segments` bounds the file, and the volume it lives on may hold less. An owner that shares the
+volume with other writers hands the log a `hyper_log::Growth` (`Log::create_with`,
+`Log::open_with`), and the file grows only as it admits: before a frame opens a slot past the
+file's end the log asks it for the slot's segment, keeping at most two slots admitted ahead, since
+the writer's decisions read only whether none, one, or two or more segments are usable. A refusal
+is the bound reached and nothing else: the frame is answered `Full`, the groups compact, sweeps
+run, and nothing is fenced (`LogStats::growth_refused` counts them). An admission is committed once
+its slot is durable, and released when the write that grew the file fails (before the fence that
+follows it) or when the log ends unused; at open the owner is told what the file's slots already
+take, each a whole segment, before it admits any. Slots are reused and the file never shrinks, so
+compaction releases nothing. The gate narrows a full volume's harm and does not end it: a write of
+another owner outside it can still fill the volume, and the log's write then fails and fences as
+before. Without a `Growth` the file grows to `max_segments`, as it always did.
+
 ### 6.1 When to compact (R22)
 
 The owner compacts a group's log (`Replica::compact`), and the shell says when it is due

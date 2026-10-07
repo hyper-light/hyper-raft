@@ -302,8 +302,18 @@ Otherwise the commit costs no write of its own (focal F17): every write states t
 the entries it or an earlier write holds allow, and a `Ready` whose commit moved alone, which need
 not sync (`Ready::must_sync`, etcd's `MustSync`), makes no write: the shell tells the core
 (`RawNode::defer_commit`), which then vouches for no commit from it, takes back the release given
-with it, holds its answers to the durable commit, and gives the hard state again with the next
-`Ready`; a member that alone decides (it leads, it is the one
+with it, holds its answers to the durable commit (the shell defers before it takes the `Ready`'s
+messages, and the core refuses a deferral after), and gives the commit again by the next `Ready`'s
+hard state or as the notice's `commit_index`, which the shell states in its next write that holds
+anything and says durable by `RawNode::commit_durable`. The cost, measured: a follower's commit
+moved alone is durable at its quiet write, a whole quiet period on, and its answers state no more
+until then, so a leader that elects by suspicion stays active (`Raft::active`: a follower's stated
+commit behind the leader's) and `configuration_known` turns true about one quiet period and a
+heartbeat later after each burst. In the liveness world (`tests/liveness.rs`, a 50 ms quiet
+period, 32 seeds), after a burst of eight entries the group sent 84.3 Raft messages and its last
+53.5 ms after the burst applied everywhere, against 9.2 and 2.2 ms when every commit was written;
+a group committing entries one at a time writes half as often (focal's commits bench). An owner
+trades the two through its quiet period; a member that alone decides (it leads, it is the one
 voter of a configuration that is not joint, the entries are of its term) states `commit = last` in
 the very write that holds the entries, which is true exactly when that write is durable, and the
 core's commit is checked against it after; and a commit no write has carried while the applied index
@@ -359,7 +369,9 @@ In `crates/hyper-raft` (`src/node.rs`, `src/raft.rs`, `src/log.rs`):
   fence's write of the hard state alone, `commit = last` in the write of a member that alone
   decides, or the state machine's durable index folded in. It never goes back, and a commit beyond
   the log is refused, fatally. The core rests on one rule of the shell's, which was already the
-  contract: a `Ready`'s hard state is written as given, its commit with it.
+  contract: a `Ready`'s hard state is written as given, its commit with it, unless the shell defers
+  it (`RawNode::defer_commit`, §4.1) before it takes the `Ready`'s messages, and then the write
+  vouches for no commit and its answers are held to `C_d`.
 - **Answers carry it.** `MsgAppendResponse` and `MsgHeartbeatResponse` are made with the commit
   the member knows, as raft-rs's are, and held to the durable commit when they may leave: a
   `Ready`'s persisted messages at that `Ready`, to `C_d` or the commit its own hard state states,

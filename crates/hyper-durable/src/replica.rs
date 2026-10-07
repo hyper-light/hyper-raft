@@ -1477,6 +1477,13 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
         }
         let readied = self.node.ready_in_place();
         let mut ready = self.must(readied)?;
+        // A commit that moved alone rides a later write (§4.1), unless the fence needs `C_d`
+        // for an entry no write out states: the core then vouches for no commit from this one,
+        // and holds the answers among its messages, not yet taken, to the durable commit.
+        if !self.fence_needs_commit() {
+            let deferred = self.node.defer_commit(&mut ready);
+            self.must(deferred)?;
+        }
         self.emit(ready.take_messages(), out);
         for read in ready.take_read_states() {
             self.reads.push_back((read.index, read.request_ctx));
@@ -1491,12 +1498,6 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
                     .snapshot
                     .is_some_and(|s| !proto::snapshot_is_empty(s))
         } || !ready.proposals().is_empty();
-        // A commit that moved alone rides a later write (§4.1), unless the fence needs `C_d`
-        // for an entry no write out states: the core then vouches for no commit from this one.
-        if !self.fence_needs_commit() {
-            let deferred = self.node.defer_commit(&mut ready);
-            self.must(deferred)?;
-        }
         let (hard, vote) = self.hard_of(ready.hard_state(), carries)?;
         let installs = self
             .node

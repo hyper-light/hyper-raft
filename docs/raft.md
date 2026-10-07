@@ -52,7 +52,12 @@ clock, no disk and no network:
 - `on_persist` says which writes are durable, in the order issued, and `advance_apply_to` how far
   the application applied; `advance_append` is `advance_issued` and `on_persist` at once;
 - `commit_durable` says a write the owner made beyond a `Ready`'s hard state states a commit, and
-  `pause_apply` that the owner holds what it was given to apply and takes no more.
+  `pause_apply` that the owner holds what it was given to apply and takes no more;
+- `defer_commit` says the owner writes no hard state for a `Ready` whose commit moved alone (one
+  that need not sync): the write vouches for no commit, the release given with it is taken back, its
+  answers are held to the durable commit, and the commit comes again by a later `Ready` or a
+  notice's `commit_index`. It is asked before the `Ready`'s messages are taken, and refused after
+  (`docs/durable.md` §4.1).
 
 A `Ready` comes in two forms that decide alike (`tests/differential.rs`, "in place"):
 - `RawNode::ready` copies what it gives, as raft-rs's `Ready` does: the entries to persist and the

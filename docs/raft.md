@@ -856,6 +856,52 @@ fails before the fix, member 4 committing another entry at 3, and passes with it
 `tests/fasttrack.rs`: `the_entry_the_swarm_lost_is_lost_by_each_rule_before_the_fix`,
 `with_the_fix_the_same_run_keeps_the_entry`.
 
+### 3.6 A leader's quorum patience (2026-10-07)
+
+A leader asks itself, every election timeout, whether a quorum heard it since it last asked
+(`MsgCheckQuorum`), and steps down where none did. A member's own patience (`Raft::set_patience`)
+covers the stalls its owner saw in itself before it campaigns; nothing covered the leader's check
+for the stalls of its followers' owners, which the leader cannot tell from followers that are gone.
+Measured in focal (`tests/control_host.rs`, sixteen copies of the suite at once, macOS arm64, 18
+cores): 155 of 160 suites passed, and in every failure a member won its term and stepped down in it
+about nine of its periods later, before its followers had heard it led, term after term, while the
+followers' owners stalled twelve to twenty-eight ticks (longest periods 0.3 to 0.7 s at a 25 ms
+tick). That breaks Raft's timing requirement, broadcast time well under the election timeout
+(Ongaro's thesis §3.4), on the followers' side alone.
+
+The rule. `Raft::set_quorum_patience(ticks)` gives a leader `ticks` beyond its election timeout
+before it checks. The check is a liveness device only (thesis §6.2): no read is answered by a lease
+(reads are ReadIndex reads a quorum confirms, and a leader answers alone only as the one voter), and
+a deposed leader commits nothing without a quorum. Checking later deposes no sound leader whose
+followers answer late, and lets one that is cut off take requests a little longer.
+
+- **Its own counter.** The check counts `quorum_elapsed`; a transfer's give-up keeps the election
+  timer and is given up at the election timeout whatever the patience. The check's counter starts
+  again where the shared one did, at a new role or term and as a transfer starts, so a leader of no
+  patience checks exactly when it did.
+- **The window counts every answer in it.** A follower is judged heard if it answered at any point
+  since the last check: the marks (`Progress::recent_active`) are cleared only by the check.
+- **The followers' side is unchanged.** Their vote-refusing lease counts their own silence against
+  the election timeout, so they may elect another while a patient old leader still believes it
+  leads: ordinary Raft, the old leader committing nothing without a quorum and stepping down at its
+  check or at the first newer term it hears.
+- **Under elections by suspicion** it is kept and changes nothing: those take no ticks, and the
+  owner's detectors depose.
+- **Bounds.** A patience whose sum with the election timeout passes what a tick counts is refused,
+  typed (`Error::Settings`), never clamped; the owner bounds it by its tick ceiling, as it bounds
+  patience.
+
+The owner's derivation (focal's, not the core's): the quorum-th smallest exchange tail among the
+leader's other voters (`PeerConnectionPool::exchange_tail`, whose answer waits for the follower's
+owner to take the frame, so a stalled follower stretches it and the leader's own stall does not),
+in ticks beyond the election timeout.
+
+Tests (`src/tests.rs`): no patience checks at the election timeout as before; followers answering
+within the patience keep the term, and a window none answers in deposes; a follower heard early in
+a long window counts at its end; past the patience the leader steps down; a transfer is given up at
+the election timeout whatever the patience; a patient leader commits nothing alone and yields to a
+newer term; an overflowing patience is refused; under suspicion it changes nothing.
+
 ## 4. The crates that follow
 
 | Crate | What | Steps and gate |

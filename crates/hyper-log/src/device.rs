@@ -210,6 +210,17 @@ pub(crate) enum Job<F> {
 pub(crate) struct Frame {
     pub(crate) frame: AlignedBuf,
     pub(crate) at: u64,
+    /// Where the frame opens a slot past the file's last: the slot, written whole with zeros
+    /// before the frame, under the frame's own flush. The file's blocks in it are then written and
+    /// its length covers it, so every later frame in the slot is an overwrite the file system need
+    /// not log: a flush of the device's cache alone, and a confirmation that is one FUA write where
+    /// the device has FUA. On ext4 and XFS a write into an unwritten extent converts it, a change
+    /// the journal must commit (fallocate(2), "Allocating disk space"; the kernel's
+    /// fs/iomap/direct-io.c takes no FUA path for an unwritten extent or a write past the file's
+    /// size), so allocating the slot is not enough: it is written. Zeros past the last frame read as
+    /// no frame, as the end of the file does (`recover::Reader::frame_at`: neither magic has a zero
+    /// byte).
+    pub(crate) zero: Option<(u64, u64)>,
     pub(crate) record: AlignedBuf,
     pub(crate) record_at: u64,
     /// The frame's sequence.
@@ -457,8 +468,11 @@ impl<F: BlockFile> Device<F> {
     /// A frame, its record and one flush; the frame before answered; this one confirmed and
     /// answered unless another frame follows.
     fn frame(&mut self, mut f: Frame, answers: &mut Vec<Answering>) -> Completion {
-        let (result, timing) =
-            self.write_then_flush((&mut f.frame, f.at), Some((&mut f.record, f.record_at)));
+        let (result, timing) = self.write_then_flush(
+            f.zero,
+            (&mut f.frame, f.at),
+            Some((&mut f.record, f.record_at)),
+        );
         let confirming = result.is_ok() && !(f.more || self.follows(f.sequence));
         if result.is_ok() {
             // This frame's record confirms the frame before.
@@ -530,14 +544,19 @@ impl<F: BlockFile> Device<F> {
     /// once: nothing after a failed write, and a failed flush never retried (mantle
     /// docs/design/raft-log.md §3). The writes and the flush are timed apart.
     fn write_then_flush(
-        &self,
+        &mut self,
+        zero: Option<(u64, u64)>,
         first: (&mut AlignedBuf, u64),
         second: Option<(&mut AlignedBuf, u64)>,
     ) -> (Result<(), LogError>, Timing) {
         let started = stats::now();
         let mut bytes = 0u64;
+        let zero = zero.filter(|_| self.file.fills_new_space());
         let wrote = guarded(|| {
-            bytes = self.write(first.0, first.1)?;
+            if let Some((at, len)) = zero {
+                bytes = self.zero_fill(at, len)?;
+            }
+            bytes = bytes.saturating_add(self.write(first.0, first.1)?);
             if let Some((buf, at)) = second {
                 bytes = bytes.saturating_add(self.write(buf, at)?);
             }
@@ -604,6 +623,26 @@ impl<F: BlockFile> Device<F> {
         };
         timing.flushed_at = result.is_ok().then_some(ended);
         (result, timing)
+    }
+
+    /// Writes zeros over `[at, at + len)`, a slot the file grows by (`Frame::zero`), in one write
+    /// from a buffer of the pool, which holds a segment: the bytes written.
+    fn zero_fill(&mut self, at: u64, len: u64) -> Result<u64, LogError> {
+        let size = usize::try_from(len).map_err(|_| LogError::Damaged("a slot past usize"))?;
+        let mut buf = self.pool.take(size).map_err(|e| LogError::Disk(e.into()))?;
+        let filled = buf
+            .as_mut_capacity()
+            .get_mut(..size)
+            .map(|bytes| bytes.fill(0))
+            .ok_or(LogError::Damaged("a slot past its buffer"))
+            .and_then(|()| buf.set_len(size).map_err(|e| LogError::Disk(e.into())));
+        let written = filled.and_then(|()| {
+            self.file
+                .write_all_at(buf.as_slice(), at)
+                .map_err(LogError::from)
+        });
+        self.pool.give(buf);
+        written.map(|()| len)
     }
 
     /// Writes `buf`, padded with zeros to the file's alignment, at `at`: the bytes written.

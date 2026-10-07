@@ -7238,3 +7238,30 @@ cost. The third device flush at one replica, on both, is ext4's journal committi
 frames grow it. What a FUA device saves is not measured here: neither this VM's disk nor the macOS
 host advertises one, and the measurement is owed on one that does (a Linux machine whose NVMe or SAS
 drive reports `queue/fua` 1).
+
+## hyper-log: a slot written whole before its frames (2026-10-07)
+
+A slot the file grows by is written with zeros before its first frame (`docs/durable.md` §6.3), so
+every later frame in it is an overwrite and its flush commits no journal. The log bench before this
+change (`beeda92`) and after it, alternated, two rounds each, one second a point, plain.
+
+**Linux** (6.12 in Docker Desktop's VM, ext4 on `vda`: write-back cache, no FUA; device flushes from
+`/sys/block/vda/stat`):
+
+| replicas | size | appends/s before | after | p50 before | after | p99 before | after | device flushes/append before | after |
+|---|---|---|---|---|---|---|---|---|---|
+| 1 | 128 B | 2,729 to 2,734 | 4,632 to 4,916 | 348 to 355 µs | 199 to 209 µs | 632 to 742 µs | 240 to 267 µs | 3.00 | 2.00 |
+| 4 | 128 B | 10,229 to 10,447 | 17,016 to 17,077 | 366 to 374 µs | 231 µs | 574 to 652 µs | 283 µs | 0.75 | 0.50 |
+| 16 | 128 B | 35,042 to 35,044 | 53,886 to 54,529 | 443 to 445 µs | 285 to 287 µs | 706 to 730 µs | 426 to 432 µs | 0.19 | 0.13 |
+| 1 | 1 KiB | 2,676 to 2,935 | 4,606 to 4,622 | 335 to 358 µs | 210 to 211 µs | 393 to 681 µs | 263 to 268 µs | 3.00 | 2.00 |
+| 4 | 1 KiB | 9,979 to 10,618 | 16,159 to 16,440 | 367 to 382 µs | 236 µs | 571 to 588 µs | 298 to 476 µs | 0.75 | 0.50 |
+| 16 | 1 KiB | 35,655 to 36,583 | 53,229 to 56,623 | 454 to 468 µs | 274 to 290 µs | 675 to 716 µs | 400 to 429 µs | 0.17 | 0.13 |
+
+The journal's flush for the file's growth is gone from every append: two device flushes where there
+were three, the frame's and its confirmation's (the kernel's emulated FUA on this disk). On a device
+with FUA the confirmation's would be a lone FUA write and one flush would remain.
+
+**macOS arm64** (APFS, internal SSD): no device counters; medians unchanged (8.4 to 8.7 ms both),
+energy an append within the spread of the two rounds, and two points whose p99 rose to 108 and 207 ms:
+the frame that grew the file wrote 16 MiB of zeros before its answer. No gain to set against it, so
+the zeros stay off on macOS (`DeviceFile::fills_new_space`).

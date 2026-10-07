@@ -142,6 +142,13 @@ impl DeviceFile {
         self.layout
     }
 
+    /// Whether new space is written with zeros before use (`BlockFile::fills_new_space`): a direct
+    /// file on Linux, where it was measured to remove the journal's flush from every write after a
+    /// slot's first (hyper-raft docs/benchmarks.md, "a slot written whole before its frames").
+    pub fn fills_new_space(&self) -> bool {
+        cfg!(target_os = "linux") && self.caching == Caching::Direct
+    }
+
     /// Writes all of `buf` at `offset` and makes that write durable before it returns. On Linux a
     /// direct file's write goes with `RWF_DSYNC` (pwritev2(2)): the block layer issues it as a FUA
     /// write where the device advertises FUA (`/sys/block/<dev>/queue/fua`) and the write is an

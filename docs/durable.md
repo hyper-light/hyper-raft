@@ -728,6 +728,42 @@ the flushes an append costs"). Three ways out were weighed (2026-10-07):
   kernel flushes in its place. macOS has no such write (`F_BARRIERFSYNC` orders and does not
   persist), so a confirmation there stays a full flush. This is what hyper-log does.
 
+### 6.3 A slot is written whole before its frames
+
+On Linux's ext4 and XFS, a write past a file's size, or into an extent allocated and not yet
+written, changes metadata the file system's journal must commit at the next flush: the size, or the
+extent's conversion from unwritten to written. `fallocate(2)` leaves its space unwritten ("Allocating
+disk space": the range reads as zeros and is converted on its first write), and the kernel's direct
+I/O path issues no FUA write, and commits the journal at a `RWF_DSYNC` or `fdatasync`, for a write
+that extends the file or lands in an unwritten extent (fs/iomap/direct-io.c). So every frame that
+grew the file paid a journal commit, a third device flush an append in the bench's closed loop, and a
+frame's confirmation could not be a lone FUA write.
+
+A slot the file grows by is therefore written whole with zeros before its first frame, under that
+frame's own flush (`device::Frame::zero`; the first slot at the log's creation), where the file says
+it pays (`BlockFile::fills_new_space`: a direct file on Linux, and the simulator, which stands for
+it). Every later frame in the slot is an overwrite of written blocks inside the file's size, a flush
+of the device's cache alone. A slot reused is written already and is not filled again.
+
+- **Recovery is unchanged by the zeros.** A frame is read only where its block begins with the frame
+  magic and a segment's header only where its block begins with the segment magic; neither magic
+  has a zero byte, so a zeroed block is no header and reads as the end, as the file's end does
+  (`recover::Reader::frame_at`). A power cut anywhere in a growing frame's writes, the zeros' among
+  them, leaves a log that opens with what it acknowledged (`tests/preallocate.rs`).
+- **What the file's length no longer does.** While frames grew the file, a frame whose flush failed
+  could be cut by the file's end falling inside its block. Inside a filled slot such a frame, if every
+  sector of it reached the medium, verifies and is kept, as it would be in a reused slot: a failed
+  flush leaves its writes' durability unknown, and an unacknowledged write may survive. What was
+  acknowledged survives either way.
+- **Accounting.** The zeros fill the segment the growth gate (§6) admitted for the slot: the gate
+  already reserves whole segments, and `held` at open counts them.
+- **Where it pays.** Measured on Linux: the device's flushes an append fall from three to two, and
+  appends a second rise by about 70% (`docs/benchmarks.md`, "a slot written whole before its frames").
+  On macOS the zeros showed no gain and a growing frame's 16 MiB of zeros cost a 100 to 200 ms answer,
+  so it stays off there, and on Windows, unmeasured. The zeros are written on the frame that grows
+  the file; writing them ahead, while a slot admitted early waits, would take that cost off the
+  frame's answer, and is open.
+
 ## 7. Threading and ownership
 
 No thread per group, no `Arc`, no lock (`CLAUDE.md` §1). A node runs a fixed set of owner threads

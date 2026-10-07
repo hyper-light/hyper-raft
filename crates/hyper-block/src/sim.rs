@@ -368,6 +368,11 @@ impl BlockFile for SimFile {
         Ok(())
     }
 
+    /// The sim stands for a direct file on Linux, so that one run's bytes are every platform's.
+    fn fills_new_space(&self) -> bool {
+        true
+    }
+
     /// The write, durable on its own as a FUA write is: its sectors reach the medium before it
     /// returns, and every other sector not yet flushed stays as it was, durable at the next flush
     /// or not at a crash. One operation, as a power cut counts it.

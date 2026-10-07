@@ -772,8 +772,17 @@ fn a_failed_flush_fences_the_log_and_loses_nothing_acknowledged() {
     file.clear_faults().unwrap();
     let (log, recovery) = Log::open(file, config(16, 8), ID).unwrap();
     // Whatever of the lost frame's persist record the failed flush left durable, the frame
-    // was never confirmed: it is the torn tail, and it held no term or vote to keep.
+    // was never confirmed: nothing of it is restored, and it held no term or vote to keep. A
+    // failed flush leaves its writes' durability unknown (Rebello et al., ATC 2020), so the frame
+    // is gone, or, where every sector of it happened to reach the medium inside the file, whole:
+    // what was acknowledged is there either way, and nothing is damaged. The file's length cut
+    // such a frame only while frames grew the file; a slot written whole before its frames
+    // (docs/durable.md §6.3), or one reused, holds it as any other frame.
     assert!(recovery.restored.is_empty());
+    assert!(recovery.damaged.is_empty());
+    if log.view(1).unwrap().unwrap().last == 3 {
+        apply(&mut models, 1, &lost);
+    }
     check(&log, &models);
 }
 

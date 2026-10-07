@@ -50,6 +50,15 @@ pub trait BlockFile: Send {
     /// unknown (Rebello et al., ATC 2020): the caller must stop trusting what it wrote.
     fn sync_data(&self) -> Result<(), DiskError>;
 
+    /// Whether a writer should write the space it grows the file by with zeros once, before it
+    /// uses it, so that its later writes there are overwrites: on Linux's ext4 and XFS a write
+    /// past the file's size, or into an unwritten extent, changes metadata the journal must commit
+    /// at the next flush (fallocate(2); fs/iomap/direct-io.c), and an overwrite of written blocks
+    /// does not. False by default: elsewhere the gain is not measured, and the zeros cost a write.
+    fn fills_new_space(&self) -> bool {
+        false
+    }
+
     /// Writes all of `buf` at `offset` and makes that write durable before it returns: at least
     /// that write, and of the others not yet flushed none it promises. By default a write and a
     /// flush of the file. A failure leaves the write's durability unknown, as a flush's does.
@@ -101,6 +110,10 @@ impl BlockFile for DeviceFile {
 
     fn write_durable_at(&self, buf: &[u8], offset: u64) -> Result<Durable, DiskError> {
         DeviceFile::write_durable_at(self, buf, offset)
+    }
+
+    fn fills_new_space(&self) -> bool {
+        DeviceFile::fills_new_space(self)
     }
 
     fn try_clone(&self) -> Result<Self, DiskError> {

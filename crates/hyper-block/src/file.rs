@@ -407,9 +407,9 @@ pub fn preferred_block(file: &File, path: &Path) -> Result<usize, DiskError> {
 /// refused rather than rounded: rounded, a block would no longer be a write the device takes whole.
 fn layout_of(file: &File, path: &Path, align: Alignment) -> Result<Alignment, DiskError> {
     let unit = preferred_block(file, path)?;
-    let unit = Alignment::new(unit).map_err(|_| DiskError::Corrupt {
+    let unit = Alignment::new(unit).map_err(|_| DiskError::Unsupported {
         path: path.to_path_buf(),
-        what: "a file whose device's write unit is no power of two within the alignment bound",
+        reason: "a file whose device's write unit is no power of two within the alignment bound",
     })?;
     Ok(if unit.get() >= align.get() {
         unit

@@ -242,7 +242,7 @@ fn a_change_waits_behind_the_fence_and_what_waits_is_bounded() {
     // entries after it applied on the volatile commit, which costs no write of its own.
     assert!(r.durable_commit() >= changed_at);
     // A whole quiet period on, the quiet write states what was applied.
-    let quiet = u64::try_from(std::time::Duration::from_millis(50).as_nanos()).unwrap();
+    let quiet = u64::try_from(settings(1, 9).quiet.as_nanos()).unwrap();
     let later = now() + 1_000 * quiet;
     for at in [later, later + quiet + 1, later + quiet + 2] {
         let mut out = Output::default();

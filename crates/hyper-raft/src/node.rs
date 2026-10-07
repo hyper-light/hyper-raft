@@ -196,6 +196,10 @@ pub struct Ready {
     after_persisting: bool,
     light: LightReady,
     must_sync: bool,
+    /// Its messages were taken: a commit can no longer be deferred, since
+    /// the answers among them already left stating it
+    /// ([`RawNode::defer_commit`]).
+    messages_taken: bool,
 }
 impl Ready {
     /// Which `Ready` this is, counted from one since the member opened.
@@ -292,6 +296,7 @@ impl Ready {
     }
     /// Takes the messages to send at once, leaving none.
     pub fn take_messages(&mut self) -> Vec<Message> {
+        self.messages_taken = true;
         if self.after_persisting {
             Vec::new()
         } else {
@@ -311,6 +316,7 @@ impl Ready {
     /// Takes the messages to send once this `Ready` is durable, leaving
     /// none.
     pub fn take_persisted_messages(&mut self) -> Vec<Message> {
+        self.messages_taken = true;
         if self.after_persisting {
             self.light.take_messages()
         } else {
@@ -521,7 +527,7 @@ impl<S: Storage> RawNode<S> {
     /// state's; those sent at once or with a notice, beyond this. That
     /// rests on the owner's part of the contract: it writes a `Ready`'s hard
     /// state as given, its commit with it, or tells the core it does not
-    /// ([`RawNode::defer_commit`]) before it issues the `Ready`.
+    /// ([`RawNode::defer_commit`]) before it takes the `Ready`'s messages.
     pub fn durable_commit(&self) -> u64 {
         self.raft.durable_commit()
     }
@@ -1092,10 +1098,16 @@ impl<S: Storage> RawNode<S> {
     /// term or a vote). Only a `Ready` that need not sync ([`Ready::must_sync`])
     /// and gives a hard state is deferred; any other is left as it is, and
     /// `false` returned. A deferred `Ready`'s write vouches for no commit: its
-    /// hard state is given again with the next `Ready`, the release given
-    /// with it is taken back (it rode the hard state, and a release is never
-    /// worth a write of its own), and the answers that leave once it is
-    /// durable state no commit past the durable one.
+    /// hard state is given again by the next `Ready`, or as a notice's
+    /// [`LightReady::commit_index`]; the release given with it is taken back
+    /// (it rode the hard state, and a release is never worth a write of its
+    /// own); and the answers that leave once it is durable state no commit
+    /// past the durable one.
+    ///
+    /// Called before any of `ready`'s messages are taken: the answers among
+    /// them state the commit, and are held to the durable one here. Refused,
+    /// `Error::Invariant`, once they were taken: never deferred with answers
+    /// already out stating a commit no write holds.
     pub fn defer_commit(&mut self, ready: &mut Ready) -> Result<bool> {
         let taken = self
             .taken
@@ -1103,6 +1115,11 @@ impl<S: Storage> RawNode<S> {
             .ok_or(Error::Invariant(
                 "a ready deferred that is not the one taken",
             ))?;
+        if ready.messages_taken {
+            return Err(Error::Invariant(
+                "a commit deferred after its ready's messages were taken",
+            ));
+        }
         if ready.must_sync || ready.hard_state.is_none() {
             return Ok(false);
         }

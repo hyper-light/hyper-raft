@@ -201,6 +201,20 @@ expected cost of parking and then parks in its driver until a kick, a completion
 the 2-competitive spin-then-block rule [KARLIN], with the threshold the measured mean wake (§10). slates'
 attribution of a long poll to the task or to the host (`attribution.rs`) is kept.
 
+**The driver is polled only when it can hold work, and the spin polls it once a quantum.** A busy loop
+takes the driver's completions without blocking once a quantum, and the spin asks it as well as its
+inboxes. Each ask is a system call (`kevent`, `epoll_wait`, `GetQueuedCompletionStatusEx`), and mantle's E2
+range bench (macOS, request and response between client threads and range tasks, 2026-10-07) found a
+shard with no readiness wait spending 50–60% of its time in `kevent` (`sample`): the spin asked every
+turn, about every few hundred nanoseconds, and a single client's round trip took 13 µs at the median for
+a 1 µs operation. The shard arms its driver only for its tasks' readiness waits (`apply_interest`,
+`deliver`), so with none registered the driver holds nothing for a task, and `harvest_io` makes no call
+(a kick left behind ends the next park at once, as it would have). With waits registered, the spin asks
+the driver at its start and then once a quantum, the measured wake's cost: a readiness waits no longer
+than a wake would, while a turn costs no system call (`tests/idle_spin.rs`: no poll with no wait; at most
+one poll a spin with a wait held and a quantum longer than the window, where every turn polled before:
+10,434 polls in one spin).
+
 **The idle window follows requests.** A shard that served a client's request within the measured idle
 window spins rather than parks, so the client's next request costs no kernel wake (slates §4.7,
 `ShardContext::note_activity`). Every path that serves requests must mark it, per request: slates' FUSE

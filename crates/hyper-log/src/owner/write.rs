@@ -56,6 +56,8 @@ pub(super) enum Phase {
     Writing(Writing),
     /// A confirmation's write and flush; `forget` once it is done when it followed a commit.
     Confirming { frame: Unconfirmed, forget: bool },
+    /// The next slot's zeros, written and flushed while nothing else is to be written.
+    Filling { slot: u32 },
 }
 
 /// What the device says of a frame's flush (`device::Completion::Frame`).
@@ -176,9 +178,74 @@ impl<F: BlockFile + 'static> Owner<F> {
             self.schedule.backlog = self.queued(inbox);
             return true;
         }
+        if let Some(slot) = self.fill_due() {
+            match writer::slot_start(&self.p.config, slot) {
+                Ok(at) => {
+                    self.phase = Phase::Filling { slot };
+                    self.dispatch(Job::Fill {
+                        at,
+                        len: self.p.config.segment_bytes,
+                    });
+                    return false;
+                }
+                Err(_) => self.fence(),
+            }
+        }
         self.end_busy_period();
         self.parked = true;
         false
+    }
+
+    /// The slot to fill ahead, while nothing else is to be written: the next past the file's last,
+    /// where the file fills the space it grows by, no freed slot would be reused before it, and
+    /// the file may grow by it (its bound, and its owner's admission: `crate::growth`); none where
+    /// it is filled already, or a fill of it failed. Only under `Waits::Measured`: whether the
+    /// writer is idle depends on when submissions arrive, and under `Waits::Never` nothing the
+    /// writer does may.
+    fn fill_due(&mut self) -> Option<u32> {
+        if !self.p.fills
+            || self.p.config.waits != Waits::Measured
+            || self.fenced
+            || !self.state.segments.free.is_empty()
+        {
+            return None;
+        }
+        if let Some(gate) = self.gate.as_mut() {
+            gate.refill(&mut self.state, self.p.config.max_segments);
+        }
+        let next = u32::try_from(self.state.segments.incarnation.len()).ok()?;
+        let bound = self.p.config.max_segments.min(self.state.ceiling);
+        (next < bound && self.filled != Some(next) && self.unfilled != Some(next)).then_some(next)
+    }
+
+    /// A fill ahead came back: its slot is durable zeros, its admission committed. Or the write or
+    /// flush failed: it is not tried again, and the frame that opens the slot zeroes it under its
+    /// own flush, failing and fencing then if the failure lasts. Nothing else was written since
+    /// the last flush (the owner fills only with every frame confirmed), so the failure reports
+    /// the zeros alone, and the frames acknowledged before stand. Then the loop goes on.
+    pub(super) fn filled_ahead(
+        &mut self,
+        result: Result<(), LogError>,
+        inbox: &Receiver<Message<F>>,
+    ) {
+        let Phase::Filling { slot } = self.phase else {
+            return;
+        };
+        self.phase = Phase::Idle;
+        match result {
+            Ok(()) => {
+                self.filled = Some(slot);
+                self.tally.fills = self.tally.fills.saturating_add(1);
+                if let Some(gate) = self.gate.as_mut() {
+                    gate.grew(1);
+                }
+            }
+            Err(_) => {
+                self.unfilled = Some(slot);
+                self.tally.fill_failures = self.tally.fill_failures.saturating_add(1);
+            }
+        }
+        self.step(inbox);
     }
 
     /// The backlog is empty: the busy period ends at the largest finish tag [SFQ96 §2], and no
@@ -663,7 +730,8 @@ impl<F: BlockFile + 'static> Owner<F> {
             // (`device::Frame::zero`); a slot reused is written already.
             let grows = usize::try_from(target.slot)
                 .is_ok_and(|slot| slot >= self.state.segments.incarnation.len());
-            let zero = (target.opens && grows).then_some((at, self.p.config.segment_bytes));
+            let zero = (target.opens && grows && self.filled != Some(target.slot))
+                .then_some((at, self.p.config.segment_bytes));
             Ok((frame, at, record, self.record_at(sequence)?, confirm, zero))
         });
         match job {
@@ -953,13 +1021,16 @@ impl<F: BlockFile + 'static> Owner<F> {
             )
         });
         if published.is_ok() {
-            // A slot past the file's former end is durable with its frame: its admission is held.
-            let grown = self
-                .state
-                .segments
-                .incarnation
-                .len()
-                .saturating_sub(slots_before);
+            // A slot past the file's former end is durable with its frame: its admission is held,
+            // unless a fill ahead held it already.
+            let slots_after = self.state.segments.incarnation.len();
+            let mut grown = slots_after.saturating_sub(slots_before);
+            if let Some(filled) = self.filled
+                && usize::try_from(filled).is_ok_and(|f| (slots_before..slots_after).contains(&f))
+            {
+                self.filled = None;
+                grown = grown.saturating_sub(1);
+            }
             if let Some(gate) = self.gate.as_mut() {
                 gate.grew(u32::try_from(grown).unwrap_or(u32::MAX));
             }

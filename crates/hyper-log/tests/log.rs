@@ -43,6 +43,20 @@ fn config(segment_blocks: u64, max_segments: u32) -> Config {
     }
 }
 
+/// Waits until `log` has filled a slot ahead `fills` times, as a writer idle under
+/// `Waits::Measured` does on its own (`docs/durable.md` §6.3), so that a test counting or holding
+/// flushes counts or holds its own. Each look is a round trip to the owner, so the wait is charged
+/// to the owner's progress.
+fn filled<F: hyper_block::block::BlockFile>(log: &Log<F>, fills: u64) {
+    for _ in 0..1_000_000 {
+        if log.stats(None).unwrap().fills >= fills {
+            return;
+        }
+        std::thread::yield_now();
+    }
+    panic!("the log never filled {fills} slots ahead");
+}
+
 fn sim(seed: u64) -> SimFile {
     SimFile::new(
         Alignment::new(BLOCK).unwrap(),
@@ -584,9 +598,10 @@ fn reclaiming_segments_keeps_every_live_record() {
     let (log, recovery) = Log::open(file, cfg, ID).unwrap();
     assert!(recovery.damaged.is_empty());
     check(&log, &models);
-    // The file never grew past its quota.
+    // The file never grew past its quota: the persist area and `max_segments` slots, the last
+    // perhaps a slot filled ahead and never opened.
     let len = hyper_block::block::BlockFile::len(&closed(log)).unwrap();
-    assert!(len <= cfg.segment_bytes * u64::from(cfg.max_segments));
+    assert!(len <= cfg.segment_bytes * (u64::from(cfg.max_segments) + 1));
 }
 
 /// The statistics count every frame, flush, byte and wait the log made (`docs/durable.md`
@@ -595,6 +610,9 @@ fn reclaiming_segments_keeps_every_live_record() {
 #[test]
 fn the_statistics_count_each_frame_flush_byte_and_wait() {
     let log = Log::create(sim(46), config(16, 8), ID).unwrap();
+    // The slot after the first, filled ahead once the new log is idle; none more while these
+    // frames fit in the first.
+    filled(&log, 1);
     let counts = |log: &Log<SimFile>| {
         log.with_file(|f| {
             let s = f.stats().unwrap();
@@ -632,6 +650,7 @@ fn the_statistics_count_each_frame_flush_byte_and_wait() {
     assert_eq!(after.flush.count() - before.flush.count(), n);
     assert_eq!(after.write.count() - before.write.count(), n);
     assert_eq!(after.commit_wait.count() - before.commit_wait.count(), n);
+    assert_eq!(after.fills, before.fills, "no slot filled among the frames");
     // Each wait runs from its submission past its frame's writes and flush and its
     // confirmation's durable write, one write at a time, so the waits hold every write and flush
     // timed.
@@ -653,6 +672,8 @@ fn the_statistics_count_each_frame_flush_byte_and_wait() {
 fn a_held_flush_shows_in_the_statistics_without_delaying_them() {
     let (device, gated) = held(sim(47));
     let log = Log::create(device, config(16, 8), ID).unwrap();
+    // The fill ahead of the new log, so the flush held is the frame's.
+    filled(&log, 1);
     let before = log.stats(None).unwrap();
     gated.hold();
     let shut = gated.released();
@@ -865,7 +886,7 @@ fn a_frame_confirmed_by_a_durable_write_is_restored_and_marked_after_a_power_cut
     // Every frame here was alone: each confirmed by a durable write, none by a flush of its own.
     let stats = log.stats(None).unwrap();
     assert!(stats.durable_writes >= 4, "{stats:?}");
-    assert_eq!(stats.flushes, stats.frames, "{stats:?}");
+    assert_eq!(stats.flushes, stats.frames + stats.fills, "{stats:?}");
     log.with_file(|f| f.crash(Crash::LoseAll).unwrap()).unwrap();
     let file = closed(log);
     file.clear_faults().unwrap();

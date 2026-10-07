@@ -92,11 +92,14 @@ pub struct Config {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Waits {
     /// Waits for the submitters the last batch answered while waiting is expected to lower
-    /// total latency (mantle docs/design/raft-log.md §3). What a node runs.
+    /// total latency (mantle docs/design/raft-log.md §3), and writes the next slot whole with
+    /// zeros while idle (`docs/durable.md` §6.3). What a node runs.
     Measured,
     /// Never waits: a batch is what is queued when the writer looks. For a caller whose
     /// submitters never return within a wait, as the replica simulation's, which drives each
-    /// member's submissions one at a time.
+    /// member's submissions one at a time. Nothing the writer does depends on when a submission
+    /// arrives, so it fills no slot ahead while idle: a slot is zeroed under its first frame's
+    /// flush.
     Never,
 }
 
@@ -319,6 +322,9 @@ pub(crate) struct Params {
     /// Bytes of the tag after each entry's and proposal's bytes: [`format::TAG_LEN`] in a sealed
     /// log, 0 in an unsealed one.
     pub(crate) tag: usize,
+    /// The file writes the space it grows by with zeros before use (`BlockFile::fills_new_space`):
+    /// the owner fills the next slot ahead while it is idle (`docs/durable.md` §6.3).
+    pub(crate) fills: bool,
 }
 
 /// `update` for `group` in parts that each fit a frame of `room` payload bytes
@@ -695,10 +701,19 @@ impl<F: BlockFile + 'static> Log<F> {
         let gate = match growth {
             None => None,
             Some(growth) => {
-                let held = u64::try_from(state.segments.incarnation.len())
+                // The file's slots, each a whole segment, or the file's own length to a segment
+                // where it runs past them: a slot filled ahead and not yet opened (`docs/durable.md`
+                // §6.3) is space the file takes.
+                let footprint = u64::try_from(state.segments.incarnation.len())
                     .ok()
                     .and_then(|slots| slots.checked_mul(config.segment_bytes))
                     .and_then(|slots| slots.checked_add(recover::persist_area(&config)));
+                let length = file.len().ok().and_then(|len| {
+                    len.checked_add(config.segment_bytes.checked_sub(1)?)?
+                        .checked_div(config.segment_bytes)?
+                        .checked_mul(config.segment_bytes)
+                });
+                let held = footprint.map(|footprint| footprint.max(length.unwrap_or(0)));
                 match held {
                     Some(held) => Some(growth::Gate::new(growth, config.segment_bytes, held)),
                     None => return Err(Refused::with(LogError::Config("a file past u64"), file)),
@@ -729,7 +744,8 @@ impl<F: BlockFile + 'static> Log<F> {
         gate: Option<growth::Gate>,
     ) -> Result<(Self, Vec<Pending>), Refused<F>> {
         match Self::prepare(file.layout_block(), config, id, restores, sealer.is_some()) {
-            Ok(prepared) => {
+            Ok(mut prepared) => {
+                prepared.p.fills = file.fills_new_space();
                 let log = Self::spawn(
                     file,
                     prepared.p,
@@ -765,6 +781,7 @@ impl<F: BlockFile + 'static> Log<F> {
             frame_room: room_bytes,
             queue_bytes,
             tag: if sealed { format::TAG_LEN } else { 0 },
+            fills: false,
         };
         let waiters = config
             .max_groups

@@ -728,6 +728,13 @@ the flushes an append costs"). Three ways out were weighed (2026-10-07):
   kernel flushes in its place. macOS has no such write (`F_BARRIERFSYNC` orders and does not
   persist), so a confirmation there stays a full flush. This is what hyper-log does.
 
+A frame not confirmed is the torn tail when it does not read, and an unacknowledged suffix when it
+does; neither is restored or marked. A frame whose flush failed, but every sector of which reached the
+medium, is the second: no one heard it was durable, as after a crash between a write and its answer.
+An unconfirmed last frame keeps its term and vote; its commit is not kept; its entries are a suffix no
+one acknowledged, which a leader may overwrite (Raft, §5.3). Whether the file's end falls inside such
+a frame changes nothing (§6.3).
+
 ### 6.3 A slot is written whole before its frames
 
 On Linux's ext4 and XFS, a write past a file's size, or into an extent allocated and not yet
@@ -760,9 +767,35 @@ of the device's cache alone. A slot reused is written already and is not filled 
 - **Where it pays.** Measured on Linux: the device's flushes an append fall from three to two, and
   appends a second rise by about 70% (`docs/benchmarks.md`, "a slot written whole before its frames").
   On macOS the zeros showed no gain and a growing frame's 16 MiB of zeros cost a 100 to 200 ms answer,
-  so it stays off there, and on Windows, unmeasured. The zeros are written on the frame that grows
-  the file; writing them ahead, while a slot admitted early waits, would take that cost off the
-  frame's answer, and is open.
+  so it stays off there, and on Windows, unmeasured.
+- **Written ahead, while the writer is idle.** With every frame confirmed and nothing queued, the
+  writer fills the next slot past the file's last (`owner::write::fill_due`): the one the next
+  growing frame opens, under the same rules as the frame's own zeros. The slot is one the file may
+  take, inside `max_segments` and the gate's admission; it is written whole and flushed by itself
+  (`device::Job::Fill`) before any frame uses it, and its admission is committed only once flushed;
+  the frame that opens it then writes no zeros. Measured on Linux (Docker's VM, ext4, 16 MiB
+  slots), it takes nothing off a growing frame's answer yet: the fill is one write and a flush of
+  a whole segment, about 5 ms there, and a frame that arrives during it waits for all of it, so in
+  a closed loop and with 1 ms between appends the cost moves to the next frame instead of leaving
+  the answers, and a reopen reads the filled slot whole (every block of a slot whose header does
+  not read is searched for a newer frame, `recover::lost_headers`), about 1.5 ms. Writing the fill
+  in pieces of the device's largest single transfer, one a moment the writer is idle, is open.
+  A freed slot to reuse comes first, so none is filled while one waits. Only under
+  `Waits::Measured`: whether the writer is idle depends on when submissions arrive, and under
+  `Waits::Never` nothing the writer does may (the replica simulation and the recorded-seed
+  equivalence, whose batches are fixed, run under it, and zero each slot under its frame's flush).
+  - *A power cut* at the fill's write, at its flush or after it leaves zeros, part of them or none
+    past the last slot, which read as the end: the log opens with every entry it acknowledged,
+    nothing damaged or restored, and `held` at open counts the file's length, the filled slot with
+    it (`tests/preallocate.rs`).
+  - *A failed fill fences nothing.* The owner fills only with every frame confirmed, so nothing else
+    was written since the last flush, and the failure reports the zeros alone; frames inside the
+    slots the file has go on being written and acknowledged. The slot is not filled again: the
+    frame that opens it zeroes it under its own flush, and fails and fences there if the failure
+    lasts, as before (`LogStats::fills`, `fill_failures`).
+  - *What it holds.* At most one slot past the last, and only while no freed slot waits: the file
+    may span its persist area and every one of `max_segments` slots a little sooner than its frames
+    need, never more.
 
 ## 7. Threading and ownership
 

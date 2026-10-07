@@ -204,6 +204,12 @@ pub(crate) enum Job<F> {
     /// Entries read back from the file.
     Read(Reads),
     Look(Look<F>),
+    /// The slot the file grows by next, written whole with zeros and flushed ahead of the frame
+    /// that opens it (`docs/durable.md` §6.3).
+    Fill {
+        at: u64,
+        len: u64,
+    },
 }
 
 /// A frame for the device.
@@ -263,6 +269,11 @@ pub(crate) enum Completion {
     Sweep(Result<Vec<Swept>, LogError>),
     Read(Reads),
     Looked,
+    /// A slot filled ahead, its zeros flushed, or failed.
+    Filled {
+        result: Result<(), LogError>,
+        timing: Timing,
+    },
 }
 
 /// One verified frame of a swept tail: the file offset of its payload and its records.
@@ -362,6 +373,9 @@ pub(crate) struct Device<F> {
     pub(crate) file: F,
     /// Buffers for reading entries back, kept between reads.
     pool: Pool,
+    /// A segment of zeros, written over each slot the file grows by (`Device::zero_fill`): made at
+    /// the first and kept.
+    zeros: Option<AlignedBuf>,
     segment_bytes: u64,
     /// The owner's word that another frame follows the one with this sequence.
     more: Receiver<u64>,
@@ -398,6 +412,7 @@ impl<F: BlockFile> Device<F> {
         Self {
             file,
             pool,
+            zeros: None,
             segment_bytes,
             more,
             flushed,
@@ -445,6 +460,10 @@ impl<F: BlockFile> Device<F> {
                 offset,
                 end,
             } => Completion::Sweep(guarded(|| self.sweep(segment, offset, end))),
+            Job::Fill { at, len } => {
+                let (result, timing) = self.fill(at, len);
+                Completion::Filled { result, timing }
+            }
             Job::Read(reads) => {
                 let group = reads.group;
                 let read =
@@ -625,24 +644,53 @@ impl<F: BlockFile> Device<F> {
         (result, timing)
     }
 
-    /// Writes zeros over `[at, at + len)`, a slot the file grows by (`Frame::zero`), in one write
-    /// from a buffer of the pool, which holds a segment: the bytes written.
+    /// A slot filled ahead: its zeros written, then one flush, so that the frame that opens it
+    /// overwrites written blocks and carries no zeros of its own.
+    fn fill(&mut self, at: u64, len: u64) -> (Result<(), LogError>, Timing) {
+        let started = stats::now();
+        let mut timing = Timing {
+            took_ns: 0,
+            write_ns: 0,
+            flush_ns: None,
+            bytes: 0,
+            flushed_at: None,
+            durable_write: false,
+            durable_fallback: false,
+        };
+        let wrote = guarded(|| self.zero_fill(at, len));
+        let written = stats::now();
+        timing.write_ns = stats::nanos(started, written);
+        let result = wrote.and_then(|bytes| {
+            timing.bytes = bytes;
+            guarded(|| self.file.sync_data().map_err(LogError::from))
+        });
+        let ended = stats::now();
+        timing.took_ns = stats::nanos(started, ended);
+        if result.is_ok() {
+            timing.flush_ns = Some(stats::nanos(written, ended));
+            timing.flushed_at = Some(ended);
+        }
+        (result, timing)
+    }
+
+    /// Writes zeros over `[at, at + len)`, a slot the file grows by (`Frame::zero`), in one write:
+    /// a segment, the log's largest write, from a zeroed buffer of a segment the device makes at the
+    /// first slot it fills and keeps for the log's life, so a slot costs no allocation and no page
+    /// fault after the first. The bytes written.
     fn zero_fill(&mut self, at: u64, len: u64) -> Result<u64, LogError> {
         let size = usize::try_from(len).map_err(|_| LogError::Damaged("a slot past usize"))?;
-        let mut buf = self.pool.take(size).map_err(|e| LogError::Disk(e.into()))?;
-        let filled = buf
-            .as_mut_capacity()
-            .get_mut(..size)
-            .map(|bytes| bytes.fill(0))
-            .ok_or(LogError::Damaged("a slot past its buffer"))
-            .and_then(|()| buf.set_len(size).map_err(|e| LogError::Disk(e.into())));
-        let written = filled.and_then(|()| {
-            self.file
-                .write_all_at(buf.as_slice(), at)
-                .map_err(LogError::from)
-        });
-        self.pool.give(buf);
-        written.map(|()| len)
+        if self.zeros.as_ref().is_none_or(|zeros| zeros.len() != size) {
+            let mut zeros = AlignedBuf::zeroed(size, self.file.layout_block())
+                .map_err(|e| LogError::Disk(e.into()))?;
+            zeros.set_len(size).map_err(|e| LogError::Disk(e.into()))?;
+            self.zeros = Some(zeros);
+        }
+        let zeros = self
+            .zeros
+            .as_ref()
+            .ok_or(LogError::Damaged("no zeros to fill a slot with"))?;
+        self.file.write_all_at(zeros.as_slice(), at)?;
+        Ok(len)
     }
 
     /// Writes `buf`, padded with zeros to the file's alignment, at `at`: the bytes written.

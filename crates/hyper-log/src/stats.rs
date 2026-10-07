@@ -47,9 +47,17 @@ pub struct LogStats {
     /// `flushes`. (Where the device has no FUA, the kernel's own fallback is invisible here: such a
     /// write counts in `durable_writes`, and only the device's counters show its flush.)
     pub durable_fallbacks: u64,
-    /// Times the owner refused the file a slot past its end (`crate::Growth`), each read as the
-    /// file's bound reached: the frame that needed it answered `Full`.
+    /// Asks for a slot past the file's end the owner refused (`crate::Growth`), each read as the
+    /// file's bound reached: the frame that needed it answered `Full`. It counts asks, not
+    /// episodes: the log asks again whenever it looks for room, so one bound reached counts as
+    /// often as the log looked while it held.
     pub growth_refused: u64,
+    /// Slots written whole with zeros and flushed ahead of the frame that opens them, while the
+    /// writer was idle (`docs/durable.md` §6.3). Each fill's flush also counts in `flushes`.
+    pub fills: u64,
+    /// Fills ahead whose write or flush failed: each slot is then zeroed under the flush of the
+    /// frame that opens it, as without a fill.
+    pub fill_failures: u64,
 }
 
 impl LogStats {
@@ -68,6 +76,8 @@ impl LogStats {
             write: Histogram::new(),
             commit_wait: Histogram::new(),
             growth_refused: 0,
+            fills: 0,
+            fill_failures: 0,
         }
     }
 }
@@ -116,6 +126,10 @@ pub(crate) struct Tally {
     pub(crate) durable_writes: u64,
     /// Durable writes made with a write and a flush instead (`Timing::durable_fallback`).
     pub(crate) durable_fallbacks: u64,
+    /// `LogStats::fills`.
+    pub(crate) fills: u64,
+    /// `LogStats::fill_failures`.
+    pub(crate) fill_failures: u64,
     pub(crate) flush: Histogram,
     pub(crate) write: Histogram,
     pub(crate) commit_wait: Histogram,
@@ -128,6 +142,8 @@ impl Tally {
             flushes: 0,
             durable_writes: 0,
             durable_fallbacks: 0,
+            fills: 0,
+            fill_failures: 0,
             flush: Histogram::new(),
             write: Histogram::new(),
             commit_wait: Histogram::new(),

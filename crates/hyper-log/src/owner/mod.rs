@@ -194,6 +194,12 @@ pub(crate) struct Owner<F> {
     seal: Option<crate::seal::Sealer>,
     /// The owner's admission for the file to grow, where it states one (`crate::growth`).
     gate: Option<crate::growth::Gate>,
+    /// The slot past the file's last that a fill ahead wrote with zeros and flushed, its admission
+    /// committed: the frame that opens it writes no zeros (`docs/durable.md` §6.3).
+    filled: Option<u32>,
+    /// The slot a fill ahead failed to write or flush: not tried again, it is zeroed under the
+    /// flush of the frame that opens it.
+    unfilled: Option<u32>,
     /// I/O waiting for the device, in the order asked: at most [`crate::device::JOBS`].
     io: VecDeque<Waiting<F>>,
     /// Where jobs come back, with the device, from the thread that did them; read before every
@@ -287,6 +293,8 @@ impl<F: BlockFile + 'static> Owner<F> {
             device: Some(device),
             seal,
             gate,
+            filled: None,
+            unfilled: None,
             io: VecDeque::new(),
             returns,
             tokens: Some(tokens),
@@ -358,7 +366,7 @@ impl<F: BlockFile + 'static> Owner<F> {
     /// Hands a job and the device to the caller waiting on it, or else to the I/O thread.
     fn start(&mut self, job: Job<F>, doer: Option<SyncSender<Reply>>, device: Device<F>) {
         self.jobs = self.jobs.wrapping_add(1);
-        if matches!(job, Job::Frame(_) | Job::Confirm { .. }) {
+        if matches!(job, Job::Frame(_) | Job::Confirm { .. } | Job::Fill { .. }) {
             self.flushing_since = Some(stats::now());
         }
         let carrier = match self.carrier.take() {
@@ -702,6 +710,11 @@ impl<F: BlockFile + 'static> Owner<F> {
                 self.tally.job(&timing, false);
                 self.flushing_since = None;
                 self.confirmed(result, these, timing.flushed_at, inbox);
+            }
+            Completion::Filled { result, timing } => {
+                self.tally.job(&timing, false);
+                self.flushing_since = None;
+                self.filled_ahead(result, inbox);
             }
             Completion::Read(reads) => self.read(reads),
             Completion::Looked => {

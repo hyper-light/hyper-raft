@@ -7116,3 +7116,37 @@ bisected (`docs/research/burst-loss.md` §8, with the 512-seed table).
 ```sh
 cargo test --release -p hyper-quic --test geo -- --ignored --nocapture --exact print_the_burst_table
 ```
+
+## hyper-rt: a thread's round trip to a task (2026-10-07)
+
+`cargo bench -p hyper-rt --bench echo` (`crates/hyper-rt/benches/echo.rs`). A plain thread sends a value to
+a task on one calibrated shard over a `hyper_rt::sync` channel, and the task answers through the reply
+sender sent with it. This is the request and response path of a consumer whose clients are threads and
+whose servers are tasks; mantle's ranges on shards (its step E2) are one. In the **spinning** row the task
+marks client activity per request and the client spins on its receiver for the calibrated window before
+it blocks. In the **parked** row neither side spins, so a round trip is two kernel wakes. The **std
+floor** is two threads spinning on std channels, the same exchange with no runtime. Each row is 2,995
+measured round trips after as many unmeasured: Wilks' least sample for a one-sided 95 % bound on the
+p99.9 [WILKS], whose maximum is that bound. Allocator calls are counted across the process.
+
+Apple M5 Max, macOS 26.4.1, release build. The machine was shared, with a one-minute load of 10.1–10.3
+during the runs. Two runs of each build, back to back:
+
+| Build | Row | p50 µs | p99 µs | max (p99.9 bound) µs | allocations / trip |
+|---|---|---|---|---|---|
+| before (`124f62a`) | std floor | 0.29, 0.29 | 0.75, 0.33 | 8.79, 11.75 | 0 |
+| | spinning | 12.29, 12.33 | 34.96, 32.29 | 87.12, 159.79 | 0 |
+| | parked | 12.00, 12.38 | 27.75, 35.08 | 61.42, 348.67 | 0 |
+| after (`cb968f1`) | std floor | 0.29, 0.71 | 0.71, 0.75 | 9.21, 6.46 | 0 |
+| | spinning | 2.58, 0.54 | 29.29, 0.79 | 35.92, 32.08 | 0 |
+| | parked | 4.42, 4.50 | 27.58, 28.29 | 94.54, 52.25 | 0 |
+
+Before, the spinning row cost 12 µs at the median, about forty times the floor, and spinning bought
+nothing over parking. The shard polled its driver (`kevent`) on every spin turn and once a quantum on its
+busy path, though no readiness wait was registered. mantle's E2 bench found half the shard's time in
+`kevent` under `sample`. After `cb968f1` the shard polls its driver only while a readiness wait is
+registered, and the spin polls it once a quantum (docs/runtime.md §3.4). The spinning round trip is now
+0.54 µs at the median in the quieter run, within 1.9× of the floor. It was 2.58 µs in the run where the
+calibrated window (4.55 µs) was shorter than the host's scheduling noise at that load. The parked round
+trip is two kernel wakes, 4.4–4.5 µs. The spinning row's p99 depends on the load: 0.79 µs in one run and
+29.29 µs in the other.

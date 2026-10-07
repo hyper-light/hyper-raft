@@ -636,6 +636,15 @@ Memory is reserved before a transition from the owner's budget (focal's R28): an
 reservation is refused changes nothing. The budget is a trait; mantle's and slates' owners pass one
 that admits all, and the reservation then costs nothing on their paths (measured in §12).
 
+The log's own bounds come from the same quantities: an owner states its node's and device's facts
+(`hyper_log::Facts`: the block, the largest entry, the disk budget, the admission bound on groups,
+the checkpoint cadence and what may be uncommitted, the cache) and `Config::derive` gives every
+field by mantle `docs/design/raft-log.md` §2–§5. A segment's frame holds the largest entry alone; a
+group retains two cadences and what is uncommitted, as the compaction rule below holds at most twice
+its threshold; the queue admits `GROUP_SUBMISSIONS` writes for every group the node admits, so it
+never refuses a handle's write for count. Facts that give no configuration are refused, typed
+(`LogError::Unfit`), never clamped, and no caller copies the log's constants.
+
 ### 6.1 When to compact (R22)
 
 The owner compacts a group's log (`Replica::compact`), and the shell says when it is due

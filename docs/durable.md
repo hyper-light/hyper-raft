@@ -674,6 +674,14 @@ state machine is the replica's own; CockroachDB and etcd move application to oth
 here would need shared ownership of the state machine, and whether apply time ever exceeds what a
 quantum allows is measured before any such split (§13).
 
+An owner thread claims its groups from its device's log through a `LogOpener` (`Log::opener`):
+the log's inbox and parameters, cloned, without the log's threads, which the `Log` alone owns and
+joins when it closes. Owners spawned for the node's life, and an owner that places groups at
+runtime, hold one each; a claim through an opener is the log's claim, refused `Claimed` while
+another handle holds the group, and every call answers `Closed` once the log has closed.
+`GroupStore::claim` and `remove` take either, through `LogGroups` (focal 27 §15.8, where focal's
+owners move onto hyper-log).
+
 Every call into the core and the state machine runs inside an unwind boundary (focal's
 `guarded_in`): an unwind fences the replica and is reported, never propagated (mantle `CLAUDE.md`
 §1). The core does not unwind; the state machine is an application's.

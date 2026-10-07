@@ -667,6 +667,7 @@ version = "0.1.0"
 dependencies = [
  "crc32c",
  "getrandom 0.4.3",
+ "hyper-measure",
  "proptest",
  "rustix 1.1.4",
  "tempfile",

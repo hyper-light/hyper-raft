@@ -89,9 +89,10 @@ const FAR_LINK: Shape = Shape {
     steps: 4 * FAR_STEPS_TAKEN,
 };
 
-/// The most steps a named seed's far-link or all-far run took: 32,188, seed 12's far-link run until
-/// every far pair configured (`record_far_link`, measured 2026-10-07).
-const FAR_STEPS_TAKEN: u64 = 32_188;
+/// The most steps a named seed's far-link or all-far run took: 26,058, seed 43's far-link run until
+/// every far pair configured (`record_far_link`, measured 2026-10-07 with the pool fed only by the
+/// pairs it fits; 32,188 before, seed 12).
+const FAR_STEPS_TAKEN: u64 = 26_058;
 
 /// Two near members and one far one: every survivor of the far one's death is far from it.
 const ALL_FAR: Shape = Shape {

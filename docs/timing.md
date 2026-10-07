@@ -609,6 +609,58 @@ datagrams queued while a peer's address was re-resolved at a re-key, sent five d
 then nothing, in 4 runs of 6 (`a_lost_first_probe_ends_at_the_initial_wait`, and in the simulated
 cluster `members_whose_first_probes_are_all_lost_probe_again`).
 
+**A pair the pool does not fit.** The pool's verdict suits the paths the member mostly probes. For a pair much farther away, it is wrong until that pair's own estimator configures. Found by slates on two networks 100 ms apart: a far member's pool, fed by its same-side peers' 1 ms round trips, put each crossing probe's deadline 1.9 to 2.7 ms after its send on a 200 ms path. Each far member condemned each live near member 76 to 115 times in 30 s, from the first second to the last. Every answer arrived after its probe's record had been reused (three a peer, above), so the pair never took a sample and never configured.
+
+The rule:
+
+- A pair is **misfit** (`misfits_pool`) when it has no verdict of its own and any of these holds:
+  - an answer came back past the pool's span `μ + α`;
+  - an answer arrived after its probe's record was reused;
+  - the handshake that keyed its session measured a round trip longer than that span (`join_measured`).
+- The pool is configured, if due, **before** the handshake is compared with it. Comparing first read no verdict on the probe that configured the pool, and that probe was judged by the pool; on slates' harness a near member was condemned in 5 of 40 runs.
+- A misfit pair is never judged by the pool. Until its own estimator configures it is judged **provisionally** (`misfit_verdict`):
+  - **Expected arrival `μ = R`**, the pair's own latest measured round trip: its latest answer however late, else its handshake's.
+  - **Margin `α = max(2R, α_pool)`.** RFC 6298 §2.2's rule for a path with one measured round trip `R` sets `SRTT = R` and `RTTVAR = R/2`, so `RTO = SRTT + 4·RTTVAR = 3R`, and the margin is `3R − R = 2R`. The pool's margin is kept where it is wider: the host's own stalls (§2.6) are in every pair's round trip, near or far.
+  - **Interval `η` and loss `p`** are the pool's. The pair is probed at the member's rounds like any other, and the loss sizes the relays an unanswered probe asks.
+- Before any round trip of the pair is measured, which needs a handshake that measured none and no answer yet, its probes are measurement only, as before.
+
+**What `mistake = 1` means.** Theorem 7's bound `(V + p·α²)/(V + α²)` needs the pair's own delay variance `V`, which a pair with one or two round trips has not measured. So the provisional verdict claims no bound, and the allowance it adds is the whole probe. The condemnation rule does not change:
+
+- an unanswered provisional probe suspects its target, as any judged probe does;
+- the next probe, which carries the suspicion, going unanswered past any extension makes the condemnation pending;
+- the pending condemnation is confirmed by an answer from another member (§2.7, above).
+
+So a member that never answers is condemned after two unanswered provisional probes and the pending wait, the same count as for a configured pair. Only the deadline that decides "unanswered" differs.
+
+**The bound for a member that never answered.** `detection_bound` counts from the peer's last answer. A member killed before any survivor heard from it has no last answer: every survivor's time to hold it dead is counted from the kill instead, on each survivor's own clock, and must be within the bound that survivor stated plus its measured pending wait. Counting from the kill is the stricter choice, since the last answer can only come before it.
+
+**Why a provisional probe's period ends at its answer.** A configured verdict's period ends at its deadline, so the pair is probed at its interval `η`. An answered provisional probe instead ends its period at the answer, as a measurement probe does. Waiting out `3R` on every answered far probe lengthened the member's periods past the interval its pairs' estimators were built at. Their samples stopped counting, and pairs near and far stopped configuring: the kill case on slates' harness failed 33 of 40 runs that way, and passes 40 of 40 with the period ending at the answer. An unanswered provisional probe runs to its deadline and is judged.
+
+**The pool is fed only by pairs it fits.** A misfit pair's round trips belong to another path, so they are not the pool's evidence (`on_ack`). The first form fed the pool with every pair's answers. A far member's pool then mixed its 200 ms crossings with its 0.4 ms same-side round trips, and its mean rose to 75–100 ms. That verdict judged the member's same-side probes, and a judged probe's period runs to its deadline, so the member's mean period grew from 18–54 ms to 95–167 ms. Every pair then sampled at about half the rate (far samples by 30 s: 615 against 1,480 on seed 0), and far pairs took 116–281 s to configure. Fed only by the pairs it fits, the pool keeps the member's own side's paths: far pairs configure in 33–155 s and a far member's death is detected in 0.55–3.54 s (tables below).
+
+**When it ends.** The pair leaves provisional judgment at the probe after its own estimator first configures: `judging` returns the pair's own verdict whenever it has one. `Detector::verdict` reports the same rule. `no_live_member_is_condemned_across_a_lossless_far_link` (`tests/sim.rs`) checks that every far pair was judged provisionally and, by the end, by its own verdict.
+
+**Measured** (`tests/sim.rs`, seeds 0 to 15 and the stale-pool seeds, each through the run-twice check):
+
+Three trees, the same harness and seeds (each row one seed's run; `never` = not within four times the
+branch's most steps):
+
+| tree | false condemnations / min (30 s) | far kill detected | all-far kill detected | far pairs configured |
+|---|---|---|---|---|
+| `756bfaa` (before the branch) | 0 to 214 (a lower bound: most runs spent the step budget inside the 30 s) | never | 59 to 493 ms, past the stated bound | never |
+| `f129a55` (misfit pairs measured, not judged) | 0 | 0.36 to 2.05 s | never | 30 to 123 s |
+| this branch, the pool fed by every pair | 0 | 1.25 to 5.03 s | 2.45 to 4.07 s | 116 to 281 s |
+| this branch, the pool fed by the pairs it fits | 0 | 0.55 to 3.54 s | 2.45 to 4.07 s | 33 to 155 s |
+
+The per-seed rows are in `docs/benchmarks.md`. On `756bfaa` the all-far kill is detected fast only
+because the far pair is judged by the near pool's 2 ms deadline: the same deadline condemns live far
+members, and the detection overran the bound the detector stated.
+
+Open: until a far pair configures, the far member's own detection of it runs at the provisional
+`3R` deadline, so a far member's death is held a few hundred milliseconds to seconds later than a
+configured pair would hold it; and configuration itself is paced by the far pairs' one sample a
+round, minutes on this topology.
+
 **The member's own lateness** (Lifeguard's local health) is measured, not multiplied:
 - every wake it asked for and got late is a sample of `G` ([`Lateness`]), which floors `α`, never
   below the resolution of the clock its owner reads (`Detector::new`, §2.4);
@@ -799,8 +851,9 @@ traced, 2,000 runs on macOS and 454, 475 and 468 on Linux at one, two and four C
 load, every one passing, every answer a live member's probe missed late and none lost. Open: §3, item 1
 governs the probe rate too, since a period is its probe's deadline and nothing yet prices a probe,
 and as the MTBF grows the margins and so the periods grow with it; two members cannot condemn each
-other, as neither can tell its own failure from the other's; the pool's mean is wrong for a pair far
-from the member's others until that pair configures; the allowance is loose while a history is
+other, as neither can tell its own failure from the other's; a pair far from the member's others is
+judged provisionally, at `3R`, until it configures ("A pair the pool does not fit", above); the
+allowance is loose while a history is
 young (§3, item 3); and views that differ are pushed whole, so under heavy churn the exchanges
 carry `2⌈n/r⌉` datagrams a member a window, where digests of ranges of the view would push only
 the ranges that differ.

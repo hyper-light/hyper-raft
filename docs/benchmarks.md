@@ -7288,3 +7288,185 @@ p99.9 and the maximum were no better. The fill is one write and flush of a segme
 and a frame that arrives during it waits for all of it: the cost moves to the next frame. Dropped;
 a fill in pieces of the device's largest transfer is where to start if a workload measures growth
 latency.
+
+## hyper-swim: a pair the pool does not fit, judged provisionally (2026-10-07)
+
+Branch `swim-pair-deadline`, the derivation in `docs/timing.md` §2.7 ("A pair the pool does not fit").
+macOS 26.4.1, Apple M5 Max, 18 cores, 128 GiB, release builds, other sessions' containers running beside (load
+averages printed with each run).
+
+### The far link and the all-far kill on hyper-sim
+
+`cargo test -p hyper-swim --test sim --release -- --ignored --nocapture record_far_link`, run on each
+tree with this branch's `tests/sim.rs`. Each row one seed's run: false condemnations a minute in the
+watched 30 s, the time from a far member's kill after it to every survivor holding it dead, the same
+for a far member killed from the start with every survivor far, and when every far pair's own
+estimator had configured; `never` = not within the step budget (four times this branch's most).
+
+This branch, the pool fed only by the pairs it fits:
+
+| seed | false condemnations / min | far kill detected | all-far detected | far pairs configured | steps |
+|---|---|---|---|---|---|
+| 0 | 0.0 | 618.21ms | 2.46s | 33.34s | 7875 |
+| 1 | 0.0 | 1.66s | 2.92s | 74.79s | 12784 |
+| 2 | 0.0 | 563.60ms | 2.46s | 81.40s | 14001 |
+| 3 | 0.0 | 640.31ms | 2.46s | 71.76s | 13610 |
+| 4 | 0.0 | 956.11ms | 2.92s | 36.01s | 8123 |
+| 5 | 0.0 | 1.21s | 2.47s | 33.71s | 7984 |
+| 6 | 0.0 | 1.06s | 2.45s | 82.66s | 15710 |
+| 7 | 0.0 | 3.20s | 2.46s | 65.21s | 12555 |
+| 8 | 0.0 | 809.11ms | 2.46s | 125.79s | 19865 |
+| 9 | 0.0 | 608.21ms | 4.07s | 48.80s | 10070 |
+| 10 | 0.0 | 3.54s | 3.66s | 67.88s | 13015 |
+| 11 | 0.0 | 730.54ms | 2.46s | 79.51s | 14762 |
+| 12 | 0.0 | 546.71ms | 2.46s | 73.23s | 14451 |
+| 13 | 0.0 | 730.99ms | 4.07s | 84.51s | 13588 |
+| 14 | 0.0 | 947.51ms | 3.66s | 82.48s | 15618 |
+| 15 | 0.0 | 1.04s | 2.46s | 81.57s | 15101 |
+| 25 | 0.0 | 1.01s | 2.46s | 81.67s | 16342 |
+| 33 | 0.0 | 1.55s | 4.07s | 84.39s | 15886 |
+| 36 | 0.0 | 2.82s | 2.46s | 82.19s | 15195 |
+| 37 | 0.0 | 657.04ms | 2.46s | 84.96s | 15884 |
+| 43 | 0.0 | 2.98s | 2.46s | 155.10s | 26058 |
+| 52 | 0.0 | 983.13ms | 4.07s | 74.92s | 13407 |
+
+`756bfaa` (before the branch). Most runs spent the step budget inside the watched 30 s condemning live
+members, so the first column is a lower bound over the time reached:
+
+| seed | false condemnations / min | far kill detected | all-far detected | far pairs configured | steps |
+|---|---|---|---|---|---|
+| 0 | 0.0 | never | 68.21ms | never | 128752 |
+| 1 | 0.0 | never | 488.09ms | never | 128752 |
+| 2 | 200.0 | never | 62.49ms | never | 128752 |
+| 3 | 2.0 | never | 63.36ms | never | 128752 |
+| 4 | 20.0 | never | 493.10ms | never | 128752 |
+| 5 | 12.0 | never | 71.24ms | never | 128752 |
+| 6 | 0.0 | never | 59.40ms | never | 128752 |
+| 7 | 2.0 | never | 65.11ms | never | 128752 |
+| 8 | 18.0 | never | 67.92ms | never | 128752 |
+| 9 | 0.0 | never | 487.75ms | never | 128752 |
+| 10 | 20.0 | never | 65.29ms | never | 128752 |
+| 11 | 0.0 | never | 63.08ms | never | 128752 |
+| 12 | 0.0 | never | 63.92ms | never | 128752 |
+| 13 | 0.0 | never | 488.54ms | never | 128752 |
+| 14 | 6.0 | never | 65.40ms | never | 128752 |
+| 15 | 214.0 | never | 61.10ms | never | 128752 |
+| 25 | 6.0 | never | 63.79ms | never | 128752 |
+| 33 | 4.0 | never | 485.04ms | never | 128752 |
+| 36 | 0.0 | never | 65.99ms | never | 128752 |
+| 37 | 2.0 | never | 65.47ms | never | 128752 |
+| 43 | 0.0 | never | 67.06ms | never | 128752 |
+| 52 | 0.0 | never | 491.78ms | never | 128752 |
+
+`f129a55` (misfit pairs measured, not judged):
+
+| seed | false condemnations / min | far kill detected | all-far detected | far pairs configured | steps |
+|---|---|---|---|---|---|
+| 0 | 0.0 | 680.27ms | never | 58.80s | 128752 |
+| 1 | 0.0 | 2.03s | never | 120.11s | 128752 |
+| 2 | 0.0 | 864.60ms | never | 122.56s | 128752 |
+| 3 | 0.0 | 849.19ms | never | 60.10s | 128752 |
+| 4 | 0.0 | 552.70ms | never | 30.01s | 128752 |
+| 5 | 0.0 | 1.23s | never | 59.82s | 128752 |
+| 6 | 0.0 | 1.14s | never | 60.23s | 128752 |
+| 7 | 0.0 | 786.61ms | never | 64.54s | 128752 |
+| 8 | 0.0 | 1.01s | never | 56.10s | 128752 |
+| 9 | 0.0 | 1.90s | never | 54.22s | 128752 |
+| 10 | 0.0 | 846.39ms | never | 60.59s | 128752 |
+| 11 | 0.0 | 727.14ms | never | 53.39s | 128752 |
+| 12 | 0.0 | 464.33ms | never | 30.38s | 128752 |
+| 13 | 0.0 | 621.18ms | never | 55.99s | 128752 |
+| 14 | 0.0 | 747.24ms | never | 53.80s | 128752 |
+| 15 | 0.0 | 1.55s | never | 30.00s | 128752 |
+| 25 | 0.0 | 665.53ms | never | 49.33s | 128752 |
+| 33 | 0.0 | 1.12s | never | 60.03s | 128752 |
+| 36 | 0.0 | 2.05s | never | 49.92s | 128752 |
+| 37 | 0.0 | 868.70ms | never | 30.01s | 128752 |
+| 43 | 0.0 | 359.46ms | never | 53.52s | 128752 |
+| 52 | 0.0 | 1.36s | never | 69.63s | 128752 |
+
+This branch with the pool fed by every pair (rejected): no false condemnation, the all-far kill as above,
+far kills held dead in 1.25–5.03 s and far pairs configured in 116–281 s, the far members' periods
+stretched by a pool their 200 ms crossings had pulled to a 75–100 ms mean (`docs/timing.md`).
+
+### The cost a member a period
+
+`cd crates/hyper-swim-compare && cargo build --release && target/release/hyper-swim-compare table 7 400`
+and `cargo bench -p hyper-swim --bench allocs`, on `756bfaa` (load 5.27 5.40 6.42) and then on this
+branch (load 4.54 5.38 6.20). slates' detector is the same code in both: its own spread between the two
+runs (up to 11 %) is the machine's noise, and hyper-swim's ratio to it moved within it (64 churning
+0.76 → 0.81, 256 quiet 0.76 → 0.74, 256 churning 0.83 → 0.88). Allocations: 0.00 a member a period
+on every row, before and after.
+
+`756bfaa`:
+
+| Members | Workload | Detector | ns a member a period | Allocations a member a period |
+|---|---|---|---|---|
+| 16 | quiet | hyper | 289 (279–292) | 0.00 (0.00–0.00) |
+| 16 | quiet | slates | 430 (419–503) | 6.13 (6.13–6.13) |
+| 16 | churning | hyper | 520 (494–567) | 0.00 (0.00–0.00) |
+| 16 | churning | slates | 817 (767–911) | 11.24 (11.24–11.24) |
+| 64 | quiet | hyper | 438 (399–500) | 0.00 (0.00–0.00) |
+| 64 | quiet | slates | 509 (498–517) | 6.03 (6.03–6.03) |
+| 64 | churning | hyper | 706 (675–730) | 0.00 (0.00–0.00) |
+| 64 | churning | slates | 928 (899–950) | 11.43 (11.43–11.43) |
+| 256 | quiet | hyper | 822 (797–923) | 0.00 (0.00–0.00) |
+| 256 | quiet | slates | 1075 (999–1210) | 6.01 (6.01–6.01) |
+| 256 | churning | hyper | 1339 (1258–1450) | 0.00 (0.00–0.00) |
+| 256 | churning | slates | 1604 (1515–1668) | 11.63 (11.63–11.63) |
+setValueForKeyFakeAssocArray:27: command not found: _encode
+setValueForKeyFakeAssocArray:27: command not found: _encode
+setValueForKeyFakeAssocArray:27: command not found: _encode
+setValueForKeyFakeAssocArray:27: command not found: _encode
+setValueForKeyFakeAssocArray:27: command not found: _encode
+setValueForKeyFakeAssocArray:27: command not found: _encode
+setValueForKeyFakeAssocArray:27: command not found: _encode
+setValueForKeyFakeAssocArray:27: command not found: _encode
+setValueForKeyFakeAssocArray:27: command not found: _encode
+setValueForKeyFakeAssocArray:27: command not found: _encode
+valueForKeyFakeAssocArray:28: command not found: _decode
+valueForKeyFakeAssocArray:28: command not found: _decode
+
+This branch:
+
+| Members | Workload | Detector | ns a member a period | Allocations a member a period |
+|---|---|---|---|---|
+| 16 | quiet | hyper | 304 (295–319) | 0.00 (0.00–0.00) |
+| 16 | quiet | slates | 431 (419–478) | 6.13 (6.13–6.13) |
+| 16 | churning | hyper | 512 (497–523) | 0.00 (0.00–0.00) |
+| 16 | churning | slates | 808 (758–832) | 11.24 (11.24–11.24) |
+| 64 | quiet | hyper | 423 (408–756) | 0.00 (0.00–0.00) |
+| 64 | quiet | slates | 514 (490–570) | 6.03 (6.03–6.03) |
+| 64 | churning | hyper | 813 (768–910) | 0.00 (0.00–0.00) |
+| 64 | churning | slates | 1008 (976–1060) | 11.43 (11.43–11.43) |
+| 256 | quiet | hyper | 884 (840–1222) | 0.00 (0.00–0.00) |
+| 256 | quiet | slates | 1192 (987–1316) | 6.01 (6.01–6.01) |
+| 256 | churning | hyper | 1438 (1324–1527) | 0.00 (0.00–0.00) |
+| 256 | churning | slates | 1640 (1465–1681) | 11.63 (11.63–11.63) |
+setValueForKeyFakeAssocArray:27: command not found: _encode
+setValueForKeyFakeAssocArray:27: command not found: _encode
+setValueForKeyFakeAssocArray:27: command not found: _encode
+setValueForKeyFakeAssocArray:27: command not found: _encode
+setValueForKeyFakeAssocArray:27: command not found: _encode
+setValueForKeyFakeAssocArray:27: command not found: _encode
+setValueForKeyFakeAssocArray:27: command not found: _encode
+setValueForKeyFakeAssocArray:27: command not found: _encode
+setValueForKeyFakeAssocArray:27: command not found: _encode
+setValueForKeyFakeAssocArray:27: command not found: _encode
+valueForKeyFakeAssocArray:28: command not found: _decode
+valueForKeyFakeAssocArray:28: command not found: _decode
+
+`allocs` (identical but for churning 16: 0.3 → 0.2 bytes a member a period), this branch:
+
+```text
+hyper-swim: allocations, reallocations, bytes asked and minor faults per member per period (400 periods, after every pair is configured); 63 gossip entries a message
+                members     allocs   reallocs      bytes     faults
+  quiet               4       0.00       0.00        0.0     0.0000
+  churning            4       0.00       0.00        1.1     0.0000
+  quiet              16       0.00       0.00        0.0     0.0000
+  churning           16       0.00       0.00        0.2     0.0000
+  quiet              64       0.00       0.00        0.0     0.0000
+  churning           64       0.00       0.00        0.3     0.0000
+  quiet             256       0.00       0.00        0.0     0.0000
+  churning          256       0.00       0.00        0.0     0.0000
+```

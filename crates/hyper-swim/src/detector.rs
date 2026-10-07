@@ -1331,8 +1331,11 @@ impl Detector {
                 }
             }
             // The pool is fed while it judges: by pairs with no verdict of their own, until it has
-            // one.
-            if !peer.report.configured || self.pool.verdict.is_none() {
+            // one; never by a pair it does not fit ([`misfits_pool`]), whose round trips are another
+            // path's and would stretch the pool's span, and with it every period it judges, over the
+            // paths it does fit.
+            let fits = !misfits_pool(peer, pooled_span);
+            if fits && (!peer.report.configured || self.pool.verdict.is_none()) {
                 self.pool
                     .take(sent.nonce, rtt, granularity, Duration::from_nanos(period));
             }

@@ -299,7 +299,11 @@ entry it has not applied. And the logged commit names only entries the same or a
 holds (I7), so a fenced entry waits for its own durability too, which §4.2 never skips.
 
 Otherwise the commit costs no write of its own (focal F17): every write states the latest commit
-the entries it or an earlier write holds allow; a member that alone decides (it leads, it is the one
+the entries it or an earlier write holds allow, and a `Ready` whose commit moved alone, which need
+not sync (`Ready::must_sync`, etcd's `MustSync`), makes no write: the shell tells the core
+(`RawNode::defer_commit`), which then vouches for no commit from it, takes back the release given
+with it, holds its answers to the durable commit, and gives the hard state again with the next
+`Ready`; a member that alone decides (it leads, it is the one
 voter of a configuration that is not joint, the entries are of its term) states `commit = last` in
 the very write that holds the entries, which is true exactly when that write is durable, and the
 core's commit is checked against it after; and a commit no write has carried while the applied index

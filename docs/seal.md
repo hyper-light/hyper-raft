@@ -352,6 +352,13 @@ rollback at rest is a stated non-goal (§13).
   all refused; a hard state changed with the frame's CRC recomputed is `Tampered`; five opens, each
   continuing the head segment with its own session; sweeps reclaiming segments, every live record
   read back after reopening.
+- **A key mismatch is named, never taken for another log.** An open whose expectation of keys
+  differs from the log's is refused by the segment headers' format alone, before anything keyed:
+  `LogError::SealedWithoutKeys` (every header of this log sealed, no `Sealing` given) and
+  `LogError::UnsealedWithKeys` (every header unsealed, `Sealing` given). They are distinct from
+  `Foreign` because a missing or misconfigured key file sends an operator to restore a key, while
+  a foreign file sends them to the wrong log or node; headers of both kinds in one log remain
+  `Tampered`, since a log is sealed or not from its creation.
 
 ## 6. A key to another machine
 

@@ -10,6 +10,8 @@ rust-version.workspace = true
 [dependencies]
 aws-lc-rs = { version = "1.18", default-features = false, features = ["aws-lc-sys", "prebuilt-nasm"] }
 getrandom.workspace = true
+# The device a sealed file is written and read through (`sealed_file`).
+hyper-block = { path = "../hyper-block" }
 thiserror.workspace = true
 
 [target.'cfg(unix)'.dependencies]
@@ -21,6 +23,7 @@ rustix = { workspace = true, features = ["mm", "param"] }
 windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_System_Memory"] }
 
 [dev-dependencies]
+hyper-block = { path = "../hyper-block", features = ["sim"] }
 hyper-measure = { path = "../hyper-measure" }
 tempfile.workspace = true
 
@@ -30,3 +33,7 @@ harness = false
 
 [lints]
 workspace = true
+
+[[bench]]
+name = "files"
+harness = false

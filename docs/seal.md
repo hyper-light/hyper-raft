@@ -206,6 +206,41 @@ spliced with another file's segments fails to open (STREAM's nonce-based OAE sec
   another key fails its commitment and one with any other field changed fails segment 0. The key
   record stays out of segment 0's additional data because a rotation rewrites it (§3.1).
 
+### 4.1 As built: `sealed_file`
+
+`SealedWriter<F: BlockFile>` and `SealedReader<F: BlockFile>` write and read a whole file of this
+section through hyper-block's device file, so no consumer builds the framing again:
+
+- **Layout.** The file is the STREAM stream (`sealed_len` of its plaintext) followed by zeros to
+  the file's alignment and the stream's length as a little-endian `u64` in the last eight bytes. A
+  file opened for direct I/O therefore takes every transfer whole. The length is stored in the
+  clear and needs no MAC: STREAM marks the last segment in its nonce, so any stated length but the
+  true one either places a tag where none was sealed or takes for last a segment not sealed last,
+  and the open fails. The reader also refuses padding that is not zero and a length that does not
+  round to the file's size.
+- **Writes** go in order. A full segment is sealed only once more bytes follow it, so the last
+  segment is always sealed as last, however the plaintext divides. `finish` seals the last
+  segment, writes the padding and the footer, and flushes the file. A writer refuses a file that
+  already holds bytes: one key seals one file, never continued.
+- **Reads** of any plaintext range open only the segments it covers, each read as the aligned
+  window around its stored bytes.
+- **A forged segment size is refused before its buffer is made.** The header's `S` is
+  authenticated only by segment 0, so the caller states the largest segment it writes and a
+  larger header is refused before any allocation.
+- **Durability.** `finish` is the platform's full flush. The caller writes to a name no reader
+  opens and then calls `hyper_block::file::rename_durable`, which renames the file into place and
+  flushes the directory (Pillai et al., OSDI 2014). A crash leaves the old file or the new one
+  whole.
+- **Memory.** One aligned buffer per writer or reader, the segment and its tag, the footer and two
+  alignments, made when the writer or reader is: no allocator call after setup (counted:
+  `cargo bench -p hyper-seal --bench files`).
+- **Tests** (`sealed_file_tests.rs`) refuse a flipped byte at every offset, a cut at and between
+  segment boundaries, an extension, a segment spliced from another file under the same key, two
+  segments swapped, the wrong parent, a header re-pointed at another file's key record (with and
+  without its commitment), a forged segment size, changed padding and footer, a write over bytes,
+  and an unfinished file. Every size at the segment boundaries reads back at alignments 1, 512 and
+  4096, and a direct-I/O file reads back on a real disk after `rename_durable`.
+
 ## 5. Sealing an appended log
 
 The shared log (`hyper-log`) appends frames to segments of a fixed size, reuses segments, and after

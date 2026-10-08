@@ -7470,3 +7470,35 @@ hyper-swim: allocations, reallocations, bytes asked and minor faults per member 
   quiet             256       0.00       0.00        0.0     0.0000
   churning          256       0.00       0.00        0.0     0.0000
 ```
+
+## Sealed files (docs/seal.md §4.1, §11)
+
+`cargo bench -p hyper-seal --bench files -- [DIR]`. A 64 MiB file is written in pieces of one
+segment, then flushed, and read back in pieces of one segment, sealed (`SealedWriter`,
+`SealedReader`) and unsealed through the same `DeviceFile` with direct 4 KiB transfers. Seven runs
+of each kind are interleaved, and the minimum, median and maximum are given in MB/s.
+
+**2026-10-07, macOS, Apple silicon, APFS on the internal NVMe, load average 70 to 72** (other
+sessions' builds and a KIND cluster). This is a busy machine, not a quiet one: the spread is wide,
+and this run is recorded for its allocation count and its shape, not for its throughput.
+
+| Segment | Path | Unsealed | Sealed |
+|---|---|---|---|
+| 4 KiB | write + flush | 83 / 129 / 265 | 84 / 122 / 294 |
+| 4 KiB | read | 103 / 134 / 150 | 113 / 131 / 145 |
+| 64 KiB | write + flush | 728 / 1,144 / 1,484 | 488 / 1,109 / 1,429 |
+| 64 KiB | read | 395 / 781 / 1,545 | 504 / 549 / 611 |
+
+- **Allocator calls after setup: 0** for writes and reads at both segment sizes (16,384 and 1,024
+  segments a run). The law holds.
+- **At 4 KiB the device bounds both paths**, and sealed is within the run-to-run spread of
+  unsealed.
+- **The 64 KiB read is the cipher in series with the I/O.** The `seal` bench, at the same load,
+  opened 64 KiB segments at 1.45 GB/s a core. A reader that reads and then opens each segment
+  costs 1 / (1/781 + 1/1,450) ≈ 507 MB/s, which matches the 549 measured. On a quiet machine
+  AES-GCM runs several times faster, and that term shrinks with it. Overlapping the next segment's
+  read with this segment's open would remove the term entirely, if a consumer's sequential reads
+  need it.
+
+To be recorded: the same bench on a quiet macOS host and on Linux (ext4 and XFS, NVMe), with the
+load beside each run.

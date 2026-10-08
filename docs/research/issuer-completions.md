@@ -165,6 +165,21 @@ calls). Windows runs on CI's windows runners. The bar for the direct rows is the
 parallelism: four device reads in about one read's time. The bar for the cached rows is the
 sequential `pread`, since a cached page is read in place.
 
+## 8. As built: reads (2026-10-08)
+
+The first piece is reads, the seek fan-out's need: `hyper_block::aio::AioReads` over a file opened
+for direct I/O, one AIO context of the caller's depth, `submit_reads`, `answer` and `try_answer`
+in the issuer's shape, the batch's vector given back with its answer. Each read asks
+`RWF_NOWAIT`, and one that would block is read in place on the submitter's thread; a kernel that
+refuses the flag (`EINVAL`) is sent the reads again without it. Partial submissions wait in order
+for room; a refusal past the batches allowed out hands the reads back. Dropping it destroys the
+context, which waits for every read out before the buffers go. The `unsafe` is in
+`src/aio/linux.rs`, listed in `scripts/check-contracts.py`. Elsewhere, and over a buffered file,
+it is refused, typed. Measured (docs/benchmarks.md, "hyper-block: a batch of reads through native
+AIO"): four direct reads in 84.5 µs at the median against 257.5 µs one after another, 0 allocations
+an operation. Still to build: writes and the flush through the same context (§2's `IOCB_CMD_FDSYNC`
+probe), and Windows' IOCP (§3).
+
 ## Sources
 
 - man-pages: io_setup(2), io_submit(2), io_getevents(2) (man7.org).

@@ -86,6 +86,8 @@ UNSAFE_ALLOWED = {
     "crates/hyper-seal/src/file_windows.rs":
         "GetSecurityInfo, GetAclInformation, GetAce, EqualSid, IsWellKnownSid and LocalFree through "
         "windows-sys (a key file's DACL, checked owner-only)",
+    "crates/hyper-block/src/aio/linux.rs":
+        "io_setup(2), io_submit(2), io_getevents(2) and io_destroy(2) through libc::syscall, with <linux/aio_abi.h>'s iocb and io_event records (native AIO reads of a direct file)",
     "crates/hyper-block/src/node/macos.rs":
         "the disk ioctls of <sys/disk.h> (a device node's capacity and cache flush)",
     "crates/hyper-raft-e2e/src/fault_windows.rs":

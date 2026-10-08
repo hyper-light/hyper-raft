@@ -7502,3 +7502,30 @@ and this run is recorded for its allocation count and its shape, not for its thr
 
 To be recorded: the same bench on a quiet macOS host and on Linux (ext4 and XFS, NVMe), with the
 load beside each run.
+
+## hyper-block: a batch of reads through native AIO (2026-10-08)
+
+`cargo bench -p hyper-block --bench reads -- DIR`, the reads bench above with a third row: the
+same four-page batch handed to the kernel's native AIO by `AioReads` (`crates/hyper-block/src/aio`),
+submitted with io_submit(2) and reaped with io_getevents(2) on the calling thread, so no thread
+stands between the caller and the device (`docs/research/issuer-completions.md`). The row exists
+on Linux and over a direct-I/O file only: elsewhere `AioReads` is refused, typed.
+
+Docker Desktop's Linux VM on the M5 Max (Linux 6.12.76-linuxkit, 18 CPUs), ext4 on its virtio disk
+over the Mac's SSD, release build, 2,995 operations a row (Wilks' 95 % bound on the p99.9), one-minute
+load 10.3 throughout:
+
+| Row | p50 µs | p99 µs | max (p99.9 bound) µs | allocations / op | faults / op |
+|---|---|---|---|---|---|
+| direct, sequential | 257.54 | 466.71 | 755.75 | 0 | 0 |
+| direct, batched through the issuer | 177.75 | 423.04 | 1,479.33 | 3 | 0 |
+| direct, native AIO | 84.54 | 218.71 | 382.08 | 0 | 0 |
+| cached, sequential | 2.83 | 3.96 | 57.04 | 0 | 0 |
+| cached, batched through the issuer | 91.25 | 199.58 | 668.00 | 3 | 0 |
+
+Native AIO reads four pages in about one page's time: 84.5 µs against 257.5 µs one after another
+(64 µs a page), 3.0 times faster, and 2.1 times faster than the issuer's batch, whose four thread
+hand-offs it drops. It allocates nothing per operation (the batch's vector comes back with its
+answer) where the issuer's batch makes three allocator calls, and its tail is the shortest of the
+direct rows. Cached pages are still read in place: AIO refuses a buffered file, and a cached read
+is 2.8 µs. The VM's disk is not a bare NVMe device; a bare-metal Linux run is owed.

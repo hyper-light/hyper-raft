@@ -30,6 +30,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+use hyper_block::aio::AioReads;
 use hyper_block::buf::{AlignedBuf, Alignment};
 use hyper_block::file::{CachingRequest, DeviceFile};
 use hyper_block::issuer::Issuer;
@@ -164,6 +165,24 @@ fn rows(dir: &Path, n: usize, request: CachingRequest, label: &str) {
         held = Some(attached.answer().unwrap().1.unwrap());
     });
     print(&format!("{label} batched"), &batched);
+    drop(attached);
+    // The same batch through the kernel's native AIO, issued and reaped on this thread (Linux,
+    // direct files only; refused elsewhere, and the row is then not printed). The reads vector is
+    // given back with its answer, so the row allocates nothing per operation.
+    if let Ok(mut aio) = AioReads::new(file, FAN_OUT, 1) {
+        let mut reads: Option<Vec<(AlignedBuf, u64)>> = held
+            .take()
+            .map(|bufs| bufs.into_iter().map(|buf| (buf, 0)).collect());
+        let native = measure(n, |seed| {
+            let mut batch = reads.take().unwrap();
+            for (_, at) in &mut batch {
+                *at = offset(seed);
+            }
+            aio.submit_reads(batch).unwrap();
+            reads = Some(aio.answer().unwrap().1.unwrap());
+        });
+        print(&format!("{label} native AIO"), &native);
+    }
 }
 
 fn main() {

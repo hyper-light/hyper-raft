@@ -8,7 +8,9 @@
 //! seek reads from as many branches. **sequential** reads them on the calling thread, one
 //! `read_exact_at` after another. **batched** hands them to an issuer of `FAN_OUT` workers as one
 //! batch (`Attached::submit_reads`) and takes its answer. The buffers are the same each operation and
-//! go back to the caller with the answer, so the count is the read path's own.
+//! go back to the caller with the answer, so the count is the read path's own. **native AIO** hands
+//! the batch to the kernel from the calling thread (Linux, direct files). The **durable writes**
+//! rows write `FAN_OUT` pages at such offsets and flush them, in place or through native AIO.
 //!
 //! Each row takes Wilks' least sample for a one-sided 95 % bound on the p99.9, `n = ⌈ln 0.05 / ln
 //! 0.999⌉ = 2,995` operations [WILKS], after as many unmeasured. Allocator calls are counted across
@@ -30,7 +32,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use hyper_block::aio::AioReads;
+use hyper_block::aio::AioFile;
 use hyper_block::buf::{AlignedBuf, Alignment};
 use hyper_block::file::{CachingRequest, DeviceFile};
 use hyper_block::issuer::Issuer;
@@ -169,7 +171,7 @@ fn rows(dir: &Path, n: usize, request: CachingRequest, label: &str) {
     // The same batch through the kernel's native AIO, issued and reaped on this thread (Linux,
     // direct files only; refused elsewhere, and the row is then not printed). The reads vector is
     // given back with its answer, so the row allocates nothing per operation.
-    if let Ok(mut aio) = AioReads::new(file, FAN_OUT, 1) {
+    if let Ok(mut aio) = AioFile::new(file, FAN_OUT, 1) {
         let mut reads: Option<Vec<(AlignedBuf, u64)>> = held
             .take()
             .map(|bufs| bufs.into_iter().map(|buf| (buf, 0)).collect());
@@ -185,6 +187,42 @@ fn rows(dir: &Path, n: usize, request: CachingRequest, label: &str) {
     }
 }
 
+/// Durable writes of `FAN_OUT` pages at the read rows' offsets over a direct file: **in place**
+/// writes each with `write_all_at` and then flushes with `sync_data`; **native AIO** hands the
+/// writes and the flush to the kernel as one batch (`AioFile::submit_writes`) and takes its answer.
+fn write_rows(dir: &Path, n: usize) {
+    let file = file(dir, CachingRequest::PreferDirect);
+    let align = file.alignment();
+    let offset = |seed: &mut u64| (next(seed) % PAGES) * PAGE as u64;
+    let mut bufs: Vec<AlignedBuf> = (0..FAN_OUT)
+        .map(|i| {
+            let mut buf = AlignedBuf::zeroed(PAGE, align).unwrap();
+            buf.extend_from_slice(&[i as u8 + 1; PAGE]).unwrap();
+            buf
+        })
+        .collect();
+    let in_place = measure(n, |seed| {
+        for buf in &bufs {
+            file.write_all_at(buf.as_slice(), offset(seed)).unwrap();
+        }
+        file.sync_data().unwrap();
+    });
+    print("durable writes in place", &in_place);
+    if let Ok(mut aio) = AioFile::new(file, FAN_OUT + 1, 1) {
+        let mut writes: Option<Vec<(AlignedBuf, u64)>> =
+            Some(bufs.drain(..).map(|buf| (buf, 0)).collect());
+        let native = measure(n, |seed| {
+            let mut batch = writes.take().unwrap();
+            for (_, at) in &mut batch {
+                *at = offset(seed);
+            }
+            aio.submit_writes(batch, true).unwrap();
+            writes = Some(aio.answer().unwrap().1.unwrap());
+        });
+        print("durable writes native AIO", &native);
+    }
+}
+
 fn main() {
     let dir: PathBuf = std::env::args()
         .skip(1)
@@ -194,6 +232,7 @@ fn main() {
     println!("{n} operations a row, {FAN_OUT} pages of {PAGE} bytes each, {PAGES} pages");
     // The device's reads, past the page cache where the file system allows it.
     rows(&dir, n, CachingRequest::PreferDirect, "direct");
+    write_rows(&dir, n);
     // The page cache's: the whole file read once first, so every row's read is a cached page's,
     // the case of an engine whose working set the OS caches.
     let cached = file(&dir, CachingRequest::Buffered);

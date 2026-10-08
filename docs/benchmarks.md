@@ -7506,10 +7506,10 @@ load beside each run.
 ## hyper-block: a batch of reads through native AIO (2026-10-08)
 
 `cargo bench -p hyper-block --bench reads -- DIR`, the reads bench above with a third row: the
-same four-page batch handed to the kernel's native AIO by `AioReads` (`crates/hyper-block/src/aio`),
+same four-page batch handed to the kernel's native AIO by `AioFile` (`crates/hyper-block/src/aio`),
 submitted with io_submit(2) and reaped with io_getevents(2) on the calling thread, so no thread
 stands between the caller and the device (`docs/research/issuer-completions.md`). The row exists
-on Linux and over a direct-I/O file only: elsewhere `AioReads` is refused, typed.
+on Linux and over a direct-I/O file only: elsewhere `AioFile` is refused, typed.
 
 Docker Desktop's Linux VM on the M5 Max (Linux 6.12.76-linuxkit, 18 CPUs), ext4 on its virtio disk
 over the Mac's SSD, release build, 2,995 operations a row (Wilks' 95 % bound on the p99.9), one-minute
@@ -7529,3 +7529,25 @@ hand-offs it drops. It allocates nothing per operation (the batch's vector comes
 answer) where the issuer's batch makes three allocator calls, and its tail is the shortest of the
 direct rows. Cached pages are still read in place: AIO refuses a buffered file, and a cached read
 is 2.8 µs. The VM's disk is not a bare NVMe device; a bare-metal Linux run is owed.
+
+### Durable writes through native AIO (2026-10-08)
+
+The same bench gained the **durable writes** rows: four pages written at the read rows' offsets in
+the direct file and then flushed. **In place** writes each with `pwrite` and flushes with
+`fdatasync` on the calling thread; **native AIO** hands the four writes to the kernel as one batch
+(`AioFile::submit_writes`, flush asked) and, once all four have completed, its `IOCB_CMD_FDSYNC`
+through the same context (Linux 4.18; the submitter's `fdatasync` where the kernel takes none).
+Same VM, disk and build as above; one-minute load 13.7 at the start of the run:
+
+| Row | p50 µs | p99 µs | max (p99.9 bound) µs | allocations / op | faults / op |
+|---|---|---|---|---|---|
+| direct, sequential reads | 179.92 | 380.79 | 695.88 | 0 | 0 |
+| direct, native AIO reads | 72.08 | 164.21 | 278.62 | 0 | 0 |
+| durable writes in place | 444.67 | 870.92 | 9,647.71 | 0 | 0 |
+| durable writes, native AIO | 311.71 | 521.58 | 1,781.92 | 0 | 0 |
+
+Four writes and their flush take 311.7 µs at the median through native AIO against 444.7 µs in
+place, 1.4 times faster, with the p99 at 0.60 times and the p99.9 bound at 0.18 times the in-place
+row's. The writes overlap, and the flush, which dominates both rows, is the same one `fdatasync`
+makes. Nothing is allocated per operation. The read rows of this run repeat the reads table's
+order (native AIO 2.5 times faster than sequential reads here). A bare-metal Linux run is owed.

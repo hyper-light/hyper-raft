@@ -167,7 +167,7 @@ sequential `pread`, since a cached page is read in place.
 
 ## 8. As built: reads (2026-10-08)
 
-The first piece is reads, the seek fan-out's need: `hyper_block::aio::AioReads` over a file opened
+The first piece is reads, the seek fan-out's need: `hyper_block::aio::AioReads` (now `AioFile`) over a file opened
 for direct I/O, one AIO context of the caller's depth, `submit_reads`, `answer` and `try_answer`
 in the issuer's shape, the batch's vector given back with its answer. Each read asks
 `RWF_NOWAIT`, and one that would block is read in place on the submitter's thread; a kernel that
@@ -177,8 +177,19 @@ context, which waits for every read out before the buffers go. The `unsafe` is i
 `src/aio/linux.rs`, listed in `scripts/check-contracts.py`. Elsewhere, and over a buffered file,
 it is refused, typed. Measured (docs/benchmarks.md, "hyper-block: a batch of reads through native
 AIO"): four direct reads in 84.5 µs at the median against 257.5 µs one after another, 0 allocations
-an operation. Still to build: writes and the flush through the same context (§2's `IOCB_CMD_FDSYNC`
-probe), and Windows' IOCP (§3).
+an operation.
+
+Writes and the flush followed the same day, and the type is now `AioFile`: `submit_writes(writes,
+flush)` issues a batch's writes (`IOCB_CMD_PWRITE`, no `RWF_NOWAIT`) and, once every one has
+completed and only if all succeeded, its flush. The flush is an `IOCB_CMD_FDSYNC` through the same
+context, so it is reaped as the writes are; §2's probe is the first flush itself: a kernel that
+refuses the opcode (`EINVAL`, before 4.18) makes the submitter flush with `fdatasync` from then on,
+counted (`flushes_in_place`). A batch's flush is tagged with an index no transfer has (2^24 - 1),
+so a batch holds fewer transfers than that, refused otherwise, as is a transfer ending past
+`i64::MAX` (the kernel's `loff_t`). Measured (docs/benchmarks.md, "Durable writes through native
+AIO"): four page writes and their flush in 311.7 µs at the median against 444.7 µs in place, p99
+521.6 µs against 870.9 µs, 0 allocations. The `fdatasync` fallback is not exercised by a kernel
+CI runs (6.x); it is the flush the in-place row makes. Still to build: Windows' IOCP (§3).
 
 ## Sources
 

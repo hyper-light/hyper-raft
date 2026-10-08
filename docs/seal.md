@@ -209,7 +209,11 @@ spliced with another file's segments fails to open (STREAM's nonce-based OAE sec
 ### 4.1 As built: `sealed_file`
 
 `SealedWriter<F: BlockFile>` and `SealedReader<F: BlockFile>` write and read a whole file of this
-section through hyper-block's device file, so no consumer builds the framing again:
+section through hyper-block's device file, so no consumer builds the framing again. They come with
+hyper-seal's `files` feature, the only one that links hyper-block: hyper-block opens and writes
+files, and a consumer that lets one crate alone write files (slates' land, checked at its build)
+takes the keys, the log's sealing and the STREAM primitives without it, and enables `files` only in
+the crate that writes.
 
 - **Layout.** The file is the STREAM stream (`sealed_len` of its plaintext) followed by zeros to
   the file's alignment and the stream's length as a little-endian `u64` in the last eight bytes. A

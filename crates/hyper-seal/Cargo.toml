@@ -10,8 +10,10 @@ rust-version.workspace = true
 [dependencies]
 aws-lc-rs = { version = "1.18", default-features = false, features = ["aws-lc-sys", "prebuilt-nasm"] }
 getrandom.workspace = true
-# The device a sealed file is written and read through (`sealed_file`).
-hyper-block = { path = "../hyper-block" }
+# The device a sealed file is written and read through (`sealed_file`), only with the `files`
+# feature: hyper-block opens and writes files, and a consumer that confines file writes to one crate
+# (slates' land) takes hyper-seal's keys, log sealing and STREAM primitives without it.
+hyper-block = { path = "../hyper-block", optional = true }
 thiserror.workspace = true
 
 [target.'cfg(unix)'.dependencies]
@@ -31,9 +33,14 @@ tempfile.workspace = true
 name = "seal"
 harness = false
 
+[features]
+# A whole file sealed through a `hyper_block::block::BlockFile` (`sealed_file`).
+files = ["dep:hyper-block"]
+
 [lints]
 workspace = true
 
 [[bench]]
 name = "files"
 harness = false
+required-features = ["files"]

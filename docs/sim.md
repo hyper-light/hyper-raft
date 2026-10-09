@@ -1417,8 +1417,8 @@ sessions' work, load 9–72 (`docs/benchmarks.md`, "hyper-check's strategies and
 | Defect (§4.6) | Random walk (§14.6) | Swarm | PCT, depth 1 | PCT, depth 2 | Coverage-guided | Exhaustive rounds (rounds played) |
 |---|---|---|---|---|---|---|
 | a commit counted from an older term's replicas | not in 2,096 | **172** | not in 2,096 | not in 2,096 | not in 2,096 | **33,621** (four rounds) |
-| a read served before the term's first commit | 4 | 18 | 8 | 8 | 20 | outside its scenarios (no reads) |
-| a vote sent before it is durable | 1 | 1 | 1 | 1 | 1 | outside its scope (no lagging writes) |
+| a read served before the term's first commit | 4 | 18 | 8 | 8 | 20 | **13,917** (two rounds, §15.14) |
+| a vote sent before it is durable | 1 | 1 | 1 | 1 | 1 | **11** (one lagged round, §15.14) |
 | the fast track without its first rule | 102,775 | **2,693** | 22,066 | 38,861 | not in 102,775 | outside its scope (no fast track) |
 | the fast track without its second rule | **8,868** | not in 8,868 | not in 8,868 | not in 8,868 | not in 8,868 | outside its scope |
 
@@ -1558,8 +1558,8 @@ searches 14.7 min, 2.48 GB resident at most.
 - **`FastTrack.tla` as a Rust `Model`** (§4.5's last paragraph): built (§15.13).
 - **The conformance check is by projection** (§15.4): a step is held to every relation the model's
   actions keep, not shown to be a sequence of model actions.
-- **The round search's scope** leaves out reads, lagging writes and the fast track (§15.8), and
-  applies no symmetry (§15.5); three of the five planted defects lie outside it.
+- **The round search's scope** takes reads and lagging writes since §15.14; it leaves out the
+  fast track and applies no symmetry (§15.5), so the two fast-track defects lie outside it.
 - **PCT's chains** (§11 item 7): per-member priorities were built; Ozkan et al.'s construction is
   still unread.
 - **The strategies in the schedule tests**: the swarm, PCT and coverage run as campaigns here;
@@ -1645,3 +1645,47 @@ every campaign was run again on it from its first seed (release, beside other se
   (`FastTrackRestampReached.cfg`, refused; the Rust search finds the pair after 1,195,591 classes),
   and keeps every invariant at 3,808,625 states (`FastTrackRestamp.cfg`,
   `the_restamp_scope_reaches_a_restamped_prefix_and_keeps_log_matching`).
+
+### 15.14 The round search reaches reads and lagging writes (2026-10-08)
+
+§15.8's last column left three of the five planted defects outside the round search's scope. Two
+are inside it now (`crates/hyper-raft/tests/strategies.rs`).
+
+**Reads, and a commit a member does not know.** A round of `Tiny` is now one of 324 scenarios: the
+replication withholds nothing, the new term's entries (as before, Figure 3.7's case), or every
+message that would raise a member's commit (an append or a heartbeat whose commit is above the
+receiver's disk's), the state a member is in whose leader's last notices were lost; and the leader
+is asked nothing, a proposal it sends to no one (as before), or a read as soon as it leads, before
+an entry of its term can be committed, confirmed by its replication's partition. A read asked in a
+round is answered in it or dropped with its member's restart, so the key is unchanged. The read
+before the term's first commit is caught in two rounds, at 13,917 rounds played: member 1 leads by
+{1, 2} and commits its first entry, the commit's notices withheld from member 2; member 2 leads by
+{2, 3}, is asked a read as it is elected, and answers at 0 a read asked when 1 was committed (Read
+safety) (`two_rounds_of_three_members_catch_the_read_before_the_first_commit`).
+
+| Rounds | Rounds played | Distinct states | Prefixes pruned | Result |
+|---|---|---|---|---|
+| 2 | 45,036 | 139 | 186 | every oracle keeps (default suite) |
+| 3 | 1,153,116 | 3,559 | 41,478 | every oracle keeps; with the older-term commit planted too (1,191,996 played) |
+| 4 | 24,049,548 | 74,227 | 1,078,890 | every oracle keeps |
+| 4, the older-term commit planted | 107,313 to the catch | — | — | caught: Leader Completeness |
+
+The four rounds took 18 minutes in release with the 2026-10-08 gates of another branch running
+(load 18–21), against §15.5's 144 scenarios' 4,481,280 rounds.
+
+**Lagging writes.** A second system, `TinyLagged`, runs three members driven ahead of their
+persistence (`Lagged`, two writes out, `docs/durable.md` §2.1) a round at a time. A round is one of
+36 scenarios: a leader, its election's partition, and which member, if any, takes what the
+election gave it to write and stops before any of it is durable, the crash point between a write's
+issue and its durability. Each pass delivers what is in flight and steps every member's persistence
+once; the passes are bounded by what can move (an election's four messages, two passes each; a
+replication's append and answer for each entry a log can hold, one a round, and the commit's
+notice), and a round that does not settle within them ends its path as a fault, a failure of the harness the search reports with its path. Three rounds
+keep every oracle (6,552 rounds played, 182 states, 539 pruned; default suite,
+`every_three_lagged_rounds_keep_every_oracle`); a vote sent before it is durable is caught in the
+first round, at 11 rounds played, member 1 stopping after it voted for member 2: the durability
+oracle refuses the vote at I1 (`a_lagged_round_catches_a_vote_sent_before_it_is_durable`).
+
+**Still outside it**: the fast track's two rules, which need fast proposals, holdings and a change
+of configuration in one scope; and symmetry (§15.5's departure stands).
+

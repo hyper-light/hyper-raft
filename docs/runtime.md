@@ -215,6 +215,31 @@ than a wake would, while a turn costs no system call (`tests/idle_spin.rs`: no p
 one poll a spin with a wait held and a quantum longer than the window, where every turn polled before:
 10,434 polls in one spin).
 
+**Every way of running the loop takes the driver's completions.** The harvest is part of the step
+(`harvest_turn`), not of the threaded `run` alone, so `block_on`, `run_until_idle` and a caller's own
+`step` and `park` deliver readiness as `run` does. A busy native turn asks the driver once a quantum, the
+same quantum the spin uses, measured from the driver's last actual retrieval; an idle turn asks at once;
+the simulation asks every turn, since its virtual clock does not advance while a task runs and a quantum
+would never pass. Only a wait in the driver renews the retrieval's age: a park skipped for ready local
+work, or a spin answered by an inbox, does not postpone it. Before, a task that yielded continuously
+kept `block_on`, a manual `step` loop and a skipped `park` from ever asking, so a datagram already in the
+socket waited until the yielding task stopped (`tests/busy_readiness.rs`, `manual_step_readiness.rs`,
+`manual_park_readiness.rs`: each failed at its watchdog on `a63ec4b`), the simulation's manual steps
+never delivered one at all (`virtual_step_readiness.rs`), and `run_until_idle` returned with a ready
+datagram undelivered (`owned_loop_readiness.rs`). `run_until_idle` now makes its last turn a
+nonblocking drain and returns with external waits still registered, which a later call delivers.
+
+**Losing the driver is terminal.** One policy reads every result of a driver wait, whether a busy
+harvest, the spin or a park: `DriverLost` is classified before any completion of the same wait is
+delivered and before a handle is armed again, so a partial read never completes on a dead driver. The
+shard closes admission, local spawns and foreign control alike (`ShardGone`), drops its control
+receiver so requests already queued retire, and cancels every live task, including the one being
+polled, at its next poll boundary; the owned loop finishes that cancellation within twice the live tasks
+plus one steps and exits. `block_on` then returns `ShardGone` and the threaded runtime's join
+`DriverLost`. A driver's other refusals to arm a handle again reach the waits still on it as that exact
+error, never as readiness (`tests/busy_driver_loss.rs`, `manual_step_faults.rs`, `park_arm_loss.rs`,
+`terminal_admission.rs`, `threaded_loss_reuse.rs`).
+
 **The idle window follows requests.** A shard that served a client's request within the measured idle
 window spins rather than parks, so the client's next request costs no kernel wake (slates §4.7,
 `ShardContext::note_activity`). Every path that serves requests must mark it, per request: slates' FUSE
@@ -372,6 +397,15 @@ test. `LocalRuntime::block_on(future) -> Result<T, RtError>` builds one shard on
 the future as its root task, runs the loop until the root completes, then cancels and joins whatever the
 root left behind (structured: nothing outlives the call) and returns the output. slates has
 `run_until_idle` only, which cannot return a value and does not end while a socket is merely registered.
+
+The root is detached: its output, not a join, is how its completion reaches the caller, so its task slot
+is free again once it ends, and a `LocalRuntime` runs any number of `block_on` calls with a task capacity
+of one root and its children (`tests/block_on_reuse.rs`: on `a63ec4b`, three calls on a capacity of two
+were refused `TooManyTasks`, each completed root still holding its slot). While a returning call cancels what its root left behind,
+admission is paused, so a destructor cannot spawn work the cancellation would miss; it reopens once the
+cancellation is done, while losing the driver or a shutdown keeps it closed. A turn that ends the shard
+after the root stored its output but before the call took it drops that output, with the shard entered,
+before the call returns its error (`tests/completed_output_loss.rs`).
 
 The test harness is the same call: `hyper_rt::test::run(|| async { ... })` inside a plain `#[test]`, with
 a test configuration (§10.3). No procedural macro crate.
@@ -663,6 +697,15 @@ shard to nothing.
 
 A test or a short command passes a stated configuration instead (one shard, the defaults named with their
 reason), so `block_on` costs no calibration.
+
+**A configuration's counts must fit the fields that carry them.** Before any driver, queue or arena is
+taken, a runtime, a local runtime, a shard's seed and a simulation check that the last task slot fits a
+task word's slot field (`Encoded::MAX_SLOT`) and that the timer, readiness-wait and driver-ring counts
+fit their `u32` indices; past either, the build is refused `BadConfig`. Zero-sized arenas keep their
+refusals as before. A ring of `usize::MAX` entries used to reach the allocator and unwind on capacity
+overflow (`tests/extreme_ring_refusal.rs`), and an empty simulation built nothing and so checked nothing
+(`tests/sim_shape_refusal.rs`). The check is the representation's bound only: a count that fits and is
+still more than the machine can allocate is the allocator's refusal, as before.
 
 ## 11. Simulation
 

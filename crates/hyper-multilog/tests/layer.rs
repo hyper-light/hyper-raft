@@ -259,6 +259,43 @@ fn a_leader_keeps_one_barrier_a_global_and_refuses_what_is_out_of_place() {
     );
 }
 
+/// `docs/multilog.md` §3.1: log 0's leader relays no barrier to a log it does not lead, for its
+/// own replication of log 0 tells that log's leader the global on every path the relay could
+/// take; each other log's leader appends its own, and the member that leads neither log 0 nor the
+/// log relays. Three logs led apart: one global costs each log one barrier and one relay.
+#[test]
+fn log_0s_leader_relays_no_barrier() {
+    let mut group = Group::new(3, 3, 11, ROOMY);
+    group.elect(0, 1);
+    group.elect(1, 2);
+    group.elect(2, 3);
+    assert!(group.member(1).propose(Route::Global, b"g".to_vec()));
+    group.quiet();
+    let proposed: Vec<u64> = group
+        .members
+        .iter()
+        .map(|member| member.counts.barriers_proposed)
+        .collect();
+    assert_eq!(
+        proposed,
+        vec![0, 2, 2],
+        "log 0's leader none; each other member its own log's barrier and one relay"
+    );
+    for log in 1..3 {
+        for member in 1..=3 {
+            assert_eq!(
+                barriers_in(&mut group, member, log),
+                1,
+                "log {log} at member {member}"
+            );
+        }
+    }
+    for member in &group.members {
+        assert_eq!(member.counts.globals_applied, 1, "member {}", member.id);
+    }
+    same_everywhere(&mut group);
+}
+
 /// `docs/multilog.md` §3.1: log 0's leader and log 1's leader cannot hear each other; log 1's
 /// leader never learns the global committed, and the member that hears both relays its barrier:
 /// it applies the global, and once the cut heals every member does, alike.
@@ -717,6 +754,95 @@ fn a_leader_at_its_unmerged_bound_takes_nothing_by_the_fast_track() {
     );
     group.quiet();
     assert_eq!(group.member(2).counts.keyed_applied, before + 1);
+    same_everywhere(&mut group);
+}
+
+/// `docs/multilog.md` §5.3 and §6: an image installed moves the merge, and the bound on what a
+/// leader takes from the fast track moves with it: a vote held past the bound is taken as the image
+/// installs, though the merge has nothing to consume until log 1's entries after the image come.
+#[test]
+fn an_image_installed_raises_the_fast_tracks_bound() {
+    // The global past log 0's merge fills a bound of one entry: a vote for the next index is held.
+    let mut group = Group::open(3, 2, 53, Limits { unmerged: 1 }, true);
+    group.elect(0, 1);
+    group.elect(1, 2);
+    let last_of_log_0 = |group: &mut Group| {
+        group
+            .member(1)
+            .multi
+            .node(0)
+            .unwrap()
+            .raft
+            .log()
+            .last_index()
+            .unwrap()
+    };
+    // 1 hears nothing from 2, log 1's leader, while 2 hears 1: 1's merge stops at the global, which
+    // waits on log 1's barrier, and 2 applies it, takes an image there and compacts its logs.
+    group.blocked.insert((2, 1));
+    // Log 1 takes commands 1 does not hear, so that the image compacts log 1 past all 1 holds.
+    let key_1 = (0..).find(|key| log_of(*key, 2) == 1).unwrap();
+    for i in 0..2u8 {
+        assert!(group.member(2).propose(Route::Key(key_1), vec![i]));
+        group.quiet();
+    }
+    group.member(2).image_at_next_global = true;
+    assert!(group.member(1).propose(Route::Global, b"g".to_vec()));
+    group.quiet();
+    assert!(
+        group.member(2).image.is_some(),
+        "2 took an image at the global"
+    );
+    assert_eq!(
+        group.member(1).counts.globals_applied,
+        0,
+        "1 waits for log 1's barrier"
+    );
+    let global = last_of_log_0(&mut group);
+    let key = (0..).find(|key| log_of(*key, 2) == 0).unwrap();
+    assert!(group.member(3).propose_fast(Route::Key(key), b"k".to_vec()));
+    group.quiet();
+    assert_eq!(
+        last_of_log_0(&mut group),
+        global,
+        "1 holds the vote past its bound"
+    );
+    // Healed: 2's heartbeat finds 1 behind its compaction, and log 1's snapshot carries the image.
+    // Delivered a round at a time, so the round that installs it is seen before log 1's entries
+    // after the image arrive: a heartbeat, its answer, an append 1 refuses, then the snapshot.
+    group.blocked.remove(&(2, 1));
+    for _ in 0..config(2, 3, 53).heartbeat_tick {
+        let _ = group.member(2).multi.node_mut(1).unwrap().tick();
+    }
+    group.settle(2);
+    while group.member(1).counts.installed == 0 {
+        assert!(
+            !group.flight.is_empty(),
+            "the group went quiet and no snapshot reached 1"
+        );
+        let flight = std::mem::take(&mut group.flight);
+        let mut touched = Vec::new();
+        for (from, log, message) in flight {
+            let to = message.to;
+            if group.blocked.contains(&(from, to)) {
+                continue;
+            }
+            let _ = group.member(to).multi.step(log, message);
+            touched.push(to);
+        }
+        touched.sort_unstable();
+        touched.dedup();
+        for id in touched {
+            group.settle(id);
+        }
+    }
+    assert_eq!(
+        last_of_log_0(&mut group),
+        global + 1,
+        "the image raised 1's bound, and 1 took the vote it held"
+    );
+    // 1 holds the global and log 1's commands by the image; the vote's command it applies.
+    group.quiet();
     same_everywhere(&mut group);
 }
 

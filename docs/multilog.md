@@ -103,6 +103,20 @@ log `k` that cannot hear log 0's leader never learns that `g` committed, while i
 `k`'s entries, and every log's entries behind a barrier for `g` wait until a partition heals. A
 member that hears both relays the barrier.
 
+**Log 0's leader relays none.** A member leading log 0 proposes a barrier only in a log it leads
+too. The global it would relay is one it committed, and its own replication of log 0 tells log
+`k`'s leader so on every link the relay could take: the leader keeps sending to each member it
+trusts that has not said it holds the commit (`hyper_raft::raft`, `Raft::active`; under ticks, its
+heartbeats carry the commit), so a leader of log `k` it can reach learns `g` from log 0 itself, and
+one it cannot reach could not take its relay either. Its relay was a message that told log `k`'s
+leader nothing log 0 does not. With three voters and the logs led apart, a global then costs each
+other log one relay, from the member leading neither, where it cost two (`tests/layer.rs`,
+`log_0s_leader_relays_no_barrier`; measured in `docs/benchmarks.md`, "Against slates' MLRaft, under
+one message discipline"). The others relay as soon as they owe: a relay deferred until evidence
+that log `k`'s leader lacks `g` would wait for a message from that leader, and a leader electing
+by suspicion sends nothing while its log is idle (`Raft::active`), which is when a global waits on
+that log's barrier.
+
 **The leader keeps one barrier a global.** A leader of log `k` takes a forwarded barrier only when
 no barrier it appended in its term, and none its merge has read in log `k`, names as much;
 otherwise it drops the message, which is no refusal for its sender (it proposes again only on a new
@@ -488,11 +502,13 @@ layer's other ways into a log what they were:
   barrier a global (§3.1) the fast track would bypass, and a misplaced command no member may
   vote for.
 - **The bound holds.** A leader takes from the fast track only as far as `Limits::unmerged` past
-  its merge (`RawNode::cap_takes`, set at each fast-track message and after each merge call):
-  votes past the cap are kept within the core's bound on them and taken as the merge moves, so a
-  stalled merge stops the fast track's growth of a log as it stops a client's proposals there.
-  A leader that dropped such votes instead lost them for its term (a member says what it holds
-  once a term), and the log's fast track stalled until another entry took those indexes.
+  its merge (`RawNode::cap_takes`, set at each fast-track message, after each merge call that
+  consumed an entry, and at each image installed ahead of the merge, `MultiLog::install`, the one
+  move of the merge that consumes nothing): votes past the cap are kept within the core's bound on
+  them and taken as the merge moves, so a stalled merge stops the fast track's growth of a log as
+  it stops a client's proposals there. A leader that dropped such votes instead lost them for its
+  term (a member says what it holds once a term), and the log's fast track stalled until another
+  entry took those indexes.
 - **The owner proposes again what was displaced.** A proposal another entry took the index of
   comes back in its log's `Ready` (`Ready::displaced`); no member applies it, and the owner
   proposes it again or answers that it was not taken, as for a single group.

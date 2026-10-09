@@ -6350,6 +6350,88 @@ What it shows:
 - Peak footprint: equal at each shape (3 to 81 MiB, the 64-command rounds' logs, which neither
   compacts in this harness).
 
+## Against slates' MLRaft, under one message discipline (2026-10-08)
+
+The loss recorded above (three logs, a command a round) traced, message by message and instruction
+by instruction, to three causes, two of them the harness's:
+- **slates was driven one follower at a time.** Its unit tests' order: the leader makes the first
+  follower's append, folds its reply (which commits), then makes the second follower's, which
+  carries the commit already. No network gives a leader that order: slates' own timed simulation
+  sends every follower its append at once (`lead`), as this layer's members do. Under that order
+  slates sends what this core sends, an append and an answer a follower and then a commit's notice
+  and its answer, 8 messages an entry against the 6 the serial order showed. Both orders are now
+  rows: `slates-multilog` sends in waves, `slates-multilog-in-turn` is the earlier row.
+- **The harness drove every member after every wave**, also members no message reached. An owner
+  driven by its events does not; such a drive cost this layer some 900 instructions (its merge,
+  its barriers and the bound on the fast track looked at again) and was 20% of its instructions a
+  command at three logs. A member is now driven when a message reached it. The layer also stops
+  moving that bound when its merge consumed nothing (`MultiLog::apply`).
+- **Log 0's leader relayed barriers** to logs it did not lead, a message each that told their
+  leaders nothing its own replication of log 0 does not (`docs/multilog.md` §3.1). It relays none
+  now: at three logs led apart the relays fell from 72 to 36 over 200 rounds, 0.36 to 0.18 messages
+  a command. The 0.18 left is the member that leads neither log, the relay that keeps a global live
+  when log `k`'s leader cannot hear log 0's, which slates' leaders-only rule does not.
+
+The same command as above, five processes a layer and shape, 2,000 rounds each; 2026-10-08 19:48
+PDT, load average 6.1 at the start and 9.0 at the end, beside other sessions' work:
+
+| workload | layer | load before | round p50 [95% interval] | p99 | p99.9 | max | CPU ns/command (user+sys) | instructions/command | cycles/command | energy nJ/command | wakeups/1k commands | allocs/command | reallocs/command | alloc bytes/command | messages/command | wire bytes/command | peak footprint MiB |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 1 logs b1 64B | hyper-multilog | 6.08 10.49 12.56 | 0.002 [0.002–0.002] | 0.012 [0.008–0.018] | 0.052 [0.047–0.074] | 0.144 | 1916 | 39693 | 7951 | 10433 | 0.00 | 25.00 | 0.000 | 5179 | 8.00 | 1059 | 3.2 |
+| 1 logs b1 64B | slates-multilog | 6.08 10.49 12.56 | 0.002 [0.002–0.002] | 0.010 [0.006–0.015] | 0.054 [0.045–0.078] | 0.136 | 2193 | 48705 | 9251 | 6871 | 0.00 | 66.00 | 1.923 | 5030 | 8.00 | 1079 | 3.3 |
+| 1 logs b1 64B | slates-multilog-in-turn | 6.08 10.49 12.56 | 0.001 [0.001–0.001] | 0.006 [0.005–0.010] | 0.038 [0.033–0.048] | 0.119 | 1646 | 38857 | 6985 | 5851 | 0.00 | 55.00 | 1.923 | 4278 | 6.00 | 852 | 3.3 |
+| 1 logs b1 64B | slates-multilog+publication | 6.08 10.49 12.56 | 0.132 [0.128–0.135] | 0.575 [0.563–0.589] | 0.789 [0.740–1.033] | 2.027 | 135614 | 2833210 | 564674 | 677093 | 0.00 | 6093.00 | 1.923 | 921743 | 8.00 | 1079 | 6.9 |
+| 3 logs b1 64B | hyper-multilog | 6.48 10.50 12.55 | 0.002 [0.002–0.002] | 0.010 [0.009–0.013] | 0.051 [0.045–0.067] | 0.104 | 2513 | 49568 | 10144 | 9771 | 0.00 | 29.18 | 0.002 | 5909 | 9.64 | 1253 | 3.6 |
+| 3 logs b1 64B | slates-multilog | 6.48 10.50 12.55 | 0.002 [0.002–0.002] | 0.011 [0.009–0.013] | 0.037 [0.029–0.050] | 0.082 | 2537 | 56161 | 10239 | 12385 | 0.00 | 74.23 | 2.127 | 5815 | 9.45 | 1251 | 3.8 |
+| 3 logs b1 64B | slates-multilog-in-turn | 6.48 10.50 12.55 | 0.002 [0.002–0.002] | 0.013 [0.011–0.018] | 0.046 [0.039–0.073] | 0.100 | 2164 | 44599 | 8758 | 9002 | 0.00 | 61.24 | 2.127 | 4927 | 7.09 | 983 | 3.8 |
+| 3 logs b1 64B | slates-multilog+publication | 6.48 10.50 12.55 | 0.161 [0.156–0.165] | 0.970 [0.920–1.040] | 2.088 [1.911–2.923] | 13.914 | 194182 | 3880663 | 790263 | 961370 | 0.00 | 8517.29 | 2.127 | 1207983 | 9.45 | 1251 | 9.3 |
+| 1 logs b64 64B | hyper-multilog | 9.00 10.96 12.70 | 0.015 [0.015–0.015] | 0.065 [0.059–0.071] | 0.150 [0.133–0.306] | 0.497 | 278 | 5791 | 1111 | 1464 | 0.00 | 9.25 | 0.000 | 1399 | 0.12 | 208 | 63.0 |
+| 1 logs b64 64B | slates-multilog | 9.00 10.96 12.70 | 0.018 [0.018–0.019] | 0.067 [0.064–0.074] | 0.161 [0.139–0.326] | 0.580 | 330 | 7824 | 1287 | 1720 | 0.00 | 13.83 | 2.097 | 1422 | 0.12 | 185 | 67.3 |
+| 1 logs b64 64B | slates-multilog-in-turn | 9.00 10.96 12.70 | 0.018 [0.018–0.018] | 0.061 [0.057–0.066] | 0.134 [0.119–0.378] | 0.503 | 316 | 7669 | 1250 | 1786 | 0.00 | 13.66 | 2.097 | 1411 | 0.09 | 181 | 66.9 |
+| 3 logs b64 64B | hyper-multilog | 9.00 10.96 12.70 | 0.023 [0.023–0.023] | 0.097 [0.092–0.107] | 0.357 [0.306–0.476] | 0.636 | 422 | 8218 | 1701 | 2233 | 0.00 | 10.56 | 0.000 | 1684 | 0.66 | 268 | 79.4 |
+| 3 logs b64 64B | slates-multilog | 9.00 10.96 12.70 | 0.024 [0.024–0.025] | 0.106 [0.099–0.112] | 0.325 [0.214–0.435] | 0.469 | 441 | 9545 | 1804 | 2438 | 0.00 | 15.38 | 2.268 | 1738 | 0.62 | 243 | 77.9 |
+| 3 logs b64 64B | slates-multilog-in-turn | 9.00 10.96 12.70 | 0.023 [0.023–0.023] | 0.104 [0.099–0.110] | 0.345 [0.306–0.498] | 1.240 | 417 | 8822 | 1698 | 2159 | 0.00 | 14.52 | 2.268 | 1679 | 0.47 | 225 | 77.7 |
+
+What it shows:
+- **Under one discipline (`slates-multilog`, in waves) this layer is even or ahead at every
+  shape.** CPU a command 1,916 against 2,193 ns at one log, 2,513 against 2,537 at three; 278
+  against 330 and 422 against 441 at 64 a round. Instructions 12 to 26% fewer at every shape;
+  allocations 38% to 69% of slates' and no reallocation against 1.9 to 2.3; messages equal at one log and 2% more at three logs (the
+  relay above), wire bytes within 0.2% at a command a round and 10 to 12% more at 64 (this core's
+  record against slates' encoding). Round p50 and p99 inside each other's intervals at every shape
+  but one: three logs, a command a round, p99.9 51 µs [45–67] against 37 [29–50], overlapping.
+  An earlier run at load 13 (19:30) had that p99.9 at 24 [20–36] against 25 [22–40].
+- **Against slates' serial order (`-in-turn`) this layer still loses at a command a round**: 16%
+  more CPU at one log (1,916 against 1,646 ns) and at three (2,513 against 2,164), 8 messages an
+  entry against 6. The difference is the core's: on a commit it sends each follower a notice and
+  each answers it (`Raft::maybe_commit`, `bcast_append`). A notice that need not be answered, or a
+  commit that rides the next append, is the core's to decide (`docs/raft.md`); this layer cannot
+  remove it. At 64 a round the orders cost the same and this layer is ahead of both.
+- **Reallocations**: 0.002 a command at three logs a command a round (4 in the 2,000 rounds counted,
+  none at any other shape, none before this change): a buffer growing once more in the counted
+  rounds. Not yet traced.
+
+**The relay rule under hostile networks**, A/B at one core: `multi_log_under_hostile_networks`
+(20 seeds, below) run on main's layer and on this one, 2026-10-08 19:35–19:40, load 14–30. Every
+condition at three and five logs sends 0.1 to 0.4 fewer messages a command and about 1% fewer wire
+bytes; the partial partition, the case the relays exist for, is unchanged (three logs keyed p99
+523 against 524 ms, five logs 526 and 526). The tails are inside each other's intervals in most
+cells, and move both ways where they are not: jitter 50 ms at three logs, global p99 707 ms
+[695–728] against main's 671 [665–688]; loss 0.1% at three logs, global p99 532 [525–671]
+against 602 [546–767]. One log is unchanged in every cell (it has no barriers). The tables below
+are the run of 2026-10-04, on the core of then.
+
+**End to end**, the same day on this layer (`cargo test --release -p hyper-multilog-e2e --test
+cluster`, from 19:40, load 14–18): all six scenarios pass; `tails-3`'s writes p50 50.8 ms
+[47.8–53.3], p99 130 [122–139], p99.9 383 [329–475], and 3,223 µs of CPU, 6.2 mJ and 7,661 device
+bytes per byte stored per write across the three members, against `tails-1`'s 15.9, 31.7, 189 ms
+and 1,329 µs, 2.2 mJ, 4,038. Three logs still cost two to three times one log here, as the
+measurement below found.
+
+```sh
+cd crates/hyper-raft-compare && cargo run --release -- multilog 5 2000
+```
+
 ## Hostile networks
 
 `tests/multilog_timed.rs`, `multi_log_under_hostile_networks`: slates' timed simulation (five Azure

@@ -4,16 +4,22 @@
 //! and two global commands a second, `tests/multilog_timed.rs`), each command proposed at the
 //! leader of the log it routes to, the group then quiet and every member applying in the merged
 //! order. Each layer is driven as its owner drives it:
-//! - slates' as its unit tests and timed simulation drive it: elections by `start_election` and
-//!   replies, each log's leader replicating to its followers (`replicate_to`), the replies folded,
-//!   barriers appended at every member (`append_barriers`), `apply_ready`, and its retention
-//!   acknowledged whenever pending; as `slates-multilog+publication`, the retained state also copied
-//!   out (`saved`) at every acknowledgment, slates' server's durability, whose copy of the whole log
-//!   grows with it (the core's comparison does the same, `docs/benchmarks.md`, "slates with its
-//!   retained-state publication"), so it runs one command a round only;
+//! - slates' as its timed simulation drives it: elections by `start_election` and replies, each
+//!   log's leader sending every follower behind it an append at once (`replicate_to`, as its
+//!   simulation's `lead` does), the followers' replies, then the replies folded, until no follower
+//!   is behind; barriers appended at every member (`append_barriers`), `apply_ready`, and its
+//!   retention acknowledged whenever pending. As `slates-multilog-in-turn`, as its unit tests drive
+//!   it instead: one follower at a time, its reply folded before the next follower's append is
+//!   made, so that the commit the first reply moves rides the second follower's first append, an
+//!   order no network gives a leader that sends to both at once. As
+//!   `slates-multilog+publication`, the retained state also copied out (`saved`) at every
+//!   acknowledgment, slates' server's durability, whose copy of the whole log grows with it (the
+//!   core's comparison does the same, `docs/benchmarks.md`, "slates with its retained-state
+//!   publication"), so it runs one command a round only;
 //! - this one as `docs/multilog.md` §9 states: each log's member's `Ready` persisted to an in-memory
 //!   disk and advanced, its committed entries handed over, its messages delivered, barriers proposed,
-//!   the merge applied.
+//!   the merge applied; a member is driven when a message reached it, as an owner driven by its
+//!   events drives it.
 //!
 //! What both owners do apart from the layer (the network's queues, this crate's disk) is set aside
 //! from the counts. A command is measured once, applied at every member.
@@ -294,9 +300,6 @@ pub mod hyper {
                         self.drive(at);
                     }
                 }
-                for at in 0..self.members.len() {
-                    self.drive(at);
-                }
             }
         }
 
@@ -360,10 +363,15 @@ pub mod slates {
         /// Whether the retained state is copied out at every transition, as slates' server
         /// publishes it before any reply; otherwise its retention is acknowledged without a copy.
         publish: bool,
+        /// Whether each leader sends every follower its append at once, as slates' timed
+        /// simulation's leader does (`lead`, one `replicate_to` a peer, then the network), and as
+        /// hyper-multilog's members send theirs; otherwise one follower at a time, its reply folded
+        /// before the next follower's append is made, as slates' unit tests drive it.
+        waves: bool,
     }
 
     impl Group {
-        pub fn new(spec: &Spec, _seed: u64, publish: bool) -> Self {
+        pub fn new(spec: &Spec, _seed: u64, publish: bool, waves: bool) -> Self {
             let voters: Vec<HostId> = (1..=VOTERS).map(HostId).collect();
             let members: Vec<MultiLog> = voters.iter().map(|id| MultiLog::new(*id, voters.clone(), spec.logs)).collect();
             let retained = members.iter().map(MultiLog::saved).collect();
@@ -376,6 +384,7 @@ pub mod slates {
                 messages: 0,
                 bytes: 0,
                 publish,
+                waves,
             };
             for log in 0..spec.logs {
                 group.elect(log, log % VOTERS as usize);
@@ -423,9 +432,69 @@ pub mod slates {
             self.replicate();
         }
 
-        /// Each log's leader replicates to each follower until every follower holds its log and
-        /// its commit.
+        /// Each log's leader replicates to its followers until every follower holds its log and
+        /// its commit: in waves, or one follower at a time.
         fn replicate(&mut self) {
+            if self.waves {
+                self.replicate_in_waves();
+            } else {
+                self.replicate_in_turn();
+            }
+        }
+
+        /// Each log's leader sends every follower behind it an append at once; the followers
+        /// answer, and the leader folds the answers; until no follower is behind.
+        fn replicate_in_waves(&mut self) {
+            let logs = self.members[0].count();
+            for log in 0..logs {
+                let Some(leader) = (0..self.members.len()).find(|at| self.members[*at].log(log).unwrap().is_leader()) else {
+                    continue;
+                };
+                for wave in 0.. {
+                    assert!(wave < 8, "log {log} never caught up");
+                    let (last, commit) = {
+                        let node = self.members[leader].log(log).unwrap();
+                        (node.last_log_index(), node.commit_index())
+                    };
+                    let mut appends = Vec::new();
+                    for follower in 0..self.members.len() {
+                        if follower == leader {
+                            continue;
+                        }
+                        let held = self.members[follower].log(log).unwrap();
+                        if held.last_log_index() == last && held.commit_index() == commit {
+                            continue;
+                        }
+                        let id = HostId(follower as u64 + 1);
+                        if let Some(append) = self.members[leader].log_mut(log).unwrap().replicate_to(id, BUDGET) {
+                            self.publish(leader);
+                            self.sent(|| RaftMessage::AppendEntries(append.clone()));
+                            alloc::aside();
+                            appends.push((follower, append));
+                            alloc::back();
+                        }
+                    }
+                    if appends.is_empty() {
+                        break;
+                    }
+                    let mut replies = Vec::new();
+                    for (follower, append) in appends {
+                        let reply = self.members[follower].log_mut(log).unwrap().on_append_entries(append);
+                        self.publish(follower);
+                        self.sent(|| RaftMessage::AppendReply(reply.clone()));
+                        alloc::aside();
+                        replies.push(reply);
+                        alloc::back();
+                    }
+                    for reply in replies {
+                        self.members[leader].log_mut(log).unwrap().on_append_reply(reply);
+                        self.publish(leader);
+                    }
+                }
+            }
+        }
+
+        fn replicate_in_turn(&mut self) {
             let logs = self.members[0].count();
             for log in 0..logs {
                 let Some(leader) = (0..self.members.len()).find(|at| self.members[*at].log(log).unwrap().is_leader()) else {
@@ -501,7 +570,7 @@ pub mod slates {
 }
 
 /// The layers, by name.
-pub const LAYERS: [&str; 3] = ["hyper-multilog", "slates-multilog", "slates-multilog+publication"];
+pub const LAYERS: [&str; 4] = ["hyper-multilog", "slates-multilog", "slates-multilog-in-turn", "slates-multilog+publication"];
 
 /// One measured run of `layer` on `spec`: `rounds` rounds of `batch` commands after the setup.
 pub fn run(layer: &str, spec: &Spec, seed: u64, counting: bool) -> Measured {
@@ -548,8 +617,9 @@ pub fn run(layer: &str, spec: &Spec, seed: u64, counting: bool) -> Measured {
     }
     match layer {
         "hyper-multilog" => drive!(hyper::Group::new(spec, seed), hyper::RESERVE),
-        "slates-multilog" => drive!(slates::Group::new(spec, seed, false), 0),
-        "slates-multilog+publication" => drive!(slates::Group::new(spec, seed, true), 0),
+        "slates-multilog" => drive!(slates::Group::new(spec, seed, false, true), 0),
+        "slates-multilog-in-turn" => drive!(slates::Group::new(spec, seed, false, false), 0),
+        "slates-multilog+publication" => drive!(slates::Group::new(spec, seed, true, true), 0),
         _ => panic!("no layer named {layer}"),
     }
     measured.ops = (spec.rounds * spec.batch) as u64;

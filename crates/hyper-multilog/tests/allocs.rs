@@ -63,9 +63,15 @@ fn applying_a_command_allocates_nothing() {
     for (log, leader) in [(0, 1), (1, 2), (2, 3)] {
         group.elect(log, leader);
     }
-    group.member(3).hold_apply = true;
+    // Warm: member 3 merges the first rounds as they commit, so that every path of its merge has
+    // run, the first rise of each log's bound on the fast track among them; then it holds its
+    // merge while the rest commit.
+    const WARM: u64 = 20;
     let mut proposed = 0;
-    for i in 0..300u64 {
+    for i in 0..300 + WARM {
+        if i == WARM {
+            group.member(3).hold_apply = true;
+        }
         let route = if i % 10 == 0 {
             Route::Global
         } else {
@@ -74,7 +80,9 @@ fn applying_a_command_allocates_nothing() {
         let log = group.member(1).multi.route(route);
         let leader = (1..=3).find(|id| group.member(*id).leads(log)).unwrap();
         assert!(group.member(leader).propose(route, command(i, 64)));
-        proposed += 1;
+        if i >= WARM {
+            proposed += 1;
+        }
         group.quiet();
     }
     let member = group.member(3);

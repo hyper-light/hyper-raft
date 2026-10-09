@@ -1019,6 +1019,11 @@ impl<S: Storage> MultiLog<S> {
             held.since.retain(|(index, _)| index >= next);
         }
         self.latest_global = self.latest_global.max(point.cut.epoch());
+        // The merge moved, though it consumed nothing: a leader held for its bound may take from
+        // the fast track again, as after a merge that consumed ([`MultiLog::apply`]).
+        for log in 0..self.nodes.len() {
+            self.steer(log)?;
+        }
         Ok(Installed::Ahead)
     }
 }

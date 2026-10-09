@@ -502,11 +502,13 @@ layer's other ways into a log what they were:
   barrier a global (§3.1) the fast track would bypass, and a misplaced command no member may
   vote for.
 - **The bound holds.** A leader takes from the fast track only as far as `Limits::unmerged` past
-  its merge (`RawNode::cap_takes`, set at each fast-track message and after each merge call):
-  votes past the cap are kept within the core's bound on them and taken as the merge moves, so a
-  stalled merge stops the fast track's growth of a log as it stops a client's proposals there.
-  A leader that dropped such votes instead lost them for its term (a member says what it holds
-  once a term), and the log's fast track stalled until another entry took those indexes.
+  its merge (`RawNode::cap_takes`, set at each fast-track message, after each merge call that
+  consumed an entry, and at each image installed ahead of the merge, `MultiLog::install`, the one
+  move of the merge that consumes nothing): votes past the cap are kept within the core's bound on
+  them and taken as the merge moves, so a stalled merge stops the fast track's growth of a log as
+  it stops a client's proposals there. A leader that dropped such votes instead lost them for its
+  term (a member says what it holds once a term), and the log's fast track stalled until another
+  entry took those indexes.
 - **The owner proposes again what was displaced.** A proposal another entry took the index of
   comes back in its log's `Ready` (`Ready::displaced`); no member applies it, and the owner
   proposes it again or answers that it was not taken, as for a single group.

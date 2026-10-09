@@ -7225,6 +7225,25 @@ device to serve (a page its own cache lacks, on a file opened for direct I/O), a
 in place. The three allocations per operation are the batch's vector, the issuer's buffer slots and
 the answer's vector.
 
+### The batch's vector given back (2026-10-08)
+
+The issuer's answer is now the batch's own vector of transfers, buffers and offsets, as `AioFile`'s
+is (`crates/hyper-block/ORIGIN.md`, change 8), so the **batched** rows hand the same vector over
+every operation. Same bench, same machine, two runs of `origin/main` (5d68252) and two of the change,
+alternated, each on a fresh file, one-minute load 5.6–6.9:
+
+| Row | before p50 µs | before p99 µs | after p50 µs | after p99 µs | allocations / op before → after |
+|---|---|---|---|---|---|
+| direct, batched (run 1) | 109.79 | 1,145.21 | 105.04 | 252.67 | 3 → 0 |
+| direct, batched (run 2) | 103.00 | 271.04 | 107.96 | 193.17 | 3 → 0 |
+| cached, batched (run 1) | 21.33 | 56.67 | 26.62 | 78.79 | 3 → 0 |
+| cached, batched (run 2) | 32.21 | 83.17 | 28.04 | 115.71 | 3 → 0 |
+
+The three allocations an operation are gone: the submitter's vector, the issuer's slots and the
+answer's vector. The latencies differ between runs by more than between the code, so the change
+claims no time; the cost it removes is allocator calls, which `tests/issuer_allocs.rs` holds at
+zero exactly for a warm pass of writes, flushes and reads (15 on `origin/main`).
+
 ## hyper-log: the flushes an append costs (2026-10-07)
 
 `benches/log.rs` reports the device flushes an append costs (`flush/app`, from

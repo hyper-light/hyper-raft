@@ -75,6 +75,13 @@ caller hands in the alignment, queue and measured depth it found.
    at 10 M puts, uncached, a put's p99.9 went from 43.8–48.9 µs to 5.6–6.7 µs and p99.99 from
    72.4–73.8 µs to 17.5–20.6 µs with two batches out (mantle `docs/design/engine-structure.md`
    §6).
+8. **An owned way to attach** (`issuer.rs`, `Issuer::attacher`, `Attacher`): the issuer's inbox
+   and worker count, cloned out to a submitter that starts later on a thread of its own, which
+   attaches through it as through the issuer. mantle's maintenance workers start lazily from a
+   `'static` spawn and their shard only borrows the issuer; with no shared ownership allowed, they
+   could not attach, and wrote their branches' pages on their own threads. It keeps nothing alive:
+   an attach after the issuer stopped is refused, and the duplicates it made are dropped with the
+   refusal.
 
 ## Planned
 

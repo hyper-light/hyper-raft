@@ -708,9 +708,12 @@ impl<S: Storage> MultiLog<S> {
             .advance(&Stores { nodes: &self.nodes }, budget, apply)?;
         self.settle_configurations();
         self.end_logs();
-        // The merge moved: a leader held for its bound may take from the fast track again.
-        for log in 0..self.nodes.len() {
-            self.steer(log)?;
+        // The merge moved: a leader held for its bound may take from the fast track again. A merge
+        // that consumed nothing moved no bound; a fast message is steered as it arrives.
+        if advance.consumed > 0 {
+            for log in 0..self.nodes.len() {
+                self.steer(log)?;
+            }
         }
         if self.merge.logs() != self.nodes.len() {
             // A resize added logs: the owner opens them, and the merge reads on.
@@ -735,13 +738,23 @@ impl<S: Storage> MultiLog<S> {
 
     /// Proposes, in every log but log 0, a barrier naming the latest global command this member's
     /// log 0 has given to apply, where none it knows of covers it (`docs/multilog.md` §3.1): at
-    /// most one a log for each term and global. How many it proposed.
+    /// most one a log for each term and global. Log 0's leader relays none to a log it does not
+    /// lead: its own replication of log 0 tells that log's leader the global on every path its
+    /// relay could take. How many it proposed.
     pub fn barriers(&mut self) -> Result<usize> {
         let mut proposed = 0usize;
+        let leads_log_0 = self
+            .nodes
+            .first()
+            .is_some_and(|node| node.raft.state() == StateRole::Leader);
         for log in 1..self.nodes.len() {
             let latest = self.latest_global;
             let born = self.born.get(log).copied().unwrap_or(0);
-            if latest <= self.covered(log)? || latest <= born {
+            let leads = self
+                .nodes
+                .get(log)
+                .is_some_and(|node| node.raft.state() == StateRole::Leader);
+            if latest <= self.covered(log)? || latest <= born || (leads_log_0 && !leads) {
                 continue;
             }
             let data = entry::barrier_naming(latest)?;

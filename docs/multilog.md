@@ -103,6 +103,20 @@ log `k` that cannot hear log 0's leader never learns that `g` committed, while i
 `k`'s entries, and every log's entries behind a barrier for `g` wait until a partition heals. A
 member that hears both relays the barrier.
 
+**Log 0's leader relays none.** A member leading log 0 proposes a barrier only in a log it leads
+too. The global it would relay is one it committed, and its own replication of log 0 tells log
+`k`'s leader so on every link the relay could take: the leader keeps sending to each member it
+trusts that has not said it holds the commit (`hyper_raft::raft`, `Raft::active`; under ticks, its
+heartbeats carry the commit), so a leader of log `k` it can reach learns `g` from log 0 itself, and
+one it cannot reach could not take its relay either. Its relay was a message that told log `k`'s
+leader nothing log 0 does not. With three voters and the logs led apart, a global then costs each
+other log one relay, from the member leading neither, where it cost two (`tests/layer.rs`,
+`log_0s_leader_relays_no_barrier`; measured in `docs/benchmarks.md`, "Against slates' MLRaft, under
+one message discipline"). The others relay as soon as they owe: a relay deferred until evidence
+that log `k`'s leader lacks `g` would wait for a message from that leader, and a leader electing
+by suspicion sends nothing while its log is idle (`Raft::active`), which is when a global waits on
+that log's barrier.
+
 **The leader keeps one barrier a global.** A leader of log `k` takes a forwarded barrier only when
 no barrier it appended in its term, and none its merge has read in log `k`, names as much;
 otherwise it drops the message, which is no refusal for its sender (it proposes again only on a new

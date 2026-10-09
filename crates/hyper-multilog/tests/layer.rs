@@ -259,6 +259,43 @@ fn a_leader_keeps_one_barrier_a_global_and_refuses_what_is_out_of_place() {
     );
 }
 
+/// `docs/multilog.md` §3.1: log 0's leader relays no barrier to a log it does not lead, for its
+/// own replication of log 0 tells that log's leader the global on every path the relay could
+/// take; each other log's leader appends its own, and the member that leads neither log 0 nor the
+/// log relays. Three logs led apart: one global costs each log one barrier and one relay.
+#[test]
+fn log_0s_leader_relays_no_barrier() {
+    let mut group = Group::new(3, 3, 11, ROOMY);
+    group.elect(0, 1);
+    group.elect(1, 2);
+    group.elect(2, 3);
+    assert!(group.member(1).propose(Route::Global, b"g".to_vec()));
+    group.quiet();
+    let proposed: Vec<u64> = group
+        .members
+        .iter()
+        .map(|member| member.counts.barriers_proposed)
+        .collect();
+    assert_eq!(
+        proposed,
+        vec![0, 2, 2],
+        "log 0's leader none; each other member its own log's barrier and one relay"
+    );
+    for log in 1..3 {
+        for member in 1..=3 {
+            assert_eq!(
+                barriers_in(&mut group, member, log),
+                1,
+                "log {log} at member {member}"
+            );
+        }
+    }
+    for member in &group.members {
+        assert_eq!(member.counts.globals_applied, 1, "member {}", member.id);
+    }
+    same_everywhere(&mut group);
+}
+
 /// `docs/multilog.md` §3.1: log 0's leader and log 1's leader cannot hear each other; log 1's
 /// leader never learns the global committed, and the member that hears both relays its barrier:
 /// it applies the global, and once the cut heals every member does, alike.

@@ -1,7 +1,9 @@
 //! Both busy and idle run_until_idle paths must deliver registered native readiness.
 //! Exact datagram presence, not a delay or yield count, establishes that the I/O can complete.
+//! The busy case's sibling yields until the root has its datagram, so that case waits on the
+//! delivery and nothing else: a run_until_idle that never retrieves readiness never returns, and
+//! the job's own limit is its failure. No clock decides any outcome here.
 
-// Test harness failures and serialization, as in the existing lifecycle fixtures.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -14,35 +16,16 @@
 use std::future::{Future, poll_fn};
 use std::pin::pin;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Sender, channel};
-use std::task::{Poll, Waker};
-use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::sync::mpsc::{TryRecvError, channel};
+use std::task::Poll;
 
 use hyper_rt::runtime::{LocalRuntime, RuntimeConfig};
 use hyper_rt::udp::UdpSocket;
 
-/// One case's facts: the watchdog's expiry (or its guard's drop) stops the case, and the busy
-/// task's start is seen. Each case has its own, so the cases run in parallel with no lock.
-struct Flags {
-    stop: AtomicBool,
-    started: AtomicBool,
-}
-
-impl Flags {
-    const fn new() -> Self {
-        Self {
-            stop: AtomicBool::new(false),
-            started: AtomicBool::new(false),
-        }
-    }
-}
-
-static BUSY: Flags = Flags::new();
-static QUIET: Flags = Flags::new();
-static LATER: Flags = Flags::new();
-// The existing channel/cross-thread fixture watchdog, used only to fail and clean up.
-const WAIT: Duration = Duration::from_secs(5);
+/// The busy case's facts: its root has the datagram, and its sibling has started. Its own
+/// statics, so the cases run in parallel with no lock.
+static DELIVERED: AtomicBool = AtomicBool::new(false);
+static BUSY_STARTED: AtomicBool = AtomicBool::new(false);
 const PAYLOAD: &[u8] = b"owned loop readiness";
 
 fn config() -> RuntimeConfig {
@@ -63,43 +46,7 @@ fn config() -> RuntimeConfig {
     }
 }
 
-struct Watchdog {
-    flags: &'static Flags,
-    done: Sender<()>,
-    thread: Option<JoinHandle<()>>,
-}
-
-impl Watchdog {
-    fn new(root: Waker, flags: &'static Flags) -> Result<Self, String> {
-        let (done, ended) = channel();
-        let thread = thread::Builder::new()
-            .name("rt-owned-loop-watchdog".to_owned())
-            .spawn(move || {
-                if ended.recv_timeout(WAIT).is_err() {
-                    flags.stop.store(true, Ordering::Release);
-                    root.wake();
-                }
-            })
-            .map_err(|error| format!("watchdog start: {error}"))?;
-        Ok(Self {
-            flags,
-            done,
-            thread: Some(thread),
-        })
-    }
-}
-
-impl Drop for Watchdog {
-    fn drop(&mut self) {
-        self.flags.stop.store(true, Ordering::Release);
-        let _ = self.done.send(());
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
-    }
-}
-
-async fn receive(busy: bool, flags: &'static Flags) -> Result<bool, String> {
+async fn receive(busy: bool) -> Result<(), String> {
     let observed = std::net::UdpSocket::bind("127.0.0.1:0")
         .map_err(|error| format!("receiver bind: {error}"))?;
     observed
@@ -117,26 +64,23 @@ async fn receive(busy: bool, flags: &'static Flags) -> Result<bool, String> {
     peer.set_nonblocking(true)
         .map_err(|error| format!("nonblocking peer: {error}"))?;
     let mut readiness = pin!(socket.readable());
-    let root = poll_fn(|cx| {
+    poll_fn(|cx| {
         Poll::Ready(match readiness.as_mut().poll(cx) {
-            Poll::Pending => Ok(cx.waker().clone()),
+            Poll::Pending => Ok(()),
             Poll::Ready(result) => Err(format!("empty socket must first wait: {result:?}")),
         })
     })
     .await?;
-    let _watchdog = Watchdog::new(root, flags)?;
     if busy {
-        hyper_rt::futures::spawn_detached(async move {
-            flags.started.store(true, Ordering::Release);
-            while !flags.stop.load(Ordering::Acquire) {
+        // The sibling keeps local work ready until the root has its datagram.
+        hyper_rt::futures::spawn_detached(async {
+            BUSY_STARTED.store(true, Ordering::Release);
+            while !DELIVERED.load(Ordering::Acquire) {
                 hyper_rt::futures::yield_now().await;
             }
         })
         .map_err(|error| format!("busy task admission: {error}"))?;
-        while !flags.started.load(Ordering::Acquire) {
-            if flags.stop.load(Ordering::Acquire) {
-                return Err("busy task did not start inside the watchdog".to_owned());
-            }
+        while !BUSY_STARTED.load(Ordering::Acquire) {
             hyper_rt::futures::yield_now().await;
         }
     }
@@ -151,9 +95,6 @@ async fn receive(busy: bool, flags: &'static Flags) -> Result<bool, String> {
     }
     let mut peeked = [0; PAYLOAD.len()];
     loop {
-        if flags.stop.load(Ordering::Acquire) {
-            return Err("loopback data did not arrive inside the watchdog".to_owned());
-        }
         match observed.peek_from(&mut peeked) {
             Ok((n, _)) if peeked.get(..n) == Some(PAYLOAD) => break,
             Ok(other) => return Err(format!("loopback peek changed the datagram: {other:?}")),
@@ -163,21 +104,11 @@ async fn receive(busy: bool, flags: &'static Flags) -> Result<bool, String> {
             Err(error) => return Err(format!("loopback peek: {error}")),
         }
     }
-    // Kernel data is now present. This root no longer self-wakes. Neither the watchdog's
-    // wake nor readiness delivered only after stopping the busy task is successful I/O.
-    poll_fn(|cx| {
-        if flags.stop.load(Ordering::Acquire) {
-            return Poll::Ready(Err(
-                "registered ready data starved until watchdog cleanup".to_owned()
-            ));
-        }
-        readiness
-            .as_mut()
-            .poll(cx)
-            .map(|result| result.map_err(|error| format!("readiness: {error}")))
-    })
-    .await?;
-    let before_stop = !flags.stop.load(Ordering::Acquire);
+    // Kernel data is now present and the root no longer wakes itself: it is woken by the driver's
+    // readiness or not at all.
+    readiness
+        .await
+        .map_err(|error| format!("readiness: {error}"))?;
     let mut received = [0; PAYLOAD.len()];
     let delivered = socket
         .try_recv_from(&mut received)
@@ -186,44 +117,44 @@ async fn receive(busy: bool, flags: &'static Flags) -> Result<bool, String> {
     if received.get(..delivered.0) != Some(PAYLOAD) {
         return Err("the readiness delivery changed the datagram".to_owned());
     }
-    Ok(before_stop)
+    if busy {
+        DELIVERED.store(true, Ordering::Release);
+    }
+    Ok(())
 }
 
-fn run_until_idle(busy: bool, flags: &'static Flags) {
+fn run_until_idle(busy: bool) {
     let mut rt = LocalRuntime::new(&config()).unwrap();
     let (done, received) = channel();
     rt.spawn(async move {
-        let _ = done.send(receive(busy, flags).await);
+        let _ = done.send(receive(busy).await);
     })
     .unwrap();
     rt.run_until_idle();
     let outcome = received.try_recv();
-    // Early-return and watchdog failures also drop all task futures and join the watchdog
-    // through its guard before a verdict. No socket or runtime task is left detached.
     drop(rt);
     assert_eq!(
         outcome,
-        Ok(Ok(true)),
-        "run_until_idle must deliver the already-present datagram before returning/cleanup"
+        Ok(Ok(())),
+        "run_until_idle must deliver the already-present datagram before it returns"
     );
 }
 
 #[test]
 #[cfg_attr(miri, ignore)] // Native socket readiness opens kqueue, epoll or AFD.
 fn run_until_idle_delivers_readiness_while_another_task_keeps_yielding() {
-    run_until_idle(true, &BUSY);
+    run_until_idle(true);
 }
 
 #[test]
 #[cfg_attr(miri, ignore)] // Native socket readiness opens kqueue, epoll or AFD.
 fn run_until_idle_does_not_skip_a_ready_socket_when_no_task_is_runnable() {
-    run_until_idle(false, &QUIET);
+    run_until_idle(false);
 }
 
 #[test]
 #[cfg_attr(miri, ignore)] // Native socket readiness opens kqueue, epoll or AFD.
 fn idle_external_waits_return_intact_and_complete_on_a_later_run() {
-    let flags = &LATER;
     let observed = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
     observed.set_nonblocking(true).unwrap();
     let address = observed.local_addr().unwrap();
@@ -238,26 +169,17 @@ fn idle_external_waits_return_intact_and_complete_on_a_later_run() {
             let socket =
                 UdpSocket::adopt(owned).map_err(|error| format!("receiver adoption: {error}"))?;
             let mut readiness = pin!(socket.readable());
-            let root = poll_fn(|cx| {
+            poll_fn(|cx| {
                 Poll::Ready(match readiness.as_mut().poll(cx) {
-                    Poll::Pending => Ok(cx.waker().clone()),
+                    Poll::Pending => Ok(()),
                     Poll::Ready(result) => Err(format!("empty socket must first wait: {result:?}")),
                 })
             })
             .await?;
-            let _watchdog = Watchdog::new(root, flags)?;
             let _ = armed.send(());
-            poll_fn(|cx| {
-                if flags.stop.load(Ordering::Acquire) {
-                    return Poll::Ready(Err("idle external wait did not return".to_owned()));
-                }
-                readiness
-                    .as_mut()
-                    .poll(cx)
-                    .map(|result| result.map_err(|error| format!("readiness: {error}")))
-            })
-            .await?;
-            let before_stop = !flags.stop.load(Ordering::Acquire);
+            readiness
+                .await
+                .map_err(|error| format!("readiness: {error}"))?;
             let mut bytes = [0; PAYLOAD.len()];
             let delivered = socket
                 .try_recv_from(&mut bytes)
@@ -266,7 +188,7 @@ fn idle_external_waits_return_intact_and_complete_on_a_later_run() {
             if bytes.get(..delivered.0) != Some(PAYLOAD) {
                 return Err("the readiness delivery changed the datagram".to_owned());
             }
-            Ok::<_, String>(before_stop)
+            Ok::<_, String>(())
         }
         .await;
         let _ = done.send(outcome);
@@ -278,46 +200,33 @@ fn idle_external_waits_return_intact_and_complete_on_a_later_run() {
         let _ = channel_done.send(receiver.recv().await);
     })
     .unwrap();
+    // Nothing is ready: the call returns with both waits still registered. One that parked in the
+    // driver for them instead never returns.
     rt.run_until_idle();
     let first = (
         pending.try_recv(),
         received.try_recv(),
         channel_received.try_recv(),
-        flags.stop.load(Ordering::Acquire),
     );
-    // On a broken infinite idle park the watchdog returns failure, not data. Dropping the
-    // runtime before the assertion closes the sockets/tasks and joins that watchdog.
-    if first
-        != (
-            Ok(()),
-            Err(std::sync::mpsc::TryRecvError::Empty),
-            Err(std::sync::mpsc::TryRecvError::Empty),
-            false,
-        )
-    {
+    if first != (Ok(()), Err(TryRecvError::Empty), Err(TryRecvError::Empty)) {
         drop(rt);
         panic!("idle external waits must remain pending without blocking: {first:?}");
     }
     assert_eq!(peer.send_to(PAYLOAD, address).unwrap(), PAYLOAD.len());
     let mut peeked = [0; PAYLOAD.len()];
-    let present = loop {
-        if flags.stop.load(Ordering::Acquire) {
-            break Err("loopback data did not arrive inside the watchdog".to_owned());
-        }
+    loop {
         match observed.peek_from(&mut peeked) {
-            Ok((n, _)) if peeked.get(..n) == Some(PAYLOAD) => break Ok(()),
-            Ok(other) => break Err(format!("loopback peek changed the datagram: {other:?}")),
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => thread::yield_now(),
-            Err(error) => break Err(format!("loopback peek: {error}")),
+            Ok((n, _)) if peeked.get(..n) == Some(PAYLOAD) => break,
+            Ok(other) => panic!("loopback peek changed the datagram: {other:?}"),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::yield_now();
+            }
+            Err(error) => panic!("loopback peek: {error}"),
         }
-    };
-    if let Err(error) = present {
-        drop(rt);
-        panic!("{error}");
     }
     sender.try_send(9).unwrap();
     rt.run_until_idle();
     let outcomes = (received.try_recv(), channel_received.try_recv());
     drop(rt);
-    assert_eq!(outcomes, (Ok(Ok(true)), Ok(Ok(9))));
+    assert_eq!(outcomes, (Ok(Ok(())), Ok(Ok(9))));
 }

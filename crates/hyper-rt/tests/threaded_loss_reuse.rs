@@ -1,4 +1,6 @@
 //! Driver loss terminates a threaded owner; all owners join, and repeated loss leaves healthy reuse.
+//! Each wait is on the fact it needs: a lost owner that never drops its tasks never sends their
+//! drops, and the job's own limit is the failure. No clock decides an outcome.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -12,15 +14,13 @@
 use std::future::pending;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Sender, channel};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use hyper_rt::RtError;
 use hyper_rt::driver::{Completion, Driver, DriverKind, DriverSeed, Kick, Prepared};
 use hyper_rt::interests::Readiness;
 use hyper_rt::runtime::{LocalRuntime, Runtime, RuntimeConfig};
 
-/// Existing cross-thread wake fixtures' failure bound, never a settle delay.
-const WAIT: Duration = Duration::from_secs(5);
 static BUSY_STARTED: AtomicBool = AtomicBool::new(false);
 
 struct LossOnRead {
@@ -123,7 +123,7 @@ fn busy_threaded_driver_loss_drops_its_tasks_and_shutdown_joins_the_healthy_sibl
             pending::<()>().await;
         })
         .unwrap();
-    let sibling_live = live.recv_timeout(WAIT).is_ok();
+    let sibling_live = live.recv().is_ok();
     let root = Capture("root", drops.clone());
     let busy = Capture("busy", drops.clone());
     let (completed, completion) = channel();
@@ -147,14 +147,9 @@ fn busy_threaded_driver_loss_drops_its_tasks_and_shutdown_joins_the_healthy_sibl
         let _ = hyper_rt::readiness::readable(0).await;
         let _ = completed.send("the root returned after driver loss");
     });
-    let mut before_shutdown = Vec::new();
-    // Exactly the two captures owned by the failed shard must disappear before explicit shutdown.
-    for _ in ["root", "busy"] {
-        match dropped.recv_timeout(WAIT) {
-            Ok(role) => before_shutdown.push(role),
-            Err(_) => break,
-        }
-    }
+    // The two captures the failed shard owns must be dropped before an explicit shutdown: the test
+    // waits for two drops, and any capture's counts, so the sibling's would show here too.
+    let mut before_shutdown: Vec<_> = (0..2).map_while(|_| dropped.recv().ok()).collect();
     let actual_busy_loss = lost.try_iter().any(|nonblocking| nonblocking);
     let no_normal_return = completion.try_iter().next().is_none();
     let shutdown = runtime.shutdown();
@@ -190,7 +185,7 @@ fn busy_threaded_driver_loss_drops_its_tasks_and_shutdown_joins_the_healthy_sibl
             let _ = answer.send(42);
         })
         .unwrap();
-    let value = answered.recv_timeout(WAIT);
+    let value = answered.recv();
     let retired = healthy.shutdown();
     assert_eq!(value, Ok(42));
     assert!(

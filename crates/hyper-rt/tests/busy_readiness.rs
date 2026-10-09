@@ -1,5 +1,7 @@
 //! LocalRuntime::block_on must deliver socket readiness while another task keeps yielding.
-//! The watchdog wakes the root and stops the busy task on failure; it does not supply readiness.
+//! The sibling yields until the root has its datagram, so the test waits on that delivery and
+//! nothing else: a block_on that never retrieves readiness never returns, and the job's own limit
+//! is its failure. No clock decides the outcome.
 
 #![allow(
     clippy::unwrap_used,
@@ -13,17 +15,12 @@
 use std::future::{Future, poll_fn};
 use std::pin::pin;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Sender, channel};
-use std::task::{Poll, Waker};
-use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::task::Poll;
 
 use hyper_rt::runtime::{LocalRuntime, RuntimeConfig};
 use hyper_rt::udp::UdpSocket;
 
-// The existing channel and cross-thread wake fixtures' failure bound, never an ordering delay.
-const WAIT: Duration = Duration::from_secs(5);
-static STOP_BUSY: AtomicBool = AtomicBool::new(false);
+static DELIVERED: AtomicBool = AtomicBool::new(false);
 static BUSY_STARTED: AtomicBool = AtomicBool::new(false);
 const PAYLOAD: &[u8] = b"ready while another task yields";
 
@@ -45,46 +42,9 @@ fn config() -> RuntimeConfig {
     }
 }
 
-struct Watchdog {
-    done: Sender<()>,
-    thread: Option<JoinHandle<()>>,
-}
-
-impl Watchdog {
-    fn new(root: Waker) -> Result<Self, String> {
-        let (done, ended) = channel();
-        let thread = thread::Builder::new()
-            .name("rt-readiness-watchdog".to_owned())
-            .spawn(move || {
-                if ended.recv_timeout(WAIT).is_err() {
-                    STOP_BUSY.store(true, Ordering::Release);
-                    // The root can report failure even if the socket's readiness never wakes it.
-                    root.wake();
-                }
-            })
-            .map_err(|error| format!("watchdog start: {error}"))?;
-        Ok(Self {
-            done,
-            thread: Some(thread),
-        })
-    }
-}
-
-impl Drop for Watchdog {
-    fn drop(&mut self) {
-        STOP_BUSY.store(true, Ordering::Release);
-        let _ = self.done.send(());
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
-    }
-}
-
 #[test]
 #[cfg_attr(miri, ignore)] // Native socket readiness opens kqueue, epoll or AFD.
-fn block_on_delivers_readiness_before_a_cooperatively_busy_task_is_stopped() {
-    STOP_BUSY.store(false, Ordering::Release);
-    BUSY_STARTED.store(false, Ordering::Release);
+fn block_on_delivers_readiness_while_another_task_keeps_yielding() {
     let mut rt = LocalRuntime::new(&config()).unwrap();
     let outcome = rt.block_on(async {
         // A duplicated descriptor observes the same kernel receive queue without consuming it.
@@ -106,25 +66,22 @@ fn block_on_delivers_readiness_before_a_cooperatively_busy_task_is_stopped() {
         peer.set_nonblocking(true)
             .map_err(|error| format!("nonblocking peer: {error}"))?;
         let mut readiness = pin!(socket.readable());
-        let root = poll_fn(|cx| {
+        poll_fn(|cx| {
             Poll::Ready(match readiness.as_mut().poll(cx) {
-                Poll::Pending => Ok(cx.waker().clone()),
+                Poll::Pending => Ok(()),
                 Poll::Ready(result) => Err(format!("empty socket must first wait: {result:?}")),
             })
         })
         .await?;
-        let _watchdog = Watchdog::new(root)?;
+        // The sibling keeps local work ready until the root has its datagram.
         hyper_rt::futures::spawn_detached(async {
             BUSY_STARTED.store(true, Ordering::Release);
-            while !STOP_BUSY.load(Ordering::Acquire) {
+            while !DELIVERED.load(Ordering::Acquire) {
                 hyper_rt::futures::yield_now().await;
             }
         })
         .map_err(|error| format!("busy task admission: {error}"))?;
         while !BUSY_STARTED.load(Ordering::Acquire) {
-            if STOP_BUSY.load(Ordering::Acquire) {
-                return Err("busy task did not start inside the watchdog".to_owned());
-            }
             hyper_rt::futures::yield_now().await;
         }
         let address = observed
@@ -138,9 +95,6 @@ fn block_on_delivers_readiness_before_a_cooperatively_busy_task_is_stopped() {
         }
         let mut peeked = [0; PAYLOAD.len()];
         loop {
-            if STOP_BUSY.load(Ordering::Acquire) {
-                return Err("loopback data did not arrive inside the watchdog".to_owned());
-            }
             match observed.peek_from(&mut peeked) {
                 Ok((n, _)) if peeked.get(..n) == Some(PAYLOAD) => break,
                 Ok(other) => return Err(format!("loopback peek changed the datagram: {other:?}")),
@@ -150,21 +104,11 @@ fn block_on_delivers_readiness_before_a_cooperatively_busy_task_is_stopped() {
                 Err(error) => return Err(format!("loopback peek: {error}")),
             }
         }
-        // The root no longer self-wakes. Only the other task yields continuously. The
-        // watchdog's eventual wake is a failure, never a successful readiness delivery.
-        poll_fn(|cx| {
-            if STOP_BUSY.load(Ordering::Acquire) {
-                return Poll::Ready(Err(
-                    "readiness starved until the busy task was stopped".to_owned()
-                ));
-            }
-            readiness
-                .as_mut()
-                .poll(cx)
-                .map(|result| result.map_err(|error| format!("readiness: {error}")))
-        })
-        .await?;
-        let before_stop = !STOP_BUSY.load(Ordering::Acquire);
+        // The datagram is in the kernel and only the sibling wakes itself now: the root is woken
+        // by the driver's readiness or not at all.
+        readiness
+            .await
+            .map_err(|error| format!("readiness: {error}"))?;
         let mut received = [0; PAYLOAD.len()];
         let delivered = socket
             .try_recv_from(&mut received)
@@ -173,15 +117,13 @@ fn block_on_delivers_readiness_before_a_cooperatively_busy_task_is_stopped() {
         if received.get(..delivered.0) != Some(PAYLOAD) {
             return Err("the readiness delivery changed the datagram".to_owned());
         }
-        Ok::<_, String>(before_stop)
+        DELIVERED.store(true, Ordering::Release);
+        Ok::<_, String>(())
     });
-    // block_on cancels its remaining tasks; dropping the runtime closes every owned socket
-    // before the public verdict. The watchdog guard joins its thread on every root exit.
     drop(rt);
-    assert!(
-        outcome
-            .expect("block_on completed")
-            .expect("public socket delivery"),
-        "the I/O completed before the watchdog stopped the yielding task"
+    assert_eq!(
+        outcome.expect("block_on completed"),
+        Ok(()),
+        "public socket delivery"
     );
 }

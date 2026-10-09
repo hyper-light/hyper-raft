@@ -1,5 +1,7 @@
 //! Public driver faults must terminate owned loops and preserve exact readiness refusals.
-//! A watchdog permits cleanup on red; it can never satisfy the fatal/typed-error oracle.
+//! Each case waits on its own outcome: a loop that never retrieves the driver's result, and so
+//! never sees the loss or the refusal, never returns, and the job's own limit is its failure. No
+//! clock decides an outcome.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -13,9 +15,9 @@ use std::future::{Future, poll_fn};
 use std::pin::{Pin, pin};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Sender, channel};
-use std::task::{Poll, Waker};
-use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::task::Poll;
+use std::thread;
+use std::time::Instant;
 
 use hyper_rt::RtError;
 use hyper_rt::TaskId;
@@ -25,8 +27,6 @@ use hyper_rt::interests::Readiness;
 use hyper_rt::runtime::{LocalRuntime, RuntimeConfig};
 use hyper_rt::task::Outcome;
 
-/// The existing cross-thread fixtures' failure bound, never an ordering delay.
-const WAIT: Duration = Duration::from_secs(5);
 /// The one opaque handle accepted by this public driver adapter; no OS descriptor is accessed.
 const HANDLE: i32 = 0;
 
@@ -34,7 +34,6 @@ struct State {
     stop: AtomicBool,
     started: AtomicBool,
     pending: AtomicBool,
-    expired: AtomicBool,
     lost: AtomicBool,
     busy_loss: AtomicBool,
     rearm_refused: AtomicBool,
@@ -46,7 +45,6 @@ impl State {
             stop: AtomicBool::new(false),
             started: AtomicBool::new(false),
             pending: AtomicBool::new(false),
-            expired: AtomicBool::new(false),
             lost: AtomicBool::new(false),
             busy_loss: AtomicBool::new(false),
             rearm_refused: AtomicBool::new(false),
@@ -189,59 +187,22 @@ impl Drop for DropNotice {
     }
 }
 
-struct Watchdog {
-    state: &'static State,
-    done: Sender<()>,
-    thread: Option<JoinHandle<()>>,
-}
+/// Stops the busy sibling when the program ends, however it ends.
+struct StopOnDrop(&'static State);
 
-impl Watchdog {
-    fn new(state: &'static State, root: Waker) -> Result<Self, String> {
-        let (done, ended) = channel();
-        let thread = thread::Builder::new()
-            .name("rt-driver-loss-watchdog".to_owned())
-            .spawn(move || {
-                if ended.recv_timeout(WAIT).is_err() {
-                    state.expired.store(true, Ordering::Release);
-                    state.stop.store(true, Ordering::Release);
-                    root.wake();
-                }
-            })
-            .map_err(|error| format!("watchdog start: {error}"))?;
-        Ok(Self {
-            state,
-            done,
-            thread: Some(thread),
-        })
-    }
-}
-
-impl Drop for Watchdog {
+impl Drop for StopOnDrop {
     fn drop(&mut self) {
-        self.state.stop.store(true, Ordering::Release);
-        let _ = self.done.send(());
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
+        self.0.stop.store(true, Ordering::Release);
     }
 }
 
-async fn guarded<F: Future>(
-    mut future: Pin<&mut F>,
-    state: &'static State,
-) -> Result<F::Output, String> {
-    poll_fn(|cx| {
-        if state.expired.load(Ordering::Acquire) {
-            return Poll::Ready(Err(
-                "watchdog released the yielding task after lost progress".to_owned(),
-            ));
-        }
-        match future.as_mut().poll(cx) {
-            Poll::Ready(output) => Poll::Ready(Ok(output)),
-            Poll::Pending => {
-                state.pending.store(true, Ordering::Release);
-                Poll::Pending
-            }
+/// Awaits `future`, noting that it returned Pending at least once.
+async fn observed<F: Future>(mut future: Pin<&mut F>, state: &'static State) -> F::Output {
+    poll_fn(|cx| match future.as_mut().poll(cx) {
+        Poll::Ready(output) => Poll::Ready(output),
+        Poll::Pending => {
+            state.pending.store(true, Ordering::Release);
+            Poll::Pending
         }
     })
     .await
@@ -255,8 +216,7 @@ async fn program(
     events: Sender<Event>,
 ) -> Result<Delivered, String> {
     let _root = DropNotice("root", events.clone());
-    let waker = poll_fn(|cx| Poll::Ready(cx.waker().clone())).await;
-    let _watchdog = Watchdog::new(state, waker)?;
+    let _stop = StopOnDrop(state);
     let busy_drop = DropNotice("busy", events.clone());
     let busy = hyper_rt::futures::spawn(async move {
         let _drop = busy_drop;
@@ -268,9 +228,6 @@ async fn program(
     .map_err(|error| format!("busy task admission: {error}"))?;
     let _ = events.send(Event::Busy(busy));
     while !state.started.load(Ordering::Acquire) {
-        if state.expired.load(Ordering::Acquire) {
-            return Err("busy task did not start".to_owned());
-        }
         hyper_rt::futures::yield_now().await;
     }
     if matches!(fault, Fault::Rearm) {
@@ -278,11 +235,11 @@ async fn program(
             hyper_rt::readiness::readable(HANDLE),
             hyper_rt::readiness::writable(HANDLE),
         ));
-        let (read, write) = guarded(both.as_mut(), state).await?;
+        let (read, write) = observed(both.as_mut(), state).await;
         Ok((read, Some(write)))
     } else {
         let mut read = pin!(hyper_rt::readiness::readable(HANDLE));
-        Ok((guarded(read.as_mut(), state).await?, None))
+        Ok((observed(read.as_mut(), state).await, None))
     }
 }
 
@@ -322,10 +279,6 @@ fn lost_case(fault: Fault, state: &'static State) {
         "loss occurred during a nonblocking busy harvest"
     );
     assert!(
-        !state.expired.load(Ordering::Acquire),
-        "the watchdog is cleanup, never fatal success: {result:?}"
-    );
-    assert!(
         matches!(result, Err(RtError::ShardGone { .. })),
         "fatal busy driver loss: {result:?}"
     );
@@ -361,10 +314,6 @@ fn a_remaining_write_wait_receives_the_exact_rearm_refusal() {
     assert!(
         REARM.rearm_refused.load(Ordering::Acquire),
         "the public adapter refused rearming"
-    );
-    assert!(
-        !REARM.expired.load(Ordering::Acquire),
-        "watchdog cannot supply the typed error: {result:?}"
     );
     assert_eq!(result, Ok(Ok((Ok(()), Some(Err(rearm_error()))))));
     assert_eq!(drop_roles(&before_drop), ["busy", "root"]);

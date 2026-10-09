@@ -1243,11 +1243,55 @@ after, per operation; the same machine and day, 2026-10-01 around 11:30 PDT, sha
 
 slates' core asks 3,368 bytes and makes 51 allocations per entry on the steady workload at batch 1
 (`one slates-core steady 3 1 64 20000 1000 count`): the gap in bytes asked, 7,064 against 3,368
-in the tables above, is now 3,800 against 3,368. The remaining 432 bytes are not yet traced: the
-four-slot first queue (`Outgoing::SMALLEST`) the earlier trace named now asks 576 bytes a ready,
-more than the gap, so it is not the whole account. An entry's bytes for the byte rules are now arithmetic on its lengths
+in the tables above, is now 3,800 against 3,368. The remaining 432 bytes are traced below ("The
+bytes an entry asks, traced"): the four-slot first queue of every ready, which the comparison's
+driver did not give back. An entry's bytes for the byte rules are now arithmetic on its lengths
 (`proto::encoded_bytes`), where raft-proto's were prost's `encoded_len`: the "counting each
 entry's encoded length" item above is closed by R-2.
+
+### The bytes an entry asks, traced (2026-10-08)
+
+The 432 bytes above are traced, and closed. A histogram of every size the allocator was asked for
+inside the measured segments of `one hyper steady 3 1 64 20000 1000 count` (a diagnostic allocator
+in the comparison binary, not committed), on `main` at `5d68252`, per entry:
+
+| Size | Per entry | Bytes | What, from its backtrace |
+|---|---|---|---|
+| 640 | 6 | 3,840 | a `Ready`'s queue of messages started at `Outgoing::SMALLEST` (4) slots of `Message`'s 160 bytes: the leader's for its two appends (`send_page`), each follower's for its answer (`handle_append_entries` → `send`), and the commit's |
+| 72 | 3 | 216 | the one-slot `Vec<Entry>` of each append (`Entry` is 72 bytes) and of the proposal |
+| 64 | 2 | 128 | the entry's data cloned into each follower's append |
+| | **11** | **4,184** | |
+
+The proposal's own 64 bytes are the harness's and are set aside. The total is 3,800 bytes on
+2026-10-01 plus 384: `Message` grew from 144 to 160 bytes with `classic: Option<u64>` (the fast
+track's release, `d8578be`), 16 bytes in each of the 24 slots. So the bytes past slates' core were
+the queues, and the queues were the owner's choice: the comparison took each `Ready`'s messages and
+dropped their vector, where hyper-durable's replica gives every emptied queue back
+(`RawNode::recycle_messages`, `crates/hyper-durable/src/replica.rs`) and the member then never
+grows one again. The comparison's in-place driver now gives them back as the replica does
+(`crates/hyper-raft-compare/src/family.rs`); the per-entry histogram after is the 72- and 64-byte
+rows alone.
+
+`one <core> <workload> ... 1000 count`, the same binary for both columns of hyper-raft, the same
+day, load 20–24:
+
+| Workload | hyper-raft before: allocations, bytes per op | after | slates' core |
+|---|---|---|---|
+| steady 3v, batch 1, per entry | 11, 4,184 | 5, 344 | 51, 3,368 |
+| steady 5v, batch 1, per entry | 19, 7,016 | 9, 616 | 99, 8,376 (8 reallocations) |
+| steady 3v, batch 64, per entry | 2.13, 332 | 2.03, 272 | — |
+| transfer 3v, per transfer | 28, 15,144 | 12, 4,904 | 99, 7,120 |
+| transfer 5v, per transfer | 48 (1 reallocation), 26,728 | 22 (0.004), 9,451 | 171 (12), 14,976 |
+| failover 3v, per failover | 32.3, 17,772 | 9.0, 2,898 | — |
+| snapshot 3v, per snapshot | 14, 70,712 | 7, 66,232 | — |
+| catch-up 3v, per entry | 1.01, 140.4 | 1.00, 136.0 | — |
+
+hyper-raft now asks a tenth of slates' core's bytes an entry at batch 1, and fewer on every row
+measured. What is left an entry is the message's payload: the append's entry slots and the data
+each follower is sent. `Message` stays 160 bytes: a queue the owner gives back holds its slots for
+good, so the message's size is paid once, not an entry. `classic` could be one word (0 for "nothing
+known", which releases nothing) to bring it back to 144, at a change of the type hyper-multilog's
+and hyper-check's tests construct; it is not made here.
 
 ## End to end
 

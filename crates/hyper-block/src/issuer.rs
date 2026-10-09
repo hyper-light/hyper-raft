@@ -26,8 +26,10 @@
 //! [`Attached`], through which it submits a batch and waits for its answer ([`Attached::write`]),
 //! or keeps up to the batches it attached for out at once and takes each answer when it needs it
 //! ([`Attached::submit`], [`Attached::answer`]): a writer on a latency path hands a write over
-//! and goes on. A batch's writes all complete before its flush is issued, and the flush only if
-//! all succeeded:
+//! and goes on. A writer that starts after the device opened, on a thread of its own, attaches
+//! through an [`Attacher`], which carries only the way to the issuer's inbox
+//! ([`Issuer::attacher`]). A batch's writes all complete before its flush is issued, and the flush
+//! only if all succeeded:
 //! a write that failed fails its batch, and its flush is never issued, because the caller then
 //! fences and recovers rather than trust what reached the device (Rebello et al., ATC 2020). The
 //! answer comes once, after the flush.
@@ -256,37 +258,84 @@ impl Issuer {
         file: &F,
         batches: usize,
     ) -> Result<Attached, DiskError> {
-        if batches == 0 {
-            return Err(invalid(&self.path, "a submitter needs one batch at least"));
-        }
-        let mut files: Vec<Handle> = Vec::with_capacity(self.workers);
-        for _ in 0..self.workers {
-            files.push(Box::new(file.try_clone()?));
-        }
-        // Each batch out is answered once: room for every answer the submitter may be owed.
-        let (answers, answered) = sync_channel(batches);
-        let (reply, replied) = sync_channel(1);
-        let gone = || stopped(&self.path, "the device's issuer has stopped");
-        self.events
-            .send(Event::Attach {
-                files,
-                batches,
-                answers,
-                reply,
-            })
-            .map_err(|_| gone())?;
-        let (slot, generation) = replied.recv().map_err(|_| gone())??;
-        Ok(Attached {
-            slot,
-            generation,
-            events: self.events.clone(),
-            answers: answered,
-            path: self.path.clone(),
-            batches,
-            out: 0,
-            next: 0,
-        })
+        attach(&self.events, self.workers, &self.path, file, batches)
     }
+
+    /// A way to attach submitters to this issuer that its holder owns and may send to another
+    /// thread: a submitter started after the device opened, on a thread of its own, attaches
+    /// through it ([`Attacher::attach_deep`]). It holds the way to the issuer's inbox and nothing
+    /// else, so it keeps no thread and no device alive: once the issuer has stopped, an attach
+    /// through it is refused as one through the issuer would be.
+    pub fn attacher(&self) -> Attacher {
+        Attacher {
+            events: self.events.clone(),
+            workers: self.workers,
+            path: self.path.clone(),
+        }
+    }
+}
+
+/// An owned way to attach submitters to a device's issuer ([`Issuer::attacher`]): a maintenance
+/// worker that starts after its shard attached, on its own thread, attaches through one rather
+/// than borrow the issuer.
+#[derive(Clone, Debug)]
+pub struct Attacher {
+    events: SyncSender<Event>,
+    workers: usize,
+    path: PathBuf,
+}
+
+impl Attacher {
+    /// [`Issuer::attach_deep`], through the issuer this came from: refused, before any duplicate
+    /// is handed over, once that issuer has stopped.
+    pub fn attach_deep<F: BlockFile + 'static>(
+        &self,
+        file: &F,
+        batches: usize,
+    ) -> Result<Attached, DiskError> {
+        attach(&self.events, self.workers, &self.path, file, batches)
+    }
+}
+
+/// Hands the issuer whose inbox is `events` duplicates of `file`, one for each of its `workers`, for
+/// a submitter that keeps up to `batches` out at once.
+fn attach<F: BlockFile + 'static>(
+    events: &SyncSender<Event>,
+    workers: usize,
+    path: &Path,
+    file: &F,
+    batches: usize,
+) -> Result<Attached, DiskError> {
+    if batches == 0 {
+        return Err(invalid(path, "a submitter needs one batch at least"));
+    }
+    let mut files: Vec<Handle> = Vec::with_capacity(workers);
+    for _ in 0..workers {
+        files.push(Box::new(file.try_clone()?));
+    }
+    // Each batch out is answered once: room for every answer the submitter may be owed.
+    let (answers, answered) = sync_channel(batches);
+    let (reply, replied) = sync_channel(1);
+    let gone = || stopped(path, "the device's issuer has stopped");
+    events
+        .send(Event::Attach {
+            files,
+            batches,
+            answers,
+            reply,
+        })
+        .map_err(|_| gone())?;
+    let (slot, generation) = replied.recv().map_err(|_| gone())??;
+    Ok(Attached {
+        slot,
+        generation,
+        events: events.clone(),
+        answers: answered,
+        path: path.to_path_buf(),
+        batches,
+        out: 0,
+        next: 0,
+    })
 }
 
 impl Drop for Issuer {
@@ -1401,5 +1450,51 @@ mod tests {
         assert!(attached.write(writes(1), true).is_err());
         drop(attached);
         assert_eq!(alive(), 1);
+    }
+
+    /// An attacher is owned and moves to another thread: a submitter started after the issuer
+    /// attaches through it, its batch lands and is flushed, and its detach gives every duplicate
+    /// back, as an attachment through the issuer does.
+    #[test]
+    fn an_attacher_moved_to_another_thread_attaches_and_its_writes_land() {
+        let dir = tempfile::tempdir().unwrap();
+        let issuer = Issuer::start(Path::new("dev"), 2).unwrap();
+        let probe = Probe::new(dir.path(), true, None);
+        let attacher = issuer.attacher();
+        let file = probe.try_clone().unwrap();
+        let landed = std::thread::scope(|s| {
+            s.spawn(move || {
+                let mut attached = attacher.attach_deep(&file, 2).unwrap();
+                let number = attached.submit(writes(2), true).unwrap();
+                let (answered, answer) = attached.answer().unwrap();
+                assert_eq!(answered, number);
+                answer.map(|buffers| buffers.len())
+            })
+            .join()
+            .unwrap()
+        });
+        assert_eq!(landed.unwrap(), 2);
+        assert_eq!(probe.counts.flushes.load(Ordering::SeqCst), 1);
+        assert_eq!(probe.counts.alive.load(Ordering::SeqCst), 1);
+        let mut page = vec![0u8; 4096];
+        probe.read_exact_at(&mut page, 4096).unwrap();
+        assert_eq!(page, [fill(1); 4096]);
+    }
+
+    /// An attacher keeps no issuer alive: once its issuer has stopped, an attach through it is
+    /// refused, typed, and no duplicate of the file outlives the refusal.
+    #[test]
+    fn an_attacher_whose_issuer_stopped_is_refused_and_keeps_no_duplicate() {
+        let dir = tempfile::tempdir().unwrap();
+        let issuer = Issuer::start(Path::new("dev"), 2).unwrap();
+        let probe = Probe::new(dir.path(), true, None);
+        let attacher = issuer.attacher();
+        drop(issuer);
+        let refused = attacher.attach_deep(&probe, 1);
+        assert!(
+            matches!(&refused, Err(DiskError::Io { source, .. }) if source.kind() == std::io::ErrorKind::BrokenPipe),
+            "{refused:?}"
+        );
+        assert_eq!(probe.counts.alive.load(Ordering::SeqCst), 1);
     }
 }

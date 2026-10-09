@@ -615,7 +615,10 @@ cannot be cancelled (the call is the OS's); its share's bound is what limits the
 thread owns the job queue's receiving end and the idle workers' reports; each worker owns a one-job slot
 and reports itself idle over a bounded channel, so each job goes to exactly one idle worker. Shares and
 counters are atomics. A job that panics ends the job, not its worker (an unwind boundary), and gives its
-share back. One per process: a second `start` is refused; `stop` drains and joins. Name resolution
+share back. A job gives its share back before its result is delivered or its sender dropped, so a task
+that sees the job end can submit again under the same share and is never refused for a slot the pool is
+still about to free (2026-10-08: the reverse order failed `tests/blocking.rs` on a slow macOS x86_64
+runner). One per process: a second `start` is refused; `stop` drains and joins. Name resolution
 (§5.4) is `dns::resolve`, on the share named `dns`. `tests/blocking.rs` passes on macOS and Linux 6.12.
 
 ## 10. Configuration from the machine

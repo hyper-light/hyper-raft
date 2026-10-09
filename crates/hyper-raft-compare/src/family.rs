@@ -3,7 +3,9 @@
 //! hyper-raft. Each is driven as focal's shell drives it (hyper-raft
 //! `tests/support/mod.rs`, `New::drain` and `Old::drain`): one `Ready` at a
 //! time, its entries persisted, its messages sent, what it commits applied,
-//! then advanced.
+//! then advanced. hyper-raft in place gives each emptied queue of messages back
+//! (`RawNode::recycle_messages`), as hyper-durable's replica does; the cores on
+//! raft-proto have no such call.
 //!
 //! Every one of them keeps its log on the same in-memory [`Disk`], so what
 //! the owner does is the same for each and is set aside from the counts of
@@ -304,11 +306,11 @@ macro_rules! focal_core {
                 $self.raw.store_mut().hard = hard.clone();
             }
             alloc::back();
-            let messages = ready.take_messages();
-            let persisted = ready.take_persisted_messages();
+            let mut messages = ready.take_messages();
+            let mut persisted = ready.take_persisted_messages();
             alloc::aside();
-            $out.extend(messages.into_iter().map(envelope));
-            $out.extend(persisted.into_iter().map(envelope));
+            $out.extend(messages.drain(..).map(envelope));
+            $out.extend(persisted.drain(..).map(envelope));
             if let Some((first, last)) = ready.committed_range() {
                 apply(&mut $self.app, $self.raw.store().range(first, last));
             }
@@ -324,16 +326,21 @@ macro_rules! focal_core {
                     alloc::back();
                 })
                 .expect("advanced");
-            let messages = light.take_messages();
+            // The emptied queues go back to the member, as hyper-durable's replica gives them
+            // (`RawNode::recycle_messages`), so a later ready's queue is not grown again.
+            $self.raw.recycle_messages(messages);
+            $self.raw.recycle_messages(persisted);
+            let mut messages = light.take_messages();
             alloc::aside();
             if let Some(commit) = light.commit_index() {
                 $self.raw.store_mut().hard.commit = commit;
             }
-            $out.extend(messages.into_iter().map(envelope));
+            $out.extend(messages.drain(..).map(envelope));
             if let Some((first, last)) = light.committed_range() {
                 apply(&mut $self.app, $self.raw.store().range(first, last));
             }
             alloc::back();
+            $self.raw.recycle_messages(messages);
             $self.raw.advance_apply_to($self.app.index).expect("applied");
         }
     };

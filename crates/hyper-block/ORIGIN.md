@@ -82,6 +82,16 @@ caller hands in the alignment, queue and measured depth it found.
    could not attach, and wrote their branches' pages on their own threads. It keeps nothing alive:
    an attach after the issuer stopped is refused, and the duplicates it made are dropped with the
    refusal.
+9. **A batch's vector comes back with its answer** (`issuer.rs`): the answer is the batch's own
+   `Transfers` (`Vec<(AlignedBuf, u64)>`, `aio::Transfers`), each buffer and offset where it was
+   given and the allocation intact, as `AioFile` answers; it was a new `Vec<AlignedBuf>`. The issuer
+   keeps a batch's slots in that vector, an empty buffer (`AlignedBuf::empty`) standing in for one
+   on a worker, where it built a `Vec<Option<AlignedBuf>>` per batch. A submitter that pools its
+   vectors makes no allocation a batch, where it made three (the vector it built, the issuer's
+   slots, the answer's vector): `tests/issuer_allocs.rs` counts 0 across the process for a warm
+   pass of five batches, 15 before. Mantle measured this round trip as about 88 % of its engine's
+   steady-state allocations over a 3 M-put fill and drain. A failed batch still drops its vector
+   and buffers, as before.
 
 ## Planned
 

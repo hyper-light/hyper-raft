@@ -12,7 +12,7 @@
 //!
 //! The far-link runs (`docs/timing.md` §2.7, "A pair the pool does not fit") put some members 100 ms one way from the rest
 //! ([`Shape`]), each pair joined with its handshake's round trip as slates' daemons join: a pair the
-//! pooled verdict does not fit is never judged by it, is judged provisionally until its own
+//! pooled verdict does not fit is never judged by it, is judged by its own timer until its own
 //! estimator configures, and a member that dies before any far pair configured is still condemned
 //! by every survivor within the bound its detector stated.
 #![allow(
@@ -39,7 +39,7 @@ use hyper_sim::{
 };
 use hyper_swim::HostId;
 use hyper_swim::codec::{Coordinate, GossipBatch, SwimMessage, gossip_capacity};
-use hyper_swim::detector::{Detector, Judge, PingReq, Verdict};
+use hyper_swim::detector::{Detector, Judge, PingReq};
 use hyper_swim::membership::{Liveness, MemberState};
 use hyper_timing::Exposure;
 
@@ -169,12 +169,6 @@ enum Ev {
     Thaw,
 }
 
-/// Whether `verdict` is a misfit pair's provisional one: it promises no bound (`mistake` 1, the
-/// detector's `misfit_verdict`).
-fn is_provisional(verdict: &Verdict) -> bool {
-    verdict.mistake >= 1.0
-}
-
 fn host(node: NodeId) -> HostId {
     HostId(u64::from(node.0) + 1)
 }
@@ -209,9 +203,9 @@ struct Member {
     relaying: BTreeMap<u64, (u64, HostId, u64)>,
     /// Each peer's death as this member came to hold it.
     deaths: BTreeMap<u64, Noted>,
-    /// The peers this member has judged by a provisional verdict (`mistake` 1, before the pair's own
+    /// The peers this member has judged by their timer's verdict (`mistake` 1, before the pair's own
     /// estimator configured), as polled.
-    provisional: std::collections::BTreeSet<u64>,
+    timed: std::collections::BTreeSet<u64>,
     /// Every probe this member sent, on its own clock, and whether the verdict that judged it rests
     /// its period at the floor: the pair's own or the pool's.
     pings: Vec<(u64, bool)>,
@@ -272,7 +266,7 @@ impl Member {
             encoded: Vec::new(),
             relaying: BTreeMap::new(),
             deaths: BTreeMap::new(),
-            provisional: std::collections::BTreeSet::new(),
+            timed: std::collections::BTreeSet::new(),
             pings: Vec::new(),
             nodes: shape.nodes,
             alive: true,
@@ -465,10 +459,10 @@ impl Member {
         for peer in (0..self.nodes).map(NodeId).filter(|peer| *peer != me) {
             if self
                 .detector
-                .verdict(host(peer))
-                .is_some_and(|verdict| is_provisional(&verdict))
+                .report(host(peer))
+                .is_some_and(|report| report.judge == Judge::Timer)
             {
-                self.provisional.insert(host(peer).0);
+                self.timed.insert(host(peer).0);
             }
             let state = self.detector.membership().state(host(peer));
             let id = host(peer).0;
@@ -643,19 +637,9 @@ impl Sim {
         Ok(())
     }
 
-    /// Whether every live member judges every live peer by a verdict, the pair's own or the
-    /// pool's.
+    /// Whether every live member judges every live peer by an estimator's verdict, the pair's own
+    /// or the pool's, not the pair's timer.
     fn every_pair_judged(&self) -> bool {
-        self.live().all(|(me, member)| {
-            self.live()
-                .filter(|(peer, _)| *peer != me)
-                .all(|(peer, _)| member.detector.verdict(host(peer)).is_some())
-        })
-    }
-
-    /// Whether every live member judges every live peer by a verdict whose period rests at the
-    /// floor: the pair's own or the pool's.
-    fn every_pair_judged_at_floor(&self) -> bool {
         self.live().all(|(me, member)| {
             self.live()
                 .filter(|(peer, _)| *peer != me)
@@ -845,10 +829,7 @@ fn budgeted(source: Source) -> Result<Record, SimError> {
         Source::Trace(_) => "the trace".to_owned(),
     };
     let mut sim = Sim::new(source, false, BUDGETED_LAN);
-    sim.run(
-        "every pair judged at the floor",
-        Sim::every_pair_judged_at_floor,
-    );
+    sim.run("every pair judged at the floor", Sim::every_pair_judged);
     let budget = SLATES_BUDGET_NS;
     let floor = budget / (2 * (2 * u64::from(NODES - 1) - 1) + 1);
     let from: Vec<usize> = sim
@@ -901,7 +882,7 @@ fn hourly(source: Source) -> Result<Record, SimError> {
         Source::Trace(_) => "the trace".to_owned(),
     };
     let mut sim = Sim::new(source, false, HOURLY_LAN);
-    sim.run("every pair judged", Sim::every_pair_judged_at_floor);
+    sim.run("every pair judged", Sim::every_pair_judged);
     for (me, member) in sim.live() {
         for (peer, _) in sim.live().filter(|(peer, _)| *peer != me) {
             let verdict = member.detector.verdict(host(peer));
@@ -1033,7 +1014,7 @@ fn stopped_and_refuted(source: Source) -> Result<Record, SimError> {
 
 /// One run from `source` of three members whose two peers of member 0 both die once every pair has
 /// answered once, before any pool configures: member 0, its pool fed by nothing more, suspects
-/// both, each by a provisional verdict once silent past RFC 6298's timeout, and condemns neither
+/// both, each by its pair's timer, and condemns neither
 /// (it has no live member's answer to show its own network works).
 fn every_peer_dead_early(source: Source) -> Result<Record, SimError> {
     let seed = match &source {
@@ -1070,19 +1051,17 @@ fn every_peer_dead_early(source: Source) -> Result<Record, SimError> {
     for peer in [1, 2] {
         let report = sim.members[0].detector.report(host(NodeId(peer)));
         assert!(
-            report.is_some_and(
-                |report| report.judge == Judge::Provisional && report.condemnations == 0
-            ),
-            "{seed}: member 0 suspects {peer} provisionally and condemns it not: {report:?}"
+            report.is_some_and(|report| report.judge == Judge::Timer && report.condemnations == 0),
+            "{seed}: member 0 suspects {peer} by its timer and condemns it not: {report:?}"
         );
     }
     Ok(sim.world.finish())
 }
 
 /// A member whose every peer dies before its pool configures still judges them (`docs/timing.md`
-/// §2.7, "Before a pair can be judged"): once silent past RFC 6298's timeout a pair is judged
-/// provisionally while the pool has no verdict. Before, nothing judged them: member 0's probes stayed
-/// measurement only, and the world ran out of steps on every seed with both peers alive in its view.
+/// §2.7, "Before a pair's own estimator configures"): every probe is judged, by its pair's timer
+/// where no estimator judges it. Before, nothing judged them: member 0's probes stayed measurement
+/// only, and the world ran out of steps on every seed with both peers alive in its view.
 #[test]
 fn a_member_whose_peers_all_die_early_suspects_them() {
     for seed in 0..16 {
@@ -1149,13 +1128,13 @@ fn condemned_live(sim: &Sim) -> Vec<(u32, u32, u64)> {
 
 /// slates' far-link repro on the simulated network: two near members, four 100 ms one way from
 /// them, the path lossless with 100 µs of jitter, watched 30 s. No member condemns a live one, and
-/// every far pair has left provisional judgement for its own estimator's verdict by the end.
+/// every far pair has left its timer's judgement for its own estimator's verdict by the end.
 fn far_link(source: Source) -> Result<Record, SimError> {
     let mut sim = Sim::new(source, false, FAR_LINK);
     sim.run("30 s watched", |sim| sim.now() >= WATCHED_NS);
     no_live_member_condemned(&sim, "in 30 s");
     // Then on until every far pair's own estimator has configured: from then each is judged by its
-    // own verdict, not the provisional one.
+    // own verdict, not its timer's.
     sim.run("every far pair configured", Sim::every_far_pair_configured);
     no_live_member_condemned(&sim, "once every far pair configured");
     for (me, member) in sim.live() {
@@ -1163,14 +1142,18 @@ fn far_link(source: Source) -> Result<Record, SimError> {
             .live()
             .filter(|(peer, _)| sim.shape.crosses(me.0, peer.0))
         {
-            let verdict = member.detector.verdict(host(peer));
+            let judge = member
+                .detector
+                .report(host(peer))
+                .map(|report| report.judge);
             assert!(
-                member.provisional.contains(&host(peer).0),
-                "member {me:?} judged far peer {peer:?} provisionally before its own estimator configured"
+                member.timed.contains(&host(peer).0),
+                "member {me:?} judged far peer {peer:?} by its timer before its own estimator configured"
             );
-            assert!(
-                verdict.is_some_and(|verdict| !is_provisional(&verdict)),
-                "member {me:?} judges configured far peer {peer:?} by its own verdict: {verdict:?}"
+            assert_eq!(
+                judge,
+                Some(Judge::Own),
+                "member {me:?} judges configured far peer {peer:?} by its own verdict"
             );
         }
     }
@@ -1193,7 +1176,7 @@ fn no_live_member_condemned(sim: &Sim, when: &str) {
 }
 
 /// slates' repro (`no_live_member_is_condemned_across_a_lossless_far_link`), deterministic: every
-/// named seed condemns no live member, and every far pair moves from provisional judgement to its
+/// named seed condemns no live member, and every far pair moves from its timer's judgement to its
 /// own verdict. Each seed through the run-twice check.
 #[test]
 fn no_live_member_is_condemned_across_a_lossless_far_link() {
@@ -1203,7 +1186,7 @@ fn no_live_member_is_condemned_across_a_lossless_far_link() {
 }
 
 /// Two near members and one far one, the far one killed from the start: neither survivor ever
-/// measures it, so neither pair has its own verdict, and each is judged provisionally. Every
+/// measures it, so neither pair has its own verdict, and each is judged by its timer. Every
 /// survivor holds it dead, by its own probes, within the bound its detector stated, counted from
 /// the kill: a member that never answered has no last answer to count from.
 fn all_far_kill(source: Source) -> Result<Record, SimError> {
@@ -1230,8 +1213,8 @@ fn all_far_kill(source: Source) -> Result<Record, SimError> {
             "member {me:?} held the far member dead {after:?} after the kill, past its stated bound {within:?}"
         );
         assert!(
-            member.provisional.contains(&host(victim).0),
-            "member {me:?} judged the never-measured far member provisionally"
+            member.timed.contains(&host(victim).0),
+            "member {me:?} judged the never-measured far member by its timer"
         );
         assert!(
             member

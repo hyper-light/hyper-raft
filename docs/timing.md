@@ -585,15 +585,17 @@ answer from another member (four Linux runs in four hundred under a CPU throttle
 probes missed too); periods already ended only (seven runs in three hundred at one CPU, where a
 throttle's freeze of some 40 ms was inside the period still running when the death was noted); and
 the current round's size for `m` (a member that had condemned another, falsely, under the throttle
-ran rounds of one, while the victim's last probe had been in a round of three). The member states
-the bound only while every probe it makes is judged, by its pair's verdict or the pool's: an
-unjudged probe that goes unanswered suspects nobody, so before then the member detects nothing by
-its own probes, and a death it holds is another member's condemnation, adopted on that member's
-timeline. Stating its own bound for one was the last form to fail: with the directed gossip below,
-three runs in 2,000 noted a death 0.2 to 2.2 ms past a bound of 2.3 to 3.3 ms, and a build that kept
-a ring of each member's probes, answers and views, dumped at the overshoot, showed why: a live
-member falsely condemned in the run's first milliseconds, adopted by gossip at a member whose probes
-were still measurement only (`a_member_that_judges_nothing_states_no_bound`).
+ran rounds of one, while the victim's last probe had been in a round of three). Every probe is
+judged (below), so the member states the bound from its first period; the span it is drawn from is
+the longest of the verdicts judging the pairs it probes now, its timers' included, and the periods
+already run count by their own lengths (`a_member_states_its_bound_from_its_first_period`). A
+longest span kept for good instead would hold a second-long first timer in every bound and window
+long after every pair had configured; and the first form counted only configured verdicts, so a
+period a timer judged could run past the bound before any such period had run. Stating a bound while
+probes judged nothing was the last form to fail before every probe was: with the directed gossip
+below, three runs in 2,000 noted a death 0.2 to 2.2 ms past a bound of 2.3 to 3.3 ms, a live member
+falsely condemned in the run's first milliseconds and adopted by gossip at a member whose probes then
+judged nothing.
 
 **The owner's detection budget** (slates' A-125). A judged period ended at its probe's deadline,
 which tracks the round trip, so an idle member probed at its round trip's pace: in slates' two-member
@@ -607,8 +609,9 @@ round probes, and an idle member probes no faster than detection within `D` need
 deadline and its relay request are unchanged: only an end that would come sooner waits for the
 floor. Where every period's deadlines fit within it, the declaration to pending is within `D`; a
 period whose deadlines run past the floor is as long as they are, and the stated bound counts it.
-Measurement and provisional periods are not floored: they judge nothing, or nothing yet, and
-flooring them left a lone peer unsuspected 9 s into its silence in slates' runs. A budget of zero
+A period a pair's timer judges is not floored: it ends at its answer, as the samples its pair's
+estimator is still gathering need, and flooring such periods left a lone peer unsuspected 9 s into
+its silence in slates' runs. A budget of zero
 leaves every period at its probe's deadline. In the unit test three near peers answering in about
 1 ms drew 138 probes in one 900 ms budget without the floor and at most 12 with it
 (`an_idle_member_probes_no_faster_than_its_detection_budget_needs`); in the simulation each member's
@@ -616,61 +619,64 @@ probe judged at the floor is followed by its next no sooner than the floor, on e
 (`a_member_under_a_detection_budget_probes_no_faster_than_its_floor`: 1.8 ms after it before);
 slates measured pings fall from 10,264 to 134 a member in 6 s.
 
-**Before a pair can be judged.** A pair's estimator refuses until it has two prediction errors and a
-measured `τ_int` (`Refusal::TooFewHeartbeats`, `CorrelationUnmeasured`). Until then its probes are
-judged by the member's pool: one more `LinkEstimator`, fed every round trip the member measured, its
-sequence the member's probe count so an unanswered probe to anyone is a loss. The pool is the
-candidate of §3, item 3 (the stalls are the host's); it configures within a few dozen round trips of
-the member's first, and a pair then within a few dozen of its own. The pool is fed while it judges:
-by pairs with no verdict of their own, and by every pair until it has one; its verdict is renewed
-when a probe needs it. A renewal the estimator refuses leaves the verdict in force, as
-`LinkEstimator::configure` leaves its margin: a stall can make `τ_int` unmeasured again, and the
-first form, which dropped the verdict then, left a probe of a crashed member unjudged (one Linux run
-in three hundred at one CPU). While the pool refuses too, a probe is measurement only, and its
-period ends when it is answered or at its expected arrival from the latest round trip (NFD-E over a
-window of one), whichever is first, until the pair has been silent, from its earliest probe that no
-answer has followed, for RFC 6298's timeout from its latest round trip `R`: `3R` (§2.2), rounded up
-to the RFC's one second (§2.4), and one second where it has none (§2.1; RFC 8961 requirement (1),
-"In the absence of any knowledge about the latency of a path, the initial RTO MUST be conservatively
-set to no less than 1 second"). From then the pair is judged provisionally at that timeout
-(`silent_verdict`), with no bound promised and one relay asked. RFC 8961 lifts §2.4's minimum from a
-timer with several observations of its path; it is kept here because the member's model of its own
-host's stalls, the pool, has refused, so nothing it measured is a timer's evidence. The design
-expected the pool to configure within a few dozen round trips; nothing promised it would. A pair
-silent from the start feeds it nothing (a two-member view whose one peer died early, a member whose
-every peer did), and an estimator refuses while a host's stalls keep its round trips correlated: slates'
-member at load 80 had a pair refuse at 141 samples and its pool at 5, and the peer, silent, was
-judged by nothing for 4,000 periods (2026-10-10). Before its silence reaches the timeout, a pair is
-measured as before, so the start-up measurement phase is unchanged for pairs that answer: a first form
-that judged every pair whenever the pool had none turned that phase into judged periods of a second
-and failed 25 of slates' 81 detector tests. A silent pair gives no samples, so measuring it on has
-nothing to wait for (`a_peer_silent_before_any_estimate_configures_is_suspected`: alive after 600 s
-simulated before; `a_member_whose_peers_all_die_early_suspects_them` in `tests/sim.rs`). Unanswered then, it is a loss to the estimators
-unless its answer comes later; it judges nothing, and its wake measures `G`. Each measurement period
-that ends unanswered doubles the next one's wait, as a retransmission timer backs off (RFC 6298
-§5.5), up to the 60 s at which §2.5 lets the doubling be capped, and a measured round trip ends the
-backing off. An answer is measured only while its probe is outstanding, the latest three of its
-peer's; without the backing off, round trips that lengthened past that, under load, came each for a
-probe written over, none was measured, the latest round trip never lengthened, and the member probed
-on at the stale pace with nothing judged, slow to answer the others, who condemned it: a member
-43,557 periods into a cluster run, condemned 95 times
-(`measurement_periods_follow_round_trips_that_lengthen`, which reproduces it in the detector alone,
-taking no round trip in 2,000 periods without it). An earlier rule ended an unanswered
-measurement period only when another member was next heard from, assuming no time at all; in Linux
-at two CPUs with four busy loops, a throttled container dropped a burst of datagrams, every member's
-probe was lost at once, and all four waited for one another for ever
-(`a_lost_measurement_probe_ends_at_its_expected_arrival`). The very first probe, before any round
-trip, has no round trip to expect its answer from: it waits as a retransmission timer does before
-its first measurement, 1 s (RFC 6298 §2.1, "Until a round-trip time (RTT) measurement has been made
-... the sender SHOULD set RTO <- 1 second"), backed off as above, and ends sooner when another member
-is heard from. An owner that measured a round trip to the peer outside the detector, the handshake
-that keyed its session, gives it at the join (`Detector::join_measured`), and the first probe waits
-on that instead: 1 s is some 10^4 times a LAN's round trip. It only times the first waits; a
-handshake is not a probe, so no estimator takes it and it judges nothing. It once waited on its answer or another member alone, and members whose first probes
-were all lost waited on one another for ever: slates' daemons, three in one process, dropped the
-datagrams queued while a peer's address was re-resolved at a re-key, sent five datagrams in all and
-then nothing, in 4 runs of 6 (`a_lost_first_probe_ends_at_the_initial_wait`, and in the simulated
-cluster `members_whose_first_probes_are_all_lost_probe_again`).
+**Before a pair's own estimator configures.** A pair's estimator refuses until it has two prediction
+errors and a measured `τ_int` (`Refusal::TooFewHeartbeats`, `CorrelationUnmeasured`). Until then its
+probes are judged by the member's pool where the pool's span covers the pair: one more
+`LinkEstimator`, fed the round trips of the pairs on its path (below), its sequence the member's
+probe count so an unanswered probe to anyone is a loss. The pool is the candidate of §3, item 3 (the
+stalls are the host's); its verdict is renewed when a probe needs it, and a renewal the estimator
+refuses leaves the verdict in force, as `LinkEstimator::configure` leaves its margin: a stall can make
+`τ_int` unmeasured again, and the first form, which dropped the verdict then, left a probe of a
+crashed member unjudged (one Linux run in three hundred at one CPU).
+
+Every other probe is judged by its pair's own retransmission timer, RFC 6298's as written over the
+pair's round trips (`Rto`, `timer_verdict`; 2026-10-10):
+- before any round trip of the pair, the initial second (§2.1; RFC 8961 requirement (1), "In the
+  absence of any knowledge about the latency of a path, the initial RTO MUST be conservatively set
+  to no less than 1 second"), all of it margin;
+- after, `SRTT + max(G, 4·RTTVAR)` (§2.2, §2.3), every round trip taken, a late answer's too: its
+  nonce names the probe it answers, so it is no ambiguous sample (§3; RFC 8961 (2)(d));
+- at least §2.4's second until the pool has measured the host's stalls, which a timer over a few of
+  the pair's round trips has not seen (§3, item 3); from then the pool's margin floors the variance
+  term as `G` does, and the second goes (RFC 8961 lifts §2.4's minimum from a timer whose observations
+  cover its path; the far-link runs measured no condemnation of a live member with the pool's margin
+  as the floor);
+- doubled at each probe that goes unanswered (§5.5), per pair, as a connection's timer backs off, up
+  to the 60 s §2.5 allows as a cap, and recomputed at the next round trip taken;
+- the handshake that keyed the pair, where its owner gives one (`Detector::join_measured`), is the
+  timer's first round trip, as TCP's handshake is; no estimator takes it, since it is not a probe.
+
+A timer-judged probe's period ends at its answer, or at its deadline unanswered, and then it is
+judged as any probe is: its relays are asked, and with no answer by theirs it suspects. Its period
+also wakes at its expected arrival, the timer's smoothed round trip past its send, where its answer
+is not in by then: the wake measures the member's lateness `G`, which every estimator needs before it
+takes a sample, and which a member whose answers all came before their deadlines would never
+otherwise measure.
+
+This replaced three earlier forms. The first held probes as measurement only until the pool or the
+pair configured, a period ending at its answer or its expected arrival and judging nothing, so
+completeness hung on an estimator configuring, which nothing promised: a pair silent from the start
+feeds the pool nothing (a two-member view whose one peer died early, a member whose every peer did),
+and an estimator refuses while a host's stalls keep its round trips correlated. slates' member at
+load 80 had a pair refuse at 141 samples and its pool at 5, and the peer, silent, was judged by
+nothing for 4,000 periods (2026-10-10; `a_peer_silent_before_any_estimate_configures_is_suspected`,
+alive after 600 s simulated before; `a_member_whose_peers_all_die_early_suspects_them` in
+`tests/sim.rs`). A second form, slates' patch for that, judged a pair only while the pool had no
+verdict and only once the pair had been silent for the timeout: a fallback beside the unjudged phase,
+which paid the timeout twice, and which the owner ruled out (no fallbacks, only the correct rule in
+every state). The third, upstream's far-link rules, judged a pair the pool did not fit at `3R` from
+its latest round trip and a pair with no evidence at a first-contact second: both are this timer,
+the first after one round trip without its smoothing, the second before any. What the measurement
+phase learned stays in the timer: a probe's answer is measured however late, so round trips that
+lengthen past the outstanding records no longer leave a member probing at a stale pace with nothing
+measured (a member 43,557 periods into a cluster run, condemned 95 times;
+`a_pair_s_estimators_follow_round_trips_that_lengthen`); and a lost probe ends at its timer's
+deadline and its relays', never on another member being heard from, which left members whose probes
+were all lost at once waiting on one another for ever (a throttled container's burst at two CPUs;
+slates' daemons dropping the datagrams queued at a re-key, 4 runs of 6;
+`a_lost_probe_is_judged_at_its_pair_s_timer`,
+`a_first_probe_is_judged_at_the_initial_second_and_its_pair_backs_off`, and in the simulated cluster
+`members_whose_first_probes_are_all_lost_probe_again`).
 
 **A pair the pool does not fit.** The pool's verdict suits the paths the member mostly probes. For a pair much farther away, it is wrong until that pair's own estimator configures. Found by slates on two networks 100 ms apart: a far member's pool, fed by its same-side peers' 1 ms round trips, put each crossing probe's deadline 1.9 to 2.7 ms after its send on a 200 ms path. Each far member condemned each live near member 76 to 115 times in 30 s, from the first second to the last. Every answer arrived after its probe's record had been reused (three a peer, above), so the pair never took a sample and never configured.
 
@@ -680,27 +686,23 @@ The rule:
 - Its latest evidence decides, both ways (2026-10-10). The first form marked a pair a misfit for good at its first answer past the span or after its record was reused. On a loaded host one stall did that to a near pair: slates' fleet at load 80 had both of a member's pairs marked so before its pool configured, so nothing fed the pool, which refused at 5 round trips, and a peer that then went silent was judged by nothing for 4,000 periods. Now a pair one stall made late is the pool's to judge again from its next answer in time, and a pair whose path lengthens leaves the pool's judgment at its first late answer (`a_pair_one_stall_made_late_feeds_the_pool_again`; `a_pool_fed_by_pairs_a_stall_made_late_configures` in `tests/sim.rs`: before, a member both of whose peers stalled 20 ms once had no pool 70 s on).
 - An answer no reuse explains moves nothing: an owner's own ping answered on the plane (slates' lease renewals, nonces from 2⁶³) or an expired relay record's is evidence of life only. Before 2026-10-09 any unexplained answer marked its pair, and an owner's renewals kept slates' pools from ever being fed (3 of 11 warm-restart runs; `an_answer_no_probe_explains_moves_nothing_and_a_silent_peer_is_suspected`).
 - The pool is configured, if due, **before** the handshake is compared with it. Comparing first read no verdict on the probe that configured the pool, and that probe was judged by the pool; on slates' harness a near member was condemned in 5 of 40 runs.
-- A pair the pool does not cover is never judged by it. Until its own estimator configures it is judged **provisionally** (`misfit_verdict`):
-  - **Expected arrival `μ = R`**, the pair's own latest measured round trip: its latest answer however late, else its handshake's. An answer that finds its probe's record reused gives one too. Each peer keeps the latest record a later probe wrote over while it was unanswered (`Peer::reused`): an answer to it is timed exactly, and an answer to an earlier probe, sent before it since nonces only increase, has at least that record's age, a lower bound. Without it, a pair made misfit by such an answer, with no handshake round trip, had no `R`, stayed measurement only, and a member that then died was never condemned by it (`a_far_peer_that_answers_only_after_its_records_are_reused_and_dies_is_condemned`, failing first: alive after 600 s simulated).
-  - **Margin `α = max(2R, α_pool)`.** RFC 6298 §2.2's rule for a path with one measured round trip `R` sets `SRTT = R` and `RTTVAR = R/2`, so `RTO = SRTT + 4·RTTVAR = 3R`, and the margin is `3R − R = 2R`. The pool's margin is kept where it is wider: the host's own stalls (§2.6) are in every pair's round trip, near or far.
-  - **Interval `η` and loss `p`** are the pool's. The pair is probed at the member's rounds like any other, and the loss sizes the relays an unanswered probe asks.
-- Before any round trip of the pair is measured, which needs a handshake that measured none and no answer yet, its probes are measurement only, as before.
+- A pair the pool does not cover is never judged by it. Until its own estimator configures it is judged by its own timer (above), the pool's margin flooring the timer's variance term: the host's own stalls (§2.6) are in every pair's round trip, near or far. Each peer keeps the latest record a later probe wrote over while it was unanswered (`Peer::reused`): an answer to it is timed exactly, and taken by the timer; an answer to an earlier probe, sent before it since nonces only increase, has at least that record's age, a lower bound, which is the pair's latest round trip for coverage. The member's probe loss, Jeffreys' posterior mean over the probes the pool has seen (half before any), sizes the relays an unanswered timer-judged probe asks.
 
-**What `mistake = 1` means.** Theorem 7's bound `(V + p·α²)/(V + α²)` needs the pair's own delay variance `V`, which a pair with one or two round trips has not measured. So the provisional verdict claims no bound, and the allowance it adds is the whole probe. The condemnation rule does not change:
+**What `mistake = 1` means.** Theorem 7's bound `(V + p·α²)/(V + α²)` needs the pair's own delay variance `V`, which a timer over a few round trips has not measured. So a timer's verdict claims no bound, and the allowance it adds is the whole probe. The condemnation rule does not change:
 
-- an unanswered provisional probe suspects its target, as any judged probe does;
+- an unanswered timer-judged probe suspects its target, as any judged probe does;
 - the next probe, which carries the suspicion, going unanswered past any extension makes the condemnation pending;
 - the pending condemnation is confirmed by an answer from another member (§2.7, above).
 
-So a member that never answers is condemned after two unanswered provisional probes and the pending wait, the same count as for a configured pair. Only the deadline that decides "unanswered" differs.
+So a member that never answers is condemned after two unanswered timer-judged probes and the pending wait, the same count as for a configured pair. Only the deadline that decides "unanswered" differs, and the told probe's timer has backed off once.
 
 **The bound for a member that never answered.** `detection_bound` counts from the peer's last answer. A member killed before any survivor heard from it has no last answer: every survivor's time to hold it dead is counted from the kill instead, on each survivor's own clock, and must be within the bound that survivor stated plus its measured pending wait. Counting from the kill is the stricter choice, since the last answer can only come before it.
 
-**Why a provisional probe's period ends at its answer.** A configured verdict's period ends at its deadline, so the pair is probed at its interval `η`. An answered provisional probe instead ends its period at the answer, as a measurement probe does. Waiting out `3R` on every answered far probe lengthened the member's periods past the interval its pairs' estimators were built at. Their samples stopped counting, and pairs near and far stopped configuring: the kill case on slates' harness failed 33 of 40 runs that way, and passes 40 of 40 with the period ending at the answer. An unanswered provisional probe runs to its deadline and is judged.
+**Why a timer-judged probe's period ends at its answer.** A configured verdict's period ends at its deadline, so the pair is probed at its interval `η`. An answered timer-judged probe instead ends its period at the answer. Waiting out `3R` on every answered far probe lengthened the member's periods past the interval its pairs' estimators were built at. Their samples stopped counting, and pairs near and far stopped configuring: the kill case on slates' harness failed 33 of 40 runs that way, and passes 40 of 40 with the period ending at the answer. An unanswered timer-judged probe runs to its deadline and is judged.
 
-**The pool is fed only by pairs on its path.** A pair is **far** (`far`) when its latest round trip is past RFC 6298's timeout of the pool's round trip `R_p`, `3R_p` (§2.2's rule for a path with one measured round trip): the mean of the round trips the pool holds, and before it holds one the least round trip the member measured exactly. A far pair's round trips belong to another path, so they are not the pool's evidence (`on_ack`), and its measurement probes back off on their own once its answers have shown it far (`backs_off_alone`; backing off on a far member that never answered, dead, slowed the measuring of the live ones, and in the all-far kill a survivor's pool configured only after another's condemnation reached it). Each sample is judged by the evidence before it: a stall on a pair whose path is the pool's is the host's, which the pool is there to see (§2.6), and is taken. The pool's mean, not its span, sets the line: a margin grows with the MTBF (above), and an hourly fleet's span passes 37 ms within its first verdict, which a span-drawn line would let a far path past. The first form fed the pool with every pair's answers. A far member's pool then mixed its 200 ms crossings with its 0.4 ms same-side round trips, and its mean rose to 75–100 ms. That verdict judged the member's same-side probes, and a judged probe's period runs to its deadline, so the member's mean period grew from 18–54 ms to 95–167 ms. Every pair then sampled at about half the rate (far samples by 30 s: 615 against 1,480 on seed 0), and far pairs took 116–281 s to configure. Fed only by the pairs it fits, the pool keeps the member's own side's paths: far pairs configure in 33–155 s and a far member's death is detected in 0.55–3.54 s (tables below).
+**The pool is fed only by pairs on its path.** A pair is **far** (`far`) when its latest round trip is past RFC 6298's timeout of the pool's round trip `R_p`, `3R_p` (§2.2's rule for a path with one measured round trip): the mean of the round trips the pool holds, and before it holds one the least round trip the member measured exactly. A far pair's round trips belong to another path, so they are not the pool's evidence (`on_ack`). Each sample is judged by the evidence before it: a stall on a pair whose path is the pool's is the host's, which the pool is there to see (§2.6), and is taken. The pool's mean, not its span, sets the line: a margin grows with the MTBF (above), and an hourly fleet's span passes 37 ms within its first verdict, which a span-drawn line would let a far path past. The first form fed the pool with every pair's answers. A far member's pool then mixed its 200 ms crossings with its 0.4 ms same-side round trips, and its mean rose to 75–100 ms. That verdict judged the member's same-side probes, and a judged probe's period runs to its deadline, so the member's mean period grew from 18–54 ms to 95–167 ms. Every pair then sampled at about half the rate (far samples by 30 s: 615 against 1,480 on seed 0), and far pairs took 116–281 s to configure. Fed only by the pairs it fits, the pool keeps the member's own side's paths: far pairs configure in 33–155 s and a far member's death is detected in 0.55–3.54 s (tables below).
 
-**When it ends.** The pair leaves provisional judgment at the probe after its own estimator first configures: `judging` returns the pair's own verdict whenever it has one. `Detector::verdict` reports the same rule. `no_live_member_is_condemned_across_a_lossless_far_link` (`tests/sim.rs`) checks that every far pair was judged provisionally and, by the end, by its own verdict.
+**When it ends.** The pair leaves its timer's judgment at the probe after its own estimator first configures: `judging` returns the pair's own verdict whenever it has one. `Detector::verdict` reports the same rule, and `PeerReport::judge` which judge it is. `no_live_member_is_condemned_across_a_lossless_far_link` (`tests/sim.rs`) checks that every far pair was judged by its timer and, by the end, by its own verdict.
 
 **Measured** (`tests/sim.rs`, seeds 0 to 15 and the stale-pool seeds, each through the run-twice check):
 
@@ -719,27 +721,21 @@ because the far pair is judged by the near pool's 2 ms deadline: the same deadli
 members, and the detection overran the bound the detector stated.
 
 **A peer with no evidence of its path** (no handshake round trip, never answered: one learned by gossip
-before it was spoken to, or re-learned after it was forgotten) is judged provisionally at RFC 6298
-§2.1's initial RTO: "until a round-trip time (RTT) measurement has been made for a segment sent
-between the sender and receiver, the sender SHOULD set RTO <- 1 second". It takes the provisional
-verdict with `R = 1/3 s`, so its deadline `3R` is that second (`FIRST_CONTACT_RTT_NS`). Its first
-answer, measured or bounded by a reused record, replaces it with the path's provisional verdict, or
-with the pool's once the pair is shown to fit; a first answer slower than a second backs off per pair
-(§5.5, above). Judged by the pool instead, a live far peer was suspected, condemned and forgotten
-before its first 200 ms answer could return (`a_peer_joined_without_a_round_trip_is_not_suspected_before_its_first_answer`,
+before it was spoken to, or re-learned after it was forgotten) is judged by its timer's initial
+second (above): no span covers a path nothing has measured. Its first answer, measured or bounded by
+a reused record, is the pair's latest round trip, and the pool's judgment follows once its span
+covers it. Judged by the pool instead, a live far peer was suspected, condemned and forgotten before
+its first 200 ms answer could return (`a_peer_joined_without_a_round_trip_is_not_suspected_before_its_first_answer`,
 failing first). Requiring a measured round trip at `join` instead would refuse every member a node
 learns by gossip before it has spoken to it. The cost falls on a peer that never answers: each
 unanswered judged probe waits out its direct deadline and then its relays', which includes the
-target's own span, two initial RTOs a probe, and a condemnation takes two probes, so its first
-detection moves by at most four initial RTOs: 4,076 ms against 108 ms with a 1 ms handshake
-(`a_near_peer_joined_without_a_round_trip_is_condemned_at_most_four_initial_rtos_later`). In the
-far-link record one seed of 22 moved: seed 10's far kill held dead in 5.51 s rather than 3.54 s, a
-survivor that had forgotten the victim having re-learned it by gossip with no evidence of its path.
+target's own span, and the told probe's timer has backed off once (§5.5), so its first detection
+moves by at most `I + I` and `2I + 2I`, six initial timeouts
+(`a_near_peer_joined_without_a_round_trip_is_condemned_at_most_six_initial_timeouts_later`).
 
-Open: until a far pair configures, the far member's own detection of it runs at the provisional
-`3R` deadline, so a far member's death is held a few hundred milliseconds to seconds later than a
-configured pair would hold it; and configuration itself is paced by the far pairs' one sample a
-round, minutes on this topology.
+Open: until a far pair configures, the far member's own detection of it runs at its timer's deadline,
+so a far member's death is held later than a configured pair would hold it; and configuration itself
+is paced by the far pairs' one sample a round, minutes on this topology.
 
 **The member's own lateness** (Lifeguard's local health) is measured, not multiplied:
 - every wake it asked for and got late is a sample of `G` ([`Lateness`]), which floors `α`, never
@@ -932,7 +928,7 @@ load, every one passing, every answer a live member's probe missed late and none
 governs the probe rate too: the owner's detection budget floors a judged period, but nothing yet
 prices a probe, and as the MTBF grows the margins and so the periods grow with it; two members cannot condemn each
 other, as neither can tell its own failure from the other's; a pair far from the member's others is
-judged provisionally, at `3R`, until it configures ("A pair the pool does not fit", above); the
+judged by its timer until it configures ("A pair the pool does not fit", above); the
 allowance is loose while a history is
 young (§3, item 3); and views that differ are pushed whole, so under heavy churn the exchanges
 carry `2⌈n/r⌉` datagrams a member a window, where digests of ranges of the view would push only

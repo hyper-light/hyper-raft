@@ -15,21 +15,21 @@
 //! [`arrival_detector_at`] chooses the margin `α` that minimizes unavailability at the pair's probe
 //! interval, any margin: a pair's probes never overlap, so each is judged alone, and a false
 //! condemnation is priced at what the owner states it costs
-//! ([`Detector::set_condemnation_cost`]). A probe's acknowledgement is due at `s + μ + α`; if none came, the indirect probe asks
-//! relays, and a probe answered by neither suspects the peer. The period is what its probe needs:
+//! ([`Detector::set_condemnation_cost`]). A probe's acknowledgement is due at `s + μ + α`; if none
+//! came, the indirect probe asks relays, and a probe answered by neither suspects the peer. The period is what its probe needs:
 //! the direct deadline, and the indirect one when the direct passed unanswered (SWIM §3.1: the
 //! protocol's properties hold for the average period).
 //!
-//! **Before a pair can be judged.** A pair's estimator refuses until it has its evidence
-//! ([`Refusal`]). Its probes are then judged by the member's pooled estimator, every round trip the
-//! member measured to anyone (the hosts' stalls, which the traces found dominate, are in it); and
-//! while that too refuses, nobody is judged: a probe is measurement only. Its period ends when it
-//! is answered or at its expected arrival from the latest round trip (NFD-E's estimate over a
-//! window of one), whichever is first; unanswered then, it is a loss to the estimators unless its
-//! answer comes later, and it judges nothing. Its wake measures the member's timer. Before any
-//! round trip, the first probe waits on the round trip its owner measured to the peer, where it
-//! gave one ([`Detector::join_measured`]), or as a retransmission timer does before its first
-//! measurement ([`INITIAL_WAIT_NS`]), or until another member is heard from.
+//! **Before a pair's own estimator configures.** A pair's estimator refuses until it has its
+//! evidence ([`Refusal`]). Its probes are then judged by the member's pooled estimator, every round
+//! trip the member measured on the paths the pool fits (the hosts' stalls, which the traces found
+//! dominate, are in it), where the pool's span covers the pair; and otherwise by the pair's own
+//! retransmission timer, RFC 6298's over its round trips: the initial second before any, then
+//! `SRTT + max(G, 4·RTTVAR)`, at least RFC 6298's second until the pool has measured the host's
+//! stalls and floored by the pool's margin after, doubled at each expiry. Every probe is judged: a
+//! timer-judged probe's period ends at its answer, or at its deadline unanswered, and then it
+//! suspects as any judged probe does. The handshake that keyed a pair, where its owner gives one
+//! ([`Detector::join_measured`]), is its timer's first round trip.
 //!
 //! **Dead.** A suspected peer is told by the member's next probe to it (Lifeguard's buddy system);
 //! it is condemned when that probe also goes unanswered, and only once the member has since had an
@@ -202,137 +202,204 @@ const RTO_ROUND_TRIPS: u64 = 3;
 
 /// Whether the pool's verdict, whose span is `pooled_span`, covers `peer`: the pair's latest round
 /// trip (its latest answer's, however late; a reused record's bound; before any answer, the
-/// handshake's) is within the span, or the pair has none. A pair the pool does not cover is judged
-/// provisionally by its own round trip ([`misfit_verdict`]). The latest evidence decides, both ways:
-/// a pair one stall made late is the pool's to judge again from its next answer in time, where a
-/// mark set once kept it out for good (slates, 2026-10-10), and a pair whose path lengthens leaves
-/// the pool's judgment at its first late answer.
+/// handshake's) is within the span. A pair with no round trip measured is not covered: nothing
+/// shows the pool's paths are its path, and judged by the pool a peer joined by gossip before it was
+/// spoken to was suspected, alive, before its first answer could return from 200 ms away. The
+/// latest evidence decides, both ways: a pair one stall made late is the pool's to judge again from
+/// its next answer in time, where a mark set once kept it out for good (slates, 2026-10-10), and a
+/// pair whose path lengthens leaves the pool's judgment at its first late answer.
 fn covered(peer: &Peer, pooled_span: u64) -> bool {
-    peer.path_rtt_ns.is_none_or(|rtt| rtt <= pooled_span)
+    peer.path_rtt_ns.is_some_and(|rtt| rtt <= pooled_span)
 }
 
 /// Whether `peer`'s path is another than the pool's: its latest round trip is past RFC 6298's
 /// timeout ([`RTO_ROUND_TRIPS`]) of the pool's round trip, `pooled_rtt` ([`Detector::pool_round_trip`]).
-/// Such a pair's round trips do not feed the pool, and its measurement probes back off on their
-/// own. The mean, not the span: a margin grows with the MTBF until a span covers a path a hundred
-/// times the pool's (§2.7), and the far-link runs showed what a far path's samples do to the pool.
+/// Such a pair's round trips do not feed the pool. The mean, not the span: a margin grows with the
+/// MTBF until a span covers a path a hundred times the pool's (§2.7), and the far-link runs showed
+/// what a far path's samples do to the pool.
 fn far(peer: &Peer, pooled_rtt: Option<u64>) -> bool {
     peer.path_rtt_ns
         .zip(pooled_rtt)
         .is_some_and(|(rtt, pooled)| rtt > pooled.saturating_mul(RTO_ROUND_TRIPS))
 }
 
-/// Whether `peer`'s measurement probes back off on their own: its answers, not its handshake alone,
-/// showed a path other than the pool's ([`far`]). The member-wide wait, reset by every other pair's
-/// answer, would never wait long enough for such a pair's answers to be measured (RFC 6298 (5.5):
-/// the timer backs off per connection). A pair that has not answered yet keeps the member-wide
-/// wait: a period holds the member's whole rotation, and backing off on a far member that is dead
-/// slowed the measuring of the live ones, so a survivor's pool configured after another's
-/// condemnation had reached it (`tests/sim.rs`, the all-far kill, every seed).
-fn backs_off_alone(peer: &Peer, pooled_rtt: Option<u64>) -> bool {
-    peer.last_answer_ns.is_some() && far(peer, pooled_rtt)
-}
-
-/// The verdict that judges a probe of `peer` started at `now_ns`, given the pool's and the pairs'
-/// probe interval: the pair's own once its estimator configures; before that, while the pool has
-/// none, the provisional [`silent_verdict`] once the pair has been silent past RFC 6298's timeout
-/// (none, measurement only, before); for a pair the pool does not cover ([`covered`]), the
-/// provisional [`misfit_verdict`] from its latest round trip; for a pair with no evidence of its
-/// path, RFC 6298's initial timeout; otherwise the pool's. With it, whether the verdict is a
-/// provisional one. The one rule [`Detector::verdict`] reports and a probe is judged by.
+/// The verdict that judges a probe of `peer`: the pair's own once its estimator configures; before
+/// that, the pool's where the pool has one and its span covers the pair ([`covered`]); otherwise the
+/// pair's own retransmission timer's ([`timer_verdict`]), with `loss` the member's probe loss and
+/// `granularity_ns` its `G`. With it, whether the verdict is the timer's, a provisional one. Every
+/// probe is judged: the first form held probes as measurement only until an estimator configured,
+/// so a peer silent before one did was judged by nothing (slates, 2026-10-10: a pair's own estimator
+/// refused at 141 samples, its pool at 5, and the peer was judged by nothing for 4,000 periods). The
+/// one rule [`Detector::verdict`] reports and a probe is judged by.
 fn judging(
     peer: &Peer,
     pooled: Option<Verdict>,
-    interval: Option<Duration>,
-    now_ns: u64,
-) -> (Option<Verdict>, bool) {
+    loss: f64,
+    granularity_ns: u64,
+) -> (Verdict, bool) {
     if let Some(own) = peer.stream.verdict {
-        return (Some(own), false);
+        return (own, false);
     }
-    let Some(pooled) = pooled else {
-        return (silent_verdict(peer, interval, now_ns), true);
-    };
-    if let Some(rtt) = peer.path_rtt_ns
-        && !covered(peer, pooled.span_ns())
+    if let Some(pooled) = pooled
+        && covered(peer, pooled.span_ns())
     {
-        return (Some(misfit_verdict(pooled, rtt)), true);
+        return (pooled, false);
     }
-    if peer.path_rtt_ns.is_none() && peer.last_answer_ns.is_none() {
-        // No evidence of the pair's path yet: no handshake round trip, no answer. RFC 6298 §2.1:
-        // "until a round-trip time (RTT) measurement has been made ... the sender SHOULD set RTO <- 1
-        // second" — the provisional verdict whose deadline, 3R, is that second. Judged by the pool
-        // instead, a peer joined by gossip before it was ever spoken to was suspected, alive, before
-        // its first answer could return from 200 ms away.
-        return (Some(misfit_verdict(pooled, FIRST_CONTACT_RTT_NS)), true);
-    }
-    (Some(pooled), false)
+    (timer_verdict(peer, pooled, loss, granularity_ns), true)
 }
 
-/// RFC 6298 §2.4's least retransmission timeout, nanoseconds: "Whenever RTO is computed, if it is
-/// less than 1 second, then the RTO SHOULD be rounded up to 1 second", there because "a large
-/// minimum RTO is needed to keep TCP conservative and avoid spurious retransmissions" (Allman and
-/// Paxson 1999). RFC 8961 lifts the minimum from a timer that has several observations of its path
-/// (requirement (2), and §5: "there is no minimum RTO specified"), and keeps the one second for a
-/// path nothing is known of (requirement (1)). It floors the provisional deadline of a pair judged
-/// while its member's pool has no verdict ([`unpooled_verdict`]): the member's own model of its
-/// host's stalls, the pool, refused, so nothing it measured is a timer's evidence.
+/// RFC 6298 (2.1)'s timeout before any round trip of the exchange is measured, nanoseconds:
+/// "Until a round-trip time (RTT) measurement has been made ... the sender SHOULD set RTO <- 1
+/// second"; RFC 8961 (1): "In the absence of any knowledge about the latency of a path, the initial
+/// RTO MUST be conservatively set to no less than 1 second".
+const INITIAL_RTO_NS: u64 = 1_000_000_000;
+
+/// RFC 6298 (2.4)'s least timeout, nanoseconds: "Whenever RTO is computed, if it is less than 1
+/// second, then the RTO SHOULD be rounded up to 1 second", because "a large minimum RTO is needed to
+/// keep TCP conservative and avoid spurious retransmissions" (Allman and Paxson 1999). RFC 8961 lifts
+/// it from a timer whose observations cover its path's behaviour (§5: "there is no minimum RTO
+/// specified"). A pair's timer floors its timeout at it until the member's pool has measured the
+/// host's stalls, which a timer over a few of the pair's round trips has not seen (§2.6, item 3: a
+/// young history underestimates the variance by an order of magnitude until it has seen a stall);
+/// from then the pool's margin, that measurement, floors its variance term instead
+/// ([`timer_verdict`]).
 const MINIMUM_RTO_NS: u64 = 1_000_000_000;
 
-/// The provisional verdict of a pair with none of its own while its member's pool has none either,
-/// once the pair has been silent, from its earliest probe that no answer has followed, for the
-/// whole of that verdict's deadline: RFC 6298's timeout, at least 1 s ([`unpooled_verdict`]).
-/// Before then its probes are measurement only, as before any pool, so a pair that answers is
-/// sampled at its round trip's pace until an estimator configures. Nothing promises the pool ever
-/// will: a pair silent from the start feeds it nothing (a two-member view whose one peer died
-/// early, or a member whose every peer did), and an estimator can refuse for want of a measured
-/// correlation while a host's stalls keep its round trips correlated (slates, 2026-10-10: a pair's
-/// own estimator refused at 141 samples, its pool at 5, and the peer, silent, was judged by nothing
-/// for 4,000 periods). A silent pair gives no samples, so measuring it on has nothing to wait for.
-/// `None` before the member's first period gives the pairs' interval.
-fn silent_verdict(peer: &Peer, interval: Option<Duration>, now_ns: u64) -> Option<Verdict> {
-    let round_trip = peer.path_rtt_ns.unwrap_or(FIRST_CONTACT_RTT_NS);
-    let verdict = unpooled_verdict(round_trip, interval?);
-    let silent_for = now_ns.saturating_sub(peer.silent_since_ns?);
-    (silent_for >= verdict.span_ns()).then_some(verdict)
+/// RFC 6298 (2.5)'s cap on a backed-off timeout, nanoseconds: "A maximum value MAY be placed on RTO
+/// provided it is at least 60 seconds."
+const MAXIMUM_RTO_NS: u64 = 60_000_000_000;
+
+/// RFC 6298 (2.3)'s gain on the smoothed round trip, `α = 1/8`, as a right shift.
+const SMOOTHED_GAIN_SHIFT: u32 = 3;
+
+/// RFC 6298 (2.3)'s gain on the round trip's variation, `β = 1/4`, as a right shift.
+const VARIATION_GAIN_SHIFT: u32 = 2;
+
+/// RFC 6298 (2.2)'s `K`: the timeout is the smoothed round trip plus `K` variations.
+const VARIATION_MULTIPLE: u64 = 4;
+
+/// RFC 6298's retransmission timer over one exchange's round trips: a pair's probes and answers
+/// ([`Peer::rto`]), or a target's relayed probes and its relays' responses ([`Peer::relay`]). A
+/// round trip's nonce names the probe it answers, so a late answer is no ambiguous sample and is
+/// taken (Karn's rule, RFC 6298 §3; RFC 8961 (2)(d)).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Rto {
+    /// `SRTT`, once a round trip was taken.
+    smoothed_ns: Option<u64>,
+    /// `RTTVAR`.
+    variation_ns: u64,
+    /// The timer's expiries since the latest round trip taken: each doubles the timeout (5.5), and a
+    /// round trip taken recomputes it from the estimates (the RFC's §5, after (5.7)).
+    backoff: u32,
+    /// Round trips taken.
+    samples: u64,
+    /// Of them, answers that came after their probe's period had ended.
+    late: u64,
+    /// The longest taken.
+    longest_ns: u64,
 }
 
-/// The provisional verdict from a pair's latest round trip `R` while its member's pool has none:
-/// RFC 6298's timeout `3R` (§2.2), rounded up to the RFC's one second (§2.4, [`MINIMUM_RTO_NS`]),
-/// as the expected arrival `R` and the margin to that deadline. Where the pool has a verdict, its
-/// margin floors a provisional one instead ([`misfit_verdict`]). It promises no bound (`mistake`
-/// 1), and with no loss measured it asks one relay ([`relay_count`] at zero loss).
-fn unpooled_verdict(path_rtt_ns: u64, interval: Duration) -> Verdict {
-    let round_trip = Duration::from_nanos(path_rtt_ns);
-    let to_minimum = Duration::from_nanos(MINIMUM_RTO_NS).saturating_sub(round_trip);
+impl Rto {
+    /// Takes a round trip (RFC 6298 (2.2) for the first, (2.3) after), `late` when its probe's
+    /// period had already ended.
+    fn take(&mut self, rtt_ns: u64, late: bool) {
+        match self.smoothed_ns {
+            None => {
+                self.smoothed_ns = Some(rtt_ns);
+                self.variation_ns = rtt_ns >> 1;
+            }
+            Some(smoothed) => {
+                let error = smoothed.abs_diff(rtt_ns);
+                // A value less a right shift of itself stays at or above zero, and each sum is at
+                // most the larger of the two values it weighs: neither saturates.
+                self.variation_ns = self
+                    .variation_ns
+                    .saturating_sub(self.variation_ns >> VARIATION_GAIN_SHIFT)
+                    .saturating_add(error >> VARIATION_GAIN_SHIFT);
+                self.smoothed_ns = Some(
+                    smoothed
+                        .saturating_sub(smoothed >> SMOOTHED_GAIN_SHIFT)
+                        .saturating_add(rtt_ns >> SMOOTHED_GAIN_SHIFT),
+                );
+            }
+        }
+        self.backoff = 0;
+        self.samples = self.samples.saturating_add(1);
+        if late {
+            self.late = self.late.saturating_add(1);
+        }
+        self.longest_ns = self.longest_ns.max(rtt_ns);
+    }
+
+    /// The timer expired with no answer: the next timeout doubles (5.5).
+    fn expired(&mut self) {
+        self.backoff = self.backoff.saturating_add(1);
+    }
+
+    /// The timeout: `SRTT + max(floor, K·RTTVAR)` (2.2, the floor RFC 6298's `G`), at least
+    /// `minimum_ns` (2.4); before any round trip, the initial second (2.1); doubled at each
+    /// expiry since the latest round trip (5.5), a doubling at most to the 60 s cap (2.5).
+    fn timeout_ns(&self, floor_ns: u64, minimum_ns: u64) -> u64 {
+        let computed = self.smoothed_ns.map_or(INITIAL_RTO_NS, |smoothed| {
+            smoothed.saturating_add(
+                self.variation_ns
+                    .saturating_mul(VARIATION_MULTIPLE)
+                    .max(floor_ns),
+            )
+        });
+        let mut timeout = computed.max(minimum_ns);
+        let cap = MAXIMUM_RTO_NS.max(timeout);
+        for _ in 0..self.backoff {
+            if timeout >= cap {
+                break;
+            }
+            timeout = timeout.saturating_mul(2).min(cap);
+        }
+        timeout
+    }
+
+    fn report(&self, floor_ns: u64, minimum_ns: u64) -> TimerReport {
+        TimerReport {
+            timeout: Duration::from_nanos(self.timeout_ns(floor_ns, minimum_ns)),
+            samples: self.samples,
+            late: self.late,
+            longest: Duration::from_nanos(self.longest_ns),
+        }
+    }
+}
+
+/// The verdict of a pair no estimator judges: its retransmission timer's (RFC 6298, [`Rto`]), the
+/// expected arrival its smoothed round trip and the margin the rest of its timeout. The timer's
+/// variance term is floored by the member's granularity `G`, as RFC 6298 floors it by its clock's,
+/// and where the pool has measured the host's stalls, by the pool's margin, since the stalls are in
+/// every pair's round trip (§2.6); until the pool has, the timeout is floored by RFC 6298 (2.4)'s
+/// second ([`MINIMUM_RTO_NS`]). Before any round trip of the pair, its timeout is the initial second
+/// (2.1) and all of it is margin. It promises no bound (`mistake` 1): Theorem 7's needs the pair's
+/// own variance, which a timer over a few round trips has not measured; and no interval configures
+/// it. `loss` sizes the relays an unanswered probe asks.
+fn timer_verdict(peer: &Peer, pooled: Option<Verdict>, loss: f64, granularity_ns: u64) -> Verdict {
+    let (floor, minimum) = timer_floors(pooled, granularity_ns);
+    let timeout = peer.rto.timeout_ns(floor, minimum);
+    let round_trip = peer
+        .rto
+        .smoothed_ns
+        .map_or(0, |smoothed| smoothed.min(timeout));
     Verdict {
-        round_trip,
-        margin: round_trip.saturating_mul(2).max(to_minimum),
-        interval,
-        loss: 0.0,
+        round_trip: Duration::from_nanos(round_trip),
+        margin: Duration::from_nanos(timeout.saturating_sub(round_trip)),
+        interval: Duration::ZERO,
+        loss,
         mistake: 1.0,
     }
 }
 
-/// The round trip a pair with no evidence of its path is judged provisionally by: a third of RFC 6298
-/// §2.1's initial RTO ([`INITIAL_WAIT_NS`], 1 s), so its provisional deadline `3R` is that RTO.
-const FIRST_CONTACT_RTT_NS: u64 = INITIAL_WAIT_NS / 3;
-
-/// The verdict a pair the pool does not fit is judged by until its own estimator configures: its
-/// own latest round trip `R` as the expected arrival, and the margin RFC 6298 §2.2 gives a path
-/// with one measured round trip — `RTTVAR = R/2`, `RTO = SRTT + 4·RTTVAR = 3R`, so `α = 2R` —
-/// or the pool's margin where that is wider. The pool's measured loss sizes the relays as before.
-/// It promises no bound (`mistake` 1): Theorem 7's bound needs the pair's own variance, which
-/// it has not measured. Without a judged deadline, a pair whose peer died before answering once
-/// was measured for ever and never condemned it (hyper-raft review of `swim-pair-deadline`,
-/// 2026-10-07: a far member killed with every survivor far from it was never held dead).
-fn misfit_verdict(pooled: Verdict, path_rtt_ns: u64) -> Verdict {
-    let round_trip = Duration::from_nanos(path_rtt_ns);
-    Verdict {
-        round_trip,
-        margin: round_trip.saturating_mul(2).max(pooled.margin),
-        interval: pooled.interval,
-        loss: pooled.loss,
-        mistake: 1.0,
+/// A pair's retransmission timer's floors: under its variance term the member's granularity and,
+/// where the pool has measured the host's stalls, the pool's margin; under its timeout RFC 6298
+/// (2.4)'s second until the pool has measured them ([`MINIMUM_RTO_NS`]).
+fn timer_floors(pooled: Option<Verdict>, granularity_ns: u64) -> (u64, u64) {
+    match pooled {
+        Some(pooled) => (granularity_ns.max(nanos(pooled.margin)), 0),
+        None => (granularity_ns, MINIMUM_RTO_NS),
     }
 }
 
@@ -340,16 +407,28 @@ fn misfit_verdict(pooled: Verdict, path_rtt_ns: u64) -> Verdict {
 /// reports and a probe is judged by.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Judge {
-    /// Nothing yet: its probes are measurement only.
+    /// The pair's own retransmission timer (RFC 6298), which promises no bound: until an estimator
+    /// judges it.
     #[default]
-    Nothing,
+    Timer,
     /// The pair's own estimator's verdict.
     Own,
     /// The member's pooled verdict.
     Pool,
-    /// A provisional verdict, which promises no bound: the pair's own round trip's (RFC 6298's
-    /// `3R`), or RFC 6298's initial timeout for a pair with no evidence of its path.
-    Provisional,
+}
+
+/// An exchange's retransmission timer (RFC 6298) as its member measured it: a pair's probes
+/// ([`PeerReport::timer`]) or a target's relayed probes ([`PeerReport::relays`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TimerReport {
+    /// The timeout now, backed off where it expired since its latest round trip.
+    pub timeout: Duration,
+    /// Round trips taken.
+    pub samples: u64,
+    /// Of them, answers that came after their probe's period had ended.
+    pub late: u64,
+    /// The longest taken.
+    pub longest: Duration,
 }
 
 /// What a member has done and promised about one peer, for its owner and its tests.
@@ -385,6 +464,8 @@ pub struct PeerReport {
     pub pool_misfit: bool,
     /// Why the pair's own estimator last refused to configure, until it configures.
     pub refused: Option<Refusal>,
+    /// The pair's retransmission timer (RFC 6298) over its probes' round trips.
+    pub timer: TimerReport,
 }
 
 /// The member's pooled verdict and its evidence ([`Detector::pool`]): what judges every pair that
@@ -406,17 +487,6 @@ pub struct PoolReport {
 /// keeps by it: an asker waits on no more relayed answers about one target than its detector keeps
 /// records for (slates' member plane keeps that many relayed probes per target and asker).
 pub const OUTSTANDING: usize = 3;
-
-/// How long a measurement period waits before any round trip was measured, nanoseconds: RFC 6298
-/// §2.1, a retransmission timer's value until a round trip has been measured ("the sender SHOULD
-/// set RTO <- 1 second"), backed off as any measurement period's wait is. Without it, a member
-/// whose first probe or its answer was lost waited on another member, and members whose first
-/// probes were all lost waited on one another for ever, none sending again.
-const INITIAL_WAIT_NS: u64 = 1_000_000_000;
-
-/// The longest a measurement period's wait backs off to, nanoseconds: RFC 6298 (2.5) lets a
-/// retransmission timer's doubling be capped, provided the cap is at least 60 seconds.
-const MEASUREMENT_WAIT_CAP_NS: u64 = 60_000_000_000;
 
 /// A probe sent and not yet answered.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -520,31 +590,22 @@ struct Peer {
     /// The previous judged probe's bound.
     last_mistake: Option<f64>,
     last_answer_ns: Option<u64>,
-    /// A far pair's own measurement backoff ([`backs_off_alone`]): its unanswered measurement
-    /// periods since its last sample. The member-wide backoff is reset by every other pair's answer, so a far pair
-    /// among near ones would never wait long enough to be answered (RFC 6298 (5.5): the timer backs
-    /// off per connection, doubling). A far peer among near ones was otherwise judged by a deadline
-    /// drawn from the near round trips for ever: every answer arrived after its record was gone, so
-    /// the pair never took a sample, never configured, and was condemned again and again while alive
-    /// (slates, 2026-10-07: a 2 ms deadline on a 200 ms path, 76 to 115 condemnations a pair in 30 s).
-    misfit_misses: u32,
+    /// The pair's retransmission timer (RFC 6298) over its round trips: what judges its probes until
+    /// an estimator does ([`timer_verdict`]). It backs off per pair (5.5), so a far peer among near
+    /// ones is waited for long enough to be answered; a far peer judged by a deadline drawn from the
+    /// near round trips was condemned again and again while alive, every answer arriving after its
+    /// record was gone (slates, 2026-10-07: a 2 ms deadline on a 200 ms path, 76 to 115 condemnations
+    /// a pair in 30 s).
+    rto: Rto,
     report: PeerReport,
-    /// A round trip to the peer its owner measured outside the detector, the handshake that keyed
-    /// the peer's session ([`Detector::join_measured`]): the first wait for its probes before this
-    /// member measured any round trip.
-    handshake_rtt_ns: Option<u64>,
-    /// The pair's latest measured round trip: its latest answered probe's, however late, else its
-    /// handshake's. What a misfit pair is judged by until its own estimator configures
-    /// ([`misfit_verdict`]).
+    /// The pair's latest measured round trip: its latest answered probe's, however late, a reused
+    /// record's bound, else its handshake's. What decides whether the pool's span covers the pair
+    /// ([`covered`]) and whether its round trips feed the pool ([`far`]).
     path_rtt_ns: Option<u64>,
     /// The latest probe whose record a later probe wrote over while it was still unanswered: an
     /// answer that finds no record is for it or for one sent before it, so its round trip is known
     /// exactly or bounded below ([`Peer::reused_round_trip`]).
     reused: Option<Sent>,
-    /// When the pair's earliest probe that no answer has followed was sent, on the caller's clock:
-    /// from then the pair has been silent. Set by a probe sent while none is pending, cleared by
-    /// any answer, direct or relayed ([`silent_verdict`]).
-    silent_since_ns: Option<u64>,
 }
 
 impl Peer {
@@ -558,12 +619,10 @@ impl Peer {
             pending_since: None,
             last_mistake: None,
             last_answer_ns: None,
-            misfit_misses: 0,
+            rto: Rto::default(),
             report: PeerReport::default(),
-            handshake_rtt_ns: None,
             path_rtt_ns: None,
             reused: None,
-            silent_since_ns: None,
         }
     }
 
@@ -589,10 +648,9 @@ impl Peer {
 
     /// An answer to `nonce` at `at_ns` whose probe's record later probes already reused: it came back
     /// after later probes of the pair. Its round trip, exact or a lower bound
-    /// ([`Peer::reused_round_trip`]), is the pair's latest, so a pair with no handshake round trip
-    /// whose answers all come after their records are gone is still judged provisionally
-    /// ([`misfit_verdict`]); without it, such a pair whose member then died was measured for ever and
-    /// never condemned. An answer no reuse explains (an owner's own ping on the same plane, its nonce
+    /// ([`Peer::reused_round_trip`]), is the pair's latest, so the pool judges a pair whose answers
+    /// all come after their records are gone only once its span covers them, and the latest reused
+    /// record's exact one is its timer's ([`Detector::on_ack`]). An answer no reuse explains (an owner's own ping on the same plane, its nonce
     /// from a range the member's probes never reach; an expired relay record's) is evidence of life
     /// only, which [`Detector::on_ack`] has taken: before 2026-10-09 it marked the pair a misfit for
     /// good, and an owner's lease renewals kept a pool from ever being fed (slates, a warm-restarted
@@ -640,30 +698,29 @@ struct Probe {
     seq: u64,
     sent_ns: u64,
     answered: bool,
-    verdict: Option<Verdict>,
+    verdict: Verdict,
     /// When the indirect probe's answers are due, once it was asked.
     indirect_until: Option<u64>,
-    /// A measurement probe's expected arrival from the latest round trip, or before one from the
-    /// owner's ([`Detector::wait_base`]), backed off while measurement periods go unanswered
-    /// ([`Detector::measurement_wait`]): where its period ends, answered or not, judging nothing;
-    /// its wake measures the member's timer.
-    expected: u64,
-    /// Whether the verdict is a misfit pair's provisional one ([`misfit_verdict`]): judged if it goes
-    /// unanswered, but its period ends at its answer as a measurement probe's does. Waiting out the
-    /// provisional deadline on an answered probe stretched the member's periods past the interval its
-    /// pairs' estimators were built at, and pairs near and far stopped configuring (33 of 40 seeds,
-    /// 2026-10-07).
+    /// Whether the verdict is the pair's timer's ([`timer_verdict`]): judged if it goes unanswered,
+    /// but its period ends at its answer. Waiting out a timer's deadline on an answered probe
+    /// stretched the member's periods past the interval its pairs' estimators were built at, and pairs
+    /// near and far stopped configuring (33 of 40 seeds, 2026-10-07).
     provisional: bool,
-    /// The earliest its period may end: for a judged probe, sent plus the member's period floor
-    /// ([`Detector::period_floor_ns`]); for a measurement or provisional one, sent. Its deadlines
-    /// are unchanged; only an end that would come sooner waits for this.
+    /// A timer-judged probe's expected arrival, its pair's smoothed round trip past its send, until
+    /// the member has woken there: a wake that measures the member's lateness `G`. Its period ends
+    /// at its answer, so without it no wake of a member whose answers all came before their
+    /// deadlines was ever reached, `G` was never measured, no estimator took a sample, and none
+    /// configured.
+    expected: Option<u64>,
+    /// The earliest its period may end: for a probe an estimator judges, sent plus the member's
+    /// period floor ([`Detector::period_floor_ns`]); for a timer's, sent. Its deadlines are
+    /// unchanged; only an end that would come sooner waits for this.
     rests_until: u64,
 }
 
 impl Probe {
-    fn due_ns(&self) -> Option<u64> {
-        self.verdict
-            .map(|verdict| self.sent_ns.saturating_add(verdict.span_ns()))
+    fn due_ns(&self) -> u64 {
+        self.sent_ns.saturating_add(self.verdict.span_ns())
     }
 }
 
@@ -812,8 +869,6 @@ pub struct Detector {
     order: Vec<HostId>,
     cursor: usize,
     probe: Option<Probe>,
-    /// Whether another member was heard from during a measurement probe.
-    heard_other: bool,
     peers: BTreeMap<HostId, Peer>,
     /// Every round trip the member measured, to anyone: the judge of a pair that cannot configure
     /// yet. Its sequence numbers are the member's probe nonces, so a probe never answered is a
@@ -831,19 +886,18 @@ pub struct Detector {
     relayed: u64,
     /// The wakes asked of the caller and how late each came: `G` and the latest lateness.
     wakes: Wakes,
+    /// The resolution of the clock the owner reads, nanoseconds: `G`'s least value
+    /// ([`Detector::granularity_ns`]).
+    resolution_ns: u64,
     /// Round trips measured before this member had a wake and a period measured, which no
     /// estimator took.
     unmeasured: u64,
-    /// The latest round trip measured, to anyone.
-    last_rtt_ns: Option<u64>,
     /// The least round trip measured exactly, to anyone: an answer to a probe still recorded, an
     /// answer to the latest reused record, or a handshake's. The pool's round trip before the pool
     /// holds a sample ([`Detector::pool_round_trip`]).
     least_rtt_ns: Option<u64>,
-    /// Measurement periods ended unanswered since the latest round trip was measured: each doubles
-    /// the next one's wait (RFC 6298 §5.5), up to [`MEASUREMENT_WAIT_CAP_NS`].
-    measurement_misses: u32,
-    /// The longest span `μ + α` any verdict of this member has had, nanoseconds.
+    /// The longest span `μ + α` of the verdicts judging the pairs this member probes, as the latest
+    /// period began, nanoseconds ([`Detector::period_bound`]).
     longest_span: u64,
     periods: Periods,
     exposure: Exposure,
@@ -961,7 +1015,6 @@ impl Detector {
             order: Vec::new(),
             cursor: 0,
             probe: None,
-            heard_other: false,
             peers: BTreeMap::new(),
             pool: Stream::default(),
             gossip: Gossip::default(),
@@ -972,10 +1025,9 @@ impl Detector {
             nonce: 0,
             relayed: u64::MAX,
             wakes: Wakes::new(resolution),
+            resolution_ns: nanos(resolution),
             unmeasured: 0,
-            last_rtt_ns: None,
             least_rtt_ns: None,
-            measurement_misses: 0,
             longest_span: 0,
             periods: Periods::default(),
             exposure: history,
@@ -1009,6 +1061,11 @@ impl Detector {
         self.findings.clear();
         self.wakes.woke(now_ns);
         self.clock_ns = self.clock_ns.max(now_ns);
+        if let Some(probe) = self.probe.as_mut()
+            && probe.expected.is_some_and(|expected| now_ns >= expected)
+        {
+            probe.expected = None;
+        }
         self.stamp_deaths(now_ns);
         self.forget_expired(now_ns);
         self.begin_exchange(now_ns);
@@ -1029,21 +1086,24 @@ impl Detector {
     }
 
     /// When to [`poll`](Detector::poll) next, on the caller's clock: the probe's deadline, or the
-    /// indirect probe's once asked, or a measurement probe's expected arrival, never before the
-    /// period floor's end unless the deadline asks relays. `None` before
-    /// the first poll.
+    /// indirect probe's once asked, never before the period floor's end unless the deadline asks
+    /// relays. `None` before the first poll.
     pub fn wake(&self) -> Option<u64> {
         let probe = self.probe?;
-        // The direct deadline of a judged probe still unanswered asks relays: kept as it is.
-        if !probe.answered && probe.verdict.is_some() && probe.indirect_until.is_none() {
-            return probe.due_ns();
+        // A timer-judged probe still unanswered wakes at its expected arrival first, measuring `G`.
+        if !probe.answered
+            && let Some(expected) = probe.expected
+        {
+            return Some(expected.min(probe.due_ns()));
         }
-        let ends = if probe.verdict.is_none() {
-            (!probe.answered).then_some(probe.expected)
-        } else if probe.answered {
-            (!probe.provisional).then(|| probe.due_ns()).flatten()
+        // The direct deadline of a probe still unanswered asks relays: kept as it is.
+        if !probe.answered && probe.indirect_until.is_none() {
+            return Some(probe.due_ns());
+        }
+        let ends = if probe.answered {
+            (!probe.provisional).then(|| probe.due_ns())
         } else {
-            probe.indirect_until.or_else(|| probe.due_ns())
+            probe.indirect_until
         };
         Some(ends.map_or(probe.rests_until, |at| at.max(probe.rests_until)))
     }
@@ -1089,23 +1149,14 @@ impl Detector {
             return Stage::Over;
         };
         let due = probe.due_ns();
-        match (probe.answered, due, probe.indirect_until) {
-            // Measurement: over when answered or at its expected arrival; before any round trip,
-            // also when another member is heard from.
-            (true, None, _) => Stage::Over,
-            (false, None, _)
-                if now_ns < probe.expected && !(self.last_rtt_ns.is_none() && self.heard_other) =>
-            {
-                Stage::Wait
-            }
-            (false, None, _) => Stage::Over,
-            // A provisional verdict's answered probe ends its period at the answer, as a measurement's.
-            (true, Some(_), _) if probe.provisional => Stage::Over,
-            (true, Some(due), _) | (false, Some(due), None) if now_ns < due => Stage::Wait,
-            (true, Some(_), _) => Stage::Over,
-            (false, Some(_), None) => Stage::Indirect,
-            (false, Some(_), Some(until)) if now_ns < until => Stage::Wait,
-            (false, Some(_), Some(_)) => Stage::Over,
+        match (probe.answered, probe.indirect_until) {
+            // A timer-judged probe's period ends at its answer.
+            (true, _) if probe.provisional => Stage::Over,
+            (true, _) | (false, None) if now_ns < due => Stage::Wait,
+            (true, _) => Stage::Over,
+            (false, None) => Stage::Indirect,
+            (false, Some(until)) if now_ns < until => Stage::Wait,
+            (false, Some(_)) => Stage::Over,
         }
     }
 
@@ -1133,15 +1184,14 @@ impl Detector {
         // long the pair's handshake had measured its path (a near member condemned by a far one in 5
         // of 40 seeds, 2026-10-07).
         let pooled = self.pooled();
+        let loss = self.probe_loss();
+        let granularity_ns = self.granularity_ns();
         // The handshake that keyed the pair already measured its path: a round trip longer than the
         // pool's deadline is the same evidence a late answer gives, known before the first probe
         // ([`covered`]).
-        let interval = self.probe_interval();
-        let (verdict, provisional) = self.peers.get(&target).map_or((pooled, false), |peer| {
-            judging(peer, pooled, interval, now_ns)
-        });
         let peer = self.peers.entry(target).or_insert_with(Peer::new);
-        peer.silent_since_ns.get_or_insert(now_ns);
+        let (verdict, provisional) = judging(peer, pooled, loss, granularity_ns);
+        let peer_expected = peer.rto.smoothed_ns;
         let seq = peer.sent;
         peer.sent = peer.sent.saturating_add(1);
         peer.send(Sent {
@@ -1157,25 +1207,58 @@ impl Detector {
             answered: false,
             verdict,
             indirect_until: None,
-            expected: now_ns.saturating_add(self.probe_wait(target)),
             provisional,
-            // Only a judged period rests: a measurement or provisional one judges nothing (or
-            // nothing yet) until its samples exist, so stretching it would leave a silent member
-            // unsuspected for that much longer after a start (a lone peer stayed alive 9 s into its
-            // silence when every period rested, slates 2026-10-09).
-            rests_until: if verdict.is_some() && !provisional {
-                now_ns.saturating_add(self.period_floor_ns())
-            } else {
+            expected: peer_expected
+                .filter(|_| provisional)
+                .map(|round_trip| now_ns.saturating_add(round_trip)),
+            // Only a period an estimator judges rests: a timer-judged one ends at its answer, as the
+            // samples its pair's estimator is still gathering need; stretched to the floor, a lone
+            // peer stayed alive 9 s into its silence (slates, 2026-10-09).
+            rests_until: if provisional {
                 now_ns
+            } else {
+                now_ns.saturating_add(self.period_floor_ns())
             },
         };
         self.probe = Some(probe);
-        self.heard_other = false;
+        self.longest_span = self.span_bound(pooled, loss, granularity_ns);
         Some(Ping {
             to: target,
             nonce,
-            due_ns: probe.due_ns(),
+            due_ns: Some(probe.due_ns()),
         })
+    }
+
+    /// The longest span `μ + α` of the verdicts judging the pairs this member probes now: what an
+    /// unanswered probe's deadlines are drawn from in the periods to come ([`Detector::period_bound`]).
+    /// Every verdict that judges a probe counts, a timer's too; the periods already run are counted
+    /// by their lengths.
+    fn span_bound(&self, pooled: Option<Verdict>, loss: f64, granularity_ns: u64) -> u64 {
+        self.peers
+            .iter()
+            .filter(|(host, _)| self.is_probed(**host))
+            .map(|(_, peer)| judging(peer, pooled, loss, granularity_ns).0.span_ns())
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// `G` in nanoseconds: the mean lateness of this member's wakes, never below the resolution of
+    /// the clock its owner reads; before a wake is measured, that resolution, the least `G` can be.
+    fn granularity_ns(&self) -> u64 {
+        self.granularity().map_or(self.resolution_ns, nanos)
+    }
+
+    /// The member's probe loss: Jeffreys' posterior mean over the probes its pool has seen,
+    /// `(k + ½)/(n + 1)` for `k` of `n` lost (Jeffreys 1946; Brown, Cai and DasGupta 2001), the
+    /// prior's half before it has seen any. A probe unanswered to anyone is a loss to the pool. It
+    /// sizes the relays a timer-judged probe asks ([`relay_count`]).
+    fn probe_loss(&self) -> f64 {
+        let (lost, received) = self.pool.estimator.as_ref().map_or((0, 0), |estimator| {
+            let estimates = estimator.estimates();
+            (estimates.lost, estimates.received)
+        });
+        // u64 → f64 rounds only past 2⁵³ probes.
+        (lost as f64 + 0.5) / (lost as f64 + received as f64 + 1.0)
     }
 
     /// Fills `requests` with the relays to ask for the period's probe, and sets when their answers
@@ -1186,9 +1269,9 @@ impl Detector {
         let Some(mut probe) = self.probe else {
             return;
         };
-        let Some(verdict) = probe.verdict else {
-            return;
-        };
+        let verdict = probe.verdict;
+        let (pooled, loss, granularity_ns) =
+            (self.pool.verdict, self.probe_loss(), self.granularity_ns());
         self.rank_relays(probe.target);
         let count = relay_count(verdict.loss, self.relays.len());
         let mut slowest = 0u64;
@@ -1198,12 +1281,10 @@ impl Detector {
                 target: probe.target,
                 nonce: probe.nonce,
             });
-            let span = self
-                .peers
-                .get(&relay)
-                .and_then(|peer| peer.stream.verdict)
-                .or(self.pool.verdict)
-                .map_or(verdict.span_ns(), |relayed| relayed.span_ns());
+            // The leg to the relay and back, judged as this member judges its probes of the relay.
+            let span = self.peers.get(&relay).map_or(verdict.span_ns(), |peer| {
+                judging(peer, pooled, loss, granularity_ns).0.span_ns()
+            });
             slowest = slowest.max(span);
         }
         if requests.is_empty() {
@@ -1242,29 +1323,24 @@ impl Detector {
     /// The period ends: its length is folded, the exposure grows, and an unanswered judged probe
     /// suspects its target or, when it had told the target, condemns it.
     fn resolve(&mut self, probe: Probe, now_ns: u64) {
-        if probe.verdict.is_none()
-            && !probe.answered
-            && self.measurement_wait(self.wait_base(probe.target)) < MEASUREMENT_WAIT_CAP_NS
-        {
-            self.measurement_misses = self.measurement_misses.saturating_add(1);
-        }
         let length = now_ns.saturating_sub(probe.sent_ns);
         self.periods.add(length);
         let watched = u32::try_from(self.order.len()).unwrap_or(u32::MAX);
         self.exposure
             .on_exposure(Duration::from_nanos(length).saturating_mul(watched));
-        let pooled_rtt = self.pool_round_trip();
         let Some(peer) = self.peers.get_mut(&probe.target) else {
             return;
         };
         Self::account(peer, probe.verdict);
-        if backs_off_alone(peer, pooled_rtt) && probe.verdict.is_none() && !probe.answered {
-            peer.misfit_misses = peer.misfit_misses.saturating_add(1);
-        }
         if probe.answered {
             peer.clear_pending();
             self.condemn_pending(probe.target, probe.nonce, now_ns);
-        } else if probe.verdict.is_some() {
+        } else {
+            if probe.provisional {
+                // The pair's timer expired with no answer: its next timeout doubles (RFC 6298
+                // (5.5)), until an answer is measured.
+                peer.rto.expired();
+            }
             self.missed(probe, now_ns);
         }
     }
@@ -1274,11 +1350,7 @@ impl Detector {
     /// (Fréchet's bound). Not their product: a pair's probes are a few periods apart, inside the
     /// stalls' correlation time the traces measured (20 to 250 ms, `docs/timing.md` §2.6), and a
     /// short history's `τ_int` of one has not yet seen a stall.
-    fn account(peer: &mut Peer, verdict: Option<Verdict>) {
-        let Some(verdict) = verdict else {
-            peer.last_mistake = None;
-            return;
-        };
+    fn account(peer: &mut Peer, verdict: Verdict) {
         let report = &mut peer.report;
         report.suspicion_allowance += verdict.mistake;
         if let Some(previous) = peer.last_mistake {
@@ -1290,8 +1362,8 @@ impl Detector {
     /// A judged probe went unanswered: its target, alive, is suspected; suspected and told by it,
     /// its condemnation is pending. Each is found with the probe's evidence.
     fn missed(&mut self, probe: Probe, now_ns: u64) {
-        let (Some(state), Some(due_ns)) = (self.membership.state(probe.target), probe.due_ns())
-        else {
+        let due_ns = probe.due_ns();
+        let Some(state) = self.membership.state(probe.target) else {
             return;
         };
         let unanswered = Unanswered {
@@ -1397,17 +1469,9 @@ impl Detector {
     /// wait ([`PeerReport::pending_since_ns`]) and adds it. A period lasts at most the longest this
     /// member has run, or, where longer, what an unanswered probe's deadlines allow: its target's
     /// span, then the slowest relay's and the target's again, at most three times the longest
-    /// span any of its verdicts has had, plus the latest this member has woken past a wake it
-    /// asked, or is late for now; the period in progress counts as run.
-    ///
-    /// `None` before a period, and while a probe this member makes would go unjudged, neither its
-    /// pair nor the pool holding a verdict: an unjudged probe that goes unanswered suspects nobody,
-    /// so until every probe is judged this member detects nothing by its own probes, and a death
-    /// it holds then is another member's, adopted.
+    /// span of the verdicts judging its pairs, plus the latest this member has woken past a wake it
+    /// asked, or is late for now; the period in progress counts as run. `None` before a period.
     pub fn detection_bound(&self, now_ns: u64) -> Option<Duration> {
-        if !self.judges_every_probe() {
-            return None;
-        }
         // The most members the view has held besides this one: no round is larger, whatever the
         // rounds in the window were (a member that condemned another, even falsely, runs smaller
         // ones, and a member forgotten since was in rounds before).
@@ -1418,61 +1482,10 @@ impl Detector {
         Some(Duration::from_nanos(period.saturating_mul(periods)))
     }
 
-    /// How long a measurement probe of `target` waits for its answer: the member's backed-off wait,
-    /// or, for a pair that backs off on its own ([`backs_off_alone`]), that pair's own backoff from
-    /// the same base.
-    fn probe_wait(&self, target: HostId) -> u64 {
-        let base = self.wait_base(target);
-        match self.peers.get(&target) {
-            Some(peer) if backs_off_alone(peer, self.pool_round_trip()) => {
-                let factor = 1u64.checked_shl(peer.misfit_misses).unwrap_or(u64::MAX);
-                base.saturating_mul(factor).min(MEASUREMENT_WAIT_CAP_NS)
-            }
-            _ => self.measurement_wait(base),
-        }
-    }
-
-    /// How long a measurement period waits past its probe: the latest round trip, doubled for each
-    /// measurement period since that ended unanswered, as a retransmission timer backs off (RFC 6298
-    /// §5.5), up to [`MEASUREMENT_WAIT_CAP_NS`]. An answer is measured only while its probe is
-    /// outstanding, the latest three of its peer's; when round trips lengthen past that, periods at
-    /// the latest round trip's pace see every answer come for a probe written over, measure none,
-    /// and never lengthen. A measured round trip ends the backing off.
-    fn measurement_wait(&self, rtt_ns: u64) -> u64 {
-        let factor = 1u64
-            .checked_shl(self.measurement_misses)
-            .unwrap_or(u64::MAX);
-        rtt_ns.saturating_mul(factor).min(MEASUREMENT_WAIT_CAP_NS)
-    }
-
-    /// The round trip a measurement probe of `target` waits from before backing off: the latest
-    /// this member measured, to anyone; before any, the one its owner measured to `target`; and
-    /// without one, [`INITIAL_WAIT_NS`].
-    fn wait_base(&self, target: HostId) -> u64 {
-        self.last_rtt_ns
-            .or_else(|| {
-                self.peers
-                    .get(&target)
-                    .and_then(|peer| peer.handshake_rtt_ns)
-            })
-            .unwrap_or(INITIAL_WAIT_NS)
-    }
-
-    /// Whether every probe this member makes is judged by a configured verdict: the pool holds
-    /// one, or every member it probes has its own.
-    fn judges_every_probe(&self) -> bool {
-        self.pool.verdict.is_some()
-            || self
-                .peers
-                .iter()
-                .filter(|(host, _)| self.is_probed(**host))
-                .all(|(_, peer)| peer.stream.verdict.is_some())
-    }
-
     /// The longest a period of this member lasts, nanoseconds: the longest it has run or, where
-    /// longer, what an unanswered probe's deadlines allow, three times the longest span any of its
-    /// verdicts has had, plus how late it has woken; the period in progress counts as run. `None`
-    /// before a period.
+    /// longer, what an unanswered probe's deadlines allow, three times the longest span of the
+    /// verdicts judging its pairs ([`Detector::span_bound`]), plus how late it has woken; the
+    /// period in progress counts as run. `None` before a period.
     fn period_bound(&self, now_ns: u64) -> Option<u64> {
         if self.periods.count == 0 {
             return None;
@@ -1570,11 +1583,14 @@ impl Detector {
     /// period's probe if it is that probe's, and its round trip is measured whatever probe it
     /// answers, however late: a late answer is the tail the margin must cover.
     pub fn on_ack(&mut self, from: HostId, nonce: u64, at_ns: u64) {
-        match self.probe.as_mut() {
-            Some(probe) if probe.target == from && probe.nonce == nonce => probe.answered = true,
-            Some(probe) if probe.target != from => self.heard_other = true,
-            _ => {}
-        }
+        // An answer to the period's probe answers it; any other is late, its period over.
+        let current = match self.probe.as_mut() {
+            Some(probe) if probe.target == from && probe.nonce == nonce => {
+                probe.answered = true;
+                true
+            }
+            _ => false,
+        };
         self.clock_ns = self.clock_ns.max(at_ns);
         let measure = self.granularity().zip(self.periods.mean_ns());
         let interval = measure.map(|(_, period)| self.pair_interval(period));
@@ -1586,9 +1602,10 @@ impl Detector {
         };
         // Any answer is evidence of life when it arrives, even one too late to be measured.
         peer.last_answer_ns = Some(peer.last_answer_ns.map_or(at_ns, |last| last.max(at_ns)));
-        peer.silent_since_ns = None;
         let Some(sent) = peer.take(nonce) else {
+            // The latest reused record's answer is timed exactly: its pair's timer takes it, late.
             if let Some((round_trip, true)) = peer.answered_unrecorded(nonce, at_ns) {
+                peer.rto.take(round_trip, true);
                 self.least_rtt_ns = Some(
                     self.least_rtt_ns
                         .map_or(round_trip, |least| least.min(round_trip)),
@@ -1602,10 +1619,8 @@ impl Detector {
         // there to see (§2.6), and a far path's samples never are.
         let pools = peer.path_rtt_ns.is_some() && pooled_rtt.is_some() && !far(peer, pooled_rtt);
         peer.path_rtt_ns = Some(rtt);
+        peer.rto.take(rtt, !current);
         self.least_rtt_ns = Some(self.least_rtt_ns.map_or(rtt, |least| least.min(rtt)));
-        peer.misfit_misses = 0;
-        self.last_rtt_ns = Some(rtt);
-        self.measurement_misses = 0;
         if let Some(((granularity, period), interval)) = measure.zip(interval) {
             peer.stream.take(sent.seq, rtt, granularity, interval);
             if peer.stream.due() {
@@ -1665,13 +1680,6 @@ impl Detector {
         self.pool.verdict
     }
 
-    /// The probe interval of every pair, once the member has a period measured: the round.
-    fn probe_interval(&self) -> Option<Duration> {
-        self.periods
-            .mean_ns()
-            .map(|period| self.pair_interval(period))
-    }
-
     /// The pair's probe interval: the round, one period for each member watched.
     fn pair_interval(&self, period_ns: u64) -> Duration {
         let watched = u64::try_from(self.order.len()).unwrap_or(1).max(1);
@@ -1685,8 +1693,7 @@ impl Detector {
     }
 
     /// Round trips this member measured before it had a wake and a period measured, which no
-    /// estimator took: with every pair's [`verdict`](Self::verdict) `None`, what tells an owner its
-    /// member is measuring and not yet judging.
+    /// estimator took (each pair's timer did).
     pub fn unmeasured(&self) -> u64 {
         self.unmeasured
     }
@@ -1703,17 +1710,12 @@ impl Detector {
             probe.answered = true;
             if let Some(peer) = self.peers.get_mut(&target) {
                 peer.last_answer_ns = Some(at_ns);
-                peer.silent_since_ns = None;
             }
         }
     }
 
-    /// Responds to a ping from `from` with the acknowledgement to send back. A ping from a member
-    /// other than the one being measured shows the network carries this member's traffic.
+    /// Responds to a ping from `from` with the acknowledgement to send back.
     pub fn on_ping(&mut self, from: HostId) -> Ack {
-        if self.probe.is_some_and(|probe| probe.target != from) {
-            self.heard_other = true;
-        }
         Ack { to: from }
     }
 
@@ -1741,13 +1743,16 @@ impl Detector {
             judge: match judging(
                 held,
                 self.pool.verdict,
-                self.probe_interval(),
-                self.clock_ns,
+                self.probe_loss(),
+                self.granularity_ns(),
             ) {
-                (None, _) => Judge::Nothing,
-                (Some(_), true) => Judge::Provisional,
-                (Some(_), false) if held.stream.verdict.is_some() => Judge::Own,
-                (Some(_), false) => Judge::Pool,
+                (_, true) => Judge::Timer,
+                (_, false) if held.stream.verdict.is_some() => Judge::Own,
+                (_, false) => Judge::Pool,
+            },
+            timer: {
+                let (floor, minimum) = timer_floors(self.pool.verdict, self.granularity_ns());
+                held.rto.report(floor, minimum)
             },
             last_answer_ns: held.last_answer_ns,
             pool_misfit: far(held, self.pool_round_trip()),
@@ -1772,22 +1777,19 @@ impl Detector {
         self.peers.get(&peer).map(|held| held.stream.samples)
     }
 
-    /// The verdict that times this member's probes of `peer` now: the pair's own; before it has one,
-    /// a pair the pool does not fit is judged provisionally ([`misfit_verdict`], `mistake` 1), else
-    /// by the pool's.
+    /// The verdict that times this member's probes of `peer` now ([`judging`]): the pair's own;
+    /// before it has one, the pool's where the pool's span covers the pair, else the pair's timer's
+    /// (`mistake` 1). `None` for a member the view does not hold.
     pub fn verdict(&self, peer: HostId) -> Option<Verdict> {
-        match self.peers.get(&peer) {
-            Some(held) => {
-                judging(
-                    held,
-                    self.pool.verdict,
-                    self.probe_interval(),
-                    self.clock_ns,
-                )
-                .0
-            }
-            None => self.pool.verdict,
-        }
+        self.peers.get(&peer).map(|held| {
+            judging(
+                held,
+                self.pool.verdict,
+                self.probe_loss(),
+                self.granularity_ns(),
+            )
+            .0
+        })
     }
 
     /// The failure history the margins are priced with: the node time this member watched beside
@@ -2188,17 +2190,18 @@ impl Detector {
     }
 
     /// Learns a peer as [`join`](Self::join) does, with a round trip to it that the owner measured
-    /// outside the detector, the handshake that keyed the peer's session: until this member
-    /// measures a round trip, its probes of the peer wait on that one instead of
-    /// [`INITIAL_WAIT_NS`], 1 s where a LAN's is about 100 µs. It judges nothing and feeds no
-    /// estimator: a handshake is not a probe. A zero round trip measures nothing and is not taken.
+    /// outside the detector, the handshake that keyed the peer's session: the pair's timer takes it
+    /// as its first round trip, as TCP's takes its handshake's (RFC 6298 (2.2)), so the pair's
+    /// probes are timed from the path's own round trip and not from the initial second, some 10⁴ of
+    /// a LAN's. No estimator takes it: a handshake is not a probe. A zero round trip measures nothing
+    /// and is not taken.
     pub fn join_measured(&mut self, peer: HostId, round_trip: Duration) -> Result<(), Full> {
         self.join(peer)?;
         let rtt = u64::try_from(round_trip.as_nanos()).unwrap_or(u64::MAX);
         if let Some(held) = self.peers.get_mut(&peer)
             && rtt > 0
         {
-            held.handshake_rtt_ns = Some(rtt);
+            held.rto.take(rtt, false);
             held.path_rtt_ns = held.path_rtt_ns.or(Some(rtt));
             self.least_rtt_ns = Some(self.least_rtt_ns.map_or(rtt, |least| least.min(rtt)));
         }
@@ -2457,97 +2460,113 @@ mod tests {
 
     /// The direct deadline of the period's probe.
     fn ping_sent(detector: &Detector) -> u64 {
-        detector.probe.unwrap().due_ns().unwrap()
+        detector.probe.unwrap().due_ns()
     }
 
     fn liveness(detector: &Detector, peer: HostId) -> Liveness {
         detector.membership().state(peer).unwrap().liveness
     }
 
-    /// A measurement probe whose ping or answer was lost ends at its expected arrival: with every
-    /// member's probe lost at once (a throttled container dropping a burst), waiting for another
-    /// member left all of them waiting for ever.
+    /// A probe whose ping or answer was lost is judged at its pair's timer: its period ends at the
+    /// timeout and then its relays', and the member probes on. An end that waited on another member
+    /// left every member waiting for ever once all their probes were lost at once (a throttled
+    /// container dropping a burst). Before the pool has measured the host's stalls, the timeout is at
+    /// least RFC 6298's second (2.4).
     #[test]
-    fn a_lost_measurement_probe_ends_at_its_expected_arrival() {
+    fn a_lost_probe_is_judged_at_its_pair_s_timer() {
         let mut detector = detector(&[A, B]);
         let mut requests = Vec::new();
         let first = detector.poll(0, &mut requests).unwrap();
         detector.on_ack(first.to, first.nonce, MS);
         let lost = detector.poll(MS, &mut requests).unwrap();
-        assert_eq!(detector.verdict(lost.to), None, "measurement only");
-        let expected = detector.wake().unwrap();
-        assert_eq!(expected, 2 * MS, "the latest round trip on");
-        assert_eq!(detector.poll(expected - 1, &mut requests), None);
-        let next = detector.poll(expected, &mut requests);
-        assert!(next.is_some(), "the period ended at the expected arrival");
+        let timeout = MS + MINIMUM_RTO_NS;
+        assert_eq!(lost.due_ns, Some(timeout), "judged at the timer's second");
+        assert_eq!(detector.poll(timeout - 1, &mut requests), None);
+        assert_eq!(detector.poll(timeout, &mut requests), None);
+        assert_eq!(requests.len(), 1, "the other member asked to relay");
+        let relays_due = detector.wake().unwrap();
+        assert!(
+            detector.poll(relays_due, &mut requests).is_some(),
+            "the period ended and the member probes on"
+        );
         assert_eq!(
             liveness(&detector, lost.to),
-            Liveness::Alive,
-            "and judged nothing"
+            Liveness::Suspect,
+            "judged, and suspected"
         );
     }
 
-    /// A first probe, before any round trip, whose ping or answer was lost ends at the initial
-    /// wait, and the next unanswered one at twice it: waiting on another member instead, members
-    /// whose first probes were all lost waited on one another for ever (slates' daemons, the
-    /// datagrams queued at a re-key dropped).
+    /// A first probe, before any round trip of its pair, is judged at RFC 6298's initial second
+    /// (2.1), and an unanswered one doubles its pair's next timeout (5.5), while another pair's stays
+    /// its own: a pair's timer backs off as a connection's does. An end that waited on another
+    /// member instead left members whose first probes were all lost waiting on one another for ever
+    /// (slates' daemons, the datagrams queued at a re-key dropped).
     #[test]
-    fn a_lost_first_probe_ends_at_the_initial_wait() {
+    fn a_first_probe_is_judged_at_the_initial_second_and_its_pair_backs_off() {
         let mut detector = detector(&[A, B]);
         let mut requests = Vec::new();
         let first = detector.poll(0, &mut requests).unwrap();
+        assert_eq!(first.due_ns, Some(INITIAL_RTO_NS), "the initial second");
+        let mut now = INITIAL_RTO_NS;
+        let mut next = None;
+        while next.is_none() {
+            next = detector.poll(now, &mut requests);
+            now = detector.wake().unwrap().max(now);
+        }
+        let second = next.unwrap();
+        assert_ne!(second.to, first.to, "the round's other member");
         assert_eq!(
-            detector.wake(),
-            Some(INITIAL_WAIT_NS),
-            "a wake before any round trip"
+            second
+                .due_ns
+                .map(|due| due - detector.probe.unwrap().sent_ns),
+            Some(INITIAL_RTO_NS),
+            "its own timer, not backed off"
         );
-        assert_eq!(detector.poll(INITIAL_WAIT_NS - 1, &mut requests), None);
-        let second = detector.poll(INITIAL_WAIT_NS, &mut requests).unwrap();
-        assert_ne!(second.nonce, first.nonce, "probing again");
+        let mut again = None;
+        while again.is_none_or(|ping: Ping| ping.to != first.to) {
+            again = detector.poll(now, &mut requests);
+            now = detector.wake().unwrap().max(now);
+        }
         assert_eq!(
-            detector.wake(),
-            Some(3 * INITIAL_WAIT_NS),
-            "backed off: twice the initial wait"
-        );
-        assert_eq!(
-            liveness(&detector, first.to),
-            Liveness::Alive,
-            "judging nothing"
+            again
+                .and_then(|ping| ping.due_ns)
+                .map(|due| due - detector.probe.unwrap().sent_ns),
+            Some(2 * INITIAL_RTO_NS),
+            "the first pair's timer backed off: twice the initial second"
         );
     }
 
-    /// A peer joined with its handshake's round trip is first probed on that round trip's wait, not
-    /// the initial one; a peer joined without one waits the initial wait, backed off.
+    /// A handshake is its pair's timer's first round trip (RFC 6298 (2.2)), as TCP's is: a peer
+    /// joined with one is judged from that round trip, and one joined without from the initial
+    /// second, all of it margin.
     #[test]
-    fn a_handshake_round_trip_sets_the_first_wait() {
+    fn a_handshake_is_its_pair_s_first_round_trip() {
         let mut detector =
             Detector::new(LOCAL, Exposure::new(), room(), RESOLUTION, Duration::ZERO);
         let handshake = Duration::from_micros(100);
         detector.join_measured(A, handshake).unwrap();
         detector.join(B).unwrap();
-        let mut requests = Vec::new();
-        // Each period's target and its wait, the first unanswered one doubling the second's.
-        let first = detector.poll(0, &mut requests).unwrap();
-        let first_wait = detector.wake().unwrap();
-        let second = detector.poll(first_wait, &mut requests).unwrap();
-        let second_wait = detector.wake().unwrap() - first_wait;
-        let base = u64::try_from(handshake.as_nanos()).unwrap();
-        let expected = if first.to == A {
-            [(A, base), (B, 2 * INITIAL_WAIT_NS)]
-        } else {
-            [(B, INITIAL_WAIT_NS), (A, 2 * base)]
-        };
-        assert_eq!([(first.to, first_wait), (second.to, second_wait)], expected);
+        let measured = detector.verdict(A).unwrap();
+        assert_eq!(measured.round_trip, handshake, "the handshake's round trip");
+        assert_eq!(detector.report(A).unwrap().timer.samples, 1);
+        let unmeasured = detector.verdict(B).unwrap();
+        assert_eq!(unmeasured.round_trip, Duration::ZERO, "none measured");
+        assert_eq!(
+            unmeasured.margin,
+            Duration::from_nanos(INITIAL_RTO_NS),
+            "the initial second, all margin"
+        );
     }
 
-    /// Measurement periods follow round trips that lengthen. A measurement period ends at its
-    /// expected arrival from the latest round trip; when the round trips lengthen past what the
-    /// outstanding probes cover (three a peer), every answer comes for a probe written over, none
-    /// is measured, the latest round trip never lengthens, and the member probes on at the stale
-    /// pace and never configures: the cluster test's spin, a member 43,557 periods into a run with
-    /// nothing judged while the others condemned it, slow to answer, 95 times.
+    /// A pair's estimators follow round trips that lengthen. A first form ended a probe's period at
+    /// its expected arrival from the latest round trip; when the round trips lengthened past what the
+    /// outstanding probes cover (three a peer), every answer came for a probe written over, none was
+    /// measured, and the member probed on at the stale pace and never configured: the cluster test's
+    /// spin, a member 43,557 periods into a run with nothing judged while the others condemned it,
+    /// slow to answer, 95 times. Each pair's timer waits for its own round trips and backs off where
+    /// they outrun it, and each pair's own estimator configures from the lengthened ones.
     #[test]
-    fn measurement_periods_follow_round_trips_that_lengthen() {
+    fn a_pair_s_estimators_follow_round_trips_that_lengthen() {
         let mut detector = detector(&[A, B]);
         let mut requests = Vec::new();
         // Answers in flight: when each arrives, from whom, for which probe.
@@ -2581,7 +2600,9 @@ mod tests {
             });
         }
         assert!(
-            detector.verdict(A).is_some() && detector.verdict(B).is_some(),
+            [A, B].iter().all(|peer| detector
+                .report(*peer)
+                .is_some_and(|report| report.configured)),
             "configured from the lengthened round trips"
         );
     }
@@ -2645,22 +2666,27 @@ mod tests {
         assert!(detector.report(A).unwrap().pending_since_ns.is_some());
     }
 
-    /// A member whose probes judge nothing yet states no detection bound: an unanswered probe
-    /// suspects nobody until a verdict times it, so a death the member holds then is another's,
-    /// adopted, on that member's timeline (the cluster test noted such a death, held from a
-    /// gossiped condemnation 7 ms into the run, against a bound of 2.5 ms its probes could not
-    /// keep).
+    /// Every probe is judged, so a member states its detection bound from its first period, and the
+    /// bound covers its timers' deadlines: an unanswered timer-judged probe's period is its deadline
+    /// and then its relays', three spans. A first form stated no bound while probes judged nothing,
+    /// and a death the member held then was another's, adopted (the cluster test noted one 7 ms into
+    /// a run against a bound of 2.5 ms its probes could not keep).
     #[test]
-    fn a_member_that_judges_nothing_states_no_bound() {
+    fn a_member_states_its_bound_from_its_first_period() {
         let peers = [A, B];
         let mut detector = detector(&peers);
         let mut world = World::new();
         world.run(&mut detector, 2, |_| Some(MS));
-        assert!(detector.periods.count > 0);
-        assert!(peers.iter().all(|peer| detector.verdict(*peer).is_none()));
-        assert_eq!(detector.detection_bound(world.now), None);
-        configured(&mut detector, &mut world, &peers);
-        assert!(detector.detection_bound(world.now).is_some());
+        assert!(
+            peers
+                .iter()
+                .all(|peer| detector.report(*peer).unwrap().judge == Judge::Timer)
+        );
+        let bound = detector.detection_bound(world.now).unwrap();
+        // Two members watched: 2(2·2 − 1) + 1 periods, each up to three timer spans, a second each
+        // before the pool has measured the host's stalls.
+        let span = Duration::from_nanos(MINIMUM_RTO_NS);
+        assert!(bound >= span * 3 * 7, "{bound:?}");
     }
 
     /// A member whose every wake is read exactly on time configures and judges: its `G` is the
@@ -2697,16 +2723,24 @@ mod tests {
         assert_eq!(detector.round_trips_taken(first.to), Some(0));
     }
 
-    /// The detection bound counts every member the view holds, not the current round's: a member
+    /// The detection bound counts every member the view has held, not the current round's: a member
     /// that condemned two others (falsely, under a CPU throttle) ran rounds of one while the
-    /// victim's last probe had been in a round of three, and stated a bound a third as long.
+    /// victim's last probe had been in a round of three, and stated a bound a third as long. Its
+    /// periods' multiplier is checked exactly; their length follows the verdicts judging the pairs
+    /// probed now, and the periods already run.
     #[test]
     fn the_detection_bound_does_not_shrink_with_the_round() {
         let peers = [A, B, C];
         let mut detector = detector(&peers);
         let mut world = World::new();
         configured(&mut detector, &mut world, &peers);
-        let before = detector.detection_bound(world.now).unwrap();
+        // The periods the bound counts: 2(2m − 1) + 1, `m` the most members the view has held.
+        let periods = |detector: &Detector, now: u64| {
+            let bound = nanos(detector.detection_bound(now).unwrap());
+            bound / detector.period_bound(now).unwrap()
+        };
+        let before = periods(&detector, world.now);
+        assert_eq!(before, 2 * (2 * 3 - 1) + 1);
         for peer in [B, C] {
             detector
                 .apply(
@@ -2721,12 +2755,12 @@ mod tests {
         let mut state = 17;
         world.run(&mut detector, 4, |_| Some(jitter(&mut state)));
         assert_eq!(detector.order.len(), 1, "a round of one");
-        assert!(detector.detection_bound(world.now).unwrap() >= before);
+        assert_eq!(periods(&detector, world.now), before);
         // Nor once the dead are forgotten: they were in the rounds before.
         while detector.membership().len() > 2 {
             world.run(&mut detector, 1, |_| Some(jitter(&mut state)));
         }
-        assert!(detector.detection_bound(world.now).unwrap() >= before);
+        assert_eq!(periods(&detector, world.now), before);
     }
 
     fn alive(incarnation: u64) -> MemberState {
@@ -2884,46 +2918,45 @@ mod tests {
         assert_eq!(detector.refused(), 1);
     }
 
-    /// Nothing is judged from no evidence. Do: run a member over A, which never answers, and B,
-    /// which answers in about 1 ms. Expect: while A has been silent for less than RFC 6298's
-    /// initial timeout (1 s) and the pool has no verdict, A has no verdict and no suspicion; once
-    /// its silence reaches that timeout, it is judged provisionally, by a verdict that claims no
-    /// bound, at that timeout. Before 2026-10-10 the first half held only until the pool configured
-    /// (56 round trips, 1.19 s in, on this driver), and a pool no pair feeds never does
-    /// ([`silent_verdict`]).
+    /// A pair no estimator judges is judged by its own timer from its first probe. Before
+    /// 2026-10-10 a probe was measurement only until an estimator configured, and a peer silent
+    /// before one did was judged by nothing (slates: 4,000 periods); a first restatement judged such
+    /// a pair only once silent for the timeout, which paid the timeout twice. Do: run a member over
+    /// A, which never answers, and B, which answers in about 1 ms. Expect: A's first probe is judged
+    /// at RFC 6298's initial second (2.1), by a verdict that claims no bound, and A is suspected when
+    /// that probe's period ends unanswered, not before its deadline.
     #[test]
-    fn nothing_is_judged_before_the_estimates_exist() {
+    fn a_pair_no_estimator_judges_is_judged_by_its_timer() {
         let mut detector = detector(&[A, B]);
         let mut world = World::new();
         world.heard = B;
         let mut state = 7;
-        let silent_for = |detector: &Detector| {
-            detector
-                .peers
-                .get(&A)
-                .and_then(|peer| peer.silent_since_ns)
-                .map_or(0, |since| detector.clock_ns.saturating_sub(since))
-        };
-        while silent_for(&detector) < MINIMUM_RTO_NS && detector.pool.verdict.is_none() {
-            assert_eq!(detector.verdict(A), None, "no verdict from no evidence");
-            assert_eq!(liveness(&detector, A), Liveness::Alive);
-            assert_eq!(detector.report(A).unwrap().suspicions, 0);
+        while !world.pings.iter().any(|ping| ping.to == A) {
             world.run(&mut detector, 0, |peer| {
                 (peer == B).then(|| jitter(&mut state))
             });
         }
-        assert!(
-            detector.pool.verdict.is_none(),
-            "A's silence reached the initial timeout before the pool configured"
-        );
-        let verdict = detector
-            .verdict(A)
-            .expect("a peer silent past the initial timeout is judged");
-        assert_eq!(verdict.mistake, 1.0, "provisionally: it claims no bound");
+        let probe = detector.probe.unwrap();
+        assert_eq!(probe.target, A);
+        assert_eq!(probe.verdict.mistake, 1.0, "the timer's: no bound claimed");
         assert_eq!(
-            verdict.round_trip.saturating_add(verdict.margin),
-            Duration::from_nanos(MINIMUM_RTO_NS),
-            "at RFC 6298's timeout"
+            probe.due_ns() - probe.sent_ns,
+            INITIAL_RTO_NS,
+            "the initial second"
+        );
+        // The period's end: the next probe goes out, and A's first probe has been judged.
+        let sent = world.pings.len();
+        while world.pings.len() == sent {
+            assert_eq!(liveness(&detector, A), Liveness::Alive, "not before its deadline");
+            world.run(&mut detector, 0, |peer| {
+                (peer == B).then(|| jitter(&mut state))
+            });
+        }
+        assert!(world.now >= probe.due_ns(), "past its deadline");
+        assert_eq!(
+            liveness(&detector, A),
+            Liveness::Suspect,
+            "suspected when its first probe's period ended"
         );
     }
 
@@ -3061,14 +3094,17 @@ mod tests {
     }
 
     /// Whether every one of `peers` is judged by a verdict whose period rests at the floor: the
-    /// pair's own or the pool's, not a provisional one, nor none.
+    /// pair's own or the pool's, not its timer's.
     fn judged_at_floor(detector: &Detector, peers: &[HostId]) -> bool {
         peers.iter().all(|peer| {
             detector.peers.get(peer).is_some_and(|held| {
-                matches!(
-                    judging(held, detector.pool.verdict, None, detector.clock_ns),
-                    (Some(_), false)
+                !judging(
+                    held,
+                    detector.pool.verdict,
+                    detector.probe_loss(),
+                    detector.granularity_ns(),
                 )
+                .1
             })
         })
     }
@@ -3125,17 +3161,21 @@ mod tests {
         );
     }
 
-    /// Only a judged period rests: a measurement period judges nothing, so it ends at its answer
-    /// whatever the budget (slates, 2026-10-09: when every period rested, a lone peer was still
-    /// alive in its member's view 9 s into its silence, its measurement phase stretched to the
-    /// floor). Do: under a 900 ms budget, answer a fresh member's first probe 1 ms after it is sent.
-    /// Expect: the next probe goes at that answer, not at the floor.
+    /// Only a period an estimator judges rests: a timer-judged period ends at its answer whatever the
+    /// budget, as the samples its pair's estimator is still gathering need (slates, 2026-10-09: when
+    /// every period rested, a lone peer was still alive in its member's view 9 s into its silence).
+    /// Do: under a 900 ms budget, answer a fresh member's first probe 1 ms after it is sent. Expect:
+    /// the next probe goes at that answer, not at the floor.
     #[test]
-    fn a_measurement_period_ends_at_its_answer_under_a_budget() {
+    fn a_timer_judged_period_ends_at_its_answer_under_a_budget() {
         let mut detector = budgeted(&[A, B]);
         let mut requests = Vec::new();
         let first = detector.poll(0, &mut requests).unwrap();
-        assert_eq!(first.due_ns, None, "measurement only");
+        assert_eq!(
+            first.due_ns,
+            Some(INITIAL_RTO_NS),
+            "judged by its timer, the initial second"
+        );
         detector.on_ack(first.to, first.nonce, MS);
         assert_eq!(detector.wake(), Some(0), "nothing left to wait for");
         assert!(
@@ -3246,32 +3286,48 @@ mod tests {
         );
     }
 
-    /// A pair one stall made late feeds the pool again from its next answer in time (slates,
-    /// 2026-10-10: on a host at load 80 an early stall delayed an answer of each of a member's two
-    /// peers past three later probes; each answer marked its pair a misfit for good, nothing fed the
-    /// pool, which refused at 5 round trips, and a peer that then went silent was judged by nothing
-    /// for 4,000 periods). Do: on a fresh member over A and B answering in about 1 ms, once each
-    /// has answered twice, stall B (its answers 40 ms late, past three later probes) until an answer
-    /// of B's finds its record reused, then A the same, then answer everything in about 1 ms.
-    /// Expect: the pool configures. Before, it never did.
+    /// A pair one stall made late is the pool's to judge again from its next answer in time, and
+    /// feeds it again from the sample after (slates, 2026-10-10: on a host at load 80 an answer after
+    /// a stall marked its pair a misfit for good; both of a member's pairs were marked so, nothing fed
+    /// its pool, which refused at 5 round trips, and a peer that then went silent was judged by
+    /// nothing for 4,000 periods). Do: on a member over A and B whose pool judges them, answering in
+    /// about 1 ms, answer one probe of B's 40 ms late, past the pool's span, then every probe in
+    /// about 1 ms. Expect: at the late answer B leaves the pool's judgment for its timer's; at its
+    /// next answer in time it returns to the pool's; and its answer after that feeds the pool, the
+    /// sample judged by the evidence before it. Before, a mark set once kept B out of both until its
+    /// own estimator configured.
     #[test]
-    fn a_pair_one_stall_made_late_feeds_the_pool_again() {
+    fn a_pair_one_stall_made_late_returns_to_the_pool() {
         const STALL_RTT: u64 = 40 * MS;
-        const HORIZON: u64 = 600_000 * MS;
         let mut detector = detector(&[A, B]);
+        let mut state = 0x9E37_79B9_7F4A_7C15;
+        let judge = |detector: &Detector, peer: HostId| detector.report(peer).unwrap().judge;
+        let mut now = drive_many(
+            &mut detector,
+            MS,
+            600_000 * MS,
+            |_| Some(jitter(&mut state)),
+            |_, _, _, _| false,
+            |detector| {
+                [A, B]
+                    .iter()
+                    .all(|peer| judge(detector, *peer) == Judge::Pool)
+            },
+        );
+        assert!(
+            [A, B]
+                .iter()
+                .all(|peer| judge(&detector, *peer) == Judge::Pool)
+        );
         let mut requests = Vec::new();
         let mut pending: Vec<(HostId, u64, u64)> = Vec::new();
-        let mut state = 0x9E37_79B9_7F4A_7C15;
-        let mut answered: BTreeMap<HostId, u32> = BTreeMap::new();
-        // The peers a stall holds back, in turn, each until one of its answers finds its record
-        // reused.
-        let mut stalls = [B, A].into_iter().peekable();
-        let mut now = MS;
-        while now < HORIZON && detector.pool.verdict.is_none() {
-            let warm = [A, B].iter().all(|peer| answered.get(peer) >= Some(&2));
-            let stall = stalls.peek().copied().filter(|_| warm);
+        // The stalled probe's nonce, then B's answers after its late one: none yet, one, two.
+        let mut stalled = None;
+        let (mut left, mut after) = (false, 0);
+        while after < 2 {
             if let Some(ping) = detector.poll(now, &mut requests) {
-                let rtt = if Some(ping.to) == stall {
+                let rtt = if ping.to == B && stalled.is_none() {
+                    stalled = Some(ping.nonce);
                     STALL_RTT
                 } else {
                     jitter(&mut state)
@@ -3279,7 +3335,7 @@ mod tests {
                 pending.push((ping.to, ping.nonce, now + rtt));
             }
             let ack = pending.iter().map(|(_, _, at)| *at).min();
-            now = match (detector.wake().map(|wake| wake + MS / 10), ack) {
+            now = match (detector.wake(), ack) {
                 (Some(wake), Some(at)) => wake.min(at).max(now),
                 (Some(wake), None) => wake.max(now),
                 (None, Some(at)) => at.max(now),
@@ -3287,26 +3343,30 @@ mod tests {
             };
             pending.sort_by_key(|(_, _, at)| *at);
             for (from, nonce, at) in pending.iter().copied().filter(|(_, _, at)| *at <= now) {
-                let recorded = detector.peers.get(&from).is_some_and(|peer| {
-                    peer.outstanding
-                        .iter()
-                        .flatten()
-                        .any(|sent| sent.nonce == nonce)
-                });
-                *answered.entry(from).or_insert(0) += 1;
+                let samples = detector.pool.samples;
                 detector.on_ack(from, nonce, at);
-                if Some(from) == stall && !recorded {
-                    stalls.next();
+                if from != B {
+                    continue;
+                }
+                if Some(nonce) == stalled {
+                    left = true;
+                    assert_eq!(judge(&detector, B), Judge::Timer, "left at the late answer");
+                } else if left && after == 0 {
+                    after = 1;
+                    assert_eq!(judge(&detector, B), Judge::Pool, "back at its next answer");
+                    assert_eq!(detector.pool.samples, samples, "its far evidence before it");
+                } else if left {
+                    after = 2;
+                    assert_eq!(
+                        detector.pool.samples,
+                        samples + 1,
+                        "the answer after feeds the pool"
+                    );
                 }
             }
             pending.retain(|(_, _, at)| *at > now);
+            assert!(now < 600_000 * MS, "the stall's sequence ran");
         }
-        assert!(stalls.peek().is_none(), "both peers stalled once");
-        assert!(
-            detector.pool.verdict.is_some(),
-            "the pool configured: {:?}",
-            detector.pool()
-        );
     }
 
     /// An answer no probe of the pair explains is evidence of life, not of the pair's path (slates,
@@ -3425,9 +3485,8 @@ mod tests {
     /// peer whose pair and pool estimators both refused was judged by nothing for 4,000 periods).
     /// Do: on a fresh member of a two-member view, answer its peer's first five probes in about
     /// 1 ms, far fewer than any estimator configures on, then nothing. Expect: the peer is
-    /// suspected, by a provisional verdict at RFC 6298's timeout, and never condemned (a lone pair
-    /// has no third member to confirm a death). Before, its probes stayed measurement only: alive
-    /// after 600 s simulated.
+    /// suspected, by its pair's timer, and never condemned (a lone pair has no third member to
+    /// confirm a death). Before, its probes stayed measurement only: alive after 600 s simulated.
     #[test]
     fn a_peer_silent_before_any_estimate_configures_is_suspected() {
         const ANSWERED: u32 = 5;
@@ -3451,11 +3510,10 @@ mod tests {
             Liveness::Suspect,
             "the silent peer is suspected"
         );
-        let verdict = detector.verdict(A).unwrap();
         assert_eq!(
-            verdict.round_trip.saturating_add(verdict.margin),
-            Duration::from_nanos(MINIMUM_RTO_NS),
-            "at RFC 6298's timeout"
+            detector.report(A).unwrap().judge,
+            Judge::Timer,
+            "by its pair's timer"
         );
         let suspected = detector.clock_ns;
         drive_many(
@@ -3532,16 +3590,17 @@ mod tests {
         );
     }
 
-    /// The cost of RFC 6298 §2.1's initial RTO for a near peer joined with no handshake round trip:
-    /// until its first answer it is judged at 1 s, not by the pool. A condemnation takes two judged
-    /// probes (the one that suspects and the one that tells), and each unanswered one waits out its
-    /// direct deadline and then the relays', which includes the target's own span: two initial RTOs a
-    /// probe, so the first detection of a peer that never answers moves by at most four. Do: on a
-    /// configured member, join a near peer that never answers, once with no handshake round trip and
-    /// once with a 1 ms one, and time each from the join to holding it dead. Expect: both held dead,
-    /// the first no more than four initial RTOs after the second (measured: 4,076 ms against 108 ms).
+    /// The cost of RFC 6298 (2.1)'s initial timeout for a near peer joined with no handshake round
+    /// trip: until its first answer its timer judges it at the initial second, not the pool. A
+    /// condemnation takes two judged probes (the one that suspects and the one that tells), each
+    /// unanswered one waiting out its direct deadline and then the relays', which includes the
+    /// target's own span; the told probe's timer has backed off once (5.5). So the first detection
+    /// of a peer that never answers moves by at most `I + I` and `2I + 2I`, six initial timeouts.
+    /// Do: on a configured member, join a near peer that never answers, once with no handshake round
+    /// trip and once with a 1 ms one, and time each from the join to holding it dead. Expect: both
+    /// held dead, the first no more than six initial timeouts after the second.
     #[test]
-    fn a_near_peer_joined_without_a_round_trip_is_condemned_at_most_four_initial_rtos_later() {
+    fn a_near_peer_joined_without_a_round_trip_is_condemned_at_most_six_initial_timeouts_later() {
         const D: HostId = HostId(5);
         let held_dead_after = |handshake: Option<u64>| {
             let (mut detector, now) = warmed();
@@ -3571,99 +3630,45 @@ mod tests {
             measured as f64 / MS as f64
         );
         assert!(
-            unmeasured <= measured + 4 * INITIAL_WAIT_NS,
-            "at most four initial RTOs later: {unmeasured} ns against {measured} ns"
+            unmeasured <= measured + 6 * INITIAL_RTO_NS,
+            "at most six initial RTOs later: {unmeasured} ns against {measured} ns"
         );
     }
 
-    /// A far peer, joined with no handshake round trip, whose first answers all come after their
-    /// probes' records were reused (the member's near peers answer in 1 ms, so it probes the far one
-    /// three more times before a 40 ms answer comes back), and which dies before any answer of its is
-    /// measured. Do: measure the near peers, join the far one, drive the member until such a reused
-    /// answer has shown the pair's path to be another than the pool's ([`far`]) with no measured
-    /// answer of the far peer's, then kill the far peer. Expect: it is held dead. Before the
-    /// reused record's age was taken as the path's round trip, the pair had none, so it was never
-    /// judged provisionally and the dead member was measured for ever (the hyper-raft owner's review
-    /// of `swim-pair-deadline`, 2026-10-07).
+    /// A far peer, joined with no handshake round trip, that answers its first probes in 40 ms and
+    /// dies before its pair's estimator configures is condemned, by its pair's timer. A first form
+    /// judged a pair the pool did not fit only once a round trip of its was measured, and a far
+    /// pair whose answers all came after their records were reused had none: a member that then
+    /// died was measured for ever (the hyper-raft owner's review of `swim-pair-deadline`, 2026-10-07).
+    /// Do: on a configured member over near peers, join the far one, answer its first three probes
+    /// in 40 ms, then nothing. Expect: it is held dead, by this member's own probes.
     #[test]
-    fn a_far_peer_that_answers_only_after_its_records_are_reused_and_dies_is_condemned() {
+    fn a_far_peer_that_dies_before_its_estimator_configures_is_condemned() {
         const F: HostId = HostId(5);
-        // Far enough that three more probes of it go out before its answer returns (the near peers
-        // answer in 1 ms), near enough that the answer returns before the pool configures: so its
-        // first answers find their records reused while nothing yet judges the pair.
         const FAR_RTT: u64 = 40 * MS;
-        const HORIZON: u64 = 600_000 * MS;
-        // The near peers are measured first, as in a running cluster the far member then joins.
-        let mut detector = detector(&[A, B, C]);
-        let mut world = World::new();
-        let mut warm = 0x2545_F491_4F6C_DD1D;
-        world.run(&mut detector, 12, |_| Some(jitter(&mut warm)));
+        const ANSWERED: u32 = 3;
+        let (mut detector, now) = warmed();
         detector.join(F).unwrap();
-        let mut requests = Vec::new();
-        let mut pending: Vec<(HostId, u64, u64)> = Vec::new();
         let mut state = 0x9E37_79B9_7F4A_7C15;
-        let mut now = world.now;
-        let (mut far_alive, mut far_measured, mut killed) = (true, false, false);
-        while now < HORIZON && !(killed && liveness(&detector, F) == Liveness::Dead) {
-            if let Some(ping) = detector.poll(now, &mut requests) {
-                let rtt = if ping.to == F {
-                    far_alive.then_some(FAR_RTT)
-                } else {
-                    Some(jitter(&mut state))
-                };
-                if let Some(rtt) = rtt {
-                    pending.push((ping.to, ping.nonce, now + rtt));
+        let mut answered = 0u32;
+        drive_many(
+            &mut detector,
+            now,
+            now + 600_000 * MS,
+            |peer| {
+                if peer != F {
+                    return Some(jitter(&mut state));
                 }
-            }
-            let ack = pending.iter().map(|(_, _, at)| *at).min();
-            now = match (detector.wake().map(|wake| wake + MS / 10), ack) {
-                (Some(wake), Some(at)) => wake.min(at).max(now),
-                (Some(wake), None) => wake.max(now),
-                (None, Some(at)) => at.max(now),
-                (None, None) => {
-                    detector.on_ping(A);
-                    now + MS
-                }
-            };
-            pending.sort_by_key(|(_, _, at)| *at);
-            let due: Vec<(HostId, u64, u64)> = pending
-                .iter()
-                .copied()
-                .filter(|(_, _, at)| *at <= now)
-                .collect();
-            pending.retain(|(_, _, at)| *at > now);
-            for (from, nonce, at) in due {
-                if from != F {
-                    detector.on_ack(from, nonce, at);
-                    continue;
-                }
-                if !far_alive {
-                    continue;
-                }
-                let outstanding = detector.peers.get(&F).is_some_and(|peer| {
-                    peer.outstanding
-                        .iter()
-                        .flatten()
-                        .any(|sent| sent.nonce == nonce)
-                });
-                far_measured |= outstanding;
-                detector.on_ack(from, nonce, at);
-                let misfit = detector.report(F).is_some_and(|report| report.pool_misfit);
-                if !outstanding && !far_measured && misfit {
-                    killed = true;
-                    far_alive = false;
-                }
-            }
-        }
-        assert!(
-            killed,
-            "the far pair was made misfit by a reused record's answer before any was measured"
+                answered += 1;
+                (answered <= ANSWERED).then_some(FAR_RTT)
+            },
+            |_, _, _, _| false,
+            |detector| liveness(detector, F) == Liveness::Dead,
         );
-        assert_eq!(
-            liveness(&detector, F),
-            Liveness::Dead,
-            "the far peer, dead, is held dead"
-        );
+        let report = detector.report(F).unwrap();
+        assert!(!report.configured, "its estimator never configured");
+        assert_eq!(liveness(&detector, F), Liveness::Dead, "held dead");
+        assert_eq!(report.condemnations, 1, "by this member's own probes");
     }
 
     #[test]
@@ -3849,8 +3854,7 @@ mod tests {
             detector
                 .probe
                 .filter(|probe| probe.target == A)
-                .and_then(|probe| probe.verdict)
-                .map(|verdict| verdict.mistake)
+                .map(|probe| probe.verdict.mistake)
         };
         let mut pending = in_force(&detector);
         let (mut sum, mut state) = (before.suspicion_allowance, 13);

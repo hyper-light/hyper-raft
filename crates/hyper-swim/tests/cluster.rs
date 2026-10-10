@@ -65,7 +65,7 @@ use hyper_datagram::{
 };
 use hyper_swim::HostId;
 use hyper_swim::codec::{Coordinate, GossipBatch, SwimMessage, gossip_capacity};
-use hyper_swim::detector::{Detector, Finding, PeerReport, PingReq, Unanswered};
+use hyper_swim::detector::{Detector, Finding, Judge, PeerReport, PingReq, Unanswered};
 use hyper_swim::membership::{Liveness, MemberState};
 use hyper_timing::{Exposure, WINDOW_LIMIT};
 
@@ -601,9 +601,9 @@ impl Member {
             let counts = self.tallies.entry(peer).or_default().update(held);
             let report = held.unwrap_or_default();
             let noted = self.dead_seen.get(&peer).copied().unwrap_or_default();
-            // Judged: a configured verdict times this member's probes of the peer, the pair's own
-            // or, while the pair's estimator refuses, the pool's.
-            let judged = self.detector.verdict(HostId(peer)).is_some();
+            // Judged: an estimator's verdict times this member's probes of the peer, the pair's own
+            // or, while the pair's estimator refuses, the pool's; not yet the pair's timer's.
+            let judged = matches!(report.judge, Judge::Own | Judge::Pool);
             line.push_str(&format!(
                 " {peer}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
                 liveness_letter(state.map(|state| state.liveness)),

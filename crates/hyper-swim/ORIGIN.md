@@ -156,11 +156,18 @@
     incarnation, not when adopted. A false condemnation, refuted, shortened the MTBF and so the
     margins. `Detector::exposure` reports the history.
 
-18. **A pair silent past RFC 6298's timeout is judged while the pool has no verdict**
-    (`docs/timing.md` §2.7, "Before a pair can be judged"; slates' local patch bee1bb41,
-    2026-10-10). A pair with no verdict of its own, silent from its earliest unanswered probe for
-    `max(3R, 1 s)`, or 1 s with no `R`, is judged provisionally at that timeout (`silent_verdict`).
-    Before, nothing judged it while the pool refused, and nothing promised the pool would configure.
+18. **Every probe is judged** (`docs/timing.md` §2.7, "Before a pair's own estimator
+    configures"). A pair no estimator judges (its own, or the pool's where the pool's span covers
+    it) is judged by its own retransmission timer, RFC 6298's as written over its round trips
+    (`Rto`): the initial second, then `SRTT + max(G, 4·RTTVAR)`, at least RFC 6298's second until
+    the pool has measured the host's stalls and floored by the pool's margin after, doubled per pair
+    at each unanswered probe. It replaces the measurement-only phase (probes that judged nothing
+    until an estimator configured, so a peer silent before one did was judged by nothing), the
+    member-wide and per-pair measurement backoffs, the first-contact and misfit provisional
+    verdicts, and slates' patch for the silent peer (bee1bb41), which judged a pair only while the
+    pool had none and only once silent for the timeout: a fallback, which the owner ruled out. A
+    timer-judged probe still wakes at its expected arrival, which measures `G`. `PeerReport::judge`
+    says which judge times a pair, and `PeerReport::timer` its timer.
 
 The wire changed in place with 8 and 11: a probe and an answer carry entries of the existing gossip
 encoding, which a receiver of the earlier form applies as any gossip, and `Sync` is a new tag with

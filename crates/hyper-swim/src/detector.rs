@@ -233,17 +233,26 @@ fn backs_off_alone(peer: &Peer, pooled_rtt: Option<u64>) -> bool {
     peer.last_answer_ns.is_some() && far(peer, pooled_rtt)
 }
 
-/// The verdict that judges a probe of `peer`, given the pool's: the pair's own once its estimator
-/// configures; before that, for a pair the pool does not cover ([`covered`]), the provisional
-/// [`misfit_verdict`] from its latest round trip; for a pair with no evidence of its path, RFC
-/// 6298's initial timeout; otherwise the pool's. With it, whether the verdict is the provisional
-/// one. The one rule [`Detector::verdict`] reports and a probe is judged by.
-fn judging(peer: &Peer, pooled: Option<Verdict>) -> (Option<Verdict>, bool) {
+/// The verdict that judges a probe of `peer` started at `now_ns`, given the pool's and the pairs'
+/// probe interval: the pair's own once its estimator configures; before that, while the pool has
+/// none, the provisional [`silent_verdict`] once the pair has been silent past RFC 6298's timeout
+/// (none, measurement only, before); for a pair the pool does not cover ([`covered`]), the
+/// provisional [`misfit_verdict`] from its latest round trip; for a pair with no evidence of its
+/// path, RFC 6298's initial timeout; otherwise the pool's. With it, whether the verdict is a
+/// provisional one. The one rule [`Detector::verdict`] reports and a probe is judged by.
+fn judging(
+    peer: &Peer,
+    pooled: Option<Verdict>,
+    interval: Option<Duration>,
+    now_ns: u64,
+) -> (Option<Verdict>, bool) {
     if let Some(own) = peer.stream.verdict {
         return (Some(own), false);
     }
-    if let Some(pooled) = pooled
-        && let Some(rtt) = peer.path_rtt_ns
+    let Some(pooled) = pooled else {
+        return (silent_verdict(peer, interval, now_ns), true);
+    };
+    if let Some(rtt) = peer.path_rtt_ns
         && !covered(peer, pooled.span_ns())
     {
         return (Some(misfit_verdict(pooled, rtt)), true);
@@ -254,10 +263,54 @@ fn judging(peer: &Peer, pooled: Option<Verdict>) -> (Option<Verdict>, bool) {
         // second" — the provisional verdict whose deadline, 3R, is that second. Judged by the pool
         // instead, a peer joined by gossip before it was ever spoken to was suspected, alive, before
         // its first answer could return from 200 ms away.
-        let provisional = pooled.map(|pooled| misfit_verdict(pooled, FIRST_CONTACT_RTT_NS));
-        return (provisional, true);
+        return (Some(misfit_verdict(pooled, FIRST_CONTACT_RTT_NS)), true);
     }
-    (pooled, false)
+    (Some(pooled), false)
+}
+
+/// RFC 6298 §2.4's least retransmission timeout, nanoseconds: "Whenever RTO is computed, if it is
+/// less than 1 second, then the RTO SHOULD be rounded up to 1 second", there because "a large
+/// minimum RTO is needed to keep TCP conservative and avoid spurious retransmissions" (Allman and
+/// Paxson 1999). RFC 8961 lifts the minimum from a timer that has several observations of its path
+/// (requirement (2), and §5: "there is no minimum RTO specified"), and keeps the one second for a
+/// path nothing is known of (requirement (1)). It floors the provisional deadline of a pair judged
+/// while its member's pool has no verdict ([`unpooled_verdict`]): the member's own model of its
+/// host's stalls, the pool, refused, so nothing it measured is a timer's evidence.
+const MINIMUM_RTO_NS: u64 = 1_000_000_000;
+
+/// The provisional verdict of a pair with none of its own while its member's pool has none either,
+/// once the pair has been silent, from its earliest probe that no answer has followed, for the
+/// whole of that verdict's deadline: RFC 6298's timeout, at least 1 s ([`unpooled_verdict`]).
+/// Before then its probes are measurement only, as before any pool, so a pair that answers is
+/// sampled at its round trip's pace until an estimator configures. Nothing promises the pool ever
+/// will: a pair silent from the start feeds it nothing (a two-member view whose one peer died
+/// early, or a member whose every peer did), and an estimator can refuse for want of a measured
+/// correlation while a host's stalls keep its round trips correlated (slates, 2026-10-10: a pair's
+/// own estimator refused at 141 samples, its pool at 5, and the peer, silent, was judged by nothing
+/// for 4,000 periods). A silent pair gives no samples, so measuring it on has nothing to wait for.
+/// `None` before the member's first period gives the pairs' interval.
+fn silent_verdict(peer: &Peer, interval: Option<Duration>, now_ns: u64) -> Option<Verdict> {
+    let round_trip = peer.path_rtt_ns.unwrap_or(FIRST_CONTACT_RTT_NS);
+    let verdict = unpooled_verdict(round_trip, interval?);
+    let silent_for = now_ns.saturating_sub(peer.silent_since_ns?);
+    (silent_for >= verdict.span_ns()).then_some(verdict)
+}
+
+/// The provisional verdict from a pair's latest round trip `R` while its member's pool has none:
+/// RFC 6298's timeout `3R` (§2.2), rounded up to the RFC's one second (§2.4, [`MINIMUM_RTO_NS`]),
+/// as the expected arrival `R` and the margin to that deadline. Where the pool has a verdict, its
+/// margin floors a provisional one instead ([`misfit_verdict`]). It promises no bound (`mistake`
+/// 1), and with no loss measured it asks one relay ([`relay_count`] at zero loss).
+fn unpooled_verdict(path_rtt_ns: u64, interval: Duration) -> Verdict {
+    let round_trip = Duration::from_nanos(path_rtt_ns);
+    let to_minimum = Duration::from_nanos(MINIMUM_RTO_NS).saturating_sub(round_trip);
+    Verdict {
+        round_trip,
+        margin: round_trip.saturating_mul(2).max(to_minimum),
+        interval,
+        loss: 0.0,
+        mistake: 1.0,
+    }
 }
 
 /// The round trip a pair with no evidence of its path is judged provisionally by: a third of RFC 6298
@@ -488,6 +541,10 @@ struct Peer {
     /// answer that finds no record is for it or for one sent before it, so its round trip is known
     /// exactly or bounded below ([`Peer::reused_round_trip`]).
     reused: Option<Sent>,
+    /// When the pair's earliest probe that no answer has followed was sent, on the caller's clock:
+    /// from then the pair has been silent. Set by a probe sent while none is pending, cleared by
+    /// any answer, direct or relayed ([`silent_verdict`]).
+    silent_since_ns: Option<u64>,
 }
 
 impl Peer {
@@ -506,6 +563,7 @@ impl Peer {
             handshake_rtt_ns: None,
             path_rtt_ns: None,
             reused: None,
+            silent_since_ns: None,
         }
     }
 
@@ -1078,11 +1136,12 @@ impl Detector {
         // The handshake that keyed the pair already measured its path: a round trip longer than the
         // pool's deadline is the same evidence a late answer gives, known before the first probe
         // ([`covered`]).
-        let (verdict, provisional) = self
-            .peers
-            .get(&target)
-            .map_or((pooled, false), |peer| judging(peer, pooled));
+        let interval = self.probe_interval();
+        let (verdict, provisional) = self.peers.get(&target).map_or((pooled, false), |peer| {
+            judging(peer, pooled, interval, now_ns)
+        });
         let peer = self.peers.entry(target).or_insert_with(Peer::new);
+        peer.silent_since_ns.get_or_insert(now_ns);
         let seq = peer.sent;
         peer.sent = peer.sent.saturating_add(1);
         peer.send(Sent {
@@ -1527,6 +1586,7 @@ impl Detector {
         };
         // Any answer is evidence of life when it arrives, even one too late to be measured.
         peer.last_answer_ns = Some(peer.last_answer_ns.map_or(at_ns, |last| last.max(at_ns)));
+        peer.silent_since_ns = None;
         let Some(sent) = peer.take(nonce) else {
             if let Some((round_trip, true)) = peer.answered_unrecorded(nonce, at_ns) {
                 self.least_rtt_ns = Some(
@@ -1605,6 +1665,13 @@ impl Detector {
         self.pool.verdict
     }
 
+    /// The probe interval of every pair, once the member has a period measured: the round.
+    fn probe_interval(&self) -> Option<Duration> {
+        self.periods
+            .mean_ns()
+            .map(|period| self.pair_interval(period))
+    }
+
     /// The pair's probe interval: the round, one period for each member watched.
     fn pair_interval(&self, period_ns: u64) -> Duration {
         let watched = u64::try_from(self.order.len()).unwrap_or(1).max(1);
@@ -1636,6 +1703,7 @@ impl Detector {
             probe.answered = true;
             if let Some(peer) = self.peers.get_mut(&target) {
                 peer.last_answer_ns = Some(at_ns);
+                peer.silent_since_ns = None;
             }
         }
     }
@@ -1670,7 +1738,12 @@ impl Detector {
     /// What this member has done and promised about `peer`.
     pub fn report(&self, peer: HostId) -> Option<PeerReport> {
         self.peers.get(&peer).map(|held| PeerReport {
-            judge: match judging(held, self.pool.verdict) {
+            judge: match judging(
+                held,
+                self.pool.verdict,
+                self.probe_interval(),
+                self.clock_ns,
+            ) {
                 (None, _) => Judge::Nothing,
                 (Some(_), true) => Judge::Provisional,
                 (Some(_), false) if held.stream.verdict.is_some() => Judge::Own,
@@ -1704,7 +1777,15 @@ impl Detector {
     /// by the pool's.
     pub fn verdict(&self, peer: HostId) -> Option<Verdict> {
         match self.peers.get(&peer) {
-            Some(held) => judging(held, self.pool.verdict).0,
+            Some(held) => {
+                judging(
+                    held,
+                    self.pool.verdict,
+                    self.probe_interval(),
+                    self.clock_ns,
+                )
+                .0
+            }
             None => self.pool.verdict,
         }
     }
@@ -2803,18 +2884,47 @@ mod tests {
         assert_eq!(detector.refused(), 1);
     }
 
+    /// Nothing is judged from no evidence. Do: run a member over A, which never answers, and B,
+    /// which answers in about 1 ms. Expect: while A has been silent for less than RFC 6298's
+    /// initial timeout (1 s) and the pool has no verdict, A has no verdict and no suspicion; once
+    /// its silence reaches that timeout, it is judged provisionally, by a verdict that claims no
+    /// bound, at that timeout. Before 2026-10-10 the first half held only until the pool configured
+    /// (56 round trips, 1.19 s in, on this driver), and a pool no pair feeds never does
+    /// ([`silent_verdict`]).
     #[test]
     fn nothing_is_judged_before_the_estimates_exist() {
         let mut detector = detector(&[A, B]);
         let mut world = World::new();
         world.heard = B;
         let mut state = 7;
-        world.run(&mut detector, 40, |peer| {
-            (peer == B).then(|| jitter(&mut state))
-        });
-        assert_eq!(detector.verdict(A), None, "no verdict from no evidence");
-        assert_eq!(liveness(&detector, A), Liveness::Alive);
-        assert_eq!(detector.report(A).unwrap().suspicions, 0);
+        let silent_for = |detector: &Detector| {
+            detector
+                .peers
+                .get(&A)
+                .and_then(|peer| peer.silent_since_ns)
+                .map_or(0, |since| detector.clock_ns.saturating_sub(since))
+        };
+        while silent_for(&detector) < MINIMUM_RTO_NS && detector.pool.verdict.is_none() {
+            assert_eq!(detector.verdict(A), None, "no verdict from no evidence");
+            assert_eq!(liveness(&detector, A), Liveness::Alive);
+            assert_eq!(detector.report(A).unwrap().suspicions, 0);
+            world.run(&mut detector, 0, |peer| {
+                (peer == B).then(|| jitter(&mut state))
+            });
+        }
+        assert!(
+            detector.pool.verdict.is_none(),
+            "A's silence reached the initial timeout before the pool configured"
+        );
+        let verdict = detector
+            .verdict(A)
+            .expect("a peer silent past the initial timeout is judged");
+        assert_eq!(verdict.mistake, 1.0, "provisionally: it claims no bound");
+        assert_eq!(
+            verdict.round_trip.saturating_add(verdict.margin),
+            Duration::from_nanos(MINIMUM_RTO_NS),
+            "at RFC 6298's timeout"
+        );
     }
 
     #[test]
@@ -2955,7 +3065,10 @@ mod tests {
     fn judged_at_floor(detector: &Detector, peers: &[HostId]) -> bool {
         peers.iter().all(|peer| {
             detector.peers.get(peer).is_some_and(|held| {
-                matches!(judging(held, detector.pool.verdict), (Some(_), false))
+                matches!(
+                    judging(held, detector.pool.verdict, None, detector.clock_ns),
+                    (Some(_), false)
+                )
             })
         })
     }
@@ -3306,6 +3419,58 @@ mod tests {
         );
         assert_eq!(detector.membership().state(C), None, "C forgotten again");
         assert_eq!(detector.exposure().failures(), 1, "one death, counted once");
+    }
+
+    /// A peer silent before its member's pool configures is still judged (slates, 2026-10-10: a
+    /// peer whose pair and pool estimators both refused was judged by nothing for 4,000 periods).
+    /// Do: on a fresh member of a two-member view, answer its peer's first five probes in about
+    /// 1 ms, far fewer than any estimator configures on, then nothing. Expect: the peer is
+    /// suspected, by a provisional verdict at RFC 6298's timeout, and never condemned (a lone pair
+    /// has no third member to confirm a death). Before, its probes stayed measurement only: alive
+    /// after 600 s simulated.
+    #[test]
+    fn a_peer_silent_before_any_estimate_configures_is_suspected() {
+        const ANSWERED: u32 = 5;
+        let mut detector = detector(&[A]);
+        let mut state = 0x2545_F491_4F6C_DD1D;
+        let mut answered = 0u32;
+        drive_many(
+            &mut detector,
+            MS,
+            600_000 * MS,
+            |_| {
+                answered += 1;
+                (answered <= ANSWERED).then(|| jitter(&mut state))
+            },
+            |_, _, _, _| false,
+            |detector| liveness(detector, A) == Liveness::Suspect,
+        );
+        assert_eq!(detector.pool.verdict, None, "no estimate configured");
+        assert_eq!(
+            liveness(&detector, A),
+            Liveness::Suspect,
+            "the silent peer is suspected"
+        );
+        let verdict = detector.verdict(A).unwrap();
+        assert_eq!(
+            verdict.round_trip.saturating_add(verdict.margin),
+            Duration::from_nanos(MINIMUM_RTO_NS),
+            "at RFC 6298's timeout"
+        );
+        let suspected = detector.clock_ns;
+        drive_many(
+            &mut detector,
+            suspected,
+            suspected + 60_000 * MS,
+            |_| None,
+            |_, _, _, _| false,
+            |_| false,
+        );
+        assert_ne!(
+            liveness(&detector, A),
+            Liveness::Dead,
+            "a lone pair never condemns"
+        );
     }
 
     /// A configured member over near peers A, B and C, and the time its warm-up ended: the member a

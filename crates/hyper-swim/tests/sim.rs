@@ -1031,6 +1031,66 @@ fn stopped_and_refuted(source: Source) -> Result<Record, SimError> {
     Ok(sim.world.finish())
 }
 
+/// One run from `source` of three members whose two peers of member 0 both die once every pair has
+/// answered once, before any pool configures: member 0, its pool fed by nothing more, suspects
+/// both, each by a provisional verdict once silent past RFC 6298's timeout, and condemns neither
+/// (it has no live member's answer to show its own network works).
+fn every_peer_dead_early(source: Source) -> Result<Record, SimError> {
+    let seed = match &source {
+        Source::Seed(seed) => format!("seed {seed}"),
+        Source::Trace(_) => "the trace".to_owned(),
+    };
+    let mut sim = Sim::new(source, false, THREE);
+    sim.run("every pair answered", |sim| {
+        sim.live().all(|(me, member)| {
+            sim.live().filter(|(peer, _)| *peer != me).all(|(peer, _)| {
+                member
+                    .detector
+                    .report(host(peer))
+                    .is_some_and(|report| report.last_answer_ns.is_some())
+            })
+        })
+    });
+    assert!(
+        sim.members[0].detector.pool().verdict.is_none(),
+        "{seed}: member 0's pool configured before the deaths"
+    );
+    sim.kill(NodeId(1));
+    sim.kill(NodeId(2));
+    let suspected = |sim: &Sim, peer: u32| {
+        sim.members[0]
+            .detector
+            .membership()
+            .state(host(NodeId(peer)))
+            .is_some_and(|state| state.liveness == Liveness::Suspect)
+    };
+    sim.run("member 0 suspecting both", |sim| {
+        suspected(sim, 1) && suspected(sim, 2)
+    });
+    for peer in [1, 2] {
+        let report = sim.members[0].detector.report(host(NodeId(peer)));
+        assert!(
+            report.is_some_and(
+                |report| report.judge == Judge::Provisional && report.condemnations == 0
+            ),
+            "{seed}: member 0 suspects {peer} provisionally and condemns it not: {report:?}"
+        );
+    }
+    Ok(sim.world.finish())
+}
+
+/// A member whose every peer dies before its pool configures still judges them (`docs/timing.md`
+/// §2.7, "Before a pair can be judged"): once silent past RFC 6298's timeout a pair is judged
+/// provisionally while the pool has no verdict. Before, nothing judged them: member 0's probes stayed
+/// measurement only, and the world ran out of steps on every seed with both peers alive in its view.
+#[test]
+fn a_member_whose_peers_all_die_early_suspects_them() {
+    for seed in 0..16 {
+        twice(seed, every_peer_dead_early)
+            .unwrap_or_else(|refusal| panic!("seed {seed}: {refusal}"));
+    }
+}
+
 /// A false condemnation is no failure (`docs/timing.md` §2.7, "The margin"): a death counts in a
 /// member's failure history once its record outlives its window unrefuted. Before, every adopted
 /// death counted, the refuted ones too, so each false condemnation shortened the MTBF the margins

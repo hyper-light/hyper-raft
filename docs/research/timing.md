@@ -260,7 +260,41 @@ default; `peer-stale-state-check-interval` sets the check between hibernated pee
 
 **RFC 6298 (Paxson, Allman, Chu, Sargent), Computing TCP's Retransmission Timer.**
 `SRTT`, `RTTVAR` with gains `α = 1/8`, `β = 1/4`; `RTO = SRTT + max(G, K·RTTVAR)`, `K = 4`; `G`
-the clock granularity, a floor under the variance term.
+the clock granularity, a floor under the variance term. Verified against the text on 2026-10-10:
+- (2.1): until an RTT measurement is made, "the sender SHOULD set RTO <- 1 second";
+- (2.2): at the first measurement `R`, `SRTT <- R`, `RTTVAR <- R/2`, `RTO <- SRTT + max(G, K*RTTVAR)`,
+  so `3R` where `2R ≥ G`;
+- (2.3): later, `RTTVAR <- (1 − β)·RTTVAR + β·|SRTT − R'|`, then `SRTT <- (1 − α)·SRTT + α·R'`,
+  "computed using alpha=1/8 and beta=1/4";
+- (2.4): "Whenever RTO is computed, if it is less than 1 second, then the RTO SHOULD be rounded up to
+  1 second", because "a large minimum RTO is needed to keep TCP conservative and avoid spurious
+  retransmissions [AP99]";
+- (2.5): a maximum, if any, at least 60 seconds;
+- §3: Karn's algorithm, no sample from a retransmitted segment, unless the timestamp option names the
+  segment an acknowledgement answers; and "at least one RTT measurement per RTT";
+- (5.5): at each expiry `RTO <- RTO * 2`; a new measurement collapses it again.
+Left open: the timer of an exchange that is sporadic (no measurement per round trip) and of one whose
+samples a nonce names (no ambiguity, as with timestamps).
+
+**RFC 8961 (Allman), Requirements for Time-Based Loss Detection, BCP 233, 2020 (read
+2026-10-10).** "The principles we outline in this document are protocol-agnostic and widely
+applicable" (§3). Requirements (§4):
+- (1): "In the absence of any knowledge about the latency of a path, the initial RTO MUST be
+  conservatively set to no less than 1 second", the second from "the analysis of Internet round-trip
+  times";
+- (2): (a) "The RTO SHOULD be set based on multiple observations of the FT [feedback time] when
+  available"; (b) observations "SHOULD be taken and incorporated into the RTO at least once per RTT"
+  (as frequently as data is exchanged in cases where that happens less frequently); (c) they "MAY be
+  taken from non-data exchanges"; (d) "An RTO mechanism MUST NOT use ambiguous FT samples";
+- (3): loss detected by the timer "MUST be taken as an indication of network congestion";
+- (4): "the value of the RTO MUST be exponentially backed off", with a maximum, if any, not under 60
+  seconds.
+§5: "there is no minimum RTO specified", and implementations use a steady-state minimum under
+RFC 6298's second; "the tension between the responsiveness and correctness of time-based loss
+detection seems to be a fundamental tradeoff". What it settles here: a relayed exchange's samples are
+named by the probe's nonce and so unambiguous, late ones included (2d); an exchange with no
+observation of its path is timed at no less than a second (1); a pair judged while the member's pool
+has refused keeps RFC 6298's minimum (`docs/timing.md` §2.7).
 
 **Microsoft, `timeBeginPeriod` (learn.microsoft.com).** The default timer resolution is
 15.625 ms (64 interrupts a second). Since Windows 10 2004 a request applies to the calling

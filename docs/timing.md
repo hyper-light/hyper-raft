@@ -626,9 +626,26 @@ by pairs with no verdict of their own, and by every pair until it has one; its v
 when a probe needs it. A renewal the estimator refuses leaves the verdict in force, as
 `LinkEstimator::configure` leaves its margin: a stall can make `τ_int` unmeasured again, and the
 first form, which dropped the verdict then, left a probe of a crashed member unjudged (one Linux run
-in three hundred at one CPU). While the pool refuses too, nothing is judged: a probe is measurement
-only, and its period ends when it is answered or at its expected arrival from the latest round trip
-(NFD-E over a window of one), whichever is first. Unanswered then, it is a loss to the estimators
+in three hundred at one CPU). While the pool refuses too, a probe is measurement only, and its
+period ends when it is answered or at its expected arrival from the latest round trip (NFD-E over a
+window of one), whichever is first, until the pair has been silent, from its earliest probe that no
+answer has followed, for RFC 6298's timeout from its latest round trip `R`: `3R` (§2.2), rounded up
+to the RFC's one second (§2.4), and one second where it has none (§2.1; RFC 8961 requirement (1),
+"In the absence of any knowledge about the latency of a path, the initial RTO MUST be conservatively
+set to no less than 1 second"). From then the pair is judged provisionally at that timeout
+(`silent_verdict`), with no bound promised and one relay asked. RFC 8961 lifts §2.4's minimum from a
+timer with several observations of its path; it is kept here because the member's model of its own
+host's stalls, the pool, has refused, so nothing it measured is a timer's evidence. The design
+expected the pool to configure within a few dozen round trips; nothing promised it would. A pair
+silent from the start feeds it nothing (a two-member view whose one peer died early, a member whose
+every peer did), and an estimator refuses while a host's stalls keep its round trips correlated: slates'
+member at load 80 had a pair refuse at 141 samples and its pool at 5, and the peer, silent, was
+judged by nothing for 4,000 periods (2026-10-10). Before its silence reaches the timeout, a pair is
+measured as before, so the start-up measurement phase is unchanged for pairs that answer: a first form
+that judged every pair whenever the pool had none turned that phase into judged periods of a second
+and failed 25 of slates' 81 detector tests. A silent pair gives no samples, so measuring it on has
+nothing to wait for (`a_peer_silent_before_any_estimate_configures_is_suspected`: alive after 600 s
+simulated before; `a_member_whose_peers_all_die_early_suspects_them` in `tests/sim.rs`). Unanswered then, it is a loss to the estimators
 unless its answer comes later; it judges nothing, and its wake measures `G`. Each measurement period
 that ends unanswered doubles the next one's wait, as a retransmission timer backs off (RFC 6298
 §5.5), up to the 60 s at which §2.5 lets the doubling be capped, and a measured round trip ends the

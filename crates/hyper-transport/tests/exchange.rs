@@ -459,6 +459,64 @@ fn a_budget_that_cannot_fund_a_head_refuses_it() {
     assert_eq!(refused, Some((Refusal::Budget, true)));
 }
 
+/// An owner that refuses an exchange it was asked tells the asker why, typed in the stream's reset:
+/// focal holds a sender to its share of the ingress and refuses past it; read as `Closed`, the
+/// refusal said the connection failed, and the asker's pool closed a connection its every other
+/// exchange shared (the audit's F37). The owner that refused it hears nothing more of it.
+#[test]
+fn an_exchange_its_owner_refuses_tells_its_asker_why() {
+    let pair = Pair::new();
+    let mut net = connected::<Mantle, Mantle>(&pair, limits(), 64 << 20);
+    let progress = hyper_transport::Progress::new(PERIOD).unwrap();
+    let body = vec![3u8; 4_000];
+    let exchange = net
+        .a
+        .open(
+            net.now,
+            2,
+            Kind::Get,
+            &[],
+            Some(body.len() as u64),
+            progress,
+        )
+        .unwrap();
+    assert_eq!(net.a.write_body(exchange, &body).unwrap(), body.len());
+    let mut asked = None;
+    net.until(TURNS, |net| {
+        let _ = events(&mut net.a);
+        for event in events(&mut net.b) {
+            if let Event::Request { exchange, .. } = event {
+                asked = Some(exchange);
+            }
+        }
+        asked.is_some()
+    });
+    net.b.refuse_exchange(asked.unwrap(), Refusal::Budget);
+    let mut refused = None;
+    let mut owner_heard = Vec::new();
+    net.until(TURNS, |net| {
+        for event in events(&mut net.b) {
+            if let Event::Refused { exchange, .. } = event {
+                owner_heard.push(exchange);
+            }
+        }
+        for event in events(&mut net.a) {
+            if let Event::Refused {
+                exchange: which,
+                refusal,
+                by_peer,
+            } = event
+            {
+                assert_eq!(which, exchange);
+                refused = Some((refusal, by_peer));
+            }
+        }
+        refused.is_some()
+    });
+    assert_eq!(refused, Some((Refusal::Budget, true)));
+    assert!(owner_heard.is_empty(), "{owner_heard:?}");
+}
+
 /// The exchange table and the lanes are bounded; past the peer's stream limit an exchange waits
 /// its turn instead of being refused (T37).
 #[test]

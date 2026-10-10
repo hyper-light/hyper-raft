@@ -12,8 +12,10 @@
 //! acknowledgements are a heartbeat stream on the member's own clock: probe `k` sent at `s_k`,
 //! answered at `A_k`, so NFD-E's delay `A_k − σ_k` is the probe's round trip, with no second clock
 //! in it. A [`LinkEstimator`] per peer holds its mean, variance, loss, correlation and window, and
-//! [`detector_at`] chooses the margin `α` that minimizes unavailability at the pair's probe
-//! interval. A probe's acknowledgement is due at `s + μ + α`; if none came, the indirect probe asks
+//! [`arrival_detector_at`] chooses the margin `α` that minimizes unavailability at the pair's probe
+//! interval, any margin: a pair's probes never overlap, so each is judged alone, and a false
+//! condemnation is priced at what the owner states it costs
+//! ([`Detector::set_condemnation_cost`]). A probe's acknowledgement is due at `s + μ + α`; if none came, the indirect probe asks
 //! relays, and a probe answered by neither suspects the peer. The period is what its probe needs:
 //! the direct deadline, and the indirect one when the direct passed unanswered (SWIM §3.1: the
 //! protocol's properties hold for the average period).
@@ -78,8 +80,8 @@ use std::num::NonZeroUsize;
 use std::time::Duration;
 
 use hyper_timing::{
-    Costs, Exposure, Floors, LinkBehaviour, LinkEstimator, Refusal, Schedule, Wakes, detector_at,
-    mistake_bound,
+    Arrivals, Costs, Exposure, LinkBehaviour, LinkEstimator, Refusal, Schedule, Wakes,
+    arrival_detector_at, lateness_bound,
 };
 
 use crate::HostId;
@@ -377,16 +379,22 @@ impl Stream {
         self.verdict.is_none() || self.samples.saturating_sub(self.configured_at) >= self.renewal
     }
 
-    /// Configures the verdict from the estimates as they stand. A refusal leaves the verdict in
-    /// force, as `LinkEstimator::configure` leaves its margin: a stall can make `τ_int` unmeasured
-    /// again, and a probe that went unjudged then would suspect nobody.
-    fn configure(&mut self, mtbf: Option<Duration>, floors: &Floors, interval: Duration) {
+    /// Configures the verdict from the estimates as they stand ([`verdict`]). A refusal leaves the
+    /// verdict in force, as `LinkEstimator::configure` leaves its margin: a stall can make `τ_int`
+    /// unmeasured again, and a probe that went unjudged then would suspect nobody.
+    fn configure(
+        &mut self,
+        mtbf: Option<Duration>,
+        granularity: Duration,
+        interval: Duration,
+        condemnation_cost: Duration,
+    ) {
         let Some(estimator) = self.estimator.as_ref() else {
             return;
         };
         self.configured_at = self.samples;
         self.renewal = estimator.estimates().window.length;
-        if let Ok(renewed) = verdict(estimator, mtbf, floors, interval) {
+        if let Ok(renewed) = verdict(estimator, mtbf, granularity, interval, condemnation_cost) {
             self.verdict = Some(renewed);
         }
     }
@@ -689,6 +697,9 @@ pub struct Detector {
     /// The owner's detection budget, nanoseconds: the longest it may take this member to declare a
     /// dead member. What sets the period floor ([`Detector::period_floor_ns`]).
     detection_budget_ns: u64,
+    /// What the owner's response to a death costs it ([`Detector::set_condemnation_cost`]): the
+    /// price of a false condemnation in every verdict's margin.
+    condemnation_cost: Duration,
     membership: Membership,
     local: HostId,
     order: Vec<HostId>,
@@ -816,7 +827,7 @@ impl Detector {
     /// nanoseconds. `detection_budget` is the longest the owner may wait for this member to declare
     /// a dead member, its requirement (Chen, Toueg and Aguilera's `T_D^U`): a judged period lasts at
     /// least the share of it the detection bound spends on one period
-    /// ([`Detector::period_floor_ns`]), so an idle member probes at the pace its owner needs and not
+    /// (`docs/timing.md` §2.7), so an idle member probes at the pace its owner needs and not
     /// at its round trip's. Zero leaves every period at what its probe needs.
     pub fn new(
         local: HostId,
@@ -827,6 +838,7 @@ impl Detector {
     ) -> Detector {
         Detector {
             detection_budget_ns: nanos(detection_budget),
+            condemnation_cost: Duration::ZERO,
             membership: Membership::new(local, members),
             local,
             order: Vec::new(),
@@ -899,7 +911,7 @@ impl Detector {
 
     /// When to [`poll`](Detector::poll) next, on the caller's clock: the probe's deadline, or the
     /// indirect probe's once asked, or a measurement probe's expected arrival, never before the
-    /// period floor's end ([`Probe::rests_until`]) unless the deadline asks relays. `None` before
+    /// period floor's end unless the deadline asks relays. `None` before
     /// the first poll.
     pub fn wake(&self) -> Option<u64> {
         let probe = self.probe?;
@@ -915,6 +927,16 @@ impl Detector {
             probe.indirect_until.or_else(|| probe.due_ns())
         };
         Some(ends.map_or(probe.rests_until, |at| at.max(probe.rests_until)))
+    }
+
+    /// States what the owner's response to a death costs it, as the unavailability it causes:
+    /// slates', a retirement and the takeovers it starts. A false condemnation costs that, so each
+    /// verdict configured from now on charges it to every probe at the probe's bound, beside a
+    /// false suspicion's refutation, and its margin is the wider for it; a verdict in
+    /// force keeps its margin until it is renewed. Zero, the default, prices a false condemnation as
+    /// a false suspicion: an owner that takes no action on a death.
+    pub fn set_condemnation_cost(&mut self, cost: Duration) {
+        self.condemnation_cost = cost;
     }
 
     /// The least a judged period of this member lasts, nanoseconds: the detection budget's share of
@@ -1421,6 +1443,7 @@ impl Detector {
         let measure = self.granularity().zip(self.periods.mean_ns());
         let interval = measure.map(|(_, period)| self.pair_interval(period));
         let mtbf = self.exposure.mtbf();
+        let condemnation_cost = self.condemnation_cost;
         let Some(peer) = self.peers.get_mut(&from) else {
             return;
         };
@@ -1442,7 +1465,8 @@ impl Detector {
         if let Some(((granularity, period), interval)) = measure.zip(interval) {
             peer.stream.take(sent.seq, rtt, granularity, interval);
             if peer.stream.due() {
-                peer.stream.configure(mtbf, &floors(granularity), interval);
+                peer.stream
+                    .configure(mtbf, granularity, interval, condemnation_cost);
                 peer.report.configured = peer.stream.verdict.is_some();
                 if let Some(verdict) = peer.stream.verdict {
                     self.longest_span = self.longest_span.max(verdict.span_ns());
@@ -1474,8 +1498,12 @@ impl Detector {
             && let Some((granularity, period)) = self.granularity().zip(self.periods.mean_ns())
         {
             let interval = self.pair_interval(period);
-            self.pool
-                .configure(self.exposure.mtbf(), &floors(granularity), interval);
+            self.pool.configure(
+                self.exposure.mtbf(),
+                granularity,
+                interval,
+                self.condemnation_cost,
+            );
             if let Some(verdict) = self.pool.verdict {
                 self.longest_span = self.longest_span.max(verdict.span_ns());
             }
@@ -2067,47 +2095,50 @@ fn feed(
     estimator.on_heartbeat(seq, arrival).map(|_| ())
 }
 
-/// The floors under a verdict: the member's granularity `G`, and the sender's `E[flush] + G = G`
-/// (an acknowledgement is not flushed). The suspicion's margin holds one probe: SWIM judges each
-/// probe on its own, and the condemnation that follows is the multi-probe rule
-/// (`docs/timing.md` §2.7), so no correlation time enters.
-fn floors(granularity: Duration) -> Floors {
-    Floors {
-        granularity,
-        sender: granularity,
-        correlation: Duration::MAX,
-    }
-}
-
-/// The verdict for a probe stream: the margin minimizing unavailability at the pair's interval,
-/// where a false suspicion costs the time until it is refuted — the pair's next probe, which
-/// carries it, answered: `η + μ` — and a crash costs its detection.
+/// The verdict for a probe stream: the margin minimizing unavailability at the pair's interval
+/// (`docs/timing.md` §2.7, "The margin"). A false suspicion costs the time until it is refuted, the
+/// pair's next probe, which carries it, answered: `η + μ`. A false condemnation costs the owner's
+/// response to a death, `condemnation_cost`, and comes at most as often as a live peer's probe and
+/// the one before both miss, which Fréchet's bound puts at the lesser of their two bounds, so each
+/// probe is charged `(η + μ + condemnation_cost)·β`. A crash costs its detection.
+///
+/// A pair's probes never overlap: a judged period runs to its probe's deadline, so the next probe
+/// of the pair is sent after it. The bound on a live peer's probe missing its deadline is therefore
+/// one Cantelli factor at any margin, `β = p + (1 − p)·V/(V + α²)` (Theorem 7's with one probe
+/// fresh), and the margin is searched over every margin: the per-arrival configurator
+/// (`hyper_timing::arrival_detector_at`) with the round trip's lateness measured from its mean and
+/// the loss in place of the unseen share. Theorem 7's product capped the margin at `η − G` to keep
+/// one factor, and early on, `η` drawn from measurement periods, the cap held a verdict at a bound
+/// of 0.713 (slates, 2026-10-10: `η` about 500 µs, `G` 375 µs, the margin 125 µs).
 fn verdict(
     estimator: &LinkEstimator,
     mtbf: Option<Duration>,
-    floors: &Floors,
+    granularity: Duration,
     interval: Duration,
+    condemnation_cost: Duration,
 ) -> Result<Verdict, Refusal> {
     let link: LinkBehaviour = estimator.behaviour()?;
     let mtbf = mtbf.ok_or(Refusal::Unconfigurable)?;
     let costs = Costs {
-        election: interval.saturating_add(link.mean_delay),
+        election: interval
+            .saturating_add(link.mean_delay)
+            .saturating_add(condemnation_cost),
         mtbf,
     };
-    let configured = detector_at(&link, &costs, floors, interval).ok_or(Refusal::Unconfigurable)?;
-    let variance = link.delay_deviation.as_secs_f64().powi(2);
-    let mistake = mistake_bound(
-        link.loss,
-        variance,
-        interval.as_secs_f64(),
-        configured.margin.as_secs_f64(),
-    );
+    let probes = Arrivals {
+        unseen: link.loss,
+        lateness: Duration::ZERO,
+        deviation: link.delay_deviation,
+        mean_delay: link.mean_delay,
+    };
+    let configured = arrival_detector_at(&probes, &costs, granularity, interval)
+        .ok_or(Refusal::Unconfigurable)?;
     Ok(Verdict {
         round_trip: link.mean_delay,
         margin: configured.margin,
         interval,
         loss: link.loss,
-        mistake,
+        mistake: lateness_bound(&probes, configured.margin),
     })
 }
 
@@ -2385,8 +2416,9 @@ mod tests {
         assert_eq!(refused.err(), Some(Refusal::TooFewHeartbeats));
         stream.configure(
             Some(Duration::from_secs(60)),
-            &floors(g),
+            g,
             Duration::from_millis(30),
+            Duration::ZERO,
         );
         assert_eq!(stream.verdict, Some(in_force));
     }
@@ -2696,10 +2728,23 @@ mod tests {
         assert!(verdict.round_trip >= Duration::from_millis(1));
         assert!(verdict.round_trip <= Duration::from_micros(1_500));
         assert!(verdict.mistake > 0.0 && verdict.mistake < 1.0);
-        assert!(verdict.margin < verdict.interval, "one probe in the margin");
         // G is the lateness of the wakes: the world's, or less where an answer woke it first.
         let g = detector.granularity().unwrap();
         assert!(g > Duration::ZERO && g <= Duration::from_nanos(world.late));
+        // The pair's next probe goes no sooner than this one's deadline: its probes never overlap,
+        // so the bound on one missing holds at any margin (`verdict`).
+        let due = ping.due_ns.unwrap();
+        let sent = world.pings.len();
+        let mut state = 5;
+        // One period at a time, so the latest probe is the first of the pair's after this one.
+        while !world.pings[sent..].iter().any(|next| next.to == ping.to) {
+            world.run(&mut detector, 0, |_| Some(jitter(&mut state)));
+        }
+        let next = detector.probe.unwrap().sent_ns;
+        assert!(
+            next >= due,
+            "the pair's next probe went at {next}, before {due}"
+        );
     }
 
     #[test]
@@ -2872,6 +2917,108 @@ mod tests {
         assert!(
             detector.poll(MS, &mut requests).is_some(),
             "the next probe goes at the answer"
+        );
+    }
+
+    /// A fleet whose nodes fail once an hour, as `docs/timing.md` §3 item 11 seeds one: a thousand
+    /// failures over a thousand hours of node time.
+    fn hourly_fleet() -> Exposure {
+        let mut history = Exposure::new();
+        history.on_exposure(Duration::from_secs(3_600 * 1_000));
+        for _ in 0..1_000 {
+            history.on_failure();
+        }
+        history
+    }
+
+    /// A member over A, B and C seeded with [`hourly_fleet`], run until its pool first configures,
+    /// everyone answering in about 1 ms; with the pool's estimator, the member's `G`, the pair
+    /// interval and the MTBF as they stand.
+    fn pooled_at_first() -> (Detector, Duration, Duration, Duration) {
+        let mut detector = Detector::new(LOCAL, hourly_fleet(), room(), RESOLUTION, Duration::ZERO);
+        for peer in [A, B, C] {
+            detector.join(peer).unwrap();
+        }
+        let mut state = 0x2545_F491_4F6C_DD1D;
+        drive_many(
+            &mut detector,
+            MS,
+            600_000 * MS,
+            |_| Some(jitter(&mut state)),
+            |_, _, _, _| false,
+            |detector| detector.pool.verdict.is_some(),
+        );
+        let granularity = detector.granularity().unwrap();
+        let interval = detector.pair_interval(detector.periods.mean_ns().unwrap());
+        let mtbf = detector.exposure.mtbf().unwrap();
+        (detector, granularity, interval, mtbf)
+    }
+
+    /// `U` (§2.2) of a probe verdict at margin `alpha`, seconds: a crash detected within
+    /// `μ + α + η` and then the cost `cost`, once an MTBF, and a mistake costing `cost`, at most one
+    /// a probe of the pair, with chance at most `β = p + (1 − p)·V/(V + α²)`.
+    fn unavailability(link: &LinkBehaviour, mtbf: f64, cost: f64, eta: f64, alpha: f64) -> f64 {
+        let mean = link.mean_delay.as_secs_f64();
+        let variance = link.delay_deviation.as_secs_f64().powi(2);
+        let beta = if alpha > 0.0 {
+            link.loss + (1.0 - link.loss) * variance / (variance + alpha * alpha)
+        } else {
+            1.0
+        };
+        (mean + alpha + eta + cost) / mtbf + cost * beta / eta
+    }
+
+    /// A verdict's margin is the one minimizing `U` over every margin (slates, 2026-10-10: a verdict
+    /// with mistake bound 0.713 was in force, its margin held at `η − G`, 125 µs, by the cap that
+    /// kept Theorem 7's product to one factor; a pair's probes never overlap, so one factor holds at
+    /// any margin). Do: seed a member with a fleet failing once an hour, run it until its pool
+    /// first configures, and configure a verdict from the pool's estimates as they stand. Expect: no
+    /// margin a granularity wider costs less. Before, the margin was held under the interval while
+    /// `U` still fell past it.
+    #[test]
+    fn a_verdict_s_margin_is_not_held_under_its_interval() {
+        let (detector, granularity, interval, mtbf) = pooled_at_first();
+        let estimator = detector.pool.estimator.as_deref().unwrap();
+        let configured =
+            verdict(estimator, Some(mtbf), granularity, interval, Duration::ZERO).unwrap();
+        let link = estimator.behaviour().unwrap();
+        let eta = interval.as_secs_f64();
+        let cost = eta + link.mean_delay.as_secs_f64();
+        let u = |alpha: f64| unavailability(&link, mtbf.as_secs_f64(), cost, eta, alpha);
+        let alpha = configured.margin.as_secs_f64();
+        let wider = alpha + granularity.as_secs_f64();
+        assert!(
+            u(wider) >= u(alpha),
+            "a margin {granularity:?} wider costs less: U({wider}) = {} < U({alpha}) = {}, \
+             interval {interval:?}",
+            u(wider),
+            u(alpha)
+        );
+        assert!(
+            configured.margin > interval,
+            "an hourly fleet's margin is past one interval: {configured:?}"
+        );
+    }
+
+    /// A stated condemnation cost widens the margin: a false condemnation costs the owner its
+    /// response to a death, and a live peer's two probes both miss with chance at most the lesser of
+    /// their bounds (Fréchet), so the verdict charges each probe that cost at its bound. Do: from
+    /// the same estimates as above, configure with no condemnation cost and with one equal to a
+    /// false suspicion's own cost (`η + μ`, so a mistake costs twice as much). Expect: the priced
+    /// verdict's margin is wider and its bound lower. Before, the cost was not priced: the same
+    /// verdict.
+    #[test]
+    fn a_stated_condemnation_cost_widens_the_margin() {
+        let (detector, granularity, interval, mtbf) = pooled_at_first();
+        let estimator = detector.pool.estimator.as_deref().unwrap();
+        let link = estimator.behaviour().unwrap();
+        let suspicion = interval.saturating_add(link.mean_delay);
+        let unpriced =
+            verdict(estimator, Some(mtbf), granularity, interval, Duration::ZERO).unwrap();
+        let priced = verdict(estimator, Some(mtbf), granularity, interval, suspicion).unwrap();
+        assert!(
+            priced.margin > unpriced.margin && priced.mistake < unpriced.mistake,
+            "priced {priced:?} against unpriced {unpriced:?}"
         );
     }
 

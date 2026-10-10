@@ -84,8 +84,9 @@ wire's loss in place of the skipped slots and the cap kept, `U`'s mistake term s
 in 1,294 of the 1,475 Linux pairs (283 of 312 on macOS); without the cap, a margin brought it below
 one in 534 of them with the skipped slots as losses (253 on macOS) and in 1,377 with the wire's loss
 (306). The per-arrival bound has neither: each freshness point is judged by the one heartbeat that
-ends its gap. SWIM's probe detector (§2.7) keeps Theorem 7's product for its probes,
-each answered or not within its period (`qos::detector_at`).
+ends its gap. SWIM's probe detector (§2.7) judges each probe alone too, by the same one factor:
+a pair's probes never overlap, so the margin it held under `η − G` to keep Theorem 7's product to
+one factor went the same way (2026-10-10).
 
 **What it minimizes.** Chen et al. configure `η` and `α` from requirements an application states.
 hyper-raft has no such application, and a requirement it chose would be a constant it picked.
@@ -464,7 +465,7 @@ average period (§3.1). The pair's interval is the mean round, `η = m·T̄`, wi
 mean period.
 
 **Each period's probe.** The acknowledgement of a probe sent at `s` is due at `s + μ + α`: `μ` the
-window's mean round trip, `α` the margin `detector_at` chooses at `η`. Unanswered then, the relays
+window's mean round trip, `α` the margin chosen at `η` (below). Unanswered then, the relays
 are asked, and their answers are due after the slowest relay's own span `μ + α` (the leg to it and
 back) plus the target's (the relay's leg to the target, whose stalls are the target's own, §2.6). A
 probe answered by neither suspects its target. The period ends at the direct deadline, or the
@@ -474,12 +475,29 @@ least three round trips" rule of thumb (§3.1) by the measured deadlines.
 **The margin.** `α` minimizes `U` (§2.2) at the pair's interval, with:
 - a false suspicion costing the time until it is refuted: the member's next probe of the peer
   carries it (the buddy system) and its answer carries the refutation, `η + μ`;
+- a false condemnation costing what the owner's response to a death costs it, `C`, which the owner
+  states (`Detector::set_condemnation_cost`; slates': a retirement and the takeovers it starts). A
+  live peer is condemned only when a probe and the one before both miss, which Fréchet's bound puts
+  at the lesser of their two bounds (below), so each probe is charged `(η + μ + C)·β`. Priced as a
+  suspicion's refutation alone, the margin ignored what acting on a death costs, and a verdict whose
+  bound was 0.713 promised a condemnation of a live peer at most as unlikely (slates, 2026-10-10);
 - the MTBF from the member's `Exposure` fold, the node time it watched and the deaths it learned,
   seeded with the fleet's history by the owner (Jeffreys' `2T` before the first failure);
-- the floors `G` (§2.4, measured) and the sender's `E[flush] + G = G`, since an acknowledgement
-  is not flushed;
-- one probe in the margin (`α < η`): SWIM judges each probe on its own, and Theorem 7's single
-  factor `β = (V + p·α²)/(V + α²)` needs no independence between probes.
+- the floor `G` (§2.4, measured), the search's resolution;
+- any margin. A pair's probes never overlap: a judged period runs to its probe's deadline, and the
+  pair's next probe is sent after the period ends, so the bound on a live peer's probe missing is
+  one factor at any margin, `β = p + (1 − p)·V/(V + α²)`, Theorem 7's with one probe fresh and
+  Cantelli's inequality on the round trip's lateness past its mean, needing no independence between
+  probes. The margin is the per-arrival configurator's (§2.2, `arrival_detector_at`), the round
+  trip's lateness from its mean and the loss in place of the unseen share. The first form held the
+  margin under `η − G` to keep Theorem 7's product to that one factor, with `η` the round of the
+  member's mean period so far: early on, measurement periods a round trip long drew `η` down, and
+  the cap held slates' verdict at `α` = 125 µs (`η` about 500 µs, `G` 375 µs on macOS), a bound of
+  0.713 in force until a window of samples renewed it, while two condemnations of a live member
+  passed under it. Without the cap, an hourly fleet's first verdict in the simulation takes a 37.9
+  ms margin where the cap held it at 1.49 ms (`a_verdict_s_margin_reaches_past_its_interval_where_unavailability_falls`;
+  `a_verdict_s_margin_is_not_held_under_its_interval`, `a_stated_condemnation_cost_widens_the_margin`).
+  hyper-liveness's node-pair stream had left the same cap for the same reason (§2.8).
 
 `β` is the configured bound on a live peer missing a probe's deadline; the member reports `Σβ` over
 its judged probes as the expected number of suspicions of a live peer it allows.

@@ -134,6 +134,15 @@
     times a second a member, each period ending at its probe's deadline. Measurement and provisional
     periods are not floored. `PeerReport::judge` states what judges a pair now.
 
+15. **The margin is searched over every margin, and a false condemnation is priced**
+    (`docs/timing.md` §2.7, "The margin"). A pair's probes never overlap, so the bound on one missing
+    is one Cantelli factor at any margin, and the verdict is the per-arrival configurator's
+    (`hyper_timing::arrival_detector_at`); Theorem 7's product, capped at `η − G` to keep one
+    factor, held slates' verdict at a bound of 0.713. The owner states what its response to a death
+    costs (`Detector::set_condemnation_cost`), and each probe is charged it at its bound beside a
+    suspicion's refutation. hyper-timing's capped configurator (`detector_at`, `Floors`) had no
+    other user and went with it.
+
 The wire changed in place with 8 and 11: a probe and an answer carry entries of the existing gossip
 encoding, which a receiver of the earlier form applies as any gossip, and `Sync` is a new tag with
 its own golden vector. No consumer runs hyper-swim yet (slates' session owns its integration), so

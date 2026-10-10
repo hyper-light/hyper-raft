@@ -66,13 +66,26 @@ const FAR_JITTER_NS: u64 = 100_000;
 const WATCHED_NS: u64 = 30_000_000_000;
 
 /// A cluster's topology: its members, which of them sit across the far path from the rest, the
-/// steps its run may take, and the detection budget its members' owners state (zero for none).
+/// steps its run may take, the detection budget its members' owners state (zero for none), and
+/// whether the owners seed each detector with an hourly fleet's failure history.
 #[derive(Clone, Copy, Debug)]
 struct Shape {
     nodes: u32,
     far: &'static [u32],
     steps: u64,
     budget: Duration,
+    hourly: bool,
+}
+
+/// A fleet whose nodes fail once an hour, as `docs/timing.md` §3 item 11 seeds one: a thousand
+/// failures over a thousand hours of node time.
+fn hourly_fleet() -> Exposure {
+    let mut history = Exposure::new();
+    history.on_exposure(Duration::from_secs(3_600 * 1_000));
+    for _ in 0..1_000 {
+        history.on_failure();
+    }
+    history
 }
 
 /// The LAN cluster every member of which is one switch from the others.
@@ -81,6 +94,7 @@ const LAN_CLUSTER: Shape = Shape {
     far: &[],
     steps: STEPS,
     budget: Duration::ZERO,
+    hourly: false,
 };
 
 /// slates' far-link repro: two near members, four 100 ms one way from them. Its steps: four times the
@@ -90,6 +104,7 @@ const FAR_LINK: Shape = Shape {
     far: &[2, 3, 4, 5],
     steps: 4 * FAR_STEPS_TAKEN,
     budget: Duration::ZERO,
+    hourly: false,
 };
 
 /// The most steps a named seed's far-link or all-far run took: 26,058, seed 43's far-link run until
@@ -103,6 +118,7 @@ const ALL_FAR: Shape = Shape {
     far: &[2],
     steps: 4 * FAR_STEPS_TAKEN,
     budget: Duration::ZERO,
+    hourly: false,
 };
 
 impl Shape {
@@ -217,9 +233,14 @@ impl Member {
     fn new(me: NodeId, shape: Shape) -> Self {
         let members = NonZeroUsize::new(shape.nodes as usize).unwrap();
         // The world's clocks read whole nanoseconds.
+        let history = if shape.hourly {
+            hourly_fleet()
+        } else {
+            Exposure::new()
+        };
         let mut detector = Detector::new(
             host(me),
-            Exposure::new(),
+            history,
             members,
             Duration::from_nanos(1),
             shape.budget,
@@ -791,6 +812,47 @@ fn budgeted(source: Source) -> Result<Record, SimError> {
 fn a_member_under_a_detection_budget_probes_no_faster_than_its_floor() {
     for seed in 0..16 {
         twice(seed, budgeted).unwrap_or_else(|refusal| panic!("seed {seed}: {refusal}"));
+    }
+}
+
+/// The LAN cluster, each member's owner seeding its detector with an hourly fleet's history.
+const HOURLY_LAN: Shape = Shape {
+    hourly: true,
+    ..LAN_CLUSTER
+};
+
+/// One run from `source` of the LAN cluster seeded with an hourly fleet's history: once every pair
+/// is judged by a verdict that rests (the pool's or its own), every verdict's margin is past its
+/// interval, where `U` falls (an hour's MTBF against round trips of about half a millisecond); then
+/// the LAN run's kill and checks.
+fn hourly(source: Source) -> Result<Record, SimError> {
+    let seed = match &source {
+        Source::Seed(seed) => format!("seed {seed}"),
+        Source::Trace(_) => "the trace".to_owned(),
+    };
+    let mut sim = Sim::new(source, false, HOURLY_LAN);
+    sim.run("every pair judged", Sim::every_pair_judged_at_floor);
+    for (me, member) in sim.live() {
+        for (peer, _) in sim.live().filter(|(peer, _)| *peer != me) {
+            let verdict = member.detector.verdict(host(peer));
+            assert!(
+                verdict.is_some_and(|verdict| verdict.margin > verdict.interval),
+                "{seed}: member {me:?} judges {peer:?} by {verdict:?}, its margin under its interval"
+            );
+        }
+    }
+    kill_and_hold_dead_within_bounds(sim, &seed)
+}
+
+/// A verdict's margin is searched over every margin, not only below the pair's interval: a pair's
+/// probes never overlap, so the one-probe bound holds at any margin (`docs/timing.md` §2.7, "The
+/// margin"). Before, the margin was held under `η − G` to keep Theorem 7's product to one factor,
+/// and a member seeded with an hourly fleet judged its peers with margins under their interval on
+/// every seed (slates saw that cap hold a verdict at a mistake bound of 0.713).
+#[test]
+fn a_verdict_s_margin_reaches_past_its_interval_where_unavailability_falls() {
+    for seed in 0..16 {
+        twice(seed, hourly).unwrap_or_else(|refusal| panic!("seed {seed}: {refusal}"));
     }
 }
 

@@ -55,6 +55,15 @@ source: its credit law (`flow.rs`, `connection.rs`) is taken here. Neither repos
 
 ## Departures found while porting
 
+- **The peer's time to answer begins when it has the request** (2026-10-10). The asking phase ended
+  a period after everything owed had been *sent*. On a slow path a bottleneck's queue holds the last
+  window for seconds after it leaves, so the peer's period ran out before it had the request: focal's
+  `a_peers_time_to_answer_begins_when_it_has_what_was_asked`, 32 KiB over 64 kbit/s answered 400 ms
+  after arrival, was refused at 4.5 s, as it was in focal before its audit's F38. Once sent whole, a
+  request is now charged with what the peer acknowledges (hyper-quic patch Q6), and the answer period
+  begins when QUIC reports the stream acknowledged whole (`StreamEvent::Finished`;
+  `a_peers_time_to_answer_begins_when_it_has_the_request`,
+  `a_request_in_the_network_is_waited_on_while_the_peer_acknowledges_it`).
 - **What is sent into silence is not progress.** focal's `carried` charged a period with the bytes
   the connection sent and did not find lost. After a peer dies the sender still sends: the flight in
   the air, then the probe timeout's probes, a datagram or two each at a doubling backoff, so every

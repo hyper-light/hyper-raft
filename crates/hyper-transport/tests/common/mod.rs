@@ -348,9 +348,46 @@ impl<A: Drive, B: Drive> Net<A, B> {
         Self::of(now, a, b, hyper_sim::Source::Seed(0))
     }
 
+    /// The network with `a`'s datagrams to `b` through a bottleneck that serializes
+    /// `rate_bits_per_second` and holds `queue_bytes`, `one_way` beyond it, and `b`'s to `a` in
+    /// `one_way`: what `a` sends waits in the queue after it has left `a`.
+    pub fn shaped(
+        now: Instant,
+        a: A,
+        b: B,
+        rate_bits_per_second: u64,
+        queue_bytes: u64,
+        one_way: Duration,
+    ) -> Self {
+        let mut net = Self::with_links(now, a, b, hyper_sim::Source::Seed(0), 1);
+        let one_way = u64::try_from(one_way.as_nanos()).unwrap();
+        let link = net
+            .wire
+            .add_link(hyper_sim::net::Link::drop_tail(
+                rate_bits_per_second,
+                queue_bytes,
+            ))
+            .unwrap();
+        net.wire
+            .set_pair_path(
+                A,
+                B,
+                hyper_sim::net::Path::in_order(one_way, 0).through(link),
+            )
+            .unwrap();
+        net.wire
+            .set_pair_path(B, A, hyper_sim::net::Path::in_order(one_way, 0))
+            .unwrap();
+        net
+    }
+
     /// The network with its world's decisions drawn from `source`: the zero path draws none, and
     /// the run-twice check ([`twice_on`]) holds it to that.
     pub fn of(now: Instant, a: A, b: B, source: hyper_sim::Source) -> Self {
+        Self::with_links(now, a, b, source, 0)
+    }
+
+    fn with_links(now: Instant, a: A, b: B, source: hyper_sim::Source, links: usize) -> Self {
         let limits = hyper_sim::Limits {
             events: 1 << 12,
             nodes: 2,
@@ -364,9 +401,9 @@ impl<A: Drive, B: Drive> Net<A, B> {
         world.node(hyper_sim::Clock::default()).unwrap();
         let wire = hyper_sim::net::Net::new(hyper_sim::net::NetLimits {
             flows: 2,
-            links: 0,
+            links,
             nats: 0,
-            link_messages: 0,
+            link_messages: if links == 0 { 0 } else { 1 << 12 },
             messages: 1 << 12,
             bytes: 1 << 26,
         });
@@ -481,11 +518,21 @@ impl<A: Drive, B: Drive> Net<A, B> {
         self.now = self.now.max(to);
     }
 
-    /// Fires the earliest timer of either side, moving the clock to it.
+    /// When the earliest datagram in flight arrives, by the caller's clock: what a move of the
+    /// clock may not pass.
+    fn in_flight(&self) -> Option<Instant> {
+        self.world
+            .earliest()
+            .map(|at| self.start + Duration::from_nanos(at))
+    }
+
+    /// Fires the earliest timer of either side, or delivers the earliest datagram in flight,
+    /// moving the clock to it.
     pub fn advance(&mut self) -> bool {
         let next = [
             self.a.timeout(),
             if self.b_dead { None } else { self.b.timeout() },
+            self.in_flight(),
         ]
         .into_iter()
         .flatten()
@@ -507,6 +554,7 @@ impl<A: Drive, B: Drive> Net<A, B> {
         let next = [
             self.a.timeout(),
             if self.b_dead { None } else { self.b.timeout() },
+            self.in_flight(),
         ]
         .into_iter()
         .flatten()
@@ -636,6 +684,8 @@ struct Served {
     /// The reply body written so far, and its length.
     written: u64,
     reply: u64,
+    /// When the request was whole, by the server's `now`.
+    whole: Option<Instant>,
 }
 
 /// A node that answers every request: it reads the request's body, checking every byte, and
@@ -644,6 +694,10 @@ struct Served {
 pub struct Server {
     served: Vec<Served>,
     pub hold_bulk: bool,
+    /// How long the server takes to answer once it has a request whole, by `now`.
+    pub think: Duration,
+    /// The clock the think time is read against, as the test last set it.
+    pub now: Option<Instant>,
     pub answered: u64,
     pub frames: Vec<(PeerId, u32, Vec<u8>)>,
     pub connected: Vec<PeerId>,
@@ -658,6 +712,8 @@ impl Server {
         Self {
             served: Vec::new(),
             hold_bulk: false,
+            think: Duration::ZERO,
+            now: None,
             answered: 0,
             frames: Vec::new(),
             connected: Vec::new(),
@@ -705,6 +761,7 @@ impl Server {
                     replied: false,
                     written: 0,
                     reply: body.unwrap_or(0),
+                    whole: None,
                 });
             }
             Event::Frame {
@@ -769,6 +826,16 @@ impl Server {
             let mut empty = hyper_transport::Reservation::default();
             let _ = node.read_body(served.exchange, &mut empty);
             if !node.body_complete(served.exchange) {
+                return false;
+            }
+        }
+        if !served.replied && !self.think.is_zero() {
+            // The request is whole: the answer is given once the server has thought.
+            let Some(now) = self.now else {
+                return false;
+            };
+            let whole = *served.whole.get_or_insert(now);
+            if now < whole + self.think {
                 return false;
             }
         }

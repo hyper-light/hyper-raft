@@ -607,6 +607,76 @@ fn a_peer_that_stops_answering_is_given_up_within_its_period() {
     assert_eq!(net.a.exchange_tail(2, GRANULARITY), Some(tail * 2));
 }
 
+/// The peer's time to answer begins when it has the request (focal's audit F38), not when this side
+/// sent it: a request that waits in a bottleneck's queue for longer than a period after it was sent
+/// is answered by a peer that takes four fifths of a period once it has it. Counted from the send,
+/// the period began while the last of the request was still in the queue, and ended before the peer
+/// had it.
+#[test]
+fn a_peers_time_to_answer_begins_when_it_has_the_request() {
+    const PIECE_OF_TIME: Duration = Duration::from_millis(10);
+    let pair = Pair::new();
+    let now = hyper_sim::Anchor::new().instant(0).unwrap();
+    let a = pair.node::<Mantle>(
+        1,
+        Role::Node,
+        pair.book(Role::Node, Role::Node),
+        limits(),
+        256 << 20,
+        now,
+    );
+    let b = pair.node::<Mantle>(
+        2,
+        Role::Node,
+        pair.book(Role::Node, Role::Node),
+        limits(),
+        256 << 20,
+        now,
+    );
+    // 64 kbit/s from a to b, its queue holding all of a 32 KiB request: a carries it in four
+    // seconds, and its last window leaves a seconds before b has it.
+    let mut net = Net::shaped(now, a, b, 64_000, 64 * 1024, PIECE_OF_TIME);
+    let address = net.b_address;
+    net.a.connect(now, 2, address).unwrap();
+    net.until(TURNS, |net| {
+        let a = events(&mut net.a)
+            .iter()
+            .any(|event| matches!(event, Event::Connected { .. }));
+        let _ = events(&mut net.b);
+        a
+    });
+    let period = Duration::from_millis(500);
+    let (mut asker, mut server) = (Asker::new(), Server::new());
+    server.think = period * 4 / 5;
+    let began = net.now;
+    asker
+        .ask(
+            &mut net.a,
+            net.now,
+            2,
+            (Kind::Get, Class::Request),
+            1,
+            Some(32 * 1024),
+            period,
+        )
+        .unwrap();
+    for _ in 0..TURNS {
+        net.exchange();
+        asker.drive(&mut net.a);
+        server.now = Some(net.now);
+        server.serve(&mut net.b);
+        if asker.finished() {
+            break;
+        }
+        net.exchange();
+        net.advance_within(PIECE_OF_TIME);
+    }
+    assert!(asker.finished());
+    assert_eq!(asker.asked[0].refused, None, "{:?}", asker.asked[0]);
+    let took = net.now - began;
+    assert!(took >= Duration::from_secs(4), "{took:?}");
+}
+
 /// Replication frames on lanes arrive in order, each lane on its own stream; a lane is as wide as
 /// the core's window, and the lanes to a peer are bounded.
 #[test]

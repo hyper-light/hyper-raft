@@ -404,6 +404,7 @@ fn moved<R>(conn: &Conn<R>, rank: u8) -> Moved {
     let stats = conn.quic.stats();
     Moved {
         sent: stats.udp_tx.bytes.saturating_sub(stats.path.lost_bytes),
+        acked: stats.path.acked_bytes,
         received: stats.udp_rx.bytes,
         delivered: conn.delivered.from(rank),
     }
@@ -1397,7 +1398,16 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
                 }
             }
             StreamEvent::Available { dir: Dir::Bi } => conn.credit_moved = Some(now),
-            StreamEvent::Finished { .. } | StreamEvent::Available { .. } => {}
+            // Every byte of the message on the stream acknowledged: the peer has it.
+            StreamEvent::Finished { id } => {
+                if let Some(exchange) = self
+                    .exchange_on(conn, id)
+                    .and_then(|exchange| self.exchanges.get_mut(exchange))
+                {
+                    exchange.out.acked = true;
+                }
+            }
+            StreamEvent::Available { .. } => {}
         }
     }
 
@@ -2558,7 +2568,8 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
                 exchange.carry.hold(now, at, backlog);
                 return Ok(());
             }
-            exchange.carry.judge(now, at, held, backlog)
+            let acknowledged = exchange.out.acked;
+            exchange.carry.judge(now, at, held, backlog, acknowledged)
         });
         if let Err(refusal) = judged {
             self.finish_exchange(conn, id, Some((refusal, false)));

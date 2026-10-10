@@ -16,6 +16,7 @@ sim = []
 # A kept record's checksum (`record`), the log's CRC-32C.
 crc32c.workspace = true
 getrandom.workspace = true
+hyper-rt = { path = "../hyper-rt" }
 thiserror.workspace = true
 
 [target.'cfg(unix)'.dependencies]

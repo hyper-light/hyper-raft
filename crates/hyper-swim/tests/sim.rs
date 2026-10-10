@@ -45,8 +45,6 @@ use hyper_timing::Exposure;
 
 /// Members in the LAN cluster.
 const NODES: u32 = 5;
-/// The member killed in the LAN cluster.
-const VICTIM: u32 = NODES - 1;
 /// The path's datagram size: QUIC's minimum, which every path carries (RFC 9000 §14.1).
 const DATAGRAM: usize = 1_200;
 /// RFC 5905's frequency tolerance, the most a member's clock runs fast or slow (§7.2).
@@ -167,6 +165,8 @@ impl Shape {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Ev {
     Arrive(Ticket),
+    /// A stalled member runs again ([`Sim::stall`]).
+    Thaw,
 }
 
 /// Whether `verdict` is a misfit pair's provisional one: it promises no bound (`mistake` 1, the
@@ -213,6 +213,9 @@ struct Member {
     pings: Vec<(u64, bool)>,
     nodes: u32,
     alive: bool,
+    /// While its process is stalled ([`Sim::stall`]): the datagrams that reached it meanwhile, each
+    /// with its arrival on the member's clock, as a kernel receive stamp gives it.
+    stalled: Option<Vec<(Vec<u8>, u64)>>,
 }
 
 struct Sim {
@@ -269,6 +272,7 @@ impl Member {
             pings: Vec::new(),
             nodes: shape.nodes,
             alive: true,
+            stalled: None,
         };
         member.gossip = member.room(me, true);
         member.view_room = member.room(me, false);
@@ -591,6 +595,22 @@ impl Sim {
                 .map_err(|refusal| refusal.to_string())?
             {
                 Step::Wake { node } => {
+                    let member = &self.members[node.0 as usize];
+                    if member.alive && member.stalled.is_none() {
+                        self.step(node);
+                    }
+                }
+                Step::Event {
+                    node,
+                    event: Ev::Thaw,
+                } => {
+                    let held = self.members[node.0 as usize].stalled.take();
+                    for (payload, stamp) in held.into_iter().flatten() {
+                        let member = &mut self.members[node.0 as usize];
+                        if let Ok(message) = SwimMessage::decode(&payload) {
+                            member.handle(node, message, stamp, &mut self.outbox);
+                        }
+                    }
                     if self.members[node.0 as usize].alive {
                         self.step(node);
                     }
@@ -611,6 +631,10 @@ impl Sim {
                             .monotonic(node)
                             .map_err(|refusal| refusal.to_string())?;
                         let member = &mut self.members[node.0 as usize];
+                        if let Some(held) = member.stalled.as_mut() {
+                            held.push((delivery.payload, stamp));
+                            continue;
+                        }
                         if let Ok(message) = SwimMessage::decode(&delivery.payload) {
                             member.handle(node, message, stamp, &mut self.outbox);
                         }
@@ -675,6 +699,15 @@ impl Sim {
         })
     }
 
+    /// Stalls `node`'s process for `for_ns` of the world's time, as a host stalls a process
+    /// (`docs/timing.md` §2.6): its timer does not fire and the datagrams that reach it wait, each
+    /// stamped on arrival; at the thaw it handles them in order, then polls.
+    fn stall(&mut self, node: NodeId, for_ns: u64) {
+        self.members[node.0 as usize].stalled = Some(Vec::new());
+        self.world.wake(node, None).unwrap();
+        self.world.after(for_ns, node, Ev::Thaw).unwrap();
+    }
+
     fn kill(&mut self, victim: NodeId) {
         self.members[victim.0 as usize].alive = false;
         self.world.wake(victim, None).unwrap();
@@ -701,9 +734,9 @@ fn run(source: Source) -> Result<Record, SimError> {
     kill_and_hold_dead_within_bounds(sim, &seed)
 }
 
-/// Kills [`VICTIM`] and runs until every survivor holds it dead: each within the bound its detector
-/// stated, with the wait it measured for evidence of its own health added, and none holding a live
-/// member dead before or after. The run's record.
+/// Kills the cluster's last member and runs until every survivor holds it dead: each within the bound
+/// its detector stated, with the wait it measured for evidence of its own health added, and none
+/// holding a live member dead before or after. The run's record.
 fn kill_and_hold_dead_within_bounds(mut sim: Sim, seed: &str) -> Result<Record, SimError> {
     for (me, member) in sim.live() {
         assert!(
@@ -711,7 +744,7 @@ fn kill_and_hold_dead_within_bounds(mut sim: Sim, seed: &str) -> Result<Record, 
             "{seed}: member {me:?} holds a live member dead"
         );
     }
-    let victim = NodeId(VICTIM);
+    let victim = NodeId(sim.shape.nodes - 1);
     sim.kill(victim);
     sim.run("the victim held dead by every survivor", |sim| {
         sim.held_dead(victim)
@@ -741,7 +774,7 @@ fn kill_and_hold_dead_within_bounds(mut sim: Sim, seed: &str) -> Result<Record, 
         );
         noted.push((me.0, death));
     }
-    assert_eq!(noted.len(), (NODES - 1) as usize);
+    assert_eq!(noted.len(), (sim.shape.nodes - 1) as usize);
     Ok(sim.world.finish())
 }
 
@@ -853,6 +886,68 @@ fn hourly(source: Source) -> Result<Record, SimError> {
 fn a_verdict_s_margin_reaches_past_its_interval_where_unavailability_falls() {
     for seed in 0..16 {
         twice(seed, hourly).unwrap_or_else(|refusal| panic!("seed {seed}: {refusal}"));
+    }
+}
+
+/// slates' fleet's three members on the LAN.
+const THREE: Shape = Shape {
+    nodes: 3,
+    ..LAN_CLUSTER
+};
+
+/// How long a stall holds a member's process: the shortest correlation time the heartbeat traces
+/// measured, 20 ms (`docs/timing.md` §2.6, item 6: 20 to 250 ms), past the few round trips three
+/// later probes of the stalled member take.
+const STALL_NS: u64 = 20_000_000;
+
+/// One run from `source` of three members whose first two each stall once before any pool
+/// configures, one after the other (slates' fleet at load 80, 2026-10-10): the member that stalls
+/// neither then has every pair of its own made late once, each answer found its record reused.
+/// Every member's pool configures, and then the LAN run's kill and checks.
+fn stalled_early(source: Source) -> Result<Record, SimError> {
+    let seed = match &source {
+        Source::Seed(seed) => format!("seed {seed}"),
+        Source::Trace(_) => "the trace".to_owned(),
+    };
+    let mut sim = Sim::new(source, false, THREE);
+    let every_pair_answered = |sim: &Sim| {
+        sim.live().all(|(me, member)| {
+            sim.live().filter(|(peer, _)| *peer != me).all(|(peer, _)| {
+                member
+                    .detector
+                    .report(host(peer))
+                    .is_some_and(|report| report.last_answer_ns.is_some())
+            })
+        })
+    };
+    sim.run("every pair answered", every_pair_answered);
+    for stalled in [NodeId(1), NodeId(2)] {
+        assert!(
+            sim.live()
+                .all(|(_, member)| member.detector.pool().verdict.is_none()),
+            "{seed}: a pool configured before the stalls"
+        );
+        sim.stall(stalled, STALL_NS);
+        sim.run("the stall over", |sim| {
+            sim.members[stalled.0 as usize].stalled.is_none()
+        });
+    }
+    sim.run("every member's pool configured", |sim| {
+        sim.live()
+            .all(|(_, member)| member.detector.pool().verdict.is_some())
+    });
+    kill_and_hold_dead_within_bounds(sim, &seed)
+}
+
+/// A pair one stall made late feeds its member's pool again from its next answer in time
+/// (`docs/timing.md` §2.7, "A pair the pool does not fit"). Before, each answer that found its
+/// record reused marked its pair a misfit for good: member 0, both of whose peers stalled once,
+/// fed its pool from neither again, and it never configured on any seed (slates: a pool at 5 round
+/// trips and a silent peer judged by nothing for 4,000 periods).
+#[test]
+fn a_pool_fed_by_pairs_a_stall_made_late_configures() {
+    for seed in 0..16 {
+        twice(seed, stalled_early).unwrap_or_else(|refusal| panic!("seed {seed}: {refusal}"));
     }
 }
 

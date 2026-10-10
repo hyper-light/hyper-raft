@@ -143,6 +143,14 @@
     suspicion's refutation. hyper-timing's capped configurator (`detector_at`, `Floors`) had no
     other user and went with it.
 
+16. **A pair's fit to the pool is its latest evidence's** (`docs/timing.md` §2.7, "A pair the pool
+    does not fit"). The pool judges a pair while its latest round trip is within the pool's span
+    (`covered`), and is fed by a pair whose latest round trip, before the sample, is within RFC
+    6298's `3R` of the pool's mean (`far`); the misfit mark set once and kept went. An answer no
+    reuse explains moves nothing (slates' local patch e6640dd3, 2026-10-09). `PeerReport` gains
+    `pool_misfit` (the pair does not feed the pool) and `refused`, and `Detector::pool` reports the
+    pooled verdict, its samples and its latest refusal.
+
 The wire changed in place with 8 and 11: a probe and an answer carry entries of the existing gossip
 encoding, which a receiver of the earlier form applies as any gossip, and `Sync` is a new tag with
 its own golden vector. No consumer runs hyper-swim yet (slates' session owns its integration), so

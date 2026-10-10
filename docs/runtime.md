@@ -629,7 +629,7 @@ blocking `recv` and never touches the cell.
 | Primitive | Built as | Bound |
 |---|---|---|
 | `channel::<T>(n)` (many senders, one receiver) | `sync_channel(n)` + a cell | `n` messages; a full channel is `Full` to `try_send`, and `send().await` waits for room, its waiters queued one to one (NOTE26 §5.3) |
-| `oneshot::<T>()` | `sync_channel(1)` + a cell | one value |
+| `oneshot::<T>()` | `sync_channel(1)` + a cell; the receiver marks the cell as it goes, which the sender reads (`is_closed`: an owner sweeps the replies of callers that stopped waiting) | one value |
 | `watch` of a `Copy` value that fits a word (`u64`) | the value and its version packed in the cell's atomic words; the `n` receiver slots claimed when it is made, chained through their cells, each taken by one compare-and-swap and given back at drop, the sender waking the taken ones | one value; readers see the latest and its version; `n` receivers, refused exactly at `n` (mantle's final review, finding 6) |
 | `watch` of a larger value | the publisher keeps it; readers are notified through the cell and ask the owner for it (a request through a `channel`) | the owner's |
 | `Semaphore(n)` | an atomic count + a bounded FIFO of waiting words; a release wakes exactly the waiters it admits, in arrival order | `n` permits; waiters bounded by the configured queue, past it `Capacity` |

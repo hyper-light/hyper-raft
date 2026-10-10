@@ -7,10 +7,11 @@
 //! cache. Each operation reads `FAN_OUT` pages at pseudo-random page offsets, the pages an engine's
 //! seek reads from as many branches. **sequential** reads them on the calling thread, one
 //! `read_exact_at` after another. **batched** hands them to an issuer of `FAN_OUT` workers as one
-//! batch (`Attached::submit_reads`) and takes its answer. The buffers are the same each operation and
-//! go back to the caller with the answer, so the count is the read path's own. **native AIO** hands
-//! the batch to the kernel from the calling thread (Linux, direct files). The **durable writes**
-//! rows write `FAN_OUT` pages at such offsets and flush them, in place or through native AIO.
+//! batch (`Attached::submit_reads`) and takes its answer. The batch's vector, its buffers and
+//! offsets, is the same each operation and goes back to the caller with the answer, so the count is
+//! the read path's own. **native AIO** hands the batch to the kernel from the calling thread
+//! (Linux, direct files). The **durable writes** rows write `FAN_OUT` pages at such offsets and
+//! flush them, in place or through native AIO.
 //!
 //! Each row takes Wilks' least sample for a one-sided 95 % bound on the p99.9, `n = ⌈ln 0.05 / ln
 //! 0.999⌉ = 2,995` operations [WILKS], after as many unmeasured. Allocator calls are counted across
@@ -155,26 +156,23 @@ fn rows(dir: &Path, n: usize, request: CachingRequest, label: &str) {
     print(&format!("{label} sequential"), &sequential);
     let issuer = Issuer::start(dir, FAN_OUT).unwrap();
     let mut attached = issuer.attach(&file).unwrap();
-    let mut held: Option<Vec<AlignedBuf>> = Some(bufs);
+    // The reads vector is given back with its answer, through the issuer as through native AIO, so
+    // neither row allocates per operation for it.
+    let mut reads: Option<Vec<(AlignedBuf, u64)>> =
+        Some(bufs.into_iter().map(|buf| (buf, 0)).collect());
     let batched = measure(n, |seed| {
-        let reads = held
-            .take()
-            .unwrap()
-            .into_iter()
-            .map(|buf| (buf, offset(seed)))
-            .collect();
-        attached.submit_reads(reads).unwrap();
-        held = Some(attached.answer().unwrap().1.unwrap());
+        let mut batch = reads.take().unwrap();
+        for (_, at) in &mut batch {
+            *at = offset(seed);
+        }
+        attached.submit_reads(batch).unwrap();
+        reads = Some(attached.answer().unwrap().1.unwrap());
     });
     print(&format!("{label} batched"), &batched);
     drop(attached);
     // The same batch through the kernel's native AIO, issued and reaped on this thread (Linux,
-    // direct files only; refused elsewhere, and the row is then not printed). The reads vector is
-    // given back with its answer, so the row allocates nothing per operation.
+    // direct files only; refused elsewhere, and the row is then not printed).
     if let Ok(mut aio) = AioFile::new(file, FAN_OUT, 1) {
-        let mut reads: Option<Vec<(AlignedBuf, u64)>> = held
-            .take()
-            .map(|bufs| bufs.into_iter().map(|buf| (buf, 0)).collect());
         let native = measure(n, |seed| {
             let mut batch = reads.take().unwrap();
             for (_, at) in &mut batch {

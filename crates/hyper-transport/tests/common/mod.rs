@@ -715,6 +715,9 @@ pub struct Server {
     pub hold_bulk: bool,
     /// How long the server takes to answer once it has a request whole, by `now`.
     pub think: Duration,
+    /// A request body longer than this is never read (0: every body is read): a peer that holds
+    /// a stream it accepted, its bytes in its buffer and none of its credit given back.
+    pub unread_above: u64,
     /// The clock the think time is read against, as the test last set it.
     pub now: Option<Instant>,
     pub answered: u64,
@@ -732,6 +735,7 @@ impl Server {
             served: Vec::new(),
             hold_bulk: false,
             think: Duration::ZERO,
+            unread_above: 0,
             now: None,
             answered: 0,
             frames: Vec::new(),
@@ -820,6 +824,9 @@ impl Server {
         served: &mut Served,
     ) -> bool {
         if served.class == Class::Bulk && self.hold_bulk {
+            return false;
+        }
+        if self.unread_above > 0 && served.body > self.unread_above {
             return false;
         }
         while served.read < served.body {

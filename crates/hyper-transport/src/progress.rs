@@ -23,7 +23,13 @@
 //!   and the exchange ends at the end of a period that began with it so (focal's audit F38: counted
 //!   from the send, the period began while the last of a request was still on its way, and ended
 //!   before the peer had it). A period in which the peer sent nothing at all ends it whatever was
-//!   charged. What was sent is progress only while the peer is
+//!   charged. A stream its peer does not read ends by its own bytes, whatever else the connection
+//!   carries (focal's audit F38): out of the peer's credit (its own, or the connection's with bytes
+//!   to send), at least a datagram of it sent and all of that acknowledged, it is unread, and a
+//!   window more ends it, its reset giving back the credit it holds (hyper-quic patch Q8,
+//!   `SendStream::sent_acknowledged`, `written`). An exchange waiting only for credit that an unread
+//!   one holds, or held in its window, is not judged: the credit comes back as the unread one
+//!   ends. What was sent is progress only while the peer is
 //!   heard: a live peer acknowledges what it receives within its `max_ack_delay` (RFC 9000 §13.2.1,
 //!   25 ms by default, §18.2), so a period that heard nothing is silence, and what the sender put
 //!   into it (the flight in the air, then the probe timeout's probes, which RFC 9002 §6.2.4 sends
@@ -251,6 +257,14 @@ impl Carry {
         self.before = moved;
         self.since = now;
         self.next = now.checked_add(self.period).unwrap_or(now);
+    }
+    /// When the window being judged began.
+    pub(crate) fn started(&self) -> Instant {
+        self.since
+    }
+    /// The window a judgement covers on a path whose probe timeout is `floor`.
+    pub(crate) fn window(&self, floor: Duration) -> Duration {
+        self.period.max(floor)
     }
     /// When the wait is next judged, if anything is waited on.
     pub(crate) fn due(&self) -> Option<Instant> {

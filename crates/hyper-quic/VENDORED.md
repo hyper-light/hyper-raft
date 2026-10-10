@@ -753,3 +753,9 @@ rows.
   exchange's window sooner: on a path whose round trip under load is longer than an exchange's
   period, nothing the peer acknowledges or answers can come within the period. No behaviour of the
   connection changes.
+- **Patch Q8: `SendStream::sent_acknowledged` and `SendStream::written`.** Whether every byte sent on
+  a stream has been acknowledged, none waiting to be sent again (the send buffer's unacknowledged
+  length equal to its unsent bytes, no retransmissions queued), and the bytes the application wrote
+  to it. Out of the peer's credit as well, the stream's bytes are all in the peer's buffer and the
+  peer is not reading them: hyper-transport ends such an exchange (focal's audit F38). No behaviour
+  of the connection changes.

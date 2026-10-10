@@ -208,6 +208,8 @@ each ported test's origin, and what was left out).
   `disconnect`, `refuse` (closes a peer's connections telling it why: a peer whose grant was
   withdrawn is refused `Identity`, which its side reports as it reports a certificate refused at
   the handshake), `open`, `head`, `write_body`, `read_body`, `body_complete`, `reply`, `end`,
+  `refuse_exchange` (ends an exchange its owner refuses, the refusal's code in the stream reset so
+  the asker reads the peer's refusal rather than a connection failing: focal's ingress share),
   `reserve`, `release`, `send_frame`, `export_keying_material`, `path`, `credit`, `exchange_tail`
   (over the caller's measured timer granularity), `set_granularity` (that granularity, for tuning
   receive windows) and `stats`.

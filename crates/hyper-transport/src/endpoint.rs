@@ -828,6 +828,17 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
         });
     }
 
+    /// End `exchange`, refusing it for `refusal`: a half not yet complete is reset with the
+    /// refusal's code, so its peer hears why — an owner holding a sender to its share of what it
+    /// reads refuses past it `Budget`, which the asker reads as the peer's refusal and not as its
+    /// connection failing. The owner, which refused it, hears nothing more of it.
+    pub fn refuse_exchange(&mut self, exchange: ExchangeId, refusal: Refusal) {
+        let _ = self.with_exchange(exchange, |core, conn, id| {
+            core.refuse(conn, id, refusal);
+            Ok(())
+        });
+    }
+
     /// Bytes for a message of `class`, from the endpoint's budget: what the owner reads bodies
     /// into.
     pub fn reserve(&mut self, class: C::Class, bytes: u64) -> Result<Reservation, Refusal> {
@@ -2364,6 +2375,16 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
         } else {
             self.finish_exchange(conn, id, None);
         }
+    }
+
+    /// End exchange `id` refused for `refusal`, by its owner: the halves not yet complete are reset
+    /// with the refusal's code, and the owner, which decided it, is told nothing (an exchange its
+    /// owner ended raises no event).
+    fn refuse(&mut self, conn: &mut Conn<C::Role>, id: u64, refusal: Refusal) {
+        if let Some(exchange) = self.exchanges.get_mut(id) {
+            exchange.ended = true;
+        }
+        self.finish_exchange(conn, id, Some((refusal, false)));
     }
 
     /// End exchange `id`: with `failure`, the owner hears it was refused. A half not yet complete

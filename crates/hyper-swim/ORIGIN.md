@@ -180,7 +180,8 @@
       member but the asker, plus `G`.
     - The asker's stage ends when every relay asked has nacked (`Detector::on_indirect_nack`), or
       when the slowest relay's response is due, its span for the relay plus the relay's bound. A peer
-      that has stated none is not asked.
+      that has stated none is not asked. `Detector::relays` reports that due for the slowest relay a
+      member could ask, and how many peers have stated a bound.
     - An answer to a told probe or a later one, however late and by whatever path, takes back the
       pending condemnation.
     - It replaces the stage timed by the slowest relay's span plus the asker's span for the target,

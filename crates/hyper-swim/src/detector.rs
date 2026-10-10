@@ -675,6 +675,17 @@ pub struct PeerReport {
     pub relay_within: Option<Duration>,
 }
 
+/// The relay stage as the member bounds it ([`Detector::relays`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RelayReport {
+    /// The latest any relay this member could ask has its response due, from the request: its span
+    /// for the relay plus the bound the relay stated ([`Ack::relay_within_ns`]). `None` while no
+    /// alive peer has stated one, and an unanswered probe asks no relay.
+    pub due: Option<Duration>,
+    /// The peers that have stated a relay bound.
+    pub stated: usize,
+}
+
 /// The member's pooled verdict and its evidence ([`Detector::pool`]): what judges every pair that
 /// has no verdict of its own and that the pool's span covers.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -2301,6 +2312,27 @@ impl Detector {
             refused: held.stream.refused,
             ..held.report
         })
+    }
+
+    /// The relay stage as this member bounds it now, every relay it could ask judged afresh.
+    pub fn relays(&self) -> RelayReport {
+        let (pooled, granularity_ns) = (self.pool.verdict, self.granularity_ns());
+        RelayReport {
+            due: self
+                .peers
+                .iter()
+                .filter_map(|(host, peer)| {
+                    self.contribution(*host, peer, pooled, granularity_ns)
+                        .relay_due_ns
+                })
+                .max()
+                .map(Duration::from_nanos),
+            stated: self
+                .peers
+                .values()
+                .filter(|peer| peer.relay_within_ns.is_some())
+                .count(),
+        }
     }
 
     /// The member's pooled verdict and its evidence.
@@ -4479,6 +4511,29 @@ mod tests {
         assert_eq!(detector.poll(until - 1, &mut world.requests), None);
         assert!(detector.poll(until, &mut world.requests).is_some());
         assert_eq!(liveness(&detector, A), Liveness::Suspect);
+    }
+
+    /// The relay report names the latest any relay this member could ask has its response due, and
+    /// how many peers have stated a bound; nothing is due while none has.
+    #[test]
+    fn the_relay_report_is_the_slowest_relay_s_due() {
+        let peers = [A, B, C];
+        let mut detector = detector(&peers);
+        assert_eq!(detector.relays(), RelayReport::default());
+        let mut world = World::new();
+        configured(&mut detector, &mut world, &peers);
+        detector.peers.get_mut(&B).unwrap().relay_within_ns = Some(3 * MS);
+        detector.peers.get_mut(&C).unwrap().relay_within_ns = Some(40 * MS);
+        detector.peers.get_mut(&A).unwrap().relay_within_ns = None;
+        let due = |relay: HostId, within: u64| detector.verdict(relay).unwrap().span_ns() + within;
+        let slowest = due(B, 3 * MS).max(due(C, 40 * MS));
+        assert_eq!(
+            detector.relays(),
+            RelayReport {
+                due: Some(Duration::from_nanos(slowest)),
+                stated: 2,
+            }
+        );
     }
 
     /// A relay stage ends once every relay it asked has nacked, before the slowest relay's response

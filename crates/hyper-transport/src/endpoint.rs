@@ -2551,6 +2551,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
         // classes are served: none means the peer is not taking what the exchange has to send.
         let peer_takes = credit(&mut conn.quic, rank);
         let credit_moved = conn.credit_moved;
+        let floor = conn.quic.probe_timeout();
         let judged = self.exchanges.get_mut(id).map_or(Ok(()), |exchange| {
             if exchange.stream.is_none() {
                 // Queued for a stream (policy C): judged on whether the connection's credit queue moves, not on its
@@ -2569,7 +2570,9 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
                 return Ok(());
             }
             let acknowledged = exchange.out.acked;
-            exchange.carry.judge(now, at, held, backlog, acknowledged)
+            exchange
+                .carry
+                .judge(now, at, held, backlog, acknowledged, floor)
         });
         if let Err(refusal) = judged {
             self.finish_exchange(conn, id, Some((refusal, false)));

@@ -679,6 +679,60 @@ fn a_peers_time_to_answer_begins_when_it_has_the_request() {
     assert!(took >= Duration::from_secs(4), "{took:?}");
 }
 
+/// A stream its peer never reads ends by its own bytes (focal's audit F38), and the exchanges of its
+/// class beside it on the connection go on. Do: ask 2 MiB the server never reads, then small requests
+/// of the same class one after another, which it answers. Expect: the large one refused `Stalled`
+/// within a few windows, and every small one answered, while it waits and after it ends.
+#[test]
+fn a_stream_its_peer_never_reads_ends_by_its_own_bytes_and_the_others_go_on() {
+    const SMALL: usize = 12;
+    let pair = Pair::new();
+    let mut net = connected::<Mantle, Mantle>(&pair, limits(), 256 << 20);
+    let (mut asker, mut server) = (Asker::new(), Server::new());
+    server.unread_above = 1 << 20;
+    let began = net.now;
+    asker
+        .ask(
+            &mut net.a,
+            net.now,
+            2,
+            (Kind::Get, Class::Request),
+            0,
+            Some(2 << 20),
+            PERIOD,
+        )
+        .unwrap();
+    net.until(TURNS, |net| {
+        asker.drive(&mut net.a);
+        server.serve(&mut net.b);
+        let small = asker.asked.len() - 1;
+        if small < SMALL
+            && asker
+                .asked
+                .last()
+                .is_some_and(|asked| asked.done || small == 0)
+        {
+            asker
+                .ask(
+                    &mut net.a,
+                    net.now,
+                    2,
+                    (Kind::Get, Class::Request),
+                    u8::try_from(small).unwrap() + 1,
+                    Some(4_000),
+                    PERIOD,
+                )
+                .unwrap();
+        }
+        asker.asked.len() == SMALL + 1 && asker.asked.iter().all(|asked| asked.done)
+    });
+    assert_eq!(asker.asked[0].refused, Some((Refusal::Stalled, false)));
+    for asked in &asker.asked[1..] {
+        assert_eq!(asked.refused, None, "{asked:?}");
+    }
+    assert!(net.now - began <= PERIOD * 8, "{:?}", net.now - began);
+}
+
 /// Replication frames on lanes arrive in order, each lane on its own stream; a lane is as wide as
 /// the core's window, and the lanes to a peer are bounded.
 #[test]

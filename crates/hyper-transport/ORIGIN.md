@@ -71,6 +71,16 @@ source: its credit law (`flow.rs`, `connection.rs`) is taken here. Neither repos
   (`a_request_held_by_the_peers_credit_moves_by_what_the_peer_acknowledges`), and a window is not
   judged sooner than the path's probe timeout (hyper-quic patch Q7;
   `a_window_is_judged_no_sooner_than_the_probe_timeout`).
+- **A stream its peer does not read** (2026-10-10, F38's other half). One the peer accepted and
+  never read took the peer's connection credit, and every exchange of its class on the connection
+  waited for credit behind it and was refused (focal's
+  `a_stream_its_peer_does_not_read_ends_whatever_else_its_connection_carries`); since the answer
+  period began from the acknowledgement, the unread one itself lived as long as the others moved
+  (over a lossy path, longer than the twenty minutes a run was given). Out of credit, a datagram of
+  it and more sent and all of that acknowledged (hyper-quic patch Q8), it is now unread and ends a
+  window later; an exchange waiting only for credit an unread one holds, or held in its window, is
+  held, and goes on as the credit comes back
+  (`a_stream_its_peer_never_reads_ends_by_its_own_bytes_and_the_others_go_on`).
 - **What is sent into silence is not progress.** focal's `carried` charged a period with the bytes
   the connection sent and did not find lost. After a peer dies the sender still sends: the flight in
   the air, then the probe timeout's probes, a datagram or two each at a doubling backoff, so every

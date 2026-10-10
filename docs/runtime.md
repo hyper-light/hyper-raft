@@ -186,7 +186,12 @@ fails when the drain clears the summary after the word.
 ### 3.3 The run queue
 
 Slot indices in a pre-sized ring with one pending flag per slot (slates' `queue.rs`), at most `batch`
-polls per step. `batch` is a latency budget over the measured cost of one loop item (slates'
+polls per step, including tasks made ready by earlier polls in that phase. Such wakes join behind
+already-ready tasks; self-wakes consume the same remaining poll budget. The bound does not grow as
+work arrives. This replaces a phase's initial ready-count snapshot, which made a single local
+request/reply pair pay the loop's control/timer/clock work twice per operation even when the configured
+batch allowed more polls. The next step still drains external control/wakes, timers and driver work.
+`batch` is a latency budget over the measured cost of one loop item (slates'
 `calibrate_batch`). **The budget, derived:** a task woken while a batch runs waits at most that batch
 before the loop next reads its wakes, and a waker on another shard would otherwise have paid a park's
 wake to reach it, so the batch may delay it by at most the expected wake: budget = the mean wake, the

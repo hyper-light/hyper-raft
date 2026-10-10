@@ -868,7 +868,10 @@ impl Shard {
         did_work |= self.wake_ready_pollers();
         self.apply();
         did_work |= self.harvest_turn();
-        let batch = self.desk.local.batch(self.core.config.batch.max(1));
+        // The configured poll budget bounds this phase, including wakes produced by
+        // earlier polls. The FIFO keeps already-ready tasks ahead of those wakes;
+        // a local request/reply handoff need not repeat the whole loop for each end.
+        let batch = self.core.config.batch.max(1);
         for _ in 0..batch {
             let Some(slot) = self.desk.local.pop() else {
                 break;

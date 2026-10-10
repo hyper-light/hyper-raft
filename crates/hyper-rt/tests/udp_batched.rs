@@ -289,3 +289,49 @@ fn an_astray_report_is_counted_not_an_error() {
     })
     .unwrap();
 }
+
+/// A datagram the kernel has no route for fails its send the same way every time: macOS reports an
+/// IPv6 destination on an IPv4 socket as unreachable (`EHOSTUNREACH`), which is also how a datagram
+/// sent earlier is reported astray. Do: queue one to such a destination, then one to a live socket,
+/// and send. Expect: the first is refused alone — its report taken once as an earlier datagram's, then
+/// as its own — and the queue behind it is sent: one unroutable peer never holds a socket's other
+/// datagrams (a focal connector that dialed a name's `::1` stopped sending to every peer).
+#[test]
+fn a_datagram_with_no_route_is_refused_alone_and_the_queue_behind_it_is_sent() {
+    let mut rt = LocalRuntime::new(&config()).unwrap();
+    rt.block_on(async {
+        let loopback = SocketAddr::from((Ipv4Addr::LOCALHOST, 0));
+        let receiver = UdpSocket::bind(loopback).unwrap();
+        let to = receiver.local_addr().unwrap();
+        let mut socket = Batched::bind(loopback, Io { batch: 4 }, false).unwrap();
+        socket.queue(
+            SocketAddr::from((Ipv6Addr::LOCALHOST, to.port())),
+            b"nowhere",
+        );
+        socket.queue(to, b"behind");
+        assert_eq!(socket.send(), Sent::Drained, "{:?}", socket.stats());
+        let mut buffer = [0u8; 16];
+        let (length, _) = receiver.recv_from(&mut buffer).await.unwrap();
+        assert_eq!(&buffer[..length], b"behind");
+        assert!(socket.stats().send_errors >= 1, "{:?}", socket.stats());
+    })
+    .unwrap();
+}
+
+/// The single-datagram send waits for the socket's room, never for a route: a datagram the kernel has
+/// no route for is refused, its astray report taken once as an earlier datagram's and then as its own.
+/// Do: send to an IPv6 destination from an IPv4 socket, waiting for writability. Expect: an error, at
+/// once, where the send used to wait for a writability that never sent it.
+#[test]
+fn a_send_waiting_for_room_is_refused_for_a_destination_with_no_route() {
+    let mut rt = LocalRuntime::new(&config()).unwrap();
+    rt.block_on(async {
+        let socket = UdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).unwrap();
+        let nowhere = SocketAddr::from((Ipv6Addr::LOCALHOST, 9));
+        let sent = hyper_rt::futures::within(1_000_000_000, socket.send_to_writable(b"x", nowhere))
+            .await
+            .unwrap();
+        assert!(matches!(sent, Some(Err(_))), "{sent:?}");
+    })
+    .unwrap();
+}

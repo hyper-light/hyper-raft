@@ -441,7 +441,12 @@ the platform calls behind one seam per kind (`netsys`), Unix through `rustix`, W
 - **Astray reports.** A UDP socket reports an earlier datagram's ICMP refusal or unreachable (and, on
   Windows, a send to a closed port as `WSAECONNRESET`) on a later call that moves no data. The seam returns
   it as its own outcome, counted and read past, never an error of the socket; a batched receive reads past
-  at most a batch of them per call.
+  at most a batch of them per call. A send whose own destination has no route is reported the same way,
+  every time it is tried (macOS returns `EHOSTUNREACH` for an IPv6 destination on an IPv4 socket): the
+  sender sends again at once after a report, which takes an earlier datagram's, and takes a second report
+  for the same datagram as its own and refuses it, counted (`Batched::send`, `UdpSocket::send_to_writable`).
+  One unroutable destination held a socket's whole queue before (2026-10-10, found by focal: a connector
+  that dialed a name's `::1` from an IPv4 socket stopped sending to every peer).
 - **Don't-fragment** set per OS, as slates does; a send the OS has no room for is `WouldBlock`, awaited on
   writability, never a lost path (slates' AUD-29-61).
 - **Socket activation** (`adopt`, `into_owned`) kept from slates, on Windows too.

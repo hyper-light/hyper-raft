@@ -670,6 +670,20 @@ probe judged at the floor is followed by its next no sooner than the floor, on e
 (`a_member_under_a_detection_budget_probes_no_faster_than_its_floor`: 1.8 ms after it before);
 slates measured pings fall from 10,264 to 134 a member in 6 s.
 
+An owner whose budget follows its own measurements re-derives it as they change (slates: its failover
+objective less the council's window for confirming a death) and sets it
+(`Detector::set_detection_budget`). A period is floored by the budget in force as it starts: one
+resting keeps its rest, and the next takes the new floor
+(`a_new_detection_budget_floors_the_next_period_and_a_resting_one_keeps_its_rest`). The member also
+states the least budget its deadlines support (`Detector::least_detection_bound`): the detection bound
+with every period at what an unanswered probe's deadlines allow, its direct span and its relay stage
+plus its lateness, not at the lengths the floor stretched its periods to. A budget below it cannot be
+kept on this network, which the owner can report; at it, a judged period's floor is exactly the
+longest an unanswered period runs
+(`the_least_detection_bound_is_the_bound_the_deadlines_allow_without_the_floor`). slates runs at the
+larger of the two. The relay bounds it is drawn from are what each peer last stated, so it settles
+within a round of every pair being judged.
+
 **Before a pair's own estimator configures.** A pair's estimator refuses until it has two prediction
 errors and a measured `τ_int` (`Refusal::TooFewHeartbeats`, `CorrelationUnmeasured`). Until then its
 probes are judged by the member's pool where the pool's span covers the pair: one more

@@ -1200,6 +1200,14 @@ impl Detector {
         Some(ends.map_or(probe.rests_until, |at| at.max(probe.rests_until)))
     }
 
+    /// Sets the owner's detection budget, [`Detector::new`]'s `detection_budget`, which an owner
+    /// re-derives as its own measurements change (slates: its failover objective less the council's
+    /// window for confirming a death). A period is floored by the budget in force as it starts: one
+    /// resting now keeps the rest its start set, and the next is floored by the new budget.
+    pub fn set_detection_budget(&mut self, budget: Duration) {
+        self.detection_budget_ns = nanos(budget);
+    }
+
     /// States what the owner's response to a death costs it, as the unavailability it causes:
     /// slates', a retirement and the takeovers it starts. A false condemnation costs that, so each
     /// verdict configured from now on charges it to every probe at the probe's bound, beside a
@@ -1626,18 +1634,41 @@ impl Detector {
     /// this member's own network works, which nothing bounds in advance: the member measures that
     /// wait ([`PeerReport::pending_since_ns`]) and adds it. A period lasts at most the longest this
     /// member has run, or, where longer, what an unanswered probe's deadlines allow: its target's
-    /// span, then the slowest relay's and the target's again, at most three times the longest
-    /// span of the verdicts judging its pairs, plus the latest this member has woken past a wake it
-    /// asked, or is late for now; the period in progress counts as run. `None` before a period.
+    /// span, then its relay stage, until the slowest relay it could ask has its response due, plus
+    /// the latest this member has woken past a wake it asked, or is late for now; the period in
+    /// progress counts as run. `None` before a period.
     pub fn detection_bound(&self, now_ns: u64) -> Option<Duration> {
-        // The most members the view has held besides this one: no round is larger, whatever the
-        // rounds in the window were (a member that condemned another, even falsely, runs smaller
-        // ones, and a member forgotten since was in rounds before).
-        let spacing = self.most_watched.saturating_mul(2).saturating_sub(1);
-        // The told probe's own period resolves it: one more.
-        let periods = spacing.saturating_mul(2).saturating_add(1);
         let period = self.period_bound(now_ns)?;
-        Some(Duration::from_nanos(period.saturating_mul(periods)))
+        Some(Duration::from_nanos(
+            period.saturating_mul(self.bound_periods()),
+        ))
+    }
+
+    /// The least detection budget this member's measured deadlines support at `now_ns`:
+    /// [`Detector::detection_bound`] with every period at what an unanswered probe's deadlines allow
+    /// (its direct span and its relay stage, as the latest period began, plus how late this member
+    /// has woken), not at the lengths its periods ran, which a budget's floor stretches. A budget
+    /// below it cannot be kept by this member on this network; at it, a judged period's floor is the
+    /// longest an unanswered period runs. `None` before a period.
+    pub fn least_detection_bound(&self, now_ns: u64) -> Option<Duration> {
+        if self.periods.count == 0 {
+            return None;
+        }
+        let period = self
+            .longest_unanswered
+            .saturating_add(self.wakes.latest_ns(now_ns));
+        Some(Duration::from_nanos(
+            period.saturating_mul(self.bound_periods()),
+        ))
+    }
+
+    /// The periods from a peer's last answer to its condemnation pending: `2(2m − 1) + 1`, `m` the
+    /// most members the view has held besides this one. No round is larger, whatever the rounds in
+    /// the window were (a member that condemned another, even falsely, runs smaller ones, and a
+    /// member forgotten since was in rounds before); the told probe's own period resolves it.
+    fn bound_periods(&self) -> u64 {
+        let spacing = self.most_watched.saturating_mul(2).saturating_sub(1);
+        spacing.saturating_mul(2).saturating_add(1)
     }
 
     /// The longest a period of this member lasts, nanoseconds: the longest it has run or, where
@@ -3373,6 +3404,94 @@ mod tests {
             unbudgeted > at_most,
             "with no budget the member probes at its round trip: {unbudgeted} probes"
         );
+    }
+
+    /// A budgeted member over three near peers, every pair judged at its floor and every peer's
+    /// relay bound stated since, and when: two rounds more, so each peer has answered after a
+    /// period began with every pair judged, and states a bound drawn from verdicts, not from the
+    /// timers before them.
+    fn judged_under_budget() -> (Detector, u64) {
+        let peers = [A, B, C];
+        let mut detector = budgeted(&peers);
+        let mut state = 0x2545_F491_4F6C_DD1D;
+        let judged = drive_many(
+            &mut detector,
+            MS,
+            600_000 * MS,
+            |_| Some(jitter(&mut state)),
+            |_, _, _, _| false,
+            |detector| judged_at_floor(detector, &peers),
+        );
+        assert!(judged_at_floor(&detector, &peers), "every pair judged");
+        let periods = detector.periods.count + 2 * 3;
+        let now = drive_many(
+            &mut detector,
+            judged,
+            judged + 600_000 * MS,
+            |_| Some(jitter(&mut state)),
+            |_, _, _, _| false,
+            |detector| detector.periods.count >= periods,
+        );
+        (detector, now)
+    }
+
+    /// Polls from `now` until the next period starts: its probe.
+    fn next_probe(detector: &mut Detector, now: &mut u64) -> Ping {
+        let mut requests = Vec::new();
+        loop {
+            if let Some(ping) = detector.poll(*now, &mut requests) {
+                return ping;
+            }
+            *now = detector.wake().unwrap().max(*now);
+        }
+    }
+
+    /// An owner re-derives its budget as its measurements change (slates: its failover objective
+    /// less the council's window for confirming a death): a new budget floors the next period, and a
+    /// period resting now keeps the rest its start set.
+    #[test]
+    fn a_new_detection_budget_floors_the_next_period_and_a_resting_one_keeps_its_rest() {
+        let (mut detector, mut now) = judged_under_budget();
+        let floor = |budget: Duration| nanos(budget) / (2 * (2 * 3 - 1) + 1);
+        let ping = next_probe(&mut detector, &mut now);
+        detector.on_ack(
+            ping.to,
+            ping.nonce,
+            now + MS,
+            detector.relay_within_ns(ping.to),
+        );
+        let resting = detector.probe.unwrap();
+        assert!(!resting.provisional, "judged by an estimator");
+        assert_eq!(resting.rests_until, resting.sent_ns + floor(BUDGET));
+        detector.set_detection_budget(BUDGET / 3);
+        assert_eq!(
+            detector.probe.unwrap().rests_until,
+            resting.rests_until,
+            "the period resting keeps its rest"
+        );
+        assert_eq!(detector.wake(), Some(resting.rests_until));
+        now = resting.rests_until;
+        let next = next_probe(&mut detector, &mut now);
+        assert_ne!(next.nonce, ping.nonce);
+        let started = detector.probe.unwrap();
+        assert_eq!(started.rests_until, started.sent_ns + floor(BUDGET / 3));
+    }
+
+    /// The least budget the member's deadlines support is its detection bound with every period at
+    /// what an unanswered probe's deadlines allow, not at the lengths the budget's floor stretched
+    /// its periods to; and a budget set at it floors a period at exactly that. Nothing before a
+    /// period.
+    #[test]
+    fn the_least_detection_bound_is_the_bound_the_deadlines_allow_without_the_floor() {
+        assert_eq!(budgeted(&[A, B, C]).least_detection_bound(MS), None);
+        let (mut detector, now) = judged_under_budget();
+        let least = detector.least_detection_bound(now).unwrap();
+        let period = detector.longest_unanswered + detector.wakes.latest_ns(now);
+        assert_eq!(least, Duration::from_nanos(period * (2 * (2 * 3 - 1) + 1)));
+        let bound = detector.detection_bound(now).unwrap();
+        assert!(least < bound, "{least:?} under the floor's {bound:?}");
+        detector.set_detection_budget(least);
+        assert_eq!(detector.period_floor_ns(), period);
     }
 
     /// Only a period an estimator judges rests: a timer-judged period ends at its answer whatever the

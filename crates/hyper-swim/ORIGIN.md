@@ -190,6 +190,13 @@
     - The acknowledgement also carries `promise_ns`, slates' ask, for an owner's per-grant lease
       (Gray and Cheriton 1989); the detector reads none of it.
 
+20. **An owner re-derives its budget and reads the least its member's deadlines support**
+    (`docs/timing.md` §2.7, "The owner's detection budget"; slates' asks of 2026-10-10).
+    `Detector::set_detection_budget` sets the budget a period starting from then is floored by;
+    `Detector::least_detection_bound` states the detection bound with every period at what an
+    unanswered probe's deadlines allow, the budget below which the owner's requirement cannot be
+    kept on its network.
+
 The wire changed in place with 8, 11 and 19: a probe and an answer carry entries of the existing
 gossip encoding, which a receiver of the earlier form applies as any gossip; `Sync` and `Nack` are
 new tags; the acknowledgement carries `promise_ns` and `relay_within_ns` after its standing, which a
@@ -198,7 +205,7 @@ revision for its whole fleet and none is in service yet, so there is no earlier 
 
 ## Tests
 
-- 92 unit tests: slates' membership, gossip, codec and coordinate tests (the engine's update checked
+- 94 unit tests: slates' membership, gossip, codec and coordinate tests (the engine's update checked
   bit for bit, on values whose every step is exact: Dabek's Fig. 3, an error estimate the same at
   scales 2¹⁰ apart, a quarter of the gap closed at each sample), the extension series and
   its bounds, the gossip queue's order, replacement and bound, and the measured timing's: nothing
@@ -221,7 +228,8 @@ revision for its whole fleet and none is in service yet, so there is no earlier 
   that stated none, it ends once every relay has nacked, a relay's deadline and stated bound leave
   out its pair with the asker, a peer answering only through slow relays is never suspected, and a
   late answer to a told probe takes back its pending condemnation, with the acknowledgement's and
-  the nack's golden encodings.
+  the nack's golden encodings; and a budget set anew floors the next period, the one resting
+  keeping its rest, and the least bound is the one the deadlines allow without the floor.
 - `tests/cluster.rs`: five real member processes run the detector over hyper-datagram on real
   UDP sockets, as the library configures it.
   - The supervisor starts them together, waits until every member judges every peer by a

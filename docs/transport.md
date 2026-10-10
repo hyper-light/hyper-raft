@@ -211,7 +211,13 @@ each ported test's origin, and what was left out).
   receive windows) and `stats`.
 - Events: `Connected { peer, role, epoch }`, `Request`, `Reply`, `BodyReady`, `Writable`,
   `Frame { peer, lane, kind, frame }`, `Refused { exchange, refusal, by_peer }`,
-  `Closed { peer, epoch }`, `Unreachable`; at most `Limits::event_bound` wait for the owner (below).
+  `Closed { peer, epoch, refusal }`, `Unreachable { peer, refusal }`; at most
+  `Limits::event_bound` wait for the owner (below).
+- The TLS is the owner's (below, "The owner's TLS"): `Config { tls, role, limits }` takes a
+  `tls::Tls`, the server side (when the endpoint listens) and the client side as hyper-tls
+  configurations, `Tls::mutual(credentials, listen)` building the mutual TLS described next;
+  `set_tls` replaces it while the endpoint runs; `directory` and `directory_mut` lend the directory
+  to its owner between driving calls.
 - Departures from §3.4's sketch, none of substance: `Directory` is the third type parameter (§3.4's
   `PeerId` presumed one); `Classes` gains `RANKS`, `rank`, `kind_code`, `kind_of` (the reserve counts
   the classes above, and the kind crosses the wire); `send_frame` takes the frame's kind (its class
@@ -243,9 +249,48 @@ on a loaded runner; `src/progress.rs`); and a period
 that moved nothing through this side's own doing (an owner not reading a body, or bytes the peer's
 credit would take but this side has not sent) is no evidence against the peer and is not judged. Replication frames travel on lanes, unidirectional streams as wide as the core's
 window, always read; a frame its class or the budget cannot take is skipped and counted. Admission
-bounds pending handshakes (Retry under load), identities, connections per identity (the one used
-longest ago replaced) and connections in all; every exchange and lane has a table bound. Every
-refusal is typed, and one that ends an exchange crosses the wire as the stream reset's code.
+bounds pending handshakes (Retry under load), identities, connections per identity (the idle one
+used longest ago replaced, below) and connections in all; every exchange and lane has a table bound.
+Every refusal is typed, and one that ends an exchange crosses the wire as the stream reset's code.
+
+**Only an idle connection is replaced** (2026-10-10, focal's fix of 2026-10-09 ported). An identity
+at its bound used to replace whichever of its connections it had used least, busy or not: in focal,
+64 callers of one principal against a bound of 16 replaced 27,765 connections in 30 s and a third
+of their writes ended unknown, each caller's dial closing another's connection under its requests.
+A connection is now replaced only when idle: no exchange under way and nothing begun, ended or
+carried on it (frames included) for the serve period. With none idle the newcomer is refused,
+`Refusal::Busy`, which crosses as the close code so the dialer is told; the exchanges under way
+complete. A full endpoint gives an identity under its fair share (the connections among the
+identities holding them, the newcomer counted) an idle connection of the identity holding the most,
+when that one holds more than the share: max-min fairness (Bertsekas and Gallager, *Data Networks*,
+§6.5.2), so one identity alone may use what its bound allows and no identity's share grows at the
+cost of one holding less; an identity at its share takes nothing, so two never trade a connection
+back and forth (`src/admission.rs`, `tests/exchange.rs`
+`a_connection_carrying_an_exchange_is_not_replaced_and_the_newcomer_is_told_it_is_busy`).
+
+**The owner's TLS** (2026-10-10, for focal-wire's layer over this crate). focal's trust is more than
+one fixed set of roots: the roots a node verifies clients under change as its issuer is succeeded,
+its client verifier adopts a successor its trusted issuer endorsed, it renews its certificate
+without rebinding, and one endpoint serves a second protocol, enrollment, whose joiners have no
+certificate yet and are served the founder's enrollment certificate. So the endpoint takes the
+owner's hyper-tls configurations (`tls::Tls`) and holds them to the transport's rules whatever built
+them: early data off on both sides, and an application protocol named on each (RFC 9001 §8.1), so
+that every connection negotiates one (`Refusal::Configuration` otherwise). `set_tls` swaps them
+while the endpoint runs: the next handshake meets the new certificate and roots, and a connection
+made under the last ones stays up until it closes (hyper-quic retires a configuration once the
+last connection made under it drains). The directory names a peer from all the handshake
+established (`Authenticated`): the certificate, or none when the server's client verifier let the
+peer in without one, the protocol it negotiated, and the peer this side dialed, if it dialed; the
+role it names is what holds such a peer to the kinds it may send (`Classes::class_of`), and a peer it
+does not name is refused (`Refusal::Identity`) and charged to no identity. A dialer is told why a
+connection ended or a dial failed, when either side said: a TLS alert from either side (RFC 9000
+§20.1's crypto codes) or either directory refusing is `Refusal::Identity`; a peer full at its
+admission says which bound in its close code (`Pending`, `Identities`, `Connections` and `Events`
+now cross the wire, appended to the codes so that every earlier code keeps its meaning), and its
+CONNECTION_REFUSED of an attempt is `Pending`. A TLS 1.3 client's handshake is complete before the
+server has verified the client's certificate (RFC 8446 §4.4.4), so a dial whose certificate is
+refused is up and then closed: `Closed` carries the cause as `Unreachable` does
+(`tests/tls.rs`).
 
 **The events the owner has not polled** are bounded too (`Limits::event_bound`): at most
 `4·exchanges + peers·(1 + lanes_per_peer·lane_window)`, `peers` the peer table's bound (the larger

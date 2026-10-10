@@ -24,6 +24,10 @@ pub enum Refusal {
     /// The connections held in all are at their bound, after the replacement rule.
     #[error("too many connections are held")]
     Connections,
+    /// The identity holds every connection it may and none of them is idle: each carries an
+    /// exchange or carried something within the quiet period, so none is replaced.
+    #[error("the identity holds every connection it may, and is using each")]
+    Busy,
     /// The peer's certificate names no peer of the directory, or not the one dialed.
     #[error("the certificate names no peer the directory knows")]
     Identity,
@@ -75,8 +79,11 @@ pub enum Refusal {
 }
 
 /// The refusals that cross the wire, in the order of their codes; a code is its index plus one,
-/// so that zero, QUIC's conventional "no error", is never a refusal.
-const WIRE: [Refusal; 9] = [
+/// so that zero, QUIC's conventional "no error", is never a refusal. A refusal is only ever added
+/// at the end, so a code keeps its meaning between versions. The admission bounds a connection is
+/// closed at (the last five) cross as the connection's close code, so a dialer learns that the
+/// peer was full rather than gone (`Event::Unreachable`).
+const WIRE: [Refusal; 14] = [
     Refusal::Kind,
     Refusal::FrameBound,
     Refusal::Budget,
@@ -86,6 +93,11 @@ const WIRE: [Refusal; 9] = [
     Refusal::Exchanges,
     Refusal::Lanes,
     Refusal::Identity,
+    Refusal::Pending,
+    Refusal::Identities,
+    Refusal::Connections,
+    Refusal::Events,
+    Refusal::Busy,
 ];
 
 impl Refusal {
@@ -121,5 +133,17 @@ mod tests {
             Refusal::from_code(u64::from(Refusal::Order.code())),
             Refusal::Closed
         );
+    }
+
+    #[test]
+    fn a_refusal_keeps_its_code_as_refusals_are_added() {
+        // Appended, never renumbered: what an older peer sends means what it meant.
+        let codes: Vec<u32> = WIRE.iter().map(|refusal| refusal.code()).collect();
+        assert_eq!(codes, (1..=14).collect::<Vec<u32>>());
+        assert_eq!(Refusal::Kind.code(), 1);
+        assert_eq!(Refusal::Identity.code(), 9);
+        assert_eq!(Refusal::Pending.code(), 10);
+        assert_eq!(Refusal::Events.code(), 13);
+        assert_eq!(Refusal::Busy.code(), 14);
     }
 }

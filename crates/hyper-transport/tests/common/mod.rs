@@ -22,10 +22,10 @@
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
-use hyper_transport::tls::{CertificateDer, Credentials, PrivateKeyDer, PrivatePkcs8KeyDer};
+use hyper_transport::tls::{CertificateDer, Credentials, PrivateKeyDer, PrivatePkcs8KeyDer, Tls};
 use hyper_transport::{
-    AdmissionLimits, Budget, Classes, Config, Directory, Endpoint, Event, Fixed, Limits, PeerId,
-    Transmit,
+    AdmissionLimits, Authenticated, Budget, Classes, Config, Directory, Endpoint, Event, Fixed,
+    Limits, PeerId, Refusal, Transmit,
 };
 
 /// The deployment's authority, issuing one certificate per node.
@@ -232,7 +232,8 @@ impl Book {
 
 impl Directory for Book {
     type Role = Role;
-    fn identify(&mut self, certificate: &[u8]) -> Option<(PeerId, Role)> {
+    fn identify(&mut self, authenticated: &Authenticated<'_>) -> Option<(PeerId, Role)> {
+        let certificate = authenticated.certificate?;
         self.entries
             .iter()
             .find(|(known, _, _)| known == certificate)
@@ -590,10 +591,9 @@ impl Pair {
     ) -> Node<C> {
         let (certificate, key) = if which == 1 { &self.one } else { &self.two };
         let config = Config {
-            credentials: credentials(&self.pki.root, certificate, key),
+            tls: Tls::mutual(&credentials(&self.pki.root, certificate, key), true).unwrap(),
             role,
             limits,
-            listen: true,
         };
         Endpoint::new(config, Fixed::new(budget, 64), book, now).unwrap()
     }
@@ -646,7 +646,8 @@ pub struct Server {
     pub answered: u64,
     pub frames: Vec<(PeerId, u32, Vec<u8>)>,
     pub connected: Vec<PeerId>,
-    pub closed: Vec<PeerId>,
+    /// Each connection that closed, and why when either side said.
+    pub closed: Vec<(PeerId, Option<Refusal>)>,
     pub refused: Vec<(hyper_transport::Refusal, bool)>,
     piece: Vec<u8>,
 }
@@ -712,7 +713,7 @@ impl Server {
                 node.release(frame);
             }
             Event::Connected { peer, .. } => self.connected.push(peer),
-            Event::Closed { peer, .. } => self.closed.push(peer),
+            Event::Closed { peer, refusal, .. } => self.closed.push((peer, refusal)),
             Event::Refused {
                 exchange,
                 refusal,
@@ -823,8 +824,10 @@ pub struct Asker {
     pub clock: Instant,
     pub events: Vec<String>,
     pub connected: Vec<PeerId>,
-    pub unreachable: Vec<PeerId>,
-    pub closed: Vec<PeerId>,
+    /// Each dial that failed, and why when either side said.
+    pub unreachable: Vec<(PeerId, Option<Refusal>)>,
+    /// Each connection that closed, and why when either side said.
+    pub closed: Vec<(PeerId, Option<Refusal>)>,
     piece: Vec<u8>,
 }
 
@@ -920,12 +923,12 @@ impl Asker {
                 }
             }
             Event::Connected { peer, .. } => self.connected.push(peer),
-            Event::Unreachable { peer } => self.unreachable.push(peer),
+            Event::Unreachable { peer, refusal } => self.unreachable.push((peer, refusal)),
             Event::Frame { lane, frame, .. } => {
                 self.frames.push((lane, frame.bytes().to_vec()));
                 node.release(frame);
             }
-            Event::Closed { peer, .. } => self.closed.push(peer),
+            Event::Closed { peer, refusal, .. } => self.closed.push((peer, refusal)),
             _ => {}
         }
     }

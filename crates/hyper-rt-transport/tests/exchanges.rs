@@ -76,10 +76,10 @@ fn endpoint(
     let mut book = Book::default();
     book.add(other, peer, Role::Node);
     let config = Config {
-        credentials: credentials(&pki.root, &own.0, &own.1),
+        tls: hyper_transport::tls::Tls::mutual(&credentials(&pki.root, &own.0, &own.1), listen)
+            .unwrap(),
         role: Role::Node,
         limits: limits(),
-        listen,
     };
     Endpoint::new(config, Fixed::new(512 << 20, 64), book, Instant::now()).unwrap()
 }

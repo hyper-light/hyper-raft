@@ -106,13 +106,31 @@ pub trait Classes {
     fn kind_of(code: u16) -> Option<Self::Kind>;
 }
 
-/// Which peer a certificate names: the node's view of its membership and its clients.
+/// What a connection's handshake established, for [`Directory::identify`]: everything the
+/// directory names the peer and its role by.
+#[derive(Clone, Copy, Debug)]
+pub struct Authenticated<'a> {
+    /// The peer's end-entity certificate (DER), verified by the TLS configuration's verifier, or
+    /// `None` when the peer presented none: a server whose client verifier lets a client
+    /// authenticate otherwise (an enrolling node, a guest) accepts it without one, and only the
+    /// directory decides what such a peer may send (its role, through [`Classes::class_of`]).
+    pub certificate: Option<&'a [u8]>,
+    /// The application protocol the handshake negotiated (RFC 7301): one of the server
+    /// configuration's, so one endpoint can serve several protocols' peers under one certificate
+    /// each and name each by its own.
+    pub protocol: &'a [u8],
+    /// The peer this side dialed, or `None` for a connection the peer opened. A dialed connection
+    /// is admitted only as the peer dialed: the directory names it, or refuses it.
+    pub dialed: Option<PeerId>,
+}
+
+/// Which peer a connection names: the node's view of its membership and its clients.
 pub trait Directory {
     /// A sender's role, as [`Classes::Role`].
     type Role: Copy + Debug;
-    /// The peer and role an authenticated end-entity certificate (DER) names, or `None`: the
-    /// connection is refused and charged to no identity.
-    fn identify(&mut self, certificate: &[u8]) -> Option<(PeerId, Self::Role)>;
+    /// The peer and role a connection's handshake names, or `None`: the connection is refused
+    /// ([`Refusal::Identity`]) and charged to no identity.
+    fn identify(&mut self, authenticated: &Authenticated<'_>) -> Option<(PeerId, Self::Role)>;
     /// The name a peer's certificate is checked against when this node dials it.
     fn server_name(&self, peer: PeerId) -> Option<&str>;
 }
@@ -186,11 +204,24 @@ pub enum Event<C: Classes> {
         peer: PeerId,
         /// The epoch of the connection that closed.
         epoch: Epoch,
+        /// Why, when either side said, as [`Event::Unreachable`] tells it: a TLS client's
+        /// handshake is complete before the server has verified its certificate (RFC 8446 §4.4.4,
+        /// RFC 9001 §4.1.2), so a dial whose certificate the peer refuses, by TLS or by its
+        /// directory, is up and then closed with [`Refusal::Identity`]; a connection the peer's
+        /// admission replaced closes with its bound ([`Refusal::Connections`]).
+        refusal: Option<Refusal>,
     },
     /// A dial to `peer` ended before it authenticated, or authenticated as someone else.
     Unreachable {
         /// The peer.
         peer: PeerId,
+        /// Why, when either side said: [`Refusal::Identity`] for a certificate refused on either
+        /// side (a TLS alert, RFC 9000 §20.1's crypto codes, or the peer's directory or this one
+        /// naming no peer, or another than the one dialed), a bound of the peer's admission
+        /// ([`Refusal::Pending`], [`Refusal::Identities`], [`Refusal::Connections`],
+        /// [`Refusal::Events`]) when its endpoint said it was full; `None` when nothing answered
+        /// (the path, a timeout, a reset).
+        refusal: Option<Refusal>,
     },
 }
 
@@ -243,10 +274,20 @@ impl<C: Classes> Debug for Event<C> {
                 formatter,
                 "Refused {{ exchange: {exchange:?}, refusal: {refusal:?}, by_peer: {by_peer} }}"
             ),
-            Self::Closed { peer, epoch } => {
-                write!(formatter, "Closed {{ peer: {peer}, epoch: {epoch} }}")
+            Self::Closed {
+                peer,
+                epoch,
+                refusal,
+            } => write!(
+                formatter,
+                "Closed {{ peer: {peer}, epoch: {epoch}, refusal: {refusal:?} }}"
+            ),
+            Self::Unreachable { peer, refusal } => {
+                write!(
+                    formatter,
+                    "Unreachable {{ peer: {peer}, refusal: {refusal:?} }}"
+                )
             }
-            Self::Unreachable { peer } => write!(formatter, "Unreachable {{ peer: {peer} }}"),
         }
     }
 }

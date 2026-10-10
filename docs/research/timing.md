@@ -291,10 +291,14 @@ applicable" (§3). Requirements (§4):
   seconds.
 §5: "there is no minimum RTO specified", and implementations use a steady-state minimum under
 RFC 6298's second; "the tension between the responsiveness and correctness of time-based loss
-detection seems to be a fundamental tradeoff". What it settles here: a relayed exchange's samples are
-named by the probe's nonce and so unambiguous, late ones included (2d); an exchange with no
-observation of its path is timed at no less than a second (1); a pair judged while the member's pool
-has refused keeps RFC 6298's minimum (`docs/timing.md` §2.7).
+detection seems to be a fundamental tradeoff". What it settles here: a pair's samples are named by
+the probe's nonce and so unambiguous, late ones included (2d); a pair with no observation of its path
+is timed at no less than a second (1); a pair judged while the member's pool has refused keeps RFC
+6298's minimum (`docs/timing.md` §2.7). And what it rules out: a timer over relayed exchanges. Relays
+are asked only when a probe goes unanswered, so on a network that answers every probe such a timer
+takes no observation at all, let alone one a round trip (2b), and rests at the cold second of (1)
+for good; the relay stage is bounded instead by what each relay states of its own deadlines
+(`docs/timing.md` §2.7, "The relay stage").
 
 **Microsoft, `timeBeginPeriod` (learn.microsoft.com).** The default timer resolution is
 15.625 ms (64 interrupts a second). Since Windows 10 2004 a request applies to the calling

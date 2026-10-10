@@ -26,16 +26,20 @@
 //!
 //! What it asserts of every suspicion and condemnation is the detector's rule, exactly, from the
 //! members' own records (`docs/timing.md` §2.7). Each member records every probe it sends, with the
-//! deadline its detector stated as it was sent, every ping-request, every answer it hands its
-//! detector, every ping it answers, and what each poll found ([`Detector::findings`]). Each
-//! suspicion, and each condemnation made pending, is traced to its probe: sent when the finding
-//! says, with the deadline it states; its period ended no earlier than that deadline nor, where
-//! relays were asked, than theirs; no answer, direct or relayed, handed to the detector before the
-//! end. Then to the answer that missed it, handed over late, or was lost, the target's record
-//! saying whether the ping reached it. Each condemnation is traced to the pending one it follows
-//! and to the answer from another member it was made at, and every count a member reports is its
-//! findings'. Theorem 7's allowance for live members, `Σβ` over every judged probe, is printed
-//! beside their counts: a report, not a test, for a count is what the rule found, not a draw.
+//! deadline its detector stated as it was sent, every ping-request, every answer and nack it hands
+//! its detector, every ping it answers, and what each poll found ([`Detector::findings`]). A member
+//! relays as the library asks: each ping it sends for another member carries its own deadline for
+//! the target, and with no answer by then it nacks (Lifeguard's nack). Each suspicion, and each
+//! condemnation made pending, is traced to its probe: sent when the finding says, with the
+//! deadline it states; its period ended no earlier than that deadline nor, where relays were asked,
+//! than theirs, unless every relay asked had nacked; no answer, direct or relayed, handed to the
+//! detector before the end. Then to the answer that missed it, handed over late, or was lost, the
+//! target's record saying whether the ping reached it. Each condemnation is traced to the pending
+//! one it follows, with no answer from its target to the told probe or a later one handed over
+//! since, and to the answer from another member it was made at; and every count a member reports
+//! is its findings'. Theorem 7's allowance for live members, `Σβ` over every judged probe, is
+//! printed beside their counts: a report, not a test, for a count is what the rule found, not a
+//! draw.
 
 #![allow(
     clippy::unwrap_used,
@@ -213,9 +217,9 @@ struct Member {
     batch: Vec<(HostId, MemberState)>,
     encoded: Vec<u8>,
     requests: Vec<PingReq>,
-    /// Probes this member relays: the target, the relay's nonce, who asked and with which nonce.
-    /// One a target, so bounded by the membership.
-    relaying: BTreeMap<u64, (u64, HostId, u64)>,
+    /// The probes this member relays, by asker and target: one an asker and target, so bounded by
+    /// the membership's square.
+    relaying: BTreeMap<(u64, u64), Relaying>,
     /// Each peer's death as this member last came to hold it, and whether it holds it still: how
     /// long after the peer's last answer, and the bound its detector stated then.
     dead_seen: BTreeMap<u64, Noted>,
@@ -224,6 +228,17 @@ struct Member {
     /// This member's record since its last line, in the order made ([`Record`]): written out with
     /// the line, so a count a line reports follows every finding it counts.
     records: String,
+}
+
+/// A probe a member relays for another (SWIM's indirect probe): its own nonce, who asked and with
+/// which nonce, the deadline its detector stated for it, and whether it has nacked.
+#[derive(Clone, Copy, Debug)]
+struct Relaying {
+    relayed: u64,
+    asker: HostId,
+    asked: u64,
+    due: u64,
+    nacked: bool,
 }
 
 /// A death a member came to hold: how long after the peer's last answer, the bound its detector
@@ -307,6 +322,8 @@ impl Member {
             boot_nonce: self.me,
             configuration_version: 0,
             standing: None,
+            promise_ns: 0,
+            relay_within_ns: u64::MAX,
             gossip: GossipBatch::Entries(&[]),
             coordinate: Coordinate::Held(&coordinate),
         }
@@ -335,9 +352,31 @@ impl Member {
     }
 
     /// Polls the detector and sends what it asks, recording what the poll found, the relays it
-    /// asks and the probe it sends with its stated deadline. Whether a period began.
+    /// asks and the probe it sends with its stated deadline; and tells the asker of each probe it
+    /// relays unanswered by its deadline so (Lifeguard's nack). Whether a period began.
     fn step(&mut self) -> bool {
         let now = self.now();
+        let expired: Vec<((u64, u64), Relaying)> = self
+            .relaying
+            .iter()
+            .filter(|(_, relaying)| !relaying.nacked && relaying.due <= now)
+            .map(|(key, relaying)| (*key, *relaying))
+            .collect();
+        for (key, relaying) in expired {
+            if let Some(held) = self.relaying.get_mut(&key) {
+                held.nacked = true;
+            }
+            self.send(
+                relaying.asker.0,
+                &SwimMessage::Nack {
+                    from: HostId(self.me),
+                    target: HostId(key.1),
+                    nonce: relaying.asked,
+                    boot_nonce: self.me,
+                    gossip: GossipBatch::Entries(&[]),
+                },
+            );
+        }
         let mut requests = std::mem::take(&mut self.requests);
         let ping = self.detector.poll(now, &mut requests);
         for finding in self.detector.findings() {
@@ -373,8 +412,7 @@ impl Member {
                 "p {} {} {now} {} {}",
                 ping.nonce,
                 ping.to.0,
-                ping.due_ns
-                    .map_or_else(|| "-".to_owned(), |due| due.to_string()),
+                ping.due_ns,
                 u8::from(told)
             );
             self.send(
@@ -409,11 +447,26 @@ impl Member {
         ping.is_some()
     }
 
-    /// Waits for one datagram until the detector's wake (or for one datagram, when it asks no
-    /// wake), and handles it. Only a timeout or a datagram ends the wait: any other error
-    /// (Windows reports a reset on the next receive after a send to a closed port) skips it.
+    /// When this member must run next: its detector's wake, or the deadline of a probe it relays
+    /// that has not nacked.
+    fn wake(&self) -> Option<u64> {
+        let relayed = self
+            .relaying
+            .values()
+            .filter(|relaying| !relaying.nacked)
+            .map(|relaying| relaying.due)
+            .min();
+        match (self.detector.wake(), relayed) {
+            (Some(own), Some(relayed)) => Some(own.min(relayed)),
+            (own, relayed) => own.or(relayed),
+        }
+    }
+
+    /// Waits for one datagram until this member's wake (or for one datagram, when it has none),
+    /// and handles it. Only a timeout or a datagram ends the wait: any other error (Windows
+    /// reports a reset on the next receive after a send to a closed port) skips it.
     fn receive(&mut self) {
-        let timeout = match self.detector.wake() {
+        let timeout = match self.wake() {
             Some(at) => match at.checked_sub(self.now()).filter(|left| *left > 0) {
                 Some(left) => Some(Duration::from_nanos(left)),
                 None => return,
@@ -467,6 +520,8 @@ impl Member {
                         boot_nonce: self.me,
                         configuration_version: 0,
                         standing: None,
+                        promise_ns: 0,
+                        relay_within_ns: ack.relay_within_ns,
                         gossip: GossipBatch::Entries(&batch),
                         coordinate: Coordinate::Held(&coordinate),
                     },
@@ -476,30 +531,37 @@ impl Member {
             SwimMessage::Ack {
                 from,
                 nonce,
+                relay_within_ns,
                 gossip,
                 coordinate,
                 ..
             } => {
                 self.detector.apply_gossip(gossip);
                 self.detector.learn_coordinate(from, coordinate);
-                // An answer to a probe made for another member goes back to it.
-                match self.relaying.get(&from.0) {
-                    Some(&(relayed, asker, asked)) if relayed == nonce => {
-                        self.relaying.remove(&from.0);
+                // An answer to a probe made for another member goes back to it, after a nack
+                // too.
+                let relayed = self
+                    .relaying
+                    .iter()
+                    .find(|((_, target), relaying)| *target == from.0 && relaying.relayed == nonce)
+                    .map(|(key, relaying)| (*key, *relaying));
+                match relayed {
+                    Some((key, relaying)) => {
+                        self.relaying.remove(&key);
                         self.send(
-                            asker.0,
+                            relaying.asker.0,
                             &SwimMessage::IndirectAck {
                                 from: HostId(self.me),
                                 target: from,
-                                nonce: asked,
+                                nonce: relaying.asked,
                                 boot_nonce: self.me,
                                 gossip: GossipBatch::Entries(&[]),
                             },
                         );
                     }
-                    _ => {
+                    None => {
                         let _ = writeln!(self.records, "a {} {nonce} {stamp}", from.0);
-                        self.detector.on_ack(from, nonce, stamp);
+                        self.detector.on_ack(from, nonce, stamp, relay_within_ns);
                     }
                 }
             }
@@ -510,8 +572,17 @@ impl Member {
                 gossip,
             } => {
                 self.detector.apply_gossip(gossip);
-                let ping = self.detector.on_ping_req(target);
-                self.relaying.insert(target.0, (ping.nonce, from, nonce));
+                let ping = self.detector.on_ping_req(from, target, stamp);
+                self.relaying.insert(
+                    (from.0, target.0),
+                    Relaying {
+                        relayed: ping.nonce,
+                        asker: from,
+                        asked: nonce,
+                        due: ping.due_ns,
+                        nacked: false,
+                    },
+                );
                 self.send(
                     target.0,
                     &SwimMessage::Ping {
@@ -539,6 +610,17 @@ impl Member {
                 let _ = writeln!(self.records, "i {} {nonce} {stamp}", target.0);
                 self.detector.apply_gossip(gossip);
                 self.detector.on_indirect_ack(target, nonce, stamp);
+            }
+            SwimMessage::Nack {
+                from,
+                target,
+                nonce,
+                gossip,
+                ..
+            } => {
+                let _ = writeln!(self.records, "n {} {} {nonce} {stamp}", from.0, target.0);
+                self.detector.apply_gossip(gossip);
+                self.detector.on_indirect_nack(from, target, nonce, stamp);
             }
         }
     }
@@ -670,14 +752,13 @@ fn note_finding(records: &mut String, finding: &Finding) {
 /// One entry of a member's record, in the order the member made it, times on its own clock.
 #[derive(Clone, Copy, Debug)]
 enum Record {
-    /// `p nonce to at due|- told`: a probe sent, the deadline its detector stated as it was sent
-    /// (`None` for a measurement probe, which judges nothing), and whether it carried the
-    /// member's suspicion of its target.
+    /// `p nonce to at due told`: a probe sent, the deadline its detector stated as it was sent, and
+    /// whether it carried the member's suspicion of its target.
     Probe {
         nonce: u64,
         to: u64,
         at: u64,
-        due: Option<u64>,
+        due: u64,
         told: bool,
     },
     /// `r relay target nonce at`: a relay asked to probe `target` for the probe `nonce`.
@@ -691,6 +772,13 @@ enum Record {
     Answer { from: u64, nonce: u64, at: u64 },
     /// `i target nonce at`: `target`'s answer to the probe `nonce` through a relay, handed over.
     Relayed { target: u64, nonce: u64, at: u64 },
+    /// `n relay target nonce at`: a relay's nack for the probe `nonce` of `target`, handed over.
+    Nacked {
+        relay: u64,
+        target: u64,
+        nonce: u64,
+        at: u64,
+    },
     /// `g from nonce at`: a ping from `from` answered.
     Pinged { from: u64, nonce: u64 },
     /// What a poll found.
@@ -722,7 +810,7 @@ fn record(line: &str) -> Option<Record> {
             nonce: number(1)?,
             to: number(2)?,
             at: number(3)?,
-            due: maybe(4)?,
+            due: number(4)?,
             told: *fields.get(5)? == "1",
         },
         "r" => Record::Asked {
@@ -740,6 +828,12 @@ fn record(line: &str) -> Option<Record> {
             target: number(1)?,
             nonce: number(2)?,
             at: number(3)?,
+        },
+        "n" => Record::Nacked {
+            relay: number(1)?,
+            target: number(2)?,
+            nonce: number(3)?,
+            at: number(4)?,
         },
         "g" => Record::Pinged {
             from: number(1)?,
@@ -1389,12 +1483,14 @@ fn a_killed_member_is_declared_dead_by_every_survivor_and_no_live_one_is() {
     let (traced, failures) = trace(&records, &victims);
     println!(
         "every finding traced: {} suspicions and {} condemnations made pending, each probe \
-         unanswered by its stated deadline, its answer late in {} (the latest {:?} past its \
-         deadline), relayed late in {}, lost in {}, its ping unheard by a live target in {} and \
-         by a killed one in {}; {} condemnations, each after its pending one and another member's \
-         answer",
+         unanswered by its stated deadline and its relays' ({} ended early, every relay having \
+         nacked), its answer late in {} (the latest {:?} past its deadline), relayed late in {}, \
+         lost in {}, its ping unheard by a live target in {} and by a killed one in {}; {} \
+         condemnations, each after its pending one and another member's answer, with no answer \
+         from its target since",
         traced.suspicions,
         traced.pending,
+        traced.nacked,
         traced.late,
         traced.latest,
         traced.relayed_late,
@@ -1424,6 +1520,8 @@ struct Traced {
     latest: Duration,
     /// Relayed answers handed over after the period ended.
     relayed_late: u64,
+    /// Relay stages that ended before their timeout, every relay asked having nacked.
+    nacked: u64,
     /// Pings the target's record answered whose answer the member never handed over.
     answer_lost: u64,
     /// Pings a target that ran to the end has no record of.
@@ -1434,7 +1532,7 @@ struct Traced {
 
 /// Where a probe is in a member's record: its place, its target, when it was sent, the deadline
 /// stated as it was sent, and whether it carried the suspicion of its target.
-type Sent = (usize, u64, u64, Option<u64>, bool);
+type Sent = (usize, u64, u64, u64, bool);
 
 /// Of each nonce, where its answers are in a member's record: their places, who answered, when.
 type Answers = BTreeMap<u64, Vec<(usize, u64, u64)>>;
@@ -1442,10 +1540,12 @@ type Answers = BTreeMap<u64, Vec<(usize, u64, u64)>>;
 /// Traces every finding in the members' records to the detector's rule, from those records
 /// alone, and lists each way one fails it. A suspicion or a condemnation made pending: its probe
 /// was sent when it says, with the deadline it states, as stated when sent; its period ended no
-/// earlier than that deadline nor, where relays were asked (at or past it), than theirs; no answer,
-/// direct or relayed, was handed to the detector between the probe and the end; a pending one's
-/// probe carried the suspicion. A condemnation: a pending one of its target ended when it says,
-/// before it, and the probe it names, of another member, was answered before it.
+/// earlier than that deadline nor, where relays were asked (at or past it), than theirs, unless
+/// every relay asked had nacked before it ended; no answer, direct or relayed, was handed to the
+/// detector between the probe and the end; a pending one's probe carried the suspicion. A
+/// condemnation: a pending one of its target ended when it says, before it, with no answer from
+/// the target to its probe or a later one handed over since; and the probe it names, of another
+/// member, was answered before it.
 fn trace(records: &BTreeMap<u64, Vec<Record>>, killed: &[u64]) -> (Traced, Vec<String>) {
     // Every ping each member answered: the member, who pinged it, the ping's nonce.
     let pinged: BTreeSet<(u64, u64, u64)> = records
@@ -1464,6 +1564,7 @@ fn trace(records: &BTreeMap<u64, Vec<Record>>, killed: &[u64]) -> (Traced, Vec<S
         let mut answers = Answers::new();
         let mut relayed = Answers::new();
         let mut asked: BTreeMap<u64, Vec<(usize, u64, u64, u64)>> = BTreeMap::new();
+        let mut nacks: BTreeMap<u64, Vec<(usize, u64, u64, u64)>> = BTreeMap::new();
         for (place, entry) in made.iter().enumerate() {
             match *entry {
                 Record::Probe {
@@ -1488,6 +1589,17 @@ fn trace(records: &BTreeMap<u64, Vec<Record>>, killed: &[u64]) -> (Traced, Vec<S
                     at,
                 } => {
                     asked
+                        .entry(nonce)
+                        .or_default()
+                        .push((place, relay, target, at));
+                }
+                Record::Nacked {
+                    relay,
+                    target,
+                    nonce,
+                    at,
+                } => {
+                    nacks
                         .entry(nonce)
                         .or_default()
                         .push((place, relay, target, at));
@@ -1530,7 +1642,7 @@ fn trace(records: &BTreeMap<u64, Vec<Record>>, killed: &[u64]) -> (Traced, Vec<S
                             "its probe went to {to} at {at} ns, after it or not as it says"
                         ));
                     }
-                    if due != Some(missed.due_ns) {
+                    if due != missed.due_ns {
                         fail(format!("its probe was sent with the deadline {due:?}"));
                     }
                     if missed.ended_ns < missed.due_ns {
@@ -1555,8 +1667,33 @@ fn trace(records: &BTreeMap<u64, Vec<Record>>, killed: &[u64]) -> (Traced, Vec<S
                     match missed.relays_due_ns {
                         None if asks.is_empty() => {}
                         Some(relays_due) if !asks.is_empty() => {
+                            // Before its timeout, the relay stage ends only once every relay it
+                            // asked has nacked, and no sooner than the last nack.
                             if missed.ended_ns < relays_due {
-                                fail("its period ended before the relays' deadline".to_owned());
+                                let nacked = |relay: u64| {
+                                    nacks
+                                        .get(&missed.nonce)
+                                        .into_iter()
+                                        .flatten()
+                                        .find(|(at, by, of, _)| {
+                                            *by == relay && *of == target && during(*at)
+                                        })
+                                        .map(|(.., at)| *at)
+                                };
+                                match asks
+                                    .iter()
+                                    .map(|(_, relay, ..)| nacked(*relay).ok_or(*relay))
+                                    .collect::<Result<Vec<u64>, u64>>()
+                                {
+                                    Err(relay) => fail(format!(
+                                        "its period ended before the relays' deadline, relay \
+                                         {relay} not having nacked"
+                                    )),
+                                    Ok(nacked) if nacked.iter().any(|at| *at > missed.ended_ns) => {
+                                        fail("its period ended before a relay's nack".to_owned());
+                                    }
+                                    Ok(_) => traced.nacked += 1,
+                                }
                             }
                             if asks.iter().any(|(.., at)| *at < missed.due_ns) {
                                 fail("relays were asked before the deadline".to_owned());
@@ -1603,12 +1740,33 @@ fn trace(records: &BTreeMap<u64, Vec<Record>>, killed: &[u64]) -> (Traced, Vec<S
                     at_ns,
                 } => {
                     traced.condemnations += 1;
-                    if !pending.iter().any(|(at, missed)| {
+                    match pending.iter().rev().find(|(at, missed)| {
                         missed.target == target
                             && missed.ended_ns == pending_since_ns
                             && *at < place
                     }) {
-                        fail("no condemnation of it was made pending when it says".to_owned());
+                        None => {
+                            fail("no condemnation of it was made pending when it says".to_owned());
+                        }
+                        // An answer from the target to the told probe or a later one, however
+                        // late and by whatever path, takes the pending condemnation back.
+                        Some(&(made, told)) => {
+                            let since = |at: usize| made < at && at < place;
+                            let later = |answers: &Answers| {
+                                answers.range(told.nonce..).any(|(_, answers)| {
+                                    answers
+                                        .iter()
+                                        .any(|(at, by, _)| *by == target.0 && since(*at))
+                                })
+                            };
+                            if later(&answers) || later(&relayed) {
+                                fail(
+                                    "the target answered its told probe or a later one after the \
+                                     condemnation was pending"
+                                        .to_owned(),
+                                );
+                            }
+                        }
                     }
                     if answered == target {
                         fail("its own answer condemned it".to_owned());

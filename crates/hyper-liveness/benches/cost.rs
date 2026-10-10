@@ -372,13 +372,13 @@ fn swim(nodes: usize) -> Rate {
                     }
                 };
                 let target = ping.to.0 as usize;
-                let _ = members[target].on_ping(HostId(prober as u64));
+                let ack = members[target].on_ping(HostId(prober as u64));
                 // A LAN's round trip, 200 µs and up to half as much again, as hyper-swim's bench.
                 noise ^= noise << 13;
                 noise ^= noise >> 7;
                 noise ^= noise << 17;
                 let lands = now[prober] + 200_000 + noise % 100_000;
-                members[prober].on_ack(ping.to, ping.nonce, lands);
+                members[prober].on_ack(ping.to, ping.nonce, lands, ack.relay_within_ns);
                 landing[prober] = Some(lands);
                 *messages += 2;
             }

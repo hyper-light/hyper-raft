@@ -43,6 +43,8 @@ pub fn gossip_per_message() -> usize {
         boot_nonce: 1,
         configuration_version: 1,
         standing: None,
+        promise_ns: 0,
+        relay_within_ns: u64::MAX,
         gossip: GossipBatch::Entries(&[]),
         coordinate: Coordinate::Held(&NetworkCoordinate::origin()),
     }
@@ -210,6 +212,8 @@ fn exchange(members: &mut [Member], prober: usize, ping: Ping, buffers: &mut Buf
         boot_nonce: 1,
         configuration_version: 1,
         standing: None,
+        promise_ns: 0,
+        relay_within_ns: ack.relay_within_ns,
         gossip: GossipBatch::Entries(&buffers.batch),
         coordinate: Coordinate::Held(answering.coordinate()),
     }
@@ -219,6 +223,7 @@ fn exchange(members: &mut [Member], prober: usize, ping: Ping, buffers: &mut Buf
         gossip,
         coordinate,
         nonce,
+        relay_within_ns,
         ..
     } = SwimMessage::decode(&buffers.ack).unwrap()
     else {
@@ -227,9 +232,8 @@ fn exchange(members: &mut [Member], prober: usize, ping: Ping, buffers: &mut Buf
     let probing = &mut members[prober];
     probing.detector.apply_gossip(gossip);
     probing.detector.learn_coordinate(from, coordinate);
-    probing.detector.on_ack(from, nonce, landing);
+    probing.detector.on_ack(from, nonce, landing, relay_within_ns);
     probing.landing = Some(landing);
-    let _ = ack;
 }
 
 /// One period of every member.

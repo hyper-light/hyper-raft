@@ -169,14 +169,36 @@
     timer-judged probe still wakes at its expected arrival, which measures `G`. `PeerReport::judge`
     says which judge times a pair, and `PeerReport::timer` its timer.
 
-The wire changed in place with 8 and 11: a probe and an answer carry entries of the existing gossip
-encoding, which a receiver of the earlier form applies as any gossip, and `Sync` is a new tag with
-its own golden vector. No consumer runs hyper-swim yet (slates' session owns its integration), so
-there is no earlier form in service to keep.
+19. **The relay stage is bounded by what each relay states** (`docs/timing.md` §2.7, "The relay
+    stage").
+    - A relay probes the target with its own deadline for it (`Detector::on_ping_req` takes the
+      asker and the time and states `Ping::due_ns`) and, with no answer by then, nacks
+      (`SwimMessage::Nack`, Lifeguard §IV-A); a later answer still goes back.
+    - Each acknowledgement states how long after a ping-request the acknowledging member responds
+      (`SwimMessage::Ack::relay_within_ns`, from `Detector::on_ping`'s `Ack`; learned by
+      `Detector::on_ack`'s new argument; `PeerReport::relay_within`): its longest deadline for any
+      member but the asker, plus `G`.
+    - The asker's stage ends when every relay asked has nacked (`Detector::on_indirect_nack`), or
+      when the slowest relay's response is due, its span for the relay plus the relay's bound. A peer
+      that has stated none is not asked.
+    - An answer to a told probe or a later one, however late and by whatever path, takes back the
+      pending condemnation.
+    - It replaces the stage timed by the slowest relay's span plus the asker's span for the target,
+      under which slates at load 100 condemned live members it reached only by relay, and slates'
+      patch for that (bee1bb41's `RelayTimer`, RFC 6298 over relayed round trips), a timer that a
+      network answering every probe never observes.
+    - The acknowledgement also carries `promise_ns`, slates' ask, for an owner's per-grant lease
+      (Gray and Cheriton 1989); the detector reads none of it.
+
+The wire changed in place with 8, 11 and 19: a probe and an answer carry entries of the existing
+gossip encoding, which a receiver of the earlier form applies as any gossip; `Sync` and `Nack` are
+new tags; the acknowledgement carries `promise_ns` and `relay_within_ns` after its standing, which a
+receiver of the earlier form cannot decode. Each has a golden vector. Every consumer vendors one
+revision for its whole fleet and none is in service yet, so there is no earlier form to keep.
 
 ## Tests
 
-- 70 unit tests: slates' membership, gossip, codec and coordinate tests (the engine's update checked
+- 92 unit tests: slates' membership, gossip, codec and coordinate tests (the engine's update checked
   bit for bit, on values whose every step is exact: Dabek's Fig. 3, an error estimate the same at
   scales 2¹⁰ apart, a quarter of the gap closed at each sample), the extension series and
   its bounds, the gossip queue's order, replacement and bound, and the measured timing's: nothing
@@ -195,7 +217,11 @@ there is no earlier form in service to keep.
   the view's digest follows the view and not the order of its changes, agreeing views exchange
   only their digests, a death of a member not held changes nothing and an exchange does not bring
   back a forgotten record, the exchanges' chunks, answers and cycle, and the view chunk's golden
-  encoding.
+  encoding; and the relay stage's: it waits for the slowest relay's stated bound and asks no peer
+  that stated none, it ends once every relay has nacked, a relay's deadline and stated bound leave
+  out its pair with the asker, a peer answering only through slow relays is never suspected, and a
+  late answer to a told probe takes back its pending condemnation, with the acknowledgement's and
+  the nack's golden encodings.
 - `tests/cluster.rs`: five real member processes run the detector over hyper-datagram on real
   UDP sockets, as the library configures it.
   - The supervisor starts them together, waits until every member judges every peer by a
@@ -209,8 +235,10 @@ there is no earlier form in service to keep.
   - Every survivor must hold each victim dead within the detection bound its own detector stated.
   - Every suspicion and condemnation must trace, from the members' own records, to the
     detector's rule: its probe, the deadline stated when it was sent, its period's end with no
-    answer handed to the detector, and the answer that missed it or was lost; a condemnation to the
-    pending one it follows and another member's answer; and every count a member reports must be
-    its record's findings. Theorem 7's allowance `Σβ` for live members is printed beside their
+    answer handed to the detector (before the relays' deadline only once every relay asked has
+    nacked), and the answer that missed it or was lost; a condemnation to the pending one it
+    follows, with no answer from its target since, and another member's answer; and every count a
+    member reports must be its record's findings. Each member relays as an owner does, nacking at
+    its own deadline. Theorem 7's allowance `Σβ` for live members is printed beside their
     counts, a report, not a test.
   - The counts over hundreds of runs on macOS and Linux are in `docs/benchmarks.md`.

@@ -465,12 +465,62 @@ average period (§3.1). The pair's interval is the mean round, `η = m·T̄`, wi
 mean period.
 
 **Each period's probe.** The acknowledgement of a probe sent at `s` is due at `s + μ + α`: `μ` the
-window's mean round trip, `α` the margin chosen at `η` (below). Unanswered then, the relays
-are asked, and their answers are due after the slowest relay's own span `μ + α` (the leg to it and
-back) plus the target's (the relay's leg to the target, whose stalls are the target's own, §2.6). A
-probe answered by neither suspects its target. The period ends at the direct deadline, or the
-indirect one when that was needed: each period is what its probe needs, which replaces SWIM's "at
-least three round trips" rule of thumb (§3.1) by the measured deadlines.
+window's mean round trip, `α` the margin chosen at `η` (below). Unanswered then, the relays are
+asked (the relay stage, below). A probe answered by neither suspects its target. The period ends at
+the direct deadline, or at the relay stage's end when that was needed: each period is what its probe
+needs, which replaces SWIM's "at least three round trips" rule of thumb (§3.1) by the measured
+deadlines.
+
+**The relay stage.** A relay asked about a target probes it with its own deadline for it, the span of
+the verdict that judges its own probes of the target, and with no answer by then it nacks
+(Lifeguard's nack, §IV-A); an answer that comes after still goes back. The asker's stage ends once
+every relay it asked has nacked, or once the slowest has its response due: the asker's span for the
+relay, which bounds the request's way there and the response's way back and holds the relay's stalls
+(they hold its acknowledgements as long), plus the bound the relay stated on its acknowledgements
+(`Ack::relay_within_ns`): the longest deadline it holds for a probe of its own of any member but the
+asker, which it is never asked about, plus `G`, since it nacks at a wake. Its deadline for a relayed
+ping is held within that, and a target it does not hold is given it. A peer that has stated nothing
+is not asked, since nothing bounds the wait for it. Lifeguard's asker knows when a relay's nack is due
+because every member is configured with the same probe timeout (80 % of it in the paper, all of it in
+memberlist), and it waits out the protocol period whatever the nacks say, counting a missing nack
+against its own health (`docs/research/swim.md`). Here deadlines are measured per member, so each
+states its own; and the stage ends once every relay has judged its leg, since past the relays'
+deadlines, as past the direct one, nothing is waited for
+(`a_relay_stage_waits_for_the_slowest_relay_s_stated_bound`,
+`a_relay_stage_ends_once_every_relay_asked_has_nacked`,
+`a_relay_states_and_keeps_its_bound_without_its_pair_with_the_asker`). An answer from the target to
+its told probe or a later one, however late and by whatever path, takes back the condemnation pending
+on that probe's miss, since it shows the target alive after it
+(`a_told_probe_s_late_answer_takes_back_its_pending_condemnation`); before, only a timely answer or a
+refutation did. Forms rejected, each measured:
+- The stage timed by the slowest relay's span plus the asker's own span for the target judged the
+  relay's leg by the asker's measure of its direct path, which a target whose direct path is lost
+  keeps from before. slates at load 100 asked 37 times about a member it reached only by relay; every
+  relayed answer came, two after their periods, and each was a suspicion and then a condemnation of
+  a live member (2026-10-10). A peer answering only through relays 150 to 160 ms away was condemned
+  655 ms in (`a_peer_answering_only_through_a_slow_relay_is_never_condemned`), and in the simulation
+  a member reachable only through a relay on a 100 ms path was held dead on all 16 seeds
+  (`a_member_reachable_only_through_a_slow_relay_is_never_condemned`).
+- RFC 6298's timer over the relayed exchanges (slates' `RelayTimer`, and this crate's first form of
+  the stage with nacks): relays are asked only when a probe goes unanswered, so on a network that
+  answers every probe the timer takes no observation (RFC 8961 (2)(b)) and rests at its cold second
+  (RFC 8961 (1)) for good, in every period bound and in every window drawn from one. No anti-entropy
+  exchange began within 1,000 periods of 1 ms round trips, and slates' least bound would have read
+  that second in every period against its 900 ms budget. slates measured the cold case too: at 400 ms
+  relayed round trips, a condemnation before the first sample.
+- A bound over every pair stated a relay's span for the asker back to the asker: with two near
+  members and one 200 ms away, the far member's detection bound was 4,585 ms, where without its own
+  pair it is 3,147 ms (4,601 ms before relays stated bounds; 16 seeds of the simulation's all-far
+  shape).
+- The latest lateness the relay had seen, in the place of `G`, states a stall for good: a member
+  stopped until it was condemned stated up to 31 ms where `G` gives 4 ms, and the longest bound the
+  others stated went from 606 to 725 ms (16 seeds).
+
+An owner keeps the probes it relays per asker and target until the target answers. Keyed by target
+alone, in this crate's simulated and real-socket harnesses, a second asker's request about a target
+took the first's place, and the first, owed a nack, waited out its whole stage: a stopped member's
+condemnation took 357 steps against 119 (seed 11). slates' member plane keeps them per target and
+asker.
 
 **The margin.** `α` minimizes `U` (§2.2) at the pair's interval, with:
 - a false suspicion costing the time until it is refuted: the member's next probe of the peer
@@ -573,8 +623,9 @@ members its view holds besides itself (no round is larger): a peer's next probe 
 periods after its last answer (§4.3), unanswered it suspects, and the told probe starts at most as
 far again, and its own period resolves it: `2(2m − 1) + 1` periods. A period is at most the longest
 the member has run or, where longer, what an unanswered probe's deadlines allow: its target's span
-`μ + α`, then the slowest relay's and the target's again, at most three times the longest span any
-of its verdicts has had, plus the latest the member has woken past a wake it asked; the period in
+`μ + α`, then its relay stage, to the latest any relay it could ask has its response due (its span
+for the relay plus the bound the relay stated), plus the latest the member has woken past a wake it
+asked; the period in
 progress, and how late the member is now for the wake it asked, count as measured. Then the wait for
 an answer from another member, the evidence that the member's own network works, which nothing
 bounds in advance (a member truly cut off waits for ever, by design): the member measures it and
@@ -728,9 +779,10 @@ covers it. Judged by the pool instead, a live far peer was suspected, condemned 
 its first 200 ms answer could return (`a_peer_joined_without_a_round_trip_is_not_suspected_before_its_first_answer`,
 failing first). Requiring a measured round trip at `join` instead would refuse every member a node
 learns by gossip before it has spoken to it. The cost falls on a peer that never answers: each
-unanswered judged probe waits out its direct deadline and then its relays', which includes the
-target's own span, and the told probe's timer has backed off once (§5.5), so its first detection
-moves by at most `I + I` and `2I + 2I`, six initial timeouts
+unanswered judged probe waits out its direct deadline and then its relay stage, whose relays, no
+better informed of a peer just learned, hold their own initial second for it within the bounds they
+state; and the told probe's timer has backed off once (§5.5), so its first detection moves by at most
+`I + I` and `2I + 2I`, six initial timeouts
 (`a_near_peer_joined_without_a_round_trip_is_condemned_at_most_six_initial_timeouts_later`).
 
 Open: until a far pair configures, the far member's own detection of it runs at its timer's deadline,
@@ -895,16 +947,19 @@ Every suspicion and condemnation it checks exactly, from the members' own record
 detector's rule. A probe states its deadline as it is sent (`Ping::due_ns`), and a poll what the
 member's own probes found, each finding with its evidence (`Detector::findings`: a suspicion, a
 condemnation made pending, a condemnation). Each member records every probe it sends with that
-deadline and whether it carried its suspicion of the target, every relay it asks, every answer it
-hands its detector, direct or relayed, every ping it answers, and every finding, in the order it
-made them. A suspicion, or a condemnation made pending, traces to its probe: sent when and to whom
-the finding says, with the deadline it states; its period ended no earlier than that deadline nor,
-where relays were asked (at or past it, for that target, none of them the target), than the
-relays' deadline; no answer, direct or relayed, handed to the detector between the probe and the
-end; and a pending one's probe carried the suspicion. Then the answer that missed it is found:
-handed over after the end, late, or never, lost, the target's record saying whether the ping
-reached it. A condemnation traces to the pending one it follows, ended when it says, and to the
-probe of another member answered before it, and every count a member reports equals its record's
+deadline and whether it carried its suspicion of the target, every relay it asks, every answer and
+nack it hands its detector, direct or relayed, every ping it answers, and every finding, in the order
+it made them; and it relays as an owner does, its relayed ping carrying its own deadline for the
+target and a nack sent when that passes unanswered. A suspicion, or a condemnation made pending,
+traces to its probe: sent when and to whom the finding says, with the deadline it states; its period
+ended no earlier than that deadline nor, where relays were asked (at or past it, for that target,
+none of them the target), than the relays' deadline, unless every relay asked had nacked, and then
+no earlier than the last nack; no answer, direct or relayed, handed to the detector between the
+probe and the end; and a pending one's probe carried the suspicion. Then the answer that missed it
+is found: handed over after the end, late, or never, lost, the target's record saying whether the
+ping reached it. A condemnation traces to the pending one it follows, ended when it says, with no
+answer from its target to the told probe or a later one handed over since, and to the probe of
+another member answered before it, and every count a member reports equals its record's
 findings at every line it writes. Theorem 7's allowance, `Σβ` over the judged probes of live
 members, is printed beside their counts, a report: it bounds an expectation, and a run's count is
 what the rule found, not a draw. Two forms before asserted the count: within `Σβ` (twelve runs in

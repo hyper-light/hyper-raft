@@ -63,13 +63,15 @@ const FAR_JITTER_NS: u64 = 100_000;
 /// How long the far-link runs watch the live cluster: slates' repro's 30 s.
 const WATCHED_NS: u64 = 30_000_000_000;
 
-/// A cluster's topology: its members, which of them sit across the far path from the rest, the
-/// steps its run may take, the detection budget its members' owners state (zero for none), and
-/// whether the owners seed each detector with an hourly fleet's failure history.
+/// A cluster's topology: its members, which of them sit across the far path from the rest, which
+/// pairs besides run over it, the steps its run may take, the detection budget its members'
+/// owners state (zero for none), and whether the owners seed each detector with an hourly fleet's
+/// failure history.
 #[derive(Clone, Copy, Debug)]
 struct Shape {
     nodes: u32,
     far: &'static [u32],
+    far_pairs: &'static [(u32, u32)],
     steps: u64,
     budget: Duration,
     hourly: bool,
@@ -90,6 +92,7 @@ fn hourly_fleet() -> Exposure {
 const LAN_CLUSTER: Shape = Shape {
     nodes: NODES,
     far: &[],
+    far_pairs: &[],
     steps: STEPS,
     budget: Duration::ZERO,
     hourly: false,
@@ -100,6 +103,7 @@ const LAN_CLUSTER: Shape = Shape {
 const FAR_LINK: Shape = Shape {
     nodes: 6,
     far: &[2, 3, 4, 5],
+    far_pairs: &[],
     steps: 4 * FAR_STEPS_TAKEN,
     budget: Duration::ZERO,
     hourly: false,
@@ -114,6 +118,7 @@ const FAR_STEPS_TAKEN: u64 = 26_058;
 const ALL_FAR: Shape = Shape {
     nodes: 3,
     far: &[2],
+    far_pairs: &[],
     steps: 4 * FAR_STEPS_TAKEN,
     budget: Duration::ZERO,
     hourly: false,
@@ -123,6 +128,8 @@ impl Shape {
     /// Whether the pair `(a, b)` crosses the far path.
     fn crosses(&self, a: u32, b: u32) -> bool {
         self.far.contains(&a) != self.far.contains(&b)
+            || self.far_pairs.contains(&(a, b))
+            || self.far_pairs.contains(&(b, a))
     }
 
     /// The pair's one-way delay before jitter: the LAN's, plus the far path's where it crosses it.
@@ -191,6 +198,17 @@ struct Noted {
     incarnation: u64,
 }
 
+/// A probe a member relays for another (SWIM's indirect probe): its own nonce, who asked and with
+/// which nonce, the deadline its detector stated for it, and whether it has nacked.
+#[derive(Clone, Copy, Debug)]
+struct Relaying {
+    relayed: u64,
+    asker: HostId,
+    asked: u64,
+    due: u64,
+    nacked: bool,
+}
+
 /// One member's driver, as the cluster test's: its detector and the probes it relays.
 struct Member {
     detector: Detector,
@@ -199,16 +217,18 @@ struct Member {
     requests: Vec<PingReq>,
     batch: Vec<(HostId, MemberState)>,
     encoded: Vec<u8>,
-    /// The probes this member relays: the target, the relay's nonce, who asked and with which nonce.
-    relaying: BTreeMap<u64, (u64, HostId, u64)>,
+    /// The probes this member relays, by asker and target: one an asker and target, so bounded by
+    /// the membership's square. Keyed by target alone, a second asker's request about a target took
+    /// the first's place, and the first, owed a nack, waited out its whole relay stage.
+    relaying: BTreeMap<(u64, u64), Relaying>,
     /// Each peer's death as this member came to hold it.
     deaths: BTreeMap<u64, Noted>,
     /// The peers this member has judged by their timer's verdict (`mistake` 1, before the pair's own
     /// estimator configured), as polled.
     timed: std::collections::BTreeSet<u64>,
-    /// Every probe this member sent, on its own clock, and whether the verdict that judged it rests
-    /// its period at the floor: the pair's own or the pool's.
-    pings: Vec<(u64, bool)>,
+    /// Every probe this member sent, on its own clock, whether the verdict that judged it rests its
+    /// period at the floor (the pair's own or the pool's), and its target.
+    pings: Vec<(u64, bool, HostId)>,
     nodes: u32,
     alive: bool,
     /// While its process is stalled ([`Sim::stall`]): the datagrams that reached it meanwhile, each
@@ -247,7 +267,7 @@ impl Member {
             shape.budget,
         );
         for peer in (0..shape.nodes).map(NodeId).filter(|peer| *peer != me) {
-            if shape.far.is_empty() {
+            if shape.far.is_empty() && shape.far_pairs.is_empty() {
                 detector.join(host(peer)).unwrap();
             } else {
                 // As slates' daemons join: with the round trip the keying handshake measured.
@@ -288,6 +308,8 @@ impl Member {
                 boot_nonce: u64::from(me.0),
                 configuration_version: 0,
                 standing: None,
+                promise_ns: 0,
+                relay_within_ns: u64::MAX,
                 gossip: GossipBatch::Entries(&[]),
                 coordinate: Coordinate::Held(&coordinate),
             }
@@ -318,6 +340,26 @@ impl Member {
     /// Polls the detector at `now` and queues what it asks: the relays, the probe, the view's
     /// chunks.
     fn step(&mut self, me: NodeId, now: u64, outbox: &mut Vec<(NodeId, NodeId, Vec<u8>)>) {
+        // A relayed probe unanswered by its deadline: tell its asker so (Lifeguard's nack).
+        let expired: Vec<((u64, u64), Relaying)> = self
+            .relaying
+            .iter()
+            .filter(|(_, relaying)| !relaying.nacked && relaying.due <= now)
+            .map(|(key, relaying)| (*key, *relaying))
+            .collect();
+        for (key, relaying) in expired {
+            if let Some(held) = self.relaying.get_mut(&key) {
+                held.nacked = true;
+            }
+            let message = SwimMessage::Nack {
+                from: host(me),
+                target: HostId(key.1),
+                nonce: relaying.asked,
+                boot_nonce: u64::from(me.0),
+                gossip: GossipBatch::Entries(&[]),
+            };
+            self.queue(outbox, me, relaying.asker, &message);
+        }
         let mut requests = std::mem::take(&mut self.requests);
         let ping = self.detector.poll(now, &mut requests);
         for request in &requests {
@@ -333,8 +375,11 @@ impl Member {
         let mut batch = std::mem::take(&mut self.batch);
         if let Some(ping) = ping {
             let judge = self.detector.report(ping.to).map(|report| report.judge);
-            self.pings
-                .push((now, matches!(judge, Some(Judge::Own | Judge::Pool))));
+            self.pings.push((
+                now,
+                matches!(judge, Some(Judge::Own | Judge::Pool)),
+                ping.to,
+            ));
             self.detector
                 .ping_gossip_into(ping.to, self.gossip, &mut batch);
             let message = SwimMessage::Ping {
@@ -385,6 +430,8 @@ impl Member {
                     boot_nonce: u64::from(me.0),
                     configuration_version: 0,
                     standing: None,
+                    promise_ns: 0,
+                    relay_within_ns: ack.relay_within_ns,
                     gossip: GossipBatch::Entries(&batch),
                     coordinate: Coordinate::Held(&coordinate),
                 };
@@ -394,25 +441,32 @@ impl Member {
             SwimMessage::Ack {
                 from,
                 nonce,
+                relay_within_ns,
                 gossip,
                 coordinate,
                 ..
             } => {
                 self.detector.apply_gossip(gossip);
                 self.detector.learn_coordinate(from, coordinate);
-                match self.relaying.get(&from.0) {
-                    Some(&(relayed, asker, asked)) if relayed == nonce => {
-                        self.relaying.remove(&from.0);
+                let relayed = self
+                    .relaying
+                    .iter()
+                    .find(|((_, target), relaying)| *target == from.0 && relaying.relayed == nonce)
+                    .map(|(key, relaying)| (*key, *relaying));
+                match relayed {
+                    // The target's answer goes back to the asker, after a nack too.
+                    Some((key, relaying)) => {
+                        self.relaying.remove(&key);
                         let message = SwimMessage::IndirectAck {
                             from: host(me),
                             target: from,
-                            nonce: asked,
+                            nonce: relaying.asked,
                             boot_nonce: u64::from(me.0),
                             gossip: GossipBatch::Entries(&[]),
                         };
-                        self.queue(outbox, me, asker, &message);
+                        self.queue(outbox, me, relaying.asker, &message);
                     }
-                    _ => self.detector.on_ack(from, nonce, stamp),
+                    None => self.detector.on_ack(from, nonce, stamp, relay_within_ns),
                 }
             }
             SwimMessage::PingReq {
@@ -422,8 +476,17 @@ impl Member {
                 gossip,
             } => {
                 self.detector.apply_gossip(gossip);
-                let ping = self.detector.on_ping_req(target);
-                self.relaying.insert(target.0, (ping.nonce, from, nonce));
+                let ping = self.detector.on_ping_req(from, target, stamp);
+                self.relaying.insert(
+                    (from.0, target.0),
+                    Relaying {
+                        relayed: ping.nonce,
+                        asker: from,
+                        asked: nonce,
+                        due: ping.due_ns,
+                        nacked: false,
+                    },
+                );
                 let message = SwimMessage::Ping {
                     from: host(me),
                     nonce: ping.nonce,
@@ -451,6 +514,31 @@ impl Member {
                 self.detector.apply_gossip(gossip);
                 self.detector.on_indirect_ack(target, nonce, stamp);
             }
+            SwimMessage::Nack {
+                from,
+                target,
+                nonce,
+                gossip,
+                ..
+            } => {
+                self.detector.apply_gossip(gossip);
+                self.detector.on_indirect_nack(from, target, nonce, stamp);
+            }
+        }
+    }
+
+    /// When this member must run next: its detector's wake, or the deadline of a probe it relays
+    /// that has not nacked.
+    fn wake(&self) -> Option<u64> {
+        let relayed = self
+            .relaying
+            .values()
+            .filter(|relaying| !relaying.nacked)
+            .map(|relaying| relaying.due)
+            .min();
+        match (self.detector.wake(), relayed) {
+            (Some(own), Some(relayed)) => Some(own.min(relayed)),
+            (own, relayed) => own.or(relayed),
         }
     }
 
@@ -560,7 +648,7 @@ impl Sim {
         let member = &mut self.members[node.0 as usize];
         member.step(node, now, &mut self.outbox);
         member.note_deaths(node, now);
-        let wake = member.detector.wake();
+        let wake = member.wake();
         self.world.wake(node, wake).unwrap();
         self.flush();
     }
@@ -843,7 +931,7 @@ fn budgeted(source: Source) -> Result<Record, SimError> {
         let pings = &member.pings[from[me.0 as usize]..];
         assert!(pings.len() > 1, "{seed}: member {me:?} probed");
         for pair in pings.windows(2) {
-            let ((sent, rests), (next, _)) = (pair[0], pair[1]);
+            let ((sent, rests, _), (next, _, _)) = (pair[0], pair[1]);
             assert!(
                 !rests || next - sent >= floor,
                 "{seed}: member {me:?} probed {} ns after a probe judged at the floor, {floor} ns",
@@ -1235,6 +1323,80 @@ fn all_far_kill(source: Source) -> Result<Record, SimError> {
         "live members condemned: {condemned:?}"
     );
     Ok(sim.world.finish())
+}
+
+/// Three members, the pair of members 1 and 2 over the far path, 100 ms one way: slates' fleet at
+/// load 100, a member reachable only through a relay whose own way to it is slower than the asker's
+/// direct way was.
+const SLOW_RELAY: Shape = Shape {
+    nodes: 3,
+    far: &[],
+    far_pairs: &[(1, 2)],
+    steps: 4 * FAR_STEPS_TAKEN,
+    budget: Duration::ZERO,
+    hourly: false,
+};
+
+/// The probes of the member it reaches only through a relay that the asker sends while the run is
+/// watched: ten times the two, a suspicion and its told probe, that condemned it before.
+const RELAYED_PROBES: usize = 20;
+
+/// One run from `source` of [`SLOW_RELAY`]: once every pair is judged, member 0 loses its direct
+/// path to member 1 both ways, and reaches it only through member 2, over member 2's far path to it;
+/// member 1 reaches member 0 only through member 2 as well. Until member 0 has probed member 1
+/// [`RELAYED_PROBES`] times since, no member condemns a live one.
+fn relayed_only(source: Source) -> Result<Record, SimError> {
+    let seed = match &source {
+        Source::Seed(seed) => format!("seed {seed}"),
+        Source::Trace(_) => "the trace".to_owned(),
+    };
+    let mut sim = Sim::new(source, false, SLOW_RELAY);
+    sim.run("every pair judged", Sim::every_pair_judged);
+    let (asker, target) = (NodeId(0), NodeId(1));
+    sim.net.partition(asker, target, true);
+    sim.net.partition(target, asker, true);
+    let from = sim.members[asker.0 as usize].pings.len();
+    // Any member that comes to hold a live one dead, at any step: a death refuted and forgotten
+    // later leaves no count behind.
+    let condemned = |sim: &Sim| {
+        sim.live().any(|(me, member)| {
+            sim.live().any(|(peer, _)| {
+                peer != me
+                    && member
+                        .detector
+                        .membership()
+                        .state(host(peer))
+                        .is_some_and(|state| state.liveness == Liveness::Dead)
+            })
+        })
+    };
+    sim.run("the asker probed the target through the relay", |sim| {
+        condemned(sim)
+            || sim.members[asker.0 as usize].pings[from..]
+                .iter()
+                .filter(|(_, _, to)| *to == host(target))
+                .count()
+                >= RELAYED_PROBES
+    });
+    assert!(
+        !condemned(&sim),
+        "{seed}: a member holds a live one dead {} ms in",
+        sim.now() / 1_000_000
+    );
+    Ok(sim.world.finish())
+}
+
+/// A member reachable only through a relay whose own leg to it is slow is never condemned: the
+/// relay judges its leg by its own deadline for it, and the asker waits for its response as long
+/// as the relay stated it might take (slates, 2026-10-10). When the asker timed the relay stage by
+/// its own span for the target, its direct path's from before the cut, every relayed answer came
+/// after the stage, and a member held a live one dead on all 16 seeds (on seed 0, member 0
+/// condemned member 1 150 ms after the cut).
+#[test]
+fn a_member_reachable_only_through_a_slow_relay_is_never_condemned() {
+    for seed in 0..16 {
+        twice(seed, relayed_only).unwrap_or_else(|refusal| panic!("seed {seed}: {refusal}"));
+    }
 }
 
 /// The hyper-raft review's liveness case for `swim-pair-deadline`: a member that dies before any far

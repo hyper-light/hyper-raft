@@ -5,8 +5,8 @@
 //!
 //! Evidence: SWIM (Das, Gupta and Motivala, DSN 2002) for the probe, the indirect probe, the
 //! suspicion and infection-style dissemination; Lifeguard (Dadgar, Phillips and Currey, DSN 2018)
-//! for the buddy system and for local health; Chen, Toueg and Aguilera (2002) for the detector each
-//! probe stream is; `docs/research/timing.md` holds what each establishes.
+//! for the buddy system, the relay's nack and local health; Chen, Toueg and Aguilera (2002) for the
+//! detector each probe stream is; `docs/research/timing.md` holds what each establishes.
 //!
 //! **Each pair is an NFD-E detector.** A member's probes to one peer and that peer's
 //! acknowledgements are a heartbeat stream on the member's own clock: probe `k` sent at `s_k`,
@@ -16,9 +16,11 @@
 //! interval, any margin: a pair's probes never overlap, so each is judged alone, and a false
 //! condemnation is priced at what the owner states it costs
 //! ([`Detector::set_condemnation_cost`]). A probe's acknowledgement is due at `s + μ + α`; if none
-//! came, the indirect probe asks relays, and a probe answered by neither suspects the peer. The period is what its probe needs:
-//! the direct deadline, and the indirect one when the direct passed unanswered (SWIM §3.1: the
-//! protocol's properties hold for the average period).
+//! came, the indirect probe asks relays, each of which judges its own leg to the peer by its own
+//! deadline and nacks when that passes unanswered, and a probe answered by neither suspects the
+//! peer. The period is what its probe needs: the direct deadline, and the relay stage when the
+//! direct passed unanswered, until every relay asked has nacked or the slowest has its response due
+//! by the bound it stated (SWIM §3.1: the protocol's properties hold for the average period).
 //!
 //! **Before a pair's own estimator configures.** A pair's estimator refuses until it has its
 //! evidence ([`Refusal`]). Its probes are then judged by the member's pooled estimator, every round
@@ -99,10 +101,11 @@ pub struct Ping {
     pub to: HostId,
     /// The nonce the acknowledgement echoes.
     pub nonce: u64,
-    /// When its answer is due, on the caller's clock, as stated when it is sent: the probe's time
-    /// plus its verdict's `μ + α`. `None` for a probe no verdict judges, whose period judges
-    /// nothing, and for a probe relayed for another member, which that member times.
-    pub due_ns: Option<u64>,
+    /// When its answer is due, on the caller's clock, as stated when it is sent: for the period's
+    /// probe, its time plus the `μ + α` of the verdict judging it; for a probe relayed for another
+    /// member, this member's own deadline for the target ([`Detector::on_ping_req`]), at which the
+    /// owner nacks if no answer has come.
+    pub due_ns: u64,
 }
 
 /// A judged probe that went unanswered, as its period ended: the evidence for what it found.
@@ -116,10 +119,11 @@ pub struct Unanswered {
     pub sent_ns: u64,
     /// When its answer was due, as stated when it was sent ([`Ping::due_ns`]).
     pub due_ns: u64,
-    /// When the relays' answers were due, where the direct deadline passed and relays were asked
-    /// ([`PingReq`]).
+    /// When the relays' responses were due, where the direct deadline passed and relays were asked
+    /// ([`PingReq`]): the slowest relay's, by this member's span for it and the bound it stated.
     pub relays_due_ns: Option<u64>,
-    /// When its period ended with no answer delivered, direct or relayed.
+    /// When its period ended with no answer delivered, direct or relayed: at the relays' deadline,
+    /// or before it once every relay asked had nacked.
     pub ended_ns: u64,
 }
 
@@ -151,11 +155,18 @@ pub enum Finding {
     },
 }
 
-/// An acknowledgement to send to `to` — the reply to a received [`Ping`].
+/// An acknowledgement to send to `to` — the reply to a received [`Ping`] — and what it states.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Ack {
     /// The member that pinged us.
     pub to: HostId,
+    /// How long after a ping-request from `to` reaches this member it responds, with the target's
+    /// answer or a nack, nanoseconds: the longest deadline it holds for a probe of its own of any
+    /// member but `to`, plus `G`, how late its wakes come on average, since it nacks at a wake. The
+    /// acknowledgement carries it
+    /// ([`SwimMessage::Ack`](crate::codec::SwimMessage::Ack)), so a prober that asks this member to
+    /// relay knows when the response is due ([`Detector::on_ack`]).
+    pub relay_within_ns: u64,
 }
 
 /// A ping-request: ask `relay` to ping `target` on our behalf and relay the acknowledgement back,
@@ -278,10 +289,9 @@ const VARIATION_GAIN_SHIFT: u32 = 2;
 /// RFC 6298 (2.2)'s `K`: the timeout is the smoothed round trip plus `K` variations.
 const VARIATION_MULTIPLE: u64 = 4;
 
-/// RFC 6298's retransmission timer over one exchange's round trips: a pair's probes and answers
-/// ([`Peer::rto`]), or a target's relayed probes and its relays' responses ([`Peer::relay`]). A
-/// round trip's nonce names the probe it answers, so a late answer is no ambiguous sample and is
-/// taken (Karn's rule, RFC 6298 §3; RFC 8961 (2)(d)).
+/// RFC 6298's retransmission timer over a pair's round trips, its probes and their answers
+/// ([`Peer::rto`]). A round trip's nonce names the probe it answers, so a late answer is no
+/// ambiguous sample and is taken (Karn's rule, RFC 6298 §3; RFC 8961 (2)(d)).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct Rto {
     /// `SRTT`, once a round trip was taken.
@@ -403,6 +413,46 @@ fn timer_floors(pooled: Option<Verdict>, granularity_ns: u64) -> (u64, u64) {
     }
 }
 
+/// The two longest spans `μ + α` of the verdicts judging the pairs a member probes, nanoseconds,
+/// and whose the longest is: the longest deadline the member holds for a probe of its own, and the
+/// longest without any one pair ([`Longest::without`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Longest {
+    first: u64,
+    of: Option<HostId>,
+    second: u64,
+}
+
+impl Longest {
+    /// The longest span over every pair but `member`'s.
+    fn without(&self, member: HostId) -> u64 {
+        if self.of == Some(member) {
+            self.second
+        } else {
+            self.first
+        }
+    }
+}
+
+/// When a relay's response to a ping-request is due, from the request: this member's span for the
+/// relay ([`judging`]), which bounds the request's way there and the response's way back, plus the
+/// bound the relay stated for responding ([`Ack::relay_within_ns`]). `None` for a relay that has
+/// stated none.
+fn relay_due_ns(
+    relay: &Peer,
+    pooled: Option<Verdict>,
+    loss: f64,
+    granularity_ns: u64,
+) -> Option<u64> {
+    let within = relay.relay_within_ns?;
+    Some(
+        judging(relay, pooled, loss, granularity_ns)
+            .0
+            .span_ns()
+            .saturating_add(within),
+    )
+}
+
 /// What judges a pair's probes now ([`PeerReport::judge`]): the one rule [`Detector::verdict`]
 /// reports and a probe is judged by.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -417,8 +467,7 @@ pub enum Judge {
     Pool,
 }
 
-/// An exchange's retransmission timer (RFC 6298) as its member measured it: a pair's probes
-/// ([`PeerReport::timer`]) or a target's relayed probes ([`PeerReport::relays`]).
+/// A pair's retransmission timer (RFC 6298) as its member measured it ([`PeerReport::timer`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct TimerReport {
     /// The timeout now, backed off where it expired since its latest round trip.
@@ -466,6 +515,10 @@ pub struct PeerReport {
     pub refused: Option<Refusal>,
     /// The pair's retransmission timer (RFC 6298) over its probes' round trips.
     pub timer: TimerReport,
+    /// How long after a ping-request reaches the peer it responds, as its latest acknowledgement
+    /// stated ([`Ack::relay_within_ns`]); `None` before one, while the peer is asked to relay
+    /// nothing.
+    pub relay_within: Option<Duration>,
 }
 
 /// The member's pooled verdict and its evidence ([`Detector::pool`]): what judges every pair that
@@ -587,6 +640,14 @@ struct Peer {
     /// When the probe that told the peer went unanswered: its condemnation waits on an answer
     /// from another member.
     pending_since: Option<u64>,
+    /// That probe's nonce: an answer to it or to a later probe, however late and by whatever path,
+    /// shows the peer alive after it and takes the pending condemnation back.
+    pending_nonce: Option<u64>,
+    /// How long after a ping-request reaches the peer it responds, as its latest acknowledgement
+    /// stated ([`Ack::relay_within_ns`]): with this member's span for the peer, when a relay stage
+    /// that asks it has the peer's response due ([`Detector::request_indirect`]). A peer that has
+    /// stated none is not asked.
+    relay_within_ns: Option<u64>,
     /// The previous judged probe's bound.
     last_mistake: Option<f64>,
     last_answer_ns: Option<u64>,
@@ -617,6 +678,8 @@ impl Peer {
             suspected_from: None,
             told_missed: 0,
             pending_since: None,
+            pending_nonce: None,
+            relay_within_ns: None,
             last_mistake: None,
             last_answer_ns: None,
             rto: Rto::default(),
@@ -681,7 +744,22 @@ impl Peer {
     fn clear_pending(&mut self) {
         self.told_missed = 0;
         self.pending_since = None;
+        self.pending_nonce = None;
         self.report.pending_since_ns = None;
+    }
+
+    /// An answer from the peer, direct or relayed, to this member's probe `nonce`, below `next`, the
+    /// member's next probe nonce (an owner's own ping answered on the plane, or a ping the member
+    /// relayed for another, is no probe of its own). An answer to the told probe or a later one shows
+    /// the peer alive after the probe whose miss made its condemnation pending, which goes: the
+    /// condemnation waited on an answer from another member, and the peer's own came first.
+    fn answered_since_told(&mut self, nonce: u64, next: u64) {
+        if self
+            .pending_nonce
+            .is_some_and(|told| nonce >= told && nonce < next)
+        {
+            self.clear_pending();
+        }
     }
 
     fn clear_suspicion(&mut self) {
@@ -699,7 +777,8 @@ struct Probe {
     sent_ns: u64,
     answered: bool,
     verdict: Verdict,
-    /// When the indirect probe's answers are due, once it was asked.
+    /// When the relays' responses are due, once relays were asked: the slowest relay's span from
+    /// this member plus the bound it stated ([`Detector::request_indirect`]).
     indirect_until: Option<u64>,
     /// Whether the verdict is the pair's timer's ([`timer_verdict`]): judged if it goes unanswered,
     /// but its period ends at its answer. Waiting out a timer's deadline on an answered probe
@@ -896,9 +975,13 @@ pub struct Detector {
     /// answer to the latest reused record, or a handshake's. The pool's round trip before the pool
     /// holds a sample ([`Detector::pool_round_trip`]).
     least_rtt_ns: Option<u64>,
-    /// The longest span `μ + α` of the verdicts judging the pairs this member probes, as the latest
-    /// period began, nanoseconds ([`Detector::period_bound`]).
-    longest_span: u64,
+    /// The longest spans of the verdicts judging the pairs this member probes, as the latest period
+    /// began: its longest deadline for a probe of its own, and the longest without any one pair,
+    /// which bounds its deadline for a ping it relays for that member ([`Detector::on_ping_req`]).
+    longest: Longest,
+    /// The longest an unanswered probe of a pair this member probes runs, its direct span and its
+    /// relay stage, as the latest period began, nanoseconds ([`Detector::period_bound`]).
+    longest_unanswered: u64,
     periods: Periods,
     exposure: Exposure,
     /// Protocol periods run: the clock an extension's rate limit counts in.
@@ -909,6 +992,10 @@ pub struct Detector {
     aging: Vec<(HostId, u64)>,
     /// The relays an indirect probe ranks, held for the same reason.
     relays: Vec<HostId>,
+    /// The relays the period's probe asked that have not responded, an answer or a nack: its relay
+    /// stage ends when none is left, or once the slowest could have responded
+    /// ([`Detector::request_indirect`]). Held across periods so it allocates nothing once grown.
+    awaiting: Vec<HostId>,
     /// The deaths the view adopted, oldest first: the order their records are forgotten in. A
     /// record the member has since left (a refutation, a newer death) is skipped when reached.
     deaths: VecDeque<Death>,
@@ -1028,13 +1115,15 @@ impl Detector {
             resolution_ns: nanos(resolution),
             unmeasured: 0,
             least_rtt_ns: None,
-            longest_span: 0,
+            longest: Longest::default(),
+            longest_unanswered: 0,
             periods: Periods::default(),
             exposure: history,
             period: 0,
             extensions: BTreeMap::new(),
             aging: Vec::new(),
             relays: Vec::new(),
+            awaiting: Vec::new(),
             deaths: VecDeque::new(),
             counted: VecDeque::with_capacity(members.get()),
             clock_ns: 0,
@@ -1102,6 +1191,9 @@ impl Detector {
         }
         let ends = if probe.answered {
             (!probe.provisional).then(|| probe.due_ns())
+        } else if self.awaiting.is_empty() {
+            // Every relay asked has nacked: the relay stage is over.
+            None
         } else {
             probe.indirect_until
         };
@@ -1155,7 +1247,9 @@ impl Detector {
             (true, _) | (false, None) if now_ns < due => Stage::Wait,
             (true, _) => Stage::Over,
             (false, None) => Stage::Indirect,
-            (false, Some(until)) if now_ns < until => Stage::Wait,
+            // The relay stage waits while a relay asked has not responded, until its response is
+            // due.
+            (false, Some(until)) if now_ns < until && !self.awaiting.is_empty() => Stage::Wait,
             (false, Some(_)) => Stage::Over,
         }
     }
@@ -1221,25 +1315,68 @@ impl Detector {
             },
         };
         self.probe = Some(probe);
-        self.longest_span = self.span_bound(pooled, loss, granularity_ns);
+        // The longest an unanswered probe of a pair it probes now runs: the span of the verdict
+        // judging it, and then its relay stage, until the slowest relay it could ask has its
+        // response due ([`Detector::request_indirect`]).
+        self.longest = self.longest_spans(pooled, loss, granularity_ns);
+        let slowest_relay = self
+            .peers
+            .iter()
+            .filter(|(host, _)| self.is_relay(**host))
+            .filter_map(|(_, peer)| relay_due_ns(peer, pooled, loss, granularity_ns))
+            .max()
+            .unwrap_or(0);
+        self.longest_unanswered = self.longest.first.saturating_add(slowest_relay);
         Some(Ping {
             to: target,
             nonce,
-            due_ns: Some(probe.due_ns()),
+            due_ns: probe.due_ns(),
         })
     }
 
-    /// The longest span `μ + α` of the verdicts judging the pairs this member probes now: what an
-    /// unanswered probe's deadlines are drawn from in the periods to come ([`Detector::period_bound`]).
-    /// Every verdict that judges a probe counts, a timer's too; the periods already run are counted
-    /// by their lengths.
-    fn span_bound(&self, pooled: Option<Verdict>, loss: f64, granularity_ns: u64) -> u64 {
-        self.peers
-            .iter()
-            .filter(|(host, _)| self.is_probed(**host))
-            .map(|(_, peer)| judging(peer, pooled, loss, granularity_ns).0.span_ns())
-            .max()
-            .unwrap_or(0)
+    /// The longest spans `μ + α` of the verdicts judging the pairs this member probes now
+    /// ([`Longest`]). Every verdict that judges a probe counts, a timer's too.
+    fn longest_spans(&self, pooled: Option<Verdict>, loss: f64, granularity_ns: u64) -> Longest {
+        let mut longest = Longest::default();
+        for (host, peer) in self.peers.iter().filter(|(host, _)| self.is_probed(**host)) {
+            let span = judging(peer, pooled, loss, granularity_ns).0.span_ns();
+            if longest.of.is_none() || span > longest.first {
+                longest.second = longest.first;
+                longest.first = span;
+                longest.of = Some(*host);
+            } else {
+                longest.second = longest.second.max(span);
+            }
+        }
+        longest
+    }
+
+    /// How long after a ping-request from `asker` reaches this member it responds, with the
+    /// target's answer or a nack ([`Ack::relay_within_ns`]): its longest deadline for a probe of its
+    /// own of any member but `asker`, which it is never asked about, as the latest period began,
+    /// which bounds its deadline for a ping it relays for `asker` ([`Detector::on_ping_req`]); plus
+    /// `G`, the mean lateness of its wakes, since it nacks at a wake and answers a ping as it
+    /// arrives. Its stalls are not added: they hold its acknowledgements as long as its nacks, so a
+    /// prober's span for it, measured from those acknowledgements, already covers them. Measured in
+    /// the simulation, 16 seeds each: a bound over every pair stated a relay's span for the asker
+    /// back to the asker, and with two near members and one 200 ms away the far member's detection
+    /// bound was 4,585 ms, where without its own pair it is 3,147 ms (4,601 ms before relays stated
+    /// bounds); and the latest lateness seen, in the place of `G`, states a stall for good: a member
+    /// stopped until it was condemned stated up to 31 ms where `G` gives 4 ms, and the longest bound
+    /// the others stated went from 606 to 725 ms.
+    fn relay_within_ns(&self, asker: HostId) -> u64 {
+        self.longest
+            .without(asker)
+            .saturating_add(self.granularity_ns())
+    }
+
+    /// Whether `member` may be asked to relay: alive, and not this member.
+    fn is_relay(&self, member: HostId) -> bool {
+        member != self.local
+            && self
+                .membership
+                .state(member)
+                .is_some_and(|state| state.liveness == Liveness::Alive)
     }
 
     /// `G` in nanoseconds: the mean lateness of this member's wakes, never below the resolution of
@@ -1261,51 +1398,71 @@ impl Detector {
         (lost as f64 + 0.5) / (lost as f64 + received as f64 + 1.0)
     }
 
-    /// Fills `requests` with the relays to ask for the period's probe, and sets when their answers
-    /// are due: the slowest relay's own deadline span (the leg to it and back) plus the target's
-    /// (the relay's leg to the target, whose stalls are the target's own). With no relay to ask,
-    /// nothing is due, and the period ends at the direct deadline.
+    /// Fills `requests` with the relays to ask for the period's probe (SWIM's indirect probe), and
+    /// sets when the relay stage ends. Each relay judges its own leg to the target, by its own
+    /// deadline for it, and with no answer by then it nacks (Lifeguard's nack, Dadgar et al.
+    /// §IV-A): the stage ends once every relay asked has nacked, or once the slowest has its
+    /// response due, this member's span for it plus the bound it stated for its responses
+    /// ([`relay_due_ns`]). Lifeguard's asker knows when a relay's nack is due because every member
+    /// runs one configured probe timeout; deadlines measured per member are known to the member
+    /// alone, so each states its bound on its acknowledgements. Two forms came first. The relay
+    /// stage was timed by the slowest relay's span plus this member's span for the target, as if
+    /// the relay's leg to the target were this member's: a target whose direct path was lost
+    /// keeps the span it had then, and at load 100 relayed answers came past it, each a suspicion
+    /// and then a condemnation of a live member (slates, 2026-10-10). Then by RFC 6298's timer over
+    /// the relayed exchanges, cold at RFC 8961 (1)'s second: relays are asked only when a probe
+    /// goes unanswered, so on a network that answers every probe the timer was never measured, and
+    /// every period bound, and every window drawn from it, stayed a second long (no anti-entropy
+    /// exchange began in 1,000 periods of 1 ms round trips). With no relay to ask, nothing is due,
+    /// and the period ends at the direct deadline.
     fn request_indirect(&mut self, now_ns: u64, requests: &mut Vec<PingReq>) {
         let Some(mut probe) = self.probe else {
             return;
         };
-        let verdict = probe.verdict;
+        self.rank_relays(probe.target);
+        let count = relay_count(probe.verdict.loss, self.relays.len());
         let (pooled, loss, granularity_ns) =
             (self.pool.verdict, self.probe_loss(), self.granularity_ns());
-        self.rank_relays(probe.target);
-        let count = relay_count(verdict.loss, self.relays.len());
+        let mut awaiting = std::mem::take(&mut self.awaiting);
+        awaiting.clear();
         let mut slowest = 0u64;
         for &relay in self.relays.iter().take(count) {
+            let Some(due) = self
+                .peers
+                .get(&relay)
+                .and_then(|peer| relay_due_ns(peer, pooled, loss, granularity_ns))
+            else {
+                continue;
+            };
             requests.push(PingReq {
                 relay,
                 target: probe.target,
                 nonce: probe.nonce,
             });
-            // The leg to the relay and back, judged as this member judges its probes of the relay.
-            let span = self.peers.get(&relay).map_or(verdict.span_ns(), |peer| {
-                judging(peer, pooled, loss, granularity_ns).0.span_ns()
-            });
-            slowest = slowest.max(span);
+            awaiting.push(relay);
+            slowest = slowest.max(due);
         }
+        self.awaiting = awaiting;
         if requests.is_empty() {
             return;
         }
-        let until = now_ns
-            .saturating_add(slowest)
-            .saturating_add(verdict.span_ns());
-        probe.indirect_until = Some(until);
+        probe.indirect_until = Some(now_ns.saturating_add(slowest));
         self.probe = Some(probe);
     }
 
-    /// Ranks the alive peers other than `target` as relays, nearest the target first.
+    /// Ranks the alive peers other than `target` that have stated a relay bound as relays, nearest
+    /// the target first.
     fn rank_relays(&mut self, target: HostId) {
         let mut relays = std::mem::take(&mut self.relays);
         relays.clear();
-        relays.extend(
-            self.membership
-                .alive()
-                .filter(|host| *host != self.local && *host != target),
-        );
+        relays.extend(self.membership.alive().filter(|host| {
+            *host != self.local
+                && *host != target
+                && self
+                    .peers
+                    .get(host)
+                    .is_some_and(|peer| peer.relay_within_ns.is_some())
+        }));
         relays.sort_by(|a, b| {
             match (
                 self.predicted_between(*a, target),
@@ -1400,6 +1557,7 @@ impl Detector {
                     peer.told_missed = peer.told_missed.saturating_add(1);
                     if peer.told_missed > granted && peer.pending_since.is_none() {
                         peer.pending_since = Some(now_ns);
+                        peer.pending_nonce = Some(probe.nonce);
                         peer.report.pending_since_ns = Some(now_ns);
                         self.findings.push(Finding::Pending(unanswered));
                     }
@@ -1483,9 +1641,9 @@ impl Detector {
     }
 
     /// The longest a period of this member lasts, nanoseconds: the longest it has run or, where
-    /// longer, what an unanswered probe's deadlines allow, three times the longest span of the
-    /// verdicts judging its pairs ([`Detector::span_bound`]), plus how late it has woken; the
-    /// period in progress counts as run. `None` before a period.
+    /// longer, what an unanswered probe's deadlines allow, its direct span and then its relay stage
+    /// ([`Detector::longest_unanswered`]), plus how late it has woken; the period in progress counts as
+    /// run. `None` before a period.
     fn period_bound(&self, now_ns: u64) -> Option<u64> {
         if self.periods.count == 0 {
             return None;
@@ -1496,7 +1654,7 @@ impl Detector {
             .probe
             .map_or(0, |probe| now_ns.saturating_sub(probe.sent_ns));
         let late = self.wakes.latest_ns(now_ns);
-        let unanswered = self.longest_span.saturating_mul(3).saturating_add(late);
+        let unanswered = self.longest_unanswered.saturating_add(late);
         Some(self.periods.longest.max(running).max(unanswered))
     }
 
@@ -1579,10 +1737,12 @@ impl Detector {
     }
 
     /// Records an acknowledgement from `from` of the probe `nonce`, received at `at_ns` (the
-    /// kernel's receive stamp where the caller has one, else when it was read). It answers the
-    /// period's probe if it is that probe's, and its round trip is measured whatever probe it
-    /// answers, however late: a late answer is the tail the margin must cover.
-    pub fn on_ack(&mut self, from: HostId, nonce: u64, at_ns: u64) {
+    /// kernel's receive stamp where the caller has one, else when it was read), stating
+    /// `relay_within_ns` ([`Ack::relay_within_ns`]), which bounds `from`'s responses when this
+    /// member asks it to relay. It answers the period's probe if it is that probe's, and its round
+    /// trip is measured whatever probe it answers, however late: a late answer is the tail the margin
+    /// must cover.
+    pub fn on_ack(&mut self, from: HostId, nonce: u64, at_ns: u64, relay_within_ns: u64) {
         // An answer to the period's probe answers it; any other is late, its period over.
         let current = match self.probe.as_mut() {
             Some(probe) if probe.target == from && probe.nonce == nonce => {
@@ -1597,11 +1757,15 @@ impl Detector {
         let mtbf = self.exposure.mtbf();
         let condemnation_cost = self.condemnation_cost;
         let pooled_rtt = self.pool_round_trip();
+        let next = self.nonce;
         let Some(peer) = self.peers.get_mut(&from) else {
             return;
         };
-        // Any answer is evidence of life when it arrives, even one too late to be measured.
+        // Any answer is evidence of life when it arrives, even one too late to be measured, and
+        // states the peer's relay bound as it stands.
         peer.last_answer_ns = Some(peer.last_answer_ns.map_or(at_ns, |last| last.max(at_ns)));
+        peer.relay_within_ns = Some(relay_within_ns);
+        peer.answered_since_told(nonce, next);
         let Some(sent) = peer.take(nonce) else {
             // The latest reused record's answer is timed exactly: its pair's timer takes it, late.
             if let Some((round_trip, true)) = peer.answered_unrecorded(nonce, at_ns) {
@@ -1627,9 +1791,6 @@ impl Detector {
                 peer.stream
                     .configure(mtbf, granularity, interval, condemnation_cost);
                 peer.report.configured = peer.stream.verdict.is_some();
-                if let Some(verdict) = peer.stream.verdict {
-                    self.longest_span = self.longest_span.max(verdict.span_ns());
-                }
             }
             // The pool is fed while it judges: by pairs with no verdict of their own, until it has
             // one; never by a far pair ([`far`]), whose round trips are another path's and would
@@ -1673,9 +1834,6 @@ impl Detector {
                 interval,
                 self.condemnation_cost,
             );
-            if let Some(verdict) = self.pool.verdict {
-                self.longest_span = self.longest_span.max(verdict.span_ns());
-            }
         }
         self.pool.verdict
     }
@@ -1698,9 +1856,11 @@ impl Detector {
         self.unmeasured
     }
 
-    /// Records an indirect acknowledgement that `target` answered the probe `nonce` through a
-    /// relay, at `at_ns`: the period's probe is answered. A relayed round trip is two paths' and
-    /// is not the pair's sample.
+    /// Records an indirect acknowledgement that `target` answered this member's probe `nonce`
+    /// through a relay, at `at_ns`: the period's probe is answered, if it is that one. However late,
+    /// it is evidence of the target's life when it arrives, and an answer to the told probe or a later
+    /// one takes back a condemnation pending on it. A relayed round trip is two paths' and is no
+    /// pair's sample.
     pub fn on_indirect_ack(&mut self, target: HostId, nonce: u64, at_ns: u64) {
         self.clock_ns = self.clock_ns.max(at_ns);
         if let Some(probe) = self.probe.as_mut()
@@ -1708,26 +1868,68 @@ impl Detector {
             && probe.nonce == nonce
         {
             probe.answered = true;
-            if let Some(peer) = self.peers.get_mut(&target) {
-                peer.last_answer_ns = Some(at_ns);
-            }
+        }
+        // Only an answer to a probe of this member's own is its evidence.
+        let next = self.nonce;
+        if nonce < next
+            && let Some(peer) = self.peers.get_mut(&target)
+        {
+            peer.last_answer_ns = Some(peer.last_answer_ns.map_or(at_ns, |last| last.max(at_ns)));
+            peer.answered_since_told(nonce, next);
         }
     }
 
-    /// Responds to a ping from `from` with the acknowledgement to send back.
-    pub fn on_ping(&mut self, from: HostId) -> Ack {
-        Ack { to: from }
+    /// Records a relay's nack at `at_ns`: `relay`, asked to probe `target` for this member's probe
+    /// `nonce`, had no answer from it by its own deadline for it, as the relayed [`Ping::due_ns`]
+    /// stated (Lifeguard's nack, Dadgar et al. §IV-A): the relay judged its own leg to the target by
+    /// its own measure, which this member cannot take. It is no evidence of life; when every relay
+    /// the period's probe asked has nacked, the relay stage ends, unanswered.
+    pub fn on_indirect_nack(&mut self, relay: HostId, target: HostId, nonce: u64, at_ns: u64) {
+        self.clock_ns = self.clock_ns.max(at_ns);
+        if self
+            .probe
+            .is_some_and(|probe| probe.target == target && probe.nonce == nonce)
+        {
+            self.awaiting.retain(|asked| *asked != relay);
+        }
     }
 
-    /// As a relay, the ping to send `target` for a ping-request; its nonce is the relay's own,
-    /// from a range its own probes never use, and the caller maps the answer back to the asker.
-    pub fn on_ping_req(&mut self, target: HostId) -> Ping {
+    /// Responds to a ping from `from` with the acknowledgement to send back, which states how long
+    /// after a ping-request from `from` reaches this member it responds ([`Ack::relay_within_ns`]).
+    pub fn on_ping(&mut self, from: HostId) -> Ack {
+        Ack {
+            to: from,
+            relay_within_ns: self.relay_within_ns(from),
+        }
+    }
+
+    /// As a relay, the ping to send `target` at `now_ns` for `asker`'s ping-request; its nonce is
+    /// the relay's own, from a range its own probes never use, and the caller maps the answer back to
+    /// the asker ([`SwimMessage::IndirectAck`](crate::codec::SwimMessage::IndirectAck)). Its
+    /// deadline, [`Ping::due_ns`], is this member's own for its probes of the target, as it judges
+    /// them now, within the longest it held for any member but the asker as the latest
+    /// period began, which the bound it states to the asker covers ([`Ack::relay_within_ns`]); a
+    /// target it does not hold is given that longest. With no answer by then the caller tells the
+    /// asker so ([`SwimMessage::Nack`](crate::codec::SwimMessage::Nack)), and an answer after it
+    /// still goes back as an indirect acknowledgement: each leg of the relayed exchange is judged by
+    /// the member that measures it (Lifeguard's nack, Dadgar et al. §IV-A).
+    pub fn on_ping_req(&mut self, asker: HostId, target: HostId, now_ns: u64) -> Ping {
+        self.clock_ns = self.clock_ns.max(now_ns);
         let nonce = self.relayed;
         self.relayed = self.relayed.saturating_sub(1);
+        let longest = self.longest.without(asker);
+        let (pooled, loss, granularity_ns) =
+            (self.pool.verdict, self.probe_loss(), self.granularity_ns());
+        let span = self.peers.get(&target).map_or(longest, |peer| {
+            judging(peer, pooled, loss, granularity_ns)
+                .0
+                .span_ns()
+                .min(longest)
+        });
         Ping {
             to: target,
             nonce,
-            due_ns: None,
+            due_ns: now_ns.saturating_add(span),
         }
     }
 
@@ -1755,6 +1957,7 @@ impl Detector {
                 held.rto.report(floor, minimum)
             },
             last_answer_ns: held.last_answer_ns,
+            relay_within: held.relay_within_ns.map(Duration::from_nanos),
             pool_misfit: far(held, self.pool_round_trip()),
             refused: held.stream.refused,
             ..held.report
@@ -1777,7 +1980,7 @@ impl Detector {
         self.peers.get(&peer).map(|held| held.stream.samples)
     }
 
-    /// The verdict that times this member's probes of `peer` now ([`judging`]): the pair's own;
+    /// The verdict that times this member's probes of `peer` now: the pair's own;
     /// before it has one, the pool's where the pool's span covers the pair, else the pair's timer's
     /// (`mistake` 1). `None` for a member the view does not hold.
     pub fn verdict(&self, peer: HostId) -> Option<Verdict> {
@@ -2431,7 +2634,7 @@ mod tests {
                 if let Some((from, nonce, at)) = pending
                     && at <= self.now
                 {
-                    detector.on_ack(from, nonce, at);
+                    detector.on_ack(from, nonce, at, detector.relay_within_ns(from));
                     pending = None;
                 }
             }
@@ -2477,10 +2680,15 @@ mod tests {
         let mut detector = detector(&[A, B]);
         let mut requests = Vec::new();
         let first = detector.poll(0, &mut requests).unwrap();
-        detector.on_ack(first.to, first.nonce, MS);
+        detector.on_ack(
+            first.to,
+            first.nonce,
+            MS,
+            detector.relay_within_ns(first.to),
+        );
         let lost = detector.poll(MS, &mut requests).unwrap();
         let timeout = MS + MINIMUM_RTO_NS;
-        assert_eq!(lost.due_ns, Some(timeout), "judged at the timer's second");
+        assert_eq!(lost.due_ns, timeout, "judged at the timer's second");
         assert_eq!(detector.poll(timeout - 1, &mut requests), None);
         assert_eq!(detector.poll(timeout, &mut requests), None);
         assert_eq!(requests.len(), 1, "the other member asked to relay");
@@ -2506,7 +2714,7 @@ mod tests {
         let mut detector = detector(&[A, B]);
         let mut requests = Vec::new();
         let first = detector.poll(0, &mut requests).unwrap();
-        assert_eq!(first.due_ns, Some(INITIAL_RTO_NS), "the initial second");
+        assert_eq!(first.due_ns, INITIAL_RTO_NS, "the initial second");
         let mut now = INITIAL_RTO_NS;
         let mut next = None;
         while next.is_none() {
@@ -2516,10 +2724,8 @@ mod tests {
         let second = next.unwrap();
         assert_ne!(second.to, first.to, "the round's other member");
         assert_eq!(
-            second
-                .due_ns
-                .map(|due| due - detector.probe.unwrap().sent_ns),
-            Some(INITIAL_RTO_NS),
+            second.due_ns - detector.probe.unwrap().sent_ns,
+            INITIAL_RTO_NS,
             "its own timer, not backed off"
         );
         let mut again = None;
@@ -2528,9 +2734,7 @@ mod tests {
             now = detector.wake().unwrap().max(now);
         }
         assert_eq!(
-            again
-                .and_then(|ping| ping.due_ns)
-                .map(|due| due - detector.probe.unwrap().sent_ns),
+            again.map(|ping| ping.due_ns - detector.probe.unwrap().sent_ns),
             Some(2 * INITIAL_RTO_NS),
             "the first pair's timer backed off: twice the initial second"
         );
@@ -2594,7 +2798,7 @@ mod tests {
             flight.retain(|&(at, from, nonce)| {
                 let due = at <= now;
                 if due {
-                    detector.on_ack(from, nonce, at);
+                    detector.on_ack(from, nonce, at, detector.relay_within_ns(from));
                 }
                 !due
             });
@@ -2718,7 +2922,12 @@ mod tests {
         let mut requests = Vec::new();
         let first = detector.poll(0, &mut requests).unwrap();
         assert_eq!(detector.granularity(), None, "no wake yet");
-        detector.on_ack(first.to, first.nonce, MS);
+        detector.on_ack(
+            first.to,
+            first.nonce,
+            MS,
+            detector.relay_within_ns(first.to),
+        );
         assert_eq!(detector.unmeasured(), 1);
         assert_eq!(detector.round_trips_taken(first.to), Some(0));
     }
@@ -2947,7 +3156,11 @@ mod tests {
         // The period's end: the next probe goes out, and A's first probe has been judged.
         let sent = world.pings.len();
         while world.pings.len() == sent {
-            assert_eq!(liveness(&detector, A), Liveness::Alive, "not before its deadline");
+            assert_eq!(
+                liveness(&detector, A),
+                Liveness::Alive,
+                "not before its deadline"
+            );
             world.run(&mut detector, 0, |peer| {
                 (peer == B).then(|| jitter(&mut state))
             });
@@ -2973,6 +3186,7 @@ mod tests {
                 world.pings.last().unwrap().to,
                 world.pings.last().unwrap().nonce,
                 world.now,
+                detector.relay_within_ns(world.pings.last().unwrap().to),
             );
             detector.poll(world.now, &mut world.requests)
         });
@@ -2987,7 +3201,7 @@ mod tests {
         assert!(g > Duration::ZERO && g <= Duration::from_nanos(world.late));
         // The pair's next probe goes no sooner than this one's deadline: its probes never overlap,
         // so the bound on one missing holds at any margin (`verdict`).
-        let due = ping.due_ns.unwrap();
+        let due = ping.due_ns;
         let sent = world.pings.len();
         let mut state = 5;
         // One period at a time, so the latest probe is the first of the pair's after this one.
@@ -3074,7 +3288,7 @@ mod tests {
                 if heard(detector, from, nonce, at) {
                     return now;
                 }
-                detector.on_ack(from, nonce, at);
+                detector.on_ack(from, nonce, at, detector.relay_within_ns(from));
             }
         }
         now
@@ -3172,11 +3386,15 @@ mod tests {
         let mut requests = Vec::new();
         let first = detector.poll(0, &mut requests).unwrap();
         assert_eq!(
-            first.due_ns,
-            Some(INITIAL_RTO_NS),
+            first.due_ns, INITIAL_RTO_NS,
             "judged by its timer, the initial second"
         );
-        detector.on_ack(first.to, first.nonce, MS);
+        detector.on_ack(
+            first.to,
+            first.nonce,
+            MS,
+            detector.relay_within_ns(first.to),
+        );
         assert_eq!(detector.wake(), Some(0), "nothing left to wait for");
         assert!(
             detector.poll(MS, &mut requests).is_some(),
@@ -3344,7 +3562,7 @@ mod tests {
             pending.sort_by_key(|(_, _, at)| *at);
             for (from, nonce, at) in pending.iter().copied().filter(|(_, _, at)| *at <= now) {
                 let samples = detector.pool.samples;
-                detector.on_ack(from, nonce, at);
+                detector.on_ack(from, nonce, at, detector.relay_within_ns(from));
                 if from != B {
                     continue;
                 }
@@ -3390,8 +3608,8 @@ mod tests {
         for _ in 0..4 {
             if let Some(ping) = detector.poll(now, &mut requests) {
                 now += jitter(&mut state);
-                detector.on_ack(ping.to, FOREIGN, now);
-                detector.on_ack(ping.to, ping.nonce, now);
+                detector.on_ack(ping.to, FOREIGN, now, detector.relay_within_ns(ping.to));
+                detector.on_ack(ping.to, ping.nonce, now, detector.relay_within_ns(ping.to));
             }
             now += MS;
         }
@@ -3719,6 +3937,280 @@ mod tests {
         assert_eq!(liveness(&detector, A), Liveness::Alive);
     }
 
+    /// Runs `world` until a probe of `target` is out and its direct deadline has passed unanswered,
+    /// every other peer answering, and polls there: the relays it asked are in `world.requests`.
+    /// The probe.
+    fn relays_asked_about(detector: &mut Detector, world: &mut World, target: HostId) -> Ping {
+        let mut state = 3;
+        loop {
+            world.run(detector, 0, |peer| {
+                (peer != target).then(|| jitter(&mut state))
+            });
+            if world.pings.last().map(|p| p.to) == Some(target) {
+                break;
+            }
+        }
+        let ping = *world.pings.last().unwrap();
+        world.now = ping_sent(detector);
+        assert_eq!(detector.poll(world.now, &mut world.requests), None);
+        ping
+    }
+
+    /// A relay stage lasts until the slowest relay asked has its response due: this member's span
+    /// for the relay, which bounds the request's way there and the response's way back, plus the
+    /// bound the relay stated for responding. A peer that has stated none is not asked.
+    #[test]
+    fn a_relay_stage_waits_for_the_slowest_relay_s_stated_bound() {
+        let peers = [A, B, C, HostId(5)];
+        let mut detector = detector(&peers);
+        let mut world = World::new();
+        configured(&mut detector, &mut world, &peers);
+        let mut state = 3;
+        loop {
+            world.run(&mut detector, 0, |peer| {
+                (peer != A).then(|| jitter(&mut state))
+            });
+            if world.pings.last().map(|p| p.to) == Some(A) {
+                break;
+            }
+        }
+        let ping = *world.pings.last().unwrap();
+        detector.peers.get_mut(&B).unwrap().relay_within_ns = Some(3 * MS);
+        detector.peers.get_mut(&C).unwrap().relay_within_ns = Some(40 * MS);
+        detector.peers.get_mut(&HostId(5)).unwrap().relay_within_ns = None;
+        world.now = ping_sent(&detector);
+        assert_eq!(detector.poll(world.now, &mut world.requests), None);
+        let mut asked: Vec<HostId> = world.requests.iter().map(|r| r.relay).collect();
+        asked.sort_unstable();
+        assert_eq!(
+            asked,
+            vec![B, C],
+            "the peer that stated nothing is not asked"
+        );
+        assert!(
+            world
+                .requests
+                .iter()
+                .all(|r| r.target == A && r.nonce == ping.nonce)
+        );
+        let due = |relay: HostId, within: u64| detector.verdict(relay).unwrap().span_ns() + within;
+        let until = world.now + due(B, 3 * MS).max(due(C, 40 * MS));
+        assert_eq!(detector.probe.unwrap().indirect_until, Some(until));
+        assert_eq!(detector.wake(), Some(until));
+        assert_eq!(detector.poll(until - 1, &mut world.requests), None);
+        assert!(detector.poll(until, &mut world.requests).is_some());
+        assert_eq!(liveness(&detector, A), Liveness::Suspect);
+    }
+
+    /// A relay stage ends once every relay it asked has nacked, before the slowest relay's response
+    /// is due: each judged its own leg to the target by its own deadline and had no answer
+    /// (Lifeguard's nack, Dadgar et al. §IV-A). One relay's nack leaves the stage waiting on the
+    /// other, and a nack about another probe moves nothing.
+    #[test]
+    fn a_relay_stage_ends_once_every_relay_asked_has_nacked() {
+        let peers = [A, B, C];
+        let mut detector = detector(&peers);
+        let mut world = World::new();
+        configured(&mut detector, &mut world, &peers);
+        let ping = relays_asked_about(&mut detector, &mut world, A);
+        let asked: Vec<HostId> = world.requests.iter().map(|r| r.relay).collect();
+        assert_eq!(asked.len(), 2, "both relays asked: {asked:?}");
+        let until = detector.wake().unwrap();
+        let at = world.now + 1;
+        detector.on_indirect_nack(asked[0], A, ping.nonce, at);
+        assert_eq!(detector.poll(at, &mut world.requests), None);
+        assert_eq!(detector.wake(), Some(until), "one relay has not responded");
+        detector.on_indirect_nack(asked[1], A, ping.nonce - 1, at);
+        assert_eq!(detector.wake(), Some(until), "a nack about another probe");
+        detector.on_indirect_nack(asked[1], A, ping.nonce, at + 1);
+        assert!(detector.wake().unwrap() <= at + 1, "every relay has nacked");
+        assert!(detector.poll(at + 1, &mut world.requests).is_some());
+        assert_eq!(liveness(&detector, A), Liveness::Suspect);
+        assert!(matches!(
+            detector.findings(),
+            [Finding::Suspected(Unanswered { target: A, relays_due_ns: Some(due), ended_ns, .. })]
+                if *due == until && *ended_ns == at + 1
+        ));
+    }
+
+    /// Takes from `pending` every answer due by `now`, earliest first.
+    fn take_due(pending: &mut Vec<(HostId, u64, u64)>, now: u64) -> Vec<(HostId, u64, u64)> {
+        pending.sort_by_key(|(_, _, at)| *at);
+        let due = pending
+            .iter()
+            .copied()
+            .filter(|(_, _, at)| *at <= now)
+            .collect();
+        pending.retain(|(_, _, at)| *at > now);
+        due
+    }
+
+    /// A peer reachable only through relays whose answers come long after the direct deadline
+    /// (slates, 2026-10-10: at load 100 a member that lost its direct path to B timed the relay
+    /// stage from two direct spans, one frozen since B stopped answering it; relayed answers came for
+    /// all 37 requests, but two came after their periods had ended, and each was a suspicion and
+    /// then, its told probe missing too, a condemnation of a live member). Do: under a 900 ms budget,
+    /// configure three pairs, then answer no direct probe of A and every relay request about A 150
+    /// to 160 ms after it was asked; each relay states it responds within 160 ms, as its own
+    /// deadline for A would, its probes of A measuring that slow path; every other probe answers in
+    /// about 1 ms; A refutes each suspicion 500 ms after it starts; run 60 s. Expect: A is never
+    /// suspected, so never condemned. When this member timed the stage by its own spans, every
+    /// relayed answer about A came after it, and A was suspected and condemned 655 ms in.
+    #[test]
+    fn a_peer_answering_only_through_a_slow_relay_is_never_condemned() {
+        const RELAYED_RTT: u64 = 150 * MS;
+        const RELAYED_SPREAD: u64 = 10 * MS;
+        const REFUTATION_DELAY: u64 = 500 * MS;
+        const RUN: u64 = 60_000 * MS;
+        let peers = [A, B, C];
+        let mut detector = budgeted(&peers);
+        let mut world = World::new();
+        configured(&mut detector, &mut world, &peers);
+        let mut state = 0x2545_F491_4F6C_DD1D;
+        let mut requests = Vec::new();
+        let mut direct: Vec<(HostId, u64, u64)> = Vec::new();
+        let mut relayed: Vec<(HostId, u64, u64)> = Vec::new();
+        let mut now = world.now;
+        let end = now + RUN;
+        let mut refutation: Option<(u64, u64)> = None;
+        while now < end && liveness(&detector, A) != Liveness::Dead {
+            if let Some(ping) = detector.poll(now, &mut requests)
+                && ping.to != A
+            {
+                direct.push((ping.to, ping.nonce, now + jitter(&mut state)));
+            }
+            if let Some(held) = detector.membership().state(A)
+                && held.liveness == Liveness::Suspect
+                && refutation.is_none()
+            {
+                refutation = Some((now + REFUTATION_DELAY, held.incarnation + 1));
+            }
+            if let Some((at, incarnation)) = refutation
+                && at <= now
+            {
+                detector.apply(A, alive(incarnation)).unwrap();
+                refutation = None;
+            }
+            for request in requests.drain(..) {
+                let rtt = if request.target == A {
+                    RELAYED_RTT + noise(&mut state) % RELAYED_SPREAD
+                } else {
+                    2 * jitter(&mut state)
+                };
+                relayed.push((request.target, request.nonce, now + rtt));
+            }
+            let next = direct
+                .iter()
+                .chain(relayed.iter())
+                .map(|(_, _, at)| *at)
+                .chain(refutation.map(|(at, _)| at))
+                .min();
+            now = match (detector.wake().map(|wake| wake + MS / 10), next) {
+                (Some(wake), Some(at)) => wake.min(at).max(now),
+                (Some(wake), None) => wake.max(now),
+                (None, Some(at)) => at.max(now),
+                (None, None) => {
+                    detector.on_ping(B);
+                    now + MS
+                }
+            };
+            for (from, nonce, at) in take_due(&mut direct, now) {
+                detector.on_ack(from, nonce, at, RELAYED_RTT + RELAYED_SPREAD);
+            }
+            for (target, nonce, at) in take_due(&mut relayed, now) {
+                detector.on_indirect_ack(target, nonce, at);
+            }
+        }
+        let report = detector.report(A).unwrap();
+        assert_eq!(
+            (report.suspicions, report.condemnations),
+            (0, 0),
+            "a peer answering through relays within their stated bound is never suspected ({} ms \
+             in): {report:?}",
+            (now - world.now) / MS
+        );
+    }
+
+    /// An answer from a suspect to the probe that told it, however late, shows it alive after that
+    /// probe: the condemnation pending on its miss is taken back, and the next answer from another
+    /// member condemns nobody. Before, only a timely answer or a refutation took it back, and a
+    /// suspect whose answers all came late was condemned at the next answer from anyone else.
+    #[test]
+    fn a_told_probe_s_late_answer_takes_back_its_pending_condemnation() {
+        let peers = [A, B, C];
+        let mut detector = detector(&peers);
+        let mut world = World::new();
+        configured(&mut detector, &mut world, &peers);
+        let mut state = 5;
+        world.found.clear();
+        let told = loop {
+            world.run(&mut detector, 0, |peer| {
+                (peer != A).then(|| jitter(&mut state))
+            });
+            if let Some(Finding::Pending(missed)) = world
+                .found
+                .iter()
+                .find(|finding| matches!(finding, Finding::Pending(_)))
+            {
+                break *missed;
+            }
+        };
+        assert_eq!(liveness(&detector, A), Liveness::Suspect);
+        assert!(detector.report(A).unwrap().pending_since_ns.is_some());
+        let late = world.now;
+        detector.on_ack(A, told.nonce, late, detector.relay_within_ns(A));
+        assert_eq!(detector.report(A).unwrap().pending_since_ns, None);
+        // The next periods' answers from the others condemn nobody.
+        world.found.clear();
+        let probes = world.pings.len();
+        while world.pings[probes..].iter().all(|ping| ping.to == A)
+            || world.pings.len() < probes + 2
+        {
+            world.run(&mut detector, 0, |peer| {
+                (peer != A).then(|| jitter(&mut state))
+            });
+        }
+        assert!(
+            !world
+                .found
+                .iter()
+                .any(|finding| matches!(finding, Finding::Condemned { target: A, .. })),
+            "{:?}",
+            world.found
+        );
+    }
+
+    /// A relay's deadline for a ping it relays is its own for its probes of the target, within the
+    /// longest it held for any member but the asker, which the bound it states to that asker covers;
+    /// a target it does not hold is given that longest. The bound it states to a member leaves out
+    /// its pair with that member, which it is never asked about.
+    #[test]
+    fn a_relay_states_and_keeps_its_bound_without_its_pair_with_the_asker() {
+        let peers = [A, B, C];
+        let mut detector = detector(&peers);
+        let mut world = World::new();
+        configured(&mut detector, &mut world, &peers);
+        let granularity = detector.granularity_ns();
+        detector.longest = Longest {
+            first: 50 * MS,
+            of: Some(A),
+            second: 20 * MS,
+        };
+        assert_eq!(detector.on_ping(A).relay_within_ns, 20 * MS + granularity);
+        assert_eq!(detector.on_ping(B).relay_within_ns, 50 * MS + granularity);
+        let now = world.now;
+        let unknown = HostId(99);
+        assert_eq!(detector.on_ping_req(A, unknown, now).due_ns, now + 20 * MS);
+        assert_eq!(detector.on_ping_req(B, unknown, now).due_ns, now + 50 * MS);
+        let span = detector.verdict(C).unwrap().span_ns();
+        assert!(span < 20 * MS);
+        assert_eq!(
+            detector.on_ping_req(A, C, now).due_ns,
+            now + span,
+            "the relay's own deadline for the target"
+        );
+    }
+
     #[test]
     fn a_refutation_clears_the_suspicion_and_its_pending_condemnation() {
         let peers = [A, B, C];
@@ -4023,7 +4515,7 @@ mod tests {
         for at in 0..6 {
             let ping = detector.poll(at, &mut requests).unwrap();
             assert_eq!(ping.to, B);
-            detector.on_ack(B, ping.nonce, at);
+            detector.on_ack(B, ping.nonce, at, detector.relay_within_ns(B));
         }
     }
 
@@ -4066,7 +4558,12 @@ mod tests {
                 answering.apply_gossip(batch.iter().copied());
                 answering.ack_gossip_into(from, 10, &mut batch);
                 prober.apply_gossip(batch.iter().copied());
-                prober.on_ack(ping.to, ping.nonce, at * MS + 1);
+                prober.on_ack(
+                    ping.to,
+                    ping.nonce,
+                    at * MS + 1,
+                    prober.relay_within_ns(ping.to),
+                );
             }
         }
         let [x, y] = detectors;
@@ -4366,7 +4863,7 @@ mod tests {
                 now = detector.wake().unwrap();
             };
             now += rtt;
-            detector.on_ack(ping.to, ping.nonce, now);
+            detector.on_ack(ping.to, ping.nonce, now, detector.relay_within_ns(ping.to));
             // A round of one: A is the only member probed.
             assert!(engine.update(&peer, Duration::from_nanos(rtt), 1));
             assert_eq!(detector.coordinate(), engine.coordinate());
@@ -4374,6 +4871,17 @@ mod tests {
         assert_eq!(detector.predicted_rtt(A), Some(engine.predict(&peer)));
     }
 
+    /// Each of `hosts` has acknowledged a probe, stating it responds to a ping-request within a
+    /// millisecond.
+    fn stated(detector: &mut Detector, hosts: &[HostId]) {
+        for host in hosts {
+            detector.peers.get_mut(host).unwrap().relay_within_ns = Some(MS);
+        }
+    }
+
+    /// Relays are ranked nearest the target first, among the alive peers that have stated when
+    /// their responses are due; one that has stated nothing is not asked, for nothing bounds the
+    /// wait for its response.
     #[test]
     fn relays_are_ranked_nearest_the_target_first() {
         let positions = [(A, 0.0), (B, 1.0), (C, 2.0), (HostId(5), 10.0)];
@@ -4386,8 +4894,13 @@ mod tests {
             detector.learn_coordinate(host, Coordinate::Held(&coordinate));
         }
         detector.rank_relays(A);
-        let ranked: Vec<HostId> = detector.relays.clone();
-        assert_eq!(ranked, vec![B, C, HostId(5)]);
+        assert!(detector.relays.is_empty(), "no relay has stated a bound");
+        stated(&mut detector, &[A, B, HostId(5)]);
+        detector.rank_relays(A);
+        assert_eq!(detector.relays, vec![B, HostId(5)]);
+        stated(&mut detector, &[C]);
+        detector.rank_relays(A);
+        assert_eq!(detector.relays, vec![B, C, HostId(5)]);
     }
 
     /// A coordinate that cannot be used is not learned, and the one held stays.
@@ -4451,6 +4964,7 @@ mod tests {
             detector.join(host).unwrap();
             detector.learn_coordinate(host, Coordinate::Held(engines[index].coordinate()));
         }
+        stated(&mut detector, &hosts[1..]);
         for target in 1..9 {
             detector.rank_relays(hosts[target]);
             let region = target / 3 * 3;

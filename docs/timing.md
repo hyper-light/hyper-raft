@@ -481,8 +481,15 @@ least three round trips" rule of thumb (§3.1) by the measured deadlines.
   at the lesser of their two bounds (below), so each probe is charged `(η + μ + C)·β`. Priced as a
   suspicion's refutation alone, the margin ignored what acting on a death costs, and a verdict whose
   bound was 0.713 promised a condemnation of a live peer at most as unlikely (slates, 2026-10-10);
-- the MTBF from the member's `Exposure` fold, the node time it watched and the deaths it learned,
-  seeded with the fleet's history by the owner (Jeffreys' `2T` before the first failure);
+- the MTBF from the member's `Exposure` fold, the node time it watched and the deaths that stood,
+  seeded with the fleet's history by the owner (Jeffreys' `2T` before the first failure). A death
+  stands once its record outlives its window (below) unrefuted, and counts once, its member and
+  incarnation naming it. Counted when adopted, as the first form did, a false condemnation shortened
+  the MTBF, and a shorter MTBF buys smaller margins and so more false condemnations (slates,
+  2026-10-10); in the simulation each member that condemned a member stopped and then refuting
+  counted it a failure (`a_refuted_death_is_no_failure`, `a_death_counts_once_it_stands`). A member
+  that crashed and came back within the window goes uncounted too, the cost of telling a refutation
+  from a restart without the owner's word;
 - the floor `G` (§2.4, measured), the search's resolution;
 - any margin. A pair's probes never overlap: a judged period runs to its probe's deadline, and the
   pair's next probe is sent after the period ends, so the bound on a live peer's probe missing is

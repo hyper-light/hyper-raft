@@ -800,6 +800,12 @@ pub struct Detector {
     /// The deaths the view adopted, oldest first: the order their records are forgotten in. A
     /// record the member has since left (a refutation, a newer death) is skipped when reached.
     deaths: VecDeque<Death>,
+    /// The latest deaths counted as failures, each a member and the incarnation it died at, at most
+    /// as many as the view holds members. A record forgotten can come back: a member the death had
+    /// not reached yet passes on its older state of the dead member, which is adopted as a
+    /// newcomer's, condemned again and forgotten again (`docs/research/swim.md`, what is left of
+    /// the window's risk); it is the same death, counted once.
+    counted: VecDeque<(HostId, u64)>,
     /// The latest time the caller gave, nanoseconds.
     clock_ns: u64,
     /// The most members the view has held at once besides this one: no round has been larger.
@@ -920,6 +926,7 @@ impl Detector {
             aging: Vec::new(),
             relays: Vec::new(),
             deaths: VecDeque::new(),
+            counted: VecDeque::with_capacity(members.get()),
             clock_ns: 0,
             most_watched: 0,
             most_transmits: 1,
@@ -1473,9 +1480,25 @@ impl Detector {
         }
     }
 
-    /// Forgets `member`, held dead, and everything held of it.
+    /// Forgets `member`, held dead, and everything held of it. Its death has stood: the record
+    /// outlived its window, which a refutation ends, so it counts as a failure of the fleet's
+    /// (`Exposure`), once for each death, which its incarnation names ([`Detector::counted`]).
+    /// Counted when adopted, a false condemnation, a live member's death refuted within the window,
+    /// shortened the MTBF the margins are priced with, and a shorter MTBF buys smaller margins and
+    /// more false condemnations (slates, 2026-10-10). A member that crashed and came back inside the
+    /// window is not counted either; its record never stood.
     fn forget(&mut self, member: HostId) {
+        let died = self.membership.state(member).map(|state| state.incarnation);
         if self.membership.forget(member) {
+            if let Some(incarnation) = died
+                && !self.counted.contains(&(member, incarnation))
+            {
+                self.exposure.on_failure();
+                if self.counted.len() >= self.membership.capacity() {
+                    self.counted.pop_front();
+                }
+                self.counted.push_back((member, incarnation));
+            }
             self.peers.remove(&member);
             self.peer_coordinates.remove(&member);
             self.extensions.remove(&member);
@@ -1686,6 +1709,12 @@ impl Detector {
         }
     }
 
+    /// The failure history the margins are priced with: the node time this member watched beside
+    /// the owner's seed, and the deaths that stood ([`Exposure::mtbf`]).
+    pub fn exposure(&self) -> Exposure {
+        self.exposure
+    }
+
     /// The mean of this member's periods, once one has ended.
     pub fn mean_period(&self) -> Option<Duration> {
         self.periods.mean_ns().map(Duration::from_nanos)
@@ -1812,7 +1841,6 @@ impl Detector {
                 peer.suspected_from = None;
                 peer.told_missed = 0;
                 peer.pending_since = None;
-                self.exposure.on_failure();
                 self.extensions.remove(&member);
                 self.peer_coordinates.remove(&member);
                 self.record_death(Death {
@@ -3222,6 +3250,62 @@ mod tests {
             Liveness::Alive,
             "the silent peer is suspected"
         );
+    }
+
+    /// A death counts in the failure history once it stands (slates, 2026-10-10: every adopted
+    /// death counted, the false and refuted ones too, so a false condemnation shortened the MTBF
+    /// the margins are priced with, and the next verdicts were the more aggressive for it). Do: on
+    /// a configured member over A, B and C, adopt A's death and then its refutation; then adopt C's
+    /// death and run until its record is forgotten past its window; then adopt C's older suspicion,
+    /// as a member the death had not reached passes it on, and the death again, until forgotten
+    /// again. Expect: no failure after the refutation, and one once C is forgotten, the same after
+    /// it comes back and goes again. Before, the refuted death counted.
+    #[test]
+    fn a_death_counts_once_it_stands() {
+        let (mut detector, now) = warmed();
+        let dead = MemberState {
+            liveness: Liveness::Dead,
+            incarnation: 0,
+        };
+        detector.apply(A, dead).unwrap();
+        detector.apply(A, alive(1)).unwrap();
+        assert_eq!(
+            detector.exposure().failures(),
+            0,
+            "a refuted death is no failure"
+        );
+        detector.apply(C, dead).unwrap();
+        assert_eq!(detector.exposure().failures(), 0, "not yet stood");
+        let mut state = 3;
+        drive_many(
+            &mut detector,
+            now,
+            now + 600_000 * MS,
+            |peer| (peer != C).then(|| jitter(&mut state)),
+            |_, _, _, _| false,
+            |detector| detector.membership().state(C).is_none(),
+        );
+        assert_eq!(detector.membership().state(C), None, "C forgotten");
+        assert_eq!(detector.exposure().failures(), 1, "the death that stood");
+        // A member the death had not reached passes on its older state of C: adopted as a
+        // newcomer's, condemned again, forgotten again. The same death, counted once.
+        let suspected = MemberState {
+            liveness: Liveness::Suspect,
+            incarnation: 0,
+        };
+        detector.apply(C, suspected).unwrap();
+        detector.apply(C, dead).unwrap();
+        let again = detector.clock_ns;
+        drive_many(
+            &mut detector,
+            again,
+            again + 600_000 * MS,
+            |peer| (peer != C).then(|| jitter(&mut state)),
+            |_, _, _, _| false,
+            |detector| detector.membership().state(C).is_none(),
+        );
+        assert_eq!(detector.membership().state(C), None, "C forgotten again");
+        assert_eq!(detector.exposure().failures(), 1, "one death, counted once");
     }
 
     /// A configured member over near peers A, B and C, and the time its warm-up ended: the member a

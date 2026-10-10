@@ -151,6 +151,11 @@
     `pool_misfit` (the pair does not feed the pool) and `refused`, and `Detector::pool` reports the
     pooled verdict, its samples and its latest refusal.
 
+17. **A death counts in the failure history once it stands** (`docs/timing.md` §2.7, "The
+    margin"): when its record is forgotten past its window unrefuted, once per member and
+    incarnation, not when adopted. A false condemnation, refuted, shortened the MTBF and so the
+    margins. `Detector::exposure` reports the history.
+
 The wire changed in place with 8 and 11: a probe and an answer carry entries of the existing gossip
 encoding, which a receiver of the earlier form applies as any gossip, and `Sync` is a new tag with
 its own golden vector. No consumer runs hyper-swim yet (slates' session owns its integration), so

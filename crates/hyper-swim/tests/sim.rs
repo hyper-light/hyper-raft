@@ -191,6 +191,10 @@ struct Noted {
     within: Option<Duration>,
     /// When the member came to hold it dead, on its own clock.
     at_ns: u64,
+    /// The incarnation it died at, which names the death: only a state at a higher one, a
+    /// refutation, ends it. A record forgotten and adopted again from a member the death had not
+    /// reached, at the incarnation it died at or below, is the same death.
+    incarnation: u64,
 }
 
 /// One member's driver, as the cluster test's: its detector and the probes it relays.
@@ -466,14 +470,10 @@ impl Member {
             {
                 self.provisional.insert(host(peer).0);
             }
-            let held = self
-                .detector
-                .membership()
-                .state(host(peer))
-                .map(|state| state.liveness);
+            let state = self.detector.membership().state(host(peer));
             let id = host(peer).0;
-            match held {
-                Some(Liveness::Dead) if !self.deaths.contains_key(&id) => {
+            match state.map(|state| (state.liveness, state.incarnation)) {
+                Some((Liveness::Dead, incarnation)) if !self.deaths.contains_key(&id) => {
                     let report = self.detector.report(host(peer)).unwrap_or_default();
                     let since = |at: Option<u64>| {
                         Duration::from_nanos(at.map_or(0, |at| now.saturating_sub(at)))
@@ -486,10 +486,16 @@ impl Member {
                             after: since(report.last_answer_ns),
                             within: bound.map(|bound| bound.saturating_add(waited)),
                             at_ns: now,
+                            incarnation,
                         },
                     );
                 }
-                Some(Liveness::Alive | Liveness::Suspect) => {
+                Some((Liveness::Alive | Liveness::Suspect, incarnation))
+                    if self
+                        .deaths
+                        .get(&id)
+                        .is_some_and(|noted| incarnation > noted.incarnation) =>
+                {
                     self.deaths.remove(&id);
                 }
                 _ => {}
@@ -603,18 +609,7 @@ impl Sim {
                 Step::Event {
                     node,
                     event: Ev::Thaw,
-                } => {
-                    let held = self.members[node.0 as usize].stalled.take();
-                    for (payload, stamp) in held.into_iter().flatten() {
-                        let member = &mut self.members[node.0 as usize];
-                        if let Ok(message) = SwimMessage::decode(&payload) {
-                            member.handle(node, message, stamp, &mut self.outbox);
-                        }
-                    }
-                    if self.members[node.0 as usize].alive {
-                        self.step(node);
-                    }
-                }
+                } => self.thaw(node),
                 Step::Event {
                     node,
                     event: Ev::Arrive(ticket),
@@ -703,9 +698,45 @@ impl Sim {
     /// (`docs/timing.md` §2.6): its timer does not fire and the datagrams that reach it wait, each
     /// stamped on arrival; at the thaw it handles them in order, then polls.
     fn stall(&mut self, node: NodeId, for_ns: u64) {
+        self.stop(node);
+        self.world.after(for_ns, node, Ev::Thaw).unwrap();
+    }
+
+    /// Stops `node`'s process, as `SIGSTOP` does, until [`Sim::thaw`]: a stall of no stated
+    /// length.
+    fn stop(&mut self, node: NodeId) {
         self.members[node.0 as usize].stalled = Some(Vec::new());
         self.world.wake(node, None).unwrap();
-        self.world.after(for_ns, node, Ev::Thaw).unwrap();
+    }
+
+    /// Runs `node`'s stalled process again: it handles what reached it meanwhile, in order, then
+    /// polls. Nothing for a member not stalled.
+    fn thaw(&mut self, node: NodeId) {
+        let Some(held) = self.members[node.0 as usize].stalled.take() else {
+            return;
+        };
+        for (payload, stamp) in held {
+            let member = &mut self.members[node.0 as usize];
+            if let Ok(message) = SwimMessage::decode(&payload) {
+                member.handle(node, message, stamp, &mut self.outbox);
+            }
+        }
+        if self.members[node.0 as usize].alive {
+            self.step(node);
+        }
+    }
+
+    /// Whether every live member but `subject` holds it in `liveness` (dead: as noted).
+    fn held_by_the_others(&self, subject: NodeId, liveness: Liveness) -> bool {
+        self.live()
+            .filter(|(me, _)| *me != subject)
+            .all(|(_, member)| {
+                member
+                    .detector
+                    .membership()
+                    .state(host(subject))
+                    .is_some_and(|state| state.liveness == liveness)
+            })
     }
 
     fn kill(&mut self, victim: NodeId) {
@@ -738,6 +769,12 @@ fn run(source: Source) -> Result<Record, SimError> {
 /// its detector stated, with the wait it measured for evidence of its own health added, and none
 /// holding a live member dead before or after. The run's record.
 fn kill_and_hold_dead_within_bounds(mut sim: Sim, seed: &str) -> Result<Record, SimError> {
+    kill_and_check(&mut sim, seed);
+    Ok(sim.world.finish())
+}
+
+/// [`kill_and_hold_dead_within_bounds`]'s kill and checks, the run going on after: the victim.
+fn kill_and_check(sim: &mut Sim, seed: &str) -> NodeId {
     for (me, member) in sim.live() {
         assert!(
             member.deaths.is_empty(),
@@ -775,7 +812,7 @@ fn kill_and_hold_dead_within_bounds(mut sim: Sim, seed: &str) -> Result<Record, 
         noted.push((me.0, death));
     }
     assert_eq!(noted.len(), (sim.shape.nodes - 1) as usize);
-    Ok(sim.world.finish())
+    victim
 }
 
 #[test]
@@ -948,6 +985,61 @@ fn stalled_early(source: Source) -> Result<Record, SimError> {
 fn a_pool_fed_by_pairs_a_stall_made_late_configures() {
     for seed in 0..16 {
         twice(seed, stalled_early).unwrap_or_else(|refusal| panic!("seed {seed}: {refusal}"));
+    }
+}
+
+/// One run from `source` of the LAN cluster in which member 1's process stops until every other
+/// member has condemned it, then runs again and refutes its death: no member counts that death a
+/// failure, so none prices its margins with an MTBF the false death shortened. Then the LAN run's
+/// kill and checks, and on until every survivor forgets the victim, its death having stood: each
+/// counts exactly that one failure.
+fn stopped_and_refuted(source: Source) -> Result<Record, SimError> {
+    let seed = match &source {
+        Source::Seed(seed) => format!("seed {seed}"),
+        Source::Trace(_) => "the trace".to_owned(),
+    };
+    let mut sim = Sim::new(source, false, LAN_CLUSTER);
+    sim.run("every pair judged", Sim::every_pair_judged);
+    let stopped = NodeId(1);
+    sim.stop(stopped);
+    sim.run("the stopped member condemned by every other", |sim| {
+        sim.held_by_the_others(stopped, Liveness::Dead)
+    });
+    sim.thaw(stopped);
+    sim.run("the stopped member alive again in every view", |sim| {
+        sim.held_by_the_others(stopped, Liveness::Alive)
+    });
+    for (me, member) in sim.live() {
+        assert_eq!(
+            member.detector.exposure().failures(),
+            0,
+            "{seed}: member {me:?} counts a death that was refuted"
+        );
+    }
+    let victim = kill_and_check(&mut sim, &seed);
+    sim.run("the victim forgotten by every survivor", |sim| {
+        sim.live()
+            .all(|(_, member)| member.detector.membership().state(host(victim)).is_none())
+    });
+    for (me, member) in sim.live() {
+        assert_eq!(
+            member.detector.exposure().failures(),
+            1,
+            "{seed}: member {me:?} counts the death that stood"
+        );
+    }
+    Ok(sim.world.finish())
+}
+
+/// A false condemnation is no failure (`docs/timing.md` §2.7, "The margin"): a death counts in a
+/// member's failure history once its record outlives its window unrefuted. Before, every adopted
+/// death counted, the refuted ones too, so each false condemnation shortened the MTBF the margins
+/// are priced with: every member that condemned the stopped member counted one failure on every
+/// seed, and smaller margins buy more false condemnations.
+#[test]
+fn a_refuted_death_is_no_failure() {
+    for seed in 0..16 {
+        twice(seed, stopped_and_refuted).unwrap_or_else(|refusal| panic!("seed {seed}: {refusal}"));
     }
 }
 

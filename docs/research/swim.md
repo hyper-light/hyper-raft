@@ -212,6 +212,11 @@ discarded.
   expectation, can still pass a stale update; the member adopted again is then probed and condemned
   again by this member's own detector, within its detection bound. The detector's verdicts are hints
   to the owner's committed membership, never durable decisions, so the cost is probes, not safety.
+  Observed (2026-10-10): with margins searched over every margin, members that measured a stall
+  judge with wider margins and condemn later than the others, whose windows are their own periods';
+  in the simulation one such member still held a killed member suspected 30 ms after two others had
+  forgotten its death, and passed its suspicion on. The death is the same one (its member and
+  incarnation): the failure history counts it once.
 - An isolated member, with nobody alive or suspected left, keeps its records: the dead are the only
   members it probes, and a live one among them refutes in its answer (`docs/timing.md` §2.7).
 - The bound. The owner's placement says how many hosts a node can know; the view holds at most that

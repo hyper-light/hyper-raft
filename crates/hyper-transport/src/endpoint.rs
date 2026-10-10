@@ -31,9 +31,9 @@ use std::time::{Duration, Instant};
 
 use hyper_quic::rustls::pki_types::CertificateDer;
 use hyper_quic::{
-    ClientConfigHandle, Connection, DatagramEvent, Dir, EcnCodepoint, EndpointConfig,
-    Event as QuicEvent, IdleTimeout, Incoming as Attempt, StreamEvent, StreamId, Transmit,
-    TransportConfig, VarInt,
+    ClientConfigHandle, Connection, ConnectionError, DatagramEvent, Dir, EcnCodepoint,
+    EndpointConfig, Event as QuicEvent, IdleTimeout, Incoming as Attempt, StreamEvent, StreamId,
+    Transmit, TransportConfig, TransportErrorCode, VarInt,
 };
 
 use crate::admission::{Admission, AdmissionLimits, AdmissionStats};
@@ -48,8 +48,8 @@ use crate::progress::{Carry, Delivered, Moved, Progress};
 use crate::receive::Receive;
 use crate::tally::{Table, Tally};
 use crate::timing::PeerTiming;
-use crate::tls::{self, Credentials};
-use crate::{Classes, Directory, Epoch, Event, ExchangeId, PeerId, Refusal};
+use crate::tls::Tls;
+use crate::{Authenticated, Classes, Directory, Epoch, Event, ExchangeId, PeerId, Refusal};
 
 /// The bounds an endpoint keeps; every one is the owner's configuration, derived by its own law
 /// (CLAUDE.md §1: no arbitrary numbers).
@@ -141,14 +141,14 @@ impl Limits {
 
 /// What an endpoint is built from.
 pub struct Config<R> {
-    /// The node's certificate, key and its authority's roots.
-    pub credentials: Credentials,
+    /// The TLS its connections run under: what it presents and how it verifies its peers, and
+    /// whether it accepts connections (a server side) or only dials ([`Tls::mutual`] from
+    /// credentials, or the owner's own configurations).
+    pub tls: Tls,
     /// The node's role as a sender: with a message's kind it gives the message's class.
     pub role: R,
     /// The endpoint's bounds.
     pub limits: Limits,
-    /// Whether the endpoint accepts connections, or only dials.
-    pub listen: bool,
 }
 
 /// What the path to a peer measures now.
@@ -248,12 +248,13 @@ struct Conn<R> {
 }
 
 /// A peer's lifecycle as the owner hears it: its newest connection up, that connection closed,
-/// or a dial to it failed with no connection up since.
+/// or a dial to it failed with no connection up since; a close and a failed dial with why, when
+/// either side said.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Lifecycle {
     Connected(Epoch),
-    Closed(Epoch),
-    Unreachable,
+    Closed(Epoch, Option<Refusal>),
+    Unreachable(Option<Refusal>),
 }
 
 #[derive(Debug)]
@@ -271,8 +272,11 @@ struct PeerEntry<R> {
     held: u32,
     /// A dial to it is in progress.
     dialing: bool,
-    /// The last dial to it failed, and no connection to it has come up since.
-    unreachable: bool,
+    /// The last dial to it failed, and no connection to it has come up since: why, when either
+    /// side said.
+    unreachable: Option<Option<Refusal>>,
+    /// Why its newest connection closed, when either side said.
+    closed: Option<Refusal>,
     /// The state the owner was last told, by the lifecycle event it polled last.
     reported: Option<Lifecycle>,
     /// The state of the lifecycle event waiting for the owner, if one does.
@@ -294,7 +298,8 @@ impl<R> PeerEntry<R> {
             used,
             held: 0,
             dialing: false,
-            unreachable: false,
+            unreachable: None,
+            closed: None,
             reported: None,
             waiting: None,
             frames: 0,
@@ -305,10 +310,10 @@ impl<R> PeerEntry<R> {
     fn lifecycle(&self) -> Option<Lifecycle> {
         if self.connection.is_some() {
             Some(Lifecycle::Connected(self.epoch))
-        } else if self.unreachable {
-            Some(Lifecycle::Unreachable)
+        } else if let Some(refusal) = self.unreachable {
+            Some(Lifecycle::Unreachable(refusal))
         } else {
-            (self.epoch > 0).then_some(Lifecycle::Closed(self.epoch))
+            (self.epoch > 0).then_some(Lifecycle::Closed(self.epoch, self.closed))
         }
     }
     /// Whether the entry must stay: a connection or a dial needs it, or events wait in it.
@@ -329,7 +334,7 @@ impl<C: Classes> Waiting<C> {
     /// Whether this is a lifecycle event of `peer`.
     fn lifecycle_of(&self, peer: PeerId) -> bool {
         matches!(self.event,
-            Event::Connected { peer: of, .. } | Event::Closed { peer: of, .. } | Event::Unreachable { peer: of }
+            Event::Connected { peer: of, .. } | Event::Closed { peer: of, .. } | Event::Unreachable { peer: of, .. }
                 if of == peer)
     }
 }
@@ -396,6 +401,43 @@ fn length(bytes: usize) -> u64 {
     u64::try_from(bytes).unwrap_or(u64::MAX)
 }
 
+/// The code range of a TLS alert carried as a QUIC CRYPTO_ERROR (RFC 9000 §20.1: `0x0100` to
+/// `0x01ff`, the alert in the low byte).
+const CRYPTO_ERRORS: std::ops::RangeInclusive<u64> = 0x0100..=0x01ff;
+
+/// What a connection's loss says of why it ended, when either side said: a TLS alert from either
+/// side is a certificate refused ([`Refusal::Identity`]); the peer's CONNECTION_REFUSED (RFC 9000
+/// §20.1), sent for an attempt its pending places or its budget could not take, is its pending
+/// bound ([`Refusal::Pending`]); the peer's application close carries its refusal's code
+/// ([`Refusal::code`]). A close that names no refusal, a timeout, a reset and this side's own close
+/// say nothing.
+fn refusal_of(reason: &ConnectionError) -> Option<Refusal> {
+    match reason {
+        ConnectionError::TransportError(error)
+            if CRYPTO_ERRORS.contains(&u64::from(error.code)) =>
+        {
+            Some(Refusal::Identity)
+        }
+        ConnectionError::ConnectionClosed(close)
+            if CRYPTO_ERRORS.contains(&u64::from(close.error_code)) =>
+        {
+            Some(Refusal::Identity)
+        }
+        ConnectionError::ConnectionClosed(close)
+            if close.error_code == TransportErrorCode::CONNECTION_REFUSED =>
+        {
+            Some(Refusal::Pending)
+        }
+        ConnectionError::ApplicationClosed(close) => {
+            match Refusal::from_code(close.error_code.into_inner()) {
+                Refusal::Unknown | Refusal::Closed => None,
+                refusal => Some(refusal),
+            }
+        }
+        _ => None,
+    }
+}
+
 impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, B, D> {
     /// An endpoint for `config`, holding its bytes against `budget` and naming peers by
     /// `directory`. `now` is the caller's clock.
@@ -407,12 +449,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
     ) -> Result<Self, Refusal> {
         config.limits.validate()?;
         let transport = config.limits.transport(C::RANKS)?;
-        let server = if config.listen {
-            Some(tls::server(&config.credentials, transport.clone())?)
-        } else {
-            None
-        };
-        let client = tls::client(&config.credentials, transport)?;
+        let (server, client) = config.tls.prepare(&transport)?;
         let mut quic = hyper_quic::Endpoint::new(EndpointConfig::default(), server, true, None)
             .map_err(|_| Refusal::Quic)?;
         let client = quic
@@ -434,7 +471,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
                 role: config.role,
                 limits,
                 serve: Progress::new(limits.serve_period)?,
-                admission: Admission::new(limits.admission)?,
+                admission: Admission::new(limits.admission, limits.serve_period)?,
                 exchanges: Table::new(limits.exchanges, C::RANKS),
                 #[cfg(feature = "oracle")]
                 oracle: false,
@@ -566,7 +603,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
                 .release_with(exchange.0, |waiting| waiting.writable_waiting = false),
             Event::Connected { peer, .. }
             | Event::Closed { peer, .. }
-            | Event::Unreachable { peer } => {
+            | Event::Unreachable { peer, .. } => {
                 self.core.lifecycle_polled(peer);
             }
             Event::Frame { peer, .. } => {
@@ -679,6 +716,29 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
         let opened = self.core.open(now, key, &mut conn, ask);
         self.put(key, conn);
         opened
+    }
+
+    /// Run the connections made from now on under `tls`: a renewed certificate, roots that
+    /// changed, a protocol added or taken away. A connection already up keeps the TLS it was
+    /// made with until it closes; a configuration replaced goes once the last connection made
+    /// under it has drained. A `tls` without a server side stops accepting connections, and one
+    /// with it starts. [`Refusal::Configuration`] for a configuration [`Endpoint::new`] would
+    /// refuse, [`Refusal::Quic`] when every configuration slot still serves a connection; either
+    /// way the endpoint keeps the TLS it had.
+    pub fn set_tls(&mut self, tls: Tls) -> Result<(), Refusal> {
+        let transport = self.core.limits.transport(C::RANKS)?;
+        let (server, client) = tls.prepare(&transport)?;
+        let client = self
+            .quic
+            .insert_client_config(client)
+            .map_err(|_| Refusal::Quic)?;
+        if self.quic.set_server_config(server).is_err() {
+            self.quic.retire_client_config(client);
+            return Err(Refusal::Quic);
+        }
+        let replaced = std::mem::replace(&mut self.client, client);
+        self.quic.retire_client_config(replaced);
+        Ok(())
     }
 
     /// The head of the message the peer sent on `exchange`, once it has arrived.
@@ -887,6 +947,19 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
     /// The budget, for the owner's accounting.
     pub fn budget(&self) -> &B {
         &self.core.budget
+    }
+
+    /// The directory, for the owner's reads.
+    pub fn directory(&self) -> &D {
+        &self.core.directory
+    }
+
+    /// The directory, for the owner to change between driving calls: a peer it is about to dial
+    /// (its server name), an identity granted or revoked. A change applies to the handshakes that
+    /// complete after it; a connection already identified keeps its peer and role until the
+    /// owner closes it ([`Endpoint::disconnect`]).
+    pub fn directory_mut(&mut self) -> &mut D {
+        &mut self.core.directory
     }
 
     fn take(&mut self, key: usize) -> Option<Box<Conn<C::Role>>> {
@@ -1185,8 +1258,12 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
                 Some(role) => Event::Connected { peer, role, epoch },
                 None => return,
             },
-            Some(Lifecycle::Closed(epoch)) => Event::Closed { peer, epoch },
-            Some(Lifecycle::Unreachable) => Event::Unreachable { peer },
+            Some(Lifecycle::Closed(epoch, refusal)) => Event::Closed {
+                peer,
+                epoch,
+                refusal,
+            },
+            Some(Lifecycle::Unreachable(refusal)) => Event::Unreachable { peer, refusal },
             None => return,
         };
         entry.waiting = state;
@@ -1231,7 +1308,10 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
     ) -> Option<usize> {
         match event {
             QuicEvent::Connected => return self.connected(now, key, conn),
-            QuicEvent::ConnectionLost { .. } => self.lost(key, conn),
+            QuicEvent::ConnectionLost { reason } => {
+                let refusal = refusal_of(&reason);
+                self.lost_for(key, conn, refusal);
+            }
             QuicEvent::Stream(event) => self.on_stream(now, key, conn, event),
             QuicEvent::HandshakeDataReady
             | QuicEvent::DatagramReceived
@@ -1278,6 +1358,14 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
         }
     }
 
+    /// The application protocol the handshake negotiated.
+    fn protocol(conn: &Conn<C::Role>) -> Option<Vec<u8>> {
+        let data = conn.quic.crypto_session().handshake_data()?;
+        data.downcast::<hyper_quic::crypto::rustls::HandshakeData>()
+            .ok()?
+            .protocol
+    }
+
     /// The certificate the peer authenticated with, its end-entity first.
     fn certificate(conn: &Conn<C::Role>) -> Option<Vec<u8>> {
         let identity = conn.quic.crypto_session().peer_identity()?;
@@ -1297,7 +1385,16 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
         if conn.dialed.is_some() {
             self.dialing = self.dialing.saturating_sub(1);
         }
-        let identified = Self::certificate(conn).and_then(|der| self.directory.identify(&der));
+        let certificate = Self::certificate(conn);
+        // A connection negotiates one of the server's protocols or none is up (RFC 9001 §8.1;
+        // `Tls::prepare` requires each side to name one).
+        let identified = Self::protocol(conn).and_then(|protocol| {
+            self.directory.identify(&Authenticated {
+                certificate: certificate.as_deref(),
+                protocol: &protocol,
+                dialed: conn.dialed,
+            })
+        });
         let Some((peer, role)) =
             identified.filter(|(peer, _)| conn.dialed.is_none_or(|dialed| dialed == *peer))
         else {
@@ -1310,7 +1407,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
             return self.refuse_connection(now, conn, Refusal::Events);
         }
         self.tick = self.tick.saturating_add(1);
-        let replaced = match self.admission.admit(peer, key, self.tick) {
+        let replaced = match self.admission.admit(peer, key, self.tick, now) {
             Ok(replaced) => replaced,
             Err(refusal) => return self.refuse_connection(now, conn, refusal),
         };
@@ -1323,7 +1420,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
             entry.held = entry.held.saturating_add(1);
             // A connection the peer opened leaves a dial to it in progress, and its entry held.
             entry.dialing &= !dialed;
-            entry.unreachable = false;
+            entry.unreachable = None;
             entry.epoch
         });
         conn.epoch = epoch;
@@ -1343,23 +1440,29 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
             .close(now, VarInt::from_u32(refusal.code()), bytes::Bytes::new());
         if let Some(peer) = conn.dialed {
             conn.lost = true;
-            self.dial_failed(peer);
+            self.dial_failed(peer, Some(refusal));
         }
         None
     }
 
-    /// A dial to `peer` ended before a connection to it was up: unreachable, unless a connection
-    /// to it came up meanwhile.
-    fn dial_failed(&mut self, peer: PeerId) {
+    /// A dial to `peer` ended before a connection to it was up, for `refusal` when either side
+    /// said why: unreachable, unless a connection to it came up meanwhile.
+    fn dial_failed(&mut self, peer: PeerId, refusal: Option<Refusal>) {
         if let Some(entry) = self.peer_entry_mut(peer) {
             entry.dialing = false;
-            entry.unreachable = entry.connection.is_none();
+            entry.unreachable = entry.connection.is_none().then_some(refusal);
         }
         self.report_lifecycle(peer);
     }
 
     /// The connection was lost: every exchange on it is refused and its owner told, once.
     fn lost(&mut self, key: usize, conn: &mut Conn<C::Role>) {
+        self.lost_for(key, conn, None);
+    }
+
+    /// [`Core::lost`], with what the peer or the handshake said when it ended (`refusal_of`): a
+    /// dial that ends before its peer is identified reports it.
+    fn lost_for(&mut self, key: usize, conn: &mut Conn<C::Role>, refusal: Option<Refusal>) {
         if conn.lost {
             return;
         }
@@ -1381,13 +1484,14 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
                     entry.held = entry.held.saturating_sub(1);
                     if entry.connection == Some(key) {
                         entry.connection = None;
+                        entry.closed = refusal;
                     }
                 }
                 self.report_lifecycle(peer);
             }
             (None, Some(peer)) => {
                 self.dialing = self.dialing.saturating_sub(1);
-                self.dial_failed(peer);
+                self.dial_failed(peer, refusal);
             }
             (None, None) => {}
         }
@@ -1482,6 +1586,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
                 self.exchanges.place(id, conn.exchanges.len());
                 conn.exchanges.push(id);
                 bind_stream(&mut conn.by_stream, stream, id);
+                self.begun(now, key, peer);
                 self.read_exchange(now, conn, id);
             }
             Err(refusal) => {
@@ -1854,13 +1959,15 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
             exchange.carry.asking(now, at, held);
         }
         self.start(conn, id);
-        self.mark_used(key, peer);
+        self.begun(now, key, peer);
         Ok(ExchangeId(id))
     }
 
-    fn mark_used(&mut self, key: usize, peer: PeerId) {
+    /// An exchange began on connection `key` of `peer`: its identity's most recently used, and
+    /// held from replacement until the exchange ends ([`Core::finish_exchange`]).
+    fn begun(&mut self, now: Instant, key: usize, peer: PeerId) {
         self.tick = self.tick.saturating_add(1);
-        self.admission.used(peer, key, self.tick);
+        self.admission.begun(peer, key, self.tick, now);
     }
 
     /// A message's prefix and head, checked against the class's bounds, in one reservation.
@@ -2245,6 +2352,8 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
         let Some(exchange) = self.exchanges.remove(id) else {
             return;
         };
+        self.admission
+            .ended(exchange.peer, exchange.connection, self.now);
         self.unlist(conn, id, exchange.at);
         // Only an exchange that held a stream frees credit; one refused while queued moves no queue.
         if exchange.stream.is_some() {
@@ -2471,6 +2580,10 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
         bytes.fill(frame);
         if let Some(out) = conn.lanes_out.get_mut(at) {
             out.queue.push_back((C::rank(class), bytes));
+        }
+        // A connection carrying frames is in use as one carrying exchanges is.
+        if let Some((peer, _)) = conn.peer {
+            self.admission.carried(peer, conn.key, self.now);
         }
         self.flush_lane(conn, at);
         Ok(())
@@ -2742,6 +2855,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
                 if let Some(entry) = self.peer_entry_mut(peer) {
                     entry.frames = entry.frames.saturating_add(1);
                 }
+                self.admission.carried(peer, conn.key, self.now);
                 self.events.push_back(Waiting {
                     event: Event::Frame {
                         peer,

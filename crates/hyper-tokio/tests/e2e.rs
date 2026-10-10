@@ -174,10 +174,10 @@ async fn serve() {
     let mut book = Book::default();
     book.add(&asker, 1, Role::Node);
     let config = Config {
-        credentials: credentials(&root, &certificate, &key),
+        tls: hyper_transport::tls::Tls::mutual(&credentials(&root, &certificate, &key), true)
+            .unwrap(),
         role: Role::Node,
         limits: limits(),
-        listen: true,
     };
     let endpoint =
         Endpoint::<Mantle, _, _>::new(config, Fixed::new(512 << 20, 64), book, Instant::now())
@@ -318,10 +318,13 @@ impl Setup {
         let mut book = Book::default();
         book.add(&self.two.0, 2, Role::Node);
         let config = Config {
-            credentials: credentials(&self.pki.root, &self.one.0, &self.one.1),
+            tls: hyper_transport::tls::Tls::mutual(
+                &credentials(&self.pki.root, &self.one.0, &self.one.1),
+                false,
+            )
+            .unwrap(),
             role: Role::Node,
             limits: limits(),
-            listen: false,
         };
         let endpoint =
             Endpoint::new(config, Fixed::new(512 << 20, 64), book, Instant::now()).unwrap();

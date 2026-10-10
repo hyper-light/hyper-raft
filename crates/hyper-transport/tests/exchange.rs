@@ -681,6 +681,14 @@ fn an_identity_past_its_bound_replaces_its_connection_used_least() {
             .iter()
             .any(|event| matches!(event, Event::Connected { .. }))
     });
+    // The first moves nothing for the server's quiet period (its serve period): it is idle.
+    let quiet = net.now + one.serve_period;
+    while net.now < quiet {
+        net.exchange();
+        let _ = events(&mut net.a);
+        let _ = events(&mut net.b);
+        net.advance_within(Duration::from_millis(250));
+    }
     // The same identity again, from another endpoint at another address: it replaces the first.
     let Net {
         now,
@@ -703,6 +711,107 @@ fn an_identity_past_its_bound_replaces_its_connection_used_least() {
         (1, 1, 2)
     );
     drop(first);
+}
+
+/// focal 2026-10-09: an identity at its bound replaced whichever of its connections it used least,
+/// closing connections whose exchanges were under way (64 callers of one principal replaced 27,765
+/// connections in 30 s, a third of their writes ending unknown). A connection carrying an exchange
+/// is never replaced: the newcomer is refused as busy and told so, and the exchange completes.
+#[test]
+fn a_connection_carrying_an_exchange_is_not_replaced_and_the_newcomer_is_told_it_is_busy() {
+    let pair = Pair::new();
+    let now = hyper_sim::Anchor::new().instant(0).unwrap();
+    let mut one = limits();
+    one.admission.per_identity = 1;
+    let book = || pair.book(Role::Node, Role::Node);
+    let first = pair.node::<Mantle>(1, Role::Node, book(), one, 64 << 20, now);
+    let second = pair.node::<Mantle>(1, Role::Node, book(), one, 64 << 20, now);
+    let server = pair.node::<Mantle>(2, Role::Node, book(), one, 64 << 20, now);
+    let mut net = Net::new(now, first, server);
+    let address = net.b_address;
+    net.a.connect(now, 2, address).unwrap();
+    net.until(TURNS, |net| {
+        let _ = events(&mut net.b);
+        events(&mut net.a)
+            .iter()
+            .any(|event| matches!(event, Event::Connected { .. }))
+    });
+    // The first asks; the server holds the request unanswered past the quiet period.
+    let progress = Progress::new(one.serve_period * 4).unwrap();
+    let asked = net
+        .a
+        .open(net.now, 2, Kind::Get, &[1, 2, 3], None, progress)
+        .unwrap();
+    let mut held = None;
+    net.until(TURNS, |net| {
+        for event in events(&mut net.b) {
+            if let Event::Request { exchange, .. } = event {
+                held = Some(exchange);
+            }
+        }
+        held.is_some()
+    });
+    let quiet = net.now + one.serve_period;
+    while net.now < quiet {
+        net.exchange();
+        let _ = events(&mut net.a);
+        let _ = events(&mut net.b);
+        net.advance_within(Duration::from_millis(250));
+    }
+    // The same identity again, from another address: the first carries an exchange, so it stays,
+    // and the newcomer is refused as busy.
+    let Net {
+        now,
+        a: first,
+        b: server,
+        ..
+    } = net;
+    let mut net = Net::new(now, second, server);
+    net.a_address = "127.0.0.1:5555".parse().unwrap();
+    let address = net.b_address;
+    net.a.connect(now, 2, address).unwrap();
+    let mut asker = Asker::new();
+    net.until(TURNS, |net| {
+        asker.drive(&mut net.a);
+        let _ = events(&mut net.b);
+        !asker.unreachable.is_empty() || !asker.closed.is_empty()
+    });
+    let told: Vec<_> = asker.unreachable.iter().chain(&asker.closed).collect();
+    assert_eq!(told, vec![&(2, Some(Refusal::Busy))]);
+    let stats = net.b.stats().admission;
+    assert_eq!(
+        (
+            stats.connections,
+            stats.replaced,
+            stats.refused_busy,
+            stats.serving
+        ),
+        (1, 0, 1, 1)
+    );
+    // The first's exchange is answered on the connection it was never taken from.
+    let Net {
+        now,
+        a: second,
+        b: server,
+        ..
+    } = net;
+    let mut net = Net::new(now, first, server);
+    let held = held.unwrap();
+    net.b.reply(held, b"ok", None).unwrap();
+    let mut replied = false;
+    net.until(TURNS, |net| {
+        let _ = events(&mut net.b);
+        for event in events(&mut net.a) {
+            if let Event::Reply { exchange, .. } = event
+                && exchange == asked
+            {
+                replied = true;
+                net.a.end(exchange);
+            }
+        }
+        replied
+    });
+    drop(second);
 }
 
 /// One exchange the slow owner below asked: what of its body it wrote, what of its reply it read.
@@ -1636,7 +1745,11 @@ fn a_peers_lifecycle_waits_as_its_latest_state() {
     assert!(
         matches!(
             events(&mut net.b)[..],
-            [Event::Closed { peer: 1, epoch: 6 }]
+            [Event::Closed {
+                peer: 1,
+                epoch: 6,
+                refusal: None
+            }]
         ),
         "a change after the poll waits again"
     );
@@ -1671,10 +1784,13 @@ fn a_peer_table_held_by_unpolled_events_refuses_a_new_peer() {
     net.exchange();
     // Peer 3 dials in from where peer 1 was, while peer 1's lifecycle waits for b's owner.
     let config = hyper_transport::Config {
-        credentials: credentials(&pair.pki.root, &third.0, &third.1),
+        tls: hyper_transport::tls::Tls::mutual(
+            &credentials(&pair.pki.root, &third.0, &third.1),
+            true,
+        )
+        .unwrap(),
         role: Role::Node,
         limits: small,
-        listen: true,
     };
     net.a = Node::<Mantle>::new(
         config,
@@ -1689,7 +1805,7 @@ fn a_peer_table_held_by_unpolled_events_refuses_a_new_peer() {
         events(&mut net.a).iter().any(|event| {
             matches!(
                 event,
-                Event::Closed { peer: 2, .. } | Event::Unreachable { peer: 2 }
+                Event::Closed { peer: 2, .. } | Event::Unreachable { peer: 2, .. }
             )
         })
     });
@@ -1702,7 +1818,11 @@ fn a_peer_table_held_by_unpolled_events_refuses_a_new_peer() {
     assert!(
         matches!(
             events(&mut net.b)[..],
-            [Event::Closed { peer: 1, epoch: 1 }]
+            [Event::Closed {
+                peer: 1,
+                epoch: 1,
+                refusal: None
+            }]
         ),
         "only peer 1's state waited"
     );

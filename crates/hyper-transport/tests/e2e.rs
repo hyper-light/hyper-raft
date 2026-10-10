@@ -10,7 +10,8 @@
 //!   and a control exchange still crosses;
 //! - `refusals`: a role that may not send a kind, a message past the peer's class bound, a head
 //!   the peer's budget cannot fund, the exchange table's bound, an identity past its connection
-//!   bound replaced, an identity past the identity bound refused, a certificate nobody knows;
+//!   bound refused as busy while its connection is in use and replacing it once idle, an identity
+//!   past the identity bound refused, a certificate nobody knows;
 //! - `killed`: the peer is killed with SIGKILL mid-upload; the exchange ends within its progress
 //!   deadline, and a new peer process is reached after the route is retired;
 //! - `lanes`: replication frames on two lanes, echoed back by the peer, in order.
@@ -214,10 +215,10 @@ fn peer_process() {
     limits.admission.per_identity = parse("HT_PER_IDENTITY", limits.admission.per_identity);
     limits.admission.identities = parse("HT_IDENTITIES", limits.admission.identities);
     let config = Config {
-        credentials: credentials(&root, &certificate, &key),
+        tls: hyper_transport::tls::Tls::mutual(&credentials(&root, &certificate, &key), true)
+            .unwrap(),
         role: Role::Node,
         limits,
-        listen: true,
     };
     let budget = Fixed::new(parse("HT_BUDGET", 512u64 << 20), 64);
     let hold = parse("HT_HOLD", 0u8) == 1;
@@ -391,10 +392,13 @@ impl Setup {
         let mut book = Book::default();
         book.add(&self.two.0, 2, Role::Node);
         let config = Config {
-            credentials: credentials(&self.pki.root, certificate, key),
+            tls: hyper_transport::tls::Tls::mutual(
+                &credentials(&self.pki.root, certificate, key),
+                false,
+            )
+            .unwrap(),
             role,
             limits,
-            listen: false,
         };
         Endpoint::new(config, Fixed::new(512 << 20, 64), book, Instant::now()).unwrap()
     }
@@ -766,21 +770,50 @@ fn refusals() -> String {
         ("HT_PER_IDENTITY", "1".into()),
     ]);
 
-    // Identity 3 twice, from two sockets: one connection per identity, so the second replaces the
-    // first, which hears it closed.
+    // Identity 3 twice, from two sockets: one connection per identity. At once the first is not
+    // idle (nothing has gone quiet on it for the peer's serve period), so the second is refused
+    // as busy; it dials again on each refusal until the first is idle and replaced, which the
+    // first hears as its close.
     let mut first = setup.asker::<Mantle>(3, Role::Node, limits());
     let (mut first_wire, mut first_asker) = (Wire::bind(), Asker::new());
     connect(&mut first_wire, &mut first, &mut first_asker, &peer);
     let mut second = setup.asker::<Mantle>(3, Role::Node, limits());
     let (mut second_wire, mut second_asker) = (Wire::bind(), Asker::new());
-    connect(&mut second_wire, &mut second, &mut second_asker, &peer);
+    second.connect(Instant::now(), 2, peer.address).unwrap();
     wait(
-        &mut first_wire,
-        &mut first,
-        &mut first_asker,
-        "the first replaced",
-        |_, asker| !asker.closed.is_empty(),
+        &mut second_wire,
+        &mut second,
+        &mut second_asker,
+        "the second refused as busy",
+        |_, asker| {
+            asker
+                .closed
+                .iter()
+                .chain(&asker.unreachable)
+                .any(|(_, refusal)| *refusal == Some(Refusal::Busy))
+        },
     );
+    let began = Instant::now();
+    let mut refusals = second_asker.closed.len() + second_asker.unreachable.len();
+    second.connect(Instant::now(), 2, peer.address).unwrap();
+    while first_asker.closed.is_empty() {
+        first_wire.turn(&mut first);
+        first_asker.drive(&mut first);
+        first_wire.flush(&mut first);
+        second_wire.turn(&mut second);
+        second_asker.drive(&mut second);
+        second_wire.flush(&mut second);
+        let now = second_asker.closed.len() + second_asker.unreachable.len();
+        if now > refusals {
+            refusals = now;
+            second.connect(Instant::now(), 2, peer.address).unwrap();
+        }
+        assert!(
+            began.elapsed() < GUARD,
+            "the first replaced: never held; the second's events {:?}",
+            second_asker.events.iter().rev().take(8).collect::<Vec<_>>()
+        );
+    }
     // Identities 3 and 4 hold the two places; identity 5 finds none.
     let mut fourth = setup.asker::<Mantle>(4, Role::Node, limits());
     let (mut fourth_wire, mut fourth_asker) = (Wire::bind(), Asker::new());
@@ -802,10 +835,13 @@ fn refusals() -> String {
         let mut book = Book::default();
         book.add(&setup.two.0, 2, Role::Node);
         let config = Config {
-            credentials: credentials(&setup.pki.root, certificate, key),
+            tls: hyper_transport::tls::Tls::mutual(
+                &credentials(&setup.pki.root, certificate, key),
+                false,
+            )
+            .unwrap(),
             role: Role::Node,
             limits: limits(),
-            listen: false,
         };
         Endpoint::<Mantle, _, _>::new(config, Fixed::new(64 << 20, 8), book, Instant::now())
             .unwrap()
@@ -827,7 +863,8 @@ fn refusals() -> String {
         wire.flush(node);
     }
     "kind, frame bound and budget refused by the peer; the table's bound and the role refused locally; \
-     an identity past its bound replaced; one past the identity bound and an unknown certificate refused"
+     an identity past its bound refused as busy, then replacing its idle connection; \
+     one past the identity bound and an unknown certificate refused"
         .to_owned()
 }
 

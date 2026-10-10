@@ -96,6 +96,8 @@ fn cluster(members: usize) -> Vec<Member> {
                 NonZeroUsize::new(members).unwrap(),
                 // The simulation's stamps are whole nanoseconds.
                 Duration::from_nanos(1),
+                // No detection budget: periods at what their probes need, as the comparison in docs/benchmarks.md was run.
+                Duration::ZERO,
             );
             for peer in 0..members as u64 {
                 detector.join(HostId(peer)).unwrap();

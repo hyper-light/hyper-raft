@@ -255,9 +255,27 @@ fn misfit_verdict(pooled: Verdict, path_rtt_ns: u64) -> Verdict {
     }
 }
 
+/// What judges a pair's probes now ([`PeerReport::judge`]): the one rule [`Detector::verdict`]
+/// reports and a probe is judged by.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Judge {
+    /// Nothing yet: its probes are measurement only.
+    #[default]
+    Nothing,
+    /// The pair's own estimator's verdict.
+    Own,
+    /// The member's pooled verdict.
+    Pool,
+    /// A provisional verdict, which promises no bound: the pair's own round trip's (RFC 6298's
+    /// `3R`), or RFC 6298's initial timeout for a pair with no evidence of its path.
+    Provisional,
+}
+
 /// What a member has done and promised about one peer, for its owner and its tests.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct PeerReport {
+    /// What judges the pair's probes now.
+    pub judge: Judge,
     /// Whether the pair's own estimator configures its probes (rather than the pool's, or none).
     pub configured: bool,
     /// Suspicions this member's own probes started.
@@ -521,6 +539,10 @@ struct Probe {
     /// pairs' estimators were built at, and pairs near and far stopped configuring (33 of 40 seeds,
     /// 2026-10-07).
     provisional: bool,
+    /// The earliest its period may end: for a judged probe, sent plus the member's period floor
+    /// ([`Detector::period_floor_ns`]); for a measurement or provisional one, sent. Its deadlines
+    /// are unchanged; only an end that would come sooner waits for this.
+    rests_until: u64,
 }
 
 impl Probe {
@@ -664,6 +686,9 @@ struct Exchanges {
 /// The failure detector for one node: its [`Membership`] view, its probe rotation, the period's
 /// probe, and per peer the estimator and verdict that time its probes.
 pub struct Detector {
+    /// The owner's detection budget, nanoseconds: the longest it may take this member to declare a
+    /// dead member. What sets the period floor ([`Detector::period_floor_ns`]).
+    detection_budget_ns: u64,
     membership: Membership,
     local: HostId,
     order: Vec<HostId>,
@@ -788,14 +813,20 @@ impl Detector {
     /// stamps on, the least step its readings take: a wake read exactly on time was late by less
     /// than it, so it bounds `G` from below (`hyper_timing::Lateness`). hyper-tokio's
     /// `Clock::resolution` states the host's monotonic clock's; a simulation's stamps are whole
-    /// nanoseconds.
+    /// nanoseconds. `detection_budget` is the longest the owner may wait for this member to declare
+    /// a dead member, its requirement (Chen, Toueg and Aguilera's `T_D^U`): a judged period lasts at
+    /// least the share of it the detection bound spends on one period
+    /// ([`Detector::period_floor_ns`]), so an idle member probes at the pace its owner needs and not
+    /// at its round trip's. Zero leaves every period at what its probe needs.
     pub fn new(
         local: HostId,
         history: Exposure,
         members: NonZeroUsize,
         resolution: Duration,
+        detection_budget: Duration,
     ) -> Detector {
         Detector {
+            detection_budget_ns: nanos(detection_budget),
             membership: Membership::new(local, members),
             local,
             order: Vec::new(),
@@ -867,20 +898,52 @@ impl Detector {
     }
 
     /// When to [`poll`](Detector::poll) next, on the caller's clock: the probe's deadline, or the
-    /// indirect probe's once asked, or a measurement probe's expected arrival. `None` once a
-    /// measurement probe is answered (poll on the next message), or before the first poll.
+    /// indirect probe's once asked, or a measurement probe's expected arrival, never before the
+    /// period floor's end ([`Probe::rests_until`]) unless the deadline asks relays. `None` before
+    /// the first poll.
     pub fn wake(&self) -> Option<u64> {
         let probe = self.probe?;
-        if probe.verdict.is_none() {
-            return (!probe.answered).then_some(probe.expected);
+        // The direct deadline of a judged probe still unanswered asks relays: kept as it is.
+        if !probe.answered && probe.verdict.is_some() && probe.indirect_until.is_none() {
+            return probe.due_ns();
         }
-        if probe.answered {
-            return (!probe.provisional).then(|| probe.due_ns()).flatten();
-        }
-        probe.indirect_until.or_else(|| probe.due_ns())
+        let ends = if probe.verdict.is_none() {
+            (!probe.answered).then_some(probe.expected)
+        } else if probe.answered {
+            (!probe.provisional).then(|| probe.due_ns()).flatten()
+        } else {
+            probe.indirect_until.or_else(|| probe.due_ns())
+        };
+        Some(ends.map_or(probe.rests_until, |at| at.max(probe.rests_until)))
+    }
+
+    /// The least a judged period of this member lasts, nanoseconds: the detection budget's share of
+    /// one period. A dead member is declared within `2(2m − 1) + 1` periods of its last answer, `m`
+    /// the members a round probes (`docs/timing.md` §2.7), so periods of at least
+    /// `D / (2(2m − 1) + 1)` keep that within the owner's budget `D` while probing no faster than
+    /// it needs. SWIM sets its protocol period for load and bounds it below by the round trip (Das
+    /// et al. 2002, §3.1); here the round trip's deadline still bounds it below, and the budget
+    /// sets the load. Without the floor an idle pair probed at its round trip: about 1,700 probes a
+    /// second per member on loopback (slates, 2026-10-09).
+    fn period_floor_ns(&self) -> u64 {
+        let watched = u64::try_from(self.order.len()).unwrap_or(u64::MAX).max(1);
+        let periods = watched
+            .saturating_mul(2)
+            .saturating_sub(1)
+            .saturating_mul(2)
+            .saturating_add(1);
+        self.detection_budget_ns.checked_div(periods).unwrap_or(0)
     }
 
     fn stage(&self, now_ns: u64) -> Stage {
+        match (self.probe, self.deadline_stage(now_ns)) {
+            (Some(probe), Stage::Over) if now_ns < probe.rests_until => Stage::Wait,
+            (_, stage) => stage,
+        }
+    }
+
+    /// Where the period's probe stands by its deadlines alone, before the period floor.
+    fn deadline_stage(&self, now_ns: u64) -> Stage {
         let Some(probe) = self.probe else {
             return Stage::Over;
         };
@@ -954,6 +1017,15 @@ impl Detector {
             indirect_until: None,
             expected: now_ns.saturating_add(self.probe_wait(target)),
             provisional,
+            // Only a judged period rests: a measurement or provisional one judges nothing (or
+            // nothing yet) until its samples exist, so stretching it would leave a silent member
+            // unsuspected for that much longer after a start (a lone peer stayed alive 9 s into its
+            // silence when every period rested, slates 2026-10-09).
+            rests_until: if verdict.is_some() && !provisional {
+                now_ns.saturating_add(self.period_floor_ns())
+            } else {
+                now_ns
+            },
         };
         self.probe = Some(probe);
         self.heard_other = false;
@@ -1476,6 +1548,12 @@ impl Detector {
     /// What this member has done and promised about `peer`.
     pub fn report(&self, peer: HostId) -> Option<PeerReport> {
         self.peers.get(&peer).map(|held| PeerReport {
+            judge: match judging(held, self.pool.verdict) {
+                (None, _) => Judge::Nothing,
+                (Some(_), true) => Judge::Provisional,
+                (Some(_), false) if held.stream.verdict.is_some() => Judge::Own,
+                (Some(_), false) => Judge::Pool,
+            },
             last_answer_ns: held.last_answer_ns,
             ..held.report
         })
@@ -2061,7 +2139,8 @@ mod tests {
 
     /// A detector for `LOCAL` that knows `peers`.
     fn detector(peers: &[HostId]) -> Detector {
-        let mut detector = Detector::new(LOCAL, Exposure::new(), room(), RESOLUTION);
+        let mut detector =
+            Detector::new(LOCAL, Exposure::new(), room(), RESOLUTION, Duration::ZERO);
         for &peer in peers {
             detector.join(peer).unwrap();
         }
@@ -2218,7 +2297,8 @@ mod tests {
     /// the initial one; a peer joined without one waits the initial wait, backed off.
     #[test]
     fn a_handshake_round_trip_sets_the_first_wait() {
-        let mut detector = Detector::new(LOCAL, Exposure::new(), room(), RESOLUTION);
+        let mut detector =
+            Detector::new(LOCAL, Exposure::new(), room(), RESOLUTION, Duration::ZERO);
         let handshake = Duration::from_micros(100);
         detector.join_measured(A, handshake).unwrap();
         detector.join(B).unwrap();
@@ -2448,6 +2528,7 @@ mod tests {
             Exposure::new(),
             NonZeroUsize::new(8).unwrap(),
             RESOLUTION,
+            Duration::ZERO,
         );
         detector.apply_gossip((10..10_010u64).map(|id| (HostId(id), alive(0))));
         assert_eq!(
@@ -2548,6 +2629,7 @@ mod tests {
             Exposure::new(),
             NonZeroUsize::new(4).unwrap(),
             RESOLUTION,
+            Duration::ZERO,
         );
         for peer in peers {
             detector.join(peer).unwrap();
@@ -2697,6 +2779,100 @@ mod tests {
             }
         }
         now
+    }
+
+    /// The detection budget the period-floor tests state: slates' membership horizon (slates
+    /// `lease::horizon_ns`, its A-125), the budget the first owner to state one states.
+    const BUDGET: Duration = Duration::from_millis(900);
+
+    /// A member over `peers` judged under [`BUDGET`].
+    fn budgeted(peers: &[HostId]) -> Detector {
+        let mut detector = Detector::new(LOCAL, Exposure::new(), room(), RESOLUTION, BUDGET);
+        for &peer in peers {
+            detector.join(peer).unwrap();
+        }
+        detector
+    }
+
+    /// Whether every one of `peers` is judged by a verdict whose period rests at the floor: the
+    /// pair's own or the pool's, not a provisional one, nor none.
+    fn judged_at_floor(detector: &Detector, peers: &[HostId]) -> bool {
+        peers.iter().all(|peer| {
+            detector.peers.get(peer).is_some_and(|held| {
+                matches!(judging(held, detector.pool.verdict), (Some(_), false))
+            })
+        })
+    }
+
+    /// The period floor (slates, 2026-10-09: an idle two-member pair probed about 1,700 times a
+    /// second per member on loopback, each period ending at its probe's deadline). Do: run a member
+    /// over three near peers, every probe answered in about 1 ms, until every pair is judged by a
+    /// verdict that rests (the pool's or its own), then count its probes for one detection budget,
+    /// under a 900 ms budget and under none. Expect: under the budget at most one probe per floor,
+    /// `D / (2(2m − 1) + 1)` with `m` = 3, and at least one; with none, more than that, at its round
+    /// trip's pace. Before the floor (the budget taken and unused) the budgeted member probed as
+    /// often as the unbudgeted one.
+    #[test]
+    fn an_idle_member_probes_no_faster_than_its_detection_budget_needs() {
+        const HORIZON: u64 = 600_000 * MS;
+        let peers = [A, B, C];
+        let budget = nanos(BUDGET);
+        let floor = budget / (2 * (2 * 3 - 1) + 1);
+        let at_most = budget / floor + 1;
+        let probes = |mut detector: Detector| {
+            let mut state = 0x2545_F491_4F6C_DD1D;
+            let judged = drive_many(
+                &mut detector,
+                MS,
+                HORIZON,
+                |_| Some(jitter(&mut state)),
+                |_, _, _, _| false,
+                |detector| judged_at_floor(detector, &peers),
+            );
+            assert!(judged_at_floor(&detector, &peers), "every pair judged");
+            let mut pings = 0u64;
+            drive_many(
+                &mut detector,
+                judged,
+                judged + budget,
+                |_| {
+                    pings += 1;
+                    Some(jitter(&mut state))
+                },
+                |_, _, _, _| false,
+                |_| false,
+            );
+            pings
+        };
+        let under_budget = probes(budgeted(&peers));
+        assert!(
+            (1..=at_most).contains(&under_budget),
+            "{under_budget} probes in one budget, at most one per {floor} ns floor and at least one"
+        );
+        let unbudgeted = probes(detector(&peers));
+        assert!(
+            unbudgeted > at_most,
+            "with no budget the member probes at its round trip: {unbudgeted} probes"
+        );
+    }
+
+    /// Only a judged period rests: a measurement period judges nothing, so it ends at its answer
+    /// whatever the budget (slates, 2026-10-09: when every period rested, a lone peer was still
+    /// alive in its member's view 9 s into its silence, its measurement phase stretched to the
+    /// floor). Do: under a 900 ms budget, answer a fresh member's first probe 1 ms after it is sent.
+    /// Expect: the next probe goes at that answer, not at the floor.
+    #[test]
+    fn a_measurement_period_ends_at_its_answer_under_a_budget() {
+        let mut detector = budgeted(&[A, B]);
+        let mut requests = Vec::new();
+        let first = detector.poll(0, &mut requests).unwrap();
+        assert_eq!(first.due_ns, None, "measurement only");
+        detector.on_ack(first.to, first.nonce, MS);
+        assert_eq!(detector.wake(), Some(0), "nothing left to wait for");
+        assert!(
+            detector.poll(MS, &mut requests).is_some(),
+            "the next probe goes at the answer"
+        );
     }
 
     /// A configured member over near peers A, B and C, and the time its warm-up ended: the member a
@@ -3202,7 +3378,7 @@ mod tests {
             .unwrap();
         let mut batch = Vec::new();
         source.gossip_into(10, &mut batch);
-        let mut other = Detector::new(B, Exposure::new(), room(), RESOLUTION);
+        let mut other = Detector::new(B, Exposure::new(), room(), RESOLUTION, Duration::ZERO);
         other.join(A).unwrap();
         other.apply_gossip(batch);
         assert_eq!(liveness(&other, A), Liveness::Dead);
@@ -3256,7 +3432,7 @@ mod tests {
     fn members_that_hold_each_other_dead_heal() {
         let (mut x, mut y) = (
             detector(&[A]),
-            Detector::new(A, Exposure::new(), room(), RESOLUTION),
+            Detector::new(A, Exposure::new(), room(), RESOLUTION, Duration::ZERO),
         );
         y.join(LOCAL).unwrap();
         let dead = |host| {
@@ -3316,10 +3492,10 @@ mod tests {
             refuted.gossip_into(10, &mut batch);
         }
         assert!(batch.is_empty());
-        let mut holds_dead = Detector::new(A, Exposure::new(), room(), RESOLUTION);
+        let mut holds_dead = Detector::new(A, Exposure::new(), room(), RESOLUTION, Duration::ZERO);
         holds_dead.join(LOCAL).unwrap();
         holds_dead.apply(LOCAL, dead).unwrap();
-        let mut forgot = Detector::new(B, Exposure::new(), room(), RESOLUTION);
+        let mut forgot = Detector::new(B, Exposure::new(), room(), RESOLUTION, Duration::ZERO);
         forgot.join(LOCAL).unwrap();
         forgot.apply(LOCAL, dead).unwrap();
         forgot.forget(LOCAL);
@@ -3368,7 +3544,8 @@ mod tests {
     /// A detector for `local` that knows `peers` and has run a few periods, everyone answering: it
     /// has a dissemination window.
     fn running(local: HostId, peers: &[HostId], world: &mut World) -> Detector {
-        let mut detector = Detector::new(local, Exposure::new(), room(), RESOLUTION);
+        let mut detector =
+            Detector::new(local, Exposure::new(), room(), RESOLUTION, Duration::ZERO);
         for &peer in peers {
             detector.join(peer).unwrap();
         }
@@ -3526,7 +3703,7 @@ mod tests {
             incarnation: 0,
         };
         let mut prober = detector(&[A]);
-        let mut holder = Detector::new(A, Exposure::new(), room(), RESOLUTION);
+        let mut holder = Detector::new(A, Exposure::new(), room(), RESOLUTION, Duration::ZERO);
         holder.join(LOCAL).unwrap();
         holder.apply(LOCAL, dead).unwrap();
         let mut batch = Vec::new();
@@ -3661,7 +3838,13 @@ mod tests {
             }
         }
         let hosts: Vec<HostId> = (0..9u64).map(|i| HostId(100 + i)).collect();
-        let mut detector = Detector::new(hosts[0], Exposure::new(), room(), RESOLUTION);
+        let mut detector = Detector::new(
+            hosts[0],
+            Exposure::new(),
+            room(),
+            RESOLUTION,
+            Duration::ZERO,
+        );
         for (index, &host) in hosts.iter().enumerate().skip(1) {
             detector.join(host).unwrap();
             detector.learn_coordinate(host, Coordinate::Held(engines[index].coordinate()));

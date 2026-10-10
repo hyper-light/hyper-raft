@@ -62,6 +62,12 @@ Detection", arXiv 1707.00788 (2018).**
 - `DeadNodeReclaimTime` (0 by default, never): when a dead node's name may be taken by another
   address.
 - `retransmitLimit`: `RetransmitMult` (4) × `⌈log10(n + 1)⌉`.
+- `ProbeInterval` and `ProbeTimeout` (checked 2026-10-10): 1 s and 500 ms in the LAN configuration
+  ("Failure check every second", "Reasonable RTT time for LAN"), 5 s and 3 s WAN, 1 s and 200 ms
+  local. The field's comment: "Setting this lower (more frequent) will cause the memberlist cluster
+  to detect failed nodes more quickly at the expense of increased bandwidth usage"; the timeout's:
+  "This should be set to 99-percentile of RTT (round-trip time) on your network." The probe rate is
+  a load setting, picked once, as SWIM's protocol period is (§3.1).
 - `PushPullInterval` (checked 2026-10-03), 30 s in the LAN configuration, 60 s WAN, 15 s local: "the
   interval between complete state syncs. Complete state syncs are done with a single node over TCP
   and are quite expensive relative to standard gossiped messages." `pushPull` picks one node at

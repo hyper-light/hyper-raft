@@ -39,7 +39,7 @@ use hyper_sim::{
 };
 use hyper_swim::HostId;
 use hyper_swim::codec::{Coordinate, GossipBatch, SwimMessage, gossip_capacity};
-use hyper_swim::detector::{Detector, PingReq, Verdict};
+use hyper_swim::detector::{Detector, Judge, PingReq, Verdict};
 use hyper_swim::membership::{Liveness, MemberState};
 use hyper_timing::Exposure;
 
@@ -65,13 +65,14 @@ const FAR_JITTER_NS: u64 = 100_000;
 /// How long the far-link runs watch the live cluster: slates' repro's 30 s.
 const WATCHED_NS: u64 = 30_000_000_000;
 
-/// A cluster's topology: its members, which of them sit across the far path from the rest, and the
-/// steps its run may take.
+/// A cluster's topology: its members, which of them sit across the far path from the rest, the
+/// steps its run may take, and the detection budget its members' owners state (zero for none).
 #[derive(Clone, Copy, Debug)]
 struct Shape {
     nodes: u32,
     far: &'static [u32],
     steps: u64,
+    budget: Duration,
 }
 
 /// The LAN cluster every member of which is one switch from the others.
@@ -79,6 +80,7 @@ const LAN_CLUSTER: Shape = Shape {
     nodes: NODES,
     far: &[],
     steps: STEPS,
+    budget: Duration::ZERO,
 };
 
 /// slates' far-link repro: two near members, four 100 ms one way from them. Its steps: four times the
@@ -87,6 +89,7 @@ const FAR_LINK: Shape = Shape {
     nodes: 6,
     far: &[2, 3, 4, 5],
     steps: 4 * FAR_STEPS_TAKEN,
+    budget: Duration::ZERO,
 };
 
 /// The most steps a named seed's far-link or all-far run took: 26,058, seed 43's far-link run until
@@ -99,6 +102,7 @@ const ALL_FAR: Shape = Shape {
     nodes: 3,
     far: &[2],
     steps: 4 * FAR_STEPS_TAKEN,
+    budget: Duration::ZERO,
 };
 
 impl Shape {
@@ -188,6 +192,9 @@ struct Member {
     /// The peers this member has judged by a provisional verdict (`mistake` 1, before the pair's own
     /// estimator configured), as polled.
     provisional: std::collections::BTreeSet<u64>,
+    /// Every probe this member sent, on its own clock, and whether the verdict that judged it rests
+    /// its period at the floor: the pair's own or the pool's.
+    pings: Vec<(u64, bool)>,
     nodes: u32,
     alive: bool,
 }
@@ -210,8 +217,13 @@ impl Member {
     fn new(me: NodeId, shape: Shape) -> Self {
         let members = NonZeroUsize::new(shape.nodes as usize).unwrap();
         // The world's clocks read whole nanoseconds.
-        let mut detector =
-            Detector::new(host(me), Exposure::new(), members, Duration::from_nanos(1));
+        let mut detector = Detector::new(
+            host(me),
+            Exposure::new(),
+            members,
+            Duration::from_nanos(1),
+            shape.budget,
+        );
         for peer in (0..shape.nodes).map(NodeId).filter(|peer| *peer != me) {
             if shape.far.is_empty() {
                 detector.join(host(peer)).unwrap();
@@ -233,6 +245,7 @@ impl Member {
             relaying: BTreeMap::new(),
             deaths: BTreeMap::new(),
             provisional: std::collections::BTreeSet::new(),
+            pings: Vec::new(),
             nodes: shape.nodes,
             alive: true,
         };
@@ -296,6 +309,9 @@ impl Member {
         self.requests = requests;
         let mut batch = std::mem::take(&mut self.batch);
         if let Some(ping) = ping {
+            let judge = self.detector.report(ping.to).map(|report| report.judge);
+            self.pings
+                .push((now, matches!(judge, Some(Judge::Own | Judge::Pool))));
             self.detector
                 .ping_gossip_into(ping.to, self.gossip, &mut batch);
             let message = SwimMessage::Ping {
@@ -597,6 +613,24 @@ impl Sim {
         })
     }
 
+    /// Whether every live member judges every live peer by a verdict whose period rests at the
+    /// floor: the pair's own or the pool's.
+    fn every_pair_judged_at_floor(&self) -> bool {
+        self.live().all(|(me, member)| {
+            self.live()
+                .filter(|(peer, _)| *peer != me)
+                .all(|(peer, _)| {
+                    matches!(
+                        member
+                            .detector
+                            .report(host(peer))
+                            .map(|report| report.judge),
+                        Some(Judge::Own | Judge::Pool)
+                    )
+                })
+        })
+    }
+
     fn live(&self) -> impl Iterator<Item = (NodeId, &Member)> {
         self.members
             .iter()
@@ -643,6 +677,13 @@ fn run(source: Source) -> Result<Record, SimError> {
     };
     let mut sim = Sim::new(source, false, LAN_CLUSTER);
     sim.run("every pair judged", Sim::every_pair_judged);
+    kill_and_hold_dead_within_bounds(sim, &seed)
+}
+
+/// Kills [`VICTIM`] and runs until every survivor holds it dead: each within the bound its detector
+/// stated, with the wait it measured for evidence of its own health added, and none holding a live
+/// member dead before or after. The run's record.
+fn kill_and_hold_dead_within_bounds(mut sim: Sim, seed: &str) -> Result<Record, SimError> {
     for (me, member) in sim.live() {
         assert!(
             member.deaths.is_empty(),
@@ -689,6 +730,67 @@ fn a_killed_member_is_held_dead_by_every_survivor_within_its_bound_and_no_live_o
     // its trace, to one digest.
     for seed in 0..16 {
         twice(seed, run).unwrap_or_else(|refusal| panic!("seed {seed}: {refusal}"));
+    }
+}
+
+/// slates' detection budget, its membership horizon (slates `lease::horizon_ns`, A-125): the budget
+/// the first owner to state one states.
+const SLATES_BUDGET_NS: u64 = 900_000_000;
+
+/// The LAN cluster, each member's owner stating slates' detection budget.
+const BUDGETED_LAN: Shape = Shape {
+    budget: Duration::from_nanos(SLATES_BUDGET_NS),
+    ..LAN_CLUSTER
+};
+
+/// One run from `source` of the LAN cluster under slates' detection budget: every pair judged by a
+/// verdict that rests its period (the pair's own or the pool's), then one budget's time, then the
+/// LAN run's kill and checks. Through the budget's time, each member's probe judged so is followed
+/// by its next no sooner than the floor `D / (2(2m − 1) + 1)` on the member's own clock, `m` the
+/// four peers its rounds hold.
+fn budgeted(source: Source) -> Result<Record, SimError> {
+    let seed = match &source {
+        Source::Seed(seed) => format!("seed {seed}"),
+        Source::Trace(_) => "the trace".to_owned(),
+    };
+    let mut sim = Sim::new(source, false, BUDGETED_LAN);
+    sim.run(
+        "every pair judged at the floor",
+        Sim::every_pair_judged_at_floor,
+    );
+    let budget = SLATES_BUDGET_NS;
+    let floor = budget / (2 * (2 * u64::from(NODES - 1) - 1) + 1);
+    let from: Vec<usize> = sim
+        .members
+        .iter()
+        .map(|member| member.pings.len())
+        .collect();
+    let until = sim.now() + budget;
+    sim.run("one budget's time", |sim| sim.now() >= until);
+    for (me, member) in sim.live() {
+        let pings = &member.pings[from[me.0 as usize]..];
+        assert!(pings.len() > 1, "{seed}: member {me:?} probed");
+        for pair in pings.windows(2) {
+            let ((sent, rests), (next, _)) = (pair[0], pair[1]);
+            assert!(
+                !rests || next - sent >= floor,
+                "{seed}: member {me:?} probed {} ns after a probe judged at the floor, {floor} ns",
+                next - sent
+            );
+        }
+    }
+    kill_and_hold_dead_within_bounds(sim, &seed)
+}
+
+/// An owner's detection budget floors each judged period at the budget's share of one period
+/// (slates' A-125, `docs/timing.md` §2.7): an idle member probes no faster than detection within
+/// the budget needs, and a killed member is still held dead within every survivor's stated bound.
+/// Before the floor (the budget taken and unused), a member probed a few hundred microseconds after
+/// its last probe on every seed.
+#[test]
+fn a_member_under_a_detection_budget_probes_no_faster_than_its_floor() {
+    for seed in 0..16 {
+        twice(seed, budgeted).unwrap_or_else(|refusal| panic!("seed {seed}: {refusal}"));
     }
 }
 

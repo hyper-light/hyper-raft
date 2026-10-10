@@ -570,6 +570,27 @@ a ring of each member's probes, answers and views, dumped at the overshoot, show
 member falsely condemned in the run's first milliseconds, adopted by gossip at a member whose probes
 were still measurement only (`a_member_that_judges_nothing_states_no_bound`).
 
+**The owner's detection budget** (slates' A-125). A judged period ended at its probe's deadline,
+which tracks the round trip, so an idle member probed at its round trip's pace: in slates' two-member
+fleet on loopback each member sent about 10,000 pings in 6 s. SWIM sets the protocol period for load
+and bounds it below by the round trip (§3.1); memberlist probes once a second on a LAN, every 5 s on a
+WAN (`docs/research/swim.md`). The owner states its detection budget `D` (`Detector::new`), the
+longest it may take this member to declare a dead member: Chen, Toueg and Aguilera's requirement
+`T_D^U`, here a statement of the owner's. A dead member is declared within `2(2m − 1) + 1` periods of
+its last answer (above), so a judged period lasts at least `D/(2(2m − 1) + 1)`, `m` the members a
+round probes, and an idle member probes no faster than detection within `D` needs. The probe's
+deadline and its relay request are unchanged: only an end that would come sooner waits for the
+floor. Where every period's deadlines fit within it, the declaration to pending is within `D`; a
+period whose deadlines run past the floor is as long as they are, and the stated bound counts it.
+Measurement and provisional periods are not floored: they judge nothing, or nothing yet, and
+flooring them left a lone peer unsuspected 9 s into its silence in slates' runs. A budget of zero
+leaves every period at its probe's deadline. In the unit test three near peers answering in about
+1 ms drew 138 probes in one 900 ms budget without the floor and at most 12 with it
+(`an_idle_member_probes_no_faster_than_its_detection_budget_needs`); in the simulation each member's
+probe judged at the floor is followed by its next no sooner than the floor, on every seed
+(`a_member_under_a_detection_budget_probes_no_faster_than_its_floor`: 1.8 ms after it before);
+slates measured pings fall from 10,264 to 134 a member in 6 s.
+
 **Before a pair can be judged.** A pair's estimator refuses until it has two prediction errors and a
 measured `τ_int` (`Refusal::TooFewHeartbeats`, `CorrelationUnmeasured`). Until then its probes are
 judged by the member's pool: one more `LinkEstimator`, fed every round trip the member measured, its
@@ -867,8 +888,8 @@ with the split closed, the soak: 2,000 runs on macOS and 500, 655 and 638 on Lin
 four CPUs with busy loops, every one passing, no split and no overshoot; and with every finding
 traced, 2,000 runs on macOS and 454, 475 and 468 on Linux at one, two and four CPUs under ambient
 load, every one passing, every answer a live member's probe missed late and none lost. Open: §3, item 1
-governs the probe rate too, since a period is its probe's deadline and nothing yet prices a probe,
-and as the MTBF grows the margins and so the periods grow with it; two members cannot condemn each
+governs the probe rate too: the owner's detection budget floors a judged period, but nothing yet
+prices a probe, and as the MTBF grows the margins and so the periods grow with it; two members cannot condemn each
 other, as neither can tell its own failure from the other's; a pair far from the member's others is
 judged provisionally, at `3R`, until it configures ("A pair the pool does not fit", above); the
 allowance is loose while a history is

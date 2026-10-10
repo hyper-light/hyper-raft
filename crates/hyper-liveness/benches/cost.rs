@@ -340,6 +340,8 @@ fn swim(nodes: usize) -> Rate {
                 Exposure::new(),
                 NonZeroUsize::new(nodes).unwrap(),
                 Duration::from_nanos(1),
+                // No detection budget: periods at what their probes need, as the costs in docs/benchmarks.md were measured.
+                Duration::ZERO,
             );
             for peer in 0..nodes as u64 {
                 detector.join(HostId(peer)).unwrap();

@@ -128,6 +128,12 @@
     answer delivered, and for a condemnation the answer from another member it was made at. An
     owner can say why; the cluster test traces every one. slates' detector stated neither.
 
+14. **The owner's detection budget floors a judged period** (`docs/timing.md` §2.7; slates' A-125,
+    carried in slates as a local patch from 2026-10-09). `Detector::new` takes the budget `D`, and a
+    judged period lasts at least `D/(2(2m − 1) + 1)`: an idle pair on loopback probed about 1,700
+    times a second a member, each period ending at its probe's deadline. Measurement and provisional
+    periods are not floored. `PeerReport::judge` states what judges a pair now.
+
 The wire changed in place with 8 and 11: a probe and an answer carry entries of the existing gossip
 encoding, which a receiver of the earlier form applies as any gossip, and `Sync` is a new tag with
 its own golden vector. No consumer runs hyper-swim yet (slates' session owns its integration), so

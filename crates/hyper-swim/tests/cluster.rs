@@ -131,6 +131,8 @@ fn member_process() {
         Exposure::new(),
         members,
         Duration::from_nanos(1),
+        // No detection budget: every period lasts what its probe needs.
+        Duration::ZERO,
     );
     for peer in (1..=NODES).filter(|peer| *peer != me) {
         let role = if me < peer {

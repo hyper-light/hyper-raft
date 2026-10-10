@@ -134,6 +134,9 @@ pub(crate) struct Outgoing {
     pub(crate) has_body: bool,
     pub(crate) sum: BodySum,
     pub(crate) trailer_written: usize,
+    /// The peer acknowledged the message whole: its stream finished, QUIC reported every byte of
+    /// it acknowledged (`StreamEvent::Finished`). The peer has the request from then.
+    pub(crate) acked: bool,
 }
 
 impl Outgoing {
@@ -146,6 +149,7 @@ impl Outgoing {
             has_body: false,
             sum: BodySum::default(),
             trailer_written: 0,
+            acked: false,
         }
     }
     /// The bytes still to be written: what the progress deadline charges the connection with.

@@ -739,3 +739,11 @@ upstream's rule; its first half holds the saving).
 Over 128 seeds, independent loss, two dials before: the first reply's p90 went from 658 / 296 ms
 (fresh / resumed) at 35 ms to 207 / 105 ms learned. Under bursts the learned rows equal the 35 ms
 rows.
+
+## 18. What the peer acknowledged (2026-10-10)
+
+- **Patch Q6: `PathStats::acked_bytes`.** The bytes of the path's packets the peer acknowledged,
+  counted where an acknowledged packet leaves flight (`Connection::on_packet_acked`). hyper-transport
+  judges a request sent whole by what reaches the peer: a bottleneck's queue holds the last window
+  for seconds after it leaves on a slow path, and bytes sent said nothing of when the peer had them
+  (focal's audit F38). No behaviour of the connection changes.

@@ -246,7 +246,11 @@ starts at RFC 9002's initial window plus the reserve and doubles when consumed w
 trips (Chromium's rule; a round trip under the owner's measured timer granularity `G` counts as
 `G`, RFC 9002's 1 ms `kGranularity` until the owner reports one through `set_granularity`), each growth
 reserved from the budget; the stream window is quinn's assembler limit made explicit (patch Q5).
-Exchanges are judged by progress-charged deadlines (T39); a period's sent bytes count only if the
+Exchanges are judged by progress-charged deadlines (T39). A request sent whole is in the network until
+the peer acknowledges it (hyper-quic's `acked_bytes`, patch Q6), and is waited on while each period brings
+the peer's acknowledgement of a datagram's worth; the peer's period to answer begins when QUIC reports
+the exchange's stream acknowledged whole, never when it was sent (focal's audit F38: a request in a
+bottleneck's queue was refused before the peer had it); a period's sent bytes count only if the
 peer was heard in it, so probes sent to a dead peer do not keep its exchanges alive; an answer is
 charged with the stream bytes the connection delivered of its class and the less urgent ones,
 against what the peer declared of them, and ends a period after all of that arrived without it, so

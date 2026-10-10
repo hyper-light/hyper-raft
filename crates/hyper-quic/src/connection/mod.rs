@@ -2172,6 +2172,13 @@ impl Connection {
     // high-latency handshakes
     fn on_packet_acked(&mut self, now: Instant, info: SentPacket) {
         self.remove_in_flight(&info);
+        // What reached the peer (patch Q6): a request's bytes in a bottleneck's queue are sent and
+        // not yet had, and an application that asks whether the peer has them reads this.
+        self.stats.path.acked_bytes = self
+            .stats
+            .path
+            .acked_bytes
+            .saturating_add(u64::from(info.size));
         // Careful Resume holds the window in its Unvalidated Phase and Safe Retreat (RFC 9959
         // §3.3, §3.5)
         if info.ack_eliciting && self.path.challenge.is_none() && !self.resume.holds_window() {

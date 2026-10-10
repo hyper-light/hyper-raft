@@ -1889,6 +1889,14 @@ impl Connection {
         self.path.rtt.get()
     }
 
+    /// The probe timeout of the application data space (RFC 9002 §6.2.1), before backoff: the
+    /// smoothed RTT, four times its variation, and the peer's acknowledgement delay. No loss is
+    /// declared sooner, and a wait an application judges on what the peer acknowledges or answers
+    /// is not judged sooner either (patch Q7).
+    pub fn probe_timeout(&self) -> Duration {
+        self.pto(SpaceId::Data)
+    }
+
     /// Minimum RTT seen on this path, ignoring ack delay
     pub fn min_rtt(&self) -> Duration {
         self.path.rtt.min()

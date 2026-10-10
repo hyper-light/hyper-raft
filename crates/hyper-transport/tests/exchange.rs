@@ -633,9 +633,11 @@ fn a_peers_time_to_answer_begins_when_it_has_the_request() {
         256 << 20,
         now,
     );
-    // 64 kbit/s from a to b, its queue holding all of a 32 KiB request: a carries it in four
-    // seconds, and its last window leaves a seconds before b has it.
-    let mut net = Net::shaped(now, a, b, 64_000, 64 * 1024, PIECE_OF_TIME);
+    // 64 kbit/s each way, each queue holding 32 datagrams (focal's relay): a carries the 32 KiB
+    // request in four seconds, a window of it waits in the queue after it left a, and under that
+    // load the round trip is longer than the period.
+    let mut net = Net::shaped(now, a, b, 64_000, 32 * 1_200, PIECE_OF_TIME);
+    net.shape_back(64_000, 32 * 1_200, PIECE_OF_TIME);
     let address = net.b_address;
     net.a.connect(now, 2, address).unwrap();
     net.until(TURNS, |net| {

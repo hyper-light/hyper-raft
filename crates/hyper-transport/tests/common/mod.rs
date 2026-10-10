@@ -348,6 +348,25 @@ impl<A: Drive, B: Drive> Net<A, B> {
         Self::of(now, a, b, hyper_sim::Source::Seed(0))
     }
 
+    /// `b`'s datagrams to `a` through a bottleneck of their own, as `shaped` puts `a`'s.
+    pub fn shape_back(&mut self, rate_bits_per_second: u64, queue_bytes: u64, one_way: Duration) {
+        let link = self
+            .wire
+            .add_link(hyper_sim::net::Link::drop_tail(
+                rate_bits_per_second,
+                queue_bytes,
+            ))
+            .unwrap();
+        let one_way = u64::try_from(one_way.as_nanos()).unwrap();
+        self.wire
+            .set_pair_path(
+                B,
+                A,
+                hyper_sim::net::Path::in_order(one_way, 0).through(link),
+            )
+            .unwrap();
+    }
+
     /// The network with `a`'s datagrams to `b` through a bottleneck that serializes
     /// `rate_bits_per_second` and holds `queue_bytes`, `one_way` beyond it, and `b`'s to `a` in
     /// `one_way`: what `a` sends waits in the queue after it has left `a`.
@@ -359,7 +378,7 @@ impl<A: Drive, B: Drive> Net<A, B> {
         queue_bytes: u64,
         one_way: Duration,
     ) -> Self {
-        let mut net = Self::with_links(now, a, b, hyper_sim::Source::Seed(0), 1);
+        let mut net = Self::with_links(now, a, b, hyper_sim::Source::Seed(0), 2);
         let one_way = u64::try_from(one_way.as_nanos()).unwrap();
         let link = net
             .wire

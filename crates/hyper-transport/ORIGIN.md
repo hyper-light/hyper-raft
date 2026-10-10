@@ -63,7 +63,14 @@ source: its credit law (`flow.rs`, `connection.rs`) is taken here. Neither repos
   request is now charged with what the peer acknowledges (hyper-quic patch Q6), and the answer period
   begins when QUIC reports the stream acknowledged whole (`StreamEvent::Finished`;
   `a_peers_time_to_answer_begins_when_it_has_the_request`,
-  `a_request_in_the_network_is_waited_on_while_the_peer_acknowledges_it`).
+  `a_request_in_the_network_is_waited_on_while_the_peer_acknowledges_it`). Over focal's own shape —
+  64 kbit/s each way, 32-datagram queues — that was not enough: the sender, held by the peer's credit,
+  sent nothing for a period while the peer drained the queue, and under that load the round trip was
+  longer than the 500 ms period, so no period could carry the peer's acknowledgements. A period is
+  now charged what the peer acknowledged where that is more than what was sent
+  (`a_request_held_by_the_peers_credit_moves_by_what_the_peer_acknowledges`), and a window is not
+  judged sooner than the path's probe timeout (hyper-quic patch Q7;
+  `a_window_is_judged_no_sooner_than_the_probe_timeout`).
 - **What is sent into silence is not progress.** focal's `carried` charged a period with the bytes
   the connection sent and did not find lost. After a peer dies the sender still sends: the flight in
   the air, then the probe timeout's probes, a datagram or two each at a doubling backoff, so every

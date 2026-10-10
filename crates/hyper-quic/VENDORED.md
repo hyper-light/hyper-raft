@@ -747,3 +747,9 @@ rows.
   judges a request sent whole by what reaches the peer: a bottleneck's queue holds the last window
   for seconds after it leaves on a slow path, and bytes sent said nothing of when the peer had them
   (focal's audit F38). No behaviour of the connection changes.
+- **Patch Q7: `Connection::probe_timeout`.** The application data space's probe timeout before
+  backoff (RFC 9002 §6.2.1: smoothed RTT, four times its variation, the peer's acknowledgement
+  delay), which the connection already computed for its own timer. hyper-transport judges no
+  exchange's window sooner: on a path whose round trip under load is longer than an exchange's
+  period, nothing the peer acknowledges or answers can come within the period. No behaviour of the
+  connection changes.

@@ -205,7 +205,9 @@ each ported test's origin, and what was left out).
   certificate names, and the name a peer's certificate is checked against when dialed).
 - `Endpoint<C, B, D>` is driven by `handle_datagram`, `poll_transmit`, `poll_timeout`,
   `handle_timeout` and `poll_event`, every one taking the caller's `now`; its owner calls `connect`,
-  `disconnect`, `open`, `head`, `write_body`, `read_body`, `body_complete`, `reply`, `end`,
+  `disconnect`, `refuse` (closes a peer's connections telling it why: a peer whose grant was
+  withdrawn is refused `Identity`, which its side reports as it reports a certificate refused at
+  the handshake), `open`, `head`, `write_body`, `read_body`, `body_complete`, `reply`, `end`,
   `reserve`, `release`, `send_frame`, `export_keying_material`, `path`, `credit`, `exchange_tail`
   (over the caller's measured timer granularity), `set_granularity` (that granularity, for tuning
   receive windows) and `stats`.

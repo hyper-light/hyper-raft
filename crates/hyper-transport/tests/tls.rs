@@ -328,6 +328,52 @@ fn a_dial_whose_certificate_the_peer_does_not_know_is_told_why() {
 }
 
 #[test]
+fn a_peer_refused_after_it_was_admitted_is_told_why() {
+    let pair = Pair::new();
+    let now = now();
+    let a = pair.node::<Mantle>(
+        1,
+        Role::Node,
+        pair.book(Role::Node, Role::Node),
+        limits(),
+        64 << 20,
+        now,
+    );
+    let b = pair.node::<Mantle>(
+        2,
+        Role::Node,
+        pair.book(Role::Node, Role::Node),
+        limits(),
+        64 << 20,
+        now,
+    );
+    let mut net = Net::new(now, a, b);
+    let address = net.b_address;
+    net.a.connect(now, 2, address).unwrap();
+    let mut asker = Asker::new();
+    let mut server = Vec::new();
+    net.until(TURNS, |net| {
+        asker.drive(&mut net.a);
+        server.extend(events(&mut net.b));
+        !asker.connected.is_empty()
+            && server
+                .iter()
+                .any(|event| matches!(event, Event::Connected { peer: 1, .. }))
+    });
+    // Node 1's grant is withdrawn on node 2, which refuses it for its identity: node 1 is told so,
+    // as a dial whose certificate was refused at its handshake is.
+    let at = net.now;
+    net.b.refuse(at, 1, Refusal::Identity);
+    net.until(TURNS, |net| {
+        asker.drive(&mut net.a);
+        let _ = events(&mut net.b);
+        !asker.closed.is_empty()
+    });
+    assert_eq!(asker.closed, vec![(2, Some(Refusal::Identity))]);
+    assert!(asker.unreachable.is_empty(), "{:?}", asker.unreachable);
+}
+
+#[test]
 fn a_server_whose_certificate_does_not_verify_is_unreachable_for_its_identity() {
     let pair = Pair::new();
     let now = now();

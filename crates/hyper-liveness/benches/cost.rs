@@ -37,7 +37,7 @@ use std::time::{Duration, Instant};
 use hyper_raft::proto::{ConfState, Entry, HardState, Message, Snapshot};
 use hyper_raft::{InitialState, RawNode, Storage, StorageError};
 use hyper_swim::HostId;
-use hyper_swim::detector::{Detector, PingReq};
+use hyper_swim::detector::{Detector, Judge, OUTSTANDING, PingReq};
 use hyper_timing::Exposure;
 
 #[path = "support/world.rs"]
@@ -325,6 +325,10 @@ fn per_pair(nodes: usize, per_node: usize) -> (Rate, f64) {
     )
 }
 
+/// An acknowledgement in flight to a prober: who answered, the probe it answers, when it lands,
+/// and the relay bound it states.
+type Flight = (HostId, u64, u64, u64);
+
 /// slates' detector at `ETA`: a member probes each of its `P` peers once a round of `P` periods.
 #[allow(
     clippy::disallowed_methods,
@@ -350,8 +354,10 @@ fn swim(nodes: usize) -> Rate {
         })
         .collect();
     let mut now = vec![1u64; nodes];
-    // Each member's acknowledgement in flight: when it lands, as hyper-swim's own bench drives it.
-    let mut landing: Vec<Option<u64>> = vec![None; nodes];
+    // Each member's acknowledgements in flight, as hyper-swim's own bench drives them: who answered
+    // which probe, when it lands, and the relay bound the answer states; as many as its detector
+    // keeps probe records for, an older answer being one no record credits.
+    let mut flights: Vec<[Option<Flight>; OUTSTANDING]> = vec![[None; OUTSTANDING]; nodes];
     // A xorshift stream (Marsaglia 2003), hyper-swim's bench's seed.
     let mut noise = 0x2545_F491_4F6C_DD1Du64;
     let mut requests: Vec<PingReq> = Vec::new();
@@ -360,13 +366,29 @@ fn swim(nodes: usize) -> Rate {
         for _ in 0..periods {
             for prober in 0..nodes {
                 let ping = loop {
-                    // A wake comes Linux's 50 µs timer slack late; with none asked, at the answer.
-                    let at = match (members[prober].wake(), landing[prober]) {
-                        (Some(wake), _) => wake + 50_000,
+                    // A wake comes Linux's 50 µs timer slack late, or the next answer lands first.
+                    let landing = flights[prober]
+                        .iter()
+                        .flatten()
+                        .map(|(_, _, lands, _)| *lands)
+                        .min();
+                    let at = match (members[prober].wake(), landing) {
+                        (Some(wake), Some(lands)) => (wake + 50_000).min(lands),
+                        (Some(wake), None) => wake + 50_000,
                         (None, Some(lands)) => lands,
                         (None, None) => now[prober],
                     };
                     now[prober] = now[prober].max(at);
+                    // The answers that have landed, in the order they land.
+                    while let Some(slot) = flights[prober]
+                        .iter_mut()
+                        .filter(|slot| slot.is_some_and(|(_, _, lands, _)| lands <= now[prober]))
+                        .min_by_key(|slot| slot.map(|(_, _, lands, _)| lands))
+                    {
+                        if let Some((from, nonce, lands, within)) = slot.take() {
+                            members[prober].on_ack(from, nonce, lands, within);
+                        }
+                    }
                     if let Some(ping) = members[prober].poll(now[prober], &mut requests) {
                         break ping;
                     }
@@ -378,18 +400,31 @@ fn swim(nodes: usize) -> Rate {
                 noise ^= noise >> 7;
                 noise ^= noise << 17;
                 let lands = now[prober] + 200_000 + noise % 100_000;
-                members[prober].on_ack(ping.to, ping.nonce, lands, ack.relay_within_ns);
-                landing[prober] = Some(lands);
+                // In flight: a free slot, or else the one that lands first, whose answer is lost.
+                let slots = &mut flights[prober];
+                let at = slots
+                    .iter()
+                    .position(Option::is_none)
+                    .or_else(|| {
+                        (0..slots.len()).min_by_key(|at| slots[*at].map(|(_, _, lands, _)| lands))
+                    })
+                    .unwrap();
+                slots[at] = Some((ping.to, ping.nonce, lands, ack.relay_within_ns));
                 *messages += 2;
             }
         }
     };
-    // Counted once every member judges every peer by a configured verdict, as it runs for good.
+    // Counted once every member judges every peer by an estimator's verdict, the pair's own or the
+    // pool's, as it runs for good: not by the pair's timer, which judges a pair before either.
     let judged = |members: &[Detector]| {
         members.iter().enumerate().all(|(id, member)| {
             (0..nodes as u64)
                 .filter(|peer| *peer != id as u64)
-                .all(|peer| member.verdict(HostId(peer)).is_some())
+                .all(|peer| {
+                    member
+                        .report(HostId(peer))
+                        .is_some_and(|report| matches!(report.judge, Judge::Own | Judge::Pool))
+                })
         })
     };
     while !judged(&members) {

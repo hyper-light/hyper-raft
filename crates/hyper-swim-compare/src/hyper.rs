@@ -9,7 +9,7 @@ use hyper_datagram::{LENGTH_BYTES, OVERHEAD_BYTES};
 use hyper_swim::HostId;
 use hyper_swim::codec::{Coordinate, GossipBatch, SwimMessage, gossip_capacity};
 use hyper_swim::coordinates::NetworkCoordinate;
-use hyper_swim::detector::{Detector, Ping, PingReq};
+use hyper_swim::detector::{Detector, OUTSTANDING, Ping, PingReq};
 use hyper_swim::membership::{Liveness, MemberState};
 use hyper_timing::Exposure;
 
@@ -25,12 +25,71 @@ const JITTER_NS: u64 = RTT_NS / 2;
 /// How late each wake comes: Linux's default timer slack, 50 µs (`PR_SET_TIMERSLACK(2const)`).
 const LATE_NS: u64 = 50_000;
 
-/// One member: its detector and its own clock.
+/// One member: its detector, its own clock, and the acknowledgements in flight to it: as many as
+/// its detector keeps probe records for (`OUTSTANDING`), an older answer being one no record
+/// credits.
 struct Member {
     detector: Detector,
     now: u64,
-    /// The acknowledgement in flight: when it lands.
+    flights: [Flight; OUTSTANDING],
+}
+
+/// An acknowledgement in flight: its encoding, and when it lands. The buffer grows once to the
+/// largest acknowledgement.
+#[derive(Default)]
+struct Flight {
     landing: Option<u64>,
+    bytes: Vec<u8>,
+}
+
+impl Member {
+    /// When the next acknowledgement in flight lands.
+    fn landing(&self) -> Option<u64> {
+        self.flights.iter().filter_map(|flight| flight.landing).min()
+    }
+
+    /// The flight a new acknowledgement takes: a free one, or else the one that lands first, whose
+    /// answer is then lost.
+    fn flight(&mut self) -> &mut Flight {
+        let at = self
+            .flights
+            .iter()
+            .position(|flight| flight.landing.is_none())
+            .or_else(|| {
+                (0..self.flights.len()).min_by_key(|at| self.flights[*at].landing)
+            })
+            .unwrap();
+        &mut self.flights[at]
+    }
+
+    /// Applies, in the order they land, the acknowledgements in flight that have landed by this
+    /// member's clock: their gossip, the answerer's coordinate, and the answer at its landing.
+    fn land(&mut self) {
+        while let Some((at, landing)) = self
+            .flights
+            .iter()
+            .enumerate()
+            .filter_map(|(at, flight)| flight.landing.map(|landing| (at, landing)))
+            .filter(|(_, landing)| *landing <= self.now)
+            .min_by_key(|(_, landing)| *landing)
+        {
+            self.flights[at].landing = None;
+            let SwimMessage::Ack {
+                from,
+                gossip,
+                coordinate,
+                nonce,
+                relay_within_ns,
+                ..
+            } = SwimMessage::decode(&self.flights[at].bytes).unwrap()
+            else {
+                unreachable!()
+            };
+            self.detector.apply_gossip(gossip);
+            self.detector.learn_coordinate(from, coordinate);
+            self.detector.on_ack(from, nonce, landing, relay_within_ns);
+        }
+    }
 }
 
 /// Gossip entries a message carries: what the datagram holds beside an acknowledgement, as
@@ -58,7 +117,6 @@ struct Buffers {
     gossip: usize,
     batch: Vec<(HostId, MemberState)>,
     ping: Vec<u8>,
-    ack: Vec<u8>,
     /// Members a chunk of a view carries, and the chunk's bytes.
     view_room: usize,
     view: Vec<u8>,
@@ -72,7 +130,6 @@ impl Buffers {
             gossip: gossip_per_message(),
             batch: Vec::new(),
             ping: Vec::new(),
-            ack: Vec::new(),
             view_room: view_room(),
             view: Vec::new(),
             requests: Vec::new(),
@@ -107,7 +164,7 @@ fn cluster(members: usize) -> Vec<Member> {
             Member {
                 detector,
                 now: 1,
-                landing: None,
+                flights: Default::default(),
             }
         })
         .collect()
@@ -118,12 +175,15 @@ fn cluster(members: usize) -> Vec<Member> {
 fn step(members: &mut [Member], prober: usize, buffers: &mut Buffers) {
     let ping = loop {
         let member = &mut members[prober];
-        let at = match (member.detector.wake(), member.landing) {
-            (Some(wake), _) => wake + LATE_NS,
+        // Its wake, late by the timer's slack, or the next answer's landing, whichever comes first.
+        let at = match (member.detector.wake(), member.landing()) {
+            (Some(wake), Some(landing)) => (wake + LATE_NS).min(landing),
+            (Some(wake), None) => wake + LATE_NS,
             (None, Some(landing)) => landing,
             (None, None) => member.now,
         };
         member.now = member.now.max(at);
+        member.land();
         if let Some(ping) = member.detector.poll(member.now, &mut buffers.requests) {
             break ping;
         }
@@ -206,6 +266,9 @@ fn exchange(members: &mut [Member], prober: usize, ping: Ping, buffers: &mut Buf
     answering.apply_gossip(gossip);
     let ack = answering.on_ping(from);
     answering.ack_gossip_into(from, buffers.gossip, &mut buffers.batch);
+    let coordinate = *answering.coordinate();
+    // In flight to the prober, which applies it as it lands, a round trip after the ping.
+    let flight = members[prober].flight();
     SwimMessage::Ack {
         from: ping.to,
         nonce,
@@ -215,25 +278,10 @@ fn exchange(members: &mut [Member], prober: usize, ping: Ping, buffers: &mut Buf
         promise_ns: 0,
         relay_within_ns: ack.relay_within_ns,
         gossip: GossipBatch::Entries(&buffers.batch),
-        coordinate: Coordinate::Held(answering.coordinate()),
+        coordinate: Coordinate::Held(&coordinate),
     }
-    .encode_into(&mut buffers.ack);
-    let SwimMessage::Ack {
-        from,
-        gossip,
-        coordinate,
-        nonce,
-        relay_within_ns,
-        ..
-    } = SwimMessage::decode(&buffers.ack).unwrap()
-    else {
-        unreachable!()
-    };
-    let probing = &mut members[prober];
-    probing.detector.apply_gossip(gossip);
-    probing.detector.learn_coordinate(from, coordinate);
-    probing.detector.on_ack(from, nonce, landing, relay_within_ns);
-    probing.landing = Some(landing);
+    .encode_into(&mut flight.bytes);
+    flight.landing = Some(landing);
 }
 
 /// One period of every member.

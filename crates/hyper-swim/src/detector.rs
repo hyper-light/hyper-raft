@@ -424,6 +424,17 @@ struct Longest {
 }
 
 impl Longest {
+    /// Takes `member`'s span.
+    fn take(&mut self, member: HostId, span: u64) {
+        if self.of.is_none() || span > self.first {
+            self.second = self.first;
+            self.first = span;
+            self.of = Some(member);
+        } else {
+            self.second = self.second.max(span);
+        }
+    }
+
     /// The longest span over every pair but `member`'s.
     fn without(&self, member: HostId) -> u64 {
         if self.of == Some(member) {
@@ -1326,15 +1337,9 @@ impl Detector {
         // The longest an unanswered probe of a pair it probes now runs: the span of the verdict
         // judging it, and then its relay stage, until the slowest relay it could ask has its
         // response due ([`Detector::request_indirect`]).
-        self.longest = self.longest_spans(pooled, loss, granularity_ns);
-        let slowest_relay = self
-            .peers
-            .iter()
-            .filter(|(host, _)| self.is_relay(**host))
-            .filter_map(|(_, peer)| relay_due_ns(peer, pooled, loss, granularity_ns))
-            .max()
-            .unwrap_or(0);
-        self.longest_unanswered = self.longest.first.saturating_add(slowest_relay);
+        let (longest, slowest_relay) = self.spans(pooled, loss, granularity_ns);
+        self.longest = longest;
+        self.longest_unanswered = longest.first.saturating_add(slowest_relay);
         Some(Ping {
             to: target,
             nonce,
@@ -1342,21 +1347,31 @@ impl Detector {
         })
     }
 
-    /// The longest spans `μ + α` of the verdicts judging the pairs this member probes now
-    /// ([`Longest`]). Every verdict that judges a probe counts, a timer's too.
-    fn longest_spans(&self, pooled: Option<Verdict>, loss: f64, granularity_ns: u64) -> Longest {
+    /// In one pass over the peers, each judged once: the longest spans `μ + α` of the verdicts
+    /// judging the pairs this member probes now ([`Longest`]), every verdict that judges a probe
+    /// counting, a timer's too; and the latest any relay it could ask, alive and having stated a
+    /// bound, has its response due ([`relay_due_ns`]).
+    fn spans(&self, pooled: Option<Verdict>, loss: f64, granularity_ns: u64) -> (Longest, u64) {
         let mut longest = Longest::default();
-        for (host, peer) in self.peers.iter().filter(|(host, _)| self.is_probed(**host)) {
+        let mut slowest_relay = 0u64;
+        for (host, peer) in &self.peers {
+            let liveness = self.membership.state(*host).map(|state| state.liveness);
+            let probed = matches!(liveness, Some(Liveness::Alive | Liveness::Suspect));
+            let within = peer
+                .relay_within_ns
+                .filter(|_| *host != self.local && liveness == Some(Liveness::Alive));
+            if !probed && within.is_none() {
+                continue;
+            }
             let span = judging(peer, pooled, loss, granularity_ns).0.span_ns();
-            if longest.of.is_none() || span > longest.first {
-                longest.second = longest.first;
-                longest.first = span;
-                longest.of = Some(*host);
-            } else {
-                longest.second = longest.second.max(span);
+            if probed {
+                longest.take(*host, span);
+            }
+            if let Some(within) = within {
+                slowest_relay = slowest_relay.max(span.saturating_add(within));
             }
         }
-        longest
+        (longest, slowest_relay)
     }
 
     /// How long after a ping-request from `asker` reaches this member it responds, with the
@@ -1376,15 +1391,6 @@ impl Detector {
         self.longest
             .without(asker)
             .saturating_add(self.granularity_ns())
-    }
-
-    /// Whether `member` may be asked to relay: alive, and not this member.
-    fn is_relay(&self, member: HostId) -> bool {
-        member != self.local
-            && self
-                .membership
-                .state(member)
-                .is_some_and(|state| state.liveness == Liveness::Alive)
     }
 
     /// `G` in nanoseconds: the mean lateness of this member's wakes, never below the resolution of

@@ -413,25 +413,153 @@ fn timer_floors(pooled: Option<Verdict>, granularity_ns: u64) -> (u64, u64) {
     }
 }
 
-/// The two longest spans `μ + α` of the verdicts judging the pairs a member probes, nanoseconds,
-/// and whose the longest is: the longest deadline the member holds for a probe of its own, and the
-/// longest without any one pair ([`Longest::without`]).
+/// What an answer changed of how its pair is judged ([`Detector::on_ack`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Answered {
+    /// Its own verdict, or the pool's or its timer's judgement: the pair is judged again.
+    Judge,
+    /// Only its stated relay bound.
+    Restated,
+    /// Nothing.
+    Same,
+}
+
+impl Answered {
+    fn of(judge: bool, restated: bool) -> Self {
+        match (judge, restated) {
+            (true, _) => Self::Judge,
+            (false, true) => Self::Restated,
+            (false, false) => Self::Same,
+        }
+    }
+}
+
+/// What one peer adds to its member's extremes ([`Extremes`]), as its pair was last judged
+/// ([`Detector::respan`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct Longest {
+struct Contribution {
+    /// The span `μ + α` of the verdict judging the pair, where the member probes the peer.
+    span_ns: Option<u64>,
+    /// When a relay request to the peer has its response due, where it may be asked to relay
+    /// ([`relay_due_ns`]).
+    relay_due_ns: Option<u64>,
+    /// Where the pair's timer judges it: the most `G` can be without changing its span
+    /// ([`timer_g_limit`]).
+    timer_g_ns: Option<u64>,
+    /// Whether the pool's verdict can change how the pair is judged: it has no verdict of its own.
+    follows_pool: bool,
+}
+
+/// A member's extremes over its peers' contributions ([`Contribution`]), nanoseconds: the two longest
+/// spans of the verdicts judging the pairs it probes, and whose they are, which give its longest
+/// deadline for a probe of its own with any one pair left out ([`Extremes::without`]); the latest any
+/// relay it could ask has its response due; and the pool's verdict, by its epoch, and `G` its
+/// contributions were judged at. Kept as each contribution changes ([`Extremes::change`]), and taken again from every
+/// contribution only after one that held an extreme shrank ([`Detector::rescan`]), so a period's work
+/// does not grow with the peers it holds. The first form judged every peer at each period's start,
+/// and at 256 members a period took eight times main's (`docs/benchmarks.md`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Extremes {
     first: u64,
     of: Option<HostId>,
     second: u64,
+    second_of: Option<HostId>,
+    relay: u64,
+    relay_of: Option<HostId>,
+    /// At least the second-latest relay due: the slowest relay's due falls to it without the
+    /// extremes being taken again, as it falls at each restated bound.
+    relay_second: u64,
+    /// The least `G` above which some timer's span changes; `u64::MAX` while no timer judges.
+    g_limit: u64,
+    g_ns: u64,
+    pool_epoch: u64,
+    /// Whether a contribution that held an extreme has shrunk since they were taken: they are taken
+    /// again before they are read.
+    stale: bool,
 }
 
-impl Longest {
-    /// Takes `member`'s span.
-    fn take(&mut self, member: HostId, span: u64) {
-        if self.of.is_none() || span > self.first {
-            self.second = self.first;
+impl Default for Extremes {
+    fn default() -> Self {
+        Self {
+            first: 0,
+            of: None,
+            second: 0,
+            second_of: None,
+            relay: 0,
+            relay_of: None,
+            relay_second: 0,
+            g_limit: u64::MAX,
+            g_ns: 0,
+            pool_epoch: 0,
+            stale: false,
+        }
+    }
+}
+
+impl Extremes {
+    /// Takes `member`'s contribution changing from `old` to `new`: what it raises is kept at once,
+    /// and an extreme it held and shrinks from leaves the extremes stale.
+    fn change(&mut self, member: HostId, old: Contribution, new: Contribution) {
+        if let Some(limit) = new.timer_g_ns {
+            self.g_limit = self.g_limit.min(limit);
+        }
+        self.stale |= self.shrinks(member, old, new);
+        if self.stale {
+            return;
+        }
+        if let Some(span) = new.span_ns {
+            self.raise_span(member, span);
+        }
+        if let Some(due) = new.relay_due_ns {
+            self.raise_relay(member, due);
+        }
+    }
+
+    /// Whether `member`'s change from `old` to `new` takes an extreme it held below what the rest are
+    /// known to reach: a span of the two longest that shrinks, or the slowest relay's due falling
+    /// past the second's bound.
+    fn shrinks(&self, member: HostId, old: Contribution, new: Contribution) -> bool {
+        let shrank =
+            |was: Option<u64>, is: Option<u64>| was.is_some_and(|was| is.is_none_or(|is| is < was));
+        // The longest may fall as far as the second, which is exact, and stay the longest.
+        let span_past_second = (self.of == Some(member)
+            && new.span_ns.is_none_or(|span| span < self.second))
+            || self.second_of == Some(member);
+        let relay_past_second = self.relay_of == Some(member)
+            && new.relay_due_ns.is_none_or(|due| due < self.relay_second);
+        (span_past_second && shrank(old.span_ns, new.span_ns))
+            || (relay_past_second && shrank(old.relay_due_ns, new.relay_due_ns))
+    }
+
+    /// Takes `member`'s span, at least what it was where it held one of the two longest.
+    fn raise_span(&mut self, member: HostId, span: u64) {
+        if self.of == Some(member) {
+            self.first = span;
+        } else if self.of.is_none() || span > self.first {
+            if self.of.is_some() {
+                self.second = self.first;
+                self.second_of = self.of;
+            }
             self.first = span;
             self.of = Some(member);
+        } else if self.second_of == Some(member) || self.second_of.is_none() || span > self.second {
+            self.second = span;
+            self.second_of = Some(member);
+        }
+    }
+
+    /// Takes `member`'s relay due, at least the second's bound where it was the slowest.
+    fn raise_relay(&mut self, member: HostId, due: u64) {
+        if self.relay_of == Some(member) {
+            self.relay = due;
+        } else if self.relay_of.is_none() || due > self.relay {
+            if self.relay_of.is_some() {
+                self.relay_second = self.relay_second.max(self.relay);
+            }
+            self.relay = due;
+            self.relay_of = Some(member);
         } else {
-            self.second = self.second.max(span);
+            self.relay_second = self.relay_second.max(due);
         }
     }
 
@@ -442,6 +570,21 @@ impl Longest {
         } else {
             self.first
         }
+    }
+}
+
+/// The most `G` can be without changing the span of `peer`'s timer verdict ([`timer_verdict`]): its
+/// variance term is `max(floor, K·RTTVAR)`, the floor `G` or the pool's margin where larger, and its
+/// timeout at least RFC 6298's second while the pool has no verdict, so `G` decides nothing at or
+/// under the larger of the others. Before any round trip, the initial second, which no `G` changes.
+fn timer_g_limit(peer: &Peer, pooled: Option<Verdict>) -> u64 {
+    let Some(smoothed) = peer.rto.smoothed_ns else {
+        return u64::MAX;
+    };
+    let variation = peer.rto.variation_ns.saturating_mul(VARIATION_MULTIPLE);
+    match pooled {
+        Some(pooled) => variation.max(nanos(pooled.margin)),
+        None => variation.max(MINIMUM_RTO_NS.saturating_sub(smoothed)),
     }
 }
 
@@ -678,6 +821,11 @@ struct Peer {
     /// answer that finds no record is for it or for one sent before it, so its round trip is known
     /// exactly or bounded below ([`Peer::reused_round_trip`]).
     reused: Option<Sent>,
+    /// What the pair adds to the member's extremes, as it was last judged ([`Detector::respan`]).
+    contribution: Contribution,
+    /// The peer's liveness in the view, kept as each change is adopted ([`Detector::adopted`]), so a
+    /// judgement reads it without a lookup.
+    liveness: Option<Liveness>,
 }
 
 impl Peer {
@@ -697,6 +845,8 @@ impl Peer {
             report: PeerReport::default(),
             path_rtt_ns: None,
             reused: None,
+            contribution: Contribution::default(),
+            liveness: None,
         }
     }
 
@@ -979,6 +1129,17 @@ pub struct Detector {
     /// The resolution of the clock the owner reads, nanoseconds: `G`'s least value
     /// ([`Detector::granularity_ns`]).
     resolution_ns: u64,
+    /// `G` in nanoseconds as the latest measured wake left it ([`Detector::granularity_ns`]): read
+    /// at every judgement, and changed only where a wake is measured.
+    g_ns: u64,
+    /// Changes of the pool's verdict, counted: what the extremes compare to know the pool's verdict
+    /// changed since they were judged ([`Detector::refresh_extremes`]).
+    pool_epoch: u64,
+    /// The pool's mean round trip, nanoseconds, and the probes it counts lost and received, as its
+    /// latest sample left them ([`Detector::pool_round_trip`], [`Detector::probe_loss`]): read at
+    /// every answer and period, and changed only where the pool takes a sample.
+    pool_mean_ns: Option<u64>,
+    pool_counts: (u64, u64),
     /// Round trips measured before this member had a wake and a period measured, which no
     /// estimator took.
     unmeasured: u64,
@@ -986,10 +1147,13 @@ pub struct Detector {
     /// answer to the latest reused record, or a handshake's. The pool's round trip before the pool
     /// holds a sample ([`Detector::pool_round_trip`]).
     least_rtt_ns: Option<u64>,
-    /// The longest spans of the verdicts judging the pairs this member probes, as the latest period
-    /// began: its longest deadline for a probe of its own, and the longest without any one pair,
-    /// which bounds its deadline for a ping it relays for that member ([`Detector::on_ping_req`]).
-    longest: Longest,
+    /// The extremes over the peers' contributions, kept as they change ([`Extremes`]): the longest
+    /// deadline for a probe of its own, with any one pair left out, which bounds its deadline for a
+    /// ping it relays for that member ([`Detector::on_ping_req`]), and the slowest relay's due.
+    extremes: Extremes,
+    /// The peers a change of the pool's verdict or of `G` judges again, held across periods so it
+    /// allocates nothing once grown.
+    rejudge: Vec<HostId>,
     /// The longest an unanswered probe of a pair this member probes runs, its direct span and its
     /// relay stage, as the latest period began, nanoseconds ([`Detector::period_bound`]).
     longest_unanswered: u64,
@@ -1124,9 +1288,14 @@ impl Detector {
             relayed: u64::MAX,
             wakes: Wakes::new(resolution),
             resolution_ns: nanos(resolution),
+            g_ns: nanos(resolution),
+            pool_epoch: 0,
+            pool_mean_ns: None,
+            pool_counts: (0, 0),
             unmeasured: 0,
             least_rtt_ns: None,
-            longest: Longest::default(),
+            extremes: Extremes::default(),
+            rejudge: Vec::new(),
             longest_unanswered: 0,
             periods: Periods::default(),
             exposure: history,
@@ -1160,6 +1329,7 @@ impl Detector {
         requests.clear();
         self.findings.clear();
         self.wakes.woke(now_ns);
+        self.g_ns = self.granularity().map_or(self.resolution_ns, nanos);
         self.clock_ns = self.clock_ns.max(now_ns);
         if let Some(probe) = self.probe.as_mut()
             && probe.expected.is_some_and(|expected| now_ns >= expected)
@@ -1302,6 +1472,7 @@ impl Detector {
         // The handshake that keyed the pair already measured its path: a round trip longer than the
         // pool's deadline is the same evidence a late answer gives, known before the first probe
         // ([`covered`]).
+        let created = !self.peers.contains_key(&target);
         let peer = self.peers.entry(target).or_insert_with(Peer::new);
         let (verdict, provisional) = judging(peer, pooled, loss, granularity_ns);
         let peer_expected = peer.rto.smoothed_ns;
@@ -1337,9 +1508,11 @@ impl Detector {
         // The longest an unanswered probe of a pair it probes now runs: the span of the verdict
         // judging it, and then its relay stage, until the slowest relay it could ask has its
         // response due ([`Detector::request_indirect`]).
-        let (longest, slowest_relay) = self.spans(pooled, loss, granularity_ns);
-        self.longest = longest;
-        self.longest_unanswered = longest.first.saturating_add(slowest_relay);
+        if created {
+            self.respan(target);
+        }
+        self.refresh_extremes();
+        self.longest_unanswered = self.extremes.first.saturating_add(self.extremes.relay);
         Some(Ping {
             to: target,
             nonce,
@@ -1347,31 +1520,122 @@ impl Detector {
         })
     }
 
-    /// In one pass over the peers, each judged once: the longest spans `μ + α` of the verdicts
-    /// judging the pairs this member probes now ([`Longest`]), every verdict that judges a probe
-    /// counting, a timer's too; and the latest any relay it could ask, alive and having stated a
-    /// bound, has its response due ([`relay_due_ns`]).
-    fn spans(&self, pooled: Option<Verdict>, loss: f64, granularity_ns: u64) -> (Longest, u64) {
-        let mut longest = Longest::default();
-        let mut slowest_relay = 0u64;
-        for (host, peer) in &self.peers {
-            let liveness = self.membership.state(*host).map(|state| state.liveness);
-            let probed = matches!(liveness, Some(Liveness::Alive | Liveness::Suspect));
-            let within = peer
-                .relay_within_ns
-                .filter(|_| *host != self.local && liveness == Some(Liveness::Alive));
-            if !probed && within.is_none() {
-                continue;
-            }
-            let span = judging(peer, pooled, loss, granularity_ns).0.span_ns();
-            if probed {
-                longest.take(*host, span);
-            }
-            if let Some(within) = within {
-                slowest_relay = slowest_relay.max(span.saturating_add(within));
-            }
+    /// What `peer` adds to this member's extremes now ([`Contribution`]): its pair's span where it
+    /// is probed (alive or suspected), and where it may be asked to relay (alive, with a stated
+    /// bound) when a request to it has its response due. The member's probe loss sizes the relays a
+    /// probe asks and moves no span, so it is not read.
+    fn contribution(
+        &self,
+        host: HostId,
+        peer: &Peer,
+        pooled: Option<Verdict>,
+        granularity_ns: u64,
+    ) -> Contribution {
+        let liveness = peer.liveness;
+        let probed = matches!(liveness, Some(Liveness::Alive | Liveness::Suspect));
+        let within = peer
+            .relay_within_ns
+            .filter(|_| host != self.local && liveness == Some(Liveness::Alive));
+        if !probed && within.is_none() {
+            return Contribution::default();
         }
-        (longest, slowest_relay)
+        let (verdict, timer) = judging(peer, pooled, 0.0, granularity_ns);
+        let span = verdict.span_ns();
+        Contribution {
+            span_ns: probed.then_some(span),
+            relay_due_ns: within.map(|within| span.saturating_add(within)),
+            timer_g_ns: timer.then(|| timer_g_limit(peer, pooled)),
+            follows_pool: peer.stream.verdict.is_none(),
+        }
+    }
+
+    /// Judges `host`'s pair again after a change to what it is judged by: its answers, its timer,
+    /// its stated relay bound or its liveness. Every such change calls this, and the extremes follow
+    /// ([`Extremes::change`]).
+    fn respan(&mut self, host: HostId) {
+        let (pooled, granularity_ns) = (self.pool.verdict, self.granularity_ns());
+        let Some(new) = self
+            .peers
+            .get(&host)
+            .map(|peer| self.contribution(host, peer, pooled, granularity_ns))
+        else {
+            return;
+        };
+        let Some(peer) = self.peers.get_mut(&host) else {
+            return;
+        };
+        let old = std::mem::replace(&mut peer.contribution, new);
+        if old != new {
+            self.extremes.change(host, old, new);
+        }
+    }
+
+    /// `host`'s relay bound restated as `within_ns` and nothing else of its pair changed: its relay
+    /// due follows from its span as last judged. A peer not yet counted as a relay is judged whole.
+    fn restate(&mut self, host: HostId, within_ns: u64) {
+        let Some(peer) = self.peers.get_mut(&host) else {
+            return;
+        };
+        let old = peer.contribution;
+        let (Some(span), Some(_)) = (old.span_ns, old.relay_due_ns) else {
+            self.respan(host);
+            return;
+        };
+        let new = Contribution {
+            relay_due_ns: Some(span.saturating_add(within_ns)),
+            ..old
+        };
+        peer.contribution = new;
+        if old != new {
+            self.extremes.change(host, old, new);
+        }
+    }
+
+    /// Takes the extremes again from every peer's contribution, as last judged.
+    fn rescan(&mut self) {
+        let mut extremes = Extremes {
+            g_ns: self.extremes.g_ns,
+            pool_epoch: self.extremes.pool_epoch,
+            ..Extremes::default()
+        };
+        for (host, peer) in &self.peers {
+            extremes.change(*host, Contribution::default(), peer.contribution);
+        }
+        self.extremes = extremes;
+    }
+
+    /// Brings the extremes to the pool's verdict and `G` now, before they are read: a changed pool
+    /// verdict judges again every pair that has none of its own, whose judgement it can change; a
+    /// `G` past some timer's limit, every pair a timer judges. Stale extremes are taken again.
+    fn refresh_extremes(&mut self) {
+        let granularity_ns = self.granularity_ns();
+        let pool_changed = self.pool_epoch != self.extremes.pool_epoch;
+        let g_moved = granularity_ns != self.extremes.g_ns
+            && granularity_ns.max(self.extremes.g_ns) > self.extremes.g_limit;
+        if pool_changed || g_moved {
+            let mut rejudge = std::mem::take(&mut self.rejudge);
+            rejudge.clear();
+            rejudge.extend(
+                self.peers
+                    .iter()
+                    .filter(|(_, peer)| {
+                        (pool_changed && peer.contribution.follows_pool)
+                            || (g_moved && peer.contribution.timer_g_ns.is_some())
+                    })
+                    .map(|(host, _)| *host),
+            );
+            for &host in &rejudge {
+                self.respan(host);
+            }
+            self.rejudge = rejudge;
+            // A timer's limit only falls as contributions change: taken again with the rest.
+            self.extremes.stale |= g_moved;
+        }
+        self.extremes.pool_epoch = self.pool_epoch;
+        self.extremes.g_ns = granularity_ns;
+        if self.extremes.stale {
+            self.rescan();
+        }
     }
 
     /// How long after a ping-request from `asker` reaches this member it responds, with the
@@ -1388,7 +1652,7 @@ impl Detector {
     /// stopped until it was condemned stated up to 31 ms where `G` gives 4 ms, and the longest bound
     /// the others stated went from 606 to 725 ms.
     fn relay_within_ns(&self, asker: HostId) -> u64 {
-        self.longest
+        self.extremes
             .without(asker)
             .saturating_add(self.granularity_ns())
     }
@@ -1396,7 +1660,7 @@ impl Detector {
     /// `G` in nanoseconds: the mean lateness of this member's wakes, never below the resolution of
     /// the clock its owner reads; before a wake is measured, that resolution, the least `G` can be.
     fn granularity_ns(&self) -> u64 {
-        self.granularity().map_or(self.resolution_ns, nanos)
+        self.g_ns
     }
 
     /// The member's probe loss: Jeffreys' posterior mean over the probes its pool has seen,
@@ -1404,10 +1668,7 @@ impl Detector {
     /// prior's half before it has seen any. A probe unanswered to anyone is a loss to the pool. It
     /// sizes the relays a timer-judged probe asks ([`relay_count`]).
     fn probe_loss(&self) -> f64 {
-        let (lost, received) = self.pool.estimator.as_ref().map_or((0, 0), |estimator| {
-            let estimates = estimator.estimates();
-            (estimates.lost, estimates.received)
-        });
+        let (lost, received) = self.pool_counts;
         // u64 → f64 rounds only past 2⁵³ probes.
         (lost as f64 + 0.5) / (lost as f64 + received as f64 + 1.0)
     }
@@ -1460,8 +1721,14 @@ impl Detector {
         if requests.is_empty() {
             return;
         }
-        probe.indirect_until = Some(now_ns.saturating_add(slowest));
+        let until = now_ns.saturating_add(slowest);
+        probe.indirect_until = Some(until);
         self.probe = Some(probe);
+        // A relay that restated a longer bound since the period began lengthens this period past
+        // what its start allowed: the bound counts the stage as set.
+        self.longest_unanswered = self
+            .longest_unanswered
+            .max(until.saturating_sub(probe.sent_ns));
     }
 
     /// Ranks the alive peers other than `target` that have stated a relay bound as relays, nearest
@@ -1511,6 +1778,7 @@ impl Detector {
                 // The pair's timer expired with no answer: its next timeout doubles (RFC 6298
                 // (5.5)), until an answer is measured.
                 peer.rto.expired();
+                self.respan(probe.target);
             }
             self.missed(probe, now_ns);
         }
@@ -1766,7 +2034,10 @@ impl Detector {
                 }
                 self.counted.push_back((member, incarnation));
             }
-            self.peers.remove(&member);
+            if let Some(peer) = self.peers.remove(&member) {
+                self.extremes
+                    .change(member, peer.contribution, Contribution::default());
+            }
             self.peer_coordinates.remove(&member);
             self.extensions.remove(&member);
             self.gossip.forget(member);
@@ -1780,6 +2051,24 @@ impl Detector {
     /// trip is measured whatever probe it answers, however late: a late answer is the tail the margin
     /// must cover.
     pub fn on_ack(&mut self, from: HostId, nonce: u64, at_ns: u64, relay_within_ns: u64) {
+        match self.take_answer(from, nonce, at_ns, relay_within_ns) {
+            Answered::Judge => self.respan(from),
+            Answered::Restated => self.restate(from, relay_within_ns),
+            Answered::Same => {}
+        }
+    }
+
+    /// [`Detector::on_ack`]'s answer taken into the pair's evidence, and what it changed of how the
+    /// pair is judged: its own verdict, which an answer changes only where it reconfigures it; the
+    /// pool's or its timer's judgement, which every answer can move, where it has no verdict of its
+    /// own; or only its stated relay bound, which states `G` and so moves at nearly every answer.
+    fn take_answer(
+        &mut self,
+        from: HostId,
+        nonce: u64,
+        at_ns: u64,
+        relay_within_ns: u64,
+    ) -> Answered {
         // An answer to the period's probe answers it; any other is late, its period over.
         let current = match self.probe.as_mut() {
             Some(probe) if probe.target == from && probe.nonce == nonce => {
@@ -1796,8 +2085,10 @@ impl Detector {
         let pooled_rtt = self.pool_round_trip();
         let next = self.nonce;
         let Some(peer) = self.peers.get_mut(&from) else {
-            return;
+            return Answered::Same;
         };
+        let verdict = peer.stream.verdict;
+        let restated = peer.relay_within_ns != Some(relay_within_ns);
         // Any answer is evidence of life when it arrives, even one too late to be measured, and
         // states the peer's relay bound as it stands.
         peer.last_answer_ns = Some(peer.last_answer_ns.map_or(at_ns, |last| last.max(at_ns)));
@@ -1812,7 +2103,7 @@ impl Detector {
                         .map_or(round_trip, |least| least.min(round_trip)),
                 );
             }
-            return;
+            return Answered::of(verdict.is_none(), restated);
         };
         let rtt = at_ns.saturating_sub(sent.at_ns);
         // The pool takes the round trip of a pair whose path its earlier evidence showed to be the
@@ -1835,26 +2126,31 @@ impl Detector {
             if pools && (!peer.report.configured || self.pool.verdict.is_none()) {
                 self.pool
                     .take(sent.nonce, rtt, granularity, Duration::from_nanos(period));
+                if let Some(estimates) = self.pool.estimator.as_ref().map(|pool| pool.estimates()) {
+                    self.pool_mean_ns = estimates.mean_delay.map(nanos);
+                    self.pool_counts = (estimates.lost, estimates.received);
+                }
             }
         } else {
             self.unmeasured = self.unmeasured.saturating_add(1);
         }
+        let rejudge = Answered::of(
+            verdict.is_none() || peer.stream.verdict != verdict,
+            restated,
+        );
         // The error estimate remembers one round: one probe of each member the round holds.
         if let Some(coordinate) = self.peer_coordinates.get(&from) {
             let round = self.order.len();
             self.coordinates
                 .update(coordinate, Duration::from_nanos(rtt), round);
         }
+        rejudge
     }
 
     /// The pool's round trip, nanoseconds: the mean of the round trips its estimator holds, and
     /// before it holds one, the least round trip this member measured exactly ([`far`]).
     fn pool_round_trip(&self) -> Option<u64> {
-        self.pool
-            .estimator
-            .as_ref()
-            .and_then(|estimator| estimator.estimates().mean_delay)
-            .map(nanos)
+        self.pool_mean_ns
             .filter(|mean| *mean > 0)
             .or(self.least_rtt_ns)
     }
@@ -1865,12 +2161,16 @@ impl Detector {
             && let Some((granularity, period)) = self.granularity().zip(self.periods.mean_ns())
         {
             let interval = self.pair_interval(period);
+            let before = self.pool.verdict;
             self.pool.configure(
                 self.exposure.mtbf(),
                 granularity,
                 interval,
                 self.condemnation_cost,
             );
+            if self.pool.verdict != before {
+                self.pool_epoch = self.pool_epoch.wrapping_add(1);
+            }
         }
         self.pool.verdict
     }
@@ -1934,6 +2234,7 @@ impl Detector {
     /// Responds to a ping from `from` with the acknowledgement to send back, which states how long
     /// after a ping-request from `from` reaches this member it responds ([`Ack::relay_within_ns`]).
     pub fn on_ping(&mut self, from: HostId) -> Ack {
+        self.refresh_extremes();
         Ack {
             to: from,
             relay_within_ns: self.relay_within_ns(from),
@@ -1954,7 +2255,8 @@ impl Detector {
         self.clock_ns = self.clock_ns.max(now_ns);
         let nonce = self.relayed;
         self.relayed = self.relayed.saturating_sub(1);
-        let longest = self.longest.without(asker);
+        self.refresh_extremes();
+        let longest = self.extremes.without(asker);
         let (pooled, loss, granularity_ns) =
             (self.pool.verdict, self.probe_loss(), self.granularity_ns());
         let span = self.peers.get(&target).map_or(longest, |peer| {
@@ -2150,6 +2452,7 @@ impl Detector {
 
     fn adopted(&mut self, member: HostId, state: MemberState) {
         let peer = self.peers.entry(member).or_insert_with(Peer::new);
+        peer.liveness = Some(state.liveness);
         match state.liveness {
             Liveness::Alive => peer.clear_suspicion(),
             // A suspicion already held, adopted again at a newer incarnation, keeps the probes
@@ -2173,6 +2476,7 @@ impl Detector {
                 });
             }
         }
+        self.respan(member);
     }
 
     /// Queues a death's record. Records the member has since left are purged once the queue holds
@@ -2444,6 +2748,7 @@ impl Detector {
             held.rto.take(rtt, false);
             held.path_rtt_ns = held.path_rtt_ns.or(Some(rtt));
             self.least_rtt_ns = Some(self.least_rtt_ns.map_or(rtt, |least| least.min(rtt)));
+            self.respan(peer);
         }
         Ok(())
     }
@@ -2587,6 +2892,50 @@ mod tests {
     const C: HostId = HostId(4);
     const MS: u64 = 1_000_000;
 
+    impl Detector {
+        /// Checks what this member keeps of its extremes against what judging every peer now
+        /// gives: each peer's contribution as kept, and the extremes taken from scratch. Every
+        /// driver below checks it after each poll and each answer, so a change to a pair that
+        /// left it unjudged fails the test that makes it.
+        fn check_extremes(&mut self) {
+            self.refresh_extremes();
+            let (pooled, granularity_ns) = (
+                self.pool.verdict,
+                self.granularity().map_or(self.resolution_ns, nanos),
+            );
+            assert_eq!(self.granularity_ns(), granularity_ns, "G as kept");
+            let estimates = self.pool.estimator.as_ref().map(|pool| pool.estimates());
+            assert_eq!(
+                (self.pool_mean_ns, self.pool_counts),
+                estimates.map_or((None, (0, 0)), |estimates| (
+                    estimates.mean_delay.map(nanos),
+                    (estimates.lost, estimates.received)
+                )),
+                "the pool's mean and counts as kept"
+            );
+            let mut scratch = Extremes::default();
+            for (host, peer) in &self.peers {
+                assert_eq!(
+                    peer.liveness,
+                    self.membership.state(*host).map(|state| state.liveness),
+                    "{host:?}'s liveness as kept"
+                );
+                let fresh = self.contribution(*host, peer, pooled, granularity_ns);
+                assert_eq!(peer.contribution, fresh, "{host:?}'s contribution as kept");
+                scratch.change(*host, Contribution::default(), fresh);
+            }
+            assert_eq!(
+                (
+                    self.extremes.first,
+                    self.extremes.second,
+                    self.extremes.relay
+                ),
+                (scratch.first, scratch.second, scratch.relay),
+                "the extremes as kept"
+            );
+        }
+    }
+
     /// A xorshift stream (Marsaglia 2003): deterministic test noise.
     fn noise(state: &mut u64) -> u64 {
         *state ^= *state << 13;
@@ -2651,6 +3000,7 @@ mod tests {
             let mut started = 0;
             while started <= periods {
                 let ping = detector.poll(self.now, &mut self.requests);
+                detector.check_extremes();
                 self.found.extend_from_slice(detector.findings());
                 if let Some(ping) = ping {
                     self.pings.push(ping);
@@ -2672,6 +3022,7 @@ mod tests {
                     && at <= self.now
                 {
                     detector.on_ack(from, nonce, at, detector.relay_within_ns(from));
+                    detector.check_extremes();
                     pending = None;
                 }
             }
@@ -3299,7 +3650,9 @@ mod tests {
         let mut requests = Vec::new();
         let mut pending: Vec<(HostId, u64, u64)> = Vec::new();
         while now < horizon && !done(detector) {
-            if let Some(ping) = detector.poll(now, &mut requests)
+            let ping = detector.poll(now, &mut requests);
+            detector.check_extremes();
+            if let Some(ping) = ping
                 && let Some(rtt) = answer(ping.to)
             {
                 pending.push((ping.to, ping.nonce, now + rtt));
@@ -3326,6 +3679,7 @@ mod tests {
                     return now;
                 }
                 detector.on_ack(from, nonce, at, detector.relay_within_ns(from));
+                detector.check_extremes();
             }
         }
         now
@@ -4316,11 +4670,11 @@ mod tests {
         let mut world = World::new();
         configured(&mut detector, &mut world, &peers);
         let granularity = detector.granularity_ns();
-        detector.longest = Longest {
-            first: 50 * MS,
-            of: Some(A),
-            second: 20 * MS,
-        };
+        detector.refresh_extremes();
+        detector.extremes.first = 50 * MS;
+        detector.extremes.of = Some(A);
+        detector.extremes.second = 20 * MS;
+        detector.extremes.second_of = Some(B);
         assert_eq!(detector.on_ping(A).relay_within_ns, 20 * MS + granularity);
         assert_eq!(detector.on_ping(B).relay_within_ns, 50 * MS + granularity);
         let now = world.now;

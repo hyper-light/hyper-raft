@@ -642,7 +642,13 @@ the longest of the verdicts judging the pairs it probes now, its timers' include
 already run count by their own lengths (`a_member_states_its_bound_from_its_first_period`). A
 longest span kept for good instead would hold a second-long first timer in every bound and window
 long after every pair had configured; and the first form counted only configured verdicts, so a
-period a timer judged could run past the bound before any such period had run. Stating a bound while
+period a timer judged could run past the bound before any such period had run. The longest spans,
+and the slowest relay's due, are kept as each pair's judgement changes (an answer, a timer's
+expiry, a liveness, a stated relay bound, and for the pairs they decide the pool's verdict and
+`G`), and taken again from every pair only after one that held an extreme shrank: judged afresh at
+every period's start, a period at 256 members took eight times `main`'s (`docs/benchmarks.md`). A
+relay stage set past what its period's start allowed, a relay having restated a longer bound since,
+counts as set. Stating a bound while
 probes judged nothing was the last form to fail before every probe was: with the directed gossip
 below, three runs in 2,000 noted a death 0.2 to 2.2 ms past a bound of 2.3 to 3.3 ms, a live member
 falsely condemned in the run's first milliseconds and adopted by gossip at a member whose probes then

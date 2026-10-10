@@ -189,6 +189,9 @@
       network answering every probe never observes.
     - The acknowledgement also carries `promise_ns`, slates' ask, for an owner's per-grant lease
       (Gray and Cheriton 1989); the detector reads none of it.
+    - The longest spans and the slowest relay's due are kept as each pair's judgement changes
+      (`Extremes`), not taken from every pair at each period's start, which at 256 members made a
+      period eight times `main`'s.
 
 20. **An owner re-derives its budget and reads the least its member's deadlines support**
     (`docs/timing.md` §2.7, "The owner's detection budget"; slates' asks of 2026-10-10).

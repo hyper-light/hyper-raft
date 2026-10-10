@@ -680,6 +680,18 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
     /// Close every connection to `peer` (T43: a retired route closes its connection); its
     /// exchanges are refused as the connections close.
     pub fn disconnect(&mut self, now: Instant, peer: PeerId) {
+        self.close_peer(now, peer, CLOSE_NORMAL);
+    }
+
+    /// Close every connection to `peer`, telling it why: a peer whose identity no longer
+    /// authenticates here (its grant withdrawn) is refused [`Refusal::Identity`], which its side
+    /// reports as it reports a dial whose certificate was refused at its handshake. Its exchanges
+    /// are refused as the connections close.
+    pub fn refuse(&mut self, now: Instant, peer: PeerId, refusal: Refusal) {
+        self.close_peer(now, peer, refusal.code());
+    }
+
+    fn close_peer(&mut self, now: Instant, peer: PeerId, code: u32) {
         self.core.now = now;
         for key in 0..self.conns.len() {
             let of = self
@@ -690,7 +702,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
                     conn.dialed == Some(peer) || conn.peer.is_some_and(|(id, _)| id == peer)
                 });
             if of {
-                self.close(now, key, CLOSE_NORMAL);
+                self.close(now, key, code);
             }
         }
     }

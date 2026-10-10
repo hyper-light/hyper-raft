@@ -217,7 +217,10 @@ each ported test's origin, and what was left out).
   `tls::Tls`, the server side (when the endpoint listens) and the client side as hyper-tls
   configurations, `Tls::mutual(credentials, listen)` building the mutual TLS described next;
   `set_tls` replaces it while the endpoint runs; `directory` and `directory_mut` lend the directory
-  to its owner between driving calls.
+  to its owner between driving calls. `Config::congestion` is the controller every connection's
+  paths run, one of hyper-quic's reviewed set (`congestion`, re-exported; CUBIC by default, focal
+  runs Copa, §4d), and `PathFacts` carries what the controller states of itself: its pacing rate
+  and its slow-start threshold, when it has them.
 - Departures from §3.4's sketch, none of substance: `Directory` is the third type parameter (§3.4's
   `PeerId` presumed one); `Classes` gains `RANKS`, `rank`, `kind_code`, `kind_of` (the reserve counts
   the classes above, and the kind crosses the wire); `send_frame` takes the frame's kind (its class

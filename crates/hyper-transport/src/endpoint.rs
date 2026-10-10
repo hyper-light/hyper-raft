@@ -29,6 +29,7 @@ use std::marker::PhantomData;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
+use hyper_quic::congestion::Congestion;
 use hyper_quic::rustls::pki_types::CertificateDer;
 use hyper_quic::{
     ClientConfigHandle, Connection, ConnectionError, DatagramEvent, Dir, EcnCodepoint,
@@ -120,7 +121,7 @@ impl Limits {
     /// The QUIC transport both sides of every connection run with: the stream limits above, the
     /// initial receive window and the reserve on top of it ([`crate::credit`]), a stream window
     /// at quinn's assembler ceiling or the share, whichever is less.
-    fn transport(&self, ranks: u8) -> Result<TransportConfig, Refusal> {
+    fn transport(&self, ranks: u8, congestion: &Congestion) -> Result<TransportConfig, Refusal> {
         let reserve = class_reserve(ranks.saturating_sub(1));
         let window = initial_window(MIN_DATAGRAM).saturating_add(reserve);
         let stream = stream_window_ceiling().min(self.window_ceiling);
@@ -134,7 +135,8 @@ impl Limits {
             .receive_window(varint(window)?)
             .send_window(self.window_ceiling)
             .max_idle_timeout(Some(idle))
-            .keep_alive_interval(self.keep_alive);
+            .keep_alive_interval(self.keep_alive)
+            .congestion(congestion.clone());
         Ok(transport)
     }
 }
@@ -149,6 +151,9 @@ pub struct Config<R> {
     pub role: R,
     /// The endpoint's bounds.
     pub limits: Limits,
+    /// The congestion controller every connection's paths run: one of hyper-quic's reviewed set
+    /// (`congestion::Congestion`; CUBIC by default, focal runs Copa).
+    pub congestion: Congestion,
 }
 
 /// What the path to a peer measures now.
@@ -166,6 +171,11 @@ pub struct PathFacts {
     pub delivery_rate: u64,
     /// The receive window this side advertises to the peer now, reserve excluded.
     pub receive_window: u64,
+    /// The rate the congestion controller paces at, bytes a second, when it states one (Copa does,
+    /// once it has a round trip; NewReno, CUBIC and BBR keep the connection's rule).
+    pub pacing_rate: Option<u64>,
+    /// The controller's slow-start threshold, bytes, when it keeps one.
+    pub ssthresh: Option<u64>,
 }
 
 /// What the endpoint holds and what it refused.
@@ -363,6 +373,8 @@ struct Core<C: Classes, B, D> {
     directory: D,
     role: C::Role,
     limits: Limits,
+    /// The congestion controller connections are made with.
+    congestion: Congestion,
     /// The deadline an exchange a peer opened is judged by.
     serve: Progress,
     admission: Admission,
@@ -448,7 +460,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
         now: Instant,
     ) -> Result<Self, Refusal> {
         config.limits.validate()?;
-        let transport = config.limits.transport(C::RANKS)?;
+        let transport = config.limits.transport(C::RANKS, &config.congestion)?;
         let (server, client) = config.tls.prepare(&transport)?;
         let mut quic = hyper_quic::Endpoint::new(EndpointConfig::default(), server, true, None)
             .map_err(|_| Refusal::Quic)?;
@@ -470,6 +482,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
                 directory,
                 role: config.role,
                 limits,
+                congestion: config.congestion,
                 serve: Progress::new(limits.serve_period)?,
                 admission: Admission::new(limits.admission, limits.serve_period)?,
                 exchanges: Table::new(limits.exchanges, C::RANKS),
@@ -726,7 +739,10 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
     /// refuse, [`Refusal::Quic`] when every configuration slot still serves a connection; either
     /// way the endpoint keeps the TLS it had.
     pub fn set_tls(&mut self, tls: Tls) -> Result<(), Refusal> {
-        let transport = self.core.limits.transport(C::RANKS)?;
+        let transport = self
+            .core
+            .limits
+            .transport(C::RANKS, &self.core.congestion)?;
         let (server, client) = tls.prepare(&transport)?;
         let client = self
             .quic
@@ -862,6 +878,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
         let rtt = stats.path.rtt;
         let nanos = u128::from(stats.path.cwnd).saturating_mul(1_000_000_000);
         let rate = nanos.checked_div(rtt.as_nanos().max(1)).unwrap_or(0);
+        let metrics = conn.quic.congestion_state().metrics();
         Some(PathFacts {
             rtt,
             min_rtt: stats.path.min_rtt,
@@ -869,6 +886,9 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
             max_datagram: stats.path.current_mtu,
             delivery_rate: u64::try_from(rate).unwrap_or(u64::MAX),
             receive_window: conn.window.window(),
+            // qlog's bits a second, in bytes.
+            pacing_rate: metrics.pacing_rate.and_then(|bits| bits.checked_div(8)),
+            ssthresh: metrics.ssthresh,
         })
     }
 

@@ -178,6 +178,7 @@ async fn serve() {
             .unwrap(),
         role: Role::Node,
         limits: limits(),
+        congestion: Default::default(),
     };
     let endpoint =
         Endpoint::<Mantle, _, _>::new(config, Fixed::new(512 << 20, 64), book, Instant::now())
@@ -325,6 +326,7 @@ impl Setup {
             .unwrap(),
             role: Role::Node,
             limits: limits(),
+            congestion: Default::default(),
         };
         let endpoint =
             Endpoint::new(config, Fixed::new(512 << 20, 64), book, Instant::now()).unwrap();

@@ -1791,6 +1791,7 @@ fn a_peer_table_held_by_unpolled_events_refuses_a_new_peer() {
         .unwrap(),
         role: Role::Node,
         limits: small,
+        congestion: Default::default(),
     };
     net.a = Node::<Mantle>::new(
         config,

@@ -219,6 +219,7 @@ fn peer_process() {
             .unwrap(),
         role: Role::Node,
         limits,
+        congestion: Default::default(),
     };
     let budget = Fixed::new(parse("HT_BUDGET", 512u64 << 20), 64);
     let hold = parse("HT_HOLD", 0u8) == 1;
@@ -399,6 +400,7 @@ impl Setup {
             .unwrap(),
             role,
             limits,
+            congestion: Default::default(),
         };
         Endpoint::new(config, Fixed::new(512 << 20, 64), book, Instant::now()).unwrap()
     }
@@ -842,6 +844,7 @@ fn refusals() -> String {
             .unwrap(),
             role: Role::Node,
             limits: limits(),
+            congestion: Default::default(),
         };
         Endpoint::<Mantle, _, _>::new(config, Fixed::new(64 << 20, 8), book, Instant::now())
             .unwrap()

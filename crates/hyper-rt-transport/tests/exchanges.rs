@@ -80,6 +80,7 @@ fn endpoint(
             .unwrap(),
         role: Role::Node,
         limits: limits(),
+        congestion: Default::default(),
     };
     Endpoint::new(config, Fixed::new(512 << 20, 64), book, Instant::now()).unwrap()
 }

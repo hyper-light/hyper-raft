@@ -594,6 +594,7 @@ impl Pair {
             tls: Tls::mutual(&credentials(&self.pki.root, certificate, key), true).unwrap(),
             role,
             limits,
+            congestion: Default::default(),
         };
         Endpoint::new(config, Fixed::new(budget, 64), book, now).unwrap()
     }

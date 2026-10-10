@@ -142,6 +142,7 @@ fn server(pair: &Pair, now: Instant) -> Open {
         tls,
         role: Role::Node,
         limits: limits(),
+        congestion: Default::default(),
     };
     Endpoint::new(config, Fixed::new(64 << 20, 64), told, now).unwrap()
 }
@@ -159,6 +160,7 @@ fn guest(pair: &Pair, role: Role, now: Instant) -> Open {
         tls,
         role,
         limits: limits(),
+        congestion: Default::default(),
     };
     Endpoint::new(config, Fixed::new(64 << 20, 64), told, now).unwrap()
 }
@@ -272,6 +274,7 @@ fn a_client_without_a_certificate_on_the_main_protocol_is_refused_and_told() {
         tls,
         role: Role::Node,
         limits: limits(),
+        congestion: Default::default(),
     };
     let anonymous = Endpoint::new(config, Fixed::new(64 << 20, 64), told, now).unwrap();
     let mut net = Net::new(now, anonymous, server(&pair, now));
@@ -334,6 +337,7 @@ fn a_server_whose_certificate_does_not_verify_is_unreachable_for_its_identity() 
         tls: Tls::mutual(&credentials(&stranger.root, &pair.one.0, &pair.one.1), true).unwrap(),
         role: Role::Node,
         limits: limits(),
+        congestion: Default::default(),
     };
     let a = Endpoint::<Mantle, _, _>::new(
         config,
@@ -381,6 +385,7 @@ fn a_dial_refused_at_the_peers_identity_bound_is_told_it_was_full() {
         tls: Tls::mutual(&credentials(&pair.pki.root, &own.0, &own.1), true).unwrap(),
         role: Role::Node,
         limits: limits(),
+        congestion: Default::default(),
     };
     let three = Node::<Mantle>::new(config(&third), Fixed::new(64 << 20, 64), book(), now).unwrap();
     let server = pair.node::<Mantle>(2, Role::Node, book(), full, 64 << 20, now);
@@ -486,6 +491,7 @@ fn tls_set_while_running_is_what_the_next_handshake_meets_and_the_last_connectio
         tls: Tls::mutual(&credentials(&successor.root, &third.0, &third.1), false).unwrap(),
         role: Role::Node,
         limits: limits(),
+        congestion: Default::default(),
     };
     let three = Node::<Mantle>::new(config, Fixed::new(64 << 20, 64), three_book, now).unwrap();
     let mut net = Net::new(now, three, server);
@@ -539,6 +545,7 @@ fn a_tls_without_a_protocol_is_refused() {
         tls,
         role: Role::Node,
         limits: limits(),
+        congestion: Default::default(),
     };
     let refused =
         Endpoint::<Mantle, _, _>::new(config, Fixed::new(1 << 20, 4), Book::default(), now());
@@ -552,6 +559,7 @@ fn a_tls_without_a_protocol_is_refused() {
         tls,
         role: Role::Node,
         limits: limits(),
+        congestion: Default::default(),
     };
     let refused =
         Endpoint::<Mantle, _, _>::new(config, Fixed::new(1 << 20, 4), Book::default(), now());
@@ -566,4 +574,72 @@ impl SeenBy for Open {
     fn directory_seen(&self) -> Vec<Seen> {
         self.directory().seen.clone()
     }
+}
+
+/// The owner's congestion controller is what its connections run (`Config::congestion`): Copa keeps
+/// no slow-start threshold and states the rate it paces at once it has a round trip; the default,
+/// CUBIC, keeps a threshold and leaves pacing to the connection's rule.
+#[test]
+fn the_owners_congestion_controller_is_what_its_connections_run() {
+    use hyper_transport::congestion::{Congestion, CopaConfig};
+    let pair = Pair::new();
+    let run = |congestion: Congestion| {
+        let now = now();
+        let config = |own: &(Vec<u8>, Vec<u8>), congestion: Congestion| Config {
+            tls: Tls::mutual(&credentials(&pair.pki.root, &own.0, &own.1), true).unwrap(),
+            role: Role::Node,
+            limits: limits(),
+            congestion,
+        };
+        let book = || pair.book(Role::Node, Role::Node);
+        let a = Node::<Mantle>::new(
+            config(&pair.one, congestion.clone()),
+            Fixed::new(64 << 20, 64),
+            book(),
+            now,
+        )
+        .unwrap();
+        let b = Node::<Mantle>::new(
+            config(&pair.two, congestion),
+            Fixed::new(64 << 20, 64),
+            book(),
+            now,
+        )
+        .unwrap();
+        let mut net = Net::new(now, a, b);
+        let address = net.b_address;
+        net.a.connect(now, 2, address).unwrap();
+        // A body that takes round trips, so the controller has samples.
+        let mut asker = Asker::new();
+        let mut served = Server::new();
+        net.until(TURNS, |net| {
+            let _ = events(&mut net.b);
+            events(&mut net.a)
+                .iter()
+                .any(|event| matches!(event, Event::Connected { .. }))
+        });
+        asker
+            .ask(
+                &mut net.a,
+                net.now,
+                2,
+                (Kind::Get, Class::Request),
+                3,
+                Some(256 << 10),
+                PERIOD,
+            )
+            .unwrap();
+        net.until(TURNS, |net| {
+            asker.drive(&mut net.a);
+            served.serve(&mut net.b);
+            asker.finished()
+        });
+        net.a.path(2).unwrap()
+    };
+    let copa = run(Congestion::Copa(CopaConfig::default()));
+    assert_eq!(copa.ssthresh, None, "{copa:?}");
+    assert!(copa.pacing_rate.is_some_and(|rate| rate > 0), "{copa:?}");
+    let cubic = run(Congestion::default());
+    assert!(cubic.ssthresh.is_some(), "{cubic:?}");
+    assert_eq!(cubic.pacing_rate, None, "{cubic:?}");
 }

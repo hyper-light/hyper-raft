@@ -57,6 +57,8 @@ pub use credit::{
 };
 pub use endpoint::{Config, Endpoint, Limits, PathFacts, Stats};
 pub use error::Refusal;
+/// The congestion controllers a connection may run ([`Config::congestion`]).
+pub use hyper_quic::congestion;
 pub use hyper_quic::{EcnCodepoint, Transmit};
 /// The fold an owner measures its timer granularity `G` with, for [`Endpoint::set_granularity`]
 /// and [`Endpoint::exchange_tail`].

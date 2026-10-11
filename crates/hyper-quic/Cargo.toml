@@ -8,8 +8,13 @@ repository.workspace = true
 rust-version.workspace = true
 
 [features]
+default = ["qlog"]
 # Fuzzing derives only; never in a shipped build.
 arbitrary = ["dep:arbitrary"]
+# qlog traces (`QlogConfig`, `QlogStream`). Optional because `qlog` turns on serde_json's
+# `preserve_order` for the whole build it is in, which changes every serde_json map's order there;
+# a consumer whose JSON relies on sorted maps builds without it (VENDORED.md §20).
+qlog = ["dep:qlog"]
 
 [dependencies]
 arbitrary = { version = "1.0.1", features = ["derive"], optional = true }
@@ -17,7 +22,7 @@ aws-lc-rs = { version = "1.9", default-features = false, features = ["aws-lc-sys
 bytes = "1"
 fastbloom = { version = "0.17", default-features = false }
 lru-slab = "0.1.2"
-qlog = "0.15.2"
+qlog = { version = "0.15.2", optional = true }
 rand = "0.10.1"
 rand_pcg = "0.10"
 rustc-hash = "2"

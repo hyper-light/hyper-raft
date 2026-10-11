@@ -469,6 +469,69 @@ fn a_dial_refused_at_the_peers_identity_bound_is_told_it_was_full() {
     drop(three);
 }
 
+/// An owner swaps its TLS again and again while the connection it dialed under the first stays up,
+/// as a node renews its certificate and keeps the connections it holds: every swap is taken, since
+/// the endpoint counts its configuration slots from what it may hold (each replaced configuration
+/// still held has a handshake or a connection holding it), and the connection still carries an
+/// exchange. The swaps outnumber twice the two sides × two generations an endpoint holds by
+/// default.
+#[test]
+fn tls_swapped_again_and_again_while_a_dialed_connection_stays_up() {
+    let pair = Pair::new();
+    let now = now();
+    let one = pair.node::<Mantle>(
+        1,
+        Role::Node,
+        pair.book(Role::Node, Role::Node),
+        limits(),
+        64 << 20,
+        now,
+    );
+    let two = pair.node::<Mantle>(
+        2,
+        Role::Node,
+        pair.book(Role::Node, Role::Node),
+        limits(),
+        64 << 20,
+        now,
+    );
+    let mut net = Net::new(now, one, two);
+    let address = net.b_address;
+    net.a.connect(now, 2, address).unwrap();
+    net.until(TURNS, |net| {
+        let _ = events(&mut net.b);
+        events(&mut net.a)
+            .iter()
+            .any(|event| matches!(event, Event::Connected { peer: 2, .. }))
+    });
+    for _ in 0..8 {
+        net.a
+            .set_tls(
+                Tls::mutual(&credentials(&pair.pki.root, &pair.one.0, &pair.one.1), true).unwrap(),
+            )
+            .expect("a swap is taken while the connection dialed under an earlier one stays up");
+    }
+    let mut asker = Asker::new();
+    let mut served = Server::new();
+    asker
+        .ask(
+            &mut net.a,
+            net.now,
+            2,
+            (Kind::Get, Class::Request),
+            7,
+            Some(4096),
+            PERIOD,
+        )
+        .unwrap();
+    net.until(TURNS, |net| {
+        asker.drive(&mut net.a);
+        served.serve(&mut net.b);
+        asker.finished()
+    });
+    assert!(asker.asked[0].done, "{:?}", asker.events);
+}
+
 #[test]
 fn tls_set_while_running_is_what_the_next_handshake_meets_and_the_last_connection_stays() {
     let pair = Pair::new();

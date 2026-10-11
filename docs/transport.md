@@ -86,13 +86,28 @@ Chosen design, by kind of state:
     whether a preferred address was sent, how many NEW_TOKEN frames to send) are copied into it
     at accept.
   - The endpoint counts the connections and incoming attempts on each slot, as bookkeeping, not
-    ownership: up at creation, down at the drain events quinn-proto already sends and when an
-    attempt is accepted, refused, retried or ignored.
+    ownership: up at creation; down when an attempt is accepted, refused, retried or ignored,
+    when a server connection's handshake completes, and when a client connection drains.
+  - A server connection holds its configuration only through its handshake: its tickets were
+    made as it read the client's Finished, a QUIC client sends no TLS message after its own
+    (RFC 9001 §4.4, §6; one that does is refused as unexpected), and a token it issues later
+    (NEW_TOKEN) is sealed under the endpoint's current configuration, the one that validates the
+    token when the client returns. A client connection holds its configuration until it drains,
+    since its server may send tickets for its cache at any time after the handshake.
   - A slot that has been superseded and has no users left is reclaimed. A full slab is a typed
     refusal (`ConfigsFull`) of the new configuration. The bound is
-    `EndpointConfig::config_slots`, default 4: one current and one draining configuration per
-    side, since rotations are days apart.
-  - Rotation therefore costs memory only while old connections live.
+    `EndpointConfig::config_slots`. Its default, 4, is one current configuration per side and its
+    replacement while it is replaced. That suffices only where replacements are further apart than
+    a handshake and a client's old connections are retired before the next.
+  - Peers hold their connections across a node's certificate renewals. The first bound assumed a
+    connection never outlived a rotation, and each replacement left one more superseded server
+    configuration pinned: after two or three, `set_tls` was refused and the node could not present
+    its renewed certificate.
+  - hyper-transport counts the bound from its admission limits instead:
+    `connections + pending + 4`. Every replaced configuration still held has a holder: an inbound
+    handshake for a server's, a dial or a connection for a client's.
+  - A rotation therefore costs memory only while the handshakes begun under the old server
+    configuration, and the connections made with the old client configuration, live.
   - Connections made with one client handle share its TLS session cache, as connections made
     from clones of one `Arc`'d config did.
 - **Shared mutable state moves to its single owner.**

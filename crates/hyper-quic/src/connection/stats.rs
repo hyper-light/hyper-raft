@@ -221,6 +221,10 @@ pub struct PathStats {
     pub sent_warm_up_bytes: u64,
     /// Why the path's warm-up ended; none while it runs, or if the connection did not warm up
     pub warm_up_end: Option<WarmUpEnd>,
+    /// Whether the path's warm-up is yet to end: measuring, or waiting for an idle connection to
+    /// begin. A connection warms its path up at most once, so once this is false no more of its
+    /// padding is to come
+    pub warm_up_pending: bool,
     /// The number of times a black hole was detected in the path
     pub black_holes_detected: u64,
     /// Largest UDP payload size the path currently supports

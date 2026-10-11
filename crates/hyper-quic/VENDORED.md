@@ -946,6 +946,13 @@ rows.
   - **Its own bytes are counted.** `PathStats::sent_warm_up_bytes` counts the warm-up's datagrams,
     each its own. hyper-transport's `PathFacts::warm_up_bytes` carries the count, so a count of
     what crossed a path can take the warm-up's padding out.
+  - **Whether a warm-up is still to come.** `PathStats::warm_up_pending` (hyper-transport's
+    `PathFacts::warming_up`) says whether the warm-up is yet to end: measuring, or waiting for an
+    idle connection. A connection warms its path up at most once, so a count of what crosses a
+    path can wait until no warm-up is pending and see the application's bytes alone.
+    - Taking the padding out by the sender's count does not work. The sender counts a datagram as
+      it sends it; a relay counts it once it has carried it, or never if it drops it.
+    - On Linux CI, in 1 run of 6, a copy then counted 27,218 bytes for a chunk of 65,536.
 - **Tests.**
   - `resume::tests::a_warm_up_whose_round_trips_stop_growing_ends_as_an_attempt`: a plateau short
     of the target ends it, a round trip no window held is not judged, and a plateau past the target

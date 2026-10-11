@@ -24,5 +24,9 @@ hyper-sim = { path = "../hyper-sim" }
 # Certificates for the tests' mutual TLS (hyper-transport's own dev-dependency).
 rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem"] }
 
+[[bench]]
+name = "connections"
+harness = false
+
 [lints]
 workspace = true

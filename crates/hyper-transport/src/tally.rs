@@ -241,6 +241,16 @@ impl<K> Table<K> {
         }
     }
 
+    /// When the earliest wait of connection `key`'s exchanges is due, settled: the top of its
+    /// deadline heap, read without visiting its other exchanges.
+    pub(crate) fn first_due(&mut self, key: usize) -> Option<Instant> {
+        self.settle();
+        self.deadlines
+            .get(key)
+            .and_then(|heap| heap.first())
+            .map(|(due, _)| *due)
+    }
+
     /// The exchanges of connection `key` a progress pass visits, settled, in the order they were
     /// made, appended to `into`.
     pub(crate) fn active(&mut self, key: usize, into: &mut Vec<u64>) {

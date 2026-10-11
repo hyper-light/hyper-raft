@@ -689,6 +689,13 @@ the numbers are `docs/benchmarks.md`, "Probe timeouts, tickets and Careful Resum
   initial windows are acknowledged in a round trip (RFC 9959 §3.1's floor), so a later burst starts
   from Careful Resume's jump rather than the initial window; the jump is taken only where it beats
   slow start (`crates/hyper-quic/VENDORED.md` §15, `docs/research/quic-overhead.md` §5).
+- **The endpoint visits what its events touch** (2026-10-11). Each turn of the driver offered
+  every connection its turn to transmit, drove every connection on a timeout, and read every
+  connection's timer and every exchange's wait for the next one. So each exchange cost about
+  0.4 µs more for every connection the server held, and focal's leader spent 8% of its CPU on it.
+  A connection an event or a call changed is now queued for its turn and placed by its deadline
+  in an indexed heap: 512 connections held cost what one does, 40 µs an exchange
+  (`docs/benchmarks.md`, "An exchange by the server's connections").
 - **BBR starts at the initial window** (2026-10-11). Upstream's BBR started at 200 datagrams,
   240,000 bytes, where RFC 9002 §7.2 starts a sender at ten. The warm-up's target and budget, four
   and sixteen initial windows, scaled with it to 3.84 MB of padding a connection. BBR now starts

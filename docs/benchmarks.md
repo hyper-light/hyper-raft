@@ -7779,3 +7779,51 @@ place, 1.4 times faster, with the p99 at 0.60 times and the p99.9 bound at 0.18 
 row's. The writes overlap, and the flush, which dominates both rows, is the same one `fdatasync`
 makes. Nothing is allocated per operation. The read rows of this run repeat the reads table's
 order (native AIO 2.5 times faster than sequential reads here). A bare-metal Linux run is owed.
+
+## An exchange by the server's connections: one asker timed beside n − 1 idle (2026-10-11)
+
+`cargo bench -p hyper-rt-transport --bench connections` (`CONNECTIONS=n` runs one row): one asker
+times small exchanges, a request and its reply of 600 bytes each way, one at a time, 1,000 rounds
+after 100 warm-up rounds, while `n − 1` other askers hold their connections to the same server
+idle. Every endpoint runs on one hyper-rt shard over loopback. Keep-alives are off, and each row
+first waits until the server hears nothing for 200 ms (every path's warm-up spent), so it times the
+exchanges alone. With a 50 ms wait, the warm-ups of 256 fresh connections ran into the timed rounds.
+
+Apple M5 Max, macOS 26.4, `focal-transport-hooks` at `ee57b45` with and without the change: one
+binary for each side, their runs interleaved, three passes a row, under other work's load (focal's
+test gate running).
+
+| Connections held | Before | After | Allocations an exchange |
+|---|---|---|---|
+| 1 | 37–40 µs | 36–39 µs | 23.6 |
+| 16 | 42 µs | 38–41 µs | 23.6 |
+| 64 | 55–57 µs | 37 µs | 23.6 |
+| 128 | 84–91 µs | 40–46 µs | 23.6–23.8 |
+| 256 | 134–139 µs | 41–43 µs | 23.6–24.1 |
+| 512 | 232–243 µs | 40–43 µs | 23.6–24.0 |
+
+Before the change, each exchange cost about 0.4 µs more for every connection the server held,
+because every turn of the driver visited every connection:
+- `poll_transmit` offered each connection its turn until one had a datagram;
+- `handle_timeout` pumped each connection, due or not;
+- `poll_timeout` read each connection's timer and every exchange's wait.
+
+focal's comparison measured the cost first. Its leader's network threads spent about 8% of the
+node's one CPU in those visits at 1,000 requests a second over some twenty connections, and 14% at
+4,000 (focal's compare run 38142415872, perf).
+
+After the change, the endpoint visits only what an event or a call touched:
+- A changed connection is marked where it is put back, and read again at the next poll: queued for
+  its turn to transmit, and placed by its deadline. The deadline is its QUIC timer or its
+  exchanges' earliest wait (the top of their heap), whichever is earlier.
+- The connections' deadlines are an indexed min-heap by key (`src/deadlines.rs`, reserved to the
+  connections held). `poll_timeout` reads its top; `handle_timeout` drives the due entries alone.
+- A connection that sent goes to the back of the line. One that had nothing leaves the line until
+  touched again.
+- With the `oracle` feature (every test), `poll_timeout` also visits everything as before and
+  counts any difference. No test found one.
+
+`benches/lookup.rs` (one connection, `n` exchanges open beside the timed one), run interleaved the
+same way: unchanged to 512 open (3.4–3.9 µs both sides). At the limit, 1,023, it went from 12.6–12.7
+µs to 8.1–8.4 µs, since `poll_timeout` no longer visits every exchange's wait. Allocations were
+identical on both benches.

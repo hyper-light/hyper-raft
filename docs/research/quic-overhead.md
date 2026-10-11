@@ -396,13 +396,24 @@ pacer like any packet; one lost is congestion, answered as any loss is, and ends
 - **How far.** Until four initial windows are acknowledged in one round trip, §3.1's floor: the
   least measurement Careful Resume keeps. The measurement goes to the endpoint at once, so a
   connection made while this one is open resumes from it.
+- **As background traffic.** A warm-up's packets are of use to no one but the next connection to
+  the remote: LEDBAT's case (RFC 6817), and it runs as LEDBAT++'s slow start does
+  (draft-irtf-iccrg-ledbat-plus-plus §4.1, §4.5). Its first two packets go once nothing of the
+  connection is in flight; its window grows by what each acknowledgement acknowledges; and it ends
+  once its packets' queueing delay, the least of its four latest RTT samples (none older than a
+  round trip, RFC 6817 §2.5) past the least of all, is larger than three quarters of the 60 ms
+  target. Only its own packets judge it, all of the path's MTU: a smaller packet's RTT is shorter
+  by the time the path takes to carry the difference, 91 ms of a 1,452-byte datagram at 128 kbit/s.
+  Over a path that cannot carry four initial windows a round trip without a queue, it stops there
+  and is recorded as an attempt: at 128 kbit/s six packets a side, where it ran to its budget,
+  some twelve seconds of the path that every other packet waited behind (`VENDORED.md` §23).
 - **Its bound.** Four times the target, sixteen initial windows: slow start doubles the window a
   round trip and a round trip's count may straddle two of the sender's rounds, so the target is met
   for certain once a window of twice it has been sent, and the rounds before carried less than that
-  again (a geometric sum). A warm-up that meets congestion or spends its budget is recorded, and no
-  connection to the remote warms up again until Careful Resume's lifetime has passed: a path the
-  warm-up cannot measure costs one budget a lifetime, not one a connection. A connection closed
-  before or during its warm-up releases the remote for the next.
+  again (a geometric sum). A warm-up that meets congestion, queues the path or spends its budget is
+  recorded, and no connection to the remote warms up again until Careful Resume's lifetime has
+  passed: a path the warm-up cannot measure costs one attempt a lifetime, not one a connection. A
+  connection closed before or during its warm-up releases the remote for the next.
 - **Round trips by packet number.** The measurement counts what is acknowledged in a round trip, and
   a round trip is a packet-timed one, as BBR counts them (draft-ietf-ccwg-bbr-06 §5.5.1): it begins
   at an acknowledgement and ends at the first acknowledgement of a packet sent after it. Counted on

@@ -232,6 +232,9 @@ each ported test's origin, and what was left out).
   one identity may hold several connections at once, and what an owner keeps per connection, such as
   focal's greeting, is found by it; focal's listener refused a node's request as ungreeted once its
   second connection closed, 2026-10-10), `Reply`, `BodyReady`, `Writable`,
+  and a peer's lifecycle events tell its current connection alone, so `connection_live(peer, epoch)`
+  says whether an older one is still up (what an owner keeps for each lets go by it: three clients
+  of one identity at once had two refused as ungreeted when only the newest connection was told),
   `Frame { peer, lane, kind, frame }`, `Refused { exchange, refusal, by_peer }`,
   `Closed { peer, epoch, refusal }`, `Unreachable { peer, refusal }`; at most
   `Limits::event_bound` wait for the owner (below).

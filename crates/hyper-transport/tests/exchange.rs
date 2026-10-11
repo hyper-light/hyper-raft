@@ -1817,6 +1817,10 @@ fn a_request_names_the_connection_it_came_on() {
         });
     }
     assert_eq!(epochs, vec![1, 2]);
+    // Only the current connection's end is an event; whether an older one is still up is asked.
+    assert!(!net.b.connection_live(1, 1), "the first connection went");
+    assert!(net.b.connection_live(1, 2), "the second is up");
+    assert!(!net.b.connection_live(1, 3), "no third");
 }
 
 /// An owner that polls nothing holds each exchange's slot with its events: the peer's exchanges

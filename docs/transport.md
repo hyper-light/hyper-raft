@@ -228,7 +228,10 @@ each ported test's origin, and what was left out).
   `reserve`, `release`, `send_frame`, `export_keying_material`, `path`, `credit`, `exchange_tail`
   (over the caller's measured timer granularity), `set_granularity` (that granularity, for tuning
   receive windows) and `stats`.
-- Events: `Connected { peer, role, epoch }`, `Request`, `Reply`, `BodyReady`, `Writable`,
+- Events: `Connected { peer, role, epoch }`, `Request` (with the `epoch` of the connection it came on:
+  one identity may hold several connections at once, and what an owner keeps per connection, such as
+  focal's greeting, is found by it; focal's listener refused a node's request as ungreeted once its
+  second connection closed, 2026-10-10), `Reply`, `BodyReady`, `Writable`,
   `Frame { peer, lane, kind, frame }`, `Refused { exchange, refusal, by_peer }`,
   `Closed { peer, epoch, refusal }`, `Unreachable { peer, refusal }`; at most
   `Limits::event_bound` wait for the owner (below).

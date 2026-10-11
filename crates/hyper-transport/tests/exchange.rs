@@ -1776,6 +1776,43 @@ fn a_peer_is_held_to_its_lanes_windows_across_its_connections() {
     assert_eq!(order.len(), 11);
 }
 
+/// A request names the connection it came on (`Event::Request`'s `epoch`): one identity may hold
+/// more than one connection to this side at once, up to its admission bound, and what an owner keeps
+/// for each connection — focal's greeting, the profile it negotiated — is found by it. Asked on the
+/// first connection, then on the one after a reconnect: each request carries its own epoch.
+#[test]
+fn a_request_names_the_connection_it_came_on() {
+    let pair = Pair::new();
+    let mut net = connected::<Mantle, Mantle>(&pair, limits(), 256 << 20);
+    let address = net.b_address;
+    let progress = hyper_transport::Progress::new(PERIOD).unwrap();
+    let mut epochs = Vec::new();
+    for round in 1..=2u64 {
+        if round == 2 {
+            net.a.disconnect(net.now, 2);
+            net.exchange();
+            net.a.connect(net.now, 2, address).unwrap();
+            net.until(TURNS, |net| {
+                events(&mut net.a)
+                    .iter()
+                    .any(|event| matches!(event, Event::Connected { epoch: 2, .. }))
+            });
+        }
+        net.a
+            .open(net.now, 2, Kind::Get, b"asked", None, progress)
+            .unwrap();
+        net.until(TURNS, |net| {
+            for event in events(&mut net.b) {
+                if let Event::Request { epoch, .. } = event {
+                    epochs.push(epoch);
+                }
+            }
+            epochs.len() as u64 == round
+        });
+    }
+    assert_eq!(epochs, vec![1, 2]);
+}
+
 /// An owner that polls nothing holds each exchange's slot with its events: the peer's exchanges
 /// past the table are refused, typed, and no more events wait than its slots hold.
 #[test]

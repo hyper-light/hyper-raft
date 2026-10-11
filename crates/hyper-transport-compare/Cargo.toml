@@ -3,7 +3,7 @@ name = "hyper-transport-compare"
 description = "hyper-transport measured against the application layer it replaces, on one workload: focal-wire's core (its transport configuration, its frame codec and its per-exchange stream over quinn), both on tokio."
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.98"
+rust-version = "1.98.1"
 license = "MIT"
 publish = false
 

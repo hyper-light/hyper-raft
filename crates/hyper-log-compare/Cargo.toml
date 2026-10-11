@@ -3,7 +3,7 @@ name = "hyper-log-compare"
 description = "hyper-log measured against the logs it replaces, on one workload: mantle's mantle-log (through its own `mantle bench log`) and focal's focal-log."
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.98"
+rust-version = "1.98.1"
 license = "MIT"
 publish = false
 

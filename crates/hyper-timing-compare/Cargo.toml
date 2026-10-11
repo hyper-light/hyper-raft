@@ -3,7 +3,7 @@ name = "hyper-timing-compare"
 description = "hyper-timing measured against the timing it replaces, operation by operation: focal-timing and slates' election timing (slates-cluster)."
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.98"
+rust-version = "1.98.1"
 license = "MIT"
 publish = false
 

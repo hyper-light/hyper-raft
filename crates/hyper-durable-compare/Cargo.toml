@@ -3,7 +3,7 @@ name = "hyper-durable-compare"
 description = "hyper-durable measured against the shells it replaces, on one workload: mantle's range replica on its own shell (crates/range at origin/dev 1c179e8, and at its step 1 on the log this repository's shell runs on) and on this shell (mantle's D-1); focal's DurableNode and slates' publication are later steps."
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.98"
+rust-version = "1.98.1"
 license = "MIT"
 publish = false
 

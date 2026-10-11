@@ -3,7 +3,7 @@ name = "hyper-raft-compare"
 description = "hyper-raft measured against each core it replaces, on one workload: focal's (at the revision it came from and at the one mantle pins), slates' and raft-rs."
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.98"
+rust-version = "1.98.1"
 license = "MIT"
 publish = false
 

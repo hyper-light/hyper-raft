@@ -78,27 +78,66 @@ enum Stop<F> {
     Spent(Spent),
 }
 
-fn descend<S: System>(search: &mut Search, system: &S, left: u32) -> Result<(), Stop<S::Fault>> {
-    if left == 0 {
-        return Ok(());
+/// What the search does next with the path.
+enum Next {
+    /// Takes up the system at the path's end: passed over if its rounds are spent or its key was
+    /// explored with as many rounds left, its first scenario played otherwise.
+    Enter,
+    /// Plays this scenario from the system at the path's end.
+    Play(usize),
+    /// Leaves the system at the path's end for its parent's next scenario.
+    Back,
+}
+
+/// The search, depth first, as one loop over the path (mantle CLAUDE.md §10: no call of its own,
+/// nothing waits on another's result). The systems kept are those after each prefix of the path,
+/// at most `1 +` the depth, which each step extends, passes over or cuts back; the paths are taken
+/// in their scenarios' lexicographic order, as a recursive descent would take them.
+fn explore<S: System>(search: &mut Search, start: &S) -> Result<(), Stop<S::Fault>> {
+    let mut systems = vec![start.clone()];
+    let mut next = Next::Enter;
+    loop {
+        let Some(system) = systems.last() else {
+            return Ok(());
+        };
+        next = match next {
+            Next::Enter => {
+                let taken = u32::try_from(search.path.len()).unwrap_or(u32::MAX);
+                let left = search.depth.saturating_sub(taken);
+                if left == 0 {
+                    Next::Back
+                } else {
+                    let key = system.key();
+                    // Explored before with at least as many rounds left: every future of this
+                    // prefix was.
+                    if (left..=search.depth).any(|more| search.seen.contains(keyed(key, more))) {
+                        search.rounds.pruned = search.rounds.pruned.saturating_add(1);
+                        Next::Back
+                    } else {
+                        search.seen.insert(keyed(key, left)).map_err(Stop::Spent)?;
+                        search.rounds.states = search.seen.len();
+                        Next::Play(0)
+                    }
+                }
+            }
+            Next::Play(choice) if choice < system.choices() => {
+                let mut played = system.clone();
+                search.rounds.played = search.rounds.played.saturating_add(1);
+                search.path.push(choice);
+                played.play(choice).map_err(Stop::Fault)?;
+                systems.push(played);
+                Next::Enter
+            }
+            Next::Play(_) | Next::Back => {
+                systems.pop();
+                match search.path.pop() {
+                    Some(choice) => Next::Play(choice.saturating_add(1)),
+                    // The start is left: every path was taken.
+                    None => return Ok(()),
+                }
+            }
+        };
     }
-    let key = system.key();
-    // Explored before with at least as many rounds left: every future of this prefix was.
-    if (left..=search.depth).any(|more| search.seen.contains(keyed(key, more))) {
-        search.rounds.pruned = search.rounds.pruned.saturating_add(1);
-        return Ok(());
-    }
-    search.seen.insert(keyed(key, left)).map_err(Stop::Spent)?;
-    search.rounds.states = search.seen.len();
-    for choice in 0..system.choices() {
-        let mut next = system.clone();
-        search.rounds.played = search.rounds.played.saturating_add(1);
-        search.path.push(choice);
-        next.play(choice).map_err(Stop::Fault)?;
-        descend(search, &next, left.saturating_sub(1))?;
-        search.path.pop();
-    }
-    Ok(())
 }
 
 /// Every path of `depth` rounds from `start`, depth first, within `budget`.
@@ -118,7 +157,7 @@ pub fn rounds<S: System>(start: &S, depth: u32, budget: Budget) -> Played<S::Fau
         rounds: Rounds::default(),
         path: Vec::new(),
     };
-    match descend(&mut search, start, depth) {
+    match explore(&mut search, start) {
         Ok(()) => Played::Exhausted(search.rounds),
         Err(Stop::Fault(fault)) => Played::Fault {
             rounds: search.rounds,

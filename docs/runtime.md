@@ -118,6 +118,13 @@ states its configured value and why.
 future's size is the caller's), with the allocation counted in the benchmarks of §12; a per-shard pool of
 fixed-size task frames is the measured follow-up, not a default.
 
+**A task's code runs inside an unwind boundary of the shard's own** (2026-10-11; CLAUDE.md §1, production
+code never panics). A task's poll and its future's drop are the caller's code, run on the shard's thread
+among every other task's: a poll that unwinds ends its task `Outcome::Unwound`, its joiner told so, its
+future dropped inside a boundary too, and a drop that unwinds is counted (`Counters::unwound`); the shard
+and its other tasks go on. Before, a task that panicked unwound the shard's loop, every task on the shard
+with it (`tests/unwind.rs`; on main, the unwind came out of `run_until_idle`).
+
 ### 3.2 Wakers
 
 A `Waker`'s data pointer *is* the task's word, `shard:16 | slot:24 | generation:24`; its vtable's
@@ -649,7 +656,7 @@ cannot be cancelled (the call is the OS's); its share's bound is what limits the
 thread owns the job queue's receiving end and the idle workers' reports; each worker owns a one-job slot
 and reports itself idle over a bounded channel, so each job goes to exactly one idle worker. Shares and
 counters are atomics. A job that panics ends the job, not its worker (an unwind boundary), and gives its
-share back. A job gives its share back before its result is delivered or its sender dropped, so a task
+share back; a result no one takes is dropped inside the boundary too, its drop being the job's code. A job gives its share back before its result is delivered or its sender dropped, so a task
 that sees the job end can submit again under the same share and is never refused for a slot the pool is
 still about to free (2026-10-08: the reverse order failed `tests/blocking.rs` on a slow macOS x86_64
 runner). One per process: a second `start` is refused; `stop` drains and joins. Name resolution

@@ -190,6 +190,10 @@ pub enum Outcome {
     /// The future was dropped before returning (cancelled by request, by its parent, or by
     /// shutdown).
     Cancelled,
+    /// The future unwound while it was polled: the task's code panicked. The poll runs inside an
+    /// unwind boundary of the shard's own, so the task ends there, its future dropped inside a
+    /// boundary too, and the shard and its other tasks go on (CLAUDE.md §1).
+    Unwound,
 }
 
 /// One task slot.

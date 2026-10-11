@@ -78,6 +78,9 @@ pub struct Counters {
     pub completed: u64,
     /// Tasks whose future was dropped.
     pub cancelled: u64,
+    /// Tasks whose poll unwound ([`Outcome::Unwound`]), and futures whose drop unwound: each caught by
+    /// the shard's boundary around the task's code.
+    pub unwound: u64,
     /// Wakes that arrived from other threads (the wake bitmap).
     pub wakes_foreign: u64,
     /// Of those, wakes for a slot with no task when drained: the task ended after the wake was sent. Not
@@ -248,7 +251,10 @@ impl Drop for Shard {
         self.close_control();
         let entered = registry::enter(&self.desk);
         for task in self.core.tasks.iter_mut() {
-            drop(task.future.take());
+            if let Some(future) = task.future.take() {
+                // A future's drop is its task's code: inside an unwind boundary of the shard's own.
+                let _ = crate::unwind::contained(move || drop(future));
+            }
         }
         drop(entered);
         registry::note_arena_generation(self.desk.id, self.core.generation_high);
@@ -1257,7 +1263,9 @@ impl Shard {
         let start = self.now_ns();
         self.desk.now_ns.set(start);
         let entered = registry::enter(&self.desk);
-        let poll = future.as_mut().poll(&mut cx);
+        // The poll is the task's code: inside an unwind boundary of the shard's own, so a task that
+        // panics ends there, typed, and costs the shard and its other tasks nothing (CLAUDE.md §1).
+        let poll = crate::unwind::contained(|| future.as_mut().poll(&mut cx));
         drop(entered);
         let ended = self.now_ns();
         self.desk.current_task.set(None);
@@ -1265,6 +1273,15 @@ impl Shard {
         // finished in one poll has them installed, linked and so cancelled with it.
         self.apply();
         let attributed = self.attribute_poll(start, ended);
+        let Some(poll) = poll else {
+            // A future that unwound is in no state to poll again: it is dropped, and the task ends.
+            if let Some(task) = slot_mut(&mut self.core.tasks, slot) {
+                task.state = State::Finishing;
+            }
+            self.drop_entered(future);
+            self.finish(slot, Outcome::Unwound);
+            return;
+        };
         self.after_poll(PollDone {
             slot,
             future,
@@ -1275,11 +1292,15 @@ impl Shard {
     }
 
     /// Drops a task's future with the desk entered: its destructors may wake or cancel other tasks of this
-    /// shard, or let their timers go.
-    fn drop_entered(&self, future: BoxedFuture) {
+    /// shard, or let their timers go. The drop is the task's code, inside an unwind boundary of the shard's
+    /// own; one that unwinds is counted.
+    fn drop_entered(&mut self, future: BoxedFuture) {
         let entered = registry::enter(&self.desk);
-        drop(future);
+        let dropped = crate::unwind::contained(move || drop(future));
         drop(entered);
+        if dropped.is_none() {
+            self.core.counters.unwound = self.core.counters.unwound.saturating_add(1);
+        }
     }
 
     /// Wakes the task `word` names: on this shard directly, elsewhere through the registry.
@@ -1347,6 +1368,9 @@ impl Shard {
             }
             Outcome::Cancelled => {
                 self.core.counters.cancelled = self.core.counters.cancelled.saturating_add(1);
+            }
+            Outcome::Unwound => {
+                self.core.counters.unwound = self.core.counters.unwound.saturating_add(1);
             }
         }
         let mut child = first_child;

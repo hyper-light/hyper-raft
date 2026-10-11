@@ -236,8 +236,8 @@ where
         state.held.fetch_sub(1, Ordering::AcqRel);
     })?;
     let wrapped: Job = Box::new(move || {
-        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job));
-        if outcome.is_err() {
+        let outcome = crate::unwind::contained(job);
+        if outcome.is_none() {
             PANICKED.fetch_add(1, Ordering::Relaxed);
         }
         // The share is given back before the receiver can see anything: a task that awaited this job's
@@ -246,10 +246,13 @@ where
             state.held.fetch_sub(1, Ordering::AcqRel);
         }
         FINISHED.fetch_add(1, Ordering::Relaxed);
+        // A dropped receiver discards the result, whose drop is the job's code: inside an unwind
+        // boundary too.
         match outcome {
-            // A dropped receiver discards the result.
-            Ok(value) => drop(sender.send(value)),
-            Err(_) => drop(sender),
+            Some(value) => {
+                let _ = crate::unwind::contained(move || drop(sender.send(value)));
+            }
+            None => drop(sender),
         }
     });
     match pool.submit.try_send(Message::Job(wrapped)) {

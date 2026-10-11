@@ -75,6 +75,7 @@ struct Shape {
     steps: u64,
     budget: Duration,
     hourly: bool,
+    cost: Duration,
 }
 
 /// A fleet whose nodes fail once an hour, as `docs/timing.md` §3 item 11 seeds one: a thousand
@@ -96,6 +97,7 @@ const LAN_CLUSTER: Shape = Shape {
     steps: STEPS,
     budget: Duration::ZERO,
     hourly: false,
+    cost: Duration::ZERO,
 };
 
 /// slates' far-link repro: two near members, four 100 ms one way from them. Its steps: four times the
@@ -107,6 +109,7 @@ const FAR_LINK: Shape = Shape {
     steps: 4 * FAR_STEPS_TAKEN,
     budget: Duration::ZERO,
     hourly: false,
+    cost: Duration::ZERO,
 };
 
 /// The most steps a named seed's far-link or all-far run took: 26,058, seed 43's far-link run until
@@ -122,6 +125,7 @@ const ALL_FAR: Shape = Shape {
     steps: 4 * FAR_STEPS_TAKEN,
     budget: Duration::ZERO,
     hourly: false,
+    cost: Duration::ZERO,
 };
 
 impl Shape {
@@ -266,6 +270,7 @@ impl Member {
             Duration::from_nanos(1),
             shape.budget,
         );
+        detector.set_condemnation_cost(shape.cost);
         for peer in (0..shape.nodes).map(NodeId).filter(|peer| *peer != me) {
             if shape.far.is_empty() && shape.far_pairs.is_empty() {
                 detector.join(host(peer)).unwrap();
@@ -1335,6 +1340,7 @@ const SLOW_RELAY: Shape = Shape {
     steps: 4 * FAR_STEPS_TAKEN,
     budget: Duration::ZERO,
     hourly: false,
+    cost: Duration::ZERO,
 };
 
 /// The probes of the member it reaches only through a relay that the asker sends while the run is
@@ -1477,5 +1483,152 @@ fn record_far_link() {
             configured.map_or("never".to_owned(), |at| format!("{at:.2?}")),
             steps.max(all_far_steps).max(configured_steps)
         );
+    }
+}
+
+/// What one detection-budget record run measured.
+struct BudgetRecord {
+    /// The largest least detection bound of any member, read just before the kill.
+    least: Duration,
+    /// The widest margin of any member's verdict on a peer, read then.
+    margin: Duration,
+    /// The widest span (round trip and margin) of any such verdict.
+    span: Duration,
+    /// The most probes any member sent a second over the window before the kill.
+    probes: f64,
+    /// The slowest survivor's detection of the killed member, from its last answer.
+    detected: Duration,
+    /// The bound that survivor stated.
+    stated: Duration,
+}
+
+/// One detection-budget record run of `shape` from `seed`: every pair judged, then the fleet's own
+/// probing for two seconds or one budget, whichever is longer, read at its end as an owner reads it
+/// in steady state, then a member killed. A pair's relay bound is restated only by its answers, and
+/// at the floor each pair is probed at least every third of the budget (`m` of the `4m − 1`
+/// periods), so a budget's time restates every bound at least three times: a shorter read takes the
+/// bounds stated before the pairs' own estimators configured, each a timer's second. Its checks are
+/// the kill's own: no live member held dead, each survivor within the bound it stated.
+fn budget_record(shape: Shape, seed: u64) -> BudgetRecord {
+    let mut sim = Sim::new(Source::Seed(seed), false, shape);
+    sim.run("every pair judged", Sim::every_pair_judged);
+    let from: Vec<usize> = sim
+        .members
+        .iter()
+        .map(|member| member.pings.len())
+        .collect();
+    let window = nanos_of(shape.budget).max(2_000_000_000);
+    let until = sim.now() + window;
+    sim.run("the window", |sim| sim.now() >= until);
+    let mut least = Duration::ZERO;
+    let mut margin = Duration::ZERO;
+    let mut span = Duration::ZERO;
+    for (me, member) in sim.live() {
+        let now = sim.world.monotonic(me).unwrap();
+        least = least.max(member.detector.least_detection_bound(now).unwrap());
+        for (peer, _) in sim.live().filter(|(peer, _)| *peer != me) {
+            let verdict = member.detector.verdict(host(peer)).unwrap();
+            margin = margin.max(verdict.margin);
+            span = span.max(verdict.round_trip + verdict.margin);
+        }
+    }
+    let sent = sim
+        .members
+        .iter()
+        .zip(&from)
+        .map(|(member, from)| member.pings.len() - from)
+        .max()
+        .unwrap();
+    let victim = kill_and_check(&mut sim, &format!("seed {seed}"));
+    let (detected, stated) = sim
+        .live()
+        .map(|(_, member)| {
+            let death = member.deaths[&host(victim).0];
+            (death.after, death.within.unwrap())
+        })
+        .max()
+        .unwrap();
+    BudgetRecord {
+        least,
+        margin,
+        span,
+        probes: sent as f64 / (window as f64 / 1e9),
+        detected,
+        stated,
+    }
+}
+
+/// `duration` in whole nanoseconds, saturating.
+fn nanos_of(duration: Duration) -> u64 {
+    u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
+}
+
+/// The budgets the record runs: none, slates' membership horizon (`SLATES_BUDGET_NS`), and slates'
+/// failover objective's placeholder, 10 s, the most its `D = F − confirmation` can be.
+const RECORD_BUDGETS: [Duration; 3] = [
+    Duration::ZERO,
+    Duration::from_nanos(SLATES_BUDGET_NS),
+    Duration::from_secs(10),
+];
+
+/// The condemnation costs the record runs: none, and a second to a thousand by decades, the range a
+/// takeover's unavailability spans from one region's handoff to a fleet's rebuild.
+const RECORD_COSTS: [Duration; 5] = [
+    Duration::ZERO,
+    Duration::from_secs(1),
+    Duration::from_secs(10),
+    Duration::from_secs(100),
+    Duration::from_secs(1_000),
+];
+
+/// Prints the detection-budget records `docs/benchmarks.md` cites: for slates' LAN fleet of five,
+/// its fleet of three and the far link, each member seeded with an hourly fleet's history, under
+/// each budget `D` and condemnation cost, the worst over the seeds the budget test runs of: the
+/// least detection bound the measured deadlines support, the widest verdict margin and span, the
+/// probes a member sends a second, and a killed member's detection with the bound stated for it.
+/// A budget is kept by every period only when it is at least the least bound. Run on demand:
+/// `cargo test -p hyper-swim --test sim --release -- --ignored --nocapture record_detection_budget`.
+#[test]
+#[ignore = "a record run for docs/benchmarks.md, printed, not checked"]
+fn record_detection_budget() {
+    let lan3 = Shape {
+        nodes: 3,
+        ..HOURLY_LAN
+    };
+    let far = Shape {
+        hourly: true,
+        ..FAR_LINK
+    };
+    println!(
+        "| fleet | D | cost | least bound | widest margin | widest span | probes/s | detected | stated |"
+    );
+    println!("|---|---|---|---|---|---|---|---|---|");
+    for (fleet, base) in [
+        ("LAN, 5", HOURLY_LAN),
+        ("LAN, 3", lan3),
+        ("far link, 6", far),
+    ] {
+        for budget in RECORD_BUDGETS {
+            for cost in RECORD_COSTS {
+                let shape = Shape {
+                    budget,
+                    cost,
+                    ..base
+                };
+                let records: Vec<BudgetRecord> =
+                    (0..16).map(|seed| budget_record(shape, seed)).collect();
+                let worst =
+                    |field: fn(&BudgetRecord) -> Duration| records.iter().map(field).max().unwrap();
+                let probes = records.iter().map(|r| r.probes).fold(0.0, f64::max);
+                println!(
+                    "| {fleet} | {budget:.1?} | {cost:?} | {:.2?} | {:.1?} | {:.1?} | {probes:.1} | {:.2?} | {:.2?} |",
+                    worst(|r| r.least),
+                    worst(|r| r.margin),
+                    worst(|r| r.span),
+                    worst(|r| r.detected),
+                    worst(|r| r.stated),
+                );
+            }
+        }
     }
 }

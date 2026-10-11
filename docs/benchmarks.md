@@ -7779,3 +7779,85 @@ place, 1.4 times faster, with the p99 at 0.60 times and the p99.9 bound at 0.18 
 row's. The writes overlap, and the flush, which dominates both rows, is the same one `fdatasync`
 makes. Nothing is allocated per operation. The read rows of this run repeat the reads table's
 order (native AIO 2.5 times faster than sequential reads here). A bare-metal Linux run is owed.
+
+## hyper-swim: a detection budget against the probe period and the condemnation cost (2026-10-11)
+
+What an owner's detection budget `D` can promise (`Detector::set_detection_budget`, the period's
+floor `D / (2(2m − 1) + 1)`), as the false condemnation's price (`Detector::set_condemnation_cost`)
+widens every verdict's margin: slates' question (its `D = F − confirmation`, its takeover's cost
+still unmeasured). `record_detection_budget` in `crates/hyper-swim/tests/sim.rs`, on hyper-sim: slates'
+LAN fleet of five and of three, and the far link (two near members, four 100 ms one way from them),
+each member seeded with an hourly fleet's history; for each budget and cost, sixteen seeds, each run
+judging every pair, probing for two seconds or one budget, whichever is longer, then killing a
+member. The worst over the seeds of: the least detection bound the members' measured deadlines
+support (`Detector::least_detection_bound`, read before the kill), the widest verdict margin and
+span, the probes a member sends a second, and the killed member's detection (the slowest survivor,
+from its last answer to holding it dead) with the bound that survivor stated. Every run held no
+live member dead and every survivor within its stated bound. macOS 26.4.1, Apple M5 Max, release
+build, main at `506c059`.
+
+| fleet | D | cost | least bound | widest margin | widest span | probes/s | detected | stated |
+|---|---|---|---|---|---|---|---|---|
+| LAN, 5 | none | 0 | 1.84 s | 41.3 ms | 41.8 ms | 29.5 | 547.83 ms | 1.81 s |
+| LAN, 5 | none | 1 s | 25.47 s | 354.8 ms | 355.2 ms | 7.5 | 3.77 s | 14.74 s |
+| LAN, 5 | none | 10 s | 37.93 s | 764.0 ms | 764.3 ms | 1.5 | 9.02 s | 33.29 s |
+| LAN, 5 | none | 100 s | 70.90 s | 1.6 s | 1.6 s | 1.0 | 19.42 s | 71.69 s |
+| LAN, 5 | none | 1,000 s | 150.26 s | 3.5 s | 3.5 s | 0.5 | 41.83 s | 154.43 s |
+| LAN, 5 | 900 ms | 0 | 1.92 s | 44.2 ms | 44.6 ms | 17.0 | 808.18 ms | 1.84 s |
+| LAN, 5 | 900 ms | 1 s | 25.47 s | 354.8 ms | 355.2 ms | 7.5 | 3.77 s | 14.74 s |
+| LAN, 5 | 900 ms | 10 s | 37.93 s | 764.0 ms | 764.3 ms | 1.5 | 9.02 s | 33.29 s |
+| LAN, 5 | 900 ms | 100 s | 70.90 s | 1.6 s | 1.6 s | 1.0 | 19.42 s | 71.69 s |
+| LAN, 5 | 900 ms | 1,000 s | 150.26 s | 3.5 s | 3.5 s | 0.5 | 41.83 s | 154.43 s |
+| LAN, 5 | 10 s | 0 | 1.91 s | 44.2 ms | 44.6 ms | 1.5 | 7.33 s | 10.67 s |
+| LAN, 5 | 10 s | 1 s | 13.79 s | 354.8 ms | 355.2 ms | 1.5 | 8.00 s | 10.67 s |
+| LAN, 5 | 10 s | 10 s | 31.17 s | 691.0 ms | 691.4 ms | 1.5 | 8.67 s | 22.59 s |
+| LAN, 5 | 10 s | 100 s | 71.57 s | 1.6 s | 1.6 s | 1.1 | 16.21 s | 68.29 s |
+| LAN, 5 | 10 s | 1,000 s | 155.16 s | 3.5 s | 3.5 s | 0.4 | 36.83 s | 152.79 s |
+| LAN, 3 | none | 0 | 852.90 ms | 41.2 ms | 41.6 ms | 28.5 | 434.79 ms | 931.07 ms |
+| LAN, 3 | none | 1 s | 9.04 s | 438.1 ms | 438.5 ms | 5.5 | 3.97 s | 9.47 s |
+| LAN, 3 | none | 10 s | 20.22 s | 943.6 ms | 943.9 ms | 2.0 | 8.14 s | 20.40 s |
+| LAN, 3 | none | 100 s | 41.93 s | 2.0 s | 2.0 s | 1.5 | 18.50 s | 44.46 s |
+| LAN, 3 | none | 1,000 s | 90.33 s | 4.4 s | 4.4 s | 1.0 | 37.46 s | 100.98 s |
+| LAN, 3 | 900 ms | 0 | 933.48 ms | 42.5 ms | 42.9 ms | 8.0 | 1.03 s | 1.16 s |
+| LAN, 3 | 900 ms | 1 s | 9.04 s | 438.1 ms | 438.5 ms | 4.5 | 3.97 s | 9.47 s |
+| LAN, 3 | 900 ms | 10 s | 20.22 s | 943.6 ms | 943.9 ms | 2.0 | 8.14 s | 20.40 s |
+| LAN, 3 | 900 ms | 100 s | 41.93 s | 2.0 s | 2.0 s | 1.5 | 18.50 s | 44.46 s |
+| LAN, 3 | 900 ms | 1,000 s | 90.33 s | 4.4 s | 4.4 s | 1.0 | 37.46 s | 100.98 s |
+| LAN, 3 | 10 s | 0 | 958.14 ms | 46.2 ms | 46.6 ms | 0.7 | 10.00 s | 12.86 s |
+| LAN, 3 | 10 s | 1 s | 9.04 s | 438.1 ms | 438.5 ms | 0.7 | 10.00 s | 12.86 s |
+| LAN, 3 | 10 s | 10 s | 19.45 s | 943.6 ms | 943.9 ms | 0.7 | 10.29 s | 15.48 s |
+| LAN, 3 | 10 s | 100 s | 41.90 s | 2.0 s | 2.0 s | 0.7 | 15.07 s | 41.33 s |
+| LAN, 3 | 10 s | 1,000 s | 90.33 s | 4.4 s | 4.4 s | 0.5 | 37.76 s | 94.64 s |
+| far link, 6 | none | 0 | 14.49 s | 55.7 ms | 255.7 ms | 9.5 | 2.35 s | 14.45 s |
+| far link, 6 | none | 1 s | 15.36 s | 72.8 ms | 272.8 ms | 8.5 | 2.96 s | 15.35 s |
+| far link, 6 | none | 10 s | 18.16 s | 127.6 ms | 325.4 ms | 6.5 | 3.93 s | 18.33 s |
+| far link, 6 | none | 100 s | 25.62 s | 260.2 ms | 455.1 ms | 4.5 | 5.25 s | 24.80 s |
+| far link, 6 | none | 1,000 s | 43.28 s | 578.9 ms | 778.8 ms | 3.5 | 8.75 s | 38.49 s |
+| far link, 6 | 900 ms | 0 | 14.45 s | 56.5 ms | 256.5 ms | 9.0 | 2.33 s | 14.66 s |
+| far link, 6 | 900 ms | 1 s | 15.35 s | 71.9 ms | 271.6 ms | 9.0 | 3.80 s | 15.46 s |
+| far link, 6 | 900 ms | 10 s | 18.16 s | 127.6 ms | 325.4 ms | 6.5 | 3.93 s | 18.33 s |
+| far link, 6 | 900 ms | 100 s | 25.62 s | 260.2 ms | 455.1 ms | 4.5 | 5.25 s | 24.80 s |
+| far link, 6 | 900 ms | 1,000 s | 43.28 s | 578.9 ms | 778.8 ms | 3.5 | 8.75 s | 38.49 s |
+| far link, 6 | 10 s | 0 | 14.45 s | 54.9 ms | 254.8 ms | 1.9 | 8.95 s | 15.03 s |
+| far link, 6 | 10 s | 1 s | 14.96 s | 66.3 ms | 266.3 ms | 1.9 | 7.89 s | 14.98 s |
+| far link, 6 | 10 s | 10 s | 17.16 s | 107.4 ms | 307.2 ms | 2.0 | 6.40 s | 17.33 s |
+| far link, 6 | 10 s | 100 s | 23.15 s | 221.5 ms | 421.6 ms | 1.9 | 7.42 s | 23.14 s |
+| far link, 6 | 10 s | 1,000 s | 37.92 s | 572.0 ms | 772.1 ms | 2.0 | 9.36 s | 36.23 s |
+
+- **The floor does what it should.** It only stretches judged periods: on the five-member LAN at no
+  cost, a member's probes fall from 29.5 a second without a budget to 17 at 900 ms and 1.5 at 10 s,
+  and detection stays within the budget wherever the budget is above the least bound.
+- **A budget is a promise only at the least bound or above.** The least bound is the bound's
+  `2(2m − 1) + 1` periods (15 for five members, 7 for three, 19 for the far link's six) each at its
+  longest unanswered length: the direct span and the relay stage. On the five-member LAN at no cost
+  it is 1.84 s, so 900 ms held on every seed (808 ms at worst) but is not a promise; on three members
+  it is 0.93 s, and one seed's detection at 900 ms took 1.03 s. A budget under the least bound is
+  what `least_detection_bound` tells an owner: it cannot be kept on that network.
+- **The condemnation cost sets the bound.** A verdict that condemns is surer the more a false
+  condemnation costs, so its margin widens with the cost: on the five-member LAN 41 ms at no cost,
+  355 ms at 1 s, 764 ms at 10 s, 1.6 s at 100 s, 3.5 s at 1,000 s; the least bound 1.8 s, 25 s, 38 s,
+  71 s, 150 s. Detection itself stays well under the bound (3.8 s at 1 s, 9 s at 10 s).
+- **Detection runs from the last answer to the condemnation**, which after the budget's periods also
+  waits for an answer from another member, the evidence that the condemning member's own network
+  works (`Detector::detection_bound`): the stated bound counts that wait, the budget does not, so an
+  owner's `D` leaves room for it (at 10 s on three members, detection came at the budget itself).

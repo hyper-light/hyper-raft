@@ -643,22 +643,36 @@ concerns every waiter (a shutdown) completes each waiter's cell once (NOTE26 §5
 
 Work that blocks a thread (a synchronous library call, `getaddrinfo`, a code sandbox, a file read on a
 platform without asynchronous file I/O) runs on **one bounded pool per process**: `workers` threads,
-started once and reused, each with its own job slot woken one to one (NOTE26 §2.5, §5.3); jobs wait in a
-bounded queue; past it, `Capacity`, decided before any thread is asked to start. Its size is the
-consumer's, derived from its own measurement (for mantle, the device's queue and measured knee, NOTE26
-§2.5; for focal, the code sandbox's concurrency budget). Each consumer may divide it into named shares
-so one kind of work cannot take all of it. A job's result returns through a `oneshot`. A blocking job
-cannot be cancelled (the call is the OS's); its share's bound is what limits the damage, stated.
+started once and reused, each with its own job slot woken one to one (NOTE26 §2.5, §5.3). Its size is
+the consumer's, derived from its own measurement (for mantle, the device's queue and measured knee, NOTE26
+§2.5; for focal, the code sandbox's concurrency budget). The consumer divides it into named shares so one
+kind of work cannot take all of it:
+- a share runs at most `limit` of its jobs at once;
+- the jobs past those wait for one of its places, in the order given, up to `waiting` of them;
+- past that a job is refused `Capacity`, decided before any thread is asked to start.
 
-**No locks, as built** (2026-10-06): the workspace's wall forbids `Mutex` and `Condvar`, so a dispatcher
-thread owns the job queue's receiving end and the idle workers' reports; each worker owns a one-job slot
-and reports itself idle over a bounded channel, so each job goes to exactly one idle worker. Shares and
-counters are atomics. A job that panics ends the job, not its worker (an unwind boundary), and gives its
+While its line has room, a job is never refused because its share is busy: essential work queues for
+its turn, as a busy machine's must (2026-10-10). The first pool refused a share's job the moment the
+share held `limit` jobs, queued or running. Under focal's concurrent node starts, a third whole-file job
+was refused and the node's bootstrap failed. `waiting: 0` keeps that behaviour where a consumer wants it.
+
+A job's result returns through a `oneshot`. A blocking job cannot be cancelled (the call is the OS's); its
+share's bound is what limits the damage, stated.
+
+**No locks, as built** (2026-10-06, the shares' lines 2026-10-10): the workspace's wall forbids `Mutex`
+and `Condvar`, so a dispatcher thread owns the shares' lines, their running counts and the idle workers'
+reports. Each worker owns a one-job slot, and reports itself idle, with the share whose job it finished,
+over the dispatcher's channel, so each job goes to exactly one idle worker. The shares take idle workers
+in turn, and each share's jobs run in the order given. A share's admitted jobs (running or waiting) are
+an atomic count checked at submission, so the dispatcher's channel holds at most the jobs admitted, one
+idle report per worker and one stop. It is bounded by admission, not preallocated: the pool's memory is
+that of the jobs it holds. A job that panics ends the job, not its worker (an unwind boundary), and gives its
 share back. A job gives its share back before its result is delivered or its sender dropped, so a task
 that sees the job end can submit again under the same share and is never refused for a slot the pool is
 still about to free (2026-10-08: the reverse order failed `tests/blocking.rs` on a slow macOS x86_64
-runner). One per process: a second `start` is refused; `stop` drains and joins. Name resolution
-(§5.4) is `dns::resolve`, on the share named `dns`. `tests/blocking.rs` passes on macOS and Linux 6.12.
+runner). One per process: a second `start` is refused; `stop` refuses new jobs, runs the jobs admitted,
+and joins. Name resolution (§5.4) is `dns::resolve`, on the share named `dns`. `tests/blocking.rs` passes
+on macOS and Linux 6.12; `tests/blocking_waits.rs` on macOS (2026-10-10).
 
 ## 10. Configuration from the machine
 

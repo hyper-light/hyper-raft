@@ -2315,6 +2315,58 @@ period stays under slates' at every point, 9.7 to 33.8 % less. `benches/allocs.r
 allocations, reallocations and faults a member a period at 4 to 256 members, quiet and churning,
 the same profile as the head before, to the bytes asked.
 
+## The liveness work (2026-10-10)
+
+The relay stage rebuilt and every probe judged (`crates/hyper-swim/ORIGIN.md` items 14 to 20), measured against `main`
+(`c3896ff`).
+
+**The workload's members apply an answer when it lands.** `benches/allocs.rs` and `crates/hyper-swim-compare` applied
+each acknowledgement as its ping went out, stamped with its landing a round trip later. Since every probe is judged
+(ORIGIN item 18), a period its pair's timer judges ends at its answer, so every period ended 50 µs in. No wake reached
+the expected arrival that measures `G`, no estimator took a sample, and the allocation bench's warm-up never ended:
+5,000 rounds at 4 members, every pair still on its timer. Each member now keeps its acknowledgements in flight (as many
+as its detector keeps probe records, `OUTSTANDING`) and applies each at its landing, as the workload above describes.
+Both builds below run the corrected driver; `main`'s detector configures under it as under the old one.
+
+**Allocations.** `cargo bench -p hyper-swim --bench allocs` counts 0 allocations, reallocations and faults a member a
+period at 4, 16, 64 and 256 members, quiet and churning; the bytes asked under churn (1.0, 0.2 and 0.3 a member a
+period at 4, 16 and 64 members) are one-time growths.
+
+**The first form**, which took the longest spans and the slowest relay's due from every pair at each period's start,
+against `main`, nine rounds at 16 and 64 members and three at 256, each a fresh process of 400 periods, the two builds'
+order rotated each round, 2026-10-10 at 15:12–15:35 PDT, load 41.5 falling to 25.3 (other sessions); ns a member a
+period, medians with the least and the most:
+
+| Members | Workload | `main` | First form | Against `main` |
+|---|---|---|---|---|
+| 16 | quiet | 506 (431–615) | 665 (640–773) | +31.4 % |
+| 16 | churning | 846 (751–992) | 972 (921–1,103) | +14.9 % |
+| 64 | quiet | 768 (683–1,183) | 1,755 (1,632–1,916) | +128.4 % |
+| 64 | churning | 1,226 (1,139–1,463) | 2,406 (2,272–11,883) | +96.3 % |
+| 256 | quiet | 1,435 (1,406–1,481) | 11,751 (11,297–17,360) | +719.1 % |
+| 256 | churning | 2,540 (2,524–2,743) | 13,025 (12,620–16,716) | +412.7 % |
+
+A build of it without that pass read 1,512 ns at 256 members quiet: the pass was all of it, about 40 ns a peer, a
+membership lookup and a judgement each. A profile (`sample`, ten seconds of 16 members quiet) then showed what was left
+after the extremes were kept: each acknowledgement restates its sender's relay bound, which states `G` and so moves at
+nearly every answer, and each restatement had judged the pair afresh and read the pool's estimates.
+
+**The head** (`e616da0`): the extremes kept as each pair's judgement changes, a restatement taking its relay due from
+the pair's span as last judged, and `G`, the pool's mean and loss counts and each peer's liveness kept where they
+change. The same rotation, 2026-10-10 at 16:24–16:34 PDT, load 91.8 falling to 10.6:
+
+| Members | Workload | `main` | Head | Against `main` |
+|---|---|---|---|---|
+| 16 | quiet | 514 (451–953) | 544 (533–622) | +5.9 % |
+| 16 | churning | 844 (805–1,169) | 882 (772–1,387) | +4.5 % |
+| 64 | quiet | 811 (676–3,523) | 781 (697–1,197) | −3.7 % |
+| 64 | churning | 1,372 (1,146–1,798) | 1,276 (1,224–1,849) | −6.9 % |
+| 256 | quiet | 1,400 (1,275–1,436) | 1,197 (1,106–1,276) | −14.5 % |
+| 256 | churning | 1,701 (1,630–2,860) | 1,812 (1,765–2,707) | +6.5 % |
+
+Within the spread at every point, from −14.5 to +6.5 %: the period does what `main`'s did, its relay stage and
+timers included, at `main`'s cost.
+
 ## The cluster test
 
 `tests/cluster.rs`, four member processes over hyper-datagram on loopback UDP, each run a fresh

@@ -12,7 +12,7 @@
 //!
 //! The far-link runs (`docs/timing.md` §2.7, "A pair the pool does not fit") put some members 100 ms one way from the rest
 //! ([`Shape`]), each pair joined with its handshake's round trip as slates' daemons join: a pair the
-//! pooled verdict does not fit is never judged by it, is judged provisionally until its own
+//! pooled verdict does not fit is never judged by it, is judged by its own timer until its own
 //! estimator configures, and a member that dies before any far pair configured is still condemned
 //! by every survivor within the bound its detector stated.
 #![allow(
@@ -39,14 +39,12 @@ use hyper_sim::{
 };
 use hyper_swim::HostId;
 use hyper_swim::codec::{Coordinate, GossipBatch, SwimMessage, gossip_capacity};
-use hyper_swim::detector::{Detector, PingReq, Verdict};
+use hyper_swim::detector::{Detector, Judge, PingReq};
 use hyper_swim::membership::{Liveness, MemberState};
 use hyper_timing::Exposure;
 
 /// Members in the LAN cluster.
 const NODES: u32 = 5;
-/// The member killed in the LAN cluster.
-const VICTIM: u32 = NODES - 1;
 /// The path's datagram size: QUIC's minimum, which every path carries (RFC 9000 §14.1).
 const DATAGRAM: usize = 1_200;
 /// RFC 5905's frequency tolerance, the most a member's clock runs fast or slow (§7.2).
@@ -65,20 +63,39 @@ const FAR_JITTER_NS: u64 = 100_000;
 /// How long the far-link runs watch the live cluster: slates' repro's 30 s.
 const WATCHED_NS: u64 = 30_000_000_000;
 
-/// A cluster's topology: its members, which of them sit across the far path from the rest, and the
-/// steps its run may take.
+/// A cluster's topology: its members, which of them sit across the far path from the rest, which
+/// pairs besides run over it, the steps its run may take, the detection budget its members'
+/// owners state (zero for none), and whether the owners seed each detector with an hourly fleet's
+/// failure history.
 #[derive(Clone, Copy, Debug)]
 struct Shape {
     nodes: u32,
     far: &'static [u32],
+    far_pairs: &'static [(u32, u32)],
     steps: u64,
+    budget: Duration,
+    hourly: bool,
+}
+
+/// A fleet whose nodes fail once an hour, as `docs/timing.md` §3 item 11 seeds one: a thousand
+/// failures over a thousand hours of node time.
+fn hourly_fleet() -> Exposure {
+    let mut history = Exposure::new();
+    history.on_exposure(Duration::from_secs(3_600 * 1_000));
+    for _ in 0..1_000 {
+        history.on_failure();
+    }
+    history
 }
 
 /// The LAN cluster every member of which is one switch from the others.
 const LAN_CLUSTER: Shape = Shape {
     nodes: NODES,
     far: &[],
+    far_pairs: &[],
     steps: STEPS,
+    budget: Duration::ZERO,
+    hourly: false,
 };
 
 /// slates' far-link repro: two near members, four 100 ms one way from them. Its steps: four times the
@@ -86,7 +103,10 @@ const LAN_CLUSTER: Shape = Shape {
 const FAR_LINK: Shape = Shape {
     nodes: 6,
     far: &[2, 3, 4, 5],
+    far_pairs: &[],
     steps: 4 * FAR_STEPS_TAKEN,
+    budget: Duration::ZERO,
+    hourly: false,
 };
 
 /// The most steps a named seed's far-link or all-far run took: 26,058, seed 43's far-link run until
@@ -98,13 +118,18 @@ const FAR_STEPS_TAKEN: u64 = 26_058;
 const ALL_FAR: Shape = Shape {
     nodes: 3,
     far: &[2],
+    far_pairs: &[],
     steps: 4 * FAR_STEPS_TAKEN,
+    budget: Duration::ZERO,
+    hourly: false,
 };
 
 impl Shape {
     /// Whether the pair `(a, b)` crosses the far path.
     fn crosses(&self, a: u32, b: u32) -> bool {
         self.far.contains(&a) != self.far.contains(&b)
+            || self.far_pairs.contains(&(a, b))
+            || self.far_pairs.contains(&(b, a))
     }
 
     /// The pair's one-way delay before jitter: the LAN's, plus the far path's where it crosses it.
@@ -147,12 +172,8 @@ impl Shape {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Ev {
     Arrive(Ticket),
-}
-
-/// Whether `verdict` is a misfit pair's provisional one: it promises no bound (`mistake` 1, the
-/// detector's `misfit_verdict`).
-fn is_provisional(verdict: &Verdict) -> bool {
-    verdict.mistake >= 1.0
+    /// A stalled member runs again ([`Sim::stall`]).
+    Thaw,
 }
 
 fn host(node: NodeId) -> HostId {
@@ -171,6 +192,21 @@ struct Noted {
     within: Option<Duration>,
     /// When the member came to hold it dead, on its own clock.
     at_ns: u64,
+    /// The incarnation it died at, which names the death: only a state at a higher one, a
+    /// refutation, ends it. A record forgotten and adopted again from a member the death had not
+    /// reached, at the incarnation it died at or below, is the same death.
+    incarnation: u64,
+}
+
+/// A probe a member relays for another (SWIM's indirect probe): its own nonce, who asked and with
+/// which nonce, the deadline its detector stated for it, and whether it has nacked.
+#[derive(Clone, Copy, Debug)]
+struct Relaying {
+    relayed: u64,
+    asker: HostId,
+    asked: u64,
+    due: u64,
+    nacked: bool,
 }
 
 /// One member's driver, as the cluster test's: its detector and the probes it relays.
@@ -181,15 +217,23 @@ struct Member {
     requests: Vec<PingReq>,
     batch: Vec<(HostId, MemberState)>,
     encoded: Vec<u8>,
-    /// The probes this member relays: the target, the relay's nonce, who asked and with which nonce.
-    relaying: BTreeMap<u64, (u64, HostId, u64)>,
+    /// The probes this member relays, by asker and target: one an asker and target, so bounded by
+    /// the membership's square. Keyed by target alone, a second asker's request about a target took
+    /// the first's place, and the first, owed a nack, waited out its whole relay stage.
+    relaying: BTreeMap<(u64, u64), Relaying>,
     /// Each peer's death as this member came to hold it.
     deaths: BTreeMap<u64, Noted>,
-    /// The peers this member has judged by a provisional verdict (`mistake` 1, before the pair's own
+    /// The peers this member has judged by their timer's verdict (`mistake` 1, before the pair's own
     /// estimator configured), as polled.
-    provisional: std::collections::BTreeSet<u64>,
+    timed: std::collections::BTreeSet<u64>,
+    /// Every probe this member sent, on its own clock, whether the verdict that judged it rests its
+    /// period at the floor (the pair's own or the pool's), and its target.
+    pings: Vec<(u64, bool, HostId)>,
     nodes: u32,
     alive: bool,
+    /// While its process is stalled ([`Sim::stall`]): the datagrams that reached it meanwhile, each
+    /// with its arrival on the member's clock, as a kernel receive stamp gives it.
+    stalled: Option<Vec<(Vec<u8>, u64)>>,
 }
 
 struct Sim {
@@ -210,10 +254,20 @@ impl Member {
     fn new(me: NodeId, shape: Shape) -> Self {
         let members = NonZeroUsize::new(shape.nodes as usize).unwrap();
         // The world's clocks read whole nanoseconds.
-        let mut detector =
-            Detector::new(host(me), Exposure::new(), members, Duration::from_nanos(1));
+        let history = if shape.hourly {
+            hourly_fleet()
+        } else {
+            Exposure::new()
+        };
+        let mut detector = Detector::new(
+            host(me),
+            history,
+            members,
+            Duration::from_nanos(1),
+            shape.budget,
+        );
         for peer in (0..shape.nodes).map(NodeId).filter(|peer| *peer != me) {
-            if shape.far.is_empty() {
+            if shape.far.is_empty() && shape.far_pairs.is_empty() {
                 detector.join(host(peer)).unwrap();
             } else {
                 // As slates' daemons join: with the round trip the keying handshake measured.
@@ -232,9 +286,11 @@ impl Member {
             encoded: Vec::new(),
             relaying: BTreeMap::new(),
             deaths: BTreeMap::new(),
-            provisional: std::collections::BTreeSet::new(),
+            timed: std::collections::BTreeSet::new(),
+            pings: Vec::new(),
             nodes: shape.nodes,
             alive: true,
+            stalled: None,
         };
         member.gossip = member.room(me, true);
         member.view_room = member.room(me, false);
@@ -252,6 +308,8 @@ impl Member {
                 boot_nonce: u64::from(me.0),
                 configuration_version: 0,
                 standing: None,
+                promise_ns: 0,
+                relay_within_ns: u64::MAX,
                 gossip: GossipBatch::Entries(&[]),
                 coordinate: Coordinate::Held(&coordinate),
             }
@@ -282,6 +340,26 @@ impl Member {
     /// Polls the detector at `now` and queues what it asks: the relays, the probe, the view's
     /// chunks.
     fn step(&mut self, me: NodeId, now: u64, outbox: &mut Vec<(NodeId, NodeId, Vec<u8>)>) {
+        // A relayed probe unanswered by its deadline: tell its asker so (Lifeguard's nack).
+        let expired: Vec<((u64, u64), Relaying)> = self
+            .relaying
+            .iter()
+            .filter(|(_, relaying)| !relaying.nacked && relaying.due <= now)
+            .map(|(key, relaying)| (*key, *relaying))
+            .collect();
+        for (key, relaying) in expired {
+            if let Some(held) = self.relaying.get_mut(&key) {
+                held.nacked = true;
+            }
+            let message = SwimMessage::Nack {
+                from: host(me),
+                target: HostId(key.1),
+                nonce: relaying.asked,
+                boot_nonce: u64::from(me.0),
+                gossip: GossipBatch::Entries(&[]),
+            };
+            self.queue(outbox, me, relaying.asker, &message);
+        }
         let mut requests = std::mem::take(&mut self.requests);
         let ping = self.detector.poll(now, &mut requests);
         for request in &requests {
@@ -296,6 +374,12 @@ impl Member {
         self.requests = requests;
         let mut batch = std::mem::take(&mut self.batch);
         if let Some(ping) = ping {
+            let judge = self.detector.report(ping.to).map(|report| report.judge);
+            self.pings.push((
+                now,
+                matches!(judge, Some(Judge::Own | Judge::Pool)),
+                ping.to,
+            ));
             self.detector
                 .ping_gossip_into(ping.to, self.gossip, &mut batch);
             let message = SwimMessage::Ping {
@@ -346,6 +430,8 @@ impl Member {
                     boot_nonce: u64::from(me.0),
                     configuration_version: 0,
                     standing: None,
+                    promise_ns: 0,
+                    relay_within_ns: ack.relay_within_ns,
                     gossip: GossipBatch::Entries(&batch),
                     coordinate: Coordinate::Held(&coordinate),
                 };
@@ -355,25 +441,32 @@ impl Member {
             SwimMessage::Ack {
                 from,
                 nonce,
+                relay_within_ns,
                 gossip,
                 coordinate,
                 ..
             } => {
                 self.detector.apply_gossip(gossip);
                 self.detector.learn_coordinate(from, coordinate);
-                match self.relaying.get(&from.0) {
-                    Some(&(relayed, asker, asked)) if relayed == nonce => {
-                        self.relaying.remove(&from.0);
+                let relayed = self
+                    .relaying
+                    .iter()
+                    .find(|((_, target), relaying)| *target == from.0 && relaying.relayed == nonce)
+                    .map(|(key, relaying)| (*key, *relaying));
+                match relayed {
+                    // The target's answer goes back to the asker, after a nack too.
+                    Some((key, relaying)) => {
+                        self.relaying.remove(&key);
                         let message = SwimMessage::IndirectAck {
                             from: host(me),
                             target: from,
-                            nonce: asked,
+                            nonce: relaying.asked,
                             boot_nonce: u64::from(me.0),
                             gossip: GossipBatch::Entries(&[]),
                         };
-                        self.queue(outbox, me, asker, &message);
+                        self.queue(outbox, me, relaying.asker, &message);
                     }
-                    _ => self.detector.on_ack(from, nonce, stamp),
+                    None => self.detector.on_ack(from, nonce, stamp, relay_within_ns),
                 }
             }
             SwimMessage::PingReq {
@@ -383,8 +476,17 @@ impl Member {
                 gossip,
             } => {
                 self.detector.apply_gossip(gossip);
-                let ping = self.detector.on_ping_req(target);
-                self.relaying.insert(target.0, (ping.nonce, from, nonce));
+                let ping = self.detector.on_ping_req(from, target, stamp);
+                self.relaying.insert(
+                    (from.0, target.0),
+                    Relaying {
+                        relayed: ping.nonce,
+                        asker: from,
+                        asked: nonce,
+                        due: ping.due_ns,
+                        nacked: false,
+                    },
+                );
                 let message = SwimMessage::Ping {
                     from: host(me),
                     nonce: ping.nonce,
@@ -412,6 +514,31 @@ impl Member {
                 self.detector.apply_gossip(gossip);
                 self.detector.on_indirect_ack(target, nonce, stamp);
             }
+            SwimMessage::Nack {
+                from,
+                target,
+                nonce,
+                gossip,
+                ..
+            } => {
+                self.detector.apply_gossip(gossip);
+                self.detector.on_indirect_nack(from, target, nonce, stamp);
+            }
+        }
+    }
+
+    /// When this member must run next: its detector's wake, or the deadline of a probe it relays
+    /// that has not nacked.
+    fn wake(&self) -> Option<u64> {
+        let relayed = self
+            .relaying
+            .values()
+            .filter(|relaying| !relaying.nacked)
+            .map(|relaying| relaying.due)
+            .min();
+        match (self.detector.wake(), relayed) {
+            (Some(own), Some(relayed)) => Some(own.min(relayed)),
+            (own, relayed) => own.or(relayed),
         }
     }
 
@@ -420,19 +547,15 @@ impl Member {
         for peer in (0..self.nodes).map(NodeId).filter(|peer| *peer != me) {
             if self
                 .detector
-                .verdict(host(peer))
-                .is_some_and(|verdict| is_provisional(&verdict))
+                .report(host(peer))
+                .is_some_and(|report| report.judge == Judge::Timer)
             {
-                self.provisional.insert(host(peer).0);
+                self.timed.insert(host(peer).0);
             }
-            let held = self
-                .detector
-                .membership()
-                .state(host(peer))
-                .map(|state| state.liveness);
+            let state = self.detector.membership().state(host(peer));
             let id = host(peer).0;
-            match held {
-                Some(Liveness::Dead) if !self.deaths.contains_key(&id) => {
+            match state.map(|state| (state.liveness, state.incarnation)) {
+                Some((Liveness::Dead, incarnation)) if !self.deaths.contains_key(&id) => {
                     let report = self.detector.report(host(peer)).unwrap_or_default();
                     let since = |at: Option<u64>| {
                         Duration::from_nanos(at.map_or(0, |at| now.saturating_sub(at)))
@@ -445,10 +568,16 @@ impl Member {
                             after: since(report.last_answer_ns),
                             within: bound.map(|bound| bound.saturating_add(waited)),
                             at_ns: now,
+                            incarnation,
                         },
                     );
                 }
-                Some(Liveness::Alive | Liveness::Suspect) => {
+                Some((Liveness::Alive | Liveness::Suspect, incarnation))
+                    if self
+                        .deaths
+                        .get(&id)
+                        .is_some_and(|noted| incarnation > noted.incarnation) =>
+                {
                     self.deaths.remove(&id);
                 }
                 _ => {}
@@ -519,7 +648,7 @@ impl Sim {
         let member = &mut self.members[node.0 as usize];
         member.step(node, now, &mut self.outbox);
         member.note_deaths(node, now);
-        let wake = member.detector.wake();
+        let wake = member.wake();
         self.world.wake(node, wake).unwrap();
         self.flush();
     }
@@ -554,10 +683,15 @@ impl Sim {
                 .map_err(|refusal| refusal.to_string())?
             {
                 Step::Wake { node } => {
-                    if self.members[node.0 as usize].alive {
+                    let member = &self.members[node.0 as usize];
+                    if member.alive && member.stalled.is_none() {
                         self.step(node);
                     }
                 }
+                Step::Event {
+                    node,
+                    event: Ev::Thaw,
+                } => self.thaw(node),
                 Step::Event {
                     node,
                     event: Ev::Arrive(ticket),
@@ -574,6 +708,10 @@ impl Sim {
                             .monotonic(node)
                             .map_err(|refusal| refusal.to_string())?;
                         let member = &mut self.members[node.0 as usize];
+                        if let Some(held) = member.stalled.as_mut() {
+                            held.push((delivery.payload, stamp));
+                            continue;
+                        }
                         if let Ok(message) = SwimMessage::decode(&delivery.payload) {
                             member.handle(node, message, stamp, &mut self.outbox);
                         }
@@ -587,13 +725,21 @@ impl Sim {
         Ok(())
     }
 
-    /// Whether every live member judges every live peer by a verdict, the pair's own or the
-    /// pool's.
+    /// Whether every live member judges every live peer by an estimator's verdict, the pair's own
+    /// or the pool's, not the pair's timer.
     fn every_pair_judged(&self) -> bool {
         self.live().all(|(me, member)| {
             self.live()
                 .filter(|(peer, _)| *peer != me)
-                .all(|(peer, _)| member.detector.verdict(host(peer)).is_some())
+                .all(|(peer, _)| {
+                    matches!(
+                        member
+                            .detector
+                            .report(host(peer))
+                            .map(|report| report.judge),
+                        Some(Judge::Own | Judge::Pool)
+                    )
+                })
         })
     }
 
@@ -620,6 +766,51 @@ impl Sim {
         })
     }
 
+    /// Stalls `node`'s process for `for_ns` of the world's time, as a host stalls a process
+    /// (`docs/timing.md` §2.6): its timer does not fire and the datagrams that reach it wait, each
+    /// stamped on arrival; at the thaw it handles them in order, then polls.
+    fn stall(&mut self, node: NodeId, for_ns: u64) {
+        self.stop(node);
+        self.world.after(for_ns, node, Ev::Thaw).unwrap();
+    }
+
+    /// Stops `node`'s process, as `SIGSTOP` does, until [`Sim::thaw`]: a stall of no stated
+    /// length.
+    fn stop(&mut self, node: NodeId) {
+        self.members[node.0 as usize].stalled = Some(Vec::new());
+        self.world.wake(node, None).unwrap();
+    }
+
+    /// Runs `node`'s stalled process again: it handles what reached it meanwhile, in order, then
+    /// polls. Nothing for a member not stalled.
+    fn thaw(&mut self, node: NodeId) {
+        let Some(held) = self.members[node.0 as usize].stalled.take() else {
+            return;
+        };
+        for (payload, stamp) in held {
+            let member = &mut self.members[node.0 as usize];
+            if let Ok(message) = SwimMessage::decode(&payload) {
+                member.handle(node, message, stamp, &mut self.outbox);
+            }
+        }
+        if self.members[node.0 as usize].alive {
+            self.step(node);
+        }
+    }
+
+    /// Whether every live member but `subject` holds it in `liveness` (dead: as noted).
+    fn held_by_the_others(&self, subject: NodeId, liveness: Liveness) -> bool {
+        self.live()
+            .filter(|(me, _)| *me != subject)
+            .all(|(_, member)| {
+                member
+                    .detector
+                    .membership()
+                    .state(host(subject))
+                    .is_some_and(|state| state.liveness == liveness)
+            })
+    }
+
     fn kill(&mut self, victim: NodeId) {
         self.members[victim.0 as usize].alive = false;
         self.world.wake(victim, None).unwrap();
@@ -643,13 +834,26 @@ fn run(source: Source) -> Result<Record, SimError> {
     };
     let mut sim = Sim::new(source, false, LAN_CLUSTER);
     sim.run("every pair judged", Sim::every_pair_judged);
+    kill_and_hold_dead_within_bounds(sim, &seed)
+}
+
+/// Kills the cluster's last member and runs until every survivor holds it dead: each within the bound
+/// its detector stated, with the wait it measured for evidence of its own health added, and none
+/// holding a live member dead before or after. The run's record.
+fn kill_and_hold_dead_within_bounds(mut sim: Sim, seed: &str) -> Result<Record, SimError> {
+    kill_and_check(&mut sim, seed);
+    Ok(sim.world.finish())
+}
+
+/// [`kill_and_hold_dead_within_bounds`]'s kill and checks, the run going on after: the victim.
+fn kill_and_check(sim: &mut Sim, seed: &str) -> NodeId {
     for (me, member) in sim.live() {
         assert!(
             member.deaths.is_empty(),
             "{seed}: member {me:?} holds a live member dead"
         );
     }
-    let victim = NodeId(VICTIM);
+    let victim = NodeId(sim.shape.nodes - 1);
     sim.kill(victim);
     sim.run("the victim held dead by every survivor", |sim| {
         sim.held_dead(victim)
@@ -679,8 +883,8 @@ fn run(source: Source) -> Result<Record, SimError> {
         );
         noted.push((me.0, death));
     }
-    assert_eq!(noted.len(), (NODES - 1) as usize);
-    Ok(sim.world.finish())
+    assert_eq!(noted.len(), (sim.shape.nodes - 1) as usize);
+    victim
 }
 
 #[test]
@@ -689,6 +893,280 @@ fn a_killed_member_is_held_dead_by_every_survivor_within_its_bound_and_no_live_o
     // its trace, to one digest.
     for seed in 0..16 {
         twice(seed, run).unwrap_or_else(|refusal| panic!("seed {seed}: {refusal}"));
+    }
+}
+
+/// slates' detection budget, its membership horizon (slates `lease::horizon_ns`, A-125): the budget
+/// the first owner to state one states.
+const SLATES_BUDGET_NS: u64 = 900_000_000;
+
+/// The LAN cluster, each member's owner stating slates' detection budget.
+const BUDGETED_LAN: Shape = Shape {
+    budget: Duration::from_nanos(SLATES_BUDGET_NS),
+    ..LAN_CLUSTER
+};
+
+/// One run from `source` of the LAN cluster under slates' detection budget: every pair judged by a
+/// verdict that rests its period (the pair's own or the pool's), then one budget's time, then the
+/// LAN run's kill and checks. Through the budget's time, each member's probe judged so is followed
+/// by its next no sooner than the floor `D / (2(2m − 1) + 1)` on the member's own clock, `m` the
+/// four peers its rounds hold.
+fn budgeted(source: Source) -> Result<Record, SimError> {
+    let seed = match &source {
+        Source::Seed(seed) => format!("seed {seed}"),
+        Source::Trace(_) => "the trace".to_owned(),
+    };
+    let mut sim = Sim::new(source, false, BUDGETED_LAN);
+    sim.run("every pair judged at the floor", Sim::every_pair_judged);
+    let budget = SLATES_BUDGET_NS;
+    let floor = budget / (2 * (2 * u64::from(NODES - 1) - 1) + 1);
+    let from: Vec<usize> = sim
+        .members
+        .iter()
+        .map(|member| member.pings.len())
+        .collect();
+    let until = sim.now() + budget;
+    sim.run("one budget's time", |sim| sim.now() >= until);
+    for (me, member) in sim.live() {
+        let pings = &member.pings[from[me.0 as usize]..];
+        assert!(pings.len() > 1, "{seed}: member {me:?} probed");
+        for pair in pings.windows(2) {
+            let ((sent, rests, _), (next, _, _)) = (pair[0], pair[1]);
+            assert!(
+                !rests || next - sent >= floor,
+                "{seed}: member {me:?} probed {} ns after a probe judged at the floor, {floor} ns",
+                next - sent
+            );
+        }
+    }
+    kill_and_hold_dead_within_bounds(sim, &seed)
+}
+
+/// An owner's detection budget floors each judged period at the budget's share of one period
+/// (slates' A-125, `docs/timing.md` §2.7): an idle member probes no faster than detection within
+/// the budget needs, and a killed member is still held dead within every survivor's stated bound.
+/// Before the floor (the budget taken and unused), a member probed a few hundred microseconds after
+/// its last probe on every seed.
+#[test]
+fn a_member_under_a_detection_budget_probes_no_faster_than_its_floor() {
+    for seed in 0..16 {
+        twice(seed, budgeted).unwrap_or_else(|refusal| panic!("seed {seed}: {refusal}"));
+    }
+}
+
+/// The LAN cluster, each member's owner seeding its detector with an hourly fleet's history.
+const HOURLY_LAN: Shape = Shape {
+    hourly: true,
+    ..LAN_CLUSTER
+};
+
+/// One run from `source` of the LAN cluster seeded with an hourly fleet's history: once every pair
+/// is judged by a verdict that rests (the pool's or its own), every verdict's margin is past its
+/// interval, where `U` falls (an hour's MTBF against round trips of about half a millisecond); then
+/// the LAN run's kill and checks.
+fn hourly(source: Source) -> Result<Record, SimError> {
+    let seed = match &source {
+        Source::Seed(seed) => format!("seed {seed}"),
+        Source::Trace(_) => "the trace".to_owned(),
+    };
+    let mut sim = Sim::new(source, false, HOURLY_LAN);
+    sim.run("every pair judged", Sim::every_pair_judged);
+    for (me, member) in sim.live() {
+        for (peer, _) in sim.live().filter(|(peer, _)| *peer != me) {
+            let verdict = member.detector.verdict(host(peer));
+            assert!(
+                verdict.is_some_and(|verdict| verdict.margin > verdict.interval),
+                "{seed}: member {me:?} judges {peer:?} by {verdict:?}, its margin under its interval"
+            );
+        }
+    }
+    kill_and_hold_dead_within_bounds(sim, &seed)
+}
+
+/// A verdict's margin is searched over every margin, not only below the pair's interval: a pair's
+/// probes never overlap, so the one-probe bound holds at any margin (`docs/timing.md` §2.7, "The
+/// margin"). Before, the margin was held under `η − G` to keep Theorem 7's product to one factor,
+/// and a member seeded with an hourly fleet judged its peers with margins under their interval on
+/// every seed (slates saw that cap hold a verdict at a mistake bound of 0.713).
+#[test]
+fn a_verdict_s_margin_reaches_past_its_interval_where_unavailability_falls() {
+    for seed in 0..16 {
+        twice(seed, hourly).unwrap_or_else(|refusal| panic!("seed {seed}: {refusal}"));
+    }
+}
+
+/// slates' fleet's three members on the LAN.
+const THREE: Shape = Shape {
+    nodes: 3,
+    ..LAN_CLUSTER
+};
+
+/// How long a stall holds a member's process: the shortest correlation time the heartbeat traces
+/// measured, 20 ms (`docs/timing.md` §2.6, item 6: 20 to 250 ms), past the few round trips three
+/// later probes of the stalled member take.
+const STALL_NS: u64 = 20_000_000;
+
+/// One run from `source` of three members whose first two each stall once before any pool
+/// configures, one after the other (slates' fleet at load 80, 2026-10-10): the member that stalls
+/// neither then has every pair of its own made late once, each answer found its record reused.
+/// Every member's pool configures, and then the LAN run's kill and checks.
+fn stalled_early(source: Source) -> Result<Record, SimError> {
+    let seed = match &source {
+        Source::Seed(seed) => format!("seed {seed}"),
+        Source::Trace(_) => "the trace".to_owned(),
+    };
+    let mut sim = Sim::new(source, false, THREE);
+    let every_pair_answered = |sim: &Sim| {
+        sim.live().all(|(me, member)| {
+            sim.live().filter(|(peer, _)| *peer != me).all(|(peer, _)| {
+                member
+                    .detector
+                    .report(host(peer))
+                    .is_some_and(|report| report.last_answer_ns.is_some())
+            })
+        })
+    };
+    sim.run("every pair answered", every_pair_answered);
+    for stalled in [NodeId(1), NodeId(2)] {
+        assert!(
+            sim.live()
+                .all(|(_, member)| member.detector.pool().verdict.is_none()),
+            "{seed}: a pool configured before the stalls"
+        );
+        sim.stall(stalled, STALL_NS);
+        sim.run("the stall over", |sim| {
+            sim.members[stalled.0 as usize].stalled.is_none()
+        });
+    }
+    sim.run("every member's pool configured", |sim| {
+        sim.live()
+            .all(|(_, member)| member.detector.pool().verdict.is_some())
+    });
+    kill_and_hold_dead_within_bounds(sim, &seed)
+}
+
+/// A pair one stall made late feeds its member's pool again from its next answer in time
+/// (`docs/timing.md` §2.7, "A pair the pool does not fit"). Before, each answer that found its
+/// record reused marked its pair a misfit for good: member 0, both of whose peers stalled once,
+/// fed its pool from neither again, and it never configured on any seed (slates: a pool at 5 round
+/// trips and a silent peer judged by nothing for 4,000 periods).
+#[test]
+fn a_pool_fed_by_pairs_a_stall_made_late_configures() {
+    for seed in 0..16 {
+        twice(seed, stalled_early).unwrap_or_else(|refusal| panic!("seed {seed}: {refusal}"));
+    }
+}
+
+/// One run from `source` of the LAN cluster in which member 1's process stops until every other
+/// member has condemned it, then runs again and refutes its death: no member counts that death a
+/// failure, so none prices its margins with an MTBF the false death shortened. Then the LAN run's
+/// kill and checks, and on until every survivor forgets the victim, its death having stood: each
+/// counts exactly that one failure.
+fn stopped_and_refuted(source: Source) -> Result<Record, SimError> {
+    let seed = match &source {
+        Source::Seed(seed) => format!("seed {seed}"),
+        Source::Trace(_) => "the trace".to_owned(),
+    };
+    let mut sim = Sim::new(source, false, LAN_CLUSTER);
+    sim.run("every pair judged", Sim::every_pair_judged);
+    let stopped = NodeId(1);
+    sim.stop(stopped);
+    sim.run("the stopped member condemned by every other", |sim| {
+        sim.held_by_the_others(stopped, Liveness::Dead)
+    });
+    sim.thaw(stopped);
+    sim.run("the stopped member alive again in every view", |sim| {
+        sim.held_by_the_others(stopped, Liveness::Alive)
+    });
+    for (me, member) in sim.live() {
+        assert_eq!(
+            member.detector.exposure().failures(),
+            0,
+            "{seed}: member {me:?} counts a death that was refuted"
+        );
+    }
+    let victim = kill_and_check(&mut sim, &seed);
+    sim.run("the victim forgotten by every survivor", |sim| {
+        sim.live()
+            .all(|(_, member)| member.detector.membership().state(host(victim)).is_none())
+    });
+    for (me, member) in sim.live() {
+        assert_eq!(
+            member.detector.exposure().failures(),
+            1,
+            "{seed}: member {me:?} counts the death that stood"
+        );
+    }
+    Ok(sim.world.finish())
+}
+
+/// One run from `source` of three members whose two peers of member 0 both die once every pair has
+/// answered once, before any pool configures: member 0, its pool fed by nothing more, suspects
+/// both, each by its pair's timer, and condemns neither
+/// (it has no live member's answer to show its own network works).
+fn every_peer_dead_early(source: Source) -> Result<Record, SimError> {
+    let seed = match &source {
+        Source::Seed(seed) => format!("seed {seed}"),
+        Source::Trace(_) => "the trace".to_owned(),
+    };
+    let mut sim = Sim::new(source, false, THREE);
+    sim.run("every pair answered", |sim| {
+        sim.live().all(|(me, member)| {
+            sim.live().filter(|(peer, _)| *peer != me).all(|(peer, _)| {
+                member
+                    .detector
+                    .report(host(peer))
+                    .is_some_and(|report| report.last_answer_ns.is_some())
+            })
+        })
+    });
+    assert!(
+        sim.members[0].detector.pool().verdict.is_none(),
+        "{seed}: member 0's pool configured before the deaths"
+    );
+    sim.kill(NodeId(1));
+    sim.kill(NodeId(2));
+    let suspected = |sim: &Sim, peer: u32| {
+        sim.members[0]
+            .detector
+            .membership()
+            .state(host(NodeId(peer)))
+            .is_some_and(|state| state.liveness == Liveness::Suspect)
+    };
+    sim.run("member 0 suspecting both", |sim| {
+        suspected(sim, 1) && suspected(sim, 2)
+    });
+    for peer in [1, 2] {
+        let report = sim.members[0].detector.report(host(NodeId(peer)));
+        assert!(
+            report.is_some_and(|report| report.judge == Judge::Timer && report.condemnations == 0),
+            "{seed}: member 0 suspects {peer} by its timer and condemns it not: {report:?}"
+        );
+    }
+    Ok(sim.world.finish())
+}
+
+/// A member whose every peer dies before its pool configures still judges them (`docs/timing.md`
+/// §2.7, "Before a pair's own estimator configures"): every probe is judged, by its pair's timer
+/// where no estimator judges it. Before, nothing judged them: member 0's probes stayed measurement
+/// only, and the world ran out of steps on every seed with both peers alive in its view.
+#[test]
+fn a_member_whose_peers_all_die_early_suspects_them() {
+    for seed in 0..16 {
+        twice(seed, every_peer_dead_early)
+            .unwrap_or_else(|refusal| panic!("seed {seed}: {refusal}"));
+    }
+}
+
+/// A false condemnation is no failure (`docs/timing.md` §2.7, "The margin"): a death counts in a
+/// member's failure history once its record outlives its window unrefuted. Before, every adopted
+/// death counted, the refuted ones too, so each false condemnation shortened the MTBF the margins
+/// are priced with: every member that condemned the stopped member counted one failure on every
+/// seed, and smaller margins buy more false condemnations.
+#[test]
+fn a_refuted_death_is_no_failure() {
+    for seed in 0..16 {
+        twice(seed, stopped_and_refuted).unwrap_or_else(|refusal| panic!("seed {seed}: {refusal}"));
     }
 }
 
@@ -738,13 +1216,13 @@ fn condemned_live(sim: &Sim) -> Vec<(u32, u32, u64)> {
 
 /// slates' far-link repro on the simulated network: two near members, four 100 ms one way from
 /// them, the path lossless with 100 µs of jitter, watched 30 s. No member condemns a live one, and
-/// every far pair has left provisional judgement for its own estimator's verdict by the end.
+/// every far pair has left its timer's judgement for its own estimator's verdict by the end.
 fn far_link(source: Source) -> Result<Record, SimError> {
     let mut sim = Sim::new(source, false, FAR_LINK);
     sim.run("30 s watched", |sim| sim.now() >= WATCHED_NS);
     no_live_member_condemned(&sim, "in 30 s");
     // Then on until every far pair's own estimator has configured: from then each is judged by its
-    // own verdict, not the provisional one.
+    // own verdict, not its timer's.
     sim.run("every far pair configured", Sim::every_far_pair_configured);
     no_live_member_condemned(&sim, "once every far pair configured");
     for (me, member) in sim.live() {
@@ -752,14 +1230,18 @@ fn far_link(source: Source) -> Result<Record, SimError> {
             .live()
             .filter(|(peer, _)| sim.shape.crosses(me.0, peer.0))
         {
-            let verdict = member.detector.verdict(host(peer));
+            let judge = member
+                .detector
+                .report(host(peer))
+                .map(|report| report.judge);
             assert!(
-                member.provisional.contains(&host(peer).0),
-                "member {me:?} judged far peer {peer:?} provisionally before its own estimator configured"
+                member.timed.contains(&host(peer).0),
+                "member {me:?} judged far peer {peer:?} by its timer before its own estimator configured"
             );
-            assert!(
-                verdict.is_some_and(|verdict| !is_provisional(&verdict)),
-                "member {me:?} judges configured far peer {peer:?} by its own verdict: {verdict:?}"
+            assert_eq!(
+                judge,
+                Some(Judge::Own),
+                "member {me:?} judges configured far peer {peer:?} by its own verdict"
             );
         }
     }
@@ -782,7 +1264,7 @@ fn no_live_member_condemned(sim: &Sim, when: &str) {
 }
 
 /// slates' repro (`no_live_member_is_condemned_across_a_lossless_far_link`), deterministic: every
-/// named seed condemns no live member, and every far pair moves from provisional judgement to its
+/// named seed condemns no live member, and every far pair moves from its timer's judgement to its
 /// own verdict. Each seed through the run-twice check.
 #[test]
 fn no_live_member_is_condemned_across_a_lossless_far_link() {
@@ -792,7 +1274,7 @@ fn no_live_member_is_condemned_across_a_lossless_far_link() {
 }
 
 /// Two near members and one far one, the far one killed from the start: neither survivor ever
-/// measures it, so neither pair has its own verdict, and each is judged provisionally. Every
+/// measures it, so neither pair has its own verdict, and each is judged by its timer. Every
 /// survivor holds it dead, by its own probes, within the bound its detector stated, counted from
 /// the kill: a member that never answered has no last answer to count from.
 fn all_far_kill(source: Source) -> Result<Record, SimError> {
@@ -819,8 +1301,8 @@ fn all_far_kill(source: Source) -> Result<Record, SimError> {
             "member {me:?} held the far member dead {after:?} after the kill, past its stated bound {within:?}"
         );
         assert!(
-            member.provisional.contains(&host(victim).0),
-            "member {me:?} judged the never-measured far member provisionally"
+            member.timed.contains(&host(victim).0),
+            "member {me:?} judged the never-measured far member by its timer"
         );
         assert!(
             member
@@ -841,6 +1323,80 @@ fn all_far_kill(source: Source) -> Result<Record, SimError> {
         "live members condemned: {condemned:?}"
     );
     Ok(sim.world.finish())
+}
+
+/// Three members, the pair of members 1 and 2 over the far path, 100 ms one way: slates' fleet at
+/// load 100, a member reachable only through a relay whose own way to it is slower than the asker's
+/// direct way was.
+const SLOW_RELAY: Shape = Shape {
+    nodes: 3,
+    far: &[],
+    far_pairs: &[(1, 2)],
+    steps: 4 * FAR_STEPS_TAKEN,
+    budget: Duration::ZERO,
+    hourly: false,
+};
+
+/// The probes of the member it reaches only through a relay that the asker sends while the run is
+/// watched: ten times the two, a suspicion and its told probe, that condemned it before.
+const RELAYED_PROBES: usize = 20;
+
+/// One run from `source` of [`SLOW_RELAY`]: once every pair is judged, member 0 loses its direct
+/// path to member 1 both ways, and reaches it only through member 2, over member 2's far path to it;
+/// member 1 reaches member 0 only through member 2 as well. Until member 0 has probed member 1
+/// [`RELAYED_PROBES`] times since, no member condemns a live one.
+fn relayed_only(source: Source) -> Result<Record, SimError> {
+    let seed = match &source {
+        Source::Seed(seed) => format!("seed {seed}"),
+        Source::Trace(_) => "the trace".to_owned(),
+    };
+    let mut sim = Sim::new(source, false, SLOW_RELAY);
+    sim.run("every pair judged", Sim::every_pair_judged);
+    let (asker, target) = (NodeId(0), NodeId(1));
+    sim.net.partition(asker, target, true);
+    sim.net.partition(target, asker, true);
+    let from = sim.members[asker.0 as usize].pings.len();
+    // Any member that comes to hold a live one dead, at any step: a death refuted and forgotten
+    // later leaves no count behind.
+    let condemned = |sim: &Sim| {
+        sim.live().any(|(me, member)| {
+            sim.live().any(|(peer, _)| {
+                peer != me
+                    && member
+                        .detector
+                        .membership()
+                        .state(host(peer))
+                        .is_some_and(|state| state.liveness == Liveness::Dead)
+            })
+        })
+    };
+    sim.run("the asker probed the target through the relay", |sim| {
+        condemned(sim)
+            || sim.members[asker.0 as usize].pings[from..]
+                .iter()
+                .filter(|(_, _, to)| *to == host(target))
+                .count()
+                >= RELAYED_PROBES
+    });
+    assert!(
+        !condemned(&sim),
+        "{seed}: a member holds a live one dead {} ms in",
+        sim.now() / 1_000_000
+    );
+    Ok(sim.world.finish())
+}
+
+/// A member reachable only through a relay whose own leg to it is slow is never condemned: the
+/// relay judges its leg by its own deadline for it, and the asker waits for its response as long
+/// as the relay stated it might take (slates, 2026-10-10). When the asker timed the relay stage by
+/// its own span for the target, its direct path's from before the cut, every relayed answer came
+/// after the stage, and a member held a live one dead on all 16 seeds (on seed 0, member 0
+/// condemned member 1 150 ms after the cut).
+#[test]
+fn a_member_reachable_only_through_a_slow_relay_is_never_condemned() {
+    for seed in 0..16 {
+        twice(seed, relayed_only).unwrap_or_else(|refusal| panic!("seed {seed}: {refusal}"));
+    }
 }
 
 /// The hyper-raft review's liveness case for `swim-pair-deadline`: a member that dies before any far

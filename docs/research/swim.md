@@ -38,6 +38,21 @@ Detection", arXiv 1707.00788 (2018).**
   which only the suspected member raises (SWIM §4.2).
 - §III-B: memberlist "retains the state of failed nodes for a period of time, so that information
   about failed nodes can be passed in a full state sync".
+- §III-A, SWIM's probe as memberlist runs it (checked 2026-10-10): "If the original member does not
+  receive any ack messages from the direct or indirect probe by the end of the protocol period, the
+  probed member is considered to have failed the failure detection."
+- §IV-A, "Local Health Aware Probe" (checked 2026-10-10): "Local Health Aware Probe adds a nack
+  message to the fault detector protocol, which is sent in the case of failed indirect probes. This
+  gives the member that initiates the indirect probe a way to check if it is receiving timely
+  responses from the k members it enlists, even if the target of their indirect pings is not
+  responsive." Footnote 5: "When a member is sent a ping-req message, it will send a nack back at 80%
+  of the probe timeout unless it receives an ack by that time. An ack is still forwarded if it is
+  received after the nack has been sent, and a member receiving a nack followed by an ack within the
+  timeout period considers this as a successful indirect probe." Among the Local Health Multiplier's
+  events: "Probe with missed nack: +1". `ProbeTimeout = BaseProbeTimeout·(LHM(S) + 1)`, the base
+  500 ms in memberlist. So the relay's deadline is the one probe timeout every member is configured
+  with, which is how the asker knows when a nack is due; the nack feeds local health and does not end
+  the asker's wait, which runs to the end of the protocol period.
 - §IV-C, "Buddy System" (checked 2026-10-03): "In SWIM, a suspected member is not guaranteed to
   hear of the suspicion at the first opportunity. A suspected node only learns of the suspicion
   when it receives a gossiped suspect message about itself. [...] the rules governing the
@@ -62,6 +77,21 @@ Detection", arXiv 1707.00788 (2018).**
 - `DeadNodeReclaimTime` (0 by default, never): when a dead node's name may be taken by another
   address.
 - `retransmitLimit`: `RetransmitMult` (4) × `⌈log10(n + 1)⌉`.
+- `ProbeInterval` and `ProbeTimeout` (checked 2026-10-10): 1 s and 500 ms in the LAN configuration
+  ("Failure check every second", "Reasonable RTT time for LAN"), 5 s and 3 s WAN, 1 s and 200 ms
+  local. The field's comment: "Setting this lower (more frequent) will cause the memberlist cluster
+  to detect failed nodes more quickly at the expense of increased bandwidth usage"; the timeout's:
+  "This should be set to 99-percentile of RTT (round-trip time) on your network." The probe rate is
+  a load setting, picked once, as SWIM's protocol period is (§3.1).
+- The nack (`net.go`, `state.go`, checked 2026-10-10). A relay's `handleIndirectPing` registers the
+  handler that forwards the target's ack for `m.config.ProbeTimeout` and, where the request asked a
+  nack, starts a timer: "Setup a timer to fire off a nack if no ack is seen in time", `case
+  <-time.After(m.config.ProbeTimeout)`, cancelled by the ack ("Try to prevent the nack if we've
+  caught it in time"). The asker's `probeNode` waits for acks until `deadline :=
+  sent.Add(probeInterval)` (its probe interval scaled by its awareness), counts `expectedNacks` from
+  the peers that speak protocol version 4, and after a failed probe adds `expectedNacks − nackCount`
+  to its awareness ("Update our self-awareness based on the results of this failed probe"). The
+  relay's timeout is its own configuration's, the same constant across a fleet configured alike.
 - `PushPullInterval` (checked 2026-10-03), 30 s in the LAN configuration, 60 s WAN, 15 s local: "the
   interval between complete state syncs. Complete state syncs are done with a single node over TCP
   and are quite expensive relative to standard gossiped messages." `pushPull` picks one node at
@@ -206,6 +236,11 @@ discarded.
   expectation, can still pass a stale update; the member adopted again is then probed and condemned
   again by this member's own detector, within its detection bound. The detector's verdicts are hints
   to the owner's committed membership, never durable decisions, so the cost is probes, not safety.
+  Observed (2026-10-10): with margins searched over every margin, members that measured a stall
+  judge with wider margins and condemn later than the others, whose windows are their own periods';
+  in the simulation one such member still held a killed member suspected 30 ms after two others had
+  forgotten its death, and passed its suspicion on. The death is the same one (its member and
+  incarnation): the failure history counts it once.
 - An isolated member, with nobody alive or suspected left, keeps its records: the dead are the only
   members it probes, and a live one among them refutes in its answer (`docs/timing.md` §2.7).
 - The bound. The owner's placement says how many hosts a node can know; the view holds at most that

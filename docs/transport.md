@@ -689,6 +689,11 @@ the numbers are `docs/benchmarks.md`, "Probe timeouts, tickets and Careful Resum
   initial windows are acknowledged in a round trip (RFC 9959 §3.1's floor), so a later burst starts
   from Careful Resume's jump rather than the initial window; the jump is taken only where it beats
   slow start (`crates/hyper-quic/VENDORED.md` §15, `docs/research/quic-overhead.md` §5).
+- **BBR starts at the initial window** (2026-10-11). Upstream's BBR started at 200 datagrams,
+  240,000 bytes, where RFC 9002 §7.2 starts a sender at ten. The warm-up's target and budget, four
+  and sixteen initial windows, scaled with it to 3.84 MB of padding a connection. BBR now starts
+  at RFC 9002's window by the datagram size, as CUBIC, NewReno and Copa do
+  (`crates/hyper-quic/VENDORED.md` §21).
 
 ## 5. Consumers
 

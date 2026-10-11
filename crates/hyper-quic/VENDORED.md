@@ -817,3 +817,30 @@ rows.
   - Upstream quinn-proto gates the same pieces behind its own `qlog` feature.
 - **Checked.** Clippy -D warnings and the 392 unit tests pass in both builds, with the feature and
   without it.
+
+## 21. BBR starts at RFC 9002's initial window (2026-10-11)
+
+- **Patch Q10: `BbrConfig`'s initial window is RFC 9002 §7.2's unless one is set.**
+  - Upstream's default was 200 datagrams of 1,200 bytes, 240,000 bytes. That number is Chromium's
+    `kMaxInitialCongestionWindow`, its bound on a window resumed from a cached bandwidth, not a
+    start. RFC 9002 §7.2 starts a sender at ten datagrams, at most 14,720 bytes; CUBIC, NewReno and
+    Copa here already did, by the path's datagram size.
+  - The path's warm-up (§15) measures to four initial windows a round trip and spends at most
+    sixteen, by the law's own initial window. Under BBR those were 960 kB and 3.84 MB a connection,
+    for every remote a connection measured, once a lifetime.
+  - Found by focal. Its three metadata owners in one process, their endpoints on one thread, spent
+    that thread on warm-up padding: one connection sent 2,546 warm-up packets (3.7 MB), where
+    RFC 9002's window makes the budget 160. Their votes and appends waited behind it, and the
+    quorum test failed 9 runs of 10 under BBR. With RFC 9002's window it passed 10 of 10.
+  - `BbrConfig::initial_window` is now `None` unless set. Unset, it is RFC 9002's for the path's
+    current datagram size, recalculated as that changes; a value set is kept, as CUBIC's is.
+- **Tests.**
+  - `congestion::bbr::tests::the_initial_window_is_rfc_9002s_by_the_datagram_size_unless_set`.
+  - `every_law_warms_its_path_up_within_sixteen_initial_windows` (`tests/geo.rs`): each law's
+    warm-up, counted from each side's `PathStats::sent_warm_up_packets`, stays within sixteen
+    initial windows. Before the patch BBR's client sent 3,200 warm-up packets where at most 193
+    fit.
+  - The geo harness's scenarios name the law both endpoints run: CUBIC, their default, unless a
+    check is of the laws.
+- **Checked.** Clippy -D warnings with and without default features; the 393 unit tests and the
+  integration suites pass.

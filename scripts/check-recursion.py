@@ -772,7 +772,10 @@ def same_file(a, b):
 def unit_ir(artifact, deps):
     """The IR file of one unit cargo reported: a library's sits beside its `.rmeta`, a test's
     beside its executable, and a binary's beside the copy in deps/ of the executable cargo
-    reports (the copy that is byte for byte the same; deps/ also keeps earlier builds' copies)."""
+    reports (the copy that is byte for byte the same; deps/ also keeps earlier builds' copies).
+    A binary's copy is named with the unit's hash, or on an MSVC target by its crate alone: cargo
+    leaves the hash out of a path package's executables there, so their debug files keep one name
+    (cargo's `should_use_metadata`)."""
     kinds = set(artifact["target"]["kind"])
     crate = artifact["target"]["name"].replace("-", "_")
     if kinds & {"lib", "rlib"}:
@@ -785,8 +788,10 @@ def unit_ir(artifact, deps):
     if "test" in kinds:
         return executable.with_suffix(".ll") if executable.suffix == ".exe" else \
             executable.parent / (executable.name + ".ll")
-    for candidate in sorted(deps.glob(crate + "-*")):
+    for candidate in sorted(deps.glob(crate + "*")):
         if candidate.suffix not in ("", ".exe") or candidate.name.count(".") > 1:
+            continue
+        if candidate.stem != crate and not candidate.stem.startswith(crate + "-"):
             continue
         if same_file(candidate, executable):
             return candidate.with_suffix(".ll") if candidate.suffix == ".exe" else \

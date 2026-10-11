@@ -1874,6 +1874,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
                 Event::Request {
                     exchange: ExchangeId(id),
                     peer,
+                    epoch: conn.epoch,
                     kind,
                     class,
                     body: prefix.body,

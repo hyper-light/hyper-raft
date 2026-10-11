@@ -861,6 +861,7 @@ dependencies = [
  "hyper-measure",
  "libc",
  "loom",
+ "pin-project-lite",
  "rustix 1.1.4",
  "windows-sys 0.61.2",
 ]

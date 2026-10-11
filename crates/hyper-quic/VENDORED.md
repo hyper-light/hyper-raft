@@ -863,3 +863,53 @@ rows.
   connection's readers, which the patch also spares.
 - **Tests.** `frame::test::a_run_of_padding_is_one_frame`: 100 bytes of padding, a PING, 50
   more, decode as three frames (151 before). The 394 unit tests and the integration suites pass.
+
+## 23. The warm-up is background traffic (2026-10-11)
+
+- **Patch Q12: the path's warm-up (§15) ends at its own queue, as LEDBAT++'s slow start does.**
+  - A warm-up measures to four initial windows a round trip. Over a path that carries far less,
+    its packets queued, and where the queue held them all no loss ended it: it ran to its budget
+    of sixteen initial windows, on a 128 kbit/s path some twelve seconds of padding that every
+    other packet waited behind. focal's 128 kbit/s crossing test (a relay of 32 datagrams each way)
+    found no leader within ten seconds in 4 of 6 runs on Linux CI with the warm-up on, its election
+    votes queued behind it, and in none of 6 with it off (focal's diag run 38171360767).
+  - RFC 9406's delay increase (HyStart++), tried first, compares each round trip's least RTT with
+    the last's. A warm-up's round trip begins with an empty queue, so its least sample stays at the
+    base however fast the others rise, and on a slow path a round trip lasts as long as the queue:
+    on the pair below it ended only in its third round trip.
+  - A warm-up is traffic of use to no one but the next connection, LEDBAT's case (RFC 6817). It now
+    runs as LEDBAT++'s slow start (draft-irtf-iccrg-ledbat-plus-plus §4.1, §4.5):
+    - it begins with two packets ("LEDBAT++ sender limits the initial window to 2 packets"), sent
+      once nothing of the connection is in flight, so its first sample is its own packets' alone;
+    - its window grows by what each acknowledgement acknowledges;
+    - it ends once its queueing delay is larger than three quarters of the 60 ms target: the least
+      of its four most recent RTT samples, none older than a round trip (RFC 6817 §2.5), past the
+      least of all its samples.
+  - Only its own packets judge it (`SentPacket::warm_up`). A smaller packet's RTT is shorter by the
+    time the path takes to carry the difference (91 ms of a 1,452-byte datagram at 128 kbit/s), and
+    a packet sent before the warm-up began met another flight's queue (the handshake's, at its end).
+  - **Departure from LEDBAT++.** The window grows by all an acknowledgement acknowledges, not by
+    LEDBAT++'s GAIN of it (§4.2: as little as 1/16 on a short path). The GAIN shares congestion
+    avoidance among background flows, which a warm-up never enters; and the warm-up's budget is
+    slow start's geometric sum, which growth at a sixteenth would spend before the target on a
+    short path.
+  - `PathStats::warm_up_end` says why a warm-up ended (`WarmUpEnd`: measured, queued, congestion,
+    budget, path changed).
+- **Measured** (the pair, 128 kbit/s each way, 10 ms one way, a queue without bound):
+  - before the patch: 160 and 163 warm-up packets, each side ending at its budget, the smoothed RTT
+    7.3 s;
+  - with RFC 9406's exit alone: 41 and 35, the smoothed RTT 1.9 s and 1.3 s, the pair idle after
+    8.4 s;
+  - with the patch: 6 a side, each ending queued at its second sample, the smoothed RTT 172 ms and
+    192 ms, the pair idle after 1.9 s.
+  - Without a rate on the path, the warm-up still measures.
+- **Tests.**
+  - `tests::a_warm_up_over_a_slow_path_ends_once_its_packets_queue_and_over_a_fast_one_measures_it`
+    fails before the patch (the warm-up ended at its budget). It runs on the pair's new link rate,
+    `Pair::rate`: each direction carries so many bytes a second, with a queue without bound behind
+    it.
+  - `resume::tests::a_queue_is_the_least_recent_sample_past_the_least_by_three_quarters_of_60_ms`,
+    `a_warm_up_begins_with_two_packets_and_grows_by_what_is_acknowledged` and
+    `a_warm_up_whose_packets_queue_ends_as_an_attempt`; the existing warm-up tests check each end's
+    cause.
+  - The 398 unit tests and the integration suites pass, and hyper-transport's suites with them.

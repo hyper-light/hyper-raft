@@ -1775,6 +1775,7 @@ impl Connection {
         stats.path.cwnd = self.path.congestion.window();
         stats.path.current_mtu = self.path.mtud.current_mtu();
         stats.path.warm_up_end = self.resume.warm_up_end();
+        stats.path.warm_up_pending = self.resume.warm_up_pending();
 
         stats
     }

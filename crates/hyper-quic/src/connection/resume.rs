@@ -571,6 +571,11 @@ impl CarefulResume {
         Some(saved)
     }
 
+    /// Whether the warm-up is yet to end: measuring, or waiting to begin
+    pub(crate) fn warm_up_pending(&self) -> bool {
+        matches!(self.warm_up, WarmUp::Measuring { .. })
+    }
+
     /// Why the warm-up ended, once it has
     pub(crate) fn warm_up_end(&self) -> Option<WarmUpEnd> {
         match self.warm_up {

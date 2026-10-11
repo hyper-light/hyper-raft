@@ -881,6 +881,7 @@ fn a_warm_up_over_a_slow_path_ends_once_its_packets_queue_and_over_a_fast_one_me
     // 128 kbit/s each way and a queue without bound: no loss ends the warm-up
     for (side, path) in ["client", "server"].into_iter().zip(warm_up(Some(16_000))) {
         assert_eq!(path.warm_up_end, Some(WarmUpEnd::Queued), "{side}");
+        assert!(!path.warm_up_pending, "{side}");
         assert_eq!(path.lost_packets, 0, "{side}");
         // Each warm-up packet is a datagram of the path's MTU, counted whole
         assert_eq!(

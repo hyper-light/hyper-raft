@@ -29,6 +29,7 @@ use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
 use bytes::BytesMut;
+use hyper_quic::congestion::{BbrConfig, Congestion, CopaConfig, CubicConfig, NewRenoConfig};
 use hyper_quic::rustls::RootCertStore;
 use hyper_quic::rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use hyper_quic::{
@@ -43,6 +44,10 @@ const MS: u64 = 1_000_000;
 /// The owner's condition: 500 ms one way (hyper-sim's `Path::GEOGRAPHIC` mean).
 const ONE_WAY: u64 = 500 * MS;
 const RTT: u64 = 2 * ONE_WAY;
+/// The warm-up's budget on these paths: sixteen of RFC 9002 §7.2's initial windows of their largest
+/// datagram (RFC 9000 §14's 1,452 bytes here), four times its target of four initial windows a
+/// round trip (`connection::resume`'s `WARM_UP_BUDGET_TARGETS` and `SAVE_FLOOR_WINDOWS`).
+const WARM_UP_BUDGET: u64 = 16 * 10 * 1_452;
 /// RFC 9002 §6.2.2's kInitialRtt.
 const K_INITIAL_RTT: u64 = 333 * MS;
 /// The first PTO with no RTT sample: smoothed_rtt = kInitialRtt and rttvar = kInitialRtt / 2
@@ -252,6 +257,32 @@ struct Dialed {
     kept: Vec<u64>,
     /// The packets the client had declared lost when the first reply arrived.
     lost_packets: u64,
+    /// The packets of its path's warm-up each side's connection sent (`PathStats::
+    /// sent_warm_up_packets`), the client's first.
+    warm_up: [u64; 2],
+}
+
+/// A congestion law both endpoints run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Law {
+    NewReno,
+    Cubic,
+    Bbr,
+    Copa,
+}
+
+impl Law {
+    /// Every law hyper-quic ships.
+    const ALL: [Self; 4] = [Self::NewReno, Self::Cubic, Self::Bbr, Self::Copa];
+
+    fn congestion(self) -> Congestion {
+        match self {
+            Self::NewReno => Congestion::NewReno(NewRenoConfig::default()),
+            Self::Cubic => Congestion::Cubic(CubicConfig::default()),
+            Self::Bbr => Congestion::Bbr(BbrConfig::default()),
+            Self::Copa => Congestion::Copa(CopaConfig::default()),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -307,6 +338,8 @@ struct Scenario {
     loss_memory: bool,
     /// The virtual time past which the run stops.
     horizon: u64,
+    /// The congestion law both endpoints run: CUBIC, their default, unless a check is of the laws.
+    law: Law,
 }
 
 impl Scenario {
@@ -349,6 +382,7 @@ impl Scenario {
             learning_bytes: (LEARNING_BYTES, LEARNING_BYTES),
             loss_memory: true,
             horizon: HORIZON,
+            law: Law::Cubic,
         }
     }
 
@@ -512,6 +546,7 @@ impl Run {
         }
         let mut client = Endpoint::new(endpoint_config.clone(), None, false, rng(CLIENT)).unwrap();
         let mut transport = TransportConfig::default();
+        transport.congestion(scenario.law.congestion());
         transport.handshake_copies(scenario.copies);
         if let Some(burst) = scenario.copy_burst {
             transport.handshake_copy_burst(burst);
@@ -733,6 +768,10 @@ impl Run {
             };
             let bytes = self.scratch[..transmit.size].to_vec();
             self.wire.emit(&mut self.world, &mut self.net, node, bytes);
+        }
+        let warm_up = connection.stats().path.sent_warm_up_packets;
+        if let Some(dialed) = self.dialed.last_mut() {
+            dialed.warm_up[usize::from(!is_client)] = warm_up;
         }
         let deadline = connection.poll_timeout().map(|due| {
             u64::try_from(due.saturating_duration_since(self.epoch).as_nanos()).unwrap()
@@ -1851,7 +1890,7 @@ fn an_idle_connection_warms_its_path_up_and_a_later_burst_needs_no_second_round_
     // Each side's warm-up within its budget: its full-sized datagrams while the first connection
     // lingered
     let lingered = with.dialed[0].kept[0]..with.dialed[1].started;
-    let budget = 16 * 10 * 1_452;
+    let budget = WARM_UP_BUDGET as usize;
     for from_client in [true, false] {
         let bytes: usize = with
             .sent
@@ -1863,6 +1902,40 @@ fn an_idle_connection_warms_its_path_up_and_a_later_burst_needs_no_second_round_
             bytes > 0 && bytes <= budget,
             "client {from_client}: {bytes} bytes"
         );
+    }
+}
+
+/// Every law's warm-up within the same budget, each run exact: the warm-up measures to four of RFC
+/// 9002 §7.2's initial windows a round trip and spends at most four times that, whatever window
+/// the law starts from. BBR started at upstream's 200 datagrams, 240,000 bytes, which made its
+/// warm-up's budget 3.84 MB a connection; on one machine focal's three control replicas spent their
+/// thread on that padding and their quorum timed out (`VENDORED.md` §21).
+#[test]
+fn every_law_warms_its_path_up_within_sixteen_initial_windows() {
+    let pki = Pki::new(0);
+    // Each warm-up packet is a datagram of the path's MTU, no smaller than QUIC's least (RFC 9000
+    // §14), so the budget bounds their count
+    let most = WARM_UP_BUDGET / 1_200;
+    for law in Law::ALL {
+        let out = Run::new(
+            Scenario {
+                dials: 2,
+                early: true,
+                kept_requests: 1,
+                kept_reply_bytes: Some(24_000),
+                linger: 20 * RTT,
+                law,
+                ..Scenario::clean()
+            },
+            &pki,
+        )
+        .run();
+        for (side, sent) in ["client", "server"].into_iter().zip(out.dialed[0].warm_up) {
+            assert!(
+                sent > 0 && sent <= most,
+                "{law:?}, {side}: {sent} warm-up packets, at most {most}"
+            );
+        }
     }
 }
 

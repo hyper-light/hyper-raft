@@ -672,7 +672,8 @@ kind of work cannot take all of it:
 While its line has room, a job is never refused because its share is busy: essential work queues for
 its turn, as a busy machine's must (2026-10-10). The first pool refused a share's job the moment the
 share held `limit` jobs, queued or running. Under focal's concurrent node starts, a third whole-file job
-was refused and the node's bootstrap failed. `waiting: 0` keeps that behaviour where a consumer wants it.
+was refused and the node's bootstrap failed. `waiting: 0` keeps that behaviour where a consumer wants it;
+`Share::new(name, limit)` makes such a share, the constructor a share written before `waiting` becomes.
 
 A job's result returns through a `oneshot`. A blocking job cannot be cancelled (the call is the OS's); its
 share's bound is what limits the damage, stated.

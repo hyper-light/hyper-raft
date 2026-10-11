@@ -47,6 +47,20 @@ pub struct Share {
     pub waiting: usize,
 }
 
+impl Share {
+    /// A share of `limit` places and no line: past its places a job is refused at once, as the pool
+    /// refused before shares had lines. The constructor a consumer's `Share { name, limit }` from
+    /// before `waiting` becomes.
+    #[must_use]
+    pub const fn new(name: &'static str, limit: usize) -> Self {
+        Self {
+            name,
+            limit,
+            waiting: 0,
+        }
+    }
+}
+
 /// The pool's shape, the consumer's (derived from its own measurement: a device's queue and knee, a
 /// sandbox's concurrency budget).
 #[derive(Clone, Debug, PartialEq, Eq)]

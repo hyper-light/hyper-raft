@@ -57,21 +57,9 @@ fn the_pool_runs_refuses_survives_and_resolves() {
     blocking::start(Config {
         workers: 2,
         shares: vec![
-            Share {
-                name: "work",
-                limit: 2,
-                waiting: 0,
-            },
-            Share {
-                name: dns::SHARE,
-                limit: 1,
-                waiting: 0,
-            },
-            Share {
-                name: "order",
-                limit: 1,
-                waiting: 0,
-            },
+            Share::new("work", 2),
+            Share::new(dns::SHARE, 1),
+            Share::new("order", 1),
         ],
     })
     .unwrap();
@@ -79,11 +67,7 @@ fn the_pool_runs_refuses_survives_and_resolves() {
         matches!(
             blocking::start(Config {
                 workers: 1,
-                shares: vec![Share {
-                    name: "x",
-                    limit: 1,
-                    waiting: 0,
-                }],
+                shares: vec![Share::new("x", 1)],
             }),
             Err(RtError::BadConfig { .. })
         ),

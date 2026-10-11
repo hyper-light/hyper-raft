@@ -4,31 +4,48 @@
 //! the one whose packed state is least is the representative. Every renaming of a state reaches
 //! the same sorted signatures and the same set of tie orders, so the same least key.
 
-/// Every order of `order[at..end]`, and for each the orders of the runs after.
-fn permute_run(
-    order: &mut [usize],
-    at: usize,
-    end: usize,
-    runs: &[(usize, usize)],
-    visit: &mut dyn FnMut(&[usize]),
-) {
-    if at.saturating_add(1) >= end {
-        each_tie_order(order, runs, visit);
-        return;
-    }
-    for swap in at..end {
-        order.swap(at, swap);
-        permute_run(order, at.saturating_add(1), end, runs, visit);
-        order.swap(at, swap);
+/// Every order that permutes `order` only within `runs`, half-open ranges of equal signatures,
+/// each run's members ascending in `order` to begin with: one loop over the runs' orders, the last
+/// run's turning fastest and each run's taken in lexicographic order, a run that has turned through
+/// all of its orders starting again as the run before it takes its next (mantle CLAUDE.md §10: no
+/// call of its own).
+fn each_tie_order(order: &mut [usize], runs: &[(usize, usize)], visit: &mut dyn FnMut(&[usize])) {
+    loop {
+        visit(order);
+        let turned = runs
+            .iter()
+            .rev()
+            .any(|&(start, end)| order.get_mut(start..end).is_some_and(next_order));
+        if !turned {
+            return;
+        }
     }
 }
 
-/// Every order that permutes `order` only within `runs`, half-open ranges of equal signatures.
-fn each_tie_order(order: &mut [usize], runs: &[(usize, usize)], visit: &mut dyn FnMut(&[usize])) {
-    match runs.split_first() {
-        None => visit(order),
-        Some((&(start, end), rest)) => permute_run(order, start, end, rest, visit),
+/// Puts `run`, of distinct members, in its next order in lexicographic order; false, with `run`
+/// back in its first order, ascending, once it was in its last (Knuth, TAOCP vol. 4A §7.2.1.2,
+/// Algorithm L).
+fn next_order(run: &mut [usize]) -> bool {
+    // The last member less than the one after it: the members after it descend.
+    let Some(at) = run
+        .windows(2)
+        .rposition(|pair| matches!(pair, [a, b] if a < b))
+    else {
+        run.reverse();
+        return false;
+    };
+    let Some(&member) = run.get(at) else {
+        return false;
+    };
+    // The last member after it greater than it, which the one right after it is if no later is.
+    let Some(swap) = run.iter().rposition(|later| *later > member) else {
+        return false;
+    };
+    run.swap(at, swap);
+    if let Some(after) = run.get_mut(at.saturating_add(1)..) {
+        after.reverse();
     }
+    true
 }
 
 /// The least key `arrange` gives over the orders of the members sorted by `signatures` that permute

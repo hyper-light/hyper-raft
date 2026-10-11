@@ -24,7 +24,7 @@ use hyper_rt::RtError;
 use hyper_rt::runtime::{LocalRuntime, RuntimeConfig};
 use hyper_rt::sim::SimRuntime;
 use hyper_rt::udp::{
-    Arrival, Batched, Io, Ipv4Addr, Ipv6Addr, MAX_BATCH, Sent, SocketAddr, UdpSocket,
+    Arrival, Batched, Io, Ipv4Addr, Ipv6Addr, MAX_BATCH, RECEIVE_BYTES, Sent, SocketAddr, UdpSocket,
 };
 
 fn config() -> RuntimeConfig {
@@ -203,6 +203,35 @@ fn the_outbox_refuses_past_its_bound_and_counts() {
         assert_eq!(socket.stats().outbox_full, 1);
         assert_eq!(socket.stats().sent, 0);
         assert!(socket.pending());
+    })
+    .unwrap();
+}
+
+/// Do: queue the largest datagram a slot takes, one past it, and fill a slot in place past it. Expect: the
+/// first queued, the others dropped and counted as oversize, and the socket holding no more than its `Io`
+/// says it may (`Io::held_bound`), which is what an owner charges for it.
+#[test]
+fn a_socket_holds_no_more_than_its_bound() {
+    let mut rt = LocalRuntime::new(&config()).unwrap();
+    rt.block_on(async {
+        let io = Io { batch: 4 };
+        let loopback = SocketAddr::from((Ipv4Addr::LOCALHOST, 0));
+        let mut socket = Batched::bind(loopback, io, false).unwrap();
+        let to = socket.local_addr().unwrap();
+        assert!(socket.held_bytes() <= io.held_bound());
+        assert!(socket.queue(to, &vec![1u8; RECEIVE_BYTES]));
+        assert!(!socket.queue(to, &vec![2u8; RECEIVE_BYTES + 1]));
+        let slot = socket.slot().unwrap();
+        slot.bytes.resize(RECEIVE_BYTES * 2, 3);
+        slot.to = to;
+        socket.commit();
+        assert_eq!(socket.stats().oversize, 2);
+        assert!(
+            socket.held_bytes() <= io.held_bound(),
+            "{} held past a bound of {}",
+            socket.held_bytes(),
+            io.held_bound()
+        );
     })
     .unwrap();
 }

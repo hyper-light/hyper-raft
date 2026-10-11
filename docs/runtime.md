@@ -453,6 +453,14 @@ the platform calls behind one seam per kind (`netsys`), Unix through `rustix`, W
 - **Don't-fragment** set per OS, as slates does; a send the OS has no room for is `WouldBlock`, awaited on
   writability, never a lost path (slates' AUD-29-61).
 - **Socket activation** (`adopt`, `into_owned`) kept from slates, on Windows too.
+- **What a socket holds, bounded and told.** `Io::held_bound` is the most a batched socket holds while it
+  lives, and what its owner charges for it: its receive buffers (`batch` of `RECEIVE_BYTES` on Linux, one
+  elsewhere), its outbox (`batch` slots, each one datagram or one segmented send of at most
+  `RECEIVE_BYTES`) and on Linux the message headers. A slot never grows past its bound: a datagram larger
+  than it, queued or filled in place, is dropped and counted (`IoStats::oversize`), since no UDP payload or
+  segmented send is; `Batched::held_bytes` says what is held now (`tests/udp_batched.rs`). Before
+  2026-10-10 a slot grew to whatever was put in it and nothing told an owner what the socket held: focal's
+  listeners held their sockets uncharged (found by focal's `network_listener`).
 - **Done** (2026-10-06): `UdpSocket` and `Batched` on IPv4 and IPv6; the batched calls and stamps moved from
   hyper-tokio's `sys` layer into `udp/linux.rs` and `udp/macos.rs`. Measured by `tests/udp_batched.rs` on
   macOS and on Linux 6.12 (Docker): a 32-datagram batch crosses loopback in fewer calls than datagrams

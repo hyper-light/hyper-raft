@@ -1980,6 +1980,36 @@ append and 95% of the time flushing, and the three are within a flush a second o
   test binary of this change passed pinned to one core (`taskset -c 0`) 200 times of 200 and
   unpinned 50 of 50.
 
+## No runtime recursion
+
+The owner's loop made flat, and the log's channels made to carry nothing that holds a way back to
+itself (`crates/hyper-log/ORIGIN.md`, "No runtime recursion"). **main** is `67f038d`, **change**
+this branch. The same Apple M5 Max (`Mac17,6`, 18 cores, 128 GiB), macOS 26.4.1, rustc 1.98.0,
+2026-10-10 19:18–19:31 PDT, load average 8 to 19 with other sessions building.
+
+- **Allocations** (`cargo bench -p hyper-log --bench allocs`, main and the change alternated, two
+  runs of each): every row is the same. Appends allocate nothing (their reallocations are 1.01 at
+  one replica and 0.08 at sixteen in both, each group's list of retained entries growing), nor do
+  fetches into a reservation, terms, views, or appends through a handle (0.01 to 0.03
+  reallocations). The one row that moves, `entries` of an entry read from the file at one
+  replica, moves as much between two runs of main (12 to 18 allocations) as between main and the
+  change.
+- **The replica's path** (`hyper-log-compare replica hyper`, main's build and the change's
+  alternated, the order turned each round, each run a fresh process), 41 rounds; medians, with the
+  least and the most:
+
+| | wall µs a committed entry | writes, views, terms, fetches | reads another thread answered | allocations | reallocations | context switches |
+|---|---|---|---|---|---|---|
+| main | 61.3 (53.4–197.3) | 6, 92, 13, 3 | 0 | 68.3 | 0.20 | 12.33 |
+| **change** | **58.5** (52.3–150.7) | 6, 92, 13, 3 | 0 | 68.3 | 0.20 | 12.20 |
+
+  A first nine rounds gave main 56.6 µs and the change 58.1, with the same counts.
+- **mantle's workload** (`hyper-log-compare pairs DIR 8 2.0 128,16384 1,256` with main's build and
+  the change's): the file's flush sets the pace, 100 to 165 a second under `F_FULLFSYNC`. The
+  change led main in 4, 6, 3 and 6 of the eight rounds of the four cells (128 B and 16 KiB, one
+  replica and 256), every median within the other's spread, and each frame carried what main's did
+  (1.0 appends at one replica, 253 to 254 at 256).
+
 ## End to end
 
 `crates/hyper-log-e2e`: a writer process (`hyper-log-writer`) appends to a log in a real file
@@ -2024,7 +2054,8 @@ cd crates/hyper-log-compare && cargo build --release
 target/release/hyper-log-compare table DIR 5 1.0 path/to/mantle
 
 # The replica's path: hyper-log and mantle-log rotated, nine rounds, each run a fresh process; one
-# run of either log, and one point of mantle's workload on hyper-log.
+# run of either log, and one point of mantle's workload on hyper-log. Two builds of hyper-log are
+# compared by running `replica hyper` from each in turn, the order turned each round.
 target/release/hyper-log-compare replicas 9
 target/release/hyper-log-compare replica <hyper|mantle>
 target/release/hyper-log-compare one hyper DIR 128 <replicas> 1.0

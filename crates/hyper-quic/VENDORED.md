@@ -913,3 +913,47 @@ rows.
     `a_warm_up_whose_packets_queue_ends_as_an_attempt`; the existing warm-up tests check each end's
     cause.
   - The 398 unit tests and the integration suites pass, and hyper-transport's suites with them.
+
+## 24. A warm-up that cannot meet its target stops, and one that can keeps what it measured (2026-10-11)
+
+- **Patch Q13: the warm-up's end at its budget, a plateau, and its own byte count.**
+  Measured on focal's three-node fleet:
+  - **Where it ran.** Loopback paths of about 0.1–1 ms and relay paths of 5 ms at 100 Mbit/s,
+    every warm-up's start, rounds and end printed.
+  - **How the warm-ups ended.** Most ran to their budget of 160 packets (232 KB each), measuring
+    nothing.
+  - **Why, on loopback.** BBR's window sat at its floor of four datagrams (the bandwidth-delay
+    product of an 86 µs path is a few kilobytes). Every round trip after that delivered three
+    datagrams, while the warm-up's own window kept doubling.
+  - **What it broke.** On Linux CI, padding from a warm-up that ran in an idle gap was counted as
+    bytes of a copy: `evidence_quic`'s copy test failed 2 of 3 runs with the warm-up on and none of
+    3 with it off.
+  - **The budget ended the warm-up as it sent.** The round trip in flight then, the one that met
+    the target, was acknowledged to an ended warm-up, and the measurement was lost. Now the budget
+    stops the sending: the warm-up ends once its last packet is acknowledged, short of the target,
+    and a round trip that met it is published.
+  - **A plateau ends it.** BBR's full-pipe test (draft-ietf-ccwg-bbr §4.3.1.2): three round trips
+    that each deliver less than a quarter more than the last one that grew, short of the target,
+    end the warm-up as an attempt (`WarmUpEnd::Plateau`).
+    - Only the warm-up's own acknowledged bytes are judged (`SentPacket::warm_up`). A reply the
+      application had in flight as the warm-up began set the bar its slow start from two packets
+      had to clear. On the 500 ms geo path, 12,647 bytes of a reply, then the warm-up's 1,200,
+      3,600 and 9,600 were counted as no growth, and the warm-up ended short of the measurement
+      that path's test needs.
+    - Only a round trip in which a window held the warm-up back is judged, its own or the
+      connection's (with its pacer). A round trip spent waiting for a quiet connection says
+      nothing of the path, as BBR judges no application-limited round trip.
+  - **Its own bytes are counted.** `PathStats::sent_warm_up_bytes` counts the warm-up's datagrams,
+    each its own. hyper-transport's `PathFacts::warm_up_bytes` carries the count, so a count of
+    what crossed a path can take the warm-up's padding out.
+- **Tests.**
+  - `resume::tests::a_warm_up_whose_round_trips_stop_growing_ends_as_an_attempt`: a plateau short
+    of the target ends it, a round trip no window held is not judged, and a plateau past the target
+    publishes.
+  - The budget test now checks that the warm-up ends once its last packet is acknowledged, and
+    that a last round trip meeting the target is published.
+  - `tests::a_warm_up_keeps_what_its_last_round_trip_measures`: under BBR at 100 Mbit/s and 40 µs
+    one way. It fails with the old budget (ended at the budget).
+  - The slow-path test checks the byte count.
+  - The 400 unit tests and the congestion, e2e, geo and handshake suites pass, with
+    hyper-transport's.

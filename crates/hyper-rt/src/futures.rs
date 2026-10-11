@@ -34,6 +34,13 @@ pub fn scheduler_overrun_ns() -> u64 {
     registry::with_current(|ctx| ctx.scheduler_overrun_ns()).unwrap_or(0)
 }
 
+/// The current shard's timer tick in nanoseconds ([`crate::shard::ShardContext::timer_tick_ns`]): a sleep
+/// ends up to a tick later than due by design, and later still by [`scheduler_overrun_ns`]. A wait that must
+/// end before another's (an answer before its asker gives up) sets both aside. Zero off a shard thread.
+pub fn timer_tick_ns() -> u64 {
+    registry::with_current(|ctx| ctx.timer_tick_ns()).unwrap_or(0)
+}
+
 /// The current shard's step quantum in nanoseconds (§4.3, "a step longer than a peer's wake starves the
 /// shard"): its online wake estimate while it tracks one, else its configured step budget
 /// ([`crate::shard::ShardContext::quantum_ns`]). A cooperative operation sizes its slices by it (a

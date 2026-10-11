@@ -327,6 +327,9 @@ than the mean wake buys nothing, since a parked shard cannot run sooner than it 
 mean wake. The clock-read term goes: the loop reads the clock once a step whatever the tick, so the tick
 does not change what the clock costs (DERIVED). A consumer states its timers' lateness tolerance; a
 configuration whose `tick + wake p99` exceeds it is refused at build, naming both, rather than run late.
+The two terms are told to the shard's tasks, `futures::timer_tick_ns` and `futures::scheduler_overrun_ns`
+(the measured overrun standing for the wake's tail): a wait that must end before another's sets both aside
+(focal answers "not yet" within its asker's period by them, 2026-10-10).
 
 **Change: the next deadline in O(levels), not O(armed timers).** slates rescans every armed entry after a
 fire or the earliest cancel, every step (NOTE08 §3.2). hyper-rt keeps an occupancy bitmap per level (64

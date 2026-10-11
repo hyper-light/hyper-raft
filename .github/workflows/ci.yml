@@ -39,6 +39,33 @@ jobs:
           name: gate-progress-${{ matrix.runner }}
           path: target/gate-progress.log
           if-no-files-found: ignore
+  recursion:
+    # No runtime recursion (CLAUDE.md §1): scripts/check-recursion.py reads the call graph of every
+    # production unit's opt-level-0 IR and refuses a cycle through the workspace's code, after its
+    # self-test (rust-lang's demangler's cases and a fixture of each kind of cycle). Each target
+    # compiles its own cfg-gated code and std, so each runs it.
+    strategy:
+      fail-fast: false
+      matrix:
+        runner:
+          - ubuntu-24.04
+          - ubuntu-24.04-arm
+          - macos-15
+          - macos-15-intel
+          - windows-2025
+          - windows-11-arm
+    runs-on: ${{ matrix.runner }}
+    # The gates job's bound until this job is measured on main: the gates build every unit this job
+    # builds, with debug info, and run them besides (this job: 95 s on the owner's machine at load 10,
+    # 2026-10-11, 83 s of it the build).
+    timeout-minutes: 64
+    steps:
+      - uses: actions/checkout@v5
+      - run: rustup show active-toolchain || rustup toolchain install
+      - run: python3 scripts/check-recursion.py --self-test
+        shell: bash
+      - run: python3 scripts/check-recursion.py --list
+        shell: bash
   miri:
     # hyper-sim under Miri (docs/sim.md §9, S-1's gate): the crate has no `unsafe` and no platform
     # code, so one OS suffices; Miri checks it keeps Rust's rules, and its isolation refuses the

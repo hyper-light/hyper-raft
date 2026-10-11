@@ -282,6 +282,8 @@ impl<K> Table<K> {
         self.arena.release_with(id, polled);
     }
 
+    /// Every exchange: the oracle's full visit alone reads them all.
+    #[cfg(feature = "oracle")]
     pub(crate) fn values(&self) -> impl Iterator<Item = &Exchange<K>> {
         self.arena.values()
     }

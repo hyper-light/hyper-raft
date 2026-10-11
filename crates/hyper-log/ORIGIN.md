@@ -376,3 +376,14 @@ with line tables; it marks the calls made on a thread the workspace spawns. In t
   never fenced (the owner thread died on main); a file whose flush unwinds, the write failed typed and
   the device handed back at close (as on main: the frame's writes and flush were inside the boundary).
 
+## The seal walks a group's release
+
+focal found that a sealed frame carrying a `Released` record fenced the log: the seal's walk of a
+laid payload (`format::sealables_of`) knew every kind of record but that one, so sealing failed, the
+commit failed and the owner fenced; a frame holding one would have read back as tampering too. The
+walk takes its eight bytes now.
+
+- **Tests**: `the_seal_walks_every_kind_of_record` lays one record of each kind, its match naming every
+  kind so a kind added later fails to build until it is laid there too, and the walk reaches the end and
+  the payload decodes whole; `a_sealed_log_writes_and_reopens_a_release` writes a release to a sealed log
+  and reads it back after a reopen. Both fail without the arm: "the walk stopped short", and `Fenced`.

@@ -59,6 +59,15 @@ The inventory, the enhancement ledger and the migration plan are in mantle's
   - The exhaustive Rust explorers in `hyper-check` run beside it.
 - **Portable.** Linux, macOS and Windows on x86_64 and aarch64. `unsafe` is allowed only in the files
   `scripts/check-contracts.py` lists, each block with a `// SAFETY:` comment.
+- **No runtime recursion.**
+  - No function calls itself, directly or through others, and no algorithm walks a structure
+    depth-first with a parent's work waiting on its children's, on the call stack or on an explicit
+    stack of frames. Recursion makes work a chain that grows with the structure, so its latency and
+    stack are unbounded by construction (the panic and bounded-growth rules above).
+  - Work is flat: loops with counted budgets and bounded queues of independent tasks, each with a
+    stated trigger.
+  - Call-graph cycles are found with a tool on the built code, not by reading:
+    `scripts/check-recursion.py` reads every production unit's opt-level-0 IR, and CI runs it.
 
 ## 1a. Law: measured against what each crate replaces
 

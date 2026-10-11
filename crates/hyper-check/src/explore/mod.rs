@@ -590,16 +590,24 @@ impl<M: Model> Level<'_, M> {
             .unwrap_or(0);
         let share = slice.len().div_ceil(workers).max(1);
         let shards: &[PrintSet] = self.shards;
-        let joined: Vec<std::thread::Result<Expansion<M>>> = std::thread::scope(|scope| {
+        // A worker runs the model's code, so behind an unwind boundary (crate::unwind).
+        let joined: Vec<Option<Expansion<M>>> = std::thread::scope(|scope| {
             let running: Vec<_> = slice
                 .chunks(share)
-                .map(|slice| scope.spawn(move || expand(model, slice, shards, allowance)))
+                .map(|slice| {
+                    scope.spawn(move || {
+                        crate::unwind::contained(|| expand(model, slice, shards, allowance))
+                    })
+                })
                 .collect();
-            running.into_iter().map(|worker| worker.join()).collect()
+            running
+                .into_iter()
+                .map(|worker| crate::unwind::joined(worker.join()))
+                .collect()
         });
         let mut expansions = Vec::with_capacity(joined.len());
         for expansion in joined {
-            expansions.push(expansion.map_err(|_| ExploreError::Worker)?);
+            expansions.push(expansion.ok_or(ExploreError::Worker)?);
         }
         let bucketed = expansions
             .iter()
@@ -633,26 +641,29 @@ impl<M: Model> Level<'_, M> {
             tally_all(&mut self.report.paths, &expansion.paths);
         }
         self.report.peak = self.report.peak.max(settling);
-        let settled: Vec<std::thread::Result<Result<Vec<M::Key>, Spent>>> =
-            std::thread::scope(|scope| {
-                let running: Vec<_> = self
-                    .shards
-                    .iter_mut()
-                    .enumerate()
-                    .map(|(index, shard)| {
-                        let buckets: Vec<&Vec<(u128, M::Key)>> = expansions
-                            .iter()
-                            .filter_map(|expansion| expansion.buckets.get(index))
-                            .collect();
-                        scope.spawn(move || settle(shard, &buckets))
-                    })
-                    .collect();
-                running.into_iter().map(|shard| shard.join()).collect()
-            });
+        // A worker hashes and compares the model's keys, so behind an unwind boundary too.
+        let settled: Vec<Option<Result<Vec<M::Key>, Spent>>> = std::thread::scope(|scope| {
+            let running: Vec<_> = self
+                .shards
+                .iter_mut()
+                .enumerate()
+                .map(|(index, shard)| {
+                    let buckets: Vec<&Vec<(u128, M::Key)>> = expansions
+                        .iter()
+                        .filter_map(|expansion| expansion.buckets.get(index))
+                        .collect();
+                    scope.spawn(move || crate::unwind::contained(|| settle(shard, &buckets)))
+                })
+                .collect();
+            running
+                .into_iter()
+                .map(|shard| crate::unwind::joined(shard.join()))
+                .collect()
+        });
         drop(expansions);
         let mut fresh = Vec::with_capacity(settled.len());
         for part in settled {
-            match part.map_err(|_| ExploreError::Worker)? {
+            match part.ok_or(ExploreError::Worker)? {
                 Ok(keys) => fresh.push(keys),
                 Err(spent) => return Ok(self.unknown(spent)),
             }

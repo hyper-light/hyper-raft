@@ -401,7 +401,10 @@ fn stop(workers: Vec<Worker>) -> Result<Vec<Counters>, RtError> {
             Ok(Err(error)) => {
                 failure.get_or_insert(error);
             }
-            Err(_) => {
+            Err(payload) => {
+                // The payload is the unwound code's own (a caller's driver; a task's poll and drop
+                // unwind inside the shard's boundary), so it is dropped inside a boundary too.
+                let _ = crate::unwind::contained(move || drop(payload));
                 failure.get_or_insert(RtError::WorkerFailed { shard: id });
             }
         }

@@ -619,7 +619,14 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
         }
         match catch_unwind(AssertUnwindSafe(|| call(&mut *self))) {
             Ok(outcome) => outcome,
-            Err(_) => Err(self.fence(Cause::Unwound)),
+            Err(payload) => {
+                // The payload is the unwound code's own, so it is dropped inside a boundary too:
+                // one whose drop unwinds again is left unfreed, one allocation, rather than unwind.
+                if let Err(again) = catch_unwind(AssertUnwindSafe(move || drop(payload))) {
+                    let _ = Box::leak(again);
+                }
+                Err(self.fence(Cause::Unwound))
+            }
         }
     }
 

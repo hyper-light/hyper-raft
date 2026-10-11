@@ -40,6 +40,7 @@ pub mod oracle;
 pub mod search;
 pub mod strategy;
 mod table;
+mod unwind;
 pub mod witness;
 
 pub use agree::{Agreed, Agreement, Disagreement, agree};

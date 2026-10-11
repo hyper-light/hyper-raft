@@ -469,6 +469,9 @@ impl StateMachine for Boom {
         if entry.data == b"boom" {
             panic!("the application unwound");
         }
+        if entry.data == b"bomb" {
+            std::panic::panic_any(Bomb);
+        }
         self.0.apply(entry, answers)
     }
     fn apply_change(
@@ -502,9 +505,25 @@ impl StateMachine for Boom {
     }
 }
 
-/// An unwind of the state machine fences the replica and is reported, never propagated.
+/// A panic payload whose drop unwinds too.
+struct Bomb;
+
+impl Drop for Bomb {
+    fn drop(&mut self) {
+        panic!("a payload that unwinds as it drops");
+    }
+}
+
+/// An unwind of the state machine fences the replica and is reported, never propagated, its
+/// payload dropped inside a boundary too: one whose drop unwinds again fences it all the same.
 #[test]
 fn an_unwind_inside_a_call_fences_the_replica() {
+    for data in [b"boom", b"bomb"] {
+        an_unwind_of(data);
+    }
+}
+
+fn an_unwind_of(data: &[u8]) {
     let mut r = Replica::open(
         &settings(1, 3),
         RamStore::new(),
@@ -517,7 +536,7 @@ fn an_unwind_inside_a_call_fences_the_replica() {
     for _ in 0..8 {
         r.drive(now(), waker(), &mut out).unwrap();
     }
-    r.propose(Vec::new(), b"boom".to_vec()).unwrap();
+    r.propose(Vec::new(), data.to_vec()).unwrap();
     let mut fenced = None;
     for _ in 0..8 {
         if let Err(e) = r.drive(now(), waker(), &mut out) {

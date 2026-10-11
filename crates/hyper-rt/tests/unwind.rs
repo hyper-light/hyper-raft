@@ -66,6 +66,40 @@ fn a_task_that_unwinds_ends_typed_and_the_shard_goes_on() {
     rt.context().detach(root).unwrap();
 }
 
+/// A panic payload whose drop unwinds too.
+struct Bomb;
+
+impl Drop for Bomb {
+    fn drop(&mut self) {
+        panic!("a payload that unwinds as it drops");
+    }
+}
+
+/// A task whose unwind carries a payload that unwinds again as it drops ends `Unwound` all the
+/// same: the payload is dropped inside a boundary of its own, and the shard goes on.
+#[test]
+fn a_task_whose_payload_unwinds_as_it_drops_ends_typed_and_the_shard_goes_on() {
+    let (tell, heard) = channel();
+    let mut rt = LocalRuntime::new(&config()).unwrap();
+    let root = rt
+        .spawn(async move {
+            let unwinding = spawn_child(async {
+                yield_now().await;
+                std::panic::panic_any(Bomb);
+            })
+            .unwrap();
+            let _ = tell.send(join(unwinding).await);
+            let after = spawn_child(async { yield_now().await }).unwrap();
+            let _ = tell.send(join(after).await);
+        })
+        .unwrap();
+    rt.run_until_idle();
+    let outcomes: Vec<_> = heard.try_iter().collect();
+    assert_eq!(outcomes, [Ok(Outcome::Unwound), Ok(Outcome::Completed)]);
+    assert_eq!(rt.counters().unwound, 1);
+    rt.context().detach(root).unwrap();
+}
+
 /// A task's future that panics as it is dropped, here at its cancellation, is counted and costs
 /// the shard nothing: the task ends `Cancelled`, and the shard runs on.
 #[test]

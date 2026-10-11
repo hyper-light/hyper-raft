@@ -173,6 +173,32 @@ fn a_look_that_unwinds_is_answered_and_the_log_goes_on() {
     log.close().unwrap();
 }
 
+/// A panic payload whose drop unwinds too.
+struct Bomb;
+
+impl Drop for Bomb {
+    fn drop(&mut self) {
+        panic!("a payload that unwinds as it drops");
+    }
+}
+
+/// A look whose unwind carries a payload that unwinds again as it drops is answered the same way:
+/// the payload is dropped inside a boundary of its own, and the log goes on.
+#[test]
+fn a_look_whose_payload_unwinds_as_it_drops_is_answered_and_the_log_goes_on() {
+    let log = Log::create(sim(74), config(), ID).unwrap();
+    log.write(1, small(1)).unwrap();
+    let looked = log.with_file(|_| -> u64 { std::panic::panic_any(Bomb) });
+    match looked {
+        Err(LogError::Disk(DiskError::Io { op, .. })) => {
+            assert_eq!(op, "a look at the file unwound")
+        }
+        other => panic!("{other:?}"),
+    }
+    log.write(1, small(2)).unwrap();
+    log.close().unwrap();
+}
+
 /// A file whose flush unwinds fails the write, typed (the log fences, as for any failed flush),
 /// and the device comes back: a look still runs on it and close hands it back.
 #[test]

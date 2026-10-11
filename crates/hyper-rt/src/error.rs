@@ -65,8 +65,9 @@ pub enum RtError {
         /// The shard.
         shard: u16,
     },
-    /// A shard's worker thread ended without a result: it panicked (AUD-29-12). Its slot was still given
-    /// back and its siblings still stopped and joined.
+    /// A shard's worker thread ended without a result: it unwound outside its tasks, in a caller's
+    /// driver (AUD-29-12; a task that unwinds ends `Outcome::Unwound` and costs its shard nothing).
+    /// Its slot was still given back and its siblings still stopped and joined.
     WorkerFailed {
         /// The shard.
         shard: u16,

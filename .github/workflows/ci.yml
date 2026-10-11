@@ -43,7 +43,10 @@ jobs:
     # No runtime recursion (CLAUDE.md §1): scripts/check-recursion.py reads the call graph of every
     # production unit's opt-level-0 IR and refuses a cycle through the workspace's code, after its
     # self-test (rust-lang's demangler's cases and a fixture of each kind of cycle). Each target
-    # compiles its own cfg-gated code and std, so each runs it.
+    # compiles its own cfg-gated code (33 source files gate on the OS, one on the architecture) and
+    # its own std, and the first run read different IR on each (Linux 436 cycles, the rest 433, of
+    # the same 20 shapes; run 38126898235), so each runs it; beside the gates jobs it adds no time
+    # to a run.
     strategy:
       fail-fast: false
       matrix:
@@ -55,10 +58,9 @@ jobs:
           - windows-2025
           - windows-11-arm
     runs-on: ${{ matrix.runner }}
-    # The gates job's bound until this job is measured on main: the gates build every unit this job
-    # builds, with debug info, and run them besides (this job: 95 s on the owner's machine at load 10,
-    # 2026-10-11, 83 s of it the build).
-    timeout-minutes: 64
+    # Twice the slowest measured, the model job's rule: macos-15-intel, 566 s (run 38126898235,
+    # 2026-10-11; the others 165 to 291 s).
+    timeout-minutes: 19
     steps:
       - uses: actions/checkout@v5
       - run: rustup show active-toolchain || rustup toolchain install

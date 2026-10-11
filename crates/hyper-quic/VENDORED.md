@@ -844,3 +844,22 @@ rows.
     check is of the laws.
 - **Checked.** Clippy -D warnings with and without default features; the 393 unit tests and the
   integration suites pass.
+
+## 22. A run of PADDING is one frame (2026-10-11)
+
+- **Patch Q11: `frame::Iter` takes a run of PADDING whole.**
+  - Each PADDING frame is one zero byte of no meaning (RFC 9000 §19.1). Upstream decoded each
+    as a frame of its own: a frame type read, a match, a `Frame::Padding` that every reader
+    then passes over (`process_payload`, `process_while_closed`, the frame statistics).
+  - A datagram padded to the path's MTU therefore cost its receiver about 1,450 frames. A path's
+    warm-up (§15) and its MTU probes send such datagrams. So does a padded Initial. A server
+    that five hundred fresh connections warm up receives up to sixteen initial windows of them
+    from each: a benchmark of 512 connections had to wait seconds for the warm-ups before its
+    timing meant anything (hyper-rt-transport's `benches/connections.rs`).
+  - The iterator now scans the run to its first non-zero byte and yields one `Frame::Padding`.
+    Every reader already skips it, so nothing else changes.
+- **Measured** (`frame::test::measure_a_padded_datagram`, release, a PING padded to 1,452 bytes):
+  4,019 ns and 1,452 frames before, 472 ns and 2 frames after, before the per-frame work of the
+  connection's readers, which the patch also spares.
+- **Tests.** `frame::test::a_run_of_padding_is_one_frame`: 100 bytes of padding, a PING, 50
+  more, decode as three frames (151 before). The 394 unit tests and the integration suites pass.

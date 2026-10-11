@@ -63,7 +63,8 @@ windows-sys = { version = "0.61", features = [
 proptest = "1.11"
 tempfile = "3.20"
 # Pin projection for hyper-rt's named futures (its combinators and `within`): each holds the futures it is
-# given in place, once, with no `unsafe` of hyper-rt's own (tokio's choice for the same futures).
+# given in place, once, with no `unsafe` of hyper-rt's own (tokio's choice for the same futures). A
+# dependency by the owner's approval, 2026-10-11 (docs/runtime.md §3.8, "The dependency").
 pin-project-lite = "0.2.17"
 
 [workspace.lints.rust]

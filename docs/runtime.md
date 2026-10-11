@@ -434,6 +434,22 @@ What each holds now, and what changed with it:
 The rule for a consumer is the same: a wait wrapped around work is a named future, never an `async` block
 that awaits a future it was handed (focal's `focal_rt::time::Timeout`).
 
+**The dependency.** `pin-project-lite` is a hyper-rt dependency by the owner's approval (2026-10-11), for
+the pin projection of these named futures; the change waited for it outside `main`. Measured here, the same
+test on both trees, futures holding 16 KiB each (bytes):
+
+| combinator | as `async fn`s (`506c059`) | as named futures |
+|---|---|---|
+| `race2` | 65,584 | 32,773 |
+| `race3` | 98,368 | 49,159 |
+| `join2` | 65,600 | 32,784 |
+| `join3` | 213,192 | 49,176 |
+| `within` | 32,856 | 16,432 |
+| `join3(join3(·,·,·), join2(·, within(·)), race2(·,·))`, seven futures | 1,755,856 | 114,800 |
+
+The nested one, 15 times smaller, overflowed a 2 MiB debug test thread as `async fn`s (`SIGABRT`). Its
+license (Apache-2.0 OR MIT) and its source (crates.io) pass mantle's and focal's `cargo deny` policies.
+
 ## 4. Running a future: `block_on`
 
 Every consumer needs to run one future to completion on the calling thread: a CLI command, `main`, a

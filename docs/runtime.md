@@ -390,6 +390,40 @@ The tests are `tests/readiness_waits.rs`, `tests/duplex.rs` and the table's mode
 hyper-rt registers `AFD_POLL_SEND` for writability and `AFD_POLL_ACCEPT`/`AFD_POLL_CONNECT_FAIL` for
 listeners and connects, which TCP on Windows needs (§5.2).
 
+### 3.8 Combinators and timed waits hold each future once
+
+`combine::{race2, race3, join2, join3}` and `futures::within` (the race of work against a deadline that
+every timed wait in the workspace goes through) are named futures (`Race2`, `Race3`, `Join2`, `Join3`,
+`Within`) holding what they are given in place, once, projected by `pin-project-lite` (tokio's choice for
+its `Timeout` and `MaybeDone`; no `unsafe` of this crate's own, §13). Until 2026-10-10 they were `async fn`s,
+and an `async fn` holds each argument twice: the argument, beside the pinned local it moves into
+(rust-lang/rust#62958, open on 1.98.1). Every level of nesting therefore multiplied what it held, and a
+debug build copies each level's value on the stack besides. focal measured it with `-Zprint-type-sizes`
+(nightly flags on the stable compiler through `RUSTC_BOOTSTRAP=1`, measurement only):
+
+| focal future | as `async fn`s | as named futures |
+|---|---|---|
+| an enrollment round, timed (`within` and focal's `timeout` around it) | 61,528 B | 5,768 B |
+| the round itself (it times its own calls) | 15,336 B | 5,720 B |
+| five 3.4 KB writes and a transfer, joined in threes | 491,800 B | 22,208 B |
+| the test holding that join (it overflowed a 2 MiB debug test thread; it now runs on 512 KiB) | 494,432 B | 24,848 B |
+
+What each holds now, and what changed with it:
+
+- **A race and `within`**: their futures and a flag set once the output is given. Polled again after
+  that, they wait (`Pending`) rather than poll a finished future, which an `async` block refuses by
+  unwinding; `within` also lets its deadline's timer go when it finishes, not when it is dropped.
+- **A join**: a slot per future, the future while it runs and its output once it finishes, so the
+  finished future is dropped then (what it holds, a timer or a reservation, let go with it) rather than
+  when the last one finishes. The slot keeps its tag out of the future's bytes (`#[repr(C)]`, as tokio's
+  `MaybeDone` does for rust-lang/miri#3780).
+- `tests/combine.rs` holds every combinator, nested ones included, to its futures' sizes plus 256 bytes
+  each, and checks the early drop and the wait after the output; each failed on the `async fn`s (the
+  nested size by overflowing its test thread's stack).
+
+The rule for a consumer is the same: a wait wrapped around work is a named future, never an `async` block
+that awaits a future it was handed (focal's `focal_rt::time::Timeout`).
+
 ## 4. Running a future: `block_on`
 
 Every consumer needs to run one future to completion on the calling thread: a CLI command, `main`, a

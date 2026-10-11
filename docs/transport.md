@@ -241,7 +241,10 @@ each ported test's origin, and what was left out).
   `set_tls` replaces it while the endpoint runs; `directory` and `directory_mut` lend the directory
   to its owner between driving calls. `Config::congestion` is the controller every connection's
   paths run, one of hyper-quic's reviewed set (`congestion`, re-exported; CUBIC by default, focal
-  runs Copa, §4d), and `PathFacts` carries what the controller states of itself: its pacing rate
+  runs Copa, §4d), and `PathFacts` carries the path's probe timeout (RFC 9002 §6.2.1, what an
+  asker waits beyond the time it gives its peer to answer, for an answer sent at that deadline to
+  arrive: focal's asker judged a reply its server sent a millisecond before the deadline as late,
+  2026-10-10) and what the controller states of itself: its pacing rate
   and its slow-start threshold, when it has them.
 - Departures from §3.4's sketch, none of substance: `Directory` is the third type parameter (§3.4's
   `PeerId` presumed one); `Classes` gains `RANKS`, `rank`, `kind_code`, `kind_of` (the reserve counts

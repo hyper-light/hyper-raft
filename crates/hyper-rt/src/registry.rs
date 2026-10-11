@@ -893,23 +893,30 @@ mod tests {
             unregister(shard_holder);
             unregister(shard_holder);
             let under_the_reader = slot.generation.load(Ordering::Acquire);
+            // No other registration takes the slot until the free is judged: a registration claims a
+            // slot (odd to even) before it publishes the slot's entry, so a test beside this one that
+            // claimed the freed slot showed the bug's state, even and no entry, for that moment (95 of
+            // 12,314 runs of these tests under eight busy loops, 2026-10-11). A slot whose arena is
+            // spent is never claimed (AUD-29-11), so the slot reads spent until then; it is claimed
+            // now, by this test, so no registration is between its checks.
+            let arena = slot
+                .arena_generation
+                .swap(Encoded::TASK_GENERATION_LIMIT + 1, Ordering::AcqRel);
             // The reader is let go before anything is judged, so a failure ends the test, not the scope.
             release.send(()).unwrap();
             assert_eq!(reader.join().unwrap(), Some(()));
+            let after = slot.generation.load(Ordering::Acquire);
+            let entry = slot.entry.unguarded().is_null();
+            slot.arena_generation.store(arena, Ordering::Release);
             assert_eq!(
                 under_the_reader, live,
                 "the slot stays claimed while its reader holds the entry"
             );
+            // Freed by the reader, once: the next odd generation, and no entry. The bug's state was a
+            // second free under the reader and the reader's free after it: even, and no entry.
+            assert_eq!(after, live + 1, "freed by the reader, once");
+            assert!(entry, "a freed slot holds no entry");
         });
-        // Freed by the reader. Another test running beside this one may claim the free slot at once, so the
-        // state is judged, not the count: an odd generation is free; an even one is a registration with its
-        // entry. The bug's state is neither: even, and no entry (a second free under the reader).
-        let after = slot.generation.load(Ordering::Acquire);
-        assert_ne!(after, live, "freed by the reader");
-        assert!(
-            after & 1 == 1 || !slot.entry.unguarded().is_null(),
-            "a claimed slot holds its entry (generation {after})"
-        );
     }
 
     /// Mantle's final review: a retirement names its registration, not only its slot. Do: retire a live

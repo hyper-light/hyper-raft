@@ -206,6 +206,12 @@ fn a_request_and_its_reply_cross_in_every_class_with_streaming_bodies() {
     );
     let path = net.a.path(2).unwrap();
     assert!(path.cwnd > 0 && path.max_datagram >= 1_200, "{path:?}");
+    // The probe timeout covers the round trip and the peer's acknowledgement delay (RFC 9002
+    // §6.2.1): what an answer sent at its peer's deadline takes to be known delivered.
+    assert!(
+        path.probe_timeout > path.rtt && path.probe_timeout >= Duration::from_millis(25),
+        "{path:?}"
+    );
     let mut one = [0u8; 32];
     let mut two = [0u8; 32];
     assert_eq!(

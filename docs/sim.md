@@ -1416,13 +1416,18 @@ sessions' work, load 9–72 (`docs/benchmarks.md`, "hyper-check's strategies and
 
 | Defect (§4.6) | Random walk (§14.6) | Swarm | PCT, depth 1 | PCT, depth 2 | Coverage-guided | Exhaustive rounds (rounds played) |
 |---|---|---|---|---|---|---|
-| a commit counted from an older term's replicas | not in 2,096 | **172** | not in 2,096 | not in 2,096 | not in 2,096 | **33,621** (four rounds) |
+| a commit counted from an older term's replicas | not in 2,096 | **533** | not in 2,096 | not in 2,096 | not in 2,096 | **33,621** (four rounds) |
 | a read served before the term's first commit | 4 | 18 | 8 | 8 | 20 | **13,917** (two rounds, §15.14) |
 | a vote sent before it is durable | 1 | 1 | 1 | 1 | 1 | **11** (one lagged round, §15.14) |
 | the fast track without its first rule | 102,775 | **2,693** | 22,066 | 38,861 | not in 102,775 | outside its scope (no fast track) |
 | the fast track without its second rule | **8,868** | not in 8,868 | not in 8,868 | not in 8,868 | not in 8,868 | outside its scope |
 
-The counts are those on the core that counts by the newest configuration in its log (§15.12) and
+On the core that takes an append behind its member's commit past it (2026-10-12: what the append
+carries after the committed entry is appended, where the core answered with the commit and dropped
+it), the swarm's campaign on the older term's commit caught it at run 533 (seed 532), where it had
+at 172; every other catch recorded at its seed still catches there, its run without the defect
+clean (`each_catch_by_seed_is_its_defects`), and the other campaigns were not run again. Otherwise
+the counts are those on the core that counts by the newest configuration in its log (§15.12) and
 holds what it holds until a classic commit (§15.13), 2026-10-05; the campaigns were run again on it
 from their first seeds, and each catch is its defect's (`each_catch_by_seed_is_its_defects`,
 `each_catch_by_coverage_is_its_defects`). On the core of §15.12 the read before the first commit took

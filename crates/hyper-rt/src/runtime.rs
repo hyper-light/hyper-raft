@@ -709,8 +709,9 @@ impl LocalRuntime {
 
     /// Runs `future` to completion on this thread as the shard's root task and returns its output. Whatever
     /// the root spawned and left running is cancelled and joined before this returns: nothing outlives the
-    /// call. Refused when the root cannot be admitted, and `ShardGone` when the shard's driver is lost
-    /// before the root finishes.
+    /// call. Refused when the root cannot be admitted, `ShardGone` when the shard's driver is lost before
+    /// the root finishes, and `RootUnwound` when the root's future unwinds: the shard's boundary ends that
+    /// task with no output to wait for.
     pub fn block_on<T: 'static>(
         &mut self,
         future: impl Future<Output = T> + 'static,
@@ -719,9 +720,23 @@ impl LocalRuntime {
             let output = future.await;
             let _ = registry::with_current(|desk| desk.put_root_output(Box::new(output)));
         }))?;
-        self.shard.context().detach(root)?;
+        self.shard.context().begin_root(root);
+        if let Err(refused) = self.shard.context().detach(root) {
+            self.shard.context().end_root();
+            return Err(refused);
+        }
         loop {
+            if self.shard.context().root_unwound() {
+                // The root's poll unwound inside the shard's boundary and its task ended `Unwound`: no output
+                // will come. What it left running is cancelled and joined as on a return.
+                self.shard.context().end_root();
+                self.shard.cancel_everything();
+                return Err(RtError::RootUnwound {
+                    shard: self.slot.0.shard(),
+                });
+            }
             if let Some(output) = self.shard.context().take_root_output() {
+                self.shard.context().end_root();
                 self.shard.cancel_everything();
                 return output.downcast::<T>().map(|output| *output).map_err(|_| {
                     RtError::BadConfig {
@@ -731,6 +746,7 @@ impl LocalRuntime {
             }
             let outcome = self.shard.step();
             if outcome.exit {
+                self.shard.context().end_root();
                 self.shard.discard_root_output();
                 return Err(RtError::ShardGone {
                     shard: self.slot.0.shard(),

@@ -1282,6 +1282,7 @@ impl Shard {
             }
             self.drop_entered(future);
             self.finish(slot, Outcome::Unwound);
+            self.desk.note_unwound(TaskId(word));
             return;
         };
         self.after_poll(PollDone {

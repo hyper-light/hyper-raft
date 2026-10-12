@@ -330,6 +330,11 @@ pub struct ShardContext {
     /// The output of a [`crate::runtime::LocalRuntime::block_on`] root, moved here by the root as it finishes
     /// and taken by the runtime: written once, taken once.
     pub(crate) root_output: Cell<Option<Box<dyn std::any::Any>>>,
+    /// The task a running `block_on` waits on, so the shard can tell it that task's poll unwound.
+    pub(crate) root: Cell<Option<TaskId>>,
+    /// Set by the shard when the root's poll unwound and its task ended `Outcome::Unwound`: no output will
+    /// come, and `block_on` is refused rather than wait for one.
+    pub(crate) root_unwound: Cell<bool>,
     /// The loop's counters as of the start of the current step, published for tasks that report them.
     pub(crate) counters: Cell<crate::shard_loop::Counters>,
     /// A simulated shard's sockets (docs/runtime.md §11); `None` on an OS driver.
@@ -427,6 +432,8 @@ impl ShardContext {
             incarnation: registry::entry(id).map(Entry::holder),
             kept: KeptValues::default(),
             root_output: Cell::new(None),
+            root: Cell::new(None),
+            root_unwound: Cell::new(false),
             counters: Cell::new(crate::shard_loop::Counters::default()),
             sim: None,
         }
@@ -440,6 +447,30 @@ impl ShardContext {
     /// Takes a `block_on` root's output, once it finished.
     pub(crate) fn take_root_output(&self) -> Option<Box<dyn std::any::Any>> {
         self.root_output.take()
+    }
+
+    /// `task` is the root a `block_on` waits on, until [`ShardContext::end_root`].
+    pub(crate) fn begin_root(&self, task: TaskId) {
+        self.root.set(Some(task));
+        self.root_unwound.set(false);
+    }
+
+    /// The `block_on` waiting on its root returns.
+    pub(crate) fn end_root(&self) {
+        self.root.set(None);
+        self.root_unwound.set(false);
+    }
+
+    /// Task `task`'s poll unwound and it ended `Outcome::Unwound`: if it is the root, its `block_on` is told.
+    pub(crate) fn note_unwound(&self, task: TaskId) {
+        if self.root.get() == Some(task) {
+            self.root_unwound.set(true);
+        }
+    }
+
+    /// Whether the root's poll unwound.
+    pub(crate) fn root_unwound(&self) -> bool {
+        self.root_unwound.get()
     }
 
     /// Keeps `value` for the shard's life and hands back its [`Kept`] handle: for an owner between steps

@@ -51,6 +51,12 @@ pub enum RtError {
         /// The shard.
         shard: u16,
     },
+    /// A `block_on`'s root future unwound: the shard's boundary ended its task `Outcome::Unwound`, so no
+    /// output will come, and what the root left running was cancelled and joined.
+    RootUnwound {
+        /// The shard.
+        shard: u16,
+    },
     /// A memory refusal beneath the runtime.
     Mem(MemError),
     /// The shard's kept values are borrowed — a keep inside a `Kept::with` on the same shard, or inside
@@ -114,6 +120,7 @@ impl fmt::Display for RtError {
             Self::BadConfig { what } => write!(f, "bad configuration: {what}"),
             Self::ControlFull { shard } => write!(f, "shard {shard}'s control channel is full"),
             Self::ShardGone { shard } => write!(f, "shard {shard} is gone"),
+            Self::RootUnwound { shard } => write!(f, "shard {shard}'s root future unwound"),
             Self::Mem(e) => write!(f, "memory: {e}"),
             Self::KeptInUse { shard } => write!(f, "shard {shard}'s kept values are borrowed"),
             Self::RingClaimed { shard } => write!(

@@ -467,6 +467,16 @@ cancellation is done, while losing the driver or a shutdown keeps it closed. A t
 after the root stored its output but before the call took it drops that output, with the shard entered,
 before the call returns its error (`tests/completed_output_loss.rs`).
 
+A root whose future unwinds has no output to give: the shard's boundary ends its task
+`Outcome::Unwound` (§3.1). The call names its root to the shard (`ShardContext::begin_root`), the shard
+tells it when that task's poll unwound, and the call cancels and joins what the root left, as on a
+return, and returns `RtError::RootUnwound`. A root dropped by cancellation, as the shard leaves its loop
+when its driver is lost, ended `Cancelled`, not `Unwound`: that call returns `ShardGone`, as before.
+Before, the call waited for an output that would never come: a test whose assertion failed inside its
+root left its binary waiting on windows-11-arm (diag run 38275004157), and a command whose root panicked
+would not have ended (`tests/block_on_reuse.rs`, `a_root_that_unwinds_ends_its_call_refused_and_the_next_runs`,
+which waited until it was stopped before the guard).
+
 The test harness is the same call: `hyper_rt::test::run(|| async { ... })` inside a plain `#[test]`, with
 a test configuration (§10.3). No procedural macro crate.
 

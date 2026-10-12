@@ -1042,11 +1042,21 @@ lateness, the stall's delay (§2.2; `PairReport::skipped` counts them).
   interval its own evidence needs (below, "The interval the evidence needs"), nor, while its node's
   evidence judges the link and its margin at the link's interval promises nothing, below the best
   interval that evidence gives ("Judged before its own evidence"). Where the floor binds
-  (before the receiver asks, or past what it asked) the interval is the floor, followed up and not
-  down: an interval below the floor is unstable (Lindley 1952), but a floor that fell is a mean that
-  moved with a sample, and following it down started the receiver's estimator again at every move
-  (`LinkEstimator::retime`), which kept a link whose flushes stalled now and then unconfigured for
-  thousands of heartbeats (§2.9). A change within `G`, the configurator's resolution, is none.
+  (before the receiver asks, or past what it asked) the interval is the floor, followed up at once
+  and down once the flushes the floor is the mean of have doubled since it last gave the interval:
+  an interval below the floor is unstable (Lindley 1952), and a mean over a growing history is as
+  stale as it is uncertain once the history has doubled (`docs/research/timing.md`, "When to renew
+  an estimate's configuration"), so the interval moves down at most once a doubling. Followed down
+  at every sample, a mean that moved with each one started the receiver's estimator again at every
+  move (`LinkEstimator::retime`), which kept a link whose flushes stalled now and then unconfigured
+  for thousands of heartbeats (§2.9). Never followed down, the interval kept a new log's first
+  flushes: on a windows-2025 runner with three of `tests/processes.rs`'s tests at once (diag run
+  38317208076, round 6 of 10), the members' first flushes took 0.7 to 3.1 s and their floors then
+  fell to 33 to 118 ms, but their links stayed at 0.65 to 2.2 s, measured `τ_int` there for 38 to
+  193 s, and moved up from there for their evidence (to 4.5, 5.0 and 9.4 s): the slowest links of
+  two tests configured after 357 and 561 s, and one link of the third had not when it was stopped
+  at 720 s, where every pair of the other nine rounds configured in 4 to 30 s. A change within `G`,
+  the configurator's resolution, is none.
   Bootstrap: the first heartbeat waits on the first flush, whose time is the first `E[flush]`; the
   first wait for a wake that the owner reports measures `G` (§2.4).
 - **The interval the evidence needs** (`T_c`, measured online: §2.6 item 6 left it open). The

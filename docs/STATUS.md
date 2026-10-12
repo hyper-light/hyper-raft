@@ -125,6 +125,13 @@ held an election back.
 
 ### Closed (2026-10-12)
 
+- **hyper-quic `tests::pad_to_mtu`, windows-2025 CI (run 38316593172, the client sent nothing,
+  "blocked by congestion control").** With `pad_to_mtu`, a packet of acknowledgments alone was padded:
+  in flight against the window (RFC 9002 §2, §3), never checked against it, and acknowledged by the peer
+  only along with an ack-eliciting packet (RFC 9000 §13.2.1). The server's warm-up drew twelve of them,
+  and the client's datagrams waited behind them; how many depended on the packet numbers the server
+  skipped at random. Only ack-eliciting packets are padded now (hyper-quic `VENDORED.md` §25; the test
+  `padding_to_the_mtu_leaves_acknowledgments_unpadded_and_out_of_flight` fails before it).
 - **A shell group stopped and opened again at once failed `Compacted` (focal, on `aa82ada`; focal-node
   on Linux, 3 to 4 runs in 10 of one test).** hyper-log released a dropped handle's group at once, while
   writes it had sent could still be out; a claim between was given the group without them and never heard

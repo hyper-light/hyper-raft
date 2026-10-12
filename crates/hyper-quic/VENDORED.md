@@ -964,3 +964,31 @@ rows.
   - The slow-path test checks the byte count.
   - The 400 unit tests and the congestion, e2e, geo and handshake suites pass, with
     hyper-transport's.
+
+## 25. Acknowledgments alone are not padded to the MTU (2026-10-12)
+
+- **Patch Q14: `pad_to_mtu` pads ack-eliciting packets only.**
+  - Upstream pads every 1-RTT datagram when `pad_to_mtu` is on, a packet of acknowledgments alone
+    included. A padded packet is in flight and counts against the congestion window: RFC 9002 §2
+    ("in flight when they are ack-eliciting or contain a PADDING frame") and §3. But a packet of
+    acknowledgments is never checked against the window (`start_datagram` checks ack-eliciting
+    packets), so padded it went past the window, which RFC 9002 §7 forbids ("MUST NOT send a
+    packet if it would cause bytes_in_flight ... to be larger than the congestion window").
+  - Nothing frees it either. A peer acknowledges a non-ack-eliciting packet only along with an
+    ack-eliciting packet of its own (RFC 9000 §13.2.1: "An endpoint that is only sending ACK frames
+    will not receive acknowledgments from its peer"). A client that only acknowledges a server's
+    flight holds the window its padded acknowledgments took until a later exchange.
+  - Found on windows-2025 CI, `tests::pad_to_mtu` (run 38316593172): the client sent nothing,
+    "blocked by congestion control". The server's warm-up (§15) ran to its budget of about 160
+    padded PINGs, and the client acknowledged them in twelve packets padded to 1,333 bytes (its
+    packet numbers 3 to 14), three of them drawn at once by packet numbers the server skipped
+    (RFC 9000 §21.4, §13.2.1), none checked against the window. How many the skips add is random,
+    so the test passed in most runs.
+  - The padding hides the size of what the application sends, the option's stated purpose. A
+    packet of acknowledgments carries none of it. The flag is now set once a packet is certain to
+    be sent, and only for an ack-eliciting one, so a congestion check that held a packet back
+    sets nothing either.
+- **Tests.** `tests::padding_to_the_mtu_leaves_acknowledgments_unpadded_and_out_of_flight`: a client
+  padding to its MTU acknowledges more server pings than its window holds padded datagrams; every
+  acknowledgment is an ACK frame alone and nothing of the client is left in flight. It fails before
+  the patch, 1,333 bytes in flight. `tests::pad_to_mtu` and the unit and integration suites pass.

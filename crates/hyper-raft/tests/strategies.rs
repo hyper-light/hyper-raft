@@ -934,12 +934,14 @@ fn check_catches(guided: bool) {
 
 /// The catches the campaigns reported (2026-10-05, on the core that counts by the newest
 /// configuration in its log and holds what it holds until a classic commit): strategy, case, and
-/// the seed (for a coverage campaign, the run). `FastAnyConfiguration` is caught by the random
+/// the seed (for a coverage campaign, the run). On the core that takes an append behind the commit
+/// past it (2026-10-12), the swarm's catch of the older term's commit moved from seed 171 to 532;
+/// every other catch here still catches at its seed. `FastAnyConfiguration` is caught by the random
 /// walk alone (`CASES`): swarm, PCT at either depth and the coverage-guided campaign each ran its
 /// 8,868 runs without a catch; and the coverage-guided campaign ran `FastBesideAnyTerm`'s 102,775
 /// without one.
 const CATCHES: &[(Strategy, usize, u64)] = &[
-    (Strategy::Swarm, 0, 171),
+    (Strategy::Swarm, 0, 532),
     (Strategy::Swarm, 1, 17),
     (Strategy::Swarm, 2, 0),
     (Strategy::Swarm, 3, 2_692),

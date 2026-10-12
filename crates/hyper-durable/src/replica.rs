@@ -38,6 +38,7 @@ use std::task::Waker;
 use std::time::Duration;
 
 use hyper_liveness::{Liveness, PeerId};
+use hyper_raft::progress::ProgressState;
 use hyper_raft::proto::{
     self, ConfChange, ConfChangeV2, ConfState, Entry, EntryType, HardState, Message, Snapshot,
     SnapshotMetadata,
@@ -383,7 +384,7 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
         let durable = machine.durable();
         let view = repair_at_open(&mut log, durable)?;
         // What the member has yet to apply it reads back from its store, which may keep it.
-        log.applied(durable.index);
+        log.keep_after(durable.index);
         let depth = log.depth();
         let mut config = settings.core.clone();
         config.applied = durable.index;
@@ -1145,6 +1146,7 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
                 r.quiet_commit(now, waker)?;
             }
             r.release_reads(out);
+            r.keep();
             r.settle();
             Ok(r.driven())
         })
@@ -1888,9 +1890,38 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
             self.must(told)?;
             self.told_applied = self.applied.index;
             // What the store kept for this replica to read back before applying it may go.
-            self.node.store_mut().log.applied(self.applied.index);
+            self.keep();
         }
         Ok(())
+    }
+
+    /// Tells the store the index after which it keeps what this replica will read back
+    /// ([`LogStore::keep_after`]): what it has yet to apply, and on a leader what a replicating
+    /// member has yet to acknowledge of what was sent to it up to the apply point, which a resend
+    /// reads (focal, 2026-10-12). A member in `Replicate` whose next index is past the apply point
+    /// has all of that in flight, within the window the leader sends it ahead (`set_inflight_bytes`),
+    /// so it holds no more than its window; one whose next index is not past it, or that probes or
+    /// takes a snapshot, holds nothing, so a stalled member pins nothing past its window. A mark
+    /// below one already given changes nothing, so a member that falls behind and catches up holds
+    /// the mark again only from where it then stands.
+    fn keep(&mut self) {
+        let applied = self.applied.index;
+        let from = if self.is_leader() {
+            let id = self.id();
+            self.node
+                .raft
+                .tracker()
+                .iter()
+                .filter(|&(member, progress)| {
+                    member != id
+                        && progress.state == ProgressState::Replicate
+                        && progress.next_index > applied
+                })
+                .fold(applied, |from, (_, progress)| from.min(progress.matched))
+        } else {
+            applied
+        };
+        self.node.store_mut().log.keep_after(from);
     }
 
     /// Gives out `messages`. The emptied vector goes back to the core as its next queue

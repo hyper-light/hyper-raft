@@ -171,6 +171,14 @@ impl<F: BlockFile + 'static> LogStore for Depth<F> {
     fn write_now(&mut self, write: &Write<'_>) -> Result<(), Fault> {
         self.0.write_now(write)
     }
+
+    fn keep_after(&mut self, index: u64) {
+        self.0.keep_after(index);
+    }
+
+    fn kept_bytes(&self) -> u64 {
+        self.0.kept_bytes()
+    }
 }
 
 type Member<F> = Replica<Depth<F>, RangeMachine, Unbounded>;

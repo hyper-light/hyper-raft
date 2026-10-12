@@ -61,6 +61,10 @@ tail, std's disconnect bit), so no send lands after the close, which mantle's ch
 check and its push; one of `readiness_waits`' tests waits for a later step, not one yield, since a step
 polls a task that yields again within its batch (PR #16); and hyper-measure's Linux probe reads `/proc`
 with no allocation, which `service_driverless_receipts` counted as the runtime's (`crates/hyper-rt/ORIGIN.md`).
+In hyper-durable, the keep mark's follower half: a leader's store keeps what a member in `Replicate` has yet
+to acknowledge of what was sent it, while all of it is in flight, within its window, so a resend reads
+from the handle and a stalled member pins nothing past what it was sent (`docs/durable.md` §8, focal's
+question); the store's two keep methods have no defaults, so a wrapper passes the mark on.
 
 ## Open defects
 
@@ -181,9 +185,7 @@ crates' open work; then each consumer's switch-over (mantle note 32 §5, each pr
      hyper-seal's `ORIGIN.md`. This repository's agent re-vendors slates (slates' own gates, its
      session fast-forwards).
 3. **The shared crates' open work**, each in its own document:
-   - hyper-durable: §14's measurements, and the follower half of the store's keep mark (focal's
-     question: entries a replicating follower has yet to acknowledge, kept within the window a
-     leader sends ahead, so a stalled follower pins nothing past it).
+   - hyper-durable: §14's measurements.
    - hyper-sim and hyper-check: S-6 (hyper-raft's and hyper-durable's harnesses onto both crates),
      S-7 (the E2E crates' histories checked) and S-8 (the consumers' simulations), `docs/sim.md` §9.
    - Tails, `docs/tails.md` §7: T-0 (the grid), T-1 (the measurement kit), T-2 (the impairment

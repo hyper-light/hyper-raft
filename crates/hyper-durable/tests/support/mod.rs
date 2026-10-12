@@ -171,6 +171,9 @@ pub struct SimStore {
     refused_epoch: Option<u64>,
     /// The log holds no room for another write until the owner frees some.
     pub full: bool,
+    /// The highest mark the replica gave ([`LogStore::keep_after`]), for a test to hold against the
+    /// core's state: every entry is in `answered`, so the store keeps nothing apart for it.
+    pub kept_after: Option<u64>,
 }
 
 impl SimStore {
@@ -190,6 +193,7 @@ impl SimStore {
             epoch: 0,
             refused_epoch: None,
             full: false,
+            kept_after: None,
         }
     }
     /// Writes submitted and not yet durable.
@@ -367,6 +371,14 @@ impl LogStore for SimStore {
         self.disk.apply(&owned).map_err(Fault::Failed)?;
         self.answered.apply(&owned).map_err(Fault::Failed)?;
         Ok(())
+    }
+
+    fn keep_after(&mut self, index: u64) {
+        self.kept_after = Some(self.kept_after.map_or(index, |kept| kept.max(index)));
+    }
+
+    fn kept_bytes(&self) -> u64 {
+        0
     }
 }
 

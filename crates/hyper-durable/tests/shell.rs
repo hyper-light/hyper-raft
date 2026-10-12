@@ -1130,6 +1130,14 @@ impl LogStore for Holding {
     fn write_now(&mut self, write: &Write<'_>) -> Result<(), Fault> {
         self.inner.write_now(write)
     }
+
+    fn keep_after(&mut self, index: u64) {
+        self.inner.keep_after(index);
+    }
+
+    fn kept_bytes(&self) -> u64 {
+        self.inner.kept_bytes()
+    }
 }
 
 /// Drives `r` and makes every write durable until nothing is out and nothing more to do, or it

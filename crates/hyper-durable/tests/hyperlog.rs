@@ -390,7 +390,7 @@ fn entries_the_replica_has_yet_to_apply_are_read_back_from_its_store_until_appli
     let mut store = GroupStore::claim(&log, 1).unwrap();
     let (waker, woken) = store_waker();
     // As a replica opens with nothing applied.
-    store.applied(0);
+    store.keep_after(0);
     let written = entries_of(1, 8, 1);
     let bytes = |entries: &[hyper_raft::proto::Entry]| -> u64 {
         entries
@@ -413,7 +413,7 @@ fn entries_the_replica_has_yet_to_apply_are_read_back_from_its_store_until_appli
     let mut read = Vec::new();
     store.entries(3, 7, u64::MAX, &mut read).unwrap();
     assert_eq!(read, written[2..6]);
-    store.applied(4);
+    store.keep_after(4);
     assert_eq!(
         store.kept_bytes(),
         bytes(&written[4..]),
@@ -441,9 +441,9 @@ fn entries_the_replica_has_yet_to_apply_are_read_back_from_its_store_until_appli
         "a range applied is the log's, and the log is closed"
     );
     // A lower mark changes nothing.
-    store.applied(2);
+    store.keep_after(2);
     assert_eq!(store.kept_bytes(), bytes(&written[4..]));
-    store.applied(8);
+    store.keep_after(8);
     assert_eq!(store.kept_bytes(), 0);
 }
 

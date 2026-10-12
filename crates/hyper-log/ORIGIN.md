@@ -402,8 +402,9 @@ its flushes.
 - `GroupLog::keep_after(index)` keeps the entries after `index` whatever the share, until a later
   call raises it; those at or before it are kept by the share alone, as before any call.
   `GroupLog::kept_bytes` counts what is kept past the share, for its caller to bound: hyper-durable's
-  replica marks what it has applied as it opens and after each apply, and counts the bytes with what
-  it holds, so its owner's budget bounds them (hyper-raft `docs/durable.md` §8). The bytes are the
+  replica marks what it will read back as it opens and after every drive (what it has yet to apply,
+  and on a leader what a replicating member has yet to acknowledge of what was sent it), and counts
+  the bytes with what it holds, so its owner's budget bounds them (hyper-raft `docs/durable.md` §8). The bytes are the
   ones the answer brought back: nothing is copied to keep them, where focal's first form of the fix,
   a second copy in the store, made one allocation and one copy an entry.
 - **Tests**: `a_handle_keeps_what_its_replica_has_yet_to_apply` (`tests/group.rs`, every count exact,

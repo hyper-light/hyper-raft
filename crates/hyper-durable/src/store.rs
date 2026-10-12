@@ -251,17 +251,16 @@ pub trait LogStore {
     /// else (`docs/durable.md` §4.3).
     fn write_now(&mut self, write: &Write<'_>) -> Result<(), Fault>;
 
-    /// The replica has applied its log through `index`: the entries after it, which it has yet to
-    /// apply, are the ones it will read back, and a store that keeps entries in memory for that keeps
-    /// them (`docs/durable.md` §8). Called as the replica opens and after it applies; `index` only
-    /// rises. A store that keeps nothing ignores it.
-    fn applied(&mut self, index: u64) {
-        let _ = index;
-    }
+    /// The entries after `index` are ones the replica will read back: those it has yet to apply,
+    /// and on a leader those a replicating member has yet to acknowledge of what was sent to it
+    /// (`docs/durable.md` §8). A store that keeps entries in memory for those reads keeps these
+    /// whatever its own cache's budget, and lets the rest go by that budget. Called as the replica
+    /// opens and at the end of every drive; an `index` below one already given changes nothing.
+    /// Every store says what it does with it, a wrapper by passing it on: a default that did
+    /// nothing let a wrapper drop it unseen.
+    fn keep_after(&mut self, index: u64);
 
-    /// The bytes the store keeps in memory for the replica's reads past its own bounds, which the
-    /// replica's budget counts with what it holds itself. Zero for a store that keeps none.
-    fn kept_bytes(&self) -> u64 {
-        0
-    }
+    /// The bytes the store keeps in memory past its own budget for [`LogStore::keep_after`], which
+    /// the replica's budget counts with what it holds itself.
+    fn kept_bytes(&self) -> u64;
 }

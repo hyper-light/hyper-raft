@@ -874,13 +874,26 @@ owner says the window's carriage as the transport's measure moves (`Replica::set
 the shell passes the rule's window to the core (`set_inflight_bytes`).
 
 **hyper-log.** The shell is generic over the log (§9); hyper-log is the disk implementation. The
-replica tells its store what it has applied (`LogStore::applied`) as it opens and after each apply,
-and counts what the store keeps for it (`LogStore::kept_bytes`) with what it holds, so its owner's
-budget bounds it. hyper-log's store keeps, in the group's handle, the entries after that mark whatever
-the group's share of the log's cache (`GroupLog::keep_after`): a leader's entries are durable at its
-own write and committed at its followers' answers, and by then the core has let them go, so its apply
-reads each back, from the handle, never through the log's owner and its device (focal, 2026-10-12:
-57% of a session owner's time on those reads at 5,000 writes a second, its share 64 KiB a group).
+replica tells its store, as it opens and at the end of every drive, the index after which it will read
+entries back (`LogStore::keep_after`), and counts what the store keeps for it (`LogStore::kept_bytes`)
+with what it holds, so its owner's budget bounds it. hyper-log's store keeps, in the group's handle,
+the entries after that mark whatever the group's share of the log's cache (`GroupLog::keep_after`): a
+leader's entries are durable at its own write and committed at its followers' answers, and by then the
+core has let them go, so its apply reads each back, from the handle, never through the log's owner and
+its device (focal, 2026-10-12: 57% of a session owner's time on those reads at 5,000 writes a second,
+its share 64 KiB a group).
+
+The mark is what the replica has yet to apply, and on a leader, below it, what a member in `Replicate`
+has yet to acknowledge, while its next index is past the apply point: everything up to the apply point
+was sent to it then and is in flight, within the window the leader sends it ahead, so a resend after a
+loss or a refusal reads from the handle too (focal's question, 2026-10-12). A member whose next index
+is not past the apply point, whose window filled and stayed full while the others went on, or one that
+probes or takes a snapshot, holds nothing: a stalled member pins no more than was in flight to it, and
+from the moment the apply point passes what was sent it, nothing at all. The mark only rises, so a
+member that falls behind holds it again from where it stands once it is caught up past it. Held after
+every leader drive against the leader's own tracker (`tests/keep.rs`), and red with the follower half
+taken out. The two methods have no defaults: a store says what it does with the mark, and a wrapper
+passes it on, where a default that did nothing let a wrapper drop it unseen.
 
 ## 9. The API
 
@@ -896,6 +909,11 @@ pub trait LogStore: hyper_raft::Storage {
     fn poll(&mut self) -> Option<Result<(), LogFault>>;
     /// What the store found of this group when it opened (§5).
     fn health(&self) -> Health;
+    /// The index after which the replica will read entries back, which a store that keeps
+    /// entries in memory keeps whatever its own budget (§8); no default.
+    fn keep_after(&mut self, index: u64);
+    /// What the store keeps past its budget for that, which the replica's budget counts.
+    fn kept_bytes(&self) -> u64;
 }
 
 /// What the shell asks of a state machine.

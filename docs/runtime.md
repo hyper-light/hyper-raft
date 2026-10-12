@@ -203,9 +203,10 @@ objective states it, and the smaller of the two applies.
 ### 3.4 The loop
 
 Each step: drain the control queue (spawns, cancels, shutdown), drain the wake bitmap, take the driver's
-completions, expire timers, poll up to `batch` ready tasks. When nothing is ready the shard spins for the
-expected cost of parking and then parks in its driver until a kick, a completion or the next deadline:
-the 2-competitive spin-then-block rule [KARLIN], with the threshold the measured mean wake (§10). slates'
+completions, expire timers, poll up to `batch` ready tasks. When nothing is ready the shard spins for what
+blocking costs it and then parks in its driver until a kick, a completion or the next deadline: the
+2-competitive spin-then-block rule [KARLIN], with the threshold the CPU one park/wake cycle costs,
+measured on the shard's own parks (§3.9, D2; it was the measured mean wake, slates' rule). slates'
 attribution of a long poll to the task or to the host (`attribution.rs`) is kept.
 
 **The driver is polled only when it can hold work, and the spin polls it once a quantum.** A busy loop
@@ -241,8 +242,16 @@ harvest, the spin or a park: `DriverLost` is classified before any completion of
 delivered and before a handle is armed again, so a partial read never completes on a dead driver. The
 shard closes admission, local spawns and foreign control alike (`ShardGone`), drops its control
 receiver so requests already queued retire, and cancels every live task, including the one being
-polled, at its next poll boundary; the owned loop finishes that cancellation within twice the live tasks
-plus one steps and exits. `block_on` then returns `ShardGone` and the threaded runtime's join
+polled, at its next poll boundary. Ordinary tasks retire at that boundary. An admitted cooperative
+service retains its future and task generation until its cancellation cleanup returns `Ready`; an
+external device transfer can therefore delay exit until its own completion. After driver loss the
+same wake bitmap carries channel completions. The actual shard thread is bound once during cold
+context construction; after driver loss, `Thread::unpark` carries one retained cleanup permit.
+The owning loop announces parking, rechecks the bitmap, and calls `thread::park` only when idle.
+A stale or spurious permit carries no completion. Manual `step`/`park` remain nonblocking after
+loss and leave pending services owned (`cleanup_permit_stress.rs`).
+No cleanup task can arm a new readiness wait or timer on the lost driver. `block_on` then returns
+`ShardGone` and the threaded runtime's join
 `DriverLost`. A driver's other refusals to arm a handle again reach the waits still on it as that exact
 error, never as readiness (`tests/busy_driver_loss.rs`, `manual_step_faults.rs`, `park_arm_loss.rs`,
 `terminal_admission.rs`, `threaded_loss_reuse.rs`).
@@ -450,6 +459,51 @@ test on both trees, futures holding 16 KiB each (bytes):
 The nested one, 15 times smaller, overflowed a 2 MiB debug test thread as `async fn`s (`SIGABRT`). Its
 license (Apache-2.0 OR MIT) and its source (crates.io) pass mantle's and focal's `cargo deny` policies.
 
+### 3.9 The loop under load: one kick a park, a spin as long as blocking costs, the cheap clock, channels with no lock
+
+Made in mantle's copy by the owner's direction and taken here as they are (mantle commits `bfdf9c2`,
+`bb0779e` and `bd7c0fd`, its `docs/design/event-loop.md` D1–D4, the evidence its
+`docs/research/42-event-loop-under-load.md`, cited "note 42"). The bar: a busy machine is the normal
+case, and the loop's costs must not grow with the load.
+
+- **One kick a park (D1).** A shard's park announcement is a state word (running, parked, parked with its
+  kick claimed). A sender that reads it parked claims the kick with one compare-and-swap and only the
+  winner makes the system call; a wake to a running shard writes nothing to its parking line. Every
+  sender used to kick: 3.2 to 4.5 system calls a park in fan-in (note 42 §3); tokio's parker claims the
+  same way with its `NOTIFIED` state. `tests/one_kick_per_park.rs` (one kick for four wakes held against
+  a park, four before) and the loom model `parking::two_senders_never_lose_a_word_and_a_park_takes_one_kick`
+  (3,520 interleavings; it fails at 63 with the claim removed).
+- **A tracking shard spins as long as blocking costs it in CPU (D2).** While a shard tracks its wake,
+  its idle spin lasts the CPU one park/wake cycle costs, read on the thread CPU clocks of the parking
+  shard and of the sender that claimed its kick (`park_cost.rs`): spin-then-block is 2-competitive when
+  the spin lasts as long as the context switch costs [KARLIN]. The spin used to last the measured wake
+  latency, about eighty times the cycle's CPU and moving with the load (1.9 µs to 577 µs between
+  calibrations a minute apart, note 42 §1–§2). No spin until a first park is measured, none where the OS
+  keeps no fine per-thread clock (Windows). The estimator's warm-up is the stopping rule's floor
+  (`MIN_SAMPLES`, 59, Wilks) and its window the rule's `N = (z·sd / (h·mean))²` on the warm-up's own
+  spread. `tests/spin_by_park_cost.rs`. The CPU clock is read only by a learning shard, around a wait it
+  makes, and the second time only after a first (`bd7c0fd`: reading it after every park halved every
+  shard's calibrated batch, 117 to 262 ns an item; `tests/park_cost_reads.rs`).
+- **The shard's clock is the cheap one, read once a poll (D3).** On macOS `mach_continuous_time` scaled
+  by the timebase as a 32-bit fixed-point ratio, 4.8 ns a read where `CLOCK_MONOTONIC` costs 16.1 ns at
+  1 µs resolution (note 42 §4); elsewhere `monotonic_ns`, already the cheap clock there. A step of `p`
+  polls reads it `1 + p` times (`2 + p` when its drains or driver did work), where it read
+  `CLOCK_MONOTONIC` `2 + 2p` times; a poll that yields cost 47.5 ns and costs 15.9 ns (note 42 §7).
+  `SCALE_BITS` (32) is format: the 64×64-bit product cannot overflow 128 bits and the rounding error stays
+  under 10⁻¹¹ of a tick (`machine::clock`'s tests).
+- **Channels hand values over with no lock (D4).** The bounded channel and the one-shot carry their values
+  through a lock-free bounded ring (`sync/ring.rs`, Vyukov's queue with std's lap-encoded positions), wake
+  a waiting receiver, task or parked thread, through its cell's waiter word (`handoff.rs`), and hold
+  senders waiting for room in places of their own (`sync/room.rs`); each take grants one place its room.
+  `channel_with`'s `waiters` bounds the senders waiting at once, and `blocking_send` past it is told
+  `Full`, where it used to wait inside std's channel, unbounded. std's `sync_channel` registered blocked
+  ends behind a mutex every send to a blocked receiver took. With plain threads one producer moves 144
+  million values a second against 30 million before, and sixteen contending producers 674 thousand against
+  407 thousand at a third of the CPU (note 42 §8). loom under the workspace's bounds: the ring (548
+  interleavings), a thread waiter (6,289), one and two senders waiting for room (50 and 71,847), each
+  failing under its recorded mutations; `tests/channel_threads.rs` runs real threads through the blocking
+  calls. `Padded`'s 128-byte alignment is shape (the largest cache line targeted, Apple silicon's).
+
 ## 4. Running a future: `block_on`
 
 Every consumer needs to run one future to completion on the calling thread: a CLI command, `main`, a
@@ -475,7 +529,53 @@ when its driver is lost, ended `Cancelled`, not `Unwound`: that call returns `Sh
 Before, the call waited for an output that would never come: a test whose assertion failed inside its
 root left its binary waiting on windows-11-arm (diag run 38275004157), and a command whose root panicked
 would not have ended (`tests/block_on_reuse.rs`, `a_root_that_unwinds_ends_its_call_refused_and_the_next_runs`,
-which waited until it was stopped before the guard).
+which waited until it was stopped before this change).
+
+An owner with asynchronous retirement uses `spawn_service` (local), or
+`spawn_service_on_with_receipt` (threaded). The service mark is installed before its first poll;
+the admission receipt must be accepted before transferring physical ownership to it. Cancellation
+is a level read by `cancellation_requested` or awaited with `cancelled()`. It cancels the service's
+children once, but does not drop the service future: the service enters closing once, awaits its
+external completions, and returns. Its join then reports `Cancelled`. Repeated cancellation cannot
+interrupt closing or recycle its generational task handle. Ordinary `spawn` retains hard cancellation
+semantics (`tests/cooperative_service.rs`, `service_retention_red.rs`, `service_sim_loss.rs`). A foreign
+future that panics cannot resume cleanup; the unwind tests cover retirement of the remaining task
+family, rather than recovery of the panicked owner's resources.
+
+Native maintenance threads transfer before service admission. The cold runtime owner calls
+`prepare_retirement` with each group's configured handle capacity, then each lease's `adopt`
+with its complete handle vector. A typed refusal before acceptance returns that entire vector;
+an accepted transfer with a lost receipt remains owned by the runtime. Adoption and blocking
+cleanup refuse on a shard. Each service later signals once and awaits the same lease's terminal
+reply, retaining it across borrowed cancellation and refusing foreign poll contexts before
+consuming an answer. That reply follows every native join, including TLS destruction; a failed
+join still retires the remaining handles. No service transfers a handle or joins a thread during
+terminal cleanup.
+
+An original device file can transfer before service admission through
+`prepare_retirement_with_original`. Its cold adoption keeps the entire file with the
+caller on refusal and moves it to the same reaper on acceptance. The service then holds
+an `OriginalLease`, while the reaper owns the file and its registered physical fence.
+Original retirement joins the group's maintenance workers, waits for the independent
+physical terminal event, and closes the file before answering that lease. The worker
+receipt remains separate, so a worker can retire before the owning attachment detaches.
+An actual physical failure precedes a later join or file-destructor failure. A foreign
+fence that returns without retirement keeps the file owned until an explicit terminal
+retry; cancellation or shutdown cannot force its close. The actor never owns the file
+after cold adoption and awaits the close receipt through channel wakes.
+
+Live groups are bounded by the configured task arena. A preparation batch owns one cold reaper,
+one command per lease plus the owner's Stop credit, and one reusable reply per lease. Completed
+group counts publish before terminal replies, so immediate cold setup can prune completed owners.
+Runtime shutdown first stops and joins its shard workers while reapers remain alive, then stops
+and joins those reapers. Unused external leases cannot hold shutdown waiting for channel EOF.
+Arbitrary adopted threads must have their input dependencies closed by their caller; the runtime
+cannot make a foreign thread or a process-aborting TLS destructor complete
+(`retirement_native.rs`, `retirement_shutdown_native.rs`, `retirement_extra_native.rs`).
+Original-file groups reserve three command roles per group plus the independent Stop
+credit: worker adoption or retirement, original publication, and original retirement.
+Their ownership, canceled waits, refusal and first-error behavior are exercised by
+`original_retirement_native.rs`.
 
 The test harness is the same call: `hyper_rt::test::run(|| async { ... })` inside a plain `#[test]`, with
 a test configuration (§10.3). No procedural macro crate.
@@ -666,13 +766,33 @@ A device issuer (hyper-block's writer and readers: Linux native AIO by mantle's 
 on Windows, the bounded pool on macOS; NOTE26 §2.6) completes an I/O on its own thread and must wake the
 task waiting for it, so that one shard waits on network and disk together without a thread per request.
 
-That seam is `std::task::Waker`, and nothing more is needed: the waiting task hands the issuer its waker
-(a `Copy` word, §3.2), the issuer writes the result into the slot it owns for that request (hyper-block's
-`Pending`), and calls `wake`; the wake sets the task's bit and kicks the shard if parked. The cost is one
-`fetch_or` and at most one kick per completion, and an issuer completing a batch kicks once (the second
-wake finds the shard already kicked or running) (DERIVED from §3.5). This is the one-to-one wake of NOTE26
-§5.2: no waiter is woken that is not admitted. NOTE32 §3.1 already chose `Waker` as the crossing for every
-shared crate, so hyper-block needs no dependency on hyper-rt.
+The pool issuer uses hyper-rt's bounded reusable channel (§8) for its numbered answers and
+terminal retirement receipt. Each attachment's declared batch capacity bounds both its submission
+lane and answers; the credit includes a batch queued, physically in flight or answered but not yet
+consumed. `answer_async` and `retire_async` borrow that receiver: dropping the wait leaves its
+number, buffers and credit with the attachment for a later poll. The channel registers the admitted
+task's `Copy` waker and publishes before waking, so an issuer completion wakes exactly that owner.
+Cold setup allocates these lanes once; no per-transfer channel or boxed waiter is created.
+Hyper-block therefore depends on the shared hyper-rt primitive, rather than retaining another
+completion implementation. Both crates must be staged and gated together before any consumer
+updates its exact snapshot. Owning asynchronous cleanup is a cooperative service (§4); a canceled
+borrowed receive does not establish that dropping an attachment itself is nonblocking.
+
+`Attached::prepare_retirement_watch` registers one independent physical receipt during
+cold setup. The broker acknowledges its ownership before the original file can transfer
+to a native retirement group. This watch survives loss of the submitter and its ordinary
+answer receiver. Normal retirement answers after every file duplicate drops; abnormal
+broker or worker exit retains the watch through all native joins, including TLS. A
+consumed write or flush failure remains its first physical cause, while a repaired
+numbered read failure does not poison retirement. Context refusal leaves even an already
+ready watch receipt untouched. The watch's blocking wait is confined to its cold native
+owner; actors use the original-file lease's asynchronous receipt (§4).
+
+Each actually started issuer worker publishes into its own cold lane: one report for its
+sole counted assignment and one native-exit notice. A capacity-one notification coalesces
+inspection and unparks the broker after publication. Inspection is bounded by the actual
+worker cohort and precedes park. An unexpected exit closes admission and drives real
+native joins rather than manufacturing an I/O completion or waiting for an absent report.
 
 ## 8. Synchronization between tasks and threads
 
@@ -690,17 +810,45 @@ handle is `(cell, generation)`, `Copy`-sized; the last handle to drop frees the 
 generation. A handle count in an arena cell is a generational arena, not shared ownership of a value: no
 `Arc`, no `Mutex` (DERIVED: the cell holds no `T`).
 
-**The value itself crosses by move**, through `std::sync::mpsc::sync_channel` (bounded, already used by
-slates for control messages; std's own internals are std's, as tokio's `Arc`s are tokio's in
-hyper-tokio). A send is `try_send`, then a wake of the cell's waiter; a receive is `try_recv`, and when
-empty, the task registers its word in the cell and re-checks before returning `Pending` (no lost wake:
-DERIVED from the order send-then-wake against register-then-check). A plain thread uses the channel's
-blocking `recv` and never touches the cell.
+**The value itself crosses by move**, through a bounded ring of hyper-rt's own (`sync/ring.rs`, §3.9's
+D4), in a block the ends share for as long as the cell's handles live. A send pushes, then wakes the
+cell's waiter; a receive pops, and when the ring is empty the waiter registers in the cell and checks
+again before it waits (no lost wake: DERIVED from the order send-then-wake against register-then-check).
+A waiter is a task's word or a plain thread blocked in `blocking_recv`, parked until the publisher that
+takes its registration unparks it (`handoff.rs`); senders waiting for room wait in places of their own
+(`sync/room.rs`). The values used to cross through `std::sync::mpsc::sync_channel`, whose blocked ends
+meet in a mutex that every send to a blocked receiver took; on macOS that lock is a pthread mutex boxed
+at its first lock, and a blocked receiver grows a list, allocations a measured window counted
+(`tests/service_resources.rs`).
+
+**A receiver's drop closes the ring** before it drops what was sent: it sets a mark in the ring's tail,
+std's disconnect bit (`sync/mpmc/array.rs`), and a sender claims a place only by a compare-and-swap from
+a tail without it. So a send either claimed its place before the close, in the tail's one order of
+changes, or is refused `Closed` with its value; a sender whose push landed fences and looks at the mark,
+and drops what is left if it is set, so nothing waits in a closed ring for the last handle. The receiver
+used to set a state bit that senders read before they pushed: its drop could free a full ring's room
+between a sender's read and its push, which then landed after the close (`tests/sync.rs`, a task waiting
+for room: 2 of 3 runs with 200 µs between the read and the push; 0 of 6 now). loom
+(`sync::ring::loom_tests`): a push against the close of a full ring, 32 interleavings under the
+workspace's bounds and 72 unbounded, fails at its fifth with the mark taken out of the close; a push
+against a close, 48 and 2,208.
+
+**A shard's control queue** (§3.4) is the same ring with no cell, held in the shard's registry entry
+(`control.rs`): any thread pushes, the shard alone takes, and the shard learns of a message from the
+entry's control flag and kick, never from a waiter. A channel's sender held in the entry would wake
+through the registry as it dropped, inside the free of the entry by its last reader (`retire.rs`), a call
+cycle the recursion gate refuses; std's channel, which it was, allocated as a shard losing its driver
+closed it. Closing drops what is queued and refuses what follows, as a receiver's drop does: the shard
+closes the ring and drains it; a sender whose push landed fences and looks at the mark, and drains for
+itself if it is set. With both fences sequentially consistent at least one of the two sees the other's
+write, so nothing is left in a closed queue (loom, `control::loom_tests`: 46 interleavings under the
+workspace's bounds, 4,779 with preemptions unbounded; with the sender's look removed, or either fence, it
+fails at its first).
 
 | Primitive | Built as | Bound |
 |---|---|---|
-| `channel::<T>(n)` (many senders, one receiver) | `sync_channel(n)` + a cell | `n` messages; a full channel is `Full` to `try_send`, and `send().await` waits for room, its waiters queued one to one (NOTE26 §5.3) |
-| `oneshot::<T>()` | `sync_channel(1)` + a cell; the receiver marks the cell as it goes, which the sender reads (`is_closed`: an owner sweeps the replies of callers that stopped waiting) | one value |
+| `channel::<T>(n)` (many senders, one receiver) | a ring of `n` places + a cell; senders waiting for room in places of their own | `n` messages; a full channel is `Full` to `try_send`, and `send().await` waits for room, its waiters queued one to one (NOTE26 §5.3); `channel_with`'s `waiters` bounds the senders waiting at once, and `blocking_send` past it is `Full` |
+| `oneshot::<T>()` | a ring of one place + a cell; the receiver marks the cell as it goes, which the sender reads (`is_closed`: an owner sweeps the replies of callers that stopped waiting) | one value |
 | `watch` of a `Copy` value that fits a word (`u64`) | the value and its version packed in the cell's atomic words; the `n` receiver slots claimed when it is made, chained through their cells, each taken by one compare-and-swap and given back at drop, the sender waking the taken ones | one value; readers see the latest and its version; `n` receivers, refused exactly at `n` (mantle's final review, finding 6) |
 | `watch` of a larger value | the publisher keeps it; readers are notified through the cell and ask the owner for it (a request through a `channel`) | the owner's |
 | `Semaphore(n)` | an atomic count + a bounded FIFO of waiting words; a release wakes exactly the waiters it admits, in arrival order | `n` permits; waiters bounded by the configured queue, past it `Capacity` |
@@ -714,8 +862,10 @@ the store-buffer pattern).
 No broadcast primitive is offered: a broadcast to N waiters is the O(N) hazard of NOTE26 §5.1. An event that
 concerns every waiter (a shutdown) completes each waiter's cell once (NOTE26 §5.3 rule 2).
 
-**INFERENCE to measure:** std's channel costs one or two atomic operations a message on its fast path;
-§12 measures it against tokio's `mpsc` and against a ring of hyper-rt's own before the choice is final.
+**Measured** (mantle's note 42 §8, `docs/benchmarks.md` "hyper-rt: the loop under load"): with plain
+threads the ring moves 144 million values a second from one producer at capacity 1,024, where std's
+`sync_channel` moved 102 million and tokio's `mpsc` 8 million; the run against slates' runtime and tokio
+on this repository's bench is owed (`docs/STATUS.md`).
 
 ## 9. Blocking work
 
@@ -781,7 +931,8 @@ bounded at 1 KiB, wall time an input; every one-byte corruption and every trunca
 
 | Constant | Formula (slates' derivations, kept) |
 |---|---|
-| spin before parking, step quantum | the mean wake [KARLIN] |
+| step quantum | the mean wake, each tracking shard's own estimate with the boot probe's mean its prior |
+| spin before parking | the CPU one park/wake cycle costs, measured on each tracking shard's own parks (§3.9, D2) [KARLIN]; slates' rule, the mean wake, is the fixed `spin_ns` of a configuration that does not track |
 | timer tick | the mean wake, refused if `tick + wake p99` exceeds the consumer's stated lateness tolerance (§3.6) |
 | control-queue depth | `wake p99 / system call` rounded up to a power of two (Little's law at the overflow target: a producer sending one message per system call for as long as the consumer's wake takes at its p99) |
 | loop batch | min(mean wake, the consumer's latency objective) / measured per-item cost (§3.3) |

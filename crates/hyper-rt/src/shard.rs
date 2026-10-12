@@ -79,6 +79,7 @@ pub(crate) struct Incoming {
     pub(crate) future: BoxedFuture,
     pub(crate) parent: Option<u32>,
     pub(crate) joinable: bool,
+    pub(crate) service: bool,
 }
 
 /// A poller's readiness question: a task that owns a ring the loop cannot see (a client's command ring in
@@ -100,6 +101,12 @@ pub(crate) struct TaskCell {
     pub(crate) poller: Cell<Option<PollerReady>>,
     /// Whether the slot waits on the timer-waiter ring.
     pub(crate) waits_for_timer: Cell<bool>,
+    /// A service owns cancellation cleanup until its future returns Ready.
+    pub(crate) service: Cell<bool>,
+    /// Level-triggered: every cancellation path sets it before waking this task.
+    pub(crate) cancelled: Cell<bool>,
+    /// Direct children are cancelled before a service begins cleanup, once per admission.
+    pub(crate) cancel_children: Cell<bool>,
 }
 
 /// Where a timer slot is in its life.
@@ -310,6 +317,9 @@ pub struct ShardContext {
     pub(crate) now_ns: Cell<u64>,
     /// When the server last served a client's work here, opening the idle window (`note_activity`).
     pub(crate) activity_ns: Cell<Option<u64>>,
+    /// Whether the poll running now served a client's work: the loop then moves `activity_ns` to the
+    /// poll's end.
+    pub(crate) activity_noted: Cell<bool>,
     /// The step quantum now, published by the loop.
     pub(crate) quantum_ns: Cell<u64>,
     /// The measured scheduler overrun, published by the loop.
@@ -389,6 +399,9 @@ impl ShardContext {
                     incoming: Cell::new(None),
                     poller: Cell::new(None),
                     waits_for_timer: Cell::new(false),
+                    service: Cell::new(false),
+                    cancelled: Cell::new(false),
+                    cancel_children: Cell::new(false),
                 })
                 .collect(),
             free_tasks: CellStack::full_of(task_ids.into_iter()),
@@ -421,6 +434,7 @@ impl ShardContext {
             accepting: Cell::new(true),
             now_ns: Cell::new(0),
             activity_ns: Cell::new(None),
+            activity_noted: Cell::new(false),
             quantum_ns: Cell::new(1),
             scheduler_overrun_ns: Cell::new(0),
             timer_tick_ns: shape.timer_tick_ns,
@@ -539,10 +553,12 @@ impl ShardContext {
     }
 
     /// Notes that a client's request was just served here (slates §4.7): the shard spins out the idle window
-    /// from now before it parks, so the client's next request within it costs no kernel wake. Every path that
-    /// hands a request to a task marks it (docs/runtime.md §3.4).
+    /// before it parks, so the client's next request within it costs no kernel wake. Every path that hands a
+    /// request to a task marks it (docs/runtime.md §3.4). Marked during a poll, the window opens where that
+    /// poll ends; marked between polls, it opens at the time the loop last published.
     pub fn note_activity(&self) {
         self.activity_ns.set(Some(self.now_ns.get()));
+        self.activity_noted.set(true);
     }
 
     /// Marks one period of forward progress of an application loop on this shard, for an observer on any
@@ -555,6 +571,15 @@ impl ShardContext {
 
     // ------------------------------------------------------------------ what tasks ask
 
+    /// Owner-published terminal driver state; channel task wakes remain live.
+    pub(crate) fn driver_lost(&self) -> bool {
+        self.entry.is_some_and(|entry| {
+            entry
+                .cleanup_mode
+                .load(std::sync::atomic::Ordering::Acquire)
+        })
+    }
+
     /// Spawns a joinable task under `parent` (a slot of this shard), answered at once with its id; the loop
     /// installs it before the next poll. Refused `TooManyTasks` when no slot is free.
     pub fn spawn_local(&self, future: BoxedFuture, parent: Option<u32>) -> Result<TaskId, RtError> {
@@ -562,6 +587,7 @@ impl ShardContext {
             future,
             parent,
             joinable: true,
+            service: false,
         })
     }
 
@@ -571,6 +597,22 @@ impl ShardContext {
             future,
             parent: None,
             joinable: false,
+            service: false,
+        })
+    }
+
+    /// Spawns a joinable service. Cancellation wakes the future; it must await
+    /// `futures::cancelled`, retire its external ownership, and return Ready.
+    pub(crate) fn spawn_service_local(
+        &self,
+        future: BoxedFuture,
+        parent: Option<u32>,
+    ) -> Result<TaskId, RtError> {
+        self.claim(Incoming {
+            future,
+            parent,
+            joinable: true,
+            service: true,
         })
     }
 
@@ -599,6 +641,9 @@ impl ShardContext {
             return Err(RtError::TooManyTasks { capacity });
         };
         cell.phase.set(Phase::Live);
+        cell.service.set(incoming.service);
+        cell.cancelled.set(false);
+        cell.cancel_children.set(false);
         cell.outcome.set(None);
         cell.joiner.set(None);
         cell.incoming.set(Some(incoming));
@@ -609,6 +654,9 @@ impl ShardContext {
     /// Requests a task's cancellation; it terminates at its next poll boundary. Refused for a stale id.
     pub fn cancel(&self, id: TaskId) -> Result<(), RtError> {
         let slot = self.live(id)?;
+        if let Some(cell) = self.task(slot) {
+            cell.cancelled.set(true);
+        }
         self.ask(slot, ask::CANCEL);
         self.local.push(slot);
         Ok(())
@@ -651,6 +699,9 @@ impl ShardContext {
     /// Takes a timer slot for `word` at `deadline_ns`; the loop arms it before the shard next waits. `None`
     /// when every timer is taken (the sleep then waits for one to free, [`Self::wait_for_timer`]).
     pub fn arm_timer(&self, deadline_ns: u64, word: u64) -> Option<TimerId> {
+        if self.driver_lost() {
+            return None;
+        }
         let slot = self.free_timers.pop()?;
         let cell = self.timer(slot)?;
         cell.phase.set(TimerPhase::Claimed);
@@ -708,6 +759,9 @@ impl ShardContext {
     /// Queues the task `word` names to be woken when a timer frees (a sleep that found every timer taken,
     /// AUD-29-39): it waits, never completing before its deadline. A task queued already is not queued twice.
     pub fn wait_for_timer(&self, word: Encoded) -> Result<(), RtError> {
+        if self.driver_lost() {
+            return Err(RtError::DriverLost);
+        }
         let slot = word.slot();
         let cell = self
             .task(slot)
@@ -740,6 +794,11 @@ impl ShardContext {
         writable: bool,
         word: Encoded,
     ) -> Result<Ticket, RtError> {
+        // Both native and simulated readiness enter here; no new ticket survives
+        // driver loss, including simulated sockets that bypass register_interest.
+        if self.driver_lost() {
+            return Err(RtError::DriverLost);
+        }
         let owner = self.incarnation.ok_or(RtError::NotOnShardThread)?;
         let slot = self.free_waits.pop().ok_or(RtError::Capacity {
             what: "readiness waits",
@@ -855,6 +914,9 @@ impl ShardContext {
         writable: bool,
         word: Encoded,
     ) -> Result<Ticket, RtError> {
+        if self.driver_lost() {
+            return Err(RtError::DriverLost);
+        }
         let ticket = self.take_wait(Some(raw), writable, word)?;
         let pushed = self.interests.push(Interest {
             raw,
@@ -881,6 +943,10 @@ impl ShardContext {
         let Some(cell) = self.wait_of(ticket) else {
             return Some(Ok(()));
         };
+        if self.driver_lost() {
+            self.free_wait(ticket);
+            return Some(Err(RtError::DriverLost));
+        }
         let outcome = match cell.phase.get() {
             WaitPhase::Armed => return None,
             WaitPhase::Refused => Err(cell.refusal.take().unwrap_or(RtError::Capacity {

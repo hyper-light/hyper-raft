@@ -32,6 +32,7 @@ pub mod image;
 pub mod issuer;
 mod node;
 pub mod record;
+mod resident;
 pub mod scratch;
 #[cfg(any(test, feature = "sim"))]
 pub mod sim;

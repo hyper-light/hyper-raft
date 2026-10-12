@@ -7934,3 +7934,32 @@ The mark adds nothing to an append at any point of the grid, and an entry the re
 apply is read where the replica is, with no allocation and no message to the log's owner, however
 small the group's share. focal's first form of the fix kept a second copy of each entry in the store:
 one allocation and one copy of its bytes an entry written, beside the handle's own.
+
+## hyper-rt: the loop under load, against tokio (mantle's runs, 2026-10-10)
+
+Measured in mantle on these sources (its vendored hyper-rt at its commits `bfdf9c2`, `bb0779e` and
+`bd7c0fd`, taken here in `docs/runtime.md` §3.9), recorded in mantle's
+`docs/research/42-event-loop-under-load.md` §7–§8 with the runs under its
+`benchmark-results/hyper-rt-vs-tokio-20261010/`. Apple M5 Max, macOS; five rounds, the arms interleaved
+and rotated; the base arm `f5d66a8`, the changed arm `4686b38` (the change before its step-level read
+reductions and park stamps on the shard clock); load 57–89 (`runs/spinclock-4686b38-r1`):
+
+| Case | Base | Changed | tokio (current-thread) |
+|---|---|---|---|
+| yield, polls a second | 13.5 M | 55.8 M | 0.13 M |
+| spawn and join, tasks a second | 12.9 M | 19.3 M | 0.59 M |
+| two-shard ping-pong, round trips a second (p99.9) | 145 k (565 µs) | 678 k (78 µs) | 18 k (11 ms) |
+| eight clients onto one shard, requests a second (one-way p99) | 26.2 k (3.7 ms) | 37.2 k (2.9 ms) | 23.6 k (2.9 ms) |
+| a client pausing 200 µs, CPU a request | 65.5 µs | 30.3 µs | 22.2 µs |
+| one client closed loop, requests a second (CPU a request) | 58.2 k (9.7 µs) | 63.7 k (10.9 µs) | 53.2 k (7.8 µs) |
+
+The channels without a lock, with plain threads (`runs/chan-98efdf7-r1`, load 15–21, interleaved
+rounds): one producer at capacity 1,024 moved 29.7 M values a second before and 144.4 M after (std's
+`sync_channel` 101.7 M, tokio's 8.0 M); sixteen producers at capacity 64, 407 k against 674 k, CPU a value
+8.8 against 2.7 µs and context switches 0.75 against 0.36; at load 96–110 (`runs/fence-cost-r1`) one
+producer 46.8 M against std's 20.7 M and sixteen 1.25 M against 677 k. The CPU clock read only by a
+learning shard (`bd7c0fd`): a simulated shard's loop item 119 ns against 110 at its base and 231 with
+the reading after every park, every shard's calibrated batch back from 17 to 35 (`runs/item-r2`).
+
+These are mantle's measurements of the same sources; the hyper-rt bench that runs them here, against
+slates' runtime and tokio on the same host, is owed (`docs/STATUS.md`, "What remains").

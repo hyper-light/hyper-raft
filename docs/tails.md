@@ -57,7 +57,11 @@ Each platform's own accounting is the source, read per process without privilege
 - **Windows**: `GetProcessTimes`, `QueryProcessCycleTime`, `GetProcessIoCounters`,
   `GetProcessMemoryInfo` (`PeakWorkingSetSize`); energy marked unmeasured unless the platform's
   estimate is read and its method cited.
-Each interface is verified at its primary documentation in T-0 before its numbers are reported.
+Each interface is verified at its primary documentation in T-0 before its numbers are reported. A
+probe allocates nothing, since the allocation counts read beside it are the whole process's: on Linux
+the `/proc` files are read into a buffer on the stack (`hyper_measure::usage`; their `format!` and
+`read_to_string` were 7 allocations a read, which a window counted as the work's;
+`crates/hyper-measure/tests/probes.rs`).
 
 ## 2. The conditions
 

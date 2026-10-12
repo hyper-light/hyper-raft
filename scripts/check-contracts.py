@@ -26,6 +26,14 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 
 # Each entry: the file, and the interface its `unsafe` binds.
 UNSAFE_ALLOWED = {
+    "crates/hyper-block/src/resident/macos.rs":
+        "mmap, mincore and munmap through libc: which pages of a file the unified buffer cache holds (resident reads)",
+    "crates/hyper-rt/src/handoff.rs":
+        "a parked thread's handle registered by address in a cell's waiter word and read once by the publisher that claimed it",
+    "crates/hyper-rt/src/sync/ring.rs":
+        "the bounded lock-free ring's slots: a value written or read only by the end whose stamp claimed the slot",
+    "crates/hyper-rt/src/sync/room.rs":
+        "a waiting sender's place: its thread handle written and read under the place's state word's claim",
     "crates/hyper-rt/src/afd.rs":
         "IOCTL_AFD_POLL through NtDeviceIoControlFile on \\Device\\Afd, its OVERLAPPED blocks and SIO_BASE_HANDLE (socket readiness on Windows; the wepoll and mio technique)",
     "crates/hyper-rt/src/attribution.rs":

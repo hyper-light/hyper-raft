@@ -42,6 +42,16 @@ out; eight more for the marked members, three that pass and five refused, at the
 as CI counted them (`docs/models/README.md`). CI's `model` job runs
 them on Linux.
 
+Landed 2026-10-12, each in its crate's document: in hyper-raft, an append behind a follower's commit
+taken past it where the entry it names there is the one held (`docs/raft.md` §3.3; focal's ordered
+appends); in hyper-quic, BBR from RFC 9002's initial window, a run of PADDING decoded as one frame, and
+the path's warm-up as background traffic, LEDBAT++'s slow start ending at its own queue or a plateau
+(`VENDORED.md` §21–§24); in hyper-transport, the endpoint visiting only the connections an event or a
+call touched (512 held: 232–243 µs an exchange before, 40–43 after; `docs/benchmarks.md`); in hyper-log
+and hyper-durable, a group's handle keeping what its replica has yet to apply, bounded by the replica's
+budget, with no allocation an append (`docs/durable.md` §8, `docs/benchmarks.md`); in hyper-rt, a wake
+probe's round timed from its waiter's start and a `block_on` whose root unwinds ending refused (below).
+
 ## Open defects
 
 Found under load, each once. They are traced to their causes; none is worked around. Every
@@ -78,6 +88,28 @@ held an election back.
   every write is that slow makes a pair re-elect past the law (each new leader's first write
   suspected in turn); the reports now state each member's core suspicions and campaign.
 
+### Closed (2026-10-12)
+
+- **hyper-rt's calibration tests, `MeasurementTimeout { probe: "wake" }`, windows-2025 CI (`1029f76`,
+  run 38021030068).** The machine tests' probes ran at once, their waiters pinned to the same cores, and
+  a waiter took p50 1.2 ms, p90 20 ms and up to 149 ms to start where a round's share of the 40 ms budget
+  was 8 ms; the start was charged to the share, so 607 of 2,067 rounds kept nothing, and once every round
+  of three probes did, each refused (diag run 38266052185). A round now times wakes from its waiter's
+  start, the start waited for within the probe's span: 41 of 2,145 rounds kept nothing on windows-2025 and
+  53 of 2,138 on windows-11-arm, each a first wake slower than its share on a busy core, and no probe
+  refused (diag run 38268800203; `crates/hyper-rt/src/machine/wake.rs`).
+- **hyper-rt `an_astray_report_is_counted_not_an_error` took a datagram, windows-11-arm CI (`67f038d`, run
+  38102324750).** windows-11-arm hands out ports one after another, but the next bind can get the port a
+  socket just released: in 2 of 300 runs the socket under test was given the port the test had closed, and
+  the datagram reached it (diag run 38275004157). The socket is bound first and the test is a binary of
+  its own (`tests/udp_astray.rs`). Its failing assertion inside the root then left the binary waiting:
+  `block_on` waited for good on a root future that unwound, since tasks' polls run behind the shard's
+  boundary (0784bb2); it now ends refused, `RtError::RootUnwound` (`docs/runtime.md` §4).
+- **hyper-log `a_waker_that_unwinds_costs_only_its_wake`, ubuntu-24.04 CI (run 38269518082, 4 wakes
+  against 5).** A caller's wait returns once its answer is in its port and the answering thread wakes its
+  waker after that, so the count read after the waits could miss the last wake; it is read once the log's
+  threads have ended.
+
 ### Closed (2026-10-05)
 
 - **hyper-durable-e2e `kill-durable-leader`** (Linux Docker, 2 CPUs, load 6.8): the survivors'
@@ -113,6 +145,64 @@ held an election back.
 
 | Consumer | Takes | State |
 |---|---|---|
-| mantle | hyper-raft, hyper-timing, hyper-log, hyper-block, hyper-measure, hyper-durable, hyper-liveness and hyper-seal vendored (`vendor/`, `SNAPSHOT` the commit that promoted `line` to `main`, 2026-10-06; before, `df54729`); its range replica is hyper-durable's `Replica` with its engine and layer as the state machine (D-1), electing on ticks | on mantle's branch `shared-d1` from `dev` `1c179e8`: the snapshot and R-6's durable commit in answers (`85b9c2d`), the replacement killed inside the window between a change's commit and its logged commit, in simulation and as real processes (`838acf8`), and D-1 (`c28027e`, and what the node lacks to carry the liveness stream, `21ae613`), six-target CI green on each; on `dev` since 2026-10-03, and the snapshot of `main` with them, its range tests' restarted leader told the replacement again (elections now count by the newest configuration in a member's log, `docs/raft.md` §3.4). Elections by suspicion wait for a node owner that carries the liveness stream, which mantle does not have yet (mantle `docs/design/node.md` §2.4) |
-| focal | hyper-raft and hyper-timing vendored (`vendor/`, `SNAPSHOT` 9893679), `crates/focal-raft` removed | step 1 of the owner's order (the core; then F-1 and D-2 as one PR, focal's WAL onto hyper-log and its shell onto hyper-durable; then timing and liveness; then the transport), open as focal PR #4 (branch `hyper-raft-core` into `slates-port`), its data directories resumed across the old and new binaries both ways: focal's WAL and wire keep raft-rs's protocol-buffer bytes through focal's own codec (`focal-consensus/src/envelope.rs`, held to raft-proto byte for byte; no protocol-buffer runtime ships); the accounting reads a change in place (`wire::changes_stated`); every focal-consensus suite passes. The format switch comes with F-1, by layer: a wire profile per connection, new WAL record kinds behind focal's upgrade fence (focal 27 §14) |
-| slates | hyper-quic, hyper-datagram, hyper-swim, hyper-timing | slates' session owns the integration (slates A-52 §5) |
+| mantle | hyper-raft, hyper-timing, hyper-log, hyper-block, hyper-measure, hyper-durable, hyper-liveness, hyper-seal and hyper-rt vendored (`vendor/`, `SNAPSHOT` `f358210`), hyper-rt and hyper-block with local changes owed here (mantle `vendor/UPSTREAM.md`; branch `mantle-runtime` replays them onto the revision mantle took them from) | its range replica is hyper-durable's `Replica` with its engine and layer as the state machine (D-1), electing on ticks; elections by suspicion wait for a node owner that carries the liveness stream (mantle `docs/design/node.md` §2.4) |
+| focal | every crate it takes vendored at `9fdf7ff` (`vendor/*/SNAPSHOT`), the head of `focal-transport-hooks`, whose commits not on `main` land here with this change; focal re-vendors from `main` as its own landing | the core (step 1) and the transport (step 4: hyper-quic, hyper-transport and hyper-rt in place of quinn and tokio) switched; its storage on hyper-log and the shell (F-1, D-2) built behind `STORAGE_LEVEL`, its `CAPABILITY_LEVEL` still 2; timing and liveness (step 3) open, its shell electing on ticks |
+| slates | hyper-datagram, hyper-seal, hyper-swim and hyper-timing vendored at `67f038d` (`vendor/hyper-raft/SNAPSHOT`, slates' main); their sources unchanged on `main` since | SWIM (S-1) and the datagram plane (P-1) switched; its consensus onto hyper-raft (X-1) and its session plane onto hyper-transport (X-2) open, slates' runtime onto hyper-rt slates' own step |
+
+## What remains (2026-10-12)
+
+In the owner's order: red CI first; then every consumer on one revision of `main`; then the shared
+crates' open work; then each consumer's switch-over (mantle note 32 §5, each project's own order).
+
+1. **Red CI.** The open defects above, each traced to its cause and fixed at it, and every target
+   green on `main`.
+2. **One revision for every consumer.** Today mantle, focal and slates each build a different one:
+   - focal vendors every crate it takes at `9fdf7ff`, the head of `focal-transport-hooks`, whose
+     commits not on `main` land with this change; then focal re-vendors from `main`, as its own
+     landing under its own rules.
+   - mantle vendors every crate at `f358210` with local changes to hyper-rt and hyper-block owed here
+     (mantle `vendor/UPSTREAM.md`): the issuer's numbered lanes, terminal ownership and retirement,
+     and resident reads (hyper-block); cooperative service admission and cancellation, per-poll
+     context guards, checked channel slot and ticket layouts, TCP setup and accept ownership,
+     cold-owned native retirement, a park with one kick and a spin as long as blocking costs,
+     channels that hand values over with no lock, and the CPU clock read after a park only when it
+     learned before it (hyper-rt), about 7,300 lines of source and 5,700 of tests. Branch
+     `mantle-runtime` replays mantle's seven commits (cf6e37c, 6f05bd8, 3743b25, f797bd9, bfdf9c2,
+     bb0779e, bd7c0fd) onto `8cd3604`, the revision mantle took them from, byte for byte; it is to be
+     merged with `main` (mantle's own merge, be8d04d, the guide), its failing `service_resources`
+     test fixed at its cause, its design brought into `docs/runtime.md` from mantle's
+     `docs/design/event-loop.md` D1–D4 and its measurements into `docs/benchmarks.md`, and gated.
+     PR #16 (a step's poll budget covers wakes its own polls make), which mantle carries already,
+     lands with it, measured here.
+   - slates vendors hyper-datagram, hyper-seal, hyper-swim and hyper-timing at `67f038d`; their
+     sources have not changed on `main` since, so its next snapshot moves only the revision and
+     hyper-seal's `ORIGIN.md`. This repository's agent re-vendors slates (slates' own gates, its
+     session fast-forwards).
+3. **The shared crates' open work**, each in its own document:
+   - hyper-durable: §14's measurements, and the follower half of the store's keep mark (focal's
+     question: entries a replicating follower has yet to acknowledge, kept within the window a
+     leader sends ahead, so a stalled follower pins nothing past it).
+   - hyper-sim and hyper-check: S-6 (hyper-raft's and hyper-durable's harnesses onto both crates),
+     S-7 (the E2E crates' histories checked) and S-8 (the consumers' simulations), `docs/sim.md` §9.
+   - Tails, `docs/tails.md` §7: T-0 (the grid), T-1 (the measurement kit), T-2 (the impairment
+     relay), then each crate class against its industry comparators under the same conditions.
+   - hyper-quic and hyper-tls against slates' and focal's transports (owed in the table above), and
+     slates' congestion bake-off.
+   - hyper-seal §11: the log sealed by default only once measured.
+   - hyper-rt §15's open items.
+   - This table's rows for hyper-rt, hyper-seal, hyper-measure and hyper-rt-transport, each with the law's
+     four columns as measured.
+   - The fast track: note 32 §3.8's tests decide it; no owner enables it until then.
+   - focal's two suggestions for the core (2026-10-11): a batched proposal on `RawNode`, and commit
+     broadcasts coalesced into the next append.
+4. **Each consumer's switch-over.**
+   - mantle: D-1 is in (its range replica is hyper-durable's, electing on ticks). Elections by
+     suspicion (L-5) wait for mantle's node to carry the node-pair liveness stream (mantle
+     `docs/design/node.md` §2.4); mantle's transport on hyper-transport (T-2) comes with its node.
+   - focal: the core (step 1) and the transport (step 4: hyper-quic, hyper-transport, hyper-rt) are
+     switched; its storage on hyper-log and the shell (F-1, D-2) is built behind `STORAGE_LEVEL`,
+     its `CAPABILITY_LEVEL` still 2, with focal's own items before it opens; timing and liveness
+     (step 3) are open: its shell elects on ticks.
+   - slates: SWIM (S-1) and the datagram plane (P-1) are switched; its consensus onto hyper-raft
+     (X-1, groups re-founded on a fresh start, owner's decision 9) and its session plane onto
+     hyper-transport (X-2) are open, and hyper-rt in place of slates' runtime is slates' own step.

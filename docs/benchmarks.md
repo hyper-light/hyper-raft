@@ -7861,3 +7861,28 @@ build, main at `506c059`.
   waits for an answer from another member, the evidence that the condemning member's own network
   works (`Detector::detection_bound`): the stated bound counts that wait, the budget does not, so an
   owner's `D` leaves room for it (at 10 s on three members, detection came at the budget itself).
+
+## The handle keeps what its replica has yet to apply (2026-10-12)
+
+`cargo bench -p hyper-log --bench allocs` (Apple M5 Max, macOS 26.4.1, a real file in the target's
+scratch, load 5.2–7.0): allocations, reallocations, bytes asked and minor faults per operation, every
+thread's, 200 rounds after 20. "Marked" rows run the same appends through handles whose replica marks
+what it applied a round behind its writes (`GroupLog::keep_after`), on a log whose group share of the
+cache is one byte, so what a handle keeps is the mark's alone; each handle then keeps exactly its
+unapplied entry (asserted), and its fetch asks the log for nothing (asserted).
+
+| Row | replicas | entry | allocs | reallocs | bytes | faults |
+|---|---|---|---|---|---|---|
+| append through the handle | 1 | 1,024 | 0.00 | 0.03 | 74 | 0.005 |
+| append, marked, a byte's share | 1 | 1,024 | 0.00 | 0.01 | 63 | 0.000 |
+| fetch of an unapplied entry, marked | 1 | 1,024 | 0.00 | 0.00 | 0 | 0.000 |
+| append through the handle | 16 | 128 | 0.00 | 0.03 | 90 | 0.003 |
+| append, marked, a byte's share | 16 | 128 | 0.00 | 0.01 | 63 | 0.000 |
+| append through the handle | 16 | 16,384 | 0.00 | 0.02 | 63 | 0.000 |
+| append, marked, a byte's share | 16 | 16,384 | 0.00 | 0.02 | 63 | 0.000 |
+| fetch of an unapplied entry, marked | 16 | 16,384 | 0.00 | 0.00 | 0 | 0.000 |
+
+The mark adds nothing to an append at any point of the grid, and an entry the replica has yet to
+apply is read where the replica is, with no allocation and no message to the log's owner, however
+small the group's share. focal's first form of the fix kept a second copy of each entry in the store:
+one allocation and one copy of its bytes an entry written, beside the handle's own.

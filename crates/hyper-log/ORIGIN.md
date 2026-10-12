@@ -387,3 +387,29 @@ walk takes its eight bytes now.
   kind so a kind added later fails to build until it is laid there too, and the walk reaches the end and
   the payload decodes whole; `a_sealed_log_writes_and_reopens_a_release` writes a release to a sealed log
   and reads it back after a reopen. Both fail without the arm: "the walk stopped short", and `Fenced`.
+
+## A group's handle keeps what its replica has yet to apply
+
+focal found its shell's session owner waiting 57% of its time on reads of entries it had written
+(5,000 writes a second, macOS `sample`: 3,370 of 5,960 samples in `GroupLog::ask` under the store's
+fetch, 2,288 of them from apply): a leader's entries are durable at its own write and committed at
+its followers' answers, by then the core has let them go, and its apply read each back. The handle
+held each written entry's bytes, from its write's answer, only within its share of the log's cache
+(`group_cache`, 64 KiB a group in focal: 64 MiB over 1,024 groups), so at that rate the entries
+had left it before they were applied, and each read went through the owner to the device, behind
+its flushes.
+
+- `GroupLog::keep_after(index)` keeps the entries after `index` whatever the share, until a later
+  call raises it; those at or before it are kept by the share alone, as before any call.
+  `GroupLog::kept_bytes` counts what is kept past the share, for its caller to bound: hyper-durable's
+  replica marks what it has applied as it opens and after each apply, and counts the bytes with what
+  it holds, so its owner's budget bounds them (hyper-raft `docs/durable.md` §8). The bytes are the
+  ones the answer brought back: nothing is copied to keep them, where focal's first form of the fix,
+  a second copy in the store, made one allocation and one copy an entry.
+- **Tests**: `a_handle_keeps_what_its_replica_has_yet_to_apply` (`tests/group.rs`, every count exact,
+  through a suffix replaced past the mark and a lower mark that changes nothing); the property test
+  `a_handle_reads_as_the_log_does` with a mark raised at random on every step: what the handle keeps
+  changes where a read is answered, never what it says. `benches/allocs.rs`: appends through marked
+  handles on a byte's share make no allocation, as through the unmarked handle, and the entry a
+  replica has yet to apply is fetched with no allocation and no ask of the log (`docs/benchmarks.md`,
+  "The handle keeps what its replica has yet to apply").

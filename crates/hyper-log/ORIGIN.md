@@ -414,3 +414,39 @@ its flushes.
   handles on a byte's share make no allocation, as through the unmarked handle, and the entry a
   replica has yet to apply is fetched with no allocation and no ask of the log (`docs/benchmarks.md`,
   "The handle keeps what its replica has yet to apply").
+
+## A group claimed again waits for its dropped handle's writes
+
+focal found a shell group stopped and opened again at once in the same process failing
+`Compacted` at `Replica::open` (3 to 4 runs in 10 of one focal-node test on Linux, rarely on
+macOS): the open read entries its store's view said the group held, and the log refused them. The
+owner released a group the moment its dropped handle's word came (`Message::Release`), while the
+writes that handle had sent could still be out: admitted, waiting for room, or in a frame not yet
+published. A claim between the two was given the group's state without them (`Mirror::of`), and
+their answers went to the dropped handle, so the new handle never heard of them: its view kept the
+start a compaction among them had moved, and its reads below the new start were the log's to
+refuse. Entries and marks those writes made were missing from it the same way. The room the queue
+keeps for each group (`room.rs`) already counted the group's writes out, so the release now waits
+for them: a group dropped with writes out is released when the last of them is answered, a claim
+meanwhile waits and is then given the group as the log holds it, a second claim is refused
+`Claimed`, and anyone else's write is taken behind them, as once the group is released, until a
+claim waits. A waiting claim counts as work on the device for the owner's watch: without it, the
+frame carrying the last of the writes came back to the owner's returns, which wake no one, while
+the claimer, the only caller, waited, and the claim waited for good (found by the reproduction,
+sampled: every thread parked).
+
+focal's second ask, that `Replica::open` count from the release mark when it passes the start, does
+not apply: the mark (`View::released`) is how far the replica released its fast-track proposals
+(`Update::released`), not a compaction's point, and once the claim holds every write, the store's
+start is the log's.
+
+- **Tests** (`tests/group.rs`), each failing without the change:
+  `a_group_claimed_again_at_once_holds_every_write_its_dropped_handle_left_out` (a compaction's
+  start, entries, a release and a hard state, each left out over 32 seeds; the new handle's view and
+  every read match the log's), `a_claim_waits_for_its_groups_write_out_and_holds_the_group_meanwhile`,
+  `a_write_to_a_group_whose_dropped_handles_write_is_out_is_taken_behind_it` and
+  `a_claim_waiting_for_a_write_the_log_fences_on_is_given_the_group_without_it` (the device held by a
+  look at the file, so the write stays out exactly as long as the test says). hyper-durable's
+  `a_group_stopped_with_its_compaction_out_opens_again_at_once` (`tests/hyperlog.rs`) is focal's case
+  whole: a replica dropped with its compaction out and opened again at once, 16 seeds, failing
+  `Core(Storage(Compacted))` without the change.

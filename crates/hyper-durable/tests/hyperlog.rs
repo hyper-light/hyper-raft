@@ -490,3 +490,47 @@ fn a_read_from_what_was_kept_takes_what_its_bytes_admit_and_one_at_least() {
     store.entries(1, 7, 1, &mut least).unwrap();
     assert_eq!(least, written[..1]);
 }
+
+/// A group stopped with a write out and opened again at once in the same process opens on the
+/// group as the log holds it, every write the log took included (focal, 2026-10-12: a shell group
+/// reopened in-process failed `Compacted` at `Replica::open`). The member compacts and is dropped
+/// before the compaction's answer comes; its store's handle goes with it, and a claim made then was
+/// given the group without the compaction, so the open read entries the compaction had let go.
+/// Each seed's log takes the compaction at its own point in the drop, as a device answers when it
+/// does.
+#[test]
+fn a_group_stopped_with_its_compaction_out_opens_again_at_once() {
+    for seed in 0..16 {
+        let log = Log::create(sim_file(40 + seed), config(16, 1 << 12), 1).unwrap();
+        let (mut r, waker, woken) = sole(&log);
+        settle(&mut r, &waker, &woken);
+        for i in 0..8u8 {
+            r.propose(Vec::new(), vec![i; 64]).unwrap();
+        }
+        settle(&mut r, &waker, &woken);
+        let applied = r.applied().index;
+        assert!(
+            r.compact(1, now(), &waker).unwrap(),
+            "seed {seed}: a compaction is due"
+        );
+        assert!(r.in_flight() > 0, "seed {seed}: the compaction is out");
+        // The machine persisted what the compaction keeps behind (`Replica::compact`): it opens
+        // again on that.
+        let kv = r.machine().crashed();
+        drop(r);
+        let store = GroupStore::claim(&log, 1).unwrap();
+        let again = Replica::open(&settings(1, 3), store, kv, Unbounded)
+            .unwrap_or_else(|e| panic!("seed {seed}: the group opens again: {e:?}"));
+        let ours = again.core().store().log().handle().view().unwrap().unwrap();
+        let theirs = log.view(1).unwrap().unwrap();
+        assert_eq!(
+            ours, theirs,
+            "seed {seed}: the store holds the group as the log does"
+        );
+        assert_eq!(
+            theirs.start.index,
+            applied - 1,
+            "seed {seed}: the compaction is the log's"
+        );
+    }
+}

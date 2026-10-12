@@ -1072,7 +1072,10 @@ impl<F: BlockFile + 'static> Log<F> {
     /// The handle through which `group` is written and read from here on (`group.rs`): the log
     /// refuses the group's submissions from anyone else, [`LogError::Claimed`], until the handle
     /// is dropped. Refused `Claimed` while another handle holds it, `Damaged` for a group whose
-    /// records are damaged, and `TooManyGroups` past the log's bound on groups.
+    /// records are damaged, and `TooManyGroups` past the log's bound on groups. A group whose
+    /// handle was dropped with writes out is given once the log has answered them, so the new
+    /// handle holds every write the log took of the group; a second claim meanwhile is refused
+    /// `Claimed`.
     pub fn group(&self, group: u128) -> Result<GroupLog<F>, LogError> {
         claim(&self.lines, self.p, group)
     }

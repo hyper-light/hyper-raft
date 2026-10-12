@@ -484,3 +484,224 @@ fn an_opener_after_its_log_closed_answers_closed() {
     assert!(matches!(opener.groups(), Err(LogError::Closed)));
     assert!(matches!(opener.stats(None), Err(LogError::Closed)));
 }
+
+/// The writes a dropped handle may leave out, one of each kind: a compaction's start, entries, a
+/// release of proposals, a hard state.
+fn left_out() -> [(&'static str, Update); 4] {
+    [
+        (
+            "start",
+            Update {
+                start: Some(Start { index: 3, term: 1 }),
+                ..Update::default()
+            },
+        ),
+        (
+            "entries",
+            Update {
+                entries: Some(entries(5, 2, 1, 64)),
+                ..Update::default()
+            },
+        ),
+        (
+            "released",
+            Update {
+                released: Some(3),
+                ..Update::default()
+            },
+        ),
+        (
+            "hard state",
+            Update {
+                hard_state: Some(HardState {
+                    term: 1,
+                    vote: 0,
+                    commit: 4,
+                }),
+                ..Update::default()
+            },
+        ),
+    ]
+}
+
+/// A group claimed again at once after its handle was dropped with a write out is given the group
+/// with that write, and reads as the log does: the claim waits for the write's answer, which went
+/// to the dropped handle (focal, 2026-10-12: a shell group stopped and opened again at once in the
+/// same process read entries a compaction left out had let go, `Compacted`, and missed entries and
+/// marks). Each kind of write, left out at whatever point each seed's device answers it.
+#[test]
+fn a_group_claimed_again_at_once_holds_every_write_its_dropped_handle_left_out() {
+    for seed in 0..32u64 {
+        for (kind, update) in left_out() {
+            let log = Log::create(sim(seed), config(1 << 20), ID).unwrap();
+            let mut h = log.group(1).unwrap();
+            h.write(Update {
+                entries: Some(entries(1, 4, 1, 64)),
+                ..Update::default()
+            })
+            .unwrap();
+            h.submit(update).unwrap();
+            drop(h);
+            let again = log.group(1).unwrap();
+            assert_eq!(
+                again.view().unwrap(),
+                log.view(1).unwrap(),
+                "seed {seed}, {kind}"
+            );
+            same_reads(&log, &again, 1).unwrap_or_else(|e| panic!("seed {seed}, {kind}: {e}"));
+        }
+    }
+}
+
+/// Holds the log's device in a look at the file until `go` is told, applying the fault it is
+/// told: the frames behind the look wait for it, so what is submitted meanwhile stays out. The
+/// look holds the device once this returns.
+fn hold_device<'scope>(
+    scope: &'scope std::thread::Scope<'scope, '_>,
+    log: &'scope Log<SimFile>,
+) -> (
+    std::sync::mpsc::SyncSender<Option<Fault>>,
+    std::thread::ScopedJoinHandle<'scope, ()>,
+) {
+    let (holding, held) = std::sync::mpsc::sync_channel(1);
+    let (go, told) = std::sync::mpsc::sync_channel::<Option<Fault>>(1);
+    let looking = scope.spawn(move || {
+        log.with_file(move |file| {
+            holding.send(()).unwrap();
+            if let Some(fault) = told.recv().unwrap() {
+                file.inject(fault).unwrap();
+            }
+        })
+        .unwrap();
+    });
+    held.recv().unwrap();
+    (go, looking)
+}
+
+/// Claims `group` twice at once, each on a thread of its own: the answers, in the order they come.
+fn claim_twice<'scope>(
+    scope: &'scope std::thread::Scope<'scope, '_>,
+    opener: &hyper_log::LogOpener<SimFile>,
+    group: u128,
+) -> std::sync::mpsc::Receiver<Result<GroupLog<SimFile>, LogError>> {
+    let (told, answers) = std::sync::mpsc::sync_channel(2);
+    for _ in 0..2 {
+        let (told, opener) = (told.clone(), opener.clone());
+        scope.spawn(move || told.send(opener.group(group)).unwrap());
+    }
+    answers
+}
+
+/// While a dropped handle's write is out, one claim of its group waits for the write's answer and
+/// a second is refused `Claimed`, as is anyone else's write to the group, the waiting claim being
+/// first; once the write is answered, the waiting claim is given the group with it.
+#[test]
+fn a_claim_waits_for_its_groups_write_out_and_holds_the_group_meanwhile() {
+    let log = Log::create(sim(11), config(1 << 20), ID).unwrap();
+    let opener = log.opener();
+    let mut h = log.group(1).unwrap();
+    h.write(Update {
+        entries: Some(entries(1, 4, 1, 64)),
+        ..Update::default()
+    })
+    .unwrap();
+    std::thread::scope(|scope| {
+        let (go, looking) = hold_device(scope, &log);
+        h.submit(Update {
+            start: Some(Start { index: 3, term: 1 }),
+            ..Update::default()
+        })
+        .unwrap();
+        drop(h);
+        let answers = claim_twice(scope, &opener, 1);
+        let first = answers.recv().unwrap();
+        assert!(matches!(first, Err(LogError::Claimed(1))), "{first:?}");
+        let theirs = log.submit(
+            1,
+            Update {
+                hard_state: Some(HardState {
+                    term: 1,
+                    vote: 0,
+                    commit: 4,
+                }),
+                ..Update::default()
+            },
+        );
+        assert!(matches!(theirs, Err(LogError::Claimed(1))), "{theirs:?}");
+        go.send(None).unwrap();
+        looking.join().unwrap();
+        let again = answers.recv().unwrap().unwrap();
+        assert_eq!(again.bounds().unwrap(), (Start { index: 3, term: 1 }, 4));
+        assert_eq!(again.view().unwrap(), log.view(1).unwrap());
+    });
+}
+
+/// Anyone's write to a group whose dropped handle's write is out, with no claim waiting, is taken
+/// behind that write, as once the group is released; a claim then waits for both.
+#[test]
+fn a_write_to_a_group_whose_dropped_handles_write_is_out_is_taken_behind_it() {
+    let log = Log::create(sim(12), config(1 << 20), ID).unwrap();
+    let mut h = log.group(1).unwrap();
+    h.write(Update {
+        entries: Some(entries(1, 4, 1, 64)),
+        ..Update::default()
+    })
+    .unwrap();
+    let theirs = std::thread::scope(|scope| {
+        let (go, looking) = hold_device(scope, &log);
+        h.submit(Update {
+            entries: Some(entries(5, 2, 1, 64)),
+            ..Update::default()
+        })
+        .unwrap();
+        drop(h);
+        let theirs = log
+            .submit(
+                1,
+                Update {
+                    entries: Some(entries(7, 1, 1, 64)),
+                    ..Update::default()
+                },
+            )
+            .unwrap();
+        go.send(None).unwrap();
+        looking.join().unwrap();
+        theirs
+    });
+    let again = log.group(1).unwrap();
+    theirs.wait().unwrap();
+    assert_eq!(again.bounds().unwrap(), (Start::default(), 7));
+    same_reads(&log, &again, 1).unwrap();
+}
+
+/// A claim waiting for a dropped handle's write is answered when the log fences on that write's
+/// frame: the write is answered `Fenced`, and the claim is given the group without it.
+#[test]
+fn a_claim_waiting_for_a_write_the_log_fences_on_is_given_the_group_without_it() {
+    let log = Log::create(sim(13), config(1 << 20), ID).unwrap();
+    let opener = log.opener();
+    let mut h = log.group(1).unwrap();
+    h.write(Update {
+        entries: Some(entries(1, 4, 1, 64)),
+        ..Update::default()
+    })
+    .unwrap();
+    std::thread::scope(|scope| {
+        let (go, looking) = hold_device(scope, &log);
+        h.submit(Update {
+            start: Some(Start { index: 3, term: 1 }),
+            ..Update::default()
+        })
+        .unwrap();
+        drop(h);
+        let answers = claim_twice(scope, &opener, 1);
+        let first = answers.recv().unwrap();
+        assert!(matches!(first, Err(LogError::Claimed(1))), "{first:?}");
+        go.send(Some(Fault::WriteError)).unwrap();
+        looking.join().unwrap();
+        let again = answers.recv().unwrap().unwrap();
+        assert!(log.is_fenced());
+        assert_eq!(again.bounds().unwrap(), (Start::default(), 4));
+        assert_eq!(again.view().unwrap(), log.view(1).unwrap());
+    });
+}

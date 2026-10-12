@@ -125,6 +125,13 @@ held an election back.
 
 ### Closed (2026-10-12)
 
+- **A shell group stopped and opened again at once failed `Compacted` (focal, on `aa82ada`; focal-node
+  on Linux, 3 to 4 runs in 10 of one test).** hyper-log released a dropped handle's group at once, while
+  writes it had sent could still be out; a claim between was given the group without them and never heard
+  of them, so a compaction among them left the new handle reading what the log had let go. The release now
+  waits for those writes' answers, and a claim meanwhile waits for it (hyper-log `ORIGIN.md`, "A group
+  claimed again waits for its dropped handle's writes"; hyper-durable's
+  `a_group_stopped_with_its_compaction_out_opens_again_at_once`, focal's case whole).
 - **hyper-rt's calibration tests, `MeasurementTimeout { probe: "wake" }`, windows-2025 CI (`1029f76`,
   run 38021030068).** The machine tests' probes ran at once, their waiters pinned to the same cores, and
   a waiter took p50 1.2 ms, p90 20 ms and up to 149 ms to start where a round's share of the 40 ms budget

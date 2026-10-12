@@ -800,7 +800,11 @@ joins when it closes. Owners spawned for the node's life, and an owner that plac
 runtime, hold one each; a claim through an opener is the log's claim, refused `Claimed` while
 another handle holds the group, and every call answers `Closed` once the log has closed.
 `GroupStore::claim` and `remove` take either, through `LogGroups` (focal 27 §15.8, where focal's
-owners move onto hyper-log).
+owners move onto hyper-log). A group stopped and opened again at once is given to its new handle
+only once the log has answered every write the old one sent: before, a claim made while a
+compaction was still out was given the group without it, and the replica's open read entries the
+log had let go, `Compacted` (focal, 2026-10-12; hyper-log `ORIGIN.md`, "A group claimed again waits
+for its dropped handle's writes").
 
 Every call into the core and the state machine runs inside an unwind boundary (focal's
 `guarded_in`): an unwind fences the replica and is reported, never propagated (mantle `CLAUDE.md`

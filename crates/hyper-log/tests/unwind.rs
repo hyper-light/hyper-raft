@@ -144,15 +144,18 @@ fn a_waker_that_unwinds_costs_only_its_wake() {
     assert_eq!(fetched.iter().count(), 1);
     woken += 1;
 
+    log.write(8, small(1)).unwrap();
+    assert!(log.with_file(|file| file.file().len().is_ok()).unwrap());
+    let file = log.close().unwrap();
+    assert!(file.into_inner().len().unwrap() > 0);
+    // A caller's wait returns once its answer is in its port, and the thread that answered wakes
+    // its waker after that (`Ticket::answer`): each wake has run once the threads that answer have
+    // ended, the writer's in the scope above and the log's at its close.
     assert_eq!(
         unwinding.0.load(Ordering::SeqCst),
         woken,
         "each wake ran, once"
     );
-    log.write(8, small(1)).unwrap();
-    assert!(log.with_file(|file| file.file().len().is_ok()).unwrap());
-    let file = log.close().unwrap();
-    assert!(file.into_inner().len().unwrap() > 0);
 }
 
 /// A look at the file that unwinds is answered as a failed operation on the file, typed, and the

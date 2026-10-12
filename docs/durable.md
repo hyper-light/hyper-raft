@@ -873,7 +873,14 @@ congestion window to it (`hyper_timing::inflight_window`; mantle note 32 R16, fo
 owner says the window's carriage as the transport's measure moves (`Replica::set_carriage`), and
 the shell passes the rule's window to the core (`set_inflight_bytes`).
 
-**hyper-log.** The shell is generic over the log (§9); hyper-log is the disk implementation.
+**hyper-log.** The shell is generic over the log (§9); hyper-log is the disk implementation. The
+replica tells its store what it has applied (`LogStore::applied`) as it opens and after each apply,
+and counts what the store keeps for it (`LogStore::kept_bytes`) with what it holds, so its owner's
+budget bounds it. hyper-log's store keeps, in the group's handle, the entries after that mark whatever
+the group's share of the log's cache (`GroupLog::keep_after`): a leader's entries are durable at its
+own write and committed at its followers' answers, and by then the core has let them go, so its apply
+reads each back, from the handle, never through the log's owner and its device (focal, 2026-10-12:
+57% of a session owner's time on those reads at 5,000 writes a second, its share 64 KiB a group).
 
 ## 9. The API
 

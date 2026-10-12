@@ -10,7 +10,8 @@
 //! its own. Fetches are counted the same way: a group's entries still in memory, the same
 //! entries read back from the file after a reopen, a term and a view. The same appends and reads
 //! are counted again through each group's handle (`GroupLog`), which keeps its writes' entries
-//! and answers its reads itself.
+//! and answers its reads itself, and through handles whose replica's mark keeps what it has yet to
+//! apply (`GroupLog::keep_after`).
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -139,6 +140,75 @@ fn through_handles(dir: &Path, replicas: usize, size: usize) {
     row("term and bounds through the handle", replicas, size, &cost);
     let asked: u64 = handles.iter().map(GroupLog::asked).sum();
     assert_eq!(asked, 0, "a handle asked the log for what it held");
+}
+
+/// The same appends through handles whose replica marks what it applied a round behind its
+/// writes (`GroupLog::keep_after`), on a log whose group share is a byte: what the handle keeps
+/// is the mark's alone. Appends are counted with the mark raised each round, then a fetch of the
+/// entry the replica has yet to apply, which no handle asks the log for.
+fn through_marked_handles(dir: &Path, replicas: usize, size: usize) {
+    let scratch = Scratch::create(dir, ".hyper-log-allocs-marked").unwrap();
+    let log = Log::create(
+        open(scratch.path()),
+        Config {
+            group_cache: 1,
+            ..config(replicas)
+        },
+        3,
+    )
+    .unwrap();
+    let mut handles: Vec<GroupLog<DeviceFile>> = (0..replicas)
+        .map(|g| log.group(g as u128).unwrap())
+        .collect();
+    for h in &mut handles {
+        h.keep_after(0);
+    }
+    let marked_rounds = |handles: &mut [GroupLog<DeviceFile>], batches: Vec<Vec<Update>>| {
+        for batch in batches {
+            let mut last = 0;
+            for (h, u) in handles.iter_mut().zip(batch) {
+                last = u.entries.as_ref().map_or(last, |e| e.first);
+                h.submit(u).unwrap();
+            }
+            for h in handles.iter_mut() {
+                h.wait().unwrap().unwrap();
+                // Applied through the round before this one: this round's entry is kept.
+                h.keep_after(last.saturating_sub(1));
+            }
+        }
+    };
+    marked_rounds(&mut handles, updates(replicas, size, 1, WARM));
+    let batches = updates(replicas, size, WARM + 1, ROUNDS);
+    let appends = ROUNDS * replicas as u64;
+    let cost = counted(appends, || marked_rounds(&mut handles, batches));
+    row("append, marked, a byte's share", replicas, size, &cost);
+    let last = WARM + ROUNDS;
+    let mut into = Some(hyper_log::Fetched::new());
+    let mut fetch = |h: &GroupLog<DeviceFile>| {
+        let got = h
+            .fetch(last, last + 1, u64::MAX, into.take().unwrap())
+            .unwrap();
+        assert_eq!(got.len(), 1);
+        into = Some(got);
+    };
+    fetch(&handles[0]);
+    let cost = counted(replicas as u64, || {
+        for h in &handles {
+            fetch(h);
+        }
+    });
+    row("fetch of an unapplied entry, marked", replicas, size, &cost);
+    let asked: u64 = handles.iter().map(GroupLog::asked).sum();
+    assert_eq!(
+        asked, 0,
+        "a marked handle asked the log for an entry it keeps"
+    );
+    let kept: u64 = handles.iter().map(GroupLog::kept_bytes).sum();
+    assert_eq!(
+        kept,
+        (replicas * size) as u64,
+        "each keeps its unapplied entry alone"
+    );
 }
 
 struct Cost {
@@ -272,6 +342,7 @@ fn main() {
         for size in [128usize, 1 << 10, 16 << 10] {
             point(&dir, replicas, size);
             through_handles(&dir, replicas, size);
+            through_marked_handles(&dir, replicas, size);
         }
     }
 }

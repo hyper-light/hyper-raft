@@ -382,6 +382,8 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
     pub fn open(settings: &Settings, mut log: L, machine: M, budget: B) -> Result<Self, OpenError> {
         let durable = machine.durable();
         let view = repair_at_open(&mut log, durable)?;
+        // What the member has yet to apply it reads back from its store, which may keep it.
+        log.applied(durable.index);
         let depth = log.depth();
         let mut config = settings.core.clone();
         config.applied = durable.index;
@@ -716,13 +718,16 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
             sum.saturating_add(context.capacity())
                 .saturating_add(std::mem::size_of::<(u64, Vec<u8>)>())
         });
+        // What the store keeps for this replica's reads is this replica's to bound.
+        let kept = usize::try_from(self.node.store().log.kept_bytes()).unwrap_or(usize::MAX);
         bytes(
             self.node
                 .raft
                 .resident_bytes()
                 .saturating_add(writes)
                 .saturating_add(stalled)
-                .saturating_add(reads),
+                .saturating_add(reads)
+                .saturating_add(kept),
         )
     }
 
@@ -1882,6 +1887,8 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
             let told = self.node.advance_apply_to(self.applied.index);
             self.must(told)?;
             self.told_applied = self.applied.index;
+            // What the store kept for this replica to read back before applying it may go.
+            self.node.store_mut().log.applied(self.applied.index);
         }
         Ok(())
     }

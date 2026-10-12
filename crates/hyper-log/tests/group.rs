@@ -172,12 +172,24 @@ fn handle_reads_as_the_log_does(
     steps: &[Step],
     cache: u64,
     seed: u64,
+    marks: bool,
 ) -> Result<(), TestCaseError> {
     let log = Log::create(sim(seed), config(cache), ID).unwrap();
     let g = 5u128;
     let mut h = log.group(g).unwrap();
     let mut term = 1u64;
+    if marks {
+        // As a replica marks what it applied when it opens.
+        h.keep_after(0);
+    }
     for &s in steps {
+        if marks {
+            // Raised as a replica applies, by any amount; a lower mark changes nothing.
+            let (start, _) = h.bounds().unwrap();
+            h.keep_after(start.index + s.at % 7);
+        } else {
+            prop_assert_eq!(h.kept_bytes(), 0);
+        }
         let (start, last) = h.bounds().unwrap();
         let u = update(s, start, last, &mut term);
         match h.write(u) {
@@ -199,14 +211,17 @@ proptest! {
     #![proptest_config(ProptestConfig::with_cases(64))]
 
     /// Whatever its group's writes, a handle answers every read as the log does, with a cache
-    /// that holds nothing, a few entries, or all of them.
+    /// that holds nothing, a few entries, or all of them, and whether or not a replica marks what
+    /// it applied (`GroupLog::keep_after`): what the handle keeps changes where a read is answered,
+    /// never what it says.
     #[test]
     fn a_handle_reads_as_the_log_does(
         steps in prop::collection::vec(step(), 1..40),
         cache in prop::sample::select(vec![0u64, 1_500, 1 << 20]),
         seed in any::<u64>(),
+        marks in any::<bool>(),
     ) {
-        handle_reads_as_the_log_does(&steps, cache, seed)?;
+        handle_reads_as_the_log_does(&steps, cache, seed, marks)?;
     }
 
     /// A handle splits an update into the parts the log would, whole or in several frames or
@@ -300,6 +315,50 @@ fn a_handle_asks_the_log_only_for_what_it_lacks() {
         entries(8, 1, 1, 100).entries[0].bytes
     );
     assert_eq!(h.asked(), 1);
+}
+
+/// A handle keeps the entries after its replica's mark whatever its group's share of the log's
+/// cache, and asks the log for none of them; a raised mark lets the entries it passes go by the
+/// share again. What it keeps past the share is counted exactly, through a suffix replaced too, and
+/// a lower mark changes nothing.
+#[test]
+fn a_handle_keeps_what_its_replica_has_yet_to_apply() {
+    let log = Log::create(sim(5), config(1), ID).unwrap();
+    let mut h = log.group(1).unwrap();
+    assert_eq!(h.kept_bytes(), 0, "nothing is kept before a mark");
+    h.keep_after(0);
+    h.write(Update {
+        entries: Some(entries(1, 6, 1, 100)),
+        ..Update::default()
+    })
+    .unwrap();
+    assert_eq!(h.kept_bytes(), 600);
+    assert_eq!(h.fetch(1, 7, u64::MAX, Fetched::new()).unwrap().len(), 6);
+    assert_eq!(h.asked(), 0, "every kept entry answered by the handle");
+    // The share is a byte: what the mark passes goes, and is the log's to answer.
+    h.keep_after(4);
+    assert_eq!(h.kept_bytes(), 200);
+    assert_eq!(h.fetch(5, 7, u64::MAX, Fetched::new()).unwrap().len(), 2);
+    assert_eq!(h.asked(), 0);
+    assert_eq!(h.fetch(3, 5, u64::MAX, Fetched::new()).unwrap().len(), 2);
+    assert_eq!(h.asked(), 1, "what the mark passed is the log's");
+    // A suffix past the mark replaced: its old entry uncounted, the new ones counted.
+    h.write(Update {
+        entries: Some(entries(6, 3, 2, 50)),
+        ..Update::default()
+    })
+    .unwrap();
+    assert_eq!(h.kept_bytes(), 100 + 3 * 50);
+    let replaced = h.fetch(5, 9, u64::MAX, Fetched::new()).unwrap();
+    assert_eq!(
+        replaced.get(1).unwrap(),
+        (2, &entries(6, 1, 2, 50).entries[0].bytes[..])
+    );
+    assert_eq!(h.asked(), 1);
+    h.keep_after(2);
+    assert_eq!(h.kept_bytes(), 250, "a lower mark changes nothing");
+    h.keep_after(8);
+    assert_eq!(h.kept_bytes(), 0);
 }
 
 /// A write that fails leaves the handle reading from the log: it cannot know what the failed

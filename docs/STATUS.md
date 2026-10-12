@@ -50,7 +50,17 @@ the path's warm-up as background traffic, LEDBAT++'s slow start ending at its ow
 call touched (512 held: 232–243 µs an exchange before, 40–43 after; `docs/benchmarks.md`); in hyper-log
 and hyper-durable, a group's handle keeping what its replica has yet to apply, bounded by the replica's
 budget, with no allocation an append (`docs/durable.md` §8, `docs/benchmarks.md`); in hyper-rt, a wake
-probe's round timed from its waiter's start and a `block_on` whose root unwinds ending refused (below).
+probe's round timed from its waiter's start and a `block_on` whose root unwinds ending refused (below);
+in hyper-rt and hyper-block, mantle's runtime work, its seven commits merged with `main`
+(`crates/hyper-rt/ORIGIN.md`, `crates/hyper-block/ORIGIN.md`, `docs/runtime.md` §3.9), with
+`tests/service_resources.rs`, red in mantle, green at its two causes: a shard losing its driver
+allocated as it closed a control queue that was std's channel, now a ring in its registry entry
+(`docs/runtime.md` §8), and the test started an observer thread inside each driver-loss round's
+measured window, now one for every round. With it, a receiver's drop closes its ring (a mark in the
+tail, std's disconnect bit), so no send lands after the close, which mantle's channel let in between its
+check and its push; one of `readiness_waits`' tests waits for a later step, not one yield, since a step
+polls a task that yields again within its batch (PR #16); and hyper-measure's Linux probe reads `/proc`
+with no allocation, which `service_driverless_receipts` counted as the runtime's (`crates/hyper-rt/ORIGIN.md`).
 
 ## Open defects
 
@@ -145,7 +155,7 @@ held an election back.
 
 | Consumer | Takes | State |
 |---|---|---|
-| mantle | hyper-raft, hyper-timing, hyper-log, hyper-block, hyper-measure, hyper-durable, hyper-liveness, hyper-seal and hyper-rt vendored (`vendor/`, `SNAPSHOT` `f358210`), hyper-rt and hyper-block with local changes owed here (mantle `vendor/UPSTREAM.md`; branch `mantle-runtime` replays them onto the revision mantle took them from) | its range replica is hyper-durable's `Replica` with its engine and layer as the state machine (D-1), electing on ticks; elections by suspicion wait for a node owner that carries the liveness stream (mantle `docs/design/node.md` §2.4) |
+| mantle | hyper-raft, hyper-timing, hyper-log, hyper-block, hyper-measure, hyper-durable, hyper-liveness, hyper-seal and hyper-rt vendored (`vendor/`, `SNAPSHOT` `f358210`), hyper-rt and hyper-block with local changes that are on `main` since `bb3a964` (mantle `vendor/UPSTREAM.md`); mantle re-vendors from `main` as its own landing | its range replica is hyper-durable's `Replica` with its engine and layer as the state machine (D-1), electing on ticks; elections by suspicion wait for a node owner that carries the liveness stream (mantle `docs/design/node.md` §2.4) |
 | focal | every crate it takes vendored at `9fdf7ff` (`vendor/*/SNAPSHOT`), the head of `focal-transport-hooks`, whose commits not on `main` land here with this change; focal re-vendors from `main` as its own landing | the core (step 1) and the transport (step 4: hyper-quic, hyper-transport and hyper-rt in place of quinn and tokio) switched; its storage on hyper-log and the shell (F-1, D-2) built behind `STORAGE_LEVEL`, its `CAPABILITY_LEVEL` still 2; timing and liveness (step 3) open, its shell electing on ticks |
 | slates | hyper-datagram, hyper-seal, hyper-swim and hyper-timing vendored at `67f038d` (`vendor/hyper-raft/SNAPSHOT`, slates' main); their sources unchanged on `main` since | SWIM (S-1) and the datagram plane (P-1) switched; its consensus onto hyper-raft (X-1) and its session plane onto hyper-transport (X-2) open, slates' runtime onto hyper-rt slates' own step |
 
@@ -160,20 +170,12 @@ crates' open work; then each consumer's switch-over (mantle note 32 §5, each pr
    - focal vendors every crate it takes at `9fdf7ff`, the head of `focal-transport-hooks`, whose
      commits not on `main` land with this change; then focal re-vendors from `main`, as its own
      landing under its own rules.
-   - mantle vendors every crate at `f358210` with local changes to hyper-rt and hyper-block owed here
-     (mantle `vendor/UPSTREAM.md`): the issuer's numbered lanes, terminal ownership and retirement,
-     and resident reads (hyper-block); cooperative service admission and cancellation, per-poll
-     context guards, checked channel slot and ticket layouts, TCP setup and accept ownership,
-     cold-owned native retirement, a park with one kick and a spin as long as blocking costs,
-     channels that hand values over with no lock, and the CPU clock read after a park only when it
-     learned before it (hyper-rt), about 7,300 lines of source and 5,700 of tests. Branch
-     `mantle-runtime` replays mantle's seven commits (cf6e37c, 6f05bd8, 3743b25, f797bd9, bfdf9c2,
-     bb0779e, bd7c0fd) onto `8cd3604`, the revision mantle took them from, byte for byte; it is to be
-     merged with `main` (mantle's own merge, be8d04d, the guide), its failing `service_resources`
-     test fixed at its cause, its design brought into `docs/runtime.md` from mantle's
-     `docs/design/event-loop.md` D1–D4 and its measurements into `docs/benchmarks.md`, and gated.
-     PR #16 (a step's poll budget covers wakes its own polls make), which mantle carries already,
-     lands with it, measured here.
+   - mantle vendors every crate at `f358210` with local changes to hyper-rt and hyper-block, which
+     are on `main` since `bb3a964`: mantle's seven commits (cf6e37c, 6f05bd8, 3743b25, f797bd9,
+     bfdf9c2, bb0779e, bd7c0fd; branch `mantle-runtime` keeps their replay) merged with `main`, PR #16
+     (a step's poll budget covers the wakes its own polls make) with them, its `service_resources`
+     test fixed at its causes, D1–D4 in `docs/runtime.md` §3.9 and mantle's measurements in
+     `docs/benchmarks.md`. mantle re-vendors every crate from `main`, as its own landing.
    - slates vendors hyper-datagram, hyper-seal, hyper-swim and hyper-timing at `67f038d`; their
      sources have not changed on `main` since, so its next snapshot moves only the revision and
      hyper-seal's `ORIGIN.md`. This repository's agent re-vendors slates (slates' own gates, its
@@ -189,7 +191,8 @@ crates' open work; then each consumer's switch-over (mantle note 32 §5, each pr
    - hyper-quic and hyper-tls against slates' and focal's transports (owed in the table above), and
      slates' congestion bake-off.
    - hyper-seal §11: the log sealed by default only once measured.
-   - hyper-rt §15's open items.
+   - hyper-rt §15's open items, and the bench of its loop under load here: mantle's cases, PR #16's
+     same-shard request and reply among them, against slates' runtime and tokio on one host.
    - This table's rows for hyper-rt, hyper-seal, hyper-measure and hyper-rt-transport, each with the law's
      four columns as measured.
    - The fast track: note 32 §3.8's tests decide it; no owner enables it until then.

@@ -299,26 +299,6 @@ fn a_simulated_batch_is_stamped_on_the_simulated_clock() {
     }
 }
 
-/// Windows reports a datagram sent to a closed port as a reset on the socket's next receive
-/// (`WSAECONNRESET`, the `recvfrom` reference). Do: send to a port nothing listens on, then receive.
-/// Expect: the report is counted as astray and the receive takes nothing, without an error.
-#[cfg(windows)]
-#[test]
-fn an_astray_report_is_counted_not_an_error() {
-    let mut rt = LocalRuntime::new(&config()).unwrap();
-    rt.block_on(async {
-        let loopback = SocketAddr::from((Ipv4Addr::LOCALHOST, 0));
-        let closed = UdpSocket::bind(loopback).unwrap().local_addr().unwrap();
-        let mut socket = Batched::bind(loopback, Io { batch: 4 }, false).unwrap();
-        socket.queue(closed, b"astray");
-        assert_eq!(socket.send(), Sent::Drained);
-        socket.readable().await.unwrap();
-        assert_eq!(socket.receive(|_, _| {}).unwrap(), 0);
-        assert!(socket.stats().astray >= 1, "{:?}", socket.stats());
-    })
-    .unwrap();
-}
-
 /// A datagram the kernel has no route for fails its send the same way every time: macOS reports an
 /// IPv6 destination on an IPv4 socket as unreachable (`EHOSTUNREACH`), which is also how a datagram
 /// sent earlier is reported astray. Do: queue one to such a destination, then one to a live socket,

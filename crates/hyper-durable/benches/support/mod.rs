@@ -76,7 +76,7 @@ pub fn now() -> u64 {
 
 /// What the group applies: entries counted, one answer each; no image, so a run compacts nothing
 /// and each opens on fresh logs.
-struct Counter {
+pub struct Counter {
     configuration: ConfState,
 }
 
@@ -377,6 +377,11 @@ impl Mode {
 /// What one run measured.
 pub struct Run {
     pub latencies: Vec<u64>,
+    /// Each span the leader held a `Ready` it could not take, its writes at the depth, nanoseconds.
+    pub held: Vec<u64>,
+    /// The leader's writes with something to make durable, and those with nothing, an entry.
+    pub readies_per_entry: f64,
+    pub empty_per_entry: f64,
     /// Each measured entry's phases, in the order answered: from its arrival to its first leaving
     /// the leader, from then to its answer, and the leader's writes out when it was proposed.
     pub phases: Vec<(u64, u64, usize)>,
@@ -392,10 +397,10 @@ pub struct Run {
     pub cpu_per_entry: f64,
 }
 
-/// One group on its logs, driven on this thread.
-pub struct Group<'w> {
+/// One group on its logs, driven on this thread, applying to `M`.
+pub struct Group<'w, M: StateMachine<Answer = ()> = Counter> {
     // Dropped before the logs, whose owners the handles reach.
-    owner: Owner<Depth, Counter, Unbounded>,
+    owner: Owner<Depth, M, Unbounded>,
     logs: Vec<Log<Member>>,
     handles: Vec<Handle>,
     woken: &'w Receiver<usize>,
@@ -405,11 +410,19 @@ pub struct Group<'w> {
     deadlines: Vec<Option<u64>>,
     /// Raft messages the members sent.
     pub messages: u64,
+    /// The store's depth: writes a member may have out.
+    pub depth: usize,
     /// When the leader first sent each entry from `first_sent` on to a follower, nanoseconds: the
     /// phase between an entry's proposal and its leaving the leader.
     sent: VecDeque<u64>,
     /// The index `sent` starts at.
     first_sent: u64,
+    /// A member whose messages, to it and from it, the network drops while it is cut.
+    cut: Option<u64>,
+    /// The bytes of the messages delivered to each member, the first's first.
+    pub bytes_to: [u64; MEMBERS as usize],
+    /// The leader's waker, for the calls an owner makes with one.
+    leader_waker: Waker,
 }
 
 /// What a member holds now: the last entry it applied, its durable commit `C_d`, and the writes of
@@ -422,10 +435,23 @@ pub struct MemberState {
 }
 
 impl<'w> Group<'w> {
-    pub fn open(
+    pub fn open(wakes: &'w Wakes, shape: Shape, device: impl FnMut(Device, u64) -> Member) -> Self {
+        Self::open_with(wakes, shape, device, |_| Counter {
+            configuration: ConfState {
+                voters: (1..=MEMBERS).collect(),
+                ..ConfState::default()
+            },
+        })
+    }
+}
+
+impl<'w, M: StateMachine<Answer = ()>> Group<'w, M> {
+    /// A group whose member `id` applies to `machine(id)`.
+    pub fn open_with(
         wakes: &'w Wakes,
         shape: Shape,
         mut device: impl FnMut(Device, u64) -> Member,
+        mut machine: impl FnMut(u64) -> M,
     ) -> Self {
         while wakes.woken.try_recv().is_ok() {}
         let mut owner = Owner::new(wakes.wakers.clone());
@@ -440,16 +466,10 @@ impl<'w> Group<'w> {
                 "depth {} past the log's",
                 shape.depth
             );
-            let machine = Counter {
-                configuration: ConfState {
-                    voters: (1..=MEMBERS).collect(),
-                    ..ConfState::default()
-                },
-            };
             let replica = Replica::open(
                 &settings(id, shape.apply_ahead, shape.quiet),
                 Depth(store, shape.depth),
-                machine,
+                machine(id),
                 Unbounded,
             )
             .expect("a member opens");
@@ -465,8 +485,16 @@ impl<'w> Group<'w> {
             wire: VecDeque::new(),
             deadlines: vec![None; MEMBERS as usize],
             messages: 0,
+            depth: shape.depth,
             sent: VecDeque::new(),
             first_sent: 0,
+            cut: None,
+            bytes_to: [0; MEMBERS as usize],
+            leader_waker: wakes
+                .wakers
+                .first()
+                .cloned()
+                .unwrap_or_else(|| Waker::noop().clone()),
         };
         let first = group.handles[0];
         group.owner.get_mut(first).unwrap().campaign().unwrap();
@@ -520,9 +548,15 @@ impl<'w> Group<'w> {
             }
         }
         while let Some(m) = self.wire.pop_front() {
+            if self.cut.is_some_and(|cut| cut == m.to || cut == m.from) {
+                continue;
+            }
             let Some(&to) = self.handles.get(usize::try_from(m.to).unwrap() - 1) else {
                 continue;
             };
+            if let Some(b) = self.bytes_to.get_mut(usize::try_from(m.to).unwrap() - 1) {
+                *b += hyper_raft::proto::message_bytes(&m) as u64;
+            }
             match self.owner.get_mut(to).unwrap().step(m) {
                 Ok(()) | Err(ReplicaError::Refused(_) | ReplicaError::Stalled) => {}
                 Err(e) => panic!("step: {e}"),
@@ -561,8 +595,19 @@ impl<'w> Group<'w> {
                     }
                 }
                 None => {
-                    if let Ok(slot) = self.woken.recv() {
+                    if let Ok(slot) = self.woken.try_recv() {
                         self.owner.woken(slot);
+                    } else {
+                        // Only a log's answer can wake the group now: with no write out, none
+                        // will come.
+                        assert!(
+                            self.writes_out(),
+                            "the group waits with nothing to wake it: {:#?}",
+                            self.stuck()
+                        );
+                        if let Ok(slot) = self.woken.recv() {
+                            self.owner.woken(slot);
+                        }
                     }
                 }
             }
@@ -577,6 +622,66 @@ impl<'w> Group<'w> {
                 self.owner.schedule(self.handles[i]);
             }
         }
+    }
+
+    /// Each member's role, term, applied, committed, first and last index, writes out, whether it
+    /// holds a `Ready` and the writes it made, and on the leader each member's progress: what a
+    /// group that waits with nothing to wake it was left in.
+    fn stuck(&self) -> Vec<String> {
+        self.handles
+            .iter()
+            .map(|&h| {
+                let r = self.owner.get(h).expect("a member is held");
+                let raft = &r.core().raft;
+                let progress: Vec<String> = if r.is_leader() {
+                    raft.tracker()
+                        .iter()
+                        .map(|(id, p)| {
+                            format!(
+                                "{id}: {:?} matched {} next {} full {}",
+                                p.state,
+                                p.matched,
+                                p.next_index,
+                                p.inflights.full()
+                            )
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                format!(
+                    "{}: {:?} term {} applied {} committed {} first {} last {} out {} ready {} \
+                     stalled {} cut {:?} {:?} {progress:?}",
+                    r.id(),
+                    raft.state(),
+                    raft.term(),
+                    r.applied().index,
+                    raft.log().committed(),
+                    raft.log().first_index().unwrap_or(0),
+                    raft.log().last_index().unwrap_or(0),
+                    r.in_flight(),
+                    r.core().has_ready(),
+                    r.is_stalled(),
+                    self.cut,
+                    r.writes()
+                )
+            })
+            .collect()
+    }
+
+    /// Whether the leader holds a `Ready` it may not take: its writes out at the store's depth.
+    fn leader_held(&self, depth: usize) -> bool {
+        self.owner
+            .get(self.handles[0])
+            .is_some_and(|r| r.core().has_ready() && r.in_flight() >= depth)
+    }
+
+    /// The leader's writes so far, by what they were for.
+    fn leader_writes(&self) -> hyper_durable::Writes {
+        self.owner
+            .get(self.handles[0])
+            .map(Replica::writes)
+            .unwrap_or_default()
     }
 
     /// The leader's last index and its writes out.
@@ -595,15 +700,90 @@ impl<'w> Group<'w> {
 
     /// Proposes an entry at the leader; false when the core refused it for now.
     pub fn propose(&mut self) -> bool {
+        self.propose_data(vec![0x5a; ENTRY_BYTES])
+    }
+
+    /// Proposes `data` at the leader; false when the core refused it for now.
+    pub fn propose_data(&mut self, data: Vec<u8>) -> bool {
         let leader = self.handles[0];
         let taken = self
             .owner
             .get_mut(leader)
             .unwrap()
-            .propose(Vec::new(), vec![0x5a; ENTRY_BYTES])
+            .propose(Vec::new(), data)
             .is_ok();
         self.owner.schedule(leader);
         taken
+    }
+
+    /// Cuts `member` off the network, or heals the cut with `None`: what it sends and what it is
+    /// sent is dropped meanwhile. The detectors on both sides of a cut say what the node-pair
+    /// liveness stream says of one (`docs/timing.md` §2.1): each side suspects the other while it
+    /// lasts and trusts it again once healed, and the leader, trusting the member again, tells it
+    /// who leads, so a member cut off while its group was idle catches up (`hyper_raft::watch`).
+    /// Without the words, a group with nothing in flight sends the healed member nothing: a leader
+    /// beats only on its owner's timing, which a bench in one process does not measure.
+    pub fn set_cut(&mut self, member: Option<u64>) {
+        let (cut, trusted) = match (member, self.cut) {
+            (Some(cut), _) => (cut, false),
+            (None, Some(cut)) => (cut, true),
+            (None, None) => return,
+        };
+        self.cut = member;
+        let handles = self.handles.clone();
+        for (at, &h) in handles.iter().enumerate() {
+            let id = at as u64 + 1;
+            let peers: Vec<u64> = if id == cut {
+                (1..=MEMBERS).filter(|&p| p != cut).collect()
+            } else {
+                vec![cut]
+            };
+            let r = self.owner.get_mut(h).expect("a member is held");
+            for peer in peers {
+                let said = if trusted {
+                    r.trust(peer)
+                } else {
+                    r.suspect(peer)
+                };
+                said.expect("a member takes its detectors' word");
+            }
+            self.owner.schedule(h);
+        }
+    }
+
+    /// Member `id`'s last index applied.
+    pub fn applied(&self, id: u64) -> u64 {
+        let h = self.handles[usize::try_from(id).unwrap() - 1];
+        self.owner.get(h).map_or(0, |r| r.applied().index)
+    }
+
+    /// The member `id`'s state machine.
+    pub fn machine(&self, id: u64) -> &M {
+        let h = self.handles[usize::try_from(id).unwrap() - 1];
+        self.owner.get(h).expect("a member is held").machine()
+    }
+
+    /// Has the leader compact its log, keeping `keep` entries behind its machine's durable point;
+    /// true when a compaction's start went out.
+    pub fn compact_leader(&mut self, keep: u64) -> bool {
+        let leader = self.handles[0];
+        let waker = self.leader_waker.clone();
+        let started = self
+            .owner
+            .get_mut(leader)
+            .unwrap()
+            .compact(keep, now(), &waker)
+            .expect("the leader compacts");
+        self.owner.schedule(leader);
+        started
+    }
+
+    /// The leader's log's first index held.
+    pub fn leader_start(&self) -> u64 {
+        self.owner
+            .get(self.handles[0])
+            .and_then(|r| r.core().raft.log().first_index().ok())
+            .unwrap_or(0)
     }
 
     /// Each member's state, the leader's first.
@@ -652,7 +832,7 @@ struct Mark {
 /// leader takes it and timed from its arrival; `again` proposes a closed loop's next entry at
 /// each answer.
 fn drive(
-    group: &mut Group<'_>,
+    group: &mut Group<'_, Counter>,
     entries: u64,
     mut arrive: impl FnMut(u64) -> Option<u64>,
     again: bool,
@@ -663,6 +843,9 @@ fn drive(
     let mut taken: VecDeque<(u64, u64, usize)> = VecDeque::new();
     let mut latencies = Vec::with_capacity(usize::try_from(entries).unwrap());
     let mut phases = Vec::with_capacity(usize::try_from(entries).unwrap());
+    let mut held: Vec<u64> = Vec::new();
+    let mut held_since: Option<u64> = None;
+    let mut writes_at_mark = group.leader_writes();
     let mut arrived = 0u64;
     let mut answered = 0u64;
     let mut next = arrive(now());
@@ -707,11 +890,21 @@ fn drive(
                     counts: group.counts(),
                     usage: hyper_measure::usage::this().ok(),
                 };
+                writes_at_mark = group.leader_writes();
+                held.clear();
             }
             if again && arrived < total {
                 waiting.push_back(at);
                 arrived += 1;
             }
+        }
+        match (group.leader_held(group.depth), held_since) {
+            (true, None) => held_since = Some(at),
+            (false, Some(since)) => {
+                held.push(at.saturating_sub(since));
+                held_since = None;
+            }
+            _ => {}
         }
         // With nothing answered and nothing it could propose, the loop waits for the group.
         if answers == 0 && (waiting.is_empty() || refused) {
@@ -725,9 +918,13 @@ fn drive(
         .map_or(f64::NAN, |u| (u.user_ns + u.system_ns) as f64 / 1e3);
     let end = group.counts();
     let per_entry = |n: u64, at: u64| n.saturating_sub(at) as f64 / entries as f64;
+    let writes = group.leader_writes();
     Run {
         latencies,
         phases,
+        held,
+        readies_per_entry: per_entry(writes.readies, writes_at_mark.readies),
+        empty_per_entry: per_entry(writes.empty, writes_at_mark.empty),
         entries_per_second: entries as f64 / elapsed,
         frames_per_entry: per_entry(end.frames, mark.counts.frames),
         flushes_per_entry: per_entry(end.flushes, mark.counts.flushes),

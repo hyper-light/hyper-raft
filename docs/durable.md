@@ -1134,10 +1134,14 @@ directory once, at create.
    (`benches/apply.rs`; `docs/benchmarks.md`, "A leader applying ahead of its own write"): with the
    leader slower than its followers by a whole flush, applying ahead halves each run's median
    answer under an open load and lets one client commit 31% more entries a second; on a shared disk
-   it changes nothing measurable. Open: near saturation its p99 grows (78.8 against 54.3 ms at 90% of
-   capacity): its slowest entries wait to leave the leader, whose disk keeps its three writes out,
-   30 ms against 6 without applying ahead; why that wait grows is open, and settled before any owner
-   turns it on.
+   it changes nothing measurable. Its slowest entries wait to leave the leader: traced, each wait is
+   a span the leader holds a `Ready` it cannot take, its three writes out, as many and as long either
+   way (a flush of its disk at the median); applying ahead answers an entry once its followers hold
+   it, so that wait is what is left of its tail (19–34 ms to leave against 11–28 after, its p99 lower,
+   38–53 against 55–65 ms, over four runs; the 78.8 ms p99 of the first run did not come again). Open:
+   a leader that sends its appends before its own write has a slot, holding the write past the
+   store's depth within the core's memory bound, which would take that wait out; settled before any
+   owner turns §4.2 on.
 3. **The quiet commit write.** How long a volatile state machine's applied state runs ahead of its
    logged commit under focal's one-period rule, and what the write costs a quiet group. Measured
    (`benches/quiet.rs`; `docs/benchmarks.md`, "A quiet group's commit write"): one period and one
@@ -1158,8 +1162,16 @@ directory once, at create.
    simulation's unavailable runs before and after R-7. Measured for R-5 (`docs/benchmarks.md`,
    "Repair by entries (R-5)"): one lost entry of 30,000 repaired in 1.8 KB and 32 µs in process
    against a snapshot's 30.7 MB and 8.9 ms; the bytes stay below the snapshot's until nearly the
-   whole log is lost, and in-process time crosses near 2,000 entries. Open: whether a leader should
-   choose a snapshot past a crossover measured on a real path. The schedules' waits on a mark
+   whole log is lost, and in-process time crosses near 2,000 entries. On real disks
+   (`benches/repair.rs`; `docs/benchmarks.md`, "Repair by entries against an image, on the disk"):
+   an image of 30–41 MB installs in 21–32 ms whatever was lost, where entries go at the member's
+   replication pace, a write and a flush a window, 21–30 ms for one to ten entries and 453 ms for
+   10,000. A leader should choose an image once the lost bytes at the replication rate take longer
+   than the image's bytes at the path's rate and its install: from about a hundred entries in process,
+   between 1,000 and 10,000 on a 1 Gb/s path. Open: the shell choosing by that rule, from the path's
+   measured rate and the image's size, where today it sends entries while its log holds them. The
+   bench found a core fault, fixed (hyper-raft `ORIGIN.md`, "Trusted again, what was sent while
+   suspected is taken for lost"). The schedules' waits on a mark
    (`crates/hyper-raft/ORIGIN.md`, R-5 and R-7): with one marked member at a time, 97 to 192 of
    1,000 schedules a setting end waiting before R-7 and after it alike, every one inspected in a
    configuration of two voters or one; with two of three marked at once, 1,950 of 4,000 before R-7

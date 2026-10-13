@@ -35,5 +35,9 @@ harness = false
 name = "quiet"
 harness = false
 
+[[bench]]
+name = "repair"
+harness = false
+
 [lints]
 workspace = true

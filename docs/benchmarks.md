@@ -8100,7 +8100,23 @@ p99.9 in ms, then entries a second:
   loop, where its answers come before its own write, 35.5 ms against none (the clients, answered
   sooner, propose into a full depth). So the tail is the leader's write queue, not the quorum. It is
   not the bound on what the leader may apply ahead (`Limits::unstable_entries`, over a hundred
-  thousand entries at the bench's 16 MiB); why its waits grow under apply-ahead is open.
+  thousand entries at the bench's 16 MiB).
+- **Why the slowest wait to leave** (2026-10-13, four more runs of the 16-client and 90% points, six
+  rounds of 615 entries each, load 10–12): each span the leader held a `Ready` it could not take, its
+  three writes out, was timed (`Run::held`). There are as many either way (207–301 a point) and as
+  long: a flush of its disk at the median, 8.4–8.5 ms in the runs nearest quiet, 20–40 ms at the
+  longest. An entry proposed in one cannot leave, for a leader sends its appends only with the
+  `Ready` that issues its own write, and the store has no slot. Across the four runs the 90% point's
+  p99 was 38.3–52.9 ms applying ahead against 55.0–64.9 after (the 78.8 above did not come again),
+  its median 13.1–18.3 against 27.5–42.9, and the slowest 1% waited 19.0–33.7 ms to leave applying
+  ahead against 10.9–28.2 after, in three runs of four the longer: applying ahead answers an entry
+  once its followers hold it, so what is left of its time is the wait for the leader's write slot,
+  where without it the leader's own write after it is. The remedy would be a leader that sends its
+  appends before its own write has a slot, holding the write past the store's depth within the core's
+  memory bound: open, as a design for §4.2, not a tuning.
+- **A shared disk's stalls.** The same trace on the shared disk at 90%: spans of the leader's writes
+  all out reached 98–268 ms after and 104–384 ms applying ahead in the five runs, every log's flushes
+  on one device; either way, so applying ahead is not their cause.
 - **On a shared disk it changes nothing measurable**: every point within the noise. The followers'
   flushes are as slow as the leader's, so the quorum's pace is its own.
 
@@ -8110,6 +8126,51 @@ default (it is off, raft-rs's default, `Config::apply_unpersisted`).
 
 ```sh
 cargo bench -p hyper-durable --bench apply -- DIR 1,16 50,90 6
+```
+
+## Repair by entries against an image, on the disk (2026-10-13)
+
+`docs/durable.md` §14 item 5: what repairing a member costs by entries (R-5) and by an image, on real
+disks. `benches/repair.rs`: three voters on hyper-log, each log a scratch file flushed with the
+platform's full flush; PAR's workload (Alagappan et al., FAST 2018, §5.2), 30,000 entries of a kibibyte,
+applied by a state machine that keeps every entry's bytes and whose image is those bytes, made durable
+in a file of its own. The third member is cut off, the detectors on both sides suspecting the other,
+while the other two commit `lost` entries more; then healed, the detectors trusting again. **By
+entries** the leader sends what it lacks from its log; **by an image** the leader first compacts past it
+(outside the time), so it sends its image and the member installs it. Timed from the heal until the
+member has applied all the leader applied; the network is in process, so the bytes sent cost nothing to
+move. Three rounds a point, the ways in turn, load 10–17, hyper-raft `b66dc9e`:
+
+| lost | by entries: ms, median [least–most] | bytes sent | by an image: ms, median [least–most] | bytes sent |
+|---|---|---|---|---|
+| 1 | 30.1 [17.0–34.9] | 1,608 | 24.1 [17.2–34.2] | 30,721,792 |
+| 10 | 21.2 [10.5–58.6] | 11,472 | 21.3 [16.9–31.7] | 30,731,008 |
+| 100 | 58.7 [54.5–80.0] | 110,368 | 30.5 [24.3–40.7] | 30,823,168 |
+| 1,000 | 67.5 [54.5–92.5] | 1,100,352 | 31.7 [28.2–51.6] | 31,744,768 |
+| 10,000 | 453.4 [411.9–457.6] | 11,001,216 | 32.0 [26.8–34.6] | 40,960,768 |
+
+- **On the disk an image is as fast at one and ten lost entries (the ranges overlap) and faster from a
+  hundred.** An image is one large
+  write of the machine's file and one flush, then the log's start: 21–32 ms for 30–41 MB whatever was
+  lost. Entries go at the member's replication pace, each window of appends a write and a flush of its
+  log before its answer frees the next: 24 MB a second at 10,000 entries (453 ms), where the image moved
+  over a gigabyte a second. The in-process figures of R-5 (32 µs against 8.9 ms, crossing near 2,000
+  entries) counted no flush.
+- **On a path, the image's bytes cost what entries' do not.** An image of 30.7 MB is 25 ms at 10 Gb/s
+  and 246 ms at 1 Gb/s; 11 MB of entries 9 and 88 ms, beside their 453. So a leader should choose an
+  image once `lost bytes / replication rate` passes `image bytes / path rate + install`: on this disk,
+  from about a hundred entries in process, and between 1,000 and 10,000 at 1 Gb/s. The shell sends entries while
+  its log holds them and an image only once it compacted past them; choosing by the rule needs the
+  path's rate (the transport's measure, `Replica::set_carriage`) and the image's size
+  (`StateMachine::image_bytes`), both in hand: open.
+- **The bench found two faults**, both fixed before these figures: a cut that healed with no detector's
+  word left a group with nothing in flight sending the member nothing (the bench's own: the detectors
+  now speak as the liveness stream would), and a leader trusting a member again kept a window full of
+  what the cut lost, repairing it only once a beat passed, and never at a leader given no timing
+  (hyper-raft `ORIGIN.md`, "Trusted again, what was sent while suspected is taken for lost").
+
+```sh
+cargo bench -p hyper-durable --bench repair -- DIR [LOST] [ROUNDS] [ENTRIES]
 ```
 
 ## A quiet group's commit write (2026-10-12)

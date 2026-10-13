@@ -93,6 +93,23 @@ fn point(
     );
     for (at, way) in ["after", "ahead"].iter().enumerate() {
         println!("- {way}: {}", phases(&runs[at]));
+        let mut held: Vec<u64> = runs[at]
+            .iter()
+            .flat_map(|r| r.held.iter().copied())
+            .collect();
+        held.sort_unstable();
+        let total: u64 = held.iter().sum();
+        let rate =
+            |f: fn(&Run) -> f64| support::median(&mut runs[at].iter().map(f).collect::<Vec<_>>());
+        println!(
+            "  {way}: leader held a Ready at its depth {} times, p50 {:.2} ms, max {:.2} ms, {:.1} ms in all; readies {:.3} and empty {:.3} an entry",
+            held.len(),
+            held.get(held.len() / 2).copied().unwrap_or(0) as f64 / 1e6,
+            held.last().copied().unwrap_or(0) as f64 / 1e6,
+            total as f64 / 1e6,
+            rate(|r| r.readies_per_entry),
+            rate(|r| r.empty_per_entry)
+        );
     }
     most
 }
